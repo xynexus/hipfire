@@ -27,6 +27,7 @@ join_rows(aie::vector<int32, MMUL::size_C> lo,
   default: return aie::concat(lo.extract<8>(7), hi.extract<8>(7));
   }
 }
+
 } // namespace
 
 extern "C" {
@@ -99,6 +100,30 @@ void r118_compact_group_n32(const int8_t *restrict activation_stage,
   }
   chess_separator_scheduler(1);
   chess_separator();
+}
+
+void r129_compact_group_n32_b2(const int8_t *restrict activation_stage0,
+                               const int8_t *restrict activation_stage1,
+                               const int8_t *restrict weight_record,
+                               float *restrict output, int32_t group) {
+  r118_compact_group_n32(activation_stage0, weight_record, output, group);
+  r118_compact_group_n32(activation_stage1, weight_record, output + 8 * 32,
+                         group);
+}
+
+void r129_compact_group_n32_b4(const int8_t *restrict activation_stage0,
+                               const int8_t *restrict activation_stage1,
+                               const int8_t *restrict activation_stage2,
+                               const int8_t *restrict activation_stage3,
+                               const int8_t *restrict weight_record,
+                               float *restrict output, int32_t group) {
+  r118_compact_group_n32(activation_stage0, weight_record, output, group);
+  r118_compact_group_n32(activation_stage1, weight_record, output + 8 * 32,
+                         group);
+  r118_compact_group_n32(activation_stage2, weight_record, output + 2 * 8 * 32,
+                         group);
+  r118_compact_group_n32(activation_stage3, weight_record, output + 3 * 8 * 32,
+                         group);
 }
 
 } // extern "C"

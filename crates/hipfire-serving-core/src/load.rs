@@ -13,7 +13,7 @@
 //! `main.rs` monolith (no behavior change); items called from `main.rs` are
 //! `pub`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_gemma3::{Gemma3Backend, Gemma3State};
@@ -683,6 +683,16 @@ pub fn load_model(
             cfg.embedding_dim,
             cfg.matryoshka_dims,
         );
+        #[cfg(target_os = "linux")]
+        let npu_projector = load_embeddinggemma_npu_projector(&hfq, &cfg);
+        #[cfg(target_os = "linux")]
+        let weights = if npu_projector.is_some() {
+            load_embeddinggemma_gpu_fallback_weights(&mut hfq, &cfg, gpu, Path::new(path))
+        } else {
+            hipfire_arch_embeddinggemma::EmbeddingGemmaWeights::load(&mut hfq, &cfg, gpu)
+        }
+        .map_err(|e| format!("embeddinggemma weights: {e}"))?;
+        #[cfg(not(target_os = "linux"))]
         let weights = hipfire_arch_embeddinggemma::EmbeddingGemmaWeights::load(&mut hfq, &cfg, gpu)
             .map_err(|e| format!("embeddinggemma weights: {e}"))?;
         let chat_template = resolve_chat_template(&hfq, path);
@@ -740,6 +750,8 @@ pub fn load_model(
             embeddinggemma: Some(EmbeddingGemmaState {
                 config: cfg,
                 weights,
+                #[cfg(target_os = "linux")]
+                npu_projector,
             }),
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
@@ -2346,6 +2358,109 @@ pub fn load_model(
             chat_template_profile,
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn load_embeddinggemma_npu_projector(
+    hfq: &HfqFile,
+    config: &hipfire_arch_embeddinggemma::EmbeddingGemmaConfig,
+) -> Option<std::sync::Mutex<hipfire_arch_embeddinggemma::NpuOpusProjector>> {
+    let requested = std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER").is_ok_and(|value| value != "0");
+    if !requested {
+        return None;
+    }
+    let batch = match std::env::var("HIPFIRE_EMBED_NPU_BATCH") {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(batch) if batch > 0 => batch,
+            _ => {
+                eprintln!("embeddinggemma NPU disabled: HIPFIRE_EMBED_NPU_BATCH must be positive");
+                return None;
+            }
+        },
+        Err(_) => 1,
+    };
+    let cache_root = std::env::var_os("HIPFIRE_EMBED_NPU_CACHE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire/npu")));
+    let Some(cache_root) = cache_root else {
+        eprintln!(
+            "embeddinggemma NPU disabled: set HIPFIRE_EMBED_NPU_CACHE or HOME to locate caches"
+        );
+        return None;
+    };
+    match hipfire_arch_embeddinggemma::NpuOpusProjector::load_cached_for_batch(
+        hfq,
+        config,
+        &cache_root,
+        batch,
+    ) {
+        Ok(projector) => {
+            eprintln!(
+                "  embeddinggemma: resident NPU enabled, batch={batch}, cache={}",
+                cache_root.display()
+            );
+            Some(std::sync::Mutex::new(projector))
+        }
+        Err(error) => {
+            eprintln!(
+                "embeddinggemma NPU unavailable ({error}); serving will use the GPU fallback"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn load_embeddinggemma_gpu_fallback_weights(
+    primary_hfq: &mut HfqFile,
+    config: &hipfire_arch_embeddinggemma::EmbeddingGemmaConfig,
+    gpu: &mut hipfire_rdna::Gpu,
+    model_path: &Path,
+) -> Result<hipfire_arch_embeddinggemma::EmbeddingGemmaWeights, String> {
+    let override_path = std::env::var_os("HIPFIRE_EMBED_GPU_FALLBACK_MODEL").map(PathBuf::from);
+    let canonical_sibling = model_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| {
+            let (family, _) = name.split_once(".npu.")?;
+            Some(model_path.with_file_name(format!("{family}.bf16.hfq")))
+        });
+    let fallback_path = override_path.or(canonical_sibling);
+    let Some(fallback_path) = fallback_path else {
+        return hipfire_arch_embeddinggemma::EmbeddingGemmaWeights::load(primary_hfq, config, gpu);
+    };
+    if !fallback_path.is_file() {
+        return Err(format!(
+            "embeddinggemma NPU serving requires a GPU fallback model at {} (set HIPFIRE_EMBED_GPU_FALLBACK_MODEL)",
+            fallback_path.display()
+        ));
+    }
+    let mut fallback_hfq = HfqFile::open(&fallback_path)
+        .map_err(|error| format!("open EmbeddingGemma GPU fallback: {error}"))?;
+    let fallback_config =
+        hipfire_arch_embeddinggemma::config_from_metadata_json(&fallback_hfq.metadata_json)
+            .ok_or_else(|| "embeddinggemma GPU fallback has no valid config".to_string())?;
+    if fallback_config.hidden_size != config.hidden_size
+        || fallback_config.num_hidden_layers != config.num_hidden_layers
+        || fallback_config.num_attention_heads != config.num_attention_heads
+        || fallback_config.num_key_value_heads != config.num_key_value_heads
+        || fallback_config.intermediate_size != config.intermediate_size
+        || fallback_config.embedding_dim != config.embedding_dim
+    {
+        return Err(format!(
+            "embeddinggemma GPU fallback geometry does not match {}",
+            model_path.display()
+        ));
+    }
+    eprintln!(
+        "  embeddinggemma: GPU fallback weights={}",
+        fallback_path.display()
+    );
+    hipfire_arch_embeddinggemma::EmbeddingGemmaWeights::load(
+        &mut fallback_hfq,
+        &fallback_config,
+        gpu,
+    )
 }
 
 /// Load a model from a HuggingFace safetensors directory (ParoQuant, AWQ, etc.).

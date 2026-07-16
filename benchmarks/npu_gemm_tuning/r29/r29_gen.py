@@ -15,6 +15,9 @@ def _int_flag(flag, default):
 BATCH = _int_flag("--batch", 1)
 if BATCH < 1:
     raise SystemExit("--batch must be positive")
+QKV_WEIGHT_REUSE = "--qkv-weight-reuse" in sys.argv[1:]
+if QKV_WEIGHT_REUSE and BATCH != 2:
+    raise SystemExit("--qkv-weight-reuse currently requires --batch=2")
 
 ATTENTION = "--attention" in sys.argv[1:]
 OUTPUT_PROJECTION = "--output-projection" in sys.argv[1:]
@@ -31,6 +34,8 @@ if EXTERNAL_RESIDUAL and not RESIDUAL_NORM:
 if ROW_STATE_OUTPUT and not RESIDUAL_NORM:
     raise SystemExit("--row-state-output requires --residual-norm")
 PAIRED_QKV = "--paired-qkv" in sys.argv[1:] or RESIDUAL_NORM
+if QKV_WEIGHT_REUSE and not PAIRED_QKV:
+    raise SystemExit("--qkv-weight-reuse requires paired QKV")
 if PAIRED_QKV:
     DIRECT_OUTPUT = True
 if DIRECT_OUTPUT:
@@ -184,6 +189,11 @@ for col in range(COLS):
             out += [
                 f'    %accpair{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = "accpair{col}_{row}"}} : memref<{ACC_ELEMS}xf32>',
             ]
+            if QKV_WEIGHT_REUSE:
+                out += [
+                    f'    %accd1{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = "accd1{col}_{row}"}} : memref<{ACC_ELEMS}xf32>',
+                    f'    %accpaird1{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = "accpaird1{col}_{row}"}} : memref<{ACC_ELEMS}xf32>',
+                ]
         if ATTENTION and col % 2 == 1:
             out += [
                 f'    %attacc0{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = "attacc0{col}_{row}"}} : memref<{ATT_ACC}xf32>',
@@ -203,6 +213,10 @@ for col in range(COLS):
             for scratch in range(3):
                 out += [
                     f'    %rns{col}_{row}_{scratch} = aie.buffer(%c{col}_{row}) {{sym_name = "rns{col}_{row}_{scratch}"}} : memref<4096xi8>',
+                ]
+            if QKV_WEIGHT_REUSE:
+                out += [
+                    f'    %rnmeta{col}_{row} = aie.buffer(%c{col}_{row}) {{sym_name = "rnmeta{col}_{row}"}} : memref<64xi8>',
                 ]
 
 for col in range(COLS):
@@ -244,7 +258,7 @@ for col in range(COLS):
         f"    aie.objectfifo.link [{attention_producers}] -> [@osh{col}] ([{attention_offsets}] [])",
     ]
 
-if RESIDUAL_NORM:
+if RESIDUAL_NORM and not QKV_WEIGHT_REUSE:
     for col in range(0, COLS, 2):
         for row in range(ROWS):
             out.append(
@@ -390,7 +404,47 @@ for col in range(COLS):
         ]
         if PAIRED_QKV:
             lines += ["        scf.for %block = %z to %outblocks step %one {"]
-            if col % 2 == 1:
+            if col % 2 == 1 and QKV_WEIGHT_REUSE:
+                lines += acquire_w(col, "ppr", "          ")
+                lines += acquire_a(row, "ppd0", "          ")
+                lines += [
+                    f"          func.call @r33_w8_projection_group_pair(%appd0v, %wpprv, %acc{col}_{row}, %accpair{col}_{row}, %corecol, %h0) : (memref<{A_BLOCK}xi8>, memref<{PAIR_W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>, memref<{ACC_ELEMS}xf32>, i32, i32) -> ()",
+                    f"          aie.objectfifo.release @abc{row}(Consume, 1)",
+                ]
+                lines += acquire_a(row, "ppd1", "          ")
+                lines += [
+                    f"          func.call @r33_w8_projection_group_pair(%appd1v, %wpprv, %accd1{col}_{row}, %accpaird1{col}_{row}, %corecol, %h0) : (memref<{A_BLOCK}xi8>, memref<{PAIR_W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>, memref<{ACC_ELEMS}xf32>, i32, i32) -> ()",
+                    f"          aie.objectfifo.release @abc{row}(Consume, 1)",
+                    f"          aie.objectfifo.release @wbc{col}(Consume, 1)",
+                    "          scf.for %group = %one to %groups step %one {",
+                ]
+                lines += acquire_w(col, "ppar", "            ")
+                lines += acquire_a(row, "ppad0", "            ")
+                lines += [
+                    f"            func.call @r33_w8_projection_group_pair(%appad0v, %wpparv, %acc{col}_{row}, %accpair{col}_{row}, %corecol, %h1) : (memref<{A_BLOCK}xi8>, memref<{PAIR_W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>, memref<{ACC_ELEMS}xf32>, i32, i32) -> ()",
+                    f"            aie.objectfifo.release @abc{row}(Consume, 1)",
+                ]
+                lines += acquire_a(row, "ppad1", "            ")
+                lines += [
+                    f"            func.call @r33_w8_projection_group_pair(%appad1v, %wpparv, %accd1{col}_{row}, %accpaird1{col}_{row}, %corecol, %h1) : (memref<{A_BLOCK}xi8>, memref<{PAIR_W_BLOCK}xi8>, memref<{ACC_ELEMS}xf32>, memref<{ACC_ELEMS}xf32>, i32, i32) -> ()",
+                    f"            aie.objectfifo.release @abc{row}(Consume, 1)",
+                    f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
+                    "          }",
+                ]
+                for document, (acc, accpair) in enumerate(
+                    (
+                        (f"%acc{col}_{row}", f"%accpair{col}_{row}"),
+                        (f"%accd1{col}_{row}", f"%accpaird1{col}_{row}"),
+                    )
+                ):
+                    for lane, accumulator in enumerate((acc, accpair)):
+                        name = f"ppo{document}_{lane}"
+                        lines += acquire_out(col, row, name, "          ")
+                        lines += [
+                            f"          func.call @r29_w8_projection_finish({accumulator}, %{name}v) : (memref<{ACC_ELEMS}xf32>, memref<{OUT_TILE}xi8>) -> ()",
+                            f"          aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+                        ]
+            elif col % 2 == 1:
                 lines += acquire_a(row, "pp", "          ")
                 lines += acquire_w(col, "pp", "          ")
                 lines += [
@@ -419,16 +473,33 @@ for col in range(COLS):
                 ]
             else:
                 lines += ["          scf.for %group = %z to %groups step %one {"]
-                lines += acquire_a(row, "ppdrop", "            ")
+                if QKV_WEIGHT_REUSE:
+                    lines += acquire_a(row, "ppdrop0", "            ")
+                    lines += [
+                        f"            aie.objectfifo.release @abc{row}(Consume, 1)",
+                    ]
+                    lines += acquire_a(row, "ppdrop1", "            ")
+                else:
+                    lines += acquire_a(row, "ppdrop", "            ")
                 lines += [
                     f"            aie.objectfifo.release @abc{row}(Consume, 1)",
                     "          }",
                 ]
-            lines += ["        }", "        scf.for %qgroup = %z to %qgroups step %one {"]
+            lines += ["        }"]
+            if QKV_WEIGHT_REUSE:
+                lines += ["        scf.for %document = %z to %waves step %one {"]
+            lines += ["        scf.for %qgroup = %z to %qgroups step %one {"]
             for pair in range(COLS // 2):
                 name = f"q{pair}"
                 lines += acquire_a(row, name, "          ")
-                if col % 2 == 1 and col // 2 == pair:
+                if QKV_WEIGHT_REUSE and col // 2 == pair:
+                    lane = col % 2
+                    lines += acquire_out(col, row, "qpo", "          ")
+                    lines += [
+                        f"          func.call @r29_pack_q(%a{name}v, %qpov, {'%h0' if lane == 0 else '%h1'}) : (memref<{PAIR}xi8>, memref<{OUT_TILE}xi8>, i32) -> ()",
+                        f"          aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+                    ]
+                elif not QKV_WEIGHT_REUSE and col == 2 * pair + 1:
                     lines += acquire_out(col, row, "qpo0", "          ")
                     lines += [
                         f"          func.call @r29_pack_q(%a{name}v, %qpo0v, %h0) : (memref<{PAIR}xi8>, memref<{OUT_TILE}xi8>, i32) -> ()",
@@ -543,10 +614,14 @@ for col in range(COLS):
         elif ATTENTION:
             if DIRECT_OUTPUT:
                 if RESIDUAL_NORM:
-                    lines += [
-                        f"        %rnmeta = aie.objectfifo.acquire @rmc{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<64xi8>>",
-                        f"        %rnmetav = aie.objectfifo.subview.access %rnmeta[0] : !aie.objectfifosubview<memref<64xi8>> -> memref<64xi8>",
-                    ]
+                    if QKV_WEIGHT_REUSE:
+                        rnmeta = f"%rnmeta{col}_{row}"
+                    else:
+                        lines += [
+                            f"        %rnmeta = aie.objectfifo.acquire @rmc{col}_{row}(Produce, 1) : !aie.objectfifosubview<memref<64xi8>>",
+                            f"        %rnmetav = aie.objectfifo.subview.access %rnmeta[0] : !aie.objectfifosubview<memref<64xi8>> -> memref<64xi8>",
+                        ]
+                        rnmeta = "%rnmetav"
                 lines += [
                     "        scf.for %omwave = %z to %omwaves step %one {",
                     "          scf.for %ogroup = %z to %ogroups step %one {",
@@ -596,7 +671,7 @@ for col in range(COLS):
                         lines += [
                             "            %rnactive = arith.cmpi eq, %rnparam, %rnrow : index",
                             "            scf.if %rnactive {",
-                            f"              func.call @r34_post_residual_pre_ffn(%rns{col}_{row}_0, %rns{col}_{row}_1, %rns{col}_{row}_2, %wrnv, %oacc{col}_{row}_0, %oacc{col}_{row}_1, %rnmetav, %omwavei) : (memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>, memref<{O_ACC_ELEMS}xf32>, memref<{O_ACC_ELEMS}xf32>, memref<64xi8>, i32) -> ()",
+                            f"              func.call @r34_post_residual_pre_ffn(%rns{col}_{row}_0, %rns{col}_{row}_1, %rns{col}_{row}_2, %wrnv, %oacc{col}_{row}_0, %oacc{col}_{row}_1, {rnmeta}, %omwavei) : (memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>, memref<{O_ACC_ELEMS}xf32>, memref<{O_ACC_ELEMS}xf32>, memref<64xi8>, i32) -> ()",
                             "            }",
                             f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
                             "          }",
@@ -607,7 +682,7 @@ for col in range(COLS):
                         lines += [
                             "            %rnactive = arith.cmpi eq, %rnparam, %rnrow : index",
                             "            scf.if %rnactive {",
-                            f"              func.call @r34_post_residual_pre_ffn(%rns{col}_{row}_0, %rns{col}_{row}_1, %rns{col}_{row}_2, %wrnv, %rnmetav, %omwavei) : (memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>, memref<64xi8>, i32) -> ()",
+                            f"              func.call @r34_post_residual_pre_ffn(%rns{col}_{row}_0, %rns{col}_{row}_1, %rns{col}_{row}_2, %wrnv, {rnmeta}, %omwavei) : (memref<4096xi8>, memref<4096xi8>, memref<4096xi8>, memref<16384xi8>, memref<64xi8>, i32) -> ()",
                             "            }",
                             f"            aie.objectfifo.release @wbc{col}(Consume, 1)",
                             "          }",
@@ -621,10 +696,17 @@ for col in range(COLS):
                             f"            aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
                             "          }",
                         ]
-                    lines += [
-                        "        }",
-                        f"        aie.objectfifo.release @rmc{col}_{row}(Produce, 1)",
-                    ]
+                    lines += ["        }"]
+                    if QKV_WEIGHT_REUSE:
+                        lines += acquire_out(col, row, "rnmetao_direct", "        ")
+                        lines += [
+                            f"        func.call @r38_relay_pre_inverse({rnmeta}, %rnmetao_directv) : (memref<64xi8>, memref<{OUT_TILE}xi8>) -> ()",
+                            f"        aie.objectfifo.release @oc{col}_{row}(Produce, 1)",
+                        ]
+                    else:
+                        lines += [
+                            f"        aie.objectfifo.release @rmc{col}_{row}(Produce, 1)",
+                        ]
                 else:
                     lines += acquire_out(col, row, "opo", "            ")
                     lines += [
@@ -647,7 +729,7 @@ for col in range(COLS):
                     "          }",
                     "        }",
                 ]
-        if RESIDUAL_NORM and col % 2 == 1:
+        if RESIDUAL_NORM and col % 2 == 1 and not QKV_WEIGHT_REUSE:
             lines += [
                 f"        %rnmetai = aie.objectfifo.acquire @rmc{col - 1}_{row}(Consume, 1) : !aie.objectfifosubview<memref<64xi8>>",
                 f"        %rnmetaiv = aie.objectfifo.subview.access %rnmetai[0] : !aie.objectfifosubview<memref<64xi8>> -> memref<64xi8>",
@@ -688,6 +770,8 @@ for col in range(COLS):
                     f"          aie.objectfifo.release @abc{row}(Consume, 1)",
                     "        }",
                 ]
+        if QKV_WEIGHT_REUSE:
+            lines += ["        }"]
         lines += [
             "      }",
             "      aie.end",
@@ -790,18 +874,25 @@ def await_raw_inputs(stem):
 
 for group in range(QUERY_GROUPS):
     if PAIRED_QKV:
-        for source_col in range(1, COLS, 2):
-            for lane in range(2):
-                target_col = source_col - 1 + lane
-                offset = group * Q_JOIN + target_col * OUT_TILE
-                name = f"tqo{group}_{source_col}_{lane}"
-                out += [
-                    f"      %{name} = aiex.dma_configure_task_for @osh{source_col} {{",
-                    f"        aie.dma_bd(%Q : memref<{Q_BYTES}xi8>, {offset}, {ROWS * OUT_TILE}, {strided_dims(ROWS, QUERY_GROUPS * Q_JOIN, OUT_TILE)}) {{burst_length = 0 : i32}}",
-                    "        aie.end",
-                    "      } {issue_token = true}",
-                    f"      aiex.dma_start_task(%{name})",
-                ]
+        q_sources = (
+            [(source_col, source_col % 2, source_col) for source_col in range(COLS)]
+            if QKV_WEIGHT_REUSE
+            else [
+                (source_col, lane, source_col - 1 + lane)
+                for source_col in range(1, COLS, 2)
+                for lane in range(2)
+            ]
+        )
+        for source_col, lane, target_col in q_sources:
+            offset = group * Q_JOIN + target_col * OUT_TILE
+            name = f"tqo{group}_{source_col}_{lane}"
+            out += [
+                f"      %{name} = aiex.dma_configure_task_for @osh{source_col} {{",
+                f"        aie.dma_bd(%Q : memref<{Q_BYTES}xi8>, {offset}, {ROWS * OUT_TILE}, {strided_dims(ROWS, QUERY_GROUPS * Q_JOIN, OUT_TILE)}) {{burst_length = 0 : i32}}",
+                "        aie.end",
+                "      } {issue_token = true}",
+                f"      aiex.dma_start_task(%{name})",
+            ]
     else:
         for col in range(COLS):
             offset = group * Q_JOIN + col * OUT_TILE
@@ -817,10 +908,9 @@ for group in range(QUERY_GROUPS):
     emit_raw_inputs(role, half * 16, f"q{group}")
     await_raw_inputs(f"q{group}")
     if PAIRED_QKV:
-        for source_col in range(1, COLS, 2):
-            for lane in range(2):
-                name = f"tqo{group}_{source_col}_{lane}"
-                out += [f"      aiex.dma_await_task(%{name})", f"      aiex.dma_free_task(%{name})"]
+        for source_col, lane, _ in q_sources:
+            name = f"tqo{group}_{source_col}_{lane}"
+            out += [f"      aiex.dma_await_task(%{name})", f"      aiex.dma_free_task(%{name})"]
     else:
         for col in range(COLS):
             name = f"tqo{group}_{col}"
@@ -892,6 +982,7 @@ def await_direct_output_tasks(mwave, first_pair, pair_count):
 
 def start_norm_output_tasks(mwave):
     for active_col, col in enumerate(range(0, COLS, 2)):
+        deferred_metadata_task = []
         if mwave == O_M_WAVES - 1:
             name = f"trnm{col}"
             offset = (
@@ -907,15 +998,18 @@ def start_norm_output_tasks(mwave):
                 if ROW_STATE_OUTPUT
                 else f"[<size = {ROWS}, stride = {8 * 12288}>, <size = {O_M_WAVES}, stride = {4 * 12288}>, <size = 1024, stride = 1>]"
             )
-            out.extend(
-                [
-                    f"      %{name} = aiex.dma_configure_task_for @osh{col + 1} {{",
-                    f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {offset}, {2048 if ROW_STATE_OUTPUT else OUT_JOIN}, {metadata_dims}) {{burst_length = 0 : i32}}",
-                    "        aie.end",
-                    "      } {issue_token = true}",
-                    f"      aiex.dma_start_task(%{name})",
-                ]
-            )
+            metadata_col = col if QKV_WEIGHT_REUSE else col + 1
+            metadata_task = [
+                f"      %{name} = aiex.dma_configure_task_for @osh{metadata_col} {{",
+                f"        aie.dma_bd(%R : memref<{R_BYTES}xi8>, {offset}, {2048 if ROW_STATE_OUTPUT else OUT_JOIN}, {metadata_dims}) {{burst_length = 0 : i32}}",
+                "        aie.end",
+                "      } {issue_token = true}",
+                f"      aiex.dma_start_task(%{name})",
+            ]
+            if QKV_WEIGHT_REUSE:
+                deferred_metadata_task = metadata_task
+            else:
+                out.extend(metadata_task)
         for block in range(3):
             for half in range(2):
                 name = f"trno{mwave}_{col}_{block}_{half}"
@@ -939,6 +1033,7 @@ def start_norm_output_tasks(mwave):
                         f"      aiex.dma_start_task(%{name})",
                     ]
                 )
+        out.extend(deferred_metadata_task)
 
 
 def await_norm_output_tasks(mwave):
@@ -1315,6 +1410,76 @@ def _batch_runtime_sequence(lines):
         return line[: match.start()] + replacement + line[match.end() :]
 
     body = lines[sequence + 1 : close]
+    if QKV_WEIGHT_REUSE:
+        first_weight = next(
+            index for index, line in enumerate(body) if "%tw1 =" in line
+        )
+        first_projection = next(
+            index for index, line in enumerate(body) if "%tpo0_1_0 =" in line
+        )
+        first_projection_free = next(
+            index
+            for index, line in enumerate(body)
+            if "aiex.dma_free_task(%ta0)" in line
+        )
+        first_downstream = next(
+            index for index, line in enumerate(body) if "%tqo0_0_0 =" in line
+        )
+
+        batched_body = []
+        # R130's input ABI stores each row stripe in
+        # block -> K-group -> document order so one immutable weight FIFO
+        # object remains acquired while both documents consume it.
+        activation_size = BATCH * A_BYTES
+        activation_records = BATCH * INBLOCKS
+        for row in range(ROWS):
+            offset = BATCH * COMPLETED_BYTES + row * activation_records * A_BLOCK
+            batched_body += [
+                f"      %ta{row} = aiex.dma_configure_task_for @ash{row} {{",
+                f"        aie.dma_bd(%A : memref<{activation_size}xi8>, {offset}, {activation_records * A_BLOCK}, {dims(activation_records, A_BLOCK)}) {{burst_length = 0 : i32}}",
+                "        aie.end",
+                "      }",
+                f"      aiex.dma_start_task(%ta{row})",
+            ]
+        batched_body += body[first_weight:first_projection]
+
+        configure = re.compile(r"%(t[A-Za-z0-9_]*) = aiex\.dma_configure_task_for")
+
+        def relocate_block(block, document):
+            relocated = []
+            current_task = ""
+            for line in block:
+                configured = configure.search(line)
+                if configured is not None:
+                    current_task = configured.group(1)
+                relocated.append(relocate(line, document, current_task))
+            return relocated
+
+        for outblock in range(OUTBLOCKS):
+            start = next(
+                index
+                for index in range(first_projection, first_projection_free)
+                if f"%tpo{outblock}_1_0 =" in body[index]
+            )
+            if outblock + 1 < OUTBLOCKS:
+                end = next(
+                    index
+                    for index in range(start + 1, first_projection_free)
+                    if f"%tpo{outblock + 1}_1_0 =" in body[index]
+                )
+            else:
+                end = first_projection_free
+            block = body[start:end]
+            for document in range(BATCH):
+                batched_body += relocate_block(block, document)
+
+        # The activation and weight tasks are shared by both documents.
+        batched_body += body[first_projection_free:first_downstream]
+        downstream = body[first_downstream:]
+        for document in range(BATCH):
+            batched_body += relocate_block(downstream, document)
+        return lines[:sequence] + [signature] + batched_body + lines[close:]
+
     batched_body = []
     configure = re.compile(r"%(t[A-Za-z0-9_]*) = aiex\.dma_configure_task_for")
     for document in range(BATCH):

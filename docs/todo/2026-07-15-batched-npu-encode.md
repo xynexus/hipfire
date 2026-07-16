@@ -459,3 +459,67 @@ driven by weight/dataflow reuse, not descriptor replication alone. Durable rows:
 `benchmarks/npu_gemm_tuning/results/r127-fused-segmented-attention-20260715.csv`
 and
 `benchmarks/npu_gemm_tuning/results/r128-full-batched-encode-20260715.csv`.
+
+## R129 — projection weight reuse is correct and sublinear (2026-07-16)
+
+The R121 staged-full-K OQ8 projection now has explicit B2/M512 and B4/M1024
+forms. Compact activations are private per document, while each N32 immutable
+weight record is acquired once and applied to every document before release.
+The N1280 weight payload remains one 7,987,200-byte argument and one DMA pass;
+B1 generation is byte-identical.
+
+Distinct documents are bit-exact against separate fresh R121 M256 hardware
+oracles, doc0 survives a last-document replacement unchanged, and three fresh
+plus twenty reused contexts pass. B2's retained paired gains are
+1.2532x/1.2735x/1.2681x. B4 fits but has a 1.2564x median paired gain. The
+approximately 1.5x target is therefore not met.
+
+Two deeper reuse attempts bound the remaining local optimization. Keeping
+eight MMUL accumulators live fails parity at cosine 0.993069742; using two N16
+passes is bit-exact but reloads activations and measures only 1.2596x. R129
+proves useful FIFO/DRAM reuse, but dense MAC execution remains row-linear. The
+normal serving path now resolves NPU batch/cache state once at load and keeps a
+long-lived projector, with GPU/sequential fallback for unavailable caches,
+unsupported segments, poisoned state, or runtime errors. The fused R108
+follow-up and its concrete limit are recorded as R130 below; larger-batch claims
+remain closed.
+
+Durable rows:
+`benchmarks/npu_gemm_tuning/results/r129-staged-fullk-batched-weight-reuse-20260716.csv`.
+
+## R130/R131 — fused boundary characterized; serving path complete (2026-07-16)
+
+R130 tried the smallest fused R108 transplant of R129: one paired QKV weight
+acquire applied to two document-private accumulator pairs. The direct graph
+fails AIE2P CDO generation because the odd-core ELF grows to 16,876 bytes.
+Moving all Q packing to even cores moves the overflow. Splitting Q packing and
+inverse relay across the pair compiles, but distinct-document hardware parity
+returns an all-zero X/inverse state. Neither corrected FIFO drain order nor an
+explicit record-interleaved input ABI changes that result. The failed topology
+and its exact compiler/hardware evidence are preserved in `r130/` and
+`results/r130-fused-qkv-weight-reuse-20260716.csv`; it is not promoted.
+
+The production projector selects the admitted R129 batched projection primitive
+for non-fused B2 QKV work. The complete supported M512 path deliberately
+continues to prefer the admitted R128 segmented resident encoder because R130
+could not be promoted. Serving resolves batch/cache/fallback state once during
+model load and keeps the projector in `EmbeddingGemmaState`. Supported
+`[0,256,512]` input uses one segmented encode; short or otherwise unsupported
+layouts, unavailable caches, poisoned state, or runtime errors fall back safely
+to the geometry-matched GPU model. Consequently, the full-encoder timings below
+are production batching evidence, not an attribution of their gain to R129.
+
+Real daemon JSONL evidence for two distinct M256 documents:
+
+- B2 versus independent B1: cosine 0.999998624/0.999998523, maximum absolute
+  error 0.000380270/0.000389665;
+- sequential B1 totals: 1683.955/1632.666/1625.189 ms;
+- segmented B2 totals: 1345.645/1282.725/1297.020 ms;
+- primed median: 1628.928 versus 1289.873 ms, a 1.2629x throughput gain;
+- unsupported short B2: two unit-normalized 128-D embeddings through fallback.
+
+Durable serving rows are in
+`benchmarks/npu_gemm_tuning/results/r131-serving-batched-npu-20260716.csv`.
+B1 remains on the unchanged R108/R121 artifacts, B4 is validated only for the
+R129 projection boundary, and no B32/B128 capacity or performance claim is
+made.

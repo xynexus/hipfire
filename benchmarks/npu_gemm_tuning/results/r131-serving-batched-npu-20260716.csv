@@ -1,0 +1,10 @@
+date,host,arch,model,protocol,mode,documents,rows,runs,command_ms,ms_per_document,tokens_per_second,cosine_vs_separate_b1,max_abs_vs_separate_b1,status,notes
+2026-07-16,halo,AIE2P+gfx1151,EmbeddingGemma-300M.npu.oq8.hfq,"hipfire daemon JSONL",B1-sequential,2,512,1,1683.955,841.9775,304.047,,,pass,"two separate 256-token daemon commands; resident batch=1"
+2026-07-16,halo,AIE2P+gfx1151,EmbeddingGemma-300M.npu.oq8.hfq,"hipfire daemon JSONL",B1-sequential,2,512,1,1632.666,816.3330,313.598,,,pass,"two separate 256-token daemon commands; resident batch=1"
+2026-07-16,halo,AIE2P+gfx1151,EmbeddingGemma-300M.npu.oq8.hfq,"hipfire daemon JSONL",B1-sequential,2,512,1,1625.189,812.5945,315.040,,,pass,"two separate 256-token daemon commands; resident batch=1"
+2026-07-16,halo,AIE2P+gfx1151,EmbeddingGemma-300M.npu.oq8.hfq,"hipfire daemon JSONL",B2-segmented,2,512,1,1345.645,672.8225,380.487,,,pass,"one [0,256,512] segmented encode; resident batch=2"
+2026-07-16,halo,AIE2P+gfx1151,EmbeddingGemma-300M.npu.oq8.hfq,"hipfire daemon JSONL",B2-segmented,2,512,1,1282.725,641.3625,399.151,,,pass,"one [0,256,512] segmented encode; resident batch=2"
+2026-07-16,halo,AIE2P+gfx1151,EmbeddingGemma-300M.npu.oq8.hfq,"hipfire daemon JSONL",B2-segmented,2,512,1,1297.020,648.5100,394.751,,,pass,"one [0,256,512] segmented encode; resident batch=2"
+2026-07-16,halo,AIE2P+gfx1151,EmbeddingGemma-300M.npu.oq8.hfq,"hipfire daemon JSONL",B2-vs-B1-doc0,1,256,1,,,,0.999998624,0.000380270,pass,"B2 document 0 versus independent resident B1 daemon output"
+2026-07-16,halo,AIE2P+gfx1151,EmbeddingGemma-300M.npu.oq8.hfq,"hipfire daemon JSONL",B2-vs-B1-doc1,1,256,1,,,,0.999998523,0.000389665,pass,"B2 document 1 versus independent resident B1 daemon output"
+2026-07-16,halo,AIE2P+gfx1151,EmbeddingGemma-300M.npu.oq8.hfq,"hipfire daemon JSONL",unsupported-shape-fallback,2,10,1,,,,,,pass,"two short documents bypass resident geometry and complete through GPU/sequential fallback; two unit-normalized 128-d embeddings"

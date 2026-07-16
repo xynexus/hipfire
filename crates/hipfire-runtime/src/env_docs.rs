@@ -1251,7 +1251,7 @@ pub const ENV_HIPFIRE_DRAFT_SUBPHASE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DSPARK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DSPARK",
     description: "Disabled when set to 0",
-    source: "crates/hipfire-serving-core/src/load.rs:3429",
+    source: "crates/hipfire-serving-core/src/load.rs:3544",
 };
 
 /// `HIPFIRE_DSPARK_ADAPTIVE_BLOCK` — Default-on; HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0 opts out (fixed block == today)
@@ -1419,14 +1419,14 @@ pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_FFN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER",
     description: "Runtime variable controlling embed compare resident layer in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:3761",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:3766",
 };
 
 /// `HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX` — Parses "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX" with fallback defaults
 pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX",
     description: "Parses \"HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX\" with fallback defaults",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:3762",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:3767",
 };
 
 /// `HIPFIRE_EMBED_E2E_TOKENS` — Runtime variable controlling embed e2e tokens in hipfire
@@ -1436,11 +1436,25 @@ pub const ENV_HIPFIRE_EMBED_E2E_TOKENS: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-embeddinggemma/examples/embed_e2e_npu_opus.rs:76",
 };
 
+/// `HIPFIRE_EMBED_GPU_FALLBACK_MODEL` — Runtime variable controlling embed gpu fallback model in hipfire
+pub const ENV_HIPFIRE_EMBED_GPU_FALLBACK_MODEL: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_EMBED_GPU_FALLBACK_MODEL",
+    description: "Runtime variable controlling embed gpu fallback model in hipfire",
+    source: "crates/hipfire-serving-core/src/load.rs:2422",
+};
+
 /// `HIPFIRE_EMBED_NPU_BATCH` — Runtime variable controlling embed npu batch in hipfire
 pub const ENV_HIPFIRE_EMBED_NPU_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_NPU_BATCH",
     description: "Runtime variable controlling embed npu batch in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:536",
+    source: "crates/hipfire-serving-core/src/load.rs:2374",
+};
+
+/// `HIPFIRE_EMBED_NPU_CACHE` — Runtime variable controlling embed npu cache in hipfire
+pub const ENV_HIPFIRE_EMBED_NPU_CACHE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_EMBED_NPU_CACHE",
+    description: "Runtime variable controlling embed npu cache in hipfire",
+    source: "crates/hipfire-serving-core/src/load.rs:2384",
 };
 
 /// `HIPFIRE_EMBED_PROFILE` — Runtime variable controlling embed profile in hipfire
@@ -1461,42 +1475,42 @@ pub const ENV_HIPFIRE_EMBED_REFERENCE_MODEL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_RESIDENT_ATTENTION_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_ATTENTION_CACHE",
     description: "Runtime variable controlling embed resident attention cache in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:1147",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:1152",
 };
 
 /// `HIPFIRE_EMBED_RESIDENT_FFN_CACHE` — Runtime variable controlling embed resident ffn cache in hipfire
 pub const ENV_HIPFIRE_EMBED_RESIDENT_FFN_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_FFN_CACHE",
     description: "Runtime variable controlling embed resident ffn cache in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:987",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:992",
 };
 
 /// `HIPFIRE_EMBED_RESIDENT_LAYER` — Runtime variable controlling embed resident layer in hipfire
 pub const ENV_HIPFIRE_EMBED_RESIDENT_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_LAYER",
     description: "Runtime variable controlling embed resident layer in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:843",
+    source: "crates/hipfire-serving-core/src/load.rs:2370",
 };
 
 /// `HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT` — Parses "HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT" with fallback defaults
 pub const ENV_HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT",
     description: "Parses \"HIPFIRE_EMBED_RESIDENT_LAYER_LIMIT\" with fallback defaults",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2778",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2783",
 };
 
 /// `HIPFIRE_EMBED_RESIDENT_NEXT_PREP_CACHE` — Runtime variable controlling embed resident next prep cache in hipfire
 pub const ENV_HIPFIRE_EMBED_RESIDENT_NEXT_PREP_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_NEXT_PREP_CACHE",
     description: "Runtime variable controlling embed resident next prep cache in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:1221",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:1226",
 };
 
 /// `HIPFIRE_EMBED_RESIDENT_TAIL_CACHE` — Runtime variable controlling embed resident tail cache in hipfire
 pub const ENV_HIPFIRE_EMBED_RESIDENT_TAIL_CACHE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_TAIL_CACHE",
     description: "Runtime variable controlling embed resident tail cache in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:1208",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:1213",
 };
 
 /// `HIPFIRE_EMBED_TRACE_PHASES` — Runtime variable controlling embed trace phases in hipfire
@@ -1510,14 +1524,14 @@ pub const ENV_HIPFIRE_EMBED_TRACE_PHASES: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_EMBED_TRACE_RESIDENT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_TRACE_RESIDENT",
     description: "Runtime variable controlling embed trace resident in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2767",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:2772",
 };
 
 /// `HIPFIRE_EMBED_UNIT_RMS_BRIDGE` — Runtime variable controlling embed unit rms bridge in hipfire
 pub const ENV_HIPFIRE_EMBED_UNIT_RMS_BRIDGE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_UNIT_RMS_BRIDGE",
     description: "Runtime variable controlling embed unit rms bridge in hipfire",
-    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:984",
+    source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:989",
 };
 
 /// `HIPFIRE_EMIT_TOKEN_IDS` — or "\" in it would corrupt the line, breaking the client's JSONL
@@ -3086,7 +3100,7 @@ pub const ENV_HIPFIRE_PFLASH_SCORE_LAYER: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PP_DFLASH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_DFLASH",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-daemon/src/main.rs:3598",
+    source: "crates/hipfire-daemon/src/main.rs:3592",
 };
 
 /// `HIPFIRE_PP_LAYERS` — HIPFIRE_PP_LAYERS="a,b,..." overrides uniform split. Length must equal
@@ -3107,7 +3121,7 @@ pub const ENV_HIPFIRE_PP_PARITY_MODEL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PP_PFLASH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_PFLASH",
     description: "Environment toggle value controls runtime behavior",
-    source: "crates/hipfire-daemon/src/main.rs:3616",
+    source: "crates/hipfire-daemon/src/main.rs:3610",
 };
 
 /// `HIPFIRE_PREFILL_ALPHA` — Runtime variable controlling prefill alpha in hipfire
@@ -3614,7 +3628,7 @@ pub const ENV_HIPFIRE_QWEN35_XDNA1_XCLBIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD",
     description: "conf_threshold ladder: env > 0.1 default (source's sweep-tuned default)",
-    source: "crates/hipfire-serving-core/src/load.rs:3492",
+    source: "crates/hipfire-serving-core/src/load.rs:3607",
 };
 
 /// `HIPFIRE_R116_UNIT_SCALES` — Runtime variable controlling r116 unit scales in hipfire
@@ -4852,7 +4866,9 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER,
     ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_LAYER_INDEX,
     ENV_HIPFIRE_EMBED_E2E_TOKENS,
+    ENV_HIPFIRE_EMBED_GPU_FALLBACK_MODEL,
     ENV_HIPFIRE_EMBED_NPU_BATCH,
+    ENV_HIPFIRE_EMBED_NPU_CACHE,
     ENV_HIPFIRE_EMBED_PROFILE,
     ENV_HIPFIRE_EMBED_REFERENCE_MODEL,
     ENV_HIPFIRE_EMBED_RESIDENT_ATTENTION_CACHE,

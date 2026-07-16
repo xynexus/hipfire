@@ -727,8 +727,13 @@ impl NpuOpusProjector {
                 }
             }
         }
-        let staged_qkv_path =
-            cache_root.join("embgemma_r121_r113_staged_fullk_n1280_repeat_output_m256_k768");
+        let staged_qkv_path = if resident_batch == 1 {
+            cache_root.join("embgemma_r121_r113_staged_fullk_n1280_repeat_output_m256_k768")
+        } else {
+            cache_root.join(format!(
+                "embgemma_r129_r121_staged_fullk_weight_reuse_m{resident_rows}_k768_n1280"
+            ))
+        };
         let staged_qkv_compatible = cfg.hidden_size == 768
             && q_dim + 2 * kv_dim == 1280
             && (0..cfg.num_hidden_layers).all(|layer_idx| {

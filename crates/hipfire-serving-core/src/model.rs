@@ -143,6 +143,8 @@ pub struct DsparkState {
 pub struct EmbeddingGemmaState {
     pub config: embeddinggemma::EmbeddingGemmaConfig,
     pub weights: embeddinggemma::EmbeddingGemmaWeights,
+    #[cfg(target_os = "linux")]
+    pub npu_projector: Option<std::sync::Mutex<embeddinggemma::NpuOpusProjector>>,
 }
 
 /// Optional LFM2 DFlash speculative-decoding state. LFM2 has no DeltaNet

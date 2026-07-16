@@ -151,13 +151,7 @@ fn embeddinggemma_encode_prefixed(
         })
         .collect::<Vec<_>>();
     let dims = state.config.resolve_dims(dims);
-    hipfire_serving_core::pooling::embed_batch_embeddinggemma(
-        gpu,
-        &state.weights,
-        &state.config,
-        &tokenized,
-        dims,
-    )
+    hipfire_serving_core::pooling::embed_batch_embeddinggemma(gpu, state, &tokenized, dims)
 }
 
 fn embeddinggemma_embed(

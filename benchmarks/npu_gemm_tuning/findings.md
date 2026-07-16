@@ -1161,3 +1161,61 @@ is admitted, but descriptor replication does not realize the original
 fixed-floor estimate; further scaling needs actual weight/dataflow reuse. See
 `results/r127-fused-segmented-attention-20260715.csv` and
 `results/r128-full-batched-encode-20260715.csv`.
+
+## 2026-07-16 R129 single-copy staged-full-K projection batching
+
+R129 stages a compact 6,336-byte full-K activation image per document on every
+core. Each 8,320-byte N32 immutable weight record is acquired once, applied to
+all staged documents, and released. The N1280 weight argument remains one
+7,987,200-byte payload and one DMA pass; activation and output storage scale
+with batch. B1 generation remains byte-identical to R121.
+
+Distinct B2 and B4 documents are bit-exact against separately recreated R121
+M256 hardware references. Replacing the final document leaves doc0 bit-exact,
+and three fresh contexts plus twenty reused commands pass. B2 traffic is
+7,987,200 weight, 1,179,648 activation, and 2,621,440 output bytes; B4 retains
+the weight bytes and scales activation/output to 2,359,296/5,242,880.
+
+The final joined-output wrapper has a 1.2681x median paired B2 row-throughput
+gain across three retained runs. B4 fits local memory and descriptors, but its
+median paired gain is only 1.2564x. An eight-accumulator tile-local reuse kernel
+failed parity (cosine 0.993069742, 81,851 doc0 mismatches). Splitting N32 into
+two N16 passes restored bit-exact output but reloaded activations and measured
+only 1.2596x. These bounded variants demonstrate that external/FIFO weight
+reuse is material while dense MAC work remains row-linear; they do not justify
+larger-batch claims or the original approximately 1.5x target.
+
+Durable rows:
+`results/r129-staged-fullk-batched-weight-reuse-20260716.csv`.
+
+## 2026-07-16 R130 fused QKV reuse rejection and serving admission
+
+R130 attempted the direct R129 topology inside R108: two accumulator pairs on
+each odd core, record-interleaved document activations, and one acquire of each
+paired QKV weight object. The natural image lowers its four-dimensional shim
+descriptor but produces a 16,876-byte odd-core ELF and fails CDO generation
+with `Overflow of program memory`. R108 is already at the AIE2P program-store
+edge.
+
+A bounded code-balance variant moved inverse relay to the even core and split Q
+packing between each even/odd pair. It compiles at 16,236/16,368 text bytes, but
+hardware returns an all-zero completed state against distinct independent R108
+M256 references (`x_cosine=NaN`, `x_max=3.5781250`; inverse max 1.2935559).
+Correcting norm/metadata drain order and replacing the shim transpose with an
+explicit record-interleaved input ABI did not change the result. R130 is
+rejected; R128 remains the fused layer and R129 remains the admitted standalone
+weight-reuse primitive. See `results/r130-fused-qkv-weight-reuse-20260716.csv`.
+
+Normal daemon serving now resolves NPU batch and cache paths once at model load,
+keeps one long-lived projector, and requires a geometry-compatible BF16 GPU
+fallback artifact. The projector selects R129 for a non-fused B2 QKV projection,
+while the complete supported M512 encoder path continues to prefer the admitted
+R128 resident layer; R131 therefore is serving-admission evidence, not a claim
+that R130 fused reuse was promoted. With B2, two distinct 256-token documents
+match independent B1 daemon outputs at cosine 0.999998624/0.999998523 and max error
+0.000380270/0.000389665. Three commands measure 1683.955/1632.666/1625.189 ms
+for two sequential B1 requests and 1345.645/1282.725/1297.020 ms for one
+segmented B2 request. Primed medians are 1628.928 versus 1289.873 ms, a 1.2629x
+document-throughput gain (314.3 versus 397.0 tokens/s). Short unsupported
+segments complete through the GPU/sequential fallback. See
+`results/r131-serving-batched-npu-20260716.csv`.

@@ -18,8 +18,10 @@
 //! Matryoshka truncation ([`truncate_and_renormalize`]) and cosine reranking
 //! ([`rank_by_cosine`]) are pure and unit-tested here.
 
-use hipfire_arch_embeddinggemma::{embed_forward, EmbeddingGemmaConfig, EmbeddingGemmaWeights};
+use hipfire_arch_embeddinggemma::embed_forward;
 use hipfire_rdna::Gpu;
+
+use crate::model::EmbeddingGemmaState;
 
 /// Encode a batch of already-tokenized texts with the embeddinggemma encoder,
 /// returning one L2-normalized embedding per text, truncated+renormalized to
@@ -27,14 +29,40 @@ use hipfire_rdna::Gpu;
 /// pass `cfg.resolve_dims(requested)`.
 pub fn embed_batch_embeddinggemma(
     gpu: &mut Gpu,
-    weights: &EmbeddingGemmaWeights,
-    cfg: &EmbeddingGemmaConfig,
+    state: &EmbeddingGemmaState,
     tokenized: &[Vec<u32>],
     dims: usize,
 ) -> Result<Vec<Vec<f32>>, String> {
+    #[cfg(target_os = "linux")]
+    if let Some(projector) = state.npu_projector.as_ref() {
+        match projector.lock() {
+            Ok(mut projector) => {
+                match hipfire_arch_embeddinggemma::embed_batch_forward_with_projector(
+                    gpu,
+                    &state.weights,
+                    &state.config,
+                    tokenized,
+                    &mut *projector,
+                ) {
+                    Ok(mut embeddings) => {
+                        embeddings
+                            .iter_mut()
+                            .for_each(|embedding| truncate_and_renormalize(embedding, dims));
+                        return Ok(embeddings);
+                    }
+                    Err(error) => eprintln!(
+                        "embeddinggemma resident NPU encode failed ({error}); retrying on GPU"
+                    ),
+                }
+            }
+            Err(_) => {
+                eprintln!("embeddinggemma resident NPU state is poisoned; retrying encode on GPU")
+            }
+        }
+    }
     let mut out = Vec::with_capacity(tokenized.len());
     for tokens in tokenized {
-        let mut v = embed_forward(gpu, weights, cfg, tokens)?;
+        let mut v = embed_forward(gpu, &state.weights, &state.config, tokens)?;
         truncate_and_renormalize(&mut v, dims);
         out.push(v);
     }

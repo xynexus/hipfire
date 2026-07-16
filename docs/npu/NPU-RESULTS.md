@@ -1313,3 +1313,64 @@ Durable rows:
 `benchmarks/npu_gemm_tuning/results/r127-fused-segmented-attention-20260715.csv`
 and
 `benchmarks/npu_gemm_tuning/results/r128-full-batched-encode-20260715.csv`.
+
+## R129 — staged-full-K weight reuse across documents (2026-07-16)
+
+R129 extends R121 from M256 to explicit B2/M512 and B4/M1024 schedules. Every
+core stages one compact full-K activation image per document, acquires each N32
+weight record once, applies it to every document, and then releases it. The
+N1280 immutable payload stays single-copy at 7,987,200 bytes with one DMA pass.
+B1 MLIR remains byte-identical to R121.
+
+Both batch sizes compile and are hardware-correct. Deliberately distinct
+documents match separately recreated M256 R121 contexts bit-for-bit; changing
+the last document never changes doc0. Three fresh contexts and twenty reused
+commands pass. B2 activation/output traffic is 1,179,648/2,621,440 bytes and B4
+traffic is 2,359,296/5,242,880 bytes.
+
+The performance target is missed but the reuse is measurably sublinear. Three
+final B2 paired runs give 1.2532x, 1.2735x, and 1.2681x row-throughput gains.
+B4's median paired gain is 1.2564x. Deeper tile-local reuse with eight live
+accumulators fails parity; a correct four-accumulator, two-pass form falls to
+1.2596x because it reloads activations. Promote only the proven B2/B4 geometry
+and fallback contracts; do not infer B32/B128 performance or capacity.
+
+Durable rows:
+`benchmarks/npu_gemm_tuning/results/r129-staged-fullk-batched-weight-reuse-20260716.csv`.
+
+## R130/R131 — fused reuse boundary and production serving (2026-07-16)
+
+The R129 acquire-once topology was transplanted into R108 with two QKV
+accumulator pairs and block/group/document activation ordering. The direct
+form exceeds AIE2P program memory: its odd-core ELF is 16,876 bytes and CDO
+generation fails. Balancing Q packing and inverse relay across even/odd cores
+fits at 16,236/16,368 bytes, but the resulting hardware image emits an all-zero
+completed state. Two follow-up corrections—norm outputs before inverse metadata,
+and an explicit record-interleaved activation ABI—retain the failure. This is a
+concrete fused-image boundary, not an admitted performance result; R130 is never
+selected by the runtime. Durable rejection rows are in
+`benchmarks/npu_gemm_tuning/results/r130-fused-qkv-weight-reuse-20260716.csv`.
+
+The admitted serving configuration is startup-resolved and typed. Set
+`HIPFIRE_EMBED_RESIDENT_LAYER=1`, `HIPFIRE_EMBED_NPU_BATCH=2`, and optionally
+`HIPFIRE_EMBED_NPU_CACHE`; the loader constructs one long-lived projector and
+checks attention, FFN, tail, and next-prep geometry. It loads an explicit
+`HIPFIRE_EMBED_GPU_FALLBACK_MODEL` or the canonical sibling BF16 artifact and
+uses that path for missing caches, unsupported segment shapes, poisoned state,
+or NPU execution errors.
+
+The projector selects R129 when the non-fused B2 QKV projection is used. When
+the complete M512 resident layer is available, `project_layer` deliberately
+prefers the admitted R128 fused encoder. The full-encoder serving numbers below
+therefore validate production batching and fallback, but are not attributed to
+R129 or to the rejected R130 fused topology.
+
+On `halo`, one daemon JSONL M512 request with two distinct M256 documents
+matches separate B1 daemon requests at minimum cosine 0.999998523 and maximum
+absolute error 0.000389665. Three B1 two-command totals are
+1683.955/1632.666/1625.189 ms; B2 one-command totals are
+1345.645/1282.725/1297.020 ms. The primed median improves from 1628.928 to
+1289.873 ms, or 1.2629x document throughput (approximately 314.3 to 397.0
+tokens/s). A two-short-document request returns two unit-normalized 128-D
+embeddings through fallback. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r131-serving-batched-npu-20260716.csv`.

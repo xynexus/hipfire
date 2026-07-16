@@ -102,6 +102,7 @@ pub struct NpuEmbeddingLayerAttentionDenseW8 {
     row_state_output: bool,
     external_residual: bool,
     direct_completed_residual: bool,
+    qkv_weight_reuse: bool,
     activation_offset: usize,
     input_bytes: usize,
     batch: usize,
@@ -153,6 +154,14 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         }
         let batch = rows / M;
         let direct_completed_residual = manifest_uses_direct_completed_residual(&manifest);
+        let qkv_weight_reuse = manifest
+            .lines()
+            .any(|line| line == "qkv-projection=two-document-weight-reuse");
+        if qkv_weight_reuse && batch != 2 {
+            return Err(invalid(
+                "resident QKV weight reuse currently requires exactly two documents",
+            ));
+        }
         if batch > 1
             && (!direct_completed_residual
                 || !manifest
@@ -260,6 +269,7 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
             row_state_output,
             external_residual,
             direct_completed_residual,
+            qkv_weight_reuse,
             activation_offset,
             input_bytes,
             batch,
@@ -535,13 +545,7 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         {
             return Err(invalid("resident layer template size mismatch"));
         }
-        for document in 0..self.batch {
-            let start = self.activation_offset + document * INPUT_BYTES;
-            copy_paired_weight_scales(
-                &mut self.input.as_mut_slice()[start..start + INPUT_BYTES],
-                &weights.input_template,
-            );
-        }
+        self.restore_activation_templates(&weights.input_template);
         self.restore_hidden(weights)?;
         if self.external_residual {
             self.kernel
@@ -560,20 +564,54 @@ impl NpuEmbeddingLayerAttentionDenseW8 {
         if packed.len() != self.loaded_activation_bytes() {
             return Err(invalid("resident layer prepacked input size mismatch"));
         }
-        self.input.as_mut_slice()[self.activation_offset..self.activation_offset + packed.len()]
-            .copy_from_slice(packed);
-        for document in 0..self.batch {
-            let start = self.activation_offset + document * INPUT_BYTES;
-            copy_paired_weight_scales(
-                &mut self.input.as_mut_slice()[start..start + INPUT_BYTES],
-                &weights.input_template,
-            );
+        if self.qkv_weight_reuse {
+            for row in 0..CORE_ROWS {
+                for record in 0..QKV_BLOCKS_PER_STRIPE {
+                    for document in 0..self.batch {
+                        let source_record =
+                            (document * CORE_ROWS + row) * QKV_BLOCKS_PER_STRIPE + record;
+                        let target_record =
+                            (row * QKV_BLOCKS_PER_STRIPE + record) * self.batch + document;
+                        let source = source_record * BLOCK;
+                        let target = self.activation_offset + target_record * BLOCK;
+                        self.input.as_mut_slice()[target..target + BLOCK]
+                            .copy_from_slice(&packed[source..source + BLOCK]);
+                    }
+                }
+            }
+        } else {
+            self.input.as_mut_slice()
+                [self.activation_offset..self.activation_offset + packed.len()]
+                .copy_from_slice(packed);
         }
+        self.restore_activation_templates(&weights.input_template);
         if self.external_residual {
             self.kernel
                 .sync_to_device_prefix(&self.input, self.input_bytes)
         } else {
             self.kernel.sync_to_device(&self.input)
+        }
+    }
+
+    fn restore_activation_templates(&mut self, template: &[u8]) {
+        for row in 0..CORE_ROWS {
+            for record in 0..QKV_BLOCKS_PER_STRIPE {
+                for document in 0..self.batch {
+                    let source = (row * QKV_BLOCKS_PER_STRIPE + record) * BLOCK;
+                    let target_record = if self.qkv_weight_reuse {
+                        (row * QKV_BLOCKS_PER_STRIPE + record) * self.batch + document
+                    } else {
+                        (document * CORE_ROWS + row) * QKV_BLOCKS_PER_STRIPE + record
+                    };
+                    let target = self.activation_offset + target_record * BLOCK;
+                    self.input.as_mut_slice()[target + PAIRED_SCALE_BASE
+                        ..target + PAIRED_SCALE_BASE + COLS * SCALE_BYTES]
+                        .copy_from_slice(
+                            &template[source + PAIRED_SCALE_BASE
+                                ..source + PAIRED_SCALE_BASE + COLS * SCALE_BYTES],
+                        );
+                }
+            }
         }
     }
 
@@ -876,6 +914,7 @@ fn prepacked_source_sha256(
     r34_prepacked::sha256_parts(&[&source])
 }
 
+#[cfg(test)]
 fn copy_paired_weight_scales(destination: &mut [u8], template: &[u8]) {
     for row_stripe in 0..CORE_ROWS {
         for block in 0..QKV_BLOCKS_PER_STRIPE {
