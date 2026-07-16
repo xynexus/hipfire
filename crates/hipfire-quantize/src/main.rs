@@ -45,12 +45,12 @@ pub use hipfire_quantize::{codecs, fixture, gptq, hessian_io, hfhs_diag, ldlq, q
 // GGUF import pipeline (owned by hipfire-coexistence) can produce byte-identical
 // artifacts through the same code path the native quantizer uses.
 use hipfire_quantize::hfq_out::{
-    insert_parameter_counts_metadata, metadata_with_quantization_hash, write_hfq, HfqTensor,
-    TensorSpill, HFQ_MAGIC,
+    insert_parameter_counts_metadata, write_hfq_with_progress, HfqStreamTensor, HfqTensor,
+    LiveHfqWriter, TensorSpill, Xxh64, HFQ_MAGIC,
 };
 // Helpers exercised only by this binary's unit tests.
 #[cfg(test)]
-use hipfire_quantize::hfq_out::{parameter_counts_metadata, Xxh64};
+use hipfire_quantize::hfq_out::parameter_counts_metadata;
 // The GGUF parser/dequant now lives in its own dedicated offline crate
 // (hipfire-gguf) — off the inference dependency surface. Alias keeps the
 // import pipeline's `gguf_input::` references source-compatible.
@@ -90,7 +90,7 @@ use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 // imatrix lookup populated once in main() when --imatrix is supplied; keyed by
@@ -302,6 +302,7 @@ struct TensorMeta {
 
 struct SafetensorsFile {
     _file: File,
+    path: PathBuf,
     mmap: Mmap,
     header_size: usize,
     tensors: HashMap<String, TensorMeta>,
@@ -331,17 +332,24 @@ impl SafetensorsFile {
 
         Ok(Self {
             _file: file,
+            path: path.to_path_buf(),
             mmap,
             header_size: 8 + header_len,
             tensors,
         })
     }
 
+    fn tensor_meta(&self, name: &str) -> Option<&TensorMeta> {
+        self.tensors.get(name)
+    }
+
     fn tensor_data(&self, name: &str) -> Option<(&TensorMeta, &[u8])> {
         let meta = self.tensors.get(name)?;
         let start = self.header_size + meta.data_offsets[0];
         let end = self.header_size + meta.data_offsets[1];
-        Some((meta, &self.mmap[start..end]))
+        let data = &self.mmap[start..end];
+        record_input_hash_tensor(&self.path, name, meta, start, data);
+        Some((meta, data))
     }
 
     /// Advise the kernel to drop page cache for a tensor's data region.
@@ -369,6 +377,84 @@ impl SafetensorsFile {
     fn tensor_names(&self) -> Vec<&str> {
         self.tensors.keys().map(|s| s.as_str()).collect()
     }
+}
+
+struct InputHashAccumulator {
+    h: Xxh64,
+    seen: std::collections::HashSet<(PathBuf, String)>,
+    tensor_count: u64,
+    payload_bytes: u64,
+}
+
+impl InputHashAccumulator {
+    fn new() -> Self {
+        let mut h = Xxh64::new(0);
+        h.update(b"hipfire-hfq-source-safetensors-v1");
+        Self {
+            h,
+            seen: std::collections::HashSet::new(),
+            tensor_count: 0,
+            payload_bytes: 0,
+        }
+    }
+}
+
+static INPUT_HASH: OnceLock<std::sync::Mutex<Option<InputHashAccumulator>>> = OnceLock::new();
+
+fn begin_input_hash() {
+    let lock = INPUT_HASH.get_or_init(|| std::sync::Mutex::new(None));
+    *lock.lock().unwrap() = Some(InputHashAccumulator::new());
+}
+
+fn record_input_hash_tensor(
+    path: &Path,
+    name: &str,
+    meta: &TensorMeta,
+    file_offset: usize,
+    data: &[u8],
+) {
+    let Some(lock) = INPUT_HASH.get() else {
+        return;
+    };
+    let mut guard = lock.lock().unwrap();
+    let Some(acc) = guard.as_mut() else {
+        return;
+    };
+    let key = (path.to_path_buf(), name.to_string());
+    if !acc.seen.insert(key) {
+        return;
+    }
+    let path_bytes = path.to_string_lossy();
+    let name_bytes = name.as_bytes();
+    acc.h.update(&(path_bytes.len() as u64).to_le_bytes());
+    acc.h.update(path_bytes.as_bytes());
+    acc.h.update(&(name_bytes.len() as u64).to_le_bytes());
+    acc.h.update(name_bytes);
+    acc.h.update(&(meta.dtype.len() as u64).to_le_bytes());
+    acc.h.update(meta.dtype.as_bytes());
+    acc.h.update(&(meta.shape.len() as u64).to_le_bytes());
+    for &dim in &meta.shape {
+        acc.h.update(&(dim as u64).to_le_bytes());
+    }
+    acc.h.update(&(file_offset as u64).to_le_bytes());
+    acc.h.update(&(data.len() as u64).to_le_bytes());
+    acc.h.update(data);
+    acc.tensor_count += 1;
+    acc.payload_bytes += data.len() as u64;
+}
+
+fn finish_input_hash() -> Option<serde_json::Value> {
+    let lock = INPUT_HASH.get()?;
+    let mut guard = lock.lock().unwrap();
+    let acc = guard.take()?;
+    Some(serde_json::json!({
+        "algorithm": "xxh64",
+        "seed": 0,
+        "scope": "source_safetensors_tensor_bytes_v1",
+        "value": format!("{:016x}", acc.h.digest()),
+        "tensor_count": acc.tensor_count,
+        "payload_bytes": acc.payload_bytes,
+    }))
 }
 
 // ─── FP16/BF16 Conversion ───────────────────────────────────────────────────
@@ -2484,15 +2570,15 @@ fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: us
 
 // ─── Model Discovery ────────────────────────────────────────────────────────
 
-fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
+fn find_safetensors(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap()
+        .map_err(|e| format!("cannot list model directory {}: {e}", dir.display()))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().map_or(false, |ext| ext == "safetensors"))
         .collect();
     files.sort();
-    files
+    Ok(files)
 }
 
 /// Determine which tensors to quantize (weight matrices) vs keep as F16 (norms, embeddings)
@@ -2654,6 +2740,30 @@ fn is_conv1d_tensor(name: &str) -> bool {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
+fn resolve_hf_cache_root(path: &Path) -> Option<PathBuf> {
+    let snapshots_dir = path.join("snapshots");
+    if !snapshots_dir.is_dir() {
+        return None;
+    }
+
+    let refs_main = path.join("refs").join("main");
+    if let Ok(revision) = std::fs::read_to_string(&refs_main) {
+        let snapshot = snapshots_dir.join(revision.trim());
+        if snapshot.join("config.json").exists() {
+            return Some(snapshot);
+        }
+    }
+
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(&snapshots_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join("config.json").exists())
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
 /// Resolve a model input to a local directory path.
 /// Accepts: local path, HuggingFace model ID (org/name), or HF cache path.
 /// If the input looks like a HF model ID and isn't a local path, tries to find it
@@ -2664,6 +2774,11 @@ fn resolve_model_path(input: &str) -> String {
     // If it's already a valid local directory with config.json, use it directly
     if path.join("config.json").exists() {
         return input.to_string();
+    }
+
+    if let Some(snapshot) = resolve_hf_cache_root(path) {
+        eprintln!("Resolved HF cache root {input} -> {}", snapshot.display());
+        return snapshot.to_string_lossy().to_string();
     }
 
     // Check if it looks like a HuggingFace model ID (contains exactly one /)
@@ -2677,20 +2792,13 @@ fn resolve_model_path(input: &str) -> String {
 
             // Check HF cache: ~/.cache/huggingface/hub/models--{org}--{name}/snapshots/*/
             let home = std::env::var("HOME").unwrap_or_default();
-            let cache_dir = format!("{home}/.cache/huggingface/hub/models--{org}--{name}");
-            let snapshots_dir = Path::new(&cache_dir).join("snapshots");
+            let cache_dir = PathBuf::from(format!(
+                "{home}/.cache/huggingface/hub/models--{org}--{name}"
+            ));
 
-            if snapshots_dir.exists() {
-                // Find the first snapshot directory
-                if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
-                    for entry in entries.flatten() {
-                        let snap_path = entry.path();
-                        if snap_path.is_dir() && snap_path.join("config.json").exists() {
-                            eprintln!("Resolved {input} -> {}", snap_path.display());
-                            return snap_path.to_string_lossy().to_string();
-                        }
-                    }
-                }
+            if let Some(snapshot) = resolve_hf_cache_root(&cache_dir) {
+                eprintln!("Resolved {input} -> {}", snapshot.display());
+                return snapshot.to_string_lossy().to_string();
             }
 
             // Not in cache — try to download
@@ -2702,14 +2810,9 @@ fn resolve_model_path(input: &str) -> String {
             match status {
                 Ok(s) if s.success() => {
                     // Retry cache lookup after download
-                    if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
-                        for entry in entries.flatten() {
-                            let snap_path = entry.path();
-                            if snap_path.is_dir() && snap_path.join("config.json").exists() {
-                                eprintln!("Downloaded {input} -> {}", snap_path.display());
-                                return snap_path.to_string_lossy().to_string();
-                            }
-                        }
+                    if let Some(snapshot) = resolve_hf_cache_root(&cache_dir) {
+                        eprintln!("Downloaded {input} -> {}", snapshot.display());
+                        return snapshot.to_string_lossy().to_string();
                     }
                 }
                 Ok(s) => eprintln!("huggingface-cli download failed with status {s}"),
@@ -2722,6 +2825,175 @@ fn resolve_model_path(input: &str) -> String {
 
     // Fall through: return as-is, will fail at config.json read with a helpful error
     input.to_string()
+}
+
+struct TensorProgress {
+    bar: indicatif::ProgressBar,
+    total: u64,
+    log_snapshots: bool,
+    pos: AtomicU64,
+}
+
+impl TensorProgress {
+    fn new(total: usize) -> Self {
+        let bar = tensor_progress_bar(total);
+        let log_snapshots = bar.is_hidden();
+        Self {
+            bar,
+            total: total as u64,
+            log_snapshots,
+            pos: AtomicU64::new(0),
+        }
+    }
+
+    fn start(&self) {
+        self.bar.set_message("starting tensor pass");
+        if self.log_snapshots {
+            eprintln!(
+                "progress: 0/{} tensors (0.0%) starting tensor pass",
+                self.total
+            );
+        }
+    }
+
+    fn tick<'a>(&'a self, name: &str) -> TensorProgressTick<'a> {
+        let name = progress_tensor_name(name);
+        self.bar.set_message(name.clone());
+        TensorProgressTick {
+            progress: self,
+            name,
+        }
+    }
+
+    fn finish(&self) {
+        self.bar.finish_with_message("tensor pass complete");
+        if self.log_snapshots {
+            eprintln!(
+                "progress: {}/{} tensors (100.0%) tensor pass complete",
+                self.total, self.total
+            );
+        }
+    }
+
+    fn detail(&self, enabled: bool, message: String) {
+        if !enabled {
+            return;
+        }
+        if self.log_snapshots {
+            eprintln!("{message}");
+        } else {
+            self.bar.println(message);
+        }
+    }
+}
+
+fn tensor_progress_bar(total: usize) -> indicatif::ProgressBar {
+    let bar = indicatif::ProgressBar::with_draw_target(
+        Some(total as u64),
+        indicatif::ProgressDrawTarget::stderr_with_hz(4),
+    );
+    let style = indicatif::ProgressStyle::with_template(
+        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} tensors ({percent}%) {msg}",
+    )
+    .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+    .progress_chars("=> ");
+    bar.set_style(style);
+    bar
+}
+
+fn progress_tensor_name(name: &str) -> String {
+    const MAX: usize = 96;
+    if name.len() <= MAX {
+        return name.to_string();
+    }
+    let tail = &name[name.len() - (MAX - 3)..];
+    format!("...{tail}")
+}
+
+struct TensorProgressTick<'a> {
+    progress: &'a TensorProgress,
+    name: String,
+}
+
+impl Drop for TensorProgressTick<'_> {
+    fn drop(&mut self) {
+        let pos = self.progress.pos.fetch_add(1, Ordering::Relaxed) + 1;
+        self.progress.bar.inc(1);
+        if self.progress.log_snapshots && (pos == 1 || pos == self.progress.total || pos % 10 == 0)
+        {
+            let pct = if self.progress.total > 0 {
+                100.0 * pos as f64 / self.progress.total as f64
+            } else {
+                100.0
+            };
+            eprintln!(
+                "progress: {}/{} tensors ({pct:.1}%) {}",
+                pos, self.progress.total, self.name
+            );
+        }
+    }
+}
+
+struct FinalWriteProgress {
+    bar: indicatif::ProgressBar,
+    log_snapshots: bool,
+    next_log_bytes: u64,
+}
+
+impl FinalWriteProgress {
+    fn new() -> Self {
+        let bar =
+            indicatif::ProgressBar::with_draw_target(None, indicatif::ProgressDrawTarget::stderr());
+        let style = indicatif::ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({percent}%) {msg}",
+        )
+        .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+        .progress_chars("=> ");
+        bar.set_style(style);
+        let log_snapshots = bar.is_hidden();
+        if log_snapshots {
+            eprintln!("progress: finalizing HFQ v2 layout, hashes, and payload");
+        }
+        Self {
+            bar,
+            log_snapshots,
+            next_log_bytes: 1 << 30,
+        }
+    }
+
+    fn update(&mut self, progress: hipfire_quantize::hfq_out::HfqWriteProgress) {
+        if self.bar.length().is_none() {
+            self.bar.set_length(progress.total_bytes);
+        }
+        self.bar.set_position(progress.written_bytes);
+        self.bar
+            .set_message("writing and hashing final HFQ payload");
+        if self.log_snapshots
+            && (progress.written_bytes >= self.next_log_bytes
+                || progress.written_bytes == progress.total_bytes)
+        {
+            let pct = if progress.total_bytes > 0 {
+                100.0 * progress.written_bytes as f64 / progress.total_bytes as f64
+            } else {
+                100.0
+            };
+            eprintln!(
+                "progress: wrote {:.1}/{:.1} GiB ({pct:.1}%)",
+                progress.written_bytes as f64 / (1u64 << 30) as f64,
+                progress.total_bytes as f64 / (1u64 << 30) as f64,
+            );
+            while self.next_log_bytes <= progress.written_bytes {
+                self.next_log_bytes = self.next_log_bytes.saturating_add(1 << 30);
+            }
+        }
+    }
+
+    fn finish(&self) {
+        self.bar.finish_and_clear();
+        if self.log_snapshots {
+            eprintln!("progress: HFQ write complete");
+        }
+    }
 }
 
 fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
@@ -4149,16 +4421,18 @@ fn run_hfq_source_pipeline(
     if let Some(ref mut output_spill) = spill {
         maybe_spill(&mut hfq_tensors, output_spill, 0);
     }
-    let metadata_json = metadata_with_quantization_hash(metadata, &hfq_tensors, spill.as_ref())
-        .map_err(|e| e.to_string())?;
-    write_hfq(
+    let metadata_json = serde_json::to_string(&metadata).map_err(|e| e.to_string())?;
+    let mut write_progress = FinalWriteProgress::new();
+    write_hfq_with_progress(
         output,
         hfq.arch_id,
         &metadata_json,
         &hfq_tensors,
         spill.as_mut(),
+        |p| write_progress.update(p),
     )
     .map_err(|e| format!("write HFQ output: {e}"))?;
+    write_progress.finish();
     if let Some(output_spill) = spill {
         output_spill.cleanup();
     }
@@ -4817,6 +5091,7 @@ OPTIONS:
                                with --awq (smooths activations + rebases the Hessian)
     --chat-template-file <P>   override the embedded chat template (Jinja file)
     --threads <N>              rayon worker threads (default 80% of cores; env HIPFIRE_QUANT_THREADS)
+    --verbose-tensors          print one detail line per tensor while quantizing
     --beam <N>                 QTIP trellis beam-search width (default 128, near-Viterbi); lower =
                                much faster encode on big models, slight quality loss (env HIPFIRE_QTIP_BEAM)
     --arch-id <U32>            override the auto-detected arch id stamped in the .hfq header
@@ -4880,7 +5155,7 @@ fn ldlq_recon_probe(args: &[String]) -> Result<(), String> {
 
     // Weight W [m,k] f32 from safetensors.
     let wname = format!("{key}.weight");
-    let st_paths = find_safetensors(Path::new(model));
+    let st_paths = find_safetensors(Path::new(model))?;
     let (w, m, k) = {
         let mut found = None;
         for p in &st_paths {
@@ -6124,15 +6399,41 @@ fn main() {
     }
 
     // Resolve input: local path or HuggingFace model ID (e.g. "Qwen/Qwen3-8B")
+    let original_input_dir = input_dir.to_string();
     let input_dir = resolve_model_path(input_dir);
     let input_dir = Path::new(&input_dir);
     let output_path = Path::new(output_path);
 
     // Read model config
     let config_path = input_dir.join("config.json");
-    let config_str = std::fs::read_to_string(&config_path)
-        .unwrap_or_else(|_| panic!("Cannot read {}. If using a HuggingFace model ID, ensure it's downloaded: huggingface-cli download {}", config_path.display(), input_dir.display()));
-    let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+    let config_str = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        eprintln!(
+            "error: cannot read model config\n\
+             input: {original}\n\
+             resolved: {resolved}\n\
+             expected: {config}\n\
+             reason: {e}\n\
+             hint: pass a Hugging Face snapshot directory, a cache root containing refs/main and snapshots/, or a model id like org/name. \
+             For /srv/huggingface cache roots, refs/main must point to a snapshot containing config.json.",
+            original = original_input_dir,
+            resolved = input_dir.display(),
+            config = config_path.display(),
+        );
+        std::process::exit(2);
+    });
+    let config: serde_json::Value = serde_json::from_str(&config_str).unwrap_or_else(|e| {
+        eprintln!(
+            "error: invalid model config JSON\n\
+             input: {original}\n\
+             resolved: {resolved}\n\
+             config: {config}\n\
+             reason: {e}",
+            original = original_input_dir,
+            resolved = input_dir.display(),
+            config = config_path.display(),
+        );
+        std::process::exit(2);
+    });
 
     let is_mamba2_config = config
         .get("ssm_cfg")
@@ -6448,13 +6749,48 @@ fn main() {
     }
 
     // Load all safetensors files
-    let st_files: Vec<SafetensorsFile> = find_safetensors(input_dir)
+    let st_paths = find_safetensors(input_dir).unwrap_or_else(|e| {
+        eprintln!(
+            "error: cannot read safetensors shards\n\
+             input: {original}\n\
+             resolved: {resolved}\n\
+             reason: {e}",
+            original = original_input_dir,
+            resolved = input_dir.display(),
+        );
+        std::process::exit(2);
+    });
+    if st_paths.is_empty() {
+        eprintln!(
+            "error: no .safetensors files found in model directory\n\
+             input: {original}\n\
+             resolved: {resolved}\n\
+             hint: pass the model snapshot directory that contains model-*.safetensors, or the top-level HF cache root with refs/main.",
+            original = original_input_dir,
+            resolved = input_dir.display(),
+        );
+        std::process::exit(2);
+    }
+    let st_files: Vec<SafetensorsFile> = st_paths
         .iter()
         .map(|p| {
             eprintln!("Loading: {}", p.display());
-            SafetensorsFile::open(p).unwrap()
+            SafetensorsFile::open(p).unwrap_or_else(|e| {
+                eprintln!(
+                    "error: cannot open safetensors shard\n\
+                     input: {original}\n\
+                     resolved: {resolved}\n\
+                     shard: {shard}\n\
+                     reason: {e}",
+                    original = original_input_dir,
+                    resolved = input_dir.display(),
+                    shard = p.display(),
+                );
+                std::process::exit(2);
+            })
         })
         .collect();
+    begin_input_hash();
 
     // Collect all tensor names.
     //
@@ -6672,6 +7008,238 @@ fn main() {
             "  [filter] --include-prefix {p:?} — only tensors with this prefix will be ingested"
         );
     }
+
+    let can_direct_stream_source_precision = use_source_precision
+        && rotate_lm_head.is_none()
+        && arch_id != ARCH_ID_GEMMA3_TEXT
+        && arch_id != ARCH_ID_EMBEDDINGGEMMA
+        && vision_quant.is_empty()
+        && !use_deepseek4_source_precision;
+    if can_direct_stream_source_precision {
+        #[derive(Clone)]
+        struct DirectSourceJob {
+            name: String,
+            file_idx: usize,
+            dtype: String,
+            shape: Vec<usize>,
+        }
+
+        let verbose_tensors = args.iter().any(|a| a == "--verbose-tensors");
+        let mut jobs = Vec::new();
+        let mut stream_entries = Vec::new();
+        let mut metadata_tensors = Vec::new();
+        let mut total_params = 0u64;
+        let mut quantized_params = 0u64;
+        let mut skipped_params = 0u64;
+
+        for (name, file_idx) in &all_tensors {
+            if let Some(ref p) = include_prefix {
+                if !name.starts_with(p) {
+                    let meta = st_files[*file_idx].tensor_meta(name).unwrap();
+                    let n: usize = meta.shape.iter().product();
+                    skipped_params += n as u64;
+                    continue;
+                }
+            }
+            let is_vision = name.starts_with("model.visual.")
+                || name.starts_with("visual.")
+                || name.starts_with("vision_tower.");
+            if is_vision && !include_vision {
+                let meta = st_files[*file_idx].tensor_meta(name).unwrap();
+                let n: usize = meta.shape.iter().product();
+                skipped_params += n as u64;
+                continue;
+            }
+            if name.starts_with("mtp.") {
+                let meta = st_files[*file_idx].tensor_meta(name).unwrap();
+                let n: usize = meta.shape.iter().product();
+                skipped_params += n as u64;
+                continue;
+            }
+
+            let meta = st_files[*file_idx].tensor_meta(name).unwrap();
+            let n_elements: usize = meta.shape.iter().product();
+            let data_len = match meta.dtype.as_str() {
+                "BF16" | "F16" => (meta.data_offsets[1] - meta.data_offsets[0]) as u64,
+                "F32" => (n_elements * 2) as u64,
+                other => {
+                    eprintln!("error: unsupported dtype for source-precision stream: {other}");
+                    std::process::exit(2);
+                }
+            };
+            let quant_type = match meta.dtype.as_str() {
+                "BF16" => QuantType::BF16,
+                "F16" | "F32" => QuantType::F16,
+                other => unreachable!("validated unsupported dtype: {other}"),
+            };
+            let shape_u32: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            total_params += n_elements as u64;
+            quantized_params += n_elements as u64;
+            stream_entries.push(HfqStreamTensor {
+                name: name.to_string(),
+                quant_type,
+                shape: shape_u32.clone(),
+                group_size: 0,
+                data_len,
+            });
+            metadata_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type,
+                shape: shape_u32,
+                group_size: 0,
+                data: Vec::new(),
+                spilled_len: data_len,
+            });
+            jobs.push(DirectSourceJob {
+                name: name.to_string(),
+                file_idx: *file_idx,
+                dtype: meta.dtype.clone(),
+                shape: meta.shape.clone(),
+            });
+        }
+
+        insert_parameter_counts_metadata(
+            &mut metadata,
+            &metadata_tensors,
+            total_params,
+            quantized_params,
+            skipped_params,
+        );
+        let source_payload_bytes: u64 = jobs
+            .iter()
+            .map(|job| {
+                let meta = st_files[job.file_idx].tensor_meta(&job.name).unwrap();
+                (meta.data_offsets[1] - meta.data_offsets[0]) as u64
+            })
+            .sum();
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert(
+                "input_hash".to_string(),
+                serde_json::json!({
+                    "algorithm": "xxh64",
+                    "seed": 0,
+                    "scope": "source_safetensors_tensor_bytes_v1",
+                    "value": "0000000000000000",
+                    "tensor_count": jobs.len() as u64,
+                    "payload_bytes": source_payload_bytes,
+                }),
+            );
+        }
+        let total_bytes: u64 = stream_entries.iter().map(|entry| entry.data_len).sum();
+        let placeholder_metadata_json = serde_json::to_string(&metadata).unwrap();
+
+        eprintln!("\nWriting: {}", output_path.display());
+        let mut live_writer = LiveHfqWriter::begin(
+            output_path,
+            arch_id,
+            &placeholder_metadata_json,
+            &stream_entries,
+        )
+        .unwrap();
+        let quant_progress = TensorProgress::new(all_tensors.len());
+        quant_progress.start();
+        let mut entry_idx = 0usize;
+
+        for (name, file_idx) in &all_tensors {
+            let _progress_tick = quant_progress.tick(name);
+            if let Some(ref p) = include_prefix {
+                if !name.starts_with(p) {
+                    continue;
+                }
+            }
+            let is_vision = name.starts_with("model.visual.")
+                || name.starts_with("visual.")
+                || name.starts_with("vision_tower.");
+            if is_vision && !include_vision {
+                continue;
+            }
+            if name.starts_with("mtp.") {
+                continue;
+            }
+
+            let entry = &stream_entries[entry_idx];
+            let job = &jobs[entry_idx];
+            let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
+            let n_elements: usize = meta.shape.iter().product();
+            let label = match job.dtype.as_str() {
+                "BF16" => "BF16",
+                "F16" | "F32" => "F16",
+                other => unreachable!("validated unsupported dtype: {other}"),
+            };
+            if verbose_tensors {
+                quant_progress.detail(
+                    true,
+                    format!(
+                        "  {label:<10} {} {:?} ({} elements, {:.1} KB) [direct-stream]",
+                        name,
+                        meta.shape,
+                        n_elements,
+                        entry.data_len as f64 / 1024.0
+                    ),
+                );
+            }
+            live_writer
+                .write_next(
+                    entry,
+                    |writer| {
+                        match job.dtype.as_str() {
+                            "BF16" | "F16" => writer.write_all(raw_data)?,
+                            "F32" => {
+                                let f32_data = to_f32(raw_data, "F32");
+                                let bytes = f32_slice_to_f16_bytes(&f32_data);
+                                writer.write_all(&bytes)?;
+                            }
+                            other => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!(
+                                        "unsupported dtype for source-precision stream: {other}"
+                                    ),
+                                ));
+                            }
+                        }
+                        Ok(())
+                    },
+                    |_| {},
+                )
+                .unwrap();
+            debug_assert_eq!(meta.shape, job.shape);
+            st_files[*file_idx].drop_tensor_pages(name);
+            entry_idx += 1;
+        }
+        quant_progress.finish();
+
+        if let Some(input_hash) = finish_input_hash() {
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert("input_hash".to_string(), input_hash);
+            }
+        }
+        let final_metadata_json = serde_json::to_string(&metadata).unwrap();
+        let mut write_progress = FinalWriteProgress::new();
+        live_writer
+            .finish(&final_metadata_json, |p| write_progress.update(p))
+            .unwrap();
+        write_progress.finish();
+
+        eprintln!("\n=== Quantization Summary ===");
+        if skipped_params > 0 {
+            eprintln!(
+                "  Skipped params:   {skipped_params} (mtp/visual — use --include-vision for VL)"
+            );
+        }
+        eprintln!("  Total params:     {total_params}");
+        eprintln!(
+            "  Quantized params: {quantized_params} ({:.1}%)",
+            100.0 * quantized_params as f64 / total_params as f64
+        );
+        eprintln!("  Mean quant error: 0.00000000");
+        eprintln!("  Max quant error:  0.00000000");
+        eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
+        let file_size = std::fs::metadata(output_path).unwrap().len();
+        eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
+        return;
+    }
+
     let mut skipped_params = 0u64;
     // MiniMax AWQ: shared-per-layer expert scales, cached + sidecars emitted once.
     let mut mm_awq_cache: std::collections::HashMap<usize, Option<(Vec<f32>, Vec<f32>)>> =
@@ -6682,7 +7250,17 @@ fn main() {
     let mut lfm2_awq_cache: std::collections::HashMap<usize, Option<(Vec<f32>, Vec<f32>)>> =
         std::collections::HashMap::new();
     let mut lfm2_awq_emitted: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let verbose_tensors = args.iter().any(|a| a == "--verbose-tensors");
+    let quant_progress = TensorProgress::new(all_tensors.len());
+    quant_progress.start();
+    macro_rules! quant_log {
+        ($($arg:tt)*) => {
+            quant_progress.detail(verbose_tensors, format!($($arg)*))
+        };
+    }
     for (name, file_idx) in &all_tensors {
+        let _progress_tick = quant_progress.tick(name);
+
         // --include-prefix filter (highest priority — runs before mtp/vision skips).
         if let Some(ref p) = include_prefix {
             if !name.starts_with(p) {
@@ -6738,7 +7316,7 @@ fn main() {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             let bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
             quantized_params += n_elements as u64;
-            eprintln!(
+            quant_log!(
                 "  {:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [F32 oracle passthrough]",
                 "F32",
                 name,
@@ -6804,7 +7382,7 @@ fn main() {
                             if scale.len() == k {
                                 awq_pre_scale_weights(&mut f32_data, m, k, scale);
                             } else {
-                                eprintln!(
+                                quant_log!(
                                     "  lfm2 AWQ L{layer_n}: scale len {} != k {} ({name}); skipped",
                                     scale.len(),
                                     k
@@ -6831,7 +7409,7 @@ fn main() {
                                     data: awq_scales_to_f16_bytes(s_dn),
                                     spilled_len: 0,
                                 });
-                                eprintln!(
+                                quant_log!(
                                     "  AWQ-LFM: emitted gate_up + down scales for L{layer_n}"
                                 );
                             }
@@ -6841,7 +7419,7 @@ fn main() {
                 let signs1 = gen_fwht_signs(42, 256);
                 let signs2 = gen_fwht_signs(1042, 256);
                 let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
-                eprintln!(
+                quant_log!(
                     "  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
                     "MQ4-LFM",
                     name,
@@ -6876,9 +7454,11 @@ fn main() {
                 for v in &f32_data {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
-                eprintln!(
+                quant_log!(
                     "  {:>8}: {} {:?} (expert_bias F32)",
-                    "F32-LFM", name, meta.shape
+                    "F32-LFM",
+                    name,
+                    meta.shape
                 );
                 hfq_tensors.push(HfqTensor {
                     name: name.to_string(),
@@ -6918,7 +7498,7 @@ fn main() {
                 let (q, qt, gs, label) =
                     quantize_hfq_source_tensor(name, arch_id, &f32_bytes, 2, &shape, oq_format)
                         .unwrap_or_else(|e| panic!("lfm2 oq quantize {name}: {e}"));
-                eprintln!(
+                quant_log!(
                     "  {label:>8}: {} {:?} ({:.1} KB -> {:.1} KB) [LFM2 dense OQ]",
                     name,
                     meta.shape,
@@ -6939,7 +7519,7 @@ fn main() {
                         None => format!("{name}.awq_scale.weight"),
                     };
                     let bytes = awq_scales_to_f16_bytes(&scales);
-                    eprintln!(
+                    quant_log!(
                         "    AWQ:    {sidecar_name} [{}] (1D F16, {} B)",
                         scales.len(),
                         bytes.len()
@@ -6986,7 +7566,7 @@ fn main() {
                 let signs1 = gen_fwht_signs(42, 256);
                 let signs2 = gen_fwht_signs(1042, 256);
                 let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
-                eprintln!(
+                quant_log!(
                     "  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
                     "MQ4-LFM",
                     name,
@@ -7020,7 +7600,7 @@ fn main() {
                 &st_files,
             );
             let q = quantize_q8f16(&f32_data);
-            eprintln!("  {:>8}: {} {:?} (Q8)", "Q8-LFM", name, meta.shape);
+            quant_log!("  {:>8}: {} {:?} (Q8)", "Q8-LFM", name, meta.shape);
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
                 quant_type: QuantType::Q8F16,
@@ -7069,7 +7649,7 @@ fn main() {
                     u32_bytes.extend_from_slice(&v_u32.to_le_bytes());
                 }
                 let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-                eprintln!(
+                quant_log!(
                     "  {:>8}: {} {:?} (I64 → U32, {} elements, {:.1} KB)",
                     "TID2EID",
                     name,
@@ -7090,9 +7670,11 @@ fn main() {
                 continue;
             }
             // Other I64 (none expected in DeepSeek V4): skip with explicit warning.
-            eprintln!(
+            quant_log!(
                 "  [skip-I64] {} {:?} ({} elements) — unexpected I64 tensor, not ingested",
-                name, meta.shape, n_elements
+                name,
+                meta.shape,
+                n_elements
             );
             skipped_params += n_elements as u64;
             continue;
@@ -7171,7 +7753,7 @@ fn main() {
                     quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2)
                 };
                 let shape: Vec<u32> = logical_shape.iter().map(|&s| s as u32).collect();
-                eprintln!(
+                quant_log!(
                     "  {:>8}: {} storage{:?} → logical{:?} ({:.1} KB → {:.1} KB)",
                     "MQ2L-DeepSeek V4",
                     name,
@@ -7237,7 +7819,7 @@ fn main() {
             let (q, qt, gs, label) =
                 quantize_hfq_source_tensor(name, arch_id, &f32_bytes, 2, &shape, oq_format)
                     .unwrap_or_else(|e| panic!("minimax oq quantize {name}: {e}"));
-            eprintln!(
+            quant_log!(
                 "  {label:>8}: {} {:?} ({:.1} KB -> {:.1} KB) [MiniMax dense OQ]",
                 name,
                 meta.shape,
@@ -7258,7 +7840,7 @@ fn main() {
                     None => format!("{name}.awq_scale.weight"),
                 };
                 let bytes = awq_scales_to_f16_bytes(&scales);
-                eprintln!(
+                quant_log!(
                     "    AWQ:    {sidecar_name} [{}] (1D F16, {} B)",
                     scales.len(),
                     bytes.len()
@@ -7297,7 +7879,7 @@ fn main() {
                 &st_files,
             );
             let q = quantize_q8f16(&f32_data);
-            eprintln!("  {:>8}: {} {:?} (router Q8)", "Q8-MM", name, meta.shape);
+            quant_log!("  {:>8}: {} {:?} (router Q8)", "Q8-MM", name, meta.shape);
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
                 quant_type: QuantType::Q8F16,
@@ -7344,7 +7926,7 @@ fn main() {
                     (f32_slice_to_f16_bytes(&f32_data), QuantType::F16, "F16")
                 };
                 let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-                eprintln!(
+                quant_log!(
                     "  {:>8}: {} {:?} ({:.1} KB -> {:.1} KB)",
                     label,
                     name,
@@ -7389,7 +7971,7 @@ fn main() {
                                 if s_gu.len() == k {
                                     awq_pre_scale_weights(&mut f32_data, m, k, s_gu);
                                 } else {
-                                    eprintln!("  minimax AWQ L{layer_n}: s_gu len {} != k {} ({name}); skipped", s_gu.len(), k);
+                                    quant_log!("  minimax AWQ L{layer_n}: s_gu len {} != k {} ({name}); skipped", s_gu.len(), k);
                                 }
                             }
                             if mm_awq_emitted.insert(layer_n) {
@@ -7402,7 +7984,7 @@ fn main() {
                                     data: awq_scales_to_f16_bytes(s_gu),
                                     spilled_len: 0,
                                 });
-                                eprintln!("  AWQ-MM: emitted gate_up scale for L{layer_n}");
+                                quant_log!("  AWQ-MM: emitted gate_up scale for L{layer_n}");
                             }
                         }
                     }
@@ -7528,7 +8110,7 @@ fn main() {
                     )
                 };
                 let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-                eprintln!(
+                quant_log!(
                     "  {label:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
                     name,
                     meta.shape,
@@ -7699,7 +8281,7 @@ fn main() {
                 && expert_lloyd_mq2_native
                 && imatrix_per_expert.is_none()
             {
-                eprintln!(
+                quant_log!(
                     "  imatrix: no entry for {} → falling back to uniform Lloyd",
                     imatrix_lookup_name
                 );
@@ -7836,7 +8418,7 @@ fn main() {
                 .collect::<Vec<Vec<HfqTensor>>>();
             let mut new_tensors: Vec<HfqTensor> = nested.into_iter().flatten().collect();
             quantized_params += inner_n as u64 * n_experts as u64;
-            // Single eprintln to summarize the whole expert sweep.
+            // Single  to summarize the whole expert sweep.
             let label = if use_bf16 && meta.dtype == "BF16" {
                 "BF16"
             } else if use_fp16 || use_bf16 {
@@ -7865,7 +8447,7 @@ fn main() {
                 "HFQ4G128"
             };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
-            eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
+            quant_log!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
                 inner_shape, bytes_per as f64 / 1024.0);
             hfq_tensors.append(&mut new_tensors);
             // Drop source pages and spill quantized data after each expert batch.
@@ -7923,7 +8505,7 @@ fn main() {
                 .iter()
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                 .collect();
-            eprintln!(
+            quant_log!(
                 "  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [src={src_dtype}, keep-F16]",
                 "F16",
                 name,
@@ -7958,7 +8540,7 @@ fn main() {
             );
             quantized_params += n_elements as u64;
             let q = quantize_q8f16(&f32_data);
-            eprintln!(
+            quant_log!(
                 "  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [src={src_dtype}]",
                 "Q8_F16",
                 name,
@@ -8023,7 +8605,7 @@ fn main() {
                     }
                 }
 
-                eprintln!(
+                quant_log!(
                     "  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB, stride={})",
                     "Q8_HFQ",
                     name,
@@ -8868,7 +9450,7 @@ fn main() {
                     _n_quant_groups += 1;
                 }
 
-                eprintln!(
+                quant_log!(
                     "  {label:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB)",
                     name,
                     meta.shape,
@@ -8897,7 +9479,7 @@ fn main() {
                         None => format!("{name}.awq_scale.weight"),
                     };
                     let bytes = awq_scales_to_f16_bytes(&scales);
-                    eprintln!(
+                    quant_log!(
                         "    AWQ:    {} [{}] (1D F16, {} B)",
                         sidecar_name,
                         scales.len(),
@@ -8934,7 +9516,7 @@ fn main() {
                 QuantType::HFQ4G128
             };
             let label = if gs == 256 { "HFQ4G256" } else { "HFQ4G128" };
-            eprintln!(
+            quant_log!(
                 "  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [vision]",
                 name,
                 meta.shape,
@@ -8959,7 +9541,7 @@ fn main() {
             } else {
                 "source"
             };
-            eprintln!(
+            quant_log!(
                 "  BF16:       {} {:?} ({} elements, {:.1} KB) [{scope}, lossless]",
                 name,
                 meta.shape,
@@ -8992,7 +9574,7 @@ fn main() {
             } else {
                 "source fallback"
             };
-            eprintln!(
+            quant_log!(
                 "  F16:        {} {:?} ({:.1} KB) [{scope}]",
                 name,
                 meta.shape,
@@ -9022,9 +9604,11 @@ fn main() {
                 _ => (f32_slice_to_bf16_bytes(rot), QuantType::BF16, "BF16"),
             };
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            eprintln!(
+            quant_log!(
                 "  {label:<10} {} {:?} ({} elements) [--rotate override]",
-                name, meta.shape, n_elements
+                name,
+                meta.shape,
+                n_elements
             );
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
@@ -9048,7 +9632,7 @@ fn main() {
             };
             let (data, qt, label) = source_precision_tensor_bytes(raw_data, &meta.dtype, &f32_data);
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            eprintln!(
+            quant_log!(
                 "  {label:<10} {} {:?} ({} elements, {:.1} KB)",
                 name,
                 meta.shape,
@@ -9069,6 +9653,7 @@ fn main() {
         // mmap'd pages from starving GPU allocations on UMA systems.
         st_files[*file_idx].drop_tensor_pages(name);
     }
+    quant_progress.finish();
 
     // Emit the synthesized untied lm_head (`--rotate`). Stored F16 [vocab, h]: the
     // output head is not on the int4 GEMM hot path, and F16 avoids replicating a
@@ -10395,23 +10980,26 @@ fn main() {
             obj.insert("calibration".to_string(), prov.clone());
         }
     }
+    if let Some(input_hash) = finish_input_hash() {
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert("input_hash".to_string(), input_hash);
+        }
+    }
 
     // Write .hfq file
     eprintln!("\nWriting: {}", output_path.display());
-    // Final spill before writing
-    if let Some(ref mut s) = spill {
-        maybe_spill(&mut hfq_tensors, s, 0); // spill everything remaining
-    }
-    let metadata_json =
-        metadata_with_quantization_hash(metadata, &hfq_tensors, spill.as_ref()).unwrap();
-    write_hfq(
+    let metadata_json = serde_json::to_string(&metadata).unwrap();
+    let mut write_progress = FinalWriteProgress::new();
+    write_hfq_with_progress(
         output_path,
         arch_id,
         &metadata_json,
         &hfq_tensors,
         spill.as_mut(),
+        |p| write_progress.update(p),
     )
     .unwrap();
+    write_progress.finish();
     if let Some(s) = spill {
         s.cleanup();
     }
@@ -10442,7 +11030,8 @@ mod xxh64_provenance_tests {
         }];
         let metadata = serde_json::json!({ "architecture": "qwen3" });
         let metadata_json =
-            metadata_with_quantization_hash(metadata, &tensors, None).expect("metadata");
+            hipfire_quantize::hfq_out::metadata_with_quantization_hash(metadata, &tensors, None)
+                .expect("metadata");
         let parsed: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
         let hash = &parsed["quantization_hash"];
         assert_eq!(hash["algorithm"], "xxh64");
@@ -12578,6 +13167,40 @@ mod tests {
         assert_eq!(
             updated,
             json!({ "chat_template": "{% for message in messages %}{{ message.content }}{% endfor %}" })
+        );
+    }
+
+    #[test]
+    fn resolve_model_path_accepts_hf_cache_root_refs_main() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models--org--model");
+        let snapshot = root.join("snapshots").join("bbb");
+        std::fs::create_dir_all(root.join("refs")).unwrap();
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(root.join("refs").join("main"), "bbb\n").unwrap();
+        std::fs::write(snapshot.join("config.json"), "{}").unwrap();
+
+        assert_eq!(
+            PathBuf::from(resolve_model_path(root.to_str().unwrap())),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn resolve_model_path_accepts_hf_cache_root_sorted_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models--org--model");
+        let snapshots = root.join("snapshots");
+        let first = snapshots.join("aaa");
+        let second = snapshots.join("bbb");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("config.json"), "{}").unwrap();
+        std::fs::write(second.join("config.json"), "{}").unwrap();
+
+        assert_eq!(
+            PathBuf::from(resolve_model_path(root.to_str().unwrap())),
+            first
         );
     }
 

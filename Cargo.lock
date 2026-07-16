@@ -2108,6 +2108,7 @@ dependencies = [
  "hipfire-primitives",
  "hipfire-quant-format",
  "hipfire-rdna",
+ "indicatif",
  "memmap2",
  "rayon",
  "serde",

@@ -14,8 +14,10 @@ use hipfire_rdna::{DType, Gpu, GpuTensor};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::Hasher;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use twox_hash::XxHash64;
 
 // The OQ4 arch-packing transform now lives in `crate::oq4_arch` (single source
 // of truth). Re-exported here so the historical `hipfire_runtime::hfq::{...}`
@@ -27,7 +29,8 @@ pub use crate::oq4_arch::{
 pub use crate::oq8_arch::{oq4_to_oq8_combined, oq8_combined, oqplus_compact_to_oq8_combined};
 
 pub const HFQM_MAGIC: &[u8; 4] = b"HFQM";
-pub const HFQM_VERSION: u32 = 1;
+pub const HFQM_VERSION: u32 = 2;
+const HFQM_V2_OFFSET_ALIGN: usize = 32;
 /// Reserved `arch_id` for HFQM containers that are intentionally shareable
 /// across model families. Role sidecars tied to one family should use the
 /// parent model's `arch_id`; use this value only when metadata explicitly
@@ -95,12 +98,78 @@ fn json_blob_end(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+fn xxh64_hex(bytes: &[u8]) -> String {
+    let mut h = XxHash64::with_seed(0);
+    h.write(bytes);
+    format!("{:016x}", h.finish())
+}
+
+fn merge_tail_metadata(
+    front_json: String,
+    mut read_tail: impl FnMut(usize, usize) -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<String> {
+    let mut front: serde_json::Value = serde_json::from_str(&front_json).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("HFQM v2 front metadata is not valid JSON: {e}"),
+        )
+    })?;
+    let Some(tail_meta) = front.get("tail_metadata").cloned() else {
+        return Ok(front_json);
+    };
+    let offset = tail_meta
+        .get("offset")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HFQM v2 tail offset missing",
+            )
+        })? as usize;
+    let size = tail_meta
+        .get("size")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM v2 tail size missing")
+        })? as usize;
+    let bytes = read_tail(offset, size)?;
+    if let Some(expected) = tail_meta
+        .get("hash")
+        .and_then(|h| h.get("value"))
+        .and_then(|v| v.as_str())
+    {
+        let actual = xxh64_hex(&bytes);
+        if actual != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("HFQM v2 tail hash mismatch: expected {expected}, got {actual}"),
+            ));
+        }
+    }
+    let tail: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("HFQM v2 tail metadata is not valid JSON: {e}"),
+        )
+    })?;
+    if let Some(full) = tail.get("metadata").cloned() {
+        if let (Some(front_map), Some(full_map)) = (front.as_object_mut(), full.as_object()) {
+            for (k, v) in full_map {
+                front_map.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+    serde_json::to_string(&front)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 fn parse_hfqm_index(
     mmap: &[u8],
     base: usize,
     metadata_offset: usize,
     data_offset: usize,
     n_entries: usize,
+    version: u32,
 ) -> std::io::Result<(String, Vec<HfqPackageEntry>, HashMap<String, usize>)> {
     if metadata_offset > data_offset || data_offset > mmap.len() {
         return Err(std::io::Error::new(
@@ -115,7 +184,24 @@ fn parse_hfqm_index(
             "HFQM metadata JSON did not end",
         )
     })?;
-    let metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
+    let mut metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
+    if version >= 2 {
+        metadata_json = merge_tail_metadata(metadata_json, |offset, size| {
+            let end = offset.checked_add(size).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM tail range overflow")
+            })?;
+            if end > mmap.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "HFQM tail range {offset}..{end} exceeds file size {}",
+                        mmap.len()
+                    ),
+                ));
+            }
+            Ok(mmap[offset..end].to_vec())
+        })?;
+    }
     let mut pos = metadata_offset + json_end;
     if pos + 4 > data_offset {
         return Err(std::io::Error::new(
@@ -134,7 +220,6 @@ fn parse_hfqm_index(
 
     let mut entries = Vec::with_capacity(n_entries);
     let mut entry_map = HashMap::new();
-    let mut cumulative_offset = data_offset;
     for i in 0..n_entries {
         if pos + 2 > data_offset {
             return Err(std::io::Error::new(
@@ -156,7 +241,8 @@ fn parse_hfqm_index(
         pos += 1;
         let n_dims = mmap[pos] as usize;
         pos += 1;
-        if pos + n_dims * 4 + 12 > data_offset {
+        let per_entry_tail = if version >= 2 { 20 } else { 12 };
+        if pos + n_dims * 4 + per_entry_tail > data_offset {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "HFQM index truncated at shape/data_size",
@@ -171,13 +257,34 @@ fn parse_hfqm_index(
         pos += 4;
         let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
         pos += 8;
-        if cumulative_offset + data_size > mmap.len() {
+        let data_offset = if version >= 2 {
+            let offset_div32 = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            offset_div32
+                .checked_mul(HFQM_V2_OFFSET_ALIGN)
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM v2 offset overflow")
+                })?
+        } else {
+            data_offset
+                + entries
+                    .iter()
+                    .map(|e: &HfqPackageEntry| e.data_size)
+                    .sum::<usize>()
+        };
+        if data_offset % HFQM_V2_OFFSET_ALIGN != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("HFQM entry {name} offset {data_offset} is not 32-byte aligned"),
+            ));
+        }
+        if data_offset + data_size > mmap.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
                     "HFQM entry {name} data range {}..{} exceeds file size {}",
-                    cumulative_offset,
-                    cumulative_offset + data_size,
+                    data_offset,
+                    data_offset + data_size,
                     mmap.len()
                 ),
             ));
@@ -188,10 +295,9 @@ fn parse_hfqm_index(
             quant_type,
             shape,
             group_size,
-            data_offset: cumulative_offset - base,
+            data_offset: data_offset - base,
             data_size,
         });
-        cumulative_offset += data_size;
     }
     Ok((metadata_json, entries, entry_map))
 }
@@ -212,7 +318,7 @@ impl HfqPackage {
         let metadata_offset = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
         let data_offset = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
         let (metadata_json, entries, entry_map) =
-            parse_hfqm_index(&mmap, 0, metadata_offset, data_offset, n_entries)?;
+            parse_hfqm_index(&mmap, 0, metadata_offset, data_offset, n_entries, version)?;
         Ok(Self {
             _file: file,
             mmap,
@@ -248,8 +354,7 @@ pub fn write_hfqm_package_from_files(
     let metadata_bytes = metadata_json.as_bytes();
     let metadata_offset = 32u64;
     let index_offset = metadata_offset + metadata_bytes.len() as u64;
-    let mut index = Vec::new();
-    index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    let mut index_len = 4u64;
     for entry in entries {
         let name_bytes = entry.name.as_bytes();
         if name_bytes.len() > u16::MAX as usize {
@@ -264,6 +369,21 @@ pub fn write_hfqm_package_from_files(
                 format!("HFQM entry has too many dims: {}", entry.name),
             ));
         }
+        index_len += 2 + name_bytes.len() as u64 + 1 + 1 + entry.shape.len() as u64 * 4 + 4 + 8 + 8;
+    }
+    let data_start_unaligned = index_offset + index_len;
+    let data_offset = (data_start_unaligned + 4095) & !4095;
+    let mut planned_offsets = Vec::with_capacity(entries.len());
+    let mut cursor = data_offset;
+    for entry in entries {
+        cursor = (cursor + 31) & !31;
+        planned_offsets.push(cursor);
+        cursor = cursor.saturating_add(entry.data_size);
+    }
+    let mut index = Vec::new();
+    index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (entry, offset) in entries.iter().zip(&planned_offsets) {
+        let name_bytes = entry.name.as_bytes();
         index.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
         index.extend_from_slice(name_bytes);
         index.push(entry.quant_type);
@@ -273,9 +393,8 @@ pub fn write_hfqm_package_from_files(
         }
         index.extend_from_slice(&entry.group_size.to_le_bytes());
         index.extend_from_slice(&entry.data_size.to_le_bytes());
+        index.extend_from_slice(&(offset / 32).to_le_bytes());
     }
-    let data_start_unaligned = index_offset + index.len() as u64;
-    let data_offset = (data_start_unaligned + 4095) & !4095;
 
     f.write_all(HFQM_MAGIC)?;
     f.write_all(&HFQM_VERSION.to_le_bytes())?;
@@ -285,12 +404,18 @@ pub fn write_hfqm_package_from_files(
     f.write_all(&data_offset.to_le_bytes())?;
     f.write_all(metadata_bytes)?;
     f.write_all(&index)?;
-    let pad_size = (data_offset - data_start_unaligned) as usize;
+    let pad_size = (data_offset - (index_offset + index.len() as u64)) as usize;
     if pad_size > 0 {
         f.write_all(&vec![0u8; pad_size])?;
     }
     let mut buf = vec![0u8; 16 * 1024 * 1024];
-    for entry in entries {
+    let mut pos = data_offset;
+    for (entry, offset) in entries.iter().zip(&planned_offsets) {
+        while pos < *offset {
+            let pad = ((*offset - pos) as usize).min(8192);
+            f.write_all(&vec![0u8; pad])?;
+            pos += pad as u64;
+        }
         let expected = std::fs::metadata(&entry.source_path)?.len();
         if expected != entry.data_size {
             return Err(std::io::Error::new(
@@ -309,6 +434,7 @@ pub fn write_hfqm_package_from_files(
                 break;
             }
             f.write_all(&buf[..n])?;
+            pos += n as u64;
         }
     }
     f.flush()?;
@@ -353,8 +479,7 @@ pub fn write_hfqm_package_streaming(
     let meta = metadata_json.as_bytes();
     let metadata_offset = 32u64;
     let index_offset = metadata_offset + meta.len() as u64;
-    let mut index = Vec::new();
-    index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    let mut index_len = 4u64;
     for e in entries {
         let nb = e.name.as_bytes();
         if nb.len() > u16::MAX as usize {
@@ -363,6 +488,21 @@ pub fn write_hfqm_package_streaming(
                 format!("HFQM entry name too long: {}", e.name),
             ));
         }
+        index_len += 2 + nb.len() as u64 + 1 + 1 + e.shape.len() as u64 * 4 + 4 + 8 + 8;
+    }
+    let data_start = index_offset + index_len;
+    let data_offset = (data_start + 4095) & !4095;
+    let mut planned_offsets = Vec::with_capacity(entries.len());
+    let mut cursor = data_offset;
+    for e in entries {
+        cursor = (cursor + 31) & !31;
+        planned_offsets.push(cursor);
+        cursor = cursor.saturating_add(e.data_len);
+    }
+    let mut index = Vec::new();
+    index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (e, offset) in entries.iter().zip(&planned_offsets) {
+        let nb = e.name.as_bytes();
         index.extend_from_slice(&(nb.len() as u16).to_le_bytes());
         index.extend_from_slice(nb);
         index.push(e.quant_type);
@@ -372,9 +512,8 @@ pub fn write_hfqm_package_streaming(
         }
         index.extend_from_slice(&e.group_size.to_le_bytes());
         index.extend_from_slice(&e.data_len.to_le_bytes());
+        index.extend_from_slice(&(offset / 32).to_le_bytes());
     }
-    let data_start = index_offset + index.len() as u64;
-    let data_offset = (data_start + 4095) & !4095;
     let mut f = std::io::BufWriter::new(File::create(path)?);
     f.write_all(HFQM_MAGIC)?;
     f.write_all(&HFQM_VERSION.to_le_bytes())?;
@@ -384,10 +523,20 @@ pub fn write_hfqm_package_streaming(
     f.write_all(&data_offset.to_le_bytes())?;
     f.write_all(meta)?;
     f.write_all(&index)?;
-    f.write_all(&vec![0u8; (data_offset - data_start) as usize])?;
+    f.write_all(&vec![
+        0u8;
+        (data_offset - (index_offset + index.len() as u64))
+            as usize
+    ])?;
     // Stream each payload through a counting writer that enforces the declared
     // data_len, so a producer bug can't silently desync the index from the data.
+    let mut pos = data_offset;
     for (i, e) in entries.iter().enumerate() {
+        while pos < planned_offsets[i] {
+            let pad = ((planned_offsets[i] - pos) as usize).min(8192);
+            f.write_all(&vec![0u8; pad])?;
+            pos += pad as u64;
+        }
         let mut counter = CountingWriter {
             inner: &mut f,
             written: 0,
@@ -402,6 +551,7 @@ pub fn write_hfqm_package_streaming(
                 ),
             ));
         }
+        pos += counter.written;
     }
     f.flush()?;
     Ok(())
@@ -554,6 +704,12 @@ impl HfqFile {
             data_offset,
             n_tensors,
             file_len,
+            version,
+            |offset, size| {
+                let mut tail = vec![0u8; size];
+                read_exact_at_portable(&file, &mut tail, offset as u64)?;
+                Ok(tail)
+            },
         )?;
         let modules = parse_module_table(&metadata_json)?.unwrap_or_default();
         if !modules.is_empty() {
@@ -634,93 +790,30 @@ impl HfqFile {
         let data_offset =
             u64::from_le_bytes(mmap[base + 24..base + 32].try_into().unwrap()) as usize + base;
 
-        // Read metadata JSON
-        // Metadata ends at the tensor index, which starts right after metadata
-        // The tensor index is at metadata_offset + metadata_len
-        // We need to find where the index starts - it's right after metadata
-        // The index starts with a u32 tensor count
-        // Let's scan for it by reading from metadata_offset until we find the tensor count
-        let _index_start = metadata_offset;
-        // First, find the metadata end by looking for the tensor count in the index
-        // The metadata is a JSON blob. The index follows immediately.
-        // We know data_offset, so index is between metadata_offset and data_offset.
-        // The index format starts with n_tensors u32. We need to find where metadata ends.
-        // Since we wrote metadata then index, and metadata_offset = 32 (header size),
-        // we need the metadata length. Let's parse the JSON to find its end.
-        let meta_bytes = &mmap[metadata_offset..data_offset];
-        // Find end of JSON by scanning for matching braces
-        let mut brace_depth = 0i32;
-        let mut in_string = false;
-        let mut escape = false;
-        let mut json_end = 0;
-        for (i, &b) in meta_bytes.iter().enumerate() {
-            if escape {
-                escape = false;
-                continue;
-            }
-            if b == b'\\' && in_string {
-                escape = true;
-                continue;
-            }
-            if b == b'"' {
-                in_string = !in_string;
-                continue;
-            }
-            if !in_string {
-                if b == b'{' {
-                    brace_depth += 1;
+        let meta_index = &mmap[metadata_offset..data_offset];
+        let (metadata_json, tensors, tensor_map) = parse_hfqm_meta_index(
+            meta_index,
+            metadata_offset,
+            data_offset,
+            n_tensors,
+            mmap.len(),
+            version,
+            |offset, size| {
+                let end = offset.checked_add(size).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM tail range overflow")
+                })?;
+                if end > mmap.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "HFQM tail range {offset}..{end} exceeds file size {}",
+                            mmap.len()
+                        ),
+                    ));
                 }
-                if b == b'}' {
-                    brace_depth -= 1;
-                    if brace_depth == 0 {
-                        json_end = i + 1;
-                        break;
-                    }
-                }
-            }
-        }
-        let metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
-
-        // Parse tensor index (follows metadata JSON)
-        let mut pos = metadata_offset + json_end;
-        let idx_n = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()) as usize;
-        assert_eq!(idx_n, n_tensors);
-        pos += 4;
-
-        let mut tensors = Vec::with_capacity(n_tensors);
-        let mut tensor_map = HashMap::new();
-        let mut cumulative_offset = data_offset;
-
-        for i in 0..n_tensors {
-            let name_len = u16::from_le_bytes(mmap[pos..pos + 2].try_into().unwrap()) as usize;
-            pos += 2;
-            let name = String::from_utf8_lossy(&mmap[pos..pos + name_len]).to_string();
-            pos += name_len;
-            let quant_type = mmap[pos];
-            pos += 1;
-            let n_dims = mmap[pos] as usize;
-            pos += 1;
-            let mut shape = Vec::with_capacity(n_dims);
-            for _ in 0..n_dims {
-                shape.push(u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()));
-                pos += 4;
-            }
-            let group_size = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
-            pos += 4;
-            let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
-            pos += 8;
-
-            tensor_map.insert(name.clone(), i);
-            tensors.push(HfqTensorInfo {
-                name,
-                quant_type,
-                shape,
-                group_size,
-                data_offset: cumulative_offset,
-                data_size,
-            });
-            cumulative_offset += data_size;
-        }
+                Ok(mmap[offset..end].to_vec())
+            },
+        )?;
 
         let modules = parse_module_table(&metadata_json)?.unwrap_or_default();
         if !modules.is_empty() {
@@ -1022,6 +1115,8 @@ fn parse_hfqm_meta_index(
     data_offset: usize,
     n_tensors: usize,
     file_len: usize,
+    version: u32,
+    mut read_tail: impl FnMut(usize, usize) -> std::io::Result<Vec<u8>>,
 ) -> std::io::Result<(String, Vec<HfqTensorInfo>, HashMap<String, usize>)> {
     let json_end = json_blob_end(meta_index).ok_or_else(|| {
         std::io::Error::new(
@@ -1029,7 +1124,10 @@ fn parse_hfqm_meta_index(
             "HFQM metadata JSON did not end",
         )
     })?;
-    let metadata_json = String::from_utf8_lossy(&meta_index[..json_end]).to_string();
+    let mut metadata_json = String::from_utf8_lossy(&meta_index[..json_end]).to_string();
+    if version >= 2 {
+        metadata_json = merge_tail_metadata(metadata_json, &mut read_tail)?;
+    }
     let mut pos = json_end;
     if pos + 4 > meta_index.len() {
         return Err(std::io::Error::new(
@@ -1070,7 +1168,8 @@ fn parse_hfqm_meta_index(
         pos += 1;
         let n_dims = meta_index[pos] as usize;
         pos += 1;
-        if pos + n_dims * 4 + 12 > meta_index.len() {
+        let per_entry_tail = if version >= 2 { 20 } else { 12 };
+        if pos + n_dims * 4 + per_entry_tail > meta_index.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "HFQM index truncated at shape/data_size",
@@ -1087,13 +1186,33 @@ fn parse_hfqm_meta_index(
         pos += 4;
         let data_size = u64::from_le_bytes(meta_index[pos..pos + 8].try_into().unwrap()) as usize;
         pos += 8;
-        if cumulative_offset + data_size > file_len {
+        let tensor_offset = if version >= 2 {
+            let offset_div32 =
+                u64::from_le_bytes(meta_index[pos..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            offset_div32
+                .checked_mul(HFQM_V2_OFFSET_ALIGN)
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM v2 offset overflow")
+                })?
+        } else {
+            let offset = cumulative_offset;
+            cumulative_offset = cumulative_offset.saturating_add(data_size);
+            offset
+        };
+        if version >= 2 && tensor_offset % HFQM_V2_OFFSET_ALIGN != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("HFQM tensor {name} offset {tensor_offset} is not 32-byte aligned"),
+            ));
+        }
+        if tensor_offset + data_size > file_len {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
                     "HFQM tensor {name} range {}..{} exceeds file size {}",
-                    cumulative_offset,
-                    cumulative_offset + data_size,
+                    tensor_offset,
+                    tensor_offset + data_size,
                     file_len
                 ),
             ));
@@ -1104,10 +1223,9 @@ fn parse_hfqm_meta_index(
             quant_type,
             shape,
             group_size,
-            data_offset: cumulative_offset,
+            data_offset: tensor_offset,
             data_size,
         });
-        cumulative_offset += data_size;
     }
     let _ = metadata_offset;
     Ok((metadata_json, tensors, tensor_map))

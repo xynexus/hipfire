@@ -815,8 +815,86 @@ pub fn detect_sidecars(path: &Path) -> Sidecars {
         mtp: sib("mtp") || has_bundled("mtp"),
         dflash: sib("dflash") || has_bundled("dflash"),
         triattn: sib("triattn"),
-        hessian: sib("calib"),
+        hessian: sib("calib") || matching_origin_calib_sidecar_exists(path),
     }
+}
+
+fn matching_origin_calib_sidecar_exists(model_path: &Path) -> bool {
+    let model_hashes = origin_weight_hashes(model_path);
+    if model_hashes.is_empty() {
+        return false;
+    }
+    let Some(dir) = model_path.parent() else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        if path == model_path || !path.is_file() {
+            return false;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        if !name.to_ascii_lowercase().ends_with(".calib.hfq") {
+            return false;
+        }
+        let calib_hashes = origin_weight_hashes(&path);
+        calib_hashes.iter().any(|h| model_hashes.contains(h))
+    })
+}
+
+fn origin_weight_hashes(path: &Path) -> std::collections::HashSet<String> {
+    let Some(meta) = read_hfq_metadata(path)
+        .ok()
+        .and_then(|m| serde_json::from_str::<Value>(&m.metadata_json).ok())
+    else {
+        return std::collections::HashSet::new();
+    };
+    let mut hashes = std::collections::HashSet::new();
+    collect_origin_weight_hashes(&meta, "", &mut hashes);
+    hashes
+}
+
+fn collect_origin_weight_hashes(
+    value: &Value,
+    key_path: &str,
+    hashes: &mut std::collections::HashSet<String>,
+) {
+    match value {
+        Value::Object(obj) => {
+            for (key, child) in obj {
+                let next = if key_path.is_empty() {
+                    key.to_ascii_lowercase()
+                } else {
+                    format!("{key_path}.{}", key.to_ascii_lowercase())
+                };
+                collect_origin_weight_hashes(child, &next, hashes);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_origin_weight_hashes(child, key_path, hashes);
+            }
+        }
+        Value::String(s) if key_path_names_origin_weights_hash(key_path) => {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                hashes.insert(trimmed.to_ascii_lowercase());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn key_path_names_origin_weights_hash(key_path: &str) -> bool {
+    let names_origin =
+        key_path.contains("source") || key_path.contains("origin") || key_path.contains("original");
+    let names_weights = key_path.contains("model") || key_path.contains("weight");
+    let names_hash = key_path.contains("sha256") || key_path.contains("hash");
+    names_origin && names_weights && names_hash
 }
 
 /// Full GPU-free description of a local model: identity, quant, arch capability,
@@ -1015,6 +1093,7 @@ pub fn read_hfq_metadata(path: &Path) -> Result<HfqMetadata, String> {
     if &header[0..4] != b"HFQM" {
         return Err("not an HFQ container".to_string());
     }
+    let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
     let arch_id = u32::from_le_bytes(header[8..12].try_into().unwrap());
     let metadata_offset = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
     let data_offset = u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize;
@@ -1031,12 +1110,46 @@ pub fn read_hfq_metadata(path: &Path) -> Result<HfqMetadata, String> {
         .map_err(|e| format!("read HFQ metadata span: {e}"))?;
     let json_end = find_json_object_end(&span)
         .ok_or_else(|| "HFQ metadata JSON object was not terminated".to_string())?;
-    let metadata_json = String::from_utf8(span[..json_end].to_vec())
+    let mut metadata_json = String::from_utf8(span[..json_end].to_vec())
         .map_err(|e| format!("HFQ metadata is not UTF-8: {e}"))?;
+    if version >= 2 {
+        metadata_json = merge_hfq_tail_metadata(&mut f, metadata_json)?;
+    }
     Ok(HfqMetadata {
         arch_id,
         metadata_json,
     })
+}
+
+fn merge_hfq_tail_metadata(f: &mut File, front_json: String) -> Result<String, String> {
+    let mut front: Value = serde_json::from_str(&front_json)
+        .map_err(|e| format!("HFQ v2 front metadata is not valid JSON: {e}"))?;
+    let Some(tail_meta) = front.get("tail_metadata").cloned() else {
+        return Ok(front_json);
+    };
+    let offset = tail_meta
+        .get("offset")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "HFQ v2 tail offset missing".to_string())?;
+    let size = tail_meta
+        .get("size")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "HFQ v2 tail size missing".to_string())? as usize;
+    f.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("seek HFQ v2 tail metadata: {e}"))?;
+    let mut bytes = vec![0u8; size];
+    f.read_exact(&mut bytes)
+        .map_err(|e| format!("read HFQ v2 tail metadata: {e}"))?;
+    let tail: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("HFQ v2 tail metadata is not valid JSON: {e}"))?;
+    if let Some(full) = tail.get("metadata").and_then(Value::as_object) {
+        if let Some(front_map) = front.as_object_mut() {
+            for (k, v) in full {
+                front_map.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+    serde_json::to_string(&front).map_err(|e| format!("serialize merged HFQ metadata: {e}"))
 }
 
 fn read_hfq_inventory(path: &Path) -> Result<(HfqMetadata, Vec<HfqIndexTensor>), String> {
@@ -1047,6 +1160,7 @@ fn read_hfq_inventory(path: &Path) -> Result<(HfqMetadata, Vec<HfqIndexTensor>),
     if &header[0..4] != b"HFQM" {
         return Err("not an HFQ container".to_string());
     }
+    let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
     let arch_id = u32::from_le_bytes(header[8..12].try_into().unwrap());
     let n_tensors = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
     let metadata_offset = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
@@ -1064,8 +1178,11 @@ fn read_hfq_inventory(path: &Path) -> Result<(HfqMetadata, Vec<HfqIndexTensor>),
         .map_err(|e| format!("read HFQ metadata span: {e}"))?;
     let json_end = find_json_object_end(&span)
         .ok_or_else(|| "HFQ metadata JSON object was not terminated".to_string())?;
-    let metadata_json = String::from_utf8(span[..json_end].to_vec())
+    let mut metadata_json = String::from_utf8(span[..json_end].to_vec())
         .map_err(|e| format!("HFQ metadata is not UTF-8: {e}"))?;
+    if version >= 2 {
+        metadata_json = merge_hfq_tail_metadata(&mut f, metadata_json)?;
+    }
 
     if n_tensors == 0 && json_end == span.len() {
         return Ok((
@@ -1106,7 +1223,8 @@ fn read_hfq_inventory(path: &Path) -> Result<(HfqMetadata, Vec<HfqIndexTensor>),
         pos += 1;
         let n_dims = span[pos] as usize;
         pos += 1;
-        if pos + n_dims * 4 + 12 > span.len() {
+        let per_entry_tail = if version >= 2 { 20 } else { 12 };
+        if pos + n_dims * 4 + per_entry_tail > span.len() {
             return Err("HFQ index truncated at shape/data size".to_string());
         }
         let mut shape = Vec::with_capacity(n_dims);
@@ -1116,6 +1234,9 @@ fn read_hfq_inventory(path: &Path) -> Result<(HfqMetadata, Vec<HfqIndexTensor>),
         }
         pos += 4; // group_size
         pos += 8; // data_size
+        if version >= 2 {
+            pos += 8; // offset_div32
+        }
         tensors.push(HfqIndexTensor {
             name,
             quant_type,
@@ -2704,6 +2825,60 @@ mod tests {
             model_display_name(Path::new("qwen3.5-9b-mq4.hfq.tmp")),
             "qwen3.5-9b-mq4.hfq"
         );
+    }
+
+    #[test]
+    fn detect_sidecars_finds_calib_by_origin_weight_hash() {
+        let root = temp_dir("hipfire-model-calib-origin-hash");
+        fs::create_dir_all(&root).unwrap();
+        let model = root.join("Qwen3.5-9B.mq4.hfq");
+        let calib = root.join("Qwen3.5-9B.bf16.calib.hfq");
+        write_minimal_hfq(
+            &model,
+            &json!({
+                "origin": {
+                    "weights": {
+                        "sha256": "AbC123"
+                    }
+                }
+            }),
+        );
+        write_minimal_hfq(
+            &calib,
+            &json!({
+                "artifact_kind": "calibration",
+                "source_model_sha256": "abc123"
+            }),
+        );
+
+        assert!(detect_sidecars(&model).hessian);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn detect_sidecars_ignores_mismatched_calib_origin_hash() {
+        let root = temp_dir("hipfire-model-calib-origin-hash-mismatch");
+        fs::create_dir_all(&root).unwrap();
+        let model = root.join("Qwen3.5-9B.mq4.hfq");
+        let calib = root.join("Qwen3.5-9B.bf16.calib.hfq");
+        write_minimal_hfq(
+            &model,
+            &json!({
+                "origin_weights_sha256": "abc123"
+            }),
+        );
+        write_minimal_hfq(
+            &calib,
+            &json!({
+                "artifact_kind": "calibration",
+                "source_model_sha256": "def456"
+            }),
+        );
+
+        assert!(!detect_sidecars(&model).hessian);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
