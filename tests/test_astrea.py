@@ -101,6 +101,43 @@ class AstreaTests(unittest.TestCase):
         buf += b"\0" * sum(item[4] for item in tensors)
         path.write_bytes(buf)
 
+    def write_hfqm_imatrix(self, path, tensors, *, tokens=4):
+        metadata = json.dumps(
+            {
+                "artifact_kind": "calibration",
+                "artifacts": ["imatrix"],
+                "input_token_count": tokens,
+                "per_tensor_tokens": {name: tokens for name in tensors},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        index = bytearray(struct.pack("<I", len(tensors)))
+        payloads = []
+        for base_name, values in tensors.items():
+            name = f"{base_name}.imatrix"
+            raw_name = name.encode("utf-8")
+            payload = struct.pack(f"<{len(values)}f", *values)
+            index += struct.pack("<H", len(raw_name))
+            index += raw_name
+            index += struct.pack("<B", 2)  # F32
+            index += struct.pack("<B", 1)
+            index += struct.pack("<I", len(values))
+            index += struct.pack("<I", 0)
+            index += struct.pack("<Q", len(payload))
+            payloads.append(payload)
+        data_offset = 32 + len(metadata) + len(index)
+        buf = bytearray(b"HFQM")
+        buf += struct.pack("<I", 1)
+        buf += struct.pack("<I", 24)
+        buf += struct.pack("<I", len(tensors))
+        buf += struct.pack("<Q", 32)
+        buf += struct.pack("<Q", data_offset)
+        buf += metadata
+        buf += index
+        for payload in payloads:
+            buf += payload
+        path.write_bytes(buf)
+
     def write_minimal_safetensors(self, path, tensors=None):
         tensors = tensors or {
             "model.language_model.layers.0.mlp.gate_proj.weight": {
@@ -994,6 +1031,60 @@ class AstreaTests(unittest.TestCase):
         )
         self.assertTrue(selected["sensitivity_alias"])
         self.assertEqual(selected["extra_bytes"], 136)
+
+    def test_policy_can_score_hfq_tensors_from_native_hfqm_imatrix(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "synthetic-oq8.hfq"
+            imatrix = root / "synthetic.calib.hfq"
+            gate = "model.language_model.layers.0.mlp.gate_proj"
+            query = "model.language_model.layers.0.self_attn.q_proj"
+            self.write_minimal_hfq(
+                model,
+                tensors=[
+                    (f"{gate}.weight", 35, [1, 256], 256, 258),
+                    (f"{query}.weight", 35, [1, 256], 256, 258),
+                ],
+            )
+            self.write_hfqm_imatrix(
+                imatrix,
+                {
+                    gate: [8.0] * 256,
+                    query: [4.0] * 256,
+                },
+                tokens=4,
+            )
+
+            policy = astrea.build_policy(
+                model=str(model),
+                base_format="oq8",
+                promotion_format="q8",
+                imatrix=str(imatrix),
+                max_extra_bytes=14,
+                methods=["imatrix-kmap"],
+                policy_id="native-hfqm-policy-smoke",
+            )
+
+        self.assertEqual(policy["sensitivity"]["source"], "hfqm-imatrix")
+        self.assertEqual(policy["sensitivity"]["matched_count"], 2)
+        self.assertEqual(policy["sensitivity"]["errors"], [])
+        self.assertEqual(policy["candidate_count"], 2)
+        self.assertEqual(policy["selected_count"], 1)
+        self.assertEqual(policy["selected"][0]["hfq_name"], f"{gate}.weight")
+        self.assertAlmostEqual(policy["selected"][0]["score"], 2.0)
+
+    def test_report_rejects_candidate_when_any_gate_artifact_failed(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            policy = root / "policy.json"
+            comparison = root / "comparison.json"
+            policy.write_text(json.dumps({"schema": astrea.POLICY_SCHEMA}), encoding="utf-8")
+            comparison.write_text(json.dumps({"status": "fail"}), encoding="utf-8")
+            report = astrea.build_report([str(policy), str(comparison)])
+
+        self.assertEqual(report["recommendation"], "candidate rejected; do not promote or package")
 
     def test_mixed_policy_emits_g256_segments_from_imatrix(self):
         astrea = load_astrea()

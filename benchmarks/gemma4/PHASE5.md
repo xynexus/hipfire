@@ -2,7 +2,8 @@
 
 Date: 2026-07-15. Status updated: 2026-07-16. Historical BF16 gate blocked;
 canonical OQ8, OQ8+, BF16-`down_proj`, and BF16-attention-`o_proj` anchor
-candidates rejected at SWA-1.
+candidates rejected at SWA-1; imatrix-ranked dynamic Q8 promotion rejected at
+base-short.
 
 ## OQ8 contract revision
 
@@ -211,6 +212,54 @@ SWA+1, IT, and OQ8++ were not run. Durable evidence is under
 comparison SHA256 is
 `8eec19a6b56c128710c4f3bbe0c443ba44a7f8934b186bd9f41c94260a15ba4a`.
 The broad OQ8 and final OQ8++ thresholds remain frozen.
+
+## Imatrix-ranked dynamic Q8 promotion rejection
+
+The next candidate uses a data-driven mixed-format policy instead of another
+hand-selected projection anchor. Astrea now consumes the native HFQM imatrix
+package directly, normalizes each activation-energy vector by its recorded
+per-tensor token count, and matches all 410 calibrated text projections to the
+plain OQ8 HFQ. Three planning-only budgets were inspected before model results;
+the experiment froze a 512 MiB maximum extra-byte budget. The selected policy:
+
+- promotes 216 calibrated text projections to runtime-compatible Q8F16;
+- leaves 194 calibrated text projections in OQ8G256;
+- covers all 60 decoder layers;
+- selects 60 `k_proj`, 57 `q_proj`, 50 `v_proj`, 17 `gate_proj`, 16 `up_proj`,
+  15 `o_proj`, and one `down_proj` tensor;
+- has policy SHA256
+  `8a6c1e7abdf1e0b601bc60c64ef18abb14e0f5d543c105f3cec8eb53143d4702`
+  and ordered-selection SHA256
+  `ed7be28e40f93e13a049d24d523c821ec8c011b8d41c445e600d3b2e1a92e067`.
+
+The resulting `Gemma-4-31B-imatrix-Q8-promotion.oq8.hfq` is 32,241,275,288
+bytes with 1,188 tensors, payload size 32,204,050,840 bytes, and quantization
+hash `549759cd8511b5b9`. Its format counts are 586 BF16, 385 OQ8G256, and 217
+Q8F16 tensors; the extra Q8F16 tensor is the existing language embedding.
+Independent validation proves exact equality between the policy selection,
+metadata overrides, and actual 216 promoted language-layer tensors, with no
+unselected language-layer Q8F16 tensor. It also verifies the pinned Gemma 4
+tokenizer SHA256
+`12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6`.
+
+Runtime loading, exact eight-token greedy output, final argmax `7001`, top-5
+overlap `5/5`, finiteness, reset, and unload/reload all pass. The candidate
+nevertheless fails four frozen base-short conditions:
+
+- layer 57 cosine `0.9948628794395625`;
+- layer 57 NRMSE `0.10123335283173694`;
+- final-logit cosine `0.998923919187978`;
+- final-logit maximum absolute error `1.2854795455932617`.
+
+These are all worse than the frozen plain-OQ8 base-short values. The comparison
+SHA256 is `21c4101b6592375eb79832f16999450e8a61851d6b12684e82e045a7f6329547`;
+durable evidence is under
+`~/.hipfire/evidence/gemma4/phase5-oq8-dynamic-q8-admission-v1`, with the policy,
+artifact validation, and Astrea rejection report under
+`~/.hipfire/evidence/gemma4/oq8-dynamic-q8-policy-v1`. Per the stop rule, SWA-1,
+SWA, SWA+1, IT, and OQ8++ were not run. Activation-energy ranking alone is
+rejected as the mixed-format selection basis. Both threshold files remain
+frozen.
 
 ## Historical BF16 base-short result
 
@@ -607,5 +656,7 @@ The original BF16 base-short verdict is therefore unchanged: final-logit maximum
 error is `0.5618224143981934`; hidden thresholds fail at layers 39, 52, 56, 57,
 and 58. The BF16 candidate path stopped here. Under the explicit OQ8 revision,
 current Phase 5 advanced through base-short, multi-global, and
-reload/sequential gates, then stopped at SWA-1 for all four tested OQ8-family
-candidates before the SWA, SWA+1, or instruction-checkpoint gates.
+reload/sequential gates, then stopped at SWA-1 for the first four tested
+OQ8-family candidates before the SWA, SWA+1, or instruction-checkpoint gates.
+The fifth, imatrix-ranked dynamic Q8 promotion candidate failed base-short and
+therefore did not advance to SWA-1.

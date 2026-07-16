@@ -105,6 +105,7 @@ SUPPORTED_FORMATS = {
     "hfp4",
     "mfp4",
     "paro4",
+    "oq8",
     "q8",
     "f16",
 }
@@ -2966,6 +2967,8 @@ def estimate_format_data_size(shape, quant_format):
         return elements * 2
     if fmt == "q8":
         return q8f16_data_size_for_shape(shape)
+    if fmt == "oq8":
+        return ceil_div(elements, 256) * 258
     if fmt in {"mq4", "hfq4"}:
         return ceil_div(elements, 256) * 136
     if fmt == "mq3":
@@ -3020,6 +3023,11 @@ def load_json_sensitivity(path):
 
 
 def load_imatrix_sensitivity(model, imatrix):
+    with Path(imatrix).open("rb") as f:
+        magic = f.read(4)
+    if magic == b"HFQM":
+        return load_hfqm_imatrix_sensitivity(model, imatrix)
+
     join = match_imatrix_to_hfq(model, imatrix, max_tensors=0)
     scores = {}
     aliases = {}
@@ -3041,6 +3049,72 @@ def load_imatrix_sensitivity(model, imatrix):
         "path": str(imatrix),
         "matched_count": join["matched_count"],
         "unmatched_count": join["unmatched_count"],
+        "errors": errors[:16],
+        "score_count": len(scores),
+        "scores": scores,
+        "aliases": aliases,
+    }
+
+
+def load_hfqm_imatrix_sensitivity(model, imatrix):
+    _, model_tensors = read_hfq_index(model, max_tensors=0)
+    calibration_summary, calibration_tensors = read_hfq_index(imatrix, max_tensors=0)
+    scores = {}
+    aliases = {}
+    errors = []
+    unmatched = []
+
+    path = Path(imatrix)
+    with path.open("rb") as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            metadata_offset = struct.unpack_from("<Q", mm, 16)[0]
+            data_offset = struct.unpack_from("<Q", mm, 24)[0]
+            metadata_region = mm[metadata_offset:data_offset]
+            metadata_end = json_object_end(metadata_region)
+            metadata = json.loads(metadata_region[:metadata_end].decode("utf-8"))
+            per_tensor_tokens = metadata.get("per_tensor_tokens") or {}
+            default_tokens = float(metadata.get("input_token_count") or 1.0)
+
+            for name, tensor in sorted(calibration_tensors.items()):
+                if not name.endswith(".imatrix"):
+                    continue
+                if tensor["quant_type_name"] != "F32":
+                    errors.append({"imatrix_name": name, "error": "native imatrix tensor is not F32"})
+                    continue
+                count = tensor_element_count(tensor["shape"])
+                if count <= 0 or tensor["data_size"] != count * 4:
+                    errors.append({"imatrix_name": name, "error": "native imatrix tensor has invalid shape or byte count"})
+                    continue
+
+                base_name = name[: -len(".imatrix")]
+                hfq_name = next(
+                    (candidate for candidate in (f"{base_name}.weight", base_name) if candidate in model_tensors),
+                    None,
+                )
+                if hfq_name is None:
+                    unmatched.append(name)
+                    continue
+
+                tokens = float(per_tensor_tokens.get(base_name) or default_tokens)
+                if not math.isfinite(tokens) or tokens <= 0.0:
+                    errors.append({"imatrix_name": name, "error": "native imatrix token count is not positive and finite"})
+                    continue
+                values = struct.unpack_from(f"<{count}f", mm, tensor["data_offset"])
+                if any(not math.isfinite(value) for value in values):
+                    errors.append({"imatrix_name": name, "error": "native imatrix contains non-finite values"})
+                    continue
+                score = sum(max(float(value) / tokens, 0.0) for value in values) / count
+                scores[hfq_name] = score
+                aliases[hfq_name] = name
+
+    return {
+        "source": "hfqm-imatrix",
+        "path": str(imatrix),
+        "tensor_names_md5": calibration_summary["tensor_names_md5"],
+        "token_normalization": "per_tensor_tokens",
+        "matched_count": len(scores),
+        "unmatched_count": len(unmatched),
+        "unmatched": unmatched[:16],
         "errors": errors[:16],
         "score_count": len(scores),
         "scores": scores,
@@ -3746,7 +3820,9 @@ def build_bundle_plan(
 def build_report(paths):
     items = [load_json(path) for path in paths]
     metric_items = [item for item in items if item.get("schema") == METRICS_SCHEMA]
-    if any(item.get("verdict") == "quality_improved" for item in metric_items):
+    if any(item.get("status") in {"fail", "rejected"} for item in items):
+        recommendation = "candidate rejected; do not promote or package"
+    elif any(item.get("verdict") == "quality_improved" for item in metric_items):
         recommendation = "quality improved; run Atlas AR/DFlash perf gates before promotion"
     elif metric_items:
         recommendation = "quality evidence does not justify promotion yet"
