@@ -1,7 +1,7 @@
 # Plan: Gemma 4 support with reusable transformer seams
 
-Status: **stopped at the revised Phase 5 dense-31B OQ8 SWA-1 gate; OQ8+
-remediation also rejected**.
+Status: **stopped at the revised Phase 5 dense-31B OQ8 SWA-1 gate; OQ8+ and
+BF16 `down_proj` anchor remediations also rejected**.
 Branch: `chaingun`. Plan date: 2026-07-15. Status updated: 2026-07-16.
 
 This is the canonical Gemma 4 plan. When older roadmap text disagrees with this
@@ -27,13 +27,13 @@ stage in `benchmarks/gemma4/oq8pp-thresholds.json`.
 | 2 — shared loader | passed | `TransformerLoader` is shared by Gemma 3 and Gemma 4; Gemma 3 regression evidence is retained. |
 | 3 — layered KV | passed | Mixed full/SWA geometry, shared-producer planning, exact storage accounting, reset, and GPU boundary parity are implemented. |
 | 4 — primitives/lowered forward | passed | Proportional RoPE, weightless RMSNorm, vector softcap, reference forward, and lowered dense forward passed operator, tiny-model, portability-compile, and coherence gates. |
-| 5 — dense 31B/serving | stopped at frozen OQ8 gate | Dense loading, bounded state, lowered execution, and the boxed serving factory exist. The real 31B OQ8 and OQ8+ base-short, all-global-layer, second-request, and unload/reload gates pass. Both candidates fail the first SWA boundary at 1023 tokens, so SWA/SWA+1 and IT were not run. |
+| 5 — dense 31B/serving | stopped at frozen OQ8 gate | Dense loading, bounded state, lowered execution, and the boxed serving factory exist. The real 31B OQ8, OQ8+, and diagnostic OQ8-with-BF16-`down_proj` candidates pass base-short, all-global-layer, second-request, and unload/reload gates. All three fail the first SWA boundary at 1023 tokens, so SWA/SWA+1 and IT were not run. |
 | 6 — prompt/tools/sampling | implementation gates passed, model not admitted | Official Jinja bytes and all 1,640 fixture token IDs match; native tools/channels, metadata EOS IDs `[1, 106, 50]`, and generic top-k 64 pass their gates. 31B-it remains unadmitted until the remaining Phase 5 OQ8 gates pass. |
 | 7 — PLE/KV sharing | scaffold only | Config lowering and generic shared-KV storage exist; the real Gemma 4 loader/forward intentionally rejects PLE and shared-KV variants. |
 | 8 — dense-plus-MoE | scaffold only | Ingest/config/toy coverage exists; no Gemma 4 routed-expert runtime or real-model admission exists. |
-| 9 — quant/eval | OQ8 and OQ8+ candidates rejected at Phase 5 | Plain OQ8 and a real activation-calibrated OQ8+ artifact have exact-prompt evidence, but both SWA-1 whole-model captures fail the frozen broad gate. Eval promotion and per-variant admission do not proceed for either candidate. |
+| 9 — quant/eval | three OQ8-family candidates rejected at Phase 5 | Plain OQ8, real activation-calibrated OQ8+, and a diagnostic OQ8 artifact with all 60 FFN `down_proj` tensors retained in BF16 have exact-prompt evidence. Every SWA-1 whole-model capture fails the frozen broad gate, so eval promotion and per-variant admission do not proceed. |
 | 10 — unified/multimodal/DSpark | not started | Only fixture/config investigation exists; no unified 12B, multimodal, or DSpark spec-decode runtime is claimed. |
-| 11 — final OQ8++ narrowing | deferred by broad-gate failure | After a broad OQ8-family candidate passes Phase 5, produce OQ8++ from the same pinned source and pass the unchanged former strict limits. Neither rejected OQ8 nor rejected OQ8+ advances to this stage. |
+| 11 — final OQ8++ narrowing | deferred by broad-gate failure | After a broad OQ8-family candidate passes Phase 5, produce OQ8++ from the same pinned source and pass the unchanged former strict limits. None of the three rejected broad-gate candidates advances to this stage. |
 
 The revised Phase 5 baseline is the valid exact-prompt OQ8 result at
 `~/.hipfire/evidence/gemma4/base-short-hipfire-all-layers-oq8-exact-prompt`:
@@ -99,6 +99,32 @@ limits do not. The comparison SHA256 is
 `205c52bb8c7ebf9f8dad1f99e614e8e46ed1173346b7fca0140fc1e5b14cf9e5`
 under `~/.hipfire/evidence/gemma4/phase5-oq8plus-admission-v1`. The gate remains
 frozen; SWA, SWA+1, IT, and final OQ8++ promotion were not run.
+
+A separate residual-write diagnostic retains all 60 language-model FFN
+`down_proj.weight` tensors in BF16 and keeps every other language-model
+projection in OQ8G256. The resulting
+`Gemma-4-31B-downbf16.oq8.hfq` is 38,586,917,272 bytes, has quantization hash
+`cb8eb6e621917c3d`, and embeds the pinned Gemma 4 tokenizer SHA256
+`12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6`.
+It passes base-short and lifecycle with minimum hidden cosine
+`0.9963057427527575`, maximum hidden NRMSE `0.08614873066273741`, final-logit
+cosine `0.9994882960196833`, maximum absolute error `1.0222406387329102`, and
+exact greedy/argmax/top-5/reset/reload agreement. The base-short comparison
+SHA256 is `d18f7d3c579ea5286d97c7d227142e42fccb0de2220c4033e0e48cabb5616447`.
+
+The BF16 `down_proj` anchor does not fix cumulative SWA-1 drift. Layer 58
+cosine/NRMSE are `0.9693396841748947`/`0.25272996220496396`, layer 59 values
+are `0.99197309255537`/`0.18601964761028233`, and final-logit cosine/maximum
+error are `0.8938572882264477`/`5.484806060791016`. All values are finite and
+the first greedy token, final argmax, and full top-5 set still match. This is
+worse than both plain OQ8 and OQ8+ on final-logit cosine and maximum error, so
+FFN down-projection precision is rejected as the remediation basis. Durable
+evidence is under
+`~/.hipfire/evidence/gemma4/phase5-oq8-downbf16-admission-v1`; the SWA-1
+comparison SHA256 is
+`d9b6d4783b868405e4fa11149332ba7ea564acc2b9a9c427c33fbe4a216fd3ae`.
+The next candidate must use a materially different error-control basis. The
+frozen stop rule still defers SWA, SWA+1, IT, and final OQ8++ promotion.
 
 The earlier BF16 result remains useful historical localization evidence, not the
 product admission target. Its best final-logit maximum error was
