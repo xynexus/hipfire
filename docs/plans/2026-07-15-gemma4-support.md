@@ -21,6 +21,12 @@ the result and is recorded honestly rather than presented as a pre-observation
 gate. The former strict limits remain unchanged as the final OQ8++ narrowing
 stage in `benchmarks/gemma4/oq8pp-thresholds.json`.
 
+Local execution capacity changed on 2026-07-16: `nix1`, the `gfx1103` Phoenix
+UMA validation host, was upgraded from 32 GB to 64 GB of RAM. This increases
+the local headroom available for bounded Gemma 4 conversion, calibration, and
+capture workflows; it does not change the frozen OQ8 admission values or the
+final OQ8++ narrowing gate.
+
 | phase | status | current result |
 |---|---|---|
 | 0 — truth freeze | passed, contract revised | Pinned config, tensor, prompt/token, and BF16 oracle fixtures remain authoritative. Separate OQ8 baseline and OQ8++ narrowing thresholds are committed under `benchmarks/gemma4/`. |
