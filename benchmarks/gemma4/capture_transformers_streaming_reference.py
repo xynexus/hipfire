@@ -18,6 +18,7 @@ import argparse
 from collections import UserDict
 import gc
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 
@@ -26,6 +27,21 @@ from safetensors import safe_open
 import torch
 import torch.nn.functional as F
 import transformers
+
+# Some ROCm development environments expose an empty torchvision namespace
+# without torchvision.io. Transformers treats that namespace as an installed
+# vision backend unless its optional-backend probe is corrected before Gemma 4
+# imports. Text-only capture must not require torchvision.
+if (
+    importlib.util.find_spec("torchvision") is not None
+    and importlib.util.find_spec("torchvision.io") is None
+):
+    from transformers.utils import import_utils
+
+    import_utils.is_torchvision_available.cache_clear()
+    import_utils.is_torchvision_available = lambda: False
+    transformers.utils.is_torchvision_available = lambda: False
+
 from transformers import Gemma4Config
 from transformers.masking_utils import (
     create_causal_mask,
@@ -37,6 +53,8 @@ from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4TextRotaryEmbedding,
 )
 
+from imatrix_hfqm import write_imatrix_hfqm
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -47,6 +65,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=1)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--head-chunk-rows", type=int, default=4096)
+    parser.add_argument(
+        "--transition-output",
+        type=Path,
+        help="optional directory for full-sequence exact layer-transition inputs",
+    )
+    parser.add_argument(
+        "--transition-layers",
+        help="comma-separated layers written to --transition-output",
+    )
+    parser.add_argument(
+        "--imatrix-output",
+        type=Path,
+        help=(
+            "optional imatrix-only HFQM calibration package populated from every "
+            "decoder projection input"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -73,6 +108,63 @@ def parse_layers(raw: str, count: int) -> list[int]:
     if any(not 0 <= layer < count for layer in layers):
         raise ValueError(f"capture layers {layers} exceed layer count {count}")
     return layers
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def model_revision(model: Path) -> str | None:
+    resolved = model.resolve()
+    if resolved.parent.name == "snapshots":
+        return resolved.name
+    cache_ref = resolved.parent.parent / "refs" / "main"
+    return cache_ref.read_text().strip() if cache_ref.is_file() else None
+
+
+class ProjectionImatrix:
+    """Accumulate projection-input mean squares without retaining activations."""
+
+    def __init__(self) -> None:
+        self.sums: dict[str, np.ndarray] = {}
+        self.counts: dict[str, int] = {}
+
+    def hook(self, name: str):
+        def capture(_module, inputs) -> None:
+            if not inputs or not isinstance(inputs[0], torch.Tensor):
+                raise ValueError(f"projection {name} did not receive a tensor input")
+            activation = inputs[0].detach()
+            if activation.ndim == 0:
+                raise ValueError(f"projection {name} received a scalar activation")
+            rows = activation.reshape(-1, activation.shape[-1]).float()
+            sumsq = rows.square().sum(dim=0).cpu().numpy().astype(np.float64)
+            if name in self.sums:
+                if self.sums[name].shape != sumsq.shape:
+                    raise ValueError(f"projection {name} changed input width")
+                self.sums[name] += sumsq
+                self.counts[name] += rows.shape[0]
+            else:
+                self.sums[name] = sumsq
+                self.counts[name] = rows.shape[0]
+
+        return capture
+
+    def attach(self, layer: torch.nn.Module, prefix: str):
+        handles = []
+        names = []
+        for module_name, module in layer.named_modules():
+            if not isinstance(module, torch.nn.Linear):
+                continue
+            name = f"{prefix}{module_name}"
+            handles.append(module.register_forward_pre_hook(self.hook(name)))
+            names.append(name)
+        if not names:
+            raise ValueError(f"decoder layer {prefix} contains no linear projections")
+        return handles, names
 
 
 class TensorSource:
@@ -168,7 +260,21 @@ def main() -> None:
     config = wrapper.text_config
     config._attn_implementation = "sdpa"
     layers = parse_layers(args.layers, config.num_hidden_layers)
+    if (args.transition_output is None) != (args.transition_layers is None):
+        raise ValueError(
+            "--transition-output and --transition-layers must be provided together"
+        )
+    transition_layers = (
+        parse_layers(args.transition_layers, config.num_hidden_layers)
+        if args.transition_layers is not None
+        else []
+    )
+    transition_layer_set = set(transition_layers)
+    if args.transition_output is not None:
+        args.transition_output.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
+    imatrix = ProjectionImatrix() if args.imatrix_output is not None else None
+    expected_imatrix_names: set[str] = set()
 
     with torch.no_grad():
         source = TensorSource(args.model)
@@ -194,19 +300,42 @@ def main() -> None:
         selected: dict[str, np.ndarray] = {}
 
         for layer_index in range(config.num_hidden_layers):
+            if layer_index in transition_layer_set:
+                hidden_states.float().cpu().numpy().astype("<f4", copy=False).tofile(
+                    args.transition_output / f"input_layer_{layer_index}.f32"
+                )
             layer = load_layer(source, config, layer_index, device)
+            hook_handles = []
+            if imatrix is not None:
+                prefix = f"model.language_model.layers.{layer_index}."
+                hook_handles, hook_names = imatrix.attach(layer, prefix)
+                for name in hook_names:
+                    weight_name = f"{name}.weight"
+                    if weight_name not in source.weight_map:
+                        raise KeyError(
+                            f"captured projection {name} has no source tensor {weight_name}"
+                        )
+                expected_imatrix_names.update(hook_names)
             layer_type = config.layer_types[layer_index]
-            hidden_states = layer(
-                hidden_states,
-                shared_kv_states=shared_kv_states,
-                position_embeddings=position_embeddings[layer_type],
-                attention_mask=masks[layer_type],
-                position_ids=position_ids,
-                past_key_values=None,
-            )
+            try:
+                hidden_states = layer(
+                    hidden_states,
+                    shared_kv_states=shared_kv_states,
+                    position_embeddings=position_embeddings[layer_type],
+                    attention_mask=masks[layer_type],
+                    position_ids=position_ids,
+                    past_key_values=None,
+                )
+            finally:
+                for handle in hook_handles:
+                    handle.remove()
             if layer_index in layers:
                 selected[f"hidden_layer_{layer_index}"] = (
                     hidden_states[:, -1:, :].float().cpu().numpy()
+                )
+            if layer_index in transition_layer_set:
+                hidden_states.float().cpu().numpy().astype("<f4", copy=False).tofile(
+                    args.transition_output / f"expected_layer_{layer_index}.f32"
                 )
             del layer
             gc.collect()
@@ -236,14 +365,78 @@ def main() -> None:
         generated_ids=np.asarray([input_ids + [next_token]], dtype=np.uint32),
         **selected,
     )
-    revision = None
-    cache_ref = args.model.parent.parent / "refs" / "main"
-    if cache_ref.is_file():
-        revision = cache_ref.read_text().strip()
+    revision = model_revision(args.model)
+    tokenizer_path = args.model / "tokenizer.json"
+    tokenizer_sha256 = sha256_file(tokenizer_path)
+    if imatrix is not None:
+        captured_names = set(imatrix.sums)
+        if captured_names != expected_imatrix_names:
+            missing = sorted(expected_imatrix_names - captured_names)
+            extra = sorted(captured_names - expected_imatrix_names)
+            raise ValueError(
+                f"imatrix projection coverage mismatch: missing={missing}, extra={extra}"
+            )
+        imatrix_metadata = {
+            "schema": "hipfire.gemma4.streaming-imatrix.v1",
+            "artifact_kind": "calibration",
+            "artifacts": ["imatrix"],
+            "model_family": "gemma4",
+            "source_model": str(args.model.resolve()),
+            "source_revision": revision,
+            "tokenizer_path": str(tokenizer_path.resolve()),
+            "tokenizer_sha256": tokenizer_sha256,
+            "execution": "transformers_bf16_layer_streamed_full_sequence",
+            "attention_implementation": "sdpa",
+            "statistic": "mean_square_projection_input",
+            "input_path": str(args.input_ids.resolve()),
+            "input_sha256": input_sha256,
+            "input_token_count": len(input_ids),
+            "n_hessian": 0,
+            "n_imatrix": len(imatrix.sums),
+            "per_tensor_tokens": imatrix.counts,
+            "torch_version": torch.__version__,
+            "transformers_version": transformers.__version__,
+        }
+        write_imatrix_hfqm(
+            args.imatrix_output,
+            imatrix_metadata,
+            imatrix.sums,
+            imatrix.counts,
+        )
+        imatrix_evidence = dict(imatrix_metadata)
+        imatrix_evidence.update(
+            {
+                "output": str(args.imatrix_output.resolve()),
+                "output_bytes": args.imatrix_output.stat().st_size,
+                "output_sha256": sha256_file(args.imatrix_output),
+                "tensor_names": sorted(imatrix.sums),
+            }
+        )
+        args.imatrix_output.with_suffix(args.imatrix_output.suffix + ".json").write_text(
+            json.dumps(imatrix_evidence, indent=2, sort_keys=True) + "\n"
+        )
+    if args.transition_output is not None:
+        transition_metadata = {
+            "schema": "hipfire.gemma4.layer-transition-inputs.v1",
+            "model": str(args.model.resolve()),
+            "revision": revision,
+            "dtype": "bfloat16",
+            "execution": "layer_streamed_full_sequence",
+            "input_path": str(args.input_ids.resolve()),
+            "input_sha256": input_sha256,
+            "positions": len(input_ids),
+            "hidden_size": config.hidden_size,
+            "layers": config.num_hidden_layers,
+            "selected_layers": transition_layers,
+        }
+        args.transition_output.joinpath("manifest.json").write_text(
+            json.dumps(transition_metadata, indent=2, sort_keys=True) + "\n"
+        )
     metadata = {
         "schema": "hipfire.gemma4.transformers-streaming-reference.v1",
         "model": str(args.model.resolve()),
         "revision": revision,
+        "tokenizer_sha256": tokenizer_sha256,
         "dtype": "bfloat16",
         "device": str(device),
         "execution": "layer_streamed_full_sequence",

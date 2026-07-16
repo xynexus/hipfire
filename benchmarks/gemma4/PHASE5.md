@@ -1,7 +1,7 @@
 # Gemma 4 Phase 5 dense-31B admission
 
-Date: 2026-07-15. Status: historical BF16 gate blocked; canonical product gate
-revised to OQ8 and advancing beyond base-short.
+Date: 2026-07-15. Status updated: 2026-07-16. Historical BF16 gate blocked;
+canonical OQ8 and OQ8+ candidates rejected at SWA-1.
 
 ## OQ8 contract revision
 
@@ -66,6 +66,55 @@ This is nevertheless a gate failure. The 1024, 1025, and IT cases were not run,
 and no threshold was changed. Evidence is retained under
 `~/.hipfire/evidence/gemma4/phase5-oq8-admission/swa-minus-one`; the comparison
 SHA256 is `7886383e21f82b5c3a2d3e83d170dea5137f79ffe9276af15e6ba39e46f7c307`.
+
+## OQ8 propagation diagnostic and OQ8+ rejection
+
+An all-layer rerun of the 1,023-token OQ8 case finds the first frozen broad-gate
+failure at layer 38 and the peak hidden NRMSE at layer 52
+(`0.404128845490751`). A separate exact-input replay then feeds the pinned BF16
+oracle boundary into each of 28 selected OQ8 decoder transitions. Every replayed
+transition remains inside the broad OQ8 envelope; the worst final-position NRMSE
+is `0.020617408105029177` and the minimum cosine is
+`0.9997874410546934`. The long-context rejection is therefore cumulative OQ8
+propagation sensitivity, not a discrete cache, SWA-geometry, or layer-operator
+failure.
+
+The remediation candidate is a real activation-aware `Gemma-4-31B.oq8+.hfq`.
+The collector immediately reduces each projection input to per-channel sum of
+squares, so no layer activation is retained. It covers all 410 real text
+projections over 1,024 exact tokens from 12 committed benchmark prompts. The
+calibration input SHA256 is
+`bcc109e964cd81c243a527dde15d05aab6adae33ad6deff320300f887efd5ec4`;
+the imatrix HFQM SHA256 is
+`ccac739df085d9630589377380b20722bf7a415505aaacbb11f577787c6fe0b2`.
+Both input preparation and capture require the pinned Gemma 4 tokenizer SHA256
+`12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6`,
+so the Gemma 3 tokenizer cannot be used accidentally. The produced artifact has
+quantization hash `62964fdf436f3945`, 1,598 tensors, quant format `oq8+`, and
+calibration signature `49d723ac0c765b84`.
+
+OQ8+ passes the unchanged base-short gate and lifecycle checks:
+
+- minimum hidden cosine `0.9971730335138623`;
+- maximum hidden NRMSE `0.07517436671794263`;
+- final-logit cosine `0.9994585015405347`;
+- final-logit maximum absolute error `0.8503456115722656`;
+- final argmax `7001`, top-5 overlap `5/5`, exact eight-token greedy output;
+- reset and full unload/reload reruns are bit-exact.
+
+OQ8+ still fails the frozen SWA-1 gate:
+
+- layer 58 cosine `0.9694387242371449`, NRMSE `0.24887576597797179`;
+- layer 59 cosine `0.9933980262856993`, NRMSE `0.17050499688760656`;
+- final-logit cosine `0.9309398679835434`;
+- final-logit maximum absolute error `5.02236795425415`.
+
+Every value is finite, final argmax and the first greedy token remain `7001`,
+and top-5 overlap improves to `5/5`. The hidden and final-logit limits still
+fail, so SWA, SWA+1, IT, and OQ8++ were not run. Durable evidence is under
+`~/.hipfire/evidence/gemma4/phase5-oq8plus-admission-v1`; the SWA-1 comparison
+SHA256 is `205c52bb8c7ebf9f8dad1f99e614e8e46ed1173346b7fca0140fc1e5b14cf9e5`.
+The broad thresholds and final OQ8++ narrowing thresholds remain unchanged.
 
 ## Historical BF16 base-short result
 

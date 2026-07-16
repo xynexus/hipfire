@@ -109,6 +109,34 @@ fn required_usize(manifest: &Value, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("manifest `{name}` must be a non-negative integer"))
 }
 
+fn selected_layers(manifest: &Value, layer_count: usize) -> Result<Vec<usize>, String> {
+    let Some(values) = manifest.get("selected_layers") else {
+        return Ok((0..layer_count).collect());
+    };
+    let values = values
+        .as_array()
+        .ok_or_else(|| "manifest `selected_layers` must be an array".to_string())?;
+    if values.is_empty() {
+        return Err("manifest `selected_layers` must not be empty".to_string());
+    }
+    let mut layers = BTreeSet::new();
+    for value in values {
+        let layer = value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                "manifest `selected_layers` entries must be non-negative integers".to_string()
+            })?;
+        if layer >= layer_count {
+            return Err(format!(
+                "manifest selected layer {layer} exceeds layer count {layer_count}"
+            ));
+        }
+        layers.insert(layer);
+    }
+    Ok(layers.into_iter().collect())
+}
+
 fn main() -> Result<(), String> {
     let args = std::env::args().collect::<Vec<_>>();
     if !matches!(args.len(), 4 | 6 | 7) {
@@ -136,6 +164,7 @@ fn main() -> Result<(), String> {
     if positions == 0 || layer_count == 0 {
         return Err("transition input set must contain positions and layers".into());
     }
+    let selected_layers = selected_layers(&manifest, layer_count)?;
 
     let mut hfq = HfqFile::open(&model).map_err(|error| error.to_string())?;
     if hfq.arch_id != Gemma4::arch_id() {
@@ -174,8 +203,8 @@ fn main() -> Result<(), String> {
     let mut state = Gemma4DenseState::new(&mut gpu, &config, positions)
         .map_err(|error| format!("Gemma 4 state: {error:?}"))?;
 
-    let mut layer_results = Vec::with_capacity(layer_count);
-    for layer in 0..layer_count {
+    let mut layer_results = Vec::with_capacity(selected_layers.len());
+    for &layer in &selected_layers {
         let inputs = read_f32(&input_dir.join(format!("input_layer_{layer}.f32")))?;
         let expected = read_f32(&input_dir.join(format!("expected_layer_{layer}.f32")))?;
         let expected_values = positions * hidden_size;
@@ -306,6 +335,7 @@ fn main() -> Result<(), String> {
         "gpu_arch": gpu.arch,
         "positions": positions,
         "hidden_size": hidden_size,
+        "selected_layers": selected_layers,
         "traced_layers": trace_layers,
         "bf16_staged_geglu_layers": bf16_geglu_layers,
         "layers": layer_results,
@@ -321,4 +351,29 @@ fn main() -> Result<(), String> {
     gpu.drain_pool();
     println!("wrote {}", output.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn selected_layers_defaults_to_every_layer() {
+        assert_eq!(selected_layers(&json!({}), 4).unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn selected_layers_sorts_and_deduplicates() {
+        assert_eq!(
+            selected_layers(&json!({"selected_layers": [3, 1, 3]}), 4).unwrap(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn selected_layers_rejects_empty_and_out_of_range_lists() {
+        assert!(selected_layers(&json!({"selected_layers": []}), 4).is_err());
+        assert!(selected_layers(&json!({"selected_layers": [4]}), 4).is_err());
+    }
 }
