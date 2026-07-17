@@ -411,6 +411,51 @@
         "THE tok/J DESIGN LAW: below ~37 MACs per byte fed, energy is dominated by data movement, not arithmetic. Decode (AI~1) is 37x movement-dominated => bit-width is the energy lever. Prefill (AI~M) is compute-dominated => MMUL rate is the energy lever. This is why power-shaped and speed-shaped kernels diverge."
       ],
       "measured_utc": "2026-07-17T08:35:24+00:00"
+    },
+    "gpu_gb_per_j": {
+      "name": "gpu_gb_per_j",
+      "value": 3.73,
+      "unit": "GB/J",
+      "bench": "G1",
+      "method": "gfx1103 grid-stride read of 256 MiB, marginal over null launch at matched 50/s",
+      "admissible": true,
+      "evidence": [
+        "GPU gfx1103 (Radeon 780M, 12 CU) and the NPU are on the SAME die and share package rails,",
+        "so RAPL package-0 measures both. Same instrument, same matched-rate padding, same null subtraction.",
+        "matched rate 50/s, 10 s windows; all kernels verified to MEET the rate (a first run had GPU compute at",
+        "311/500 launches @30.8/s \u2014 the harness now refuses results whose rate target was missed).",
+        "GPU null 0.735 W / feed 4.323 W -> marginal 3.588 W -> 3.73 GB/J",
+        "NPU E1 feed: 5.13 GB/J => NPU is 1.37x more energy-efficient at moving bytes"
+      ],
+      "caveats": [
+        "FAIR COMPARISON: C2 uses 4 workers = full NPU width; this uses all 12 CUs.",
+        "256 MiB working set, far beyond cache, so it is real DDR traffic on both sides."
+      ],
+      "measured_utc": "2026-07-17T08:48:06+00:00"
+    },
+    "gpu_gmacs_per_j_int8": {
+      "name": "gpu_gmacs_per_j_int8",
+      "value": 430.24,
+      "unit": "G MACs/J",
+      "bench": "G1",
+      "method": "gfx1103 v_wmma_i32_16x16x16_iu8 resident chain, marginal over null at matched 50/s",
+      "admissible": false,
+      "evidence": [
+        "GPU gfx1103 (Radeon 780M, 12 CU) and the NPU are on the SAME die and share package rails,",
+        "so RAPL package-0 measures both. Same instrument, same matched-rate padding, same null subtraction.",
+        "matched rate 50/s, 10 s windows; all kernels verified to MEET the rate (a first run had GPU compute at",
+        "311/500 launches @30.8/s \u2014 the harness now refuses results whose rate target was missed).",
+        "GPU null 0.735 W / compute 9.479 W -> marginal 8.744 W -> 430.24 G MACs/J",
+        "uses the same WMMA builtin hipfire gfx1103 kernels use (71 call sites)"
+      ],
+      "caveats": [
+        "NOT ADMISSIBLE AS A DEVICE COMPARISON \u2014 the parallelism is mismatched. This runs 768 waves",
+        "across all 12 GPU CUs; the NPU side (c4_mmul) builds a SINGLE Worker = 1 core of 16.",
+        "So \"GPU 2.29x NPU on compute\" is really 12 GPU CUs vs 1 NPU core.",
+        "NPU J/MAC may improve at 16 cores as fixed costs amortize, or hold flat if power scales",
+        "linearly. Unmeasured. A multi-core NPU compute bench is required before this is a verdict."
+      ],
+      "measured_utc": "2026-07-17T08:48:06+00:00"
     }
   }
 }
