@@ -131,8 +131,9 @@ def predict(spec: ScheduleSpec, key: str | None = None, device: str = "auto") ->
         p.terms["t_core"] = vmacs * cyc_per_vmac / f_h / eff
         if eff < 1.0:
             p.assumptions.append(
-                f"core_efficiency={eff:.2f}: t_core is {1 / eff:.1f}x the saturated-pipe time "
-                "(tiled-kernel overhead). Calibrated single-core on oq_gemm; unverified for multi-core."
+                f"core_efficiency={eff:.2f}: t_core is {1 / eff:.1f}x the saturated-pipe time. This is the "
+                "LARGE-TILE asymptote; multi-core whole_array measured 0.014 (small tile/problem) up to 0.24 "
+                "(2048^3). t_core is optimistic for small compute-bound GEMMs — efficiency is tile-area-dependent."
             )
 
         m, k, n = spec.mmul_shape

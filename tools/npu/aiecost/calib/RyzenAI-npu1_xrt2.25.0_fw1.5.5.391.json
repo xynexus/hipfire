@@ -1032,11 +1032,16 @@
       "evidence": [
         "eta_core (fixed floor removed) at compute-bound points: 512x512 B256=0.285, 1024x512 B256=0.287,",
         "  768x768 B256=0.292, 512x512 B128=0.280 -> clusters 0.28-0.29",
-        "applying t_core /= 0.28: B=64 -5%, B=128 -0%, B=256 +1% vs measured (was -46..-61% at eff=1)"
+        "applying t_core /= 0.28: B=64 -5%, B=128 -0%, B=256 +1% vs measured (was -46..-61% at eff=1)",
+        "MULTI-CORE whole_array (mlir-aie example, 4 cols/16 cores, i8, floor-removed, npu1):",
+        "  512^3 tile32^3: 108 GFLOP/s -> eff 0.014;  1024^3 t64: 685 -> 0.086;  2048^3 t64: 1955 -> 0.239",
+        "=> efficiency is TILE+SIZE dependent (aie2p tilesweep law), NOT constant. 0.28 is the large-tile asymptote,",
+        "   reached by single-core oq_gemm (tile 32,64,64) and multi-core 2048^3; small tiles/problems are far lower."
       ],
       "caveats": [
-        "SINGLE-CORE, tile (32,64,64). design.py applies it to full-array specs too, which is an EXTRAPOLATION",
-        "flagged in each prediction's assumptions. A real multi-core tiled GEMM may differ.",
+        "0.28 IS THE LARGE-TILE ASYMPTOTE, not a universal efficiency. Multi-core measurement: 0.014 (512^3/32^3) up to 0.239 (2048^3/64^3). Applying flat 0.28 OVER-predicts efficiency (UNDER-predicts t_core) by up to ~20x for small tiles/problems.",
+        "design.py uses it for GEMM specs: defensible for PREFILL-scale (large M -> large tiles -> ~0.24-0.28), optimistic for small compute-bound GEMMs. Decode is movement-bound so t_core (and thus this) does not matter.",
+        "THE REAL FIX: efficiency as a function of output-tile area (L1-capped ~16384, per aie2p tilesweep), not a scalar. design.py does not yet model the L1 tile, so a scalar stand-in is used.",
         "eff=1.0 remains correct for tight resident chains (K1/C4/families C/D saturate the pipe)."
       ],
       "measured_utc": "2026-07-17T16:11:36+00:00"
