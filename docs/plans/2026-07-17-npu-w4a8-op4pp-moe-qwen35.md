@@ -165,24 +165,43 @@ The composed expert FFN (`npu_expert_ffn_w4_parity`, committed) is **correct**
   dispatch; whole-scaled likewise. Two GEMMs → ~2 dispatches/expert.
 - Wall time = host AWQ+FWHT-256+int8-quant prep + a ~12.6 MB int32 **partial
   readback** (`run_resident`) + host scale-reconstruction + host SiLU.
-- **Device time ≈ roofline ~145 µs/expert @M=256** (2 × ~73 µs floor; work hidden).
+### MEASURED device time (`npu_expert_gemm_device_time`, halo, one dispatch)
 
-Perf lever is **eliminate host round-trips**, not fewer FLOPs. Two paths toward
-device-time wall clock (the clean PP/TG number):
-- **`run_resident_scaled`** — f32 reconstructed on-device (no int32 partial readback),
-  pre-prepped int8 acts in; prep once, dispatch many.
-- **device-resident chaining** — gate_up out → on-array SiLU (`NpuQwen3SwiGlu`) → down
-  in via shared dma-buf, no host between GEMMs. The clean PP/TG measurement path.
+Clean device time via `run_resident_scaled` (prep-once, no partial readback),
+timed loop of 300 dispatches:
 
-**PP/TG projection (halo AIE2P, design-guide part 5):**
-
-| | per-expert (device) | per MoE layer | note |
+| GEMM | MACs | device/dispatch | rate |
 |---|---|---|---|
-| **PP** M=256 prefill | ~145 µs (2 disp) / ~73 µs fused | movement-bound ~288 MiB → ~5.76 ms/layer | op4++ 4-bit halves it vs Q8 |
-| **TG** M=1 decode | ~145 µs/expert, pure floor | 9 experts × ~145 µs ≈ 1.3 ms × 48 layers ≈ 63 ms/tok → **~16 tok/s** | floor-catastrophic **without M3** |
+| gate_up K=2048 N=1536 | 805 M | **~3.4 ms** | **~215 GMAC/s** |
+| gate/up-half K=2048 N=768 | 402 M | ~1.9 ms | ~210 GMAC/s |
+| down-class K=768 N=3072 | 604 M | ~2.7 ms | ~220 GMAC/s |
 
-TG is the problem: at M=1 every expert dispatch is pure 72.6 µs floor, and
-top-8 + shared × 48 layers dominates. **M3 grouped-expert dispatch is the TG lever.**
+Device time is **∝ MACs** (N=768→1536 = 1.9× time), so this is real compute/
+movement-bound device work, not fixed overhead. **This corrects the earlier
+~145 µs roofline by ~35×.** The available `fullk_submit` op4++ kernel sustains only
+**~215 GMAC/s — ~1% of the 28.9 T microbench peak** and ~4× below the design-guide's
+own npu1 GEMM candidate (~940 GMAC/s). So **per-expert FFN device time ≈ ~5 ms
+@M=256**, not ~145 µs.
+
+**Implication — kernel efficiency, not dispatch count, is now the gating PP/TG
+factor.** The 28.9 T figure is an ideal resident-CHAIN microbench (no realistic
+weight/act movement, no W4 unpack); the real kernels are ~100× below it. Two
+possibilities, unresolved: (a) `fullk_submit` is an un-tuned r6-series baseline and a
+performance-tuned fused kernel recovers most of the gap; (b) ~215 GMAC/s is close to
+what real W4A8 movement allows on this array. **Resolving this is the top open
+question** — it dominates every PP/TG number below and reprioritises the plan
+(tune the GEMM kernel *before* M3 grouped dispatch).
+
+**PP/TG at the measured ~215 GMAC/s (un-tuned kernel, worst case):**
+
+| | per-expert (device) | note |
+|---|---|---|
+| **PP** M=256 prefill | ~5 ms (2 GEMMs) | op4++ 4-bit still the movement lever; but compute/kernel-bound here, not movement |
+| **TG** M=1 decode | ~5 ms/expert | 9 experts × 48 layers ≈ 2+ s/token → **non-viable** until the kernel is tuned AND M3 groups dispatches |
+
+Perf lever ordering therefore flips: **(1) tune the op4++ GEMM kernel** (close the
+~40× gap or prove it's a hard floor), then **(2) M3 grouped-expert dispatch**, then
+device-resident chaining for the clean end-to-end wall clock.
 
 ## 5b. M3 grouped-expert dispatch (design)
 
