@@ -714,6 +714,91 @@
         "Bounds the per-column output join at 6 sub-fifos."
       ],
       "measured_utc": "2026-07-17T10:14:39+00:00"
+    },
+    "gpu_feed_peak_bytes_s": {
+      "name": "gpu_feed_peak_bytes_s",
+      "value": 79500000000.0,
+      "unit": "bytes/s",
+      "bench": "G1",
+      "method": "free-run grid-stride read of 256 MiB, gfx1103, 12 CU",
+      "admissible": true,
+      "evidence": [
+        "free-run (rate=0), 8 s windows: GPU feed 296.1 launches/s x 256 MiB = 79.5 GB/s;",
+        "  GPU compute 100.0 launches/s x 7.55e10 MACs = 7.55 T MACs/s = 15.1 TOPS",
+        "NPU (measured, full width): feed 30.8 GB/s (8 shim streams); compute 3.72 T MACs/s = 7.4 TOPS (16 cores)",
+        "GPU free-run package delta: feed 24.0 W, compute 27.8 W; NPU full-width ~1.4 W => ~17x the power"
+      ],
+      "caveats": [
+        "THE SPEED GAP IS UNDERSTATED. The NPU compute figure is 89% of its 4.16 T MACs/s theoretical peak, but the GPU's 15.1 TOPS is only ~42% of gfx1103's ~35 TOPS theoretical - the g1 chain kernel is not tuned for the GPU (4 chains, occupancy unexplored). A tuned GPU kernel widens the gap.",
+        "GPU feed 79.5 GB/s is ~78% of LPDDR5-6400 dual-channel theoretical (~102 GB/s) - near roofline, trustworthy.",
+        "NPU feed 30.8 GB/s is a HARD shim-channel ceiling (8 streams), not a tuning artifact.",
+        "Speed is free-run; energy is matched-rate. Do not mix: free-run energy tracks dispatch rate (see E1)."
+      ],
+      "measured_utc": "2026-07-17T10:22:28+00:00"
+    },
+    "gpu_compute_peak_macs_s": {
+      "name": "gpu_compute_peak_macs_s",
+      "value": 7550000000000.0,
+      "unit": "MACs/s",
+      "bench": "G1",
+      "method": "free-run v_wmma_i32_16x16x16_iu8 chain, gfx1103",
+      "admissible": true,
+      "evidence": [
+        "free-run (rate=0), 8 s windows: GPU feed 296.1 launches/s x 256 MiB = 79.5 GB/s;",
+        "  GPU compute 100.0 launches/s x 7.55e10 MACs = 7.55 T MACs/s = 15.1 TOPS",
+        "NPU (measured, full width): feed 30.8 GB/s (8 shim streams); compute 3.72 T MACs/s = 7.4 TOPS (16 cores)",
+        "GPU free-run package delta: feed 24.0 W, compute 27.8 W; NPU full-width ~1.4 W => ~17x the power"
+      ],
+      "caveats": [
+        "THE SPEED GAP IS UNDERSTATED. The NPU compute figure is 89% of its 4.16 T MACs/s theoretical peak, but the GPU's 15.1 TOPS is only ~42% of gfx1103's ~35 TOPS theoretical - the g1 chain kernel is not tuned for the GPU (4 chains, occupancy unexplored). A tuned GPU kernel widens the gap.",
+        "GPU feed 79.5 GB/s is ~78% of LPDDR5-6400 dual-channel theoretical (~102 GB/s) - near roofline, trustworthy.",
+        "NPU feed 30.8 GB/s is a HARD shim-channel ceiling (8 streams), not a tuning artifact.",
+        "Speed is free-run; energy is matched-rate. Do not mix: free-run energy tracks dispatch rate (see E1).",
+        "NOT the GPU's peak: ~42% of theoretical. A lower bound on GPU speed."
+      ],
+      "measured_utc": "2026-07-17T10:22:28+00:00"
+    },
+    "npu_feed_peak_bytes_s": {
+      "name": "npu_feed_peak_bytes_s",
+      "value": 30800000000.0,
+      "unit": "bytes/s",
+      "bench": "C2-audit",
+      "method": "8 shim input streams, the hard channel ceiling",
+      "admissible": true,
+      "evidence": [
+        "free-run (rate=0), 8 s windows: GPU feed 296.1 launches/s x 256 MiB = 79.5 GB/s;",
+        "  GPU compute 100.0 launches/s x 7.55e10 MACs = 7.55 T MACs/s = 15.1 TOPS",
+        "NPU (measured, full width): feed 30.8 GB/s (8 shim streams); compute 3.72 T MACs/s = 7.4 TOPS (16 cores)",
+        "GPU free-run package delta: feed 24.0 W, compute 27.8 W; NPU full-width ~1.4 W => ~17x the power"
+      ],
+      "caveats": [
+        "THE SPEED GAP IS UNDERSTATED. The NPU compute figure is 89% of its 4.16 T MACs/s theoretical peak, but the GPU's 15.1 TOPS is only ~42% of gfx1103's ~35 TOPS theoretical - the g1 chain kernel is not tuned for the GPU (4 chains, occupancy unexplored). A tuned GPU kernel widens the gap.",
+        "GPU feed 79.5 GB/s is ~78% of LPDDR5-6400 dual-channel theoretical (~102 GB/s) - near roofline, trustworthy.",
+        "NPU feed 30.8 GB/s is a HARD shim-channel ceiling (8 streams), not a tuning artifact.",
+        "Speed is free-run; energy is matched-rate. Do not mix: free-run energy tracks dispatch rate (see E1)."
+      ],
+      "measured_utc": "2026-07-17T10:22:28+00:00"
+    },
+    "npu_compute_peak_macs_s": {
+      "name": "npu_compute_peak_macs_s",
+      "value": 3720000000000.0,
+      "unit": "MACs/s",
+      "bench": "E1/C4",
+      "method": "16 cores, int8 mmul<4,8,8>; 89% of theoretical",
+      "admissible": true,
+      "evidence": [
+        "free-run (rate=0), 8 s windows: GPU feed 296.1 launches/s x 256 MiB = 79.5 GB/s;",
+        "  GPU compute 100.0 launches/s x 7.55e10 MACs = 7.55 T MACs/s = 15.1 TOPS",
+        "NPU (measured, full width): feed 30.8 GB/s (8 shim streams); compute 3.72 T MACs/s = 7.4 TOPS (16 cores)",
+        "GPU free-run package delta: feed 24.0 W, compute 27.8 W; NPU full-width ~1.4 W => ~17x the power"
+      ],
+      "caveats": [
+        "THE SPEED GAP IS UNDERSTATED. The NPU compute figure is 89% of its 4.16 T MACs/s theoretical peak, but the GPU's 15.1 TOPS is only ~42% of gfx1103's ~35 TOPS theoretical - the g1 chain kernel is not tuned for the GPU (4 chains, occupancy unexplored). A tuned GPU kernel widens the gap.",
+        "GPU feed 79.5 GB/s is ~78% of LPDDR5-6400 dual-channel theoretical (~102 GB/s) - near roofline, trustworthy.",
+        "NPU feed 30.8 GB/s is a HARD shim-channel ceiling (8 streams), not a tuning artifact.",
+        "Speed is free-run; energy is matched-rate. Do not mix: free-run energy tracks dispatch rate (see E1)."
+      ],
+      "measured_utc": "2026-07-17T10:22:28+00:00"
     }
   }
 }
