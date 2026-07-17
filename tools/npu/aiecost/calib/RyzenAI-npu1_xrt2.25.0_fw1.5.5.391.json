@@ -854,6 +854,98 @@
         "Below the 183 int8 break-even at every batch size => an int32-output projection is movement-bound no matter how much you batch."
       ],
       "measured_utc": "2026-07-17T11:11:36+00:00"
+    },
+    "cpu_gb_per_j": {
+      "name": "cpu_gb_per_j",
+      "value": 1.48,
+      "unit": "GB/J",
+      "bench": "P1",
+      "method": "7840HS 16-thread streaming read of 256 MiB, RAPL package delta over idle",
+      "admissible": true,
+      "evidence": [
+        "7840HS, 8 cores / 16 threads, AVX-512 VNNI (_mm512_dpbusd_epi32 = 64 int8 MACs/instr), OpenMP x16",
+        "feed:    idle 3.92 W load 41.67 W delta 37.75 W -> 55.83 GB/s, 1.48 GB/J (256 MiB streaming read)",
+        "compute: idle 4.09 W load 42.35 W delta 38.26 W -> 2.07 T MACs/s (4.1 TOPS), 54.0 G MACs/J",
+        "compute is AT Zen 4 peak: 8 cores x 64 MACs x 4.05 GHz = 2.07e12 exactly (AVX-512 is double-pumped,",
+        "  so 1 dpbusd/cycle/core is the ceiling; SMT does not help a port-limited op)",
+        "same package, same rails, same RAPL counter as E1 (NPU) and G1 (GPU) -> directly comparable"
+      ],
+      "caveats": [
+        "THE CPU IS DOMINATED ON BOTH AXES: slower than the GPU on feed (55.8 vs 79.5 GB/s) and compute (4.1 vs 15.1 TOPS), and far worse on energy than either (1.48 GB/J vs NPU 5.13; 54 G MACs/J vs NPU 938 \u2014 17x). It is never the throughput-optimal or energy-optimal choice for LLM work on this SoC.",
+        "The one thing the CPU beats the NPU at is movement SPEED (55.8 vs 30.8 GB/s) \u2014 the NPU is capped by its 8-stream shim ceiling while the CPU has the full DDR path. If a kernel is movement-bound and latency-critical, CPU > NPU on speed, though at 3.5x the energy per byte.",
+        "Unlike the GPU compute leg (~42% of theoretical), this is at ~100% of peak, so it is not understated.",
+        "No rate-matching needed: E1's confound was the HOST submit loop, and here the host IS the workload."
+      ],
+      "measured_utc": "2026-07-17T11:18:09+00:00"
+    },
+    "cpu_gmacs_per_j_int8": {
+      "name": "cpu_gmacs_per_j_int8",
+      "value": 54.0,
+      "unit": "G MACs/J",
+      "bench": "P1",
+      "method": "AVX-512 VNNI resident dot chain, 16 threads, RAPL package delta over idle",
+      "admissible": true,
+      "evidence": [
+        "7840HS, 8 cores / 16 threads, AVX-512 VNNI (_mm512_dpbusd_epi32 = 64 int8 MACs/instr), OpenMP x16",
+        "feed:    idle 3.92 W load 41.67 W delta 37.75 W -> 55.83 GB/s, 1.48 GB/J (256 MiB streaming read)",
+        "compute: idle 4.09 W load 42.35 W delta 38.26 W -> 2.07 T MACs/s (4.1 TOPS), 54.0 G MACs/J",
+        "compute is AT Zen 4 peak: 8 cores x 64 MACs x 4.05 GHz = 2.07e12 exactly (AVX-512 is double-pumped,",
+        "  so 1 dpbusd/cycle/core is the ceiling; SMT does not help a port-limited op)",
+        "same package, same rails, same RAPL counter as E1 (NPU) and G1 (GPU) -> directly comparable"
+      ],
+      "caveats": [
+        "THE CPU IS DOMINATED ON BOTH AXES: slower than the GPU on feed (55.8 vs 79.5 GB/s) and compute (4.1 vs 15.1 TOPS), and far worse on energy than either (1.48 GB/J vs NPU 5.13; 54 G MACs/J vs NPU 938 \u2014 17x). It is never the throughput-optimal or energy-optimal choice for LLM work on this SoC.",
+        "The one thing the CPU beats the NPU at is movement SPEED (55.8 vs 30.8 GB/s) \u2014 the NPU is capped by its 8-stream shim ceiling while the CPU has the full DDR path. If a kernel is movement-bound and latency-critical, CPU > NPU on speed, though at 3.5x the energy per byte.",
+        "Unlike the GPU compute leg (~42% of theoretical), this is at ~100% of peak, so it is not understated.",
+        "No rate-matching needed: E1's confound was the HOST submit loop, and here the host IS the workload."
+      ],
+      "measured_utc": "2026-07-17T11:18:09+00:00"
+    },
+    "cpu_feed_peak_bytes_s": {
+      "name": "cpu_feed_peak_bytes_s",
+      "value": 55830000000.0,
+      "unit": "bytes/s",
+      "bench": "P1",
+      "method": "16-thread streaming read",
+      "admissible": true,
+      "evidence": [
+        "7840HS, 8 cores / 16 threads, AVX-512 VNNI (_mm512_dpbusd_epi32 = 64 int8 MACs/instr), OpenMP x16",
+        "feed:    idle 3.92 W load 41.67 W delta 37.75 W -> 55.83 GB/s, 1.48 GB/J (256 MiB streaming read)",
+        "compute: idle 4.09 W load 42.35 W delta 38.26 W -> 2.07 T MACs/s (4.1 TOPS), 54.0 G MACs/J",
+        "compute is AT Zen 4 peak: 8 cores x 64 MACs x 4.05 GHz = 2.07e12 exactly (AVX-512 is double-pumped,",
+        "  so 1 dpbusd/cycle/core is the ceiling; SMT does not help a port-limited op)",
+        "same package, same rails, same RAPL counter as E1 (NPU) and G1 (GPU) -> directly comparable"
+      ],
+      "caveats": [
+        "THE CPU IS DOMINATED ON BOTH AXES: slower than the GPU on feed (55.8 vs 79.5 GB/s) and compute (4.1 vs 15.1 TOPS), and far worse on energy than either (1.48 GB/J vs NPU 5.13; 54 G MACs/J vs NPU 938 \u2014 17x). It is never the throughput-optimal or energy-optimal choice for LLM work on this SoC.",
+        "The one thing the CPU beats the NPU at is movement SPEED (55.8 vs 30.8 GB/s) \u2014 the NPU is capped by its 8-stream shim ceiling while the CPU has the full DDR path. If a kernel is movement-bound and latency-critical, CPU > NPU on speed, though at 3.5x the energy per byte.",
+        "Unlike the GPU compute leg (~42% of theoretical), this is at ~100% of peak, so it is not understated.",
+        "No rate-matching needed: E1's confound was the HOST submit loop, and here the host IS the workload."
+      ],
+      "measured_utc": "2026-07-17T11:18:09+00:00"
+    },
+    "cpu_compute_peak_macs_s": {
+      "name": "cpu_compute_peak_macs_s",
+      "value": 2070000000000.0,
+      "unit": "MACs/s",
+      "bench": "P1",
+      "method": "AVX-512 VNNI, at Zen 4 theoretical peak",
+      "admissible": true,
+      "evidence": [
+        "7840HS, 8 cores / 16 threads, AVX-512 VNNI (_mm512_dpbusd_epi32 = 64 int8 MACs/instr), OpenMP x16",
+        "feed:    idle 3.92 W load 41.67 W delta 37.75 W -> 55.83 GB/s, 1.48 GB/J (256 MiB streaming read)",
+        "compute: idle 4.09 W load 42.35 W delta 38.26 W -> 2.07 T MACs/s (4.1 TOPS), 54.0 G MACs/J",
+        "compute is AT Zen 4 peak: 8 cores x 64 MACs x 4.05 GHz = 2.07e12 exactly (AVX-512 is double-pumped,",
+        "  so 1 dpbusd/cycle/core is the ceiling; SMT does not help a port-limited op)",
+        "same package, same rails, same RAPL counter as E1 (NPU) and G1 (GPU) -> directly comparable"
+      ],
+      "caveats": [
+        "THE CPU IS DOMINATED ON BOTH AXES: slower than the GPU on feed (55.8 vs 79.5 GB/s) and compute (4.1 vs 15.1 TOPS), and far worse on energy than either (1.48 GB/J vs NPU 5.13; 54 G MACs/J vs NPU 938 \u2014 17x). It is never the throughput-optimal or energy-optimal choice for LLM work on this SoC.",
+        "The one thing the CPU beats the NPU at is movement SPEED (55.8 vs 30.8 GB/s) \u2014 the NPU is capped by its 8-stream shim ceiling while the CPU has the full DDR path. If a kernel is movement-bound and latency-critical, CPU > NPU on speed, though at 3.5x the energy per byte.",
+        "Unlike the GPU compute leg (~42% of theoretical), this is at ~100% of peak, so it is not understated.",
+        "No rate-matching needed: E1's confound was the HOST submit loop, and here the host IS the workload."
+      ],
+      "measured_utc": "2026-07-17T11:18:09+00:00"
     }
   }
 }

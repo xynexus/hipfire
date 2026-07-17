@@ -146,14 +146,29 @@ energy at all — and the LLM hot path never gets close:
 So **int4's 2× MMUL rate is mostly a *speed* lever**; its energy value comes from
 halving weight bytes, not from the faster MMUL.
 
-### NPU vs GPU (gfx1103, same die, same rails, same instrument)
+### NPU vs GPU vs CPU (all on one die, one set of rails, one RAPL counter)
 
-**The two objectives choose opposite devices. This is the headline.**
+**The two objectives choose opposite devices, and the CPU wins neither.**
 
-| axis | NPU | GPU | **speed** | **energy** |
-|---|---|---|---|---|
-| movement | 30.8 GB/s · 5.13 GB/J | **79.5 GB/s** · 3.73 GB/J | **GPU 2.58×** | **NPU 1.37×** |
-| compute int8 | 7.4 TOPS · 938 G MACs/J | **15.1 TOPS** · 432 G MACs/J | **GPU 2.03×** | **NPU 2.15×** |
+| axis | NPU | GPU | CPU |
+|---|---|---|---|
+| **movement** | 30.8 GB/s · **5.13 GB/J** | **79.5 GB/s** · 3.73 GB/J | 55.8 GB/s · 1.48 GB/J |
+| **compute int8** | 7.4 TOPS · **938 G MACs/J** | **15.1 TOPS** · 432 G MACs/J | 4.1 TOPS · 54 G MACs/J |
+
+- **tok/s → GPU.** 2.58× the NPU on movement, 2.03× on compute.
+- **tok/J → NPU.** 1.37× the GPU on movement, 2.15× on compute — and **17× the
+  CPU** on compute energy.
+- **CPU → neither.** Dominated on both axes: slower than the GPU on both, and far
+  less efficient than either. Its one advantage over the NPU is movement *speed*
+  (55.8 vs 30.8 GB/s), because the NPU is capped by its 8-stream shim ceiling
+  while the CPU has the full DDR path — but it pays 3.5× the energy per byte for
+  it.
+
+Confidence differs by leg. The **CPU compute figure is at ~100% of Zen 4's peak**
+(8 cores × 64 MACs/dpbusd × 4.05 GHz = 2.07 T MACs/s exactly — AVX-512 is
+double-pumped, so 1 dpbusd/cycle is the ceiling and SMT cannot help a
+port-limited op). The **NPU is at 89%**. The **GPU is at ~42%** and is therefore
+the one understated leg.
 
 - **tok/s → GPU.** ~2–2.6× faster on *both* axes.
 - **tok/J → NPU.** ~1.4–2.2× more efficient on *both* axes.
@@ -337,7 +352,9 @@ to the 37-MACs/byte artifact for any dtype pair without a specific ratio.
 
 0. **Pick the device by objective, not by habit.** GPU for tok/s, NPU for tok/J
    — ~2× either way, on both movement and compute. There is no regime where one
-   wins both.
+   wins both, and the **CPU wins neither** (dominated on both axes; 17× worse
+   than the NPU on compute energy). Its only edge over the NPU is movement speed
+   (55.8 vs 30.8 GB/s), at 3.5× the energy per byte.
 1. **BATCH — the biggest lever measured.** 64× tok/J and 348× tok/s from B=1 to
    B=512 on a 768×1280 projection, because weights are read once and reused
    across the batch (weight byte share falls 32% → 6%).
@@ -525,7 +542,8 @@ that output-tile area matters — never the values or the rankings.
   theoretical, so the measured speed gap is a lower bound.
 - ~~The true feed ceiling~~ **RESOLVED**: ~30.8 GB/s at 8 shim input streams,
   confirmed by measurement and the toolchain channel budget independently.
-- **CPU as a third target.**
+- ~~CPU as a third target~~ **DONE** (P1): dominated on both axes — 55.8 GB/s ·
+  1.48 GB/J, 4.1 TOPS · 54 G MACs/J. Measured at ~100% of Zen 4's VNNI peak.
 - ~~Dual-objective (tok/s × tok/J) search~~ **DONE**: `design.py` reports the
   Pareto front, both optima, and the cost of choosing tok/J — with a 2%
   tolerance so a sub-noise difference is not announced as a trade.
