@@ -7,13 +7,14 @@ Streams tiles into the array and consumes them as cheaply as possible (one word
 per tile), so the only thing scaling with bytes is transport. The slope of
 time-vs-bytes is 1/bandwidth; the intercept absorbs the C1 dispatch floor.
 
-halo's numbers (14.4 GB/s per stream, 56.5 GB/s at 8 columns) DO NOT transFER:
-npu1 has 4 columns and dual-channel LPDDR5 rather than Strix Halo's memory.
-This measures npu1 directly.
+Bandwidth is target-specific: NPU1 has 4 columns and dual-channel LPDDR5,
+whereas NPU2/AIE2P has 8 columns and Strix Halo's wider memory subsystem.
+This bench always measures the selected target directly.
 
-Sizing note: C1 put the dispatch floor at ~155 us. To be feed-bound rather than
-floor-bound the transfer must take well over that, so the sweep starts in the
-megabytes. Anything smaller measures the floor, not the bandwidth.
+Sizing note: C1 puts the dispatch floor in the tens to hundreds of microseconds,
+depending on the target. To be feed-bound rather than floor-bound the transfer
+must take well over that, so the sweep starts in the megabytes. Anything smaller
+measures the floor, not the bandwidth.
 
 Usage:
     python -m aiecost.benches.c2_feed
@@ -34,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from aiecost import env  # noqa: E402
+from aiecost.target import include_dirs, resolve_program, resolve_target  # noqa: E402
 
 env.bootstrap()
 
@@ -43,27 +45,28 @@ HERE = Path(__file__).resolve().parent
 KERNEL_SRC = HERE / "c2_sink.cc"
 
 _mlir_pkg = next((Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None)
-AIE_INCLUDE = _mlir_pkg / "mlir_aie" / "include" if _mlir_pkg else None
-AIE_RUNTIME_LIB = _mlir_pkg / "mlir_aie" / "aie_runtime_lib" / "AIE2" if _mlir_pkg else None
-
 TILE_ELEM = 1024  # 4 KiB tiles: well inside L1 (64 KiB), big enough to amortise per-tile setup
 ACC_ELEM = 16
 
 
-def build(n_tiles: int, columns: int, out_dir: Path) -> tuple[Path, Path]:
+def build(n_tiles: int, columns: int, out_dir: Path, device: str = "auto") -> tuple[Path, Path]:
     from aie.iron import ObjectFifo, Program, Runtime, Worker
     from aie.iron.controlflow import range_
-    from aie.iron.device import NPU1
     from aie.iron.kernel import ExternalFunction
-    from aie.iron.placers import SequentialPlacer
     from aie.utils import set_current_device
     from aie.utils.compile import compile_external_kernel, compile_mlir_module
 
-    set_current_device(NPU1())
+    target = resolve_target(device)
+    if columns > target.compute_columns:
+        raise ValueError(f"columns={columns} exceeds {target.compute_columns} on {target.key}")
+    if columns > 4:
+        raise ValueError("C2 currently uses one output BO per column and is limited to 4 columns by the 5-argument DPU ABI")
+    iron_device = target.iron_device()
+    set_current_device(iron_device)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    xclbin = out_dir / f"c2-t{n_tiles}-c{columns}.xclbin"
-    insts = out_dir / f"c2-t{n_tiles}-c{columns}-insts.bin"
+    xclbin = out_dir / f"c2-{target.cache_tag}-t{n_tiles}-c{columns}.xclbin"
+    insts = out_dir / f"c2-{target.cache_tag}-t{n_tiles}-c{columns}-insts.bin"
     if xclbin.exists() and insts.exists():
         return xclbin, insts
 
@@ -75,7 +78,7 @@ def build(n_tiles: int, columns: int, out_dir: Path) -> tuple[Path, Path]:
         "c2_sink",
         source_file=str(KERNEL_SRC),
         arg_types=[Tile, Acc],
-        include_dirs=[str(AIE_INCLUDE), str(AIE_RUNTIME_LIB)],
+        include_dirs=include_dirs(_mlir_pkg, target),
         compile_flags=["-std=c++20", "-O2"],
     )
 
@@ -110,10 +113,10 @@ def build(n_tiles: int, columns: int, out_dir: Path) -> tuple[Path, Path]:
         for c in range(columns):
             rt.drain(of_outs[c].cons(), dsts[c], wait=True)
 
-    module = Program(NPU1(), rt).resolve_program(SequentialPlacer())
+    module = resolve_program(Program(iron_device, rt))
     with tempfile.TemporaryDirectory(prefix="aiecost_c2_") as tmpname:
         tmp = Path(tmpname)
-        compile_external_kernel(kern, tmp, target_arch="aie2")
+        compile_external_kernel(kern, tmp, target_arch=target.target_arch)
         compile_mlir_module(mlir_module=module, insts_path=tmp / "insts.bin", xclbin_path=tmp / "final.xclbin", work_dir=tmp)
         shutil.copy2(tmp / "final.xclbin", xclbin)
         shutil.copy2(tmp / "insts.bin", insts)
@@ -161,17 +164,19 @@ def main() -> int:
     p.add_argument("--columns", type=int, nargs="+", default=[1, 2, 4])
     p.add_argument("--reps", type=int, default=20)
     p.add_argument("--warmup", type=int, default=5)
+    p.add_argument("--device", default="auto", choices=["auto", "npu1", "npu2"])
     p.add_argument("--cache", default=str(Path.home() / ".cache" / "hipfire-aiecost" / "c2"))
     p.add_argument("--save", action="store_true")
     p.add_argument("--json", metavar="PATH")
     args = p.parse_args()
 
-    print(f"C2 feed bandwidth: tiles={args.tiles} columns={args.columns} (tile={TILE_ELEM * 4} B)")
+    target = resolve_target(args.device)
+    print(f"C2 feed bandwidth: target={target.cache_tag} tiles={args.tiles} columns={args.columns} (tile={TILE_ELEM * 4} B)")
     per_col: dict[int, dict] = {}
     for cols in args.columns:
         pts = []
         for nt in args.tiles:
-            xclbin, insts = build(nt, cols, Path(args.cache))
+            xclbin, insts = build(nt, cols, Path(args.cache), target.key)
             r = run(xclbin, insts, nt, cols, args.reps, args.warmup)
             if not r["npu_med"]:
                 continue
@@ -183,7 +188,7 @@ def main() -> int:
         fixed, slope = fit(pts)
         bw = 1.0 / slope if slope > 0 else float("nan")
         per_col[cols] = {"fixed_s": fixed, "slope_s_per_byte": slope, "bw_bytes_s": bw, "points": pts}
-        print(f"  -> cols={cols}: slope-BW={bw / 1e9:6.3f} GB/s  fixed={fixed * 1e6:8.2f} us (cf. C1 floor 155 us)\n")
+        print(f"  -> cols={cols}: slope-BW={bw / 1e9:6.3f} GB/s  fixed={fixed * 1e6:8.2f} us (compare with target C1)\n")
 
     if not per_col:
         print("no results")
@@ -196,7 +201,8 @@ def main() -> int:
     best = max(per_col, key=lambda c: per_col[c]["bw_bytes_s"])
     bw = per_col[best]["bw_bytes_s"]
     print(f"\n  C2: bw_feed = {bw / 1e9:.3f} GB/s at {best} columns")
-    print("  (halo aie2p reference: 14.4 GB/s/stream, 56.5 GB/s @8col — different silicon, not comparable)")
+    if target.key == "npu1":
+        print("  (Strix Halo AIE2P reference is different silicon and is not comparable)")
 
     if args.json:
         Path(args.json).write_text(json.dumps({str(k): v for k, v in per_col.items()}, indent=2))
@@ -215,11 +221,24 @@ def main() -> int:
                 caveats=[
                     "slope basis: the C1 dispatch floor lands in the intercept, not the bandwidth",
                     "cheapest possible consumer; a real kernel may not reach this feed rate",
-                    "halo's 14.4/56.5 GB/s are aie2p on Strix Halo and do not transfer",
+                    f"target-specific measurement for {target.key}/{target.tile_isa}; do not transfer it across NPU generations",
                 ],
-            )
+            ),
+            "bw_feed_per_col_bytes_s": calib.Constant(
+                name="bw_feed_per_col_bytes_s",
+                value=bw / best,
+                unit="bytes/s/column",
+                bench="C2",
+                method=f"aggregate C2 slope bandwidth divided by {best} active columns",
+                admissible=True,
+                evidence=ev,
+                caveats=[
+                    "the model scales this rate to the requested active-column count",
+                    "C2 is capped at four columns by its one-output-BO-per-column measurement layout",
+                ],
+            ),
         }
-        print(f"  saved -> {calib.save(key, cs)}")
+        print(f"  saved -> {calib.save(key, cs, meta={'device': target.key, 'tile_isa': target.tile_isa})}")
     return 0
 
 

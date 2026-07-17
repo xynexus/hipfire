@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # hipfire — see LICENSE and NOTICE in the project root.
-"""K1: measure the AIE compute clock (f_H) on npu1.
+"""K1: measure the AIE compute clock (f_H) on AIE2 or AIE2P.
 
 npu1 reports no clock. xrt-smi implements only {aie-partitions, all, host,
 platform} and none carries npu_clk_max — halo's 1800 MHz comes from a report
@@ -42,6 +42,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from aiecost import env  # noqa: E402
+from aiecost.target import include_dirs, resolve_program, resolve_target  # noqa: E402
 
 env.bootstrap()
 
@@ -51,35 +52,50 @@ HERE = Path(__file__).resolve().parent
 KERNEL_SRC = HERE / "k1_vmac_chain.cc"
 
 _mlir_pkg = next((Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None)
-AIE_INCLUDE = _mlir_pkg / "mlir_aie" / "include" if _mlir_pkg else None
-AIE_RUNTIME_LIB = _mlir_pkg / "mlir_aie" / "aie_runtime_lib" / "AIE2" if _mlir_pkg else None
+def vmac_geometry(device: str = "auto") -> tuple[int, int, int, int]:
+    """Return MR, two-A bytes, two-B bytes, and output i32 elements.
 
-# Resident tile sizes for aie::mmul<4,8,8,int8,int8>: A=4x8=32B, B=8x8=64B.
-SA, SB, OUT_N = 32, 64, 64
-A_N, B_N = 2 * SA, 2 * SB
+    K1 is a clock probe: at II=1 the VMAC issue rate is f_H regardless of tile
+    shape, so both targets use the small MR=4 accumulator. On AIE2P the 8x8x8
+    accumulator (64 int32) spills the register file before enough chains hide
+    the accumulator latency — the sweep collapsed at 8 chains instead of
+    plateauing. MR=4 (32 int32) leaves room to push chains to the plateau.
+    """
+    resolve_target(device)  # validate the target is supported
+    mr, mk, mn = 4, 8, 8
+    return mr, 2 * mr * mk, 2 * mk * mn, 8 + mr * mn
 
 
-def build(iters: int, chains: int, out_dir: Path) -> tuple[Path, Path]:
+def build(iters: int, chains: int, out_dir: Path, device: str = "auto") -> tuple[Path, Path]:
     """Compile one (iters, chains) point. Returns (xclbin, insts)."""
     from aie.iron import ObjectFifo, Program, Runtime, Worker
-    from aie.iron.device import NPU1
     from aie.iron.kernel import ExternalFunction
-    from aie.iron.placers import SequentialPlacer
     from aie.utils import set_current_device
     from aie.utils.compile import compile_external_kernel, compile_mlir_module
 
-    set_current_device(NPU1())
+    target = resolve_target(device)
+    iron_device = target.iron_device()
+    set_current_device(iron_device)
+    mr, a_n, b_n, out_n = vmac_geometry(target.key)
 
-    A_ty: object = np.ndarray[(A_N,), np.dtype[np.int8]]
-    B_ty: object = np.ndarray[(B_N,), np.dtype[np.int8]]
-    O_ty: object = np.ndarray[(OUT_N,), np.dtype[np.int32]]
+    A_ty: object = np.ndarray[(a_n,), np.dtype[np.int8]]
+    B_ty: object = np.ndarray[(b_n,), np.dtype[np.int8]]
+    O_ty: object = np.ndarray[(out_n,), np.dtype[np.int32]]
 
     kern = ExternalFunction(
         "k1_vmac_chain",
         source_file=str(KERNEL_SRC),
         arg_types=[A_ty, B_ty, O_ty],
-        include_dirs=[str(AIE_INCLUDE), str(AIE_RUNTIME_LIB)],
-        compile_flags=["-std=c++20", "-O2", f"-DITERS={iters}", f"-DCHAINS={chains}"],
+        include_dirs=include_dirs(_mlir_pkg, target),
+        compile_flags=[
+            "-std=c++20",
+            "-O2",
+            f"-DITERS={iters}",
+            f"-DCHAINS={chains}",
+            f"-DMR={mr}",
+            "-DMK=8",
+            "-DMN=8",
+        ],
     )
 
     of_a = ObjectFifo(A_ty, name="a", depth=1)
@@ -103,36 +119,37 @@ def build(iters: int, chains: int, out_dir: Path) -> tuple[Path, Path]:
         rt.fill(of_b.prod(), b)
         rt.drain(of_o.cons(), o, wait=True)
 
-    module = Program(NPU1(), rt).resolve_program(SequentialPlacer())
+    module = resolve_program(Program(iron_device, rt))
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    xclbin = out_dir / f"k1-i{iters}-c{chains}.xclbin"
-    insts = out_dir / f"k1-i{iters}-c{chains}-insts.bin"
+    xclbin = out_dir / f"k1-{target.cache_tag}-meta2-m{mr}-i{iters}-c{chains}.xclbin"
+    insts = out_dir / f"k1-{target.cache_tag}-meta2-m{mr}-i{iters}-c{chains}-insts.bin"
     if xclbin.exists() and insts.exists():
         return xclbin, insts
 
     with tempfile.TemporaryDirectory(prefix="aiecost_k1_") as tmpname:
         tmp = Path(tmpname)
-        compile_external_kernel(kern, tmp, target_arch="aie2")
+        compile_external_kernel(kern, tmp, target_arch=target.target_arch)
         compile_mlir_module(mlir_module=module, insts_path=tmp / "insts.bin", xclbin_path=tmp / "final.xclbin", work_dir=tmp)
         shutil.copy2(tmp / "final.xclbin", xclbin)
         shutil.copy2(tmp / "insts.bin", insts)
     return xclbin, insts
 
 
-def run(xclbin: Path, insts: Path, reps: int) -> dict:
+def run(xclbin: Path, insts: Path, reps: int, device: str = "auto") -> dict:
     """Run the kernel `reps` times; return best device + wall time and counters."""
     from aie.utils.hostruntime.xrtruntime.hostruntime import XRTHostRuntime
     from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
     from aie.utils.npukernel import NPUKernel
 
+    _mr, a_n, b_n, out_n = vmac_geometry(device)
     rng = np.random.default_rng(0)
-    a = rng.integers(-8, 8, size=(A_N,), dtype=np.int8)
-    b = rng.integers(-8, 8, size=(B_N,), dtype=np.int8)
+    a = rng.integers(-8, 8, size=(a_n,), dtype=np.int8)
+    b = rng.integers(-8, 8, size=(b_n,), dtype=np.int8)
 
     t_a = XRTTensor(a, dtype=np.int8, device="cpu")
     t_b = XRTTensor(b, dtype=np.int8, device="cpu")
-    t_o = XRTTensor((OUT_N,), dtype=np.int32, device="cpu")
+    t_o = XRTTensor((out_n,), dtype=np.int32, device="cpu")
 
     kernel = NPUKernel(xclbin_path=str(xclbin), insts_path=str(insts), kernel_name="MLIR_AIE")
     hrt = XRTHostRuntime()
@@ -153,10 +170,11 @@ def run(xclbin: Path, insts: Path, reps: int) -> dict:
     return {
         "npu_s": None if best_npu == float("inf") else best_npu,
         "wall_s": best_wall,
-        "reported_iters": int(o[0]),
-        "reported_chains": int(o[1]),
-        "vmacs": int(o[2]),
-        "macs_per_vmac": int(o[3]),
+        "reported_iters": int(o[4]),
+        "reported_chains": int(o[5]),
+        "vmacs": int(o[6]),
+        "macs_per_vmac": int(o[7]),
+        "output_head": [int(value) for value in o[:8]],
     }
 
 
@@ -171,27 +189,45 @@ def fit_slope(points: list[tuple[int, float]]) -> tuple[float, float]:
     return (sy - b * sx) / n, b
 
 
+def select_plateau(results: dict[int, dict]) -> tuple[tuple[int, int] | None, float]:
+    """Return an adjacent non-regressing plateau and its mean VMAC/s."""
+    order = sorted(results)
+    for left, right in zip(order, order[1:]):
+        left_rate = results[left]["vmac_per_s"]
+        right_rate = results[right]["vmac_per_s"]
+        gain = right_rate / left_rate
+        if 0.90 <= gain <= 1.10:
+            return (left, right), (left_rate + right_rate) / 2
+    return None, max((results[c]["vmac_per_s"] for c in order), default=float("nan"))
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--iters", type=int, nargs="+", default=[200_000, 400_000, 800_000, 1_600_000])
-    p.add_argument("--chains", type=int, nargs="+", default=[1, 2, 4])
+    p.add_argument("--chains", type=int, nargs="+", default=[1, 2, 4, 8, 12, 16])
     p.add_argument("--reps", type=int, default=5)
+    p.add_argument("--device", default="auto", choices=["auto", "npu1", "npu2"])
     p.add_argument("--cache", default=str(Path.home() / ".cache" / "hipfire-aiecost" / "k1"))
     p.add_argument("--json", metavar="PATH")
+    p.add_argument("--save", action="store_true", help="record admissible f_H in the current calibration")
     args = p.parse_args()
 
+    target = resolve_target(args.device)
     cache = Path(args.cache)
-    print(f"K1 clock: chains={args.chains} iters={args.iters} reps={args.reps}")
+    print(f"K1 clock: target={target.cache_tag} chains={args.chains} iters={args.iters} reps={args.reps}")
     results: dict[int, dict] = {}
 
     for chains in args.chains:
         pts_npu: list[tuple[int, float]] = []
         pts_wall: list[tuple[int, float]] = []
         for iters in args.iters:
-            xclbin, insts = build(iters, chains, cache)
-            r = run(xclbin, insts, args.reps)
+            xclbin, insts = build(iters, chains, cache, target.key)
+            r = run(xclbin, insts, args.reps, target.key)
             if r["reported_iters"] != iters or r["reported_chains"] != chains:
-                print(f"  !! kernel reported iters={r['reported_iters']} chains={r['reported_chains']}, expected {iters}/{chains}")
+                print(
+                    f"  !! kernel reported iters={r['reported_iters']} chains={r['reported_chains']}, "
+                    f"expected {iters}/{chains}; output_head={r['output_head']}"
+                )
                 return 2
             if r["npu_s"]:
                 pts_npu.append((iters, r["npu_s"]))
@@ -225,22 +261,56 @@ def main() -> int:
         print(f"  chains={c}: {results[c]['vmac_per_s'] / 1e9:7.3f} G VMAC/s  ->  f_H {results[c]['implied_f_h_mhz']:7.1f} MHz")
 
     order = sorted(results)
-    verdict, admissible = "UNKNOWN (need >= 2 chain points)", False
-    if len(order) >= 2:
-        gain = results[order[-1]]["vmac_per_s"] / results[order[-2]]["vmac_per_s"]
-        print(f"\n  chains {order[-2]} -> {order[-1]} changed throughput by {gain:.3f}x")
-        if gain < 1.10:
-            verdict, admissible = "PLATEAU — II=1 supported, f_H admissible", True
-        else:
-            verdict = "STILL SCALING — not saturated; add chains before trusting f_H"
+    plateau, f_h_rate = select_plateau(results)
+    admissible = plateau is not None
+    if plateau:
+        left, right = plateau
+        gain = results[right]["vmac_per_s"] / results[left]["vmac_per_s"]
+        print(f"\n  chains {left} -> {right} changed throughput by {gain:.3f}x")
+        verdict = "PLATEAU — II=1 supported, f_H admissible"
+    elif len(order) >= 2 and results[order[-1]]["vmac_per_s"] < 0.9 * results[order[-2]]["vmac_per_s"]:
+        verdict = "REGRESSION — highest chain count spills/stalls; no adjacent plateau"
+    else:
+        verdict = "STILL SCALING — not saturated; add chains before trusting f_H"
     print(f"  verdict: {verdict}")
 
-    f_h = results[order[-1]]["implied_f_h_mhz"]
-    print(f"\n  K1: f_H ~= {f_h:.1f} MHz" + ("" if admissible else "   [NOT ADMISSIBLE]"))
+    f_h = f_h_rate / 1e6
+    print(f"\n  K1: f_H ~= {f_h:.1f} MHz" + ("" if admissible else "   [LOWER BOUND; NOT ADMISSIBLE]"))
 
     if args.json:
         Path(args.json).write_text(json.dumps({"results": {str(k): v for k, v in results.items()}, "admissible": admissible, "f_h_mhz": f_h}, indent=2))
         print(f"  wrote {args.json}")
+    if args.save:
+        if not admissible:
+            print("  refusing to save f_H: the independent-chain sweep did not reach a plateau")
+            return 2
+        from aiecost import calib
+
+        key = calib.current_key()
+        evidence = [
+            f"chains={chains}: {results[chains]['vmac_per_s'] / 1e9:.6f} G VMAC/s, "
+            f"f_H={results[chains]['implied_f_h_mhz']:.3f} MHz"
+            for chains in order
+        ]
+        constants = {
+            "f_h_hz": calib.Constant(
+                name="f_h_hz",
+                value=f_h * 1e6,
+                unit="Hz",
+                bench="K1",
+                method=f"native {target.tile_isa} int8 VMAC ITERS slope after independent-chain plateau",
+                admissible=True,
+                evidence=evidence,
+                caveats=[
+                    "derived from one resident VMAC family; C4 must still calibrate cycles/VMAC by dtype and shape",
+                    "power mode must be recorded with every use",
+                ],
+            )
+        }
+        print(
+            "  saved -> "
+            f"{calib.save(key, constants, meta={'device': target.key, 'tile_isa': target.tile_isa})}"
+        )
     return 0
 
 

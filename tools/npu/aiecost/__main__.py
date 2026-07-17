@@ -73,10 +73,10 @@ def cmd_predict(args: argparse.Namespace) -> int:
         if isinstance(s.mmul_shape, list):
             s.mmul_shape = tuple(s.mmul_shape)
     if len(specs) == 1:
-        print(model.predict(specs[0], args.key).render())
+        print(model.predict(specs[0], args.key, args.device).render())
         return 0
     print(f"ranking {len(specs)} candidates (fastest first):\n")
-    for i, (s, p) in enumerate(model.rank(specs, args.key), 1):
+    for i, (s, p) in enumerate(model.rank(specs, args.key, args.device), 1):
         head = f"{p.device_s * 1e6:10.3f} us" if (p.admissible and p.buildable) else "     ---   "
         print(f"{i:2}. {head}  {s.name}  [{p.limiter if p.admissible else 'refused'}]")
     return 0
@@ -87,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pr = sub.add_parser("probe", help="H-series device facts + claims register")
-    pr.add_argument("--device", default="npu1", choices=["npu1", "npu2"])
+    pr.add_argument("--device", default="auto", choices=["auto", "npu1", "npu2"])
     pr.add_argument("--json", action="store_true", help="machine-readable report")
     pr.add_argument("--csv", metavar="PATH", help="durable one-row-per-claim CSV")
     pr.set_defaults(fn=cmd_probe)
@@ -99,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     pd = sub.add_parser("predict", help="predict a ScheduleSpec (JSON: one object or a list to rank)")
     pd.add_argument("spec", help="path to spec JSON")
     pd.add_argument("--key", help="version key (default: this device)")
+    pd.add_argument("--device", default="auto", choices=["auto", "npu1", "npu2"])
     pd.set_defaults(fn=cmd_predict)
 
     args = p.parse_args(argv)

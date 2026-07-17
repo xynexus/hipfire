@@ -54,8 +54,14 @@ class Residual:
         )
 
 
-def score(spec: ScheduleSpec, measured_s: float, basis: str = "device", key: str | None = None) -> tuple[Prediction, Residual]:
-    p = model.predict(spec, key)
+def score(
+    spec: ScheduleSpec,
+    measured_s: float,
+    basis: str = "device",
+    key: str | None = None,
+    device: str = "auto",
+) -> tuple[Prediction, Residual]:
+    p = model.predict(spec, key, device)
     pred = p.device_s if basis == "device" else p.wrapper_s
     return p, Residual(spec.name, pred, measured_s, basis)
 
@@ -91,12 +97,17 @@ def diagnose(p: Prediction, r: Residual) -> list[str]:
     return out
 
 
-def report(rows: list[tuple[ScheduleSpec, float]], basis: str = "device", key: str | None = None) -> str:
+def report(
+    rows: list[tuple[ScheduleSpec, float]],
+    basis: str = "device",
+    key: str | None = None,
+    device: str = "auto",
+) -> str:
     key = key or calib.current_key()
     lines = [f"refit residual report — key={key}  basis={basis}", ""]
     residuals = []
     for spec, meas in rows:
-        p, r = score(spec, meas, basis, key)
+        p, r = score(spec, meas, basis, key, device)
         residuals.append((p, r))
         lines.append(r.render())
     lines.append("")

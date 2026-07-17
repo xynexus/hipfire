@@ -27,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from aiecost import env  # noqa: E402
+from aiecost.target import include_dirs, resolve_program, resolve_target  # noqa: E402
 
 env.bootstrap()
 
@@ -36,26 +37,27 @@ HERE = Path(__file__).resolve().parent
 KERNEL_SRC = HERE / "c5_src.cc"
 
 _mlir_pkg = next((Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None)
-AIE_INCLUDE = _mlir_pkg / "mlir_aie" / "include" if _mlir_pkg else None
-AIE_RUNTIME_LIB = _mlir_pkg / "mlir_aie" / "aie_runtime_lib" / "AIE2" if _mlir_pkg else None
-
 TILE_ELEM = 1024  # 4 KiB
 
 
-def build(n_tiles: int, columns: int, out_dir: Path) -> tuple[Path, Path]:
+def build(n_tiles: int, columns: int, out_dir: Path, device: str = "auto") -> tuple[Path, Path]:
     from aie.iron import ObjectFifo, Program, Runtime, Worker
     from aie.iron.controlflow import range_
-    from aie.iron.device import NPU1
     from aie.iron.kernel import ExternalFunction
-    from aie.iron.placers import SequentialPlacer
     from aie.utils import set_current_device
     from aie.utils.compile import compile_external_kernel, compile_mlir_module
 
-    set_current_device(NPU1())
+    target = resolve_target(device)
+    if columns > target.compute_columns:
+        raise ValueError(f"columns={columns} exceeds {target.compute_columns} on {target.key}")
+    if columns > 5:
+        raise ValueError("C5 currently uses one output BO per column and is limited to 5 columns by the DPU ABI")
+    iron_device = target.iron_device()
+    set_current_device(iron_device)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    xclbin = out_dir / f"c5-t{n_tiles}-c{columns}.xclbin"
-    insts = out_dir / f"c5-t{n_tiles}-c{columns}-insts.bin"
+    xclbin = out_dir / f"c5-{target.cache_tag}-t{n_tiles}-c{columns}.xclbin"
+    insts = out_dir / f"c5-{target.cache_tag}-t{n_tiles}-c{columns}-insts.bin"
     if xclbin.exists() and insts.exists():
         return xclbin, insts
 
@@ -66,7 +68,7 @@ def build(n_tiles: int, columns: int, out_dir: Path) -> tuple[Path, Path]:
         "c5_src",
         source_file=str(KERNEL_SRC),
         arg_types=[Tile],
-        include_dirs=[str(AIE_INCLUDE), str(AIE_RUNTIME_LIB)],
+        include_dirs=include_dirs(_mlir_pkg, target),
         compile_flags=["-std=c++20", "-O2"],
     )
 
@@ -88,10 +90,10 @@ def build(n_tiles: int, columns: int, out_dir: Path) -> tuple[Path, Path]:
         for c in range(columns):
             rt.drain(of_outs[c].cons(), dsts[c], wait=True)
 
-    module = Program(NPU1(), rt).resolve_program(SequentialPlacer())
+    module = resolve_program(Program(iron_device, rt))
     with tempfile.TemporaryDirectory(prefix="aiecost_c5_") as tmpname:
         tmp = Path(tmpname)
-        compile_external_kernel(kern, tmp, target_arch="aie2")
+        compile_external_kernel(kern, tmp, target_arch=target.target_arch)
         compile_mlir_module(mlir_module=module, insts_path=tmp / "insts.bin", xclbin_path=tmp / "final.xclbin", work_dir=tmp)
         shutil.copy2(tmp / "final.xclbin", xclbin)
         shutil.copy2(tmp / "insts.bin", insts)
@@ -136,17 +138,19 @@ def main() -> int:
     p.add_argument("--columns", type=int, nargs="+", default=[1, 2, 4])
     p.add_argument("--reps", type=int, default=12)
     p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--device", default="auto", choices=["auto", "npu1", "npu2"])
     p.add_argument("--cache", default=str(Path.home() / ".cache" / "hipfire-aiecost" / "c5"))
     p.add_argument("--save", action="store_true")
     p.add_argument("--json", metavar="PATH")
     args = p.parse_args()
 
-    print(f"C5 drain bandwidth: tiles={args.tiles} columns={args.columns} (tile={TILE_ELEM * 4} B)")
+    target = resolve_target(args.device)
+    print(f"C5 drain bandwidth: target={target.cache_tag} tiles={args.tiles} columns={args.columns} (tile={TILE_ELEM * 4} B)")
     per_col: dict[int, dict] = {}
     for cols in args.columns:
         pts = []
         for nt in args.tiles:
-            xclbin, insts = build(nt, cols, Path(args.cache))
+            xclbin, insts = build(nt, cols, Path(args.cache), target.key)
             r = run(xclbin, insts, nt, cols, args.reps, args.warmup)
             if not r["npu_med"]:
                 continue
@@ -183,9 +187,22 @@ def main() -> int:
                 admissible=True, evidence=ev,
                 caveats=["slope basis; C1 floor lands in the intercept",
                          "measured separately from feed because R64 found drain, not feed, was the limiter"],
-            )
+            ),
+            "bw_drain_per_col_bytes_s": calib.Constant(
+                name="bw_drain_per_col_bytes_s",
+                value=bw / best,
+                unit="bytes/s/column",
+                bench="C5",
+                method=f"aggregate C5 slope bandwidth divided by {best} active columns",
+                admissible=True,
+                evidence=ev,
+                caveats=[
+                    "the model scales this rate to the requested active-column count",
+                    "C5 is capped at five columns by its one-output-BO-per-column measurement layout and the 5-argument DPU ABI",
+                ],
+            ),
         }
-        print(f"  saved -> {calib.save(key, cs)}")
+        print(f"  saved -> {calib.save(key, cs, meta={'device': target.key, 'tile_isa': target.tile_isa})}")
     return 0
 
 

@@ -199,7 +199,7 @@ def main() -> int:
         from aiecost import model
 
         print()
-        print(model.predict(spec).render())
+        print(model.predict(spec, device=e.device if e.device in ("npu1", "npu2") else "auto").render())
 
     if args.json:
         Path(args.json).write_text(json.dumps(spec.to_dict(), indent=2))

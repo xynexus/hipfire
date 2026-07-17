@@ -83,7 +83,7 @@ def current_key() -> str:
     from . import device as dev
 
     xrt = dev.probe_xrt()
-    fw = _firmware()
+    fw = xrt.get("firmware_version") or _firmware()
     return key_for(xrt.get("device_name", "unknown"), xrt.get("xrt_version", "unknown"), fw)
 
 

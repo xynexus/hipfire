@@ -1351,13 +1351,17 @@ concrete fused-image boundary, not an admitted performance result; R130 is never
 selected by the runtime. Durable rejection rows are in
 `benchmarks/npu_gemm_tuning/results/r130-fused-qkv-weight-reuse-20260716.csv`.
 
-The admitted serving configuration is startup-resolved and typed. Set
-`HIPFIRE_EMBED_RESIDENT_LAYER=1`, `HIPFIRE_EMBED_NPU_BATCH=2`, and optionally
-`HIPFIRE_EMBED_NPU_CACHE`; the loader constructs one long-lived projector and
-checks attention, FFN, tail, and next-prep geometry. It loads an explicit
-`HIPFIRE_EMBED_GPU_FALLBACK_MODEL` or the canonical sibling BF16 artifact and
-uses that path for missing caches, unsupported segment shapes, poisoned state,
-or NPU execution errors.
+The admitted serving configuration is resolved at model load. Row-padded OQ8
+storage (`qt=43`, plus shape/byte-validated legacy ragged `qt=35`) requests the
+NPU automatically; `HIPFIRE_EMBED_RESIDENT_LAYER=1` remains an explicit opt-in
+for portable artifacts and `=0` forces it off. Set `HIPFIRE_EMBED_NPU_BATCH=2`
+and optionally `HIPFIRE_EMBED_NPU_CACHE`; the loader constructs one long-lived
+projector and checks attention, FFN, tail, and next-prep geometry. A GPU fallback
+is used only when `HIPFIRE_EMBED_GPU_FALLBACK_MODEL` explicitly names it; the
+old `.npu.` filename-to-BF16-sibling inference is removed. Without an explicit
+fallback, a row-padded artifact requires the complete resident-layer cache and
+NPU execution failures return an error rather than entering the incompatible
+GPU OQ8 unpacker.
 
 The projector selects R129 when the non-fused B2 QKV projection is used. When
 the complete M512 resident layer is available, `project_layer` deliberately
@@ -1374,3 +1378,333 @@ absolute error 0.000389665. Three B1 two-command totals are
 tokens/s). A two-short-document request returns two unit-normalized 128-D
 embeddings through fallback. Durable rows:
 `benchmarks/npu_gemm_tuning/results/r131-serving-batched-npu-20260716.csv`.
+
+## R132 — full-encoder capacity and variable-length HTTP admission (2026-07-16/17)
+
+The isolated staged-full-K projection remains correct through B4, but the
+production resident encoder only has complete cache sets for B1/M256 and
+B2/M512. Median full-encoder latency is 800.970 ms at B1 and 1274.406 ms per
+B2 command (637.203 ms/document), improving estimated input-token throughput
+from 319.612 to 401.756 tokens/s, or 1.2570x. B4 is not admitted because no
+complete M1024 attention, FFN, tail, and next-prep cache set exists. Durable
+rows are in
+`benchmarks/npu_gemm_tuning/results/r132-embeddinggemma-batch-sweep-20260716.csv`.
+
+The daemon recognizes the legacy row-padded OQ8 storage from tensor shape and
+payload metadata, loads the B2 resident projector, and never enters the
+incompatible GPU unpacker. Exact M256/M512 segments retain the fused resident
+path. Other row counts now use the canonical variable-length encoder: every
+quantized linear remains on the NPU, while attention, normalization, residuals,
+and pooling operate over only the real rows on the GPU. This avoids semantic
+padding and preserves exact bidirectional-attention and mean-pooling lengths.
+
+Two specialized components were initially over-admitted for arbitrary rows.
+Using the M512 staged combined-QKV and resident FFN paths for an 11-token input
+produced cosine 0.00850622 against BF16. Restricting only the resident FFN to
+its exact loaded geometry improved cosine to 0.14972219 but still failed.
+Restricting both resident FFN and staged combined-QKV to exact loaded rows, and
+using the general NPU projection executors otherwise, reached cosine 0.99974084
+and maximum absolute error 0.00266806. A two-document variable-length request
+then reached per-document cosines 0.99979071 and 0.99973855 with matching token
+counts.
+
+The FIQA HTTP sweep completed at batches 1, 2, 4, 8, 16, 32, and 64 with one
+warmup and three timed requests per size. Throughput remained nearly flat at
+2.789-2.929 documents/s because variable-length documents currently execute
+independently rather than through the exact-256 fused batch ABI. BF16 measured
+54.112-85.336 documents/s on the same corpus, so this correctness fallback is
+approximately 20-29x slower and is not a performance promotion. Durable HTTP
+results are in
+`benchmarks/results/http-embeddings/fiqa-batch-sweep-npu-oq8-20260717.json`.
+
+## R133 — Qwen3 geometry-driven segmented causal attention (2026-07-17)
+
+A new AIE2P component uses explicit bucket, batch, query-head, KV-head, and
+head-dimension geometry. One KV head maps to each of the eight columns; both
+the 0.6B 16/8 GQA topology and the larger-model 32/8 topology use the same
+physical ABI. A 512-byte trailer on every two-column Q object carries the real
+document length while preserving representable DMA blocks. Q, K/V, and output
+regions are disjoint per document.
+
+Real Peano/aiecc builds succeeded for sequence buckets 128, 256, 512, 1024,
+and 2048. Dense-oracle S128/B1 reached cosine 0.99991863 and maximum absolute
+error 0.0038886; S128/B2 with distinct lengths 127/110 reached cosine
+0.99990557 and maximum error 0.0043560. Replacing document 1 left document 0
+bit-identical. The 32/8 topology reached cosine 0.99992292 and maximum error
+0.0038326.
+
+A zero-Q/K closed-form oracle exercised the full bucket range, where causal
+attention reduces to a prefix mean. Cosines for S256/S512/S1024/S2048 were
+0.99999729/0.99999517/0.99999536/0.99999542; maximum errors stayed at or below
+0.0019531. Boundary lengths 1 and 128 passed together in one B2 dispatch.
+Measured wrapper-level times were 9.34/31.86/73.58/262.13 ms respectively.
+
+This admits the segmented-attention component and its bucket ABI only. It is
+not a full Qwen3 encoder, calibrated OQ8+ model, HTTP, quality, or throughput
+promotion; Q/K normalization, RoPE, projections, FFN, final norm, pooling, and
+full-model image composition remain required before model admission.
+
+## R134 — Qwen3 NPU layout chain and OQ8+ projection (2026-07-17)
+
+Directly replaying token-major K/V into the segmented-attention graph was
+rejected: the nested token/head DMA schedule delivered only 16 rows per
+document. The admitted boundary uses three geometry-driven AIE2P transforms:
+token-major Q packing, token-major K/V packing, and attention-output unpacking.
+At S128/B2/QH16/KVH8/D128, Q packing accepted changing real lengths across
+reused commands, K/V packing and output unpacking were byte-exact, and the
+complete pack -> segmented attention -> unpack chain matched the canonical
+segmented path byte-for-byte for lengths 127/110.
+
+A generic dense OQ8+ projection image now covers M in 256-row increments,
+K in G256 groups, and N in 16-column tiles. The NPU performs AWQ division,
+the two signed FWHT passes, dynamic int8 activation quantization, AIE2P
+`mmul<8,8,8>`, group accumulation, scaling, and BF16 output. M256/K256/N16
+reached cosine 0.99999464 and maximum absolute error 0.2481651 against the
+existing `OpusPackedMatrix` oracle. M256/K512/N32 exercised two K groups and
+two output tiles at cosine 0.99999464 and maximum error 0.2490158.
+
+The 32-core projection runtime sequence does not reliably re-arm every
+object-FIFO consumer on the current amdxdna stack: without an array reset,
+reused commands intermittently complete in about 0.6 ms with partial or zero
+output. The failure persists with row-local/four-core weight broadcasts,
+double-buffered FIFOs, a 16 KiB stack, scalar quantization, and a constant core
+body, so it is not projection arithmetic. Recreating only the hardware context
+before a public dispatch preserves PDI, instructions, resident weights, and
+argument BOs and passed 30 fresh processes with two dispatches each, plus ten
+M256/K512/N32 processes. This admits the component correctness seam, not a
+full-encoder or performance result; full-image composition should place all
+layer projections inside one request sequence rather than reset per projection.
+
+## R135 — Qwen3 0.6B full encoder matrix and admission hold (2026-07-17)
+
+The Qwen3-Embedding-0.6B implementation now composes every encoder operation:
+host embedding lookup, 28 resident causal-attention/SwiGLU layers, final
+RMSNorm, last-real-token pooling, and L2 normalization. The compiled AIE2P
+matrix covers S128 B1/2/4/8/16/32, S256 B1/2/4/8/16, S512 B1/2/4/8, S1024
+B1/2/4, and S2048 B1/2, preserving the 4096-padded-row ceiling. A three-input
+S128/B4 run with a repeated first document produced bit-exact embeddings for
+the duplicate slots and bit-exact agreement with the same documents in the
+S128/B2 run. This admits padding isolation and batch invariance for that
+geometry.
+
+Several initially compiled large-batch images exceeded live DMA descriptor or
+program-memory limits. Query packing, KV packing, attention unpacking, and
+segmented attention now phase transfers per document; S2048 transfers use at
+most 64 chunks. The final pool uses four reusable pair lanes instead of one
+core/FIFO pair per document pair. The resulting S128/B4 attention layout chain
+is byte-exact, and the S2048/B1 query pack and unpack transforms are byte-exact.
+
+The first matrix rebuild exposed a cache correctness bug: component readiness
+checked only for `final.xclbin` and `insts.bin`, so an image compiled before a
+builder fix could be silently repackaged. Every component now records a
+source-and-command SHA-256 manifest; absent, malformed, source-stale, or
+command-stale manifests force recompilation. A clean rebuild produced 155
+stamped component images and 20 bundles containing 260 copied component build
+records.
+
+Full-model admission remains **held**. A tooling-only ROCm oracle inverse-
+transformed the exact HFQ OQ8 payload and folded each AWQ sidecar back into an
+ordinary BF16 linear weight. On two realistic 127/108-token inputs, dequantized
+HFQ versus source BF16 reached cosine 0.99886274/0.99932420, passing the 0.995
+weight-quality target. The resident NPU output versus that same-artifact GPU
+oracle reached only 0.98727685/0.98817223; NPU versus source BF16 reached
+0.98777235/0.98806179. Thus calibration/weight quantization is not the current
+limiter, and the required 0.999 same-artifact execution threshold is not met.
+Do not promote the 8K-calibrated candidate or infer 4B/8B admission.
+
+Switching sequence buckets initially failed with `aie2_alloc_resource` because
+the runtime constructed a new thirteen-context encoder before dropping the old
+thirteen-context encoder. It now releases the old geometry first. An isolated
+S128/B1 length-1 full encode then completed on XDNA in 37,627.689 ms with a
+0.99999994 output norm. This is correctness evidence only; the per-projection
+hardware-context recreation makes it unsuitable for a throughput promotion.
+
+The complete boundary sweep subsequently passed at lengths
+1/127/128/255/256/257/511/512/1024/2048. All ten 1024-D outputs were finite
+and unit-normalized within 4e-7. The confirmed-XDNA command took
+1,232,387.216 ms for 4.153727 actual tokens/s and 0.008114 documents/s at a
+0.166829 padding ratio. The result record is
+`/tmp/qwen3-boundary-matrix.json` (SHA-256
+`0445852ae01a153eefa4af8eebde92fad8f0b4eea0b9b339ae4daeb128a10e8c`).
+This closes bucket-boundary execution coverage, but the latency is explicitly
+not a performance admission.
+
+An explicit diagnostic trace retained the last-real-token residual after every
+layer and the final layer's component boundaries without adding allocations to
+normal serving. On a length-1 input, same-artifact GPU/NPU cosine remained at
+least 0.9999209 through layer 26, then fell to 0.6061212 after layer 27;
+final RMSNorm/L2 normalization recovered only to 0.9313588. Replaying the exact
+dequantized-HFQ last layer from the NPU's own layer-26 state showed that each
+component bank was selecting the intended tensor: Q/K/V projections were
+0.9999884/0.9999907/0.9998902, attention was 0.9998904, the down projection was
+0.9999788, and the cancellation-sensitive completed residual was 0.9997571.
+The large final error therefore comes from amplification of small accumulated
+activation error, not a last-bank selector or tensor-order bug. The detailed
+record is `/tmp/qwen3-length1-stage-parity-replay.json`.
+
+Two follow-up precision hypotheses were rejected. Reusing an earlier RMSNorm
+parameter bank for the final residual produced a byte-identical trace, proving
+that the unused normalized half and 57th norm parameter were not the cause. A
+two-term dynamic-int8 residual activation projection compiled and repeated
+stably, but regressed the isolated component from the admitted 0.9999946 cosine
+and approximately 0.248 maximum error to 0.9999787 and 0.3903656. That kernel
+was reverted. Full-model admission remains held pending a precision strategy
+that improves accumulated state without regressing the component contract.
+
+The production HTTP path was exercised through `hipfire serve` and the daemon
+using the registry ID `Qwen3-Embedding-0.6B.npu.oq8+.gfx1151`. A three-document
+request returned HTTP 200 with indices 0/1/2 in order, requested 256-D output,
+unit norms, and bit-exact embeddings for duplicate documents. Explicit
+document and query roles both returned HTTP 200; the query prompt changed the
+same text's embedding as expected (cosine 0.9570363). An unknown `passage` role
+was rejected with HTTP 422. A 3001-token input was rejected in 29 ms with HTTP
+400 and the explicit 2048-token maximum, without NPU dispatch. `/v1/rerank`
+returned HTTP 200 and ranked the directly relevant passage first at
+0.6655046 versus 0.4955520. API correctness is therefore covered even though
+model-quality and performance admission remain held.
+
+## R136 — Qwen3 output coherency and BF16-equivalent component numerics (2026-07-17)
+
+The R135 drift investigation first found an execution-coherency defect rather
+than a model equation defect. Several XDNA component wrappers synchronized an
+output BO only after dispatch, but did not reconcile an output BO that had been
+written by a preceding HIP or host producer before reusing it as an in/out
+argument. Explicit pre-dispatch output synchronization in segmented attention,
+SwiGLU, projection, headnorm/RoPE, residual/RMSNorm, and final pool removed the
+intermittent stale/partial state. Repeated length-1 full encodes then became
+byte-exact.
+
+Round-to-nearest-even BF16 conversion replaced truncation in the Qwen3 OQ8
+projection, residual/RMSNorm, headnorm/RoPE, segmented-attention, and SwiGLU
+images. Exact NPU-input replay showed that projection and residual stages were
+then exact enough for admission, while the remaining accumulated drift was
+concentrated in Q/K head normalization and SwiGLU. The admitted headnorm path
+keeps the reciprocal RMS in F32 for the input product, rounds the normalized
+value to BF16, and then performs the BF16 weight product, matching the PyTorch
+Qwen3 RMSNorm order. The direct component reached Q cosine 1.0 with maximum
+absolute error 0.0078125; K was exact.
+
+The vector approximation in the AIE2P SwiGLU image was replaced by a stable
+scalar F32 exponential/sigmoid path with BF16 rounding at the SiLU and final
+multiply boundaries. Its direct component reached cosine 1.0 and maximum
+absolute error 8, versus 16 for the previous vector path. This costs about 7%
+on the short realistic pair and 16.7% on the boundary sweep, so it is a
+correctness promotion rather than a speed claim.
+
+Rejected precision experiments are retained as negative evidence. BF16 score
+rounding in attention catastrophically reduced full-model cosine to about
+0.60/0.78. A final-pool RNE change was a no-op. Lane-wise headnorm reduction,
+explicit BF16 RoPE products, dynamic-int8 residual projection, K8 projection
+accumulation, and alternate residual/RMSNorm orderings all regressed or failed
+to improve the admitted result and were reverted.
+
+## R137 — Qwen3 0.6B correctness and quality pass, performance hold (2026-07-17)
+
+With the R136 numerics, the final boundary matrix passed at lengths
+1/127/128/255/256/257/511/512/1024/2048. All outputs were finite and
+unit-normalized. Same-artifact GPU/NPU cosines were
+0.99998564/0.99973524/0.99976194/0.99971539/0.99980199/0.99970651/
+0.99972665/0.99969709/0.99965811/0.99961793, so the minimum passes the
+0.999 admission threshold. The minimum NPU-versus-source-BF16 cosine was
+0.99765217, passing the 0.995 threshold. The confirmed-XDNA command took
+496,192.065 ms for 0.020153 documents/s and 10.316570 actual tokens/s at a
+0.166829 padding ratio. The result is `/tmp/qwen3-final-boundary.json`
+(SHA-256 `960af1e525ff527fd0d74e00346e1262192c6b2ce40819780ef09a354c14e710`)
+and its parity record is `/tmp/qwen3-final-boundary-parity.json` (SHA-256
+`991d0f65df73a8ec7a5db011d899dcceb6fe176625028a07e849b8800b2c0ab7`).
+
+The realistic 127/108-token pair independently passed: same-artifact cosine
+0.99958104/0.99952483 and NPU-versus-BF16 cosine
+0.99868560/0.99936408. It took 47,225.276 ms, or 4.976 actual tokens/s.
+
+The quality fixture pins `mteb/scifact` revision
+`cf10ab6856b15b0e670ef8ae5dae4e266c12d035`. Source SHA-256 values are
+`9db7df096f7414435d52bafcbacf814c30cea50eb565c1e8fa6d11440759bba8`
+for queries, `f0d32db0d156b526d75921ed7a76f2cb912902631c87248c5c97c617bad0b60c`
+for corpus, and `da33fc0edc7447d43908ea92bf11de010e361ac43228295f09bdcd33ce14730c`
+for test qrels. A deterministic 16-query/128-document subset retains every
+relevant document and fills distractors by stable SHA ordering. Both the BF16
+reference and NPU candidate reached nDCG@10 0.9597629492, for zero measured
+degradation. This is a deliberately small deterministic admission fixture, not
+a claim for the full SciFact leaderboard.
+
+Performance does not pass. Encoding the 144 SciFact inputs, with real lengths
+28 through 1002, took 2,738,577.008 ms: 0.052582 documents/s and 16.693706
+actual tokens/s at a 0.323553 padding ratio. Consequently the 0.6B artifact is
+admitted for correctness, API behavior, and the fixed quality fixture only;
+it is held from performance promotion. The plan's 4B/8B gate remains closed,
+and neither larger model is downloaded or packaged.
+
+## R138 — exact EmbeddingGemma local attention through 2048 (2026-07-17)
+
+The shared embedding scheduler already assigns the 128/256/512/1024/2048
+buckets, rejects inputs above 2048, and limits dispatches to 4096 padded rows.
+The remaining EmbeddingGemma correctness gap was below that scheduler: for
+sequences longer than its 512-token local window, local layers warned and ran
+full bidirectional attention. A HIP-direct online-softmax entry point now
+restricts visible keys to `abs(query - key) < window`. Short local layers and
+all global layers retain the existing full-attention path. A direct gfx1151
+hardware oracle at sequence 17/window 4 reached maximum absolute error
+1.5e-8 against the CPU reference.
+
+Real model checks used `EmbeddingGemma-300M.npu.oq8+.hfq` for the calibrated
+NPU projections and `EmbeddingGemma-300M.bf16.hfq` as the reference. At the
+first clipped length, 513 tokens, cosine was 0.99979591 with maximum absolute
+error 0.00254500; the hybrid path took 687.027 ms and 746.7 tokens/s. At the
+2048-token cap, cosine was 0.99962610 with maximum absolute error 0.00327036;
+the hybrid path took 1,467.896 ms and 1,395.2 tokens/s. The BF16 GPU references
+took 44.025 and 242.379 ms respectively.
+
+These long-sequence results are deliberately classified as hybrid: every
+quantized linear projection remains on XDNA, while exact sliding/global
+attention, normalization, residuals, and pooling use the HIP bridge. The only
+fully fused resident images remain exact 256-token document geometries (B1 and
+B2). No full-AIE 512/1024/2048 image or performance promotion is inferred.
+
+## R139 — Qwen3 host-boundary SwiGLU removes an AIE2P bottleneck (2026-07-17)
+
+Aggregate stage timing showed that the scalar, correctness-first AIE2P SwiGLU
+image consumed about 808 ms of a 2,387 ms warm length-1 encode. Its inputs and
+outputs were already materialized as host BF16 vectors between independently
+submitted projection images, so keeping this elementwise boundary on NPU added
+dispatch, transfer, and scalar-exp cost without preserving residency. The
+default path now uses a 65,536-entry BF16 SiLU lookup table followed by a BF16
+multiply on the host; `HIPFIRE_QWEN3_SWIGLU=npu` retains the old path for
+comparison and diagnosis.
+
+Warm length-1 median latency fell from **2,386.808 ms to 1,578.667 ms**
+(**1.512×**, 33.9% lower). A realistic 127/108-token pair fell from
+**5,066.470 ms to 2,035.114 ms** (**2.490×**, 59.8% lower), increasing actual
+throughput from 46.38 to 115.47 tokens/s. The complete pinned SciFact subset
+fell from **2,738,577.008 ms to 536,455.192 ms** (**5.105×**), reaching 0.2684
+documents/s and 85.22 tokens/s.
+
+Quality remained admitted. The realistic pair's minimum same-artifact cosine
+against the dequantized-HFQ GPU oracle was **0.99903619**. On all 144 SciFact
+embeddings, cosine versus the prior admitted scalar-NPU output was at least
+**0.99922347**, and both candidates produced exactly the same nDCG@10,
+**0.9597629492** (zero relative degradation). A faster vector-tanh AIE2P image
+was rejected because its realistic-pair cosines, 0.998655/0.998817, missed the
+0.999 execution gate. Raw timings are in
+`benchmarks/npu_gemm_tuning/results/r139-qwen3-host-swiglu-aie2p-20260717.csv`.
+
+## R140 — aiecost gains an NPU2/AIE2P calibration target (2026-07-17)
+
+The version-keyed AIE cost harness now supports `--device auto|npu1|npu2`,
+resolves both generations of IRON APIs, selects the AIE2P runtime library, and
+uses NPU2-specific compiler targets and cache identities. Live detection on
+Strix Halo records 8 compute columns / 32 cores, 64 KiB tile L1, eight 512 KiB
+memory tiles, and 16 BDs and locks per core. All seven probes build and run on
+AIE2P.
+
+The calibrated warm dispatch floor is 72.55 µs; pack/deblock are
+63.78/129.76 GB/s; feed reaches 50.01 GB/s at four columns and drain reaches
+48.46 GB/s at five columns, their respective ABI limits. The task-count slope
+is below noise. FIFO depth 2 won the latest sweep
+by 1.118× over depth 1, but ordering changed across repeats, so this is a hint
+rather than a universal optimum. K1 compiles with the AIE2P 8×8×8 VMAC shape,
+but did not establish a stable chain-length plateau, so the clock is correctly
+left inadmissible. The full target notes are in
+`docs/npu/aie2-cost-model-plan.md`; raw probe records are the
+`aiecost-aie2p-*-20260717.json` files under
+`benchmarks/npu_gemm_tuning/results/`.

@@ -27,7 +27,7 @@ from . import calib
 from .spec import Prediction, ScheduleSpec
 
 
-def _hw_limits(device: str = "npu1") -> dict:
+def _hw_limits(device: str = "auto") -> dict:
     """Buildability limits, read live from the toolchain target model."""
     from .device import probe_toolchain
 
@@ -60,7 +60,7 @@ def check_buildable(spec: ScheduleSpec, limits: dict) -> list[str]:
     return errs
 
 
-def predict(spec: ScheduleSpec, key: str | None = None, device: str = "npu1") -> Prediction:
+def predict(spec: ScheduleSpec, key: str | None = None, device: str = "auto") -> Prediction:
     """Predict a schedule. Refuses (admissible=False) if constants are missing."""
     key = key or calib.current_key()
     consts = calib.load(key)
@@ -204,9 +204,11 @@ def predict(spec: ScheduleSpec, key: str | None = None, device: str = "npu1") ->
     return p
 
 
-def rank(specs: list[ScheduleSpec], key: str | None = None) -> list[tuple[ScheduleSpec, Prediction]]:
+def rank(
+    specs: list[ScheduleSpec], key: str | None = None, device: str = "auto"
+) -> list[tuple[ScheduleSpec, Prediction]]:
     """Rank candidates fastest-first. Ordinal accuracy is the product (§3)."""
-    out = [(s, predict(s, key)) for s in specs]
+    out = [(s, predict(s, key, device)) for s in specs]
     ok = [(s, p) for s, p in out if p.buildable and p.admissible]
     bad = [(s, p) for s, p in out if not (p.buildable and p.admissible)]
     ok.sort(key=lambda sp: sp[1].device_s)

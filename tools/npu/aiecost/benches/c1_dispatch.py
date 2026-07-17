@@ -36,6 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from aiecost import env  # noqa: E402
+from aiecost.target import include_dirs, resolve_program, resolve_target  # noqa: E402
 
 env.bootstrap()
 
@@ -45,21 +46,18 @@ HERE = Path(__file__).resolve().parent
 KERNEL_SRC = HERE / "c1_null.cc"
 
 _mlir_pkg = next((Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None)
-AIE_INCLUDE = _mlir_pkg / "mlir_aie" / "include" if _mlir_pkg else None
-AIE_RUNTIME_LIB = _mlir_pkg / "mlir_aie" / "aie_runtime_lib" / "AIE2" if _mlir_pkg else None
-
 N_ELEM = 16  # tiny: we are measuring the floor, not bandwidth
 
 
-def build(nargs: int, out_dir: Path) -> tuple[Path, Path]:
+def build(nargs: int, out_dir: Path, device: str = "auto") -> tuple[Path, Path]:
     from aie.iron import ObjectFifo, Program, Runtime, Worker
-    from aie.iron.device import NPU1
     from aie.iron.kernel import ExternalFunction
-    from aie.iron.placers import SequentialPlacer
     from aie.utils import set_current_device
     from aie.utils.compile import compile_external_kernel, compile_mlir_module
 
-    set_current_device(NPU1())
+    target = resolve_target(device)
+    iron_device = target.iron_device()
+    set_current_device(iron_device)
 
     T: object = np.ndarray[(N_ELEM,), np.dtype[np.int32]]
     arg_types = [T] * nargs + [T]
@@ -68,13 +66,13 @@ def build(nargs: int, out_dir: Path) -> tuple[Path, Path]:
         "c1_null",
         source_file=str(KERNEL_SRC),
         arg_types=arg_types,
-        include_dirs=[str(AIE_INCLUDE), str(AIE_RUNTIME_LIB)],
+        include_dirs=include_dirs(_mlir_pkg, target),
         compile_flags=["-std=c++20", "-O2", f"-DNARGS={nargs}"],
     )
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    xclbin = out_dir / f"c1-n{nargs}.xclbin"
-    insts = out_dir / f"c1-n{nargs}-insts.bin"
+    xclbin = out_dir / f"c1-{target.cache_tag}-n{nargs}.xclbin"
+    insts = out_dir / f"c1-{target.cache_tag}-n{nargs}-insts.bin"
     if xclbin.exists() and insts.exists():
         return xclbin, insts
 
@@ -97,10 +95,10 @@ def build(nargs: int, out_dir: Path) -> tuple[Path, Path]:
             rt.fill(f.prod(), a)
         rt.drain(of_o.cons(), args[-1], wait=True)
 
-    module = Program(NPU1(), rt).resolve_program(SequentialPlacer())
+    module = resolve_program(Program(iron_device, rt))
     with tempfile.TemporaryDirectory(prefix="aiecost_c1_") as tmpname:
         tmp = Path(tmpname)
-        compile_external_kernel(kern, tmp, target_arch="aie2")
+        compile_external_kernel(kern, tmp, target_arch=target.target_arch)
         compile_mlir_module(mlir_module=module, insts_path=tmp / "insts.bin", xclbin_path=tmp / "final.xclbin", work_dir=tmp)
         shutil.copy2(tmp / "final.xclbin", xclbin)
         shutil.copy2(tmp / "insts.bin", insts)
@@ -157,18 +155,26 @@ def fit(points: list[tuple[int, float]]) -> tuple[float, float]:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--nargs", type=int, nargs="+", default=[1, 2, 3, 4], help="inputs; BOs = nargs+1 (H4 caps at 5)")
+    p.add_argument(
+        "--nargs",
+        type=int,
+        nargs="+",
+        default=[1, 2],
+        help="inputs; one core has two input DMA channels (BOs = nargs+1)",
+    )
     p.add_argument("--reps", type=int, default=100)
     p.add_argument("--warmup", type=int, default=20)
+    p.add_argument("--device", default="auto", choices=["auto", "npu1", "npu2"])
     p.add_argument("--cache", default=str(Path.home() / ".cache" / "hipfire-aiecost" / "c1"))
     p.add_argument("--save", action="store_true", help="record c_cmd/c_bo into the calibration set")
     p.add_argument("--json", metavar="PATH")
     args = p.parse_args()
 
-    print(f"C1 dispatch floor: nargs={args.nargs} reps={args.reps} warmup={args.warmup}")
+    target = resolve_target(args.device)
+    print(f"C1 dispatch floor: target={target.cache_tag} nargs={args.nargs} reps={args.reps} warmup={args.warmup}")
     rows = []
     for nargs in args.nargs:
-        xclbin, insts = build(nargs, Path(args.cache))
+        xclbin, insts = build(nargs, Path(args.cache), target.key)
         r = run(xclbin, insts, nargs, args.reps, args.warmup)
         if r["reported_nargs"] != nargs:
             print(f"  !! kernel reported NARGS={r['reported_nargs']}, expected {nargs}")
@@ -210,7 +216,10 @@ def main() -> int:
                 name="c_bo_s", value=c_bo, unit="s", bench="C1",
                 method=f"null-kernel BO sweep, slope ({basis} basis)",
                 admissible=True, evidence=ev,
-                caveats=["H4 caps BOs at 5 data-arg slots"],
+                caveats=[
+                    "H4 caps BOs at 5 data-arg slots",
+                    "the null graph uses one core and therefore measures only two and three total BOs; that core has two input DMA channels",
+                ],
             ),
             "c_call_s": calib.Constant(
                 name="c_call_s", value=max(0.0, w_cmd - c_cmd), unit="s", bench="C1",
@@ -219,7 +228,7 @@ def main() -> int:
                 caveats=["excludes user-side pack/deblock, which C7 measures separately"],
             ),
         }
-        print(f"  saved -> {calib.save(key, cs, meta={'device': 'npu1'})}")
+        print(f"  saved -> {calib.save(key, cs, meta={'device': target.key, 'tile_isa': target.tile_isa})}")
     return 0
 
 

@@ -1,9 +1,11 @@
-# AIE2 NPU cost model — scope, design, build plan
+# AIE2/AIE2P NPU cost model — scope, design, build plan
 
-**Status:** IMPLEMENTED — all 7 phases. Code in `tools/npu/aiecost/`.
+**Status:** IMPLEMENTED — all 7 phases, with calibrated NPU1/AIE2 and
+NPU2/AIE2P targets. Code in `tools/npu/aiecost/`.
 Both §3 gates pass on an uncontaminated set (Kendall tau = +1.000, 6/6 within
 ±30%). See §10 for results, including two priors this plan got wrong.
-**Target:** XDNA / NPU1 / AIE2 (Phoenix, `RyzenAI-npu1`) on **nix1**.
+**Targets:** XDNA / NPU1 / AIE2 (Phoenix, `RyzenAI-npu1`) on **nix1**, and
+XDNA / NPU2 / AIE2P (Strix Halo, `NPU2`) on **halo**.
 **Goal:** a Python meta-program that characterises the NPU, then predicts kernel
 latency and overheads *ahead of writing the kernel*, well enough to rank
 candidate schedules and identify the limiter.
@@ -406,8 +408,9 @@ before the sweep runs.
 - Confirmed: predict **end-to-end wrapper time**, not device-only. R64 puts
   device at 23.4% of the wrapper on aie2p; a device-only model would predict the
   small half. AIE2's split is unknown and is itself an early measurement (C1+C7).
-- Whether npu2/aie2p becomes a second calibration target later. The design is
-  version-keyed, so this is additive — no structural change needed.
+- Resolved 2026-07-17: npu2/aie2p is a second calibration target. Target
+  selection is explicit (`--device auto|npu1|npu2`) and calibration remains
+  version-keyed, so constants cannot silently cross NPU generations.
 
 ## 10. Results (implemented 2026-07-16)
 
@@ -569,3 +572,30 @@ above, int4 changes device time by *nothing* — 191.6 µs either way — becaus
 `t_submit` (155 µs) and `t_feed` (36.6 µs) dominate and `t_core` is ~1.5–3 µs.
 The 2× is real but invisible unless a schedule is actually compute-bound. That is
 the same lesson as R117, arriving from the other direction.
+
+## 11. NPU2/AIE2P extension (implemented 2026-07-17)
+
+The same harness now resolves IRON's `NPU2` target and the AIE2P runtime library,
+uses target-specific compiler flags and cache tags, and records the detected
+topology in the calibration key. On this Strix Halo host that is 8 compute
+columns / 32 cores, 64 KiB L1 per tile, eight 512 KiB memory tiles, and 16 BDs
+and locks per core. The saved calibration is
+`tools/npu/aiecost/calib/NPUStrixHalo_xrt2.25.0_fw1.1.2.65.json`.
+
+| Bench | NPU2/AIE2P result |
+|---|---|
+| **C1** | `c_cmd` **72.55 µs**, `c_bo` **5.51 µs**. |
+| **C7** | Pack **63.78 GB/s**, deblock **129.76 GB/s**, `c_call` **6.92 µs**; BO allocation is a **6.58 ms setup-only** cost. |
+| **C2** | Feed **12.50 GB/s/column**, **50.01 GB/s aggregate at 4 columns**. |
+| **C5** | Drain **9.69 GB/s/column**, **48.46 GB/s aggregate at 5 columns**. |
+| **C3** | Task-issue slope is below measurement noise and is stored as zero. |
+| **C6** | Depth 2 was best in the refresh sweep: **414.39 µs** versus **463.20 µs** at depth 1 (1.118×). The winner is noisy across runs, so treat this as a schedule hint, not a universal optimum. |
+| **K1** | Inadmissible on AIE2P. The independent-chain probe was extended to 16 chains and driven with the small MR=4 accumulator, but the iteration floor is constant (~4 ns for chains 1/2/4 — pure latency-hiding, throughput just scales with chain count) and the register file spills before the pipe saturates, so no II=1 plateau is reachable in this kernel family. The admissible route is the disassembly VMAC-count method C4 used on npu1 (count `vmac` bundles in the loop; a native shape emits one per `mac()`), pending an aie2p-native int8 shape. |
+
+C2 exercises at most four columns because its source plus one output BO per
+column reaches the five-data-argument DPU ABI limit; C5 has no source BO and
+therefore reaches five drain columns. Their model constants use a measured
+per-column rate and scale to the requested active-column count; the 8-column
+extrapolation must be validated before it is used as an admission claim. All
+raw probe records are under
+`benchmarks/npu_gemm_tuning/results/aiecost-aie2p-*-20260717.json`.

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from . import env
+from .target import resolve_target
 
 env.bootstrap()
 
@@ -74,7 +75,7 @@ class Claim:
 # ── live probes ─────────────────────────────────────────────────────────────
 
 
-def probe_toolchain(device: str = "npu1") -> dict[str, Any]:
+def probe_toolchain(device: str = "auto") -> dict[str, Any]:
     """Read the mlir-aie target model. Tier 2: what the compiler believes.
 
     Also reads the Versal (AIE1) model as a control. That control is what proves
@@ -103,7 +104,13 @@ def probe_toolchain(device: str = "npu1") -> dict[str, Any]:
             f["locks_per_core"] = tm.get_num_locks(*cores[0])
         return f
 
-    out = facts(device)
+    target = resolve_target(device)
+    out = facts(target.key)
+    out["target"] = {
+        "key": target.key,
+        "tile_isa": target.tile_isa,
+        "target_arch": target.target_arch,
+    }
     # AIE1 control: proves the 32 KB / no-memtile figures are Versal's, not ours.
     out["aie1_control"] = facts("xcvc1902")
     return out
@@ -116,31 +123,43 @@ def _run(cmd: list[str]) -> str:
         return ""
 
 
+def parse_xrt_reports(platform: str, system: str) -> dict[str, Any]:
+    """Parse xrt-smi without confusing BIOS and XRT version fields."""
+    out: dict[str, Any] = {}
+    if m := re.search(r"^\s*Name\s*:\s*(.*?)\s*$", platform, re.MULTILINE):
+        out["device_name"] = m.group(1)
+    table = re.search(r"\|\[[^]]+\]\s*\|([^|]+)\|([^|]+)\|([^|]+)\|", system)
+    if table:
+        out.setdefault("device_name", table.group(1).strip())
+        out["architecture"] = table.group(2).strip()
+        out["topology"] = table.group(3).strip()
+    if m := re.search(r"Total Columns\s*:\s*(\d+)", platform):
+        out["total_columns"] = int(m.group(1))
+    if m := re.search(r"Power Mode\s*:\s*(\S+)", platform):
+        out["power_mode"] = m.group(1)
+    out["npu_clk_max_mhz"] = _search_int(platform, r"npu_clk_max\D+(\d+)")
+    out["npu_tops_max"] = _search_int(platform, r"npu_tops_max\D+(\d+)")
+
+    xrt = re.search(r"^XRT\s*$\n(?P<body>.*?)(?=^Device\(s\) Present|\Z)", system, re.MULTILINE | re.DOTALL)
+    body = xrt.group("body") if xrt else ""
+    if m := re.search(r"^\s*Version\s*:\s*([\d.]+)\s*$", body, re.MULTILINE):
+        out["xrt_version"] = m.group(1)
+    if m := re.search(r"^\s*amdxdna Version\s*:\s*(.*?)\s*$", body, re.MULTILINE):
+        out["amdxdna_version"] = m.group(1)
+    if m := re.search(r"^\s*NPU Firmware Version\s*:\s*(\S+)\s*$", body, re.MULTILINE):
+        out["firmware_version"] = m.group(1)
+    return out
+
+
 def probe_xrt() -> dict[str, Any]:
-    """Read xrt-smi. Tier 1 for identity/topology; notably silent on clock."""
+    """Read xrt-smi. Tier 1 for identity, topology, and installed versions."""
     smi = env.xrt_bin("xrt-smi")
     if not smi.exists():
         return {}
-    txt = _run([str(smi), "examine", "-r", "platform"])
-    out: dict[str, Any] = {}
-    if m := re.search(r"Name\s*:\s*(\S+)", txt):
-        out["device_name"] = m.group(1)
-    if m := re.search(r"Total Columns\s*:\s*(\d+)", txt):
-        out["total_columns"] = int(m.group(1))
-    if m := re.search(r"Power Mode\s*:\s*(\S+)", txt):
-        out["power_mode"] = m.group(1)
-    # npu1 reports neither of these; halo reports both. Absence is the finding.
-    out["npu_clk_max_mhz"] = _search_int(txt, r"npu_clk_max\D+(\d+)")
-    out["npu_tops_max"] = _search_int(txt, r"npu_tops_max\D+(\d+)")
-
-    ver = _run([str(smi), "examine"])
-    for key, pat in (
-        ("xrt_version", r"Version\s*:\s*([\d.]+)"),
-        ("amdxdna_version", r"amdxdna Version\s*:\s*(\S+)"),
-    ):
-        if m := re.search(pat, ver):
-            out[key] = m.group(1)
-    return out
+    return parse_xrt_reports(
+        _run([str(smi), "examine", "-r", "platform"]),
+        _run([str(smi), "examine"]),
+    )
 
 
 def _search_int(txt: str, pat: str) -> int | None:
@@ -186,13 +205,14 @@ def git_commit() -> str:
 # ── register ────────────────────────────────────────────────────────────────
 
 
-def build_register(device: str = "npu1") -> list[Claim]:
+def build_register(device: str = "auto") -> list[Claim]:
     """Assemble the claims register from live sources.
 
     Values come from probes, not from constants in this file, so the register
     re-derives itself on a toolchain or firmware change rather than going stale.
     """
-    tc = probe_toolchain(device)
+    target = resolve_target(device)
+    tc = probe_toolchain(target.key)
     xrt = probe_xrt()
     roc = probe_rocminfo()
     aie1 = tc["aie1_control"]
@@ -243,7 +263,7 @@ def build_register(device: str = "npu1") -> list[Claim]:
             Tier.PROBE,
             Status.LIKELY,
             probe="sweep BO count to EINVAL",
-            note="command-packet ABI; expected to transfer, unverified on npu1",
+            note=f"command-packet ABI; verified indirectly by existing {target.tile_isa} images, explicit sweep still pending",
         )
     )
 
@@ -311,8 +331,10 @@ def build_register(device: str = "npu1") -> list[Claim]:
     )
 
     # ── B: bandwidth (halo numbers do not transfer) ──
-    add(Claim("B1", "Per-stream feed roof", None, "halo aie2p: 14.4 GB/s", Tier.PROBE, Status.NO_TRANSFER, probe="C2"))
-    add(Claim("B2", "Aggregate feed roof", None, "halo aie2p: 56.5 GB/s @8col", Tier.PROBE, Status.NO_TRANSFER, probe="C2"))
+    same_halo = target.key == "npu2" and "halo" in xrt.get("device_name", "").lower()
+    bandwidth_status = Status.LIKELY if same_halo else Status.NO_TRANSFER
+    add(Claim("B1", "Per-stream feed roof", None, "halo aie2p: 14.4 GB/s", Tier.PROBE, bandwidth_status, probe="C2"))
+    add(Claim("B2", "Aggregate feed roof", None, "halo aie2p: 56.5 GB/s @8col", Tier.PROBE, bandwidth_status, probe="C2"))
     add(Claim("B3", "Drain roof / shim channel capacity", None, "R61 (aie2p, qualitative)", Tier.PROBE, Status.UNKNOWN, probe="C5"))
 
     # ── K: clock and power ──
@@ -321,7 +343,7 @@ def build_register(device: str = "npu1") -> list[Claim]:
             "K1",
             "AIE compute clock",
             xrt.get("npu_clk_max_mhz"),
-            "xrt-smi reports no clock on npu1 (halo reports npu_clk_max=1800)",
+            f"xrt-smi clock report on {xrt.get('device_name', target.key)}",
             Tier.PROBE,
             Status.CONFIRMED if xrt.get("npu_clk_max_mhz") else Status.UNKNOWN,
             probe="K1: time a loop of known instruction count",
@@ -333,7 +355,7 @@ def build_register(device: str = "npu1") -> list[Claim]:
             "K2",
             "Peak TOPS",
             xrt.get("npu_tops_max"),
-            "marketing (~16 for npu1); xrt-smi silent on npu1",
+            f"xrt-smi/marketing for {xrt.get('device_name', target.key)}",
             Tier.UNRELIABLE,
             Status.CONFIRMED if xrt.get("npu_tops_max") else Status.UNKNOWN,
             probe="C4, derives from K1",
@@ -381,34 +403,36 @@ def build_register(device: str = "npu1") -> list[Claim]:
             None,
             "R56 (aie2p / Strix Halo)",
             Tier.PROBE,
-            Status.NO_TRANSFER,
-            note="N/A on Phoenix: no MALL exists on this SoC",
+            Status.LIKELY if same_halo else Status.NO_TRANSFER,
+            note=("R56 was measured on the same Strix Halo family" if same_halo else "N/A on Phoenix: no MALL exists on this SoC"),
         )
     )
     return claims
 
 
-def provenance(device: str = "npu1") -> dict[str, Any]:
+def provenance(device: str = "auto") -> dict[str, Any]:
     """Full report: register + raw source dumps + versions, for durable rows."""
+    target = resolve_target(device)
     xrt = probe_xrt()
     roc = probe_rocminfo()
-    claims = build_register(device)
+    claims = build_register(target.key)
     by_status: dict[str, list[str]] = {}
     for c in claims:
         by_status.setdefault(c.status, []).append(c.id)
     return {
-        "device": device,
+        "device": target.key,
+        "tile_isa": target.tile_isa,
         "git_commit": git_commit(),
         "xrt": xrt,
         "rocminfo": roc,
-        "toolchain": probe_toolchain(device),
+        "toolchain": probe_toolchain(target.key),
         "claims": [c.to_row() for c in claims],
         "summary": by_status,
         "envelope_gaps": [c.id for c in claims if c.status in (Status.UNKNOWN, Status.WRONG_GEN, Status.NO_TRANSFER)],
     }
 
 
-def render(device: str = "npu1") -> str:
+def render(device: str = "auto") -> str:
     rep = provenance(device)
     lines = [
         f"aiecost H-series provenance — device={rep['device']} git={rep['git_commit']}",

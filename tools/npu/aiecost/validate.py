@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aiecost import calib, model, refit  # noqa: E402
 from aiecost.spec import ScheduleSpec  # noqa: E402
+from aiecost.target import resolve_target  # noqa: E402
 
 TILE_BYTES = 4096
 ACC_BYTES = 64
@@ -115,10 +116,10 @@ def kendall_tau(a: list[int], b: list[int]) -> float:
     return (conc - disc) / total if total else float("nan")
 
 
-def measure(cand: Candidate, reps: int, warmup: int, cache: Path) -> float | None:
+def measure(cand: Candidate, reps: int, warmup: int, cache: Path, device: str) -> float | None:
     from aiecost.benches import c2_feed
 
-    built = c2_feed.build(cand.n_tiles, cand.columns, cache)
+    built = c2_feed.build(cand.n_tiles, cand.columns, cache, device)
     if not built:
         return None
     r = c2_feed.run(*built, cand.n_tiles, cand.columns, reps, warmup)
@@ -130,20 +131,22 @@ def main() -> int:
     p.add_argument("--family", choices=["a", "b"], default="b", help="b = clean post-fix set; a = burned, regression only")
     p.add_argument("--reps", type=int, default=10)
     p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--device", default="auto", choices=["auto", "npu1", "npu2"])
     p.add_argument("--dry-run", action="store_true", help="print the committed ranking, do not measure")
     p.add_argument("--cache", default=str(Path.home() / ".cache" / "hipfire-aiecost" / "validate"))
     p.add_argument("--json", metavar="PATH")
     args = p.parse_args()
 
+    target = resolve_target(args.device)
     key = calib.current_key()
-    print(f"phase 6: commit-first ordinal validation — key={key}\n")
+    print(f"phase 6: commit-first ordinal validation — target={target.cache_tag} key={key}\n")
 
     # ── COMMIT ──
     family = FAMILIES[args.family]
     if args.family == "a":
         print("  NOTE: family A is BURNED — the dispatch-floor fix was derived from its residuals.\n"
               "  Its tau is contaminated and counts as regression, not validation.\n")
-    preds = [(c, model.predict(c.spec(), key)) for c in family]
+    preds = [(c, model.predict(c.spec(), key, target.key)) for c in family]
     refused = [c.name for c, pr in preds if not (pr.buildable and pr.admissible)]
     if refused:
         print(f"model refused/rejected: {refused}")
@@ -165,7 +168,7 @@ def main() -> int:
     print("measuring...")
     measured: dict[str, float] = {}
     for c, _ in preds:
-        t = measure(c, args.reps, args.warmup, Path(args.cache))
+        t = measure(c, args.reps, args.warmup, Path(args.cache), target.key)
         if t:
             measured[c.name] = t
             print(f"  {c.name:<12} {t * 1e6:9.2f} us")
@@ -191,7 +194,7 @@ def main() -> int:
     print(f"\n  Kendall tau = {tau:+.3f}   (gate: >= {gate})   {'PASS' if tau >= gate else 'FAIL'}")
 
     print()
-    print(refit.report([(c.spec(), measured[c.name]) for c, _ in usable], basis="device", key=key))
+    print(refit.report([(c.spec(), measured[c.name]) for c, _ in usable], basis="device", key=key, device=target.key))
 
     print("\n  scope: interpolation within C2's kernel family at off-grid operating points;")
     print("  not an independent test of a different dataflow.")

@@ -33,6 +33,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from aiecost import env  # noqa: E402
+from aiecost.target import include_dirs, resolve_program, resolve_target  # noqa: E402
 
 env.bootstrap()
 
@@ -42,27 +43,24 @@ HERE = Path(__file__).resolve().parent
 KERNEL_SRC = HERE / "c2_sink.cc"
 
 _mlir_pkg = next((Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None)
-AIE_INCLUDE = _mlir_pkg / "mlir_aie" / "include" if _mlir_pkg else None
-AIE_RUNTIME_LIB = _mlir_pkg / "mlir_aie" / "aie_runtime_lib" / "AIE2" if _mlir_pkg else None
-
 TILE_ELEM = 1024  # 4 KiB
 ACC_ELEM = 16
 
 
-def build(depth: int, n_tiles: int, out_dir: Path) -> tuple[Path, Path] | None:
+def build(depth: int, n_tiles: int, out_dir: Path, device: str = "auto") -> tuple[Path, Path] | None:
     from aie.iron import ObjectFifo, Program, Runtime, Worker
     from aie.iron.controlflow import range_
-    from aie.iron.device import NPU1
     from aie.iron.kernel import ExternalFunction
-    from aie.iron.placers import SequentialPlacer
     from aie.utils import set_current_device
     from aie.utils.compile import compile_external_kernel, compile_mlir_module
 
-    set_current_device(NPU1())
+    target = resolve_target(device)
+    iron_device = target.iron_device()
+    set_current_device(iron_device)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    xclbin = out_dir / f"c6-d{depth}-t{n_tiles}.xclbin"
-    insts = out_dir / f"c6-d{depth}-t{n_tiles}-insts.bin"
+    xclbin = out_dir / f"c6-{target.cache_tag}-d{depth}-t{n_tiles}.xclbin"
+    insts = out_dir / f"c6-{target.cache_tag}-d{depth}-t{n_tiles}-insts.bin"
     if xclbin.exists() and insts.exists():
         return xclbin, insts
 
@@ -72,7 +70,7 @@ def build(depth: int, n_tiles: int, out_dir: Path) -> tuple[Path, Path] | None:
 
     kern = ExternalFunction(
         "c2_sink", source_file=str(KERNEL_SRC), arg_types=[Tile, Acc],
-        include_dirs=[str(AIE_INCLUDE), str(AIE_RUNTIME_LIB)], compile_flags=["-std=c++20", "-O2"],
+        include_dirs=include_dirs(_mlir_pkg, target), compile_flags=["-std=c++20", "-O2"],
     )
 
     of_in = ObjectFifo(Tile, name="in0", depth=depth)
@@ -94,10 +92,10 @@ def build(depth: int, n_tiles: int, out_dir: Path) -> tuple[Path, Path] | None:
         rt.drain(of_out.cons(), dst, wait=True)
 
     try:
-        module = Program(NPU1(), rt).resolve_program(SequentialPlacer())
+        module = resolve_program(Program(iron_device, rt))
         with tempfile.TemporaryDirectory(prefix="aiecost_c6_") as tmpname:
             tmp = Path(tmpname)
-            compile_external_kernel(kern, tmp, target_arch="aie2")
+            compile_external_kernel(kern, tmp, target_arch=target.target_arch)
             compile_mlir_module(mlir_module=module, insts_path=tmp / "insts.bin", xclbin_path=tmp / "final.xclbin", work_dir=tmp)
             shutil.copy2(tmp / "final.xclbin", xclbin)
             shutil.copy2(tmp / "insts.bin", insts)
@@ -133,16 +131,18 @@ def main() -> int:
     p.add_argument("--tiles", type=int, default=1024)
     p.add_argument("--reps", type=int, default=12)
     p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--device", default="auto", choices=["auto", "npu1", "npu2"])
     p.add_argument("--cache", default=str(Path.home() / ".cache" / "hipfire-aiecost" / "c6"))
     p.add_argument("--save", action="store_true")
     p.add_argument("--json", metavar="PATH")
     args = p.parse_args()
 
+    target = resolve_target(args.device)
     total = TILE_ELEM * args.tiles * 4
-    print(f"C6 fifo depth: depths={args.depths} tiles={args.tiles} (tile={TILE_ELEM * 4} B, total={total / 1024:.0f} KiB)")
+    print(f"C6 fifo depth: target={target.cache_tag} depths={args.depths} tiles={args.tiles} (tile={TILE_ELEM * 4} B, total={total / 1024:.0f} KiB)")
     rows = {}
     for d in args.depths:
-        built = build(d, args.tiles, Path(args.cache))
+        built = build(d, args.tiles, Path(args.cache), target.key)
         if not built:
             rows[d] = None
             continue
@@ -184,12 +184,12 @@ def main() -> int:
                 method="fifo-depth sweep at constant payload; per-depth residual over the best pipelined time",
                 admissible=True, evidence=ev,
                 caveats=[
-                    "small term on npu1: the C1 dispatch floor (~155 us) dwarfs it",
+                    f"small term on {target.key}: compare it with that target's measured C1 dispatch floor",
                     "L1 (M1) bounds depth*tile_bytes; aie2p saw depth-4 build failures for the same reason (R58/E2)",
                 ],
             )
         }
-        print(f"  saved -> {calib.save(key, cs)}")
+        print(f"  saved -> {calib.save(key, cs, meta={'device': target.key, 'tile_isa': target.tile_isa})}")
     return 0
 
 
