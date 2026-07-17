@@ -695,7 +695,18 @@ partials core-to-core (GEMM row 2 → scale row 3) but via an **objectfifo** (me
 mediated) — cascade replaces that hop with the direct acc bus and frees rows 4–5.
 Tradeoff to measure: cascade forwards the C-partial (output-sized) per chain hop, so
 it wins when input-DMA savings (∝ K) exceed the on-chip partial-forwarding cost.
-**Status: experiment under construction (`benchmarks/npu_gemm_tuning/cascade/`).**
+
+**MEASURED — cascade runs at ~10× the memtile GEMM (feed-free compute).** r5's full
+32-core cascade array (COLS=8 × ROWS=4, `r5_gen.py 8 4`, `r5_cascade.cc` head/mid/tail)
+built via `r5_build.sh` and timed with `npu_cascade_time` (slope of INNER=64 vs 1024 to
+subtract the 72.6 µs floor): **~2090 GMAC/s** (~65 GMAC/s/core), vs the r6 fullk memtile
+GEMM at **210 GMAC/s**. The floor model checks out (INNER=64 = 72 µs floor + 16 µs
+compute). This is **feed-free** (INNER recomputes resident tiles, no memtile pressure),
+so it isolates the compute ceiling: keeping C in the flowing accumulator removes the
+per-tile C-reload that pinned r6/SOTA to ~5–15 TOPS. **This flips the earlier
+"sublinear ~2.3×" verdict — that was the memtile dataflow; cascade is a different
+machine.** OPEN: the realistic feed-bound rate (a larger streaming design, memtile-fed)
+to see how much of the 10× survives real weight/activation feed.
 
 **Prior art: `r5/` already prototyped cascade.** `benchmarks/npu_gemm_tuning/r5/`
 (`r5_cascade.cc`, `r5_2core.mlir`, `r5_4core.mlir`, `r5/README.md`) is a full
