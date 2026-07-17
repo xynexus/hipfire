@@ -1,0 +1,267 @@
+{
+  "key": "RyzenAI-npu1_xrt2.25.0_fw1.5.5.391",
+  "meta": {
+    "device": "npu1",
+    "note": "K1 established; see benches/k1_clock.py"
+  },
+  "constants": {
+    "f_h_hz": {
+      "name": "f_h_hz",
+      "value": 1015000000.0,
+      "unit": "Hz",
+      "bench": "K1",
+      "method": "saturated VMAC issue rate; CHAINS sweep 1/2/4/8, ITERS slope fit on npu_time",
+      "admissible": true,
+      "evidence": [
+        "plateau: 1.015/1.019/1.013 G VMAC/s at chains=2/4/8 (within 0.6%) -> pipe saturated, latency hidden",
+        "chains=1 (1.92 ns/iter) == chains=2 (1.97 ns/iter): 1 chain is latency-bound, 2 fill the pipe",
+        "chains=4 -> 8 throughput ratio 0.994x: plateau, not still-scaling",
+        "disassembly (llvm-objdump, aie2): loop .LBB0_1 unrolled 4x (r5=0x3e8=ITERS, add r5,r5,#-0x4); 16 bundles / 16 vmac in body incl. branch delay slots => exactly 1 VMAC per bundle",
+        "bundle count x measured slope: 4 cycles/iter / 3.9244 ns = 1.019 GHz, agrees with the plateau independently"
+      ],
+      "caveats": [
+        "assumes 1 bundle/cycle issue (standard VLIW model); the plateau corroborates but does not prove it",
+        "measured at pmode=default; setting pmode needs CAP_SYS_ADMIN. Do not assume clock-invariance across modes.",
+        "npu_time basis; cold-vs-warm does not affect the slope (fixed cost cancels)"
+      ],
+      "measured_utc": "2026-07-16T18:59:40+00:00"
+    },
+    "c_cmd_s": {
+      "name": "c_cmd_s",
+      "value": 0.000155,
+      "unit": "s",
+      "bench": "C1",
+      "method": "near-null kernel (touch each input once, write one word), warmed, median device npu_time",
+      "admissible": true,
+      "evidence": [
+        "run A (reps=30):  n_bos=2 -> 153.781 us, n_bos=3 -> 148.651 us",
+        "run B (reps=150): n_bos=2 -> 157.362 us, n_bos=3 -> 161.962 us",
+        "across both runs the floor sits in 148.7-162.0 us; point estimate 155 us (+/-5%)",
+        "independent corroboration: K1 chains=1 fit intercept ~236 us on a larger graph, same order"
+      ],
+      "caveats": [
+        "THIS IS THE DOMINANT TERM ON npu1: a do-nothing dispatch costs ~155 us of device time. For scale, R64 measured aie2p full production QKV device span at 241 us.",
+        "warmed medians; cold first-command values are far higher (R63 saw 3.5-4.2 ms cold vs 1.03 ms warm)",
+        "measured at n_bos 2-3 only; see c_bo_s"
+      ],
+      "measured_utc": "2026-07-16T19:04:28+00:00"
+    },
+    "c_bo_s": {
+      "name": "c_bo_s",
+      "value": 0.0,
+      "unit": "s",
+      "bench": "C1",
+      "method": "BO-count sweep slope; not separable from noise",
+      "admissible": true,
+      "evidence": [
+        "run A slope = -5.130 us/BO (negative => unphysical => noise-dominated)",
+        "run B slope = +4.600 us/BO; the sign flips between runs",
+        "conclusion: |c_bo| < ~5 us, indistinguishable from zero, and <3% of the 155 us floor"
+      ],
+      "caveats": [
+        "value 0.0 is a bounded measurement (|c_bo| < 5 us), not an extrapolation",
+        "sweep is BLOCKED above n_bos=3: nargs>=3 fails aiecc with \"Resource allocation pipeline failed\" at tile(0,2) \u2014 a core tile cannot source that many input DMA channels. The 5-slot H4 limit is never reached because the per-core DMA channel limit binds first."
+      ],
+      "measured_utc": "2026-07-16T19:04:28+00:00"
+    },
+    "c_call_s": {
+      "name": "c_call_s",
+      "value": 7.716595090388244e-06,
+      "unit": "s",
+      "bench": "C7",
+      "method": "byte-independent intercept of pack + deblock (direct, not by subtraction)",
+      "admissible": true,
+      "evidence": [
+        "    4096 B: pack=    4.48 us deblock=    2.12 us (alloc=24559.72 sync=4.48 back=1.30 numpy=0.82)",
+        "   16384 B: pack=    4.13 us deblock=    1.80 us (alloc=16732.06 sync=4.13 back=1.04 numpy=0.76)",
+        "   65536 B: pack=    5.31 us deblock=    2.26 us (alloc=16805.13 sync=5.31 back=1.51 numpy=0.75)",
+        "  262144 B: pack=   10.64 us deblock=    4.79 us (alloc=17437.30 sync=10.64 back=3.92 numpy=0.87)",
+        " 1048576 B: pack=   25.96 us deblock=   13.65 us (alloc=17746.45 sync=25.96 back=12.66 numpy=0.99)",
+        " 4194304 B: pack=   63.04 us deblock=   48.83 us (alloc=18275.31 sync=63.04 back=47.96 numpy=0.87)"
+      ],
+      "caveats": [
+        "supersedes C1's unstable 48-75 us wall-minus-device estimate, which was measured by subtraction"
+      ],
+      "measured_utc": "2026-07-16T19:07:46+00:00"
+    },
+    "c_bo_alloc_s": {
+      "name": "c_bo_alloc_s",
+      "value": 0.01759187349853164,
+      "unit": "s",
+      "bench": "C7",
+      "method": "XRTTensor construction (BO allocation), median across the byte sweep",
+      "admissible": true,
+      "evidence": [
+        "    4096 B: pack=    4.48 us deblock=    2.12 us (alloc=24559.72 sync=4.48 back=1.30 numpy=0.82)",
+        "   16384 B: pack=    4.13 us deblock=    1.80 us (alloc=16732.06 sync=4.13 back=1.04 numpy=0.76)",
+        "   65536 B: pack=    5.31 us deblock=    2.26 us (alloc=16805.13 sync=5.31 back=1.51 numpy=0.75)",
+        "  262144 B: pack=   10.64 us deblock=    4.79 us (alloc=17437.30 sync=10.64 back=3.92 numpy=0.87)",
+        " 1048576 B: pack=   25.96 us deblock=   13.65 us (alloc=17746.45 sync=25.96 back=12.66 numpy=0.99)",
+        " 4194304 B: pack=   63.04 us deblock=   48.83 us (alloc=18275.31 sync=63.04 back=47.96 numpy=0.87)",
+        "size-independent: 24.6 ms at 4096 B vs 18.3 ms at 4194304 B"
+      ],
+      "caveats": [
+        "SETUP ONLY \u2014 never add this to a per-dispatch prediction. Real code allocates once and reuses.",
+        "A first cut of this bench folded alloc into pack and got a negative c_pack (-9 GB/s); size-independence is what proves it is not a per-byte cost."
+      ],
+      "measured_utc": "2026-07-16T19:07:46+00:00"
+    },
+    "c_pack_s_per_byte": {
+      "name": "c_pack_s_per_byte",
+      "value": 1.3945061372417357e-11,
+      "unit": "s/byte",
+      "bench": "C7",
+      "method": ".to('npu') host->device sync, byte sweep slope, medians (BO alloc excluded)",
+      "admissible": true,
+      "evidence": [
+        "    4096 B: pack=    4.48 us deblock=    2.12 us (alloc=24559.72 sync=4.48 back=1.30 numpy=0.82)",
+        "   16384 B: pack=    4.13 us deblock=    1.80 us (alloc=16732.06 sync=4.13 back=1.04 numpy=0.76)",
+        "   65536 B: pack=    5.31 us deblock=    2.26 us (alloc=16805.13 sync=5.31 back=1.51 numpy=0.75)",
+        "  262144 B: pack=   10.64 us deblock=    4.79 us (alloc=17437.30 sync=10.64 back=3.92 numpy=0.87)",
+        " 1048576 B: pack=   25.96 us deblock=   13.65 us (alloc=17746.45 sync=25.96 back=12.66 numpy=0.99)",
+        " 4194304 B: pack=   63.04 us deblock=   48.83 us (alloc=18275.31 sync=63.04 back=47.96 numpy=0.87)"
+      ],
+      "caveats": [
+        "host->device path only; no kernel runs",
+        "excludes any workload-specific block-layout transform"
+      ],
+      "measured_utc": "2026-07-16T19:07:46+00:00"
+    },
+    "c_deblock_s_per_byte": {
+      "name": "c_deblock_s_per_byte",
+      "value": 1.1222336272966609e-11,
+      "unit": "s/byte",
+      "bench": "C7",
+      "method": ".to('cpu') + .numpy(), byte sweep slope, medians",
+      "admissible": true,
+      "evidence": [
+        "    4096 B: pack=    4.48 us deblock=    2.12 us (alloc=24559.72 sync=4.48 back=1.30 numpy=0.82)",
+        "   16384 B: pack=    4.13 us deblock=    1.80 us (alloc=16732.06 sync=4.13 back=1.04 numpy=0.76)",
+        "   65536 B: pack=    5.31 us deblock=    2.26 us (alloc=16805.13 sync=5.31 back=1.51 numpy=0.75)",
+        "  262144 B: pack=   10.64 us deblock=    4.79 us (alloc=17437.30 sync=10.64 back=3.92 numpy=0.87)",
+        " 1048576 B: pack=   25.96 us deblock=   13.65 us (alloc=17746.45 sync=25.96 back=12.66 numpy=0.99)",
+        " 4194304 B: pack=   63.04 us deblock=   48.83 us (alloc=18275.31 sync=63.04 back=47.96 numpy=0.87)"
+      ],
+      "caveats": [
+        "device->host path only"
+      ],
+      "measured_utc": "2026-07-16T19:07:46+00:00"
+    },
+    "bw_feed_bytes_s": {
+      "name": "bw_feed_bytes_s",
+      "value": 16147410475.518131,
+      "unit": "bytes/s",
+      "bench": "C2",
+      "method": "tile stream, 1 word touched per tile; slope of npu_time vs bytes at 4 columns",
+      "admissible": true,
+      "evidence": [
+        "cols=1: 4.097 GB/s (fixed 228.2 us)",
+        "cols=2: 7.637 GB/s (fixed 176.7 us)",
+        "cols=4: 16.147 GB/s (fixed 181.9 us)"
+      ],
+      "caveats": [
+        "slope basis: the C1 dispatch floor lands in the intercept, not the bandwidth",
+        "cheapest possible consumer; a real kernel may not reach this feed rate",
+        "halo's 14.4/56.5 GB/s are aie2p on Strix Halo and do not transfer"
+      ],
+      "measured_utc": "2026-07-16T19:10:40+00:00"
+    },
+    "bw_drain_bytes_s": {
+      "name": "bw_drain_bytes_s",
+      "value": 15915537435.026638,
+      "unit": "bytes/s",
+      "bench": "C5",
+      "method": "core writes 1 word/tile, DMA drains; slope of npu_time vs bytes at 4 columns",
+      "admissible": true,
+      "evidence": [
+        "cols=1: 4.140 GB/s (fixed 210.5 us)",
+        "cols=2: 8.149 GB/s (fixed 183.4 us)",
+        "cols=4: 15.916 GB/s (fixed 172.2 us)"
+      ],
+      "caveats": [
+        "slope basis; C1 floor lands in the intercept",
+        "measured separately from feed because R64 found drain, not feed, was the limiter"
+      ],
+      "measured_utc": "2026-07-16T19:12:07+00:00"
+    },
+    "c_task_issue_s": {
+      "name": "c_task_issue_s",
+      "value": 5e-09,
+      "unit": "s",
+      "bench": "C3",
+      "method": "8 MiB payload held constant; tile-size sweep varies task count 8x (4096 -> 512). Slope of npu_time vs task count.",
+      "admissible": true,
+      "evidence": [
+        "run A: n_tiles 4096/2048/1024/512 -> 2276.52/2274.86/2244.65/2241.37 us (8x fewer tasks = 1.5% faster)",
+        "run B: n_tiles 4096/2048/1024/512 -> 2335.27/2279.08/2383.50/2281.78 us (NON-MONOTONIC: 1024 tiles slower than 4096)",
+        "fitted slope moved 9.8 ns -> 3.3 ns/task between runs; point estimate 5 ns with the sign stable but the magnitude not",
+        "even at 4096 tasks this is ~20 us against a ~2280 us transfer: under 1%"
+      ],
+      "caveats": [
+        "FINDING \u2014 THE aie2p PRIOR DOES NOT TRANSFER. R68 cut tasks ~3x on halo for 24% less time; on npu1 an 8x cut buys ~1.5%. Reason: npu1 feeds at ~3.7 GB/s/column, so a 2 KiB tile takes ~553 ns to move while task issue costs ~5 ns \u2014 the overhead hides completely behind the transfer. halo moves bytes ~3.5x faster per column, which is what made per-task cost visible there. Task-count optimisation is NOT a lever on npu1.",
+        "value is an upper bound, not a fit: below the noise floor at these sizes",
+        "single column; concurrent multi-column issue is unmeasured",
+        "tile=32 KiB failed to build: 32 KiB x depth-2 double buffer = 64 KiB = exactly L1 (M1). M1 binds the tile size."
+      ],
+      "measured_utc": "2026-07-16T19:13:58+00:00"
+    },
+    "fill_drain_s": {
+      "name": "fill_drain_s",
+      "value": 0.0,
+      "unit": "s",
+      "bench": "C6",
+      "method": "fifo-depth sweep at constant payload; per-depth residual over the best pipelined time",
+      "admissible": true,
+      "evidence": [
+        "depth=1: 1252.06 us",
+        "depth=2: 1231.90 us",
+        "depth=3: 1228.28 us",
+        "depth=4: 1225.03 us",
+        "depth=8: 1229.91 us",
+        "depth1 -> best(4): 1.022x"
+      ],
+      "caveats": [
+        "small term on npu1: the C1 dispatch floor (~155 us) dwarfs it",
+        "L1 (M1) bounds depth*tile_bytes; aie2p saw depth-4 build failures for the same reason (R58/E2)"
+      ],
+      "measured_utc": "2026-07-16T19:14:53+00:00"
+    },
+    "bw_feed_per_col_bytes_s": {
+      "name": "bw_feed_per_col_bytes_s",
+      "value": 4030000000.0,
+      "unit": "bytes/s/column",
+      "bench": "C2",
+      "method": "per-column feed rate; C2 column sweep is near-linear so bandwidth is modelled as per_col * columns",
+      "admissible": true,
+      "evidence": [
+        "cols=1: 4.097 GB/s",
+        "cols=2: 7.637 GB/s (1.86x)",
+        "cols=4: 16.147 GB/s (3.94x)",
+        "linear within ~4%: 4.03 GB/s/col x 4 = 16.1 GB/s, matches the measured 4-col roof"
+      ],
+      "caveats": [
+        "broadcast pattern (every column reads the same stream); R56 found shared vs distinct made no difference on aie2p, unverified here",
+        "cheapest possible consumer \u2014 a real kernel may not reach this rate"
+      ],
+      "measured_utc": "2026-07-16T19:15:37+00:00"
+    },
+    "bw_drain_per_col_bytes_s": {
+      "name": "bw_drain_per_col_bytes_s",
+      "value": 3980000000.0,
+      "unit": "bytes/s/column",
+      "bench": "C5",
+      "method": "per-column drain rate from the C5 column sweep",
+      "admissible": true,
+      "evidence": [
+        "cols=1: 4.140 GB/s",
+        "cols=2: 8.149 GB/s (1.97x)",
+        "cols=4: 15.916 GB/s (3.84x)",
+        "feed and drain are SYMMETRIC on npu1 (16.147 vs 15.916 GB/s at 4 cols) \u2014 unlike halo, where R64 found the output DMA starved 198 us of a 241 us span"
+      ],
+      "caveats": [
+        "near-linear in columns, same as feed"
+      ],
+      "measured_utc": "2026-07-16T19:15:37+00:00"
+    }
+  }
+}
