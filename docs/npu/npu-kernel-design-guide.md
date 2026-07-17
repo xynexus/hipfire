@@ -404,6 +404,18 @@ is `add` + `jnz` + a 5-slot branch shadow = 7 bundles/iter, giving f_H = 7 cyc �
   *schedule* effect. int4's durable wins: it fills the pipe more easily **and**
   halves weight-DMA bytes.
 - **int4 × int4 (W4A4): no `mmul` family** on AIE2P — unsupported natively.
+- **bfp16 (block-float / MX) is int8-rate, not a 2× path.** `mmul_bfp16_bfp16<8,8,8>`
+  → `mac_8x8_8x8T`, `block_vector<bfp16ebs8,64>`, single accumulator block =
+  **512 MACs/native-VMAC, same as int8** (header-derived; hardware-unconfirmed —
+  needs a `block_vector` kernel the shared chain probe can't express). The "Block
+  FP16 2×" claim is bfp16 *vs true bf16* (which is heavily emulated, ~16 VMACs per
+  `mac()`), **not** vs int8. So bfp16 buys FP16-ish accuracy at int8 speed, not
+  more throughput.
+- **512 MACs/native-VMAC is the datapath ceiling for every dtype on AIE2P.** int8,
+  int4, and bfp16 all top out there — the 512-bit VMAC does 512 MACs/cycle and no
+  operand width exceeds it (int8 already saturates the MAC units; narrower operands
+  don't add MAC lanes, unlike npu1 where int8 leaves half the lanes idle so int4
+  doubles). Peak is therefore ~55–58 TOPS for the whole int/bfp family.
 - **The ~126 TOPS figure is NOT the NPU.** It is AMD's Ryzen AI Max+ 395 *system*
   nameplate — NPU (~50) + Radeon 8060S GPU + Zen5 CPU. The NPU alone measures
   ~55–58 TOPS (32 × 512 MACs/native-VMAC × 2 × ~1.68 GHz), int8 and int4 alike.
