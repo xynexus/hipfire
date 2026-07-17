@@ -3689,6 +3689,53 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
     ) -> HipResult<()> {
+        self.attention_dflash_with_window_f32(q, k, v, out, b, l, n_heads, n_kv_heads, head_dim, 0)
+    }
+
+    /// Bidirectional self-attention restricted to keys satisfying
+    /// `abs(query_position - key_position) < window`.
+    ///
+    /// This is the exact local-attention contract used by encoder embedding
+    /// models. Unlike the full cross-attention entry point, queries and keys
+    /// must describe the same sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_dflash_bidirectional_window_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        out: &GpuTensor,
+        sequence: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        window: usize,
+    ) -> HipResult<()> {
+        if window == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "bidirectional attention window must be positive",
+            ));
+        }
+        self.attention_dflash_with_window_f32(
+            q, k, v, out, sequence, sequence, n_heads, n_kv_heads, head_dim, window,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_dflash_with_window_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        out: &GpuTensor,
+        b: usize,
+        l: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        window: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
             "attention_dflash_f32",
@@ -3723,6 +3770,7 @@ impl Gpu {
         let mut hd = head_dim as i32;
         let mut sc = scale;
         let mut ts = tile_size as i32;
+        let mut win = window as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -3735,6 +3783,7 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
             &mut ts as *mut _ as *mut c_void,
+            &mut win as *mut _ as *mut c_void,
         ];
         let shared_mem = ((tile_size + block_size as usize + head_dim) * 4) as u32;
         unsafe {

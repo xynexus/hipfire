@@ -901,8 +901,10 @@ impl HfqFile {
     /// hipfire-quantize path produces `model.layers.N.`. Callers consistently
     /// pass one prefix style; this helper tries the exact name first, then
     /// strips or adds the `model.language_model.` prefix so a model file
-    /// from either pipeline loads cleanly. Returns `None` only when no
-    /// variant matches — the per-callsite `?` early-return is preserved.
+    /// from either pipeline loads cleanly. SentenceTransformers exports may
+    /// also omit the outer `model.` prefix entirely, so that variant is tried
+    /// as well. Returns `None` only when no variant matches — the per-callsite
+    /// `?` early-return is preserved.
     fn resolve_idx(&self, name: &str) -> Option<usize> {
         if let Some(&idx) = self.tensor_map.get(name) {
             return Some(idx);
@@ -916,6 +918,12 @@ impl HfqFile {
         }
         // Add "model.language_model." prefix: "model.X" → "model.language_model.X"
         if let Some(rest) = name.strip_prefix("model.") {
+            // SentenceTransformers Qwen exports the transformer directly, so
+            // its safetensors keys are `embed_tokens.*`, `layers.*`, `norm.*`
+            // rather than the causal-LM wrapper's `model.*` keys.
+            if let Some(&idx) = self.tensor_map.get(rest) {
+                return Some(idx);
+            }
             let long = format!("model.language_model.{rest}");
             if let Some(&idx) = self.tensor_map.get(&long) {
                 return Some(idx);
@@ -2686,6 +2694,28 @@ mod tests {
 
         let _ = std::fs::remove_file(payload_a);
         let _ = std::fs::remove_file(payload_b);
+        let _ = std::fs::remove_file(package_path);
+    }
+
+    #[test]
+    fn canonical_model_prefix_resolves_stripped_sentence_transformer_tensor() {
+        let payload = temp_path("stripped-tensor.bin");
+        let package_path = temp_path("stripped-tensor.hfq");
+        std::fs::write(&payload, 1.0f32.to_le_bytes()).unwrap();
+        let entries = vec![HfqPackageWriteEntry {
+            name: "embed_tokens.weight".to_string(),
+            quant_type: 2,
+            shape: vec![1],
+            group_size: 0,
+            source_path: payload.clone(),
+            data_size: 4,
+        }];
+        write_hfqm_package_from_files(&package_path, 1, "{}", &entries).unwrap();
+
+        let hfq = HfqFile::open(&package_path).unwrap();
+        assert!(hfq.find_tensor_info("model.embed_tokens.weight").is_some());
+
+        let _ = std::fs::remove_file(payload);
         let _ = std::fs::remove_file(package_path);
     }
 }

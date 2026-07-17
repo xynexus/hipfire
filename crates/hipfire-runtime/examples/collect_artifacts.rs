@@ -46,7 +46,7 @@ use hipfire_arch_nemotron::{calibration as nemotron_calib, model::NemotronModel,
 use hipfire_arch_qwen35::qwen35::{self, CalibOpts as QwenCalibOpts};
 use hipfire_arch_zaya::{calibration as zaya_calib, ZayaConfig};
 use hipfire_rdna::Gpu;
-use hipfire_runtime::calibration::tokenize_embedding_samples;
+use hipfire_runtime::calibration::{collect_qwen3_embedding_artifacts, tokenize_embedding_samples};
 use std::path::Path;
 
 fn arg(flag: &str, default: Option<String>) -> Option<String> {
@@ -83,11 +83,17 @@ fn main() {
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(hfq.arch_id);
 
-    if source_arch_id == 19 && synthetic {
-        panic!("EmbeddingGemma calibration requires --corpus sample boundaries; --synthetic-tokens is unsupported");
+    let embedding_metadata =
+        hipfire_model::embedding::EmbeddingMetadata::from_hfq_metadata_json(&hfq.metadata_json)
+            .expect("embedding metadata");
+    let is_embedding_workload =
+        source_arch_id == 19 || (source_arch_id == 1 && embedding_metadata.is_some());
+
+    if is_embedding_workload && synthetic {
+        panic!("embedding calibration requires --corpus sample boundaries; --synthetic-tokens is unsupported");
     }
-    if source_arch_id == 19 && want_kldref {
-        panic!("EmbeddingGemma calibration does not produce autoregressive KLDREF artifacts");
+    if is_embedding_workload && want_kldref {
+        panic!("embedding calibration does not produce autoregressive KLDREF artifacts");
     }
 
     // Loaded lazily — synthetic mode has no usable tokenizer; only the gemma3
@@ -106,15 +112,24 @@ fn main() {
     // so the tapped activations match the served distribution instead of bare
     // text. Opt out with `--no-calib-prompt` for a legacy unprompted calibration.
     let calib_apply_prompt =
-        source_arch_id == 19 && !std::env::args().any(|a| a == "--no-calib-prompt");
+        is_embedding_workload && !std::env::args().any(|a| a == "--no-calib-prompt");
     let calib_doc_prompt: String = if calib_apply_prompt {
-        embeddinggemma::config_from_metadata_json(&hfq.metadata_json)
-            .expect("embeddinggemma config for calibration prompt")
-            .document_prompt
+        embedding_metadata
+            .as_ref()
+            .map(|metadata| {
+                metadata
+                    .prompt(hipfire_model::embedding::EmbeddingInputType::Document)
+                    .to_string()
+            })
+            .unwrap_or_else(|| {
+                embeddinggemma::config_from_metadata_json(&hfq.metadata_json)
+                    .expect("embeddinggemma config for calibration prompt")
+                    .document_prompt
+            })
     } else {
         String::new()
     };
-    let embedding_samples: Vec<Vec<u32>> = if source_arch_id == 19 {
+    let embedding_samples: Vec<Vec<u32>> = if is_embedding_workload {
         let text = std::fs::read_to_string(&corpus).expect("read embedding corpus as UTF-8");
         if calib_apply_prompt {
             eprintln!("embedding calibration: prepending document_prompt {calib_doc_prompt:?}");
@@ -141,7 +156,7 @@ fn main() {
         Vec::new()
     };
 
-    let tokens_owned: Vec<u32> = if source_arch_id == 19 {
+    let tokens_owned: Vec<u32> = if is_embedding_workload {
         Vec::new()
     } else if synthetic {
         // Parse vocab_size from the hfq metadata (flat or under `config`).
@@ -168,19 +183,19 @@ fn main() {
         let text = String::from_utf8_lossy(&raw[..take]).to_string();
         tokenizer.as_ref().unwrap().encode(&text)
     };
-    let n_tok = if source_arch_id == 19 {
+    let n_tok = if is_embedding_workload {
         embedding_samples.iter().map(Vec::len).sum()
     } else {
         tokens_owned.len().min(max_tokens)
     };
-    let tokens = if source_arch_id == 19 {
+    let tokens = if is_embedding_workload {
         &[][..]
     } else {
         &tokens_owned[..n_tok]
     };
     eprintln!(
         "calibrating on {n_tok} tokens across {} sample(s) (kldref={want_kldref}, synthetic={synthetic})",
-        if source_arch_id == 19 {
+        if is_embedding_workload {
             embedding_samples.len()
         } else {
             1
@@ -200,6 +215,27 @@ fn main() {
     ];
     let t0 = std::time::Instant::now();
     let (n_hessian, n_imatrix, max_consistency, mode) = match source_arch_id {
+        1 if is_embedding_workload => {
+            let config =
+                hipfire_runtime::hfq::config_from_hfq(&hfq).expect("qwen3 embedding config");
+            let weights = hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, &mut gpu)
+                .expect("qwen3 embedding weights");
+            let summary = collect_qwen3_embedding_artifacts(
+                &mut gpu,
+                &weights,
+                &config,
+                &embedding_samples,
+                Path::new(&output),
+                &provenance,
+            )
+            .expect("collect");
+            (
+                summary.n_hessian,
+                summary.n_imatrix,
+                summary.max_consistency,
+                "qwen3-embedding",
+            )
+        }
         5 | 6 => {
             let config = qwen35::config_from_hfq(&hfq).expect("qwen35 config");
             let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load_weights");

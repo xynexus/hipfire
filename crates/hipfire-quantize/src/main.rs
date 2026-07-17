@@ -2375,7 +2375,7 @@ impl HfqInputFile {
                 "not an HFQM container",
             ));
         }
-        let _version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
         let arch_id = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
         let n_tensors = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
         let metadata_offset = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
@@ -2475,7 +2475,8 @@ impl HfqInputFile {
             pos += 1;
             let n_dims = mmap[pos] as usize;
             pos += 1;
-            if pos + n_dims * 4 + 12 > data_offset {
+            let trailing_index_bytes = if version >= 2 { 20 } else { 12 };
+            if pos + n_dims * 4 + trailing_index_bytes > data_offset {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "HFQM index truncated at shape/data size",
@@ -2490,13 +2491,26 @@ impl HfqInputFile {
             pos += 4;
             let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
             pos += 8;
-            if cumulative_offset + data_size > mmap.len() {
+            let tensor_data_offset = if version >= 2 {
+                let offset_units =
+                    u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
+                pos += 8;
+                offset_units.checked_mul(32).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("HFQM tensor {name} data offset overflow"),
+                    )
+                })?
+            } else {
+                cumulative_offset
+            };
+            if tensor_data_offset < data_offset || tensor_data_offset + data_size > mmap.len() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
                         "HFQM tensor {name} range {}..{} exceeds file size {}",
-                        cumulative_offset,
-                        cumulative_offset + data_size,
+                        tensor_data_offset,
+                        tensor_data_offset + data_size,
                         mmap.len()
                     ),
                 ));
@@ -2506,10 +2520,10 @@ impl HfqInputFile {
                 quant_type,
                 shape,
                 group_size,
-                data_offset: cumulative_offset,
+                data_offset: tensor_data_offset,
                 data_size,
             });
-            cumulative_offset += data_size;
+            cumulative_offset = tensor_data_offset + data_size;
         }
 
         Ok(Self {
@@ -3103,6 +3117,100 @@ fn tokenizer_config_with_chat_template(
         }
         _ => serde_json::json!({ "chat_template": chat_template }),
     }
+}
+
+fn read_optional_json(path: &Path, label: &str) -> Result<Option<serde_json::Value>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("read {label} {}: {error}", path.display()))?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|error| format!("parse {label} {}: {error}", path.display()))
+}
+
+fn sentence_transformers_embedding_metadata(
+    input_dir: &Path,
+    model_config: &serde_json::Value,
+    npu_required: bool,
+    quant_format: &str,
+) -> Result<Option<hipfire_model::embedding::EmbeddingMetadata>, String> {
+    use std::collections::BTreeMap;
+
+    use hipfire_model::embedding::{EmbeddingMetadata, EmbeddingNpuMetadata};
+
+    let Some(modules) = read_optional_json(&input_dir.join("modules.json"), "modules.json")? else {
+        if npu_required {
+            return Err(
+                "--npu-embedding requires a SentenceTransformers modules.json sidecar".to_string(),
+            );
+        }
+        return Ok(None);
+    };
+    let module_list = modules
+        .as_array()
+        .ok_or_else(|| "SentenceTransformers modules.json must contain an array".to_string())?;
+    let mut module_configs = BTreeMap::new();
+    for module in module_list {
+        let path = module
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if path.is_empty() {
+            continue;
+        }
+        let relative = Path::new(path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(format!("invalid SentenceTransformers module path {path:?}"));
+        }
+        if let Some(config) = read_optional_json(
+            &input_dir.join(relative).join("config.json"),
+            "SentenceTransformers module config",
+        )? {
+            module_configs.insert(path.to_string(), config);
+        }
+    }
+    let sentence_config = read_optional_json(
+        &input_dir.join("config_sentence_transformers.json"),
+        "config_sentence_transformers.json",
+    )?;
+    let npu = npu_required.then(|| EmbeddingNpuMetadata {
+        required: true,
+        architecture: "aie2p".to_string(),
+        quant_format: quant_format.to_string(),
+        storage_layout: "opus_oq8_g256_per_row".to_string(),
+    });
+    EmbeddingMetadata::from_sentence_transformers(
+        model_config,
+        &modules,
+        &module_configs,
+        sentence_config.as_ref(),
+        npu,
+    )
+    .map(Some)
+}
+
+fn validate_npu_embedding_output_name(path: &Path) -> Result<(), String> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "--npu-embedding output must have a UTF-8 .hfq filename".to_string())?;
+    let parsed = hipfire_model::parse_canonical_model_artifact_name(file_name).ok_or_else(|| {
+        format!(
+            "--npu-embedding output filename {file_name:?} is not canonical; expected <model>-<size>.npu.oq8+[.gfxNNNN].hfq"
+        )
+    })?;
+    if parsed.quant != "oq8+" || parsed.features != ["npu"] {
+        return Err(format!(
+            "--npu-embedding output filename {file_name:?} must use exactly the .npu.oq8+ feature/quant groups"
+        ));
+    }
+    Ok(())
 }
 
 // ─── GGUF input pipeline ────────────────────────────────────────────────────
@@ -3701,7 +3809,8 @@ fn quantize_hfq_source_tensor(
                     quantize_oq8g256(row, &signs1, &signs2)
                 })
             };
-            (q, QuantType::Oq8G256, 256, "OQ8G256")
+            let quant_type = QuantType::oq8_for_matrix_cols(k);
+            (q, quant_type, 256, "OQ8G256")
         }
         HfqInputFormat::OqPlusTiered | HfqInputFormat::OqPlusCompact => {
             // OQ+ magnitude-tiered W4A8: bulk int4, top-`w8_frac` weights/group at
@@ -3795,7 +3904,8 @@ fn quantize_hfq_source_tensor(
             if compact {
                 (q, QuantType::OqPlusCompact, 256, "OQ+C")
             } else {
-                (q, QuantType::Oq8G256, 256, "OQ+T")
+                let quant_type = QuantType::oq8_for_matrix_cols(k);
+                (q, quant_type, 256, "OQ+T")
             }
         }
         HfqInputFormat::F16
@@ -4594,6 +4704,16 @@ fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
 ///   - the tensor name doesn't have a ggml-mapping (norms, small 1D, etc.), OR
 ///   - the imatrix file doesn't carry this tensor (rare; usually means the
 ///     tensor wasn't exercised by the calibration corpus).
+fn imatrix_direct_name_candidates(safetensors_name: &str) -> Vec<String> {
+    let mut names = vec![safetensors_name.to_string()];
+    if let Some(stripped) = safetensors_name.strip_prefix("model.") {
+        names.push(stripped.to_string());
+    } else {
+        names.push(format!("model.{safetensors_name}"));
+    }
+    names
+}
+
 fn imatrix_weights_for(safetensors_name: &str) -> Option<&'static [f32]> {
     let im = IMATRIX.get()?;
     // `load_imatrix` keys the map by the imatrix FILE's tensor names (`.in_sum2`
@@ -4603,8 +4723,10 @@ fn imatrix_weights_for(safetensors_name: &str) -> Option<&'static [f32]> {
     // safetensors-keyed but we only tried the GGML-converted name, which always
     // missed (and 27B-3.6 hybrid linear_attn names don't round-trip anyway).
     // Fall back to the GGML name for llama.cpp-style (blk.*) imatrices.
-    if let Some(v) = im.get(safetensors_name) {
-        return Some(v.as_slice());
+    for name in imatrix_direct_name_candidates(safetensors_name) {
+        if let Some(v) = im.get(&name) {
+            return Some(v.as_slice());
+        }
     }
     let ggml_name = safetensors_to_ggml_name(safetensors_name)?;
     im.get(&ggml_name).map(|v| v.as_slice())
@@ -5090,6 +5212,8 @@ OPTIONS:
                                weights instead of RTN; requires --hessian. Composes
                                with --awq (smooths activations + rebases the Hessian)
     --chat-template-file <P>   override the embedded chat template (Jinja file)
+    --npu-embedding            emit the typed AIE2P embedding workload/storage contract;
+                               requires SentenceTransformers sidecars and --format oq8+
     --threads <N>              rayon worker threads (default 80% of cores; env HIPFIRE_QUANT_THREADS)
     --verbose-tensors          print one detail line per tensor while quantizing
     --beam <N>                 QTIP trellis beam-search width (default 128, near-Viterbi); lower =
@@ -5314,6 +5438,7 @@ fn main() {
         eprintln!("error: {error}");
         std::process::exit(2);
     });
+    let npu_embedding = args.iter().any(|arg| arg == "--npu-embedding");
 
     // `--emit-fixture <arch>`: write a tiny random-init HF model (safetensors +
     // config.json) for gating, then exit. Flows through the normal `--input`
@@ -5392,6 +5517,18 @@ fn main() {
         std::process::exit(2);
     });
     let requested_format = normalize_format_flag(format_arg);
+    if npu_embedding && requested_format != "oq8+" {
+        eprintln!(
+            "error: --npu-embedding currently requires --format oq8+ (got {requested_format})"
+        );
+        std::process::exit(2);
+    }
+    if npu_embedding {
+        if let Err(error) = validate_npu_embedding_output_name(Path::new(output_path)) {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    }
     let opus_mixed_spec = parse_opus_mixed_format(&requested_format);
     let mut format_storage = requested_format.clone();
     // OQ4+/OQ4++ are not separate storage tags: they use OQ4 bytes plus
@@ -6553,6 +6690,12 @@ fn main() {
     } else {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
+    if npu_embedding && arch_id != ARCH_ID_QWEN3_QWEN2_LEGACY && arch_id != ARCH_ID_EMBEDDINGGEMMA {
+        eprintln!(
+            "error: --npu-embedding supports Qwen3 (arch_id=1) and EmbeddingGemma (arch_id=19), got arch_id={arch_id}"
+        );
+        std::process::exit(2);
+    }
     // Resolve stacked routed-expert ingest from the registered source layout and
     // config structure. Dense variants sharing a base id remain dense because
     // they declare no experts, while Qwen3.5-MoE, Zaya, and future registered
@@ -6736,6 +6879,34 @@ fn main() {
         "tokenizer_config": tokenizer_config,
         "generation_config": generation_config,
     });
+    let embedding_metadata = sentence_transformers_embedding_metadata(
+        input_dir,
+        &config,
+        npu_embedding,
+        &requested_format,
+    );
+    let is_embedding_workload = embedding_metadata
+        .as_ref()
+        .is_ok_and(|metadata| metadata.is_some());
+    match embedding_metadata {
+        Ok(Some(embedding)) => {
+            metadata["embedding"] = serde_json::to_value(embedding)
+                .expect("EmbeddingMetadata serialization cannot fail");
+            eprintln!(
+                "  embedding metadata: SentenceTransformers workload{}",
+                if npu_embedding {
+                    ", NPU-only AIE2P"
+                } else {
+                    ""
+                }
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("error: embedding metadata: {error}");
+            std::process::exit(2);
+        }
+    }
 
     // Gemma3 RMSNorm uses the (1 + weight) zero-centered convention. We bake the
     // +1 into every norm tensor (post-pass below, before write) so the standard
@@ -6835,6 +7006,13 @@ fn main() {
         }
     }
     all_tensors.sort_by_key(|(name, _)| name.to_string());
+    if is_embedding_workload {
+        let before = all_tensors.len();
+        all_tensors.retain(|(name, _)| !name.ends_with("lm_head.weight"));
+        if all_tensors.len() != before {
+            eprintln!("  embedding workload: omitted autoregressive lm_head.weight");
+        }
+    }
     eprintln!(
         "Found {} tensors ({} FP8 scale siblings indexed)",
         all_tensors.len(),
@@ -11080,10 +11258,20 @@ mod xxh64_provenance_tests {
         assert_eq!(tensors[1].spilled_len, expected_payloads[1].len() as u64);
 
         let metadata = serde_json::json!({ "architecture": "test" });
-        let metadata_json =
-            metadata_with_quantization_hash(metadata, &tensors, Some(&spill)).expect("metadata");
-        write_hfq(&output, 24, &metadata_json, &tensors, Some(&mut spill))
-            .expect("write spilled HFQ");
+        let metadata_json = hipfire_quantize::hfq_out::metadata_with_quantization_hash(
+            metadata,
+            &tensors,
+            Some(&spill),
+        )
+        .expect("metadata");
+        hipfire_quantize::hfq_out::write_hfq(
+            &output,
+            24,
+            &metadata_json,
+            &tensors,
+            Some(&mut spill),
+        )
+        .expect("write spilled HFQ");
 
         let hfq = HfqInputFile::open(&output).expect("open round-trip HFQ");
         assert_eq!(hfq.arch_id, 24);
@@ -13077,6 +13265,95 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn sentence_transformers_sidecars_are_ingested_from_disk() {
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-st-embedding-metadata-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("1_Pooling")).unwrap();
+        std::fs::write(
+            root.join("modules.json"),
+            serde_json::to_vec(&json!([
+                {"path":"", "type":"sentence_transformers.models.Transformer"},
+                {"path":"1_Pooling", "type":"sentence_transformers.models.Pooling"},
+                {"path":"2_Normalize", "type":"sentence_transformers.models.Normalize"}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("1_Pooling/config.json"),
+            serde_json::to_vec(&json!({
+                "word_embedding_dimension": 1024,
+                "pooling_mode_cls_token": false,
+                "pooling_mode_mean_tokens": false,
+                "pooling_mode_max_tokens": false,
+                "pooling_mode_mean_sqrt_len_tokens": false,
+                "pooling_mode_weightedmean_tokens": false,
+                "pooling_mode_lasttoken": true,
+                "include_prompt": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("config_sentence_transformers.json"),
+            serde_json::to_vec(&json!({
+                "prompts": {
+                    "query": "Instruct: retrieve relevant passages\nQuery:",
+                    "document": ""
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let metadata = sentence_transformers_embedding_metadata(
+            &root,
+            &json!({"model_type":"qwen3", "hidden_size":1024}),
+            true,
+            "oq8+",
+        )
+        .unwrap()
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(
+            metadata.pooling.mode,
+            hipfire_model::embedding::EmbeddingPoolingMode::LastToken
+        );
+        assert_eq!(
+            metadata.prompt(hipfire_model::embedding::EmbeddingInputType::Query),
+            "Instruct: retrieve relevant passages\nQuery:"
+        );
+        let npu = metadata.npu.unwrap();
+        assert!(npu.required);
+        assert_eq!(npu.architecture, "aie2p");
+        assert_eq!(npu.quant_format, "oq8+");
+        assert_eq!(npu.storage_layout, "opus_oq8_g256_per_row");
+    }
+
+    #[test]
+    fn npu_embedding_output_name_uses_canonical_feature_and_quant_groups() {
+        validate_npu_embedding_output_name(Path::new("Qwen3-Embedding-0.6B.npu.oq8+.gfx1151.hfq"))
+            .unwrap();
+        for invalid in [
+            "qwen3-embedding-0.6b-npu-oq8+.hfq",
+            "Qwen3-Embedding-0.6B.oq8+.hfq",
+            "Qwen3-Embedding-0.6B.npu.oq8++.hfq",
+        ] {
+            assert!(
+                validate_npu_embedding_output_name(Path::new(invalid)).is_err(),
+                "accepted invalid NPU embedding artifact name {invalid}"
+            );
+        }
+    }
+
+    #[test]
     fn randomized_lowrank_recovers_lowrank() {
         // E = u1 v1ᵀ + u2 v2ᵀ (exactly rank 2). rank-2 approx ≈ exact; rank-0 = 0.
         let (m, k) = (24usize, 40usize);
@@ -13425,7 +13702,7 @@ mod tests {
 
         for (format, quant_type, block_bytes) in [
             (HfqInputFormat::Oq4, QuantType::Oq4G256, 130usize),
-            (HfqInputFormat::Oq8, QuantType::Oq8G256, 258usize),
+            (HfqInputFormat::Oq8, QuantType::Oq8G256RowPadded, 258usize),
         ] {
             let (packed, actual_type, group, _) = quantize_hfq_source_tensor(
                 "model.layers.0.mlp.down_proj.weight",
@@ -13518,6 +13795,24 @@ mod tests {
         ] {
             assert!(awq_eligible(name), "{name}");
         }
+    }
+
+    #[test]
+    fn imatrix_candidates_bridge_sentence_transformer_model_prefix() {
+        assert_eq!(
+            imatrix_direct_name_candidates("layers.0.self_attn.q_proj.weight"),
+            vec![
+                "layers.0.self_attn.q_proj.weight",
+                "model.layers.0.self_attn.q_proj.weight",
+            ]
+        );
+        assert_eq!(
+            imatrix_direct_name_candidates("model.layers.0.mlp.down_proj.weight"),
+            vec![
+                "model.layers.0.mlp.down_proj.weight",
+                "layers.0.mlp.down_proj.weight",
+            ]
+        );
     }
 
     fn roughquant4_test_tensor(name: &str, shape: &[u32]) -> HfqTensor {

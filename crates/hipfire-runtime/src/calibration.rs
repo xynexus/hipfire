@@ -536,6 +536,162 @@ where
     )
 }
 
+fn qwen3_embedding_layer_tensor_names(layer_idx: usize) -> [String; 7] {
+    let prefix = format!("model.layers.{layer_idx}");
+    [
+        format!("{prefix}.self_attn.q_proj"),
+        format!("{prefix}.self_attn.k_proj"),
+        format!("{prefix}.self_attn.v_proj"),
+        format!("{prefix}.self_attn.o_proj"),
+        format!("{prefix}.mlp.gate_proj"),
+        format!("{prefix}.mlp.up_proj"),
+        format!("{prefix}.mlp.down_proj"),
+    ]
+}
+
+fn qwen3_embedding_capture_names_for_layers(
+    weights: &crate::llama::LlamaWeights,
+    start_layer: usize,
+    end_layer: usize,
+) -> HashMap<usize, String> {
+    let mut names = HashMap::new();
+    for (layer_idx, layer) in weights
+        .layers
+        .iter()
+        .enumerate()
+        .skip(start_layer)
+        .take(end_layer.saturating_sub(start_layer))
+    {
+        let linears = [
+            &layer.wq,
+            &layer.wk,
+            &layer.wv,
+            &layer.wo,
+            &layer.w_gate,
+            &layer.w_up,
+            &layer.w_down,
+        ];
+        for (weight, name) in linears
+            .into_iter()
+            .zip(qwen3_embedding_layer_tensor_names(layer_idx))
+        {
+            names.insert(weight.buf.buf.as_ptr() as usize, name);
+        }
+    }
+    names
+}
+
+fn validate_qwen3_embedding_samples(
+    samples: &[Vec<u32>],
+    max_sequence_length: usize,
+) -> Result<(), String> {
+    if samples.is_empty() {
+        return Err("qwen3 embedding calibration: sample set is empty".to_string());
+    }
+    if max_sequence_length == 0 {
+        return Err("qwen3 embedding calibration: maximum sequence length is zero".to_string());
+    }
+    if let Some((sample_idx, sample)) = samples
+        .iter()
+        .enumerate()
+        .find(|(_, sample)| sample.is_empty() || sample.len() > max_sequence_length)
+    {
+        if sample.is_empty() {
+            return Err(format!(
+                "qwen3 embedding calibration: sample {sample_idx} is empty"
+            ));
+        }
+        return Err(format!(
+            "qwen3 embedding calibration: sample {sample_idx} length {} exceeds maximum {max_sequence_length}",
+            sample.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Collect activation statistics for a SentenceTransformers Qwen3 encoder.
+///
+/// Qwen3 embedding models use the normal causal Qwen3 transformer and pool the
+/// last real token. Each corpus sample therefore runs as an independent causal
+/// prefill starting at position zero. OQ8+ consumes only the imatrix diagonal,
+/// so this path deliberately skips full KxK Hessians for every encoder linear;
+/// that keeps the collector bounded while preserving the exact activations
+/// seen by AWQ.
+pub fn collect_qwen3_embedding_artifacts(
+    gpu: &mut Gpu,
+    weights: &crate::llama::LlamaWeights,
+    config: &crate::llama::LlamaConfig,
+    samples: &[Vec<u32>],
+    output: &std::path::Path,
+    provenance: &[(&str, serde_json::Value)],
+) -> Result<CalibSummary, String> {
+    use crate::llama::ModelArch;
+
+    const RELEASE_MAX_SEQUENCE: usize = 2048;
+    if config.arch != ModelArch::Qwen3 {
+        return Err("qwen3 embedding calibration requires model_type=qwen3".to_string());
+    }
+    if !config.has_qk_norm {
+        return Err("qwen3 embedding calibration requires q_norm and k_norm tensors".to_string());
+    }
+    let maximum = config.max_seq_len.min(RELEASE_MAX_SEQUENCE);
+    validate_qwen3_embedding_samples(samples, maximum)?;
+
+    let total_tokens: usize = samples.iter().map(Vec::len).sum();
+    let max_sample_length = samples.iter().map(Vec::len).max().unwrap_or(0);
+    let mut metadata = provenance.to_vec();
+    metadata.extend([
+        ("task", serde_json::json!("embedding")),
+        ("causal", serde_json::json!(true)),
+        ("pooling_mode", serde_json::json!("last_token")),
+        ("imatrix_only", serde_json::json!(true)),
+        ("sample_count", serde_json::json!(samples.len())),
+        ("total_tokens", serde_json::json!(total_tokens)),
+        ("max_sample_length", serde_json::json!(max_sample_length)),
+    ]);
+
+    let mut kv_cache = crate::llama::KvCache::new_gpu(
+        gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        max_sample_length,
+    )
+    .map_err(|error| format!("qwen3 embedding calibration KV cache: {error:?}"))?;
+
+    // Imatrix storage is small enough to capture all layers in one pass. The
+    // env override is useful for diagnosing a problematic layer without
+    // changing the artifact contract.
+    let layers_per_pass = std::env::var("HIPFIRE_QWEN3_EMBEDDING_CALIB_LAYERS_PER_PASS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(config.n_layers);
+    let result = collect_grouped(
+        gpu,
+        1,
+        config.n_layers,
+        layers_per_pass,
+        vec!["model.layers.".to_string()],
+        output,
+        &metadata,
+        |start, end| qwen3_embedding_capture_names_for_layers(weights, start, end),
+        |gpu, _group_idx| {
+            for (sample_idx, tokens) in samples.iter().enumerate() {
+                crate::llama::prefill_forward(gpu, weights, config, tokens, &mut kv_cache)
+                    .map_err(|error| {
+                        format!(
+                            "qwen3 embedding calibration forward for sample {sample_idx}: {error:?}"
+                        )
+                    })?;
+            }
+            Ok(CalibForward::default())
+        },
+    );
+    kv_cache.free_gpu(gpu);
+    result
+}
+
 /// Memory-bounded variant of [`collect`] for dense arches whose full Hessians
 /// for ALL layers do not fit at once. Captures the layers in groups of
 /// `group_size` — each group re-runs the arch forward but registers only that
@@ -1053,6 +1209,28 @@ mod tests {
             }
         });
         assert_eq!(samples, vec![vec![7]]);
+    }
+
+    #[test]
+    fn qwen3_embedding_capture_names_cover_all_encoder_linears() {
+        let names = qwen3_embedding_layer_tensor_names(3);
+        assert_eq!(names.len(), 7);
+        assert_eq!(names[0], "model.layers.3.self_attn.q_proj");
+        assert_eq!(names[1], "model.layers.3.self_attn.k_proj");
+        assert_eq!(names[2], "model.layers.3.self_attn.v_proj");
+        assert_eq!(names[3], "model.layers.3.self_attn.o_proj");
+        assert_eq!(names[4], "model.layers.3.mlp.gate_proj");
+        assert_eq!(names[5], "model.layers.3.mlp.up_proj");
+        assert_eq!(names[6], "model.layers.3.mlp.down_proj");
+    }
+
+    #[test]
+    fn qwen3_embedding_calibration_rejects_bad_sample_geometry() {
+        assert!(validate_qwen3_embedding_samples(&[], 2048).is_err());
+        assert!(validate_qwen3_embedding_samples(&[Vec::new()], 2048).is_err());
+        let error = validate_qwen3_embedding_samples(&[vec![1, 2, 3]], 2).unwrap_err();
+        assert!(error.contains("sample 0 length 3 exceeds maximum 2"));
+        assert!(validate_qwen3_embedding_samples(&[vec![1], vec![2, 3]], 2).is_ok());
     }
 
     #[test]

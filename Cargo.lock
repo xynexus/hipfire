@@ -2053,6 +2053,7 @@ dependencies = [
  "hipfire-cpu",
  "hipfire-model",
  "hipfire-xdna",
+ "serde",
  "serde_json",
 ]
 
@@ -2269,6 +2270,7 @@ dependencies = [
  "hipfire-specdecode-dspark",
  "hipfire-state",
  "hipfire-vision-cache",
+ "hipfire-xdna",
  "serde_json",
  "tracing",
 ]
@@ -2419,6 +2421,7 @@ name = "hipfire-xdna"
 version = "0.3.0"
 dependencies = [
  "hipfire-primitives",
+ "hipfire-quant-format",
  "hipfire-rdna",
  "libc",
  "rayon",

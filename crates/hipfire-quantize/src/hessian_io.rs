@@ -40,7 +40,7 @@ use std::fs::File;
 use std::path::Path;
 
 const HFQM_MAGIC: &[u8; 4] = b"HFQM";
-const HFQM_VERSION_SUPPORTED: u32 = 1;
+const HFQM_VERSION_SUPPORTED: u32 = 2;
 const HEADER_SIZE: usize = 32;
 /// HFQM `quant_type` byte for dense F32 tensors.
 const QUANT_TYPE_F32: u8 = 2;
@@ -77,7 +77,7 @@ impl std::fmt::Display for HessianError {
                 write!(f, "invalid HFQM magic: got {m:?}, expected {HFQM_MAGIC:?}")
             }
             HessianError::UnsupportedVersion(v) => {
-                write!(f, "unsupported HFQM version {v}, this build understands v{HFQM_VERSION_SUPPORTED}")
+                write!(f, "unsupported HFQM version {v}, this build understands v1-v{HFQM_VERSION_SUPPORTED}")
             }
             HessianError::TruncatedFile { needed, have } => {
                 write!(f, "HFQM truncated: needed {needed} bytes, file is {have}")
@@ -287,7 +287,7 @@ impl HessianSidecar {
             return Err(HessianError::InvalidMagic(magic));
         }
         let version = LittleEndian::read_u32(&mmap[4..8]);
-        if version != HFQM_VERSION_SUPPORTED {
+        if !(1..=HFQM_VERSION_SUPPORTED).contains(&version) {
             return Err(HessianError::UnsupportedVersion(version));
         }
         // mmap[8..12] = arch_id (unused for a calibration package)
@@ -344,7 +344,8 @@ impl HessianSidecar {
             pos += 1;
             let n_dims = mmap[pos] as usize;
             pos += 1;
-            if pos + n_dims * 4 + 12 > data_offset {
+            let fixed_tail = if version >= 2 { 20 } else { 12 };
+            if pos + n_dims * 4 + fixed_tail > data_offset {
                 return Err(HessianError::InvalidData(
                     "index truncated at shape/data_size".into(),
                 ));
@@ -358,11 +359,23 @@ impl HessianSidecar {
             pos += 4;
             let data_size = LittleEndian::read_u64(&mmap[pos..pos + 8]) as usize;
             pos += 8;
-            let payload_offset = cumulative_offset;
-            cumulative_offset += data_size;
-            if cumulative_offset > mmap.len() {
+            let payload_offset = if version >= 2 {
+                let offset_units = LittleEndian::read_u64(&mmap[pos..pos + 8]) as usize;
+                pos += 8;
+                offset_units.checked_mul(32).ok_or_else(|| {
+                    HessianError::InvalidData(format!("{name}: payload offset overflow"))
+                })?
+            } else {
+                let offset = cumulative_offset;
+                cumulative_offset += data_size;
+                offset
+            };
+            let payload_end = payload_offset.checked_add(data_size).ok_or_else(|| {
+                HessianError::InvalidData(format!("{name}: payload range overflow"))
+            })?;
+            if payload_offset < data_offset || payload_end > mmap.len() {
                 return Err(HessianError::TruncatedFile {
-                    needed: cumulative_offset,
+                    needed: payload_end,
                     have: mmap.len(),
                 });
             }
@@ -717,6 +730,51 @@ mod tests {
         assert_eq!(ia.k, 2);
         assert_eq!(ia.iter_f32().collect::<Vec<_>>(), vec![1.0, 2.0]);
         assert!(sc.imatrix("tA.imatrix").is_none());
+    }
+
+    #[test]
+    fn opens_current_hfqm_v2_imatrix_only_package() {
+        let mut tf = NamedTempFile::new().unwrap();
+        let name = "model.layers.0.self_attn.q_proj.imatrix";
+        let metadata = b"{}";
+        let metadata_offset = 32u64;
+        let data_offset = 4096u64;
+        let data: Vec<u8> = [1.0f32, 2.0]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let mut index = Vec::new();
+        index.extend_from_slice(&1u32.to_le_bytes());
+        index.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        index.extend_from_slice(name.as_bytes());
+        index.push(2); // F32
+        index.push(1); // one dimension
+        index.extend_from_slice(&2u32.to_le_bytes());
+        index.extend_from_slice(&0u32.to_le_bytes()); // group size
+        index.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        index.extend_from_slice(&(data_offset / 32).to_le_bytes());
+        let body_end = metadata_offset + metadata.len() as u64 + index.len() as u64;
+        let file = tf.as_file_mut();
+        file.write_all(b"HFQM").unwrap();
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        file.write_all(&data_offset.to_le_bytes()).unwrap();
+        file.write_all(metadata).unwrap();
+        file.write_all(&index).unwrap();
+        file.write_all(&vec![0u8; (data_offset - body_end) as usize])
+            .unwrap();
+        file.write_all(&data).unwrap();
+        tf.flush().unwrap();
+
+        let sc = HessianSidecar::open(tf.path()).unwrap();
+        assert_eq!(sc.n_tensors(), 0);
+        assert_eq!(sc.n_imatrix_tensors(), 1);
+        let imatrix = sc
+            .imatrix("model.layers.0.self_attn.q_proj")
+            .expect("v2 imatrix missing");
+        assert_eq!(imatrix.iter_f32().collect::<Vec<_>>(), vec![1.0, 2.0]);
     }
 
     #[test]

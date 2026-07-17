@@ -115,6 +115,35 @@ The Rust code still uses internal enum names such as `Oq4G256` and `Oq8G256`.
 Those are implementation details; artifact names should use the canonical `oq*`
 tokens.
 
+For an OQ8 matrix whose logical `K` is not divisible by 256, the quantizer
+stores one independently zero-padded final group per row and tags the tensor as
+`Oq8G256RowPadded` (`quant_type=43`). Its payload is
+`M * ceil(K/256) * 258` bytes while its HFQ shape remains logical `[M,K]`.
+This layout is XDNA-native and must not enter the GPU OQ8 unpacker. Exact-width
+OQ8 matrices retain `Oq8G256` (`quant_type=35`) and remain usable by either
+backend. Set `HIPFIRE_OQ_RAGGED_Q8` while quantizing when a GPU-compatible
+artifact is required; ragged matrices then use `Q8F16` instead.
+
+For a Qwen3 or EmbeddingGemma SentenceTransformers checkpoint intended for the
+XDNA2 embedding path, add `--npu-embedding`. This reads `modules.json`, the
+pooling/Dense module configs, and `config_sentence_transformers.json`, then
+embeds a typed `hipfire.embedding.v1` contract in the HFQ metadata. The contract
+records prompt roles, pooling, output dimensions, the 128/256/512/1024/2048
+sequence buckets, the 4096-padded-row dispatch ceiling, and the required AIE2P
+Opus storage layout. Runtime admission reads that metadata and never infers NPU
+execution from the filename.
+The compiled manifest and resident buffer contract are specified in
+[Qwen3 embedding image ABI](npu/QWEN3-EMBEDDING-IMAGE-ABI.md).
+
+```bash
+cargo run --release -p hipfire-quantize -- \
+  --input /srv/huggingface/models--Qwen--Qwen3-Embedding-0.6B/snapshots/<snapshot> \
+  --output ~/.hipfire/models/Qwen3-Embedding-0.6B.npu.oq8+.gfx1151.hfq \
+  --format oq8+ \
+  --npu-embedding \
+  --imatrix <Qwen3-Embedding-0.6B.imatrix.gguf>
+```
+
 The plus marks are positional:
 
 - `+` means activation-aware clipping/scaling. The quantizer auto-enables AWQ

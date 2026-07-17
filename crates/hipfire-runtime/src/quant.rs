@@ -275,6 +275,14 @@ mod tests {
     use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 
     #[test]
+    fn gpu_dtype_map_rejects_row_padded_npu_oq8() {
+        assert_eq!(
+            dtype_for_quant_type(QuantType::Oq8G256RowPadded.code(), 1152),
+            None
+        );
+    }
+
+    #[test]
     fn dequant_oq8g256_inverts_the_fwht_rotation() {
         // Regression: Oq8 stores FWHT-rotated weights (matches
         // hipfire-quantize::codecs::quantize_oq8g256). dequant_oq8g256 must
