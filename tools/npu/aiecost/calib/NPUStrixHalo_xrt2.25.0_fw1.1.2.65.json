@@ -236,6 +236,24 @@
         "L1 (M1) bounds depth*tile_bytes; aie2p saw depth-4 build failures for the same reason (R58/E2)"
       ],
       "measured_utc": "2026-07-17T05:53:39+00:00"
+    },
+    "f_h_hz": {
+      "name": "f_h_hz",
+      "value": 1675837138.9408877,
+      "unit": "Hz",
+      "bench": "K1",
+      "method": "ISA bundle count \u00f7 ITERS slope: the statically-scheduled VLIW loop is 7.0 cycles per source iteration; f_H = cyc/iter \u00f7 (ns/iter), cross-checked across non-spilled chain counts",
+      "admissible": true,
+      "evidence": [
+        "ISA: mmul<4,8,8> int8 loop = 7 bundles, unroll 1 -> 7.0 cyc/iter, 4 vmac (native), count taken at packed chains=4",
+        "chains=2: 7.0 cyc / 4.031 ns = 1.737 GHz",
+        "chains=4: 7.0 cyc / 4.177 ns = 1.676 GHz"
+      ],
+      "caveats": [
+        "AIE2P never reaches the II=1 throughput plateau (register spill precedes saturation); the clock is read from the ISA bundle count, not a plateau",
+        "power mode must be recorded with every use"
+      ],
+      "measured_utc": "2026-07-17T07:57:48+00:00"
     }
   }
 }

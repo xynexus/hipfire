@@ -1702,9 +1702,15 @@ The calibrated warm dispatch floor is 72.55 µs; pack/deblock are
 48.46 GB/s at five columns, their respective ABI limits. The task-count slope
 is below noise. FIFO depth 2 won the latest sweep
 by 1.118× over depth 1, but ordering changed across repeats, so this is a hint
-rather than a universal optimum. K1 compiles with the AIE2P 8×8×8 VMAC shape,
-but did not establish a stable chain-length plateau, so the clock is correctly
-left inadmissible. The full target notes are in
+rather than a universal optimum. K1 is now admissible at **f_H = 1.68 GHz**: the
+throughput-plateau method fails on AIE2P (the accumulator register file spills at
+8 chains before the pipe saturates, so II=1 is never reached), so the clock is
+read from C4's disassembly route instead — the statically-scheduled VLIW loop is
+`add` + `jnz` + a 5-slot branch shadow = 7 bundles per iteration for the native
+`mmul<4,8,8>` int8 shape, and f_H = 7 cyc ÷ (ns/iter) cross-checks to 1.68 GHz
+(chains=4) / 1.74 GHz (chains=2), just under the 1800 MHz nominal — clock maxed
+but throttled under sustained load. Both `<4,8,8>` and `<8,8,8>` are native int8
+on AIE2P. The full target notes are in
 `docs/npu/aie2-cost-model-plan.md`; raw probe records are the
 `aiecost-aie2p-*-20260717.json` files under
 `benchmarks/npu_gemm_tuning/results/`.
