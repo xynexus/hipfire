@@ -997,6 +997,55 @@
         "sum model: 33.2% \u2014 8x worse. The composition is not a sum."
       ],
       "measured_utc": "2026-07-17T11:47:39+00:00"
+    },
+    "model_vs_oqgemm_ordinal": {
+      "name": "model_vs_oqgemm_ordinal",
+      "value": 1.0,
+      "unit": "kendall_tau",
+      "bench": "validate",
+      "method": "design.py single-core predictions vs oq_gemm measured, B sweep",
+      "admissible": true,
+      "evidence": [
+        "oq_gemm (independent, hand-written single-core int_matmul), M=512 K=512, vs model single-core spec:",
+        "  B=32  pred 190.3 meas 370.1 (-49%);  B=64 220 vs 405 (-46%);  B=128 284 vs 617 (-54%);  B=256 413 vs 1062 (-61%)",
+        "ORDINAL: perfect (pred and meas both monotonic 32<64<128<256, Kendall tau=1.0)",
+        "MAGNITUDE: model under-predicts 46-61%, worsening as t_core dominates",
+        "root cause: t_core assumes peak (1 VMAC/cyc saturated); oq_gemm reaches ~28% of one core's peak",
+        "  (63 GMAC/s vs 260 GMAC/s single-core peak) due to small tiles + per-tile objectfifo acquire/release + K-loop C re-zero"
+      ],
+      "caveats": [
+        "FIRST validation against an INDEPENDENT real kernel (design.py specs were previously derived, never validated).",
+        "The model is a PEAK LOWER-BOUND for tiled compute, not a magnitude predictor. Families B/C/D validated it on the SAME tight-resident-chain structure it was calibrated on (which DOES saturate the VMAC pipe); a differently-structured hand-written GEMM does not, so t_core is ~2.3x optimistic.",
+        "ORDINAL still holds against the real kernel \u2014 so ranking (the model's stated product) works; absolute numbers do not.",
+        "THE IMPROVEMENT LEVER: a calibrated core-efficiency factor for tiled kernels (t_core /= eta). eta~0.28 for oq_gemm's tile(32,64,32); would need calibrating across real GEMM shapes/tilings, not fitting from one point.",
+        "single-core comparison; design.py's full-array specs (broadcast+join) are still unvalidated against a real multi-core kernel."
+      ],
+      "measured_utc": "2026-07-17T16:11:36+00:00"
+    },
+    "t_core_efficiency_tiled_gemm": {
+      "name": "t_core_efficiency_tiled_gemm",
+      "value": 0.28,
+      "unit": "fraction",
+      "bench": "validate",
+      "method": "measured single-core GMAC/s / peak, oq_gemm tile(32,64,32)",
+      "admissible": false,
+      "evidence": [
+        "oq_gemm (independent, hand-written single-core int_matmul), M=512 K=512, vs model single-core spec:",
+        "  B=32  pred 190.3 meas 370.1 (-49%);  B=64 220 vs 405 (-46%);  B=128 284 vs 617 (-54%);  B=256 413 vs 1062 (-61%)",
+        "ORDINAL: perfect (pred and meas both monotonic 32<64<128<256, Kendall tau=1.0)",
+        "MAGNITUDE: model under-predicts 46-61%, worsening as t_core dominates",
+        "root cause: t_core assumes peak (1 VMAC/cyc saturated); oq_gemm reaches ~28% of one core's peak",
+        "  (63 GMAC/s vs 260 GMAC/s single-core peak) due to small tiles + per-tile objectfifo acquire/release + K-loop C re-zero"
+      ],
+      "caveats": [
+        "FIRST validation against an INDEPENDENT real kernel (design.py specs were previously derived, never validated).",
+        "The model is a PEAK LOWER-BOUND for tiled compute, not a magnitude predictor. Families B/C/D validated it on the SAME tight-resident-chain structure it was calibrated on (which DOES saturate the VMAC pipe); a differently-structured hand-written GEMM does not, so t_core is ~2.3x optimistic.",
+        "ORDINAL still holds against the real kernel \u2014 so ranking (the model's stated product) works; absolute numbers do not.",
+        "THE IMPROVEMENT LEVER: a calibrated core-efficiency factor for tiled kernels (t_core /= eta). eta~0.28 for oq_gemm's tile(32,64,32); would need calibrating across real GEMM shapes/tilings, not fitting from one point.",
+        "single-core comparison; design.py's full-array specs (broadcast+join) are still unvalidated against a real multi-core kernel.",
+        "NOT ADMISSIBLE as a model constant yet: one tiling, one shape. The model does NOT apply it; t_core remains a peak lower bound until an efficiency term is calibrated across shapes."
+      ],
+      "measured_utc": "2026-07-17T16:11:36+00:00"
     }
   }
 }
