@@ -1,6 +1,6 @@
-# NPU kernel design guide — AIE2 (XDNA/npu1)
+# NPU kernel design guide — AIE2 (npu1) and AIE2P (npu2)
 
-Everything measured about this NPU, and how to measure it without fooling
+Everything measured about these NPUs, and how to measure it without fooling
 yourself. Companion to `tools/npu/aiecost/` (the metrics tool) and
 `docs/npu/aie2-cost-model-plan.md` (the cost model's design and validation).
 
@@ -8,10 +8,15 @@ yourself. Companion to `tools/npu/aiecost/` (the metrics tool) and
 initially wrong was wrong because of something in part 2 — and *most* of the
 numbers here were initially wrong.
 
-Scope: AIE2 / npu1 / Phoenix, measured on nix1. AIE2P differs on nearly every
-value and on some of the *conclusions* — see part 5. Calibration constants live
-in `tools/npu/aiecost/calib/`, version-keyed to device+XRT+firmware; run
-`python -m aiecost calib` for the live set with evidence and caveats.
+**Two generations, kept separate on purpose.** Parts 1–4 are **AIE2 / npu1 /
+Phoenix**, measured on nix1 (16 cores, 1.015 GHz). Part 5 is **AIE2P / npu2 /
+Strix Halo**, measured on halo (32 cores, ~1.68 GHz) — it has its own measured
+values *and* its own conclusions, several of which point the opposite way. Do
+not read a npu1 number as an aie2p number; the vector width, core count, clock,
+and even the int4 and task-count levers differ. Calibration constants live in
+`tools/npu/aiecost/calib/`, version-keyed to device+XRT+firmware (npu1 =
+`RyzenAI-npu1_*`, npu2 = `NPUStrixHalo_*`); run `python -m aiecost calib
+--device {npu1,npu2}` for the live set with evidence and caveats.
 
 ---
 
@@ -269,6 +274,15 @@ topology it was taken on.**
   drifted apart and produced a 1.6×-wrong number.
 - Large fifo counts can **crash XRT** (an 8-fifo/4-column feed variant dumped
   core).
+- **There is one NPU, on a shared package.** Two hazards follow. (a) *Serialize*:
+  every NPU bench must hold the `hipfire lock` — there is a single hardware queue,
+  so a second NPU process (a parallel agent, another bench) contends and skews
+  timing. (b) *Isolate*: RAPL/PPT are package-wide, so **any** concurrent CPU/GPU
+  load lands in an energy delta. A `graphify` rebuild fired by a commit hook, or a
+  second agent's energy run, adds several watts — a compute kernel that should
+  read ~1 W read ~6 W with a rebuild running. Check `ps`/lock and quiesce the box
+  before an energy window; a single spinning CPU core is **+17 W** of RAPL (§2.3),
+  which dwarfs the whole NPU signal.
 
 ### 2.10 Retire superseded constants
 
@@ -337,23 +351,77 @@ compute-bound regimes.
 
 ---
 
-## Part 5 — AIE2 vs AIE2P: what does NOT carry across
+## Part 5 — AIE2P (npu2 / Strix Halo): measured, and where it diverges
 
-Both are `AIE2TargetModel` (64 KB L1, 512 KB memtile), but:
+Both are `AIE2TargetModel` (64 KB L1, 512 KB memtile), but AIE2P is a wider,
+faster, differently-shaped machine and several *conclusions* flip. Measured on
+halo; constants keyed `NPUStrixHalo_xrt2.25.0_fw1.1.2.65`.
+
+### Topology, clock, bandwidth, dispatch
+
+| fact | AIE2 (npu1) | AIE2P (npu2) |
+|---|---|---|
+| columns / cores | 4 / 16 | **8 / 32** |
+| vector width | 256-bit | **512-bit** |
+| memtiles / shim | 4 / 4 | **8 / 8** |
+| L1 / memtile | 64 KB / 512 KB | same (4 MiB memtile agg) |
+| BDs / locks per core | 16 / 16 | same |
+| f_H | 1.015 GHz | **~1.68 GHz** (1.676 from K1; the II=1 int4 loop implies ~1.77) |
+| feed roof | 16.1 GB/s @4col | **50.0 GB/s @4col** (12.5/col) |
+| drain roof | 15.9 GB/s | **48.5 GB/s @5col** (9.69/col) |
+| dispatch floor `c_cmd` | ~155 µs device | **72.6 µs** (`c_bo` 5.5 µs) |
+| host `c_call` / pack / deblock | 7.7 µs / 71.7 / 89.1 GB/s | 6.9 µs / 63.8 / 129.8 GB/s |
+
+**f_H comes from the ISA bundle count, not a plateau.** K1's throughput-plateau
+method is DEAD on AIE2P: the accumulator register file spills at 8 independent
+chains *before* the VMAC pipe saturates, so II=1 is never reached (constant ~4 ns
+iteration floor for 1/2/4 chains, then collapse at 8). Instead, the AIE core is
+statically-scheduled VLIW so loop bundles ARE cycles: the `mmul<4,8,8>` int8 loop
+is `add` + `jnz` + a 5-slot branch shadow = 7 bundles/iter, giving f_H = 7 cyc ÷
+(ns/iter) = 1.68 GHz — just under the 1800 MHz nominal.
+
+### Compute: shapes, rates, and the int4 question
+
+| operand pair | native shape | MACs / native VMAC | peak |
+|---|---|---|---|
+| int8 × int8 | `mmul<8,8,8>` | **512** | ~55–58 TOPS |
+| int8 × int4 (W4A8) | `mmul<4,16,16>` (`mac_4x16_16x16`) | **512** (2 VMACs per `mac()`) | ~55–58 TOPS |
+
+- **`mmul<8,8,8>` is NATIVE on AIE2P** (512 MACs, 1 VMAC) — the *opposite* of npu1
+  where it is VIRTUAL. Use `<8,8,8>` for int8; `<4,8,8>` under-fills (256 of 512).
+- **int4 does NOT double the per-VMAC rate on AIE2P.** `mac_4x16_16x16` takes a
+  1024-bit B operand (`vector<int4,256>`) and computes 1024 MACs, but the
+  disassembly shows it **lowers to 2 native VMACs of 512 MACs each** — the same
+  512 MACs/native-VMAC as int8. (npu1's int4 genuinely doubles it, 256→512; the
+  levers do not transfer.)
+- **But int4 IS ~1.7× faster in the chain microbench**, measured per core:
+  int8 `<8,8,8>` = **532 G MACs/s** (317 of 512 MACs/cyc); int4 `<4,16,16>` =
+  **904 G MACs/s** (539 MACs/cyc — at peak). This corrects an earlier ISA-only
+  "no compute win" claim: the win is real but it is **pipe-filling**, not a
+  hardware rate. `<4,16,16>` issues 2 VMACs/call and reaches II=1 with just 4
+  chains, whereas int8 `<8,8,8>` is overhead/spill-limited in the same microbench.
+  A well-scheduled int8 GEMM can also approach the ~55 TOPS peak — treat 1.7× as a
+  *schedule* effect. int4's durable wins: it fills the pipe more easily **and**
+  halves weight-DMA bytes.
+- **int4 × int4 (W4A4): no `mmul` family** on AIE2P — unsupported natively.
+- **The ~126 TOPS figure is NOT the NPU.** It is AMD's Ryzen AI Max+ 395 *system*
+  nameplate — NPU (~50) + Radeon 8060S GPU + Zen5 CPU. The NPU alone measures
+  ~55–58 TOPS (32 × 512 MACs/native-VMAC × 2 × ~1.68 GHz), int8 and int4 alike.
+  **There is no int4×int8 path that doubles NPU compute to ~110+ TOPS**: 126 on
+  the NPU alone would need 3.85 GHz, and every shape lowers to 512 MACs/VMAC.
+
+### Conclusions that flip vs npu1
 
 | | AIE2 (npu1) | AIE2P (npu2) |
 |---|---|---|
-| columns / cores | 4 / 16 | 8 / 32 |
-| f_H | 1.015 GHz | 1.68 GHz |
-| `mmul<8,8,8>` int8 | **VIRTUAL** (2 VMACs) | **NATIVE** (512 MACs) |
-| int4 (W4A8) | **~2× on speed AND energy** | **NO compute win** |
-| task count as a lever | **no** (~1.5% for 8×) | **yes** (R68: 24% for 3×) |
-| feed roof | 16.1 GB/s @4col | 56.5 GB/s @8col |
+| `mmul<8,8,8>` int8 | VIRTUAL (2 VMACs) | **NATIVE** (512 MACs) |
+| int4 (W4A8) per-VMAC rate | **2×** (256→512) | same 512; ~1.7× *sustained* via pipe-fill |
+| task count as a lever | no (~1.5% for 8×) | **yes** (R68: 24% for 3×) — feed is ~3.5× faster/col, so per-task cost is no longer hidden behind the transfer |
 
-**Conclusions do not transfer, not just constants.** The int4 lever and the
-task-count lever point *opposite ways* on the two generations. What transfers is
-the *structure* — which cost terms exist, that fixed cost dominates small
-consumers, that output-tile area matters — never the values or the rankings.
+**Conclusions do not transfer, not just constants.** The int4 and task-count
+levers point *opposite ways* on the two generations. What transfers is the
+*structure* — which cost terms exist, that fixed cost dominates small consumers,
+that output-tile area matters — never the values or the rankings.
 
 ---
 
