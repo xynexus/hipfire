@@ -217,6 +217,22 @@ hard, uncertain core-optimization on a device whose value was always tok/J, not
 tok/s. Decision point: accept ~2–3× for the R25 rewrite, attempt the per-core stall
 (high-risk), or pivot to M4 (energy/heterogeneous split — the NPU's actual win).
 
+**DE-RISK REOPENED — cascade (inter-core transfer) is the untested lever.** The
+sublinear scaling above was measured ONLY within r6's dataflow (independent cores,
+each pulling full K from the memtile). That is precisely the memtile→core DMA stall.
+**Cascade forwards partial-sum accumulators core-to-core, bypassing the memtile** —
+and it is completely unused: absent from the design guide, absent from every r6/r25/
+r99 kernel. But it is fully supported: AIE2P has a **512-bit accumulator cascade**
+(`getAccumulatorCascadeSize`), the MLIR op is `aie.cascade_flow(%tileA, %tileB)`, and
+there's a reference kernel `aie_kernels/aie2/cascade_mm.cc` (`put_mcd`/`get_scd_v16int32`,
+roles: put_only → put_get → get_only). **Chain a column's 4 core-rows and split K
+across them: each core reads only 1/4 the weights+activations from the memtile**,
+directly relieving the stall — and it uses all 32 cores. This could break the
+sublinear scaling, so the de-risk is NOT concluded. NEXT EXPERIMENT (the real
+per-core-stall test): adapt `r6_mac` into cascade put/get roles (K-split) + a
+generator with `aie.cascade_flow` + 4 core-rows/column, compile, measure vs the
+210 GMAC/s baseline. (Credit: user flagged inter-core transfer.)
+
 Original (over-optimistic) reasoning kept for the record:
 **"RESOLVED — it's an un-tuned kernel, not a floor."** Evidence: (1) compute-bound —
 weight+act movement is only ~2.76 MiB → ~55 µs @ 50 GB/s, ≪ the 3.4 ms dispatch, so
