@@ -291,6 +291,43 @@ impl NpuResidentFfnW4 {
         Ok(NpuResidentFfnW4Weights { buffer })
     }
 
+    /// Standalone host-driven run for the plain canonical-BF16 ABI: write
+    /// row-major BF16 activations `[M, K]` into the resident input buffer, run
+    /// one dispatch, and decode the compensated BF16x2 output. Mirrors the
+    /// dense-W8 convenience so a hardware parity harness can exercise the
+    /// productionised `upload_weights`/`run_shared` path without a shared
+    /// dma-buf. Only the plain canonical-BF16 mode is accepted; the unit-RMS
+    /// and direct-X modes fold a pre-FFN norm into the input and need the
+    /// dedicated feeders.
+    pub fn run_canonical_bf16(
+        &mut self,
+        weights: &NpuResidentFfnW4Weights,
+        input: &[u16],
+    ) -> Result<Vec<f32>, XdnaError> {
+        if self.io_mode != NpuResidentFfnW4IoMode::CanonicalBf16InterleavedBf16x2 {
+            return Err(invalid(
+                "resident W4 FFN cache does not accept plain canonical BF16 input",
+            ));
+        }
+        if input.len() != M * K {
+            return Err(invalid(format!(
+                "resident W4 FFN canonical input wants {} BF16 values, got {}",
+                M * K,
+                input.len()
+            )));
+        }
+        self.input.as_mut_slice().fill(0);
+        for (destination, value) in self.input.as_mut_slice()[..M * K * size_of::<u16>()]
+            .chunks_exact_mut(size_of::<u16>())
+            .zip(input.iter().copied())
+        {
+            destination.copy_from_slice(&value.to_le_bytes());
+        }
+        self.kernel.sync_to_device(&self.input)?;
+        self.run_shared(weights)?;
+        self.read_canonical_output_f32()
+    }
+
     pub fn run_shared(&mut self, weights: &NpuResidentFfnW4Weights) -> Result<(), XdnaError> {
         if weights.buffer.len() != COLS * W_BLOCKS * W_BLOCK {
             return Err(invalid("resident FFN packed weight size mismatch"));
