@@ -74,7 +74,7 @@ VMAC.**
 | quantity | value |
 |---|---|
 | feed | **~3.95 GB/s per DMA STREAM (fifo)** — linear in stream count |
-| feed roof | **≥30.8 GB/s at 8 streams**, still scaling; true ceiling unmeasured |
+| **feed roof** | **~30.8 GB/s at 8 streams** — shim-channel limited, this is the ceiling |
 | drain | ~symmetric with feed |
 | **dispatch floor** | **~155 µs of DEVICE time for a null kernel** |
 | host per dispatch | 7.7 µs fixed + pack 71.7 GB/s + deblock 89.1 GB/s |
@@ -90,8 +90,31 @@ VMAC.**
     4 columns, 4/8 streams:      15.40 / 30.79 GB/s
 
 **One column with 4 fifos matches what was reported as the whole device's roof.**
-More fifos per column is a real and large lever. 16 streams fails placement, so
-the true ceiling is still unknown.
+More streams is a real and large lever — up to a hard wall at **8**.
+
+### The wall: shim DMA channels
+
+    device.get_num_connections()   shim: in=2  out=2   (x4 tiles)  => 8 streams
+                                   memtile: in=6 out=6 (x4)
+                                   core:    in=2 out=2 (x16)
+
+    4 streams  OK   15.40 GB/s
+    8 streams  OK   30.79 (4col x 2) / 28.31 (2col x 4)  <- both work
+    12 streams FAIL placement (shim channels exhausted)
+    16 streams FAIL
+
+**Measurement and the toolchain agree exactly: the feed ceiling is 8 concurrent
+shim input streams ≈ 30.8 GB/s.** Shim channels are the binding resource — *not*
+columns, *not* cores. 2 columns × 4 fifos works as well as 4 columns × 2; only
+the total stream count matters.
+
+These channel budgets explain two other things:
+
+- **`core: in=2`** is why C1's `nargs≥3` failed with "Resource allocation
+  pipeline failed" — 3 inputs + 1 output needs 4 core in-channels and a core has
+  2. More streams therefore needs more **cores**, not more fifos per core.
+- **`memtile: in=6`** is why the per-column output join works (≤6 sub-fifos
+  gathered per memtile).
 
 **The 155 µs floor dominates everything.** It is 58% of the best 256×768×1280
 GEMM candidate and 37% of a kvarn4 decode token (32 layers × 155 µs = 4.96 ms of
@@ -325,7 +348,9 @@ to the 37-MACs/byte artifact for any dtype pair without a specific ratio.
 | BDs | 16/core | DMA task budget (R118/R119) |
 | locks | 16/core | R61 exhausted these at FIFO depth 1 |
 | DPU args | **5 BOs** | binds constantly; forces broadcast+join |
-| DMA channels | ~2 in/core tile | `nargs≥3` fails "Resource allocation pipeline failed" |
+| core DMA channels | **2 in / 2 out** | `nargs≥3` fails "Resource allocation pipeline failed" |
+| **shim streams** | **8** (2 in × 4 tiles) | the feed ceiling; 12 streams fails placement |
+| memtile channels | 6 in / 6 out | bounds the per-column join |
 | columns | 4 | — |
 
 `python -m aiecost predict spec.json` checks all of these and rejects with the
@@ -441,10 +466,8 @@ that output-tile area matters — never the values or the rankings.
 
 - **tok/s device comparison** (NPU 7.4 TOPS vs GPU peak). The speed verdict may
   invert the energy one. This is the biggest gap.
-- **The true feed ceiling.** RESOLVED that the roof is per-stream and ≥30.8 GB/s
-  at 8 streams (was reported as 16.1 GB/s total), but 16 streams fails
-  placement, so the ceiling itself is unmeasured. J/byte and the 183 law are
-  unaffected — energy per byte does not depend on how fast the bytes move.
+- ~~The true feed ceiling~~ **RESOLVED**: ~30.8 GB/s at 8 shim input streams,
+  confirmed by measurement and the toolchain channel budget independently.
 - **CPU as a third target.**
 - **Dual-objective (tok/s × tok/J) search** — the objectives provably diverge but
   `design.py` still ranks on time alone.

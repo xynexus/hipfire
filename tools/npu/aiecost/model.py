@@ -39,7 +39,24 @@ def _hw_limits(device: str = "auto") -> dict:
         "columns": tc["columns"],
         "cores": tc["n_core_tiles"],
         "arg_slots": 5,  # H4: findings R59 (aie2p); likely transfers, unverified on npu1
+        # Shim DMA channels are the feed ceiling: 2 in per shim tile x 4 tiles = 8
+        # concurrent input streams. Measured — 12 streams fails placement, and the
+        # toolchain's get_num_connections agrees exactly.
+        "shim_streams": _shim_in_streams(device),
+        "core_in_channels": 2,  # why nargs>=3 fails "Resource allocation pipeline failed"
     }
+
+
+def _shim_in_streams(device: str) -> int:
+    """Concurrent shim input streams = per-shim in-channels x shim tiles."""
+    try:
+        from .target import resolve_target
+
+        dev = resolve_target(device).iron_device()
+        shims = list(dev.get_shim_tiles())
+        return dev.get_num_connections(shims[0], False) * len(shims)
+    except Exception:
+        return 8
 
 
 def check_buildable(spec: ScheduleSpec, limits: dict) -> list[str]:
@@ -57,6 +74,11 @@ def check_buildable(spec: ScheduleSpec, limits: dict) -> list[str]:
         errs.append(f"cores={spec.cores} exceeds {limits['cores']} (H2)")
     if spec.n_bos > limits["arg_slots"]:
         errs.append(f"n_bos={spec.n_bos} exceeds {limits['arg_slots']} DPU arg slots (H4; cf. R59)")
+    if spec.feed_streams and spec.feed_streams > limits["shim_streams"]:
+        errs.append(
+            f"feed_streams={spec.feed_streams} exceeds {limits['shim_streams']} shim input streams "
+            "(2 in-channels x 4 shim tiles). Measured: 12 streams fails placement. This is the feed ceiling."
+        )
     return errs
 
 
