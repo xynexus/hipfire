@@ -185,12 +185,20 @@ own npu1 GEMM candidate (~940 GMAC/s). So **per-expert FFN device time ≈ ~5 ms
 
 **Implication — kernel efficiency, not dispatch count, is now the gating PP/TG
 factor.** The 28.9 T figure is an ideal resident-CHAIN microbench (no realistic
-weight/act movement, no W4 unpack); the real kernels are ~100× below it. Two
-possibilities, unresolved: (a) `fullk_submit` is an un-tuned r6-series baseline and a
-performance-tuned fused kernel recovers most of the gap; (b) ~215 GMAC/s is close to
-what real W4A8 movement allows on this array. **Resolving this is the top open
-question** — it dominates every PP/TG number below and reprioritises the plan
-(tune the GEMM kernel *before* M3 grouped dispatch).
+weight/act movement, no W4 unpack); the real kernels are ~100× below it.
+
+**RESOLVED — it's an un-tuned kernel, not a floor.** Evidence: (1) compute-bound —
+weight+act movement is only ~2.76 MiB → ~55 µs @ 50 GB/s, ≪ the 3.4 ms dispatch, so
+it is NOT movement-bound; (2) the compiled `aie.mlir` programs only **16 `aie.core`
+blocks (8 cols × 2 core-rows) — HALF of AIE2P's 32 cores**; (3) per-core ≈ 13 GMAC/s
+= ~1.5% of the 904 GMAC/s/core microbench, so the inner schedule badly under-fills
+the VMAC too; (4) 14× below the design-guide npu1 GEMM candidate extrapolated to
+npu2. So `fullk_submit` is a **functional r6-series baseline**, and a performance-tuned
+op4++ kernel (all 32 cores + VMAC-filling resident schedule) should recover most of
+the ~100× gap. **The perf path is therefore: build a tuned fused op4++ FFN kernel**
+(the R25/R99 tuned lineage, or a fresh 32-core schedule) — that, not M3 dispatch
+grouping, is the dominant lever. Correctness (parity, composed FFN) is done; the
+remaining work is a real kernel-authoring effort.
 
 **PP/TG at the measured ~215 GMAC/s (un-tuned kernel, worst case):**
 
