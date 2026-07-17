@@ -144,12 +144,14 @@ def isa_probe(shape, tmpdir: Path, target) -> dict:
     }
 
 
-def build(shape, iters: int, out_dir: Path, target) -> tuple[Path, Path] | None:
+def build(shape, iters: int, out_dir: Path, target=None) -> tuple[Path, Path] | None:
     from aie.iron import ObjectFifo, Program, Runtime, Worker
     from aie.iron.kernel import ExternalFunction
     from aie.utils import set_current_device
     from aie.utils.compile import compile_external_kernel, compile_mlir_module
 
+    if target is None:  # match c1/c2's device="auto" convention for external callers
+        target = resolve_target("auto")
     iron_device = target.iron_device()
     set_current_device(iron_device)
     m, k, n = shape[0], shape[1], shape[2]
