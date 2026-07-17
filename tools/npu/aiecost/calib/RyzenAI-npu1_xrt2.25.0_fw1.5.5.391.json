@@ -635,6 +635,85 @@
         "DOES NOT affect J/byte or the 183 law: energy per byte is independent of how fast the bytes move. It DOES mean t_feed is up to ~4x pessimistic for multi-stream schedules."
       ],
       "measured_utc": "2026-07-17T09:57:51+00:00"
+    },
+    "feed_roof_bytes_s": {
+      "name": "feed_roof_bytes_s",
+      "value": 30800000000.0,
+      "unit": "bytes/s",
+      "bench": "C2-audit",
+      "method": "8 concurrent shim input streams x ~3.85 GB/s; shim-channel limited",
+      "admissible": true,
+      "evidence": [
+        "toolchain (device.get_num_connections): shim in=2/out=2 per tile x 4 shim tiles => 8 streams max;",
+        "  memtile in=6/out=6 x4; core in=2/out=2 x16",
+        "measured: 4 streams 15.40 GB/s; 8 streams 30.79 GB/s (4col x2) and 28.31 (2col x4) - both work;",
+        "  12 streams (4col x3) and 16 (4col x4) FAIL placement: shim channels exhausted",
+        "measurement and the toolchain channel budget agree exactly: the wall is at 8"
+      ],
+      "caveats": [
+        "This is the DEVICE feed ceiling, not a bench artifact: ~3.95 GB/s x 8 streams = ~30.8 GB/s.",
+        "Shim channels are the binding resource, NOT columns and NOT cores. 2 col x 4 fifos works as well as",
+        " 4 col x 2 - only the total stream count matters.",
+        "core in=2/out=2 also explains C1's earlier 'nargs>=3 fails Resource allocation pipeline failed':",
+        " 3 inputs + 1 output needs 4 core in-channels and a core has 2.",
+        "memtile in=6/out=6 is why the per-column join works (<=6 sub-fifos gathered per memtile)."
+      ],
+      "measured_utc": "2026-07-17T10:14:39+00:00"
+    },
+    "max_shim_input_streams": {
+      "name": "max_shim_input_streams",
+      "value": 8,
+      "unit": "streams",
+      "bench": "C2-audit",
+      "method": "toolchain get_num_connections(shim, in)=2 x 4 shim tiles; confirmed by placement failure at 12",
+      "admissible": true,
+      "evidence": [
+        "toolchain (device.get_num_connections): shim in=2/out=2 per tile x 4 shim tiles => 8 streams max;",
+        "  memtile in=6/out=6 x4; core in=2/out=2 x16",
+        "measured: 4 streams 15.40 GB/s; 8 streams 30.79 GB/s (4col x2) and 28.31 (2col x4) - both work;",
+        "  12 streams (4col x3) and 16 (4col x4) FAIL placement: shim channels exhausted",
+        "measurement and the toolchain channel budget agree exactly: the wall is at 8"
+      ],
+      "caveats": [
+        "This is the DEVICE feed ceiling, not a bench artifact: ~3.95 GB/s x 8 streams = ~30.8 GB/s.",
+        "Shim channels are the binding resource, NOT columns and NOT cores. 2 col x 4 fifos works as well as",
+        " 4 col x 2 - only the total stream count matters.",
+        "core in=2/out=2 also explains C1's earlier 'nargs>=3 fails Resource allocation pipeline failed':",
+        " 3 inputs + 1 output needs 4 core in-channels and a core has 2.",
+        "memtile in=6/out=6 is why the per-column join works (<=6 sub-fifos gathered per memtile)."
+      ],
+      "measured_utc": "2026-07-17T10:14:39+00:00"
+    },
+    "core_dma_channels_in": {
+      "name": "core_dma_channels_in",
+      "value": 2,
+      "unit": "channels",
+      "bench": "C0",
+      "method": "device.get_num_connections(core_tile, input)",
+      "admissible": true,
+      "evidence": [
+        "core in=2 out=2"
+      ],
+      "caveats": [
+        "Explains C1's nargs>=3 build failure: 3 inputs + 1 output exceeds a core's 2 in-channels.",
+        "Caps fifos per core, which is why multi-stream schedules need more CORES, not more fifos/core."
+      ],
+      "measured_utc": "2026-07-17T10:14:39+00:00"
+    },
+    "memtile_dma_channels_in": {
+      "name": "memtile_dma_channels_in",
+      "value": 6,
+      "unit": "channels",
+      "bench": "C0",
+      "method": "device.get_num_connections(mem_tile, input)",
+      "admissible": true,
+      "evidence": [
+        "memtile in=6 out=6"
+      ],
+      "caveats": [
+        "Bounds the per-column output join at 6 sub-fifos."
+      ],
+      "measured_utc": "2026-07-17T10:14:39+00:00"
     }
   }
 }
