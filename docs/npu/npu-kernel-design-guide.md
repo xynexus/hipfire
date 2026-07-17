@@ -591,14 +591,21 @@ that output-tile area matters — never the values or the rankings.
   Ranking is perfect (τ=1.0, both monotonic) — so the model's *product* (ranking
   schedules) holds against a real kernel. But absolute `t_core` under-predicts
   because it assumes a **saturated VMAC pipe** (1 VMAC/cyc), which the tight
-  resident chains of families B/C/D reach but a hand-written tiled GEMM does not:
-  `oq_gemm` runs its core at ~28% of peak (small tiles + per-tile objectfifo
-  acquire/release + K-loop C re-zero). **The model is a peak lower-bound for
-  tiled compute, not a magnitude predictor.** The improvement lever is a
-  calibrated core-efficiency factor (`t_core /= η`), which needs η measured
-  across shapes/tilings, not fit from one point.
-  Still open: `design.py`'s *full-array* specs (broadcast+join) remain unchecked
-  against a real multi-core kernel — `oq_gemm` is single-core.
+  resident chains of families B/C/D reach but a hand-written tiled GEMM does not.
+  Fixed by `ScheduleSpec.core_efficiency` (default 1.0 for the saturated chains):
+  `t_core /= η`, and with η=0.28 the `oq_gemm` predictions land within ±5%
+  (compute-bound), ordinal preserved.
+
+  **η is NOT a constant, though.** The independent multi-core `whole_array`
+  matmul measures efficiency climbing with tile area and problem size —
+  **0.014 (512³/32³ tile) → 0.24 (2048³/64³)** — the same aie2p tilesweep law
+  (32²=2.4 → 128²=15.7 TOPS). So **0.28 is the large-tile asymptote** (reached by
+  single-core `oq_gemm` and multi-core 2048³), and `design.py`'s flat value is
+  optimistic by up to ~20× for small GEMMs. The real fix is `η = f(output-tile
+  area)`, but `design.py` models only MAC counts, not the L1 tile — so a scalar
+  stand-in remains. Defensible for prefill-scale (large M → large tiles →
+  ~0.24–0.28); optimistic for small compute-bound GEMMs; moot for decode
+  (movement-bound, `t_core` doesn't matter).
 - ~~The true feed ceiling~~ **RESOLVED**: ~30.8 GB/s at 8 shim input streams,
   confirmed by measurement and the toolchain channel budget independently.
 - ~~CPU as a third target~~ **DONE** (P1): dominated on both axes — 55.8 GB/s ·
