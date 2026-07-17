@@ -373,7 +373,7 @@
       "unit": "J/MAC",
       "bench": "E1",
       "method": "matched-rate marginal of K1/C4 VMAC chain over null, per int8 MAC",
-      "admissible": true,
+      "admissible": false,
       "evidence": [
         "matched-rate 50 disp/s, 500 dispatches, 10 s windows, RAPL package-0 integration",
         "null 0.337 W / feed 0.664 W / compute 0.773 W package delta; marginals subtract null so host submit cancels",
@@ -381,6 +381,7 @@
         "compute marginal 0.436 W = 8.721 mJ/dispatch over 1.638 G MACs -> 5.3227e-12 J/MAC (187.9 G MACs/J)"
       ],
       "caveats": [
+        "RETIRED \u2014 DO NOT USE. 1-CORE figure \u2014 5.5x pessimistic. Fixed costs (0.36 W) do not amortise at 1 core. This is the constant that made the GPU look 2.29x more efficient than the NPU. Use j_per_mac_int8_int8_16core.",
         "PACKAGE-DELTA basis on an APU: CPU+GPU+NPU share rails and there is no NPU power sensor. Never report as NPU power.",
         "MATCHED RATE IS LOAD-BEARING. Free-running, package power tracks dispatch rate: a null kernel at 4326/s burns 10.343 W doing nothing, vs compute 1.082 W at 133/s. Free-run even INVERTS the ordering (free-run says feed >> compute; matched-rate says compute > feed). Any energy number taken without rate matching is measuring the host submit loop.",
         "measured at pmode=default; f_H is pmode-invariant (turbo is a no-op) but energy may not be",
@@ -395,7 +396,7 @@
       "unit": "MACs/byte",
       "bench": "E1",
       "method": "J/byte divided by J/MAC \u2014 the break-even arithmetic intensity",
-      "admissible": true,
+      "admissible": false,
       "evidence": [
         "matched-rate 50 disp/s, 500 dispatches, 10 s windows, RAPL package-0 integration",
         "null 0.337 W / feed 0.664 W / compute 0.773 W package delta; marginals subtract null so host submit cancels",
@@ -404,6 +405,7 @@
         "1.9508e-10 / 5.3227e-12 = 36.7"
       ],
       "caveats": [
+        "RETIRED \u2014 DO NOT USE. ARTIFACT of the 1-core J/MAC. Divided J/byte by 5.32e-12 (1 core, where the fixed 0.36 W dominates) giving 37 MACs/byte. The correct value from the 16-core J/MAC is 183 (int8) / 401 (int4). Use byte_mac_energy_ratio_<dtype_pair>. Retired so no dtype pair can silently fall back to it.",
         "PACKAGE-DELTA basis on an APU: CPU+GPU+NPU share rails and there is no NPU power sensor. Never report as NPU power.",
         "MATCHED RATE IS LOAD-BEARING. Free-running, package power tracks dispatch rate: a null kernel at 4326/s burns 10.343 W doing nothing, vs compute 1.082 W at 133/s. Free-run even INVERTS the ordering (free-run says feed >> compute; matched-rate says compute > feed). Any energy number taken without rate matching is measuring the host submit loop.",
         "measured at pmode=default; f_H is pmode-invariant (turbo is a no-op) but energy may not be",
@@ -456,7 +458,7 @@
       "unit": "J/MAC",
       "bench": "E1",
       "method": "4-core NPU VMAC chain, matched-rate marginal over null",
-      "admissible": true,
+      "admissible": false,
       "evidence": [
         "matched rate 50/s, 10 s windows, RAPL package-0, null-subtracted marginals",
         "cores=1: 0.487 W -> 169.0 G MACs/J   cores=2: 0.607 W -> 268.2   cores=4: 0.864 W -> 379.7",
@@ -466,6 +468,7 @@
         "379.7 G MACs/J at 4 cores vs 169.0 at 1 core \u2014 2.25x better per MAC"
       ],
       "caveats": [
+        "RETIRED \u2014 DO NOT USE. Superseded by the 16-core measurement AND measured on the old per-core-BO topology, which the broadcast+join layout replaced. Not comparable to current numbers.",
         "4 cores of 16. H4 caps DPU data-args at 5 BOs; the multi-core build spends 1 on a shared source and 1 per core output, so 4 is the ceiling without a memtile output join.",
         "SUPERSEDES the 1-core j_per_mac_int8 (5.32e-12) for any device comparison \u2014 the 1-core figure is 2.25x pessimistic and was what made the GPU look 2.29x better."
       ],
@@ -477,7 +480,7 @@
       "unit": "W/core",
       "bench": "E1",
       "method": "slope of marginal package delta vs core count at matched 50/s; intercept 0.358 W",
-      "admissible": true,
+      "admissible": false,
       "evidence": [
         "matched rate 50/s, 10 s windows, RAPL package-0, null-subtracted marginals",
         "cores=1: 0.487 W -> 169.0 G MACs/J   cores=2: 0.607 W -> 268.2   cores=4: 0.864 W -> 379.7",
@@ -486,6 +489,7 @@
         "so 4x the MACs costs only 1.77x the power: a 0.358 W FIXED component amortises across cores"
       ],
       "caveats": [
+        "RETIRED \u2014 DO NOT USE. The fit W = 0.358 + 0.1261*cores was excellent (+/-0.6%) over 1-4 cores but ONLY for the per-core-BO topology. Reaching 16 cores required broadcast+join, which costs far less DMA, so extrapolating this fit predicted 551.6 G MACs/J where 929 was measured. Fitting across a topology change is invalid.",
         "fitted over cores=1..4 only; 8/16-core values are EXTRAPOLATION, not measurement"
       ],
       "measured_utc": "2026-07-17T08:58:23+00:00"
@@ -496,7 +500,7 @@
       "unit": "G MACs/J",
       "bench": "E1",
       "method": "full 16-core NPU VMAC chain, matched-rate marginal over null, median of 4 runs",
-      "admissible": true,
+      "admissible": false,
       "evidence": [
         "4 runs: [994.6, 965.3, 884.2, 893.0] G MACs/J -> median 929.1, range 884-995 (+/-6%)",
         "package delta 1.318/1.358/1.482/1.468 W \u2014 well clear of the ~0.3 W idle drift, unlike the",
@@ -505,6 +509,7 @@
         "topology: broadcast a/b fifos + per-column memtile join -> 1 source + 4 column outputs = 5 BOs"
       ],
       "caveats": [
+        "RETIRED \u2014 DO NOT USE. Redundant duplicate of j_per_mac_int8_int8_16core in inverse units. Kept only as the reference g1_gpu prints; superseded to avoid two sources of truth for one quantity.",
         "SUPERSEDES both the 1-core figure (169) and the 16-core EXTRAPOLATION (551.6). The extrapolation",
         "was pessimistic ~1.7x because the TOPOLOGY changed: broadcast+join costs far less DMA than the",
         "per-core-BO layout the fit was taken on. Fitting a trend across a topology change is invalid.",

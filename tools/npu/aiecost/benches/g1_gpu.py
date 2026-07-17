@@ -148,8 +148,15 @@ def main() -> int:
         from aiecost import calib as _calib
 
         _c = _calib.load(_calib.current_key())
-        npu_feed = _c["gpu_ref_npu_gb_per_j"].value if "gpu_ref_npu_gb_per_j" in _c else 5.13
-        npu_comp = _c["j_per_mac_int8_16core_gmacs_j"].value if "j_per_mac_int8_16core_gmacs_j" in _c else None
+        def _live(name):
+            v = _c.get(name)
+            return v.value if (v is not None and v.admissible) else None
+
+        npu_feed = _live("gpu_ref_npu_gb_per_j") or 5.13
+        # Derive from the live per-dtype J/MAC rather than a second stored copy:
+        # a duplicate quantity is a second source of truth that goes stale.
+        _jm = _live("j_per_mac_int8_int8_16core")
+        npu_comp = (1.0 / _jm / 1e9) if _jm else None
         if npu_comp is None:
             print("  (no 16-core NPU compute reference in calib — compute verdict suppressed)")
         for kind, unit, work, npu_ref in (("feed", "GB/J", FEED_BYTES / 1e9, npu_feed),
