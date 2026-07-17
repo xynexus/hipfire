@@ -160,7 +160,7 @@ class Window:
         return (self.p0 + self.p1) / 2
 
 
-def build_kernel(kind: str, cache: Path):
+def build_kernel(kind: str, cache: Path, cores: int = 1):
     if kind == "null":
         # C1's near-null kernel: same dispatch/submit machinery, no useful work.
         # Isolates the host+dispatch power that the other kernels also pay, so a
@@ -177,11 +177,13 @@ def build_kernel(kind: str, cache: Path):
 
         shape = (4, 8, 8, "int8", "int8")
         iters = 1_600_000
-        built = c4_mmul.build(shape, iters, cache)
+        built = c4_mmul.build(shape, iters, cache, cores=cores)
         if not built:
             return None
-        macs = iters * c4_mmul.CHAINS * 4 * 8 * 8
-        return {"kind": kind, "built": built, "shape": shape, "macs_per_dispatch": macs, "bytes_per_dispatch": 0}
+        # Every core runs the same chain concurrently, so MACs scale with cores.
+        macs = iters * c4_mmul.CHAINS * 4 * 8 * 8 * cores
+        return {"kind": kind, "built": built, "shape": shape, "cores": cores,
+                "macs_per_dispatch": macs, "bytes_per_dispatch": 0}
     from aiecost.benches import c2_feed
 
     n_tiles, cols = 2048, 4
@@ -222,15 +224,9 @@ def sustained_run(k: dict, seconds: float, rate: float = 0.0) -> tuple[int, floa
 
         args = [XRTTensor(np.ones((N_ELEM,), dtype=np.int32), dtype=np.int32, device="cpu") for _ in range(2)]
     elif k["kind"] == "compute":
-        from aiecost.benches.c4_mmul import sizes
+        from aiecost.benches.c4_mmul import tensors_for
 
-        s = sizes(k["shape"])
-        rng = np.random.default_rng(0)
-        args = [
-            XRTTensor(rng.integers(-8, 8, size=(2 * s["bytes_A"],), dtype=np.int8), dtype=np.int8, device="cpu"),
-            XRTTensor(rng.integers(-8, 8, size=(2 * s["bytes_B"],), dtype=np.int8), dtype=np.int8, device="cpu"),
-            XRTTensor((8 + s["size_C"] + 8,), dtype=np.int32, device="cpu"),
-        ]
+        args = tensors_for(k["shape"], k.get("cores", 1))
     else:
         from aiecost.benches.c2_feed import ACC_ELEM, TILE_ELEM
 
@@ -259,6 +255,7 @@ def sustained_run(k: dict, seconds: float, rate: float = 0.0) -> tuple[int, floa
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--kernel", choices=["compute", "feed", "null"], default="compute")
+    p.add_argument("--cores", type=int, default=1, help="compute kernel only: NPU cores (H4 caps BOs at 5, so <=4)")
     p.add_argument("--seconds", type=float, default=8.0)
     p.add_argument("--rate", type=float, default=0.0,
                    help="pad to this dispatch/s so host submit work is matched across kernels (0 = free-run)")
@@ -270,10 +267,10 @@ def main() -> int:
         print("RAPL package energy unreadable (needs passwordless sudo). Cannot measure energy.")
         return 1
 
-    print(f"E1 energy — kernel={args.kernel} window={args.seconds}s")
+    print(f"E1 energy — kernel={args.kernel} cores={args.cores} window={args.seconds}s rate={args.rate or 'free'}")
     print(f"  RAPL: {RAPL}\n  PPT : {PPT}\n")
 
-    k = build_kernel(args.kernel, Path(args.cache))
+    k = build_kernel(args.kernel, Path(args.cache), args.cores)
     if not k:
         print("build failed")
         return 1

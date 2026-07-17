@@ -657,24 +657,51 @@ gfx1103 kernels use).
 width) against all 12 GPU CUs, 256 MiB working set on both. Since decode is
 37× movement-dominated, this says: **decode belongs on the NPU for tok/J.**
 
-**The compute result is not admissible as a device comparison.** `c4_mmul`
-builds a *single* Worker — 1 core of 16 — while the GPU side runs 768 waves
-across 12 CUs. "GPU 2.29×" is 12 GPU CUs vs 1 NPU core. NPU J/MAC may improve
-at 16 cores (fixed costs amortising) or hold flat (power scaling linearly);
-unmeasured. **A multi-core NPU compute bench is the blocker** on any
-prefill-side split verdict.
+**The compute result was initially not admissible**: `c4_mmul` built a *single*
+Worker — 1 core of 16 — against 768 GPU waves on 12 CUs, so "GPU 2.29×" was
+really 12 CUs vs 1 core. `c4_mmul` now takes `cores=`, and the answer flips.
+
+### NPU core scaling (E1, matched 50/s)
+
+| cores | marginal | G MACs/s | G MACs/J | |
+|---|---|---|---|---|
+| 1 | 0.487 W | 237.4 | 169.0 | measured |
+| 2 | 0.607 W | 472.9 | 268.2 | measured |
+| 4 | 0.864 W | 939.7 | 379.7 | measured |
+| 8 | 1.367 W | — | 479.3 | *extrapolated* |
+| 16 | 2.376 W | — | **551.6** | *extrapolated* |
+
+Throughput scales near-perfectly (3.96× at 4 cores; per-dispatch time is flat at
+1.725→1.744 ms) while power scales **sublinearly**: `W = 0.358 + 0.1261·cores`,
+residuals −0.5%/+0.6%/−0.1%. A 0.358 W fixed component amortises, so **4× the
+MACs costs 1.77× the power** and J/MAC improves 2.25×.
+
+Consequently the 1-core figure was **2.25× pessimistic** — it is what made the
+GPU look 2.29× better. At 4 cores the GPU leads by only 1.13×; extrapolated to
+16 cores the **NPU leads by 1.28×** (551.6 vs 430.2).
+
+**Why 4 cores and not 16**: H4 caps DPU data-args at 5 BOs. The multi-core build
+spends 1 on a shared source (one BO fills every A and B fifo) and 1 per core
+output, so 4 is the ceiling without joining outputs through a memtile. The
+8/16-core rows are extrapolation from a 3-point fit, not measurement.
 
 ### Split recommendation, at current confidence
 
-- **Decode → NPU.** Movement-bound, and the NPU moves bytes 1.37× more
+- **Decode → NPU.** Movement-bound (37×), and the NPU moves bytes 1.37× more
   efficiently. Combined with KVarN-4bit's 1.61× (§10), this is the strongest
-  supported result.
-- **Prefill → unresolved.** Compute-bound, and the only compute datapoint is
-  1-core-vs-12-CU. Do not act on it.
+  supported result, and every input to it is measured.
+- **Prefill → NPU, provisionally.** Compute-bound. At 4 measured cores the GPU
+  still leads 1.13×; the NPU only wins on a 16-core extrapolation (1.28×). The
+  core-scaling fit is excellent (±0.6% over 1–4) but a 4× extension is not a
+  measurement. If prefill placement matters, measure 16 cores first.
+
+Both axes now point at the NPU, which is a stronger claim than the transcript
+had an hour ago — and it rests on a 1-core artifact having been caught.
 
 ### Not done
 
-- Multi-core NPU compute energy (blocks the prefill verdict).
+- **16-core NPU compute energy** — blocked by the 5-BO arg limit; needs a memtile
+  output join. Until then the prefill verdict rests on extrapolation.
 - int4 J/MAC — E1 measured int8 only; the model halves it as a flagged assumption.
 - CPU as a third target.
 - A dual-objective (tok/s × tok/J) sweep in `design.py`.

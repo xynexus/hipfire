@@ -144,7 +144,7 @@ def isa_probe(shape, tmpdir: Path, target) -> dict:
     }
 
 
-def build(shape, iters: int, out_dir: Path, target=None) -> tuple[Path, Path] | None:
+def build(shape, iters: int, out_dir: Path, target=None, cores: int = 1) -> tuple[Path, Path] | None:
     from aie.iron import ObjectFifo, Program, Runtime, Worker
     from aie.iron.kernel import ExternalFunction
     from aie.utils import set_current_device
@@ -163,7 +163,7 @@ def build(shape, iters: int, out_dir: Path, target=None) -> tuple[Path, Path] | 
     out_n = 8 + s["size_C"] + 8  # kernel stores counters at [0..3] then a size_C vector at +8
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    tag = f"{target.cache_tag}-{m}{k}{n}-{s['ta']}{s['tb']}-i{iters}"
+    tag = f"{target.cache_tag}-{m}{k}{n}-{s['ta']}{s['tb']}-i{iters}" + (f"-x{cores}" if cores > 1 else "")
     xclbin, insts = out_dir / f"c4-{tag}.xclbin", out_dir / f"c4-{tag}-insts.bin"
     if xclbin.exists() and insts.exists():
         return xclbin, insts
@@ -172,14 +172,19 @@ def build(shape, iters: int, out_dir: Path, target=None) -> tuple[Path, Path] | 
     B: object = np.ndarray[(b_n,), np.dtype[np.int8]]
     O: object = np.ndarray[(out_n,), np.dtype[np.int32]]
 
+    # Multi-core shares one over-allocated tile type for both operands (see the
+    # cores>1 branch below), so the kernel must be DECLARED with those types —
+    # otherwise func.call gets memref<128xi8> where it declared memref<64xi8> and
+    # MLIR verification fails.
+    IN: object = np.ndarray[(max(a_n, b_n),), np.dtype[np.int8]]
+    kern_args = [A, B, O] if cores <= 1 else [IN, IN, O]
+
     kern = ExternalFunction(
-        "k1_vmac_chain", source_file=str(KERNEL_SRC), arg_types=[A, B, O],
+        "k1_vmac_chain", source_file=str(KERNEL_SRC), arg_types=kern_args,
         include_dirs=include_dirs(_mlir_pkg, target),
         compile_flags=["-std=c++20", "-O2", f"-DITERS={iters}", f"-DCHAINS={CHAINS}",
                        f"-DMR={m}", f"-DMK={k}", f"-DMN={n}", f"-DTA={s['ta']}", f"-DTB={s['tb']}"],
     )
-    fa, fb, fo = ObjectFifo(A, name="a", depth=1), ObjectFifo(B, name="b", depth=1), ObjectFifo(O, name="o", depth=1)
-
     def core(a_in, b_in, o_out, kk):
         ea, eb, eo = a_in.acquire(1), b_in.acquire(1), o_out.acquire(1)
         kk(ea, eb, eo)
@@ -187,13 +192,38 @@ def build(shape, iters: int, out_dir: Path, target=None) -> tuple[Path, Path] | 
         b_in.release(1)
         o_out.release(1)
 
-    w = Worker(core, [fa.cons(), fb.cons(), fo.prod(), kern])
     rt = Runtime()
-    with rt.sequence(A, B, O) as (a, b, o):
-        rt.start(w)
-        rt.fill(fa.prod(), a)
-        rt.fill(fb.prod(), b)
-        rt.drain(fo.cons(), o, wait=True)
+    if cores <= 1:
+        fa, fb, fo = ObjectFifo(A, name="a", depth=1), ObjectFifo(B, name="b", depth=1), ObjectFifo(O, name="o", depth=1)
+        w = Worker(core, [fa.cons(), fb.cons(), fo.prod(), kern])
+        with rt.sequence(A, B, O) as (a, b, o):
+            rt.start(w)
+            rt.fill(fa.prod(), a)
+            rt.fill(fb.prod(), b)
+            rt.drain(fo.cons(), o, wait=True)
+    else:
+        # Multi-core. The binding constraint is H4: 5 DPU data-arg slots. N workers
+        # each need an output, so per-worker A and B args would blow the budget at
+        # N=4 (2 + 4 = 6 BOs). Instead ONE source BO fills both the A and B fifos
+        # — c2_feed already relies on filling several fifos from one arg — giving
+        # 1 + N BOs, so N=4 fits exactly.
+        #
+        # Both fifos therefore carry the same over-allocated tile type; the kernel
+        # reads only size_A / size_B from each pointer. Operand VALUES are
+        # irrelevant to a throughput/energy bench, so the overlap is harmless.
+        fas = [ObjectFifo(IN, name=f"a{i}", depth=1) for i in range(cores)]
+        fbs = [ObjectFifo(IN, name=f"b{i}", depth=1) for i in range(cores)]
+        fos = [ObjectFifo(O, name=f"o{i}", depth=1) for i in range(cores)]
+        ws = [Worker(core, [fas[i].cons(), fbs[i].cons(), fos[i].prod(), kern]) for i in range(cores)]
+        with rt.sequence(IN, *([O] * cores)) as args:
+            src, outs = args[0], args[1:]
+            for w in ws:
+                rt.start(w)
+            for i in range(cores):
+                rt.fill(fas[i].prod(), src)
+                rt.fill(fbs[i].prod(), src)
+            for i in range(cores):
+                rt.drain(fos[i].cons(), outs[i], wait=True)
 
     try:
         module = resolve_program(Program(iron_device, rt))
@@ -210,23 +240,36 @@ def build(shape, iters: int, out_dir: Path, target=None) -> tuple[Path, Path] | 
     return xclbin, insts
 
 
-def run(xclbin: Path, insts: Path, shape, reps: int) -> float | None:
-    from aie.utils.hostruntime.xrtruntime.hostruntime import XRTHostRuntime
+def tensors_for(shape, cores: int = 1) -> list:
+    """Host buffers matching build()'s arg layout for `cores`."""
     from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
-    from aie.utils.npukernel import NPUKernel
 
     s = sizes(shape)
     rng = np.random.default_rng(0)
-    ta = XRTTensor(rng.integers(-8, 8, size=(2 * s["bytes_A"],), dtype=np.int8), dtype=np.int8, device="cpu")
-    tb = XRTTensor(rng.integers(-8, 8, size=(2 * s["bytes_B"],), dtype=np.int8), dtype=np.int8, device="cpu")
-    to = XRTTensor((8 + s["size_C"] + 8,), dtype=np.int32, device="cpu")
+    out_n = 8 + s["size_C"] + 8
+    if cores <= 1:
+        return [
+            XRTTensor(rng.integers(-8, 8, size=(2 * s["bytes_A"],), dtype=np.int8), dtype=np.int8, device="cpu"),
+            XRTTensor(rng.integers(-8, 8, size=(2 * s["bytes_B"],), dtype=np.int8), dtype=np.int8, device="cpu"),
+            XRTTensor((out_n,), dtype=np.int32, device="cpu"),
+        ]
+    # Multi-core: one shared source BO feeds every A and B fifo (see build()).
+    n = max(2 * s["bytes_A"], 2 * s["bytes_B"])
+    src = XRTTensor(rng.integers(-8, 8, size=(n,), dtype=np.int8), dtype=np.int8, device="cpu")
+    return [src] + [XRTTensor((out_n,), dtype=np.int32, device="cpu") for _ in range(cores)]
 
+
+def run(xclbin: Path, insts: Path, shape, reps: int, cores: int = 1) -> float | None:
+    from aie.utils.hostruntime.xrtruntime.hostruntime import XRTHostRuntime
+    from aie.utils.npukernel import NPUKernel
+
+    args = tensors_for(shape, cores)
     kernel = NPUKernel(xclbin_path=str(xclbin), insts_path=str(insts), kernel_name="MLIR_AIE")
     hrt = XRTHostRuntime()
     h = hrt.load(kernel)
     npu = []
     for _ in range(reps):
-        r = hrt.run(h, [ta, tb, to])
+        r = hrt.run(h, args)
         if getattr(r, "npu_time", None):
             npu.append(float(r.npu_time) * 1e-9)
     return min(npu) if npu else None

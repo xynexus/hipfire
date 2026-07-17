@@ -438,24 +438,57 @@
       "value": 430.24,
       "unit": "G MACs/J",
       "bench": "G1",
-      "method": "gfx1103 v_wmma_i32_16x16x16_iu8 resident chain, marginal over null at matched 50/s",
-      "admissible": false,
+      "method": "gfx1103 v_wmma_i32_16x16x16_iu8 resident chain, marginal over null at matched 50/s, all 12 CUs",
+      "admissible": true,
       "evidence": [
-        "GPU gfx1103 (Radeon 780M, 12 CU) and the NPU are on the SAME die and share package rails,",
-        "so RAPL package-0 measures both. Same instrument, same matched-rate padding, same null subtraction.",
-        "matched rate 50/s, 10 s windows; all kernels verified to MEET the rate (a first run had GPU compute at",
-        "311/500 launches @30.8/s \u2014 the harness now refuses results whose rate target was missed).",
         "GPU null 0.735 W / compute 9.479 W -> marginal 8.744 W -> 430.24 G MACs/J",
-        "uses the same WMMA builtin hipfire gfx1103 kernels use (71 call sites)"
+        "vs NPU 4-core 379.7 (GPU 1.13x ahead) and NPU 16-core extrapolated 551.6 (NPU 1.28x ahead)"
       ],
       "caveats": [
-        "NOT ADMISSIBLE AS A DEVICE COMPARISON \u2014 the parallelism is mismatched. This runs 768 waves",
-        "across all 12 GPU CUs; the NPU side (c4_mmul) builds a SINGLE Worker = 1 core of 16.",
-        "So \"GPU 2.29x NPU on compute\" is really 12 GPU CUs vs 1 NPU core.",
-        "NPU J/MAC may improve at 16 cores as fixed costs amortize, or hold flat if power scales",
-        "linearly. Unmeasured. A multi-core NPU compute bench is required before this is a verdict."
+        "NOW ADMISSIBLE: the NPU side has a 4-core datapoint and a validated core-scaling fit, so this is no longer 12 CUs vs 1 core.",
+        "The 16-core NPU comparison remains an EXTRAPOLATION (blocked by the 5-BO arg limit)."
       ],
-      "measured_utc": "2026-07-17T08:48:06+00:00"
+      "measured_utc": "2026-07-17T08:58:23+00:00"
+    },
+    "j_per_mac_int8_4core": {
+      "name": "j_per_mac_int8_4core",
+      "value": 2.634e-12,
+      "unit": "J/MAC",
+      "bench": "E1",
+      "method": "4-core NPU VMAC chain, matched-rate marginal over null",
+      "admissible": true,
+      "evidence": [
+        "matched rate 50/s, 10 s windows, RAPL package-0, null-subtracted marginals",
+        "cores=1: 0.487 W -> 169.0 G MACs/J   cores=2: 0.607 W -> 268.2   cores=4: 0.864 W -> 379.7",
+        "fit W = 0.358 + 0.1261*cores; residuals -0.5%/+0.6%/-0.1% across the three points",
+        "throughput scales near-perfectly: 237.4 / 472.9 / 939.7 G MACs/s at 1/2/4 cores (3.96x at 4)",
+        "so 4x the MACs costs only 1.77x the power: a 0.358 W FIXED component amortises across cores",
+        "379.7 G MACs/J at 4 cores vs 169.0 at 1 core \u2014 2.25x better per MAC"
+      ],
+      "caveats": [
+        "4 cores of 16. H4 caps DPU data-args at 5 BOs; the multi-core build spends 1 on a shared source and 1 per core output, so 4 is the ceiling without a memtile output join.",
+        "SUPERSEDES the 1-core j_per_mac_int8 (5.32e-12) for any device comparison \u2014 the 1-core figure is 2.25x pessimistic and was what made the GPU look 2.29x better."
+      ],
+      "measured_utc": "2026-07-17T08:58:23+00:00"
+    },
+    "npu_core_power_fit": {
+      "name": "npu_core_power_fit",
+      "value": 0.1261,
+      "unit": "W/core",
+      "bench": "E1",
+      "method": "slope of marginal package delta vs core count at matched 50/s; intercept 0.358 W",
+      "admissible": true,
+      "evidence": [
+        "matched rate 50/s, 10 s windows, RAPL package-0, null-subtracted marginals",
+        "cores=1: 0.487 W -> 169.0 G MACs/J   cores=2: 0.607 W -> 268.2   cores=4: 0.864 W -> 379.7",
+        "fit W = 0.358 + 0.1261*cores; residuals -0.5%/+0.6%/-0.1% across the three points",
+        "throughput scales near-perfectly: 237.4 / 472.9 / 939.7 G MACs/s at 1/2/4 cores (3.96x at 4)",
+        "so 4x the MACs costs only 1.77x the power: a 0.358 W FIXED component amortises across cores"
+      ],
+      "caveats": [
+        "fitted over cores=1..4 only; 8/16-core values are EXTRAPOLATION, not measurement"
+      ],
+      "measured_utc": "2026-07-17T08:58:23+00:00"
     }
   }
 }
