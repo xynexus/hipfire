@@ -275,13 +275,37 @@ Marginals below ~1 W sit inside the ~0.3 W idle drift and go **non-monotonic**
 reproduces to ±6%. **Size the workload so the delta clears the drift**, and
 repeat: 3+ runs, report median and range.
 
-### 2.5 Use slopes; fixed cost cancels
+### 2.5 Validate the COMPOSITION, not just the terms
+
+Family B validated `t_feed` (feed-only, trivial core). Family C validated
+`t_core` (compute-only, no feed). Both in **isolation** — so the model's central
+claim, that terms compose as `max()` and not a sum, went untested for the whole
+build. A model can have every constant right and still compose them wrong.
+
+D1 streams tiles *and* computes per tile, sweeping MMULS across the crossover:
+
+    MMULS   t_core/tile   MEASURED   max model   sum model
+        0            0n      1044n       1037n       1037n
+       64          252n      1057n       1037n       1289n
+      256         1009n      1151n       1037n       2046n   <- crossover
+      512         2018n      2142n       2018n       3055n
+     1024         4035n      4136n       4035n       5072n
+
+    mean |error|:  max 4.1%   sum 33.2%
+
+**Feed and compute genuinely overlap.** The shape is the prediction: flat while
+compute hides under the feed, then slope 1. **Known limit:** at the crossover the
+hard `max()` under-predicts by ~10% — a real pipeline has a soft knee. Away from
+it, 2–6%. Single stream, single core; overlap under 8-stream × 16-core
+contention is unmeasured.
+
+### 2.6 Use slopes; fixed cost cancels
 
 Sweep a parameter and fit — the 155 µs floor lands in the intercept, not the
 rate. K1 gets f_H from the ITERS slope; C2/C5 get bandwidth from the bytes slope.
 An absolute measurement of anything small is mostly floor.
 
-### 2.6 Do not fit across a topology change
+### 2.7 Do not fit across a topology change
 
 The core-power fit `W = 0.358 + 0.1261·cores` was excellent (±0.6% over 1–4
 cores) — and its extrapolation to 16 was **1.7× wrong**, because reaching 16
@@ -289,7 +313,7 @@ cores *required* changing the topology to broadcast+join, which costs far less
 DMA. The fit was fine; the extension was not. **A fit is only valid inside the
 topology it was taken on.**
 
-### 2.7 The ISA is the truth
+### 2.8 The ISA is the truth
 
 - The `C_block<..., N>` template parameter in `mmul_8_4.hpp` looks like a
   native-op count and mostly is — but says `1` for `<4,32,8>` where the
@@ -299,7 +323,7 @@ topology it was taken on.**
 - Watch the unroll factor (`add rN, rN, #-0x4` ⇒ 4×) — bundles-per-source-iter is
   not what you'd assume.
 
-### 2.8 Sources, ranked
+### 2.9 Sources, ranked
 
 1. **Probe on silicon** — settles behaviour.
 2. **Toolchain target model** (`AIETargetModel.h`) — what the compiler believes.
@@ -310,7 +334,7 @@ topology it was taken on.**
 5. **Self-inconsistent metadata** (`rocminfo`: reports L2 alongside Cacheline 0,
    Max Clock 0, CU 0) — corroboration only, never alone.
 
-### 2.9 Platform hazards
+### 2.10 Platform hazards
 
 - **`@jit` is broken here**: aiecc asserts `targetModel.hasProperty(IsNPU)`
   during CDO generation even for a correct `aie.device(npu1)`. Use the
@@ -338,7 +362,7 @@ topology it was taken on.**
   before an energy window; a single spinning CPU core is **+17 W** of RAPL (§2.3),
   which dwarfs the whole NPU signal.
 
-### 2.10 Retire superseded constants
+### 2.11 Retire superseded constants
 
 Five constants in the calibration set are `admissible=False` because they are
 artifacts or superseded (`byte_mac_energy_ratio`=36.7, `j_per_mac_int8` 1-core,

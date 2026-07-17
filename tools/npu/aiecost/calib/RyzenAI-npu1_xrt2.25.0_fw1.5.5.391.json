@@ -946,6 +946,57 @@
         "No rate-matching needed: E1's confound was the HOST submit loop, and here the host IS the workload."
       ],
       "measured_utc": "2026-07-17T11:18:09+00:00"
+    },
+    "composition_is_max": {
+      "name": "composition_is_max",
+      "value": 1.0,
+      "unit": "bool",
+      "bench": "D1",
+      "method": "stream tiles AND compute per tile; sweep MMULS across the feed/compute crossover",
+      "admissible": true,
+      "evidence": [
+        "1 stream, 1024 x 4 KiB tiles, C1 floor subtracted, per-tile times (npu1):",
+        "  MMULS   t_core/tile   MEASURED   max model    sum model",
+        "      0            0n      1044n       1037n        1037n",
+        "     64          252n      1057n       1037n        1289n",
+        "    256         1009n      1151n       1037n        2046n   <- crossover",
+        "    512         2018n      2142n       2018n        3055n",
+        "   1024         4035n      4136n       4035n        5072n",
+        "mean |error|: max 4.1%, sum 33.2%; max closer on 4/5 points (the 5th is MMULS=0 where both agree)",
+        "shape is the prediction: FLAT (1044->1057->1151) while t_core < t_feed, then slope 1"
+      ],
+      "caveats": [
+        "This validates the model's CENTRAL design decision, which nothing had tested: family B is feed-only (trivial core) and family C is compute-only (no feed). Both terms were validated in ISOLATION; the composition never was.",
+        "KNOWN LIMIT: at the crossover (t_core ~= t_feed) the hard max() UNDER-predicts by ~10% \u2014 a real pipeline has a soft knee where neither term fully dominates. Away from the knee the error is 2-6%.",
+        "Single stream, single core. Whether the overlap holds with 8 streams x 16 cores contending is unmeasured."
+      ],
+      "measured_utc": "2026-07-17T11:47:39+00:00"
+    },
+    "composition_max_mean_err": {
+      "name": "composition_max_mean_err",
+      "value": 0.041,
+      "unit": "fraction",
+      "bench": "D1",
+      "method": "mean |error| of the max model across the MMULS sweep",
+      "admissible": true,
+      "evidence": [
+        "1 stream, 1024 x 4 KiB tiles, C1 floor subtracted, per-tile times (npu1):",
+        "  MMULS   t_core/tile   MEASURED   max model    sum model",
+        "      0            0n      1044n       1037n        1037n",
+        "     64          252n      1057n       1037n        1289n",
+        "    256         1009n      1151n       1037n        2046n   <- crossover",
+        "    512         2018n      2142n       2018n        3055n",
+        "   1024         4035n      4136n       4035n        5072n",
+        "mean |error|: max 4.1%, sum 33.2%; max closer on 4/5 points (the 5th is MMULS=0 where both agree)",
+        "shape is the prediction: FLAT (1044->1057->1151) while t_core < t_feed, then slope 1"
+      ],
+      "caveats": [
+        "This validates the model's CENTRAL design decision, which nothing had tested: family B is feed-only (trivial core) and family C is compute-only (no feed). Both terms were validated in ISOLATION; the composition never was.",
+        "KNOWN LIMIT: at the crossover (t_core ~= t_feed) the hard max() UNDER-predicts by ~10% \u2014 a real pipeline has a soft knee where neither term fully dominates. Away from the knee the error is 2-6%.",
+        "Single stream, single core. Whether the overlap holds with 8 streams x 16 cores contending is unmeasured.",
+        "sum model: 33.2% \u2014 8x worse. The composition is not a sum."
+      ],
+      "measured_utc": "2026-07-17T11:47:39+00:00"
     }
   }
 }
