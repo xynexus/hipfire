@@ -489,6 +489,43 @@
         "fitted over cores=1..4 only; 8/16-core values are EXTRAPOLATION, not measurement"
       ],
       "measured_utc": "2026-07-17T08:58:23+00:00"
+    },
+    "j_per_mac_int8_16core_gmacs_j": {
+      "name": "j_per_mac_int8_16core_gmacs_j",
+      "value": 929.15,
+      "unit": "G MACs/J",
+      "bench": "E1",
+      "method": "full 16-core NPU VMAC chain, matched-rate marginal over null, median of 4 runs",
+      "admissible": true,
+      "evidence": [
+        "4 runs: [994.6, 965.3, 884.2, 893.0] G MACs/J -> median 929.1, range 884-995 (+/-6%)",
+        "package delta 1.318/1.358/1.482/1.468 W \u2014 well clear of the ~0.3 W idle drift, unlike the",
+        "2/4-core points whose small deltas came out NON-MONOTONIC (4c read lower than 2c), not usable",
+        "throughput 3718 G MACs/s = 3.72 T MACs/s = 7.4 TOPS, 89% of the 4.16 T MACs/s theoretical peak",
+        "topology: broadcast a/b fifos + per-column memtile join -> 1 source + 4 column outputs = 5 BOs"
+      ],
+      "caveats": [
+        "SUPERSEDES both the 1-core figure (169) and the 16-core EXTRAPOLATION (551.6). The extrapolation",
+        "was pessimistic ~1.7x because the TOPOLOGY changed: broadcast+join costs far less DMA than the",
+        "per-core-BO layout the fit was taken on. Fitting a trend across a topology change is invalid.",
+        "still a package delta on shared rails; not NPU-only power"
+      ],
+      "measured_utc": "2026-07-17T09:19:23+00:00"
+    },
+    "gpu_ref_npu_gb_per_j": {
+      "name": "gpu_ref_npu_gb_per_j",
+      "value": 5.13,
+      "unit": "GB/J",
+      "bench": "E1",
+      "method": "NPU feed reference used by g1_gpu for its verdict line",
+      "admissible": true,
+      "evidence": [
+        "C2 4-column feed, matched rate"
+      ],
+      "caveats": [
+        "reference only"
+      ],
+      "measured_utc": "2026-07-17T09:19:23+00:00"
     }
   }
 }

@@ -601,7 +601,7 @@ extrapolation must be validated before it is used as an admission claim. All
 raw probe records are under
 `benchmarks/npu_gemm_tuning/results/aiecost-aie2p-*-20260717.json`.
 
-## 11. Energy (E1/G1) and the NPU-vs-GPU split
+## 12. Energy (E1/G1) and the NPU-vs-GPU split
 
 ### The energy law: one external byte costs 37 MACs
 
@@ -661,47 +661,73 @@ width) against all 12 GPU CUs, 256 MiB working set on both. Since decode is
 Worker — 1 core of 16 — against 768 GPU waves on 12 CUs, so "GPU 2.29×" was
 really 12 CUs vs 1 core. `c4_mmul` now takes `cores=`, and the answer flips.
 
-### NPU core scaling (E1, matched 50/s)
+### NPU core scaling (E1, matched 50/s) — measured to the full array
+
+The 5-BO arg cap (H4) was the blocker. Solved with two IRON features:
+
+- **inputs broadcast**: one a-fifo and one b-fifo whose `cons()` every worker
+  shares (an objectfifo's consumer list is native broadcast). Input DMA stays at
+  2 tasks regardless of core count — R61 found ~32 independent shim transfers
+  exceed shim DMA capacity.
+- **outputs join per column** at that column's memtile via
+  `ObjectFifo.prod().join()`. A single join across all 16 cores is unplaceable
+  ("Failed to find a tile matching column 0") because a memtile serves only its
+  own column.
+
+That is **1 shared source + 4 column outputs = 5 BOs for all 16 cores**.
 
 | cores | marginal | G MACs/s | G MACs/J | |
 |---|---|---|---|---|
-| 1 | 0.487 W | 237.4 | 169.0 | measured |
-| 2 | 0.607 W | 472.9 | 268.2 | measured |
-| 4 | 0.864 W | 939.7 | 379.7 | measured |
-| 8 | 1.367 W | — | 479.3 | *extrapolated* |
-| 16 | 2.376 W | — | **551.6** | *extrapolated* |
+| 1 | 0.487 W | 237.4 | 169.0 | measured (single-fifo path) |
+| 16 | **1.318–1.482 W** | **3718** | **929 median** | **measured, 4 runs, ±6%** |
 
-Throughput scales near-perfectly (3.96× at 4 cores; per-dispatch time is flat at
-1.725→1.744 ms) while power scales **sublinearly**: `W = 0.358 + 0.1261·cores`,
-residuals −0.5%/+0.6%/−0.1%. A 0.358 W fixed component amortises, so **4× the
-MACs costs 1.77× the power** and J/MAC improves 2.25×.
+At 16 cores: **3.72 T MACs/s = 7.4 TOPS — 89% of the 4.16 T MACs/s theoretical
+peak** — at **929 G MACs/J** (994.6 / 965.3 / 884.2 / 893.0).
 
-Consequently the 1-core figure was **2.25× pessimistic** — it is what made the
-GPU look 2.29× better. At 4 cores the GPU leads by only 1.13×; extrapolated to
-16 cores the **NPU leads by 1.28×** (551.6 vs 430.2).
+**Two dead numbers, both recorded as superseded:**
 
-**Why 4 cores and not 16**: H4 caps DPU data-args at 5 BOs. The multi-core build
-spends 1 on a shared source (one BO fills every A and B fifo) and 1 per core
-output, so 4 is the ceiling without joining outputs through a memtile. The
-8/16-core rows are extrapolation from a 3-point fit, not measurement.
+1. The **1-core figure (169) was 5.5× pessimistic** — it is what made the GPU
+   look 2.29× better.
+2. The **16-core extrapolation (551.6) was 1.7× pessimistic**, and wrong for the
+   more interesting reason: the fit `W = 0.358 + 0.1261·cores` was excellent
+   (±0.6%) over 1–4 cores *on the per-core-BO topology it was taken on*. Reaching
+   16 cores **required changing that topology** to broadcast+join, which costs
+   far less DMA. **Fitting a trend across a topology change is invalid** — the
+   fit was fine, the extension was not.
 
-### Split recommendation, at current confidence
+The 2/4-core points on the new topology are **excluded as unusable**: their
+marginals (0.464–0.692 W) came out non-monotonic — 4 cores read *lower* than 2 —
+because a sub-1 W delta sits inside the ~0.3 W idle drift. The 16-core delta
+(~1.4 W) clears it, which is why it reproduces to ±6%.
 
-- **Decode → NPU.** Movement-bound (37×), and the NPU moves bytes 1.37× more
-  efficiently. Combined with KVarN-4bit's 1.61× (§10), this is the strongest
-  supported result, and every input to it is measured.
-- **Prefill → NPU, provisionally.** Compute-bound. At 4 measured cores the GPU
-  still leads 1.13×; the NPU only wins on a 16-core extrapolation (1.28×). The
-  core-scaling fit is excellent (±0.6% over 1–4) but a 4× extension is not a
-  measurement. If prefill placement matters, measure 16 cores first.
+### Split recommendation
 
-Both axes now point at the NPU, which is a stronger claim than the transcript
-had an hour ago — and it rests on a 1-core artifact having been caught.
+Both axes, measured, at full width on both devices:
+
+| axis | NPU | GPU | verdict |
+|---|---|---|---|
+| movement | **5.13 GB/J** | 3.73 GB/J | **NPU 1.37×** |
+| compute (int8) | **929 G MACs/J** (16 cores) | 432 G MACs/J (12 CUs) | **NPU 2.15×** |
+
+- **Decode → NPU.** Movement-bound (37×); NPU moves bytes 1.37× more
+  efficiently. With KVarN-4bit's 1.61× (§10), well supported.
+- **Prefill → NPU.** Compute-bound; NPU is 2.15× more energy-efficient per int8
+  MAC at full width. No longer an extrapolation.
+
+**On tok/J the NPU wins both regimes** — the exact reverse of what this section
+said one iteration ago, when the compute figure came from 1 NPU core against 12
+GPU CUs. GPU compute reproduces at 430.2 / 434.4 G MACs/J (±1%).
+
+This is a **tok/J verdict only**. The NPU's measured 7.4 TOPS ceiling is far
+below the GPU's int8 ceiling, so a latency-bound prefill may still belong on the
+GPU. That is the speed/power divergence restated at device granularity.
 
 ### Not done
 
-- **16-core NPU compute energy** — blocked by the 5-BO arg limit; needs a memtile
-  output join. Until then the prefill verdict rests on extrapolation.
-- int4 J/MAC — E1 measured int8 only; the model halves it as a flagged assumption.
+- **tok/s device comparison** — only tok/J is settled. The speed verdict may
+  invert the energy one; unmeasured.
+- int4 J/MAC — E1 measured int8 only; the model halves it as a flagged
+  assumption. Note §11's AIE2P finding that W4A8 gives no compute win there —
+  the AIE2 int4 energy assumption deserves the same scrutiny.
 - CPU as a third target.
 - A dual-objective (tok/s × tok/J) sweep in `design.py`.
