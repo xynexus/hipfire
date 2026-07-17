@@ -156,6 +156,47 @@ retargets from EmbeddingGemma shape (today) to the A3B expert shape (after M2).
   tok/s objective (`concurrent-prefill-split-design.md`); wire into serving;
   end-to-end tok/J measurement vs 8060S GPU baseline.
 
+## 5a. Perf structure & PP/TG (composed FFN measured + roofline)
+
+The composed expert FFN (`npu_expert_ffn_w4_parity`, committed) is **correct**
+(cosine 1.0, SQNR 83.85 dB on silicon) but its wall time (~11 ms/expert @M=256) is
+**NOT device time** — it is host round-trips. Structure of `NpuOpusGemmMp::run_f32`:
+- **1 device dispatch per GEMM** — fullk accumulates all K-groups in a single array
+  dispatch; whole-scaled likewise. Two GEMMs → ~2 dispatches/expert.
+- Wall time = host AWQ+FWHT-256+int8-quant prep + a ~12.6 MB int32 **partial
+  readback** (`run_resident`) + host scale-reconstruction + host SiLU.
+- **Device time ≈ roofline ~145 µs/expert @M=256** (2 × ~73 µs floor; work hidden).
+
+Perf lever is **eliminate host round-trips**, not fewer FLOPs. Two paths toward
+device-time wall clock (the clean PP/TG number):
+- **`run_resident_scaled`** — f32 reconstructed on-device (no int32 partial readback),
+  pre-prepped int8 acts in; prep once, dispatch many.
+- **device-resident chaining** — gate_up out → on-array SiLU (`NpuQwen3SwiGlu`) → down
+  in via shared dma-buf, no host between GEMMs. The clean PP/TG measurement path.
+
+**PP/TG projection (halo AIE2P, design-guide part 5):**
+
+| | per-expert (device) | per MoE layer | note |
+|---|---|---|---|
+| **PP** M=256 prefill | ~145 µs (2 disp) / ~73 µs fused | movement-bound ~288 MiB → ~5.76 ms/layer | op4++ 4-bit halves it vs Q8 |
+| **TG** M=1 decode | ~145 µs/expert, pure floor | 9 experts × ~145 µs ≈ 1.3 ms × 48 layers ≈ 63 ms/tok → **~16 tok/s** | floor-catastrophic **without M3** |
+
+TG is the problem: at M=1 every expert dispatch is pure 72.6 µs floor, and
+top-8 + shared × 48 layers dominates. **M3 grouped-expert dispatch is the TG lever.**
+
+## 5b. M3 grouped-expert dispatch (design)
+
+Amortize the 72.6 µs floor across ALL active experts in **one** dispatch/layer:
+- **Gather**: router → per-expert token segments (expected M·top_k/num_experts ≈ 16
+  tokens/expert at M=256; ~all 128 experts active in a prefill batch).
+- **One batched W4A8 GEMM** over concatenated segments with per-segment weight
+  indexing (the GPU MoE-GEMM shape), on the array — 1 dispatch/layer, not ~128.
+- **Residency**: 128 × 2.25 MiB = 288 MiB ≫ 4 MiB memtile → stream from GTT; op4++
+  4-bit is the movement lever; hot-expert caching for skewed decode routing.
+- **Floor math**: 1 grouped dispatch/layer × 48 ≈ 48 × 72.6 µs ≈ 3.5 ms/tok floor
+  (vs 63 ms unfused) → moves NPU TG from floor-catastrophic to **movement-bound**,
+  i.e. the design-guide energy regime (tok/J win, GPU keeps tok/s).
+
 ## 6. Side-tasks / open
 
 - Fill npu2 `macs_per_native_vmac_int8_int4` (C4) + C2 feed audit so
