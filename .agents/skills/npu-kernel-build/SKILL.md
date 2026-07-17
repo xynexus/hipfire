@@ -54,9 +54,21 @@ keeps them as accum; the scalar core can't bypass an accumulator back to the vec
 input path, stalling the pipeline and breaking chained ops (no `mul(vec, accum)` overload).
 Always declare intermediates as `aie::vector<bfloat16, 16>` explicitly.
 
-**Tile local memory**: 32 KB SRAM per compute tile, shared between both processors and the DMA.
-At BF16 (2 bytes): 32 KB = 16 K elements. The streaming tile pattern (objectfifo) exists
+**Tile local memory**: **64 KB** SRAM per compute tile, shared between both processors and the DMA.
+At BF16 (2 bytes): 64 KB = 32 K elements. The streaming tile pattern (objectfifo) exists
 precisely because full tensors don't fit — only the active tile slice lives in SRAM at once.
+
+This is 64 KB on **both** AIE2 (NPU1) and AIE2P (NPU2) — `BaseNPU1TargetModel` and
+`BaseNPU2TargetModel` both derive from `AIE2TargetModel`, whose
+`getLocalMemorySize()` is `0x10000`. Do not use 32 KB: that is the **AIE1/Versal**
+value (`AIE1TargetModel`, `0x8000`), which UG1079 documents and which does not
+apply to any XDNA NPU. Verify against the installed toolchain rather than a
+Versal-era manual:
+`mlir_aie/include/aie/Dialect/AIE/IR/AIETargetModel.h`.
+
+**Memory tiles**: 512 KB each (`getMemTileSize() = 0x80000`), one per column —
+so 2 MiB total on NPU1 (4 columns), 4 MiB on NPU2 (8 columns). AIE1 has no
+memory tiles at all (`getMemTileSize() = 0`).
 
 ## Toolchain locations
 
