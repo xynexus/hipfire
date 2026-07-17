@@ -429,13 +429,20 @@ is `add` + `jnz` + a 5-slot branch shadow = 7 bundles/iter, giving f_H = 7 cyc �
   *schedule* effect. int4's durable wins: it fills the pipe more easily **and**
   halves weight-DMA bytes.
 - **int4 × int4 (W4A4): no `mmul` family** on AIE2P — unsupported natively.
-- **bfp16 (block-float / MX) is int8-rate, not a 2× path.** `mmul_bfp16_bfp16<8,8,8>`
-  → `mac_8x8_8x8T`, `block_vector<bfp16ebs8,64>`, single accumulator block =
-  **512 MACs/native-VMAC, same as int8** (header-derived; hardware-unconfirmed —
-  needs a `block_vector` kernel the shared chain probe can't express). The "Block
-  FP16 2×" claim is bfp16 *vs true bf16* (which is heavily emulated, ~16 VMACs per
-  `mac()`), **not** vs int8. So bfp16 buys FP16-ish accuracy at int8 speed, not
-  more throughput.
+- **bfp16 (block-float / MX) is implemented, and is int8-rate — not a 2× path.**
+  It is a real type (`bfp16ebs8`), with `block_vector.hpp`, the
+  `mmul_bfp16_bfp16` family, and an AMD aie2p reference GEMM
+  (`aie_kernels/aie2p/mm_bfp.cc`). **Compile-confirmed**: a minimal
+  `mac_8x8_8x8T(block_vector<bfp16ebs8,64>, …, accum<accfloat,64>)` builds for
+  aie2p and emits **one native `vmac.f` per call = 512 MACs**, same as int8 (the
+  loads are `vlda.pop.576` — 64 values × 9 bits = mantissa + shared exponent). The
+  "Block FP16 2×" claim is bfp16 *vs true bf16* (which is heavily emulated, ~16
+  VMACs per `mac()`), **not** vs int8: bfp16 buys FP16-ish accuracy **at int8
+  speed**, not more throughput. **Caveat for building it:** AMD's *full*
+  `mm_bfp.cc` fails to compile with the installed peano/llvm-aie backend
+  (`unable to legalize <8 x s8> G_BUILD_VECTOR` in the shuffle/exponent *helper*,
+  not the matmul) — a hipfire bfp16 GEMM must call the core `mac_8x8_8x8T`
+  directly and avoid that helper. Correctness on hardware is unrun.
 - **512 MACs/native-VMAC is the datapath ceiling for every dtype on AIE2P.** int8,
   int4, and bfp16 all top out there — the 512-bit VMAC does 512 MACs/cycle and no
   operand width exceeds it (int8 already saturates the MAC units; narrower operands
