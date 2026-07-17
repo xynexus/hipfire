@@ -662,3 +662,70 @@ that output-tile area matters — never the values or the rankings.
 - **C8** alignment penalty; **AM020** never fetched (H3/M2/M3/M4 remain
   wrong-generation).
 - Attention modelling excludes projections and assumes a device-resident cache.
+
+---
+
+## Part 7 — Under-utilized hardware (features the kernels don't touch yet)
+
+Real op4++ GEMM kernels measure **~215 GMAC/s** on AIE2P — ~1% of the 28.9 T
+resident-chain microbench. The gap is dominated by a **per-core memory-delivery
+stall**: each GEMM core pulls its full K-slice of weights+activations from the
+memtile over the memtile→core DMA, and core-count scaling is sublinear (measured
+1.53× for 2× cores). The microbench is unreachable (it has no weight streaming, no
+W4 unpack); the realistic ceiling is ~3000 GMAC/s (design-guide npu1 candidate
+scaled to npu2). Closing the gap means **using hardware the current kernels ignore.**
+
+### Accumulator cascade — the top unused lever
+
+**Unused everywhere** — not in this guide, not in any r6/r25/r99 kernel — yet fully
+supported: AIE2P has a **512-bit accumulator cascade** (`getAccumulatorCascadeSize`
+= 512), the MLIR op is **`aie.cascade_flow(%tileA, %tileB)`**, and there is a
+reference kernel `aie_kernels/aie2/cascade_mm.cc` (`put_mcd(v16int32)` /
+`get_scd_v16int32()`, roles **put_only → put_get → get_only**).
+
+**Why it attacks the stall.** Cascade forwards partial-sum accumulators *core-to-core
+on-chip*, bypassing the memtile. Chain a column's 4 core-rows (tiles rows 2–5) and
+**split the K-reduction across them** — each core computes 2 of the 8 K-groups and
+forwards its int32 partial down the chain; the last core applies scale and writes C.
+Effect: (a) all 32 cores do GEMM (today only 8 do, on row 2; row 3 does scaling), and
+(b) **each core reads only 1/4 the weights+activations from the memtile**, directly
+cutting the memtile→core traffic that the M-split (more columns) *increases*. This is
+why cascade can beat the sublinear column-scaling ceiling. Note r6 already forwards
+partials core-to-core (GEMM row 2 → scale row 3) but via an **objectfifo** (memtile-
+mediated) — cascade replaces that hop with the direct acc bus and frees rows 4–5.
+Tradeoff to measure: cascade forwards the C-partial (output-sized) per chain hop, so
+it wins when input-DMA savings (∝ K) exceed the on-chip partial-forwarding cost.
+**Status: experiment under construction (`benchmarks/npu_gemm_tuning/cascade/`).**
+
+**Prior art: `r5/` already prototyped cascade.** `benchmarks/npu_gemm_tuning/r5/`
+(`r5_cascade.cc`, `r5_2core.mlir`, `r5_4core.mlir`, `r5/README.md`) is a full
+reverse-engineered cascade design — it named cascade + the per-tile scalar RISC as
+"the two under-used features" — but **stalled at the build step**: IRON's
+`@jit`/`ExternalFunction` can't pass cascade args. That blocker is now moot — the
+r6/r25 kernels drive **hand-written low-level `aie.mlir` straight to xclbin via
+aiecc** (`aie.tile`/`aie.core`/`aie.cascade_flow`), the exact path r5 needed. Build
+the cascade experiment on r5, not from scratch.
+
+### Other under-utilized features (ranked; op-surface survey vs. hipfire usage)
+
+Value framed against the documented tax: real W4A8 prefill is pinned at ~5 TOPS of
+~40–55 capacity by per-tile C load/store + objectfifo lock ping-pong
+(`findings.md`, `r5/README.md`), and M512 batching is blocked by memtile/shim
+channel saturation.
+
+| # | feature (MLIR op) | status | lever |
+|---|---|---|---|
+| 1 | **accumulator cascade** (`aie.cascade_flow`, `put_mcd`/`get_scd`) | unused (r5 proto only) | split K down a column, C stays in the flowing accumulator, stored once → kills the per-tile C reload. **~3–8× prefill.** |
+| 2 | **runtime params** (`aiex.npu.rtp_write`) | unused | one parametric xclbin across tile-count/batch/scale — fixes the r130 program-store overflow + M256→M512 without a new image. |
+| 3 | **packet-switched routing** (`aie.packet_flow`, `amsel`, `dma_bd_packet`) | unused | ID-tag multiple streams over one channel → attacks the 8-shim-stream ceiling + saturated memtiles (the M512 weight-broadcast blocker). |
+| 4 | **DMA n-D transform + pad** (`dma_bd bd_dim_layout`/`bd_pad_layout`) | barely used | free transpose/reshape/K-tail-pad in the memtile → frees the vector cycles `aie2p/mm.cc` spends on `aie::transpose`. |
+| 5 | **counting-semaphore / lock-free** (`AcquireGreaterEqual`, `disable_synchronization`) | unused | batch-acquire N objects, skip lock gen where static-safe → cuts the per-tile acquire/release part of the ~5 TOPS tax. |
+| 6 | **wider resident-C tiling** (deeper `aie::mmul` expansion) | partial (2×2) | keep more C sub-tiles in the register file across K → fewer C load/stores (lower-risk partial of #1). |
+| 7 | **core direct stream** (`aie.put_stream`/`get_stream`) | unused | low-latency small-operand path (bias, per-group scales, RMSNorm stats) without a DMA/lock round trip. |
+| 8 | **trace unit** (`aie.trace`, `trace.event`) | unused | per-tile event/PC/cycle trace to host — localizes exactly which stage costs the tax (we currently only infer stalls indirectly). |
+| 9 | **parametric BD chains** (`aie.bd_chain`, `dma_start_bd_chain`) | unused | define ping-pong once, concretize at runtime → shrinks runtime_sequence bloat, cheaper double-buffer (dispatch-floor lever). |
+| 10 | **fuller weight-replay** (`iter_count`/`repeat_count`) | partial, BLOCKED | one weight object feeds many activation macros; gated on #3 to free the channel it needs (today naive batch = 1.07×). |
+
+**The rule stays: a feature is "under-utilized" only until measured to help — log the
+ones that don't.** #1 (cascade) is under construction; #2/#3/#4 most directly attack
+the program-store and channel-saturation bottlenecks the memory notes call out.
