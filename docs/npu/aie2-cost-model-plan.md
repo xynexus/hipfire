@@ -600,3 +600,81 @@ per-column rate and scale to the requested active-column count; the 8-column
 extrapolation must be validated before it is used as an admission claim. All
 raw probe records are under
 `benchmarks/npu_gemm_tuning/results/aiecost-aie2p-*-20260717.json`.
+
+## 11. Energy (E1/G1) and the NPU-vs-GPU split
+
+### The energy law: one external byte costs 37 MACs
+
+Matched-rate marginals on npu1 (`benches/e1_energy.py`), RAPL package-0
+integration, null kernel subtracted so the host submit loop cancels:
+
+    J/byte = 1.9508e-10   (5.13 GB/J)
+    J/MAC  = 5.3227e-12   (187.9 G MACs/J)   [1 core]
+    => break-even arithmetic intensity ~= 37 MACs per byte fed
+
+**Matched rate is load-bearing.** Free-running, package power tracks dispatch
+*rate*, not work: a null NPU kernel at 4326 dispatch/s burns 10.343 W doing
+nothing, vs 1.082 W for a compute kernel at 133/s. Free-run even **inverts** the
+compute-vs-feed ordering. Every energy number here pads to a fixed rate and
+subtracts a null baseline; the harnesses refuse results whose rate target was
+missed.
+
+There is **no NPU power sensor** — energy is a package delta on a shared-rail
+APU and must never be reported as "NPU power". PPT (amdgpu hwmon) is unusable:
+it read 11.0 W idle and 5.5 W under load.
+
+### Where the two LLM phases land
+
+| phase | AI (MACs/byte) | energy set by | lever |
+|---|---|---|---|
+| prefill (M=256) | 82–101 | **compute** | MMUL rate (int4 = 2×) |
+| decode (M=1) | 1.0 | **movement** (37×) | bit width (KVarN/OQ4) |
+
+This is why power- and speed-shaped kernels diverge: **the currency changes**.
+int4's 2× MMUL rate is an energy win on prefill and worth nothing on decode;
+KVarN-4bit is exactly the reverse.
+
+And they select different schedules. M=256 QKV projection:
+
+    c4  265.2 us  1.940 mJ   <- speed-optimal
+    c1  484.3 us  1.825 mJ   <- energy-optimal (1.83x slower, 6% less energy)
+
+because broadcasting activations across 4 columns replicates bytes that cost
+37 MACs each.
+
+### NPU vs GPU (`benches/g1_gpu.py`)
+
+Same die, same rails, same instrument, same matched-rate discipline. gfx1103 =
+Radeon 780M, 12 CU, using `v_wmma_i32_16x16x16_iu8` (the builtin hipfire's own
+gfx1103 kernels use).
+
+| axis | NPU | GPU | verdict |
+|---|---|---|---|
+| movement | **5.13 GB/J** | 3.73 GB/J | **NPU 1.37×** — fair: full width both sides |
+| compute | 187.9 G MACs/J | 430.2 G MACs/J | **NOT A VERDICT** — see below |
+
+**The movement result is solid and decisive.** C2 runs 4 workers (full NPU
+width) against all 12 GPU CUs, 256 MiB working set on both. Since decode is
+37× movement-dominated, this says: **decode belongs on the NPU for tok/J.**
+
+**The compute result is not admissible as a device comparison.** `c4_mmul`
+builds a *single* Worker — 1 core of 16 — while the GPU side runs 768 waves
+across 12 CUs. "GPU 2.29×" is 12 GPU CUs vs 1 NPU core. NPU J/MAC may improve
+at 16 cores (fixed costs amortising) or hold flat (power scaling linearly);
+unmeasured. **A multi-core NPU compute bench is the blocker** on any
+prefill-side split verdict.
+
+### Split recommendation, at current confidence
+
+- **Decode → NPU.** Movement-bound, and the NPU moves bytes 1.37× more
+  efficiently. Combined with KVarN-4bit's 1.61× (§10), this is the strongest
+  supported result.
+- **Prefill → unresolved.** Compute-bound, and the only compute datapoint is
+  1-core-vs-12-CU. Do not act on it.
+
+### Not done
+
+- Multi-core NPU compute energy (blocks the prefill verdict).
+- int4 J/MAC — E1 measured int8 only; the model halves it as a flagged assumption.
+- CPU as a third target.
+- A dual-objective (tok/s × tok/J) sweep in `design.py`.
