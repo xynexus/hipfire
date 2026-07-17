@@ -187,7 +187,38 @@ own npu1 GEMM candidate (~940 GMAC/s). So **per-expert FFN device time ≈ ~5 ms
 factor.** The 28.9 T figure is an ideal resident-CHAIN microbench (no realistic
 weight/act movement, no W4 unpack); the real kernels are ~100× below it.
 
-**RESOLVED — it's an un-tuned kernel, not a floor.** Evidence: (1) compute-bound —
+**CORRECTION (measured R99 + r6 core placement).** The first "~100× recoverable"
+read was too optimistic — it targeted the 28.9 T resident-chain microbench, which
+excludes weight streaming + activation load + W4 unpack and is **not** a realistic
+GEMM target. Two new measurements:
+- **R99 tuned FFN (32 cores) is ALSO ms-scale: ~19 ms/dispatch** (stable across
+  iters=6/60/300, so not hwctx-recreation) — but it does RMSNorm+FWHT+int8-quant+
+  GeGLU+2 GEMMs all on-array, so its low apparent GMAC/s is prep, not GEMM.
+- **The r6 fullk kernel runs W4 GEMM on ONE core-row (8 cores, tile row 2) and f32
+  scaling on row 3** — so 215 GMAC/s uses **8 of 32 cores for MACs = 27 GMAC/s/core**.
+Realistic ceiling = the design guide's own npu1 GEMM candidate (940 GMAC/s @16 cores
+= 58/core) scaled to npu2 (32 cores × 1.65 clock) ≈ **~3000 GMAC/s → ~14× headroom,
+NOT ~100×**. Levers: (a) GEMM on all 4 core-rows (32 cores, ~4×), (b) fill the VMAC
+(27→~58/core, ~2×). **A tuned op4++ GEMM is worth ~10–14× on PP — real and worth
+doing, but the NPU stays a ms/expert, energy-not-speed device (design-guide thesis
+holds).** De-risk: prove a minimal 32-core W4 GEMM hits the ceiling BEFORE the full
+fused-FFN rewrite.
+
+**DE-RISK MEASUREMENT (COLS scaling, `r6_fullk_cache.sh` 4 vs 8):** same GEMM
+(256×2048×768), 4 GEMM-cores → **137 GMAC/s**, 8 GEMM-cores → **210 GMAC/s** =
+only **1.53× for 2× cores** (sublinear, ~77% parallel efficiency; per-core stays ~3%
+of the microbench). Projection: a full 32-GEMM-core kernel ≈ 4^0.61 ≈ **2.3× ≈
+~480 GMAC/s**, NOT 4×. **So parallelism alone buys ~2–3×; the ~14× ceiling requires
+cracking the ~3% per-core efficiency — a memory-delivery stall (memtile→core DMA),
+which is a hard, uncertain core-kernel/dataflow problem, possibly a real W4-on-AIE
+limit.** Per the de-risk bar ("invest in the full rewrite only if it proves ~10×"),
+**the validation did NOT clear it** — cores give ~2.3×, and the rest is gated behind
+hard, uncertain core-optimization on a device whose value was always tok/J, not
+tok/s. Decision point: accept ~2–3× for the R25 rewrite, attempt the per-core stall
+(high-risk), or pivot to M4 (energy/heterogeneous split — the NPU's actual win).
+
+Original (over-optimistic) reasoning kept for the record:
+**"RESOLVED — it's an un-tuned kernel, not a floor."** Evidence: (1) compute-bound —
 weight+act movement is only ~2.76 MiB → ~55 µs @ 50 GB/s, ≪ the 3.4 ms dispatch, so
 it is NOT movement-bound; (2) the compiled `aie.mlir` programs only **16 `aie.core`
 blocks (8 cols × 2 core-rows) — HALF of AIE2P's 32 cores**; (3) per-core ≈ 13 GMAC/s
