@@ -148,14 +148,30 @@ halving weight bytes, not from the faster MMUL.
 
 ### NPU vs GPU (gfx1103, same die, same rails, same instrument)
 
-| axis | NPU | GPU | verdict |
-|---|---|---|---|
-| movement | **5.13 GB/J** | 3.73 GB/J | **NPU 1.37×** |
-| compute int8 | **938 G MACs/J** | 432 G MACs/J | **NPU 2.15×** |
+**The two objectives choose opposite devices. This is the headline.**
 
-**On tok/J the NPU wins both regimes.** This is a **tok/J verdict only** — the
-NPU's 7.4 TOPS ceiling is far below the GPU's, so a latency-bound prefill may
-still belong on the GPU. That comparison is unmeasured.
+| axis | NPU | GPU | **speed** | **energy** |
+|---|---|---|---|---|
+| movement | 30.8 GB/s · 5.13 GB/J | **79.5 GB/s** · 3.73 GB/J | **GPU 2.58×** | **NPU 1.37×** |
+| compute int8 | 7.4 TOPS · 938 G MACs/J | **15.1 TOPS** · 432 G MACs/J | **GPU 2.03×** | **NPU 2.15×** |
+
+- **tok/s → GPU.** ~2–2.6× faster on *both* axes.
+- **tok/J → NPU.** ~1.4–2.2× more efficient on *both* axes.
+- **The GPU buys that speed for ~17× the power**: 24–28 W free-run package delta
+  vs the NPU's ~1.4 W at full width.
+
+There is no regime where one device wins both. Placement is a *policy* choice —
+latency or battery — not an optimisation the model can make for you.
+
+**The speed gap is understated.** The NPU compute figure is 89% of its
+theoretical peak; the GPU's 15.1 TOPS is only ~42% of gfx1103's ~35 TOPS — the
+`g1` chain kernel was written as an NPU analogue, not tuned for the GPU. A tuned
+GPU kernel widens the gap. By contrast GPU feed (79.5 GB/s ≈ 78% of LPDDR5-6400
+dual-channel) is near roofline, and the NPU's 30.8 GB/s is a hard shim-channel
+ceiling, not a tuning artifact.
+
+**Never mix the two measurements**: speed is free-run, energy is matched-rate.
+Free-run energy tracks dispatch rate (§2.2) and is meaningless.
 
 ---
 
@@ -319,6 +335,9 @@ to the 37-MACs/byte artifact for any dtype pair without a specific ratio.
 
 ## Part 3 — Design rules that follow from the numbers
 
+0. **Pick the device by objective, not by habit.** GPU for tok/s, NPU for tok/J
+   — ~2× either way, on both movement and compute. There is no regime where one
+   wins both.
 1. **Maximise work per dispatch.** The 155 µs floor is 37–58% of realistic
    kernels. Fusing layers into one dispatch beats any format choice.
 2. **Energy is bytes** (AI break-even 183). Narrower weights/KV cut energy; a
@@ -471,8 +490,10 @@ that output-tile area matters — never the values or the rankings.
 
 ## Part 6 — Open / unmeasured
 
-- **tok/s device comparison** (NPU 7.4 TOPS vs GPU peak). The speed verdict may
-  invert the energy one. This is the biggest gap.
+- ~~tok/s device comparison~~ **RESOLVED**: GPU 2.0–2.6× faster on both axes;
+  NPU 1.4–2.2× more efficient on both. The verdicts *do* invert.
+- **A tuned GPU compute kernel** — `g1`'s chain reaches only ~42% of gfx1103's
+  theoretical, so the measured speed gap is a lower bound.
 - ~~The true feed ceiling~~ **RESOLVED**: ~30.8 GB/s at 8 shim input streams,
   confirmed by measurement and the toolchain channel budget independently.
 - **CPU as a third target.**
