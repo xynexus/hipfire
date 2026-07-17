@@ -579,11 +579,26 @@ that output-tile area matters — never the values or the rankings.
   NPU 1.4–2.2× more efficient on both. The verdicts *do* invert.
 - **A tuned GPU compute kernel** — `g1`'s chain reaches only ~42% of gfx1103's
   theoretical, so the measured speed gap is a lower bound.
-- **`design.py`'s GEMM/attention specs are DERIVED, never validated.** All four
-  families (B feed, C compute, D composition) validate *primitives*; no family
-  covers a real LLM schedule. The design rules inherit that gap. The natural
-  independent test — the repo's own `oq_gemm_design.py` — is bit-rotted (§2.10),
-  and rewriting it myself would forfeit the independence that made it worth using.
+- **`design.py` validated against an independent kernel — ORDINAL passes,
+  MAGNITUDE is ~2.3× optimistic.** With `oq_gemm` runnable again (custom
+  toolchain, see AGENTS.local.md), the model was checked against its measured
+  single-core batch sweep (M=512,K=512):
+
+      B     pred    meas    err
+      32   190 µs  370 µs  −49%
+      256  413 µs 1062 µs  −61%
+
+  Ranking is perfect (τ=1.0, both monotonic) — so the model's *product* (ranking
+  schedules) holds against a real kernel. But absolute `t_core` under-predicts
+  because it assumes a **saturated VMAC pipe** (1 VMAC/cyc), which the tight
+  resident chains of families B/C/D reach but a hand-written tiled GEMM does not:
+  `oq_gemm` runs its core at ~28% of peak (small tiles + per-tile objectfifo
+  acquire/release + K-loop C re-zero). **The model is a peak lower-bound for
+  tiled compute, not a magnitude predictor.** The improvement lever is a
+  calibrated core-efficiency factor (`t_core /= η`), which needs η measured
+  across shapes/tilings, not fit from one point.
+  Still open: `design.py`'s *full-array* specs (broadcast+join) remain unchecked
+  against a real multi-core kernel — `oq_gemm` is single-core.
 - ~~The true feed ceiling~~ **RESOLVED**: ~30.8 GB/s at 8 shim input streams,
   confirmed by measurement and the toolchain channel budget independently.
 - ~~CPU as a third target~~ **DONE** (P1): dominated on both axes — 55.8 GB/s ·
