@@ -137,16 +137,25 @@ def predict(spec: ScheduleSpec, key: str | None = None, device: str = "auto") ->
             p.terms["t_core"] *= 1.0 + pen
 
     # ── t_feed / t_drain ──
-    # C2 and C5 both scale near-linearly with columns, so bandwidth is stored
-    # per-column and multiplied. Using a fixed 4-column figure would mispredict
-    # a 1-column schedule by ~4x.
-    bw_feed_col = need("bw_feed_per_col_bytes_s", "C2")
-    if bw_feed_col and spec.wire_bytes_in:
-        p.terms["t_feed"] = spec.wire_bytes_in / (bw_feed_col * spec.columns)
-
-    bw_drain_col = need("bw_drain_per_col_bytes_s", "C5")
-    if bw_drain_col and spec.output_bytes:
-        p.terms["t_drain"] = spec.output_bytes / (bw_drain_col * spec.columns)
+    # Bandwidth is per DMA STREAM (fifo), NOT per column — c2_feed built one fifo
+    # per column, which made "4 columns = 16.1 GB/s" look like a column law. It is
+    # not: ONE column with 4 fifos also reaches 15.8 GB/s, and 8 streams reach
+    # 30.8 GB/s, still scaling linearly. Multiplying by columns understates any
+    # schedule with more than one stream per column by up to 4x.
+    bw_stream = need("bw_feed_per_stream_bytes_s", "C2-audit")
+    streams = spec.feed_streams or spec.columns  # 0 => one stream per column
+    if bw_stream and spec.wire_bytes_in:
+        p.terms["t_feed"] = spec.wire_bytes_in / (bw_stream * streams)
+        if not spec.feed_streams and spec.columns < 8:
+            p.advice.append(
+                f"FEED: assuming {streams} stream(s) (one per column) because feed_streams is unset. "
+                f"Each stream carries ~{bw_stream / 1e9:.1f} GB/s and they scale linearly — more fifos per "
+                "column is a real lever (8 streams measured at 30.8 GB/s). Set feed_streams explicitly."
+            )
+    # Drain is measured symmetric with feed; c5_drain has the same one-fifo-per-
+    # column shape, so the same per-stream reading applies.
+    if bw_stream and spec.output_bytes:
+        p.terms["t_drain"] = spec.output_bytes / (bw_stream * streams)
 
     # ── t_task ──
     c_issue = need("c_task_issue_s", "C3")

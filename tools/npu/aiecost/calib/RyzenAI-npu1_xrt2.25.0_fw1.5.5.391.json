@@ -153,13 +153,14 @@
       "unit": "bytes/s",
       "bench": "C2",
       "method": "tile stream, 1 word touched per tile; slope of npu_time vs bytes at 4 columns",
-      "admissible": true,
+      "admissible": false,
       "evidence": [
         "cols=1: 4.097 GB/s (fixed 228.2 us)",
         "cols=2: 7.637 GB/s (fixed 176.7 us)",
         "cols=4: 16.147 GB/s (fixed 181.9 us)"
       ],
       "caveats": [
+        "RETIRED - MISLABELLED. This is a per-STREAM feed rate, not per-column: c2_feed/c5_drain build ONE fifo per column, so '4 columns' meant 4 streams. One column with 4 fifos reaches 15.8 GB/s; 8 streams reach 30.8 GB/s, still scaling. Use bw_feed_per_stream_bytes_s.",
         "slope basis: the C1 dispatch floor lands in the intercept, not the bandwidth",
         "cheapest possible consumer; a real kernel may not reach this feed rate",
         "halo's 14.4/56.5 GB/s are aie2p on Strix Halo and do not transfer"
@@ -172,13 +173,14 @@
       "unit": "bytes/s",
       "bench": "C5",
       "method": "core writes 1 word/tile, DMA drains; slope of npu_time vs bytes at 4 columns",
-      "admissible": true,
+      "admissible": false,
       "evidence": [
         "cols=1: 4.140 GB/s (fixed 210.5 us)",
         "cols=2: 8.149 GB/s (fixed 183.4 us)",
         "cols=4: 15.916 GB/s (fixed 172.2 us)"
       ],
       "caveats": [
+        "RETIRED - MISLABELLED. This is a per-STREAM drain rate, not per-column: c2_feed/c5_drain build ONE fifo per column, so '4 columns' meant 4 streams. One column with 4 fifos reaches 15.8 GB/s; 8 streams reach 30.8 GB/s, still scaling. Use bw_feed_per_stream_bytes_s.",
         "slope basis; C1 floor lands in the intercept",
         "measured separately from feed because R64 found drain, not feed, was the limiter"
       ],
@@ -232,7 +234,7 @@
       "unit": "bytes/s/column",
       "bench": "C2",
       "method": "per-column feed rate; C2 column sweep is near-linear so bandwidth is modelled as per_col * columns",
-      "admissible": true,
+      "admissible": false,
       "evidence": [
         "cols=1: 4.097 GB/s",
         "cols=2: 7.637 GB/s (1.86x)",
@@ -240,6 +242,7 @@
         "linear within ~4%: 4.03 GB/s/col x 4 = 16.1 GB/s, matches the measured 4-col roof"
       ],
       "caveats": [
+        "RETIRED - MISLABELLED. This is a per-STREAM feed rate, not per-column: c2_feed/c5_drain build ONE fifo per column, so '4 columns' meant 4 streams. One column with 4 fifos reaches 15.8 GB/s; 8 streams reach 30.8 GB/s, still scaling. Use bw_feed_per_stream_bytes_s.",
         "broadcast pattern (every column reads the same stream); R56 found shared vs distinct made no difference on aie2p, unverified here",
         "cheapest possible consumer \u2014 a real kernel may not reach this rate"
       ],
@@ -251,7 +254,7 @@
       "unit": "bytes/s/column",
       "bench": "C5",
       "method": "per-column drain rate from the C5 column sweep",
-      "admissible": true,
+      "admissible": false,
       "evidence": [
         "cols=1: 4.140 GB/s",
         "cols=2: 8.149 GB/s (1.97x)",
@@ -259,6 +262,7 @@
         "feed and drain are SYMMETRIC on npu1 (16.147 vs 15.916 GB/s at 4 cols) \u2014 unlike halo, where R64 found the output DMA starved 198 us of a 241 us span"
       ],
       "caveats": [
+        "RETIRED - MISLABELLED. This is a per-STREAM drain rate, not per-column: c2_feed/c5_drain build ONE fifo per column, so '4 columns' meant 4 streams. One column with 4 fifos reaches 15.8 GB/s; 8 streams reach 30.8 GB/s, still scaling. Use bw_feed_per_stream_bytes_s.",
         "near-linear in columns, same as feed"
       ],
       "measured_utc": "2026-07-16T19:15:37+00:00"
@@ -609,6 +613,28 @@
         "a kernel needs AI > 183 (int8) or > 401 (int4) before arithmetic dominates its energy at all"
       ],
       "measured_utc": "2026-07-17T09:31:50+00:00"
+    },
+    "bw_feed_per_stream_bytes_s": {
+      "name": "bw_feed_per_stream_bytes_s",
+      "value": 3950000000.0,
+      "unit": "bytes/s/stream",
+      "bench": "C2-audit",
+      "method": "per-fifo feed rate; linear in stream count",
+      "admissible": true,
+      "evidence": [
+        "1 column, 1/2/4 fifos: 3.972 / 8.071 / 15.803 GB/s (floor-corrected) - 3.98x for 4x the fifos,",
+        "  span FLAT at 2267/2234/2278 us. One column with 4 fifos matches C2's entire 4-column roof.",
+        "4 columns, 1/2 fifos each (4/8 streams): 15.40 / 30.79 GB/s - 2.0x for 2x the streams",
+        "per-stream rate ~3.85-4.03 GB/s, linear in STREAM count, not column count",
+        "16 streams (4 col x 4) failed placement: 'Failed to find a tile matching column 2'"
+      ],
+      "caveats": [
+        "THE ROOF IS NOT 16.1 GB/s. That was 4 STREAMS (c2_feed builds one fifo per column). Measured >=30.8 GB/s at 8 streams and still scaling linearly; the true ceiling is unmeasured (16-stream placement fails).",
+        "Same error class as the 1-core compute bug: the constant described the BENCH topology, not the device.",
+        "The aie2p corpus used the right language all along ('one active receive stream is 14.4 GB/s') - the per-column mislabel was introduced here.",
+        "DOES NOT affect J/byte or the 183 law: energy per byte is independent of how fast the bytes move. It DOES mean t_feed is up to ~4x pessimistic for multi-stream schedules."
+      ],
+      "measured_utc": "2026-07-17T09:57:51+00:00"
     }
   }
 }

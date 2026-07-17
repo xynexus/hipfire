@@ -68,13 +68,25 @@ VMAC.**
 
 | quantity | value |
 |---|---|
-| feed | 4.03 GB/s/column → **16.1 GB/s at 4 columns** |
-| drain | 3.98 GB/s/column → 15.9 GB/s (feed ≈ drain, **symmetric**) |
+| feed | **~3.95 GB/s per DMA STREAM (fifo)** — linear in stream count |
+| feed roof | **≥30.8 GB/s at 8 streams**, still scaling; true ceiling unmeasured |
+| drain | ~symmetric with feed |
 | **dispatch floor** | **~155 µs of DEVICE time for a null kernel** |
 | host per dispatch | 7.7 µs fixed + pack 71.7 GB/s + deblock 89.1 GB/s |
 | BO allocation | **17.6 ms**, size-independent — **setup only, never per dispatch** |
 | DMA task issue | ~5 ns — **below the noise floor** |
 | FIFO depth 1→4 | 2.2% |
+
+**Bandwidth is per STREAM, not per column.** An earlier "4.03 GB/s/column →
+16.1 GB/s at 4 columns" was a mislabel: `c2_feed` builds one fifo per column, so
+"4 columns" meant *4 streams*. Measured:
+
+    1 column, 1/2/4 fifos:  3.972 / 8.071 / 15.803 GB/s   (span FLAT: 2267/2234/2278 us)
+    4 columns, 4/8 streams:      15.40 / 30.79 GB/s
+
+**One column with 4 fifos matches what was reported as the whole device's roof.**
+More fifos per column is a real and large lever. 16 streams fails placement, so
+the true ceiling is still unknown.
 
 **The 155 µs floor dominates everything.** It is 58% of the best 256×768×1280
 GEMM candidate and 37% of a kvarn4 decode token (32 layers × 155 µs = 4.96 ms of
@@ -143,6 +155,17 @@ one session:
 
 **Check the worker count before trusting any per-core number.** `c4_mmul` built
 one `Worker`; `c2_feed` built one per column. Neither is obvious from the output.
+
+**The same bug bit the feed roof, in units.** `c2_feed`'s one-fifo-per-column
+shape made a per-STREAM rate look like a per-COLUMN law — "16.1 GB/s at 4
+columns" was really 4 streams, and one column with 4 fifos reaches the same
+15.8 GB/s. The constant described the *bench topology*, not the device. Note the
+aie2p corpus said "one active receive stream is 14.4 GB/s" — it had the units
+right; the per-column framing was introduced here.
+
+**Generalised rule: a constant measured on one topology is a property of that
+topology until proven otherwise.** Before naming a constant "per X", vary X
+*independently* of the bench's incidental structure.
 
 **Reaching all 16 cores** (the 5-BO arg cap is what stops you):
 - **inputs broadcast**: one fifo whose `cons()` every worker shares (an
@@ -338,11 +361,10 @@ consumers, that output-tile area matters — never the values or the rankings.
 
 - **tok/s device comparison** (NPU 7.4 TOPS vs GPU peak). The speed verdict may
   invert the energy one. This is the biggest gap.
-- **Is C2's feed roof core-limited?** It uses 4 workers (1/column) of 16 cores.
-  The consumer is trivial (~1 add per 4 KiB tile, ~90% idle) so it *should* be
-  DMA-limited, and columns scale linearly (4.1/7.6/16.1) — but "more fifos per
-  column might open more DMA channels" is untested. An 8-fifo variant crashed
-  XRT. **If this is core-limited, J/byte and the 183 law both move.**
+- **The true feed ceiling.** RESOLVED that the roof is per-stream and ≥30.8 GB/s
+  at 8 streams (was reported as 16.1 GB/s total), but 16 streams fails
+  placement, so the ceiling itself is unmeasured. J/byte and the 183 law are
+  unaffected — energy per byte does not depend on how fast the bytes move.
 - **CPU as a third target.**
 - **Dual-objective (tok/s × tok/J) search** — the objectives provably diverge but
   `design.py` still ranks on time alone.
