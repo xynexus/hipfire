@@ -163,7 +163,7 @@ def build(shape, iters: int, out_dir: Path, target=None, cores: int = 1) -> tupl
     out_n = 8 + s["size_C"] + 8  # kernel stores counters at [0..3] then a size_C vector at +8
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    tag = f"{target.cache_tag}-{m}{k}{n}-{s['ta']}{s['tb']}-i{iters}" + (f"-x{cores}" if cores > 1 else "")
+    tag = f"{target.cache_tag}-{m}{k}{n}-{s['ta']}{s['tb']}-i{iters}" + (f"-x{cores}j" if cores > 1 else "")
     xclbin, insts = out_dir / f"c4-{tag}.xclbin", out_dir / f"c4-{tag}-insts.bin"
     if xclbin.exists() and insts.exists():
         return xclbin, insts
@@ -202,28 +202,53 @@ def build(shape, iters: int, out_dir: Path, target=None, cores: int = 1) -> tupl
             rt.fill(fb.prod(), b)
             rt.drain(fo.cons(), o, wait=True)
     else:
-        # Multi-core. The binding constraint is H4: 5 DPU data-arg slots. N workers
-        # each need an output, so per-worker A and B args would blow the budget at
-        # N=4 (2 + 4 = 6 BOs). Instead ONE source BO fills both the A and B fifos
-        # — c2_feed already relies on filling several fifos from one arg — giving
-        # 1 + N BOs, so N=4 fits exactly.
+        # Multi-core, up to the full array. Two constraints shape this topology:
         #
-        # Both fifos therefore carry the same over-allocated tile type; the kernel
-        # reads only size_A / size_B from each pointer. Operand VALUES are
-        # irrelevant to a throughput/energy bench, so the overlap is harmless.
-        fas = [ObjectFifo(IN, name=f"a{i}", depth=1) for i in range(cores)]
-        fbs = [ObjectFifo(IN, name=f"b{i}", depth=1) for i in range(cores)]
-        fos = [ObjectFifo(O, name=f"o{i}", depth=1) for i in range(cores)]
-        ws = [Worker(core, [fas[i].cons(), fbs[i].cons(), fos[i].prod(), kern]) for i in range(cores)]
-        with rt.sequence(IN, *([O] * cores)) as args:
+        #  1. H4 caps DPU data-args at 5 BOs. Per-worker outputs blow that at
+        #     N=4. Instead each column's cores JOIN into one fifo at that
+        #     column's memtile, so outputs cost 1 BO per COLUMN, not per core:
+        #     1 shared source + 4 column outputs = 5 BOs for all 16 cores.
+        #  2. A join is placed on a memtile, and a memtile serves only its own
+        #     column — joining all 16 cores into ONE fifo is unplaceable
+        #     ("Failed to find a tile matching column 0"). Hence per-column.
+        #
+        # Inputs are BROADCAST: one a-fifo and one b-fifo, whose cons() every
+        # worker shares (an objectfifo's consumer list is native broadcast). That
+        # keeps input DMA at 2 tasks regardless of core count — R61 found ~32
+        # independent shim transfers exceed shim DMA capacity.
+        #
+        # Both fifos carry the same over-allocated tile type and are filled from
+        # one source BO; the kernel reads only size_A / size_B from each pointer.
+        # Operand VALUES are irrelevant to a throughput/energy bench.
+        cols = min(cores, target.compute_columns)
+        per_col = -(-cores // cols)
+        BIG: object = np.ndarray[(out_n * per_col,), np.dtype[np.int32]]
+        fa = ObjectFifo(IN, name="a", depth=1)
+        fb = ObjectFifo(IN, name="b", depth=1)
+        bigs, subs = [], []
+        for c in range(cols):
+            b = ObjectFifo(BIG, name=f"out{c}", depth=1)
+            bigs.append(b)
+            subs.append(
+                b.prod().join(
+                    offsets=[i * out_n for i in range(per_col)],
+                    obj_types=[O] * per_col,
+                    names=[f"o{c}_{i}" for i in range(per_col)],
+                )
+            )
+        ws = [
+            Worker(core, [fa.cons(), fb.cons(), subs[c][i].prod(), kern])
+            for c in range(cols)
+            for i in range(per_col)
+        ]
+        with rt.sequence(IN, *([BIG] * cols)) as args:
             src, outs = args[0], args[1:]
             for w in ws:
                 rt.start(w)
-            for i in range(cores):
-                rt.fill(fas[i].prod(), src)
-                rt.fill(fbs[i].prod(), src)
-            for i in range(cores):
-                rt.drain(fos[i].cons(), outs[i], wait=True)
+            rt.fill(fa.prod(), src)
+            rt.fill(fb.prod(), src)
+            for c in range(cols):
+                rt.drain(bigs[c].cons(), outs[c], wait=True)
 
     try:
         module = resolve_program(Program(iron_device, rt))
@@ -240,7 +265,7 @@ def build(shape, iters: int, out_dir: Path, target=None, cores: int = 1) -> tupl
     return xclbin, insts
 
 
-def tensors_for(shape, cores: int = 1) -> list:
+def tensors_for(shape, cores: int = 1, columns: int = 4) -> list:
     """Host buffers matching build()'s arg layout for `cores`."""
     from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
 
@@ -253,10 +278,13 @@ def tensors_for(shape, cores: int = 1) -> list:
             XRTTensor(rng.integers(-8, 8, size=(2 * s["bytes_B"],), dtype=np.int8), dtype=np.int8, device="cpu"),
             XRTTensor((out_n,), dtype=np.int32, device="cpu"),
         ]
-    # Multi-core: one shared source BO feeds every A and B fifo (see build()).
+    # Multi-core: one shared source BO feeds every A and B fifo, and outputs are
+    # joined per COLUMN, so there is one output BO per column (see build()).
     n = max(2 * s["bytes_A"], 2 * s["bytes_B"])
     src = XRTTensor(rng.integers(-8, 8, size=(n,), dtype=np.int8), dtype=np.int8, device="cpu")
-    return [src] + [XRTTensor((out_n,), dtype=np.int32, device="cpu") for _ in range(cores)]
+    cols = min(cores, columns)
+    per_col = -(-cores // cols)
+    return [src] + [XRTTensor((out_n * per_col,), dtype=np.int32, device="cpu") for _ in range(cols)]
 
 
 def run(xclbin: Path, insts: Path, shape, reps: int, cores: int = 1) -> float | None:

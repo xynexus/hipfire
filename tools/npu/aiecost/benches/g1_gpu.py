@@ -141,8 +141,21 @@ def main() -> int:
             print(f"\n  !! {bad} missed the rate target — null subtraction is INVALID for them")
             print("     (host cost only cancels when every kernel submits at the same rate). Lower --rate.")
         print()
-        for kind, unit, work, npu_ref in (("feed", "GB/J", FEED_BYTES / 1e9, 5.13),
-                                          ("compute", "G MACs/J", COMPUTE_ITERS * CHAINS * WMMA_MACS * WAVES / 1e9, 187.9)):
+        # NPU references come from the calibration set, never hardcoded: the
+        # compute figure moved 187.9 -> ~929 G MACs/J once the NPU side ran on
+        # all 16 cores instead of 1, which REVERSED the verdict. A literal here
+        # would have kept printing "GPU 2.31x NPU" long after it became false.
+        from aiecost import calib as _calib
+
+        _c = _calib.load(_calib.current_key())
+        npu_feed = _c["gpu_ref_npu_gb_per_j"].value if "gpu_ref_npu_gb_per_j" in _c else 5.13
+        npu_comp = _c["j_per_mac_int8_16core_gmacs_j"].value if "j_per_mac_int8_16core_gmacs_j" in _c else None
+        if npu_comp is None:
+            print("  (no 16-core NPU compute reference in calib — compute verdict suppressed)")
+        for kind, unit, work, npu_ref in (("feed", "GB/J", FEED_BYTES / 1e9, npu_feed),
+                                          ("compute", "G MACs/J", COMPUTE_ITERS * CHAINS * WMMA_MACS * WAVES / 1e9, npu_comp)):
+            if npu_ref is None:
+                continue
             if kind not in out or not out[kind]["rate_met"] or not out["null"]["rate_met"]:
                 continue
             mj = (out[kind]["delta_w"] - nullw) / out[kind]["actual_rate"]
