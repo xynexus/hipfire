@@ -57,6 +57,12 @@ NATIVE_SHAPES = {
 
 _BITS = {"int8": 8, "int4": 4, "bf16": 16}
 
+# Fraction of peak the CORE reaches for a real tiled GEMM. Measured 0.28 on
+# oq_gemm (single-core, stable across a 4x shape range); see calib. Without it
+# the model under-predicts tiled GEMM ~2.3x. Single-core-calibrated — multi-core
+# is unverified, so predictions carry that as a flagged assumption.
+TILED_GEMM_EFFICIENCY = 0.28
+
 # KVarN record: codes pack 8/bits per byte, plus fp16 per-channel scale+zp and
 # fp16 per-token s_col. Mirrors kvarn_record_bytes_bits() in hipfire-kvquant.
 def kvarn_record_bytes(r_dim: int, c_dim: int, bits: int) -> int:
@@ -114,6 +120,7 @@ class GemmProblem:
                         dtype_a=self.dtype_a,
                         dtype_b=self.dtype_b,
                         local_stage_bytes=stage,
+                        core_efficiency=TILED_GEMM_EFFICIENCY,
                         host_pack_bytes=self.act_bytes(),
                         host_deblock_bytes=self.m * self.n * self.out_bytes_per_elem,
                         n_bos=3,
@@ -176,6 +183,7 @@ class DecodeAttnProblem:
                         dtype_a=self.dtype_a,
                         dtype_b=dtype_b,
                         local_stage_bytes=stage,
+                        core_efficiency=TILED_GEMM_EFFICIENCY,
                         host_pack_bytes=0,  # cache is already resident device-side
                         host_deblock_bytes=self.kv_heads * self.head_dim * 2,
                         n_bos=3,

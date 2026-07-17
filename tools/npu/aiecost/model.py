@@ -122,7 +122,18 @@ def predict(spec: ScheduleSpec, key: str | None = None, device: str = "auto") ->
         macs = spec.macs_per_call
         native_per_call = math.ceil(macs / ceiling)
         vmacs = spec.mmul_calls_per_core * native_per_call
-        p.terms["t_core"] = vmacs * cyc_per_vmac / f_h
+        # Divide by core efficiency: t_core is the SATURATED-pipe time (validated
+        # by K1/C4's tight chains at eff=1.0). A tiled kernel reaches only a
+        # fraction — oq_gemm ~0.28 — so a spec that models one sets core_efficiency
+        # < 1. Without this the model is a peak lower-bound and under-predicts real
+        # tiled GEMMs ~2.3x (validated against oq_gemm).
+        eff = spec.core_efficiency if spec.core_efficiency > 0 else 1.0
+        p.terms["t_core"] = vmacs * cyc_per_vmac / f_h / eff
+        if eff < 1.0:
+            p.assumptions.append(
+                f"core_efficiency={eff:.2f}: t_core is {1 / eff:.1f}x the saturated-pipe time "
+                "(tiled-kernel overhead). Calibrated single-core on oq_gemm; unverified for multi-core."
+            )
 
         m, k, n = spec.mmul_shape
         if native_per_call > 1:

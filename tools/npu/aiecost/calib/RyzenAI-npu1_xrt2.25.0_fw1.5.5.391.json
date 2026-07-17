@@ -1027,23 +1027,17 @@
       "value": 0.28,
       "unit": "fraction",
       "bench": "validate",
-      "method": "measured single-core GMAC/s / peak, oq_gemm tile(32,64,32)",
-      "admissible": false,
+      "method": "measured single-core GMAC/s / peak across 4 shapes (256x512,512x512,1024x512,768x768), tile(32,64,64)",
+      "admissible": true,
       "evidence": [
-        "oq_gemm (independent, hand-written single-core int_matmul), M=512 K=512, vs model single-core spec:",
-        "  B=32  pred 190.3 meas 370.1 (-49%);  B=64 220 vs 405 (-46%);  B=128 284 vs 617 (-54%);  B=256 413 vs 1062 (-61%)",
-        "ORDINAL: perfect (pred and meas both monotonic 32<64<128<256, Kendall tau=1.0)",
-        "MAGNITUDE: model under-predicts 46-61%, worsening as t_core dominates",
-        "root cause: t_core assumes peak (1 VMAC/cyc saturated); oq_gemm reaches ~28% of one core's peak",
-        "  (63 GMAC/s vs 260 GMAC/s single-core peak) due to small tiles + per-tile objectfifo acquire/release + K-loop C re-zero"
+        "eta_core (fixed floor removed) at compute-bound points: 512x512 B256=0.285, 1024x512 B256=0.287,",
+        "  768x768 B256=0.292, 512x512 B128=0.280 -> clusters 0.28-0.29",
+        "applying t_core /= 0.28: B=64 -5%, B=128 -0%, B=256 +1% vs measured (was -46..-61% at eff=1)"
       ],
       "caveats": [
-        "FIRST validation against an INDEPENDENT real kernel (design.py specs were previously derived, never validated).",
-        "The model is a PEAK LOWER-BOUND for tiled compute, not a magnitude predictor. Families B/C/D validated it on the SAME tight-resident-chain structure it was calibrated on (which DOES saturate the VMAC pipe); a differently-structured hand-written GEMM does not, so t_core is ~2.3x optimistic.",
-        "ORDINAL still holds against the real kernel \u2014 so ranking (the model's stated product) works; absolute numbers do not.",
-        "THE IMPROVEMENT LEVER: a calibrated core-efficiency factor for tiled kernels (t_core /= eta). eta~0.28 for oq_gemm's tile(32,64,32); would need calibrating across real GEMM shapes/tilings, not fitting from one point.",
-        "single-core comparison; design.py's full-array specs (broadcast+join) are still unvalidated against a real multi-core kernel.",
-        "NOT ADMISSIBLE as a model constant yet: one tiling, one shape. The model does NOT apply it; t_core remains a peak lower bound until an efficiency term is calibrated across shapes."
+        "SINGLE-CORE, tile (32,64,64). design.py applies it to full-array specs too, which is an EXTRAPOLATION",
+        "flagged in each prediction's assumptions. A real multi-core tiled GEMM may differ.",
+        "eff=1.0 remains correct for tight resident chains (K1/C4/families C/D saturate the pipe)."
       ],
       "measured_utc": "2026-07-17T16:11:36+00:00"
     }

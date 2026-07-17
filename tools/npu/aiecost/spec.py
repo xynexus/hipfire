@@ -50,6 +50,13 @@ class ScheduleSpec:
     # (C4). hipfire's OQ4/MQ4 weights are the int4 case and get 2x the int8 rate.
     dtype_a: str = "int8"
     dtype_b: str = "int8"
+    # Fraction of peak VMAC throughput the CORE actually reaches. 1.0 = saturated
+    # pipe, which the tight resident-chain benches (K1/C4, families C/D) hit and
+    # validated t_core against. A real TILED kernel does NOT: per-output-tile
+    # objectfifo acquire/release + K-loop C re-zero stall the pipe. Measured
+    # ~0.28 for oq_gemm's single-core tiled int8 GEMM, stable across a 4x shape
+    # range (see calib t_core_efficiency_tiled_gemm). t_core is divided by this.
+    core_efficiency: float = 1.0
     local_stage_bytes: int = 0  # tile-local staging buffer per core
     aligned_loads: bool = True  # 64 B-aligned local loads (see R118 / K3)
 
