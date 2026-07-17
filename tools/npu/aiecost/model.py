@@ -204,23 +204,30 @@ def predict(spec: ScheduleSpec, key: str | None = None, device: str = "auto") ->
     # cancels; free-running numbers track dispatch rate and even invert the
     # compute-vs-feed ordering. The dispatch floor's own energy is NOT included:
     # it is rate-dependent and a real runtime would not spin like the bench does.
-    j_mac = consts.get("j_per_mac_int8")
+    # Per-dtype J/MAC, MEASURED at 16 cores (E1). int4 was previously an assumed
+    # 2.0x halving; measurement gives 2.19x (interval ~[1.93, 2.45]), so the
+    # assumption was validated and slightly conservative. Falls back to the
+    # 1-core int8 figure only if the 16-core set is absent — that fallback is
+    # 5.5x pessimistic and flagged loudly if it ever fires.
+    j_mac = consts.get(f"j_per_mac_{spec.dtype_pair}_16core")
     j_byte = consts.get("j_per_byte_external")
+    if j_mac is None:
+        j_mac = consts.get("j_per_mac_int8")
+        if j_mac is not None:
+            p.assumptions.append(
+                f"no 16-core J/MAC for {spec.dtype_pair}; using the 1-core int8 figure, which is ~5.5x "
+                "pessimistic (fixed costs do not amortise at 1 core). Energy is a LOWER bound on efficiency."
+            )
     if j_mac and j_byte and j_mac.admissible and j_byte.admissible:
         macs = spec.useful_macs
-        # int4 packs 2x the MACs into one VMAC, so the per-MAC energy should halve.
-        # Unmeasured (E1 only ran int8) — applied as an explicit, flagged model
-        # assumption rather than silently using the int8 number for int4.
         jm = j_mac.value
-        if spec.dtype_b == "int4":
-            jm = j_mac.value / 2.0
-            p.assumptions.append("j_per_mac halved for int4 (2x MACs/VMAC); E1 measured int8 only — unverified")
         bytes_moved = spec.wire_bytes_in + spec.output_bytes
         p.energy_terms = {"compute": jm * macs, "movement": j_byte.value * bytes_moved}
         p.energy_j = sum(p.energy_terms.values())
         p.arithmetic_intensity = macs / bytes_moved if bytes_moved else float("inf")
 
-        ratio = consts.get("byte_mac_energy_ratio")
+        # Break-even is per operand pair: int8 183, int4 401 (E1, 16-core).
+        ratio = consts.get(f"byte_mac_energy_ratio_{spec.dtype_pair}") or consts.get("byte_mac_energy_ratio")
         if ratio and p.arithmetic_intensity < ratio.value:
             p.advice.append(
                 f"ENERGY: AI={p.arithmetic_intensity:.1f} MACs/byte is below the {ratio.value:.0f} break-even — "

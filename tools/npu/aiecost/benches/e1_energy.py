@@ -160,7 +160,16 @@ class Window:
         return (self.p0 + self.p1) / 2
 
 
-def build_kernel(kind: str, cache: Path, cores: int = 1):
+# C4's native shapes per operand pair: int8xint8 does 256 MACs/VMAC, int8xint4
+# does 512. Whether the ENERGY per MAC also halves is the open question — the
+# model currently assumes it does, unverified.
+COMPUTE_SHAPES = {
+    "int8": (4, 8, 8, "int8", "int8"),
+    "int4": (4, 16, 8, "int8", "int4"),
+}
+
+
+def build_kernel(kind: str, cache: Path, cores: int = 1, dtype: str = "int8"):
     if kind == "null":
         # C1's near-null kernel: same dispatch/submit machinery, no useful work.
         # Isolates the host+dispatch power that the other kernels also pay, so a
@@ -175,13 +184,14 @@ def build_kernel(kind: str, cache: Path, cores: int = 1):
     if kind == "compute":
         from aiecost.benches import c4_mmul
 
-        shape = (4, 8, 8, "int8", "int8")
+        shape = COMPUTE_SHAPES[dtype]
         iters = 1_600_000
         built = c4_mmul.build(shape, iters, cache, cores=cores)
         if not built:
             return None
         # Every core runs the same chain concurrently, so MACs scale with cores.
-        macs = iters * c4_mmul.CHAINS * 4 * 8 * 8 * cores
+        m, k, n = shape[0], shape[1], shape[2]
+        macs = iters * c4_mmul.CHAINS * m * k * n * cores
         return {"kind": kind, "built": built, "shape": shape, "cores": cores,
                 "macs_per_dispatch": macs, "bytes_per_dispatch": 0}
     from aiecost.benches import c2_feed
@@ -255,7 +265,8 @@ def sustained_run(k: dict, seconds: float, rate: float = 0.0) -> tuple[int, floa
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--kernel", choices=["compute", "feed", "null"], default="compute")
-    p.add_argument("--cores", type=int, default=1, help="compute kernel only: NPU cores (H4 caps BOs at 5, so <=4)")
+    p.add_argument("--cores", type=int, default=1, help="compute kernel only: NPU cores (broadcast+join reaches all 16)")
+    p.add_argument("--dtype", choices=["int8", "int4"], default="int8", help="compute kernel operand pair")
     p.add_argument("--seconds", type=float, default=8.0)
     p.add_argument("--rate", type=float, default=0.0,
                    help="pad to this dispatch/s so host submit work is matched across kernels (0 = free-run)")
@@ -267,10 +278,10 @@ def main() -> int:
         print("RAPL package energy unreadable (needs passwordless sudo). Cannot measure energy.")
         return 1
 
-    print(f"E1 energy — kernel={args.kernel} cores={args.cores} window={args.seconds}s rate={args.rate or 'free'}")
+    print(f"E1 energy — kernel={args.kernel} dtype={args.dtype} cores={args.cores} window={args.seconds}s rate={args.rate or 'free'}")
     print(f"  RAPL: {RAPL}\n  PPT : {PPT}\n")
 
-    k = build_kernel(args.kernel, Path(args.cache), args.cores)
+    k = build_kernel(args.kernel, Path(args.cache), args.cores, args.dtype)
     if not k:
         print("build failed")
         return 1

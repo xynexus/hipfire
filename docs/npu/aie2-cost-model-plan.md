@@ -603,14 +603,20 @@ raw probe records are under
 
 ## 12. Energy (E1/G1) and the NPU-vs-GPU split
 
-### The energy law: one external byte costs 37 MACs
+### The energy law: one external byte costs 183 MACs (int8) / 401 (int4)
 
 Matched-rate marginals on npu1 (`benches/e1_energy.py`), RAPL package-0
-integration, null kernel subtracted so the host submit loop cancels:
+integration, null kernel subtracted so the host submit loop cancels. J/MAC is
+measured at **16 cores** (median of 7 int8 / 3 int4 runs):
 
-    J/byte = 1.9508e-10   (5.13 GB/J)
-    J/MAC  = 5.3227e-12   (187.9 G MACs/J)   [1 core]
-    => break-even arithmetic intensity ~= 37 MACs per byte fed
+    J/byte              = 1.9508e-10   (5.13 GB/J)
+    J/MAC  int8 x int8  = 1.0659e-12   (938 G MACs/J)   -> break-even 183 MACs/byte
+    J/MAC  int8 x int4  = 4.8671e-13   (2055 G MACs/J)  -> break-even 401 MACs/byte
+
+**This supersedes an earlier "1 byte = 37 MACs" law, which was an artifact.**
+That figure divided by the **1-core** J/MAC (5.32e-12), where the fixed 0.36 W
+dominates and each MAC looks 5.5× more expensive than it is at full width. The
+law was measured on an under-parallelised bench.
 
 **Matched rate is load-bearing.** Free-running, package power tracks dispatch
 *rate*, not work: a null NPU kernel at 4326 dispatch/s burns 10.343 W doing
@@ -623,24 +629,37 @@ There is **no NPU power sensor** — energy is a package delta on a shared-rail
 APU and must never be reported as "NPU power". PPT (amdgpu hwmon) is unusable:
 it read 11.0 W idle and 5.5 W under load.
 
+### int4 energy: measured, not assumed
+
+The model previously **assumed** int4 halves J/MAC (2× MACs per native VMAC, per
+C4). Measured at 16 cores: int4 does 2× the MACs (52.4 vs 26.2 G/dispatch) for
+slightly *less* power (1.276 vs 1.397 W) → **2.19×**, interval ≈[1.93, 2.45].
+The assumed 2.0× sits inside that range: validated, slightly conservative. The
+model now reads a measured per-dtype constant instead of halving.
+
+**This is arch-specific.** §11 found W4A8 gives **no** compute win on AIE2P. On
+AIE2 int4 wins ~2× on *both* speed (512 vs 256 MACs/native VMAC) and energy
+(2.19×). Do not carry either result across generations.
+
 ### Where the two LLM phases land
 
-| phase | AI (MACs/byte) | energy set by | lever |
-|---|---|---|---|
-| prefill (M=256) | 82–101 | **compute** | MMUL rate (int4 = 2×) |
-| decode (M=1) | 1.0 | **movement** (37×) | bit width (KVarN/OQ4) |
+| phase | AI (MACs/byte) | break-even | energy set by | lever |
+|---|---|---|---|---|
+| prefill (M=256) | 82–101 | 183 | **movement** | bit width |
+| decode (M=1) | 1.0 | 183 | **movement** (183×) | bit width |
 
-This is why power- and speed-shaped kernels diverge: **the currency changes**.
-int4's 2× MMUL rate is an energy win on prefill and worth nothing on decode;
-KVarN-4bit is exactly the reverse.
+**Both phases are movement-dominated on npu1** — a direct consequence of the
+corrected law. Under the old 37 figure prefill looked compute-dominated; at 183
+it is not. The array is simply very efficient (938 G MACs/J) relative to DDR
+bytes (5.13 GB/J), so a kernel needs AI > 183 before arithmetic dominates its
+energy at all, and the LLM hot path does not get close.
 
-And they select different schedules. M=256 QKV projection:
-
-    c4  265.2 us  1.940 mJ   <- speed-optimal
-    c1  484.3 us  1.825 mJ   <- energy-optimal (1.83x slower, 6% less energy)
-
-because broadcasting activations across 4 columns replicates bytes that cost
-37 MACs each.
+The practical reading: **on npu1, energy is bytes.** int4's 2× MMUL rate is
+mostly a *speed* lever; its energy value comes from halving the weight bytes,
+not from the faster MMUL. A schedule that replicates bytes to go faster is
+trading energy for latency — e.g. the M=256 QKV projection, where c4 is
+speed-optimal (265.2 µs) and c1 is energy-optimal, because broadcasting
+activations across 4 columns replicates bytes that cost 183 MACs each.
 
 ### NPU vs GPU (`benches/g1_gpu.py`)
 
@@ -726,8 +745,7 @@ GPU. That is the speed/power divergence restated at device granularity.
 
 - **tok/s device comparison** — only tok/J is settled. The speed verdict may
   invert the energy one; unmeasured.
-- int4 J/MAC — E1 measured int8 only; the model halves it as a flagged
-  assumption. Note §11's AIE2P finding that W4A8 gives no compute win there —
-  the AIE2 int4 energy assumption deserves the same scrutiny.
+- **A dual-objective (tok/s x tok/J) sweep in `design.py`** — the two objectives
+  now provably pick different schedules; the search still ranks on time only.
 - CPU as a third target.
 - A dual-objective (tok/s × tok/J) sweep in `design.py`.

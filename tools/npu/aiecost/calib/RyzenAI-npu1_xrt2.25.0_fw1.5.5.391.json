@@ -526,6 +526,84 @@
         "reference only"
       ],
       "measured_utc": "2026-07-17T09:19:23+00:00"
+    },
+    "j_per_mac_int8_int8_16core": {
+      "name": "j_per_mac_int8_int8_16core",
+      "value": 1.0658708164570455e-12,
+      "unit": "J/MAC",
+      "bench": "E1",
+      "method": "16-core VMAC chain, matched-rate marginal over null, median of 7 runs",
+      "admissible": true,
+      "evidence": [
+        "int8 x int8 <4,8,8>, 16 cores, 7 runs: median 938.2 G MACs/J, range 869-1035 (+/-9%)",
+        "int8 x int4 <4,16,8>, 16 cores, 3 runs: median 2054.6 G MACs/J, range 1900-2222 (+/-8%)",
+        "ratio 2.19x \u2014 int4 does 2x the MACs (52.4 vs 26.2 G/dispatch) for slightly LESS power (1.276 vs 1.397 W)",
+        "matched rate 50/s, RAPL package-0, null-subtracted; broadcast+join topology across all 16 cores"
+      ],
+      "caveats": [
+        "combined noise puts the ratio interval at roughly [1.93, 2.45]; the model previously ASSUMED exactly 2.0x, which sits inside that range \u2014 the assumption is validated, if slightly conservative.",
+        "CONTRAST WITH AIE2P: 8bf799233 found W4A8 gives NO compute win on AIE2P. On AIE2 int4 wins ~2x on BOTH speed (C4: 512 vs 256 MACs/native VMAC) and energy (2.19x). The int4 lever is arch-specific \u2014 do not carry either result across generations.",
+        "package delta on shared rails; not NPU-only power"
+      ],
+      "measured_utc": "2026-07-17T09:30:30+00:00"
+    },
+    "j_per_mac_int8_int4_16core": {
+      "name": "j_per_mac_int8_int4_16core",
+      "value": 4.867127421395892e-13,
+      "unit": "J/MAC",
+      "bench": "E1",
+      "method": "16-core int8xint4 mmul<4,16,8> chain, matched-rate marginal over null, median of 3 runs",
+      "admissible": true,
+      "evidence": [
+        "int8 x int8 <4,8,8>, 16 cores, 7 runs: median 938.2 G MACs/J, range 869-1035 (+/-9%)",
+        "int8 x int4 <4,16,8>, 16 cores, 3 runs: median 2054.6 G MACs/J, range 1900-2222 (+/-8%)",
+        "ratio 2.19x \u2014 int4 does 2x the MACs (52.4 vs 26.2 G/dispatch) for slightly LESS power (1.276 vs 1.397 W)",
+        "matched rate 50/s, RAPL package-0, null-subtracted; broadcast+join topology across all 16 cores"
+      ],
+      "caveats": [
+        "combined noise puts the ratio interval at roughly [1.93, 2.45]; the model previously ASSUMED exactly 2.0x, which sits inside that range \u2014 the assumption is validated, if slightly conservative.",
+        "CONTRAST WITH AIE2P: 8bf799233 found W4A8 gives NO compute win on AIE2P. On AIE2 int4 wins ~2x on BOTH speed (C4: 512 vs 256 MACs/native VMAC) and energy (2.19x). The int4 lever is arch-specific \u2014 do not carry either result across generations.",
+        "package delta on shared rails; not NPU-only power"
+      ],
+      "measured_utc": "2026-07-17T09:30:30+00:00"
+    },
+    "byte_mac_energy_ratio_int8_int8": {
+      "name": "byte_mac_energy_ratio_int8_int8",
+      "value": 183.0,
+      "unit": "MACs/byte",
+      "bench": "E1",
+      "method": "J/byte divided by 16-core int8 J/MAC",
+      "admissible": true,
+      "evidence": [
+        "J/byte 1.9508e-10 (C2 feed, 4 columns) / J/MAC 16-core measured",
+        "int8 x int8: 1.9508e-10 / 1.0659e-12 = 183 MACs per byte",
+        "int8 x int4: 1.9508e-10 / 4.8671e-13 = 401 MACs per byte"
+      ],
+      "caveats": [
+        "SUPERSEDES the 36.7 figure, which divided by the 1-CORE J/MAC (5.32e-12). At 1 core the fixed 0.36 W dominates, making each MAC look 5.5x more expensive than it is at full width. The law was an artifact of an under-parallelised bench.",
+        "CONSEQUENCE: prefill (AI 82-101) is NOT compute-dominated as previously stated \u2014 it sits well below the 183 break-even, so on npu1 BOTH LLM phases are movement-dominated for energy. The array is simply very efficient (929 G MACs/J) relative to DDR bytes (5.13 GB/J).",
+        "a kernel needs AI > 183 (int8) or > 401 (int4) before arithmetic dominates its energy at all"
+      ],
+      "measured_utc": "2026-07-17T09:31:50+00:00"
+    },
+    "byte_mac_energy_ratio_int8_int4": {
+      "name": "byte_mac_energy_ratio_int8_int4",
+      "value": 400.8,
+      "unit": "MACs/byte",
+      "bench": "E1",
+      "method": "J/byte divided by 16-core int4 J/MAC",
+      "admissible": true,
+      "evidence": [
+        "J/byte 1.9508e-10 (C2 feed, 4 columns) / J/MAC 16-core measured",
+        "int8 x int8: 1.9508e-10 / 1.0659e-12 = 183 MACs per byte",
+        "int8 x int4: 1.9508e-10 / 4.8671e-13 = 401 MACs per byte"
+      ],
+      "caveats": [
+        "SUPERSEDES the 36.7 figure, which divided by the 1-CORE J/MAC (5.32e-12). At 1 core the fixed 0.36 W dominates, making each MAC look 5.5x more expensive than it is at full width. The law was an artifact of an under-parallelised bench.",
+        "CONSEQUENCE: prefill (AI 82-101) is NOT compute-dominated as previously stated \u2014 it sits well below the 183 break-even, so on npu1 BOTH LLM phases are movement-dominated for energy. The array is simply very efficient (929 G MACs/J) relative to DDR bytes (5.13 GB/J).",
+        "a kernel needs AI > 183 (int8) or > 401 (int4) before arithmetic dominates its energy at all"
+      ],
+      "measured_utc": "2026-07-17T09:31:50+00:00"
     }
   }
 }
