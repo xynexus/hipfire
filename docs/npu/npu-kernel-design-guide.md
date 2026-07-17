@@ -497,8 +497,9 @@ that output-tile area matters — never the values or the rankings.
 - ~~The true feed ceiling~~ **RESOLVED**: ~30.8 GB/s at 8 shim input streams,
   confirmed by measurement and the toolchain channel budget independently.
 - **CPU as a third target.**
-- **Dual-objective (tok/s × tok/J) search** — the objectives provably diverge but
-  `design.py` still ranks on time alone.
+- ~~Dual-objective (tok/s × tok/J) search~~ **DONE**: `design.py` reports the
+  Pareto front, both optima, and the cost of choosing tok/J — with a 2%
+  tolerance so a sub-noise difference is not announced as a trade.
 - **C8** alignment penalty; **AM020** never fetched (H3/M2/M3/M4 remain
   wrong-generation).
 - Attention modelling excludes projections and assumes a device-resident cache.

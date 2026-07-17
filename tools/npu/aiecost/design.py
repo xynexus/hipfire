@@ -194,11 +194,49 @@ def _column_options(target) -> list[int]:
     return opts
 
 
-def rank_and_render(specs: list[ScheduleSpec], key: str, device: str, header: str) -> str:
+# Differences below this are not real: E1's energy marginals reproduce to ~±6-9%,
+# and the device-span gate is ±30%. Treating a 1% gap as a trade-off would claim a
+# distinction the model cannot support — the same error the validator made when it
+# scored predicted TIES as misorderings.
+TOL = 0.02
+
+
+def _better(a: float, b: float) -> bool:
+    """a beats b by more than tolerance."""
+    return a < b * (1.0 - TOL)
+
+
+def _worse(a: float, b: float) -> bool:
+    return a > b * (1.0 + TOL)
+
+
+def pareto_front(rows: list[tuple]) -> set[str]:
+    """Names of candidates not dominated on BOTH time and energy, within tolerance.
+
+    A candidate is dominated if another is no worse on either axis and clearly
+    better on one. Everything surviving is a real trade — a policy call (latency
+    vs battery) the model cannot settle. Ranking on time alone hides exactly
+    these; but calling a sub-tolerance difference a trade invents one.
+    """
+    front = set()
+    for s, p in rows:
+        dominated = any(
+            not _worse(q.device_s, p.device_s)
+            and not _worse(q.energy_j, p.energy_j)
+            and (_better(q.device_s, p.device_s) or _better(q.energy_j, p.energy_j))
+            for t, q in rows
+            if t.name != s.name
+        )
+        if not dominated:
+            front.add(s.name)
+    return front
+
+
+def rank_and_render(specs: list[ScheduleSpec], key: str, device: str, header: str,
+                    objective: str = "pareto") -> str:
     rows = [(s, model.predict(s, key, device)) for s in specs]
     ok = [(s, p) for s, p in rows if p.buildable and p.admissible]
     bad = [(s, p) for s, p in rows if not (p.buildable and p.admissible)]
-    ok.sort(key=lambda sp: sp[1].device_s)
 
     lines = [header, ""]
     if not ok:
@@ -207,20 +245,53 @@ def rank_and_render(specs: list[ScheduleSpec], key: str, device: str, header: st
             lines.append(f"    {s.name}: {'; '.join(p.build_errors or p.missing)}")
         return "\n".join(lines)
 
-    lines.append(f"  {'candidate':<40} {'device':>10} {'limiter':>9} {'TOPS':>7} {'energy':>9} {'AI':>7} {'E-bound':>9}")
+    key_fn = {"speed": lambda sp: sp[1].device_s, "energy": lambda sp: sp[1].energy_j}.get(
+        objective, lambda sp: sp[1].device_s
+    )
+    ok.sort(key=key_fn)
+    front = pareto_front(ok)
+    fastest = min(ok, key=lambda sp: sp[1].device_s)
+    cheapest = min(ok, key=lambda sp: sp[1].energy_j)
+
+    lines.append(f"  {'candidate':<38} {'device':>10} {'energy':>9} {'limiter':>9} {'AI':>6} {'E-bound':>9}  flags")
     for s, p in ok:
         ebound = "movement" if p.energy_terms.get("movement", 0) > p.energy_terms.get("compute", 0) else "compute"
-        lines.append(f"  {s.name:<40} {p.device_s * 1e6:>9.1f}u {p.limiter:>9} {p.useful_tops:>7.2f} "
-                     f"{p.energy_j * 1e3:>8.3f}m {p.arithmetic_intensity:>7.1f} {ebound:>9}")
+        flags = []
+        if s.name == fastest[0].name:
+            flags.append("FASTEST")
+        if s.name == cheapest[0].name:
+            flags.append("LOWEST-E")
+        if s.name not in front:
+            flags.append("dominated")
+        lines.append(f"  {s.name:<38} {p.device_s * 1e6:>9.1f}u {p.energy_j * 1e3:>8.3f}m {p.limiter:>9} "
+                     f"{p.arithmetic_intensity:>6.1f} {ebound:>9}  {' '.join(flags)}")
     if bad:
         lines.append("")
         for s, p in bad:
             why = p.build_errors[0] if p.build_errors else f"uncalibrated: {p.missing[0]}"
             lines.append(f"  REJECTED {s.name}: {why}")
 
+    # The trade, stated explicitly — but only if there IS one. Ranking on a single
+    # objective buries a real trade; announcing a sub-tolerance one invents it.
+    lines.append("")
+    dt = cheapest[1].device_s / fastest[1].device_s
+    de = fastest[1].energy_j / cheapest[1].energy_j if cheapest[1].energy_j else 1.0
+    if fastest[0].name == cheapest[0].name:
+        lines.append(f"  NO TRADE: {fastest[0].name} is both fastest and lowest-energy.")
+    elif de <= 1.0 + TOL:
+        lines.append(f"  NO MEANINGFUL TRADE: the lowest-energy candidate saves only {(de - 1) * 100:.1f}% "
+                     f"(under the {TOL * 100:.0f}% tolerance) while costing {dt:.2f}x the time.")
+        lines.append(f"  => take the fastest, {fastest[0].name}. Energy is flat across these candidates.")
+    else:
+        lines.append("  TRADE-OFF — the objectives pick DIFFERENT schedules:")
+        lines.append(f"    tok/s -> {fastest[0].name:<32} {fastest[1].device_s * 1e6:8.1f} us  {fastest[1].energy_j * 1e3:7.3f} mJ")
+        lines.append(f"    tok/J -> {cheapest[0].name:<32} {cheapest[1].device_s * 1e6:8.1f} us  {cheapest[1].energy_j * 1e3:7.3f} mJ")
+        lines.append(f"    cost of choosing tok/J: {dt:.2f}x slower for {de:.2f}x less energy")
+    lines.append(f"  Pareto front ({len(front)} of {len(ok)}, {TOL * 100:.0f}% tol): {', '.join(sorted(front))}")
+
     best_s, best_p = ok[0]
     lines.append("")
-    lines.append(f"  best: {best_s.name}")
+    lines.append(f"  breakdown of the {objective}-optimal candidate: {best_s.name}")
     for k, v in sorted(best_p.terms.items(), key=lambda kv: -kv[1]):
         mark = "  <== limiter" if k == best_p.limiter else ""
         lines.append(f"    {k:<10} {v * 1e6:9.2f} us{mark}")
@@ -232,6 +303,8 @@ def rank_and_render(specs: list[ScheduleSpec], key: str, device: str, header: st
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--device", default="auto", choices=["auto", "npu1", "npu2"])
+    p.add_argument("--objective", default="pareto", choices=["pareto", "speed", "energy"],
+                   help="which objective to sort by; the trade-off and Pareto front are always reported")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     g = sub.add_parser("gemm", help="rank schedules for a projection GEMM")
@@ -261,7 +334,7 @@ def main() -> int:
         hdr = (f"GEMM {args.m}x{args.k}x{args.n} int8 x int{args.weight_bits} on {target.key} "
                f"({target.compute_columns} cols, {target.compute_cores} cores)\n"
                f"  {prob.total_macs / 1e6:.1f} M MACs, weights {prob.weight_bytes() / 1024:.0f} KiB")
-        print(rank_and_render(prob.candidates(target), key, args.device, hdr))
+        print(rank_and_render(prob.candidates(target), key, args.device, hdr, args.objective))
         return 0
 
     if args.cmd == "attn":
@@ -269,7 +342,7 @@ def main() -> int:
         hdr = (f"decode attention, 1 layer, ctx={args.context} kv_heads={args.kv_heads} "
                f"head_dim={args.head_dim} kvarn{args.kv_bits} on {target.key}\n"
                f"  KV bytes/layer {prob.kv_bytes() / 1024:.0f} KiB, {prob.total_macs / 1e6:.1f} M MACs")
-        print(rank_and_render(prob.candidates(target), key, args.device, hdr))
+        print(rank_and_render(prob.candidates(target), key, args.device, hdr, args.objective))
         return 0
 
     # kv-sweep: the KVarN question, answered per-layer then scaled to the model.
