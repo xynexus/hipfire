@@ -1,0 +1,72 @@
+{
+  "isa": {
+    "(4, 8, 8, 'int8', 'int8')": {
+      "compiles": true,
+      "loop_vmac": 4,
+      "unroll": 1,
+      "mac_calls": 4,
+      "vmac_per_call": 1.0,
+      "macs_per_call": 256,
+      "macs_per_vmac": 256.0,
+      "native": true,
+      "ta": "int8",
+      "tb": "int8"
+    },
+    "(8, 8, 8, 'int8', 'int8')": {
+      "compiles": true,
+      "loop_vmac": 4,
+      "unroll": 1,
+      "mac_calls": 4,
+      "vmac_per_call": 1.0,
+      "macs_per_call": 512,
+      "macs_per_vmac": 512.0,
+      "native": true,
+      "ta": "int8",
+      "tb": "int8"
+    },
+    "(2, 8, 8, 'int8', 'int8')": {
+      "compiles": true,
+      "loop_vmac": 4,
+      "unroll": 1,
+      "mac_calls": 4,
+      "vmac_per_call": 1.0,
+      "macs_per_call": 128,
+      "macs_per_vmac": 128.0,
+      "native": true,
+      "ta": "int8",
+      "tb": "int8"
+    },
+    "(4, 16, 8, 'int8', 'int4')": {
+      "compiles": false,
+      "error": "  750 | #define STATIC_ASSERT_CONSTANT_EXPRESSION(e, m) do { if (!chess_manifest(e)) chess_error(m); } while (0)"
+    },
+    "(8, 16, 8, 'int8', 'int4')": {
+      "compiles": false,
+      "error": "  750 | #define STATIC_ASSERT_CONSTANT_EXPRESSION(e, m) do { if (!chess_manifest(e)) chess_error(m); } while (0)"
+    },
+    "(4, 32, 8, 'int8', 'int4')": {
+      "compiles": false,
+      "error": "  750 | #define STATIC_ASSERT_CONSTANT_EXPRESSION(e, m) do { if (!chess_manifest(e)) chess_error(m); } while (0)"
+    }
+  },
+  "hw": {
+    "(4, 8, 8, 'int8', 'int8')": {
+      "slope": 4.039996964285716e-09,
+      "macs_s": 253465536992.31464,
+      "vmac_s": 990099753.876229,
+      "macs_per_cycle": 151.2471176957579
+    },
+    "(8, 8, 8, 'int8', 'int8')": {
+      "slope": 3.825411071428569e-09,
+      "macs_s": 535367300862.4379,
+      "vmac_s": 1045639259.4969491,
+      "macs_per_cycle": 319.4626067308573
+    },
+    "(2, 8, 8, 'int8', 'int8')": {
+      "slope": 3.94919625e-09,
+      "macs_s": 129646633792.88887,
+      "vmac_s": 1012864326.5069443,
+      "macs_per_cycle": 77.36231091932015
+    }
+  }
+}

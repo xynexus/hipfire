@@ -46,6 +46,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from aiecost import env  # noqa: E402
+from aiecost.target import include_dirs, resolve_program, resolve_target  # noqa: E402
 
 env.bootstrap()
 
@@ -56,7 +57,6 @@ KERNEL_SRC = HERE / "k1_vmac_chain.cc"
 
 _mlir_pkg = next((Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None)
 AIE_INCLUDE = _mlir_pkg / "mlir_aie" / "include" if _mlir_pkg else None
-AIE_RUNTIME_LIB = _mlir_pkg / "mlir_aie" / "aie_runtime_lib" / "AIE2" if _mlir_pkg else None
 PEANO = next((Path(p) / "llvm-aie" for p in sys.path if (Path(p) / "llvm-aie").is_dir()), None)
 
 CHAINS = 4
@@ -87,14 +87,14 @@ def sizes(shape) -> dict:
     }
 
 
-def isa_probe(shape, tmpdir: Path) -> dict:
+def isa_probe(shape, tmpdir: Path, target) -> dict:
     """Compile + disassemble only. Returns vmac counts; no hardware needed."""
     m, k, n = shape[0], shape[1], shape[2]
     s_ = sizes(shape)
     obj = tmpdir / f"c4_{m}{k}{n}_{s_['ta']}{s_['tb']}.o"
     dis = tmpdir / f"c4_{m}{k}{n}_{s_['ta']}{s_['tb']}.dis"
     cmd = [
-        str(PEANO / "bin" / "clang"), "--target=aie2-none-unknown-elf", "-std=c++20",
+        str(PEANO / "bin" / "clang"), f"--target={target.target_arch}-none-unknown-elf", "-std=c++20",
         f"-I{AIE_INCLUDE}", "-O2", "-DITERS=1000", f"-DCHAINS={CHAINS}",
         f"-DMR={m}", f"-DMK={k}", f"-DMN={n}", f"-DTA={s_['ta']}", f"-DTB={s_['tb']}",
         "-c", str(KERNEL_SRC), "-o", str(obj),
@@ -144,15 +144,14 @@ def isa_probe(shape, tmpdir: Path) -> dict:
     }
 
 
-def build(shape, iters: int, out_dir: Path) -> tuple[Path, Path] | None:
+def build(shape, iters: int, out_dir: Path, target) -> tuple[Path, Path] | None:
     from aie.iron import ObjectFifo, Program, Runtime, Worker
-    from aie.iron.device import NPU1
     from aie.iron.kernel import ExternalFunction
-    from aie.iron.placers import SequentialPlacer
     from aie.utils import set_current_device
     from aie.utils.compile import compile_external_kernel, compile_mlir_module
 
-    set_current_device(NPU1())
+    iron_device = target.iron_device()
+    set_current_device(iron_device)
     m, k, n = shape[0], shape[1], shape[2]
     s = sizes(shape)
     # Buffers are declared in BYTES as int8 memrefs; the kernel reinterprets the
@@ -162,7 +161,7 @@ def build(shape, iters: int, out_dir: Path) -> tuple[Path, Path] | None:
     out_n = 8 + s["size_C"] + 8  # kernel stores counters at [0..3] then a size_C vector at +8
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    tag = f"{m}{k}{n}-{s['ta']}{s['tb']}-i{iters}"
+    tag = f"{target.cache_tag}-{m}{k}{n}-{s['ta']}{s['tb']}-i{iters}"
     xclbin, insts = out_dir / f"c4-{tag}.xclbin", out_dir / f"c4-{tag}-insts.bin"
     if xclbin.exists() and insts.exists():
         return xclbin, insts
@@ -173,7 +172,7 @@ def build(shape, iters: int, out_dir: Path) -> tuple[Path, Path] | None:
 
     kern = ExternalFunction(
         "k1_vmac_chain", source_file=str(KERNEL_SRC), arg_types=[A, B, O],
-        include_dirs=[str(AIE_INCLUDE), str(AIE_RUNTIME_LIB)],
+        include_dirs=include_dirs(_mlir_pkg, target),
         compile_flags=["-std=c++20", "-O2", f"-DITERS={iters}", f"-DCHAINS={CHAINS}",
                        f"-DMR={m}", f"-DMK={k}", f"-DMN={n}", f"-DTA={s['ta']}", f"-DTB={s['tb']}"],
     )
@@ -195,10 +194,10 @@ def build(shape, iters: int, out_dir: Path) -> tuple[Path, Path] | None:
         rt.drain(fo.cons(), o, wait=True)
 
     try:
-        module = Program(NPU1(), rt).resolve_program(SequentialPlacer())
+        module = resolve_program(Program(iron_device, rt))
         with tempfile.TemporaryDirectory(prefix="aiecost_c4_") as tn:
             tmp = Path(tn)
-            compile_external_kernel(kern, tmp, target_arch="aie2")
+            compile_external_kernel(kern, tmp, target_arch=target.target_arch)
             compile_mlir_module(mlir_module=module, insts_path=tmp / "insts.bin",
                                 xclbin_path=tmp / "final.xclbin", work_dir=tmp)
             shutil.copy2(tmp / "final.xclbin", xclbin)
@@ -239,20 +238,22 @@ def main() -> int:
     p.add_argument("--cache", default=str(Path.home() / ".cache" / "hipfire-aiecost" / "c4"))
     p.add_argument("--save", action="store_true")
     p.add_argument("--json", metavar="PATH")
+    p.add_argument("--device", default="auto", choices=["auto", "npu1", "npu2"])
     args = p.parse_args()
 
     from aiecost import calib
 
+    target = resolve_target(args.device)
     consts = calib.load(calib.current_key())
     f_h = consts["f_h_hz"].value if "f_h_hz" in consts else None
 
-    print("C4 — MMUL shape: native or virtual?\n")
+    print(f"C4 — MMUL shape: native or virtual?  target={target.cache_tag}\n")
     print("ISA check (vmac emitted per source mac() call):")
     print(f"  {'shape':<24} {'loop vmac':>9} {'calls':>6} {'vmac/call':>9} {'MACs/call':>9} {'MACs/vmac':>9}  verdict")
     isa = {}
     with tempfile.TemporaryDirectory(prefix="aiecost_c4_isa_") as tn:
         for shape in SHAPES:
-            r = isa_probe(shape, Path(tn))
+            r = isa_probe(shape, Path(tn), target)
             isa[str(shape)] = r
             tag = f"<{shape[0]},{shape[1]},{shape[2]},{shape[3]},{shape[4]}>"
             if not r["compiles"]:
@@ -279,8 +280,9 @@ def main() -> int:
             line += f"   optimal shape <{best[0]},{best[1]},{best[2]}> (native, fills the VMAC)"
         print(line)
         if f_h:
-            print(f"{'':18}=> peak = 16 cores x {ceiling:.0f} x 2 x {f_h / 1e9:.3f} GHz = "
-                  f"{16 * ceiling * 2 * f_h / 1e12:.2f} TOPS")
+            cores = target.compute_cores
+            print(f"{'':18}=> peak = {cores} cores x {ceiling:.0f} x 2 x {f_h / 1e9:.3f} GHz = "
+                  f"{cores * ceiling * 2 * f_h / 1e12:.2f} TOPS")
     print("\n  Wider shapes within a family are decomposed into several native VMACs")
     print("  (VIRTUAL) and buy nothing; narrower ones under-fill the VMAC.")
 
@@ -295,7 +297,7 @@ def main() -> int:
             continue
         pts = []
         for it in args.iters:
-            built = build(shape, it, Path(args.cache))
+            built = build(shape, it, Path(args.cache), target)
             if not built:
                 break
             t = run(*built, shape, args.reps)
@@ -329,18 +331,29 @@ def main() -> int:
         ev = [f"{k}: vmac/call={isa[k]['vmac_per_call']:.2f}, MACs/vmac={isa[k]['macs_per_vmac']:.0f}"
               for k in isa if isa[k].get("compiles")]
         ev += [f"{k}: {v['macs_s'] / 1e9:.2f} G MACs/s/core ({v['macs_per_cycle']:.0f} MACs/cycle)" for k, v in hw.items()]
+        # The int8xint8 ceiling is measured, not assumed: it differs by generation
+        # (AIE2 <4,8,8>=256 native, <8,8,8> virtual; AIE2P both native, ceiling 512).
+        int8 = [isa[k] for k in isa if isa[k].get("compiles") and isa[k]["ta"] == "int8" and isa[k]["tb"] == "int8"]
+        int8_ceiling = max((x["macs_per_vmac"] for x in int8), default=256.0)
+        native_shapes = [f"<{x['shape'][0]},{x['shape'][1]},{x['shape'][2]}>" for x in int8 if x["native"]]
+        virtual_shapes = [f"<{x['shape'][0]},{x['shape'][1]},{x['shape'][2]}>" for x in int8 if not x["native"]]
+        native_note = f"native int8 shapes: {', '.join(native_shapes) or 'none'}"
+        if virtual_shapes:
+            native_note += f"; virtual (decompose, buy nothing): {', '.join(virtual_shapes)}"
         cs = {
             "cyc_per_vmac": calib.Constant(
                 name="cyc_per_vmac", value=1.0, unit="cycles", bench="C4",
-                method="ISA: 1 vmac per bundle in the unrolled chain loop; hardware: VMAC/s == f_H at saturation",
+                method="ISA: 1 vmac per bundle in the unrolled chain loop; hardware: MACs/s tracks the ISA vmac count",
                 admissible=True, evidence=ev,
-                caveats=["int8 x int8 only; other dtypes unmeasured"]),
+                caveats=[f"{target.tile_isa}: int8 x int8 measured; other dtypes as probed"]),
             "macs_per_native_vmac_int8": calib.Constant(
-                name="macs_per_native_vmac_int8", value=256.0, unit="MACs", bench="C4",
+                name="macs_per_native_vmac_int8", value=float(int8_ceiling), unit="MACs", bench="C4",
                 method="MACs per source mac() divided by native vmacs emitted, across mmul shapes",
                 admissible=True, evidence=ev,
-                caveats=["mmul<8,8,8> is VIRTUAL on AIE2: it emits 2 native VMACs, so it buys no throughput",
-                         "closes the plan's open lead — mmul<4,8,8> does NOT leave 2x on the table"]),
+                caveats=[
+                    native_note,
+                    f"peak int8 = {target.compute_cores} cores x {int8_ceiling:.0f} x 2 x f_H",
+                ]),
         }
         print(f"\n  saved -> {calib.save(key, cs)}")
     return 0

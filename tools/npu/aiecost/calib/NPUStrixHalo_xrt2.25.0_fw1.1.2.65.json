@@ -254,6 +254,47 @@
         "power mode must be recorded with every use"
       ],
       "measured_utc": "2026-07-17T07:57:48+00:00"
+    },
+    "cyc_per_vmac": {
+      "name": "cyc_per_vmac",
+      "value": 1.0,
+      "unit": "cycles",
+      "bench": "C4",
+      "method": "ISA: 1 vmac per bundle in the unrolled chain loop; hardware: MACs/s tracks the ISA vmac count",
+      "admissible": true,
+      "evidence": [
+        "(4, 8, 8, 'int8', 'int8'): vmac/call=1.00, MACs/vmac=256",
+        "(8, 8, 8, 'int8', 'int8'): vmac/call=1.00, MACs/vmac=512",
+        "(2, 8, 8, 'int8', 'int8'): vmac/call=1.00, MACs/vmac=128",
+        "(4, 8, 8, 'int8', 'int8'): 253.47 G MACs/s/core (151 MACs/cycle)",
+        "(8, 8, 8, 'int8', 'int8'): 535.37 G MACs/s/core (319 MACs/cycle)",
+        "(2, 8, 8, 'int8', 'int8'): 129.65 G MACs/s/core (77 MACs/cycle)"
+      ],
+      "caveats": [
+        "AIE2P: int8 x int8 measured; other dtypes as probed"
+      ],
+      "measured_utc": "2026-07-17T08:29:00+00:00"
+    },
+    "macs_per_native_vmac_int8": {
+      "name": "macs_per_native_vmac_int8",
+      "value": 512.0,
+      "unit": "MACs",
+      "bench": "C4",
+      "method": "MACs per source mac() divided by native vmacs emitted, across mmul shapes",
+      "admissible": true,
+      "evidence": [
+        "(4, 8, 8, 'int8', 'int8'): vmac/call=1.00, MACs/vmac=256",
+        "(8, 8, 8, 'int8', 'int8'): vmac/call=1.00, MACs/vmac=512",
+        "(2, 8, 8, 'int8', 'int8'): vmac/call=1.00, MACs/vmac=128",
+        "(4, 8, 8, 'int8', 'int8'): 253.47 G MACs/s/core (151 MACs/cycle)",
+        "(8, 8, 8, 'int8', 'int8'): 535.37 G MACs/s/core (319 MACs/cycle)",
+        "(2, 8, 8, 'int8', 'int8'): 129.65 G MACs/s/core (77 MACs/cycle)"
+      ],
+      "caveats": [
+        "native int8 shapes: <4,8,8>, <8,8,8>, <2,8,8>",
+        "peak int8 = 32 cores x 512 x 2 x f_H"
+      ],
+      "measured_utc": "2026-07-17T08:29:00+00:00"
     }
   }
 }
