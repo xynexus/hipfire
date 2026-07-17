@@ -414,10 +414,13 @@ def main() -> int:
 
         key = calib.current_key()
         cps = lc["cycles_per_iter"]
+        # Built outside the f-string: nesting the same quote character inside an
+        # f-string needs Python 3.12, and pyproject targets py311 (ruff E-syntax).
+        nativeness = "native" if lc["native"] else f"{lc['vmac_per_call']:.2f}/mac()"
         evidence = [
             f"ISA: mmul<{mr},8,8> int8 loop = {lc['cycles']} bundles, unroll {lc['unroll']} "
             f"-> {cps:.1f} cyc/iter, {lc['vmac']} vmac "
-            f"({'native' if lc['native'] else f'{lc['vmac_per_call']:.2f}/mac()'}), "
+            f"({nativeness}), "
             f"count taken at packed chains={best}"
         ]
         evidence += [

@@ -345,6 +345,72 @@
         "dense int8 peak = 16 x 256 x 2 x 1.015 GHz = 8.31 TOPS \u2014 HALF the ~16 TOPS figure"
       ],
       "measured_utc": "2026-07-17T05:19:29+00:00"
+    },
+    "j_per_byte_external": {
+      "name": "j_per_byte_external",
+      "value": 1.9508e-10,
+      "unit": "J/byte",
+      "bench": "E1",
+      "method": "matched-rate marginal of C2 feed kernel over null, per external byte",
+      "admissible": true,
+      "evidence": [
+        "matched-rate 50 disp/s, 500 dispatches, 10 s windows, RAPL package-0 integration",
+        "null 0.337 W / feed 0.664 W / compute 0.773 W package delta; marginals subtract null so host submit cancels",
+        "feed marginal 0.327 W = 6.546 mJ/dispatch over 33.6 MB -> 1.9508e-10 J/byte (5.13 GB/J)",
+        "compute marginal 0.436 W = 8.721 mJ/dispatch over 1.638 G MACs -> 5.3227e-12 J/MAC (187.9 G MACs/J)"
+      ],
+      "caveats": [
+        "PACKAGE-DELTA basis on an APU: CPU+GPU+NPU share rails and there is no NPU power sensor. Never report as NPU power.",
+        "MATCHED RATE IS LOAD-BEARING. Free-running, package power tracks dispatch rate: a null kernel at 4326/s burns 10.343 W doing nothing, vs compute 1.082 W at 133/s. Free-run even INVERTS the ordering (free-run says feed >> compute; matched-rate says compute > feed). Any energy number taken without rate matching is measuring the host submit loop.",
+        "measured at pmode=default; f_H is pmode-invariant (turbo is a no-op) but energy may not be",
+        "feed = external DDR->array DMA (C2 tile stream). Does not cover memtile->core or core->core movement."
+      ],
+      "measured_utc": "2026-07-17T08:35:24+00:00"
+    },
+    "j_per_mac_int8": {
+      "name": "j_per_mac_int8",
+      "value": 5.3227e-12,
+      "unit": "J/MAC",
+      "bench": "E1",
+      "method": "matched-rate marginal of K1/C4 VMAC chain over null, per int8 MAC",
+      "admissible": true,
+      "evidence": [
+        "matched-rate 50 disp/s, 500 dispatches, 10 s windows, RAPL package-0 integration",
+        "null 0.337 W / feed 0.664 W / compute 0.773 W package delta; marginals subtract null so host submit cancels",
+        "feed marginal 0.327 W = 6.546 mJ/dispatch over 33.6 MB -> 1.9508e-10 J/byte (5.13 GB/J)",
+        "compute marginal 0.436 W = 8.721 mJ/dispatch over 1.638 G MACs -> 5.3227e-12 J/MAC (187.9 G MACs/J)"
+      ],
+      "caveats": [
+        "PACKAGE-DELTA basis on an APU: CPU+GPU+NPU share rails and there is no NPU power sensor. Never report as NPU power.",
+        "MATCHED RATE IS LOAD-BEARING. Free-running, package power tracks dispatch rate: a null kernel at 4326/s burns 10.343 W doing nothing, vs compute 1.082 W at 133/s. Free-run even INVERTS the ordering (free-run says feed >> compute; matched-rate says compute > feed). Any energy number taken without rate matching is measuring the host submit loop.",
+        "measured at pmode=default; f_H is pmode-invariant (turbo is a no-op) but energy may not be",
+        "feed = external DDR->array DMA (C2 tile stream). Does not cover memtile->core or core->core movement.",
+        "int8 x int8 via mmul<4,8,8>; int4 does 2x MACs per VMAC so J/MAC should halve \u2014 unmeasured"
+      ],
+      "measured_utc": "2026-07-17T08:35:24+00:00"
+    },
+    "byte_mac_energy_ratio": {
+      "name": "byte_mac_energy_ratio",
+      "value": 36.7,
+      "unit": "MACs/byte",
+      "bench": "E1",
+      "method": "J/byte divided by J/MAC \u2014 the break-even arithmetic intensity",
+      "admissible": true,
+      "evidence": [
+        "matched-rate 50 disp/s, 500 dispatches, 10 s windows, RAPL package-0 integration",
+        "null 0.337 W / feed 0.664 W / compute 0.773 W package delta; marginals subtract null so host submit cancels",
+        "feed marginal 0.327 W = 6.546 mJ/dispatch over 33.6 MB -> 1.9508e-10 J/byte (5.13 GB/J)",
+        "compute marginal 0.436 W = 8.721 mJ/dispatch over 1.638 G MACs -> 5.3227e-12 J/MAC (187.9 G MACs/J)",
+        "1.9508e-10 / 5.3227e-12 = 36.7"
+      ],
+      "caveats": [
+        "PACKAGE-DELTA basis on an APU: CPU+GPU+NPU share rails and there is no NPU power sensor. Never report as NPU power.",
+        "MATCHED RATE IS LOAD-BEARING. Free-running, package power tracks dispatch rate: a null kernel at 4326/s burns 10.343 W doing nothing, vs compute 1.082 W at 133/s. Free-run even INVERTS the ordering (free-run says feed >> compute; matched-rate says compute > feed). Any energy number taken without rate matching is measuring the host submit loop.",
+        "measured at pmode=default; f_H is pmode-invariant (turbo is a no-op) but energy may not be",
+        "feed = external DDR->array DMA (C2 tile stream). Does not cover memtile->core or core->core movement.",
+        "THE tok/J DESIGN LAW: below ~37 MACs per byte fed, energy is dominated by data movement, not arithmetic. Decode (AI~1) is 37x movement-dominated => bit-width is the energy lever. Prefill (AI~M) is compute-dominated => MMUL rate is the energy lever. This is why power-shaped and speed-shaped kernels diverge."
+      ],
+      "measured_utc": "2026-07-17T08:35:24+00:00"
     }
   }
 }

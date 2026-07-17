@@ -198,6 +198,42 @@ def predict(spec: ScheduleSpec, key: str | None = None, device: str = "auto") ->
     if spec.useful_macs and p.device_s > 0:
         p.useful_tops = spec.useful_macs * 2 / p.device_s / 1e12
 
+    # ── energy (E1) ──
+    # E = J/MAC * MACs + J/byte * bytes_moved. Both marginals were measured at a
+    # MATCHED dispatch rate with a null kernel subtracted, so the host submit loop
+    # cancels; free-running numbers track dispatch rate and even invert the
+    # compute-vs-feed ordering. The dispatch floor's own energy is NOT included:
+    # it is rate-dependent and a real runtime would not spin like the bench does.
+    j_mac = consts.get("j_per_mac_int8")
+    j_byte = consts.get("j_per_byte_external")
+    if j_mac and j_byte and j_mac.admissible and j_byte.admissible:
+        macs = spec.useful_macs
+        # int4 packs 2x the MACs into one VMAC, so the per-MAC energy should halve.
+        # Unmeasured (E1 only ran int8) — applied as an explicit, flagged model
+        # assumption rather than silently using the int8 number for int4.
+        jm = j_mac.value
+        if spec.dtype_b == "int4":
+            jm = j_mac.value / 2.0
+            p.assumptions.append("j_per_mac halved for int4 (2x MACs/VMAC); E1 measured int8 only — unverified")
+        bytes_moved = spec.wire_bytes_in + spec.output_bytes
+        p.energy_terms = {"compute": jm * macs, "movement": j_byte.value * bytes_moved}
+        p.energy_j = sum(p.energy_terms.values())
+        p.arithmetic_intensity = macs / bytes_moved if bytes_moved else float("inf")
+
+        ratio = consts.get("byte_mac_energy_ratio")
+        if ratio and p.arithmetic_intensity < ratio.value:
+            p.advice.append(
+                f"ENERGY: AI={p.arithmetic_intensity:.1f} MACs/byte is below the {ratio.value:.0f} break-even — "
+                f"energy is MOVEMENT-dominated ({p.energy_terms['movement'] / p.energy_j * 100:.0f}%). "
+                "Narrower weights/KV cut energy; a faster MMUL does not."
+            )
+        elif ratio:
+            p.advice.append(
+                f"ENERGY: AI={p.arithmetic_intensity:.1f} MACs/byte exceeds the {ratio.value:.0f} break-even — "
+                f"energy is COMPUTE-dominated ({p.energy_terms['compute'] / p.energy_j * 100:.0f}%). "
+                "A faster/wider MMUL cuts energy; narrower weights mostly do not."
+            )
+
     p.limiter = max((("t_feed", feed_side), ("t_core", core), ("t_drain", drain)), key=lambda kv: kv[1])[0]
     # The receiver stalls whenever the consumer cannot keep up with the feed.
     p.stall_fraction = 0.0 if steady <= 0 else max(0.0, (steady - feed_side) / steady)
