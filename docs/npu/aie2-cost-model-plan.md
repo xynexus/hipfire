@@ -464,16 +464,108 @@ took the errors from −0.3…−30.9% to −0.4…−9.0%.
 `refit.systematic()` now detects this class of error across residuals, because
 the per-point diagnosis had confidently blamed the wrong thing (C2's bandwidth).
 
+### C4 (done) — the "2× on the table" lead was WRONG, and is now closed
+
+The lead was: K1 implies `mmul<4,8,8>` (256 MACs/VMAC) gives 8.3 TOPS while the
+~16 TOPS claim needs 512, and aie2p used 8×8×8 — so maybe a wider native shape
+exists. **It does not.** `aie::mmul<8,8,8>` compiles on AIE2 but is a **virtual**
+instruction: the API decomposes it into two native 256-MAC VMACs.
+
+Two independent checks agree (`benches/c4_mmul.py`):
+
+| shape | vmac/call (ISA) | MACs/vmac | ns/iter (HW) | G MACs/s | verdict |
+|---|---|---|---|---|---|
+| `<4,8,8>` | 1.00 | **256** | 3.819 | 268.2 | NATIVE, fills the VMAC |
+| `<8,8,8>` | 2.00 | 256 | **7.937** | 258.1 | VIRTUAL — 2× the time, same MACs/s |
+| `<4,16,8>` | 2.00 | 256 | 7.859 | 260.6 | VIRTUAL |
+| `<2,8,8>` | 1.00 | 128 | 3.943 | 129.9 | native but half-fills the VMAC |
+| `<4,8,16>` | — | — | — | — | does not compile (static assert) |
+
+Disassembly counts `vmac` in the unrolled chain loop; hardware measures the ITERS
+slope. They agree: **every full-width shape lands at ~256 MACs/cycle/core**, and
+`<8,8,8>` costs exactly 2× per call for 2× the MACs. A wider `aie::mmul` is
+source-level sugar.
+
+**"Virtual" is throughput-neutral, not harmful** — a distinction worth stating
+because it is easy to get backwards. `<4,16,8>`=520.09, `<4,32,8>`=524.98,
+`<8,16,8>`=522.82 G MACs/s: a virtual shape costs N× the issue slots and returns
+N× the MACs. Its real cost is **accumulator registers** (`C_block` holds N
+accums), which leaves fewer registers for the independent chains that hide VMAC
+latency — exactly why R0 found 2×2 mmul optimal. The genuinely lossy case is
+**under-filling**: `<2,8,8>` gets 128 of 256 MACs per issue and throws away half.
+
+**Consequences:**
+
+1. **`mmul<4,8,8>` is already optimal for int8×int8 on AIE2.** No 2× is available
+   *within that dtype pair*. `cyc_per_vmac=1.0` is now measured, not assumed.
+2. This is why aie2p's 8×8×8 does not carry over: on AIE2P that shape is native
+   (512 MACs/VMAC); on AIE2 it is emulated.
+
+Method note: the `C_block<..., N>` template parameter in `mmul_8_4.hpp` looks
+like a native-op count and mostly is, but it says `1` for `<4,32,8>` while the
+disassembly shows 2 vmac/call. **The ISA is the truth; the header is a hint.**
+
+### The ~16 TOPS figure resolved: it is int8×int4, not dense int8
+
+Dense int8×int8 peaks at 8.31 TOPS, half the marketing number. Two candidate
+explanations were tested and only one survived.
+
+**Clock — ruled out.** Unlike halo (password-gated sudo), this box has
+passwordless sudo, so `xrt-smi configure --pmode turbo` was testable for the
+first time. K1 re-run under turbo: **988.5 MHz vs default's 1019.3 MHz** — a
+no-op, 3% slower and within noise. This matches halo's finding exactly (turbo
+15.21 vs 15.7 TOPS: "compute clock already maxed under load"). pmode restored to
+`default` afterwards.
+
+**Operand width — confirmed.** `aie::mmul` has a separate `mmul_8_4` family for
+int8×int4 with its **own shape set** (`4×16×8`, `8×16×8`, `4×32×8` — the int8
+shapes are invalid for it, which is why a first probe using `<4,8,8,int8,int4>`
+wrongly looked like "int4 unsupported").
+
+| pair | ceiling | optimal shape | HW MACs/cycle | peak |
+|---|---|---|---|---|
+| int8 × int8 | 256 MACs/VMAC | `<4,8,8>` | 254.9 | 8.31 TOPS |
+| **int8 × int4** | **512 MACs/VMAC** | **`<4,16,8>`** | **512.4** | **16.63 TOPS** |
+
+`<4,16,8,int8,int4>` is native — 1 vmac/call for 512 MACs — and hardware confirms
+520.09 G MACs/s = 512.4 MACs/cycle, exactly 2× int8×int8. **VMAC/s stays
+~1.01–1.03 G across every shape and every dtype**: the issue rate is pinned at
+f_H and only MACs-per-VMAC changes. 16 × 512 × 2 × 1.015 GHz = **16.63 TOPS**,
+matching the ~16 TOPS claim.
+
+**This matters for hipfire directly**: OQ4/MQ4 are 4-bit weight formats, so the
+quant path is exactly the int8×int4 case and gets the 2×. The dense-int8 path
+does not. Any plan that assumes 16 TOPS for int8×int8 is 2× optimistic; any plan
+that assumes 8.31 for the OQ4 path leaves half the machine unused.
+
 ### Not done
 
-- **C4** (cyc_mmul per dtype/shape) — `cyc_per_vmac=1.0` is carried as a
-  *documented assumption* from K1's disassembly, surfaced on every prediction.
 - **C8** (alignment penalty) — only affects specs with `aligned_loads=False`.
 - **AM020** — §6's fetch list is untouched; H3/M2/M3/M4 remain wrong-generation.
+- **int4×int4, bf16, sparsity** — unmeasured; `mmul_bf16_bf16.hpp` and
+  `mmul_16_8/16_16/8_16` families exist and would extend the table.
 
-### Open lead worth chasing
+### Model corrections applied
 
-K1's TOPS cross-check implies **`mmul<4,8,8>` (256 MACs/VMAC) leaves 2× on the
-table**: 16 cores × 512 × 2 × 1.015 GHz = 16.6 TOPS matches the ~16 TOPS claim,
-while 256 gives 8.3. aie2p's corpus used 8×8×8=512. Confirming which int8 shapes
-AIE2 supports is the highest-value next measurement (C4).
+`t_core` assumed 256 MACs/VMAC for everything, which would have mispredicted
+every OQ4/MQ4 kernel by 2×. Fixed:
+
+- `ScheduleSpec` now carries `dtype_a`/`dtype_b`, and counts **source-level
+  `mmul_calls_per_core`** rather than native VMACs. The old field made the
+  *caller* responsible for knowing that `<8,8,8>` costs two VMACs — getting that
+  wrong was a silent 2×.
+- `model.py` derives `native_vmacs_per_call = ceil(macs_per_call / ceiling)`
+  where the ceiling comes from C4 keyed by operand-type pair. That one line
+  reproduces every measured C4 row, including `<2,8,8>`'s `ceil(0.5)=1`.
+- Predictions now carry **actionable advice**: virtual shapes (with the correct
+  neutral framing), under-filled VMACs (real loss), and the int4 2× when a spec
+  uses int8×int8 — qualified with "only if `t_core` is the limiter".
+
+Verified: same total MACs, `t_core` 3.027 µs (int8×int8 `<4,8,8>`) → 1.513 µs
+(OQ4 `<4,16,8>`), exactly half.
+
+**The honest caveat the model itself surfaces**: on the QKV-shaped schedule
+above, int4 changes device time by *nothing* — 191.6 µs either way — because
+`t_submit` (155 µs) and `t_feed` (36.6 µs) dominate and `t_core` is ~1.5–3 µs.
+The 2× is real but invisible unless a schedule is actually compute-bound. That is
+the same lesson as R117, arriving from the other direction.

@@ -60,7 +60,7 @@ class Candidate:
             bds_per_core=2,
             locks_per_core=2,
             fifo_depth=2,
-            vmacs_per_core=0,  # the sink kernel does no mmul
+            mmul_calls_per_core=0,  # the sink kernel does no mmul
             local_stage_bytes=TILE_BYTES * 2,
             host_pack_bytes=TILE_BYTES * self.n_tiles,
             host_deblock_bytes=ACC_BYTES * self.columns,

@@ -17,8 +17,9 @@ What it reads, and from where:
     aiex.dma_start_task                       -> live task count
 
 What it CANNOT read, and says so rather than guessing:
-    vmacs_per_core   — lives inside the external kernel object, not the IR
-    aligned_loads    — a property of the kernel body
+    mmul_calls_per_core — lives inside the external kernel object, not the IR
+    dtype_a / dtype_b   — mmul operand types are a kernel-body property
+    aligned_loads       — a property of the kernel body
     host pack/deblock — host-side, outside the module entirely
 
 Those stay at their ScheduleSpec defaults and are listed in `unknown`, so a
@@ -120,7 +121,8 @@ def parse(text: str) -> Extraction:
     _ = pos
 
     e.unknown = [
-        "vmacs_per_core (inside the external kernel, not the IR)",
+        "mmul_calls_per_core (inside the external kernel, not the IR)",
+        "dtype_a/dtype_b (mmul operand types are a kernel-body property)",
         "aligned_loads (kernel body property)",
         "host_pack_bytes / host_deblock_bytes (host-side, outside the module)",
     ]

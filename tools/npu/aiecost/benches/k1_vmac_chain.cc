@@ -37,16 +37,25 @@
 #ifndef CHAINS
 #define CHAINS 4
 #endif
+// Operand types. C4 sweeps these to find which (dtype, shape) pairs are native:
+// int8 x int8 tops out at 256 MACs/VMAC, but a narrower operand type may pack
+// more MACs into the same native instruction (aie2p's R58 used int8 x int4).
+#ifndef TA
+#define TA int8
+#endif
+#ifndef TB
+#define TB int8
+#endif
 
-using MMUL = aie::mmul<MR, MK, MN, int8, int8>;
+using MMUL = aie::mmul<MR, MK, MN, TA, TB>;
 
-extern "C" void k1_vmac_chain(const int8 *__restrict pA, const int8 *__restrict pB, int32 *__restrict pOut) {
+extern "C" void k1_vmac_chain(const TA *__restrict pA, const TB *__restrict pB, int32 *__restrict pOut) {
   // Two A tiles x two B tiles give four independent (a_i, b_j) chains, all
   // resident in registers across the loop.
-  aie::vector<int8, MMUL::size_A> a0 = aie::load_v<MMUL::size_A>(pA);
-  aie::vector<int8, MMUL::size_A> a1 = aie::load_v<MMUL::size_A>(pA + MMUL::size_A);
-  aie::vector<int8, MMUL::size_B> b0 = aie::load_v<MMUL::size_B>(pB);
-  aie::vector<int8, MMUL::size_B> b1 = aie::load_v<MMUL::size_B>(pB + MMUL::size_B);
+  aie::vector<TA, MMUL::size_A> a0 = aie::load_v<MMUL::size_A>(pA);
+  aie::vector<TA, MMUL::size_A> a1 = aie::load_v<MMUL::size_A>(pA + MMUL::size_A);
+  aie::vector<TB, MMUL::size_B> b0 = aie::load_v<MMUL::size_B>(pB);
+  aie::vector<TB, MMUL::size_B> b1 = aie::load_v<MMUL::size_B>(pB + MMUL::size_B);
 
   MMUL c0, c1, c2, c3, c4, c5, c6, c7;
   c0.mul(a0, b0);

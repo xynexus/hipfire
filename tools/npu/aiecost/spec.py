@@ -39,8 +39,17 @@ class ScheduleSpec:
     fifo_depth: int = 2
 
     # ── per-core compute ──
-    vmacs_per_core: int = 0  # VMAC (mmul) issues per core per dispatch
+    # Count SOURCE-level aie::mmul mac() calls, not native VMACs. One call costs
+    # 1 or 2 native VMACs depending on shape and operand types (C4): mmul<8,8,8>
+    # is virtual and issues 2. The model derives the native count; giving it VMACs
+    # directly would make the caller responsible for knowing that, and getting it
+    # wrong is a silent 2x.
+    mmul_calls_per_core: int = 0
     mmul_shape: tuple[int, int, int] = (4, 8, 8)  # M,K,N of aie::mmul
+    # Operand types decide MACs-per-native-VMAC: int8xint8 = 256, int8xint4 = 512
+    # (C4). hipfire's OQ4/MQ4 weights are the int4 case and get 2x the int8 rate.
+    dtype_a: str = "int8"
+    dtype_b: str = "int8"
     local_stage_bytes: int = 0  # tile-local staging buffer per core
     aligned_loads: bool = True  # 64 B-aligned local loads (see R118 / K3)
 
@@ -52,13 +61,18 @@ class ScheduleSpec:
     note: str = ""
 
     @property
-    def macs_per_vmac(self) -> int:
+    def macs_per_call(self) -> int:
+        """MACs one aie::mmul mac() computes — independent of how many VMACs it costs."""
         m, k, n = self.mmul_shape
         return m * k * n
 
     @property
+    def dtype_pair(self) -> str:
+        return f"{self.dtype_a}_{self.dtype_b}"
+
+    @property
     def useful_macs(self) -> int:
-        return self.vmacs_per_core * self.macs_per_vmac * self.cores
+        return self.mmul_calls_per_core * self.macs_per_call * self.cores
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -81,10 +95,10 @@ class Prediction:
     admissible: bool = True  # False => outside the calibrated envelope
     missing: list[str] = field(default_factory=list)  # constants that were absent
     assumptions: list[str] = field(default_factory=list)
-
-    @property
-    def useful_tops(self) -> float:
-        return 0.0
+    # Actionable design feedback: a virtual mmul shape or an under-filled VMAC is
+    # throughput the schedule is leaving on the table, and the model knows it.
+    advice: list[str] = field(default_factory=list)
+    useful_tops: float = 0.0
 
     def render(self) -> str:
         out = [f"prediction: {self.spec_name}"]
@@ -105,6 +119,10 @@ class Prediction:
             out.append(f"  wrapper : {self.wrapper_s * 1e6:10.3f} us")
             out.append(f"  limiter : {self.limiter}")
             out.append(f"  predicted receive-stall fraction: {self.stall_fraction * 100:.1f}%")
+            if self.useful_tops:
+                out.append(f"  useful  : {self.useful_tops:.2f} TOPS")
+        for a in self.advice:
+            out.append(f"  ADVICE: {a}")
         for a in self.assumptions:
             out.append(f"  assumption: {a}")
         return "\n".join(out)

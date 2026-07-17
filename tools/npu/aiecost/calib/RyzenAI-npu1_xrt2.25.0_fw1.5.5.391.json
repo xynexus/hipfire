@@ -262,6 +262,89 @@
         "near-linear in columns, same as feed"
       ],
       "measured_utc": "2026-07-16T19:15:37+00:00"
+    },
+    "cyc_per_vmac": {
+      "name": "cyc_per_vmac",
+      "value": 1.0,
+      "unit": "cycles",
+      "bench": "C4",
+      "method": "ISA: 1 vmac per bundle in the unrolled chain loop; hardware: VMAC/s == f_H at saturation",
+      "admissible": true,
+      "evidence": [
+        "(4, 8, 8): vmac/call=1.00, MACs/vmac=256",
+        "(8, 8, 8): vmac/call=2.00, MACs/vmac=256",
+        "(4, 16, 8): vmac/call=2.00, MACs/vmac=256",
+        "(2, 8, 8): vmac/call=1.00, MACs/vmac=128",
+        "(4, 8, 8): 268.17 G MACs/s/core (264 MACs/cycle)",
+        "(8, 8, 8): 258.05 G MACs/s/core (254 MACs/cycle)",
+        "(4, 16, 8): 260.59 G MACs/s/core (257 MACs/cycle)",
+        "(2, 8, 8): 129.85 G MACs/s/core (128 MACs/cycle)"
+      ],
+      "caveats": [
+        "int8 x int8 only; other dtypes unmeasured"
+      ],
+      "measured_utc": "2026-07-17T05:02:50+00:00"
+    },
+    "macs_per_native_vmac_int8_int4": {
+      "name": "macs_per_native_vmac_int8_int4",
+      "value": 512.0,
+      "unit": "MACs",
+      "bench": "C4",
+      "method": "int8 x int4 (mmul_8_4): MACs per source mac() / native vmacs; confirmed by measured MACs/s",
+      "admissible": true,
+      "evidence": [
+        "ISA <4,16,8,int8,int4>: 1 vmac/call, 512 MACs => 512 MACs/VMAC (NATIVE)",
+        "HW <4,16,8,int8,int4>: 520.09 G MACs/s = 512.4 MACs/cycle \u2014 exactly 2x int8 x int8",
+        "HW <8,16,8>: 522.82 G MACs/s; HW <4,32,8>: 524.98 G MACs/s (both VIRTUAL, same rate)",
+        "VMAC/s is ~1.01-1.03 G across every shape AND dtype: the issue rate is fixed at f_H, only MACs-per-VMAC changes"
+      ],
+      "caveats": [
+        "THIS IS WHERE >16 TOPS COMES FROM: 16 x 512 x 2 x 1.015 GHz = 16.63 TOPS, matching the ~16 TOPS marketing figure. The claim is int8 x int4, NOT dense int8 x int8.",
+        "directly relevant to hipfire: OQ4/MQ4 are 4-bit weight formats, so the quant path gets 2x",
+        "mmul_8_4 has its OWN shape family (4x16x8, 8x16x8, 4x32x8); int8 shapes are invalid for it",
+        "optimal shape is <4,16,8,int8,int4> \u2014 native and fills the VMAC"
+      ],
+      "measured_utc": "2026-07-17T05:19:29+00:00"
+    },
+    "f_h_pmode_invariant": {
+      "name": "f_h_pmode_invariant",
+      "value": 1.0,
+      "unit": "bool",
+      "bench": "K1/K4",
+      "method": "re-ran K1 chains=4 under pmode=turbo via passwordless sudo, compared against default",
+      "admissible": true,
+      "evidence": [
+        "default: 1019.3 MHz (0.981 ns/VMAC)",
+        "turbo: 988.5 MHz (1.011 ns/VMAC)",
+        "turbo is a NO-OP for the AIE compute clock \u2014 3% slower, within run-to-run noise",
+        "matches halo/aie2p findings: turbo 15.21 vs 15.7 TOPS, compute clock already maxed under load"
+      ],
+      "caveats": [
+        "pmode restored to default after the test",
+        "rules OUT clock as the explanation for >16 TOPS; the answer is int4 (see macs_per_native_vmac_int8_int4)"
+      ],
+      "measured_utc": "2026-07-17T05:19:29+00:00"
+    },
+    "macs_per_native_vmac_int8_int8": {
+      "name": "macs_per_native_vmac_int8_int8",
+      "value": 256.0,
+      "unit": "MACs",
+      "bench": "C4",
+      "method": "int8 x int8: MACs per source mac() / native vmacs emitted; confirmed by measured MACs/s",
+      "admissible": true,
+      "evidence": [
+        "ISA <4,8,8>: 1 vmac/call, 256 MACs => 256 MACs/VMAC (NATIVE)",
+        "ISA <8,8,8>: 2 vmac/call, 512 MACs => 256 MACs/VMAC (VIRTUAL)",
+        "HW <4,8,8>: 258.68 G MACs/s = 254.9 MACs/cycle",
+        "HW <8,8,8>: 258.84 G MACs/s = 255.0 MACs/cycle \u2014 2x the time per call, IDENTICAL throughput",
+        "HW <2,8,8>: 130.47 G MACs/s = 128.5 MACs/cycle (half-fills the VMAC)"
+      ],
+      "caveats": [
+        "mmul<8,8,8> is VIRTUAL on AIE2 (native on AIE2P) \u2014 it buys nothing here",
+        "optimal int8 x int8 shape is <4,8,8>",
+        "dense int8 peak = 16 x 256 x 2 x 1.015 GHz = 8.31 TOPS \u2014 HALF the ~16 TOPS figure"
+      ],
+      "measured_utc": "2026-07-17T05:19:29+00:00"
     }
   }
 }

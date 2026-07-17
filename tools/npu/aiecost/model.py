@@ -21,6 +21,8 @@ Two rules the aie2p corpus earned the hard way:
 
 from __future__ import annotations
 
+import math
+
 from . import calib
 from .spec import Prediction, ScheduleSpec
 
@@ -80,17 +82,53 @@ def predict(spec: ScheduleSpec, key: str | None = None, device: str = "npu1") ->
             return None
         return c.value
 
-    # ── t_core: the only fully calibrated term today (K1) ──
+    # ── t_core ──
+    # A source-level mac() costs 1 or 2 NATIVE VMACs depending on shape and
+    # operand types, and only native VMACs consume issue slots. C4 measured the
+    # MACs a native VMAC can carry, per operand-type pair:
+    #   int8 x int8 -> 256   int8 x int4 -> 512
+    # so native_vmacs_per_call = ceil(macs_per_call / ceiling). That reproduces
+    # every C4 row: <4,8,8,i8,i8> 256/256=1; <8,8,8,i8,i8> 512/256=2 (virtual);
+    # <4,16,8,i8,i4> 512/512=1; <4,32,8,i8,i4> 1024/512=2; <2,8,8> ceil(0.5)=1
+    # (one VMAC, half wasted). Assuming 256 for everything would mispredict any
+    # OQ4/MQ4 kernel by 2x.
     f_h = need("f_h_hz", "K1")
     cyc_per_vmac = need("cyc_per_vmac", "C4")
-    if cyc_per_vmac is None:
-        # K1's disassembly showed exactly 1 VMAC per bundle at 1 bundle/cycle.
-        # Recorded as an assumption, not silently treated as measured.
-        cyc_per_vmac = 1.0
-        missing.pop()  # not fatal: we have direct ISA evidence for this one
-        p.assumptions.append("cyc_per_vmac=1.0 from K1 disassembly (1 VMAC/bundle); C4 should confirm per dtype/shape")
-    if f_h:
-        p.terms["t_core"] = spec.vmacs_per_core * cyc_per_vmac / f_h
+    ceiling = need(f"macs_per_native_vmac_{spec.dtype_pair}", "C4")
+
+    if f_h and cyc_per_vmac and ceiling and spec.mmul_calls_per_core:
+        macs = spec.macs_per_call
+        native_per_call = math.ceil(macs / ceiling)
+        vmacs = spec.mmul_calls_per_core * native_per_call
+        p.terms["t_core"] = vmacs * cyc_per_vmac / f_h
+
+        m, k, n = spec.mmul_shape
+        if native_per_call > 1:
+            # Throughput-NEUTRAL, not harmful: C4 measured <4,16,8>=520.09,
+            # <4,32,8>=524.98, <8,16,8>=522.82 G MACs/s — a virtual shape costs
+            # N x the issue slots but delivers N x the MACs. The real cost is
+            # accumulator registers (C_block holds N accums), which limits how
+            # many independent chains fit; R0 found 2x2 mmul optimal for exactly
+            # that reason. Do not report this as lost throughput.
+            p.advice.append(
+                f"mmul<{m},{k},{n},{spec.dtype_a},{spec.dtype_b}> is VIRTUAL: {macs} MACs = "
+                f"{native_per_call} native VMACs at {ceiling:.0f} each. Throughput is unaffected "
+                f"(same MACs/VMAC), but it uses {native_per_call} accumulators per call, leaving "
+                f"fewer registers for independent chains — which is what hides VMAC latency (K1)."
+            )
+        if macs < ceiling:
+            waste = 1.0 - macs / ceiling
+            p.advice.append(
+                f"mmul<{m},{k},{n}> UNDER-FILLS the VMAC: {macs} of {ceiling:.0f} MACs — "
+                f"{waste * 100:.0f}% of every issue is wasted, and this IS lost throughput. "
+                f"Use a shape whose M*K*N reaches {ceiling:.0f} in this dtype family."
+            )
+        if spec.dtype_a == "int8" and spec.dtype_b == "int8":
+            p.advice.append(
+                "int8 x int8 caps at 256 MACs/VMAC (8.31 TOPS peak). If the weights are 4-bit "
+                "(OQ4/MQ4), mmul<4,16,8,int8,int4> is native at 512 MACs/VMAC — 2x the compute "
+                "rate, 16.63 TOPS. Only worth chasing if t_core is actually the limiter."
+            )
 
     # ── t_stage / alignment ──
     if not spec.aligned_loads:
@@ -156,6 +194,9 @@ def predict(spec: ScheduleSpec, key: str | None = None, device: str = "npu1") ->
     # fixed term rather than a wrong rate.
     p.device_s = p.terms.get("t_submit", 0.0) + fill_tail + steady
     p.wrapper_s = p.terms.get("t_host", 0.0) + p.device_s
+
+    if spec.useful_macs and p.device_s > 0:
+        p.useful_tops = spec.useful_macs * 2 / p.device_s / 1e12
 
     p.limiter = max((("t_feed", feed_side), ("t_core", core), ("t_drain", drain)), key=lambda kv: kv[1])[0]
     # The receiver stalls whenever the consumer cannot keep up with the feed.
