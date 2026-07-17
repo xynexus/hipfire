@@ -339,7 +339,22 @@ topology it was taken on.**
 - **`@jit` is broken here**: aiecc asserts `targetModel.hasProperty(IsNPU)`
   during CDO generation even for a correct `aie.device(npu1)`. Use the
   skill-documented `compile_mlir_module` + `XRTHostRuntime` path.
-  `r0/r0b_run.py` is halo-era and will not run.
+  `r0/r0b_run.py` is halo-era and will not run. **19 files use `@jit`.**
+- **`tools/npu/oq_gemm_design.py` is bit-rotted** — the repo's only NPU GEMM, and
+  it does not run on nix1's toolchain. It needs **five removed `aie.iron` names**:
+
+      In  Out  kernels (kernels.mm)  ceildiv  CompileTime      -> all MISSING
+      str_to_dtype, TensorTiler2D                              -> still present
+
+  It also uses `@jit`, so it is dead twice over. Blast radius is contained: it is
+  the *only* file importing removed names (`build_qwen35_*.py` etc. use only
+  surviving APIs and still build — verified). Its dependents
+  `bench_oq_gemm_npu.py` and `test_oq_gemm_npu.py` go with it.
+
+  **This blocks validating `design.py` against an independent kernel** — which is
+  what it was worth. Rewriting it against the new API would make it *mine*, and
+  destroy exactly the independence that made it valuable evidence. Fixing it is
+  a toolchain-pin-vs-rewrite decision for a human.
 - **Context-transition zero output** (R114–R120): fresh contexts sometimes return
   all zeros. Platform nondeterminism — detect and **exclude**, never average in.
 - **Cold vs warm**: R63 saw 3.5–4.2 ms cold vs 1.03 ms warm. Warm up, or use
@@ -564,6 +579,11 @@ that output-tile area matters — never the values or the rankings.
   NPU 1.4–2.2× more efficient on both. The verdicts *do* invert.
 - **A tuned GPU compute kernel** — `g1`'s chain reaches only ~42% of gfx1103's
   theoretical, so the measured speed gap is a lower bound.
+- **`design.py`'s GEMM/attention specs are DERIVED, never validated.** All four
+  families (B feed, C compute, D composition) validate *primitives*; no family
+  covers a real LLM schedule. The design rules inherit that gap. The natural
+  independent test — the repo's own `oq_gemm_design.py` — is bit-rotted (§2.10),
+  and rewriting it myself would forfeit the independence that made it worth using.
 - ~~The true feed ceiling~~ **RESOLVED**: ~30.8 GB/s at 8 shim input streams,
   confirmed by measurement and the toolchain channel budget independently.
 - ~~CPU as a third target~~ **DONE** (P1): dominated on both axes — 55.8 GB/s ·
