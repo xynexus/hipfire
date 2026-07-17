@@ -319,6 +319,14 @@ def main() -> int:
     a.add_argument("--head-dim", type=int, default=128, choices=[128, 256])
     a.add_argument("--kv-bits", type=int, default=4, choices=[2, 4, 8])
 
+    b = sub.add_parser("batch-sweep", help="batch size vs tok/s and tok/J — where the energy regime flips")
+    b.add_argument("--k", type=int, default=768)
+    b.add_argument("--n", type=int, default=1280)
+    b.add_argument("--weight-bits", type=int, default=8, choices=[4, 8])
+    b.add_argument("--out-bits", type=int, default=32, choices=[16, 32],
+                   help="accumulator output width. 32 = int32; 16 = bf16. This is a LEVER: the output\nscales with batch and comes to dominate the byte count, capping arithmetic intensity.")
+    b.add_argument("--batches", type=int, nargs="+", default=[1, 4, 16, 64, 128, 256, 512])
+
     s = sub.add_parser("kv-sweep", help="KVarN 2/4/8-bit head-to-head on decode attention")
     s.add_argument("--context", type=int, default=4096)
     s.add_argument("--kv-heads", type=int, default=8)
@@ -343,6 +351,52 @@ def main() -> int:
                f"head_dim={args.head_dim} kvarn{args.kv_bits} on {target.key}\n"
                f"  KV bytes/layer {prob.kv_bytes() / 1024:.0f} KiB, {prob.total_macs / 1e6:.1f} M MACs")
         print(rank_and_render(prob.candidates(target), key, args.device, hdr, args.objective))
+        return 0
+
+    if args.cmd == "batch-sweep":
+        # Batching is the lever that crosses the energy break-even. For a
+        # projection, weights are read ONCE and reused for every token in the
+        # batch, so arithmetic intensity ~= M. At M=1 a GEMM is pure movement; at
+        # M > ~183 (int8) arithmetic finally dominates its energy.
+        #
+        # NOTE the asymmetry that decides LLM design: batching amortises WEIGHTS
+        # but NOT the KV cache — every sequence carries its own KV, so attention
+        # stays movement-bound at any batch size while the projections do not.
+        ratio_name = f"byte_mac_energy_ratio_int8_{'int4' if args.weight_bits == 4 else 'int8'}"
+        consts = calib.load(key)
+        breakeven = consts[ratio_name].value if ratio_name in consts else None
+        print(f"batch sweep — {args.k}x{args.n} projection, int8 x int{args.weight_bits}, "
+              f"{'bf16' if args.out_bits == 16 else 'int32'} out, on {target.key}")
+        if breakeven:
+            print(f"  energy break-even: AI > {breakeven:.0f} MACs/byte before arithmetic dominates\n")
+        print(f"  {'batch':>6} {'AI':>7} {'E-bound':>9} {'device':>10} {'energy':>9} "
+              f"{'tok/s':>9} {'tok/J':>8} {'us/tok':>8} {'uJ/tok':>8}")
+        base = None
+        for m in args.batches:
+            prob = GemmProblem(m, args.k, args.n, "int8", "int4" if args.weight_bits == 4 else "int8",
+                               out_bytes_per_elem=args.out_bits // 8)
+            rows = [(s_, model.predict(s_, key, args.device)) for s_ in prob.candidates(target)]
+            ok = sorted([r for r in rows if r[1].buildable and r[1].admissible], key=lambda sp: sp[1].device_s)
+            if not ok:
+                print(f"  {m:>6}  no admissible candidate")
+                continue
+            _, p = ok[0]  # fastest; per-token metrics are what serving cares about
+            eb = "movement" if p.energy_terms.get("movement", 0) > p.energy_terms.get("compute", 0) else "compute"
+            tok_s = m / p.device_s
+            tok_j = m / p.energy_j if p.energy_j else 0.0
+            # base is the FIRST batch swept, not necessarily 1 — label it honestly.
+            gain = f"  ({tok_j / base:.1f}x tok/J vs B={args.batches[0]})" if base else ""
+            print(f"  {m:>6} {p.arithmetic_intensity:>7.1f} {eb:>9} {p.device_s * 1e6:>9.1f}u "
+                  f"{p.energy_j * 1e3:>8.3f}m {tok_s:>9.0f} {tok_j:>8.0f} "
+                  f"{p.device_s / m * 1e6:>8.2f} {p.energy_j / m * 1e6:>8.2f}{gain}")
+            if base is None:
+                base = tok_j
+        print("\n  Batching amortises WEIGHTS, so per-token cost falls hard on both axes. But it does")
+        print("  NOT amortise the OUTPUT: that scales with the batch and comes to dominate the byte")
+        print("  count (80% at B=2048, int32, 1 col), capping AI. Batching ALONE cannot cross the")
+        print("  break-even — only bf16 output + minimal activation replication gets there.")
+        print("  It also does NOT amortise the KV cache — each sequence has its own — so attention")
+        print("  stays movement-bound at any batch size. Batch the projections; the KV read is irreducible.")
         return 0
 
     # kv-sweep: the KVarN question, answered per-layer then scaled to the model.

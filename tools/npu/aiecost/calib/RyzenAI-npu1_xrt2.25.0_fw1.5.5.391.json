@@ -799,6 +799,61 @@
         "Speed is free-run; energy is matched-rate. Do not mix: free-run energy tracks dispatch rate (see E1)."
       ],
       "measured_utc": "2026-07-17T10:22:28+00:00"
+    },
+    "batching_tok_j_gain_b512": {
+      "name": "batching_tok_j_gain_b512",
+      "value": 64.4,
+      "unit": "x",
+      "bench": "design",
+      "method": "tok/J at B=512 divided by tok/J at B=1, 768x1280 int8 projection, fastest candidate",
+      "admissible": true,
+      "evidence": [
+        "768x1280 projection, int8xint8, int32 out, fastest candidate per batch (npu1):",
+        "  B=1    AI 1.0   217.9us  0.194mJ    4589 tok/s   5144 tok/J  194.4 uJ/tok",
+        "  B=64   AI 41.7  230.1us  0.361mJ  278090 tok/s 177232 tok/J    5.6 uJ/tok",
+        "  B=512  AI 97.2  320.9us  1.546mJ 1595443 tok/s 331077 tok/J    3.0 uJ/tok",
+        "  B=2048 AI 113.4 818.7us  5.611mJ 2501662 tok/s 365026 tok/J    2.7 uJ/tok",
+        "AI saturates because the OUTPUT scales with batch: byte share w=32%/a=26%/out=43% at B=256",
+        "  -> w=6%/a=35%/out=59% at B=2048 (int32, 4col); 80% out at 1 col.",
+        "bf16 out at B=2048: AI 113.4->160.8, device 818.7->639.3us, tok/J 365026->446404 (+22% both axes)",
+        "only bf16 out AND minimal activation replication crosses 183: B=512 1col bf16 = 187.3; B=2048 1col bf16 = 258.2"
+      ],
+      "caveats": [
+        "BATCHING IS THE BIGGEST SINGLE LEVER MEASURED: 64x tok/J and 348x tok/s from B=1 to B=512. It amortises WEIGHTS across the batch (weight byte share falls 32% -> 6%).",
+        "But batching does NOT amortise the OUTPUT, which scales with batch and comes to dominate the byte count (up to 80%), capping arithmetic intensity around 97-113 with an int32 accumulator. BATCHING ALONE CANNOT CROSS THE 183 BREAK-EVEN.",
+        "It also does NOT amortise the KV cache - each sequence carries its own - so decode attention stays movement-bound at ANY batch size. Batch the projections; the KV read is irreducible.",
+        "CONSEQUENCE: on npu1 the LLM hot path is movement-bound at every batch size in the practical range, so 'energy is bytes' holds throughout. bf16 output is the cheapest way to buy back both axes (+22% at B=2048), and R65 reached the same conclusion by hand on aie2p.",
+        "Model-derived, not measured on hardware: rests on the calibrated J/byte, J/MAC and bw_feed_per_stream."
+      ],
+      "measured_utc": "2026-07-17T11:11:36+00:00"
+    },
+    "gemm_ai_ceiling_int32_out": {
+      "name": "gemm_ai_ceiling_int32_out",
+      "value": 113.4,
+      "unit": "MACs/byte",
+      "bench": "design",
+      "method": "AI at B=2048 with an int32 accumulator output, 4 columns; output dominates bytes",
+      "admissible": true,
+      "evidence": [
+        "768x1280 projection, int8xint8, int32 out, fastest candidate per batch (npu1):",
+        "  B=1    AI 1.0   217.9us  0.194mJ    4589 tok/s   5144 tok/J  194.4 uJ/tok",
+        "  B=64   AI 41.7  230.1us  0.361mJ  278090 tok/s 177232 tok/J    5.6 uJ/tok",
+        "  B=512  AI 97.2  320.9us  1.546mJ 1595443 tok/s 331077 tok/J    3.0 uJ/tok",
+        "  B=2048 AI 113.4 818.7us  5.611mJ 2501662 tok/s 365026 tok/J    2.7 uJ/tok",
+        "AI saturates because the OUTPUT scales with batch: byte share w=32%/a=26%/out=43% at B=256",
+        "  -> w=6%/a=35%/out=59% at B=2048 (int32, 4col); 80% out at 1 col.",
+        "bf16 out at B=2048: AI 113.4->160.8, device 818.7->639.3us, tok/J 365026->446404 (+22% both axes)",
+        "only bf16 out AND minimal activation replication crosses 183: B=512 1col bf16 = 187.3; B=2048 1col bf16 = 258.2"
+      ],
+      "caveats": [
+        "BATCHING IS THE BIGGEST SINGLE LEVER MEASURED: 64x tok/J and 348x tok/s from B=1 to B=512. It amortises WEIGHTS across the batch (weight byte share falls 32% -> 6%).",
+        "But batching does NOT amortise the OUTPUT, which scales with batch and comes to dominate the byte count (up to 80%), capping arithmetic intensity around 97-113 with an int32 accumulator. BATCHING ALONE CANNOT CROSS THE 183 BREAK-EVEN.",
+        "It also does NOT amortise the KV cache - each sequence carries its own - so decode attention stays movement-bound at ANY batch size. Batch the projections; the KV read is irreducible.",
+        "CONSEQUENCE: on npu1 the LLM hot path is movement-bound at every batch size in the practical range, so 'energy is bytes' holds throughout. bf16 output is the cheapest way to buy back both axes (+22% at B=2048), and R65 reached the same conclusion by hand on aie2p.",
+        "Model-derived, not measured on hardware: rests on the calibrated J/byte, J/MAC and bw_feed_per_stream.",
+        "Below the 183 int8 break-even at every batch size => an int32-output projection is movement-bound no matter how much you batch."
+      ],
+      "measured_utc": "2026-07-17T11:11:36+00:00"
     }
   }
 }

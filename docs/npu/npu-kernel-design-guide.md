@@ -338,26 +338,52 @@ to the 37-MACs/byte artifact for any dtype pair without a specific ratio.
 0. **Pick the device by objective, not by habit.** GPU for tok/s, NPU for tok/J
    — ~2× either way, on both movement and compute. There is no regime where one
    wins both.
-1. **Maximise work per dispatch.** The 155 µs floor is 37–58% of realistic
+1. **BATCH — the biggest lever measured.** 64× tok/J and 348× tok/s from B=1 to
+   B=512 on a 768×1280 projection, because weights are read once and reused
+   across the batch (weight byte share falls 32% → 6%).
+
+   | B | AI | device | tok/s | tok/J | µJ/tok |
+   |---|---|---|---|---|---|
+   | 1 | 1.0 | 217.9 µs | 4 589 | 5 144 | 194.4 |
+   | 64 | 41.7 | 230.1 µs | 278 090 | 177 232 | 5.6 |
+   | 512 | 97.2 | 320.9 µs | 1 595 443 | 331 077 | 3.0 |
+   | 2048 | 113.4 | 818.7 µs | 2 501 662 | 365 026 | 2.7 |
+
+   **Batching does NOT amortise the output**, which scales with B and comes to
+   dominate the byte count (43% → 59% at 4 columns, **80%** at 1 column). So AI
+   ceilings at ~97–113 with an int32 accumulator: **batching alone cannot cross
+   the 183 break-even.** It also does **not** amortise the KV cache — every
+   sequence carries its own — so decode attention stays movement-bound at *any*
+   batch size. **Batch the projections; the KV read is irreducible.**
+
+   `python -m aiecost.design batch-sweep --batches 1 64 512 2048`
+
+2. **Emit bf16, not int32.** At B=2048: AI 113.4 → 160.8, and **22% on *both*
+   axes** (819 → 639 µs, 365k → 446k tok/J) — nearly free, since the f32
+   accumulator is rounded on the way out anyway. Only bf16 output *plus* minimal
+   activation replication crosses 183 (B=512, 1 col: 187.3; B=2048: 258.2). R65
+   reached this by hand on aie2p.
+3. **Maximise work per dispatch.** The 155 µs floor is 37–58% of realistic
    kernels. Fusing layers into one dispatch beats any format choice.
-2. **Energy is bytes** (AI break-even 183). Narrower weights/KV cut energy; a
-   faster MMUL mostly does not.
-3. **Speed and energy pick different schedules.** M=256 QKV: `c4` is
+4. **Energy is bytes** (AI break-even 183) — and per rule 1, that holds at every
+   practical batch size. Narrower weights/KV cut energy; a faster MMUL mostly
+   does not.
+5. **Speed and energy pick different schedules.** M=256 QKV: `c4` is
    speed-optimal (265.2 µs, 1.940 mJ), `c1` is energy-optimal (484.3 µs,
    1.825 mJ). Broadcasting activations across 4 columns replicates bytes that
-   cost 183 MACs each. *You cannot optimise both at once.*
-4. **Use native, VMAC-filling MMUL shapes** (part 1). Wider is sugar; narrower
+   cost 183 MACs each. *You cannot optimise both at once* — but check the size of
+   the trade: at M=1 it is 0.2% and the "trade" is illusory.
+6. **Use native, VMAC-filling MMUL shapes** (part 1). Wider is sugar; narrower
    wastes half the issue.
-5. **Task count is NOT a lever on npu1** — an 8× cut buys ~1.5%. This
-   *contradicts* aie2p (R68: 3× cut → 24%). npu1 feeds at ~4 GB/s/column, so a
+7. **Task count is NOT a lever on npu1** — an 8× cut buys ~1.5%. This
+   *contradicts* aie2p (R68: 3× cut → 24%). npu1 feeds at ~3.95 GB/s/stream, so a
    2 KiB tile takes ~553 ns to move while task issue costs ~5 ns: the overhead
    hides entirely behind the transfer.
-6. **Watch the output drain.** For int4 GEMM the int32 accumulator output becomes
-   the limiter once weights halve. Emit BF16 — which is what R65 did by hand on
-   aie2p.
-7. **KV bit-width is the decode lever**: kvarn8→4 gives 1.61× (not 2× — the floor
+8. **Watch the output drain.** For int4 GEMM the int32 accumulator output becomes
+   the limiter once weights halve — see rule 2.
+9. **KV bit-width is the decode lever**: kvarn8→4 gives 1.61× (not 2× — the floor
    doesn't shrink), kvarn2 2.33×.
-8. **Allocate BOs once.** 17.6 ms each, size-independent.
+10. **Allocate BOs once.** 17.6 ms each, size-independent.
 
 ### Buildability — check before designing
 
