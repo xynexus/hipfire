@@ -1036,7 +1036,11 @@
         "MULTI-CORE whole_array (mlir-aie example, 4 cols/16 cores, i8, floor-removed, npu1):",
         "  512^3 tile32^3: 108 GFLOP/s -> eff 0.014;  1024^3 t64: 685 -> 0.086;  2048^3 t64: 1955 -> 0.239",
         "=> efficiency is TILE+SIZE dependent (aie2p tilesweep law), NOT constant. 0.28 is the large-tile asymptote,",
-        "   reached by single-core oq_gemm (tile 32,64,64) and multi-core 2048^3; small tiles/problems are far lower."
+        "   reached by single-core oq_gemm (tile 32,64,64) and multi-core 2048^3; small tiles/problems are far lower.",
+        "TILE ISOLATED at fixed 2048^3 (npu1, 4 cols): tile 32^3 -> 0.075, tile 64^3 -> 0.239, tile 128^3 -> L1-BLOCKED",
+        "  (128x128 int32 output = 64KB = full L1, no double-buffer room -> 'Resource allocation pipeline failed')",
+        "=> efficiency is TILE-AREA-driven; npu1 practical ceiling ~0.24 for this kernel, capped by L1 at 64^3 with i32 out",
+        "=> bf16 output (2B) halves the output tile, freeing L1 for a bigger tile: a DOUBLE win (movement + efficiency)"
       ],
       "caveats": [
         "0.28 IS THE LARGE-TILE ASYMPTOTE, not a universal efficiency. Multi-core measurement: 0.014 (512^3/32^3) up to 0.239 (2048^3/64^3). Applying flat 0.28 OVER-predicts efficiency (UNDER-predicts t_core) by up to ~20x for small tiles/problems.",

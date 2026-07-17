@@ -414,11 +414,15 @@ to the 37-MACs/byte artifact for any dtype pair without a specific ratio.
 
    `python -m aiecost.design batch-sweep --batches 1 64 512 2048`
 
-2. **Emit bf16, not int32.** At B=2048: AI 113.4 → 160.8, and **22% on *both*
-   axes** (819 → 639 µs, 365k → 446k tok/J) — nearly free, since the f32
-   accumulator is rounded on the way out anyway. Only bf16 output *plus* minimal
-   activation replication crosses 183 (B=512, 1 col: 187.3; B=2048: 258.2). R65
-   reached this by hand on aie2p.
+2. **Emit bf16, not int32 — a DOUBLE win.** (a) 22% on *both* speed and energy
+   (B=2048: AI 113.4→160.8, 819→639 µs, 365k→446k tok/J) — nearly free, since the
+   f32 accumulator is rounded on the way out anyway. (b) It also **halves the L1
+   output tile** (2 B vs 4 B), which lets a *bigger* compute tile fit — and tile
+   area drives core efficiency. Concretely: `whole_array` 128³ won't build with
+   int32 output (128×128×4 = 64 KB = full L1), capping npu1 at tile 64³ ≈ 0.24
+   efficiency; bf16 output frees the room. Only bf16 output *plus* minimal
+   activation replication crosses AI 183 (B=512,1col: 187.3; B=2048: 258.2). R65
+   reached the movement half of this by hand on aie2p.
 3. **Maximise work per dispatch.** The 155 µs floor is 37–58% of realistic
    kernels. Fusing layers into one dispatch beats any format choice.
 4. **Energy is bytes** (AI break-even 183) — and per rule 1, that holds at every
