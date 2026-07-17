@@ -69,7 +69,7 @@ use dummy::{
 use events::{emit_error_with_id, write_error, MAX_BASE64_ENCODED_LEN};
 use generate::*;
 use generate_vl::{decode_vl_frames, generate_vl, generate_vl_dots_ocr, generate_vl_gemma3};
-use hipfire_daemon_protocol::{DaemonRequest, EmbeddingVector, RerankResult};
+use hipfire_daemon_protocol::{DaemonRequest, EmbeddingInputType, EmbeddingVector, RerankResult};
 #[cfg(feature = "arch-lfm2moe")]
 use hipfire_serving_core::lfm2_prefill;
 use hipfire_serving_core::{
@@ -150,25 +150,106 @@ fn embeddinggemma_encode_prefixed(
             }
         })
         .collect::<Vec<_>>();
+    if let Some(metadata) = state.embedding_metadata.as_ref() {
+        for (index, tokens) in tokenized.iter().enumerate() {
+            metadata
+                .sequence
+                .bucket_for_len(tokens.len())
+                .map_err(|error| format!("embedding input {index}: {error}"))?;
+        }
+    } else {
+        for (index, tokens) in tokenized.iter().enumerate() {
+            if tokens.len() > 2048 {
+                return Err(format!(
+                    "embedding input {index} has {} tokens; maximum supported length is 2048",
+                    tokens.len()
+                ));
+            }
+        }
+    }
     let dims = state.config.resolve_dims(dims);
     hipfire_serving_core::pooling::embed_batch_embeddinggemma(gpu, state, &tokenized, dims)
+}
+
+fn qwen3_embedding_encode_prefixed(
+    state: &hipfire_serving_core::qwen3_embedding::Qwen3EmbeddingState,
+    tokenizer: &hipfire_model::tokenizer::Tokenizer,
+    texts: &[String],
+    prefix: &str,
+    dims: Option<usize>,
+) -> Result<Vec<Vec<f32>>, String> {
+    let tokenized = texts
+        .iter()
+        .map(|text| {
+            if prefix.is_empty() {
+                tokenizer.encode(text)
+            } else {
+                tokenizer.encode(&format!("{prefix}{text}"))
+            }
+        })
+        .collect::<Vec<_>>();
+    let dimensions = dims.unwrap_or(state.metadata.output.native_dimensions);
+    if dimensions != state.metadata.output.native_dimensions
+        && !state
+            .metadata
+            .output
+            .matryoshka_dimensions
+            .contains(&dimensions)
+    {
+        return Err(format!(
+            "unsupported embedding dimensions {dimensions}; native={} supported_matryoshka={:?}",
+            state.metadata.output.native_dimensions, state.metadata.output.matryoshka_dimensions
+        ));
+    }
+    let mut embeddings = state.encode_token_batches(&tokenized)?;
+    if dimensions != state.metadata.output.native_dimensions {
+        for embedding in &mut embeddings {
+            embedding.truncate(dimensions);
+            let norm = embedding
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+            if norm > 0.0 {
+                for value in embedding {
+                    *value /= norm;
+                }
+            }
+        }
+    }
+    Ok(embeddings)
 }
 
 fn embeddinggemma_embed(
     gpu: &mut hipfire_rdna::Gpu,
     m: &LoadedModel,
     texts: &[String],
+    input_type: EmbeddingInputType,
     dims: Option<usize>,
 ) -> Result<Vec<EmbeddingVector>, String> {
+    if let Some(state) = m.qwen3_embedding.as_ref() {
+        let tokenizer = m
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| "embed: loaded Qwen3 embedding model has no tokenizer".to_string())?;
+        let prefix = state.metadata.prompt(input_type);
+        let embeddings = qwen3_embedding_encode_prefixed(state, tokenizer, texts, prefix, dims)?;
+        return Ok(embeddings
+            .into_iter()
+            .enumerate()
+            .map(|(index, embedding)| EmbeddingVector { index, embedding })
+            .collect());
+    }
     let (state, tokenizer) = embeddinggemma_parts(m, "embed")?;
-    let embeddings = embeddinggemma_encode_prefixed(
-        gpu,
-        state,
-        tokenizer,
-        texts,
-        &state.config.document_prompt,
-        dims,
-    )?;
+    let prefix = state
+        .embedding_metadata
+        .as_ref()
+        .map(|metadata| metadata.prompt(input_type))
+        .unwrap_or_else(|| match input_type {
+            EmbeddingInputType::Query => &state.config.query_prompt,
+            EmbeddingInputType::Document => &state.config.document_prompt,
+        });
+    let embeddings = embeddinggemma_encode_prefixed(gpu, state, tokenizer, texts, prefix, dims)?;
     Ok(embeddings
         .into_iter()
         .enumerate()
@@ -182,6 +263,44 @@ fn embeddinggemma_rerank(
     query: &str,
     documents: &[String],
 ) -> Result<Vec<RerankResult>, String> {
+    if let Some(state) = m.qwen3_embedding.as_ref() {
+        let tokenizer = m
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| "rerank: loaded Qwen3 embedding model has no tokenizer".to_string())?;
+        let query_texts = vec![query.to_string()];
+        let query_embedding = qwen3_embedding_encode_prefixed(
+            state,
+            tokenizer,
+            &query_texts,
+            state
+                .metadata
+                .prompt(hipfire_model::embedding::EmbeddingInputType::Query),
+            None,
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "rerank: query produced no embedding".to_string())?;
+        let document_embeddings = qwen3_embedding_encode_prefixed(
+            state,
+            tokenizer,
+            documents,
+            state
+                .metadata
+                .prompt(hipfire_model::embedding::EmbeddingInputType::Document),
+            None,
+        )?;
+        return Ok(hipfire_serving_core::pooling::rank_by_cosine(
+            &query_embedding,
+            &document_embeddings,
+        )
+        .into_iter()
+        .map(|(index, relevance_score)| RerankResult {
+            index,
+            relevance_score,
+        })
+        .collect());
+    }
     let (state, tokenizer) = embeddinggemma_parts(m, "rerank")?;
     let query_texts = vec![query.to_string()];
     let query_embedding = embeddinggemma_encode_prefixed(
@@ -4032,7 +4151,7 @@ fn main() {
                     emit_error_with_id(&mut stdout, id, "no model loaded");
                     continue;
                 };
-                match embeddinggemma_embed(&mut gpu, m, &req.texts, req.dims) {
+                match embeddinggemma_embed(&mut gpu, m, &req.texts, req.input_type, req.dims) {
                     Ok(embeddings) => {
                         let _ = serde_json::to_writer(
                             &mut stdout,

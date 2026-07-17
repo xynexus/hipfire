@@ -13,12 +13,161 @@
 
 use hipfire_cpu::{BackendSelection, DenseFfnBackend, DenseFfnBackendPreference, ModuleInvocation};
 use hipfire_model::AcceleratorDeviceInfo;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 
 pub const XDNA_SWIGLU_BACKEND: &str = "npu_xdna";
 pub const NPU_ARTIFACTS_MISSING_FALLBACK: &str = "npu_artifacts_missing";
 pub const XDNA_RUNTIME_MISSING_FALLBACK: &str = "xdna_runtime_missing";
 pub const NPU_HARDWARE_ABSENT_FALLBACK: &str = "npu_hardware_absent";
+pub const EMBEDDING_IMAGE_SCHEMA: &str = "hipfire.npu_embedding_image.v1";
+pub const FULL_EMBEDDING_ENCODER_ABI: &str = "hipfire.full_embedding_encoder.v1";
+
+#[derive(Debug, Clone, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct EmbeddingModelGeometry {
+    /// Underlying HF architecture identity, for example `qwen3` or `embeddinggemma`.
+    pub architecture: String,
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct EmbeddingImageCacheKey {
+    pub npu_architecture: String,
+    pub model_geometry: EmbeddingModelGeometry,
+    pub quant_format: String,
+    pub sequence_bucket: usize,
+    pub dispatch_batch: usize,
+}
+
+impl EmbeddingImageCacheKey {
+    pub fn directory_name(&self) -> Result<String, String> {
+        for (label, value) in [
+            ("NPU architecture", self.npu_architecture.as_str()),
+            (
+                "model architecture",
+                self.model_geometry.architecture.as_str(),
+            ),
+            ("quant format", self.quant_format.as_str()),
+        ] {
+            if value.is_empty()
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+'))
+            {
+                return Err(format!("invalid embedding image {label} {value:?}"));
+            }
+        }
+        let g = &self.model_geometry;
+        Ok(format!(
+            "{}-{}-h{}-l{}-qh{}-kvh{}-d{}-i{}-{}-s{}-b{}",
+            self.npu_architecture,
+            g.architecture,
+            g.hidden_size,
+            g.num_hidden_layers,
+            g.num_attention_heads,
+            g.num_key_value_heads,
+            g.head_dim,
+            g.intermediate_size,
+            self.quant_format,
+            self.sequence_bucket,
+            self.dispatch_batch,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EmbeddingImageManifest {
+    pub schema: String,
+    pub runtime_abi: String,
+    pub key: EmbeddingImageCacheKey,
+    pub xclbin: String,
+    pub instructions: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ResolvedEmbeddingImage {
+    pub directory: PathBuf,
+    pub xclbin: PathBuf,
+    pub instructions: PathBuf,
+}
+
+/// Resolve one exact compiled embedding image. There is deliberately no nearest
+/// geometry or filename fallback: a missing/incompatible NPU-only image must
+/// fail before execution can be reported as NPU-backed.
+pub fn resolve_embedding_image(
+    cache_root: &Path,
+    key: &EmbeddingImageCacheKey,
+) -> Result<ResolvedEmbeddingImage, String> {
+    let directory = cache_root.join("embedding").join(key.directory_name()?);
+    let manifest_path = directory.join("manifest.json");
+    let manifest_bytes = std::fs::read(&manifest_path).map_err(|error| {
+        format!(
+            "missing embedding NPU image manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: EmbeddingImageManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            format!(
+                "invalid embedding NPU image manifest {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+    if manifest.schema != EMBEDDING_IMAGE_SCHEMA {
+        return Err(format!(
+            "embedding NPU image {} has unsupported schema {:?}",
+            directory.display(),
+            manifest.schema
+        ));
+    }
+    if manifest.runtime_abi != FULL_EMBEDDING_ENCODER_ABI {
+        return Err(format!(
+            "embedding NPU image {} has incompatible runtime ABI {:?}",
+            directory.display(),
+            manifest.runtime_abi
+        ));
+    }
+    if &manifest.key != key {
+        return Err(format!(
+            "embedding NPU image {} is incompatible with the requested cache key",
+            directory.display()
+        ));
+    }
+    let file = |name: &str, role: &str| -> Result<PathBuf, String> {
+        let relative = Path::new(name);
+        if relative.is_absolute()
+            || relative.components().count() != 1
+            || relative
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "embedding NPU image has invalid {role} path {name:?}"
+            ));
+        }
+        let path = directory.join(relative);
+        if !path.is_file() {
+            return Err(format!(
+                "embedding NPU image is missing {role} {}",
+                path.display()
+            ));
+        }
+        Ok(path)
+    };
+    let xclbin = file(&manifest.xclbin, "xclbin")?;
+    let instructions = file(&manifest.instructions, "instructions")?;
+    Ok(ResolvedEmbeddingImage {
+        directory,
+        xclbin,
+        instructions,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NpuModuleTarget {
@@ -278,6 +427,94 @@ pub fn npu_module_admission_json(admission: &NpuModuleAdmission) -> Value {
 mod tests {
     use super::*;
     use hipfire_cpu::{dense_ffn_module_invocation_from_shape, DenseFfnBackendPreference};
+
+    fn embedding_image_key() -> EmbeddingImageCacheKey {
+        EmbeddingImageCacheKey {
+            npu_architecture: "aie2p".into(),
+            model_geometry: EmbeddingModelGeometry {
+                architecture: "qwen3".into(),
+                hidden_size: 1024,
+                num_hidden_layers: 28,
+                num_attention_heads: 16,
+                num_key_value_heads: 8,
+                head_dim: 128,
+                intermediate_size: 3072,
+            },
+            quant_format: "oq8+".into(),
+            sequence_bucket: 512,
+            dispatch_batch: 8,
+        }
+    }
+
+    #[test]
+    fn embedding_image_cache_key_covers_arch_geometry_quant_bucket_and_batch() {
+        let key = embedding_image_key();
+        assert_eq!(
+            key.directory_name().unwrap(),
+            "aie2p-qwen3-h1024-l28-qh16-kvh8-d128-i3072-oq8+-s512-b8"
+        );
+        let mut different = key.clone();
+        different.dispatch_batch = 4;
+        assert_ne!(
+            key.directory_name().unwrap(),
+            different.directory_name().unwrap()
+        );
+    }
+
+    #[test]
+    fn embedding_image_resolution_fails_closed_on_incompatible_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-npu-image-resolution-{}",
+            std::process::id()
+        ));
+        let key = embedding_image_key();
+        let directory = root.join("embedding").join(key.directory_name().unwrap());
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("final.xclbin"), b"xclbin").unwrap();
+        std::fs::write(directory.join("insts.bin"), b"instructions").unwrap();
+        let mut wrong_key = key.clone();
+        wrong_key.sequence_bucket = 256;
+        let manifest = EmbeddingImageManifest {
+            schema: EMBEDDING_IMAGE_SCHEMA.into(),
+            runtime_abi: FULL_EMBEDDING_ENCODER_ABI.into(),
+            key: wrong_key,
+            xclbin: "final.xclbin".into(),
+            instructions: "insts.bin".into(),
+        };
+        std::fs::write(
+            directory.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = resolve_embedding_image(&root, &key).unwrap_err();
+        assert!(error.contains("incompatible"));
+
+        std::fs::write(
+            directory.join("manifest.json"),
+            serde_json::to_vec(&EmbeddingImageManifest {
+                runtime_abi: "hipfire.full_embedding_encoder.v0".into(),
+                key: key.clone(),
+                ..manifest.clone()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let error = resolve_embedding_image(&root, &key).unwrap_err();
+        assert!(error.contains("runtime ABI"));
+
+        std::fs::write(
+            directory.join("manifest.json"),
+            serde_json::to_vec(&EmbeddingImageManifest {
+                key: key.clone(),
+                ..manifest
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let resolved = resolve_embedding_image(&root, &key).unwrap();
+        assert_eq!(resolved.xclbin, directory.join("final.xclbin"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn xdna_artifacts_require_both_paths() {

@@ -19,12 +19,9 @@
 //!
 //! ## Sliding window
 //!
-//! embeddinggemma interleaves local (`sliding_window = 512`) and global layers, but
-//! the attention is *bidirectional within the window*. For `m ≤ sliding_window`
-//! (the common retrieval-chunk case) the window never clips, so full bidirectional
-//! attention is exact on every layer. For `m > sliding_window` the local layers
-//! would need a banded mask that this bring-up path does not yet apply; we warn and
-//! proceed (still exact on the global layers, an approximation on the local ones).
+//! embeddinggemma interleaves local (`sliding_window = 512`) and global layers.
+//! Local layers use symmetric bidirectional windows while global layers see the
+//! full document, including for sequences longer than the local window.
 
 use hip_bridge::HipResult;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
@@ -93,6 +90,13 @@ pub trait LinearProjector {
     /// Whether one flattened encoder command can preserve the supplied
     /// document boundaries through every resident layer.
     fn supports_segmented_batch(&self, _segment_offsets: &[usize]) -> bool {
+        false
+    }
+
+    /// Whether the canonical encoder body can safely fall back from a fused
+    /// resident layer while keeping every quantized linear projection on this
+    /// backend. Resident-only OQ8 weights must never reach `weight_gemm`.
+    fn supports_resident_only_projection_fallback(&self) -> bool {
         false
     }
 
@@ -391,15 +395,6 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
     let g3 = crate::weights::gemma3_config(cfg);
     let backbone = &weights.backbone;
 
-    if m > cfg.sliding_window {
-        eprintln!(
-            "embeddinggemma: sequence length {m} exceeds sliding_window {} — local \
-             layers are approximated as full-bidirectional (banded mask not yet \
-             implemented)",
-            cfg.sliding_window
-        );
-    }
-
     // ── Embed all m tokens (×√hidden) into a [m, dim] residual batch ──
     let x_batch = gpu.alloc_owned(&[m * dim], DType::F32)?;
     let embed_tmp = gpu.alloc_owned(&[dim], DType::F32)?;
@@ -469,11 +464,15 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
             )?;
         }
         let completed_layer = projector.project_layer(gpu, layer_idx, &tmp, &x_batch, m)?;
-        if weights.resident_only && !completed_layer {
+        if !encoder_path_is_available(
+            weights.resident_only,
+            completed_layer,
+            projector.supports_resident_only_projection_fallback(),
+        ) {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "resident-only EmbeddingGemma weights require the complete M256 NPU layer path (layer {layer_idx}, rows {m})"
+                    "resident-only EmbeddingGemma weights require either the complete M256 NPU layer path or complete NPU projection fallback (layer {layer_idx}, rows {m})"
                 ),
             ));
         }
@@ -532,8 +531,20 @@ fn encode_pooled_hidden_with_projector<P: LinearProjector>(
                 m,
             )?;
 
-            // Bidirectional self-attention: B = L = m, no causal mask.
-            gpu.attention_dflash_f32(&q, &k, &v, &attn_out, m, m, n_heads, n_kv_heads, head_dim)?;
+            if let Some(window) = bidirectional_attention_window(
+                cfg.is_global_layer(layer_idx),
+                cfg.sliding_window,
+                m,
+            ) {
+                gpu.attention_dflash_bidirectional_window_f32(
+                    &q, &k, &v, &attn_out, m, n_heads, n_kv_heads, head_dim, window,
+                )?;
+            } else {
+                // The local window covers the whole sequence in the short case.
+                gpu.attention_dflash_f32(
+                    &q, &k, &v, &attn_out, m, m, n_heads, n_kv_heads, head_dim,
+                )?;
+            }
             if trace_phases {
                 gpu.device_synchronize()?;
                 attention_core_ms += stage_started.elapsed().as_secs_f64() * 1e3;
@@ -755,6 +766,22 @@ fn pool_segments(
         .collect()
 }
 
+fn encoder_path_is_available(
+    resident_only: bool,
+    completed_layer: bool,
+    npu_projection_fallback: bool,
+) -> bool {
+    !resident_only || completed_layer || npu_projection_fallback
+}
+
+fn bidirectional_attention_window(
+    is_global_layer: bool,
+    sliding_window: usize,
+    sequence: usize,
+) -> Option<usize> {
+    (!is_global_layer && sequence > sliding_window).then_some(sliding_window)
+}
+
 fn tensor_metrics(left: &[f32], right: &[f32]) -> (f64, f32) {
     let mut dot = 0.0f64;
     let mut left_norm = 0.0f64;
@@ -861,6 +888,25 @@ mod tests {
             pool_segments(&hidden, &[0, 2, 4], 2, PoolingMode::Mean),
             vec![vec![3.0, 5.0], vec![200.0, 300.0]]
         );
+    }
+
+    #[test]
+    fn resident_only_accepts_complete_npu_projection_fallback() {
+        assert!(encoder_path_is_available(true, false, true));
+    }
+
+    #[test]
+    fn resident_only_rejects_non_npu_projection_fallback() {
+        assert!(!encoder_path_is_available(true, false, false));
+        assert!(encoder_path_is_available(true, true, false));
+        assert!(encoder_path_is_available(false, false, false));
+    }
+
+    #[test]
+    fn long_local_layers_use_exact_bidirectional_windows() {
+        assert_eq!(bidirectional_attention_window(false, 512, 513), Some(512));
+        assert_eq!(bidirectional_attention_window(true, 512, 2048), None);
+        assert_eq!(bidirectional_attention_window(false, 512, 512), None);
     }
 
     #[test]

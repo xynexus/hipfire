@@ -4,6 +4,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use hipfire_daemon_adapter::{EmbedRequest, RerankRequest};
+use hipfire_model::embedding::EmbeddingInputType;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -18,6 +19,8 @@ pub struct EmbeddingsRequest {
     pub dimensions: Option<usize>,
     #[serde(default)]
     pub dims: Option<usize>,
+    #[serde(default)]
+    pub input_type: EmbeddingInputType,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,13 +84,14 @@ pub async fn post_embeddings(
     let embeddings = match engine
         .embed(EmbedRequest {
             texts,
+            input_type: body.input_type,
             dims,
             worker_key_id: loaded.worker_key_id,
         })
         .await
     {
         Ok(embeddings) => embeddings,
-        Err(e) => return server_error(e.to_string()),
+        Err(e) => return embedding_error(e.to_string()),
     };
     let data = embeddings
         .into_iter()
@@ -205,4 +209,68 @@ fn server_error(message: impl Into<String>) -> Response {
         })),
     )
         .into_response()
+}
+
+fn embedding_error(message: String) -> Response {
+    if message.contains("maximum supported length")
+        || message.contains("no compiled sequence bucket")
+        || message.contains("unsupported embedding dimensions")
+        || message.contains("must be non-empty")
+    {
+        bad_request(message)
+    } else {
+        server_error(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedding_input_type_defaults_to_document_and_accepts_query() {
+        let default: EmbeddingsRequest = serde_json::from_value(json!({
+            "model": "embedding",
+            "input": ["one", "two"]
+        }))
+        .unwrap();
+        assert_eq!(default.input_type, EmbeddingInputType::Document);
+        assert!(matches!(default.input, EmbeddingInput::Many(values) if values.len() == 2));
+
+        let query: EmbeddingsRequest = serde_json::from_value(json!({
+            "model": "embedding",
+            "input": "question",
+            "input_type": "query",
+            "dimensions": 256
+        }))
+        .unwrap();
+        assert_eq!(query.input_type, EmbeddingInputType::Query);
+        assert_eq!(query.dimensions, Some(256));
+    }
+
+    #[test]
+    fn embedding_input_type_rejects_unknown_roles() {
+        let error = serde_json::from_value::<EmbeddingsRequest>(json!({
+            "model": "embedding",
+            "input": "text",
+            "input_type": "passage"
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn oversized_embedding_errors_are_client_errors() {
+        assert_eq!(
+            embedding_error(
+                "embedding input has 2049 tokens; maximum supported length is 2048".into()
+            )
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            embedding_error("missing NPU image".into()).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 }

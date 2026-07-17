@@ -1,6 +1,6 @@
 //! Format-generic Opus GEMM over AIE2P W4A8, W8A8, and sparse-overlay kernels.
 //!
-//! W4 (`qt=33/34`), compact mixed (`qt=36`), and W8 (`qt=35`) share one
+//! W4 (`qt=33/34`), compact mixed (`qt=36`), and W8 (`qt=35/43`) share one
 //! activation preprocessing and output reconstruction contract. Mixed matrices
 //! evaluate as `A·Q4 + A·(Q8-Q4)` with a variable number of sparse chunks.
 //!
@@ -9,9 +9,10 @@
 #![cfg(target_os = "linux")]
 
 use hipfire_primitives::{
-    conv::f16_to_f32,
+    conv::{bf16_bits_to_f32, f16_to_f32, f32_to_bf16_bits},
     fwht::{cpu_fwht_256, gen_fwht_signs},
 };
+use hipfire_quant_format::QuantType;
 use rayon::prelude::*;
 
 use crate::{
@@ -25,6 +26,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 const GROUP: usize = 256;
+const OQ8_QT: u8 = QuantType::Oq8G256.code();
+const OQ8_ROW_PADDED_QT: u8 = QuantType::Oq8G256RowPadded.code();
 
 /// Runtime encoding for any grouped Opus projection matrix.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,7 +36,7 @@ pub enum OpusMatrixEncoding {
     W4,
     /// Int4 bulk plus a variable number of int8 replacements (`qt=36`).
     Mixed { overlays: usize },
-    /// Pure signed-int8 groups (`qt=35`).
+    /// Pure signed-int8 groups (`qt=35`, or row-padded `qt=43`).
     W8,
 }
 
@@ -69,15 +72,18 @@ impl OpusMatrixEncoding {
         let block_bytes = data_len / blocks;
         match quant_type {
             33 | 34 if block_bytes == 130 => Ok(Self::W4),
-            35 if block_bytes == 258 => Ok(Self::W8),
+            OQ8_ROW_PADDED_QT if k % GROUP == 0 => Err(invalid(format!(
+                "row-padded OQ8 is only valid for ragged K, got K={k}"
+            ))),
+            OQ8_QT | OQ8_ROW_PADDED_QT if block_bytes == 258 => Ok(Self::W8),
             36 if block_bytes >= 132 && (block_bytes - 130) % 2 == 0 => Ok(Self::Mixed {
                 overlays: (block_bytes - 130) / 2,
             }),
             33 | 34 => Err(invalid(format!(
                 "W4 qt={quant_type} wants 130-byte blocks, got {block_bytes}"
             ))),
-            35 => Err(invalid(format!(
-                "W8 qt=35 wants 258-byte blocks, got {block_bytes}"
+            OQ8_QT | OQ8_ROW_PADDED_QT => Err(invalid(format!(
+                "W8 qt={quant_type} wants 258-byte blocks, got {block_bytes}"
             ))),
             36 => Err(invalid(format!(
                 "mixed qt=36 wants 130+2*N nonzero-overlay blocks, got {block_bytes}"
@@ -235,6 +241,59 @@ impl OpusPackedMatrix {
                             })
                             .sum();
                         *destination += dot as f32 * prepared.scales[group_idx][row] * scales[col];
+                    }
+                }
+            });
+        Ok(output)
+    }
+
+    /// Decode the stored rotated Opus weights into the ordinary KxN BF16
+    /// matrix used by precision-preserving NPU projection images. AWQ is folded
+    /// back into each input column exactly once at model load.
+    pub fn dequantized_bf16(&self) -> Vec<u16> {
+        let signs1 = gen_fwht_signs(42, GROUP);
+        let signs2 = gen_fwht_signs(1042, GROUP);
+        let ones = vec![1.0f32; self.k];
+        let awq = self.awq_scale.as_deref().unwrap_or(&ones);
+        let mut output = vec![0u16; self.k * self.n];
+        for (group_index, group) in self.groups.iter().enumerate() {
+            let dense = dense_group_i8(self.encoding, group);
+            for column in 0..self.n {
+                let mut values = [0.0f32; GROUP];
+                for inner in 0..GROUP {
+                    values[inner] = dense[inner * self.n + column] as f32 * group.scales[column];
+                }
+                cpu_fwht_256(&mut values, &signs2, &signs1);
+                for (inner, value) in values.into_iter().enumerate() {
+                    let row = group_index * GROUP + inner;
+                    output[row * self.n + column] = f32_to_bf16_bits(value / awq[row]);
+                }
+            }
+        }
+        output
+    }
+
+    /// CPU oracle for BF16 activations multiplied by the exact load-time
+    /// dequantized BF16 matrix.
+    pub fn reference_dequantized_bf16_f32(
+        &self,
+        m: usize,
+        x: &[f32],
+    ) -> Result<Vec<f32>, XdnaError> {
+        let mut output = vec![0.0f32; m * self.n];
+        validate_run_shapes(m, self.k, self.n, x, &output)?;
+        let weights = self.dequantized_bf16();
+        let k = self.k;
+        let n = self.n;
+        output
+            .par_chunks_mut(n)
+            .enumerate()
+            .for_each(|(row, destination)| {
+                for inner in 0..k {
+                    let activation = x[row * k + inner];
+                    for column in 0..n {
+                        destination[column] +=
+                            activation * bf16_bits_to_f32(weights[inner * n + column]);
                     }
                 }
             });
@@ -1633,6 +1692,11 @@ mod tests {
             OpusMatrixEncoding::classify(35, 258, 256, 1).unwrap(),
             OpusMatrixEncoding::W8
         );
+        assert_eq!(
+            OpusMatrixEncoding::classify(OQ8_ROW_PADDED_QT, 2 * 258, 384, 1).unwrap(),
+            OpusMatrixEncoding::W8
+        );
+        assert!(OpusMatrixEncoding::classify(OQ8_ROW_PADDED_QT, 258, 256, 1).is_err());
         assert!(OpusMatrixEncoding::classify(36, 130, 256, 1).is_err());
         assert!(OpusMatrixEncoding::classify(35, 257, 256, 1).is_err());
         assert!(OpusMatrixEncoding::classify(7, 130, 256, 1).is_err());

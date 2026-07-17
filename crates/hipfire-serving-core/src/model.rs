@@ -38,6 +38,7 @@ use hipfire_runtime::sequence_state::SequenceState;
 use hipfire_runtime::triattn::EvictionCtx;
 use hipfire_state::ModelArtifactMemory;
 
+use crate::qwen3_embedding::Qwen3EmbeddingState;
 #[cfg(feature = "arch-lfm2moe")]
 use crate::session::Lfm2RequestSessionState;
 use crate::session::Qwen35RequestSessionState;
@@ -142,6 +143,7 @@ pub struct DsparkState {
 /// Resident non-autoregressive embedding model state (arch_id=19).
 pub struct EmbeddingGemmaState {
     pub config: embeddinggemma::EmbeddingGemmaConfig,
+    pub embedding_metadata: Option<hipfire_model::embedding::EmbeddingMetadata>,
     pub weights: embeddinggemma::EmbeddingGemmaWeights,
     #[cfg(target_os = "linux")]
     pub npu_projector: Option<std::sync::Mutex<embeddinggemma::NpuOpusProjector>>,
@@ -406,6 +408,9 @@ pub struct LoadedModel {
     // embeddinggemma (arch_id=19). Bidirectional encoder for embeddings/rerank;
     // no KV cache and no autoregressive decode state.
     pub embeddinggemma: Option<EmbeddingGemmaState>,
+    /// Qwen3 (arch_id=1) embedding workload. Holds no lm_head, generation
+    /// scratch, or persistent KV state; all encoder execution is XDNA-only.
+    pub qwen3_embedding: Option<Qwen3EmbeddingState>,
     // Shared
     pub tokenizer: Option<hipfire_model::tokenizer::Tokenizer>,
     /// Advertised context window — client-facing capacity, the upper bound on

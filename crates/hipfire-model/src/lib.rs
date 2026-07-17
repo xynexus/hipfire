@@ -4,6 +4,7 @@
 
 //! Shared model artifact identity helpers and model-source contracts.
 
+pub mod embedding;
 /// Generated model-support tables (`ARCH_ROWS`/`QUANT_TABLE`/`GATE_TABLE`).
 /// Source of truth: `docs/model-support.toml`; regenerate with
 /// `cargo run -p hipfire-cli -- gen-model-support`.
@@ -2024,7 +2025,7 @@ fn is_arch_group(group: &str) -> bool {
 fn is_feature_group(group: &str) -> bool {
     matches!(
         group,
-        "mtp" | "vl" | "dflash" | "triattn" | "jinja" | "hessian"
+        "mtp" | "vl" | "dflash" | "triattn" | "jinja" | "hessian" | "npu"
     )
 }
 
@@ -2787,6 +2788,15 @@ mod tests {
         assert_eq!(qwen.model, "Qwen3.5");
         assert_eq!(qwen.size.as_deref(), Some("9B"));
         assert_eq!(qwen.quant, "mq4");
+
+        let qwen_embedding =
+            parse_canonical_model_artifact_name("Qwen3-Embedding-0.6B.npu.oq8+.gfx1151.hfq")
+                .unwrap();
+        assert_eq!(qwen_embedding.model, "Qwen3-Embedding");
+        assert_eq!(qwen_embedding.size.as_deref(), Some("0.6B"));
+        assert_eq!(qwen_embedding.features, vec!["npu"]);
+        assert_eq!(qwen_embedding.quant, "oq8+");
+        assert_eq!(qwen_embedding.arch.as_deref(), Some("gfx1151"));
     }
 
     #[test]
@@ -3023,8 +3033,9 @@ mod tests {
                 "num_experts_per_tok": 1,
             },
         });
+        let model_path = models.join("DeepSeek-V4-671M-E71M.mq4.hfq");
         write_index_hfq(
-            &models.join("Deepseek-v4-Flash.hfq"),
+            &model_path,
             &metadata,
             &[
                 (
@@ -3039,13 +3050,14 @@ mod tests {
                 ),
             ],
         );
+        read_hfq_inventory(&model_path).expect("fixture inventory must be readable");
 
         let registry = build_llm_registry_in(&models, &triattn, &drafts, &templates);
 
         assert_eq!(registry.model_count(), 1);
         let model = &registry.models[0];
-        assert_eq!(model.id, "Deepseek-v4-Flash");
-        assert_eq!(model.model, "Deepseek-v4-Flash");
+        assert_eq!(model.id, "DeepSeek-V4-671M-E71M.mq4");
+        assert_eq!(model.model, "DeepSeek-V4-671M-E71M.mq4");
         assert_eq!(model.size.as_deref(), Some("671M-E71M"));
         assert_eq!(model.quant, "unknown");
         assert_eq!(
@@ -3714,6 +3726,7 @@ mod tests {
                 index.extend_from_slice(&dim.to_le_bytes());
             }
             index.extend_from_slice(&0u32.to_le_bytes());
+            index.extend_from_slice(&0u64.to_le_bytes());
             index.extend_from_slice(&0u64.to_le_bytes());
         }
         let metadata_offset = 32u64;

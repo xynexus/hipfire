@@ -6,7 +6,7 @@ use hipfire_rdna::{
     DType, Gpu, GpuTensor, ImportedTensor, OpusNpuIoLayout, OwnedTensor, SharedGttBuffer,
 };
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::quant::f16_to_f32;
+use hipfire_runtime::quant::{f16_to_f32, QuantType};
 use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 use hipfire_xdna::{
     NpuAttentionOutputBf16, NpuAttentionOutputBf16Weights, NpuEmbeddingDenseL2,
@@ -1776,6 +1776,7 @@ fn fullk_mode_tag(quant_type: u8) -> Option<&'static str> {
     match quant_type {
         33 | 34 => Some("w4"),
         35 => Some("w8"),
+        value if value == QuantType::Oq8G256RowPadded.code() => Some("w8"),
         36 => Some("mixed"),
         _ => None,
     }
@@ -1916,6 +1917,10 @@ fn try_shared_projection(
 }
 
 impl LinearProjector for NpuOpusProjector {
+    fn supports_resident_only_projection_fallback(&self) -> bool {
+        !self.layers.is_empty() && self.layers.iter().all(|layer| layer.down.is_some())
+    }
+
     fn project_layer(
         &mut self,
         gpu: &mut Gpu,
@@ -3101,12 +3106,16 @@ impl LinearProjector for NpuOpusProjector {
         v: &GpuTensor,
         rows: usize,
     ) -> HipResult<()> {
-        if self
+        let resident_rows = self
+            .resident_layer
+            .as_ref()
+            .map(|state| state.attention.loaded_rows());
+        let combined_available = self
             .layers
             .get(layer_idx)
             .and_then(|layer| layer.qkv.as_ref())
-            .is_none()
-        {
+            .is_some();
+        if !use_combined_qkv(combined_available, resident_rows, rows) {
             self.project(gpu, layer_idx, Projection::Query, wq, input, q, rows)?;
             self.project(gpu, layer_idx, Projection::Key, wk, input, k, rows)?;
             return self.project(gpu, layer_idx, Projection::Value, wv, input, v, rows);
@@ -3259,7 +3268,7 @@ impl LinearProjector for NpuOpusProjector {
         if self
             .resident_ffn
             .as_ref()
-            .is_some_and(|state| rows <= state.rows())
+            .is_some_and(|state| use_fixed_resident_geometry(rows, state.rows()))
             && self.resident_ffn_selected
         {
             let layer = self
@@ -3567,7 +3576,8 @@ fn load_optional_matrix(
     let (info, payload) = hfq
         .tensor_data_vec(name)
         .ok_or_else(|| format!("embeddinggemma NPU: missing tensor {name}"))?;
-    if !matches!(info.quant_type, 33..=36) {
+    if !matches!(info.quant_type, 33..=36) && info.quant_type != QuantType::Oq8G256RowPadded.code()
+    {
         return Ok(None);
     }
     if info.shape.len() != 2 {
@@ -3632,6 +3642,7 @@ fn opus_prepacked_path(
     let format = match quant_type {
         33 | 34 => "oq4",
         35 => "oq8",
+        value if value == QuantType::Oq8G256RowPadded.code() => "oq8-row-padded",
         36 => "oq-mixed",
         _ => "oq-unknown",
     };
@@ -3788,6 +3799,14 @@ fn should_materialize_completed_output(
     compare_layer: bool,
 ) -> bool {
     terminal_or_fallback || !prepared_activation || !prepared_residual || compare_layer
+}
+
+fn use_fixed_resident_geometry(rows: usize, loaded_rows: usize) -> bool {
+    rows == loaded_rows
+}
+
+fn use_combined_qkv(combined_available: bool, resident_rows: Option<usize>, rows: usize) -> bool {
+    combined_available && resident_rows.is_none_or(|loaded_rows| rows == loaded_rows)
 }
 
 fn host_metrics(left: &[f32], right: &[f32]) -> (f64, f32) {
@@ -3971,6 +3990,21 @@ mod tests {
         ));
         assert!(should_materialize_completed_output(true, true, true, false));
         assert!(should_materialize_completed_output(false, true, true, true));
+    }
+
+    #[test]
+    fn fixed_resident_components_require_exact_loaded_rows() {
+        assert!(use_fixed_resident_geometry(512, 512));
+        assert!(!use_fixed_resident_geometry(131, 512));
+        assert!(!use_fixed_resident_geometry(256, 512));
+    }
+
+    #[test]
+    fn staged_combined_qkv_is_not_used_for_variable_rows() {
+        assert!(use_combined_qkv(true, Some(512), 512));
+        assert!(!use_combined_qkv(true, Some(512), 131));
+        assert!(!use_combined_qkv(false, Some(512), 512));
+        assert!(use_combined_qkv(true, None, 131));
     }
 
     #[test]

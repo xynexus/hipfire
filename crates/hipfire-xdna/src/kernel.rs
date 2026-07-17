@@ -183,6 +183,7 @@ impl NpuKernel {
     /// instruction, argument, and imported dma-buf BOs. This resets array-local
     /// core/FIFO state without changing any command-packet argument addresses.
     pub fn recreate_hwctx(&mut self) -> Result<(), XdnaError> {
+        let started = xdna_trace_enabled().then(std::time::Instant::now);
         self.dev.destroy_hwctx(self.hwctx)?;
         let (hwctx, syncobj) =
             self.dev
@@ -193,6 +194,12 @@ impl NpuKernel {
         }
         self.hwctx = hwctx;
         self.syncobj = syncobj;
+        if let Some(started) = started {
+            eprintln!(
+                "xdna_hwctx_recreate elapsed_ms={:.3}",
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
         Ok(())
     }
 

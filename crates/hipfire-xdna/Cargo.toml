@@ -10,6 +10,7 @@ description = "AMD XDNA (Ryzen AI NPU) device layer for hipfire: /dev/accel ioct
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 hipfire-primitives = { path = "../hipfire-primitives" }
+hipfire-quant-format = { path = "../hipfire-quant-format" }
 rayon.workspace = true
 sha2 = "0.10"
 

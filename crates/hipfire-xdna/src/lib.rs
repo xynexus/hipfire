@@ -161,8 +161,51 @@ pub mod kernel;
 #[cfg(target_os = "linux")]
 pub use kernel::{NpuInFlight, NpuKernel};
 
+#[cfg(target_os = "linux")]
+pub mod full_embedding_encoder;
+#[cfg(target_os = "linux")]
+pub use full_embedding_encoder::{FullEmbeddingIoGeometry, NpuFullEmbeddingEncoder};
+
 pub mod embedding_attention;
 pub use embedding_attention::EmbeddingGemmaAttentionLayout;
+
+pub mod segmented_attention;
+#[cfg(target_os = "linux")]
+pub use segmented_attention::NpuSegmentedAttention;
+pub use segmented_attention::SegmentedAttentionGeometry;
+
+#[cfg(target_os = "linux")]
+pub mod qwen3_pack;
+#[cfg(target_os = "linux")]
+pub use qwen3_pack::{NpuQwen3AttentionUnpack, NpuQwen3KvPack, NpuQwen3QueryPack};
+
+#[cfg(target_os = "linux")]
+pub mod qwen3_projection;
+#[cfg(target_os = "linux")]
+pub use qwen3_projection::NpuQwen3Oq8Projection;
+
+#[cfg(target_os = "linux")]
+mod qwen3_residual_rmsnorm;
+#[cfg(target_os = "linux")]
+pub use qwen3_residual_rmsnorm::NpuQwen3ResidualRmsNorm;
+
+#[cfg(target_os = "linux")]
+mod qwen3_headnorm_rope;
+#[cfg(target_os = "linux")]
+pub use qwen3_headnorm_rope::{NpuQwen3HeadNormRope, Qwen3HeadNormRopeGeometry};
+
+#[cfg(target_os = "linux")]
+mod qwen3_swiglu;
+#[cfg(target_os = "linux")]
+pub use qwen3_swiglu::NpuQwen3SwiGlu;
+
+#[cfg(target_os = "linux")]
+mod qwen3_final_pool_l2;
+#[cfg(target_os = "linux")]
+pub use qwen3_final_pool_l2::NpuQwen3FinalPoolL2;
+
+#[cfg(target_os = "linux")]
+mod qwen3_encoder_blob;
 
 #[cfg(target_os = "linux")]
 pub mod attention_output_bf16;
@@ -946,10 +989,21 @@ mod imp {
 
         /// Sync a BO's cache to/from the device (`submit::SYNC_DIRECT_*`).
         pub fn sync_bo(&self, handle: u32, direction: u32, size: usize) -> Result<(), XdnaError> {
+            self.sync_bo_range(handle, direction, 0, size)
+        }
+
+        /// Sync a byte range of a BO's cache to/from the device.
+        pub fn sync_bo_range(
+            &self,
+            handle: u32,
+            direction: u32,
+            offset: usize,
+            size: usize,
+        ) -> Result<(), XdnaError> {
             let mut s = submit::SyncBo {
                 handle,
                 direction,
-                offset: 0,
+                offset: offset as u64,
                 size: size as u64,
             };
             self.submit_ioctl(

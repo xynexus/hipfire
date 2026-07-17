@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use hipfire_generate::{DoneEvent, ErrorEvent, GenerateTextRequest, TokenEvent, ToolCallsEvent};
 use hipfire_kld::KldConfig;
+pub use hipfire_model::embedding::EmbeddingInputType;
 use hipfire_model::{
     AcceleratorInventory, LlmModelRegistry, ModelLoadRequest, ModelLoadedResponse,
 };
@@ -307,6 +308,8 @@ pub struct BenchPrefillResponse {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EmbedRequest {
     pub texts: Vec<String>,
+    #[serde(default)]
+    pub input_type: EmbeddingInputType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dims: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -949,5 +952,27 @@ mod tests {
         assert_eq!(tool_calls.id, "req-1");
         assert_eq!(tool_calls.calls[0].name, "lookup");
         assert_eq!(tool_calls.calls[0].arguments, json!({"q": "hipfire"}));
+    }
+
+    #[test]
+    fn embed_input_type_defaults_to_document_and_rejects_unknown_roles() {
+        let request: EmbedRequest = serde_json::from_value(serde_json::json!({
+            "texts": ["hello"]
+        }))
+        .unwrap();
+        assert_eq!(request.input_type, EmbeddingInputType::Document);
+
+        let query: EmbedRequest = serde_json::from_value(serde_json::json!({
+            "texts": ["hello"],
+            "input_type": "query"
+        }))
+        .unwrap();
+        assert_eq!(query.input_type, EmbeddingInputType::Query);
+
+        assert!(serde_json::from_value::<EmbedRequest>(serde_json::json!({
+            "texts": ["hello"],
+            "input_type": "passage"
+        }))
+        .is_err());
     }
 }

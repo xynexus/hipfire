@@ -1,0 +1,289 @@
+{
+  "schema_version": 1,
+  "benchmark": "openai_http_embeddings",
+  "timestamp_utc": "2026-07-16T17:01:16.527520+00:00",
+  "host": "halo",
+  "git_commit": "371460708718e4a2e0558b2c3a702d33d6d6edda",
+  "endpoint": "http://127.0.0.1:11435/v1/embeddings",
+  "model": "EmbeddingGemma-300M.npu.oq8",
+  "embedding_dimensions": 768,
+  "corpus": "/home/sadara/.hipfire/datasets/embeddinggemma/fiqa/5e59eeb3a7df6b85882112b747008547c21587ea/corpus.jsonl",
+  "corpus_sha256": "a5e31bffdcbab9dbe0ff849faa170a6e71b60587ff3a99a4272584183e64d729",
+  "corpus_documents_loaded": 57600,
+  "seed": 20260716,
+  "max_estimated_tokens_per_document": 256,
+  "max_utf8_bytes_per_document": 1024,
+  "token_accounting": "HTTP usage.prompt_tokens; Hipfire estimates ceil(UTF-8 bytes / 4)",
+  "warmup_requests_per_batch_size": 1,
+  "timed_requests_per_batch_size": 3,
+  "http_concurrency": 1,
+  "rate_limit_wait_excluded_from_request_latency": true,
+  "results": [
+    {
+      "batch_size": 1,
+      "requests": 3,
+      "documents": 3,
+      "input_bytes": 1213,
+      "estimated_tokens": 305,
+      "mean_estimated_tokens_per_document": 101.66666666666667,
+      "total_ms": 1031.0430579120293,
+      "latency_mean_ms": 343.6810193040098,
+      "latency_p50_ms": 341.0895310807973,
+      "latency_p95_ms": 349.19527925085276,
+      "latency_p99_ms": 349.91579019930214,
+      "documents_per_second": 2.909674796778435,
+      "estimated_tokens_per_second": 295.81693767247424,
+      "samples": [
+        {
+          "request": 1,
+          "documents": 1,
+          "input_bytes": 262,
+          "estimated_tokens": 66,
+          "latency_ms": 339.85760889481753
+        },
+        {
+          "request": 2,
+          "documents": 1,
+          "input_bytes": 433,
+          "estimated_tokens": 109,
+          "latency_ms": 341.0895310807973
+        },
+        {
+          "request": 3,
+          "documents": 1,
+          "input_bytes": 518,
+          "estimated_tokens": 130,
+          "latency_ms": 350.0959179364145
+        }
+      ]
+    },
+    {
+      "batch_size": 2,
+      "requests": 3,
+      "documents": 6,
+      "input_bytes": 3475,
+      "estimated_tokens": 870,
+      "mean_estimated_tokens_per_document": 145.0,
+      "total_ms": 2048.5817790031433,
+      "latency_mean_ms": 682.8605930010477,
+      "latency_p50_ms": 685.6331870658323,
+      "latency_p95_ms": 685.7290342333727,
+      "latency_p99_ms": 685.7375539815985,
+      "documents_per_second": 2.928855494809511,
+      "estimated_tokens_per_second": 424.6840467473791,
+      "samples": [
+        {
+          "request": 1,
+          "documents": 2,
+          "input_bytes": 1236,
+          "estimated_tokens": 309,
+          "latency_ms": 677.2089080186561
+        },
+        {
+          "request": 2,
+          "documents": 2,
+          "input_bytes": 1210,
+          "estimated_tokens": 303,
+          "latency_ms": 685.6331870658323
+        },
+        {
+          "request": 3,
+          "documents": 2,
+          "input_bytes": 1029,
+          "estimated_tokens": 258,
+          "latency_ms": 685.7396839186549
+        }
+      ]
+    },
+    {
+      "batch_size": 4,
+      "requests": 3,
+      "documents": 12,
+      "input_bytes": 7627,
+      "estimated_tokens": 1912,
+      "mean_estimated_tokens_per_document": 159.33333333333334,
+      "total_ms": 4100.1936389366165,
+      "latency_mean_ms": 1366.7312129788722,
+      "latency_p50_ms": 1360.1677829865366,
+      "latency_p95_ms": 1380.3864530753344,
+      "latency_p99_ms": 1382.1836681943387,
+      "documents_per_second": 2.9266910435752482,
+      "estimated_tokens_per_second": 466.3194396096562,
+      "samples": [
+        {
+          "request": 1,
+          "documents": 4,
+          "input_bytes": 2214,
+          "estimated_tokens": 555,
+          "latency_ms": 1382.6329719740897
+        },
+        {
+          "request": 2,
+          "documents": 4,
+          "input_bytes": 2630,
+          "estimated_tokens": 659,
+          "latency_ms": 1360.1677829865366
+        },
+        {
+          "request": 3,
+          "documents": 4,
+          "input_bytes": 2783,
+          "estimated_tokens": 698,
+          "latency_ms": 1357.3928839759901
+        }
+      ]
+    },
+    {
+      "batch_size": 8,
+      "requests": 3,
+      "documents": 24,
+      "input_bytes": 15641,
+      "estimated_tokens": 3920,
+      "mean_estimated_tokens_per_document": 163.33333333333334,
+      "total_ms": 8517.283582012169,
+      "latency_mean_ms": 2839.0945273373895,
+      "latency_p50_ms": 2789.753218065016,
+      "latency_p95_ms": 2957.0704800775275,
+      "latency_p99_ms": 2971.9431255897507,
+      "documents_per_second": 2.8177998030599927,
+      "estimated_tokens_per_second": 460.24063449979883,
+      "samples": [
+        {
+          "request": 1,
+          "documents": 8,
+          "input_bytes": 4355,
+          "estimated_tokens": 1092,
+          "latency_ms": 2975.6612869678065
+        },
+        {
+          "request": 2,
+          "documents": 8,
+          "input_bytes": 5667,
+          "estimated_tokens": 1420,
+          "latency_ms": 2751.8690769793466
+        },
+        {
+          "request": 3,
+          "documents": 8,
+          "input_bytes": 5619,
+          "estimated_tokens": 1408,
+          "latency_ms": 2789.753218065016
+        }
+      ]
+    },
+    {
+      "batch_size": 16,
+      "requests": 3,
+      "documents": 48,
+      "input_bytes": 31006,
+      "estimated_tokens": 7771,
+      "mean_estimated_tokens_per_document": 161.89583333333334,
+      "total_ms": 16845.184418023564,
+      "latency_mean_ms": 5615.061472674522,
+      "latency_p50_ms": 5578.376703080721,
+      "latency_p95_ms": 5761.569111899007,
+      "latency_p99_ms": 5777.852881571744,
+      "documents_per_second": 2.8494790445061695,
+      "estimated_tokens_per_second": 461.31878447619675,
+      "samples": [
+        {
+          "request": 1,
+          "documents": 16,
+          "input_bytes": 11038,
+          "estimated_tokens": 2767,
+          "latency_ms": 5578.376703080721
+        },
+        {
+          "request": 2,
+          "documents": 16,
+          "input_bytes": 11637,
+          "estimated_tokens": 2914,
+          "latency_ms": 5781.923823989928
+        },
+        {
+          "request": 3,
+          "documents": 16,
+          "input_bytes": 8331,
+          "estimated_tokens": 2090,
+          "latency_ms": 5484.883890952915
+        }
+      ]
+    },
+    {
+      "batch_size": 32,
+      "requests": 3,
+      "documents": 96,
+      "input_bytes": 51999,
+      "estimated_tokens": 13035,
+      "mean_estimated_tokens_per_document": 135.78125,
+      "total_ms": 34423.03873610217,
+      "latency_mean_ms": 11474.346245367391,
+      "latency_p50_ms": 11547.422395087779,
+      "latency_p95_ms": 11760.69218562916,
+      "latency_p99_ms": 11779.649500343949,
+      "documents_per_second": 2.7888299094093973,
+      "estimated_tokens_per_second": 378.67081113699476,
+      "samples": [
+        {
+          "request": 1,
+          "documents": 32,
+          "input_bytes": 15512,
+          "estimated_tokens": 3889,
+          "latency_ms": 11547.422395087779
+        },
+        {
+          "request": 2,
+          "documents": 32,
+          "input_bytes": 18311,
+          "estimated_tokens": 4590,
+          "latency_ms": 11091.227511991747
+        },
+        {
+          "request": 3,
+          "documents": 32,
+          "input_bytes": 18176,
+          "estimated_tokens": 4556,
+          "latency_ms": 11784.388829022646
+        }
+      ]
+    },
+    {
+      "batch_size": 64,
+      "requests": 3,
+      "documents": 192,
+      "input_bytes": 111092,
+      "estimated_tokens": 27842,
+      "mean_estimated_tokens_per_document": 145.01041666666666,
+      "total_ms": 68494.92377601564,
+      "latency_mean_ms": 22831.64125867188,
+      "latency_p50_ms": 22831.12397498917,
+      "latency_p95_ms": 23275.481972214766,
+      "latency_p99_ms": 23314.98046085704,
+      "documents_per_second": 2.803127435076163,
+      "estimated_tokens_per_second": 406.482677330159,
+      "samples": [
+        {
+          "request": 1,
+          "documents": 64,
+          "input_bytes": 34289,
+          "estimated_tokens": 8593,
+          "latency_ms": 22831.12397498917
+        },
+        {
+          "request": 2,
+          "documents": 64,
+          "input_bytes": 36485,
+          "estimated_tokens": 9148,
+          "latency_ms": 22338.94471800886
+        },
+        {
+          "request": 3,
+          "documents": 64,
+          "input_bytes": 40318,
+          "estimated_tokens": 10101,
+          "latency_ms": 23324.85508301761
+        }
+      ]
+    }
+  ]
+}

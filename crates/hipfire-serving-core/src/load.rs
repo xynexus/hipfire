@@ -38,12 +38,14 @@ use hipfire_model::{
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::kv;
 use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::quant::QuantType;
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 
+use crate::embedding_runtime::{classify_embedding_workload, EmbeddingRuntimeKind};
 use crate::memory::{hfq_model_memory, unknown_model_memory};
 use crate::model::CaskConfig;
 #[cfg(feature = "arch-lfm2moe")]
@@ -52,6 +54,7 @@ use crate::model::{
     DdtreeState, DflashState, DsparkState, EmbeddingGemmaState, Eviction, LoadedModel,
     ResidentSession,
 };
+use crate::qwen3_embedding::Qwen3EmbeddingState;
 use crate::session::{
     next_qwen35_state_allocation_epoch, SessionRegistry, QWEN35_LEGACY_SESSION_ID,
 };
@@ -654,6 +657,114 @@ pub fn load_model(
         requested.clamp(512.min(max_seq), max_seq)
     };
 
+    let embedding_metadata =
+        hipfire_model::embedding::EmbeddingMetadata::from_hfq_metadata_json(&hfq.metadata_json)?;
+    let embedding_runtime = classify_embedding_workload(hfq.arch_id, embedding_metadata.as_ref())?;
+
+    if embedding_runtime == Some(EmbeddingRuntimeKind::Qwen3) {
+        if draft_path.is_some() {
+            return Err(
+                "DFlash is not supported by Qwen3 embedding workloads; reload without a draft"
+                    .into(),
+            );
+        }
+        if cask.sidecar.is_some() {
+            return Err(
+                "CASK eviction is not supported by Qwen3 embedding workloads; reload without --cask-sidecar"
+                    .into(),
+            );
+        }
+        let metadata = embedding_metadata.expect("classified Qwen3 embedding has metadata");
+        let config = hipfire_runtime::hfq::config_from_hfq(&hfq)
+            .ok_or_else(|| "Qwen3 embedding: failed to parse Qwen3 config".to_string())?;
+        if config.arch != llama::ModelArch::Qwen3 || !config.has_qk_norm {
+            return Err(
+                "Qwen3 embedding requires model_type=qwen3 and per-head Q/K norm tensors".into(),
+            );
+        }
+        let state = Qwen3EmbeddingState::load(&hfq, config, metadata)?;
+        hfq.drop_mmap();
+        eprintln!(
+            "  qwen3 embedding: hidden={}, layers={}, heads={}, kv_heads={}, head_dim={}, intermediate={}, backend=xdna-only",
+            state.config.dim,
+            state.config.n_layers,
+            state.config.n_heads,
+            state.config.n_kv_heads,
+            state.config.head_dim,
+            state.config.hidden_dim,
+        );
+        let chat_template = resolve_chat_template(&hfq, path);
+        let (chat_template, chat_template_profile) =
+            profile_chat_template(chat_template, Some(&tokenizer));
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            registered_backend: None,
+            pp: 1,
+            pp_gpus: None,
+            pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            q35_kv_mode: None,
+            q35_state_quant: None,
+            q35_registry: SessionRegistry::default(),
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            llama_backend: None,
+            nemotron_backend: None,
+            zaya_backend: None,
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_config: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_weights: None,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_registry: SessionRegistry::default(),
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2moe_eos_tok: 0,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
+            gemma3_vl: None,
+            gemma3_text: None,
+            embeddinggemma: None,
+            qwen3_embedding: Some(state),
+            tokenizer: Some(tokenizer),
+            active: ResidentSession::default(),
+            max_seq: 2048,
+            physical_cap: 2048,
+            eviction: None,
+            asst_turn_cache: std::collections::HashMap::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            memory: model_memory,
+            #[cfg(feature = "arch-lfm2moe")]
+            lfm2_dflash: None,
+            dflash: None,
+            dspark: None,
+            chat_template,
+            chat_template_profile,
+        });
+    }
+
     if hfq.arch_id == ARCH_ID_EMBEDDINGGEMMA {
         // embeddinggemma is a non-autoregressive encoder: no KV cache, no
         // decode loop, and no speculative drafter/eviction state.
@@ -673,6 +784,7 @@ pub fn load_model(
         let _ = (kv_mode.as_str(), state_quant_override);
         let cfg = hipfire_arch_embeddinggemma::config_from_metadata_json(&hfq.metadata_json)
             .ok_or("embeddinggemma: failed to parse config from HFQ metadata")?;
+        let embedding_metadata = embedding_metadata;
         eprintln!(
             "  embeddinggemma: hidden={}, layers={}, heads={}, kv_heads={}, vocab={}, embedding_dim={}, matryoshka={:?}",
             cfg.hidden_size,
@@ -683,18 +795,53 @@ pub fn load_model(
             cfg.embedding_dim,
             cfg.matryoshka_dims,
         );
+        let storage = embeddinggemma_storage_contract(hfq.tensors())?;
+        let metadata_requires_npu = embedding_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.npu.as_ref())
+            .is_some_and(|npu| npu.required);
+        let requires_npu = metadata_requires_npu || storage.requires_npu();
+        if requires_npu {
+            eprintln!(
+                "  embeddinggemma: artifact contract requires XDNA{}",
+                if !metadata_requires_npu {
+                    " (legacy implicit qt=35; requantize to explicit qt=43)"
+                } else {
+                    ""
+                }
+            );
+        }
         #[cfg(target_os = "linux")]
-        let npu_projector = load_embeddinggemma_npu_projector(&hfq, &cfg);
+        let npu_projector = load_embeddinggemma_npu_projector(&hfq, &cfg, requires_npu);
         #[cfg(target_os = "linux")]
-        let weights = if npu_projector.is_some() {
-            load_embeddinggemma_gpu_fallback_weights(&mut hfq, &cfg, gpu, Path::new(path))
+        let weights = if requires_npu {
+            if std::env::var_os("HIPFIRE_EMBED_GPU_FALLBACK_MODEL").is_some() {
+                load_embeddinggemma_gpu_fallback_weights(&cfg, gpu)
+            } else if npu_projector.is_some() {
+                hipfire_arch_embeddinggemma::EmbeddingGemmaWeights::load_resident_npu(
+                    &mut hfq, &cfg, gpu,
+                )
+            } else {
+                Err(
+                    "row-padded OQ8 artifact requires a complete XDNA resident-layer cache; \
+                     set HIPFIRE_EMBED_GPU_FALLBACK_MODEL for an explicit GPU fallback"
+                        .to_string(),
+                )
+            }
         } else {
             hipfire_arch_embeddinggemma::EmbeddingGemmaWeights::load(&mut hfq, &cfg, gpu)
         }
         .map_err(|e| format!("embeddinggemma weights: {e}"))?;
         #[cfg(not(target_os = "linux"))]
-        let weights = hipfire_arch_embeddinggemma::EmbeddingGemmaWeights::load(&mut hfq, &cfg, gpu)
-            .map_err(|e| format!("embeddinggemma weights: {e}"))?;
+        let weights = {
+            if requires_npu {
+                return Err(
+                    "NPU-only embedding artifact requires the Linux XDNA backend".to_string(),
+                );
+            }
+            hipfire_arch_embeddinggemma::EmbeddingGemmaWeights::load(&mut hfq, &cfg, gpu)
+                .map_err(|e| format!("embeddinggemma weights: {e}"))?
+        };
         let chat_template = resolve_chat_template(&hfq, path);
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
@@ -749,10 +896,12 @@ pub fn load_model(
             gemma3_text: None,
             embeddinggemma: Some(EmbeddingGemmaState {
                 config: cfg,
+                embedding_metadata,
                 weights,
                 #[cfg(target_os = "linux")]
                 npu_projector,
             }),
+            qwen3_embedding: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -850,6 +999,7 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             embeddinggemma: None,
+            qwen3_embedding: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq: physical_cap,
@@ -942,6 +1092,7 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             embeddinggemma: None,
+            qwen3_embedding: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -1069,6 +1220,7 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             embeddinggemma: None,
+            qwen3_embedding: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -1168,6 +1320,7 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: Some(backend),
             embeddinggemma: None,
+            qwen3_embedding: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -1280,6 +1433,7 @@ pub fn load_model(
             gemma3_vl: Some(backend),
             gemma3_text: None,
             embeddinggemma: None,
+            qwen3_embedding: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -1379,6 +1533,7 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             embeddinggemma: None,
+            qwen3_embedding: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -1499,6 +1654,7 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             embeddinggemma: None,
+            qwen3_embedding: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -1625,6 +1781,7 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             embeddinggemma: None,
+            qwen3_embedding: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -1856,6 +2013,7 @@ pub fn load_model(
                 gemma3_vl: None,
                 gemma3_text: None,
                 embeddinggemma: None,
+                qwen3_embedding: None,
                 tokenizer: Some(tokenizer),
                 active: ResidentSession {
                     lfm2moe_state: Some(state),
@@ -2211,6 +2369,7 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             embeddinggemma: None,
+            qwen3_embedding: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession {
                 sequence_state,
@@ -2341,6 +2500,7 @@ pub fn load_model(
             gemma3_vl: None,
             gemma3_text: None,
             embeddinggemma: None,
+            qwen3_embedding: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -2364,8 +2524,12 @@ pub fn load_model(
 fn load_embeddinggemma_npu_projector(
     hfq: &HfqFile,
     config: &hipfire_arch_embeddinggemma::EmbeddingGemmaConfig,
+    storage_requires_npu: bool,
 ) -> Option<std::sync::Mutex<hipfire_arch_embeddinggemma::NpuOpusProjector>> {
-    let requested = std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER").is_ok_and(|value| value != "0");
+    let requested = match std::env::var("HIPFIRE_EMBED_RESIDENT_LAYER") {
+        Ok(value) => value != "0",
+        Err(_) => storage_requires_npu,
+    };
     if !requested {
         return None;
     }
@@ -2394,16 +2558,23 @@ fn load_embeddinggemma_npu_projector(
         &cache_root,
         batch,
     ) {
-        Ok(projector) => {
+        Ok(projector) if !storage_requires_npu || projector.resident_layer_enabled() => {
             eprintln!(
                 "  embeddinggemma: resident NPU enabled, batch={batch}, cache={}",
                 cache_root.display()
             );
             Some(std::sync::Mutex::new(projector))
         }
+        Ok(_) => {
+            eprintln!(
+                "embeddinggemma NPU unavailable (row-padded OQ8 requires the complete \
+                 resident-layer cache); serving will use an explicit GPU fallback if configured"
+            );
+            None
+        }
         Err(error) => {
             eprintln!(
-                "embeddinggemma NPU unavailable ({error}); serving will use the GPU fallback"
+                "embeddinggemma NPU unavailable ({error}); serving will use an explicit GPU fallback if configured"
             );
             None
         }
@@ -2412,23 +2583,12 @@ fn load_embeddinggemma_npu_projector(
 
 #[cfg(target_os = "linux")]
 fn load_embeddinggemma_gpu_fallback_weights(
-    primary_hfq: &mut HfqFile,
     config: &hipfire_arch_embeddinggemma::EmbeddingGemmaConfig,
     gpu: &mut hipfire_rdna::Gpu,
-    model_path: &Path,
 ) -> Result<hipfire_arch_embeddinggemma::EmbeddingGemmaWeights, String> {
-    let override_path = std::env::var_os("HIPFIRE_EMBED_GPU_FALLBACK_MODEL").map(PathBuf::from);
-    let canonical_sibling = model_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| {
-            let (family, _) = name.split_once(".npu.")?;
-            Some(model_path.with_file_name(format!("{family}.bf16.hfq")))
-        });
-    let fallback_path = override_path.or(canonical_sibling);
-    let Some(fallback_path) = fallback_path else {
-        return hipfire_arch_embeddinggemma::EmbeddingGemmaWeights::load(primary_hfq, config, gpu);
-    };
+    let fallback_path = std::env::var_os("HIPFIRE_EMBED_GPU_FALLBACK_MODEL")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HIPFIRE_EMBED_GPU_FALLBACK_MODEL is not set".to_string())?;
     if !fallback_path.is_file() {
         return Err(format!(
             "embeddinggemma NPU serving requires a GPU fallback model at {} (set HIPFIRE_EMBED_GPU_FALLBACK_MODEL)",
@@ -2449,7 +2609,7 @@ fn load_embeddinggemma_gpu_fallback_weights(
     {
         return Err(format!(
             "embeddinggemma GPU fallback geometry does not match {}",
-            model_path.display()
+            fallback_path.display()
         ));
     }
     eprintln!(
@@ -2461,6 +2621,69 @@ fn load_embeddinggemma_gpu_fallback_weights(
         &fallback_config,
         gpu,
     )
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EmbeddingGemmaStorageContract {
+    explicit_row_padded_oq8: bool,
+    legacy_implicit: bool,
+}
+
+impl EmbeddingGemmaStorageContract {
+    fn requires_npu(self) -> bool {
+        self.explicit_row_padded_oq8 || self.legacy_implicit
+    }
+}
+
+/// Validate the on-disk OQ8 geometry before either backend sees the payload.
+/// New artifacts use qt=43 explicitly. Legacy qt=35 artifacts are recognized
+/// only when logical K is ragged and the payload has one padded group sequence
+/// per row; this keeps existing NPU artifacts diagnosable without making the
+/// filename part of the storage contract.
+fn embeddinggemma_storage_contract(
+    tensors: &[HfqTensorInfo],
+) -> Result<EmbeddingGemmaStorageContract, String> {
+    let mut contract = EmbeddingGemmaStorageContract::default();
+    for info in tensors {
+        let explicit = info.quant_type == QuantType::Oq8G256RowPadded.code();
+        let legacy_candidate = info.quant_type == QuantType::Oq8G256.code()
+            && info.shape.len() == 2
+            && info.shape[1] % 256 != 0;
+        if !explicit && !legacy_candidate {
+            continue;
+        }
+        if info.shape.len() != 2 {
+            return Err(format!(
+                "embeddinggemma: row-padded OQ8 tensor {} must be rank two, got {:?}",
+                info.name, info.shape
+            ));
+        }
+        let rows = info.shape[0] as usize;
+        let cols = info.shape[1] as usize;
+        if cols % 256 == 0 {
+            return Err(format!(
+                "embeddinggemma: tensor {} uses row-padded OQ8 with aligned K={cols}",
+                info.name
+            ));
+        }
+        let expected = QuantType::Oq8G256RowPadded
+            .matrix_tensor_bytes(rows, cols)
+            .ok_or_else(|| {
+                format!(
+                    "embeddinggemma: OQ8 byte geometry overflow for {}",
+                    info.name
+                )
+            })?;
+        if info.data_size != expected {
+            return Err(format!(
+                "embeddinggemma: row-padded OQ8 tensor {} has {} bytes; expected {} for [{rows},{cols}]",
+                info.name, info.data_size, expected
+            ));
+        }
+        contract.explicit_row_padded_oq8 |= explicit;
+        contract.legacy_implicit |= legacy_candidate;
+    }
+    Ok(contract)
 }
 
 /// Load a model from a HuggingFace safetensors directory (ParoQuant, AWQ, etc.).
@@ -2635,6 +2858,7 @@ pub fn load_model_safetensors(
             gemma3_vl: None,
             gemma3_text: None,
             embeddinggemma: None,
+            qwen3_embedding: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -2751,6 +2975,7 @@ pub fn load_model_safetensors(
             gemma3_vl: None,
             gemma3_text: None,
             embeddinggemma: None,
+            qwen3_embedding: None,
             tokenizer: Some(tokenizer),
             active: ResidentSession::default(),
             max_seq,
@@ -2890,6 +3115,7 @@ pub fn load_model_safetensors(
         gemma3_vl: None,
         gemma3_text: None,
         embeddinggemma: None,
+        qwen3_embedding: None,
         tokenizer: Some(tokenizer),
         active: ResidentSession {
             sequence_state,
@@ -3186,6 +3412,7 @@ pub fn load_model_pp(
         gemma3_vl: None,
         gemma3_text: None,
         embeddinggemma: None,
+        qwen3_embedding: None,
         tokenizer: Some(tokenizer),
         active: ResidentSession {
             sequence_state,
@@ -3852,6 +4079,68 @@ pub fn load_dflash_state(
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    fn tensor_info(name: &str, quant_type: QuantType, rows: u32, cols: u32) -> HfqTensorInfo {
+        let data_size = if quant_type == QuantType::Oq8G256RowPadded {
+            quant_type
+                .matrix_tensor_bytes(rows as usize, cols as usize)
+                .unwrap()
+        } else {
+            rows as usize * cols.div_ceil(256) as usize * 258
+        };
+        HfqTensorInfo {
+            name: name.to_string(),
+            quant_type: quant_type.code(),
+            shape: vec![rows, cols],
+            group_size: 256,
+            data_offset: 0,
+            data_size,
+        }
+    }
+
+    #[test]
+    fn embeddinggemma_storage_contract_is_driven_by_tensor_layout() {
+        let aligned = tensor_info("aligned", QuantType::Oq8G256, 2, 512);
+        assert_eq!(
+            embeddinggemma_storage_contract(&[aligned]).unwrap(),
+            EmbeddingGemmaStorageContract::default()
+        );
+
+        let explicit = tensor_info(
+            "model.layers.0.mlp.down_proj.weight",
+            QuantType::Oq8G256RowPadded,
+            768,
+            1152,
+        );
+        let contract = embeddinggemma_storage_contract(&[explicit]).unwrap();
+        assert!(contract.requires_npu());
+        assert!(contract.explicit_row_padded_oq8);
+        assert!(!contract.legacy_implicit);
+
+        let legacy = tensor_info(
+            "model.layers.0.mlp.down_proj.weight",
+            QuantType::Oq8G256,
+            768,
+            1152,
+        );
+        let contract = embeddinggemma_storage_contract(&[legacy]).unwrap();
+        assert!(contract.requires_npu());
+        assert!(contract.legacy_implicit);
+    }
+
+    #[test]
+    fn embeddinggemma_storage_contract_rejects_invalid_explicit_geometry() {
+        let aligned = tensor_info("aligned", QuantType::Oq8G256RowPadded, 2, 512);
+        assert!(embeddinggemma_storage_contract(&[aligned])
+            .unwrap_err()
+            .contains("aligned K"));
+
+        let mut truncated = tensor_info("truncated", QuantType::Oq8G256RowPadded, 2, 384);
+        truncated.data_size -= 1;
+        assert!(embeddinggemma_storage_contract(&[truncated])
+            .unwrap_err()
+            .contains("expected"));
+    }
 
     /// The DFlash load gate is driven by the generated capability matrix, not a
     /// hard-coded arch list: qwen3.5 (5/6) is admitted; archs whose matrix marks

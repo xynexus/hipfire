@@ -23,6 +23,57 @@ use hipfire_rdna::Gpu;
 
 use crate::model::EmbeddingGemmaState;
 
+#[cfg(target_os = "linux")]
+fn embed_planned_embeddinggemma(
+    gpu: &mut Gpu,
+    state: &EmbeddingGemmaState,
+    tokenized: &[Vec<u32>],
+    projector: &mut hipfire_arch_embeddinggemma::NpuOpusProjector,
+) -> Result<Vec<Vec<f32>>, String> {
+    let Some(metadata) = state.embedding_metadata.as_ref() else {
+        return hipfire_arch_embeddinggemma::embed_batch_forward_with_projector(
+            gpu,
+            &state.weights,
+            &state.config,
+            tokenized,
+            projector,
+        );
+    };
+    let lengths = tokenized.iter().map(Vec::len).collect::<Vec<_>>();
+    let dispatches =
+        crate::embedding_batch::plan_embedding_dispatches(&lengths, &metadata.sequence)?;
+    let mut output = vec![Vec::new(); tokenized.len()];
+    for dispatch in dispatches {
+        let documents = dispatch
+            .request_indices
+            .iter()
+            .map(|&index| tokenized[index].clone())
+            .collect::<Vec<_>>();
+        let embeddings = hipfire_arch_embeddinggemma::embed_batch_forward_with_projector(
+            gpu,
+            &state.weights,
+            &state.config,
+            &documents,
+            projector,
+        )?;
+        if embeddings.len() != dispatch.request_indices.len() {
+            return Err(format!(
+                "embeddinggemma bucket {} returned {} embeddings for {} documents",
+                dispatch.bucket,
+                embeddings.len(),
+                dispatch.request_indices.len()
+            ));
+        }
+        for (embedding, request_index) in embeddings
+            .into_iter()
+            .zip(dispatch.request_indices.into_iter())
+        {
+            output[request_index] = embedding;
+        }
+    }
+    Ok(output)
+}
+
 /// Encode a batch of already-tokenized texts with the embeddinggemma encoder,
 /// returning one L2-normalized embedding per text, truncated+renormalized to
 /// `dims` (Matryoshka). `dims` is the *resolved* output length — the caller should
@@ -37,23 +88,28 @@ pub fn embed_batch_embeddinggemma(
     if let Some(projector) = state.npu_projector.as_ref() {
         match projector.lock() {
             Ok(mut projector) => {
-                match hipfire_arch_embeddinggemma::embed_batch_forward_with_projector(
-                    gpu,
-                    &state.weights,
-                    &state.config,
-                    tokenized,
-                    &mut *projector,
-                ) {
+                match embed_planned_embeddinggemma(gpu, state, tokenized, &mut *projector) {
                     Ok(mut embeddings) => {
                         embeddings
                             .iter_mut()
                             .for_each(|embedding| truncate_and_renormalize(embedding, dims));
                         return Ok(embeddings);
                     }
+                    Err(error) if state.weights.resident_only() => {
+                        return Err(format!(
+                            "embeddinggemma resident NPU encode failed ({error}); no GPU fallback is loaded"
+                        ));
+                    }
                     Err(error) => eprintln!(
                         "embeddinggemma resident NPU encode failed ({error}); retrying on GPU"
                     ),
                 }
+            }
+            Err(_) if state.weights.resident_only() => {
+                return Err(
+                    "embeddinggemma resident NPU state is poisoned; no GPU fallback is loaded"
+                        .to_string(),
+                );
             }
             Err(_) => {
                 eprintln!("embeddinggemma resident NPU state is poisoned; retrying encode on GPU")
