@@ -62,18 +62,28 @@ PEANO = next((Path(p) / "llvm-aie" for p in sys.path if (Path(p) / "llvm-aie").i
 CHAINS = 4
 UNROLL_HINT = 4  # Peano unrolls the chain loop 4x; verified from the counter decrement
 
-# (M, K, N, TypeA, TypeB). int8xint4 has its OWN shape family (mmul_8_4 supports
-# 4x16x8, 8x16x8, 4x32x8) — the int8 shapes are not valid for it.
-SHAPES = [
+# (M, K, N, TypeA, TypeB). int8xint4 has its OWN shape family (mmul_8_4), and the
+# valid shapes differ by generation because the vector width does:
+#   AIE2  (npu1, 256-bit): 4x16x8, 8x16x8, 4x32x8
+#   AIE2P (npu2, 512-bit): mmul_8_4 specializes ONLY <4,16,16>, and it is VIRTUAL
+#     (2 native VMACs of 512 MACs each) — int4 buys NO compute density over int8
+#     on AIE2P, only halved weight-DMA bytes. int4xint4 has no mmul family at all.
+_INT8_SHAPES = [
     (4, 8, 8, "int8", "int8"),
     (8, 8, 8, "int8", "int8"),
     (2, 8, 8, "int8", "int8"),
-    (4, 16, 8, "int8", "int4"),
-    (8, 16, 8, "int8", "int4"),
-    (4, 32, 8, "int8", "int4"),
 ]
+_INT4_SHAPES = {
+    "npu1": [(4, 16, 8, "int8", "int4"), (8, 16, 8, "int8", "int4"), (4, 32, 8, "int8", "int4")],
+    "npu2": [(4, 16, 16, "int8", "int4")],
+}
 
-_BITS = {"int8": 8, "int4": 4, "int16": 16}
+
+def shapes_for(target) -> list:
+    return _INT8_SHAPES + _INT4_SHAPES.get(target.key, [])
+
+
+_BITS = {"int8": 8, "int4": 4, "int16": 16, "uint8": 8, "uint4": 4, "uint16": 16}
 
 
 def sizes(shape) -> dict:
@@ -289,6 +299,7 @@ def main() -> int:
     from aiecost import calib
 
     target = resolve_target(args.device)
+    shapes = shapes_for(target)
     consts = calib.load(calib.current_key())
     f_h = consts["f_h_hz"].value if "f_h_hz" in consts else None
 
@@ -297,7 +308,7 @@ def main() -> int:
     print(f"  {'shape':<24} {'loop vmac':>9} {'calls':>6} {'vmac/call':>9} {'MACs/call':>9} {'MACs/vmac':>9}  verdict")
     isa = {}
     with tempfile.TemporaryDirectory(prefix="aiecost_c4_isa_") as tn:
-        for shape in SHAPES:
+        for shape in shapes:
             r = isa_probe(shape, Path(tn), target)
             isa[str(shape)] = r
             tag = f"<{shape[0]},{shape[1]},{shape[2]},{shape[3]},{shape[4]}>"
@@ -337,7 +348,7 @@ def main() -> int:
     print("\nHardware check (MACs/s must agree with the ISA count):")
     print(f"  {'shape':<24} {'ns/iter':>9} {'GVMAC/s':>9} {'GMAC/s':>9} {'MACs/cyc':>9}")
     hw = {}
-    for shape in SHAPES:
+    for shape in shapes:
         if not isa[str(shape)].get("compiles"):
             continue
         pts = []
