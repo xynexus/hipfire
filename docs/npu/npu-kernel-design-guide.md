@@ -460,8 +460,11 @@ is `add` + `jnz` + a 5-slot branch shadow = 7 bundles/iter, giving f_H = 7 cyc �
   speed**, not more throughput. **Caveat for building it:** AMD's *full*
   `mm_bfp.cc` fails to compile with the installed peano/llvm-aie backend
   (`unable to legalize <8 x s8> G_BUILD_VECTOR` in the shuffle/exponent *helper*,
-  not the matmul) — a hipfire bfp16 GEMM must call the core `mac_8x8_8x8T`
-  directly and avoid that helper. Correctness on hardware is unrun.
+  not the matmul; see `BUGS.md`) — a hipfire bfp16 GEMM must call the core
+  `mac_8x8_8x8T` directly and avoid that helper. **Hardware-confirmed rate**: the
+  `e2_bfp16` resident-chain bench builds and runs on halo at **489 G MACs/s/core**
+  — int8-rate (int8 `<8,8,8>` = 532), as predicted. (Numerics — block-float
+  packing + a reference compare — still unrun; the rate uses random-byte inputs.)
 - **512 MACs/native-VMAC is the datapath ceiling for every dtype on AIE2P.** int8,
   int4, and bfp16 all top out there — the 512-bit VMAC does 512 MACs/cycle and no
   operand width exceeds it (int8 already saturates the MAC units; narrower operands

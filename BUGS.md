@@ -4,6 +4,19 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
+## bfp16 GEMM: AMD `mm_bfp.cc` reference kernel fails peano legalization
+
+**Toolchain gap, not ours.** The vendored AMD aie2p bfp16 GEMM
+`mlir_aie/include/aie_kernels/aie2p/mm_bfp.cc` fails to compile with the installed
+peano/llvm-aie backend: `error in backend: unable to legalize instruction:
+<8 x s8> G_BUILD_VECTOR (in function: matmul_vectorized_bfp16)`. The failure is in
+the kernel's shuffle/exponent **helper** (`scalarShuffleMatrixForBfp16ebs8` / the
+block re-layout for `bfp16ebs8`), **not** the matmul: a minimal `mac_8x8_8x8T`
+over `block_vector<bfp16ebs8,64>` compiles fine and emits one native `vmac.f`
+(512 MACs/call, int8-rate). Workaround for a hipfire bfp16 GEMM — call the core
+`mac_8x8_8x8T` directly and do our own block-layout packing, avoiding the helper.
+Confirmed 2026-07-17 on halo (peano/llvm-aie, aie2p target).
+
 ## BF16 weights + Q8 KV batched-prefill → garbage on gfx1151 (detailed, by request)
 
 **STATUS: GUARDED/FIXED** (`is_batchable_la` now routes BF16 prefill per-token on
