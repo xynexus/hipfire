@@ -97,26 +97,102 @@ FAMILY_B = [
     Candidate("b-c4-t2600", 2600, 4),
 ]
 
-FAMILIES = {"a": FAMILY_A, "b": FAMILY_B}
+# FAMILY C is a different REGIME, not just different points. A and B are entirely
+# t_feed-limited (transport-bound, trivial compute). C is t_core-limited: resident
+# operands, zero feed, pure VMAC. LLM kernels span both — a QKV GEMM can be
+# compute-bound while KV-cache attention is bandwidth-bound — so a model validated
+# only on transport says nothing about half the design space.
+#
+# Points are OFF every calibration grid: K1 fitted f_H from iters in
+# {200k, 400k, 800k, 1.6M} and C4 from {400k, 800k, 1.6M}. C uses none of them.
+# The int4 rows additionally exercise the ceiling lookup that C4 added.
+@dataclass
+class ComputeCandidate:
+    name: str
+    iters: int
+    shape: tuple  # (M, K, N, TypeA, TypeB)
+    chains: int = 4  # matches c4_mmul.CHAINS
+
+    def spec(self) -> ScheduleSpec:
+        m, k, n, ta, tb = self.shape
+        return ScheduleSpec(
+            name=self.name,
+            columns=1,
+            cores=1,
+            wire_bytes_in=0,  # operands are resident; nothing streams
+            output_bytes=0,
+            dma_tasks_live=1,
+            bds_per_core=3,
+            locks_per_core=4,
+            fifo_depth=1,
+            mmul_calls_per_core=self.iters * self.chains,
+            mmul_shape=(m, k, n),
+            dtype_a=ta,
+            dtype_b=tb,
+            local_stage_bytes=256,
+            host_pack_bytes=0,
+            host_deblock_bytes=0,
+            n_bos=3,
+        )
 
 
-def kendall_tau(a: list[int], b: list[int]) -> float:
-    """Rank correlation. +1 = identical order, -1 = reversed."""
+FAMILY_C = [
+    ComputeCandidate("c-i300k-i8", 300_000, (4, 8, 8, "int8", "int8")),
+    ComputeCandidate("c-i1200k-i8", 1_200_000, (4, 8, 8, "int8", "int8")),
+    ComputeCandidate("c-i600k-i8-virt", 600_000, (8, 8, 8, "int8", "int8")),
+    ComputeCandidate("c-i300k-i4", 300_000, (4, 16, 8, "int8", "int4")),
+    ComputeCandidate("c-i1200k-i4", 1_200_000, (4, 16, 8, "int8", "int4")),
+    ComputeCandidate("c-i600k-i4-virt", 600_000, (4, 32, 8, "int8", "int4")),
+]
+
+FAMILIES = {"a": FAMILY_A, "b": FAMILY_B, "c": FAMILY_C}
+
+
+def kendall_tau(a: list[float], b: list[float], tol: float = 0.02) -> tuple[float, int]:
+    """Rank correlation over VALUES, not ranks. Returns (tau, n_tied_pairs).
+
+    Takes predicted/measured values rather than sorted ranks so that TIES are
+    visible. This matters: family C's candidates are physically identical work
+    (all 4.8M native VMACs via different call/shape splits), so the model
+    correctly predicts equal times. Ranking them is meaningless, and measurement
+    noise orders them arbitrarily — an earlier version sorted predictions into
+    distinct ranks, which destroyed the tie information and scored those
+    arbitrary orderings as errors (tau=0.600 for a model that was right).
+
+    A pair is tied if the two predictions are within `tol` relative, and such
+    pairs are excluded from the denominator: the model is scored only on
+    distinctions it actually claims to make.
+    """
     n = len(a)
     if n < 2:
-        return float("nan")
-    conc = disc = 0
+        return float("nan"), 0
+    conc = disc = tied = 0
     for i, j in itertools.combinations(range(n), 2):
+        denom = max(abs(a[i]), abs(a[j])) or 1.0
+        if abs(a[i] - a[j]) / denom <= tol:
+            tied += 1
+            continue
         s = (a[i] - a[j]) * (b[i] - b[j])
         if s > 0:
             conc += 1
         elif s < 0:
             disc += 1
     total = conc + disc
-    return (conc - disc) / total if total else float("nan")
+    return ((conc - disc) / total if total else float("nan")), tied
 
 
-def measure(cand: Candidate, reps: int, warmup: int, cache: Path, device: str) -> float | None:
+def measure(cand, reps: int, warmup: int, cache: Path, device: str) -> float | None:
+    if isinstance(cand, ComputeCandidate):
+        # Compute-bound: resident operands, no feed. c4_mmul builds the VMAC chain.
+        # c4_mmul is not device-parameterised yet (npu1 only), unlike c2_feed —
+        # family C is therefore AIE2-only until that is threaded through.
+        from aiecost.benches import c4_mmul
+
+        built = c4_mmul.build(cand.shape, cand.iters, cache)
+        if not built:
+            return None
+        return c4_mmul.run(*built, cand.shape, reps)
+
     from aiecost.benches import c2_feed
 
     built = c2_feed.build(cand.n_tiles, cand.columns, cache, device)
@@ -128,7 +204,8 @@ def measure(cand: Candidate, reps: int, warmup: int, cache: Path, device: str) -
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--family", choices=["a", "b"], default="b", help="b = clean post-fix set; a = burned, regression only")
+    p.add_argument("--family", choices=["a", "b", "c"], default="b",
+                   help="b = transport-bound (clean); c = compute-bound regime; a = burned, regression only")
     p.add_argument("--reps", type=int, default=10)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--device", default="auto", choices=["auto", "npu1", "npu2"])
@@ -183,15 +260,28 @@ def main() -> int:
     pred_order = {c.name: i for i, (c, _) in enumerate(sorted(usable, key=lambda cp: cp[1].device_s))}
     meas_order = {n: i for i, n in enumerate(sorted(measured, key=lambda n: measured[n]))}
     names = [c.name for c, _ in usable]
-    tau = kendall_tau([pred_order[n] for n in names], [meas_order[n] for n in names])
+    pred_vals = {c.name: pr.device_s for c, pr in usable}
+    # Score on values so predicted ties are excluded, not scored as errors.
+    tau, n_tied = kendall_tau([pred_vals[n] for n in names], [measured[n] for n in names])
 
     print("ORDINAL RESULT:")
     print(f"  {'candidate':<12} {'pred rank':>9} {'meas rank':>9}")
     for n in sorted(names, key=lambda n: pred_order[n]):
-        flag = "" if pred_order[n] == meas_order[n] else "   <- misordered"
-        print(f"  {n:<12} {pred_order[n] + 1:>9} {meas_order[n] + 1:>9}{flag}")
+        # Only call it misordered if the model actually claimed a distinction.
+        tied_with = [m for m in names if m != n and abs(pred_vals[n] - pred_vals[m]) / max(pred_vals[n], pred_vals[m]) <= 0.02]
+        if pred_order[n] == meas_order[n]:
+            flag = ""
+        elif tied_with:
+            flag = "   (tied prediction — not scored)"
+        else:
+            flag = "   <- misordered"
+        print(f"  {n:<16} {pred_order[n] + 1:>9} {meas_order[n] + 1:>9}{flag}")
     gate = 0.8
+    n_pairs = len(names) * (len(names) - 1) // 2
     print(f"\n  Kendall tau = {tau:+.3f}   (gate: >= {gate})   {'PASS' if tau >= gate else 'FAIL'}")
+    if n_tied:
+        print(f"  {n_tied}/{n_pairs} pairs predicted TIED (within 2%) and excluded — the model declines to")
+        print("  order them, so it is not scored on them. Their magnitudes are still checked below.")
 
     print()
     print(refit.report([(c.spec(), measured[c.name]) for c, _ in usable], basis="device", key=key, device=target.key))
