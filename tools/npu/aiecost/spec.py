@@ -99,6 +99,12 @@ class Prediction:
     # throughput the schedule is leaving on the table, and the model knows it.
     advice: list[str] = field(default_factory=list)
     useful_tops: float = 0.0
+    # Energy is the second axis (E1). It does NOT co-optimise with time: below
+    # ~37 MACs per byte fed, energy is set by data movement while time may be set
+    # by something else entirely.
+    energy_j: float = 0.0
+    energy_terms: dict[str, float] = field(default_factory=dict)
+    arithmetic_intensity: float = 0.0
 
     def render(self) -> str:
         out = [f"prediction: {self.spec_name}"]
@@ -121,6 +127,11 @@ class Prediction:
             out.append(f"  predicted receive-stall fraction: {self.stall_fraction * 100:.1f}%")
             if self.useful_tops:
                 out.append(f"  useful  : {self.useful_tops:.2f} TOPS")
+            if self.energy_j:
+                out.append(f"  energy  : {self.energy_j * 1e3:10.4f} mJ   (AI={self.arithmetic_intensity:.1f} MACs/byte)")
+                for k, v in sorted(self.energy_terms.items(), key=lambda kv: -kv[1]):
+                    share = v / self.energy_j * 100 if self.energy_j else 0
+                    out.append(f"    E:{k:<8} {v * 1e3:9.4f} mJ  {share:5.1f}%")
         for a in self.advice:
             out.append(f"  ADVICE: {a}")
         for a in self.assumptions:

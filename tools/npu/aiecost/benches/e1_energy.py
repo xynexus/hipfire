@@ -198,8 +198,16 @@ def build_kernel(kind: str, cache: Path):
     }
 
 
-def sustained_run(k: dict, seconds: float) -> tuple[int, float]:
-    """Dispatch in a tight loop until the window closes. Returns (n, elapsed)."""
+def sustained_run(k: dict, seconds: float, rate: float = 0.0) -> tuple[int, float]:
+    """Dispatch until the window closes. Returns (n, elapsed).
+
+    rate > 0 pads each dispatch to a fixed period so every kernel submits at the
+    SAME dispatch/s. That makes the host's submit work identical across kernels
+    by construction, so subtracting the null kernel leaves only the energy of the
+    work itself. Without this, package power just tracks dispatch rate (null at
+    4326/s burns 10.3 W doing nothing) and any compute-vs-feed comparison is
+    really a CPU comparison.
+    """
     from aie.utils.hostruntime.xrtruntime.hostruntime import XRTHostRuntime
     from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
     from aie.utils.npukernel import NPUKernel
@@ -230,10 +238,21 @@ def sustained_run(k: dict, seconds: float) -> tuple[int, float]:
         args = [src] + [XRTTensor((ACC_ELEM,), dtype=np.int32, device="cpu") for _ in range(k["cols"])]
 
     hrt.run(h, args)  # warm
+    period = 1.0 / rate if rate > 0 else 0.0
     n, t0 = 0, time.perf_counter()
-    while time.perf_counter() - t0 < seconds:
+    while True:
+        now = time.perf_counter()
+        if now - t0 >= seconds:
+            break
+        slot = t0 + n * period
         hrt.run(h, args)
         n += 1
+        if period:
+            # Sleep out the remainder of the slot. If the kernel overruns its
+            # slot the pad is zero and the rate silently drops — main() checks.
+            rest = (slot + period) - time.perf_counter()
+            if rest > 0:
+                time.sleep(rest)
     return n, time.perf_counter() - t0
 
 
@@ -241,6 +260,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--kernel", choices=["compute", "feed", "null"], default="compute")
     p.add_argument("--seconds", type=float, default=8.0)
+    p.add_argument("--rate", type=float, default=0.0,
+                   help="pad to this dispatch/s so host submit work is matched across kernels (0 = free-run)")
     p.add_argument("--cache", default=str(Path.home() / ".cache" / "hipfire-aiecost" / "e1"))
     p.add_argument("--json", metavar="PATH")
     args = p.parse_args()
@@ -263,9 +284,13 @@ def main() -> int:
 
     n = elapsed = 0
     with Window() as load:
-        n, elapsed = sustained_run(k, args.seconds)
+        n, elapsed = sustained_run(k, args.seconds, args.rate)
     print(f"  load : {load.watts:6.3f} W (RAPL)   {load.ppt_w or float('nan'):6.3f} W (PPT)   {n} dispatches in {elapsed:.2f}s")
 
+    actual_rate = n / elapsed if elapsed else 0.0
+    if args.rate and actual_rate < args.rate * 0.95:
+        print(f"\n  !! rate target {args.rate:.0f}/s NOT met (actual {actual_rate:.1f}/s) — kernel overruns its slot.")
+        print("     Matched-rate comparison is INVALID at this rate; lower --rate.")
     delta = load.watts - idle.watts
     per_disp_s = elapsed / n if n else float("nan")
     j_per_disp = delta * per_disp_s

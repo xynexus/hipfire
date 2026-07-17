@@ -207,9 +207,11 @@ def rank_and_render(specs: list[ScheduleSpec], key: str, device: str, header: st
             lines.append(f"    {s.name}: {'; '.join(p.build_errors or p.missing)}")
         return "\n".join(lines)
 
-    lines.append(f"  {'candidate':<40} {'device':>10} {'limiter':>9} {'TOPS':>7}")
+    lines.append(f"  {'candidate':<40} {'device':>10} {'limiter':>9} {'TOPS':>7} {'energy':>9} {'AI':>7} {'E-bound':>9}")
     for s, p in ok:
-        lines.append(f"  {s.name:<40} {p.device_s * 1e6:>9.1f}u {p.limiter:>9} {p.useful_tops:>7.2f}")
+        ebound = "movement" if p.energy_terms.get("movement", 0) > p.energy_terms.get("compute", 0) else "compute"
+        lines.append(f"  {s.name:<40} {p.device_s * 1e6:>9.1f}u {p.limiter:>9} {p.useful_tops:>7.2f} "
+                     f"{p.energy_j * 1e3:>8.3f}m {p.arithmetic_intensity:>7.1f} {ebound:>9}")
     if bad:
         lines.append("")
         for s, p in bad:
