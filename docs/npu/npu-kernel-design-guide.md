@@ -709,7 +709,9 @@ machine.**
 
 **MEASURED feed-bound too (streaming, INNER=1, NB=256):** **866 GMAC/s raw**
 (floor-included) = **4.1× r6**; the streaming work is 82 µs for 4.2 MB = **51 GB/s**
-(the memtile feed roof), so floor-excluded ≈ **1630 GMAC/s ≈ 8× r6**. This is at r5's
+(the memtile feed roof), so floor-excluded ≈ **1630 GMAC/s ≈ 8× r6** — confirmed
+rigorously by the NB=256-vs-512 slope (134.2M MACs / 80.4 µs = **~1670 GMAC/s**,
+floor-free). This is at r5's
 *unfavorable* arithmetic intensity (~32 MACs/byte: it streams weights and holds
 activations resident — inverted from a real GEMM). At the **gate_up AI (341
 MACs/byte**, weights reused across M), feed drops ~10× and the kernel becomes
