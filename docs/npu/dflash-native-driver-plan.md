@@ -110,6 +110,30 @@ actual device work, so that floor never governed the block wall.
 16 activation rows the GEMM is pure weight bandwidth, and ~1.09 GB/block at
 ~3.8 GB/s is ~290 ms no matter how the dispatch is issued.
 
+**UPDATE 2026-07-18 — the better GEMM is built and measured (not yet wired in).**
+A multi-core W4A8 GEMM at DFlash shapes on npu1 measures **9.33 GB/s on the weight
+stream vs the single-core `int_matmul`'s 3.8 GB/s (2.45×)**; int4 halves the bytes for
+the same logical weight (2×), taking the 5-layer body's 482 MB int4 payload to a
+projected **GEMM term of ~52 ms, down from ~317 ms (≈6×)**. Both build variants pass
+kernel-level numerical correctness; the full-body parity gate cannot run until it is
+wired in. Artifacts: `~/.hipfire/npu/r14_1x2x128_nb128` (recommended, best W:A ratio at
+M=16) and `~/.hipfire/npu/r14_1x4x64_nb128` (the activation-reduction control).
+
+Two findings worth carrying forward:
+- **The binding constraint is the weight path (~9.3 GB/s), not the ~13–16 GB/s
+  aggregate DDR ceiling.** The control variant cut 1 MB of activation traffic and the
+  time did not move (899.3 → 905.5 µs), so A and C ride concurrently on other channels
+  and are effectively free. An earlier "we are at the DDR ceiling" reading was
+  aggregate-bytes ÷ time — an artifact of one variant's traffic mix. The remaining gap
+  to the ceiling is real headroom; **cascade (`aie.cascade_flow`, measured 4–10×
+  elsewhere, unused in every shipped kernel) is untested on this path.**
+- **Cores are ~12% utilized** (0.60 TOPS over 16 cores ≈ 18.75 GMAC/s/core vs r9's 150
+  GMAC/s/core resident) — firmly feed-bound at M=16, as expected.
+
+Remaining to convert this into a block-wall measurement: a host-side blocked A/W packer
+matching r14's stripe layout, an **oq4 DFlash sidecar** (only the OQ8 one exists today),
+and wiring into `dflash_body_native.rs`.
+
 **Where the remaining gap actually lives:** a better int8 GEMM (multi-core,
 reusing the streamed weight tile across the 16 activation rows — the current
 design is single-core with its own tiling) and a multi-core attention kernel
