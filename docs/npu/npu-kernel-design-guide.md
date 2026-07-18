@@ -444,25 +444,29 @@ to the 37-MACs/byte artifact for any dtype pair without a specific ratio.
 9. **KV bit-width is the decode lever**: kvarn8→4 gives 1.61× (not 2× — the floor
    doesn't shrink), kvarn2 2.33×.
 10. **Allocate BOs once.** 17.6 ms each, size-independent.
-11. **Spec-decode drafter: the NPU-viable size is set by the feed, not the FLOPs.**
-    A draft token is one M=1 forward — pure decode, so every op is feed-bound on
-    weight bytes (AI≈1) and the drafter's throughput is just `feed_BW ÷
-    model_bytes`. The regime flips hard with drafter size:
-    - The **runtime DSpark body** (5-layer, dim 4096, FFN 12288 — a ~1B block) is
-      **feed-starved**: ~965 MB int8/token ÷ 30.8 GB/s ≈ **32 tok/s** (64 at int4,
-      the only real lever). A 4-token window is ~124 ms — it cannot hide under a
-      few-ms GPU verify, so **NPU-draft ‖ GPU-verify loses** at this size.
-    - A **tiny drafter** (h=512, 3-layer, ~5 M params) is instead **dispatch-floor
-      bound**: unfused it is 40× the C1 floor (259 tok/s), **fused whole-body it is
-      3341 tok/s** (a 13× fusion win, 92% floor tax) and drafts 4 tokens in ~1.2 ms
-      — which **fits under a 3 ms verify: the draft is free**, at ~1256 tok/J.
+11. **Spec-decode drafter (DFlash/DSpark) — it is BLOCK-DIFFUSION, and for the
+    NPU-viable size fusion is the whole game.** DFlash (z-lab/dflash;
+    `hipfire-runtime/src/dflash.rs`) is not autoregressive: it noise-inits
+    `block_size` (2-8) positions and denoises the whole block in ONE bidirectional
+    forward, with per-layer cross-attention over the target's hidden states. So
+    the projections are M = block_size (weights reused across the block, AI ≈
+    block_size ≈ 7 — *not* the AI≈1 of an M=1 decode). The regime splits by size:
+    - The **full body** (5-layer, dim 4096, FFN 12288 — a ~1B block) is
+      **feed-starved**: ~1 GB int8 of weights ÷ 30.8 GB/s per block, so a block
+      costs tens of ms — it cannot hide under a few-ms GPU verify. **NPU-draft ‖
+      GPU-verify loses** at this size; the only lever is weight bit-width.
+    - A **tiny drafter** (h=512, 3-layer, ~5 M params) is **100% dispatch-floor
+      bound**: the entire block body's compute work is ~130 µs but one C1 floor is
+      155 µs, so unfused (per-op dispatch) is **92% floor tax** — 3869 µs/block.
+      **Fused whole-body: 304 µs for a 4-token block (13 158 tok/s, 4628 tok/J)**,
+      trivially hidden under a 3 ms verify: **the draft is free.**
 
-    So: big drafter → weight-bit-width is the lever (feed-bound); small drafter →
-    **fusion is the lever** (floor-bound). The NPU's role in spec-decode is a
-    *small* energy-cheap drafter fully hidden under the GPU verify, not a full-size
-    one. `python -m aiecost.design drafter --gpu-verify-us 3000` tests the
-    pipelining condition (GPU verify time is an input — no GPU calibration in the
-    tool).
+    So the tiny drafter's kernel imperative is **ONE fused dispatch for the whole
+    block body** — keep activations resident across all layers; individual GEMM
+    efficiency is irrelevant when the floor is 12× the work. Big drafter →
+    weight-bit-width; tiny drafter → fusion. `python -m aiecost.design drafter
+    --block-size 4 --gpu-verify-us 3000` tests the pipelining condition (GPU verify
+    time is an input — no GPU calibration in the tool).
 
 ### Buildability — check before designing
 
