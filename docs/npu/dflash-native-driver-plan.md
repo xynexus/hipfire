@@ -75,6 +75,72 @@ precision reference. Bit-exactness is expected for the integer GEMM steps — if
 native path differs from the Python path on the same inputs, that is a bug, not
 precision. Do not loosen tolerances.
 
+## RESULTS (measured on nix1, 2026-07-18) — budget NOT met, premise was wrong
+
+The driver is built and validated; the projection above is superseded.
+
+| | Python/XRT | native |
+|---|---|---|
+| warm block wall | 1164 ms | **726 ms** (cold 712 ms) |
+| dispatches | 68 | 68 |
+| parity vs f16 golden | 0.998092 | **0.998114** |
+| parity vs int8/bf16 ref | 0.998147 | **0.998170** |
+
+The native driver removes ~440 ms of host/XRT overhead per block (1.6×) and is
+numerically correct. It does **not** reach 57 ms — it misses by 12.7×.
+
+**The 30 ms projection was wrong in its premise, not its arithmetic.** It
+assumed per-dispatch overhead dominates. It does not. Attribution, each term
+measured with a probe that pins the kernel so there is *no* context churn:
+
+| term | per block | share | evidence |
+|---|---|---|---|
+| GEMM weight streaming | ~317 ms | 55% | linear in weight bytes: 101 MB→26.5 ms, 50→13.6, 25→7.2, 17→5.3 (~3.8 GB/s); identical pinned vs churning ⇒ device work |
+| attention compute | ~236 ms | 33% | `dflash_attn_all` = 37.5 ms standalone on 131/197 KB buffers |
+| host glue (quant, bf16, packing) | ~143 ms | 20% | wall − dispatch time |
+| primitives (norm/rope/swiglu) | ~24 ms | 3% | 0.35–1.22 ms each |
+
+The 169 µs per-dispatch figure is real and reproducible (163 µs for the 1-row
+`qwen35-rmsnorm-4096`, 308 µs for the `-b16` batch), but it is the **overhead
+floor for a tiny kernel**. The body's expensive dispatches are dominated by
+actual device work, so that floor never governed the block wall.
+
+`int_matmul` re-streams the entire int8 weight from DDR on **every** dispatch —
+"resident" keeps the buffer allocated, it does not keep the weight on-chip. At
+16 activation rows the GEMM is pure weight bandwidth, and ~1.09 GB/block at
+~3.8 GB/s is ~290 ms no matter how the dispatch is issued.
+
+**Where the remaining gap actually lives:** a better int8 GEMM (multi-core,
+reusing the streamed weight tile across the 16 activation rows — the current
+design is single-core with its own tiling) and a multi-core attention kernel
+(`dflash_attn_all` loops all 8 kv-heads on ONE core). Both are kernel work, not
+driver work. Further *fusion* also will not help: it reduces dispatch count,
+and dispatch count is 3% of the wall.
+
+### Secondary finding: hardware-context budget
+
+npu1 (Phoenix) admits only **six** concurrent hardware contexts (`NpuKernel::load`
+returns EINVAL on the 7th — the same limit the Python harness's LRU-of-6 was
+built around), while the body uses 12 distinct kernels per layer. The driver
+therefore runs a pinned-anchor LRU. This turned out to be cheap and off the
+critical path:
+
+- `NpuKernel::load` ≈ **19.5 ms** — re-opens the DRM file and a 64 MiB heap.
+- `NpuKernel::load_peer` ≈ **205 µs** — shares the anchor's file + heap.
+
+At 62 misses/block via `load_peer` that is ~30 ms, ~4% of the wall. Argument
+buffers survive eviction because they belong to the shared device, not the
+context — which is what makes ~1.09 GB of resident weights compatible with
+kernel churn.
+
+### Artifacts
+
+- `tools/npu/dflash_body_npu.py --dump-manifest|--dump-weights|--dump-op|--dump-ref`
+- `crates/hipfire-xdna/examples/dflash_manifest_load.rs` (step 1, `--hold` probes the ctx budget)
+- `crates/hipfire-xdna/examples/dflash_op_parity.rs` (step 2, bit-exact)
+- `crates/hipfire-xdna/examples/dflash_ctx_swap_time.rs`
+- `crates/hipfire-xdna/examples/dflash_body_native.rs` (steps 3–4, `--probe-gemm`/`--probe-attn`)
+
 ## Guardrails
 
 - Hold the GPU/NPU lock while measuring: `./target/release/hipfire lock acquire
