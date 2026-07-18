@@ -124,6 +124,46 @@ def quant_group_mixed4(x, group, n_out=3):
     return q.reshape(orig), s.reshape(orig[:-1] + (orig[-1] // group,))
 
 
+def fwht_signs(seed, n=256):
+    """Port of hipfire_primitives::fwht::gen_fwht_signs (LCG, bit 16 -> +/-1)."""
+    state = seed
+    out = np.empty(n, dtype=np.float32)
+    for i in range(n):
+        state = (state * 1103515245 + 12345) & 0x7FFFFFFF
+        out[i] = 1.0 if ((state >> 16) & 1) == 1 else -1.0
+    return out
+
+
+# The engine's fixed sign table (gen_fwht_signs(42|1042, 256)); see
+# crates/hipfire-quantize/src/rotate.rs.
+SIGNS1 = fwht_signs(42)
+SIGNS2 = fwht_signs(1042)
+
+
+def fwht_groups(x, group=256, signs1=SIGNS1, signs2=SIGNS2):
+    """Signed orthonormal FWHT over the LAST axis in contiguous `group` blocks.
+
+    Port of cpu_fwht_256: signs1 pre-multiply, Hadamard butterfly, then
+    1/sqrt(n)*signs2 post. Orthonormal, so for weights w and activations x
+    rotated by the same H: (Hx).(Hw) == x.w exactly. Rotation is therefore
+    loss-free on the product and only changes what the QUANTIZER sees --
+    spreading outliers so a low-bit grid fits the distribution better.
+    """
+    orig = x.shape
+    a = x.reshape(-1, group).astype(np.float32) * signs1
+    m, n = a.shape
+    s = 1
+    while s < n:
+        a = a.reshape(m, n // (2 * s), 2, s)
+        u = a[:, :, 0, :]
+        v = a[:, :, 1, :]
+        a = np.concatenate([(u + v)[:, :, None, :], (u - v)[:, :, None, :]],
+                           axis=2).reshape(m, n)
+        s *= 2
+    a = a * (signs2 / np.sqrt(n, dtype=np.float32))
+    return a.reshape(orig)
+
+
 def dequant_group(q, scale, group):
     orig = q.shape
     flat = q.reshape(-1, group).astype(np.float32)
@@ -140,22 +180,33 @@ class QLinear:
     identical either way.
     """
 
-    def __init__(self, W, group, clip_steps, wq=None):
+    def __init__(self, W, group, clip_steps, wq=None, rotate=False):
         # W: [out, in]; quantize along `in` (the contraction dim, grouped).
         self.group = group
+        self.rotate = rotate
+        # Rotation is applied to the weights OFFLINE here and to activations at
+        # forward time. Orthonormal per group, so the product is unchanged; only
+        # the quantization grid sees a better-conditioned distribution.
+        Wq = fwht_groups(W, group) if rotate else W
         if wq is None:
-            self.qW, self.sW = quant_group_symmetric_int8(W, group, clip_steps)
+            self.qW, self.sW = quant_group_symmetric_int8(Wq, group, clip_steps)
         else:
-            self.qW, self.sW = quant_group_mixed4(W, group, n_out=wq)
+            self.qW, self.sW = quant_group_mixed4(Wq, group, n_out=wq)
         self.W_deq = dequant_group(self.qW, self.sW, group)  # [out,in]
         self.n_groups = W.shape[1] // group
 
     def w8a16(self, x):
         # x: [batch, in] f32; weights dequantized, exact f32 matmul.
+        if self.rotate:
+            x = fwht_groups(x, self.group)
         return x @ self.W_deq.T
 
     def w8a8(self, x, clip_steps=1):
         # x: [batch, in] f32 -> per-group int8; int32 fold with int8 weights.
+        # Rotate BEFORE quantizing: rotation also conditions the activation
+        # distribution, which is the other half of what incoherence buys.
+        if self.rotate:
+            x = fwht_groups(x, self.group)
         qx, sx = quant_group_symmetric_int8(x, self.group, clip_steps)  # [B,in],[B,ng]
         B = x.shape[0]
         out = self.W_deq.shape[0]
@@ -179,10 +230,13 @@ def run_forward(meta, inp, W, group, mode, clip_steps):
     act8 = mode.endswith("a8")
     act_steps = clip_steps if act8 else 1
     # mixed4* modes use the 4.25 b/w weight codec (3 overlays per 256-group).
-    wq = 3 if mode.startswith("mixed4") else None
+    # "r" prefix => FWHT-rotated (incoherence) variant.
+    rot = mode.startswith("r")
+    base = mode[1:] if rot else mode
+    wq = 3 if base.startswith("mixed4") else None
 
     def proj(name):
-        return QLinear(W[name], group, clip_steps, wq=wq)
+        return QLinear(W[name], group, clip_steps, wq=wq, rotate=rot)
 
     def apply(ql, x):
         return ql.w8a8(x, act_steps) if act8 else ql.w8a16(x)
@@ -240,7 +294,9 @@ def main():
     ap.add_argument("--weights", required=True)
     ap.add_argument("--group", type=int, default=256)
     ap.add_argument("--mode",
-                    choices=["w8a16", "w8a8", "mixed4a16", "mixed4a8", "both", "all"],
+                    choices=["w8a16", "w8a8", "mixed4a16", "mixed4a8",
+                             "rw8a16", "rw8a8", "rmixed4a16", "rmixed4a8",
+                             "both", "all", "rot"],
                     default="both")
     ap.add_argument("--clip-steps", type=int, default=24)
     args = ap.parse_args()
@@ -259,6 +315,8 @@ def main():
         modes = ["w8a16", "w8a8"]
     elif args.mode == "all":
         modes = ["w8a16", "w8a8", "mixed4a16", "mixed4a8"]
+    elif args.mode == "rot":
+        modes = ["mixed4a16", "rmixed4a16", "mixed4a8", "rmixed4a8"]
     else:
         modes = [args.mode]
     print(f"[int8-sim] group={args.group} clip_steps={args.clip_steps} "
