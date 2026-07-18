@@ -1372,16 +1372,15 @@ pub(crate) fn run_examples_qwen35_speed_model(
 ) -> Vec<EvalResult> {
     let cases = qwen35_speed_cases();
     let prompt_ref = prompt("benchmarks/prompts/lru_cache_single_blank.txt");
-    // Speed battery defaults to q8, NOT the global `kvarn` default: (1) the perf
+    // Speed battery defaults to q8, NOT the global `kvarn` default: the perf
     // baseline (benchmarks/perf-baselines/gfx1151-*.json) is a legacy q8/fp32-era
-    // capture, and (2) kvarn BATCHED PREFILL is currently broken — the qwen35
-    // prefill path calls the generic `kv_cache_write` for K/V, but a kvarn cache
-    // stores K as 4-bit var-norm block records + fp16 window, so the write faults
-    // OOB (GPU "Memory access fault ... kernel: kv_cache_write" at pp128). Measuring
-    // a broken/unmeasurable mode against a q8 baseline can't gate. Restore the
-    // kvarn default here once kvarn prefill routes through the kvarn write path
-    // AND the baseline is re-captured under kvarn. An explicit config.kv_mode
-    // still wins (bench_qwen35_speed now understands the kvarn* modes).
+    // capture, and kvarn batched prefill — now correct (it routes through
+    // `kvarn_attend` in prefill_chunk.rs, no longer faulting in `kv_cache_write`)
+    // — is meaningfully SLOWER than q8 (window append + per-block flush vs the
+    // batched q8 write), so measuring kvarn against the q8 baseline would spuriously
+    // fail the gate. Restore the kvarn default here once the baseline is re-captured
+    // under kvarn. An explicit config.kv_mode still wins (bench_qwen35_speed
+    // understands the kvarn* modes).
     let kv_mode = config.kv_mode.as_deref().unwrap_or("q8").to_string();
     let mut rows = Vec::new();
     let base_metrics = BTreeMap::from([

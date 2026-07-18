@@ -4171,7 +4171,68 @@ pub(crate) fn forward_prefill_chunk(
                 );
 
                 // 6. Batched KV cache writes (per-row positions).
-                if kv_cache.quant_asym4 {
+                if kv_cache.quant_kvarn {
+                    // KVarN K = 4-bit block records + fp16 window (not a contiguous
+                    // buffer), so the generic batched writes below would fault.
+                    // kvarn_attend owns the batched write (window append + 128-block
+                    // flush) AND the fused causal flash together — the same entry
+                    // point decode uses (mod.rs), which already supports n>1.
+                    // Rotation + tiles scratch mirror the decode path. The paired
+                    // attention step below is a no-op for kvarn (done here).
+                    static PREFILL_KVARN_ROTATE: std::sync::OnceLock<bool> =
+                        std::sync::OnceLock::new();
+                    let kvarn_rotate = *PREFILL_KVARN_ROTATE.get_or_init(|| {
+                        std::env::var("HIPFIRE_KVARN_ROTATE").ok().as_deref() != Some("0")
+                    });
+                    if kvarn_rotate && config.head_dim == 256 {
+                        gpu.rotate_x_mq_batched(
+                            &pbs.fa_k_batch,
+                            &pbs.fa_k_batch,
+                            config.n_kv_heads * config.head_dim,
+                            n,
+                        )?;
+                        gpu.rotate_x_mq_batched(
+                            &pbs.fa_q_batch,
+                            &pbs.fa_q_batch,
+                            config.n_heads * config.head_dim,
+                            n,
+                        )?;
+                    }
+                    if kv_cache.kvarn_tiles.is_none() {
+                        let tiles = gpu.alloc_tensor(
+                            &[config.n_kv_heads * config.head_dim * 128],
+                            DType::F32,
+                        )?;
+                        kv_cache.kvarn_tiles = Some(tiles);
+                    }
+                    let kvarn_tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
+                    let (kvarn_block_start, kvarn_block_cols) = match tree_verify.as_ref() {
+                        Some(_) => (start_pos, n),
+                        None => (0, 0),
+                    };
+                    gpu.kvarn_attend(
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.k_window[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_q_batch,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        &pbs.positions,
+                        &pbs.fa_attn_out_batch,
+                        &s.flash_partials,
+                        kv_cache.kvarn_tiles.as_ref().unwrap(),
+                        n,
+                        start_pos,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
+                        kvarn_tree_bias,
+                        kvarn_block_start,
+                        kvarn_block_cols,
+                        kv_cache.kvarn_bits,
+                    )?;
+                } else if kv_cache.quant_asym4 {
                     let ct = givens_cos_view!().unwrap();
                     let st = givens_sin_view!().unwrap();
                     if kv_cache.quant_fwht {
@@ -4322,7 +4383,9 @@ pub(crate) fn forward_prefill_chunk(
                     Some(_) => (start_pos, n),
                     None => (0, 0),
                 };
-                if use_kld_direct_f16kv_attention {
+                if kv_cache.quant_kvarn {
+                    // KVarN did the fused write + causal flash in the write step above.
+                } else if use_kld_direct_f16kv_attention {
                     gpu.attention_dflash_wmma_causal_f32(
                         &pbs.fa_q_batch,
                         &pbs.fa_k_batch,
@@ -6583,7 +6646,68 @@ pub(crate) fn forward_prefill_chunk(
                     n,
                 );
 
-                if kv_cache.quant_asym4 {
+                if kv_cache.quant_kvarn {
+                    // KVarN K = 4-bit block records + fp16 window (not a contiguous
+                    // buffer), so the generic batched writes below would fault.
+                    // kvarn_attend owns the batched write (window append + 128-block
+                    // flush) AND the fused causal flash together — the same entry
+                    // point decode uses (mod.rs), which already supports n>1.
+                    // Rotation + tiles scratch mirror the decode path. The paired
+                    // attention step below is a no-op for kvarn (done here).
+                    static PREFILL_KVARN_ROTATE: std::sync::OnceLock<bool> =
+                        std::sync::OnceLock::new();
+                    let kvarn_rotate = *PREFILL_KVARN_ROTATE.get_or_init(|| {
+                        std::env::var("HIPFIRE_KVARN_ROTATE").ok().as_deref() != Some("0")
+                    });
+                    if kvarn_rotate && config.head_dim == 256 {
+                        gpu.rotate_x_mq_batched(
+                            &pbs.fa_k_batch,
+                            &pbs.fa_k_batch,
+                            config.n_kv_heads * config.head_dim,
+                            n,
+                        )?;
+                        gpu.rotate_x_mq_batched(
+                            &pbs.fa_q_batch,
+                            &pbs.fa_q_batch,
+                            config.n_heads * config.head_dim,
+                            n,
+                        )?;
+                    }
+                    if kv_cache.kvarn_tiles.is_none() {
+                        let tiles = gpu.alloc_tensor(
+                            &[config.n_kv_heads * config.head_dim * 128],
+                            DType::F32,
+                        )?;
+                        kv_cache.kvarn_tiles = Some(tiles);
+                    }
+                    let kvarn_tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
+                    let (kvarn_block_start, kvarn_block_cols) = match tree_verify.as_ref() {
+                        Some(_) => (start_pos, n),
+                        None => (0, 0),
+                    };
+                    gpu.kvarn_attend(
+                        &kv_cache.k_gpu[layer_idx],
+                        &kv_cache.k_window[layer_idx],
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_q_batch,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        &pbs.positions,
+                        &pbs.fa_attn_out_batch,
+                        &s.flash_partials,
+                        kv_cache.kvarn_tiles.as_ref().unwrap(),
+                        n,
+                        start_pos,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_cache.physical_cap,
+                        kvarn_tree_bias,
+                        kvarn_block_start,
+                        kvarn_block_cols,
+                        kv_cache.kvarn_bits,
+                    )?;
+                } else if kv_cache.quant_asym4 {
                     let ct = givens_cos_view!().unwrap();
                     let st = givens_sin_view!().unwrap();
                     if kv_cache.quant_fwht {
@@ -6717,7 +6841,9 @@ pub(crate) fn forward_prefill_chunk(
                     Some(_) => (start_pos, n),
                     None => (0, 0),
                 };
-                if use_kld_direct_f16kv_attention {
+                if kv_cache.quant_kvarn {
+                    // KVarN did the fused write + causal flash in the write step above.
+                } else if use_kld_direct_f16kv_attention {
                     gpu.attention_dflash_wmma_causal_f32(
                         &pbs.fa_q_batch,
                         &pbs.fa_k_batch,
@@ -7481,7 +7607,15 @@ fn run_fa_layer_body(
         gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
     }
 
-    if kv_cache.quant_asym4 {
+    if kv_cache.quant_kvarn {
+        // KVarN K = 4-bit block records + fp16 window (not a contiguous buffer),
+        // so the generic fused write/attention below (the trailing `else` uses
+        // kv_cache_write on k_gpu) would fault. This single-token fallback also
+        // calls kv_cache_attention_dispatch (mod.rs) at the end of the layer body,
+        // which already owns the fused KVarN write + causal flash (rotation +
+        // kvarn_attend, the decode path). Defer to it here so the KVarN write is
+        // done exactly once with a single rotation — no-op in this dispatch.
+    } else if kv_cache.quant_asym4 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
         if kv_cache.quant_fwht {
