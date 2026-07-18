@@ -138,8 +138,19 @@ pub fn new_kv_cache(
         }
         "asym2" | "turbo2" => KvCache::new_gpu_asym2(gpu, n_layers, n_kv_heads, head_dim, kv_seq)
             .map_err(|err| err.to_string()),
+        // KVarN (variance-normalized K + Q8 V). `kvarn`/`kvarn4` = 4-bit K,
+        // `kvarn8` = near-lossless, `kvarn2` = aggressive tier — matching the
+        // serving kv_mode menu (serving-core `kvarn_bits_from_mode`). The speed
+        // executor defaults to `kvarn`, so this arm is what the gate actually
+        // measures; without it the bench panicked and emitted no metrics.
+        "kvarn" | "kvarn4" => KvCache::new_gpu_kvarn(gpu, n_layers, n_kv_heads, head_dim, kv_seq, 4)
+            .map_err(|err| err.to_string()),
+        "kvarn8" => KvCache::new_gpu_kvarn(gpu, n_layers, n_kv_heads, head_dim, kv_seq, 8)
+            .map_err(|err| err.to_string()),
+        "kvarn2" => KvCache::new_gpu_kvarn(gpu, n_layers, n_kv_heads, head_dim, kv_seq, 2)
+            .map_err(|err| err.to_string()),
         other => Err(format!(
-            "unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4|asym3|asym2)"
+            "unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4|asym3|asym2|kvarn|kvarn2|kvarn4|kvarn8)"
         )),
     }
 }

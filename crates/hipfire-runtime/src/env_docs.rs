@@ -1215,7 +1215,7 @@ pub const ENV_HIPFIRE_DOTS_OCR_TRACE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DPM_WARMUP_SECS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DPM_WARMUP_SECS",
     description: "Runtime variable controlling dpm warmup secs in hipfire",
-    source: "crates/hipfire-runtime/src/speed_bench.rs:148",
+    source: "crates/hipfire-runtime/src/speed_bench.rs:159",
 };
 
 /// `HIPFIRE_DRAFT_DECODE_UPSCALED` — Diagnostic: HIPFIRE_DRAFT_DECODE_UPSCALED decodes the upscaled Stage-1
@@ -3053,14 +3053,14 @@ pub const ENV_HIPFIRE_PARO_SWIGLU_FUSED: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PERF_BASELINE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PERF_BASELINE",
     description: "Runtime variable controlling perf baseline in hipfire",
-    source: "crates/hipfire-eval/src/executor_examples.rs:1779",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1811",
 };
 
 /// `HIPFIRE_PERF_BASELINE_DIR` — Runtime variable controlling perf baseline dir in hipfire
 pub const ENV_HIPFIRE_PERF_BASELINE_DIR: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PERF_BASELINE_DIR",
     description: "Runtime variable controlling perf baseline dir in hipfire",
-    source: "crates/hipfire-eval/src/executor_examples.rs:1792",
+    source: "crates/hipfire-eval/src/executor_examples.rs:1824",
 };
 
 /// `HIPFIRE_PERPLEXITY_BIN` — Runtime variable controlling perplexity bin in hipfire
