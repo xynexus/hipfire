@@ -216,6 +216,93 @@ class DecodeAttnProblem:
         return out
 
 
+@dataclass
+class DrafterProblem:
+    """One draft-token forward through a DSpark/DFlash speculator body.
+
+    The runtime DSpark drafter (crates/hipfire-arch-llama/src/dspark_body.rs:76)
+    is a 5-layer dense Qwen3 block: dim=4096, FFN=12288, GQA 32 q / 8 kv x 128.
+    Each draft token is one full forward at M=1 (autoregressive) — so it is the
+    DECODE regime: weights stream once per token, arithmetic intensity ~1, and
+    the schedule is movement-bound, not compute-bound.
+
+    The design question this answers is not "how fast is one GEMM" but "does the
+    WHOLE body fit a latency/energy budget on the NPU" — and the dominant lever
+    turns out to be dispatch FUSION, because every op pays the C1 dispatch floor
+    (~t_submit) and a 5-layer body is ~40 ops. Unfused, the floor alone is
+    ~40 x 155 us = 6 ms/token; fused into one dispatch it is paid once. Energy
+    excludes the floor (rate-dependent), so it sums cleanly either way — the
+    fusion lever moves latency, not tok/J.
+    """
+
+    n_layers: int = 5
+    dim: int = 4096
+    inter: int = 12288
+    n_heads: int = 32
+    n_kv: int = 8
+    head_dim: int = 128
+    context: int = 512  # drafter block/context length (small)
+    weight_bits: int = 8  # DSpark sidecar is Q8F16; 4 = OQ4/MQ4
+    kv_bits: int = 4
+
+    def _dtype_b(self) -> str:
+        return "int4" if self.weight_bits == 4 else "int8"
+
+    def layer_ops(self, target) -> list[tuple[str, ScheduleSpec]]:
+        """The per-layer op list (one representative candidate each): 4 attn
+        projections + 3 FFN projections + 1 block-attention step. M=1 decode."""
+        q_dim = self.n_heads * self.head_dim
+        kv_dim = self.n_kv * self.head_dim
+        db = self._dtype_b()
+        projs = [
+            ("q_proj", self.dim, q_dim),
+            ("k_proj", self.dim, kv_dim),
+            ("v_proj", self.dim, kv_dim),
+            ("o_proj", q_dim, self.dim),
+            ("gate_proj", self.dim, self.inter),
+            ("up_proj", self.dim, self.inter),
+            ("down_proj", self.inter, self.dim),
+        ]
+        # M=1 decode is feed-bound on weight bytes, so a real drafter kernel is
+        # designed to saturate the feed: use all shim input streams (8 => 30.8
+        # GB/s), not the one-per-column default (4 => 15.4 GB/s). This is the
+        # single biggest lever after weight bit-width.
+        shim = _shim_streams(target)
+        ops: list[tuple[str, ScheduleSpec]] = []
+        for label, k, n in projs:
+            # Fastest candidate = the one the model would pick; use full columns.
+            cand = _fastest(GemmProblem(1, k, n, "int8", db).candidates(target))
+            if cand:
+                cand.feed_streams = shim
+                # The tiled-GEMM efficiency surface is fit on square 64x64 output
+                # tiles; an M=1 GEMV has a 1x64 output strip, so the surface
+                # collapses to ~0.0004 and inflates a ~1 us compute to ~2 ms. That
+                # is wrong: decode issues its few MACs back-to-back and then waits
+                # on weight streaming. Model it at saturated efficiency so t_feed
+                # (the real, physical limiter for M=1) dominates.
+                cand.core_efficiency = 1.0
+                ops.append((label, cand))
+        attn = _fastest(DecodeAttnProblem(self.context, self.n_kv, self.head_dim, self.kv_bits).candidates(target))
+        if attn:
+            ops.append(("block_attn", attn))
+        return ops
+
+
+def _fastest(cands: list[ScheduleSpec]) -> ScheduleSpec | None:
+    """The candidate a speed-ranked search would build (most columns first)."""
+    return max(cands, key=lambda s: s.columns) if cands else None
+
+
+def _shim_streams(target) -> int:
+    """Concurrent shim input streams (feed ceiling) for the target; 8 on npu1."""
+    try:
+        dev = target.iron_device()
+        shims = list(dev.get_shim_tiles())
+        return dev.get_num_connections(shims[0], False) * len(shims)
+    except Exception:
+        return 8
+
+
 def _column_options(target) -> list[int]:
     opts, c = [], 1
     while c <= target.compute_columns:
@@ -332,6 +419,91 @@ def rank_and_render(specs: list[ScheduleSpec], key: str, device: str, header: st
     return "\n".join(lines)
 
 
+def render_drafter(prob: DrafterProblem, target, key: str, device: str,
+                   draft_len: int, gpu_verify_us: float | None) -> str:
+    ops = prob.layer_ops(target)
+    preds = [(label, model.predict(s, key, device)) for label, s in ops]
+    bad = [(label, p) for label, p in preds if not (p.buildable and p.admissible)]
+
+    lines = []
+    lines.append(f"DSpark/DFlash drafter body on {target.key} — {prob.n_layers}-layer, dim={prob.dim}, "
+                 f"FFN={prob.inter}, GQA {prob.n_heads}/{prob.n_kv}x{prob.head_dim}")
+    lines.append(f"  int8 x int{prob.weight_bits} weights, kvarn{prob.kv_bits}, ctx={prob.context}, "
+                 f"M=1 decode (one draft token = one full forward)")
+    lines.append("")
+    if bad:
+        lines.append("  NON-ADMISSIBLE ops (cannot model the body):")
+        for label, p in bad:
+            why = (p.build_errors or p.missing or ["?"])[0]
+            lines.append(f"    {label}: {why}")
+        return "\n".join(lines)
+
+    # Per-op: device_s already includes one dispatch floor (t_submit). Split it
+    # out so we can model FUSION — a fused kernel pays the floor once, not per op.
+    lines.append(f"  {'op':<12} {'device':>10} {'work':>10} {'floor':>9} {'energy':>9} {'limiter':>9} {'AI':>6}")
+    work_sum = 0.0
+    floor_max = 0.0
+    energy_sum = 0.0
+    for label, p in preds:
+        floor = p.terms.get("t_submit", 0.0)
+        work = p.device_s - floor
+        work_sum += work
+        floor_max = max(floor_max, floor)
+        energy_sum += p.energy_j
+        eb = "mv" if p.energy_terms.get("movement", 0) > p.energy_terms.get("compute", 0) else "cmp"
+        lines.append(f"  {label:<12} {p.device_s * 1e6:>9.1f}u {work * 1e6:>9.1f}u {floor * 1e6:>8.1f}u "
+                     f"{p.energy_j * 1e3:>8.4f}m {p.limiter:>7}/{eb} {p.arithmetic_intensity:>6.1f}")
+
+    n_ops = len(preds) * prob.n_layers
+    unfused_tok = sum(p.device_s for _, p in preds) * prob.n_layers
+    # Fused-per-layer: one floor per layer dispatch; work is sequential (data-dep).
+    fused_layer_tok = (floor_max + work_sum) * prob.n_layers
+    # Fused-whole-body: one floor for the entire forward.
+    fused_body_tok = floor_max + work_sum * prob.n_layers
+    energy_tok = energy_sum * prob.n_layers  # floor excluded from energy — fusion-invariant
+
+    lines.append("")
+    lines.append(f"  per DRAFT TOKEN ({prob.n_layers} layers x {len(preds)} ops = {n_ops} ops):")
+
+    def _row(name: str, t: float) -> str:
+        toks = 1.0 / t if t else 0.0
+        toks_j = 1.0 / energy_tok if energy_tok else 0.0
+        return (f"    {name:<22} {t * 1e6:>10.1f} us/tok  {toks:>8.0f} tok/s   "
+                f"{energy_tok * 1e3:>8.3f} mJ/tok  {toks_j:>7.0f} tok/J")
+
+    lines.append(_row("unfused (floor/op)", unfused_tok))
+    lines.append(_row("fused per-layer", fused_layer_tok))
+    lines.append(_row("fused whole-body", fused_body_tok))
+    floor_tax = (unfused_tok - fused_body_tok) / unfused_tok * 100 if unfused_tok else 0.0
+    lines.append(f"  => dispatch-floor tax, unfused vs fused-body: {floor_tax:.0f}% of latency is the "
+                 f"C1 floor paid {n_ops}x. Energy is identical (floor excluded).")
+
+    lines.append("")
+    lines.append(f"  speculative window (draft_len={draft_len}, autoregressive, fused-body):")
+    window_s = fused_body_tok * draft_len
+    window_j = energy_tok * draft_len
+    lines.append(f"    {window_s * 1e6:>10.1f} us   {window_j * 1e3:>8.3f} mJ  to draft {draft_len} tokens")
+    if gpu_verify_us is not None:
+        verify_s = gpu_verify_us * 1e-6
+        hidden = window_s <= verify_s
+        lines.append(f"    GPU verify budget (input): {gpu_verify_us:.0f} us for the {draft_len + 1}-token verify pass")
+        if hidden:
+            lines.append(f"    => NPU draft ({window_s * 1e6:.0f} us) FITS under the verify pass: drafting is FREE "
+                         "(fully hidden), and it runs on the NPU's energy budget, not the GPU's.")
+        else:
+            over = window_s / verify_s
+            lines.append(f"    => NPU draft ({window_s * 1e6:.0f} us) EXCEEDS the verify pass by {over:.2f}x: it is "
+                         "on the critical path. Shorten draft_len, fuse harder, or the split loses to GPU-only draft.")
+        lines.append("    (GPU verify time is an INPUT — design.py has no GPU calibration; supply it from a GPU bench.)")
+
+    lines.append("")
+    lines.append("  caveats: M=1 GEMMs charge only USEFUL macs (tile padding for a 1-row output is not")
+    lines.append("  modelled, but decode is movement-bound so t_core is not the limiter anyway); LM/markov")
+    lines.append("  /confidence heads and embed lookup are excluded (small vs the body); fusion model treats")
+    lines.append("  per-op work as sequential (data-dependent q->attn->o->ffn) sharing one dispatch floor.")
+    return "\n".join(lines)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--device", default="auto", choices=["auto", "npu1", "npu2"])
@@ -364,6 +536,20 @@ def main() -> int:
     s.add_argument("--kv-heads", type=int, default=8)
     s.add_argument("--head-dim", type=int, default=128, choices=[128, 256])
     s.add_argument("--layers", type=int, default=32, help="scale the per-layer answer to a whole model")
+
+    d = sub.add_parser("drafter", help="DSpark/DFlash speculator body — per-draft-token latency, tok/J, fusion tax")
+    d.add_argument("--layers", type=int, default=5, help="drafter body layers (DSpark runtime = 5)")
+    d.add_argument("--dim", type=int, default=4096)
+    d.add_argument("--inter", type=int, default=12288)
+    d.add_argument("--heads", type=int, default=32)
+    d.add_argument("--kv-heads", type=int, default=8)
+    d.add_argument("--head-dim", type=int, default=128, help="drafter head_dim (tiny config uses 64)")
+    d.add_argument("--context", type=int, default=512, help="drafter block/context length")
+    d.add_argument("--weight-bits", type=int, default=8, choices=[4, 8], help="8 = DSpark Q8F16 sidecar; 4 = OQ4/MQ4")
+    d.add_argument("--kv-bits", type=int, default=4, choices=[2, 4, 8])
+    d.add_argument("--draft-len", type=int, default=4, help="speculative tokens drafted per verify cycle")
+    d.add_argument("--gpu-verify-us", type=float, default=None,
+                   help="GPU verify-pass time (us) to test the NPU-draft||GPU-verify pipelining condition")
 
     args = p.parse_args()
     target = resolve_target(args.device)
@@ -429,6 +615,15 @@ def main() -> int:
         print("  break-even — only bf16 output + minimal activation replication gets there.")
         print("  It also does NOT amortise the KV cache — each sequence has its own — so attention")
         print("  stays movement-bound at any batch size. Batch the projections; the KV read is irreducible.")
+        return 0
+
+    if args.cmd == "drafter":
+        prob = DrafterProblem(
+            n_layers=args.layers, dim=args.dim, inter=args.inter, n_heads=args.heads,
+            n_kv=args.kv_heads, head_dim=args.head_dim, context=args.context,
+            weight_bits=args.weight_bits, kv_bits=args.kv_bits,
+        )
+        print(render_drafter(prob, target, key, args.device, args.draft_len, args.gpu_verify_us))
         return 0
 
     # kv-sweep: the KVarN question, answered per-layer then scaled to the model.

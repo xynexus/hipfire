@@ -444,6 +444,25 @@ to the 37-MACs/byte artifact for any dtype pair without a specific ratio.
 9. **KV bit-width is the decode lever**: kvarn8→4 gives 1.61× (not 2× — the floor
    doesn't shrink), kvarn2 2.33×.
 10. **Allocate BOs once.** 17.6 ms each, size-independent.
+11. **Spec-decode drafter: the NPU-viable size is set by the feed, not the FLOPs.**
+    A draft token is one M=1 forward — pure decode, so every op is feed-bound on
+    weight bytes (AI≈1) and the drafter's throughput is just `feed_BW ÷
+    model_bytes`. The regime flips hard with drafter size:
+    - The **runtime DSpark body** (5-layer, dim 4096, FFN 12288 — a ~1B block) is
+      **feed-starved**: ~965 MB int8/token ÷ 30.8 GB/s ≈ **32 tok/s** (64 at int4,
+      the only real lever). A 4-token window is ~124 ms — it cannot hide under a
+      few-ms GPU verify, so **NPU-draft ‖ GPU-verify loses** at this size.
+    - A **tiny drafter** (h=512, 3-layer, ~5 M params) is instead **dispatch-floor
+      bound**: unfused it is 40× the C1 floor (259 tok/s), **fused whole-body it is
+      3341 tok/s** (a 13× fusion win, 92% floor tax) and drafts 4 tokens in ~1.2 ms
+      — which **fits under a 3 ms verify: the draft is free**, at ~1256 tok/J.
+
+    So: big drafter → weight-bit-width is the lever (feed-bound); small drafter →
+    **fusion is the lever** (floor-bound). The NPU's role in spec-decode is a
+    *small* energy-cheap drafter fully hidden under the GPU verify, not a full-size
+    one. `python -m aiecost.design drafter --gpu-verify-us 3000` tests the
+    pipelining condition (GPU verify time is an input — no GPU calibration in the
+    tool).
 
 ### Buildability — check before designing
 
@@ -470,6 +489,7 @@ specific limit cited.
     python -m aiecost predict spec.json  # breakdown, limiter, energy, advice
     python -m aiecost.design gemm --m 256 --k 768 --n 1280 --weight-bits 4
     python -m aiecost.design kv-sweep --context 4096
+    python -m aiecost.design drafter --gpu-verify-us 3000   # DSpark/DFlash spec-decode body
     python -m aiecost.validate --family c    # commit-first ordinal validation
     python -m aiecost.benches.e1_energy --kernel compute --cores 16 --rate 50
     python -m aiecost.benches.g1_gpu --all --rate 50
