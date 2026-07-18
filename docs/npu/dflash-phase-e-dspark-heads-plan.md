@@ -156,3 +156,51 @@ The f32 reference is a line-by-line mirror of `dspark_core::run_heads` +
 GPU implementation was not run (it needs a GPU harness that uploads synthetic
 `x_head`/`logits` into `run_heads`, which does not exist yet) — so the reference
 is validated by construction, not by execution against the Rust.
+
+## Top-k shortlist: the markov head should run on ONE CPU THREAD, not the NPU
+
+The markov bias only ever decides an **argmax**. So instead of the full
+`[151936, 256]` GEMV, compute the bias for only the top-`k` candidates of the base
+logits. Implemented as `backend="topk"` in `dspark_heads_npu.py` (CPU, f32).
+
+**Exactness (real trained `markov_w2`; only the logits are synthetic):**
+
+| k | out_ids vs f32 reference | truncation | free-running chain |
+|---|---|---|---|
+| 16 | 5/5 seeds exact | 5/5 exact | 35/35 tokens identical |
+| 64 | 5/5 seeds exact | 5/5 exact | — |
+| 256 | 5/5 seeds exact | 5/5 exact | 35/35 tokens identical |
+
+100% agreement held across logit-scale multipliers 1×–8×, teacher-forced AND
+free-running. Zero flips at any k tested, down to k=16.
+
+**Cost (single CPU thread, measured):**
+
+| variant | per slot | per block (7) |
+|---|---|---|
+| NPU int8 GEMV (Phase E as built) | 25.6–26.8 ms | **180 ms** |
+| CPU f32 full-vocab GEMV | 10.59 ms (17.2 GB/s, 156 MB streamed) | 74.2 ms |
+| **CPU f32 top-k (k=256)** | **1.24 ms** | **8.7 ms** |
+
+**~20× better than the NPU path**, and it takes the head from budget-dominating to
+nearly free against the 57 ms verify window.
+
+Three reasons this is the right split, not just a faster number:
+1. The markov loop is inherently sequential, so no cross-slot parallelism is lost by
+   using one thread.
+2. The CPU is idle exactly when the drafter runs (NPU-draft ‖ GPU-verify).
+3. The NPU is the wrong shape for it: a 1-row GEMV against a 39 MB weight, where the
+   activation must be a multiple of 16 (15/16 of MACs are padding) and `markov_w2`
+   cannot stay on-chip. The NPU wins the *body* (dense M=16 GEMMs, 23 ms) and loses
+   this.
+
+**Correction to an earlier estimate:** the speedup is ~9× over full-vocab CPU, NOT the
+~300× a naive MAC count suggests. The gathered dot does collapse to nothing, but the
+top-k **selection** is O(vocab) and now dominates (~1.2 ms/slot floor) — which is why
+k=16 is no faster than k=256. If the target's sampler already produces a top-k, the
+markov head reduces to a gather + a 256-wide dot, i.e. microseconds.
+
+Caveat: with synthetic N(0,1) logits the top-2 gap is ~0.1 while the bias reaches
+±0.6, so bias-driven flips *were* genuinely exercised — the winner simply never fell
+outside the top 16. Real lm_head logits are more peaked, which makes top-k safer, not
+riskier. A markedly flatter-than-N(0,1) target is the case to re-check.
