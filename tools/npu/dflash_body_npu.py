@@ -120,7 +120,7 @@ def quantize_row_symmetric(x_f32, bits=8):
 # ─────────────────────────────────────────────────────────────────────────────
 class NpuOps:
     def __init__(self, count=True, batch_ops=False, proj_mode="group",
-                 resident_weights=False):
+                 resident_weights=False, concat_proj=False):
         # batch_ops   : Lever 1 — run norm/headnorm/rope/swiglu batched (all rows
         #               in ONE dispatch) via the *-b<rows> xclbins instead of the
         #               per-row loop.
@@ -129,6 +129,10 @@ class NpuOps:
         #               dispatch/projection, Lever 2a).
         self.batch_ops = batch_ops
         self.proj_mode = proj_mode
+        # concat_proj : Lever 3 — projections sharing an input (q/k/v on x_norm,
+        #               gate/up on x2, k_ctx/v_ctx on thp) stacked into ONE GEMM.
+        #               Exact; row-proj mode only. Saves 4 dispatches/layer.
+        self.concat_proj = concat_proj
         # Lever 4 (speed, not dispatch count): keep int8 projection weights
         # resident on the NPU instead of re-uploading ~1 GB every pass.
         self.resident_weights = resident_weights
@@ -302,6 +306,26 @@ class NpuOps:
             dev = W.device_weight(name) if self.resident_weights else None
             return self._proj_row(x, qw, sw, dev)
         return self._proj_group(x, *W.qproj(name))
+
+    def project_concat(self, x, W, names):
+        """Lever 3 (concat-GEMM): ONE dispatch for projections sharing an input.
+
+        q/k/v all consume x_norm; gate/up both consume x2; k_ctx/v_ctx both consume
+        thp — stacking their weights along the output dim turns N GEMMs into 1.
+        EXACT (per-row int8 scales are per-output-channel, so stacking changes
+        nothing). Falls back to sequential `project` in per-group mode.
+        Returns the outputs split back out, in `names` order.
+        """
+        if self.proj_mode != "row" or not self.concat_proj:
+            return [self.project(x, W, n) for n in names]
+        qw, sw, sizes = W.qproj_row_concat(names)
+        dev = W.device_weight_concat(names) if self.resident_weights else None
+        y = self._proj_row(x, qw, sw, dev)          # [rows, sum(N)]
+        out, off = [], 0
+        for n in sizes:
+            out.append(y[:, off:off + n])
+            off += n
+        return out
 
     def _proj_group(self, x, qw, sw):
         """Per-256-group int8 (baseline): one dispatch per group.
@@ -506,6 +530,36 @@ class Weights:
             self._q[key] = q
         return q
 
+    def qproj_row_concat(self, names):
+        """Lever 3 (concat-GEMM): projections that share an INPUT are stacked along
+        the output dim into ONE weight, so they run as a single GEMM.
+
+        EXACT: per-row (per-output-channel) int8 quantization is independent per
+        row, so vstacking pre-quantized weights and concatenating their scales is
+        bit-identical to projecting separately. Returns (qw_cat[sum(N),K],
+        sw_cat[sum(N)], sizes[list of N]). Cached per name-tuple.
+        """
+        key = ("rowcat", tuple(names))
+        q = self._q.get(key)
+        if q is None:
+            parts = [self.qproj_row(n) for n in names]
+            qw = np.concatenate([p[0] for p in parts], axis=0)
+            sw = np.concatenate([p[1] for p in parts], axis=0)
+            sizes = [p[0].shape[0] for p in parts]
+            q = (qw, sw, sizes)
+            self._q[key] = q
+        return q
+
+    def device_weight_concat(self, names):
+        """NPU-resident upload of the concatenated weight (uploaded once)."""
+        key = ("rowcat", tuple(names))
+        d = self._dev.get(key)
+        if d is None:
+            qw, _sw, _sizes = self.qproj_row_concat(names)
+            d = design.upload_int8(qw)
+            self._dev[key] = d
+        return d
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
@@ -548,11 +602,12 @@ def run_body(ops, W, cfg, noise, thp, per_layer_out=None):
         p = f"layers.{li}."
         residual = hidden
         xn = ops.rmsnorm(hidden, W.raw(p + "input_layernorm.weight"))
-        q = ops.project(xn, W, p + "self_attn.q_proj.weight")
-        k_noise = ops.project(xn, W, p + "self_attn.k_proj.weight")
-        v_noise = ops.project(xn, W, p + "self_attn.v_proj.weight")
-        k_ctx = ops.project(thp, W, p + "self_attn.k_proj.weight")
-        v_ctx = ops.project(thp, W, p + "self_attn.v_proj.weight")
+        # Lever 3 concat-GEMM: q/k/v share x_norm -> 1 dispatch; k_ctx/v_ctx share thp -> 1.
+        q, k_noise, v_noise = ops.project_concat(
+            xn, W, [p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
+                    p + "self_attn.v_proj.weight"])
+        k_ctx, v_ctx = ops.project_concat(
+            thp, W, [p + "self_attn.k_proj.weight", p + "self_attn.v_proj.weight"])
 
         q = ops.headnorm(q, W.raw(p + "self_attn.q_norm.weight"), "q", cfg.NH)
         k = np.concatenate([k_ctx, k_noise], axis=0)  # [tot, NKV*HD]
@@ -572,8 +627,9 @@ def run_body(ops, W, cfg, noise, thp, per_layer_out=None):
 
         residual = hidden
         xn2 = ops.rmsnorm(hidden, W.raw(p + "post_attention_layernorm.weight"))
-        gate = ops.project(xn2, W, p + "mlp.gate_proj.weight")
-        up = ops.project(xn2, W, p + "mlp.up_proj.weight")
+        # Lever 3 concat-GEMM: gate/up share x2 -> 1 dispatch.
+        gate, up = ops.project_concat(
+            xn2, W, [p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"])
         s = ops.swiglu(gate, up)
         d = ops.project(s, W, p + "mlp.down_proj.weight")
         hidden = residual + d
@@ -846,6 +902,10 @@ def main():
     ap.add_argument("--proj", choices=["group", "row"], default="group",
                     help="Lever 2: 'group'=per-256-group int8 (baseline); "
                          "'row'=full-K per-row/per-channel int8 (2a, one dispatch/proj)")
+    ap.add_argument("--concat-proj", action="store_true",
+                    help="Lever 3: stack projections sharing an input (q/k/v, "
+                         "gate/up, k_ctx/v_ctx) into ONE GEMM each — exact, "
+                         "saves 4 dispatches/layer (row proj only)")
     args = ap.parse_args()
 
     G = Golden(args.golden_dir)
@@ -857,9 +917,11 @@ def main():
     print(f"[dflash_body_npu] loading weights ...")
     W = Weights(args.weights)
     ops = NpuOps(batch_ops=args.batch_ops, proj_mode=args.proj,
-                 resident_weights=args.resident_weights)
+                 resident_weights=args.resident_weights,
+                 concat_proj=args.concat_proj)
     print(f"[dflash_body_npu] config: batch_ops={ops.batch_ops} "
-          f"proj_mode={ops.proj_mode} resident_weights={ops.resident_weights}")
+          f"proj_mode={ops.proj_mode} resident_weights={ops.resident_weights} "
+          f"concat_proj={ops.concat_proj}")
 
     if args.op_by_op:
         ok = op_by_op(ops, W, cfg, G, args.cos_gate)
