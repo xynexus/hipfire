@@ -118,6 +118,9 @@ MANIFEST = Manifest()
 # integer, so any difference is a layout/arg-order bug, never precision.
 DUMP_OP_DIR = None
 _DUMPED_OP = False
+# Where to save the int8/bf16 precision reference (the second cosine gate), so
+# the native driver validates against the identical array.
+DUMP_REF_PATH = None
 
 
 def _tdesc(t, role):
@@ -147,6 +150,67 @@ def _maybe_dump_op(qw, qx, C, M, K, N):
                    "dtype_in_str": "i8", "dtype_out_str": "i32",
                    "b_col_maj": 1}, f, indent=2)
     print(f"[dump-op] int_matmul M={M} K={K} N={N} -> {d}")
+
+
+def dump_native_weights(W, cfg, outdir):
+    """Emit everything the native (Rust) body driver needs, once.
+
+    The int8 quantization of the projection weights is an OFFLINE step (in a
+    real deployment the .hfq sidecar already stores them quantized), so the
+    native driver loads them pre-quantized rather than re-deriving them — and
+    loads exactly the CONCATENATED groups the body dispatches, in the same
+    stacking order the harness uses.
+
+    Raw little-endian binary + an index.json of shapes: these are ~1 GB of
+    int8, and .npy framing buys nothing when both sides are ours.
+    """
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    index = {"gemms": {}, "gammas": {}}
+
+    def put_gemm(key, names):
+        qw, sw, sizes = W.qproj_row_concat(names)
+        (outdir / f"w_{key}.i8").write_bytes(
+            np.ascontiguousarray(qw, np.int8).tobytes())
+        (outdir / f"w_{key}.scale").write_bytes(
+            np.ascontiguousarray(sw, np.float32).tobytes())
+        index["gemms"][key] = {"M": int(qw.shape[0]), "K": int(qw.shape[1]),
+                               "sizes": [int(s) for s in sizes]}
+
+    def put_gamma(key, name):
+        g = np.ascontiguousarray(W.raw(name), np.float32)
+        (outdir / f"g_{key}.f32").write_bytes(g.tobytes())
+        index["gammas"][key] = {"n": int(g.size)}
+
+    put_gemm("fc", ["fc.weight"])
+    put_gamma("hidden_norm", "hidden_norm.weight")
+    put_gamma("final_norm", "norm.weight")
+    for li in range(cfg.NL):
+        p = f"layers.{li}."
+        put_gemm(f"l{li}_qkv", [p + "self_attn.q_proj.weight",
+                                p + "self_attn.k_proj.weight",
+                                p + "self_attn.v_proj.weight"])
+        put_gemm(f"l{li}_kv", [p + "self_attn.k_proj.weight",
+                               p + "self_attn.v_proj.weight"])
+        put_gemm(f"l{li}_o", [p + "self_attn.o_proj.weight"])
+        put_gemm(f"l{li}_gateup", [p + "mlp.gate_proj.weight",
+                                   p + "mlp.up_proj.weight"])
+        put_gemm(f"l{li}_down", [p + "mlp.down_proj.weight"])
+        put_gamma(f"l{li}_input", p + "input_layernorm.weight")
+        put_gamma(f"l{li}_post", p + "post_attention_layernorm.weight")
+        put_gamma(f"l{li}_qnorm", p + "self_attn.q_norm.weight")
+        put_gamma(f"l{li}_knorm", p + "self_attn.k_norm.weight")
+
+    index["cfg"] = {"H": cfg.H, "I": cfg.I, "NH": cfg.NH, "NKV": cfg.NKV,
+                    "HD": cfg.HD, "NL": cfg.NL, "B": cfg.B, "L": cfg.L,
+                    "NE": cfg.NE, "tot": cfg.tot, "groups": cfg.groups,
+                    "EPS": cfg.EPS, "KERNEL_EPS": KERNEL_EPS,
+                    "THETA": cfg.THETA}
+    with open(outdir / "index.json", "w") as f:
+        json.dump(index, f, indent=2)
+    nb = sum(v["M"] * v["K"] for v in index["gemms"].values())
+    print(f"[dump-weights] {len(index['gemms'])} GEMM weights ({nb/1e6:.0f}M int8), "
+          f"{len(index['gammas'])} gammas -> {outdir}")
 
 
 def _jit_artifacts(design_obj, **compile_kwargs):
@@ -1298,6 +1362,13 @@ def full_body(ops, W, cfg, G, cos_gate=0.99, warm_runs=0):
                          proj_mode=ops.proj_mode, fold_norm=ops.fold_norm,
                          stack_ctx=ops.stack_ctx)
 
+    if DUMP_REF_PATH is not None:
+        # The native driver gates on the SAME two cosines as Python, and the
+        # int8/bf16 precision reference is pure numpy — dump it so the native
+        # side compares against an identical array rather than recomputing it.
+        np.save(DUMP_REF_PATH, np.ascontiguousarray(final_ref, np.float32))
+        print(f"[dump-ref] precision reference -> {DUMP_REF_PATH}")
+
     gold_final = G.rust("final_block_hidden")
     ok = True
     print("  per-layer (NPU vs golden l{li}_out / vs precision-ref):")
@@ -1366,6 +1437,12 @@ def main():
                     help="Phase D step 3a: merge the q/k/v and k_ctx/v_ctx GEMMs "
                          "into ONE by stacking activation rows (exact; implies "
                          "--fold-norm); saves 1 dispatch/layer")
+    ap.add_argument("--dump-ref", type=Path, default=None,
+                    help="save the int8/bf16 precision reference final "
+                         "block_hidden (the native driver's second cosine gate)")
+    ap.add_argument("--dump-weights", type=Path, default=None,
+                    help="emit pre-quantized int8 GEMM weights + gammas + shape "
+                         "index for the native Rust body driver, then exit")
     ap.add_argument("--dump-op", type=Path, default=None,
                     help="dump the FIRST int8 projection's exact A/B/C device "
                          "buffers for native bit-for-bit parity (step 2)")
@@ -1384,6 +1461,9 @@ def main():
     if args.dump_op:
         global DUMP_OP_DIR
         DUMP_OP_DIR = args.dump_op
+    if args.dump_ref:
+        global DUMP_REF_PATH
+        DUMP_REF_PATH = args.dump_ref
     meta = json.load(open(G.root / "ref_meta.json"))
     cfg = Cfg(meta)
     print(f"[dflash_body_npu] B={cfg.B} L={cfg.L} tot={cfg.tot} H={cfg.H} I={cfg.I} "
@@ -1401,6 +1481,10 @@ def main():
           f"concat_proj={ops.concat_proj} attn_all_kv={ops.attn_all_kv} "
           f"fuse_hnrope={ops.fuse_hnrope} fold_norm={ops.fold_norm} "
           f"stack_ctx={ops.stack_ctx}")
+
+    if args.dump_weights:
+        dump_native_weights(W, cfg, args.dump_weights)
+        return 0
 
     if args.op_by_op:
         ok = op_by_op(ops, W, cfg, G, args.cos_gate)

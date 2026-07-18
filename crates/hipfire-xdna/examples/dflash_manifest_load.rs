@@ -6,7 +6,14 @@
 //! hash-keyed `@iron.jit` cache paths (`~/.npu/cache/<hash>/`) that the native
 //! side cannot compute, alongside the plain `target/npu/*.xclbin` primitives.
 //!
-//! Usage: `dflash_manifest_load MANIFEST.json`   (hold the hipfire lock)
+//! With `--hold`, every kernel is kept loaded simultaneously instead of being
+//! dropped after loading. That is the decisive check for the native body
+//! driver: npu1 (Phoenix) has a small hardware-context budget (the Python
+//! harness runs an LRU of 6 and drains on exhaustion), so if all the body's
+//! kernels cannot be resident at once, the native driver needs its own
+//! eviction policy and pays context churn on the hot path.
+//!
+//! Usage: `dflash_manifest_load MANIFEST.json [--hold]`   (hold the hipfire lock)
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -22,6 +29,8 @@ fn main() {
             .expect("parse manifest");
     let kernels = manifest["kernels"].as_object().expect("kernels object");
 
+    let hold = args.iter().any(|a| a == "--hold");
+    let mut held = Vec::new();
     let mut ok = 0usize;
     let mut failed = Vec::new();
     for (name, spec) in kernels {
@@ -41,19 +50,27 @@ fn main() {
                 continue;
             }
         };
-        // Load and drop immediately: npu1 (Phoenix) can only keep a handful of
-        // hardware contexts resident, so holding all 14 at once would exhaust
-        // the budget. This step only proves each artifact is loadable.
         match NpuKernel::load(&xclbin, &insts) {
-            Ok(_k) => {
+            Ok(k) => {
                 ok += 1;
                 println!("  [OK]   {name}  (xclbin {} B, insts {} B)", xclbin.len(), insts.len());
+                if hold {
+                    held.push(k);
+                }
             }
             Err(e) => failed.push(format!("{name}: NpuKernel::load failed: {e:?}")),
         }
     }
 
-    println!("\ndflash_manifest_load: {ok}/{} kernels loaded", kernels.len());
+    println!(
+        "\ndflash_manifest_load: {ok}/{} kernels loaded{}",
+        kernels.len(),
+        if hold {
+            format!(" ({} held resident simultaneously)", held.len())
+        } else {
+            String::new()
+        }
+    );
     for f in &failed {
         println!("  [FAIL] {f}");
     }
