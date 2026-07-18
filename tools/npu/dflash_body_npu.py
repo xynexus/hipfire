@@ -121,7 +121,7 @@ def quantize_row_symmetric(x_f32, bits=8):
 class NpuOps:
     def __init__(self, count=True, batch_ops=False, proj_mode="group",
                  resident_weights=False, concat_proj=False, attn_all_kv=False,
-                 fuse_hnrope=False, fold_norm=False):
+                 fuse_hnrope=False, fold_norm=False, stack_ctx=False):
         # batch_ops   : Lever 1 — run norm/headnorm/rope/swiglu batched (all rows
         #               in ONE dispatch) via the *-b<rows> xclbins instead of the
         #               per-row loop.
@@ -146,6 +146,10 @@ class NpuOps:
         #             weight, 1/rms folded into the per-row activation scale).
         #             Saves 2 dispatches/layer + the one-time hidden_norm.
         self.fold_norm = fold_norm
+        # stack_ctx : Phase D step 3a — merge the q/k/v and k_ctx/v_ctx GEMMs
+        #             into ONE by stacking their activation ROWS (exact; needs
+        #             fold_norm, since the two halves carry different norms).
+        self.stack_ctx = stack_ctx
         # Lever 4 (speed, not dispatch count): keep int8 projection weights
         # resident on the NPU instead of re-uploading ~1 GB every pass.
         self.resident_weights = resident_weights
@@ -425,6 +429,45 @@ class NpuOps:
             off += n
         return out
 
+    def project_qkv_stacked(self, hidden, thp, W, p, cfg):
+        """Phase D step 3a: the q/k/v projection and the k_ctx/v_ctx projection
+        merged into ONE GEMM by stacking their ROWS.
+
+        Both consume the SAME per-layer [q|k|v] weight and differ only in their
+        activation (block hidden, 16 rows, vs the context projection thp, 32
+        rows). Per-row int8 quantization is independent per row, so vstacking
+        the two activations and running a single GEMM is EXACT — bit-identical
+        to the two separate GEMMs for every output that is kept.
+
+        This is only expressible because step 2 moved gamma to the activation
+        side: the two halves carry DIFFERENT norms (input_layernorm vs
+        hidden_norm), which a shared weight could not have absorbed, but which
+        per-row activation scaling handles for free.
+
+        Rows are stacked [thp ; hidden] so k/v come out already in the
+        ctx-then-noise order the attention expects. The q outputs of the 32 thp
+        rows are computed and discarded — ~2.1x the MACs in this GEMM, but the
+        25 MB of int8 weight streams ONCE instead of twice, which is the actual
+        bound. Saves 1 dispatch/layer.
+        """
+        names = [p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
+                 p + "self_attn.v_proj.weight"]
+        value, rms_thp, gamma_thp = thp
+        hidden = np.ascontiguousarray(hidden, np.float32)
+        rms_hid = np.sqrt(np.mean(hidden ** 2, axis=1) + cfg.EPS).astype(np.float32)
+        act_hid = hidden * W.raw(p + "input_layernorm.weight").astype(np.float32)[None, :]
+        act_thp = value.astype(np.float32) * W.raw(gamma_thp).astype(np.float32)[None, :]
+        stacked = np.vstack([act_thp, act_hid])                 # [tot, H]
+        act_div = np.concatenate([rms_thp, rms_hid])            # [tot]
+        qw, sw, sizes = W.qproj_row_concat(names)
+        dev = W.device_weight_concat(names) if self.resident_weights else None
+        y = self._proj_row(stacked, qw, sw, dev, act_div=act_div)
+        nq, nk, _nv = sizes
+        q = y[cfg.L:, :nq]                    # block rows only
+        k = y[:, nq:nq + nk]                  # [tot] ctx rows then noise rows
+        v = y[:, nq + nk:]
+        return q, k, v
+
     def project_concat_thp(self, thp, W, names):
         """k_ctx/v_ctx from the context projection `thp`.
 
@@ -637,6 +680,23 @@ def ref_project_concat_prenorm(W, names, gamma_name, x, eps, fold_norm):
     return _split(ref_proj_int8_row_prenorm(xg, qw, sw, rms), sizes)
 
 
+def ref_project_qkv_stacked(W, p, cfg, hidden, thp):
+    """Reference twin of NpuOps.project_qkv_stacked."""
+    names = [p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
+             p + "self_attn.v_proj.weight"]
+    value, rms_thp, gamma_thp = thp
+    hidden = hidden.astype(np.float32)
+    rms_hid = np.sqrt(np.mean(hidden ** 2, axis=1) + cfg.EPS).astype(np.float32)
+    act_hid = hidden * W.raw(p + "input_layernorm.weight").astype(np.float32)[None, :]
+    act_thp = value.astype(np.float32) * W.raw(gamma_thp).astype(np.float32)[None, :]
+    stacked = np.vstack([act_thp, act_hid])
+    act_div = np.concatenate([rms_thp, rms_hid])
+    qw, sw, sizes = W.qproj_row_concat(names)
+    y = ref_proj_int8_row_prenorm(stacked, qw, sw, act_div)
+    nq, nk, _nv = sizes
+    return y[cfg.L:, :nq], y[:, nq:nq + nk], y[:, nq + nk:]
+
+
 def ref_project_thp(W, names, thp, fold_norm):
     """Reference twin of NpuOps.project_concat_thp."""
     value, rms, gamma_name = thp
@@ -784,17 +844,22 @@ def run_body(ops, W, cfg, noise, thp, per_layer_out=None):
     for li in range(cfg.NL):
         p = f"layers.{li}."
         residual = hidden
-        # Lever 3 concat-GEMM: q/k/v share x_norm -> 1 dispatch; k_ctx/v_ctx share thp -> 1.
-        # Phase D step 2: the input_layernorm is absorbed into that GEMM.
-        q, k_noise, v_noise = ops.project_concat_prenorm(
-            hidden, W, [p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
-                        p + "self_attn.v_proj.weight"],
-            p + "input_layernorm.weight", cfg.EPS)
-        k_ctx, v_ctx = ops.project_concat_thp(
-            thp, W, [p + "self_attn.k_proj.weight", p + "self_attn.v_proj.weight"])
+        if ops.stack_ctx:
+            # Phase D step 3a: q/k/v and k_ctx/v_ctx merged into ONE GEMM by
+            # stacking their rows; k/v come out already ctx-then-noise ordered.
+            q, k, v = ops.project_qkv_stacked(hidden, thp, W, p, cfg)
+        else:
+            # Lever 3 concat-GEMM: q/k/v share x_norm -> 1 dispatch; k_ctx/v_ctx share thp -> 1.
+            # Phase D step 2: the input_layernorm is absorbed into that GEMM.
+            q, k_noise, v_noise = ops.project_concat_prenorm(
+                hidden, W, [p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
+                            p + "self_attn.v_proj.weight"],
+                p + "input_layernorm.weight", cfg.EPS)
+            k_ctx, v_ctx = ops.project_concat_thp(
+                thp, W, [p + "self_attn.k_proj.weight", p + "self_attn.v_proj.weight"])
+            k = np.concatenate([k_ctx, k_noise], axis=0)  # [tot, NKV*HD]
+            v = np.concatenate([v_ctx, v_noise], axis=0)
 
-        k = np.concatenate([k_ctx, k_noise], axis=0)  # [tot, NKV*HD]
-        v = np.concatenate([v_ctx, v_noise], axis=0)
         # Phase D step 1: headnorm+rope fused into one dispatch each (q, k).
         q = ops.headnorm_rope(q, W.raw(p + "self_attn.q_norm.weight"),
                               np.arange(cfg.L, cfg.L + cfg.B), "q", cfg.NH, cfg.THETA)
@@ -873,13 +938,16 @@ def prequantize(W, cfg, proj_mode, resident=False, fold_norm=False):
 
 
 def ref_body(W, cfg, noise, thp_ref, per_layer_out=None, proj_mode="group",
-             fold_norm=False):
+             fold_norm=False, stack_ctx=False):
     """bf16/int8-precision numpy mirror of run_body (no NPU)."""
     hidden = noise.astype(np.float32).copy()
     for li in range(cfg.NL):
         p = f"layers.{li}."
         residual = hidden
-        if proj_mode == "row":
+        if proj_mode == "row" and stack_ctx:
+            q, k, v = ref_project_qkv_stacked(W, p, cfg, hidden, thp_ref)
+            k_ctx = k_noise = v_ctx = v_noise = None
+        elif proj_mode == "row":
             q, k_noise, v_noise = ref_project_concat_prenorm(
                 W, [p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
                     p + "self_attn.v_proj.weight"],
@@ -896,8 +964,9 @@ def ref_body(W, cfg, noise, thp_ref, per_layer_out=None, proj_mode="group",
             v_ctx = ref_project(W, p + "self_attn.v_proj.weight", thp_ref[0], proj_mode)
 
         q = ref_headnorm(q, W.raw(p + "self_attn.q_norm.weight"), cfg.NH, cfg.EPS)
-        k = np.concatenate([k_ctx, k_noise], axis=0)
-        v = np.concatenate([v_ctx, v_noise], axis=0)
+        if k_ctx is not None:
+            k = np.concatenate([k_ctx, k_noise], axis=0)
+            v = np.concatenate([v_ctx, v_noise], axis=0)
         k = ref_headnorm(k, W.raw(p + "self_attn.k_norm.weight"), cfg.NKV, cfg.EPS)
 
         q = ref_rope(q, np.arange(cfg.L, cfg.L + cfg.B), cfg.NH, cfg.THETA)
@@ -980,7 +1049,11 @@ def op_by_op(ops, W, cfg, G, cos_gate=0.99):
     #    q_roped/k_roped then validate norm-fold and projection together.
     xn_g = G.rust("l0_input_norm")          # feed golden to isolate downstream
     thp_g = G.rust("target_hidden_proj")
-    if ops.fold_norm:
+    if ops.stack_ctx:
+        q, k_all, v_all = ops.project_qkv_stacked(noise, thp, W, p, cfg)
+        k_ctx, k_noise = k_all[:cfg.L], k_all[cfg.L:]
+        v_ctx, v_noise = v_all[:cfg.L], v_all[cfg.L:]
+    elif ops.fold_norm:
         q, k_noise, v_noise = ops.project_concat_prenorm(
             noise, W, [p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
                        p + "self_attn.v_proj.weight"],
@@ -1083,7 +1156,8 @@ def full_body(ops, W, cfg, G, cos_gate=0.99, warm_runs=0):
                           proj_mode=ops.proj_mode, fold_norm=ops.fold_norm)
     per_layer_ref = []
     final_ref = ref_body(W, cfg, noise, thp_ref, per_layer_out=per_layer_ref,
-                         proj_mode=ops.proj_mode, fold_norm=ops.fold_norm)
+                         proj_mode=ops.proj_mode, fold_norm=ops.fold_norm,
+                         stack_ctx=ops.stack_ctx)
 
     gold_final = G.rust("final_block_hidden")
     ok = True
@@ -1149,6 +1223,10 @@ def main():
                          "projection INTO that projection (gamma folded into the "
                          "weight, 1/rms into the per-row activation scale); "
                          "saves 2 dispatches/layer (row proj only)")
+    ap.add_argument("--stack-ctx", action="store_true",
+                    help="Phase D step 3a: merge the q/k/v and k_ctx/v_ctx GEMMs "
+                         "into ONE by stacking activation rows (exact; implies "
+                         "--fold-norm); saves 1 dispatch/layer")
     ap.add_argument("--fuse-hnrope", action="store_true",
                     help="Phase D step 1: fuse headnorm+rope into ONE kernel for "
                          "q and k (dflash-hnrope-*); saves 2 dispatches/layer")
@@ -1165,11 +1243,14 @@ def main():
     ops = NpuOps(batch_ops=args.batch_ops, proj_mode=args.proj,
                  resident_weights=args.resident_weights,
                  concat_proj=args.concat_proj, attn_all_kv=args.attn_all_kv,
-                 fuse_hnrope=args.fuse_hnrope, fold_norm=args.fold_norm)
+                 fuse_hnrope=args.fuse_hnrope,
+                 fold_norm=args.fold_norm or args.stack_ctx,
+                 stack_ctx=args.stack_ctx)
     print(f"[dflash_body_npu] config: batch_ops={ops.batch_ops} "
           f"proj_mode={ops.proj_mode} resident_weights={ops.resident_weights} "
           f"concat_proj={ops.concat_proj} attn_all_kv={ops.attn_all_kv} "
-          f"fuse_hnrope={ops.fuse_hnrope} fold_norm={ops.fold_norm}")
+          f"fuse_hnrope={ops.fuse_hnrope} fold_norm={ops.fold_norm} "
+          f"stack_ctx={ops.stack_ctx}")
 
     if args.op_by_op:
         ok = op_by_op(ops, W, cfg, G, args.cos_gate)

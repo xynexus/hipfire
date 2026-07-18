@@ -1,9 +1,24 @@
 # DFlash Phase D — multi-core / memtile STAGE FUSION design
 
-Goal: get from **13.6 dispatches/layer** (current, one dispatch per logical op) to
-the plan's **~3/layer** by fusing multiple logical ops into single AIE kernels.
+Goal: get from **13.6 dispatches/layer** (one dispatch per logical op) to the
+plan's **~3/layer** by fusing multiple logical ops into single AIE kernels.
 Parity must not move: full-body cos > 0.99 vs the f16 golden AND vs the int8/bf16
-precision reference (current: 0.998092 / 0.998147 — has not moved across 5 levers).
+precision reference.
+
+**Current status: 8.4 dispatches/layer, parity improved, ~3/layer NOT reached.**
+
+| stage | dispatches/layer | cos vs golden | cos vs precision ref |
+|---|---|---|---|
+| baseline (5 levers) | 13.6 (68) | 0.998092 | 0.998147 |
+| + step 1 headnorm+rope fused | 11.6 (58) | 0.998132 | 0.998221 |
+| + step 2 rmsnorm absorbed | 9.4 (47) | 0.998200 | 0.998578 |
+| + step 3a qkv/ctx row-stack | **8.4 (42)** | **0.998200** | **0.998578** |
+
+Steps 1–3a needed exactly one new AIE kernel
+(`dflash_headnorm_rope_batched_bf16.cc`); steps 2 and 3a are pure algebra on the
+int8 scales and cost nothing. The remaining 8.4 -> ~3 needs the multi-phase
+memtile program described under step 3, which was deliberately NOT attempted —
+see the blockers recorded there.
 
 ## Why this needs multi-core / memtile
 
@@ -122,7 +137,27 @@ rmsnorm dispatches/layer (13.6 -> ~9.6 after step 1's -2).
 Note the activation quant currently happens on the HOST; folding it in-core is part
 of this step (it also removes a host round-trip).
 
-### Step 3 — full stage-1 / stage-3 fusion (largest)
+### Step 3a — q/k/v and k_ctx/v_ctx GEMMs merged by ROW stacking — **LANDED**
+Result: **47 -> 42 raw dispatches (9.4 -> 8.4/layer)**, parity **bit-identical**
+to step 2 (0.998200 / 0.998578) — this fusion is exact, so the numbers do not
+move at all. Cold wall 14.06 s -> 12.42 s. Wired behind `--stack-ctx`.
+
+The two projections use the SAME per-layer `[q|k|v]` weight and differ only in
+their activation: block hidden (16 rows) vs the context projection `thp` (32
+rows). Per-row int8 quantization is independent per row, so vstacking the two
+activations into one `[48, 4096]` GEMM is bit-identical for every kept output.
+
+Only expressible because step 2 moved gamma to the ACTIVATION side: the two
+halves carry different norms (`input_layernorm` vs `hidden_norm`), which a
+shared weight could never have absorbed but which per-row activation scaling
+handles for free. Rows are stacked `[thp ; hidden]` so k/v emerge already in the
+ctx-then-noise order attention wants.
+
+Costs ~2.1x the MACs in that GEMM (the q outputs of the 32 thp rows are computed
+and discarded), but the 25 MB of int8 weight streams ONCE instead of twice —
+which is the actual bound, hence the wall went down, not up.
+
+### Step 3 — full stage-1 / stage-3 fusion (largest) — NOT ATTEMPTED
 One kernel per stage, multi-phase on each core, activation resident in memtile
 across phases:
 - **stage 1**: rmsnorm -> qkv GEMM -> (k_ctx/v_ctx GEMM) -> headnorm -> rope.
@@ -131,6 +166,47 @@ across phases:
 Each stage is a multi-phase AIE program: phases share the memtile-staged activation
 and switch objectfifos per phase (weights stream per GEMM phase). This is the big
 design; only attempt after steps 1–2 land.
+
+**Status: deliberately not attempted.** Steps 1, 2 and 3a took the body from
+13.6 to **8.4 dispatches/layer** without a single custom GEMM and without moving
+parity (it improved). The remaining 8.4 -> ~3 is exactly this multi-phase memtile
+work, and the current per-layer residue is:
+
+| # | op | fusable only by |
+|---|---|---|
+| 1 | q/k/v/k_ctx/v_ctx stacked GEMM | — |
+| 2,3 | hnrope q, hnrope k | stage-1 memtile program |
+| 4 | attention | stays its own dispatch (by design) |
+| 5 | o proj | stage-3 memtile program |
+| 6 | gate/up GEMM | stage-3 |
+| 7 | swiglu | stage-3 (nonlinear — cannot fold into scales) |
+| 8 | down proj | stage-3 |
+
+Every remaining merge requires the GEMM kernel to absorb a neighbour, which means
+replacing the stock `kernels.mm` / `oq_gemm_design.int_matmul` single-core design
+with a multi-phase program. Three concrete blockers, in order of severity:
+
+1. **DMA fanin is the hard wall, confirmed empirically in step 1.** A core tile
+   has 2 inbound / 2 outbound DMA channels, and ObjectFifo endpoints are
+   allocated statically for the WHOLE program, not per phase. A fused stage 1
+   needs activation + weight + cs + gamma inbound. So the operands must be
+   multiplexed through memtile — a dataflow redesign, not a kernel edit.
+2. **The resident-weight path must survive.** `design.upload_int8` /
+   `matmul_npu_resident` keep ~1 GB of int8 weights on-device and the whole body
+   depends on it; a rewritten program has to preserve that or lose far more than
+   fusion gains.
+3. **New unvalidated numerics.** Keeping the activation on-device across stage 1
+   moves the GEMM output rescale (per-row act scale ⊗ per-channel weight scale),
+   the headnorm, the rope, AND the int8 requant for the next GEMM into in-core
+   bf16 code. Today the rescale and requant are exact f32 host arithmetic; all of
+   that would become new device code needing its own parity campaign.
+
+Next concrete move if this is picked up: do NOT start with the full stage. Start
+by proving ONE memtile-staged activation feeding the existing `int_matmul` — i.e.
+a GEMM whose B operand is read from memtile rather than host DDR, with numerics
+unchanged. That single step exercises blockers 1 and 2 in isolation and is
+independently verifiable against the current parity numbers before any op is
+actually fused into it.
 
 ## Guardrails
 
