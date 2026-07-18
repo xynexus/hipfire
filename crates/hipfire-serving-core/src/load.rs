@@ -318,6 +318,20 @@ fn gemma3_kv_mode(kv_mode: &str) -> (hipfire_runtime::kv::KvQuantMode, usize) {
     }
 }
 
+/// KVarN K-code bit width for a `kvarn*` kv_mode token — the shared-`KvCache`
+/// analog of the kvarn arm in [`gemma3_kv_mode`], so the qwen3.5/llama serving
+/// paths expose the full KVarN menu (`kvarn8` near-lossless, `kvarn`/`kvarn4`
+/// the default, `kvarn2` the aggressive cold/CASK tier) instead of only the
+/// hard-coded 4-bit tier. Non-kvarn tokens never reach this (the match arm
+/// guards on the `kvarn*` patterns), so the fallback is a harmless 4.
+fn kvarn_bits_from_mode(kv_mode: &str) -> usize {
+    match kv_mode {
+        "kvarn8" => 8,
+        "kvarn2" => 2,
+        _ => 4, // "kvarn" | "kvarn4"
+    }
+}
+
 fn cap_gemma3_stopgap_max_seq(max_seq: usize, arch_id: u32, kv_mode: &str) -> usize {
     let is_gemma3 = arch_id == ARCH_ID_GEMMA3_TEXT || arch_id == ARCH_ID_GEMMA3_VL;
     if !is_gemma3 {
@@ -2149,14 +2163,14 @@ pub fn load_model(
                 physical_cap,
             )
             .map_err(|e| format!("{e}"))?,
-            "kvarn" => kv::KvCache::new_gpu_kvarn_capped(
+            m @ ("kvarn" | "kvarn2" | "kvarn4" | "kvarn8") => kv::KvCache::new_gpu_kvarn_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
                 config.head_dim,
                 max_seq,
                 physical_cap,
-                4,
+                kvarn_bits_from_mode(m),
             )
             .map_err(|e| format!("{e}"))?,
             "asym2" | "turbo2" => kv::KvCache::new_gpu_asym2_capped(
@@ -2763,14 +2777,14 @@ pub fn load_model_safetensors(
                 max_seq,
                 max_seq,
             ),
-            "kvarn" => kv::KvCache::new_gpu_kvarn_capped(
+            m @ ("kvarn" | "kvarn2" | "kvarn4" | "kvarn8") => kv::KvCache::new_gpu_kvarn_capped(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
                 config.head_dim,
                 max_seq,
                 max_seq,
-                4,
+                kvarn_bits_from_mode(m),
             ),
             "asym3" => kv::KvCache::new_gpu_asym3_capped(
                 gpu,
@@ -3030,14 +3044,14 @@ pub fn load_model_safetensors(
             max_seq,
             max_seq,
         ),
-        "kvarn" => kv::KvCache::new_gpu_kvarn_capped(
+        m @ ("kvarn" | "kvarn2" | "kvarn4" | "kvarn8") => kv::KvCache::new_gpu_kvarn_capped(
             gpu,
             config.n_layers,
             config.n_kv_heads,
             config.head_dim,
             max_seq,
             max_seq,
-            4,
+            kvarn_bits_from_mode(m),
         ),
         _ => kv::KvCache::new_gpu_asym3_capped(
             gpu,
