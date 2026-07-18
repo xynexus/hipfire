@@ -21,6 +21,9 @@ with the batched num_elements. This builder emits those batched variants:
                                         head-tile carries its own position's cs.
                                         N_div_n = rows*nh.
   qwen35-swiglu-<I>-b<rows>            parallel silu(gate)*up over rows*I.
+  dflash-hnrope-<q|k>-<nh>h<hd>d-b<rows>  Phase D step 1 FUSION: headnorm+rope in
+                                        ONE dispatch (weight param + tiled cs);
+                                        replaces the headnorm/rope pair.
 
 Env (fork, nix1) — same as the body runner:
   PATH=/opt/xilinx/xrt/bin:$PATH
@@ -54,7 +57,13 @@ if _XRT_BIN.is_dir() and str(_XRT_BIN) not in os.environ.get("PATH", ""):
 import numpy as np
 from ml_dtypes import bfloat16
 from aie.iron import ExternalFunction
-from aie.iron.algorithms.transform import _transform_gen, transform_parallel_binary
+try:
+    # stock wheel (~/.venv, mlir-aie 1.3.1)
+    from aie.iron.algorithms.transform import _transform_gen, transform_parallel_binary
+except ModuleNotFoundError:
+    # custom fork (~/mlir-aie-312) renamed the module to _transform; the
+    # _transform_gen signature/semantics are the same in both.
+    from aie.iron.algorithms._transform import _transform_gen, transform_parallel_binary
 from aie.iron.device import NPU1, NPU2
 from aie.utils import set_current_device, get_current_device
 from aie.utils.compile import compile_mlir_module, compile_external_kernel
@@ -154,6 +163,36 @@ def build_rope(label, nh, hd, rows, target_arch):
     _emit(mlir, kernel, OUT_DIR / f"{stem}.xclbin", OUT_DIR / f"{stem}-instr.bin", target_arch)
 
 
+def build_headnorm_rope(label, nh, hd, rows, target_arch):
+    """Phase D step 1: FUSED per-head rmsnorm + FULL-neox rope in ONE dispatch.
+
+    Replaces the qwen35-headnorm-* + dflash-rope-* pair for q and k.
+
+    TWO heads per tile (tile_size = 2*hd): a core tile has only 2 input DMA
+    channels, so tiled-qk + tiled-cs + a weight PARAM (3 inbound) will not
+    place. Widening the tile lets the norm gamma and the row's cs share one
+    stream as [gamma(hd) | cs(hd)] — valid because gamma is shared by all heads
+    and both heads of a pair sit in the same row (nh even), hence same position.
+    """
+    if nh % 2:
+        raise ValueError(f"n_heads must be even for head-pair tiling, got {nh}")
+    stem = f"dflash-hnrope-{label}-{nh}h{hd}d-b{rows}"
+    tile = 2 * hd
+    print(f"[hnrope] {label} nh={nh} hd={hd} rows={rows} tile={tile} "
+          f"N_div_n={rows*nh//2} -> {stem}")
+    tile_ty: Any = np.ndarray[(tile,), np.dtype[bfloat16]]
+    kernel = ExternalFunction(
+        name="dflash_headnorm_rope_batched_bf16",
+        source_file=str(SCRIPT_DIR / "dflash_headnorm_rope_batched_bf16.cc"),
+        arg_types=[tile_ty, tile_ty, tile_ty, np.int32],
+        include_dirs=_incs())
+    qk = np.zeros(rows * nh * hd, dtype=bfloat16)
+    coeff = np.zeros(rows * nh * hd, dtype=bfloat16)
+    out = np.zeros(rows * nh * hd, dtype=bfloat16)
+    mlir = _transform_gen(kernel, [qk, coeff], out, tile_size=tile)
+    _emit(mlir, kernel, OUT_DIR / f"{stem}.xclbin", OUT_DIR / f"{stem}-instr.bin", target_arch)
+
+
 def build_swiglu(I, rows, target_arch, runtime_subdir, tile_size=16):
     stem = f"qwen35-swiglu-{I}-b{rows}"
     dev = get_current_device()
@@ -190,6 +229,9 @@ VARIANTS = {
     "rope_q16": lambda ta, rs: build_rope("q", 32, 128, 16, ta),
     "rope_k48": lambda ta, rs: build_rope("k", 8, 128, 48, ta),
     "swiglu16": lambda ta, rs: build_swiglu(12288, 16, ta, rs),
+    # Phase D step 1: fused headnorm+rope (supersedes headnorm_* + rope_* pairs).
+    "hnrope_q16": lambda ta, rs: build_headnorm_rope("q", 32, 128, 16, ta),
+    "hnrope_k48": lambda ta, rs: build_headnorm_rope("k", 8, 128, 48, ta),
 }
 
 

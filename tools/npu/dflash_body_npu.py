@@ -120,7 +120,8 @@ def quantize_row_symmetric(x_f32, bits=8):
 # ─────────────────────────────────────────────────────────────────────────────
 class NpuOps:
     def __init__(self, count=True, batch_ops=False, proj_mode="group",
-                 resident_weights=False, concat_proj=False, attn_all_kv=False):
+                 resident_weights=False, concat_proj=False, attn_all_kv=False,
+                 fuse_hnrope=False):
         # batch_ops   : Lever 1 — run norm/headnorm/rope/swiglu batched (all rows
         #               in ONE dispatch) via the *-b<rows> xclbins instead of the
         #               per-row loop.
@@ -136,6 +137,10 @@ class NpuOps:
         # attn_all_kv : Lever 3 — whole layer's attention in ONE dispatch
         #               (core loops the kv-heads, streaming via ObjectFifo).
         self.attn_all_kv = attn_all_kv
+        # fuse_hnrope : Phase D step 1 — TRUE multi-op fusion. headnorm+rope
+        #               collapse into one kernel (dflash-hnrope-*), for both q
+        #               and k. Saves 2 dispatches/layer (13.6 -> 11.6).
+        self.fuse_hnrope = fuse_hnrope
         # Lever 4 (speed, not dispatch count): keep int8 projection weights
         # resident on the NPU instead of re-uploading ~1 GB every pass.
         self.resident_weights = resident_weights
@@ -272,6 +277,42 @@ class NpuOps:
             out[r] = t_out.numpy().astype(bfloat16).astype(np.float32)
         self.op_dispatches += 1
         return out
+
+    # ── FUSED headnorm + rope (full neox)  [rows, nh*hd] ────────────────────
+    def headnorm_rope(self, x, weight, positions, which, nh, theta):
+        """Phase D step 1: headnorm and rope in ONE dispatch (was two).
+
+        Falls back to the separate ops when --fuse-hnrope is off, so the fused
+        and unfused paths stay comparable in one binary.
+
+        Tiling: 2*HEAD_DIM per tile == one PAIR of heads, because an AIE2 core
+        tile has only 2 inbound DMA channels — tiled-qk + tiled-cs + a weight
+        param would need 3 and will not place. The widened tile lets gamma and
+        the row's cs share the second stream as [gamma | cs]. Both heads of a
+        pair are in the same row (nh even), so they share the position/cs.
+        """
+        if not self.fuse_hnrope:
+            x = self.headnorm(x, weight, which, nh)
+            return self.rope(x, positions, which, nh, theta)
+        x = np.ascontiguousarray(x, np.float32)
+        rows, ND = x.shape
+        assert ND == nh * HEAD_DIM
+        assert nh % 2 == 0, f"fused headnorm+rope needs even n_heads, got {nh}"
+        h = self._load(f"dflash-hnrope-{which}-{nh}h{HEAD_DIM}d-b{rows}")
+        # coeff[r, pair, 0:HD] = gamma ; coeff[r, pair, HD:2*HD] = cs(position[r])
+        g = bf16(weight).astype(np.float32)
+        coeff = np.empty((rows, nh // 2, 2 * HEAD_DIM), np.float32)
+        coeff[:, :, :HEAD_DIM] = g
+        for r in range(rows):
+            cs_r = np.asarray(_make_cs_buf(HEAD_DIM, int(positions[r]), theta), np.float32)
+            coeff[r, :, HEAD_DIM:] = cs_r
+        t_in = XRTTensor(x.reshape(-1).astype(bfloat16), dtype=bfloat16, device="cpu")
+        t_co = XRTTensor(coeff.reshape(-1).astype(bfloat16), dtype=bfloat16, device="cpu")
+        t_out = XRTTensor((rows * ND,), dtype=bfloat16, device="cpu")
+        self._run(h, [t_in, t_co, t_out])  # order: in, coeff, out
+        t_out.to("cpu")
+        self.op_dispatches += 1
+        return t_out.numpy().astype(bfloat16).astype(np.float32).reshape(rows, ND)
 
     # ── swiglu  silu(gate)*up  [rows, I] ────────────────────────────────────
     def swiglu(self, gate, up):
@@ -620,13 +661,13 @@ def run_body(ops, W, cfg, noise, thp, per_layer_out=None):
         k_ctx, v_ctx = ops.project_concat(
             thp, W, [p + "self_attn.k_proj.weight", p + "self_attn.v_proj.weight"])
 
-        q = ops.headnorm(q, W.raw(p + "self_attn.q_norm.weight"), "q", cfg.NH)
         k = np.concatenate([k_ctx, k_noise], axis=0)  # [tot, NKV*HD]
         v = np.concatenate([v_ctx, v_noise], axis=0)
-        k = ops.headnorm(k, W.raw(p + "self_attn.k_norm.weight"), "k", cfg.NKV)
-
-        q = ops.rope(q, np.arange(cfg.L, cfg.L + cfg.B), "q", cfg.NH, cfg.THETA)
-        k = ops.rope(k, np.arange(0, cfg.tot), "k", cfg.NKV, cfg.THETA)
+        # Phase D step 1: headnorm+rope fused into one dispatch each (q, k).
+        q = ops.headnorm_rope(q, W.raw(p + "self_attn.q_norm.weight"),
+                              np.arange(cfg.L, cfg.L + cfg.B), "q", cfg.NH, cfg.THETA)
+        k = ops.headnorm_rope(k, W.raw(p + "self_attn.k_norm.weight"),
+                              np.arange(0, cfg.tot), "k", cfg.NKV, cfg.THETA)
 
         qh = q.reshape(cfg.B, cfg.NH, cfg.HD)
         kh = k.reshape(cfg.tot, cfg.NKV, cfg.HD)
@@ -779,12 +820,12 @@ def op_by_op(ops, W, cfg, G, cos_gate=0.99):
     v_noise = ops.project(xn_g, W, p + "self_attn.v_proj.weight")
     k_ctx = ops.project(thp_g, W, p + "self_attn.k_proj.weight")
     v_ctx = ops.project(thp_g, W, p + "self_attn.v_proj.weight")
-    q = ops.headnorm(q, W.raw(p + "self_attn.q_norm.weight"), "q", cfg.NH)
     k = np.concatenate([k_ctx, k_noise], axis=0)
     v = np.concatenate([v_ctx, v_noise], axis=0)
-    k = ops.headnorm(k, W.raw(p + "self_attn.k_norm.weight"), "k", cfg.NKV)
-    q = ops.rope(q, np.arange(cfg.L, cfg.L + cfg.B), "q", cfg.NH, cfg.THETA)
-    k = ops.rope(k, np.arange(0, cfg.tot), "k", cfg.NKV, cfg.THETA)
+    q = ops.headnorm_rope(q, W.raw(p + "self_attn.q_norm.weight"),
+                          np.arange(cfg.L, cfg.L + cfg.B), "q", cfg.NH, cfg.THETA)
+    k = ops.headnorm_rope(k, W.raw(p + "self_attn.k_norm.weight"),
+                          np.arange(0, cfg.tot), "k", cfg.NKV, cfg.THETA)
     check("q_roped (proj+hn+rope)", q, G.rust("l0_q_roped"))
     check("k_roped (proj+hn+rope)", k, G.rust("l0_k_roped"))
     check("v (proj)", v, G.rust("l0_v").reshape(cfg.tot, cfg.NKV * cfg.HD))
@@ -920,6 +961,9 @@ def main():
     ap.add_argument("--attn-all-kv", action="store_true",
                     help="Lever 3: whole layer attention in ONE dispatch "
                          "(core loops kv-heads); exact, saves 7 dispatches/layer")
+    ap.add_argument("--fuse-hnrope", action="store_true",
+                    help="Phase D step 1: fuse headnorm+rope into ONE kernel for "
+                         "q and k (dflash-hnrope-*); saves 2 dispatches/layer")
     args = ap.parse_args()
 
     G = Golden(args.golden_dir)
@@ -932,10 +976,12 @@ def main():
     W = Weights(args.weights)
     ops = NpuOps(batch_ops=args.batch_ops, proj_mode=args.proj,
                  resident_weights=args.resident_weights,
-                 concat_proj=args.concat_proj, attn_all_kv=args.attn_all_kv)
+                 concat_proj=args.concat_proj, attn_all_kv=args.attn_all_kv,
+                 fuse_hnrope=args.fuse_hnrope)
     print(f"[dflash_body_npu] config: batch_ops={ops.batch_ops} "
           f"proj_mode={ops.proj_mode} resident_weights={ops.resident_weights} "
-          f"concat_proj={ops.concat_proj} attn_all_kv={ops.attn_all_kv}")
+          f"concat_proj={ops.concat_proj} attn_all_kv={ops.attn_all_kv} "
+          f"fuse_hnrope={ops.fuse_hnrope}")
 
     if args.op_by_op:
         ok = op_by_op(ops, W, cfg, G, args.cos_gate)

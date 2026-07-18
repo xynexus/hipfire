@@ -35,7 +35,34 @@ Target: stage1(1) + attention(1) + stage3(1) = **3/layer**.
 
 ## Incremental path (do in this order — each is independently valuable)
 
-### Step 1 — fused headnorm+rope, FULL-NEOX (tractable, do first)
+### Step 1 — fused headnorm+rope, FULL-NEOX — **LANDED**
+Result: **68 -> 58 raw dispatches (13.6 -> 11.6/layer)**, parity did not regress —
+it improved slightly (one fewer bf16 round-trip between the two ops):
+
+| | dispatches/layer | cos vs golden | cos vs precision ref |
+|---|---|---|---|
+| before | 13.6 (68) | 0.998092 | 0.998147 |
+| after  | 11.6 (58) | 0.998132 | 0.998221 |
+
+op-by-op layer 0: 8/8 PASS, `q_roped` cos 0.999900, `k_roped` cos 0.999890.
+
+Built as `dflash_headnorm_rope_batched_bf16.cc` +
+`build_dflash_body_batched.py --which hnrope_{q16,k48}`, wired behind
+`dflash_body_npu.py --fuse-hnrope`.
+
+**Trap found — core-tile DMA fanin (relevant to steps 2/3).** The obvious wiring
+(tiled qk + tiled cs + a weight tensor param) needs THREE inbound DMA channels,
+but an AIE2 core tile has only **2 input / 2 output**. aiecc rejects it:
+> tile (0,3) requires 3 input/1 output DMA channels, but only 2 input/2 output available
+
+Workaround used: widen the tile to `2*head_dim` so each invocation handles a head
+PAIR, letting gamma and the row's cs share one stream as `[gamma | cs]`. Valid
+because gamma is shared by every head and both heads of a pair sit in the same row
+(n_heads even), hence the same position/cs. **Any further fusion that wants more
+than two inbound streams must stage through memtile** — this is the concrete
+mechanism forcing the memtile design in steps 2/3, not just a capacity argument.
+
+### Step 1 (original plan)
 `headnorm_rope_bf16.cc` / `qwen3_headnorm_rope_bf16.cc` already fuse head-norm with
 rope in one dispatch, but are hard-coded to **Qwen3.5 partial rotary**
 (`n_rot = head_dim/4`). The DFlash draft needs FULL head_dim neox — exactly the
