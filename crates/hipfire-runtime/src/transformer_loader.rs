@@ -10,8 +10,8 @@
 //! upload, embeddings, direct norms, and tied/untied language-model heads.
 
 use crate::hfq::{
-    load_awq_scale, oq4_arch_load, oq4_to_oq8_combined, oq8_combined,
-    oqplus_compact_to_oq8_combined, HfqFile, HfqTensorInfo, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
+    load_awq_scale, oq4_arch_load, oq8_arch_load, HfqFile, HfqTensorInfo, OQ4_ARCH_PACKED_QT,
+    OQ4_CANONICAL_QT,
 };
 use crate::quant::f16_to_f32;
 use crate::weights::{EmbeddingFormat, WeightTensor};
@@ -260,21 +260,15 @@ impl<'a> TransformerLoader<'a> {
     ) -> HipResult<WeightTensor> {
         let (info, data) = self.required_data(name, &[m, k]);
         let mut weight = match info.quant_type {
-            33 => self.upload_weight_bytes(
-                gpu,
-                oq4_to_oq8_combined(&data, m, k),
-                DType::Oq8G256,
-                m,
-                k,
-            )?,
-            35 => self.upload_weight_bytes(gpu, oq8_combined(&data, m, k), DType::Oq8G256, m, k)?,
-            36 => self.upload_weight_bytes(
-                gpu,
-                oqplus_compact_to_oq8_combined(&data, m, k),
-                DType::Oq8G256,
-                m,
-                k,
-            )?,
+            // OQ int8-activation family (33 = OQ+ W4A8, 35 = OQ8 W8A8, 36 = OQ+
+            // compact) via the shared `oq8_arch_load`, parallel to the OQ4 arm
+            // below — the single arch-agnostic OQ8 dispatch every loader routes
+            // through.
+            qt @ (33 | 35 | 36) => {
+                let (bytes, dtype) = oq8_arch_load(qt, &data, m, k)
+                    .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36");
+                self.upload_weight_bytes(gpu, bytes, dtype, m, k)?
+            }
             OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {
                 let (bytes, dtype) = oq4_arch_load(info.quant_type, &data, m, k)
                     .expect("OQ4 quant type handled by oq4_arch_load");
