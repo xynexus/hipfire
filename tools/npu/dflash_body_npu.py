@@ -67,6 +67,96 @@ from dflash_ref import load_safetensors_f32  # noqa: E402
 
 KERNEL_NAME = "MLIR_AIE"
 NPU_DIR = REPO_ROOT / "target" / "npu"
+# ── artifact manifest ───────────────────────────────────────────────────────
+# The native (Rust) driver cannot compute the @iron.jit cache hash, so the
+# Python harness emits the resolved artifact paths + per-dispatch buffer
+# contract it actually used. That manifest is the contract the native driver
+# consumes; see docs/npu/dflash-native-driver-plan.md.
+import json  # noqa: E402
+
+
+class Manifest:
+    """Records, per dispatch: op name, resolved xclbin/insts, buffer order+sizes."""
+
+    def __init__(self, enabled=False):
+        self.enabled = enabled
+        self.kernels = {}
+        self.seq = []
+
+    def kernel(self, key, xclbin, insts, compile_args=None):
+        if not self.enabled:
+            return key
+        if key not in self.kernels:
+            xclbin, insts = Path(xclbin), Path(insts)
+            self.kernels[key] = {
+                "xclbin": str(xclbin),
+                "insts": str(insts),
+                "xclbin_bytes": xclbin.stat().st_size if xclbin.exists() else -1,
+                "insts_bytes": insts.stat().st_size if insts.exists() else -1,
+                "compile_args": compile_args or {},
+            }
+        return key
+
+    def dispatch(self, key, args):
+        if self.enabled:
+            self.seq.append({"kernel": key, "args": args})
+
+    def dump(self, path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"kernels": self.kernels, "dispatches": self.seq}, f, indent=2)
+        print(f"[manifest] {len(self.kernels)} kernels, {len(self.seq)} dispatches "
+              f"-> {path}")
+
+
+MANIFEST = Manifest()
+
+# Step-2 single-op parity: capture the FIRST int8 projection's exact device
+# buffers (A weight, B activation, C int32 result) so the native driver can be
+# fed byte-identical inputs and its int32 output diffed BIT-FOR-BIT. The GEMM is
+# integer, so any difference is a layout/arg-order bug, never precision.
+DUMP_OP_DIR = None
+_DUMPED_OP = False
+
+
+def _tdesc(t, role):
+    """Describe one dispatch argument buffer (dtype/shape/bytes) for the manifest."""
+    try:
+        a = t.numpy()
+        return {"role": role, "dtype": str(a.dtype), "shape": list(a.shape),
+                "bytes": int(a.nbytes)}
+    except Exception:
+        return {"role": role, "dtype": "?", "shape": [], "bytes": -1}
+
+
+def _maybe_dump_op(qw, qx, C, M, K, N):
+    """Dump the first int8 projection's device buffers for native bit-parity."""
+    global _DUMPED_OP
+    if DUMP_OP_DIR is None or _DUMPED_OP:
+        return
+    _DUMPED_OP = True
+    d = Path(DUMP_OP_DIR)
+    d.mkdir(parents=True, exist_ok=True)
+    np.save(d / "op_A_int8.npy", np.ascontiguousarray(qw, np.int8))
+    np.save(d / "op_B_int8.npy", np.ascontiguousarray(qx, np.int8))
+    np.save(d / "op_C_int32.npy", np.ascontiguousarray(C, np.int32))
+    m, k, n = design._tiles_for(M, K, N, design.DEFAULT_TILE)
+    with open(d / "op_meta.json", "w") as f:
+        json.dump({"M": M, "K": K, "N": N, "m": m, "k": k, "n": n,
+                   "dtype_in_str": "i8", "dtype_out_str": "i32",
+                   "b_col_maj": 1}, f, indent=2)
+    print(f"[dump-op] int_matmul M={M} K={K} N={N} -> {d}")
+
+
+def _jit_artifacts(design_obj, **compile_kwargs):
+    """Resolve an @iron.jit design's cached (xclbin, insts) WITHOUT recompiling.
+
+    CompilableDesign.specialize(**kw).compile() is a pure cache lookup on a hit
+    (~/.npu/cache/<hash>/{final.xclbin,insts.bin}); it is the only way to learn
+    the hash-keyed path from outside, since the hash covers the generator
+    bytecode + compile kwargs + tool mtimes."""
+    return design_obj.specialize(**compile_kwargs).compile()
 GROUP = 256
 HEAD_DIM = 128
 # The rmsnorm / headnorm xclbins bake eps = 1e-5 (see rms_norm_weighted_bf16.cc /
@@ -182,13 +272,20 @@ class NpuOps:
     def _load(self, stem):
         # Cached load: returns the resident handle if the context is cached, else
         # creates one (evicting LRU / draining on Phoenix as needed).
+        self._cur_stem = stem
+        MANIFEST.kernel(stem, NPU_DIR / f"{stem}.xclbin",
+                        NPU_DIR / f"{stem}-instr.bin")
         return self._rt.load(self._npukernel(stem))
 
     def release(self):
         """No-op: the shared cached runtime manages context lifetime/eviction."""
         return
 
-    def _run(self, handle, tensors):
+    def _run(self, handle, tensors, roles=None):
+        if MANIFEST.enabled:
+            r = roles or ["?"] * len(tensors)
+            MANIFEST.dispatch(getattr(self, "_cur_stem", "?"),
+                              [_tdesc(t, r[i]) for i, t in enumerate(tensors)])
         res = self._rt.run(handle, tensors)
         if not res.is_success():
             raise RuntimeError(f"NPU kernel failed: {res.ret}")
@@ -209,7 +306,7 @@ class NpuOps:
             t_in = XRTTensor(xin, dtype=bfloat16, device="cpu")
             t_w = XRTTensor(wrep, dtype=bfloat16, device="cpu")
             t_out = XRTTensor((rows * H,), dtype=bfloat16, device="cpu")
-            self._run(h, [t_in, t_w, t_out])  # order: in, weight, out
+            self._run(h, [t_in, t_w, t_out], ["in", "weight", "out"])
             t_out.to("cpu")
             self.op_dispatches += 1
             return t_out.numpy().astype(bfloat16).astype(np.float32).reshape(rows, H)
@@ -219,7 +316,7 @@ class NpuOps:
         for r in range(rows):
             t_in = XRTTensor(x[r].astype(bfloat16), dtype=bfloat16, device="cpu")
             t_out = XRTTensor((H,), dtype=bfloat16, device="cpu")
-            self._run(h, [t_in, w, t_out])  # order: in, weight, out
+            self._run(h, [t_in, w, t_out], ["in", "weight", "out"])
             t_out.to("cpu")
             out[r] = t_out.numpy().astype(bfloat16).astype(np.float32)
         self.op_dispatches += 1
@@ -237,7 +334,7 @@ class NpuOps:
             h = self._load(f"qwen35-headnorm-{which}-{nh}h{HEAD_DIM}d-b{rows}")
             t_in = XRTTensor(x.reshape(-1).astype(bfloat16), dtype=bfloat16, device="cpu")
             t_out = XRTTensor((rows * ND,), dtype=bfloat16, device="cpu")
-            self._run(h, [t_in, t_out, w])  # order: in, out, weight
+            self._run(h, [t_in, t_out, w], ["in", "out", "weight"])
             t_out.to("cpu")
             self.op_dispatches += 1
             return t_out.numpy().astype(bfloat16).astype(np.float32).reshape(rows, ND)
@@ -246,7 +343,7 @@ class NpuOps:
         for r in range(rows):
             t_in = XRTTensor(x[r].astype(bfloat16), dtype=bfloat16, device="cpu")
             t_out = XRTTensor((ND,), dtype=bfloat16, device="cpu")
-            self._run(h, [t_in, t_out, w])  # order: in, out, weight
+            self._run(h, [t_in, t_out, w], ["in", "out", "weight"])
             t_out.to("cpu")
             out[r] = t_out.numpy().astype(bfloat16).astype(np.float32)
         self.op_dispatches += 1
@@ -270,7 +367,7 @@ class NpuOps:
             t_in = XRTTensor(x.reshape(-1).astype(bfloat16), dtype=bfloat16, device="cpu")
             t_cs = XRTTensor(cs_rows.reshape(-1).astype(bfloat16), dtype=bfloat16, device="cpu")
             t_out = XRTTensor((rows * ND,), dtype=bfloat16, device="cpu")
-            self._run(h, [t_in, t_cs, t_out])  # order: in, cs, out
+            self._run(h, [t_in, t_cs, t_out], ["in", "cs", "out"])
             t_out.to("cpu")
             self.op_dispatches += 1
             return t_out.numpy().astype(bfloat16).astype(np.float32).reshape(rows, ND)
@@ -281,7 +378,7 @@ class NpuOps:
             t_in = XRTTensor(x[r].astype(bfloat16), dtype=bfloat16, device="cpu")
             t_out = XRTTensor((ND,), dtype=bfloat16, device="cpu")
             t_cs = XRTTensor(cs, dtype=bfloat16, device="cpu")
-            self._run(h, [t_in, t_out, t_cs])  # order: in, out, cs
+            self._run(h, [t_in, t_out, t_cs], ["in", "out", "cs"])
             t_out.to("cpu")
             out[r] = t_out.numpy().astype(bfloat16).astype(np.float32)
         self.op_dispatches += 1
@@ -318,7 +415,7 @@ class NpuOps:
         t_in = XRTTensor(x.reshape(-1).astype(bfloat16), dtype=bfloat16, device="cpu")
         t_co = XRTTensor(coeff.reshape(-1).astype(bfloat16), dtype=bfloat16, device="cpu")
         t_out = XRTTensor((rows * ND,), dtype=bfloat16, device="cpu")
-        self._run(h, [t_in, t_co, t_out])  # order: in, coeff, out
+        self._run(h, [t_in, t_co, t_out], ["in", "coeff", "out"])
         t_out.to("cpu")
         self.op_dispatches += 1
         return t_out.numpy().astype(bfloat16).astype(np.float32).reshape(rows, ND)
@@ -334,7 +431,7 @@ class NpuOps:
             t_g = XRTTensor(gate.reshape(-1).astype(bfloat16), dtype=bfloat16, device="cpu")
             t_u = XRTTensor(up.reshape(-1).astype(bfloat16), dtype=bfloat16, device="cpu")
             t_out = XRTTensor((rows * I,), dtype=bfloat16, device="cpu")
-            self._run(h, [t_g, t_u, t_out])  # order: gate, up, out
+            self._run(h, [t_g, t_u, t_out], ["gate", "up", "out"])
             t_out.to("cpu")
             self.op_dispatches += 1
             return t_out.numpy().astype(bfloat16).astype(np.float32).reshape(rows, I)
@@ -344,7 +441,7 @@ class NpuOps:
             t_g = XRTTensor(gate[r].astype(bfloat16), dtype=bfloat16, device="cpu")
             t_u = XRTTensor(up[r].astype(bfloat16), dtype=bfloat16, device="cpu")
             t_out = XRTTensor((I,), dtype=bfloat16, device="cpu")
-            self._run(h, [t_g, t_u, t_out])  # order: gate, up, out
+            self._run(h, [t_g, t_u, t_out], ["gate", "up", "out"])
             t_out.to("cpu")
             out[r] = t_out.numpy().astype(bfloat16).astype(np.float32)
         self.op_dispatches += 1
@@ -489,6 +586,44 @@ class NpuOps:
             off += n
         return out
 
+    def _manifest_gemm(self, M, K, N):
+        """Record one int8 `int_matmul` dispatch (C[M,N] = A[M,K]·B[N,K]^T).
+
+        The tile split mirrors matmul_npu_resident so the recorded CompileTime
+        args are exactly the ones that keyed the JIT cache entry."""
+        if not MANIFEST.enabled:
+            return
+        m, k, n = design._tiles_for(M, K, N, design.DEFAULT_TILE)
+        ca = {"M": M, "K": K, "N": N, "m": m, "k": k, "n": n,
+              "dtype_in_str": "i8", "dtype_out_str": "i32", "b_col_maj": 1}
+        key = f"int_matmul:M{M}_K{K}_N{N}_m{m}_k{k}_n{n}"
+        if key not in MANIFEST.kernels:
+            xcl, ins = _jit_artifacts(design.int_matmul, **ca)
+            MANIFEST.kernel(key, xcl, ins, ca)
+        MANIFEST.dispatch(key, [
+            {"role": "A_weight_int8", "dtype": "int8", "shape": [M, K], "bytes": M * K},
+            {"role": "B_act_int8", "dtype": "int8", "shape": [N, K], "bytes": N * K},
+            {"role": "C_out_int32", "dtype": "int32", "shape": [M, N], "bytes": M * N * 4},
+        ])
+
+    def _manifest_attn_all(self, q_len, kv_len, n_iters):
+        """Record the one-dispatch whole-layer attention (dflash_attn_all)."""
+        if not MANIFEST.enabled:
+            return
+        ca = {"q_len": q_len, "kv_len": kv_len, "n_iters": n_iters}
+        key = f"dflash_attn_all:q{q_len}_kv{kv_len}_it{n_iters}"
+        if key not in MANIFEST.kernels:
+            from build_dflash_attention_sc import dflash_attn_all
+            xcl, ins = _jit_artifacts(dflash_attn_all, **ca)
+            MANIFEST.kernel(key, xcl, ins, ca)
+        qn = n_iters * q_len * HEAD_DIM
+        kvn = n_iters * 2 * kv_len * HEAD_DIM
+        MANIFEST.dispatch(key, [
+            {"role": "Q_bf16", "dtype": "bfloat16", "shape": [qn], "bytes": qn * 2},
+            {"role": "KV_bf16", "dtype": "bfloat16", "shape": [kvn], "bytes": kvn * 2},
+            {"role": "O_bf16", "dtype": "bfloat16", "shape": [qn], "bytes": qn * 2},
+        ])
+
     def _proj_group(self, x, qw, sw):
         """Per-256-group int8 (baseline): one dispatch per group.
         qw int8 [N,K], sw f32 [N,ng] pre-quantized weight."""
@@ -525,9 +660,12 @@ class NpuOps:
             sx = sx / np.asarray(act_div, np.float32)
         if dev is not None:
             A_t, M_w, K_w = dev
+            self._manifest_gemm(M_w, K_w, rows)
             C, _tile = design.matmul_npu_resident(A_t, M_w, K_w, qx)  # C[N,rows] i32
             self.npu_ns += int(design.LAST_NPU_US * 1000.0)
+            _maybe_dump_op(qw, qx, C, M_w, K_w, rows)
         else:
+            self._manifest_gemm(N, K, rows)
             C, _tile = design.matmul_npu(qw, qx)    # A=W[N,K], B=X[rows,K] -> C[N,rows] i32
         self.dispatches += 1
         Y = (sw[:, None] * sx[None, :]) * C.astype(np.float32)  # [N,rows]
@@ -560,6 +698,7 @@ class NpuOps:
             # ONE dispatch for the whole layer: the core loops the NKV kv-heads,
             # streaming each group's Q/KV/O through the ObjectFifos (tile holds one
             # iteration, 56 KB). Verified cos=1.00000 vs bf16 ref on all 32 q-heads.
+            self._manifest_attn_all(q_len, tot, NKV)
             ctx = run_attn_all_kv(q, k, v, groups)
             self.dispatches += 1
             self.op_dispatches += 1
@@ -1227,13 +1366,24 @@ def main():
                     help="Phase D step 3a: merge the q/k/v and k_ctx/v_ctx GEMMs "
                          "into ONE by stacking activation rows (exact; implies "
                          "--fold-norm); saves 1 dispatch/layer")
+    ap.add_argument("--dump-op", type=Path, default=None,
+                    help="dump the FIRST int8 projection's exact A/B/C device "
+                         "buffers for native bit-for-bit parity (step 2)")
+    ap.add_argument("--dump-manifest", type=Path, default=None,
+                    help="write the per-dispatch artifact manifest (op name, "
+                         "resolved xclbin/insts paths, buffer order+sizes, "
+                         "CompileTime args) consumed by the native Rust driver")
     ap.add_argument("--fuse-hnrope", action="store_true",
                     help="Phase D step 1: fuse headnorm+rope into ONE kernel for "
                          "q and k (dflash-hnrope-*); saves 2 dispatches/layer")
     args = ap.parse_args()
 
     G = Golden(args.golden_dir)
-    import json
+    if args.dump_manifest:
+        MANIFEST.enabled = True
+    if args.dump_op:
+        global DUMP_OP_DIR
+        DUMP_OP_DIR = args.dump_op
     meta = json.load(open(G.root / "ref_meta.json"))
     cfg = Cfg(meta)
     print(f"[dflash_body_npu] B={cfg.B} L={cfg.L} tot={cfg.tot} H={cfg.H} I={cfg.I} "
@@ -1256,6 +1406,8 @@ def main():
         ok = op_by_op(ops, W, cfg, G, args.cos_gate)
     else:
         ok = full_body(ops, W, cfg, G, args.cos_gate, warm_runs=args.warm_runs)
+    if args.dump_manifest:
+        MANIFEST.dump(args.dump_manifest)
     return 0 if ok else 1
 
 
