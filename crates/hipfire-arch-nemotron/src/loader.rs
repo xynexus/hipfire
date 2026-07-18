@@ -196,15 +196,7 @@ pub fn load_linear_hfq(
     // qt=36) → arch-combined `Oq8G256` via the shared repack helpers, dispatched by
     // the generic iu8 GEMV/GEMM. Nemotron previously handled only OQ4 (34/37) and
     // errored on qt 35. Mirrors the hfq.rs LLaMA loader.
-    let oq8_bytes = match qt {
-        35 => Some(hipfire_runtime::hfq::oq8_combined(&data, m, k)),
-        33 => Some(hipfire_runtime::hfq::oq4_to_oq8_combined(&data, m, k)),
-        36 => Some(hipfire_runtime::hfq::oqplus_compact_to_oq8_combined(
-            &data, m, k,
-        )),
-        _ => None,
-    };
-    if let Some(bytes) = oq8_bytes {
+    if let Some((bytes, gpu_dtype)) = hipfire_runtime::hfq::oq8_arch_load(qt, &data, m, k) {
         let buf = gpu
             .upload_raw(&bytes, &[bytes.len()])
             .map_err(|e| format!("nemotron hfq oq8 upload {name}: {e:?}"))?;
@@ -212,7 +204,7 @@ pub fn load_linear_hfq(
         let awq_scale = hipfire_runtime::hfq::load_awq_scale(hfq, gpu, name, k);
         return Ok(LinearWeight::Quant(Box::new(WeightTensor {
             buf,
-            gpu_dtype: DType::Oq8G256,
+            gpu_dtype,
             m,
             k,
             row_stride: 0,

@@ -27,6 +27,7 @@
 //! that would make OQ8/W4A8 weights page-in as pure copies.
 
 use crate::quant::{f16_to_f32, QuantType};
+use hipfire_rdna::DType;
 
 /// Sign-extend a 4-bit nibble to `i8` (levels in `[-8, 7]`).
 fn sext4(nib: u8) -> i8 {
@@ -149,6 +150,32 @@ pub fn oqplus_compact_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8
     combined
 }
 
+/// Load-time dispatch for the OQ int8-activation family: expand the on-disk
+/// W8A8/W4A8 codes into the combined `Oq8G256` device buffer. This is the
+/// single arch-agnostic entry point every per-arch weight loader should call for
+/// these codes — the OQ8 analog of [`crate::oq4_arch::oq4_arch_load`] for the
+/// W4A4 family. It exists because the SAME 33/35/36 dispatch was open-coded (and
+/// forgotten) in loader after loader (qwen2, the shared llama `load_weights_hfq`,
+/// nemotron), each panicking on qt 35 until fixed one at a time; routing every
+/// loader through here means a new family gets OQ8/OQ+ for free.
+///
+///   * qt 35 (`Oq8G256`)     — W8A8, int8 weights + int8 acts.
+///   * qt 33 (`OqPlusG256`)  — W4A8, int4 weights sign-extended to int8.
+///   * qt 36 (`OqPlusCompact`) — mixed W4A8, int4 bulk + int8 outliers.
+///
+/// Returns `None` for any other code so the caller falls through to its own arms
+/// (OQ4 via `oq4_arch_load`, plain dtypes, etc.). All three resolve to
+/// `DType::Oq8G256`, dispatched by the generic iu8 GEMV/GEMM.
+pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, DType)> {
+    let bytes = match qt {
+        c if c == QuantType::Oq8G256.code() => oq8_combined(data, m, k),
+        c if c == QuantType::OqPlusG256.code() => oq4_to_oq8_combined(data, m, k),
+        c if c == QuantType::OqPlusCompact.code() => oqplus_compact_to_oq8_combined(data, m, k),
+        _ => return None,
+    };
+    Some((bytes, DType::Oq8G256))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +196,21 @@ mod tests {
         assert_eq!(out.len(), 256 + 4);
         assert_eq!(&out[0..256], &data[2..258]); // int8 weights verbatim
         assert_eq!(&out[256..260], &one_le()); // group f32 scale
+    }
+
+    #[test]
+    fn oq8_arch_load_dispatches_family_and_rejects_others() {
+        // qt 35 (Oq8G256): routes to oq8_combined, tagged Oq8G256.
+        let mut data = Vec::new();
+        data.extend_from_slice(&F16_ONE.to_le_bytes());
+        data.extend((0..256).map(|i| i as u8));
+        let (bytes, dt) = oq8_arch_load(QuantType::Oq8G256.code(), &data, 1, 256)
+            .expect("qt 35 is an OQ8-family code");
+        assert_eq!(dt, DType::Oq8G256);
+        assert_eq!(bytes, oq8_combined(&data, 1, 256));
+        // A non-OQ8-family code (13 = MQ4G256) falls through so callers try their
+        // own arms.
+        assert!(oq8_arch_load(QuantType::MQ4G256.code(), &data, 1, 256).is_none());
     }
 
     #[test]

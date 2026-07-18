@@ -37,8 +37,7 @@ use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::dispatch::gemv_family;
 use hipfire_runtime::hfq::{
-    oq4_arch_load, oq4_to_oq8_combined, oq8_combined, oqplus_compact_to_oq8_combined, HfqFile,
-    OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
+    oq4_arch_load, oq8_arch_load, HfqFile, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
 };
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::transformer_loader::decode_direct_f32;
@@ -701,47 +700,18 @@ fn load_weight_tensor(
                 awq_scale: None,
             })
         }
-        // Opus Quant int8-activation family. Bytes are repacked host-side into the
-        // arch-combined device layout by the shared helpers (single source of
-        // truth in `hipfire_runtime::{oq4_arch, oq8_arch}`), mirroring the generic
-        // `TransformerLoader::load_weight` / `load_weights_hfq` OQ arms so qwen2
-        // serves OQ through the same dtype-dispatched `weight_gemv`/`weight_gemm`
-        // kernels as every other simple-AR family.
-        //   33 = OQ+ W4A8 (int4 on disk, expanded to int8 combined at load)
-        //   35 = OQ8 W8A8
-        //   36 = OQ+ compact mixed W4A8
-        33 => {
-            let bytes = oq4_to_oq8_combined(&data, m, k);
+        // Opus Quant int8-activation family (33 = OQ+ W4A8, 35 = OQ8 W8A8, 36 =
+        // OQ+ compact) via the shared `oq8_arch_load` — the single arch-agnostic
+        // entry point so qwen2 serves OQ through the same dtype-dispatched
+        // weight_gemv/weight_gemm kernels as every other simple-AR family, without
+        // re-deriving the repack (the recurring gap fixed once in oq8_arch).
+        qt @ (33 | 35 | 36) => {
+            let (bytes, gpu_dtype) = oq8_arch_load(qt, &data, m, k)
+                .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36");
             let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
             Ok(WeightTensor {
                 buf,
-                gpu_dtype: DType::Oq8G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        35 => {
-            let bytes = oq8_combined(&data, m, k);
-            let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::Oq8G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        36 => {
-            let bytes = oqplus_compact_to_oq8_combined(&data, m, k);
-            let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::Oq8G256,
+                gpu_dtype,
                 m,
                 k,
                 row_stride: 0,
