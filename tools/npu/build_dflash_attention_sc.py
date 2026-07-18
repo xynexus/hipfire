@@ -62,9 +62,13 @@ def dflash_attn_head(Q: In, KV: In, O: Out, *,
     attn = _attn_kernel(q_len, kv_len)
 
     # depth=1 (single-buffer): one head/dispatch, no pipelining; keeps the big
-    # KV buffer from double-buffering past the 64 KB tile budget.
+    # KV buffer from double-buffering past the 64 KB tile budget. Stage inputs
+    # through the memtile (.forward) like oq_gemm_design — direct shim->core
+    # delivery of Q did not land (output was invariant to the score compute).
     inQ = ObjectFifo(Q_ty, name="inQ", depth=1)
+    memQ = inQ.cons().forward(name="memQ")
     inKV = ObjectFifo(KV_ty, name="inKV", depth=1)
+    memKV = inKV.cons().forward(name="memKV")
     outO = ObjectFifo(Q_ty, name="outO", depth=1)
 
     def core_fn(of_q, of_kv, of_o, kfn):
@@ -76,7 +80,7 @@ def dflash_attn_head(Q: In, KV: In, O: Out, *,
         of_kv.release(1)
         of_o.release(1)
 
-    worker = Worker(core_fn, [inQ.cons(), inKV.cons(), outO.prod(), attn],
+    worker = Worker(core_fn, [memQ.cons(), memKV.cons(), outO.prod(), attn],
                     stack_size=0x1000)
 
     rt = Runtime()

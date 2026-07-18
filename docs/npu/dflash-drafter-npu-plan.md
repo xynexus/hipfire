@@ -211,11 +211,16 @@ non-causal full softmax, GQA on the host) + `build_dflash_attention_sc.py`
 depth=1 for the 64 KB tile) + `test_dflash_attention_npu.py`.
 - ALGORITHM validated vs golden l0 (numpy `--algo-only`): **cos = 1.000000**.
 - BUILDS + RUNS on nix1 (RyzenAI-npu1/aie2) — dataflow executes.
-- **Numerics WIP:** on-device output is wrong (cos ≈ 0.065) and INVARIANT to the
-  score computation → Q isn't effectively reaching the kernel (output ≈ average
-  of V, i.e. scores≈0 → uniform softmax). Diagnosed: an IRON fill/drain wiring
-  issue (plain `rt.fill` without the memtile `.forward()` + TensorTiler taps that
-  `oq_gemm_design` uses). Next: mirror oq_gemm's staged fill/drain to deliver Q.
+- **Numerics WIP:** on-device output is wrong and BIT-IDENTICAL across the dot
+  rewrite, a cache clear, AND adding memtile `.forward()` — i.e. totally invariant
+  to the kernel. Refined diagnosis: the plain `rt.fill(fifo.prod(), tensor)` /
+  `rt.drain(...)` WITHOUT a `TensorTiler2D` **tap** transfers no data —
+  `oq_gemm_design`/`single_core` ALWAYS pass `tap=...` to fill/drain (A_tiles,
+  b_tap, C_tiles). So the core runs on uninitialised tile memory (deterministic
+  garbage) and the output never reflects the compute. **Next step: add
+  TensorTiler2D taps to the fill/drain** (a trivial identity tiler for the
+  contiguous 1-D case) so Q/KV actually DMA in and O drains out. The attention
+  algorithm is golden-validated; this is purely the IRON transfer wiring.
 
 **Two blockers to Gate C (8-col path):**
 1. **nix1 can't run it:** the segmented kernel is **8-column** (aie2p/halo); nix1's
