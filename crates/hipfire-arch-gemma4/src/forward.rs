@@ -919,6 +919,25 @@ fn run_reference_layer(
         }
     }
     gpu.scale_f32(&state.x, layer.layer_scalar)?;
+    if std::env::var("HIPFIRE_GEMMA4_DEBUG_NORMS").is_ok() {
+        if let Ok(h) = gpu.download_f32(&state.x) {
+            let mut sum = 0.0f32;
+            let mut amax = 0.0f32;
+            let mut nan = false;
+            for v in &h {
+                sum += v * v;
+                amax = amax.max(v.abs());
+                nan |= !v.is_finite();
+            }
+            let lp = &config.layers[layer_idx];
+            let shared = !matches!(lp.kv_producer, KvProducer::Own);
+            eprintln!(
+                "[g4norm] L{layer_idx:>2} shared={shared} kind={:?} |x|={:.3} amax={amax:.3} nan={nan}",
+                lp.kind,
+                sum.sqrt()
+            );
+        }
+    }
     if let Some(capture) = capture {
         capture_operator(gpu, capture, layer_idx, "layer_output", &state.x)?;
     }

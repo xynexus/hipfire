@@ -108,6 +108,39 @@ plmp_scratch [8960] scratch. ple_dim/num_layers from config.
       op. The E2B-loading changes are UNCOMMITTED (broken forward kept off-branch); the
       committed branch (PLE at e118d49ec) still rejects KV-share so nothing serves garbage.
 - [ ] then: HIPFIRE_KV_MODE=kvarn end-to-end (needs kvarn-on-shared-layer attend-only).
+
+## Coherence-bug isolation (2026-07-18, in progress)
+Symptom: E2B loads + fluent; correct short pattern completion (`1..7`→`8 9 10 11`) but
+semantic next-token prediction COPIES a recent token (`opposite of hot is`→`hot`,
+`sets in the`→`east`, `red, violets are`→`red`). Present at the FIRST generated token
+(prefill), so it's fundamental, not decode-accumulation.
+RULED OUT so far:
+- Gross numerics: per-layer residual `|x|` trace (HIPFIRE_GEMMA4_DEBUG_NORMS=1) is smooth
+  ~27→70, no NaN, NO discontinuity at the first shared layer (L15). So KV-share isn't
+  exploding magnitudes.
+- Attention scaling: upstream Gemma4TextAttention hardcodes `self.scaling = 1.0` (with
+  q_norm) — hipfire's "score scale 1" (pre-scale q by √head_dim to cancel the kernel's
+  1/√head_dim) MATCHES. Not the bug.
+- V handling: upstream applies weightless `v_norm` (Gemma4RMSNorm with_scale=False), RoPE
+  to q/k only — hipfire matches (rmsnorm_weightless_f32 on V; rope q/k). E2B is
+  attention_k_eq_v=false (Separate v_proj), so the FromPreNormKey pre/post-norm subtlety
+  doesn't apply here.
+- PLE math + scales: match upstream get/project_per_layer_inputs + the decoder merge
+  order (verified earlier). embed_tokens_per_layer=Q8 (lookup ok), model_projection=Oq8
+  (weight_gemv ok).
+- Quant: deprioritized (oq8 norms smooth; 8-bit rarely flips "cold"→"hot"). A bf16 E2B was
+  built but blocked on a BF16 embed-table lookup (no bf16 embedding_lookup kernel) — not
+  pursued since quant is an unlikely cause.
+REMAINING SUSPECTS (need an HF per-layer reference to pin):
+- KV-share LOGIC (my code): shared layers reuse the producer's K/V — subtle correctness.
+- BASE gemma4 forward, UNVALIDATED on any real model (no gemma4 ever admitted): esp. the
+  FULL/global layers' PROPORTIONAL partial RoPE (rotary_dim=128 of head_dim 512) and the
+  head_dim-512 attention — global/semantic integration lives there; a bug would make the
+  model fall back to local copying (matches the symptom).
+NEXT (definitive): capture per-layer hidden states from HF transformers (gemma4 needs
+transformers ~5.5-dev) on the duat CUDA box for one factual prompt, diff vs hipfire's
+per-layer capture, find the first divergent op. `HIPFIRE_GEMMA4_DEBUG_NORMS=1` +
+temporarily un-gating the loader reject reproduces locally.
 - [ ] FOLLOW-UP: mirror PLE (+KV-share) into the lowered superop program
       (forward.rs lower_dense_forward ~935 / run_attend ~1035) for production perf; today
       lowered is the default so serving needs HIPFIRE_GEMMA4_FORWARD_ORACLE=1 until then.
