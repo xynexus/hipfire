@@ -3,7 +3,7 @@
 // DO NOT EDIT BY HAND — edit the .toml and regenerate.
 #![allow(dead_code)]
 
-use crate::{ArchFeatures, FeatureSupport};
+use crate::{ArchFeatures, DiffusionFeatures, FeatureSupport};
 
 /// One row of the per-arch capability matrix.
 pub struct ArchRow {
@@ -277,4 +277,56 @@ pub const GATE_TABLE: &[GateRow] = &[
     GateRow { arch: 11, quant: "oq4+", feature: "prefill", support: FeatureSupport::Partial, note: "LFM2 OQ4+ W4A8 prefill routes through int8 activation MMQ; full calibration/quality pending" },
     GateRow { arch: 11, quant: "oq8", feature: "prefill", support: FeatureSupport::Partial, note: "LFM2 OQ8 W8A8 prefill routes through iu8 WMMA; current evidence is 350M smoke/parity" },
     GateRow { arch: 11, quant: "oq8+", feature: "prefill", support: FeatureSupport::Partial, note: "LFM2 OQ8+ shares OQ8 runtime kernels; calibrated plus artifact quality is pending" },
+];
+
+/// One row of the diffusion (image/video denoiser) capability matrix.
+pub struct DiffusionRow {
+    pub ids: &'static [u32],
+    pub features: DiffusionFeatures,
+}
+
+/// Per-diffusion-family capabilities, keyed by HFQ arch_id (see `diffusion_features`).
+pub const DIFFUSION_ROWS: &[DiffusionRow] = &[
+    DiffusionRow {
+        ids: &[23],
+        features: DiffusionFeatures {
+            label: "flux2",
+            family: "flux2-mmdit",
+            ingest: FeatureSupport::Full,
+            text_enc: FeatureSupport::Full,
+            denoise: FeatureSupport::Full,
+            sampler: FeatureSupport::Full,
+            vae: FeatureSupport::Full,
+            t2i: FeatureSupport::Full,
+            quant: "bf16·q4f16·q8f16·hfq4/6·oq4/++/8",
+        },
+    },
+    DiffusionRow {
+        ids: &[17],
+        features: DiffusionFeatures {
+            label: "krea2",
+            family: "krea2-mmdit",
+            ingest: FeatureSupport::Full,
+            text_enc: FeatureSupport::Partial,
+            denoise: FeatureSupport::Full,
+            sampler: FeatureSupport::Partial,
+            vae: FeatureSupport::Full,
+            t2i: FeatureSupport::Partial,
+            quant: "bf16·q4f16·q8f16·hfq4/6·oq4/++/8",
+        },
+    },
+    DiffusionRow {
+        ids: &[18],
+        features: DiffusionFeatures {
+            label: "qwen-image",
+            family: "qwen-image-mmdit",
+            ingest: FeatureSupport::Full,
+            text_enc: FeatureSupport::None,
+            denoise: FeatureSupport::Partial,
+            sampler: FeatureSupport::None,
+            vae: FeatureSupport::Partial,
+            t2i: FeatureSupport::None,
+            quant: "bf16·q4f16·q8f16·hfq4/6·oq4/++/8",
+        },
+    },
 ];

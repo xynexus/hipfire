@@ -152,9 +152,10 @@ pub fn has_worker_or_model_identity(msg: &Value) -> bool {
 // See `docs/architecture-ids.md` for the id table and where the constants live.
 pub use hipfire_arch_api::{
     ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA, ARCH_ID_FLUX2,
-    ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL, ARCH_ID_GEMMA4, ARCH_ID_LFM2_MOE,
+    ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL, ARCH_ID_GEMMA4, ARCH_ID_KREA2, ARCH_ID_LFM2_MOE,
     ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2,
-    ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
+    ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_QWEN_IMAGE,
+    ARCH_ID_ZAYA,
 };
 
 /// Runtime model arch IDs that must appear in `docs/model-support.toml`.
@@ -175,6 +176,17 @@ pub const KNOWN_RUNTIME_ARCH_IDS: &[(u32, &str)] = &[
     (ARCH_ID_ZAYA, "zaya"),
     (ARCH_ID_EMBEDDINGGEMMA, "embeddinggemma"),
     (ARCH_ID_GEMMA4, "gemma4"),
+];
+
+/// Diffusion (image/video denoiser) arch IDs that must appear in the separate
+/// `[[diffusion]]` matrix of `docs/model-support.toml`. Kept distinct from
+/// [`KNOWN_RUNTIME_ARCH_IDS`] because diffusion families are graded on a
+/// different capability spine (text-encoder / denoise / sampler / VAE / t2i)
+/// than autoregressive language models — see `gen-model-support`.
+pub const KNOWN_DIFFUSION_ARCH_IDS: &[(u32, &str)] = &[
+    (ARCH_ID_KREA2, "krea2"),
+    (ARCH_ID_QWEN_IMAGE, "qwen-image"),
+    (ARCH_ID_FLUX2, "flux2"),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -709,6 +721,54 @@ pub fn arch_features(arch_id: u32) -> ArchFeatures {
         mtp: FeatureSupport::Unknown,
         kv: "?",
         vision: FeatureSupport::Unknown,
+    }
+}
+
+/// Per-diffusion-family capability summary, keyed by HFQ diffusion arch_id.
+/// Diffusion denoisers are graded on the image-generation pipeline spine rather
+/// than the autoregressive `ArchFeatures` spine. Mirrors the `[[diffusion]]`
+/// table in `docs/model-support.toml` (kept in sync by `hipfire
+/// gen-model-support`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DiffusionFeatures {
+    pub label: &'static str,
+    /// Stable denoiser family tag, e.g. `"flux2-mmdit"` (matches `Diffusion::denoiser_family`).
+    pub family: &'static str,
+    /// Offline HFQ import + quant precision policy (the `Ingest` capability).
+    pub ingest: FeatureSupport,
+    /// Prompt conditioning / text-encoder pass.
+    pub text_enc: FeatureSupport,
+    /// MMDiT / UNet denoiser forward pass on GPU.
+    pub denoise: FeatureSupport,
+    /// Scheduler / sampling-loop (denoise step schedule).
+    pub sampler: FeatureSupport,
+    /// VAE decode (latent → RGB).
+    pub vae: FeatureSupport,
+    /// End-to-end text-to-image serving.
+    pub t2i: FeatureSupport,
+    /// Diffusion weight-quant menu, e.g. "q4f16g64+f16" / "f16".
+    pub quant: &'static str,
+}
+
+/// Look up the capability summary for a diffusion HFQ arch_id. Backed by the
+/// generated `DIFFUSION_ROWS` table (source of truth: `docs/model-support.toml`,
+/// kept in sync by `hipfire gen-model-support` + the no-gpu-ci `--check` gate).
+pub fn diffusion_features(arch_id: u32) -> DiffusionFeatures {
+    for row in model_support_generated::DIFFUSION_ROWS {
+        if row.ids.contains(&arch_id) {
+            return row.features;
+        }
+    }
+    DiffusionFeatures {
+        label: "unknown",
+        family: "?",
+        ingest: FeatureSupport::Unknown,
+        text_enc: FeatureSupport::Unknown,
+        denoise: FeatureSupport::Unknown,
+        sampler: FeatureSupport::Unknown,
+        vae: FeatureSupport::Unknown,
+        t2i: FeatureSupport::Unknown,
+        quant: "?",
     }
 }
 
@@ -2610,6 +2670,34 @@ mod tests {
     fn normalizes_tag_stems_for_fuzzy_lookup() {
         assert_eq!(normalize_tag_stem("qwen3.6:35b-a3b"), "qwen3.6-35b-a3b");
         assert_eq!(normalize_tag_stem("QWEN3.5:9B"), "qwen3.5-9b");
+    }
+
+    #[test]
+    fn diffusion_features_cover_every_known_diffusion_id() {
+        // Every diffusion arch id that the coverage gate enforces must resolve to
+        // a concrete `[[diffusion]]` row (never the Unknown fallback), and its
+        // ingest axis is `full` — the offline `Ingest` policy is the one
+        // capability all three families already ship.
+        for &(arch_id, label) in KNOWN_DIFFUSION_ARCH_IDS {
+            let f = diffusion_features(arch_id);
+            assert_ne!(
+                f.ingest,
+                FeatureSupport::Unknown,
+                "{label}({arch_id}) should resolve to a concrete DiffusionFeatures row"
+            );
+            assert_eq!(
+                f.ingest,
+                FeatureSupport::Full,
+                "{label}({arch_id}) declares the Ingest capability, so ingest is full"
+            );
+            assert!(
+                f.family.ends_with("-mmdit"),
+                "{label}({arch_id}) family tag {:?} should match denoiser_family()",
+                f.family
+            );
+        }
+        // An unknown id falls back to Unknown, mirroring `arch_features`.
+        assert_eq!(diffusion_features(999).ingest, FeatureSupport::Unknown);
     }
 
     #[test]

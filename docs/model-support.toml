@@ -302,3 +302,53 @@ quant = "oq8+"
 feature = "prefill"
 support = "partial"
 note = "LFM2 OQ8+ shares OQ8 runtime kernels; calibrated plus artifact quality is pending"
+
+# ── Diffusion (image/video denoiser) capability matrix ─────────────────────────
+# A SEPARATE matrix from the [[arch]] rows above: diffusion families are graded on
+# the image-generation pipeline spine (text-encoder → denoise → sampler → VAE →
+# t2i), not the autoregressive prefill/dflash/mtp/kv/vision spine. Keyed by the
+# diffusion arch_id (KREA2=17, QWEN_IMAGE=18, FLUX2=23); coverage is gated against
+# hipfire_model::KNOWN_DIFFUSION_ARCH_IDS. The offline `-spec` crates register
+# `Diffusion + Ingest` (identity + quant policy); the servable forward path lives
+# in the `hipfire-diffusion` crate, which is wired end-to-end only for flux2.
+#
+# marks: "full" | "partial" | "none"  (same is_full() admission semantics).
+
+[[diffusion]]
+ids = [23]
+label = "flux2"
+family = "flux2-mmdit"
+ingest = "full"
+text_enc = "full"
+denoise = "full"
+sampler = "full"
+vae = "full"
+t2i = "full"
+quant = "bf16·q4f16·q8f16·hfq4/6·oq4/++/8"
+note = "Only end-to-end-wired family: Qwen3 text tower + SeFi dual-time denoise loop, flow-match Euler + DPM schedulers, shared VAE decode; variants Klein (5/20) and SeFi-2B (4/16); img2img + inpaint via the shared pipeline"
+
+[[diffusion]]
+ids = [17]
+label = "krea2"
+family = "krea2-mmdit"
+ingest = "full"
+text_enc = "partial"
+denoise = "full"
+sampler = "partial"
+vae = "full"
+t2i = "partial"
+quant = "bf16·q4f16·q8f16·hfq4/6·oq4/++/8"
+note = "Denoiser topology + Qwen3-VL tower + text-fusion load and a family-specific mixed-precision policy exist, but the generate-path glue is still `#[allow(dead_code)]`; not yet a wired serve loop"
+
+[[diffusion]]
+ids = [18]
+label = "qwen-image"
+family = "qwen-image-mmdit"
+ingest = "full"
+text_enc = "none"
+denoise = "partial"
+sampler = "none"
+vae = "partial"
+t2i = "none"
+quant = "bf16·q4f16·q8f16·hfq4/6·oq4/++/8"
+note = "Ingest/identity only: MMDiT backbone topology and the Wan-class per-channel VAE are recognized, but NativeDiffusionRuntime builds no Qwen-Image text conditioner, so there is no servable t2i loop"

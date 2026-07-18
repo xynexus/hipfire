@@ -89,6 +89,20 @@ Per-quant overrides of an arch capability (admission consults these before green
 | 11 | oq8 | prefill | 🟡 | LFM2 OQ8 W8A8 prefill routes through iu8 WMMA; current evidence is 350M smoke/parity |
 | 11 | oq8+ | prefill | 🟡 | LFM2 OQ8+ shares OQ8 runtime kernels; calibrated plus artifact quality is pending |
 
+### Diffusion capability matrix (generated)
+
+Image/video denoiser families (keyed by their diffusion `arch_id`), graded on the generation-pipeline spine rather than the autoregressive spine above. **ingest** = offline HFQ import + quant precision policy; **text-enc** = prompt conditioning tower; **denoise** = MMDiT/DiT backbone forward; **sampler** = scheduler / denoise-loop; **vae** = latent→RGB decode; **t2i** = end-to-end text-to-image serving. Edit `docs/model-support.toml`.
+
+| Family (arch_id) | Denoiser | Ingest | Text-enc | Denoise | Sampler | VAE | t2i | Quant |
+|---|---|---|---|---|---|---|---|---|
+| flux2 (23) | flux2-mmdit | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | bf16·q4f16·q8f16·hfq4/6·oq4/++/8 |
+| krea2 (17) | krea2-mmdit | ✅ | 🟡 | ✅ | 🟡 | ✅ | 🟡 | bf16·q4f16·q8f16·hfq4/6·oq4/++/8 |
+| qwen-image (18) | qwen-image-mmdit | ✅ | ❌ | 🟡 | ❌ | 🟡 | ❌ | bf16·q4f16·q8f16·hfq4/6·oq4/++/8 |
+
+- **flux2**: Only end-to-end-wired family: Qwen3 text tower + SeFi dual-time denoise loop, flow-match Euler + DPM schedulers, shared VAE decode; variants Klein (5/20) and SeFi-2B (4/16); img2img + inpaint via the shared pipeline
+- **krea2**: Denoiser topology + Qwen3-VL tower + text-fusion load and a family-specific mixed-precision policy exist, but the generate-path glue is still `#[allow(dead_code)]`; not yet a wired serve loop
+- **qwen-image**: Ingest/identity only: MMDiT backbone topology and the Wan-class per-channel VAE are recognized, but NativeDiffusionRuntime builds no Qwen-Image text conditioner, so there is no servable t2i loop
+
 ### Batched prefill: quant × gfx-class (derived)
 
 Projection of the prefill axis over **weight-quant × gfx-class**, computed from the runtime predicate `is_batchable_la` (GPU-free). ✅ = batched-prefill GEMM exists; ❌ = falls back to per-token decode; 🔒 = governed by a quality `[[gate]]` (OQ activation-quant formats), see the gates table. This is the kernel-availability truth the per-arch chart collapses to the reference gfx.
