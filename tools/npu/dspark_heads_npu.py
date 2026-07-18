@@ -26,8 +26,9 @@ reference's `out_ids[i]`) are reported: free-running cascades a single argmax
 flip into every later slot, so teacher-forced is what isolates per-slot error.
 
 Shape constraints of the int8 GEMM kernel, both hit here:
-  * `M % m == 0` and `(M // m)` even  -> the confidence head's `[1, 1280]` proj
-    must be zero-padded to `[8, 1280]` (row 0 is the real one).
+  * `m % (4*r) == 0` with r=4, plus `M % m == 0` and `(M // m)` even -> the
+    confidence head's `[1, 1280]` proj must be zero-padded to `[32, 1280]`
+    (row 0 is the real one); 31/32 of its rows are waste.
   * `n % (2 * t) == 0` with t=8       -> the activation batch N must be a
     multiple of 16, so a single 1-row GEMV is padded to 16 columns and column 0
     is read back. 15/16 of the MACs are waste; see the cost note in `main`.
@@ -61,8 +62,10 @@ from dspark_ref import (  # noqa: E402
 
 # Activation batch width the int8 kernel accepts (n % (2*t) == 0, t = 8).
 NPU_BATCH = 16
-# Minimum padded row count for the A operand: m shrinks to 4 and needs M//m even.
-CONF_PROJ_ROWS = 8
+# Minimum padded row count for the A operand. The micro-kernel needs
+# m % (4*r) == 0 with r=4, so m >= 16, and `_tiles_for` additionally needs
+# M % m == 0 with (M // m) even -> M must be a multiple of 32.
+CONF_PROJ_ROWS = 32
 
 
 def quantize_row_symmetric(x_f32: np.ndarray, bits: int = 8):

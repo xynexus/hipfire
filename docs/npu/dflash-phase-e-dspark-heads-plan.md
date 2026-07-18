@@ -93,3 +93,66 @@ report any slot where the argmax differs, since int8 error can flip a near-tie).
   float broadcast); a `noinline` helper around a scalar reduction miscompiles (inline
   it); degree-2 exp poly is too coarse (degree-6).
 - graphify before grepping source. Don't loosen tolerances to pass.
+
+## Results (Gate E) — MET
+
+`tools/npu/dspark_ref.py` (f32 golden) and `tools/npu/dspark_heads_npu.py`
+(int8 host sim + NPU), seeds 0/6/7, `block_size = 7`.
+
+| tier | markov bias cosine | out_ids | truncation |
+|---|---|---|---|
+| int8 host sim vs f32 | 0.99999997 | 21/21 exact | match |
+| NPU vs f32 | 0.99999997 | 21/21 exact | match |
+| NPU vs int8 host sim | max\|delta\| **0.0** | 21/21 | match |
+
+**Zero argmax flips.** The NPU integer GEMM reproduces the host int8 simulation
+bit-for-bit, so the residual cosine gap is quantization, not kernel error.
+Truncation was swept over thresholds {0.25, 0.35, 0.40, 0.45, 0.50}, exercising
+firing positions {1, 2, 3, 7}; every position matched the reference.
+
+### Confidence head: does NOT earn a dispatch
+
+| | latency | confidence cosine vs f32 |
+|---|---|---|
+| host f32 dot | **0.5 µs** | 1.0 (exact) |
+| NPU int8 GEMV | **1640 µs** | 0.99988 (max\|delta\| 1.7e-2) |
+
+~3300× slower *and* less accurate. The `[1, 1280]` proj must zero-pad to
+`[32, 1280]` (`m % (4*r) == 0`, `M % m == 0`, `M//m` even) and the activation to
+16 columns, so 31/32 × 15/16 of the MACs are padding. Keep it host-side, as the
+plan permitted. The NPU path is retained in the harness only as a measurement.
+
+### Markov head cost (the head budget)
+
+**7 dispatches per block** (one per slot — the loop is sequential, `out_ids[i+1]`
+needs slot `i`'s argmax) at **25.6–26.8 ms/dispatch** ≈ **180 ms/block**.
+`markov_w2` is 38.9 MB int8 and stays NPU-resident (upload 0.05 s, once).
+
+The activation batch must be a multiple of 16 (`n % (2*t) == 0`, t=8), so a
+1-row GEMV wastes 15/16 of its MACs. That is the obvious lever, but it does not
+rescue the head: this is the single-core `int_matmul`, and 180 ms/block is far
+off any useful drafting budget. A multi-core design and/or an on-chip-resident
+tiling of `markov_w2` would be the next step if this head is to move.
+
+### Corrections to this plan's earlier text
+
+- Truncation is **not** a mean-confidence threshold. `mtp_step` truncates at the
+  **first** slot whose `sigmoid(conf) < conf_threshold`, keeping ≥ 1 slot.
+- The sidecar is not "all F16": the head tensors are F16 (qt=1), but the body
+  layer weights are Q8F16 (qt=3).
+- `dspark_block_size` is **7**, and `confidence_uses_normed` is **true**.
+- The container header carries the tensor count, and index records have no
+  explicit offset (payloads are sequential from `data_offset`) — the older
+  inline reader in `compare_qwen3_embedding_reference.py` does not parse it.
+
+### Scope limitation
+
+This is the **qwen3-0.6b** sidecar (hidden 1024), not the Qwen3.5-9B DFlash body
+from Phases A–D. Gate E validates the head kernels at these dims. It is not an
+end-to-end 9B DSpark run, and no 9B DSpark sidecar exists locally.
+
+The f32 reference is a line-by-line mirror of `dspark_core::run_heads` +
+`mtp_step`, verified by reading the Rust. A **runtime** differential against the
+GPU implementation was not run (it needs a GPU harness that uploads synthetic
+`x_head`/`logits` into `run_heads`, which does not exist yet) — so the reference
+is validated by construction, not by execution against the Rust.
