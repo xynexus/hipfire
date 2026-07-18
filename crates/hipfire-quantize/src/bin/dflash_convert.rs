@@ -254,6 +254,63 @@ fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     output
 }
 
+/// Non-rotated (plain-basis) OQ8: per-256-group symmetric signed int8, f16 scale.
+/// Block = `[f16 scale][256 int8]` = 258 B/group. NO FWHT — the AIE2 int8 kernel
+/// (W8A16/W8A8) reads these codes directly and needs no activation rotation.
+///
+/// Scale = max_abs / 127 (round-to-nearest-even quantization). At 8-bit,
+/// clip-search is a no-op vs max-abs (measured: identical on the z-lab 9B
+/// drafter — no outliers to clip at 256 levels), so this matches OQ8+ quality
+/// while keeping the runtime activation path a plain per-group int8 quant.
+/// The final partial group (if `n % 256 != 0`) is zero-padded; padded lanes are
+/// never read by the kernel. Dequant oracle: `dequant_oq8_plain`.
+fn quantize_oq8_plain(f32_data: &[f32]) -> Vec<u8> {
+    let group_size = 256usize;
+    let block_bytes = 2 + 256; // f16 scale + 256 signed int8
+    let n = f32_data.len();
+    let n_blocks = n.div_ceil(group_size);
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let grp = &f32_data[start..end];
+        let max_abs = grp.iter().fold(0.0f32, |a, &w| a.max(w.abs()));
+        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        let scale_f16 = hipfire_primitives::conv::f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        for (i, &w) in grp.iter().enumerate() {
+            // round-to-nearest-even, clamp to symmetric signed int8 [-127, 127].
+            let q = (w * inv).round_ties_even().clamp(-127.0, 127.0) as i8;
+            output[out_off + 2 + i] = q as u8;
+        }
+        // trailing lanes of a partial final group stay 0 (== quantized zero).
+    }
+    output
+}
+
+/// Dequant oracle for `quantize_oq8_plain` — for the round-trip validation.
+#[cfg(test)]
+fn dequant_oq8_plain(data: &[u8], n: usize) -> Vec<f32> {
+    let group_size = 256usize;
+    let block_bytes = 2 + 256;
+    let n_blocks = n.div_ceil(group_size);
+    let mut out = Vec::with_capacity(n_blocks * group_size);
+    for b in 0..n_blocks {
+        let off = b * block_bytes;
+        let scale =
+            hipfire_primitives::conv::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        for i in 0..group_size {
+            let q = data[off + 2 + i] as i8;
+            out.push(q as f32 * scale);
+        }
+    }
+    out.truncate(n);
+    out
+}
+
 // ─── HFQ File Format ──────────────────────────────────────────────────────
 
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
@@ -270,6 +327,13 @@ enum QuantType {
     MQ4G256 = 13,
     MQ6G256 = 15,
     MQ3G256 = 17,
+    /// Non-rotated (plain-basis) symmetric signed INT8, per-256-group f16 scale.
+    /// On-disk block = [f16 scale][256 int8] = 258 B/group — same bytes as the
+    /// canonical `Oq8G256 = 35` but WITHOUT the FWHT rotation, so the AIE2 int8
+    /// W8A8/W8A16 projection kernel consumes it directly with no per-block
+    /// activation rotation. Distinct id (and `"rotated": false` in metadata) so a
+    /// rotated-OQ8 consumer can never mis-handle these bytes. NPU-only sidecar.
+    Oq8Plain = 45,
 }
 
 struct HfqTensor {
@@ -426,6 +490,7 @@ fn main() {
     let mut use_mq4 = false;
     let mut use_mq6 = false;
     let mut use_mq3 = false;
+    let mut use_oq8 = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -454,9 +519,13 @@ fn main() {
                 use_mq3 = true;
                 i += 1;
             }
+            "--oq8" => {
+                use_oq8 = true;
+                i += 1;
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq3 | --mq4 | --mq6]"
+                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq3 | --mq4 | --mq6 | --oq8]"
                 );
                 std::process::exit(0);
             }
@@ -466,9 +535,10 @@ fn main() {
             }
         }
     }
-    let n_format_flags = (keep_f32 as u8) + (use_mq3 as u8) + (use_mq4 as u8) + (use_mq6 as u8);
+    let n_format_flags =
+        (keep_f32 as u8) + (use_mq3 as u8) + (use_mq4 as u8) + (use_mq6 as u8) + (use_oq8 as u8);
     if n_format_flags > 1 {
-        eprintln!("--keep-f32, --mq3, --mq4, and --mq6 are mutually exclusive");
+        eprintln!("--keep-f32, --mq3, --mq4, --mq6, and --oq8 are mutually exclusive");
         std::process::exit(1);
     }
 
@@ -489,6 +559,8 @@ fn main() {
         "MQ4-G256 (weights), F32 (norms)"
     } else if use_mq6 {
         "MQ6-G256 (weights), F32 (norms)"
+    } else if use_oq8 {
+        "OQ8-plain (non-rotated int8 G256 weights), F32 (norms) — NPU int8 W8A8/W8A16"
     } else {
         "F16 (weights), F32 (norms)"
     };
@@ -575,6 +647,8 @@ fn main() {
         "mq4"
     } else if use_mq6 {
         "mq6"
+    } else if use_oq8 {
+        "oq8"
     } else {
         "f16"
     };
@@ -610,6 +684,10 @@ fn main() {
             "rope_theta": config.get("rope_theta").cloned().unwrap_or_else(|| serde_json::Value::from(10_000_000.0)),
             "vocab_size": config.get("vocab_size").cloned(),
             "draft_dtype": draft_dtype,
+            // OQ8-plain is non-rotated: the AIE2 int8 kernel reads codes directly
+            // and must NOT rotate activations. Explicit so a rotated-OQ8 consumer
+            // (canonical Oq8G256=35) can never mis-handle these bytes.
+            "rotated": if use_oq8 { serde_json::Value::Bool(false) } else { serde_json::Value::Null },
         },
         "tokenizer": serde_json::Value::Null,
     });
@@ -670,6 +748,9 @@ fn main() {
         } else if use_mq3 && n_elements >= 256 {
             let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ3G256, 256u32, q)
+        } else if use_oq8 && n_elements >= 256 {
+            let q = quantize_oq8_plain(&f32_data);
+            (QuantType::Oq8Plain, 256u32, q)
         } else {
             (QuantType::F16, 0u32, f32_slice_to_f16_bytes(&f32_data))
         };
@@ -709,4 +790,56 @@ fn main() {
     .expect("write_hfq failed");
 
     eprintln!("  wrote: {}", output_path.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snr_db(w: &[f32], deq: &[f32]) -> f64 {
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for (a, b) in w.iter().zip(deq) {
+            num += ((*a - *b) as f64).powi(2);
+            den += (*a as f64).powi(2);
+        }
+        10.0 * (den / num.max(1e-30)).log10()
+    }
+
+    #[test]
+    fn oq8_plain_round_trip_smooth_is_near_lossless() {
+        // Realistic (outlier-free) weight distribution: per-group int8 at 256
+        // levels should clear ~45 dB. This is the weight-only quant ceiling the
+        // W8A16 NPU path inherits (real 9B drafter measured ~33 dB end-to-end,
+        // lower because errors compound across 5 layers + activation range).
+        let n = 256 * 4;
+        let w: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.011).sin()) * 0.06).collect();
+        let packed = quantize_oq8_plain(&w);
+        assert_eq!(packed.len(), 4 * (2 + 256));
+        let deq = dequant_oq8_plain(&packed, n);
+        let snr = snr_db(&w, &deq);
+        assert!(snr > 44.0, "oq8-plain smooth SNR {snr:.1} dB too low");
+    }
+
+    #[test]
+    fn oq8_plain_round_trip_with_outlier_is_int8_limited() {
+        // A per-group outlier sets the group scale and crushes bulk resolution —
+        // the known int8 limitation (not a bug). Documents the ~30 dB floor that
+        // clip-search does NOT recover at 8 bits on real weights (measured).
+        let n = 256 * 4;
+        let w: Vec<f32> = (0..n)
+            .map(|i| if i % 256 == 0 { 0.9 } else { (i as f32 * 0.017).sin() * 0.08 })
+            .collect();
+        let deq = dequant_oq8_plain(&quantize_oq8_plain(&w), n);
+        let snr = snr_db(&w, &deq);
+        assert!(snr > 30.0, "oq8-plain outlier SNR {snr:.1} dB unexpectedly low");
+    }
+
+    #[test]
+    fn oq8_plain_zero_group_is_stable() {
+        let w = vec![0.0f32; 256 * 2];
+        let packed = quantize_oq8_plain(&w);
+        let deq = dequant_oq8_plain(&packed, w.len());
+        assert!(deq.iter().all(|&v| v == 0.0));
+    }
 }

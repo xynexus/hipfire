@@ -67,6 +67,34 @@ Stage the trained weights and lock a golden reference to validate against.
 **Gate A.** Golden reference dumps exist and are deterministic across two runs
 (byte-identical), for both a random-init and the trained sidecar.
 
+**Gate A — DONE (2026-07-18).** Deliverables landed:
+- `crates/hipfire-runtime/examples/dflash_ref_dump.rs` — dumps deterministic
+  seeded inputs + final `[16,4096]` block hidden to `.npy`. Byte-identical across
+  two runs.
+- `HIPFIRE_DFLASH_GOLDEN_DIR` env hook in `dflash::draft_forward_opts` — dumps
+  per-op GPU intermediates (`rust_target_hidden_proj`, `rust_l0_input_norm`,
+  `rust_l0_{q,k}_roped`, `rust_l0_v`, `rust_l0_attn_out`, `rust_l0_attn_proj`,
+  `rust_l{0..4}_out`, `rust_final_block_hidden`). No-op when unset.
+- `tools/npu/dflash_ref.py` — numpy float reference. Reads the same safetensors
+  (bf16→f32, bit-exact to the HFQ) + dumped inputs, reproduces every per-op
+  intermediate, writes them to `<ref_dir>/golden/`, and validates its final vs
+  the GPU dump. **This numpy reference is the authoritative per-op golden for
+  Phase B** (exact float math from real weights, no kernel/quant error).
+
+Result vs the **F16** sidecar (production WMMA path): every primitive matches at
+cos = 1.000000; full-body `max_abs = 0.017`, `mean_abs = 0.0015` (bf16 tol).
+
+**Golden uses the F16 sidecar, NOT F32.** The F32 draft path
+(`gemm_f32_batched`) has a latent transpose bug for batch>1: it writes output
+feature-major `Y[n*batch + m]`, correct only at batch=1 (decode), so the F32
+DFlash body (batch=block_size=16) comes out transposed (cos≈0 vs reference,
+matching RMS). Production DFlash uses the F16/MQ4 kernels, which are correct, so
+this never bit inference — but it means the F32 sidecar is NOT a usable golden.
+See the tracked runtime finding; fix is out of scope for this NPU plan.
+
+Sidecars: `~/.hipfire/drafts/Qwen3.5-9B.dflash.f16.hfq` (golden),
+`Qwen3.5-9B.dflash.f32.hfq` (kept for the bug repro only).
+
 ### Phase B — Per-primitive parity at block granularity (M=16)
 
 Confirm every existing primitive matches the reference at the drafter's dims. Most
@@ -74,7 +102,7 @@ already have `test_*_npu.py`; re-point them at drafter shapes.
 
 | primitive | kernel | check |
 |---|---|---|
-| projection GEMM | `build_qwen3_oq8_projection` (m,k,n) | ✅ block-16 bit-exact (done) |
+| projection GEMM (int8 W8A8) | `oq_gemm_design.matmul_npu` per-group G256 | ✅ block-16 int32 bit-exact on halo, all 8 drafter shapes (2026-07-18) |
 | rmsnorm | `build_qwen35_rmsnorm` | parity on `[16, 4096]` |
 | head norm (q/k) | `build_qwen35_headnorm` | parity on `[16, 32/8, 128]` |
 | RoPE | `build_qwen35_rope` | parity, rope_theta 1e7 |
@@ -83,6 +111,54 @@ already have `test_*_npu.py`; re-point them at drafter shapes.
 
 **Gate B.** Each primitive passes parity vs its Phase-A golden slice at M=16 on
 `accel0`, at rope_theta and eps from the sidecar config.
+
+**Projection GEMM validated on device (2026-07-18).** `tools/npu/test_dflash_projection_npu.py`
+runs the TRUE int8 W8A8 projection (per-group G256, `aie::mmul<4,8,8,int8,int8,acc32>`
+via `oq_gemm_design.matmul_npu`) at every drafter shape on the halo Strix-Halo NPU:
+q/k/v/o/gate/up/down/fc all **int32 bit-exact** vs numpy int64. W8A8 rescale = +40 dB
+(confirmed on-device at N=1024 and on nix1 numpy for all N; halo numpy 2.x mis-reports
+float SNR at N≥4096 — kernel proven by the integer check). Toolchain caveat: the
+mlir-aie `single_core` `@iron.jit` example WEDGES the firmware (status 8, health-report);
+`oq_gemm_design`'s design is the proven-good one. Recover a wedged NPU with
+`sudo modprobe -r amdxdna && sudo modprobe amdxdna`.
+
+**OQ8 quant decision + evidence (2026-07-18).** The NPU projection is a TRUE int8
+compute path (W8A16 / W8A8), NOT the dequant-to-bf16 that `build_qwen3_oq8_projection`
+(`aie::mmul<...,bfloat16,bfloat16>`) does — that image is a quality probe, not the
+target. int8 gives 2× MACs + half weight-feed on AIE. FWHT is DROPPED for int8:
+weight rotation is offline-once but the matching activation rotation is unavoidably
+per-block, and at 8 bits incoherence buys ~nothing.
+
+Numpy sim (`tools/npu/dflash_int8_sim.py`) on the real 9B drafter vs the F16 golden,
+non-rotated per-group G256:
+
+| granularity | W8A16 | W8A8 |
+|---|---|---|
+| G256 (per-group) | 33.2 dB / cos 0.99976 | 29.8 dB / cos 0.99948 |
+| G1024 | 31.7 dB | 27.6 dB |
+| per-row (K) | 30.9 dB | 26.0 dB |
+
+Findings: (1) clip-search ≡ RTN at 8 bits (no outliers to clip) → OQ8 ≈ OQ8+ ≈
+OQ8++ at W8; the "++" (Hessian/LDLQ) buys sub-dB and is a low-priority follow-on
+gated on the calibration-Hessian pipeline. (2) A8 activation quant costs ~3.3 dB.
+(3) per-group G256 beats per-row by 2.3–3.8 dB → the kernel MUST apply per-group
+`w_scale·a_scale` (the `opus_lowbit::dot_offset_fold` structure), not a single
+end-of-K scale.
+
+**OQ8 converter — DONE.** `dflash_convert --oq8` emits a non-rotated per-group
+symmetric signed-int8 sidecar (`QuantType::Oq8Plain = 45`, block `[f16 scale]
+[256 int8]` = 258 B/group, `"rotated": false` in metadata). Round-trip unit tests
+pass; real sidecar `~/.hipfire/drafts/Qwen3.5-9B.dflash.npu.oq8.hfq` (1008 MiB)
+validates at ~43 dB weight-only SNR per projection, norms kept F32. This is the
+int8 weight format both int8 kernels consume.
+
+**Kernel target = aie2p on `halo`.** ALL existing qwen3 NPU kernels are
+`aie.device(npu2)`/`--target=aie2p` (Strix Halo); nix1 is aie2/Phoenix and cannot
+run aie2p. Build + run int8 kernels on halo (172.16.16.20, verified: Strix Halo
+aie2p 6×8, full mlir-aie + aiecc toolchain). aie2p int8 mmul shapes:
+W8A16 = `mmul<4,8,8,int16,int8,32>` (mmul_16_8), W8A8 = `mmul<4,8,8,int8,int8,32>`
+(mmul_8_8) — both mirror the bf16 kernel's <4,8,8> tiling. int8 CPU reference to
+validate against: `opus_lowbit::dot_signed` / `dot_offset_fold`.
 
 ### Phase C — The one new primitive: non-causal cross-attention
 

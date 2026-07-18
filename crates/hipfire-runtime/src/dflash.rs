@@ -46,6 +46,53 @@ use std::collections::{HashMap, HashSet};
 /// first-call `fc` rotation (one-shot per prompt, negligible vs prefill).
 const MQ_X_ROT_CHUNK_ROWS: usize = 1024;
 
+// ─── Golden per-op dump (bring-up only) ──────────────────────────────────────
+// Gated by `HIPFIRE_DFLASH_GOLDEN_DIR`; writes GPU intermediates as .npy so the
+// NPU bring-up (docs/npu/dflash-drafter-npu-plan.md, Phase A/B) can check each
+// primitive against the F32 GPU reference. No-op when the env var is unset.
+fn dflash_golden_npy(
+    gpu: &mut Gpu,
+    dir: &str,
+    name: &str,
+    t: &GpuTensor,
+    shape: &[usize],
+) {
+    let data = match gpu.download_f32(t) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[dflash-golden] download {name} failed: {e:?}");
+            return;
+        }
+    };
+    let n: usize = shape.iter().product();
+    let data = &data[..n.min(data.len())];
+    let shape_str = if shape.len() == 1 {
+        format!("({},)", shape[0])
+    } else {
+        let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+        format!("({})", dims.join(", "))
+    };
+    let dict = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_str}, }}");
+    let mut header = dict.into_bytes();
+    let unpadded = 10 + header.len() + 1;
+    let pad = (64 - (unpadded % 64)) % 64;
+    header.extend(std::iter::repeat(b' ').take(pad));
+    header.push(b'\n');
+    let mut out = Vec::with_capacity(10 + header.len() + data.len() * 4);
+    out.extend_from_slice(b"\x93NUMPY");
+    out.push(1);
+    out.push(0);
+    out.extend_from_slice(&(header.len() as u16).to_le_bytes());
+    out.extend_from_slice(&header);
+    for &v in data {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    let _ = std::fs::create_dir_all(dir);
+    if let Err(e) = std::fs::write(format!("{dir}/{name}.npy"), &out) {
+        eprintln!("[dflash-golden] write {name} failed: {e}");
+    }
+}
+
 // ─── Config ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -1183,6 +1230,7 @@ pub fn draft_forward_opts(
     let hd = cfg.head_dim;
     let eps = cfg.norm_eps;
     let theta = cfg.rope_theta;
+    let golden_dir = std::env::var("HIPFIRE_DFLASH_GOLDEN_DIR").ok();
 
     assert!(b <= scratch.max_block_size, "block_size > scratch max");
     assert!(l <= scratch.max_ctx_len, "ctx_len > scratch max");
@@ -1278,6 +1326,9 @@ pub fn draft_forward_opts(
         )?;
         gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, delta, h, eps)?;
     }
+    if let Some(dir) = &golden_dir {
+        dflash_golden_npy(gpu, dir, "rust_target_hidden_proj", &scratch.target_hidden_proj, &[l, h]);
+    }
 
     // HIPFIRE_DRAFT_SUBPHASE=1: per-layer-section timing inside draft_forward.
     // Diagnostic only — device_synchronize at each boundary makes this 2-3×
@@ -1314,6 +1365,11 @@ pub fn draft_forward_opts(
 
         // attn_norm.
         gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
+        if li == 0 {
+            if let Some(dir) = &golden_dir {
+                dflash_golden_npy(gpu, dir, "rust_l0_input_norm", &scratch.x_norm, &[b, h]);
+            }
+        }
 
         let t0 = if dbg {
             gpu.hip.device_synchronize()?;
@@ -1502,6 +1558,13 @@ pub fn draft_forward_opts(
             tot,
         )?;
         dflash_subphase_sync(gpu, dbg, li, "rope_k")?;
+        if li == 0 {
+            if let Some(dir) = &golden_dir {
+                dflash_golden_npy(gpu, dir, "rust_l0_q_roped", &scratch.q, &[b, cfg.q_dim()]);
+                dflash_golden_npy(gpu, dir, "rust_l0_k_roped", &scratch.k_cat, &[tot, kvd]);
+                dflash_golden_npy(gpu, dir, "rust_l0_v", &scratch.v_cat, &[tot, kvd]);
+            }
+        }
 
         if let Some(t) = t1 {
             gpu.hip.device_synchronize()?;
@@ -1543,6 +1606,11 @@ pub fn draft_forward_opts(
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
         };
         dflash_subphase_sync(gpu, dbg, li, "attention")?;
+        if li == 0 {
+            if let Some(dir) = &golden_dir {
+                dflash_golden_npy(gpu, dir, "rust_l0_attn_out", &scratch.attn_out, &[b, cfg.q_dim()]);
+            }
+        }
         if let Some(t) = t2 {
             gpu.hip.device_synchronize()?;
             us_attn_kernel += t.elapsed().as_micros();
@@ -1568,6 +1636,12 @@ pub fn draft_forward_opts(
         // x = residual_attn + attn_proj
         gpu.add_f32(&scratch.residual_attn, &scratch.attn_proj, &scratch.x)?;
         dflash_subphase_sync(gpu, dbg, li, "attn_residual_add")?;
+        if li == 0 {
+            if let Some(dir) = &golden_dir {
+                dflash_golden_npy(gpu, dir, "rust_l0_attn_proj", &scratch.attn_proj, &[b, h]);
+                dflash_golden_npy(gpu, dir, "rust_l0_post_attn_residual", &scratch.x, &[b, h]);
+            }
+        }
 
         // Fixed-shape FFN tail. MoE DFlash can optionally capture this as a
         // per-layer/per-B hipGraph; the attention/context work above is left
@@ -1586,6 +1660,9 @@ pub fn draft_forward_opts(
             gpu.hip.device_synchronize()?;
             us_ffn_gemm += t.elapsed().as_micros();
         }
+        if let Some(dir) = &golden_dir {
+            dflash_golden_npy(gpu, dir, &format!("rust_l{li}_out"), &scratch.x, &[b, h]);
+        }
     }
 
     if dbg {
@@ -1598,6 +1675,9 @@ pub fn draft_forward_opts(
 
     // ── 3. Final norm ────────────────────────────────────────────────────
     gpu.rmsnorm_batched(&scratch.x, &weights.norm, &scratch.x, b, h, eps)?;
+    if let Some(dir) = &golden_dir {
+        dflash_golden_npy(gpu, dir, "rust_final_block_hidden", &scratch.x, &[b, h]);
+    }
 
     // ── 4. Advance the draft-ctx projection cache pointer ────────────────
     // All rows [0..l) of target_hidden_proj and every layer's
