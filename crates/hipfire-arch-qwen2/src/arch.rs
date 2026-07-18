@@ -13,7 +13,7 @@
 //! reach the hot path via [`crate::qwen2::forward_step`] /
 //! [`crate::qwen2::forward_step_greedy`] directly.
 
-use crate::qwen2::{forward_step, Qwen2Config, Qwen2State, Qwen2Weights};
+use crate::qwen2::{forward_prefill_batch, forward_step, Qwen2Config, Qwen2State, Qwen2Weights};
 use hipfire_rdna::{Gpu, GpuTensor};
 use hipfire_runtime::arch::{
     run_simple_ar, ArchCaps, Architecture, EosFilterOverrides, FactoryLoadedBackend, GenerateCtx,
@@ -23,6 +23,13 @@ use hipfire_runtime::arch::{
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
+
+/// Prompt length at or above which prefill takes the batched multi-token path
+/// (`forward_prefill_batch`) instead of the per-token `forward_step` loop.
+/// Below this the per-token loop wins: the batched path pays a fixed setup cost
+/// (batch scratch alloc + per-row embed copy) that only amortizes once several
+/// positions share each weight read.
+const MIN_PREFILL_BATCH: usize = 8;
 
 /// Zero-sized type marker for the Qwen2 arch.
 pub struct Qwen2;
@@ -126,12 +133,27 @@ impl Qwen2Backend {
 impl SimpleAr for Qwen2Backend {
     fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {
         self.state.reset();
-        // Qwen2's forward_step has no batched prefill — run the prompt one token
-        // at a time (it tracks the KV write slot in state.next_pos). The final
-        // call leaves the next-token logits in state.logits.
-        for &t in tokens {
-            forward_step(gpu, &self.weights, &self.config, &mut self.state, t)
-                .map_err(|e| format!("qwen2 prefill forward_step: {e:?}"))?;
+        // Batched multi-token prefill (mirrors gemma3) reads each weight once for
+        // the whole prompt via batched GEMM / RoPE / causal attention; short
+        // prompts stay on the per-token `forward_step` loop, which tracks the KV
+        // write slot in state.next_pos. Either way the final position's
+        // next-token logits land in state.logits.
+        if tokens.len() >= MIN_PREFILL_BATCH {
+            let start_pos = self.state.next_pos;
+            forward_prefill_batch(
+                gpu,
+                &self.weights,
+                &self.config,
+                &mut self.state,
+                tokens,
+                start_pos,
+            )
+            .map_err(|e| format!("qwen2 prefill forward_prefill_batch: {e:?}"))?;
+        } else {
+            for &t in tokens {
+                forward_step(gpu, &self.weights, &self.config, &mut self.state, t)
+                    .map_err(|e| format!("qwen2 prefill forward_step: {e:?}"))?;
+            }
         }
         Ok(())
     }
