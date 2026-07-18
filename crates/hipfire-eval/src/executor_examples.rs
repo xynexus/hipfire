@@ -1488,6 +1488,21 @@ pub(crate) fn run_examples_qwen35_speed_model(
     let shared_metrics = parse_summary_kv_metrics(&stderr);
     let stdout_hash = stable_hash_bytes(stdout.as_bytes());
     let stderr_hash = stable_hash_bytes(stderr.as_bytes());
+    // The child writes ALL bench output (incl. the SUMMARY/CASE_SUMMARY metric
+    // lines) to stderr; on failure we otherwise keep only stderr_hash, which is
+    // useless for triage. Surface a bounded tail so a single battery run shows
+    // *why* the child emitted no metrics (panic, HIP error, missing deltanet
+    // feature, OOM) instead of forcing a standalone repro hunt.
+    // ponytail: tail only; full stderr stays in the child's own logs.
+    let stderr_tail = {
+        let trimmed = stderr.trim_end();
+        let start = trimmed.len().saturating_sub(1200);
+        trimmed
+            .get(start..)
+            .unwrap_or(trimmed)
+            .trim_start()
+            .to_string()
+    };
 
     for case in cases {
         let mut metrics = base_metrics.clone();
@@ -1524,7 +1539,7 @@ pub(crate) fn run_examples_qwen35_speed_model(
         } else {
             EvalStatus::Fail
         };
-        let reason = if let Some(error) = &baseline_error {
+        let mut reason = if let Some(error) = &baseline_error {
             Some(error.to_string())
         } else if baseline_failed {
             Some("bench_qwen35_speed fell below perf baseline floor".to_string())
@@ -1538,6 +1553,13 @@ pub(crate) fn run_examples_qwen35_speed_model(
         } else {
             None
         };
+        if matches!(status, EvalStatus::Fail) {
+            metrics.insert("stderr_tail".to_string(), json!(stderr_tail.clone()));
+            if !stderr_tail.is_empty() {
+                let base = reason.take().unwrap_or_default();
+                reason = Some(format!("{base} | child stderr tail: {stderr_tail}"));
+            }
+        }
         rows.push(row_for_model(
             BatteryId::Speed,
             None,
