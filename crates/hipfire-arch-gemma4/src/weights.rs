@@ -4,7 +4,7 @@
 
 //! Gemma 4 family-owned core tensor names over the shared loader mechanics.
 
-use crate::config::{FfnPlan, Gemma4Config, KvProducer, ValueProjection};
+use crate::config::{FfnPlan, Gemma4Config, ValueProjection};
 use hip_bridge::HipResult;
 use hipfire_rdna::{Gpu, GpuTensor};
 use hipfire_runtime::hfq::HfqFile;
@@ -50,11 +50,39 @@ pub struct Gemma4DenseLayerWeights {
     pub w_down: WeightTensor,
     /// Source-precision scalar resolved once at load time.
     pub layer_scalar: f32,
+    /// Per-Layer-Embedding merge weights (E2B/E4B); `None` when the model has no PLE
+    /// (`hidden_size_per_layer_input == 0`).
+    pub ple: Option<Gemma4PleLayerWeights>,
+}
+
+/// PLE per-layer merge weights: `h += post_norm(projection(act(gate·h) ⊙ ple[L]))`.
+pub struct Gemma4PleLayerWeights {
+    /// `[ple_dim, hidden]` — hidden → ple_dim gate.
+    pub input_gate: WeightTensor,
+    /// `[hidden, ple_dim]` — ple_dim → hidden projection.
+    pub projection: WeightTensor,
+    /// `[hidden]` RMSNorm.
+    pub post_norm: GpuTensor,
+}
+
+/// PLE model-level weights: the per-layer embedding table + its projection from the
+/// token embedding, computed once per token into `state.per_layer_inputs`.
+pub struct Gemma4PleWeights {
+    /// `[vocab, num_layers * ple_dim]` Q8 embedding table (row-lookup per token).
+    pub embed_per_layer: WeightTensor,
+    /// `[num_layers * ple_dim, hidden]` projection of the token embedding.
+    pub model_projection: WeightTensor,
+    /// `[ple_dim]` RMSNorm over each per-layer slice.
+    pub projection_norm: GpuTensor,
+    pub ple_dim: usize,
+    pub num_layers: usize,
 }
 
 pub struct Gemma4DenseWeights {
     pub core: Gemma4CoreWeights,
     pub layers: Vec<Gemma4DenseLayerWeights>,
+    /// `Some` for E2B/E4B (PLE models); `None` for plain-dense gemma4 (31B).
+    pub ple: Option<Gemma4PleWeights>,
 }
 
 impl Gemma4CoreWeights {
@@ -88,6 +116,16 @@ impl Gemma4DenseWeights {
             layer.w_gate.free_all(gpu);
             layer.w_up.free_all(gpu);
             layer.w_down.free_all(gpu);
+            if let Some(ple) = layer.ple {
+                ple.input_gate.free_all(gpu);
+                ple.projection.free_all(gpu);
+                let _ = gpu.free_tensor(ple.post_norm);
+            }
+        }
+        if let Some(ple) = self.ple {
+            ple.embed_per_layer.free_all(gpu);
+            ple.model_projection.free_all(gpu);
+            let _ = gpu.free_tensor(ple.projection_norm);
         }
     }
 }
@@ -136,15 +174,18 @@ pub fn load_dense_weights(
     gpu: &mut Gpu,
     config: &Gemma4Config,
 ) -> HipResult<Gemma4DenseWeights> {
-    if config.hidden_size_per_layer_input != 0
-        || config.layers.iter().any(|layer| {
-            !matches!(layer.kv_producer, KvProducer::Own)
-                || !matches!(layer.ffn, FfnPlan::Dense { .. })
-        })
-    {
+    // PLE (per-layer embeddings) IS supported (E2B/E4B). KV-sharing and routed
+    // experts (MoE) are not yet — KV-sharing needs a forward branch that skips the
+    // K/V projection + cache write for shared layers and, for shared SWA layers, a
+    // ring-read to reuse the producer's already-written current-token K (see
+    // docs/plans/2026-07-18-gemma4-effective-ple-kvshare.md).
+    if config.layers.iter().any(|layer| {
+        !matches!(layer.kv_producer, crate::config::KvProducer::Own)
+            || !matches!(layer.ffn, FfnPlan::Dense { .. })
+    }) {
         return Err(hip_bridge::HipError::new(
             0,
-            "Gemma 4 dense loader requires no PLE, KV sharing, or routed experts",
+            "Gemma 4 dense loader does not support KV sharing or routed experts (MoE) yet",
         ));
     }
 
@@ -248,9 +289,60 @@ pub fn load_dense_weights(
                 intermediate,
             )?,
             layer_scalar,
+            ple: if config.hidden_size_per_layer_input != 0 {
+                let ple_dim = config.hidden_size_per_layer_input;
+                Some(Gemma4PleLayerWeights {
+                    input_gate: loader.load_weight(
+                        gpu,
+                        &format!("{prefix}.per_layer_input_gate.weight"),
+                        ple_dim,
+                        config.hidden_size,
+                    )?,
+                    projection: loader.load_weight(
+                        gpu,
+                        &format!("{prefix}.per_layer_projection.weight"),
+                        config.hidden_size,
+                        ple_dim,
+                    )?,
+                    post_norm: loader.load_direct_f32(
+                        gpu,
+                        &format!("{prefix}.post_per_layer_input_norm.weight"),
+                        &[config.hidden_size],
+                    )?,
+                })
+            } else {
+                None
+            },
         });
     }
-    Ok(Gemma4DenseWeights { core, layers })
+    let ple = if config.hidden_size_per_layer_input != 0 {
+        let ple_dim = config.hidden_size_per_layer_input;
+        let num_layers = config.layers.len();
+        Some(Gemma4PleWeights {
+            embed_per_layer: loader.load_weight(
+                gpu,
+                "model.language_model.embed_tokens_per_layer.weight",
+                config.vocab_size,
+                num_layers * ple_dim,
+            )?,
+            model_projection: loader.load_weight(
+                gpu,
+                "model.language_model.per_layer_model_projection.weight",
+                num_layers * ple_dim,
+                config.hidden_size,
+            )?,
+            projection_norm: loader.load_direct_f32(
+                gpu,
+                "model.language_model.per_layer_projection_norm.weight",
+                &[ple_dim],
+            )?,
+            ple_dim,
+            num_layers,
+        })
+    } else {
+        None
+    };
+    Ok(Gemma4DenseWeights { core, layers, ple })
 }
 
 #[cfg(test)]

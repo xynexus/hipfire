@@ -5,7 +5,7 @@
 //! Straightforward and lowered dense Gemma 4 decode over shared weights/state.
 
 use crate::config::{AttentionKind, Gemma4Config, RopePlan, ValueProjection};
-use crate::weights::{Gemma4DenseLayerWeights, Gemma4DenseWeights};
+use crate::weights::{Gemma4DenseLayerWeights, Gemma4DenseWeights, Gemma4PleWeights};
 use hip_bridge::{DeviceBuffer, HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
@@ -17,7 +17,7 @@ use hipfire_dispatch::types::DispatchError;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::kv::{KvCache, KvQuantMode};
 use hipfire_runtime::layered_kv::{KvStorageKind, LayeredAttentionScratch, LayeredKvArena};
-use hipfire_runtime::weights::{weight_gemv, EmbeddingFormat};
+use hipfire_runtime::weights::{weight_gemv, EmbeddingFormat, WeightTensor};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default)]
@@ -51,6 +51,15 @@ pub struct Gemma4DenseState {
     kvarn_tiles: Option<GpuTensor>,
     /// FlashAttention partials `[max_q_heads × ceil(max_seq/GROUP) × (2 + head_dim)]`.
     kvarn_flash_partials: Option<GpuTensor>,
+    // ── PLE scratch (Some only for E2B/E4B — hidden_size_per_layer_input != 0) ──
+    /// Per-token per-layer inputs `[num_layers × ple_dim]`, precomputed at embed.
+    per_layer_inputs: Option<GpuTensor>,
+    /// Scratch `[num_layers × ple_dim]` for the model-projection branch at embed.
+    ple_plmp: Option<GpuTensor>,
+    /// Per-layer merge gate scratch `[ple_dim]`.
+    ple_gate: Option<GpuTensor>,
+    /// Per-layer merge projection scratch `[hidden]`.
+    ple_proj: Option<GpuTensor>,
 }
 
 impl Gemma4DenseState {
@@ -103,6 +112,21 @@ impl Gemma4DenseState {
         } else {
             (None, None)
         };
+        // PLE scratch (E2B/E4B): per-layer inputs + the model-projection branch +
+        // per-layer merge gate/projection scratch.
+        let (per_layer_inputs, ple_plmp, ple_gate, ple_proj) =
+            if config.hidden_size_per_layer_input != 0 {
+                let ple_dim = config.hidden_size_per_layer_input;
+                let n = config.layers.len() * ple_dim;
+                (
+                    Some(gpu.alloc_tensor(&[n], DType::F32)?),
+                    Some(gpu.alloc_tensor(&[n], DType::F32)?),
+                    Some(gpu.alloc_tensor(&[ple_dim], DType::F32)?),
+                    Some(gpu.alloc_tensor(&[config.hidden_size], DType::F32)?),
+                )
+            } else {
+                (None, None, None, None)
+            };
         let attention = LayeredAttentionScratch::new(gpu, &plan)?;
         let hidden = config.hidden_size;
         let intermediate = config
@@ -143,6 +167,10 @@ impl Gemma4DenseState {
             pos_buf: gpu.hip.malloc(4)?,
             kvarn_tiles,
             kvarn_flash_partials,
+            per_layer_inputs,
+            ple_plmp,
+            ple_gate,
+            ple_proj,
         })
     }
 
@@ -179,6 +207,10 @@ impl Gemma4DenseState {
             .kvarn_tiles
             .into_iter()
             .chain(self.kvarn_flash_partials)
+            .chain(self.per_layer_inputs)
+            .chain(self.ple_plmp)
+            .chain(self.ple_gate)
+            .chain(self.ple_proj)
         {
             let _ = gpu.free_tensor(tensor);
         }
@@ -616,6 +648,88 @@ fn ffn_finish(
     gpu.add_f32(&state.x, &state.tmp, &state.x)
 }
 
+/// Row-lookup a per-token embedding from a (possibly quantized) `[vocab, dim]`
+/// `WeightTensor`, dispatched on its stored dtype (mirrors `embed_token`).
+fn embed_lookup_weight(
+    gpu: &mut Gpu,
+    wt: &WeightTensor,
+    out: &GpuTensor,
+    token: u32,
+    dim: usize,
+) -> HipResult<()> {
+    match wt.gpu_dtype {
+        DType::Q8_0 => gpu.embedding_lookup_q8(&wt.buf, out, token, dim),
+        DType::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&wt.buf, out, token, dim),
+        DType::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&wt.buf, out, token, dim),
+        DType::F32 => gpu.embedding_lookup(&wt.buf, out, token, dim),
+        other => Err(HipError::new(
+            0,
+            &format!("Gemma 4 PLE embed table dtype {other:?} unsupported"),
+        )),
+    }
+}
+
+/// Precompute the per-token PLE inputs into `state.per_layer_inputs` [num_layers ×
+/// ple_dim] (E2B/E4B). Matches upstream `get_per_layer_inputs` +
+/// `project_per_layer_inputs`:
+///   tokens = embed_tokens_per_layer[t] · sqrt(ple_dim)   (ScaledWordEmbedding)
+///   proj   = per_layer_projection_norm( (per_layer_model_projection · x_embed)·H^-0.5 )
+///   ple    = (proj + tokens) · 2^-0.5
+/// `state.x` must hold the scaled token embedding (i.e. called right after embed_token).
+fn ple_embed_precompute(
+    gpu: &mut Gpu,
+    ple: &Gemma4PleWeights,
+    config: &Gemma4Config,
+    state: &Gemma4DenseState,
+    token: u32,
+) -> HipResult<()> {
+    let ple_dim = ple.ple_dim;
+    let n = ple.num_layers * ple_dim;
+    let pli = state.per_layer_inputs.as_ref().expect("PLE state buffers");
+    let plmp = state.ple_plmp.as_ref().expect("PLE state buffers");
+    embed_lookup_weight(gpu, &ple.embed_per_layer, pli, token, n)?;
+    gpu.scale_f32(pli, (ple_dim as f32).sqrt())?;
+    weight_gemv(gpu, &ple.model_projection, &state.x, plmp)?;
+    gpu.scale_f32(plmp, (config.hidden_size as f32).powf(-0.5))?;
+    gpu.rmsnorm_batched(
+        plmp,
+        &ple.projection_norm,
+        plmp,
+        ple.num_layers,
+        ple_dim,
+        config.rms_norm_eps,
+    )?;
+    gpu.add_f32(pli, plmp, pli)?;
+    gpu.scale_f32(pli, 0.5f32.sqrt())?;
+    Ok(())
+}
+
+/// PLE per-layer merge (E2B/E4B), applied after the FFN residual and before the
+/// `layer_scalar` scale:
+///   h += post_per_layer_input_norm( per_layer_projection( act(input_gate·h) ⊙ ple[L] ) )
+fn ple_merge(
+    gpu: &mut Gpu,
+    ple: &crate::weights::Gemma4PleLayerWeights,
+    config: &Gemma4Config,
+    state: &Gemma4DenseState,
+    layer_idx: usize,
+) -> HipResult<()> {
+    let ple_dim = config.hidden_size_per_layer_input;
+    let gate = state.ple_gate.as_ref().expect("PLE state buffers");
+    let proj = state.ple_proj.as_ref().expect("PLE state buffers");
+    let pli = state.per_layer_inputs.as_ref().expect("PLE state buffers");
+    // gate = gelu_tanh(input_gate · h)  → [ple_dim]
+    weight_gemv(gpu, &ple.input_gate, &state.x, gate)?;
+    gpu.gelu_tanh_f32(gate, gate, ple_dim)?;
+    // gate ⊙ per_layer_inputs[layer_idx]
+    let slice = pli.sub_offset(layer_idx * ple_dim, ple_dim);
+    gpu.mul_f32(gate, &slice, gate)?;
+    // proj = per_layer_projection · gate  → [hidden]; RMSNorm; residual add.
+    weight_gemv(gpu, &ple.projection, gate, proj)?;
+    gpu.rmsnorm_f32(proj, &ple.post_norm, proj, config.rms_norm_eps)?;
+    gpu.add_f32(&state.x, proj, &state.x)
+}
+
 fn finish_logits(
     gpu: &mut Gpu,
     weights: &Gemma4DenseWeights,
@@ -717,6 +831,14 @@ fn run_reference_layer(
         capture_operator(gpu, capture, layer_idx, "post_ffn_norm", &state.tmp)?;
         capture_operator(gpu, capture, layer_idx, "post_ffn_residual", &state.x)?;
     }
+    // PLE per-layer merge (E2B/E4B) — between the FFN residual and the layer_scalar
+    // scale, matching Gemma4TextDecoderLayer.forward.
+    if let Some(ple) = &layer.ple {
+        ple_merge(gpu, ple, config, state, layer_idx)?;
+        if let Some(capture) = capture.as_deref_mut() {
+            capture_operator(gpu, capture, layer_idx, "post_ple", &state.x)?;
+        }
+    }
     gpu.scale_f32(&state.x, layer.layer_scalar)?;
     if let Some(capture) = capture {
         capture_operator(gpu, capture, layer_idx, "layer_output", &state.x)?;
@@ -734,6 +856,9 @@ pub fn forward_step_reference(
 ) -> HipResult<()> {
     let position = state.next_pos();
     embed_token(gpu, weights, config, state, token)?;
+    if let Some(ple) = &weights.ple {
+        ple_embed_precompute(gpu, ple, config, state, token)?;
+    }
     for layer_idx in 0..weights.layers.len() {
         run_reference_layer(
             gpu,

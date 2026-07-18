@@ -104,6 +104,7 @@ fn weights(gpu: &mut Gpu, config: &Gemma4Config) -> Gemma4DenseWeights {
             w_up: weight(gpu, config.intermediate_size, config.hidden_size, seed + 11),
             w_down: weight(gpu, config.hidden_size, config.intermediate_size, seed + 12),
             layer_scalar: if layer_idx == 0 { 0.97 } else { 1.03 },
+            ple: None,
         });
     }
     Gemma4DenseWeights {
@@ -121,6 +122,7 @@ fn weights(gpu: &mut Gpu, config: &Gemma4Config) -> Gemma4DenseWeights {
             tied_lm_head: true,
         },
         layers,
+        ple: None,
     }
 }
 
