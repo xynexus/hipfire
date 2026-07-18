@@ -745,6 +745,16 @@ fn load_weight_tensor(
                 awq_scale: None,
             })
         }
+        // qt 43 = Oq8G256RowPadded: the NPU-only ragged layout the GPU path can't
+        // load. `--format oq8` emits it for tensors with k % 256 != 0 (e.g.
+        // Qwen2-0.5B hidden=896). Re-quantize with HIPFIRE_OQ_RAGGED_Q8=1 so those
+        // fall back to Q8 while the % 256 tensors stay Oq8G256 (qt 35).
+        43 => panic!(
+            "qwen2: weight {name} is Oq8G256RowPadded (qt 43), an NPU-only ragged OQ8 \
+                     layout the GPU loader cannot consume. Re-quantize with \
+                     HIPFIRE_OQ_RAGGED_Q8=1 so ragged (k % 256 != 0) tensors fall back to Q8 \
+                     and the aligned tensors stay Oq8G256 (qt 35)."
+        ),
         qt => panic!(
             "qwen2: unsupported weight quant_type {qt} for {name}. \
                      This loader handles qt ∈ {{1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128), \

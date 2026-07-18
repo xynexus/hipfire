@@ -306,29 +306,34 @@ note = "LFM2 OQ8+ shares OQ8 runtime kernels; calibrated plus artifact quality i
 # Qwen2 (arch 7) gained the OQ loader path: load_weight_tensor now repacks the
 # OQ codes (33/34/35/36/37) via the shared oq4_arch/oq8_arch helpers, so qwen2
 # serves OQ through the same generic dtype-dispatched weight_gemv/weight_gemm
-# kernels as every other simple-AR family. Marked partial pending GPU quality
-# admission (loader + generic kernels are in place; coherence/parity not yet run).
+# kernels as every other simple-AR family. GPU-validated coherent on halo/gfx1151
+# (Qwen2-0.5B-Instruct oq4 W4A4 + oq8 W8A8 both decode correctly). Still `partial`
+# because full eval-battery quality/KLD admission has not been run.
+# CAVEAT: for ragged-hidden models (hidden % 256 != 0, e.g. Qwen2-0.5B hidden=896)
+# plain `--format oq8` emits Oq8G256RowPadded (qt 43), an NPU-only layout the GPU
+# loader rejects; quantize with HIPFIRE_OQ_RAGGED_Q8=1 so ragged tensors fall back
+# to Q8 and the % 256 tensors stay Oq8G256 (qt 35).
 
 [[gate]]
 arch = 7
 quant = "oq4"
 feature = "prefill"
 support = "partial"
-note = "Qwen2 OQ4 W4A4 loads via oq4_arch_load into the generic iu4 GEMM route; quality admission pending"
+note = "Qwen2 OQ4 W4A4 loads via oq4_arch_load into the generic iu4 GEMM route; GPU-validated coherent (Qwen2-0.5B), eval-battery admission pending"
 
 [[gate]]
 arch = 7
 quant = "oq4+"
 feature = "prefill"
 support = "partial"
-note = "Qwen2 OQ4+ W4A8 loads via oq4_to_oq8_combined into the shared int8-activation route; quality admission pending"
+note = "Qwen2 OQ4+ W4A8 loads via oq4_to_oq8_combined into the shared int8-activation route; shares the validated oq4/oq8 loader arms, calibrated quality pending"
 
 [[gate]]
 arch = 7
 quant = "oq8"
 feature = "prefill"
 support = "partial"
-note = "Qwen2 OQ8 W8A8 loads via oq8_combined into the shared iu8 GEMM route; quality admission pending"
+note = "Qwen2 OQ8 W8A8 loads via oq8_combined into the shared iu8 GEMM route; GPU-validated coherent (Qwen2-0.5B), eval-battery admission pending"
 
 [[gate]]
 arch = 7
