@@ -1839,12 +1839,12 @@ where
             let mut inbox = state.batch_inbox.lock().await;
             inbox.insert(
                 req_id.clone(),
-                crate::batch_runner::PendingRequest {
+                crate::batch_runner::ScheduledJob::Text(crate::batch_runner::PendingRequest {
                     spec,
                     worker_key_id: worker_key_id.clone(),
                     tx,
                     resume_position: None,
-                },
+                }),
             );
         }
         // Admit through the ContinuousWorkScheduler (the batch runner's front-end):

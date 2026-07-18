@@ -20,8 +20,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use hipfire_arch_api::ArchRegistry;
-use hipfire_daemon_adapter::DaemonEngine;
-use tokio::sync::{mpsc, Mutex};
+use hipfire_daemon_adapter::{DaemonEngine, EmbedRequest, EmbeddingVector};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::state::SharedState;
 
@@ -107,6 +107,24 @@ enum CycleOutcome {
     Parked(Vec<PendingRequest>),
 }
 
+/// A unit of GPU work admitted to the runner (P5). The runner is the single GPU
+/// executor: it leases a workload from the scheduler and dispatches by variant.
+/// A lease is single-class, so a lease's jobs are all the same variant.
+pub enum ScheduledJob {
+    /// Fused text prefill+decode (the park/resume, preemptible path).
+    Text(PendingRequest),
+    /// A single embedding request. Short; runs to completion (no parking yet).
+    Embed(EmbedJob),
+}
+
+/// An embedding request routed through the runner instead of locking the engine
+/// directly, so it shares the one GPU arbiter (and never races the runner's
+/// engine `take`). The result goes back over a oneshot.
+pub struct EmbedJob {
+    pub req: EmbedRequest,
+    pub tx: oneshot::Sender<Result<Vec<EmbeddingVector>, String>>,
+}
+
 /// Min decode steps a batch runs before it may be preempted (anti-thrash floor).
 fn min_quantum() -> u32 {
     std::env::var("HIPFIRE_SERVER_PREEMPT_MIN_QUANTUM")
@@ -125,8 +143,8 @@ fn preempt_max_depth() -> usize {
         .unwrap_or(4)
 }
 
-/// Registry of in-flight batch-path requests, keyed by request id.
-pub type BatchInbox = Mutex<HashMap<String, PendingRequest>>;
+/// Registry of in-flight runner jobs (any class), keyed by workload id.
+pub type BatchInbox = Mutex<HashMap<String, ScheduledJob>>;
 
 /// Live counters the runner writes and `/health` reads. Field names mirror the
 /// `smoke-server-decode-batch.sh` telemetry contract so the acceptance test can
@@ -384,69 +402,162 @@ async fn batch_runner_loop(state: SharedState) {
             continue;
         }
 
-        // Select the batch to run this iteration: the parked one (resume, no
-        // lease), or a fresh lease from the scheduler front-end.
-        let (batch, running_priority, lease_id): (Vec<PendingRequest>, u8, Option<u64>) =
-            if resume_parked {
-                let (b, pri) = parked.pop().unwrap();
-                (b, pri, None)
-            } else {
-                // Gather window: let concurrent requests accumulate before the
-                // scheduler forms the batch (so a burst coalesces).
-                let wait_ms = batch_wait_ms();
-                if wait_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-                }
-                let lease = {
-                    let mut sched = state.work_scheduler.lock().await;
-                    sched.next_batch(now_ms())
-                };
-                let Some(lease) = lease else {
-                    continue;
-                };
-                let batch: Vec<PendingRequest> = {
-                    let mut inbox = state.batch_inbox.lock().await;
-                    lease
-                        .workloads
-                        .iter()
-                        .filter_map(|w| inbox.remove(&w.id))
-                        .collect()
-                };
-                if batch.is_empty() {
-                    state.work_scheduler.lock().await.complete(lease.lease_id);
-                    continue;
-                }
-                let pri = lease
-                    .workloads
-                    .first()
-                    .map(|w| w.priority)
-                    .unwrap_or(u8::MAX);
-                (batch, pri, Some(lease.lease_id))
+        // Select what to run this iteration: a resumed parked text batch (no
+        // lease), or a fresh lease — which the runner dispatches by class.
+        let dispatch: Dispatch = if resume_parked {
+            let (b, pri) = parked.pop().unwrap();
+            Dispatch::Text {
+                batch: b,
+                running_priority: pri,
+                lease_id: None,
+            }
+        } else {
+            // Gather window: let concurrent requests accumulate before the
+            // scheduler forms the batch (so a burst coalesces).
+            let wait_ms = batch_wait_ms();
+            if wait_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            }
+            let lease = {
+                let mut sched = state.work_scheduler.lock().await;
+                sched.next_batch(now_ms())
             };
-
-        let engine = state.engine.lock().await.take();
-        let Some(mut engine) = engine else {
-            for pending in batch {
-                let _ = pending
-                    .tx
-                    .send(BatchEvent::Error("daemon not running".to_string()));
+            let Some(lease) = lease else {
+                continue;
+            };
+            let jobs: Vec<ScheduledJob> = {
+                let mut inbox = state.batch_inbox.lock().await;
+                lease
+                    .workloads
+                    .iter()
+                    .filter_map(|w| inbox.remove(&w.id))
+                    .collect()
+            };
+            if jobs.is_empty() {
+                state.work_scheduler.lock().await.complete(lease.lease_id);
+                continue;
             }
-            if let Some(id) = lease_id {
-                state.work_scheduler.lock().await.complete(id);
+            let pri = lease
+                .workloads
+                .first()
+                .map(|w| w.priority)
+                .unwrap_or(u8::MAX);
+            // A lease is single-class; split the already-drained jobs by variant
+            // (exactly one side is non-empty) and dispatch accordingly.
+            let (text_jobs, embed_jobs): (Vec<ScheduledJob>, Vec<ScheduledJob>) = jobs
+                .into_iter()
+                .partition(|j| matches!(j, ScheduledJob::Text(_)));
+            if !embed_jobs.is_empty() {
+                let embeds = embed_jobs
+                    .into_iter()
+                    .filter_map(|j| match j {
+                        ScheduledJob::Embed(e) => Some(e),
+                        ScheduledJob::Text(_) => None,
+                    })
+                    .collect();
+                Dispatch::Embed {
+                    jobs: embeds,
+                    lease_id: lease.lease_id,
+                }
+            } else {
+                let batch = text_jobs
+                    .into_iter()
+                    .filter_map(|j| match j {
+                        ScheduledJob::Text(p) => Some(p),
+                        ScheduledJob::Embed(_) => None,
+                    })
+                    .collect();
+                Dispatch::Text {
+                    batch,
+                    running_priority: pri,
+                    lease_id: Some(lease.lease_id),
+                }
             }
-            continue;
         };
-        // Park only while the stack has room (bounds resident VRAM from nested
-        // preemption); at the cap the batch runs to completion instead.
-        let can_park = parked.len() < max_depth;
-        let outcome = run_batch_cycle(&mut engine, &state, batch, running_priority, can_park).await;
-        *state.engine.lock().await = Some(engine);
-        if let Some(id) = lease_id {
-            state.work_scheduler.lock().await.complete(id);
+
+        let mut engine = match state.engine.lock().await.take() {
+            Some(e) => e,
+            None => {
+                let lease_id = dispatch.lease_id();
+                dispatch.fail_all("daemon not running");
+                if let Some(id) = lease_id {
+                    state.work_scheduler.lock().await.complete(id);
+                }
+                continue;
+            }
+        };
+        match dispatch {
+            Dispatch::Text {
+                batch,
+                running_priority,
+                lease_id,
+            } => {
+                // Park only while the stack has room (bounds resident VRAM from
+                // nested preemption); at the cap the batch runs to completion.
+                let can_park = parked.len() < max_depth;
+                let outcome =
+                    run_batch_cycle(&mut engine, &state, batch, running_priority, can_park).await;
+                *state.engine.lock().await = Some(engine);
+                if let Some(id) = lease_id {
+                    state.work_scheduler.lock().await.complete(id);
+                }
+                if let CycleOutcome::Parked(remaining) = outcome {
+                    parked.push((remaining, running_priority));
+                }
+            }
+            Dispatch::Embed { jobs, lease_id } => {
+                run_embed_jobs(&mut engine, jobs).await;
+                *state.engine.lock().await = Some(engine);
+                state.work_scheduler.lock().await.complete(lease_id);
+            }
         }
-        if let CycleOutcome::Parked(remaining) = outcome {
-            parked.push((remaining, running_priority));
+    }
+}
+
+/// What one runner iteration executes. A text batch is park/resume-capable; an
+/// embed batch runs to completion.
+enum Dispatch {
+    Text {
+        batch: Vec<PendingRequest>,
+        running_priority: u8,
+        lease_id: Option<u64>,
+    },
+    Embed {
+        jobs: Vec<EmbedJob>,
+        lease_id: u64,
+    },
+}
+
+impl Dispatch {
+    fn lease_id(&self) -> Option<u64> {
+        match self {
+            Dispatch::Text { lease_id, .. } => *lease_id,
+            Dispatch::Embed { lease_id, .. } => Some(*lease_id),
         }
+    }
+
+    /// Fail every job in this dispatch with `msg` (used when the engine is gone).
+    fn fail_all(self, msg: &str) {
+        match self {
+            Dispatch::Text { batch, .. } => {
+                for p in &batch {
+                    let _ = p.tx.send(BatchEvent::Error(msg.to_string()));
+                }
+            }
+            Dispatch::Embed { jobs, .. } => {
+                for j in jobs {
+                    let _ = j.tx.send(Err(msg.to_string()));
+                }
+            }
+        }
+    }
+}
+
+/// Run each embedding job on the runner-owned engine and return its result.
+async fn run_embed_jobs(engine: &mut DaemonEngine, jobs: Vec<EmbedJob>) {
+    for job in jobs {
+        let result = engine.embed(job.req).await.map_err(|e| e.to_string());
+        let _ = job.tx.send(result);
     }
 }
 

@@ -3,13 +3,26 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
-use hipfire_daemon_adapter::{EmbedRequest, RerankRequest};
+use hipfire_daemon_adapter::{EmbedRequest, EmbeddingVector, RerankRequest};
 use hipfire_model::embedding::EmbeddingInputType;
+use hipfire_scheduler::{
+    server_prefill_batch_enabled, SchedulerPolicyEnv, WorkloadClass, WorkloadResources,
+    WorkloadSpec,
+};
 use serde::Deserialize;
 use serde_json::json;
+use uuid::Uuid;
 
+use crate::batch_runner::{EmbedJob, ScheduledJob};
 use crate::routes::chat::ensure_model_loaded;
 use crate::state::SharedState;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Deserialize)]
 pub struct EmbeddingsRequest {
@@ -77,22 +90,57 @@ pub async fn post_embeddings(
         Ok(loaded) => loaded,
         Err(e) => return server_error(format!("load failed: {e}")),
     };
-    let mut engine_guard = state.engine.lock().await;
-    let Some(engine) = engine_guard.as_mut() else {
-        return server_error("daemon engine unavailable after model load");
+    let req = EmbedRequest {
+        texts,
+        input_type: body.input_type,
+        dims,
+        worker_key_id: loaded.worker_key_id,
     };
-    let embeddings = match engine
-        .embed(EmbedRequest {
-            texts,
-            input_type: body.input_type,
-            dims,
-            worker_key_id: loaded.worker_key_id,
-        })
-        .await
-    {
-        Ok(embeddings) => embeddings,
-        Err(e) => return embedding_error(e.to_string()),
-    };
+
+    // Route through the runner (the one GPU arbiter) when it is active, so embed
+    // shares priority admission with text/image and never races the runner's
+    // engine `take`. Kill switch off (HIPFIRE_SERVER_PREFILL_BATCH=0) falls back
+    // to locking the engine directly.
+    let embeddings: Vec<EmbeddingVector> =
+        if server_prefill_batch_enabled(&SchedulerPolicyEnv::from_pairs(std::env::vars())) {
+            let req_id = Uuid::new_v4().to_string();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            state
+                .batch_inbox
+                .lock()
+                .await
+                .insert(req_id.clone(), ScheduledJob::Embed(EmbedJob { req, tx }));
+            // Embed is its own lease (no coalescing yet): distinct microbatch key,
+            // size 1, Maintenance class. Priority 64 ~ interactive default.
+            let workload = WorkloadSpec::microbatchable(
+                req_id.clone(),
+                WorkloadClass::Maintenance,
+                64,
+                now_ms(),
+                WorkloadResources::default(),
+                format!("embed:{model}"),
+                1,
+            );
+            if let Err(e) = state.work_scheduler.lock().await.enqueue(workload) {
+                state.batch_inbox.lock().await.remove(&req_id);
+                return server_error(format!("scheduler admission: {e}"));
+            }
+            state.prefill_notify.notify_waiters();
+            match rx.await {
+                Ok(Ok(embeddings)) => embeddings,
+                Ok(Err(e)) => return embedding_error(e),
+                Err(_) => return server_error("embed job dropped before completion"),
+            }
+        } else {
+            let mut engine_guard = state.engine.lock().await;
+            let Some(engine) = engine_guard.as_mut() else {
+                return server_error("daemon engine unavailable after model load");
+            };
+            match engine.embed(req).await {
+                Ok(embeddings) => embeddings,
+                Err(e) => return embedding_error(e.to_string()),
+            }
+        };
     let data = embeddings
         .into_iter()
         .map(|item| {
