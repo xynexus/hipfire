@@ -141,12 +141,64 @@ the 8-channel variant allocated cleanly in aiecc (retiring r12's "number of outp
 channel exceeded" as a concern at this shape). Independently: feed-only 837.4 µs vs the
 full GEMM 890.5 µs — stripping *all* compute and activation traffic recovers only **6%**.
 
-So the GEMM runs at **~92% of the achievable feed ceiling**. The limiter sits **upstream
+So the GEMM runs at ~92% of the *weight-path* feed ceiling. The limiter sits **upstream
 of the shim MM2S channels** — DDR/NOC path into the column, or memtile write bandwidth.
 **Which of the two is NOT determined**; the distinguishing test (shim→core direct feed,
-one core/column, bypassing the memtile) was not run. Note this ceiling is ~10.4 GB/s,
-so the ~13–16 GB/s aggregate DDR figure from r12 is **not reachable through this
-dataflow** and should not be used as a target for it.
+one core/column, bypassing the memtile) was not run.
+
+**Aggregate vs weight path — do not conflate them** (this corrects an earlier claim in
+this file that the 13–16 GB/s figure was "not reachable through this dataflow"):
+
+- **Aggregate IS reachable**: the npu1 GEMM measures **14.1 GB/s** (12.71 MB / 899.3 µs).
+- **The weight path alone is NOT**: capped at 10.0–10.4 GB/s across six measured knobs.
+
+Provenance caveat on that 13–16 GB/s figure: both npu1 documents that cite it
+(`r11/README.md:37`, `r12/README.md:19`) source it from **R6, which is aie2p-only**
+(`r14/r14_cache.sh:2`). The value happens to be about right for npu1 aggregate, so this
+is a sourcing problem rather than a wrong number. The highest directly-measured *npu1*
+aggregate in the tree before this work was r12's 11.7 GB/s. Genuinely non-transferable:
+`docs/npu/npu-memory-bandwidth-cache-characterization.md:4` states `Host: halo`, so its
+14.4 GB/s per-stream and 56.5 GB/s aggregate figures are npu2 and must not be applied
+to nix1.
+
+### OPEN: a locality anomaly that could move the GEMM term ~1.5×
+
+Reads are **faster split across buffers than drawn from one region** (reads only; the
+0.13 MB of C writes is excluded, so this is not a direction artifact):
+
+| | read bytes | time | read GB/s |
+|---|---|---|---|
+| `r14_1x2x128_nb128` GEMM (A + W, separate buffers) | 12.58 MB | 899.3 µs | **13.99** |
+| `r132` W-only (8 channels, one contiguous 8 MB region) | 8.39 MB | 809.1 µs | **10.37** |
+
+The GEMM pulls 50% more read bytes at 35% higher read bandwidth than the dedicated feed
+probe. If the ~10.4 GB/s "weight ceiling" is DRAM bank/page locality in the probe rather
+than a real wall, then laying weights across distinct regions could approach ~14 GB/s and
+take the DFlash GEMM term to **~35–39 ms instead of ~51–58 ms**.
+
+Settling measurement (NOT yet run): rebuild the r132 W-only probe with each of the 8
+channels reading a **distinct buffer region**, total held at 8 MB. `> 10.4 GB/s` ⇒ weight
+layout is a live lever and the projection improves materially; `≈ 10.4 GB/s` ⇒ the wall is
+genuine and the GEMM's higher aggregate comes from A and W using independent paths.
+
+**Until that runs, treat 9.4 GB/s and ~51–58 ms as provisional.**
+
+### r14b (activation-fold) — dead as written, not dead in principle
+
+`benchmarks/npu_gemm_tuning/r14b/` folds A into the column shim object to free a channel.
+It fails at **resource/channel allocation**:
+
+```
+aie.mlir:5:13: error: 'aie.tile' op number of input DMA channel exceeded!
+    %c0_0 = aie.tile(0, 2)
+AIECC COMPILATION FAILED
+Error: Resource allocation pipeline failed
+```
+
+Compute tile (0,2) is given 4 inbound objectfifos (`wbc_j0`, `wbc_j1`, `abc_j0`, `abc_j1`);
+an **AIE2 compute tile has 2 inbound DMA channels**. Fixable by joining the paired streams
+memtile-side so each core sees one W fifo and one A fifo — r132 proves that topology
+compiles. Not worth building: r132 already measured that rebalanced condition at +3.4%.
 
 Measured nulls, all non-binding: buffer depth 3 vs 2 = +0.04%; halving MACs = +4%;
 halving activation traffic = +1%. The **activation-stationary restructure was therefore
