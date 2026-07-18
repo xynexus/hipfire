@@ -102,15 +102,24 @@ already have `test_*_npu.py`; re-point them at drafter shapes.
 
 | primitive | kernel | check |
 |---|---|---|
-| projection GEMM (int8 W8A8) | `oq_gemm_design.matmul_npu` per-group G256 | ✅ block-16 int32 bit-exact on halo, all 8 drafter shapes (2026-07-18) |
-| rmsnorm | `build_qwen35_rmsnorm` | parity on `[16, 4096]` |
-| head norm (q/k) | `build_qwen35_headnorm` | parity on `[16, 32/8, 128]` |
-| RoPE | `build_qwen35_rope` | parity, rope_theta 1e7 |
-| SiLU/SwiGLU | `build_qwen35_swiglu` | parity on `[16, 12288]` |
-| softmax | `build_qwen35_softmax` | parity (used by attn) |
+| projection GEMM (int8 W8A8) | `oq_gemm_design.matmul_npu` per-group G256 | ✅ int32 bit-exact, all 8 shapes, halo + nix1 |
+| rmsnorm | `build_qwen35_rmsnorm --hidden-size 4096` | ✅ nix1 PASS (max_rel 0.019) |
+| head norm (q/k) | `build_qwen35_headnorm --n-heads 32 --n-kv-heads 8 --head-dim 128` | ✅ nix1 PASS (Q+K) |
+| RoPE (FULL neox) | `build_qwen3_dflash_rope` (`dflash_rope_bf16.cc`) — NEW | ✅ nix1 PASS (theta 1e7, full head_dim) |
+| SiLU/SwiGLU | `build_qwen35_swiglu --hidden-size 12288` | ✅ nix1 PASS (max_rel 0.022) |
+| softmax | `build_qwen35_softmax --n-heads 32 --ctx-len 48` | ✅ nix1 PASS (max_rel 0.082) |
 
-**Gate B.** Each primitive passes parity vs its Phase-A golden slice at M=16 on
-`accel0`, at rope_theta and eps from the sidecar config.
+**RoPE needed a NEW kernel:** the existing `build_qwen35_rope`/`rope_rotate_bf16.cc`
+is hard-coded to Qwen3.5 partial rotary (`n_rot = head_dim/4`); the DFlash draft
+(Qwen3) rotates the FULL head_dim (neox), so `dflash_rope_bf16.cc` +
+`build_qwen3_dflash_rope.py` + `test_dflash_rope_npu.py` were added (n_rot=head_dim).
+
+**Gate B — PASSED (2026-07-18, nix1 RyzenAI-npu1/aie2).** All primitives pass at
+drafter shapes on device: int8 projection (all 8 shapes int32 bit-exact + ~40 dB
+W8A8), rmsnorm[16,4096], headnorm Q[32×128]/K[8×128], full-neox RoPE (theta 1e7),
+SwiGLU[16,12288], softmax[32h,48ctx]. Primitive builders use the STOCK `~/.venv`
+toolchain (`aie.iron.algorithms.transform`); the int8 projection uses the FORK
+`~/mlir-aie-312` (`@iron.jit`) — two toolchains, both on nix1.
 
 **Projection GEMM validated on device (2026-07-18).** `tools/npu/test_dflash_projection_npu.py`
 runs the TRUE int8 W8A8 projection (per-group G256, `aie::mmul<4,8,8,int8,int8,acc32>`
@@ -121,6 +130,14 @@ float SNR at N≥4096 — kernel proven by the integer check). Toolchain caveat:
 mlir-aie `single_core` `@iron.jit` example WEDGES the firmware (status 8, health-report);
 `oq_gemm_design`'s design is the proven-good one. Recover a wedged NPU with
 `sudo modprobe -r amdxdna && sudo modprobe amdxdna`.
+
+**Also validated on nix1's own NPU (RyzenAI-npu1 / aie2, fw 1.5.5) 2026-07-18:**
+all 8 drafter projections int32 bit-exact + clean **+40 dB W8A8** (nix1 numpy 1.26
+computes the float SNR correctly, unlike halo's numpy 2.x). aie2 supports the same
+`mmul<4,8,8,int8,int8,32>`. So the int8 projection runs on BOTH nix1 (aie2) and halo
+(aie2p) — `oq_gemm_design` auto-detects the arch. Env (nix1): fork toolchain
+`~/mlir-aie-312` (PEANO_INSTALL_DIR + PYTHONPATH=~/mlir-aie-312/install/python, run
+with `~/mlir-aie-312/venv312/bin/python`).
 
 **OQ8 quant decision + evidence (2026-07-18).** The NPU projection is a TRUE int8
 compute path (W8A16 / W8A8), NOT the dequant-to-bf16 that `build_qwen3_oq8_projection`
