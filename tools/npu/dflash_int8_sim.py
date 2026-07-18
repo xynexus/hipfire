@@ -65,6 +65,65 @@ def quant_group_symmetric_int8(x, group, clip_steps=1, min_clip=0.6):
     return q.reshape(orig), scale.reshape(orig[:-1] + (orig[-1] // group,))
 
 
+def quant_group_mixed4(x, group, n_out=3):
+    """Per-group MIXED int4 bulk + sparse int8 overlay — the oq4.25 codec.
+
+    Mirrors `quantize_oq4_mixed_plain` in crates/hipfire-quantize/src/bin/
+    dflash_convert.rs (non-rotated). Returns (codes_int8, scale_per_group) in the
+    SAME representation as quant_group_symmetric_int8: every value is
+    `code * scale`, with codes clamped to +/-7 for the bulk and +/-127 for the
+    n_out overlay slots. That means QLinear consumes it unchanged.
+
+    n_out=3 over a 256-group is 130+2*3 = 136 B/group = 4.25 bits/weight.
+    """
+    orig = x.shape
+    flat = x.reshape(-1, group).astype(np.float32)
+    amax = np.abs(flat).max(axis=1, keepdims=True)
+
+    def sse(scale, limits):
+        q = np.clip(np.round(flat / scale), -limits, limits)
+        return ((flat - q * scale) ** 2).sum(axis=1, keepdims=True)
+
+    def clipsearch(grid, limits, seed):
+        best_s = seed.copy()
+        best_e = sse(best_s, limits)
+        for c in grid:
+            s = np.maximum(c * amax / 7.0, 1e-12)
+            e = sse(s, limits)
+            better = e < best_e
+            best_e = np.where(better, e, best_e)
+            best_s = np.where(better, s, best_s)
+        return best_s
+
+    def overlay_limits(scale):
+        """Pick the n_out highest int8-upgrade-gain slots; return a per-element
+        clamp limit array (127 at overlay slots, 7 elsewhere)."""
+        q4 = np.clip(np.round(flat / scale), -7, 7)
+        q8 = np.clip(np.round(flat / scale), -127, 127)
+        e4 = (flat - q4 * scale) ** 2
+        e8 = (flat - q8 * scale) ** 2
+        gain = e4 - e8
+        idx = np.argpartition(-gain, n_out - 1, axis=1)[:, :n_out]
+        limits = np.full(flat.shape, 7.0, dtype=np.float32)
+        np.put_along_axis(limits, idx, 127.0, axis=1)
+        return limits
+
+    # int4-only clip-search, then two rounds of (pick overlays -> refit scale),
+    # matching the Rust mixed_clipsearch_plain exactly.
+    grid4 = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6]
+    grid_mixed = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65,
+                  0.6, 0.55, 0.5, 0.45, 0.4, 0.35]
+    seed = np.where(amax > 0, amax / 7.0, 1.0)
+    s = clipsearch(grid4, 7.0, seed)
+    for _ in range(2):
+        lim = overlay_limits(s)
+        s = clipsearch(grid_mixed, lim, s)
+    limits = overlay_limits(s)
+
+    q = np.clip(np.round(flat / s), -limits, limits).astype(np.int8)
+    return q.reshape(orig), s.reshape(orig[:-1] + (orig[-1] // group,))
+
+
 def dequant_group(q, scale, group):
     orig = q.shape
     flat = q.reshape(-1, group).astype(np.float32)
@@ -73,12 +132,21 @@ def dequant_group(q, scale, group):
 
 
 class QLinear:
-    """int8-weight linear. mode 'w8a16' (f32 act) or 'w8a8' (int8 act fold)."""
+    """Quantized-weight linear. Activation path: 'w8a16' (f32) or 'w8a8' (int8).
 
-    def __init__(self, W, group, clip_steps):
+    `wq` selects the WEIGHT codec: None => symmetric int8 (8 b/w), or an int
+    n_out => mixed int4 bulk + n_out int8 overlays (4.0625 + n_out/16 b/w).
+    Both yield (int8 codes, per-group scale), so the activation paths below are
+    identical either way.
+    """
+
+    def __init__(self, W, group, clip_steps, wq=None):
         # W: [out, in]; quantize along `in` (the contraction dim, grouped).
         self.group = group
-        self.qW, self.sW = quant_group_symmetric_int8(W, group, clip_steps)
+        if wq is None:
+            self.qW, self.sW = quant_group_symmetric_int8(W, group, clip_steps)
+        else:
+            self.qW, self.sW = quant_group_mixed4(W, group, n_out=wq)
         self.W_deq = dequant_group(self.qW, self.sW, group)  # [out,in]
         self.n_groups = W.shape[1] // group
 
@@ -107,13 +175,17 @@ def run_forward(meta, inp, W, group, mode, clip_steps):
     B, L, NE = meta["block_size"], meta["ctx_len"], meta["num_extract"]
     scaling = HD ** -0.5
     noise, th, pos_q, pos_k = inp
-    act_steps = clip_steps if mode == "w8a8" else 1
+    # int8 activations whenever the mode ends in a8 (w8a8 / mixed4a8).
+    act8 = mode.endswith("a8")
+    act_steps = clip_steps if act8 else 1
+    # mixed4* modes use the 4.25 b/w weight codec (3 overlays per 256-group).
+    wq = 3 if mode.startswith("mixed4") else None
 
     def proj(name):
-        return QLinear(W[name], group, clip_steps)
+        return QLinear(W[name], group, clip_steps, wq=wq)
 
     def apply(ql, x):
-        return ql.w8a16(x) if mode == "w8a16" else ql.w8a8(x, act_steps)
+        return ql.w8a8(x, act_steps) if act8 else ql.w8a16(x)
 
     fc = proj("fc.weight")
     thp = apply(fc, th.reshape(L, NE * H))
@@ -167,7 +239,9 @@ def main():
     ap.add_argument("--ref-dir", required=True)
     ap.add_argument("--weights", required=True)
     ap.add_argument("--group", type=int, default=256)
-    ap.add_argument("--mode", choices=["w8a16", "w8a8", "both"], default="both")
+    ap.add_argument("--mode",
+                    choices=["w8a16", "w8a8", "mixed4a16", "mixed4a8", "both", "all"],
+                    default="both")
     ap.add_argument("--clip-steps", type=int, default=24)
     args = ap.parse_args()
 
@@ -181,7 +255,12 @@ def main():
     golden = np.load(os.path.join(rd, "golden", "final_block_hidden.npy"))
     W = R.load_safetensors_f32(args.weights)
 
-    modes = ["w8a16", "w8a8"] if args.mode == "both" else [args.mode]
+    if args.mode == "both":
+        modes = ["w8a16", "w8a8"]
+    elif args.mode == "all":
+        modes = ["w8a16", "w8a8", "mixed4a16", "mixed4a8"]
+    else:
+        modes = [args.mode]
     print(f"[int8-sim] group={args.group} clip_steps={args.clip_steps} "
           f"vs golden final rms={np.sqrt((golden**2).mean()):.4f}")
     for mode in modes:
@@ -192,7 +271,7 @@ def main():
                     (np.linalg.norm(final) * np.linalg.norm(golden)))
         # signal-to-noise in dB relative to golden energy
         snr = 10 * np.log10((golden ** 2).sum() / ((final - golden) ** 2).sum())
-        print(f"  {mode:6s} max_abs={d.max():.4e} mean_abs={d.mean():.4e} "
+        print(f"  {mode:10s} max_abs={d.max():.4e} mean_abs={d.mean():.4e} "
               f"max_rel={(d/denom).max():.3e} cos={cos:.6f} SNR={snr:.2f}dB")
 
 
