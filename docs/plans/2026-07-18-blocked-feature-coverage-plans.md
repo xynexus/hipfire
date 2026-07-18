@@ -81,10 +81,12 @@ quant path in `LayeredKvArena` to simply call.
    via `KvCache::new_gpu_q8_capped` / `new_gpu_kvarn_capped(.., bits)` instead of
    `new_gpu_capped_filtered`. Store the per-group `KvQuantMode` on the arena.
 2. **Make store/view/attend quant-aware.** This is the hard part: `store_f32` and the
-   attention read must dispatch on the group's storage dtype. Q8 is the tractable
-   first tier (per-group q8 store + q8 attend kernels already exist for the plain
-   `KvCache` path used by qwen3.5/gemma3). KVarN is harder (block-record + window ring
-   layout — mirror the kvarn_attend path). **Scope tier 1 = Q8 only**, defer KVarN.
+   attention read must dispatch on the group's storage dtype. **Target the KVarN tier**
+   (variance-normalized K + Q8 V, block-record + window ring — mirror the kvarn_attend
+   path), NOT plain Q8 KV: Q8 (weight and KV) is being deprecated per the 2026-07-18
+   directive (see memory `project_mq_q8_deprecation`), so Q8-KV wiring here would be
+   throwaway. KVarN is the harder path but the go-forward one; reuse the qwen3.5/gemma3
+   kvarn store/attend kernels and the 082ee3da4 batched-prefill kvarn fix.
 3. **Plumb gemma4:** add `gemma4_kv_mode` (mirror `gemma3_kv_mode` load.rs:310), thread
    `options.kv_mode` at arch.rs:290 into `Gemma4DenseState::new` (forward.rs:50) →
    `LayeredKvArena::new_quant`.
@@ -92,13 +94,14 @@ quant path in `LayeredKvArena` to simply call.
    confirm the fp32 default is untouched and only the new `new_quant` opt-in changes
    behavior. head_dim 256 → later kvarn tier needs no new rotation kernel.
 5. **Validate:** gemma4 DOES serve. Use a small on-disk variant (gemma-4-E2B / E4B),
-   quantize (e.g. oq8), `HIPFIRE_KV_MODE=q8 hipfire chat` coherence vs fp32-KV.
+   quantize with an OQ format, `HIPFIRE_KV_MODE=kvarn hipfire chat` coherence vs fp32-KV.
 
 ### Risk / unknowns
-Medium. Shared-infra change (`LayeredKvArena`) that gemma3 may also ride → needs
-GPU-validation on both. Q8-only tier keeps it bounded; KVarN-through-layered-arena is a
-separate follow-up (the same block-record-layout hazard as the qwen3.5 kvarn batched
--prefill OOB fix, 082ee3da4).
+Medium-large. Shared-infra change (`LayeredKvArena`) that gemma3 may also ride → needs
+GPU-validation on both. Targeting KVarN (not the deprecated Q8) raises the difficulty:
+the block-record + window-ring layout is the same hazard as the qwen3.5 kvarn
+batched-prefill OOB fix (082ee3da4), so port that store/attend carefully into the
+layered arena.
 
 ---
 
