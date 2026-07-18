@@ -75,7 +75,16 @@ pub fn generate_registered_backend(
     let strip_think = loaded.profile.eos_filter.strip_think.unwrap_or(false);
     let output_protocol = loaded.profile.output_protocol;
     let framed = if raw {
-        prompt.to_string()
+        // Base models (raw, no chat template) still need the model's mandatory
+        // leading BOS — e.g. gemma requires `<bos>` or next-token prediction
+        // degrades badly. The tokenizer's `encode` recognizes the special-token
+        // text but never auto-prepends it, and the instruction-tuned path only
+        // gets BOS via the jinja template. Prepend it here when the profile
+        // declares one (no-op for models without a `bos_token`).
+        match bos_token {
+            Some(bos) if !prompt.starts_with(bos) => format!("{bos}{prompt}"),
+            _ => prompt.to_string(),
+        }
     } else if let Some(template) = m.chat_template.as_deref() {
         let frame = prompt_frame::JinjaChatFrame {
             tokenizer,

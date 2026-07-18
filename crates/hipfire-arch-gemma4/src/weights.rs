@@ -167,8 +167,8 @@ pub fn load_core_weights(
 }
 
 /// Load the resident dense decoder used by the Phase 4 reference/lowered
-/// forward and Phase 5 31B bring-up. PLE, sharing, and routed experts remain
-/// explicit later-phase paths rather than optional fields on this structure.
+/// forward and Phase 5 31B bring-up. PLE (E2B/E4B per-layer embeddings) and KV
+/// sharing ARE supported; routed experts (MoE) remain an explicit later phase.
 pub fn load_dense_weights(
     hfq: &mut HfqFile,
     gpu: &mut Gpu,
@@ -179,13 +179,14 @@ pub fn load_dense_weights(
     // prediction degrades — see docs/plans/2026-07-18-gemma4-effective-ple-kvshare.md),
     // so KV-sharing stays gated until that is isolated + fixed. Routed experts (MoE)
     // are not yet supported. Flip this to enable E2B/E4B once coherence is fixed.
-    if config.layers.iter().any(|layer| {
-        !matches!(layer.kv_producer, crate::config::KvProducer::Own)
-            || !matches!(layer.ffn, FfnPlan::Dense { .. })
-    }) {
+    if config
+        .layers
+        .iter()
+        .any(|layer| !matches!(layer.ffn, FfnPlan::Dense { .. }))
+    {
         return Err(hip_bridge::HipError::new(
             0,
-            "Gemma 4 dense loader: KV sharing pending a coherence fix; MoE unsupported",
+            "Gemma 4 dense loader does not support routed experts (MoE) yet",
         ));
     }
 

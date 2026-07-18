@@ -109,7 +109,27 @@ plmp_scratch [8960] scratch. ple_dim/num_layers from config.
       committed branch (PLE at e118d49ec) still rejects KV-share so nothing serves garbage.
 - [ ] then: HIPFIRE_KV_MODE=kvarn end-to-end (needs kvarn-on-shared-layer attend-only).
 
-## Coherence-bug isolation (2026-07-18, in progress)
+## RESOLVED (2026-07-19): root cause = MISSING BOS in the raw prompt path
+The E2B coherence bug was NOT in PLE/KV-share/attention — those are all correct. It was
+that base gemma4 models (raw path, no chat template) never got the mandatory leading
+`<bos>`: `generate_arch.rs` raw branch used `prompt.to_string()` and the tokenizer's
+`encode` never auto-prepends BOS (instruction-tuned models get it via the jinja template,
+which is why gemma3-it worked). Gemma is extremely BOS-sensitive → without it the model
+copies recent tokens. FIX: prepend `profile.bos_token` in the raw branch (generate_arch.rs).
+VALIDATED via the HF reference on duat (transformers 5.8, /home/sadara/.venv):
+- Before fix: hipfire post-embed vs HF `cos=0.115` (it embedded the wrong token — the
+  stream was `[The,opposite,of,hot,is]` with no bos; the "extra hot" was the generated tok).
+- After fix: token stream `[2(bos),818,...,563]`, per-layer hidden matches HF at
+  cos 0.9997-1.0000 for L0..L33 (tiny gap = oq8 vs bf16; L34 0.18 = final-norm alignment
+  artifact, prediction is correct). Predicts " cold" for "opposite of hot is",
+  " west" for "...sets in the". E2B/E4B now serve coherently (fp32 KV).
+Debug harness kept (behind env flags): HIPFIRE_GEMMA4_DEBUG_NORMS (per-layer |x| + token
+log), HIPFIRE_GEMMA4_DUMP_HS + _POS (per-layer hidden dump for the HF cosine diff). The
+duat reference scripts: /tmp/e2b_ref.py, e2b_hs.py, cmp.py, emb.py.
+Remaining follow-ups: kvarn-on-E2B (shared-layer attend-only; fp32 works now) + the
+lowered superop path (reference path is forced for PLE/KV-share).
+
+## Coherence-bug isolation (2026-07-18 — SUPERSEDED by the resolution above)
 Symptom: E2B loads + fluent; correct short pattern completion (`1..7`→`8 9 10 11`) but
 semantic next-token prediction COPIES a recent token (`opposite of hot is`→`hot`,
 `sets in the`→`east`, `red, violets are`→`red`). Present at the FIRST generated token

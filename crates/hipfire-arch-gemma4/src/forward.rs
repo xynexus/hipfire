@@ -251,6 +251,36 @@ impl Gemma4DenseState {
     }
 }
 
+/// Debug: append `[i32 tag][f32 × n]` for the hidden state to
+/// `HIPFIRE_GEMMA4_DUMP_HS` when `position == HIPFIRE_GEMMA4_DUMP_POS` (tag = layer
+/// index, or -1 for the post-embed vector). For the HF per-layer cosine diff.
+fn dump_hs(gpu: &mut Gpu, x: &GpuTensor, tag: i32, position: usize) {
+    let (Ok(path), Ok(dp)) = (
+        std::env::var("HIPFIRE_GEMMA4_DUMP_HS"),
+        std::env::var("HIPFIRE_GEMMA4_DUMP_POS"),
+    ) else {
+        return;
+    };
+    if dp.parse::<usize>() != Ok(position) {
+        return;
+    }
+    if let Ok(h) = gpu.download_f32(x) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = f.write_all(&tag.to_le_bytes());
+            let mut buf = Vec::with_capacity(h.len() * 4);
+            for v in &h {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            let _ = f.write_all(&buf);
+        }
+    }
+}
+
 fn set_position(gpu: &Gpu, state: &Gemma4DenseState, position: usize) -> HipResult<()> {
     let position =
         i32::try_from(position).map_err(|_| HipError::new(0, "Gemma 4 position exceeds i32"))?;
@@ -938,6 +968,7 @@ fn run_reference_layer(
             );
         }
     }
+    dump_hs(gpu, &state.x, layer_idx as i32, position);
     if let Some(capture) = capture {
         capture_operator(gpu, capture, layer_idx, "layer_output", &state.x)?;
     }
@@ -953,10 +984,14 @@ pub fn forward_step_reference(
     mut capture: Option<&mut Gemma4ForwardCapture>,
 ) -> HipResult<()> {
     let position = state.next_pos();
+    if std::env::var("HIPFIRE_GEMMA4_DEBUG_NORMS").is_ok() {
+        eprintln!("[g4tok] pos={position} token={token}");
+    }
     embed_token(gpu, weights, config, state, token)?;
     if let Some(ple) = &weights.ple {
         ple_embed_precompute(gpu, ple, config, state, token)?;
     }
+    dump_hs(gpu, &state.x, -1, position);
     for layer_idx in 0..weights.layers.len() {
         run_reference_layer(
             gpu,
