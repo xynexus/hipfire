@@ -174,18 +174,18 @@ pub fn load_dense_weights(
     gpu: &mut Gpu,
     config: &Gemma4Config,
 ) -> HipResult<Gemma4DenseWeights> {
-    // PLE (per-layer embeddings) IS supported (E2B/E4B). KV-sharing and routed
-    // experts (MoE) are not yet — KV-sharing needs a forward branch that skips the
-    // K/V projection + cache write for shared layers and, for shared SWA layers, a
-    // ring-read to reuse the producer's already-written current-token K (see
-    // docs/plans/2026-07-18-gemma4-effective-ple-kvshare.md).
+    // PLE (per-layer embeddings) IS supported (E2B/E4B). The KV-sharing forward is
+    // implemented too, but E2B currently has a coherence bug (semantic next-token
+    // prediction degrades — see docs/plans/2026-07-18-gemma4-effective-ple-kvshare.md),
+    // so KV-sharing stays gated until that is isolated + fixed. Routed experts (MoE)
+    // are not yet supported. Flip this to enable E2B/E4B once coherence is fixed.
     if config.layers.iter().any(|layer| {
         !matches!(layer.kv_producer, crate::config::KvProducer::Own)
             || !matches!(layer.ffn, FfnPlan::Dense { .. })
     }) {
         return Err(hip_bridge::HipError::new(
             0,
-            "Gemma 4 dense loader does not support KV sharing or routed experts (MoE) yet",
+            "Gemma 4 dense loader: KV sharing pending a coherence fix; MoE unsupported",
         ));
     }
 
@@ -318,7 +318,7 @@ pub fn load_dense_weights(
     let ple = if config.hidden_size_per_layer_input != 0 {
         let ple_dim = config.hidden_size_per_layer_input;
         let num_layers = config.layers.len();
-        Some(Gemma4PleWeights {
+        let p = Gemma4PleWeights {
             embed_per_layer: loader.load_weight(
                 gpu,
                 "model.language_model.embed_tokens_per_layer.weight",
@@ -338,7 +338,8 @@ pub fn load_dense_weights(
             )?,
             ple_dim,
             num_layers,
-        })
+        };
+        Some(p)
     } else {
         None
     };

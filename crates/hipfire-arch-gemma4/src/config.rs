@@ -309,7 +309,8 @@ impl Gemma4Config {
                     },
                 ),
             };
-            let kv_producer = if layer_idx >= shared_start {
+            let is_shared = layer_idx >= shared_start;
+            let kv_producer = if is_shared {
                 KvProducer::SharedFrom {
                     producer_layer: last_owned[slot].ok_or_else(|| {
                         format!(
@@ -321,13 +322,23 @@ impl Gemma4Config {
                 last_owned[slot] = Some(layer_idx);
                 KvProducer::Own
             };
+            // `use_double_wide_mlp`: the KV-shared tail layers double their dense MLP
+            // intermediate (E2B/E4B: 6144 → 12288) to offset the shared KV.
+            let layer_ffn = match ffn {
+                FfnPlan::Dense { intermediate } if use_double_wide_mlp && is_shared => {
+                    FfnPlan::Dense {
+                        intermediate: intermediate * 2,
+                    }
+                }
+                other => other,
+            };
             layers.push(Gemma4LayerPlan {
                 kind,
                 attention,
                 rope,
                 value_projection,
                 kv_producer,
-                ffn,
+                ffn: layer_ffn,
             });
         }
 

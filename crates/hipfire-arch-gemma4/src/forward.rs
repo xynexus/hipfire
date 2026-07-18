@@ -4,7 +4,7 @@
 
 //! Straightforward and lowered dense Gemma 4 decode over shared weights/state.
 
-use crate::config::{AttentionKind, Gemma4Config, RopePlan, ValueProjection};
+use crate::config::{AttentionKind, Gemma4Config, KvProducer, RopePlan, ValueProjection};
 use crate::weights::{Gemma4DenseLayerWeights, Gemma4DenseWeights, Gemma4PleWeights};
 use hip_bridge::{DeviceBuffer, HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
@@ -60,6 +60,11 @@ pub struct Gemma4DenseState {
     ple_gate: Option<GpuTensor>,
     /// Per-layer merge projection scratch `[hidden]`.
     ple_proj: Option<GpuTensor>,
+    // ── KV-sharing (E2B/E4B): producer layers save their post-RoPE K/V here so
+    // later same-type shared layers reuse it. `Some` per producer (Own) layer when
+    // the model has any shared layer; all `None` otherwise (no overhead). ──
+    kv_share_saved_k: Vec<Option<GpuTensor>>,
+    kv_share_saved_v: Vec<Option<GpuTensor>>,
 }
 
 impl Gemma4DenseState {
@@ -95,7 +100,14 @@ impl Gemma4DenseState {
             .fold((0usize, 0usize, 0usize), |(kw, qh, _), spec| {
                 (kw.max(spec.kv_width()), qh.max(spec.q_heads), spec.head_dim)
             });
-        let kv_kvarn = matches!(kv_mode, KvQuantMode::Kvarn) && max_kv_width > 0;
+        // KVarN on a KV-shared global layer (attend-only against the producer's
+        // kvarn cache) is a follow-up, so models with KV-sharing (E2B/E4B) stay fp32
+        // KV for now even when kv_mode=kvarn. Non-shared gemma4 (31B) is unaffected.
+        let has_kv_share = config
+            .layers
+            .iter()
+            .any(|l| !matches!(l.kv_producer, KvProducer::Own));
+        let kv_kvarn = matches!(kv_mode, KvQuantMode::Kvarn) && max_kv_width > 0 && !has_kv_share;
         let kv = if kv_kvarn {
             LayeredKvArena::new_kvarn(gpu, plan.clone(), kvarn_bits)?
         } else {
@@ -127,6 +139,23 @@ impl Gemma4DenseState {
             } else {
                 (None, None, None, None)
             };
+        // KV-sharing save buffers: one post-RoPE K/V slot per producer (Own) layer,
+        // sized to that layer's kv_width; only when the model actually has shared
+        // layers (E2B/E4B) — plain-dense gemma4 allocates none.
+        let (mut kv_share_saved_k, mut kv_share_saved_v) = (
+            Vec::with_capacity(config.layers.len()),
+            Vec::with_capacity(config.layers.len()),
+        );
+        for l in &config.layers {
+            if has_kv_share && matches!(l.kv_producer, KvProducer::Own) {
+                let w = l.attention.kv_heads * l.attention.head_dim;
+                kv_share_saved_k.push(Some(gpu.alloc_tensor(&[w], DType::F32)?));
+                kv_share_saved_v.push(Some(gpu.alloc_tensor(&[w], DType::F32)?));
+            } else {
+                kv_share_saved_k.push(None);
+                kv_share_saved_v.push(None);
+            }
+        }
         let attention = LayeredAttentionScratch::new(gpu, &plan)?;
         let hidden = config.hidden_size;
         let intermediate = config
@@ -171,6 +200,8 @@ impl Gemma4DenseState {
             ple_plmp,
             ple_gate,
             ple_proj,
+            kv_share_saved_k,
+            kv_share_saved_v,
         })
     }
 
@@ -211,6 +242,8 @@ impl Gemma4DenseState {
             .chain(self.ple_plmp)
             .chain(self.ple_gate)
             .chain(self.ple_proj)
+            .chain(self.kv_share_saved_k.into_iter().flatten())
+            .chain(self.kv_share_saved_v.into_iter().flatten())
         {
             let _ = gpu.free_tensor(tensor);
         }
@@ -395,6 +428,34 @@ fn attention_block(
         capture_operator(gpu, capture, layer_idx, "k_rope", &scratch.k)?;
     }
 
+    // KV-sharing (E2B/E4B): a producer (Own) layer saves its final post-RoPE K/V; a
+    // shared layer discards its own (K/V projected from ITS hidden state, which is
+    // wrong) and reuses the producer's saved K/V — matching upstream's
+    // `key_states = shared_kv_states[layer_type]`. The Q path is unchanged.
+    let kv_bytes = kv_width * std::mem::size_of::<f32>();
+    let is_shared = !matches!(plan.kv_producer, KvProducer::Own);
+    match plan.kv_producer {
+        KvProducer::Own => {
+            if let (Some(sk), Some(sv)) = (
+                state.kv_share_saved_k[layer_idx].as_ref(),
+                state.kv_share_saved_v[layer_idx].as_ref(),
+            ) {
+                gpu.copy_d2d(&scratch.k, sk, kv_bytes)?;
+                gpu.copy_d2d(&scratch.v, sv, kv_bytes)?;
+            }
+        }
+        KvProducer::SharedFrom { producer_layer } => {
+            let sk = state.kv_share_saved_k[producer_layer]
+                .as_ref()
+                .expect("gemma4 KV-share: producer K not saved");
+            let sv = state.kv_share_saved_v[producer_layer]
+                .as_ref()
+                .expect("gemma4 KV-share: producer V not saved");
+            gpu.copy_d2d(sk, &scratch.k, kv_bytes)?;
+            gpu.copy_d2d(sv, &scratch.v, kv_bytes)?;
+        }
+    }
+
     let cache = state
         .kv
         .view(layer_idx, position)
@@ -467,32 +528,46 @@ fn attention_block(
                 1,
                 1.0 / (geometry.head_dim as f32).sqrt(),
             )?;
-            for kv_head in 0..geometry.kv_heads {
-                gpu.swa_ring_write_batched_f32(
-                    &scratch
-                        .k
-                        .sub_offset(kv_head * geometry.head_dim, geometry.head_dim),
-                    &cache.k.sub_offset(kv_head * head_window, head_window),
-                    1,
-                    geometry.head_dim as i32,
-                    window as i32,
-                    position as i32,
-                    1,
-                )?;
-                gpu.swa_ring_write_batched_f32(
-                    &scratch
-                        .v
-                        .sub_offset(kv_head * geometry.head_dim, geometry.head_dim),
-                    &cache.v.sub_offset(kv_head * head_window, head_window),
-                    1,
-                    geometry.head_dim as i32,
-                    window as i32,
-                    position as i32,
-                    1,
-                )?;
+            // A shared SWA layer must NOT write into the producer's ring — the
+            // producer already wrote this position; staging above re-injected the
+            // producer's saved K/V, so the read is correct without a write.
+            if !is_shared {
+                for kv_head in 0..geometry.kv_heads {
+                    gpu.swa_ring_write_batched_f32(
+                        &scratch
+                            .k
+                            .sub_offset(kv_head * geometry.head_dim, geometry.head_dim),
+                        &cache.k.sub_offset(kv_head * head_window, head_window),
+                        1,
+                        geometry.head_dim as i32,
+                        window as i32,
+                        position as i32,
+                        1,
+                    )?;
+                    gpu.swa_ring_write_batched_f32(
+                        &scratch
+                            .v
+                            .sub_offset(kv_head * geometry.head_dim, geometry.head_dim),
+                        &cache.v.sub_offset(kv_head * head_window, head_window),
+                        1,
+                        geometry.head_dim as i32,
+                        window as i32,
+                        position as i32,
+                        1,
+                    )?;
+                }
             }
         }
         KvStorageKind::Full if cache.quant_kvarn => {
+            // KVarN on a KV-shared global layer (attend-only against the producer's
+            // kvarn cache) is a follow-up; kvarn_attend here would write into the
+            // producer's cache. Not reached under fp32 KV (kv_mode default).
+            if is_shared {
+                return Err(HipError::new(
+                    0,
+                    "gemma4 KVarN on KV-shared layers is not yet supported (use fp32 KV)",
+                ));
+            }
             // KVarN (variance-normalized bits-bit K + Q8 V) fused write+attend for
             // the global/full-context layers, n=1 (decode + per-token prefill). Local
             // sliding-window layers stay F32 (the arm above). Mirrors gemma3's KVarN
@@ -546,8 +621,12 @@ fn attention_block(
         }
         KvStorageKind::Full => {
             set_position(gpu, state, cache.physical_position)?;
-            gpu.kv_cache_write(cache.k, &scratch.k, &state.pos_buf, kv_width)?;
-            gpu.kv_cache_write(cache.v, &scratch.v, &state.pos_buf, kv_width)?;
+            // A shared global layer reads the producer's full cache (which already
+            // holds this position) — no write of its own.
+            if !is_shared {
+                gpu.kv_cache_write(cache.k, &scratch.k, &state.pos_buf, kv_width)?;
+                gpu.kv_cache_write(cache.v, &scratch.v, &state.pos_buf, kv_width)?;
+            }
             if let Some(capture) = capture.as_deref_mut() {
                 let context_elements = cache.visible_positions.len() * kv_width;
                 capture_operator(
@@ -1349,11 +1428,19 @@ pub fn forward_step(
     lowered: &LoweredForward,
     token: u32,
 ) -> HipResult<()> {
-    if std::env::var("HIPFIRE_GEMMA4_FORWARD_ORACLE")
+    // PLE + KV-sharing are implemented only on the reference forward so far, so
+    // E2B/E4B must use it regardless of the oracle env; the lowered superop program
+    // is a follow-up. Plain-dense gemma4 (31B) still defaults to lowered.
+    let needs_reference = weights.ple.is_some()
+        || config
+            .layers
+            .iter()
+            .any(|l| !matches!(l.kv_producer, KvProducer::Own));
+    let oracle = std::env::var("HIPFIRE_GEMMA4_FORWARD_ORACLE")
         .ok()
         .as_deref()
-        == Some("1")
-    {
+        == Some("1");
+    if oracle || needs_reference {
         forward_step_reference(gpu, weights, config, state, token, None)
     } else {
         forward_step_lowered(gpu, weights, config, state, lowered, token, None)

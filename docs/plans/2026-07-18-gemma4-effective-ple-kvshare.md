@@ -88,9 +88,26 @@ plmp_scratch [8960] scratch. ple_dim/num_layers from config.
         on swa_visibility_stage that stages purely from the ring. (a) is least invasive.
       - Mirror the KV-share branch into the lowered superop attend (forward.rs run_attend).
       - Then flip the reject to also allow KV-share.
-- [ ] validate: quantize E2B done (scratchpad/gemma-4-E2B.oq8.hfq) →
-      HIPFIRE_GEMMA4_FORWARD_ORACLE=1 chat, fp32-KV coherence, then HIPFIRE_KV_MODE=kvarn
-      (exercises the head_dim-512 kvarn kernel end-to-end — the original goal).
+- [x] KV-share forward IMPLEMENTED (no new kernel): producer (Own) layers save their
+      post-RoPE K/V (contiguous copy_d2d); shared layers restore it + skip wk/wv-write.
+      SWA-shared re-inject into staging; Full-shared attend the producer cache. reject
+      flipped to allow KV-share; `forward_step` forces the reference path for PLE/KV-share
+      models; `use_double_wide_mlp` handled (shared layers 15-34 → intermediate 12288).
+      kvarn-on-shared guarded (fp32 forced for KV-share models) — that's a follow-up.
+- [~] **E2B LOADS + SERVES (fp32 KV) — but COHERENCE BUG (uncommitted, off-branch).**
+      Loads fully (PLE + KV-share + double-wide all resolved). Produces fluent English
+      and CORRECT short pattern completion (`1 2 3 4 5 6 7` → `8 9 10 11`). BUT semantic
+      next-token prediction is WRONG — it copies a recent token instead of predicting
+      (`opposite of hot is` → `hot`; `sun ... sets in the` → `east`; `roses are red,
+      violets are` → `red`). Ruled OUT: embed_tokens_per_layer=Q8_0 (lookup correct),
+      per_layer_model_projection=Oq8G256 (weight_gemv handles it). So the bug is in the
+      PLE *math* or the KV-share *logic* (both touch the whole model / deep layers, which
+      are the KV-shared 15-34 where semantic processing lives). NEXT: isolate — (a) run
+      with PLE disabled vs KV-share disabled to bisect; (b) capture per-layer hidden
+      states vs an HF-transformers reference (duat CUDA box) to find the first divergent
+      op. The E2B-loading changes are UNCOMMITTED (broken forward kept off-branch); the
+      committed branch (PLE at e118d49ec) still rejects KV-share so nothing serves garbage.
+- [ ] then: HIPFIRE_KV_MODE=kvarn end-to-end (needs kvarn-on-shared-layer attend-only).
 - [ ] FOLLOW-UP: mirror PLE (+KV-share) into the lowered superop program
       (forward.rs lower_dense_forward ~935 / run_attend ~1035) for production perf; today
       lowered is the default so serving needs HIPFIRE_GEMMA4_FORWARD_ORACLE=1 until then.
