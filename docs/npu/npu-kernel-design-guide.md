@@ -727,7 +727,11 @@ feeds per-core slices via shim→memtile→per-core `objectfifo.link` (respects 
 `ri` weight=`ri+1` → C[0] = ΣᵣKSLICE·16·(ri+1)): 2-core C[0]=768, **24-core (COLS=8
 ROWS=3) C[0]=1536 CORRECT** on halo. Its rate: **~1510 GMAC/s raw, ~2075 floor-free —
 the SAME ~10× as the replication probe.** So the numerically-correct cascade GEMM
-loses nothing to the probe. NEXT: ROWS=4 (combine A|W per core for the 6-channel
+loses nothing to the probe. **Correct at gate_up's real K, too:** COLS=8 ROWS=2
+KSLICE=64 (K = 2·64·16 = **2048**, a 2-way K-split, 16 cores — fits the channel budget,
+divides K evenly) verifies **C[0]=3072 CORRECT** on halo. (A precise 16-core floor-free
+rate needs a 2-point INNER slope; single-INNER points are floor-confounded — deferred.)
+NEXT: ROWS=4 (combine A|W per core for the 6-channel
 memtile), real gate_up M/N tiling (M=256×N=768/1536, K=2048), op4++ per-group scale in
 the tail, then wire into the expert FFN and re-measure PP/TG. Gen `r5_ksplit_gen.py
 COLS ROWS KSLICE`; harnesses `npu_cascade_verify` / `npu_cascade_time`.
