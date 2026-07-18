@@ -350,15 +350,30 @@ class NpuOps:
 
     # ── attention  q[B,NH,HD] k/v[tot,NKV,HD] -> ctx[B, NH*HD] ──────────────
     def attention(self, q, k, v, groups):
+        """GQA head-batched: one dispatch per KV-head, not per q-head.
+
+        Attention is per-query independent given K/V, and the `groups` q-heads
+        that share a kv-head attend to the SAME K/V — so their queries can be
+        STACKED into a single q_len = groups*B call. Mathematically exact (verified
+        cos=1.00000 vs the bf16 reference on all 8 kv-heads,
+        test_dflash_attention_batched_npu.py) and needs NO kernel change: the
+        kernel already takes q_len as a compile-time constant.
+        Dispatches/layer: NH (32) -> NKV (8). Tile budget at groups=4, kv_len=48:
+        Q 16 KB + KV 24 KB + O 16 KB = 56 KB of 64 KB.
+        """
         self.release()  # free XRT columns for the @iron.jit attention
         B, NH, HD = q.shape
         tot = k.shape[0]
+        NKV = NH // groups
+        q_len = groups * B
         ctx = np.empty((B, NH * HD), np.float32)
-        for h in range(NH):
-            kvh = h // groups
-            o = run_attn_head(q[:, h, :], k[:, kvh, :], v[:, kvh, :], B, tot)  # [B,HD]
+        for kvh in range(NKV):
+            heads = range(kvh * groups, (kvh + 1) * groups)
+            qs = np.concatenate([q[:, h, :] for h in heads], axis=0)  # [groups*B, HD]
+            o = run_attn_head(qs, k[:, kvh, :], v[:, kvh, :], q_len, tot)  # [groups*B, HD]
             self.dispatches += 1
-            ctx[:, h * HD:(h + 1) * HD] = o
+            for i, h in enumerate(heads):
+                ctx[:, h * HD:(h + 1) * HD] = o[i * B:(i + 1) * B, :]
         self.op_dispatches += 1
         return ctx
 
