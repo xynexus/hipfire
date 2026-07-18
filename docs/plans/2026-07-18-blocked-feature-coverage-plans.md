@@ -14,7 +14,21 @@ separately; it is NOT blocked. The two items below ARE blocked.
 
 ## 1. zaya serving loader ↔ real ZAYA1-8B residual-scale mismatch (BLOCKS all zaya serving)
 
-### Root cause
+### ⚠️ SCOPE CORRECTION (2026-07-18, after checking the checkpoint)
+The mismatch is NOT limited to residual scaling — the ENTIRE zaya crate targets a
+phantom/preview layout. Real ZAYA1-8B = 80 layers ALTERNATING half-layers: even idx =
+attention (`model.layers.2k.self_attn`), odd idx = MoE (`model.layers.2k+1.zaya_block`
+with `router` + `experts.local_experts.{E}.linear_fc1/linear_fc2`), one `input_norm` +
+one `res_scale` each. The crate instead reads 40 COMBINED blocks with
+`self_attn`+`mlp.experts`(sliced 3D)+two layernorms+two residual-scale blocks per index.
+⇒ Fixing zaya serving is a **full loader + forward BRING-UP against the real checkpoint**
+(needs the zaya1_vl modeling code studied for CCA attention / EDA router / zaya_block MoE
+shapes), a LARGE dedicated task — not the "mechanical residual-scale rewrite" the steps
+below assume. The residual-scale detail below is CORRECT but is only one of ~4 layers of
+mismatch. Deprioritize vs tractable serveable work (gemma4 KVarN). The landed qt-36 OQ
+fix is unaffected.
+
+### Root cause (residual-scale layer — one of several)
 `crates/hipfire-arch-zaya/src/weights.rs` `ZayaWeights::load_host` (L146-221) was
 written against a residual-scale layout that the shipped checkpoint does not use.
 
@@ -116,12 +130,16 @@ layered arena.
 
 ---
 
-## Sequencing recommendation
-By the user's axis priority (P1 OQ > P2 > P3), the next CHEAP P1 item —
-**dots-ocr OQ loader reroute** (hand-rolled panic at
-`crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:660/753` → route through shared
-`oq8_arch_load`/`oq4_arch_load`, same pattern as zaya) — should land before either of
-the above deep items. It has no small model on disk to serving-validate (VL), so land
-it unit-tested + unvalidated per the gemma3/gemma4 reroute precedent, document, move on.
-Then tackle item 1 (zaya, unblocks a whole family + validates qt-36 end-to-end) or
-item 2 (gemma4 Q8-KV) as dedicated non-loop sessions.
+## Sequencing recommendation (revised 2026-07-18)
+Cheap loader-reroute wins are exhausted. Ranking the remaining deep work by
+tractability × value:
+1. **gemma4 KVarN KV (item 2) — DO FIRST.** gemma4 loads + serves today, so it is
+   validatable; the change is bounded to the shared `LayeredKvArena` + reusing existing
+   kvarn kernels. Highest tractability among the deep items.
+2. **zaya full bring-up (item 1) — LARGE, deprioritize.** After the scope correction
+   above it is a from-scratch loader+forward reimplementation against the real ZAYA1-8B
+   layout (needs the zaya1_vl modeling code studied), not a mechanical fix. Best as a
+   dedicated session with the user engaged; the landed qt-36 OQ fix does not depend on it.
+3. dots-ocr OQ: SKIP — not the cheap zaya-style reroute (F16-dequant vision loader,
+   unvalidatable, author-deferred). Documented in the scratchpad; not worth churn now.
+Deeper still: W2A8/oq2 codec, P2 batched prefill per family, P4 spec-decode.
