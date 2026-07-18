@@ -50,12 +50,33 @@ fn main() {
     kernel.dispatch(&[&x, &c]).expect("dispatch");
 
     let c0 = unsafe { *(c.as_slice().as_ptr() as *const i32) };
-    let expected: i32 = (0..rows).map(|ri| (kslice * 16 * (ri + 1)) as i32).sum();
+    // With INNER>1 the kernel recomputes its slice INNER times, so C scales by INNER;
+    // pass INNER as a8 (default 1). Correctness = C0 is an INNER multiple of the base sum.
+    let inner: i32 = a.get(8).and_then(|v| v.parse().ok()).unwrap_or(1);
+    let base: i32 = (0..rows).map(|ri| (kslice * 16 * (ri + 1)) as i32).sum();
+    let expected = base * inner;
     let ok = c0 == expected;
     println!(
         "npu_cascade_verify {dir}: C[0]={c0} expected={expected} (K-split {}) cols={ncols} rows={rows}",
         if ok { "CORRECT" } else { "WRONG — replicated or layout bug" }
     );
+    // Optional timing: pass MACS_PER_DISPATCH as a9 (+ ITERS a10) to report GMAC/s.
+    if let Some(macs) = a.get(9).and_then(|v| v.parse::<f64>().ok()) {
+        use std::time::Instant;
+        let iters: usize = a.get(10).and_then(|v| v.parse().ok()).unwrap_or(200);
+        for _ in 0..8 {
+            kernel.dispatch(&[&x, &c]).expect("warmup");
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            kernel.dispatch(&[&x, &c]).expect("dispatch");
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        println!(
+            "  device_us={us:.2} GMAC/s={:.1} iters={iters}",
+            macs / (us * 1e-6) / 1e9
+        );
+    }
     if !ok {
         std::process::exit(1);
     }

@@ -717,9 +717,20 @@ activations resident — inverted from a real GEMM). At the **gate_up AI (341
 MACs/byte**, weights reused across M), feed drops ~10× and the kernel becomes
 **compute-bound → ~2090 GMAC/s ≈ 10× r6** (gate_up moves only ~2.36 MB, ~47 µs of
 feed vs milliseconds of compute). **Verdict: cascade delivers 4–10× over the memtile
-GEMM even feed-bound.** NEXT: a weight-resident / M-streamed cascade design (real
-gate_up dataflow, AI 341) to confirm the compute-bound ~10× directly, then wire into
-the FFN. Harness: `npu_cascade_time`; generator `r5_gen.py COLS ROWS NB`.
+GEMM even feed-bound.**
+
+**CORRECT K-split — correctness is free.** r5_gen.py's probe *broadcasts* the same
+A/W to all ROWS cores (cascade sums ROWS identical partials = replication, output =
+ROWS× truth). The real GEMM needs each core on a DIFFERENT K-slice: `r5_ksplit_gen.py`
+feeds per-core slices via shim→memtile→per-core `objectfifo.link` (respects the shim-2
+/ memtile-6 out-channel budget). Differential verify (`npu_cascade_verify`: A=1, core
+`ri` weight=`ri+1` → C[0] = ΣᵣKSLICE·16·(ri+1)): 2-core C[0]=768, **24-core (COLS=8
+ROWS=3) C[0]=1536 CORRECT** on halo. Its rate: **~1510 GMAC/s raw, ~2075 floor-free —
+the SAME ~10× as the replication probe.** So the numerically-correct cascade GEMM
+loses nothing to the probe. NEXT: ROWS=4 (combine A|W per core for the 6-channel
+memtile), real gate_up M/N tiling (M=256×N=768/1536, K=2048), op4++ per-group scale in
+the tail, then wire into the expert FFN and re-measure PP/TG. Gen `r5_ksplit_gen.py
+COLS ROWS KSLICE`; harnesses `npu_cascade_verify` / `npu_cascade_time`.
 
 **Prior art: `r5/` already prototyped cascade.** `benchmarks/npu_gemm_tuning/r5/`
 (`r5_cascade.cc`, `r5_2core.mlir`, `r5_4core.mlir`, `r5/README.md`) is a full
