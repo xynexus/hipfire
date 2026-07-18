@@ -9,6 +9,7 @@ pub mod accounting;
 pub mod admin_ui;
 pub mod api_auth;
 pub mod auth;
+pub mod batch_runner;
 pub mod deferred_jobs;
 pub mod model;
 pub mod routes;
@@ -305,6 +306,16 @@ pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
     // runs after daemon startup so the daemon owns resource leases first.
     state.resolve_diffusion_runtime_default();
     deferred_jobs::spawn_deferred_job_runner(state.clone());
+
+    // Continuous-batching runner: owns the engine and fuses concurrent same-model
+    // requests into batched prefill + decode. Opt-in; when the flag is off the
+    // legacy per-request path (engine.lock in chat.rs) is used unchanged.
+    if hipfire_scheduler::server_prefill_batch_enabled(
+        &hipfire_scheduler::SchedulerPolicyEnv::from_pairs(std::env::vars()),
+    ) {
+        batch_runner::spawn_batch_runner(state.clone());
+        tracing::info!("continuous-batching runner enabled (HIPFIRE_SERVER_PREFILL_BATCH)");
+    }
 
     let app = build_router(state.clone(), &cors_allowed_origins);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

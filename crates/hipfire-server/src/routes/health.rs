@@ -1,8 +1,8 @@
 use axum::{extract::State, response::Json};
 use hipfire_model::AcceleratorInventory;
 use hipfire_scheduler::{
-    server_decode_batch_health_json, server_prefill_batch_health_json,
-    server_state_cache_health_json, SchedulerPolicyEnv,
+    server_decode_batch_health_json, server_prefill_batch_enabled,
+    server_prefill_batch_health_json, server_state_cache_health_json, SchedulerPolicyEnv,
 };
 use hipfire_state::runtime_workers_health_json_with_inventory;
 use serde_json::{json, Value};
@@ -48,6 +48,12 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
     let accelerator_inventory = server_accelerator_inventory(&state).await;
     let runtime_workers = runtime_workers_health_payload(&state, &accelerator_inventory).await;
     let scheduler_env = scheduler_env_from_process();
+    // When continuous batching is enabled, the batch runner owns live counters
+    // (residency, selected batch size, decode backend). Surface them here so
+    // `/health` and smoke-server-decode-batch.sh see real values instead of the
+    // static metadata. With the flag off the legacy metadata view is kept.
+    let batch_enabled = server_prefill_batch_enabled(&scheduler_env);
+    let batch_telemetry = state.batch_telemetry.lock().await.clone();
     let mut prefill_batch = server_prefill_batch_health_json(&scheduler_env);
     if let Some(obj) = prefill_batch.as_object_mut() {
         obj.insert("queue_size".to_string(), json!(prefill_queue_size));
@@ -56,6 +62,25 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
             "selected_pending_dispatch".to_string(),
             json!(selected_prefill_requests),
         );
+        if batch_enabled {
+            if let Some(tel) = batch_telemetry.prefill_health_json().as_object() {
+                for (k, v) in tel {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            // The continuous-batching runner is active, so the server drives the
+            // daemon's fused batch-prefill lifecycle. Capability is a static
+            // property of the enabled runner, not of any currently-resident model
+            // (models load on demand per request).
+            obj.insert(
+                "generate_batch_prefill_capability".to_string(),
+                json!("supported"),
+            );
+            obj.insert(
+                "generate_batch_prefill_capability_reason".to_string(),
+                json!("continuous_batch_runner_active"),
+            );
+        }
         if prefill_queue_size > 0 || selected_prefill_requests > 0 {
             obj.insert(
                 "runtime_dispatch_skipped_reason".to_string(),
@@ -72,7 +97,11 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         "pid": std::process::id(),
         "scheduler_resources": scheduler_resources,
         "prefill_batch": prefill_batch,
-        "decode_batch": server_decode_batch_health_json(&scheduler_env),
+        "decode_batch": if batch_enabled {
+            batch_telemetry.decode_health_json()
+        } else {
+            server_decode_batch_health_json(&scheduler_env)
+        },
         "state_cache": server_state_cache_health_json(&scheduler_env),
         "deferred_jobs": crate::deferred_jobs::deferred_jobs_health_json(),
         "runtime_workers": runtime_workers,
@@ -291,7 +320,7 @@ mod tests {
         assert_eq!(payload["state_cache"], json!({ "enabled": false }));
         assert_eq!(
             payload["deferred_jobs"]["execution_mode"],
-            "startup_sequential"
+            "continuous_sequential"
         );
         assert_eq!(payload["runtime_workers"]["resident_workers"], 0);
         assert_eq!(payload["runtime_workers"]["state_arena_backend"], "none");

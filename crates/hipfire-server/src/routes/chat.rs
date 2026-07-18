@@ -415,6 +415,18 @@ pub(crate) fn generate_request_from_chat(
         )
 }
 
+/// Text of the last user turn — used as the batch-prefill session's `prompt`
+/// (the daemon renders the full conversation from `messages_history`; the prompt
+/// field is the current-turn placeholder the validator requires).
+fn last_user_text(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| openai_chat_content_to_text(m.content.as_ref()))
+        .unwrap_or_default()
+}
+
 fn chat_messages_to_prompt_messages(messages: &[ChatMessage]) -> Vec<PromptMessage> {
     messages
         .iter()
@@ -1747,6 +1759,107 @@ where
         Ok(loaded) => loaded,
         Err(e) => return Err(json!({"error": {"message": e, "type": "server_error"}})),
     };
+
+    // Continuous-batching path: hand the request to the batch runner (which owns
+    // the engine and fuses concurrent same-model requests) and await its streamed
+    // tokens, instead of taking the engine per-request. Opt-in via the same flag
+    // that spawns the runner; when off, fall through to the legacy path below.
+    if server_prefill_batch_enabled(&SchedulerPolicyEnv::from_pairs(std::env::vars())) {
+        let controls = {
+            let cfg = state.config.lock().await;
+            let resolved = cfg.resolve_for_model(&model_arg);
+            request_generation_controls(
+                &resolved,
+                body.chat_template_kwargs.as_ref(),
+                body.reasoning_effort.as_deref(),
+                body.reasoning.as_ref(),
+                body.presence_penalty,
+                body.frequency_penalty,
+            )
+        };
+        let assistant_prefix = controls
+            .assistant_prefix
+            .clone()
+            .unwrap_or_else(|| "plain".to_string());
+        // `controls.max_think_tokens` already encodes the batch-prefill daemon's
+        // `enable_thinking = (max_think_tokens != 1)` convention: it is Some(1)
+        // when thinking is disabled and Some(budget)/None otherwise. Pass it
+        // through unchanged (None → 0, which the daemon reads as thinking-on).
+        let max_think_tokens: u32 = controls.max_think_tokens.unwrap_or(0);
+        let messages_history =
+            serde_json::to_value(chat_messages_to_prompt_messages(&body.messages)).ok();
+        let spec = crate::batch_runner::SessionSpec {
+            id: req_id.clone(),
+            prompt: last_user_text(&body.messages),
+            messages_history,
+            system_prompt: body.system.clone(),
+            state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+            assistant_prefix,
+            max_think_tokens,
+            max_tokens: request_max_tokens as usize,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut inbox = state.batch_inbox.lock().await;
+            inbox.insert(
+                req_id.clone(),
+                crate::batch_runner::PendingRequest {
+                    spec,
+                    worker_key_id: loaded.worker_key_id.clone().unwrap_or_default(),
+                    tx,
+                },
+            );
+        }
+        state.prefill_notify.notify_waiters();
+
+        let mut text = String::new();
+        let mut finish_reason = "stop".to_string();
+        loop {
+            if should_cancel() {
+                state.batch_inbox.lock().await.remove(&req_id);
+                return Ok(None);
+            }
+            match rx.recv().await {
+                Some(crate::batch_runner::BatchEvent::Token(t)) => text.push_str(&t),
+                Some(crate::batch_runner::BatchEvent::Done(done)) => {
+                    finish_reason = done
+                        .get("finish_reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("stop")
+                        .to_string();
+                    break;
+                }
+                Some(crate::batch_runner::BatchEvent::Error(e)) => {
+                    return Err(json!({"error": {"message": e, "type": "server_error"}}));
+                }
+                None => break,
+            }
+        }
+        let token_count = text.split_whitespace().count() as u32;
+        let final_text = strip_visible_thinking(text, preserve_thinking, true);
+        let done = hipfire_generate::DoneEvent {
+            id: req_id.clone(),
+            tokens: token_count,
+            tok_s: None,
+            prefill_tokens: None,
+            prefill_ms: None,
+            prefill_tok_s: None,
+            decode_tok_s: None,
+            ttft_ms: None,
+            finish_reason: Some(finish_reason),
+            response_id: None,
+            extra: std::collections::HashMap::new(),
+        };
+        return Ok(Some(BlockingChatResult {
+            req_id,
+            created,
+            model: model_arg,
+            text: final_text,
+            done,
+            tool_calls: Vec::new(),
+            request_max_tokens,
+        }));
+    }
 
     if let Err(e) = wait_for_prefill_scheduler_turn(
         &state,

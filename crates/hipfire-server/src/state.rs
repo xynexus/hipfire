@@ -85,6 +85,12 @@ pub struct AppState {
     /// Serializes scheduler selection so one request path chooses batches at a time.
     pub prefill_dispatch: Mutex<()>,
     pub prefill_notify: Notify,
+    /// Continuous-batching request registry (Phase 1). Requests park here and
+    /// await the runner instead of taking `engine` directly. Only populated
+    /// when `HIPFIRE_SERVER_PREFILL_BATCH` is enabled and the runner is spawned.
+    pub batch_inbox: crate::batch_runner::BatchInbox,
+    /// Live batch-runner telemetry surfaced by `/health`.
+    pub batch_telemetry: Mutex<crate::batch_runner::BatchTelemetry>,
     pub responses_contexts: Mutex<HashMap<String, StoredResponsesContext>>,
     pub responses_order: Mutex<VecDeque<String>>,
     pub files: Mutex<HashMap<String, StoredFile>>,
@@ -245,6 +251,8 @@ impl AppState {
             selected_prefill_requests: Mutex::new(HashSet::new()),
             prefill_dispatch: Mutex::new(()),
             prefill_notify: Notify::new(),
+            batch_inbox: Mutex::new(HashMap::new()),
+            batch_telemetry: Mutex::new(crate::batch_runner::BatchTelemetry::default()),
             responses_contexts: Mutex::new(HashMap::new()),
             responses_order: Mutex::new(VecDeque::new()),
             files: Mutex::new(HashMap::new()),
