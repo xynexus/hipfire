@@ -194,6 +194,26 @@ validate against: `opus_lowbit::dot_signed` / `dot_offset_fold`.
 (non-causal, with cross-context) within tolerance, for ctx_len ∈ {block-only,
 short, 512}.
 
+**Phase C progress (2026-07-18) — kernel authored + compiles; Gate C NOT yet met.**
+The compute `.cc` (`segmented_attention_bf16.cc`) already takes `causal` as a
+RUNTIME flag and does `real_length` window masking, and is arch-neutral
+(`aie::mmul<4,8,8,bf16,bf16>` on aie2 + aie2p). So the non-causal cross-attention
+is just: `causal=0`, stage KV=[ctx|block] with `real_length=ctx+block`, extract the
+block's last-`block_size` output rows. `build_qwen3_dflash_attention.py` reuses
+`build_qwen3_segmented_attention.generate_mlir` verbatim, patches `causal=0` and the
+device line, and **compiles cleanly for npu2/aie2p** (final.xclbin + insts.bin).
+
+**Two blockers to Gate C:**
+1. **nix1 can't run it:** the segmented kernel is **8-column** (aie2p/halo); nix1's
+   npu1 is **4-column** (`aie.tile column index 4 must be < 4`). The drafter's tiny
+   attention (16 q, 48 kv) actually wants a **≤4-col / single-core** design — a real
+   (bounded) redesign reusing the same `.cc` block/init/finish. Or run on halo (npu2).
+2. **No host runner exists** for the segmented kernel — the Q/KV/O multi-core bucket
+   layout (query-pair + embedded real_length, GQA head map, kv MMUL interleave) must
+   be staged by a new `test_dflash_attention_npu.py`, validated vs the Phase-A golden
+   l0 tensors (`rust_l0_q_roped`/`k_roped`/`v`/`attn_out`). This is the main remaining
+   Phase-C work. The attention MATH is already golden-validated (Phase A, cos=1.0).
+
 ### Phase D — Assemble + fuse the block body
 
 Compose the primitives into the 5-layer forward, then fuse to cut the dispatch
