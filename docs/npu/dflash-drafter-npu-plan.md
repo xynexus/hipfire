@@ -272,6 +272,30 @@ golden.
    xclbins are per-row), ~23 s wall (unfused, correctness-first). Gate on cos, not a
    fixed abs tol (Gate-C precedent). Run:
    `dflash_body_npu.py --golden-dir <OUT>/rust --weights <safetensors> [--op-by-op]`.
+   **DONE (Gate D step 2, nix1 npu1)** — dispatch reduction, levers 1/2a/4 of
+   `docs/npu/dflash-phase-d-fusion-plan.md`. **2048 → 243 raw dispatches (8.4×)**,
+   88 logical, with parity held:
+
+   | config | raw | raw/layer | cos vs f16 golden | cos vs int8/bf16 ref |
+   |---|---|---|---|---|
+   | baseline (step 1) | 2048 | 384 | 0.999019 | 0.999153 |
+   | + lever 1 (batched norm/rope/swiglu) | 1157 | 231 | 0.999019 | 0.999153 |
+   | + lever 2a (full-K per-row int8 proj) | 243 | 48.6 | 0.998092 | 0.998147 |
+
+   - **Lever 1 is numerically exact** (bit-identical cos): the `_transform_gen`
+     primitives bake `N_div_n` into the instr stream, so batching is a rebuild,
+     not a math change. `build_dflash_body_batched.py` emits the `-b<rows>`
+     xclbins. RoPE needed a new kernel (`dflash_rope_batched_bf16.cc`): its `cs`
+     was a once-acquired *param*, so one dispatch could only carry one position;
+     making `cs` a second *tiled input* lets each head-tile carry its own
+     position's cs.
+   - **Lever 2a held the gate** (cos 0.99902 → 0.99809, still ≫ 0.99), so the
+     in-core per-group epilogue (2b) was NOT needed. One `matmul_npu` over the
+     whole K per projection; rank-1 rescale `C·(a_scale[m]⊗w_scale[n])`.
+   - **Lever 4**: int8 weights quantized ONCE up front (8.9 s setup, offline in a
+     real deployment) and uploaded to the NPU ONCE (`--resident-weights`, 0.7 s),
+     instead of ~1 GB re-uploaded per pass — warm wall 2268 → 1307 ms.
+
 2. **Fuse stage 1** per layer: rmsnorm → qkv → q/k-norm → RoPE in one dispatch.
 3. **Fuse stage 3** per layer: o-proj → residual → rmsnorm → gate/up → SiLU → down
    → residual in one dispatch. (Attention stays its own dispatch — different
@@ -281,6 +305,25 @@ golden.
 
 **Gate D.** Full-body parity holds after fusion; dispatch count ≤ ~3/layer;
 measured block wall-time < the 9B verify budget (57 ms) with margin.
+
+**Gate D status: parity MET, dispatch/wall targets NOT yet met.** Parity holds
+(cos 0.99809 vs golden, 0.99815 vs the int8/bf16 reference — both ≫ 0.99, gate
+unchanged, no loosened tolerance). Remaining gap:
+
+- **48.6 raw dispatches/layer vs the ≤3 target.** 32 of those 48 are *attention*:
+  `dflash_attn_head` is one q-head per dispatch (Gate C), so the per-layer floor
+  is 32 until attention batches heads in-core (GQA: acquire each kv-head's K/V
+  once, loop its 4 q-heads). That — not stage fusion — is now the dominant
+  structural term. Non-attention is already down to ~16.6/layer (9 projections +
+  7 batched norm/rope/swiglu), which steps 2–3 would fold to ~2.
+- **Warm block wall 1307 ms vs the 57 ms budget — but the NPU is not the
+  bottleneck.** Measured on-device time for the whole 5-layer block is
+  **23 ms (2 % of wall)**; the other **1284 ms is host/XRT round-trip at
+  ~5.3 ms per dispatch** from the Python driver. So the block already fits the
+  57 ms budget *in NPU compute*; hitting it end-to-end needs a lean (native,
+  non-Python) driver — at a native ~100 µs/dispatch even today's 243 dispatches
+  would land ≈ 47 ms. Dispatch count and driver overhead are independent levers;
+  reducing dispatches alone will not reach 57 ms under the Python host.
 
 ### Phase E — DSpark heads (dflash + dspark)
 

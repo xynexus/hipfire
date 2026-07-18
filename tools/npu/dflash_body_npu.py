@@ -104,12 +104,34 @@ def quantize_group_symmetric(x_f32, bits=8):
     return q.reshape(rows, K), scale
 
 
+def quantize_row_symmetric(x_f32, bits=8):
+    """Per-ROW symmetric int8 over the WHOLE K (single scale per row).
+    x:[rows,K] -> (q int8 [rows,K], scale[rows])."""
+    qmax = (1 << (bits - 1)) - 1
+    absmax = np.abs(x_f32).max(axis=1)
+    scale = np.where(absmax > 0, absmax / qmax, 1.0).astype(np.float32)
+    q = np.round(x_f32 / scale[:, None]).clip(-qmax, qmax).astype(np.int8)
+    return q, scale
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # NPU op wrappers.  Each takes np.float32 in, returns np.float32 out.
 # XRTHostRuntime handles are cached per-xclbin (one hw_context each).
 # ─────────────────────────────────────────────────────────────────────────────
 class NpuOps:
-    def __init__(self, count=True):
+    def __init__(self, count=True, batch_ops=False, proj_mode="group",
+                 resident_weights=False):
+        # batch_ops   : Lever 1 — run norm/headnorm/rope/swiglu batched (all rows
+        #               in ONE dispatch) via the *-b<rows> xclbins instead of the
+        #               per-row loop.
+        # proj_mode   : Lever 2 — "group" = per-256-group int8 (one dispatch/group,
+        #               baseline); "row" = full-K per-row/per-channel int8 (one
+        #               dispatch/projection, Lever 2a).
+        self.batch_ops = batch_ops
+        self.proj_mode = proj_mode
+        # Lever 4 (speed, not dispatch count): keep int8 projection weights
+        # resident on the NPU instead of re-uploading ~1 GB every pass.
+        self.resident_weights = resident_weights
         # Use the SHARED default cached runtime — the SAME CachedXRTRuntime that
         # @iron.jit's projection/attention go through. npu1 (Phoenix) can only
         # keep a handful of hw_contexts resident; a separate XRTHostRuntime added
@@ -120,6 +142,7 @@ class NpuOps:
         import aie.utils as _aieutils
         self._rt = _aieutils._get_default_npu_runtime()
         self._npukernels = {}  # stem -> NPUKernel (cheap, reused across loads)
+        self.npu_ns = 0  # accumulated on-device (NPU-busy) time, ns
         self.dispatches = 0  # raw NPU kernel invocations
         self.op_dispatches = 0  # logical op-level dispatches
         self._count = count
@@ -147,14 +170,28 @@ class NpuOps:
     def _run(self, handle, tensors):
         res = self._rt.run(handle, tensors)
         if not res.is_success():
-            raise RuntimeError(f"NPU kernel {stem} failed: {res.ret}")
+            raise RuntimeError(f"NPU kernel failed: {res.ret}")
         self.dispatches += 1
+        self.npu_ns += int(getattr(res, "npu_time", 0) or 0)
         return res
 
     # ── rmsnorm  [rows, H] weighted, over last dim ──────────────────────────
     def rmsnorm(self, x, weight):
         x = np.ascontiguousarray(x, np.float32)
         rows, H = x.shape
+        if self.batch_ops:
+            # Lever 1: one dispatch for all rows. The -b<rows> xclbin bakes
+            # N_div_n=rows; weight is a tiled input so replicate gamma per row.
+            h = self._load(f"qwen35-rmsnorm-{H}-b{rows}")
+            xin = x.reshape(-1).astype(bfloat16)
+            wrep = np.tile(bf16(weight).astype(bfloat16), rows)
+            t_in = XRTTensor(xin, dtype=bfloat16, device="cpu")
+            t_w = XRTTensor(wrep, dtype=bfloat16, device="cpu")
+            t_out = XRTTensor((rows * H,), dtype=bfloat16, device="cpu")
+            self._run(h, [t_in, t_w, t_out])  # order: in, weight, out
+            t_out.to("cpu")
+            self.op_dispatches += 1
+            return t_out.numpy().astype(bfloat16).astype(np.float32).reshape(rows, H)
         h = self._load(f"qwen35-rmsnorm-{H}")
         w = XRTTensor(bf16(weight).astype(bfloat16), dtype=bfloat16, device="cpu")
         out = np.empty((rows, H), np.float32)
@@ -172,8 +209,18 @@ class NpuOps:
         x = np.ascontiguousarray(x, np.float32)
         rows, ND = x.shape
         assert ND == nh * HEAD_DIM
-        h = self._load(f"qwen35-headnorm-{which}-{nh}h{HEAD_DIM}d")
         w = XRTTensor(bf16(weight).astype(bfloat16), dtype=bfloat16, device="cpu")
+        if self.batch_ops:
+            # Lever 1: one dispatch, N_div_n=rows*nh head-tiles; weight is a
+            # once-acquired param (shared across all head-tiles) — unchanged.
+            h = self._load(f"qwen35-headnorm-{which}-{nh}h{HEAD_DIM}d-b{rows}")
+            t_in = XRTTensor(x.reshape(-1).astype(bfloat16), dtype=bfloat16, device="cpu")
+            t_out = XRTTensor((rows * ND,), dtype=bfloat16, device="cpu")
+            self._run(h, [t_in, t_out, w])  # order: in, out, weight
+            t_out.to("cpu")
+            self.op_dispatches += 1
+            return t_out.numpy().astype(bfloat16).astype(np.float32).reshape(rows, ND)
+        h = self._load(f"qwen35-headnorm-{which}-{nh}h{HEAD_DIM}d")
         out = np.empty((rows, ND), np.float32)
         for r in range(rows):
             t_in = XRTTensor(x[r].astype(bfloat16), dtype=bfloat16, device="cpu")
@@ -189,6 +236,23 @@ class NpuOps:
         x = np.ascontiguousarray(x, np.float32)
         rows, ND = x.shape
         assert ND == nh * HEAD_DIM
+        if self.batch_ops:
+            # Lever 1: one dispatch for all rows via dflash_rope_batched_bf16
+            # (cs is a 2nd TILED input, so each head-tile gets its row's cs).
+            # Pack cs[rows*nh*head_dim]: per row repeat that position's cs over
+            # all nh heads; the input tile is head_dim == cs tile size.
+            h = self._load(f"dflash-rope-{which}-{nh}h{HEAD_DIM}d-b{rows}")
+            cs_rows = np.empty((rows, ND), np.float32)
+            for r in range(rows):
+                cs_r = np.asarray(_make_cs_buf(HEAD_DIM, int(positions[r]), theta), np.float32)
+                cs_rows[r] = np.tile(cs_r, nh)
+            t_in = XRTTensor(x.reshape(-1).astype(bfloat16), dtype=bfloat16, device="cpu")
+            t_cs = XRTTensor(cs_rows.reshape(-1).astype(bfloat16), dtype=bfloat16, device="cpu")
+            t_out = XRTTensor((rows * ND,), dtype=bfloat16, device="cpu")
+            self._run(h, [t_in, t_cs, t_out])  # order: in, cs, out
+            t_out.to("cpu")
+            self.op_dispatches += 1
+            return t_out.numpy().astype(bfloat16).astype(np.float32).reshape(rows, ND)
         h = self._load(f"dflash-rope-{which}-{nh}h{HEAD_DIM}d")
         out = np.empty((rows, ND), np.float32)
         for r in range(rows):
@@ -207,6 +271,16 @@ class NpuOps:
         gate = np.ascontiguousarray(gate, np.float32)
         up = np.ascontiguousarray(up, np.float32)
         rows, I = gate.shape
+        if self.batch_ops:
+            # Lever 1: one dispatch over rows*I (parallel silu(gate)*up).
+            h = self._load(f"qwen35-swiglu-{I}-b{rows}")
+            t_g = XRTTensor(gate.reshape(-1).astype(bfloat16), dtype=bfloat16, device="cpu")
+            t_u = XRTTensor(up.reshape(-1).astype(bfloat16), dtype=bfloat16, device="cpu")
+            t_out = XRTTensor((rows * I,), dtype=bfloat16, device="cpu")
+            self._run(h, [t_g, t_u, t_out])  # order: gate, up, out
+            t_out.to("cpu")
+            self.op_dispatches += 1
+            return t_out.numpy().astype(bfloat16).astype(np.float32).reshape(rows, I)
         h = self._load(f"qwen35-swiglu-{I}")
         out = np.empty((rows, I), np.float32)
         for r in range(rows):
@@ -219,9 +293,19 @@ class NpuOps:
         self.op_dispatches += 1
         return out
 
-    # ── int8 per-group projection  Y[rows,N] = X[rows,K] @ W[N,K]^T ─────────
-    def proj(self, x, qw, sw):
-        """qw int8 [N,K], sw f32 [N,ng] are the pre-quantized weight."""
+    # ── int8 projection  Y[rows,N] = X[rows,K] @ W[N,K]^T ───────────────────
+    def project(self, x, W, name):
+        """Dispatch to the active projection mode (Lever 2)."""
+        if self.proj_mode == "row":
+            qw, sw = W.qproj_row(name)
+            # Weight resident on the NPU (uploaded once) when enabled.
+            dev = W.device_weight(name) if self.resident_weights else None
+            return self._proj_row(x, qw, sw, dev)
+        return self._proj_group(x, *W.qproj(name))
+
+    def _proj_group(self, x, qw, sw):
+        """Per-256-group int8 (baseline): one dispatch per group.
+        qw int8 [N,K], sw f32 [N,ng] pre-quantized weight."""
         self.release()  # free XRT columns for the @iron.jit matmul
         x = np.ascontiguousarray(x, np.float32)
         rows, K = x.shape
@@ -237,6 +321,32 @@ class NpuOps:
             Y += (sx[:, g][:, None] * sw[:, g][None, :]) * C.T.astype(np.float32)
         self.op_dispatches += 1
         return Y
+
+    def _proj_row(self, x, qw, sw, dev=None):
+        """Lever 2a: full-K per-ROW/per-CHANNEL int8 — ONE dispatch/projection.
+        Single int8 quant over the whole K (one scale per activation row and per
+        output channel); rank-1 rescale C·(a_scale[m]⊗w_scale[n]).
+        qw int8 [N,K] per-channel, sw f32 [N] per-channel scale.
+        `dev` = (A_t, M, K) NPU-resident weight from design.upload_int8()."""
+        self.release()  # free XRT columns for the @iron.jit matmul
+        x = np.ascontiguousarray(x, np.float32)
+        rows, K = x.shape
+        N = qw.shape[0]
+        qx, sx = quantize_row_symmetric(x, 8)      # [rows,K], [rows]
+        if dev is not None:
+            A_t, M_w, K_w = dev
+            C, _tile = design.matmul_npu_resident(A_t, M_w, K_w, qx)  # C[N,rows] i32
+            self.npu_ns += int(design.LAST_NPU_US * 1000.0)
+        else:
+            C, _tile = design.matmul_npu(qw, qx)    # A=W[N,K], B=X[rows,K] -> C[N,rows] i32
+        self.dispatches += 1
+        Y = (sw[:, None] * sx[None, :]) * C.astype(np.float32)  # [N,rows]
+        self.op_dispatches += 1
+        return Y.T.copy()                            # [rows,N]
+
+    # legacy alias (op-by-op paths that pre-fetch the group weight)
+    def proj(self, x, qw, sw):
+        return self._proj_group(x, qw, sw)
 
     # ── attention  q[B,NH,HD] k/v[tot,NKV,HD] -> ctx[B, NH*HD] ──────────────
     def attention(self, q, k, v, groups):
@@ -314,6 +424,19 @@ def ref_proj_int8(x, qw, sw):
     return Y
 
 
+def ref_proj_int8_row(x, qw, sw):
+    """bf16/int8 mirror of NpuOps._proj_row (full-K per-row/per-channel int8)."""
+    qx, sx = quantize_row_symmetric(x.astype(np.float32), 8)
+    C = (qx.astype(np.int64) @ qw.astype(np.int64).T).astype(np.float32)  # [rows,N]
+    return (sx[:, None] * sw[None, :]) * C
+
+
+def ref_project(W, name, x, proj_mode):
+    if proj_mode == "row":
+        return ref_proj_int8_row(x, *W.qproj_row(name))
+    return ref_proj_int8(x, *W.qproj(name))
+
+
 def ref_attention(q, k, v, groups):
     B, NH, HD = q.shape
     tot = k.shape[0]
@@ -336,6 +459,7 @@ class Weights:
     def __init__(self, path):
         self.W = load_safetensors_f32(path)
         self._q = {}  # name -> (qw int8, sw f32)
+        self._dev = {}  # name -> (iron.tensor A_t, M, K) resident int8 weight
 
     def raw(self, name):
         return self.W[name]
@@ -346,6 +470,25 @@ class Weights:
             qw, sw = quantize_group_symmetric(self.W[name].astype(np.float32), 8)
             q = (qw, sw)
             self._q[name] = q
+        return q
+
+    def device_weight(self, name):
+        """NPU-resident int8 weight (uploaded once) as (A_t, M, K)."""
+        d = self._dev.get(name)
+        if d is None:
+            qw, _sw = self.qproj_row(name)
+            d = design.upload_int8(qw)
+            self._dev[name] = d
+        return d
+
+    def qproj_row(self, name):
+        """Per-output-channel (per-row of W) int8 over full K — Lever 2a."""
+        key = ("row", name)
+        q = self._q.get(key)
+        if q is None:
+            qw, sw = quantize_row_symmetric(self.W[name].astype(np.float32), 8)
+            q = (qw, sw)
+            self._q[key] = q
         return q
 
 
@@ -369,15 +512,14 @@ class Cfg:
         self.tot = self.L + self.B
 
 
-def compute_thp(ops, W, cfg, target_hidden, use_ref=False):
+def compute_thp(ops, W, cfg, target_hidden, use_ref=False, proj_mode="group"):
     """One-time context projection: thp = hidden_norm(fc(target_hidden))."""
     th_flat = target_hidden.reshape(cfg.L, cfg.NE * cfg.H)
-    qw, sw = W.qproj("fc.weight")
     if use_ref:
-        thp = ref_proj_int8(th_flat, qw, sw)
+        thp = ref_project(W, "fc.weight", th_flat, proj_mode)
         thp = ref_rmsnorm(thp, W.raw("hidden_norm.weight"), cfg.EPS)
     else:
-        thp = ops.proj(th_flat, qw, sw)
+        thp = ops.project(th_flat, W, "fc.weight")
         thp = ops.rmsnorm(thp, W.raw("hidden_norm.weight"))
     return thp
 
@@ -391,11 +533,11 @@ def run_body(ops, W, cfg, noise, thp, per_layer_out=None):
         p = f"layers.{li}."
         residual = hidden
         xn = ops.rmsnorm(hidden, W.raw(p + "input_layernorm.weight"))
-        q = ops.proj(xn, *W.qproj(p + "self_attn.q_proj.weight"))
-        k_noise = ops.proj(xn, *W.qproj(p + "self_attn.k_proj.weight"))
-        v_noise = ops.proj(xn, *W.qproj(p + "self_attn.v_proj.weight"))
-        k_ctx = ops.proj(thp, *W.qproj(p + "self_attn.k_proj.weight"))
-        v_ctx = ops.proj(thp, *W.qproj(p + "self_attn.v_proj.weight"))
+        q = ops.project(xn, W, p + "self_attn.q_proj.weight")
+        k_noise = ops.project(xn, W, p + "self_attn.k_proj.weight")
+        v_noise = ops.project(xn, W, p + "self_attn.v_proj.weight")
+        k_ctx = ops.project(thp, W, p + "self_attn.k_proj.weight")
+        v_ctx = ops.project(thp, W, p + "self_attn.v_proj.weight")
 
         q = ops.headnorm(q, W.raw(p + "self_attn.q_norm.weight"), "q", cfg.NH)
         k = np.concatenate([k_ctx, k_noise], axis=0)  # [tot, NKV*HD]
@@ -410,15 +552,15 @@ def run_body(ops, W, cfg, noise, thp, per_layer_out=None):
         vh = v.reshape(cfg.tot, cfg.NKV, cfg.HD)
         ctx = ops.attention(qh, kh, vh, cfg.groups)
 
-        attn_proj = ops.proj(ctx, *W.qproj(p + "self_attn.o_proj.weight"))
+        attn_proj = ops.project(ctx, W, p + "self_attn.o_proj.weight")
         hidden = residual + attn_proj
 
         residual = hidden
         xn2 = ops.rmsnorm(hidden, W.raw(p + "post_attention_layernorm.weight"))
-        gate = ops.proj(xn2, *W.qproj(p + "mlp.gate_proj.weight"))
-        up = ops.proj(xn2, *W.qproj(p + "mlp.up_proj.weight"))
+        gate = ops.project(xn2, W, p + "mlp.gate_proj.weight")
+        up = ops.project(xn2, W, p + "mlp.up_proj.weight")
         s = ops.swiglu(gate, up)
-        d = ops.proj(s, *W.qproj(p + "mlp.down_proj.weight"))
+        d = ops.project(s, W, p + "mlp.down_proj.weight")
         hidden = residual + d
         if per_layer_out is not None:
             per_layer_out.append(hidden.copy())
@@ -426,18 +568,56 @@ def run_body(ops, W, cfg, noise, thp, per_layer_out=None):
     return final
 
 
-def ref_body(W, cfg, noise, thp_ref, per_layer_out=None):
+def proj_weight_names(cfg):
+    """Every projection weight the body touches (one-time int8 quant targets)."""
+    names = ["fc.weight"]
+    for li in range(cfg.NL):
+        p = f"layers.{li}."
+        names += [p + n for n in (
+            "self_attn.q_proj.weight", "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight", "self_attn.o_proj.weight",
+            "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight")]
+    return names
+
+
+def prequantize(W, cfg, proj_mode, resident=False):
+    """Lever-4 speed win: int8-quantize every projection weight ONCE, up front,
+    so the timed block forward does not pay for it. In a real deployment this is
+    an offline step (the .hfq sidecar already stores quantized weights)."""
+    t0 = time.perf_counter()
+    n_elem = 0
+    for name in proj_weight_names(cfg):
+        if proj_mode == "row":
+            qw, _ = W.qproj_row(name)
+        else:
+            qw, _ = W.qproj(name)
+        n_elem += qw.size
+    dt = time.perf_counter() - t0
+    print(f"  [setup] pre-quantized {len(proj_weight_names(cfg))} projection weights "
+          f"({n_elem/1e6:.0f}M elems) in {dt:.1f} s")
+    if resident:
+        t1 = time.perf_counter()
+        for name in proj_weight_names(cfg):
+            W.device_weight(name)
+        du = time.perf_counter() - t1
+        print(f"  [setup] uploaded {n_elem/1e6:.0f}M int8 weight elems to the NPU "
+              f"once in {du:.1f} s")
+        dt += du
+    return dt
+
+
+def ref_body(W, cfg, noise, thp_ref, per_layer_out=None, proj_mode="group"):
     """bf16/int8-precision numpy mirror of run_body (no NPU)."""
     hidden = noise.astype(np.float32).copy()
     for li in range(cfg.NL):
         p = f"layers.{li}."
         residual = hidden
         xn = ref_rmsnorm(hidden, W.raw(p + "input_layernorm.weight"), cfg.EPS)
-        q = ref_proj_int8(xn, *W.qproj(p + "self_attn.q_proj.weight"))
-        k_noise = ref_proj_int8(xn, *W.qproj(p + "self_attn.k_proj.weight"))
-        v_noise = ref_proj_int8(xn, *W.qproj(p + "self_attn.v_proj.weight"))
-        k_ctx = ref_proj_int8(thp_ref, *W.qproj(p + "self_attn.k_proj.weight"))
-        v_ctx = ref_proj_int8(thp_ref, *W.qproj(p + "self_attn.v_proj.weight"))
+        q = ref_project(W, p + "self_attn.q_proj.weight", xn, proj_mode)
+        k_noise = ref_project(W, p + "self_attn.k_proj.weight", xn, proj_mode)
+        v_noise = ref_project(W, p + "self_attn.v_proj.weight", xn, proj_mode)
+        k_ctx = ref_project(W, p + "self_attn.k_proj.weight", thp_ref, proj_mode)
+        v_ctx = ref_project(W, p + "self_attn.v_proj.weight", thp_ref, proj_mode)
 
         q = ref_headnorm(q, W.raw(p + "self_attn.q_norm.weight"), cfg.NH, cfg.EPS)
         k = np.concatenate([k_ctx, k_noise], axis=0)
@@ -452,15 +632,15 @@ def ref_body(W, cfg, noise, thp_ref, per_layer_out=None):
         vh = v.reshape(cfg.tot, cfg.NKV, cfg.HD)
         ctx = ref_attention(qh, kh, vh, cfg.groups)
 
-        attn_proj = ref_proj_int8(ctx, *W.qproj(p + "self_attn.o_proj.weight"))
+        attn_proj = ref_project(W, p + "self_attn.o_proj.weight", ctx, proj_mode)
         hidden = residual + attn_proj
 
         residual = hidden
         xn2 = ref_rmsnorm(hidden, W.raw(p + "post_attention_layernorm.weight"), cfg.EPS)
-        gate = ref_proj_int8(xn2, *W.qproj(p + "mlp.gate_proj.weight"))
-        up = ref_proj_int8(xn2, *W.qproj(p + "mlp.up_proj.weight"))
+        gate = ref_project(W, p + "mlp.gate_proj.weight", xn2, proj_mode)
+        up = ref_project(W, p + "mlp.up_proj.weight", xn2, proj_mode)
         s = ref_swiglu(gate, up)
-        d = ref_proj_int8(s, *W.qproj(p + "mlp.down_proj.weight"))
+        d = ref_project(W, p + "mlp.down_proj.weight", s, proj_mode)
         hidden = residual + d
         if per_layer_out is not None:
             per_layer_out.append(hidden.copy())
@@ -501,7 +681,7 @@ def op_by_op(ops, W, cfg, G, cos_gate=0.99):
         return out
 
     # thp (one-time) vs golden target_hidden_proj
-    thp = compute_thp(ops, W, cfg, target_hidden)
+    thp = compute_thp(ops, W, cfg, target_hidden, proj_mode=ops.proj_mode)
     check("thp (fc+hidden_norm)", thp, G.rust("target_hidden_proj"))
 
     # 1. input_layernorm : noise -> l0_input_norm
@@ -512,11 +692,11 @@ def op_by_op(ops, W, cfg, G, cos_gate=0.99):
     #    checkpoints available: q_roped, k_roped, v.
     xn_g = G.rust("l0_input_norm")          # feed golden to isolate downstream
     thp_g = G.rust("target_hidden_proj")
-    q = ops.proj(xn_g, *W.qproj(p + "self_attn.q_proj.weight"))
-    k_noise = ops.proj(xn_g, *W.qproj(p + "self_attn.k_proj.weight"))
-    v_noise = ops.proj(xn_g, *W.qproj(p + "self_attn.v_proj.weight"))
-    k_ctx = ops.proj(thp_g, *W.qproj(p + "self_attn.k_proj.weight"))
-    v_ctx = ops.proj(thp_g, *W.qproj(p + "self_attn.v_proj.weight"))
+    q = ops.project(xn_g, W, p + "self_attn.q_proj.weight")
+    k_noise = ops.project(xn_g, W, p + "self_attn.k_proj.weight")
+    v_noise = ops.project(xn_g, W, p + "self_attn.v_proj.weight")
+    k_ctx = ops.project(thp_g, W, p + "self_attn.k_proj.weight")
+    v_ctx = ops.project(thp_g, W, p + "self_attn.v_proj.weight")
     q = ops.headnorm(q, W.raw(p + "self_attn.q_norm.weight"), "q", cfg.NH)
     k = np.concatenate([k_ctx, k_noise], axis=0)
     v = np.concatenate([v_ctx, v_noise], axis=0)
@@ -536,17 +716,17 @@ def op_by_op(ops, W, cfg, G, cos_gate=0.99):
 
     # 4. o_proj + residual from GOLDEN attn_out -> l0_post_attn_residual
     ctx_g = G.rust("l0_attn_out")
-    attn_proj = ops.proj(ctx_g, *W.qproj(p + "self_attn.o_proj.weight"))
+    attn_proj = ops.project(ctx_g, W, p + "self_attn.o_proj.weight")
     post = noise + attn_proj
     check("post_attn_residual", post, G.rust("l0_post_attn_residual"))
 
     # 5. MLP from GOLDEN post_attn_residual -> l0_out
     post_g = G.rust("l0_post_attn_residual")
     xn2 = ops.rmsnorm(post_g, W.raw(p + "post_attention_layernorm.weight"))
-    gate = ops.proj(xn2, *W.qproj(p + "mlp.gate_proj.weight"))
-    up = ops.proj(xn2, *W.qproj(p + "mlp.up_proj.weight"))
+    gate = ops.project(xn2, W, p + "mlp.gate_proj.weight")
+    up = ops.project(xn2, W, p + "mlp.up_proj.weight")
     s = ops.swiglu(gate, up)
-    d = ops.proj(s, *W.qproj(p + "mlp.down_proj.weight"))
+    d = ops.project(s, W, p + "mlp.down_proj.weight")
     l0_out = post_g + d
     check("l0_out (MLP)", l0_out, G.rust("l0_out"))
 
@@ -559,21 +739,45 @@ def op_by_op(ops, W, cfg, G, cos_gate=0.99):
 # ─────────────────────────────────────────────────────────────────────────────
 # Full unfused body validation (Gate D step 1)
 # ─────────────────────────────────────────────────────────────────────────────
-def full_body(ops, W, cfg, G, cos_gate=0.99):
+def full_body(ops, W, cfg, G, cos_gate=0.99, warm_runs=0):
     print("=== full unfused body ===")
     noise = G.inp("noise_embedding").astype(np.float32)
     target_hidden = G.inp("target_hidden").astype(np.float32)
 
+    # One-time setup (weight int8 quant) is NOT part of the block forward budget.
+    prequantize(W, cfg, ops.proj_mode, resident=ops.resident_weights)
+
     t0 = time.perf_counter()
-    thp = compute_thp(ops, W, cfg, target_hidden)
+    thp = compute_thp(ops, W, cfg, target_hidden, proj_mode=ops.proj_mode)
     per_layer = []
     final = run_body(ops, W, cfg, noise, thp, per_layer_out=per_layer)
     wall = time.perf_counter() - t0
 
-    # bf16/int8-precision numpy reference
-    thp_ref = compute_thp(None, W, cfg, target_hidden, use_ref=True)
+    # Steady-state (warm) block wall: repeat the body with everything resident
+    # (JIT cache warm, contexts loaded, weights already quantized). This is the
+    # number the <57 ms Gate-D budget refers to; the first pass still pays
+    # xclbin/context load + first-touch costs.
+    warm_wall = None
+    if warm_runs > 0:
+        d0, o0 = ops.dispatches, ops.op_dispatches
+        wt = []
+        warm_npu = []
+        for _ in range(warm_runs):
+            n0 = ops.npu_ns
+            t1 = time.perf_counter()
+            thp_w = compute_thp(ops, W, cfg, target_hidden, proj_mode=ops.proj_mode)
+            run_body(ops, W, cfg, noise, thp_w)
+            wt.append(time.perf_counter() - t1)
+            warm_npu.append(ops.npu_ns - n0)
+        warm_wall = min(wt)
+        warm_npu_s = warm_npu[wt.index(warm_wall)] / 1e9
+        # warm passes are timing-only: don't let them inflate the reported counts
+        ops.dispatches, ops.op_dispatches = d0, o0
+
+    # bf16/int8-precision numpy reference (mirrors the active device precision)
+    thp_ref = compute_thp(None, W, cfg, target_hidden, use_ref=True, proj_mode=ops.proj_mode)
     per_layer_ref = []
-    final_ref = ref_body(W, cfg, noise, thp_ref, per_layer_out=per_layer_ref)
+    final_ref = ref_body(W, cfg, noise, thp_ref, per_layer_out=per_layer_ref, proj_mode=ops.proj_mode)
 
     gold_final = G.rust("final_block_hidden")
     ok = True
@@ -591,8 +795,18 @@ def full_body(ops, W, cfg, G, cos_gate=0.99):
     print(f"    cos vs golden          = {c_golden:.6f}")
     print(f"    cos vs int8/bf16 ref   = {c_ref:.6f}")
     print(f"    (ref  vs golden        = {c_refgold:.6f})")
+    nl = cfg.NL
     print(f"  raw NPU dispatches = {ops.dispatches}  |  logical op dispatches = {ops.op_dispatches}")
-    print(f"  wall = {wall:.1f} s")
+    print(f"  per-layer: raw≈{ops.dispatches/nl:.1f}  logical≈{ops.op_dispatches/nl:.1f} "
+          f"(config: batch_ops={ops.batch_ops} proj_mode={ops.proj_mode})")
+    print(f"  wall (cold) = {wall:.2f} s  ({wall*1e3/nl:.0f} ms/layer)")
+    if warm_wall is not None:
+        print(f"  wall (warm) = {warm_wall*1e3:.0f} ms  ({warm_wall*1e3/nl:.0f} ms/layer)"
+              f"   [Gate D budget: <57 ms/block]")
+        host = warm_wall - warm_npu_s
+        print(f"    NPU-busy  = {warm_npu_s*1e3:.0f} ms  ({warm_npu_s/warm_wall*100:.0f}% of warm wall)")
+        print(f"    host/XRT  = {host*1e3:.0f} ms  ({host*1e3/max(ops.dispatches,1):.2f} ms per dispatch"
+              f" over {ops.dispatches} dispatches)")
 
     gate = (c_golden > cos_gate) and (c_ref > cos_gate)
     print(f"=== GATE D step 1: {'MET' if gate else 'NOT MET'} "
@@ -606,6 +820,17 @@ def main():
     ap.add_argument("--weights", type=str, required=True, help="safetensors file or HF dir")
     ap.add_argument("--op-by-op", action="store_true", help="layer-0 hand-off checks only")
     ap.add_argument("--cos-gate", type=float, default=0.99)
+    ap.add_argument("--batch-ops", action="store_true",
+                    help="Lever 1: batch norm/headnorm/rope/swiglu (one dispatch each)")
+    ap.add_argument("--resident-weights", action="store_true",
+                    help="upload int8 projection weights to the NPU once "
+                         "(row proj only); avoids ~1 GB of re-upload per pass")
+    ap.add_argument("--warm-runs", type=int, default=0,
+                    help="extra timing-only body passes; reports the best as the "
+                         "steady-state (warm) block wall")
+    ap.add_argument("--proj", choices=["group", "row"], default="group",
+                    help="Lever 2: 'group'=per-256-group int8 (baseline); "
+                         "'row'=full-K per-row/per-channel int8 (2a, one dispatch/proj)")
     args = ap.parse_args()
 
     G = Golden(args.golden_dir)
@@ -616,12 +841,15 @@ def main():
           f"NH={cfg.NH} NKV={cfg.NKV} NL={cfg.NL} theta={cfg.THETA:.0e}")
     print(f"[dflash_body_npu] loading weights ...")
     W = Weights(args.weights)
-    ops = NpuOps()
+    ops = NpuOps(batch_ops=args.batch_ops, proj_mode=args.proj,
+                 resident_weights=args.resident_weights)
+    print(f"[dflash_body_npu] config: batch_ops={ops.batch_ops} "
+          f"proj_mode={ops.proj_mode} resident_weights={ops.resident_weights}")
 
     if args.op_by_op:
         ok = op_by_op(ops, W, cfg, G, args.cos_gate)
     else:
-        ok = full_body(ops, W, cfg, G, args.cos_gate)
+        ok = full_body(ops, W, cfg, G, args.cos_gate, warm_runs=args.warm_runs)
     return 0 if ok else 1
 
 
