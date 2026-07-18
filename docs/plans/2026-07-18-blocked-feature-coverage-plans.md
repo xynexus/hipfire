@@ -21,43 +21,54 @@ written against a residual-scale layout that the shipped checkpoint does not use
 - **Loader expects:** model-level `model.input_hidden_states_scale` (L148) + per-layer
   TWO blocks `{prefix}.post_attention_residual_scale.{hidden_states,residual}_{scale,bias}`
   and `{prefix}.post_mlp_residual_scale.*` (via `ZayaResidualScale::load`, L107-113).
-- **Real ZAYA1-8B has** (from model.safetensors.index.json):
-  - model-level: `model.res_scale.{hidden_states,residual}_{scale,bias}` (4 tensors)
-  - per-layer: `model.layers.N.res_scale.{hidden_states,residual}_{scale,bias}`
-  - config: `residual_in_fp32: true`, `scale_residual_merge: true`, `num_hidden_layers: 80`.
-- So the real model uses ONE **merged** `res_scale` block per layer (+ one at model
-  level), not a model-level input scale + two post-op blocks. Load fails at the first
-  missing tensor (`model.input_hidden_states_scale`), before any weight, on ANY quant
-  format (bf16 included). The zaya serving path has never loaded the real checkpoint;
-  only the config-parse test (`parses_zaya1_8b`) exercises real data.
+- **Real ZAYA1-8B has** (CONFIRMED via Zyphra/transformers `zaya1-vl` modeling code +
+  model.safetensors.index.json inventory):
+  - per-half-layer `model.layers.N.res_scale.*` (N in 0..80): `hidden_states_scale`
+    + `hidden_states_bias` ALWAYS (80 each); `residual_scale` + `residual_bias` only
+    if not first layer (79 each — layer 0 omits them).
+  - model-level `model.res_scale.{hidden_states,residual}_{scale,bias}` (1 each).
+  - config: `residual_in_fp32: true`, `scale_residual_merge: true`,
+    `num_hidden_layers: 80`, hidden 2048.
+- **Confirmed semantics** (upstream `ResidualScaling` module): ZAYA alternates ATT and
+  MLP *half-layers* (matches the zaya crate's `half_layer_roles_alternate` test and the
+  `blocks=40` load log → 40 att + 40 mlp = 80). Each half-layer applies its `res_scale`
+  ONCE: `hidden_states = (hidden_states + hidden_states_bias) * hidden_states_scale`,
+  and (layer>0) `residual = (residual + residual_bias) * residual_scale`, gated on
+  `scale_residual_merge`. So per full transformer layer the scaling happens TWICE (once
+  in the att half, once in the mlp half) — the loader's `post_attention_residual_scale`
+  + `post_mlp_residual_scale` intuition was directionally right about "twice per layer"
+  but modeled it as two blocks on ONE layer index instead of one block on each of two
+  half-layer indices, and it invented a nonexistent `model.input_hidden_states_scale`.
+- Load fails at the first missing tensor (`model.input_hidden_states_scale`), before any
+  weight, on ANY quant format (bf16 included). The zaya serving path has never loaded
+  the real checkpoint; only the config-parse test (`parses_zaya1_8b`) exercises real data.
 
-### Plan
-1. **Nail the real forward semantics first.** Read Zyphra's ZAYA1 modeling code (HF
-   `Zyphra/ZAYA1-8B/*.py` or config `auto_map`) to learn exactly where the single
-   `res_scale` applies and what `scale_residual_merge` means (likely: one affine
-   `h = hidden_states_scale*h + hidden_states_bias`, `residual = residual_scale*res +
-   residual_bias`, merged into a single residual-combine per layer, vs the loader's
-   two-op post-attn/post-mlp assumption). Cross-check against `cpu.rs` reference math
-   (L50, L67-71) which currently applies `input_hidden_states_scale` then per-op
-   `residual_scale(...)` with the two blocks.
-2. **Reshape the loader** (`weights.rs`): replace `input_hidden_states_scale` +
-   `post_{attention,mlp}_residual_scale` with a single per-layer `res_scale` block
-   (`ZayaResidualScale::load(src, "{prefix}.res_scale")`) + a model-level
-   `model.res_scale` block. Add `residual_bias` (the real model has it; current
-   `ZayaResidualScale` has scale/bias for hidden_states + residual_scale but check
-   residual_bias coverage at L99-113).
-3. **Reconcile the forward math** in `cpu.rs` and `gpu.rs` to the merged single-scale
-   layout so the reference (cpu) and GPU paths agree; keep `residual_in_fp32`.
-4. **Validate:** the ZAYA1-8B.oq4.125.hfq artifact already exists
+### Plan (semantics now RESOLVED — see above; implementation is mechanical-ish)
+1. **Reshape the loader** (`weights.rs`): per half-layer, load ONE `res_scale` block via
+   `ZayaResidualScale::load(src, "{prefix}.res_scale")` (currently at L107-113); drop the
+   `post_attention_residual_scale`/`post_mlp_residual_scale` two-block model (L124-125,
+   L208-215) and the model-level `input_hidden_states_scale` (L148). Make
+   `residual_{scale,bias}` OPTIONAL (layer 0 omits them → `Option<Vec<f32>>` or default
+   to identity scale=1/bias=0). Add a model-level `model.res_scale` block.
+2. **Reconcile the forward math** in `cpu.rs` (L50, L67-71) and `gpu.rs`: each half-layer
+   applies its single res_scale ONCE — `h = (h + hidden_states_bias) * hidden_states_scale`
+   and (layer>0) `residual = (residual + residual_bias) * residual_scale`, gated on
+   `scale_residual_merge`. Remove the `input_hidden_states_scale` pre-scale. Keep
+   `residual_in_fp32`. The half-layer ATT/MLP alternation already exists (tests pass), so
+   this is a residual-scale rewrite, not a layer-structure change.
+3. **Validate:** the ZAYA1-8B.oq4.125.hfq artifact already exists
    (scratchpad/, 5.25GB) — once loading works, `hipfire chat` coherence check at
    temperature 0 (base model → factual continuation). Also validates the qt-36 OQ
    path end-to-end on GPU (currently only unit-tested). A bf16 zaya quant is the
    cleaner first load target (isolates the structural fix from quant).
 
 ### Risk / unknowns
-Medium-large. Requires reading the upstream modeling code (the exact merge semantics
-are the crux). Touches loader + both forward paths. Not a rename — an architecture
-reconciliation. ~half-day with the reference code in hand.
+Medium (downgraded — semantics now RESOLVED above from upstream code + checkpoint
+inventory). Touches the loader + cpu/gpu forward residual-scale math; the half-layer
+structure is already correct. Main remaining care: get the model-level `model.res_scale`
+application point right (upstream applies it within the layer loop, not at the model
+boundary — verify against a bf16 load before trusting) and keep cpu/gpu in agreement.
+~half-day; validatable on the existing artifact.
 
 ---
 
