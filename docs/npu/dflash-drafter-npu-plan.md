@@ -258,6 +258,20 @@ golden.
 
 1. **Unfused body**: chain all ops op-by-op (each its own dispatch); validate full
    `[16, hidden]` output parity. This is correctness-first; expect ~40 dispatches.
+   **DONE (Gate D step 1, nix1 npu1).** `tools/npu/dflash_body_npu.py` composes the
+   Gate-B primitives + Gate-C attention into the full 5-layer body in one process
+   via the shared `CachedXRTRuntime` (unified LRU so the pre-built xclbins and the
+   `@iron.jit` int8 projection/attention share npu1's context budget — a separate
+   `XRTHostRuntime` blew the hw-context limit, `CREATE_HWCTX err=-22`). Op-by-op
+   layer-0 hand-offs all pass (cos > 0.9999 vs each golden slice). Full unfused
+   body: **cos = 0.99902 vs the f16 golden `rust_final_block_hidden`** and **cos =
+   0.99915 vs a bf16/int8-precision numpy reference** (per-layer `l{0..4}_out` all
+   cos > 0.999); the precision reference itself sits at cos 0.99943 vs the golden,
+   so the on-device body is at the bf16/int8 floor. 88 logical op-dispatches (2048
+   raw, since per-group G256 projection = one matmul/group and the norm/rope/swiglu
+   xclbins are per-row), ~23 s wall (unfused, correctness-first). Gate on cos, not a
+   fixed abs tol (Gate-C precedent). Run:
+   `dflash_body_npu.py --golden-dir <OUT>/rust --weights <safetensors> [--op-by-op]`.
 2. **Fuse stage 1** per layer: rmsnorm → qkv → q/k-norm → RoPE in one dispatch.
 3. **Fuse stage 3** per layer: o-proj → residual → rmsnorm → gate/up → SiLU → down
    → residual in one dispatch. (Attention stays its own dispatch — different
