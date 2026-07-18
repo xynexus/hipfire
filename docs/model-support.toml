@@ -303,6 +303,40 @@ feature = "prefill"
 support = "partial"
 note = "LFM2 OQ8+ shares OQ8 runtime kernels; calibrated plus artifact quality is pending"
 
+# Qwen2 (arch 7) gained the OQ loader path: load_weight_tensor now repacks the
+# OQ codes (33/34/35/36/37) via the shared oq4_arch/oq8_arch helpers, so qwen2
+# serves OQ through the same generic dtype-dispatched weight_gemv/weight_gemm
+# kernels as every other simple-AR family. Marked partial pending GPU quality
+# admission (loader + generic kernels are in place; coherence/parity not yet run).
+
+[[gate]]
+arch = 7
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "Qwen2 OQ4 W4A4 loads via oq4_arch_load into the generic iu4 GEMM route; quality admission pending"
+
+[[gate]]
+arch = 7
+quant = "oq4+"
+feature = "prefill"
+support = "partial"
+note = "Qwen2 OQ4+ W4A8 loads via oq4_to_oq8_combined into the shared int8-activation route; quality admission pending"
+
+[[gate]]
+arch = 7
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "Qwen2 OQ8 W8A8 loads via oq8_combined into the shared iu8 GEMM route; quality admission pending"
+
+[[gate]]
+arch = 7
+quant = "oq8+"
+feature = "prefill"
+support = "partial"
+note = "Qwen2 OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending"
+
 # ── Diffusion (image/video denoiser) capability matrix ─────────────────────────
 # A SEPARATE matrix from the [[arch]] rows above: diffusion families are graded on
 # the image-generation pipeline spine (text-encoder → denoise → sampler → VAE →

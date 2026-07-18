@@ -277,6 +277,10 @@ pub const GATE_TABLE: &[GateRow] = &[
     GateRow { arch: 11, quant: "oq4+", feature: "prefill", support: FeatureSupport::Partial, note: "LFM2 OQ4+ W4A8 prefill routes through int8 activation MMQ; full calibration/quality pending" },
     GateRow { arch: 11, quant: "oq8", feature: "prefill", support: FeatureSupport::Partial, note: "LFM2 OQ8 W8A8 prefill routes through iu8 WMMA; current evidence is 350M smoke/parity" },
     GateRow { arch: 11, quant: "oq8+", feature: "prefill", support: FeatureSupport::Partial, note: "LFM2 OQ8+ shares OQ8 runtime kernels; calibrated plus artifact quality is pending" },
+    GateRow { arch: 7, quant: "oq4", feature: "prefill", support: FeatureSupport::Partial, note: "Qwen2 OQ4 W4A4 loads via oq4_arch_load into the generic iu4 GEMM route; quality admission pending" },
+    GateRow { arch: 7, quant: "oq4+", feature: "prefill", support: FeatureSupport::Partial, note: "Qwen2 OQ4+ W4A8 loads via oq4_to_oq8_combined into the shared int8-activation route; quality admission pending" },
+    GateRow { arch: 7, quant: "oq8", feature: "prefill", support: FeatureSupport::Partial, note: "Qwen2 OQ8 W8A8 loads via oq8_combined into the shared iu8 GEMM route; quality admission pending" },
+    GateRow { arch: 7, quant: "oq8+", feature: "prefill", support: FeatureSupport::Partial, note: "Qwen2 OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending" },
 ];
 
 /// One row of the diffusion (image/video denoiser) capability matrix.
