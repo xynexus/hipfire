@@ -100,14 +100,14 @@ impl Gemma4DenseState {
             .fold((0usize, 0usize, 0usize), |(kw, qh, _), spec| {
                 (kw.max(spec.kv_width()), qh.max(spec.q_heads), spec.head_dim)
             });
-        // KVarN on a KV-shared global layer (attend-only against the producer's
-        // kvarn cache) is a follow-up, so models with KV-sharing (E2B/E4B) stay fp32
-        // KV for now even when kv_mode=kvarn. Non-shared gemma4 (31B) is unaffected.
+        // KVarN applies to the producer (Own) global/Full layers; KV-shared global
+        // layers attend read-only against the producer's kvarn cache (handled in
+        // attention_block). E2B/E4B global head_dim is 512 → the `_hd512` kvarn kernels.
         let has_kv_share = config
             .layers
             .iter()
             .any(|l| !matches!(l.kv_producer, KvProducer::Own));
-        let kv_kvarn = matches!(kv_mode, KvQuantMode::Kvarn) && max_kv_width > 0 && !has_kv_share;
+        let kv_kvarn = matches!(kv_mode, KvQuantMode::Kvarn) && max_kv_width > 0;
         let kv = if kv_kvarn {
             LayeredKvArena::new_kvarn(gpu, plan.clone(), kvarn_bits)?
         } else {
@@ -589,29 +589,21 @@ fn attention_block(
             }
         }
         KvStorageKind::Full if cache.quant_kvarn => {
-            // KVarN on a KV-shared global layer (attend-only against the producer's
-            // kvarn cache) is a follow-up; kvarn_attend here would write into the
-            // producer's cache. Not reached under fp32 KV (kv_mode default).
-            if is_shared {
-                return Err(HipError::new(
-                    0,
-                    "gemma4 KVarN on KV-shared layers is not yet supported (use fp32 KV)",
-                ));
-            }
-            // KVarN (variance-normalized bits-bit K + Q8 V) fused write+attend for
-            // the global/full-context layers, n=1 (decode + per-token prefill). Local
-            // sliding-window layers stay F32 (the arm above). Mirrors gemma3's KVarN
-            // hook. Full storage → physical position == absolute.
+            // KVarN (variance-normalized bits-bit K + Q8 V) for global/full-context
+            // layers, n=1 (decode + per-token prefill). A producer (Own) layer does the
+            // fused write+attend; a KV-shared layer reuses the producer's kvarn cache
+            // (already written this token) and attends READ-ONLY — no K/V write.
             set_position(gpu, state, position)?;
             // Optional Hadamard-incoherence rotation of K and Q by the SAME per-head
-            // FWHT-256 (scores preserved; V/Q8 stays un-rotated). Opt out with
-            // HIPFIRE_KVARN_ROTATE=0. Requires head_dim==256 (gemma4's shape).
+            // FWHT-256; skipped at gemma4's global head_dim 512 (kvarn runs unrotated).
             static KVARN_ROTATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let kvarn_rotate = *KVARN_ROTATE
                 .get_or_init(|| std::env::var("HIPFIRE_KVARN_ROTATE").ok().as_deref() != Some("0"));
             if kvarn_rotate && geometry.head_dim == 256 {
-                gpu.rotate_x_mq_batched(&scratch.k, &scratch.k, kv_width, 1)?;
                 gpu.rotate_x_mq_batched(&scratch.q, &scratch.q, q_width, 1)?;
+                if !is_shared {
+                    gpu.rotate_x_mq_batched(&scratch.k, &scratch.k, kv_width, 1)?;
+                }
             }
             // The KV kernels read positions from a GpuTensor; wrap the raw 4-byte i32
             // pos_buf as a non-owning [1] view (mirrors gemma3/qwen35's KVarN hook).
@@ -620,34 +612,64 @@ fn attention_block(
                 shape: vec![1],
                 dtype: DType::F32,
             };
-            gpu.kvarn_attend(
-                cache.k,
-                cache.k_window.expect("kvarn cache view exposes k_window"),
-                cache.v,
-                &scratch.q,
-                &scratch.k,
-                &scratch.v,
-                &pos_view,
-                &scratch.attention,
-                state
-                    .kvarn_flash_partials
-                    .as_ref()
-                    .expect("kvarn scratch allocated when kv_mode=kvarn"),
-                state
-                    .kvarn_tiles
-                    .as_ref()
-                    .expect("kvarn scratch allocated when kv_mode=kvarn"),
-                1,
-                position,
-                geometry.q_heads,
-                geometry.kv_heads,
-                geometry.head_dim,
-                cache.physical_cap,
-                None,
-                0,
-                0,
-                cache.kvarn_bits,
-            )?;
+            let flash_partials = state
+                .kvarn_flash_partials
+                .as_ref()
+                .expect("kvarn scratch allocated when kv_mode=kvarn");
+            if is_shared {
+                // Read-only kvarn flash over the producer's records + window.
+                let seq_len = position + 1;
+                let n_full_blocks = seq_len / KvCache::KVARN_GROUP;
+                let rec_bytes =
+                    KvCache::kvarn_k_record_bytes_bits(geometry.head_dim, cache.kvarn_bits);
+                gpu.attention_flash_kvarn_batched_masked(
+                    &scratch.q,
+                    cache.k,
+                    cache.k_window.expect("kvarn cache view exposes k_window"),
+                    cache.v,
+                    &scratch.attention,
+                    &pos_view,
+                    geometry.q_heads,
+                    geometry.kv_heads,
+                    geometry.head_dim,
+                    cache.physical_cap,
+                    seq_len,
+                    1,
+                    flash_partials,
+                    None,
+                    0,
+                    0,
+                    n_full_blocks,
+                    rec_bytes,
+                    cache.kvarn_bits,
+                )?;
+            } else {
+                gpu.kvarn_attend(
+                    cache.k,
+                    cache.k_window.expect("kvarn cache view exposes k_window"),
+                    cache.v,
+                    &scratch.q,
+                    &scratch.k,
+                    &scratch.v,
+                    &pos_view,
+                    &scratch.attention,
+                    flash_partials,
+                    state
+                        .kvarn_tiles
+                        .as_ref()
+                        .expect("kvarn scratch allocated when kv_mode=kvarn"),
+                    1,
+                    position,
+                    geometry.q_heads,
+                    geometry.kv_heads,
+                    geometry.head_dim,
+                    cache.physical_cap,
+                    None,
+                    0,
+                    0,
+                    cache.kvarn_bits,
+                )?;
+            }
         }
         KvStorageKind::Full => {
             set_position(gpu, state, cache.physical_position)?;
