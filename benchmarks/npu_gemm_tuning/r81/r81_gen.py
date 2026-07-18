@@ -46,8 +46,10 @@ def projection_graph():
     lines = []
     for line in text.splitlines():
         if "aie.objectfifo.acquire @abc" in line or "aie.objectfifo.subview.access %a" in line:
-            line = line.replace("memref<8192xi8>", "memref<10240xi8>")
-        lines.append(line)
+            out_line = line.replace("memref<8192xi8>", "memref<10240xi8>")
+        else:
+            out_line = line
+        lines.append(out_line)
     text = "\n".join(lines) + "\n"
     text = text.replace(
         "(memref<8192xi8>, memref<16384xi8>, memref<2304xi32>)",

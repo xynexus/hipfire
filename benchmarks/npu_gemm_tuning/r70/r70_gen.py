@@ -45,9 +45,8 @@ def projection_graph():
     for marker in ("aie.objectfifo.acquire @abc", "aie.objectfifo.subview.access %a"):
         lines = []
         for line in text.splitlines():
-            if marker in line:
-                line = line.replace("memref<8192xi8>", "memref<10240xi8>")
-            lines.append(line)
+            out_line = line.replace("memref<8192xi8>", "memref<10240xi8>") if marker in line else line
+            lines.append(out_line)
         text = "\n".join(lines) + "\n"
     text = text.replace(
         "(memref<8192xi8>, memref<16384xi8>, memref<2304xi32>)",

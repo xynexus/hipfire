@@ -304,7 +304,7 @@ def do_run(cfg, trials, mode):
                 "--fill", str(cfg.fill)]
         env = _child_env()
         for _ in range(trials):
-            r = subprocess.run(base, capture_output=True, text=True, env=env)
+            r = subprocess.run(base, capture_output=True, text=True, env=env, check=False)
             line = (r.stdout.strip().splitlines() or [""])[-1]
             try:
                 record(json.loads(line))

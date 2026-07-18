@@ -597,16 +597,17 @@ def extend_core(op, col, row):
     if DIRECT_Q or LOCAL_Q:
         converted = []
         for line in result:
+            converted_line = line
             if "@r70_w4_scaled_group" in line:
-                line = line.replace(
+                converted_line = converted_line.replace(
                     "@r70_w4_scaled_group", "@r72_w4_scaled_group_cache"
                 ).replace("memref<2304xi32>", "memref<6144xi32>")
             if "@r65_w4_finish_bf16_slice" in line:
-                line = line.replace(
+                converted_line = converted_line.replace(
                     "@r65_w4_finish_bf16_slice",
                     "@r72_w4_finish_bf16_slice_cache",
                 ).replace("memref<2304xi32>", "memref<6144xi32>")
-            converted.append(line)
+            converted.append(converted_line)
         result = converted
     return result
 
