@@ -705,8 +705,19 @@ compute). This is **feed-free** (INNER recomputes resident tiles, no memtile pre
 so it isolates the compute ceiling: keeping C in the flowing accumulator removes the
 per-tile C-reload that pinned r6/SOTA to ~5–15 TOPS. **This flips the earlier
 "sublinear ~2.3×" verdict — that was the memtile dataflow; cascade is a different
-machine.** OPEN: the realistic feed-bound rate (a larger streaming design, memtile-fed)
-to see how much of the 10× survives real weight/activation feed.
+machine.**
+
+**MEASURED feed-bound too (streaming, INNER=1, NB=256):** **866 GMAC/s raw**
+(floor-included) = **4.1× r6**; the streaming work is 82 µs for 4.2 MB = **51 GB/s**
+(the memtile feed roof), so floor-excluded ≈ **1630 GMAC/s ≈ 8× r6**. This is at r5's
+*unfavorable* arithmetic intensity (~32 MACs/byte: it streams weights and holds
+activations resident — inverted from a real GEMM). At the **gate_up AI (341
+MACs/byte**, weights reused across M), feed drops ~10× and the kernel becomes
+**compute-bound → ~2090 GMAC/s ≈ 10× r6** (gate_up moves only ~2.36 MB, ~47 µs of
+feed vs milliseconds of compute). **Verdict: cascade delivers 4–10× over the memtile
+GEMM even feed-bound.** NEXT: a weight-resident / M-streamed cascade design (real
+gate_up dataflow, AI 341) to confirm the compute-bound ~10× directly, then wire into
+the FFN. Harness: `npu_cascade_time`; generator `r5_gen.py COLS ROWS NB`.
 
 **Prior art: `r5/` already prototyped cascade.** `benchmarks/npu_gemm_tuning/r5/`
 (`r5_cascade.cc`, `r5_2core.mlir`, `r5_4core.mlir`, `r5/README.md`) is a full
