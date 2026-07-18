@@ -280,6 +280,37 @@ physical fragmentation).
 > **Required before the projection can be trusted: re-measure the new kernel at real
 > DFlash weight sizes (~100 MB), not 8 MB.** This is now the top validation item.
 
+### The surviving lever has a hardware mechanism: the BD iteration dimension
+
+Our fully-lowered BD leaves **two of four levels of hardware pointer auto-advance idle**:
+
+```
+"aiex.npu.writebd"() <{ buffer_length = 262144, d0_size = 128, d0_stride = 0,
+   d1_size = 16, d1_stride = 127, d2_size = 0, d2_stride = 4095,
+   iteration_current = 0, iteration_size = 0, iteration_stride = 0, ... }>
+```
+
+- `d2_size = 0` — third traversal dimension unused (the innermost contiguous run folds
+  into `buffer_length`, so `_split()`'s two dims occupy d0/d1).
+- `iteration_size = 0, iteration_stride = 0` — the **iteration dimension is entirely
+  unused**. This is design-guide lever #10, *"fuller weight-replay (`iter_count`/
+  `repeat_count`) — one weight object feeds many activation macros."*
+
+That matters because replay is the hardware expression of **the one lever seven null knobs
+left standing: more activation rows per weight fetch**. It does not raise the ~10 GB/s
+weight-path wall — it amortizes that wall over more useful work, which is the only
+direction still open besides cutting bytes.
+
+Caveats: the BD dump above is quoted from compiler output and has **not been independently
+re-derived here**. And for DFlash specifically, replay pays only where multiple activation
+blocks share one weight stream — a single sequence's block is already M=16 against a
+one-shot weight fetch, so the win would come from batching sequences/blocks, not from the
+existing per-block path. Scope before building.
+
+*(A parallel branch proposed re-probing the distinct-buffer anomaly as motivation for this;
+that anomaly was already resolved as a non-lever by r133 above — region count is flat at
+constant BO size. The iteration-dimension finding stands on its own.)*
+
 ### r14b (activation-fold) — dead as written, not dead in principle
 
 `benchmarks/npu_gemm_tuning/r14b/` folds A into the column shim object to free a channel.
