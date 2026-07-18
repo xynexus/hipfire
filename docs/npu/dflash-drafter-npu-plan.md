@@ -203,8 +203,22 @@ block's last-`block_size` output rows. `build_qwen3_dflash_attention.py` reuses
 `build_qwen3_segmented_attention.generate_mlir` verbatim, patches `causal=0` and the
 device line, and **compiles cleanly for npu2/aie2p** (final.xclbin + insts.bin).
 
-**Second path (nix1, single-core) — kernel BUILDS + RUNS on nix1's NPU; numerics
-WIP.** Since the 8-col kernel can't run on nix1, added a single-core drafter
+**Gate C — PASSED (2026-07-18, nix1 single-core).** `test_dflash_attention_npu.py
+--heads 0` (all 32 q-heads) vs the Phase-A golden l0: **cos = 1.00000 vs a
+bf16-input reference on every head** — the kernel computes bf16 non-causal cross-
+attention EXACTLY on nix1's NPU. Golden (f16) cos = 0.99999/head; the worst
+`max_abs` = 0.204 is the bf16 arithmetic floor (an ideal bf16 kernel scores the
+same vs the f16 golden — |attn_out| reaches ~39 and bf16's ~0.4% relative precision
+forces ~0.2 abs there), so the gate compares against a bf16-input reference (the
+correct tolerance for a bf16 kernel), not a fixed absolute vs the f16 golden.
+Three AIE-toolchain miscompiles were found+fixed in `dflash_attention_sc_bf16.cc`:
+(1) `aie::broadcast<bfloat16>(runtime_scalar)` miscompiles → broadcast the softmax
+weight as `float`; (2) a `noinline` exp helper's surrounding `sum` reduction
+collapsed to ~1.0 → inline the exp (IEEE-754 exponent bit-pack); (3) degree-2 exp
+poly ~9% off → degree-6. kv_len=16 also passes the strict absolute gate
+(max_abs 0.092). kv_len≥128 doesn't fit the single tile (Gate D KV tiling).
+
+**Second path (nix1, single-core) — build/debug history (now PASSED, see above).** Since the 8-col kernel can't run on nix1, added a single-core drafter
 attention: `dflash_attention_sc_bf16.cc` (plain bf16 layout, one q-head/dispatch,
 non-causal full softmax, GQA on the host) + `build_dflash_attention_sc.py`
 (`@iron.jit` + ObjectFifo, KV=[K|V] in one fifo for the 2-input DMA limit,

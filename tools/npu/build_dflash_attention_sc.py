@@ -52,7 +52,11 @@ def _attn_kernel(q_len: int, kv_len: int):
     )
 
 
-@iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
+# source_files=[KERNEL_SRC] folds the .cc mtime into the JIT cache key so that
+# editing the kernel reliably invalidates ~/.npu/cache (the ExternalFunction is
+# created inside the generator, after the cache hash is computed, so without this
+# the design hash would not track .cc edits — the JIT would reuse a stale xclbin).
+@iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"], source_files=[str(KERNEL_SRC)])
 def dflash_attn_head(Q: In, KV: In, O: Out, *,
                      q_len: CompileTime[int], kv_len: CompileTime[int]):
     nd = cast(Any, np.ndarray)

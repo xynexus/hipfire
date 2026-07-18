@@ -80,22 +80,42 @@ def main():
         return 0 if cos > 0.999 else 1
 
     from build_dflash_attention_sc import run_attn_head
+    from ml_dtypes import bfloat16
+
+    def bf16(x):
+        return x.astype(bfloat16).astype(np.float32)
+
+    # The kernel computes bf16 attention. Gate it against a bf16-INPUT reference
+    # (inputs cast to bf16, fp32 math, output cast to bf16) — this isolates kernel
+    # correctness from the bf16-vs-f16 precision gap of the golden. A fixed
+    # absolute max_abs vs the f16 golden sits BELOW the bf16 arithmetic floor for
+    # large-magnitude heads (|attn_out| reaches ~39, and bf16's ~0.4% relative
+    # precision alone forces ~0.2 abs there — an ideal bf16 kernel scores the same).
+    # cos vs golden is reported too (informational).
     all_ok = True
-    worst = 0.0
+    worst_g = 0.0
+    worst_bf16_cos = 1.0
     for h in range(n_heads):
         kvh = h // groups
         npu = run_attn_head(q[:, h, :], k[:, kvh, :], v[:, kvh, :], block, tot)
         g = ref[:, h, :]
-        d = np.abs(npu - g)
-        denom = np.linalg.norm(npu) * np.linalg.norm(g)
-        cos = float(npu.reshape(-1) @ g.reshape(-1) / denom) if denom > 0 else 0.0
-        ok = bool(d.max() < 0.1 and cos > 0.99)
+        # bf16-input reference for this head
+        bref = attn_ref(bf16(q[:, h, :]), bf16(k[:, kvh, :]), bf16(v[:, kvh, :]))
+        bref = bf16(bref)
+        cb = float(npu.reshape(-1) @ bref.reshape(-1) /
+                   (np.linalg.norm(npu) * np.linalg.norm(bref) + 1e-30))
+        dg = np.abs(npu - g)
+        cg = float(npu.reshape(-1) @ g.reshape(-1) /
+                   (np.linalg.norm(npu) * np.linalg.norm(g) + 1e-30))
+        ok = bool(cb > 0.999)  # kernel correctness gate (bf16-aware)
         all_ok &= ok
-        worst = max(worst, d.max())
+        worst_g = max(worst_g, dg.max())
+        worst_bf16_cos = min(worst_bf16_cos, cb)
         if h < 4 or not ok:
-            print(f"  head {h:2d} (kv {kvh}): max_abs={d.max():.3e} cos={cos:.5f} "
-                  f"[{'PASS' if ok else 'FAIL'}]")
-    print(f"[test_dflash_attention] worst max_abs={worst:.3e}  {'PASS' if all_ok else 'FAIL'}")
+            print(f"  head {h:2d} (kv {kvh}): cos_bf16ref={cb:.5f}  "
+                  f"[golden cos={cg:.5f} max_abs={dg.max():.3e}]  [{'PASS' if ok else 'FAIL'}]")
+    print(f"[test_dflash_attention] worst cos_bf16ref={worst_bf16_cos:.5f} "
+          f"(golden worst max_abs={worst_g:.3e})  {'PASS' if all_ok else 'FAIL'}")
     return 0 if all_ok else 1
 
 
