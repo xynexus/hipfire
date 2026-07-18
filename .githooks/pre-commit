@@ -53,11 +53,20 @@ CHANGED=$(git diff --cached --name-only --diff-filter=ACMR)
 STAGED_RS=$(echo "$CHANGED" | grep -E '\.rs$' || true)
 if [ -n "$STAGED_RS" ]; then
     echo "=== Env-var docs: regenerate + re-stage ==="
-    if cargo run -q -p hipfire-cli -- gen-env-docs 2>/dev/null; then
-        git add crates/hipfire-runtime/src/env_docs.rs
-        echo "  env-docs: regenerated + staged env_docs.rs (no-op if unchanged)"
+    # Only regenerate + re-stage when the author already staged env_docs.rs (an
+    # intentional env-var change). Force-staging it on every .rs commit pollutes
+    # unrelated commits, since gen-env-docs output varies with local build state
+    # (source line numbers, per-var descriptions). CI's `gen-env-docs --check`
+    # (tests/no-gpu-ci.sh) still guards real drift for forgotten updates.
+    if echo "$CHANGED" | grep -qx 'crates/hipfire-runtime/src/env_docs.rs'; then
+        if cargo run -q -p hipfire-cli -- gen-env-docs 2>/dev/null; then
+            git add crates/hipfire-runtime/src/env_docs.rs
+            echo "  env-docs: regenerated + re-staged (was already staged)"
+        else
+            echo "  env-docs: WARN gen-env-docs failed to run; skipping (CI --check still guards)"
+        fi
     else
-        echo "  env-docs: WARN gen-env-docs failed to run; skipping (CI --check still guards)"
+        echo "  env-docs: skipped (env_docs.rs not staged; CI --check guards drift)"
     fi
     echo
 
