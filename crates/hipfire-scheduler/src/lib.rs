@@ -608,6 +608,15 @@ impl ContinuousWorkScheduler {
         self.active.remove(&lease_id)
     }
 
+    /// The priority bucket the next `next_batch` call would draw from (honouring
+    /// aging), without removing anything. Lower = served sooner. A running batch
+    /// polls this to decide whether a higher-priority workload is waiting: if the
+    /// peeked priority is strictly less than the running batch's own priority, a
+    /// more-urgent workload would be granted next, so the batch should yield.
+    pub fn peek_next_priority(&self, now_ms: u64) -> Option<u8> {
+        self.next_seed(now_ms).map(|(priority, _)| priority as u8)
+    }
+
     pub fn snapshot(&self) -> ContinuousSchedulerSnapshot {
         ContinuousSchedulerSnapshot {
             queued: self.queued_ids.len(),
@@ -2819,6 +2828,19 @@ mod tests {
         assert_eq!(WorkloadClass::ImageGeneration.billing_class(), Auth::Image);
         assert_eq!(WorkloadClass::Training.billing_class(), Auth::Training);
         assert_eq!(WorkloadClass::Maintenance.billing_class(), Auth::Other);
+    }
+
+    #[test]
+    fn peek_next_priority_reports_most_urgent_queued_without_dequeuing() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        assert_eq!(scheduler.peek_next_priority(0), None);
+        scheduler.enqueue(token_workload("low", 128, 0)).unwrap();
+        assert_eq!(scheduler.peek_next_priority(1), Some(128));
+        // A more urgent (lower-number) workload takes over the peek.
+        scheduler.enqueue(token_workload("high", 8, 1)).unwrap();
+        assert_eq!(scheduler.peek_next_priority(2), Some(8));
+        // Peek is non-destructive: the queue is untouched.
+        assert_eq!(scheduler.snapshot().queued, 2);
     }
 
     #[test]

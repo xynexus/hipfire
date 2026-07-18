@@ -92,6 +92,27 @@ pub struct PendingRequest {
     pub worker_key_id: String,
     /// Delivers tokens / completion back to the awaiting HTTP task.
     pub tx: mpsc::UnboundedSender<BatchEvent>,
+    /// Set when this request was preempted mid-generation and re-queued: the
+    /// daemon session is already prefilled and resident at this `logical_position`,
+    /// so the resume cycle skips prefill and continues decoding from here. `None`
+    /// for a fresh request. `spec.max_tokens` carries the remaining token budget.
+    pub resume_position: Option<usize>,
+}
+
+/// Outcome of one `run_batch_cycle`. `Parked` carries the still-active requests
+/// (with resume cursors) when the batch yielded to higher-priority work before
+/// finishing; the daemon sessions stay resident so no decoded work is discarded.
+enum CycleOutcome {
+    Completed,
+    Parked(Vec<PendingRequest>),
+}
+
+/// Min decode steps a batch runs before it may be preempted (anti-thrash floor).
+fn min_quantum() -> u32 {
+    std::env::var("HIPFIRE_SERVER_PREEMPT_MIN_QUANTUM")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(4)
 }
 
 /// Registry of in-flight batch-path requests, keyed by request id.
@@ -113,6 +134,8 @@ pub struct BatchTelemetry {
     pub resident_runtime_sessions: u64,
     pub resident_decode_sessions: u64,
     pub pending_requests: u64,
+    /// Times a running batch yielded to a higher-priority workload (Phase 4).
+    pub preemptions: u64,
 }
 
 /// The generic seam the runner groups by: two requests may share one fused
@@ -266,6 +289,7 @@ impl BatchTelemetry {
             "last_chunk_size": self.last_chunk_size,
             "last_decode_ms": self.last_decode_ms,
             "active_sessions": self.active_sessions,
+            "preemptions": self.preemptions,
         })
     }
 
@@ -320,44 +344,72 @@ fn now_ms() -> u64 {
 }
 
 async fn batch_runner_loop(state: SharedState) {
+    // At most one batch is parked at a time (single-level cooperative
+    // preemption). `parked.1` is the priority it was running at; the daemon
+    // sessions for these requests stay resident so resume skips prefill.
+    let mut parked: Option<(Vec<PendingRequest>, u8)> = None;
     loop {
-        if state.work_scheduler.lock().await.snapshot().queued == 0 {
+        // What would the scheduler grant next (honouring aging)? Lower = sooner.
+        let waiter = {
+            let sched = state.work_scheduler.lock().await;
+            sched.peek_next_priority(now_ms())
+        };
+        // Resume the parked batch unless a strictly-higher-priority workload is
+        // queued (waiter < parked priority). Nothing queued (waiter None) resumes.
+        let resume_parked = match &parked {
+            Some((_, pri)) => waiter.map_or(true, |top| top >= *pri),
+            None => false,
+        };
+
+        if !resume_parked && waiter.is_none() {
+            // Nothing queued and nothing to resume: wait for work.
             tokio::select! {
                 _ = state.prefill_notify.notified() => {}
                 _ = tokio::time::sleep(Duration::from_millis(5)) => {}
             }
             continue;
         }
-        // Gather window: let concurrent requests accumulate before the scheduler
-        // forms the batch (so a burst coalesces instead of running one-at-a-time).
-        let wait_ms = batch_wait_ms();
-        if wait_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-        }
-        // Admission: the ContinuousWorkScheduler is the front-end. It picks a
-        // priority seed, greedily groups microbatch-compatible workloads (same
-        // worker key, up to max), admits by resource capacity, and hands back a
-        // lease. This replaces the old worker-key drain.
-        let lease = {
-            let mut sched = state.work_scheduler.lock().await;
-            sched.next_batch(now_ms())
-        };
-        let Some(lease) = lease else {
-            continue;
-        };
-        // Retrieve the parked requests for this lease's workloads.
-        let batch: Vec<PendingRequest> = {
-            let mut inbox = state.batch_inbox.lock().await;
-            lease
-                .workloads
-                .iter()
-                .filter_map(|w| inbox.remove(&w.id))
-                .collect()
-        };
-        if batch.is_empty() {
-            state.work_scheduler.lock().await.complete(lease.lease_id);
-            continue;
-        }
+
+        // Select the batch to run this iteration: the parked one (resume, no
+        // lease), or a fresh lease from the scheduler front-end.
+        let (batch, running_priority, lease_id): (Vec<PendingRequest>, u8, Option<u64>) =
+            if resume_parked {
+                let (b, pri) = parked.take().unwrap();
+                (b, pri, None)
+            } else {
+                // Gather window: let concurrent requests accumulate before the
+                // scheduler forms the batch (so a burst coalesces).
+                let wait_ms = batch_wait_ms();
+                if wait_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                }
+                let lease = {
+                    let mut sched = state.work_scheduler.lock().await;
+                    sched.next_batch(now_ms())
+                };
+                let Some(lease) = lease else {
+                    continue;
+                };
+                let batch: Vec<PendingRequest> = {
+                    let mut inbox = state.batch_inbox.lock().await;
+                    lease
+                        .workloads
+                        .iter()
+                        .filter_map(|w| inbox.remove(&w.id))
+                        .collect()
+                };
+                if batch.is_empty() {
+                    state.work_scheduler.lock().await.complete(lease.lease_id);
+                    continue;
+                }
+                let pri = lease
+                    .workloads
+                    .first()
+                    .map(|w| w.priority)
+                    .unwrap_or(u8::MAX);
+                (batch, pri, Some(lease.lease_id))
+            };
+
         let engine = state.engine.lock().await.take();
         let Some(mut engine) = engine else {
             for pending in batch {
@@ -365,12 +417,21 @@ async fn batch_runner_loop(state: SharedState) {
                     .tx
                     .send(BatchEvent::Error("daemon not running".to_string()));
             }
-            state.work_scheduler.lock().await.complete(lease.lease_id);
+            if let Some(id) = lease_id {
+                state.work_scheduler.lock().await.complete(id);
+            }
             continue;
         };
-        run_batch_cycle(&mut engine, &state, batch).await;
+        // Only park if nothing is already parked (single-level preemption).
+        let can_park = parked.is_none();
+        let outcome = run_batch_cycle(&mut engine, &state, batch, running_priority, can_park).await;
         *state.engine.lock().await = Some(engine);
-        state.work_scheduler.lock().await.complete(lease.lease_id);
+        if let Some(id) = lease_id {
+            state.work_scheduler.lock().await.complete(id);
+        }
+        if let CycleOutcome::Parked(remaining) = outcome {
+            parked = Some((remaining, running_priority));
+        }
     }
 }
 
@@ -380,43 +441,67 @@ fn fail_all(txs: &HashMap<String, mpsc::UnboundedSender<BatchEvent>>, msg: &str)
     }
 }
 
-/// One fused prefill + decode-to-completion cycle over `batch`.
+/// One fused prefill + decode cycle over `batch`. Runs to completion unless
+/// `can_park` and a higher-priority (lower number than `running_priority`)
+/// workload appears after the min-quantum floor, in which case the still-active
+/// requests are returned as `Parked` with their resume cursors and the daemon
+/// sessions are left resident.
 async fn run_batch_cycle(
     engine: &mut DaemonEngine,
     state: &SharedState,
     batch: Vec<PendingRequest>,
-) {
+    running_priority: u8,
+    can_park: bool,
+) -> CycleOutcome {
     let worker = batch[0].worker_key_id.clone();
     let batch_id = format!("batch-{}", batch[0].spec.id);
+    let resuming = batch[0].resume_position.is_some();
     let specs: Vec<SessionSpec> = batch.iter().map(|p| p.spec.clone()).collect();
     if std::env::var("HIPFIRE_BATCH_RUNNER_DEBUG").as_deref() == Ok("1") {
         eprintln!(
-            "[batch-cycle] coalesced {} request(s) into one batch",
+            "[batch-cycle] {} {} request(s) into one batch",
+            if resuming { "resumed" } else { "coalesced" },
             specs.len()
         );
     }
 
     let mut txs: HashMap<String, mpsc::UnboundedSender<BatchEvent>> = HashMap::new();
     let mut remaining: HashMap<String, usize> = HashMap::new();
+    let mut specs_by_id: HashMap<String, SessionSpec> = HashMap::new();
+    let mut resume_pos: HashMap<String, usize> = HashMap::new();
     for p in &batch {
         txs.insert(p.spec.id.clone(), p.tx.clone());
         remaining.insert(p.spec.id.clone(), p.spec.max_tokens.max(1));
+        specs_by_id.insert(p.spec.id.clone(), p.spec.clone());
+        if let Some(pos) = p.resume_position {
+            resume_pos.insert(p.spec.id.clone(), pos);
+        }
     }
 
-    // Fused prefill: warms every session's KV in one daemon call.
-    let prefill_req = build_batch_prefill_request(&batch_id, &worker, &specs);
-    let events = match engine.generate_batch_prefill(prefill_req).await {
-        Ok(events) => events,
-        Err(e) => return fail_all(&txs, &format!("batch prefill: {e}")),
-    };
+    // Fresh batches prefill every session's KV in one daemon call. Resumed
+    // batches skip prefill: the sessions are already resident at their cursor.
     let mut positions: HashMap<String, usize> = HashMap::new();
-    for ev in &events {
-        if ev.get("type").and_then(|t| t.as_str()) == Some("generate_batch_prefill_session_done") {
-            if let (Some(sid), Some(pos)) = (
-                ev.get("session_id").and_then(|v| v.as_str()),
-                ev.get("logical_position").and_then(|v| v.as_u64()),
-            ) {
-                positions.insert(sid.to_string(), pos as usize);
+    if resuming {
+        positions = resume_pos.clone();
+    } else {
+        let prefill_req = build_batch_prefill_request(&batch_id, &worker, &specs);
+        let events = match engine.generate_batch_prefill(prefill_req).await {
+            Ok(events) => events,
+            Err(e) => {
+                fail_all(&txs, &format!("batch prefill: {e}"));
+                return CycleOutcome::Completed;
+            }
+        };
+        for ev in &events {
+            if ev.get("type").and_then(|t| t.as_str())
+                == Some("generate_batch_prefill_session_done")
+            {
+                if let (Some(sid), Some(pos)) = (
+                    ev.get("session_id").and_then(|v| v.as_str()),
+                    ev.get("logical_position").and_then(|v| v.as_u64()),
+                ) {
+                    positions.insert(sid.to_string(), pos as usize);
+                }
             }
         }
     }
@@ -437,8 +522,10 @@ async fn run_batch_cycle(
         }
     }
 
+    let quantum = min_quantum();
     let mut last_backend: Option<String> = None;
     let mut chunk_count = 0u64;
+    let mut steps: u32 = 0;
     while !active.is_empty() {
         let cursors: Vec<DecodeCursor> = active
             .iter()
@@ -457,6 +544,7 @@ async fn run_batch_cycle(
             }
         };
         chunk_count += 1;
+        steps += 1;
 
         let mut still_active = Vec::new();
         for id in &active {
@@ -507,8 +595,41 @@ async fn run_batch_cycle(
                 .map(|s| s.to_string());
         }
         active = still_active;
+
+        // Cooperative preemption: past the min-quantum floor, yield to a
+        // strictly-higher-priority waiter. Park the still-active sessions
+        // (left resident in the daemon) so no decoded work is discarded; the
+        // runner resumes them once the higher-priority work drains.
+        if can_park && !active.is_empty() && steps >= quantum {
+            let waiter = state
+                .work_scheduler
+                .lock()
+                .await
+                .peek_next_priority(now_ms());
+            if waiter.is_some_and(|top| top < running_priority) {
+                let parked: Vec<PendingRequest> = active
+                    .iter()
+                    .filter_map(|id| {
+                        let mut spec = specs_by_id.get(id)?.clone();
+                        spec.max_tokens = remaining[id];
+                        Some(PendingRequest {
+                            spec,
+                            worker_key_id: worker.clone(),
+                            tx: txs.get(id)?.clone(),
+                            resume_position: Some(positions[id]),
+                        })
+                    })
+                    .collect();
+                let mut tel = state.batch_telemetry.lock().await;
+                tel.preemptions += 1;
+                tel.last_chunk_count = chunk_count;
+                tel.last_backend = last_backend;
+                return CycleOutcome::Parked(parked);
+            }
+        }
     }
 
+    // All requests finished: release the sessions and record the batch.
     let handles: Vec<String> = specs.iter().map(|s| s.id.clone()).collect();
     let _ = engine
         .release_sessions(build_release_request(&worker, &handles))
@@ -519,6 +640,7 @@ async fn run_batch_cycle(
     tel.selected_batch_size = specs.len() as u64;
     tel.last_chunk_count = chunk_count;
     tel.last_backend = last_backend;
+    CycleOutcome::Completed
 }
 
 #[cfg(test)]

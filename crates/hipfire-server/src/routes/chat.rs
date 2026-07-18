@@ -549,6 +549,25 @@ pub(crate) async fn ensure_model_loaded(
         .map_err(|e| e.to_string())?;
     params.residency_mode = Some(residency_plan.residency_mode.as_str().to_string());
     params.module_vram_budget_bytes = residency_plan.module_vram_budget_bytes;
+
+    // Fast path: the model is already loaded with sufficient max_seq. Return its
+    // context without touching the engine mutex. The batch runner takes the
+    // engine out of the mutex (leaving None) for the duration of an in-flight
+    // prefill+decode cycle, so a request that arrives mid-batch — e.g. a
+    // high-priority request meant to preempt a running low-priority one — would
+    // otherwise see None here and wrongly try to spawn a second daemon. A
+    // concurrent request only needs the loaded-model metadata to enqueue.
+    if let Some(loaded) = state.loaded_models.lock().await.get(&model_str).cloned() {
+        if loaded.max_seq >= params.max_seq {
+            return Ok(LoadedModelContext {
+                model_path: model_str,
+                worker_key_id: loaded.worker_key_id,
+                cache_capable: loaded.cache_capable,
+                arch: loaded.arch,
+            });
+        }
+    }
+
     let mut engine_guard = state.engine.lock().await;
 
     if let Some(eng) = engine_guard.as_mut() {
@@ -1824,6 +1843,7 @@ where
                     spec,
                     worker_key_id: worker_key_id.clone(),
                     tx,
+                    resume_position: None,
                 },
             );
         }
