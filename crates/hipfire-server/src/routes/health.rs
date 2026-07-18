@@ -54,6 +54,7 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
     // static metadata. With the flag off the legacy metadata view is kept.
     let batch_enabled = server_prefill_batch_enabled(&scheduler_env);
     let batch_telemetry = state.batch_telemetry.lock().await.clone();
+    let batch_pending = state.batch_inbox.lock().await.len();
     let mut prefill_batch = server_prefill_batch_health_json(&scheduler_env);
     if let Some(obj) = prefill_batch.as_object_mut() {
         obj.insert("queue_size".to_string(), json!(prefill_queue_size));
@@ -68,6 +69,8 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
                     obj.insert(k.clone(), v.clone());
                 }
             }
+            // Live gauge: requests parked in the batch inbox right now.
+            obj.insert("pending_requests".to_string(), json!(batch_pending));
             // The continuous-batching runner is active, so the server drives the
             // daemon's fused batch-prefill lifecycle. Capability is a static
             // property of the enabled runner, not of any currently-resident model
@@ -306,10 +309,13 @@ mod tests {
             "none",
             &AcceleratorInventory::not_probed(),
         );
+        // Continuous batching is on by default (Phase 2); use the kill switch to
+        // exercise the disabled batch payload shapes.
+        let batch_off = SchedulerPolicyEnv::from_pairs([("HIPFIRE_SERVER_PREFILL_BATCH", "0")]);
         let payload = json!({
-            "prefill_batch": server_prefill_batch_health_json(&SchedulerPolicyEnv::empty()),
-            "decode_batch": server_decode_batch_health_json(&SchedulerPolicyEnv::empty()),
-            "state_cache": server_state_cache_health_json(&SchedulerPolicyEnv::empty()),
+            "prefill_batch": server_prefill_batch_health_json(&batch_off),
+            "decode_batch": server_decode_batch_health_json(&batch_off),
+            "state_cache": server_state_cache_health_json(&batch_off),
             "deferred_jobs": crate::deferred_jobs::deferred_jobs_health_json(),
             "runtime_workers": runtime_workers,
             "batches": json!({ "enabled": true }),

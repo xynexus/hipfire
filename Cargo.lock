@@ -2207,6 +2207,8 @@ dependencies = [
  "base64",
  "futures",
  "hipfire-admin-types",
+ "hipfire-arch-api",
+ "hipfire-arch-specs",
  "hipfire-auth",
  "hipfire-build-info",
  "hipfire-config",

@@ -9,7 +9,7 @@
 
 use hipfire_arch_api::{
     default_importance, default_requires, register_arch, transformer_role, Arch, ArchId, CapReq,
-    ExpertLayout, Ingest, Init, TensorRole, TensorSpec, ToyFixture, ToyModel,
+    ContinuousBatching, ExpertLayout, Ingest, Init, TensorRole, TensorSpec, ToyFixture, ToyModel,
 };
 
 /// Qwen3.5 dense header id.
@@ -438,10 +438,25 @@ impl ToyModel for Qwen35MoeSpec {
     }
 }
 
+// Qwen3.5 dense + MoE are served through the server-side continuous-batching
+// runner (fused generate_batch_prefill + batched decode over N co-resident
+// sessions). Declaring the capability is how the serving layer decides a
+// request is safe to route through the batch path.
+impl ContinuousBatching for Qwen35Spec {
+    fn max_batch_sessions(&self) -> usize {
+        8
+    }
+}
+impl ContinuousBatching for Qwen35MoeSpec {
+    fn max_batch_sessions(&self) -> usize {
+        8
+    }
+}
+
 static QWEN35_SPEC: Qwen35Spec = Qwen35Spec;
 static QWEN35_MOE_SPEC: Qwen35MoeSpec = Qwen35MoeSpec;
-register_arch!(QWEN35_SPEC, Ingest, ToyModel);
-register_arch!(QWEN35_MOE_SPEC, Ingest, ToyModel);
+register_arch!(QWEN35_SPEC, Ingest, ToyModel, ContinuousBatching);
+register_arch!(QWEN35_MOE_SPEC, Ingest, ToyModel, ContinuousBatching);
 
 #[cfg(test)]
 mod tests {

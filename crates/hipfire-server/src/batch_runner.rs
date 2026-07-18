@@ -7,20 +7,67 @@
 //! a request registry the HTTP routes park into, plus the telemetry surface the
 //! `/health` route and `smoke-server-decode-batch.sh` read.
 //!
-//! This increment lands the registry + telemetry types and the `AppState`
-//! wiring. The runner task that owns the engine and drives
-//! reserve -> batch_prefill -> decode-step loop -> release plugs into these and
-//! lands next. Everything here is gated behind the default-off
-//! `HIPFIRE_SERVER_PREFILL_BATCH`; with it unset the inbox stays empty and the
-//! legacy monolithic per-request path (chat.rs engine.lock) is unaffected.
+//! It holds the request registry + telemetry, the runner task that owns the
+//! engine and drives reserve -> batch_prefill -> decode-step loop -> release,
+//! and the batch-eligibility gate ([`batch_eligible`], a declared arch
+//! capability via the arch-specs registry). Routing to the runner is on by
+//! default but only for eligible requests; `HIPFIRE_SERVER_PREFILL_BATCH=0` is
+//! the kill switch, and any ineligible request falls back to the legacy
+//! per-request path (chat.rs engine.lock).
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use hipfire_arch_api::ArchRegistry;
 use hipfire_daemon_adapter::DaemonEngine;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::state::SharedState;
+
+/// The arch registry, built once from the force-linked `-spec` crates
+/// (`hipfire-arch-specs` is a dep so their capability registrations are linked).
+fn arch_registry() -> &'static ArchRegistry {
+    static REG: OnceLock<ArchRegistry> = OnceLock::new();
+    REG.get_or_init(ArchRegistry::build)
+}
+
+/// Whether a request whose model reports arch tag `arch` (the daemon's
+/// `model_type`, e.g. `qwen3_5`) may be routed through the continuous-batching
+/// runner. Eligibility is a **declared arch capability** (`ContinuousBatching`)
+/// resolved via the arch-specs registry, AND the runtime envelope the daemon's
+/// fused batch path requires. Anything ineligible falls back to the legacy
+/// per-request path — the safe default that always works.
+pub fn batch_eligible(arch: Option<&str>) -> bool {
+    arch_supports_continuous_batching(arch) && batch_envelope_ok()
+}
+
+fn arch_supports_continuous_batching(arch: Option<&str>) -> bool {
+    let Some(arch) = arch else {
+        return false;
+    };
+    arch_registry()
+        .find_by_model_type(arch)
+        .and_then(|a| a.caps.continuous_batching)
+        .is_some()
+}
+
+/// Runtime toggles the fused batch path can't (or shouldn't yet) run under.
+/// Conservative: DFlash, pipeline-parallel > 1, and hierarchical KV route to the
+/// proven legacy path. (Hierarchical KV would fall to the serial-swap decode
+/// backend inside the batch op; excluded here until validated.)
+fn batch_envelope_ok() -> bool {
+    let hierarchical = std::env::var("HIPFIRE_KV_HIERARCHICAL").ok().as_deref() == Some("1");
+    let dflash = std::env::var("HIPFIRE_DFLASH_DRAFT")
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let pp_multi = std::env::var("HIPFIRE_PP_LAYERS")
+        .ok()
+        .map(|v| v.split(',').filter(|s| !s.trim().is_empty()).count() > 1)
+        .unwrap_or(false);
+    !hierarchical && !dflash && !pp_multi
+}
 
 /// One event delivered from the batch runner back to a waiting request task.
 #[derive(Clone, Debug)]
@@ -581,6 +628,26 @@ mod tests {
             diff_cache.batch_key(),
             "different cache mode must not"
         );
+    }
+
+    #[test]
+    fn batch_eligibility_reads_continuous_batching_capability() {
+        // qwen3.5 dense + MoE declare ContinuousBatching in their -spec crates,
+        // which hipfire-arch-specs force-links into this binary.
+        assert!(
+            arch_supports_continuous_batching(Some("qwen3_5")),
+            "qwen3.5 dense declares ContinuousBatching"
+        );
+        assert!(
+            arch_supports_continuous_batching(Some("qwen3_5_moe")),
+            "qwen3.5 MoE declares ContinuousBatching"
+        );
+        // An arch tag with no ContinuousBatching capability (or unknown) is not
+        // eligible — it routes to the legacy path.
+        assert!(!arch_supports_continuous_batching(Some(
+            "no_such_model_type"
+        )));
+        assert!(!arch_supports_continuous_batching(None));
     }
 
     #[test]

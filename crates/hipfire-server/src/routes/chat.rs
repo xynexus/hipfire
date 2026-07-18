@@ -357,6 +357,10 @@ pub(crate) struct LoadedModelContext {
     pub(crate) model_path: String,
     pub(crate) worker_key_id: Option<String>,
     pub(crate) cache_capable: bool,
+    /// Arch tag reported by the daemon load (a registered model_type, e.g.
+    /// `qwen3_5`). Used to resolve the ContinuousBatching capability for
+    /// batch-eligibility routing.
+    pub(crate) arch: Option<String>,
 }
 
 const MAX_REQUEST_TOKENS: u32 = 131_072;
@@ -556,6 +560,7 @@ pub(crate) async fn ensure_model_loaded(
                             model_path: model_str,
                             worker_key_id: loaded.worker_key_id,
                             cache_capable: loaded.cache_capable,
+                            arch: loaded.arch,
                         });
                     }
                     tracing::info!(
@@ -575,6 +580,7 @@ pub(crate) async fn ensure_model_loaded(
                     .await
                     .map_err(|e| e.to_string())?;
                 let cache_capable = loaded_response_cache_capable(&loaded);
+                let arch = loaded.arch.clone();
                 let worker_key_id = Some(loaded.worker_key_id);
                 set_loaded_model_state(
                     state,
@@ -583,6 +589,7 @@ pub(crate) async fn ensure_model_loaded(
                         worker_key_id: worker_key_id.clone(),
                         cache_capable,
                         max_seq: params.max_seq,
+                        arch: arch.clone(),
                     },
                 )
                 .await;
@@ -590,6 +597,7 @@ pub(crate) async fn ensure_model_loaded(
                     model_path: model_str,
                     worker_key_id,
                     cache_capable,
+                    arch,
                 });
             }
             Err(e) => {
@@ -614,6 +622,7 @@ pub(crate) async fn ensure_model_loaded(
         .map_err(|e| e.to_string())?;
 
     let cache_capable = loaded_response_cache_capable(&loaded);
+    let arch = loaded.arch.clone();
     let worker_key_id = Some(loaded.worker_key_id);
     set_loaded_model_state(
         state,
@@ -622,6 +631,7 @@ pub(crate) async fn ensure_model_loaded(
             worker_key_id: worker_key_id.clone(),
             cache_capable,
             max_seq: params.max_seq,
+            arch: arch.clone(),
         },
     )
     .await;
@@ -630,6 +640,7 @@ pub(crate) async fn ensure_model_loaded(
         model_path: model_str,
         worker_key_id,
         cache_capable,
+        arch,
     })
 }
 
@@ -1762,9 +1773,12 @@ where
 
     // Continuous-batching path: hand the request to the batch runner (which owns
     // the engine and fuses concurrent same-model requests) and await its streamed
-    // tokens, instead of taking the engine per-request. Opt-in via the same flag
-    // that spawns the runner; when off, fall through to the legacy path below.
-    if server_prefill_batch_enabled(&SchedulerPolicyEnv::from_pairs(std::env::vars())) {
+    // tokens, instead of taking the engine per-request. Gated by the flag that
+    // spawns the runner AND by batch-eligibility (arch declares ContinuousBatching
+    // + runtime envelope) — ineligible models fall through to the legacy path.
+    if server_prefill_batch_enabled(&SchedulerPolicyEnv::from_pairs(std::env::vars()))
+        && crate::batch_runner::batch_eligible(loaded.arch.as_deref())
+    {
         let controls = {
             let cfg = state.config.lock().await;
             let resolved = cfg.resolve_for_model(&model_arg);
@@ -3390,6 +3404,7 @@ mod tests {
                 worker_key_id: Some("worker-old".to_string()),
                 cache_capable: false,
                 max_seq: 1024,
+                arch: None,
             },
         );
 
@@ -3411,6 +3426,7 @@ mod tests {
                 worker_key_id: Some("worker-old".to_string()),
                 cache_capable: false,
                 max_seq: 4096,
+                arch: None,
             },
         );
         let status = json!({
@@ -3458,6 +3474,7 @@ mod tests {
                 worker_key_id: Some("worker-resident".to_string()),
                 cache_capable: false,
                 max_seq: 2048,
+                arch: None,
             },
         );
 

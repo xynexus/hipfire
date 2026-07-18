@@ -45,6 +45,10 @@ hipfire-generate = { path = "../hipfire-generate" }
 hipfire-diffusion = { path = "../hipfire-diffusion" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-arch-api = { path = "../hipfire-arch-api" }
+# Force-links every arch `-spec` crate so ArchRegistry sees their capability
+# registrations (e.g. ContinuousBatching) for batch-eligibility routing.
+hipfire-arch-specs = { path = "../hipfire-arch-specs" }
 hipfire-operator = { path = "../hipfire-operator" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-scheduler = { path = "../hipfire-scheduler" }

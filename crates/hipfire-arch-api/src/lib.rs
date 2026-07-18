@@ -150,6 +150,18 @@ pub trait BatchedPrefill: Sync + 'static {
     fn max_prefill_batch(&self) -> usize;
 }
 
+/// The arch can be served through the server-side continuous-batching runner:
+/// concurrent same-model requests fused into one `generate_batch_prefill` plus a
+/// batched decode-step lifecycle over N co-resident sessions. Distinct from
+/// [`BatchedPrefill`] (single-request prompt-in-one-forward). Presence is the
+/// "yes" that lets the serving layer route requests through the batch runner
+/// rather than the per-request path; the method carries the batch-size ceiling.
+pub trait ContinuousBatching: Sync + 'static {
+    /// Default upper bound on sessions fused into one batch (a starting value;
+    /// `HIPFIRE_SERVER_PREFILL_BATCH_MAX` still overrides at runtime).
+    fn max_batch_sessions(&self) -> usize;
+}
+
 /// The arch supports a speculative-decode *chain* drafter (linear draft of N
 /// tokens verified in one step). Distinct from a tree drafter.
 pub trait SpecDecodeChain: Sync + 'static {
@@ -192,6 +204,7 @@ pub trait Diffusion: Sync + 'static {
 /// registry construction from the arch's `register_arch!` list.
 pub struct Caps {
     pub batched_prefill: Option<&'static dyn BatchedPrefill>,
+    pub continuous_batching: Option<&'static dyn ContinuousBatching>,
     pub spec_decode_chain: Option<&'static dyn SpecDecodeChain>,
     pub toy_model: Option<&'static dyn ToyModel>,
     pub ingest: Option<&'static dyn Ingest>,
@@ -203,6 +216,7 @@ impl Caps {
     pub const fn none() -> Self {
         Caps {
             batched_prefill: None,
+            continuous_batching: None,
             spec_decode_chain: None,
             toy_model: None,
             ingest: None,
@@ -228,6 +242,7 @@ impl Caps {
             };
         }
         merge_field!(batched_prefill);
+        merge_field!(continuous_batching);
         merge_field!(spec_decode_chain);
         merge_field!(toy_model);
         merge_field!(ingest);
@@ -358,6 +373,10 @@ macro_rules! __set_cap {
     ($caps:ident, $inst:expr, BatchedPrefill) => {
         $caps.batched_prefill =
             ::core::option::Option::Some($inst as &'static dyn $crate::BatchedPrefill);
+    };
+    ($caps:ident, $inst:expr, ContinuousBatching) => {
+        $caps.continuous_batching =
+            ::core::option::Option::Some($inst as &'static dyn $crate::ContinuousBatching);
     };
     ($caps:ident, $inst:expr, SpecDecodeChain) => {
         $caps.spec_decode_chain =

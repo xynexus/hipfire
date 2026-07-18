@@ -1008,14 +1008,18 @@ pub fn parse_server_prefill_policy_controls(
 }
 
 pub fn server_prefill_batch_enabled(env: &SchedulerPolicyEnv) -> bool {
+    // On by default (Phase 2). The continuous-batching runner only takes effect
+    // for batch-eligible requests (see `batch_runner::batch_eligible`); everything
+    // else falls back to the legacy per-request path. `HIPFIRE_SERVER_PREFILL_BATCH=0`
+    // (or `off`/`false`/`no`) is the kill switch back to the legacy path for all.
     env.get("HIPFIRE_SERVER_PREFILL_BATCH")
         .map(|value| {
-            matches!(
+            !matches!(
                 value.trim().to_ascii_lowercase().as_str(),
-                "1" | "on" | "true"
+                "0" | "off" | "false" | "no"
             )
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 pub fn server_prefill_batch_health_json(env: &SchedulerPolicyEnv) -> serde_json::Value {
@@ -2082,11 +2086,17 @@ mod tests {
     }
 
     #[test]
-    fn server_prefill_batch_health_is_disabled_by_default() {
-        let payload = server_prefill_batch_health_json(&SchedulerPolicyEnv::empty());
+    fn server_prefill_batch_enabled_by_default_with_kill_switch() {
+        // Phase 2: on by default (unset -> enabled).
+        assert!(server_prefill_batch_enabled(&SchedulerPolicyEnv::empty()));
 
-        assert_eq!(payload, serde_json::json!({ "enabled": false }));
-        assert!(!server_prefill_batch_enabled(&SchedulerPolicyEnv::empty()));
+        // The kill switch disables it and collapses the health JSON.
+        let off = env(&[("HIPFIRE_SERVER_PREFILL_BATCH", "0")]);
+        assert!(!server_prefill_batch_enabled(&off));
+        assert_eq!(
+            server_prefill_batch_health_json(&off),
+            serde_json::json!({ "enabled": false })
+        );
     }
 
     #[test]

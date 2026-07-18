@@ -63,6 +63,9 @@ pub struct LoadedModelState {
     pub worker_key_id: Option<String>,
     pub cache_capable: bool,
     pub max_seq: u32,
+    /// Arch tag reported by the daemon load (a registered model_type), cached
+    /// for batch-eligibility routing.
+    pub arch: Option<String>,
 }
 
 pub struct AppState {
