@@ -37,6 +37,13 @@ testpaths = ["tests"]
 ignore_missing_imports = true
 follow_imports = "skip"
 check_untyped_defs = false
+# The NPU GEMM-tuning tree is a stack of throwaway experiment scaffolds: many
+# sibling `rNN/` dirs each ship a `run_matrix.py` (10+ and counting) with no
+# package markers, so mypy's flat module resolution collides on the basename
+# ("Duplicate module named 'run_matrix'") and bails before checking anything
+# else. New iterations land constantly, so exclude the tree here rather than
+# sprinkling `__init__.py` files. ruff still lints it.
+exclude = "^benchmarks/npu_gemm_tuning/"
 disable_error_code = [
   "annotation-unchecked",
   "arg-type",
