@@ -450,23 +450,30 @@ to the 37-MACs/byte artifact for any dtype pair without a specific ratio.
     `block_size` (2-8) positions and denoises the whole block in ONE bidirectional
     forward, with per-layer cross-attention over the target's hidden states. So
     the projections are M = block_size (weights reused across the block, AI ≈
-    block_size ≈ 7 — *not* the AI≈1 of an M=1 decode). The regime splits by size:
-    - The **full body** (5-layer, dim 4096, FFN 12288 — a ~1B block) is
-      **feed-starved**: ~1 GB int8 of weights ÷ 30.8 GB/s per block, so a block
-      costs tens of ms — it cannot hide under a few-ms GPU verify. **NPU-draft ‖
-      GPU-verify loses** at this size; the only lever is weight bit-width.
-    - A **tiny drafter** (h=512, 3-layer, ~5 M params) is **100% dispatch-floor
-      bound**: the entire block body's compute work is ~130 µs but one C1 floor is
-      155 µs, so unfused (per-op dispatch) is **92% floor tax** — 3869 µs/block.
-      **Fused whole-body: 304 µs for a 4-token block (13 158 tok/s, 4628 tok/J)**,
-      trivially hidden under a 3 ms verify: **the draft is free.**
+    block_size — *not* the AI≈1 of an M=1 decode). **The verify budget is the
+    target's OWN decode speed on this hardware, which is slow — that is what makes
+    NPU drafting hide.** Measured on nix1: qwen3.5-9B-mq4 decodes at **17.6 tok/s
+    (57 ms/token)**; by the memory-bound BW law (86.9 GiB/s effective) a 27B is
+    ~6.4 tok/s (155 ms) and a 31B-oq8 ~2.9 tok/s (345 ms). A block verify is one
+    batched forward ≈ one weight read ≈ that per-token budget. Against it:
+    - The **real trained z-lab body** (5-layer, dim 4096, FFN 12288, block 16 —
+      the ~1B draft that ships with 9B/27B targets) is feed-bound at **~16 ms/block
+      int4** (999 tok/s, 150 tok/J). That **hides under the real verify with 3.5×
+      (9B) to 20× (31B) margin — NPU-draft ‖ GPU-verify WINS**, freeing the GPU for
+      verify and drafting on the NPU's low-power rails. (Only a fabricated few-ms
+      verify made it "lose".)
+    - A **tiny drafter** (h=512, 3-layer) is instead **100% dispatch-floor bound**:
+      its whole block body is ~130 µs of work but one C1 floor is 155 µs, so
+      unfused is **92% floor tax** (3869 µs/block); fused whole-body is **304 µs**
+      (13 158 tok/s, 4628 tok/J).
 
-    So the tiny drafter's kernel imperative is **ONE fused dispatch for the whole
-    block body** — keep activations resident across all layers; individual GEMM
-    efficiency is irrelevant when the floor is 12× the work. Big drafter →
-    weight-bit-width; tiny drafter → fusion. `python -m aiecost.design drafter
-    --block-size 4 --gpu-verify-us 3000` tests the pipelining condition (GPU verify
-    time is an input — no GPU calibration in the tool).
+    Kernel imperative either way: **ONE fused dispatch for the whole block body** —
+    keep activations resident across all layers; for the tiny body the floor is 12×
+    the work, for the real body fusion still saves the 27% floor tax. Levers: real
+    body → weight bit-width (feed-bound); tiny body → fusion. `python -m
+    aiecost.design drafter --block-size 16 --gpu-verify-us 56600` tests the
+    pipelining condition (verify time is a MEASURED input — run `bench_qwen35_speed
+    <target>.hfq --gen 128` to get it; no GPU calibration lives in the tool).
 
 ### Buildability — check before designing
 
