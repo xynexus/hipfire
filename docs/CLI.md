@@ -38,6 +38,8 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire diffusion smoke`↴](#hipfire-diffusion-smoke)
 * [`hipfire diffusion quantize`↴](#hipfire-diffusion-quantize)
 * [`hipfire diffusion calibrate`↴](#hipfire-diffusion-calibrate)
+* [`hipfire diffusion quant-diff`↴](#hipfire-diffusion-quant-diff)
+* [`hipfire diffusion calib-eval`↴](#hipfire-diffusion-calib-eval)
 * [`hipfire admin`↴](#hipfire-admin)
 * [`hipfire admin status`↴](#hipfire-admin-status)
 * [`hipfire admin chat`↴](#hipfire-admin-chat)
@@ -190,7 +192,7 @@ Examples:
 
 * `--host <HOST>` — Override bind host
 * `-p`, `--port <PORT>` — Override bind port
-* `-m`, `--model <MODEL>` — Pre-load a model on startup by name, shorthand, alias, or path
+* `-m`, `--model <MODEL>` — Default model name, shorthand, alias, or path for requests that omit model
 * `--debug-chat` — Log full raw chat requests and raw model replies
 
 
@@ -382,7 +384,7 @@ GPU resource lock for multi-agent coordination (acquire/release/status)
 ###### **Subcommands:**
 
 * `acquire` — Acquire the GPU lock (blocks until free). A detached holder keeps it until `release` or the calling shell exits
-* `release` — Release the GPU lock (SIGTERM the holder recorded in the lockfile)
+* `release` — Release the GPU lock (SIGTERM the recorded holder + its `run` process group). With a `label`, only releases a matching holder (a safety guard so `release <name>` never drops another agent's lock); `--all` releases regardless of the recorded label; `--force` escalates to SIGKILL for a wedged holder (and also ignores the label). No-op if the lock is free
 * `status` — Print lock status: "gpu is free" or "gpu BUSY: <holder>"
 * `kill` — Forcibly free the lock by signalling its recorded holder — and, for a `run`-held lock, the whole workload process group. SIGTERM by default; `-f`/`--force` escalates to SIGKILL for a wedged holder. No-op if free or if the recorded holder is already gone
 * `run` — Acquire the lock, run `command` under it, release on exit — the scoped form. The lock lives exactly as long as this process (killing it drops the flock via the kernel); no detached holder or watched pid. Exit code is the command's; 2 on acquire timeout. Usage: `lock run <label> -- cmd…`
@@ -413,9 +415,18 @@ Acquire the GPU lock (blocks until free). A detached holder keeps it until `rele
 
 ## `hipfire lock release`
 
-Release the GPU lock (SIGTERM the holder recorded in the lockfile)
+Release the GPU lock (SIGTERM the recorded holder + its `run` process group). With a `label`, only releases a matching holder (a safety guard so `release <name>` never drops another agent's lock); `--all` releases regardless of the recorded label; `--force` escalates to SIGKILL for a wedged holder (and also ignores the label). No-op if the lock is free
 
-**Usage:** `hipfire lock release`
+**Usage:** `hipfire lock release [OPTIONS] [LABEL]`
+
+###### **Arguments:**
+
+* `<LABEL>` — Only release if the recorded holder label matches (safety guard)
+
+###### **Options:**
+
+* `--all` — Release regardless of which label holds the lock
+* `-f`, `--force` — Escalate to SIGKILL for a wedged holder (also ignores the label)
 
 
 
@@ -527,6 +538,8 @@ The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128, HFQ4G256, 
 * `smoke` — Run an end-to-end diffusion admission smoke and validate output PNGs
 * `quantize` — Re-encode the weight tensors of a source .hfq into a packed quant format
 * `calibrate` — Run an activation-calibration pass and write a .calib.hfq sidecar
+* `quant-diff` — Compare per-tensor weight reconstruction error between two diffusion .hfq artifacts (e.g. a bf16 reference vs its quantized derivative)
+* `calib-eval` — Quantify the activation-aware clip calibration ("+") on the fold format: for each fold-eligible transformer linear, report RTN vs clip weight-space error using a `.calib.hfq` imatrix. Weight-space only (no GPU)
 
 
 
@@ -800,7 +813,7 @@ Reads an existing diffusion .hfq (weights stored as f32/f16/bf16 source), re-enc
 
 Run an activation-calibration pass and write a .calib.hfq sidecar
 
-Generates a few CPU-reference denoise steps over sample prompts, capturing per-weight activation statistics (imatrix + per-linear Hessian). The resulting .calib.hfq feeds `quantize --format oq4++ --calib`.
+Generates a few instrumented denoise steps over sample prompts, capturing per-weight activation statistics (imatrix + per-linear Hessian). The resulting .calib.hfq feeds `quantize --format oq4++ --calib`.
 
 **Usage:** `hipfire diffusion calibrate [OPTIONS] --output <OUTPUT> <MODEL>`
 
@@ -827,6 +840,52 @@ Generates a few CPU-reference denoise steps over sample prompts, capturing per-w
 * `--hessian-max-k <HESSIAN_MAX_K>` — Max linear input dim K to capture a full [K,K] Hessian for (else imatrix only)
 
   Default value: `2048`
+* `--rocm-device-id <ROCM_DEVICE_ID>` — ROCm device used for instrumented resident calibration
+
+
+
+## `hipfire diffusion quant-diff`
+
+Compare per-tensor weight reconstruction error between two diffusion .hfq artifacts (e.g. a bf16 reference vs its quantized derivative)
+
+Decodes every quantizable `transformer/tensors/*.weight` from both artifacts to f32 and reports per-tensor error, ranked by relative L2. This is the sampler-independent quant-quality check: if the worst tensor is near-lossless, any rendered-image drift is trajectory divergence, not weight corruption. Pairs with `scripts/flux2_trajectory_divergence.py`.
+
+**Usage:** `hipfire diffusion quant-diff [OPTIONS] <REFERENCE> <CANDIDATE>`
+
+###### **Arguments:**
+
+* `<REFERENCE>` — Reference artifact (typically the bf16 / p0 source .hfq)
+* `<CANDIDATE>` — Candidate artifact (typically the quantized .hfq, e.g. .oq8.hfq)
+
+###### **Options:**
+
+* `--top <TOP>` — Print the N worst tensors by relative L2 error
+
+  Default value: `20`
+* `--rel-rms-threshold <REL_RMS_THRESHOLD>` — Relative-L2 threshold above which a tensor is flagged as real corruption
+
+  Default value: `0.05`
+* `--json` — Emit the full per-tensor diff as JSON instead of a table
+
+
+
+## `hipfire diffusion calib-eval`
+
+Quantify the activation-aware clip calibration ("+") on the fold format: for each fold-eligible transformer linear, report RTN vs clip weight-space error using a `.calib.hfq` imatrix. Weight-space only (no GPU)
+
+**Usage:** `hipfire diffusion calib-eval [OPTIONS] <SOURCE> <CALIB>`
+
+###### **Arguments:**
+
+* `<SOURCE>` — Source diffusion .hfq (bf16 weights)
+* `<CALIB>` — Calibration sidecar (.calib.hfq) with per-tensor imatrix
+
+###### **Options:**
+
+* `--bits <BITS>` — Fold bit width to evaluate (1/2/4)
+
+  Default value: `4`
+* `--json` — Emit JSON instead of a table
 
 
 
