@@ -111,13 +111,46 @@ actual device work, so that floor never governed the block wall.
 ~3.8 GB/s is ~290 ms no matter how the dispatch is issued.
 
 **UPDATE 2026-07-18 — the better GEMM is built and measured (not yet wired in).**
-A multi-core W4A8 GEMM at DFlash shapes on npu1 measures **9.33 GB/s on the weight
+A multi-core W4A8 GEMM at DFlash shapes on npu1 measures **9.4 GB/s on the weight
 stream vs the single-core `int_matmul`'s 3.8 GB/s (2.45×)**; int4 halves the bytes for
-the same logical weight (2×), taking the 5-layer body's 482 MB int4 payload to a
-projected **GEMM term of ~52 ms, down from ~317 ms (≈6×)**. Both build variants pass
-kernel-level numerical correctness; the full-body parity gate cannot run until it is
-wired in. Artifacts: `~/.hipfire/npu/r14_1x2x128_nb128` (recommended, best W:A ratio at
-M=16) and `~/.hipfire/npu/r14_1x4x64_nb128` (the activation-reduction control).
+the same logical weight (2×, licensed by the W8-vs-int4 runs measuring 9.81 vs 9.42
+GB/s — byte rate is ~precision-independent). Composed: **≈4.9×**, projecting the GEMM
+term to **~51–58 ms, down from ~317 ms**. Artifacts: `~/.hipfire/npu/r14_1x2x128_nb128`
+and `~/.hipfire/npu/r14_1x4x64_nb128`.
+
+Correctness, all exact: C[0] = 2048 / 1024 / 1024 / 17408 against expected
+2048 / 1024 / 1024 / 17408 (last is the W8 run, K=1024 × byte 0x11 = 17).
+
+**This is a projection, not an end-to-end result.** It assumes essentially all of the
+measured 317 ms was weight streaming — defensible, since that term was measured linear
+in weight bytes at ~3.8 GB/s, but any surviving fixed per-dispatch overhead lands the
+real number higher. The full-body parity gate has NOT been run against this kernel.
+
+### The kernel is done; the remaining headroom is ~10%, and it is not in this dataflow
+
+An r132 feed-only probe (no compute, no activations — `benchmarks/npu_gemm_tuning/r132/`)
+isolates the weight path:
+
+| config | channels | W-path GB/s |
+|---|---|---|
+| STREAMS=1 | 4 MM2S (1/col) | 10.02 |
+| STREAMS=2 | 8 MM2S (2/col) | 10.37 |
+
+**Doubling weight-fetch channels bought +3.4%** — channel count is NOT the limiter, and
+the 8-channel variant allocated cleanly in aiecc (retiring r12's "number of output DMA
+channel exceeded" as a concern at this shape). Independently: feed-only 837.4 µs vs the
+full GEMM 890.5 µs — stripping *all* compute and activation traffic recovers only **6%**.
+
+So the GEMM runs at **~92% of the achievable feed ceiling**. The limiter sits **upstream
+of the shim MM2S channels** — DDR/NOC path into the column, or memtile write bandwidth.
+**Which of the two is NOT determined**; the distinguishing test (shim→core direct feed,
+one core/column, bypassing the memtile) was not run. Note this ceiling is ~10.4 GB/s,
+so the ~13–16 GB/s aggregate DDR figure from r12 is **not reachable through this
+dataflow** and should not be used as a target for it.
+
+Measured nulls, all non-binding: buffer depth 3 vs 2 = +0.04%; halving MACs = +4%;
+halving activation traffic = +1%. The **activation-stationary restructure was therefore
+NOT built** — the +3.4% channel result removes its premise.
 
 Two findings worth carrying forward:
 - **The binding constraint is the weight path (~9.3 GB/s), not the ~13–16 GB/s
