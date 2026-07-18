@@ -34,6 +34,7 @@ mod body {
     use hipfire_xdna::{DeviceBuffer, NpuKernel, XdnaError};
     use std::collections::HashMap;
 
+    #[allow(dead_code)] // shape constant, kept for readability at call sites
     pub const HEAD_DIM: usize = 128;
     const QMAX: f32 = 127.0;
 
@@ -118,6 +119,7 @@ mod body {
     /// buffer is allocated against it), so it must never be evicted.
     pub struct KernelCache {
         pub anchor: NpuKernel,
+        #[allow(dead_code)] // read by is_anchor(); kept to document the pinned anchor
         anchor_name: String,
         artifacts: HashMap<String, (Vec<u8>, Vec<u8>)>,
         live: Vec<(String, NpuKernel)>,
@@ -185,6 +187,7 @@ mod body {
             &self.live[idx].1
         }
 
+        #[allow(dead_code)] // guards against evicting the anchor; kept as API
         pub fn is_anchor(&self, name: &str) -> bool {
             name == self.anchor_name
         }
@@ -354,22 +357,22 @@ fn main() {
     let max_rows = tot.max(l_ctx).max(b_rows);
 
     let mut gemm_b = mk(max_rows * (ne * h).max(i_dim).max(h)); // int8 activation
-    let mut gemm_c = mk(max_gemm_m * max_rows * 4); // int32 result
+    let gemm_c = mk(max_gemm_m * max_rows * 4); // int32 result
     let mut norm_in = mk(max_rows * h * 2);
     let mut norm_w = mk(max_rows * h * 2);
-    let mut norm_out = mk(max_rows * h * 2);
+    let norm_out = mk(max_rows * h * 2);
     let mut hn_in = mk(tot * nh * hd * 2);
-    let mut hn_out = mk(tot * nh * hd * 2);
+    let hn_out = mk(tot * nh * hd * 2);
     let mut hn_w = mk(hd * 2);
     let mut rope_in = mk(tot * nh * hd * 2);
     let mut rope_cs = mk(tot * nh * hd * 2);
-    let mut rope_out = mk(tot * nh * hd * 2);
+    let rope_out = mk(tot * nh * hd * 2);
     let mut sw_gate = mk(b_rows * i_dim * 2);
     let mut sw_up = mk(b_rows * i_dim * 2);
-    let mut sw_out = mk(b_rows * i_dim * 2);
+    let sw_out = mk(b_rows * i_dim * 2);
     let mut attn_q = mk(nkv * q_len * hd * 2);
     let mut attn_kv = mk(nkv * 2 * tot * hd * 2);
-    let mut attn_o = mk(nkv * q_len * hd * 2);
+    let attn_o = mk(nkv * q_len * hd * 2);
 
     // Host-side staging (f32, mirroring the numpy harness exactly).
     let mut qbuf = vec![0i8; max_rows * (ne * h).max(i_dim).max(h)];
