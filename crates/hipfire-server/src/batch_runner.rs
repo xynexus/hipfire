@@ -115,6 +115,16 @@ fn min_quantum() -> u32 {
         .unwrap_or(4)
 }
 
+/// Max simultaneously-parked batches. Each parked batch pins its sessions
+/// resident in the daemon, so nested preemption is bounded to cap VRAM.
+fn preempt_max_depth() -> usize {
+    std::env::var("HIPFIRE_SERVER_PREEMPT_MAX_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&d| d >= 1)
+        .unwrap_or(4)
+}
+
 /// Registry of in-flight batch-path requests, keyed by request id.
 pub type BatchInbox = Mutex<HashMap<String, PendingRequest>>;
 
@@ -344,20 +354,24 @@ fn now_ms() -> u64 {
 }
 
 async fn batch_runner_loop(state: SharedState) {
-    // At most one batch is parked at a time (single-level cooperative
-    // preemption). `parked.1` is the priority it was running at; the daemon
-    // sessions for these requests stay resident so resume skips prefill.
-    let mut parked: Option<(Vec<PendingRequest>, u8)> = None;
+    // Parked batches form a stack (LIFO): each entry was preempted by a
+    // strictly-higher-priority workload, so priorities decrease toward the top.
+    // The daemon sessions for parked requests stay resident, so resume skips
+    // prefill. Depth is bounded (each level pins resident VRAM) — see
+    // `preempt_max_depth`. `.1` is the priority the batch was running at.
+    let mut parked: Vec<(Vec<PendingRequest>, u8)> = Vec::new();
+    let max_depth = preempt_max_depth();
     loop {
         // What would the scheduler grant next (honouring aging)? Lower = sooner.
         let waiter = {
             let sched = state.work_scheduler.lock().await;
             sched.peek_next_priority(now_ms())
         };
-        // Resume the parked batch unless a strictly-higher-priority workload is
-        // queued (waiter < parked priority). Nothing queued (waiter None) resumes.
-        let resume_parked = match &parked {
-            Some((_, pri)) => waiter.map_or(true, |top| top >= *pri),
+        // Resume the top parked batch unless a strictly-higher-priority workload
+        // is queued (waiter < top parked priority). Nothing queued resumes it.
+        let top_parked = parked.last().map(|(_, pri)| *pri);
+        let resume_parked = match top_parked {
+            Some(pri) => waiter.map_or(true, |top| top >= pri),
             None => false,
         };
 
@@ -374,7 +388,7 @@ async fn batch_runner_loop(state: SharedState) {
         // lease), or a fresh lease from the scheduler front-end.
         let (batch, running_priority, lease_id): (Vec<PendingRequest>, u8, Option<u64>) =
             if resume_parked {
-                let (b, pri) = parked.take().unwrap();
+                let (b, pri) = parked.pop().unwrap();
                 (b, pri, None)
             } else {
                 // Gather window: let concurrent requests accumulate before the
@@ -422,15 +436,16 @@ async fn batch_runner_loop(state: SharedState) {
             }
             continue;
         };
-        // Only park if nothing is already parked (single-level preemption).
-        let can_park = parked.is_none();
+        // Park only while the stack has room (bounds resident VRAM from nested
+        // preemption); at the cap the batch runs to completion instead.
+        let can_park = parked.len() < max_depth;
         let outcome = run_batch_cycle(&mut engine, &state, batch, running_priority, can_park).await;
         *state.engine.lock().await = Some(engine);
         if let Some(id) = lease_id {
             state.work_scheduler.lock().await.complete(id);
         }
         if let CycleOutcome::Parked(remaining) = outcome {
-            parked = Some((remaining, running_priority));
+            parked.push((remaining, running_priority));
         }
     }
 }
@@ -527,6 +542,16 @@ async fn run_batch_cycle(
     let mut chunk_count = 0u64;
     let mut steps: u32 = 0;
     while !active.is_empty() {
+        // Drop sessions whose client disconnected (response receiver closed):
+        // stop decoding, and don't park/resume them. A session that was parked
+        // and then abandoned is retired here on its resume cycle. Their KV is
+        // freed with the rest of the batch at cycle end.
+        // ponytail: eager per-session release could reclaim KV sooner; the
+        // batch-end release is enough until nested-preemption VRAM bites.
+        active.retain(|id| txs.get(id).is_some_and(|tx| !tx.is_closed()));
+        if active.is_empty() {
+            break;
+        }
         let cursors: Vec<DecodeCursor> = active
             .iter()
             .map(|id| DecodeCursor {
@@ -607,6 +632,13 @@ async fn run_batch_cycle(
                 .await
                 .peek_next_priority(now_ms());
             if waiter.is_some_and(|top| top < running_priority) {
+                if std::env::var("HIPFIRE_BATCH_RUNNER_DEBUG").as_deref() == Ok("1") {
+                    eprintln!(
+                        "[batch-cycle] parked {} session(s) at step {steps}: pri {running_priority} yields to {}",
+                        active.len(),
+                        waiter.unwrap()
+                    );
+                }
                 let parked: Vec<PendingRequest> = active
                     .iter()
                     .filter_map(|id| {
