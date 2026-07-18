@@ -57,27 +57,28 @@ NATIVE_SHAPES = {
 
 _BITS = {"int8": 8, "int4": 4, "bf16": 16}
 
-# Core efficiency for a MULTI-CORE tiled GEMM. Tried to model it as eff(tile
-# area) but measurement showed it is a 2-D SURFACE, not a 1-D curve:
+# Core efficiency for a MULTI-CORE tiled GEMM: a 2-D SURFACE over output-tile
+# area (m*n) and tile count per core. Both drive it: a bigger tile amortises the
+# per-tile DMA + accumulator + acquire/release overhead; more tiles amortise the
+# per-dispatch fill/drain. Fitted to a whole_array grid on npu1 (4 cols, i8,
+# tile 32/48/64 x problem 768/1536/2304 + 2048^3 anchors):
 #
-#   whole_array (npu1, 4 cols, i8, output-tile area sweep):
-#     at 2048^3:  area 256->0.033, 1024->0.092, 2048->0.173, 4096->0.209
-#     tile 64 (area 4096):  1024^3->0.086, 1536^3->0.141, 2048^3->0.209
+#   eff = SURF_CMAX * area/(area + SURF_A) * n/(n + SURF_N)
 #
-# So efficiency rises with BOTH tile area AND problem size (tile count amortises
-# the per-dispatch fill/drain). And the buildable tile ceiling is tighter than a
-# naive L1 sum suggests — tile 96/128 with i32 output fail placement; 64 is the
-# real max. A full model needs eff(tile_area, tile_count) + a real L1 budget,
-# which is more than a scalar; NOT built.
-#
-# Pending that, design.py uses the MEASURED max-buildable-tile, large-problem
-# value: whole_array 2048^3 tile 64 = 0.209. Defensible for prefill-scale GEMMs
-# (large K,N -> many tiles -> well amortised); OPTIMISTIC for small problems
-# (measured down to 0.014). This replaces the earlier flat 0.28, which was the
-# SINGLE-CORE oq_gemm value and too high for design.py's multi-core specs.
-MULTI_CORE_GEMM_EFFICIENCY = 0.209
+# mean |err| 20% overall, ~10% in the design-relevant large-problem regime; it
+# over-predicts at very low tile count (n<40). tile 64 is the max buildable
+# output tile for i32 output (96/128 fail placement). This SUPERSEDES the earlier
+# flat 0.209, which was right only at one operating point.
+SURF_CMAX = 0.600
+SURF_A = 5391.0
+SURF_N = 23.3
 GEMM_TILE = 64  # max buildable square output tile (i32 out); L1-capped on npu1
 GEMM_K_TILE = 64  # k-reduction tile
+
+
+def eff_surface(out_area: int, n_tiles_per_core: float) -> float:
+    n = max(n_tiles_per_core, 1.0)
+    return SURF_CMAX * (out_area / (out_area + SURF_A)) * (n / (n + SURF_N))
 
 # KVarN record: codes pack 8/bits per byte, plus fp16 per-channel scale+zp and
 # fp16 per-token s_col. Mirrors kvarn_record_bytes_bits() in hipfire-kvquant.
@@ -110,12 +111,14 @@ class GemmProblem:
     def candidates(self, target) -> list[ScheduleSpec]:
         out = []
         shapes = NATIVE_SHAPES.get((self.dtype_a, self.dtype_b), [])
-        # Fixed max-buildable L1 tile (see MULTI_CORE_GEMM_EFFICIENCY note): its
-        # footprint is the real stage, and its large-problem efficiency is the eff.
+        # Fixed max-buildable L1 tile; efficiency comes from the 2-D surface
+        # (tile area x tile-count-per-core), so it is computed per column count.
         t_tile = GEMM_TILE
-        eff = MULTI_CORE_GEMM_EFFICIENCY
+        out_area = t_tile * t_tile
         for cols in _column_options(target):
             cores = cols * (target.compute_cores // target.compute_columns)
+            n_tiles_pc = (-(-self.m // t_tile) * -(-self.n // t_tile)) / cores
+            eff = eff_surface(out_area, n_tiles_pc)
             for (mm, mk, mn) in shapes:
                 macs_per_call = mm * mk * mn
                 calls_total = -(-self.total_macs // macs_per_call)
@@ -127,7 +130,7 @@ class GemmProblem:
                             + t_tile * t_tile * self.out_bytes_per_elem)
                 out.append(
                     ScheduleSpec(
-                        name=f"gemm-{self.dtype_a}x{self.dtype_b}-c{cols}-t{t_tile}",
+                        name=f"gemm-{self.dtype_a}x{self.dtype_b}-c{cols}-t{t_tile}(eff{eff:.2f})",
                         columns=cols,
                         cores=cores,
                         wire_bytes_in=wire,
@@ -204,7 +207,7 @@ class DecodeAttnProblem:
                         dtype_a=self.dtype_a,
                         dtype_b=dtype_b,
                         local_stage_bytes=stage,
-                        core_efficiency=MULTI_CORE_GEMM_EFFICIENCY,  # movement-bound; moot
+                        core_efficiency=eff_surface(GEMM_TILE * GEMM_TILE, 64),  # movement-bound; moot
                         host_pack_bytes=0,  # cache is already resident device-side
                         host_deblock_bytes=self.kv_heads * self.head_dim * 2,
                         n_bos=3,

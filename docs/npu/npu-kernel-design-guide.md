@@ -608,15 +608,21 @@ that output-tile area matters — never the values or the rankings.
       tile 64 (area 4096):      1024³→0.086  1536³→0.141  2048³→0.209
 
   Problem size matters because more output tiles amortise the per-dispatch
-  fill/drain. A 1-D `eff(area)` fit was tried and **rejected** — it ignored
-  problem size (over-predicts small ones) and picked unbuildable tiles: tile
-  96/128 with int32 output **fail placement** (L1), so 64 is the real ceiling.
-  A proper model is `eff(tile_area, tile_count)` + a real L1-placement budget —
-  not built. Pending it, `design.py` uses a **flat 0.209** (whole_array 2048³
-  tile 64: max buildable tile, large problem): defensible for prefill-scale
-  GEMMs (large K,N → many tiles → well amortised), optimistic for small ones
-  (down to 0.014), moot for decode (movement-bound). Single-core `oq_gemm` is a
-  separate regime (~0.28 at its tile) — don't conflate.
+  fill/drain. A 1-D `eff(area)` fit was rejected (it ignored problem size and
+  picked unbuildable tiles — 96/128 with int32 output fail placement, so 64 is
+  the real ceiling). **The 2-D surface is now built and in `design.py`:**
+
+      eff = 0.600 · area/(area + 5391) · n/(n + 23.3)     (n = output tiles per core)
+
+  fitted to a whole_array grid (tile 32/48/64 × problem 768/1536/2304 + 2048³
+  anchors), mean |err| 20% overall, ~10% for n ≥ 64. `design.py` fixes tile 64
+  (max buildable, i32) and computes `n` from the problem, so efficiency now
+  scales with problem size: **0.05 (256×768×1280) → 0.15 (512×4096²) → 0.24
+  (2048×8192²)** — tracking measurement instead of a flat scalar.
+  **Caveats:** over-predicts at very low tile count (n < 40: +55–78%), so small
+  square GEMMs are worse than modelled; bf16 output could allow a bigger tile
+  (unverified); single-core `oq_gemm` is a separate regime (~0.28); decode is
+  movement-bound so this is moot there.
 - ~~The true feed ceiling~~ **RESOLVED**: ~30.8 GB/s at 8 shim input streams,
   confirmed by measurement and the toolchain channel budget independently.
 - ~~CPU as a third target~~ **DONE** (P1): dominated on both axes — 55.8 GB/s ·
