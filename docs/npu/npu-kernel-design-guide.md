@@ -612,17 +612,22 @@ that output-tile area matters — never the values or the rankings.
   picked unbuildable tiles — 96/128 with int32 output fail placement, so 64 is
   the real ceiling). **The 2-D surface is now built and in `design.py`:**
 
-      eff = 0.600 · area/(area + 5391) · n/(n + 23.3)     (n = output tiles per core)
+      eff = 0.800 · area/(area + 9775) · n²/(n² + 23.5²)   (n = output tiles per core)
 
-  fitted to a whole_array grid (tile 32/48/64 × problem 768/1536/2304 + 2048³
-  anchors), mean |err| 20% overall, ~10% for n ≥ 64. `design.py` fixes tile 64
-  (max buildable, i32) and computes `n` from the problem, so efficiency now
-  scales with problem size: **0.05 (256×768×1280) → 0.15 (512×4096²) → 0.24
-  (2048×8192²)** — tracking measurement instead of a flat scalar.
-  **Caveats:** over-predicts at very low tile count (n < 40: +55–78%), so small
-  square GEMMs are worse than modelled; bf16 output could allow a bigger tile
-  (unverified); single-core `oq_gemm` is a separate regime (~0.28); decode is
-  movement-bound so this is moot there.
+  fitted to a whole_array grid (tile 32/48/64 × problem 128…2304 + 2048³ anchors,
+  13 points). The amortisation is **squared in n**: a dense low-tile-count sweep
+  showed the drop is far steeper than n/(n+N), which over-predicted +543 % at
+  n = 4. Squared form: mean |err| 22 %, max 80 %, well-behaved for n ≥ 16.
+  `design.py` fixes tile 64 (max buildable, i32) and computes `n` from the
+  problem, so efficiency scales with problem size: **0.03 (768², n=9) → 0.17
+  (1536², n=36) → 0.23 (4096², n=256)** — tracking measurement instead of a flat
+  scalar.
+  **Caveats:** n = 4 (tiny 256–512³ problems) is still noisy (±30–50 %,
+  mixed-sign); the whole_array tiling constraint (P/t must be a multiple of 8 to
+  build) blocked odd-n points (1/9/25), so the fit uses the 13 buildable
+  configs; bf16 output could allow a bigger tile (unverified); single-core
+  `oq_gemm` is a separate regime (~0.28); decode is movement-bound so this is
+  moot there.
 - ~~The true feed ceiling~~ **RESOLVED**: ~30.8 GB/s at 8 shim input streams,
   confirmed by measurement and the toolchain channel budget independently.
 - ~~CPU as a third target~~ **DONE** (P1): dominated on both axes — 55.8 GB/s ·

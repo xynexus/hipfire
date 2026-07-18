@@ -1056,24 +1056,25 @@
     },
     "gemm_efficiency_surface": {
       "name": "gemm_efficiency_surface",
-      "value": 0.6,
+      "value": 0.8,
       "unit": "Cmax",
       "bench": "whole_array-2d",
-      "method": "fit eff = Cmax*area/(area+A)*n/(n+N) to whole_array grid (tile 32/48/64 x problem 768/1536/2304 + 2048^3 anchors)",
+      "method": "fit eff = Cmax*area/(area+A)*n^2/(n^2+N^2) to whole_array grid (tile 32/48/64 x problem 128..2304 + 2048^3 anchors, 13 points)",
       "admissible": true,
       "evidence": [
-        "params: Cmax=0.600, A=5391, N=23.3 (area=m*n, n=tiles per core)",
+        "params: Cmax=0.800, A=9775, N=23.5 (area=m*n, n=tiles per core); amortization is SQUARED in n",
+        "low-n sweep added: t32 area1024 n4->0.0016 n16->0.0133; t48 area2304 n4->0.0059 n16->0.0400; t64 area4096 n4->0.0134 n16->0.0835",
         "grid eff: t32 area1024 -> 0.038/0.080/0.081 (n 36/144/324); t48 area2304 -> 0.041/0.139/0.141 (n 16/64/144); t64 area4096 -> 0.168 (n36), 0.209 (n64 @2048^3)",
-        "mean |err| 20% overall, ~10% for n>=64 (design-relevant large problems)",
-        "design.py tile-64 eff: P=768->0.07, 1536->0.16, 4096->0.24, 8192->0.25"
+        "squared form: mean |err| 22%, max 80% (vs linear n/(n+N): mean 92%, +543% at n=4). well-behaved for n>=16",
+        "design.py tile-64 eff: P=768(n9)->0.03, 1536(n36)->0.17, 4096(n256)->0.23, 8192->0.24"
       ],
       "caveats": [
-        "OVER-predicts at very low tile count (n<40): +55-78% at n=16/36. Small square GEMMs are worse than modelled.",
+        "n=4 (tiny 256-512^3 problems) still noisy: model +33%/-27%/-51% across the three areas, mixed-sign (measurement noise, not bias).",
         "MULTI-CORE (4 cols) i8 whole_array; single-core oq_gemm is a separate regime (~0.28).",
         "tile 64 = max buildable for i32 output (96/128 fail placement); bf16 could allow larger (unverified).",
-        "2 grid points failed to build/run (t64 P768/P2304) \u2014 surface uses 7 points + anchors."
+        "whole_array tiling constraint: P/t must be a multiple of 8 to build, so odd n (1/9/25) could not be measured \u2014 surface uses the 13 buildable points."
       ],
-      "measured_utc": "2026-07-18T04:05:08+00:00"
+      "measured_utc": "2026-07-18T05:40:00+00:00"
     }
   }
 }

@@ -61,24 +61,24 @@ _BITS = {"int8": 8, "int4": 4, "bf16": 16}
 # area (m*n) and tile count per core. Both drive it: a bigger tile amortises the
 # per-tile DMA + accumulator + acquire/release overhead; more tiles amortise the
 # per-dispatch fill/drain. Fitted to a whole_array grid on npu1 (4 cols, i8,
-# tile 32/48/64 x problem 768/1536/2304 + 2048^3 anchors):
+# tile 32/48/64 x problem 128..2304 + 2048^3 anchors, 13 points):
 #
-#   eff = SURF_CMAX * area/(area + SURF_A) * n/(n + SURF_N)
+#   eff = SURF_CMAX * area/(area + SURF_A) * n^2/(n^2 + SURF_N^2)
 #
-# mean |err| 20% overall, ~10% in the design-relevant large-problem regime; it
-# over-predicts at very low tile count (n<40). tile 64 is the max buildable
-# output tile for i32 output (96/128 fail placement). This SUPERSEDES the earlier
-# flat 0.209, which was right only at one operating point.
-SURF_CMAX = 0.600
-SURF_A = 5391.0
-SURF_N = 23.3
+# The amortization is SQUARED in n: a dense low-tile-count sweep showed the drop
+# is much steeper than n/(n+N) (which over-predicted +540% at n=4). Squared form:
+# mean |err| 22%, max 80%, well-behaved for n>=16. tile 64 is the max buildable
+# output tile for i32 (96/128 fail placement).
+SURF_CMAX = 0.800
+SURF_A = 9775.0
+SURF_N = 23.5
 GEMM_TILE = 64  # max buildable square output tile (i32 out); L1-capped on npu1
 GEMM_K_TILE = 64  # k-reduction tile
 
 
 def eff_surface(out_area: int, n_tiles_per_core: float) -> float:
     n = max(n_tiles_per_core, 1.0)
-    return SURF_CMAX * (out_area / (out_area + SURF_A)) * (n / (n + SURF_N))
+    return SURF_CMAX * (out_area / (out_area + SURF_A)) * (n * n / (n * n + SURF_N * SURF_N))
 
 # KVarN record: codes pack 8/bits per byte, plus fp16 per-channel scale+zp and
 # fp16 per-token s_col. Mirrors kvarn_record_bytes_bits() in hipfire-kvquant.
