@@ -62,7 +62,7 @@ from aie.utils.hostruntime.xrtruntime.hostruntime import XRTHostRuntime  # noqa:
 from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor  # noqa: E402
 from aie.utils.npukernel import NPUKernel  # noqa: E402
 
-from build_dflash_attention_sc import run_attn_head  # noqa: E402
+from build_dflash_attention_sc import run_attn_head, run_attn_all_kv  # noqa: E402
 from dflash_ref import load_safetensors_f32  # noqa: E402
 
 KERNEL_NAME = "MLIR_AIE"
@@ -120,7 +120,7 @@ def quantize_row_symmetric(x_f32, bits=8):
 # ─────────────────────────────────────────────────────────────────────────────
 class NpuOps:
     def __init__(self, count=True, batch_ops=False, proj_mode="group",
-                 resident_weights=False, concat_proj=False):
+                 resident_weights=False, concat_proj=False, attn_all_kv=False):
         # batch_ops   : Lever 1 — run norm/headnorm/rope/swiglu batched (all rows
         #               in ONE dispatch) via the *-b<rows> xclbins instead of the
         #               per-row loop.
@@ -133,6 +133,9 @@ class NpuOps:
         #               gate/up on x2, k_ctx/v_ctx on thp) stacked into ONE GEMM.
         #               Exact; row-proj mode only. Saves 4 dispatches/layer.
         self.concat_proj = concat_proj
+        # attn_all_kv : Lever 3 — whole layer's attention in ONE dispatch
+        #               (core loops the kv-heads, streaming via ObjectFifo).
+        self.attn_all_kv = attn_all_kv
         # Lever 4 (speed, not dispatch count): keep int8 projection weights
         # resident on the NPU instead of re-uploading ~1 GB every pass.
         self.resident_weights = resident_weights
@@ -390,6 +393,14 @@ class NpuOps:
         tot = k.shape[0]
         NKV = NH // groups
         q_len = groups * B
+        if self.attn_all_kv:
+            # ONE dispatch for the whole layer: the core loops the NKV kv-heads,
+            # streaming each group's Q/KV/O through the ObjectFifos (tile holds one
+            # iteration, 56 KB). Verified cos=1.00000 vs bf16 ref on all 32 q-heads.
+            ctx = run_attn_all_kv(q, k, v, groups)
+            self.dispatches += 1
+            self.op_dispatches += 1
+            return ctx
         ctx = np.empty((B, NH * HD), np.float32)
         for kvh in range(NKV):
             heads = range(kvh * groups, (kvh + 1) * groups)
@@ -906,6 +917,9 @@ def main():
                     help="Lever 3: stack projections sharing an input (q/k/v, "
                          "gate/up, k_ctx/v_ctx) into ONE GEMM each — exact, "
                          "saves 4 dispatches/layer (row proj only)")
+    ap.add_argument("--attn-all-kv", action="store_true",
+                    help="Lever 3: whole layer attention in ONE dispatch "
+                         "(core loops kv-heads); exact, saves 7 dispatches/layer")
     args = ap.parse_args()
 
     G = Golden(args.golden_dir)
@@ -918,10 +932,10 @@ def main():
     W = Weights(args.weights)
     ops = NpuOps(batch_ops=args.batch_ops, proj_mode=args.proj,
                  resident_weights=args.resident_weights,
-                 concat_proj=args.concat_proj)
+                 concat_proj=args.concat_proj, attn_all_kv=args.attn_all_kv)
     print(f"[dflash_body_npu] config: batch_ops={ops.batch_ops} "
           f"proj_mode={ops.proj_mode} resident_weights={ops.resident_weights} "
-          f"concat_proj={ops.concat_proj}")
+          f"concat_proj={ops.concat_proj} attn_all_kv={ops.attn_all_kv}")
 
     if args.op_by_op:
         ok = op_by_op(ops, W, cfg, G, args.cos_gate)

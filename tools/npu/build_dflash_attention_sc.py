@@ -25,6 +25,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import oq_gemm_design as design  # noqa: E402 — sets device/pyxrt; provides iron env
 
 import aie.iron as iron  # noqa: E402
+from aie.iron.controlflow import range_  # noqa: E402
 from aie.iron import (  # noqa: E402
     CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker, ExternalFunction,
 )
@@ -104,6 +105,89 @@ def dflash_attn_head(Q: In, KV: In, O: Out, *,
         rt.fill(inKV.prod(), KVh, tap=kv_tap)
         rt.drain(outO.cons(), Oh, tap=o_tap, wait=True)
     return Program(iron.get_current_device(), rt).resolve_program()
+
+
+# ── all-KV-head streaming variant: ONE dispatch for the whole layer's attention ──
+# The core loops `n_iters` (= n_kv) times, acquiring one kv-head's Q-group / KV /
+# O-group per iteration through the ObjectFifos, so the tile only ever holds ONE
+# iteration (56 KB at groups=4, kv_len=48) while all 8 groups stream through.
+# Dispatches/layer: n_kv (8) -> 1. Same kernel, same math as run_attn_head.
+@iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"], source_files=[str(KERNEL_SRC)])
+def dflash_attn_all(Q: In, KV: In, O: Out, *,
+                    q_len: CompileTime[int], kv_len: CompileTime[int],
+                    n_iters: CompileTime[int]):
+    nd = cast(Any, np.ndarray)
+    dt = cast(Any, np.dtype)
+    qN, kvN = q_len * HEAD_DIM, 2 * kv_len * HEAD_DIM
+    # fifo element = ONE iteration; runtime buffers hold all n_iters back to back.
+    Qt_ty: Any = nd[(qN,), dt[bfloat16]]
+    KVt_ty: Any = nd[(kvN,), dt[bfloat16]]
+    Q_all: Any = nd[(n_iters * qN,), dt[bfloat16]]
+    KV_all: Any = nd[(n_iters * kvN,), dt[bfloat16]]
+    attn = _attn_kernel(q_len, kv_len)
+
+    inQ = ObjectFifo(Qt_ty, name="inQ", depth=1)
+    memQ = inQ.cons().forward(name="memQ")
+    inKV = ObjectFifo(KVt_ty, name="inKV", depth=1)
+    memKV = inKV.cons().forward(name="memKV")
+    outO = ObjectFifo(Qt_ty, name="outO", depth=1)
+
+    def core_fn(of_q, of_kv, of_o, kfn):
+        for _ in range_(n_iters):
+            q = of_q.acquire(1)
+            kv = of_kv.acquire(1)
+            o = of_o.acquire(1)
+            kfn(q, kv, o)
+            of_q.release(1)
+            of_kv.release(1)
+            of_o.release(1)
+
+    worker = Worker(core_fn, [memQ.cons(), memKV.cons(), outO.prod(), attn],
+                    stack_size=0x1000)
+
+    from aie.helpers.taplib import TensorTiler2D
+    # stream n_iters tiles of one iteration each
+    q_tap = TensorTiler2D.group_tiler((n_iters, qN), (1, qN), (n_iters, 1), prune_step=False)[0]
+    kv_tap = TensorTiler2D.group_tiler((n_iters, kvN), (1, kvN), (n_iters, 1), prune_step=False)[0]
+    o_tap = TensorTiler2D.group_tiler((n_iters, qN), (1, qN), (n_iters, 1), prune_step=False)[0]
+
+    rt = Runtime()
+    with rt.sequence(Q_all, KV_all, Q_all) as (Qh, KVh, Oh):
+        rt.start(worker)
+        rt.fill(inQ.prod(), Qh, tap=q_tap)
+        rt.fill(inKV.prod(), KVh, tap=kv_tap)
+        rt.drain(outO.cons(), Oh, tap=o_tap, wait=True)
+    return Program(iron.get_current_device(), rt).resolve_program()
+
+
+def run_attn_all_kv(q, k, v, groups):
+    """ONE dispatch for a whole layer's attention.
+
+    q [B,NH,HD], k/v [tot,NKV,HD] -> ctx [B, NH*HD]. Packs, per kv-head, the
+    `groups` q-heads' queries stacked (q_len=groups*B) and that kv-head's [K|V],
+    then streams all NKV groups through a single dispatch.
+    """
+    from aie.utils.benchmark import run_iters
+    B, NH, HD = q.shape
+    tot = k.shape[0]
+    NKV = NH // groups
+    q_len = groups * B
+    qbuf, kvbuf = [], []
+    for kvh in range(NKV):
+        heads = range(kvh * groups, (kvh + 1) * groups)
+        qbuf.append(np.concatenate([q[:, h, :] for h in heads], axis=0).reshape(-1))
+        kvbuf.append(np.concatenate([k[:, kvh, :].reshape(-1), v[:, kvh, :].reshape(-1)]))
+    Qt = iron.tensor(np.concatenate(qbuf).astype(bfloat16), dtype=bfloat16, device="npu")
+    KVt = iron.tensor(np.concatenate(kvbuf).astype(bfloat16), dtype=bfloat16, device="npu")
+    Ot = iron.zeros(NKV * q_len * HEAD_DIM, dtype=bfloat16, device="npu")
+    run_iters(dflash_attn_all, Qt, KVt, Ot, q_len=q_len, kv_len=tot, n_iters=NKV,
+              warmup=0, iters=1)
+    o = np.array(Ot.numpy(), dtype=np.float32).reshape(NKV, q_len, HEAD_DIM)
+    ctx = np.empty((B, NH * HD), np.float32)
+    for kvh in range(NKV):
+        for i, h in enumerate(range(kvh * groups, (kvh + 1) * groups)):
+            ctx[:, h * HD:(h + 1) * HD] = o[kvh, i * B:(i + 1) * B, :]
+    return ctx
 
 
 def run_attn_head(Qh_np, Kh_np, Vh_np, q_len, kv_len):
