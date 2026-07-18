@@ -57,11 +57,27 @@ NATIVE_SHAPES = {
 
 _BITS = {"int8": 8, "int4": 4, "bf16": 16}
 
-# Fraction of peak the CORE reaches for a real tiled GEMM. Measured 0.28 on
-# oq_gemm (single-core, stable across a 4x shape range); see calib. Without it
-# the model under-predicts tiled GEMM ~2.3x. Single-core-calibrated — multi-core
-# is unverified, so predictions carry that as a flagged assumption.
-TILED_GEMM_EFFICIENCY = 0.28
+# Core efficiency for a MULTI-CORE tiled GEMM. Tried to model it as eff(tile
+# area) but measurement showed it is a 2-D SURFACE, not a 1-D curve:
+#
+#   whole_array (npu1, 4 cols, i8, output-tile area sweep):
+#     at 2048^3:  area 256->0.033, 1024->0.092, 2048->0.173, 4096->0.209
+#     tile 64 (area 4096):  1024^3->0.086, 1536^3->0.141, 2048^3->0.209
+#
+# So efficiency rises with BOTH tile area AND problem size (tile count amortises
+# the per-dispatch fill/drain). And the buildable tile ceiling is tighter than a
+# naive L1 sum suggests — tile 96/128 with i32 output fail placement; 64 is the
+# real max. A full model needs eff(tile_area, tile_count) + a real L1 budget,
+# which is more than a scalar; NOT built.
+#
+# Pending that, design.py uses the MEASURED max-buildable-tile, large-problem
+# value: whole_array 2048^3 tile 64 = 0.209. Defensible for prefill-scale GEMMs
+# (large K,N -> many tiles -> well amortised); OPTIMISTIC for small problems
+# (measured down to 0.014). This replaces the earlier flat 0.28, which was the
+# SINGLE-CORE oq_gemm value and too high for design.py's multi-core specs.
+MULTI_CORE_GEMM_EFFICIENCY = 0.209
+GEMM_TILE = 64  # max buildable square output tile (i32 out); L1-capped on npu1
+GEMM_K_TILE = 64  # k-reduction tile
 
 # KVarN record: codes pack 8/bits per byte, plus fp16 per-channel scale+zp and
 # fp16 per-token s_col. Mirrors kvarn_record_bytes_bits() in hipfire-kvquant.
@@ -94,6 +110,10 @@ class GemmProblem:
     def candidates(self, target) -> list[ScheduleSpec]:
         out = []
         shapes = NATIVE_SHAPES.get((self.dtype_a, self.dtype_b), [])
+        # Fixed max-buildable L1 tile (see MULTI_CORE_GEMM_EFFICIENCY note): its
+        # footprint is the real stage, and its large-problem efficiency is the eff.
+        t_tile = GEMM_TILE
+        eff = MULTI_CORE_GEMM_EFFICIENCY
         for cols in _column_options(target):
             cores = cols * (target.compute_cores // target.compute_columns)
             for (mm, mk, mn) in shapes:
@@ -102,11 +122,12 @@ class GemmProblem:
                 calls_per_core = -(-calls_total // cores)
                 # Weights stream once; activations are broadcast to every column.
                 wire = self.weight_bytes() + self.act_bytes() * cols
-                # One A-tile + one B-tile double-buffered, plus the C accumulator.
-                stage = (mm * mk + mk * mn) * 2 * 2 + mm * mn * 4
+                # Real L1 tile footprint: A+B double-buffered + C accumulator.
+                stage = int((t_tile * GEMM_K_TILE * _BITS[self.dtype_a] / 8 + GEMM_K_TILE * t_tile * _BITS[self.dtype_b] / 8) * 2
+                            + t_tile * t_tile * self.out_bytes_per_elem)
                 out.append(
                     ScheduleSpec(
-                        name=f"gemm-{self.dtype_a}x{self.dtype_b}-c{cols}-mmul{mm}.{mk}.{mn}",
+                        name=f"gemm-{self.dtype_a}x{self.dtype_b}-c{cols}-t{t_tile}",
                         columns=cols,
                         cores=cores,
                         wire_bytes_in=wire,
@@ -120,7 +141,7 @@ class GemmProblem:
                         dtype_a=self.dtype_a,
                         dtype_b=self.dtype_b,
                         local_stage_bytes=stage,
-                        core_efficiency=TILED_GEMM_EFFICIENCY,
+                        core_efficiency=eff,
                         host_pack_bytes=self.act_bytes(),
                         host_deblock_bytes=self.m * self.n * self.out_bytes_per_elem,
                         n_bos=3,
@@ -183,7 +204,7 @@ class DecodeAttnProblem:
                         dtype_a=self.dtype_a,
                         dtype_b=dtype_b,
                         local_stage_bytes=stage,
-                        core_efficiency=TILED_GEMM_EFFICIENCY,
+                        core_efficiency=MULTI_CORE_GEMM_EFFICIENCY,  # movement-bound; moot
                         host_pack_bytes=0,  # cache is already resident device-side
                         host_deblock_bytes=self.kv_heads * self.head_dim * 2,
                         n_bos=3,

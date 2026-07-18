@@ -1040,13 +1040,17 @@
         "TILE ISOLATED at fixed 2048^3 (npu1, 4 cols): tile 32^3 -> 0.075, tile 64^3 -> 0.239, tile 128^3 -> L1-BLOCKED",
         "  (128x128 int32 output = 64KB = full L1, no double-buffer room -> 'Resource allocation pipeline failed')",
         "=> efficiency is TILE-AREA-driven; npu1 practical ceiling ~0.24 for this kernel, capped by L1 at 64^3 with i32 out",
-        "=> bf16 output (2B) halves the output tile, freeing L1 for a bigger tile: a DOUBLE win (movement + efficiency)"
+        "=> bf16 output (2B) halves the output tile, freeing L1 for a bigger tile: a DOUBLE win (movement + efficiency)",
+        "EFFICIENCY IS A 2-D SURFACE (tile area x problem size), not a 1-D eff(area) curve:",
+        "  tile 64 (area 4096) at 1024^3/1536^3/2048^3 -> 0.086/0.141/0.209 (rises with problem size = tile count)",
+        "  attempted eff = 0.334*A/(A+2287) fit 2048^3 area 256-4096 within +-12%, but over-predicts smaller problems",
+        "BUILDABLE TILE CEILING is tile 64 for i32 output: tile 96 and 128 FAIL placement (L1), tighter than a naive sum"
       ],
       "caveats": [
-        "0.28 IS THE LARGE-TILE ASYMPTOTE, not a universal efficiency. Multi-core measurement: 0.014 (512^3/32^3) up to 0.239 (2048^3/64^3). Applying flat 0.28 OVER-predicts efficiency (UNDER-predicts t_core) by up to ~20x for small tiles/problems.",
-        "design.py uses it for GEMM specs: defensible for PREFILL-scale (large M -> large tiles -> ~0.24-0.28), optimistic for small compute-bound GEMMs. Decode is movement-bound so t_core (and thus this) does not matter.",
-        "THE REAL FIX: efficiency as a function of output-tile area (L1-capped ~16384, per aie2p tilesweep), not a scalar. design.py does not yet model the L1 tile, so a scalar stand-in is used.",
-        "eff=1.0 remains correct for tight resident chains (K1/C4/families C/D saturate the pipe)."
+        "design.py uses a FLAT 0.209 = whole_array 2048^3 tile 64 (max buildable, large problem). Defensible for prefill-scale GEMMs (large K,N -> many tiles -> well amortised); optimistic for small problems (down to 0.014).",
+        "A proper model is eff(tile_area, tile_count) + a real L1-placement budget -- a 2-D surface, NOT built. The 1-D eff(area) curve was tried and rejected: it ignored problem-size and picked unbuildable tiles (96/128).",
+        "SINGLE-CORE oq_gemm is a different regime (0.28 at its tile) -- do not conflate with the multi-core 0.209.",
+        "eff=1.0 remains correct for tight resident chains (K1/C4 saturate the pipe)."
       ],
       "measured_utc": "2026-07-17T16:11:36+00:00"
     }
