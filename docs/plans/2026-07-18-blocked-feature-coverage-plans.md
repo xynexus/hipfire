@@ -100,7 +100,23 @@ groups. gemma3's WORKING quant KV does NOT go through this — it threads a
 `Gemma3State::new_with_max_seq` gemma3/forward.rs:103). So there is no existing
 quant path in `LayeredKvArena` to simply call.
 
-### ⚠️ BUILT + BLOCKED (2026-07-18): gemma4 global layers are head_dim 512
+### ✅ kvarn head_dim-512 kernel DONE + GPU-validated (2026-07-18)
+The head_dim-512 blocker below is RESOLVED. The kvarn kernels were almost entirely
+head_dim-generic already (strided `dpt = head_dim/32` loops); the only 256 caps were
+LDS/register sizing: `kvarn_quantize_tile` LDS `KVARN_RMAX` 256→512; and the flash
+tile + asym reduce kernels' per-thread register arrays (`mq/sa/za/out_vec` and the
+reduce's dim split), which were templated on a `MAXDPT`/`DPT` parameter — the default
+entry points stay MAXDPT=8 (BYTE-IDENTICAL for gemma3/qwen35 @256) and new `_hd512`
+entry points use 16, selected in `attention_flash_kvarn_batched_masked` when
+head_dim>256. Asserts relaxed to allow 512 on the two kvarn ctors + quantize dispatch.
+`kvarn_gather_k_tiles`/`kvarn_dequant_tile` were already generic. Rotation stays
+256-only (FWHT-256; gemma4 @512 runs kvarn unrotated). VALIDATED: extended
+`parity_kvarn_fused_flash` to sweep head_dim {256,512} vs an f64 host oracle — 256
+still matches (regression guard for the template refactor) AND 512 matches at ~1e-5
+(same precision). So gemma4 KVarN is now kernel-unblocked; the remaining gap is only
+the separate gemma4-dense-loader PLE issue (E2B/E4B don't load) for full serve-validation.
+
+### ⚠️ (historical) BUILT + BLOCKED: gemma4 global layers are head_dim 512
 The full KVarN wiring was implemented and compiles + unit-tests clean:
 `LayeredKvArena::new_kvarn` + `LayerCacheView` kvarn fields (layered_kv.rs), a
 `new_with_kv_mode` state ctor + KVarN branch in the Full attention path + kvarn scratch

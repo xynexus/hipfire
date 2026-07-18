@@ -391,7 +391,7 @@ impl LayeredKvArena {
     }
 
     /// KVarN variant of [`Self::new_fp32`]: Full-storage groups whose
-    /// `head_dim ∈ {128, 256}` hold variance-normalized `bits`-bit K + Q8 V;
+    /// `head_dim ∈ {128, 256, 512}` hold variance-normalized `bits`-bit K + Q8 V;
     /// SlidingWindow (local) groups and any incompatible geometry stay F32 (the
     /// local rings never carry the long-context KV, matching gemma3's choice).
     /// Only gemma4 rides this arena's quant path, so no other family is affected.
@@ -401,7 +401,7 @@ impl LayeredKvArena {
             let owned = vec![true; group.owned_layers];
             let cap = group.storage.physical_cap(plan.max_seq);
             let kvarn_ok = matches!(group.storage, KvStorageKind::Full)
-                && (group.head_dim == 128 || group.head_dim == 256);
+                && (group.head_dim == 128 || group.head_dim == 256 || group.head_dim == 512);
             let cache = if kvarn_ok {
                 KvCache::new_gpu_kvarn_capped_filtered(
                     gpu,

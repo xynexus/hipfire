@@ -9,6 +9,11 @@
 // produced it).
 //
 // Grid: [n_heads, sub_batch_size, 1]. Block: [32, 1, 1]. Zero LDS.
+//
+// DPT (dims-per-thread) is a template parameter: the default entry point uses
+// DPT=8 (32 threads × 8 = head_dim 256 — BYTE-IDENTICAL to before; asym4/3/2 and
+// kvarn @256), and `_hd512` uses DPT=16 (32 × 16 = head_dim 512) for gemma4's
+// global layers. partials are dim-indexed so any even split works.
 #include <hip/hip_runtime.h>
 
 // When `block_cols > 0` the reduce runs in DDTree tree-attention mode and
@@ -16,8 +21,8 @@
 // Otherwise it uses `positions[global_bid] + 1` (legacy causal). The tile
 // kernel's bias is already baked into the partials, so reduce only needs
 // to know how many tiles to combine.
-extern "C" __launch_bounds__(32, 16)
-__global__ void attention_flash_asym_reduce_batched(
+template <int DPT>
+__device__ __forceinline__ void asym_reduce_body(
     const float* __restrict__ partials,        // [sub_batch × n_heads × max_tiles × stride]
     float* __restrict__ out,                   // [sub_batch × n_heads × head_dim]
     const int* __restrict__ positions,         // [total_batch]
@@ -42,10 +47,8 @@ __global__ void attention_flash_asym_reduce_batched(
 
     const float* my_partials = partials + ((long long)local_bid * n_heads + h) * max_tiles * stride;
 
-    // Per-thread assignment: 8 consecutive dims per thread (matches asym3 tile),
-    // but since partials are dim-indexed we could use any per-thread split.
-    // Using tid*8 to match the asym3 tile layout exactly.
-    const int d_base = tid * 8;
+    // Per-thread assignment: DPT consecutive dims per thread (32 × DPT == head_dim).
+    const int d_base = tid * DPT;
 
     // Pass 1: global max
     float global_max = -1e30f;
@@ -55,9 +58,11 @@ __global__ void attention_flash_asym_reduce_batched(
             global_max = fmaxf(global_max, p[0]);
     }
 
-    // Pass 2: accumulate 8 dims per thread
+    // Pass 2: accumulate DPT dims per thread
     float global_sum = 0.0f;
-    float g[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    float g[DPT];
+    #pragma unroll
+    for (int i = 0; i < DPT; i++) g[i] = 0.0f;
 
     for (int tile = 0; tile < n_tiles; tile++) {
         const float* p = my_partials + tile * stride;
@@ -66,7 +71,7 @@ __global__ void attention_flash_asym_reduce_batched(
         if (tile_sum <= 0.0f) continue;
         float corr = expf(tile_max - global_max);
         #pragma unroll
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < DPT; i++)
             g[i] += p[2 + d_base + i] * corr;
         global_sum += tile_sum * corr;
     }
@@ -76,6 +81,26 @@ __global__ void attention_flash_asym_reduce_batched(
     const int q_dim = n_heads * head_dim;
     float* my_out = out + local_bid * q_dim + h * head_dim;
     #pragma unroll
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < DPT; i++)
         my_out[d_base + i] = g[i] * inv_sum;
+}
+
+// head_dim 256 (and asym4/3/2): DPT=8 — byte-identical to the original.
+extern "C" __launch_bounds__(32, 16)
+__global__ void attention_flash_asym_reduce_batched(
+    const float* __restrict__ partials, float* __restrict__ out,
+    const int* __restrict__ positions, int n_heads, int head_dim, int tile_size,
+    int max_tiles, int batch_offset, int block_start, int block_cols) {
+    asym_reduce_body<8>(partials, out, positions, n_heads, head_dim, tile_size,
+                        max_tiles, batch_offset, block_start, block_cols);
+}
+
+// head_dim 512: DPT=16 (gemma4 global layers).
+extern "C" __launch_bounds__(32, 16)
+__global__ void attention_flash_asym_reduce_hd512(
+    const float* __restrict__ partials, float* __restrict__ out,
+    const int* __restrict__ positions, int n_heads, int head_dim, int tile_size,
+    int max_tiles, int batch_offset, int block_start, int block_cols) {
+    asym_reduce_body<16>(partials, out, positions, n_heads, head_dim, tile_size,
+                         max_tiles, batch_offset, block_start, block_cols);
 }

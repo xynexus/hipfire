@@ -28,12 +28,19 @@
 //   [ GROUP*2   ]             s_col[c]     fp16   (per token-in-block)
 //
 // Grid: [n_heads, max_tiles, sub_batch_size]. Block: [32, 1, 1].
+//
+// The per-thread register arrays are sized by the MAXDPT template parameter =
+// max(head_dim)/32: the default entry point uses MAXDPT=8 (head_dim <= 256, e.g.
+// gemma3/qwen35 — BYTE-IDENTICAL to before) and `_hd512` uses MAXDPT=16 for
+// gemma4's head_dim-512 global layers. The loop bound `dpt = head_dim/32` is the
+// real work extent; MAXDPT only sizes the storage so head_dim-256 keeps its low
+// register pressure.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-extern "C" __launch_bounds__(32, 16)
-__global__ void attention_flash_kvarn_tile_batched(
+template <int MAXDPT>
+__device__ __forceinline__ void kvarn_tile_body(
     const float* __restrict__ q,               // [sub_batch × n_heads × head_dim]
     const uint8_t* __restrict__ records,       // block-tiled KVarN K records
     const float* __restrict__ window,          // [GROUP × kv_dim] f32 recent window
@@ -92,7 +99,7 @@ __global__ void attention_flash_kvarn_tile_batched(
     // Load Q for this batch position: `dpt` consecutive dims per thread.
     const float* q_head = q + local_bid * q_dim + h * head_dim;
     const int d0 = tid * dpt;
-    float mq[8];                               // dpt <= 8 (head_dim <= 256)
+    float mq[MAXDPT];                          // dpt <= MAXDPT (head_dim <= 32*MAXDPT)
     for (int i = 0; i < dpt; i++) mq[i] = q_head[d0 + i];
 
     // ── Phase A: Q·K with inline KVarN dequant (records) or f32 window. ──
@@ -107,7 +114,7 @@ __global__ void attention_flash_kvarn_tile_batched(
         const __half* zp_abs = (const __half*)(rec + off_zp);
         const __half* s_col = (const __half*)(rec + off_scol);
         // Per-channel scale/zp for this thread's dpt dims — load once per tile.
-        float sa[8], za[8];
+        float sa[MAXDPT], za[MAXDPT];
         for (int i = 0; i < dpt; i++) {
             sa[i] = __half2float(scale_abs[d0 + i]);
             za[i] = __half2float(zp_abs[d0 + i]);
@@ -175,7 +182,8 @@ __global__ void attention_flash_kvarn_tile_batched(
     __syncthreads();
 
     // ── Phase D: V-weighted accumulation (Q8_0) — identical to the Q8 tile. ──
-    float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    float out_vec[MAXDPT];
+    for (int i = 0; i < MAXDPT; i++) out_vec[i] = 0.0f;
     for (int t_local = 0; t_local < tile_len; t_local++) {
         float w = scores[t_local];
         int t = tile_start + t_local;
@@ -198,4 +206,34 @@ __global__ void attention_flash_kvarn_tile_batched(
     }
     for (int i = 0; i < dpt; i++)
         p[2 + d0 + i] = out_vec[i];
+}
+
+// head_dim <= 256 (dpt <= 8): the original entry point, byte-identical register
+// footprint (gemma3/qwen35 kvarn).
+extern "C" __launch_bounds__(32, 16) __global__ void attention_flash_kvarn_tile_batched(
+    const float* __restrict__ q, const uint8_t* __restrict__ records,
+    const float* __restrict__ window, const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials, const int* __restrict__ positions,
+    const float* __restrict__ tree_bias, int n_heads, int n_kv_heads, int head_dim,
+    int max_seq, float scale_attn, int tile_size, int max_tiles, int batch_offset,
+    int block_start, int block_cols, int n_full_blocks, int rec_bytes, int bits) {
+    kvarn_tile_body<8>(q, records, window, v_cache, partials, positions, tree_bias,
+                       n_heads, n_kv_heads, head_dim, max_seq, scale_attn, tile_size,
+                       max_tiles, batch_offset, block_start, block_cols, n_full_blocks,
+                       rec_bytes, bits);
+}
+
+// head_dim == 512 (dpt == 16): gemma4 global layers. Lower min-blocks hint since
+// the register arrays double.
+extern "C" __launch_bounds__(32, 8) __global__ void attention_flash_kvarn_tile_batched_hd512(
+    const float* __restrict__ q, const uint8_t* __restrict__ records,
+    const float* __restrict__ window, const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials, const int* __restrict__ positions,
+    const float* __restrict__ tree_bias, int n_heads, int n_kv_heads, int head_dim,
+    int max_seq, float scale_attn, int tile_size, int max_tiles, int batch_offset,
+    int block_start, int block_cols, int n_full_blocks, int rec_bytes, int bits) {
+    kvarn_tile_body<16>(q, records, window, v_cache, partials, positions, tree_bias,
+                        n_heads, n_kv_heads, head_dim, max_seq, scale_attn, tile_size,
+                        max_tiles, batch_offset, block_start, block_cols, n_full_blocks,
+                        rec_bytes, bits);
 }

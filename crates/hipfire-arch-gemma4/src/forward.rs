@@ -62,12 +62,10 @@ impl Gemma4DenseState {
 
     /// State with a selectable KV cache mode. `KvQuantMode::Kvarn` stores the
     /// Full-storage (global) layers as variance-normalized `kvarn_bits`-bit K + Q8 V
-    /// when their `head_dim ∈ {128, 256}`; SlidingWindow (local) layers stay F32.
-    /// NOTE: shipped gemma4 uses `global_head_dim` = 512 for its Full layers, which
-    /// the KVarN kernels do not yet support (they cap at 256), so this path currently
-    /// falls back to F32 there — the wiring activates once a head_dim-512 kvarn kernel
-    /// lands. Q8 KV is not wired (deprecated per the mq*/Q8 direction); non-Kvarn
-    /// modes use F32.
+    /// when their `head_dim ∈ {128, 256, 512}` (shipped gemma4 uses `global_head_dim`
+    /// = 512, served by the `_hd512` kvarn kernel variants); SlidingWindow (local)
+    /// layers stay F32. Q8 KV is not wired (deprecated per the mq*/Q8 direction);
+    /// non-Kvarn modes use F32.
     pub fn new_with_kv_mode(
         gpu: &mut Gpu,
         config: &Gemma4Config,
@@ -84,7 +82,7 @@ impl Gemma4DenseState {
             .layers()
             .iter()
             .filter(|spec| matches!(spec.storage, KvStorageKind::Full))
-            .filter(|spec| spec.head_dim == 128 || spec.head_dim == 256)
+            .filter(|spec| spec.head_dim == 128 || spec.head_dim == 256 || spec.head_dim == 512)
             .fold((0usize, 0usize, 0usize), |(kw, qh, _), spec| {
                 (kw.max(spec.kv_width()), qh.max(spec.q_heads), spec.head_dim)
             });

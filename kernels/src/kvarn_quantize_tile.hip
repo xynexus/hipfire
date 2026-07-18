@@ -20,7 +20,7 @@
 //
 // `bits` in {2,4,8}: codes/byte = 8/bits; qmax = 2^bits - 1. bits=4 is the
 // legacy nibble layout. Constraints: c_dim*bits % 8 == 0 (each row owns whole
-// bytes → the one-thread-per-row pack is race-free); r_dim,c_dim <= 256.
+// bytes → the one-thread-per-row pack is race-free); c_dim <= 256, r_dim <= 512.
 // Grid:[n_tiles], block:[256]. SINKHORN_ITERS matches kvarn.rs.
 
 #include <hip/hip_runtime.h>
@@ -28,7 +28,11 @@
 #include <stdint.h>
 
 #define KVARN_SINKHORN_ITERS 10
-#define KVARN_RMAX 256
+// Max r_dim (head_dim) supported: gemma4 global layers are head_dim 512, so the
+// per-row LDS scale arrays must span up to 512 (c_dim = GROUP = 128 always fits).
+// ~8 KB LDS total — well within budget; loops are bounded by r_dim/c_dim so the
+// head_dim-256 path stays bit-identical.
+#define KVARN_RMAX 512
 
 __device__ __forceinline__ float kvarn_log_clamp(float x) {
     return fminf(fmaxf(x, -0.3f), 10.0f);

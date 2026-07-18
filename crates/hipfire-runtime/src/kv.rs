@@ -1233,8 +1233,8 @@ impl KvCache {
         bits: usize,
     ) -> HipResult<Self> {
         assert!(
-            head_dim == 128 || head_dim == 256,
-            "kvarn requires head_dim=128 or 256"
+            head_dim == 128 || head_dim == 256 || head_dim == 512,
+            "kvarn requires head_dim=128, 256, or 512"
         );
         assert!(head_dim % 32 == 0);
         assert!(matches!(bits, 2 | 4 | 8), "kvarn bits must be 2, 4, or 8");
@@ -1344,8 +1344,8 @@ impl KvCache {
         bits: usize,
     ) -> HipResult<Self> {
         assert!(
-            head_dim == 128 || head_dim == 256,
-            "kvarn requires head_dim=128 or 256"
+            head_dim == 128 || head_dim == 256 || head_dim == 512,
+            "kvarn requires head_dim=128, 256, or 512"
         );
         assert!(head_dim % 32 == 0);
         assert!(matches!(bits, 2 | 4 | 8), "kvarn bits must be 2, 4, or 8");

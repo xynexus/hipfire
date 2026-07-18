@@ -1562,15 +1562,29 @@ impl Gpu {
         } else {
             batch_size
         };
+        // head_dim > 256 (gemma4 global layers = 512) selects the `_hd512` entry
+        // points, whose per-thread register arrays / dim split are sized for
+        // dpt=16; head_dim <= 256 keeps the byte-identical dpt=8 kernels.
+        let (tile_kernel, reduce_kernel) = if head_dim > 256 {
+            (
+                "attention_flash_kvarn_tile_batched_hd512",
+                "attention_flash_asym_reduce_hd512",
+            )
+        } else {
+            (
+                "attention_flash_kvarn_tile_batched",
+                "attention_flash_asym_reduce_batched",
+            )
+        };
         self.ensure_kernel(
-            "attention_flash_kvarn_tile_batched",
+            tile_kernel,
             kernels::ATTENTION_FLASH_KVARN_TILE_BATCHED_SRC,
-            "attention_flash_kvarn_tile_batched",
+            tile_kernel,
         )?;
         self.ensure_kernel(
-            "attention_flash_asym_reduce_batched",
+            reduce_kernel,
             kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC,
-            "attention_flash_asym_reduce_batched",
+            reduce_kernel,
         )?;
         let q_dim = n_heads * head_dim;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -1603,7 +1617,7 @@ impl Gpu {
                 let rb = rec_bytes as i32;
                 let bt = bits as i32;
                 self.launch_kernargs(
-                    "attention_flash_kvarn_tile_batched",
+                    tile_kernel,
                     [n_heads as u32, max_tiles as u32, chunk as u32],
                     [32, 1, 1],
                     (TILE_SIZE * 4) as u32,
@@ -1628,7 +1642,7 @@ impl Gpu {
                 let bs = block_start as i32;
                 let bc = block_cols as i32;
                 self.launch_kernargs(
-                    "attention_flash_asym_reduce_batched",
+                    reduce_kernel,
                     [n_heads as u32, chunk as u32, 1],
                     [32, 1, 1],
                     0,

@@ -1393,8 +1393,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         assert!(
-            r_dim <= 256 && c_dim <= 256,
-            "kvarn_quantize_tile: r,c must be <= 256"
+            r_dim <= 512 && c_dim <= 256,
+            "kvarn_quantize_tile: r must be <= 512, c <= 256"
         );
         assert!(
             matches!(bits, 2 | 4 | 8),
