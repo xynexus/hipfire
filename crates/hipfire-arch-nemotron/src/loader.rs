@@ -192,6 +192,34 @@ pub fn load_linear_hfq(
     k: usize,
 ) -> Result<LinearWeight, String> {
     let (qt, data) = hfq_tensor(hfq, name)?;
+    // Opus int8-activation family (OQ8 W8A8 qt=35, OQ+ W4A8 qt=33, OQ+ compact
+    // qt=36) → arch-combined `Oq8G256` via the shared repack helpers, dispatched by
+    // the generic iu8 GEMV/GEMM. Nemotron previously handled only OQ4 (34/37) and
+    // errored on qt 35. Mirrors the hfq.rs LLaMA loader.
+    let oq8_bytes = match qt {
+        35 => Some(hipfire_runtime::hfq::oq8_combined(&data, m, k)),
+        33 => Some(hipfire_runtime::hfq::oq4_to_oq8_combined(&data, m, k)),
+        36 => Some(hipfire_runtime::hfq::oqplus_compact_to_oq8_combined(
+            &data, m, k,
+        )),
+        _ => None,
+    };
+    if let Some(bytes) = oq8_bytes {
+        let buf = gpu
+            .upload_raw(&bytes, &[bytes.len()])
+            .map_err(|e| format!("nemotron hfq oq8 upload {name}: {e:?}"))?;
+        // oq8+/oq8++ carry the per-input-channel awq_scale sidecar; plain oq8 has none.
+        let awq_scale = hipfire_runtime::hfq::load_awq_scale(hfq, gpu, name, k);
+        return Ok(LinearWeight::Quant(Box::new(WeightTensor {
+            buf,
+            gpu_dtype: DType::Oq8G256,
+            m,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale,
+        })));
+    }
     // OQ4 (Opus Quant, symmetric W4): qt=34 is the row-major grouped on-disk form
     // that needs the arch-combined repack; qt=37 is already arch-packed. Both
     // dispatch as `DType::Oq4G256` (gemv via the shared dispatch, batched prefill

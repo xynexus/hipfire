@@ -285,6 +285,10 @@ pub const GATE_TABLE: &[GateRow] = &[
     GateRow { arch: 0, quant: "oq4+", feature: "prefill", support: FeatureSupport::Partial, note: "LLaMA OQ4+ W4A8 loads via oq4_to_oq8_combined into the shared int8-activation route; quality admission pending" },
     GateRow { arch: 0, quant: "oq8", feature: "prefill", support: FeatureSupport::Partial, note: "LLaMA OQ8 W8A8 loads via oq8_combined into the shared iu8 GEMM route; GPU-validated coherent (Llama-3.2-1B), eval-battery admission pending" },
     GateRow { arch: 0, quant: "oq8+", feature: "prefill", support: FeatureSupport::Partial, note: "LLaMA OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending" },
+    GateRow { arch: 14, quant: "oq4", feature: "prefill", support: FeatureSupport::Partial, note: "Nemotron OQ4 W4A4 loads via oq4_arch_load; batched prefill via weight_gemm; quality admission pending" },
+    GateRow { arch: 14, quant: "oq4+", feature: "prefill", support: FeatureSupport::Partial, note: "Nemotron OQ4+ W4A8 loads via oq4_to_oq8_combined; AWQ alpha 0.1 for Mamba acts (per calib notes); quality admission pending" },
+    GateRow { arch: 14, quant: "oq8", feature: "prefill", support: FeatureSupport::Partial, note: "Nemotron OQ8 W8A8 loads via oq8_combined + weight_gemm Oq8G256 route; GPU-validated coherent (Nemotron-3-Nano-4B), eval-battery admission pending" },
+    GateRow { arch: 14, quant: "oq8+", feature: "prefill", support: FeatureSupport::Partial, note: "Nemotron OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending" },
 ];
 
 /// One row of the diffusion (image/video denoiser) capability matrix.

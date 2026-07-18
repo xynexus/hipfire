@@ -96,6 +96,10 @@ Per-quant overrides of an arch capability (admission consults these before green
 | 0 | oq4+ | prefill | 🟡 | LLaMA OQ4+ W4A8 loads via oq4_to_oq8_combined into the shared int8-activation route; quality admission pending |
 | 0 | oq8 | prefill | 🟡 | LLaMA OQ8 W8A8 loads via oq8_combined into the shared iu8 GEMM route; GPU-validated coherent (Llama-3.2-1B), eval-battery admission pending |
 | 0 | oq8+ | prefill | 🟡 | LLaMA OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending |
+| 14 | oq4 | prefill | 🟡 | Nemotron OQ4 W4A4 loads via oq4_arch_load; batched prefill via weight_gemm; quality admission pending |
+| 14 | oq4+ | prefill | 🟡 | Nemotron OQ4+ W4A8 loads via oq4_to_oq8_combined; AWQ alpha 0.1 for Mamba acts (per calib notes); quality admission pending |
+| 14 | oq8 | prefill | 🟡 | Nemotron OQ8 W8A8 loads via oq8_combined + weight_gemm Oq8G256 route; GPU-validated coherent (Nemotron-3-Nano-4B), eval-battery admission pending |
+| 14 | oq8+ | prefill | 🟡 | Nemotron OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending |
 
 ### Diffusion capability matrix (generated)
 

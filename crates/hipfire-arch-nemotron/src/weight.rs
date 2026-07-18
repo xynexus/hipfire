@@ -115,9 +115,13 @@ impl LinearWeight {
                         let _ = gpu.free_tensor(x_rot);
                         res
                     }
-                    // OQ4 batched prefill (rotation + act-bit/batch heuristics) is
-                    // already implemented canonically in the shared weight_gemm.
-                    DType::Oq4G256 => hipfire_runtime::weights::weight_gemm(gpu, wt, x, out, seq),
+                    // OQ4 (W4A4) / OQ8 (W8A8) batched prefill — rotation +
+                    // act-bit/batch heuristics — is implemented canonically in the
+                    // shared dtype-dispatched weight_gemm (which owns the iu4/iu8
+                    // GEMM route). The decode/gemv path already accepts both.
+                    DType::Oq4G256 | DType::Oq8G256 => {
+                        hipfire_runtime::weights::weight_gemm(gpu, wt, x, out, seq)
+                    }
                     other => Err(HipError::unsupported(&format!(
                         "nemotron prefill: no quantized batched gemm for {other:?}"
                     ))),

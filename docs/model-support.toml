@@ -376,6 +376,41 @@ feature = "prefill"
 support = "partial"
 note = "LLaMA OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending"
 
+# Nemotron-H (arch 14, hybrid Mamba-2 + attention) OQ int8-activation: its own
+# loader (loader.rs) and its own prefill GEMM dispatch (weight.rs) each handled
+# only OQ4 — the loader errored on qt 35, and the batched GEMM had "no quantized
+# batched gemm for Oq8G256". Both now route OQ8/OQ+ through the shared
+# oq8_combined helpers + weight_gemm. GPU-validated coherent on halo
+# (Nemotron-3-Nano-4B oq8 → "Paris").
+
+[[gate]]
+arch = 14
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "Nemotron OQ4 W4A4 loads via oq4_arch_load; batched prefill via weight_gemm; quality admission pending"
+
+[[gate]]
+arch = 14
+quant = "oq4+"
+feature = "prefill"
+support = "partial"
+note = "Nemotron OQ4+ W4A8 loads via oq4_to_oq8_combined; AWQ alpha 0.1 for Mamba acts (per calib notes); quality admission pending"
+
+[[gate]]
+arch = 14
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "Nemotron OQ8 W8A8 loads via oq8_combined + weight_gemm Oq8G256 route; GPU-validated coherent (Nemotron-3-Nano-4B), eval-battery admission pending"
+
+[[gate]]
+arch = 14
+quant = "oq8+"
+feature = "prefill"
+support = "partial"
+note = "Nemotron OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending"
+
 # ── Diffusion (image/video denoiser) capability matrix ─────────────────────────
 # A SEPARATE matrix from the [[arch]] rows above: diffusion families are graded on
 # the image-generation pipeline spine (text-encoder → denoise → sampler → VAE →
