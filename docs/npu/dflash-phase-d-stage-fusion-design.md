@@ -72,7 +72,47 @@ tensor param) + a batched build (`-b<rows>`), and use it for BOTH q and k.
 **Saves 2 dispatches/layer (4 ops -> 2): 13.6 -> 11.6.** Low risk; validate against
 the golden `rust_l0_q_roped` / `rust_l0_k_roped`.
 
-### Step 2 — fuse rmsnorm INTO the projection GEMM (pre-pass)
+### Step 2 — rmsnorm absorbed into the projection — **LANDED**
+Result: **58 -> 47 raw dispatches (11.6 -> 9.4/layer)**, parity improved again:
+
+| | dispatches/layer | cos vs golden | cos vs precision ref |
+|---|---|---|---|
+| baseline    | 13.6 (68) | 0.998092 | 0.998147 |
+| after step 1| 11.6 (58) | 0.998132 | 0.998221 |
+| after step 2|  9.4 (47) | 0.998200 | 0.998578 |
+
+op-by-op layer 0: 7/7 PASS (the standalone `input_norm` check disappears — there
+is no standalone norm op left to check; `q_roped`/`k_roped` now validate the
+norm-fold and the projection together, fed the RAW layer-0 hidden).
+Wired behind `dflash_body_npu.py --fold-norm`.
+
+**This did NOT need a custom int8 GEMM.** The plan assumed a norm pre-pass inside
+the GEMM kernel; the algebra makes that unnecessary. `rmsnorm(x)[r,k] =
+x[r,k]*gamma[k]/rms(x[r])` is a per-INPUT-CHANNEL scale times a per-ROW scale,
+and the int8 projection already carries exactly those two degrees of freedom:
+
+* **gamma** multiplies the activation elementwise on the host, alongside the
+  per-row int8 quant that already happens there — free, no dispatch.
+* **1/rms** never touches the activation at all. Per-row int8 quantization is
+  invariant to a per-row rescale, so quantizing `x*gamma` gives the same int8
+  codes and the `1/rms` is applied to the resulting per-row activation SCALE.
+  Exact.
+
+Absorbed: both per-layer rmsnorms + the one-time `hidden_norm` (`compute_thp` now
+returns a bundle `(value, rms, gamma_name)` and defers the norm into the per-layer
+k_ctx/v_ctx projection). The final `norm.weight` stays a real dispatch — its
+output is the block result, not a GEMM input.
+
+**Measured dead end — do NOT fold gamma into the WEIGHT.** The obvious "fuse into
+the GEMM" move, `W'[n,k] = W[n,k]*gamma[k]` folded offline before quantization, is
+equally exact in real arithmetic but was tried and measurably regresses parity:
+full body **0.998132 -> 0.994632** vs golden, with the precision reference
+degrading identically (0.998592 -> 0.994792). The cause is structural, not a
+kernel bug: a per-INPUT-channel scale is exactly what per-OUTPUT-channel int8
+quantization cannot absorb. Both variants save the same dispatches; the
+activation-side fold is strictly better.
+
+### Step 2 (original plan — superseded by the above)
 The GEMM streams 25 MB of weights; the preceding rmsnorm touches only the 128 KB
 activation. Fuse by giving the projection kernel a pre-pass that norms the staged
 activation (in memtile) before the GEMM streams weights. Requires a CUSTOM int8

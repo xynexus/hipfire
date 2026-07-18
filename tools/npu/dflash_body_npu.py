@@ -121,7 +121,7 @@ def quantize_row_symmetric(x_f32, bits=8):
 class NpuOps:
     def __init__(self, count=True, batch_ops=False, proj_mode="group",
                  resident_weights=False, concat_proj=False, attn_all_kv=False,
-                 fuse_hnrope=False):
+                 fuse_hnrope=False, fold_norm=False):
         # batch_ops   : Lever 1 — run norm/headnorm/rope/swiglu batched (all rows
         #               in ONE dispatch) via the *-b<rows> xclbins instead of the
         #               per-row loop.
@@ -141,6 +141,11 @@ class NpuOps:
         #               collapse into one kernel (dflash-hnrope-*), for both q
         #               and k. Saves 2 dispatches/layer (13.6 -> 11.6).
         self.fuse_hnrope = fuse_hnrope
+        # fold_norm : Phase D step 2 — the rmsnorm feeding a projection is
+        #             ABSORBED into that projection (gamma folded into the
+        #             weight, 1/rms folded into the per-row activation scale).
+        #             Saves 2 dispatches/layer + the one-time hidden_norm.
+        self.fold_norm = fold_norm
         # Lever 4 (speed, not dispatch count): keep int8 projection weights
         # resident on the NPU instead of re-uploading ~1 GB every pass.
         self.resident_weights = resident_weights
@@ -371,6 +376,76 @@ class NpuOps:
             off += n
         return out
 
+    def project_concat_prenorm(self, x, W, names, gamma_name, eps=KERNEL_EPS):
+        """Phase D step 2: the preceding rmsnorm ABSORBED into the projection.
+
+        rmsnorm(x)[r,k] = x[r,k] * gamma[k] / rms(x[r]) is the product of a
+        per-INPUT-CHANNEL scale (gamma) and a per-ROW scale (1/rms), and the
+        int8 projection can absorb both without a single extra dispatch:
+
+          * gamma multiplies the activation elementwise, on the host, alongside
+            the per-row int8 quant that already happens there — free.
+          * 1/rms is a per-ROW scale, and per-row int8 quantization is invariant
+            to a per-row rescale, so it never has to touch the activation at
+            all: quantize (x*gamma) and divide the resulting per-row activation
+            SCALE by rms. Identical int8 codes, exact.
+
+        So the rmsnorm dispatch disappears with no custom GEMM kernel and, just
+        as importantly, no change to the weight or its quantization.
+
+        Saves 2 dispatches/layer (both rmsnorms) plus the one-time hidden_norm.
+
+        Why not fold gamma into the WEIGHT instead (W'[n,k] = W[n,k]*gamma[k]),
+        which is the more obvious "fuse into the GEMM" move: it is algebraically
+        just as exact, but the weight then gets int8-quantized AFTER folding, and
+        a per-INPUT-channel scale is exactly what per-OUTPUT-channel quantization
+        cannot absorb. Measured on the 9B drafter it cost ~0.0035 cosine on the
+        full body (0.998132 -> 0.994632 vs golden), with the precision reference
+        degrading identically (0.998592 -> 0.994792) — i.e. inherent to the
+        quantization, not a kernel artifact. The activation-side fold below has
+        no such cost.
+
+        Numerically this is not bit-identical to running the two ops separately;
+        it moves in the ACCURATE direction on both counts that change (rms is
+        computed in f32 on the host rather than bf16 on device, and the normed
+        activation is never rounded to bf16).
+        """
+        if not self.fold_norm:
+            xn = self.rmsnorm(x, W.raw(gamma_name))
+            return self.project_concat(xn, W, names)
+        x = np.ascontiguousarray(x, np.float32)
+        rms = np.sqrt(np.mean(x ** 2, axis=1) + eps).astype(np.float32)  # [rows]
+        xg = x * W.raw(gamma_name).astype(np.float32)[None, :]
+        qw, sw, sizes = W.qproj_row_concat(names)
+        dev = W.device_weight_concat(names) if self.resident_weights else None
+        y = self._proj_row(xg, qw, sw, dev, act_div=rms)   # [rows, sum(N)]
+        out, off = [], 0
+        for n in sizes:
+            out.append(y[:, off:off + n])
+            off += n
+        return out
+
+    def project_concat_thp(self, thp, W, names):
+        """k_ctx/v_ctx from the context projection `thp`.
+
+        `thp` is a bundle (value, rms_or_None, gamma_name_or_None) from
+        compute_thp. With fold_norm on, the value is the RAW fc output and the
+        hidden_norm is absorbed here exactly as in project_concat_prenorm —
+        which is what lets compute_thp skip its rmsnorm dispatch entirely.
+        """
+        value, rms, gamma_name = thp
+        if not self.fold_norm:
+            return self.project_concat(value, W, names)
+        vg = value.astype(np.float32) * W.raw(gamma_name).astype(np.float32)[None, :]
+        qw, sw, sizes = W.qproj_row_concat(names)
+        dev = W.device_weight_concat(names) if self.resident_weights else None
+        y = self._proj_row(vg, qw, sw, dev, act_div=rms)
+        out, off = [], 0
+        for n in sizes:
+            out.append(y[:, off:off + n])
+            off += n
+        return out
+
     def _proj_group(self, x, qw, sw):
         """Per-256-group int8 (baseline): one dispatch per group.
         qw int8 [N,K], sw f32 [N,ng] pre-quantized weight."""
@@ -390,17 +465,21 @@ class NpuOps:
         self.op_dispatches += 1
         return Y
 
-    def _proj_row(self, x, qw, sw, dev=None):
+    def _proj_row(self, x, qw, sw, dev=None, act_div=None):
         """Lever 2a: full-K per-ROW/per-CHANNEL int8 — ONE dispatch/projection.
         Single int8 quant over the whole K (one scale per activation row and per
         output channel); rank-1 rescale C·(a_scale[m]⊗w_scale[n]).
         qw int8 [N,K] per-channel, sw f32 [N] per-channel scale.
-        `dev` = (A_t, M, K) NPU-resident weight from design.upload_int8()."""
+        `dev` = (A_t, M, K) NPU-resident weight from design.upload_int8().
+        `act_div` = optional per-row divisor folded into the activation scale
+        (Phase D step 2: the rmsnorm 1/rms, see project_concat_prenorm)."""
         self.release()  # free XRT columns for the @iron.jit matmul
         x = np.ascontiguousarray(x, np.float32)
         rows, K = x.shape
         N = qw.shape[0]
         qx, sx = quantize_row_symmetric(x, 8)      # [rows,K], [rows]
+        if act_div is not None:
+            sx = sx / np.asarray(act_div, np.float32)
         if dev is not None:
             A_t, M_w, K_w = dev
             C, _tile = design.matmul_npu_resident(A_t, M_w, K_w, qx)  # C[N,rows] i32
@@ -528,6 +607,46 @@ def ref_project(W, name, x, proj_mode):
     return ref_proj_int8(x, *W.qproj(name))
 
 
+def ref_proj_int8_row_prenorm(xg, qw, sw, rms):
+    """Mirror of NpuOps._proj_row with act_div (Phase D step 2 norm folding).
+    xg is the gamma-scaled activation; rms is the per-row rmsnorm divisor,
+    folded into the per-row activation scale rather than into the values."""
+    qx, sx = quantize_row_symmetric(xg.astype(np.float32), 8)
+    sx = sx / np.asarray(rms, np.float32)
+    C = (qx.astype(np.int64) @ qw.astype(np.int64).T).astype(np.float32)
+    return (sx[:, None] * sw[None, :]) * C
+
+
+def _split(y, sizes):
+    out, off = [], 0
+    for n in sizes:
+        out.append(y[:, off:off + n])
+        off += n
+    return out
+
+
+def ref_project_concat_prenorm(W, names, gamma_name, x, eps, fold_norm):
+    """Reference twin of NpuOps.project_concat_prenorm (row proj only)."""
+    if not fold_norm:
+        xn = ref_rmsnorm(x, W.raw(gamma_name), eps)
+        return [ref_proj_int8_row(xn, *W.qproj_row(n)) for n in names]
+    x = x.astype(np.float32)
+    rms = np.sqrt(np.mean(x ** 2, axis=1) + eps).astype(np.float32)
+    xg = x * W.raw(gamma_name).astype(np.float32)[None, :]
+    qw, sw, sizes = W.qproj_row_concat(names)
+    return _split(ref_proj_int8_row_prenorm(xg, qw, sw, rms), sizes)
+
+
+def ref_project_thp(W, names, thp, fold_norm):
+    """Reference twin of NpuOps.project_concat_thp."""
+    value, rms, gamma_name = thp
+    if not fold_norm:
+        return [ref_proj_int8_row(value, *W.qproj_row(n)) for n in names]
+    vg = value.astype(np.float32) * W.raw(gamma_name).astype(np.float32)[None, :]
+    qw, sw, sizes = W.qproj_row_concat(names)
+    return _split(ref_proj_int8_row_prenorm(vg, qw, sw, rms), sizes)
+
+
 def ref_attention(q, k, v, groups):
     B, NH, HD = q.shape
     tot = k.shape[0]
@@ -633,16 +752,28 @@ class Cfg:
         self.tot = self.L + self.B
 
 
-def compute_thp(ops, W, cfg, target_hidden, use_ref=False, proj_mode="group"):
-    """One-time context projection: thp = hidden_norm(fc(target_hidden))."""
+def compute_thp(ops, W, cfg, target_hidden, use_ref=False, proj_mode="group",
+                fold_norm=False):
+    """One-time context projection: thp = hidden_norm(fc(target_hidden)).
+
+    Returns the BUNDLE (value, rms_or_None, gamma_name_or_None) consumed by
+    NpuOps.project_concat_thp / ref_project_thp. With fold_norm the hidden_norm
+    is not applied here at all — the value stays raw and the norm is absorbed
+    into the per-layer k_ctx/v_ctx projection, saving this rmsnorm dispatch.
+    """
     th_flat = target_hidden.reshape(cfg.L, cfg.NE * cfg.H)
+    gamma_name = "hidden_norm.weight"
     if use_ref:
         thp = ref_project(W, "fc.weight", th_flat, proj_mode)
-        thp = ref_rmsnorm(thp, W.raw("hidden_norm.weight"), cfg.EPS)
-    else:
-        thp = ops.project(th_flat, W, "fc.weight")
-        thp = ops.rmsnorm(thp, W.raw("hidden_norm.weight"))
-    return thp
+        if fold_norm:
+            rms = np.sqrt(np.mean(thp.astype(np.float32) ** 2, axis=1) + cfg.EPS)
+            return (thp, rms.astype(np.float32), gamma_name)
+        return (ref_rmsnorm(thp, W.raw(gamma_name), cfg.EPS), None, None)
+    thp = ops.project(th_flat, W, "fc.weight")
+    if fold_norm:
+        rms = np.sqrt(np.mean(thp.astype(np.float32) ** 2, axis=1) + cfg.EPS)
+        return (thp, rms.astype(np.float32), gamma_name)
+    return (ops.rmsnorm(thp, W.raw(gamma_name)), None, None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -653,12 +784,13 @@ def run_body(ops, W, cfg, noise, thp, per_layer_out=None):
     for li in range(cfg.NL):
         p = f"layers.{li}."
         residual = hidden
-        xn = ops.rmsnorm(hidden, W.raw(p + "input_layernorm.weight"))
         # Lever 3 concat-GEMM: q/k/v share x_norm -> 1 dispatch; k_ctx/v_ctx share thp -> 1.
-        q, k_noise, v_noise = ops.project_concat(
-            xn, W, [p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
-                    p + "self_attn.v_proj.weight"])
-        k_ctx, v_ctx = ops.project_concat(
+        # Phase D step 2: the input_layernorm is absorbed into that GEMM.
+        q, k_noise, v_noise = ops.project_concat_prenorm(
+            hidden, W, [p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
+                        p + "self_attn.v_proj.weight"],
+            p + "input_layernorm.weight", cfg.EPS)
+        k_ctx, v_ctx = ops.project_concat_thp(
             thp, W, [p + "self_attn.k_proj.weight", p + "self_attn.v_proj.weight"])
 
         k = np.concatenate([k_ctx, k_noise], axis=0)  # [tot, NKV*HD]
@@ -678,10 +810,11 @@ def run_body(ops, W, cfg, noise, thp, per_layer_out=None):
         hidden = residual + attn_proj
 
         residual = hidden
-        xn2 = ops.rmsnorm(hidden, W.raw(p + "post_attention_layernorm.weight"))
         # Lever 3 concat-GEMM: gate/up share x2 -> 1 dispatch.
-        gate, up = ops.project_concat(
-            xn2, W, [p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"])
+        # Phase D step 2: the post_attention_layernorm is absorbed into it.
+        gate, up = ops.project_concat_prenorm(
+            hidden, W, [p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"],
+            p + "post_attention_layernorm.weight", cfg.EPS)
         s = ops.swiglu(gate, up)
         d = ops.project(s, W, p + "mlp.down_proj.weight")
         hidden = residual + d
@@ -689,6 +822,16 @@ def run_body(ops, W, cfg, noise, thp, per_layer_out=None):
             per_layer_out.append(hidden.copy())
     final = ops.rmsnorm(hidden, W.raw("norm.weight"))
     return final
+
+
+def materialize_thp(thp, W):
+    """The normed thp value, for comparison against the golden checkpoint.
+    With fold_norm the bundle holds the raw fc output plus its rms, so rebuild
+    normed = value * gamma / rms; otherwise the value is already normed."""
+    value, rms, gamma_name = thp
+    if rms is None:
+        return value
+    return bf16((value.astype(np.float32) / rms[:, None]) * W.raw(gamma_name).astype(np.float32))
 
 
 def proj_weight_names(cfg):
@@ -703,7 +846,7 @@ def proj_weight_names(cfg):
     return names
 
 
-def prequantize(W, cfg, proj_mode, resident=False):
+def prequantize(W, cfg, proj_mode, resident=False, fold_norm=False):
     """Lever-4 speed win: int8-quantize every projection weight ONCE, up front,
     so the timed block forward does not pay for it. In a real deployment this is
     an offline step (the .hfq sidecar already stores quantized weights)."""
@@ -729,18 +872,28 @@ def prequantize(W, cfg, proj_mode, resident=False):
     return dt
 
 
-def ref_body(W, cfg, noise, thp_ref, per_layer_out=None, proj_mode="group"):
+def ref_body(W, cfg, noise, thp_ref, per_layer_out=None, proj_mode="group",
+             fold_norm=False):
     """bf16/int8-precision numpy mirror of run_body (no NPU)."""
     hidden = noise.astype(np.float32).copy()
     for li in range(cfg.NL):
         p = f"layers.{li}."
         residual = hidden
-        xn = ref_rmsnorm(hidden, W.raw(p + "input_layernorm.weight"), cfg.EPS)
-        q = ref_project(W, p + "self_attn.q_proj.weight", xn, proj_mode)
-        k_noise = ref_project(W, p + "self_attn.k_proj.weight", xn, proj_mode)
-        v_noise = ref_project(W, p + "self_attn.v_proj.weight", xn, proj_mode)
-        k_ctx = ref_project(W, p + "self_attn.k_proj.weight", thp_ref, proj_mode)
-        v_ctx = ref_project(W, p + "self_attn.v_proj.weight", thp_ref, proj_mode)
+        if proj_mode == "row":
+            q, k_noise, v_noise = ref_project_concat_prenorm(
+                W, [p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
+                    p + "self_attn.v_proj.weight"],
+                p + "input_layernorm.weight", hidden, cfg.EPS, fold_norm)
+            k_ctx, v_ctx = ref_project_thp(
+                W, [p + "self_attn.k_proj.weight", p + "self_attn.v_proj.weight"],
+                thp_ref, fold_norm)
+        else:
+            xn = ref_rmsnorm(hidden, W.raw(p + "input_layernorm.weight"), cfg.EPS)
+            q = ref_project(W, p + "self_attn.q_proj.weight", xn, proj_mode)
+            k_noise = ref_project(W, p + "self_attn.k_proj.weight", xn, proj_mode)
+            v_noise = ref_project(W, p + "self_attn.v_proj.weight", xn, proj_mode)
+            k_ctx = ref_project(W, p + "self_attn.k_proj.weight", thp_ref[0], proj_mode)
+            v_ctx = ref_project(W, p + "self_attn.v_proj.weight", thp_ref[0], proj_mode)
 
         q = ref_headnorm(q, W.raw(p + "self_attn.q_norm.weight"), cfg.NH, cfg.EPS)
         k = np.concatenate([k_ctx, k_noise], axis=0)
@@ -759,9 +912,14 @@ def ref_body(W, cfg, noise, thp_ref, per_layer_out=None, proj_mode="group"):
         hidden = residual + attn_proj
 
         residual = hidden
-        xn2 = ref_rmsnorm(hidden, W.raw(p + "post_attention_layernorm.weight"), cfg.EPS)
-        gate = ref_project(W, p + "mlp.gate_proj.weight", xn2, proj_mode)
-        up = ref_project(W, p + "mlp.up_proj.weight", xn2, proj_mode)
+        if proj_mode == "row":
+            gate, up = ref_project_concat_prenorm(
+                W, [p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"],
+                p + "post_attention_layernorm.weight", hidden, cfg.EPS, fold_norm)
+        else:
+            xn2 = ref_rmsnorm(hidden, W.raw(p + "post_attention_layernorm.weight"), cfg.EPS)
+            gate = ref_project(W, p + "mlp.gate_proj.weight", xn2, proj_mode)
+            up = ref_project(W, p + "mlp.up_proj.weight", xn2, proj_mode)
         s = ref_swiglu(gate, up)
         d = ref_project(W, p + "mlp.down_proj.weight", s, proj_mode)
         hidden = residual + d
@@ -803,23 +961,38 @@ def op_by_op(ops, W, cfg, G, cos_gate=0.99):
         print(f"  [{'PASS' if ok else 'FAIL'}] {tag:26s} cos={c:.6f}  max_abs={d:.3e}")
         return out
 
-    # thp (one-time) vs golden target_hidden_proj
-    thp = compute_thp(ops, W, cfg, target_hidden, proj_mode=ops.proj_mode)
-    check("thp (fc+hidden_norm)", thp, G.rust("target_hidden_proj"))
+    # thp (one-time) vs golden target_hidden_proj. With fold_norm the bundle
+    # carries the RAW fc output; materialize the normed value to compare.
+    thp = compute_thp(ops, W, cfg, target_hidden, proj_mode=ops.proj_mode,
+                      fold_norm=ops.fold_norm)
+    check("thp (fc+hidden_norm)", materialize_thp(thp, W), G.rust("target_hidden_proj"))
 
-    # 1. input_layernorm : noise -> l0_input_norm
-    xn = ops.rmsnorm(noise, W.raw(p + "input_layernorm.weight"))
-    xn = check("input_norm", xn, G.rust("l0_input_norm"))
+    # 1. input_layernorm : noise -> l0_input_norm. Absorbed into the projection
+    #    when fold_norm is on, so there is nothing standalone to check then.
+    if not ops.fold_norm:
+        xn = ops.rmsnorm(noise, W.raw(p + "input_layernorm.weight"))
+        xn = check("input_norm", xn, G.rust("l0_input_norm"))
 
     # 2. projections from GOLDEN input_norm + golden thp, headnorm, rope
     #    checkpoints available: q_roped, k_roped, v.
+    #    With fold_norm the norm+projection are one op, so it is fed the RAW
+    #    layer-0 hidden (== noise) instead of the golden normed activation —
+    #    q_roped/k_roped then validate norm-fold and projection together.
     xn_g = G.rust("l0_input_norm")          # feed golden to isolate downstream
     thp_g = G.rust("target_hidden_proj")
-    q = ops.project(xn_g, W, p + "self_attn.q_proj.weight")
-    k_noise = ops.project(xn_g, W, p + "self_attn.k_proj.weight")
-    v_noise = ops.project(xn_g, W, p + "self_attn.v_proj.weight")
-    k_ctx = ops.project(thp_g, W, p + "self_attn.k_proj.weight")
-    v_ctx = ops.project(thp_g, W, p + "self_attn.v_proj.weight")
+    if ops.fold_norm:
+        q, k_noise, v_noise = ops.project_concat_prenorm(
+            noise, W, [p + "self_attn.q_proj.weight", p + "self_attn.k_proj.weight",
+                       p + "self_attn.v_proj.weight"],
+            p + "input_layernorm.weight", cfg.EPS)
+        k_ctx, v_ctx = ops.project_concat_thp(
+            thp, W, [p + "self_attn.k_proj.weight", p + "self_attn.v_proj.weight"])
+    else:
+        q = ops.project(xn_g, W, p + "self_attn.q_proj.weight")
+        k_noise = ops.project(xn_g, W, p + "self_attn.k_proj.weight")
+        v_noise = ops.project(xn_g, W, p + "self_attn.v_proj.weight")
+        k_ctx = ops.project(thp_g, W, p + "self_attn.k_proj.weight")
+        v_ctx = ops.project(thp_g, W, p + "self_attn.v_proj.weight")
     k = np.concatenate([k_ctx, k_noise], axis=0)
     v = np.concatenate([v_ctx, v_noise], axis=0)
     q = ops.headnorm_rope(q, W.raw(p + "self_attn.q_norm.weight"),
@@ -845,9 +1018,14 @@ def op_by_op(ops, W, cfg, G, cos_gate=0.99):
 
     # 5. MLP from GOLDEN post_attn_residual -> l0_out
     post_g = G.rust("l0_post_attn_residual")
-    xn2 = ops.rmsnorm(post_g, W.raw(p + "post_attention_layernorm.weight"))
-    gate = ops.project(xn2, W, p + "mlp.gate_proj.weight")
-    up = ops.project(xn2, W, p + "mlp.up_proj.weight")
+    if ops.fold_norm:
+        gate, up = ops.project_concat_prenorm(
+            post_g, W, [p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"],
+            p + "post_attention_layernorm.weight", cfg.EPS)
+    else:
+        xn2 = ops.rmsnorm(post_g, W.raw(p + "post_attention_layernorm.weight"))
+        gate = ops.project(xn2, W, p + "mlp.gate_proj.weight")
+        up = ops.project(xn2, W, p + "mlp.up_proj.weight")
     s = ops.swiglu(gate, up)
     d = ops.project(s, W, p + "mlp.down_proj.weight")
     l0_out = post_g + d
@@ -868,10 +1046,12 @@ def full_body(ops, W, cfg, G, cos_gate=0.99, warm_runs=0):
     target_hidden = G.inp("target_hidden").astype(np.float32)
 
     # One-time setup (weight int8 quant) is NOT part of the block forward budget.
-    prequantize(W, cfg, ops.proj_mode, resident=ops.resident_weights)
+    prequantize(W, cfg, ops.proj_mode, resident=ops.resident_weights,
+                fold_norm=ops.fold_norm)
 
     t0 = time.perf_counter()
-    thp = compute_thp(ops, W, cfg, target_hidden, proj_mode=ops.proj_mode)
+    thp = compute_thp(ops, W, cfg, target_hidden, proj_mode=ops.proj_mode,
+                      fold_norm=ops.fold_norm)
     per_layer = []
     final = run_body(ops, W, cfg, noise, thp, per_layer_out=per_layer)
     wall = time.perf_counter() - t0
@@ -888,7 +1068,8 @@ def full_body(ops, W, cfg, G, cos_gate=0.99, warm_runs=0):
         for _ in range(warm_runs):
             n0 = ops.npu_ns
             t1 = time.perf_counter()
-            thp_w = compute_thp(ops, W, cfg, target_hidden, proj_mode=ops.proj_mode)
+            thp_w = compute_thp(ops, W, cfg, target_hidden, proj_mode=ops.proj_mode,
+                                fold_norm=ops.fold_norm)
             run_body(ops, W, cfg, noise, thp_w)
             wt.append(time.perf_counter() - t1)
             warm_npu.append(ops.npu_ns - n0)
@@ -898,9 +1079,11 @@ def full_body(ops, W, cfg, G, cos_gate=0.99, warm_runs=0):
         ops.dispatches, ops.op_dispatches = d0, o0
 
     # bf16/int8-precision numpy reference (mirrors the active device precision)
-    thp_ref = compute_thp(None, W, cfg, target_hidden, use_ref=True, proj_mode=ops.proj_mode)
+    thp_ref = compute_thp(None, W, cfg, target_hidden, use_ref=True,
+                          proj_mode=ops.proj_mode, fold_norm=ops.fold_norm)
     per_layer_ref = []
-    final_ref = ref_body(W, cfg, noise, thp_ref, per_layer_out=per_layer_ref, proj_mode=ops.proj_mode)
+    final_ref = ref_body(W, cfg, noise, thp_ref, per_layer_out=per_layer_ref,
+                         proj_mode=ops.proj_mode, fold_norm=ops.fold_norm)
 
     gold_final = G.rust("final_block_hidden")
     ok = True
@@ -961,6 +1144,11 @@ def main():
     ap.add_argument("--attn-all-kv", action="store_true",
                     help="Lever 3: whole layer attention in ONE dispatch "
                          "(core loops kv-heads); exact, saves 7 dispatches/layer")
+    ap.add_argument("--fold-norm", action="store_true",
+                    help="Phase D step 2: absorb each rmsnorm that feeds a "
+                         "projection INTO that projection (gamma folded into the "
+                         "weight, 1/rms into the per-row activation scale); "
+                         "saves 2 dispatches/layer (row proj only)")
     ap.add_argument("--fuse-hnrope", action="store_true",
                     help="Phase D step 1: fuse headnorm+rope into ONE kernel for "
                          "q and k (dflash-hnrope-*); saves 2 dispatches/layer")
@@ -977,11 +1165,11 @@ def main():
     ops = NpuOps(batch_ops=args.batch_ops, proj_mode=args.proj,
                  resident_weights=args.resident_weights,
                  concat_proj=args.concat_proj, attn_all_kv=args.attn_all_kv,
-                 fuse_hnrope=args.fuse_hnrope)
+                 fuse_hnrope=args.fuse_hnrope, fold_norm=args.fold_norm)
     print(f"[dflash_body_npu] config: batch_ops={ops.batch_ops} "
           f"proj_mode={ops.proj_mode} resident_weights={ops.resident_weights} "
           f"concat_proj={ops.concat_proj} attn_all_kv={ops.attn_all_kv} "
-          f"fuse_hnrope={ops.fuse_hnrope}")
+          f"fuse_hnrope={ops.fuse_hnrope} fold_norm={ops.fold_norm}")
 
     if args.op_by_op:
         ok = op_by_op(ops, W, cfg, G, args.cos_gate)
