@@ -310,32 +310,68 @@ high it starves; leave it env-tunable).
 one min-quantum (measured), and the preempted job's final output is
 byte-identical to running it uninterrupted; `coherence-gate-dflash.sh` clean.
 
-## Phase 5 — Bring a second modality under the arbiter (COORDINATED, not concurrent)
+## Phase 5 — Merge the arbiters: one universal GPU arbiter across every class
 
-This is where "across modalities" starts being real, honestly, on a serial GPU:
-the arbiter decides *who runs next* by priority + resources — image vs text —
-instead of two paths blindly contending. Depends on Phase 4: without the
-diffusion-step yield point, "image under the arbiter" would just let a txt2img
-hold the GPU for minutes.
+**Revised target (2026-07-18, per direction):** not "bolt image/embed admission
+onto the scheduler," but *merge the arbiters*. Today there are two-and-a-half
+independent GPU arbiters: (1) `work_scheduler` (`ContinuousWorkScheduler`) —
+admission/priority, text-only so far; (2) the `state.engine` mutex — the de-facto
+*execution* gate every daemon op (`engine.lock()`: chat legacy, embeddings,
+`responses`, admin, steer) contends on; (3) the diffusion path
+(`spawn_blocking` on `diffusion_pipelines`) which bypasses both and contends on
+the physical GPU. The end state: **`work_scheduler` is the one arbiter that
+orders work, and the batch runner is the one thing that touches the GPU.** Every
+class enqueues a lease and the runner dispatches it inside its exclusive GPU
+turn; the P4 preemption machinery (park/resume stack, yield checkpoints) applies
+uniformly at each class's step boundary. The engine mutex stops being a separate
+arbiter; diffusion stops bypassing.
 
-- Route image-gen (`sdapi.rs`) admission through `ContinuousWorkScheduler` as
-  `WorkloadClass::ImageGeneration` before it grabs the GPU via `spawn_blocking`.
-  It takes a lease and, via Phase 4, yields at sampler-step boundaries to
-  higher-priority interactive text.
-- Embeddings (`embeddings.rs`) admit as their own lease similarly (cheap; direct
-  `engine.embed`).
-- `ImageGeneration` already flows through `supports_microbatching()`
-  (`lib.rs:279`) and the test `continuous_scheduler_microbatches_compatible_
-  image_work` (`lib.rs:2819`) proves the engine handles it — this phase makes
-  that test path real.
+Scope spans **all five workload classes** (`WorkloadClass` already carries
+`TokenPrefill`/`TokenDecode`/`ImageGeneration`/`Training`/`Maintenance`), across
+**two coordination regimes**:
 
-**Delivers:** text + image + embeddings share one priority/resource arbiter with
-preemption — a long txt2img no longer blocks interactive text. Still
-time-sliced, not simultaneous.
-**Risk:** medium — image lease duration + preemption interaction.
-**Exit check:** interleaved text+image load shows priority-ordered, preemptive
-GPU handoff (trace); p99 interactive-text latency bounded under concurrent image
-load.
+- **In-process (runner-dispatched)** — the runner owns the engine + diffusion
+  pipelines and runs these on its GPU turn:
+  - **Text** (`TokenPrefill`/`TokenDecode`) — fused decode cycle. DONE (P1–P4).
+  - **Image** (`ImageGeneration`) — diffusion pipeline moved off the route's
+    `spawn_blocking` into the runner's turn. Preempts at *sampler-step*
+    boundaries via the existing progress callback: return `Err`/`Interrupted`
+    when a higher-priority waiter appears, then **restart from the same seed**
+    (diffusion is deterministic → the restarted image is byte-identical to the
+    uninterrupted one; cost is redone steps, not correctness). This is the meaty
+    preemption case and drives the design.
+  - **Embed** (`Maintenance`/dedicated) — `engine.embed`, short; whole-op
+    quantum (non-preemptible, min-quantum covers it).
+  - **Steering** (`hipfire_steer`, in-daemon, process-global) — daemon steer
+    ops (capture/apply/load_lora) routed like a short daemon op; its own class
+    or `Maintenance`.
+- **Cross-process (flock bridge)** — **Training** (`hipfire-train`, a separate
+  non-daemon binary) coordinates via the `hipfire lock` GPU flock, not the
+  runner. The arbiter bridges: when the scheduler grants a training lease the
+  runner *releases* the GPU flock and quiesces; training takes a scheduler-aware
+  lease + flock; interactive work preempts training back by priority. This is
+  the hardest, novel piece and can trail the in-process merge.
+
+**Incremental order (each GPU-validated + committed):**
+1. **Runner executor seam** — generalize the runner loop from "text batch only"
+   to `dispatch(lease)` by `WorkloadClass`; a unified job inbox
+   (`ScheduledJob { Text | Embed | Image | Steer }`) parallel to `batch_inbox`.
+   Text is the existing impl; prove the seam end-to-end with **Embed** first
+   (simplest new class) — embed route enqueues + awaits instead of locking the
+   engine.
+2. **Image under the runner** — move diffusion into the runner turn; sampler-step
+   preemption via callback + restart-from-seed; the byte-identical exit check.
+3. **Steering under the runner** — steer ops as a runner-dispatched class.
+4. **Training flock bridge** — cross-process yield/resume against the GPU flock.
+
+**Delivers:** one priority/resource arbiter and one GPU executor for text,
+image, embed, steering (and, via the bridge, training) — a long txt2img or a
+training step no longer blocks interactive text; everything time-slices by
+priority. Still coordinated, not simultaneous (serial GPU).
+**Risk:** medium→high — execution-path surgery + the cross-process flock bridge.
+**Exit check (per step):** interleaved load shows priority-ordered, preemptive
+GPU handoff (trace); preempted image restart is byte-identical; p99 interactive-
+text latency bounded under concurrent image/train load.
 
 ## Phase 6 — Complete the hoist + PROVE genericity with a second arch
 
