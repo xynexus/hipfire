@@ -357,6 +357,16 @@ pub struct LayerCacheView<'a> {
     pub head_dim: usize,
     pub k: &'a GpuTensor,
     pub v: &'a GpuTensor,
+    /// KVarN metadata: `true` when this group's `KvCache` stores variance-normalized
+    /// K + Q8 V (only Full-storage groups under [`LayeredKvArena::new_kvarn`]). The
+    /// consumer then routes attention through `kvarn_attend` instead of `attention_f32`.
+    pub quant_kvarn: bool,
+    /// K recent-window ring for the KVarN path (`Some` iff `quant_kvarn`).
+    pub k_window: Option<&'a GpuTensor>,
+    /// Per-slot physical capacity (KVarN block/window sizing).
+    pub physical_cap: usize,
+    /// KVarN K-code bit width (2/4/8); meaningless unless `quant_kvarn`.
+    pub kvarn_bits: usize,
 }
 
 impl LayeredKvArena {
@@ -372,6 +382,47 @@ impl LayeredKvArena {
                 plan.max_seq,
                 group.storage.physical_cap(plan.max_seq),
             )?);
+        }
+        Ok(Self {
+            plan,
+            groups,
+            cursor: KvSequenceCursor::default(),
+        })
+    }
+
+    /// KVarN variant of [`Self::new_fp32`]: Full-storage groups whose
+    /// `head_dim ∈ {128, 256}` hold variance-normalized `bits`-bit K + Q8 V;
+    /// SlidingWindow (local) groups and any incompatible geometry stay F32 (the
+    /// local rings never carry the long-context KV, matching gemma3's choice).
+    /// Only gemma4 rides this arena's quant path, so no other family is affected.
+    pub fn new_kvarn(gpu: &mut Gpu, plan: LayeredKvPlan, bits: usize) -> HipResult<Self> {
+        let mut groups = Vec::with_capacity(plan.groups.len());
+        for group in &plan.groups {
+            let owned = vec![true; group.owned_layers];
+            let cap = group.storage.physical_cap(plan.max_seq);
+            let kvarn_ok = matches!(group.storage, KvStorageKind::Full)
+                && (group.head_dim == 128 || group.head_dim == 256);
+            let cache = if kvarn_ok {
+                KvCache::new_gpu_kvarn_capped_filtered(
+                    gpu,
+                    &owned,
+                    group.kv_heads,
+                    group.head_dim,
+                    plan.max_seq,
+                    cap,
+                    bits,
+                )?
+            } else {
+                KvCache::new_gpu_capped_filtered(
+                    gpu,
+                    &owned,
+                    group.kv_heads,
+                    group.head_dim,
+                    plan.max_seq,
+                    cap,
+                )?
+            };
+            groups.push(cache);
         }
         Ok(Self {
             plan,
@@ -428,6 +479,14 @@ impl LayeredKvArena {
             head_dim: cache.head_dim,
             k: &cache.k_gpu[slot],
             v: &cache.v_gpu[slot],
+            quant_kvarn: cache.quant_kvarn,
+            k_window: if cache.quant_kvarn {
+                Some(&cache.k_window[slot])
+            } else {
+                None
+            },
+            physical_cap: cache.physical_cap,
+            kvarn_bits: cache.kvarn_bits,
         })
     }
 

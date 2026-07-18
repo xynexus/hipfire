@@ -15,6 +15,7 @@ use hipfire_dispatch::pipeline::superop::{
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_runtime::kv::{KvCache, KvQuantMode};
 use hipfire_runtime::layered_kv::{KvStorageKind, LayeredAttentionScratch, LayeredKvArena};
 use hipfire_runtime::weights::{weight_gemv, EmbeddingFormat};
 use std::collections::BTreeMap;
@@ -44,14 +45,66 @@ pub struct Gemma4DenseState {
     swa_staged_v: GpuTensor,
     swa_nvalid: GpuTensor,
     pos_buf: DeviceBuffer,
+    // ── KVarN scratch (Some only under KvQuantMode::Kvarn with ≥1 Full/256 layer) ──
+    /// Reusable gather/quantize tile `[max_kv_width × KVARN_GROUP]` for
+    /// `kvarn_attend`; allocated once so the single-token hot path never allocates.
+    kvarn_tiles: Option<GpuTensor>,
+    /// FlashAttention partials `[max_q_heads × ceil(max_seq/GROUP) × (2 + head_dim)]`.
+    kvarn_flash_partials: Option<GpuTensor>,
 }
 
 impl Gemma4DenseState {
+    /// F32-KV state (examples / diagnostics). Delegates to [`Self::new_with_kv_mode`]
+    /// with the unquantized mode.
     pub fn new(gpu: &mut Gpu, config: &Gemma4Config, max_seq: usize) -> HipResult<Self> {
+        Self::new_with_kv_mode(gpu, config, max_seq, KvQuantMode::Unquantized, 4)
+    }
+
+    /// State with a selectable KV cache mode. `KvQuantMode::Kvarn` stores the
+    /// Full-storage (global) layers as variance-normalized `kvarn_bits`-bit K + Q8 V
+    /// when their `head_dim ∈ {128, 256}`; SlidingWindow (local) layers stay F32.
+    /// NOTE: shipped gemma4 uses `global_head_dim` = 512 for its Full layers, which
+    /// the KVarN kernels do not yet support (they cap at 256), so this path currently
+    /// falls back to F32 there — the wiring activates once a head_dim-512 kvarn kernel
+    /// lands. Q8 KV is not wired (deprecated per the mq*/Q8 direction); non-Kvarn
+    /// modes use F32.
+    pub fn new_with_kv_mode(
+        gpu: &mut Gpu,
+        config: &Gemma4Config,
+        max_seq: usize,
+        kv_mode: KvQuantMode,
+        kvarn_bits: usize,
+    ) -> HipResult<Self> {
         let plan = config
             .layered_kv_plan(max_seq)
             .unwrap_or_else(|error| panic!("Gemma 4 KV plan: {error}"));
-        let kv = LayeredKvArena::new_fp32(gpu, plan.clone())?;
+        // KVarN applies to Full-storage (global) layers with head_dim ∈ {128,256}.
+        // Size the reusable scratch at the max geometry over those layers.
+        let (max_kv_width, max_q_heads, kvarn_head_dim) = plan
+            .layers()
+            .iter()
+            .filter(|spec| matches!(spec.storage, KvStorageKind::Full))
+            .filter(|spec| spec.head_dim == 128 || spec.head_dim == 256)
+            .fold((0usize, 0usize, 0usize), |(kw, qh, _), spec| {
+                (kw.max(spec.kv_width()), qh.max(spec.q_heads), spec.head_dim)
+            });
+        let kv_kvarn = matches!(kv_mode, KvQuantMode::Kvarn) && max_kv_width > 0;
+        let kv = if kv_kvarn {
+            LayeredKvArena::new_kvarn(gpu, plan.clone(), kvarn_bits)?
+        } else {
+            LayeredKvArena::new_fp32(gpu, plan.clone())?
+        };
+        let (kvarn_tiles, kvarn_flash_partials) = if kv_kvarn {
+            let tiles = gpu.alloc_tensor(&[max_kv_width * KvCache::KVARN_GROUP], DType::F32)?;
+            let max_tiles = plan.max_seq().div_ceil(KvCache::KVARN_GROUP);
+            let partials = gpu.alloc_tensor(
+                &[max_q_heads * max_tiles * (2 + kvarn_head_dim)],
+                DType::F32,
+            )?;
+            (Some(tiles), Some(partials))
+        } else {
+            (None, None)
+        };
         let attention = LayeredAttentionScratch::new(gpu, &plan)?;
         let hidden = config.hidden_size;
         let intermediate = config
@@ -90,6 +143,8 @@ impl Gemma4DenseState {
             swa_staged_v: gpu.alloc_tensor(&[swa_elements], DType::F32)?,
             swa_nvalid: gpu.alloc_tensor(&[1], DType::F32)?,
             pos_buf: gpu.hip.malloc(4)?,
+            kvarn_tiles,
+            kvarn_flash_partials,
         })
     }
 
@@ -120,6 +175,13 @@ impl Gemma4DenseState {
             self.swa_staged_v,
             self.swa_nvalid,
         ] {
+            let _ = gpu.free_tensor(tensor);
+        }
+        for tensor in self
+            .kvarn_tiles
+            .into_iter()
+            .chain(self.kvarn_flash_partials)
+        {
             let _ = gpu.free_tensor(tensor);
         }
         let _ = gpu.hip.free(self.pos_buf);
@@ -399,6 +461,58 @@ fn attention_block(
                     1,
                 )?;
             }
+        }
+        KvStorageKind::Full if cache.quant_kvarn => {
+            // KVarN (variance-normalized bits-bit K + Q8 V) fused write+attend for
+            // the global/full-context layers, n=1 (decode + per-token prefill). Local
+            // sliding-window layers stay F32 (the arm above). Mirrors gemma3's KVarN
+            // hook. Full storage → physical position == absolute.
+            set_position(gpu, state, position)?;
+            // Optional Hadamard-incoherence rotation of K and Q by the SAME per-head
+            // FWHT-256 (scores preserved; V/Q8 stays un-rotated). Opt out with
+            // HIPFIRE_KVARN_ROTATE=0. Requires head_dim==256 (gemma4's shape).
+            static KVARN_ROTATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let kvarn_rotate = *KVARN_ROTATE
+                .get_or_init(|| std::env::var("HIPFIRE_KVARN_ROTATE").ok().as_deref() != Some("0"));
+            if kvarn_rotate && geometry.head_dim == 256 {
+                gpu.rotate_x_mq_batched(&scratch.k, &scratch.k, kv_width, 1)?;
+                gpu.rotate_x_mq_batched(&scratch.q, &scratch.q, q_width, 1)?;
+            }
+            // The KV kernels read positions from a GpuTensor; wrap the raw 4-byte i32
+            // pos_buf as a non-owning [1] view (mirrors gemma3/qwen35's KVarN hook).
+            let pos_view = GpuTensor {
+                buf: unsafe { DeviceBuffer::from_raw(state.pos_buf.as_ptr(), 4) },
+                shape: vec![1],
+                dtype: DType::F32,
+            };
+            gpu.kvarn_attend(
+                cache.k,
+                cache.k_window.expect("kvarn cache view exposes k_window"),
+                cache.v,
+                &scratch.q,
+                &scratch.k,
+                &scratch.v,
+                &pos_view,
+                &scratch.attention,
+                state
+                    .kvarn_flash_partials
+                    .as_ref()
+                    .expect("kvarn scratch allocated when kv_mode=kvarn"),
+                state
+                    .kvarn_tiles
+                    .as_ref()
+                    .expect("kvarn scratch allocated when kv_mode=kvarn"),
+                1,
+                position,
+                geometry.q_heads,
+                geometry.kv_heads,
+                geometry.head_dim,
+                cache.physical_cap,
+                None,
+                0,
+                0,
+                cache.kvarn_bits,
+            )?;
         }
         KvStorageKind::Full => {
             set_position(gpu, state, cache.physical_position)?;

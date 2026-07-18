@@ -100,7 +100,32 @@ groups. gemma3's WORKING quant KV does NOT go through this — it threads a
 `Gemma3State::new_with_max_seq` gemma3/forward.rs:103). So there is no existing
 quant path in `LayeredKvArena` to simply call.
 
-### Feasibility CONFIRMED (2026-07-18) — de-risked, turnkey
+### ⚠️ BUILT + BLOCKED (2026-07-18): gemma4 global layers are head_dim 512
+The full KVarN wiring was implemented and compiles + unit-tests clean:
+`LayeredKvArena::new_kvarn` + `LayerCacheView` kvarn fields (layered_kv.rs), a
+`new_with_kv_mode` state ctor + KVarN branch in the Full attention path + kvarn scratch
+(gemma4/forward.rs), and `gemma4_kv_mode` plumb (gemma4/arch.rs). BUT it is INERT on
+shipped gemma4: gemma4's **Full/global attention layers use `global_head_dim` = 512**
+(config.rs:294-303; only the SlidingWindow/local layers are 256), and the KVarN kernels
+HARD-CAP at head_dim ≤ 256 (`kvarn_quantize_tile: r,c must be <= 256`, kv.rs:1397; FWHT
+rotation is 256; block/window layout sized ≤256). So `new_kvarn` safely falls back to
+F32 for the 512 global groups → KVarN is a no-op on gemma4. The F32 path is unchanged
+by construction (the head_dim filter yields 0 kvarn groups → `new_fp32`, no scratch), so
+the refactor is a safe no-op, not a regression.
+Second blocker (validation): no small DENSE gemma4 on disk. gemma-4-E2B/E4B use
+Per-Layer-Embeddings / shared-tail KV → the gemma4 **dense** loader rejects them
+("requires no PLE, KV sharing, or routed experts"); only plain-dense gemma4 (31B) loads,
+too heavy for a loop tick. So the refactor could only be checked by construction + unit
+tests (fp32 path: head_dim filter → 0 kvarn groups → `new_fp32`, no scratch, unchanged)
+— a live gemma4 serve was not possible here.
+
+**To actually deliver gemma4 KVarN needs a kvarn head_dim-512 kernel** (tile 512→2×256 in
+`kvarn_quantize_tile`/`kvarn_build_kcache`/flash, extend the window ring + FWHT) — a real
+kernel task, NOT config. That is the true remaining blocker; the arena/forward/plumb
+above is ready and activates the moment kvarn supports 512 (or for any head_dim-256
+layered model).
+
+### Feasibility CONFIRMED (2026-07-18) — de-risked, turnkey (superseded by the block above)
 - **gemma3 is NOT at risk.** gemma3's working KVarN uses plain `KvCache::new_gpu_kvarn_filtered`
   + separate `swa_k/swa_v` F32 rings (forward.rs:142-159), NOT `LayeredKvArena`. gemma3 only
   touches the arena via `homogeneous_fp32_cache` (returns a plain `KvCache`). So adding a quant

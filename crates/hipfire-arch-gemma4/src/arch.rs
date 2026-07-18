@@ -16,7 +16,23 @@ use hipfire_runtime::arch::{
     ServingFactoryOptions, SimpleAr,
 };
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::kv::KvQuantMode;
 use hipfire_runtime::tokenizer::Tokenizer;
+
+/// Map an operator `kv_mode` string to the gemma4 KV cache mode + KVarN bit width.
+/// gemma4 wires KVarN (variance-normalized K + Q8 V) on the global/full-context
+/// layers at `kvarn2`/`kvarn`(=4)/`kvarn8` (head_dim 256; local sliding-window
+/// layers stay F32). Q8 KV is intentionally not offered (deprecated per the mq*/Q8
+/// direction); every other token → unquantized F32. The `usize` is the KVarN K bit
+/// width (meaningful only for the Kvarn mode).
+fn gemma4_kv_mode(kv_mode: &str) -> (KvQuantMode, usize) {
+    match kv_mode {
+        "kvarn2" => (KvQuantMode::Kvarn, 2),
+        "kvarn" | "kvarn4" => (KvQuantMode::Kvarn, 4),
+        "kvarn8" => (KvQuantMode::Kvarn, 8),
+        _ => (KvQuantMode::Unquantized, 4),
+    }
+}
 
 pub struct Gemma4;
 
@@ -268,8 +284,10 @@ impl ServingFactory for Gemma4ServingFactory {
         let instruction_tuned = eos_token_ids.len() > 1;
         let weights = load_dense_weights(hfq, gpu, &config)
             .map_err(|error| format!("Gemma 4 weights: {error:?}"))?;
-        let state = Gemma4DenseState::new(gpu, &config, physical_cap)
-            .map_err(|error| format!("Gemma 4 state: {error:?}"))?;
+        let (kv_mode, kvarn_bits) = gemma4_kv_mode(options.kv_mode);
+        let state =
+            Gemma4DenseState::new_with_kv_mode(gpu, &config, physical_cap, kv_mode, kvarn_bits)
+                .map_err(|error| format!("Gemma 4 state: {error:?}"))?;
         let shape = ModelShapeProfile {
             hidden_size: config.hidden_size,
             num_layers: config.num_hidden_layers,
@@ -287,7 +305,6 @@ impl ServingFactory for Gemma4ServingFactory {
             bos_token: Some("<bos>"),
             require_official_template: instruction_tuned,
         };
-        let _ = options.kv_mode;
         Ok(FactoryLoadedBackend {
             backend: Box::new(Gemma4Backend::new(config, weights, state, eos_token_ids)),
             family: self.family(),
