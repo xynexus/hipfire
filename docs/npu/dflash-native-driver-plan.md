@@ -277,8 +277,58 @@ physical fragmentation).
 > 101 MB** (101→26.5 ms, 50→13.6, 25→7.2, 17→5.3), showing **no** BO-size effect over that
 > range. The two observations conflict and are from different kernels/paths.
 >
-> **Required before the projection can be trusted: re-measure the new kernel at real
-> DFlash weight sizes (~100 MB), not 8 MB.** This is now the top validation item.
+> **RESOLVED — see below. The concern was inverted: the weight path IMPROVES at scale.**
+
+### RESOLVED (r134): the BO penalty was a host cache-flush artifact, not bandwidth
+
+`benchmarks/npu_gemm_tuning/r134/` + `crates/hipfire-xdna/examples/npu_bo_probe.rs`.
+
+**Root cause:** `NpuKernel::dispatch` → `submit_synced(args, None)` flushes **every argument
+on every iteration** (`crates/hipfire-xdna/src/kernel.rs:298-303`) — a full-buffer host cache
+op costing time linear in **BO size**, independent of bytes the NPU reads. Implied flush
+rate ~61 GB/s.
+
+**Reads scaled to BO (what a real projection does):**
+
+| W BO | sync=1 GB/s | sync=0 GB/s |
+|---|---|---|
+| 8 MB | 10.19 | 12.55 |
+| 32 MB | 9.43 | 14.36 |
+| **100 MB** | **11.58** | **15.14** |
+
+**Reads held constant from an inflated BO (r133's setup):** sync=1 gives 10.12 / 9.53 /
+5.87 at 8/15/57 MB — a dead-on replication of r133's 10.35 / 9.70 / 5.84. Under sync=0 the
+same arm is **flat** (12.41 / 12.54 / 12.54), proving the penalty is 100% host flush cost
+and 0% DMA bandwidth.
+
+**The old int_matmul and r133 were never in conflict.** With reads scaled to BO, flush time
+and DMA time are both linear in size so the ratio is flat; r133 broke that by growing the BO
+while holding reads constant, so only the flush term grew. Both behaviors reproduce from the
+same kernel and allocator. (Caveat: int_matmul itself was not re-run.)
+
+Correctness: every row gated at C[0] = 3072 = AVAL(3) × KT(64) × 16, exact — real compute
+runs, not feed-only. Cross-process repeatability ~1%.
+
+**Revised projection — the earlier number was conservative, not optimistic:**
+
+| basis | rate | 482 MB int4/block | 964 MB int8/block |
+|---|---|---|---|
+| old `int_matmul` | 3.8 GB/s | 127 ms | 254 ms |
+| r134 @100 MB, sync=1 | 11.58 GB/s | 41.6 ms | 83.2 ms |
+| **r134 @100 MB, sync=0** | **15.14 GB/s** | **31.8 ms** | 63.7 ms |
+
+**3.05× like-for-like, 3.97× with the flush removed** — and sync=0 is the correct model for
+DFlash: `dflash_body_native.rs:407,411,472` already dispatches the GEMM as
+`dispatch_synced(&[&gm.w, &gemm_b, &gemm_c], &[false, true, false])`, never re-flushing
+weights. So the ~25% tax lives in the benchmark harness, not the driver. The driver's
+remaining plain `dispatch()` calls (attention, rmsnorm, headnorm, rope, swiglu) act on small
+buffers — attention's largest is ~197 KB ≈ 3 µs — so there is no large free win there.
+
+**Net: the GEMM term projects from the measured ~317 ms to ~32–42 ms.**
+
+Caveat to confirm before leaning on it: 15.14 GB/s weight-only plus 13.1 MB of C traffic is
+~16.9 GB/s aggregate, at or slightly **above** the previously documented 13–16 GB/s band.
+Also `burst_length` was left at 0 throughout, so these figures are likely ~4% pessimistic.
 
 ### The surviving lever has a hardware mechanism: the BD iteration dimension
 
