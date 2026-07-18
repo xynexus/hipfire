@@ -352,6 +352,78 @@ markov values; truncation fires at the same positions as the reference.
 **Gate F.** Measured block hides under measured verify on ≥1 real target; results
 committed.
 
+**Phase F is now the DECIDING experiment for the weight format, not a reporting
+step.** See the quant results below.
+
+## 2b. Weight-format results (2026-07-18) — int4-class FAILS on SNR, and that may not matter
+
+Body-level quality vs the f16 golden, real z-lab 9B drafter, via
+`tools/npu/dflash_int8_sim.py`:
+
+| mode | cos | SNR |
+|---|---|---|
+| w8a16 (int8 W, f32 act) | 0.999759 | **33.18 dB** |
+| w8a8 (int8 W + int8 act) | 0.999489 | 29.91 dB |
+| mixed4a16 (oq4.25, f32 act) | 0.960586 | **11.04 dB** |
+| mixed4a8 (oq4.25 + int8 act) | 0.960390 | 11.01 dB |
+
+**Two candidate rescues were tested. BOTH are second-order. Do not retry them.**
+
+*Overlay count* (`n_out` sweep, storage bits = 4.0625 + n_out/16):
+
+| n_out | bits | cos | SNR |
+|---|---|---|---|
+| 3 | 4.25 | 0.960586 | 11.04 |
+| 7 | 4.50 | 0.964238 | 11.46 |
+| 15 | 5.00 | 0.964375 | 11.47 |
+| 31 | 6.00 | 0.966222 | 11.71 |
+| 63 | **8.00** | 0.968764 | **12.05** |
+
+The curve is FLAT: doubling storage (4.25→8.0 b/w) buys **1 dB**. The endpoint is
+damning — at n_out=63 the format costs **exactly int8's 8.0 b/w** and delivers
+12.05 dB against int8's 33.18. Same bytes, 21 dB worse. So the error was never in
+the outliers the overlay targets; it is **int4 bulk resolution** on the other ~200
+values per group, which sparse int8 promotion cannot touch.
+
+*FWHT rotation* (incoherence), tested because the GEMM is weight-bandwidth-bound
+(cores ~12% utilized) so an activation FWHT is nearly free in latency:
+
+| mode | cos | SNR |
+|---|---|---|
+| mixed4a16 | 0.960586 | 11.04 |
+| rmixed4a16 | 0.962575 | 11.25 (**+0.21**) |
+| rmixed4a8 | 0.962254 | 11.21 (**+0.20**) |
+
+**+0.2 dB.** Free in latency, also free in benefit.
+
+**NONE OF THIS IS ANOMALOUS — there is no bug to hunt.** Quantization theory gives
+~6.02 dB/bit. Measured: 33.18 → 11.04 across 4 bits = **5.5 dB/bit**. The codec is
+correct; 4-bit weights are simply ~22 dB worse than 8-bit, and second-order tricks
+move fractions of a dB, not bits.
+
+### The gate itself was wrong for this artifact
+
+`cos > 0.99` is the right gate for a KERNEL (a mismatch there means a bug). It is
+the WRONG gate for a drafter's weight format: **speculative decoding is lossless
+regardless of draft quality** — the target verifies every token, so degradation
+costs *acceptance rate*, not correctness. A drafter at cos 0.96 is not wrong; it
+proposes worse candidates, some of which get rejected.
+
+So the deciding question is: **does the acceptance-rate drop exceed the ~2×
+weight-bandwidth saving?** The economics favour testing it — the GEMM is
+weight-bandwidth-bound, so halving weight bytes nearly halves the dominant term,
+while draft tokens are close to free (block time is independent of activation
+rows). Run Phase F across f16 / oq8 / oq4.25 drafters on a fixed prompt set before
+spending anything further on codec variants.
+
+### Caveat on a passing unit test
+
+`oq4_25_overlay_rescues_outlier_groups` (in `dflash_convert`) PASSES — the overlay
+buys >6 dB — but on synthetic data with one injected 0.9 outlier per 256-group.
+Real drafter weights lack that structure, so the test validates the codec's
+*mechanics*, not its *premise*. A synthetic fixture that confirms a hypothesis
+about a distribution's shape is weak evidence.
+
 ## 3. Dependencies / ordering
 
 ```
