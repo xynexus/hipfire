@@ -97,6 +97,12 @@ pub struct AppState {
     /// await the runner instead of taking `engine` directly. Only populated
     /// when `HIPFIRE_SERVER_PREFILL_BATCH` is enabled and the runner is spawned.
     pub batch_inbox: crate::batch_runner::BatchInbox,
+    /// True once [`crate::batch_runner::spawn_batch_runner`] has started the
+    /// runner loop. Routes that enqueue + await a runner result (image gen) must
+    /// only do so when this is set — otherwise (e.g. unit tests that build an
+    /// `AppState` without a serve loop) the request would park forever. Text/embed
+    /// are additionally gated by arch-eligibility, but image has no such gate.
+    pub batch_runner_active: std::sync::atomic::AtomicBool,
     /// Live batch-runner telemetry surfaced by `/health`.
     pub batch_telemetry: Mutex<crate::batch_runner::BatchTelemetry>,
     pub responses_contexts: Mutex<HashMap<String, StoredResponsesContext>>,
@@ -275,6 +281,7 @@ impl AppState {
             prefill_dispatch: Mutex::new(()),
             prefill_notify: Notify::new(),
             batch_inbox: Mutex::new(HashMap::new()),
+            batch_runner_active: std::sync::atomic::AtomicBool::new(false),
             batch_telemetry: Mutex::new(crate::batch_runner::BatchTelemetry::default()),
             responses_contexts: Mutex::new(HashMap::new()),
             responses_order: Mutex::new(VecDeque::new()),

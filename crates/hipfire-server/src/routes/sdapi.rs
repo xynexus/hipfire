@@ -12,6 +12,10 @@ use hipfire_diffusion::{
     DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionImg2ImgResizeMode, DiffusionPipeline,
     DiffusionProgress, DiffusionPrompt, RgbImageBatch,
 };
+use hipfire_scheduler::{
+    server_prefill_batch_enabled, SchedulerPolicyEnv, WorkloadClass, WorkloadResources,
+    WorkloadSpec,
+};
 use image::{ImageEncoder, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -19,12 +23,21 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::batch_runner::{ImageJob, ScheduledJob};
 use crate::model::discovery::{find_model, list_local_models, local_llm_registry};
 use crate::routes::chat::{execute_blocking_chat, ChatMessage, ChatRequest};
 use crate::state::{SdapiProgressState, SharedState};
+
+fn sdapi_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 const COMPAT_SAMPLER: &str = "Hipfire";
 
@@ -497,7 +510,16 @@ async fn execute_hfq_diffusion_txt2img(
     // `SdapiGeometryLimits` is `Copy`; capture it by value so the blocking
     // closure does not have to borrow `state` (which is used again later).
     let geometry_limits = state.sdapi_geometry_limits;
-    let output = match tokio::task::spawn_blocking(move || {
+    // Minimum sampler steps a generation runs before a preempt flag is honoured
+    // (anti-thrash floor; shared with text decode's min-quantum).
+    let preempt_min = crate::batch_runner::min_quantum() as usize;
+    // The whole diffusion run as a re-runnable, deterministic closure. `Fn` (not
+    // `FnOnce`) so a preempted job restarts from the same seed → byte-identical
+    // output. `preempt_flag` is checked each sampler step inside the progress
+    // callbacks; when set past `preempt_min` the run aborts with `Interrupted`.
+    let run: Arc<
+        dyn Fn(Arc<AtomicBool>) -> Result<DiffusionBatchOutput, DiffusionError> + Send + Sync,
+    > = Arc::new(move |preempt_flag: Arc<AtomicBool>| {
         let mut outputs = Vec::with_capacity(n_iter as usize);
         for iter in 0..n_iter {
             let iter_seed_offset = iter.saturating_mul(batch_size_for_body(&worker_body));
@@ -513,6 +535,11 @@ async fn execute_hfq_diffusion_txt2img(
             let base_step_offset = iter as usize * iteration_steps;
             let total_steps = iteration_steps * n_iter as usize;
             let mut progress = |progress: DiffusionProgress| {
+                if preempt_flag.load(Ordering::Relaxed) && progress.completed_steps >= preempt_min {
+                    return Err(DiffusionError::Interrupted(
+                        "preempted by higher-priority workload".to_string(),
+                    ));
+                }
                 let progress = DiffusionProgress {
                     completed_steps: base_step_offset.saturating_add(progress.completed_steps),
                     total_steps,
@@ -564,6 +591,11 @@ async fn execute_hfq_diffusion_txt2img(
             let highres_step_offset =
                 base_step_offset.saturating_add(first_output_steps(&worker_first_pass_body));
             let mut progress = |progress: DiffusionProgress| {
+                if preempt_flag.load(Ordering::Relaxed) && progress.completed_steps >= preempt_min {
+                    return Err(DiffusionError::Interrupted(
+                        "preempted by higher-priority workload".to_string(),
+                    ));
+                }
                 let progress = DiffusionProgress {
                     completed_steps: highres_step_offset.saturating_add(progress.completed_steps),
                     total_steps,
@@ -595,13 +627,63 @@ async fn execute_hfq_diffusion_txt2img(
             outputs.push(highres_output);
         }
         merge_diffusion_outputs(outputs)
-    })
-    .await
+    });
+
+    // Route through the runner (the single GPU arbiter) when active so image
+    // generation time-slices with text/embed by priority and yields at
+    // sampler-step boundaries (restart-from-seed). Kill switch off
+    // (HIPFIRE_SERVER_PREFILL_BATCH=0) falls back to the legacy direct
+    // spawn_blocking path, which never contends with the scheduler.
+    let output = if server_prefill_batch_enabled(&SchedulerPolicyEnv::from_pairs(std::env::vars()))
+        && state
+            .batch_runner_active
+            .load(std::sync::atomic::Ordering::Relaxed)
     {
-        Ok(result) => result,
-        Err(error) => Err(DiffusionError::Io(format!(
-            "diffusion worker task failed: {error}"
-        ))),
+        let req_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let enqueued_at = sdapi_now_ms();
+        // Background priority: numerically above interactive text (default 64),
+        // so a chat request preempts a running image but not vice versa.
+        let priority = 128u8;
+        let label = format!("image:{}", sd_requested_model(&body).unwrap_or_default());
+        state.batch_inbox.lock().await.insert(
+            req_id.clone(),
+            ScheduledJob::Image(ImageJob {
+                run: run.clone(),
+                tx,
+                priority,
+                enqueued_at_ms: enqueued_at,
+                label: label.clone(),
+            }),
+        );
+        let workload = WorkloadSpec::microbatchable(
+            req_id.clone(),
+            WorkloadClass::ImageGeneration,
+            priority,
+            enqueued_at,
+            WorkloadResources::default(),
+            label,
+            1,
+        );
+        if let Err(error) = state.work_scheduler.lock().await.enqueue(workload) {
+            state.batch_inbox.lock().await.remove(&req_id);
+            Err(DiffusionError::Io(format!("scheduler admission: {error}")))
+        } else {
+            state.prefill_notify.notify_waiters();
+            match rx.await {
+                Ok(result) => result,
+                Err(_) => Err(DiffusionError::Io(
+                    "image job dropped before completion".to_string(),
+                )),
+            }
+        }
+    } else {
+        match tokio::task::spawn_blocking(move || run(Arc::new(AtomicBool::new(false)))).await {
+            Ok(result) => result,
+            Err(error) => Err(DiffusionError::Io(format!(
+                "diffusion worker task failed: {error}"
+            ))),
+        }
     };
     let current_image = output
         .as_ref()

@@ -16,11 +16,14 @@
 //! per-request path (chat.rs engine.lock).
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use hipfire_arch_api::ArchRegistry;
 use hipfire_daemon_adapter::{DaemonEngine, EmbedRequest, EmbeddingVector};
+use hipfire_diffusion::{DiffusionBatchOutput, DiffusionError};
+use hipfire_scheduler::{WorkloadClass, WorkloadResources, WorkloadSpec};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::state::SharedState;
@@ -115,6 +118,8 @@ pub enum ScheduledJob {
     Text(PendingRequest),
     /// A single embedding request. Short; runs to completion (no parking yet).
     Embed(EmbedJob),
+    /// A txt2img/img2img diffusion job (the restart-from-seed preemptible path).
+    Image(ImageJob),
 }
 
 /// An embedding request routed through the runner instead of locking the engine
@@ -125,8 +130,29 @@ pub struct EmbedJob {
     pub tx: oneshot::Sender<Result<Vec<EmbeddingVector>, String>>,
 }
 
-/// Min decode steps a batch runs before it may be preempted (anti-thrash floor).
-fn min_quantum() -> u32 {
+/// A diffusion (txt2img/img2img) job routed through the runner instead of the
+/// route's own `spawn_blocking`, so it time-slices with text/embed under the one
+/// GPU arbiter. `run` is a **re-runnable, deterministic** diffusion invocation:
+/// given the shared preempt flag (checked each sampler step by the pipeline's
+/// progress callback), it runs the blocking pipeline to completion or aborts
+/// with [`DiffusionError::Interrupted`]. It is `Fn` (not `FnOnce`) so a preempted
+/// job restarts from the **same seed** — deterministic diffusion makes the
+/// restarted image byte-identical to an uninterrupted one; the only cost is
+/// redone sampler steps. `priority` / `enqueued_at_ms` / `label` reproduce the
+/// scheduler admission on restart with the **same aging basis**, so repeated
+/// preemption ages the image up and it eventually wins (no restart livelock).
+pub struct ImageJob {
+    pub run:
+        Arc<dyn Fn(Arc<AtomicBool>) -> Result<DiffusionBatchOutput, DiffusionError> + Send + Sync>,
+    pub tx: oneshot::Sender<Result<DiffusionBatchOutput, DiffusionError>>,
+    pub priority: u8,
+    pub enqueued_at_ms: u64,
+    pub label: String,
+}
+
+/// Min decode/sampler steps a job runs before it may be preempted (anti-thrash
+/// floor). Shared by text decode and image sampler-step preemption.
+pub fn min_quantum() -> u32 {
     std::env::var("HIPFIRE_SERVER_PREEMPT_MIN_QUANTUM")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
@@ -164,6 +190,9 @@ pub struct BatchTelemetry {
     pub pending_requests: u64,
     /// Times a running batch yielded to a higher-priority workload (Phase 4).
     pub preemptions: u64,
+    /// Times a running image yielded at a sampler-step boundary and was
+    /// restarted from seed (Phase 5.2).
+    pub image_preemptions: u64,
 }
 
 /// The generic seam the runner groups by: two requests may share one fused
@@ -318,6 +347,7 @@ impl BatchTelemetry {
             "last_decode_ms": self.last_decode_ms,
             "active_sessions": self.active_sessions,
             "preemptions": self.preemptions,
+            "image_preemptions": self.image_preemptions,
         })
     }
 
@@ -341,6 +371,12 @@ const BATCH_MAX_DEFAULT: usize = 8;
 /// for the duration of each batch cycle and returns it between cycles so other
 /// engine users (embeddings, sdapi) still interleave.
 pub fn spawn_batch_runner(state: SharedState) {
+    // Mark the runner live so enqueue-and-await routes (image gen) know a loop is
+    // actually draining the inbox; without this an `AppState` built outside a
+    // serve loop (unit tests) would park image requests forever.
+    state
+        .batch_runner_active
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     tokio::spawn(async move {
         batch_runner_loop(state).await;
     });
@@ -442,56 +478,73 @@ async fn batch_runner_loop(state: SharedState) {
                 .first()
                 .map(|w| w.priority)
                 .unwrap_or(u8::MAX);
-            // A lease is single-class; split the already-drained jobs by variant
-            // (exactly one side is non-empty) and dispatch accordingly.
-            let (text_jobs, embed_jobs): (Vec<ScheduledJob>, Vec<ScheduledJob>) = jobs
-                .into_iter()
-                .partition(|j| matches!(j, ScheduledJob::Text(_)));
-            if !embed_jobs.is_empty() {
-                let embeds = embed_jobs
-                    .into_iter()
-                    .filter_map(|j| match j {
-                        ScheduledJob::Embed(e) => Some(e),
-                        ScheduledJob::Text(_) => None,
-                    })
-                    .collect();
-                Dispatch::Embed {
-                    jobs: embeds,
-                    lease_id: lease.lease_id,
+            // A lease is single-class; classify by the first job's variant and
+            // dispatch the whole (single-variant) set accordingly.
+            match jobs.first() {
+                Some(ScheduledJob::Embed(_)) => {
+                    let embeds = jobs
+                        .into_iter()
+                        .filter_map(|j| match j {
+                            ScheduledJob::Embed(e) => Some(e),
+                            _ => None,
+                        })
+                        .collect();
+                    Dispatch::Embed {
+                        jobs: embeds,
+                        lease_id: lease.lease_id,
+                    }
                 }
-            } else {
-                let batch = text_jobs
-                    .into_iter()
-                    .filter_map(|j| match j {
-                        ScheduledJob::Text(p) => Some(p),
-                        ScheduledJob::Embed(_) => None,
-                    })
-                    .collect();
-                Dispatch::Text {
-                    batch,
-                    running_priority: pri,
-                    lease_id: Some(lease.lease_id),
+                Some(ScheduledJob::Image(_)) => {
+                    // Image leases are singletons (max_microbatch_size 1).
+                    let job = jobs
+                        .into_iter()
+                        .find_map(|j| match j {
+                            ScheduledJob::Image(i) => Some(i),
+                            _ => None,
+                        })
+                        .expect("image lease carries one image job");
+                    Dispatch::Image {
+                        job,
+                        running_priority: pri,
+                        lease_id: lease.lease_id,
+                    }
+                }
+                _ => {
+                    let batch = jobs
+                        .into_iter()
+                        .filter_map(|j| match j {
+                            ScheduledJob::Text(p) => Some(p),
+                            _ => None,
+                        })
+                        .collect();
+                    Dispatch::Text {
+                        batch,
+                        running_priority: pri,
+                        lease_id: Some(lease.lease_id),
+                    }
                 }
             }
         };
 
-        let mut engine = match state.engine.lock().await.take() {
-            Some(e) => e,
-            None => {
-                let lease_id = dispatch.lease_id();
-                dispatch.fail_all("daemon not running");
-                if let Some(id) = lease_id {
-                    state.work_scheduler.lock().await.complete(id);
-                }
-                continue;
-            }
-        };
         match dispatch {
             Dispatch::Text {
                 batch,
                 running_priority,
                 lease_id,
             } => {
+                let mut engine = match state.engine.lock().await.take() {
+                    Some(e) => e,
+                    None => {
+                        for p in &batch {
+                            let _ =
+                                p.tx.send(BatchEvent::Error("daemon not running".to_string()));
+                        }
+                        if let Some(id) = lease_id {
+                            state.work_scheduler.lock().await.complete(id);
+                        }
+                        continue;
+                    }
+                };
                 // Park only while the stack has room (bounds resident VRAM from
                 // nested preemption); at the cap the batch runs to completion.
                 let can_park = parked.len() < max_depth;
@@ -506,8 +559,34 @@ async fn batch_runner_loop(state: SharedState) {
                 }
             }
             Dispatch::Embed { jobs, lease_id } => {
+                let mut engine = match state.engine.lock().await.take() {
+                    Some(e) => e,
+                    None => {
+                        for j in jobs {
+                            let _ = j.tx.send(Err("daemon not running".to_string()));
+                        }
+                        state.work_scheduler.lock().await.complete(lease_id);
+                        continue;
+                    }
+                };
                 run_embed_jobs(&mut engine, jobs).await;
                 *state.engine.lock().await = Some(engine);
+                state.work_scheduler.lock().await.complete(lease_id);
+            }
+            Dispatch::Image {
+                job,
+                running_priority,
+                lease_id,
+            } => {
+                // Own the GPU turn: take the daemon engine out (if attached) so no
+                // daemon op runs while diffusion holds the physical GPU. Diffusion
+                // is in-process and does not use the daemon, so a missing engine is
+                // fine (a diffusion-only server has no resident LLM). The watcher
+                // inside `run_image_job` polls the scheduler, not the engine, so
+                // holding the engine here cannot deadlock the yield path.
+                let engine = state.engine.lock().await.take();
+                run_image_job(&state, job, running_priority).await;
+                *state.engine.lock().await = engine;
                 state.work_scheduler.lock().await.complete(lease_id);
             }
         }
@@ -515,7 +594,7 @@ async fn batch_runner_loop(state: SharedState) {
 }
 
 /// What one runner iteration executes. A text batch is park/resume-capable; an
-/// embed batch runs to completion.
+/// embed batch runs to completion; an image is restart-from-seed preemptible.
 enum Dispatch {
     Text {
         batch: Vec<PendingRequest>,
@@ -526,31 +605,11 @@ enum Dispatch {
         jobs: Vec<EmbedJob>,
         lease_id: u64,
     },
-}
-
-impl Dispatch {
-    fn lease_id(&self) -> Option<u64> {
-        match self {
-            Dispatch::Text { lease_id, .. } => *lease_id,
-            Dispatch::Embed { lease_id, .. } => Some(*lease_id),
-        }
-    }
-
-    /// Fail every job in this dispatch with `msg` (used when the engine is gone).
-    fn fail_all(self, msg: &str) {
-        match self {
-            Dispatch::Text { batch, .. } => {
-                for p in &batch {
-                    let _ = p.tx.send(BatchEvent::Error(msg.to_string()));
-                }
-            }
-            Dispatch::Embed { jobs, .. } => {
-                for j in jobs {
-                    let _ = j.tx.send(Err(msg.to_string()));
-                }
-            }
-        }
-    }
+    Image {
+        job: ImageJob,
+        running_priority: u8,
+        lease_id: u64,
+    },
 }
 
 /// Run each embedding job on the runner-owned engine and return its result.
@@ -558,6 +617,98 @@ async fn run_embed_jobs(engine: &mut DaemonEngine, jobs: Vec<EmbedJob>) {
     for job in jobs {
         let result = engine.embed(job.req).await.map_err(|e| e.to_string());
         let _ = job.tx.send(result);
+    }
+}
+
+/// Fresh workload ids for image restarts. A restart re-enqueues while the
+/// previous lease is still active (it completes only after this returns), so it
+/// must use a new id the scheduler will not reject as a duplicate.
+static IMAGE_RESTART_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Run one image job on the runner-owned GPU turn. Diffusion is blocking, so it
+/// runs on a blocking thread; a lightweight async watcher polls the scheduler and
+/// sets a shared preempt flag when a strictly-higher-priority workload appears.
+/// The diffusion progress callback checks the flag each sampler step (past the
+/// min-quantum floor) and returns [`DiffusionError::Interrupted`], aborting
+/// sampling. On interrupt the job is re-enqueued and later re-run from the SAME
+/// SEED, so the finished image is byte-identical to an uninterrupted one; the
+/// cost is redone sampler steps, not correctness.
+async fn run_image_job(state: &SharedState, job: ImageJob, running_priority: u8) {
+    let flag = Arc::new(AtomicBool::new(false));
+    // Watcher: signal preempt-intent when a strictly-higher-priority workload is
+    // queued. The min-quantum sampler-step floor is enforced by the callback, so
+    // the watcher only sets intent; setting it early is harmless.
+    let watcher_flag = flag.clone();
+    let watcher_state = state.clone();
+    let watcher = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let waiter = watcher_state
+                .work_scheduler
+                .lock()
+                .await
+                .peek_next_priority(now_ms());
+            if waiter.is_some_and(|top| top < running_priority) {
+                watcher_flag.store(true, Ordering::SeqCst);
+                break;
+            }
+        }
+    });
+
+    let run = job.run.clone();
+    let run_flag = flag.clone();
+    let result = tokio::task::spawn_blocking(move || run(run_flag)).await;
+    watcher.abort();
+    let output = match result {
+        Ok(inner) => inner,
+        Err(e) => Err(DiffusionError::Io(format!(
+            "diffusion worker task failed: {e}"
+        ))),
+    };
+
+    match output {
+        Err(DiffusionError::Interrupted(_)) => {
+            if std::env::var("HIPFIRE_BATCH_RUNNER_DEBUG").as_deref() == Ok("1") {
+                eprintln!(
+                    "[batch-cycle] image preempted at sampler-step boundary: pri {running_priority} yields; restarting from seed"
+                );
+            }
+            state.batch_telemetry.lock().await.image_preemptions += 1;
+            // Re-admit from the same seed under a fresh id. Insert into the inbox
+            // first, then enqueue, mirroring the route's admission order; on
+            // admission failure remove and fail the client so it never hangs.
+            let req_id = format!(
+                "image-restart-{}",
+                IMAGE_RESTART_SEQ.fetch_add(1, Ordering::Relaxed)
+            );
+            let workload = WorkloadSpec::microbatchable(
+                req_id.clone(),
+                WorkloadClass::ImageGeneration,
+                job.priority,
+                job.enqueued_at_ms,
+                WorkloadResources::default(),
+                job.label.clone(),
+                1,
+            );
+            state
+                .batch_inbox
+                .lock()
+                .await
+                .insert(req_id.clone(), ScheduledJob::Image(job));
+            if let Err(e) = state.work_scheduler.lock().await.enqueue(workload) {
+                if let Some(ScheduledJob::Image(j)) = state.batch_inbox.lock().await.remove(&req_id)
+                {
+                    let _ = j.tx.send(Err(DiffusionError::Io(format!(
+                        "image re-enqueue after preempt failed: {e}"
+                    ))));
+                }
+            } else {
+                state.prefill_notify.notify_waiters();
+            }
+        }
+        other => {
+            let _ = job.tx.send(other);
+        }
     }
 }
 
