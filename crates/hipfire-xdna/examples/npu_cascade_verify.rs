@@ -49,16 +49,32 @@ fn main() {
     c.as_mut_slice().fill(0);
     kernel.dispatch(&[&x, &c]).expect("dispatch");
 
-    let c0 = unsafe { *(c.as_slice().as_ptr() as *const i32) };
     // With INNER>1 the kernel recomputes its slice INNER times, so C scales by INNER;
-    // pass INNER as a8 (default 1). Correctness = C0 is an INNER multiple of the base sum.
+    // pass INNER as a8 (default 1). Correctness = each tile's [0] == base*inner.
     let inner: i32 = a.get(8).and_then(|v| v.parse().ok()).unwrap_or(1);
     let base: i32 = (0..rows).map(|ri| (kslice * 16 * (ri + 1)) as i32).sum();
     let expected = base * inner;
-    let ok = c0 == expected;
+    // Every output tile (CW=64 int32 = 4x16) is fed the same differential pattern, so
+    // each tile's first element must equal `expected`. Checking ALL tiles proves NB
+    // streaming produced every tile (not just the first) — the M/N-tiling correctness.
+    const CW: usize = 64;
+    let cbuf = c.as_slice();
+    let n_tiles = (csz / 4) / CW;
+    let mut bad = 0usize;
+    let mut first_bad = None;
+    for t in 0..n_tiles {
+        let v = i32::from_le_bytes(cbuf[t * CW * 4..t * CW * 4 + 4].try_into().unwrap());
+        if v != expected {
+            bad += 1;
+            first_bad.get_or_insert((t, v));
+        }
+    }
+    let c0 = i32::from_le_bytes(cbuf[0..4].try_into().unwrap());
+    let ok = bad == 0;
     println!(
-        "npu_cascade_verify {dir}: C[0]={c0} expected={expected} (K-split {}) cols={ncols} rows={rows}",
-        if ok { "CORRECT" } else { "WRONG — replicated or layout bug" }
+        "npu_cascade_verify {dir}: C[0]={c0} expected={expected} tiles={n_tiles} bad={bad}{} (K-split {}) cols={ncols} rows={rows}",
+        first_bad.map(|(t, v)| format!(" first_bad=tile{t}:{v}")).unwrap_or_default(),
+        if ok { "CORRECT" } else { "WRONG — streaming/K-split/layout bug" }
     );
     // Optional timing: pass MACS_PER_DISPATCH as a9 (+ ITERS a10) to report GMAC/s.
     if let Some(macs) = a.get(9).and_then(|v| v.parse::<f64>().ok()) {

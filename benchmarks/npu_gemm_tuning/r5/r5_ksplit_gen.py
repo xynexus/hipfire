@@ -31,6 +31,10 @@ KSLICE = int(sys.argv[3]) if len(sys.argv) > 3 else 16
 # kernel with R5_COMBINED=1 so it splits internally). ROWS fifos <= 6 memtile out
 # channels, so ROWS=4 fits (vs 8 separate A/W fifos). Default: separate A/W fifos.
 COMBINED = len(sys.argv) > 4 and sys.argv[4] in ("1", "combined")
+# NB: output tiles streamed per dispatch (M/N tiling). Each column loops NB times,
+# consuming the next A|W and producing the next C tile — amortizes the ~72us
+# dispatch floor across NB tiles. NB=1 = one tile/dispatch (the original).
+NB = int(sys.argv[5]) if len(sys.argv) > 5 else 1
 if COLS > MAXCOL:
     sys.exit(f"COLS={COLS} exceeds {MAXCOL}")
 if not 2 <= ROWS <= 4:
@@ -54,11 +58,14 @@ def core_body(cid, fifo, tile, kern, has_c):
       %z = arith.constant 0 : index
       %m = arith.constant {INF} : index
       %o = arith.constant 1 : index
+      %nb = arith.constant {NB} : index
       scf.for %i = %z to %m step %o {{
-        %x = aie.objectfifo.acquire @fcx{fifo}(Consume, 1) : !aie.objectfifosubview<memref<{XE}xi8>>
-        %xv = aie.objectfifo.subview.access %x[0] : !aie.objectfifosubview<memref<{XE}xi8>> -> memref<{XE}xi8>{c_acq}
-        {call}
-        aie.objectfifo.release @fcx{fifo}(Consume, 1){c_rel}
+        scf.for %j = %z to %nb step %o {{
+          %x = aie.objectfifo.acquire @fcx{fifo}(Consume, 1) : !aie.objectfifosubview<memref<{XE}xi8>>
+          %xv = aie.objectfifo.subview.access %x[0] : !aie.objectfifosubview<memref<{XE}xi8>> -> memref<{XE}xi8>{c_acq}
+          {call}
+          aie.objectfifo.release @fcx{fifo}(Consume, 1){c_rel}
+        }}
       }}
       aie.end
     }}'''
@@ -127,19 +134,20 @@ for c in range(COLS):
     for r in rows:
         kern = "r5_cascade_head" if r == top else ("r5_cascade_tail" if r == 2 else "r5_cascade_mid")
         out.append(core_body(f"{c}_{r}", f"{c}_{r}", f"%t{c}_{r}", kern, r == 2))
-# runtime sequence: X [COLS*XTOT_COL] combined A|W per core, C [COLS*CW].
-# X layout per column: [core0_A(AW), core0_W(WW), core1_A(AW), core1_W(WW), ...].
-XTOT, CTOT = COLS * XTOT_COL, COLS * CW
+# runtime sequence: X [COLS*NB*XTOT_COL] combined A|W per core-tile, C [COLS*NB*CW].
+# X per column = NB tiles, each [core0_A,core0_W, core1_A,core1_W, ...]. The fx object
+# is one tile (XTOT_COL); feeding NB*XTOT_COL streams NB objects (fifo tracks bounds).
+XCOL, CCOL = NB * XTOT_COL, NB * CW
+XTOT, CTOT = COLS * XCOL, COLS * CCOL
 out.append(f"    aie.runtime_sequence(%X: memref<{XTOT}xi8>, %C: memref<{CTOT}xi32>) {{")
 for c in range(COLS):
-    x_off = c * XTOT_COL
     out.append(f'''      %tx{c} = aiex.dma_configure_task_for @fx{c} {{
-        aie.dma_bd(%X : memref<{XTOT}xi8>, {x_off}, {XTOT_COL}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {XTOT_COL}, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.dma_bd(%X : memref<{XTOT}xi8>, {c * XCOL}, {XCOL}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {XCOL}, stride = 1>]) {{burst_length = 0 : i32}}
         aie.end
       }}
       aiex.dma_start_task(%tx{c})
       %tc{c} = aiex.dma_configure_task_for @fc{c}_2 {{
-        aie.dma_bd(%C : memref<{CTOT}xi32>, {c*CW}, {CW}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {CW}, stride = 1>]) {{burst_length = 0 : i32}}
+        aie.dma_bd(%C : memref<{CTOT}xi32>, {c * CCOL}, {CCOL}, [<size = 1, stride = 0>, <size = 1, stride = 0>, <size = 1, stride = 0>, <size = {CCOL}, stride = 1>]) {{burst_length = 0 : i32}}
         aie.end
       }} {{issue_token = true}}
       aiex.dma_start_task(%tc{c})''')

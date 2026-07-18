@@ -737,11 +737,17 @@ into ONE memtile→core fifo per core (`r5_ksplit_gen.py … --combined` + build
 memtile's 6 out channels. COLS=8 ROWS=4 KSLICE=32 (K=4·32·16=**2048**, 4-way split,
 **32 cores**): differential-verified **C[0]=5120 CORRECT**, rate **~2121 GMAC/s raw
 (~2472 floor-free) ≈ 10× r6** — a numerically-correct full-array cascade GEMM at
-gate_up's real K. NEXT: real gate_up **M/N tiling** (the design does one 4×16 C tile
-per column; gate_up is M=256×N=768/1536 → loop/stream output tiles), op4++ per-group
-scale in the tail, then wire into the expert FFN and re-measure PP/TG. Gen
-`r5_ksplit_gen.py COLS ROWS KSLICE [combined]`; harnesses `npu_cascade_verify` /
-`npu_cascade_time`.
+gate_up's real K. **M/N tiling (NB streaming) DONE.** `r5_ksplit_gen.py COLS ROWS KSLICE [combined] [NB]`
+adds an inner `scf.for %j = 0..NB` loop per core + a linear `NB·XTOT_COL` feed; the fx
+object is one tile, so streaming `NB·XTOT_COL` streams NB objects and the memtile
+`objectfifo.link` distributes each (the streaming-semantics unknown — resolved). Each
+dispatch produces NB output tiles, amortizing the ~72 µs floor. Verified all-tiles
+(`npu_cascade_verify` now checks every tile's [0]): NB=2 → 16 tiles bad=0, NB=16 → 128
+tiles bad=0. gate_up (M=256×N=768/1536 = 3072 tiles across 8 columns) = one NB≈384/col
+dispatch. NEXT: (1) large-NB INNER=1 streaming RATE (floor amortized → the real
+feed-bound number); (2) op4++ per-group scale in the tail (raw int32 today); (3) the
+M×N→(column,NB-index) A/W feed mapping + full-C reference; (4) wire into the expert FFN,
+re-measure PP/TG. Harnesses `npu_cascade_verify` / `npu_cascade_time`.
 
 **Prior art: `r5/` already prototyped cascade.** `benchmarks/npu_gemm_tuning/r5/`
 (`r5_cascade.cc`, `r5_2core.mlir`, `r5_4core.mlir`, `r5/README.md`) is a full
