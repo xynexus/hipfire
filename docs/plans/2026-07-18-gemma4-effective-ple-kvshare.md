@@ -131,6 +131,12 @@ RULED OUT so far:
 - Quant: deprioritized (oq8 norms smooth; 8-bit rarely flips "cold"→"hot"). A bf16 E2B was
   built but blocked on a BF16 embed-table lookup (no bf16 embedding_lookup kernel) — not
   pursued since quant is an unlikely cause.
+- RoPE convention: RULED OUT. `rope_partial_interleaved_f32` is a MISLEADING name — it
+  dispatches the HALF-SPLIT kernel `rope_partial_halfsplit_f32` by DEFAULT (rope.rs:404-417);
+  the interleaved (2i,2i+1) kernel only runs under HIPFIRE_ROPE_INTERLEAVED_LEGACY=1. Gemma
+  is rotate-half; hipfire gemma4 correctly gets half-split (matches gemma3). The full-layer
+  "proportional" rope uses basis_dim=global_head_dim(512) as the freq denominator with
+  n_rot=rotary_dim(128) — plausibly the correct proportional variant.
 REMAINING SUSPECTS (need an HF per-layer reference to pin):
 - KV-share LOGIC (my code): shared layers reuse the producer's K/V — subtle correctness.
 - BASE gemma4 forward, UNVALIDATED on any real model (no gemma4 ever admitted): esp. the
