@@ -211,16 +211,19 @@ non-causal full softmax, GQA on the host) + `build_dflash_attention_sc.py`
 depth=1 for the 64 KB tile) + `test_dflash_attention_npu.py`.
 - ALGORITHM validated vs golden l0 (numpy `--algo-only`): **cos = 1.000000**.
 - BUILDS + RUNS on nix1 (RyzenAI-npu1/aie2) — dataflow executes.
-- **Numerics WIP:** on-device output is wrong and BIT-IDENTICAL across the dot
-  rewrite, a cache clear, AND adding memtile `.forward()` — i.e. totally invariant
-  to the kernel. Refined diagnosis: the plain `rt.fill(fifo.prod(), tensor)` /
-  `rt.drain(...)` WITHOUT a `TensorTiler2D` **tap** transfers no data —
-  `oq_gemm_design`/`single_core` ALWAYS pass `tap=...` to fill/drain (A_tiles,
-  b_tap, C_tiles). So the core runs on uninitialised tile memory (deterministic
-  garbage) and the output never reflects the compute. **Next step: add
-  TensorTiler2D taps to the fill/drain** (a trivial identity tiler for the
-  contiguous 1-D case) so Q/KV actually DMA in and O drains out. The attention
-  algorithm is golden-validated; this is purely the IRON transfer wiring.
+- **Numerics WIP (corrected diagnosis):** with `TensorTiler2D` taps added to
+  fill/drain, the output IS input-dependent (different q-heads → different output),
+  so the kernel processes real data — but computes wrong attention (cos 0.03–0.21).
+  Two things to chase: (1) a compute/layout bug in `dflash_attention_sc_bf16.cc`
+  (dot / softmax / KV split / bf16 mac semantics), and (2) a suspected `@iron.jit`
+  cache-invalidation gap — head-0 output stayed bit-identical after a `.cc` dot
+  rewrite + `rm -rf ~/.npu/cache`, suggesting the JIT design hash does NOT track
+  the ExternalFunction `.cc` **content**, so `.cc` edits may silently reuse a stale
+  kernel. Debug approach for next session: force a fresh `.cc` (rename/bump a
+  comment token) or verify the compiled object changes; add a Q→O passthrough
+  variant to confirm the layout; compare on-device output to numpy per-op. The
+  attention ALGORITHM is golden-validated (cos=1.0); remaining work is the on-device
+  compute/wiring + JIT-cache handling. Committed WIP: ff48d840a, ae5f7f715, + taps.
 
 **Two blockers to Gate C (8-col path):**
 1. **nix1 can't run it:** the segmented kernel is **8-column** (aie2p/halo); nix1's

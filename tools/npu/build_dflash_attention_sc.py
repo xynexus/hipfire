@@ -83,12 +83,22 @@ def dflash_attn_head(Q: In, KV: In, O: Out, *,
     worker = Worker(core_fn, [memQ.cons(), memKV.cons(), outO.prod(), attn],
                     stack_size=0x1000)
 
+    # Contiguous 1-D taps — WITHOUT a tap, rt.fill/drain transfer no data (the
+    # core then runs on uninitialised tile memory). Treat each 1-D buffer as
+    # (1, N) tiled whole.
+    from aie.helpers.taplib import TensorTiler2D
+    qN = q_len * HEAD_DIM
+    kvN = 2 * kv_len * HEAD_DIM
+    q_tap = TensorTiler2D.group_tiler((1, qN), (1, qN), (1, 1), prune_step=False)[0]
+    kv_tap = TensorTiler2D.group_tiler((1, kvN), (1, kvN), (1, 1), prune_step=False)[0]
+    o_tap = TensorTiler2D.group_tiler((1, qN), (1, qN), (1, 1), prune_step=False)[0]
+
     rt = Runtime()
     with rt.sequence(Q_ty, KV_ty, Q_ty) as (Qh, KVh, Oh):
         rt.start(worker)
-        rt.fill(inQ.prod(), Qh)
-        rt.fill(inKV.prod(), KVh)
-        rt.drain(outO.cons(), Oh, wait=True)
+        rt.fill(inQ.prod(), Qh, tap=q_tap)
+        rt.fill(inKV.prod(), KVh, tap=kv_tap)
+        rt.drain(outO.cons(), Oh, tap=o_tap, wait=True)
     return Program(iron.get_current_device(), rt).resolve_program()
 
 
