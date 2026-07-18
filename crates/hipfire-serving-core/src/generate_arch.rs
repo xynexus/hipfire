@@ -2310,8 +2310,12 @@ pub fn generate_lfm2moe(
     // ── Prompt build (same two-path branch as the minimax AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        // LFM2's chat template begins with `{{ bos_token }}` (`<|startoftext|>`),
+        // which the hand-rolled ChatScaffold does not emit — omitting the leading
+        // BOS yields incoherent output. Default to the jinja template when present
+        // (opt out with HIPFIRE_JINJA_CHAT=0); the Plain ChatFrame stays the fallback.
+        let try_jinja = m.chat_template.is_some()
+            && std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
@@ -2654,8 +2658,11 @@ fn generate_lfm2moe_dflash(
     }
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        // LFM2's chat template leads with `{{ bos_token }}` (`<|startoftext|>`);
+        // the hand-rolled ChatScaffold drops that BOS. Default to the jinja
+        // template when present (opt out with HIPFIRE_JINJA_CHAT=0).
+        let try_jinja = m.chat_template.is_some()
+            && std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
