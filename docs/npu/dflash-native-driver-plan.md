@@ -183,6 +183,103 @@ genuine and the GEMM's higher aggregate comes from A and W using independent pat
 
 **Until that runs, treat 9.4 GB/s and ~51–58 ms as provisional.**
 
+### NOISE FLOOR — read this before trusting any delta above
+
+**Run-to-run variance on an identical binary is 3.4%** (the same 8-channel/4-core/burst-0
+build measured 809.1 µs and 836.6 µs). Single-shot deltas below ~5% in this document are
+therefore **not meaningful**, including several reported earlier as findings:
+
+| earlier claim | verdict |
+|---|---|
+| channel count 4→8 = "+3.4%" | **noise** — strengthens the null: extra weight channels buy *nothing* |
+| halving MACs = "+4%" | at the noise boundary |
+| burst 0→64 = "+3.5%" | at the noise boundary |
+| halving activation traffic = "+1%" | noise |
+| buffer depth 3 vs 2 = "+0.04%" | noise |
+
+Clearly outside noise: burst=256 (**−8%**), and the int4-vs-int8 shape difference.
+Repeats should have been run before reporting deltas at this granularity.
+
+### Knobs measured and retired (seven, all null or noise-level)
+
+channel count · consumer count · buffer depth · compute load · activation traffic ·
+shape · burst length. **The weight path holds 10.0–10.6 GB/s throughout.**
+
+`burst_length` was previously left at its default (0). Best of four is 64 (10.56 GB/s);
+larger is actively worse (256 → 9.44 GB/s, −8%). The DMA preferring many small bursts is
+consistent with a **fabric/arbitration limit rather than a DDR-page-efficiency limit**.
+
+n-D DMA auto-advance *is* in use (3-D `dma_bd` with hardware stride/size advance, no host
+re-issue per block), but degenerately: **two of three dimensions are consumed expressing
+contiguity**, because `_split()` exists solely to work around npu1's 1023-per-dimension
+cap (a 16 KB contiguous run encoded as 32×512 B). Only the block stride does real work.
+
+### Activation-stationary: BUILDS, and the fanout control is decisive
+
+`benchmarks/npu_gemm_tuning/r14b/r14c_gen.py` — W pulled by **both** MM2S channels per
+column and reassembled by a memtile **join**; activation held in a core-resident buffer.
+Verified in lowered IR: `wsh{0..3}_{0,1}_shim_alloc(MM2S, 0)` **and** `(MM2S, 1)` on all
+four shims, zero `ash` allocations.
+
+| config | W chans | A path | cores | C[0] | W GB/s |
+|---|---|---|---|---|---|
+| R14 control | 4 | 2 MB streamed | 16 | 1024 ✓ | 9.5 |
+| R14C 1 ch/col | 4 | resident | 16 | 3072 ✓ | 9.8 |
+| R14C 2 ch/col | 8 | resident | 16 | 3072 ✓ | 10.1 |
+| R14C 2 ch/col | 8 | resident | **4** | 3072 ✓ | **10.1** |
+| R14C 2 ch/col, N_BLK=256 | 8 | resident | 16 | 3072 ✓ | 9.9 |
+
+**The decisive control: 4 cores and 16 cores take the same time** at identical weight
+bytes (827.2 vs 818.8 µs). Time is set purely by the DDR→shim weight stream — not compute,
+not memtile broadcast, not the core side — and stays linear in weight bytes (2× W → 2.05×
+time). Correctness exact throughout; resident-A configs use `AVAL=3` (not 1) so
+C[0] = 3 × KT × 16 = 3072 **proves the resident buffer is actually read**.
+
+Second npu1 wall found here: `ObjectFifoLinkOp does not support 'join' and 'distribute' at
+the same time` — you get 8 weight channels **or** a streamed activation, not both.
+
+**Revised projection: ~48 ms** (not the ~37 ms that 13 GB/s implied). More DDR streams is
+retired as a lever. **The next lever must cut weight BYTES (deeper quant) or get more
+activation rows per weight fetch (larger M) — or overlap dispatches.**
+
+> DFlash consequence: since time is set by weight bytes and is **independent of activation
+> rows**, draft tokens are close to free on the GEMM. This is now a measured argument for
+> materializing the full 16-token block rather than truncating to ~8.
+
+### RESOLVED: the distinct-buffer anomaly is not a lever — but BO SIZE is
+
+`benchmarks/npu_gemm_tuning/r133/` swept region count with read bytes held at exactly
+8,388,608 in every row. **At constant BO size, region count is flat:**
+
+| BO size | 1 region | 2 | 4 | 8 |
+|---|---|---|---|---|
+| 57 MB | 5.84 | 5.98 | 5.96 | 5.99 GB/s |
+| 15 MB | 9.70 | — | 9.68 | 9.70 GB/s |
+
+Regions 1→8 moves nothing. Splitting across two separate buffer *objects* (4 MB in `%A` +
+4 MB in `%W`) gives 10.26 vs 10.35 single-BO — also nothing. So the GEMM's 13.99 GB/s does
+**not** come from separate BOs or from layout. **Nothing measured exceeded 10.4 GB/s**;
+the weight-path wall is genuine. The residual is best explained by A and W riding
+**independent paths**, so aggregate exceeds either stream alone.
+
+**The real finding is a penalty, not a gain: larger weight BOs cost bandwidth.** The same
+dense 8 MB read region measured at 8 / 15 / 57 MB BO gives **10.35 / 9.70 / 5.84 GB/s — a
+1.77× penalty**. Cause not diagnosed (TLB/page-table pressure vs XRT allocation path vs
+physical fragmentation).
+
+> **⚠ THIS THREATENS THE HEADLINE NUMBER — VALIDATE BEFORE TRUSTING ~48–58 ms.**
+> The new kernel was measured on **8 MB** weight buffers. Real DFlash weights are far
+> larger (the native driver's own probe used up to **101 MB**). If the 1.77× large-BO
+> penalty applies at DFlash sizes, the projection is optimistic and the 2.45× improvement
+> is partly an artifact of comparing an 8 MB microbenchmark against a ~100 MB workload.
+>
+> Countervailing evidence: the *old* `int_matmul` measured **flat 3.8 GB/s from 17 MB to
+> 101 MB** (101→26.5 ms, 50→13.6, 25→7.2, 17→5.3), showing **no** BO-size effect over that
+> range. The two observations conflict and are from different kernels/paths.
+>
+> **Required before the projection can be trusted: re-measure the new kernel at real
+> DFlash weight sizes (~100 MB), not 8 MB.** This is now the top validation item.
+
 ### r14b (activation-fold) — dead as written, not dead in principle
 
 `benchmarks/npu_gemm_tuning/r14b/` folds A into the column shim object to free a channel.

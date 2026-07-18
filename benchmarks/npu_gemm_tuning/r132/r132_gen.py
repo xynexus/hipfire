@@ -19,6 +19,8 @@ NBLK    = int(sys.argv[2]) if len(sys.argv) > 2 else 128
 STREAMS = int(sys.argv[3]) if len(sys.argv) > 3 else 1       # shim MM2S feeds per column
 DEVICE  = sys.argv[4] if len(sys.argv) > 4 else "npu1"
 DEPTH   = int(sys.argv[5]) if len(sys.argv) > 5 else 2
+NCORES  = int(sys.argv[6]) if len(sys.argv) > 6 else 4   # consumers per column
+BURST   = int(sys.argv[7]) if len(sys.argv) > 7 else 0   # shim DMA burst length
 assert STREAMS in (1, 2), "STREAMS must be 1 or 2"
 assert WB % STREAMS == 0, "WB must divide evenly across streams"
 SEG = WB // STREAMS
@@ -46,7 +48,7 @@ for c in G:
         out.append(f"    %c{c}_{i} = aie.tile({c}, {2+i})")
 
 for j in G:
-    cores = ", ".join(f"%c{j}_{i}" for i in G)
+    cores = ", ".join(f"%c{j}_{i}" for i in range(NCORES))
     # STREAMS shim->memtile feeds, joined into one memtile->cores broadcast.
     for s in range(STREAMS):
         out.append(f"    aie.objectfifo @wsh{j}_{s}(%shim{j}, {{%mt{j}}}, {DEPTH} : i32) : !aie.objectfifo<memref<{SEG}xi8>>")
@@ -57,7 +59,7 @@ for j in G:
 
 # Cores: consume only. No compute -- this is a pure feed probe.
 for c in G:
-    for i in G:
+    for i in range(NCORES):
         out.append(f'''    %core{c}_{i} = aie.core(%c{c}_{i}) {{
       %z = arith.constant 0 : index
       %m = arith.constant {INF} : index
@@ -78,7 +80,7 @@ for j in G:
         # Stream s of column j: stride WB between blocks, SEG-sized segment at offset s*SEG.
         base = j * Wt + s * SEG
         out.append(f'''      %tw{j}_{s} = aiex.dma_configure_task_for @wsh{j}_{s} {{
-        aie.dma_bd(%W : memref<{4*Wt}xi8>, {base}, {NBLK*SEG}, {_bd_dims(NBLK, WB, SEG)}) {{burst_length = 0 : i32}}
+        aie.dma_bd(%W : memref<{4*Wt}xi8>, {base}, {NBLK*SEG}, {_bd_dims(NBLK, WB, SEG)}) {{burst_length = {BURST} : i32}}
         aie.end
       }} {{issue_token = true}}
       aiex.dma_start_task(%tw{j}_{s})''')

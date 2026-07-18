@@ -43,12 +43,14 @@ CBASE = int(sys.argv[7]) if len(sys.argv) > 7 else 32
 DEPTH = int(sys.argv[8]) if len(sys.argv) > 8 else 2
 AVAL = int(sys.argv[9]) if len(sys.argv) > 9 else 3
 NCH = int(sys.argv[10]) if len(sys.argv) > 10 else 2   # shim MM2S channels per column
+ROWS = int(sys.argv[11]) if len(sys.argv) > 11 else 4  # active core rows per column (broadcast fanout probe)
 AB = LM * KT * 64        # A-stripe bytes, now core-resident
 WB = LN * KT * WBYTES    # W-stripe bytes (shared by a physical column)
 CB = LM * LN * CBASE     # per-core C i32
-CJ = 4 * CB              # joined C per column
+CJ = (int(sys.argv[11]) if len(sys.argv) > 11 else 4) * CB              # joined C per column
 INF = 9223372036854775807
 G = range(4)
+R = range(int(sys.argv[11]) if len(sys.argv) > 11 else 4)
 
 S0 = ((WB // 2) // 64) * 64      # balanced cut of the W stripe across the 2 MM2S
 S1 = WB - S0
@@ -71,18 +73,18 @@ out = ["module {", f"  aie.device({DEVICE}) {{"]
 for c in G:
     out.append(f"    %shim{c} = aie.tile({c}, 0)")
     out.append(f"    %mt{c} = aie.tile({c}, 1)")
-    for i in G:
+    for i in R:
         out.append(f"    %c{c}_{i} = aie.tile({c}, {2+i})")
 
 # core-resident activation stripe (one per core, compile-time initialised)
 for c in G:
-    for i in G:
+    for i in R:
         out.append(f'    %abuf{c}_{i} = aie.buffer(%c{c}_{i}) {{sym_name = "abuf{c}_{i}"}} : memref<{AB}xi8> = dense<{AVAL}>')
 
 # W: per column j, TWO shim MM2S channels joined in the memtile, then broadcast to the
 # 4 cores of column j.
 for j in G:
-    colcores = ", ".join(f"%c{j}_{i}" for i in G)
+    colcores = ", ".join(f"%c{j}_{i}" for i in R)
     out.append(f"    aie.objectfifo @wbc{j}(%mt{j}, {{{colcores}}}, {DEPTH} : i32) : !aie.objectfifo<memref<{WB}xi8>>")
     if NCH == 2:
         out.append(f"    aie.objectfifo @wsh{j}_0(%shim{j}, {{%mt{j}}}, {DEPTH} : i32) : !aie.objectfifo<memref<{S0}xi8>>")
@@ -93,16 +95,16 @@ for j in G:
         out.append(f"    aie.objectfifo.link [@wsh{j}_0] -> [@wbc{j}] ([] [0])")
 # C: per column j, 4 cores -> memtile -> shim (join). Unchanged from r14.
 for j in G:
-    ins = ", ".join(f"@cc{j}_{i}" for i in G)
-    offs = ", ".join(str(i * CB) for i in G)
-    for i in G:
+    ins = ", ".join(f"@cc{j}_{i}" for i in R)
+    offs = ", ".join(str(i * CB) for i in R)
+    for i in R:
         out.append(f"    aie.objectfifo @cc{j}_{i}(%c{j}_{i}, {{%mt{j}}}, {DEPTH} : i32) : !aie.objectfifo<memref<{CB}xi32>>")
     out.append(f"    aie.objectfifo @csh{j}(%mt{j}, {{%shim{j}}}, {DEPTH} : i32) : !aie.objectfifo<memref<{CJ}xi32>>")
     out.append(f"    aie.objectfifo.link [{ins}] -> [@csh{j}] ([{offs}] [])")
 
 out.append(f'    func.func private @r11_gemm(memref<{AB}xi8>, memref<{WB}xi8>, memref<{CB}xi32>) attributes {{link_with = "r11.o"}}')
 for c in G:
-    for i in G:
+    for i in R:
         out.append(f'''    %core{c}_{i} = aie.core(%c{c}_{i}) {{
       %z = arith.constant 0 : index
       %m = arith.constant {INF} : index
