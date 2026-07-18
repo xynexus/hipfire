@@ -203,7 +203,21 @@ block's last-`block_size` output rows. `build_qwen3_dflash_attention.py` reuses
 `build_qwen3_segmented_attention.generate_mlir` verbatim, patches `causal=0` and the
 device line, and **compiles cleanly for npu2/aie2p** (final.xclbin + insts.bin).
 
-**Two blockers to Gate C:**
+**Second path (nix1, single-core) — kernel BUILDS + RUNS on nix1's NPU; numerics
+WIP.** Since the 8-col kernel can't run on nix1, added a single-core drafter
+attention: `dflash_attention_sc_bf16.cc` (plain bf16 layout, one q-head/dispatch,
+non-causal full softmax, GQA on the host) + `build_dflash_attention_sc.py`
+(`@iron.jit` + ObjectFifo, KV=[K|V] in one fifo for the 2-input DMA limit,
+depth=1 for the 64 KB tile) + `test_dflash_attention_npu.py`.
+- ALGORITHM validated vs golden l0 (numpy `--algo-only`): **cos = 1.000000**.
+- BUILDS + RUNS on nix1 (RyzenAI-npu1/aie2) — dataflow executes.
+- **Numerics WIP:** on-device output is wrong (cos ≈ 0.065) and INVARIANT to the
+  score computation → Q isn't effectively reaching the kernel (output ≈ average
+  of V, i.e. scores≈0 → uniform softmax). Diagnosed: an IRON fill/drain wiring
+  issue (plain `rt.fill` without the memtile `.forward()` + TensorTiler taps that
+  `oq_gemm_design` uses). Next: mirror oq_gemm's staged fill/drain to deliver Q.
+
+**Two blockers to Gate C (8-col path):**
 1. **nix1 can't run it:** the segmented kernel is **8-column** (aie2p/halo); nix1's
    npu1 is **4-column** (`aie.tile column index 4 must be < 4`). The drafter's tiny
    attention (16 q, 48 kv) actually wants a **≤4-col / single-core** design — a real
