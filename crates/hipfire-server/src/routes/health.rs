@@ -55,6 +55,7 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
     let batch_enabled = server_prefill_batch_enabled(&scheduler_env);
     let batch_telemetry = state.batch_telemetry.lock().await.clone();
     let batch_pending = state.batch_inbox.lock().await.len();
+    let work_snapshot = state.work_scheduler.lock().await.snapshot();
     let mut prefill_batch = server_prefill_batch_health_json(&scheduler_env);
     if let Some(obj) = prefill_batch.as_object_mut() {
         obj.insert("queue_size".to_string(), json!(prefill_queue_size));
@@ -99,6 +100,14 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         "diffusion": diffusion,
         "pid": std::process::id(),
         "scheduler_resources": scheduler_resources,
+        "work_scheduler": json!({
+            "queued": work_snapshot.queued,
+            "active_batches": work_snapshot.active_batches,
+            "active_workloads": work_snapshot.active_workloads,
+            "exclusive_active": work_snapshot.exclusive_active,
+            "active_vram_bytes": work_snapshot.active_resources.vram_bytes,
+            "active_gpu_slots": work_snapshot.active_resources.gpu_slots,
+        }),
         "prefill_batch": prefill_batch,
         "decode_batch": if batch_enabled {
             batch_telemetry.decode_health_json()

@@ -294,7 +294,7 @@ pub fn spawn_batch_runner(state: SharedState) {
     });
 }
 
-fn batch_max() -> usize {
+pub fn batch_max() -> usize {
     std::env::var("HIPFIRE_SERVER_PREFILL_BATCH_MAX")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -312,25 +312,50 @@ fn batch_wait_ms() -> u64 {
         .unwrap_or(10)
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 async fn batch_runner_loop(state: SharedState) {
     loop {
-        if state.batch_inbox.lock().await.is_empty() {
+        if state.work_scheduler.lock().await.snapshot().queued == 0 {
             tokio::select! {
                 _ = state.prefill_notify.notified() => {}
                 _ = tokio::time::sleep(Duration::from_millis(5)) => {}
             }
             continue;
         }
-        // Let concurrent requests accumulate into one batch before forming it.
+        // Gather window: let concurrent requests accumulate before the scheduler
+        // forms the batch (so a burst coalesces instead of running one-at-a-time).
         let wait_ms = batch_wait_ms();
         if wait_ms > 0 {
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         }
-        let batch = {
+        // Admission: the ContinuousWorkScheduler is the front-end. It picks a
+        // priority seed, greedily groups microbatch-compatible workloads (same
+        // worker key, up to max), admits by resource capacity, and hands back a
+        // lease. This replaces the old worker-key drain.
+        let lease = {
+            let mut sched = state.work_scheduler.lock().await;
+            sched.next_batch(now_ms())
+        };
+        let Some(lease) = lease else {
+            continue;
+        };
+        // Retrieve the parked requests for this lease's workloads.
+        let batch: Vec<PendingRequest> = {
             let mut inbox = state.batch_inbox.lock().await;
-            drain_compatible_batch(&mut inbox, batch_max())
+            lease
+                .workloads
+                .iter()
+                .filter_map(|w| inbox.remove(&w.id))
+                .collect()
         };
         if batch.is_empty() {
+            state.work_scheduler.lock().await.complete(lease.lease_id);
             continue;
         }
         let engine = state.engine.lock().await.take();
@@ -340,29 +365,13 @@ async fn batch_runner_loop(state: SharedState) {
                     .tx
                     .send(BatchEvent::Error("daemon not running".to_string()));
             }
+            state.work_scheduler.lock().await.complete(lease.lease_id);
             continue;
         };
         run_batch_cycle(&mut engine, &state, batch).await;
         *state.engine.lock().await = Some(engine);
+        state.work_scheduler.lock().await.complete(lease.lease_id);
     }
-}
-
-/// Remove up to `max` pending requests that share the first request's worker
-/// key (only same-worker sessions can fuse into one GPU batch).
-fn drain_compatible_batch(
-    inbox: &mut HashMap<String, PendingRequest>,
-    max: usize,
-) -> Vec<PendingRequest> {
-    let Some(worker) = inbox.values().next().map(|p| p.worker_key_id.clone()) else {
-        return Vec::new();
-    };
-    let ids: Vec<String> = inbox
-        .iter()
-        .filter(|(_, p)| p.worker_key_id == worker)
-        .take(max)
-        .map(|(id, _)| id.clone())
-        .collect();
-    ids.into_iter().filter_map(|id| inbox.remove(&id)).collect()
 }
 
 fn fail_all(txs: &HashMap<String, mpsc::UnboundedSender<BatchEvent>>, msg: &str) {

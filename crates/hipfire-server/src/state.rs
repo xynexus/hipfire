@@ -8,7 +8,9 @@ use hipfire_config::{HipfireConfig, LoadedConfig};
 use hipfire_daemon_adapter::DaemonEngine;
 use hipfire_diffusion::{DiffusionGenerationRuntimeOptions, DiffusionPipeline};
 use hipfire_prompt::Message;
-use hipfire_scheduler::{PriorityPrefillScheduler, SchedulerPolicyEnv};
+use hipfire_scheduler::{
+    ContinuousWorkScheduler, PriorityPrefillScheduler, SchedulerPolicyEnv, WorkloadResources,
+};
 
 #[derive(Clone, Debug)]
 pub struct StoredResponsesContext {
@@ -83,6 +85,9 @@ pub struct AppState {
     pub loaded_models: Mutex<HashMap<String, LoadedModelState>>,
     /// Shared prefill scheduler used by Rust request paths when enabled.
     pub prefill_scheduler: Mutex<PriorityPrefillScheduler>,
+    /// Continuous work scheduler: the admission spine the batch runner pulls
+    /// batches from (priority + microbatch grouping + resource leases). Phase 3.
+    pub work_scheduler: Mutex<ContinuousWorkScheduler>,
     /// Request IDs selected by the scheduler and ready to enter daemon I/O.
     pub selected_prefill_requests: Mutex<HashSet<String>>,
     /// Serializes scheduler selection so one request path chooses batches at a time.
@@ -251,6 +256,21 @@ impl AppState {
             loaded_model_max_seq: Mutex::new(None),
             loaded_models: Mutex::new(HashMap::new()),
             prefill_scheduler: Mutex::new(PriorityPrefillScheduler::new(scheduler_env)),
+            // Generous capacity: admission is behavior-neutral for now (the
+            // scheduler provides priority ordering, microbatch grouping, and
+            // resource leases; real inventory-based capacity is a follow-up).
+            // Unbounded queue (max_queued=0) mirrors the prior inbox behaviour.
+            work_scheduler: Mutex::new(ContinuousWorkScheduler::new(
+                WorkloadResources {
+                    system_memory_bytes: u64::MAX,
+                    vram_bytes: u64::MAX,
+                    gpu_slots: u32::MAX,
+                    npu_slots: u32::MAX,
+                    cpu_threads: u32::MAX,
+                },
+                0,
+                0,
+            )),
             selected_prefill_requests: Mutex::new(HashSet::new()),
             prefill_dispatch: Mutex::new(()),
             prefill_notify: Notify::new(),

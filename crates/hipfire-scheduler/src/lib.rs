@@ -282,6 +282,20 @@ impl WorkloadClass {
             Self::TokenPrefill | Self::TokenDecode | Self::ImageGeneration
         )
     }
+
+    /// The coarse billing / rate-limit class this scheduling class rolls up to.
+    /// This is the single source of truth that unifies the two taxonomies: a
+    /// request classified once (as a scheduler `WorkloadClass`) derives its
+    /// `hipfire_auth::WorkloadClass` here rather than being classified twice and
+    /// risking drift.
+    pub fn billing_class(self) -> hipfire_auth::WorkloadClass {
+        match self {
+            Self::TokenPrefill | Self::TokenDecode => hipfire_auth::WorkloadClass::Text,
+            Self::ImageGeneration => hipfire_auth::WorkloadClass::Image,
+            Self::Training => hipfire_auth::WorkloadClass::Training,
+            Self::Maintenance => hipfire_auth::WorkloadClass::Other,
+        }
+    }
 }
 
 /// Conservatively additive resources used for admission and active leases.
@@ -2795,6 +2809,16 @@ mod tests {
     ) -> WorkloadSpec {
         token_workload(id, priority, enqueued_at_ms)
             .with_owner(WorkloadOwner::authenticated(user, Some(token.to_string())))
+    }
+
+    #[test]
+    fn workload_class_billing_class_rolls_up_to_auth_taxonomy() {
+        use hipfire_auth::WorkloadClass as Auth;
+        assert_eq!(WorkloadClass::TokenPrefill.billing_class(), Auth::Text);
+        assert_eq!(WorkloadClass::TokenDecode.billing_class(), Auth::Text);
+        assert_eq!(WorkloadClass::ImageGeneration.billing_class(), Auth::Image);
+        assert_eq!(WorkloadClass::Training.billing_class(), Auth::Training);
+        assert_eq!(WorkloadClass::Maintenance.billing_class(), Auth::Other);
     }
 
     #[test]

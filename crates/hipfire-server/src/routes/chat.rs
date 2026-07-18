@@ -1813,15 +1813,37 @@ where
             max_tokens: request_max_tokens as usize,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker_key_id = loaded.worker_key_id.clone().unwrap_or_default();
+        // Register the pending request first so the runner can always resolve a
+        // granted lease's workload ids back to their session inputs + channel.
         {
             let mut inbox = state.batch_inbox.lock().await;
             inbox.insert(
                 req_id.clone(),
                 crate::batch_runner::PendingRequest {
                     spec,
-                    worker_key_id: loaded.worker_key_id.clone().unwrap_or_default(),
+                    worker_key_id: worker_key_id.clone(),
                     tx,
                 },
+            );
+        }
+        // Admit through the ContinuousWorkScheduler (the batch runner's front-end):
+        // same worker key = microbatch-compatible, up to the batch max. On backpressure
+        // or duplicate id, unregister and surface the error.
+        let workload = hipfire_scheduler::WorkloadSpec::microbatchable(
+            req_id.clone(),
+            hipfire_scheduler::WorkloadClass::TokenPrefill,
+            hipfire_scheduler::clamp_scheduler_priority(body.priority.unwrap_or(64)),
+            now_ms(),
+            hipfire_scheduler::WorkloadResources::default(),
+            worker_key_id,
+            crate::batch_runner::batch_max(),
+        )
+        .with_owner(owner.clone());
+        if let Err(e) = state.work_scheduler.lock().await.enqueue(workload) {
+            state.batch_inbox.lock().await.remove(&req_id);
+            return Err(
+                json!({"error": {"message": format!("scheduler admission: {e}"), "type": "server_error"}}),
             );
         }
         state.prefill_notify.notify_waiters();
