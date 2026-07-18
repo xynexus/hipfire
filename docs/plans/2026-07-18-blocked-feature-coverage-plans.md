@@ -100,11 +100,28 @@ groups. gemma3's WORKING quant KV does NOT go through this — it threads a
 `Gemma3State::new_with_max_seq` gemma3/forward.rs:103). So there is no existing
 quant path in `LayeredKvArena` to simply call.
 
-### Plan
-1. **Add a KvQuantMode-aware constructor to `LayeredKvArena`:**
-   `new_quant(gpu, plan, mode: KvQuantMode, kvarn_bits: usize)` that builds each group
-   via `KvCache::new_gpu_q8_capped` / `new_gpu_kvarn_capped(.., bits)` instead of
-   `new_gpu_capped_filtered`. Store the per-group `KvQuantMode` on the arena.
+### Feasibility CONFIRMED (2026-07-18) — de-risked, turnkey
+- **gemma3 is NOT at risk.** gemma3's working KVarN uses plain `KvCache::new_gpu_kvarn_filtered`
+  + separate `swa_k/swa_v` F32 rings (forward.rs:142-159), NOT `LayeredKvArena`. gemma3 only
+  touches the arena via `homogeneous_fp32_cache` (returns a plain `KvCache`). So adding a quant
+  path to `LayeredKvArena` is **gemma4-only** — no gemma3 regression surface.
+- **Kernels + KvCache ctors already exist:** `KvCache::new_gpu_kvarn_capped_filtered(gpu,
+  is_kv_layer, n_kv_heads, head_dim, max_seq, physical_cap, bits)` (kv.rs:1337) is the exact
+  analog of the `new_gpu_capped_filtered` that `new_fp32` (layered_kv.rs:363) already calls per
+  group; plus `kvarn_attend` / `attention_flash_kvarn_batched_masked` for the read side.
+- **gemma4 has MIXED storage** (Full global + SlidingWindow local, forward.rs:70-78) — apply
+  KVarN to the **Full-storage groups only** (head_dim 256 ∈ {128,256} ✓), keep SlidingWindow
+  groups F32 (mirrors gemma3's local-rings-stay-F32 choice).
+- ⚠️ **ATOMIC change:** ctor + store-routing + forward attend must land together; a partial is
+  dead/broken code (can't validate). Do it as ONE focused unit, not a tick fragment.
+
+### Plan (turnkey)
+1. **Add `LayeredKvArena::new_kvarn(gpu, plan, bits)`** mirroring `new_fp32` (L363) but, per
+   group, dispatch on `group.storage`: `KvStorageKind::Full` + head_dim∈{128,256} →
+   `KvCache::new_gpu_kvarn_capped_filtered(gpu, &owned, group.kv_heads, group.head_dim,
+   plan.max_seq, group.storage.physical_cap(plan.max_seq), bits)`; else (SlidingWindow /
+   incompatible) → the existing `new_gpu_capped_filtered` (F32). Tag each group's mode so
+   store/view/attend can branch.
 2. **Make store/view/attend quant-aware.** This is the hard part: `store_f32` and the
    attention read must dispatch on the group's storage dtype. **Target the KVarN tier**
    (variance-normalized K + Q8 V, block-record + window ring — mirror the kvarn_attend
@@ -115,9 +132,9 @@ quant path in `LayeredKvArena` to simply call.
 3. **Plumb gemma4:** add `gemma4_kv_mode` (mirror `gemma3_kv_mode` load.rs:310), thread
    `options.kv_mode` at arch.rs:290 into `Gemma4DenseState::new` (forward.rs:50) →
    `LayeredKvArena::new_quant`.
-4. **Guard the shared change:** gemma3 also constructs `LayeredKvArena` in some paths —
-   confirm the fp32 default is untouched and only the new `new_quant` opt-in changes
-   behavior. head_dim 256 → later kvarn tier needs no new rotation kernel.
+4. **Guard:** keep `new_fp32` the default path (gemma4 fp32-KV unchanged when kv_mode is
+   unset). gemma3 confirmed NOT on the arena quant path, so no gemma3 regression surface;
+   head_dim 256 → no new rotation kernel needed.
 5. **Validate:** gemma4 DOES serve. Use a small on-disk variant (gemma-4-E2B / E4B),
    quantize with an OQ format, `HIPFIRE_KV_MODE=kvarn hipfire chat` coherence vs fp32-KV.
 
