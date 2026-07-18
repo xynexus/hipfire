@@ -426,6 +426,8 @@ fn main() {
     let mut ctx_capacity: usize = 512;
     let mut ctx_slice: Option<usize> = None;
     let mut kv_mode_str = String::from("q8");
+    let mut calib_out: Option<String> = None;
+    let mut calib_imatrix_only: Vec<String> = Vec::new();
     let mut block_size_override: Option<usize> = None;
     let mut temp: f32 = 0.0;
     let mut seed: u64 = 42;
@@ -585,6 +587,30 @@ fn main() {
             }
             "--kv-mode" => {
                 kv_mode_str = args[i + 1].clone();
+                i += 2;
+            }
+            // ── DFlash calibration collection ──────────────────────
+            // `--calib-out <path>` arms a CalibCollector over the DRAFTER's
+            // projections only (fc + per-layer q/k/v/o/gate/up/down) for the
+            // whole decode run, then streams the per-tensor GPTQ Hessian +
+            // imatrix to `<path>` as an HFQM `.calib.hfq`. Because the
+            // activations are the drafter's REAL inputs during real spec
+            // decode against the real target, the resulting Hessian carries
+            // the true input covariance LDLQ needs — unlike a synthetic
+            // (`dflash_ref_dump`-style) input, whose Hessian is ~isotropic.
+            "--calib-out" => {
+                calib_out = Some(args[i + 1].clone());
+                i += 2;
+            }
+            // Comma-separated name substrings that keep imatrix only (no
+            // [K,K] Hessian). Use to shed the largest accumulators when the
+            // full set does not fit, e.g. `fc,down_proj`.
+            "--calib-imatrix-only" => {
+                calib_imatrix_only = args[i + 1]
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 i += 2;
             }
             "--block-size" => {
@@ -1159,6 +1185,40 @@ fn main() {
     // (exhaustive)" — anything not zeroed by
     // `seed_target_hidden_from_prompt → target.reset_state(gpu)`
     // (which only touches DeltaNet recurrent state).
+    // ── Calibration capture: arm over the DRAFTER's weights only ──────
+    // `capture_names` is keyed by weight-buffer address, and
+    // `maybe_capture_activation` returns early on an unregistered address —
+    // so registering only `draft_weights` is what guarantees the artifact
+    // contains no target-model tensors, even though target and draft share
+    // this `gpu`. Names are the drafter's canonical HFQ tensor names minus
+    // `.weight`, so the quantizer joins `<name>.{hessian,imatrix}` straight
+    // onto the source weight it is about to encode.
+    let calib_collector = calib_out.as_ref().map(|path| {
+        let mut names: std::collections::HashMap<usize, String> =
+            std::collections::HashMap::new();
+        names.insert(draft_weights.fc.buf.buf.as_ptr() as usize, "fc".to_string());
+        for (li, layer) in draft_weights.layers.iter().enumerate() {
+            let p = format!("layers.{li}");
+            for (w, suffix) in [
+                (&layer.wq, "self_attn.q_proj"),
+                (&layer.wk, "self_attn.k_proj"),
+                (&layer.wv, "self_attn.v_proj"),
+                (&layer.wo, "self_attn.o_proj"),
+                (&layer.w_gate, "mlp.gate_proj"),
+                (&layer.w_up, "mlp.up_proj"),
+                (&layer.w_down, "mlp.down_proj"),
+            ] {
+                names.insert(w.buf.buf.as_ptr() as usize, format!("{p}.{suffix}"));
+            }
+        }
+        eprintln!(
+            "calib: arming over {} drafter tensors → {path} (imatrix_only={:?})",
+            names.len(),
+            calib_imatrix_only,
+        );
+        hipfire_runtime::calibration::arm(&mut gpu, names, calib_imatrix_only.clone())
+    });
+
     for (row_idx, (row_label, row_raw_prompt, row_max_tokens)) in prompts.iter().enumerate() {
         let row_max_tokens: usize = *row_max_tokens;
         if multi_row {
@@ -2657,6 +2717,43 @@ fn main() {
         // ── End of per-row loop body ──────────────────────────────
         if multi_row {
             eprintln!("@@@ ROW {row_idx} END @@@");
+        }
+    }
+
+    // ── Calibration capture: disarm + stream the .calib.hfq ───────────
+    if let Some(collector) = calib_collector {
+        hipfire_runtime::calibration::disarm(&mut gpu);
+        let out = std::path::PathBuf::from(calib_out.as_ref().unwrap());
+        let static_meta: Vec<(&str, serde_json::Value)> = vec![
+            ("source_model", serde_json::json!(target_path)),
+            ("source_drafter", serde_json::json!(draft_path)),
+            ("collector", serde_json::json!("dflash_spec_demo")),
+            ("dflash_block_size", serde_json::json!(draft_cfg.block_size)),
+            (
+                "dflash_target_layer_ids",
+                serde_json::json!(draft_cfg.target_layer_ids),
+            ),
+            ("calib_rows", serde_json::json!(prompts.len())),
+        ];
+        match hipfire_runtime::calibration::finish(
+            &mut gpu,
+            &collector,
+            draft_hfq.arch_id,
+            &out,
+            &static_meta,
+            &hipfire_runtime::calibration::CalibForward::default(),
+        ) {
+            Ok(s) => eprintln!(
+                "calib: wrote {} (n_hessian={} n_imatrix={} max_diag_consistency={:.3e})",
+                out.display(),
+                s.n_hessian,
+                s.n_imatrix,
+                s.max_consistency,
+            ),
+            Err(e) => {
+                eprintln!("calib: FAILED: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }

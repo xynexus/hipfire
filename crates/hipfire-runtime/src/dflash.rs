@@ -876,6 +876,26 @@ fn gemm_dispatch(
     // atomic load per call rather than an env lookup.
     static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let dump = *DUMP.get_or_init(|| crate::config::get().draft_gemm_dump);
+    // Calibration tap. No-op unless a `CalibCollector` is armed AND `w.buf`'s
+    // address is registered in `gpu.capture_names` — so a drafter-only
+    // registration never picks up the target model's projections even though
+    // both run on the same `gpu`. Placed BEFORE the dtype dispatch so the
+    // captured `x` is the PLAIN-BASIS activation: for MQ3/MQ4 drafters the FWHT
+    // rotation happens below, inside the match, and we deliberately do not
+    // want the rotated basis in the Hessian (the LDLQ consumer works in the
+    // same plain basis as the F16/F32 source weights).
+    //
+    // The `x` handed in is often a WHOLE scratch tensor sized for
+    // `max_block_size` rows while this call only uses `batch ≤ max_block_size`
+    // of them (adaptive-B). `CalibCollector::capture` infers the source row
+    // stride as `input.numel() / n`, which is only correct when the view's
+    // element count is exactly `n × k` — so pass an explicit `batch × w.k`
+    // view rather than the oversized scratch, or every row after the first
+    // would be copied from the wrong offset.
+    if gpu.active_capture.is_some() {
+        let x_rows = x.sub_offset(0, batch * w.k);
+        gpu.maybe_capture_activation(&w.buf, &x_rows, batch, w.k);
+    }
     if dump || sync_after {
         gpu.hip.device_synchronize()?;
     }
@@ -1646,7 +1666,14 @@ pub fn draft_forward_opts(
         // Fixed-shape FFN tail. MoE DFlash can optionally capture this as a
         // per-layer/per-B hipGraph; the attention/context work above is left
         // direct because `ctx_len` changes every accepted cycle.
-        let graph_ffn_active = graph_ffn && !dbg && !crate::config::get().draft_gemm_dump;
+        // A captured/replayed hipGraph bypasses the host-side calibration tap
+        // in `gemm_dispatch` (and capturing a graph while the collector
+        // launches its own reduce kernels would be illegal anyway), so the FFN
+        // graph path is disabled whenever a calibration capture is armed.
+        let graph_ffn_active = graph_ffn
+            && !dbg
+            && !crate::config::get().draft_gemm_dump
+            && gpu.active_capture.is_none();
         draft_ffn_layer_maybe_graph(gpu, layer, scratch, li, b, h, eps, graph_ffn_active)?;
         // 2026-04-21: tried target's fused gemm_gate_up_hfq4g256 here (shared
         // FP16-X convert + interleaved gate/up GEMMs). Byte-exact A/B neutral
