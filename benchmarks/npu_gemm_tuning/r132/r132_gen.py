@@ -21,6 +21,7 @@ DEVICE  = sys.argv[4] if len(sys.argv) > 4 else "npu1"
 DEPTH   = int(sys.argv[5]) if len(sys.argv) > 5 else 2
 NCORES  = int(sys.argv[6]) if len(sys.argv) > 6 else 4   # consumers per column
 BURST   = int(sys.argv[7]) if len(sys.argv) > 7 else 0   # shim DMA burst length
+SPLITBO = int(sys.argv[8]) if len(sys.argv) > 8 else 0   # 1 = split weight reads across TWO buffer objects
 assert STREAMS in (1, 2), "STREAMS must be 1 or 2"
 assert WB % STREAMS == 0, "WB must divide evenly across streams"
 SEG = WB // STREAMS
@@ -74,13 +75,20 @@ for c in G:
 Wt = NBLK * WB                      # bytes per column
 # Signature mirrors r14 (A, W, C) so npu_gemm_bench drives it unchanged; A and C are
 # unused here -- this probe streams weights only.
-out.append(f"    aie.runtime_sequence(%A: memref<64xi8>, %W: memref<{4*Wt}xi8>, %C: memref<64xi32>) {{")
+if SPLITBO:
+    HALF = 2 * Wt   # two columns' worth per buffer object
+    out.append(f"    aie.runtime_sequence(%A: memref<{HALF}xi8>, %W: memref<{HALF}xi8>, %C: memref<64xi32>) {{")
+else:
+    out.append(f"    aie.runtime_sequence(%A: memref<64xi8>, %W: memref<{4*Wt}xi8>, %C: memref<64xi32>) {{")
 for j in G:
     for s in range(STREAMS):
         # Stream s of column j: stride WB between blocks, SEG-sized segment at offset s*SEG.
-        base = j * Wt + s * SEG
+        if SPLITBO:
+            buf, bufsz, base = ("%A" if j < 2 else "%W"), 2 * Wt, (j % 2) * Wt + s * SEG
+        else:
+            buf, bufsz, base = "%W", 4 * Wt, j * Wt + s * SEG
         out.append(f'''      %tw{j}_{s} = aiex.dma_configure_task_for @wsh{j}_{s} {{
-        aie.dma_bd(%W : memref<{4*Wt}xi8>, {base}, {NBLK*SEG}, {_bd_dims(NBLK, WB, SEG)}) {{burst_length = {BURST} : i32}}
+        aie.dma_bd({buf} : memref<{bufsz}xi8>, {base}, {NBLK*SEG}, {_bd_dims(NBLK, WB, SEG)}) {{burst_length = {BURST} : i32}}
         aie.end
       }} {{issue_token = true}}
       aiex.dma_start_task(%tw{j}_{s})''')
