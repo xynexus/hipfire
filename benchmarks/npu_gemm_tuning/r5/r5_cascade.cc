@@ -124,6 +124,25 @@ static inline CVEC cascade_get() {
 }
 #endif
 
+#ifdef COMBINED_XW
+// COMBINED_XW: one memtile->core fifo carries this core's A then W back to back
+// (A = KSLICE*size_A int8, then W). Lets a ROWS=4 column fit the memtile's 6 out
+// channels (4 combined fifos vs 8 separate A/W fifos). A/W split at compile time.
+static constexpr int R5_AWB = KSLICE * MMUL::size_A;   // A bytes; W starts here
+#if ROLE == 0
+extern "C" void r5_cascade_head(const int8 *__restrict x) {
+  cascade_put(to_cvec(kslice_partial(x, x + R5_AWB)));
+}
+#elif ROLE == 1
+extern "C" void r5_cascade_mid(const int8 *__restrict x) {
+  cascade_put(csum(cascade_get(), to_cvec(kslice_partial(x, x + R5_AWB))));
+}
+#elif ROLE == 2
+extern "C" void r5_cascade_tail(const int8 *__restrict x, int32 *__restrict pC) {
+  store_c(pC, csum(cascade_get(), to_cvec(kslice_partial(x, x + R5_AWB))));
+}
+#endif
+#else  // separate A / W fifos (the default two-arg path)
 #if ROLE == 0   // HEAD: seed the cascade with the four partials.
 extern "C" void r5_cascade_head(const int8 *__restrict pA, const int8 *__restrict wbytes) {
   cascade_put(to_cvec(kslice_partial(pA, wbytes)));
@@ -137,4 +156,5 @@ extern "C" void r5_cascade_tail(const int8 *__restrict pA, const int8 *__restric
                                 int32 *__restrict pC) {
   store_c(pC, csum(cascade_get(), to_cvec(kslice_partial(pA, wbytes))));
 }
+#endif
 #endif

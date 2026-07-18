@@ -731,10 +731,17 @@ loses nothing to the probe. **Correct at gate_up's real K, too:** COLS=8 ROWS=2
 KSLICE=64 (K = 2·64·16 = **2048**, a 2-way K-split, 16 cores — fits the channel budget,
 divides K evenly) verifies **C[0]=3072 CORRECT** on halo. (A precise 16-core floor-free
 rate needs a 2-point INNER slope; single-INNER points are floor-confounded — deferred.)
-NEXT: ROWS=4 (combine A|W per core for the 6-channel
-memtile), real gate_up M/N tiling (M=256×N=768/1536, K=2048), op4++ per-group scale in
-the tail, then wire into the expert FFN and re-measure PP/TG. Gen `r5_ksplit_gen.py
-COLS ROWS KSLICE`; harnesses `npu_cascade_verify` / `npu_cascade_time`.
+**ROWS=4 (full 32-core) DONE — correct at gate_up K.** The channel fix: combine A|W
+into ONE memtile→core fifo per core (`r5_ksplit_gen.py … --combined` + build
+`R5_COMBINED=1`, kernel splits at compile-time offset `KSLICE·64`), so 4 fifos ≤ the
+memtile's 6 out channels. COLS=8 ROWS=4 KSLICE=32 (K=4·32·16=**2048**, 4-way split,
+**32 cores**): differential-verified **C[0]=5120 CORRECT**, rate **~2121 GMAC/s raw
+(~2472 floor-free) ≈ 10× r6** — a numerically-correct full-array cascade GEMM at
+gate_up's real K. NEXT: real gate_up **M/N tiling** (the design does one 4×16 C tile
+per column; gate_up is M=256×N=768/1536 → loop/stream output tiles), op4++ per-group
+scale in the tail, then wire into the expert FFN and re-measure PP/TG. Gen
+`r5_ksplit_gen.py COLS ROWS KSLICE [combined]`; harnesses `npu_cascade_verify` /
+`npu_cascade_time`.
 
 **Prior art: `r5/` already prototyped cascade.** `benchmarks/npu_gemm_tuning/r5/`
 (`r5_cascade.cc`, `r5_2core.mlir`, `r5_4core.mlir`, `r5/README.md`) is a full

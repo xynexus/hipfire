@@ -27,6 +27,10 @@ INF = 9223372036854775807
 COLS = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 ROWS = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 KSLICE = int(sys.argv[3]) if len(sys.argv) > 3 else 16
+# COMBINED: one memtile->core fifo per core carries A|W back-to-back (build the
+# kernel with R5_COMBINED=1 so it splits internally). ROWS fifos <= 6 memtile out
+# channels, so ROWS=4 fits (vs 8 separate A/W fifos). Default: separate A/W fifos.
+COMBINED = len(sys.argv) > 4 and sys.argv[4] in ("1", "combined")
 if COLS > MAXCOL:
     sys.exit(f"COLS={COLS} exceeds {MAXCOL}")
 if not 2 <= ROWS <= 4:
@@ -42,6 +46,22 @@ def core_body(cid, fifo, tile, kern, has_c):
         %c = aie.objectfifo.acquire @fc{fifo}(Produce, 1) : !aie.objectfifosubview<memref<{CW}xi32>>
         %cv = aie.objectfifo.subview.access %c[0] : !aie.objectfifosubview<memref<{CW}xi32>> -> memref<{CW}xi32>''' if has_c else "")
     c_rel = "\n        aie.objectfifo.release @fc" + fifo + "(Produce, 1)" if has_c else ""
+    if COMBINED:
+        call = (f"func.call @{kern}(%xv, %cv) : (memref<{XE}xi8>, memref<{CW}xi32>) -> ()"
+                if has_c else
+                f"func.call @{kern}(%xv) : (memref<{XE}xi8>) -> ()")
+        return f'''    %core_{cid} = aie.core({tile}) {{
+      %z = arith.constant 0 : index
+      %m = arith.constant {INF} : index
+      %o = arith.constant 1 : index
+      scf.for %i = %z to %m step %o {{
+        %x = aie.objectfifo.acquire @fcx{fifo}(Consume, 1) : !aie.objectfifosubview<memref<{XE}xi8>>
+        %xv = aie.objectfifo.subview.access %x[0] : !aie.objectfifosubview<memref<{XE}xi8>> -> memref<{XE}xi8>{c_acq}
+        {call}
+        aie.objectfifo.release @fcx{fifo}(Consume, 1){c_rel}
+      }}
+      aie.end
+    }}'''
     call = (f"func.call @{kern}(%av, %wv, %cv) : (memref<{AW}xi8>, memref<{WW}xi8>, memref<{CW}xi32>) -> ()"
             if has_c else
             f"func.call @{kern}(%av, %wv) : (memref<{AW}xi8>, memref<{WW}xi8>) -> ()")
@@ -84,15 +104,25 @@ for c in range(COLS):
     links = []
     offs = []
     for ri, r in enumerate(rows):
-        out.append(f"    aie.objectfifo @fa{c}_{r}(%mt{c}, {{%t{c}_{r}}}, 2 : i32) : !aie.objectfifo<memref<{AW}xi8>>")
-        out.append(f"    aie.objectfifo @fw{c}_{r}(%mt{c}, {{%t{c}_{r}}}, 2 : i32) : !aie.objectfifo<memref<{WW}xi8>>")
-        links += [f"@fa{c}_{r}", f"@fw{c}_{r}"]
-        offs += [str(ri * XE), str(ri * XE + AW)]
+        if COMBINED:
+            out.append(f"    aie.objectfifo @fcx{c}_{r}(%mt{c}, {{%t{c}_{r}}}, 2 : i32) : !aie.objectfifo<memref<{XE}xi8>>")
+            links.append(f"@fcx{c}_{r}")
+            offs.append(str(ri * XE))
+        else:
+            out.append(f"    aie.objectfifo @fa{c}_{r}(%mt{c}, {{%t{c}_{r}}}, 2 : i32) : !aie.objectfifo<memref<{AW}xi8>>")
+            out.append(f"    aie.objectfifo @fw{c}_{r}(%mt{c}, {{%t{c}_{r}}}, 2 : i32) : !aie.objectfifo<memref<{WW}xi8>>")
+            links += [f"@fa{c}_{r}", f"@fw{c}_{r}"]
+            offs += [str(ri * XE), str(ri * XE + AW)]
     out.append(f"    aie.objectfifo.link [@fx{c}] -> [{', '.join(links)}] ([] [{', '.join(offs)}])")
     out.append(f"    aie.objectfifo @fc{c}_2(%t{c}_2, {{%shim{c}}}, 1 : i32) : !aie.objectfifo<memref<{CW}xi32>>")
-out.append(f'    func.func private @r5_cascade_head(memref<{AW}xi8>, memref<{WW}xi8>) attributes {{link_with = "r5_head.o"}}')
-out.append(f'    func.func private @r5_cascade_mid(memref<{AW}xi8>, memref<{WW}xi8>) attributes {{link_with = "r5_mid.o"}}')
-out.append(f'    func.func private @r5_cascade_tail(memref<{AW}xi8>, memref<{WW}xi8>, memref<{CW}xi32>) attributes {{link_with = "r5_tail.o"}}')
+if COMBINED:
+    out.append(f'    func.func private @r5_cascade_head(memref<{XE}xi8>) attributes {{link_with = "r5_head.o"}}')
+    out.append(f'    func.func private @r5_cascade_mid(memref<{XE}xi8>) attributes {{link_with = "r5_mid.o"}}')
+    out.append(f'    func.func private @r5_cascade_tail(memref<{XE}xi8>, memref<{CW}xi32>) attributes {{link_with = "r5_tail.o"}}')
+else:
+    out.append(f'    func.func private @r5_cascade_head(memref<{AW}xi8>, memref<{WW}xi8>) attributes {{link_with = "r5_head.o"}}')
+    out.append(f'    func.func private @r5_cascade_mid(memref<{AW}xi8>, memref<{WW}xi8>) attributes {{link_with = "r5_mid.o"}}')
+    out.append(f'    func.func private @r5_cascade_tail(memref<{AW}xi8>, memref<{WW}xi8>, memref<{CW}xi32>) attributes {{link_with = "r5_tail.o"}}')
 for c in range(COLS):
     for r in rows:
         kern = "r5_cascade_head" if r == top else ("r5_cascade_tail" if r == 2 else "r5_cascade_mid")
