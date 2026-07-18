@@ -2440,6 +2440,29 @@ pub fn load_model(
                 )
                 .map_err(|e| format!("{e}"))?
             }
+            // The LLaMA arch has no rotated-K (asym) or KVarN attention path —
+            // those need head_dim ∈ {128,256} and a distinct kernel, and llama
+            // head_dim is frequently 64 (e.g. Llama-3.2-1B). Since the global
+            // default kv_mode is now `kvarn`, an unqualified llama load would
+            // otherwise FAIL rather than serve. Fall back to Q8 (with a clear
+            // note) so llama stays servable under the kvarn default; an operator
+            // who explicitly wants FP32 still gets it via the fp32 arm.
+            "kvarn" | "kvarn2" | "kvarn4" | "kvarn8" | "asym2" | "asym3" | "asym4" | "turbo"
+            | "turbo2" | "turbo3" | "turbo4" => {
+                eprintln!(
+                    "  KV cache: Q8 (llama has no kvarn/asym path at head_dim={}; \
+                     '{kv_mode}' → Q8)",
+                    config.head_dim
+                );
+                kv::KvCache::new_gpu_q8(
+                    gpu,
+                    config.n_layers,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    max_seq,
+                )
+                .map_err(|e| format!("{e}"))?
+            }
             other => {
                 return Err(format!(
                     "kv_mode '{other}' is not supported for the LLaMA arch \

@@ -92,6 +92,10 @@ Per-quant overrides of an arch capability (admission consults these before green
 | 7 | oq4+ | prefill | 🟡 | Qwen2 OQ4+ W4A8 loads via oq4_to_oq8_combined into the shared int8-activation route; shares the validated oq4/oq8 loader arms, calibrated quality pending |
 | 7 | oq8 | prefill | 🟡 | Qwen2 OQ8 W8A8 loads via oq8_combined into the shared iu8 GEMM route; GPU-validated coherent (Qwen2-0.5B), eval-battery admission pending |
 | 7 | oq8+ | prefill | 🟡 | Qwen2 OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending |
+| 0 | oq4 | prefill | 🟡 | LLaMA OQ4 W4A4 loads via oq4_arch_load; K must be % 256 else the linear stays BF16; quality admission pending |
+| 0 | oq4+ | prefill | 🟡 | LLaMA OQ4+ W4A8 loads via oq4_to_oq8_combined into the shared int8-activation route; quality admission pending |
+| 0 | oq8 | prefill | 🟡 | LLaMA OQ8 W8A8 loads via oq8_combined into the shared iu8 GEMM route; GPU-validated coherent (Llama-3.2-1B), eval-battery admission pending |
+| 0 | oq8+ | prefill | 🟡 | LLaMA OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending |
 
 ### Diffusion capability matrix (generated)
 

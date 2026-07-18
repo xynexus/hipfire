@@ -1859,6 +1859,53 @@ fn load_weight_tensor(
                 awq_scale: None,
             })
         }
+        // Opus int8-activation family — the shared helpers repack into the
+        // arch-combined `Oq8G256` device layout the iu8 GEMV/GEMM consume:
+        //   35 = OQ8 W8A8, 33 = OQ+ W4A8 (int4 on disk → int8 combined),
+        //   36 = OQ+ compact (mixed W4A8).
+        // Only OQ4 W4A4 (below) was wired into this shared loader, so every
+        // simple-AR family that loads through `load_weights_hfq` (llama, etc.)
+        // panicked on qt 35/33/36 despite the generic dtype-dispatched kernels
+        // already supporting them. Mirrors `TransformerLoader::load_weight`.
+        35 => {
+            let bytes = oq8_combined(data, m, k);
+            let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Oq8G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        33 => {
+            let bytes = oq4_to_oq8_combined(data, m, k);
+            let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Oq8G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        36 => {
+            let bytes = oqplus_compact_to_oq8_combined(data, m, k);
+            let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::Oq8G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         // Oq4G256 (34, canonical) / Oq4G256ArchPacked (37, pre-packed) — Opus Quant
         // symmetric W4 (int4 per-256-group, FWHT-256 rotated). The shared
         // `oq4_arch_load` repacks the canonical form into the arch combined device

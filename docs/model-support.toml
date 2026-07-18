@@ -342,6 +342,40 @@ feature = "prefill"
 support = "partial"
 note = "Qwen2 OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending"
 
+# LLaMA (arch 0) OQ int8-activation: the shared load_weights_hfq gained the OQ8/OQ+
+# arms (33/35/36) it was missing — it previously only wired OQ4 (34/37), so llama
+# and every family loading through it panicked on qt 35. GPU-validated coherent on
+# halo (Llama-3.2-1B oq8 -> "Paris"). NB: llama head_dim is often 64, which has no
+# kvarn/asym KV path, so the global kvarn default falls back to Q8 for llama.
+
+[[gate]]
+arch = 0
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "LLaMA OQ4 W4A4 loads via oq4_arch_load; K must be % 256 else the linear stays BF16; quality admission pending"
+
+[[gate]]
+arch = 0
+quant = "oq4+"
+feature = "prefill"
+support = "partial"
+note = "LLaMA OQ4+ W4A8 loads via oq4_to_oq8_combined into the shared int8-activation route; quality admission pending"
+
+[[gate]]
+arch = 0
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "LLaMA OQ8 W8A8 loads via oq8_combined into the shared iu8 GEMM route; GPU-validated coherent (Llama-3.2-1B), eval-battery admission pending"
+
+[[gate]]
+arch = 0
+quant = "oq8+"
+feature = "prefill"
+support = "partial"
+note = "LLaMA OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending"
+
 # ── Diffusion (image/video denoiser) capability matrix ─────────────────────────
 # A SEPARATE matrix from the [[arch]] rows above: diffusion families are graded on
 # the image-generation pipeline spine (text-encoder → denoise → sampler → VAE →
