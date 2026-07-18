@@ -126,8 +126,23 @@ VALIDATED via the HF reference on duat (transformers 5.8, /home/sadara/.venv):
 Debug harness kept (behind env flags): HIPFIRE_GEMMA4_DEBUG_NORMS (per-layer |x| + token
 log), HIPFIRE_GEMMA4_DUMP_HS + _POS (per-layer hidden dump for the HF cosine diff). The
 duat reference scripts: /tmp/e2b_ref.py, e2b_hs.py, cmp.py, emb.py.
-Remaining follow-ups: kvarn-on-E2B (shared-layer attend-only; fp32 works now) + the
-lowered superop path (reference path is forced for PLE/KV-share).
+Follow-ups:
+- kvarn-on-E2B: DONE (c8c8e640b) — producer global layers kvarn write+attend, shared
+  globals attend-read the producer kvarn cache via attention_flash_kvarn_batched_masked
+  (read-only). E2B HIPFIRE_KV_MODE=kvarn coherent (cold/west/blue). Validates kvarn-512
+  in real serving.
+- lowered superop path: OPEN, LARGE + LOW ROI. `SuperOpKind::Ple` is an UNIMPLEMENTED
+  stub (only in the exhaustiveness list ~forward.rs:1545) — no run_ple handler, no PLE op
+  emission in lower_dense_forward (~1215; per layer it emits Attend/Proj/Act/ResidualGemv/
+  Scale only), no embed-precompute in forward_step_lowered (~1451), no KV-share in the
+  fused attend (lowered_attention_flavor/run_attend). Mirroring needs: (1) emit a PLE op
+  per layer + the embed-precompute; (2) implement run_ple; (3) thread KV-share (skip
+  write / attend-read producer) into the fused Attend flavor+run; (4) extend
+  dense_reference_lowered_parity for PLE weights + validate ref==lowered. It's
+  all-or-nothing for E2B (needs both PLE + KV-share). The reference path (forced for
+  PLE/KV-share models via forward_step) serves E2B correctly at ~30 tok/s TODAY, so this
+  is a production-speed optimization for a small base model — recommend a dedicated
+  session, not a marathon-tail rush.
 
 ## Coherence-bug isolation (2026-07-18 — SUPERSEDED by the resolution above)
 Symptom: E2B loads + fluent; correct short pattern completion (`1..7`→`8 9 10 11`) but
