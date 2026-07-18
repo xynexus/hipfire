@@ -20,7 +20,7 @@
 | `gpu_slab_load` | `enum(auto|off|on)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | GPU slab loading policy for model weights. |
 | `host` | `string` | optional | `127.0.0.1` | `global`, `runtime` | `static` | `none` | Bind host for the OpenAI-compatible HTTP server. Defaults to loopback; set to 0.0.0.0 to expose on all interfaces. |
 | `kv_adaptive` | `enum(off|auto)` | optional | `off` | `global`, `model`, `runtime` | `load_time` | `none` | Adaptive KV-cache policy. |
-| `kv_cache` | `enum(auto|q8|asym2|asym3|asym4|kvarn2|kvarn|kvarn4|kvarn8)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | KV-cache precision and memory policy. |
+| `kv_cache` | `enum(auto|q8|asym2|asym3|asym4|kvarn2|kvarn|kvarn4|kvarn8)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | KV-cache precision and memory policy. NOTE: asym2/asym3/asym4 are DEPRECATED — single-tier KVarN strictly dominates them (better PPL+KLD at iso-memory, both short and long ctx; see docs/plans/2026-07-12-hot-cold-hierarchical-kv-implementation.md and NEXT-STEPS Phase D). Prefer kvarn. asym is retained only for back-compat and because TriAttention/CASK eviction scoring reads the asym format. |
 | `max_seq` | `u32` | optional | `8192` | `global`, `model`, `runtime` | `load_time` | `none` | Maximum context/KV-cache capacity allocated at model load. |
 | `max_tokens` | `u32` | optional | `512` | `global`, `model`, `request` | `request_only` | `none` | Default maximum number of generated tokens per request. |
 | `mmq_screen` | `enum(auto|off|on)` | optional | `auto` | `global`, `model`, `runtime` | `load_time` | `none` | MMQ safety screening mode. |
