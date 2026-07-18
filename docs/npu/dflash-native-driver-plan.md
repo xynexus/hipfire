@@ -330,6 +330,74 @@ Caveat to confirm before leaning on it: 15.14 GB/s weight-only plus 13.1 MB of C
 ~16.9 GB/s aggregate, at or slightly **above** the previously documented 13–16 GB/s band.
 Also `burst_length` was left at 0 throughout, so these figures are likely ~4% pessimistic.
 
+### CONFIRMED: npu1 is TOPOLOGY-limited, not bandwidth-limited (~10.3 per route, ~13 aggregate)
+
+`benchmarks/npu_gemm_tuning/r135/` — the deciding test for the r133 dual-topology lead.
+All feed-only, WB=8192, burst 64, sync=1, 5 passes each.
+
+| config | topology | link | DDR read | delivered | median (spread) | GB/s on DDR |
+|---|---|---|---|---|---|---|
+| vert ×4 | single route | bcast, join 2→1 | 8 MiB | 32 MiB | 820.8 µs (2.2%) | 10.22 |
+| vert ×4 | single route | **distribute** | 8 MiB | 8 MiB | 805.5 µs (2.9%) | **10.41** |
+| horiz ×4 | single route | bcast | 8 MiB | 32 MiB | 809.6 µs (5.6%) | 10.36 |
+| horiz ×4 | single route | **distribute** | 8 MiB | 8 MiB | 808.6 µs (5.4%) | **10.37** |
+| vert+horiz | **two routes** | bcast/bcast | 8 MiB | 32 MiB | 639.1 µs (2.6%) | **13.13** |
+| vert+horiz | **two routes** | **bcast/distribute** | 8 MiB | 20 MiB | 664.6 µs (1.2%) | **12.62** |
+| vert+horiz | **two routes** | **distribute/bcast** | 8 MiB | 20 MiB | 673.2 µs (1.4%) | **12.46** |
+| vert+horiz | two routes | dist/dist | — | — | **BUILD FAIL** | — |
+
+**The 13.22 GB/s figure was computed on DDR read bytes, not delivered bytes** — the
+broadcast-inflation worry is dead. r133's *vertical* fifo is also a 1-producer/4-consumer
+broadcast, and r133 holds DDR constant across topologies by halving `NBLK` per route
+(`r133_gen.py:89-93`); both rows are 8 MiB DDR / 32 MiB delivered.
+
+**Distribute carries the lever.** Matched broadcast-vs-distribute pairs are null on DDR
+bytes: vertical +1.2%, horizontal +0.1%, dual balanced −2.3% — all inside the 3.4% floor.
+Distribute pulls 4× the DDR bytes at the same rate.
+
+**Mechanism is concurrency of orthogonal routes, NOT that horizontal is faster** — horizontal
+alone (10.36) ≈ vertical alone (10.29). Per-route wall ~10.3 GB/s; two concurrent routes
+reach ~12.6–13.1 GB/s aggregate. This reframes the eight prior nulls: every one of them
+varied a parameter *within* a single routing topology, which is why they were all null.
+
+**Hard limit:** both routes distribute is unbuildable —
+`'aie.tile' op number of output DMA channel exceeded!` (memtile needs 4+4 MM2S, cap 6).
+**A dual-route design must keep one route broadcast.**
+
+**Trap:** a naive `b/d` pairing measures 11.49 GB/s — that is **load imbalance, not a
+distribute penalty**. The routes couple 1:1 per core iteration, so a distribute route pulls
+4× its partner's bytes and the broadcast route drains early. `VREP=4` rebalances; a
+two-phase model (13.1 shared, then 10.4 solo) predicts 737 µs vs 727 µs measured.
+
+Corrections to earlier text: r133 cannot have run at WB=16384 (TOPO=2 fails L1 allocation);
+the real shape is WB=8192/NBLK=256. r133's join asymmetry was a real confound — tested,
+null (10.43 vs 10.29). The 32 MiB points carry 12–46% spread and must not be read as a size
+trend.
+
+**NOT measured:** compute (all feed-only, C[0]=0, no correctness meaning); composition with
+r134's sync=0 flush removal (every r135 run is sync=1); concurrent activation/C traffic;
+real GEMM shapes; ~100 MB weight scale; whether >2 routes or packet-switched routing lifts
+the ~13 GB/s aggregate.
+
+> **Composition is the open question.** At 8 MB/sync=1 both levers measure ~+25–29%
+> independently (flush removal 10.19→12.55; topology 10.22→13.13). Whether they stack is
+> **unmeasured and must not be assumed** — if they do, the result would exceed the
+> documented 13–16 GB/s aggregate band and needs independent confirmation before use.
+
+### ⚠ THE CORRECTNESS GATE USED THROUGHOUT IS STRUCTURALLY WEAK
+
+Every validation in this effort checked **`C[0]` — a single element** (2048 / 1024 / 3072 /
+17408). That is blind to whole classes of error: wrong per-column slice offsets, transposed
+strides, dropped tail blocks — anything affecting elements 1..N but not element 0. The
+results are not believed wrong, but **the evidence is thinner than "correctness exact"
+implies.**
+
+This matters most for exactly the dual-route/distribute designs above, where each core reads
+a different quarter of a shared buffer via compile-time offsets — an indexing bug there would
+hide perfectly behind `C[0]`. **Minimum fix before building the next variant: check the last
+C element plus a canary past the buffer end.** Strengthen the gate *before* the next kernel,
+not after.
+
 ### The surviving lever has a hardware mechanism: the BD iteration dimension
 
 Our fully-lowered BD leaves **two of four levels of hardware pointer auto-advance idle**:
