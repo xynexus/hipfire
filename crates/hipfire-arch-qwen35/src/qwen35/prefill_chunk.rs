@@ -2775,48 +2775,13 @@ pub(crate) fn forward_prefill_chunk(
                     // decode siblings already do (forward_scratch_layers:13194),
                     // so the captured/eager batched prefill honours FP32/Q4 state
                     // instead of forcing the Q8 kernel onto non-Q8 buffers.
-                    match dn_state.quant {
-                        StateQuant::FP32 => gpu.gated_delta_net_f32_batch_seq(
-                            &pbs.dn_q_batch,
-                            &pbs.dn_k_batch,
-                            &pbs.dn_v_batch,
-                            &pbs.dn_alpha_batch,
-                            &pbs.dn_beta_batch,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                        )?,
-                        StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
-                            &pbs.dn_q_batch,
-                            &pbs.dn_k_batch,
-                            &pbs.dn_v_batch,
-                            &pbs.dn_alpha_batch,
-                            &pbs.dn_beta_batch,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                            position_at_row(0) as u32,
-                            delta_layer_idx as u32,
-                        )?,
-                        StateQuant::Q4 => gpu.gated_delta_net_q4(
-                            &pbs.dn_q_batch,
-                            &pbs.dn_k_batch,
-                            &pbs.dn_v_batch,
-                            &pbs.dn_alpha_batch,
-                            &pbs.dn_beta_batch,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                        )?,
-                    }
+                    // #18: the GDN recurrence for this layer already ran above and
+                    // advanced `dn_state.s_matrices[delta_layer_idx]` IN PLACE. The
+                    // former re-dispatch here ran the same recurrence a SECOND time
+                    // over the same tokens, double-advancing the state and clobbering
+                    // `dn_attn_out_batch` with a value computed from the doubly-
+                    // advanced state. The tape copy above must stay; the re-dispatch
+                    // must not.
                 }
 
                 // Batched gated output norm.
@@ -5958,48 +5923,13 @@ pub(crate) fn forward_prefill_chunk(
                         0,
                         n * v_row_bytes,
                     )?;
-                    match dn_state.quant {
-                        StateQuant::FP32 => gpu.gated_delta_net_f32_batch_seq(
-                            &pbs.dn_q_batch,
-                            &pbs.dn_k_batch,
-                            &pbs.dn_v_batch,
-                            &pbs.dn_alpha_batch,
-                            &pbs.dn_beta_batch,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                        )?,
-                        StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
-                            &pbs.dn_q_batch,
-                            &pbs.dn_k_batch,
-                            &pbs.dn_v_batch,
-                            &pbs.dn_alpha_batch,
-                            &pbs.dn_beta_batch,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                            position_at_row(0) as u32,
-                            delta_layer_idx as u32,
-                        )?,
-                        StateQuant::Q4 => gpu.gated_delta_net_q4(
-                            &pbs.dn_q_batch,
-                            &pbs.dn_k_batch,
-                            &pbs.dn_v_batch,
-                            &pbs.dn_alpha_batch,
-                            &pbs.dn_beta_batch,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                        )?,
-                    }
+                    // #18: the GDN recurrence for this layer already ran above and
+                    // advanced `dn_state.s_matrices[delta_layer_idx]` IN PLACE. The
+                    // former re-dispatch here ran the same recurrence a SECOND time
+                    // over the same tokens, double-advancing the state and clobbering
+                    // `dn_attn_out_batch` with a value computed from the doubly-
+                    // advanced state. The tape copy above must stay; the re-dispatch
+                    // must not.
                     // DIAG: dump GDN attention output at layer 0
                     if layer_idx == 0 {
                         dump_hidden_localize(
