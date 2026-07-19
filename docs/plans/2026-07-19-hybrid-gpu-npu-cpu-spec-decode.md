@@ -179,6 +179,54 @@ supplied by DFlash. No DDTree.
 and committed output is byte-identical to `--ar-baseline` at temperature 0 across
 ≥2 drafters (the losslessness gate).
 
+#### 1a. Cross-block draft pipelining — start block N+1 before N finishes decoding
+
+**Lossless by construction, and DO NOT SCHEDULE IT BEFORE PHASE 0.**
+
+The idea: while the GPU decodes/verifies block N, have the NPU start drafting
+N+1. Correctness is not at risk — the target verifies everything, so a wrong
+speculative draft costs work, never output.
+
+**Why it cannot precede Phase 0 — the `max()` is the whole argument.** Overlap
+gives `T_step = max(T_verify, T_draft)`. Hiding the draft behind the verify only
+helps when the draft is not the long pole, and today it is:
+
+| | serial | overlapped | gain |
+|---|---|---|---|
+| today (726 ms draft / 155 ms verify) | 881 ms | 726 ms | −18% |
+| post-Phase-0 (~230 / 155) | 385 ms | **230 ms** | **−40%** |
+
+The NPU is not idle during verify today; it *is* the bottleneck. Overlapping a
+bottleneck with a shorter stage buys nothing. This is a 1.4–1.7× win that
+materialises only once the draft is within the same order of magnitude as the
+verify — i.e. gated on exactly the same work as everything else in this plan.
+
+**Two dependencies must be speculated, not one.** Block N covers `[t, t+B)`;
+after verify, `accept_len + 1` tokens commit and N+1 starts at
+`t + accept_len + 1`. So drafting N+1 early means guessing **`accept_len`
+itself**, not just token values — and DFlash conditions on `target_hidden`, which
+the *target* produces during verify.
+
+**Hit rate is therefore governed by τ, and τ is currently low.** Measured
+τ ≈ 1.9–2.2 at B = 16, i.e. ~2 of 15 drafted tokens accepted. A speculative N+1
+drafted against "all of N accepted" is essentially always wrong; drafted against
+"≈2 accepted" it is right perhaps a fifth of the time. **Wasted-draft rate is
+`1 − P(guessed accept_len == actual)` — measure it before assuming the overlap
+pays.**
+
+**The more promising variant:** condition N+1 on the drafter's *own* block-N
+hidden states instead of waiting for the target's. Those exist the moment N's
+draft finishes, so the dependency on verify breaks cleanly and no `accept_len`
+guess is needed for the conditioning (only for the start offset). Quality is
+lower — self-conditioning rather than the authoritative hidden state — but it
+composes with DDTree, since hedging across accept points is structurally the same
+as hedging across tokens. Prefer this form if 1a is attempted.
+
+**Gate 1a.** Overlapped `T_step` beats serial by ≥20% on a real target, with the
+losslessness gate unchanged, AND the measured wasted-draft rate reported
+alongside — an overlap that discards 80% of its drafts is a power cost, not a
+speedup.
+
 ### Phase 2 — CPU DDTree, forked DSpark
 
 Clone DSpark state at forks, bounded node budget, pruning, packed GPU tree verify
