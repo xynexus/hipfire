@@ -19,15 +19,30 @@ NPU DFlash block wall: **726 ms** (native driver,
 `crates/hipfire-xdna/examples/dflash_body_native.rs`). Verify budgets: 9B 57 ms,
 27B 155 ms, 31B 345 ms. Attribution, each term measured with the kernel pinned:
 
-| term | now | available |
+| term | original | NOW (measured) |
 |---|---|---|
-| GEMM (weight-bandwidth-bound) | 317 ms | **123.7 ms MEASURED** (98bbce9b6, 2.57×) |
-| attention (single-core) | 236 ms | ~30 ms if multi-cored. **UNTOUCHED** |
-| host glue (quant/bf16/packing) | 143 ms | Rust-side, tractable |
-| primitives (norm/rope/swiglu) | 24 ms | — |
+| GEMM (weight-bandwidth-bound) | 317 ms | **139.5 ms** (98bbce9b6, r14 W4A8) |
+| attention | 236 ms | **61.4 ms** (326971468, 4-core, 3.83×) |
+| host glue (quant/bf16/packing) | 143 ms | **67.9 ms** |
+| primitives (norm/rope/swiglu) | 24 ms | 22.3 ms |
+| **warm block wall** | **726 ms** | **291.1 ms** |
 
-**Measured after item 1b: warm block 734.5 → 480.8 ms; attention (235.5 ms) is now
-the largest single term.** `dflash_attn_all` loops all 8 kv-heads on ONE core.
+**291.1 ms FITS the 31B budget (345 ms) with margin. Still 1.88× over 27B
+(155 ms)**, which is Phase 0's stated gate — so the gate is not met, but the
+architecture is viable end-to-end on a 31B-class target today.
+
+**Items 1 and 2 are DONE.** Remaining budget gap to 27B is ~136 ms, and the two
+largest remaining terms are GEMM (139.5) and host glue (67.9).
+
+**Of the GEMM's 139.5 ms, ~62 ms is hardware-context contention, not bandwidth** —
+npu1 admits 6 contexts, the r14 array pins one, leaving 4 LRU slots for 8 primitive
+kernels → 36 context misses/block. Isolated probes hit 0.80–0.84 ms/dispatch vs
+1.24–3.30 ms in-body. ~60 ms is the genuine floor (600 MiB packed W ÷ 10.4 GB/s;
+`M_TILE=16` makes the rows=32 GEMMs stream weights twice). **Context contention is
+the single largest recoverable term left.**
+
+8-core attention is BLOCKED by the shim DMA budget (~2 MM2S/column; each worker
+needs its own Q and KV stream) and would buy only ~30 ms — not the next move.
 
 **The "~32–42 ms" projection this brief originally carried was WRONG** — it came
 from an aggregate bandwidth figure (15.14 GB/s) mistaken for the weight path
@@ -43,7 +58,7 @@ cost does not. A 9B prototype measures a permanently-negative result.
 
 ## Tasks, in order
 
-1. **Wire the multi-core W4A8 GEMM into the body.** Needs (a) an **oq4 DFlash
+1. ~~**Wire the multi-core W4A8 GEMM into the body.**~~ **DONE** (98bbce9b6). Needs (a) an **oq4 DFlash
    sidecar** — only OQ8 exists. `dflash_convert` has `--oq4.<bits>`; use **pure W4
    (qt=33/34)**, since qt=36 mixed expands to dense int8 at upload and buys no
    bandwidth. (b) a **host-side stripe packer** matching r14's layout. Kernel
@@ -51,8 +66,8 @@ cost does not. A 9B prototype measures a permanently-negative result.
    (recommended) and `r14_1x4x64_nb128`.
    **Trap:** `NpuGemmMp::load_cached` REJECTS an `r14_…` basename — its `_r{N}`
    guard matches the `r14` token itself. Use `load_with_tile`.
-2. **Multi-core the attention kernel.**
-3. **Attack host glue.**
+2. ~~**Multi-core the attention kernel.**~~ **DONE** (326971468, 4-core).
+3. **Attack host glue** (67.9 ms) **and the ~62 ms of GEMM context contention** — the two remaining levers to reach the 27B budget.
 4. **Re-measure the block wall after each.** Report cold and warm separately.
 5. **Then re-run Phase F** — acceptance rate across f16 / oq8 / oq4.25+ / mq4
    drafters. Valid for the first time (see traps).
