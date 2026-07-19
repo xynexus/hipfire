@@ -950,19 +950,38 @@ fn dflash_verify_frame_rollback_replay_from_env() -> bool {
     )
 }
 
-/// `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=0` opts out of the conservative
-/// serial-source tape rollback path. Default-on: capture the committed prefix
-/// through the serial target path, then commit DN state through token-major
-/// GDN tape replay instead of trusting the serial/full-prefill DN result
-/// directly.
+/// `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=1` opts IN to the serial-source tape
+/// rollback path: capture the committed prefix through the serial target path,
+/// then commit DN state through token-major GDN tape replay instead of trusting
+/// the serial/full-prefill DN result directly.
+///
+/// **Default-off as of 2026-07-19 — this path breaks spec-decode losslessness
+/// (bug #21).** It was default-on as a "conservative" DN-commit, but the tape it
+/// replays is the *batched verify* tape over the drafted block, so the hidden
+/// states it feeds the replay depend on the drafted tokens. Committed output
+/// therefore followed the drafter. Measured on qwen3.5-9b-mq4 + the engine
+/// prompt, `HIPFIRE_DFLASH_ROLLBACK_COMPARE=1` at the most trivial possible
+/// rollback (`pos=18 accepted=0 replay_steps=1` — zero accepted tokens, so no
+/// speculative logic is involved at all):
+///
+/// * `serial-tape-state-compare` → **match** (the DN S/conv state is fine), but
+/// * `input-compare` → mismatch `wo_residual_in[0]`, mean_abs 1.30e-2, max_abs 6.59
+/// * `x-in-compare`  → mismatch `x_in[1]`, mean_abs 4.75e-2
+/// * `wo-delta-compare` → 6 of 4096 words, max_abs 9.3e-10 (pure rounding, fine)
+///
+/// So the replay's *inputs* are wrong, not its arithmetic or the DN state it
+/// produces. Turning it off makes all four drafters (f16, npu.oq8, npu.oq4.25+,
+/// mq4) commit byte-identical tokens matching `--ar-baseline` while genuinely
+/// differing in acceptance (30/31/33/30 cycles, τ 2.200/2.097/1.879/2.200), and
+/// is also ~30% FASTER (≈6.1 vs ≈4.5 tok/s) since it skips the replay entirely.
 fn dflash_serial_tape_rollback_replay_from_env() -> bool {
-    !matches!(
-        // HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE: default-on conservative
-        // serial-source GDN tape rollback; set 0/false/off/no to opt out.
+    matches!(
+        // HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE: default-OFF; set 1/true/on/yes to
+        // opt in to the (lossy) serial-source GDN tape rollback.
         std::env::var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE")
             .ok()
             .as_deref(),
-        Some("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+        Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
     )
 }
 

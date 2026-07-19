@@ -532,12 +532,18 @@ fn main() {
     // Reverting the seed to the counter reproduces the old divergence, so the
     // causation is confirmed rather than inferred.
     //
-    // Still open, and NOT a drafter bleed:
-    //  #16 tape-on CORRUPTS the target's verify logits outright — with a tape
-    //      attached the first committed token already differs from AR
-    //      (bonus=271 vs AR's 198 at pos=19, accepted=0 in both, so no
-    //      speculative logic is involved). tau collapses 4.556 -> 0.000.
-    //      --no-tape is the honest configuration until this lands.
+    // #21 IS FIXED (2026-07-19), and the old #16 note below is STALE. Tape-on
+    // no longer collapses tau (measured tau=2.429 with the tape attached); the
+    // residual tape-on divergence was the *serial-source tape rollback* path
+    // (HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE), which was default-on and is now
+    // default-off. It replayed the BATCHED VERIFY tape over the drafted block,
+    // so the hidden states feeding the replay depended on the drafted tokens
+    // and the committed output followed the drafter. See the rationale on
+    // `dflash_serial_tape_rollback_replay_from_env` in hipfire-arch-qwen35's
+    // speculative.rs for the per-buffer evidence. With it off, tape-on is
+    // byte-identical to --ar-baseline for all four drafters and ~30% faster.
+    //
+    // Still open:
     //  * A residual DFlash-vs-AR difference remains on SOME prompts and is
     //    BLOCK-SIZE dependent, not drafter dependent (one prompt matched AR
     //    exactly at --block-size 4 but not at 2 or the default). That is
