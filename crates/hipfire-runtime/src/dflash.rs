@@ -384,6 +384,84 @@ fn hfq_weight(
                 awq_scale: None,
             })
         }
+        45 | 46 => {
+            // Plain-basis (non-rotated) NPU sidecar formats, dequantized at
+            // load so the GPU spec-decode path can run a drafter that was
+            // built for the AIE2 projection kernels. There is no GPU kernel for
+            // these layouts (they carry no FWHT rotation), so this is a
+            // measurement path: the *weight values* are exactly the quantized
+            // ones, only the arithmetic differs. Decode is staged through f32
+            // and lands in F16 — see the dtype note at the end of this arm.
+            // Layouts are the on-disk
+            // contract documented in hipfire-quantize/src/bin/dflash_convert.rs
+            // (`Oq8Plain = 45`, `Oq4MixedPlain = 46`).
+            const GROUP: usize = 256;
+            let n = m * k;
+            let n_blocks = n.div_ceil(GROUP);
+            let block_bytes = data.len() / n_blocks.max(1);
+            let mut f32_data = vec![0.0f32; n_blocks * GROUP];
+            if info.quant_type == 45 {
+                assert_eq!(
+                    block_bytes,
+                    2 + GROUP,
+                    "dflash {name}: oq8-plain block must be 258 B, got {block_bytes}"
+                );
+                for b in 0..n_blocks {
+                    let off = b * block_bytes;
+                    let scale =
+                        crate::quant::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+                    for i in 0..GROUP {
+                        f32_data[b * GROUP + i] = scale * (data[off + 2 + i] as i8) as f32;
+                    }
+                }
+            } else {
+                // block = [f16 scale][128 nibbles][n_out × (u8 idx, i8 val)]
+                assert!(
+                    block_bytes >= 132 && (block_bytes - 130) % 2 == 0,
+                    "dflash {name}: oq4-mixed-plain block length {block_bytes} is not 130 + 2·n_out"
+                );
+                let n_out = (block_bytes - 130) / 2;
+                for b in 0..n_blocks {
+                    let off = b * block_bytes;
+                    let scale =
+                        crate::quant::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+                    let grp = &mut f32_data[b * GROUP..b * GROUP + GROUP];
+                    // int4 bulk, nibbles sign-extended from 4 bits.
+                    for i in 0..128 {
+                        let byte = data[off + 2 + i];
+                        grp[2 * i] = scale * (((byte & 0xf) as i8) << 4 >> 4) as f32;
+                        grp[2 * i + 1] = scale * (((byte >> 4) as i8) << 4 >> 4) as f32;
+                    }
+                    // sparse int8 overlay wins wherever present.
+                    let tbl = off + 130;
+                    for s in 0..n_out {
+                        let pos = data[tbl + 2 * s] as usize;
+                        grp[pos] = scale * (data[tbl + 2 * s + 1] as i8) as f32;
+                    }
+                }
+            }
+            f32_data.truncate(n);
+            // Land in F16, not F32: the F32 draft dispatch goes through
+            // gemm_f32_batched, which has a known batch>1 transpose bug (the
+            // pure-F32 drafter scores tau=0 for the same reason). F16 is the
+            // golden WMMA path, and f16 round-trip is ~-42 dB of headroom
+            // below the int8 quantization error being measured here, so it
+            // does not perturb the comparison.
+            let f16_bytes: Vec<u8> = f32_data
+                .iter()
+                .flat_map(|&v| crate::quant::f32_to_f16(v).to_le_bytes())
+                .collect();
+            let buf = gpu.upload_raw(&f16_bytes, &[n])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F16,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
     }?;
     // AWQ sidecar attachment — same pattern as hfq.rs::load_weight_tensor
