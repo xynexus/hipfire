@@ -355,6 +355,68 @@ committed.
 **Phase F is now the DECIDING experiment for the weight format, not a reporting
 step.** See the quant results below.
 
+## 2a-ROOT. The verify forward is NONDETERMINISTIC (2026-07-19) — read this first
+
+**This supersedes the framing in §2a below.** §2a described two target-path defects
+(#16, #17). #17 was real and is fixed. **#16's premise was wrong**, and the actual
+root cause is worse:
+
+**The DFlash verify forward produces different outputs from bit-identical inputs.**
+
+```
+tape-on   run1 b41c5e03280f   run2 ad7656b40d07   run3 b41c5e03280f
+no-tape   run1 02e621bd56b5   run2 02e621bd56b5
+ar             02e621bd56b5
+```
+
+Tape-on is not a fixed wrong answer — it is a **coin flip**. Consequently **any
+bisection comparing single-run md5s is measuring noise**, including several
+"eliminations" recorded in §2a and on task #16. Treat them as suggestive, not
+established; re-establish with repeats anything a fix depends on. (The
+`coherence-gate-dflash.sh` gate also compares single runs and is not a valid
+signal here.)
+
+**Evidence.** Per-layer hidden-state hashes inside the verify forward, with
+`device_synchronize` before each read: `dn_state` entering a cycle is
+**bit-identical** across runs, and the prompt KV region is **bit-identical** — yet
+verify-written KV rows and per-layer hidden state **differ every run**. The first
+divergent layer varies (3, 11, 23) and is **always a FullAttention layer**; layers
+0–2 (LinearAttention) are always stable. Present under `--no-tape` too.
+
+**Localized to an intra-kernel race in `dispatch_attend`** (batched FullAttention).
+At one cycle, KV rows for layers 3 and 7 were byte-stable across runs while layer
+3's *hidden output* still diverged — the kernel returns different results from
+identical stored K/V. Survives flash and non-flash tiers, so the shared suspects
+are per-position causal masking via `pbs.positions` / `s.pos_buf` (async-upload vs
+kernel ordering) or the `flash_partials` scratch.
+
+Ruled out by direct experiment: uninitialized memory (`HIPFIRE_ZERO_ALLOC=1`),
+graph capture, flash split-K, KV-store→attend ordering (explicit
+`device_synchronize` between them), dn_state/rollback replay, and allocation
+layout (`GdnTape::new_for_config` is called unconditionally even under
+`--no-tape`).
+
+### The consequence that matters
+
+**`--no-tape` losslessness is ACCIDENTAL, not structural.** With no tape, rollback
+takes `force_serial_rollback` → serial `forward_scratch`, which deterministically
+rewrites `dn_state` and the committed KV rows each cycle, **scrubbing** the racy
+values before they can be read. The tape path leaves them in place, so the
+nondeterminism reaches the next cycle's logits.
+
+So we do not have a lossless verify that one bug breaks. We have a **racy verify
+that one code path happens to mask**. #17's fix is principled and correct, but its
+validation was measured on the masked path.
+
+**Next step:** minimal isolated repro — batched attention, `n>1`, fixed synthetic
+K/V/Q, hash across runs. No model, no tape, no rollback. Tracked as **#18**;
+**#16 is superseded** and most likely closes as a duplicate. A separate hazard,
+**#19**, was found alongside: `prefill_chunk.rs:4716` and `:6985` hardcode
+`is_boundary: false` in `KvTierInputs` while serial decode honours
+`kv_cache.layer_is_boundary[layer_idx]` — harmless on this all-Q8 model
+(`boundary_layers=0`), but a batched-vs-serial mismatch on any model with
+boundary layers.
+
 ## 2a. CORRECTNESS: two target-path defects make output drafter-dependent (2026-07-19)
 
 Audited against the reference (`/srv/hipfire/references/dflash/dflash/model.py::dflash_generate`)
