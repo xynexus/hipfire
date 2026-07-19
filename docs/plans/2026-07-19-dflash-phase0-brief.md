@@ -112,10 +112,20 @@ i.e. **0.97 GFLOP/s across 4 cores (~0.1% of bf16 core peak)**, and the traffic 
 ~458 KB/dispatch = 35 MB/s against a ~10 GB/s path. `dflash_attention_sc_bf16.cc`
 is vectorised at LANES=16 but computes each score with 8 `aie::mul` + 8
 `aie::add` + a full `aie::reduce_add` per (q,k) pair — ~2400 core cycles per
-128-length dot product. It uses no `aie::mmul`. **The lever is the inner loop
-(accumulator-tiled `mmul`, hoisting the reduce), not the dispatch count, not the
-build shape.** A 10× there would take attention from 61.5 ms to ~6 ms *and* the
-retiling needed for `mmul` is the same restructuring that lifts the tot≤55 cap.
+128-length dot product. It uses no `aie::mmul`.
+
+**⚠ THE NEXT SENTENCE WAS WRONG — kept because the mistake is instructive.**
+This brief asserted: *"The lever is the inner loop (accumulator-tiled `mmul`,
+hoisting the reduce)."* The rewrite (task #27, `75dafc5bc`) measured it:
+**putting BOTH GEMMs on `aie::mmul<4,8,4>` bought only 1.36×** (0.262 → 0.192
+ms/row), leaving ~1900 cycles/pair against the sc kernel's ~2400. The dot
+product was never the limiter.
+
+The actual limiter was the **one SCALAR `exp` per (q,k) pair**, because AIE2's
+scalar unit has no fast float datapath. Vectorising it took 9.65 → 1.37 ms in a
+single step — **7× of the total 10×.** The conclusion ("rewrite the inner loop")
+was right for a reason that had nothing to do with the argument given for it.
+**Generalizable rule: on AIE2, count scalar float ops before counting MACs.**
 
 **Does the phase survive this? Yes — because the FLOPs are trivial.** Run the
 arithmetic forward rather than extrapolating the measured ms:
