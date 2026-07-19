@@ -355,6 +355,40 @@ committed.
 **Phase F is now the DECIDING experiment for the weight format, not a reporting
 step.** See the quant results below.
 
+## 2a-ARCH. The reference cannot guide our rewind: hipfire's target is HYBRID
+
+**Why auditing against the DFlash reference was necessarily incomplete.**
+
+`/srv/hipfire/references/dflash/dflash/model.py::dflash_generate` guarantees
+losslessness with three crops after each accept:
+
+```python
+past_key_values_draft.crop(start)
+past_key_values_target.crop(start)
+target_hidden = extract_context_feature(...)[:, :acceptance_length + 1, :]
+```
+
+**But the reference's target is a PURE-ATTENTION Qwen3 model.** Rewinding after a
+partial accept is just cropping a KV cache — an O(1) index change.
+
+hipfire's target is a **HYBRID**: Qwen3.5 with GatedDeltaNet linear-attention
+layers (GDN at 0,1,2,4,5,6,8,9,10; FullAttn at 3,7,11) carrying **recurrent
+state** — `dn_state.s_matrices` plus the conv1d ring in
+`DeltaNetState::conv_states`.
+
+**Recurrent state cannot be cropped.** Verify advances the GDN recurrence over
+all `B` speculative tokens, but only `accept_len + 1` are committed, so the state
+must be rewound — by snapshot/restore (`target_snap.restore_to`,
+`speculative.rs:~7522`) or by replay. If that rewind is incomplete or asymmetric,
+the residue depends on how many speculative tokens were processed → on accept
+length → **on the drafter**. That is a fourth requirement the reference never had
+to solve, and it is exactly the observed symptom in #21.
+
+Consequence for auditing: "all three reference bleed-prevention points are
+implemented" was true and still insufficient. When porting a spec-decode scheme
+onto a different target architecture, enumerate the state the *new* architecture
+carries, not just the state the reference's architecture carried.
+
 ## 2a-ROOT. The verify forward is NONDETERMINISTIC (2026-07-19) — read this first
 
 **This supersedes the framing in §2a below.** §2a described two target-path defects
