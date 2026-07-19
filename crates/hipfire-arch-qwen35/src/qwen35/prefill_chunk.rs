@@ -4698,6 +4698,12 @@ pub(crate) fn forward_prefill_chunk(
                     capture_mode: gpu.capture_mode,
                     batch_size: n,
                     is_tree,
+                    // TODO: boundary producer not yet populated. Matches the
+                    // serial path (qwen35/mod.rs:3191) — `layer_is_boundary` is
+                    // `vec![]` at every KvCache constructor and never filled, so
+                    // `KvCache::is_boundary()` is always false. Threading it here
+                    // would be a no-op AND would imply boundary layers work.
+                    // Wire all three sites together when the producer lands.
                     is_boundary: false,
                 })
                 .map_err(|e| HipError::new(0, &e.to_string()))?;
@@ -6967,6 +6973,12 @@ pub(crate) fn forward_prefill_chunk(
                     capture_mode: gpu.capture_mode,
                     batch_size: n,
                     is_tree,
+                    // TODO: boundary producer not yet populated. Matches the
+                    // serial path (qwen35/mod.rs:3191) — `layer_is_boundary` is
+                    // `vec![]` at every KvCache constructor and never filled, so
+                    // `KvCache::is_boundary()` is always false. Threading it here
+                    // would be a no-op AND would imply boundary layers work.
+                    // Wire all three sites together when the producer lands.
                     is_boundary: false,
                 })
                 .map_err(|e| HipError::new(0, &e.to_string()))?;
