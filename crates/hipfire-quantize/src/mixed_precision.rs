@@ -10,9 +10,43 @@
 //! bits-per-weight budget. The result is a per-tensor format map the quantizer
 //! consults so oq2 only ever carries the least-important weights.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::codecs::{dequant_oq2g256, quantize_oq2g256};
+use crate::codecs::{
+    dequant_oq2g256, dequant_oq4g256, quantize_oq2g256, quantize_oq4g256,
+};
+
+/// On-disk / in-kernel-VRAM bits-per-weight of the three Opus tiers (block
+/// overhead folded in): oq2 = 66 B/256, oq4 = 130 B/256, oq8 = 258 B/256. These
+/// are the weight-bandwidth costs the in-kernel expand actually reads.
+pub const OQ2_BPW: f64 = 66.0 * 8.0 / 256.0; // 2.0625
+pub const OQ4_BPW: f64 = 130.0 * 8.0 / 256.0; // 4.0625
+pub const OQ8_BPW: f64 = 258.0 * 8.0 / 256.0; // 8.0625
+
+/// One of the three Opus weight tiers a dense-linear tensor can take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tier {
+    Oq2,
+    Oq4,
+    Oq8,
+}
+
+impl Tier {
+    pub fn bpw(self) -> f64 {
+        match self {
+            Tier::Oq2 => OQ2_BPW,
+            Tier::Oq4 => OQ4_BPW,
+            Tier::Oq8 => OQ8_BPW,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Tier::Oq2 => "oq2",
+            Tier::Oq4 => "oq4",
+            Tier::Oq8 => "oq8",
+        }
+    }
+}
 
 /// A dense-linear tensor considered for mixed-precision assignment.
 #[derive(Clone, Debug)]
@@ -139,6 +173,126 @@ pub fn oq2_sensitivity(
         .sum()
 }
 
+/// imatrix-weighted output error at oq4 (per tensor), the sibling of
+/// [`oq2_sensitivity`] used for 3-tier assignment. `< oq2` error and `>` the
+/// (≈0) oq8 error, so the two together give the marginal quality of each upgrade
+/// step (oq2→oq4→oq8).
+pub fn oq4_sensitivity(
+    weights_f32: &[f32],
+    m: usize,
+    k: usize,
+    imatrix_col: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> f64 {
+    debug_assert_eq!(weights_f32.len(), m * k);
+    let q = quantize_oq4g256(weights_f32, signs1, signs2);
+    let deq = dequant_oq4g256(&q, m * k, signs1, signs2);
+    let mut per_col = vec![0.0f64; k];
+    for row in 0..m {
+        let base = row * k;
+        for c in 0..k {
+            let d = (weights_f32[base + c] - deq[base + c]) as f64;
+            per_col[c] += d * d;
+        }
+    }
+    (0..k)
+        .map(|c| per_col[c] * imatrix_col.get(c).copied().unwrap_or(1.0) as f64)
+        .sum()
+}
+
+/// A dense-linear tensor with its output error at oq2 and oq4 (oq8 error is
+/// taken as ≈0, near-lossless). The two errors define the quality gained by
+/// each upgrade step.
+#[derive(Clone, Debug)]
+pub struct TierCandidate {
+    pub name: String,
+    pub numel: usize,
+    pub err_oq2: f64,
+    pub err_oq4: f64,
+}
+
+/// Per-tensor tier assignment across oq2/oq4/oq8.
+#[derive(Clone, Debug, Default)]
+pub struct TierPlan {
+    pub tiers: HashMap<String, Tier>,
+}
+
+impl TierPlan {
+    /// Assigned tier for a tensor (defaults to oq2 for unlisted tensors).
+    pub fn tier(&self, name: &str) -> Tier {
+        self.tiers.get(name).copied().unwrap_or(Tier::Oq2)
+    }
+    pub fn count(&self, t: Tier) -> usize {
+        self.tiers.values().filter(|&&x| x == t).count()
+    }
+    /// Realized average bits-per-weight (weight-bandwidth) over `candidates`.
+    pub fn realized_bpw(&self, candidates: &[TierCandidate]) -> f64 {
+        let total: usize = candidates.iter().map(|c| c.numel).sum();
+        if total == 0 {
+            return OQ2_BPW;
+        }
+        let bits: f64 = candidates
+            .iter()
+            .map(|c| self.tier(&c.name).bpw() * c.numel as f64)
+            .sum();
+        bits / total as f64
+    }
+}
+
+/// 3-tier greedy assignment across oq2/oq4/oq8 under a target average bpw.
+/// Start every tensor at oq2, then repeatedly apply the single upgrade step
+/// (oq2→oq4 or oq4→oq8) with the best error-reduction per extra bit that still
+/// fits the remaining budget. Each tensor upgrades at most twice, in order.
+/// Reducing total weighted output error per byte spent is what we maximize.
+pub fn assign_tiers(candidates: &[TierCandidate], target_bpw: f64) -> TierPlan {
+    let total: usize = candidates.iter().map(|c| c.numel).sum();
+    let mut plan = TierPlan::default();
+    for c in candidates {
+        plan.tiers.insert(c.name.clone(), Tier::Oq2);
+    }
+    if total == 0 {
+        return plan;
+    }
+    let target = target_bpw.clamp(OQ2_BPW, OQ8_BPW);
+    let budget_bits = (target - OQ2_BPW) * total as f64; // extra above all-oq2
+    let mut spent = 0.0f64;
+
+    loop {
+        // Best available upgrade step by gain/cost density that still fits.
+        let mut best: Option<(usize, f64, f64)> = None; // (idx, gain, cost)
+        for (i, c) in candidates.iter().enumerate() {
+            let (gain, cost, from_ok) = match plan.tier(&c.name) {
+                Tier::Oq2 => (c.err_oq2 - c.err_oq4, (OQ4_BPW - OQ2_BPW) * c.numel as f64, true),
+                Tier::Oq4 => (c.err_oq4, (OQ8_BPW - OQ4_BPW) * c.numel as f64, true),
+                Tier::Oq8 => (0.0, 0.0, false),
+            };
+            if !from_ok || cost <= 0.0 || spent + cost > budget_bits + 1e-6 {
+                continue;
+            }
+            let density = gain / cost;
+            match best {
+                Some((_, bg, bc)) if density <= bg / bc => {}
+                _ => best = Some((i, gain, cost)),
+            }
+        }
+        match best {
+            Some((i, _, cost)) => {
+                let name = candidates[i].name.clone();
+                let next = match plan.tier(&name) {
+                    Tier::Oq2 => Tier::Oq4,
+                    Tier::Oq4 => Tier::Oq8,
+                    Tier::Oq8 => Tier::Oq8,
+                };
+                plan.tiers.insert(name, next);
+                spent += cost;
+            }
+            None => break,
+        }
+    }
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +367,51 @@ mod tests {
         let w2: Vec<f32> = (0..256).map(|i| ((i % 7) as f32 - 3.0) * 0.13).collect();
         let s2v = oq2_sensitivity(&w2, 1, 256, &imat, &s1, &s2);
         assert!(s2v > 0.0, "lossy weights ⇒ positive sensitivity, got {s2v}");
+    }
+
+    fn tcand(name: &str, numel: usize, e2: f64, e4: f64) -> TierCandidate {
+        TierCandidate {
+            name: name.to_string(),
+            numel,
+            err_oq2: e2,
+            err_oq4: e4,
+        }
+    }
+
+    #[test]
+    fn tiers_all_oq2_at_min_budget_all_oq8_at_max() {
+        let cs = vec![tcand("a", 256, 10.0, 3.0), tcand("b", 256, 4.0, 1.0)];
+        let lo = assign_tiers(&cs, OQ2_BPW);
+        assert_eq!(lo.count(Tier::Oq2), 2);
+        let hi = assign_tiers(&cs, OQ8_BPW);
+        assert_eq!(hi.count(Tier::Oq8), 2, "max budget ⇒ everything oq8");
+        assert!((hi.realized_bpw(&cs) - OQ8_BPW).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tiers_upgrade_highest_density_step_first() {
+        // Equal size. "hot" has a big oq2→oq4 gain; "cold" barely benefits.
+        // A mid budget (~oq4 avg) should lift "hot" toward oq8 before "cold"
+        // leaves oq2.
+        let cs = vec![tcand("hot", 256, 20.0, 2.0), tcand("cold", 256, 1.0, 0.5)];
+        let plan = assign_tiers(&cs, OQ4_BPW);
+        assert_ne!(plan.tier("hot"), Tier::Oq2, "sensitive tensor upgraded");
+        assert!(plan.realized_bpw(&cs) <= OQ4_BPW + 1e-9, "budget respected");
+    }
+
+    #[test]
+    fn tiers_respect_budget_and_monotone_bpw() {
+        let cs = vec![
+            tcand("a", 512, 12.0, 4.0),
+            tcand("b", 256, 6.0, 2.0),
+            tcand("c", 128, 3.0, 1.0),
+        ];
+        let mut last = 0.0;
+        for &t in &[OQ2_BPW, 3.0, 4.0, 5.0, 6.0, OQ8_BPW] {
+            let bpw = assign_tiers(&cs, t).realized_bpw(&cs);
+            assert!(bpw <= t + 1e-6, "realized {bpw} over target {t}");
+            assert!(bpw >= last - 1e-6, "bpw must be monotone in budget");
+            last = bpw;
+        }
     }
 }

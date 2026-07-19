@@ -65,7 +65,9 @@ use hipfire_gguf as gguf_input;
 // library (so hipfire-coexistence can drive the import). Re-imported here for
 // the native safetensors path + the deprecation shim.
 use hipfire_quantize::gguf_import::{is_gguf_input, parse_arch_id_override};
-use hipfire_quantize::mixed_precision::{assign_mixed_precision, oq2_sensitivity, TensorCandidate};
+use hipfire_quantize::mixed_precision::{
+    assign_tiers, oq2_sensitivity, oq4_sensitivity, Tier, TierCandidate,
+};
 #[cfg(test)]
 use hipfire_quantize::quant_plan::{is_positional_promote, kmap_resolve, parse_layer_idx};
 use hipfire_quantize::quant_plan::{kmap_resolve_mode, GgufFormat, QuantLevel};
@@ -138,7 +140,7 @@ static CALIB_PROVENANCE: OnceLock<serde_json::Value> = OnceLock::new();
 // Per-tensor mixed-precision plan (oq8 head / oq2 tail), built by the planning
 // pre-pass when `--mix-target-bpw` is set. Consulted at the LFM2 dense-linear
 // dispatch so each tensor quantizes to its assigned format.
-static MIXED_PLAN: OnceLock<hipfire_quantize::mixed_precision::MixedPlan> = OnceLock::new();
+static MIXED_PLAN: OnceLock<hipfire_quantize::mixed_precision::TierPlan> = OnceLock::new();
 
 /// Compute and record `{source, xxh64, bytes}` for the calib file at `path`.
 /// The xxh64 is over the full file bytes, so any change to the calibration
@@ -7086,12 +7088,10 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse::<f64>().ok())
     {
-        const OQ8_BPW: f64 = 8.0625;
-        const OQ2_BPW: f64 = 2.0625;
         let s1 = gen_fwht_signs(42, 256);
         let s2 = gen_fwht_signs(1042, 256);
         let empty_fp8: HashMap<String, (usize, String)> = HashMap::new();
-        let mut cands: Vec<TensorCandidate> = Vec::new();
+        let mut cands: Vec<TierCandidate> = Vec::new();
         for st in &st_files {
             for name in st.tensor_names() {
                 if let Some((meta, raw)) = st.tensor_data(name) {
@@ -7104,30 +7104,31 @@ fn main() {
                     if w.len() != m * k {
                         continue;
                     }
-                    // Output-aware importance: per-input-column activation
-                    // energy from the imatrix (--imatrix / --hessian). Falls back
-                    // to unweighted (uniform) when no calibration is loaded.
+                    // Output-aware importance: per-input-column activation energy
+                    // from the imatrix (--imatrix / --hessian). Falls back to
+                    // unweighted (uniform) when no calibration is loaded.
                     let imat: Vec<f32> = match imatrix_weights_for(name) {
                         Some(v) if v.len() == k => v.to_vec(),
                         _ => vec![1.0f32; k],
                     };
-                    let sens = oq2_sensitivity(&w, m, k, &imat, &s1, &s2);
-                    cands.push(TensorCandidate {
+                    cands.push(TierCandidate {
                         name: name.to_string(),
                         numel: m * k,
-                        sensitivity: sens,
+                        err_oq2: oq2_sensitivity(&w, m, k, &imat, &s1, &s2),
+                        err_oq4: oq4_sensitivity(&w, m, k, &imat, &s1, &s2),
                     });
                 }
             }
         }
-        let plan = assign_mixed_precision(&cands, OQ8_BPW, OQ2_BPW, target_bpw);
+        let plan = assign_tiers(&cands, target_bpw);
         eprintln!(
             "mixed-precision plan: {} dense-linear tensors, target {target_bpw:.2} bpw, \
-             realized {:.2} bpw (oq8={}, oq2={})",
+             realized {:.3} bpw (oq8={}, oq4={}, oq2={})",
             cands.len(),
-            plan.realized_bpw(&cands, OQ8_BPW, OQ2_BPW),
-            plan.num_high(),
-            cands.len() - plan.num_high(),
+            plan.realized_bpw(&cands),
+            plan.count(Tier::Oq8),
+            plan.count(Tier::Oq4),
+            plan.count(Tier::Oq2),
         );
         let _ = MIXED_PLAN.set(plan);
     }
@@ -7820,13 +7821,11 @@ fn main() {
             // lfm2_oq_format; unlisted tensors keep the uniform format.
             let per_tensor_oq = lfm2_oq_format.filter(|_| is_lfm2_dense_linear).map(|base| {
                 match MIXED_PLAN.get() {
-                    Some(plan) if is_lfm2_dense_linear => {
-                        if plan.is_high(name) {
-                            HfqInputFormat::Oq8
-                        } else {
-                            HfqInputFormat::Oq2
-                        }
-                    }
+                    Some(plan) if is_lfm2_dense_linear => match plan.tier(name) {
+                        Tier::Oq8 => HfqInputFormat::Oq8,
+                        Tier::Oq4 => HfqInputFormat::Oq4,
+                        Tier::Oq2 => HfqInputFormat::Oq2,
+                    },
                     _ => base,
                 }
             });
