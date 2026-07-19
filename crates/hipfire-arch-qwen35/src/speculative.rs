@@ -2097,6 +2097,14 @@ pub struct GdnTape {
     /// token-major stochastic requant frames.
     pub q8_requant_frame_base: Option<u32>,
     pub q8_requant_frame_layers: usize,
+    /// Absolute sequence position of tape row 0. Every replay derives the Q8
+    /// requant seed from `base_position + step`, so replayed rounding matches
+    /// what an AR run at those same positions would produce (issue #17).
+    ///
+    /// Set at capture time — see [`GdnTape::set_base_position`], called from
+    /// `verify_dflash_block_inner` with the verify block's `start_pos` and
+    /// from every diagnostic capture that fills a fresh tape.
+    pub base_position: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -2301,7 +2309,15 @@ impl GdnTape {
             attn_scratch: gpu.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?,
             q8_requant_frame_base: None,
             q8_requant_frame_layers: n_la_layers,
+            base_position: 0,
         })
+    }
+
+    /// Record the absolute sequence position of tape row 0. Must be called by
+    /// whatever fills the tape, before any replay: the Q8 requant seed for
+    /// replay step `s` is `base_position + s` (issue #17).
+    pub fn set_base_position(&mut self, base_position: usize) {
+        self.base_position = base_position;
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -2629,6 +2645,7 @@ impl GdnTapeShards {
                 attn_scratch: g.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?,
                 q8_requant_frame_base: None,
                 q8_requant_frame_layers: n_la_total,
+                base_position: 0,
             });
         }
 
@@ -3206,6 +3223,14 @@ impl GdnTapeShards {
     ///
     /// Caller must have restored the DN snapshot to the pre-verify point
     /// before calling this.
+    /// Record the absolute sequence position of tape row 0 on every band.
+    /// Mirrors [`GdnTape::set_base_position`]; see issue #17.
+    pub fn set_base_position(&mut self, base_position: usize) {
+        for shard in &mut self.shards {
+            shard.base_position = base_position;
+        }
+    }
+
     pub fn replay_gdn_multi(
         &self,
         gpus: &mut Gpus,
@@ -3327,6 +3352,10 @@ impl GdnTapeShards {
                 n_steps,
                 n_v_heads,
                 config.linear_value_head_dim,
+                // Block base: the batched kernel adds its intra-block token
+                // index `t`, so token `t` is seeded at `base_position + t`.
+                shard.base_position as u32,
+                global_la_idx as u32,
             )?;
 
             global_la_idx += 1;
@@ -4604,6 +4633,8 @@ impl GdnTape {
                         1,
                         n_v_heads,
                         value_head_dim,
+                        (self.base_position + step) as u32,
+                        la_idx as u32,
                     )?,
                     qwen35::StateQuant::Q4 => gpu.gated_delta_net_q4(
                         &q,
@@ -4752,6 +4783,8 @@ impl GdnTape {
                         1,
                         n_v_heads,
                         value_head_dim,
+                        (self.base_position + step) as u32,
+                        la_idx as u32,
                     )?,
                     qwen35::StateQuant::Q4 => gpu.gated_delta_net_q4(
                         &q,
@@ -5036,6 +5069,10 @@ impl GdnTape {
                             1,
                             n_v_heads,
                             value_head_dim,
+                            // Replay row `step` is the token at absolute
+                            // position `base_position + step` (issue #17).
+                            (self.base_position + step) as u32,
+                            la_idx as u32,
                         )?;
                     }
                 }
@@ -6131,6 +6168,16 @@ fn verify_dflash_block_inner(
     graph_policy: VerifyGraphPolicy,
     verify_scratch: &VerifyScratch,
 ) -> HipResult<DflashVerifyOutput> {
+    // Tape row 0 records `draft_tokens[0]`, which occupies absolute sequence
+    // position `start_pos`. Stamping it here means every replay of this tape
+    // (including the branch re-capture in Path C, which passes its own
+    // `branch_start_pos`) derives Q8 requant seeds from real positions rather
+    // than dispatch history (issue #17).
+    let mut gdn_tape = gdn_tape;
+    if let Some(tape) = gdn_tape.as_deref_mut() {
+        tape.set_base_position(start_pos);
+    }
+
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
     let dim = target.config.dim;
@@ -7607,6 +7654,8 @@ pub fn spec_step_dflash(
                 &target.config,
                 replay_tokens.len(),
             )?);
+            // Tape row 0 = absolute sequence position `position` (issue #17).
+            serial_tape.set_base_position(position);
             for (i, &tok) in replay_tokens.iter().enumerate() {
                 qwen35::forward_scratch_capture_gdn_tape(
                     gpu,
@@ -8333,6 +8382,8 @@ pub fn spec_step_dflash(
                 gpu.debug_set_gdn_requant_frame(serial_frame_start);
                 let mut prefill_tape =
                     GdnTape::new_for_config(gpu, &target.config, accept_len + 1)?;
+                // Tape row 0 = absolute sequence position `position` (issue #17).
+                prefill_tape.set_base_position(position);
                 qwen35::forward_prefill_batch_force_q8_gdn_per_token(
                     gpu,
                     &target.weights,
@@ -8394,6 +8445,8 @@ pub fn spec_step_dflash(
                 target_snap.restore_to(&mut target.dn_state, gpu)?;
                 gpu.debug_set_gdn_requant_frame(serial_frame_start);
                 let mut serial_tape = GdnTape::new_for_config(gpu, &target.config, accept_len + 1)?;
+                // Tape row 0 = absolute sequence position `position` (issue #17).
+                serial_tape.set_base_position(position);
                 let mut serial_prefix_result: Option<DeltaNetSnapshot> = None;
                 for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
                     qwen35::forward_scratch_capture_gdn_tape(
@@ -8823,6 +8876,9 @@ pub fn spec_step_dflash(
                 {
                     let mut repaired_tape =
                         GdnTape::new_for_config(gpu, &target.config, accept_len + 1)?;
+                    // Repaired rows mirror the source tape's rows 0..accept_len+1,
+                    // which start at absolute position `position` (issue #17).
+                    repaired_tape.set_base_position(position);
                     match repaired_tape.repair_qkvza_from_captured_x_single_row(
                         gpu,
                         &target.weights,
@@ -9276,6 +9332,8 @@ pub fn spec_step_dflash(
             let serial_frame_start = gpu.debug_gdn_requant_frame();
             target_snap.restore_to(&mut target.dn_state, gpu)?;
             let mut serial_tape = GdnTape::new_for_config(gpu, &target.config, accept_len + 1)?;
+            // Tape row 0 = absolute sequence position `position` (issue #17).
+            serial_tape.set_base_position(position);
             let mut serial_prefix_result: Option<DeltaNetSnapshot> = None;
             for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
                 qwen35::forward_scratch_capture_gdn_tape(
@@ -9778,6 +9836,8 @@ pub fn spec_step_dflash(
             gpu.debug_set_gdn_requant_frame(serial_frame_start);
             let mut token_major_tape =
                 GdnTape::new_for_config(gpu, &target.config, accept_len + 1)?;
+            // Tape row 0 = absolute sequence position `position` (issue #17).
+            token_major_tape.set_base_position(position);
             for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
                 qwen35::forward_scratch_capture_gdn_tape(
                     gpu,

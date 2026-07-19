@@ -515,27 +515,34 @@ fn main() {
     // --no-tape: disable GdnTape capture so spec_step_dflash replays via
     // forward_prefill_batch on committed tokens.
     //
-    // WAS DOCUMENTED as "byte-exact vs AR when combined with
-    // HIPFIRE_PREFILL_BATCHED=0". THAT IS STALE AND WRONG (measured
-    // 2026-07-19): --no-tape tracks --ar-baseline for 43 tokens then diverges
-    // at index 44 (AR=24057, DFlash=11991) over a 96-token generation, and
-    // HIPFIRE_PREFILL_BATCHED=0 does not change it.
+    // #17 IS FIXED (2026-07-19). The Q8 GDN stochastic-rounding seed was
+    // GDN_REQUANT_FRAME, a process-global dispatch counter; dispatch count
+    // depends on accept_len, so the DRAFTER perturbed the TARGET's numerics.
+    // The seed is now derived from the absolute sequence position and the
+    // DeltaNet layer index (see `gdn_requant_seed` in hipfire-rdna), so it is
+    // a pure function of WHERE we are, not of how many dispatches ran.
     //
-    // Two separate defects are in play; see tasks #16 and #17.
+    // Measured after the fix, temp 0, 96 tokens, kv_mode=q8 (the live path):
+    //  * --no-tape is BYTE-IDENTICAL to --ar-baseline on the engine prompt
+    //    that previously diverged at index 44.
+    //  * All four drafters (f16, npu.oq8, npu.oq4.25+, mq4) commit the
+    //    IDENTICAL token sequence while genuinely differing in acceptance
+    //    (35/35/36/37 cycles, tau 1.743/1.743/1.667/1.595). A worse drafter
+    //    now changes only HOW MANY tokens are accepted, never WHICH.
+    // Reverting the seed to the counter reproduces the old divergence, so the
+    // causation is confirmed rather than inferred.
+    //
+    // Still open, and NOT a drafter bleed:
     //  #16 tape-on CORRUPTS the target's verify logits outright — with a tape
     //      attached the first committed token already differs from AR
     //      (bonus=271 vs AR's 198 at pos=19, accepted=0 in both, so no
     //      speculative logic is involved). tau collapses 4.556 -> 0.000.
-    //      So --no-tape is much CLOSER to correct, just not exact.
-    //  #17 the residual index-44 divergence is (strongly suspected) the Q8 GDN
-    //      stochastic-rounding seed: GDN_REQUANT_FRAME is a process-global
-    //      dispatch counter, and dispatch count depends on accept_len, so the
-    //      DRAFTER perturbs the TARGET's numerics. kv_mode=q8 is the default,
-    //      so this path is live; a bf16 KV/GDN target avoids it.
-    //
-    // Practical consequence: do NOT treat any temp-0 run here as
-    // drafter-independent until #16 and #17 land. Cross-drafter output
-    // comparisons and acceptance measurements are confounded by both.
+    //      --no-tape is the honest configuration until this lands.
+    //  * A residual DFlash-vs-AR difference remains on SOME prompts and is
+    //    BLOCK-SIZE dependent, not drafter dependent (one prompt matched AR
+    //    exactly at --block-size 4 but not at 2 or the default). That is
+    //    batched-verify vs serial-decode parity, a separate question from
+    //    #17. Cross-drafter identity holds regardless.
     let mut no_tape: bool = false;
     let mut evidence_dir: Option<String> = std::env::var("HIPFIRE_EVAL_EVIDENCE_DIR").ok();
 

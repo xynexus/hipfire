@@ -2717,11 +2717,10 @@ pub(crate) fn forward_prefill_chunk(
                     )?;
                 } else if use_q8_gdn_per_token {
                     for step in 0..n {
-                        if let Some(frame_base) = q8_gdn_serial_frame_base {
-                            gpu.debug_set_gdn_requant_frame(frame_base.wrapping_add(
-                                (step * q8_gdn_serial_frame_layers + delta_layer_idx) as u32,
-                            ));
-                        }
+                        // #17: the Q8 requant seed is derived from the absolute
+                        // sequence position and the LA layer index, so the old
+                        // `debug_set_gdn_requant_frame` poke that synthesized a
+                        // serial-decode-matching frame here is no longer needed.
                         let q = pbs.dn_q_batch.sub_offset(step * v_dim, v_dim);
                         let k = pbs.dn_k_batch.sub_offset(step * v_dim, v_dim);
                         let v = pbs.dn_v_batch.sub_offset(step * v_dim, v_dim);
@@ -2740,12 +2739,9 @@ pub(crate) fn forward_prefill_chunk(
                             1,
                             n_v_heads,
                             config.linear_value_head_dim,
+                            position_at_row(step) as u32,
+                            delta_layer_idx as u32,
                         )?;
-                    }
-                    if let Some(frame_base) = q8_gdn_serial_frame_base {
-                        gpu.debug_set_gdn_requant_frame(
-                            frame_base.wrapping_add((n * q8_gdn_serial_frame_layers) as u32),
-                        );
                     }
                 } else {
                     gpu.gated_delta_net_q8_batch_seq(
@@ -2760,6 +2756,8 @@ pub(crate) fn forward_prefill_chunk(
                         n,
                         n_v_heads,
                         config.linear_value_head_dim,
+                        position_at_row(0) as u32,
+                        delta_layer_idx as u32,
                     )?;
                 }
 
@@ -2802,6 +2800,8 @@ pub(crate) fn forward_prefill_chunk(
                             n,
                             n_v_heads,
                             config.linear_value_head_dim,
+                            position_at_row(0) as u32,
+                            delta_layer_idx as u32,
                         )?,
                         StateQuant::Q4 => gpu.gated_delta_net_q4(
                             &pbs.dn_q_batch,
@@ -5898,11 +5898,10 @@ pub(crate) fn forward_prefill_chunk(
                     )?;
                 } else if use_q8_gdn_per_token {
                     for step in 0..n {
-                        if let Some(frame_base) = q8_gdn_serial_frame_base {
-                            gpu.debug_set_gdn_requant_frame(frame_base.wrapping_add(
-                                (step * q8_gdn_serial_frame_layers + delta_layer_idx) as u32,
-                            ));
-                        }
+                        // #17: the Q8 requant seed is derived from the absolute
+                        // sequence position and the LA layer index, so the old
+                        // `debug_set_gdn_requant_frame` poke that synthesized a
+                        // serial-decode-matching frame here is no longer needed.
                         let q = pbs.dn_q_batch.sub_offset(step * v_dim, v_dim);
                         let k = pbs.dn_k_batch.sub_offset(step * v_dim, v_dim);
                         let v = pbs.dn_v_batch.sub_offset(step * v_dim, v_dim);
@@ -5921,12 +5920,9 @@ pub(crate) fn forward_prefill_chunk(
                             1,
                             n_v_heads,
                             config.linear_value_head_dim,
+                            position_at_row(step) as u32,
+                            delta_layer_idx as u32,
                         )?;
-                    }
-                    if let Some(frame_base) = q8_gdn_serial_frame_base {
-                        gpu.debug_set_gdn_requant_frame(
-                            frame_base.wrapping_add((n * q8_gdn_serial_frame_layers) as u32),
-                        );
                     }
                 } else {
                     gpu.gated_delta_net_q8_batch_seq(
@@ -5941,6 +5937,8 @@ pub(crate) fn forward_prefill_chunk(
                         n,
                         n_v_heads,
                         config.linear_value_head_dim,
+                        position_at_row(0) as u32,
+                        delta_layer_idx as u32,
                     )?;
                 }
                 debug_stop_after!("gdn", layer_idx);
@@ -5979,6 +5977,8 @@ pub(crate) fn forward_prefill_chunk(
                             n,
                             n_v_heads,
                             config.linear_value_head_dim,
+                            position_at_row(0) as u32,
+                            delta_layer_idx as u32,
                         )?,
                         StateQuant::Q4 => gpu.gated_delta_net_q4(
                             &pbs.dn_q_batch,
