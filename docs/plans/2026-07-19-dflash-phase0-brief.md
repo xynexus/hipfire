@@ -74,9 +74,50 @@ Cache size: k+v per token per layer = 2×8×128 f32 = 8 KiB, ×5 layers =
 **40 KiB/token** (20 MiB at L=512, halved in bf16).
 
 **What this does NOT fix:** attention is over `tot = L + B` and genuinely scales
-with L. At tot=48 it is 61.5 ms for 5 layers (12.3 ms/layer) — implausibly slow
-for that little work, so it is probably dispatch-overhead-dominated and may scale
-sublinearly. **Unmeasured.** Attention, not the GEMMs, is the real L-axis risk.
+with L. **MEASURED (task #26, `tools/npu/bench_dflash_attention_mc.py`,
+`dflash_attn_mc` 4-core, block=16, 32q/8kv/128d, n=10 reps each):**
+
+| tot (= L+16) | ms / dispatch (= ms/layer) |
+|---|---|
+| 16 | 4.262 |
+| 32 | 8.465 |
+| 48 | 12.938 (×5 layers = 64.7 ms; body measures 61.5 — instruments agree) |
+| 55 | 14.327 |
+| 56 | **BUILD FAILS** |
+
+**Scaling is exactly linear, and the fixed overhead is ~zero.** Least-squares fit
+over the four points: **0.262 ms per KV row + 0.096 ms fixed**. R² is essentially
+1. Consequences:
+
+- **Fusing the 5 per-layer attention dispatches into one buys ~0.4 ms of 61.5.**
+  Not worth building. The 0.096 ms intercept is an *upper* bound — it includes
+  the Python `iron` host call.
+- **Bucketed builds vs shape-generic is the wrong question.** Neither helps: the
+  cost is work, not shape-change. A bucket that pads tot up to the next power of
+  two pays the padding linearly.
+
+**HARD CEILING: tot ≤ 55.** tot=56 fails aiecc with `'aie.tile' op allocated
+buffers exceeded available memory`. The design keeps one kv-head's whole KV
+resident in core-tile L1 (64 KiB): stack 4096 + `memQ` 16384 + `outO` 16384 +
+`memKV` = 512·tot. 512·tot ≤ 28660 → tot ≤ 55. This is **data memory, not the
+16 KB program store and not the 1023 BD cap.** The current tot=48 build is
+already at 87% of the ceiling — **this kernel cannot reach L=64, let alone 512,
+by any amount of rebuilding.** It needs a tiled/streaming (flash-style) KV loop
+before context length is even a discussable axis.
+
+**The kernel is core-compute-bound, ~1000× off peak.** Core scaling at tot=48:
+1 core 47.40 ms, 2 cores 24.84 (1.91×), 4 cores 12.94 (3.66×) — near-linear, so
+it is not DMA- or dispatch-bound. But the arithmetic is only 12.6 MFLOP/dispatch,
+i.e. **0.97 GFLOP/s across 4 cores (~0.1% of bf16 core peak)**, and the traffic is
+~458 KB/dispatch = 35 MB/s against a ~10 GB/s path. `dflash_attention_sc_bf16.cc`
+is vectorised at LANES=16 but computes each score with 8 `aie::mul` + 8
+`aie::add` + a full `aie::reduce_add` per (q,k) pair — ~2400 core cycles per
+128-length dot product. It uses no `aie::mmul`. **The lever is the inner loop
+(accumulator-tiled `mmul`, hoisting the reduce), not the dispatch count, not the
+build shape.** A 10× there would take attention from 61.5 ms to ~6 ms *and* the
+retiling needed for `mmul` is the same restructuring that lifts the tot≤55 cap.
+
+Attention, not the GEMMs, remains the real L-axis risk.
 
 Re-measuring needs the golden set regenerated: `/tmp/dflash_w/index.json`
 survives but `target_hidden.npy` / `noise_embedding.npy` are gone (tmpfs).
@@ -138,9 +179,13 @@ is architecture-independent, so build it on 9B and swap the target.
        axis from `fc`, `kv`, `rmsnorm-b{L}`, `headnorm-k`, `rope-k`. These then
        run at a **fixed small row count** (16, matching `M_TILE`) over newly
        committed tokens, so no shape-generic build is needed for them.
-   (b) **Attention is the only remaining L-shaped kernel.** Either bucket the
-       builds (tot ∈ {64, 128, 256, 512, …}, pad within a bucket) or make it
-       shape-generic. Measure the L-scaling before choosing.
+   (b) **Attention is the only remaining L-shaped kernel — and it is the
+       blocker.** MEASURED (see above): linear at 0.262 ms/KV row with ~0.1 ms
+       fixed overhead, and it **will not build past tot=55** (core-tile L1).
+       Bucketing and shape-generic builds are BOTH dead ends. The required work
+       is a tiled/streaming KV loop with `aie::mmul` in
+       `tools/npu/dflash_attention_sc_bf16.cc`; that single change removes the
+       tot cap and is the only path to a 10× on the 61.5 ms term.
    (c) Then the seam, with the gates below.
    `--ctx-slice 32` (`dflash_spec_demo.rs:618`) would run the seam today and
    prove plumbing + losslessness, but at 32 context rows the resulting τ and
