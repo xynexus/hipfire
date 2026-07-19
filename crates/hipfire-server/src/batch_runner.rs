@@ -16,14 +16,12 @@
 //! per-request path (chat.rs engine.lock).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use hipfire_arch_api::ArchRegistry;
 use hipfire_daemon_adapter::{DaemonEngine, EmbedRequest, EmbeddingVector};
-use hipfire_diffusion::{DiffusionBatchOutput, DiffusionError};
-use hipfire_scheduler::{WorkloadClass, WorkloadResources, WorkloadSpec};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::state::SharedState;
@@ -130,24 +128,29 @@ pub struct EmbedJob {
     pub tx: oneshot::Sender<Result<Vec<EmbeddingVector>, String>>,
 }
 
-/// A diffusion (txt2img/img2img) job routed through the runner instead of the
-/// route's own `spawn_blocking`, so it time-slices with text/embed under the one
-/// GPU arbiter. `run` is a **re-runnable, deterministic** diffusion invocation:
-/// given the shared preempt flag (checked each sampler step by the pipeline's
-/// progress callback), it runs the blocking pipeline to completion or aborts
-/// with [`DiffusionError::Interrupted`]. It is `Fn` (not `FnOnce`) so a preempted
-/// job restarts from the **same seed** — deterministic diffusion makes the
-/// restarted image byte-identical to an uninterrupted one; the only cost is
-/// redone sampler steps. `priority` / `enqueued_at_ms` / `label` reproduce the
-/// scheduler admission on restart with the **same aging basis**, so repeated
-/// preemption ages the image up and it eventually wins (no restart livelock).
+/// A request for an exclusive GPU turn to run diffusion. The image route
+/// registers one and awaits `grant`; the runner leases it, grants the turn, and
+/// **holds** it (parks its loop) until the route releases — that hold is what
+/// serializes image generation with text/embed on the single GPU.
+///
+/// The runner does **not** run the diffusion itself: the route runs it in its own
+/// `spawn_blocking` (the proven diffusion execution path — running the blocking
+/// pipeline from the runner task instead wedges before the first sampler step).
+/// The runner only arbitrates: grant a turn, watch for a higher-priority waiter
+/// (setting the preempt flag at a sampler-step boundary), and hold until done.
 pub struct ImageJob {
-    pub run:
-        Arc<dyn Fn(Arc<AtomicBool>) -> Result<DiffusionBatchOutput, DiffusionError> + Send + Sync>,
-    pub tx: oneshot::Sender<Result<DiffusionBatchOutput, DiffusionError>>,
+    pub grant: oneshot::Sender<ImageTurn>,
     pub priority: u8,
-    pub enqueued_at_ms: u64,
-    pub label: String,
+}
+
+/// The granted GPU turn handed to the image route: a preempt flag the diffusion
+/// progress callback checks each sampler step (set by the runner's watcher when a
+/// strictly-higher-priority workload appears), and a `release` channel the route
+/// signals when the diffusion finishes or is interrupted so the runner frees the
+/// turn and dispatches the next workload.
+pub struct ImageTurn {
+    pub preempt: Arc<AtomicBool>,
+    pub release: oneshot::Sender<()>,
 }
 
 /// Min decode/sampler steps a job runs before it may be preempted (anti-thrash
@@ -461,6 +464,14 @@ async fn batch_runner_loop(state: SharedState) {
             let Some(lease) = lease else {
                 continue;
             };
+            if std::env::var("HIPFIRE_BATCH_RUNNER_DEBUG").as_deref() == Ok("1") {
+                eprintln!(
+                    "[batch-cycle] lease {} class={:?} workloads={}",
+                    lease.lease_id,
+                    lease.class,
+                    lease.workloads.len()
+                );
+            }
             let jobs: Vec<ScheduledJob> = {
                 let mut inbox = state.batch_inbox.lock().await;
                 lease
@@ -579,18 +590,66 @@ async fn batch_runner_loop(state: SharedState) {
                 lease_id,
             } => {
                 // Own the GPU turn: take the daemon engine out (if attached) so no
-                // daemon op runs while diffusion holds the physical GPU. Diffusion
-                // is in-process and does not use the daemon, so a missing engine is
-                // fine (a diffusion-only server has no resident LLM). The watcher
-                // inside `run_image_job` polls the scheduler, not the engine, so
-                // holding the engine here cannot deadlock the yield path.
+                // daemon op runs while the route drives diffusion on the physical
+                // GPU. Diffusion is in-process and does not use the daemon, so a
+                // missing engine is fine (a diffusion-only server has no resident
+                // LLM). Grant the turn to the route and HOLD it (park this loop on
+                // `release`) until the route reports done — that hold is what
+                // serializes image with text/embed. A watcher sets the preempt
+                // flag when a strictly-higher-priority workload appears; it polls
+                // the scheduler, not the engine, so holding the engine cannot
+                // deadlock the yield path.
                 let engine = state.engine.lock().await.take();
-                run_image_job(&state, job, running_priority).await;
+                let preempt = Arc::new(AtomicBool::new(false));
+                let (release_tx, release_rx) = oneshot::channel();
+                let watcher = spawn_preempt_watcher(&state, preempt.clone(), running_priority);
+                if std::env::var("HIPFIRE_BATCH_RUNNER_DEBUG").as_deref() == Ok("1") {
+                    eprintln!(
+                        "[batch-cycle] image turn granted (pri {running_priority}), holding GPU"
+                    );
+                }
+                if job
+                    .grant
+                    .send(ImageTurn {
+                        preempt,
+                        release: release_tx,
+                    })
+                    .is_ok()
+                {
+                    // Route disconnected? `release_rx` errors and we free the turn.
+                    let _ = release_rx.await;
+                }
+                watcher.abort();
                 *state.engine.lock().await = engine;
                 state.work_scheduler.lock().await.complete(lease_id);
             }
         }
     }
+}
+
+/// Spawn the sampler-step preempt watcher: set `preempt` once a strictly-higher-
+/// priority workload is queued. The min-quantum step floor is enforced by the
+/// route's diffusion callback, so the watcher only signals intent.
+fn spawn_preempt_watcher(
+    state: &SharedState,
+    preempt: Arc<AtomicBool>,
+    running_priority: u8,
+) -> tokio::task::JoinHandle<()> {
+    let state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let waiter = state
+                .work_scheduler
+                .lock()
+                .await
+                .peek_next_priority(now_ms());
+            if waiter.is_some_and(|top| top < running_priority) {
+                preempt.store(true, Ordering::SeqCst);
+                break;
+            }
+        }
+    })
 }
 
 /// What one runner iteration executes. A text batch is park/resume-capable; an
@@ -617,98 +676,6 @@ async fn run_embed_jobs(engine: &mut DaemonEngine, jobs: Vec<EmbedJob>) {
     for job in jobs {
         let result = engine.embed(job.req).await.map_err(|e| e.to_string());
         let _ = job.tx.send(result);
-    }
-}
-
-/// Fresh workload ids for image restarts. A restart re-enqueues while the
-/// previous lease is still active (it completes only after this returns), so it
-/// must use a new id the scheduler will not reject as a duplicate.
-static IMAGE_RESTART_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Run one image job on the runner-owned GPU turn. Diffusion is blocking, so it
-/// runs on a blocking thread; a lightweight async watcher polls the scheduler and
-/// sets a shared preempt flag when a strictly-higher-priority workload appears.
-/// The diffusion progress callback checks the flag each sampler step (past the
-/// min-quantum floor) and returns [`DiffusionError::Interrupted`], aborting
-/// sampling. On interrupt the job is re-enqueued and later re-run from the SAME
-/// SEED, so the finished image is byte-identical to an uninterrupted one; the
-/// cost is redone sampler steps, not correctness.
-async fn run_image_job(state: &SharedState, job: ImageJob, running_priority: u8) {
-    let flag = Arc::new(AtomicBool::new(false));
-    // Watcher: signal preempt-intent when a strictly-higher-priority workload is
-    // queued. The min-quantum sampler-step floor is enforced by the callback, so
-    // the watcher only sets intent; setting it early is harmless.
-    let watcher_flag = flag.clone();
-    let watcher_state = state.clone();
-    let watcher = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            let waiter = watcher_state
-                .work_scheduler
-                .lock()
-                .await
-                .peek_next_priority(now_ms());
-            if waiter.is_some_and(|top| top < running_priority) {
-                watcher_flag.store(true, Ordering::SeqCst);
-                break;
-            }
-        }
-    });
-
-    let run = job.run.clone();
-    let run_flag = flag.clone();
-    let result = tokio::task::spawn_blocking(move || run(run_flag)).await;
-    watcher.abort();
-    let output = match result {
-        Ok(inner) => inner,
-        Err(e) => Err(DiffusionError::Io(format!(
-            "diffusion worker task failed: {e}"
-        ))),
-    };
-
-    match output {
-        Err(DiffusionError::Interrupted(_)) => {
-            if std::env::var("HIPFIRE_BATCH_RUNNER_DEBUG").as_deref() == Ok("1") {
-                eprintln!(
-                    "[batch-cycle] image preempted at sampler-step boundary: pri {running_priority} yields; restarting from seed"
-                );
-            }
-            state.batch_telemetry.lock().await.image_preemptions += 1;
-            // Re-admit from the same seed under a fresh id. Insert into the inbox
-            // first, then enqueue, mirroring the route's admission order; on
-            // admission failure remove and fail the client so it never hangs.
-            let req_id = format!(
-                "image-restart-{}",
-                IMAGE_RESTART_SEQ.fetch_add(1, Ordering::Relaxed)
-            );
-            let workload = WorkloadSpec::microbatchable(
-                req_id.clone(),
-                WorkloadClass::ImageGeneration,
-                job.priority,
-                job.enqueued_at_ms,
-                WorkloadResources::default(),
-                job.label.clone(),
-                1,
-            );
-            state
-                .batch_inbox
-                .lock()
-                .await
-                .insert(req_id.clone(), ScheduledJob::Image(job));
-            if let Err(e) = state.work_scheduler.lock().await.enqueue(workload) {
-                if let Some(ScheduledJob::Image(j)) = state.batch_inbox.lock().await.remove(&req_id)
-                {
-                    let _ = j.tx.send(Err(DiffusionError::Io(format!(
-                        "image re-enqueue after preempt failed: {e}"
-                    ))));
-                }
-            } else {
-                state.prefill_notify.notify_waiters();
-            }
-        }
-        other => {
-            let _ = job.tx.send(other);
-        }
     }
 }
 

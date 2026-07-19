@@ -639,42 +639,76 @@ async fn execute_hfq_diffusion_txt2img(
             .batch_runner_active
             .load(std::sync::atomic::Ordering::Relaxed)
     {
-        let req_id = uuid::Uuid::new_v4().to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let enqueued_at = sdapi_now_ms();
         // Background priority: numerically above interactive text (default 64),
-        // so a chat request preempts a running image but not vice versa.
+        // so a chat request preempts a running image but not vice versa. Keep one
+        // enqueue timestamp across restarts so aging accumulates and repeated
+        // preemption eventually lets the image win (no restart livelock).
+        let enqueued_at = sdapi_now_ms();
         let priority = 128u8;
         let label = format!("image:{}", sd_requested_model(&body).unwrap_or_default());
-        state.batch_inbox.lock().await.insert(
-            req_id.clone(),
-            ScheduledJob::Image(ImageJob {
-                run: run.clone(),
-                tx,
+        // Validation hook (`HIPFIRE_IMAGE_TEST_PREEMPT_MS`): fire the real preempt
+        // flag on a timer, first attempt only, to exercise the interrupt +
+        // restart-from-seed path without a concurrent daemon preemptor (which OOMs
+        // the diffusion on tiny-dedicated-VRAM APUs). Unset in normal operation.
+        let mut test_preempt_ms = std::env::var("HIPFIRE_IMAGE_TEST_PREEMPT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        // Request a GPU turn from the runner, run the diffusion HERE (the route's
+        // own spawn_blocking — the proven execution path), release the turn, and
+        // restart from the same seed if preempted mid-sampling (byte-identical).
+        loop {
+            let req_id = uuid::Uuid::new_v4().to_string();
+            let (grant_tx, grant_rx) = tokio::sync::oneshot::channel();
+            state.batch_inbox.lock().await.insert(
+                req_id.clone(),
+                ScheduledJob::Image(ImageJob {
+                    grant: grant_tx,
+                    priority,
+                }),
+            );
+            let workload = WorkloadSpec::microbatchable(
+                req_id.clone(),
+                WorkloadClass::ImageGeneration,
                 priority,
-                enqueued_at_ms: enqueued_at,
-                label: label.clone(),
-            }),
-        );
-        let workload = WorkloadSpec::microbatchable(
-            req_id.clone(),
-            WorkloadClass::ImageGeneration,
-            priority,
-            enqueued_at,
-            WorkloadResources::default(),
-            label,
-            1,
-        );
-        if let Err(error) = state.work_scheduler.lock().await.enqueue(workload) {
-            state.batch_inbox.lock().await.remove(&req_id);
-            Err(DiffusionError::Io(format!("scheduler admission: {error}")))
-        } else {
+                enqueued_at,
+                WorkloadResources::default(),
+                label.clone(),
+                1,
+            );
+            if let Err(error) = state.work_scheduler.lock().await.enqueue(workload) {
+                state.batch_inbox.lock().await.remove(&req_id);
+                break Err(DiffusionError::Io(format!("scheduler admission: {error}")));
+            }
             state.prefill_notify.notify_waiters();
-            match rx.await {
+            let turn = match grant_rx.await {
+                Ok(turn) => turn,
+                Err(_) => break Err(DiffusionError::Io("image turn dropped".to_string())),
+            };
+            if let Some(ms) = test_preempt_ms.take() {
+                let f = turn.preempt.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    f.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+            let flag = turn.preempt.clone();
+            let run_once = run.clone();
+            let out = match tokio::task::spawn_blocking(move || run_once(flag)).await {
                 Ok(result) => result,
-                Err(_) => Err(DiffusionError::Io(
-                    "image job dropped before completion".to_string(),
-                )),
+                Err(error) => Err(DiffusionError::Io(format!(
+                    "diffusion worker task failed: {error}"
+                ))),
+            };
+            // Release the GPU turn so the runner can dispatch the next workload
+            // (e.g. the higher-priority text that preempted us).
+            let _ = turn.release.send(());
+            match out {
+                Err(DiffusionError::Interrupted(_)) => {
+                    state.batch_telemetry.lock().await.image_preemptions += 1;
+                    // Loop: re-request a turn and re-run from the same seed.
+                    continue;
+                }
+                other => break other,
             }
         }
     } else {
