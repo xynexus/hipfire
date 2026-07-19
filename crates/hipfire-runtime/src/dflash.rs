@@ -384,7 +384,7 @@ fn hfq_weight(
                 awq_scale: None,
             })
         }
-        45 | 46 => {
+        45 | 46 | 47 => {
             // Plain-basis (non-rotated) NPU sidecar formats, dequantized at
             // load so the GPU spec-decode path can run a drafter that was
             // built for the AIE2 projection kernels. There is no GPU kernel for
@@ -412,6 +412,24 @@ fn hfq_weight(
                         crate::quant::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
                     for i in 0..GROUP {
                         f32_data[b * GROUP + i] = scale * (data[off + 2 + i] as i8) as f32;
+                    }
+                }
+            } else if info.quant_type == 47 {
+                // PURE int4: block = [f16 scale][128 nibbles] = 130 B/group.
+                // Minimum-bandwidth weight format for the AIE2 W4A8 kernel.
+                assert_eq!(
+                    block_bytes, 130,
+                    "dflash {name}: oq4-plain block must be 130 B, got {block_bytes}"
+                );
+                for b in 0..n_blocks {
+                    let off = b * block_bytes;
+                    let scale =
+                        crate::quant::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+                    let grp = &mut f32_data[b * GROUP..b * GROUP + GROUP];
+                    for i in 0..128 {
+                        let byte = data[off + 2 + i];
+                        grp[2 * i] = scale * (((byte & 0xf) as i8) << 4 >> 4) as f32;
+                        grp[2 * i + 1] = scale * (((byte >> 4) as i8) << 4 >> 4) as f32;
                     }
                 }
             } else {
