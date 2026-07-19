@@ -492,6 +492,15 @@ fn main() {
     // `--gemm multicore` routes every projection through the r14 4x4 array
     // (W4A8) instead of the single-core `int_matmul` (W8A8).
     let mc = arg("--gemm").as_deref() == Some("multicore");
+    // `--ctx-cache` caches the position-invariant context projection across
+    // cycles: thp = rmsnorm(fc(target_hidden)) and each layer's post-headnorm/
+    // post-rope context K plus raw context V. Those depend only on committed
+    // tokens (rope uses absolute pos0=0, so context row r keeps position r as
+    // the context grows), so they are computed once (block 0) and reused. This
+    // removes fc, the per-layer kv GEMMs and rms-b{L} from the warm per-cycle
+    // path. Block 1 recomputes them and directly compares against the cache
+    // (bit-identical gate); blocks >=2 are the timed warm-cached cycles.
+    let ctx_cache = arg("--ctx-cache").is_some();
     let r14_dir = arg("--r14-dir").unwrap_or_else(|| {
         format!(
             "{}/.hipfire/npu/r14_1x2x128_nb128",
@@ -875,6 +884,18 @@ fn main() {
     let mut per_op: HashMap<String, (u64, u64, u64)> = HashMap::new(); // n, ns, ns_after_miss
     let mut block_out = vec![0f32; b_rows * h];
 
+    // ── host-side context cache (--ctx-cache) ───────────────────────────────
+    // c_k[li] / c_v[li] hold layer li's post-headnorm/post-rope context K and
+    // raw context V for rows 0..l_ctx. Populated on block 0, checked on block 1,
+    // reused on blocks >=2. block_out_ref snapshots the non-cached result so the
+    // end-to-end cached-vs-recomputed gate can compare directly.
+    let mut c_k: Vec<Vec<f32>> = vec![Vec::new(); nl];
+    let mut c_v: Vec<Vec<f32>> = vec![Vec::new(); nl];
+    let mut block_out_ref: Vec<f32> = Vec::new();
+    let mut cache_k_maxdiff = 0f64;
+    let mut cache_v_maxdiff = 0f64;
+    let mut walls_cached: Vec<f64> = Vec::new();
+
     // One GEMM: quantize rows, dispatch, rescale into `out` [rows, M].
     macro_rules! gemm {
         ($cache:expr, $gm:expr, $mx:expr, $x:expr, $rows:expr, $out:expr) => {{
@@ -1038,10 +1059,16 @@ fn main() {
         let n0 = npu_ns_total;
 
         // ── one-time context projection: thp = hidden_norm(fc(target_hidden))
-        let mut thp_raw = vec![0f32; l_ctx * h];
-        gemm!(cache, &w_fc, mc_fc, &target_hidden, l_ctx, &mut thp_raw);
+        // compute_ctx is true when the cache is off, or on the block-0 populate
+        // and the block-1 verify. Warm-cached cycles (blk>=2) skip fc + rms-b{L}
+        // and the per-layer kv GEMMs entirely, reusing c_k/c_v.
+        let compute_ctx = !ctx_cache || blk <= 1;
         let mut thp = vec![0f32; l_ctx * h];
-        rmsnorm!(cache, &rms32, thp_raw, &g_hidden, l_ctx, thp);
+        if compute_ctx {
+            let mut thp_raw = vec![0f32; l_ctx * h];
+            gemm!(cache, &w_fc, mc_fc, &target_hidden, l_ctx, &mut thp_raw);
+            rmsnorm!(cache, &rms32, thp_raw, &g_hidden, l_ctx, thp);
+        }
 
         let mut hidden = noise[..b_rows * h].to_vec();
         let mut x_norm = vec![0f32; b_rows * h];
@@ -1071,25 +1098,33 @@ fn main() {
                 &layers[li].8,
             );
             let residual = hidden.clone();
+            let (nq, nk) = (gm_qkv.sizes[0], gm_qkv.sizes[1]);
+            let m_qkv = gm_qkv.m;
+            let nkd = nkv * hd;
 
             // input_layernorm -> concat q/k/v projection (one GEMM)
             rmsnorm!(cache, &rms16, hidden, g_in, b_rows, x_norm);
             gemm!(cache, gm_qkv, mc_layers[li][0], &x_norm, b_rows, &mut qkv);
-            // k_ctx/v_ctx from thp (one GEMM)
-            gemm!(cache, gm_kv, mc_layers[li][1], &thp, l_ctx, &mut kv_ctx);
 
-            // split + assemble k/v as [ctx rows ; noise rows]
-            let (nq, nk) = (gm_qkv.sizes[0], gm_qkv.sizes[1]);
-            let m_qkv = gm_qkv.m;
+            // Context k/v from thp (one GEMM), split into the [ctx rows] prefix.
+            // Warm-cached cycles skip this GEMM: V context comes straight from
+            // the cache, K context is installed after the rope below.
+            if compute_ctx {
+                gemm!(cache, gm_kv, mc_layers[li][1], &thp, l_ctx, &mut kv_ctx);
+                let m_kv = gm_kv.m;
+                for r in 0..l_ctx {
+                    k_all[r * nkd..(r + 1) * nkd]
+                        .copy_from_slice(&kv_ctx[r * m_kv..r * m_kv + nkd]);
+                    v_all[r * nkd..(r + 1) * nkd]
+                        .copy_from_slice(&kv_ctx[r * m_kv + nkd..r * m_kv + 2 * nkd]);
+                }
+            } else {
+                v_all[..l_ctx * nkd].copy_from_slice(&c_v[li]);
+            }
+
+            // q rows + the noise k/v rows are new every cycle (O(B), never cached)
             for r in 0..b_rows {
                 q[r * nq..(r + 1) * nq].copy_from_slice(&qkv[r * m_qkv..r * m_qkv + nq]);
-            }
-            let m_kv = gm_kv.m;
-            let nkd = nkv * hd;
-            for r in 0..l_ctx {
-                k_all[r * nkd..(r + 1) * nkd].copy_from_slice(&kv_ctx[r * m_kv..r * m_kv + nkd]);
-                v_all[r * nkd..(r + 1) * nkd]
-                    .copy_from_slice(&kv_ctx[r * m_kv + nkd..r * m_kv + 2 * nkd]);
             }
             for r in 0..b_rows {
                 let d = (l_ctx + r) * nkd;
@@ -1098,11 +1133,36 @@ fn main() {
                     .copy_from_slice(&qkv[r * m_qkv + nq + nk..r * m_qkv + nq + 2 * nk]);
             }
 
-            // headnorm + rope, q and k
+            // headnorm + rope, q (always) and k.
             headnorm!(cache, &hn_q, q, g_qn, b_rows * nh * hd, q_tmp);
             rope!(cache, &rope_q, q_tmp, b_rows, nh, l_ctx, q);
+            // The k-side norm/rope kernels are built only at b{tot}, so the
+            // warm-cached path still dispatches them over all `tot` rows; the
+            // context outputs are discarded and overwritten by the cache below,
+            // and only the noise rows [l_ctx..tot] are kept. A b{B}-shaped build
+            // would run these over the B noise rows alone — accounted for as the
+            // projected column in the report, not measured here.
             headnorm!(cache, &hn_k, k_all, g_kn, tot * nkv * hd, k_tmp);
             rope!(cache, &rope_k, k_tmp, tot, nkv, 0, k_all);
+            if ctx_cache {
+                if blk == 0 {
+                    // populate: capture post-rope context K, raw context V
+                    c_k[li] = k_all[..l_ctx * nkd].to_vec();
+                    c_v[li] = v_all[..l_ctx * nkd].to_vec();
+                } else if blk == 1 {
+                    // verify: this block recomputed context fresh — compare it
+                    // directly against the cache captured on block 0.
+                    for i in 0..l_ctx * nkd {
+                        cache_k_maxdiff =
+                            cache_k_maxdiff.max((k_all[i] - c_k[li][i]).abs() as f64);
+                        cache_v_maxdiff =
+                            cache_v_maxdiff.max((v_all[i] - c_v[li][i]).abs() as f64);
+                    }
+                } else {
+                    // reuse: install cached post-rope context K (V already set)
+                    k_all[..l_ctx * nkd].copy_from_slice(&c_k[li]);
+                }
+            }
 
             // attention: whole layer in ONE dispatch, kv-heads streamed.
             // Pack Q per kv-head as the `groups` q-heads' rows stacked.
@@ -1354,14 +1414,25 @@ fn main() {
             wall * 1e3
         );
         // Block 0 is cold (first touch of every weight BO + every hwctx). Drop
-        // its samples so the per-op table reports the WARM steady state.
+        // its samples so the per-op table reports the WARM steady state. With the
+        // cache on, block 1 is the verify block (recomputes context AND checks
+        // it against the cache), so the warm-cached steady state is blk>=2 — drop
+        // per-op through block 1 so the table shows only the cached cycle.
         if blk == 0 {
+            block_out_ref = block_out.clone();
+        }
+        let warm_start = if ctx_cache { 2 } else { 1 };
+        if blk + 1 == warm_start {
             per_op.clear();
         }
         if blk == 0 {
             wall_cold = wall;
-        } else {
+        }
+        if blk >= 1 {
             walls.push(wall);
+        }
+        if ctx_cache && blk >= warm_start {
+            walls_cached.push(wall);
         }
     }
 
@@ -1386,6 +1457,38 @@ fn main() {
             "    dispatches/block = {per_block_dispatches:.0}   per-dispatch mean = {:.0} us",
             warm * 1e6 / per_block_dispatches
         );
+    }
+
+    // ── context-cache correctness + cached-vs-recomputed wall ────────────────
+    if ctx_cache {
+        let cos_ref = cosine(&block_out, &block_out_ref);
+        let warm_cached = walls_cached.iter().cloned().fold(f64::INFINITY, f64::min);
+        // block 1 is the non-cached warm reference measured in this same run.
+        let warm_noncached = walls.first().copied().unwrap_or(f64::NAN);
+        println!("\n  === CONTEXT CACHE ({} layers, l_ctx={l_ctx}) ===", nl);
+        println!(
+            "    cache-vs-recompute (block1 direct): max|Δ| K = {:.3e}  V = {:.3e}  {}",
+            cache_k_maxdiff,
+            cache_v_maxdiff,
+            if cache_k_maxdiff == 0.0 && cache_v_maxdiff == 0.0 {
+                "BIT-IDENTICAL"
+            } else {
+                "NON-ZERO — investigate"
+            }
+        );
+        println!(
+            "    final block_hidden cached-vs-recomputed cos = {cos_ref:.9}  (gate > 0.999999)"
+        );
+        if warm_cached.is_finite() {
+            println!(
+                "    warm wall: non-cached (blk1) = {:.1} ms   cached (blk>=2) = {:.1} ms   \
+                 delta = {:.1} ms ({:.1}x)",
+                warm_noncached * 1e3,
+                warm_cached * 1e3,
+                (warm_noncached - warm_cached) * 1e3,
+                warm_noncached / warm_cached
+            );
+        }
     }
     println!(
         "    ctx misses = {} total, {:.1} ms in load_peer",
