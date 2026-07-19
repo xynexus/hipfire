@@ -45,12 +45,38 @@ Attribution of the 726 ms, each term measured with the kernel pinned:
 So a realistic post-work NPU block is **~230–250 ms**, and ~100–150 ms if the glue
 is also attacked.
 
-### Consequence: the prototype target is 27B/31B, NOT 9B
+### Consequence: the prototype target is 27B-class, NOT 9B
 
-The verify budget scales with target size while the draft cost does not. This
-architecture becomes viable on **27B (155 ms) and comfortable on 31B (345 ms)**,
-and is out of reach on 9B. The source design's §17 does not state a target model;
-it should say 27B-class or larger.
+**⚠ CORRECTED 2026-07-19.** This section originally said "the verify budget scales
+with target size while the draft cost does not." **That is wrong.** A DFlash
+drafter is TARGET-SPECIFIC — it consumes `target_hidden` from that target's layers
+— so you cannot pair a 9B drafter with a 27B target. Draft cost scales too.
+
+Measured drafter sizes: Qwen3.5-9B DFlash = **1.049 B params**; Qwen3.6-27B
+DFlash = **1.730 B params** (×1.65). So going 9B → 27B grows the budget ×2.72
+(57 → 155 ms) and the drafter ×1.65. **The move still helps, by ~1.6×, not the
+~2.7× that holding draft cost fixed implied.**
+
+Re-derived, scaling each term by what it actually depends on — attention is
+CONSTANT (both drafters are 32q / 8kv / head_dim 128), GEMM is weight-bound
+(×1.65), glue and primitives track hidden (5120/4096 = ×1.25):
+
+| term | 9B measured | 27B estimated |
+|---|---|---|
+| GEMM | 103.5 ms | ~171 ms |
+| attention | 61.5 | ~61.5 |
+| host glue | 53.0 | ~66 |
+| primitives | 23.5 | ~29 |
+| **block** | **236.0** | **~328** |
+
+Against the 27B budget (155 ms) that is **~2.1× over** — better than 9B's 4.14×,
+but NOT fitting. **This is an ESTIMATE**; measuring it needs rmsnorm/swiglu kernel
+rebuilds for hidden 5120 / FFN 17408 (rope and headnorm transfer unchanged, since
+32q/8kv/128 matches exactly).
+
+Any claim of the form "the block fits budget X" must pair the block time of
+**X's own drafter** with X's budget. Earlier statements that 236.0 ms "fits the
+31B budget (345 ms)" compared a 9B drafter against a 31B target and are void.
 
 This inverts the intuition that one prototypes on the small model first. On 9B the
 pipeline can never hide the draft, so a 9B prototype would measure a
