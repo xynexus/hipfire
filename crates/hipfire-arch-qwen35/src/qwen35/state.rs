@@ -150,10 +150,23 @@ impl DeltaNetState {
         // HIPFIRE_DN_STATE_EF=0. Q8-only (FP32 has no requant; Q4 EF is future
         // work; the multi-GPU band split is still stochastic — new_with_quant_multi
         // leaves s_ef_residual empty). Residual is f16 per-element.
-        let ef_enabled = quant == StateQuant::Q8
-            && std::env::var("HIPFIRE_DN_STATE_EF")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+        // DISABLED 2026-07-19 with the Q8/Q4 state arms below — error feedback is
+        // Q8-only, so this can no longer fire. Preserved as REFERENCE for the
+        // DeltaNet-state codec: sigma-delta noise shaping is the technique that
+        // made Q8 state viable at all (see the measurements above), and a codec
+        // will likely want the same trick.
+        //
+        //   let ef_enabled = quant == StateQuant::Q8
+        //       && std::env::var("HIPFIRE_DN_STATE_EF")
+        //           .map(|v| v != "0")
+        //           .unwrap_or(true);
+        //
+        // KNOWN DEFECT if this is ever restored: `s_ef_residual` is NOT saved or
+        // restored by `DeltaNetSnapshot` (which covers only s_matrices, s_scales
+        // and conv_states). A per-token recurrent buffer surviving rollback makes
+        // committed output depend on accept length, hence on the drafter —
+        // breaking spec-decode losslessness. Fix the snapshot first.
+        let ef_enabled = false;
 
         let mut s_matrices = Vec::with_capacity(n_delta_layers);
         let mut s_scales = Vec::with_capacity(n_delta_layers);
@@ -165,27 +178,52 @@ impl DeltaNetState {
                     s_matrices.push(gpu.zeros(&[s_size], DType::F32)?);
                     s_scales.push(gpu.zeros(&[n_heads], DType::F32)?);
                 }
-                StateQuant::Q8 => {
-                    // int8 state: s_size bytes (1 byte each), per-row scales
-                    let buf = gpu.hip.malloc(s_size)?;
-                    gpu.hip.memset(&buf, 0, s_size)?;
-                    s_matrices.push(GpuTensor {
-                        buf,
-                        shape: vec![s_size],
-                        dtype: DType::F32,
-                    });
-                    s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
-                }
-                StateQuant::Q4 => {
-                    // 4-bit nibble-packed: s_size/2 bytes, per-row scales
-                    let buf = gpu.hip.malloc(s_size / 2)?;
-                    gpu.hip.memset(&buf, 0, s_size / 2)?;
-                    s_matrices.push(GpuTensor {
-                        buf,
-                        shape: vec![s_size / 2],
-                        dtype: DType::F32,
-                    });
-                    s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
+                // ── Q8 / Q4 DeltaNet state: DISABLED 2026-07-19 ──────────────
+                //
+                // Quantized recurrent state is disallowed by policy (see the
+                // note on `deltanet_state_fp32_below`). The allocation bodies
+                // are preserved verbatim below as REFERENCE for the eventual
+                // DeltaNet-state codec — the layout decisions (byte-container
+                // sizing, per-row vs per-head scales, nibble packing) are the
+                // part worth keeping. Do NOT re-enable them as-is:
+                // `s_ef_residual` is still missing from `DeltaNetSnapshot`, so
+                // Q8 breaks spec-decode losslessness the moment it is restored.
+                //
+                //   StateQuant::Q8 => {
+                //       // int8 state: s_size bytes (1 byte each), per-row scales
+                //       let buf = gpu.hip.malloc(s_size)?;
+                //       gpu.hip.memset(&buf, 0, s_size)?;
+                //       s_matrices.push(GpuTensor {
+                //           buf,
+                //           shape: vec![s_size],
+                //           dtype: DType::F32,
+                //       });
+                //       s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
+                //   }
+                //   StateQuant::Q4 => {
+                //       // 4-bit nibble-packed: s_size/2 bytes, per-row scales
+                //       let buf = gpu.hip.malloc(s_size / 2)?;
+                //       gpu.hip.memset(&buf, 0, s_size / 2)?;
+                //       s_matrices.push(GpuTensor {
+                //           buf,
+                //           shape: vec![s_size / 2],
+                //           dtype: DType::F32,
+                //       });
+                //       s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
+                //   }
+                //
+                // NOTE: the Q8-only DDTree tree-replay path
+                // (`gated_delta_net_q8_tree_batch_seq`) cannot run while this is
+                // disabled. It will now fail LOUDLY here rather than silently
+                // producing a non-lossless spec-decode path.
+                StateQuant::Q8 | StateQuant::Q4 => {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "quantized DeltaNet state (Q8/Q4) is disabled by policy — \
+                         use FP32 (see qwen35::deltanet_state_fp32_below). The \
+                         reference allocation is preserved in-source for the \
+                         future DeltaNet-state codec.",
+                    ));
                 }
             }
             if ef_enabled {

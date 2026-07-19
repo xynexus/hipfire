@@ -648,7 +648,7 @@ pub fn load_drafter(
             })?;
             let weights = qwen35::load_weights(&mut hfq, &q35_cfg, gpu)?;
             let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &q35_cfg, 128, max_kv_seq)?;
-            let params = hfq_parameter_count(&hfq);
+            let _params = hfq_parameter_count(&hfq);
             let dn_quant = parse_drafter_state_quant(
                 std::env::var("HIPFIRE_PFLASH_DRAFTER_STATE")
                     .ok()
