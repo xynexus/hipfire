@@ -113,6 +113,182 @@ mod body {
         }
     }
 
+    // ── multi-core (r14) W4A8 GEMM path ─────────────────────────────────────
+    use hipfire_xdna::gemm_r14::{NpuGemmR14, R14Geometry};
+
+    /// One weight matrix staged for the r14 array: int4 codes packed into
+    /// per-dispatch resident buffers, plus the per-(out-row, k-chunk) dequant
+    /// scale. The group size is pinned to the kernel's `K_CHUNK` — the array
+    /// emits one int32 partial per chunk and the host owns all scaling, so a
+    /// finer group (e.g. the sidecar's 256) cannot be applied without a build
+    /// whose `KT*16` equals it.
+    pub struct R14Matrix {
+        pub m: usize, // output dim (GEMM N)
+        pub k: usize,
+        pub rows: usize,
+        pub k_chunks: usize,
+        pub scale4: Vec<f32>, // [m][k_chunks]
+        pub wbufs: Vec<DeviceBuffer>,
+        pub plan: Vec<(usize, usize, usize)>, // per iteration: (m_block, k_chunk, n_tile)
+    }
+
+    impl R14Matrix {
+        /// Requantize a row-scaled int8 `[m][k]` weight to int4 at `K_CHUNK`
+        /// granularity and pack it into resident per-dispatch buffers.
+        #[allow(clippy::too_many_arguments)]
+        pub fn build(
+            g: &NpuGemmR14,
+            raw: &[i8],
+            row_scale: &[f32],
+            m: usize,
+            k: usize,
+            rows: usize,
+        ) -> Result<Self, XdnaError> {
+            let geom = g.geom();
+            let (mt, nt, kc) = (geom.m_tile(), geom.n_tile(), geom.k_chunk());
+            assert_eq!(k % kc, 0, "K={k} must be a multiple of K_CHUNK={kc}");
+            assert_eq!(m % nt, 0, "N={m} must be a multiple of N_TILE={nt}");
+            assert_eq!(rows % mt, 0, "rows={rows} must be a multiple of M_TILE={mt}");
+            let (k_chunks, n_tiles, m_blocks) = (k / kc, m / nt, rows / mt);
+
+            let mut codes = vec![0i8; m * k];
+            let mut scale4 = vec![0f32; m * k_chunks];
+            for n in 0..m {
+                for c in 0..k_chunks {
+                    let seg = &raw[n * k + c * kc..n * k + (c + 1) * kc];
+                    let amax = seg.iter().map(|v| (*v as i32).abs()).max().unwrap_or(0);
+                    if amax == 0 {
+                        continue;
+                    }
+                    scale4[n * k_chunks + c] = row_scale[n] * amax as f32 / 7.0;
+                    let inv = 7.0 / amax as f32;
+                    for (i, &v) in seg.iter().enumerate() {
+                        codes[n * k + c * kc + i] =
+                            (v as f32 * inv).round_ties_even().clamp(-7.0, 7.0) as i8;
+                    }
+                }
+            }
+
+            let mut plan = Vec::with_capacity(m_blocks * k_chunks * n_tiles);
+            for mb in 0..m_blocks {
+                for c in 0..k_chunks {
+                    for t in 0..n_tiles {
+                        plan.push((mb, c, t));
+                    }
+                }
+            }
+            let nblk = geom.nblk;
+            let ndisp = plan.len().div_ceil(nblk);
+            let mut wbufs = Vec::with_capacity(ndisp);
+            for d in 0..ndisp {
+                let mut buf = g.alloc_weights()?;
+                buf.as_mut_slice().fill(0);
+                for s in 0..nblk {
+                    let Some(&(_, c, t)) = plan.get(d * nblk + s) else {
+                        break;
+                    };
+                    geom.pack_w_slot(buf.as_mut_slice(), s, &codes, k, c * kc, t * nt);
+                }
+                g.sync_weights(&buf)?;
+                wbufs.push(buf);
+            }
+            Ok(Self {
+                m,
+                k,
+                rows,
+                k_chunks,
+                scale4,
+                wbufs,
+                plan,
+            })
+        }
+    }
+
+    /// Per-(row, k-chunk) symmetric int8 activation quant — the chunked twin of
+    /// [`quantize_row`], required because the array contracts one chunk at a time.
+    pub fn quantize_row_chunked(
+        x: &[f32],
+        rows: usize,
+        k: usize,
+        kc: usize,
+        q: &mut [i8],
+        scale: &mut [f32],
+    ) {
+        let chunks = k / kc;
+        for r in 0..rows {
+            for c in 0..chunks {
+                let seg = &x[r * k + c * kc..r * k + (c + 1) * kc];
+                let absmax = seg.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                let s = if absmax > 0.0 { absmax / QMAX } else { 1.0 };
+                scale[r * chunks + c] = s;
+                let inv = 1.0 / s;
+                for (i, &v) in seg.iter().enumerate() {
+                    q[r * k + c * kc + i] =
+                        (v * inv).round_ties_even().clamp(-QMAX, QMAX) as i8;
+                }
+            }
+        }
+    }
+
+    /// Run one full GEMM on the r14 array. Returns (device ns, dispatch count).
+    pub fn run_r14(
+        g: &mut NpuGemmR14,
+        mx: &R14Matrix,
+        x: &[f32],
+        out: &mut [f32],
+        qa: &mut [i8],
+        sx: &mut [f32],
+    ) -> (u64, u64) {
+        let geom: R14Geometry = g.geom();
+        let (mt, nt, kc) = (geom.m_tile(), geom.n_tile(), geom.k_chunk());
+        let (rows, m, k, nblk) = (mx.rows, mx.m, mx.k, geom.nblk);
+        quantize_row_chunked(x, rows, k, kc, qa, sx);
+        out[..rows * m].fill(0.0);
+
+        let mut ns = 0u64;
+        let mut disp = 0u64;
+        for (d, wbuf) in mx.wbufs.iter().enumerate() {
+            let lo = d * nblk;
+            let hi = (lo + nblk).min(mx.plan.len());
+            {
+                let abuf = g.a_mut();
+                let mut prev: Option<(usize, usize, usize)> = None;
+                for (s, &(mb, c, _)) in mx.plan[lo..hi].iter().enumerate() {
+                    // A depends only on (m_block, k_chunk); consecutive slots in a
+                    // dispatch usually share both, so replicate instead of repacking.
+                    if let Some((pmb, pc, ps)) = prev {
+                        if pmb == mb && pc == c {
+                            for i in 0..hipfire_xdna::gemm_r14::GRID {
+                                let (base, off) = (i * geom.at(), geom.ab());
+                                let (src, dst) = (base + ps * off, base + s * off);
+                                abuf.copy_within(src..src + off, dst);
+                            }
+                            continue;
+                        }
+                    }
+                    geom.pack_a_slot(abuf, s, qa, k, mb * mt, c * kc);
+                    prev = Some((mb, c, s));
+                }
+            }
+            let t = std::time::Instant::now();
+            g.dispatch(wbuf).expect("r14 dispatch");
+            ns += t.elapsed().as_nanos() as u64;
+            disp += 1;
+            let c32 = g.read_c().expect("r14 read C");
+            for (s, &(mb, kchunk, tile)) in mx.plan[lo..hi].iter().enumerate() {
+                let row0 = mb * mt;
+                let col0 = tile * nt;
+                geom.each_c(c32, s, |lr, lc, v| {
+                    let (r, n) = (row0 + lr, col0 + lc);
+                    out[r * m + n] += mx.scale4[n * mx.k_chunks + kchunk]
+                        * sx[r * mx.k_chunks + kchunk]
+                        * v as f32;
+                });
+            }
+        }
+        (ns, disp)
+    }
+
     // ── kernel cache ────────────────────────────────────────────────────────
     /// Kernels under a hardware-context budget. The anchor is pinned (it owns
     /// the DRM file and device heap every peer shares, and every argument
@@ -197,6 +373,7 @@ mod body {
 #[cfg(target_os = "linux")]
 fn main() {
     use body::*;
+    use hipfire_xdna::gemm_r14::NpuGemmR14;
     use hipfire_xdna::{DeviceBuffer, NpuKernel};
     use std::collections::HashMap;
     use std::time::Instant;
@@ -212,6 +389,15 @@ fn main() {
     let refpath = arg("--ref");
     let blocks: usize = arg("--blocks").and_then(|v| v.parse().ok()).unwrap_or(3);
     let capacity: usize = arg("--ctx-budget").and_then(|v| v.parse().ok()).unwrap_or(5);
+    // `--gemm multicore` routes every projection through the r14 4x4 array
+    // (W4A8) instead of the single-core `int_matmul` (W8A8).
+    let mc = arg("--gemm").as_deref() == Some("multicore");
+    let r14_dir = arg("--r14-dir").unwrap_or_else(|| {
+        format!(
+            "{}/.hipfire/npu/r14_1x2x128_nb128",
+            std::env::var("HOME").unwrap()
+        )
+    });
 
     // ── config + weights ────────────────────────────────────────────────────
     let index: serde_json::Value =
@@ -285,7 +471,10 @@ fn main() {
         k: usize,
         sizes: Vec<usize>,
     }
-    let load_gemm = |anchor: &NpuKernel, key: &str| -> Gemm {
+    let load_gemm = |anchor: &NpuKernel,
+                     key: &str,
+                     r14: Option<(&NpuGemmR14, usize)>|
+     -> (Gemm, Option<R14Matrix>) {
         let spec = &index["gemms"][key];
         let (m, k) = (
             spec["M"].as_u64().unwrap() as usize,
@@ -293,28 +482,44 @@ fn main() {
         );
         let raw = std::fs::read(format!("{wdir}/w_{key}.i8")).expect("weight");
         assert_eq!(raw.len(), m * k, "{key} weight size");
-        let mut w = anchor.alloc_arg(m * k).expect("alloc weight");
-        w.as_mut_slice().copy_from_slice(&raw);
-        // Flush once here; the dispatch path then skips re-flushing this
-        // buffer, which is the point of keeping it resident.
-        anchor.sync_to_device(&w).expect("sync weight");
         let sraw = std::fs::read(format!("{wdir}/w_{key}.scale")).expect("scale");
         let scale: Vec<f32> = sraw
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        Gemm {
-            w,
-            scale,
-            m,
-            k,
-            sizes: spec["sizes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_u64().unwrap() as usize)
-                .collect(),
+        let sizes: Vec<usize> = spec["sizes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let raw_i8 =
+            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
+        // In multicore mode the int8 weight never reaches the device — only the
+        // r14 int4 repack does — so the placeholder buffer stays 1 byte.
+        let mx = r14.map(|(g, rows)| {
+            R14Matrix::build(g, raw_i8, &scale, m, k, rows)
+                .unwrap_or_else(|e| panic!("r14 build {key}: {e:?}"))
+        });
+        let mut w = anchor
+            .alloc_arg(if mx.is_some() { 1 } else { m * k })
+            .expect("alloc weight");
+        if mx.is_none() {
+            w.as_mut_slice().copy_from_slice(&raw);
+            // Flush once here; the dispatch path then skips re-flushing this
+            // buffer, which is the point of keeping it resident.
+            anchor.sync_to_device(&w).expect("sync weight");
         }
+        (
+            Gemm {
+                w,
+                scale,
+                m,
+                k,
+                sizes,
+            },
+            mx,
+        )
     };
     let load_gamma = |key: &str| -> Vec<f32> {
         std::fs::read(format!("{wdir}/g_{key}.f32"))
@@ -324,25 +529,54 @@ fn main() {
             .collect()
     };
 
-    let w_fc = load_gemm(&cache.anchor, "fc");
+    // The r14 array shares the anchor's DRM file + device heap, so its argument
+    // buffers survive every LRU eviction exactly like the resident weights do.
+    let mut r14 = if mc {
+        let g = NpuGemmR14::load_peer_dir(&cache.anchor, &r14_dir)
+            .unwrap_or_else(|e| panic!("load r14 {r14_dir}: {e:?}"));
+        let gm = g.geom();
+        println!(
+            "  [r14] {r14_dir}  M_TILE={} N_TILE={} K_CHUNK={}  (W group size = K_CHUNK)",
+            gm.m_tile(),
+            gm.n_tile(),
+            gm.k_chunk()
+        );
+        Some(g)
+    } else {
+        None
+    };
+    let rr = |rows: usize| r14.as_ref().map(|g| (g, rows));
+
+    let (w_fc, mc_fc) = load_gemm(&cache.anchor, "fc", rr(l_ctx));
     let g_hidden = load_gamma("hidden_norm");
     let g_final = load_gamma("final_norm");
-    let layers: Vec<(Gemm, Gemm, Gemm, Gemm, Gemm, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = (0
-        ..nl)
+    #[allow(clippy::type_complexity)]
+    let (layers, mc_layers): (
+        Vec<(Gemm, Gemm, Gemm, Gemm, Gemm, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>,
+        Vec<[Option<R14Matrix>; 5]>,
+    ) = (0..nl)
         .map(|li| {
+            let (qkv, m_qkv) = load_gemm(&cache.anchor, &format!("l{li}_qkv"), rr(b_rows));
+            let (kv, m_kv) = load_gemm(&cache.anchor, &format!("l{li}_kv"), rr(l_ctx));
+            let (o, m_o) = load_gemm(&cache.anchor, &format!("l{li}_o"), rr(b_rows));
+            let (gu, m_gu) = load_gemm(&cache.anchor, &format!("l{li}_gateup"), rr(b_rows));
+            let (dn, m_dn) = load_gemm(&cache.anchor, &format!("l{li}_down"), rr(b_rows));
             (
-                load_gemm(&cache.anchor, &format!("l{li}_qkv")),
-                load_gemm(&cache.anchor, &format!("l{li}_kv")),
-                load_gemm(&cache.anchor, &format!("l{li}_o")),
-                load_gemm(&cache.anchor, &format!("l{li}_gateup")),
-                load_gemm(&cache.anchor, &format!("l{li}_down")),
-                load_gamma(&format!("l{li}_input")),
-                load_gamma(&format!("l{li}_post")),
-                load_gamma(&format!("l{li}_qnorm")),
-                load_gamma(&format!("l{li}_knorm")),
+                (
+                    qkv,
+                    kv,
+                    o,
+                    gu,
+                    dn,
+                    load_gamma(&format!("l{li}_input")),
+                    load_gamma(&format!("l{li}_post")),
+                    load_gamma(&format!("l{li}_qnorm")),
+                    load_gamma(&format!("l{li}_knorm")),
+                ),
+                [m_qkv, m_kv, m_o, m_gu, m_dn],
             )
         })
-        .collect();
+        .unzip();
     println!(
         "  [setup] weights resident in {:.1} s",
         t_setup.elapsed().as_secs_f64()
@@ -376,7 +610,7 @@ fn main() {
 
     // Host-side staging (f32, mirroring the numpy harness exactly).
     let mut qbuf = vec![0i8; max_rows * (ne * h).max(i_dim).max(h)];
-    let mut sxbuf = vec![0f32; max_rows];
+    let mut sxbuf = vec![0f32; max_rows * 64]; // rows x k_chunks in multicore mode
     let mut csrow = vec![0f32; hd];
 
     // ── inputs + validation targets ─────────────────────────────────────────
@@ -393,7 +627,7 @@ fn main() {
     // one GEMM repeatedly on a kernel that is never evicted.
     if let Some(key) = arg("--probe-gemm") {
         let n: usize = arg("--probe-iters").and_then(|v| v.parse().ok()).unwrap_or(50);
-        let gm = load_gemm(&cache.anchor, &key);
+        let gm = load_gemm(&cache.anchor, &key, None).0;
         let rows = if gm.k == ne * h { l_ctx } else { b_rows };
         let name = gemm_kernel(gm.m, gm.k, rows);
         let idx = cache.get(&name);
@@ -418,6 +652,48 @@ fn main() {
             gm.m,
             gm.k,
             (gm.m * gm.k) as f64 / 1e6
+        );
+        return;
+    }
+
+    // Steady-state cost of ONE matrix on the r14 array, with no other kernel
+    // interleaved: separates the array's stream rate from body interference.
+    if let Some(key) = arg("--probe-r14") {
+        let n: usize = arg("--probe-iters").and_then(|v| v.parse().ok()).unwrap_or(20);
+        let rows: usize = arg("--probe-rows").and_then(|v| v.parse().ok()).unwrap_or(b_rows);
+        let (gm, mx, wb) = {
+            let g = r14.as_ref().expect("--gemm multicore");
+            let wb = g.geom().w_bytes();
+            let (gm, mx) = load_gemm(&cache.anchor, &key, Some((g, rows)));
+            (gm, mx.unwrap(), wb)
+        };
+        let x = vec![0.5f32; rows * gm.k];
+        let mut out = vec![0f32; rows * gm.m];
+        let gr = r14.as_mut().unwrap();
+        let (_, nd) = run_r14(gr, &mx, &x, &mut out, &mut qbuf, &mut sxbuf);
+        let mut ts = Vec::new();
+        for _ in 0..n {
+            let t0 = Instant::now();
+            let (dt, _) = run_r14(gr, &mx, &x, &mut out, &mut qbuf, &mut sxbuf);
+            ts.push((dt as f64 / 1e6, t0.elapsed().as_secs_f64() * 1e3));
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (lo, md, hi) = (ts[0], ts[n / 2], ts[n - 1]);
+        println!(
+            "  probe-r14 {key}: N={} K={} rows={rows}  {nd} dispatches, {:.1} MiB packed W\n\
+             \x20   device  min={:.2} med={:.2} max={:.2} ms   ({:.2} ms/dispatch med, {:.2} GB/s W)\n\
+             \x20   +host   min={:.2} med={:.2} max={:.2} ms   (n={n})",
+            gm.m,
+            gm.k,
+            (nd as usize * wb) as f64 / 1048576.0,
+            lo.0,
+            md.0,
+            hi.0,
+            md.0 / nd as f64,
+            (nd as usize * wb) as f64 / 1e6 / md.0,
+            lo.1,
+            md.1,
+            hi.1
         );
         return;
     }
@@ -454,9 +730,19 @@ fn main() {
 
     // One GEMM: quantize rows, dispatch, rescale into `out` [rows, M].
     macro_rules! gemm {
-        ($cache:expr, $gm:expr, $x:expr, $rows:expr, $out:expr) => {{
+        ($cache:expr, $gm:expr, $mx:expr, $x:expr, $rows:expr, $out:expr) => {{
             let gm: &Gemm = $gm;
             let rows: usize = $rows;
+            if let Some(mx) = $mx.as_ref() {
+                let g = r14.as_mut().expect("r14 kernel");
+                let (dt, nd) = run_r14(g, mx, $x, $out, &mut qbuf, &mut sxbuf);
+                npu_ns_total += dt;
+                dispatches += nd;
+                let name = format!("r14:N{}_K{}_rows{}", gm.m, gm.k, rows);
+                let e = per_op.entry(name).or_insert((0, 0, 0));
+                e.0 += nd;
+                e.1 += dt;
+            } else {
             quantize_row($x, rows, gm.k, &mut qbuf, &mut sxbuf);
             gemm_b.as_mut_slice()[..rows * gm.k].copy_from_slice(unsafe {
                 std::slice::from_raw_parts(qbuf.as_ptr() as *const u8, rows * gm.k)
@@ -491,6 +777,7 @@ fn main() {
                 for r in 0..rows {
                     out[r * gm.m + n] = sw * sxbuf[r] * c32[n * rows + r] as f32;
                 }
+            }
             }
         }};
     }
@@ -605,7 +892,7 @@ fn main() {
 
         // ── one-time context projection: thp = hidden_norm(fc(target_hidden))
         let mut thp_raw = vec![0f32; l_ctx * h];
-        gemm!(cache, &w_fc, &target_hidden, l_ctx, &mut thp_raw);
+        gemm!(cache, &w_fc, mc_fc, &target_hidden, l_ctx, &mut thp_raw);
         let mut thp = vec![0f32; l_ctx * h];
         rmsnorm!(cache, &rms32, thp_raw, &g_hidden, l_ctx, thp);
 
@@ -640,9 +927,9 @@ fn main() {
 
             // input_layernorm -> concat q/k/v projection (one GEMM)
             rmsnorm!(cache, &rms16, hidden, g_in, b_rows, x_norm);
-            gemm!(cache, gm_qkv, &x_norm, b_rows, &mut qkv);
+            gemm!(cache, gm_qkv, mc_layers[li][0], &x_norm, b_rows, &mut qkv);
             // k_ctx/v_ctx from thp (one GEMM)
-            gemm!(cache, gm_kv, &thp, l_ctx, &mut kv_ctx);
+            gemm!(cache, gm_kv, mc_layers[li][1], &thp, l_ctx, &mut kv_ctx);
 
             // split + assemble k/v as [ctx rows ; noise rows]
             let (nq, nk) = (gm_qkv.sizes[0], gm_qkv.sizes[1]);
@@ -733,14 +1020,14 @@ fn main() {
                 }
             }
 
-            gemm!(cache, gm_o, &ctx, b_rows, &mut attn_proj);
+            gemm!(cache, gm_o, mc_layers[li][2], &ctx, b_rows, &mut attn_proj);
             for i in 0..b_rows * h {
                 hidden[i] = residual[i] + attn_proj[i];
             }
 
             let residual2 = hidden.clone();
             rmsnorm!(cache, &rms16, hidden, g_post, b_rows, x_norm);
-            gemm!(cache, gm_gu, &x_norm, b_rows, &mut gateup);
+            gemm!(cache, gm_gu, mc_layers[li][3], &x_norm, b_rows, &mut gateup);
             // swiglu over the [gate | up] halves of the concat GEMM output
             {
                 let m_gu = gm_gu.m;
@@ -779,7 +1066,7 @@ fn main() {
                 kern.sync_output(&sw_out).expect("sync swiglu");
                 read_bf16(&sw_out, &mut swig[..b_rows * i_dim]);
             }
-            gemm!(cache, gm_dn, &swig, b_rows, &mut down);
+            gemm!(cache, gm_dn, mc_layers[li][4], &swig, b_rows, &mut down);
             for i in 0..b_rows * h {
                 hidden[i] = residual2[i] + down[i];
             }
