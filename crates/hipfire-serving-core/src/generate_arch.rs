@@ -3101,6 +3101,35 @@ pub fn framed_gemma3_prompt(prompt: &str, system_prompt: Option<&str>) -> String
     framed
 }
 
+/// Frame a `{system, user}` turn into the qwen35 jinja `chat_template` the
+/// serving prefill path uses, so the daemon's steer-capture op templates a turn
+/// byte-identically to serving. Mirrors `qwen35_materialize_batch_prefill_prompt`'s
+/// single-turn render (bos folded by the template; `enable_thinking` on).
+pub fn framed_qwen35_prompt(
+    m: &LoadedModel,
+    user: &str,
+    system: Option<&str>,
+) -> Result<String, String> {
+    let tokenizer = m
+        .tokenizer
+        .as_ref()
+        .ok_or_else(|| "tokenizer not loaded".to_string())?;
+    let template = m
+        .chat_template
+        .as_deref()
+        .ok_or_else(|| "qwen35 steer-capture requires a jinja chat_template".to_string())?;
+    prompt_frame::JinjaChatFrame {
+        tokenizer,
+        template,
+        system,
+        user,
+        enable_thinking: true,
+        bos_token: None,
+    }
+    .render()
+    .map_err(|e| format!("qwen35 chat_template render failed: {e}"))
+}
+
 /// Gemma3 text (arch_id=12, e.g. medgemma-*-text) generate path.
 ///
 /// Frames the gemma chat prompt (bos + user turn + model turn; `<bos>` /

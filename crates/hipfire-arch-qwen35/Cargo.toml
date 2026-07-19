@@ -31,6 +31,7 @@ hipfire-rocm = { path = "../hipfire-rocm" }
 hip-bridge = { path = "../hip-bridge" }
 hipfire-rdna = { path = "../hipfire-rdna" }
 hipfire-specdecode = { path = "../hipfire-specdecode" }
+hipfire-steer = { path = "../hipfire-steer" }
 serde.workspace = true
 serde_json = "1"
 libc.workspace = true

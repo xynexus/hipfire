@@ -399,6 +399,10 @@ pub enum DaemonRequest {
     UnloadWorker,
     PflashLabels(PflashLabelsRequest),
     TrainDrafter,
+    /// Wire tag `train_lora`. Raw-JSON op (the daemon re-parses the message);
+    /// mirrors `TrainDrafter`. Terminal event is the shared `train_done`
+    /// ([`DaemonResponse::TrainDone`]).
+    TrainLora,
     Diag,
     BenchPrefill(BenchPrefillRequest),
     Profile,
@@ -488,6 +492,20 @@ pub enum DaemonResponse {
     HneuronOk {
         n_intervened: usize,
         gain: f32,
+    },
+    /// Terminal event of a [`DaemonRequest::TrainDrafter`] run. Progress
+    /// (`train_start`/`train_progress`) falls through to `Unknown`; this
+    /// carries the final report (best_eval, checkpoint, ...).
+    TrainDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    /// Non-terminal progress event of a micro-step-preemptible `train_lora` run
+    /// (`done: false`). The runner resumes the resident session via `run_id` and
+    /// re-enqueues; the terminal event stays `train_done`.
+    TrainProgress {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
     },
     #[serde(other)]
     Unknown,
@@ -824,6 +842,9 @@ mod tests {
             (json!({"type": "train_drafter", "output": "d.hfq"}), |r| {
                 matches!(r, DaemonRequest::TrainDrafter)
             }),
+            (json!({"type": "train_lora", "output": "a.hfq"}), |r| {
+                matches!(r, DaemonRequest::TrainLora)
+            }),
             (json!({"type": "diag"}), |r| {
                 matches!(r, DaemonRequest::Diag)
             }),
@@ -878,6 +899,10 @@ mod tests {
             (
                 json!({"type": "release_sessions_done", "id": "x", "released": 1}),
                 |response| matches!(response, DaemonResponse::ReleaseSessionsDone { .. }),
+            ),
+            (
+                json!({"type": "train_progress", "run_id": "r", "step": 25, "done": false}),
+                |response| matches!(response, DaemonResponse::TrainProgress { .. }),
             ),
         ];
         for (value, matches) in cases {

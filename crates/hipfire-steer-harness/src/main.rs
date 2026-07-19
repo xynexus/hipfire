@@ -16,12 +16,25 @@ use std::path::{Path, PathBuf};
 
 use hipfire_steer::driver::{load_prompts, run_driver, DriverConfig, ModelHarness, Prompt};
 use hipfire_steer::SteerMode;
-use hipfire_steer_harness::DaemonHarness;
+use hipfire_steer_harness::{DaemonHarness, HttpHarness};
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 
 struct Args {
-    hfq: String,
+    /// Required in the default (spawn-own-daemon) mode; optional in server mode
+    /// where it only supplies the default `--model` stem.
+    hfq: Option<String>,
+    /// When set, run as a THIN CLIENT of a live server at this URL (talking to its
+    /// HTTP `/steer` + `/v1/chat/completions` routes) instead of spawning a private
+    /// daemon that would take the GPU flock and rival the serving process.
+    server_url: Option<String>,
+    /// Model geometry — the server's `/steer/capture` needs it and a thin client
+    /// can't read it from a load response it never made. Required in server mode.
+    num_layers: Option<usize>,
+    hidden: Option<usize>,
+    /// Chat/generate model id for `/v1/chat/completions`; defaults to the `--hfq`
+    /// file stem.
+    model: Option<String>,
     data_dir: PathBuf,
     limit: usize,
     eval_limit: usize,
@@ -40,6 +53,10 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut hfq = None;
+    let mut server_url = None;
+    let mut num_layers = None;
+    let mut hidden = None;
+    let mut model = None;
     let mut data_dir = PathBuf::from("crates/hipfire-steer/data/medical");
     let mut limit = 16usize;
     let mut eval_limit = 16usize;
@@ -57,6 +74,10 @@ fn parse_args() -> Result<Args, String> {
         let mut next = || it.next().ok_or(format!("{a} needs a value"));
         match a.as_str() {
             "--hfq" => hfq = Some(next()?),
+            "--server-url" => server_url = Some(next()?),
+            "--num-layers" => num_layers = Some(next()?.parse().map_err(|_| "bad --num-layers")?),
+            "--hidden" => hidden = Some(next()?.parse().map_err(|_| "bad --hidden")?),
+            "--model" => model = Some(next()?),
             "--data-dir" => data_dir = PathBuf::from(next()?),
             "--limit" => limit = next()?.parse().map_err(|_| "bad --limit")?,
             "--eval-limit" => eval_limit = next()?.parse().map_err(|_| "bad --eval-limit")?,
@@ -89,6 +110,8 @@ fn parse_args() -> Result<Args, String> {
                     "usage: hipfire-steer --hfq <model.hfq> [--data-dir DIR] [--limit N] \
                      [--eval-limit N] [--strengths a,b,c] [--mode steer|ablate|both] \
                      [--max-new-tokens N] [--max-seq N] [--no-orthogonalize]\n\
+                     thin-client (talk to a live server, no private daemon):\n\
+                     \x20 --server-url URL --num-layers N --hidden H [--model NAME]\n\
                      runtime demos: [--apply-lora PATH] [--stack-demo PATH] [--eval-refusals]\n\
                      (adapter export / merge / convert live in `hipfire-coexistence lora ...`)"
                 );
@@ -98,8 +121,18 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
+    // In the default mode `--hfq` is required (it names the model to load); in
+    // server mode the server already holds the model, so `--hfq` is optional and
+    // only feeds the `--model` default.
+    if server_url.is_none() && hfq.is_none() {
+        return Err("--hfq is required (or use --server-url for thin-client mode)".to_string());
+    }
     Ok(Args {
-        hfq: hfq.ok_or("--hfq is required")?,
+        hfq,
+        server_url,
+        num_layers,
+        hidden,
+        model,
         data_dir,
         limit,
         eval_limit,
@@ -137,16 +170,52 @@ fn main() -> Result<(), Box<dyn Error>> {
         bad_eval.len()
     );
 
+    // Thin-client mode: drive a live server over HTTP (no private daemon, no rival
+    // GPU flock). The lora/eval demos are daemon-only; server mode is the driver.
+    if let Some(url) = args.server_url.clone() {
+        let model = args
+            .model
+            .clone()
+            .or_else(|| {
+                args.hfq.as_deref().and_then(|h| {
+                    Path::new(h)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                })
+            })
+            .ok_or("server mode needs --model (or --hfq to default its stem)")?;
+        let num_layers = args.num_layers.ok_or(
+            "server mode needs --num-layers (the server can't report geometry to a thin client)",
+        )?;
+        let hidden = args.hidden.ok_or(
+            "server mode needs --hidden (the server can't report geometry to a thin client)",
+        )?;
+        eprintln!("thin client → {url} (model {model}, {num_layers} layers, hidden {hidden}) ...");
+        let mut harness = HttpHarness::connect(
+            url,
+            model,
+            num_layers,
+            hidden,
+            SYSTEM_PROMPT.to_string(),
+            args.max_new_tokens,
+        )?;
+        return run_and_report(
+            &args,
+            good_prompts,
+            bad_prompts,
+            good_eval,
+            bad_eval,
+            &mut harness,
+        );
+    }
+
+    let hfq = args.hfq.clone().ok_or("--hfq is required")?;
     let daemon_bin = hipfire_daemon_adapter::find_daemon_bin_or_error()?;
-    eprintln!(
-        "loading {} via daemon {} ...",
-        args.hfq,
-        daemon_bin.display()
-    );
+    eprintln!("loading {} via daemon {} ...", hfq, daemon_bin.display());
     let tmp = std::env::temp_dir().join(format!("hipfire-steer-{}", std::process::id()));
     let mut harness = DaemonHarness::connect(
         &daemon_bin,
-        Path::new(&args.hfq),
+        Path::new(&hfq),
         args.max_seq,
         args.max_new_tokens,
         SYSTEM_PROMPT.to_string(),
@@ -170,20 +239,41 @@ fn main() -> Result<(), Box<dyn Error>> {
         return eval_refusals(&mut harness, &bad_eval);
     }
 
+    run_and_report(
+        &args,
+        good_prompts,
+        bad_prompts,
+        good_eval,
+        bad_eval,
+        &mut harness,
+    )
+}
+
+/// Build the driver config, run the sweep, and print the Pareto report. Shared by
+/// the daemon and thin-client (HTTP) paths — both reach the model through the
+/// `ModelHarness` trait, so the driver code is identical.
+fn run_and_report(
+    args: &Args,
+    good_prompts: Vec<Prompt>,
+    bad_prompts: Vec<Prompt>,
+    good_eval: Vec<Prompt>,
+    bad_eval: Vec<Prompt>,
+    harness: &mut dyn ModelHarness,
+) -> Result<(), Box<dyn Error>> {
     let cfg = DriverConfig {
         good_prompts,
         bad_prompts,
         good_eval,
         bad_eval,
-        modes: args.modes,
-        strengths: args.strengths,
+        modes: args.modes.clone(),
+        strengths: args.strengths.clone(),
         layer_range: 0..harness.num_layers(),
         orthogonalize: args.orthogonalize,
         markers: DriverConfig::default_markers(),
     };
 
     eprintln!("running driver ({} layers) ...", harness.num_layers());
-    let report = run_driver(&cfg, &mut harness)?;
+    let report = run_driver(&cfg, harness)?;
 
     println!("\n=== steer driver report ===");
     println!(

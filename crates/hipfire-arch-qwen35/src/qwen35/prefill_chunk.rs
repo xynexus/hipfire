@@ -7272,6 +7272,11 @@ pub(crate) fn forward_prefill_chunk(
             _ => panic!("layer type mismatch at layer {layer_idx}"),
         }
         dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
+        // Block-boundary steering/abliteration hook (no-op unless active).
+        // Prefill convention: capture folds the last position, apply hits all.
+        // `pbs.x_batch` holds the settled per-layer residual for all n rows of
+        // this chunk (same tensor the DFlash extract sites write).
+        hipfire_steer::maybe_steer_block_batched(gpu, &pbs.x_batch, layer_idx, n, dim)?;
     }
 
     // ── 3. Final output norm + logits ───────────────────────────────────

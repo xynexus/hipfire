@@ -315,6 +315,174 @@ impl ModelHarness for DaemonHarness {
     }
 }
 
+/// A [`ModelHarness`] that talks to an ALREADY-RUNNING `hipfire` server over its
+/// HTTP `/steer` + `/v1/chat/completions` routes, instead of spawning a private
+/// daemon that would take the GPU flock and rival the serving process. The GPU
+/// work runs on the shared resident daemon behind the server's batch runner.
+///
+/// The server holds the capture/apply session (process-global on its side), so
+/// this harness is a thin client: it buffers capture prompts locally and posts a
+/// whole atomic capture session, and routes apply/clear/generate as single POSTs.
+/// Geometry (`num_layers`/`hidden`) can't be read from a load response we never
+/// made, so it is supplied by the caller (CLI flags).
+pub struct HttpHarness {
+    client: reqwest::blocking::Client,
+    base_url: String,
+    model: String,
+    system: String,
+    num_layers: usize,
+    hidden: usize,
+    max_new_tokens: usize,
+    /// Buffered `(system, user)` capture prompts between begin/finish.
+    buf: Vec<(String, String)>,
+}
+
+impl HttpHarness {
+    /// Build the client and warm the server so a model is resident before the
+    /// first `/steer/*` call (those error "no model loaded" otherwise). `base_url`
+    /// is the server root, e.g. `http://127.0.0.1:11435`.
+    pub fn connect(
+        base_url: String,
+        model: String,
+        num_layers: usize,
+        hidden: usize,
+        system: String,
+        max_new_tokens: usize,
+    ) -> Result<Self, String> {
+        let client = reqwest::blocking::Client::builder()
+            // Generation of a batch can be slow; no ceiling short enough to be safe.
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .map_err(|e| format!("steer http harness: build client: {e}"))?;
+        let h = Self {
+            client,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model,
+            system,
+            num_layers,
+            hidden,
+            max_new_tokens,
+            buf: Vec::new(),
+        };
+        // Warm the lazy loader: one trivial chat turn makes the model resident.
+        h.chat("ok")
+            .map_err(|e| format!("steer http harness: warm load: {e}"))?;
+        Ok(h)
+    }
+
+    /// POST `body` to `path` and return the parsed JSON response, mapping transport
+    /// and non-2xx statuses into the trait's error channel.
+    fn post(&self, path: &str, body: serde_json::Value) -> HipResult<serde_json::Value> {
+        let url = format!("{}{path}", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .map_err(|e| HipError::new(0, &format!("POST {path}: {e}")))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .map_err(|e| HipError::new(0, &format!("POST {path}: read body: {e}")))?;
+        if !status.is_success() {
+            return Err(HipError::new(0, &format!("POST {path}: {status}: {text}")));
+        }
+        serde_json::from_str(&text)
+            .map_err(|e| HipError::new(0, &format!("POST {path}: parse json: {e}: {text}")))
+    }
+
+    /// One greedy chat completion, returning the assistant content (thinking stripped).
+    fn chat(&self, user: &str) -> HipResult<String> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": self.system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": self.max_new_tokens,
+        });
+        let v = self.post("/v1/chat/completions", body)?;
+        let content = v["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| {
+                HipError::new(0, &format!("chat: no choices[0].message.content in {v}"))
+            })?;
+        Ok(strip_thinking(content).to_string())
+    }
+}
+
+impl ModelHarness for HttpHarness {
+    fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+    fn hidden(&self) -> usize {
+        self.hidden
+    }
+
+    fn begin_capture(&mut self) -> HipResult<()> {
+        self.buf.clear();
+        Ok(())
+    }
+
+    fn capture(&mut self, prompts: &[Prompt]) -> HipResult<()> {
+        for p in prompts {
+            self.buf.push((self.system.clone(), p.user.clone()));
+        }
+        Ok(())
+    }
+
+    fn finish_capture(&mut self) -> HipResult<CaptureMeans> {
+        let prompts: Vec<_> = self
+            .buf
+            .drain(..)
+            .map(|(system, user)| serde_json::json!({ "system": system, "user": user }))
+            .collect();
+        let body = serde_json::json!({
+            "num_layers": self.num_layers,
+            "hidden": self.hidden,
+            "prompts": prompts,
+        });
+        let v = self.post("/steer/capture", body)?;
+        let means: Vec<Vec<f32>> = serde_json::from_value(v["means"].clone())
+            .map_err(|e| HipError::new(0, &format!("finish_capture: parse means: {e}")))?;
+        Ok(CaptureMeans(means))
+    }
+
+    fn begin_apply(&mut self, spec: &SteerSpec) -> HipResult<()> {
+        let body = serde_json::json!({
+            "directions": spec.directions,
+            "mode": match spec.mode {
+                SteerMode::Steer => "steer",
+                SteerMode::Ablate => "ablate",
+            },
+            "strength": spec.strength,
+            "layer_start": spec.layer_range.start,
+            "layer_end": spec.layer_range.end,
+        });
+        self.post("/steer/apply", body)?;
+        Ok(())
+    }
+
+    fn clear(&mut self) -> HipResult<()> {
+        self.post("/steer/clear", serde_json::json!({}))?;
+        Ok(())
+    }
+
+    fn generate(&mut self, prompts: &[Prompt]) -> HipResult<Vec<String>> {
+        prompts.iter().map(|p| self.chat(&p.user)).collect()
+    }
+
+    // ponytail: KLD scoring isn't wired over HTTP yet — no `/steer/kld` route.
+    // Refusal-count scoring still works without it; the driver's KLD column just
+    // reads 0.0 (never a false "damage-free" — it's simply unmeasured over HTTP).
+    fn kld_build_ref(&mut self, _prompts: &[Prompt]) -> HipResult<()> {
+        Ok(())
+    }
+    fn kld_score(&mut self, _prompts: &[Prompt]) -> HipResult<f32> {
+        Ok(0.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::strip_thinking;

@@ -44,11 +44,11 @@ use crate::model::{effective_raw, LoadedModel};
 use crate::output_filter::normalize_daemon_prompt;
 use crate::session::{
     loaded_model_state_arena_backend, loaded_model_worker_runtime_view, qwen35_activate_session,
-    qwen35_active_logical_position, qwen35_allocate_session_state, qwen35_save_active_session,
-    sequence_state_arena_activate_session, sequence_state_arena_active_logical_position,
-    sequence_state_arena_checkpoint_session_state, sequence_state_arena_fork_session_state,
-    sequence_state_arena_is_session_resident, sequence_state_arena_reset_active_session,
-    sequence_state_arena_resident_session_count,
+    qwen35_active_logical_position, qwen35_allocate_session_state, qwen35_reset_active_session,
+    qwen35_save_active_session, sequence_state_arena_activate_session,
+    sequence_state_arena_active_logical_position, sequence_state_arena_checkpoint_session_state,
+    sequence_state_arena_fork_session_state, sequence_state_arena_is_session_resident,
+    sequence_state_arena_reset_active_session, sequence_state_arena_resident_session_count,
     validate_qwen35_fused_grouped_moe_prefill_model_capability, Qwen35RequestSessionState,
 };
 
@@ -184,6 +184,32 @@ pub fn qwen35_prefill_active_session(
         0
     };
     Ok(tokens.len())
+}
+
+/// Steer-capture prefill: run the block-hooked qwen35 forward ONCE over `tokens`
+/// from a fresh single-sequence state (positions from 0), discarding logits, so
+/// the wired block-boundary steer hook (`maybe_steer_block_batched`) folds the
+/// last-prompt-token residual per layer into the active capture session. Reuses
+/// the exact serving forward-assembly (`qwen35_prefill_active_session` →
+/// `forward_prefill_batch`) so residuals match serving. Resets the active session
+/// before AND after so the capture prompt leaves no state for the next request.
+pub fn run_steer_capture_prefill_qwen35(
+    m: &mut LoadedModel,
+    gpu: &mut hipfire_rdna::Gpu,
+    tokens: &[u32],
+) -> Result<(), String> {
+    if !is_qwen35_family_arch_id(m.arch_id) {
+        return Err(format!(
+            "steer_capture: arch_id {} is not qwen35 family",
+            m.arch_id
+        ));
+    }
+    // Fresh single-sequence state: seq_pos=0, KV + DeltaNet cleared.
+    qwen35_reset_active_session(m, gpu)?;
+    let result = qwen35_prefill_active_session(m, gpu, tokens, false).map(|_| ());
+    // Tear down so the capture prompt does not leak into the next real request.
+    qwen35_reset_active_session(m, gpu)?;
+    result
 }
 
 /// Serial-path prefill of one owned session's token segment (the per-session

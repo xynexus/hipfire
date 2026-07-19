@@ -43,6 +43,9 @@ pub(crate) fn forward_scratch_layers(
         && hidden_rb.is_none()
         && gdn_tape_capture.is_none()
         && !rq_hand_optin
+        // An active steer/capture session needs the per-layer block-boundary
+        // hook, which only the hand arms below carry — force the hand path.
+        && !hipfire_steer::is_active()
     {
         return forward_scratch_layers_lowered(
             gpu,
@@ -2991,6 +2994,10 @@ pub(crate) fn forward_scratch_layers(
             _ => unreachable!(),
         }
         dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
+        // Block-boundary steering/abliteration hook (no-op unless a session is
+        // active). `s.x` is the settled post-residual stream for every layer arm
+        // here — same site `dump_hidden_localize` reads. Decode is one position.
+        hipfire_steer::maybe_steer_block(gpu, &s.x, layer_idx)?;
     }
 
     // Final norm into scratch.tmp; optionally emit logits into scratch.logits.

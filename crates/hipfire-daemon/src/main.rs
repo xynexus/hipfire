@@ -3138,6 +3138,25 @@ fn report_gpu_init_failure(err: &hip_bridge::HipError) {
     eprintln!("  Run `hipfire diag` for a full environment report.");
 }
 
+/// Resident state of a micro-step-preemptible `train_lora` run. The daemon runs
+/// one `quantum` of steps per `TrainLora` request and keeps this alive between
+/// requests (keyed by `run_id`); the runner re-enqueues the training lease each
+/// quantum so lower-priority training time-slices with interactive serving.
+struct LoraTrainSession {
+    run_id: String,
+    model: hipfire_train::model::LlamaModel,
+    opt: hipfire_train::optim::AdamW,
+    batch: Vec<(Vec<u32>, Vec<f32>)>,
+    pos: Vec<f32>,
+    target_tokens: f32,
+    step: usize,
+    total: usize,
+    initial_ce: f32,
+    last_ce: f32,
+    output: String,
+    vocab: usize,
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -3261,6 +3280,9 @@ fn main() {
     // None means the drafter shares the target gpu (single-card, unchanged).
     let mut pflash_drafter_gpu: Option<hipfire_rdna::Gpu> = None;
     let mut dummy_model: Option<DummyModelState> = None;
+    // Resident micro-step-preemptible LoRA training session (see LoraTrainSession).
+    // Some between quanta of a run; runner drives one quantum per TrainLora request.
+    let mut lora_train_session: Option<LoraTrainSession> = None;
     let mut resource_reservations = ResourceReservationManager::from_env();
     if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
         hipfire_daemon_adapter::fatal_startup_error(
@@ -6369,10 +6391,23 @@ fn main() {
                     continue;
                 };
                 // Frame the turn byte-identically to the `generate` path so capture
-                // sees the exact residuals serving would (BOS + gemma3 turn frame).
+                // sees the exact residuals serving would. gemma3 uses its literal
+                // turn frame; qwen35 (loose-slot) uses its jinja `chat_template`
+                // single-turn render.
                 let system_opt = (!system.is_empty()).then_some(system.as_str());
-                let framed =
-                    hipfire_serving_core::generate_arch::framed_gemma3_prompt(&user, system_opt);
+                let framed = if is_qwen35_family_arch_id(m.arch_id) {
+                    match hipfire_serving_core::generate_arch::framed_qwen35_prompt(
+                        m, &user, system_opt,
+                    ) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            emit_error_with_id(&mut stdout, "", format!("steer_capture: {e}"));
+                            continue;
+                        }
+                    }
+                } else {
+                    hipfire_serving_core::generate_arch::framed_gemma3_prompt(&user, system_opt)
+                };
                 let tokens = tokenizer.encode(&framed);
                 if tokens.is_empty() {
                     emit_error_with_id(
@@ -6382,12 +6417,15 @@ fn main() {
                     );
                     continue;
                 }
-                // Prefill-only through whichever gemma3 backend is resident; both
-                // fire the block-boundary hook (batched last-position for arch 12,
-                // per-token last-wins for arch 13), so the hook observes the
-                // last-prompt-token residual per block. No decode loop.
+                // Prefill-only through whichever resident arch fires the
+                // block-boundary hook so it observes the last-prompt-token residual
+                // per block. No decode loop. gemma3 (12/13) folds via its backend
+                // prefill; qwen35 (loose-slot) folds via a fresh single-sequence
+                // capture prefill. Both hit `maybe_steer_block[_batched]`.
                 use hipfire_runtime::arch::SimpleAr;
-                let result: Result<(), String> = if let Some(b) = m.gemma3_text.as_mut() {
+                let result: Result<(), String> = if is_qwen35_family_arch_id(m.arch_id) {
+                    run_steer_capture_prefill_qwen35(m, &mut gpu, &tokens)
+                } else if let Some(b) = m.gemma3_text.as_mut() {
                     b.state.reset();
                     SimpleAr::prefill(b, &mut gpu, &tokens)
                 } else if let Some(b) = m.gemma3_vl.as_mut() {
@@ -6395,7 +6433,7 @@ fn main() {
                     SimpleAr::prefill(b, &mut gpu, &tokens)
                 } else {
                     Err(format!(
-                        "steer_capture: arch_id {} is not gemma3 (12|13)",
+                        "steer_capture: arch_id {} is unsupported (need gemma3 or qwen35)",
                         m.arch_id
                     ))
                 };
@@ -7336,6 +7374,325 @@ fn main() {
                     })
                 );
                 let _ = stdout.flush();
+            }
+
+            // Train a LoRA adapter on a frozen bf16 base, in-process on the
+            // resident engine. SCAFFOLD: this validates args + the hipfire-train
+            // link and reserves the wire/runner/route path (mirrors TrainDrafter),
+            // but the ASSEMBLED, data-driven, adapter-SAVING LoRA loop is not yet
+            // wired — hipfire-train has the proven primitives (model::from_f32_weights
+            // → model_forward → model_loss_backward → optim::AdamW, demonstrated in
+            // examples/overfit_supra50m.rs) but no reusable loop that loads real
+            // data/labels and serializes an adapter checkpoint. Emits a clear
+            // not-implemented error until that lands.
+            //
+            // NOTE: even when assembled, this trains hipfire-train's OWN un-fused
+            // LlamaModel — NOT the served qwen35 arch's adapters. Training the
+            // served forward via activation-save at the in-forward HOOK sites is
+            // the large P3 follow-on. See docs/plans/2026-07-19-daemon-training-steering.md.
+            DaemonRequest::TrainLora => {
+                // Micro-step-PREEMPTIBLE LoRA-on-frozen training as a daemon op.
+                // Runs up to `quantum` steps per request and keeps a resident
+                // LoraTrainSession alive between requests (keyed by `run_id`); the
+                // runner re-enqueues the low-priority training lease each quantum so
+                // it time-slices with interactive serving. Compute is verbatim from
+                // the validated whole-run loop (hipfire_train, overfit_supra50m.rs):
+                // forward → loss → backward-THROUGH-ADAPTERS → AdamW, then a final
+                // HFLORA01 adapter dump. NOTE: trains hipfire-train's own un-fused
+                // LlamaModel, NOT the served qwen35 adapters (a follow-on).
+                // `data=overfit` is a deterministic synthetic batch.
+                const IGNORE: i32 = -100;
+                let run_id = msg
+                    .get("run_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let train = msg
+                    .get("train")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let quantum = msg
+                    .get("quantum")
+                    .or_else(|| train.get("quantum"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(25)
+                    .max(1);
+
+                // CONTINUE the resident session iff its run_id matches; else START
+                // fresh (loading the model + building the batch/optimizer once).
+                let continue_run = !run_id.is_empty()
+                    && lora_train_session
+                        .as_ref()
+                        .map(|s| s.run_id == run_id)
+                        .unwrap_or(false);
+                if !continue_run {
+                    lora_train_session = None; // drop any stale session, free VRAM
+                    let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from)
+                    else {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            "train_lora: 'output' (adapter checkpoint path) required".to_string(),
+                        );
+                        continue;
+                    };
+                    let Some(base_dir) = msg
+                        .get("model")
+                        .or_else(|| msg.get("base"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                    else {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            "train_lora: 'model' (fp32 base model dir) required".to_string(),
+                        );
+                        continue;
+                    };
+                    let getu = |k: &str, d: usize| -> usize {
+                        train
+                            .get(k)
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                            .unwrap_or(d)
+                    };
+                    let getf = |k: &str, d: f32| -> f32 {
+                        train
+                            .get(k)
+                            .and_then(|v| v.as_f64())
+                            .map(|v| v as f32)
+                            .unwrap_or(d)
+                    };
+                    let steps = getu("steps", 200);
+                    let rank = getu("rank", 16);
+                    let seq = getu("seq", 8);
+                    let n_seqs = getu("n_seqs", 3);
+                    let alpha = getf("alpha", 32.0);
+                    let lr = getf("lr", 5e-3);
+                    let data_mode = msg
+                        .get("data")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("overfit");
+                    if data_mode != "overfit" {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("train_lora: data source '{data_mode}' not implemented (only 'overfit' synthetic batch is wired; real-corpus loading is a follow-on)"),
+                        );
+                        continue;
+                    }
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "train_start", "op": "train_lora", "base": base_dir,
+                            "steps": steps, "rank": rank, "alpha": alpha, "lr": lr,
+                            "run_id": run_id, "quantum": quantum,
+                        })
+                    );
+                    let _ = stdout.flush();
+                    let built: Result<LoraTrainSession, String> = (|| {
+                        let dir = std::path::Path::new(&base_dir);
+                        if !dir.exists() {
+                            return Err(format!("base model dir not found: {base_dir}"));
+                        }
+                        let (cfg, weights) = hipfire_train::loader::load_llama_fp32(&mut gpu, dir)
+                            .map_err(|e| e.to_string())?;
+                        let vocab = cfg.vocab_size;
+                        let model = hipfire_train::model::LlamaModel::from_f32_weights(
+                            &mut gpu, &cfg, weights, seq, rank, alpha,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        let pos: Vec<f32> = (0..seq).map(|t| t as f32).collect();
+                        let batch: Vec<(Vec<u32>, Vec<f32>)> = (0..n_seqs)
+                            .map(|s| {
+                                let toks: Vec<u32> = (0..seq)
+                                    .map(|t| (((t + 1) * 2654435761 + s * 40503) % vocab) as u32)
+                                    .collect();
+                                let mut tgts: Vec<f32> =
+                                    (0..seq).map(|t| toks[(t + 1) % seq] as f32).collect();
+                                tgts[seq - 1] = IGNORE as f32;
+                                (toks, tgts)
+                            })
+                            .collect();
+                        let target_tokens = (n_seqs * (seq - 1)).max(1) as f32;
+                        let sizes = model.lora_param_sizes();
+                        let opt = hipfire_train::optim::AdamW::new(
+                            &mut gpu, &sizes, lr, 0.9, 0.999, 1e-8, 0.0,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        // total = steps + 1: the final pass is eval-only (no update),
+                        // matching the validated whole-run `for step in 0..=steps`.
+                        Ok(LoraTrainSession {
+                            run_id: run_id.clone(),
+                            model,
+                            opt,
+                            batch,
+                            pos,
+                            target_tokens,
+                            step: 0,
+                            total: steps + 1,
+                            initial_ce: 0.0,
+                            last_ce: 0.0,
+                            output,
+                            vocab,
+                        })
+                    })();
+                    match built {
+                        Ok(sess) => lora_train_session = Some(sess),
+                        Err(e) => {
+                            emit_error_with_id(&mut stdout, "", format!("train_lora: {e}"));
+                            continue;
+                        }
+                    }
+                }
+
+                // Run ONE quantum of steps on the resident session. Destructure the
+                // &mut session into disjoint field bindings so the per-step
+                // forward/backward (reads `model`) and `opt.step` (mut `opt`) don't
+                // trip the borrow checker through a single `sess`.
+                let quantum_result: Result<(), String> = {
+                    let sess = lora_train_session
+                        .as_mut()
+                        .expect("session present after start/continue");
+                    let LoraTrainSession {
+                        model,
+                        opt,
+                        batch,
+                        pos,
+                        target_tokens,
+                        step,
+                        total,
+                        initial_ce,
+                        last_ce,
+                        ..
+                    } = sess;
+                    (|| {
+                        let end = (*step + quantum).min(*total);
+                        while *step < end {
+                            let s = *step;
+                            let mut total_loss = 0.0f32;
+                            for (toks, tgts) in batch.iter() {
+                                let acts = hipfire_train::model::model_forward(
+                                    &mut gpu,
+                                    &*model,
+                                    toks,
+                                    pos.as_slice(),
+                                )
+                                .map_err(|e| e.to_string())?;
+                                let (loss, grads) = hipfire_train::model::model_loss_backward(
+                                    &mut gpu, &*model, &acts, tgts, IGNORE,
+                                )
+                                .map_err(|e| e.to_string())?;
+                                total_loss += loss;
+                                // Last pass (step == total-1) is eval-only.
+                                if s < *total - 1 {
+                                    let params = model.lora_params();
+                                    let gflat = hipfire_train::model::flatten_lora_grads(&grads);
+                                    opt.step(&mut gpu, &params, &gflat)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                                // Free per-step activations + grads. model_forward /
+                                // model_loss_backward allocate fresh GPU scratch each
+                                // step and neither frees it; without this the resident
+                                // session leaks VRAM across steps → OOM after a few
+                                // hundred steps (the overfit example only "works"
+                                // because it runs alone on a big-VRAM box).
+                                hipfire_train::model::free_model_acts(&mut gpu, acts)
+                                    .map_err(|e| e.to_string())?;
+                                for g in grads {
+                                    gpu.free_tensor(g.daq).map_err(|e| e.to_string())?;
+                                    gpu.free_tensor(g.dbq).map_err(|e| e.to_string())?;
+                                    gpu.free_tensor(g.dav).map_err(|e| e.to_string())?;
+                                    gpu.free_tensor(g.dbv).map_err(|e| e.to_string())?;
+                                    gpu.free_tensor(g.dnorm1).map_err(|e| e.to_string())?;
+                                    gpu.free_tensor(g.dnorm2).map_err(|e| e.to_string())?;
+                                }
+                            }
+                            *last_ce = total_loss / *target_tokens;
+                            if s == 0 {
+                                *initial_ce = *last_ce;
+                            }
+                            *step += 1;
+                        }
+                        Ok(())
+                    })()
+                };
+                if let Err(e) = quantum_result {
+                    lora_train_session = None;
+                    emit_error_with_id(&mut stdout, "", format!("train_lora: {e}"));
+                    continue;
+                }
+
+                let done = lora_train_session
+                    .as_ref()
+                    .map(|s| s.step >= s.total)
+                    .unwrap_or(false);
+                if done {
+                    // Final quantum: dump the adapter and finish. `take()` drops the
+                    // resident session (frees VRAM) before we emit the terminal event.
+                    let sess = lora_train_session.take().expect("done implies present");
+                    // Persist the trained adapter: layer-major [aq,bq,av,bv] f32
+                    // tensors. Minimal container (magic + count + per-tensor
+                    // shape/data) — a serving-loadable format is a follow-on.
+                    let dump: Result<usize, String> = (|| {
+                        let params = sess.model.lora_params();
+                        let mut buf: Vec<u8> = Vec::new();
+                        buf.extend_from_slice(b"HFLORA01");
+                        buf.extend_from_slice(&(params.len() as u32).to_le_bytes());
+                        for t in &params {
+                            let data = gpu.download_f32(t).map_err(|e| e.to_string())?;
+                            buf.extend_from_slice(&(t.shape.len() as u32).to_le_bytes());
+                            for &d in &t.shape {
+                                buf.extend_from_slice(&(d as u32).to_le_bytes());
+                            }
+                            buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                            for &f in &data {
+                                buf.extend_from_slice(&f.to_le_bytes());
+                            }
+                        }
+                        std::fs::write(&sess.output, &buf)
+                            .map_err(|e| format!("write adapter {}: {e}", sess.output))?;
+                        Ok(params.len())
+                    })();
+                    match dump {
+                        Ok(n_trainable) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                serde_json::json!({
+                                    "type": "train_done", "op": "train_lora",
+                                    "initial_per_tok_ce": sess.initial_ce,
+                                    "final_per_tok_ce": sess.last_ce,
+                                    "steps": sess.total - 1, "trainable_tensors": n_trainable,
+                                    "baseline_ce_ln_vocab": (sess.vocab as f32).ln(),
+                                    "output": sess.output, "run_id": sess.run_id,
+                                    "note": "trained hipfire-train LlamaModel LoRA (overfit synthetic batch); served-qwen35 adapters + real-corpus loading are follow-ons",
+                                })
+                            );
+                            let _ = stdout.flush();
+                        }
+                        Err(e) => emit_error_with_id(&mut stdout, "", format!("train_lora: {e}")),
+                    }
+                } else {
+                    // Quantum done but run unfinished: report progress and keep the
+                    // session resident. The runner re-enqueues; training yields to
+                    // any pending interactive request before the next quantum.
+                    let sess = lora_train_session
+                        .as_ref()
+                        .expect("unfinished implies present");
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "train_progress", "run_id": sess.run_id,
+                            "step": sess.step, "total": sess.total,
+                            "per_tok_ce": sess.last_ce, "done": false,
+                        })
+                    );
+                    let _ = stdout.flush();
+                }
             }
 
             DaemonRequest::Diag => {

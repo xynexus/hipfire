@@ -118,6 +118,46 @@ pub enum ScheduledJob {
     Embed(EmbedJob),
     /// A txt2img/img2img diffusion job (the restart-from-seed preemptible path).
     Image(ImageJob),
+    /// A steering/abliteration control op (capture session / apply / clear),
+    /// routed through the runner so it shares the one GPU arbiter.
+    Steer(SteerJob),
+    /// A drafter-training run, executed in-daemon on the runner-owned engine.
+    /// Long (minutes) and HOLDS the runner turn to completion — see `Dispatch::Train`.
+    Train(TrainJob),
+}
+
+/// A drafter-training job run on the runner-owned engine. `req` is the raw
+/// `train_drafter` request Value (the daemon re-parses raw JSON for this op); the
+/// terminal `train_done` payload (or an error) goes back over `tx`.
+pub struct TrainJob {
+    pub req: serde_json::Value,
+    pub tx: oneshot::Sender<Result<serde_json::Value, String>>,
+}
+
+/// A steer control op run on the runner-owned engine. Capture is a WHOLE session
+/// (begin → prefill each prompt → finish) executed atomically in one runner turn:
+/// the capture hook is process-global, so an interleaved text generate would fold
+/// its residuals into the means — the atomic session is what prevents that. Apply
+/// and Clear are instantaneous daemon state ops (an active apply steers ordinary
+/// generation, which already rides the runner, so it needs no exclusivity).
+pub struct SteerJob {
+    pub op: SteerOp,
+    /// `Some(means)` for a finished capture session; `None` for apply/clear.
+    pub tx: oneshot::Sender<Result<Option<Vec<Vec<f32>>>, String>>,
+}
+
+pub enum SteerOp {
+    /// Atomic capture: begin(num_layers, hidden) → steer_capture(system, user) for
+    /// each prompt → finish → per-block means. One runner turn, no interleaving.
+    CaptureSession {
+        num_layers: usize,
+        hidden: usize,
+        prompts: Vec<(String, String)>,
+    },
+    /// Install an apply session (directions/mode/strength/layer range).
+    BeginApply(hipfire_daemon_adapter::SteerApplyRequest),
+    /// Tear down any active steer session.
+    Clear,
 }
 
 /// An embedding request routed through the runner instead of locking the engine
@@ -520,6 +560,33 @@ async fn batch_runner_loop(state: SharedState) {
                         lease_id: lease.lease_id,
                     }
                 }
+                Some(ScheduledJob::Steer(_)) => {
+                    let jobs = jobs
+                        .into_iter()
+                        .filter_map(|j| match j {
+                            ScheduledJob::Steer(s) => Some(s),
+                            _ => None,
+                        })
+                        .collect();
+                    Dispatch::Steer {
+                        jobs,
+                        lease_id: lease.lease_id,
+                    }
+                }
+                Some(ScheduledJob::Train(_)) => {
+                    // Training leases are singletons (max_microbatch_size 1).
+                    let job = jobs
+                        .into_iter()
+                        .find_map(|j| match j {
+                            ScheduledJob::Train(t) => Some(t),
+                            _ => None,
+                        })
+                        .expect("train lease carries one train job");
+                    Dispatch::Train {
+                        job,
+                        lease_id: lease.lease_id,
+                    }
+                }
                 _ => {
                     let batch = jobs
                         .into_iter()
@@ -583,6 +650,109 @@ async fn batch_runner_loop(state: SharedState) {
                 run_embed_jobs(&mut engine, jobs).await;
                 *state.engine.lock().await = Some(engine);
                 state.work_scheduler.lock().await.complete(lease_id);
+            }
+            Dispatch::Steer { jobs, lease_id } => {
+                let mut engine = match state.engine.lock().await.take() {
+                    Some(e) => e,
+                    None => {
+                        for j in jobs {
+                            let _ = j.tx.send(Err("daemon not running".to_string()));
+                        }
+                        state.work_scheduler.lock().await.complete(lease_id);
+                        continue;
+                    }
+                };
+                run_steer_jobs(&mut engine, jobs).await;
+                *state.engine.lock().await = Some(engine);
+                state.work_scheduler.lock().await.complete(lease_id);
+            }
+            Dispatch::Train { job, lease_id } => {
+                // One Train lease covers every training op; dispatch by the raw
+                // wire `type` the route stamped (drafter vs LoRA adapter).
+                //
+                // train_drafter STILL holds the runner turn for the WHOLE run.
+                // train_lora is MICRO-STEP PREEMPTIBLE: the daemon runs ONE quantum
+                // of steps and returns; this lease completes, and if the run is
+                // unfinished the job is RE-ENQUEUED (carrying its run_id + tx) as a
+                // fresh low-priority Training workload. Because training sits below
+                // interactive text/steer, the scheduler serves any pending
+                // interactive request between quanta, then resumes training —
+                // cooperative yield via re-enqueue, no explicit park/resume.
+                let mut engine = match state.engine.lock().await.take() {
+                    Some(e) => e,
+                    None => {
+                        let _ = job.tx.send(Err("daemon not running".to_string()));
+                        state.work_scheduler.lock().await.complete(lease_id);
+                        continue;
+                    }
+                };
+                let is_lora = job.req.get("type").and_then(|v| v.as_str()) == Some("train_lora");
+                if is_lora {
+                    // ONE quantum. The daemon keeps the training session resident
+                    // (keyed by run_id) across quanta, so we pass the same req each
+                    // time and never reload the model.
+                    let step = engine.train_lora_step(job.req.clone()).await;
+                    *state.engine.lock().await = Some(engine);
+                    state.work_scheduler.lock().await.complete(lease_id);
+                    match step {
+                        Ok((true, payload)) => {
+                            // Final quantum: the run is done — answer the route.
+                            let _ = job.tx.send(Ok(payload));
+                        }
+                        Ok((false, _progress)) => {
+                            // Unfinished: re-enqueue the SAME job (req carries run_id)
+                            // under a fresh id, moving tx into it. tx is answered only
+                            // on the terminal (done) quantum — never here.
+                            let run_id = job
+                                .req
+                                .get("run_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let new_id = uuid::Uuid::new_v4().to_string();
+                            state.batch_inbox.lock().await.insert(
+                                new_id.clone(),
+                                ScheduledJob::Train(TrainJob {
+                                    req: job.req,
+                                    tx: job.tx,
+                                }),
+                            );
+                            let workload = hipfire_scheduler::WorkloadSpec::microbatchable(
+                                new_id.clone(),
+                                hipfire_scheduler::WorkloadClass::Training,
+                                160,
+                                now_ms(),
+                                hipfire_scheduler::WorkloadResources::default(),
+                                format!("train:{run_id}"),
+                                1,
+                            );
+                            if let Err(e) = state.work_scheduler.lock().await.enqueue(workload) {
+                                // Admission failed: reclaim the job so its tx is
+                                // answered instead of leaving the route hung.
+                                if let Some(ScheduledJob::Train(j)) =
+                                    state.batch_inbox.lock().await.remove(&new_id)
+                                {
+                                    let _ =
+                                        j.tx.send(Err(format!("train re-enqueue admission: {e}")));
+                                }
+                            } else {
+                                state.prefill_notify.notify_waiters();
+                            }
+                        }
+                        Err(e) => {
+                            let _ = job.tx.send(Err(e.to_string()));
+                        }
+                    }
+                } else {
+                    // train_drafter: whole-run, holds the turn to completion.
+                    let result = engine
+                        .train_drafter(job.req)
+                        .await
+                        .map_err(|e| e.to_string());
+                    *state.engine.lock().await = Some(engine);
+                    state.work_scheduler.lock().await.complete(lease_id);
+                    let _ = job.tx.send(result);
+                }
             }
             Dispatch::Image {
                 job,
@@ -664,11 +834,70 @@ enum Dispatch {
         jobs: Vec<EmbedJob>,
         lease_id: u64,
     },
+    Steer {
+        jobs: Vec<SteerJob>,
+        lease_id: u64,
+    },
+    Train {
+        job: TrainJob,
+        lease_id: u64,
+    },
     Image {
         job: ImageJob,
         running_priority: u8,
         lease_id: u64,
     },
+}
+
+/// Run each steer control op on the runner-owned engine. A CaptureSession runs
+/// its whole begin→capture*→finish atomically here (one runner turn), so no other
+/// GPU work interleaves while the capture hook is folding residuals into the means.
+async fn run_steer_jobs(engine: &mut DaemonEngine, jobs: Vec<SteerJob>) {
+    for job in jobs {
+        let result = match job.op {
+            SteerOp::CaptureSession {
+                num_layers,
+                hidden,
+                prompts,
+            } => run_capture_session(engine, num_layers, hidden, prompts).await,
+            SteerOp::BeginApply(req) => engine
+                .steer_begin_apply(req)
+                .await
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            SteerOp::Clear => engine
+                .steer_clear()
+                .await
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+        };
+        let _ = job.tx.send(result);
+    }
+}
+
+/// begin → capture each prompt → finish, returning the per-block means. On any
+/// error mid-session, clear the daemon session so a partial capture can't leak.
+async fn run_capture_session(
+    engine: &mut DaemonEngine,
+    num_layers: usize,
+    hidden: usize,
+    prompts: Vec<(String, String)>,
+) -> Result<Option<Vec<Vec<f32>>>, String> {
+    engine
+        .steer_begin_capture(num_layers, hidden)
+        .await
+        .map_err(|e| e.to_string())?;
+    for (system, user) in prompts {
+        if let Err(e) = engine.steer_capture(system, user).await {
+            let _ = engine.steer_clear().await;
+            return Err(e.to_string());
+        }
+    }
+    engine
+        .steer_finish_capture()
+        .await
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 /// Run each embedding job on the runner-owned engine and return its result.

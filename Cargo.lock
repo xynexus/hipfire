@@ -1546,6 +1546,7 @@ dependencies = [
  "hipfire-rocm",
  "hipfire-runtime",
  "hipfire-specdecode",
+ "hipfire-steer",
  "libc",
  "libloading",
  "serde",
@@ -2364,6 +2365,7 @@ dependencies = [
  "hipfire-hneurons",
  "hipfire-model",
  "hipfire-steer",
+ "reqwest",
  "serde_json",
  "tokio",
 ]
