@@ -316,8 +316,8 @@ byte-identical to running it uninterrupted; `coherence-gate-dflash.sh` clean.
 onto the scheduler," but *merge the arbiters*. Today there are two-and-a-half
 independent GPU arbiters: (1) `work_scheduler` (`ContinuousWorkScheduler`) —
 admission/priority, text-only so far; (2) the `state.engine` mutex — the de-facto
-*execution* gate every daemon op (`engine.lock()`: chat legacy, embeddings,
-`responses`, admin, steer) contends on; (3) the diffusion path
+*execution* gate every server daemon op (`engine.lock()`: chat legacy,
+embeddings, `responses`, admin) contends on; (3) the diffusion path
 (`spawn_blocking` on `diffusion_pipelines`) which bypasses both and contends on
 the physical GPU. The end state: **`work_scheduler` is the one arbiter that
 orders work, and the batch runner is the one thing that touches the GPU.** Every
@@ -326,52 +326,74 @@ turn; the P4 preemption machinery (park/resume stack, yield checkpoints) applies
 uniformly at each class's step boundary. The engine mutex stops being a separate
 arbiter; diffusion stops bypassing.
 
-Scope spans **all five workload classes** (`WorkloadClass` already carries
-`TokenPrefill`/`TokenDecode`/`ImageGeneration`/`Training`/`Maintenance`), across
-**two coordination regimes**:
+Scope spans **all workload classes** (`WorkloadClass` already carries
+`TokenPrefill`/`TokenDecode`/`ImageGeneration`/`Training`/`Maintenance`). Most
+run **in-process (runner-dispatched)** — the runner owns the engine + diffusion
+pipelines and runs them on its GPU turn:
 
-- **In-process (runner-dispatched)** — the runner owns the engine + diffusion
-  pipelines and runs these on its GPU turn:
-  - **Text** (`TokenPrefill`/`TokenDecode`) — fused decode cycle. DONE (P1–P4).
-  - **Image** (`ImageGeneration`) — diffusion pipeline moved off the route's
-    `spawn_blocking` into the runner's turn. Preempts at *sampler-step*
-    boundaries via the existing progress callback: return `Err`/`Interrupted`
-    when a higher-priority waiter appears, then **restart from the same seed**
-    (diffusion is deterministic → the restarted image is byte-identical to the
-    uninterrupted one; cost is redone steps, not correctness). This is the meaty
-    preemption case and drives the design.
-  - **Embed** (`Maintenance`/dedicated) — `engine.embed`, short; whole-op
-    quantum (non-preemptible, min-quantum covers it).
-  - **Steering** (`hipfire_steer`, in-daemon, process-global) — daemon steer
-    ops (capture/apply/load_lora) routed like a short daemon op; its own class
-    or `Maintenance`.
-- **Cross-process (flock bridge)** — **Training** (`hipfire-train`, a separate
-  non-daemon binary) coordinates via the `hipfire lock` GPU flock, not the
-  runner. The arbiter bridges: when the scheduler grants a training lease the
-  runner *releases* the GPU flock and quiesces; training takes a scheduler-aware
-  lease + flock; interactive work preempts training back by priority. This is
-  the hardest, novel piece and can trail the in-process merge.
+- **Text** (`TokenPrefill`/`TokenDecode`) — fused decode cycle. DONE (P1–P4).
+- **Image** (`ImageGeneration`) — diffusion moved off the route's
+  `spawn_blocking` into the runner's turn; preempts at *sampler-step* boundaries
+  via the progress callback (return `Interrupted` when a higher-priority waiter
+  appears), then **restart from the same seed** (diffusion is deterministic → the
+  restarted image is byte-identical; cost is redone steps, not correctness).
+  Implemented; image GPU-validation pending on a diffusion-capable box (P5.2).
+- **Embed** (`Maintenance`/dedicated) — `engine.embed`, short; whole-op quantum.
+  DONE (P5.1).
 
-**Incremental order (each GPU-validated + committed):**
-1. **Runner executor seam** — generalize the runner loop from "text batch only"
-   to `dispatch(lease)` by `WorkloadClass`; a unified job inbox
-   (`ScheduledJob { Text | Embed | Image | Steer }`) parallel to `batch_inbox`.
-   Text is the existing impl; prove the seam end-to-end with **Embed** first
-   (simplest new class) — embed route enqueues + awaits instead of locking the
-   engine.
-2. **Image under the runner** — move diffusion into the runner turn; sampler-step
-   preemption via callback + restart-from-seed; the byte-identical exit check.
-3. **Steering under the runner** — steer ops as a runner-dispatched class.
-4. **Training flock bridge** — cross-process yield/resume against the GPU flock.
+**Training and steering are the exception — and the fix is to fold them INTO the
+daemon** (revised 2026-07-19, per direction). Measured reality: each is a
+*separate binary that spawns its own daemon* (`DaemonHarness::connect` in
+`hipfire-steer-harness`; `hipfire-train`) via `DaemonEngine::spawn`, so it takes
+the `hip-gpu-0` GPU flock and can only run when nothing else holds it — mutually
+exclusive with serving and invisible to `work_scheduler`. There is no server-side
+steer path at all (`maybe_steer_block` is a process-global forward-pass transform;
+nothing on the server activates a session). Rather than build a *cross-process
+flock bridge* (the arbiter negotiating one flock with foreign daemon processes —
+the old P5.4), **make training and steering daemon-resident ops on the same
+daemon the server already drives**:
 
-**Delivers:** one priority/resource arbiter and one GPU executor for text,
-image, embed, steering (and, via the bridge, training) — a long txt2img or a
-training step no longer blocks interactive text; everything time-slices by
-priority. Still coordinated, not simultaneous (serial GPU).
-**Risk:** medium→high — execution-path surgery + the cross-process flock bridge.
-**Exit check (per step):** interleaved load shows priority-ordered, preemptive
-GPU handoff (trace); preempted image restart is byte-identical; p99 interactive-
-text latency bounded under concurrent image/train load.
+- The daemon gains **train-step** and **steer** (capture / apply / clear) ops
+  alongside `generate`/`embed`/`prefill`. The standalone `hipfire-train` and
+  steer-harness binaries become thin clients that submit these ops to the shared
+  daemon (or via the server), *not* GPU-flock-holding rivals that spawn a second
+  daemon.
+- The server exposes them as workload classes (`Training`; steer as
+  `Maintenance`/dedicated) enqueued into `work_scheduler` and dispatched by the
+  runner like any other lease. A training micro-step or a steer capture batch is
+  just another op on the runner's GPU turn, preemptible at its own step boundary
+  (train micro-step; capture batch), reusing the P4 park/resume machinery.
+- Net: **one daemon, one flock (held by that daemon), one arbiter** over
+  text/image/embed/train/steer. The foreign-flock negotiation problem disappears
+  instead of being bridged.
+- Serving-time steer *apply* falls out for free: an active steer session on the
+  serving daemon steers ordinary text generation, which already rides the runner.
+
+**Revised incremental order (each GPU-validated + committed):**
+1. **Runner executor seam + embed** — `ScheduledJob { Text | Embed | Image }`
+   inbox; runner dispatches a lease by class. DONE (P5.1).
+2. **Image under the runner** — sampler-step preempt + restart-from-seed.
+   Implemented; validation pending on a diffusion box (P5.2).
+3. **Fold training + steering into the daemon** (replaces the old P5.3 steering
+   and P5.4 flock-bridge): add daemon train-step + steer ops, expose as
+   runner-dispatched classes, preempt at train-micro-step / capture-batch
+   boundaries. The old cross-process flock bridge is **dropped** — bringing the
+   work into the one daemon is simpler and removes the foreign-flock problem
+   entirely. Big daemon-side surgery (the daemon is an inference engine today;
+   train needs backward + optimizer state, steer needs the capture/apply ops
+   hoisted from the harness), so this is its own multi-step sub-phase.
+
+**Delivers:** one daemon, one flock, one arbiter and one GPU executor for text,
+image, embed, training, and steering — a long txt2img, a training micro-step, or
+a steer capture no longer blocks interactive text; everything time-slices by
+priority on a single daemon. Still coordinated, not simultaneous (serial GPU).
+**Risk:** high — execution-path surgery in the server *and* moving train/steer
+compute into the daemon op set (`hipfire-train`, `hipfire-steer*`, daemon
+dispatch).
+**Exit check (per step):** interleaved serving + a training run + a steer capture
+all time-slice by priority on one daemon (trace); preempted image restart is
+byte-identical; p99 interactive-text latency bounded under concurrent
+image/train load; no second daemon is ever spawned for train/steer.
 
 ## Phase 6 — Complete the hoist + PROVE genericity with a second arch
 
@@ -387,10 +409,12 @@ real second/third arches.
   native MTP). This is the genericity acceptance test: if any seam needs a
   generic-layer change to fit deepseek4, the seam was wrong — fix it there, not
   in deepseek4. Then a fresh arch (GLM-5.2) should need only trait impls.
-- Give the standalone trainer (`hipfire-train`) a **cooperative VRAM lease**:
-  it submits a `WorkloadClass::Training` (singleton, `lib.rs:348`) claim to the
-  daemon's resource accounting so serving evicts/pauses cleanly instead of
-  OOM-contending. Trainer stays a separate process; it just respects the lease.
+- Training coexistence is handled by the revised **P5.3 (fold train/steer into
+  the daemon)**, not a separate-process VRAM lease: training runs as daemon
+  `WorkloadClass::Training` ops (singleton, `lib.rs:348`) under the one arbiter,
+  so serving and training already time-slice on one daemon. P6 only *validates*
+  that the second-arch port keeps that coexistence working (no OOM, no second
+  daemon).
 
 **Delivers:** proof the cross-modality arbiter is arch-generic — a second MoE
 arch runs through the same scheduler/preemption/estimator path with no
