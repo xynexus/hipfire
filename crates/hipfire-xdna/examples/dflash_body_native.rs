@@ -532,11 +532,45 @@ fn main() {
             .map(|(n, _)| n.clone())
             .unwrap_or_else(|| panic!("no GEMM kernel M={m} K={k} N={n}"))
     };
+    // Attention kernel. Two ABIs live side by side:
+    //   sc    (`dflash_attn_all*`)   — one iteration per kv-head, whole KV
+    //                                  resident, plain row-major Q/K/V.
+    //   flash (`dflash_attn_flash*`) — one iteration per q-head, KV streamed in
+    //                                  mmul-tiled tiles, tiled C-layout output.
+    // They are NOT interchangeable by xclbin swap; the host packing differs.
+    // sc stays the default so a flash regression cannot cost the working path.
     let attn_name = mkernels
         .keys()
-        .find(|n| n.starts_with("dflash_attn_all"))
+        .find(|n| n.starts_with("dflash_attn_flash"))
+        .filter(|_| arg("--attn").as_deref() == Some("flash"))
+        .or_else(|| mkernels.keys().find(|n| n.starts_with("dflash_attn_all")))
         .expect("attn kernel")
         .clone();
+    let attn_flash = attn_name.starts_with("dflash_attn_flash");
+    // Flash geometry comes from the manifest entry's compile_args, so the host
+    // packing cannot silently disagree with what the kernel was built for.
+    let (fl_q_len, fl_kv_tile, fl_n_tiles, fl_n_iters) = if attn_flash {
+        let ca = &mkernels[&attn_name]["compile_args"];
+        let ga = |k: &str| ca[k].as_u64().unwrap_or_else(|| panic!("compile_args.{k}")) as usize;
+        (ga("q_len"), ga("kv_tile"), ga("n_tiles"), ga("n_iters"))
+    } else {
+        (q_len, 0, 0, nkv)
+    };
+    if attn_flash {
+        let hpi = fl_q_len / b_rows;
+        assert_eq!(fl_q_len % b_rows, 0, "flash q_len must be a multiple of B");
+        assert_eq!(fl_n_iters, nh / hpi, "flash n_iters disagrees with NH");
+        assert!(
+            fl_n_tiles * fl_kv_tile >= tot,
+            "flash n_tiles*kv_tile={} cannot cover tot={tot}",
+            fl_n_tiles * fl_kv_tile
+        );
+        println!(
+            "  [attn] flash: q_len={fl_q_len} kv_tile={fl_kv_tile} n_tiles={fl_n_tiles} \
+             n_iters={fl_n_iters} heads/iter={hpi} tot={tot} (pad {})",
+            fl_n_tiles * fl_kv_tile - tot
+        );
+    }
 
     let artifacts: HashMap<String, (Vec<u8>, Vec<u8>)> = mkernels
         .iter()
@@ -705,9 +739,21 @@ fn main() {
     let mut sw_gate = mk(b_rows * i_dim * 2);
     let mut sw_up = mk(b_rows * i_dim * 2);
     let sw_out = mk(b_rows * i_dim * 2);
-    let mut attn_q = mk(nkv * q_len * hd * 2);
-    let mut attn_kv = mk(nkv * 2 * tot * hd * 2);
-    let attn_o = mk(nkv * q_len * hd * 2);
+    // sc:    Q/O = nkv*q_len*hd, KV = nkv*2*tot*hd
+    // flash: Q/O = n_iters*fl_q_len*hd (identical total), KV is larger — each
+    //        q-head iteration carries its kv-head's whole KV, so KV is replicated
+    //        `groups` times, plus the per-tile f32 mask (2 bf16 slots per row).
+    let (attn_q_elems, attn_kv_elems) = if attn_flash {
+        (
+            fl_n_iters * fl_q_len * hd,
+            fl_n_iters * fl_n_tiles * (2 * fl_kv_tile * hd + 2 * fl_kv_tile),
+        )
+    } else {
+        (nkv * q_len * hd, nkv * 2 * tot * hd)
+    };
+    let mut attn_q = mk(attn_q_elems * 2);
+    let mut attn_kv = mk(attn_kv_elems * 2);
+    let attn_o = mk(attn_q_elems * 2);
 
     // Host-side staging (f32, mirroring the numpy harness exactly).
     let mut qbuf = vec![0i8; max_rows * (ne * h).max(i_dim).max(h)];
@@ -1061,32 +1107,134 @@ fn main() {
             // attention: whole layer in ONE dispatch, kv-heads streamed.
             // Pack Q per kv-head as the `groups` q-heads' rows stacked.
             {
-                let dst = attn_q.as_mut_slice();
-                for kvh in 0..nkv {
-                    for i in 0..groups {
-                        let head = kvh * groups + i;
-                        for r in 0..b_rows {
-                            for d in 0..hd {
-                                let src = q[r * nh * hd + head * hd + d];
-                                let o = ((kvh * q_len + i * b_rows + r) * hd + d) * 2;
-                                dst[o..o + 2].copy_from_slice(&f32_to_bf16(src).to_le_bytes());
+                // aie::mmul<4,8,4> block shape, and the padding-row mask value.
+                // Mirrors build_dflash_attention_flash.py's MR/MS/MT/MASK_NEG.
+                const MR: usize = 4;
+                const MS: usize = 8;
+                const MT: usize = 4;
+                const MASK_NEG: f32 = -3.0e30;
+
+                if attn_flash {
+                    let hpi = fl_q_len / b_rows;
+                    // Q: per iteration an A-layout [fl_q_len, hd] of the
+                    // iteration's q-head rows stacked.
+                    let dst = attn_q.as_mut_slice();
+                    for it in 0..fl_n_iters {
+                        let qbase = it * fl_q_len * hd;
+                        for i in 0..hpi {
+                            let head = it * hpi + i;
+                            for r in 0..b_rows {
+                                let (qb, qi) = ((i * b_rows + r) / MR, (i * b_rows + r) % MR);
+                                for d in 0..hd {
+                                    let (db, si) = (d / MS, d % MS);
+                                    let o = (qbase
+                                        + ((qb * (hd / MS) + db) * MR + qi) * MS
+                                        + si)
+                                        * 2;
+                                    let src = q[r * nh * hd + head * hd + d];
+                                    dst[o..o + 2]
+                                        .copy_from_slice(&f32_to_bf16(src).to_le_bytes());
+                                }
                             }
                         }
                     }
-                }
-                let dst = attn_kv.as_mut_slice();
-                for kvh in 0..nkv {
-                    let base = kvh * 2 * tot * hd;
-                    for t in 0..tot {
-                        for d in 0..hd {
-                            let o = (base + t * hd + d) * 2;
-                            dst[o..o + 2].copy_from_slice(
-                                &f32_to_bf16(k_all[t * nkd + kvh * hd + d]).to_le_bytes(),
-                            );
-                            let o2 = (base + tot * hd + t * hd + d) * 2;
-                            dst[o2..o2 + 2].copy_from_slice(
-                                &f32_to_bf16(v_all[t * nkd + kvh * hd + d]).to_le_bytes(),
-                            );
+                    // KV: per iteration, n_tiles of [ Kᵀ | V | mask ]. Each
+                    // q-head iteration carries its kv-head's whole KV, so a
+                    // kv-head's KV is packed `groups` times.
+                    let dst = attn_kv.as_mut_slice();
+                    let tile_elems = 2 * fl_kv_tile * hd + 2 * fl_kv_tile;
+                    let (kb_n, ob_n) = (fl_kv_tile / MT, hd / MT);
+                    for it in 0..fl_n_iters {
+                        let kvh = (it * hpi) / groups;
+                        for t in 0..fl_n_tiles {
+                            let base = (it * fl_n_tiles + t) * tile_elems;
+                            // Kᵀ : B-layout of [hd, kv_tile]
+                            for db in 0..(hd / MS) {
+                                for kb in 0..kb_n {
+                                    for si in 0..MS {
+                                        for ti in 0..MT {
+                                            let krow = t * fl_kv_tile + kb * MT + ti;
+                                            let val = if krow < tot {
+                                                k_all[krow * nkd + kvh * hd + db * MS + si]
+                                            } else {
+                                                0.0
+                                            };
+                                            let o = (base
+                                                + ((db * kb_n + kb) * MS + si) * MT
+                                                + ti)
+                                                * 2;
+                                            dst[o..o + 2].copy_from_slice(
+                                                &f32_to_bf16(val).to_le_bytes(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            // V : B-layout of [kv_tile, hd]
+                            let vbase = base + fl_kv_tile * hd;
+                            for vb in 0..(fl_kv_tile / MS) {
+                                for ob in 0..ob_n {
+                                    for si in 0..MS {
+                                        for ti in 0..MT {
+                                            let krow = t * fl_kv_tile + vb * MS + si;
+                                            let val = if krow < tot {
+                                                v_all[krow * nkd + kvh * hd + ob * MT + ti]
+                                            } else {
+                                                0.0
+                                            };
+                                            let o = (vbase
+                                                + ((vb * ob_n + ob) * MS + si) * MT
+                                                + ti)
+                                                * 2;
+                                            dst[o..o + 2].copy_from_slice(
+                                                &f32_to_bf16(val).to_le_bytes(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            // mask : f32 over the trailing 2*kv_tile bf16 slots.
+                            // MUST be additive-negative, not zeroed K/V — a
+                            // zeroed K row scores 0, and exp(0 - m) is an
+                            // ordinary softmax weight that would inflate the
+                            // running sum and scale the output down.
+                            let mbase = (base + 2 * fl_kv_tile * hd) * 2;
+                            for j in 0..fl_kv_tile {
+                                let m = if t * fl_kv_tile + j < tot { 0.0f32 } else { MASK_NEG };
+                                dst[mbase + j * 4..mbase + j * 4 + 4]
+                                    .copy_from_slice(&m.to_le_bytes());
+                            }
+                        }
+                    }
+                } else {
+                    let dst = attn_q.as_mut_slice();
+                    for kvh in 0..nkv {
+                        for i in 0..groups {
+                            let head = kvh * groups + i;
+                            for r in 0..b_rows {
+                                for d in 0..hd {
+                                    let src = q[r * nh * hd + head * hd + d];
+                                    let o = ((kvh * q_len + i * b_rows + r) * hd + d) * 2;
+                                    dst[o..o + 2]
+                                        .copy_from_slice(&f32_to_bf16(src).to_le_bytes());
+                                }
+                            }
+                        }
+                    }
+                    let dst = attn_kv.as_mut_slice();
+                    for kvh in 0..nkv {
+                        let base = kvh * 2 * tot * hd;
+                        for t in 0..tot {
+                            for d in 0..hd {
+                                let o = (base + t * hd + d) * 2;
+                                dst[o..o + 2].copy_from_slice(
+                                    &f32_to_bf16(k_all[t * nkd + kvh * hd + d]).to_le_bytes(),
+                                );
+                                let o2 = (base + tot * hd + t * hd + d) * 2;
+                                dst[o2..o2 + 2].copy_from_slice(
+                                    &f32_to_bf16(v_all[t * nkd + kvh * hd + d]).to_le_bytes(),
+                                );
+                            }
                         }
                     }
                 }
@@ -1107,14 +1255,37 @@ fn main() {
                 }
                 kern.sync_output(&attn_o).expect("sync attn");
                 let src = attn_o.as_slice();
-                for kvh in 0..nkv {
-                    for i in 0..groups {
-                        let head = kvh * groups + i;
-                        for r in 0..b_rows {
-                            for d in 0..hd {
-                                let o = ((kvh * q_len + i * b_rows + r) * hd + d) * 2;
-                                ctx[r * nh * hd + head * hd + d] =
-                                    bf16_to_f32(u16::from_le_bytes([src[o], src[o + 1]]));
+                if attn_flash {
+                    // O is C-layout: (fl_q_len/MR) x (hd/MT) tiles of MR x MT.
+                    let hpi = fl_q_len / b_rows;
+                    for it in 0..fl_n_iters {
+                        let obase = it * fl_q_len * hd;
+                        for i in 0..hpi {
+                            let head = it * hpi + i;
+                            for r in 0..b_rows {
+                                let (qb, qi) = ((i * b_rows + r) / MR, (i * b_rows + r) % MR);
+                                for d in 0..hd {
+                                    let (ob, ti) = (d / MT, d % MT);
+                                    let o = (obase
+                                        + ((qb * (hd / MT) + ob) * MR + qi) * MT
+                                        + ti)
+                                        * 2;
+                                    ctx[r * nh * hd + head * hd + d] =
+                                        bf16_to_f32(u16::from_le_bytes([src[o], src[o + 1]]));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for kvh in 0..nkv {
+                        for i in 0..groups {
+                            let head = kvh * groups + i;
+                            for r in 0..b_rows {
+                                for d in 0..hd {
+                                    let o = ((kvh * q_len + i * b_rows + r) * hd + d) * 2;
+                                    ctx[r * nh * hd + head * hd + d] =
+                                        bf16_to_f32(u16::from_le_bytes([src[o], src[o + 1]]));
+                                }
                             }
                         }
                     }

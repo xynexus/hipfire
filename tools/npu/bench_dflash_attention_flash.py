@@ -80,9 +80,6 @@ def main():
 
     for tot_s in args.tot_sweep.split(","):
         tot = int(tot_s)
-        if tot % args.kv_tile:
-            print(f"[tot={tot}] SKIP: kv_tile={args.kv_tile} does not divide tot")
-            continue
         rng = np.random.default_rng(0)
         q = rng.standard_normal((block, nh, HEAD_DIM), np.float32) * 0.5
         k = rng.standard_normal((tot, nkv, HEAD_DIM), np.float32) * 0.5

@@ -19,7 +19,10 @@ Two structural differences from the sc kernel:
 * **mmul tiling.** Both GEMMs go through `aie::mmul<4,8,4,bfloat16,bfloat16>`,
   so Q/K/V are pre-tiled host-side into the mm.cc block layout.
 
-`kv_tile` must divide `tot` (no tail masking in v1) and be a multiple of 16.
+`kv_tile` must be a multiple of 16. `tot` is padded up to a multiple of
+`kv_tile` host-side and the padding rows are removed from the softmax by an
+additive per-tile score mask carried in the KV tile (v2 — v1 required
+`kv_tile` to divide `tot`, which the spec-decode loop cannot honour).
 
 MEASURED on nix1/npu1, 4 cores, block=16, 32q/8kv/128d, vs the sc kernel's
 12.246 ms at tot=48 in the same session:
@@ -54,6 +57,10 @@ from ml_dtypes import bfloat16  # noqa: E402
 
 HEAD_DIM = 128
 MR, MS, MT = 4, 8, 4  # aie::mmul<r, s, t>
+# Additive mask value for padding KV rows. Matches the kernel's NEG_BIG
+# sentinel: large enough that exp_neg_v's exponent clamp floors it to 2^-126,
+# small enough to stay well inside float32 range when summed with a score.
+MASK_NEG = -3.0e30
 KERNEL_SRC = SCRIPT_DIR / "dflash_attention_flash_bf16.cc"
 
 _mlir_aie_pkg = next((Path(p) for p in sys.path if (Path(p) / "mlir_aie").is_dir()), None)
@@ -79,13 +86,23 @@ def unpack_c(v: np.ndarray, m: int, n: int) -> np.ndarray:
     return v.reshape(m // MR, n // MT, MR, MT).transpose(0, 2, 1, 3).reshape(m, n)
 
 
+def kv_tile_elems(kv_tile: int) -> int:
+    """bfloat16 elements in one KV tile: Kᵀ + V + the float32 additive mask.
+
+    The mask is float32 (2 bf16 slots per entry) so the kernel can add it
+    straight onto the float score vector; it rides in the bf16-typed fifo
+    because an ObjectFifo carries exactly one element type.
+    """
+    return 2 * kv_tile * HEAD_DIM + 2 * kv_tile
+
+
 def _flash_kernel(q_len: int, kv_tile: int, n_tiles: int):
     """Single entry point: two exported symbols from one .cc collide at link
     time (IRON recompiles the whole file per ExternalFunction)."""
     nd = cast(Any, np.ndarray)
     dt = cast(Any, np.dtype)
     q_ty: Any = nd[(q_len * HEAD_DIM,), dt[bfloat16]]
-    kvt_ty: Any = nd[(2 * kv_tile * HEAD_DIM,), dt[bfloat16]]
+    kvt_ty: Any = nd[(kv_tile_elems(kv_tile),), dt[bfloat16]]
     inc = [str(AIE_INCLUDE)] if AIE_INCLUDE and AIE_INCLUDE.is_dir() else []
     return ExternalFunction(
         name="dflash_flash_step",
@@ -112,7 +129,7 @@ def dflash_attn_flash_mc(Q: In, KV: In, O: Out, *,
     nd = cast(Any, np.ndarray)
     dt = cast(Any, np.dtype)
     qN = q_len * HEAD_DIM
-    kvtN = 2 * kv_tile * HEAD_DIM
+    kvtN = kv_tile_elems(kv_tile)
     assert n_iters % n_cores == 0, f"n_iters={n_iters} not divisible by n_cores={n_cores}"
     per = n_iters // n_cores
 
@@ -169,15 +186,29 @@ def pack_inputs(q, k, v, groups, q_len, kv_tile):
     q [B, NH, HD]; k/v [tot, NKV, HD]. One iteration covers `q_len` query rows
     (i.e. `q_len // B` q-heads) that share one kv-head, so the kv-head's K/V is
     repeated once per iteration that consumes it.
+
+    `tot` no longer has to be a multiple of `kv_tile`: it is padded up to one,
+    and the padding rows carry MASK_NEG in the per-tile additive score mask so
+    they cannot contribute to the softmax. Only `n_tiles` remains
+    tot-dependent, so the compiled kernel changes once per `kv_tile` tokens
+    rather than every spec-decode cycle.
     """
     b, nh, hd = q.shape
     tot = k.shape[0]
     assert hd == HEAD_DIM
     assert q_len % b == 0, f"q_len={q_len} must be a multiple of block={b}"
+    assert kv_tile % 16 == 0, f"kv_tile={kv_tile} must be a multiple of 16"
     heads_per_iter = q_len // b
     assert groups % heads_per_iter == 0 or heads_per_iter % groups == 0
-    assert tot % kv_tile == 0, f"kv_tile={kv_tile} must divide tot={tot}"
-    n_tiles = tot // kv_tile
+    n_tiles = (tot + kv_tile - 1) // kv_tile
+    tot_pad = n_tiles * kv_tile
+    if tot_pad != tot:
+        pad = tot_pad - tot
+        k = np.concatenate([k, np.zeros((pad,) + k.shape[1:], k.dtype)], axis=0)
+        v = np.concatenate([v, np.zeros((pad,) + v.shape[1:], v.dtype)], axis=0)
+    # additive score mask, per padded KV row: 0 real, MASK_NEG padding
+    mask = np.zeros(tot_pad, np.float32)
+    mask[tot:] = MASK_NEG
 
     qbuf, kvbuf = [], []
     for h0 in range(0, nh, heads_per_iter):
@@ -192,8 +223,12 @@ def pack_inputs(q, k, v, groups, q_len, kv_tile):
             vt = v[sl, kvh, :].astype(bfloat16)
             kvbuf.append(pack_b(kt.T))            # Kᵀ: [HD, kv_tile]
             kvbuf.append(pack_b(vt))              # V : [kv_tile, HD]
+            # float32 mask aliased into bf16 slots; `.view` keeps the bits
+            # through the caller's (identity) .astype(bfloat16).
+            kvbuf.append(mask[sl].view(bfloat16))
     n_iters = nh // heads_per_iter
-    return (np.concatenate(qbuf), np.concatenate(kvbuf), n_iters, n_tiles,
+    return (np.concatenate(qbuf).astype(bfloat16),
+            np.concatenate(kvbuf).astype(bfloat16), n_iters, n_tiles,
             heads_per_iter)
 
 

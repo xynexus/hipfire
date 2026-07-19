@@ -21,11 +21,15 @@ NPU DFlash block wall: **726 ms** (native driver,
 
 | term | original | NOW (measured, warm) |
 |---|---|---|
-| GEMM (weight-bandwidth-bound) | 317 ms | **103.5 ms** (98bbce9b6, r14 W4A8) |
-| attention | 236 ms | **61.5 ms** (326971468, 4-core) → **~6.1 ms** (flash kernel, 10.1×) |
-| host glue (quant/bf16/packing) | 143 ms | **53.0 ms** (8da5aa5b3) |
-| primitives (norm/rope/swiglu) | 24 ms | 23.5 ms |
-| **warm block wall** | **726 ms** | **236.0 ms** |
+| GEMM (weight-bandwidth-bound) | 317 ms | **102.3 ms** (98bbce9b6, r14 W4A8) |
+| attention | 236 ms | **7.0 ms** (flash kernel wired into the body, task #28) |
+| host glue (quant/bf16/packing) | 143 ms | **54.0 ms** (8da5aa5b3) |
+| primitives (norm/rope/swiglu) | 24 ms | 23.7 ms |
+| **warm block wall** | **726 ms** | **185.4 ms** |
+
+**Attention is now the SMALLEST term (3.7% of the wall).** GEMM is 55%, host
+glue 29%, primitives 13%. The `M_TILE=16` double-stream in the GEMM (~40 ms
+above the ~60 ms bandwidth floor) is now the only large single lever left.
 
 **⚠ MEASURE WARM-ONLY.** An earlier revision of this table was wrong twice from
 one mistake: per-op means were averaged over ALL blocks including the cold first
@@ -249,8 +253,53 @@ is architecture-independent, so build it on 9B and swap the target.
 
        Measured null: `q_len=32` (no change), `kv_depth=2` (no change — the
        kernel is not DMA-bound). `kv_tile=48` beats 16 by ~1.35× at long
-       context. `kv_tile` must divide `tot` and be a multiple of 16 (no tail
-       masking in v1). Bench: `tools/npu/bench_dflash_attention_flash.py`.
+       context. Bench: `tools/npu/bench_dflash_attention_flash.py`.
+
+       **WIRED INTO THE BODY (task #28).** Not an xclbin swap — the host ABI
+       differs on every axis (iterations are q-heads not kv-heads, Q/Kᵀ/V are
+       mmul-tiled, O comes back C-tiled), so `dflash_body_native.rs`'s packing
+       and unpacking were rewritten. Selected with `--attn flash`; the sc path
+       stays the default fallback and is bit-identical to before.
+       Registered by `tools/npu/swap_attn_flash_manifest.py`.
+
+       | | sc (in body) | flash (in body) |
+       |---|---|---|
+       | attention / dispatch | 12.30 ms | **1.40 ms** (8.8×) |
+       | attention / block (×5) | 61.5 ms | **7.0 ms** |
+       | warm block wall | 238.8 ms | **185.4 ms** (185.0/181.9/189.4) |
+       | cos vs f32 golden / bf16 ref (int8 GEMM path) | 0.998114 / 0.998170 | **0.998083 / 0.998140** |
+
+       In-body 1.40 ms vs the standalone kernel's 1.21–1.35 ms: the ~0.18 ms
+       gap per dispatch is the already-documented context-alternation cost,
+       not a wiring loss. **Host glue moved 53.0 → 54.0 ms** despite the flash
+       packing being tiled and replicating KV `groups`× — the extra packing is
+       ~1 ms, not a tax worth designing around. Context budget unchanged: the
+       flash kernel pins one hw context like the sc one, `--ctx-budget 4` still
+       correct, dispatches/block still 117.
+
+       **TAIL MASKING (v2), not padding-with-zeros.** v1 required `kv_tile` to
+       divide `tot`, which the spec-decode loop cannot honour (`tot = L + B`
+       grows every cycle). `tot` is now padded up to a multiple of `kv_tile`
+       and the pad rows are removed by an **additive f32 score mask carried as
+       runtime data inside each KV tile** (trailing `2*kv_tile` bf16 slots,
+       read through a `float*` reinterpret). Zeroing the padded K/V does NOT
+       work: with online softmax a zeroed K row scores 0, and `exp(0 - m)` is
+       an ordinary weight that inflates the running sum and scales the output
+       down. Masked lanes land at −3e30, which `exp_neg_v`'s −126 exponent
+       clamp floors to 2^−126 — the same mechanism the `NEG_BIG` running-max
+       sentinel already used, so no new numerical path.
+       Cost: one vector add per (q, tile-row). Measured null — tot=48 and
+       tot=528 timings and cosines are unchanged from the pre-mask kernel, and
+       tot=50 (46 masked rows, which v1 could not build at all) holds
+       cos 0.999996. In-body with `kv_tile=32` (tot=48 → 2 tiles, 16 masked
+       rows) parity is 0.998143 / 0.998172.
+
+       **Constraint this imposes on the context cache (task #25):** only
+       `n_tiles` remains compile-time, so the attention build changes once per
+       `kv_tile` committed tokens rather than every cycle. The cache must
+       either tolerate a rebuild every `kv_tile` tokens or hold a prebuilt
+       ladder of `n_tiles`. It does NOT need to advance `tot` in whole tiles —
+       any `tot` is legal, it is just rounded up and masked.
    (c) Then the seam, with the gates below.
    `--ctx-slice 32` (`dflash_spec_demo.rs:618`) would run the seam today and
    prove plumbing + losslessness, but at 32 context rows the resulting τ and

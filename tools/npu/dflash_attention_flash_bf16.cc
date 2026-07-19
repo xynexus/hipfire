@@ -24,10 +24,32 @@
 // row-major order — the convention documented in aie_kernels/aie2/mm.cc.
 //
 //   Q  : A-layout, (Q_LEN/4) x (128/8) tiles of 4x8 bf16
-//   KV : per tile, [ Kt | V ]
+//   KV : per tile, [ Kt | V | M ]
 //          Kt : B-layout of Kᵀ (128 x KV_TILE), (128/8) x (KV_TILE/4) tiles of 8x4
 //          V  : B-layout of V  (KV_TILE x 128), (KV_TILE/8) x (128/4) tiles of 8x4
+//          M  : KV_TILE float32 additive score mask, occupying 2*KV_TILE of the
+//               bfloat16-typed buffer's trailing slots (see below)
 //   O  : C-layout, (Q_LEN/4) x (128/4) tiles of 4x4 bf16
+//
+// TAIL MASKING. v1 required KV_TILE to divide `tot` exactly, which the
+// spec-decode loop cannot honour (tot = L + B grows by one token per cycle).
+// The fix is an ADDITIVE per-KV-row score mask carried as runtime data in the
+// tile itself: 0.0f for a real KV row, MASK_NEG for a padding row. `tot` is
+// padded up to a multiple of KV_TILE host-side and the pad rows are masked, so
+// only N_TILES stays compile-time and it changes once per KV_TILE tokens
+// instead of every cycle.
+//
+// The mask MUST be additive-negative, not zeroed K/V: with online softmax a
+// zeroed K row scores 0, and exp(0 - m) is a perfectly ordinary weight that
+// inflates the running sum `l` and scales the output down. Only a
+// -inf-equivalent score removes the row from the distribution.
+//
+// The mask is float32 but the ObjectFifo is typed bfloat16 (one element type
+// per fifo), so it rides in the buffer's trailing 2*KV_TILE bfloat16 slots and
+// is read back through a float* reinterpret. That keeps its offset
+// (2*128*KV_TILE elements = 512*KV_TILE bytes) 64-byte aligned for any
+// KV_TILE that is a multiple of 16, which the static_assert below already
+// requires.
 //
 // Call protocol (driven from the IRON core_fn): O is acquired ONCE per head and
 // held across the whole tile loop, so a single entry point suffices —
@@ -177,6 +199,9 @@ void dflash_flash_step(bfloat16 *restrict Q, bfloat16 *restrict KV,
   aie::set_rounding(aie::rounding_mode::conv_even);
   const bfloat16 *restrict Kt = KV;              // D x KVT, B-layout
   const bfloat16 *restrict Vt = KV + D * KVT;    // KVT x D, B-layout
+  // Additive score mask, float32 aliased over the trailing bf16 slots.
+  const float *restrict Mk =
+      reinterpret_cast<const float *>(KV + 2 * D * KVT);
 
   if (g_tile == 0) {
     const aie::vector<float, 16> z = aie::zeros<float, 16>();
@@ -217,8 +242,13 @@ void dflash_flash_step(bfloat16 *restrict Q, bfloat16 *restrict KV,
     float m_new = g_m[q];
 #pragma clang loop unroll(disable)
     for (int nv = 0; nv < NV; ++nv) {
-      const vf sv = aie::mul(aie::load_v<VL>(sr + nv * VL), SCALE)
-                        .template to_vector<float>();
+      // scale, then apply the additive tail mask. Masked lanes land at
+      // ~MASK_NEG, which exp_neg_v's -126 exponent clamp turns into 2^-126:
+      // the same "structurally zero" mechanism the NEG_BIG running-max
+      // sentinel already relies on, so no new numerical path is introduced.
+      const vf sv = aie::add(aie::mul(aie::load_v<VL>(sr + nv * VL), SCALE)
+                                 .template to_vector<float>(),
+                             aie::load_v<VL>(Mk + nv * VL));
       aie::store_v(sr + nv * VL, sv);
       const float r = aie::reduce_max(sv);
       if (r > m_new) m_new = r;
