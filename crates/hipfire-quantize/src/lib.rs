@@ -36,6 +36,7 @@ pub mod hfhs_diag;
 pub mod hfq_out;
 #[allow(dead_code)]
 pub mod ldlq;
+pub mod mixed_precision;
 /// Opus mixed-precision low-bit weight codec (unsigned codes + offset fold).
 pub mod opus_lowbit;
 pub mod quant_plan;
