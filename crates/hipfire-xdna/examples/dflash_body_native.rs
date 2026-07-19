@@ -127,7 +127,11 @@ mod body {
         pub k: usize,
         pub rows: usize,
         pub k_chunks: usize,
-        pub scale4: Vec<f32>, // [m][k_chunks]
+        /// Per-(out-row, k-chunk) dequant scale, stored `[k_chunks][m]`. The
+        /// dequant accumulate walks output columns contiguously for a fixed
+        /// k-chunk, so this layout turns a stride-`k_chunks` gather into a
+        /// unit-stride load.
+        pub scale4t: Vec<f32>,
         pub wbufs: Vec<DeviceBuffer>,
         pub plan: Vec<(usize, usize, usize)>, // per iteration: (m_block, k_chunk, n_tile)
     }
@@ -192,12 +196,18 @@ mod body {
                 g.sync_weights(&buf)?;
                 wbufs.push(buf);
             }
+            let mut scale4t = vec![0f32; m * k_chunks];
+            for n in 0..m {
+                for c in 0..k_chunks {
+                    scale4t[c * m + n] = scale4[n * k_chunks + c];
+                }
+            }
             Ok(Self {
                 m,
                 k,
                 rows,
                 k_chunks,
-                scale4,
+                scale4t,
                 wbufs,
                 plan,
             })
@@ -207,6 +217,44 @@ mod body {
     /// Per-(row, k-chunk) symmetric int8 activation quant — the chunked twin of
     /// [`quantize_row`], required because the array contracts one chunk at a time.
     pub fn quantize_row_chunked(
+        x: &[f32],
+        rows: usize,
+        k: usize,
+        kc: usize,
+        q: &mut [i8],
+        scale: &mut [f32],
+    ) {
+        // Baseline x86-64 has no round-to-nearest-even instruction, so
+        // `round_ties_even` compiles to a libm call PER ELEMENT and the loop
+        // stays scalar. SSE4.1's `roundps` (mode 0) is exactly ties-to-even, so
+        // an AVX2 clone of the identical source vectorizes with bit-identical
+        // results. Measured on nix1: 28.1 ms -> 3.2 ms per block.
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                // SAFETY: guarded by the runtime feature check above.
+                unsafe { quantize_row_chunked_avx2(x, rows, k, kc, q, scale) };
+                return;
+            }
+        }
+        quantize_row_chunked_scalar(x, rows, k, kc, q, scale)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn quantize_row_chunked_avx2(
+        x: &[f32],
+        rows: usize,
+        k: usize,
+        kc: usize,
+        q: &mut [i8],
+        scale: &mut [f32],
+    ) {
+        quantize_row_chunked_scalar(x, rows, k, kc, q, scale)
+    }
+
+    #[inline(always)]
+    fn quantize_row_chunked_scalar(
         x: &[f32],
         rows: usize,
         k: usize,
@@ -247,10 +295,22 @@ mod body {
 
         let mut ns = 0u64;
         let mut disp = 0u64;
+        // Identity of the (m_block, k_chunk) stripe set currently resident in the
+        // array's A buffer, or None when it holds something else.
+        let a_state = &mut None::<(usize, usize)>;
         for (d, wbuf) in mx.wbufs.iter().enumerate() {
             let lo = d * nblk;
             let hi = (lo + nblk).min(mx.plan.len());
-            {
+            // Every slot of a dispatch usually shares one (m_block, k_chunk) — the
+            // plan runs n_tile innermost — so the whole A buffer is one stripe set
+            // replicated nblk times. When the NEXT dispatch carries the same pair,
+            // the buffer is already correct and the entire fill is skipped.
+            let span = &mx.plan[lo..hi];
+            let uniform = span.first().map(|&(mb, c, _)| {
+                span.iter().all(|&(m2, c2, _)| m2 == mb && c2 == c).then_some((mb, c))
+            }).flatten();
+            let skip = uniform.is_some() && uniform == *a_state;
+            if !skip {
                 let abuf = g.a_mut();
                 let mut prev: Option<(usize, usize, usize)> = None;
                 for (s, &(mb, c, _)) in mx.plan[lo..hi].iter().enumerate() {
@@ -269,6 +329,7 @@ mod body {
                     geom.pack_a_slot(abuf, s, qa, k, mb * mt, c * kc);
                     prev = Some((mb, c, s));
                 }
+                *a_state = uniform;
             }
             let t = std::time::Instant::now();
             g.dispatch(wbuf).expect("r14 dispatch");
@@ -278,11 +339,18 @@ mod body {
             for (s, &(mb, kchunk, tile)) in mx.plan[lo..hi].iter().enumerate() {
                 let row0 = mb * mt;
                 let col0 = tile * nt;
-                geom.each_c(c32, s, |lr, lc, v| {
-                    let (r, n) = (row0 + lr, col0 + lc);
-                    out[r * m + n] += mx.scale4[n * mx.k_chunks + kchunk]
-                        * sx[r * mx.k_chunks + kchunk]
-                        * v as f32;
+                let scol = &mx.scale4t[kchunk * mx.m..(kchunk + 1) * mx.m];
+                geom.each_c_run(c32, s, |lr, lc0, vals| {
+                    let r = row0 + lr;
+                    // Hoisted out of the column run; `scale4 * sx * v` keeps its
+                    // original left-to-right grouping, so results are bit-identical.
+                    let sxr = sx[r * mx.k_chunks + kchunk];
+                    let n0 = col0 + lc0;
+                    let sc = &scol[n0..n0 + vals.len()];
+                    let o = &mut out[r * m + n0..r * m + n0 + vals.len()];
+                    for t in 0..vals.len() {
+                        o[t] += sc[t] * sxr * vals[t] as f32;
+                    }
                 });
             }
         }
@@ -304,6 +372,10 @@ mod body {
         last_use: HashMap<String, u64>,
         pub misses: u64,
         pub miss_ns: u64,
+        /// Eviction policy. The body touches its primitives in a fixed repeating
+        /// cycle longer than the slot count, which is LRU's pessimal case (every
+        /// access misses). MRU keeps `capacity-1` of the cycle resident instead.
+        pub mru: bool,
     }
 
     impl KernelCache {
@@ -324,13 +396,24 @@ mod body {
                 last_use: HashMap::new(),
                 misses: 0,
                 miss_ns: 0,
+                mru: true,
             })
         }
 
         /// Borrow a loaded kernel, loading (and evicting) as needed. Returns an
         /// index into `live`, not a reference, so the caller can still touch
         /// the cache; use [`Self::at`] to dispatch.
+        /// Sentinel index meaning "this is the anchor" — already loaded and
+        /// pinned, so it costs no LRU slot and can never miss.
+        pub const ANCHOR: usize = usize::MAX;
+
         pub fn get(&mut self, name: &str) -> usize {
+            // The anchor is permanently resident. Loading it again as a peer
+            // would burn a second hardware context on the same program AND make
+            // the body's most frequent kernel a recurring LRU victim.
+            if name == self.anchor_name {
+                return Self::ANCHOR;
+            }
             self.clock += 1;
             self.last_use.insert(name.to_string(), self.clock);
             if let Some(idx) = self.live.iter().position(|(n, _)| n == name) {
@@ -340,13 +423,21 @@ mod body {
                 // Evict least-recently-used. Dropping the kernel destroys its
                 // hwctx, freeing a slot; its argument buffers are unaffected
                 // (they belong to the shared device, not the context).
-                let victim = self
-                    .live
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, (n, _))| self.last_use.get(n).copied().unwrap_or(0))
-                    .map(|(i, _)| i)
-                    .expect("non-empty cache");
+                let key = |n: &String| self.last_use.get(n).copied().unwrap_or(0);
+                let victim = if self.mru {
+                    self.live
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, (n, _))| key(n))
+                        .map(|(i, _)| i)
+                } else {
+                    self.live
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, (n, _))| key(n))
+                        .map(|(i, _)| i)
+                }
+                .expect("non-empty cache");
                 self.live.remove(victim);
             }
             let t0 = std::time::Instant::now();
@@ -360,6 +451,9 @@ mod body {
         }
 
         pub fn at(&self, idx: usize) -> &NpuKernel {
+            if idx == Self::ANCHOR {
+                return &self.anchor;
+            }
             &self.live[idx].1
         }
 
@@ -468,6 +562,7 @@ fn main() {
 
     let t_setup = Instant::now();
     let mut cache = KernelCache::new(artifacts, &rms16, capacity).expect("kernel cache");
+    cache.mru = arg("--evict").as_deref() != Some("lru");
 
     // ── resident weights: uploaded ONCE, reused across dispatches + blocks ──
     struct Gemm {
@@ -1087,6 +1182,11 @@ fn main() {
             "  block {blk}: wall={:.1} ms  dispatches={nd}  npu_busy={npu_ms:.1} ms  ctx_misses={nm}",
             wall * 1e3
         );
+        // Block 0 is cold (first touch of every weight BO + every hwctx). Drop
+        // its samples so the per-op table reports the WARM steady state.
+        if blk == 0 {
+            per_op.clear();
+        }
         if blk == 0 {
             wall_cold = wall;
         } else {
@@ -1122,7 +1222,8 @@ fn main() {
         cache.miss_ns as f64 / 1e6
     );
 
-    println!("\n  per-op dispatch time (total over {blocks} blocks):");
+    let warm_n = blocks.saturating_sub(1).max(1);
+    println!("\n  per-op dispatch time (WARM blocks only, n={warm_n}):");
     let mut ops: Vec<_> = per_op.iter().collect();
     ops.sort_by_key(|(_, v)| std::cmp::Reverse(v.1));
     for (name, (n, ns, ns_miss)) in ops {

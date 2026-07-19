@@ -105,8 +105,8 @@ def main():
                 ctx[:, h * HEAD_DIM:(h + 1) * HEAD_DIM] = o[kvh, i * block:(i + 1) * block, :]
         return ctx
 
-    for name in args.variants.split(","):
-        name = name.strip()
+    for raw_name in args.variants.split(","):
+        name = raw_name.strip()
         if name == "all":
             fn, kw, label = B.dflash_attn_all, dict(q_len=q_len, kv_len=tot, n_iters=NKV), \
                 "dflash_attn_all (1 core)"

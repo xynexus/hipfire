@@ -173,8 +173,35 @@ impl R14Geometry {
                     for r in 0..MR {
                         let row = m0 + i * lm * MR + im * MR + r;
                         let src = row * k_total + k0 + ktile * MK;
-                        for kk in 0..MK {
-                            dst[toff + r * MK + kk] = a[src + kk] as u8;
+                        // int8 -> u8 is a pure reinterpret; copy the whole MK run
+                        // as one memcpy instead of MK bounds-checked byte stores.
+                        let s: &[u8] = unsafe {
+                            std::slice::from_raw_parts(a[src..src + MK].as_ptr() as *const u8, MK)
+                        };
+                        dst[toff + r * MK..toff + r * MK + MK].copy_from_slice(s);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read one iteration's C grid as contiguous `MN`-wide runs, calling
+    /// `f(row, col0, &values[..MN])`. Same traversal order as [`Self::each_c`]
+    /// — only the innermost `MN` loop is handed to the caller as a slice, so a
+    /// consumer can vectorize it without changing accumulation order.
+    pub fn each_c_run(&self, c: &[i32], slot: usize, mut f: impl FnMut(usize, usize, &[i32])) {
+        let (lm, ln, cb) = (self.lm, self.ln, self.cb());
+        for j in 0..GRID {
+            for i in 0..GRID {
+                let base = j * self.ct() + slot * GRID * cb + i * cb;
+                for im in 0..lm {
+                    for jn in 0..ln {
+                        let toff = base + (im * ln + jn) * (MR * MN);
+                        for r in 0..MR {
+                            let row = i * lm * MR + im * MR + r;
+                            let col0 = j * ln * MN + jn * MN;
+                            let o = toff + r * MN;
+                            f(row, col0, &c[o..o + MN]);
                         }
                     }
                 }
