@@ -388,7 +388,13 @@ fn main() {
     let gdir = arg("--golden").expect("--golden");
     let refpath = arg("--ref");
     let blocks: usize = arg("--blocks").and_then(|v| v.parse().ok()).unwrap_or(3);
-    let capacity: usize = arg("--ctx-budget").and_then(|v| v.parse().ok()).unwrap_or(5);
+    // npu1 (Phoenix) admits only SIX concurrent hardware contexts. The anchor
+    // plus this LRU capacity plus (under `--gemm multicore`) the pinned r14 array
+    // must stay within that. The default was 5, which gives anchor + r14 + 5 = 7
+    // under multicore and panics at load_peer with Ioctl(EINVAL, os code 22) on
+    // the first primitive that misses. 4 is the largest value that fits the
+    // multicore config; the single-core path has one context spare.
+    let capacity: usize = arg("--ctx-budget").and_then(|v| v.parse().ok()).unwrap_or(4);
     // `--gemm multicore` routes every projection through the r14 4x4 array
     // (W4A8) instead of the single-core `int_matmul` (W8A8).
     let mc = arg("--gemm").as_deref() == Some("multicore");

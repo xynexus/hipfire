@@ -275,7 +275,8 @@ def quantize_row_symmetric(x_f32, bits=8):
 class NpuOps:
     def __init__(self, count=True, batch_ops=False, proj_mode="group",
                  resident_weights=False, concat_proj=False, attn_all_kv=False,
-                 fuse_hnrope=False, fold_norm=False, stack_ctx=False):
+                 fuse_hnrope=False, fold_norm=False, stack_ctx=False,
+                 attn_cores=1):
         # batch_ops   : Lever 1 — run norm/headnorm/rope/swiglu batched (all rows
         #               in ONE dispatch) via the *-b<rows> xclbins instead of the
         #               per-row loop.
@@ -291,6 +292,11 @@ class NpuOps:
         # attn_all_kv : Lever 3 — whole layer's attention in ONE dispatch
         #               (core loops the kv-heads, streaming via ObjectFifo).
         self.attn_all_kv = attn_all_kv
+        # attn_cores : Phase 0 item 2 — spread the kv-heads of the whole-layer
+        #              attention across this many columns (1 = serial single-core
+        #              dflash_attn_all). Same dispatch ABI and buffer layout, so
+        #              it is a drop-in xclbin swap and still ONE hw context.
+        self.attn_cores = attn_cores
         # fuse_hnrope : Phase D step 1 — TRUE multi-op fusion. headnorm+rope
         #               collapse into one kernel (dflash-hnrope-*), for both q
         #               and k. Saves 2 dispatches/layer (13.6 -> 11.6).
@@ -670,15 +676,26 @@ class NpuOps:
             {"role": "C_out_int32", "dtype": "int32", "shape": [M, N], "bytes": M * N * 4},
         ])
 
-    def _manifest_attn_all(self, q_len, kv_len, n_iters):
-        """Record the one-dispatch whole-layer attention (dflash_attn_all)."""
+    def _manifest_attn_all(self, q_len, kv_len, n_iters, n_cores=1):
+        """Record the one-dispatch whole-layer attention.
+
+        n_cores=1 -> dflash_attn_all (serial); n_cores>1 -> dflash_attn_mc, whose
+        kv-heads are split across columns. Both keys start with "dflash_attn_all"
+        so dflash_body_native.rs finds either by its existing prefix match, and
+        both take the same (Q, KV, O) buffers at the same sizes.
+        """
         if not MANIFEST.enabled:
             return
         ca = {"q_len": q_len, "kv_len": kv_len, "n_iters": n_iters}
-        key = f"dflash_attn_all:q{q_len}_kv{kv_len}_it{n_iters}"
+        if n_cores > 1:
+            from build_dflash_attention_sc import dflash_attn_mc as _attn_fn
+            ca["n_cores"] = n_cores
+            key = f"dflash_attn_all_mc{n_cores}:q{q_len}_kv{kv_len}_it{n_iters}"
+        else:
+            from build_dflash_attention_sc import dflash_attn_all as _attn_fn
+            key = f"dflash_attn_all:q{q_len}_kv{kv_len}_it{n_iters}"
         if key not in MANIFEST.kernels:
-            from build_dflash_attention_sc import dflash_attn_all
-            xcl, ins = _jit_artifacts(dflash_attn_all, **ca)
+            xcl, ins = _jit_artifacts(_attn_fn, **ca)
             MANIFEST.kernel(key, xcl, ins, ca)
         qn = n_iters * q_len * HEAD_DIM
         kvn = n_iters * 2 * kv_len * HEAD_DIM
@@ -762,8 +779,8 @@ class NpuOps:
             # ONE dispatch for the whole layer: the core loops the NKV kv-heads,
             # streaming each group's Q/KV/O through the ObjectFifos (tile holds one
             # iteration, 56 KB). Verified cos=1.00000 vs bf16 ref on all 32 q-heads.
-            self._manifest_attn_all(q_len, tot, NKV)
-            ctx = run_attn_all_kv(q, k, v, groups)
+            self._manifest_attn_all(q_len, tot, NKV, self.attn_cores)
+            ctx = run_attn_all_kv(q, k, v, groups, self.attn_cores)
             self.dispatches += 1
             self.op_dispatches += 1
             return ctx
@@ -1428,6 +1445,12 @@ def main():
     ap.add_argument("--attn-all-kv", action="store_true",
                     help="Lever 3: whole layer attention in ONE dispatch "
                          "(core loops kv-heads); exact, saves 7 dispatches/layer")
+    ap.add_argument("--attn-cores", type=int, default=1,
+                    help="Phase 0 item 2: spread the whole-layer attention's "
+                         "kv-heads across N columns (1 = serial single core). "
+                         "Exact; same dispatch ABI and still one hw context. "
+                         "N must divide n_kv and is capped at 4 by the "
+                         "per-column shim MM2S budget (2 per column: Q + KV)")
     ap.add_argument("--fold-norm", action="store_true",
                     help="Phase D step 2: absorb each rmsnorm that feeds a "
                          "projection INTO that projection (gamma folded into the "
@@ -1473,12 +1496,14 @@ def main():
     ops = NpuOps(batch_ops=args.batch_ops, proj_mode=args.proj,
                  resident_weights=args.resident_weights,
                  concat_proj=args.concat_proj, attn_all_kv=args.attn_all_kv,
+                 attn_cores=args.attn_cores,
                  fuse_hnrope=args.fuse_hnrope,
                  fold_norm=args.fold_norm or args.stack_ctx,
                  stack_ctx=args.stack_ctx)
     print(f"[dflash_body_npu] config: batch_ops={ops.batch_ops} "
           f"proj_mode={ops.proj_mode} resident_weights={ops.resident_weights} "
           f"concat_proj={ops.concat_proj} attn_all_kv={ops.attn_all_kv} "
+          f"attn_cores={ops.attn_cores} "
           f"fuse_hnrope={ops.fuse_hnrope} fold_norm={ops.fold_norm} "
           f"stack_ctx={ops.stack_ctx}")
 

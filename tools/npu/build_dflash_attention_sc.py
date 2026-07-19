@@ -160,12 +160,93 @@ def dflash_attn_all(Q: In, KV: In, O: Out, *,
     return Program(iron.get_current_device(), rt).resolve_program()
 
 
-def run_attn_all_kv(q, k, v, groups):
+# ── multi-core variant: the SAME dispatch ABI, kv-heads split across columns ──
+# `dflash_attn_all` loops all n_iters kv-heads on ONE core; attention is the
+# largest term in the block (235.5 ms). The kv-heads are fully independent, so
+# they spread across cores with no cross-core communication.
+#
+# Placement: one worker per column on row 2 (the first compute row), worker w
+# owning the contiguous kv-head range [w*per, (w+1)*per). Each worker gets its
+# own inQ/inKV/outO triple, so per column the shim uses 2 MM2S (Q, KV) + 1 S2MM
+# (O) — exactly the ~2-MM2S-per-column-shim budget — and each core sees 2 inbound
+# DMA channels, the AIE2 compute-tile maximum. Going wider than one core per
+# column would need memtile distribute (or packet-switched routing) to stay
+# inside both caps.
+#
+# The host buffer layout is BYTE-IDENTICAL to dflash_attn_all (n_iters tiles of
+# Q / KV / O, back to back, in kv-head order); each worker's tap just selects its
+# own contiguous slice via a TensorAccessPattern offset. That keeps
+# `dflash_body_native.rs` working unchanged — it is a drop-in xclbin swap — and
+# it stays ONE xclbin, so the hw-context count is unchanged (npu1 admits 6).
+@iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"], source_files=[str(KERNEL_SRC)])
+def dflash_attn_mc(Q: In, KV: In, O: Out, *,
+                   q_len: CompileTime[int], kv_len: CompileTime[int],
+                   n_iters: CompileTime[int], n_cores: CompileTime[int]):
+    from aie.helpers.taplib import TensorAccessPattern
+    from aie.iron.device import Tile
+
+    nd = cast(Any, np.ndarray)
+    dt = cast(Any, np.dtype)
+    qN, kvN = q_len * HEAD_DIM, 2 * kv_len * HEAD_DIM
+    assert n_iters % n_cores == 0, f"n_iters={n_iters} not divisible by n_cores={n_cores}"
+    per = n_iters // n_cores
+
+    Qt_ty: Any = nd[(qN,), dt[bfloat16]]
+    KVt_ty: Any = nd[(kvN,), dt[bfloat16]]
+    Q_all: Any = nd[(n_iters * qN,), dt[bfloat16]]
+    KV_all: Any = nd[(n_iters * kvN,), dt[bfloat16]]
+    attn = _attn_kernel(q_len, kv_len)
+
+    def core_fn(of_q, of_kv, of_o, kfn):
+        for _ in range_(per):
+            q = of_q.acquire(1)
+            kv = of_kv.acquire(1)
+            o = of_o.acquire(1)
+            kfn(q, kv, o)
+            of_q.release(1)
+            of_kv.release(1)
+            of_o.release(1)
+
+    workers, fills, drains = [], [], []
+    for w in range(n_cores):
+        inQ = ObjectFifo(Qt_ty, name=f"inQ{w}", depth=1)
+        memQ = inQ.cons().forward(name=f"memQ{w}")
+        inKV = ObjectFifo(KVt_ty, name=f"inKV{w}", depth=1)
+        memKV = inKV.cons().forward(name=f"memKV{w}")
+        outO = ObjectFifo(Qt_ty, name=f"outO{w}", depth=1)
+        # Column-major fill: cores 0..3 take row 2 of columns 0..3, then row 3.
+        # Beyond n_cores=4 this puts 2 workers (4 MM2S) on one column shim.
+        workers.append(Worker(core_fn, [memQ.cons(), memKV.cons(), outO.prod(), attn],
+                              tile=Tile(w % 4, 2 + w // 4), stack_size=0x1000))
+        # per tiles of one iteration each, starting at this worker's kv-head.
+        fills.append(("q", inQ.prod(), TensorAccessPattern(
+            (n_iters, qN), w * per * qN, [1, 1, per, qN], [0, 0, qN, 1])))
+        fills.append(("kv", inKV.prod(), TensorAccessPattern(
+            (n_iters, kvN), w * per * kvN, [1, 1, per, kvN], [0, 0, kvN, 1])))
+        drains.append((outO.cons(), TensorAccessPattern(
+            (n_iters, qN), w * per * qN, [1, 1, per, qN], [0, 0, qN, 1])))
+
+    rt = Runtime()
+    with rt.sequence(Q_all, KV_all, Q_all) as (Qh, KVh, Oh):
+        for wk in workers:
+            rt.start(wk)
+        for which, prod, tap in fills:
+            rt.fill(prod, Qh if which == "q" else KVh, tap=tap)
+        for consumer, tap in drains:
+            rt.drain(consumer, Oh, tap=tap, wait=True)
+    return Program(iron.get_current_device(), rt).resolve_program()
+
+
+def run_attn_all_kv(q, k, v, groups, n_cores=1):
     """ONE dispatch for a whole layer's attention.
 
     q [B,NH,HD], k/v [tot,NKV,HD] -> ctx [B, NH*HD]. Packs, per kv-head, the
     `groups` q-heads' queries stacked (q_len=groups*B) and that kv-head's [K|V],
     then streams all NKV groups through a single dispatch.
+
+    n_cores=1 uses the serial `dflash_attn_all`; n_cores>1 uses `dflash_attn_mc`,
+    which splits the kv-heads across that many columns. Identical host buffer
+    layout either way.
     """
     from aie.utils.benchmark import run_iters
     B, NH, HD = q.shape
@@ -180,8 +261,12 @@ def run_attn_all_kv(q, k, v, groups):
     Qt = iron.tensor(np.concatenate(qbuf).astype(bfloat16), dtype=bfloat16, device="npu")
     KVt = iron.tensor(np.concatenate(kvbuf).astype(bfloat16), dtype=bfloat16, device="npu")
     Ot = iron.zeros(NKV * q_len * HEAD_DIM, dtype=bfloat16, device="npu")
-    run_iters(dflash_attn_all, Qt, KVt, Ot, q_len=q_len, kv_len=tot, n_iters=NKV,
-              warmup=0, iters=1)
+    if n_cores > 1:
+        run_iters(dflash_attn_mc, Qt, KVt, Ot, q_len=q_len, kv_len=tot, n_iters=NKV,
+                  n_cores=n_cores, warmup=0, iters=1)
+    else:
+        run_iters(dflash_attn_all, Qt, KVt, Ot, q_len=q_len, kv_len=tot, n_iters=NKV,
+                  warmup=0, iters=1)
     o = np.array(Ot.numpy(), dtype=np.float32).reshape(NKV, q_len, HEAD_DIM)
     ctx = np.empty((B, NH * HD), np.float32)
     for kvh in range(NKV):

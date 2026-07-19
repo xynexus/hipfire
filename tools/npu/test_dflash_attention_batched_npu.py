@@ -35,6 +35,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--golden-dir", type=Path, required=True)
     ap.add_argument("--kv-heads-tested", type=int, default=0, help="0 = all kv-heads")
+    ap.add_argument("--cores", type=int, default=0,
+                    help="0 = per-kv-head dispatches via run_attn_head (default); "
+                         ">=1 = whole-layer dflash_attn_all/_mc with that many cores "
+                         "(Phase 0 item 2 multi-core attention)")
     args = ap.parse_args()
 
     g = args.golden_dir
@@ -57,7 +61,7 @@ def main():
           f"-> q_len={q_len} per dispatch; kv_heads_tested={n_kvh} "
           f"(dispatches/layer: {n_q} -> {n_kv})")
 
-    from build_dflash_attention_sc import run_attn_head
+    from build_dflash_attention_sc import run_attn_head, run_attn_all_kv
     from ml_dtypes import bfloat16
 
     def bf16(x):
@@ -68,15 +72,25 @@ def main():
         w = np.exp(s - s.max(1, keepdims=True))
         return (w / w.sum(1, keepdims=True)) @ vh
 
+    # Whole-layer path: ONE dispatch, kv-heads split across `--cores` columns.
+    # Returns ctx [block, n_q*HEAD_DIM]; slice it back per q-head so the same
+    # per-head bf16-reference cosine gate applies unchanged.
+    ctx_all = None
+    if args.cores >= 1:
+        ctx_all = run_attn_all_kv(q, k, v, groups, n_cores=args.cores)
+        print(f"[attn_batched] whole-layer path, n_cores={args.cores}")
+
     all_ok = True
     worst = 1.0
     for kvh in range(n_kvh):
         heads = list(range(kvh * groups, (kvh + 1) * groups))
         # stack the group's q-heads: [groups*block, 128]
-        Qs = np.concatenate([q[:, h, :] for h in heads], axis=0)
-        out = run_attn_head(Qs, k[:, kvh, :], v[:, kvh, :], q_len, tot)  # [q_len,128]
+        if ctx_all is None:
+            Qs = np.concatenate([q[:, h, :] for h in heads], axis=0)
+            out = run_attn_head(Qs, k[:, kvh, :], v[:, kvh, :], q_len, tot)  # [q_len,128]
         for i, h in enumerate(heads):
-            npu_h = out[i * block:(i + 1) * block, :]
+            npu_h = (ctx_all[:, h * HEAD_DIM:(h + 1) * HEAD_DIM] if ctx_all is not None
+                     else out[i * block:(i + 1) * block, :])
             gh = ref[:, h, :]
             bref = bf16(attn_ref(bf16(q[:, h, :]), bf16(k[:, kvh, :]), bf16(v[:, kvh, :])))
             cb = float(npu_h.reshape(-1) @ bref.reshape(-1) /
