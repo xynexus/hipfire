@@ -22,7 +22,7 @@ NPU DFlash block wall: **726 ms** (native driver,
 | term | original | NOW (measured, warm) |
 |---|---|---|
 | GEMM (weight-bandwidth-bound) | 317 ms | **103.5 ms** (98bbce9b6, r14 W4A8) |
-| attention | 236 ms | **61.5 ms** (326971468, 4-core, 3.83×) |
+| attention | 236 ms | **61.5 ms** (326971468, 4-core) → **~6.1 ms** (flash kernel, 10.1×) |
 | host glue (quant/bf16/packing) | 143 ms | **53.0 ms** (8da5aa5b3) |
 | primitives (norm/rope/swiglu) | 24 ms | 23.5 ms |
 | **warm block wall** | **726 ms** | **236.0 ms** |
@@ -203,13 +203,44 @@ is architecture-independent, so build it on 9B and swap the target.
        axis from `fc`, `kv`, `rmsnorm-b{L}`, `headnorm-k`, `rope-k`. These then
        run at a **fixed small row count** (16, matching `M_TILE`) over newly
        committed tokens, so no shape-generic build is needed for them.
-   (b) **Attention is the only remaining L-shaped kernel — and it is the
-       blocker.** MEASURED (see above): linear at 0.262 ms/KV row with ~0.1 ms
-       fixed overhead, and it **will not build past tot=55** (core-tile L1).
-       Bucketing and shape-generic builds are BOTH dead ends. The required work
-       is a tiled/streaming KV loop with `aie::mmul` in
-       `tools/npu/dflash_attention_sc_bf16.cc`; that single change removes the
-       tot cap and is the only path to a 10× on the 61.5 ms term.
+   (b) ~~**Attention is the only remaining L-shaped kernel — and it is the
+       blocker.**~~ **DONE.** `tools/npu/dflash_attention_flash_bf16.cc` +
+       `build_dflash_attention_flash.py` (the sc pair is kept as the fallback).
+       Streaming KV tiles + online softmax + `aie::mmul<4,8,4>`. MEASURED on
+       nix1, 4 cores, block=16, 32q/8kv/128d, q_len=16 / kv_tile=48:
+
+       | | sc kernel | flash kernel |
+       |---|---|---|
+       | tot=48 | 12.246 ms | **1.214 ms** (10.1×) |
+       | tot=528 | would not build | **6.607 ms** |
+       | tot=4080 | would not build | **48.342 ms** |
+       | ms / KV row | 0.262 | **0.0125** (21×) |
+       | GFLOP/s | 0.97 | **10.4 (tot=48) → 22.1 (tot=4080)** |
+       | cos vs f32 / bf16 ref | 0.999997 / 0.999999 | **0.999996 / 0.999997** |
+
+       **The tot ≤ 55 cap is gone** — core L1 now holds one KV tile, not the
+       whole KV, so it is independent of tot. tot=4080 builds and runs with
+       parity intact and ms/row still flat; no new limit was reached.
+       Attention at the in-body shape drops **61.5 ms → ~6.1 ms**; at L=512
+       (tot=528) 5 layers cost **33 ms**, versus the 691 ms the sc kernel's
+       ms/row extrapolated to.
+
+       **⚠ The brief's attribution of the sc kernel's cost to the dot product
+       was WRONG, and it matters.** Putting both GEMMs on `aie::mmul` alone
+       bought only 1.36× (0.262 → 0.192 ms/row) — the kernel still cost ~1900
+       core cycles per (q,k) pair, essentially unchanged. The real limiter is
+       that **AIE2's scalar unit has no fast float datapath**, and the sc kernel
+       ran one SCALAR exp per (q,k) pair. Vectorising the exp (`exp_neg_v`, a
+       magic-constant round-to-nearest 2^n split feeding a degree-5 series)
+       took 9.65 ms → 1.37 ms in one step, 7× of the total 10×. **On AIE2,
+       count scalar float ops before counting MACs.** `aie::exp2` is
+       `arch::XDNA_2`-only (aie2p), so the software vector exp is required on
+       npu1.
+
+       Measured null: `q_len=32` (no change), `kv_depth=2` (no change — the
+       kernel is not DMA-bound). `kv_tile=48` beats 16 by ~1.35× at long
+       context. `kv_tile` must divide `tot` and be a multiple of 16 (no tail
+       masking in v1). Bench: `tools/npu/bench_dflash_attention_flash.py`.
    (c) Then the seam, with the gates below.
    `--ctx-slice 32` (`dflash_spec_demo.rs:618`) would run the seam today and
    prove plumbing + losslessness, but at 32 context rows the resulting τ and
