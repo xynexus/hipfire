@@ -67,6 +67,33 @@ is **~118 ms for 27B**, and GEMM (168.8 derived, 55% of the wall) is now the
 only large lever — specifically the `M_TILE=16` double-stream, ~40 ms above the
 ~60 ms bandwidth floor on 9B. Host glue (29%) is second.
 
+**⚠ 185.4 ms IS A NO-CACHE, FULL-RECOMPUTE-EVERY-BLOCK WALL. In the actual loop
+the per-cycle cost is much lower — the L axis is defeated (task #25, `9df9ae357`,
+`--ctx-cache`).** The context cache stores `thp` and each layer's post-headnorm/
+post-rope context K and raw V across cycles. Correctness is **bit-identical**
+(cache-vs-recompute max|Δ| K=0 V=0 across all 5 layers; final block_hidden
+cos = 1.000000000). It removes from the per-cycle path exactly the L-scaling
+terms: `fc` (38.4 ms), the 5 per-layer `kv` GEMMs (21.0 ms), `rms-b32` (1.2 ms)
+— 60.6 ms of direct compute at L=32, and these are the weight-bandwidth-bound
+GEMMs that re-stream `ceil(L/16)` times, so without the cache they would be
+~950 ms/block at L=512. **Cached, the only per-cycle term that still grows with
+L is flash attention** (6.9 ms at tot=48 → ~33 ms at tot=528), which the cache
+structurally cannot help (query rows are new every cycle) but which is cheap.
+
+Projected cached per-cycle wall at L=512 ≈ **155–160 ms** (normalised to this
+brief's machine state) — *below* the L=32 no-cache wall and ~10× under the
+no-cache L=512 cost. **MEASURED: the bit-identical correctness, the per-op
+removals, and a same-run 470→388 ms warm delta. PROJECTED: the L=512 number** —
+in-body L-scaling could not be measured because the weights/manifest are built
+at fixed N=l_ctx=32; a larger L needs a Python regen + new-shape kernel builds.
+The k-side headnorm/rope exist only at b48, so the cached path still dispatches
+them over all `tot` rows (output discarded); a b16 build trims those to noise
+rows (projected, not measured).
+
+Absolute walls in that run ran ~2.5× this brief's 185.4/132 (context-miss weight
+re-faulting, a machine/thermal state, not the cache) — which is exactly why the
+result is reported as a same-run delta.
+
 **⚠ 236.0 ms IS A COLD-CONTEXT NUMBER, measured at L=32 with NO context cache.**
 The harness recomputes the entire context projection every block. In a real
 spec-decode loop the context grows every cycle, so the naive reading is that the
