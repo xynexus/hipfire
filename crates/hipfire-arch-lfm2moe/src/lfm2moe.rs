@@ -59,6 +59,30 @@ fn load_lfm2_awq_scale(hfq: &HfqFile, gpu: &mut Gpu, name: &str, k: usize) -> Op
     gpu.upload_raw(&f32_bytes, &[f32_data.len()]).ok()
 }
 
+/// Decode a per-element float tensor (F16=1, F32=2, BF16=16) to F32. Returns
+/// None for any other quant code. Shared by the embedding-table loader so a
+/// bf16/f16 embed is not misread by the Q8 lookup path.
+fn plain_to_f32(qt: u8, data: &[u8]) -> Option<Vec<f32>> {
+    match qt {
+        1 => Some(
+            data.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+        ),
+        2 => Some(
+            data.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        ),
+        16 => Some(
+            data.chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 /// Load a 1D/raw F16/F32 vector → F32 GpuTensor with the given shape.
 /// LFM2 uses STANDARD RMSNorm (`weight * x̂`, no +1 offset — verified against
 /// Lfm2MoeRMSNorm), so no offset is baked in. Also used for the depthwise conv
@@ -407,7 +431,8 @@ pub struct Lfm2MoeLayerWeights {
 }
 
 pub struct Lfm2MoeWeights {
-    pub embed: GpuTensor, // model.embed_tokens.weight (raw, for embedding_lookup)
+    pub embed: GpuTensor, // model.embed_tokens.weight (raw Q8_0, or decoded F32 table)
+    pub embed_is_f32: bool, // true = F32 table (float formats), false = raw Q8_0
     pub embedding_norm: GpuTensor, // model.embedding_norm.weight (final norm)
     pub lm_head: WeightTensor, // tied = embed_tokens (loaded as Q8 weight)
     pub layers: Vec<Lfm2MoeLayerWeights>,
@@ -515,11 +540,23 @@ impl Lfm2MoeWeights {
         let n_exp = cfg.num_experts;
         let k_conv = cfg.conv_kernel_size;
 
-        // Globals. embed_tokens is the shared (tied) lm_head.
-        let (_eqt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
-        let embed = gpu
-            .upload_raw(&embed_bytes, &[embed_bytes.len()])
-            .map_err(|e| format!("lfm2moe: upload embed: {e:?}"))?;
+        // Globals. embed_tokens is the shared (tied) lm_head. The embedding
+        // TABLE keeps its stored format: Q8_0 stays raw for the GPU dequant
+        // lookup; per-element float formats (F16/F32/BF16) are decoded to an F32
+        // table so the F32 D2D lookup reads them correctly. Reading a bf16/f16
+        // table with the Q8 lookup produced garbage (RMS ~66 vs ~0.02) — the
+        // format was previously ignored (`_eqt` discarded).
+        let (embed_qt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
+        let embed_is_f32 = matches!(embed_qt, 1 | 2 | 16);
+        let embed = if embed_is_f32 {
+            let f32_data = plain_to_f32(embed_qt, &embed_bytes)
+                .ok_or_else(|| format!("lfm2moe: embed decode failed for qt={embed_qt}"))?;
+            gpu.upload_f32(&f32_data, &[cfg.vocab_size, hidden])
+                .map_err(|e| format!("lfm2moe: upload embed(f32): {e:?}"))?
+        } else {
+            gpu.upload_raw(&embed_bytes, &[embed_bytes.len()])
+                .map_err(|e| format!("lfm2moe: upload embed: {e:?}"))?
+        };
         let embedding_norm = load_f32(hfq, gpu, "model.embedding_norm.weight", &[hidden])?;
         // lm_head: tied → reuse embed_tokens.weight as a Q8 weight tensor.
         let lm_head = load_wt(
@@ -754,6 +791,7 @@ impl Lfm2MoeWeights {
         let _ = (conv_state_count, kv_count);
         Ok(Lfm2MoeWeights {
             embed,
+            embed_is_f32,
             embedding_norm,
             lm_head,
             layers,

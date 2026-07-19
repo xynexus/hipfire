@@ -738,8 +738,12 @@ fn prefill_batch_chunk(
     upload_i32_rows(gpu, &s.tokens, tokens)?;
     let positions: Vec<u32> = (0..n).map(|i| (start_pos + i) as u32).collect();
     upload_i32_rows(gpu, &s.positions, &positions)?;
-    gpu.embedding_lookup_q8_batched(&weights.embed, &s.h_batch, &s.tokens, n, hidden)
-        .map_err(|e| format!("lfm2moe prefill: embedding batch: {e:?}"))?;
+    if weights.embed_is_f32 {
+        gpu.embedding_lookup_f32_batched(&weights.embed, &s.h_batch, &s.tokens, n, hidden)
+    } else {
+        gpu.embedding_lookup_q8_batched(&weights.embed, &s.h_batch, &s.tokens, n, hidden)
+    }
+    .map_err(|e| format!("lfm2moe prefill: embedding batch: {e:?}"))?;
 
     let max_ctx_len = start_pos + n;
     for (l, layer) in weights.layers.iter().enumerate() {
@@ -1114,9 +1118,13 @@ fn decode_step_inner(
     // swaps in logical position when TriAttention compaction is active.
     stage_position(gpu, state, position, "physical")?;
 
-    // Embedding lookup → residual stream h (Q8 table).
-    gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
-        .map_err(|e| format!("lfm2moe: embed lookup: {e:?}"))?;
+    // Embedding lookup → residual stream h (Q8 dequant, or F32 D2D for float tables).
+    if weights.embed_is_f32 {
+        gpu.embedding_lookup(&weights.embed, &state.h, token_id, hidden)
+    } else {
+        gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
+    }
+    .map_err(|e| format!("lfm2moe: embed lookup: {e:?}"))?;
 
     decode_step_layers_and_head(cfg, weights, state, gpu, position, capture)
 }

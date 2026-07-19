@@ -373,8 +373,12 @@ pub fn run_dflash_draft_for_logits(
                 draft_cfg.mask_token_id
             };
             let dst = draft_scratch.x.sub_offset(row * h, h);
-            gpu.embedding_lookup_q8(&target_weights.embed, &dst, tok, h)
-                .map_err(|e| format!("lfm2 dflash: target embedding row {row}: {e:?}"))?;
+            if target_weights.embed_is_f32 {
+                gpu.embedding_lookup(&target_weights.embed, &dst, tok, h)
+            } else {
+                gpu.embedding_lookup_q8(&target_weights.embed, &dst, tok, h)
+            }
+            .map_err(|e| format!("lfm2 dflash: target embedding row {row}: {e:?}"))?;
         }
     }
 
