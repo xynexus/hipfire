@@ -21,13 +21,22 @@ NPU DFlash block wall: **726 ms** (native driver,
 
 | term | now | available |
 |---|---|---|
-| GEMM (weight-bandwidth-bound) | 317 ms | ~32–42 ms **PROJECTED, NOT WIRED IN** |
+| GEMM (weight-bandwidth-bound) | 317 ms | **123.7 ms MEASURED** (98bbce9b6, 2.57×) |
 | attention (single-core) | 236 ms | ~30 ms if multi-cored. **UNTOUCHED** |
 | host glue (quant/bf16/packing) | 143 ms | Rust-side, tractable |
 | primitives (norm/rope/swiglu) | 24 ms | — |
 
-After the GEMM fix alone the block is still **~435–445 ms — attention becomes the
-dominant term.** `dflash_attn_all` loops all 8 kv-heads on ONE core.
+**Measured after item 1b: warm block 734.5 → 480.8 ms; attention (235.5 ms) is now
+the largest single term.** `dflash_attn_all` loops all 8 kv-heads on ONE core.
+
+**The "~32–42 ms" projection this brief originally carried was WRONG** — it came
+from an aggregate bandwidth figure (15.14 GB/s) mistaken for the weight path
+(actually 10.0–10.7). Of the measured 123.7 ms, ~60 ms is the genuine bandwidth
+floor (600 MiB packed W ÷ 10.4 GB/s — M_TILE=16 makes the rows=32 GEMMs stream
+weights twice) and ~62 ms is **hardware-context contention**: npu1 admits 6 hw
+contexts, the r14 array pins one, leaving 4 LRU slots for 8 primitive kernels →
+36 context misses/block. Isolated probes hit 0.80–0.84 ms/dispatch; in-body the
+same dispatches cost 1.24–3.30 ms. That contention is a NEW actionable term.
 
 **Target 27B/31B, NOT 9B.** The verify budget scales with target size; the draft
 cost does not. A 9B prototype measures a permanently-negative result.

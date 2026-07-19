@@ -296,6 +296,31 @@ rate ~61 GB/s.
 | 32 MB | 9.43 | 14.36 |
 | **100 MB** | **11.58** | **15.14** |
 
+> ### ⚠ CORRECTION 2026-07-19 — THESE ARE AGGREGATE, NOT WEIGHT-PATH
+>
+> **The table above is aggregate bytes ÷ time. It must NOT be used as a
+> weight-path projection, and it was.** The `r14_selftest` harness
+> (`crates/hipfire-xdna/examples/r14_selftest.rs`) separates them directly:
+> **W-path 10.0–10.7 GB/s, aggregate 15.5–16.8 GB/s** on the same runs.
+>
+> That reproduces the ~10.4 GB/s weight ceiling stated **150 lines above this
+> table**, in the section titled *"Aggregate vs weight path — do not conflate
+> them"*. The ceiling has now been measured four independent ways — r132, r133,
+> r135, and r14_selftest — and 15.14 is the outlier, because it is a different
+> quantity.
+>
+> **Cost of the error:** 15.14 was propagated into
+> `docs/plans/2026-07-19-dflash-phase0-brief.md`, the Phase 0 plan, and the goal
+> prompt, producing a "~32–42 ms" GEMM projection. The measured result is
+> **123.7 ms** (commit 98bbce9b6). Roughly ~60 ms of that is the genuine
+> bandwidth floor (600 MiB packed W ÷ 10.4 GB/s) and ~62 ms is hardware-context
+> contention — neither is recoverable by the dataflow tuning the projection
+> implicitly assumed.
+>
+> **Rule:** when quoting a bandwidth number for a projection, state which stream
+> it measures and prove it by varying the others. Aggregate ÷ time is not a
+> ceiling for any single stream.
+
 **Reads held constant from an inflated BO (r133's setup):** sync=1 gives 10.12 / 9.53 /
 5.87 at 8/15/57 MB — a dead-on replication of r133's 10.35 / 9.70 / 5.84. Under sync=0 the
 same arm is **flat** (12.41 / 12.54 / 12.54), proving the penalty is 100% host flush cost
