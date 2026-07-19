@@ -33,9 +33,18 @@ block (~1.7× warm) and then subtracted from the WARM wall. That understated glu
 (claimed 67.9, actually 105.7 before optimisation) and manufactured a
 "~62 ms of hardware-context contention" term that **does not exist**.
 
-**291.1 ms FITS the 31B budget (345 ms) with margin. Still 1.88× over 27B
-(155 ms)**, which is Phase 0's stated gate — so the gate is not met, but the
-architecture is viable end-to-end on a 31B-class target today.
+**⚠ 236.0 ms is the 9B DRAFTER's block time. Do NOT compare it against a 27B or
+31B budget — that is an invalid pairing.** A DFlash drafter is target-specific
+(it consumes `target_hidden` from that target's layers), so each target needs its
+own drafter and the draft cost scales with target size. Measured: Qwen3.5-9B
+DFlash = 1.049 B params, Qwen3.6-27B DFlash = **1.730 B (×1.65)**.
+
+Against its OWN budget the 9B pair is 236.0 vs 57 ms = **4.14× over**. Estimated
+for the 27B pair: **~328 ms vs 155 ms = ~2.1× over** (attention constant — both
+are 32q/8kv/128; GEMM weight-bound ×1.65; glue/primitives track hidden ×1.25).
+Moving to 27B helps by ~1.6×, not the ~2.7× that holding draft cost fixed
+implied. See the corrected section in
+`docs/plans/2026-07-19-hybrid-gpu-npu-cpu-spec-decode.md`.
 
 **Items 1 and 2 are DONE.** Remaining budget gap to 27B is ~136 ms, and the two
 largest remaining terms are GEMM (139.5) and host glue (67.9).
@@ -62,8 +71,11 @@ contexts, the r14 array pins one, leaving 4 LRU slots for 8 primitive kernels �
 36 context misses/block. Isolated probes hit 0.80–0.84 ms/dispatch; in-body the
 same dispatches cost 1.24–3.30 ms. That contention is a NEW actionable term.
 
-**Target 27B/31B, NOT 9B.** The verify budget scales with target size; the draft
-cost does not. A 9B prototype measures a permanently-negative result.
+**Target 27B-class, NOT 9B** — but for a weaker reason than originally stated.
+The budget scales with target size AND SO DOES THE DRAFTER (×2.72 vs ×1.65 for
+9B→27B), so the net gain is ~1.6×. A 9B prototype is still permanently negative
+(4.14× over its own budget); 27B is ~2.1× over its own. The integration plumbing
+is architecture-independent, so build it on 9B and swap the target.
 
 ## Tasks, in order
 
