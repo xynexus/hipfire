@@ -207,12 +207,26 @@ after verify, `accept_len + 1` tokens commit and N+1 starts at
 itself**, not just token values — and DFlash conditions on `target_hidden`, which
 the *target* produces during verify.
 
-**Hit rate is therefore governed by τ, and τ is currently low.** Measured
-τ ≈ 1.9–2.2 at B = 16, i.e. ~2 of 15 drafted tokens accepted. A speculative N+1
-drafted against "all of N accepted" is essentially always wrong; drafted against
-"≈2 accepted" it is right perhaps a fifth of the time. **Wasted-draft rate is
-`1 − P(guessed accept_len == actual)` — measure it before assuming the overlap
-pays.**
+**Hit rate is governed by τ. ⚠ CORRECTED 2026-07-19 — the τ this section
+originally used was from an INVALIDATED sweep.**
+
+It said "τ ≈ 1.9–2.2 at B = 16, ~2 of 15 accepted", and concluded a speculative
+N+1 is "essentially always wrong". That τ came from the first Phase F attempt,
+which was confounded by adaptive-B (a feedback loop on the metric) and by
+resident-mode state leakage — the very run this plan elsewhere marks invalid.
+
+**Properly measured (`benchmarks/results/dflash-phasef-acceptance-20260719.md`,
+8 prompts, `--no-adaptive-b --block-size 16`, separate processes): τ = 5.739,
+accept rate 0.3826.** That is ~2.6× the figure the pessimistic conclusion rested
+on, so **the conclusion does not follow and must be re-derived.** ~5.7 of 15
+drafted positions survive per cycle, so guessing `accept_len` is a materially
+better bet than "right perhaps a fifth of the time" implied.
+
+**Wasted-draft rate is still `1 − P(guessed accept_len == actual)` and still must
+be MEASURED, not assumed** — the point stands even though the number that
+motivated it was wrong. What is needed is the accept_len *distribution*, not just
+its mean; a high τ with a wide spread still makes a single-guess speculation
+unreliable.
 
 **The more promising variant:** condition N+1 on the drafter's *own* block-N
 hidden states instead of waiting for the target's. Those exist the moment N's
