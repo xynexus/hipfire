@@ -559,19 +559,51 @@ fn hfq_parameter_count(hfq: &HfqFile) -> u128 {
         .sum()
 }
 
+/// Parse the pflash drafter's DeltaNet state-quant from
+/// `HIPFIRE_PFLASH_DRAFTER_STATE`.
+///
+/// Absent or `auto` resolves through the redundancy gate
+/// (`qwen35::default_state_quant`), which yields **FP32** for all current models.
+///
+/// **Q8 is DEPRECATED (2026-07-19)** — see the policy note on
+/// `qwen35::deltanet_state_fp32_below`. Still parseable because the tree replay
+/// path is Q8-only, but an explicit request warns.
+///
+/// This previously mapped absent/`""`/`auto` straight to Q8, bypassing the gate.
+/// Returns `Ok(None)` for absent/`auto`, meaning "resolve through the redundancy
+/// gate" — the caller applies `qwen35::default_state_quant(config)`. Kept
+/// config-free so it stays unit-testable (there is no `Qwen35Config` fixture).
 #[cfg(feature = "deltanet")]
-fn parse_drafter_state_quant(
-    mode: Option<&str>,
-    _params: u128,
-) -> Result<qwen35::StateQuant, String> {
+fn parse_drafter_state_quant(mode: Option<&str>) -> Result<Option<qwen35::StateQuant>, String> {
     use qwen35::StateQuant;
-    match mode.unwrap_or("q8").to_ascii_lowercase().as_str() {
-        "" | "auto" | "q8" | "int8" => Ok(StateQuant::Q8),
-        "fp32" | "f32" => Ok(StateQuant::FP32),
-        "q4" | "int4" => Ok(StateQuant::Q4),
+    match mode.unwrap_or("auto").to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(None),
+        "q8" | "int8" => {
+            warn_deprecated_drafter_state_quant("q8");
+            Ok(Some(StateQuant::Q8))
+        }
+        "fp32" | "f32" => Ok(Some(StateQuant::FP32)),
+        "q4" | "int4" => {
+            warn_deprecated_drafter_state_quant("q4");
+            Ok(Some(StateQuant::Q4))
+        }
         other => Err(format!(
-            "HIPFIRE_PFLASH_DRAFTER_STATE={other:?} not in {{auto,q8,fp32,q4}}"
+            "HIPFIRE_PFLASH_DRAFTER_STATE={other:?} not in {{auto,fp32,q8,q4}}"
         )),
+    }
+}
+
+/// One-shot deprecation warning for a quantized drafter DeltaNet state.
+#[cfg(feature = "deltanet")]
+fn warn_deprecated_drafter_state_quant(which: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "warning: HIPFIRE_PFLASH_DRAFTER_STATE='{which}' is DEPRECATED — \
+             quantized DeltaNet recurrent state is disallowed by policy (see \
+             qwen35::deltanet_state_fp32_below). Use 'auto' (=FP32)."
+        );
     }
 }
 
@@ -621,9 +653,10 @@ pub fn load_drafter(
                 std::env::var("HIPFIRE_PFLASH_DRAFTER_STATE")
                     .ok()
                     .as_deref(),
-                params,
             )
-            .map_err(|e| hip_bridge::HipError::new(0, &format!("pflash: {e}")))?;
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("pflash: {e}")))?
+            // `None` = auto -> the redundancy gate (FP32 for all current models).
+            .unwrap_or_else(|| qwen35::default_state_quant(&q35_cfg));
             let dn_state = qwen35::DeltaNetState::new_with_quant(gpu, &q35_cfg, dn_quant)?;
             // Hybrid drafter only stores K (and V for chat-path) at
             // FullAttention layers; LinearAttention layers' recurrent
@@ -1831,34 +1864,34 @@ mod tests {
 
     #[cfg(feature = "deltanet")]
     #[test]
-    fn drafter_state_quant_defaults_to_q8_with_explicit_overrides() {
+    fn drafter_state_quant_defaults_to_auto_with_explicit_overrides() {
         use qwen35::StateQuant;
 
         assert_eq!(
-            parse_drafter_state_quant(None, 800_000_000).unwrap(),
-            StateQuant::Q8
+            parse_drafter_state_quant(None).unwrap(),
+            None
         );
         assert_eq!(
-            parse_drafter_state_quant(Some("auto"), 800_000_000).unwrap(),
-            StateQuant::Q8
+            parse_drafter_state_quant(Some("auto")).unwrap(),
+            None
         );
         assert_eq!(
-            parse_drafter_state_quant(Some("auto"), 27_000_000_000).unwrap(),
-            StateQuant::Q8
+            parse_drafter_state_quant(Some("")).unwrap(),
+            None
         );
         assert_eq!(
-            parse_drafter_state_quant(Some("q8"), 800_000_000).unwrap(),
-            StateQuant::Q8
+            parse_drafter_state_quant(Some("q8")).unwrap(),
+            Some(StateQuant::Q8)
         );
         assert_eq!(
-            parse_drafter_state_quant(Some("fp32"), 27_000_000_000).unwrap(),
-            StateQuant::FP32
+            parse_drafter_state_quant(Some("fp32")).unwrap(),
+            Some(StateQuant::FP32)
         );
         assert_eq!(
-            parse_drafter_state_quant(Some("q4"), 27_000_000_000).unwrap(),
-            StateQuant::Q4
+            parse_drafter_state_quant(Some("q4")).unwrap(),
+            Some(StateQuant::Q4)
         );
-        assert!(parse_drafter_state_quant(Some("bad"), 800_000_000).is_err());
+        assert!(parse_drafter_state_quant(Some("bad")).is_err());
     }
 
     fn synthetic_loaded(compat: bool) -> PflashState {

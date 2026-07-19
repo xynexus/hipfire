@@ -534,7 +534,16 @@ pub struct ModelSlotConfig {
     pub max_seq: usize,
     pub kv_mode: KvMode,
     pub repeat_window: usize,
-    pub state_quant: qwen35::StateQuant,
+    /// DeltaNet recurrent-state precision. `None` = **auto**, resolved at load
+    /// through the redundancy gate (`qwen35::default_state_quant`), which yields
+    /// FP32 for all current models.
+    ///
+    /// This was `StateQuant::Q8` hardcoded, which bypassed the gate entirely —
+    /// every `ModelSlot` (including every spec-decode harness) silently ran Q8
+    /// recurrent state despite the gate being configured to select FP32.
+    /// Quantized DeltaNet state is deprecated; see the policy note on
+    /// `qwen35::deltanet_state_fp32_below`.
+    pub state_quant: Option<qwen35::StateQuant>,
 }
 
 impl Default for ModelSlotConfig {
@@ -543,7 +552,7 @@ impl Default for ModelSlotConfig {
             max_seq: 2048,
             kv_mode: KvMode::Q8,
             repeat_window: 128,
-            state_quant: qwen35::StateQuant::Q8,
+            state_quant: None, // auto -> redundancy gate (FP32 today)
         }
     }
 }
@@ -671,7 +680,10 @@ impl ModelSlot {
             )?,
         };
 
-        let dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;
+        let dn_quant = slot_config
+            .state_quant
+            .unwrap_or_else(|| qwen35::default_state_quant(&config));
+        let dn_state = DeltaNetState::new_with_quant(gpu, &config, dn_quant)?;
         let scratch = Qwen35Scratch::new(gpu, &config, slot_config.repeat_window)?;
 
         Ok(Self {
