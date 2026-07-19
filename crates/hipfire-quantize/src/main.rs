@@ -7088,6 +7088,18 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse::<f64>().ok())
     {
+        // Floor tier: `--mix-floor oq4` excludes oq2 entirely (tail = oq4), for
+        // exploring the oq4/oq8 regime. Default oq2 (full 3-tier).
+        let floor = match args
+            .iter()
+            .position(|a| a == "--mix-floor")
+            .and_then(|i| args.get(i + 1))
+            .map(|s| s.as_str())
+        {
+            Some("oq4") => Tier::Oq4,
+            Some("oq8") => Tier::Oq8,
+            _ => Tier::Oq2,
+        };
         let s1 = gen_fwht_signs(42, 256);
         let s2 = gen_fwht_signs(1042, 256);
         let empty_fp8: HashMap<String, (usize, String)> = HashMap::new();
@@ -7120,7 +7132,7 @@ fn main() {
                 }
             }
         }
-        let plan = assign_tiers(&cands, target_bpw);
+        let plan = assign_tiers(&cands, target_bpw, floor);
         eprintln!(
             "mixed-precision plan: {} dense-linear tensors, target {target_bpw:.2} bpw, \
              realized {:.3} bpw (oq8={}, oq4={}, oq2={})",

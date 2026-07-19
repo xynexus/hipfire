@@ -241,21 +241,22 @@ impl TierPlan {
 }
 
 /// 3-tier greedy assignment across oq2/oq4/oq8 under a target average bpw.
-/// Start every tensor at oq2, then repeatedly apply the single upgrade step
+/// Start every tensor at `floor` (oq2 for the full 3-tier sweep, or oq4 to
+/// exclude oq2 entirely), then repeatedly apply the single upgrade step
 /// (oq2→oq4 or oq4→oq8) with the best error-reduction per extra bit that still
 /// fits the remaining budget. Each tensor upgrades at most twice, in order.
 /// Reducing total weighted output error per byte spent is what we maximize.
-pub fn assign_tiers(candidates: &[TierCandidate], target_bpw: f64) -> TierPlan {
+pub fn assign_tiers(candidates: &[TierCandidate], target_bpw: f64, floor: Tier) -> TierPlan {
     let total: usize = candidates.iter().map(|c| c.numel).sum();
     let mut plan = TierPlan::default();
     for c in candidates {
-        plan.tiers.insert(c.name.clone(), Tier::Oq2);
+        plan.tiers.insert(c.name.clone(), floor);
     }
     if total == 0 {
         return plan;
     }
-    let target = target_bpw.clamp(OQ2_BPW, OQ8_BPW);
-    let budget_bits = (target - OQ2_BPW) * total as f64; // extra above all-oq2
+    let target = target_bpw.clamp(floor.bpw(), OQ8_BPW);
+    let budget_bits = (target - floor.bpw()) * total as f64; // extra above all-floor
     let mut spent = 0.0f64;
 
     loop {
@@ -381,9 +382,9 @@ mod tests {
     #[test]
     fn tiers_all_oq2_at_min_budget_all_oq8_at_max() {
         let cs = vec![tcand("a", 256, 10.0, 3.0), tcand("b", 256, 4.0, 1.0)];
-        let lo = assign_tiers(&cs, OQ2_BPW);
+        let lo = assign_tiers(&cs, OQ2_BPW, Tier::Oq2);
         assert_eq!(lo.count(Tier::Oq2), 2);
-        let hi = assign_tiers(&cs, OQ8_BPW);
+        let hi = assign_tiers(&cs, OQ8_BPW, Tier::Oq2);
         assert_eq!(hi.count(Tier::Oq8), 2, "max budget ⇒ everything oq8");
         assert!((hi.realized_bpw(&cs) - OQ8_BPW).abs() < 1e-9);
     }
@@ -394,7 +395,7 @@ mod tests {
         // A mid budget (~oq4 avg) should lift "hot" toward oq8 before "cold"
         // leaves oq2.
         let cs = vec![tcand("hot", 256, 20.0, 2.0), tcand("cold", 256, 1.0, 0.5)];
-        let plan = assign_tiers(&cs, OQ4_BPW);
+        let plan = assign_tiers(&cs, OQ4_BPW, Tier::Oq2);
         assert_ne!(plan.tier("hot"), Tier::Oq2, "sensitive tensor upgraded");
         assert!(plan.realized_bpw(&cs) <= OQ4_BPW + 1e-9, "budget respected");
     }
@@ -408,7 +409,7 @@ mod tests {
         ];
         let mut last = 0.0;
         for &t in &[OQ2_BPW, 3.0, 4.0, 5.0, 6.0, OQ8_BPW] {
-            let bpw = assign_tiers(&cs, t).realized_bpw(&cs);
+            let bpw = assign_tiers(&cs, t, Tier::Oq2).realized_bpw(&cs);
             assert!(bpw <= t + 1e-6, "realized {bpw} over target {t}");
             assert!(bpw >= last - 1e-6, "bpw must be monotone in budget");
             last = bpw;
