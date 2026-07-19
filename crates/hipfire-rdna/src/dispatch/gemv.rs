@@ -2669,6 +2669,90 @@ impl Gpu {
         }
         result
     }
+    /// OQ4 shared-expert DOWN: N-batched W4A16 decode GEMV + fused sigmoid-scaled
+    /// residual add (the OQ sibling of the HFQ4 kernel above). `w` = [M, K/2]
+    /// packed signed int4, `w_scales` = [M, K/256] f32 group scales — a sub-offset
+    /// view (`w.sub_offset(M*K/2 bytes)`) into the same combined down buffer.
+    /// `y_batch[t,row] += sigmoid(c_batch[t]) * (w[row]·x_batch[t])`. Grid (M, N),
+    /// wave32, one wave owns (row, token) so the `+=` is race-free.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq4g256_residual_sigmoid_scaled_gpu_batched(
+        &mut self,
+        w: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        c_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            group, 256,
+            "gemv_oq4g256_residual_sigmoid_scaled: group must be 256"
+        );
+        self.ensure_kernel(
+            "gemv_oq4g256_residual_sigmoid_scaled_gpu_batched",
+            kernels::GEMV_OQ_RESIDUAL_SIGMOID_SCALED_SRC,
+            "gemv_oq4g256_residual_sigmoid_scaled_gpu_batched",
+        )?;
+        let wp = w.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xp = x_batch.buf.as_ptr();
+        let yp = y_batch.buf.as_ptr();
+        let cp = c_batch.buf.as_ptr();
+        let (mi, ki, gi) = (m as i32, k as i32, group as i32);
+        self.launch_kernargs(
+            "gemv_oq4g256_residual_sigmoid_scaled_gpu_batched",
+            [m as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr wsp, ptr xp, ptr yp, ptr cp, i32 mi, i32 ki, i32 gi],
+        )
+    }
+
+    /// OQ8 sibling of `gemv_oq4g256_residual_sigmoid_scaled_gpu_batched`. `w` =
+    /// [M, K] signed int8, `w_scales` = [M, K/256] f32 (`w.sub_offset(M*K bytes)`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq8g256_residual_sigmoid_scaled_gpu_batched(
+        &mut self,
+        w: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        c_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            group, 256,
+            "gemv_oq8g256_residual_sigmoid_scaled: group must be 256"
+        );
+        self.ensure_kernel(
+            "gemv_oq8g256_residual_sigmoid_scaled_gpu_batched",
+            kernels::GEMV_OQ_RESIDUAL_SIGMOID_SCALED_SRC,
+            "gemv_oq8g256_residual_sigmoid_scaled_gpu_batched",
+        )?;
+        let wp = w.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xp = x_batch.buf.as_ptr();
+        let yp = y_batch.buf.as_ptr();
+        let cp = c_batch.buf.as_ptr();
+        let (mi, ki, gi) = (m as i32, k as i32, group as i32);
+        self.launch_kernargs(
+            "gemv_oq8g256_residual_sigmoid_scaled_gpu_batched",
+            [m as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr wsp, ptr xp, ptr yp, ptr cp, i32 mi, i32 ki, i32 gi],
+        )
+    }
+
     /// HFQ3/MQ3 analogue of `gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched`.
     /// Same grid shape, but reads HFQ3's 104 B / group layout. MQ3G256 shares
     /// storage with HFQ3G256; callers apply the FWHT rotation upstream.

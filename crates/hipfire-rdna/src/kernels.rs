@@ -4056,6 +4056,11 @@ pub const FUSED_QKVZA_OQ4_DP4A_SRC: &str =
 pub const GEMV_OQ4_GROUPED_RESIDUAL_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq4_grouped_residual.hip");
 
+/// OQ4/OQ8 shared-expert DOWN: N-batched decode GEMV + fused sigmoid-scaled
+/// residual add (the OQ sibling of gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched).
+pub const GEMV_OQ_RESIDUAL_SIGMOID_SCALED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq_residual_sigmoid_scaled.hip");
+
 /// OQ4+ W4A16 fused gate+up DECODE (B=1): 2 GEMVs in one launch (blockIdx demux),
 /// cuts the per-token dispatch count vs looping gemv_oq4_grouped. See the .hip.
 pub const FUSED_GATE_UP_OQ4_GEMV_SRC: &str =
