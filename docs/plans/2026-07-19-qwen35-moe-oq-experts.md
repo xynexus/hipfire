@@ -41,15 +41,14 @@ Applied across 5 files, compiled clean, then reverted to keep the tree clean:
 
 ## Blockers (why it can't land/validate yet)
 
-1. **No OQ shared-expert-down kernel.** The shared expert down uses
-   `gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched` (fused down GEMV + sigmoid
-   shared-gate scale + residual). There is **no** `gemv_oq{4,8}g256_residual_sigmoid_scaled`
-   sibling. `FusedGateUpOq4G256`/`Oq8G256` keys DO exist (shared gate+up is
-   wireable), but without the down kernel the shared expert can't be OQ. And
-   **every shipping qwen35 MoE has a shared expert** (`config.rs`:
-   `has_shared_expert = shared_expert_intermediate_size > 0`; A3B=512, A10B,
-   A17B). Keeping the shared expert in MQ/Q8 while routed is OQ breaks the
-   `shared_matches_routed` admissibility (would need a mixed-layout redesign).
+1. ~~No OQ shared-expert-down kernel.~~ **RESOLVED (commit d2bc41a63):** added
+   `gemv_oq{4,8}g256_residual_sigmoid_scaled_gpu_batched` (W4A16/W8A16 dense OQ
+   decode + batched + sigmoid(c) scaled residual add) + dispatch wrappers +
+   parity test (PASS gfx1151, oq4 ≤2e-5 / oq8 ≤2e-4). `FusedGateUpOq4G256`/`Oq8G256`
+   keys already exist for the shared gate+up. So the shared expert is now fully
+   OQ-serviceable. Keep shared + routed BOTH OQ so `shared_matches_routed` holds
+   (every shipping qwen35 MoE has an always-on shared expert; `config.rs`
+   `has_shared_expert = shared_expert_intermediate_size > 0`; A3B=512, A10B, A17B).
 
 2. **Routed-only MoE forward is pre-existing unvalidated infra.** The only way to
    dodge the shared expert (a fixture with `shared_expert_intermediate_size=0`,
@@ -61,15 +60,26 @@ Applied across 5 files, compiled clean, then reverted to keep the tree clean:
 
 ## Next steps to unblock
 
-1. Write `gemv_oq4g256_residual_sigmoid_scaled_gpu_batched` (+ oq8) by cloning
-   the hfq4 sibling and swapping the weight decode to the OQ grouped iu4/iu8
-   path; add a parity test vs CPU oracle.
-2. Wire the shared expert: gate+up via `run_fused_gate_up_key(FusedGateUpOq4G256/
-   Oq8G256)` (prefill_chunk.rs ~L303), down via the new kernel (~L569), plus the
-   decode shared-expert path and the scalar-gate dispatch.
-3. Re-apply the dispatch/loader/quantizer design above.
+1. ~~Write the OQ shared-expert-down kernel~~ — DONE (commit d2bc41a63).
+2. Re-apply the reverted quantizer arm + loader repack + routed dispatch design
+   above (main.rs, loading.rs, moe_decode.rs, prefill_chunk.rs, mod.rs).
+3. Wire the shared expert: gate+up via `run_fused_gate_up_key(FusedGateUpOq4G256/
+   Oq8G256)` (prefill_chunk.rs ~L303) + the decode shared-expert path + scalar
+   gate; down via `gpu.gemv_oq{4,8}g256_residual_sigmoid_scaled_gpu_batched(w,
+   w_scales=w.sub_offset(M*K/2 for oq4 | M*K for oq8), x_batch, y_batch, c_batch,
+   M, K, 256, n)` (prefill_chunk.rs ~L569 batched; the decode shared-expert down
+   at the single-token site). w = shared_expert.down.buf; scales sub-offset:
+   OQ4 = M*(K/2) bytes, OQ8 = M*K bytes.
 4. Validate on `Qwen3.5-35B-A3B` (`/srv/huggingface/models--Qwen--Qwen3.5-35B-A3B`,
    67 GB source) `--format oq4` — coherence on halo (gfx1151).
+
+## Pre-existing test-harness issues seen (NOT caused by this work)
+
+- `tiny_quant/qwen3_5_moe/collect` + kld probes fail with `tensor not found:
+  layers.0.mlp.experts.0.gate_up_proj.weight` (tiny-fixture name lacks the
+  `model.`/`layers.` prefix the probe expects). Blocks using the tiny
+  qwen3_5_moe fixture for gate coverage; unrelated to OQ.
+- `tiny_quant/qwen3_5/kld:qtip3-sim(calib)` KLD-drift baseline mismatch.
 
 ## Reference
 
