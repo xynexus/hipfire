@@ -117,10 +117,34 @@ is vectorised at LANES=16 but computes each score with 8 `aie::mul` + 8
 build shape.** A 10× there would take attention from 61.5 ms to ~6 ms *and* the
 retiling needed for `mmul` is the same restructuring that lifts the tot≤55 cap.
 
-Attention, not the GEMMs, remains the real L-axis risk.
+**Does the phase survive this? Yes — because the FLOPs are trivial.** Run the
+arithmetic forward rather than extrapolating the measured ms:
 
-Re-measuring needs the golden set regenerated: `/tmp/dflash_w/index.json`
-survives but `target_hidden.npy` / `noise_embedding.npy` are gone (tmpfs).
+- At the *current* 0.262 ms/row, tot=528 (L=512) costs 138 ms/layer × 5 =
+  **691 ms of attention alone** against a 57 ms budget. Extrapolating the
+  measured kernel says the architecture is dead.
+- But attention at tot=528 is only 16×528×128×2×2 FLOP × 32 heads = 138 MFLOP
+  per layer, **692 MFLOP per block**. At even a modest 50 GFLOP/s that is
+  **~14 ms/block**; at 0.97 GFLOP/s it is 691 ms.
+
+So the 691 ms is not a work bound, it is a 1000×-off-peak bound. Unlike the
+GEMMs — which are genuinely weight-bandwidth-bound at a ~60 ms floor and cannot
+be argued down — **attention has essentially unlimited headroom on paper.**
+Do not extrapolate the current kernel's ms/row into any budget decision; it
+measures the implementation, not the problem.
+
+Note attention is the one term the context cache CANNOT help: the block's query
+rows are new every cycle, so its O(L) growth is structural. That makes the inner
+loop the load-bearing fix rather than an optimisation.
+
+Attention, not the GEMMs, remains the real L-axis risk — but it is an
+implementation risk, not an architectural one.
+
+Re-measuring the *body* needs the golden set regenerated: `/tmp/dflash_w/index.json`
+survives but `target_hidden.npy` / `noise_embedding.npy` are gone (tmpfs). The
+attention kernel alone can be measured without it via
+`tools/npu/bench_dflash_attention_mc.py`, which cross-validates against the body
+figure (64.7 vs 61.5 ms at tot=48).
 
 **CONTEXT CONTENTION IS NOT A LEVER — disproved, do not retry.** Sweeping cache
 capacity 1→4 × {LRU, MRU} moves misses 31 → 16 while `npu_busy` stays FLAT at
