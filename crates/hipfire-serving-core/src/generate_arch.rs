@@ -2024,8 +2024,12 @@ pub fn generate_minimax(
     let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        // Prefer the model's own jinja template when present (opt out with
+        // HIPFIRE_JINJA_CHAT=0). The hand-rolled ChatScaffold never emits a
+        // leading BOS and can misframe non-Qwen ChatML variants; the real
+        // template is authoritative. A render failure falls back to Plain below.
+        let try_jinja = m.chat_template.is_some()
+            && std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
