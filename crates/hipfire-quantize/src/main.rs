@@ -65,6 +65,7 @@ use hipfire_gguf as gguf_input;
 // library (so hipfire-coexistence can drive the import). Re-imported here for
 // the native safetensors path + the deprecation shim.
 use hipfire_quantize::gguf_import::{is_gguf_input, parse_arch_id_override};
+use hipfire_quantize::mixed_precision::{assign_mixed_precision, oq2_sensitivity, TensorCandidate};
 #[cfg(test)]
 use hipfire_quantize::quant_plan::{is_positional_promote, kmap_resolve, parse_layer_idx};
 use hipfire_quantize::quant_plan::{kmap_resolve_mode, GgufFormat, QuantLevel};
@@ -134,6 +135,10 @@ static OQ4_LDLQ_HESSIAN: OnceLock<Oq4LdlqHessian> = OnceLock::new();
 /// self-report WHICH calibration produced it (source name + content hash). Set
 /// once when `--hessian` is first resolved; absent for RTN/data-free formats.
 static CALIB_PROVENANCE: OnceLock<serde_json::Value> = OnceLock::new();
+// Per-tensor mixed-precision plan (oq8 head / oq2 tail), built by the planning
+// pre-pass when `--mix-target-bpw` is set. Consulted at the LFM2 dense-linear
+// dispatch so each tensor quantizes to its assigned format.
+static MIXED_PLAN: OnceLock<hipfire_quantize::mixed_precision::MixedPlan> = OnceLock::new();
 
 /// Compute and record `{source, xxh64, bytes}` for the calib file at `path`.
 /// The xxh64 is over the full file bytes, so any change to the calibration
@@ -2744,6 +2749,23 @@ fn precision_class_via_ingest(
 /// capability layer drains (cf. `is_positional_promote`, LDLQ, FWHT packers).
 fn is_conv1d_tensor(name: &str) -> bool {
     name.ends_with("conv1d.weight")
+}
+
+/// LFM2 dense-linear weight eligible for OQ quantization (and mixed-precision
+/// assignment): 2D, K % 256 == 0, and one of the conv/attn/FFN projections.
+/// Router/embed/norm/conv-filter stay Q8/F32 on their existing runtime paths.
+fn is_lfm2_dense_linear_shape(name: &str, shape: &[usize]) -> bool {
+    shape.len() == 2
+        && shape[1] % 256 == 0
+        && (name.ends_with(".conv.in_proj.weight")
+            || name.ends_with(".conv.out_proj.weight")
+            || name.ends_with(".self_attn.q_proj.weight")
+            || name.ends_with(".self_attn.k_proj.weight")
+            || name.ends_with(".self_attn.v_proj.weight")
+            || name.ends_with(".self_attn.out_proj.weight")
+            || name.ends_with(".feed_forward.w1.weight")
+            || name.ends_with(".feed_forward.w2.weight")
+            || name.ends_with(".feed_forward.w3.weight"))
 }
 
 // Nemotron-H / Mamba-2 state-critical mixer protection now lives arch-side as the
@@ -7052,6 +7074,64 @@ fn main() {
     // iteration. When we encounter the `.weight` half we look up the
     // sibling and call `dequantize_e4m3_ue8m0_to_f32` to recover f32
     // before the existing MQ-family pipeline runs.
+    // ── Mixed-precision planning pre-pass (LFM2 oq2/oq8) ────────────────────
+    // `--mix-target-bpw <B>` ranks dense-linear tensors by their oq2 quantization
+    // sensitivity and keeps the most sensitive at oq8 under the target average
+    // bits/weight; the rest form the oq2 tail. The per-tensor dispatch below then
+    // quantizes each to its assigned format. Sensitivity is data-free (unweighted
+    // oq2 error over the weights); imatrix weighting is a quality follow-up.
+    if let Some(target_bpw) = args
+        .iter()
+        .position(|a| a == "--mix-target-bpw")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        const OQ8_BPW: f64 = 8.0625;
+        const OQ2_BPW: f64 = 2.0625;
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let empty_fp8: HashMap<String, (usize, String)> = HashMap::new();
+        let mut cands: Vec<TensorCandidate> = Vec::new();
+        for st in &st_files {
+            for name in st.tensor_names() {
+                if let Some((meta, raw)) = st.tensor_data(name) {
+                    if !is_lfm2_dense_linear_shape(name, &meta.shape) {
+                        continue;
+                    }
+                    let (m, k) = (meta.shape[0], meta.shape[1]);
+                    let w =
+                        tensor_to_f32_with_optional_fp8_scale(name, raw, meta, &empty_fp8, &st_files);
+                    if w.len() != m * k {
+                        continue;
+                    }
+                    // Output-aware importance: per-input-column activation
+                    // energy from the imatrix (--imatrix / --hessian). Falls back
+                    // to unweighted (uniform) when no calibration is loaded.
+                    let imat: Vec<f32> = match imatrix_weights_for(name) {
+                        Some(v) if v.len() == k => v.to_vec(),
+                        _ => vec![1.0f32; k],
+                    };
+                    let sens = oq2_sensitivity(&w, m, k, &imat, &s1, &s2);
+                    cands.push(TensorCandidate {
+                        name: name.to_string(),
+                        numel: m * k,
+                        sensitivity: sens,
+                    });
+                }
+            }
+        }
+        let plan = assign_mixed_precision(&cands, OQ8_BPW, OQ2_BPW, target_bpw);
+        eprintln!(
+            "mixed-precision plan: {} dense-linear tensors, target {target_bpw:.2} bpw, \
+             realized {:.2} bpw (oq8={}, oq2={})",
+            cands.len(),
+            plan.realized_bpw(&cands, OQ8_BPW, OQ2_BPW),
+            plan.num_high(),
+            cands.len() - plan.num_high(),
+        );
+        let _ = MIXED_PLAN.set(plan);
+    }
+
     let mut all_tensors: Vec<(&str, usize)> = Vec::new();
     let mut fp8_scale_for: HashMap<String, (usize, String)> = HashMap::new();
     for (fi, st) in st_files.iter().enumerate() {
@@ -7734,18 +7814,23 @@ fn main() {
             // the non-expert linears in LFM2-MoE. Routed experts stay MQ4/MQ6
             // until the indexed MoE OQ kernels exist; router/embed/norm/conv
             // filter remain Q8/F32 for their existing runtime paths.
-            let is_lfm2_dense_linear = meta.shape.len() == 2
-                && meta.shape[1] % 256 == 0
-                && (name.ends_with(".conv.in_proj.weight")
-                    || name.ends_with(".conv.out_proj.weight")
-                    || name.ends_with(".self_attn.q_proj.weight")
-                    || name.ends_with(".self_attn.k_proj.weight")
-                    || name.ends_with(".self_attn.v_proj.weight")
-                    || name.ends_with(".self_attn.out_proj.weight")
-                    || name.ends_with(".feed_forward.w1.weight")
-                    || name.ends_with(".feed_forward.w2.weight")
-                    || name.ends_with(".feed_forward.w3.weight"));
-            if let Some(oq_format) = lfm2_oq_format.filter(|_| is_lfm2_dense_linear) {
+            let is_lfm2_dense_linear = is_lfm2_dense_linear_shape(name, &meta.shape);
+            // Under a mixed-precision plan, each dense-linear tensor takes its
+            // assigned format (oq8 head / oq2 tail) instead of the uniform
+            // lfm2_oq_format; unlisted tensors keep the uniform format.
+            let per_tensor_oq = lfm2_oq_format.filter(|_| is_lfm2_dense_linear).map(|base| {
+                match MIXED_PLAN.get() {
+                    Some(plan) if is_lfm2_dense_linear => {
+                        if plan.is_high(name) {
+                            HfqInputFormat::Oq8
+                        } else {
+                            HfqInputFormat::Oq2
+                        }
+                    }
+                    _ => base,
+                }
+            });
+            if let Some(oq_format) = per_tensor_oq {
                 let f32_data = tensor_to_f32_with_optional_fp8_scale(
                     name,
                     raw_data,
