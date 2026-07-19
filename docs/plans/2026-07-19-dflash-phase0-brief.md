@@ -93,10 +93,17 @@ BYTE-IDENTICAL tokens to `--ar-baseline` while differing in accepted counts:
 ```
 T=~/.hipfire/models/qwen3.5-9b-mq4.hfq
 ./target/release/examples/dflash_spec_demo --target $T --draft <D> \
-  --prompt "Explain how a four-stroke engine works." --max 96
+  --prompt "Explain how a four-stroke engine works." --max 96 \
+  2>/dev/null | md5sum        # -> 02e621bd56b5 for AR and every drafter
 ```
 
-md5 over `| tail -20` must be `02e621bd56b5` for AR and all four drafters.
+**`2>/dev/null` IS LOAD-BEARING — do not drop it.** stdout is the generated text
+(the substantive invariant); stderr carries a `BENCH METRICS` block with
+wall-clock timings that changes every run. An earlier revision of this brief
+wrote the gate as `md5 over | tail -20` WITHOUT specifying stderr handling, which
+made the digest unstable and read as "every drafter diverges" — a false
+correctness regression that was nearly filed. Digest **all of stdout**, not a
+tail window.
 
 ## Traps that cost the most last time
 
@@ -109,10 +116,15 @@ md5 over `| tail -20` must be `02e621bd56b5` for AR and all four drafters.
   for a variance bug; a baked scalar is stale but DETERMINISTIC. Check first.
 - **Check the claimed-CORRECT side of a comparison**, not just the claimed-broken
   side. One filed bug asserted the serial path "honors" a value it does not.
-- **SNR is the WRONG gate for a drafter weight format.** Spec decode is lossless,
-  so quality costs ACCEPTANCE RATE, not correctness. `oq4.25+` fails on SNR
-  (cos 0.9606 / 11.04 dB vs int8's 33.18) — that may not matter. **Phase F
-  decides.**
+- **SNR is the WRONG gate for a drafter weight format — now PROVEN.** Spec decode
+  is lossless, so quality costs ACCEPTANCE RATE, not correctness. Phase F
+  (`benchmarks/results/dflash-phasef-acceptance-20260719.md`) measured it: pure
+  int4 fails SNR badly (cos 0.898, ~22 dB down) yet costs only **7.2% of τ**.
+  The SNR gate would have rejected a perfectly usable format.
+- **Residual verify nondeterminism ~1.5% (1 in 68 runs)** — one token flip
+  observed in a Phase F sweep cell, NOT a format effect (18/18 repeats of the
+  same command reproduced the reference). Below what motivated `6ca303af8` but
+  not zero. Single-run md5 remains an unsafe gate.
 
 ## Dead ends — do not repeat
 
