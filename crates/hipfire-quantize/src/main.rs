@@ -3232,6 +3232,7 @@ enum HfqInputFormat {
     Qtip3,
     Qtip4,
     Oq3,
+    Oq2,
     Oq6,
     Oq4,
     OqPlus,
@@ -3262,6 +3263,7 @@ impl HfqInputFormat {
             "qtip3" => Some(Self::Qtip3),
             "qtip4" => Some(Self::Qtip4),
             "op3" | "op3g256" | "oq3" | "oq3g256" => Some(Self::Oq3),
+            "oq2" | "oq2g256" => Some(Self::Oq2),
             "op6" | "op6g256" | "oq6" | "oq6g256" => Some(Self::Oq6),
             "op4" | "op4-4" | "op4g256" | "op4+" | "op4-4+" | "op4-8+" | "oq4" | "oq4+"
             | "oq4++" | "oq4g256" => Some(Self::Oq4),
@@ -3484,6 +3486,7 @@ fn quantize_hfq_source_tensor(
         && matches!(
             format,
             HfqInputFormat::Oq3
+                | HfqInputFormat::Oq2
                 | HfqInputFormat::Oq4
                 | HfqInputFormat::OqPlus
                 | HfqInputFormat::Oq6
@@ -3653,6 +3656,20 @@ fn quantize_hfq_source_tensor(
                 quantize_oq3g256(&f32_data, &signs1, &signs2)
             };
             (q, QuantType::Oq3G256, 256, "OQ3G256")
+        }
+        HfqInputFormat::Oq2 => {
+            // Opus Quant W2 — symmetric signed-int2 (±1, 3 levels), FWHT-256,
+            // 2-bit-packed (Oq2G256, 66 B/group). Plain RTN only (no +/++
+            // calibration variant yet); ragged K falls back to Q8. Served via the
+            // Oq8 upcast loader (`expand_oq2_to_oq8`) — the stored 2-bit weights
+            // sign-extend into int8 containers so the existing iu8 W8A8 kernels run
+            // them, no dedicated W2 decode GEMV. Quality-marginal by design; see
+            // project_lowbit_quant_findings.
+            if k % 256 != 0 {
+                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+            }
+            let q = quantize_oq2g256(&f32_data, &signs1, &signs2);
+            (q, QuantType::Oq2G256, 256, "OQ2G256")
         }
         HfqInputFormat::Oq4 | HfqInputFormat::OqPlus => {
             // Opus Quant W4A4 (Oq4) / OQ+ Opus Plus W4A8 (OqPlus). IDENTICAL weight
@@ -5814,6 +5831,7 @@ fn main() {
                 | HfqInputFormat::OqPlusCompact
                 | HfqInputFormat::Oq8
                 | HfqInputFormat::Oq8Plus
+                | HfqInputFormat::Oq2
         )
     });
     // DeepSeek V4 recipe (2026-05-20): routed experts → MQ2-Lloyd, every other

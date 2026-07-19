@@ -841,6 +841,73 @@ pub fn dequant_oq3g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) ->
     out
 }
 
+/// Opus-Quant W2 weight codec (Oq2G256). Per 256-group block =
+/// `[f16 scale][64 B 2-bit-packed]` = 66 B/group (2.0625 b/w). FWHT-256 rotated,
+/// symmetric clip-searched scale, `q in [-1, 1]` (signed 2-bit → 3 levels; the
+/// −2 code is unused to keep the range symmetric). 4 weights per byte. Dequant:
+/// `scale · sext2`, inverse FWHT. Quality-marginal on its own (see
+/// project_lowbit_quant_findings); intended for the Oq8-upcast serving path
+/// (`expand_oq2_to_oq8`), so the existing iu8 W8A8 kernels serve it without a
+/// dedicated W2 decode GEMV.
+pub fn quantize_oq2g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let (group_size, block_bytes) = (256usize, bb(QuantType::Oq2G256)); // 2 (f16 scale) + 64 (2-bit×256)
+    let n = f32_data.len();
+    let n_blocks = n.div_ceil(group_size);
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let scale = symmetric_clipsearch(&group, 1.0);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        let scale_f16 = f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        for byte_i in 0..64 {
+            let mut packed = 0u8;
+            for j in 0..4 {
+                let q = (group[byte_i * 4 + j] * inv).round().clamp(-1.0, 1.0) as i8;
+                packed |= ((q as u8) & 3) << (2 * j);
+            }
+            output[out_off + 2 + byte_i] = packed;
+        }
+    }
+    output
+}
+
+/// Dequantize OQ2G256 (round-trip oracle for the Opus W2 codec / tests).
+/// `[f16 scale][64 B 2-bit-packed]` per 256-group → reconstruct signed 2-bit
+/// two's-complement `scale·sext2`, inverse FWHT.
+pub fn dequant_oq2g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+    let (group_size, block_bytes) = (256usize, bb(QuantType::Oq2G256));
+    let n_blocks = n.div_ceil(group_size);
+    let mut out = Vec::with_capacity(n_blocks * group_size);
+    for b in 0..n_blocks {
+        let off = b * block_bytes;
+        if off + block_bytes > data.len() {
+            break;
+        }
+        let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let mut grp = [0.0f32; 256];
+        for byte_i in 0..64 {
+            let packed = data[off + 2 + byte_i];
+            for j in 0..4 {
+                let u = (packed >> (2 * j)) & 3;
+                let signed = if u >= 2 { u as i32 - 4 } else { u as i32 };
+                grp[byte_i * 4 + j] = scale * signed as f32;
+            }
+        }
+        // inverse FWHT (forward with signs swapped)
+        cpu_fwht_256(&mut grp, signs2, signs1);
+        out.extend_from_slice(&grp);
+    }
+    out.truncate(n);
+    out
+}
+
 /// Opus-Quant W8A8 weight codec (Oq8G256). Per 256-group block =
 /// `[f16 scale][256 signed int8]` = 258 B/group (8.0625 b/w). FWHT-256 rotated,
 /// symmetric clip-searched scale, `q in [-127, 127]` (signed 8-bit, avoid -128 to
@@ -2488,6 +2555,21 @@ mod tests {
     // ── encode/decode round-trips (in-module pairs) ─────────────────────
     // Bounds are ~2× the theoretical quantization RMSE for each bit width
     // (orthonormal FWHT preserves RMSE across the rotation).
+
+    #[test]
+    fn oq2g256_roundtrip_and_geometry() {
+        let (s1, s2) = test_signs();
+        let data = test_data(600); // 2 full blocks + partial → 3 blocks
+        let encoded = quantize_oq2g256(&data, &s1, &s2);
+        assert_eq!(encoded.len(), 3 * 66, "oq2 block geometry (2 scale + 64 packed)");
+        let decoded = dequant_oq2g256(&encoded, data.len(), &s1, &s2);
+        assert_eq!(decoded.len(), data.len());
+        // 2-bit / 3-level is coarse; the round-trip must at least not diverge
+        // past the signal magnitude (std ~0.58 for U[-1,1)).
+        let e = rmse(&data, &decoded);
+        assert!(e < 0.7, "oq2 round-trip rmse too high: {e}");
+        assert_eq!(encoded, quantize_oq2g256(&data, &s1, &s2), "oq2 encode nondeterministic");
+    }
 
     #[test]
     fn mq4g256_roundtrip_within_tolerance() {

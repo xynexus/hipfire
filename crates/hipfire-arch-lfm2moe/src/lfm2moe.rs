@@ -170,6 +170,7 @@ fn load_wt_with_awq(
 const OQ_PLUS_QT: u8 = hipfire_runtime::quant::QuantType::OqPlusG256.code();
 const OQ8_QT: u8 = hipfire_runtime::quant::QuantType::Oq8G256.code();
 const OQ_PLUS_COMPACT_QT: u8 = hipfire_runtime::quant::QuantType::OqPlusCompact.code();
+const OQ2_QT: u8 = hipfire_runtime::quant::QuantType::Oq2G256.code();
 const OQ_GROUP: usize = 256;
 // OQ4 canonical (34) / arch-packed (37) codes + transform come from the shared
 // `hipfire_runtime::oq4_arch` (imported above).
@@ -181,6 +182,53 @@ fn sext4(nib: u8) -> i8 {
     } else {
         v
     }
+}
+
+fn sext2(bits: u8) -> i8 {
+    let v = (bits & 0x03) as i8;
+    if v > 1 {
+        v - 4
+    } else {
+        v
+    }
+}
+
+/// Upcast on-disk Oq2G256 (`[f16 scale][64 B 2-bit×256]`, 66 B/group) to the
+/// runtime Oq8G256 layout (`[m*k int8 weights][m*ng f32 scale]`). The stored
+/// 2-bit weights (signed ±1, FWHT-rotated) sign-extend into int8 containers so
+/// the existing iu8 W8A8 grouped-WMMA kernels run them directly — no dedicated
+/// W2 decode GEMV. Mirror of [`expand_oq_plus_compact_to_oq8`].
+fn expand_oq2_to_oq8(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
+    const BLOCK: usize = 66; // 2 (f16 scale) + 64 (2-bit×256); Oq2G256.block_bytes()
+    if k % OQ_GROUP != 0 {
+        return Err(format!("Oq2 requires K % 256 == 0 (got K={k})"));
+    }
+    let ng = k / OQ_GROUP;
+    let n_groups = m * ng;
+    if n_groups == 0 || data.len() != n_groups * BLOCK {
+        return Err(format!(
+            "Oq2 byte length {} != n_groups {n_groups} * {BLOCK}",
+            data.len()
+        ));
+    }
+    let weight_bytes = m * k;
+    let mut out = vec![0u8; weight_bytes + m * ng * 4];
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let dst = r * k + g * OQ_GROUP;
+            for byte_i in 0..64 {
+                let packed = data[src + 2 + byte_i];
+                for j in 0..4 {
+                    out[dst + byte_i * 4 + j] = sext2(packed >> (2 * j)) as u8;
+                }
+            }
+            let scale_dst = weight_bytes + (r * ng + g) * 4;
+            out[scale_dst..scale_dst + 4].copy_from_slice(&scale.to_le_bytes());
+        }
+    }
+    Ok(out)
 }
 
 fn expand_oq_plus_to_oq8(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
@@ -343,6 +391,9 @@ fn wt_from_raw(
             return upload_wt_raw(gpu, &bytes, dtype, m, k);
         }
         OQ8_QT => return upload_wt_raw(gpu, &pack_oq8(data, m, k)?, DType::Oq8G256, m, k),
+        OQ2_QT => {
+            return upload_wt_raw(gpu, &expand_oq2_to_oq8(data, m, k)?, DType::Oq8G256, m, k)
+        }
         OQ_PLUS_COMPACT_QT => {
             return upload_wt_raw(
                 gpu,
@@ -1056,6 +1107,22 @@ mod tests {
         assert_eq!(expanded.len(), 256 + 4);
         assert_eq!(expanded[0] as i8, 1);
         assert_eq!(expanded[1] as i8, -5);
+        assert_eq!(&expanded[256..260], &1.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn oq2_expands_signed_2bit_to_oq8_layout() {
+        let mut data = vec![0u8; 66]; // 2 (f16 scale) + 64 (2-bit×256)
+        data[0..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // f16 1.0
+        // First byte packs q = [1, -1, 0, 1] at 2 bits each, LSB-first.
+        data[2] = 0b01_00_11_01; // j3=1, j2=0, j1=-1(0b11), j0=1
+
+        let expanded = expand_oq2_to_oq8(&data, 1, 256).unwrap();
+        assert_eq!(expanded.len(), 256 + 4);
+        assert_eq!(expanded[0] as i8, 1);
+        assert_eq!(expanded[1] as i8, -1);
+        assert_eq!(expanded[2] as i8, 0);
+        assert_eq!(expanded[3] as i8, 1);
         assert_eq!(&expanded[256..260], &1.0f32.to_le_bytes());
     }
 }

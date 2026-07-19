@@ -259,6 +259,7 @@ impl QuantType {
             // Opus Quant (symmetric)
             Oq4G256 => Some(130), // 2 (f16 scale) + 128 nibbles
             Oq3G256 => Some(98),  // 2 (f16 scale) + 8×3 u32 bit-planes
+            Oq2G256 => Some(66),  // 2 (f16 scale) + 64 (2-bit×256, signed ±1)
             Oq6G256 => Some(194), // 2 (f16 scale) + 192 (6-bit×256)
             Oq8G256 | Oq8G256RowPadded => Some(258), // 2 (f16 scale) + 256 int8
             // QTIP trellis (f32 scale + packed symbols)
@@ -268,9 +269,9 @@ impl QuantType {
             //  - Q8HFQ: row-dependent
             //  - HFP4G32 / MFP4G32: per-row FP scale
             //  - OqPlusG256 / OqPlusCompact: tiered / 130 + 2·N_out
-            //  - Oq2G256 / Oq4G256ArchPacked / Qtip2G256: geometry unconfirmed
+            //  - Oq4G256ArchPacked / Qtip2G256: geometry unconfirmed
             //  - Paro / TidI32: engine-tiled, arch-specific
-            Q8HFQ | HFP4G32 | MFP4G32 | OqPlusG256 | OqPlusCompact | Oq2G256
+            Q8HFQ | HFP4G32 | MFP4G32 | OqPlusG256 | OqPlusCompact
             | Oq4G256ArchPacked | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 => None,
         }
     }
