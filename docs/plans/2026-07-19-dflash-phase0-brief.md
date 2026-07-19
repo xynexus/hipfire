@@ -43,15 +43,29 @@ block (~1.7× warm) and then subtracted from the WARM wall. That understated glu
 own drafter and the draft cost scales with target size. Measured: Qwen3.5-9B
 DFlash = 1.049 B params, Qwen3.6-27B DFlash = **1.730 B (×1.65)**.
 
-Against its OWN budget the 9B pair is 236.0 vs 57 ms = **4.14× over**. Estimated
-for the 27B pair: **~328 ms vs 155 ms = ~2.1× over** (attention constant — both
-are 32q/8kv/128; GEMM weight-bound ×1.65; glue/primitives track hidden ×1.25).
-Moving to 27B helps by ~1.6×, not the ~2.7× that holding draft cost fixed
+Against its OWN budget the 9B pair is **185.4 vs 57 ms = 3.25× over** (was
+4.14× before flash attention). Re-derived for the 27B pair from the CURRENT
+per-term numbers — attention constant at 7.0 (both are 32q/8kv/128); GEMM
+weight-bound ×1.65; glue/primitives track hidden ×1.25:
+
+| term | 9B (measured) | 27B (derived) |
+|---|---|---|
+| GEMM | 102.3 | 168.8 |
+| attention | 7.0 | 7.0 |
+| host glue | 54.0 | 67.5 |
+| primitives | 23.7 | 29.6 |
+| **block** | **185.4** | **~273** |
+| budget | 57 | 155 |
+| **over by** | **3.25×** | **~1.76×** |
+
+Moving to 27B helps by ~1.85×, not the ~2.7× that holding draft cost fixed
 implied. See the corrected section in
 `docs/plans/2026-07-19-hybrid-gpu-npu-cpu-spec-decode.md`.
 
-**Items 1 and 2 are DONE.** Remaining budget gap to 27B is ~136 ms, and the two
-largest remaining terms are GEMM (139.5) and host glue (67.9).
+**Items 1, 2 and attention are DONE.** Neither pair fits yet. The remaining gap
+is **~118 ms for 27B**, and GEMM (168.8 derived, 55% of the wall) is now the
+only large lever — specifically the `M_TILE=16` double-stream, ~40 ms above the
+~60 ms bandwidth floor on 9B. Host glue (29%) is second.
 
 **⚠ 236.0 ms IS A COLD-CONTEXT NUMBER, measured at L=32 with NO context cache.**
 The harness recomputes the entire context projection every block. In a real
@@ -309,9 +323,29 @@ is architecture-independent, so build it on 9B and swap the target.
 
 ## Gates
 
-**Parity.** Full-body cosine > 0.99 vs the f16 golden AND vs the int4/bf16
-precision reference. Do NOT loosen. The F32 sidecar is a bug repro only —
-`gemm_f32_batched` has a batch>1 transpose bug and a pure-F32 drafter scores τ=0.
+**⚠ THE 0.99 PARITY GATE APPLIES TO THE int8 PATH ONLY.** As previously written
+("Full-body cosine > 0.99 … Do NOT loosen") it was **unachievable on the
+shipping W4 path and contradicted two other records in this repo**:
+
+- `--gemm multicore` (W4A8) measures **cos 0.898/0.897** full-body. That is
+  pre-existing 4-bit codebook loss, not a regression — `98bbce9b6`'s own commit
+  message already states no W4 format can pass 0.99.
+- Phase F **proved SNR is the wrong gate for a drafter** (see Traps): pure int4
+  fails cosine badly yet costs only 7.2% of τ, and oq4.25+ costs 1.25%.
+
+So use the right gate for the path under test:
+
+| path | gate |
+|---|---|
+| int8 (`--gemm` default) | **full-body cos > 0.99** vs f16 golden AND int4/bf16 reference. Do NOT loosen — attention/primitive changes are isolated here, which is what makes it a usable regression gate. |
+| W4A8 (`--gemm multicore`) | **acceptance rate (τ)**, per `benchmarks/results/dflash-phasef-acceptance-20260719.md`. Cosine is ~0.898 by construction; treat a *change* from 0.898 as the signal, not the absolute value. |
+
+Reference: int8 path is **0.998083/0.998140** with flash attention wired
+(sc was 0.998114/0.998170, Δ 3e-5). W4A8 is **0.898399/0.897333** (sc:
+0.898395/0.897311).
+
+The F32 sidecar is a bug repro only — `gemm_f32_batched` has a batch>1 transpose
+bug and a pure-F32 drafter scores τ=0.
 
 **Losslessness (must not regress).** At temp 0, all drafters commit
 BYTE-IDENTICAL tokens to `--ar-baseline` while differing in accepted counts:
