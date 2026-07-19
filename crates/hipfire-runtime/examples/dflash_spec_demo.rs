@@ -513,8 +513,29 @@ fn main() {
     // for the first N cycles to help diagnose divergence.
     let mut debug_cycles: usize = 0;
     // --no-tape: disable GdnTape capture so spec_step_dflash replays via
-    // forward_prefill_batch on committed tokens (byte-exact vs AR when
-    // combined with HIPFIRE_PREFILL_BATCHED=0).
+    // forward_prefill_batch on committed tokens.
+    //
+    // WAS DOCUMENTED as "byte-exact vs AR when combined with
+    // HIPFIRE_PREFILL_BATCHED=0". THAT IS STALE AND WRONG (measured
+    // 2026-07-19): --no-tape tracks --ar-baseline for 43 tokens then diverges
+    // at index 44 (AR=24057, DFlash=11991) over a 96-token generation, and
+    // HIPFIRE_PREFILL_BATCHED=0 does not change it.
+    //
+    // Two separate defects are in play; see tasks #16 and #17.
+    //  #16 tape-on CORRUPTS the target's verify logits outright — with a tape
+    //      attached the first committed token already differs from AR
+    //      (bonus=271 vs AR's 198 at pos=19, accepted=0 in both, so no
+    //      speculative logic is involved). tau collapses 4.556 -> 0.000.
+    //      So --no-tape is much CLOSER to correct, just not exact.
+    //  #17 the residual index-44 divergence is (strongly suspected) the Q8 GDN
+    //      stochastic-rounding seed: GDN_REQUANT_FRAME is a process-global
+    //      dispatch counter, and dispatch count depends on accept_len, so the
+    //      DRAFTER perturbs the TARGET's numerics. kv_mode=q8 is the default,
+    //      so this path is live; a bf16 KV/GDN target avoids it.
+    //
+    // Practical consequence: do NOT treat any temp-0 run here as
+    // drafter-independent until #16 and #17 land. Cross-drafter output
+    // comparisons and acceptance measurements are confounded by both.
     let mut no_tape: bool = false;
     let mut evidence_dir: Option<String> = std::env::var("HIPFIRE_EVAL_EVIDENCE_DIR").ok();
 

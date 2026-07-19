@@ -355,6 +355,59 @@ committed.
 **Phase F is now the DECIDING experiment for the weight format, not a reporting
 step.** See the quant results below.
 
+## 2a. CORRECTNESS: two target-path defects make output drafter-dependent (2026-07-19)
+
+Audited against the reference (`/srv/hipfire/references/dflash/dflash/model.py::dflash_generate`)
+after Phase F saw committed text change with the drafter at temperature 0. Spec
+decode is lossless by construction, so that must not happen.
+
+**Our DFlash speculative logic is CORRECT — all three of the reference's
+bleed-prevention points are implemented, and the accept predicate matches.**
+
+| reference guard | our implementation |
+|---|---|
+| `past_key_values_draft.crop(start)` | N/A — our draft is stateless across cycles (`speculative.rs:6660`) |
+| `past_key_values_target.crop(start)` | positional overwrite; attention masks on absolute position (`speculative.rs:7541-7546`), DeltaNet rewound via `target_snap.restore_to()` (`:7522`) |
+| `target_hidden[..., :acceptance_length+1, :]` | exact — `rows_to_keep = accept_len + 1` (`speculative.rs:7474`), scatter copies only those rows (`:6541`, `:7488`) |
+| exact-match accept + target-sourced bonus | exact — `argmax_per_pos[i] == block[i+1]`, break on mismatch (`speculative.rs:7345`) |
+
+Also ruled out: HIP graph capture, batched vs serial prefill, rollback branch
+selection, and samplers (`repeat_penalty` defaults 1.0, `ngram` false). `cactus_delta`
+defaults 0.0 and only affects temp>0.
+
+**The bleed is in the TARGET's numerics path, in two places.**
+
+**#16 — `GdnTape` attachment corrupts verify logits (CONFIRMED).** Same position,
+same seed, `accepted=0` in both, so no speculative logic is involved:
+
+```
+TAPE ON : pos=19 seed=248068 bonus=271 accepted=0   tau 0.000
+TAPE OFF: pos=19 seed=248068 bonus=198 accepted=0   tau 4.556
+```
+
+AR baseline gives 198 → tape-on is wrong, and DFlash diverges from `--ar-baseline`
+at token index 1. Suspected site `qwen35/prefill_chunk.rs:2432` (tape presence swaps
+the QKVZA kernel), though for an `oq4` target `is_oq4` (`:2105`) should short-circuit
+that arm — **which branch actually fires needs one instrumented run.**
+
+**#17 — GDN stochastic rounding is seeded by a GLOBAL DISPATCH COUNTER (structural).**
+`GDN_REQUANT_FRAME` is a process-global `AtomicU32` (`hipfire-rdna/src/dispatch/mod.rs:115`),
+incremented per GDN dispatch (`dispatch/gated.rs:298,361,452`), feeding the rounding
+noise (`kernels/src/gated_delta_net_q8_routed_batch_seq.hip:118`). **Dispatch count
+depends on `accept_len`**, so a different drafter yields different rounding noise →
+different DeltaNet state → different target logits. The drafter reaches into the
+target through a global counter. Live by default (`kv_mode=q8`); a bf16 KV/GDN target
+is unaffected. Explains the residual `--no-tape` divergence at index 44.
+
+Proposed fix for #17: seed from **absolute token position** (plus layer/head/row)
+rather than a dispatch counter — deterministic, reproducible, and independent of
+execution history, while keeping the decorrelation stochastic rounding provides.
+
+**⚠ CONSEQUENCE: every acceptance/quality measurement below and in Phase F was taken
+on a confounded path.** Re-measure after #16 and #17 land. Verification target: DFlash
+at temp 0 must be byte-identical to `--ar-baseline` over a long generation, across
+multiple drafters.
+
 ## 2b. Weight-format results (2026-07-18) — int4-class FAILS on SNR, and that may not matter
 
 Body-level quality vs the f16 golden, real z-lab 9B drafter, via
