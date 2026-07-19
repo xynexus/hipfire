@@ -3093,6 +3093,14 @@ fn oq8_calibration_recipe(format: &str) -> OqCalibrationRecipe {
     }
 }
 
+fn oq2_calibration_recipe(format: &str) -> OqCalibrationRecipe {
+    match format {
+        "oq2+" => OqCalibrationRecipe::Awq,
+        "oq2++" => OqCalibrationRecipe::AwqLdlq,
+        _ => OqCalibrationRecipe::Plain,
+    }
+}
+
 fn read_chat_template_file(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!(
@@ -3263,7 +3271,7 @@ impl HfqInputFormat {
             "qtip3" => Some(Self::Qtip3),
             "qtip4" => Some(Self::Qtip4),
             "op3" | "op3g256" | "oq3" | "oq3g256" => Some(Self::Oq3),
-            "oq2" | "oq2g256" => Some(Self::Oq2),
+            "oq2" | "oq2g256" | "oq2+" | "oq2++" => Some(Self::Oq2),
             "op6" | "op6g256" | "oq6" | "oq6g256" => Some(Self::Oq6),
             "op4" | "op4-4" | "op4g256" | "op4+" | "op4-4+" | "op4-8+" | "oq4" | "oq4+"
             | "oq4++" | "oq4g256" => Some(Self::Oq4),
@@ -3659,16 +3667,60 @@ fn quantize_hfq_source_tensor(
         }
         HfqInputFormat::Oq2 => {
             // Opus Quant W2 — symmetric signed-int2 (±1, 3 levels), FWHT-256,
-            // 2-bit-packed (Oq2G256, 66 B/group). Plain RTN only (no +/++
-            // calibration variant yet); ragged K falls back to Q8. Served via the
-            // Oq8 upcast loader (`expand_oq2_to_oq8`) — the stored 2-bit weights
-            // sign-extend into int8 containers so the existing iu8 W8A8 kernels run
-            // them, no dedicated W2 decode GEMV. Quality-marginal by design; see
-            // project_lowbit_quant_findings.
+            // 2-bit-packed (Oq2G256, 66 B/group). Shares the Oq4 calibration
+            // machinery exactly like Oq3: `--hessian` (full-Hessian OBS error
+            // feedback, `oq2++`) takes precedence, else AWQ SmoothQuant (`oq2+`),
+            // else plain RTN+FWHT (`oq2`). At 2 bits the ±1 grid is the coarsest,
+            // so error feedback matters most — but oq2 is meant as the low-importance
+            // TAIL of a mixed-precision model (project_oq_mixed_precision_promotion),
+            // not a standalone format. Ragged K falls back to Q8. Served via the Oq8
+            // upcast loader (`expand_oq2_to_oq8`).
             if k % 256 != 0 {
                 return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
             }
-            let q = quantize_oq2g256(&f32_data, &signs1, &signs2);
+            let m_dim = shape[0] as usize;
+            let ldlq_q = OQ4_LDLQ_HESSIAN.get().and_then(|idx| {
+                let mut h = ldlq_hessian_for_tensor(idx, name, k)?;
+                let awq_scales = awq_scales_for(name);
+                let wbuf: std::borrow::Cow<[f32]> = if let Some(s) = &awq_scales {
+                    let mut scaled = f32_data.clone();
+                    awq_pre_scale_weights(&mut scaled, m_dim, k, s);
+                    for i in 0..k {
+                        let si = s[i] as f64;
+                        for j in 0..k {
+                            h[i * k + j] = (h[i * k + j] as f64 / (si * s[j] as f64)) as f32;
+                        }
+                    }
+                    std::borrow::Cow::Owned(scaled)
+                } else {
+                    std::borrow::Cow::Borrowed(&f32_data[..])
+                };
+                let diag_sum: f64 = (0..k).map(|i| h[i * k + i] as f64).sum();
+                let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
+                let out = ldlq::oq2_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp);
+                if out.is_some() {
+                    ldlq_record_success();
+                    if let Some(s) = awq_scales {
+                        OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
+                        eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] OBS int2 + smooth");
+                    } else {
+                        eprintln!("  ldlq: {name} [{m_dim}x{k}] OBS error-feedback int2");
+                    }
+                } else {
+                    ldlq_record_pack_failed(name);
+                }
+                out
+            });
+            let q = if let Some(q) = ldlq_q {
+                q
+            } else if let Some(scales) = awq_scales_for(name) {
+                let mut scaled = f32_data.clone();
+                awq_pre_scale_weights(&mut scaled, m_dim, k, &scales);
+                OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(scales));
+                quantize_oq2g256(&scaled, &signs1, &signs2)
+            } else {
+                quantize_oq2g256(&f32_data, &signs1, &signs2)
+            };
             (q, QuantType::Oq2G256, 256, "OQ2G256")
         }
         HfqInputFormat::Oq4 | HfqInputFormat::OqPlus => {
@@ -5563,9 +5615,20 @@ fn main() {
     if oq8_plus_recipe {
         format_storage = "oq8+".to_string();
     }
-    let oq_plus_recipe = oq4_plus_recipe || oq8_plus_recipe;
-    let oq_ldlq_recipe =
-        oq4_recipe == OqCalibrationRecipe::AwqLdlq || oq8_recipe == OqCalibrationRecipe::AwqLdlq;
+    // OQ2+/OQ2++ are calibrated OQ2 (same Oq2G256 on-disk / Oq8 upcast runtime).
+    // Normalize to the base token; the Oq2 dispatch arm keys off the loaded
+    // hessian/AWQ artifacts exactly like OQ3/OQ4. oq2 is a tail-only format for
+    // mixed precision (see project_oq_mixed_precision_promotion), so error
+    // feedback matters most here even though standalone oq2 stays incoherent.
+    let oq2_recipe = oq2_calibration_recipe(format_storage.as_str());
+    let oq2_plus_recipe = oq2_recipe != OqCalibrationRecipe::Plain;
+    if oq2_plus_recipe {
+        format_storage = "oq2".to_string();
+    }
+    let oq_plus_recipe = oq4_plus_recipe || oq8_plus_recipe || oq2_plus_recipe;
+    let oq_ldlq_recipe = oq4_recipe == OqCalibrationRecipe::AwqLdlq
+        || oq8_recipe == OqCalibrationRecipe::AwqLdlq
+        || oq2_recipe == OqCalibrationRecipe::AwqLdlq;
     // Legacy Opus-A8 is a distinct W4A8 FORMAT, not the generic `+`
     // clip/AWQ modifier and not calibrated OQ4+.
     let is_legacy_opus_plus = matches!(format_storage.as_str(), "opplus" | "op4-plus");
