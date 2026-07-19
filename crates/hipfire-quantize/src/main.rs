@@ -6878,8 +6878,15 @@ fn main() {
         if use_source_precision {
             eprintln!("  LFM2.5 detected — source-precision {format} passthrough.");
         } else if let Some(fmt) = lfm2_oq_format {
+            let expert_fmt = if matches!(fmt, HfqInputFormat::Oq8 | HfqInputFormat::Oq8Plus)
+                || OQPLUS_W8_FRAC.get().is_some()
+            {
+                "OqPlusCompact→Oq8G256"
+            } else {
+                "Oq4G256"
+            };
             eprintln!(
-                "  LFM2.5 detected — dense conv/attn/FFN linears → {fmt:?}, routed experts → MQ4G256, expert_bias → F32, router/embed/norm/conv-filter → Q8."
+                "  LFM2.5 detected — dense conv/attn/FFN linears → {fmt:?}, routed experts → {expert_fmt}, expert_bias → F32, router/embed/norm/conv-filter → Q8."
             );
         } else {
             eprintln!("  LFM2.5 detected — experts → MQ4G256, expert_bias → F32, dense projections follow explicit --format when supported, remaining tensors → Q8.");
@@ -7111,8 +7118,9 @@ fn main() {
                         continue;
                     }
                     let (m, k) = (meta.shape[0], meta.shape[1]);
-                    let w =
-                        tensor_to_f32_with_optional_fp8_scale(name, raw, meta, &empty_fp8, &st_files);
+                    let w = tensor_to_f32_with_optional_fp8_scale(
+                        name, raw, meta, &empty_fp8, &st_files,
+                    );
                     if w.len() != m * k {
                         continue;
                     }
@@ -7770,10 +7778,50 @@ fn main() {
                 }
                 let signs1 = gen_fwht_signs(42, 256);
                 let signs2 = gen_fwht_signs(1042, 256);
-                let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                // Opus-quant experts when an OQ format is requested. These feed the
+                // indexed gemv_oq{4,8}g256_moe_* kernels the lfm2moe forward now
+                // dispatches (the loader fuses w1‖w3 → gate_up by byte-concat, valid
+                // for the per-row G256 layout — same as the MQ4 path). `--w8-top
+                // <frac>` promotes the top-frac magnitude weights/group to int8 via
+                // OqPlusCompact (int4 bulk + sparse int8 outliers; loader expands to
+                // Oq8G256). No OQ format → legacy MQ4G256 experts (deprecated, still
+                // served). Per-expert LDLQ does not apply (no per-expert Hessian);
+                // the AWQ pre-scaling above still holds.
+                // Experts feed the indexed-MoE kernels, which read only two OQ block
+                // layouts: Oq4G256 (4-bit) and OqPlusCompact (int4 bulk + sparse int8,
+                // expanded to Oq8G256 at load). There is NO straight-Oq8 expert kernel,
+                // so an oq8 request maps to OqPlusCompact (default top-1% → int8);
+                // `--w8-top <frac>` overrides the fraction.
+                let want_oq8 = matches!(
+                    lfm2_oq_format,
+                    Some(HfqInputFormat::Oq8 | HfqInputFormat::Oq8Plus)
+                );
+                let oq_w8_frac = OQPLUS_W8_FRAC
+                    .get()
+                    .copied()
+                    .or(if want_oq8 { Some(0.01) } else { None })
+                    .filter(|_| lfm2_oq_format.is_some());
+                let (q, qt, label) = if let Some(frac) = oq_w8_frac {
+                    (
+                        quantize_oqplus_compact(&f32_data, &signs1, &signs2, frac),
+                        QuantType::OqPlusCompact,
+                        "OQ+C-LFM",
+                    )
+                } else if lfm2_oq_format.is_some() {
+                    (
+                        quantize_oq4g256(&f32_data, &signs1, &signs2),
+                        QuantType::Oq4G256,
+                        "OQ4-LFM",
+                    )
+                } else {
+                    (
+                        quantize_mq4g256(&f32_data, &signs1, &signs2),
+                        QuantType::MQ4G256,
+                        "MQ4-LFM",
+                    )
+                };
                 quant_log!(
-                    "  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
-                    "MQ4-LFM",
+                    "  {label:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
                     name,
                     meta.shape,
                     raw_data.len() as f64 / 1024.0,
@@ -7781,7 +7829,7 @@ fn main() {
                 );
                 hfq_tensors.push(HfqTensor {
                     name: name.to_string(),
-                    quant_type: QuantType::MQ4G256,
+                    quant_type: qt,
                     shape,
                     group_size: 256,
                     data: q,
@@ -7824,9 +7872,10 @@ fn main() {
                 continue;
             }
             // OQ route for LFM2 dense linears. This covers both dense LFM2 and
-            // the non-expert linears in LFM2-MoE. Routed experts stay MQ4/MQ6
-            // until the indexed MoE OQ kernels exist; router/embed/norm/conv
-            // filter remain Q8/F32 for their existing runtime paths.
+            // the non-expert linears in LFM2-MoE. Routed experts take the OQ path
+            // above (oq4/oq8/OqPlusCompact) when an OQ format is requested, else
+            // legacy MQ4; router/embed/norm/conv filter remain Q8/F32 for their
+            // existing runtime paths.
             let is_lfm2_dense_linear = is_lfm2_dense_linear_shape(name, &meta.shape);
             // Under a mixed-precision plan, each dense-linear tensor takes its
             // assigned format (oq8 head / oq2 tail) instead of the uniform
