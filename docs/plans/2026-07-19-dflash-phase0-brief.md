@@ -49,6 +49,38 @@ implied. See the corrected section in
 **Items 1 and 2 are DONE.** Remaining budget gap to 27B is ~136 ms, and the two
 largest remaining terms are GEMM (139.5) and host glue (67.9).
 
+**⚠ 236.0 ms IS A COLD-CONTEXT NUMBER, measured at L=32 with NO context cache.**
+The harness recomputes the entire context projection every block. In a real
+spec-decode loop the context grows every cycle, so the naive reading is that the
+block wall scales with L (≈1700 ms at L=512, derived not measured). **That
+scaling is a harness artifact, not a property of DFlash.** Confirmed by reading
+`dflash_body_native.rs:994–1033`:
+
+- `thp = rmsnorm(fc(target_hidden))` is computed **once per block** over all
+  `l_ctx` rows (the code comment already calls it "one-time context projection").
+- Each layer's context K/V comes from `thp` directly —
+  `gemm!(.., gm_kv, .., &thp, l_ctx, ..)` — NOT from an evolving per-layer
+  hidden state. Context rows contribute K/V only; they never run
+  attention/FFN.
+
+So every L-scaling term depends **only on that token's target hidden**, which is
+frozen once the token is committed. `thp`, and each layer's post-headnorm,
+post-rope `k_ctx` and `v_ctx`, are all position-invariant and therefore
+**cacheable across cycles** (rope uses absolute position `pos0=0`, so row `r`
+keeps position `r` as the context grows). Steady-state per-cycle work becomes
+O(τ≈5 new rows), not O(L).
+
+Cache size: k+v per token per layer = 2×8×128 f32 = 8 KiB, ×5 layers =
+**40 KiB/token** (20 MiB at L=512, halved in bf16).
+
+**What this does NOT fix:** attention is over `tot = L + B` and genuinely scales
+with L. At tot=48 it is 61.5 ms for 5 layers (12.3 ms/layer) — implausibly slow
+for that little work, so it is probably dispatch-overhead-dominated and may scale
+sublinearly. **Unmeasured.** Attention, not the GEMMs, is the real L-axis risk.
+
+Re-measuring needs the golden set regenerated: `/tmp/dflash_w/index.json`
+survives but `target_hidden.npy` / `noise_embedding.npy` are gone (tmpfs).
+
 **CONTEXT CONTENTION IS NOT A LEVER — disproved, do not retry.** Sweeping cache
 capacity 1→4 × {LRU, MRU} moves misses 31 → 16 while `npu_busy` stays FLAT at
 186.9–187.7 ms. Misses cost only their host-side `load_peer` (~0.28 ms each), not
@@ -90,8 +122,31 @@ is architecture-independent, so build it on 9B and swap the target.
 2. ~~**Multi-core the attention kernel.**~~ **DONE** (326971468, 4-core).
 3. ~~**Attack host glue.**~~ **DONE** (8da5aa5b3, 105.7 → 53.0 ms). Remaining levers: the `M_TILE=16` double-stream in the GEMM (~40 ms above floor), and 8-core attention (~30 ms, blocked on shim DMA budget).
 4. **Re-measure the block wall after each.** Report cold and warm separately.
-5. **Then re-run Phase F** — acceptance rate across f16 / oq8 / oq4.25+ / mq4
-   drafters. Valid for the first time (see traps).
+5. ~~**Then re-run Phase F**~~ **DONE** — `benchmarks/results/dflash-phasef-acceptance-20260719.md`. Ship **oq4.25+** (τ 5.668, 0.9875 of f16).
+6. **Phase 1 — context cache, then the seam.** The seam itself is clean:
+   `spec_step_dflash` (`crates/hipfire-arch-qwen35/src/speculative.rs:6979`)
+   leaves block hidden in `draft_scratch.x` and the next step applies
+   `target.lm_head` to rows `1..B`, so the NPU swap is one substitution and
+   losslessness is structurally safe (the target verifies everything).
+   **Blocked on shape:** prebuilt kernels bake row counts into their names
+   (`qwen35-rmsnorm-4096-b32` → L=32; `dflash-rope-k-8h128d-b48` → tot=48; GEMMs
+   keyed by CompileTime `(M, K, N)` with N = rows). `ctx_len` is a bring-up
+   choice, not a model property — the drafter sidecar has no `ctx_len` field
+   (`max_position_embeddings: 262144`).
+   Order of work:
+   (a) **Host-side context cache** for `thp`, `k_ctx`, `v_ctx` — removes the L
+       axis from `fc`, `kv`, `rmsnorm-b{L}`, `headnorm-k`, `rope-k`. These then
+       run at a **fixed small row count** (16, matching `M_TILE`) over newly
+       committed tokens, so no shape-generic build is needed for them.
+   (b) **Attention is the only remaining L-shaped kernel.** Either bucket the
+       builds (tot ∈ {64, 128, 256, 512, …}, pad within a bucket) or make it
+       shape-generic. Measure the L-scaling before choosing.
+   (c) Then the seam, with the gates below.
+   `--ctx-slice 32` (`dflash_spec_demo.rs:618`) would run the seam today and
+   prove plumbing + losslessness, but at 32 context rows the resulting τ and
+   tokens/s say nothing about the architecture. It also needs `position >= 32`,
+   which the ~10-token gate prompt does not satisfy on the first cycle. Use it
+   as a plumbing smoke test only — do not quote numbers from it.
 
 ## Gates
 
@@ -108,6 +163,14 @@ T=~/.hipfire/models/qwen3.5-9b-mq4.hfq
   --prompt "Explain how a four-stroke engine works." --max 96 \
   2>/dev/null | md5sum        # -> 02e621bd56b5 for AR and every drafter
 ```
+
+**`--ar-baseline` ALSO REQUIRES `--draft`** or it panics at
+`dflash_spec_demo.rs:822`. Run it without, and stdout is empty — `md5sum`
+returns `d41d8cd98f00`, the digest of the empty string, which reads as a total
+mismatch against every drafter. Same false-regression trap as below, one layer
+down. **Assert the digest is not `d41d8cd98f00` before comparing anything.**
+Corrected, the gate passes: AR baseline and f16 drafter both `02e621bd56b5`,
+3/3 repeats each.
 
 **`2>/dev/null` IS LOAD-BEARING — do not drop it.** stdout is the generated text
 (the substantive invariant); stderr carries a `BENCH METRICS` block with
