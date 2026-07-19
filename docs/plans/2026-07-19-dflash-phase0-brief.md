@@ -19,13 +19,19 @@ NPU DFlash block wall: **726 ms** (native driver,
 `crates/hipfire-xdna/examples/dflash_body_native.rs`). Verify budgets: 9B 57 ms,
 27B 155 ms, 31B 345 ms. Attribution, each term measured with the kernel pinned:
 
-| term | original | NOW (measured) |
+| term | original | NOW (measured, warm) |
 |---|---|---|
-| GEMM (weight-bandwidth-bound) | 317 ms | **139.5 ms** (98bbce9b6, r14 W4A8) |
-| attention | 236 ms | **61.4 ms** (326971468, 4-core, 3.83×) |
-| host glue (quant/bf16/packing) | 143 ms | **67.9 ms** |
-| primitives (norm/rope/swiglu) | 24 ms | 22.3 ms |
-| **warm block wall** | **726 ms** | **291.1 ms** |
+| GEMM (weight-bandwidth-bound) | 317 ms | **103.5 ms** (98bbce9b6, r14 W4A8) |
+| attention | 236 ms | **61.5 ms** (326971468, 4-core, 3.83×) |
+| host glue (quant/bf16/packing) | 143 ms | **53.0 ms** (8da5aa5b3) |
+| primitives (norm/rope/swiglu) | 24 ms | 23.5 ms |
+| **warm block wall** | **726 ms** | **236.0 ms** |
+
+**⚠ MEASURE WARM-ONLY.** An earlier revision of this table was wrong twice from
+one mistake: per-op means were averaged over ALL blocks including the cold first
+block (~1.7× warm) and then subtracted from the WARM wall. That understated glue
+(claimed 67.9, actually 105.7 before optimisation) and manufactured a
+"~62 ms of hardware-context contention" term that **does not exist**.
 
 **291.1 ms FITS the 31B budget (345 ms) with margin. Still 1.88× over 27B
 (155 ms)**, which is Phase 0's stated gate — so the gate is not met, but the
@@ -34,12 +40,15 @@ architecture is viable end-to-end on a 31B-class target today.
 **Items 1 and 2 are DONE.** Remaining budget gap to 27B is ~136 ms, and the two
 largest remaining terms are GEMM (139.5) and host glue (67.9).
 
-**Of the GEMM's 139.5 ms, ~62 ms is hardware-context contention, not bandwidth** —
-npu1 admits 6 contexts, the r14 array pins one, leaving 4 LRU slots for 8 primitive
-kernels → 36 context misses/block. Isolated probes hit 0.80–0.84 ms/dispatch vs
-1.24–3.30 ms in-body. ~60 ms is the genuine floor (600 MiB packed W ÷ 10.4 GB/s;
-`M_TILE=16` makes the rows=32 GEMMs stream weights twice). **Context contention is
-the single largest recoverable term left.**
+**CONTEXT CONTENTION IS NOT A LEVER — disproved, do not retry.** Sweeping cache
+capacity 1→4 × {LRU, MRU} moves misses 31 → 16 while `npu_busy` stays FLAT at
+186.9–187.7 ms. Misses cost only their host-side `load_peer` (~0.28 ms each), not
+dispatch time; true alternation cost is ~0.2 ms/dispatch (~20%), not 5×. Fusing
+the 8 primitives would recover ~5 ms, not 62.
+
+**Remaining GEMM lever:** 103.5 ms against a ~60 ms bandwidth floor
+(600 MiB packed W ÷ 10.4 GB/s). The gap is `M_TILE=16` forcing the rows=32 GEMMs
+(`fc`, `kv`) to stream weights TWICE. That is the real one.
 
 8-core attention is BLOCKED by the shim DMA budget (~2 MM2S/column; each worker
 needs its own Q and KV stream) and would buy only ~30 ms — not the next move.
@@ -67,7 +76,7 @@ cost does not. A 9B prototype measures a permanently-negative result.
    **Trap:** `NpuGemmMp::load_cached` REJECTS an `r14_…` basename — its `_r{N}`
    guard matches the `r14` token itself. Use `load_with_tile`.
 2. ~~**Multi-core the attention kernel.**~~ **DONE** (326971468, 4-core).
-3. **Attack host glue** (67.9 ms) **and the ~62 ms of GEMM context contention** — the two remaining levers to reach the 27B budget.
+3. ~~**Attack host glue.**~~ **DONE** (8da5aa5b3, 105.7 → 53.0 ms). Remaining levers: the `M_TILE=16` double-stream in the GEMM (~40 ms above floor), and 8-core attention (~30 ms, blocked on shim DMA budget).
 4. **Re-measure the block wall after each.** Report cold and warm separately.
 5. **Then re-run Phase F** — acceptance rate across f16 / oq8 / oq4.25+ / mq4
    drafters. Valid for the first time (see traps).
