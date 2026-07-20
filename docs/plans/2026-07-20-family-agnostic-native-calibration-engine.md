@@ -270,6 +270,33 @@ Exclude the following layer-29 checkpoint from performance comparisons: the
 pressure-gate Clippy/tests and required Graphify refresh ran concurrently on the
 host. Its correctness and read-ledger evidence remain usable.
 
+A cumulative audit at 30/60 committed layers covered 78,643,200 valid K=10
+routed slots. Every router total matched the sum of its 512 per-expert hit
+counters, gate-up and down seen/admitted/quota-skipped records reconciled with
+zero count failures, and all layer read ledgers remained duplicate-free under
+one unchanged run fingerprint. The ledger had consumed 520 of 1,038 logical
+tensors and 396,359,511,168 source bytes; the other 518 tensors belong to later
+layers or finalization. Fourteen resident-staging checkpoints consumed every
+staged source byte with zero prefetch errors. The frozen
+`preserve-undercovered` policy remained necessary: the first 30 layers contain
+3,021 under-floor `(layer, expert)` instances, including 27 zero-hit experts,
+and per-layer preservation counts range from 22 to 250.
+
+This audit also preserves an instrumentation failure rather than concealing it.
+Layers 0--9 were committed by the earlier binary before per-launch expert
+capture telemetry landed, so their routing, capture, coverage, imatrix, and
+read-ledger evidence is complete but `capture_gather_launches`, full/partial
+reduction tile counts, and active-expert/padding fields are explicitly marked
+unrecorded. Layers 10--29 carry the new fields: all 20 layers satisfy the
+admitted-row-to-full/partial-tile identity for both capture roles and record
+2,560 model microbatches, 1,251,555 active-expert instances, 9,865,200 padded
+routed rows, 1,122,912 gate-up gather launches, 119,770 full gate-up reduction
+tiles, and 5,328 final partial gate-up tiles. Do not fabricate the missing
+launch counts or use this mixed-instrumentation production run as the final
+all-layer capture-cost proof; a future resumable run must bind checkpoints to
+the calibration-engine build identity so a telemetry/schema-changing binary
+cannot silently continue the same semantic recipe fingerprint.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
