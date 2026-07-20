@@ -313,6 +313,22 @@ pass-2 inputs. The boundary manifest stores a composite executable/run identity
 before embedding begins, closing the otherwise uncovered crash window before
 the first layer progress file exists.
 
+The first attempt at layer 31 exposed a second no-lookahead SVM-pressure
+failure. The durable boundary, source-read counter, and output writes remained
+unchanged for more than two hours while GPU activity stayed at zero. A
+five-second `perf` sample attributed 96.96% of user cycles to
+`rocr::core::BusyWaitSignal::WaitRelaxed`, proving that rising process CPU time
+was HSA signal polling rather than teacher progress. The kernel log recorded
+repeated `SVM mapping failed, exceeds resident system memory limit` messages at
+the start of the attempt; layer 31 is a full-attention layer, but the preceding
+full-attention layer 27 had completed, so this is pressure/queue evidence rather
+than proof of a deterministic attention-kernel defect. The wedged queue held a
+pending `SIGKILL` briefly before releasing its allocations. Host available
+memory then recovered from about 56 GiB to 122 GiB, the GPU lock released, and
+the exact schema-1/no-lookahead recipe resumed from the intact 31/60 boundary.
+Treat this attempt as failure and recovery evidence only; the resumed layer
+must commit before the stream is considered healthy again.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
