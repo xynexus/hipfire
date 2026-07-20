@@ -82,9 +82,9 @@ fn families() -> &'static [FamilyPlan] {
         FamilyPlan {
             arch: "gemma3",
             anchor: "fp16",
-            candidates: &["q8f16", "hfq4", "op4", "op8"],
+            candidates: &["q8f16", "hfq4", "oq4", "oq8"],
             quant_flags: &[],
-            calibrated: &["op4+"],
+            calibrated: &["oq4++"],
         },
         FamilyPlan {
             arch: "minimax",
@@ -224,8 +224,8 @@ fn run_quantize(
         cmd.arg(f);
     }
     if let Some(h) = calib {
-        if matches!(format, "op4+" | "op4-4+" | "op4-8+") {
-            cmd.arg("--awq").arg("--ldlq").arg("--hessian").arg(h);
+        if format == "oq4++" {
+            cmd.arg("--hessian").arg(h);
         } else {
             cmd.env("HIPFIRE_QTIP_HESSIAN", h);
         }
@@ -717,4 +717,26 @@ fn write_baselines(observed: &[(String, String, String, f64)]) -> std::io::Resul
         out.push('\n');
     }
     std::fs::write(&path, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opus_cells_use_canonical_oq_tokens() {
+        let gemma3 = families()
+            .iter()
+            .find(|plan| plan.arch == "gemma3")
+            .expect("Gemma3 tiny-quant plan");
+
+        assert!(gemma3.candidates.contains(&"oq4"));
+        assert!(gemma3.candidates.contains(&"oq8"));
+        assert!(gemma3.calibrated.contains(&"oq4++"));
+        assert!(gemma3
+            .candidates
+            .iter()
+            .chain(gemma3.calibrated.iter())
+            .all(|format| !format.starts_with("op")));
+    }
 }
