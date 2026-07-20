@@ -179,6 +179,17 @@ invalid routes, matched gate-up/down counts, 110 explicitly preserved experts),
 not an idle-host throughput sample. Keep subsequent production layers free of
 unrelated builds or host-load experiments before using them for tuning.
 
+A cumulative audit at 21/60 committed layers covered 55,050,240 K=10 routed
+slots. Every router index was valid, every per-expert gate-up telemetry record
+matched its down-role record exactly, all 21 checkpoint read ledgers were free
+of duplicate logical reads, and the nine layers carrying resident-staging
+telemetry reported complete staged-byte consumption with zero prefetch errors.
+The latest ledger had consumed 364 logical/canonical tensors totaling
+278,059,297,792 bytes, with the remaining 674 tensors still belonging to later
+layers or finalization. Per-layer preservation counts ranged from 22 to 179 and
+minimum admitted expert rows from zero to 484, reinforcing that fallback must
+remain a per-layer/per-expert decision rather than a model-wide route average.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
