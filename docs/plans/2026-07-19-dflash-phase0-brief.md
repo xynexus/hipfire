@@ -483,6 +483,18 @@ T=~/.hipfire/models/qwen3.5-9b-mq4.hfq
   2>/dev/null | md5sum        # -> 02e621bd56b5 for AR and every drafter
 ```
 
+**⚠ THE REFERENCE DIGEST IS TARGET-SPECIFIC, AND THE ORIGINAL `02e621bd56b5`
+TARGET IS GONE.** The Jun-era `qwen3.5-9b-mq4.hfq` that produced `02e621bd56b5`
+was absent from nix1 during seam phase 1 (task #34); the target was rebuilt from
+HF safetensors via `hipfire-quantize --format mq4`, and the mq4 recipe has since
+evolved, so the rebuilt target commits **`a099a2729d04d7dd2362d1676f868c6c`** —
+different bytes, still internally lossless. **The invariant is drafter-
+INDEPENDENCE, not a fixed digest**: assert AR-baseline == flag-off == flag-on ==
+every drafter, all equal to each other, on WHICHEVER target you actually have.
+For the current rebuilt target that value is `a099a2729d04…`; do not expect
+`02e621bd56b5` unless the original artifact is restored. (`d41d8cd98f00` is still
+the empty-string trap — see below.)
+
 **`--ar-baseline` ALSO REQUIRES `--draft`** or it panics at
 `dflash_spec_demo.rs:822`. Run it without, and stdout is empty — `md5sum`
 returns `d41d8cd98f00`, the digest of the empty string, which reads as a total

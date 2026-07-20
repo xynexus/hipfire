@@ -174,8 +174,18 @@ all-GPU spec path stays reproducible.
 
 Losslessness gate every phase:
 `dflash_spec_demo --target $T --draft <D> --prompt "Explain how a four-stroke engine works." --max 96 2>/dev/null | md5sum`
-→ `02e621bd56b5`, ≥3 repeats, assert digest ≠ `d41d8cd98f00` first (the empty-
-string digest from a mis-invoked `--ar-baseline`).
+→ AR-baseline == flag-off == flag-on, ≥3 repeats, assert digest ≠ `d41d8cd98f00`
+first (the empty-string digest from a mis-invoked `--ar-baseline`). **The gate is
+drafter-INDEPENDENCE, not a fixed digest** — the original `02e621bd56b5` target
+is gone; the current rebuilt mq4 target commits `a099a2729d04…` (phase 1, task
+#34). Anchor to whatever target you have; see the brief's Losslessness §.
+
+**Phase 1 is DONE** (`0fa4a2972`): `HIPFIRE_DFLASH_NPU_DRAFT=1`,
+`hipfire_xdna::DflashNpuBody` (`crates/hipfire-xdna/src/dflash_body.rs`),
+tail-mirror feed on `DflashScratch.npu_target_hidden_host`. AR == flag-off ==
+flag-on = `a099a2729d04…`, 3/3 each. Run with `--no-adaptive-b` so the
+B=16/l_ctx=32-baked body engages every eligible cycle (else it falls back to the
+GPU draft, losslessly).
 
 1. **Reachability (serial, no overlap).** Wire the NPU body into
    `spec_step_dflash` behind a flag as a *serial* substitute for
