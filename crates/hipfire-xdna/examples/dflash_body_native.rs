@@ -98,6 +98,108 @@ mod body {
         }
     }
 
+    // ── CPU primitives (--cpu-primitives) ──────────────────────────────────
+    // f32 host implementations of the 8 NPU primitive ops, mirroring the numpy
+    // reference (dflash_body_npu.py: ref_rmsnorm/headnorm/rope/swiglu) exactly:
+    // rms over the last dim with KERNEL_EPS, gamma applied post-normalise, neox
+    // split-half rope, silu(gate)*up. Kept in f32 — this deletes the bf16
+    // pack/unpack + DeviceBuffer sync/dispatch that existed ONLY to cross the
+    // NPU boundary for these ops, and moves the numerics toward the f16 golden
+    // (the NPU path rounds every intermediate to bf16; f32 does not).
+
+    /// rmsnorm over H: out[r,i] = x[r,i] / sqrt(mean(x[r]^2)+eps) * gamma[i].
+    pub fn cpu_rmsnorm(x: &[f32], gamma: &[f32], rows: usize, h: usize, eps: f32, out: &mut [f32]) {
+        for r in 0..rows {
+            let row = &x[r * h..(r + 1) * h];
+            let ss: f32 = row.iter().map(|&v| v * v).sum();
+            let inv = 1.0 / (ss / h as f32 + eps).sqrt();
+            let o = &mut out[r * h..(r + 1) * h];
+            for i in 0..h {
+                o[i] = row[i] * inv * gamma[i];
+            }
+        }
+    }
+
+    /// Per-head rmsnorm over HD: gamma is [hd], shared across all heads.
+    pub fn cpu_headnorm(
+        x: &[f32],
+        gamma: &[f32],
+        rows: usize,
+        heads: usize,
+        hd: usize,
+        eps: f32,
+        out: &mut [f32],
+    ) {
+        for t in 0..rows * heads {
+            let head = &x[t * hd..(t + 1) * hd];
+            let ss: f32 = head.iter().map(|&v| v * v).sum();
+            let inv = 1.0 / (ss / hd as f32 + eps).sqrt();
+            let o = &mut out[t * hd..(t + 1) * hd];
+            for i in 0..hd {
+                o[i] = head[i] * inv * gamma[i];
+            }
+        }
+    }
+
+    /// Full-neox rope: for head row at position (pos0+r), rotate the two halves
+    /// out[:half] = xi*c - yi*s ; out[half:] = yi*c + xi*s, with c/s = cs_buf.
+    pub fn cpu_rope(
+        x: &[f32],
+        rows: usize,
+        heads: usize,
+        hd: usize,
+        pos0: usize,
+        theta: f64,
+        out: &mut [f32],
+    ) {
+        let half = hd / 2;
+        let mut cs = vec![0f32; hd];
+        for r in 0..rows {
+            cs_buf(hd, (pos0 + r) as f64, theta, &mut cs);
+            let (c, s) = cs.split_at(half);
+            for hh in 0..heads {
+                let base = (r * heads + hh) * hd;
+                let (xin, xout) = (&x[base..base + hd], &mut out[base..base + hd]);
+                for i in 0..half {
+                    let (xi, yi) = (xin[i], xin[half + i]);
+                    xout[i] = xi * c[i] - yi * s[i];
+                    xout[half + i] = yi * c[i] + xi * s[i];
+                }
+            }
+        }
+    }
+
+    /// swiglu: out[r,i] = silu(gate[r,i]) * up[r,i], reading gate|up from the
+    /// concat GEMM output row [gate(0..I) | up(I..2I)] of stride `m_gu`.
+    pub fn cpu_swiglu(gateup: &[f32], m_gu: usize, i_dim: usize, rows: usize, out: &mut [f32]) {
+        for r in 0..rows {
+            for i in 0..i_dim {
+                let g = gateup[r * m_gu + i];
+                let u = gateup[r * m_gu + i_dim + i];
+                out[r * i_dim + i] = (g / (1.0 + (-g).exp())) * u;
+            }
+        }
+    }
+
+    /// Record an isolated CPU-vs-NPU primitive parity sample (same input fed to
+    /// both). Keeps the worst (min cos, max |Δ|) seen for `name` across a block.
+    pub fn record_parity(
+        map: &mut std::collections::HashMap<String, (f64, f64, u64)>,
+        name: &str,
+        npu: &[f32],
+        cpu: &[f32],
+    ) {
+        let c = cosine(npu, cpu);
+        let maxd = npu
+            .iter()
+            .zip(cpu)
+            .fold(0f64, |a, (&x, &y)| a.max((x - y).abs() as f64));
+        let e = map.entry(name.to_string()).or_insert((1.0, 0.0, 0));
+        e.0 = e.0.min(c);
+        e.1 = e.1.max(maxd);
+        e.2 += 1;
+    }
+
     pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
         let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
         for i in 0..a.len().min(b.len()) {
@@ -501,6 +603,31 @@ fn main() {
     // path. Block 1 recomputes them and directly compares against the cache
     // (bit-identical gate); blocks >=2 are the timed warm-cached cycles.
     let ctx_cache = arg("--ctx-cache").is_some();
+    // `--cpu-primitives` runs rmsnorm/headnorm/rope/swiglu on the host in f32
+    // instead of dispatching the 8 primitive NPU kernels. This removes those
+    // kernels from the NPU working set (10 warm kernels -> the GEMM path +
+    // attention) and deletes their bf16 pack/unpack glue. Opt-in: the all-NPU
+    // path stays the default so existing measurements reproduce.
+    let cpu_prim = arg("--cpu-primitives").is_some();
+    // `--parity` (used WITH the all-NPU path) runs each CPU primitive on the
+    // SAME input the NPU kernel just consumed and records cos + max|Δ| between
+    // the two outputs — the ISOLATED primitive parity the gate wants, since it
+    // never passes the delta through the int8 GEMM (which would amplify a bf16
+    // vs f32 rounding to the quant floor).
+    let parity = arg("--parity").is_some();
+    // `--parity-bf16` rounds the CPU reference's input, weight and output through
+    // bf16 in the parity probe, matching the NPU kernel's actual I/O contract
+    // (write_bf16 in / read_bf16 out). Confirms the pure-f32 residual is bf16
+    // precision, not an algorithmic difference.
+    let parity_bf16 = arg("--parity-bf16").is_some();
+    let bfr = |s: &[f32]| -> Vec<f32> {
+        s.iter().map(|&v| bf16_to_f32(f32_to_bf16(v))).collect()
+    };
+    // Same-run parity plumbing: --dump-out writes the final block_hidden as raw
+    // little-endian f32; --cmp loads such a file and reports cos against this
+    // run's block_hidden (CPU-vs-NPU primitive parity, GEMM path held fixed).
+    let dump_out = arg("--dump-out");
+    let cmp_path = arg("--cmp");
     let r14_dir = arg("--r14-dir").unwrap_or_else(|| {
         format!(
             "{}/.hipfire/npu/r14_1x2x128_nb128",
@@ -518,6 +645,9 @@ fn main() {
     let (nl, b_rows, l_ctx, ne, tot, groups) =
         (g("NL"), g("B"), g("L"), g("NE"), g("tot"), g("groups"));
     let theta = c["THETA"].as_f64().unwrap();
+    // The rmsnorm/headnorm NPU kernels bake eps=1e-5 (KERNEL_EPS); mirror it on
+    // the CPU path so the host norms track the device, not the model's ~1e-6.
+    let kernel_eps = c["KERNEL_EPS"].as_f64().unwrap_or(1e-5) as f32;
     let q_len = groups * b_rows;
     println!(
         "[dflash_body_native] H={h} I={i_dim} NH={nh} NKV={nkv} NL={nl} B={b_rows} L={l_ctx} tot={tot}"
@@ -878,10 +1008,13 @@ fn main() {
 
     // ── the block body ──────────────────────────────────────────────────────
     let mut npu_ns_total: u64 = 0;
+    let mut cpu_prim_ns: u64 = 0; // host time in CPU primitives (--cpu-primitives)
     let mut dispatches: u64 = 0;
     // Per-op accounting: which kernels the dispatch time actually goes to, and
     // how much of it lands on a freshly-(re)loaded context.
     let mut per_op: HashMap<String, (u64, u64, u64)> = HashMap::new(); // n, ns, ns_after_miss
+    // Isolated CPU-vs-NPU primitive parity: name -> (min cos, max |Δ|, samples).
+    let mut parity_map: HashMap<String, (f64, f64, u64)> = HashMap::new();
     let mut block_out = vec![0f32; b_rows * h];
 
     // ── host-side context cache (--ctx-cache) ───────────────────────────────
@@ -955,6 +1088,11 @@ fn main() {
         ($cache:expr, $name:expr, $x:expr, $gamma:expr, $rows:expr, $out:expr) => {{
             let rows: usize = $rows;
             let gamma: &[f32] = $gamma;
+            if cpu_prim {
+                let t = Instant::now();
+                cpu_rmsnorm(&$x[..rows * h], gamma, rows, h, kernel_eps, &mut $out[..rows * h]);
+                cpu_prim_ns += t.elapsed().as_nanos() as u64;
+            } else {
             write_bf16(&mut norm_in, &$x[..rows * h]);
             {
                 let dst = norm_w.as_mut_slice();
@@ -982,13 +1120,34 @@ fn main() {
             }
             k.sync_output(&norm_out).expect("sync norm");
             read_bf16(&norm_out, &mut $out[..rows * h]);
+            if parity {
+                let (inp, gam) = if parity_bf16 {
+                    (bfr(&$x[..rows * h]), bfr(gamma))
+                } else {
+                    ($x[..rows * h].to_vec(), gamma.to_vec())
+                };
+                let mut cpu_o = vec![0f32; rows * h];
+                cpu_rmsnorm(&inp, &gam, rows, h, kernel_eps, &mut cpu_o);
+                if parity_bf16 {
+                    cpu_o = bfr(&cpu_o);
+                }
+                record_parity(&mut parity_map, $name, &$out[..rows * h], &cpu_o);
+            }
+            }
         }};
     }
 
     // headnorm: arg order is in, out, weight (differs from rmsnorm!).
     macro_rules! headnorm {
-        ($cache:expr, $name:expr, $x:expr, $gamma:expr, $n:expr, $out:expr) => {{
-            let n: usize = $n;
+        ($cache:expr, $name:expr, $x:expr, $gamma:expr, $rows:expr, $heads:expr, $out:expr) => {{
+            let rows: usize = $rows;
+            let heads: usize = $heads;
+            let n = rows * heads * hd;
+            if cpu_prim {
+                let t = Instant::now();
+                cpu_headnorm(&$x[..n], $gamma, rows, heads, hd, kernel_eps, &mut $out[..n]);
+                cpu_prim_ns += t.elapsed().as_nanos() as u64;
+            } else {
             write_bf16(&mut hn_in, &$x[..n]);
             write_bf16(&mut hn_w, $gamma);
             let miss0 = $cache.misses;
@@ -1008,6 +1167,20 @@ fn main() {
             }
             k.sync_output(&hn_out).expect("sync hn");
             read_bf16(&hn_out, &mut $out[..n]);
+            if parity {
+                let (inp, gam) = if parity_bf16 {
+                    (bfr(&$x[..n]), bfr($gamma))
+                } else {
+                    ($x[..n].to_vec(), $gamma.to_vec())
+                };
+                let mut cpu_o = vec![0f32; n];
+                cpu_headnorm(&inp, &gam, rows, heads, hd, kernel_eps, &mut cpu_o);
+                if parity_bf16 {
+                    cpu_o = bfr(&cpu_o);
+                }
+                record_parity(&mut parity_map, $name, &$out[..n], &cpu_o);
+            }
+            }
         }};
     }
 
@@ -1017,6 +1190,11 @@ fn main() {
             let rows: usize = $rows;
             let heads: usize = $heads;
             let n = rows * heads * hd;
+            if cpu_prim {
+                let t = Instant::now();
+                cpu_rope(&$x[..n], rows, heads, hd, $pos0, theta, &mut $out[..n]);
+                cpu_prim_ns += t.elapsed().as_nanos() as u64;
+            } else {
             write_bf16(&mut rope_in, &$x[..n]);
             {
                 let dst = rope_cs.as_mut_slice();
@@ -1047,6 +1225,16 @@ fn main() {
             }
             k.sync_output(&rope_out).expect("sync rope");
             read_bf16(&rope_out, &mut $out[..n]);
+            if parity {
+                let inp = if parity_bf16 { bfr(&$x[..n]) } else { $x[..n].to_vec() };
+                let mut cpu_o = vec![0f32; n];
+                cpu_rope(&inp, rows, heads, hd, $pos0, theta, &mut cpu_o);
+                if parity_bf16 {
+                    cpu_o = bfr(&cpu_o);
+                }
+                record_parity(&mut parity_map, $name, &$out[..n], &cpu_o);
+            }
+            }
         }};
     }
 
@@ -1134,7 +1322,7 @@ fn main() {
             }
 
             // headnorm + rope, q (always) and k.
-            headnorm!(cache, &hn_q, q, g_qn, b_rows * nh * hd, q_tmp);
+            headnorm!(cache, &hn_q, q, g_qn, b_rows, nh, q_tmp);
             rope!(cache, &rope_q, q_tmp, b_rows, nh, l_ctx, q);
             // The k-side norm/rope kernels are built only at b{tot}, so the
             // warm-cached path still dispatches them over all `tot` rows; the
@@ -1142,7 +1330,7 @@ fn main() {
             // and only the noise rows [l_ctx..tot] are kept. A b{B}-shaped build
             // would run these over the B noise rows alone — accounted for as the
             // projected column in the report, not measured here.
-            headnorm!(cache, &hn_k, k_all, g_kn, tot * nkv * hd, k_tmp);
+            headnorm!(cache, &hn_k, k_all, g_kn, tot, nkv, k_tmp);
             rope!(cache, &rope_k, k_tmp, tot, nkv, 0, k_all);
             if ctx_cache {
                 if blk == 0 {
@@ -1361,7 +1549,11 @@ fn main() {
             rmsnorm!(cache, &rms16, hidden, g_post, b_rows, x_norm);
             gemm!(cache, gm_gu, mc_layers[li][3], &x_norm, b_rows, &mut gateup);
             // swiglu over the [gate | up] halves of the concat GEMM output
-            {
+            if cpu_prim {
+                let t = Instant::now();
+                cpu_swiglu(&gateup, gm_gu.m, i_dim, b_rows, &mut swig[..b_rows * i_dim]);
+                cpu_prim_ns += t.elapsed().as_nanos() as u64;
+            } else {
                 let m_gu = gm_gu.m;
                 let dg = sw_gate.as_mut_slice();
                 for r in 0..b_rows {
@@ -1397,6 +1589,15 @@ fn main() {
                 }
                 kern.sync_output(&sw_out).expect("sync swiglu");
                 read_bf16(&sw_out, &mut swig[..b_rows * i_dim]);
+                if parity {
+                    let gu = if parity_bf16 { bfr(&gateup) } else { gateup.clone() };
+                    let mut cpu_o = vec![0f32; b_rows * i_dim];
+                    cpu_swiglu(&gu, gm_gu.m, i_dim, b_rows, &mut cpu_o);
+                    if parity_bf16 {
+                        cpu_o = bfr(&cpu_o);
+                    }
+                    record_parity(&mut parity_map, &swiglu, &swig[..b_rows * i_dim], &cpu_o);
+                }
             }
             gemm!(cache, gm_dn, mc_layers[li][4], &swig, b_rows, &mut down);
             for i in 0..b_rows * h {
@@ -1444,9 +1645,42 @@ fn main() {
     if let Some(cr) = cos_ref {
         println!("    cos vs int8/bf16 ref = {cr:.6}");
     }
+    // Same-run CPU-vs-NPU primitive parity: dump this run's block_hidden and/or
+    // compare it against a previously dumped one (GEMM path held fixed, only
+    // --cpu-primitives toggled, so the cos isolates the primitives).
+    if let Some(p) = dump_out.as_ref() {
+        let mut bytes = Vec::with_capacity(block_out.len() * 4);
+        for &v in &block_out {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(p, &bytes).expect("dump-out");
+        println!("    [dump-out] {} f32 -> {p}", block_out.len());
+    }
+    if let Some(p) = cmp_path.as_ref() {
+        let raw = std::fs::read(p).expect("cmp file");
+        let other: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let c = cosine(&block_out, &other);
+        let maxd = block_out
+            .iter()
+            .zip(&other)
+            .fold(0f64, |a, (&x, &y)| a.max((x - y).abs() as f64));
+        println!(
+            "    [cmp vs {p}] primitive parity cos = {c:.9}  max|Δ| = {maxd:.3e}  (gate > 0.999999)"
+        );
+    }
 
     let warm = walls.iter().cloned().fold(f64::INFINITY, f64::min);
     let per_block_dispatches = dispatches as f64 / blocks as f64;
+    if cpu_prim {
+        println!(
+            "\n  CPU primitives (host, single-core) = {:.2} ms/block  ({:.2} ms total over {blocks} blocks)",
+            cpu_prim_ns as f64 / 1e6 / blocks as f64,
+            cpu_prim_ns as f64 / 1e6
+        );
+    }
     println!("\n  wall (cold) = {:.1} ms", wall_cold * 1e3);
     if warm.is_finite() {
         println!(
@@ -1506,6 +1740,24 @@ fn main() {
             name,
             *ns as f64 / 1e6 / *n as f64,
             if *ns > 0 { *ns_miss as f64 / *ns as f64 * 100.0 } else { 0.0 }
+        );
+    }
+
+    if !parity_map.is_empty() {
+        println!("\n  isolated CPU-vs-NPU primitive parity (same input, per op):");
+        let mut pv: Vec<_> = parity_map.iter().collect();
+        pv.sort_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap());
+        let mut worst = 1.0f64;
+        for (name, (mincos, maxd, n)) in &pv {
+            worst = worst.min(*mincos);
+            println!(
+                "    {:44} n={n:3}  min cos={:.9}  max|Δ|={:.3e}",
+                name, mincos, maxd
+            );
+        }
+        println!(
+            "    -> worst primitive cos = {worst:.9}  {} (gate > 0.999999)",
+            if worst > 0.999999 { "PARITY MET" } else { "PARITY NOT MET" }
         );
     }
 
