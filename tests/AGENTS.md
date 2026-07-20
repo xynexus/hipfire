@@ -6,9 +6,10 @@ admission logic in `hipfire-eval` first.
 
 ## Gate Policy
 
-- `./tests/coherence-gate-dflash.sh` is the canonical correctness gate for
-  kernels, quant formats, dispatch, fusion, rotation, rmsnorm, and spec-decode
-  changes.
+- `./tests/tiny-affected-gate.sh --require-coverage` is the automatic GPU
+  correctness front tier for covered runtime and quantization changes.
+- `./tests/coherence-gate-dflash.sh` is a manual DFlash/DDTree diagnostic. Keep
+  it runnable, but do not wire it into commit hooks or mandatory gate chains.
 - `./tests/no-gpu-ci.sh` is the default no-GPU handoff check for workflow-only
   changes.
 - GPU gates must acquire `hipfire gpu-lock` unless they exclusively drive a

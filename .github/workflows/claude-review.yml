@@ -111,10 +111,10 @@ jobs:
 
             3. COHERENCE / ATTRACTORS — if the diff touches kernels / dispatch /
                forward pass / quant / fusion / rotation / rmsnorm / sampling /
-               spec-decode, the PR MUST cite coherence-gate.sh (and
-               coherence-gate-dflash.sh if spec-decode is touched). Flag missing
-               gate evidence. Watch for changes that could induce token
-               attractors / loops / special-token leaks.
+               spec-decode, the PR MUST cite the affected tiny-model gate and,
+               when it escalates, coherence-gate.sh. DFlash is a manual
+               diagnostic, not mandatory evidence. Watch for changes that could
+               induce token attractors / loops / special-token leaks.
 
             4. DISPATCH ROUTING — crates/rdna-compute/src/dispatch.rs is the
                most-edited and most-reverted file in the repo. For any change to

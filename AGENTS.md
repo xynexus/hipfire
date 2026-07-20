@@ -55,9 +55,10 @@ the relevant docs under `docs/`.
 ## Verification
 
 - Run `./tests/no-gpu-ci.sh` before handing off workflow-only changes.
-- `./tests/coherence-gate-dflash.sh` is the canonical correctness gate after
-  changes touching kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
-  or the spec-decode path.
+- `./tests/tiny-affected-gate.sh --require-coverage` is the automatic GPU
+  correctness front tier for covered runtime and quantization changes.
+- `./tests/coherence-gate-dflash.sh` remains available as a manual
+  DFlash/DDTree diagnostic; it is not an automatic or mandatory gate.
 - Model/runtime admission evidence belongs in `hipfire-eval` batteries or
   suites first. Shell gates should remain enforcement wrappers when they still
   provide baseline comparison or hook integration.

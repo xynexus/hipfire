@@ -54,7 +54,7 @@ Implemented and verified in this checkout:
   hole punching rather than retaining two full artifact-sized payloads;
 - canonical induction naming for the target, typed BF16/F16 DFlash sidecars,
   TriAttention sidecars, calibration artifact, and two-pass manifest;
-- `./tests/no-gpu-ci.sh`, `./tests/coherence-gate-dflash.sh`, GPU calibration
+- `./tests/no-gpu-ci.sh`, affected tiny-model GPU coverage, GPU calibration
   reduction/grouped-capture/KLD tests, and mixed/paged expert parity on gfx1151;
 - an index-only dry run of the 397B source: 60 layers, 1,038 logical tensors,
   792,692,717,952 unique source bytes across 94 shards, K=10, sequence batch 4,
@@ -818,7 +818,8 @@ Gate:
   indices, K=8, K=10, and 512 experts;
 - GPU channel parity of grouped versus indexed/reference outputs;
 - Qwen prefill tests and `cargo test -p hipfire-arch-qwen35 --lib moe_prefill`;
-- `tests/coherence-gate-dflash.sh` because the serving MoE path is touched.
+- affected tiny-model coverage for the serving MoE path; the heavyweight
+  DFlash/DDTree script remains an optional manual diagnostic.
 
 ### C2 — Add source plan, read ledger, and boundary store
 

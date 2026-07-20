@@ -22,7 +22,7 @@
 - [ ] `cargo build --release --workspace --features deltanet` clean
 - [ ] `cargo test --lib --workspace --features deltanet` passes
 - [ ] If kernel/dispatch changed: `./scripts/coherence-gate.sh` clean
-- [ ] If spec-decode changed: `./scripts/coherence-gate-dflash.sh` clean
+- [ ] If runtime/quant changed: affected tiny-model cells pass
 - [ ] If perf-relevant: `./scripts/speed-gate.sh` within ±2% of locked baselines
 
 ## Architecture-trait change?
