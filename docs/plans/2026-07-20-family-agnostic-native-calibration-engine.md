@@ -873,7 +873,10 @@ KLD finalizer. `gemm_raw_x_f32_auto` selects wave32 WMMA only where the
 instruction is available and otherwise uses the family-neutral scalar
 F16/BF16-weight x F32-activation kernel. The portable source compile-checks for
 gfx906, gfx1030, gfx1100, gfx1151, gfx1201, and gfx942; admitted-path channel
-execution remains part of the hardware evidence ladder.
+execution remains part of the hardware evidence ladder. The direct channel
+probe is `cargo run --release -p hipfire-rdna --example
+test_gemm_raw_x_f32_portable`; it forces both storage dtypes through the scalar
+backend even on a WMMA-capable host.
 
 The baseline must be correct on the portability matrix before an arch-specific
 fast path is admitted. Kernel optimization follows channel test -> coherence
