@@ -84,6 +84,13 @@ Implemented and verified in this checkout:
 - bounded quantizer storage: completed tensors spill to disk for bounded RSS,
   and Linux final assembly releases each copied-and-hashed spill range with
   hole punching rather than retaining two full artifact-sized payloads;
+- preserved-expert-aware pass-two storage admission: the two-pass wrapper reads
+  only safetensors headers, recognizes grouped and pre-split routed experts by
+  structural layer/expert/projection components, charges every audited fallback
+  expert at BF16/F16 instead of the nominal OQ width, adds alignment/container
+  overhead plus a 64 GiB or 10% safety margin, persists the estimate in the
+  manifest, and refuses quantization before the second source pass when the
+  output filesystem is too small;
 - canonical induction naming for the target, typed BF16/F16 DFlash sidecars,
   TriAttention sidecars, calibration artifact, and two-pass manifest;
 - `./tests/no-gpu-ci.sh`, affected tiny-model GPU coverage, GPU calibration
@@ -1285,7 +1292,7 @@ does not mean the production artifact or admission ladder is complete.
 |---|---|---|
 | 1. Family-resolved native CLI | Proven | Qwen3.5 and Gemma3-text registry/factory tests plus successful architecture-selected dry runs and real streams; no family CLI flag exists. |
 | 2. Complete 397B teacher artifact | In progress | The recovered durable production stream has 35 of 60 layer checkpoints and crossed the prior layer-31 SVM-pressure failure with lookahead disabled. No final `.calib.hfq` exists yet, so finalizer, KLDREF, complete ledger, and all-layer telemetry are not proven. |
-| 3. Second and only target-source pass | Pending | The target `Qwen3.5-397B-A17B.oq4.25++.hfq` does not exist. The quantizer join is implemented and bounded Gemma join evidence exists, but the production source pass has not run. |
+| 3. Second and only target-source pass | Pending; storage admission proven | The target `Qwen3.5-397B-A17B.oq4.25++.hfq` does not exist. The quantizer join is implemented and bounded Gemma join evidence exists, but the production source pass has not run. Before that pass, the reusable wrapper now computes and persists an index-only mixed-output estimate using the artifact's exact high-precision fallback set and refuses insufficient storage. At 35/60 durable checkpoints, the 4,161 already-preserved experts raise the estimated artifact from 215,455,185,888 nominal payload bytes to at least 295,943,306,208 bytes including alignment/container overhead; the final admission intentionally waits for the complete fallback set. |
 | 4. Per-layer/per-expert floor | Mechanism proven; production pending | Unit/GPU capture tests and all 35 durable production layer journals reconcile K=10 routing. Serialized layer snapshots independently validate routed slots, full/admitted weight counts, quota/slack accounting, and reduction tiles. Preserve-undercovered records real deficits, but the complete 60-layer fallback set is not available until finalization. |
 | 5. Frozen telemetry and quantizer refusal | Mechanism proven; production pending | `artifact audit-calibration` now provides a family-neutral nonzero gate for the complete ledger, Hessian/imatrix index, KLDREF map, per-layer telemetry reconciliation, policy, deficits, and exact high-precision fallback set. The reusable two-pass workflow requires that gate before quantization and persists its fingerprint-bound report; induction will not reuse a target manifest without it. Quantizer enforcement tests pass; the final production artifact and quantizer evidence are absent. |
 | 6. Independent batched state and chosen geometry | Proven on gfx1151 | Ragged independent-state scheduler tests and the Qwen layer-0 batch/row sweeps select batch 64, time tile 32, and 2,048 rows for this host. |

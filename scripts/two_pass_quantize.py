@@ -13,7 +13,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import os
+import re
 import shlex
+import struct
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +31,331 @@ DEFAULT_EXPERT_CAPTURE_TILE_ROWS = 256
 DEFAULT_REQUIRED_EXPERT_FRACTION = 1.0
 DEFAULT_SAMPLING_SEED = 1
 DEFAULT_EXPERT_COVERAGE_POLICY = "preserve-undercovered"
+PASS_TWO_FIXED_SAFETY_BYTES = 64 * 1024**3
+PASS_TWO_RELATIVE_SAFETY = 0.10
+PASS_TWO_CONTAINER_OVERHEAD_BYTES = 16 * 1024**2
+PASS_TWO_TENSOR_ALIGNMENT_BYTES = 4096
+
+
+_DTYPE_BYTES = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "F8_E4M3": 1,
+    "F8_E4M3FN": 1,
+    "F8_E5M2": 1,
+    "U16": 2,
+    "I16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "U32": 4,
+    "I32": 4,
+    "F32": 4,
+    "U64": 8,
+    "I64": 8,
+    "F64": 8,
+}
+
+
+def _resolve_snapshot(path: Path) -> Path:
+    path = path.expanduser().resolve()
+    if (path / "config.json").is_file():
+        return path
+    main_ref = path / "refs" / "main"
+    if main_ref.is_file():
+        candidate = path / "snapshots" / main_ref.read_text().strip()
+        if (candidate / "config.json").is_file():
+            return candidate.resolve()
+    snapshots = path / "snapshots"
+    if snapshots.is_dir():
+        candidates = sorted(
+            (candidate for candidate in snapshots.iterdir() if (candidate / "config.json").is_file()),
+            key=lambda candidate: candidate.stat().st_mtime,
+        )
+        if candidates:
+            return candidates[-1].resolve()
+    raise FileNotFoundError(f"no Hugging Face snapshot/config.json under {path}")
+
+
+def _safetensors_index(model: Path) -> list[dict]:
+    snapshot = _resolve_snapshot(model)
+    shards = sorted(snapshot.glob("*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(f"no safetensors files under {snapshot}")
+    tensors = []
+    for shard in shards:
+        with shard.open("rb") as source:
+            prefix = source.read(8)
+            if len(prefix) != 8:
+                raise RuntimeError(f"truncated safetensors header prefix: {shard}")
+            header_len = struct.unpack("<Q", prefix)[0]
+            if header_len > 1024**3:
+                raise RuntimeError(f"unreasonable safetensors header size {header_len}: {shard}")
+            encoded = source.read(header_len)
+        if len(encoded) != header_len:
+            raise RuntimeError(f"truncated safetensors header: {shard}")
+        header = json.loads(encoded)
+        for name, value in header.items():
+            if name == "__metadata__":
+                continue
+            shape = value.get("shape")
+            offsets = value.get("data_offsets")
+            dtype = value.get("dtype")
+            if (
+                not isinstance(shape, list)
+                or not all(isinstance(dim, int) and dim >= 0 for dim in shape)
+                or not isinstance(offsets, list)
+                or len(offsets) != 2
+                or not all(isinstance(offset, int) and offset >= 0 for offset in offsets)
+                or offsets[1] < offsets[0]
+                or not isinstance(dtype, str)
+            ):
+                raise RuntimeError(f"invalid safetensors index entry {name!r} in {shard}")
+            numel = math.prod(shape)
+            byte_len = offsets[1] - offsets[0]
+            dtype_bytes = _DTYPE_BYTES.get(dtype)
+            if dtype_bytes is not None and byte_len != numel * dtype_bytes:
+                raise RuntimeError(
+                    f"safetensors byte length mismatch for {name}: {byte_len} != {numel}*{dtype_bytes}"
+                )
+            tensors.append(
+                {
+                    "name": name,
+                    "dtype": dtype,
+                    "shape": shape,
+                    "numel": numel,
+                    "source_bytes": byte_len,
+                }
+            )
+    return tensors
+
+
+def _routed_expert_identity(name: str) -> tuple[int, int | None, str] | None:
+    parts = name.split(".")
+    try:
+        layer_at = parts.index("layers")
+        layer = int(parts[layer_at + 1])
+        expert_at = parts.index("experts", layer_at + 2)
+    except (ValueError, IndexError):
+        return None
+    suffix = parts[expert_at + 1 :]
+    if not suffix:
+        return None
+    expert = None
+    if suffix[0].isdigit():
+        expert = int(suffix.pop(0))
+    if not suffix:
+        return None
+    projection = suffix[0]
+    if projection in {"gate_up_proj", "gate_proj", "up_proj", "w1", "w3"}:
+        role = "gate_up"
+    elif projection in {"down_proj", "w2"}:
+        role = "down"
+    else:
+        return None
+    return layer, expert, role
+
+
+def _oq_block_bytes(quant_format: str) -> tuple[float, int]:
+    base = quant_format.removesuffix("++").removesuffix("+")
+    if base == "oq4":
+        return 4.0625, 130
+    if base == "oq8":
+        return 8.0625, 258
+    match = re.fullmatch(r"oq(\d+\.\d+)", base)
+    if match is None:
+        raise RuntimeError(
+            f"pass-two storage admission does not know the on-disk block size for {quant_format!r}"
+        )
+    requested = float(match.group(1))
+    overlays = round((requested - 4.0625) * 16)
+    if not 1 <= overlays <= 62 or abs((4.0625 + overlays / 16) - requested) > 1e-6:
+        raise RuntimeError(f"invalid mixed Opus storage width {quant_format!r}")
+    return requested, 130 + 2 * overlays
+
+
+def _source_precision_output_bytes(tensor: dict) -> int:
+    if tensor["dtype"] in {"BF16", "F16", "F32"}:
+        return tensor["numel"] * 2
+    return tensor["source_bytes"]
+
+
+def _is_q8_role(name: str) -> bool:
+    return any(
+        marker in name
+        for marker in (
+            "embed_tokens.weight",
+            "word_embeddings.weight",
+            "lm_head.weight",
+            ".router.weight",
+            ".mlp.gate.weight",
+            ".block_sparse_moe.gate.weight",
+        )
+    )
+
+
+def _quantized_tensor_bytes(numel: int, block_bytes: int, *, q8: bool = False) -> int:
+    effective_block = 34 if q8 else block_bytes
+    group = 32 if q8 else 256
+    return math.ceil(numel / group) * effective_block
+
+
+def _nearest_existing_path(path: Path) -> Path:
+    candidate = path if path.is_dir() else path.parent
+    while not candidate.exists():
+        parent = candidate.parent
+        if parent == candidate:
+            raise FileNotFoundError(f"no existing parent for output path {path}")
+        candidate = parent
+    return candidate.resolve()
+
+
+def pass_two_storage_preflight(
+    *,
+    model: Path,
+    output: Path,
+    quant_format: str,
+    calibration: dict,
+    available_bytes: int | None = None,
+) -> dict:
+    """Estimate pass-two disk demand without reading tensor payloads.
+
+    The source scan reads safetensors headers only. Routed-expert tensors are
+    recognized structurally (layer/expert/projection components), including
+    grouped `[experts,...]` and already-split layouts. Experts declared by the
+    audited calibration artifact are costed at F16/BF16 rather than at the
+    requested OQ width.
+    """
+
+    storage_bits, block_bytes = _oq_block_bytes(quant_format)
+    tensors = _safetensors_index(model)
+    preserved_values = calibration.get("metadata", {}).get("preserve_high_precision", [])
+    if not isinstance(preserved_values, list):
+        raise RuntimeError("calibration preserve_high_precision is not a list")
+    preserved = set()
+    for value in preserved_values:
+        if not isinstance(value, dict) or not isinstance(value.get("layer"), int) or not isinstance(value.get("expert"), int):
+            raise RuntimeError(f"invalid calibration preserve_high_precision entry: {value!r}")
+        preserved.add((value["layer"], value["expert"]))
+
+    payload_bytes = 0
+    nominal_payload_bytes = 0
+    preserve_output_bytes = 0
+    preserve_nominal_bytes = 0
+    matched_roles: dict[tuple[int, int], set[str]] = {key: set() for key in preserved}
+    output_tensors = 0
+    source_payload_bytes = 0
+    source_parameters = 0
+
+    for tensor in tensors:
+        source_payload_bytes += tensor["source_bytes"]
+        source_parameters += tensor["numel"]
+        identity = _routed_expert_identity(tensor["name"])
+        if identity is not None:
+            layer, explicit_expert, role = identity
+            if explicit_expert is None:
+                if len(tensor["shape"]) < 2 or tensor["shape"][0] < 1:
+                    raise RuntimeError(f"grouped routed-expert tensor has no expert dimension: {tensor['name']}")
+                expert_count = tensor["shape"][0]
+                expert_numel = math.prod(tensor["shape"][1:])
+                experts = range(expert_count)
+            else:
+                expert_numel = tensor["numel"]
+                experts = (explicit_expert,)
+            for expert in experts:
+                nominal = _quantized_tensor_bytes(expert_numel, block_bytes)
+                nominal_payload_bytes += nominal
+                key = (layer, expert)
+                if key in preserved:
+                    full = expert_numel * 2
+                    payload_bytes += full
+                    preserve_output_bytes += full
+                    preserve_nominal_bytes += nominal
+                    matched_roles[key].add(role)
+                else:
+                    payload_bytes += nominal
+                output_tensors += 1
+            continue
+
+        is_weight = len(tensor["shape"]) >= 2 and tensor["name"].endswith(".weight")
+        if is_weight:
+            encoded = _quantized_tensor_bytes(
+                tensor["numel"],
+                block_bytes,
+                q8=_is_q8_role(tensor["name"]),
+            )
+        else:
+            encoded = _source_precision_output_bytes(tensor)
+        payload_bytes += encoded
+        nominal_payload_bytes += encoded
+        output_tensors += 1
+
+    if preserved:
+        missing = sorted(key for key, roles in matched_roles.items() if not roles)
+        incomplete = sorted((key, sorted(roles)) for key, roles in matched_roles.items() if roles and roles != {"gate_up", "down"})
+        if missing:
+            raise RuntimeError(
+                f"calibration preserves {len(missing)} experts with no routed-expert source tensors: {missing[:8]}"
+            )
+        if incomplete:
+            raise RuntimeError(
+                f"calibration preserved experts lack both routed roles in source index: {incomplete[:8]}"
+            )
+
+    alignment_bytes = output_tensors * PASS_TWO_TENSOR_ALIGNMENT_BYTES
+    artifact_estimate = payload_bytes + alignment_bytes + PASS_TWO_CONTAINER_OVERHEAD_BYTES
+    safety_margin = max(PASS_TWO_FIXED_SAFETY_BYTES, math.ceil(artifact_estimate * PASS_TWO_RELATIVE_SAFETY))
+    required_free = artifact_estimate + safety_margin
+    probe_path = _nearest_existing_path(output)
+    if available_bytes is None:
+        stats = os.statvfs(probe_path)
+        available_bytes = stats.f_bavail * stats.f_frsize
+    sufficient = available_bytes >= required_free
+    return {
+        "schema": "hipfire.pass_two_storage_preflight.v1",
+        "index_only": True,
+        "payload_values_read": False,
+        "format": quant_format,
+        "storage_bits_per_weight": storage_bits,
+        "source": {
+            "snapshot": str(_resolve_snapshot(model)),
+            "tensors": len(tensors),
+            "parameters": source_parameters,
+            "payload_bytes": source_payload_bytes,
+        },
+        "preserve_high_precision": {
+            "requested_experts": len(preserved),
+            "matched_experts": sum(roles == {"gate_up", "down"} for roles in matched_roles.values()),
+            "output_bytes": preserve_output_bytes,
+            "nominal_quantized_bytes": preserve_nominal_bytes,
+            "delta_bytes": preserve_output_bytes - preserve_nominal_bytes,
+        },
+        "estimate": {
+            "nominal_payload_bytes": nominal_payload_bytes,
+            "mixed_payload_bytes": payload_bytes,
+            "tensor_alignment_bytes": alignment_bytes,
+            "fixed_container_overhead_bytes": PASS_TWO_CONTAINER_OVERHEAD_BYTES,
+            "completed_artifact_estimate_bytes": artifact_estimate,
+            "safety_margin_bytes": safety_margin,
+            "required_free_bytes": required_free,
+        },
+        "filesystem": {
+            "probe_path": str(probe_path),
+            "available_bytes": available_bytes,
+            "required_free_bytes": required_free,
+            "sufficient": sufficient,
+        },
+    }
+
+
+def require_pass_two_storage(preflight: dict) -> None:
+    filesystem = preflight["filesystem"]
+    if filesystem["sufficient"] is not True:
+        raise RuntimeError(
+            "insufficient output storage for pass two: "
+            f"{filesystem['available_bytes']} bytes available at {filesystem['probe_path']}, "
+            f"{filesystem['required_free_bytes']} bytes required by the preserved-expert-aware estimate"
+        )
 
 
 def build_commands(
@@ -200,6 +529,7 @@ def update_manifest(
     phase: str,
     calibration: dict | None = None,
     calibration_audit: dict | None = None,
+    storage_preflight: dict | None = None,
     quantized: dict | None = None,
 ) -> dict:
     previous = {}
@@ -228,6 +558,10 @@ def update_manifest(
         manifest["calibration_audit"] = calibration_audit
     elif calibration is None and "calibration_audit" in previous:
         manifest["calibration_audit"] = previous["calibration_audit"]
+    if storage_preflight is not None:
+        manifest["pass_two_storage_preflight"] = storage_preflight
+    elif "pass_two_storage_preflight" in previous:
+        manifest["pass_two_storage_preflight"] = previous["pass_two_storage_preflight"]
     if quantized is not None:
         manifest["quantized"] = quantized
     elif "quantized" in previous:
@@ -597,12 +931,32 @@ def main() -> None:
         calibration=calibration,
         calibration_audit=calibration_audit,
     )
+    storage_preflight = pass_two_storage_preflight(
+        model=args.model,
+        output=args.output,
+        quant_format=args.quant_format,
+        calibration=calibration,
+    )
+    update_manifest(
+        manifest_path,
+        recipe=recipe,
+        phase=(
+            "quantization_ready"
+            if storage_preflight["filesystem"]["sufficient"]
+            else "quantization_refused_storage"
+        ),
+        calibration=calibration,
+        calibration_audit=calibration_audit,
+        storage_preflight=storage_preflight,
+    )
+    require_pass_two_storage(storage_preflight)
     update_manifest(
         manifest_path,
         recipe=recipe,
         phase="quantization_running",
         calibration=calibration,
         calibration_audit=calibration_audit,
+        storage_preflight=storage_preflight,
     )
     subprocess.run(quant_exec, check=True)
     quantized = inspect_artifact(args.coexistence, args.output)
@@ -613,6 +967,7 @@ def main() -> None:
         phase="complete",
         calibration=calibration,
         calibration_audit=calibration_audit,
+        storage_preflight=storage_preflight,
         quantized=quantized,
     )
 

@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import copy
+import struct
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,20 @@ two_pass = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(two_pass)
 
 
+def write_safetensors_index(path: Path, tensors: dict[str, tuple[str, list[int], int]]) -> None:
+    offset = 0
+    header = {}
+    for name, (dtype, shape, byte_len) in tensors.items():
+        header[name] = {
+            "dtype": dtype,
+            "shape": shape,
+            "data_offsets": [offset, offset + byte_len],
+        }
+        offset += byte_len
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded)
+
+
 def test_default_quant_format_is_mixed_oq425_double_plus():
     assert two_pass.DEFAULT_QUANT_FORMAT == "oq4.25++"
     assert two_pass.DEFAULT_LAYER_PREFETCH_BYTES == 16 * 1024**3
@@ -22,6 +37,97 @@ def test_default_quant_format_is_mixed_oq425_double_plus():
     assert two_pass.DEFAULT_REQUIRED_EXPERT_FRACTION == 1.0
     assert two_pass.DEFAULT_SAMPLING_SEED == 1
     assert two_pass.DEFAULT_EXPERT_COVERAGE_POLICY == "preserve-undercovered"
+
+
+def test_pass_two_storage_preflight_counts_grouped_preserved_experts(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    write_safetensors_index(
+        model / "model.safetensors",
+        {
+            # Four grouped experts. Gate/up and down are deliberately different
+            # shapes so the estimator must derive each expert's actual payload.
+            "model.layers.0.mlp.experts.gate_up_proj.weight": ("BF16", [4, 8, 256], 4 * 8 * 256 * 2),
+            "model.layers.0.mlp.experts.down_proj.weight": ("BF16", [4, 256, 4], 4 * 256 * 4 * 2),
+            "model.layers.0.self_attn.q_proj.weight": ("BF16", [256, 256], 256 * 256 * 2),
+            "model.layers.0.input_layernorm.weight": ("BF16", [256], 256 * 2),
+        },
+    )
+    calibration = {
+        "metadata": {
+            "preserve_high_precision": [
+                {"layer": 0, "expert": 1},
+                {"layer": 0, "expert": 3},
+            ]
+        }
+    }
+
+    preflight = two_pass.pass_two_storage_preflight(
+        model=model,
+        output=tmp_path / "out" / "Tiny-MoE.oq4.25++.hfq",
+        quant_format="oq4.25++",
+        calibration=calibration,
+        available_bytes=1,
+    )
+
+    # Each preserved expert owns 8*256 + 256*4 BF16 values.
+    assert preflight["preserve_high_precision"]["requested_experts"] == 2
+    assert preflight["preserve_high_precision"]["matched_experts"] == 2
+    assert preflight["preserve_high_precision"]["output_bytes"] == 2 * (8 * 256 + 256 * 4) * 2
+    assert preflight["estimate"]["completed_artifact_estimate_bytes"] > 0
+    assert preflight["estimate"]["required_free_bytes"] > preflight["estimate"]["completed_artifact_estimate_bytes"]
+    assert preflight["filesystem"]["available_bytes"] == 1
+    assert preflight["filesystem"]["sufficient"] is False
+    with pytest.raises(RuntimeError, match="insufficient output storage"):
+        two_pass.require_pass_two_storage(preflight)
+
+
+def test_pass_two_storage_preflight_rejects_unmatched_preserved_expert(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    write_safetensors_index(
+        model / "model.safetensors",
+        {"model.layers.0.self_attn.q_proj.weight": ("BF16", [256, 256], 256 * 256 * 2)},
+    )
+    calibration = {
+        "metadata": {"preserve_high_precision": [{"layer": 0, "expert": 7}]}
+    }
+
+    with pytest.raises(RuntimeError, match="no routed-expert source tensors"):
+        two_pass.pass_two_storage_preflight(
+            model=model,
+            output=tmp_path / "Tiny.oq4.25++.hfq",
+            quant_format="oq4.25++",
+            calibration=calibration,
+            available_bytes=10**12,
+        )
+
+
+def test_pass_two_storage_preflight_accepts_presplit_w1_w2_w3_experts(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    tensors = {
+        "model.layers.2.mlp.experts.5.w1.weight": ("F16", [8, 256], 8 * 256 * 2),
+        "model.layers.2.mlp.experts.5.w2.weight": ("F16", [256, 8], 256 * 8 * 2),
+        "model.layers.2.mlp.experts.5.w3.weight": ("F16", [8, 256], 8 * 256 * 2),
+    }
+    write_safetensors_index(model / "model.safetensors", tensors)
+
+    preflight = two_pass.pass_two_storage_preflight(
+        model=model,
+        output=tmp_path / "Tiny.oq4.25++.hfq",
+        quant_format="oq4.25++",
+        calibration={
+            "metadata": {"preserve_high_precision": [{"layer": 2, "expert": 5}]}
+        },
+        available_bytes=10**12,
+    )
+
+    assert preflight["preserve_high_precision"]["matched_experts"] == 1
+    assert preflight["preserve_high_precision"]["output_bytes"] == 3 * 8 * 256 * 2
 
 
 def test_build_commands_use_one_layer_streamed_teacher_pass_then_quantize(tmp_path):
@@ -230,6 +336,10 @@ def test_manifest_consumes_native_read_ledger_and_artifact_fingerprints(tmp_path
         "payload_values_checked": False,
         "errors": [],
     }
+    storage_preflight = {
+        "schema": "hipfire.pass_two_storage_preflight.v1",
+        "filesystem": {"sufficient": True},
+    }
 
     manifest = two_pass.update_manifest(
         path,
@@ -237,6 +347,7 @@ def test_manifest_consumes_native_read_ledger_and_artifact_fingerprints(tmp_path
         phase="complete",
         calibration=calibration,
         calibration_audit=calibration_audit,
+        storage_preflight=storage_preflight,
         quantized=quantized,
     )
 
@@ -244,6 +355,7 @@ def test_manifest_consumes_native_read_ledger_and_artifact_fingerprints(tmp_path
     assert restored == manifest
     assert restored["source_reads"] == calibration["metadata"]["read_ledger"]
     assert restored["calibration_audit"] == calibration_audit
+    assert restored["pass_two_storage_preflight"] == storage_preflight
     assert restored["fingerprints"] == {
         "calibration_artifact": "fnv64:calib",
         "calibration_engine_build": "executable:sha256-engine",
