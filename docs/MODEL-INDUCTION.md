@@ -85,8 +85,10 @@ calibrator defaults: `--min-expert-activations`,
 `--required-expert-fraction`, `--sampling-seed`, and
 `--expert-coverage-policy`. They are forwarded to the native pass and included
 in the two-pass recipe fingerprint. This makes strict/fallback runs and the
-planned coverage/capture sweeps distinct resumable recipes even if native CLI
-defaults later change.
+coverage/capture sweeps distinct resumable recipes even if native CLI defaults
+later change. Use `astrea expert-sweep-plan` to freeze those sweeps before
+execution; [QUANTIZE.md](QUANTIZE.md) records the family-neutral command and
+held-out evidence contract.
 
 Mixed-precision Opus targets are supported directly. For example,
 `--format oq4.5++` keeps the `++` calibration recipe and emits canonically

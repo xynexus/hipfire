@@ -38,6 +38,13 @@ Implemented and verified in this checkout:
   forwarded to the native command and participates in the recipe fingerprint,
   with a cross-wrapper test preventing the induction and quantization
   fingerprints from drifting;
+- an immutable, family-neutral Astrea expert-sweep planner: minimum-floor
+  experiments hold the capture target fixed, capture-target experiments require
+  a previously selected floor, calibration and held-out corpora are content
+  hashed and must differ, every variant emits a canonical native two-pass
+  command plus a GPU-lock-scoped held-out evaluator, and the complete recipe,
+  engine, commands, output paths, and required comparison metrics participate
+  in the plan fingerprint;
 - durable per-layer phase timing for source load/upload, teacher execution,
   capture serialization, collector finalization, and part sync/hash, persisted
   in checkpoints and the completed artifact for resume-safe ETA analysis;
@@ -237,7 +244,8 @@ Still required before declaring the engine complete or promoting a production
   remains optimal, the full Qwen layer stream, and production per-expert
   coverage/fallback results from the real corpus;
 - resident-versus-streamed comparison and matched held-out KLD/PPL evidence;
-- the controlled minimum-coverage and capture-target sweeps;
+- execution of the now-frozen controlled minimum-coverage and capture-target
+  sweeps, including complete held-out quality and capture-cost rows;
 - resident-versus-streamed second-family parity (the complete streamed artifact
   and quantizer-consumption half are now proven); and
 - admitted-path channel evidence beyond the currently tested gfx1151 host.

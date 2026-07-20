@@ -220,6 +220,23 @@ ENGINE_HASH_PATHS = [
     "kernels/src/rope_partial_interleaved_batched.hip",
     "kernels/src/rope_partial_halfsplit.hip",
     "kernels/src/rope_partial_halfsplit_batched.hip",
+    "crates/hipfire-runtime/src/calibration/boundary.rs",
+    "crates/hipfire-runtime/src/calibration/contracts.rs",
+    "crates/hipfire-runtime/src/calibration/expert_capture.rs",
+    "crates/hipfire-runtime/src/calibration/schedule.rs",
+    "crates/hipfire-runtime/src/calibration/source.rs",
+    "crates/hipfire-runtime/src/calibration/stream.rs",
+    "crates/hipfire-runtime/src/moe/grouped.rs",
+    "crates/hipfire-rdna/src/dispatch/moe.rs",
+    "crates/hipfire-arch-qwen35/src/calibration_stream.rs",
+    "crates/hipfire-arch-gemma3/src/calibration_stream.rs",
+    "crates/hipfire-coexistence/src/calibrate.rs",
+    "crates/hipfire-quantize/src/main.rs",
+    "crates/hipfire-quantize/src/gptq.rs",
+    "crates/hipfire-quantize/src/ldlq.rs",
+    "crates/hipfire-quantize/src/mixed_precision.rs",
+    "scripts/two_pass_quantize.py",
+    "scripts/astrea_expert_sweep.py",
 ]
 
 GGML_TYPE_NAMES = {
@@ -4014,6 +4031,22 @@ def load_paroquant_oracle_module():
     return module
 
 
+def load_expert_sweep_module():
+    import importlib.util
+
+    script_path = Path(__file__).with_name("astrea_expert_sweep.py")
+    spec = importlib.util.spec_from_file_location("hipfire_astrea_expert_sweep", script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def build_expert_sweep_plan(**kwargs):
+    return load_expert_sweep_module().build_plan(**kwargs)
+
+
 def paro_probe_model(model, *, local_only=False, max_modules=None):
     module = load_paroquant_import_module()
     return module.probe_model(model, local_only=local_only, max_modules=max_modules)
@@ -4147,6 +4180,54 @@ def build_parser():
     promote.add_argument("--tensor-filter")
     promote.add_argument("--pretty", action="store_true")
     promote.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    expert_sweep = sub.add_parser(
+        "expert-sweep-plan",
+        help="Freeze a one-axis routed-expert calibration and held-out quality sweep.",
+    )
+    expert_sweep.add_argument("--model", required=True)
+    expert_sweep.add_argument("--artifact-stem", required=True)
+    expert_sweep.add_argument("--calibration-dataset", required=True)
+    expert_sweep.add_argument("--evaluation-dataset", required=True)
+    expert_sweep.add_argument("--reference-model", required=True)
+    expert_sweep.add_argument("--output-dir", required=True)
+    expert_sweep.add_argument("--evaluation-command-template", required=True)
+    expert_sweep.add_argument("--axis", choices=("minimum", "capture"), required=True)
+    expert_sweep.add_argument("--minimum-rows", dest="minimum_rows", type=int, action="append")
+    expert_sweep.add_argument("--capture-target", dest="capture_targets", type=int, action="append")
+    expert_sweep.add_argument("--selected-minimum", type=int)
+    expert_sweep.add_argument("--fixed-capture-target", type=int)
+    expert_sweep.add_argument("--quant-format", default="oq4.25++")
+    expert_sweep.add_argument(
+        "--quant-arg",
+        dest="quant_args",
+        action="append",
+        help="Quantizer option; use --quant-arg=--flag for values beginning with a dash.",
+    )
+    expert_sweep.add_argument("--sequences", type=int, default=128)
+    expert_sweep.add_argument("--context", type=int, default=2048)
+    expert_sweep.add_argument("--sequence-batch", type=int, default=64)
+    expert_sweep.add_argument("--time-tile", type=int, default=32)
+    expert_sweep.add_argument("--max-rows", type=int, default=2048)
+    expert_sweep.add_argument("--layer-prefetch-bytes", type=int, default=16 * 1024**3)
+    expert_sweep.add_argument("--kldref-topk", type=int, default=64)
+    expert_sweep.add_argument("--expert-capture-tile-rows", type=int, default=256)
+    expert_sweep.add_argument("--required-expert-fraction", type=float, default=1.0)
+    expert_sweep.add_argument("--sampling-seed", type=int, default=1)
+    expert_sweep.add_argument(
+        "--expert-coverage-policy",
+        choices=("strict", "preserve-undercovered"),
+        default="preserve-undercovered",
+    )
+    expert_sweep.add_argument("--hipfire", default="target/release/hipfire")
+    expert_sweep.add_argument(
+        "--evaluation-owns-resource-lease",
+        action="store_true",
+        help="Do not add a hipfire flock wrapper around the held-out evaluator.",
+    )
+    expert_sweep.add_argument("--engine-root")
+    expert_sweep.add_argument("--pretty", action="store_true")
+    expert_sweep.add_argument("--out", help="Write JSON to this path instead of stdout.")
 
     latent_kv_plan = sub.add_parser(
         "latent-kv-plan",
@@ -4415,6 +4496,42 @@ def run(argv=None):
                 output=args.output,
                 max_tensors=args.max_tensors,
                 tensor_filter=args.tensor_filter,
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "expert-sweep-plan":
+        write_json(
+            build_expert_sweep_plan(
+                model=args.model,
+                artifact_stem=args.artifact_stem,
+                calibration_dataset=args.calibration_dataset,
+                evaluation_dataset=args.evaluation_dataset,
+                reference_model=args.reference_model,
+                output_dir=args.output_dir,
+                evaluation_command_template=args.evaluation_command_template,
+                axis=args.axis,
+                minimum_rows=args.minimum_rows,
+                capture_targets=args.capture_targets,
+                selected_minimum=args.selected_minimum,
+                fixed_capture_target=args.fixed_capture_target,
+                quant_format=args.quant_format,
+                quant_args=args.quant_args,
+                sequences=args.sequences,
+                context=args.context,
+                sequence_batch=args.sequence_batch,
+                time_tile=args.time_tile,
+                max_rows=args.max_rows,
+                layer_prefetch_bytes=args.layer_prefetch_bytes,
+                kldref_topk=args.kldref_topk,
+                capture_tile_rows=args.expert_capture_tile_rows,
+                required_expert_fraction=args.required_expert_fraction,
+                sampling_seed=args.sampling_seed,
+                expert_coverage_policy=args.expert_coverage_policy,
+                hipfire=args.hipfire,
+                evaluation_owns_resource_lease=args.evaluation_owns_resource_lease,
+                engine=engine_fingerprint(args.engine_root),
+                command=["python3", "scripts/astrea.py", *raw_argv],
             ),
             pretty=args.pretty,
             out=args.out,
