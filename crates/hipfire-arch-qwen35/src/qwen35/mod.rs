@@ -1779,7 +1779,7 @@ fn moe_decode_dispatch_flags_for_dtypes(
 }
 
 fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
-    k_top == 8 && num_experts <= 1024
+    matches!(k_top, 8 | 10) && num_experts <= 1024
 }
 
 fn moe_prefill_side_gate_dtype_supported(dtype: DType) -> bool {
@@ -1924,8 +1924,10 @@ pub fn prefill_batch_pbs_eligible(
         && (is_rdna3_dgpu || decouple_env.as_deref() == Some("1"));
     let force_fallback =
         !verify_decouple && std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
-    // MoE batched path requires K_TOP=8 (hard-coded in the indexed kernels) and
-    // num_experts ≤ 1024 (bound of the batched top-K shared mem).
+    // The grouped/indexed routing kernels take runtime K_TOP. K=8 uses the GPU
+    // top-K reducer; K=10 uses the deterministic host merge/upload fallback in
+    // prefill_chunk. Keep the explicit admitted set narrow until another K is
+    // channel-tested. The scatter workspace supports at most 1024 experts.
     let moe_topk_ok =
         moe_prefill_topk_shape_supported(config.num_experts_per_tok, config.num_experts);
     !force_fallback
@@ -5133,10 +5135,13 @@ mod tests {
     }
 
     #[test]
-    fn moe_prefill_topk_shape_requires_k8_and_bounded_experts() {
+    fn moe_prefill_topk_shape_admits_k8_k10_and_bounded_experts() {
         assert!(moe_prefill_topk_shape_supported(8, 256));
         assert!(moe_prefill_topk_shape_supported(8, 1024));
+        assert!(moe_prefill_topk_shape_supported(10, 512));
         assert!(!moe_prefill_topk_shape_supported(4, 256));
+        assert!(!moe_prefill_topk_shape_supported(9, 512));
+        assert!(!moe_prefill_topk_shape_supported(10, 1025));
         assert!(!moe_prefill_topk_shape_supported(8, 1025));
     }
 

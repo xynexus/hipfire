@@ -28,8 +28,10 @@ Implemented and verified in this checkout:
 - persisted grouped-capture cost telemetry: microbatch count, active-expert
   sum/maximum, grouped padding rows, row-gather launches, full and final-partial
   reduction tiles, and the routed-token point at which a layer saturated;
-- shared grouped-MoE routing/scratch/capture machinery, K=8/K=10 tests, mixed
-  OQ4 plus BF16/F16 expert execution, and canonical paged OQ4 expert layout;
+- shared grouped-MoE routing/scratch/capture machinery, K=8/K=10 tests and
+  normal Qwen grouped-prefill admission (GPU top-K at K=8, deterministic host
+  top-K merge/upload at K=10), mixed OQ4 plus BF16/F16 expert execution, and
+  canonical paged OQ4 expert layout;
 - native two-pass orchestration, atomic recipe manifests, artifact fingerprints,
   interrupted-run resume, and quantizer enforcement of high-precision fallback;
   explicit calibration reuse derives a fresh no-GPU native plan and requires

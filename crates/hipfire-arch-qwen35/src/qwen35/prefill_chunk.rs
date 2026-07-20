@@ -20,8 +20,9 @@ use super::*;
 ///   use an arch-supported MoE quant family.
 /// - `pbs.moe_*_batch` tensors are allocated (num_experts > 0 at scratch
 ///   construction time) and sized to max_batch ≥ N
-/// - `config.num_experts_per_tok == 8` and `config.num_experts <= 1024`
-///   (hard limits of the batched top-K kernel)
+/// - `config.num_experts_per_tok` is an admitted routed shape (currently K=8
+///   or K=10) and `config.num_experts <= 1024`; K=8 uses the GPU top-K reducer
+///   while K=10 uses the deterministic host merge/upload path below
 ///
 /// Sequence mirrors `moe_ffn_decode_impl`'s GPU fast path, with every
 /// per-token launch replaced by its N-batched equivalent. Byte-exact
