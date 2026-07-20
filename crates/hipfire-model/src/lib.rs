@@ -3076,7 +3076,7 @@ mod tests {
         fs::write(models.join("Deepseek-v4-Flash.mtp.hfq"), "mtp").unwrap();
         fs::write(models.join("Deepseek-v4-Flash.hfq.triattn.hfq"), "old tri").unwrap();
         fs::write(triattn.join("Deepseek-v4-Flash.triattn.hfq"), "tri").unwrap();
-        fs::write(drafts.join("Deepseek-v4-Flash.dflash.hfq"), "draft").unwrap();
+        fs::write(drafts.join("Deepseek-v4-Flash-BF16.dflash.hfq"), "draft").unwrap();
         fs::write(drafts.join("Deepseek-v4-Flash.draft.hfq"), "old draft").unwrap();
         fs::write(templates.join("Deepseek-v4-Flash.jinja"), "template").unwrap();
         fs::write(templates.join("Deepseek-v4-Flash.hfq.j2"), "old template").unwrap();
@@ -3101,7 +3101,7 @@ mod tests {
         assert_eq!(model.quant, "mq4");
         assert_eq!(model.hfq_arch_id, Some(1));
         assert_eq!(model.triattn[0].file, "Deepseek-v4-Flash.triattn.hfq");
-        assert_eq!(model.drafts[0].file, "Deepseek-v4-Flash.dflash.hfq");
+        assert_eq!(model.drafts[0].file, "Deepseek-v4-Flash-BF16.dflash.hfq");
         assert_eq!(model.chat_templates[0].file, "Deepseek-v4-Flash.jinja");
 
         let _ = fs::remove_dir_all(root);
