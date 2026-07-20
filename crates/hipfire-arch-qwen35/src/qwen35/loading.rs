@@ -3550,6 +3550,15 @@ fn collect_calibration_artifacts_sequences(
                             "top1_histogram": h.top1_histogram,
                             "topk_histogram": h.topk_histogram,
                             "per_layer_topk": h.per_layer.iter().map(|l| serde_json::json!(l.topk_histogram)).collect::<Vec<_>>(),
+                            "per_layer": h.per_layer.iter().map(|layer| serde_json::json!({
+                                "layer": layer.layer_idx,
+                                "routed_tokens": layer.routed_tokens,
+                                "routed_slots": layer.routed_slots,
+                                "dropped_indices": layer.dropped_indices,
+                                "top1_hits": layer.top1_histogram,
+                                "topk_hits": layer.topk_histogram,
+                                "weight_sums": layer.weight_sums,
+                            })).collect::<Vec<_>>(),
                             "top_cooccurrence": cooc_json,
                         }),
                     ));

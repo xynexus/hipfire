@@ -232,7 +232,11 @@ The comparator is family-neutral and does not load a model or GPU. It requires
 matching corpus and sample fingerprints by default, checks the tensor set,
 shapes, per-tensor activation counts, KLDREF metadata, and every finite tensor
 value. Dense-F32 and compact BF16-triangle Hessians are compared through the
-same logical diagonal/lower-triangle view; KLDREF indices are exact. Use
+same logical diagonal/lower-triangle view; KLDREF indices are exact. When both
+packages carry routed-MoE telemetry, it also normalizes the resident histogram
+and streamed expert records, then requires exact routed-token, routed-slot,
+dropped-index, top-1, and top-k counts with tolerance-bounded route-weight sums.
+Missing per-layer router telemetry on only one side is a comparison failure. Use
 `--allow-unproven-provenance` only for diagnostic comparison of a legacy
 resident artifact that predates the matched-sample metadata contract. Such a
 run is not admission evidence.

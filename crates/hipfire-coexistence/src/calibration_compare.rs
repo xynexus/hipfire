@@ -80,6 +80,20 @@ pub struct TensorMismatch {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RouterParityReport {
+    pub reference_format: Option<String>,
+    pub candidate_format: Option<String>,
+    pub compared_layers: usize,
+    pub compared_weight_sums: u64,
+    pub mismatched_layers: usize,
+    pub mismatched_weight_sums: u64,
+    pub max_weight_abs_error: f64,
+    pub max_weight_rel_error: f64,
+    pub errors: Vec<String>,
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CalibrationComparisonReport {
     pub schema_version: u32,
     pub reference: String,
@@ -89,6 +103,7 @@ pub struct CalibrationComparisonReport {
     pub provenance_required: bool,
     pub provenance_complete: bool,
     pub metadata_checks: Vec<MetadataCheck>,
+    pub router_parity: Option<RouterParityReport>,
     pub reference_tensor_count: usize,
     pub candidate_tensor_count: usize,
     pub compared_tensors: usize,
@@ -151,6 +166,12 @@ pub fn compare_calibration_artifacts(
         .iter()
         .filter(|check| check.required_for_matched_provenance)
         .all(|check| matches!(check.status, MetadataCheckStatus::Match));
+    let router_parity = compare_router_telemetry(
+        &reference_metadata,
+        &candidate_metadata,
+        options.atol as f64,
+        options.rtol as f64,
+    );
 
     let reference_tensors = tensor_map(reference.tensors());
     let candidate_tensors = tensor_map(candidate.tensors());
@@ -287,10 +308,11 @@ pub fn compare_calibration_artifacts(
         && structural_errors.is_empty()
         && mismatched_values == 0
         && !metadata_mismatch
+        && router_parity.as_ref().is_none_or(|report| report.ok)
         && (!options.require_provenance || provenance_complete);
 
     Ok(CalibrationComparisonReport {
-        schema_version: 1,
+        schema_version: 2,
         reference: reference_path.display().to_string(),
         candidate: candidate_path.display().to_string(),
         atol: options.atol,
@@ -298,6 +320,7 @@ pub fn compare_calibration_artifacts(
         provenance_required: options.require_provenance,
         provenance_complete,
         metadata_checks,
+        router_parity,
         reference_tensor_count: reference_tensors.len(),
         candidate_tensor_count: candidate_tensors.len(),
         compared_tensors,
@@ -315,6 +338,215 @@ pub fn compare_calibration_artifacts(
         reports_truncated,
         ok,
     })
+}
+
+#[derive(Debug)]
+struct RouterLayer {
+    routed_tokens: u64,
+    routed_slots: u64,
+    dropped_indices: u64,
+    top1_hits: Vec<u64>,
+    topk_hits: Vec<u64>,
+    weight_sums: Vec<f64>,
+}
+
+fn compare_router_telemetry(
+    reference: &Value,
+    candidate: &Value,
+    atol: f64,
+    rtol: f64,
+) -> Option<RouterParityReport> {
+    let reference = normalize_router_layers(reference);
+    let candidate = normalize_router_layers(candidate);
+    if reference.is_none() && candidate.is_none() {
+        return None;
+    }
+    let mut report = RouterParityReport {
+        reference_format: reference.as_ref().map(|(format, _)| (*format).into()),
+        candidate_format: candidate.as_ref().map(|(format, _)| (*format).into()),
+        compared_layers: 0,
+        compared_weight_sums: 0,
+        mismatched_layers: 0,
+        mismatched_weight_sums: 0,
+        max_weight_abs_error: 0.0,
+        max_weight_rel_error: 0.0,
+        errors: Vec::new(),
+        ok: false,
+    };
+    let Some((_, reference)) = reference else {
+        report
+            .errors
+            .push("reference artifact has no per-layer router telemetry".into());
+        return Some(report);
+    };
+    let Some((_, candidate)) = candidate else {
+        report
+            .errors
+            .push("candidate artifact has no per-layer router telemetry".into());
+        return Some(report);
+    };
+
+    for layer in reference
+        .keys()
+        .chain(candidate.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+    {
+        let Some(left) = reference.get(&layer) else {
+            report
+                .errors
+                .push(format!("router layer {layer} exists only in candidate"));
+            report.mismatched_layers += 1;
+            continue;
+        };
+        let Some(right) = candidate.get(&layer) else {
+            report
+                .errors
+                .push(format!("router layer {layer} exists only in reference"));
+            report.mismatched_layers += 1;
+            continue;
+        };
+        report.compared_layers += 1;
+        let mut layer_mismatch = false;
+        for (field, a, b) in [
+            ("routed_tokens", left.routed_tokens, right.routed_tokens),
+            ("routed_slots", left.routed_slots, right.routed_slots),
+            (
+                "dropped_indices",
+                left.dropped_indices,
+                right.dropped_indices,
+            ),
+        ] {
+            if a != b {
+                report
+                    .errors
+                    .push(format!("router layer {layer} {field} {a} != {b}"));
+                layer_mismatch = true;
+            }
+        }
+        for (field, a, b) in [
+            ("top1_hits", &left.top1_hits, &right.top1_hits),
+            ("topk_hits", &left.topk_hits, &right.topk_hits),
+        ] {
+            if a != b {
+                report.errors.push(format!(
+                    "router layer {layer} {field} differs (reference_len={} candidate_len={})",
+                    a.len(),
+                    b.len()
+                ));
+                layer_mismatch = true;
+            }
+        }
+        if left.weight_sums.len() != right.weight_sums.len() {
+            report.errors.push(format!(
+                "router layer {layer} weight_sums length {} != {}",
+                left.weight_sums.len(),
+                right.weight_sums.len()
+            ));
+            layer_mismatch = true;
+        } else {
+            for (&a, &b) in left.weight_sums.iter().zip(&right.weight_sums) {
+                report.compared_weight_sums += 1;
+                if !a.is_finite() || !b.is_finite() {
+                    report.mismatched_weight_sums += 1;
+                    layer_mismatch = true;
+                    continue;
+                }
+                let abs = (a - b).abs();
+                let scale = a.abs().max(b.abs());
+                let rel = abs / scale.max(f64::MIN_POSITIVE);
+                report.max_weight_abs_error = report.max_weight_abs_error.max(abs);
+                report.max_weight_rel_error = report.max_weight_rel_error.max(rel);
+                if abs > atol + rtol * scale {
+                    report.mismatched_weight_sums += 1;
+                    layer_mismatch = true;
+                }
+            }
+        }
+        if layer_mismatch {
+            report.mismatched_layers += 1;
+        }
+    }
+    report.ok = report.errors.is_empty()
+        && report.mismatched_layers == 0
+        && report.mismatched_weight_sums == 0;
+    Some(report)
+}
+
+fn normalize_router_layers(
+    metadata: &Value,
+) -> Option<(&'static str, BTreeMap<usize, RouterLayer>)> {
+    if metadata.get("moe_router_histogram").is_some() {
+        let layers = metadata
+            .pointer("/moe_router_histogram/per_layer")?
+            .as_array()?;
+        let mut normalized = BTreeMap::new();
+        for layer in layers {
+            let index = json_usize(layer, "layer")?;
+            normalized.insert(
+                index,
+                RouterLayer {
+                    routed_tokens: json_u64(layer, "routed_tokens")?,
+                    routed_slots: json_u64(layer, "routed_slots")?,
+                    dropped_indices: json_u64(layer, "dropped_indices")?,
+                    top1_hits: json_u64_vec(layer, "top1_hits")?,
+                    topk_hits: json_u64_vec(layer, "topk_hits")?,
+                    weight_sums: json_f64_vec(layer, "weight_sums")?,
+                },
+            );
+        }
+        return Some(("resident_histogram", normalized));
+    }
+    let telemetry = metadata.get("expert_telemetry")?.as_array()?;
+    let mut normalized = BTreeMap::new();
+    for layer in telemetry {
+        let index = json_usize(layer, "layer")?;
+        let router = layer.get("router")?;
+        let weight_sums = router
+            .get("route_weights")?
+            .as_array()?
+            .iter()
+            .map(|weight| weight.get("sum")?.as_f64())
+            .collect::<Option<Vec<_>>>()?;
+        normalized.insert(
+            index,
+            RouterLayer {
+                routed_tokens: json_u64(router, "routed_tokens")?,
+                routed_slots: json_u64(router, "routed_slots")?,
+                dropped_indices: json_u64(router, "dropped_indices")?,
+                top1_hits: json_u64_vec(router, "top1_hits")?,
+                topk_hits: json_u64_vec(router, "topk_hits")?,
+                weight_sums,
+            },
+        );
+    }
+    Some(("streamed_expert_telemetry", normalized))
+}
+
+fn json_usize(value: &Value, key: &str) -> Option<usize> {
+    usize::try_from(json_u64(value, key)?).ok()
+}
+
+fn json_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key)?.as_u64()
+}
+
+fn json_u64_vec(value: &Value, key: &str) -> Option<Vec<u64>> {
+    value
+        .get(key)?
+        .as_array()?
+        .iter()
+        .map(Value::as_u64)
+        .collect()
+}
+
+fn json_f64_vec(value: &Value, key: &str) -> Option<Vec<f64>> {
+    value
+        .get(key)?
+        .as_array()?
+        .iter()
+        .map(Value::as_f64)
+        .collect()
 }
 
 pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -765,5 +997,48 @@ mod tests {
         .unwrap();
         assert!(relaxed.ok);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn router_parity_normalizes_resident_and_streamed_telemetry() {
+        let resident = serde_json::json!({
+            "moe_router_histogram": {
+                "per_layer": [{
+                    "layer": 3,
+                    "routed_tokens": 2,
+                    "routed_slots": 4,
+                    "dropped_indices": 0,
+                    "top1_hits": [1, 1],
+                    "topk_hits": [2, 2],
+                    "weight_sums": [1.25, 0.75]
+                }]
+            }
+        });
+        let streamed = serde_json::json!({
+            "expert_telemetry": [{
+                "layer": 3,
+                "router": {
+                    "routed_tokens": 2,
+                    "routed_slots": 4,
+                    "dropped_indices": 0,
+                    "top1_hits": [1, 1],
+                    "topk_hits": [2, 2],
+                    "route_weights": [
+                        {"count": 2, "sum": 1.25, "sum_squared": 0.8},
+                        {"count": 2, "sum": 0.75, "sum_squared": 0.4}
+                    ]
+                }
+            }]
+        });
+        let matching = compare_router_telemetry(&resident, &streamed, 1e-6, 1e-6).unwrap();
+        assert!(matching.ok);
+        assert_eq!(matching.compared_layers, 1);
+        assert_eq!(matching.compared_weight_sums, 2);
+
+        let mut drifted = streamed;
+        drifted["expert_telemetry"][0]["router"]["topk_hits"] = serde_json::json!([3, 1]);
+        let mismatch = compare_router_telemetry(&resident, &drifted, 1e-6, 1e-6).unwrap();
+        assert!(!mismatch.ok);
+        assert_eq!(mismatch.mismatched_layers, 1);
     }
 }
