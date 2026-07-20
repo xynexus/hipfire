@@ -326,6 +326,15 @@ mod body {
         q: &mut [i8],
         scale: &mut [f32],
     ) {
+        // `--thread-quant`: the per-row quant is embarrassingly parallel (each row
+        // owns disjoint q/scale slices, no cross-row state), so rayon over rows is
+        // bit-identical to the serial loop — the per-row computation and its
+        // intra-row order are unchanged. MEASURED NET-NEGATIVE at this shape (see
+        // THREAD_QUANT doc); the flag exists only to reproduce that null.
+        if THREAD_QUANT.load(std::sync::atomic::Ordering::Relaxed) {
+            quantize_row_chunked_rayon(x, rows, k, kc, q, scale);
+            return;
+        }
         // Baseline x86-64 has no round-to-nearest-even instruction, so
         // `round_ties_even` compiles to a libm call PER ELEMENT and the loop
         // stays scalar. SSE4.1's `roundps` (mode 0) is exactly ties-to-even, so
@@ -340,6 +349,37 @@ mod body {
             }
         }
         quantize_row_chunked_scalar(x, rows, k, kc, q, scale)
+    }
+
+    /// Row-parallel twin of [`quantize_row_chunked_scalar`] (`--thread-glue`).
+    /// Bit-identical: each row is computed exactly as the scalar loop, only the
+    /// rows are distributed across the rayon pool.
+    fn quantize_row_chunked_rayon(
+        x: &[f32],
+        rows: usize,
+        k: usize,
+        kc: usize,
+        q: &mut [i8],
+        scale: &mut [f32],
+    ) {
+        use rayon::prelude::*;
+        let chunks = k / kc;
+        q[..rows * k]
+            .par_chunks_mut(k)
+            .zip(scale[..rows * chunks].par_chunks_mut(chunks))
+            .zip(x[..rows * k].par_chunks(k))
+            .for_each(|((qr, sr), xr)| {
+                for c in 0..chunks {
+                    let seg = &xr[c * kc..(c + 1) * kc];
+                    let absmax = seg.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                    let s = if absmax > 0.0 { absmax / QMAX } else { 1.0 };
+                    sr[c] = s;
+                    let inv = 1.0 / s;
+                    for (i, &v) in seg.iter().enumerate() {
+                        qr[c * kc + i] = (v * inv).round_ties_even().clamp(-QMAX, QMAX) as i8;
+                    }
+                }
+            });
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -385,6 +425,22 @@ mod body {
     // A-stripe pack, and the int32→f32 rescale. Only pack + rescale are
     // overlappable behind weight streaming; quant depends on the previous op's
     // output, so it stays on the layer critical path.
+    // `--thread-glue` threads the per-row activation quant and the int32→f32
+    // rescale across the rayon pool; `--thread-pack` additionally threads the
+    // A-stripe pack (which, under `--pipeline-glue`, contends with NPU weight
+    // streaming on the shared Phoenix UMA bus — measured separately so the
+    // contention verdict is isolated from the safe wait-window glue).
+    pub static THREAD_GLUE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    pub static THREAD_PACK: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    /// Separate from THREAD_GLUE: threading the per-row activation quant is a
+    /// MEASURED REGRESSION on this shape (16 rows/GEMM, 20 GEMMs/block — the rayon
+    /// fork/join overhead exceeds the per-row work, and quant sits on the layer
+    /// critical path so the loss hits the wall directly: 1.7→3.5 ms/block). Kept
+    /// behind its own opt-in flag for reproducibility; NOT folded into thread-glue.
+    pub static THREAD_QUANT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     pub static GLUE_QUANT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     pub static GLUE_PACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     pub static GLUE_RESCALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -405,6 +461,126 @@ mod body {
         (q, p, r)
     }
 
+    /// `*mut f32` wrapper so a rayon closure can write disjoint regions of the
+    /// output buffer in parallel. SAFETY contract is per call site: every task
+    /// must write a range that provably aliases no other task's range.
+    #[derive(Clone, Copy)]
+    struct SendMutF32(*mut f32);
+    unsafe impl Send for SendMutF32 {}
+    unsafe impl Sync for SendMutF32 {}
+
+    /// Rescale one dispatch's int32 C into `out` (`+= scale4 * sx * v`). Serial by
+    /// default (bit-identical to the original inline loop). Under `--thread-glue`,
+    /// and only when every slot in the dispatch shares one k-chunk — which makes
+    /// the slots' output column ranges disjoint (distinct tiles) or their rows
+    /// disjoint (distinct m-blocks) — the slots are rescaled in parallel. Each
+    /// output element still receives exactly its one contribution per dispatch, in
+    /// the same value, so the result is bit-identical; only the C-buffer read-back
+    /// hazard order changes, which is already resolved before this call.
+    #[allow(clippy::too_many_arguments)]
+    fn rescale_dispatch(
+        geom: &R14Geometry,
+        span: &[(usize, usize, usize)],
+        c32: &[i32],
+        scale4t: &[f32],
+        sx: &[f32],
+        k_chunks: usize,
+        m: usize,
+        out: &mut [f32],
+    ) {
+        let (mt, nt) = (geom.m_tile(), geom.n_tile());
+        let threaded = THREAD_GLUE.load(std::sync::atomic::Ordering::Relaxed)
+            && span
+                .first()
+                .map(|&(_, c0, _)| span.iter().all(|&(_, c, _)| c == c0))
+                .unwrap_or(false);
+        if threaded {
+            use rayon::prelude::*;
+            let p = SendMutF32(out.as_mut_ptr());
+            span.par_iter().enumerate().for_each(|(s, &(mb, kchunk, tile))| {
+                let p = p; // move the Copy pointer into the task
+                let (row0, col0) = (mb * mt, tile * nt);
+                let scol = &scale4t[kchunk * m..(kchunk + 1) * m];
+                geom.each_c_run(c32, s, |lr, lc0, vals| {
+                    let r = row0 + lr;
+                    let sxr = sx[r * k_chunks + kchunk];
+                    let n0 = col0 + lc0;
+                    let sc = &scol[n0..n0 + vals.len()];
+                    // SAFETY: within a single-k-chunk dispatch, distinct slots
+                    // have distinct (m_block, tile) => disjoint [r*m+n0 ..) runs,
+                    // so no two tasks touch the same element.
+                    let o = unsafe {
+                        std::slice::from_raw_parts_mut(p.0.add(r * m + n0), vals.len())
+                    };
+                    for t in 0..vals.len() {
+                        o[t] += sc[t] * sxr * vals[t] as f32;
+                    }
+                });
+            });
+        } else {
+            for (s, &(mb, kchunk, tile)) in span.iter().enumerate() {
+                let (row0, col0) = (mb * mt, tile * nt);
+                let scol = &scale4t[kchunk * m..(kchunk + 1) * m];
+                geom.each_c_run(c32, s, |lr, lc0, vals| {
+                    let r = row0 + lr;
+                    let sxr = sx[r * k_chunks + kchunk];
+                    let n0 = col0 + lc0;
+                    let sc = &scol[n0..n0 + vals.len()];
+                    let o = &mut out[r * m + n0..r * m + n0 + vals.len()];
+                    for t in 0..vals.len() {
+                        o[t] += sc[t] * sxr * vals[t] as f32;
+                    }
+                });
+            }
+        }
+    }
+
+    /// `--thread-pack`: pack one dispatch's A stripes in parallel across the four
+    /// A-stripe regions (block-rows), which are contiguous and disjoint in the A
+    /// buffer, so `par_chunks_mut` splits them cleanly. NOTE this discards the
+    /// serial path's within-dispatch replication (consecutive slots sharing
+    /// (m_block, k_chunk) copy A instead of repacking): every slot is packed from
+    /// `qa` independently, so the total byte work is higher — the point is to
+    /// measure whether more cores beat the memory-movement cost under UMA
+    /// contention, not to assume it wins. Bit-identical bytes to the serial pack.
+    fn pack_dispatch_threaded(
+        geom: &R14Geometry,
+        span: &[(usize, usize, usize)],
+        qa: &[i8],
+        k: usize,
+        abuf: &mut [u8],
+    ) {
+        use hipfire_xdna::gemm_r14::{GRID, MK, MR};
+        use rayon::prelude::*;
+        let (lm, kt) = (geom.lm, geom.kt);
+        let (at, ab) = (geom.at(), geom.ab());
+        let (mt, kc) = (geom.m_tile(), geom.k_chunk());
+        abuf[..GRID * at]
+            .par_chunks_mut(at)
+            .enumerate()
+            .for_each(|(i, chunk)| {
+                for (s, &(mb, c, _)) in span.iter().enumerate() {
+                    let (m0, k0) = (mb * mt, c * kc);
+                    for im in 0..lm {
+                        for ktile in 0..kt {
+                            let toff = s * ab + (im * kt + ktile) * (MR * MK);
+                            for r in 0..MR {
+                                let row = m0 + i * lm * MR + im * MR + r;
+                                let src = row * k + k0 + ktile * MK;
+                                let s8: &[u8] = unsafe {
+                                    std::slice::from_raw_parts(
+                                        qa[src..src + MK].as_ptr() as *const u8,
+                                        MK,
+                                    )
+                                };
+                                chunk[toff + r * MK..toff + r * MK + MK].copy_from_slice(s8);
+                            }
+                        }
+                    }
+                }
+            });
+    }
+
     /// Run one full GEMM on the r14 array. Returns (device ns, dispatch count).
     pub fn run_r14(
         g: &mut NpuGemmR14,
@@ -415,7 +591,7 @@ mod body {
         sx: &mut [f32],
     ) -> (u64, u64) {
         let geom: R14Geometry = g.geom();
-        let (mt, nt, kc) = (geom.m_tile(), geom.n_tile(), geom.k_chunk());
+        let (mt, kc) = (geom.m_tile(), geom.k_chunk());
         let (rows, m, k, nblk) = (mx.rows, mx.m, mx.k, geom.nblk);
         let tq = std::time::Instant::now();
         quantize_row_chunked(x, rows, k, kc, qa, sx);
@@ -441,25 +617,30 @@ mod body {
             let skip = uniform.is_some() && uniform == *a_state;
             let tp = std::time::Instant::now();
             if !skip {
-                let abuf = g.a_mut();
-                let mut prev: Option<(usize, usize, usize)> = None;
-                for (s, &(mb, c, _)) in mx.plan[lo..hi].iter().enumerate() {
-                    // A depends only on (m_block, k_chunk); consecutive slots in a
-                    // dispatch usually share both, so replicate instead of repacking.
-                    if let Some((pmb, pc, ps)) = prev {
-                        if pmb == mb && pc == c {
-                            for i in 0..hipfire_xdna::gemm_r14::GRID {
-                                let (base, off) = (i * geom.at(), geom.ab());
-                                let (src, dst) = (base + ps * off, base + s * off);
-                                abuf.copy_within(src..src + off, dst);
+                if THREAD_PACK.load(std::sync::atomic::Ordering::Relaxed) {
+                    pack_dispatch_threaded(&geom, span, qa, k, g.a_mut());
+                    *a_state = uniform;
+                } else {
+                    let abuf = g.a_mut();
+                    let mut prev: Option<(usize, usize, usize)> = None;
+                    for (s, &(mb, c, _)) in mx.plan[lo..hi].iter().enumerate() {
+                        // A depends only on (m_block, k_chunk); consecutive slots in a
+                        // dispatch usually share both, so replicate instead of repacking.
+                        if let Some((pmb, pc, ps)) = prev {
+                            if pmb == mb && pc == c {
+                                for i in 0..hipfire_xdna::gemm_r14::GRID {
+                                    let (base, off) = (i * geom.at(), geom.ab());
+                                    let (src, dst) = (base + ps * off, base + s * off);
+                                    abuf.copy_within(src..src + off, dst);
+                                }
+                                continue;
                             }
-                            continue;
                         }
+                        geom.pack_a_slot(abuf, s, qa, k, mb * mt, c * kc);
+                        prev = Some((mb, c, s));
                     }
-                    geom.pack_a_slot(abuf, s, qa, k, mb * mt, c * kc);
-                    prev = Some((mb, c, s));
+                    *a_state = uniform;
                 }
-                *a_state = uniform;
             }
             glue_add(&GLUE_PACK, tp.elapsed());
             let t = std::time::Instant::now();
@@ -468,23 +649,7 @@ mod body {
             disp += 1;
             let c32 = g.read_c().expect("r14 read C");
             let tr = std::time::Instant::now();
-            for (s, &(mb, kchunk, tile)) in mx.plan[lo..hi].iter().enumerate() {
-                let row0 = mb * mt;
-                let col0 = tile * nt;
-                let scol = &mx.scale4t[kchunk * mx.m..(kchunk + 1) * mx.m];
-                geom.each_c_run(c32, s, |lr, lc0, vals| {
-                    let r = row0 + lr;
-                    // Hoisted out of the column run; `scale4 * sx * v` keeps its
-                    // original left-to-right grouping, so results are bit-identical.
-                    let sxr = sx[r * mx.k_chunks + kchunk];
-                    let n0 = col0 + lc0;
-                    let sc = &scol[n0..n0 + vals.len()];
-                    let o = &mut out[r * m + n0..r * m + n0 + vals.len()];
-                    for t in 0..vals.len() {
-                        o[t] += sc[t] * sxr * vals[t] as f32;
-                    }
-                });
-            }
+            rescale_dispatch(&geom, span, c32, &mx.scale4t, sx, mx.k_chunks, m, out);
             glue_add(&GLUE_RESCALE, tr.elapsed());
         }
         (ns, disp)
@@ -545,7 +710,7 @@ mod body {
     ) -> (u64, u64) {
         use hipfire_xdna::gemm_r14::GRID;
         let geom: R14Geometry = g.geom();
-        let (mt, nt, kc) = (geom.m_tile(), geom.n_tile(), geom.k_chunk());
+        let (mt, kc) = (geom.m_tile(), geom.k_chunk());
         let (m, k, nblk) = (mx.m, mx.k, geom.nblk);
         let tq = std::time::Instant::now();
         quantize_row_chunked(x, mx.rows, k, kc, qa, sx);
@@ -568,21 +733,26 @@ mod body {
                 let lo = d * nblk;
                 let hi = (lo + nblk).min(mx.plan.len());
                 let tp = std::time::Instant::now();
-                let abuf = g.a_mut_p(p);
-                let mut prev: Option<(usize, usize, usize)> = None;
-                for (s, &(mb, c, _)) in mx.plan[lo..hi].iter().enumerate() {
-                    if let Some((pmb, pc, ps)) = prev {
-                        if pmb == mb && pc == c {
-                            for i in 0..GRID {
-                                let (base, off) = (i * geom.at(), geom.ab());
-                                let (src, dst) = (base + ps * off, base + s * off);
-                                abuf.copy_within(src..src + off, dst);
+                let span = &mx.plan[lo..hi];
+                if THREAD_PACK.load(std::sync::atomic::Ordering::Relaxed) {
+                    pack_dispatch_threaded(&geom, span, qa, k, g.a_mut_p(p));
+                } else {
+                    let abuf = g.a_mut_p(p);
+                    let mut prev: Option<(usize, usize, usize)> = None;
+                    for (s, &(mb, c, _)) in span.iter().enumerate() {
+                        if let Some((pmb, pc, ps)) = prev {
+                            if pmb == mb && pc == c {
+                                for i in 0..GRID {
+                                    let (base, off) = (i * geom.at(), geom.ab());
+                                    let (src, dst) = (base + ps * off, base + s * off);
+                                    abuf.copy_within(src..src + off, dst);
+                                }
+                                continue;
                             }
-                            continue;
                         }
+                        geom.pack_a_slot(abuf, s, qa, k, mb * mt, c * kc);
+                        prev = Some((mb, c, s));
                     }
-                    geom.pack_a_slot(abuf, s, qa, k, mb * mt, c * kc);
-                    prev = Some((mb, c, s));
                 }
                 glue_add(&GLUE_PACK, tp.elapsed());
             }};
@@ -596,21 +766,7 @@ mod body {
                 let hi = (lo + nblk).min(mx.plan.len());
                 let tr = std::time::Instant::now();
                 let c32 = g.read_c_p(p).expect("r14 read C");
-                for (s, &(mb, kchunk, tile)) in mx.plan[lo..hi].iter().enumerate() {
-                    let row0 = mb * mt;
-                    let col0 = tile * nt;
-                    let scol = &mx.scale4t[kchunk * mx.m..(kchunk + 1) * mx.m];
-                    geom.each_c_run(c32, s, |lr, lc0, vals| {
-                        let r = row0 + lr;
-                        let sxr = sx[r * mx.k_chunks + kchunk];
-                        let n0 = col0 + lc0;
-                        let sc = &scol[n0..n0 + vals.len()];
-                        let o = &mut out[r * m + n0..r * m + n0 + vals.len()];
-                        for t in 0..vals.len() {
-                            o[t] += sc[t] * sxr * vals[t] as f32;
-                        }
-                    });
-                }
+                rescale_dispatch(&geom, &mx.plan[lo..hi], c32, &mx.scale4t, sx, mx.k_chunks, m, out);
                 glue_add(&GLUE_RESCALE, tr.elapsed());
             }};
         }
@@ -812,6 +968,17 @@ fn main() {
     let has = |k: &str| argv.iter().any(|a| a == k);
     let pipeline_glue = has("--pipeline-glue");
     let pipeline_check = has("--pipeline-check");
+    // `--thread-glue` threads the int32→f32 rescale across the rayon pool;
+    // `--thread-pack` additionally threads the A-stripe pack (the UMA-contended
+    // one); `--thread-quant` threads the on-chain per-row quant (measured
+    // regression, opt-in only). All are bit-identical by disjoint-region
+    // construction; the serial path stays the default so prior numbers reproduce.
+    let thread_glue = has("--thread-glue") || has("--thread-pack");
+    let thread_pack = has("--thread-pack");
+    let thread_quant = has("--thread-quant");
+    THREAD_GLUE.store(thread_glue, std::sync::atomic::Ordering::Relaxed);
+    THREAD_PACK.store(thread_pack, std::sync::atomic::Ordering::Relaxed);
+    THREAD_QUANT.store(thread_quant, std::sync::atomic::Ordering::Relaxed);
     // Per-block gate for the bit-identity check, set from the block loop (block 0
     // is cold — excluded). A Cell so the `gemm!` macro can read it at its
     // definition-site scope while the loop updates it each block.
@@ -1923,6 +2090,41 @@ fn main() {
             "    dispatches/block = {per_block_dispatches:.0}   per-dispatch mean = {:.0} us",
             warm * 1e6 / per_block_dispatches
         );
+    }
+
+    // Block-wall latency percentiles over the warm sustained-load samples (the
+    // cached steady state when --ctx-cache is on, else all warm blocks). Decides
+    // whether a tail-latency problem exists that CPU isolation could fix; the
+    // glue-threading A/B is read straight off p50 vs the serial baseline.
+    {
+        let mut samples: Vec<f64> = if ctx_cache && !walls_cached.is_empty() {
+            walls_cached.clone()
+        } else {
+            walls.clone()
+        };
+        if samples.len() >= 3 {
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pct = |q: f64| -> f64 {
+                // nearest-rank on the sorted warm samples
+                let idx = ((q * (samples.len() as f64 - 1.0)).round() as usize).min(samples.len() - 1);
+                samples[idx] * 1e3
+            };
+            let mean = samples.iter().sum::<f64>() / samples.len() as f64 * 1e3;
+            println!(
+                "    [latency] n={} threaded_glue={} threaded_pack={} threaded_quant={}  \
+                 p50={:.1} p90={:.1} p99={:.1} max={:.1} mean={:.1} ms  (spread {:.1}%)",
+                samples.len(),
+                thread_glue,
+                thread_pack,
+                thread_quant,
+                pct(0.50),
+                pct(0.90),
+                pct(0.99),
+                samples.last().unwrap() * 1e3,
+                mean,
+                (samples.last().unwrap() - samples[0]) / samples[0] * 100.0,
+            );
+        }
     }
 
     // ── context-cache correctness + cached-vs-recomputed wall ────────────────
