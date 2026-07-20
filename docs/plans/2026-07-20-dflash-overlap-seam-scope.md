@@ -193,23 +193,45 @@ GPU draft, losslessly).
    Prove byte-identical `02e621bd56b5`. Validates plumbing + the `draft_scratch.x`
    seam + the host feed, zero concurrency. (`--ctx-slice 32` can smoke-test
    plumbing but do not quote its τ.)
-2. **Seed-oracle measurement — the cheap go/no-go.** With the serial NPU path
-   live, dump `record_seed_oracle` TAIL/ANYPOS hit-rates (`:7489`) over a real
-   workload. This bounds Grain B's achievable overlap *before* building
-   concurrency. **If the hit-rate is low, the mispredict rate is high and the
-   phase's value shrinks — decide here, not after building threads.**
-3. **Draft-side context snapshot/restore.** Add a one-block snapshot/rewind to
-   `DflashScratch` (`target_hidden` watermark, `uploaded_target_hidden_rows`,
-   `draft_ctx_cached_rows`, `target_hidden_abs_positions`). Verify "draft on N-1
-   context → rewind → draft on correct context" reproduces the serial result
-   bit-identically. Add the **τ-regression check** here (the md5 gate cannot see
-   a rewind bug). Still no concurrency.
-4. **Concurrency via NPU worker thread.** Draft N+1 (N-1 context + predicted
-   seed) on a worker while the GPU verifies N on its stream; add the
-   match/mispredict gate using real `bonus_token`/`accept_len`. Losslessness gate
-   still `02e621bd56b5`. Measure end-to-end tok/s vs the serial NPU path and vs
-   GPU-only AR (17.46 baseline).
-5. **Compose** with ddtree width variants or async XRT dispatch — only after 1–4.
+2. ~~**Seed-oracle measurement — the cheap go/no-go.**~~ **DONE → NO-GO on
+   phases 3–4** (task #35, `b55f6c638`,
+   `benchmarks/results/dflash-seed-oracle-hitrate-20260720.md`). **TAIL_MATCH =
+   2.0% (GPU drafter) / 1.0% (NPU drafter)** over the Phase F corpus — the
+   Grain-B predicted seed (`drafted[b-1] == bonus_token`) is almost never right.
+   Blended throughput at that rate: serial (phase 1, already built) 33.2 tok/s →
+   overlap at TAIL 2% = **33.5 tok/s (+0.9%)**. The full `max(draft,verify)`
+   promise (62.8) is unreachable because the mispredict rate is ~98%.
+
+   **It is STRUCTURAL, not a drafter-quality issue** (GPU and NPU rates are
+   statistically identical): `bonus_token` is by construction either the target's
+   *correction at the rejection boundary* (the token the draft got wrong, ~70% of
+   cycles) or one position beyond a full-accept block — neither sits at a
+   predictable draft position. This **refutes the earlier "high-τ → high TAIL"
+   guess**: the highest-τ prompt (merge_sort, τ=11.3, 9/13 full-accept) has
+   TAIL=**0.000**, because high τ means *more* full-accept cycles = *worse* tail
+   prediction. ANYPOS ceiling is 22–23% (only +12% even if a predictor could hit
+   it).
+
+3. ~~**Draft-side context snapshot/restore.**~~ **NOT PROCEEDING** — gated NO-GO
+   by phase 2. Kept for the record: a one-block snapshot/rewind of `DflashScratch`
+   (`target_hidden` watermark, `uploaded_target_hidden_rows`,
+   `draft_ctx_cached_rows`, `target_hidden_abs_positions`) with a τ-regression
+   check (the md5 gate cannot see a rewind bug). Only revisit if the seed
+   predictor is redesigned (see below).
+4. ~~**Concurrency via NPU worker thread.**~~ **NOT PROCEEDING** — gated NO-GO by
+   phase 2. Would buy +0.9% over the already-shipped serial path.
+5. **Compose** with ddtree width variants or async XRT dispatch — moot while 3–4
+   are shelved.
+
+**What could rescue an overlap (out of current scope):** a seed predictor NOT
+built from the draft's own tokens — a dedicated bonus head, or top-K seed
+hedging. Hedging blows the `max(draft,verify)` budget on Phoenix; a bonus head is
+a drafter redesign. Neither is in scope; both are the only paths that move
+TAIL_MATCH off ~2%.
+
+**Landed instead: the serial NPU draft (phase 1) is the deliverable** — ~1.9×
+GPU-only AR at τ≈5, structurally lossless, already shipped. The overlap was the
+hoped-for multiplier on top; the go/no-go says it is not there on this axis.
 
 ## 9. Risks & open questions
 
