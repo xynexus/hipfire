@@ -718,7 +718,7 @@ pub fn dense_prefill_session_batch_final_logits_full_precision(
             weights.output.k,
             row_count,
         ),
-        DType::F16 | DType::BF16 | DType::Raw => gemm_fp16_or_bf16_x_f32_wmma(
+        DType::F16 | DType::BF16 | DType::Raw => gemm_raw_x_f32_auto(
             gpu,
             &weights.output.buf,
             &normed_rows,
@@ -3942,22 +3942,6 @@ pub(crate) fn kld_fp32_gqa4_attention_eligible(
         && shared_mem <= 64 * 1024
 }
 
-fn gemm_f16_x_f32_wmma_residual_batched(
-    gpu: &mut Gpu,
-    weight: &GpuTensor,
-    x: &GpuTensor,
-    y_residual: &GpuTensor,
-    scratch: &GpuTensor,
-    m: usize,
-    k: usize,
-    n: usize,
-) -> HipResult<()> {
-    let y_n = y_residual.sub_offset(0, n * m);
-    let scratch_n = scratch.sub_offset(0, n * m);
-    gpu.gemm_f16_x_f32_wmma(weight, x, &scratch_n, m, k, n)?;
-    gpu.add_inplace_f32(&y_n, &scratch_n)
-}
-
 pub(crate) fn gemm_f32_residual_batched(
     gpu: &mut Gpu,
     weight: &GpuTensor,
@@ -3974,7 +3958,19 @@ pub(crate) fn gemm_f32_residual_batched(
     gpu.add_inplace_f32(&y_n, &scratch_n)
 }
 
-fn gemm_bf16_x_bf16_wmma_residual_batched(
+pub(crate) fn gemm_raw_x_f32_auto(
+    gpu: &mut Gpu,
+    weight: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> HipResult<()> {
+    gpu.gemm_raw_x_f32_auto(weight, x, y, m, k, n)
+}
+
+pub(crate) fn gemm_raw_x_f32_residual_batched_auto(
     gpu: &mut Gpu,
     weight: &GpuTensor,
     x: &GpuTensor,
@@ -3986,45 +3982,8 @@ fn gemm_bf16_x_bf16_wmma_residual_batched(
 ) -> HipResult<()> {
     let y_n = y_residual.sub_offset(0, n * m);
     let scratch_n = scratch.sub_offset(0, n * m);
-    gpu.gemm_bf16_x_bf16_wmma(weight, x, &scratch_n, m, k, n)?;
+    gpu.gemm_raw_x_f32_auto(weight, x, &scratch_n, m, k, n)?;
     gpu.add_inplace_f32(&y_n, &scratch_n)
-}
-
-pub(crate) fn gemm_fp16_or_bf16_x_f32_wmma(
-    gpu: &mut Gpu,
-    weight: &GpuTensor,
-    x: &GpuTensor,
-    y: &GpuTensor,
-    m: usize,
-    k: usize,
-    n: usize,
-) -> HipResult<()> {
-    match weight.dtype {
-        DType::F16 | DType::Raw => gpu.gemm_f16_x_f32_wmma(weight, x, y, m, k, n),
-        DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(weight, x, y, m, k, n),
-        other => panic!("expected F16/BF16 prefill weight, got {other:?}"),
-    }
-}
-
-pub(crate) fn gemm_fp16_or_bf16_x_f32_wmma_residual_batched(
-    gpu: &mut Gpu,
-    weight: &GpuTensor,
-    x: &GpuTensor,
-    y_residual: &GpuTensor,
-    scratch: &GpuTensor,
-    m: usize,
-    k: usize,
-    n: usize,
-) -> HipResult<()> {
-    match weight.dtype {
-        DType::F16 | DType::Raw => {
-            gemm_f16_x_f32_wmma_residual_batched(gpu, weight, x, y_residual, scratch, m, k, n)
-        }
-        DType::BF16 => {
-            gemm_bf16_x_bf16_wmma_residual_batched(gpu, weight, x, y_residual, scratch, m, k, n)
-        }
-        other => panic!("expected F16/BF16 residual prefill weight, got {other:?}"),
-    }
 }
 
 // Batched single-projection GEMM for the dense fused prefill. Despite the
@@ -4044,7 +4003,7 @@ fn dense_session_prefill_gemm_full_precision(
     match weight.gpu_dtype {
         DType::F32 => gpu.gemm_f32_register_tiled(&weight.buf, x, y, weight.m, weight.k, n),
         DType::F16 | DType::BF16 | DType::Raw => {
-            gemm_fp16_or_bf16_x_f32_wmma(gpu, &weight.buf, x, y, weight.m, weight.k, n)
+            gemm_raw_x_f32_auto(gpu, &weight.buf, x, y, weight.m, weight.k, n)
         }
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&weight.buf, x, y, weight.m, weight.k, n),
         DType::MQ4G256 => {
@@ -4086,7 +4045,7 @@ fn dense_session_prefill_gemm_full_precision_residual(
             weight.k,
             n,
         ),
-        DType::F16 | DType::BF16 | DType::Raw => gemm_fp16_or_bf16_x_f32_wmma_residual_batched(
+        DType::F16 | DType::BF16 | DType::Raw => gemm_raw_x_f32_residual_batched_auto(
             gpu,
             &weight.buf,
             x,

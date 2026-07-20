@@ -868,6 +868,13 @@ dtype in the artifact.
 - **CDNA:** use its supported dense/batched backend; do not route through RDNA
   WMMA kernels.
 
+The same architecture rule applies to non-expert projections and the streamed
+KLD finalizer. `gemm_raw_x_f32_auto` selects wave32 WMMA only where the
+instruction is available and otherwise uses the family-neutral scalar
+F16/BF16-weight x F32-activation kernel. The portable source compile-checks for
+gfx906, gfx1030, gfx1100, gfx1151, gfx1201, and gfx942; admitted-path channel
+execution remains part of the hardware evidence ladder.
+
 The baseline must be correct on the portability matrix before an arch-specific
 fast path is admitted. Kernel optimization follows channel test -> coherence
 gate -> fresh-process speed gate, with one tuning lever per change.
@@ -1231,7 +1238,7 @@ does not mean the production artifact or admission ladder is complete.
 | 7. Shared grouped-MoE substrate | Mechanism proven; serving gate pending | Scratch/routing/capture live in `hipfire-runtime`, the routed executor in `hipfire-dispatch`, and Qwen admits K=8/K=10. Production exercises raw K=10; matched grouped-versus-reference serving parity remains required after the GPU is free. |
 | 8. Second family | Proven | Gemma3-text uses the same engine/CLI, completed a 62-layer pause/resume stream, and completed a bounded calibrated second-pass join without a generic family branch. |
 | 9. Resident/streamed parity and quality | Tooling complete; evidence pending | `collect_artifacts --job-from <streamed.calib.hfq>` now drives Qwen3.5 and Gemma3 resident oracles from the exact serialized independent-sample job, resetting state per sample and emitting the canonical non-terminal KLD map. `hipfire-coexistence artifact compare-calibration` provides the family-neutral full-tensor gate with mandatory matched corpus/sample provenance, logical dense/compact Hessian comparison, exact KLD indices, finite-value enforcement, normalized resident/streamed per-layer router parity, and bounded mismatch reporting. Opt-in bounded `.residuals.hfq` sidecars plus `artifact compare-residuals` cover exact row provenance and tolerance-bound post-layer residuals without bloating production artifacts; the resident Qwen oracle now explicitly uses the same FP32 DeltaNet-state contract as the streamed teacher. Matched Qwen/Gemma runs, expert floor/cap sweeps, and held-out KLD/PPL comparisons still await the production GPU. |
-| 10. Precision portability | Partial | BF16/F16 conversion tests and raw grouped-kernel compile coverage pass for RDNA2/3/4 and CDNA targets. Only gfx1151 has channel execution evidence; admitted-path execution or an honest rejection is still needed on the remaining classes. |
+| 10. Precision portability | Partial | BF16/F16 conversion tests plus both grouped-expert and family-neutral dense/KLD raw-kernel compile coverage pass for RDNA2/3/4 and CDNA targets. Dense projections now select WMMA only on capable architectures and otherwise use the scalar F16/BF16 fallback. Only gfx1151 has channel execution evidence; admitted-path execution or an honest rejection is still needed on the remaining classes. |
 | 11. Native workflow documentation | Proven | `MODEL-INDUCTION.md` and `QUANTIZE.md` name native calibration as default, Python as oracle/tooling only, and `oq4.25++` as the default quant. |
 
 Induction artifacts match that audit: both typed DFlash sidecars exist and the

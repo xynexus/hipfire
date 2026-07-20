@@ -265,11 +265,8 @@ impl CalibrationFinalizer for RmsNormLmHeadFinalizer {
             match lm_head.gpu_dtype {
                 DType::F32 => gpu
                     .gemm_f32_register_tiled(&weight, &normed, &logits, tile_rows, self.dim, rows),
-                DType::F16 => {
-                    gpu.gemm_f16_x_f32_wmma(&weight, &normed, &logits, tile_rows, self.dim, rows)
-                }
-                DType::BF16 => {
-                    gpu.gemm_bf16_x_bf16_wmma(&weight, &normed, &logits, tile_rows, self.dim, rows)
+                DType::F16 | DType::BF16 => {
+                    gpu.gemm_raw_x_f32_auto(&weight, &normed, &logits, tile_rows, self.dim, rows)
                 }
                 dtype => {
                     return Err(CalibError::InvalidSourcePlan(format!(

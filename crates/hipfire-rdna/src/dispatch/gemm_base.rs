@@ -5,11 +5,133 @@
 //! Base-dtype GEMM dispatch (f16/bf16/f32, incl. WMMA + train). Pure move (Phase 1 M6).
 
 use super::{DType, Gpu, GpuTensor};
+use crate::arch_caps::ArchCaps;
 use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawXf32Backend {
+    Wmma,
+    Portable,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::feature_flags::FeatureFlags;
+    use std::sync::Arc;
+
+    fn caps(arch: &str) -> ArchCaps {
+        ArchCaps::new(arch, Arc::new(FeatureFlags::from_env_for_test(arch)))
+    }
+
+    #[test]
+    fn raw_x_f32_backend_is_wmma_only_where_the_instruction_is_available() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert_eq!(raw_x_f32_backend(&caps(arch)), RawXf32Backend::Wmma);
+        }
+        for arch in ["gfx1030", "gfx906", "gfx908", "gfx942"] {
+            assert_eq!(raw_x_f32_backend(&caps(arch)), RawXf32Backend::Portable);
+        }
+    }
+}
+
+fn raw_x_f32_backend(arch: &ArchCaps) -> RawXf32Backend {
+    if arch.has_wmma() {
+        RawXf32Backend::Wmma
+    } else {
+        RawXf32Backend::Portable
+    }
+}
+
 impl Gpu {
+    /// Raw F16/BF16 weight x F32 activation GEMM with an architecture-honest
+    /// backend. Wave32 WMMA is retained on RDNA3/4; RDNA2/CDNA/older targets
+    /// use the scalar correctness kernel instead of attempting an unsupported
+    /// WMMA intrinsic.
+    pub fn gemm_raw_x_f32_auto(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        match (weight.dtype, raw_x_f32_backend(&self.arch_caps)) {
+            (DType::F16 | DType::Raw, RawXf32Backend::Wmma) => {
+                self.gemm_f16_x_f32_wmma(weight, x, y, m, k, batch_size)
+            }
+            (DType::BF16, RawXf32Backend::Wmma) => {
+                self.gemm_bf16_x_bf16_wmma(weight, x, y, m, k, batch_size)
+            }
+            (DType::F16 | DType::Raw | DType::BF16, RawXf32Backend::Portable) => {
+                self.gemm_raw_x_f32_portable(weight, x, y, m, k, batch_size)
+            }
+            (dtype, _) => Err(hip_bridge::HipError::new(
+                0,
+                &format!("raw F16/BF16 GEMM does not support weight dtype {dtype:?}"),
+            )),
+        }
+    }
+
+    /// Scalar raw matrix fallback used by [`Self::gemm_raw_x_f32_auto`].
+    pub fn gemm_raw_x_f32_portable(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(matches!(
+            weight.dtype,
+            DType::F16 | DType::Raw | DType::BF16
+        ));
+        assert_eq!(x.dtype, DType::F32);
+        assert_eq!(y.dtype, DType::F32);
+        assert!(m <= i32::MAX as usize && k <= i32::MAX as usize);
+        assert!(batch_size <= i32::MAX as usize);
+        let kernel_name = match weight.dtype {
+            DType::F16 | DType::Raw => "gemm_f16_x_f32_portable",
+            DType::BF16 => "gemm_bf16_x_f32_portable",
+            _ => unreachable!(),
+        };
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_RAW_X_F32_PORTABLE_SRC,
+            kernel_name,
+        )?;
+        let wp = weight.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let block = 256u32;
+        let grid_x = (m as u32).div_ceil(block);
+        let bytes = m
+            .saturating_mul(k)
+            .saturating_mul(2)
+            .saturating_add(batch_size.saturating_mul(k).saturating_mul(4))
+            .saturating_add(batch_size.saturating_mul(m).saturating_mul(4));
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_kernargs(
+            kernel_name,
+            [grid_x, batch_size as u32, 1],
+            [block, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.hip);
+        }
+        result
+    }
+
     /// FP16-weight lm_head fast path for DFlash drafts that ship F16 (not
     /// quantized) weights. Routes through `gemm_mw16_residual_wmma` with the
     /// usual memset-then-atomicAdd residual pattern.

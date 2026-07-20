@@ -3954,6 +3954,12 @@ pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
 pub const GEMM_F16_X_F16_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16_x_f16_wmma.hip");
 
+/// Scalar raw F16/BF16 weight x F32 activation fallback. Unlike the wave32
+/// WMMA kernels, this source compiles on RDNA2, RDNA3/4, CDNA, and older
+/// supported targets.
+pub const GEMM_RAW_X_F32_PORTABLE_SRC: &str =
+    include_str!("../../../kernels/src/gemm_raw_x_f32_portable.hip");
+
 /// WMMA BF16 × BF16 → F32 GEMM with (B, M) output layout.
 /// Targets gfx1100+ wave32 WMMA and consumes raw BF16 weight/input
 /// payloads. See `kernels/src/gemm_bf16_x_bf16_wmma.hip`.
