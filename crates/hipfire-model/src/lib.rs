@@ -47,6 +47,18 @@ pub struct TensorInfo {
     pub data_size: usize,
 }
 
+/// Physical byte range backing a tensor in a [`ModelSource`].
+///
+/// Offline streaming tools use this to plan shard ownership without reading
+/// tensor payloads. `data_offset` remains source-relative metadata; this type
+/// makes the backing file explicit for multi-shard sources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TensorStorageLocation {
+    pub path: PathBuf,
+    pub byte_offset: u64,
+    pub byte_len: u64,
+}
+
 /// Quantization config parsed from HFQ metadata or HF config.json.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QuantConfig {
@@ -445,6 +457,12 @@ pub trait ModelSource {
     /// Look up a tensor by name. Returns metadata + byte slice.
     fn tensor_data(&self, name: &str) -> Option<(&TensorInfo, &[u8])>;
 
+    /// Advise the source that a tensor payload is no longer needed by the
+    /// current streaming consumer. File-backed implementations should release
+    /// page-cache residency without invalidating the mapped address range.
+    /// The default is a no-op for resident/in-memory sources.
+    fn release_tensor_pages(&self, _name: &str) {}
+
     /// Look up tensor metadata without data (for pre-screening).
     fn tensor_info(&self, name: &str) -> Option<&TensorInfo>;
 
@@ -453,6 +471,18 @@ pub trait ModelSource {
 
     /// Path to the model directory or file (for weight pager, logging).
     fn path(&self) -> &Path;
+
+    /// Physical byte range for a tensor, when the source can expose one.
+    /// Single-file sources get a useful default; multi-shard sources must
+    /// override this method with the actual shard path.
+    fn tensor_storage(&self, name: &str) -> Option<TensorStorageLocation> {
+        let info = self.tensor_info(name)?;
+        Some(TensorStorageLocation {
+            path: self.path().to_path_buf(),
+            byte_offset: info.data_offset as u64,
+            byte_len: info.data_size as u64,
+        })
+    }
 
     /// Path to tokenizer.json (if available in the model directory).
     /// HFQ embeds the tokenizer in metadata; safetensors models ship it
@@ -1957,19 +1987,24 @@ fn is_chat_template_file_name(file: &str) -> bool {
 }
 
 fn triattn_matches_model(sidecar_file: &str, model_file: &str) -> bool {
-    Path::new(model_file)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .map(|stem| sidecar_file == format!("{stem}.triattn.hfq"))
-        .unwrap_or(false)
+    model_sidecar_identity(model_file)
+        .is_some_and(|identity| sidecar_file == format!("{identity}.triattn.hfq"))
 }
 
 fn draft_matches_model(draft_file: &str, model_file: &str) -> bool {
-    Path::new(model_file)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .map(|stem| draft_file == format!("{stem}.dflash.hfq"))
-        .unwrap_or(false)
+    dflash_draft_candidates(model_file)
+        .iter()
+        .any(|candidate| candidate == draft_file)
+}
+
+fn model_sidecar_identity(model_file: &str) -> Option<String> {
+    let stem = model_file.strip_suffix(".hfq")?;
+    let groups = stem.split('.').collect::<Vec<_>>();
+    let quant_start = find_canonical_quant_group(&groups)
+        .map(|(start, _)| start)
+        .unwrap_or(groups.len());
+    let identity = groups[..quant_start].join(".");
+    (!identity.is_empty()).then_some(identity)
 }
 
 fn template_matches_model(template_file: &str, model_file: &str) -> bool {
@@ -2158,27 +2193,13 @@ fn dflash_draft_search_dirs(model_dir: &Path) -> Vec<PathBuf> {
 
 /// Return candidate DFlash draft sidecar filenames for a target model filename.
 pub fn dflash_draft_candidates(filename: &str) -> Vec<String> {
-    let Some(target) = parse_dflash_target(filename) else {
+    let Some(identity) = model_sidecar_identity(filename) else {
         return Vec::new();
     };
-
-    let mut quants = vec![target.quant.clone()];
-    if target.family == "qwen3" && target.quant == "mq3" {
-        quants.push("mq4".to_string());
-    } else if target.family == "qwen3" && target.quant == "mq4" {
-        quants.push("mq3".to_string());
-    } else if target.family == "lfm2" {
-        match target.quant.as_str() {
-            "oq4" | "oq4+" => quants.push("mq4".to_string()),
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    for q in quants {
-        out.push(target.format_candidate(&q, "dflash"));
-        out.push(target.format_candidate(&q, "draft"));
-    }
-    out
+    ["BF16", "F16", "MQ6", "MQ4", "MQ3"]
+        .into_iter()
+        .map(|quant| format!("{identity}-{quant}.dflash.hfq"))
+        .collect()
 }
 
 /// Discover a DSpark drafter sidecar next to a target model artifact.
@@ -2839,7 +2860,16 @@ mod tests {
     fn role_sidecars_are_not_primary_models() {
         assert!(is_role_sidecar_name("qwen3.5-9b-mq4.mtp.hfq"));
         assert!(is_role_sidecar_name("qwen3.5-9b-mq4.triattn.hfq"));
+        assert!(is_role_sidecar_name("Qwen3.5-397B-A17B-BF16.dflash.hfq"));
         assert!(!is_role_sidecar_name("qwen3.5-9b-mq4.hfq"));
+        assert!(draft_matches_model(
+            "Qwen3.5-397B-A17B-BF16.dflash.hfq",
+            "Qwen3.5-397B-A17B.oq4++.hfq"
+        ));
+        assert!(triattn_matches_model(
+            "Qwen3.5-397B-A17B.triattn.hfq",
+            "Qwen3.5-397B-A17B.oq4++.hfq"
+        ));
     }
 
     #[test]
@@ -3681,24 +3711,24 @@ mod tests {
     }
 
     #[test]
-    fn dflash_draft_discovery_uses_adjacent_qwen_sidecar_names() {
+    fn dflash_draft_discovery_uses_canonical_independent_sidecar_names() {
         assert_eq!(
-            dflash_draft_candidates("qwen3.5-27b-mq4.hfq"),
+            dflash_draft_candidates("Qwen3.5-27B.mq4.hfq"),
             vec![
-                "qwen3.5-27b-mq4.dflash.hfq".to_string(),
-                "qwen3.5-27b-mq4.draft.hfq".to_string(),
-                "qwen3.5-27b-mq3.dflash.hfq".to_string(),
-                "qwen3.5-27b-mq3.draft.hfq".to_string(),
+                "Qwen3.5-27B-BF16.dflash.hfq".to_string(),
+                "Qwen3.5-27B-F16.dflash.hfq".to_string(),
+                "Qwen3.5-27B-MQ6.dflash.hfq".to_string(),
+                "Qwen3.5-27B-MQ4.dflash.hfq".to_string(),
+                "Qwen3.5-27B-MQ3.dflash.hfq".to_string(),
             ]
         );
-        assert!(dflash_draft_candidates("qwen3.5-35b-a3b-mq4.hfq")
-            .contains(&"qwen3.5-35b-a3b-mq4.dflash.hfq".to_string()));
-        assert!(dflash_draft_candidates("llama-8b-mq4.hfq").is_empty());
+        assert!(dflash_draft_candidates("Qwen3.5-35B-A3B.mq4.hfq")
+            .contains(&"Qwen3.5-35B-A3B-BF16.dflash.hfq".to_string()));
 
         let root = temp_dir("hipfire-dflash-draft-discovery");
         fs::create_dir_all(&root).unwrap();
-        let target = root.join("qwen3.5-27b-mq4.hfq");
-        let draft = root.join("qwen3.5-27b-mq4.dflash.hfq");
+        let target = root.join("Qwen3.5-27B.mq4.hfq");
+        let draft = root.join("Qwen3.5-27B-BF16.dflash.hfq");
         fs::write(&target, "target").unwrap();
         fs::write(&draft, "draft").unwrap();
 
@@ -3712,19 +3742,17 @@ mod tests {
     }
 
     #[test]
-    fn dflash_draft_discovery_uses_lfm2_sidecar_names() {
-        let oq4 = dflash_draft_candidates("LFM2.5-350M-oq4.hfq");
-        assert!(oq4.contains(&"LFM2.5-350M-oq4.dflash.hfq".to_string()));
-        assert!(oq4.contains(&"LFM2.5-350M-mq4.dflash.hfq".to_string()));
+    fn dflash_draft_discovery_is_family_agnostic() {
+        let oq4 = dflash_draft_candidates("LFM2.5-350M.oq4.hfq");
+        assert!(oq4.contains(&"LFM2.5-350M-BF16.dflash.hfq".to_string()));
 
         let oq4_plus = dflash_draft_candidates("LFM2.5-1.2B-Thinking.oq4+.hfq");
-        assert!(oq4_plus.contains(&"LFM2.5-1.2B-Thinking.oq4+.dflash.hfq".to_string()));
-        assert!(oq4_plus.contains(&"LFM2.5-1.2B-Thinking.mq4.dflash.hfq".to_string()));
+        assert!(oq4_plus.contains(&"LFM2.5-1.2B-Thinking-F16.dflash.hfq".to_string()));
 
         let root = temp_dir("hipfire-lfm2-dflash-draft-discovery");
         fs::create_dir_all(&root).unwrap();
-        let target = root.join("LFM2.5-350M-oq4.hfq");
-        let draft = root.join("LFM2.5-350M-oq4.dflash.hfq");
+        let target = root.join("LFM2.5-350M.oq4.hfq");
+        let draft = root.join("LFM2.5-350M-BF16.dflash.hfq");
         fs::write(&target, "target").unwrap();
         fs::write(&draft, "draft").unwrap();
 

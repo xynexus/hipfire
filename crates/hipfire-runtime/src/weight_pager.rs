@@ -43,10 +43,15 @@ use std::fs::File;
 use std::path::Path;
 
 use hip_bridge::HipResult;
+use hipfire_quant_format::QuantType;
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 use crate::hfq::HfqFile;
-use crate::hfq_modules::{HfqModuleKind, HfqModuleRecord};
+use crate::hfq_modules::{HfqModuleKind, HfqModuleRecord, HfqModuleTensor};
+use crate::oq_moe::{
+    oq4_canonical_to_moe_blocks, oq4_moe_packed_len, oq8_canonical_to_moe_blocks,
+    oq8_moe_packed_len, oqplus_compact_to_moe_oq8_blocks,
+};
 
 const DIRECT_IO_ALIGN: usize = 4096;
 
@@ -162,6 +167,12 @@ pub trait Transport: Send {
         len: usize,
         gpu: &mut Gpu,
     ) -> HipResult<(GpuTensor, TransferHandle)>;
+
+    /// Read a byte range into host memory for formats whose portable HFQ bytes
+    /// must be converted before upload. This is deliberately separate from
+    /// `fetch`: pure formats retain direct/pinned transfer behavior, while a
+    /// canonical routed OQ module takes the explicit host-repack path.
+    fn read_host(&mut self, hfq_offset: usize, len: usize, gpu: &mut Gpu) -> HipResult<Vec<u8>>;
 
     /// Block until every handle in `handles` has completed. v0.1 no-op
     /// because `fetch` is synchronous; defined for forward compatibility.
@@ -460,6 +471,20 @@ impl Transport for DirectH2DTransport {
         ))
     }
 
+    fn read_host(&mut self, hfq_offset: usize, len: usize, _gpu: &mut Gpu) -> HipResult<Vec<u8>> {
+        let (rel, copy_len) = self.read_into_staging(hfq_offset, len).map_err(|e| {
+            hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "direct host read {} bytes at offset {} from {:?}: {}",
+                    len, hfq_offset, self.path, e
+                ),
+            )
+        })?;
+        let staging = self.staging.as_ref().expect("direct staging");
+        Ok(staging.as_slice()[rel..rel + copy_len].to_vec())
+    }
+
     fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
         Ok(())
     }
@@ -484,6 +509,16 @@ impl Transport for PreadH2DTransport {
         //    — that interpretation belongs to `WeightTensor` at the call site.
         let tensor = gpu.upload_raw(&self.staging[..len], &[len])?;
         Ok((tensor, self.next_handle()))
+    }
+
+    fn read_host(&mut self, hfq_offset: usize, len: usize, _gpu: &mut Gpu) -> HipResult<Vec<u8>> {
+        self.pread_into_staging(hfq_offset, len).map_err(|e| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("pread {} bytes at offset {}: {}", len, hfq_offset, e),
+            )
+        })?;
+        Ok(self.staging[..len].to_vec())
     }
 
     fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
@@ -525,6 +560,22 @@ impl Transport for PinnedH2DTransport {
         ))
     }
 
+    fn read_host(&mut self, hfq_offset: usize, len: usize, gpu: &mut Gpu) -> HipResult<Vec<u8>> {
+        self.ensure_staging(len, gpu)?;
+        self.pread_into_staging(hfq_offset, len).map_err(|e| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("pinned pread {} bytes at offset {}: {}", len, hfq_offset, e),
+            )
+        })?;
+        Ok(self
+            .staging
+            .as_ref()
+            .ok_or_else(|| hip_bridge::HipError::new(0, "pinned staging buffer missing"))?
+            .as_slice()[..len]
+            .to_vec())
+    }
+
     fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
         Ok(())
     }
@@ -536,6 +587,193 @@ fn align_down(v: usize, align: usize) -> usize {
 
 fn align_up(v: usize, align: usize) -> usize {
     (v + align - 1) & !(align - 1)
+}
+
+const MODULE_TENSOR_ALIGN: usize = 32;
+
+#[derive(Debug)]
+struct PreparedExpertModule {
+    bytes: Vec<u8>,
+    gate_up_rel: usize,
+    down_rel: usize,
+}
+
+fn module_tensor_shape(tensor: &HfqModuleTensor) -> Result<(usize, usize), WeightPagerError> {
+    let [m, k] = tensor.shape.as_slice() else {
+        return Err(WeightPagerError::InvalidModule(format!(
+            "routed tensor {} must be rank two, got {:?}",
+            tensor.name, tensor.shape
+        )));
+    };
+    Ok((*m as usize, *k as usize))
+}
+
+fn module_tensor_resident_len(tensor: &HfqModuleTensor) -> Result<usize, WeightPagerError> {
+    let Some(quant_type) = QuantType::from_code(tensor.quant_type) else {
+        return Err(WeightPagerError::InvalidModule(format!(
+            "routed tensor {} has unknown quant_type {}",
+            tensor.name, tensor.quant_type
+        )));
+    };
+    match quant_type {
+        QuantType::Oq4G256 => {
+            let (m, k) = module_tensor_shape(tensor)?;
+            oq4_moe_packed_len(m, k).map_err(WeightPagerError::InvalidModule)
+        }
+        QuantType::Oq8G256 | QuantType::OqPlusCompact => {
+            let (m, k) = module_tensor_shape(tensor)?;
+            oq8_moe_packed_len(m, k).map_err(WeightPagerError::InvalidModule)
+        }
+        // The arch-combined dense OQ4 layout contains an indexed tail, but its
+        // relative offset is not represented by hfqm_modules.v1. Refuse it
+        // rather than point an indexed kernel at the dense prefix.
+        QuantType::Oq4G256ArchPacked => Err(WeightPagerError::InvalidModule(format!(
+            "routed tensor {} uses dense Oq4G256ArchPacked storage; regenerate a canonical pageable artifact",
+            tensor.name
+        ))),
+        QuantType::OqPlusG256 => Err(WeightPagerError::InvalidModule(format!(
+            "routed tensor {} uses OqPlusG256 storage without an indexed expert contract; use OqPlusCompact or Oq8G256",
+            tensor.name
+        ))),
+        _ => Ok(tensor.data_size),
+    }
+}
+
+fn module_requires_host_repack(module: &HfqModuleRecord) -> bool {
+    module.tensors.iter().any(|tensor| {
+        matches!(
+            QuantType::from_code(tensor.quant_type),
+            Some(QuantType::Oq4G256 | QuantType::Oq8G256 | QuantType::OqPlusCompact)
+        )
+    })
+}
+
+fn module_resident_len(module: &HfqModuleRecord) -> Result<usize, WeightPagerError> {
+    if !module_requires_host_repack(module) {
+        // Still validate unsupported transformed storage before accepting its
+        // disk length as the resident layout.
+        for tensor in &module.tensors {
+            module_tensor_resident_len(tensor)?;
+        }
+        return Ok(module.data_size);
+    }
+    let mut tensors = module.tensors.iter().collect::<Vec<_>>();
+    tensors.sort_by_key(|tensor| tensor.rel_offset);
+    let mut len = 0usize;
+    for tensor in tensors {
+        len = align_up(len, MODULE_TENSOR_ALIGN);
+        len = len
+            .checked_add(module_tensor_resident_len(tensor)?)
+            .ok_or_else(|| {
+                WeightPagerError::InvalidModule(format!(
+                    "resident byte length overflows for module {}",
+                    module.module_id
+                ))
+            })?;
+    }
+    Ok(len)
+}
+
+fn prepare_expert_module(
+    module: &HfqModuleRecord,
+    disk_bytes: &[u8],
+) -> Result<PreparedExpertModule, WeightPagerError> {
+    if disk_bytes.len() != module.data_size {
+        return Err(WeightPagerError::InvalidModule(format!(
+            "module {} read {} bytes, expected {}",
+            module.module_id,
+            disk_bytes.len(),
+            module.data_size
+        )));
+    }
+    let mut tensors = module.tensors.iter().collect::<Vec<_>>();
+    tensors.sort_by_key(|tensor| tensor.rel_offset);
+    let capacity = module_resident_len(module)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut gate_up_rel = None;
+    let mut down_rel = None;
+
+    for tensor in tensors {
+        let source_end = tensor
+            .rel_offset
+            .checked_add(tensor.data_size)
+            .ok_or_else(|| {
+                WeightPagerError::InvalidModule(format!(
+                    "tensor {} source range overflows",
+                    tensor.name
+                ))
+            })?;
+        let source = disk_bytes
+            .get(tensor.rel_offset..source_end)
+            .ok_or_else(|| {
+                WeightPagerError::InvalidModule(format!(
+                    "tensor {} source range {}..{} exceeds module {} bytes",
+                    tensor.name, tensor.rel_offset, source_end, module.data_size
+                ))
+            })?;
+        let aligned = align_up(bytes.len(), MODULE_TENSOR_ALIGN);
+        bytes.resize(aligned, 0);
+        let resident_rel = bytes.len();
+        let quant_type = QuantType::from_code(tensor.quant_type).ok_or_else(|| {
+            WeightPagerError::InvalidModule(format!(
+                "routed tensor {} has unknown quant_type {}",
+                tensor.name, tensor.quant_type
+            ))
+        })?;
+        let transformed = match quant_type {
+            QuantType::Oq4G256 => {
+                let (m, k) = module_tensor_shape(tensor)?;
+                oq4_canonical_to_moe_blocks(source, m, k)
+                    .map_err(WeightPagerError::InvalidModule)?
+            }
+            QuantType::Oq8G256 => {
+                let (m, k) = module_tensor_shape(tensor)?;
+                oq8_canonical_to_moe_blocks(source, m, k)
+                    .map_err(WeightPagerError::InvalidModule)?
+            }
+            QuantType::OqPlusCompact => {
+                let (m, k) = module_tensor_shape(tensor)?;
+                oqplus_compact_to_moe_oq8_blocks(source, m, k)
+                    .map_err(WeightPagerError::InvalidModule)?
+            }
+            QuantType::Oq4G256ArchPacked | QuantType::OqPlusG256 => {
+                // Produce the precise diagnostic shared with preflight.
+                module_tensor_resident_len(tensor)?;
+                unreachable!("unsupported OQ module storage returned a resident length")
+            }
+            _ => source.to_vec(),
+        };
+        bytes.extend_from_slice(&transformed);
+        if tensor.name.contains("gate_up_proj") {
+            gate_up_rel = Some(resident_rel);
+        }
+        if tensor.name.contains("down_proj") {
+            down_rel = Some(resident_rel);
+        }
+    }
+
+    if bytes.len() != capacity {
+        return Err(WeightPagerError::InvalidModule(format!(
+            "module {} prepared {} resident bytes, planned {capacity}",
+            module.module_id,
+            bytes.len()
+        )));
+    }
+    Ok(PreparedExpertModule {
+        bytes,
+        gate_up_rel: gate_up_rel.ok_or_else(|| {
+            WeightPagerError::InvalidModule(format!(
+                "module {} missing gate_up_proj tensor",
+                module.module_id
+            ))
+        })?,
+        down_rel: down_rel.ok_or_else(|| {
+            WeightPagerError::InvalidModule(format!(
+                "module {} missing down_proj tensor",
+                module.module_id
+            ))
+        })?,
+    })
 }
 
 fn read_direct_allow_eof(file: &File, dst: &mut [u8], offset: u64) -> std::io::Result<usize> {
@@ -808,6 +1046,7 @@ impl WeightPager {
                 module.module_id
             )));
         }
+        module_resident_len(&module)?;
         self.module_catalog
             .insert(ExpertModuleKey { layer, expert }, module);
         self.module_stats.registered_modules = self.module_catalog.len();
@@ -856,7 +1095,7 @@ impl WeightPager {
                 .module_catalog
                 .get(&key)
                 .ok_or(WeightPagerError::ModuleNotRegistered(key))?;
-            need = need.saturating_add(module.data_size as u64);
+            need = need.saturating_add(module_resident_len(module)? as u64);
         }
         self.would_fit(need)
     }
@@ -874,8 +1113,8 @@ impl WeightPager {
             .module_catalog
             .iter()
             .filter(|(key, _)| key.layer == layer)
-            .map(|(_, m)| m.data_size as u64)
-            .collect();
+            .map(|(_, module)| module_resident_len(module).map(|size| size as u64))
+            .collect::<Result<Vec<_>, _>>()?;
         sizes.sort_unstable_by(|a, b| b.cmp(a));
         let need: u64 = sizes.iter().take(k).sum();
         self.would_fit(need)
@@ -965,21 +1204,31 @@ impl WeightPager {
             .get(&key)
             .cloned()
             .ok_or(WeightPagerError::ModuleNotRegistered(key))?;
-        let need = module.data_size as u64;
+        let need = module_resident_len(&module)? as u64;
         self.would_fit(need)?;
         if self.config.vram_budget_bytes != u64::MAX
             && self.vram_used_bytes.saturating_add(need) > self.config.vram_budget_bytes
         {
             self.evict_lru_until(need, gpu)?;
         }
-        let (tensor, _handle) = self
-            .transport
-            .fetch(module.data_offset, module.data_size, gpu)?;
+        let (tensor, gate_up_rel, down_rel) = if module_requires_host_repack(&module) {
+            let disk_bytes = self
+                .transport
+                .read_host(module.data_offset, module.data_size, gpu)?;
+            let prepared = prepare_expert_module(&module, &disk_bytes)?;
+            let tensor = gpu.upload_raw(&prepared.bytes, &[prepared.bytes.len()])?;
+            (tensor, prepared.gate_up_rel, prepared.down_rel)
+        } else {
+            let (tensor, _handle) =
+                self.transport
+                    .fetch(module.data_offset, module.data_size, gpu)?;
+            let gate_up_rel = find_module_tensor_rel_ptr(&module, "gate_up_proj")
+                .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
+            let down_rel = find_module_tensor_rel_ptr(&module, "down_proj")
+                .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
+            (tensor, gate_up_rel, down_rel)
+        };
         let base = tensor.buf.as_ptr() as usize;
-        let gate_up_rel = find_module_tensor_rel_ptr(&module, "gate_up_proj")
-            .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
-        let down_rel = find_module_tensor_rel_ptr(&module, "down_proj")
-            .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
         self.resident_modules.insert(
             key,
@@ -997,7 +1246,7 @@ impl WeightPager {
                 "[weight_pager] cold-load module layer={} expert={} ({} bytes) — {} modules resident, {} bytes used",
                 key.layer,
                 key.expert,
-                module.data_size,
+                need,
                 self.resident_modules.len(),
                 self.vram_used_bytes
             );
@@ -1494,6 +1743,68 @@ mod tests {
             Err(WeightPagerError::InvalidModule(_))
         ));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn canonical_oq4_module_prepares_indexed_blocks_and_resident_offsets() {
+        let mut gate_up = vec![0u8; 130];
+        gate_up[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        gate_up[2..].fill(0x21);
+        let mut down = vec![0u8; 130];
+        down[..2].copy_from_slice(&0x3800u16.to_le_bytes());
+        down[2..].fill(0x87);
+
+        let mut disk = gate_up.clone();
+        disk.resize(160, 0);
+        disk.extend_from_slice(&down);
+        let module = HfqModuleRecord {
+            module_id: "layers.0.experts.0".to_string(),
+            kind: HfqModuleKind::RoutedExpert,
+            layer: Some(0),
+            expert: Some(0),
+            placement_policy: Some("lazy_lru".to_string()),
+            data_offset: 4096,
+            data_size: disk.len(),
+            tensors: vec![
+                HfqModuleTensor {
+                    name: "model.layers.0.mlp.experts.0.gate_up_proj.weight".to_string(),
+                    quant_type: QuantType::Oq4G256.code(),
+                    shape: vec![1, 256],
+                    group_size: 256,
+                    rel_offset: 0,
+                    data_size: gate_up.len(),
+                },
+                HfqModuleTensor {
+                    name: "model.layers.0.mlp.experts.0.down_proj.weight".to_string(),
+                    quant_type: QuantType::Oq4G256.code(),
+                    shape: vec![1, 256],
+                    group_size: 256,
+                    rel_offset: 160,
+                    data_size: down.len(),
+                },
+            ],
+        };
+
+        assert_eq!(module_resident_len(&module).unwrap(), 292);
+        let prepared = prepare_expert_module(&module, &disk).unwrap();
+        assert_eq!(prepared.bytes.len(), 292);
+        assert_eq!(prepared.gate_up_rel, 0);
+        assert_eq!(prepared.down_rel, 160);
+        assert_eq!(&prepared.bytes[..4], &1.0f32.to_le_bytes());
+        assert_eq!(&prepared.bytes[4..132], &gate_up[2..]);
+        assert_eq!(&prepared.bytes[160..164], &0.5f32.to_le_bytes());
+        assert_eq!(&prepared.bytes[164..292], &down[2..]);
+    }
+
+    #[test]
+    fn routed_module_rejects_dense_arch_packed_oq4_storage() {
+        let mut module = routed_module(0, 0);
+        module.tensors[0].quant_type = QuantType::Oq4G256ArchPacked.code();
+        assert!(matches!(
+            module_resident_len(&module),
+            Err(WeightPagerError::InvalidModule(message))
+                if message.contains("dense Oq4G256ArchPacked")
+        ));
     }
 
     /// Regression: a need bigger than the entire budget must NOT cause

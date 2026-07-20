@@ -8,6 +8,7 @@
 //! `forward_prefill_chunk` (in prefill_chunk.rs) on the prefill path.
 
 use super::*;
+use hipfire_runtime::moe::grouped as grouped_moe;
 
 /// Per-layer batched intermediates used by `forward_prefill_batch`. Each
 /// row is one token in the batch; rows are contiguous [N × K] blocks so
@@ -81,10 +82,14 @@ pub struct PrefillBatchScratch {
     pub moe_shared_gate_batch: Option<GpuTensor>,   // [N × smi]
     pub moe_shared_up_batch: Option<GpuTensor>,     // [N × smi]
     pub moe_shared_rot_batch: Option<GpuTensor>,    // [N × smi] — FWHT(silu(gate) * up)
-    pub moe_topk_indices_batch: Option<GpuTensor>,  // [N × k_top] i32 in F32 slots
+    pub moe_topk_indices_batch: Option<GpuTensor>,  // [N × k_top] i32, Raw byte storage
     pub moe_topk_weights_batch: Option<GpuTensor>,  // [N × k_top]
     pub moe_gate_batch: Option<GpuTensor>,          // [N × k_top × mi]
     pub moe_up_batch: Option<GpuTensor>,            // [N × k_top × mi]
+    /// Unrotated SwiGLU output. Mixed low-bit + BF16/F16 expert layers need
+    /// this alongside `moe_rot_batch`: raw down projections consume this
+    /// basis while quantized siblings consume the rotated basis.
+    pub moe_hidden_batch: Option<GpuTensor>, // [N × k_top × mi]
     pub moe_rot_batch: Option<GpuTensor>,           // [N × k_top × mi]
     // Atomic-free MoE down expansion buffer — [N × k_top × dim] f32.
     // Paired with `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` +
@@ -106,13 +111,7 @@ pub struct PrefillBatchScratch {
     //   moe_sorted_slot_index:   [m_total_max] i32 (flat slot or -1 padding)
     //   moe_expert_tile_ids:     [m_total_max / 16] i32 (per-tile expert id)
     //   moe_y_gate_up_grouped:   [m_total_max × (2*mi)] f32 (grouped GEMM output)
-    pub moe_expert_token_counts: Option<GpuTensor>,
-    pub moe_expert_offsets: Option<GpuTensor>,
-    pub moe_sorted_slot_index: Option<GpuTensor>,
-    pub moe_inverse_perm: Option<GpuTensor>, // [total_slots] i32: flat → sorted_pos
-    pub moe_expert_tile_ids: Option<GpuTensor>,
-    pub moe_y_gate_up_grouped: Option<GpuTensor>, // [m_total × (2*mi)]
-    pub moe_y_down_grouped: Option<GpuTensor>,    // [m_total × dim] for the down step
+    pub grouped_moe_scratch: Option<grouped_moe::GroupedMoeScratch>,
 
     // ── Tree-aware LA scratch (Phase 3b of Task #101) ──
     // Per-token S-state tape consumed by gated_delta_net_q8_tree kernel
@@ -1710,7 +1709,15 @@ pub fn build_dense_prefill_session_batch_rounds(
     inputs: &[DensePrefillSessionBatchInput<'_>],
     max_batch: usize,
 ) -> Result<Vec<DensePrefillSessionBatchRound>, String> {
-    if inputs.len() < 2 {
+    build_prefill_session_batch_rounds(inputs, max_batch, 2)
+}
+
+fn build_prefill_session_batch_rounds(
+    inputs: &[DensePrefillSessionBatchInput<'_>],
+    max_batch: usize,
+    min_sessions: usize,
+) -> Result<Vec<DensePrefillSessionBatchRound>, String> {
+    if inputs.len() < min_sessions {
         return Err(
             "dense session prefill batch requires at least two independent sessions".to_string(),
         );
@@ -1757,6 +1764,28 @@ pub fn build_dense_prefill_session_batch_execution_plan(
     max_batch: usize,
 ) -> Result<DensePrefillSessionBatchExecutionPlan, String> {
     let rounds = build_dense_prefill_session_batch_rounds(inputs, max_batch)?;
+    Ok(prefill_session_batch_execution_plan_from_rounds(rounds))
+}
+
+/// Calibration consumes every scheduled row through the routed batch kernels,
+/// including a one-session final group and a ragged one-session tail. Unlike
+/// the server plan, there is no serial full-model fallback after the resident
+/// layer is released, so every round is represented in the pointer tables.
+pub fn build_calibration_session_batch_execution_plan(
+    inputs: &[DensePrefillSessionBatchInput<'_>],
+    max_batch: usize,
+) -> Result<DensePrefillSessionBatchExecutionPlan, String> {
+    let rounds = build_prefill_session_batch_rounds(inputs, max_batch, 1)?;
+    let mut plan = prefill_session_batch_execution_plan_from_rounds(rounds);
+    plan.multi_state_prefix_rounds = plan.rounds.len();
+    plan.multi_state_prefix_rows = plan.total_rows;
+    plan.singleton_tail = None;
+    Ok(plan)
+}
+
+fn prefill_session_batch_execution_plan_from_rounds(
+    rounds: Vec<DensePrefillSessionBatchRound>,
+) -> DensePrefillSessionBatchExecutionPlan {
     let mut total_rows = 0usize;
     let mut max_rows_per_round = 0usize;
     let mut multi_state_rounds = 0usize;
@@ -1807,7 +1836,7 @@ pub fn build_dense_prefill_session_batch_execution_plan(
                 rows,
             })
         });
-    Ok(DensePrefillSessionBatchExecutionPlan {
+    DensePrefillSessionBatchExecutionPlan {
         rounds,
         state_routes,
         total_rows,
@@ -1816,7 +1845,7 @@ pub fn build_dense_prefill_session_batch_execution_plan(
         multi_state_prefix_rounds,
         multi_state_prefix_rows,
         singleton_tail,
-    })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2357,6 +2386,127 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
     sessions: usize,
     max_ctx_len: usize,
 ) -> HipResult<()> {
+    forward_grouped_moe_session_batch_layers(
+        gpu,
+        Some(weights),
+        config,
+        pbs,
+        device_tables,
+        route_shape,
+        row_count,
+        sessions,
+        max_ctx_len,
+        None,
+        None,
+        true,
+        true,
+        None,
+        None,
+        true,
+        true,
+    )
+}
+
+/// Execute one already-embedded grouped-MoE layer over independent session
+/// rows. The supplied config is a one-layer view, so KV and DeltaNet state
+/// indices are zero while `logical_layer_idx` preserves capture identity.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_streamed_grouped_moe_layer_batch(
+    gpu: &mut Gpu,
+    layer: &LayerWeights,
+    logical_layer_idx: usize,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    row_count: usize,
+    sessions: usize,
+    max_ctx_len: usize,
+    capture: Option<&dyn hipfire_dispatch::families::moe::MoePrefillCapture>,
+    dense_capture: Option<(
+        &hipfire_runtime::calibration::CalibCollector,
+        &hipfire_runtime::calibration::contracts::CaptureRegistry,
+    )>,
+) -> HipResult<()> {
+    if config.n_layers != 1 || config.layer_types.len() != 1 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "streamed grouped-MoE execution requires a one-layer config view",
+        ));
+    }
+    forward_grouped_moe_session_batch_layers(
+        gpu,
+        None,
+        config,
+        pbs,
+        device_tables,
+        route_shape,
+        row_count,
+        sessions,
+        max_ctx_len,
+        Some(layer),
+        Some(logical_layer_idx),
+        false,
+        false,
+        capture,
+        dense_capture,
+        false,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_streamed_dense_input(
+    gpu: &mut Gpu,
+    dense_capture: Option<(
+        &hipfire_runtime::calibration::CalibCollector,
+        &hipfire_runtime::calibration::contracts::CaptureRegistry,
+    )>,
+    layer: usize,
+    role: hipfire_runtime::calibration::contracts::ProjectionRole,
+    source: &GpuTensor,
+    rows: usize,
+    width: usize,
+) -> HipResult<()> {
+    let Some((collector, registry)) = dense_capture else {
+        return Ok(());
+    };
+    let prefix = source.sub_offset(0, rows * width);
+    collector
+        .capture_by_id(
+            gpu,
+            registry,
+            hipfire_runtime::calibration::contracts::CaptureId::new(layer, role, None),
+            &prefix,
+            rows,
+            width,
+        )
+        .map_err(|error| hip_bridge::HipError::new(0, &error.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_grouped_moe_session_batch_layers(
+    gpu: &mut Gpu,
+    weights: Option<&Qwen35Weights>,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    row_count: usize,
+    sessions: usize,
+    max_ctx_len: usize,
+    layer_override: Option<&LayerWeights>,
+    logical_layer_idx: Option<usize>,
+    embed_tokens: bool,
+    finalize_logits: bool,
+    capture: Option<&dyn hipfire_dispatch::families::moe::MoePrefillCapture>,
+    dense_capture: Option<(
+        &hipfire_runtime::calibration::CalibCollector,
+        &hipfire_runtime::calibration::contracts::CaptureRegistry,
+    )>,
+    kv_q8: bool,
+    delta_q8: bool,
+) -> HipResult<()> {
     let dim = config.dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -2364,41 +2514,65 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
     let hd = config.linear_key_head_dim;
     let q8_wmma_arch = gpu.arch_caps.has_wmma();
 
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
-            &weights.token_embd,
-            &pbs.x_batch,
-            &pbs.tokens,
-            row_count,
-            dim,
-        )?,
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
-            &weights.token_embd,
-            &pbs.x_batch,
-            &pbs.tokens,
-            row_count,
-            dim,
-        )?,
-        EmbeddingFormat::F32 => gpu.embedding_lookup_f32_batched(
-            &weights.token_embd,
-            &pbs.x_batch,
-            &pbs.tokens,
-            row_count,
-            dim,
-        )?,
-        other => {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
+    if embed_tokens {
+        let weights = weights.ok_or_else(|| {
+            hip_bridge::HipError::new(0, "embedding requested without resident Qwen weights")
+        })?;
+        match weights.embd_format {
+            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                row_count,
+                dim,
+            )?,
+            EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                row_count,
+                dim,
+            )?,
+            EmbeddingFormat::F32 => gpu.embedding_lookup_f32_batched(
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                row_count,
+                dim,
+            )?,
+            other => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
                     "grouped MoE session fused prefix does not support embedding format {other:?}"
                 ),
-            ));
+                ));
+            }
         }
     }
 
     let mut delta_layer_idx = 0usize;
     for layer_idx in 0..config.n_layers {
-        match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
+        let layer_weights = if let Some(layer) = layer_override {
+            if layer_idx != 0 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "a streamed layer override cannot execute more than one layer",
+                ));
+            }
+            layer
+        } else {
+            weights
+                .and_then(|weights| weights.layers.get(layer_idx))
+                .ok_or_else(|| {
+                    hip_bridge::HipError::new(
+                        0,
+                        &format!("missing resident Qwen layer {layer_idx}"),
+                    )
+                })?
+        };
+        let capture_layer_idx = logical_layer_idx.unwrap_or(layer_idx);
+        match (layer_weights, config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
                 let attn_is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0)
                     && matches!(layer.wz.gpu_dtype, DType::Q8_0)
@@ -2412,10 +2586,18 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                     && matches!(layer.wz.gpu_dtype, DType::MQ6G256)
                     && matches!(layer.w_alpha.gpu_dtype, DType::MQ6G256)
                     && matches!(layer.w_beta.gpu_dtype, DType::MQ6G256);
-                if !attn_is_q8 && !attn_is_mq4 && !attn_is_mq6 {
+                let attn_is_raw = [
+                    layer.wqkv.gpu_dtype,
+                    layer.wz.gpu_dtype,
+                    layer.w_alpha.gpu_dtype,
+                    layer.w_beta.gpu_dtype,
+                ]
+                .into_iter()
+                .all(|dtype| matches!(dtype, DType::F32 | DType::F16 | DType::BF16 | DType::Raw));
+                if !attn_is_q8 && !attn_is_mq4 && !attn_is_mq6 && !attn_is_raw {
                     return Err(hip_bridge::HipError::new(
                         0,
-                        "grouped MoE session fused prefix currently supports Q8, MQ4, or MQ6 DeltaNet-MoE attention weights only; use serial_reference",
+                        "grouped MoE session fused prefix supports raw F32/F16/BF16, Q8, MQ4, or MQ6 DeltaNet-MoE attention weights",
                     ));
                 }
                 if attn_is_mq4 || attn_is_mq6 {
@@ -2439,6 +2621,15 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                         config.norm_eps,
                     )?;
                 }
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::QueryInput,
+                    &pbs.x_rot_batch,
+                    row_count,
+                    dim,
+                )?;
                 if attn_is_mq4 {
                     gpu.gemm_qkvza_hfq4g256(
                         &layer.wqkv.buf,
@@ -2475,7 +2666,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                         layer.wqkv.k,
                         row_count,
                     )?;
-                } else if q8_wmma_arch {
+                } else if attn_is_q8 && q8_wmma_arch {
                     gpu.gemm_qkvza_q8_0_wmma(
                         &layer.wqkv.buf,
                         &layer.wz.buf,
@@ -2493,7 +2684,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                         layer.wqkv.k,
                         row_count,
                     )?;
-                } else {
+                } else if attn_is_q8 {
                     gpu.gemm_q8_0_batched_chunked(
                         &layer.wqkv.buf,
                         &pbs.x_rot_batch,
@@ -2524,6 +2715,35 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                         &pbs.dn_alpha_batch,
                         layer.w_alpha.m,
                         layer.w_alpha.k,
+                        row_count,
+                    )?;
+                } else {
+                    dense_session_prefill_gemm_full_precision(
+                        gpu,
+                        &layer.wqkv,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_qkv_batch,
+                        row_count,
+                    )?;
+                    dense_session_prefill_gemm_full_precision(
+                        gpu,
+                        &layer.wz,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_z_batch,
+                        row_count,
+                    )?;
+                    dense_session_prefill_gemm_full_precision(
+                        gpu,
+                        &layer.w_beta,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_beta_batch,
+                        row_count,
+                    )?;
+                    dense_session_prefill_gemm_full_precision(
+                        gpu,
+                        &layer.w_alpha,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_alpha_batch,
                         row_count,
                     )?;
                 }
@@ -2583,22 +2803,41 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                         row_count * k_dim * 4,
                     )?;
                 }
-                grouped_moe_prefill_session_batch_gated_delta_net_q8_layer(
-                    gpu,
-                    device_tables,
-                    route_shape,
-                    sessions,
-                    delta_layer_idx,
-                    &pbs.dn_q_batch,
-                    &pbs.dn_k_batch,
-                    &pbs.dn_v_batch,
-                    &pbs.dn_alpha_batch,
-                    &pbs.dn_beta_batch,
-                    &pbs.dn_attn_out_batch,
-                    row_count,
-                    n_v_heads,
-                    config.linear_value_head_dim,
-                )?;
+                if delta_q8 {
+                    grouped_moe_prefill_session_batch_gated_delta_net_q8_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        sessions,
+                        delta_layer_idx,
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_attn_out_batch,
+                        row_count,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?;
+                } else {
+                    dense_prefill_session_batch_gated_delta_net_f32_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        sessions,
+                        delta_layer_idx,
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_attn_out_batch,
+                        row_count,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?;
+                }
                 gpu.gated_norm_f32_batched(
                     &pbs.dn_attn_out_batch,
                     &pbs.dn_z_batch,
@@ -2608,6 +2847,15 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                     config.linear_value_head_dim,
                     config.norm_eps,
                     row_count,
+                )?;
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::AttentionOutputInput,
+                    &pbs.dn_normed_batch,
+                    row_count,
+                    n_v_heads * config.linear_value_head_dim,
                 )?;
                 if matches!(layer.wo.gpu_dtype, DType::MQ4G256) {
                     rotate_x_mq_batched_for(
@@ -2667,24 +2915,57 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                     )?;
                     let x_n = pbs.x_batch.sub_offset(0, row_count * layer.wo.m);
                     gpu.add_inplace_f32(&x_n, &scratch)?;
+                } else if matches!(
+                    layer.wo.gpu_dtype,
+                    DType::F32 | DType::F16 | DType::BF16 | DType::Raw
+                ) {
+                    dense_session_prefill_gemm_full_precision_residual(
+                        gpu,
+                        &layer.wo,
+                        &pbs.dn_normed_batch,
+                        &pbs.x_batch,
+                        &pbs.dn_normed_rot_batch,
+                        row_count,
+                    )?;
                 } else {
                     return Err(hip_bridge::HipError::new(
                         0,
-                        "grouped MoE session fused prefix currently supports Q8 or MQ4 DeltaNet-MoE wo weights only; use serial_reference",
+                        "grouped MoE session fused prefix encountered an unsupported DeltaNet-MoE output weight",
                     ));
                 }
                 let ctx = DispatchCtx::new(gpu);
                 prefill_moe_ffn_body_batched(
                     gpu,
-                    weights.pager.as_ref(),
+                    weights.and_then(|weights| weights.pager.as_ref()),
                     &layer.ffn,
                     &layer.ffn_norm,
                     config,
                     pbs,
                     row_count,
-                    layer_idx,
+                    capture_layer_idx,
                     &ctx,
                     None,
+                    capture,
+                )?;
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::RouterInput,
+                    &pbs.x_norm_batch,
+                    row_count,
+                    dim,
+                )?;
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::SharedExpertInput,
+                    pbs.moe_shared_rot_batch.as_ref().ok_or_else(|| {
+                        hip_bridge::HipError::new(0, "missing shared-expert capture scratch")
+                    })?,
+                    row_count,
+                    config.shared_expert_intermediate_size,
                 )?;
                 delta_layer_idx += 1;
             }
@@ -2698,10 +2979,15 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                 let attn_is_mq6 = matches!(layer.wq.gpu_dtype, DType::MQ6G256)
                     && matches!(layer.wk.gpu_dtype, DType::MQ6G256)
                     && matches!(layer.wv.gpu_dtype, DType::MQ6G256);
-                if !attn_is_q8 && !attn_is_mq4 && !attn_is_mq6 {
+                let attn_is_raw = [layer.wq.gpu_dtype, layer.wk.gpu_dtype, layer.wv.gpu_dtype]
+                    .into_iter()
+                    .all(|dtype| {
+                        matches!(dtype, DType::F32 | DType::F16 | DType::BF16 | DType::Raw)
+                    });
+                if !attn_is_q8 && !attn_is_mq4 && !attn_is_mq6 && !attn_is_raw {
                     return Err(hip_bridge::HipError::new(
                         0,
-                        "grouped MoE session fused prefix currently supports Q8, MQ4, or MQ6 FullAttention-MoE attention weights only; use serial_reference",
+                        "grouped MoE session fused prefix supports raw F32/F16/BF16, Q8, MQ4, or MQ6 FullAttention-MoE attention weights",
                     ));
                 }
                 if attn_is_mq4 || attn_is_mq6 {
@@ -2725,6 +3011,15 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                         config.norm_eps,
                     )?;
                 }
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::QueryInput,
+                    &pbs.x_rot_batch,
+                    row_count,
+                    dim,
+                )?;
                 if attn_is_mq4 {
                     gpu.gemm_qkv_hfq4g256(
                         &layer.wq.buf,
@@ -2755,7 +3050,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                         layer.wq.k,
                         row_count,
                     )?;
-                } else if q8_wmma_arch {
+                } else if attn_is_q8 && q8_wmma_arch {
                     gpu.gemm_qkv_q8_0_wmma(
                         &layer.wq.buf,
                         &layer.wk.buf,
@@ -2770,7 +3065,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                         layer.wq.k,
                         row_count,
                     )?;
-                } else {
+                } else if attn_is_q8 {
                     gpu.gemm_q8_0_batched_chunked(
                         &layer.wq.buf,
                         &pbs.x_rot_batch,
@@ -2793,6 +3088,28 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                         &pbs.fa_v_batch,
                         layer.wv.m,
                         layer.wv.k,
+                        row_count,
+                    )?;
+                } else {
+                    dense_session_prefill_gemm_full_precision(
+                        gpu,
+                        &layer.wq,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_q_full_batch,
+                        row_count,
+                    )?;
+                    dense_session_prefill_gemm_full_precision(
+                        gpu,
+                        &layer.wk,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_k_batch,
+                        row_count,
+                    )?;
+                    dense_session_prefill_gemm_full_precision(
+                        gpu,
+                        &layer.wv,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_v_batch,
                         row_count,
                     )?;
                 }
@@ -2834,32 +3151,68 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                     row_count,
                     0,
                 )?;
-                prefill_session_batch_write_q8_kv_layer(
-                    gpu,
-                    device_tables,
-                    route_shape,
-                    layer_idx,
-                    &pbs.fa_k_batch,
-                    &pbs.fa_v_batch,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    row_count,
-                )?;
-                prefill_session_batch_attention_q8_layer(
-                    gpu,
-                    device_tables,
-                    route_shape,
-                    layer_idx,
-                    &pbs.fa_q_batch,
-                    &pbs.fa_attn_out_batch,
-                    config.n_heads,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    max_ctx_len,
-                    max_ctx_len,
-                    row_count,
-                )?;
+                if kv_q8 {
+                    prefill_session_batch_write_q8_kv_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        row_count,
+                    )?;
+                    prefill_session_batch_attention_q8_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_q_batch,
+                        &pbs.fa_attn_out_batch,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        max_ctx_len,
+                        max_ctx_len,
+                        row_count,
+                    )?;
+                } else {
+                    dense_prefill_session_batch_write_f32_kv_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        config.n_kv_heads * config.head_dim,
+                        row_count,
+                    )?;
+                    dense_prefill_session_batch_attention_f32_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        layer_idx,
+                        &pbs.fa_q_batch,
+                        &pbs.fa_attn_out_batch,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        max_ctx_len,
+                        max_ctx_len,
+                        row_count,
+                    )?;
+                }
                 qwen35_apply_fa_gate(gpu, config, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::AttentionOutputInput,
+                    &pbs.fa_attn_out_batch,
+                    row_count,
+                    config.n_heads * config.head_dim,
+                )?;
                 if matches!(layer.wo.gpu_dtype, DType::MQ4G256) {
                     rotate_x_mq_batched_for(
                         gpu,
@@ -2918,24 +3271,57 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                     )?;
                     let x_n = pbs.x_batch.sub_offset(0, row_count * layer.wo.m);
                     gpu.add_inplace_f32(&x_n, &scratch)?;
+                } else if matches!(
+                    layer.wo.gpu_dtype,
+                    DType::F32 | DType::F16 | DType::BF16 | DType::Raw
+                ) {
+                    dense_session_prefill_gemm_full_precision_residual(
+                        gpu,
+                        &layer.wo,
+                        &pbs.fa_attn_out_batch,
+                        &pbs.x_batch,
+                        &pbs.fa_attn_out_rot_batch,
+                        row_count,
+                    )?;
                 } else {
                     return Err(hip_bridge::HipError::new(
                         0,
-                        "grouped MoE session fused prefix currently supports Q8 or MQ4 FullAttention-MoE wo weights only; use serial_reference",
+                        "grouped MoE session fused prefix encountered an unsupported FullAttention-MoE output weight",
                     ));
                 }
                 let ctx = DispatchCtx::new(gpu);
                 prefill_moe_ffn_body_batched(
                     gpu,
-                    weights.pager.as_ref(),
+                    weights.and_then(|weights| weights.pager.as_ref()),
                     &layer.ffn,
                     &layer.ffn_norm,
                     config,
                     pbs,
                     row_count,
-                    layer_idx,
+                    capture_layer_idx,
                     &ctx,
                     None,
+                    capture,
+                )?;
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::RouterInput,
+                    &pbs.x_norm_batch,
+                    row_count,
+                    dim,
+                )?;
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::SharedExpertInput,
+                    pbs.moe_shared_rot_batch.as_ref().ok_or_else(|| {
+                        hip_bridge::HipError::new(0, "missing shared-expert capture scratch")
+                    })?,
+                    row_count,
+                    config.shared_expert_intermediate_size,
                 )?;
             }
             _ => {
@@ -2949,15 +3335,21 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
         }
     }
 
-    grouped_moe_prefill_session_batch_final_logits(
-        gpu,
-        weights,
-        config,
-        pbs,
-        device_tables,
-        row_count,
-        sessions,
-    )
+    if finalize_logits {
+        grouped_moe_prefill_session_batch_final_logits(
+            gpu,
+            weights.ok_or_else(|| {
+                hip_bridge::HipError::new(0, "final logits requested without resident weights")
+            })?,
+            config,
+            pbs,
+            device_tables,
+            row_count,
+            sessions,
+        )
+    } else {
+        Ok(())
+    }
 }
 
 pub fn forward_prefill_grouped_moe_session_batch(
@@ -3154,7 +3546,10 @@ impl PrefillBatchScratch {
                 None
             },
             moe_topk_indices_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok], DType::F32)?)
+                Some(gpu.alloc_tensor(
+                    &[max_batch * config.num_experts_per_tok * std::mem::size_of::<i32>()],
+                    DType::Raw,
+                )?)
             } else {
                 None
             },
@@ -3172,6 +3567,14 @@ impl PrefillBatchScratch {
                 None
             },
             moe_up_batch: if config.num_experts > 0 {
+                Some(gpu.alloc_tensor(
+                    &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
+                    DType::F32,
+                )?)
+            } else {
+                None
+            },
+            moe_hidden_batch: if config.num_experts > 0 {
                 Some(gpu.alloc_tensor(
                     &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
                     DType::F32,
@@ -3198,62 +3601,15 @@ impl PrefillBatchScratch {
             // Path 2 scatter + grouped-WMMA-GEMM scratch (gated at runtime by
             // HIPFIRE_MOE_GROUPED_GEMM=1). m_total_max = N*K_TOP + E*(BLOCK_M-1).
             // i32 buffers stored as Raw (4 bytes/elem matches; no DType::I32 yet).
-            moe_expert_token_counts: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[config.num_experts * 4], DType::Raw)?)
-            } else {
-                None
-            },
-            moe_expert_offsets: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[(config.num_experts + 1) * 4], DType::Raw)?)
-            } else {
-                None
-            },
-            moe_sorted_slot_index: if config.num_experts > 0 {
-                let m_total_max = moe_grouped_m_total_max(
+            grouped_moe_scratch: if config.num_experts > 0 {
+                Some(grouped_moe::GroupedMoeScratch::new(
+                    gpu,
                     max_batch,
                     config.num_experts_per_tok,
                     config.num_experts,
-                );
-                Some(gpu.alloc_tensor(&[m_total_max * 4], DType::Raw)?)
-            } else {
-                None
-            },
-            moe_inverse_perm: if config.num_experts > 0 {
-                let total_slots_max = max_batch * config.num_experts_per_tok;
-                Some(gpu.alloc_tensor(&[total_slots_max * 4], DType::Raw)?)
-            } else {
-                None
-            },
-            moe_expert_tile_ids: if config.num_experts > 0 {
-                let m_total_max = moe_grouped_m_total_max(
-                    max_batch,
-                    config.num_experts_per_tok,
-                    config.num_experts,
-                );
-                Some(gpu.alloc_tensor(&[(m_total_max / MOE_GROUPED_BLOCK_M) * 4], DType::Raw)?)
-            } else {
-                None
-            },
-            moe_y_gate_up_grouped: if config.num_experts > 0 {
-                let m_total_max = moe_grouped_m_total_max(
-                    max_batch,
-                    config.num_experts_per_tok,
-                    config.num_experts,
-                );
-                Some(gpu.alloc_tensor(
-                    &[m_total_max * 2 * config.moe_intermediate_size],
-                    DType::F32,
+                    2 * config.moe_intermediate_size,
+                    config.dim,
                 )?)
-            } else {
-                None
-            },
-            moe_y_down_grouped: if config.num_experts > 0 {
-                let m_total_max = moe_grouped_m_total_max(
-                    max_batch,
-                    config.num_experts_per_tok,
-                    config.num_experts,
-                );
-                Some(gpu.alloc_tensor(&[m_total_max * config.dim], DType::F32)?)
             } else {
                 None
             },
@@ -3319,15 +3675,9 @@ impl PrefillBatchScratch {
             self.moe_topk_weights_batch,
             self.moe_gate_batch,
             self.moe_up_batch,
+            self.moe_hidden_batch,
             self.moe_rot_batch,
             self.moe_down_expanded_batch,
-            self.moe_expert_token_counts,
-            self.moe_expert_offsets,
-            self.moe_sorted_slot_index,
-            self.moe_inverse_perm,
-            self.moe_expert_tile_ids,
-            self.moe_y_gate_up_grouped,
-            self.moe_y_down_grouped,
             self.dn_s_tape_q8,
             self.dn_s_tape_scales,
         ]
@@ -3335,6 +3685,9 @@ impl PrefillBatchScratch {
         .flatten()
         {
             let _ = gpu.free_tensor(t);
+        }
+        if let Some(scratch) = self.grouped_moe_scratch {
+            scratch.free_gpu(gpu);
         }
     }
 }
@@ -3387,7 +3740,7 @@ impl PrefillBatchScratch {
 /// on prompt seeding of long prompts).
 pub const PREFILL_MAX_BATCH: usize = 256;
 
-pub(crate) const MOE_GROUPED_BLOCK_M: usize = 16;
+pub(crate) const MOE_GROUPED_BLOCK_M: usize = grouped_moe::GROUPED_MOE_BLOCK_ROWS;
 
 #[inline]
 pub(crate) fn prefill_should_emit_last_token_logits(
@@ -3398,33 +3751,22 @@ pub(crate) fn prefill_should_emit_last_token_logits(
 }
 
 #[inline]
+#[cfg(test)]
 pub(crate) fn align_up_usize(x: usize, align: usize) -> usize {
-    debug_assert!(align.is_power_of_two());
-    (x + align - 1) & !(align - 1)
+    grouped_moe::align_up(x, align)
 }
 
 #[inline]
+#[cfg(test)]
 pub(crate) fn moe_grouped_m_total_max(max_batch: usize, k_top: usize, n_exp: usize) -> usize {
-    // Every grouped-GEMM tile consumes 16 sorted slots. The scatter kernel
-    // initializes sentinel tile ids up to this bound, so the bound itself must
-    // be tile-aligned; otherwise the final launched tile can read an
-    // uninitialized expert id.
-    align_up_usize(
-        max_batch * k_top + n_exp * (MOE_GROUPED_BLOCK_M - 1),
-        MOE_GROUPED_BLOCK_M,
-    )
+    grouped_moe::grouped_m_total_max(max_batch, k_top, n_exp)
+        .expect("Qwen grouped-MoE scratch dimensions are validated")
 }
 
 #[inline]
 pub(crate) fn moe_grouped_m_total_bound(total_slots: usize, n_exp: usize) -> usize {
-    // Actual grouped rows are sum_e align_up(count_e, BLOCK_M). Only experts
-    // that receive at least one slot can contribute padding, so small verify
-    // batches do not need to launch the full all-experts worst case.
-    let live_expert_bound = total_slots.min(n_exp);
-    align_up_usize(
-        total_slots + live_expert_bound * (MOE_GROUPED_BLOCK_M - 1),
-        MOE_GROUPED_BLOCK_M,
-    )
+    grouped_moe::grouped_m_total_bound(total_slots, n_exp)
+        .expect("Qwen grouped-MoE routed dimensions are validated")
 }
 
 #[inline]
@@ -3775,15 +4117,7 @@ fn dense_session_prefill_gemm_full_precision_residual(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MoeGroupedPath2Shape {
-    pub(crate) total_slots: usize,
-    pub(crate) m_total_bound: usize,
-    pub(crate) gate_up_x_row_div: usize,
-    pub(crate) gate_up_source_rows: usize,
-    pub(crate) down_x_row_div: usize,
-    pub(crate) down_source_rows: usize,
-}
+pub(crate) type MoeGroupedPath2Shape = grouped_moe::GroupedMoeShape;
 
 #[inline]
 pub(crate) fn moe_grouped_path2_shape(
@@ -3791,29 +4125,11 @@ pub(crate) fn moe_grouped_path2_shape(
     k_top: usize,
     n_exp: usize,
 ) -> MoeGroupedPath2Shape {
-    let total_slots = n * k_top;
-    MoeGroupedPath2Shape {
-        total_slots,
-        m_total_bound: moe_grouped_m_total_bound(total_slots, n_exp),
-        // Gate/up consumes x_rot_batch [N x dim]. The grouped scatter's
-        // sorted slot encodes token*K_TOP + expert-rank, so the kernel divides
-        // source-row lookup by K_TOP to recover the token row.
-        gate_up_x_row_div: k_top,
-        gate_up_source_rows: n,
-        // Down consumes rot_batch [N*K_TOP x mi]. Sorted slots already index
-        // the flattened routed-expert rows, so no division is required.
-        down_x_row_div: 1,
-        down_source_rows: total_slots,
-    }
+    grouped_moe::grouped_moe_shape(n, k_top, n_exp)
+        .expect("Qwen grouped-MoE path dimensions are validated")
 }
 
-pub(crate) struct PagedMoeExpertBucket {
-    pub(crate) expert: u16,
-    pub(crate) m_total: usize,
-    pub(crate) sorted_slot_index: Vec<i32>,
-    pub(crate) inverse_perm: Vec<i32>,
-    pub(crate) expert_tile_ids: Vec<i32>,
-}
+pub(crate) type PagedMoeExpertBucket = grouped_moe::PagedMoeExpertBucket;
 
 pub(crate) fn build_paged_moe_expert_buckets(
     topk_indices: &[usize],
@@ -3821,52 +4137,8 @@ pub(crate) fn build_paged_moe_expert_buckets(
     k_top: usize,
     n_exp: usize,
 ) -> HipResult<Vec<PagedMoeExpertBucket>> {
-    let total_slots = n
-        .checked_mul(k_top)
-        .ok_or_else(|| HipError::new(0, "paged MoE expert bucket total_slots overflow"))?;
-    if topk_indices.len() != total_slots {
-        return Err(HipError::new(
-            0,
-            &format!(
-                "paged MoE expert bucket topk length mismatch: got {}, expected {}",
-                topk_indices.len(),
-                total_slots
-            ),
-        ));
-    }
-    let mut slots_by_expert = vec![Vec::<i32>::new(); n_exp];
-    for (flat, &expert) in topk_indices.iter().enumerate() {
-        if expert >= n_exp {
-            return Err(HipError::new(
-                0,
-                &format!("paged MoE router selected expert {expert}, but n_exp={n_exp}"),
-            ));
-        }
-        slots_by_expert[expert].push(flat as i32);
-    }
-
-    let mut buckets = Vec::new();
-    for (expert, slots) in slots_by_expert.into_iter().enumerate() {
-        if slots.is_empty() {
-            continue;
-        }
-        let m_total = align_up_usize(slots.len(), MOE_GROUPED_BLOCK_M);
-        let mut sorted_slot_index = vec![-1i32; m_total];
-        sorted_slot_index[..slots.len()].copy_from_slice(&slots);
-        let mut inverse_perm = vec![-1i32; total_slots];
-        for (sorted_pos, &flat) in slots.iter().enumerate() {
-            inverse_perm[flat as usize] = sorted_pos as i32;
-        }
-        let expert_tile_ids = vec![expert as i32; m_total / MOE_GROUPED_BLOCK_M];
-        buckets.push(PagedMoeExpertBucket {
-            expert: expert as u16,
-            m_total,
-            sorted_slot_index,
-            inverse_perm,
-            expert_tile_ids,
-        });
-    }
-    Ok(buckets)
+    grouped_moe::build_paged_expert_buckets(topk_indices, n, k_top, n_exp)
+        .map_err(|error| HipError::new(0, &error.to_string()))
 }
 
 pub(crate) fn upload_paged_moe_expert_bucket(

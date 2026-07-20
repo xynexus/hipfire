@@ -58,6 +58,7 @@ pub(crate) struct MoeScratchRef<'a> {
     ffn_out: &'a GpuTensor,
     gate_batch: &'a GpuTensor,
     up_batch: &'a GpuTensor,
+    hidden_batch: &'a GpuTensor,
     rot_batch: &'a GpuTensor,
     topk_indices: &'a GpuTensor,
     topk_weights: &'a GpuTensor,
@@ -67,6 +68,11 @@ pub(crate) struct MoeScratchRef<'a> {
     // the MoE FFN is byte-deterministic under hipGraph replay; see
     // task #100 root-cause notes in `forward_scratch`.
     down_expanded: &'a GpuTensor,
+    bucket_sorted: &'a GpuTensor,
+    bucket_inverse: &'a GpuTensor,
+    bucket_tile_ids: &'a GpuTensor,
+    bucket_y_gate_up: &'a GpuTensor,
+    bucket_y_down: &'a GpuTensor,
 }
 
 impl<'a> MoeScratchRef<'a> {
@@ -87,10 +93,16 @@ impl<'a> MoeScratchRef<'a> {
             ffn_out: s.moe_ffn_out.as_ref().expect("MoE scratch"),
             gate_batch: s.moe_gate_batch.as_ref().expect("MoE scratch"),
             up_batch: s.moe_up_batch.as_ref().expect("MoE scratch"),
+            hidden_batch: s.moe_hidden_batch.as_ref().expect("MoE scratch"),
             rot_batch: s.moe_rot_batch.as_ref().expect("MoE scratch"),
             topk_indices: s.moe_topk_indices.as_ref().expect("MoE scratch"),
             topk_weights: s.moe_topk_weights.as_ref().expect("MoE scratch"),
             down_expanded: s.moe_down_expanded.as_ref().expect("MoE scratch"),
+            bucket_sorted: s.moe_bucket_sorted.as_ref().expect("MoE scratch"),
+            bucket_inverse: s.moe_bucket_inverse.as_ref().expect("MoE scratch"),
+            bucket_tile_ids: s.moe_bucket_tile_ids.as_ref().expect("MoE scratch"),
+            bucket_y_gate_up: s.moe_bucket_y_gate_up.as_ref().expect("MoE scratch"),
+            bucket_y_down: s.moe_bucket_y_down.as_ref().expect("MoE scratch"),
         }
     }
 }
@@ -126,10 +138,16 @@ pub(crate) fn moe_ffn_decode(
     let ffn_out = gpu.alloc_tensor(&[hidden], DType::F32)?;
     let gate_batch = gpu.alloc_tensor(&[k * mi], DType::F32)?;
     let up_batch = gpu.alloc_tensor(&[k * mi], DType::F32)?;
+    let hidden_batch = gpu.alloc_tensor(&[k * mi], DType::F32)?;
     let rot_batch = gpu.alloc_tensor(&[k * mi], DType::F32)?;
     let topk_indices = gpu.alloc_tensor(&[k], DType::F32)?;
     let topk_weights = gpu.alloc_tensor(&[k], DType::F32)?;
     let down_expanded = gpu.alloc_tensor(&[k * hidden], DType::F32)?;
+    let bucket_sorted = gpu.alloc_tensor(&[16 * 4], DType::Raw)?;
+    let bucket_inverse = gpu.alloc_tensor(&[k * 4], DType::Raw)?;
+    let bucket_tile_ids = gpu.alloc_tensor(&[4], DType::Raw)?;
+    let bucket_y_gate_up = gpu.alloc_tensor(&[16 * 2 * mi], DType::F32)?;
+    let bucket_y_down = gpu.alloc_tensor(&[16 * hidden], DType::F32)?;
 
     let refs = MoeScratchRef {
         router_logits: &router_logits,
@@ -142,10 +160,16 @@ pub(crate) fn moe_ffn_decode(
         ffn_out: &ffn_out,
         gate_batch: &gate_batch,
         up_batch: &up_batch,
+        hidden_batch: &hidden_batch,
         rot_batch: &rot_batch,
         topk_indices: &topk_indices,
         topk_weights: &topk_weights,
         down_expanded: &down_expanded,
+        bucket_sorted: &bucket_sorted,
+        bucket_inverse: &bucket_inverse,
+        bucket_tile_ids: &bucket_tile_ids,
+        bucket_y_gate_up: &bucket_y_gate_up,
+        bucket_y_down: &bucket_y_down,
     };
     let result = moe_ffn_decode_impl(
         gpu, pager, ffn, x_norm, x_residual, config, &refs, false, layer_idx, None, false,
@@ -162,10 +186,16 @@ pub(crate) fn moe_ffn_decode(
         ffn_out,
         gate_batch,
         up_batch,
+        hidden_batch,
         rot_batch,
         topk_indices,
         topk_weights,
         down_expanded,
+        bucket_sorted,
+        bucket_inverse,
+        bucket_tile_ids,
+        bucket_y_gate_up,
+        bucket_y_down,
     ] {
         gpu.free_tensor(t)?;
     }
@@ -445,6 +475,140 @@ fn paged_moe_debug_sync(gpu: &Gpu, label: &str) -> HipResult<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_paged_mixed_routed_decode(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x_norm: &GpuTensor,
+    x_rot: &GpuTensor,
+    routed_target: &GpuTensor,
+    topk_indices: &[usize],
+    topk_weights: &GpuTensor,
+    config: &Qwen35Config,
+    s: &MoeScratchRef<'_>,
+) -> HipResult<()> {
+    if gpu.arch != "gfx1151" {
+        return Err(HipError::new(
+            0,
+            "mixed paged routed-expert decode is currently admitted on gfx1151 only",
+        ));
+    }
+    let k_top = config.num_experts_per_tok;
+    let mi = config.moe_intermediate_size;
+    let shape = moe_expert_shape(ffn)
+        .ok_or_else(|| HipError::new(0, "missing mixed paged MoE expert shape metadata"))?;
+    let buckets = build_paged_moe_expert_buckets(topk_indices, 1, k_top, config.num_experts)?;
+
+    for bucket in &buckets {
+        let expert = bucket.expert as usize;
+        let gate_up_dtype = moe_expert_gate_up_dtype(ffn, expert).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("missing mixed paged gate_up dtype for expert {expert}"),
+            )
+        })?;
+        let down_dtype = moe_expert_down_dtype(ffn, expert).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("missing mixed paged down dtype for expert {expert}"),
+            )
+        })?;
+        if gate_up_dtype != down_dtype {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "mixed paged expert {expert} gate_up dtype {gate_up_dtype:?} differs from down {down_dtype:?}"
+                ),
+            ));
+        }
+        let gate_up_source = if matches!(gate_up_dtype, DType::F16 | DType::BF16) {
+            x_norm
+        } else {
+            x_rot
+        };
+        upload_paged_moe_expert_bucket(
+            gpu,
+            bucket,
+            s.bucket_sorted,
+            s.bucket_inverse,
+            s.bucket_tile_ids,
+        )?;
+        hipfire_dispatch::pipeline::run_grouped_moe_gemm(
+            gpu,
+            gate_up_dtype,
+            &ffn.expert_gate_up_ptrs,
+            s.bucket_tile_ids,
+            s.bucket_sorted,
+            gate_up_source,
+            s.bucket_y_gate_up,
+            2 * mi,
+            shape.gate_up_k,
+            k_top,
+            bucket.m_total,
+            1,
+            false,
+            false,
+        )
+        .map_err(HipError::from)?;
+        gpu.moe_gate_up_unscatter_k8(
+            s.bucket_y_gate_up,
+            s.bucket_sorted,
+            s.gate_batch,
+            s.up_batch,
+            mi,
+            k_top,
+            bucket.m_total,
+        )?;
+    }
+
+    gpu.silu_mul_f32(s.gate_batch, s.up_batch, s.hidden_batch)?;
+    gpu.rotate_x_mq_batched(s.hidden_batch, s.rot_batch, mi, k_top)?;
+
+    for bucket in &buckets {
+        let expert = bucket.expert as usize;
+        let dtype = moe_expert_down_dtype(ffn, expert).expect("validated mixed expert dtype");
+        let down_source = if matches!(dtype, DType::F16 | DType::BF16) {
+            s.hidden_batch
+        } else {
+            s.rot_batch
+        };
+        upload_paged_moe_expert_bucket(
+            gpu,
+            bucket,
+            s.bucket_sorted,
+            s.bucket_inverse,
+            s.bucket_tile_ids,
+        )?;
+        hipfire_dispatch::pipeline::run_grouped_moe_gemm(
+            gpu,
+            dtype,
+            &ffn.expert_down_ptrs,
+            s.bucket_tile_ids,
+            s.bucket_sorted,
+            down_source,
+            s.bucket_y_down,
+            shape.down_m,
+            shape.down_k,
+            1,
+            bucket.m_total,
+            k_top,
+            false,
+            false,
+        )
+        .map_err(HipError::from)?;
+        gpu.moe_down_combine_grouped_k8(
+            s.bucket_y_down,
+            s.bucket_inverse,
+            topk_weights,
+            routed_target,
+            shape.down_m,
+            k_top,
+            1,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_qwen35_forward_capability(config: &Qwen35Config) -> HipResult<()> {
     if config.num_experts > 0
         && !config.has_shared_expert
@@ -507,7 +671,8 @@ pub(crate) fn moe_ffn_decode_impl(
     // router (e.g. the post-PR-171 attractor rule for MoE) thus still get
     // the device-side top-K + indexed expert GEMV path — only the 4-way
     // fused GEMV falls back to four individual `weight_gemv` calls.
-    let dispatch_flags = if let Some(dtypes) = MoePrefillDtypes::from_ffn(ffn) {
+    let prefill_dtypes = MoePrefillDtypes::from_ffn(ffn);
+    let dispatch_flags = if let Some(dtypes) = prefill_dtypes {
         moe_decode_dispatch_flags_for_dtypes(&dtypes, k, ffn.paro_shared.is_some())
     } else {
         let gate_side_mq4 = config.has_shared_expert
@@ -568,6 +733,8 @@ pub(crate) fn moe_ffn_decode_impl(
     // of the HFQ4 ones — same control flow, different kernel binary.
     let use_gpu_topk = dispatch_flags.use_gpu_topk;
     let needs_x_rot_local = dispatch_flags.needs_x_rot_local;
+    let paged_mixed_routed = ffn.experts.is_empty()
+        && prefill_dtypes.is_some_and(|dtypes| dtypes.routed_profile.is_mixed());
     let x_rot_local = if needs_x_rot_local {
         if !routed_gate_up_paro {
             // FWHT-rotated path needs the MQ sign LUT.
@@ -859,6 +1026,26 @@ pub(crate) fn moe_ffn_decode_impl(
     // ── 4. Top-K routed experts ──
     if routed_mq4 {
         gpu.ensure_mq_signs()?;
+    }
+
+    if paged_mixed_routed {
+        let indices = topk_indices_cpu
+            .as_ref()
+            .expect("mixed paged decode uses CPU top-K");
+        let xr = x_rot_local.expect("mixed paged decode requires quantized activation basis");
+        let routed_target = ep_routed_out.unwrap_or(x_residual);
+        run_paged_mixed_routed_decode(
+            gpu,
+            ffn,
+            x_norm,
+            xr,
+            routed_target,
+            indices,
+            s.topk_weights,
+            config,
+            s,
+        )?;
+        return Ok(());
     }
 
     if use_gpu_topk || ffn.experts.is_empty() {

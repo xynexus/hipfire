@@ -1,8 +1,99 @@
 # Native Tier-1 calibration collector — status & roadmap
 
-Status as of the 2026-06-18 build session. The native single-load calibration
-artifact collector is built and verified; the remaining work is daemon/scheduler
-integration + cross-model capture, flagged below.
+Status as of 2026-07-20. The resident collector and family-neutral layer-stream
+engine are built and mechanism-verified. Full-scale Qwen3.5-397B production and
+matched quality/admission evidence remain pending.
+
+## Update (2026-07-20) — family-neutral native safetensors engine
+
+`hipfire-coexistence calibrate` now emits the canonical HFQM v2
+`<model>.calib.hfq` contract directly from Hugging Face BF16 or F16
+safetensors. The Rust engine owns sampling, source planning, layer execution,
+capture reduction, KLDREF, read accounting, and crash-safe resume;
+`scripts/collect_hessian.py` is retained only as a parity/debug oracle.
+
+Large checkpoints can use original-shard reference offload. Disk-owned layers
+are loaded from the existing safetensors files on demand instead of first
+copying hundreds of GiB into an Accelerate `.dat` offload directory. Dense
+projections known to consume the same activation (Q/K/V, linear-attention input
+projections, and gate/up pairs) share one accumulator while retaining separate
+HFQM entries. This reduces the 397B model's estimated dense accumulator memory
+from about 36.8 GiB to roughly 23 GiB.
+
+The 397B path uses the native layer stream with KLDREF: embedding and host boundary
+activations are materialized once, each Qwen3.5 layer consumes every corpus
+microbatch while resident, and finalized layer statistics are spooled before
+the weights are released. Routed-expert capture is quota- and tile-aware while
+teacher routes always execute. Final norm/lm-head tensors are read once to
+append KLDREF. The native read ledger rejects a duplicate teacher read, so
+calibration is one source-checkpoint pass. `scripts/two_pass_quantize.py`
+composes it with the existing safetensors quantizer pass and records the ledger
+and artifact fingerprints in an atomic resume manifest.
+
+Qwen3.5 and Gemma3 provide thin adapters to the same engine. Mechanism tests,
+including grouped expert capture and mixed OQ4 plus BF16/F16 execution, pass on
+gfx1151. A full Qwen3.5-397B production artifact and matched quality/admission
+evidence are still pending; the Python oracle is not deleted until those and a
+second-family production run complete.
+
+Production preflight now estimates compact or dense Hessian payloads including
+activation aliases, KLDREF bytes, the mmap boundary spool, simultaneous layer
+parts plus final assembly, fixed container overhead, and a safety margin. It
+reports filesystem availability during `--dry-run` and refuses an insufficient
+fresh run. `--pause-after-layers N` provides a durable bounded-layer check that
+can be continued with `--resume`; no partial artifact is published.
+
+Live gfx1151 evidence on 2026-07-20:
+
+- Qwen3.5-397B-A17B layer 0 streamed from the real 94-shard checkpoint with
+  K=10 routing: 2 tokens produced 20 routed slots at both gate-up and down,
+  zero dropped indices, a 203,066,368-byte capture part, 19 canonical logical
+  reads totaling 15,184,552,832 bytes, and zero duplicate reads. The deliberately
+  undercovered smoke correctly preserved all 512 experts.
+- Gemma3-text (`medgemma-27b-text-it`) committed layer 0 and then resumed through
+  layer 1. The ledger grew monotonically from 14 to 27 canonical reads and from
+  3,644,369,408 to 4,470,166,528 bytes, with zero duplicates and no embedding or
+  layer-0 reread.
+- The same Gemma job subsequently completed all 62 layers and published a
+  38,692,740,100-byte artifact with 434 Hessians, 434 imatrices, one KLDREF row,
+  and a complete 809-logical/808-canonical, 54,018,004,480-byte ledger. A bounded
+  `oq4++` second pass joined all seven layer-0 Hessians through AWQ+LDLQ with no
+  missing/mismatched records and wrote a 249,080,134-byte HFQ.
+- Qwen layer-0 fresh-process sequence-batch 1/4/8/16/32 wall times on the same
+  32x8-token sample set were 6.06/4.89/4.48/4.31/4.18 seconds. All geometries
+  recorded exactly 2,560 K=10 routes at gate-up and down, zero drops/duplicates,
+  identical part sizes, and zero diagonal consistency error. Batch 32 is the
+  bounded-layer winner, not yet the declared full-run optimum.
+- A longer Qwen batch-32 layer-0 run processed 4,096 tokens and observed all
+  40,960 K=10 routes at both capture roles without invalid, duplicate, or
+  quota-dropped rows. It took 138.88 seconds cold with 15.1 GB maximum RSS, but
+  remained deliberately undercovered: 31 experts had zero routes, only one met
+  the 2,048-row floor, and 511 were preserved at high precision.
+- Resume checkpoints and final artifacts now retain per-layer phase timings. A
+  fresh two-token Gemma layer-0 check attributed 64.6 ms to load/upload,
+  118.1 ms to execution, 1.226 s to capture serialization, 0.5 ms to finish,
+  and 1.437 s to part sync/hash (2.846 s before checkpoint commit).
+- On the identical 4,096-token Qwen sample set, 256/512/1,024/2,048/4,096-row
+  geometries took 7.56/3.76/2.55/2.16/1.89 seconds of layer execution and
+  produced identical normalized descriptors and expert telemetry. Total
+  pre-checkpoint time was best at 2,048 rows due capture-write variance. At that
+  row count, sequence batches 32/64/128 took 2.55/2.15/2.27 seconds; batch 64 is
+  the bounded-layer target. The native CLI now uses 2,048 as its auto-tuning
+  ceiling while retaining live memory estimates and allocation fallback.
+
+The full Gemma run found a unified-memory residency hazard: mmap-backed source
+pages accumulated to about 57 GB RSS and blocked ROCm SVM setup in the finalizer.
+Planned safetensor views release completed ranges while canonical tied-weight
+pages remain until their declared alias is consumed. Gemma completed after an
+initial `posix_fadvise(DONTNEED)` fix, but Qwen's larger shard mappings proved
+that file advice alone did not evict mapped PTEs: RSS reached 44.8 GB after two
+layers. Adding mapping-level `MADV_DONTNEED` bounded the next production layer
+to a 21.9 GB peak; a refault test verifies that released read-only bytes remain
+available if a declared alias needs them later.
+
+The tiny-corpus artifacts are mechanism/read-accounting evidence, and the batch
+figures are bounded-layer throughput evidence. None establish production expert
+coverage, matched KLD/PPL quality, or model admission.
 
 ## Done + verified (committed)
 

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — calibration activation reductions (Tier-1 native Hessian/imatrix).
 //
-// Two accumulate-in-place reductions over a captured activation block
+// One indexed staging primitive plus two accumulate-in-place reductions over a
+// captured activation block
 // x[N, K] (row-major, F32; N = tokens this call, K = linear input dim):
 //
+//   calib_gather_rows_f32       dst[d+r,:] = src[sorted[s+r]/div,:]
 //   calib_sumsq_reduce_f32      acc[c]   += Σ_n x[n,c]²          (imatrix / diag(H))
 //   calib_hessian_outer_f32     H[i,j]   += Σ_n x[n,i]·x[n,j]    (GPTQ Hessian, K×K)
 //
@@ -12,6 +14,33 @@
 // are caller-zeroed once at start.
 
 #include <hip/hip_runtime.h>
+
+// Gather a contiguous expert segment from the grouped-MoE sorted-slot
+// permutation into a persistent calibration tile. `x_row_div=K_TOP` maps a
+// gate/up routed slot back to its token row; `x_row_div=1` selects the flattened
+// post-activation row used by down projections. The admission planner excludes
+// padding, but retain the negative-slot guard so malformed work never reads src.
+extern "C" __global__ void calib_gather_rows_f32(
+    const float* __restrict__ src,
+    const int* __restrict__ sorted_slot_index,
+    float* __restrict__ dst,
+    int sorted_start,
+    int dst_start,
+    int N,
+    int K,
+    int x_row_div
+) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)N * K;
+    if (i >= total) return;
+    int row = (int)(i / K);
+    int col = (int)(i - (long long)row * K);
+    int flat = sorted_slot_index[sorted_start + row];
+    if (flat < 0) return;
+    int src_row = flat / x_row_div;
+    dst[(long long)(dst_start + row) * K + col] =
+        src[(long long)src_row * K + col];
+}
 
 // acc[c] += Σ_n x[n,c]².  One thread per column; the inner loop walks rows.
 // Threads in a warp cover consecutive columns → coalesced reads of x[n, c..c+31].

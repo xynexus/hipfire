@@ -1311,6 +1311,16 @@ fn moe_dtypes_paro() -> MoeDtypes {
     d
 }
 
+fn moe_dtypes_raw(dtype: DType) -> MoeDtypes {
+    let mut d = moe_dtypes_mq4();
+    d.shared_expert_gate = dtype;
+    d.shared_expert_up = dtype;
+    d.routed_gate_up = dtype;
+    d.routed_down = dtype;
+    d.experts_all_gate_up_mq4 = false;
+    d
+}
+
 fn flags_default() -> hipfire_rdna::feature_flags::FeatureFlags {
     hipfire_rdna::feature_flags::FeatureFlags::from_env_for_test("gfx1100")
 }
@@ -1420,14 +1430,40 @@ fn moe_prefill_resolution_mq6_gfx11_falls_back_to_path1() {
 }
 
 #[test]
-fn moe_prefill_resolution_mq6_gfx1151_falls_back_to_path1() {
+fn moe_prefill_resolution_mq6_gfx1151_uses_wired_grouped_kernel() {
     let arch = crate::context::DispatchCtx::for_test("gfx1151");
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
     assert!(
-        !r.use_path2,
-        "MQ6 on gfx1151 should NOT use Path 2 (grouped WMMA is gfx12-only)"
+        r.use_path2,
+        "MQ6 on gfx1151 has a dedicated grouped WMMA implementation"
     );
     assert!(!r.down_path0);
+}
+
+#[test]
+fn moe_prefill_resolution_raw_f16_bf16_use_fast_or_portable_grouped_path() {
+    for dtype in [DType::F16, DType::BF16] {
+        let mut flags = flags_default();
+        flags.moe_grouped_gemm = false;
+        let flags = std::sync::Arc::new(flags);
+        let caps = hipfire_rdna::arch_caps::ArchCaps::new("gfx1151", flags.clone());
+        let resolution = MoePrefillResolution::resolve(&moe_dtypes_raw(dtype), &caps, &flags);
+        assert!(
+            resolution.use_path2,
+            "{dtype:?} has no indexed fallback and must retain grouped execution"
+        );
+
+        let unsupported = crate::context::DispatchCtx::for_test("gfx1100");
+        let resolution = MoePrefillResolution::resolve(
+            &moe_dtypes_raw(dtype),
+            &unsupported.arch,
+            &unsupported.flags,
+        );
+        assert!(
+            resolution.use_path2,
+            "raw experts require the portable grouped fallback off gfx1151"
+        );
+    }
 }
 
 #[test]

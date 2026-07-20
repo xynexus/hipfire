@@ -519,6 +519,7 @@ pub struct Qwen35Scratch {
     pub moe_ffn_out: Option<GpuTensor>,       // [dim]           fallback path
     pub moe_gate_batch: Option<GpuTensor>,    // [k × mi]
     pub moe_up_batch: Option<GpuTensor>,      // [k × mi]
+    pub moe_hidden_batch: Option<GpuTensor>,  // [k × mi], unrotated mixed fallback
     pub moe_rot_batch: Option<GpuTensor>,     // [k × mi]
     /// Phase 2b: GPU-side top-K outputs (kept on-device so moe_ffn_decode
     /// can stay in a graph-capturable stream).
@@ -531,6 +532,14 @@ pub struct Qwen35Scratch {
     // non-deterministic wavefront-order-dependent FP rounding under hipGraph
     // replay (task #100).
     pub moe_down_expanded: Option<GpuTensor>,
+    // Mixed paged-expert decode uses one tile-sized bucket at a time so the
+    // launch dtype matches that expert's pointer layout. Persistent scratch
+    // keeps the decode path allocation-free and works for K=8 and K=10.
+    pub moe_bucket_sorted: Option<GpuTensor>, // [16] i32 bytes
+    pub moe_bucket_inverse: Option<GpuTensor>, // [k] i32 bytes
+    pub moe_bucket_tile_ids: Option<GpuTensor>, // [1] i32 bytes
+    pub moe_bucket_y_gate_up: Option<GpuTensor>, // [16 × 2mi]
+    pub moe_bucket_y_down: Option<GpuTensor>, // [16 × dim]
 
     // Optional long-prefill scratch. Default is None to preserve VRAM
     // footprint; set HIPFIRE_PREFILL_REUSE_PBS=1 to allocate and reuse it.
@@ -676,10 +685,16 @@ impl Qwen35Scratch {
             moe_ffn_out: None,
             moe_gate_batch: None,
             moe_up_batch: None,
+            moe_hidden_batch: None,
             moe_rot_batch: None,
             moe_topk_indices: None,
             moe_topk_weights: None,
             moe_down_expanded: None,
+            moe_bucket_sorted: None,
+            moe_bucket_inverse: None,
+            moe_bucket_tile_ids: None,
+            moe_bucket_y_gate_up: None,
+            moe_bucket_y_down: None,
             prefill_batch: None,
         })
         .and_then(|mut s| {
@@ -703,6 +718,7 @@ impl Qwen35Scratch {
                 s.moe_ffn_out = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
                 s.moe_gate_batch = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
                 s.moe_up_batch = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
+                s.moe_hidden_batch = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
                 s.moe_rot_batch = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
                 // i32 topk_indices stored in an F32 tensor (same byte width).
                 // The kernel that writes it casts the buffer to int*, and the
@@ -711,6 +727,11 @@ impl Qwen35Scratch {
                 s.moe_topk_weights = Some(gpu.alloc_tensor(&[k], DType::F32)?);
                 // Atomic-free decode MoE down output: [k × dim].
                 s.moe_down_expanded = Some(gpu.alloc_tensor(&[k * hidden], DType::F32)?);
+                s.moe_bucket_sorted = Some(gpu.alloc_tensor(&[16 * 4], DType::Raw)?);
+                s.moe_bucket_inverse = Some(gpu.alloc_tensor(&[k * 4], DType::Raw)?);
+                s.moe_bucket_tile_ids = Some(gpu.alloc_tensor(&[4], DType::Raw)?);
+                s.moe_bucket_y_gate_up = Some(gpu.alloc_tensor(&[16 * 2 * mi], DType::F32)?);
+                s.moe_bucket_y_down = Some(gpu.alloc_tensor(&[16 * hidden], DType::F32)?);
                 // Pre-warm MQ FWHT sign tables (otherwise the lazy init in
                 // ensure_mq_signs fires during the first moe_ffn_decode and
                 // blows up hipGraph capture with a hipMalloc-in-capture
@@ -783,10 +804,16 @@ impl Qwen35Scratch {
             self.moe_ffn_out,
             self.moe_gate_batch,
             self.moe_up_batch,
+            self.moe_hidden_batch,
             self.moe_rot_batch,
             self.moe_topk_indices,
             self.moe_topk_weights,
             self.moe_down_expanded,
+            self.moe_bucket_sorted,
+            self.moe_bucket_inverse,
+            self.moe_bucket_tile_ids,
+            self.moe_bucket_y_gate_up,
+            self.moe_bucket_y_down,
         ]
         .into_iter()
         .flatten()
@@ -1473,6 +1500,74 @@ fn paro_moe_i8_k8_enabled_from_env(i8_enabled: bool, value: Option<&str>) -> boo
     i8_enabled && value != Some("0")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutedExpertDtypeProfile {
+    /// Every expert has the same paired gate-up/down dtype.
+    Uniform(DType),
+    /// A calibrated low-bit layer with undercovered experts preserved in the
+    /// source full-precision compute dtype.  Each expert must use the same
+    /// dtype for gate-up and down; only the expert identity varies.
+    QuantWithFullPrecisionFallback {
+        quant: DType,
+        full: DType,
+    },
+    Invalid,
+}
+
+impl RoutedExpertDtypeProfile {
+    fn is_mixed(self) -> bool {
+        matches!(self, Self::QuantWithFullPrecisionFallback { .. })
+    }
+}
+
+fn mixed_routed_quant_dtype_supported(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ2G256Lloyd | DType::Oq4G256
+    )
+}
+
+fn classify_routed_expert_dtypes(gate_up: &[DType], down: &[DType]) -> RoutedExpertDtypeProfile {
+    if gate_up.is_empty() || gate_up.len() != down.len() {
+        return RoutedExpertDtypeProfile::Invalid;
+    }
+    if gate_up
+        .iter()
+        .zip(down)
+        .any(|(gate_up, down)| gate_up != down)
+    {
+        return RoutedExpertDtypeProfile::Invalid;
+    }
+
+    let first = gate_up[0];
+    let mut second = None;
+    for &dtype in &gate_up[1..] {
+        if dtype == first {
+            continue;
+        }
+        if second.is_some_and(|other| other != dtype) {
+            return RoutedExpertDtypeProfile::Invalid;
+        }
+        second = Some(dtype);
+    }
+    let Some(second) = second else {
+        return RoutedExpertDtypeProfile::Uniform(first);
+    };
+
+    let (quant, full) = if mixed_routed_quant_dtype_supported(first)
+        && matches!(second, DType::F16 | DType::BF16)
+    {
+        (first, second)
+    } else if mixed_routed_quant_dtype_supported(second)
+        && matches!(first, DType::F16 | DType::BF16)
+    {
+        (second, first)
+    } else {
+        return RoutedExpertDtypeProfile::Invalid;
+    };
+    RoutedExpertDtypeProfile::QuantWithFullPrecisionFallback { quant, full }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MoePrefillDtypes {
     router: DType,
@@ -1484,6 +1579,7 @@ struct MoePrefillDtypes {
     expert_down: DType,
     expert_gate_up_uniform: bool,
     expert_down_uniform: bool,
+    routed_profile: RoutedExpertDtypeProfile,
 }
 
 impl MoePrefillDtypes {
@@ -1499,42 +1595,60 @@ impl MoePrefillDtypes {
             expert_down: dtype,
             expert_gate_up_uniform: true,
             expert_down_uniform: true,
+            routed_profile: RoutedExpertDtypeProfile::Uniform(dtype),
         }
     }
 
     fn from_ffn(ffn: &MoeFfnWeights) -> Option<Self> {
-        if ffn.experts.is_empty() {
-            let expert_gate_up = ffn.expert_gate_up_dtype?;
-            let expert_down = ffn.expert_down_dtype?;
-            return Some(Self {
-                router: ffn.router.gpu_dtype,
-                shared_expert_scalar_gate: ffn.shared_expert_gate.gpu_dtype,
-                shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
-                shared_expert_up: ffn.shared_expert.up.gpu_dtype,
-                shared_expert_down: ffn.shared_expert.down.gpu_dtype,
-                expert_gate_up,
-                expert_down,
-                expert_gate_up_uniform: true,
-                expert_down_uniform: true,
-            });
-        }
-        let first = ffn.experts.first()?;
+        let (gate_up_dtypes, down_dtypes) =
+            if !ffn.expert_gate_up_dtypes.is_empty() || !ffn.expert_down_dtypes.is_empty() {
+                if ffn.expert_gate_up_dtypes.len() != ffn.expert_down_dtypes.len() {
+                    return None;
+                }
+                (
+                    ffn.expert_gate_up_dtypes.as_slice(),
+                    ffn.expert_down_dtypes.as_slice(),
+                )
+            } else if ffn.experts.is_empty() {
+                // Compatibility for older in-memory constructors. New loaders
+                // populate the per-expert vectors, including paged layers.
+                return Some(Self {
+                    router: ffn.router.gpu_dtype,
+                    shared_expert_scalar_gate: ffn.shared_expert_gate.gpu_dtype,
+                    shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
+                    shared_expert_up: ffn.shared_expert.up.gpu_dtype,
+                    shared_expert_down: ffn.shared_expert.down.gpu_dtype,
+                    expert_gate_up: ffn.expert_gate_up_dtype?,
+                    expert_down: ffn.expert_down_dtype?,
+                    expert_gate_up_uniform: true,
+                    expert_down_uniform: true,
+                    routed_profile: RoutedExpertDtypeProfile::Uniform(ffn.expert_gate_up_dtype?),
+                });
+            } else {
+                return None;
+            };
+        let (&first_gate_up, &first_down) = gate_up_dtypes.first().zip(down_dtypes.first())?;
+        let routed_profile = classify_routed_expert_dtypes(gate_up_dtypes, down_dtypes);
+        // Mixed execution uses the low-bit dtype as its representative so the
+        // existing rotation/admission helpers describe the quantized basis,
+        // independent of whether expert zero happens to be a raw fallback.
+        let (expert_gate_up, expert_down) = match routed_profile {
+            RoutedExpertDtypeProfile::QuantWithFullPrecisionFallback { quant, .. } => {
+                (quant, quant)
+            }
+            _ => (first_gate_up, first_down),
+        };
         Some(Self {
             router: ffn.router.gpu_dtype,
             shared_expert_scalar_gate: ffn.shared_expert_gate.gpu_dtype,
             shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
             shared_expert_up: ffn.shared_expert.up.gpu_dtype,
             shared_expert_down: ffn.shared_expert.down.gpu_dtype,
-            expert_gate_up: first.gate_up.gpu_dtype,
-            expert_down: first.down.gpu_dtype,
-            expert_gate_up_uniform: ffn
-                .experts
-                .iter()
-                .all(|e| e.gate_up.gpu_dtype == first.gate_up.gpu_dtype),
-            expert_down_uniform: ffn
-                .experts
-                .iter()
-                .all(|e| e.down.gpu_dtype == first.down.gpu_dtype),
+            expert_gate_up,
+            expert_down,
+            expert_gate_up_uniform: gate_up_dtypes.iter().all(|&dtype| dtype == first_gate_up),
+            expert_down_uniform: down_dtypes.iter().all(|&dtype| dtype == first_down),
+            routed_profile,
         })
     }
 }
@@ -1639,7 +1753,8 @@ fn moe_decode_dispatch_flags_for_dtypes(
         || routed_gate_up_mq2_lloyd
         || routed_gate_up_paro
         || routed_gate_up_oq4
-        || routed_gate_up_oq8;
+        || routed_gate_up_oq8
+        || dtypes.routed_profile.is_mixed();
     MoeDecodeDispatchFlags {
         gate_side_mq4,
         shared_gate_up_mq4,
@@ -1679,7 +1794,7 @@ fn moe_prefill_full_precision_shared_dtype_supported(dtype: DType, arch: &str) -
 }
 
 fn moe_prefill_full_precision_routed_dtype_supported(dtype: DType, arch: &str) -> bool {
-    matches!(dtype, DType::F16 | DType::BF16) && arch == "gfx1151"
+    matches!(dtype, DType::F16 | DType::BF16) && arch.starts_with("gfx")
 }
 
 fn moe_ffn_batched_admissible_for_dtypes(
@@ -1689,8 +1804,33 @@ fn moe_ffn_batched_admissible_for_dtypes(
 ) -> bool {
     let router_ok = moe_prefill_side_gate_dtype_supported(dtypes.router);
     let shared_gate_ok = moe_prefill_side_gate_dtype_supported(dtypes.shared_expert_scalar_gate);
-    if !(router_ok && shared_gate_ok && dtypes.expert_gate_up_uniform && dtypes.expert_down_uniform)
-    {
+    // Unit-level callers historically construct a uniform profile and then
+    // replace both representative dtypes. Derive the uniform profile from the
+    // authoritative fields; non-uniform profiles come only from the loader's
+    // full per-expert classification.
+    let routed_profile = if dtypes.expert_gate_up_uniform && dtypes.expert_down_uniform {
+        if dtypes.expert_gate_up == dtypes.expert_down {
+            RoutedExpertDtypeProfile::Uniform(dtypes.expert_gate_up)
+        } else {
+            RoutedExpertDtypeProfile::Invalid
+        }
+    } else {
+        dtypes.routed_profile
+    };
+    if !(router_ok && shared_gate_ok) || routed_profile == RoutedExpertDtypeProfile::Invalid {
+        return false;
+    }
+    let profile_metadata_consistent = match routed_profile {
+        RoutedExpertDtypeProfile::Uniform(_) => true,
+        RoutedExpertDtypeProfile::QuantWithFullPrecisionFallback { quant, .. } => {
+            !dtypes.expert_gate_up_uniform
+                && !dtypes.expert_down_uniform
+                && dtypes.expert_gate_up == quant
+                && dtypes.expert_down == quant
+        }
+        RoutedExpertDtypeProfile::Invalid => false,
+    };
+    if !profile_metadata_consistent {
         return false;
     }
 
@@ -1705,8 +1845,7 @@ fn moe_ffn_batched_admissible_for_dtypes(
     }
 
     let shared_gu_one_dtype = dtypes.shared_expert_up == dtypes.shared_expert_gate;
-    let experts_one_dtype = dtypes.expert_down == dtypes.expert_gate_up;
-    if !(shared_gu_one_dtype && experts_one_dtype) {
+    if !shared_gu_one_dtype {
         return false;
     }
 
@@ -1716,10 +1855,27 @@ fn moe_ffn_batched_admissible_for_dtypes(
     let shared_down_supported =
         moe_prefill_quant_family_supported_for_arch(dtypes.shared_expert_down, arch)
             || moe_prefill_full_precision_shared_dtype_supported(dtypes.shared_expert_down, arch);
-    let routed_supported = moe_prefill_quant_family_supported_for_arch(dtypes.expert_gate_up, arch)
-        || moe_prefill_full_precision_routed_dtype_supported(dtypes.expert_gate_up, arch);
+    let routed_supported = match routed_profile {
+        RoutedExpertDtypeProfile::Uniform(dtype) => {
+            moe_prefill_quant_family_supported_for_arch(dtype, arch)
+                || moe_prefill_full_precision_routed_dtype_supported(dtype, arch)
+        }
+        RoutedExpertDtypeProfile::QuantWithFullPrecisionFallback { quant, full } => {
+            // First production admission is the target gfx1151 path. Both
+            // layouts are dispatched as independent routed buckets while the
+            // teacher routing and combine remain one logical microbatch.
+            arch == "gfx1151"
+                && moe_grouped_gemm_supported_for_dtype(quant, arch)
+                && moe_grouped_gemm_supported_for_dtype(full, arch)
+        }
+        RoutedExpertDtypeProfile::Invalid => false,
+    };
     if !shared_gate_up_supported || !shared_down_supported || !routed_supported {
         return false;
+    }
+
+    if routed_profile.is_mixed() {
+        return moe_grouped_gemm_supported_for_dtype(dtypes.expert_gate_up, arch);
     }
 
     let shared_matches_routed = dtypes.shared_expert_gate == dtypes.expert_gate_up
@@ -1874,12 +2030,14 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
         DType::MQ6G256 => arch == "gfx1151" || arch.starts_with("gfx12"),
         DType::MQ3G256 => arch == "gfx1151" || arch.starts_with("gfx12"),
         DType::MQ2G256Lloyd => arch == "gfx1151",
-        DType::F16 | DType::BF16 => arch == "gfx1151",
+        // gfx1151 resolves to the tuned WMMA implementation; every other HIP
+        // target retains the same grouped routing through the portable raw
+        // active-expert kernel.
+        DType::F16 | DType::BF16 => arch.starts_with("gfx"),
         DType::ParoQ4G128 => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
-        // OQ routed experts have NO grouped-WMMA MoE kernel — they use the indexed
-        // Path 1 GEMV. Deliberately absent so path2 eligibility stays false and OQ
-        // prefill routes to the indexed kernels; admissibility for OQ passes via
-        // `shared_matches_routed` (shared + routed both OQ).
+        // OQ4 mixed-precision routing uses the indexed-block W4A16 grouped kernel
+        // on gfx11. Uniform OQ can still use the existing indexed Path 1 kernels.
+        DType::Oq4G256 => arch.starts_with("gfx11"),
         _ => false,
     }
 }
@@ -1944,6 +2102,30 @@ fn moe_prefill_needs_routed_gate_up_reprojection(dtypes: &MoePrefillDtypes) -> b
         && moe_prefill_mq_family_uses_prerotation(dtypes.expert_gate_up)
 }
 
+fn moe_expert_gate_up_dtype(ffn: &MoeFfnWeights, expert: usize) -> Option<DType> {
+    ffn.expert_gate_up_dtypes
+        .get(expert)
+        .copied()
+        .or_else(|| {
+            ffn.experts
+                .get(expert)
+                .map(|weights| weights.gate_up.gpu_dtype)
+        })
+        .or(ffn.expert_gate_up_dtype)
+}
+
+fn moe_expert_down_dtype(ffn: &MoeFfnWeights, expert: usize) -> Option<DType> {
+    ffn.expert_down_dtypes
+        .get(expert)
+        .copied()
+        .or_else(|| {
+            ffn.experts
+                .get(expert)
+                .map(|weights| weights.down.gpu_dtype)
+        })
+        .or(ffn.expert_down_dtype)
+}
+
 fn moe_prefill_prepare_routed_gate_up_input(
     gpu: &mut Gpu,
     ffn: &MoeFfnWeights,
@@ -1957,7 +2139,12 @@ fn moe_prefill_prepare_routed_gate_up_input(
         return Ok(());
     }
 
-    let Some(representative) = ffn.experts.first().map(|e| &e.gate_up) else {
+    let Some(representative) = ffn
+        .experts
+        .iter()
+        .find(|expert| expert.gate_up.gpu_dtype == dtypes.expert_gate_up)
+        .map(|expert| &expert.gate_up)
+    else {
         return Err(HipError::new(
             0,
             "mixed-dtype paged MoE prefill needs a routed gate_up representative",
@@ -4208,6 +4395,61 @@ mod tests {
     }
 
     #[test]
+    fn calibration_session_plan_keeps_singletons_and_ragged_tail_in_row_order() {
+        let single = build_calibration_session_batch_execution_plan(
+            &[DensePrefillSessionBatchInput {
+                tokens: &[10, 11],
+                start_pos: 4,
+            }],
+            8,
+        )
+        .expect("single calibration session is a valid microbatch");
+        assert_eq!(single.total_rows, 2);
+        assert_eq!(single.multi_state_prefix_rounds, 2);
+        assert_eq!(single.multi_state_prefix_rows, 2);
+        assert_eq!(single.singleton_tail, None);
+
+        let ragged = build_calibration_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10, 11, 12],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 9,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[30, 31],
+                    start_pos: 2,
+                },
+            ],
+            8,
+        )
+        .expect("ragged calibration sessions are valid");
+        assert_eq!(ragged.total_rows, 6);
+        assert_eq!(ragged.multi_state_prefix_rounds, 3);
+        assert_eq!(ragged.multi_state_prefix_rows, 6);
+        assert_eq!(ragged.singleton_tail, None);
+        let route_shape = DensePrefillSessionStateRouteShape {
+            kv_k_layers: 1,
+            kv_v_layers: 1,
+            dn_s_layers: 0,
+            dn_scale_layers: 0,
+            dn_conv_layers: 0,
+        };
+        let tables = dense_prefill_session_batch_pointer_table_plan(&ragged, route_shape, 3);
+        assert_eq!(
+            tables
+                .prefix_rows
+                .iter()
+                .map(|row| (row.session_index, row.position))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (1, 9), (2, 2), (0, 5), (2, 3), (0, 6)]
+        );
+    }
+
+    #[test]
     fn dense_session_fused_prefix_contract_accepts_dense_fp32_state() {
         let config = test_qwen35_config_with_layers(vec![
             LayerType::LinearAttention,
@@ -4899,6 +5141,124 @@ mod tests {
     }
 
     #[test]
+    fn routed_expert_dtype_profile_accepts_one_quant_family_plus_raw_fallback() {
+        assert_eq!(
+            classify_routed_expert_dtypes(
+                &[DType::BF16, DType::MQ6G256, DType::MQ6G256],
+                &[DType::BF16, DType::MQ6G256, DType::MQ6G256],
+            ),
+            RoutedExpertDtypeProfile::QuantWithFullPrecisionFallback {
+                quant: DType::MQ6G256,
+                full: DType::BF16,
+            }
+        );
+        assert_eq!(
+            classify_routed_expert_dtypes(
+                &[DType::MQ4G256, DType::F16],
+                &[DType::MQ4G256, DType::F16],
+            ),
+            RoutedExpertDtypeProfile::QuantWithFullPrecisionFallback {
+                quant: DType::MQ4G256,
+                full: DType::F16,
+            }
+        );
+        assert_eq!(
+            classify_routed_expert_dtypes(
+                &[DType::Oq4G256, DType::BF16],
+                &[DType::Oq4G256, DType::BF16],
+            ),
+            RoutedExpertDtypeProfile::QuantWithFullPrecisionFallback {
+                quant: DType::Oq4G256,
+                full: DType::BF16,
+            }
+        );
+    }
+
+    #[test]
+    fn paged_moe_dtype_maps_canonical_oq_storage_to_indexed_runtime_dtypes() {
+        assert_eq!(
+            loading::paged_moe_dtype_for_quant(OQ4_CANONICAL_QT, 256),
+            Some(DType::Oq4G256)
+        );
+        assert_eq!(
+            loading::paged_moe_dtype_for_quant(hipfire_runtime::oq_moe::OQ8_CANONICAL_QT, 256),
+            Some(DType::Oq8G256)
+        );
+        assert_eq!(
+            loading::paged_moe_dtype_for_quant(hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT, 256),
+            Some(DType::Oq8G256)
+        );
+    }
+
+    #[test]
+    fn routed_expert_dtype_profile_rejects_unpaired_or_multi_family_layouts() {
+        assert_eq!(
+            classify_routed_expert_dtypes(
+                &[DType::MQ6G256, DType::BF16],
+                &[DType::MQ6G256, DType::F16],
+            ),
+            RoutedExpertDtypeProfile::Invalid
+        );
+        assert_eq!(
+            classify_routed_expert_dtypes(
+                &[DType::MQ4G256, DType::MQ6G256, DType::BF16],
+                &[DType::MQ4G256, DType::MQ6G256, DType::BF16],
+            ),
+            RoutedExpertDtypeProfile::Invalid
+        );
+        assert_eq!(
+            classify_routed_expert_dtypes(
+                &[DType::ParoQ4G128, DType::BF16],
+                &[DType::ParoQ4G128, DType::BF16],
+            ),
+            RoutedExpertDtypeProfile::Invalid
+        );
+    }
+
+    #[test]
+    fn moe_prefill_mixed_fallback_is_admitted_only_on_proven_gfx1151_path() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ6G256);
+        dtypes.router = DType::Q8_0;
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        dtypes.expert_gate_up_uniform = false;
+        dtypes.expert_down_uniform = false;
+        dtypes.routed_profile = RoutedExpertDtypeProfile::QuantWithFullPrecisionFallback {
+            quant: DType::MQ6G256,
+            full: DType::BF16,
+        };
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1151"
+        ));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1201"
+        ));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1100"
+        ));
+
+        let decode = moe_decode_dispatch_flags_for_dtypes(&dtypes, 10, false);
+        assert_eq!(decode.routed_path, MoeDecodeIndexedRoutedPath::None);
+        assert!(!decode.use_gpu_topk);
+        assert!(
+            decode.needs_x_rot_local,
+            "mixed decode must materialize both raw and quantized input bases"
+        );
+
+        dtypes.expert_gate_up = DType::Oq4G256;
+        dtypes.expert_down = DType::Oq4G256;
+        dtypes.routed_profile = RoutedExpertDtypeProfile::QuantWithFullPrecisionFallback {
+            quant: DType::Oq4G256,
+            full: DType::BF16,
+        };
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1151"
+        ));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1201"
+        ));
+    }
+
+    #[test]
     fn moe_prefill_admits_mq4_as_known_good_control() {
         let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         assert!(moe_ffn_batched_admissible_for_dtypes(
@@ -4967,9 +5327,9 @@ mod tests {
     }
 
     #[test]
-    fn moe_prefill_rejects_full_precision_routed_body_but_admits_fp_router_and_gate() {
+    fn moe_prefill_admits_full_precision_routed_body_via_portable_grouped_fallback() {
         let dtypes = MoePrefillDtypes::uniform(DType::F16);
-        assert!(!moe_ffn_batched_admissible_for_dtypes(
+        assert!(moe_ffn_batched_admissible_for_dtypes(
             &dtypes, false, "gfx1201"
         ));
 
@@ -5152,7 +5512,7 @@ mod tests {
     }
 
     #[test]
-    fn moe_prefill_grouped_gemm_routes_mq6_only_where_grouped_kernel_exists() {
+    fn moe_prefill_grouped_gemm_routes_quant_and_portable_raw_paths() {
         assert!(moe_grouped_gemm_supported_for_dtype(
             DType::MQ4G256,
             "gfx1151"
@@ -5176,6 +5536,14 @@ mod tests {
         assert!(moe_grouped_gemm_supported_for_dtype(
             DType::MQ3G256,
             "gfx1151"
+        ));
+        assert!(moe_grouped_gemm_supported_for_dtype(
+            DType::Oq4G256,
+            "gfx1151"
+        ));
+        assert!(!moe_grouped_gemm_supported_for_dtype(
+            DType::Oq4G256,
+            "gfx1201"
         ));
         assert!(moe_grouped_gemm_supported_for_dtype(
             DType::MQ2G256Lloyd,
@@ -5189,12 +5557,12 @@ mod tests {
         assert!(moe_grouped_gemm_supported_for_dtype(DType::BF16, "gfx1151"));
         for arch in ["gfx1100", "gfx1201", "gfx9"] {
             assert!(
-                !moe_grouped_gemm_supported_for_dtype(DType::F16, arch),
-                "F16 routed MoE grouped GEMM should stay gfx1151-only on {arch}"
+                moe_grouped_gemm_supported_for_dtype(DType::F16, arch),
+                "F16 routed MoE grouped GEMM should use the portable fallback on {arch}"
             );
             assert!(
-                !moe_grouped_gemm_supported_for_dtype(DType::BF16, arch),
-                "BF16 routed MoE grouped GEMM should stay gfx1151-only on {arch}"
+                moe_grouped_gemm_supported_for_dtype(DType::BF16, arch),
+                "BF16 routed MoE grouped GEMM should use the portable fallback on {arch}"
             );
         }
     }
@@ -5271,7 +5639,7 @@ mod tests {
     }
 
     #[test]
-    fn moe_prefill_full_precision_routed_is_gfx1151_path2_only() {
+    fn moe_prefill_full_precision_routed_uses_fast_or_portable_grouped_path() {
         for dtype in [DType::F16, DType::BF16] {
             let mut dtypes = MoePrefillDtypes::uniform(dtype);
             dtypes.router = DType::Q8_0;
@@ -5290,14 +5658,14 @@ mod tests {
                 "{dtype:?} routed MoE should force Path 2 even when env disables grouped GEMM"
             );
 
-            for arch in ["gfx1100", "gfx1201", "gfx9"] {
+            for arch in ["gfx1100", "gfx1201", "gfx942"] {
                 assert!(
-                    !moe_ffn_batched_admissible_for_dtypes(&dtypes, false, arch),
-                    "{dtype:?} routed MoE prefill should stay rejected on {arch}"
+                    moe_ffn_batched_admissible_for_dtypes(&dtypes, false, arch),
+                    "{dtype:?} routed MoE prefill should use the portable grouped fallback on {arch}"
                 );
                 assert!(
-                    !moe_grouped_gemm_path2_eligible_for_dtype(dtype, arch, true),
-                    "{dtype:?} grouped MoE dispatch should stay rejected on {arch}"
+                    moe_grouped_gemm_path2_eligible_for_dtype(dtype, arch, true),
+                    "{dtype:?} grouped MoE dispatch should remain mandatory on {arch}"
                 );
             }
         }

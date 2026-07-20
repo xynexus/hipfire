@@ -19,58 +19,18 @@
 use crate::gpu::{build_capture_names, gpu_forward_calib, ZayaGpuWeights};
 use crate::{ZayaConfig, ARCH_ID_ZAYA};
 use hipfire_rdna::Gpu;
+use hipfire_runtime::calibration::contracts::legacy_kldref_tensors;
 use hipfire_runtime::calibration::{collect, CalibForward};
 use hipfire_runtime::hfq::HfqMemTensor;
 use std::path::Path;
 
+pub use hipfire_runtime::calibration::contracts::KldRefOptions as CalibOpts;
 pub use hipfire_runtime::calibration::CalibSummary;
-
-/// Calibration knobs. `kldref` taps the tied lm-head logits during the forward
-/// and bakes the per-position `(logZ, top-k)` reference into the sidecar.
-pub struct CalibOpts {
-    pub kldref: bool,
-    pub kldref_topk: usize,
-}
-
-fn f32_bytes(v: &[f32]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(v.len() * 4);
-    for &x in v {
-        b.extend_from_slice(&x.to_le_bytes());
-    }
-    b
-}
 
 /// Pack the per-position `(logZ, top-k)` KLDREF reference into HFQ tensors
 /// (`lm_head.kldref_{idx,logit,logz}`), matching the other arches' layout.
 fn kldref_extra(kldref: &[(f32, Vec<(u32, f32)>)]) -> Vec<HfqMemTensor> {
-    if kldref.is_empty() {
-        return Vec::new();
-    }
-    let np = kldref.len();
-    let kk = kldref[0].1.len();
-    let (mut idx_v, mut lg_v, mut lz_v) = (Vec::new(), Vec::new(), Vec::new());
-    for (logz, tk) in kldref {
-        lz_v.push(*logz);
-        for j in 0..kk {
-            let (i, l) = tk.get(j).copied().unwrap_or((0, f32::NEG_INFINITY));
-            idx_v.push(i as f32);
-            lg_v.push(l);
-        }
-    }
-    [
-        ("lm_head.kldref_idx", vec![np as u32, kk as u32], idx_v),
-        ("lm_head.kldref_logit", vec![np as u32, kk as u32], lg_v),
-        ("lm_head.kldref_logz", vec![np as u32], lz_v),
-    ]
-    .into_iter()
-    .map(|(name, shape, data)| HfqMemTensor {
-        name: name.to_string(),
-        quant_type: 2,
-        shape,
-        group_size: 0,
-        data: f32_bytes(&data),
-    })
-    .collect()
+    legacy_kldref_tensors(kldref).expect("internally generated Zaya KLDREF rows are valid")
 }
 
 /// Run the calibration forward over `tokens` and write the HFQM Hessian sidecar

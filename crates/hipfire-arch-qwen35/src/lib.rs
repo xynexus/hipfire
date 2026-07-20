@@ -40,6 +40,8 @@
 #[cfg(feature = "deltanet")]
 pub mod arch;
 #[cfg(feature = "deltanet")]
+pub mod calibration_stream;
+#[cfg(feature = "deltanet")]
 pub mod ffn_bf16;
 #[cfg(feature = "deltanet")]
 pub mod mtp_compose;

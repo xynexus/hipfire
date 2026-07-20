@@ -2561,14 +2561,22 @@ mod tests {
         let (s1, s2) = test_signs();
         let data = test_data(600); // 2 full blocks + partial → 3 blocks
         let encoded = quantize_oq2g256(&data, &s1, &s2);
-        assert_eq!(encoded.len(), 3 * 66, "oq2 block geometry (2 scale + 64 packed)");
+        assert_eq!(
+            encoded.len(),
+            3 * 66,
+            "oq2 block geometry (2 scale + 64 packed)"
+        );
         let decoded = dequant_oq2g256(&encoded, data.len(), &s1, &s2);
         assert_eq!(decoded.len(), data.len());
         // 2-bit / 3-level is coarse; the round-trip must at least not diverge
         // past the signal magnitude (std ~0.58 for U[-1,1)).
         let e = rmse(&data, &decoded);
         assert!(e < 0.7, "oq2 round-trip rmse too high: {e}");
-        assert_eq!(encoded, quantize_oq2g256(&data, &s1, &s2), "oq2 encode nondeterministic");
+        assert_eq!(
+            encoded,
+            quantize_oq2g256(&data, &s1, &s2),
+            "oq2 encode nondeterministic"
+        );
     }
 
     #[test]

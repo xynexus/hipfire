@@ -14,11 +14,15 @@
 
 use hipfire_arch_api::{transformer_role, TensorRole};
 use hipfire_quant_format::QuantType;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::hash::Hasher;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use twox_hash::XxHash64;
+
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 
 /// HFQ container magic + format version.
 pub const HFQ_MAGIC: &[u8; 4] = b"HFQM";
@@ -268,9 +272,134 @@ fn expert_key(name: &str) -> Option<(u16, u16)> {
     Some((layer, expert))
 }
 
+fn expert_role_rank(name: &str) -> u8 {
+    let parts = name.split('.').collect::<Vec<_>>();
+    let Some(expert_pos) = parts.iter().position(|part| *part == "experts") else {
+        return u8::MAX;
+    };
+    match parts.get(expert_pos + 2).copied() {
+        Some("gate_up_proj") | Some("gate_proj") => 0,
+        Some("up_proj") => 1,
+        Some("down_proj") => 2,
+        _ => 3,
+    }
+}
+
+/// Keep non-routed tensors in source order, then group routed tensors by
+/// `(layer, expert)` and projection role. This makes every expert a contiguous
+/// page-in unit while remaining independent of the model-family name.
+fn canonical_tensor_order(tensors: &[HfqTensor]) -> Vec<&HfqTensor> {
+    let mut always = Vec::new();
+    let mut experts = BTreeMap::<(u16, u16), Vec<(u8, usize, &HfqTensor)>>::new();
+    for (index, tensor) in tensors.iter().enumerate() {
+        if let Some(key) = expert_key(&tensor.name) {
+            experts
+                .entry(key)
+                .or_default()
+                .push((expert_role_rank(&tensor.name), index, tensor));
+        } else {
+            always.push(tensor);
+        }
+    }
+    for entries in experts.values_mut() {
+        entries.sort_by_key(|(role, index, _)| (*role, *index));
+        always.extend(entries.iter().map(|(_, _, tensor)| *tensor));
+    }
+    always
+}
+
+fn metadata_with_routed_modules(
+    mut metadata: serde_json::Value,
+    tensors: &[&HfqTensor],
+    planned: &[PlannedTensor],
+) -> std::io::Result<serde_json::Value> {
+    if tensors.len() != planned.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HFQ module planning tensor/offset count mismatch",
+        ));
+    }
+    let mut groups = BTreeMap::<(u16, u16), Vec<(&HfqTensor, &PlannedTensor)>>::new();
+    let mut last_key = None;
+    let mut closed = std::collections::BTreeSet::new();
+    for (tensor, plan) in tensors.iter().zip(planned) {
+        let key = expert_key(&tensor.name);
+        if key != last_key {
+            if let Some(previous) = last_key {
+                closed.insert(previous);
+            }
+            if key.is_some_and(|next| closed.contains(&next)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "routed expert tensors are not contiguous in canonical HFQ order",
+                ));
+            }
+            last_key = key;
+        }
+        if let Some(key) = key {
+            groups.entry(key).or_default().push((tensor, plan));
+        }
+    }
+
+    let mut modules = Vec::with_capacity(groups.len());
+    for ((layer, expert), entries) in groups {
+        let start = entries.first().map(|(_, plan)| plan.offset).unwrap_or(0);
+        let end = entries
+            .last()
+            .map(|(_, plan)| plan.offset.saturating_add(plan.data_len))
+            .unwrap_or(start);
+        let module_tensors = entries
+            .iter()
+            .map(|(tensor, plan)| {
+                serde_json::json!({
+                    "name": tensor.name,
+                    "quant_type": tensor.quant_type as u8,
+                    "shape": tensor.shape,
+                    "group_size": tensor.group_size,
+                    "rel_offset": plan.offset.saturating_sub(start),
+                    "data_size": plan.data_len,
+                })
+            })
+            .collect::<Vec<_>>();
+        modules.push(serde_json::json!({
+            "module_id": format!("layers.{layer}.experts.{expert}"),
+            "kind": "routed_expert",
+            "layer": layer,
+            "expert": expert,
+            "placement_policy": "lazy_lru",
+            "data_offset": start,
+            "data_size": end.saturating_sub(start),
+            "tensors": module_tensors,
+        }));
+    }
+    let object = metadata.as_object_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQ metadata must be a JSON object",
+        )
+    })?;
+    object.remove("hfqm_modules");
+    if !modules.is_empty() {
+        object.insert(
+            "hfqm_modules".to_string(),
+            serde_json::json!({
+                "format": "hipfire.hfqm.modules.v1",
+                "modules": modules,
+            }),
+        );
+    }
+    Ok(metadata)
+}
+
 fn split_front_tail_metadata(metadata_json: &str) -> std::io::Result<(serde_json::Value, Vec<u8>)> {
     let full: serde_json::Value = serde_json::from_str(metadata_json)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    split_front_tail_metadata_value(full)
+}
+
+fn split_front_tail_metadata_value(
+    full: serde_json::Value,
+) -> std::io::Result<(serde_json::Value, Vec<u8>)> {
     let mut front = match full.clone() {
         serde_json::Value::Object(map) => serde_json::Value::Object(map),
         _ => serde_json::json!({ "metadata": full.clone() }),
@@ -282,6 +411,7 @@ fn split_front_tail_metadata(metadata_json: &str) -> std::io::Result<(serde_json
             "tokenizer_config",
             "generation_config",
             "gguf_meta",
+            "hfqm_modules",
         ] {
             map.remove(key);
         }
@@ -299,13 +429,13 @@ fn split_front_tail_metadata(metadata_json: &str) -> std::io::Result<(serde_json
     Ok((front, tail_bytes))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PlannedTensor {
     offset: u64,
     data_len: u64,
 }
 
-fn build_v2_index(tensors: &[HfqTensor], planned: &[PlannedTensor]) -> std::io::Result<Vec<u8>> {
+fn build_v2_index(tensors: &[&HfqTensor], planned: &[PlannedTensor]) -> std::io::Result<Vec<u8>> {
     let mut index_bytes = Vec::new();
     index_bytes.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
     for (t, p) in tensors.iter().zip(planned) {
@@ -376,7 +506,7 @@ fn build_v2_stream_index(
     Ok(index_bytes)
 }
 
-fn plan_offsets(tensors: &[HfqTensor], payload_start: u64) -> Vec<PlannedTensor> {
+fn plan_offsets(tensors: &[&HfqTensor], payload_start: u64) -> Vec<PlannedTensor> {
     let mut out = Vec::with_capacity(tensors.len());
     let mut cursor = align_up(payload_start, PAYLOAD_ALIGN);
     let mut active_expert: Option<(u16, u16)> = None;
@@ -554,7 +684,7 @@ pub fn hfq_quantization_hash_metadata(
     };
     let mut buf = vec![0u8; 4 * 1024 * 1024];
 
-    for t in tensors {
+    for t in canonical_tensor_order(tensors) {
         let name_bytes = t.name.as_bytes();
         xxh64_update_u64(&mut h, name_bytes.len() as u64);
         h.update(name_bytes);
@@ -576,6 +706,10 @@ pub fn hfq_quantization_hash_metadata(
             let reader = spill_reader
                 .as_mut()
                 .expect("spilled tensor requires spill reader");
+            let (spill_offset, _) = spill
+                .expect("spilled tensor requires spill state")
+                .location(&t.name, t.spilled_len)?;
+            reader.seek(SeekFrom::Start(spill_offset))?;
             let mut remaining = t.spilled_len as usize;
             while remaining > 0 {
                 let chunk = remaining.min(buf.len());
@@ -664,6 +798,7 @@ pub struct TensorSpill {
     file: std::io::BufWriter<File>,
     path: PathBuf,
     offset: u64,
+    locations: BTreeMap<String, (u64, u64)>,
 }
 
 impl TensorSpill {
@@ -677,15 +812,71 @@ impl TensorSpill {
             file,
             path,
             offset: 0,
+            locations: BTreeMap::new(),
         })
     }
 
-    /// Write tensor data to the spill file. Returns the byte count written.
-    pub fn spill(&mut self, data: &[u8]) -> std::io::Result<u64> {
+    /// Write named tensor data to the spill file. The recorded byte range lets
+    /// the final writer emit tensors in canonical module order without loading
+    /// them back into RAM or assuming spill order equals artifact order.
+    pub fn spill(&mut self, name: &str, data: &[u8]) -> std::io::Result<u64> {
         use std::io::Write;
+        if self.locations.contains_key(name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("tensor {name} was already spilled"),
+            ));
+        }
+        let start = self.offset;
         self.file.write_all(data)?;
         self.offset += data.len() as u64;
+        self.locations
+            .insert(name.to_string(), (start, data.len() as u64));
         Ok(data.len() as u64)
+    }
+
+    fn location(&self, name: &str, expected_len: u64) -> std::io::Result<(u64, u64)> {
+        let location = self.locations.get(name).copied().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("spilled tensor {name} has no recorded byte range"),
+            )
+        })?;
+        if location.1 != expected_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "spilled tensor {name} range is {} bytes, expected {expected_len}",
+                    location.1
+                ),
+            ));
+        }
+        Ok(location)
+    }
+
+    /// Release filesystem blocks for a tensor after the final HFQ writer has
+    /// copied and hashed it. Keeping the logical file length and location map
+    /// intact lets the reader continue seeking to later tensors while peak
+    /// disk usage stays close to one artifact instead of spill + artifact.
+    fn release_location(&self, name: &str, expected_len: u64) -> std::io::Result<()> {
+        let (offset, len) = self.location(name, expected_len)?;
+        #[cfg(target_os = "linux")]
+        {
+            let result = unsafe {
+                libc::fallocate(
+                    self.file.get_ref().as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    offset as libc::off_t,
+                    len as libc::off_t,
+                )
+            };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (offset, len);
+        Ok(())
     }
 
     pub fn flush(&mut self) -> std::io::Result<()> {
@@ -734,110 +925,66 @@ pub fn write_hfq_with_progress(
     if let Some(spill) = spill.as_mut() {
         spill.flush()?;
     }
-    let (front_base, tail_bytes) = split_front_tail_metadata(metadata_json)?;
+    let metadata_base: serde_json::Value = serde_json::from_str(metadata_json)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let ordered = canonical_tensor_order(tensors);
     let metadata_offset = HEADER_SIZE;
 
     let mut front_json = String::new();
+    let mut front_base = serde_json::json!({});
+    let mut tail_bytes = Vec::new();
     let mut index_bytes = Vec::new();
-    #[allow(unused_assignments)]
     let mut planned = Vec::new();
-    #[allow(unused_assignments)]
     let mut data_offset = 0u64;
-    #[allow(unused_assignments)]
     let mut tail_offset = 0u64;
-    for _ in 0..16 {
-        data_offset = align_up(
+    let mut converged = false;
+    for _ in 0..32 {
+        let next_data_offset = align_up(
             metadata_offset + front_json.len() as u64 + index_bytes.len() as u64,
             PAYLOAD_ALIGN,
         );
-        planned = plan_offsets(tensors, data_offset);
-        index_bytes = build_v2_index(tensors, &planned)?;
-        let payload_end = planned
+        let next_planned = plan_offsets(&ordered, next_data_offset);
+        let next_index = build_v2_index(&ordered, &next_planned)?;
+        let full_metadata =
+            metadata_with_routed_modules(metadata_base.clone(), &ordered, &next_planned)?;
+        let (next_front_base, next_tail_bytes) = split_front_tail_metadata_value(full_metadata)?;
+        let payload_end = next_planned
             .last()
             .map(|p| p.offset.saturating_add(p.data_len))
-            .unwrap_or(data_offset);
-        tail_offset = align_up(payload_end, TENSOR_ALIGN);
-        let quant_hash =
-            placeholder_quantization_hash(tensors.len(), planned.iter().map(|p| p.data_len).sum());
-        let next_front =
-            build_front_metadata(front_base.clone(), tail_offset, &tail_bytes, quant_hash)?;
-        if next_front == front_json {
+            .unwrap_or(next_data_offset);
+        let next_tail_offset = align_up(payload_end, TENSOR_ALIGN);
+        let quant_hash = placeholder_quantization_hash(
+            ordered.len(),
+            next_planned.iter().map(|p| p.data_len).sum(),
+        );
+        let next_front = build_front_metadata(
+            next_front_base.clone(),
+            next_tail_offset,
+            &next_tail_bytes,
+            quant_hash,
+        )?;
+        converged = next_data_offset == data_offset
+            && next_tail_offset == tail_offset
+            && next_planned == planned
+            && next_index == index_bytes
+            && next_tail_bytes == tail_bytes
+            && next_front == front_json;
+        data_offset = next_data_offset;
+        tail_offset = next_tail_offset;
+        planned = next_planned;
+        index_bytes = next_index;
+        front_base = next_front_base;
+        tail_bytes = next_tail_bytes;
+        front_json = next_front;
+        if converged {
             break;
         }
-        let old_len = front_json.len();
-        front_json = next_front;
-        if front_json.len() == old_len {
-            data_offset = align_up(
-                metadata_offset + front_json.len() as u64 + index_bytes.len() as u64,
-                PAYLOAD_ALIGN,
-            );
-            planned = plan_offsets(tensors, data_offset);
-            index_bytes = build_v2_index(tensors, &planned)?;
-            tail_offset = align_up(
-                planned
-                    .last()
-                    .map(|p| p.offset.saturating_add(p.data_len))
-                    .unwrap_or(data_offset),
-                TENSOR_ALIGN,
-            );
-            let quant_hash = placeholder_quantization_hash(
-                tensors.len(),
-                planned.iter().map(|p| p.data_len).sum(),
-            );
-            let stable_front =
-                build_front_metadata(front_base.clone(), tail_offset, &tail_bytes, quant_hash)?;
-            if stable_front.len() == front_json.len() {
-                front_json = stable_front;
-                break;
-            }
-            front_json = stable_front;
-        }
     }
-    data_offset = align_up(
-        metadata_offset + front_json.len() as u64 + index_bytes.len() as u64,
-        PAYLOAD_ALIGN,
-    );
-    planned = plan_offsets(tensors, data_offset);
-    index_bytes = build_v2_index(tensors, &planned)?;
-    tail_offset = align_up(
-        planned
-            .last()
-            .map(|p| p.offset.saturating_add(p.data_len))
-            .unwrap_or(data_offset),
-        TENSOR_ALIGN,
-    );
-    let quant_hash =
-        placeholder_quantization_hash(tensors.len(), planned.iter().map(|p| p.data_len).sum());
-    front_json = build_front_metadata(front_base.clone(), tail_offset, &tail_bytes, quant_hash)?;
-    let final_data_offset = align_up(
-        metadata_offset + front_json.len() as u64 + index_bytes.len() as u64,
-        PAYLOAD_ALIGN,
-    );
-    if final_data_offset != data_offset {
-        data_offset = final_data_offset;
-        planned = plan_offsets(tensors, data_offset);
-        index_bytes = build_v2_index(tensors, &planned)?;
-        tail_offset = align_up(
-            planned
-                .last()
-                .map(|p| p.offset.saturating_add(p.data_len))
-                .unwrap_or(data_offset),
-            TENSOR_ALIGN,
-        );
-        let quant_hash =
-            placeholder_quantization_hash(tensors.len(), planned.iter().map(|p| p.data_len).sum());
-        front_json =
-            build_front_metadata(front_base.clone(), tail_offset, &tail_bytes, quant_hash)?;
-        let check_data_offset = align_up(
-            metadata_offset + front_json.len() as u64 + index_bytes.len() as u64,
-            PAYLOAD_ALIGN,
-        );
-        if check_data_offset != data_offset {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "HFQ v2 front metadata did not converge",
-            ));
-        }
+    if !converged {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQ v2 module/front metadata did not converge",
+        ));
     }
 
     let total_output_bytes = tail_offset.saturating_add(tail_bytes.len() as u64);
@@ -863,7 +1010,7 @@ pub fn write_hfq_with_progress(
     f.write_all(INVALID_HFQ_MAGIC)?;
     f.write_all(&HFQ_VERSION.to_le_bytes())?;
     f.write_all(&arch.to_le_bytes())?;
-    f.write_all(&(tensors.len() as u32).to_le_bytes())?;
+    f.write_all(&(ordered.len() as u32).to_le_bytes())?;
     f.write_all(&metadata_offset.to_le_bytes())?;
     f.write_all(&data_offset.to_le_bytes())?;
     f.write_all(front_json.as_bytes())?;
@@ -879,15 +1026,14 @@ pub fn write_hfq_with_progress(
     write_zeroes(&mut f, data_offset - pos)?;
     report_progress(data_offset);
 
-    let mut spill_reader = if let Some(spill) = spill {
-        spill.flush()?;
+    let mut spill_reader = if let Some(spill) = spill.as_ref() {
         Some(std::io::BufReader::new(File::open(&spill.path)?))
     } else {
         None
     };
     let mut buf = vec![0u8; 4 * 1024 * 1024];
     let mut payload_hash = PayloadHashState::new();
-    for (t, p) in tensors.iter().zip(&planned) {
+    for (t, p) in ordered.iter().zip(&planned) {
         let pos = f.stream_position()?;
         if pos > p.offset {
             return Err(std::io::Error::new(
@@ -904,6 +1050,11 @@ pub fn write_hfq_with_progress(
             let reader = spill_reader
                 .as_mut()
                 .expect("spilled tensor requires spill reader");
+            let (spill_offset, _) = spill
+                .as_ref()
+                .expect("spilled tensor requires spill state")
+                .location(&t.name, t.spilled_len)?;
+            reader.seek(SeekFrom::Start(spill_offset))?;
             let mut remaining = t.spilled_len as usize;
             while remaining > 0 {
                 let chunk = remaining.min(buf.len());
@@ -913,6 +1064,13 @@ pub fn write_hfq_with_progress(
                 remaining -= chunk;
                 report_progress(f.stream_position()?);
             }
+            // Best effort: unsupported filesystems retain the old, safe
+            // double-space behavior. Linux filesystems with hole punching
+            // release copied spill blocks incrementally.
+            let _ = spill
+                .as_ref()
+                .expect("spilled tensor requires spill state")
+                .release_location(&t.name, t.spilled_len);
         } else {
             f.write_all(&t.data)?;
             payload_hash.update_payload(&t.data);
@@ -1446,6 +1604,23 @@ fn write_zeroes(f: &mut File, mut n: u64) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spill_range_release_punches_copied_payload_without_touching_neighbor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spill = TensorSpill::new(dir.path()).unwrap();
+        let first = vec![0x11u8; 128 * 1024];
+        let second = vec![0x22u8; 128 * 1024];
+        spill.spill("first", &first).unwrap();
+        spill.spill("second", &second).unwrap();
+        spill.flush().unwrap();
+
+        spill.release_location("first", first.len() as u64).unwrap();
+        let bytes = std::fs::read(&spill.path).unwrap();
+        assert!(bytes[..first.len()].iter().all(|&byte| byte == 0));
+        assert_eq!(&bytes[first.len()..first.len() + second.len()], second);
+    }
+
     fn json_end(bytes: &[u8]) -> usize {
         let mut depth = 0i32;
         let mut in_string = false;
@@ -1492,7 +1667,7 @@ mod tests {
             },
             HfqTensor {
                 name: "model.layers.0.mlp.experts.1.down_proj.weight".to_string(),
-                quant_type: QuantType::Q8F16,
+                quant_type: QuantType::F16,
                 shape: vec![5, 3],
                 group_size: 256,
                 data: vec![2u8; 19],
@@ -1534,6 +1709,7 @@ mod tests {
         let front_end = json_end(front);
         let front_json: serde_json::Value = serde_json::from_slice(&front[..front_end]).unwrap();
         assert!(front_json.get("config").is_none());
+        assert!(front_json.get("hfqm_modules").is_none());
         let tail_meta = front_json.get("tail_metadata").unwrap();
         let tail_offset = tail_meta["offset"].as_u64().unwrap() as usize;
         let tail_size = tail_meta["size"].as_u64().unwrap() as usize;
@@ -1544,15 +1720,26 @@ mod tests {
             tail_json["metadata"]["tokenizer_config"]["chat_template"],
             "{{ messages }}"
         );
+        let modules = &tail_json["metadata"]["hfqm_modules"];
+        assert_eq!(modules["format"], "hipfire.hfqm.modules.v1");
+        assert_eq!(modules["modules"].as_array().unwrap().len(), 1);
+        assert_eq!(modules["modules"][0]["kind"], "routed_expert");
+        assert_eq!(modules["modules"][0]["layer"], 0);
+        assert_eq!(modules["modules"][0]["expert"], 1);
+        assert_eq!(modules["modules"][0]["tensors"][0]["quant_type"], 3);
+        assert_eq!(modules["modules"][0]["tensors"][1]["quant_type"], 1);
 
         let mut pos = 32 + front_end;
         let n = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
         assert_eq!(n, tensors.len());
+        let mut names = Vec::new();
         let mut offsets = Vec::new();
         for _ in 0..n {
             let name_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
-            pos += 2 + name_len;
+            pos += 2;
+            names.push(String::from_utf8(bytes[pos..pos + name_len].to_vec()).unwrap());
+            pos += name_len;
             pos += 1;
             let n_dims = bytes[pos] as usize;
             pos += 1 + n_dims * 4 + 4;
@@ -1562,8 +1749,17 @@ mod tests {
             pos += 8;
             offsets.push(offset_div32 * 32);
         }
+        assert_eq!(
+            names,
+            [
+                "model.norm.weight",
+                "model.layers.0.mlp.experts.1.gate_up_proj.weight",
+                "model.layers.0.mlp.experts.1.down_proj.weight",
+            ]
+        );
         assert_eq!(offsets[0] % 4096, 0);
-        assert_eq!(offsets[1] % 32, 0);
+        assert_eq!(offsets[1] % 4096, 0);
         assert_eq!(offsets[2] % 32, 0);
+        assert_eq!(modules["modules"][0]["data_offset"], offsets[1]);
     }
 }

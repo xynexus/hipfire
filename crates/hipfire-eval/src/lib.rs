@@ -2278,8 +2278,8 @@ mod tests {
     fn dflash_auto_discovers_matching_qwen_draft() {
         let dir = temp_path("dflash-autodiscover");
         fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("qwen3.5-27b-mq4.hfq");
-        let draft = dir.join("qwen3.5-27b-mq4.dflash.hfq");
+        let target = dir.join("Qwen3.5-27B.mq4.hfq");
+        let draft = dir.join("Qwen3.5-27B-BF16.dflash.hfq");
         fs::write(&target, b"target").unwrap();
         fs::write(&draft, b"draft").unwrap();
 
@@ -2302,8 +2302,8 @@ mod tests {
     fn explicit_dflash_draft_overrides_auto_discovery() {
         let dir = temp_path("dflash-explicit-draft");
         fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("qwen3.5-27b-mq4.hfq");
-        let discovered = dir.join("qwen3.5-27b-mq4.dflash.hfq");
+        let target = dir.join("Qwen3.5-27B.mq4.hfq");
+        let discovered = dir.join("Qwen3.5-27B-BF16.dflash.hfq");
         let explicit = dir.join("custom-draft.hfq");
         fs::write(&target, b"target").unwrap();
         fs::write(&discovered, b"draft").unwrap();

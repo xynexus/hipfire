@@ -3,6 +3,11 @@
 `hipfire-quantize` converts Hugging Face safetensors directories, GGUF files, or
 source-precision `.hfq` files into HipFire `.hfq` artifacts.
 
+The default quant is `oq4.25++`. Omitting `--format` selects its mixed 4.25-bit
+Opus storage plus AWQ and Hessian/LDLQ recipe; the corresponding calibration
+artifact is therefore required. Pass `--format` explicitly to select another
+encoding.
+
 ## Basic Usage
 
 ```bash
@@ -102,14 +107,14 @@ Opus Quant (`oq`) is the symmetric FWHT-rotated signed-integer family. OQ tokens
 describe stored weights and calibration. The runtime can reuse the same OQ
 weights with different activation precision paths.
 
-| Format | Stored weights | Calibration recipe | Quantizer aliases |
-|---|---|---|---|
-| `oq4` | signed int4 OQ, 256-element groups | plain RTN/clip path | legacy `op4`, `op4-4`, `oq4g256` |
-| `oq4+` | same `oq4` bytes | AWQ/SmoothQuant-style activation-aware scaling | none |
-| `oq4++` | same `oq4` bytes | `oq4+` plus full-Hessian LDLQ/OBS error feedback | legacy `op4+`, `op4-4+`, `op4-8+` |
-| `oq8` | signed int8 OQ, 256-element groups | plain RTN/clip path | legacy `op8`, `op8-16`, `oq8g256` |
-| `oq8+` | same `oq8` bytes | AWQ/SmoothQuant-style activation-aware scaling | none |
-| `oq8++` | same `oq8` bytes | `oq8+` plus full-Hessian LDLQ/OBS error feedback | legacy `op8+`, `op8-16+`, `op8-plus` |
+| Format | Stored weights | Calibration recipe |
+|---|---|---|
+| `oq4` | signed int4 OQ, 256-element groups | plain RTN/clip path |
+| `oq4+` | same `oq4` bytes | AWQ/SmoothQuant-style activation-aware scaling |
+| `oq4++` | same `oq4` bytes | `oq4+` plus full-Hessian LDLQ/OBS error feedback |
+| `oq8` | signed int8 OQ, 256-element groups | plain RTN/clip path |
+| `oq8+` | same `oq8` bytes | AWQ/SmoothQuant-style activation-aware scaling |
+| `oq8++` | same `oq8` bytes | `oq8+` plus full-Hessian LDLQ/OBS error feedback |
 
 The Rust code still uses internal enum names such as `Oq4G256` and `Oq8G256`.
 Those are implementation details; artifact names should use the canonical `oq*`
@@ -154,10 +159,6 @@ The plus marks are positional:
   producer-specific artifacts and need an explicit producer/evidence trail.
 - No suffix means the plain weight codec.
 
-Legacy `op4+` and `op8+` predate the positional `+`/`++` taxonomy and currently
-parse as the `++` recipe. New commands and artifacts should use `oq4++` or
-`oq8++` when Hessian feedback is intended.
-
 For a quality-gated `oq4+` artifact, provide activation calibration inputs:
 
 ```bash
@@ -171,26 +172,117 @@ cargo run --release -p hipfire-quantize -- \
 For a quality-gated `oq4++` artifact, provide full-Hessian calibration inputs:
 
 ```bash
-cargo run --release -p hipfire-quantize -- \
-  --input <source-model> \
-  --output ~/.hipfire/models/<name>.oq4++.hfq \
-  --format oq4++ \
-  --awq \
-  --ldlq \
-  --hessian <model>.hessian.bin
+target/release/hipfire-coexistence calibrate \
+  --model /srv/huggingface/models--Qwen--Qwen3.5-397B-A17B \
+  --corpus benchmarks/calib/calib-5m.txt \
+  --output ~/.hipfire/calib/Qwen3.5-397B-A17B.calib.hfq \
+  --kldref \
+  --sequence-batch 64 \
+  --time-tile 32 \
+  --max-rows 2048
 ```
 
-Legacy parser aliases remain accepted for old scripts, but new commands and
-artifact names should stay canonical:
+The family-neutral native engine resolves a thin model adapter, loads the
+embedding once, keeps layer-boundary activations in host memory or an mmap
+spool, then loads one layer from the original safetensor shards and runs every
+calibration microbatch before releasing that layer. Per-layer
+Hessians/imatrices are spooled to disk immediately. The final norm/lm-head load produces
+`lm_head.kldref_{idx,logit,logz}` without another BF16 checkpoint sweep. The
+native read ledger rejects attempted tensor rereads. Routed experts are
+captured separately with per-expert coverage and tile-admission telemetry.
+Undercovered experts either fail the strict gate or are explicitly listed for
+BF16/F16 preservation.
+
+The CLI's automatic geometry ceiling is 2,048 rows. It probes the adapter's
+layer/state/scratch estimate against live VRAM and verifies the candidate with
+a real allocation, falling back to a smaller geometry where required. A gfx1151
+sweep on the 397B source selected 2,048 rows and sequence batch 64 for the
+production recipe; explicit geometry remains part of the artifact fingerprint
+and is required when reproducing that run on another host.
+
+Run the command once with `--dry-run` before allocating the artifact. The JSON
+report includes the compact/dense Hessian mode, calibration payload estimate,
+part-plus-final-assembly peak, mmap boundary bytes, safety margin, filesystem
+free bytes, and a sufficiency verdict. A fresh run is refused when this
+conservative bound does not fit. Corpus tokenization is windowed according to
+the remaining requested sample geometry, so a small smoke does not tokenize a
+large concatenated prefix before truncation.
+
+For a bounded real-weight mechanism check, add `--pause-after-layers N`. The
+engine commits exactly `N` total layers, the boundary checkpoint, and the
+monotonic read ledger, then returns `status: paused` without publishing a
+calibration artifact. Continue the same job with `--resume` and either a larger
+pause count or no pause count. The pause control changes execution scheduling,
+not the run fingerprint or final artifact semantics. Each committed layer also
+records load/upload, execution, capture-write, collector-finish, part-sync/hash,
+and total pre-checkpoint time; the same timing history is copied into the final
+artifact for throughput and resume ETA analysis.
+
+On unified-memory systems, completed safetensor ranges receive mapping-level
+`MADV_DONTNEED` plus a backing-file cache hint after their synchronous GPU
+upload. A canonical range with a declared tied-weight alias is retained until
+the alias view is consumed. This bounds layer-stream RSS without turning a tied
+embedding/lm-head into an untracked source reread; later access safely refaults
+the original read-only bytes.
+
+This is one BF16 source-checkpoint pass. `hipfire-quantize` is the second
+source-checkpoint pass. Later KLD/PPL evaluation reads the quantized HFQ, not
+the BF16 safetensors. `scripts/collect_hessian.py` remains an explicit
+parity/debug oracle; it is not the production model-forward path.
+
+KLDREF is the teacher signal for comparing quant candidates; it is not an
+input to the Hessian calculation itself. `hipfire-quantize` consumes the
+Hessian/imatrix records for AWQ/LDLQ, while the bundled KLDREF is retained for
+matched-corpus candidate scoring and promotion evidence.
 
 ```bash
-  --format op4    # canonical artifact token oq4
-  --format op4+   # canonical artifact token oq4++
+cargo run --release -p hipfire-quantize -- \
+  --input <source-model> \
+  --output ~/.hipfire/models/<name>.oq4.25++.hfq \
+  --format oq4.25++ \
+  --awq \
+  --ldlq \
+  --hessian ~/.hipfire/calib/<Model-Size>.calib.hfq
 ```
 
-Current caveat: `--ldlq` / `oq4++` for Opus Quant reads the legacy HFHS
-`*.hessian.bin` sidecar. The newer unified `*.calib.hfq` collector format is not
-yet wired into this specific OQ4 LDLQ path.
+The two commands can be run as one resumable workflow. Extra quantizer flags
+go after `--`:
+
+```bash
+python3 scripts/two_pass_quantize.py \
+  --model /srv/huggingface/models--Qwen--Qwen3.5-397B-A17B \
+  --calib ~/.hipfire/calib/Qwen3.5-397B-A17B.calib.hfq \
+  --output ~/.hipfire/models/Qwen3.5-397B-A17B.oq4.25++.hfq \
+  --format oq4.25++ \
+  --batch-size 64 \
+  --time-tile 32 \
+  --max-rows 2048 \
+  -- --awq --ldlq
+```
+
+The native calibration command owns the shared GPU lock directly; the wrapper
+scopes pass 2 under `hipfire lock run` without nesting locks. It writes an atomic
+`*.two-pass.json` manifest containing the native read ledger and both artifact
+fingerprints. Use `--skip-calib` to resume pass 2 from an existing artifact,
+and `--dry-run` to inspect both commands without loading the model. Geometry is
+part of the two-pass recipe fingerprint, so a resume cannot silently change its
+sequence batch, time tile, or row budget.
+
+Large quantization runs spill completed tensors to the output filesystem to
+bound RAM. During final HFQ assembly on Linux, each spill range is hole-punched
+only after its payload has been copied and included in the quantization hash.
+This keeps peak temporary storage near one output artifact instead of retaining
+a full spill plus a full second copy; filesystems without hole-punch support
+retain the conservative two-copy behavior.
+
+For the end-to-end Qwen3.5 397B workflow—including DFlash conversion,
+calibration/KLDREF, target quantization, TriAttention/CASK sidecar generation,
+resumption, and an admission manifest—use `scripts/induct_model.py`. See
+[MODEL-INDUCTION.md](MODEL-INDUCTION.md).
+
+`--hessian` retains its historical flag name but reads the unified HFQM
+`*.calib.hfq` package. New workflows must not create legacy HFHS
+`*.hessian.bin` sidecars.
 
 ## Activation-Precision Reuse
 
@@ -245,9 +337,8 @@ the A4/A8 activation error and extra activation-quantization launch.
 - `+` and `++` are quality claims only when the calibration inputs were present
   and the runtime path attaches the matching sidecar. Check loader logs and run
   KLD/PPL/coherence gates before promoting an artifact.
-- Older plan docs may mention `OQ+`, `Opus Plus`, `op4`, or `op8`. Treat those
-  as historical aliases unless the text is explicitly describing the legacy
-  experimental format.
+- Older plan docs may mention `OQ+`, `Opus Plus`, `op4`, or `op8`; these are
+  historical spellings and are not accepted by the current quantizer.
 
 ## Useful Flags
 

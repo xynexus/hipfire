@@ -509,19 +509,22 @@ pub fn oq2_ldlq_pack(
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
-    residual.par_chunks_mut(k).enumerate().for_each(|(row, rr)| {
-        let base = row * k;
-        let mut buf = [0.0f32; 256];
-        for b in 0..nb {
-            for c in 0..256 {
-                buf[c] = weights_f32[base + b * 256 + c];
+    residual
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(row, rr)| {
+            let base = row * k;
+            let mut buf = [0.0f32; 256];
+            for b in 0..nb {
+                for c in 0..256 {
+                    buf[c] = weights_f32[base + b * 256 + c];
+                }
+                crate::cpu_fwht_256(&mut buf, signs1, signs2);
+                for c in 0..256 {
+                    rr[b * 256 + c] = buf[c] as f64;
+                }
             }
-            crate::cpu_fwht_256(&mut buf, signs1, signs2);
-            for c in 0..256 {
-                rr[b * 256 + c] = buf[c] as f64;
-            }
-        }
-    });
+        });
 
     const BLOCK_BYTES: usize = 66; // 2 (f16 scale) + 64 (2-bit×256)
     let mut out = vec![0u8; m * nb * BLOCK_BYTES];

@@ -4,16 +4,34 @@
 //! Reads config.json for architecture detection and quantization config.
 //! Mmaps .safetensors files and serves tensor data by name.
 
-use hipfire_model::{ModelSource, QuantConfig, TensorInfo, ARCH_ID_MAMBA2, ARCH_ID_NEMOTRON_H};
+use hipfire_model::{
+    ModelSource, QuantConfig, TensorInfo, TensorStorageLocation, ARCH_ID_GEMMA3_TEXT,
+    ARCH_ID_GEMMA3_VL, ARCH_ID_MAMBA2, ARCH_ID_NEMOTRON_H,
+};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
+#[cfg(unix)]
+fn release_mmap_range(mmap: &Mmap, offset: usize, len: usize) -> std::io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    // SAFETY: callers invoke this only after the temporary tensor view and its
+    // synchronous host-to-device upload are complete. No slice into this range
+    // remains live. Later reads are permitted and fault the file bytes back in.
+    unsafe { mmap.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, offset, len) }
+}
+
 struct SafetensorsFile {
     _file: File,
     mmap: Mmap,
+    path: PathBuf,
 }
 
 pub struct SafetensorsSource {
@@ -68,13 +86,23 @@ impl SafetensorsSource {
             let mmap = unsafe { Mmap::map(&file)? };
 
             // Parse safetensors header
+            if mmap.len() < 8 {
+                return Err(invalid_safetensors(
+                    st_path,
+                    "file is shorter than header prefix",
+                ));
+            }
             let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
+            let header_size = 8usize.checked_add(header_len).ok_or_else(|| {
+                invalid_safetensors(st_path, "header length overflows address space")
+            })?;
+            if header_size > mmap.len() {
+                return Err(invalid_safetensors(st_path, "header extends beyond file"));
+            }
             let header_json = std::str::from_utf8(&mmap[8..8 + header_len])
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             let raw: serde_json::Value = serde_json::from_str(header_json)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-            let header_size = 8 + header_len;
 
             if let serde_json::Value::Object(map) = raw {
                 for (name, meta) in map {
@@ -90,14 +118,37 @@ impl SafetensorsSource {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let offsets = meta["data_offsets"]
-                        .as_array()
-                        .map(|a| {
-                            let start = a[0].as_u64().unwrap_or(0) as usize;
-                            let end = a[1].as_u64().unwrap_or(0) as usize;
-                            (start, end)
-                        })
-                        .unwrap_or((0, 0));
+                    let offsets = meta["data_offsets"].as_array().ok_or_else(|| {
+                        invalid_safetensors(st_path, &format!("tensor {name} has no data_offsets"))
+                    })?;
+                    if offsets.len() != 2 {
+                        return Err(invalid_safetensors(
+                            st_path,
+                            &format!("tensor {name} data_offsets must contain two values"),
+                        ));
+                    }
+                    let start = offsets[0].as_u64().ok_or_else(|| {
+                        invalid_safetensors(st_path, &format!("tensor {name} start is not u64"))
+                    })? as usize;
+                    let end = offsets[1].as_u64().ok_or_else(|| {
+                        invalid_safetensors(st_path, &format!("tensor {name} end is not u64"))
+                    })? as usize;
+                    if end < start
+                        || header_size
+                            .checked_add(end)
+                            .is_none_or(|end| end > mmap.len())
+                    {
+                        return Err(invalid_safetensors(
+                            st_path,
+                            &format!("tensor {name} byte range is outside the shard"),
+                        ));
+                    }
+                    if tensor_map.contains_key(&name) {
+                        return Err(invalid_safetensors(
+                            st_path,
+                            &format!("tensor {name} appears in more than one shard"),
+                        ));
+                    }
 
                     let tensor_idx = tensors.len();
                     let info = TensorInfo {
@@ -105,15 +156,19 @@ impl SafetensorsSource {
                         dtype,
                         shape,
                         quant_type: 0xFF, // not an HFQ quant_type
-                        data_offset: header_size + offsets.0,
-                        data_size: offsets.1 - offsets.0,
+                        data_offset: header_size + start,
+                        data_size: end - start,
                     };
                     tensors.push(info);
                     tensor_map.insert(name, (file_idx, tensor_idx));
                 }
             }
 
-            files.push(SafetensorsFile { _file: file, mmap });
+            files.push(SafetensorsFile {
+                _file: file,
+                mmap,
+                path: st_path.clone(),
+            });
         }
 
         Ok(Self {
@@ -151,6 +206,32 @@ impl ModelSource for SafetensorsSource {
         ))
     }
 
+    fn release_tensor_pages(&self, name: &str) {
+        let Some(&(file_idx, tensor_idx)) = self.tensor_map.get(name) else {
+            return;
+        };
+        let info = &self.tensors[tensor_idx];
+        #[cfg(unix)]
+        {
+            // MADV_DONTNEED removes this mapping's resident PTEs immediately;
+            // posix_fadvise then gives the page cache the matching backing-file
+            // hint. The mapping remains valid and refaults if a declared alias
+            // later reads the same source range.
+            let _ =
+                release_mmap_range(&self.files[file_idx].mmap, info.data_offset, info.data_size);
+            unsafe {
+                libc::posix_fadvise(
+                    self.files[file_idx]._file.as_raw_fd(),
+                    info.data_offset as libc::off_t,
+                    info.data_size as libc::off_t,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = file_idx;
+    }
+
     fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
         let &(_file_idx, tensor_idx) = self.tensor_map.get(name)?;
         Some(&self.tensors[tensor_idx])
@@ -162,6 +243,16 @@ impl ModelSource for SafetensorsSource {
 
     fn path(&self) -> &Path {
         &self.dir
+    }
+
+    fn tensor_storage(&self, name: &str) -> Option<TensorStorageLocation> {
+        let &(file_idx, tensor_idx) = self.tensor_map.get(name)?;
+        let info = &self.tensors[tensor_idx];
+        Some(TensorStorageLocation {
+            path: self.files[file_idx].path.clone(),
+            byte_offset: info.data_offset as u64,
+            byte_len: info.data_size as u64,
+        })
     }
 
     fn tokenizer_json_path(&self) -> Option<PathBuf> {
@@ -182,6 +273,13 @@ impl ModelSource for SafetensorsSource {
     }
 }
 
+fn invalid_safetensors(path: &Path, message: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("{}: {message}", path.display()),
+    )
+}
+
 fn derive_arch_id(config: &serde_json::Value) -> u32 {
     let archs = config
         .get("architectures")
@@ -199,6 +297,12 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
 
     for arch in &archs {
         let arch_lower = arch.to_lowercase();
+        if arch_lower.contains("gemma3forcausallm") {
+            return ARCH_ID_GEMMA3_TEXT;
+        }
+        if arch_lower.contains("gemma3forconditionalgeneration") {
+            return ARCH_ID_GEMMA3_VL;
+        }
         if arch_lower.contains("qwen3_5")
             || arch_lower.contains("qwen3.5")
             || arch_lower.contains("qwen3_6")
@@ -249,6 +353,8 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         }
         "qwen3" | "qwen2" => 1,
         "llama" | "mistral" => 0,
+        "gemma3_text" => ARCH_ID_GEMMA3_TEXT,
+        "gemma3" => ARCH_ID_GEMMA3_VL,
         "nemotron_h" => ARCH_ID_NEMOTRON_H,
         "mamba2" => ARCH_ID_MAMBA2,
         _ => {
@@ -309,4 +415,150 @@ fn build_metadata_json(config: &serde_json::Value, raw_config: &str) -> String {
     }
 
     serde_json::to_string(&serde_json::Value::Object(meta)).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "hipfire-safetensors-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn write_shard(path: &Path, name: &str, bytes: &[u8]) {
+        let mut header = serde_json::Map::new();
+        header.insert(
+            name.to_string(),
+            serde_json::json!({
+                "dtype": "BF16",
+                "shape": [bytes.len() / 2],
+                "data_offsets": [0, bytes.len()],
+            }),
+        );
+        let header = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut file = File::create(path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    #[test]
+    fn derives_gemma3_text_and_vl_architectures() {
+        assert_eq!(
+            derive_arch_id(&serde_json::json!({
+                "architectures": ["Gemma3ForCausalLM"],
+                "model_type": "gemma3_text"
+            })),
+            ARCH_ID_GEMMA3_TEXT
+        );
+        assert_eq!(
+            derive_arch_id(&serde_json::json!({
+                "architectures": ["Gemma3ForConditionalGeneration"],
+                "model_type": "gemma3",
+                "text_config": { "model_type": "gemma3_text" }
+            })),
+            ARCH_ID_GEMMA3_VL
+        );
+    }
+
+    #[test]
+    fn multi_shard_source_reports_exact_backing_file_and_range() {
+        let dir = temp_dir("multi-shard");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        )
+        .unwrap();
+        write_shard(
+            &dir.join("model-00001-of-00002.safetensors"),
+            "model.embed_tokens.weight",
+            &[1, 2, 3, 4],
+        );
+        write_shard(
+            &dir.join("model-00002-of-00002.safetensors"),
+            "model.layers.0.mlp.down_proj.weight",
+            &[5, 6, 7, 8, 9, 10],
+        );
+
+        let source = SafetensorsSource::open(&dir).unwrap();
+        assert_eq!(source.tensor_names().len(), 2);
+        let embed = source.tensor_storage("model.embed_tokens.weight").unwrap();
+        assert!(embed.path.ends_with("model-00001-of-00002.safetensors"));
+        assert_eq!(embed.byte_len, 4);
+        assert_eq!(
+            source.tensor_data("model.embed_tokens.weight").unwrap().1,
+            [1, 2, 3, 4]
+        );
+        let down = source
+            .tensor_storage("model.layers.0.mlp.down_proj.weight")
+            .unwrap();
+        assert!(down.path.ends_with("model-00002-of-00002.safetensors"));
+        assert_eq!(down.byte_len, 6);
+        drop(source);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn released_mmap_range_refaults_the_original_tensor_bytes() {
+        let dir = temp_dir("madvise-refault");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
+        let payload = vec![0x5au8; 128 * 1024];
+        write_shard(&dir.join("model.safetensors"), "weight", &payload);
+
+        let source = SafetensorsSource::open(&dir).unwrap();
+        let &(file_idx, tensor_idx) = source.tensor_map.get("weight").unwrap();
+        let info = &source.tensors[tensor_idx];
+        assert_eq!(source.tensor_data("weight").unwrap().1, payload);
+        release_mmap_range(
+            &source.files[file_idx].mmap,
+            info.data_offset,
+            info.data_size,
+        )
+        .unwrap();
+        assert_eq!(source.tensor_data("weight").unwrap().1, payload);
+
+        drop(source);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn malformed_range_and_duplicate_tensor_are_rejected() {
+        let malformed = temp_dir("malformed");
+        fs::create_dir_all(&malformed).unwrap();
+        fs::write(malformed.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
+        let header = serde_json::to_vec(&serde_json::json!({
+            "bad": {"dtype":"F16", "shape":[2], "data_offsets":[0, 99]}
+        }))
+        .unwrap();
+        let mut file = File::create(malformed.join("model.safetensors")).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(&[0, 1, 2, 3]).unwrap();
+        drop(file);
+        assert!(SafetensorsSource::open(&malformed).is_err());
+        fs::remove_dir_all(malformed).unwrap();
+
+        let duplicate = temp_dir("duplicate");
+        fs::create_dir_all(&duplicate).unwrap();
+        fs::write(duplicate.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
+        write_shard(&duplicate.join("a.safetensors"), "same", &[1, 2]);
+        write_shard(&duplicate.join("b.safetensors"), "same", &[3, 4]);
+        assert!(SafetensorsSource::open(&duplicate).is_err());
+        fs::remove_dir_all(duplicate).unwrap();
+    }
 }

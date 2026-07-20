@@ -18,6 +18,13 @@ use hipfire_rdna::{ActivationCapture, DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+pub mod boundary;
+pub mod contracts;
+pub mod expert_capture;
+pub mod schedule;
+pub mod source;
+pub mod stream;
+
 /// Rows buffered per tensor before flushing the outer-product. A single
 /// `calib_hessian_outer_f32` over `[FLUSH_BATCH, K]` is ~FLUSH_BATCH× more
 /// efficient than per-token (N=1) launches (the tiled GEMM is built for N≥16),
@@ -52,6 +59,10 @@ fn compact_hessian_bytes(k: usize) -> u64 {
 
 /// Per-tensor on-GPU accumulators + a small activation row buffer.
 struct Acc {
+    /// Canonical checkpoint outputs that share this exact input activation.
+    /// Gate/up and Q/K/V aliases therefore reuse one GPU accumulator while the
+    /// writer still emits one record per source tensor.
+    output_names: Vec<String>,
     diag: GpuTensor,      // [K]   Σx²  (imatrix)
     h: Option<GpuTensor>, // [K,K] Σxxᵀ (Hessian); `None` = imatrix-only tensor
     /// Host f64 reference accumulator (`Some` only under `HIPFIRE_CALIB_F64_AUDIT`).
@@ -63,6 +74,7 @@ struct Acc {
     h_f64: Option<Vec<f64>>,
     buf: GpuTensor,  // [FLUSH_BATCH, K] staged activation rows
     buf_rows: usize, // rows currently staged in `buf`
+    buf_capacity: usize,
     k: usize,
     n_tokens: u64,
 }
@@ -74,22 +86,22 @@ impl Acc {
     /// are captured: a full per-expert Hessian (256 experts × ~48 layers ×
     /// [K,K]) is ~196 GB and does not fit, but the imatrix (Σx², a K-vector)
     /// is ~100 MB and is the importance signal AWQ-style quant needs.
-    fn flush(&mut self, gpu: &mut Gpu) {
+    fn flush_result(&mut self, gpu: &mut Gpu) -> Result<(), contracts::CalibError> {
         if self.buf_rows == 0 {
-            return;
+            return Ok(());
         }
         gpu.calib_sumsq_reduce_f32(&self.buf, &self.diag, self.buf_rows, self.k)
-            .unwrap();
+            .map_err(|error| contracts::CalibError::Runtime(error.to_string()))?;
         if let Some(h) = &self.h {
             gpu.calib_hessian_outer_f32(&self.buf, h, self.buf_rows, self.k)
-                .unwrap();
+                .map_err(|error| contracts::CalibError::Runtime(error.to_string()))?;
         }
         // Audit: accumulate the same rows in f64 on the CPU (no GPU f64 path).
         if let Some(h_f64) = &mut self.h_f64 {
             let k = self.k;
             let rows = gpu
                 .download_f32(&self.buf)
-                .expect("download buf (f64 audit)");
+                .map_err(|error| contracts::CalibError::Runtime(error.to_string()))?;
             for r in 0..self.buf_rows {
                 let x = &rows[r * k..r * k + k];
                 for i in 0..k {
@@ -102,6 +114,12 @@ impl Acc {
             }
         }
         self.buf_rows = 0;
+        Ok(())
+    }
+
+    fn flush(&mut self, gpu: &mut Gpu) {
+        self.flush_result(gpu)
+            .expect("calibration activation reduction");
     }
 }
 
@@ -149,8 +167,69 @@ impl CalibCollector {
         !self.imatrix_only_substr.iter().any(|s| name.contains(s))
     }
 
+    fn allocate_acc(
+        &self,
+        gpu: &mut Gpu,
+        output_names: Vec<String>,
+        policy: contracts::CapturePolicy,
+        k: usize,
+        buf_capacity: usize,
+    ) -> Result<Acc, contracts::CalibError> {
+        let diag = gpu
+            .zeros(&[k], DType::F32)
+            .map_err(|error| contracts::CalibError::Runtime(error.to_string()))?;
+        let h = if policy == contracts::CapturePolicy::HessianAndImatrix {
+            match gpu.zeros(&[k, k], DType::F32) {
+                Ok(h) => Some(h),
+                Err(error) => {
+                    let _ = gpu.free_tensor(diag);
+                    return Err(contracts::CalibError::Runtime(error.to_string()));
+                }
+            }
+        } else {
+            None
+        };
+        let buf = match gpu.zeros(&[buf_capacity, k], DType::F32) {
+            Ok(buf) => buf,
+            Err(error) => {
+                let _ = gpu.free_tensor(diag);
+                if let Some(h) = h {
+                    let _ = gpu.free_tensor(h);
+                }
+                return Err(contracts::CalibError::Runtime(error.to_string()));
+            }
+        };
+        let h_f64 = if self.f64_audit && h.is_some() {
+            Some(vec![0.0f64; k * k])
+        } else {
+            None
+        };
+        Ok(Acc {
+            output_names,
+            diag,
+            h,
+            h_f64,
+            buf,
+            buf_rows: 0,
+            buf_capacity,
+            k,
+            n_tokens: 0,
+        })
+    }
+
     /// Number of distinct tensors captured so far.
     pub fn len(&self) -> usize {
+        self.accs
+            .lock()
+            .unwrap()
+            .values()
+            .map(|acc| acc.output_names.len())
+            .sum()
+    }
+
+    /// Number of physical GPU accumulators. This may be smaller than [`len`]
+    /// when multiple checkpoint outputs share an input activation.
+    pub fn accumulator_len(&self) -> usize {
         self.accs.lock().unwrap().len()
     }
 
@@ -164,20 +243,19 @@ impl CalibCollector {
     /// (the HFQM index/metadata must be written ahead of the payloads).
     pub fn tensor_descriptors(&self) -> Vec<CalibTensorDesc> {
         let accs = self.accs.lock().unwrap();
-        let mut names: Vec<&String> = accs.keys().collect();
-        names.sort();
-        names
-            .iter()
-            .map(|name| {
-                let acc = &accs[*name];
-                CalibTensorDesc {
-                    name: (*name).clone(),
+        let mut descriptors = accs
+            .values()
+            .flat_map(|acc| {
+                acc.output_names.iter().map(|name| CalibTensorDesc {
+                    name: name.clone(),
                     has_hessian: acc.h.is_some(),
                     k: acc.k,
                     n_tokens: acc.n_tokens,
-                }
+                })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
+        descriptors
     }
 
     /// Release all GPU accumulators owned by this collector. Grouped
@@ -225,11 +303,13 @@ impl CalibCollector {
             accs.insert(
                 tensor_name.to_string(),
                 Acc {
+                    output_names: vec![tensor_name.to_string()],
                     diag,
                     h,
                     h_f64: None,
                     buf,
                     buf_rows: 0,
+                    buf_capacity: 1,
                     k,
                     n_tokens: 0,
                 },
@@ -241,6 +321,202 @@ impl CalibCollector {
             gpu.calib_hessian_outer_weighted_f32(x, w, h, n, k).unwrap();
         }
         acc.n_tokens += n as u64;
+    }
+
+    /// Capture through a stable logical descriptor rather than a weight-buffer
+    /// address. Multiple `output_names` share one physical accumulator and are
+    /// expanded only when descriptors and HFQ records are emitted.
+    pub fn capture_by_id(
+        &self,
+        gpu: &mut Gpu,
+        registry: &contracts::CaptureRegistry,
+        capture_id: contracts::CaptureId,
+        input: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> Result<(), contracts::CalibError> {
+        let descriptor = registry.get(capture_id).ok_or_else(|| {
+            contracts::CalibError::InvalidCapture(format!(
+                "unknown logical capture id {}",
+                capture_id.0
+            ))
+        })?;
+        if descriptor.policy == contracts::CapturePolicy::Skip {
+            return Ok(());
+        }
+        if n == 0 || k == 0 || descriptor.input_width != k {
+            return Err(contracts::CalibError::InvalidCapture(format!(
+                "capture {} received shape [{n}, {k}], expected non-zero rows with width {}",
+                capture_id.0, descriptor.input_width
+            )));
+        }
+        let row_stride = input.numel() / n;
+        if row_stride < k {
+            return Err(contracts::CalibError::InvalidCapture(format!(
+                "capture {} input row stride {row_stride} is below width {k}",
+                capture_id.0
+            )));
+        }
+
+        let key = format!("@capture:{:016x}", capture_id.0);
+        let mut accs = self.accs.lock().unwrap();
+        if !accs.contains_key(&key) {
+            accs.insert(
+                key.clone(),
+                self.allocate_acc(
+                    gpu,
+                    descriptor.output_names.clone(),
+                    descriptor.policy,
+                    k,
+                    FLUSH_BATCH,
+                )?,
+            );
+        }
+        let acc = accs.get_mut(&key).unwrap();
+        if acc.k != k || acc.output_names != descriptor.output_names {
+            return Err(contracts::CalibError::InvalidCapture(format!(
+                "capture {} descriptor changed after accumulation started",
+                capture_id.0
+            )));
+        }
+        for row in 0..n {
+            if acc.buf_rows == acc.buf_capacity {
+                acc.flush(gpu);
+            }
+            gpu.memcpy_dtod_at_auto(
+                &acc.buf.buf,
+                acc.buf_rows * k * 4,
+                &input.buf,
+                row * row_stride * 4,
+                k * 4,
+            )
+            .map_err(|error| contracts::CalibError::Runtime(error.to_string()))?;
+            acc.buf_rows += 1;
+        }
+        acc.n_tokens += n as u64;
+        Ok(())
+    }
+
+    /// Execute a quota-capped grouped-expert capture plan against the existing
+    /// grouped-MoE permutation. This stages only admitted routes; teacher
+    /// execution continues to use the unmodified routing tensors.
+    pub fn capture_grouped_plan(
+        &self,
+        gpu: &mut Gpu,
+        registry: &contracts::CaptureRegistry,
+        source: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        plan: &expert_capture::GroupedExpertCapturePlan,
+    ) -> Result<(), contracts::CalibError> {
+        if source.dtype != DType::F32 || sorted_slot_index.dtype != DType::Raw {
+            return Err(contracts::CalibError::InvalidCapture(
+                "grouped expert capture requires an F32 source and Raw i32 sorted indices".into(),
+            ));
+        }
+        let projection_role = match plan.role {
+            contracts::ExpertCaptureRole::GateUpInput => contracts::ProjectionRole::GateUpInput,
+            contracts::ExpertCaptureRole::DownInput => contracts::ProjectionRole::DownInput,
+        };
+        let mut accs = self.accs.lock().unwrap();
+        for action in &plan.actions {
+            if action.layer != plan.layer || action.role != plan.role || action.rows == 0 {
+                return Err(contracts::CalibError::InvalidCapture(
+                    "grouped expert capture action does not match its plan".into(),
+                ));
+            }
+            let capture_id =
+                contracts::CaptureId::new(plan.layer, projection_role, Some(action.expert));
+            let descriptor = registry.get(capture_id).ok_or_else(|| {
+                contracts::CalibError::InvalidCapture(format!(
+                    "missing grouped expert capture descriptor {}",
+                    capture_id.0
+                ))
+            })?;
+            if descriptor.layer != plan.layer
+                || descriptor.role != projection_role
+                || descriptor.expert != Some(action.expert)
+                || descriptor.policy != contracts::CapturePolicy::ImatrixOnly
+            {
+                return Err(contracts::CalibError::InvalidCapture(format!(
+                    "descriptor {} is not the expected imatrix-only routed expert capture",
+                    capture_id.0
+                )));
+            }
+            let quota = descriptor.expert_quota.ok_or_else(|| {
+                contracts::CalibError::InvalidCapture(format!(
+                    "descriptor {} has no expert quota",
+                    capture_id.0
+                ))
+            })?;
+            if quota.tile_rows != action.tile_rows
+                || action.destination_row + action.rows > action.tile_rows
+            {
+                return Err(contracts::CalibError::InvalidCapture(format!(
+                    "descriptor {} tile geometry does not match capture action",
+                    capture_id.0
+                )));
+            }
+            let k = descriptor.input_width;
+            if source.numel() % k != 0 {
+                return Err(contracts::CalibError::InvalidCapture(format!(
+                    "descriptor {} source size {} is not row-major width {k}",
+                    capture_id.0,
+                    source.numel()
+                )));
+            }
+            let key = format!("@capture:{:016x}", capture_id.0);
+            if !accs.contains_key(&key) {
+                accs.insert(
+                    key.clone(),
+                    self.allocate_acc(
+                        gpu,
+                        descriptor.output_names.clone(),
+                        descriptor.policy,
+                        k,
+                        action.tile_rows,
+                    )?,
+                );
+            }
+            let acc = accs.get_mut(&key).expect("accumulator inserted above");
+            if acc.k != k
+                || acc.output_names != descriptor.output_names
+                || acc.buf_capacity != action.tile_rows
+                || acc.buf_rows != action.destination_row
+            {
+                return Err(contracts::CalibError::InvalidCapture(format!(
+                    "descriptor {} capture staging state diverged from its plan",
+                    capture_id.0
+                )));
+            }
+            gpu.calib_gather_rows_f32(
+                source,
+                sorted_slot_index,
+                &acc.buf,
+                action.sorted_start,
+                action.destination_row,
+                action.rows,
+                k,
+                action.source_row_div,
+            )
+            .map_err(|error| contracts::CalibError::Runtime(error.to_string()))?;
+            acc.buf_rows += action.rows;
+            acc.n_tokens += action.rows as u64;
+            if action.flush_full_tile {
+                if acc.buf_rows != acc.buf_capacity {
+                    return Err(contracts::CalibError::InvalidCapture(format!(
+                        "descriptor {} requested a partial normal-path flush",
+                        capture_id.0
+                    )));
+                }
+                acc.flush_result(gpu)?;
+            } else if acc.buf_rows == acc.buf_capacity {
+                return Err(contracts::CalibError::InvalidCapture(format!(
+                    "descriptor {} filled a tile without scheduling its reduction",
+                    capture_id.0
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Stream the accumulated tensors into an HFQM `.calib.hfq` at `path`,
@@ -269,20 +545,29 @@ impl CalibCollector {
         for acc in accs.values_mut() {
             acc.flush(gpu);
         }
-        let mut names: Vec<String> = accs.keys().cloned().collect();
-        names.sort();
+        let mut outputs = accs
+            .iter()
+            .flat_map(|(key, acc)| {
+                acc.output_names
+                    .iter()
+                    .cloned()
+                    .map(|output_name| (output_name, key.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        outputs.sort_by(|left, right| left.0.cmp(&right.0));
 
         // Build the index entries (payload sizes from `k`) + a parallel plan of
         // how to produce each payload, in the SAME order.
         enum Plan {
-            Hessian(String),
-            Imatrix(String),
+            Hessian { key: String, output_name: String },
+            Imatrix { key: String },
             Extra(usize),
         }
         let mut entries: Vec<HfqStreamEntry> = Vec::new();
         let mut plan: Vec<Plan> = Vec::new();
-        for name in &names {
-            let acc = &accs[name];
+        for (output_name, key) in &outputs {
+            let acc = &accs[key];
             if acc.h.is_some() {
                 let (quant_type, data_len) = match hessian_storage {
                     HessianStorage::DenseF32 => (2, (acc.k * acc.k * 4) as u64),
@@ -292,22 +577,25 @@ impl CalibCollector {
                     ),
                 };
                 entries.push(HfqStreamEntry {
-                    name: format!("{name}.hessian"),
+                    name: format!("{output_name}.hessian"),
                     quant_type,
                     shape: vec![acc.k as u32, acc.k as u32],
                     group_size: 0,
                     data_len,
                 });
-                plan.push(Plan::Hessian(name.clone()));
+                plan.push(Plan::Hessian {
+                    key: key.clone(),
+                    output_name: output_name.clone(),
+                });
             }
             entries.push(HfqStreamEntry {
-                name: format!("{name}.imatrix"),
+                name: format!("{output_name}.imatrix"),
                 quant_type: 2,
                 shape: vec![acc.k as u32],
                 group_size: 0,
                 data_len: (acc.k * 4) as u64,
             });
-            plan.push(Plan::Imatrix(name.clone()));
+            plan.push(Plan::Imatrix { key: key.clone() });
         }
         for (j, t) in extra.iter().enumerate() {
             entries.push(HfqStreamEntry {
@@ -328,8 +616,8 @@ impl CalibCollector {
 
         write_hfqm_package_streaming(path, arch_id, metadata_json, &entries, |i, w| {
             match &plan[i] {
-                Plan::Hessian(name) => {
-                    let acc = &accs[name];
+                Plan::Hessian { key, output_name } => {
+                    let acc = &accs[key];
                     let inv = 1.0 / acc.n_tokens.max(1) as f32;
                     let h = gpu.download_f32(acc.h.as_ref().unwrap()).map_err(io_err)?;
                     let diag = gpu.download_f32(&acc.diag).map_err(io_err)?;
@@ -348,7 +636,7 @@ impl CalibCollector {
                         audit_n.set(audit_n.get() + 1);
                         if tmax > audit_max.get() {
                             audit_max.set(tmax);
-                            *audit_worst.borrow_mut() = name.clone();
+                            *audit_worst.borrow_mut() = output_name.clone();
                         }
                     }
                     match hessian_storage {
@@ -358,8 +646,8 @@ impl CalibCollector {
                         }
                     }
                 }
-                Plan::Imatrix(name) => {
-                    let acc = &accs[name];
+                Plan::Imatrix { key } => {
+                    let acc = &accs[key];
                     let inv = 1.0 / acc.n_tokens.max(1) as f32;
                     let diag = gpu.download_f32(&acc.diag).map_err(io_err)?;
                     write_f32_scaled(w, &diag, inv)
@@ -765,38 +1053,17 @@ where
         extra_meta.append(&mut out.extra_meta);
     }
 
-    let n_hessian = all_descriptors.iter().filter(|d| d.has_hessian).count();
-    let n_imatrix = all_descriptors.len();
-    let mut per_tensor_tokens = serde_json::Map::new();
-    for d in &all_descriptors {
-        per_tensor_tokens.insert(d.name.clone(), serde_json::json!(d.n_tokens));
-    }
-    let mut meta = serde_json::json!({
-        "artifact_kind": "calibration",
-        "layers_per_pass": group,
-        "n_hessian": n_hessian,
-        "n_imatrix": n_imatrix,
-        "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
-        "artifacts": ["hessian", "imatrix"],
-    });
-    if let Some(obj) = meta.as_object_mut() {
-        for (k, v) in static_meta {
-            obj.insert((*k).to_string(), v.clone());
-        }
-        for (k, v) in &extra_meta {
-            obj.insert(k.clone(), v.clone());
-        }
-    }
-    let metadata_json = serde_json::to_string(&meta).unwrap();
-    combine_calib_parts(output, arch_id, &metadata_json, &part_paths, &extra_tensors)
+    let metadata =
+        build_calibration_metadata(&all_descriptors, Some(group), static_meta, &extra_meta)?;
+    combine_calib_parts(output, arch_id, &metadata.json, &part_paths, &extra_tensors)
         .map_err(|e| format!("calib combine {}: {e}", output.display()))?;
     for part in part_paths {
         let _ = std::fs::remove_file(part);
     }
 
     Ok(CalibSummary {
-        n_hessian,
-        n_imatrix,
+        n_hessian: metadata.n_hessian,
+        n_imatrix: metadata.n_imatrix,
         max_consistency,
     })
 }
@@ -814,7 +1081,7 @@ fn calib_part_path(output: &std::path::Path, group_idx: usize) -> std::path::Pat
 /// Concatenate the per-group part packages (+ in-RAM `extra` tensors) into the
 /// final combined `.calib.hfq`, streaming each part's blobs through without
 /// materializing them all at once.
-fn combine_calib_parts(
+pub fn combine_calib_parts(
     output: &std::path::Path,
     arch_id: u32,
     metadata_json: &str,
@@ -878,11 +1145,82 @@ fn combine_calib_parts(
 }
 
 /// Per-tensor descriptor from [`CalibCollector::tensor_descriptors`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CalibTensorDesc {
     pub name: String,
     pub has_hessian: bool,
     pub k: usize,
     pub n_tokens: u64,
+}
+
+/// Canonical calibration metadata assembled before the streaming writer emits
+/// the HFQM index. Resident and grouped collectors share this path so artifact
+/// counts, per-tensor rows, provenance, and dynamic extras cannot drift.
+pub struct CalibrationArtifactMetadata {
+    pub n_hessian: usize,
+    pub n_imatrix: usize,
+    pub json: String,
+}
+
+pub fn build_calibration_metadata(
+    descriptors: &[CalibTensorDesc],
+    layers_per_pass: Option<usize>,
+    static_meta: &[(&str, serde_json::Value)],
+    extra_meta: &[(String, serde_json::Value)],
+) -> Result<CalibrationArtifactMetadata, String> {
+    let n_hessian = descriptors
+        .iter()
+        .filter(|descriptor| descriptor.has_hessian)
+        .count();
+    let n_imatrix = descriptors.len();
+    let mut per_tensor_tokens = serde_json::Map::new();
+    for descriptor in descriptors {
+        if per_tensor_tokens
+            .insert(
+                descriptor.name.clone(),
+                serde_json::json!(descriptor.n_tokens),
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "calib: duplicate tensor descriptor {}",
+                descriptor.name
+            ));
+        }
+    }
+
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "artifact_kind".into(),
+        serde_json::Value::String("calibration".into()),
+    );
+    if let Some(layers_per_pass) = layers_per_pass {
+        object.insert("layers_per_pass".into(), serde_json::json!(layers_per_pass));
+    }
+    object.insert("n_hessian".into(), serde_json::json!(n_hessian));
+    object.insert("n_imatrix".into(), serde_json::json!(n_imatrix));
+    object.insert(
+        "per_tensor_tokens".into(),
+        serde_json::Value::Object(per_tensor_tokens),
+    );
+    object.insert(
+        "artifacts".into(),
+        serde_json::json!(["hessian", "imatrix"]),
+    );
+    for (key, value) in static_meta {
+        object.insert((*key).to_string(), value.clone());
+    }
+    for (key, value) in extra_meta {
+        object.insert(key.clone(), value.clone());
+    }
+
+    let json = serde_json::to_string(&serde_json::Value::Object(object))
+        .map_err(|error| format!("calib metadata serialization: {error}"))?;
+    Ok(CalibrationArtifactMetadata {
+        n_hessian,
+        n_imatrix,
+        json,
+    })
 }
 
 /// Result of a calibration-collection pass — the three fields every arch's
@@ -981,44 +1319,22 @@ where
     if descriptors.is_empty() {
         return Err("calib: no tensors captured (check capture_names wiring)".to_string());
     }
-    let n_hessian = descriptors.iter().filter(|d| d.has_hessian).count();
-    let n_imatrix = descriptors.len();
-    let mut per_tensor_tokens = serde_json::Map::new();
-    for d in &descriptors {
-        per_tensor_tokens.insert(d.name.clone(), serde_json::json!(d.n_tokens));
-    }
-    let mut meta = serde_json::json!({
-        "artifact_kind": "calibration",
-        "n_hessian": n_hessian,
-        "n_imatrix": n_imatrix,
-        "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
-        "artifacts": ["hessian", "imatrix"],
-    });
-    if let Some(obj) = meta.as_object_mut() {
-        // static_meta first, then forward extras (so a dynamic field — e.g. the
-        // KLDREF-augmented `artifacts` list — overrides the static default).
-        for (k, v) in static_meta {
-            obj.insert((*k).to_string(), v.clone());
-        }
-        for (k, v) in &forward_out.extra_meta {
-            obj.insert(k.clone(), v.clone());
-        }
-    }
-    let metadata_json = serde_json::to_string(&meta).unwrap();
+    let metadata =
+        build_calibration_metadata(&descriptors, None, static_meta, &forward_out.extra_meta)?;
     let max_consistency = collector
         .write_streaming(
             gpu,
             output,
             arch_id,
-            &metadata_json,
+            &metadata.json,
             &forward_out.extra_tensors,
         )
         .map_err(|e| format!("calib write {}: {e}", output.display()))?;
     collector.free_gpu(gpu);
 
     Ok(CalibSummary {
-        n_hessian,
-        n_imatrix,
+        n_hessian: metadata.n_hessian,
+        n_imatrix: metadata.n_imatrix,
         max_consistency,
     })
 }
@@ -1094,11 +1410,13 @@ impl ActivationCapture for CalibCollector {
             accs.insert(
                 tensor_name.to_string(),
                 Acc {
+                    output_names: vec![tensor_name.to_string()],
                     diag,
                     h,
                     h_f64,
                     buf,
                     buf_rows: 0,
+                    buf_capacity: FLUSH_BATCH,
                     k,
                     n_tokens: 0,
                 },
@@ -1111,7 +1429,7 @@ impl ActivationCapture for CalibCollector {
         // k columns of each of the n rows.
         let row_stride = input.numel() / n.max(1);
         for r in 0..n {
-            if acc.buf_rows == FLUSH_BATCH {
+            if acc.buf_rows == acc.buf_capacity {
                 acc.flush(gpu);
             }
             gpu.memcpy_dtod_at_auto(
@@ -1153,6 +1471,67 @@ mod tests {
         assert_eq!(compact_hessian_bytes(2), 10);
         assert_eq!(compact_hessian_bytes(3), 18);
         assert_eq!(compact_hessian_bytes(4096), 16_789_504);
+    }
+
+    #[test]
+    fn canonical_metadata_matches_legacy_shape_and_dynamic_overrides() {
+        let descriptors = vec![
+            CalibTensorDesc {
+                name: "dense.0".into(),
+                has_hessian: true,
+                k: 4,
+                n_tokens: 12,
+            },
+            CalibTensorDesc {
+                name: "expert.0".into(),
+                has_hessian: false,
+                k: 8,
+                n_tokens: 7,
+            },
+        ];
+        let metadata = build_calibration_metadata(
+            &descriptors,
+            Some(4),
+            &[("corpus", serde_json::json!("fixture"))],
+            &[(
+                "artifacts".into(),
+                serde_json::json!(["hessian", "imatrix", "kldref"]),
+            )],
+        )
+        .unwrap();
+        assert_eq!(metadata.n_hessian, 1);
+        assert_eq!(metadata.n_imatrix, 2);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&metadata.json).unwrap(),
+            serde_json::json!({
+                "artifact_kind": "calibration",
+                "layers_per_pass": 4,
+                "n_hessian": 1,
+                "n_imatrix": 2,
+                "per_tensor_tokens": {"dense.0": 12, "expert.0": 7},
+                "artifacts": ["hessian", "imatrix", "kldref"],
+                "corpus": "fixture",
+            })
+        );
+    }
+
+    #[test]
+    fn canonical_metadata_rejects_duplicate_tensor_descriptors() {
+        let descriptors = vec![
+            CalibTensorDesc {
+                name: "same".into(),
+                has_hessian: true,
+                k: 4,
+                n_tokens: 1,
+            },
+            CalibTensorDesc {
+                name: "same".into(),
+                has_hessian: false,
+                k: 4,
+                n_tokens: 1,
+            },
+        ];
+        assert!(build_calibration_metadata(&descriptors, None, &[], &[]).is_err());
     }
 
     #[test]

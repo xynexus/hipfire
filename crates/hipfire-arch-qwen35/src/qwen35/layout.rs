@@ -109,6 +109,13 @@ pub struct MoeFfnWeights {
     pub expert_shape: Option<hipfire_runtime::weight_pager::ExpertShape>,
     pub expert_gate_up_dtype: Option<DType>,
     pub expert_down_dtype: Option<DType>,
+    /// Per-expert dtype metadata used when experts are paged and therefore do
+    /// not have resident [`ExpertWeights`] records to inspect.  These vectors
+    /// are also populated for resident layers so admission/provenance checks
+    /// can use one representation.  Mixed-precision induction may preserve an
+    /// undercovered expert at BF16/F16 while quantizing its siblings.
+    pub expert_gate_up_dtypes: Vec<DType>,
+    pub expert_down_dtypes: Vec<DType>,
 
     /// ParoQuant only: shared per-layer rotation sidecars for the routed
     /// experts. shisa-ai's PARO checkpoint quantizes all 256 experts with
@@ -120,6 +127,15 @@ pub struct MoeFfnWeights {
     /// lifetime of the layer. `None` for HFQ MoE (per-tensor PARO sidecars
     /// or no PARO at all).
     pub paro_shared: Option<MoeParoSidecars>,
+    /// Owning storage for source safetensors whose routed experts are stacked
+    /// as `[E, M, K]`. `experts` then contains non-owning slice aliases used by
+    /// the existing executor; the two backing allocations are freed once here.
+    pub raw_expert_storage: Option<RawExpertStorage>,
+}
+
+pub struct RawExpertStorage {
+    pub gate_up: GpuTensor,
+    pub down: GpuTensor,
 }
 
 /// Owning storage for the per-layer shared ParoQuant rotation sidecars.
@@ -495,6 +511,7 @@ fn free_weight_tensor_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>,
 }
 
 fn free_moe_ffn_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>, ffn: MoeFfnWeights) {
+    let raw_expert_storage = ffn.raw_expert_storage;
     free_weight_tensor_maybe_slab(gpu, slabs, ffn.router);
     free_weight_tensor_maybe_slab(gpu, slabs, ffn.shared_expert_gate);
     free_weight_tensor_maybe_slab(gpu, slabs, ffn.shared_expert.gate);
@@ -503,7 +520,76 @@ fn free_moe_ffn_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>, ffn: 
     let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
     let _ = gpu.free_tensor(ffn.expert_down_ptrs);
     for e in ffn.experts {
-        free_weight_tensor_maybe_slab(gpu, slabs, e.gate_up);
-        free_weight_tensor_maybe_slab(gpu, slabs, e.down);
+        if raw_expert_storage.is_some() {
+            // These buffers alias slices of the owning stacked allocations.
+            std::mem::forget(e.gate_up.buf);
+            std::mem::forget(e.down.buf);
+        } else {
+            free_weight_tensor_maybe_slab(gpu, slabs, e.gate_up);
+            free_weight_tensor_maybe_slab(gpu, slabs, e.down);
+        }
+    }
+    if let Some(storage) = raw_expert_storage {
+        let _ = gpu.free_tensor(storage.gate_up);
+        let _ = gpu.free_tensor(storage.down);
+    }
+}
+
+pub(crate) fn free_streamed_layer_weights(gpu: &mut Gpu, layer: LayerWeights) {
+    match layer {
+        LayerWeights::DeltaNet(l) => {
+            let _ = gpu.free_tensor(l.attn_norm);
+            let _ = gpu.free_tensor(l.wqkv.buf);
+            let _ = gpu.free_tensor(l.wz.buf);
+            let _ = gpu.free_tensor(l.w_alpha.buf);
+            let _ = gpu.free_tensor(l.w_beta.buf);
+            let _ = gpu.free_tensor(l.a_log);
+            let _ = gpu.free_tensor(l.dt_bias);
+            let _ = gpu.free_tensor(l.conv_weight);
+            let _ = gpu.free_tensor(l.norm_weight);
+            let _ = gpu.free_tensor(l.wo.buf);
+            let _ = gpu.free_tensor(l.ffn_norm);
+            let _ = gpu.free_tensor(l.w_gate.buf);
+            let _ = gpu.free_tensor(l.w_up.buf);
+            let _ = gpu.free_tensor(l.w_down.buf);
+        }
+        LayerWeights::FullAttn(l) => {
+            let _ = gpu.free_tensor(l.attn_norm);
+            let _ = gpu.free_tensor(l.wq.buf);
+            let _ = gpu.free_tensor(l.wk.buf);
+            let _ = gpu.free_tensor(l.wv.buf);
+            let _ = gpu.free_tensor(l.wo.buf);
+            let _ = gpu.free_tensor(l.q_norm);
+            let _ = gpu.free_tensor(l.k_norm);
+            let _ = gpu.free_tensor(l.ffn_norm);
+            let _ = gpu.free_tensor(l.w_gate.buf);
+            let _ = gpu.free_tensor(l.w_up.buf);
+            let _ = gpu.free_tensor(l.w_down.buf);
+        }
+        LayerWeights::DeltaNetMoe(l) => {
+            let _ = gpu.free_tensor(l.attn_norm);
+            let _ = gpu.free_tensor(l.wqkv.buf);
+            let _ = gpu.free_tensor(l.wz.buf);
+            let _ = gpu.free_tensor(l.w_alpha.buf);
+            let _ = gpu.free_tensor(l.w_beta.buf);
+            let _ = gpu.free_tensor(l.a_log);
+            let _ = gpu.free_tensor(l.dt_bias);
+            let _ = gpu.free_tensor(l.conv_weight);
+            let _ = gpu.free_tensor(l.norm_weight);
+            let _ = gpu.free_tensor(l.wo.buf);
+            let _ = gpu.free_tensor(l.ffn_norm);
+            free_moe_ffn_maybe_slab(gpu, None, l.ffn);
+        }
+        LayerWeights::FullAttnMoe(l) => {
+            let _ = gpu.free_tensor(l.attn_norm);
+            let _ = gpu.free_tensor(l.wq.buf);
+            let _ = gpu.free_tensor(l.wk.buf);
+            let _ = gpu.free_tensor(l.wv.buf);
+            let _ = gpu.free_tensor(l.wo.buf);
+            let _ = gpu.free_tensor(l.q_norm);
+            let _ = gpu.free_tensor(l.k_norm);
+            let _ = gpu.free_tensor(l.ffn_norm);
+            free_moe_ffn_maybe_slab(gpu, None, l.ffn);
+        }
     }
 }

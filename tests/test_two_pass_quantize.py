@@ -1,0 +1,193 @@
+import importlib.util
+import json
+from pathlib import Path
+
+
+SCRIPT = Path(__file__).parents[1] / "scripts" / "two_pass_quantize.py"
+SPEC = importlib.util.spec_from_file_location("two_pass_quantize", SCRIPT)
+assert SPEC and SPEC.loader
+two_pass = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(two_pass)
+
+
+def test_default_quant_format_is_mixed_oq425_double_plus():
+    assert two_pass.DEFAULT_QUANT_FORMAT == "oq4.25++"
+
+
+def test_build_commands_use_one_layer_streamed_teacher_pass_then_quantize(tmp_path):
+    model = Path("/srv/huggingface/models--Qwen--Qwen3.5-397B-A17B")
+    calib = tmp_path / "Qwen3.5-397B-A17B.calib.hfq"
+    output = tmp_path / "Qwen3.5-397B-A17B.oq4++.hfq"
+
+    collect_cmd, quant_cmd = two_pass.build_commands(
+        coexistence="target/release/hipfire-coexistence",
+        quantizer="target/release/hipfire-quantize",
+        model=model,
+        calib=calib,
+        output=output,
+        quant_format="oq4++",
+        corpus="benchmarks/prompts/calibration.txt",
+        n_sequences=128,
+        ctx_len=2048,
+        batch_size=64,
+        time_tile=32,
+        max_rows=2048,
+        kldref_topk=64,
+        quant_args=["--awq", "--ldlq"],
+    )
+
+    assert collect_cmd[:2] == ["target/release/hipfire-coexistence", "calibrate"]
+    assert "scripts/collect_hessian.py" not in collect_cmd
+    assert "--kldref" in collect_cmd
+    assert "--resume" in collect_cmd
+    assert collect_cmd[collect_cmd.index("--expert-coverage-policy") + 1] == "preserve-undercovered"
+    assert collect_cmd[collect_cmd.index("--kldref-topk") + 1] == "64"
+    assert collect_cmd[collect_cmd.index("--sequence-batch") + 1] == "64"
+    assert collect_cmd[collect_cmd.index("--time-tile") + 1] == "32"
+    assert collect_cmd[collect_cmd.index("--max-rows") + 1] == "2048"
+    assert quant_cmd == [
+        "target/release/hipfire-quantize",
+        "--input",
+        str(model),
+        "--output",
+        str(output),
+        "--format",
+        "oq4++",
+        "--hessian",
+        str(calib),
+        "--awq",
+        "--ldlq",
+    ]
+    collect_exec, quant_exec = two_pass.scope_gpu_commands("target/release/hipfire", collect_cmd, quant_cmd)
+    assert collect_exec == collect_cmd
+    assert quant_exec[:6] == [
+        "target/release/hipfire",
+        "lock",
+        "run",
+        "two-pass-quantization",
+        "--",
+        "target/release/hipfire-quantize",
+    ]
+
+
+def test_recipe_fingerprint_changes_with_inputs_but_not_dict_order(tmp_path):
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("one\ntwo\n")
+    first = two_pass.recipe_manifest(
+        model=Path("/models/snapshot"),
+        calib=tmp_path / "model.calib.hfq",
+        output=tmp_path / "model.oq4++.hfq",
+        quant_format="oq4++",
+        corpus=corpus,
+        n_sequences=128,
+        ctx_len=2048,
+        batch_size=16,
+        time_tile=32,
+        max_rows=512,
+        kldref_topk=64,
+        quant_args=["--awq", "--ldlq"],
+    )
+    second = two_pass.recipe_manifest(
+        model=Path("/models/snapshot"),
+        calib=tmp_path / "model.calib.hfq",
+        output=tmp_path / "model.oq4++.hfq",
+        quant_format="oq4++",
+        corpus=corpus,
+        n_sequences=128,
+        ctx_len=2048,
+        batch_size=16,
+        time_tile=32,
+        max_rows=512,
+        kldref_topk=64,
+        quant_args=["--awq", "--ldlq"],
+    )
+    assert first == second
+    assert first["recipe_fingerprint"].startswith("sha256:")
+    corpus.write_text("changed\n")
+    changed = two_pass.recipe_manifest(
+        model=Path("/models/snapshot"),
+        calib=tmp_path / "model.calib.hfq",
+        output=tmp_path / "model.oq4++.hfq",
+        quant_format="oq4++",
+        corpus=corpus,
+        n_sequences=128,
+        ctx_len=2048,
+        batch_size=16,
+        time_tile=64,
+        max_rows=1024,
+        kldref_topk=64,
+        quant_args=["--awq", "--ldlq"],
+    )
+    assert changed["recipe_fingerprint"] != first["recipe_fingerprint"]
+    assert first["time_tile"] == 32
+    assert first["max_rows"] == 512
+
+
+def test_manifest_consumes_native_read_ledger_and_artifact_fingerprints(tmp_path):
+    path = tmp_path / "two-pass.json"
+    recipe = {"recipe_fingerprint": "sha256:recipe"}
+    calibration = {
+        "artifact_fingerprint": "fnv64:calib",
+        "metadata": {
+            "run_fingerprint": "fnv1a64:run",
+            "source_manifest": {"fingerprint": "fnv1a64:source"},
+            "job": {"samples": {"fingerprint": "fnv1a64:samples"}},
+            "read_ledger": {
+                "planned_logical": ["a", "b"],
+                "consumed_logical": ["a", "b"],
+                "duplicate_logical": [],
+                "missing_logical": [],
+            },
+        },
+    }
+    quantized = {
+        "artifact_fingerprint": "fnv64:model",
+        "metadata": {
+            "quantization_hash": {"value": "0123456789abcdef"},
+            "calibration": {"xxh64": "feedface"},
+        },
+    }
+
+    manifest = two_pass.update_manifest(
+        path,
+        recipe=recipe,
+        phase="complete",
+        calibration=calibration,
+        quantized=quantized,
+    )
+
+    restored = json.loads(path.read_text())
+    assert restored == manifest
+    assert restored["source_reads"] == calibration["metadata"]["read_ledger"]
+    assert restored["fingerprints"] == {
+        "calibration_artifact": "fnv64:calib",
+        "calibration_run": "fnv1a64:run",
+        "source": "fnv1a64:source",
+        "samples": "fnv1a64:samples",
+        "quantized_artifact": "fnv64:model",
+        "quantized_payload": "0123456789abcdef",
+    }
+
+
+def test_interrupted_manifest_resume_preserves_completed_calibration(tmp_path):
+    path = tmp_path / "two-pass.json"
+    recipe = {"recipe_fingerprint": "sha256:recipe"}
+    calibration = {
+        "artifact_fingerprint": "fnv64:calib",
+        "metadata": {
+            "run_fingerprint": "run",
+            "read_ledger": {"missing_logical": [], "duplicate_logical": []},
+        },
+    }
+    two_pass.update_manifest(
+        path,
+        recipe=recipe,
+        phase="calibration_complete",
+        calibration=calibration,
+    )
+
+    resumed = two_pass.update_manifest(path, recipe=recipe, phase="quantization_running")
+
+    assert resumed["calibration"] == calibration
+    assert resumed["source_reads"] == calibration["metadata"]["read_ledger"]
+    assert resumed["status"] == "quantization_running"

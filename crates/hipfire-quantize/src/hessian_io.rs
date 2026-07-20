@@ -35,7 +35,7 @@
 use byteorder::{ByteOrder, LittleEndian};
 use hipfire_primitives::conv::bf16_bits_to_f32 as bf16_to_f32;
 use memmap2::{Advice, Mmap};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 
@@ -219,6 +219,22 @@ pub struct HessianSidecar {
     _file: File,
     index: HashMap<String, TensorEntry>,
     imatrix_index: HashMap<String, ImatrixEntry>,
+    metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CalibrationAdmission {
+    preserve_high_precision: HashSet<(usize, usize)>,
+}
+
+impl CalibrationAdmission {
+    pub fn preserves(&self, layer: usize, expert: usize) -> bool {
+        self.preserve_high_precision.contains(&(layer, expert))
+    }
+
+    pub fn preserve_high_precision(&self) -> &HashSet<(usize, usize)> {
+        &self.preserve_high_precision
+    }
 }
 
 impl std::fmt::Debug for HessianSidecar {
@@ -265,6 +281,15 @@ fn json_blob_end(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+fn json_usize(value: &serde_json::Value, field: &str) -> Result<usize, HessianError> {
+    let raw = value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| HessianError::InvalidData(format!("metadata field {field} is not u64")))?;
+    usize::try_from(raw)
+        .map_err(|_| HessianError::InvalidData(format!("metadata field {field} exceeds usize")))
+}
+
 impl HessianSidecar {
     pub fn open(path: &Path) -> Result<Self, HessianError> {
         let file = File::open(path)?;
@@ -305,6 +330,10 @@ impl HessianSidecar {
         let meta_bytes = &mmap[metadata_offset..data_offset];
         let json_end = json_blob_end(meta_bytes)
             .ok_or_else(|| HessianError::InvalidData("metadata JSON did not end".into()))?;
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&meta_bytes[..json_end]).map_err(|error| {
+                HessianError::InvalidData(format!("metadata JSON is invalid: {error}"))
+            })?;
         let mut pos = metadata_offset + json_end;
         if pos + 4 > data_offset {
             return Err(HessianError::InvalidData(
@@ -449,6 +478,7 @@ impl HessianSidecar {
             _file: file,
             index,
             imatrix_index,
+            metadata,
         })
     }
 
@@ -509,6 +539,87 @@ impl HessianSidecar {
 
     pub fn n_imatrix_tensors(&self) -> usize {
         self.imatrix_index.len()
+    }
+
+    pub fn metadata(&self) -> &serde_json::Value {
+        &self.metadata
+    }
+
+    /// Validate the native calibration coverage contract and return the set of
+    /// routed experts that the quantizer must preserve at source precision.
+    /// Legacy HFQM files without expert telemetry remain valid dense
+    /// calibration inputs and yield an empty set.
+    pub fn calibration_admission(&self) -> Result<CalibrationAdmission, HessianError> {
+        let Some(telemetry) = self
+            .metadata
+            .get("expert_telemetry")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return Ok(CalibrationAdmission::default());
+        };
+        let min_rows = self
+            .metadata
+            .pointer("/expert_capture_quota/minimum_rows")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                self.metadata
+                    .pointer("/job/options/expert_quota/min_rows")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .ok_or_else(|| {
+                HessianError::InvalidData(
+                    "expert telemetry is present without a minimum-row contract".into(),
+                )
+            })?;
+        let mut deficits = HashSet::new();
+        for layer_value in telemetry {
+            let layer = json_usize(layer_value, "layer")?;
+            for role in ["gate_up", "down"] {
+                let stats = layer_value
+                    .get(role)
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| {
+                        HessianError::InvalidData(format!(
+                            "expert telemetry layer {layer} has no {role} array"
+                        ))
+                    })?;
+                for (expert, stat) in stats.iter().enumerate() {
+                    let admitted = stat
+                        .get("admitted_rows")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| {
+                            HessianError::InvalidData(format!(
+                                "expert telemetry layer {layer} expert {expert} {role} has no admitted_rows"
+                            ))
+                        })?;
+                    if admitted < min_rows {
+                        deficits.insert((layer, expert));
+                    }
+                }
+            }
+        }
+        let mut declared = HashSet::new();
+        for value in self
+            .metadata
+            .get("preserve_high_precision")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            declared.insert((json_usize(value, "layer")?, json_usize(value, "expert")?));
+        }
+        if deficits != declared {
+            let mut missing = deficits.difference(&declared).copied().collect::<Vec<_>>();
+            let mut extra = declared.difference(&deficits).copied().collect::<Vec<_>>();
+            missing.sort_unstable();
+            extra.sort_unstable();
+            return Err(HessianError::InvalidData(format!(
+                "expert coverage fallback mismatch: missing {missing:?}, extra {extra:?}"
+            )));
+        }
+        Ok(CalibrationAdmission {
+            preserve_high_precision: declared,
+        })
     }
 
     /// Cheap symmetry sanity check on a per-tensor basis. Samples 32 random
@@ -575,6 +686,10 @@ mod tests {
     /// plus its sibling `.imatrix` vector. Mirrors
     /// `hipfire_runtime::hfq::write_hfqm_package_mem`.
     fn make_test_package() -> NamedTempFile {
+        make_test_package_with_metadata(br#"{"artifact_kind":"calibration"}"#)
+    }
+
+    fn make_test_package_with_metadata(metadata: &[u8]) -> NamedTempFile {
         struct Entry {
             name: &'static str,
             quant_type: u8,
@@ -597,7 +712,6 @@ mod tests {
             },
         ];
 
-        let metadata = b"{\"artifact_kind\":\"calibration\"}";
         let metadata_offset = 32u64;
         let index_offset = metadata_offset + metadata.len() as u64;
         let mut index = Vec::new();
@@ -730,6 +844,41 @@ mod tests {
         assert_eq!(ia.k, 2);
         assert_eq!(ia.iter_f32().collect::<Vec<_>>(), vec![1.0, 2.0]);
         assert!(sc.imatrix("tA.imatrix").is_none());
+    }
+
+    #[test]
+    fn calibration_admission_requires_exact_undercovered_expert_fallbacks() {
+        let metadata = serde_json::json!({
+            "artifact_kind": "calibration",
+            "expert_capture_quota": { "minimum_rows": 4 },
+            "expert_telemetry": [{
+                "layer": 3,
+                "gate_up": [{"admitted_rows": 4}, {"admitted_rows": 2}],
+                "down": [{"admitted_rows": 5}, {"admitted_rows": 4}],
+            }],
+            "preserve_high_precision": [{"layer": 3, "expert": 1}],
+        });
+        let encoded = serde_json::to_vec(&metadata).unwrap();
+        let tf = make_test_package_with_metadata(&encoded);
+        let sidecar = HessianSidecar::open(tf.path()).unwrap();
+        let admission = sidecar.calibration_admission().unwrap();
+        assert!(admission.preserves(3, 1));
+        assert!(!admission.preserves(3, 0));
+
+        let mismatched = serde_json::json!({
+            "artifact_kind": "calibration",
+            "expert_capture_quota": { "minimum_rows": 4 },
+            "expert_telemetry": [{
+                "layer": 3,
+                "gate_up": [{"admitted_rows": 4}, {"admitted_rows": 2}],
+                "down": [{"admitted_rows": 5}, {"admitted_rows": 4}],
+            }],
+            "preserve_high_precision": [],
+        });
+        let encoded = serde_json::to_vec(&mismatched).unwrap();
+        let tf = make_test_package_with_metadata(&encoded);
+        let sidecar = HessianSidecar::open(tf.path()).unwrap();
+        assert!(sidecar.calibration_admission().is_err());
     }
 
     #[test]

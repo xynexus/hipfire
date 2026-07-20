@@ -28,6 +28,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let group = args.first().map(String::as_str);
     let op = args.get(1).map(String::as_str);
     match (group, op) {
+        (Some("calibrate"), _) => hipfire_coexistence::calibrate::run_cli(&args[1..]),
+        (Some("artifact"), Some("inspect")) => {
+            hipfire_coexistence::artifact::run_inspect_cli(&args[2..])
+        }
         (Some("lora"), Some("export")) => lora_export(&args[2..]),
         (Some("lora"), Some("merge")) => lora_merge(&args[2..]),
         (Some("lora"), Some("convert")) => lora_convert(&args[2..]),
@@ -45,6 +49,15 @@ fn usage() {
     eprintln!(
         "usage: hipfire-coexistence <group> <op> [flags]\n\
          \n\
+         calibrate --model <safetensors-dir-or-cache-root> --corpus <text> \
+         --output <model.calib.hfq> [--sequences N] [--context N] \
+         [--sequence-batch auto|N] [--time-tile auto|N] [--max-rows N] \
+         [--min-expert-activations N] [--expert-capture-target N] \
+         [--expert-capture-tile-rows N] [--expert-coverage-policy \
+         strict|preserve-undercovered] [--kldref|--no-kldref] \
+         [--kldref-topk N] [--boundary-dir DIR|--boundary-ram] [--resume] [--dry-run]\n\
+         [--pause-after-layers N]\n\
+         artifact inspect --input <artifact.hfq>\n\
          lora export  --hfq <model.hfq> --data-dir <dir> [--limit N] [--strength S] \
          [--no-orthogonalize] [--max-seq N] --out <adapter.lora.{{hfq,json}}>\n\
          lora merge   --hfq <base.hfq> --adapter <adapter.lora> --out <merged.hfq>\n\

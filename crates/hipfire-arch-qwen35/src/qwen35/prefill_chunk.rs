@@ -44,6 +44,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // expert (step 5) stays in `pbs.x_batch` — replicated per rank, not
     // redirected. `None` = byte-identical single-GPU behavior.
     routed_out: Option<&GpuTensor>,
+    capture: Option<&dyn hipfire_dispatch::families::moe::MoePrefillCapture>,
 ) -> HipResult<()> {
     let dim = config.dim;
     let mi = config.moe_intermediate_size;
@@ -60,10 +61,19 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     let topk_weights = pbs.moe_topk_weights_batch.as_ref().expect("moe scratch");
     let gate_batch = pbs.moe_gate_batch.as_ref().expect("moe scratch");
     let up_batch = pbs.moe_up_batch.as_ref().expect("moe scratch");
+    let hidden_batch = pbs.moe_hidden_batch.as_ref().expect("moe scratch");
     let rot_batch = pbs.moe_rot_batch.as_ref().expect("moe scratch");
     let down_expanded = pbs.moe_down_expanded_batch.as_ref().expect("moe scratch");
     let dtypes = MoePrefillDtypes::from_ffn(ffn)
         .ok_or_else(|| HipError::new(0, "missing MoE expert dtype metadata for batched prefill"))?;
+    if (!ffn.expert_gate_up_dtypes.is_empty() && ffn.expert_gate_up_dtypes.len() != n_exp)
+        || (!ffn.expert_down_dtypes.is_empty() && ffn.expert_down_dtypes.len() != n_exp)
+    {
+        return Err(HipError::new(
+            0,
+            "MoE per-expert dtype metadata length differs from configured expert count",
+        ));
+    }
     let expert_shape = moe_expert_shape(ffn)
         .ok_or_else(|| HipError::new(0, "missing MoE expert shape metadata for batched prefill"))?;
 
@@ -122,78 +132,31 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // is not applicable when router/shared_expert_gate are Q8 (mixed
     // strides). Four separate launches; +3 per MoE layer over the fused
     // ideal, acceptable for the structural unlock.
-    match ffn.router.gpu_dtype {
-        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
-            &ffn.router.buf,
-            &pbs.x_norm_batch,
-            router_logits,
-            ffn.router.m,
-            ffn.router.k,
-            n,
-        )?,
-        DType::MQ4G256 => gpu.gemm_hfq4g256(
-            &ffn.router.buf,
-            &pbs.x_rot_batch,
-            router_logits,
-            ffn.router.m,
-            ffn.router.k,
-            n,
-        )?,
-        DType::F32 => gpu.gemm_f32_register_tiled(
-            &ffn.router.buf,
-            &pbs.x_norm_batch,
-            router_logits,
-            ffn.router.m,
-            ffn.router.k,
-            n,
-        )?,
-        DType::F16 => gpu.gemm_f16_x_f32_wmma(
-            &ffn.router.buf,
-            &pbs.x_norm_batch,
-            router_logits,
-            ffn.router.m,
-            ffn.router.k,
-            n,
-        )?,
-        DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(
-            &ffn.router.buf,
-            &pbs.x_norm_batch,
-            router_logits,
-            ffn.router.m,
-            ffn.router.k,
-            n,
-        )?,
-        other => panic!(
-            "prefill_moe_ffn_body_batched: unexpected router dtype {other:?} \
-                         — moe_ffn_batched_admissible admits MQ4G256, Q8_0, F32, F16, BF16"
-        ),
-    }
+    let raw_router = match ffn.router.gpu_dtype {
+        DType::F16 => gpu
+            .gemm_f16_x_f32_wmma(
+                &ffn.router.buf,
+                &pbs.x_norm_batch,
+                router_logits,
+                ffn.router.m,
+                ffn.router.k,
+                n,
+            )
+            .map(|()| true)?,
+        DType::BF16 => gpu
+            .gemm_bf16_x_bf16_wmma(
+                &ffn.router.buf,
+                &pbs.x_norm_batch,
+                router_logits,
+                ffn.router.m,
+                ffn.router.k,
+                n,
+            )
+            .map(|()| true)?,
+        _ => false,
+    };
     if config.has_shared_expert {
         match ffn.shared_expert_gate.gpu_dtype {
-            DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
-                &ffn.shared_expert_gate.buf,
-                &pbs.x_norm_batch,
-                shared_scalar,
-                ffn.shared_expert_gate.m,
-                ffn.shared_expert_gate.k,
-                n,
-            )?,
-            DType::MQ4G256 => gpu.gemm_hfq4g256(
-                &ffn.shared_expert_gate.buf,
-                &pbs.x_rot_batch,
-                shared_scalar,
-                ffn.shared_expert_gate.m,
-                ffn.shared_expert_gate.k,
-                n,
-            )?,
-            DType::F32 => gpu.gemm_f32_register_tiled(
-                &ffn.shared_expert_gate.buf,
-                &pbs.x_norm_batch,
-                shared_scalar,
-                ffn.shared_expert_gate.m,
-                ffn.shared_expert_gate.k,
-                n,
-            )?,
             DType::F16 => gpu.gemm_f16_x_f32_wmma(
                 &ffn.shared_expert_gate.buf,
                 &pbs.x_norm_batch,
@@ -210,10 +173,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                 ffn.shared_expert_gate.k,
                 n,
             )?,
-            other => panic!(
-                "prefill_moe_ffn_body_batched: unexpected shared_expert_gate dtype {other:?} \
-                             — moe_ffn_batched_admissible admits MQ4G256, Q8_0, F32, F16, BF16"
-            ),
+            _ => {}
         }
     }
     // #397 Ship 5.2 PILOT: route the router GEMM through GemmFamily::run_key.
@@ -224,7 +184,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // byte-for-byte. The x input still differs per dtype (Q8/F32 read
     // x_norm_batch; MQ4 reads x_rot_batch), exactly as before. The three keys
     // are registered ArchPredicate::Always, so run_key never rejects.
-    {
+    if !raw_router {
         use hipfire_dispatch::families::gemm::GemmParams;
         let ctx = DispatchCtx::new(gpu);
         let (key, x_in): (hipfire_dispatch::types::KernelKey, &GpuTensor) =
@@ -271,7 +231,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // GemmFamily::run_key. Same dtype-routed dispatcher-entry keys as the router
     // match above (Q8/F32 read x_norm_batch, MQ4 reads x_rot_batch) → identical
     // gpu.gemm_* method, byte-for-byte.
-    {
+    if !matches!(ffn.shared_expert_gate.gpu_dtype, DType::F16 | DType::BF16) {
         use hipfire_dispatch::types::KernelKey;
         let (key, x_in): (KernelKey, &GpuTensor) = match ffn.shared_expert_gate.gpu_dtype {
             DType::Q8_0 => (KernelKey::GemmQ8_0BatchedChunked, &pbs.x_norm_batch),
@@ -523,7 +483,14 @@ pub(crate) fn prefill_moe_ffn_body_batched(
             record_moe_router_selection(layer_idx, &indices[start..end], &weights[start..end]);
         }
     }
-    let paged_topk_indices = if ffn.experts.is_empty() {
+    let bucketed_routed_experts = ffn.experts.is_empty() || dtypes.routed_profile.is_mixed();
+    if bucketed_routed_experts && capture.is_some() {
+        return Err(HipError::new(
+            0,
+            "bucketed mixed/paged routed-expert prefill capture is not supported",
+        ));
+    }
+    let bucket_topk_indices = if bucketed_routed_experts {
         let indices = if let Some((indices, _)) = cpu_topk.as_ref() {
             indices.clone()
         } else {
@@ -536,7 +503,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     } else {
         None
     };
-    let paged_expert_buckets = if let Some(indices) = paged_topk_indices.as_ref() {
+    let routed_expert_buckets = if let Some(indices) = bucket_topk_indices.as_ref() {
         Some(build_paged_moe_expert_buckets(indices, n, k_top, n_exp)?)
     } else {
         None
@@ -763,93 +730,340 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         }
     }
 
-    // ── 6. Routed experts: batched gate_up → SwiGLU+FWHT → down ──
-    //
-    // Gate/up for top-K experts (per token) → [N × K_TOP × mi]. Each
-    // output row reads topk_indices[token × K_TOP + krank] to pick its
-    // expert weight base from the device-side expert_gate_up_ptrs table.
-    let down_m = expert_shape.down_m;
-    let down_k = expert_shape.down_k;
-    let gate_up_k = expert_shape.gate_up_k;
+    // Paged experts retain page-in orchestration here. Mixed resident experts
+    // use the same one-expert buckets so each launch interprets its weight
+    // pointer with the correct low-bit or raw layout.
+    if routed_expert_buckets.is_some() {
+        // ── 6. Routed experts: batched gate_up → SwiGLU+FWHT → down ──
+        //
+        // Gate/up for top-K experts (per token) → [N × K_TOP × mi]. Each
+        // output row reads topk_indices[token × K_TOP + krank] to pick its
+        // expert weight base from the device-side expert_gate_up_ptrs table.
+        let down_m = expert_shape.down_m;
+        let down_k = expert_shape.down_k;
+        let gate_up_k = expert_shape.gate_up_k;
 
-    // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) — default ON for
-    // gfx11/gfx12, where the grouped-WMMA kernel is validated (gfx11 routes
-    // to `gemm_hfq4g256_moe_grouped_wmma_k2` via the base w32 WMMA builtin,
-    // gfx12 to the `_gfx12` variant). Empirical lift on Qwen3.5-A3B mq4
-    // prefill=256: gfx1100 7900 XTX 1396 → 2983 tok/s (+114%); gfx1201
-    // R9700 1016 → 2966 tok/s (uniform-mq4.hfq, +192%). CDNA wave64 (gfx9*)
-    // and pre-WMMA RDNA (gfx10*) stay on the per-token indexed_batched
-    // GEMV path. Opt out with `HIPFIRE_MOE_GROUPED_GEMM=0`.
-    // Cached read — getenv on every layer × MoE call adds up.
-    static USE_PATH2_GATE_UP: OnceLock<bool> = OnceLock::new();
-    let use_path2 = *USE_PATH2_GATE_UP.get_or_init(|| {
-        moe_grouped_gemm_path2_enabled_from_env(
-            std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref(),
-        )
-    });
-    let path2_eligible = moe_grouped_gemm_path2_eligible_for_dtype(
-        dtypes.expert_gate_up,
-        &gpu.arch,
-        use_path2 && (!ffn.experts.is_empty() || paged_expert_buckets.is_some()),
-    );
-    // m_total — computed during gate_up scatter, reused for down. Avoids
-    // a second dtoh sync per MoE layer.
-    let mut path2_m_total: usize = 0;
-    let path2_shape = moe_grouped_path2_shape(n, k_top, n_exp);
-    if paged_expert_buckets.is_some() && !path2_eligible {
-        return Err(HipError::new(
-            0,
-            "paged grouped-MoE prefill requires grouped GEMM path2 support",
-        ));
-    }
-    moe_prefill_prepare_routed_gate_up_input(
-        gpu,
-        ffn,
-        &dtypes,
-        &pbs.x_norm_batch,
-        &pbs.x_rot_batch,
-        dim,
-        n,
-    )?;
-    if path2_eligible {
-        // Stage 1 scatter pipeline. The scratch buffers are sized for
-        // worst-case max_batch. Runtime launch bounds use the tighter live
-        // slot upper bound below. Block size 16 (the WMMA tile row count).
-        const BLOCK_M: usize = MOE_GROUPED_BLOCK_M;
-        let counts = pbs.moe_expert_token_counts.as_ref().expect("path2 scratch");
-        let offsets = pbs.moe_expert_offsets.as_ref().expect("path2 scratch");
-        let sorted = pbs.moe_sorted_slot_index.as_ref().expect("path2 scratch");
-        let inverse_perm = pbs.moe_inverse_perm.as_ref().expect("path2 scratch");
-        let tile_ids = pbs.moe_expert_tile_ids.as_ref().expect("path2 scratch");
-        let y_gu_grouped = pbs.moe_y_gate_up_grouped.as_ref().expect("path2 scratch");
-        if let Some(buckets) = paged_expert_buckets.as_ref() {
-            if dtypes.expert_gate_up != DType::MQ6G256 {
-                return Err(HipError::new(
-                    0,
-                    &format!(
-                        "paged grouped-MoE prefill currently supports MQ6 routed experts only, got {:?}",
-                        dtypes.expert_gate_up
-                    ),
-                ));
-            }
-            // Load all active experts once before the per-bucket loops so the
-            // down phase doesn't need a second round of page-ins.
-            let active_experts: Vec<usize> = buckets.iter().map(|b| b.expert as usize).collect();
-            ensure_paged_experts_resident(gpu, pager, ffn, &active_experts)?;
-            for bucket in buckets {
-                upload_paged_moe_expert_bucket(gpu, bucket, sorted, inverse_perm, tile_ids)?;
-                gpu.gemm_hfq6g256_moe_grouped_wmma(
-                    &ffn.expert_gate_up_ptrs,
-                    tile_ids,
+        // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) — default ON for
+        // gfx11/gfx12, where the grouped-WMMA kernel is validated (gfx11 routes
+        // to `gemm_hfq4g256_moe_grouped_wmma_k2` via the base w32 WMMA builtin,
+        // gfx12 to the `_gfx12` variant). Empirical lift on Qwen3.5-A3B mq4
+        // prefill=256: gfx1100 7900 XTX 1396 → 2983 tok/s (+114%); gfx1201
+        // R9700 1016 → 2966 tok/s (uniform-mq4.hfq, +192%). CDNA wave64 (gfx9*)
+        // and pre-WMMA RDNA (gfx10*) stay on the per-token indexed_batched
+        // GEMV path. Opt out with `HIPFIRE_MOE_GROUPED_GEMM=0`.
+        // Cached read — getenv on every layer × MoE call adds up.
+        static USE_PATH2_GATE_UP: OnceLock<bool> = OnceLock::new();
+        let use_path2 = *USE_PATH2_GATE_UP.get_or_init(|| {
+            moe_grouped_gemm_path2_enabled_from_env(
+                std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref(),
+            )
+        });
+        let path2_eligible = moe_grouped_gemm_path2_eligible_for_dtype(
+            dtypes.expert_gate_up,
+            &gpu.arch,
+            (use_path2 || dtypes.routed_profile.is_mixed())
+                && (!ffn.experts.is_empty() || routed_expert_buckets.is_some()),
+        );
+        // m_total — computed during gate_up scatter, reused for down. Avoids
+        // a second dtoh sync per MoE layer.
+        let mut path2_m_total: usize = 0;
+        let path2_shape = moe_grouped_path2_shape(n, k_top, n_exp);
+        if routed_expert_buckets.is_some() && !path2_eligible {
+            return Err(HipError::new(
+                0,
+                "paged grouped-MoE prefill requires grouped GEMM path2 support",
+            ));
+        }
+        moe_prefill_prepare_routed_gate_up_input(
+            gpu,
+            ffn,
+            &dtypes,
+            &pbs.x_norm_batch,
+            &pbs.x_rot_batch,
+            dim,
+            n,
+        )?;
+        if path2_eligible {
+            // Stage 1 scatter pipeline. The scratch buffers are sized for
+            // worst-case max_batch. Runtime launch bounds use the tighter live
+            // slot upper bound below. Block size 16 (the WMMA tile row count).
+            const BLOCK_M: usize = MOE_GROUPED_BLOCK_M;
+            let grouped_scratch = pbs.grouped_moe_scratch.as_ref().expect("path2 scratch");
+            let counts = &grouped_scratch.expert_token_counts;
+            let offsets = &grouped_scratch.expert_offsets;
+            let sorted = &grouped_scratch.sorted_slot_index;
+            let inverse_perm = &grouped_scratch.inverse_perm;
+            let tile_ids = &grouped_scratch.expert_tile_ids;
+            let y_gu_grouped = &grouped_scratch.y_gate_up_grouped;
+            if let Some(buckets) = routed_expert_buckets.as_ref() {
+                // Load all active experts once before the per-bucket loops so the
+                // down phase doesn't need a second round of page-ins.
+                let active_experts: Vec<usize> =
+                    buckets.iter().map(|b| b.expert as usize).collect();
+                ensure_paged_experts_resident(gpu, pager, ffn, &active_experts)?;
+                for bucket in buckets {
+                    let expert = bucket.expert as usize;
+                    let dtype = moe_expert_gate_up_dtype(ffn, expert).ok_or_else(|| {
+                        HipError::new(
+                            0,
+                            &format!("missing gate_up dtype for routed expert {expert}"),
+                        )
+                    })?;
+                    if !mixed_routed_quant_dtype_supported(dtype)
+                        && !matches!(dtype, DType::F16 | DType::BF16)
+                    {
+                        return Err(HipError::new(
+                            0,
+                            &format!(
+                                "bucketed grouped-MoE gate_up does not support expert {expert} dtype {dtype:?}"
+                            ),
+                        ));
+                    }
+                    let x_source = if matches!(dtype, DType::F16 | DType::BF16) {
+                        &pbs.x_norm_batch
+                    } else {
+                        &pbs.x_rot_batch
+                    };
+                    upload_paged_moe_expert_bucket(gpu, bucket, sorted, inverse_perm, tile_ids)?;
+                    hipfire_dispatch::pipeline::run_grouped_moe_gemm(
+                        gpu,
+                        dtype,
+                        &ffn.expert_gate_up_ptrs,
+                        tile_ids,
+                        sorted,
+                        x_source,
+                        y_gu_grouped,
+                        2 * mi,
+                        gate_up_k,
+                        path2_shape.gate_up_x_row_div,
+                        bucket.m_total,
+                        path2_shape.gate_up_source_rows,
+                        false,
+                        false,
+                    )
+                    .map_err(HipError::from)?;
+                    gpu.moe_gate_up_unscatter_k8(
+                        y_gu_grouped,
+                        sorted,
+                        gate_batch,
+                        up_batch,
+                        mi,
+                        k_top,
+                        bucket.m_total,
+                    )?;
+                }
+            } else {
+                // m_total upper bound — scratch is sized in PrefillBatchScratch::new
+                // with the all-experts worst case, while this launch only needs slots
+                // plus padding for experts that can be non-empty at this N.
+                // The scatter fused kernel pre-fills every tile id in this aligned
+                // bound with -1; grouped GEMM early-returns on sentinel tiles, so we
+                // can skip the m_total dtoh sync entirely. Saves ~50µs/layer.
+                let m_total_max = path2_shape.m_total_bound;
+
+                // Fused scatter pipeline: one launch replaces histogram + offsets
+                // + permute. Saves 2 launches × ~75µs × MoE layers.
+                gpu.moe_scatter_fused_k8(
+                    topk_indices,
+                    counts,
+                    offsets,
                     sorted,
-                    &pbs.x_rot_batch,
-                    y_gu_grouped,
-                    2 * mi,
-                    gate_up_k,
-                    path2_shape.gate_up_x_row_div,
-                    bucket.m_total,
-                    path2_shape.gate_up_source_rows,
+                    tile_ids,
+                    inverse_perm,
+                    path2_shape.total_slots,
+                    n_exp,
+                    m_total_max,
+                    BLOCK_M,
                 )?;
+
+                // Use m_total_max as the upper bound for grid sizing — the kernel
+                // early-returns on expert_tile_ids[tile_y] == -1 for the
+                // pre-sentinel'd unused-tile range.
+                path2_m_total = m_total_max;
+                let m_total = m_total_max;
+
+                // Stage 2 grouped GEMM (gate_up). Writes Y_grouped[m_total × 2*mi] direct.
+                // x_src = x_rot_batch [N × dim], x_row_div = K_TOP.
+                // Per-dtype dispatch: experts uniform per layer (admit predicate
+                // enforces). MQ4/MQ3/MQ6 route to their HFQ-layout grouped WMMA
+                // sisters.
+                match dtypes.expert_gate_up {
+                    DType::MQ4G256 => gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
+                        &ffn.expert_gate_up_ptrs,
+                        tile_ids,
+                        sorted,
+                        &pbs.x_rot_batch,
+                        y_gu_grouped,
+                        2 * mi,
+                        gate_up_k,
+                        path2_shape.gate_up_x_row_div,
+                        m_total,
+                        path2_shape.gate_up_source_rows,
+                    )?,
+                    DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
+                        &ffn.expert_gate_up_ptrs,
+                        tile_ids,
+                        sorted,
+                        &pbs.x_rot_batch,
+                        y_gu_grouped,
+                        2 * mi,
+                        gate_up_k,
+                        path2_shape.gate_up_x_row_div,
+                        m_total,
+                        path2_shape.gate_up_source_rows,
+                    )?,
+                    DType::MQ3G256 => gpu.gemm_hfq3g256_moe_grouped_wmma(
+                        &ffn.expert_gate_up_ptrs,
+                        tile_ids,
+                        sorted,
+                        &pbs.x_rot_batch,
+                        y_gu_grouped,
+                        2 * mi,
+                        gate_up_k,
+                        path2_shape.gate_up_x_row_div,
+                        m_total,
+                        path2_shape.gate_up_source_rows,
+                    )?,
+                    DType::MQ2G256Lloyd => {
+                        if mq2_lloyd_n32_gfx1151_enabled(&gpu.arch, path2_shape.total_slots) {
+                            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
+                                &ffn.expert_gate_up_ptrs,
+                                tile_ids,
+                                sorted,
+                                &pbs.x_rot_batch,
+                                y_gu_grouped,
+                                2 * mi,
+                                gate_up_k,
+                                path2_shape.gate_up_x_row_div,
+                                m_total,
+                                path2_shape.gate_up_source_rows,
+                            )?
+                        } else {
+                            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+                                &ffn.expert_gate_up_ptrs,
+                                tile_ids,
+                                sorted,
+                                &pbs.x_rot_batch,
+                                y_gu_grouped,
+                                2 * mi,
+                                gate_up_k,
+                                path2_shape.gate_up_x_row_div,
+                                m_total,
+                                path2_shape.gate_up_source_rows,
+                            )?
+                        }
+                    }
+                    DType::F16 => gpu.gemm_f16_moe_grouped_wmma_gfx1151(
+                        &ffn.expert_gate_up_ptrs,
+                        tile_ids,
+                        sorted,
+                        &pbs.x_norm_batch,
+                        y_gu_grouped,
+                        2 * mi,
+                        gate_up_k,
+                        path2_shape.gate_up_x_row_div,
+                        m_total,
+                        path2_shape.gate_up_source_rows,
+                    )?,
+                    DType::BF16 => gpu.gemm_bf16_moe_grouped_wmma_gfx1151(
+                        &ffn.expert_gate_up_ptrs,
+                        tile_ids,
+                        sorted,
+                        &pbs.x_norm_batch,
+                        y_gu_grouped,
+                        2 * mi,
+                        gate_up_k,
+                        path2_shape.gate_up_x_row_div,
+                        m_total,
+                        path2_shape.gate_up_source_rows,
+                    )?,
+                    // Phase 4: Path 2 ParoQ4G128 grouped-WMMA. All 256 routed
+                    // experts at this layer share one gate_up Givens rotation
+                    // sidecar (ffn.paro_shared.gate_up_*); rotate x_norm into
+                    // x_rot ONCE, then dispatch the HFQ4G128 grouped WMMA. The
+                    // kernel auto-converts the F32 x_rot to F16 internally via
+                    // ensure_fp16_x, same as the G256 sister.
+                    //
+                    // gfx1151 i8 MMQ opt-in (HIPFIRE_MOE_PARO_I8=1): routes to the
+                    // HFQ4G128 i8 MMQ kernel which doubles compute throughput on
+                    // Strix Halo (~140 vs ~71 TFLOPS). Compute-bound regime per
+                    // Phase 4 attribution (gemm_paro_q4g128_moe_grouped_wmma_k2
+                    // = 68.5% GPU time, 25.8 GiB/s — far from BW roof).
+                    DType::ParoQ4G128 => {
+                        let paro = ffn
+                            .paro_shared
+                            .as_ref()
+                            .expect("ParoQ4G128 routed experts require paro_shared sidecars");
+                        gpu.givens_rotate_to(
+                            &pbs.x_norm_batch,
+                            &pbs.x_rot_batch,
+                            &paro.gate_up_pairs,
+                            &paro.gate_up_theta,
+                            &paro.gate_up_channel_scales,
+                            n,
+                            dim,
+                            paro.krot as usize,
+                        )?;
+                        // Default-on for gfx1151 since 2026-05-21: i8 MMQ +6.3% over
+                        // FP16 WMMA, k8 +2.5% over k2, both validated via PARO gen 100
+                        // (clean decode, finite logits) + coherence-gate (MQ4 paths
+                        // unchanged). Opt-out via HIPFIRE_MOE_PARO_I8=0 or _K8=0.
+                        let use_paro_i8 = paro_moe_i8_enabled_for_arch_from_env(
+                            gpu.arch.as_str(),
+                            std::env::var("HIPFIRE_MOE_PARO_I8").ok().as_deref(),
+                        );
+                        let use_paro_i8_k8 = paro_moe_i8_k8_enabled_from_env(
+                            use_paro_i8,
+                            std::env::var("HIPFIRE_MOE_PARO_I8_K8").ok().as_deref(),
+                        );
+                        if use_paro_i8_k8 {
+                            gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
+                                &ffn.expert_gate_up_ptrs,
+                                tile_ids,
+                                sorted,
+                                &pbs.x_rot_batch,
+                                y_gu_grouped,
+                                2 * mi,
+                                gate_up_k,
+                                path2_shape.gate_up_x_row_div,
+                                m_total,
+                                path2_shape.gate_up_source_rows,
+                            )?;
+                        } else if use_paro_i8 {
+                            gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
+                                &ffn.expert_gate_up_ptrs,
+                                tile_ids,
+                                sorted,
+                                &pbs.x_rot_batch,
+                                y_gu_grouped,
+                                2 * mi,
+                                gate_up_k,
+                                path2_shape.gate_up_x_row_div,
+                                m_total,
+                                path2_shape.gate_up_source_rows,
+                            )?;
+                        } else {
+                            gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
+                                &ffn.expert_gate_up_ptrs,
+                                tile_ids,
+                                sorted,
+                                &pbs.x_rot_batch,
+                                y_gu_grouped,
+                                2 * mi,
+                                gate_up_k,
+                                path2_shape.gate_up_x_row_div,
+                                m_total,
+                                path2_shape.gate_up_source_rows,
+                            )?;
+                        }
+                    }
+                    other => panic!(
+                    "prefill_moe_ffn_body_batched: unsupported experts[0].gate_up dtype {other:?} \
+                             — admit predicate should have rejected this layer"
+                ),
+                }
+
+                // Stage 3 unscatter combine. Fans Y_grouped → gate_batch + up_batch.
                 gpu.moe_gate_up_unscatter_k8(
                     y_gu_grouped,
                     sorted,
@@ -857,146 +1071,86 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     up_batch,
                     mi,
                     k_top,
-                    bucket.m_total,
+                    m_total,
                 )?;
             }
         } else {
-            // m_total upper bound — scratch is sized in PrefillBatchScratch::new
-            // with the all-experts worst case, while this launch only needs slots
-            // plus padding for experts that can be non-empty at this N.
-            // The scatter fused kernel pre-fills every tile id in this aligned
-            // bound with -1; grouped GEMM early-returns on sentinel tiles, so we
-            // can skip the m_total dtoh sync entirely. Saves ~50µs/layer.
-            let m_total_max = path2_shape.m_total_bound;
-
-            // Fused scatter pipeline: one launch replaces histogram + offsets
-            // + permute. Saves 2 launches × ~75µs × MoE layers.
-            gpu.moe_scatter_fused_k8(
-                topk_indices,
-                counts,
-                offsets,
-                sorted,
-                tile_ids,
-                inverse_perm,
-                path2_shape.total_slots,
-                n_exp,
-                m_total_max,
-                BLOCK_M,
-            )?;
-
-            // Use m_total_max as the upper bound for grid sizing — the kernel
-            // early-returns on expert_tile_ids[tile_y] == -1 for the
-            // pre-sentinel'd unused-tile range.
-            path2_m_total = m_total_max;
-            let m_total = m_total_max;
-
-            // Stage 2 grouped GEMM (gate_up). Writes Y_grouped[m_total × 2*mi] direct.
-            // x_src = x_rot_batch [N × dim], x_row_div = K_TOP.
-            // Per-dtype dispatch: experts uniform per layer (admit predicate
-            // enforces). MQ4/MQ3/MQ6 route to their HFQ-layout grouped WMMA
-            // sisters.
+            // Path 1 fallback (CDNA/gfx10): per-token indexed GEMV, batched
+            // over the N tokens via grid.z. The dispatch is dtype-keyed because
+            // the kernel reads the weight nibble layout directly (HFQ4G256:
+            // 136 B/group; HFQ4G128/PARO: 72 B/group).
             match dtypes.expert_gate_up {
-                DType::MQ4G256 => gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
+                DType::MQ4G256 => gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
                     &ffn.expert_gate_up_ptrs,
-                    tile_ids,
-                    sorted,
+                    topk_indices,
                     &pbs.x_rot_batch,
-                    y_gu_grouped,
+                    gate_batch,
+                    up_batch,
                     2 * mi,
                     gate_up_k,
-                    path2_shape.gate_up_x_row_div,
-                    m_total,
-                    path2_shape.gate_up_source_rows,
+                    k_top,
+                    n,
                 )?,
-                DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
+                DType::MQ6G256 => gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
                     &ffn.expert_gate_up_ptrs,
-                    tile_ids,
-                    sorted,
+                    topk_indices,
                     &pbs.x_rot_batch,
-                    y_gu_grouped,
+                    gate_batch,
+                    up_batch,
                     2 * mi,
                     gate_up_k,
-                    path2_shape.gate_up_x_row_div,
-                    m_total,
-                    path2_shape.gate_up_source_rows,
+                    k_top,
+                    n,
                 )?,
-                DType::MQ3G256 => gpu.gemm_hfq3g256_moe_grouped_wmma(
+                DType::MQ2G256 => gpu.gemv_hfq2g256_moe_gate_up_k8_indexed_batched(
                     &ffn.expert_gate_up_ptrs,
-                    tile_ids,
-                    sorted,
+                    topk_indices,
                     &pbs.x_rot_batch,
-                    y_gu_grouped,
+                    gate_batch,
+                    up_batch,
                     2 * mi,
                     gate_up_k,
-                    path2_shape.gate_up_x_row_div,
-                    m_total,
-                    path2_shape.gate_up_source_rows,
+                    k_top,
+                    n,
                 )?,
-                DType::MQ2G256Lloyd => {
-                    if mq2_lloyd_n32_gfx1151_enabled(&gpu.arch, path2_shape.total_slots) {
-                        gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
-                            &ffn.expert_gate_up_ptrs,
-                            tile_ids,
-                            sorted,
-                            &pbs.x_rot_batch,
-                            y_gu_grouped,
-                            2 * mi,
-                            gate_up_k,
-                            path2_shape.gate_up_x_row_div,
-                            m_total,
-                            path2_shape.gate_up_source_rows,
-                        )?
-                    } else {
-                        gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
-                            &ffn.expert_gate_up_ptrs,
-                            tile_ids,
-                            sorted,
-                            &pbs.x_rot_batch,
-                            y_gu_grouped,
-                            2 * mi,
-                            gate_up_k,
-                            path2_shape.gate_up_x_row_div,
-                            m_total,
-                            path2_shape.gate_up_source_rows,
-                        )?
-                    }
-                }
-                DType::F16 => gpu.gemm_f16_moe_grouped_wmma_gfx1151(
+                DType::MQ8G256 => gpu.gemv_hfq8g256_moe_gate_up_k8_indexed_batched(
                     &ffn.expert_gate_up_ptrs,
-                    tile_ids,
-                    sorted,
-                    &pbs.x_norm_batch,
-                    y_gu_grouped,
+                    topk_indices,
+                    &pbs.x_rot_batch,
+                    gate_batch,
+                    up_batch,
                     2 * mi,
                     gate_up_k,
-                    path2_shape.gate_up_x_row_div,
-                    m_total,
-                    path2_shape.gate_up_source_rows,
+                    k_top,
+                    n,
                 )?,
-                DType::BF16 => gpu.gemm_bf16_moe_grouped_wmma_gfx1151(
+                DType::MQ2G256Lloyd => gpu.gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched(
                     &ffn.expert_gate_up_ptrs,
-                    tile_ids,
-                    sorted,
-                    &pbs.x_norm_batch,
-                    y_gu_grouped,
+                    topk_indices,
+                    &pbs.x_rot_batch,
+                    gate_batch,
+                    up_batch,
                     2 * mi,
                     gate_up_k,
-                    path2_shape.gate_up_x_row_div,
-                    m_total,
-                    path2_shape.gate_up_source_rows,
+                    k_top,
+                    n,
                 )?,
-                // Phase 4: Path 2 ParoQ4G128 grouped-WMMA. All 256 routed
-                // experts at this layer share one gate_up Givens rotation
-                // sidecar (ffn.paro_shared.gate_up_*); rotate x_norm into
-                // x_rot ONCE, then dispatch the HFQ4G128 grouped WMMA. The
-                // kernel auto-converts the F32 x_rot to F16 internally via
-                // ensure_fp16_x, same as the G256 sister.
-                //
-                // gfx1151 i8 MMQ opt-in (HIPFIRE_MOE_PARO_I8=1): routes to the
-                // HFQ4G128 i8 MMQ kernel which doubles compute throughput on
-                // Strix Halo (~140 vs ~71 TFLOPS). Compute-bound regime per
-                // Phase 4 attribution (gemm_paro_q4g128_moe_grouped_wmma_k2
-                // = 68.5% GPU time, 25.8 GiB/s — far from BW roof).
+                DType::MQ3G256Lloyd => gpu.gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched(
+                    &ffn.expert_gate_up_ptrs,
+                    topk_indices,
+                    &pbs.x_rot_batch,
+                    gate_batch,
+                    up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    k_top,
+                    n,
+                )?,
+                // Phase 3 PARO routed-expert: apply the layer's shared gate_up
+                // Givens rotation to x_norm_batch into x_rot_batch ONCE, then
+                // dispatch the HFQ4G128 indexed batched kernel. All 256 experts
+                // at this layer share the same gate_up rotation sidecar
+                // (ffn.paro_shared, populated by paro_load_moe_shared_sidecars).
                 DType::ParoQ4G128 => {
                     let paro = ffn
                         .paro_shared
@@ -1012,169 +1166,21 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         dim,
                         paro.krot as usize,
                     )?;
-                    // Default-on for gfx1151 since 2026-05-21: i8 MMQ +6.3% over
-                    // FP16 WMMA, k8 +2.5% over k2, both validated via PARO gen 100
-                    // (clean decode, finite logits) + coherence-gate (MQ4 paths
-                    // unchanged). Opt-out via HIPFIRE_MOE_PARO_I8=0 or _K8=0.
-                    let use_paro_i8 = paro_moe_i8_enabled_for_arch_from_env(
-                        gpu.arch.as_str(),
-                        std::env::var("HIPFIRE_MOE_PARO_I8").ok().as_deref(),
-                    );
-                    let use_paro_i8_k8 = paro_moe_i8_k8_enabled_from_env(
-                        use_paro_i8,
-                        std::env::var("HIPFIRE_MOE_PARO_I8_K8").ok().as_deref(),
-                    );
-                    if use_paro_i8_k8 {
-                        gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
-                            &ffn.expert_gate_up_ptrs,
-                            tile_ids,
-                            sorted,
-                            &pbs.x_rot_batch,
-                            y_gu_grouped,
-                            2 * mi,
-                            gate_up_k,
-                            path2_shape.gate_up_x_row_div,
-                            m_total,
-                            path2_shape.gate_up_source_rows,
-                        )?;
-                    } else if use_paro_i8 {
-                        gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
-                            &ffn.expert_gate_up_ptrs,
-                            tile_ids,
-                            sorted,
-                            &pbs.x_rot_batch,
-                            y_gu_grouped,
-                            2 * mi,
-                            gate_up_k,
-                            path2_shape.gate_up_x_row_div,
-                            m_total,
-                            path2_shape.gate_up_source_rows,
-                        )?;
-                    } else {
-                        gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
-                            &ffn.expert_gate_up_ptrs,
-                            tile_ids,
-                            sorted,
-                            &pbs.x_rot_batch,
-                            y_gu_grouped,
-                            2 * mi,
-                            gate_up_k,
-                            path2_shape.gate_up_x_row_div,
-                            m_total,
-                            path2_shape.gate_up_source_rows,
-                        )?;
-                    }
+                    gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed_batched(
+                        &ffn.expert_gate_up_ptrs,
+                        topk_indices,
+                        &pbs.x_rot_batch,
+                        gate_batch,
+                        up_batch,
+                        2 * mi,
+                        gate_up_k,
+                        k_top,
+                        n,
+                    )?;
                 }
-                other => panic!(
-                    "prefill_moe_ffn_body_batched: unsupported experts[0].gate_up dtype {other:?} \
-                             — admit predicate should have rejected this layer"
-                ),
-            }
-
-            // Stage 3 unscatter combine. Fans Y_grouped → gate_batch + up_batch.
-            gpu.moe_gate_up_unscatter_k8(
-                y_gu_grouped,
-                sorted,
-                gate_batch,
-                up_batch,
-                mi,
-                k_top,
-                m_total,
-            )?;
-        }
-    } else {
-        // Path 1 fallback (CDNA/gfx10): per-token indexed GEMV, batched
-        // over the N tokens via grid.z. The dispatch is dtype-keyed because
-        // the kernel reads the weight nibble layout directly (HFQ4G256:
-        // 136 B/group; HFQ4G128/PARO: 72 B/group).
-        match dtypes.expert_gate_up {
-            DType::MQ4G256 => gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-                &ffn.expert_gate_up_ptrs,
-                topk_indices,
-                &pbs.x_rot_batch,
-                gate_batch,
-                up_batch,
-                2 * mi,
-                gate_up_k,
-                k_top,
-                n,
-            )?,
-            DType::MQ6G256 => gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
-                &ffn.expert_gate_up_ptrs,
-                topk_indices,
-                &pbs.x_rot_batch,
-                gate_batch,
-                up_batch,
-                2 * mi,
-                gate_up_k,
-                k_top,
-                n,
-            )?,
-            DType::MQ2G256 => gpu.gemv_hfq2g256_moe_gate_up_k8_indexed_batched(
-                &ffn.expert_gate_up_ptrs,
-                topk_indices,
-                &pbs.x_rot_batch,
-                gate_batch,
-                up_batch,
-                2 * mi,
-                gate_up_k,
-                k_top,
-                n,
-            )?,
-            DType::MQ8G256 => gpu.gemv_hfq8g256_moe_gate_up_k8_indexed_batched(
-                &ffn.expert_gate_up_ptrs,
-                topk_indices,
-                &pbs.x_rot_batch,
-                gate_batch,
-                up_batch,
-                2 * mi,
-                gate_up_k,
-                k_top,
-                n,
-            )?,
-            DType::MQ2G256Lloyd => gpu.gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched(
-                &ffn.expert_gate_up_ptrs,
-                topk_indices,
-                &pbs.x_rot_batch,
-                gate_batch,
-                up_batch,
-                2 * mi,
-                gate_up_k,
-                k_top,
-                n,
-            )?,
-            DType::MQ3G256Lloyd => gpu.gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched(
-                &ffn.expert_gate_up_ptrs,
-                topk_indices,
-                &pbs.x_rot_batch,
-                gate_batch,
-                up_batch,
-                2 * mi,
-                gate_up_k,
-                k_top,
-                n,
-            )?,
-            // Phase 3 PARO routed-expert: apply the layer's shared gate_up
-            // Givens rotation to x_norm_batch into x_rot_batch ONCE, then
-            // dispatch the HFQ4G128 indexed batched kernel. All 256 experts
-            // at this layer share the same gate_up rotation sidecar
-            // (ffn.paro_shared, populated by paro_load_moe_shared_sidecars).
-            DType::ParoQ4G128 => {
-                let paro = ffn
-                    .paro_shared
-                    .as_ref()
-                    .expect("ParoQ4G128 routed experts require paro_shared sidecars");
-                gpu.givens_rotate_to(
-                    &pbs.x_norm_batch,
-                    &pbs.x_rot_batch,
-                    &paro.gate_up_pairs,
-                    &paro.gate_up_theta,
-                    &paro.gate_up_channel_scales,
-                    n,
-                    dim,
-                    paro.krot as usize,
-                )?;
-                gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed_batched(
+                // Opus Quant routed experts (indexed Path 1; no grouped-WMMA kernel).
+                // x_rot_batch is FWHT-rotated above like the MQ path.
+                DType::Oq4G256 => gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
                     &ffn.expert_gate_up_ptrs,
                     topk_indices,
                     &pbs.x_rot_batch,
@@ -1184,121 +1190,324 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     gate_up_k,
                     k_top,
                     n,
-                )?;
-            }
-            // Opus Quant routed experts (indexed Path 1; no grouped-WMMA kernel).
-            // x_rot_batch is FWHT-rotated above like the MQ path.
-            DType::Oq4G256 => gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
-                &ffn.expert_gate_up_ptrs,
-                topk_indices,
-                &pbs.x_rot_batch,
-                gate_batch,
-                up_batch,
-                2 * mi,
-                gate_up_k,
-                k_top,
-                n,
-            )?,
-            DType::Oq8G256 => gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
-                &ffn.expert_gate_up_ptrs,
-                topk_indices,
-                &pbs.x_rot_batch,
-                gate_batch,
-                up_batch,
-                2 * mi,
-                gate_up_k,
-                k_top,
-                n,
-            )?,
-            other => panic!(
-                "prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
+                )?,
+                DType::Oq8G256 => gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+                    &ffn.expert_gate_up_ptrs,
+                    topk_indices,
+                    &pbs.x_rot_batch,
+                    gate_batch,
+                    up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    k_top,
+                    n,
+                )?,
+                other => panic!(
+                    "prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
                              experts[0].gate_up dtype {other:?} — admit predicate should \
                              have rejected this layer"
-            ),
-        }
-    }
-
-    // SwiGLU + FWHT over [N*K_TOP × mi] — batch flatten across tokens and
-    // expert ranks, k=mi is per-row width.
-    // F2: AWQ-aware silu_mul+rotate; experts[0].down is representative (all
-    // experts at this layer share imatrix at the same residual basis).
-    // PARO branch (Phase 3): the layer-shared `down` rotation sidecar lives
-    // on ffn.paro_shared (not per-expert; all 256 experts alias the same
-    // tuple). Apply via fused_silu_mul_givens_rotate_f32 over the flattened
-    // [n*k_top × mi] grid.
-    if paro_mode {
-        let paro = ffn
-            .paro_shared
-            .as_ref()
-            .expect("ParoQ4G128 routed experts require paro_shared sidecars");
-        gpu.fused_silu_mul_givens_rotate_f32(
-            gate_batch,
-            up_batch,
-            rot_batch,
-            &paro.down_pairs,
-            &paro.down_theta,
-            &paro.down_channel_scales,
-            n * k_top,
-            mi,
-            paro.krot as usize,
-        )?;
-    } else if matches!(dtypes.expert_down, DType::F16 | DType::BF16) {
-        gpu.silu_mul_f32(gate_batch, up_batch, rot_batch)?;
-    } else if ffn.experts.is_empty() {
-        gpu.fused_silu_mul_rotate_mq_batched(gate_batch, up_batch, rot_batch, mi, n * k_top)?;
-    } else {
-        fused_silu_mul_rotate_mq_batched_for(
-            gpu,
-            &ffn.experts[0].down,
-            gate_batch,
-            up_batch,
-            rot_batch,
-            mi,
-            n * k_top,
-        )?;
-    }
-
-    // Down projection. Three paths:
-    //   Path 2 (HIPFIRE_MOE_GROUPED_GEMM=1, RDNA): grouped-WMMA-GEMM
-    //     reusing the gate_up scatter + inverse_perm + a non-atomic combine.
-    //   Path 1 (RDNA, default): atomic-free expanded GEMV write + combine.
-    //   Path 0 (CDNA wave64 fallback): residual_scaled atomic GEMV.
-    //
-    // Path 1: K_TOP-way atomicAdd contention per output cell — 387 GiB/s
-    // observed vs 954 on the sister gate_up. Path 2 amortizes weights via
-    // WMMA across the m_total tokens routed to each expert; ~67ms saved on
-    // the down kernel for A3B prefill at batch 256 (R9700).
-    // CDNA (wave64, HBM2/3) stays on Path 0 — cheap HBM atomics +
-    // expanded scratch cost makes the GEMV pattern competitive.
-    if path2_eligible {
-        let y_down_grouped = pbs.moe_y_down_grouped.as_ref().expect("path2 scratch");
-        let inverse_perm = pbs.moe_inverse_perm.as_ref().expect("path2 scratch");
-        let sorted = pbs.moe_sorted_slot_index.as_ref().expect("path2 scratch");
-        let tile_ids = pbs.moe_expert_tile_ids.as_ref().expect("path2 scratch");
-        if let Some(buckets) = paged_expert_buckets.as_ref() {
-            if dtypes.expert_down != DType::MQ6G256 {
-                return Err(HipError::new(
-                    0,
-                    &format!(
-                        "paged grouped-MoE prefill currently supports MQ6 routed down experts only, got {:?}",
-                        dtypes.expert_down
-                    ),
-                ));
+                ),
             }
-            for bucket in buckets {
-                upload_paged_moe_expert_bucket(gpu, bucket, sorted, inverse_perm, tile_ids)?;
-                gpu.gemm_hfq6g256_moe_grouped_wmma(
-                    &ffn.expert_down_ptrs,
-                    tile_ids,
-                    sorted,
+        }
+
+        // SwiGLU + FWHT over [N*K_TOP × mi] — batch flatten across tokens and
+        // expert ranks, k=mi is per-row width.
+        // F2: AWQ-aware silu_mul+rotate; experts[0].down is representative (all
+        // experts at this layer share imatrix at the same residual basis).
+        // PARO branch (Phase 3): the layer-shared `down` rotation sidecar lives
+        // on ffn.paro_shared (not per-expert; all 256 experts alias the same
+        // tuple). Apply via fused_silu_mul_givens_rotate_f32 over the flattened
+        // [n*k_top × mi] grid.
+        if paro_mode {
+            let paro = ffn
+                .paro_shared
+                .as_ref()
+                .expect("ParoQ4G128 routed experts require paro_shared sidecars");
+            gpu.fused_silu_mul_givens_rotate_f32(
+                gate_batch,
+                up_batch,
+                rot_batch,
+                &paro.down_pairs,
+                &paro.down_theta,
+                &paro.down_channel_scales,
+                n * k_top,
+                mi,
+                paro.krot as usize,
+            )?;
+        } else if dtypes.routed_profile.is_mixed() {
+            // Raw fallback experts and low-bit siblings share gate/up results,
+            // but their down projections consume different activation bases.
+            // Materialize the unrotated SwiGLU once, then derive the quantized
+            // basis into the existing rotation buffer.
+            gpu.silu_mul_f32(gate_batch, up_batch, hidden_batch)?;
+            if ffn.experts.is_empty() {
+                gpu.rotate_x_mq_batched(hidden_batch, rot_batch, mi, n * k_top)?;
+            } else {
+                let representative = ffn
+                    .experts
+                    .iter()
+                    .find(|expert| expert.down.gpu_dtype == dtypes.expert_down)
+                    .ok_or_else(|| {
+                        HipError::new(0, "mixed MoE layer has no quantized down representative")
+                    })?;
+                rotate_x_mq_batched_for(
+                    gpu,
+                    &representative.down,
+                    hidden_batch,
                     rot_batch,
-                    y_down_grouped,
-                    down_m,
-                    down_k,
-                    path2_shape.down_x_row_div,
-                    bucket.m_total,
-                    path2_shape.down_source_rows,
+                    mi,
+                    n * k_top,
                 )?;
+            }
+        } else if matches!(dtypes.expert_down, DType::F16 | DType::BF16) {
+            gpu.silu_mul_f32(gate_batch, up_batch, rot_batch)?;
+        } else if ffn.experts.is_empty() {
+            gpu.fused_silu_mul_rotate_mq_batched(gate_batch, up_batch, rot_batch, mi, n * k_top)?;
+        } else {
+            fused_silu_mul_rotate_mq_batched_for(
+                gpu,
+                &ffn.experts[0].down,
+                gate_batch,
+                up_batch,
+                rot_batch,
+                mi,
+                n * k_top,
+            )?;
+        }
+
+        // Down projection. Three paths:
+        //   Path 2 (HIPFIRE_MOE_GROUPED_GEMM=1, RDNA): grouped-WMMA-GEMM
+        //     reusing the gate_up scatter + inverse_perm + a non-atomic combine.
+        //   Path 1 (RDNA, default): atomic-free expanded GEMV write + combine.
+        //   Path 0 (CDNA wave64 fallback): residual_scaled atomic GEMV.
+        //
+        // Path 1: K_TOP-way atomicAdd contention per output cell — 387 GiB/s
+        // observed vs 954 on the sister gate_up. Path 2 amortizes weights via
+        // WMMA across the m_total tokens routed to each expert; ~67ms saved on
+        // the down kernel for A3B prefill at batch 256 (R9700).
+        // CDNA (wave64, HBM2/3) stays on Path 0 — cheap HBM atomics +
+        // expanded scratch cost makes the GEMV pattern competitive.
+        if path2_eligible {
+            let grouped_scratch = pbs.grouped_moe_scratch.as_ref().expect("path2 scratch");
+            let y_down_grouped = &grouped_scratch.y_down_grouped;
+            let inverse_perm = &grouped_scratch.inverse_perm;
+            let sorted = &grouped_scratch.sorted_slot_index;
+            let tile_ids = &grouped_scratch.expert_tile_ids;
+            if let Some(buckets) = routed_expert_buckets.as_ref() {
+                let routed_target = routed_out.unwrap_or(&pbs.x_batch);
+                for bucket in buckets {
+                    let expert = bucket.expert as usize;
+                    let dtype = moe_expert_down_dtype(ffn, expert).ok_or_else(|| {
+                        HipError::new(0, &format!("missing down dtype for routed expert {expert}"))
+                    })?;
+                    if !mixed_routed_quant_dtype_supported(dtype)
+                        && !matches!(dtype, DType::F16 | DType::BF16)
+                    {
+                        return Err(HipError::new(
+                            0,
+                            &format!(
+                                "bucketed grouped-MoE down does not support expert {expert} dtype {dtype:?}"
+                            ),
+                        ));
+                    }
+                    let down_source = if matches!(dtype, DType::F16 | DType::BF16) {
+                        hidden_batch
+                    } else {
+                        rot_batch
+                    };
+                    upload_paged_moe_expert_bucket(gpu, bucket, sorted, inverse_perm, tile_ids)?;
+                    hipfire_dispatch::pipeline::run_grouped_moe_gemm(
+                        gpu,
+                        dtype,
+                        &ffn.expert_down_ptrs,
+                        tile_ids,
+                        sorted,
+                        down_source,
+                        y_down_grouped,
+                        down_m,
+                        down_k,
+                        path2_shape.down_x_row_div,
+                        bucket.m_total,
+                        path2_shape.down_source_rows,
+                        false,
+                        false,
+                    )
+                    .map_err(HipError::from)?;
+                    gpu.moe_down_combine_grouped_k8(
+                        y_down_grouped,
+                        inverse_perm,
+                        topk_weights,
+                        routed_target,
+                        down_m,
+                        k_top,
+                        n,
+                    )?;
+                }
+            } else {
+                // m_total already computed during gate_up scatter — reuse to skip
+                // a second dtoh sync per MoE layer (~50µs each × 40 layers = 2ms).
+                let m_total = path2_m_total;
+
+                // Grouped GEMM on down: x_src = rot_batch [N*K_TOP × mi], x_row_div = 1
+                // (sorted_slot_index[slot] directly indexes the source row).
+                // Per-dtype dispatch: experts uniform per layer. MQ4 → HFQ4-layout;
+                // MQ6 → HFQ6 sister (shipped via feat/hfq6-moe-grouped-wmma).
+                match dtypes.expert_down {
+                    DType::MQ4G256 => gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
+                        &ffn.expert_down_ptrs,
+                        tile_ids,
+                        sorted,
+                        rot_batch,
+                        y_down_grouped,
+                        down_m,
+                        down_k,
+                        path2_shape.down_x_row_div,
+                        m_total,
+                        path2_shape.down_source_rows,
+                    )?,
+                    DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
+                        &ffn.expert_down_ptrs,
+                        tile_ids,
+                        sorted,
+                        rot_batch,
+                        y_down_grouped,
+                        down_m,
+                        down_k,
+                        path2_shape.down_x_row_div,
+                        m_total,
+                        path2_shape.down_source_rows,
+                    )?,
+                    DType::MQ3G256 => gpu.gemm_hfq3g256_moe_grouped_wmma(
+                        &ffn.expert_down_ptrs,
+                        tile_ids,
+                        sorted,
+                        rot_batch,
+                        y_down_grouped,
+                        down_m,
+                        down_k,
+                        path2_shape.down_x_row_div,
+                        m_total,
+                        path2_shape.down_source_rows,
+                    )?,
+                    DType::MQ2G256Lloyd => {
+                        if mq2_lloyd_n32_gfx1151_enabled(&gpu.arch, path2_shape.total_slots) {
+                            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
+                                &ffn.expert_down_ptrs,
+                                tile_ids,
+                                sorted,
+                                rot_batch,
+                                y_down_grouped,
+                                down_m,
+                                down_k,
+                                path2_shape.down_x_row_div,
+                                m_total,
+                                path2_shape.down_source_rows,
+                            )?
+                        } else {
+                            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+                                &ffn.expert_down_ptrs,
+                                tile_ids,
+                                sorted,
+                                rot_batch,
+                                y_down_grouped,
+                                down_m,
+                                down_k,
+                                path2_shape.down_x_row_div,
+                                m_total,
+                                path2_shape.down_source_rows,
+                            )?
+                        }
+                    }
+                    DType::F16 => gpu.gemm_f16_moe_grouped_wmma_gfx1151(
+                        &ffn.expert_down_ptrs,
+                        tile_ids,
+                        sorted,
+                        rot_batch,
+                        y_down_grouped,
+                        down_m,
+                        down_k,
+                        path2_shape.down_x_row_div,
+                        m_total,
+                        path2_shape.down_source_rows,
+                    )?,
+                    DType::BF16 => gpu.gemm_bf16_moe_grouped_wmma_gfx1151(
+                        &ffn.expert_down_ptrs,
+                        tile_ids,
+                        sorted,
+                        rot_batch,
+                        y_down_grouped,
+                        down_m,
+                        down_k,
+                        path2_shape.down_x_row_div,
+                        m_total,
+                        path2_shape.down_source_rows,
+                    )?,
+                    // Phase 4: Path 2 ParoQ4G128 down grouped-WMMA (with i8 MMQ
+                    // opt-in for gfx1151 — see gate_up arm above). rot_batch was
+                    // already Givens-rotated by paro_shared.down_* via the PARO
+                    // fused_silu_mul_givens_rotate_f32 step above; the kernel is
+                    // rotation-agnostic. Same kernel for gate_up + down — only
+                    // shape parameters and x_row_div differ.
+                    DType::ParoQ4G128 => {
+                        // Default-on for gfx1151 since 2026-05-21: i8 MMQ +6.3% over
+                        // FP16 WMMA, k8 +2.5% over k2, both validated via PARO gen 100
+                        // (clean decode, finite logits) + coherence-gate (MQ4 paths
+                        // unchanged). Opt-out via HIPFIRE_MOE_PARO_I8=0 or _K8=0.
+                        let use_paro_i8 = paro_moe_i8_enabled_for_arch_from_env(
+                            gpu.arch.as_str(),
+                            std::env::var("HIPFIRE_MOE_PARO_I8").ok().as_deref(),
+                        );
+                        let use_paro_i8_k8 = paro_moe_i8_k8_enabled_from_env(
+                            use_paro_i8,
+                            std::env::var("HIPFIRE_MOE_PARO_I8_K8").ok().as_deref(),
+                        );
+                        if use_paro_i8_k8 {
+                            gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
+                                &ffn.expert_down_ptrs,
+                                tile_ids,
+                                sorted,
+                                rot_batch,
+                                y_down_grouped,
+                                down_m,
+                                down_k,
+                                path2_shape.down_x_row_div,
+                                m_total,
+                                path2_shape.down_source_rows,
+                            )?;
+                        } else if use_paro_i8 {
+                            gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
+                                &ffn.expert_down_ptrs,
+                                tile_ids,
+                                sorted,
+                                rot_batch,
+                                y_down_grouped,
+                                down_m,
+                                down_k,
+                                path2_shape.down_x_row_div,
+                                m_total,
+                                path2_shape.down_source_rows,
+                            )?;
+                        } else {
+                            gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
+                                &ffn.expert_down_ptrs,
+                                tile_ids,
+                                sorted,
+                                rot_batch,
+                                y_down_grouped,
+                                down_m,
+                                down_k,
+                                path2_shape.down_x_row_div,
+                                m_total,
+                                path2_shape.down_source_rows,
+                            )?;
+                        }
+                    }
+                    other => panic!(
+                    "prefill_moe_ffn_body_batched: unsupported experts[0].down dtype {other:?} \
+                             — admit predicate should have rejected this layer"
+                ),
+                }
+                // Non-atomic combine via inverse_perm + topk_weights.
                 gpu.moe_down_combine_grouped_k8(
                     y_down_grouped,
                     inverse_perm,
@@ -1310,230 +1519,14 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                 )?;
             }
         } else {
-            // m_total already computed during gate_up scatter — reuse to skip
-            // a second dtoh sync per MoE layer (~50µs each × 40 layers = 2ms).
-            let m_total = path2_m_total;
-
-            // Grouped GEMM on down: x_src = rot_batch [N*K_TOP × mi], x_row_div = 1
-            // (sorted_slot_index[slot] directly indexes the source row).
-            // Per-dtype dispatch: experts uniform per layer. MQ4 → HFQ4-layout;
-            // MQ6 → HFQ6 sister (shipped via feat/hfq6-moe-grouped-wmma).
-            match dtypes.expert_down {
-                DType::MQ4G256 => gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
-                    &ffn.expert_down_ptrs,
-                    tile_ids,
-                    sorted,
-                    rot_batch,
-                    y_down_grouped,
-                    down_m,
-                    down_k,
-                    path2_shape.down_x_row_div,
-                    m_total,
-                    path2_shape.down_source_rows,
-                )?,
-                DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
-                    &ffn.expert_down_ptrs,
-                    tile_ids,
-                    sorted,
-                    rot_batch,
-                    y_down_grouped,
-                    down_m,
-                    down_k,
-                    path2_shape.down_x_row_div,
-                    m_total,
-                    path2_shape.down_source_rows,
-                )?,
-                DType::MQ3G256 => gpu.gemm_hfq3g256_moe_grouped_wmma(
-                    &ffn.expert_down_ptrs,
-                    tile_ids,
-                    sorted,
-                    rot_batch,
-                    y_down_grouped,
-                    down_m,
-                    down_k,
-                    path2_shape.down_x_row_div,
-                    m_total,
-                    path2_shape.down_source_rows,
-                )?,
-                DType::MQ2G256Lloyd => {
-                    if mq2_lloyd_n32_gfx1151_enabled(&gpu.arch, path2_shape.total_slots) {
-                        gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
-                            &ffn.expert_down_ptrs,
-                            tile_ids,
-                            sorted,
-                            rot_batch,
-                            y_down_grouped,
-                            down_m,
-                            down_k,
-                            path2_shape.down_x_row_div,
-                            m_total,
-                            path2_shape.down_source_rows,
-                        )?
-                    } else {
-                        gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
-                            &ffn.expert_down_ptrs,
-                            tile_ids,
-                            sorted,
-                            rot_batch,
-                            y_down_grouped,
-                            down_m,
-                            down_k,
-                            path2_shape.down_x_row_div,
-                            m_total,
-                            path2_shape.down_source_rows,
-                        )?
-                    }
-                }
-                DType::F16 => gpu.gemm_f16_moe_grouped_wmma_gfx1151(
-                    &ffn.expert_down_ptrs,
-                    tile_ids,
-                    sorted,
-                    rot_batch,
-                    y_down_grouped,
-                    down_m,
-                    down_k,
-                    path2_shape.down_x_row_div,
-                    m_total,
-                    path2_shape.down_source_rows,
-                )?,
-                DType::BF16 => gpu.gemm_bf16_moe_grouped_wmma_gfx1151(
-                    &ffn.expert_down_ptrs,
-                    tile_ids,
-                    sorted,
-                    rot_batch,
-                    y_down_grouped,
-                    down_m,
-                    down_k,
-                    path2_shape.down_x_row_div,
-                    m_total,
-                    path2_shape.down_source_rows,
-                )?,
-                // Phase 4: Path 2 ParoQ4G128 down grouped-WMMA (with i8 MMQ
-                // opt-in for gfx1151 — see gate_up arm above). rot_batch was
-                // already Givens-rotated by paro_shared.down_* via the PARO
-                // fused_silu_mul_givens_rotate_f32 step above; the kernel is
-                // rotation-agnostic. Same kernel for gate_up + down — only
-                // shape parameters and x_row_div differ.
-                DType::ParoQ4G128 => {
-                    // Default-on for gfx1151 since 2026-05-21: i8 MMQ +6.3% over
-                    // FP16 WMMA, k8 +2.5% over k2, both validated via PARO gen 100
-                    // (clean decode, finite logits) + coherence-gate (MQ4 paths
-                    // unchanged). Opt-out via HIPFIRE_MOE_PARO_I8=0 or _K8=0.
-                    let use_paro_i8 = paro_moe_i8_enabled_for_arch_from_env(
-                        gpu.arch.as_str(),
-                        std::env::var("HIPFIRE_MOE_PARO_I8").ok().as_deref(),
-                    );
-                    let use_paro_i8_k8 = paro_moe_i8_k8_enabled_from_env(
-                        use_paro_i8,
-                        std::env::var("HIPFIRE_MOE_PARO_I8_K8").ok().as_deref(),
-                    );
-                    if use_paro_i8_k8 {
-                        gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
-                            &ffn.expert_down_ptrs,
-                            tile_ids,
-                            sorted,
-                            rot_batch,
-                            y_down_grouped,
-                            down_m,
-                            down_k,
-                            path2_shape.down_x_row_div,
-                            m_total,
-                            path2_shape.down_source_rows,
-                        )?;
-                    } else if use_paro_i8 {
-                        gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
-                            &ffn.expert_down_ptrs,
-                            tile_ids,
-                            sorted,
-                            rot_batch,
-                            y_down_grouped,
-                            down_m,
-                            down_k,
-                            path2_shape.down_x_row_div,
-                            m_total,
-                            path2_shape.down_source_rows,
-                        )?;
-                    } else {
-                        gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
-                            &ffn.expert_down_ptrs,
-                            tile_ids,
-                            sorted,
-                            rot_batch,
-                            y_down_grouped,
-                            down_m,
-                            down_k,
-                            path2_shape.down_x_row_div,
-                            m_total,
-                            path2_shape.down_source_rows,
-                        )?;
-                    }
-                }
-                other => panic!(
-                    "prefill_moe_ffn_body_batched: unsupported experts[0].down dtype {other:?} \
-                             — admit predicate should have rejected this layer"
-                ),
-            }
-            // Non-atomic combine via inverse_perm + topk_weights.
-            gpu.moe_down_combine_grouped_k8(
-                y_down_grouped,
-                inverse_perm,
-                topk_weights,
-                &pbs.x_batch,
-                down_m,
-                k_top,
-                n,
-            )?;
-        }
-    } else {
-        let use_atomic_free_down = !gpu.arch.starts_with("gfx9");
-        if use_atomic_free_down {
-            // Path 1 expanded-down: per-token-per-rank GEMV writes to a
-            // [N × K_TOP × M] scratch, then a separate combine kernel folds
-            // it back into pbs.x_batch with topk weights. The expanded
-            // kernel is dtype-keyed; the combine kernel is dtype-agnostic.
-            match dtypes.expert_down {
-                DType::MQ4G256 => gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                    &ffn.expert_down_ptrs,
-                    topk_indices,
-                    rot_batch,
-                    down_expanded,
-                    down_m,
-                    down_k,
-                    k_top,
-                    n,
-                )?,
-                DType::MQ6G256 => gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-                    &ffn.expert_down_ptrs,
-                    topk_indices,
-                    rot_batch,
-                    down_expanded,
-                    down_m,
-                    down_k,
-                    k_top,
-                    n,
-                )?,
-                DType::MQ2G256 => gpu.gemv_hfq2g256_moe_down_k8_indexed_batched_expanded(
-                    &ffn.expert_down_ptrs,
-                    topk_indices,
-                    rot_batch,
-                    down_expanded,
-                    down_m,
-                    down_k,
-                    k_top,
-                    n,
-                )?,
-                DType::MQ8G256 => gpu.gemv_hfq8g256_moe_down_k8_indexed_batched_expanded(
-                    &ffn.expert_down_ptrs,
-                    topk_indices,
-                    rot_batch,
-                    down_expanded,
-                    down_m,
-                    down_k,
-                    k_top,
-                    n,
-                )?,
-                DType::MQ2G256Lloyd => gpu
-                    .gemv_mq2g256_lloyd_moe_down_k8_indexed_batched_expanded(
+            let use_atomic_free_down = !gpu.arch.starts_with("gfx9");
+            if use_atomic_free_down {
+                // Path 1 expanded-down: per-token-per-rank GEMV writes to a
+                // [N × K_TOP × M] scratch, then a separate combine kernel folds
+                // it back into pbs.x_batch with topk weights. The expanded
+                // kernel is dtype-keyed; the combine kernel is dtype-agnostic.
+                match dtypes.expert_down {
+                    DType::MQ4G256 => gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
                         &ffn.expert_down_ptrs,
                         topk_indices,
                         rot_batch,
@@ -1543,8 +1536,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         k_top,
                         n,
                     )?,
-                DType::MQ3G256Lloyd => gpu
-                    .gemv_mq3g256_lloyd_moe_down_k8_indexed_batched_expanded(
+                    DType::MQ6G256 => gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
                         &ffn.expert_down_ptrs,
                         topk_indices,
                         rot_batch,
@@ -1554,68 +1546,112 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         k_top,
                         n,
                     )?,
-                // Phase 3 PARO down: the layer-shared `down` Givens rotation
-                // has already been applied to rot_batch by the
-                // fused_silu_mul_givens_rotate_f32 call above. The HFQ4G128
-                // indexed kernel (existing, shipped in 7c00970d) is
-                // rotation-agnostic; same dispatch shape as G256 sister.
-                DType::ParoQ4G128 => gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
-                    &ffn.expert_down_ptrs,
-                    topk_indices,
-                    rot_batch,
-                    down_expanded,
-                    down_m,
-                    down_k,
-                    k_top,
-                    n,
-                )?,
-                DType::Oq4G256 => gpu.gemv_oq4g256_moe_down_k8_indexed_batched_expanded(
-                    &ffn.expert_down_ptrs,
-                    topk_indices,
-                    rot_batch,
-                    down_expanded,
-                    down_m,
-                    down_k,
-                    k_top,
-                    n,
-                )?,
-                DType::Oq8G256 => gpu.gemv_oq8g256_moe_down_k8_indexed_batched_expanded(
-                    &ffn.expert_down_ptrs,
-                    topk_indices,
-                    rot_batch,
-                    down_expanded,
-                    down_m,
-                    down_k,
-                    k_top,
-                    n,
-                )?,
-                other => panic!(
-                    "prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
+                    DType::MQ2G256 => gpu.gemv_hfq2g256_moe_down_k8_indexed_batched_expanded(
+                        &ffn.expert_down_ptrs,
+                        topk_indices,
+                        rot_batch,
+                        down_expanded,
+                        down_m,
+                        down_k,
+                        k_top,
+                        n,
+                    )?,
+                    DType::MQ8G256 => gpu.gemv_hfq8g256_moe_down_k8_indexed_batched_expanded(
+                        &ffn.expert_down_ptrs,
+                        topk_indices,
+                        rot_batch,
+                        down_expanded,
+                        down_m,
+                        down_k,
+                        k_top,
+                        n,
+                    )?,
+                    DType::MQ2G256Lloyd => gpu
+                        .gemv_mq2g256_lloyd_moe_down_k8_indexed_batched_expanded(
+                            &ffn.expert_down_ptrs,
+                            topk_indices,
+                            rot_batch,
+                            down_expanded,
+                            down_m,
+                            down_k,
+                            k_top,
+                            n,
+                        )?,
+                    DType::MQ3G256Lloyd => gpu
+                        .gemv_mq3g256_lloyd_moe_down_k8_indexed_batched_expanded(
+                            &ffn.expert_down_ptrs,
+                            topk_indices,
+                            rot_batch,
+                            down_expanded,
+                            down_m,
+                            down_k,
+                            k_top,
+                            n,
+                        )?,
+                    // Phase 3 PARO down: the layer-shared `down` Givens rotation
+                    // has already been applied to rot_batch by the
+                    // fused_silu_mul_givens_rotate_f32 call above. The HFQ4G128
+                    // indexed kernel (existing, shipped in 7c00970d) is
+                    // rotation-agnostic; same dispatch shape as G256 sister.
+                    DType::ParoQ4G128 => gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
+                        &ffn.expert_down_ptrs,
+                        topk_indices,
+                        rot_batch,
+                        down_expanded,
+                        down_m,
+                        down_k,
+                        k_top,
+                        n,
+                    )?,
+                    DType::Oq4G256 => gpu.gemv_oq4g256_moe_down_k8_indexed_batched_expanded(
+                        &ffn.expert_down_ptrs,
+                        topk_indices,
+                        rot_batch,
+                        down_expanded,
+                        down_m,
+                        down_k,
+                        k_top,
+                        n,
+                    )?,
+                    DType::Oq8G256 => gpu.gemv_oq8g256_moe_down_k8_indexed_batched_expanded(
+                        &ffn.expert_down_ptrs,
+                        topk_indices,
+                        rot_batch,
+                        down_expanded,
+                        down_m,
+                        down_k,
+                        k_top,
+                        n,
+                    )?,
+                    other => panic!(
+                        "prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
                                  experts[0].down dtype {other:?} — admit predicate should \
                                  have rejected this layer"
-                ),
+                    ),
+                }
+                gpu.moe_down_combine_k8_batched(
+                    down_expanded,
+                    topk_weights,
+                    &pbs.x_batch,
+                    down_m,
+                    k_top,
+                    n,
+                )?;
+            } else {
+                gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
+                    &ffn.expert_down_ptrs,
+                    topk_indices,
+                    topk_weights,
+                    rot_batch,
+                    &pbs.x_batch,
+                    down_m,
+                    down_k,
+                    k_top,
+                    n,
+                )?;
             }
-            gpu.moe_down_combine_k8_batched(
-                down_expanded,
-                topk_weights,
-                &pbs.x_batch,
-                down_m,
-                k_top,
-                n,
-            )?;
-        } else {
-            gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
-                &ffn.expert_down_ptrs,
-                topk_indices,
-                topk_weights,
-                rot_batch,
-                &pbs.x_batch,
-                down_m,
-                down_k,
-                k_top,
-                n,
-            )?;
         }
+        return Ok(());
     }
     // ── 6. Routed experts: delegated to MoeFamily::run_prefill (Ship 4.2) ──
     let down_m = ffn.experts[0].down.m;
@@ -1657,8 +1693,11 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                 krot: paro.krot as usize,
             });
     let down_awq_scale = ffn.experts[0].down.awq_scale.as_ref();
+    let grouped_scratch = pbs.grouped_moe_scratch.as_ref().expect("moe scratch");
 
     let moe_prefill_params = hipfire_dispatch::families::moe::MoePrefillParams {
+        layer: layer_idx,
+        capture,
         dtypes: moe_dtypes,
         batch_size: n,
         mi,
@@ -1679,13 +1718,13 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         up_batch,
         rot_batch,
         down_expanded,
-        expert_token_counts: pbs.moe_expert_token_counts.as_ref().expect("moe scratch"),
-        expert_offsets: pbs.moe_expert_offsets.as_ref().expect("moe scratch"),
-        sorted_slot_index: pbs.moe_sorted_slot_index.as_ref().expect("moe scratch"),
-        expert_tile_ids: pbs.moe_expert_tile_ids.as_ref().expect("moe scratch"),
-        inverse_perm: pbs.moe_inverse_perm.as_ref().expect("moe scratch"),
-        y_gate_up_grouped: pbs.moe_y_gate_up_grouped.as_ref().expect("moe scratch"),
-        y_down_grouped: pbs.moe_y_down_grouped.as_ref().expect("moe scratch"),
+        expert_token_counts: &grouped_scratch.expert_token_counts,
+        expert_offsets: &grouped_scratch.expert_offsets,
+        sorted_slot_index: &grouped_scratch.sorted_slot_index,
+        expert_tile_ids: &grouped_scratch.expert_tile_ids,
+        inverse_perm: &grouped_scratch.inverse_perm,
+        y_gate_up_grouped: &grouped_scratch.y_gate_up_grouped,
+        y_down_grouped: &grouped_scratch.y_down_grouped,
         paro_gate_up,
         paro_down,
         down_awq_scale,
@@ -6390,6 +6429,7 @@ pub(crate) fn forward_prefill_chunk(
                     layer_idx,
                     &ctx,
                     routed_out,
+                    None,
                 )?;
 
                 // Post-layer hidden extract for the DFlash draft path.
@@ -7370,6 +7410,7 @@ pub(crate) fn forward_prefill_chunk(
                     layer_idx,
                     &ctx,
                     routed_out,
+                    None,
                 )?;
 
                 // Post-layer hidden extract for the DFlash draft path.

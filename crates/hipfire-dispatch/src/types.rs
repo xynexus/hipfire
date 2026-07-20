@@ -512,6 +512,7 @@ pub enum DispatchError {
         key: KernelKey,
     },
     Hip(String),
+    Capture(String),
 }
 
 impl std::fmt::Display for DispatchError {
@@ -529,6 +530,7 @@ impl std::fmt::Display for DispatchError {
             Self::NotFound { key } => write!(f, "kernel not registered: {key:?}"),
             Self::EmptyEntry { key } => write!(f, "kernel registry entry empty: {key:?}"),
             Self::Hip(msg) => write!(f, "HIP error: {msg}"),
+            Self::Capture(msg) => write!(f, "calibration capture error: {msg}"),
         }
     }
 }

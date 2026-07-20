@@ -318,6 +318,37 @@ pub struct MoeBiasAwarePrefillParams<'a> {
 
 // ── Qwen3.5 softmax-top-k MoE prefill parameters (Ship 4.2) ──
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoePrefillCapturePoint {
+    GateUpInput,
+    DownInput,
+}
+
+/// Family-neutral view of a routed-expert activation seam. The callback sees
+/// the complete teacher routing plus the already-built grouped permutation;
+/// it may filter rows for calibration, but must not mutate execution routing.
+pub struct MoePrefillCaptureBatch<'a> {
+    pub layer: usize,
+    pub point: MoePrefillCapturePoint,
+    pub source: &'a GpuTensor,
+    pub source_width: usize,
+    pub source_row_div: usize,
+    pub topk_indices: &'a GpuTensor,
+    pub topk_weights: &'a GpuTensor,
+    pub sorted_slot_index: &'a GpuTensor,
+    pub batch_size: usize,
+    pub k_top: usize,
+    pub num_experts: usize,
+}
+
+pub trait MoePrefillCapture: Send + Sync {
+    fn capture(
+        &self,
+        gpu: &mut hipfire_rdna::Gpu,
+        batch: &MoePrefillCaptureBatch<'_>,
+    ) -> Result<(), DispatchError>;
+}
+
 /// Parameters for the qwen35 batched/prefill MoE routed-expert block.
 ///
 /// Distinct from [`MoeBiasAwarePrefillParams`] — qwen35 uses softmax top-k
@@ -332,6 +363,8 @@ pub struct MoeBiasAwarePrefillParams<'a> {
 /// All tensor refs are `&'a GpuTensor` (shared, not `&mut` — GpuTensor is Copy).
 /// Scratch tensors are model-owned; the family holds only references.
 pub struct MoePrefillParams<'a> {
+    pub layer: usize,
+    pub capture: Option<&'a dyn MoePrefillCapture>,
     // dtype snapshot
     pub dtypes: MoeDtypes,
     // dims
@@ -418,15 +451,23 @@ impl MoePrefillResolution {
         arch: &hipfire_rdna::arch_caps::ArchCaps,
         flags: &hipfire_rdna::feature_flags::FeatureFlags,
     ) -> Self {
-        let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
-        let use_path2 = flags.moe_grouped_gemm && arch.has_wmma();
-        // MQ6 grouped-WMMA (`gemm_hfq6g256_moe_grouped_wmma`) is gfx12-only
-        // (no gfx11 variant yet). Fall back to Path 1 (indexed batched GEMV)
-        // on gfx11 to avoid the gfx12-only kernel panic. Path 1 MQ6 indexed
-        // kernels exist on all WMMA archs.
-        let mq6_on_non_gfx12 =
-            d.routed_gate_up == DType::MQ6G256 && !(arch.is_gfx1200() || arch.is_gfx1201());
-        let use_path2 = use_path2 && !mq6_on_non_gfx12;
+        let routed_dtype = d.routed_gate_up;
+        let paro_mode = routed_dtype == DType::ParoQ4G128 && d.has_paro_shared;
+        let is_gfx12 = arch.is_gfx1200() || arch.is_gfx1201();
+        let grouped_supported = match routed_dtype {
+            DType::MQ4G256 | DType::ParoQ4G128 => arch.has_wmma(),
+            DType::MQ6G256 | DType::MQ3G256 => arch.is_gfx1151() || is_gfx12,
+            DType::MQ2G256Lloyd => arch.is_gfx1151(),
+            // gfx1151 uses the admitted raw WMMA kernels. Other architectures
+            // retain the same grouped routing and use the portable active-route
+            // fallback rather than rejecting source-model calibration.
+            DType::F16 | DType::BF16 => true,
+            _ => false,
+        };
+        // MQ3 and raw F16/BF16 have no indexed fallback, so do not let a tuning
+        // opt-out route them into a nonexistent path.
+        let grouped_required = matches!(routed_dtype, DType::MQ3G256 | DType::F16 | DType::BF16);
+        let use_path2 = grouped_supported && (flags.moe_grouped_gemm || grouped_required);
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.
         let down_path0 = arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna3();

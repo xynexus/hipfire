@@ -12,9 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::codecs::{
-    dequant_oq2g256, dequant_oq4g256, quantize_oq2g256, quantize_oq4g256,
-};
+use crate::codecs::{dequant_oq2g256, dequant_oq4g256, quantize_oq2g256, quantize_oq4g256};
 
 /// On-disk / in-kernel-VRAM bits-per-weight of the three Opus tiers (block
 /// overhead folded in): oq2 = 66 B/256, oq4 = 130 B/256, oq8 = 258 B/256. These
@@ -264,7 +262,11 @@ pub fn assign_tiers(candidates: &[TierCandidate], target_bpw: f64, floor: Tier) 
         let mut best: Option<(usize, f64, f64)> = None; // (idx, gain, cost)
         for (i, c) in candidates.iter().enumerate() {
             let (gain, cost, from_ok) = match plan.tier(&c.name) {
-                Tier::Oq2 => (c.err_oq2 - c.err_oq4, (OQ4_BPW - OQ2_BPW) * c.numel as f64, true),
+                Tier::Oq2 => (
+                    c.err_oq2 - c.err_oq4,
+                    (OQ4_BPW - OQ2_BPW) * c.numel as f64,
+                    true,
+                ),
                 Tier::Oq4 => (c.err_oq4, (OQ8_BPW - OQ4_BPW) * c.numel as f64, true),
                 Tier::Oq8 => (0.0, 0.0, false),
             };

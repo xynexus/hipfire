@@ -3121,6 +3121,112 @@ impl Gpu {
         }
     }
 
+    /// Calibration: gather `n` routed rows into a persistent F32 staging tile.
+    ///
+    /// `sorted_slot_index[sorted_start + row]` stores the flattened routed slot.
+    /// Gate/up capture passes `x_row_div = K_TOP` to recover the original token
+    /// row; down capture passes `1` because its source is already flattened to
+    /// one row per route. `dst_start` lets the caller carry a partial tile across
+    /// model microbatches without an undersized reduction launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn calib_gather_rows_f32(
+        &mut self,
+        src: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        dst: &GpuTensor,
+        sorted_start: usize,
+        dst_start: usize,
+        n: usize,
+        k: usize,
+        x_row_div: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if n == 0 || k == 0 || x_row_div == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "calib_gather_rows_f32 requires non-zero rows, width, and row divisor",
+            ));
+        }
+        let total = n.checked_mul(k).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "calib_gather_rows_f32 launch size overflow")
+        })?;
+        for (name, value) in [
+            ("sorted_start", sorted_start),
+            ("dst_start", dst_start),
+            ("rows", n),
+            ("width", k),
+            ("x_row_div", x_row_div),
+        ] {
+            if value > i32::MAX as usize {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("calib_gather_rows_f32 {name} exceeds i32 kernel contract"),
+                ));
+            }
+        }
+        if src.dtype != DType::F32 || dst.dtype != DType::F32 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "calib_gather_rows_f32 source and destination must be F32",
+            ));
+        }
+        let sorted_bytes = sorted_start
+            .checked_add(n)
+            .and_then(|rows| rows.checked_mul(std::mem::size_of::<i32>()))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "calib_gather_rows_f32 index range overflow")
+            })?;
+        if sorted_slot_index.buf.size() < sorted_bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "calib_gather_rows_f32 sorted index buffer is too small",
+            ));
+        }
+        let dst_elems = dst_start
+            .checked_add(n)
+            .and_then(|rows| rows.checked_mul(k))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "calib_gather_rows_f32 destination range overflow")
+            })?;
+        if dst.numel() < dst_elems {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "calib_gather_rows_f32 destination buffer is too small",
+            ));
+        }
+        self.ensure_kernel(
+            "calib_reduce",
+            kernels::CALIB_REDUCE_SRC,
+            "calib_gather_rows_f32",
+        )?;
+        let src_ptr = src.buf.as_ptr();
+        let sorted_ptr = sorted_slot_index.buf.as_ptr();
+        let dst_ptr = dst.buf.as_ptr();
+        let sorted_start_i = sorted_start as i32;
+        let dst_start_i = dst_start as i32;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let x_row_div_i = x_row_div as i32;
+        let block = 256u32;
+        let grid = ((total as u64 + block as u64 - 1) / block as u64) as u32;
+        self.launch_kernargs(
+            "calib_gather_rows_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &kernargs![
+                ptr src_ptr,
+                ptr sorted_ptr,
+                ptr dst_ptr,
+                i32 sorted_start_i,
+                i32 dst_start_i,
+                i32 n_i,
+                i32 k_i,
+                i32 x_row_div_i
+            ],
+        )
+    }
+
     /// Calibration: `acc[c] += Σ_n x[n,c]²` (per-column sum-of-squares, the
     /// imatrix / diag(H) signal). `x` is [N, K] F32; `acc` is [K] F32, ADDED into
     /// (caller zeroes once, then accumulates across the calibration corpus).

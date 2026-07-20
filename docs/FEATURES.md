@@ -39,9 +39,10 @@ Status tags: **shipped** / **partial** (works but incomplete or guarded) /
 - **Hierarchical KV (hot/cold tiering)** — recent tokens in a VRAM ring buffer;
   older tokens compacted/pruned by importance during idle decode.
   `hipfire-runtime/src/kv_hier.rs`.
-- **CASK** — KV-cache eviction controller for long-context without OOM: generate a
-  sidecar (`hipfire sidecar-gen`), enable with `cask-profile {balanced,…}` /
-  `cask_beta`. `hipfire-runtime/src/cask.rs`.
+- **CASK** — KV-cache eviction controller for long-context without OOM. Generate
+  its TriAttention band-center sidecar with `scripts/induct_model.py` (or the
+  `triattn_validate` runtime example), then enable it with `cask-profile
+  {balanced,…}` / `cask_beta`. `hipfire-runtime/src/cask.rs`.
 - **TriAttn** — sparse attention with calibrated per-(layer, head, band) centers
   (phase / magnitude / mean-resultant-length), FWHT-rotated. `triattn.rs`.
 - **PFlash** — long-context **prompt compression** (not speculative prefill): past
@@ -236,7 +237,7 @@ attention families included. Layer composition is described by `hipfire-mixer`
 ### CLI (`hipfire …`)
 
 `serve`, `chat`, `run`, `list`, `pull` (Ollama-style model/draft fetch),
-`quantize`, `config` (global/per-model), `eval`, `sidecar-gen`, `detect` (token
+`quantize`, `config` (global/per-model), `eval`, `detect` (token
 coherence), `diffusion` (import/inspect diffusion `.hfq`), `admin`,
 `lock {acquire,release,status}` (GPU/NPU/CPU resource mutex), `host-profile`
 (bandwidth/capability profiling), `collect-artifacts` (Hessian/imatrix), `optimize`

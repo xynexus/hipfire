@@ -4,11 +4,72 @@
 
 //! MoE gating/routing dispatch (router top-k, expert gather). NB the moe_scalar_indexed_wrappers! macro + its 4 invocations stay in mod.rs for now (they delegate to gemv_* methods). Pure move (Phase 1 M2).
 
-use super::{Gpu, GpuTensor};
+use super::{DType, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
 
 impl Gpu {
+    /// Portable active-route grouped fallback for raw F16/BF16 expert weights.
+    /// The fast gfx1151 path uses WMMA; this scalar kernel keeps streamed source
+    /// calibration correct on RDNA2, other RDNA3 cards, RDNA4, and CDNA.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_raw_moe_grouped_portable(
+        &mut self,
+        dtype: DType,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(matches!(dtype, DType::F16 | DType::BF16));
+        assert_eq!(x_src.dtype, DType::F32);
+        assert_eq!(y_grouped.dtype, DType::F32);
+        assert!(m <= i32::MAX as usize && k <= i32::MAX as usize);
+        assert!(m_total <= i32::MAX as usize && x_row_div <= i32::MAX as usize);
+        let kernel_name = match dtype {
+            DType::F16 => "gemm_f16_moe_grouped_portable",
+            DType::BF16 => "gemm_bf16_moe_grouped_portable",
+            _ => unreachable!(),
+        };
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_RAW_MOE_GROUPED_PORTABLE_SRC,
+            kernel_name,
+        )?;
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_src.buf.as_ptr();
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+        let block = 256u32;
+        let grid_x = (m as u32).div_ceil(block);
+        let bytes = m_total
+            .saturating_mul(m)
+            .saturating_mul(k.saturating_mul(2).saturating_add(4));
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_kernargs(
+            kernel_name,
+            [grid_x, m_total as u32, 1],
+            [block, 1, 1],
+            0,
+            &kernargs![ptr ep, ptr tp, ptr sp, ptr xp, ptr yp, i32 m_val, i32 k_val, i32 xrd_val, i32 mt_val],
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.hip);
+        }
+        result
+    }
+
     /// MoE router GPU softmax + top-K + (optional) renormalize. One
     /// workgroup, no D2H sync. Writes [k_top] i32 indices and [k_top]
     /// f32 weights to device buffers. Hardcoded k_top=8 to match A3B.

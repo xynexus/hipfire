@@ -26,7 +26,7 @@
 //!
 //! 1. Run forward on a small calibration corpus, collecting pre-RoPE Q at
 //!    each FA layer via the triattn tap. Finalize into BandCenters and save
-//!    to a `.triattn.bin` sidecar.
+//!    to a canonical `.triattn.hfq` sidecar.
 //! 2. Run forward on a validation prompt with a full-capture tap that stores
 //!    pre-RoPE Q *and* K per token per FA layer.
 //! 3. For each FA layer, for each query head, predict attention logits
@@ -122,13 +122,16 @@ fn main() {
                 i += 1;
             }
             other => {
-                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model-mq4.hfq> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar] [--gpu-calib | --cpu-calib]");
+                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model.hfq> --sidecar <model.triattn.hfq> [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar] [--gpu-calib | --cpu-calib]");
                 std::process::exit(1);
             }
         }
     }
     let model_path = model_path.expect("need <model-mq4.hfq> positional arg");
-    let sidecar_path = sidecar_path.unwrap_or_else(|| format!("{model_path}.triattn.bin"));
+    let sidecar_path = sidecar_path.unwrap_or_else(|| {
+        eprintln!("--sidecar <model.triattn.hfq> is required; implicit legacy sidecar names are not supported");
+        std::process::exit(2);
+    });
 
     // Calibration corpus: either chunks from --corpus file or 8 built-in
     // sentences (quick-iterate mode).

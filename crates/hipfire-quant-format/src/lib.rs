@@ -271,8 +271,8 @@ impl QuantType {
             //  - OqPlusG256 / OqPlusCompact: tiered / 130 + 2·N_out
             //  - Oq4G256ArchPacked / Qtip2G256: geometry unconfirmed
             //  - Paro / TidI32: engine-tiled, arch-specific
-            Q8HFQ | HFP4G32 | MFP4G32 | OqPlusG256 | OqPlusCompact
-            | Oq4G256ArchPacked | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 => None,
+            Q8HFQ | HFP4G32 | MFP4G32 | OqPlusG256 | OqPlusCompact | Oq4G256ArchPacked
+            | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 => None,
         }
     }
 

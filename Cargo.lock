@@ -1367,6 +1367,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
  "hipfire-hneurons",
+ "hipfire-model",
  "hipfire-rdna",
  "hipfire-runtime",
  "hipfire-specdecode-dspark",
@@ -1730,12 +1731,22 @@ dependencies = [
 name = "hipfire-coexistence"
 version = "0.3.0"
 dependencies = [
+ "hipfire-arch-gemma3",
+ "hipfire-arch-qwen35",
  "hipfire-daemon-adapter",
+ "hipfire-hash",
+ "hipfire-lock",
  "hipfire-lora-hfq",
+ "hipfire-model",
  "hipfire-quantize",
+ "hipfire-rdna",
+ "hipfire-runtime",
  "hipfire-steer",
  "hipfire-steer-harness",
  "hipfire-xdna",
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2111,6 +2122,7 @@ dependencies = [
  "hipfire-quant-format",
  "hipfire-rdna",
  "indicatif",
+ "libc",
  "memmap2",
  "rayon",
  "serde",

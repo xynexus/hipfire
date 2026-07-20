@@ -175,11 +175,20 @@ fn cpu_ref(
     x_row_div: usize,
     m_total: usize,
     bf16: bool,
+    round_x: bool,
 ) -> Vec<f32> {
     let mut y = vec![0f32; m_total * m];
     let x_rounded: Vec<f32> = x
         .iter()
-        .map(|v| if bf16 { bf16_round(*v) } else { f16_round(*v) })
+        .map(|v| {
+            if !round_x {
+                *v
+            } else if bf16 {
+                bf16_round(*v)
+            } else {
+                f16_round(*v)
+            }
+        })
         .collect();
     for tile_y in 0..(m_total / 16) {
         let expert_id = tile_ids[tile_y];
@@ -366,6 +375,7 @@ fn run_case(
         x_row_div,
         m_total,
         bf16,
+        true,
     );
 
     let mut max_abs = 0f32;
@@ -388,6 +398,47 @@ fn run_case(
     let rel_tol = if bf16 { 8e-2 } else { 2e-2 };
     if max_abs > abs_tol && max_rel > rel_tol {
         eprintln!("  FAIL");
+        std::process::exit(1);
+    }
+
+    gpu.hip
+        .memset(&y_gpu.buf, 0, m_total * m * 4)
+        .expect("zero portable y");
+    gpu.gemm_raw_moe_grouped_portable(
+        if bf16 { DType::BF16 } else { DType::F16 },
+        &expert_weight_ptrs,
+        &tile_ids_gpu,
+        &sorted_gpu,
+        &x_gpu,
+        &y_gpu,
+        m,
+        k,
+        x_row_div,
+        m_total,
+    )
+    .expect("portable grouped launch");
+    gpu.hip.device_synchronize().expect("portable sync");
+    let portable = download_f32(&gpu, &y_gpu, m_total * m);
+    let portable_ref = cpu_ref(
+        &expert_weights,
+        &sorted,
+        &tile_ids,
+        &x,
+        m,
+        k,
+        x_row_div,
+        m_total,
+        bf16,
+        false,
+    );
+    let portable_max_abs = portable
+        .iter()
+        .zip(&portable_ref)
+        .map(|(got, want)| (got - want).abs())
+        .fold(0.0f32, f32::max);
+    println!("  portable max_abs={portable_max_abs:.6e}");
+    if portable_max_abs > 2e-4 {
+        eprintln!("  portable FAIL");
         std::process::exit(1);
     }
     drop(expert_tensors);

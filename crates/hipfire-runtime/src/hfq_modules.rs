@@ -10,10 +10,6 @@
 //! contiguous, slab-loadable units.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-
-use crate::hfq::HfqTensorInfo;
-
 pub const HFQM_MODULE_TABLE_KEY: &str = "hfqm_modules";
 pub const HFQM_MODULE_TABLE_FORMAT: &str = "hipfire.hfqm.modules.v1";
 
@@ -172,95 +168,44 @@ pub fn classify_always_resident_tensor(name: &str) -> HfqModuleKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct ExpertKey {
-    layer: u16,
-    expert: u16,
-}
-
-pub fn infer_qwen35_moe_expert_modules(tensors: &[HfqTensorInfo]) -> Vec<HfqModuleRecord> {
-    let mut experts: BTreeMap<ExpertKey, Vec<&HfqTensorInfo>> = BTreeMap::new();
-    for tensor in tensors {
-        if let Some((layer, expert)) = parse_qwen35_expert_tensor_name(&tensor.name) {
-            experts
-                .entry(ExpertKey { layer, expert })
-                .or_default()
-                .push(tensor);
-        }
-    }
-
-    let mut modules = Vec::with_capacity(experts.len());
-    for (key, mut entries) in experts {
-        entries.sort_by_key(|t| t.data_offset);
-        let start = entries.iter().map(|t| t.data_offset).min().unwrap_or(0);
-        let end = entries
-            .iter()
-            .map(|t| t.data_offset.saturating_add(t.data_size))
-            .max()
-            .unwrap_or(start);
-        let tensors = entries
-            .into_iter()
-            .map(|t| HfqModuleTensor {
-                name: t.name.clone(),
-                quant_type: t.quant_type,
-                shape: t.shape.clone(),
-                group_size: t.group_size,
-                rel_offset: t.data_offset.saturating_sub(start),
-                data_size: t.data_size,
-            })
-            .collect();
-        modules.push(HfqModuleRecord {
-            module_id: format!("layers.{}.experts.{}", key.layer, key.expert),
-            kind: HfqModuleKind::RoutedExpert,
-            layer: Some(key.layer),
-            expert: Some(key.expert),
-            placement_policy: Some("lazy_lru".to_string()),
-            data_offset: start,
-            data_size: end.saturating_sub(start),
-            tensors,
-        });
-    }
-    modules
-}
-
-fn parse_qwen35_expert_tensor_name(name: &str) -> Option<(u16, u16)> {
-    let parts: Vec<&str> = name.split('.').collect();
-    let layer_pos = parts.iter().position(|p| *p == "layers")?;
-    let layer = parts.get(layer_pos + 1)?.parse::<u16>().ok()?;
-    let expert_pos = parts.iter().position(|p| *p == "experts")?;
-    let expert = parts.get(expert_pos + 1)?.parse::<u16>().ok()?;
-    let role = parts.get(expert_pos + 2)?;
-    if *role == "gate_up_proj" || *role == "gate_proj" || *role == "up_proj" || *role == "down_proj"
-    {
-        Some((layer, expert))
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tensor(name: &str, offset: usize, size: usize) -> HfqTensorInfo {
-        HfqTensorInfo {
-            name: name.to_string(),
-            quant_type: 15,
-            shape: vec![4, 4],
-            group_size: 256,
-            data_offset: offset,
-            data_size: size,
-        }
-    }
-
     #[test]
-    fn infers_qwen35_routed_expert_modules() {
-        let tensors = vec![
-            tensor("model.layers.3.mlp.experts.7.gate_up_proj.weight", 100, 20),
-            tensor("model.layers.3.mlp.experts.7.down_proj.weight", 120, 10),
-            tensor("model.layers.3.mlp.gate.weight", 20, 5),
-        ];
-        let modules = infer_qwen35_moe_expert_modules(&tensors);
+    fn parses_family_neutral_routed_expert_module_with_mixed_dtypes() {
+        let modules = vec![HfqModuleRecord {
+            module_id: "layers.3.experts.7".into(),
+            kind: HfqModuleKind::RoutedExpert,
+            layer: Some(3),
+            expert: Some(7),
+            placement_policy: Some("lazy_lru".into()),
+            data_offset: 100,
+            data_size: 30,
+            tensors: vec![
+                HfqModuleTensor {
+                    name: "model.layers.3.mlp.experts.7.gate_up_proj.weight".into(),
+                    quant_type: 15,
+                    shape: vec![4, 4],
+                    group_size: 256,
+                    rel_offset: 0,
+                    data_size: 20,
+                },
+                HfqModuleTensor {
+                    name: "model.layers.3.mlp.experts.7.down_proj.weight".into(),
+                    quant_type: 1,
+                    shape: vec![4, 4],
+                    group_size: 0,
+                    rel_offset: 20,
+                    data_size: 10,
+                },
+            ],
+        }];
+        let metadata = serde_json::json!({
+            HFQM_MODULE_TABLE_KEY: module_table_json(modules),
+        })
+        .to_string();
+        let modules = parse_module_table(&metadata).unwrap().unwrap();
         assert_eq!(modules.len(), 1);
         assert_eq!(modules[0].kind, HfqModuleKind::RoutedExpert);
         assert_eq!(modules[0].layer, Some(3));
@@ -268,6 +213,8 @@ mod tests {
         assert_eq!(modules[0].data_offset, 100);
         assert_eq!(modules[0].data_size, 30);
         assert_eq!(modules[0].tensors.len(), 2);
+        assert_eq!(modules[0].tensors[0].quant_type, 15);
+        assert_eq!(modules[0].tensors[1].quant_type, 1);
     }
 
     #[test]

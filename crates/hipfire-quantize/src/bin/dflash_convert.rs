@@ -17,12 +17,14 @@
 //! into a hipfire `.hfq` file with a dflash metadata section.
 //!
 //! Usage:
-//!     dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32]
+//!     dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--bf16 | --f16 | --keep-f32]
 //!
 //! Reads a single-file safetensors dump (the z-lab/Qwen3.5-*-DFlash draft
 //! layout — no shards in practice at 1-4B params) and rewrites the tensors
-//! into the hipfire HFQ container. All weights are cast BF16 → F16 by default
-//! to halve the file size (pass `--keep-f32` to keep full F32 precision).
+//! into the hipfire HFQ container. BF16 weights are preserved by default.
+//! `--f16` produces the compatibility artifact for older cards, while the
+//! runtime can also convert a BF16 artifact to F16 when native BF16 WMMA is
+//! unavailable. Pass `--keep-f32` to expand weights to F32.
 //! Per-layer norms (`input_layernorm`, `post_attention_layernorm`,
 //! `q_norm`, `k_norm`, `hidden_norm`, `norm`) are always F32.
 //!
@@ -37,7 +39,7 @@
 //!     "mask_token_id": 248070,
 //!     "target_layer_ids": [1, 8, 15, 22, 29],
 //!     "num_target_layers": 32,
-//!     "draft_dtype": "f16"
+//!     "draft_dtype": "bf16"
 //!   },
 //!   "tokenizer": null
 //! }
@@ -47,7 +49,9 @@
 //! dflash drafts from Qwen3/Qwen3.5 by both arch_id and the presence of
 //! the top-level `dflash` key in metadata.
 
-use hipfire_primitives::conv::{f32_slice_to_f16_bytes, plain_dtype_to_f32 as to_f32};
+use hipfire_primitives::conv::{
+    f32_slice_to_bf16_bytes, f32_slice_to_f16_bytes, plain_dtype_to_f32 as to_f32,
+};
 use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -119,6 +123,134 @@ fn f32_slice_to_f32_bytes(f32_data: &[f32]) -> Vec<u8> {
         out.extend_from_slice(&v.to_bits().to_le_bytes());
     }
     out
+}
+
+fn dflash_block_size(config: &serde_json::Value) -> Result<u32, String> {
+    config
+        .get("block_size")
+        .and_then(|value| value.as_u64())
+        .or_else(|| {
+            config
+                .get("dflash_config")
+                .and_then(|value| value.get("block_size"))
+                .and_then(|value| value.as_u64())
+        })
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            "config.json missing positive block_size (top-level or dflash_config.block_size)"
+                .to_string()
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DraftFormat {
+    Bf16,
+    F16,
+    F32,
+    Mq3,
+    Mq4,
+    Mq6,
+}
+
+impl DraftFormat {
+    fn from_flags(
+        use_f16: bool,
+        keep_f32: bool,
+        use_bf16: bool,
+        use_mq3: bool,
+        use_mq4: bool,
+        use_mq6: bool,
+    ) -> Result<Self, String> {
+        let selected = [use_f16, keep_f32, use_bf16, use_mq3, use_mq4, use_mq6]
+            .into_iter()
+            .filter(|enabled| *enabled)
+            .count();
+        if selected > 1 {
+            return Err(
+                "--bf16, --f16, --keep-f32, --mq3, --mq4, and --mq6 are mutually exclusive"
+                    .to_string(),
+            );
+        }
+        Ok(if use_f16 {
+            Self::F16
+        } else if keep_f32 {
+            Self::F32
+        } else if use_mq3 {
+            Self::Mq3
+        } else if use_mq4 {
+            Self::Mq4
+        } else if use_mq6 {
+            Self::Mq6
+        } else {
+            // No flag and explicit --bf16 intentionally resolve identically.
+            Self::Bf16
+        })
+    }
+
+    fn metadata_name(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::F16 => "f16",
+            Self::F32 => "f32",
+            Self::Mq3 => "mq3",
+            Self::Mq4 => "mq4",
+            Self::Mq6 => "mq6",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Bf16 => "BF16 (weights), F32 (norms)",
+            Self::F16 => "F16 (weights), F32 (norms)",
+            Self::F32 => "F32",
+            Self::Mq3 => "MQ3-G256 (weights), F32 (norms)",
+            Self::Mq4 => "MQ4-G256 (weights), F32 (norms)",
+            Self::Mq6 => "MQ6-G256 (weights), F32 (norms)",
+        }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::{dflash_block_size, DraftFormat};
+
+    #[test]
+    fn reads_current_zlab_nested_block_size() {
+        let config = serde_json::json!({
+            "block_size": null,
+            "dflash_config": {"block_size": 16}
+        });
+        assert_eq!(dflash_block_size(&config).unwrap(), 16);
+    }
+
+    #[test]
+    fn preserves_legacy_top_level_block_size() {
+        let config = serde_json::json!({
+            "block_size": 8,
+            "dflash_config": {"block_size": 16}
+        });
+        assert_eq!(dflash_block_size(&config).unwrap(), 8);
+    }
+
+    #[test]
+    fn bf16_is_the_default_draft_format() {
+        assert_eq!(
+            DraftFormat::from_flags(false, false, false, false, false, false).unwrap(),
+            DraftFormat::Bf16
+        );
+        assert_eq!(DraftFormat::Bf16.metadata_name(), "bf16");
+        assert_eq!(super::QuantType::BF16 as u8, 16);
+    }
+
+    #[test]
+    fn f16_remains_an_explicit_compatibility_format() {
+        assert_eq!(
+            DraftFormat::from_flags(true, false, false, false, false, false).unwrap(),
+            DraftFormat::F16
+        );
+        assert!(DraftFormat::from_flags(true, true, false, false, false, false).is_err());
+    }
 }
 
 // ─── FWHT + MQ quantization ───────────────────────────────────────────────
@@ -269,6 +401,7 @@ enum QuantType {
     F32 = 2,
     MQ4G256 = 13,
     MQ6G256 = 15,
+    BF16 = 16,
     MQ3G256 = 17,
 }
 
@@ -400,7 +533,7 @@ fn resolve_model_path(input: &str) -> String {
 
 /// Returns true for tensors that must stay in F32 for numerical fidelity:
 /// any RMSNorm weight. The rest (Q/K/V/O/fc/gate/up/down projections) can
-/// be cast to F16.
+/// use the selected draft weight format.
 fn is_norm_tensor(name: &str) -> bool {
     name.contains("input_layernorm")
         || name.contains("post_attention_layernorm")
@@ -422,6 +555,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut input_dir: Option<String> = None;
     let mut output_path: Option<String> = None;
+    let mut use_bf16 = false;
+    let mut use_f16 = false;
     let mut keep_f32 = false;
     let mut use_mq4 = false;
     let mut use_mq6 = false;
@@ -442,6 +577,14 @@ fn main() {
                 keep_f32 = true;
                 i += 1;
             }
+            "--bf16" => {
+                use_bf16 = true;
+                i += 1;
+            }
+            "--f16" => {
+                use_f16 = true;
+                i += 1;
+            }
             "--mq4" => {
                 use_mq4 = true;
                 i += 1;
@@ -456,7 +599,7 @@ fn main() {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq3 | --mq4 | --mq6]"
+                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--bf16 | --f16 | --keep-f32 | --mq3 | --mq4 | --mq6]"
                 );
                 std::process::exit(0);
             }
@@ -466,11 +609,12 @@ fn main() {
             }
         }
     }
-    let n_format_flags = (keep_f32 as u8) + (use_mq3 as u8) + (use_mq4 as u8) + (use_mq6 as u8);
-    if n_format_flags > 1 {
-        eprintln!("--keep-f32, --mq3, --mq4, and --mq6 are mutually exclusive");
-        std::process::exit(1);
-    }
+    let draft_format =
+        DraftFormat::from_flags(use_f16, keep_f32, use_bf16, use_mq3, use_mq4, use_mq6)
+            .unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(1);
+            });
 
     let input_dir = input_dir.expect("--input required");
     let output_path = output_path.expect("--output required");
@@ -481,18 +625,7 @@ fn main() {
     eprintln!("dflash_convert");
     eprintln!("  input : {}", input_dir.display());
     eprintln!("  output: {}", output_path.display());
-    let dtype_desc = if keep_f32 {
-        "F32"
-    } else if use_mq3 {
-        "MQ3-G256 (weights), F32 (norms)"
-    } else if use_mq4 {
-        "MQ4-G256 (weights), F32 (norms)"
-    } else if use_mq6 {
-        "MQ6-G256 (weights), F32 (norms)"
-    } else {
-        "F16 (weights), F32 (norms)"
-    };
-    eprintln!("  dtype : {}", dtype_desc);
+    eprintln!("  dtype : {}", draft_format.description());
 
     let config_path = input_dir.join("config.json");
     let config_str = std::fs::read_to_string(&config_path)
@@ -517,10 +650,7 @@ fn main() {
     let dflash_cfg = config
         .get("dflash_config")
         .expect("config.json missing dflash_config block");
-    let block_size = config
-        .get("block_size")
-        .and_then(|v| v.as_u64())
-        .expect("config.json missing block_size") as u32;
+    let block_size = dflash_block_size(&config).unwrap_or_else(|error| panic!("{error}"));
     let mask_token_id = dflash_cfg
         .get("mask_token_id")
         .and_then(|v| v.as_u64())
@@ -567,21 +697,14 @@ fn main() {
     );
 
     // Metadata JSON for the HFQ file.
-    let draft_dtype = if keep_f32 {
-        "f32"
-    } else if use_mq3 {
-        "mq3"
-    } else if use_mq4 {
-        "mq4"
-    } else if use_mq6 {
-        "mq6"
-    } else {
-        "f16"
-    };
+    let draft_dtype = draft_format.metadata_name();
     // FWHT sign tables for MQ rotation. Seeds 42/1042 match the engine's
     // `hipfire_rdna::Gpu::ensure_mq_signs()` so quantized weights here can
     // be dequantized/used correctly on GPU at inference.
-    let needs_fwht = use_mq3 || use_mq4 || use_mq6;
+    let needs_fwht = matches!(
+        draft_format,
+        DraftFormat::Mq3 | DraftFormat::Mq4 | DraftFormat::Mq6
+    );
     let signs1: Vec<f32> = if needs_fwht {
         gen_fwht_signs(42, 256)
     } else {
@@ -650,28 +773,30 @@ fn main() {
 
         // Classification rules:
         //   norms → always F32 (small, precision-critical).
-        //   other (projections) → F32 if --keep-f32,
-        //                         MQ{3,4,6}-G256 if requested (and N ≥ 256),
-        //                         else F16.
+        //   other (projections) → selected draft weight format. BF16 is the
+        //                         precision-preserving default; F16 remains an
+        //                         explicit compatibility artifact.
         // MQ divisibility: quantizers pad the final partial group with
         // zeros. That's safe for weights since the padded lanes are never read
         // at inference. We still require N ≥ 256 to ensure a full first group
         // (per-group scale/min carries meaning).
         let (quant_type, group_size, bytes) = if is_norm_tensor(name) {
             (QuantType::F32, 0u32, f32_slice_to_f32_bytes(&f32_data))
-        } else if keep_f32 {
+        } else if draft_format == DraftFormat::F32 {
             (QuantType::F32, 0u32, f32_slice_to_f32_bytes(&f32_data))
-        } else if use_mq4 && n_elements >= 256 {
+        } else if draft_format == DraftFormat::Mq4 && n_elements >= 256 {
             let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ4G256, 256u32, q)
-        } else if use_mq6 && n_elements >= 256 {
+        } else if draft_format == DraftFormat::Mq6 && n_elements >= 256 {
             let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ6G256, 256u32, q)
-        } else if use_mq3 && n_elements >= 256 {
+        } else if draft_format == DraftFormat::Mq3 && n_elements >= 256 {
             let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ3G256, 256u32, q)
-        } else {
+        } else if draft_format == DraftFormat::F16 {
             (QuantType::F16, 0u32, f32_slice_to_f16_bytes(&f32_data))
+        } else {
+            (QuantType::BF16, 0u32, f32_slice_to_bf16_bytes(&f32_data))
         };
 
         total_bytes_out += bytes.len();

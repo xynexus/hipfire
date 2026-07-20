@@ -32,8 +32,8 @@
 
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo, HFQM_MAGIC};
 use hipfire_runtime::hfq_modules::{
-    classify_always_resident_tensor, infer_qwen35_moe_expert_modules, module_table_json,
-    HfqModuleKind, HfqModuleRecord, HfqModuleTensor, HFQM_MODULE_TABLE_KEY,
+    classify_always_resident_tensor, module_table_json, HfqModuleKind, HfqModuleRecord,
+    HfqModuleTensor, HFQM_MODULE_TABLE_KEY,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -70,22 +70,24 @@ fn usage() -> ! {
 fn probe(path: &Path) {
     let hfq = HfqFile::open_index_only(path).expect("open HFQ index");
     let file_bytes = std::fs::metadata(path).expect("stat model").len();
-    let explicit_modules = !hfq.modules().is_empty();
-    let modules = if explicit_modules {
-        hfq.modules().to_vec()
-    } else {
-        infer_qwen35_moe_expert_modules(hfq.tensors())
-    };
+    if hfq.modules().is_empty() {
+        panic!(
+            "{} has no explicit HFQM v2 module table; use `repack` for deliberate legacy conversion or regenerate it with hipfire-quantize",
+            path.display()
+        );
+    }
+    let modules = hfq.modules().to_vec();
     let routed_expert_bytes: usize = modules
         .iter()
         .filter(|m| m.kind == HfqModuleKind::RoutedExpert)
-        .map(|m| module_logical_bytes(m, explicit_modules))
+        .map(module_logical_bytes)
         .sum();
     let routed_modules = modules
         .iter()
         .filter(|m| m.kind == HfqModuleKind::RoutedExpert)
         .count();
     let mut per_layer: BTreeMap<u16, usize> = BTreeMap::new();
+    let mut routed_tensor_quant_types: BTreeMap<u8, usize> = BTreeMap::new();
     for module in modules
         .iter()
         .filter(|m| m.kind == HfqModuleKind::RoutedExpert)
@@ -93,16 +95,17 @@ fn probe(path: &Path) {
         if let Some(layer) = module.layer {
             *per_layer.entry(layer).or_default() += 1;
         }
+        for tensor in &module.tensors {
+            *routed_tensor_quant_types
+                .entry(tensor.quant_type)
+                .or_default() += 1;
+        }
     }
-    let largest_module_bytes = modules
-        .iter()
-        .map(|m| module_logical_bytes(m, explicit_modules))
-        .max()
-        .unwrap_or(0);
+    let largest_module_bytes = modules.iter().map(module_logical_bytes).max().unwrap_or(0);
     let largest_routed_expert_module_bytes = modules
         .iter()
         .filter(|m| m.kind == HfqModuleKind::RoutedExpert)
-        .map(|m| module_logical_bytes(m, explicit_modules))
+        .map(module_logical_bytes)
         .max()
         .unwrap_or(0);
     let mean_routed_expert_module_bytes = if routed_modules > 0 {
@@ -113,8 +116,8 @@ fn probe(path: &Path) {
     let summary = json!({
         "path": path.display().to_string(),
         "hfqm_version": hfq.version,
-        "module_table": if explicit_modules { "explicit_hfqm_v2" } else { "inferred_from_v1_tensor_names" },
-        "modules_are_contiguous": explicit_modules,
+        "module_table": "explicit_hfqm_v2",
+        "modules_are_contiguous": true,
         "file_bytes": file_bytes,
         "tensor_count": hfq.tensors().len(),
         "module_count": modules.len(),
@@ -125,6 +128,7 @@ fn probe(path: &Path) {
         "largest_routed_expert_module_bytes": largest_routed_expert_module_bytes,
         "mean_routed_expert_module_bytes": mean_routed_expert_module_bytes,
         "per_layer_expert_modules": per_layer,
+        "routed_tensor_quant_types": routed_tensor_quant_types,
         "payload_read_bytes": 0,
         "gpu_allocated_bytes": 0,
         "full_payload_allocation_skipped": true,
@@ -132,12 +136,8 @@ fn probe(path: &Path) {
     println!("{}", serde_json::to_string_pretty(&summary).unwrap());
 }
 
-fn module_logical_bytes(module: &HfqModuleRecord, explicit_modules: bool) -> usize {
-    if explicit_modules {
-        module.data_size
-    } else {
-        module.tensors.iter().map(|t| t.data_size).sum()
-    }
+fn module_logical_bytes(module: &HfqModuleRecord) -> usize {
+    module.data_size
 }
 
 fn repack(input: &Path, output: &Path) {

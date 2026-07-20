@@ -27,6 +27,8 @@
 
 use hip_bridge::{DeviceBuffer, HipError, HipResult};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_runtime::calibration::contracts::{CaptureId, CaptureRegistry, ProjectionRole};
+use hipfire_runtime::calibration::CalibCollector;
 use hipfire_runtime::kv::{KvCache, KvQuantMode};
 use hipfire_runtime::layered_kv::LayeredKvArena;
 use hipfire_runtime::llama::HiddenCaptureSink;
@@ -324,7 +326,7 @@ pub fn forward_step_capture(
 ) -> HipResult<()> {
     let pos = prelude(gpu, state)?;
     embed_token(gpu, weights, cfg, &state.x, token)?;
-    forward_after_x_capture(gpu, weights, cfg, state, pos, capture)?;
+    forward_after_x_capture(gpu, weights, cfg, state, pos, capture, None, true, 0)?;
     state.next_pos += 1;
     Ok(())
 }
@@ -393,7 +395,69 @@ fn forward_after_x(
     state: &mut Gemma3State,
     pos: usize,
 ) -> HipResult<()> {
-    forward_after_x_capture(gpu, weights, cfg, state, pos, None)
+    forward_after_x_capture(gpu, weights, cfg, state, pos, None, None, true, 0)
+}
+
+/// Execute exactly one resident Gemma3 decoder layer from an already-built
+/// F32 residual row. This is the layer-stream calibration seam: the supplied
+/// config/weights/state must each describe one physical layer, while
+/// `logical_layer` retains the original layer's global/local attention and
+/// steering identity. Final norm and lm_head are intentionally skipped.
+pub fn forward_single_layer_residual(
+    gpu: &mut Gpu,
+    weights: &Gemma3Weights,
+    cfg: &Gemma3Config,
+    state: &mut Gemma3State,
+    residual: &[f32],
+    logical_layer: usize,
+) -> HipResult<Vec<f32>> {
+    forward_single_layer_residual_capture(gpu, weights, cfg, state, residual, logical_layer, None)
+}
+
+/// Stream one layer while capturing its four distinct linear-input streams by
+/// stable logical ID. Q/K/V and gate/up aliases share a single accumulator.
+pub fn forward_single_layer_residual_capture(
+    gpu: &mut Gpu,
+    weights: &Gemma3Weights,
+    cfg: &Gemma3Config,
+    state: &mut Gemma3State,
+    residual: &[f32],
+    logical_layer: usize,
+    calibration: Option<(&CalibCollector, &CaptureRegistry)>,
+) -> HipResult<Vec<f32>> {
+    if cfg.num_hidden_layers != 1 || weights.layers.len() != 1 {
+        return Err(HipError::new(
+            0,
+            "gemma3 streamed layer requires exactly one resident layer",
+        ));
+    }
+    if residual.len() != cfg.hidden_size {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "gemma3 streamed residual has {} values; expected {}",
+                residual.len(),
+                cfg.hidden_size
+            ),
+        ));
+    }
+    let pos = prelude(gpu, state)?;
+    let bytes =
+        unsafe { std::slice::from_raw_parts(residual.as_ptr() as *const u8, residual.len() * 4) };
+    gpu.hip.memcpy_htod(&state.x.buf, bytes)?;
+    forward_after_x_capture(
+        gpu,
+        weights,
+        cfg,
+        state,
+        pos,
+        None,
+        calibration,
+        false,
+        logical_layer,
+    )?;
+    state.next_pos += 1;
+    gpu.download_f32(&state.x)
 }
 
 /// `forward_after_x` with an optional extract-layer hidden-capture sink.
@@ -413,6 +477,9 @@ fn forward_after_x_capture(
     state: &mut Gemma3State,
     pos: usize,
     mut capture: Option<&mut HiddenCaptureSink>,
+    calibration: Option<(&CalibCollector, &CaptureRegistry)>,
+    finalize: bool,
+    logical_layer_offset: usize,
 ) -> HipResult<()> {
     let n_heads = cfg.num_attention_heads;
     let n_kv_heads = cfg.num_key_value_heads;
@@ -421,10 +488,23 @@ fn forward_after_x_capture(
     let eps = cfg.rms_norm_eps;
 
     for layer_idx in 0..cfg.num_hidden_layers {
+        let logical_layer_idx = logical_layer_offset + layer_idx;
         let layer = &weights.layers[layer_idx];
 
         // ── Attention block ──────────────────────────────────────────
         gpu.rmsnorm_f32(&state.x, &layer.input_norm, &state.tmp, eps)?;
+        if let Some((collector, registry)) = calibration {
+            collector
+                .capture_by_id(
+                    gpu,
+                    registry,
+                    CaptureId::new(logical_layer_idx, ProjectionRole::QueryInput, None),
+                    &state.tmp,
+                    1,
+                    cfg.hidden_size,
+                )
+                .map_err(|error| HipError::new(0, &error.to_string()))?;
+        }
         weight_gemv(gpu, &layer.wq, &state.tmp, &state.q)?;
         weight_gemv(gpu, &layer.wk, &state.tmp, &state.k)?;
         weight_gemv(gpu, &layer.wv, &state.tmp, &state.v)?;
@@ -634,6 +714,22 @@ fn forward_after_x_capture(
             )?;
         }
 
+        if let Some((collector, registry)) = calibration {
+            collector
+                .capture_by_id(
+                    gpu,
+                    registry,
+                    CaptureId::new(
+                        logical_layer_idx,
+                        ProjectionRole::AttentionOutputInput,
+                        None,
+                    ),
+                    &state.attn_out,
+                    1,
+                    n_heads * head_dim,
+                )
+                .map_err(|error| HipError::new(0, &error.to_string()))?;
+        }
         weight_gemv(gpu, &layer.wo, &state.attn_out, &state.o)?;
         // post_attention_layernorm sits INSIDE the residual: norm(o) then add.
         gpu.rmsnorm_f32(&state.o, &layer.post_attn_norm, &state.tmp, eps)?;
@@ -641,23 +737,52 @@ fn forward_after_x_capture(
 
         // ── FFN block (GeGLU) ────────────────────────────────────────
         gpu.rmsnorm_f32(&state.x, &layer.pre_ffn_norm, &state.tmp, eps)?;
+        if let Some((collector, registry)) = calibration {
+            collector
+                .capture_by_id(
+                    gpu,
+                    registry,
+                    CaptureId::new(logical_layer_idx, ProjectionRole::DenseMlpInput, None),
+                    &state.tmp,
+                    1,
+                    cfg.hidden_size,
+                )
+                .map_err(|error| HipError::new(0, &error.to_string()))?;
+        }
         weight_gemv(gpu, &layer.w_gate, &state.tmp, &state.gate)?;
         weight_gemv(gpu, &layer.w_up, &state.tmp, &state.up)?;
         gpu.gelu_mul_f32(&state.gate, &state.up, &state.ffn_hidden)?;
         // H-Neuron intervention gain (no-op unless a session is active): scale the
         // down_proj input in place before down. Decode is a single position.
-        hipfire_hneurons::intervene::maybe_intervene_ffn(gpu, &state.ffn_hidden, layer_idx, 1)?;
+        hipfire_hneurons::intervene::maybe_intervene_ffn(
+            gpu,
+            &state.ffn_hidden,
+            logical_layer_idx,
+            1,
+        )?;
+        if let Some((collector, registry)) = calibration {
+            collector
+                .capture_by_id(
+                    gpu,
+                    registry,
+                    CaptureId::new(logical_layer_idx, ProjectionRole::DownInput, None),
+                    &state.ffn_hidden,
+                    1,
+                    cfg.intermediate_size,
+                )
+                .map_err(|error| HipError::new(0, &error.to_string()))?;
+        }
         weight_gemv(gpu, &layer.w_down, &state.ffn_hidden, &state.o)?;
         // post_feedforward_layernorm, also inside the residual.
         gpu.rmsnorm_f32(&state.o, &layer.post_ffn_norm, &state.tmp, eps)?;
         gpu.add_f32(&state.x, &state.tmp, &state.x)?;
         // Block-boundary steering/abliteration hook (no-op unless a session is
         // active). `state.x` is the settled post-residual stream — fusion-proof.
-        hipfire_steer::maybe_steer_block(gpu, &state.x, layer_idx)?;
+        hipfire_steer::maybe_steer_block(gpu, &state.x, logical_layer_idx)?;
         // DSpark/DFlash extract-layer capture: append the settled residual at the
         // requested layers (ascending) to the host sink. See fn doc.
         if let Some(sink) = capture.as_deref_mut() {
-            if sink.extract_layers.contains(&layer_idx) {
+            if sink.extract_layers.contains(&logical_layer_idx) {
                 if sink.hidden_gpu.is_some() {
                     return Err(HipError::new(
                         0,
@@ -672,15 +797,17 @@ fn forward_after_x_capture(
         maybe_dump_lm(
             gpu,
             &state.x,
-            &format!("lm_block_{layer_idx:02}"),
+            &format!("lm_block_{logical_layer_idx:02}"),
             &[cfg.hidden_size],
         );
     }
 
-    // Final norm + lm_head.
-    gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, eps)?;
-    weight_gemv(gpu, &weights.output, &state.tmp, &state.logits)?;
-    maybe_dump_lm(gpu, &state.logits, "lm_logits", &[cfg.vocab_size]);
+    if finalize {
+        // Final norm + lm_head.
+        gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, eps)?;
+        weight_gemv(gpu, &weights.output, &state.tmp, &state.logits)?;
+        maybe_dump_lm(gpu, &state.logits, "lm_logits", &[cfg.vocab_size]);
+    }
     Ok(())
 }
 

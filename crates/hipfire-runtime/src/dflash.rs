@@ -5,8 +5,8 @@
 //! DFlash draft forward pass — native Rust+HIP.
 //!
 //! Minimal dependency surface: only reads HFQ draft files (arch_id = 20),
-//! writes F32 GpuTensor weights, and runs a bidirectional cross-attention
-//! Qwen3-flavored decoder over a block of masked positions.
+//! loads BF16/F16/F32 or supported MQ matrix weights, and runs a bidirectional
+//! cross-attention Qwen3-flavored decoder over a block of masked positions.
 //!
 //! The draft model does not own a vocab head. Its output is the final
 //! hidden state per block position; the caller applies the target's
@@ -29,6 +29,7 @@
 use crate::hfq::{load_awq_scale, HfqFile};
 use crate::weights::WeightTensor;
 use hip_bridge::{Graph, GraphExec, HipResult};
+use hipfire_primitives::conv::{bf16_bits_to_f32, f32_to_f16_bits};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::collections::{HashMap, HashSet};
 
@@ -157,7 +158,7 @@ pub struct DflashWeights {
     /// of the upstream DFlash draft architecture.
     pub logit_bias: Option<GpuTensor>, // [vocab_size] — F32
     pub layers: Vec<DflashLayerWeights>,
-    /// True when at least one matrix weight is MQ4G256 — drives whether
+    /// True when at least one matrix weight is MQ4G256 or MQ3G256 — drives whether
     /// the draft_forward path needs to allocate FWHT rotation scratches.
     pub has_mq: bool,
 }
@@ -180,6 +181,10 @@ fn hfq_tensor_f32(
         2 => data
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        16 => data
+            .chunks_exact(2)
+            .map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect(),
         q => panic!("dflash: unsupported quant_type {q} for {name}"),
     };
@@ -214,6 +219,10 @@ fn optional_hfq_tensor_f32(
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
+        16 => data
+            .chunks_exact(2)
+            .map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
         q => panic!("dflash: unsupported quant_type {q} for {name}"),
     };
     let expected: usize = shape.iter().product();
@@ -229,9 +238,10 @@ fn optional_hfq_tensor_f32(
 
 /// Load a matrix tensor as a `WeightTensor` carrying its native dtype.
 /// Supported quant_types:
-///   1  (F16)      → lifted to F32 on GPU (legacy path).
+///   1  (F16)      → native F16, optionally lifted to F32 for legacy A/B.
 ///   2  (F32)      → uploaded as F32.
 ///   13 (MQ4-G256) → uploaded raw, kernel dispatch will FWHT-rotate x at use.
+///   16 (BF16)     → native BF16 on WMMA arches, host-converted to F16 elsewhere.
 ///
 /// `shape = [m, k]` so m=output_dim and k=input_dim. The HFQ index stores
 /// the unaligned byte length; for MQ4 we skip shape verification (the
@@ -263,7 +273,8 @@ fn hfq_weight(
                     m * k * 2,
                     "dflash {name} F16 byte-size mismatch"
                 );
-                let buf = gpu.upload_raw(data, &[m * k])?;
+                let mut buf = gpu.upload_raw(data, &[m * k])?;
+                buf.dtype = DType::F16;
                 Ok::<WeightTensor, hip_bridge::HipError>(WeightTensor {
                     buf,
                     gpu_dtype: DType::F16,
@@ -322,6 +333,30 @@ fn hfq_weight(
                 awq_scale: None,
             })
         }
+        16 => {
+            assert_eq!(
+                data.len(),
+                m * k * 2,
+                "dflash {name} BF16 byte-size mismatch"
+            );
+            let gpu_dtype = dflash_bf16_load_dtype(&gpu.arch);
+            let mut buf = if gpu_dtype == DType::BF16 {
+                gpu.upload_raw(data, &[m * k])?
+            } else {
+                let f16_data = dflash_bf16_to_f16_bytes(data);
+                gpu.upload_raw(&f16_data, &[m * k])?
+            };
+            buf.dtype = gpu_dtype;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         17 => {
             // MQ3-G256: 104 bytes per 256 weights. Same opaque-buffer pattern
             // as MQ4. Dispatch path (`gemm_dispatch`) routes through
@@ -348,6 +383,23 @@ fn hfq_weight(
         wt.awq_scale = load_awq_scale(hfq, gpu, name, k);
     }
     Ok(wt)
+}
+
+fn dflash_bf16_load_dtype(arch: &str) -> DType {
+    if hipfire_rdna::arch_caps::gfx_has_wmma(arch) {
+        DType::BF16
+    } else {
+        DType::F16
+    }
+}
+
+fn dflash_bf16_to_f16_bytes(data: &[u8]) -> Vec<u8> {
+    data.chunks_exact(2)
+        .flat_map(|chunk| {
+            let value = bf16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+            f32_to_f16_bits(value).to_le_bytes()
+        })
+        .collect()
 }
 
 impl DflashWeights {
@@ -840,6 +892,7 @@ fn gemm_dispatch(
     let result = match w.gpu_dtype {
         DType::F32 => gpu.gemm_f32_batched(x, &w.buf, y, batch, w.k, w.m),
         DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
+        DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, batch),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {
             // Chunk on `batch` when the request exceeds the scratch capacity
@@ -930,7 +983,7 @@ fn gemm_dispatch(
         let us = t.elapsed().as_micros();
         let weight_bytes = match w.gpu_dtype {
             DType::F32 => w.m * w.k * 4,
-            DType::F16 => w.m * w.k * 2,
+            DType::F16 | DType::BF16 => w.m * w.k * 2,
             // HFQ4/MQ4: 136B per group of 256
             _ => w.m * (w.k / 256).max(1) * 136,
         };
@@ -1606,4 +1659,30 @@ pub fn draft_forward_opts(
     scratch.draft_ctx_cached_rows = l;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod dtype_tests {
+    use super::{dflash_bf16_load_dtype, dflash_bf16_to_f16_bytes};
+    use hipfire_rdna::DType;
+
+    #[test]
+    fn bf16_draft_weights_stay_native_on_bf16_wmma_arches() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert_eq!(dflash_bf16_load_dtype(arch), DType::BF16, "{arch}");
+        }
+    }
+
+    #[test]
+    fn bf16_draft_weights_fall_back_to_f16_on_older_arches() {
+        for arch in ["gfx906", "gfx1030"] {
+            assert_eq!(dflash_bf16_load_dtype(arch), DType::F16, "{arch}");
+        }
+    }
+
+    #[test]
+    fn bf16_fallback_conversion_preserves_representable_values() {
+        let bf16 = [0x80, 0x3f, 0x00, 0xc0]; // 1.0, -2.0
+        assert_eq!(dflash_bf16_to_f16_bytes(&bf16), [0x00, 0x3c, 0x00, 0xc0]);
+    }
 }

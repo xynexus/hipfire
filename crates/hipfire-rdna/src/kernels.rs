@@ -1467,6 +1467,12 @@ pub const MOE_SCATTER_PERMUTE_K8_SRC: &str =
 pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma_k2.hip");
 
+/// Family-neutral grouped routed-expert OQ4 W4A16 kernel. Consumes indexed
+/// `[f32 scale | 128 signed-int4]` blocks prepared by the runtime pager/eager
+/// loader and the same scatter/tile descriptors as the MQ grouped kernels.
+pub const GEMM_OQ4G256_MOE_GROUPED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq4g256_moe_grouped_wmma.hip");
+
 /// gfx12 (RDNA4) sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC. Same
 /// dispatch contract; differs in WMMA intrinsic (_gfx12), operand
 /// width (half8_t vs half16_t), and K-lane split (K split across 2
@@ -1626,6 +1632,12 @@ pub const GEMM_F16_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/gemm_f16_moe_grouped_wmma.gfx1151.hip");
 pub const GEMM_BF16_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/gemm_bf16_moe_grouped_wmma.gfx1151.hip");
+
+/// Scalar grouped fallback for raw F16/BF16 routed experts. Uses the same
+/// expert-tile permutation as the fast grouped kernels and compiles on every
+/// supported HIP architecture.
+pub const GEMM_RAW_MOE_GROUPED_PORTABLE_SRC: &str =
+    include_str!("../../../kernels/src/gemm_raw_moe_grouped_portable.hip");
 
 /// i8 MMQ sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC for gfx11 dGPUs
 /// (gfx1100/1101/1102/1103 — 7900 XTX, 7800/7700, 7600, Phoenix mobile).
@@ -2530,8 +2542,9 @@ pub const ADD_INPLACE_SRC: &str = include_str!("../../../kernels/src/add_inplace
 /// space for the real-format correction GEMV (y += R_S·x_S).
 pub const RQ_CORRECTION_SRC: &str = include_str!("../../../kernels/src/rq_correction.hip");
 
-/// Calibration activation reductions (`calib_sumsq_reduce_f32` = per-column Σx²
-/// for imatrix/diag; `calib_hessian_outer_f32` = Σxxᵀ K×K for GPTQ Hessian).
+/// Calibration activation staging/reductions (`calib_gather_rows_f32` = indexed
+/// grouped-MoE row gather, `calib_sumsq_reduce_f32` = per-column Σx² for
+/// imatrix/diag; `calib_hessian_outer_f32` = Σxxᵀ K×K for GPTQ Hessian).
 /// Accumulate-in-place over the calibration corpus. Tier-1 native collector.
 pub const CALIB_REDUCE_SRC: &str = include_str!("../../../kernels/src/calib_reduce.hip");
 
