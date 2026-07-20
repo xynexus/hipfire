@@ -111,9 +111,22 @@ refault correctness and the one-read ledger.
 The first six steady production Qwen layers read about 13.15 GB each. Layers
 1--5 spent 123/152/229/240/277 seconds in source load plus upload versus
 144/142/219/156/162 seconds executing, so the 1 Gbps network source is a
-co-limiter or dominant limiter. The bounded lookahead above is intended to
-overlap that source read with current-layer execution; its actual reduction is
-still an evidence item and is not inferred from the implementation alone.
+co-limiter or dominant limiter. The first two layers with completed lookahead
+telemetry each read about 13.1 GB in 113.8 seconds while the current layer
+executed for 232.1/234.7 seconds. Foreground prefetch waits were 3/4
+microseconds with zero read errors, proving that one-layer lookahead hides the
+network-read portion on this host. Foreground mapping, conversion, preparation,
+and GPU upload still took 140.1/191.1 seconds, so those phases remain separate
+optimization targets. A matched prefetch-on/off comparison of the same layer is
+still required before claiming an end-to-end speedup.
+
+The same production checkpoints prove K=10 routing over 262,144 corpus rows
+(2,621,440 routed slots) with zero invalid indices. Coverage is deliberately
+evaluated per layer rather than inferred from the total route count: layer 8
+had 28 of 512 experts below the 2,048-row floor (minimum 109 rows), and the
+preserve-undercovered policy recorded all 28 for high-precision fallback. This
+is correct fallback behavior, not evidence that the current corpus satisfies a
+strict all-expert coverage gate.
 
 Still required before declaring the engine complete or promoting a production
 397B quant:
