@@ -4047,6 +4047,10 @@ def build_expert_sweep_plan(**kwargs):
     return load_expert_sweep_module().build_plan(**kwargs)
 
 
+def verify_expert_sweep_plan(plan, *, current_engine=None):
+    return load_expert_sweep_module().verify_plan(plan, current_engine=current_engine)
+
+
 def paro_probe_model(model, *, local_only=False, max_modules=None):
     module = load_paroquant_import_module()
     return module.probe_model(model, local_only=local_only, max_modules=max_modules)
@@ -4228,6 +4232,15 @@ def build_parser():
     expert_sweep.add_argument("--engine-root")
     expert_sweep.add_argument("--pretty", action="store_true")
     expert_sweep.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    expert_sweep_verify = sub.add_parser(
+        "expert-sweep-verify",
+        help="Reject sweep plan, corpus, model, reference, or engine drift before execution.",
+    )
+    expert_sweep_verify.add_argument("--plan", required=True)
+    expert_sweep_verify.add_argument("--engine-root")
+    expert_sweep_verify.add_argument("--pretty", action="store_true")
+    expert_sweep_verify.add_argument("--out", help="Write JSON to this path instead of stdout.")
 
     latent_kv_plan = sub.add_parser(
         "latent-kv-plan",
@@ -4532,6 +4545,15 @@ def run(argv=None):
                 evaluation_owns_resource_lease=args.evaluation_owns_resource_lease,
                 engine=engine_fingerprint(args.engine_root),
                 command=["python3", "scripts/astrea.py", *raw_argv],
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "expert-sweep-verify":
+        write_json(
+            verify_expert_sweep_plan(
+                load_json(args.plan),
+                current_engine=engine_fingerprint(args.engine_root),
             ),
             pretty=args.pretty,
             out=args.out,

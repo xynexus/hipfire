@@ -318,15 +318,20 @@ python3 scripts/astrea.py expert-sweep-plan \
   --minimum-rows 2048 --minimum-rows 4096 \
   --fixed-capture-target 4096 \
   --out ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-plan.json
+
+python3 scripts/astrea.py expert-sweep-verify \
+  --plan ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-plan.json
 ```
 
 The plan fingerprints the native calibration engine, registered adapters,
 grouped-MoE substrate, quantizer, workflow scripts, datasets, commands, and
 expert policy. Every variant uses `oq4.25++` with AWQ+LDLQ by default and emits
 canonical native two-pass commands. Non-daemon evaluation commands are wrapped
-in the shared GPU lock. The plan is a reproducibility contract only; promotion
-still requires all listed KLD, PPL, low-traffic-expert, size, capture-time, and
-reduction-launch evidence.
+in the shared GPU lock. The verifier checks the plan fingerprint, current corpus
+hashes, source/reference paths, engine fingerprint, one-axis invariants, and
+command/output bindings before any execution. The plan is a reproducibility
+contract only; promotion still requires all listed KLD, PPL,
+low-traffic-expert, size, capture-time, and reduction-launch evidence.
 
 Large quantization runs spill completed tensors to the output filesystem to
 bound RAM. During final HFQ assembly on Linux, each spill range is hole-punched

@@ -22,6 +22,7 @@ from string import Formatter
 
 
 EXPERT_SWEEP_PLAN_SCHEMA = "hipfire.astrea.expert_calibration_sweep_plan.v0"
+EXPERT_SWEEP_VERIFY_SCHEMA = "hipfire.astrea.expert_calibration_sweep_verify.v0"
 DEFAULT_QUANT_FORMAT = "oq4.25++"
 DEFAULT_MINIMUM_ROWS = (512, 1024, 2048, 4096)
 DEFAULT_CAPTURE_TARGETS = (2048, 4096, 8192)
@@ -177,6 +178,120 @@ def _plan_fingerprint(payload: dict) -> str:
     if isinstance(stable.get("engine"), dict):
         stable["engine"].pop("captured_at_utc", None)
     return _fingerprint(stable)
+
+
+def _command_value(command: list[str], flag: str) -> str:
+    try:
+        index = command.index(flag)
+        return command[index + 1]
+    except (ValueError, IndexError) as error:
+        raise ValueError(f"variant two-pass command is missing {flag}") from error
+
+
+def verify_plan(plan, *, current_engine=None) -> dict:
+    """Validate a frozen sweep contract immediately before model execution."""
+
+    if not isinstance(plan, dict) or plan.get("schema") != EXPERT_SWEEP_PLAN_SCHEMA:
+        raise ValueError("unsupported expert sweep plan schema")
+    fingerprint = plan.get("plan_fingerprint")
+    body = {key: value for key, value in plan.items() if key != "plan_fingerprint"}
+    expected = _plan_fingerprint(body)
+    if fingerprint != expected:
+        raise ValueError(f"plan fingerprint mismatch: recorded {fingerprint}, computed {expected}")
+
+    observed_datasets = {}
+    for role in ("calibration", "evaluation"):
+        record = plan.get("datasets", {}).get(role)
+        if not isinstance(record, dict) or not record.get("path") or not record.get("sha256"):
+            raise ValueError(f"plan has no {role} dataset identity")
+        path = Path(record["path"])
+        if not path.is_file():
+            raise ValueError(f"{role} dataset is missing: {path}")
+        observed = _sha256_file(path)
+        if observed != record["sha256"]:
+            raise ValueError(
+                f"{role} dataset hash drift: recorded {record['sha256']}, observed {observed}"
+            )
+        observed_datasets[role] = observed
+    if observed_datasets["calibration"] == observed_datasets["evaluation"]:
+        raise ValueError("calibration and evaluation datasets no longer have distinct content")
+
+    model = Path(plan.get("model", {}).get("path", ""))
+    reference = Path(plan.get("reference_model", {}).get("path", ""))
+    if not model.is_dir():
+        raise ValueError(f"source model directory is missing: {model}")
+    if not reference.is_file():
+        raise ValueError(f"reference model is missing: {reference}")
+
+    planned_engine = plan.get("engine", {}).get("fingerprint_id")
+    observed_engine = (current_engine or {}).get("fingerprint_id")
+    if current_engine is not None and planned_engine != observed_engine:
+        raise ValueError(
+            f"engine fingerprint drift: recorded {planned_engine}, observed {observed_engine}"
+        )
+
+    variants = plan.get("variants")
+    if not isinstance(variants, list) or not variants:
+        raise ValueError("expert sweep plan has no variants")
+    ids = [variant.get("id") for variant in variants]
+    if any(not variant_id for variant_id in ids) or len(ids) != len(set(ids)):
+        raise ValueError("expert sweep variant ids must be non-empty and unique")
+    outputs = [variant.get("quantized_artifact") for variant in variants]
+    if any(not output for output in outputs) or len(outputs) != len(set(outputs)):
+        raise ValueError("expert sweep quantized outputs must be non-empty and unique")
+
+    minimums = set()
+    targets = set()
+    evaluation_dataset = plan["datasets"]["evaluation"]["path"]
+    for variant in variants:
+        minimum = int(variant.get("minimum_expert_activations", 0))
+        target = int(variant.get("expert_capture_target", 0))
+        if minimum < 1 or target < minimum:
+            raise ValueError(f"variant {variant.get('id')} has an invalid minimum/capture target")
+        minimums.add(minimum)
+        targets.add(target)
+        two_pass = variant.get("two_pass_command")
+        evaluation = variant.get("evaluation_command")
+        if not isinstance(two_pass, list) or not isinstance(evaluation, list):
+            raise ValueError(f"variant {variant.get('id')} has malformed commands")
+        if _command_value(two_pass, "--min-expert-activations") != str(minimum):
+            raise ValueError(f"variant {variant.get('id')} minimum disagrees with its command")
+        if _command_value(two_pass, "--expert-capture-target") != str(target):
+            raise ValueError(f"variant {variant.get('id')} capture target disagrees with its command")
+        for expected_path in (
+            variant["quantized_artifact"],
+            variant["evaluation_output"],
+            evaluation_dataset,
+        ):
+            if expected_path not in evaluation:
+                raise ValueError(
+                    f"variant {variant.get('id')} evaluator is not bound to {expected_path}"
+                )
+
+    axis = plan.get("axis")
+    if axis == "minimum_expert_activations":
+        if len(targets) != 1:
+            raise ValueError("minimum sweep must hold the capture target fixed")
+        frozen = int(plan.get("selection_contract", {}).get("capture_target_held_fixed", 0))
+        if targets != {frozen}:
+            raise ValueError("minimum sweep capture target disagrees with its selection contract")
+    elif axis == "expert_capture_target":
+        if len(minimums) != 1:
+            raise ValueError("capture sweep must hold the selected minimum fixed")
+        frozen = int(plan.get("selection_contract", {}).get("selected_minimum", 0))
+        if minimums != {frozen}:
+            raise ValueError("capture sweep minimum disagrees with its selection contract")
+    else:
+        raise ValueError(f"unsupported expert sweep axis: {axis}")
+
+    return {
+        "schema": EXPERT_SWEEP_VERIFY_SCHEMA,
+        "status": "verified_not_run",
+        "plan_fingerprint": fingerprint,
+        "engine_fingerprint": planned_engine,
+        "dataset_sha256": observed_datasets,
+        "variant_ids": ids,
+    }
 
 
 def build_plan(

@@ -265,3 +265,66 @@ def test_astrea_cli_writes_frozen_expert_sweep_plan(tmp_path):
     assert "crates/hipfire-coexistence/src/calibrate.rs" in plan["engine"]["source_hashes"]
     assert "scripts/astrea_expert_sweep.py" in plan["engine"]["source_hashes"]
     assert plan["command_argv"][:3] == ["python3", "scripts/astrea.py", "expert-sweep-plan"]
+
+
+def test_verify_plan_rejects_dataset_engine_and_payload_drift(tmp_path):
+    sweep = load_module()
+    inputs = common_inputs(tmp_path)
+    inputs["model"] = tmp_path / "model"
+    inputs["reference_model"] = tmp_path / "reference.hfq"
+    inputs["model"].mkdir(parents=True)
+    inputs["reference_model"].write_bytes(b"reference")
+    plan = sweep.build_plan(
+        **inputs,
+        axis="minimum",
+        minimum_rows=[512, 1024],
+        capture_targets=None,
+        selected_minimum=None,
+        fixed_capture_target=4096,
+    )
+
+    verified = sweep.verify_plan(plan, current_engine={"fingerprint_id": "sha256:engine"})
+    assert verified["schema"] == sweep.EXPERT_SWEEP_VERIFY_SCHEMA
+    assert verified["status"] == "verified_not_run"
+    assert verified["variant_ids"] == ["min512-cap4096", "min1024-cap4096"]
+
+    inputs["evaluation_dataset"].write_text("changed held-out rows\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="evaluation dataset hash drift"):
+        sweep.verify_plan(plan, current_engine={"fingerprint_id": "sha256:engine"})
+
+    inputs["evaluation_dataset"].write_text("held-out rows\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="engine fingerprint drift"):
+        sweep.verify_plan(plan, current_engine={"fingerprint_id": "sha256:different"})
+
+    tampered = json.loads(json.dumps(plan))
+    tampered["variants"][0]["minimum_expert_activations"] = 1
+    with pytest.raises(ValueError, match="plan fingerprint mismatch"):
+        sweep.verify_plan(tampered, current_engine={"fingerprint_id": "sha256:engine"})
+
+
+def test_astrea_cli_verifies_plan_before_execution(tmp_path):
+    astrea = load_astrea()
+    sweep = load_module()
+    inputs = common_inputs(tmp_path)
+    inputs["model"] = tmp_path / "model"
+    inputs["reference_model"] = tmp_path / "reference.hfq"
+    inputs["model"].mkdir(parents=True)
+    inputs["reference_model"].write_bytes(b"reference")
+    current_engine = astrea.engine_fingerprint()
+    inputs["engine"] = current_engine
+    plan = sweep.build_plan(
+        **inputs,
+        axis="capture",
+        minimum_rows=None,
+        capture_targets=[2048, 4096],
+        selected_minimum=2048,
+        fixed_capture_target=None,
+    )
+    plan_path = tmp_path / "capture-plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+    code, stdout, stderr = astrea.main_for_test(["expert-sweep-verify", "--plan", str(plan_path)])
+    assert code == 0, stderr
+    result = json.loads(stdout)
+    assert result["status"] == "verified_not_run"
+    assert result["plan_fingerprint"] == plan["plan_fingerprint"]

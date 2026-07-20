@@ -44,7 +44,9 @@ Implemented and verified in this checkout:
   hashed and must differ, every variant emits a canonical native two-pass
   command plus a GPU-lock-scoped held-out evaluator, and the complete recipe,
   engine, commands, output paths, and required comparison metrics participate
-  in the plan fingerprint;
+  in the plan fingerprint; a pre-execution verifier rejects payload, corpus,
+  source/reference, engine, one-axis, command-binding, or output-identity drift
+  before any model load;
 - durable per-layer phase timing for source load/upload, teacher execution,
   capture serialization, collector finalization, and part sync/hash, persisted
   in checkpoints and the completed artifact for resume-safe ETA analysis;
