@@ -1237,6 +1237,23 @@ from the low-bit eligibility rule. Astrea selects the default cap from measured
 quality/cost evidence; a cap is not declared safe merely because every expert
 met the minimum.
 
+The minimum-floor contract is now frozen, but deliberately not executed while
+the 397B production stream owns the GPU. The v1 plan lives at
+`~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-plan.json` with
+fingerprint `sha256:a6a34652657c3007795330ffaf1e500567027c91a02e8012c73113f372836d18`.
+It binds Qwen3.5-35B-A3B source manifest
+`sha256:fca57860a6c176240d3dd6112989ff235e77130ed3d0de97034fe36597e8dc55`,
+the local OQ8 reference HFQ control region
+`sha256:36cfac4e7f5bef8b9569ada126cb4bccd414bb03daf65b8d53ab1f68a1ebe328`,
+calibration corpus
+`sha256:c263d37c5eaf71b03e86c1e9609c343986cda0bd7cedc95d4ac367c6b3169b8f`,
+held-out corpus
+`sha256:c8b1a1fa66299336f8349e11f2a7679c3f349263f08ff72ea035fac84a3af5bd`,
+the 512/1,024/2,048/4,096 floors, fixed 4,096-row capture target, 64x32
+microbatch geometry, no source lookahead, and 32 daemon-backed quality chunks.
+`expert-sweep-verify` reports `verified_not_run`; this is a reproducibility
+contract, not KLD/PPL or expert-floor selection evidence.
+
 ## Performance methodology
 
 Measure before tuning. For each batch sweep record:
