@@ -79,28 +79,37 @@ block (~1.7× warm) and then subtracted from the WARM wall. That understated glu
 own drafter and the draft cost scales with target size. Measured: Qwen3.5-9B
 DFlash = 1.049 B params, Qwen3.6-27B DFlash = **1.730 B (×1.65)**.
 
-Against its OWN budget the 9B pair is **185.4 vs 57 ms = 3.25× over** (was
-4.14× before flash attention). Re-derived for the 27B pair from the CURRENT
-per-term numbers — attention constant at 7.0 (both are 32q/8kv/128); GEMM
-weight-bound ×1.65; glue/primitives track hidden ×1.25:
+**⚠ 27B IS NOW MEASURED, NOT DERIVED — and it FITS (task #32, `657b55b2e`,
+`benchmarks/results/dflash-27b-block-wall-20260720.md`).** Cached warm block
+**136.1 ms** (blocks 2–5, `--cpu-primitives` + `--ctx-cache` + `--attn flash`,
+W4A8 multicore). Cold block 0 = 291.6 ms; warm no-cache block 1 = 168.0 ms. The
+9B→27B **no-cache** scaling is **1.50×** (168.0 vs 111.9) — better than the ×1.65
+param ratio, and my earlier *derived* ~273 ms was ~2× pessimistic because it
+omitted the ctx cache. Context cache bit-identical again (K/V Δ=0 all 5 layers,
+cos 1.000000000). int8 full-body **cos 0.998653** (>0.99 PASS). ctx_misses=0.
 
-| term | 9B (measured) | 27B (derived) |
+Full budget picture, using the **corrected** verify walls (task #31 showed the
+old single-token "budget" understates the batched-16 verify wall by ~1.75×):
+
+| | 9B | 27B |
 |---|---|---|
-| GEMM | 102.3 | 168.8 |
-| attention | 7.0 | 7.0 |
-| host glue | 54.0 | 67.5 |
-| primitives | 23.7 | 29.6 |
-| **block** | **185.4** | **~273** |
-| budget | 57 | 155 |
-| **over by** | **3.25×** | **~1.76×** |
+| cached draft block | 185.4 (no cpu-prim) / **111.9** (cpu-prim) | **136.1** (measured) |
+| single-token AR forward (old "budget") | 57 | 155 |
+| batched-16 verify wall (the real target) | ~100 (measured) | ~271 (PROJECTED 155×1.75; no runnable 27B target hfq on disk) |
+| draft vs real verify wall | 111.9 / ~100 = **1.12× over** (near parity) | 136.1 / ~271 = **0.50× — UNDER, ~2× headroom** |
 
-Moving to 27B helps by ~1.85×, not the ~2.7× that holding draft cost fixed
-implied. See the corrected section in
+**27B fits with ~2× headroom — free under overlap. Even against the stricter
+single-token 155 ms, 136 < 155 (1.14× under).** The 9B is at near-parity; the
+27B is the config where the sufficient condition ("draft ≤ verify") holds
+outright. GEMM geometry trap for 27B solved with the existing
+`r14_1x4x64_nb128` (K_CHUNK=1024 divides the 27B K-dims 5120/17408/25600; the 9B
+K_CHUNK=2048 does not — gcd is 1024). See
 `docs/plans/2026-07-19-hybrid-gpu-npu-cpu-spec-decode.md`.
 
-**Items 1, 2 and attention are DONE.** Neither pair fits yet. The remaining gap
-is **~118 ms for 27B**, and GEMM (168.8 derived, 55% of the wall) is now the
-only large lever — specifically the `M_TILE=16` double-stream, ~40 ms above the
+**Items 1, 2, attention, context cache, cpu-primitives, AND the 27B measurement
+are DONE. The 27B pair fits its verify budget.** GEMM (~96 ms NPU, still 70% of
+the 27B wall) remains the only large lever if more headroom is wanted —
+specifically the `M_TILE=16` double-stream, ~40 ms above the
 ~60 ms bandwidth floor on 9B. Host glue (29%) is second.
 
 **⚠ 185.4 ms IS A NO-CACHE, FULL-RECOMPUTE-EVERY-BLOCK WALL. In the actual loop
