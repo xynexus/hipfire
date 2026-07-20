@@ -75,9 +75,13 @@ one layer executes, the native engine reads the following layer's canonical
 safetensor ranges into bounded resident host staging without consuming its
 read-ledger entries. The next layer consumes complete tensor views directly
 from staging, which is freed after synchronous GPU upload. It retains a 32 GiB
-live host-memory reserve and reduces the effective budget when required.
-Override with `--layer-prefetch-bytes N`, or pass zero to disable lookahead;
-the chosen operational budget is recorded in the two-pass recipe.
+live host-memory reserve plus the following layer's upload footprint and
+reduces the effective budget when required. A transition is disabled when
+Linux reports recent full-memory PSI or less than 25% free swap, and no
+mid-tensor prefix is retained because it cannot satisfy a direct view. Override
+with `--layer-prefetch-bytes N`, or pass zero to disable lookahead; the chosen
+operational budget is recorded in the two-pass recipe while pressure decisions
+are recorded per layer.
 
 Expert quality controls are also explicit induction inputs rather than hidden
 calibrator defaults: `--min-expert-activations`,

@@ -64,8 +64,10 @@ Implemented and verified in this checkout:
 - bounded family-neutral source lookahead: the engine selects the next owner's
   canonical physical ranges without consuming the read ledger, reads at most
   16 GiB through one fixed 8 MiB worker chunk into resident staging during
-  current-layer execution, preserves 32 GiB of live host-memory headroom,
-  serves complete tensor views directly from those staged bytes, releases the
+  current-layer execution, preserves 32 GiB of live host-memory headroom plus
+  the next layer upload footprint, refuses transitions with recent full-memory
+  PSI or less than 25% free swap, retains only complete tensors that can satisfy
+  a direct view, serves those views directly from staged bytes, releases the
   staging immediately after GPU upload, and advises the OS that the redundant
   file-cache copy is no longer needed;
   read/wait/staged/consumed byte counts remain compatible with older
@@ -240,6 +242,33 @@ explicitly preserved and the duplicate-free ledger advanced to 400/1,038
 logical tensors. The scheduled 30-minute monitor also followed the replacement
 PID and reported the new 23/60 checkpoint, proving the operational watcher
 survives a resumable process restart.
+
+The same 16 GiB resident lookahead later reproduced host-pressure loss of
+progress after layer 27/60. For more than 20 minutes the durable boundary,
+logical read counters, and source I/O remained unchanged, GPU use stayed at
+zero, the process alternated between runnable and SVM memory waits, the host had
+about 52 GiB swapped, and full-memory PSI reached roughly 10% over 10 seconds.
+The process was terminated at the intact 27/60 boundary and resumed with
+lookahead disabled; memory availability immediately rose from about 28 GiB to
+122 GiB, PSI returned to zero, and the resumed layer reached 99% GPU use. This
+is a second independent correctness proof for durable resume and evidence that
+`MemAvailable - 32 GiB` alone is not a safe staging admission rule on a unified
+memory host. The generic admission policy now additionally reserves the next
+layer upload footprint, rejects any transition with recent full-memory PSI or
+less than 25% free swap, avoids retaining unusable mid-tensor prefixes, and
+persists the pressure-disable reason. The production process remains on the
+explicit no-lookahead recovery path until completion, so these new controls
+still require a later bounded live transition check.
+
+The first no-lookahead recovery layer then committed 28/60 in 336 seconds:
+foreground source load plus upload took 115 seconds (including 77 seconds in
+HIP upload) and teacher execution took 220 seconds. This confirms forward
+progress with the pressure source removed and exposes the expected network-load
+cost. It is useful recovery and on/off directional evidence, but it is not the
+still-required same-layer, same-host-state controlled comparison.
+Exclude the following layer-29 checkpoint from performance comparisons: the
+pressure-gate Clippy/tests and required Graphify refresh ran concurrently on the
+host. Its correctness and read-ledger evidence remain usable.
 
 Still required before declaring the engine complete or promoting a production
 397B quant:

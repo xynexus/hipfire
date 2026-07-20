@@ -218,9 +218,11 @@ impl TensorLoadPlan {
             .find(|entry| entry.logical_name == logical_name)
     }
 
-    /// Return physical source ranges for one owner without consuming the read
-    /// ledger. Ranges are sorted into backing-file order and the final range is
-    /// clipped when the caller's bounded lookahead budget ends mid-tensor.
+    /// Return complete physical source ranges for one owner without consuming
+    /// the read ledger. Ranges are sorted into backing-file order. A tensor that
+    /// does not fit in the remaining lookahead budget is not staged because a
+    /// partial range cannot satisfy a direct tensor view and would only consume
+    /// host memory before the source mmap fallback runs.
     pub fn prefetch_ranges_for(
         &self,
         owner: TensorOwner,
@@ -245,15 +247,15 @@ impl TensorLoadPlan {
 
         let mut remaining = byte_budget;
         let mut bounded = Vec::new();
-        for mut range in ranges {
+        for range in ranges {
             if remaining == 0 {
                 break;
             }
-            range.byte_len = range.byte_len.min(remaining);
-            remaining -= range.byte_len;
-            if range.byte_len > 0 {
-                bounded.push(range);
+            if range.byte_len > remaining {
+                continue;
             }
+            remaining -= range.byte_len;
+            bounded.push(range);
         }
         bounded
     }
@@ -1251,12 +1253,10 @@ mod tests {
         .unwrap();
 
         let ranges = plan.prefetch_ranges_for(TensorOwner::Layer(1), 25);
-        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].byte_offset, 300);
         assert_eq!(ranges[0].byte_len, 10);
-        assert_eq!(ranges[1].byte_offset, 400);
-        assert_eq!(ranges[1].byte_len, 15);
-        assert_eq!(ranges.iter().map(|range| range.byte_len).sum::<u64>(), 25);
+        assert_eq!(ranges.iter().map(|range| range.byte_len).sum::<u64>(), 10);
         assert!(plan
             .prefetch_ranges_for(TensorOwner::Layer(1), 0)
             .is_empty());

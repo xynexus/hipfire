@@ -83,14 +83,22 @@ Live gfx1151 evidence on 2026-07-20:
 - Network-backed source lookahead is now family-neutral and ledger-safe. The
   engine reads the next owner's canonical physical ranges through one 8 MiB
   worker chunk into resident staging while the current layer executes, bounded
-  to 16 GiB with a 32 GiB live host-memory reserve. Complete tensor views are
-  consumed directly from staging and released after GPU upload. Checkpoints
+  to 16 GiB with a 32 GiB live host-memory reserve plus the next layer's upload
+  footprint. Any recent full-memory PSI or less than 25% free swap disables the
+  transition, and only complete tensor ranges are retained. Complete tensor
+  views are consumed directly from staging and released after GPU upload. Checkpoints
   record read/staged/consumed bytes plus background, view, decode, upload,
-  release, foreground-wait, and error telemetry; matched staged/page-cache/off
+  release, foreground-wait, pressure-disable reason, and error telemetry;
+  matched staged/page-cache/off
   production timings remain to be collected. The first 397B production layer
   using resident staging consumed all 13.124 GB across 15 tensors directly,
   waited 3 microseconds, uploaded in 1.027 seconds, and completed layer
   construction in 1.540 seconds before 232.463 seconds of teacher execution.
+  After resident staging reproduced a second swap/SVM stall at layer 27/60,
+  the same run resumed with lookahead disabled and committed layer 28 in 336
+  seconds: 115 seconds of foreground load/upload and 220 seconds of teacher
+  execution. This proves the recovery path and motivates the pressure gate; it
+  is not a same-layer controlled performance comparison.
 - On the identical 4,096-token Qwen sample set, 256/512/1,024/2,048/4,096-row
   geometries took 7.56/3.76/2.55/2.16/1.89 seconds of layer execution and
   produced identical normalized descriptors and expert telemetry. Total

@@ -45,6 +45,7 @@ const ARTIFACT_ESTIMATE_MIN_SAFETY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const CALIBRATION_CLI_DEFAULT_MAX_ROWS: usize = 2048;
 const CALIBRATION_DEFAULT_LAYER_PREFETCH_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const CALIBRATION_PREFETCH_HOST_RESERVE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const CALIBRATION_PREFETCH_MIN_SWAP_FREE_DENOMINATOR: u64 = 4;
 
 const CALIBRATE_USAGE: &str = "usage: hipfire-coexistence calibrate \
 --model <safetensors-dir-or-cache-root> --corpus <text> --output <model.calib.hfq> \
@@ -935,7 +936,12 @@ fn dry_run_report(
     let storage_estimate = calibration_storage_estimate(command, inspection, job, capture)?;
     let storage_filesystem =
         filesystem_space(&command.output, storage_estimate.required_free_bytes);
-    let host_available_bytes = host_available_memory_bytes();
+    let host_memory = host_memory_snapshot();
+    let prefetch_decision = layer_prefetch_decision(
+        command.layer_prefetch_bytes,
+        max_layer_source_bytes,
+        host_memory,
+    );
     Ok(serde_json::json!({
         "command": "calibrate",
         "dry_run": command.dry_run,
@@ -974,12 +980,12 @@ fn dry_run_report(
                 "worker_chunk_bytes": LAYER_PREFETCH_WORKER_CHUNK_BYTES,
                 "configured_bytes": command.layer_prefetch_bytes,
                 "host_reserve_bytes": CALIBRATION_PREFETCH_HOST_RESERVE_BYTES,
-                "effective_max_layer_bytes": effective_layer_prefetch_bytes(
-                    command.layer_prefetch_bytes,
-                    max_layer_source_bytes,
-                    host_available_bytes,
-                ),
-                "host_available_bytes": host_available_bytes,
+                "next_layer_upload_reserve_bytes": max_layer_source_bytes,
+                "minimum_swap_free_fraction": 1.0 / CALIBRATION_PREFETCH_MIN_SWAP_FREE_DENOMINATOR as f64,
+                "requires_zero_full_pressure_avg10": true,
+                "effective_max_layer_bytes": prefetch_decision.bytes,
+                "disabled_reason": prefetch_decision.disabled_reason,
+                "host_memory": host_memory,
             },
             "adapter_estimate": resource_estimate,
         },
@@ -1159,6 +1165,10 @@ pub struct CalibrationLayerTiming {
     pub prefetch_errors: usize,
     /// Time required to plan and start the following layer's lookahead worker.
     pub prefetch_submit_us: u64,
+    /// Why lookahead for the following layer was not started despite reaching
+    /// the submission point. This distinguishes pressure admission from a
+    /// configured-off run in persisted timing evidence.
+    pub next_prefetch_disabled_reason: Option<String>,
     /// Successful source tensors materialized for this layer.
     pub source_tensor_count: u64,
     pub source_bytes: u64,
@@ -1187,32 +1197,102 @@ fn elapsed_us(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-fn effective_layer_prefetch_bytes(
-    configured_bytes: u64,
-    layer_source_bytes: u64,
-    host_available_bytes: Option<u64>,
-) -> u64 {
-    let capacity = host_available_bytes
-        .map(|available| available.saturating_sub(CALIBRATION_PREFETCH_HOST_RESERVE_BYTES))
-        .unwrap_or(configured_bytes);
-    configured_bytes.min(layer_source_bytes).min(capacity)
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+struct HostMemorySnapshot {
+    available_bytes: Option<u64>,
+    swap_total_bytes: Option<u64>,
+    swap_free_bytes: Option<u64>,
+    full_pressure_avg10: Option<f64>,
 }
 
-fn host_available_memory_bytes() -> Option<u64> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayerPrefetchDecision {
+    bytes: u64,
+    disabled_reason: Option<&'static str>,
+}
+
+fn layer_prefetch_decision(
+    configured_bytes: u64,
+    layer_source_bytes: u64,
+    host: HostMemorySnapshot,
+) -> LayerPrefetchDecision {
+    if configured_bytes == 0 {
+        return LayerPrefetchDecision {
+            bytes: 0,
+            disabled_reason: Some("disabled_by_configuration"),
+        };
+    }
+    if host.full_pressure_avg10.is_some_and(|avg10| avg10 > 0.0) {
+        return LayerPrefetchDecision {
+            bytes: 0,
+            disabled_reason: Some("memory_psi_full"),
+        };
+    }
+    if matches!(
+        (host.swap_total_bytes, host.swap_free_bytes),
+        (Some(total), Some(free))
+            if total > 0
+                && free < total.div_ceil(CALIBRATION_PREFETCH_MIN_SWAP_FREE_DENOMINATOR)
+    ) {
+        return LayerPrefetchDecision {
+            bytes: 0,
+            disabled_reason: Some("swap_free_below_25_percent"),
+        };
+    }
+    // Staging and the next layer's GPU upload coexist until the upload is
+    // synchronously complete. Reserve both that upload footprint and the live
+    // host margin before retaining any anonymous lookahead bytes.
+    let required_headroom =
+        CALIBRATION_PREFETCH_HOST_RESERVE_BYTES.saturating_add(layer_source_bytes);
+    let capacity = host
+        .available_bytes
+        .map(|available| available.saturating_sub(required_headroom))
+        .unwrap_or(configured_bytes);
+    let bytes = configured_bytes.min(layer_source_bytes).min(capacity);
+    LayerPrefetchDecision {
+        bytes,
+        disabled_reason: (bytes == 0).then_some("host_headroom_below_reserve_plus_upload"),
+    }
+}
+
+fn host_memory_snapshot() -> HostMemorySnapshot {
     #[cfg(target_os = "linux")]
     {
-        let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
-        let available_kib = meminfo.lines().find_map(|line| {
-            let mut fields = line.split_ascii_whitespace();
-            (fields.next()? == "MemAvailable:")
-                .then(|| fields.next()?.parse::<u64>().ok())
-                .flatten()
-        })?;
-        available_kib.checked_mul(1024)
+        let meminfo = fs::read_to_string("/proc/meminfo").ok();
+        let kib = |label: &str| {
+            meminfo.as_deref()?.lines().find_map(|line| {
+                let mut fields = line.split_ascii_whitespace();
+                (fields.next()? == label)
+                    .then(|| fields.next()?.parse::<u64>().ok())
+                    .flatten()
+                    .and_then(|value| value.checked_mul(1024))
+            })
+        };
+        let full_pressure_avg10 =
+            fs::read_to_string("/proc/pressure/memory")
+                .ok()
+                .and_then(|pressure| {
+                    pressure.lines().find_map(|line| {
+                        let mut fields = line.split_ascii_whitespace();
+                        (fields.next()? == "full").then(|| {
+                            fields.find_map(|field| {
+                                field
+                                    .strip_prefix("avg10=")
+                                    .and_then(|value| value.parse::<f64>().ok())
+                            })
+                        })?
+                    })
+                });
+        HostMemorySnapshot {
+            available_bytes: kib("MemAvailable:"),
+            swap_total_bytes: kib("SwapTotal:"),
+            swap_free_bytes: kib("SwapFree:"),
+            full_pressure_avg10,
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        None
+        HostMemorySnapshot::default()
     }
 }
 
@@ -2052,24 +2132,39 @@ impl LayerStreamEngine {
             let prefetch_submit_started = Instant::now();
             let next_layer = layer_index + 1;
             let pausing_after_this_layer = self.pause_after_layers == Some(next_layer);
-            if next_layer < model.num_layers
-                && !pausing_after_this_layer
-                && self.layer_prefetch_bytes > 0
-            {
-                let layer_source_bytes = tensor_plan.bytes_for(TensorOwner::Layer(next_layer));
-                let prefetch_bytes = effective_layer_prefetch_bytes(
-                    self.layer_prefetch_bytes,
-                    layer_source_bytes,
-                    host_available_memory_bytes(),
-                );
-                let ranges =
-                    tensor_plan.prefetch_ranges_for(TensorOwner::Layer(next_layer), prefetch_bytes);
-                if !ranges.is_empty() {
-                    match LayerPrefetch::spawn(ranges) {
-                        Ok(prefetch) => pending_prefetch = Some((next_layer, prefetch)),
-                        Err(error) => eprintln!(
-                            "calibrate: layer {next_layer} prefetch disabled for this transition: {error}"
-                        ),
+            let mut next_prefetch_disabled_reason = None;
+            if next_layer < model.num_layers {
+                if pausing_after_this_layer {
+                    next_prefetch_disabled_reason = Some("pause_boundary".into());
+                } else if self.layer_prefetch_bytes == 0 {
+                    next_prefetch_disabled_reason = Some("disabled_by_configuration".into());
+                } else {
+                    let layer_source_bytes = tensor_plan.bytes_for(TensorOwner::Layer(next_layer));
+                    let decision = layer_prefetch_decision(
+                        self.layer_prefetch_bytes,
+                        layer_source_bytes,
+                        host_memory_snapshot(),
+                    );
+                    let ranges = tensor_plan
+                        .prefetch_ranges_for(TensorOwner::Layer(next_layer), decision.bytes);
+                    if !ranges.is_empty() {
+                        match LayerPrefetch::spawn(ranges) {
+                            Ok(prefetch) => pending_prefetch = Some((next_layer, prefetch)),
+                            Err(error) => {
+                                next_prefetch_disabled_reason = Some("worker_spawn_failed".into());
+                                eprintln!(
+                                    "calibrate: layer {next_layer} prefetch disabled for this transition: {error}"
+                                );
+                            }
+                        }
+                    } else {
+                        let reason = decision
+                            .disabled_reason
+                            .unwrap_or("no_complete_tensor_fits_budget");
+                        next_prefetch_disabled_reason = Some(reason.to_string());
+                        eprintln!(
+                            "calibrate: layer {next_layer} prefetch disabled for this transition: {reason}"
+                        );
                     }
                 }
             }
@@ -2143,6 +2238,7 @@ impl LayerStreamEngine {
                 prefetch_staged_bytes,
                 prefetch_errors: prefetch_report.errors.len(),
                 prefetch_submit_us,
+                next_prefetch_disabled_reason,
                 source_tensor_count: source_load.tensor_count,
                 source_bytes: source_load.source_bytes,
                 gpu_upload_bytes: source_load.gpu_upload_bytes,
@@ -2749,19 +2845,62 @@ mod tests {
     #[test]
     fn layer_prefetch_budget_preserves_host_reserve_and_layer_bound() {
         let gib = 1024 * 1024 * 1024;
+        let healthy = HostMemorySnapshot {
+            available_bytes: Some(65 * gib),
+            swap_total_bytes: Some(64 * gib),
+            swap_free_bytes: Some(64 * gib),
+            full_pressure_avg10: Some(0.0),
+        };
         assert_eq!(
-            effective_layer_prefetch_bytes(16 * gib, 13 * gib, Some(65 * gib)),
-            13 * gib
+            layer_prefetch_decision(16 * gib, 13 * gib, healthy),
+            LayerPrefetchDecision {
+                bytes: 13 * gib,
+                disabled_reason: None,
+            }
+        );
+        let constrained = HostMemorySnapshot {
+            available_bytes: Some(40 * gib),
+            ..healthy
+        };
+        assert_eq!(
+            layer_prefetch_decision(16 * gib, 13 * gib, constrained),
+            LayerPrefetchDecision {
+                bytes: 0,
+                disabled_reason: Some("host_headroom_below_reserve_plus_upload"),
+            }
         );
         assert_eq!(
-            effective_layer_prefetch_bytes(16 * gib, 13 * gib, Some(40 * gib)),
-            8 * gib
+            layer_prefetch_decision(16 * gib, 20 * gib, HostMemorySnapshot::default()).bytes,
+            16 * gib,
         );
         assert_eq!(
-            effective_layer_prefetch_bytes(16 * gib, 20 * gib, None),
-            16 * gib
+            layer_prefetch_decision(
+                16 * gib,
+                13 * gib,
+                HostMemorySnapshot {
+                    full_pressure_avg10: Some(0.01),
+                    ..healthy
+                },
+            )
+            .disabled_reason,
+            Some("memory_psi_full"),
         );
-        assert_eq!(effective_layer_prefetch_bytes(0, 20 * gib, None), 0);
+        assert_eq!(
+            layer_prefetch_decision(
+                16 * gib,
+                13 * gib,
+                HostMemorySnapshot {
+                    swap_free_bytes: Some(12 * gib),
+                    ..healthy
+                },
+            )
+            .disabled_reason,
+            Some("swap_free_below_25_percent"),
+        );
+        assert_eq!(
+            layer_prefetch_decision(0, 20 * gib, healthy).disabled_reason,
+            Some("disabled_by_configuration"),
+        );
     }
 
     #[test]
@@ -2781,6 +2920,7 @@ mod tests {
         assert_eq!(timing.prefetch_bytes, 0);
         assert_eq!(timing.prefetch_staged_bytes, 0);
         assert_eq!(timing.prefetch_errors, 0);
+        assert_eq!(timing.next_prefetch_disabled_reason, None);
         assert_eq!(timing.source_tensor_count, 0);
         assert_eq!(timing.source_bytes, 0);
         assert_eq!(timing.gpu_upload_bytes, 0);
