@@ -16,8 +16,19 @@ npu1/aie2 NPU, 4 columns).
 ## Measured state — do not re-derive
 
 NPU DFlash block wall: **726 ms** (native driver,
-`crates/hipfire-xdna/examples/dflash_body_native.rs`). Verify budgets: 9B 57 ms,
-27B 155 ms, 31B 345 ms. Attribution, each term measured with the kernel pinned:
+`crates/hipfire-xdna/examples/dflash_body_native.rs`).
+
+**⚠ THE "57 ms 9B BUDGET" WAS THE WRONG NUMBER — measured and corrected (task
+#31, `78efc1798`).** 57 ms is the **single-token AR forward** (GPU-only AR =
+17.46 tok/s → 1/17.46 = 57.3 ms), NOT the thing the draft competes with. Under
+overlap the draft runs concurrent with the GPU **verify of a 16-token block**,
+whose measured wall is **~100 ms** on the 9B (batched-16, profile-summed) —
+1.75× the single-token forward. So the draft must beat **~100 ms**, not 57. The
+9B draft at 111.9 ms (conservative, no cache) is **1.12× over the real verify
+wall — near parity**, and the context cache should close it. The old "57 ms"
+figures below are single-token forwards; 27B 155 / 31B 345 are almost certainly
+the same and need the same ~1.75× correction (unmeasured). Attribution, each
+term measured with the kernel pinned:
 
 | term | original | NOW (measured, warm) |
 |---|---|---|
@@ -32,6 +43,29 @@ NPU DFlash block wall: **726 ms** (native driver,
 host glue. The `M_TILE=16` GEMM double-stream and the ~35 ms host glue
 (overlappable behind streaming, task #30) are the two levers left. NOTE the
 185.4 ms row is the all-NPU path, kept as the flag default and reproducible.
+
+**TOKENS/S REALITY CHECK (task #31, `benchmarks/results/dflash-npu-tokps-reality-check-20260720.md`) — the 9B is NOT permanently negative on Phoenix.** Measured, no runtime wiring:
+
+| config | tok/s |
+|---|---|
+| GPU-only AR | **17.46** |
+| GPU-spec (iGPU DFlash drafter) | 6.88 @ τ2.17 … 9.55 @ τ5.60 — **loses to AR** |
+| NPU-spec, perfect overlap (step = max(111.9, verify)) | **27.7 @ τ2.1 … 59.0 @ τ5.6** |
+| NPU-spec, no overlap (serial) | 14.6–18.4 @ τ2.1 … 31.1–39.1 @ τ5.6 |
+
+**NPU-draft-overlap beats GPU-only AR by 1.6–3.4× at every τ** (only the worst
+pessimistic corner, τ2.1 + verify100, dips just under). **NPU beats the iGPU
+drafter everywhere** — which refutes the aiecost "offload loses at this drafter
+size" claim BY REFUTING ITS PREMISE: that claim assumes the GPU drafter wins on
+tok/s, but on Phoenix the iGPU block drafter is B *sequential* ~1B forwards
+(~320 ms) and loses to plain AR. **Honest caveat: the NPU wins because the iGPU
+drafter baseline is bad, not because 111.9 ms is fast in absolute terms** (it is
+~2× the single forward). On a fast discrete GPU where a cheap draft sits under a
+dominant verify, offload could still lose. The NPU's real edge is drafting the
+whole block in one shot vs the iGPU's sequential forwards. **The load-bearing
+integration is therefore the OVERLAP SEAM — draft block N+1 while the GPU
+verifies block N** (the "tokens after next" axis); the serial path is only
+marginal at low τ.
 
 **⚠ MEASURE WARM-ONLY.** An earlier revision of this table was wrong twice from
 one mistake: per-op means were averaged over ALL blocks including the cold first
