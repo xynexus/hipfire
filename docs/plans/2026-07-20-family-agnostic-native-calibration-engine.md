@@ -1259,7 +1259,7 @@ decode, and host-to-device upload before considering pinned host staging or
 GPU double buffering. Kernel changes come after those measurements and land
 one lever at a time.
 
-## Completion audit — 2026-07-21 06:22 AWST
+## Completion audit — 2026-07-21 06:30 AWST
 
 This table evaluates the numbered definition of done below. "Mechanism proven"
 does not mean the production artifact or admission ladder is complete.
@@ -1267,10 +1267,10 @@ does not mean the production artifact or admission ladder is complete.
 | Item | Status | Authoritative evidence / missing proof |
 |---|---|---|
 | 1. Family-resolved native CLI | Proven | Qwen3.5 and Gemma3-text registry/factory tests plus successful architecture-selected dry runs and real streams; no family CLI flag exists. |
-| 2. Complete 397B teacher artifact | In progress | The recovered durable production stream has 34 of 60 layer checkpoints and crossed the prior layer-31 SVM-pressure failure with lookahead disabled. No final `.calib.hfq` exists yet, so finalizer, KLDREF, complete ledger, and all-layer telemetry are not proven. |
+| 2. Complete 397B teacher artifact | In progress | The recovered durable production stream has 35 of 60 layer checkpoints and crossed the prior layer-31 SVM-pressure failure with lookahead disabled. No final `.calib.hfq` exists yet, so finalizer, KLDREF, complete ledger, and all-layer telemetry are not proven. |
 | 3. Second and only target-source pass | Pending | The target `Qwen3.5-397B-A17B.oq4.25++.hfq` does not exist. The quantizer join is implemented and bounded Gemma join evidence exists, but the production source pass has not run. |
-| 4. Per-layer/per-expert floor | Mechanism proven; production pending | Unit/GPU capture tests and all 34 durable production layer journals reconcile K=10 routing. Serialized layer snapshots independently validate routed slots, full/admitted weight counts, quota/slack accounting, and reduction tiles. Preserve-undercovered records real deficits, but the complete 60-layer fallback set is not available until finalization. |
-| 5. Frozen telemetry and quantizer refusal | Mechanism proven; production pending | `artifact audit-calibration` now provides a family-neutral nonzero gate for the complete ledger, Hessian/imatrix index, KLDREF map, per-layer telemetry reconciliation, policy, deficits, and exact high-precision fallback set. Quantizer enforcement tests pass; the final production artifact and quantizer evidence are absent. |
+| 4. Per-layer/per-expert floor | Mechanism proven; production pending | Unit/GPU capture tests and all 35 durable production layer journals reconcile K=10 routing. Serialized layer snapshots independently validate routed slots, full/admitted weight counts, quota/slack accounting, and reduction tiles. Preserve-undercovered records real deficits, but the complete 60-layer fallback set is not available until finalization. |
+| 5. Frozen telemetry and quantizer refusal | Mechanism proven; production pending | `artifact audit-calibration` now provides a family-neutral nonzero gate for the complete ledger, Hessian/imatrix index, KLDREF map, per-layer telemetry reconciliation, policy, deficits, and exact high-precision fallback set. The reusable two-pass workflow requires that gate before quantization and persists its fingerprint-bound report; induction will not reuse a target manifest without it. Quantizer enforcement tests pass; the final production artifact and quantizer evidence are absent. |
 | 6. Independent batched state and chosen geometry | Proven on gfx1151 | Ragged independent-state scheduler tests and the Qwen layer-0 batch/row sweeps select batch 64, time tile 32, and 2,048 rows for this host. |
 | 7. Shared grouped-MoE substrate | Mechanism proven; serving gate pending | Scratch/routing/capture live in `hipfire-runtime`, the routed executor in `hipfire-dispatch`, and Qwen admits K=8/K=10. Production exercises raw K=10; matched grouped-versus-reference serving parity remains required after the GPU is free. |
 | 8. Second family | Proven | Gemma3-text uses the same engine/CLI, completed a 62-layer pause/resume stream, and completed a bounded calibrated second-pass join without a generic family branch. The new index-only auditor passes its 434-Hessian/434-imatrix artifact, 809/809 logical ledger, and KLDREF structure without a family branch. |

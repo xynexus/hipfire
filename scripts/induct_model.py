@@ -345,6 +345,7 @@ def target_stage_complete(paths: dict[str, Path], recipe_fingerprint: str) -> bo
         return False
     ledger = manifest.get("source_reads")
     fingerprints = manifest.get("fingerprints")
+    audit = manifest.get("calibration_audit")
     return (
         manifest.get("status") == "complete"
         and manifest.get("recipe_fingerprint") == recipe_fingerprint
@@ -354,6 +355,11 @@ def target_stage_complete(paths: dict[str, Path], recipe_fingerprint: str) -> bo
         and isinstance(fingerprints, dict)
         and bool(fingerprints.get("calibration_artifact"))
         and bool(fingerprints.get("quantized_artifact"))
+        and isinstance(audit, dict)
+        and audit.get("schema") == "hipfire.calibration_audit.v1"
+        and audit.get("valid") is True
+        and not audit.get("errors")
+        and audit.get("artifact_fingerprint") == fingerprints.get("calibration_artifact")
     )
 
 

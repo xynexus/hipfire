@@ -394,7 +394,9 @@ python3 scripts/two_pass_quantize.py \
 The native calibration command owns the shared GPU lock directly; the wrapper
 scopes pass 2 under `hipfire lock run` without nesting locks. It writes an atomic
 `*.two-pass.json` manifest containing the native read ledger and both artifact
-fingerprints. Use `--skip-calib` to resume pass 2 from an existing artifact,
+fingerprints. Before either a fresh or reused artifact can enter pass 2, the
+wrapper runs `artifact audit-calibration` and embeds its fingerprint-bound
+structural report in that manifest. Use `--skip-calib` to resume pass 2 from an existing artifact,
 and `--dry-run` to inspect both commands without loading the model. Geometry is
 part of the two-pass recipe fingerprint, so a resume cannot silently change its
 sequence batch, time tile, or row budget. The expert activation floor, capture
@@ -405,7 +407,7 @@ With `--skip-calib`, the wrapper also executes the native no-GPU dry plan and
 requires the existing artifact to match its family/adapter/architecture,
 source fingerprint and shard set, tokenizer/corpus/sample fingerprints,
 microbatch and F32 boundary geometry, expert capture policy, and KLDREF recipe.
-It also requires the native run fingerprint, which binds the complete adapter
+It also requires the native structural audit and run fingerprint; the latter binds the complete adapter
 tensor plan, calibration job, and geometry. The producer executable identity is
 recorded separately in the artifact and copied into the two-pass manifest; it
 guards in-progress checkpoint resume without unnecessarily invalidating a

@@ -252,12 +252,22 @@ def test_target_resume_requires_matching_two_pass_provenance(tmp_path):
                     "quantized_artifact": "fnv64:model",
                 },
                 "source_reads": {"missing_logical": [], "duplicate_logical": []},
+                "calibration_audit": {
+                    "schema": "hipfire.calibration_audit.v1",
+                    "valid": True,
+                    "artifact_fingerprint": "fnv64:calib",
+                    "errors": [],
+                },
             }
         )
     )
 
     assert induct.target_stage_complete(paths, "sha256:expected")
     assert not induct.target_stage_complete(paths, "sha256:different")
+    manifest = json.loads(paths["two_pass_manifest"].read_text())
+    manifest.pop("calibration_audit")
+    paths["two_pass_manifest"].write_text(json.dumps(manifest))
+    assert not induct.target_stage_complete(paths, "sha256:expected")
 
 
 def test_induction_target_fingerprint_matches_two_pass_recipe(tmp_path):

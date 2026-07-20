@@ -121,7 +121,8 @@ The target stage is skipped only when both HFQ outputs are structurally valid
 and `two-pass.json` matches the requested recipe. That atomic manifest embeds
 the native calibration engine-build identity, read ledger,
 source/run/sample fingerprints, the cheap HFQ metadata/index fingerprints, and
-the quantizer's payload hash. A file with the right magic but stale or missing
+the fingerprint-bound native calibration structural audit, and the quantizer's
+payload hash. A file with the right magic but stale or missing
 provenance is regenerated. DFlash and TriAttention stages additionally require
 their expected magic. Useful controls are:
 
@@ -134,7 +135,8 @@ python3 scripts/induct_model.py --stage target --force
 
 When a complete calibration artifact exists but the target quant does not,
 induction automatically asks the two-pass workflow to reuse it. Reuse first
-runs the native calibrator's no-GPU dry plan and compares the artifact's family,
+runs the native calibrator's no-GPU dry plan, requires the family-neutral
+`artifact audit-calibration` gate, and compares the artifact's family,
 adapter, architecture, source/shard identities, tokenizer, corpus and sampled
 tokens, microbatch geometry, F32 boundary mode, expert capture policy, and
 KLDREF settings against the requested run. The native run fingerprint also

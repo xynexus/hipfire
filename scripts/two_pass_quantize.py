@@ -199,6 +199,7 @@ def update_manifest(
     recipe: dict,
     phase: str,
     calibration: dict | None = None,
+    calibration_audit: dict | None = None,
     quantized: dict | None = None,
 ) -> dict:
     previous = {}
@@ -223,6 +224,10 @@ def update_manifest(
         manifest["calibration"] = previous["calibration"]
         if "source_reads" in previous:
             manifest["source_reads"] = previous["source_reads"]
+    if calibration_audit is not None:
+        manifest["calibration_audit"] = calibration_audit
+    elif calibration is None and "calibration_audit" in previous:
+        manifest["calibration_audit"] = previous["calibration_audit"]
     if quantized is not None:
         manifest["quantized"] = quantized
     elif "quantized" in previous:
@@ -247,6 +252,20 @@ def update_manifest(
 def inspect_artifact(coexistence: str, path: Path) -> dict:
     result = subprocess.run(
         [coexistence, "artifact", "inspect", "--input", str(path)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return json.loads(result.stdout)
+
+
+def calibration_audit_command(coexistence: str, path: Path) -> list[str]:
+    return [coexistence, "artifact", "audit-calibration", "--input", str(path)]
+
+
+def audit_calibration_artifact(coexistence: str, path: Path) -> dict:
+    result = subprocess.run(
+        calibration_audit_command(coexistence, path),
         check=True,
         text=True,
         capture_output=True,
@@ -374,6 +393,17 @@ def validate_calibration_inspection(inspection: dict) -> None:
         raise RuntimeError(f"native calibration read ledger has missing tensors: {ledger['missing_logical']}")
     if ledger.get("duplicate_logical"):
         raise RuntimeError(f"native calibration read ledger has duplicate reads: {ledger['duplicate_logical']}")
+
+
+def validate_calibration_audit(audit: dict, inspection: dict) -> None:
+    if audit.get("schema") != "hipfire.calibration_audit.v1" or audit.get("valid") is not True:
+        raise RuntimeError("native calibration artifact did not pass the structural audit")
+    if audit.get("errors"):
+        raise RuntimeError(f"native calibration structural audit reports errors: {audit['errors']}")
+    if audit.get("artifact_fingerprint") != inspection.get("artifact_fingerprint"):
+        raise RuntimeError("native calibration structural audit fingerprint differs from inspection")
+    if audit.get("index_only") is not True or audit.get("payload_values_checked") is not False:
+        raise RuntimeError("native calibration structural audit has an unknown evidence scope")
 
 
 def validate_quantized_inspection(inspection: dict) -> None:
@@ -556,6 +586,8 @@ def main() -> None:
         subprocess.run(collect_exec, check=True)
     calibration = inspect_artifact(args.coexistence, args.calib)
     validate_calibration_inspection(calibration)
+    calibration_audit = audit_calibration_artifact(args.coexistence, args.calib)
+    validate_calibration_audit(calibration_audit, calibration)
     if expected_calibration is not None:
         validate_reusable_calibration(calibration, expected_calibration)
     update_manifest(
@@ -563,12 +595,14 @@ def main() -> None:
         recipe=recipe,
         phase="calibration_complete",
         calibration=calibration,
+        calibration_audit=calibration_audit,
     )
     update_manifest(
         manifest_path,
         recipe=recipe,
         phase="quantization_running",
         calibration=calibration,
+        calibration_audit=calibration_audit,
     )
     subprocess.run(quant_exec, check=True)
     quantized = inspect_artifact(args.coexistence, args.output)
@@ -578,6 +612,7 @@ def main() -> None:
         recipe=recipe,
         phase="complete",
         calibration=calibration,
+        calibration_audit=calibration_audit,
         quantized=quantized,
     )
 

@@ -222,18 +222,28 @@ def test_manifest_consumes_native_read_ledger_and_artifact_fingerprints(tmp_path
             "calibration": {"xxh64": "feedface"},
         },
     }
+    calibration_audit = {
+        "schema": "hipfire.calibration_audit.v1",
+        "valid": True,
+        "artifact_fingerprint": "fnv64:calib",
+        "index_only": True,
+        "payload_values_checked": False,
+        "errors": [],
+    }
 
     manifest = two_pass.update_manifest(
         path,
         recipe=recipe,
         phase="complete",
         calibration=calibration,
+        calibration_audit=calibration_audit,
         quantized=quantized,
     )
 
     restored = json.loads(path.read_text())
     assert restored == manifest
     assert restored["source_reads"] == calibration["metadata"]["read_ledger"]
+    assert restored["calibration_audit"] == calibration_audit
     assert restored["fingerprints"] == {
         "calibration_artifact": "fnv64:calib",
         "calibration_engine_build": "executable:sha256-engine",
@@ -385,3 +395,31 @@ def test_skip_calibration_validation_command_is_native_dry_run():
         "--resume",
     ]
     assert two_pass.calibration_validation_command(collect) == [*collect, "--dry-run"]
+
+
+def test_calibration_artifact_audit_command_uses_family_neutral_native_gate():
+    assert two_pass.calibration_audit_command(
+        "target/release/hipfire-coexistence",
+        Path("/artifacts/model.calib.hfq"),
+    ) == [
+        "target/release/hipfire-coexistence",
+        "artifact",
+        "audit-calibration",
+        "--input",
+        "/artifacts/model.calib.hfq",
+    ]
+
+    inspection = {"artifact_fingerprint": "fnv64:calib"}
+    audit = {
+        "schema": "hipfire.calibration_audit.v1",
+        "valid": True,
+        "artifact_fingerprint": "fnv64:calib",
+        "index_only": True,
+        "payload_values_checked": False,
+        "errors": [],
+    }
+    two_pass.validate_calibration_audit(audit, inspection)
+    changed = copy.deepcopy(audit)
+    changed["artifact_fingerprint"] = "fnv64:other"
+    with pytest.raises(RuntimeError, match="fingerprint differs"):
+        two_pass.validate_calibration_audit(changed, inspection)
