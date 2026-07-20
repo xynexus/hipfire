@@ -46,6 +46,7 @@ use hipfire_arch_nemotron::{calibration as nemotron_calib, model::NemotronModel,
 use hipfire_arch_qwen35::qwen35::{self, CalibOpts as QwenCalibOpts};
 use hipfire_arch_zaya::{calibration as zaya_calib, ZayaConfig};
 use hipfire_rdna::Gpu;
+use hipfire_runtime::calibration::contracts::CalibrationJob;
 use hipfire_runtime::calibration::{collect_qwen3_embedding_artifacts, tokenize_embedding_samples};
 use std::path::Path;
 
@@ -57,6 +58,45 @@ fn arg(flag: &str, default: Option<String>) -> Option<String> {
         .or(default)
 }
 
+struct ResidentParityJob {
+    job: CalibrationJob,
+    arch_id: u32,
+    family: String,
+    artifact: String,
+}
+
+fn load_resident_parity_job(path: &str) -> ResidentParityJob {
+    let hfq = hipfire_runtime::hfq::HfqFile::open_index_only(Path::new(path))
+        .expect("open --job-from calibration artifact");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&hfq.metadata_json).expect("parse --job-from metadata");
+    assert_eq!(
+        metadata
+            .get("artifact_kind")
+            .and_then(|value| value.as_str()),
+        Some("calibration"),
+        "--job-from must name a completed calibration artifact"
+    );
+    let job = serde_json::from_value(
+        metadata
+            .get("job")
+            .cloned()
+            .expect("--job-from calibration artifact has no native job contract"),
+    )
+    .expect("parse --job-from native calibration job");
+    let family = metadata
+        .get("family")
+        .and_then(|value| value.as_str())
+        .expect("--job-from calibration artifact has no family")
+        .to_string();
+    ResidentParityJob {
+        job,
+        arch_id: hfq.arch_id,
+        family,
+        artifact: path.to_string(),
+    }
+}
+
 fn main() {
     let model = arg("--model", None).expect("--model required");
     // Optional under `--synthetic-tokens` (no corpus is read in that mode).
@@ -66,13 +106,30 @@ fn main() {
         .unwrap()
         .parse()
         .unwrap();
-    let want_kldref = std::env::args().any(|a| a == "--kldref");
+    let parity_job = arg("--job-from", None).map(|path| load_resident_parity_job(&path));
+    let cli_kldref = std::env::args().any(|a| a == "--kldref");
+    let want_kldref = parity_job
+        .as_ref()
+        .map(|parity| parity.job.options.kldref)
+        .unwrap_or(cli_kldref);
     // Tiny seeded fixtures (`hipfire-quantize --emit-fixture <family>`) carry a
     // synthetic tokenizer with no real `model`, so the corpus-encode path can't
     // run. `--synthetic-tokens` skips the tokenizer and feeds seeded random ids
     // in `[0, vocab)` — enough to exercise the capturing forward + streamed
     // collector for pipeline validation. Real models still use `--corpus`.
     let synthetic = std::env::args().any(|a| a == "--synthetic-tokens");
+    assert!(
+        !(synthetic && parity_job.is_some()),
+        "--job-from conflicts with --synthetic-tokens"
+    );
+    if cli_kldref {
+        if let Some(parity) = &parity_job {
+            assert!(
+                parity.job.options.kldref,
+                "--kldref conflicts with the no-KLD native job in --job-from"
+            );
+        }
+    }
     let seed: u64 = arg("--seed", Some("0".into())).unwrap().parse().unwrap();
 
     let mut hfq = hipfire_runtime::hfq::HfqFile::open(Path::new(&model)).expect("open model");
@@ -82,6 +139,17 @@ fn main() {
     let source_arch_id = arg("--arch", None)
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(hfq.arch_id);
+    if let Some(parity) = &parity_job {
+        assert_eq!(
+            source_arch_id, parity.arch_id,
+            "resident model architecture differs from --job-from artifact"
+        );
+        assert!(
+            parity.job.samples.samples().len() == 1
+                || matches!(source_arch_id, 5 | 6 | 12 | 13),
+            "--job-from has multiple independent samples, but this resident family has no state-reset oracle"
+        );
+    }
 
     let embedding_metadata =
         hipfire_model::embedding::EmbeddingMetadata::from_hfq_metadata_json(&hfq.metadata_json)
@@ -158,6 +226,12 @@ fn main() {
 
     let tokens_owned: Vec<u32> = if is_embedding_workload {
         Vec::new()
+    } else if let Some(parity) = &parity_job {
+        if parity.job.samples.samples().len() == 1 {
+            parity.job.samples.samples()[0].tokens.clone()
+        } else {
+            Vec::new()
+        }
     } else if synthetic {
         // Parse vocab_size from the hfq metadata (flat or under `config`).
         let meta: serde_json::Value =
@@ -185,18 +259,30 @@ fn main() {
     };
     let n_tok = if is_embedding_workload {
         embedding_samples.iter().map(Vec::len).sum()
+    } else if let Some(parity) = &parity_job {
+        parity.job.samples.total_rows()
     } else {
         tokens_owned.len().min(max_tokens)
     };
-    let tokens = if is_embedding_workload {
+    let tokens = if is_embedding_workload
+        || parity_job
+            .as_ref()
+            .is_some_and(|parity| parity.job.samples.samples().len() > 1)
+    {
         &[][..]
     } else {
         &tokens_owned[..n_tok]
     };
+    let kldref_topk = parity_job
+        .as_ref()
+        .map(|parity| parity.job.options.kldref_top_k)
+        .unwrap_or(64);
     eprintln!(
         "calibrating on {n_tok} tokens across {} sample(s) (kldref={want_kldref}, synthetic={synthetic})",
         if is_embedding_workload {
             embedding_samples.len()
+        } else if let Some(parity) = &parity_job {
+            parity.job.samples.samples().len()
         } else {
             1
         }
@@ -206,13 +292,24 @@ fn main() {
     eprintln!("GPU: {}", gpu.arch);
 
     // Provenance keys (caller-known) layered onto the driver's technical metadata.
-    let provenance = [
+    let mut provenance = vec![
         ("source_model", serde_json::json!(model)),
         ("corpus", serde_json::json!(corpus)),
         ("n_calib_tokens", serde_json::json!(n_tok)),
         ("source_arch_id", serde_json::json!(source_arch_id)),
         ("calib_document_prompt", serde_json::json!(calib_doc_prompt)),
     ];
+    if let Some(parity) = &parity_job {
+        provenance.extend([
+            ("family", serde_json::json!(&parity.family)),
+            ("job", serde_json::to_value(&parity.job).unwrap()),
+            ("resident_oracle", serde_json::json!(true)),
+            (
+                "oracle_streamed_artifact",
+                serde_json::json!(&parity.artifact),
+            ),
+        ]);
+    }
     let t0 = std::time::Instant::now();
     let (n_hessian, n_imatrix, max_consistency, mode) = match source_arch_id {
         1 if is_embedding_workload => {
@@ -241,17 +338,29 @@ fn main() {
             let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load_weights");
             let opts = QwenCalibOpts {
                 kldref: want_kldref,
-                kldref_topk: 64,
+                kldref_topk: kldref_topk,
             };
-            let summary = qwen35::collect_calibration_artifacts(
-                &mut gpu,
-                &weights,
-                &config,
-                tokens,
-                &opts,
-                Path::new(&output),
-                &provenance,
-            )
+            let summary = if let Some(parity) = &parity_job {
+                qwen35::collect_calibration_artifacts_samples(
+                    &mut gpu,
+                    &weights,
+                    &config,
+                    &parity.job.samples,
+                    &opts,
+                    Path::new(&output),
+                    &provenance,
+                )
+            } else {
+                qwen35::collect_calibration_artifacts(
+                    &mut gpu,
+                    &weights,
+                    &config,
+                    tokens,
+                    &opts,
+                    Path::new(&output),
+                    &provenance,
+                )
+            }
             .expect("collect");
             (
                 summary.n_hessian,
@@ -272,21 +381,36 @@ fn main() {
                     .expect("load_weights");
             let opts = gemma3_calib::CalibOpts {
                 kldref: want_kldref,
-                kldref_topk: 64,
+                kldref_topk: kldref_topk,
             };
-            let summary = gemma3_calib::collect_calibration_artifacts_text_only(
-                &mut gpu,
-                &weights,
-                &config,
-                tokenizer
-                    .as_ref()
-                    .expect("gemma3 text-only collect needs a tokenizer (not --synthetic-tokens)"),
-                tokens,
-                &opts,
-                Path::new(&output),
-                prefix,
-                &provenance,
-            )
+            let tokenizer = tokenizer
+                .as_ref()
+                .expect("gemma3 text-only collect needs a tokenizer (not --synthetic-tokens)");
+            let summary = if let Some(parity) = &parity_job {
+                gemma3_calib::collect_calibration_artifacts_samples_text_only(
+                    &mut gpu,
+                    &weights,
+                    &config,
+                    tokenizer,
+                    &parity.job.samples,
+                    &opts,
+                    Path::new(&output),
+                    prefix,
+                    &provenance,
+                )
+            } else {
+                gemma3_calib::collect_calibration_artifacts_text_only(
+                    &mut gpu,
+                    &weights,
+                    &config,
+                    tokenizer,
+                    tokens,
+                    &opts,
+                    Path::new(&output),
+                    prefix,
+                    &provenance,
+                )
+            }
             .expect("collect");
             (
                 summary.n_hessian,
@@ -327,7 +451,7 @@ fn main() {
             let weights = Lfm2MoeWeights::load(&mut hfq, &config, &mut gpu).expect("lfm2 weights");
             let opts = lfm2_calib::CalibOpts {
                 kldref: want_kldref,
-                kldref_topk: 64,
+                kldref_topk: kldref_topk,
             };
             let summary = lfm2_calib::collect_calibration_artifacts(
                 &mut gpu,
@@ -355,7 +479,7 @@ fn main() {
                 .expect("zaya weights");
             let opts = zaya_calib::CalibOpts {
                 kldref: want_kldref,
-                kldref_topk: 64,
+                kldref_topk: kldref_topk,
             };
             let summary = zaya_calib::collect_calibration_artifacts(
                 &mut gpu,
@@ -384,7 +508,7 @@ fn main() {
                 MiniMaxWeights::load(&mut hfq, &config, &mut gpu, None).expect("minimax weights");
             let opts = minimax_calib::CalibOpts {
                 kldref: want_kldref,
-                kldref_topk: 64,
+                kldref_topk: kldref_topk,
             };
             let summary = minimax_calib::collect_calibration_artifacts(
                 &mut gpu,
@@ -417,7 +541,7 @@ fn main() {
                 .expect("nemotron from_hfq");
             let opts = nemotron_calib::CalibOpts {
                 kldref: want_kldref,
-                kldref_topk: 64,
+                kldref_topk: kldref_topk,
             };
             let summary = nemotron_calib::collect_calibration_artifacts(
                 &mut gpu,

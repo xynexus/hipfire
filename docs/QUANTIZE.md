@@ -201,7 +201,24 @@ Undercovered experts either fail the strict gate or are explicitly listed for
 BF16/F16 preservation.
 
 For a resident-versus-layer-streamed parity run, generate both calibration
-packages from the same frozen sample set and compare them offline:
+packages from the same frozen sample set. After the streamed artifact exists,
+the resident oracle consumes its embedded native job rather than retokenizing
+the corpus or concatenating independent sequences:
+
+```bash
+target/release/hipfire lock acquire resident-calibration --watch-pid "$$"
+cargo run --release -p hipfire-runtime --example collect_artifacts -- \
+  --model <same-source-bf16.hfq> \
+  --job-from /tmp/streamed.calib.hfq \
+  --output /tmp/resident.calib.hfq
+target/release/hipfire lock release
+```
+
+Qwen3.5 and Gemma3 resident collectors recreate KV/recurrent state for every
+sample in the job, accumulate statistics across those independent forwards,
+and emit the same non-terminal KLD position map. The legacy no-`--job-from`
+form remains a single concatenated stream and is not independent-sample parity
+evidence. Compare the completed packages offline:
 
 ```bash
 target/release/hipfire-coexistence artifact compare-calibration \

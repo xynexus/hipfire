@@ -3,9 +3,8 @@
 
 use hip_bridge::{HipError, HipResult};
 use hipfire_rdna::Gpu;
-use hipfire_runtime::calibration::contracts::legacy_kldref_tensors;
+use hipfire_runtime::calibration::contracts::{KldRefBuilder, KldRefRow, SampleSet};
 use hipfire_runtime::calibration::{collect_grouped, logsumexp, topk_logits, CalibForward};
-use hipfire_runtime::hfq::HfqMemTensor;
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weights::WeightTensor;
 
@@ -77,8 +76,9 @@ fn run_text_forward_for_capture(
     config: &Gemma3Config,
     tokens: &[u32],
     opts: &CalibOpts,
-    collect_kldref: bool,
-    kldref: &mut Vec<(f32, Vec<(u32, f32)>)>,
+    sample_index: usize,
+    include_terminal_kld: bool,
+    kldref: Option<&mut KldRefBuilder>,
 ) -> HipResult<()> {
     // Per-position KLDREF needs lm-head logits at EVERY position, but batched
     // prefill only emits last-position logits — so that path stays per-token.
@@ -86,13 +86,22 @@ fn run_text_forward_for_capture(
     // linear captures the whole microbatch in a single launch (the `weight_gemm`
     // calibration tap), instead of one N=1 GEMV per token. `HIPFIRE_GEMMA3_CALIB_NO_BATCH=1`
     // forces the legacy per-token path (for bit-for-bit comparison / debugging).
-    let want_kldref = collect_kldref && opts.kldref;
+    let want_kldref = kldref.is_some() && opts.kldref;
     let force_per_token = std::env::var("HIPFIRE_GEMMA3_CALIB_NO_BATCH")
         .ok()
         .as_deref()
         == Some("1");
     if want_kldref || force_per_token {
-        return run_text_forward_per_token(gpu, weights, config, tokens, opts, want_kldref, kldref);
+        return run_text_forward_per_token(
+            gpu,
+            weights,
+            config,
+            tokens,
+            opts,
+            sample_index,
+            include_terminal_kld,
+            kldref,
+        );
     }
 
     let dim = config.hidden_size;
@@ -150,20 +159,36 @@ fn run_text_forward_per_token(
     config: &Gemma3Config,
     tokens: &[u32],
     opts: &CalibOpts,
-    want_kldref: bool,
-    kldref: &mut Vec<(f32, Vec<(u32, f32)>)>,
+    sample_index: usize,
+    include_terminal_kld: bool,
+    mut kldref: Option<&mut KldRefBuilder>,
 ) -> HipResult<()> {
     let mut state = Gemma3State::new(gpu, config)
         .map_err(|e| HipError::new(0, &format!("gemma3 calib state: {e}")))?;
     let mut result = Ok(());
-    for &tok in tokens {
+    for (position, &tok) in tokens.iter().enumerate() {
         if let Err(e) = forward_step(gpu, weights, config, &mut state, tok) {
             result = Err(e);
             break;
         }
-        if want_kldref {
+        if let Some(builder) = kldref
+            .as_deref_mut()
+            .filter(|_| include_terminal_kld || position + 1 < tokens.len())
+        {
             match gpu.download_f32(&state.logits) {
-                Ok(lg) => kldref.push((logsumexp(&lg), topk_logits(&lg, opts.kldref_topk))),
+                Ok(lg) => {
+                    let topk = topk_logits(&lg, opts.kldref_topk);
+                    if let Err(error) = builder.push(KldRefRow {
+                        sample_index,
+                        position,
+                        indices: topk.iter().map(|(index, _)| *index).collect(),
+                        logits: topk.iter().map(|(_, logit)| *logit).collect(),
+                        log_z: logsumexp(&lg),
+                    }) {
+                        result = Err(HipError::new(0, &error.to_string()));
+                        break;
+                    }
+                }
                 Err(e) => {
                     result = Err(e);
                     break;
@@ -173,10 +198,6 @@ fn run_text_forward_per_token(
     }
     state.free_gpu(gpu);
     result
-}
-
-fn kldref_extra(kldref: &[(f32, Vec<(u32, f32)>)]) -> Vec<HfqMemTensor> {
-    legacy_kldref_tensors(kldref).expect("internally generated Gemma3 KLDREF rows are valid")
 }
 
 /// Collect calibration Hessians/imatrices from the Gemma3 text decoder only.
@@ -189,6 +210,56 @@ pub fn collect_calibration_artifacts_text_only(
     config: &Gemma3Config,
     _tokenizer: &Tokenizer,
     tokens: &[u32],
+    opts: &CalibOpts,
+    output: &std::path::Path,
+    prefix: &str,
+    provenance: &[(&str, serde_json::Value)],
+) -> HipResult<CalibSummary> {
+    collect_calibration_artifacts_sequences_text_only(
+        gpu,
+        weights,
+        config,
+        &[tokens],
+        true,
+        opts,
+        output,
+        prefix,
+        provenance,
+    )
+}
+
+/// Resident-oracle Gemma3 collection over the exact independent sample set
+/// used by the layer-streamed engine. Every sequence gets fresh KV/state;
+/// KLDREF rows exclude terminal positions and retain their sample map.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_calibration_artifacts_samples_text_only(
+    gpu: &mut Gpu,
+    weights: &Gemma3Weights,
+    config: &Gemma3Config,
+    _tokenizer: &Tokenizer,
+    samples: &SampleSet,
+    opts: &CalibOpts,
+    output: &std::path::Path,
+    prefix: &str,
+    provenance: &[(&str, serde_json::Value)],
+) -> HipResult<CalibSummary> {
+    let sequences = samples
+        .samples()
+        .iter()
+        .map(|sample| sample.tokens.as_slice())
+        .collect::<Vec<_>>();
+    collect_calibration_artifacts_sequences_text_only(
+        gpu, weights, config, &sequences, false, opts, output, prefix, provenance,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_calibration_artifacts_sequences_text_only(
+    gpu: &mut Gpu,
+    weights: &Gemma3Weights,
+    config: &Gemma3Config,
+    sequences: &[&[u32]],
+    include_terminal_kld: bool,
     opts: &CalibOpts,
     output: &std::path::Path,
     prefix: &str,
@@ -226,32 +297,48 @@ pub fn collect_calibration_artifacts_text_only(
         &static_meta,
         |start, end| build_capture_names_for_layers(weights, prefix, start, end),
         |gpu, group_idx| {
-            let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
-            run_text_forward_for_capture(
-                gpu,
-                weights,
-                config,
-                tokens,
-                opts,
-                group_idx == 0,
-                &mut kldref,
-            )
-            .map_err(|e| format!("gemma3 calib forward: {e}"))?;
+            let n_kld = sequences
+                .iter()
+                .map(|tokens| {
+                    if include_terminal_kld {
+                        tokens.len()
+                    } else {
+                        tokens.len().saturating_sub(1)
+                    }
+                })
+                .sum::<usize>();
+            let mut kldref = if group_idx == 0 && opts.kldref && n_kld > 0 {
+                Some(KldRefBuilder::new(opts.kldref_topk).map_err(|e| e.to_string())?)
+            } else {
+                None
+            };
+            for (sample_index, tokens) in sequences.iter().enumerate() {
+                run_text_forward_for_capture(
+                    gpu,
+                    weights,
+                    config,
+                    tokens,
+                    opts,
+                    sample_index,
+                    include_terminal_kld,
+                    kldref.as_mut(),
+                )
+                .map_err(|e| format!("gemma3 calib forward: {e}"))?;
+            }
             let mut extra_meta: Vec<(String, serde_json::Value)> = Vec::new();
-            let extra_tensors = if group_idx == 0 {
-                if !kldref.is_empty() {
-                    let np = kldref.len();
-                    let kk = kldref[0].1.len();
-                    extra_meta.push((
-                        "kldref".to_string(),
-                        serde_json::json!({ "n_positions": np, "top_k": kk }),
-                    ));
+            let extra_tensors = if let Some(payload) = kldref
+                .map(KldRefBuilder::finish)
+                .transpose()
+                .map_err(|e| e.to_string())?
+            {
+                extra_meta.push(("kldref".to_string(), payload.metadata()));
+                if group_idx == 0 {
                     extra_meta.push((
                         "artifacts".to_string(),
                         serde_json::json!(["hessian", "imatrix", "kldref"]),
                     ));
                 }
-                kldref_extra(&kldref)
+                payload.to_hfq_tensors()
             } else {
                 Vec::new()
             };
@@ -292,6 +379,33 @@ impl hipfire_runtime::calibration::CalibratableBackend for crate::arch::Gemma3Ba
             output,
             "",
             provenance,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn collect_calibration_job(
+        &self,
+        gpu: &mut Gpu,
+        tokenizer: &Tokenizer,
+        job: &hipfire_runtime::calibration::contracts::CalibrationJob,
+        output: &std::path::Path,
+        provenance: &[(&str, serde_json::Value)],
+    ) -> Result<CalibSummary, String> {
+        let provenance = hipfire_runtime::calibration::calibration_job_provenance(job, provenance)?;
+        let opts = CalibOpts {
+            kldref: job.options.kldref,
+            kldref_topk: job.options.kldref_top_k,
+        };
+        collect_calibration_artifacts_samples_text_only(
+            gpu,
+            &self.weights,
+            &self.config,
+            tokenizer,
+            &job.samples,
+            &opts,
+            output,
+            "",
+            &provenance,
         )
         .map_err(|e| e.to_string())
     }

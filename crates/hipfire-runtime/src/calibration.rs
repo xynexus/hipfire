@@ -1256,6 +1256,61 @@ pub trait CalibratableBackend {
         output: &std::path::Path,
         provenance: &[(&str, serde_json::Value)],
     ) -> Result<CalibSummary, String>;
+
+    /// Admission-grade resident-oracle collection over the exact native
+    /// calibration job. Family implementations override this when they can
+    /// reset model state between multiple independent samples. The default is
+    /// deliberately strict: legacy collectors may consume one sample only and
+    /// use the historical fixed KLD top-k of 64.
+    fn collect_calibration_job(
+        &self,
+        gpu: &mut Gpu,
+        tokenizer: &crate::tokenizer::Tokenizer,
+        job: &contracts::CalibrationJob,
+        output: &std::path::Path,
+        provenance: &[(&str, serde_json::Value)],
+    ) -> Result<CalibSummary, String> {
+        let [sample] = job.samples.samples() else {
+            return Err(format!(
+                "resident calibration backend does not implement independent sample resets; job has {} samples",
+                job.samples.samples().len()
+            ));
+        };
+        if job.options.kldref && job.options.kldref_top_k != 64 {
+            return Err(format!(
+                "resident calibration backend uses fixed KLD top-k 64, but the job requests {}",
+                job.options.kldref_top_k
+            ));
+        }
+        let provenance = calibration_job_provenance(job, provenance)?;
+        self.collect_calibration(
+            gpu,
+            tokenizer,
+            &sample.tokens,
+            job.options.kldref,
+            output,
+            &provenance,
+        )
+    }
+}
+
+/// Add the exact serialized calibration job to a resident artifact's metadata.
+/// The streamed/resident comparator requires this field to prove that corpus
+/// and independently reset sample maps match; a duplicate caller key is
+/// rejected rather than silently overwritten by metadata assembly.
+pub fn calibration_job_provenance<'a>(
+    job: &contracts::CalibrationJob,
+    provenance: &[(&'a str, serde_json::Value)],
+) -> Result<Vec<(&'a str, serde_json::Value)>, String> {
+    if provenance.iter().any(|(key, _)| *key == "job") {
+        return Err("calibration provenance already contains a job field".into());
+    }
+    let mut result = provenance.to_vec();
+    result.push((
+        "job",
+        serde_json::to_value(job).map_err(|error| format!("serialize calibration job: {error}"))?,
+    ));
+    Ok(result)
 }
 
 /// Outputs of an arch's capturing forward that the driver folds into the
@@ -1532,6 +1587,34 @@ mod tests {
             },
         ];
         assert!(build_calibration_metadata(&descriptors, None, &[], &[]).is_err());
+    }
+
+    #[test]
+    fn resident_job_provenance_is_exact_and_rejects_shadowing() {
+        use contracts::{CalibrationJob, CalibrationOptions, CalibrationSample, SampleSet};
+
+        let samples = SampleSet::new(
+            vec![
+                CalibrationSample::new("a", vec![1, 2], "fixture"),
+                CalibrationSample::new("b", vec![3, 4], "fixture"),
+            ],
+            2,
+            7,
+        )
+        .unwrap();
+        let job = CalibrationJob::new(
+            "source",
+            "tokenizer",
+            samples,
+            CalibrationOptions::default(),
+        )
+        .unwrap();
+        let provenance =
+            calibration_job_provenance(&job, &[("oracle", serde_json::json!("resident"))]).unwrap();
+        assert_eq!(provenance.len(), 2);
+        assert_eq!(provenance[1].0, "job");
+        assert_eq!(provenance[1].1, serde_json::to_value(&job).unwrap());
+        assert!(calibration_job_provenance(&job, &[("job", serde_json::json!("shadow"))]).is_err());
     }
 
     #[test]

@@ -3330,6 +3330,31 @@ impl hipfire_runtime::calibration::CalibratableBackend for Qwen35CalibBackend<'_
         )
         .map_err(|e| e.to_string())
     }
+
+    fn collect_calibration_job(
+        &self,
+        gpu: &mut Gpu,
+        _tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+        job: &hipfire_runtime::calibration::contracts::CalibrationJob,
+        output: &std::path::Path,
+        provenance: &[(&str, serde_json::Value)],
+    ) -> Result<CalibSummary, String> {
+        let provenance = hipfire_runtime::calibration::calibration_job_provenance(job, provenance)?;
+        let opts = CalibOpts {
+            kldref: job.options.kldref,
+            kldref_topk: job.options.kldref_top_k,
+        };
+        collect_calibration_artifacts_samples(
+            gpu,
+            self.weights,
+            self.config,
+            &job.samples,
+            &opts,
+            output,
+            &provenance,
+        )
+        .map_err(|e| e.to_string())
+    }
 }
 
 /// Single-load calibration driver: arm the [`CalibCollector`] on the resident
@@ -3348,7 +3373,53 @@ pub fn collect_calibration_artifacts(
     output: &std::path::Path,
     provenance: &[(&str, serde_json::Value)],
 ) -> HipResult<CalibSummary> {
-    use hipfire_runtime::calibration::contracts::legacy_kldref_tensors;
+    collect_calibration_artifacts_sequences(
+        gpu,
+        weights,
+        config,
+        &[tokens],
+        true,
+        opts,
+        output,
+        provenance,
+    )
+}
+
+/// Resident-oracle collection over the native engine's independent sample
+/// contract. Model state is recreated for every sample; Hessian/imatrix
+/// accumulation remains shared, while KLDREF omits each sample's terminal
+/// position and records the canonical `(sample_index, position)` map.
+pub fn collect_calibration_artifacts_samples(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    samples: &hipfire_runtime::calibration::contracts::SampleSet,
+    opts: &CalibOpts,
+    output: &std::path::Path,
+    provenance: &[(&str, serde_json::Value)],
+) -> HipResult<CalibSummary> {
+    let sequences = samples
+        .samples()
+        .iter()
+        .map(|sample| sample.tokens.as_slice())
+        .collect::<Vec<_>>();
+    collect_calibration_artifacts_sequences(
+        gpu, weights, config, &sequences, false, opts, output, provenance,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_calibration_artifacts_sequences(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    sequences: &[&[u32]],
+    include_terminal_kld: bool,
+    opts: &CalibOpts,
+    output: &std::path::Path,
+    provenance: &[(&str, serde_json::Value)],
+) -> HipResult<CalibSummary> {
+    use hipfire_runtime::calibration::contracts::{KldRefBuilder, KldRefRow};
     use hipfire_runtime::calibration::{collect, logsumexp, topk_logits, CalibForward};
     use hipfire_runtime::hfq::HfqMemTensor;
 
@@ -3370,51 +3441,82 @@ pub fn collect_calibration_artifacts(
             if is_moe {
                 reset_moe_router_histogram(config.num_experts, config.num_experts_per_tok);
             }
-            let n_tok = tokens.len();
-            let mut kv = kv::KvCache::new_gpu(
-                gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                n_tok + 16,
-            )
-            .map_err(|e| format!("qwen35 calib kv: {e}"))?;
-            let mut dn =
-                DeltaNetState::new(gpu, config).map_err(|e| format!("qwen35 calib dn: {e}"))?;
-            let scratch = Qwen35Scratch::new(gpu, config, 64)
-                .map_err(|e| format!("qwen35 calib scratch: {e}"))?;
-
-            let mut kldref: Vec<(f32, Vec<(u32, f32)>)> = Vec::new();
+            let n_tok = sequences.iter().map(|tokens| tokens.len()).sum::<usize>();
+            let n_kld = sequences
+                .iter()
+                .map(|tokens| {
+                    if include_terminal_kld {
+                        tokens.len()
+                    } else {
+                        tokens.len().saturating_sub(1)
+                    }
+                })
+                .sum::<usize>();
+            let mut kldref = if opts.kldref && n_kld > 0 {
+                Some(KldRefBuilder::new(opts.kldref_topk).map_err(|e| e.to_string())?)
+            } else {
+                None
+            };
             let progress_started = std::time::Instant::now();
             let mut last_progress = progress_started;
-            for (pos, &tok) in tokens.iter().enumerate() {
-                forward_scratch(gpu, weights, config, tok, pos, &mut kv, &mut dn, &scratch)
-                    .map_err(|e| format!("qwen35 calib forward: {e}"))?;
-                if opts.kldref {
-                    let lg = gpu
-                        .download_f32(&scratch.logits)
-                        .map_err(|e| format!("qwen35 calib logits: {e}"))?;
-                    kldref.push((logsumexp(&lg), topk_logits(&lg, opts.kldref_topk)));
+            let mut completed_before = 0usize;
+            for (sample_index, tokens) in sequences.iter().enumerate() {
+                let mut kv = kv::KvCache::new_gpu(
+                    gpu,
+                    config.n_layers,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    tokens.len() + 16,
+                )
+                .map_err(|e| format!("qwen35 calib kv: {e}"))?;
+                let mut dn = DeltaNetState::new(gpu, config)
+                    .map_err(|e| format!("qwen35 calib dn: {e}"))?;
+                let scratch = Qwen35Scratch::new(gpu, config, 64)
+                    .map_err(|e| format!("qwen35 calib scratch: {e}"))?;
+
+                for (pos, &tok) in tokens.iter().enumerate() {
+                    forward_scratch(gpu, weights, config, tok, pos, &mut kv, &mut dn, &scratch)
+                        .map_err(|e| format!("qwen35 calib forward: {e}"))?;
+                    if let Some(builder) = kldref.as_mut().filter(|_| {
+                        include_terminal_kld || pos + 1 < tokens.len()
+                    }) {
+                        let lg = gpu
+                            .download_f32(&scratch.logits)
+                            .map_err(|e| format!("qwen35 calib logits: {e}"))?;
+                        let topk = topk_logits(&lg, opts.kldref_topk);
+                        builder
+                            .push(KldRefRow {
+                                sample_index,
+                                position: pos,
+                                indices: topk.iter().map(|(index, _)| *index).collect(),
+                                logits: topk.iter().map(|(_, logit)| *logit).collect(),
+                                log_z: logsumexp(&lg),
+                            })
+                            .map_err(|e| e.to_string())?;
+                    }
+                    let done = completed_before + pos + 1;
+                    if done == 1
+                        || done == n_tok
+                        || last_progress.elapsed() >= std::time::Duration::from_secs(10)
+                    {
+                        let elapsed = progress_started.elapsed();
+                        let elapsed_secs = elapsed.as_secs_f64().max(1e-9);
+                        let rate = done as f64 / elapsed_secs;
+                        let remaining = n_tok.saturating_sub(done);
+                        let eta = std::time::Duration::from_secs_f64(
+                            remaining as f64 / rate.max(1e-9),
+                        );
+                        eprintln!(
+                            "  calib capture: {done}/{n_tok} tokens ({:.1}%) elapsed={} rate={:.2} tok/s eta={}",
+                            (done as f64 * 100.0) / n_tok.max(1) as f64,
+                            format_calib_duration(elapsed),
+                            rate,
+                            format_calib_duration(eta)
+                        );
+                        last_progress = std::time::Instant::now();
+                    }
                 }
-                let done = pos + 1;
-                if done == 1
-                    || done == n_tok
-                    || last_progress.elapsed() >= std::time::Duration::from_secs(10)
-                {
-                    let elapsed = progress_started.elapsed();
-                    let elapsed_secs = elapsed.as_secs_f64().max(1e-9);
-                    let rate = done as f64 / elapsed_secs;
-                    let remaining = n_tok.saturating_sub(done);
-                    let eta = std::time::Duration::from_secs_f64(remaining as f64 / rate.max(1e-9));
-                    eprintln!(
-                        "  calib capture: {done}/{n_tok} tokens ({:.1}%) elapsed={} rate={:.2} tok/s eta={}",
-                        (done as f64 * 100.0) / n_tok.max(1) as f64,
-                        format_calib_duration(elapsed),
-                        rate,
-                        format_calib_duration(eta)
-                    );
-                    last_progress = std::time::Instant::now();
-                }
+                completed_before += tokens.len();
             }
 
             let mut extra_meta: Vec<(String, serde_json::Value)> = Vec::new();
@@ -3458,15 +3560,13 @@ pub fn collect_calibration_artifacts(
             // KLDREF tensors — small, already in host RAM; passed as `extra` to the
             // streaming writer (the big Hessians stream straight from GPU).
             let mut extra_tensors: Vec<HfqMemTensor> = Vec::new();
-            if !kldref.is_empty() {
-                let np = kldref.len();
-                let kk = kldref[0].1.len();
-                extra_tensors = legacy_kldref_tensors(&kldref)
-                    .expect("internally generated Qwen3.5 KLDREF rows are valid");
-                extra_meta.push((
-                    "kldref".to_string(),
-                    serde_json::json!({ "n_positions": np, "top_k": kk }),
-                ));
+            if let Some(payload) = kldref
+                .map(KldRefBuilder::finish)
+                .transpose()
+                .map_err(|e| e.to_string())?
+            {
+                extra_tensors = payload.to_hfq_tensors();
+                extra_meta.push(("kldref".to_string(), payload.metadata()));
                 artifacts.push(serde_json::json!("kldref"));
             }
             extra_meta.push(("artifacts".to_string(), serde_json::Value::Array(artifacts)));

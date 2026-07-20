@@ -163,12 +163,21 @@ statistics alone are not a long-context quality result.
 Resident-oracle comparisons use the offline, family-neutral artifact gate:
 
 ```bash
+target/release/hipfire lock acquire resident-calibration --watch-pid "$$"
+cargo run --release -p hipfire-runtime --example collect_artifacts -- \
+  --model <same-source-bf16.hfq> \
+  --job-from <streamed.calib.hfq> \
+  --output <resident.calib.hfq>
+target/release/hipfire lock release
+
 hipfire-coexistence artifact compare-calibration \
   --reference <resident.calib.hfq> \
   --candidate <streamed.calib.hfq>
 ```
 
-The command refuses to treat numerically similar artifacts as matched evidence
-when either package lacks the frozen corpus and sample fingerprints. Its JSON
-report records structural, provenance, non-finite, and tolerance failures for
-the induction evidence ledger.
+The Qwen3.5 and Gemma3 resident oracles consume the exact serialized job and
+reset state between its independent samples. The comparator refuses to treat
+numerically similar artifacts as matched evidence when either package lacks
+the frozen corpus and sample fingerprints. Its JSON report records structural,
+provenance, non-finite, and tolerance failures for the induction evidence
+ledger.
