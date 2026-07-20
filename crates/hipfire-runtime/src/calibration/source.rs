@@ -686,16 +686,19 @@ pub struct PlannedTensorView<'a> {
 }
 
 impl PlannedTensorView<'_> {
-    fn release_copied_range(&self, byte_offset: usize, byte_len: usize) {
+    fn release_copied_range(&self, byte_offset: usize, byte_len: usize) -> bool {
         if !self.release_pages || byte_len == 0 || byte_offset != self.released_prefix.get() {
-            return;
+            return false;
         }
         let byte_len = byte_len.min(self.bytes.len().saturating_sub(byte_offset));
         let Some(source) = self.source else {
-            return;
+            return false;
         };
         if source.release_tensor_range_pages(&self.source_name, byte_offset, byte_len) {
             self.released_prefix.set(byte_offset + byte_len);
+            true
+        } else {
+            false
         }
     }
 }
@@ -718,9 +721,11 @@ pub struct SourceLoadTimings {
     /// Host dtype conversion or adjustment before upload.
     pub decode_us: u64,
     /// HIP allocation and synchronous host-to-device copy. Any mmap refaults
-    /// incurred while HIP reads the source slice are included here.
+    /// incurred while HIP reads the source slice are included here; interleaved
+    /// range-release advice is subtracted into `release_us`.
     pub upload_us: u64,
-    /// Mapping/page-cache release after the synchronous upload completes.
+    /// Mapping/page-cache release after each completed upload chunk and at the
+    /// end of the tensor view.
     pub release_us: u64,
 }
 
@@ -1077,6 +1082,7 @@ pub fn load_source_tensor(
     validate_source_shape(view.info, shape, logical_name)?;
     let source_bytes = view.bytes.len();
     let from_prefetch = view.from_prefetch;
+    let mut chunk_release_us = 0u64;
     let upload_started = Instant::now();
     let upload = if let Some(dtype) = native_source_gpu_dtype(gpu, view.info.dtype.as_str()) {
         validate_source_bytes(
@@ -1092,7 +1098,11 @@ pub fn load_source_tensor(
                     shape,
                     SOURCE_UPLOAD_CHUNK_BYTES,
                     |byte_offset, byte_len| {
-                        view.release_copied_range(byte_offset, byte_len);
+                        let release_started = Instant::now();
+                        if view.release_copied_range(byte_offset, byte_len) {
+                            chunk_release_us =
+                                chunk_release_us.saturating_add(elapsed_micros(release_started));
+                        }
                     },
                 )
                 .map_err(|error| CalibError::Runtime(error.to_string()))?;
@@ -1102,7 +1112,7 @@ pub fn load_source_tensor(
     } else {
         upload_source_payload(gpu, view.info.dtype.as_str(), view.bytes, shape)
     };
-    let upload_us = elapsed_micros(upload_started);
+    let upload_us = elapsed_micros(upload_started).saturating_sub(chunk_release_us);
     let gpu_upload_bytes = shape
         .iter()
         .try_fold(1usize, |total, &dimension| total.checked_mul(dimension))
@@ -1115,7 +1125,7 @@ pub fn load_source_tensor(
         .unwrap_or(source_bytes);
     let release_started = Instant::now();
     drop(view);
-    let release_us = elapsed_micros(release_started);
+    let release_us = chunk_release_us.saturating_add(elapsed_micros(release_started));
     reader.record_load(
         source_bytes,
         gpu_upload_bytes,
@@ -1546,14 +1556,14 @@ mod tests {
             let mut reader =
                 PlannedTensorReader::new(&source, &mut ledger, TensorOwner::Persistent);
             let embedding = reader.read("embedding").unwrap();
-            embedding.release_copied_range(0, 8);
+            assert!(!embedding.release_copied_range(0, 8));
             assert!(source.released_ranges.borrow().is_empty());
         }
         {
             let mut reader = PlannedTensorReader::new(&source, &mut ledger, TensorOwner::Layer(0));
             let layer = reader.read("layer0.weight").unwrap();
-            layer.release_copied_range(0, 8);
-            layer.release_copied_range(8, 16);
+            assert!(layer.release_copied_range(0, 8));
+            assert!(layer.release_copied_range(8, 16));
             assert_eq!(
                 source.released_ranges.borrow().as_slice(),
                 [("l0.w".to_string(), 0, 8), ("l0.w".to_string(), 8, 16)]
