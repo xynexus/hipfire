@@ -196,6 +196,24 @@ layers or finalization. Per-layer preservation counts ranged from 22 to 179 and
 minimum admitted expert rows from zero to 484, reinforcing that fallback must
 remain a per-layer/per-expert decision rather than a model-wide route average.
 
+The next layer attempt exposed a host-pressure failure mode rather than a
+checkpoint-integrity failure. The calibration process stopped making source or
+GPU progress while its main thread spun after an SVM wait; at the same time the
+host had exhausted roughly 64.5 GiB of swap, sustained about 80% I/O pressure,
+and accumulated 27,682 failed user units from a recursive
+`drkonqi-coredump-launcher` crash loop. Layer 21 had not committed, so the
+process was terminated after SIGTERM failed and resumed from the durable 21/60
+boundary. A reboot-scoped runtime mask stopped the crash-handler recursion and
+terminating an idle `rust-analyzer` released about 9 GiB of swap. The first
+post-recovery layer then committed 22/60 in 273.60 seconds: 13,150,315,392
+source bytes, 96.69 seconds upload, 137.77 seconds execution, and zero prefetch
+errors. Its K=10 telemetry reconciled all 2,621,440 routed slots with zero
+invalid indices; gate-up and down records matched exactly, 144 undercovered
+experts were explicitly preserved, and the ledger advanced to 382/1,038
+logical tensors with zero duplicates. Treat both the stalled attempt and this
+cold recovery layer as correctness/resume evidence only, not idle-host
+performance samples.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
