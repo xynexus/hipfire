@@ -77,3 +77,27 @@ recovering the head/embed size that Q8F16 leaves on the table.
 4. **Scope of loaders.** `llama.rs` is the shared embedding path (llama/qwen2/
    gemma3/qwen3.5 route through it); confirm each arch that would use Lloyd embed
    goes through this dispatch and not an arch-private lookup.
+
+## Future kernel work: bf16 codebooks + RDNA3+ intrinsics
+
+Applies to the Lloyd lookup kernel above (and is a broader theme for the decode
+kernel family, not embed-specific):
+
+- **bf16-codebook variants.** The MQ3G256Lloyd codebook is 8-entry **fp16**
+  today. A parallel set of kernels that store/decode the codebook (and other
+  dequant paths) as **bf16** would match the model's native dtype end-to-end,
+  avoid fp16 range clipping on outlier centroids, and feed the RDNA3+ bf16 path
+  directly. This is a *second* set of kernels alongside the fp16 ones (both kept
+  — pick per source/target dtype), plus a `QuantType`/`EmbeddingFormat` distinction
+  (e.g. a bf16-codebook Lloyd tag) so the loader routes to the right decode.
+- **RDNA3+ conversion/packed intrinsics.** The decode path currently leans on
+  generic casts. On gfx11+ (RDNA3 / RDNA3.5 / RDNA4) use the hardware conversion
+  + packed intrinsics (native bf16 `v_cvt`, packed f16/bf16 ops) in the decode
+  loop instead. Because these gather/decode kernels are per-element (not WMMA),
+  the win is in conversion throughput and packed loads, not matrix accumulate —
+  distinct from the WMMA-accumulate story (RDNA3 f16-accumulate is no faster than
+  f32-accumulate; see `reference_rdna3_wmma_accumulate`).
+- **Portability guardrail (AGENTS.md).** RDNA3+ intrinsics need an RDNA2/gfx10
+  fallback (generic cast path) so the kernels still build+run on RDNA2. Gate the
+  intrinsic path by arch at compile/dispatch time; never make gfx11+ the only
+  path.
