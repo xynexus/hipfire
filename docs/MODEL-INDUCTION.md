@@ -4,7 +4,7 @@
 Hugging Face source checkpoint into the artifacts needed by hipfire. For the
 Qwen3.5 397B path it produces:
 
-- a BF16-preserving DFlash draft sidecar converted from the published z-lab
+- BF16 and F16 DFlash draft sidecars converted from the published z-lab
   safetensors;
 - one unified calibration artifact containing Hessians, imatrices, routed
   expert statistics, router histograms, and matched-corpus KLDREF records;
@@ -19,6 +19,7 @@ quant:
 ```text
 ~/.hipfire/models/Qwen3.5-397B-A17B.oq4.25++.hfq
 ~/.hipfire/drafts/Qwen3.5-397B-A17B-BF16.dflash.hfq
+~/.hipfire/drafts/Qwen3.5-397B-A17B-F16.dflash.hfq
 ~/.hipfire/triattn/Qwen3.5-397B-A17B.triattn.hfq
 ~/.hipfire/calib/Qwen3.5-397B-A17B.calib.hfq
 ~/.hipfire/induction/Qwen3.5-397B-A17B.oq4.25++/manifest.json
@@ -52,12 +53,13 @@ vocabulary size, and target-layer contract. Their attention geometries are
 reported but deliberately not required to match: the published DFlash draft
 uses its own head and KV-head layout.
 
-The DFlash sidecar defaults to BF16 for the quality-first path. RDNA3/RDNA4
-load those weights as native BF16; older cards convert the same BF16 payload to
-F16 while loading, so the default artifact remains portable. Use
-`--dflash-format f16` to create an explicitly F16 fallback artifact. MQ draft
-formats are separate size/speed experiments and need their own acceptance
-evidence. The target defaults to `oq4.25++`: mixed 4.25-bit Opus storage with
+The DFlash stage creates both BF16 and F16 sidecars by default. RDNA3/RDNA4 use
+the BF16 artifact natively; older cards can select the explicit F16 artifact,
+and the runtime can also convert a BF16 payload to F16 while loading. To build
+only one representation, pass one `--dflash-format`; repeat the flag to request
+a custom set. MQ draft formats are separate size/speed experiments and need
+their own acceptance evidence. The target defaults to `oq4.25++`: mixed
+4.25-bit Opus storage with
 AWQ plus Hessian/LDLQ feedback. Additional target quantizer flags can be
 supplied after `--`.
 

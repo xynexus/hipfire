@@ -23,6 +23,7 @@ DEFAULT_TARGET = Path("/srv/huggingface/models--Qwen--Qwen3.5-397B-A17B")
 DEFAULT_DRAFT = Path("/srv/huggingface/models--z-lab--Qwen3.5-397B-A17B-DFlash")
 DEFAULT_CORPUS = Path("benchmarks/calib/calib-5m.txt")
 DEFAULT_QUANT_FORMAT = "oq4.25++"
+DEFAULT_DFLASH_FORMATS = ("bf16", "f16")
 DEFAULT_LAYER_PREFETCH_BYTES = 16 * 1024**3
 STAGES = ("dflash", "target", "triattn")
 
@@ -135,16 +136,28 @@ def preflight_sources(target: Path, draft: Path) -> dict:
     }
 
 
-def artifact_layout(root: Path, model_name: str, quant_format: str, dflash_format: str) -> dict[str, Path]:
+def artifact_layout(
+    root: Path,
+    model_name: str,
+    quant_format: str,
+    dflash_formats: list[str] | tuple[str, ...],
+) -> dict[str, Path]:
     primary_stem = f"{model_name}.{quant_format}"
-    return {
+    paths = {
         "model": root / "models" / f"{primary_stem}.hfq",
-        "dflash": root / "drafts" / f"{model_name}-{dflash_format.upper()}.dflash.hfq",
         "triattn": root / "triattn" / f"{model_name}.triattn.hfq",
         "calib": root / "calib" / f"{model_name}.calib.hfq",
         "manifest": root / "induction" / primary_stem / "manifest.json",
         "two_pass_manifest": root / "induction" / primary_stem / "two-pass.json",
     }
+    for dflash_format in dict.fromkeys(dflash_formats):
+        _dflash_format_args(dflash_format)
+        paths[f"dflash_{dflash_format}"] = (
+            root / "drafts" / f"{model_name}-{dflash_format.upper()}.dflash.hfq"
+        )
+    if not any(key.startswith("dflash_") for key in paths):
+        raise ValueError("at least one DFlash format is required")
+    return paths
 
 
 def _dflash_format_args(dflash_format: str) -> list[str]:
@@ -173,7 +186,7 @@ def build_stage_commands(
     corpus: Path,
     paths: dict[str, Path],
     quant_format: str,
-    dflash_format: str,
+    dflash_formats: list[str],
     n_sequences: int,
     ctx_len: int,
     batch_size: int,
@@ -190,14 +203,17 @@ def build_stage_commands(
     dflash_converter: str,
     triattn_bin: str,
     quant_args: list[str],
-) -> dict[str, list[str]]:
-    dflash_command = [
-        dflash_converter,
-        *_dflash_format_args(dflash_format),
-        "--input",
-        str(draft),
-        "--output",
-        str(paths["dflash"]),
+) -> dict[str, list[list[str]]]:
+    dflash_commands = [
+        [
+            dflash_converter,
+            *_dflash_format_args(dflash_format),
+            "--input",
+            str(draft),
+            "--output",
+            str(paths[f"dflash_{dflash_format}"]),
+        ]
+        for dflash_format in dflash_formats
     ]
     target_command = [
         python,
@@ -255,7 +271,11 @@ def build_stage_commands(
         str(triattn_chunk_len),
         "--gpu-calib",
     ]
-    return {"dflash": dflash_command, "target": target_command, "triattn": triattn_command}
+    return {
+        "dflash": dflash_commands,
+        "target": [target_command],
+        "triattn": [triattn_command],
+    }
 
 
 def artifact_is_valid(path: Path, magic: bytes) -> bool:
@@ -274,7 +294,11 @@ def _write_manifest(path: Path, manifest: dict) -> None:
 
 def _required_outputs(stage: str, paths: dict[str, Path]) -> list[tuple[Path, bytes]]:
     if stage == "dflash":
-        return [(paths["dflash"], b"HFQM")]
+        return [
+            (path, b"HFQM")
+            for key, path in paths.items()
+            if key.startswith("dflash_")
+        ]
     if stage == "target":
         return [(paths["calib"], b"HFQM"), (paths["model"], b"HFQM")]
     if stage == "triattn":
@@ -432,8 +456,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--dflash-format",
+        action="append",
+        dest="dflash_formats",
         choices=["bf16", "f16", "f32", "mq3", "mq4", "mq6"],
-        default="bf16",
+        help="DFlash sidecar dtype/format; repeat to select multiple (default: bf16 and f16).",
     )
     parser.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
     parser.add_argument("--n-sequences", type=int, default=128)
@@ -497,7 +523,8 @@ def main() -> None:
     draft = resolve_hf_snapshot(args.dflash_source)
     preflight = preflight_sources(target, draft)
     artifact_root = args.artifact_root.expanduser().resolve()
-    paths = artifact_layout(artifact_root, args.model_name, args.quant_format, args.dflash_format)
+    dflash_formats = list(dict.fromkeys(args.dflash_formats or DEFAULT_DFLASH_FORMATS))
+    paths = artifact_layout(artifact_root, args.model_name, args.quant_format, dflash_formats)
     supplied_quant_args = args.quant_args[1:] if args.quant_args[:1] == ["--"] else args.quant_args
     quant_args = supplied_quant_args or default_quant_args(args.quant_format)
     commands = build_stage_commands(
@@ -506,7 +533,7 @@ def main() -> None:
         corpus=corpus,
         paths=paths,
         quant_format=args.quant_format,
-        dflash_format=args.dflash_format,
+        dflash_formats=dflash_formats,
         n_sequences=args.n_sequences,
         ctx_len=args.ctx_len,
         batch_size=args.batch_size,
@@ -559,7 +586,9 @@ def main() -> None:
         if _stage_complete(stage, paths, target_recipe_fingerprint) and not args.force:
             print(f"{stage}: reuse valid artifact(s)")
         else:
-            _print_command(stage, commands[stage])
+            for index, command in enumerate(commands[stage], start=1):
+                suffix = f"[{index}/{len(commands[stage])}]" if len(commands[stage]) > 1 else ""
+                _print_command(f"{stage}{suffix}", command)
     if args.dry_run:
         return
     if build_commands and args.no_auto_build:
@@ -579,7 +608,7 @@ def main() -> None:
         "updated_at": utc_now(),
         "model_name": args.model_name,
         "quant_format": args.quant_format,
-        "dflash_format": args.dflash_format,
+        "dflash_formats": dflash_formats,
         "corpus": str(corpus),
         "sources": preflight,
         "artifacts": {key: str(value) for key, value in paths.items() if key != "manifest"},
@@ -616,12 +645,13 @@ def main() -> None:
         manifest["stages"][stage] = {
             "status": "running",
             "started_at": utc_now(),
-            "command": commands[stage],
+            "commands": commands[stage],
         }
         manifest["updated_at"] = utc_now()
         _write_manifest(paths["manifest"], manifest)
         try:
-            subprocess.run(commands[stage], cwd=REPO_ROOT, check=True)
+            for command in commands[stage]:
+                subprocess.run(command, cwd=REPO_ROOT, check=True)
             if not _stage_complete(stage, paths, target_recipe_fingerprint):
                 raise RuntimeError(f"{stage} command returned success but its output artifact is invalid")
         except BaseException as error:

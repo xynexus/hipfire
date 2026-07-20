@@ -74,10 +74,13 @@ def test_preflight_accepts_current_nested_target_and_zlab_dflash_shape(tmp_path)
 
 
 def test_artifact_layout_matches_registry_sidecar_names(tmp_path):
-    paths = induct.artifact_layout(tmp_path, "Qwen3.5-397B-A17B", "oq4++", "bf16")
+    paths = induct.artifact_layout(
+        tmp_path, "Qwen3.5-397B-A17B", "oq4++", ["bf16", "f16"]
+    )
 
     assert paths["model"] == tmp_path / "models" / "Qwen3.5-397B-A17B.oq4++.hfq"
-    assert paths["dflash"] == tmp_path / "drafts" / "Qwen3.5-397B-A17B-BF16.dflash.hfq"
+    assert paths["dflash_bf16"] == tmp_path / "drafts" / "Qwen3.5-397B-A17B-BF16.dflash.hfq"
+    assert paths["dflash_f16"] == tmp_path / "drafts" / "Qwen3.5-397B-A17B-F16.dflash.hfq"
     assert paths["triattn"] == tmp_path / "triattn" / "Qwen3.5-397B-A17B.triattn.hfq"
     assert paths["calib"] == tmp_path / "calib" / "Qwen3.5-397B-A17B.calib.hfq"
     assert paths["manifest"] == tmp_path / "induction" / "Qwen3.5-397B-A17B.oq4++" / "manifest.json"
@@ -85,14 +88,15 @@ def test_artifact_layout_matches_registry_sidecar_names(tmp_path):
 
 def test_default_quant_format_is_mixed_oq425_double_plus():
     assert induct.DEFAULT_QUANT_FORMAT == "oq4.25++"
+    assert induct.DEFAULT_DFLASH_FORMATS == ("bf16", "f16")
     assert induct.DEFAULT_LAYER_PREFETCH_BYTES == 16 * 1024**3
 
 
 def test_mixed_opus_format_keeps_calibration_recipe_and_canonical_name(tmp_path):
-    paths = induct.artifact_layout(tmp_path, "Qwen3.5-397B-A17B", "oq4.5++", "f16")
+    paths = induct.artifact_layout(tmp_path, "Qwen3.5-397B-A17B", "oq4.5++", ["f16"])
 
     assert paths["model"].name == "Qwen3.5-397B-A17B.oq4.5++.hfq"
-    assert paths["dflash"].name == "Qwen3.5-397B-A17B-F16.dflash.hfq"
+    assert paths["dflash_f16"].name == "Qwen3.5-397B-A17B-F16.dflash.hfq"
     assert induct.default_quant_args("oq4.5++") == ["--awq", "--ldlq"]
 
 
@@ -100,7 +104,9 @@ def test_commands_compose_existing_converters_with_scoped_gpu_stages(tmp_path):
     target, draft = _configs(tmp_path)
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("calibration text")
-    paths = induct.artifact_layout(tmp_path, "Qwen3.5-397B-A17B", "oq4++", "bf16")
+    paths = induct.artifact_layout(
+        tmp_path, "Qwen3.5-397B-A17B", "oq4++", ["bf16", "f16"]
+    )
 
     commands = induct.build_stage_commands(
         target=target,
@@ -108,7 +114,7 @@ def test_commands_compose_existing_converters_with_scoped_gpu_stages(tmp_path):
         corpus=corpus,
         paths=paths,
         quant_format="oq4++",
-        dflash_format="bf16",
+        dflash_formats=["bf16", "f16"],
         n_sequences=128,
         ctx_len=2048,
         batch_size=64,
@@ -127,8 +133,21 @@ def test_commands_compose_existing_converters_with_scoped_gpu_stages(tmp_path):
         quant_args=["--awq", "--ldlq"],
     )
 
-    assert commands["dflash"][-4:] == ["--input", str(draft), "--output", str(paths["dflash"])]
-    target_cmd = commands["target"]
+    assert commands["dflash"][0][-4:] == [
+        "--input",
+        str(draft),
+        "--output",
+        str(paths["dflash_bf16"]),
+    ]
+    assert commands["dflash"][1] == [
+        "target/release/dflash_convert",
+        "--f16",
+        "--input",
+        str(draft),
+        "--output",
+        str(paths["dflash_f16"]),
+    ]
+    target_cmd = commands["target"][0]
     assert target_cmd[:2] == ["python3", "scripts/two_pass_quantize.py"]
     assert target_cmd[target_cmd.index("--calib") + 1] == str(paths["calib"])
     assert target_cmd[target_cmd.index("--coexistence") + 1] == "target/release/hipfire-coexistence"
@@ -139,7 +158,7 @@ def test_commands_compose_existing_converters_with_scoped_gpu_stages(tmp_path):
     assert target_cmd[target_cmd.index("--max-rows") + 1] == "2048"
     assert target_cmd[target_cmd.index("--layer-prefetch-bytes") + 1] == str(16 * 1024**3)
     assert target_cmd[-2:] == ["--awq", "--ldlq"]
-    triattn = commands["triattn"]
+    triattn = commands["triattn"][0]
     assert triattn[:6] == [
         "target/release/hipfire",
         "lock",
@@ -183,7 +202,7 @@ def test_repo_tool_is_rebuilt_when_a_source_is_newer(tmp_path):
 
 
 def test_target_resume_requires_matching_two_pass_provenance(tmp_path):
-    paths = induct.artifact_layout(tmp_path, "Qwen3.5-397B-A17B", "oq4++", "bf16")
+    paths = induct.artifact_layout(tmp_path, "Qwen3.5-397B-A17B", "oq4++", ["bf16", "f16"])
     for key in ("model", "calib"):
         paths[key].parent.mkdir(parents=True, exist_ok=True)
         paths[key].write_bytes(b"HFQM" + b"\0" * 28)
@@ -237,5 +256,7 @@ def test_main_dry_run_prints_native_two_pass_plan_without_running_tools(tmp_path
     assert "--manifest" in output
     assert "--python" not in output
     assert "Qwen3.5-397B-A17B.oq4.25++.hfq" in output
+    assert "Qwen3.5-397B-A17B-BF16.dflash.hfq" in output
+    assert "Qwen3.5-397B-A17B-F16.dflash.hfq" in output
     assert "--format oq4.25++" in output
     assert f"--layer-prefetch-bytes {16 * 1024**3}" in output
