@@ -180,20 +180,6 @@ def _source_precision_output_bytes(tensor: dict) -> int:
     return tensor["source_bytes"]
 
 
-def _is_q8_role(name: str) -> bool:
-    return any(
-        marker in name
-        for marker in (
-            "embed_tokens.weight",
-            "word_embeddings.weight",
-            "lm_head.weight",
-            ".router.weight",
-            ".mlp.gate.weight",
-            ".block_sparse_moe.gate.weight",
-        )
-    )
-
-
 def _quantized_tensor_bytes(numel: int, block_bytes: int, *, q8: bool = False) -> int:
     effective_block = 34 if q8 else block_bytes
     group = 32 if q8 else 256
@@ -279,11 +265,12 @@ def pass_two_storage_preflight(
 
         is_weight = len(tensor["shape"]) >= 2 and tensor["name"].endswith(".weight")
         if is_weight:
-            encoded = _quantized_tensor_bytes(
-                tensor["numel"],
-                block_bytes,
-                q8=_is_q8_role(tensor["name"]),
-            )
+            # K-map, embedding, router, architecture-critical and divisibility
+            # fallbacks can widen a nominal OQ matrix. Q8F16 is the widest
+            # compressed result those branches emit. Cost every non-expert
+            # matrix at that ceiling rather than mirroring evolving K-map
+            # policy in this orchestration wrapper.
+            encoded = _quantized_tensor_bytes(tensor["numel"], block_bytes, q8=True)
         else:
             encoded = _source_precision_output_bytes(tensor)
         payload_bytes += encoded
@@ -333,6 +320,7 @@ def pass_two_storage_preflight(
         "estimate": {
             "nominal_payload_bytes": nominal_payload_bytes,
             "mixed_payload_bytes": payload_bytes,
+            "nonexpert_weight_ceiling": "q8f16",
             "tensor_alignment_bytes": alignment_bytes,
             "fixed_container_overhead_bytes": PASS_TWO_CONTAINER_OVERHEAD_BYTES,
             "completed_artifact_estimate_bytes": artifact_estimate,

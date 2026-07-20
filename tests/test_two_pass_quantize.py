@@ -130,6 +130,31 @@ def test_pass_two_storage_preflight_accepts_presplit_w1_w2_w3_experts(tmp_path):
     assert preflight["preserve_high_precision"]["output_bytes"] == 3 * 8 * 256 * 2
 
 
+def test_pass_two_storage_preflight_uses_q8_ceiling_for_nonexpert_weights(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    write_safetensors_index(
+        model / "model.safetensors",
+        {
+            "model.layers.0.self_attn.q_proj.weight": ("BF16", [256, 256], 256 * 256 * 2),
+            "model.layers.0.input_layernorm.weight": ("BF16", [256], 256 * 2),
+        },
+    )
+
+    preflight = two_pass.pass_two_storage_preflight(
+        model=model,
+        output=tmp_path / "Tiny.oq4.25++.hfq",
+        quant_format="oq4.25++",
+        calibration={"metadata": {"preserve_high_precision": []}},
+        available_bytes=10**12,
+    )
+
+    expected_q8 = (256 * 256 // 32) * 34
+    assert preflight["estimate"]["nonexpert_weight_ceiling"] == "q8f16"
+    assert preflight["estimate"]["mixed_payload_bytes"] == expected_q8 + 256 * 2
+
+
 def test_build_commands_use_one_layer_streamed_teacher_pass_then_quantize(tmp_path):
     model = Path("/srv/huggingface/models--Qwen--Qwen3.5-397B-A17B")
     calib = tmp_path / "Qwen3.5-397B-A17B.calib.hfq"
