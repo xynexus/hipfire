@@ -3177,7 +3177,7 @@ pub const ENV_HIPFIRE_PFLASH_SCORE_LAYER: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PIPE_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PIPE_TRACE",
     description: "Runtime variable controlling pipe trace in hipfire",
-    source: "crates/hipfire-xdna/examples/dflash_body_native.rs:1837",
+    source: "crates/hipfire-xdna/examples/dflash_body_native.rs:2004",
 };
 
 /// `HIPFIRE_PP_DFLASH` — Environment toggle value controls runtime behavior
