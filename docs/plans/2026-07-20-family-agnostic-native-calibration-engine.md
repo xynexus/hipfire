@@ -152,6 +152,16 @@ preserve-undercovered policy recorded all 28 for high-precision fallback. This
 is correct fallback behavior, not evidence that the current corpus satisfies a
 strict all-expert coverage gate.
 
+The paused production run subsequently resumed from its 15/60 checkpoint with
+the same run fingerprint. The cold first layer after process restart committed
+in 450.15 seconds because its 13.12 GB source payload had to load in the
+foreground. Lookahead was warm again on the following layer: 13.15 GB was read
+into resident staging in 113.91 seconds during teacher execution, the foreground
+wait was 3 microseconds, all 18 source tensors were consumed from staging, and
+the layer committed in 148.84 seconds. That layer observed K=10 routes with zero
+invalid or duplicate rows; 42 experts were below the 2,048-row floor (minimum
+309), and all 42 were recorded for high-precision preservation.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
