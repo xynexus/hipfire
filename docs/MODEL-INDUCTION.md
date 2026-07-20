@@ -159,3 +159,16 @@ Kernel Atlas AR/DFlash performance rows.
 
 The TriAttention generator validates its own center statistics, but those
 statistics alone are not a long-context quality result.
+
+Resident-oracle comparisons use the offline, family-neutral artifact gate:
+
+```bash
+hipfire-coexistence artifact compare-calibration \
+  --reference <resident.calib.hfq> \
+  --candidate <streamed.calib.hfq>
+```
+
+The command refuses to treat numerically similar artifacts as matched evidence
+when either package lacks the frozen corpus and sample fingerprints. Its JSON
+report records structural, provenance, non-finite, and tolerance failures for
+the induction evidence ledger.

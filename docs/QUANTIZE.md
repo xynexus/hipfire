@@ -200,6 +200,26 @@ captured separately with per-expert coverage and tile-admission telemetry.
 Undercovered experts either fail the strict gate or are explicitly listed for
 BF16/F16 preservation.
 
+For a resident-versus-layer-streamed parity run, generate both calibration
+packages from the same frozen sample set and compare them offline:
+
+```bash
+target/release/hipfire-coexistence artifact compare-calibration \
+  --reference /tmp/resident.calib.hfq \
+  --candidate /tmp/streamed.calib.hfq \
+  --atol 1e-5 \
+  --rtol 5e-3
+```
+
+The comparator is family-neutral and does not load a model or GPU. It requires
+matching corpus and sample fingerprints by default, checks the tensor set,
+shapes, per-tensor activation counts, KLDREF metadata, and every finite tensor
+value. Dense-F32 and compact BF16-triangle Hessians are compared through the
+same logical diagonal/lower-triangle view; KLDREF indices are exact. Use
+`--allow-unproven-provenance` only for diagnostic comparison of a legacy
+resident artifact that predates the matched-sample metadata contract. Such a
+run is not admission evidence.
+
 The routed telemetry includes grouped microbatch count, active-expert
 sum/maximum, padding rows, capture-gather launches, full and final-partial
 reduction tiles, and the routed-token saturation point. This makes capture
