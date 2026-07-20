@@ -545,6 +545,13 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
     let resource_estimate = resolved
         .adapter
         .resource_estimate(&inspection, &job, geometry)?;
+    let run_fingerprint = calibration_run_fingerprint(
+        resolved.adapter.as_ref(),
+        &inspection,
+        &tensor_plan,
+        &job,
+        geometry,
+    )?;
     let dry_run = dry_run_report(
         &command,
         &snapshot,
@@ -555,6 +562,7 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
         &tensor_plan,
         geometry,
         &job,
+        &run_fingerprint,
         &source_manifest,
         resource_estimate.as_ref(),
         &capture,
@@ -905,6 +913,7 @@ fn dry_run_report(
     tensor_plan: &TensorLoadPlan,
     geometry: MicrobatchGeometry,
     job: &CalibrationJob,
+    run_fingerprint: &str,
     source_manifest: &SourceManifestIdentity,
     resource_estimate: Option<&hipfire_runtime::calibration::stream::CalibrationResourceEstimate>,
     capture: &CaptureRegistry,
@@ -930,6 +939,7 @@ fn dry_run_report(
     Ok(serde_json::json!({
         "command": "calibrate",
         "dry_run": command.dry_run,
+        "run_fingerprint": run_fingerprint,
         "model": {
             "requested_path": command.model,
             "snapshot_path": snapshot,
@@ -991,6 +1001,7 @@ fn dry_run_report(
             "target_rows": job.options.expert_quota.target_rows,
             "limit_rows": job.options.expert_quota.limit_rows()?,
             "tile_rows": job.options.expert_quota.tile_rows,
+            "sampling": job.options.expert_quota.sampling,
             "maximum_batch_slack_rows": job.options.expert_quota.tile_rows - 1,
             "required_fraction": job.options.required_expert_fraction,
             "coverage_policy": job.options.expert_coverage_policy,

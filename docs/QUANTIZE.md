@@ -296,6 +296,13 @@ sequence batch, time tile, or row budget. The expert activation floor, capture
 target/tile, required fraction, deterministic sampling seed, and strict versus
 preserve-undercovered policy are also explicit two-pass options and recipe
 fields, so quality-policy changes cannot reuse stale calibration provenance.
+With `--skip-calib`, the wrapper also executes the native no-GPU dry plan and
+requires the existing artifact to match its family/adapter/architecture,
+source fingerprint and shard set, tokenizer/corpus/sample fingerprints,
+microbatch and F32 boundary geometry, expert capture policy, and KLDREF recipe.
+It also requires the native run fingerprint, which binds the complete adapter
+tensor plan, calibration job, and geometry. An HFQM header alone is not
+sufficient evidence for reuse; any semantic drift fails before pass 2 starts.
 
 Before changing the family-neutral 2,048-row eligibility floor or 4,096-row
 capture target, freeze a one-axis Astrea experiment. A minimum sweep holds the

@@ -32,6 +32,12 @@ Implemented and verified in this checkout:
   OQ4 plus BF16/F16 expert execution, and canonical paged OQ4 expert layout;
 - native two-pass orchestration, atomic recipe manifests, artifact fingerprints,
   interrupted-run resume, and quantizer enforcement of high-precision fallback;
+  explicit calibration reuse derives a fresh no-GPU native plan and requires
+  exact family/adapter/architecture, source-shard, tokenizer/corpus/sample,
+  geometry/F32-boundary, expert-policy, and KLDREF parity before pass 2, while
+  the native run fingerprint additionally binds the complete adapter tensor
+  plan and calibration job; induction automatically selects that validated
+  path for a completed calibration artifact unless `--force` is requested;
 - explicit two-pass/induction provenance for the expert activation floor,
   capture target and tile, required expert fraction, deterministic sampling
   seed, and strict versus preserve-undercovered policy; every control is

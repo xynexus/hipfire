@@ -128,6 +128,16 @@ python3 scripts/induct_model.py --stage triattn
 python3 scripts/induct_model.py --stage target --force
 ```
 
+When a complete calibration artifact exists but the target quant does not,
+induction automatically asks the two-pass workflow to reuse it. Reuse first
+runs the native calibrator's no-GPU dry plan and compares the artifact's family,
+adapter, architecture, source/shard identities, tokenizer, corpus and sampled
+tokens, microbatch geometry, F32 boundary mode, expert capture policy, and
+KLDREF settings against the requested run. The native run fingerprint also
+binds the complete adapter tensor plan, calibration job, and geometry. Any
+mismatch fails before quantization; `--force` disables automatic reuse and
+regenerates calibration.
+
 Repo-built tools are rebuilt when missing or older than their defining source.
 Use `--no-auto-build` to require the tools to be current before starting. GPU
 stages use the shared `hipfire lock` path. Native calibration acquires the lock

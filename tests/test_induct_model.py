@@ -149,6 +149,7 @@ def test_commands_compose_existing_converters_with_scoped_gpu_stages(tmp_path):
         dflash_converter="target/release/dflash_convert",
         triattn_bin="target/release/examples/triattn_validate",
         quant_args=["--awq", "--ldlq"],
+        reuse_calibration=True,
     )
 
     assert commands["dflash"][0][-4:] == [
@@ -181,6 +182,7 @@ def test_commands_compose_existing_converters_with_scoped_gpu_stages(tmp_path):
     assert target_cmd[target_cmd.index("--required-expert-fraction") + 1] == "1.0"
     assert target_cmd[target_cmd.index("--sampling-seed") + 1] == "1"
     assert target_cmd[target_cmd.index("--expert-coverage-policy") + 1] == "preserve-undercovered"
+    assert "--skip-calib" in target_cmd
     assert target_cmd[-2:] == ["--awq", "--ldlq"]
     triattn = commands["triattn"][0]
     assert triattn[:6] == [
@@ -209,6 +211,15 @@ def test_resume_only_skips_artifacts_with_expected_magic(tmp_path):
     assert induct.artifact_is_valid(hfq, b"HFQM")
     assert induct.artifact_is_valid(triattn, b"TRIA")
     assert not induct.artifact_is_valid(hfq, b"TRIA")
+
+
+def test_existing_complete_calibration_is_reused_unless_forced(tmp_path):
+    paths = induct.artifact_layout(tmp_path, "Qwen3.5-397B-A17B", "oq4.25++", ["bf16", "f16"])
+    assert not induct.should_reuse_calibration(paths, force=False)
+    paths["calib"].parent.mkdir(parents=True)
+    paths["calib"].write_bytes(b"HFQM" + b"\0" * 28)
+    assert induct.should_reuse_calibration(paths, force=False)
+    assert not induct.should_reuse_calibration(paths, force=True)
 
 
 def test_repo_tool_is_rebuilt_when_a_source_is_newer(tmp_path):

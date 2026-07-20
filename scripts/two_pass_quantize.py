@@ -253,6 +253,115 @@ def inspect_artifact(coexistence: str, path: Path) -> dict:
     return json.loads(result.stdout)
 
 
+def calibration_validation_command(collect_cmd: list[str]) -> list[str]:
+    return [*collect_cmd, "--dry-run"]
+
+
+def inspect_calibration_plan(collect_cmd: list[str]) -> dict:
+    result = subprocess.run(
+        calibration_validation_command(collect_cmd),
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return json.loads(result.stdout)
+
+
+def _require_equal(label: str, actual, expected) -> None:
+    if actual != expected:
+        raise RuntimeError(f"reused calibration {label} mismatch: artifact={actual!r}, requested={expected!r}")
+
+
+def validate_reusable_calibration(inspection: dict, expected: dict) -> None:
+    """Bind --skip-calib to the native producer's exact semantic recipe."""
+
+    metadata = inspection.get("metadata", {})
+    job = metadata.get("job", {})
+    options = job.get("options", {})
+    samples = job.get("samples", {})
+    source_manifest = metadata.get("source_manifest", {})
+    expected_model = expected.get("model", {})
+    expected_source = expected.get("source_plan", {})
+    expected_corpus = expected.get("corpus", {})
+    expected_geometry = expected.get("microbatch", {})
+    expected_expert = expected.get("expert_capture", {})
+    expected_kldref = expected.get("kldref", {})
+
+    _require_equal(
+        "run fingerprint",
+        metadata.get("run_fingerprint"),
+        expected.get("run_fingerprint"),
+    )
+    _require_equal("family", metadata.get("family"), expected_model.get("family"))
+    _require_equal(
+        "adapter_version",
+        metadata.get("adapter_version"),
+        expected_model.get("adapter_version"),
+    )
+    _require_equal("arch_id", metadata.get("arch_id"), expected_model.get("arch_id"))
+    _require_equal(
+        "source fingerprint",
+        source_manifest.get("fingerprint"),
+        expected_source.get("source_fingerprint"),
+    )
+    _require_equal(
+        "source job fingerprint",
+        job.get("source_fingerprint"),
+        expected_source.get("source_fingerprint"),
+    )
+    _require_equal("source shards", source_manifest.get("shards"), expected_source.get("shards"))
+    _require_equal(
+        "tokenizer fingerprint",
+        job.get("tokenizer_fingerprint"),
+        expected_source.get("tokenizer_fingerprint"),
+    )
+    _require_equal(
+        "corpus fingerprint",
+        job.get("corpus_fingerprint"),
+        expected_corpus.get("corpus_fingerprint"),
+    )
+    _require_equal(
+        "sample fingerprint",
+        samples.get("fingerprint"),
+        expected_corpus.get("sample_fingerprint"),
+    )
+    sample_rows = sum(len(sample.get("tokens", [])) for sample in samples.get("samples", []))
+    _require_equal("sample count", len(samples.get("samples", [])), expected_corpus.get("sequences"))
+    _require_equal("sample context", samples.get("context_len"), expected_corpus.get("context"))
+    _require_equal("sample rows", sample_rows, expected_corpus.get("rows"))
+
+    geometry = metadata.get("microbatch_geometry", {})
+    _require_equal(
+        "geometry sequence_batch",
+        geometry.get("sequence_batch"),
+        expected_geometry.get("sequence_batch"),
+    )
+    _require_equal("geometry time_tile", geometry.get("time_tile"), expected_geometry.get("time_tile"))
+    _require_equal("geometry row_budget", geometry.get("row_budget"), expected_geometry.get("max_rows"))
+    _require_equal("job sequence_batch", options.get("sequence_batch"), expected_geometry.get("sequence_batch"))
+    _require_equal("job time_tile", options.get("time_tile"), expected_geometry.get("time_tile"))
+    _require_equal("job max_rows", options.get("max_rows"), expected_geometry.get("max_rows"))
+    _require_equal("boundary precision", options.get("boundary_precision"), "f32")
+
+    quota = options.get("expert_quota", {})
+    _require_equal("minimum_rows", quota.get("min_rows"), expected_expert.get("minimum_rows"))
+    _require_equal("target_rows", quota.get("target_rows"), expected_expert.get("target_rows"))
+    _require_equal("tile_rows", quota.get("tile_rows"), expected_expert.get("tile_rows"))
+    _require_equal("sampling", quota.get("sampling"), expected_expert.get("sampling"))
+    _require_equal(
+        "required_fraction",
+        options.get("required_expert_fraction"),
+        expected_expert.get("required_fraction"),
+    )
+    _require_equal(
+        "coverage_policy",
+        options.get("expert_coverage_policy"),
+        expected_expert.get("coverage_policy"),
+    )
+    _require_equal("KLDREF enabled", options.get("kldref"), expected_kldref.get("enabled"))
+    _require_equal("KLDREF top_k", options.get("kldref_top_k"), expected_kldref.get("top_k"))
+
+
 def validate_calibration_inspection(inspection: dict) -> None:
     metadata = inspection.get("metadata", {})
     if metadata.get("artifact_kind") != "calibration":
@@ -436,11 +545,18 @@ def main() -> None:
         raise RuntimeError(
             f"two-pass manifest recipe mismatch: existing {prior_recipe}, requested {recipe['recipe_fingerprint']}"
         )
-    update_manifest(manifest_path, recipe=recipe, phase="calibration_running")
+    expected_calibration = None
+    if args.skip_calib:
+        expected_calibration = inspect_calibration_plan(collect_exec)
+        update_manifest(manifest_path, recipe=recipe, phase="calibration_validating")
+    else:
+        update_manifest(manifest_path, recipe=recipe, phase="calibration_running")
     if not args.skip_calib:
         subprocess.run(collect_exec, check=True)
     calibration = inspect_artifact(args.coexistence, args.calib)
     validate_calibration_inspection(calibration)
+    if expected_calibration is not None:
+        validate_reusable_calibration(calibration, expected_calibration)
     update_manifest(
         manifest_path,
         recipe=recipe,

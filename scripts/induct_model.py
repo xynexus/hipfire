@@ -215,6 +215,7 @@ def build_stage_commands(
     dflash_converter: str,
     triattn_bin: str,
     quant_args: list[str],
+    reuse_calibration: bool = False,
 ) -> dict[str, list[list[str]]]:
     dflash_commands = [
         [
@@ -274,6 +275,7 @@ def build_stage_commands(
         coexistence,
         "--hipfire",
         hipfire,
+        *(["--skip-calib"] if reuse_calibration else []),
         "--",
         *quant_args,
     ]
@@ -307,6 +309,10 @@ def artifact_is_valid(path: Path, magic: bytes) -> bool:
         return False
     with path.open("rb") as file:
         return file.read(len(magic)) == magic
+
+
+def should_reuse_calibration(paths: dict[str, Path], *, force: bool) -> bool:
+    return not force and artifact_is_valid(paths["calib"], b"HFQM")
 
 
 def _write_manifest(path: Path, manifest: dict) -> None:
@@ -626,6 +632,7 @@ def main() -> None:
         dflash_converter=str(args.dflash_converter),
         triattn_bin=str(args.triattn_bin),
         quant_args=quant_args,
+        reuse_calibration=should_reuse_calibration(paths, force=args.force),
     )
     target_recipe_fingerprint = _target_recipe_fingerprint(
         target=target,

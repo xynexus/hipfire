@@ -1,6 +1,9 @@
 import importlib.util
 import json
+import copy
 from pathlib import Path
+
+import pytest
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "two_pass_quantize.py"
@@ -262,3 +265,115 @@ def test_interrupted_manifest_resume_preserves_completed_calibration(tmp_path):
     assert resumed["calibration"] == calibration
     assert resumed["source_reads"] == calibration["metadata"]["read_ledger"]
     assert resumed["status"] == "quantization_running"
+
+
+def reusable_calibration_contract():
+    expected = {
+        "run_fingerprint": "fnv64:run",
+        "model": {"family": "qwen3.5", "adapter_version": "qwen3.5-stream-v1", "arch_id": 6},
+        "corpus": {
+            "sequences": 128,
+            "context": 2048,
+            "rows": 262144,
+            "sample_fingerprint": "fnv64:samples",
+            "corpus_fingerprint": "sha256:corpus",
+        },
+        "microbatch": {"sequence_batch": 64, "time_tile": 32, "max_rows": 2048},
+        "source_plan": {
+            "source_fingerprint": "fnv64:source",
+            "tokenizer_fingerprint": "sha256:tokenizer",
+            "shards": [{"file": "model-00001.safetensors", "bytes": 123}],
+        },
+        "expert_capture": {
+            "minimum_rows": 2048,
+            "target_rows": 4096,
+            "tile_rows": 256,
+            "sampling": {"kind": "deterministic_first", "seed": 1},
+            "required_fraction": 1.0,
+            "coverage_policy": "preserve-undercovered",
+        },
+        "kldref": {"enabled": True, "top_k": 64},
+    }
+    inspection = {
+        "metadata": {
+            "artifact_kind": "calibration",
+            "run_fingerprint": "fnv64:run",
+            "family": "qwen3.5",
+            "adapter_version": "qwen3.5-stream-v1",
+            "arch_id": 6,
+            "source_manifest": {
+                "fingerprint": "fnv64:source",
+                "shards": [{"file": "model-00001.safetensors", "bytes": 123}],
+            },
+            "job": {
+                "source_fingerprint": "fnv64:source",
+                "tokenizer_fingerprint": "sha256:tokenizer",
+                "corpus_fingerprint": "sha256:corpus",
+                "samples": {
+                    "samples": [{"id": f"sample-{index}", "tokens": [1] * 2048} for index in range(128)],
+                    "context_len": 2048,
+                    "sampling_seed": 1,
+                    "fingerprint": "fnv64:samples",
+                },
+                "options": {
+                    "sequence_batch": 64,
+                    "time_tile": 32,
+                    "max_rows": 2048,
+                    "boundary_precision": "f32",
+                    "expert_quota": {
+                        "min_rows": 2048,
+                        "target_rows": 4096,
+                        "tile_rows": 256,
+                        "sampling": {"kind": "deterministic_first", "seed": 1},
+                    },
+                    "required_expert_fraction": 1.0,
+                    "expert_coverage_policy": "preserve-undercovered",
+                    "kldref": True,
+                    "kldref_top_k": 64,
+                },
+            },
+            "microbatch_geometry": {"sequence_batch": 64, "time_tile": 32, "row_budget": 2048},
+            "read_ledger": {"missing_logical": [], "duplicate_logical": []},
+        }
+    }
+    return expected, inspection
+
+
+def test_skip_calibration_recipe_validation_binds_native_identity_and_policy():
+    expected, inspection = reusable_calibration_contract()
+    two_pass.validate_calibration_inspection(inspection)
+    two_pass.validate_reusable_calibration(inspection, expected)
+
+    mutations = [
+        ("run fingerprint", lambda value: value["metadata"].update(run_fingerprint="other")),
+        ("source", lambda value: value["metadata"]["source_manifest"].update(fingerprint="other")),
+        ("tokenizer", lambda value: value["metadata"]["job"].update(tokenizer_fingerprint="other")),
+        ("corpus", lambda value: value["metadata"]["job"].update(corpus_fingerprint="other")),
+        ("sample", lambda value: value["metadata"]["job"]["samples"].update(fingerprint="other")),
+        ("geometry", lambda value: value["metadata"]["microbatch_geometry"].update(row_budget=1024)),
+        (
+            "minimum_rows",
+            lambda value: value["metadata"]["job"]["options"]["expert_quota"].update(min_rows=1024),
+        ),
+        (
+            "coverage_policy",
+            lambda value: value["metadata"]["job"]["options"].update(expert_coverage_policy="strict"),
+        ),
+        ("KLDREF", lambda value: value["metadata"]["job"]["options"].update(kldref_top_k=32)),
+    ]
+    for label, mutate in mutations:
+        changed = copy.deepcopy(inspection)
+        mutate(changed)
+        with pytest.raises(RuntimeError, match=label):
+            two_pass.validate_reusable_calibration(changed, expected)
+
+
+def test_skip_calibration_validation_command_is_native_dry_run():
+    collect = [
+        "target/release/hipfire-coexistence",
+        "calibrate",
+        "--model",
+        "/model",
+        "--resume",
+    ]
+    assert two_pass.calibration_validation_command(collect) == [*collect, "--dry-run"]
