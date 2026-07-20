@@ -3157,6 +3157,24 @@ struct LoraTrainSession {
     vocab: usize,
 }
 
+/// Resident state of a micro-step-preemptible `train_drafter` run. The daemon
+/// runs one `quantum` of EPOCHS per `TrainDrafter` request and keeps this alive
+/// between requests (keyed by `run_id`); the runner re-enqueues the training
+/// lease each quantum so drafter training time-slices with interactive serving.
+/// `embed` is moved into `drafter`, so we hold the label tensors still needed
+/// across quanta (chunks + mid labels; base_shallow was consumed by init for the
+/// `bar` baseline) rather than the whole LabelSet.
+struct DrafterTrainSession {
+    run_id: String,
+    drafter: hipfire_train::ssm_drafter::SsmDrafter,
+    chunks: Vec<Vec<u32>>,
+    label_mid: Vec<Vec<f32>>,
+    cfg: hipfire_train::train_loop::TrainCfg,
+    st: hipfire_train::train_loop::DrafterLoopState,
+    output: String,
+    quantum: usize,
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -3283,6 +3301,10 @@ fn main() {
     // Resident micro-step-preemptible LoRA training session (see LoraTrainSession).
     // Some between quanta of a run; runner drives one quantum per TrainLora request.
     let mut lora_train_session: Option<LoraTrainSession> = None;
+    // Resident micro-step-preemptible SSM-drafter training session (see
+    // DrafterTrainSession). Some between quanta of a run; runner drives one
+    // quantum of EPOCHS per TrainDrafter request.
+    let mut drafter_train_session: Option<DrafterTrainSession> = None;
     let mut resource_reservations = ResourceReservationManager::from_env();
     if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
         hipfire_daemon_adapter::fatal_startup_error(
@@ -7183,197 +7205,294 @@ fn main() {
             // validates args + the hipfire-train link; the loop wiring lands in
             // step 3. See docs/plans/2026-06-19-train-as-daemon-op.md.
             DaemonRequest::TrainDrafter => {
-                let arch = msg
-                    .get("arch")
+                // Micro-step-PREEMPTIBLE SSM-drafter training as a daemon op. Runs
+                // up to `quantum` EPOCHS per request and keeps a resident
+                // DrafterTrainSession alive between requests (keyed by `run_id`);
+                // the runner re-enqueues the low-priority training lease each
+                // quantum so it time-slices with interactive serving. Numerics are
+                // verbatim from the whole-run loop (drafter_loop_init/run_epochs/
+                // finish reproduce train_ssm_drafter_loop). Per-eval-epoch stream
+                // uses type `train_epoch` (not `train_progress`) so the runner's
+                // adapter only sees ONE quantum-boundary `train_progress`/`train_done`.
+                let run_id = msg
+                    .get("run_id")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("ssm")
+                    .unwrap_or("")
                     .to_string();
-                if arch != "ssm" {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        format!("train_drafter: arch '{arch}' not implemented (only ssm; step 3)"),
-                    );
-                    continue;
-                }
-                // Parse the train block into the SHARED TrainCfg.
                 let t = msg
                     .get("train")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                let labels = msg
-                    .get("labels")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let getu = |o: &serde_json::Value, k: &str, d: usize| -> usize {
-                    o.get(k)
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as usize)
-                        .unwrap_or(d)
-                };
-                let getf = |o: &serde_json::Value, k: &str, d: f32| -> f32 {
-                    o.get(k)
-                        .and_then(|v| v.as_f64())
-                        .map(|v| v as f32)
-                        .unwrap_or(d)
-                };
-                let cfg = hipfire_train::train_loop::TrainCfg {
-                    seq: getu(&labels, "seq", 512),
-                    block: getu(&labels, "block", 64),
-                    n_eval: getu(&labels, "n_eval", 20),
-                    epochs: getu(&t, "epochs", 300),
-                    lr: getf(&t, "lr", 1e-3),
-                    wd: getf(&t, "wd", 0.0),
-                    tau: getf(&t, "tau", 0.1),
-                    eval_every: getu(&t, "eval_every", 15),
-                    report_train: t
-                        .get("report_train")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                };
-                let source = labels
-                    .get("source")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("file");
-                if source != "file" {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        format!("train_drafter: label source '{source}' not implemented (only file; capture is step 4)"),
-                    );
-                    continue;
-                }
-                let Some(path) = labels
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                else {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        "train_drafter: labels.path required for source=file".to_string(),
-                    );
-                    continue;
-                };
-                let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from)
-                else {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        "train_drafter: 'output' (checkpoint path) required".to_string(),
-                    );
-                    continue;
-                };
+                let quantum = msg
+                    .get("quantum")
+                    .or_else(|| t.get("quantum"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(25)
+                    .max(1);
 
-                // ── load cached labels + frozen target embedding (file source) ──
-                let mut ls =
-                    match hipfire_train::labels::load_daemon_labels(&mut gpu, &path, cfg.seq) {
-                        Ok(ls) => ls,
+                // CONTINUE the resident session iff its run_id matches; else START
+                // fresh (loading labels + building drafter/optimizer once).
+                let continue_run = !run_id.is_empty()
+                    && drafter_train_session
+                        .as_ref()
+                        .map(|s| s.run_id == run_id)
+                        .unwrap_or(false);
+                if !continue_run {
+                    drafter_train_session = None; // drop any stale session, free VRAM
+                    let arch = msg
+                        .get("arch")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ssm")
+                        .to_string();
+                    if arch != "ssm" {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!(
+                                "train_drafter: arch '{arch}' not implemented (only ssm; step 3)"
+                            ),
+                        );
+                        continue;
+                    }
+                    // Parse the train/labels blocks into the SHARED TrainCfg.
+                    let labels = msg
+                        .get("labels")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let getu = |o: &serde_json::Value, k: &str, d: usize| -> usize {
+                        o.get(k)
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                            .unwrap_or(d)
+                    };
+                    let getf = |o: &serde_json::Value, k: &str, d: f32| -> f32 {
+                        o.get(k)
+                            .and_then(|v| v.as_f64())
+                            .map(|v| v as f32)
+                            .unwrap_or(d)
+                    };
+                    let cfg = hipfire_train::train_loop::TrainCfg {
+                        seq: getu(&labels, "seq", 512),
+                        block: getu(&labels, "block", 64),
+                        n_eval: getu(&labels, "n_eval", 20),
+                        epochs: getu(&t, "epochs", 300),
+                        lr: getf(&t, "lr", 1e-3),
+                        wd: getf(&t, "wd", 0.0),
+                        tau: getf(&t, "tau", 0.1),
+                        eval_every: getu(&t, "eval_every", 15),
+                        report_train: t
+                            .get("report_train")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                    };
+                    let source = labels
+                        .get("source")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("file");
+                    if source != "file" {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("train_drafter: label source '{source}' not implemented (only file; capture is step 4)"),
+                        );
+                        continue;
+                    }
+                    let Some(path) = labels
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                    else {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            "train_drafter: labels.path required for source=file".to_string(),
+                        );
+                        continue;
+                    };
+                    let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from)
+                    else {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            "train_drafter: 'output' (checkpoint path) required".to_string(),
+                        );
+                        continue;
+                    };
+
+                    // ── load cached labels + frozen target embedding (file source) ──
+                    let mut ls =
+                        match hipfire_train::labels::load_daemon_labels(&mut gpu, &path, cfg.seq) {
+                            Ok(ls) => ls,
+                            Err(e) => {
+                                emit_error_with_id(
+                                    &mut stdout,
+                                    "",
+                                    format!("train_drafter: load labels {path}: {e}"),
+                                );
+                                continue;
+                            }
+                        };
+                    let shuffle_seed = getu(&labels, "shuffle_seed", 0x5EED) as u64;
+                    hipfire_train::labels::shuffle_in_place(
+                        &mut ls.chunks,
+                        &mut ls.label_mid,
+                        &mut ls.base_shallow,
+                        shuffle_seed,
+                    );
+
+                    // ── build the SSM drafter from the request config ──
+                    let dc = msg
+                        .get("config")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let mut dcfg =
+                        hipfire_train::ssm_drafter::SsmDrafterConfig::tiny(10000.0, 1e-5);
+                    dcfg.h_draft = getu(&dc, "h_draft", 512);
+                    dcfg.n_layers = getu(&dc, "n_layers", 3);
+                    dcfg.inter = getu(&dc, "inter", 1024);
+                    dcfg.n_kv = getu(&dc, "n_kv", 4);
+                    dcfg.head_dim = getu(&dc, "head_dim", 64);
+                    let (h_t, vocab) = (ls.h_t, ls.vocab);
+                    let drafter = match hipfire_train::ssm_drafter::SsmDrafter::new(
+                        &mut gpu, ls.embed, h_t, vocab, dcfg, cfg.seq,
+                    ) {
+                        Ok(d) => d,
                         Err(e) => {
                             emit_error_with_id(
                                 &mut stdout,
                                 "",
-                                format!("train_drafter: load labels {path}: {e}"),
+                                format!("train_drafter: build drafter: {e}"),
                             );
                             continue;
                         }
                     };
-                let shuffle_seed = getu(&labels, "shuffle_seed", 0x5EED) as u64;
-                hipfire_train::labels::shuffle_in_place(
-                    &mut ls.chunks,
-                    &mut ls.label_mid,
-                    &mut ls.base_shallow,
-                    shuffle_seed,
-                );
-
-                // ── build the SSM drafter from the request config ──
-                let dc = msg
-                    .get("config")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let mut dcfg = hipfire_train::ssm_drafter::SsmDrafterConfig::tiny(10000.0, 1e-5);
-                dcfg.h_draft = getu(&dc, "h_draft", 512);
-                dcfg.n_layers = getu(&dc, "n_layers", 3);
-                dcfg.inter = getu(&dc, "inter", 1024);
-                dcfg.n_kv = getu(&dc, "n_kv", 4);
-                dcfg.head_dim = getu(&dc, "head_dim", 64);
-                let (h_t, vocab) = (ls.h_t, ls.vocab);
-                let drafter = match hipfire_train::ssm_drafter::SsmDrafter::new(
-                    &mut gpu, ls.embed, h_t, vocab, dcfg, cfg.seq,
-                ) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        emit_error_with_id(
-                            &mut stdout,
-                            "",
-                            format!("train_drafter: build drafter: {e}"),
-                        );
-                        continue;
-                    }
-                };
-                let nparams: usize = drafter.param_sizes().iter().sum();
-                let _ = writeln!(
-                    stdout,
-                    "{}",
-                    serde_json::json!({
-                        "type": "train_start", "arch": arch, "params": nparams,
-                        "chunks": ls.chunks.len(), "n_train": ls.chunks.len().saturating_sub(cfg.n_eval),
-                        "n_eval": cfg.n_eval, "epochs": cfg.epochs,
-                    })
-                );
-                let _ = stdout.flush();
-
-                // ── run the SHARED training loop, streaming progress JSONL ──
-                let train_res = hipfire_train::train_loop::train_ssm_drafter_loop(
-                    &mut gpu,
-                    &drafter,
-                    &ls.chunks,
-                    &ls.label_mid,
-                    &ls.base_shallow,
-                    &cfg,
-                    |ep, train_loss, corr, best, best_ep, train_corr| {
-                        let mut ev = serde_json::json!({
-                            "type": "train_progress", "epoch": ep, "train_loss": train_loss,
-                            "eval": corr, "best": best, "best_epoch": best_ep,
-                        });
-                        if let Some(tc) = train_corr {
-                            ev["train_rho"] = serde_json::json!(tc);
+                    // Set up the resumable loop state (bar, optimizer, scores scratch).
+                    let st = match hipfire_train::train_loop::drafter_loop_init(
+                        &mut gpu,
+                        &drafter,
+                        &ls.chunks,
+                        &ls.label_mid,
+                        &ls.base_shallow,
+                        &cfg,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                "",
+                                format!("train_drafter: loop init: {e}"),
+                            );
+                            continue;
                         }
-                        let _ = writeln!(stdout, "{ev}");
-                        let _ = stdout.flush();
-                    },
-                );
-                let report = match train_res {
-                    Ok(r) => r,
-                    Err(e) => {
-                        emit_error_with_id(
-                            &mut stdout,
-                            "",
-                            format!("train_drafter: train loop: {e}"),
-                        );
-                        continue;
-                    }
-                };
+                    };
+                    let nparams: usize = drafter.param_sizes().iter().sum();
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "train_start", "arch": arch, "params": nparams,
+                            "chunks": ls.chunks.len(), "n_train": ls.chunks.len().saturating_sub(cfg.n_eval),
+                            "n_eval": cfg.n_eval, "epochs": cfg.epochs,
+                            "run_id": run_id, "quantum": quantum,
+                        })
+                    );
+                    let _ = stdout.flush();
+                    drafter_train_session = Some(DrafterTrainSession {
+                        run_id: run_id.clone(),
+                        drafter,
+                        chunks: ls.chunks,
+                        label_mid: ls.label_mid,
+                        cfg,
+                        st,
+                        output,
+                        quantum,
+                    });
+                }
 
-                // ── checkpoint the best-eval weights ──
-                let saved = hipfire_train::labels::save_ssm_drafter_weights(
-                    &output,
-                    &report.best_weights,
-                    report.best_epoch as u32,
-                );
-                let _ = writeln!(
-                    stdout,
-                    "{}",
-                    serde_json::json!({
-                        "type": "train_done",
-                        "best_eval": report.best_eval, "best_epoch": report.best_epoch,
-                        "bar": report.bar, "final_eval": report.final_eval,
-                        "beat_bar": report.best_eval > report.bar,
-                        "checkpoint": if saved.is_ok() { Some(output.clone()) } else { None },
-                        "checkpoint_error": saved.err().map(|e| e.to_string()),
-                    })
-                );
-                let _ = stdout.flush();
+                // ── run ONE quantum of epochs, streaming per-epoch `train_epoch` ──
+                let quantum_result: Result<(), String> = {
+                    let sess = drafter_train_session
+                        .as_mut()
+                        .expect("session present after start/continue");
+                    let ep_end = (sess.st.ep + sess.quantum).min(sess.cfg.epochs);
+                    hipfire_train::train_loop::drafter_loop_run_epochs(
+                        &mut gpu,
+                        &sess.drafter,
+                        sess.chunks.as_slice(),
+                        sess.label_mid.as_slice(),
+                        &sess.cfg,
+                        &mut sess.st,
+                        ep_end,
+                        |ep, train_loss, corr, best, best_ep, train_corr| {
+                            let mut ev = serde_json::json!({
+                                "type": "train_epoch", "epoch": ep, "train_loss": train_loss,
+                                "eval": corr, "best": best, "best_epoch": best_ep,
+                            });
+                            if let Some(tc) = train_corr {
+                                ev["train_rho"] = serde_json::json!(tc);
+                            }
+                            let _ = writeln!(stdout, "{ev}");
+                            let _ = stdout.flush();
+                        },
+                    )
+                    .map_err(|e| e.to_string())
+                };
+                if let Err(e) = quantum_result {
+                    drafter_train_session = None;
+                    emit_error_with_id(&mut stdout, "", format!("train_drafter: train loop: {e}"));
+                    continue;
+                }
+
+                let done = drafter_train_session
+                    .as_ref()
+                    .map(|s| s.st.ep >= s.cfg.epochs)
+                    .unwrap_or(false);
+                if done {
+                    // Final quantum: finish (free scratch) → checkpoint best-eval
+                    // weights → terminal event. `take()` drops the resident session.
+                    let sess = drafter_train_session.take().expect("done implies present");
+                    let output = sess.output.clone();
+                    let run_id = sess.run_id.clone();
+                    let report = hipfire_train::train_loop::drafter_loop_finish(&mut gpu, sess.st);
+                    let saved = hipfire_train::labels::save_ssm_drafter_weights(
+                        &output,
+                        &report.best_weights,
+                        report.best_epoch as u32,
+                    );
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "train_done",
+                            "best_eval": report.best_eval, "best_epoch": report.best_epoch,
+                            "bar": report.bar, "final_eval": report.final_eval,
+                            "beat_bar": report.best_eval > report.bar,
+                            "checkpoint": if saved.is_ok() { Some(output.clone()) } else { None },
+                            "checkpoint_error": saved.err().map(|e| e.to_string()),
+                            "run_id": run_id,
+                        })
+                    );
+                    let _ = stdout.flush();
+                } else {
+                    // Quantum done but run unfinished: report progress and keep the
+                    // session resident. The runner re-enqueues; training yields to
+                    // any pending interactive request before the next quantum.
+                    let sess = drafter_train_session
+                        .as_ref()
+                        .expect("unfinished implies present");
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "train_progress", "run_id": sess.run_id,
+                            "epoch": sess.st.ep, "total": sess.cfg.epochs,
+                            "eval": sess.st.final_eval, "best": sess.st.best_eval,
+                            "done": false,
+                        })
+                    );
+                    let _ = stdout.flush();
+                }
             }
 
             // Train a LoRA adapter on a frozen bf16 base, in-process on the

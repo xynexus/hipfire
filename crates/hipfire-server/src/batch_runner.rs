@@ -670,14 +670,16 @@ async fn batch_runner_loop(state: SharedState) {
                 // One Train lease covers every training op; dispatch by the raw
                 // wire `type` the route stamped (drafter vs LoRA adapter).
                 //
-                // train_drafter STILL holds the runner turn for the WHOLE run.
-                // train_lora is MICRO-STEP PREEMPTIBLE: the daemon runs ONE quantum
-                // of steps and returns; this lease completes, and if the run is
-                // unfinished the job is RE-ENQUEUED (carrying its run_id + tx) as a
-                // fresh low-priority Training workload. Because training sits below
-                // interactive text/steer, the scheduler serves any pending
-                // interactive request between quanta, then resumes training —
-                // cooperative yield via re-enqueue, no explicit park/resume.
+                // Both train ops are MICRO-STEP PREEMPTIBLE: the daemon runs ONE
+                // quantum (train_lora = steps, train_drafter = epochs) and returns;
+                // this lease completes, and if the run is unfinished the job is
+                // RE-ENQUEUED (carrying its run_id + tx) as a fresh low-priority
+                // Training workload. Because training sits below interactive
+                // text/steer, the scheduler serves any pending interactive request
+                // between quanta, then resumes training — cooperative yield via
+                // re-enqueue, no explicit park/resume. The daemon keeps the training
+                // session resident (keyed by run_id) across quanta, so we pass the
+                // same req each time and never reload the model/labels.
                 let mut engine = match state.engine.lock().await.take() {
                     Some(e) => e,
                     None => {
@@ -686,72 +688,60 @@ async fn batch_runner_loop(state: SharedState) {
                         continue;
                     }
                 };
-                let is_lora = job.req.get("type").and_then(|v| v.as_str()) == Some("train_lora");
-                if is_lora {
-                    // ONE quantum. The daemon keeps the training session resident
-                    // (keyed by run_id) across quanta, so we pass the same req each
-                    // time and never reload the model.
-                    let step = engine.train_lora_step(job.req.clone()).await;
-                    *state.engine.lock().await = Some(engine);
-                    state.work_scheduler.lock().await.complete(lease_id);
-                    match step {
-                        Ok((true, payload)) => {
-                            // Final quantum: the run is done — answer the route.
-                            let _ = job.tx.send(Ok(payload));
-                        }
-                        Ok((false, _progress)) => {
-                            // Unfinished: re-enqueue the SAME job (req carries run_id)
-                            // under a fresh id, moving tx into it. tx is answered only
-                            // on the terminal (done) quantum — never here.
-                            let run_id = job
-                                .req
-                                .get("run_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let new_id = uuid::Uuid::new_v4().to_string();
-                            state.batch_inbox.lock().await.insert(
-                                new_id.clone(),
-                                ScheduledJob::Train(TrainJob {
-                                    req: job.req,
-                                    tx: job.tx,
-                                }),
-                            );
-                            let workload = hipfire_scheduler::WorkloadSpec::microbatchable(
-                                new_id.clone(),
-                                hipfire_scheduler::WorkloadClass::Training,
-                                160,
-                                now_ms(),
-                                hipfire_scheduler::WorkloadResources::default(),
-                                format!("train:{run_id}"),
-                                1,
-                            );
-                            if let Err(e) = state.work_scheduler.lock().await.enqueue(workload) {
-                                // Admission failed: reclaim the job so its tx is
-                                // answered instead of leaving the route hung.
-                                if let Some(ScheduledJob::Train(j)) =
-                                    state.batch_inbox.lock().await.remove(&new_id)
-                                {
-                                    let _ =
-                                        j.tx.send(Err(format!("train re-enqueue admission: {e}")));
-                                }
-                            } else {
-                                state.prefill_notify.notify_waiters();
+                let step = match job.req.get("type").and_then(|v| v.as_str()) {
+                    Some("train_drafter") => engine.train_drafter_step(job.req.clone()).await,
+                    // train_lora (default): the other stepwise training op.
+                    _ => engine.train_lora_step(job.req.clone()).await,
+                };
+                *state.engine.lock().await = Some(engine);
+                state.work_scheduler.lock().await.complete(lease_id);
+                match step {
+                    Ok((true, payload)) => {
+                        // Final quantum: the run is done — answer the route.
+                        let _ = job.tx.send(Ok(payload));
+                    }
+                    Ok((false, _progress)) => {
+                        // Unfinished: re-enqueue the SAME job (req carries run_id)
+                        // under a fresh id, moving tx into it. tx is answered only
+                        // on the terminal (done) quantum — never here.
+                        let run_id = job
+                            .req
+                            .get("run_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let new_id = uuid::Uuid::new_v4().to_string();
+                        state.batch_inbox.lock().await.insert(
+                            new_id.clone(),
+                            ScheduledJob::Train(TrainJob {
+                                req: job.req,
+                                tx: job.tx,
+                            }),
+                        );
+                        let workload = hipfire_scheduler::WorkloadSpec::microbatchable(
+                            new_id.clone(),
+                            hipfire_scheduler::WorkloadClass::Training,
+                            160,
+                            now_ms(),
+                            hipfire_scheduler::WorkloadResources::default(),
+                            format!("train:{run_id}"),
+                            1,
+                        );
+                        if let Err(e) = state.work_scheduler.lock().await.enqueue(workload) {
+                            // Admission failed: reclaim the job so its tx is
+                            // answered instead of leaving the route hung.
+                            if let Some(ScheduledJob::Train(j)) =
+                                state.batch_inbox.lock().await.remove(&new_id)
+                            {
+                                let _ = j.tx.send(Err(format!("train re-enqueue admission: {e}")));
                             }
-                        }
-                        Err(e) => {
-                            let _ = job.tx.send(Err(e.to_string()));
+                        } else {
+                            state.prefill_notify.notify_waiters();
                         }
                     }
-                } else {
-                    // train_drafter: whole-run, holds the turn to completion.
-                    let result = engine
-                        .train_drafter(job.req)
-                        .await
-                        .map_err(|e| e.to_string());
-                    *state.engine.lock().await = Some(engine);
-                    state.work_scheduler.lock().await.complete(lease_id);
-                    let _ = job.tx.send(result);
+                    Err(e) => {
+                        let _ = job.tx.send(Err(e.to_string()));
+                    }
                 }
             }
             Dispatch::Image {

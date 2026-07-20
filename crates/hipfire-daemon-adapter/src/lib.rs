@@ -736,26 +736,30 @@ impl DaemonEngine {
         self.expect_steer_ok("steer_clear").await
     }
 
-    /// Run one in-daemon SSM-drafter training job to completion. `req` is the raw
-    /// `train_drafter` request (the daemon re-parses raw JSON for this op). The
-    /// daemon streams `train_start`/`train_progress` (ignored here) and finishes
-    /// with `train_done`; we return that terminal payload. Long-running — the
-    /// caller (batch runner) holds the GPU turn for the whole run.
-    pub async fn train_drafter(
+    /// Run ONE micro-step quantum of a preemptible SSM-drafter training run.
+    /// `req` is the raw `train_drafter` request (carrying `run_id` so the daemon
+    /// resumes the resident session). The daemon runs up to `quantum` epochs and
+    /// returns: `train_progress` (`(false, payload)` — session still resident,
+    /// runner re-enqueues) or the terminal `train_done` (`(true, payload)`).
+    /// `train_start` on a fresh run falls through to `Unknown` and is skipped.
+    pub async fn train_drafter_step(
         &mut self,
         req: serde_json::Value,
-    ) -> anyhow::Result<serde_json::Value> {
+    ) -> anyhow::Result<(bool, serde_json::Value)> {
         self.send_value(&req).await?;
         loop {
             match self.recv().await? {
+                DaemonResponse::TrainProgress { payload } => {
+                    return Ok((false, serde_json::Value::Object(payload)));
+                }
                 DaemonResponse::TrainDone { payload } => {
-                    return Ok(serde_json::Value::Object(payload));
+                    return Ok((true, serde_json::Value::Object(payload)));
                 }
                 DaemonResponse::Error(e) => {
                     anyhow::bail!("daemon train_drafter error: {}", e.message)
                 }
-                // train_start (Unknown) / train_progress land here; keep waiting.
-                DaemonResponse::TrainProgress { .. } | DaemonResponse::Unknown => {}
+                // train_start lands here; keep waiting for progress/done.
+                DaemonResponse::Unknown => {}
                 other => {
                     tracing::warn!("unexpected response during train_drafter: {other:?}")
                 }

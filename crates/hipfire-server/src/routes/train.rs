@@ -75,10 +75,11 @@ async fn enqueue_train(
     // Stamp the wire type the daemon dispatches on (raw-JSON op).
     if let Some(obj) = body.as_object_mut() {
         obj.insert("type".to_string(), json!(wire_type));
-        // train_lora is micro-step preemptible: the daemon keys the resident
+        // Both train ops are micro-step preemptible: the daemon keys the resident
         // training session on `run_id`, and the runner re-enqueues one `quantum`
-        // of steps at a time. Inject defaults when the caller omits them.
-        if wire_type == "train_lora" {
+        // at a time (train_lora = steps, train_drafter = epochs). Inject defaults
+        // when the caller omits them.
+        if wire_type == "train_lora" || wire_type == "train_drafter" {
             obj.entry("run_id")
                 .or_insert_with(|| json!(Uuid::new_v4().to_string()));
             obj.entry("quantum").or_insert_with(|| json!(25));
