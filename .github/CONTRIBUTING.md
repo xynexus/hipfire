@@ -133,7 +133,8 @@ files match the hotspot regex.
 
 ```bash
 ./tests/coherence-gate.sh             # AR coherence (panic / zero-tokens / timeout = hard fail)
-./tests/coherence-gate-dflash.sh      # spec-decode token-attractor detection
+./tests/tiny-affected-gate.sh --require-coverage  # automatic affected-model coverage
+./tests/coherence-gate-dflash.sh      # optional manual spec-decode diagnostic
 ./tests/speed-gate.sh --fast          # 4B prefill+decode regression vs tests/speed-baselines/<arch>.txt
 ```
 
