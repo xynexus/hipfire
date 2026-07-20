@@ -31,6 +31,11 @@ Implemented and verified in this checkout:
 - durable per-layer phase timing for source load/upload, teacher execution,
   capture serialization, collector finalization, and part sync/hash, persisted
   in checkpoints and the completed artifact for resume-safe ETA analysis;
+- bounded family-neutral source lookahead: the engine selects the next owner's
+  canonical physical ranges without consuming the read ledger, warms at most
+  16 GiB through one fixed 8 MiB worker buffer during current-layer execution,
+  preserves 32 GiB of live host-memory headroom, and persists read/wait/error
+  timing while remaining compatible with older checkpoints;
 - bounded quantizer storage: completed tensors spill to disk for bounded RSS,
   and Linux final assembly releases each copied-and-hashed spill range with
   hole punching rather than retaining two full artifact-sized payloads;
@@ -99,10 +104,19 @@ PTEs immediately and `posix_fadvise` retains the backing-cache hint. A bounded
 Qwen resume fell from a 44.8 GB two-layer peak to 21.9 GB while preserving
 refault correctness and the one-read ledger.
 
+The first six steady production Qwen layers read about 13.15 GB each. Layers
+1--5 spent 123/152/229/240/277 seconds in source load plus upload versus
+144/142/219/156/162 seconds executing, so the 1 Gbps network source is a
+co-limiter or dominant limiter. The bounded lookahead above is intended to
+overlap that source read with current-layer execution; its actual reduction is
+still an evidence item and is not inferred from the implementation alone.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
 - the full Qwen3.5-397B teacher pass and calibration/KLDREF artifact;
+- matched prefetch-on versus prefetch-off layer timings on the same network
+  source, separating background read duration, foreground wait, and upload;
 - the second target-source read and completed quantized artifact;
 - full-run confirmation that the bounded-layer 2,048-row, batch-64 winner
   remains optimal, the full Qwen layer stream, and production per-expert
@@ -991,9 +1005,11 @@ Measure before tuning. For each batch sweep record:
 - fresh-process median throughput.
 
 Optimize only the measured limiter. Likely first levers are row geometry,
-grouped scratch lifetime, segmented capture, and overlapping the next layer's
-host view/pinned upload with current-layer finalization. Kernel changes come
-after those measurements and land one lever at a time.
+grouped scratch lifetime, segmented capture, and the bounded next-layer source
+read lookahead. If warmed loads remain dominant, split source fault/read,
+decode, and host-to-device upload before considering pinned host staging or
+GPU double buffering. Kernel changes come after those measurements and land
+one lever at a time.
 
 ## Definition of done
 

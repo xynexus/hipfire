@@ -20,6 +20,7 @@ from pathlib import Path
 
 
 DEFAULT_QUANT_FORMAT = "oq4.25++"
+DEFAULT_LAYER_PREFETCH_BYTES = 16 * 1024**3
 
 
 def build_commands(
@@ -36,6 +37,7 @@ def build_commands(
     batch_size: int,
     time_tile: int,
     max_rows: int,
+    layer_prefetch_bytes: int,
     kldref_topk: int,
     quant_args: list[str],
 ) -> tuple[list[str], list[str]]:
@@ -58,6 +60,8 @@ def build_commands(
         str(time_tile),
         "--max-rows",
         str(max_rows),
+        "--layer-prefetch-bytes",
+        str(layer_prefetch_bytes),
         "--kldref",
         "--kldref-topk",
         str(kldref_topk),
@@ -115,6 +119,7 @@ def recipe_manifest(
     batch_size: int,
     time_tile: int,
     max_rows: int,
+    layer_prefetch_bytes: int,
     kldref_topk: int,
     quant_args: list[str],
 ) -> dict:
@@ -130,6 +135,7 @@ def recipe_manifest(
         "sequence_batch": batch_size,
         "time_tile": time_tile,
         "max_rows": max_rows,
+        "layer_prefetch_bytes": layer_prefetch_bytes,
         "kldref_topk": kldref_topk,
         "expert_coverage_policy": "preserve_undercovered",
         "quant_args": quant_args,
@@ -253,6 +259,12 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--time-tile", type=int, default=32)
     parser.add_argument("--max-rows", type=int, default=2048)
+    parser.add_argument(
+        "--layer-prefetch-bytes",
+        type=int,
+        default=DEFAULT_LAYER_PREFETCH_BYTES,
+        help=f"Bounded next-layer source lookahead (default: {DEFAULT_LAYER_PREFETCH_BYTES}; 0 disables).",
+    )
     parser.add_argument("--kldref-topk", type=int, default=64)
     parser.add_argument(
         "--coexistence",
@@ -278,6 +290,8 @@ def main() -> None:
         parser.error("sequence, context, geometry, and top-k values must be positive")
     if args.batch_size * args.time_tile > args.max_rows:
         parser.error("--batch-size * --time-tile must not exceed --max-rows")
+    if args.layer_prefetch_bytes < 0:
+        parser.error("--layer-prefetch-bytes must be nonnegative")
     manifest_path = args.manifest or args.output.with_suffix(".two-pass.json")
     corpus = Path(args.corpus)
     recipe = recipe_manifest(
@@ -291,6 +305,7 @@ def main() -> None:
         batch_size=args.batch_size,
         time_tile=args.time_tile,
         max_rows=args.max_rows,
+        layer_prefetch_bytes=args.layer_prefetch_bytes,
         kldref_topk=args.kldref_topk,
         quant_args=quant_args,
     )
@@ -308,6 +323,7 @@ def main() -> None:
         batch_size=args.batch_size,
         time_tile=args.time_tile,
         max_rows=args.max_rows,
+        layer_prefetch_bytes=args.layer_prefetch_bytes,
         kldref_topk=args.kldref_topk,
         quant_args=quant_args,
     )

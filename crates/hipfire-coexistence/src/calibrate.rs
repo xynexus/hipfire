@@ -15,7 +15,8 @@ use hipfire_runtime::calibration::contracts::{
 };
 use hipfire_runtime::calibration::schedule::{MicrobatchGeometry, MicrobatchPlanner};
 use hipfire_runtime::calibration::source::{
-    PlannedTensorReader, ReadLedger, ReadLedgerSnapshot, TensorLoadPlan, TensorOwner,
+    LayerPrefetch, LayerPrefetchReport, PlannedTensorReader, ReadLedger, ReadLedgerSnapshot,
+    TensorLoadPlan, TensorOwner,
 };
 use hipfire_runtime::calibration::stream::{CalibrationFamilyAdapter, ModelInspection};
 use hipfire_runtime::calibration::{
@@ -42,6 +43,8 @@ const ARTIFACT_ESTIMATE_MIN_SAFETY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 // allocation. Live resource estimates and allocation probes select a smaller
 // geometry when the model/architecture cannot support the full row count.
 const CALIBRATION_CLI_DEFAULT_MAX_ROWS: usize = 2048;
+const CALIBRATION_DEFAULT_LAYER_PREFETCH_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const CALIBRATION_PREFETCH_HOST_RESERVE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
 const CALIBRATE_USAGE: &str = "usage: hipfire-coexistence calibrate \
 --model <safetensors-dir-or-cache-root> --corpus <text> --output <model.calib.hfq> \
@@ -49,7 +52,8 @@ const CALIBRATE_USAGE: &str = "usage: hipfire-coexistence calibrate \
 [--max-rows N (default: 2048)] [--min-expert-activations N] [--expert-capture-target N] \
 [--expert-capture-tile-rows N] [--required-expert-fraction F] \
 [--expert-coverage-policy strict|preserve-undercovered] [--kldref|--no-kldref] \
-[--kldref-topk N] [--boundary-dir DIR|--boundary-ram] [--resume] \
+[--kldref-topk N] [--layer-prefetch-bytes N (default: 17179869184; 0 disables)] \
+[--boundary-dir DIR|--boundary-ram] [--resume] \
 [--pause-after-layers N] [--dry-run]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -266,6 +270,7 @@ struct CalibrateCommand {
     expert_coverage_policy: ExpertCoveragePolicy,
     kldref: bool,
     kldref_top_k: usize,
+    layer_prefetch_bytes: u64,
     boundary_ram: bool,
     boundary_directory: Option<PathBuf>,
     resume: bool,
@@ -291,6 +296,7 @@ impl CalibrateCommand {
         let mut expert_coverage_policy = ExpertCoveragePolicy::Strict;
         let mut kldref = true;
         let mut kldref_top_k = 64usize;
+        let mut layer_prefetch_bytes = CALIBRATION_DEFAULT_LAYER_PREFETCH_BYTES;
         let mut boundary_ram = false;
         let mut boundary_directory = None;
         let mut resume = false;
@@ -345,6 +351,9 @@ impl CalibrateCommand {
                             }
                         }
                         "--kldref-topk" => kldref_top_k = parse_value(flag, value)?,
+                        "--layer-prefetch-bytes" => {
+                            layer_prefetch_bytes = parse_value(flag, value)?
+                        }
                         "--boundary-dir" => boundary_directory = Some(PathBuf::from(value)),
                         "--pause-after-layers" => {
                             pause_after_layers = Some(parse_value(flag, value)?)
@@ -373,6 +382,7 @@ impl CalibrateCommand {
             expert_coverage_policy,
             kldref,
             kldref_top_k,
+            layer_prefetch_bytes,
             boundary_ram,
             boundary_directory,
             resume,
@@ -592,6 +602,7 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
     let result = LayerStreamEngine::new(boundary_backend, &command.output)
         .with_resume(command.resume)
         .with_pause_after_layers(command.pause_after_layers)
+        .with_layer_prefetch_bytes(command.layer_prefetch_bytes)
         .run(resolved.adapter.as_mut(), &source, &mut gpu, &job)?;
     let report = match result {
         CalibrationRunOutcome::Complete(result) => serde_json::json!({
@@ -915,6 +926,7 @@ fn dry_run_report(
     let storage_estimate = calibration_storage_estimate(command, inspection, job, capture)?;
     let storage_filesystem =
         filesystem_space(&command.output, storage_estimate.required_free_bytes);
+    let host_available_bytes = host_available_memory_bytes();
     Ok(serde_json::json!({
         "command": "calibrate",
         "dry_run": command.dry_run,
@@ -947,6 +959,16 @@ fn dry_run_report(
             "boundary_bytes": boundary_bytes,
             "persistent_source_bytes": tensor_plan.bytes_for(TensorOwner::Persistent),
             "max_layer_source_bytes": max_layer_source_bytes,
+            "layer_prefetch": {
+                "configured_bytes": command.layer_prefetch_bytes,
+                "host_reserve_bytes": CALIBRATION_PREFETCH_HOST_RESERVE_BYTES,
+                "effective_max_layer_bytes": effective_layer_prefetch_bytes(
+                    command.layer_prefetch_bytes,
+                    max_layer_source_bytes,
+                    host_available_bytes,
+                ),
+                "host_available_bytes": host_available_bytes,
+            },
             "adapter_estimate": resource_estimate,
         },
         "storage": {
@@ -1109,8 +1131,17 @@ pub struct GeometryTuningReport {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CalibrationLayerTiming {
     pub layer: usize,
+    /// Time spent waiting for a lookahead read started by the previous layer.
+    pub prefetch_wait_us: u64,
+    /// Total background read duration for this layer's prefetched source bytes.
+    pub prefetch_read_us: u64,
+    pub prefetch_bytes: u64,
+    pub prefetch_errors: usize,
+    /// Time required to plan and start the following layer's lookahead worker.
+    pub prefetch_submit_us: u64,
     pub load_upload_us: u64,
     pub execute_us: u64,
     pub capture_write_us: u64,
@@ -1121,6 +1152,35 @@ pub struct CalibrationLayerTiming {
 
 fn elapsed_us(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn effective_layer_prefetch_bytes(
+    configured_bytes: u64,
+    layer_source_bytes: u64,
+    host_available_bytes: Option<u64>,
+) -> u64 {
+    let capacity = host_available_bytes
+        .map(|available| available.saturating_sub(CALIBRATION_PREFETCH_HOST_RESERVE_BYTES))
+        .unwrap_or(configured_bytes);
+    configured_bytes.min(layer_source_bytes).min(capacity)
+}
+
+fn host_available_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+        let available_kib = meminfo.lines().find_map(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            (fields.next()? == "MemAvailable:")
+                .then(|| fields.next()?.parse::<u64>().ok())
+                .flatten()
+        })?;
+        available_kib.checked_mul(1024)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 fn estimated_remaining_layer_us(
@@ -1626,6 +1686,7 @@ pub struct LayerStreamEngine {
     artifact_output: PathBuf,
     resume: bool,
     pause_after_layers: Option<usize>,
+    layer_prefetch_bytes: u64,
 }
 
 impl LayerStreamEngine {
@@ -1635,6 +1696,7 @@ impl LayerStreamEngine {
             artifact_output: artifact_output.into(),
             resume: false,
             pause_after_layers: None,
+            layer_prefetch_bytes: CALIBRATION_DEFAULT_LAYER_PREFETCH_BYTES,
         }
     }
 
@@ -1645,6 +1707,11 @@ impl LayerStreamEngine {
 
     pub const fn with_pause_after_layers(mut self, pause_after_layers: Option<usize>) -> Self {
         self.pause_after_layers = pause_after_layers;
+        self
+    }
+
+    pub const fn with_layer_prefetch_bytes(mut self, layer_prefetch_bytes: u64) -> Self {
+        self.layer_prefetch_bytes = layer_prefetch_bytes;
         self
     }
 
@@ -1845,6 +1912,7 @@ impl LayerStreamEngine {
         let mut max_consistency = 0.0f32;
         let mut layer_timings = Vec::with_capacity(model.num_layers);
         let mut resume_ledger = None;
+        let mut pending_prefetch: Option<(usize, LayerPrefetch)> = None;
 
         if resuming_existing_checkpoint {
             let mut prior_consumed = std::collections::BTreeSet::new();
@@ -1899,6 +1967,34 @@ impl LayerStreamEngine {
 
         for layer_index in completed_layers..model.num_layers {
             let layer_started = Instant::now();
+            let prefetch_wait_started = Instant::now();
+            let prefetch_report = match pending_prefetch.take() {
+                Some((target_layer, prefetch)) if target_layer == layer_index => prefetch.wait(),
+                Some((target_layer, prefetch)) => {
+                    drop(prefetch);
+                    LayerPrefetchReport {
+                        errors: vec![format!(
+                            "prefetch target layer {target_layer} reached engine layer {layer_index}"
+                        )],
+                        ..LayerPrefetchReport::default()
+                    }
+                }
+                None => LayerPrefetchReport::default(),
+            };
+            let prefetch_wait_us = if prefetch_report.requested_bytes == 0 {
+                0
+            } else {
+                elapsed_us(prefetch_wait_started)
+            };
+            if !prefetch_report.errors.is_empty() {
+                eprintln!(
+                    "calibrate: layer {layer_index} prefetch completed {}/{} bytes with {} error(s): {}",
+                    prefetch_report.completed_bytes,
+                    prefetch_report.requested_bytes,
+                    prefetch_report.errors.len(),
+                    prefetch_report.errors.join("; "),
+                );
+            }
             let load_started = Instant::now();
             let mut layer = {
                 let mut reader =
@@ -1906,6 +2002,31 @@ impl LayerStreamEngine {
                 adapter.load_layer(&mut reader, gpu, &model, layer_index, &execution_job)?
             };
             let load_upload_us = elapsed_us(load_started);
+            let prefetch_submit_started = Instant::now();
+            let next_layer = layer_index + 1;
+            let pausing_after_this_layer = self.pause_after_layers == Some(next_layer);
+            if next_layer < model.num_layers
+                && !pausing_after_this_layer
+                && self.layer_prefetch_bytes > 0
+            {
+                let layer_source_bytes = tensor_plan.bytes_for(TensorOwner::Layer(next_layer));
+                let prefetch_bytes = effective_layer_prefetch_bytes(
+                    self.layer_prefetch_bytes,
+                    layer_source_bytes,
+                    host_available_memory_bytes(),
+                );
+                let ranges =
+                    tensor_plan.prefetch_ranges_for(TensorOwner::Layer(next_layer), prefetch_bytes);
+                if !ranges.is_empty() {
+                    match LayerPrefetch::spawn(ranges) {
+                        Ok(prefetch) => pending_prefetch = Some((next_layer, prefetch)),
+                        Err(error) => eprintln!(
+                            "calibrate: layer {next_layer} prefetch disabled for this transition: {error}"
+                        ),
+                    }
+                }
+            }
+            let prefetch_submit_us = elapsed_us(prefetch_submit_started);
             let execute_started = Instant::now();
             let execute_result = (|| {
                 for batch in &batches {
@@ -1969,6 +2090,11 @@ impl LayerStreamEngine {
             let part_sync_hash_us = elapsed_us(part_sync_started);
             let timing = CalibrationLayerTiming {
                 layer: layer_index,
+                prefetch_wait_us,
+                prefetch_read_us: prefetch_report.elapsed_us,
+                prefetch_bytes: prefetch_report.completed_bytes,
+                prefetch_errors: prefetch_report.errors.len(),
+                prefetch_submit_us,
                 load_upload_us,
                 execute_us,
                 capture_write_us,
@@ -2010,9 +2136,11 @@ impl LayerStreamEngine {
                 .map(format_duration_us)
                 .unwrap_or_else(|| "unknown".to_string());
             eprintln!(
-                "calibrate: committed layer {completed}/{} in {} (load {}, execute {}, capture+sync {}); rolling layer ETA {eta}",
+                "calibrate: committed layer {completed}/{} in {} (prefetch {} read/{} wait, load {}, execute {}, capture+sync {}); rolling layer ETA {eta}",
                 model.num_layers,
                 format_duration_us(latest.total_before_checkpoint_us),
+                format_duration_us(latest.prefetch_read_us),
+                format_duration_us(latest.prefetch_wait_us),
                 format_duration_us(latest.load_upload_us),
                 format_duration_us(latest.execute_us),
                 format_duration_us(
@@ -2539,6 +2667,42 @@ mod tests {
     }
 
     #[test]
+    fn layer_prefetch_budget_preserves_host_reserve_and_layer_bound() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(
+            effective_layer_prefetch_bytes(16 * gib, 13 * gib, Some(65 * gib)),
+            13 * gib
+        );
+        assert_eq!(
+            effective_layer_prefetch_bytes(16 * gib, 13 * gib, Some(40 * gib)),
+            8 * gib
+        );
+        assert_eq!(
+            effective_layer_prefetch_bytes(16 * gib, 20 * gib, None),
+            16 * gib
+        );
+        assert_eq!(effective_layer_prefetch_bytes(0, 20 * gib, None), 0);
+    }
+
+    #[test]
+    fn old_layer_timing_checkpoints_default_new_prefetch_fields() {
+        let timing: CalibrationLayerTiming = serde_json::from_value(serde_json::json!({
+            "layer": 3,
+            "load_upload_us": 10,
+            "execute_us": 20,
+            "capture_write_us": 30,
+            "finish_us": 40,
+            "part_sync_hash_us": 50,
+            "total_before_checkpoint_us": 150
+        }))
+        .unwrap();
+        assert_eq!(timing.prefetch_wait_us, 0);
+        assert_eq!(timing.prefetch_read_us, 0);
+        assert_eq!(timing.prefetch_bytes, 0);
+        assert_eq!(timing.prefetch_errors, 0);
+    }
+
+    #[test]
     fn cli_parses_auto_geometry_and_unaligned_capture_target() {
         let args = [
             "--model",
@@ -2564,6 +2728,7 @@ mod tests {
         assert_eq!(command.sequence_batch, None);
         assert_eq!(command.time_tile, Some(8));
         assert_eq!(command.max_rows, 2048);
+        assert_eq!(command.layer_prefetch_bytes, 16 * 1024 * 1024 * 1024);
         assert_eq!(
             command
                 .options()
@@ -2575,6 +2740,23 @@ mod tests {
         );
         assert!(command.dry_run);
         assert_eq!(command.pause_after_layers, Some(2));
+    }
+
+    #[test]
+    fn cli_accepts_an_explicit_layer_prefetch_budget() {
+        let args = [
+            "--model",
+            "model",
+            "--corpus",
+            "corpus.txt",
+            "--output",
+            "out.hfq",
+            "--layer-prefetch-bytes",
+            "12345",
+        ]
+        .map(str::to_string);
+        let command = CalibrateCommand::parse(&args).unwrap();
+        assert_eq!(command.layer_prefetch_bytes, 12345);
     }
 
     #[test]

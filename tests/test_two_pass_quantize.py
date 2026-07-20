@@ -12,6 +12,7 @@ SPEC.loader.exec_module(two_pass)
 
 def test_default_quant_format_is_mixed_oq425_double_plus():
     assert two_pass.DEFAULT_QUANT_FORMAT == "oq4.25++"
+    assert two_pass.DEFAULT_LAYER_PREFETCH_BYTES == 16 * 1024**3
 
 
 def test_build_commands_use_one_layer_streamed_teacher_pass_then_quantize(tmp_path):
@@ -32,6 +33,7 @@ def test_build_commands_use_one_layer_streamed_teacher_pass_then_quantize(tmp_pa
         batch_size=64,
         time_tile=32,
         max_rows=2048,
+        layer_prefetch_bytes=16 * 1024**3,
         kldref_topk=64,
         quant_args=["--awq", "--ldlq"],
     )
@@ -45,6 +47,7 @@ def test_build_commands_use_one_layer_streamed_teacher_pass_then_quantize(tmp_pa
     assert collect_cmd[collect_cmd.index("--sequence-batch") + 1] == "64"
     assert collect_cmd[collect_cmd.index("--time-tile") + 1] == "32"
     assert collect_cmd[collect_cmd.index("--max-rows") + 1] == "2048"
+    assert collect_cmd[collect_cmd.index("--layer-prefetch-bytes") + 1] == str(16 * 1024**3)
     assert quant_cmd == [
         "target/release/hipfire-quantize",
         "--input",
@@ -84,6 +87,7 @@ def test_recipe_fingerprint_changes_with_inputs_but_not_dict_order(tmp_path):
         batch_size=16,
         time_tile=32,
         max_rows=512,
+        layer_prefetch_bytes=16 * 1024**3,
         kldref_topk=64,
         quant_args=["--awq", "--ldlq"],
     )
@@ -98,6 +102,7 @@ def test_recipe_fingerprint_changes_with_inputs_but_not_dict_order(tmp_path):
         batch_size=16,
         time_tile=32,
         max_rows=512,
+        layer_prefetch_bytes=16 * 1024**3,
         kldref_topk=64,
         quant_args=["--awq", "--ldlq"],
     )
@@ -115,12 +120,14 @@ def test_recipe_fingerprint_changes_with_inputs_but_not_dict_order(tmp_path):
         batch_size=16,
         time_tile=64,
         max_rows=1024,
+        layer_prefetch_bytes=8 * 1024**3,
         kldref_topk=64,
         quant_args=["--awq", "--ldlq"],
     )
     assert changed["recipe_fingerprint"] != first["recipe_fingerprint"]
     assert first["time_tile"] == 32
     assert first["max_rows"] == 512
+    assert first["layer_prefetch_bytes"] == 16 * 1024**3
 
 
 def test_manifest_consumes_native_read_ledger_and_artifact_fingerprints(tmp_path):

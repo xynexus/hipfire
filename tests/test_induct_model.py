@@ -85,6 +85,7 @@ def test_artifact_layout_matches_registry_sidecar_names(tmp_path):
 
 def test_default_quant_format_is_mixed_oq425_double_plus():
     assert induct.DEFAULT_QUANT_FORMAT == "oq4.25++"
+    assert induct.DEFAULT_LAYER_PREFETCH_BYTES == 16 * 1024**3
 
 
 def test_mixed_opus_format_keeps_calibration_recipe_and_canonical_name(tmp_path):
@@ -113,6 +114,7 @@ def test_commands_compose_existing_converters_with_scoped_gpu_stages(tmp_path):
         batch_size=64,
         time_tile=32,
         max_rows=2048,
+        layer_prefetch_bytes=16 * 1024**3,
         kldref_topk=64,
         triattn_max_tokens=100_000,
         triattn_chunk_len=1024,
@@ -135,6 +137,7 @@ def test_commands_compose_existing_converters_with_scoped_gpu_stages(tmp_path):
     assert target_cmd[target_cmd.index("--batch-size") + 1] == "64"
     assert target_cmd[target_cmd.index("--time-tile") + 1] == "32"
     assert target_cmd[target_cmd.index("--max-rows") + 1] == "2048"
+    assert target_cmd[target_cmd.index("--layer-prefetch-bytes") + 1] == str(16 * 1024**3)
     assert target_cmd[-2:] == ["--awq", "--ldlq"]
     triattn = commands["triattn"]
     assert triattn[:6] == [
@@ -235,3 +238,4 @@ def test_main_dry_run_prints_native_two_pass_plan_without_running_tools(tmp_path
     assert "--python" not in output
     assert "Qwen3.5-397B-A17B.oq4.25++.hfq" in output
     assert "--format oq4.25++" in output
+    assert f"--layer-prefetch-bytes {16 * 1024**3}" in output

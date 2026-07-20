@@ -68,6 +68,13 @@ fingerprint, so resume cannot silently change the geometry. The native engine
 also performs live memory estimates and allocation probes before accepting an
 automatic geometry on a different host.
 
+The target pass defaults to a 16 GiB bounded next-layer source prefetch. While
+one layer executes, the native engine warms the following layer's canonical
+safetensor ranges without consuming its read-ledger entries. It retains a 32
+GiB live host-memory reserve and reduces the effective budget when required.
+Override with `--layer-prefetch-bytes N`, or pass zero to disable lookahead;
+the chosen operational budget is recorded in the two-pass recipe.
+
 Mixed-precision Opus targets are supported directly. For example,
 `--format oq4.5++` keeps the `++` calibration recipe and emits canonically
 named `oq4.5++` primary and sidecar artifacts. The bitwidth must satisfy the

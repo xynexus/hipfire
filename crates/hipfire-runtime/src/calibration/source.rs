@@ -8,6 +8,12 @@ use hipfire_model::{ModelSource, TensorInfo, TensorStorageLocation};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
+
+const LAYER_PREFETCH_STAGING_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum TensorOwner {
@@ -207,6 +213,177 @@ impl TensorLoadPlan {
         self.entries
             .iter()
             .find(|entry| entry.logical_name == logical_name)
+    }
+
+    /// Return physical source ranges for one owner without consuming the read
+    /// ledger. Ranges are sorted into backing-file order and the final range is
+    /// clipped when the caller's bounded lookahead budget ends mid-tensor.
+    pub fn prefetch_ranges_for(
+        &self,
+        owner: TensorOwner,
+        byte_budget: u64,
+    ) -> Vec<TensorStorageLocation> {
+        if byte_budget == 0 {
+            return Vec::new();
+        }
+        let mut ranges = self
+            .entries
+            .iter()
+            .filter(|entry| entry.owner == owner && entry.alias_of.is_none())
+            .map(|entry| entry.storage.clone())
+            .collect::<Vec<_>>();
+        ranges.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.byte_offset.cmp(&right.byte_offset))
+                .then_with(|| left.byte_len.cmp(&right.byte_len))
+        });
+        ranges.dedup();
+
+        let mut remaining = byte_budget;
+        let mut bounded = Vec::new();
+        for mut range in ranges {
+            if remaining == 0 {
+                break;
+            }
+            range.byte_len = range.byte_len.min(remaining);
+            remaining -= range.byte_len;
+            if range.byte_len > 0 {
+                bounded.push(range);
+            }
+        }
+        bounded
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerPrefetchReport {
+    pub requested_bytes: u64,
+    pub completed_bytes: u64,
+    pub ranges: usize,
+    pub elapsed_us: u64,
+    pub errors: Vec<String>,
+}
+
+/// A bounded background read that warms the operating-system page cache for
+/// the next layer. It owns only a fixed-size staging buffer and never touches
+/// tensor payload semantics or the logical read ledger.
+pub struct LayerPrefetch {
+    requested_bytes: u64,
+    ranges: usize,
+    handle: Option<JoinHandle<LayerPrefetchReport>>,
+}
+
+impl LayerPrefetch {
+    pub fn spawn(ranges: Vec<TensorStorageLocation>) -> Result<Self, CalibError> {
+        let requested_bytes = ranges
+            .iter()
+            .fold(0u64, |total, range| total.saturating_add(range.byte_len));
+        let range_count = ranges.len();
+        let handle = thread::Builder::new()
+            .name("hipfire-layer-prefetch".into())
+            .spawn(move || prefetch_ranges(ranges))
+            .map_err(|error| {
+                CalibError::Runtime(format!("failed to spawn layer-prefetch worker: {error}"))
+            })?;
+        Ok(Self {
+            requested_bytes,
+            ranges: range_count,
+            handle: Some(handle),
+        })
+    }
+
+    pub fn wait(mut self) -> LayerPrefetchReport {
+        self.join()
+    }
+
+    fn join(&mut self) -> LayerPrefetchReport {
+        let Some(handle) = self.handle.take() else {
+            return LayerPrefetchReport {
+                requested_bytes: self.requested_bytes,
+                ranges: self.ranges,
+                errors: vec!["layer-prefetch worker was already joined".into()],
+                ..LayerPrefetchReport::default()
+            };
+        };
+        handle.join().unwrap_or_else(|_| LayerPrefetchReport {
+            requested_bytes: self.requested_bytes,
+            ranges: self.ranges,
+            errors: vec!["layer-prefetch worker panicked".into()],
+            ..LayerPrefetchReport::default()
+        })
+    }
+}
+
+impl Drop for LayerPrefetch {
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            let _ = self.join();
+        }
+    }
+}
+
+fn prefetch_ranges(ranges: Vec<TensorStorageLocation>) -> LayerPrefetchReport {
+    let started = Instant::now();
+    let requested_bytes = ranges
+        .iter()
+        .fold(0u64, |total, range| total.saturating_add(range.byte_len));
+    let range_count = ranges.len();
+    let mut completed_bytes = 0u64;
+    let mut errors = Vec::new();
+    let mut staging = vec![0u8; LAYER_PREFETCH_STAGING_BYTES];
+    for range in ranges {
+        let mut file = match File::open(&range.path) {
+            Ok(file) => file,
+            Err(error) => {
+                errors.push(format!("{}: {error}", range.path.display()));
+                continue;
+            }
+        };
+        if let Err(error) = file.seek(SeekFrom::Start(range.byte_offset)) {
+            errors.push(format!(
+                "{}@{}: {error}",
+                range.path.display(),
+                range.byte_offset
+            ));
+            continue;
+        }
+        let mut remaining = range.byte_len;
+        while remaining > 0 {
+            let chunk = usize::try_from(remaining.min(staging.len() as u64)).unwrap();
+            match file.read(&mut staging[..chunk]) {
+                Ok(0) => {
+                    errors.push(format!(
+                        "{}@{}: unexpected EOF with {remaining} bytes remaining",
+                        range.path.display(),
+                        range.byte_offset
+                    ));
+                    break;
+                }
+                Ok(read) => {
+                    completed_bytes = completed_bytes.saturating_add(read as u64);
+                    remaining -= read as u64;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    errors.push(format!(
+                        "{}@{}: {error}",
+                        range.path.display(),
+                        range.byte_offset
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    LayerPrefetchReport {
+        requested_bytes,
+        completed_bytes,
+        ranges: range_count,
+        elapsed_us: u64::try_from(started.elapsed().as_micros())
+            .unwrap_or(u64::MAX)
+            .max(1),
+        errors,
     }
 }
 
@@ -679,6 +856,8 @@ mod tests {
             for (name, shard, offset, len) in [
                 ("embed", "model-00001.safetensors", 100, 16),
                 ("l0.w", "model-00002.safetensors", 200, 24),
+                ("l1.a", "model-00003.safetensors", 300, 10),
+                ("l1.b", "model-00003.safetensors", 400, 20),
             ] {
                 infos.insert(
                     name.into(),
@@ -769,6 +948,68 @@ mod tests {
             plan.entry("lm_head").unwrap().alias_of.as_deref(),
             Some("embedding")
         );
+    }
+
+    #[test]
+    fn prefetch_ranges_are_owner_scoped_alias_free_and_budget_bounded() {
+        let plan = TensorLoadPlan::build(
+            &FakeSource::new(),
+            [
+                TensorLoadRequest::tensor("layer1.a", "l1.a", TensorOwner::Layer(1)),
+                TensorLoadRequest::alias(
+                    "layer1.a_alias",
+                    "l1.a",
+                    TensorOwner::Layer(1),
+                    "layer1.a",
+                ),
+                TensorLoadRequest::tensor("layer1.b", "l1.b", TensorOwner::Layer(1)),
+                TensorLoadRequest::tensor("layer0.weight", "l0.w", TensorOwner::Layer(0)),
+            ],
+        )
+        .unwrap();
+
+        let ranges = plan.prefetch_ranges_for(TensorOwner::Layer(1), 25);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].byte_offset, 300);
+        assert_eq!(ranges[0].byte_len, 10);
+        assert_eq!(ranges[1].byte_offset, 400);
+        assert_eq!(ranges[1].byte_len, 15);
+        assert_eq!(ranges.iter().map(|range| range.byte_len).sum::<u64>(), 25);
+        assert!(plan
+            .prefetch_ranges_for(TensorOwner::Layer(1), 0)
+            .is_empty());
+    }
+
+    #[test]
+    fn layer_prefetch_reads_ranges_with_a_fixed_size_staging_buffer() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "hipfire-layer-prefetch-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&vec![0x5au8; 3 * 1024 * 1024]).unwrap();
+        drop(file);
+
+        let report = LayerPrefetch::spawn(vec![TensorStorageLocation {
+            path: path.clone(),
+            byte_offset: 512 * 1024,
+            byte_len: 2 * 1024 * 1024,
+        }])
+        .unwrap()
+        .wait();
+        assert_eq!(report.requested_bytes, 2 * 1024 * 1024);
+        assert_eq!(report.completed_bytes, report.requested_bytes);
+        assert_eq!(report.ranges, 1);
+        assert!(report.errors.is_empty());
+        assert!(report.elapsed_us > 0);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

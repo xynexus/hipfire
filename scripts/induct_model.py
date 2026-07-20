@@ -23,6 +23,7 @@ DEFAULT_TARGET = Path("/srv/huggingface/models--Qwen--Qwen3.5-397B-A17B")
 DEFAULT_DRAFT = Path("/srv/huggingface/models--z-lab--Qwen3.5-397B-A17B-DFlash")
 DEFAULT_CORPUS = Path("benchmarks/calib/calib-5m.txt")
 DEFAULT_QUANT_FORMAT = "oq4.25++"
+DEFAULT_LAYER_PREFETCH_BYTES = 16 * 1024**3
 STAGES = ("dflash", "target", "triattn")
 
 
@@ -178,6 +179,7 @@ def build_stage_commands(
     batch_size: int,
     time_tile: int,
     max_rows: int,
+    layer_prefetch_bytes: int,
     kldref_topk: int,
     triattn_max_tokens: int,
     triattn_chunk_len: int,
@@ -220,6 +222,8 @@ def build_stage_commands(
         str(time_tile),
         "--max-rows",
         str(max_rows),
+        "--layer-prefetch-bytes",
+        str(layer_prefetch_bytes),
         "--kldref-topk",
         str(kldref_topk),
         "--manifest",
@@ -320,6 +324,7 @@ def _target_recipe_fingerprint(
     batch_size: int,
     time_tile: int,
     max_rows: int,
+    layer_prefetch_bytes: int,
     kldref_topk: int,
     quant_args: list[str],
 ) -> str:
@@ -336,6 +341,7 @@ def _target_recipe_fingerprint(
         "sequence_batch": batch_size,
         "time_tile": time_tile,
         "max_rows": max_rows,
+        "layer_prefetch_bytes": layer_prefetch_bytes,
         "kldref_topk": kldref_topk,
         "expert_coverage_policy": "preserve_undercovered",
         "quant_args": quant_args,
@@ -435,6 +441,12 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--time-tile", type=int, default=32)
     parser.add_argument("--max-rows", type=int, default=2048)
+    parser.add_argument(
+        "--layer-prefetch-bytes",
+        type=int,
+        default=DEFAULT_LAYER_PREFETCH_BYTES,
+        help=f"Bounded next-layer source lookahead (default: {DEFAULT_LAYER_PREFETCH_BYTES}; 0 disables).",
+    )
     parser.add_argument("--kldref-topk", type=int, default=64)
     parser.add_argument("--triattn-max-tokens", type=int, default=100_000)
     parser.add_argument("--triattn-chunk-len", type=int, default=1024)
@@ -478,6 +490,8 @@ def main() -> None:
         parser.error("token, sequence, batch, and top-k values must be positive")
     if args.batch_size * args.time_tile > args.max_rows:
         parser.error("--batch-size * --time-tile must not exceed --max-rows")
+    if args.layer_prefetch_bytes < 0:
+        parser.error("--layer-prefetch-bytes must be nonnegative")
 
     target = resolve_hf_snapshot(args.target)
     draft = resolve_hf_snapshot(args.dflash_source)
@@ -498,6 +512,7 @@ def main() -> None:
         batch_size=args.batch_size,
         time_tile=args.time_tile,
         max_rows=args.max_rows,
+        layer_prefetch_bytes=args.layer_prefetch_bytes,
         kldref_topk=args.kldref_topk,
         triattn_max_tokens=args.triattn_max_tokens,
         triattn_chunk_len=args.triattn_chunk_len,
@@ -519,6 +534,7 @@ def main() -> None:
         batch_size=args.batch_size,
         time_tile=args.time_tile,
         max_rows=args.max_rows,
+        layer_prefetch_bytes=args.layer_prefetch_bytes,
         kldref_topk=args.kldref_topk,
         quant_args=quant_args,
     )

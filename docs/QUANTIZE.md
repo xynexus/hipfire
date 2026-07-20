@@ -179,7 +179,8 @@ target/release/hipfire-coexistence calibrate \
   --kldref \
   --sequence-batch 64 \
   --time-tile 32 \
-  --max-rows 2048
+  --max-rows 2048 \
+  --layer-prefetch-bytes 17179869184
 ```
 
 The family-neutral native engine resolves a thin model adapter, loads the
@@ -217,6 +218,16 @@ not the run fingerprint or final artifact semantics. Each committed layer also
 records load/upload, execution, capture-write, collector-finish, part-sync/hash,
 and total pre-checkpoint time; the same timing history is copied into the final
 artifact for throughput and resume ETA analysis.
+
+Network-backed sources use a bounded one-layer lookahead by default. After
+layer N is GPU-resident, a family-neutral worker reads layer N+1's canonical
+physical source ranges into the operating-system page cache while N executes.
+The worker uses one fixed 8 MiB staging buffer, never consumes the logical read
+ledger, and waits only for any unfinished tail before N+1 uploads. The default
+budget is 16 GiB with a live 32 GiB host-memory reserve; use
+`--layer-prefetch-bytes 0` to disable it. Checkpoints record prefetched bytes,
+background read time, foreground wait time, submission time, and errors, while
+older timing checkpoints remain resume-compatible.
 
 On unified-memory systems, completed safetensor ranges receive mapping-level
 `MADV_DONTNEED` plus a backing-file cache hint after their synchronous GPU
