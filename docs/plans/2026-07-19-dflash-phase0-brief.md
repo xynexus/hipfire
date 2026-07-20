@@ -46,10 +46,35 @@ serial ~112–115, pipelined ~97–98). Async XRT submit+fence exists on npu1
 (`NpuKernel::submit_synced`/`wait`) — no worker thread needed; this resolves the
 seam scope's §9 open question. Single-in-flight: while dispatch d streams, the
 CPU rescales d−1 and packs d+1's A stripes. Parity **bit-identical** to serial
-(`--pipeline-check`). Caveat: A-pack inflates ~14→20 ms under overlap — CPU
-packing contends with NPU weight streaming on the shared **Phoenix UMA bus** — so
-the win is bounded below the ~77 ms naive ceiling. The `M_TILE=16` GEMM
-double-stream is the remaining lever. NOTE the 185.4 ms row is the all-NPU path,
+(`--pipeline-check`).
+
+**⚠ THE 111.9 / ~97 ms NUMBERS ARE NO-CACHE. The composed CACHED 9B wall is
+~82 ms (task #38, `ef3c17462`)** — `--gemm multicore --cpu-primitives
+--ctx-cache --pipeline-glue --attn flash`, warm 81.9/82.0, ctx_misses=0, cache
+bit-identical. **That is BELOW the ~100 ms verify wall — the 9B fits its real
+budget under overlap, no kernel change.** Threading the glue (task #39,
+`b1367291d`, `--thread-glue --thread-pack`) trims another ~4% → **~81.4 ms p50**;
+`--thread-quant` REGRESSES (rayon overhead at 16 rows on the critical path).
+
+**Two levers here turned out MOOT / small — both measured, not assumed:**
+- **`M_TILE=16` double-stream is MOOT in the cached loop.** Every warm-loop r14
+  GEMM (`qkv`/`o`/`gateup`/`down`) runs at exactly 16 rows = M_TILE → single
+  weight pass. The only 32-row GEMMs (`fc`, `kv`) are the context projections the
+  cache removes from the per-cycle path. Do NOT rebuild the kernel for it.
+- **Glue threading buys ~4% and tail-smoothing, not more** — the cached wall is
+  **NPU-weight-streaming-bound** (warm `npu_busy` ~46 ms sits exactly at the int4
+  bandwidth floor, 482 MB/cycle ÷ ~10.4 GB/s), not host-glue-bound. Counter to
+  the #30 worry, threading the A-pack **MITIGATES** UMA contention (16→11 ms
+  under overlap), it does not worsen it.
+
+**CPU isolation (isolcpus/cpuset) NOT warranted — measured (task #39):** block
+wall p99 is within ~4% of p50 in every config; threading tightens the spread to
+~3.6% (at the ~3.4% run-to-run noise floor). No tail pathology to fix, and blunt
+CPU isolation risks starving the XRT/amdxdna completion threads.
+
+**The real remaining GEMM lever is the ~46 ms int4 bandwidth floor** — fewer
+weight bytes (lower bits, acceptance-gated) or r135 route-concurrency (~1.25×) —
+plus the ~6 ms serial submit ioctl. NOTE the 185.4 ms row is the all-NPU path,
 kept as the flag default and reproducible.
 
 **TOKENS/S REALITY CHECK (task #31, `benchmarks/results/dflash-npu-tokps-reality-check-20260720.md`) — the 9B is NOT permanently negative on Phoenix.** Measured, no runtime wiring:
@@ -326,9 +351,13 @@ by expected payoff, with the GEMM assumed to stay on the NPU:
    ioctl (~7 ms/block). Caveat: A-pack contends with weight streaming on the UMA
    bus (~14→20 ms under overlap), so the win is below the ~77 ms naive ceiling.
 
-4. **Thread the remaining glue across cores.** `quantize_row` and the int32→f32
-   rescale are per-row / per-element independent and currently one core. rayon is
-   already a dep (`crates/hipfire-xdna/src/opus.rs`). Near-linear on 8 cores.
+4. ~~**Thread the remaining glue across cores.**~~ **DONE (task #39,
+   `b1367291d`, `--thread-glue`/`--thread-pack`/`--thread-quant`).** ~4% wall
+   (84.9 → 81.4 ms p50) + tail-smoothing, NOT near-linear — the cached wall is
+   NPU-bandwidth-bound, not host-bound. rescale 6.5→5.6, pack 16→11 (threading
+   the pack MITIGATES UMA contention, refuting the #30 worry); `--thread-quant`
+   REGRESSES (rayon overhead at 16 rows on the critical path). p99 within ~4% of
+   p50 → CPU isolation not warranted.
 
 Not moving: attention (7 ms, wants NPU parallelism) and the GEMM (by assumption).
 Structural/later: draft block N+1 on CPU while the GPU verifies block N (the
