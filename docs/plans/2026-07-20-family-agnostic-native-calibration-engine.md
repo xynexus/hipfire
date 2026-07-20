@@ -1215,6 +1215,30 @@ decode, and host-to-device upload before considering pinned host staging or
 GPU double buffering. Kernel changes come after those measurements and land
 one lever at a time.
 
+## Completion audit — 2026-07-21 04:30 AWST
+
+This table evaluates the numbered definition of done below. "Mechanism proven"
+does not mean the production artifact or admission ladder is complete.
+
+| Item | Status | Authoritative evidence / missing proof |
+|---|---|---|
+| 1. Family-resolved native CLI | Proven | Qwen3.5 and Gemma3-text registry/factory tests plus successful architecture-selected dry runs and real streams; no family CLI flag exists. |
+| 2. Complete 397B teacher artifact | In progress | The durable production stream has 31 of 60 layer checkpoints. No final `.calib.hfq` exists yet, so finalizer, KLDREF, complete ledger, and all-layer telemetry are not proven. |
+| 3. Second and only target-source pass | Pending | The target `Qwen3.5-397B-A17B.oq4.25++.hfq` does not exist. The quantizer join is implemented and bounded Gemma join evidence exists, but the production source pass has not run. |
+| 4. Per-layer/per-expert floor | Mechanism proven; production pending | Unit/GPU capture tests and the first 31 production layers reconcile K=10 routing. Preserve-undercovered records real deficits, but the complete 60-layer fallback set is not available until finalization. |
+| 5. Frozen telemetry and quantizer refusal | Mechanism proven; production pending | Artifact schemas, fingerprints, quota telemetry, strict/preserve policy, and high-precision enforcement tests pass. The final production artifact and quantizer evidence are absent. |
+| 6. Independent batched state and chosen geometry | Proven on gfx1151 | Ragged independent-state scheduler tests and the Qwen layer-0 batch/row sweeps select batch 64, time tile 32, and 2,048 rows for this host. |
+| 7. Shared grouped-MoE substrate | Mechanism proven; serving gate pending | Scratch/routing/capture live in `hipfire-runtime`, the routed executor in `hipfire-dispatch`, and Qwen admits K=8/K=10. Production exercises raw K=10; matched grouped-versus-reference serving parity remains required after the GPU is free. |
+| 8. Second family | Proven | Gemma3-text uses the same engine/CLI, completed a 62-layer pause/resume stream, and completed a bounded calibrated second-pass join without a generic family branch. |
+| 9. Resident/streamed parity and quality | Pending | Mechanism tests are not a substitute for matched resident-versus-streamed Qwen/Gemma KLD/PPL. The controlled expert floor/cap sweeps and held-out comparisons have not run. |
+| 10. Precision portability | Partial | BF16/F16 conversion tests and raw grouped-kernel compile coverage pass for RDNA2/3/4 and CDNA targets. Only gfx1151 has channel execution evidence; admitted-path execution or an honest rejection is still needed on the remaining classes. |
+| 11. Native workflow documentation | Proven | `MODEL-INDUCTION.md` and `QUANTIZE.md` name native calibration as default, Python as oracle/tooling only, and `oq4.25++` as the default quant. |
+
+Induction artifacts match that audit: both typed DFlash sidecars exist and the
+manifest records the DFlash stage complete; the calibration, target quant, and
+TriAttention artifacts are absent, while the induction manifest remains a
+valid partial-stage journal rather than claiming overall completion.
+
 ## Definition of done
 
 The calibration engine is complete when:
