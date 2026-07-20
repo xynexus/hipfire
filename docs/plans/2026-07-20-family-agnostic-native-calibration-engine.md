@@ -32,6 +32,12 @@ Implemented and verified in this checkout:
   OQ4 plus BF16/F16 expert execution, and canonical paged OQ4 expert layout;
 - native two-pass orchestration, atomic recipe manifests, artifact fingerprints,
   interrupted-run resume, and quantizer enforcement of high-precision fallback;
+- explicit two-pass/induction provenance for the expert activation floor,
+  capture target and tile, required expert fraction, deterministic sampling
+  seed, and strict versus preserve-undercovered policy; every control is
+  forwarded to the native command and participates in the recipe fingerprint,
+  with a cross-wrapper test preventing the induction and quantization
+  fingerprints from drifting;
 - durable per-layer phase timing for source load/upload, teacher execution,
   capture serialization, collector finalization, and part sync/hash, persisted
   in checkpoints and the completed artifact for resume-safe ETA analysis;

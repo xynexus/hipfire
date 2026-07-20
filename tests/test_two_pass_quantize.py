@@ -13,6 +13,12 @@ SPEC.loader.exec_module(two_pass)
 def test_default_quant_format_is_mixed_oq425_double_plus():
     assert two_pass.DEFAULT_QUANT_FORMAT == "oq4.25++"
     assert two_pass.DEFAULT_LAYER_PREFETCH_BYTES == 16 * 1024**3
+    assert two_pass.DEFAULT_MIN_EXPERT_ACTIVATIONS == 2048
+    assert two_pass.DEFAULT_EXPERT_CAPTURE_TARGET == 4096
+    assert two_pass.DEFAULT_EXPERT_CAPTURE_TILE_ROWS == 256
+    assert two_pass.DEFAULT_REQUIRED_EXPERT_FRACTION == 1.0
+    assert two_pass.DEFAULT_SAMPLING_SEED == 1
+    assert two_pass.DEFAULT_EXPERT_COVERAGE_POLICY == "preserve-undercovered"
 
 
 def test_build_commands_use_one_layer_streamed_teacher_pass_then_quantize(tmp_path):
@@ -35,6 +41,12 @@ def test_build_commands_use_one_layer_streamed_teacher_pass_then_quantize(tmp_pa
         max_rows=2048,
         layer_prefetch_bytes=16 * 1024**3,
         kldref_topk=64,
+        min_expert_activations=2048,
+        expert_capture_target=4096,
+        expert_capture_tile_rows=256,
+        required_expert_fraction=1.0,
+        sampling_seed=1,
+        expert_coverage_policy="preserve-undercovered",
         quant_args=["--awq", "--ldlq"],
     )
 
@@ -48,6 +60,11 @@ def test_build_commands_use_one_layer_streamed_teacher_pass_then_quantize(tmp_pa
     assert collect_cmd[collect_cmd.index("--time-tile") + 1] == "32"
     assert collect_cmd[collect_cmd.index("--max-rows") + 1] == "2048"
     assert collect_cmd[collect_cmd.index("--layer-prefetch-bytes") + 1] == str(16 * 1024**3)
+    assert collect_cmd[collect_cmd.index("--min-expert-activations") + 1] == "2048"
+    assert collect_cmd[collect_cmd.index("--expert-capture-target") + 1] == "4096"
+    assert collect_cmd[collect_cmd.index("--expert-capture-tile-rows") + 1] == "256"
+    assert collect_cmd[collect_cmd.index("--required-expert-fraction") + 1] == "1.0"
+    assert collect_cmd[collect_cmd.index("--sampling-seed") + 1] == "1"
     assert quant_cmd == [
         "target/release/hipfire-quantize",
         "--input",
@@ -89,6 +106,12 @@ def test_recipe_fingerprint_changes_with_inputs_but_not_dict_order(tmp_path):
         max_rows=512,
         layer_prefetch_bytes=16 * 1024**3,
         kldref_topk=64,
+        min_expert_activations=2048,
+        expert_capture_target=4096,
+        expert_capture_tile_rows=256,
+        required_expert_fraction=1.0,
+        sampling_seed=1,
+        expert_coverage_policy="preserve-undercovered",
         quant_args=["--awq", "--ldlq"],
     )
     second = two_pass.recipe_manifest(
@@ -104,6 +127,12 @@ def test_recipe_fingerprint_changes_with_inputs_but_not_dict_order(tmp_path):
         max_rows=512,
         layer_prefetch_bytes=16 * 1024**3,
         kldref_topk=64,
+        min_expert_activations=2048,
+        expert_capture_target=4096,
+        expert_capture_tile_rows=256,
+        required_expert_fraction=1.0,
+        sampling_seed=1,
+        expert_coverage_policy="preserve-undercovered",
         quant_args=["--awq", "--ldlq"],
     )
     assert first == second
@@ -122,12 +151,47 @@ def test_recipe_fingerprint_changes_with_inputs_but_not_dict_order(tmp_path):
         max_rows=1024,
         layer_prefetch_bytes=8 * 1024**3,
         kldref_topk=64,
+        min_expert_activations=1024,
+        expert_capture_target=8192,
+        expert_capture_tile_rows=128,
+        required_expert_fraction=0.75,
+        sampling_seed=7,
+        expert_coverage_policy="strict",
         quant_args=["--awq", "--ldlq"],
     )
     assert changed["recipe_fingerprint"] != first["recipe_fingerprint"]
     assert first["time_tile"] == 32
     assert first["max_rows"] == 512
     assert first["layer_prefetch_bytes"] == 16 * 1024**3
+    assert first["min_expert_activations"] == 2048
+    assert first["expert_capture_target"] == 4096
+    assert first["expert_capture_tile_rows"] == 256
+    assert first["required_expert_fraction"] == 1.0
+    assert first["sampling_seed"] == 1
+    assert first["expert_coverage_policy"] == "preserve_undercovered"
+
+    changed_quality_policy = two_pass.recipe_manifest(
+        model=Path("/models/snapshot"),
+        calib=tmp_path / "model.calib.hfq",
+        output=tmp_path / "model.oq4++.hfq",
+        quant_format="oq4++",
+        corpus=corpus,
+        n_sequences=128,
+        ctx_len=2048,
+        batch_size=16,
+        time_tile=64,
+        max_rows=1024,
+        layer_prefetch_bytes=8 * 1024**3,
+        kldref_topk=64,
+        min_expert_activations=1024,
+        expert_capture_target=4096,
+        expert_capture_tile_rows=128,
+        required_expert_fraction=0.75,
+        sampling_seed=7,
+        expert_coverage_policy="preserve-undercovered",
+        quant_args=["--awq", "--ldlq"],
+    )
+    assert changed_quality_policy["recipe_fingerprint"] != changed["recipe_fingerprint"]
 
 
 def test_manifest_consumes_native_read_ledger_and_artifact_fingerprints(tmp_path):

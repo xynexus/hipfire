@@ -79,6 +79,15 @@ live host-memory reserve and reduces the effective budget when required.
 Override with `--layer-prefetch-bytes N`, or pass zero to disable lookahead;
 the chosen operational budget is recorded in the two-pass recipe.
 
+Expert quality controls are also explicit induction inputs rather than hidden
+calibrator defaults: `--min-expert-activations`,
+`--expert-capture-target`, `--expert-capture-tile-rows`,
+`--required-expert-fraction`, `--sampling-seed`, and
+`--expert-coverage-policy`. They are forwarded to the native pass and included
+in the two-pass recipe fingerprint. This makes strict/fallback runs and the
+planned coverage/capture sweeps distinct resumable recipes even if native CLI
+defaults later change.
+
 Mixed-precision Opus targets are supported directly. For example,
 `--format oq4.5++` keeps the `++` calibration recipe and emits canonically
 named `oq4.5++` primary and sidecar artifacts. The bitwidth must satisfy the

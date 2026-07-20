@@ -11,6 +11,12 @@ assert SPEC and SPEC.loader
 induct = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(induct)
 
+TWO_PASS_SCRIPT = Path(__file__).parents[1] / "scripts" / "two_pass_quantize.py"
+TWO_PASS_SPEC = importlib.util.spec_from_file_location("induct_two_pass_quantize", TWO_PASS_SCRIPT)
+assert TWO_PASS_SPEC and TWO_PASS_SPEC.loader
+two_pass = importlib.util.module_from_spec(TWO_PASS_SPEC)
+TWO_PASS_SPEC.loader.exec_module(two_pass)
+
 
 def _configs(tmp_path):
     target = tmp_path / "target"
@@ -90,6 +96,12 @@ def test_default_quant_format_is_mixed_oq425_double_plus():
     assert induct.DEFAULT_QUANT_FORMAT == "oq4.25++"
     assert induct.DEFAULT_DFLASH_FORMATS == ("bf16", "f16")
     assert induct.DEFAULT_LAYER_PREFETCH_BYTES == 16 * 1024**3
+    assert induct.DEFAULT_MIN_EXPERT_ACTIVATIONS == 2048
+    assert induct.DEFAULT_EXPERT_CAPTURE_TARGET == 4096
+    assert induct.DEFAULT_EXPERT_CAPTURE_TILE_ROWS == 256
+    assert induct.DEFAULT_REQUIRED_EXPERT_FRACTION == 1.0
+    assert induct.DEFAULT_SAMPLING_SEED == 1
+    assert induct.DEFAULT_EXPERT_COVERAGE_POLICY == "preserve-undercovered"
 
 
 def test_mixed_opus_format_keeps_calibration_recipe_and_canonical_name(tmp_path):
@@ -122,6 +134,12 @@ def test_commands_compose_existing_converters_with_scoped_gpu_stages(tmp_path):
         max_rows=2048,
         layer_prefetch_bytes=16 * 1024**3,
         kldref_topk=64,
+        min_expert_activations=2048,
+        expert_capture_target=4096,
+        expert_capture_tile_rows=256,
+        required_expert_fraction=1.0,
+        sampling_seed=1,
+        expert_coverage_policy="preserve-undercovered",
         triattn_max_tokens=100_000,
         triattn_chunk_len=1024,
         python="python3",
@@ -157,6 +175,12 @@ def test_commands_compose_existing_converters_with_scoped_gpu_stages(tmp_path):
     assert target_cmd[target_cmd.index("--time-tile") + 1] == "32"
     assert target_cmd[target_cmd.index("--max-rows") + 1] == "2048"
     assert target_cmd[target_cmd.index("--layer-prefetch-bytes") + 1] == str(16 * 1024**3)
+    assert target_cmd[target_cmd.index("--min-expert-activations") + 1] == "2048"
+    assert target_cmd[target_cmd.index("--expert-capture-target") + 1] == "4096"
+    assert target_cmd[target_cmd.index("--expert-capture-tile-rows") + 1] == "256"
+    assert target_cmd[target_cmd.index("--required-expert-fraction") + 1] == "1.0"
+    assert target_cmd[target_cmd.index("--sampling-seed") + 1] == "1"
+    assert target_cmd[target_cmd.index("--expert-coverage-policy") + 1] == "preserve-undercovered"
     assert target_cmd[-2:] == ["--awq", "--ldlq"]
     triattn = commands["triattn"][0]
     assert triattn[:6] == [
@@ -225,6 +249,59 @@ def test_target_resume_requires_matching_two_pass_provenance(tmp_path):
     assert not induct.target_stage_complete(paths, "sha256:different")
 
 
+def test_induction_target_fingerprint_matches_two_pass_recipe(tmp_path):
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("calibration text")
+    paths = induct.artifact_layout(tmp_path, "Qwen3.5-397B-A17B", "oq4.25++", ["bf16", "f16"])
+    target = tmp_path / "target"
+    target.mkdir()
+    common = {
+        "target": target,
+        "corpus": corpus,
+        "paths": paths,
+        "quant_format": "oq4.25++",
+        "n_sequences": 128,
+        "ctx_len": 2048,
+        "batch_size": 64,
+        "time_tile": 32,
+        "max_rows": 2048,
+        "layer_prefetch_bytes": 16 * 1024**3,
+        "kldref_topk": 64,
+        "min_expert_activations": 2048,
+        "expert_capture_target": 4096,
+        "expert_capture_tile_rows": 256,
+        "required_expert_fraction": 1.0,
+        "sampling_seed": 1,
+        "expert_coverage_policy": "preserve-undercovered",
+        "quant_args": ["--awq", "--ldlq"],
+    }
+
+    induction_fingerprint = induct._target_recipe_fingerprint(**common)
+    two_pass_recipe = two_pass.recipe_manifest(
+        model=target,
+        calib=paths["calib"],
+        output=paths["model"],
+        quant_format=common["quant_format"],
+        corpus=corpus,
+        n_sequences=common["n_sequences"],
+        ctx_len=common["ctx_len"],
+        batch_size=common["batch_size"],
+        time_tile=common["time_tile"],
+        max_rows=common["max_rows"],
+        layer_prefetch_bytes=common["layer_prefetch_bytes"],
+        kldref_topk=common["kldref_topk"],
+        min_expert_activations=common["min_expert_activations"],
+        expert_capture_target=common["expert_capture_target"],
+        expert_capture_tile_rows=common["expert_capture_tile_rows"],
+        required_expert_fraction=common["required_expert_fraction"],
+        sampling_seed=common["sampling_seed"],
+        expert_coverage_policy=common["expert_coverage_policy"],
+        quant_args=common["quant_args"],
+    )
+
+    assert induction_fingerprint == two_pass_recipe["recipe_fingerprint"]
+
+
 def test_main_dry_run_prints_native_two_pass_plan_without_running_tools(tmp_path, monkeypatch, capsys):
     target, draft = _configs(tmp_path)
     corpus = tmp_path / "corpus.txt"
@@ -260,3 +337,9 @@ def test_main_dry_run_prints_native_two_pass_plan_without_running_tools(tmp_path
     assert "Qwen3.5-397B-A17B-F16.dflash.hfq" in output
     assert "--format oq4.25++" in output
     assert f"--layer-prefetch-bytes {16 * 1024**3}" in output
+    assert "--min-expert-activations 2048" in output
+    assert "--expert-capture-target 4096" in output
+    assert "--expert-capture-tile-rows 256" in output
+    assert "--required-expert-fraction 1.0" in output
+    assert "--sampling-seed 1" in output
+    assert "--expert-coverage-policy preserve-undercovered" in output

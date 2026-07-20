@@ -21,6 +21,12 @@ from pathlib import Path
 
 DEFAULT_QUANT_FORMAT = "oq4.25++"
 DEFAULT_LAYER_PREFETCH_BYTES = 16 * 1024**3
+DEFAULT_MIN_EXPERT_ACTIVATIONS = 2048
+DEFAULT_EXPERT_CAPTURE_TARGET = 4096
+DEFAULT_EXPERT_CAPTURE_TILE_ROWS = 256
+DEFAULT_REQUIRED_EXPERT_FRACTION = 1.0
+DEFAULT_SAMPLING_SEED = 1
+DEFAULT_EXPERT_COVERAGE_POLICY = "preserve-undercovered"
 
 
 def build_commands(
@@ -39,6 +45,12 @@ def build_commands(
     max_rows: int,
     layer_prefetch_bytes: int,
     kldref_topk: int,
+    min_expert_activations: int,
+    expert_capture_target: int,
+    expert_capture_tile_rows: int,
+    required_expert_fraction: float,
+    sampling_seed: int,
+    expert_coverage_policy: str,
     quant_args: list[str],
 ) -> tuple[list[str], list[str]]:
     collect_cmd = [
@@ -65,8 +77,18 @@ def build_commands(
         "--kldref",
         "--kldref-topk",
         str(kldref_topk),
+        "--min-expert-activations",
+        str(min_expert_activations),
+        "--expert-capture-target",
+        str(expert_capture_target),
+        "--expert-capture-tile-rows",
+        str(expert_capture_tile_rows),
+        "--required-expert-fraction",
+        str(required_expert_fraction),
+        "--sampling-seed",
+        str(sampling_seed),
         "--expert-coverage-policy",
-        "preserve-undercovered",
+        expert_coverage_policy,
         "--resume",
     ]
     quant_cmd = [
@@ -121,6 +143,12 @@ def recipe_manifest(
     max_rows: int,
     layer_prefetch_bytes: int,
     kldref_topk: int,
+    min_expert_activations: int,
+    expert_capture_target: int,
+    expert_capture_tile_rows: int,
+    required_expert_fraction: float,
+    sampling_seed: int,
+    expert_coverage_policy: str,
     quant_args: list[str],
 ) -> dict:
     recipe = {
@@ -137,7 +165,12 @@ def recipe_manifest(
         "max_rows": max_rows,
         "layer_prefetch_bytes": layer_prefetch_bytes,
         "kldref_topk": kldref_topk,
-        "expert_coverage_policy": "preserve_undercovered",
+        "min_expert_activations": min_expert_activations,
+        "expert_capture_target": expert_capture_target,
+        "expert_capture_tile_rows": expert_capture_tile_rows,
+        "required_expert_fraction": required_expert_fraction,
+        "sampling_seed": sampling_seed,
+        "expert_coverage_policy": expert_coverage_policy.replace("-", "_"),
         "quant_args": quant_args,
     }
     encoded = json.dumps(recipe, sort_keys=True, separators=(",", ":")).encode()
@@ -267,6 +300,32 @@ def main() -> None:
     )
     parser.add_argument("--kldref-topk", type=int, default=64)
     parser.add_argument(
+        "--min-expert-activations",
+        type=int,
+        default=DEFAULT_MIN_EXPERT_ACTIVATIONS,
+    )
+    parser.add_argument(
+        "--expert-capture-target",
+        type=int,
+        default=DEFAULT_EXPERT_CAPTURE_TARGET,
+    )
+    parser.add_argument(
+        "--expert-capture-tile-rows",
+        type=int,
+        default=DEFAULT_EXPERT_CAPTURE_TILE_ROWS,
+    )
+    parser.add_argument(
+        "--required-expert-fraction",
+        type=float,
+        default=DEFAULT_REQUIRED_EXPERT_FRACTION,
+    )
+    parser.add_argument("--sampling-seed", type=int, default=DEFAULT_SAMPLING_SEED)
+    parser.add_argument(
+        "--expert-coverage-policy",
+        choices=("strict", "preserve-undercovered"),
+        default=DEFAULT_EXPERT_COVERAGE_POLICY,
+    )
+    parser.add_argument(
         "--coexistence",
         default="target/release/hipfire-coexistence",
         help="Native compatibility/calibration tool used for pass 1.",
@@ -286,12 +345,28 @@ def main() -> None:
         parser.error("--calib must end in .calib.hfq")
     if not args.output.name.endswith(".hfq"):
         parser.error("--output must end in .hfq")
-    if min(args.n_sequences, args.ctx_len, args.batch_size, args.time_tile, args.max_rows, args.kldref_topk) < 1:
+    if min(
+        args.n_sequences,
+        args.ctx_len,
+        args.batch_size,
+        args.time_tile,
+        args.max_rows,
+        args.kldref_topk,
+        args.min_expert_activations,
+        args.expert_capture_target,
+        args.expert_capture_tile_rows,
+    ) < 1:
         parser.error("sequence, context, geometry, and top-k values must be positive")
     if args.batch_size * args.time_tile > args.max_rows:
         parser.error("--batch-size * --time-tile must not exceed --max-rows")
     if args.layer_prefetch_bytes < 0:
         parser.error("--layer-prefetch-bytes must be nonnegative")
+    if args.expert_capture_target < args.min_expert_activations:
+        parser.error("--expert-capture-target must be at least --min-expert-activations")
+    if not 0.0 < args.required_expert_fraction <= 1.0:
+        parser.error("--required-expert-fraction must be in (0, 1]")
+    if args.sampling_seed < 0:
+        parser.error("--sampling-seed must be nonnegative")
     manifest_path = args.manifest or args.output.with_suffix(".two-pass.json")
     corpus = Path(args.corpus)
     recipe = recipe_manifest(
@@ -307,6 +382,12 @@ def main() -> None:
         max_rows=args.max_rows,
         layer_prefetch_bytes=args.layer_prefetch_bytes,
         kldref_topk=args.kldref_topk,
+        min_expert_activations=args.min_expert_activations,
+        expert_capture_target=args.expert_capture_target,
+        expert_capture_tile_rows=args.expert_capture_tile_rows,
+        required_expert_fraction=args.required_expert_fraction,
+        sampling_seed=args.sampling_seed,
+        expert_coverage_policy=args.expert_coverage_policy,
         quant_args=quant_args,
     )
 
@@ -325,6 +406,12 @@ def main() -> None:
         max_rows=args.max_rows,
         layer_prefetch_bytes=args.layer_prefetch_bytes,
         kldref_topk=args.kldref_topk,
+        min_expert_activations=args.min_expert_activations,
+        expert_capture_target=args.expert_capture_target,
+        expert_capture_tile_rows=args.expert_capture_tile_rows,
+        required_expert_fraction=args.required_expert_fraction,
+        sampling_seed=args.sampling_seed,
+        expert_coverage_policy=args.expert_coverage_policy,
         quant_args=quant_args,
     )
     collect_exec, quant_exec = scope_gpu_commands(args.hipfire, collect_cmd, quant_cmd)

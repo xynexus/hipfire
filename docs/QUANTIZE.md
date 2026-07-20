@@ -180,6 +180,12 @@ target/release/hipfire-coexistence calibrate \
   --sequence-batch 64 \
   --time-tile 32 \
   --max-rows 2048 \
+  --min-expert-activations 2048 \
+  --expert-capture-target 4096 \
+  --expert-capture-tile-rows 256 \
+  --required-expert-fraction 1.0 \
+  --sampling-seed 1 \
+  --expert-coverage-policy preserve-undercovered \
   --layer-prefetch-bytes 17179869184
 ```
 
@@ -286,7 +292,10 @@ scopes pass 2 under `hipfire lock run` without nesting locks. It writes an atomi
 fingerprints. Use `--skip-calib` to resume pass 2 from an existing artifact,
 and `--dry-run` to inspect both commands without loading the model. Geometry is
 part of the two-pass recipe fingerprint, so a resume cannot silently change its
-sequence batch, time tile, or row budget.
+sequence batch, time tile, or row budget. The expert activation floor, capture
+target/tile, required fraction, deterministic sampling seed, and strict versus
+preserve-undercovered policy are also explicit two-pass options and recipe
+fields, so quality-policy changes cannot reuse stale calibration provenance.
 
 Large quantization runs spill completed tensors to the output filesystem to
 bound RAM. During final HFQ assembly on Linux, each spill range is hole-punched
