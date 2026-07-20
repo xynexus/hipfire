@@ -20,10 +20,14 @@ Implemented and verified in this checkout:
   scheduling, F32 RAM/mmap boundary stores, tensor plans, read ledger, resume,
   KLDREF packing, and canonical calibration metadata;
 - registered Qwen3.5 and Gemma3-text source adapters selected by architecture
-  metadata rather than a family-specific CLI option;
+  metadata rather than a family-specific CLI option, with registry tests for
+  unique architecture ownership and factory/implementation identity;
 - per-layer/per-expert gate-up and down telemetry, the 2,048-row hard floor,
   strict and preserve-undercovered policies, and routing-aware tile admission
   with seen/admitted/slack/quota-skipped accounting;
+- persisted grouped-capture cost telemetry: microbatch count, active-expert
+  sum/maximum, grouped padding rows, row-gather launches, full and final-partial
+  reduction tiles, and the routed-token point at which a layer saturated;
 - shared grouped-MoE routing/scratch/capture machinery, K=8/K=10 tests, mixed
   OQ4 plus BF16/F16 expert execution, and canonical paged OQ4 expert layout;
 - native two-pass orchestration, atomic recipe manifests, artifact fingerprints,

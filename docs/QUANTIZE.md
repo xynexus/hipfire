@@ -194,6 +194,12 @@ captured separately with per-expert coverage and tile-admission telemetry.
 Undercovered experts either fail the strict gate or are explicitly listed for
 BF16/F16 preservation.
 
+The routed telemetry includes grouped microbatch count, active-expert
+sum/maximum, padding rows, capture-gather launches, full and final-partial
+reduction tiles, and the routed-token saturation point. This makes capture
+batch economics inspectable from the artifact instead of reconstructing them
+from aggregate expert hits.
+
 The CLI's automatic geometry ceiling is 2,048 rows. It probes the adapter's
 layer/state/scratch estimate against live VRAM and verifies the candidate with
 a real allocation, falling back to a smaller geometry where required. A gfx1151

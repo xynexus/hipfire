@@ -30,6 +30,13 @@ calibration is one source-checkpoint pass. `scripts/two_pass_quantize.py`
 composes it with the existing safetensors quantizer pass and records the ledger
 and artifact fingerprints in an atomic resume manifest.
 
+Layer telemetry also persists the cost shape behind routed capture: grouped
+microbatch count, active-expert sum/maximum, padding rows, gather launches,
+full reduction tiles, final partial tiles, and the routed-token point where all
+expert roles reached the capture limit. New fields default safely when older
+resume checkpoints are loaded; those records remain explicitly distinguishable
+with `launch_telemetry_recorded=false`.
+
 Qwen3.5 and Gemma3 provide thin adapters to the same engine. Mechanism tests,
 including grouped expert capture and mixed OQ4 plus BF16/F16 execution, pass on
 gfx1151. A full Qwen3.5-397B production artifact and matched quality/admission

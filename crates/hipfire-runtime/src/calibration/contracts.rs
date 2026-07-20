@@ -672,11 +672,20 @@ impl WeightStats {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ExpertCaptureStats {
     pub seen_rows: u64,
     pub admitted_rows: u64,
     pub batch_slack_rows: u64,
     pub quota_skipped_rows: u64,
+    /// Number of row-gather launches used to fill persistent reduction tiles.
+    pub capture_gather_launches: u64,
+    /// Distinguishes legacy/resident telemetry from the streamed tile path.
+    pub launch_telemetry_recorded: bool,
+    /// Complete reduction tiles launched during normal microbatch processing.
+    pub full_reduction_tiles: u64,
+    /// Final nonempty partial tiles launched at corpus exhaustion.
+    pub partial_reduction_tiles: u64,
     pub full_weight: WeightStats,
     pub admitted_weight: WeightStats,
 }
@@ -688,10 +697,16 @@ pub enum CaptureAdmission {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LayerRouterStats {
     pub routed_tokens: u64,
     pub routed_slots: u64,
     pub dropped_indices: u64,
+    pub microbatches: u64,
+    pub active_expert_sum: u64,
+    pub max_active_experts: usize,
+    pub padded_routed_rows: u64,
+    pub saturated_after_routed_tokens: Option<u64>,
     pub top1_hits: Vec<u64>,
     pub topk_hits: Vec<u64>,
     pub route_weights: Vec<WeightStats>,
@@ -753,11 +768,22 @@ impl LayerRouterStats {
             routed_tokens: 0,
             routed_slots: 0,
             dropped_indices: 0,
+            microbatches: 0,
+            active_expert_sum: 0,
+            max_active_experts: 0,
+            padded_routed_rows: 0,
+            saturated_after_routed_tokens: None,
             top1_hits: vec![0; num_experts],
             topk_hits: vec![0; num_experts],
             route_weights: vec![WeightStats::default(); num_experts],
             cooccurrence: BTreeMap::new(),
         }
+    }
+}
+
+impl Default for LayerRouterStats {
+    fn default() -> Self {
+        Self::new(0)
     }
 }
 
@@ -883,6 +909,80 @@ impl ExpertTelemetry {
                     *stats.cooccurrence.entry(key).or_insert(0) += 1;
                 }
             }
+        }
+        Ok(())
+    }
+
+    pub fn record_grouped_batch_shape(
+        &mut self,
+        layer: usize,
+        total_slots: usize,
+        padded_rows: usize,
+        active_experts: usize,
+    ) -> Result<(), CalibError> {
+        self.validate_layer(layer)?;
+        if padded_rows < total_slots || active_experts > self.num_experts {
+            return Err(CalibError::InvalidRouting(format!(
+                "grouped batch shape slots={total_slots}, padded={padded_rows}, active={active_experts} is invalid for {} experts",
+                self.num_experts
+            )));
+        }
+        let stats = &mut self.router[layer];
+        stats.microbatches = stats.microbatches.saturating_add(1);
+        stats.active_expert_sum = stats
+            .active_expert_sum
+            .saturating_add(active_experts as u64);
+        stats.max_active_experts = stats.max_active_experts.max(active_experts);
+        stats.padded_routed_rows = stats
+            .padded_routed_rows
+            .saturating_add((padded_rows - total_slots) as u64);
+        Ok(())
+    }
+
+    pub fn record_capture_launches(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        role: ExpertCaptureRole,
+        gather_launches: usize,
+        full_reduction_tiles: usize,
+    ) -> Result<(), CalibError> {
+        self.validate_layer(layer)?;
+        self.validate_expert(expert)?;
+        let index = self.capture_index(layer, expert, role);
+        let stats = &mut self.capture[index];
+        stats.launch_telemetry_recorded = true;
+        stats.capture_gather_launches = stats
+            .capture_gather_launches
+            .saturating_add(gather_launches as u64);
+        stats.full_reduction_tiles = stats
+            .full_reduction_tiles
+            .saturating_add(full_reduction_tiles as u64);
+        Ok(())
+    }
+
+    pub fn record_partial_reduction_tile(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        role: ExpertCaptureRole,
+    ) -> Result<(), CalibError> {
+        self.validate_layer(layer)?;
+        self.validate_expert(expert)?;
+        let index = self.capture_index(layer, expert, role);
+        self.capture[index].partial_reduction_tiles = self.capture[index]
+            .partial_reduction_tiles
+            .saturating_add(1);
+        Ok(())
+    }
+
+    pub fn mark_layer_saturated_if_complete(&mut self, layer: usize) -> Result<(), CalibError> {
+        self.validate_layer(layer)?;
+        if self.layer_capture_saturated(layer)
+            && self.router[layer].saturated_after_routed_tokens.is_none()
+        {
+            self.router[layer].saturated_after_routed_tokens =
+                Some(self.router[layer].routed_tokens);
         }
         Ok(())
     }
@@ -1048,6 +1148,22 @@ impl ExpertTelemetry {
                             "layer {layer} expert {expert} {role}: batch slack {} does not match admitted-above-target rows {expected_slack}",
                             stats.batch_slack_rows
                         )));
+                    }
+                    if stats.launch_telemetry_recorded {
+                        let tile_rows = self.quota.tile_rows as u64;
+                        let expected_full_tiles = stats.admitted_rows / tile_rows;
+                        let expected_partial_tiles =
+                            u64::from(stats.admitted_rows % tile_rows != 0);
+                        if stats.full_reduction_tiles != expected_full_tiles
+                            || stats.partial_reduction_tiles != expected_partial_tiles
+                        {
+                            return Err(CalibError::InvalidCapture(format!(
+                                "layer {layer} expert {expert} {role}: reduction tiles full={} partial={} do not match admitted rows {} at tile width {tile_rows}",
+                                stats.full_reduction_tiles,
+                                stats.partial_reduction_tiles,
+                                stats.admitted_rows,
+                            )));
+                        }
                     }
                 }
             }
@@ -1562,6 +1678,39 @@ mod tests {
             .unwrap();
         let error = telemetry.reconcile().unwrap_err().to_string();
         assert!(error.contains("down_input"));
+    }
+
+    #[test]
+    fn legacy_telemetry_json_defaults_new_launch_and_batch_counters() {
+        let capture: ExpertCaptureStats = serde_json::from_value(serde_json::json!({
+            "seen_rows": 3,
+            "admitted_rows": 3,
+            "batch_slack_rows": 0,
+            "quota_skipped_rows": 0,
+            "full_weight": {"count": 3, "sum": 3.0, "sum_squared": 3.0},
+            "admitted_weight": {"count": 3, "sum": 3.0, "sum_squared": 3.0}
+        }))
+        .unwrap();
+        assert_eq!(capture.capture_gather_launches, 0);
+        assert!(!capture.launch_telemetry_recorded);
+        assert_eq!(capture.full_reduction_tiles, 0);
+        assert_eq!(capture.partial_reduction_tiles, 0);
+
+        let router: LayerRouterStats = serde_json::from_value(serde_json::json!({
+            "routed_tokens": 3,
+            "routed_slots": 3,
+            "dropped_indices": 0,
+            "top1_hits": [3],
+            "topk_hits": [3],
+            "route_weights": [{"count": 3, "sum": 3.0, "sum_squared": 3.0}],
+            "cooccurrence": {}
+        }))
+        .unwrap();
+        assert_eq!(router.microbatches, 0);
+        assert_eq!(router.active_expert_sum, 0);
+        assert_eq!(router.max_active_experts, 0);
+        assert_eq!(router.padded_routed_rows, 0);
+        assert_eq!(router.saturated_after_routed_tokens, None);
     }
 
     #[test]

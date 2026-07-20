@@ -173,8 +173,12 @@ impl GroupedMoeCalibrationCapture {
                 state.pending.len()
             )));
         }
-        state.telemetry.reconcile()?;
-        Ok(state.staging.drain_partials())
+        let GroupedCaptureState {
+            telemetry, staging, ..
+        } = &mut *state;
+        let partials = finalize_capture_staging(telemetry, staging)?;
+        telemetry.reconcile()?;
+        Ok(partials)
     }
 }
 
@@ -531,6 +535,12 @@ pub fn record_grouped_router_batch(
     route_weights: &[f32],
 ) -> Result<(), CalibError> {
     validate_batch_contract(telemetry, None, layer, routing, route_weights)?;
+    telemetry.record_grouped_batch_shape(
+        layer,
+        routing.total_slots,
+        routing.m_total,
+        routing.live_experts(),
+    )?;
     let indices = flat_expert_indices(routing)?;
     for row in 0..routing.rows {
         let start = row * routing.k_top;
@@ -594,16 +604,29 @@ pub fn plan_grouped_expert_capture(
         admitted_rows += admitted;
         batch_slack_rows += slack;
         if admitted != 0 {
-            actions.extend(staging.stage(
+            let expert_actions = staging.stage(
                 layer,
                 expert,
                 role,
                 routing.offsets[expert],
                 admitted,
                 source_row_div,
-            )?);
+            )?;
+            telemetry.record_capture_launches(
+                layer,
+                expert,
+                role,
+                expert_actions.len(),
+                expert_actions
+                    .iter()
+                    .filter(|action| action.flush_full_tile)
+                    .count(),
+            )?;
+            actions.extend(expert_actions);
         }
     }
+
+    telemetry.mark_layer_saturated_if_complete(layer)?;
 
     Ok(GroupedExpertCapturePlan {
         layer,
@@ -615,6 +638,17 @@ pub fn plan_grouped_expert_capture(
         admissions,
         actions,
     })
+}
+
+fn finalize_capture_staging(
+    telemetry: &mut ExpertTelemetry,
+    staging: &mut ExpertCaptureStaging,
+) -> Result<Vec<PartialCaptureTile>, CalibError> {
+    let partials = staging.drain_partials();
+    for partial in &partials {
+        telemetry.record_partial_reduction_tile(partial.layer, partial.expert, partial.role)?;
+    }
+    Ok(partials)
 }
 
 fn validate_batch_contract(
@@ -819,6 +853,14 @@ mod tests {
             ),
             (6, 4, 2)
         );
+        assert_eq!(stats.capture_gather_launches, 3);
+        assert_eq!(stats.full_reduction_tiles, 2);
+        assert_eq!(stats.partial_reduction_tiles, 0);
+        let router = &telemetry.layer_snapshot(0).unwrap().router;
+        assert_eq!(router.microbatches, 2);
+        assert_eq!(router.active_expert_sum, 2);
+        assert_eq!(router.max_active_experts, 1);
+        assert_eq!(router.padded_routed_rows, 26);
     }
 
     #[test]
@@ -854,6 +896,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(down.batch_slack_rows, 1);
+        assert_eq!(
+            telemetry
+                .layer_snapshot(0)
+                .unwrap()
+                .router
+                .saturated_after_routed_tokens,
+            Some(6)
+        );
+        telemetry.reconcile().unwrap();
+    }
+
+    #[test]
+    fn finalization_records_one_partial_reduction_per_nonempty_role() {
+        let mut telemetry = ExpertTelemetry::new(1, 1, 1, quota(2, 4, 2), 8).unwrap();
+        let mut staging = ExpertCaptureStaging::new(1, 1, 2).unwrap();
+        let routing = GroupedMoeRoutingPlan::build(&[0, 0, 0], 3, 1, 1).unwrap();
+        record_grouped_router_batch(&mut telemetry, 0, &routing, &[1.0; 3]).unwrap();
+        for role in [ExpertCaptureRole::GateUpInput, ExpertCaptureRole::DownInput] {
+            plan_grouped_expert_capture(&mut telemetry, &mut staging, 0, role, &routing, &[1.0; 3])
+                .unwrap();
+        }
+
+        let partials = finalize_capture_staging(&mut telemetry, &mut staging).unwrap();
+        assert_eq!(partials.len(), 2);
+        for role in [ExpertCaptureRole::GateUpInput, ExpertCaptureRole::DownInput] {
+            let stats = telemetry.capture_stats(0, 0, role);
+            assert_eq!(stats.capture_gather_launches, 2);
+            assert_eq!(stats.full_reduction_tiles, 1);
+            assert_eq!(stats.partial_reduction_tiles, 1);
+        }
         telemetry.reconcile().unwrap();
     }
 

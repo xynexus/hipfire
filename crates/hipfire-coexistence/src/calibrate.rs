@@ -2607,6 +2607,25 @@ mod tests {
     }
 
     #[test]
+    fn calibration_adapter_registry_has_unique_arches_and_matching_factories() {
+        let mut registered_arches = std::collections::BTreeSet::new();
+        for registration in ADAPTERS {
+            assert!(!registration.family.is_empty());
+            assert!(!registration.version.is_empty());
+            assert!(!registration.arch_ids.is_empty());
+            let adapter = (registration.factory)();
+            assert_eq!(adapter.family(), registration.family);
+            assert_eq!(adapter.adapter_version(), registration.version);
+            for &arch_id in registration.arch_ids {
+                assert!(
+                    registered_arches.insert(arch_id),
+                    "architecture {arch_id} has more than one calibration adapter"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn explicit_and_auto_geometry_obey_row_budget() {
         let mut options = CalibrationOptions::default();
         options.max_rows = 128;
