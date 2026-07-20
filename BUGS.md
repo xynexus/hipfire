@@ -4,6 +4,14 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
+## Stale DFlash gate guidance
+
+The automatic DFlash gate was removed in `96afc6149`, but nested `AGENTS.md`
+files, agent skills, README sections, and active plans still contain mandatory
+or canonical `coherence-gate-dflash.sh` guidance, including obsolete `scripts/`
+paths. Update normative references to the tiny affected-model gate while
+retaining intentional manual-diagnostic and historical references.
+
 ## bfp16 GEMM: AMD `mm_bfp.cc` reference kernel fails peano legalization
 
 **Toolchain gap, not ours.** The vendored AMD aie2p bfp16 GEMM
