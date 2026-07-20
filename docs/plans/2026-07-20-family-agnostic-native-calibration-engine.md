@@ -168,6 +168,17 @@ the layer committed in 148.84 seconds. That layer observed K=10 routes with zero
 invalid or duplicate rows; 42 experts were below the 2,048-row floor (minimum
 309), and all 42 were recorded for high-precision preservation.
 
+Exclude the later layer-20 checkpoint from performance comparisons. A full
+no-GPU CI run and the multi-architecture `hipcc` portability check ran on the
+host concurrently with that layer. Its complete 13.15 GB staged payload was
+still consumed with a 4-microsecond foreground wait and the read ledger stayed
+duplicate-free, but background read time rose to 173.34 seconds, GPU upload to
+91.79 seconds, teacher execution to 321.20 seconds, and checkpoint time to
+414.56 seconds. It remains valid correctness/coverage evidence (K=10, zero
+invalid routes, matched gate-up/down counts, 110 explicitly preserved experts),
+not an idle-host throughput sample. Keep subsequent production layers free of
+unrelated builds or host-load experiments before using them for tuning.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
