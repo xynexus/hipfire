@@ -4244,6 +4244,13 @@ fn acquire_gpu_lock() -> Option<hipfire_lock::FlockGuard> {
 /// per-symbol width and the on-disk packing change. `beam` is the beam-search
 /// width — 128 is near-Viterbi; smaller trades a little quality for a large
 /// encode speedup (the beam search is the offline bottleneck on big models).
+/// Opt-in: trellis the untied lm_head/output under QTIP formats instead of
+/// keeping it Q8F16. Set `HIPFIRE_QTIP_LM_HEAD=1`. Default off preserves the
+/// measured gather-friendly Q8F16 head (see `pack_qtip_real_tensors`).
+fn qtip_trellis_lm_head_enabled() -> bool {
+    std::env::var("HIPFIRE_QTIP_LM_HEAD").ok().as_deref() == Some("1")
+}
+
 fn pack_qtip_real_tensors(
     tensors: &mut Vec<HfqTensor>,
     qtip_cb: &[f32],
@@ -4252,6 +4259,11 @@ fn pack_qtip_real_tensors(
     lowrank_r: usize,
     bits: u32,
     beam: usize,
+    // When true, an UNTIED lm_head / output.weight (a [vocab × dim] matmul, not a
+    // gather) is trellised like the transformer weights instead of kept Q8F16.
+    // The embedding table (`embed_tokens`) always stays gather-friendly (Q8F16);
+    // tied models have no separate head tensor so the flag is a no-op there.
+    trellis_lm_head: bool,
 ) {
     assert!(
         bits == 3 || bits == 4,
@@ -4301,14 +4313,15 @@ fn pack_qtip_real_tensors(
     // bf16 erased the transformer-weight savings (measured: qtip3 40.9 tok/s
     // vs mq4 57.4 with bf16 lm_head). Quantize it Q8F16 (gather-friendly,
     // 1 B/w), matching what the mq4 path does for tied embed/lm_head.
+    // The embedding table is always gather-accessed → Q8F16. The untied
+    // lm_head/output is a matmul: keep it Q8F16 by default, but trellis it when
+    // `trellis_lm_head` is set (it then falls through to the packing loop below).
+    let is_embed_table = |n: &str| n.contains("embed");
+    let is_untied_head = |n: &str| n.contains("lm_head") || n.ends_with("output.weight");
     let mut n_q8 = 0usize;
     for t in tensors.iter_mut() {
-        if !(matches!(t.quant_type, QuantType::BF16)
-            && t.shape.len() == 2
-            && (t.name.contains("embed")
-                || t.name.contains("lm_head")
-                || t.name.ends_with("output.weight")))
-        {
+        let force_q8 = is_embed_table(&t.name) || (is_untied_head(&t.name) && !trellis_lm_head);
+        if !(matches!(t.quant_type, QuantType::BF16) && t.shape.len() == 2 && force_q8) {
             continue;
         }
         let wf: Vec<f32> = t
@@ -4338,11 +4351,15 @@ fn pack_qtip_real_tensors(
     let mut new_sidecars: Vec<HfqTensor> = Vec::new();
     let mut n_lr = 0usize;
     for t in tensors.iter_mut() {
+        // Trellis every BF16 2D weight with k%256==0, except the embedding table
+        // (always gather → Q8F16 above). The untied lm_head/output is trellised
+        // only when `trellis_lm_head` is set (else it was Q8F16'd above and is no
+        // longer BF16 here).
+        let trellis_ok = !is_embed_table(&t.name) && (!is_untied_head(&t.name) || trellis_lm_head);
         if !(matches!(t.quant_type, QuantType::BF16)
             && t.shape.len() == 2
             && (t.shape[1] as usize) % 256 == 0
-            && !t.name.contains("embed")
-            && !t.name.contains("lm_head"))
+            && trellis_ok)
         {
             continue;
         }
@@ -4663,6 +4680,7 @@ fn run_hfq_source_pipeline(
                 .unwrap_or(0),
             bits,
             qtip_beam_width(),
+            qtip_trellis_lm_head_enabled(),
         );
         // Recount rewritten params: the post-pass changes quant types after the
         // per-tensor loop above bumped the counter for the BF16 staging.
@@ -11532,6 +11550,7 @@ fn main() {
                 .unwrap_or(0),
             qtip_bits,
             qtip_beam_width(),
+            qtip_trellis_lm_head_enabled(),
         );
     }
 
