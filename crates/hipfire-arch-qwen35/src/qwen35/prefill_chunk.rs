@@ -2437,7 +2437,7 @@ pub(crate) fn forward_prefill_chunk(
                         "LA qkvza F16/BF16 dispatch requires all of wqkv/wz/w_beta/w_alpha to be F16",
                     );
                     if f16_prefill_wmma {
-                        gemm_fp16_or_bf16_x_f32_wmma(
+                        gemm_raw_x_f32_auto(
                             gpu,
                             &layer.wqkv.buf,
                             &pbs.x_rot_batch,
@@ -2446,7 +2446,7 @@ pub(crate) fn forward_prefill_chunk(
                             layer.wqkv.k,
                             n,
                         )?;
-                        gemm_fp16_or_bf16_x_f32_wmma(
+                        gemm_raw_x_f32_auto(
                             gpu,
                             &layer.wz.buf,
                             &pbs.x_rot_batch,
@@ -2455,7 +2455,7 @@ pub(crate) fn forward_prefill_chunk(
                             layer.wz.k,
                             n,
                         )?;
-                        gemm_fp16_or_bf16_x_f32_wmma(
+                        gemm_raw_x_f32_auto(
                             gpu,
                             &layer.w_beta.buf,
                             &pbs.x_rot_batch,
@@ -2464,7 +2464,7 @@ pub(crate) fn forward_prefill_chunk(
                             layer.w_beta.k,
                             n,
                         )?;
-                        gemm_fp16_or_bf16_x_f32_wmma(
+                        gemm_raw_x_f32_auto(
                             gpu,
                             &layer.w_alpha.buf,
                             &pbs.x_rot_batch,
@@ -3129,7 +3129,7 @@ pub(crate) fn forward_prefill_chunk(
                     )?;
                 } else if wo_is_f16 {
                     if f16_prefill_wmma {
-                        gemm_fp16_or_bf16_x_f32_wmma_residual_batched(
+                        gemm_raw_x_f32_residual_batched_auto(
                             gpu,
                             &layer.wo.buf,
                             wo_input,
@@ -3362,7 +3362,7 @@ pub(crate) fn forward_prefill_chunk(
                         "LA FFN F16/BF16 dispatch requires both w_gate and w_up to be F16",
                     );
                     if f16_prefill_wmma {
-                        gemm_fp16_or_bf16_x_f32_wmma(
+                        gemm_raw_x_f32_auto(
                             gpu,
                             &layer.w_gate.buf,
                             &pbs.x_rot_batch,
@@ -3371,7 +3371,7 @@ pub(crate) fn forward_prefill_chunk(
                             layer.w_gate.k,
                             n,
                         )?;
-                        gemm_fp16_or_bf16_x_f32_wmma(
+                        gemm_raw_x_f32_auto(
                             gpu,
                             &layer.w_up.buf,
                             &pbs.x_rot_batch,
@@ -3622,7 +3622,7 @@ pub(crate) fn forward_prefill_chunk(
                     )?;
                 } else if w_down_is_f16 {
                     if f16_prefill_wmma {
-                        gemm_fp16_or_bf16_x_f32_wmma_residual_batched(
+                        gemm_raw_x_f32_residual_batched_auto(
                             gpu,
                             &layer.w_down.buf,
                             &pbs.ffn_hidden_batch,
@@ -4009,7 +4009,7 @@ pub(crate) fn forward_prefill_chunk(
                     );
                 } else if qkv_is_f16 && qkv_same_dtype {
                     if f16_prefill_wmma {
-                        gemm_fp16_or_bf16_x_f32_wmma(
+                        gemm_raw_x_f32_auto(
                             gpu,
                             &layer.wq.buf,
                             &pbs.x_rot_batch,
@@ -4018,7 +4018,7 @@ pub(crate) fn forward_prefill_chunk(
                             layer.wq.k,
                             n,
                         )?;
-                        gemm_fp16_or_bf16_x_f32_wmma(
+                        gemm_raw_x_f32_auto(
                             gpu,
                             &layer.wk.buf,
                             &pbs.x_rot_batch,
@@ -4027,7 +4027,7 @@ pub(crate) fn forward_prefill_chunk(
                             layer.wk.k,
                             n,
                         )?;
-                        gemm_fp16_or_bf16_x_f32_wmma(
+                        gemm_raw_x_f32_auto(
                             gpu,
                             &layer.wv.buf,
                             &pbs.x_rot_batch,
@@ -5061,7 +5061,7 @@ pub(crate) fn forward_prefill_chunk(
                     )?;
                 } else if fa_wo_is_f16 {
                     if f16_prefill_wmma {
-                        gemm_fp16_or_bf16_x_f32_wmma_residual_batched(
+                        gemm_raw_x_f32_residual_batched_auto(
                             gpu,
                             &layer.wo.buf,
                             fa_wo_input,
@@ -5290,7 +5290,7 @@ pub(crate) fn forward_prefill_chunk(
                         "FA FFN F16/BF16 dispatch requires both w_gate and w_up to be F16",
                     );
                     if f16_prefill_wmma {
-                        gemm_fp16_or_bf16_x_f32_wmma(
+                        gemm_raw_x_f32_auto(
                             gpu,
                             &layer.w_gate.buf,
                             &pbs.x_rot_batch,
@@ -5299,7 +5299,7 @@ pub(crate) fn forward_prefill_chunk(
                             layer.w_gate.k,
                             n,
                         )?;
-                        gemm_fp16_or_bf16_x_f32_wmma(
+                        gemm_raw_x_f32_auto(
                             gpu,
                             &layer.w_up.buf,
                             &pbs.x_rot_batch,
@@ -5474,7 +5474,7 @@ pub(crate) fn forward_prefill_chunk(
                     )?;
                 } else if fa_w_down_is_f16 {
                     if f16_prefill_wmma {
-                        gemm_fp16_or_bf16_x_f32_wmma_residual_batched(
+                        gemm_raw_x_f32_residual_batched_auto(
                             gpu,
                             &layer.w_down.buf,
                             &pbs.ffn_hidden_batch,
