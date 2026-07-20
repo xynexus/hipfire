@@ -143,8 +143,8 @@ The deployable form loses to existing mq4. No Phase 3.
 4. **Only remaining avenue (speculative): cross-model.** Both failures are on a
    0.8B. A 7B/9B has more redundancy — 2-bit might become viable AND the shared-
    rotation penalty might shrink (a bigger residual stream may admit a better
-   single rotation). Requires a fresh Hessian (~1–3 h collect via
-   `scripts/collect_hessian.py`) + a slower sweep. Given two clean negatives
+   single rotation). Requires a fresh native `.calib.hfq` (~1–3 h collect via
+   `hipfire-coexistence calibrate`) + a slower sweep. Given two clean negatives
    here, pursue only if there's an independent reason to expect big models to
    differ qualitatively. Not auto-run.
 

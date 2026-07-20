@@ -251,19 +251,12 @@ verified**. Final-session work:
   Correctness is token-count-independent (the consistency check holds at any N),
   so this is a full-size, real-disk validation of the focus model.
 
-- **Importance/KLD sweep re-run — DEFERRED (scoped follow-up, not done).** The
-  prior sweep tooling (`scripts/roughquant_ablation_oracle.sh`, task #9) reads the
-  **old binary** Hessian (`HIPFIRE_QTIP_HESSIAN=<model>.hessian.bin`) and is
-  0.8B-specific (hard-coded model path, 39-rank per-channel ablation × full
-  `perplexity` KLD eval). Re-running it on a fresh model needs, in order:
-  1. a **format bridge** — the quantizer/`perplexity` path consumes the legacy
-     `.hessian.bin`, not the new `.calib.hfq`; either teach them to read the HFQM
-     `<name>.hessian` tensors (preferred) or add a `hfq extract`→`.hessian.bin`
-     shim;
-  2. a per-model `DUMP_RANK` diag rank-map (the sweep's input);
-  3. the ablation loop itself (expensive on 9B/A3B: ~39 quant+PPL evals).
-  This is a research investigation (not autonomous build work) and is gated on
-  step 1 — left as a documented follow-up rather than rabbit-holed.
+- **Importance/KLD sweep bridge — RESOLVED.** The quantizer reads canonical
+  `<name>.hessian` tensors directly from `.calib.hfq`; no HFHS extraction shim
+  is needed. `scripts/roughquant_ablation_oracle.sh` was parameterized and the
+  9B rerun is recorded in `docs/roughquant/9b-importance-generality.md`. Legacy
+  `.hessian.bin` inputs remain historical fixtures only and must not be produced
+  by new workflows.
 
 ## f32 vs f64 Hessian accumulation (measured — f32 is sufficient)
 

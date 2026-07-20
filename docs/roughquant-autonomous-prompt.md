@@ -38,18 +38,19 @@ missing inputs:
   (models--<org>--<name>/snapshots/<hash>/). Check it BEFORE downloading
   anything. Available includes Qwen3 0.6B/1.7B/4B/8B/14B/30B-A3B,
   Qwen2.5 0.5B/3B/7B/14B, LFM2.5, etc.
-- Existing Hessian: ~/.hipfire/hessians/qwen3.5-0.8b.hessian.bin. A 0.8B model
-  is fine for the NUMERICS gate (Phases 1–2) — PPL deltas at sub-4-bit are
-  visible at this size — but it is NOT a valid vehicle for tok/s figures.
-  IMPORTANT: a Hessian is tied to the exact model it was collected from (tensor
-  names/shapes must match). Locate the qwen3.5-0.8b safetensors that this
-  sidecar corresponds to before running PPL against it; if it can't be found,
-  regenerate the sidecar against a model you DO have (next bullet).
-- Generating a new Hessian sidecar: scripts/collect_hessian.py
-  (--model <hf-dir> --output <out.hessian.bin> --n-sequences 128 --ctx-len 2048
-  --corpus wikitext). NOTE: the Rust crates/.../bin/collect_hessian.rs is still
-  unimplemented!() — use the Python script (offline tooling, allowed). It writes
-  the HFHS-v1 format that hessian_io.rs reads unchanged.
+- Historical Hessian fixture:
+  `~/.hipfire/hessians/qwen3.5-0.8b.hessian.bin`. This retired HFHS artifact is
+  valid only for reproducing the recorded 0.8B experiment; do not use its name
+  or format as a template for new work. A 0.8B model is fine for the NUMERICS
+  gate (Phases 1–2), but it is NOT a valid vehicle for tok/s figures. Every
+  calibration artifact is tied to the exact source, tokenizer, corpus, and
+  sample geometry recorded in its metadata.
+- Generate new calibration natively:
+  `target/release/hipfire-coexistence calibrate --model <hf-dir> --corpus <corpus.txt> --output <name>.calib.hfq --sequences 128 --context 2048 --kldref --kldref-topk 64`.
+  The canonical HFQM package contains Hessians, imatrices, provenance, and the
+  matched KLDREF in one layer-streamed source pass. Use
+  `scripts/collect_hessian.py` only as an explicit parity/debug oracle, never as
+  the production forward or a producer for a new legacy sidecar.
 - Generating an .hfq to run PPL: hipfire-quantize --input <model_dir> --output
   <out.hfq> [--format mq4]. Use the existing formats as the 4-bit-uniform and
   QTIP baselines to compare RoughQuant against.
@@ -59,9 +60,10 @@ missing inputs:
   Qwen2.5-7B), collect ITS Hessian, and produce real tok/s there.
 
 WHERE THE REUSE LIVES (verified to exist — start here, don't reinvent):
-- C = XᵀX Hessian I/O: crates/hipfire-quantize/src/hessian_io.rs
-  (HessianSidecar::open/get, HessianRef::iter_f64/at, check_symmetry/
-  positive_diagonal). One artifact → P (eigenvectors=rotation),
+- C = XᵀX Hessian I/O: `crates/hipfire-quantize/src/hessian_io.rs` reads the
+  canonical `<tensor>.hessian` entries in `.calib.hfq`
+  (`HessianSidecar::open/get`, `HessianRef::iter_f64/at`, symmetry and positive
+  diagonal checks). One artifact → P (eigenvectors=rotation),
   eigenvalues (importance bins), and LDLQ feedback.
 - LDLQ / GPTQ: crates/hipfire-quantize/src/{ldlq.rs,gptq.rs}
 - QTIP trellis (low-tier format): crates/hipfire-quantize/src/qtip.rs
@@ -72,7 +74,9 @@ WHERE THE REUSE LIVES (verified to exist — start here, don't reinvent):
 - PPL harness: crates/hipfire-runtime/examples/perplexity.rs
   (model.hfq + corpus.txt --ctx --warmup --offset; 2K tokens sees sub-4-bit
   deltas, 8K+ for stable second decimal). KLD refs: build_kld_ref*.rs.
-- Coherence gates: tests/coherence-gate.sh, tests/coherence-gate-dflash.sh.
+- Automatic affected-model correctness gate: `tests/tiny-affected-gate.sh
+  --require-coverage`. `tests/coherence-gate-dflash.sh` remains a manual
+  DFlash/DDTree diagnostic, not a mandatory gate.
 - Fresh-probe perf: scripts/probe_commits.sh.
 - Eval batteries: crates/hipfire-eval (model/runtime evidence belongs here per
   AGENTS.md, not in ad-hoc scripts).

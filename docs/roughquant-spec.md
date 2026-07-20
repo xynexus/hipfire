@@ -112,9 +112,9 @@ weight-only quant), `W ∈ ℝ^{d×d_out}`.
 
 ## hipfire reuse
 
-- **Calibration / `C = XᵀX`:** the per-layer Hessian the LDLQ path already
-  collects (HFHS sidecar). One artifact → `P` (rotation), eigenvalues (importance
-  bins), and LDLQ feedback.
+- **Calibration / `C = XᵀX`:** the per-layer Hessian emitted in the canonical
+  native HFQM `<model>.calib.hfq` package. One artifact → `P` (rotation),
+  eigenvalues (importance bins), LDLQ feedback, and matched KLDREF.
 - **Within-tier Hadamard:** existing `cpu_fwht_256` + FWHT GEMV machinery.
 - **Low-tier format:** QTIP-3/2 trellis (the within-tier rotation Gaussianizes →
   codebook valid). Mid tiers: MQ4/Q8. Top: fp32/bf16 dense.

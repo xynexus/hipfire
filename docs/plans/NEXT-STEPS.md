@@ -445,9 +445,11 @@ Papers + reference implementations vendored for Phases C/D:
     2-bit Lloyd). So QTIP-LDLQ = **swap that path's Lloyd scalar quantizer
     for the trellis `beam_encode_group` on the feedback-adjusted target.**
     Steps & exact design (scoped 2026-06-16):
-    - **Hessians:** native `collect_hessian` is a SCAFFOLD (panics) — use the
-      Tier-2 Python collector `scripts/collect_hessian.py` (torch CPU-only
-      here, so slow; offline tooling, Rule-1-OK). HFHS read by `hessian_io.rs`.
+    - **Hessians (superseded 2026-07-21):** use
+      `hipfire-coexistence calibrate` to write the canonical `.calib.hfq` with
+      Hessians, imatrices, provenance, and optional matched KLDREF in one native
+      layer-streamed pass. `scripts/collect_hessian.py` is now only a parity
+      oracle; do not create new HFHS sidecars.
     - **CORRECTION (2026-06-16): `gptq.rs` + `hessian_io.rs` are ORPHANED** —
       never declared as modules (no `mod gptq;`), and `gptq.rs` uses `faer`
       which isn't a dependency, so they don't compile. NOT reusable infra as-is.
