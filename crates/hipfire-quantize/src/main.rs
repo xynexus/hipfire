@@ -3193,6 +3193,18 @@ fn normalize_format_flag(flag: &str) -> String {
     flag.trim().to_ascii_lowercase()
 }
 
+fn removed_opus_format_replacement(format: &str) -> Option<&'static str> {
+    match format {
+        "op4" | "op4-4" => Some("oq4"),
+        "op4+" | "op4-4+" | "op4-8+" => Some("oq4+"),
+        "op4++" | "op4-4++" | "op4-8++" => Some("oq4++"),
+        "op8" | "op8-16" | "op8g256" | "oq8g256" => Some("oq8"),
+        "op8+" | "op8-16+" | "op8-plus" | "oq8-plus" => Some("oq8+"),
+        "op8++" | "op8-16++" => Some("oq8++"),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OqCalibrationRecipe {
     Plain,
@@ -5716,6 +5728,12 @@ fn main() {
 
     let format_arg = format_arg(&args);
     let requested_format = normalize_format_flag(format_arg);
+    if let Some(replacement) = removed_opus_format_replacement(&requested_format) {
+        eprintln!(
+            "error: --format {requested_format} was removed; use the canonical --format {replacement}"
+        );
+        std::process::exit(2);
+    }
     if npu_embedding && requested_format != "oq8+" {
         eprintln!(
             "error: --npu-embedding currently requires --format oq8+ (got {requested_format})"
@@ -13964,6 +13982,21 @@ mod tests {
         assert_eq!(normalize_format_flag(" BF16 "), "bf16");
         assert_eq!(normalize_format_flag("Mq4G256"), "mq4g256");
         assert_eq!(normalize_format_flag("OQ4+"), "oq4+");
+    }
+
+    #[test]
+    fn removed_opus_aliases_have_canonical_replacements() {
+        for (legacy, canonical) in [
+            ("op4", "oq4"),
+            ("op4+", "oq4+"),
+            ("op4++", "oq4++"),
+            ("op8", "oq8"),
+            ("op8+", "oq8+"),
+            ("op8++", "oq8++"),
+        ] {
+            assert_eq!(removed_opus_format_replacement(legacy), Some(canonical));
+        }
+        assert_eq!(removed_opus_format_replacement("oq4.25++"), None);
     }
 
     #[test]
