@@ -101,6 +101,50 @@ class AstreaTests(unittest.TestCase):
         buf += b"\0" * sum(item[4] for item in tensors)
         path.write_bytes(buf)
 
+    def write_minimal_hfq_v2(self, path):
+        tensors = [
+            ("layers.0.attn_q.weight", 4, [2, 2], 0, b"abc"),
+            ("layers.0.attn_k.weight", 4, [2, 2], 0, b"defgh"),
+        ]
+        metadata = json.dumps(
+            {"architecture": "qwen3.5", "quantization_hash": {"value": "fixture"}},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        index_size = 4 + sum(
+            2 + len(name.encode("utf-8")) + 2 + 4 * len(shape) + 4 + 8 + 8
+            for name, _, shape, _, _ in tensors
+        )
+        data_offset = (32 + len(metadata) + index_size + 4095) & ~4095
+        payload_offsets = []
+        cursor = data_offset
+        for _, _, _, _, payload in tensors:
+            cursor = (cursor + 31) & ~31
+            payload_offsets.append(cursor)
+            cursor += len(payload)
+
+        index = bytearray(struct.pack("<I", len(tensors)))
+        for (name, quant_type, shape, group_size, payload), offset in zip(
+            tensors, payload_offsets
+        ):
+            raw_name = name.encode("utf-8")
+            index += struct.pack("<H", len(raw_name))
+            index += raw_name
+            index += struct.pack("<BB", quant_type, len(shape))
+            index += b"".join(struct.pack("<I", dim) for dim in shape)
+            index += struct.pack("<IQ", group_size, len(payload))
+            index += struct.pack("<Q", offset // 32)
+
+        buf = bytearray(
+            struct.pack("<4sIIIQQ", b"HFQM", 2, 6, len(tensors), 32, data_offset)
+        )
+        buf += metadata
+        buf += index
+        buf += b"\0" * (data_offset - len(buf))
+        for (_, _, _, _, payload), offset in zip(tensors, payload_offsets):
+            buf += b"\0" * (offset - len(buf))
+            buf += payload
+        path.write_bytes(buf)
+
     def write_hfqm_imatrix(self, path, tensors, *, tokens=4):
         metadata = json.dumps(
             {
@@ -350,6 +394,22 @@ class AstreaTests(unittest.TestCase):
             "model.language_model.layers.0.mlp.gate_proj.weight",
         )
         self.assertEqual(result["tensors"][0]["data_offset"], result["data_offset"])
+
+    def test_summarize_hfq_reads_v2_explicit_aligned_offsets(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            model = Path(td) / "synthetic-v2.hfq"
+            self.write_minimal_hfq_v2(model)
+
+            result = astrea.summarize_hfq(model)
+
+        self.assertEqual(result["version"], 2)
+        self.assertTrue(result["data_end_matches_file_size"])
+        self.assertEqual(result["tensors"][0]["data_offset"], result["data_offset"])
+        self.assertEqual(result["tensors"][1]["data_offset"] % 32, 0)
+        self.assertGreater(
+            result["tensors"][1]["data_offset"], result["tensors"][0]["data_offset"]
+        )
 
     def test_summarize_hfq_names_current_mq_container_qtypes(self):
         astrea = load_astrea()

@@ -615,6 +615,7 @@ def read_hfq_index(path, *, max_tensors=32):
             tensor_map = {}
             all_names = []
             quant_type_counts = {}
+            data_end = data_offset
             cumulative_offset = data_offset
             for i in range(n_tensors):
                 name_len = struct.unpack_from("<H", mm, pos)[0]
@@ -633,6 +634,20 @@ def read_hfq_index(path, *, max_tensors=32):
                 pos += 4
                 data_size = struct.unpack_from("<Q", mm, pos)[0]
                 pos += 8
+                if version >= 2:
+                    if pos + 8 > data_offset:
+                        raise ValueError(f"HFQ v2 tensor {name} is missing its payload offset")
+                    offset_div32 = struct.unpack_from("<Q", mm, pos)[0]
+                    pos += 8
+                    tensor_data_offset = offset_div32 * 32
+                else:
+                    tensor_data_offset = cumulative_offset
+                tensor_data_end = tensor_data_offset + data_size
+                if tensor_data_offset < data_offset or tensor_data_end > len(mm):
+                    raise ValueError(
+                        f"HFQ tensor {name} payload range "
+                        f"{tensor_data_offset}..{tensor_data_end} exceeds the file"
+                    )
 
                 quant_type_name = HFQ_QUANT_TYPE_NAMES.get(quant_type, f"UNKNOWN_{quant_type}")
                 item = {
@@ -641,7 +656,7 @@ def read_hfq_index(path, *, max_tensors=32):
                     "quant_type_name": quant_type_name,
                     "shape": shape,
                     "group_size": group_size,
-                    "data_offset": cumulative_offset,
+                    "data_offset": tensor_data_offset,
                     "data_size": data_size,
                 }
                 all_names.append(name)
@@ -649,7 +664,8 @@ def read_hfq_index(path, *, max_tensors=32):
                 quant_type_counts[quant_type_name] = quant_type_counts.get(quant_type_name, 0) + 1
                 if i < max_tensors:
                     tensors.append(dict(item))
-                cumulative_offset += data_size
+                cumulative_offset = tensor_data_end
+                data_end = max(data_end, tensor_data_end)
 
             names_md5 = hashlib.md5("\n".join(all_names).encode("utf-8")).hexdigest()
             summary = {
@@ -660,9 +676,9 @@ def read_hfq_index(path, *, max_tensors=32):
                 "tensor_count": n_tensors,
                 "metadata_offset": metadata_offset,
                 "data_offset": data_offset,
-                "data_end": cumulative_offset,
+                "data_end": data_end,
                 "file_bytes": len(mm),
-                "data_end_matches_file_size": cumulative_offset == len(mm),
+                "data_end_matches_file_size": data_end == len(mm),
                 "metadata": metadata_summary(metadata),
                 "quant_type_counts": dict(sorted(quant_type_counts.items())),
                 "tensor_names_md5": names_md5,
