@@ -1,6 +1,22 @@
 # TODO: bf16/f16 quantize does not split 3D-stacked MoE experts
 
-**Status:** open (pre-existing, surfaced 2026-07-20 by the qwen35 MoE OQ work).
+**Status:** RESOLVED 2026-07-20 (commit `f6d031b7e`). See "Fix (landed)" below.
+
+## Fix (landed)
+
+Root cause was broader than expected: `can_direct_stream_source_precision`
+gated on `use_source_precision` (= `use_fp16 || use_bf16`), and `use_bf16` also
+covers the qtip-sim / roughquant-sim / *-real families. The zero-copy stream
+therefore (a) kept 3D-stacked MoE experts stacked (unloadable), and (b) skipped
+the f32 perturbation for simulation formats (qtip3-sim(calib) KLD → 0). Fixed by
+restricting the fast path to a **pure** bf16/fp16 passthrough
+(`format == bf16 | bfloat16 | fp16`) AND non-stacked-MoE archs (`!is_moe`);
+everything else falls through to the main quantize loop, which perturbs/splits
+and still emits BF16/F16 per expert. `tiny-quant-gate: PASS` (all 26 cells).
+
+---
+
+_Original report (pre-existing, surfaced 2026-07-20 by the qwen35 MoE OQ work):_
 
 ## Symptom
 
