@@ -229,6 +229,53 @@ The budget scales with target size AND SO DOES THE DRAFTER (×2.72 vs ×1.65 for
 (4.14× over its own budget); 27B is ~2.1× over its own. The integration plumbing
 is architecture-independent, so build it on 9B and swap the target.
 
+## CPU-offload levers (step-time, GEMM PINNED on the NPU)
+
+The NPU dispatch loop is **strictly serial and single-threaded on the host**
+(`dispatch_synced` + `sync_output` both block; `quantize_row` is AVX2 but
+one core, no rayon in the body harness). So CPU and NPU never run at once, and
+the CPU uses one of ~8 Zen4 cores. On Phoenix UMA there is **no transfer cost** —
+an "upload" is a cache flush — which is what makes host offload cheap. Levers,
+by expected payoff, with the GEMM assumed to stay on the NPU:
+
+1. **Move the 8 primitives (rmsnorm ×2/layer, headnorm q+k, rope q+k, swiglu)
+   to the CPU.** Compounds three ways: (a) removes 23.7 ms of NPU dispatch
+   directly; (b) removes the bf16 pack/unpack glue that exists ONLY to feed them
+   across the NPU boundary (part of the 54 ms), and keeps intermediates f32 on
+   host; (c) **shrinks the NPU working set from ~10 resident kernels to ~2**,
+   which is the real prize — the thrash diagnosis is "10 warm kernels ≫ ≤5 LRU
+   slots" driving 40–46 context-misses/block and up to 2.5× wall inflation.
+   MEASURED part = the 23.7 ms + glue; the thrash recovery is the larger but
+   UNMEASURED part and is the number this work exists to get.
+
+2. **Fuse / co-resident the r14 GEMM array + attention as the pinned NPU set.**
+   The endpoint of lever 1: once the primitives are gone, the GEMM array and the
+   flash attention kernel are the ONLY NPU consumers. Pin both resident (one
+   persistent hw-context allocation, no LRU eviction between them) so a block
+   never re-faults weight/attention BOs. This is what converts lever 1's
+   working-set shrink into an actual zero-miss steady state — do it together with
+   1, since 1 without pinning still lets the two evict each other. Watch the
+   6-hwctx hard limit (`--ctx-budget 6` EINVALs; the r14 array already pins one).
+
+3. **Overlap remaining glue behind NPU weight-streaming (double-buffer).** ~60 ms
+   of the 102 ms GEMM is pure weight streaming — NPU busy, CPU idle. Pipeline so
+   the CPU quantizes the next activation and rescales the previous int32 output
+   during that window. Hides the glue that is not on the immediate dependency
+   chain.
+
+4. **Thread the remaining glue across cores.** `quantize_row` and the int32→f32
+   rescale are per-row / per-element independent and currently one core. rayon is
+   already a dep (`crates/hipfire-xdna/src/opus.rs`). Near-linear on 8 cores.
+
+Not moving: attention (7 ms, wants NPU parallelism) and the GEMM (by assumption).
+Structural/later: draft block N+1 on CPU while the GPU verifies block N (the
+"tokens after next" axis) — Phase 2 DDTree/DSpark, not this step's breakdown.
+
+**Gate for all of these:** cached-vs-recomputed / CPU-vs-NPU-primitive
+intermediates bit-identical or cos > 0.999999, AND int8 full-body cos > 0.99
+(the W4A8 path is ~0.898 by construction — gate it on acceptance rate, see
+Gates). Keep every offload flag-gated so the all-NPU path stays reproducible.
+
 ## Tasks, in order
 
 1. ~~**Wire the multi-core W4A8 GEMM into the body.**~~ **DONE** (98bbce9b6). Needs (a) an **oq4 DFlash
