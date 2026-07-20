@@ -1177,6 +1177,10 @@ Run under `hipfire lock`:
 - segmented expert reduction versus CPU;
 - Qwen one-layer streamed output versus resident output;
 - multi-session state routing versus independent serial sessions;
+- calibration-shaped routed F32 attention at 64 sequences x 32 positions,
+  2,048 context, 32 query heads, 2 KV heads, and head dimension 256 via
+  `cargo run --release -p hipfire-rdna --example
+  channel_attention_f32_routed_calibration`;
 - grouped expert output versus indexed/reference path;
 - batched KLD top-k/logZ versus CPU;
 - compile/channel coverage for gfx1010, gfx1030, gfx1100, gfx1151, gfx1201,

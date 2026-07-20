@@ -105,19 +105,26 @@ fn run(gpu: &mut Gpu, dtype: DType) {
     let activations: Vec<f32> = (0..batch * k)
         .map(|index| ((index % 31) as f32 - 15.0) * 0.005859375)
         .collect();
-    let mut weight = gpu
-        .upload_raw(&raw_bytes(&weights, dtype), &[m, k])
-        .expect("upload raw weight");
-    weight.dtype = dtype;
-    let x = gpu.upload_f32(&activations, &[batch, k]).expect("upload x");
-    let y = gpu
-        .alloc_tensor(&[batch, m], DType::F32)
-        .expect("allocate y");
+    let actual = {
+        let weight = gpu
+            .alloc_owned(&[m, k], dtype)
+            .expect("allocate raw weight");
+        gpu.hip
+            .memcpy_htod(&weight.buf, &raw_bytes(&weights, dtype))
+            .expect("upload raw weight");
+        let x = gpu
+            .upload_owned_f32(&activations, &[batch, k])
+            .expect("upload x");
+        let y = gpu
+            .alloc_owned(&[batch, m], DType::F32)
+            .expect("allocate y");
 
-    gpu.gemm_raw_x_f32_portable(&weight, &x, &y, m, k, batch)
-        .expect("portable raw GEMM");
-    gpu.device_synchronize().expect("synchronize");
-    let actual = gpu.download_f32(&y).expect("download y");
+        gpu.gemm_raw_x_f32_portable(&weight, &x, &y, m, k, batch)
+            .expect("portable raw GEMM");
+        gpu.device_synchronize().expect("synchronize");
+        gpu.download_f32(&y).expect("download y")
+    };
+    gpu.reclaim_pending();
 
     let mut max_abs = 0.0f32;
     for batch_index in 0..batch {
