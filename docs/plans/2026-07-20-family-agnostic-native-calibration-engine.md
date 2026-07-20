@@ -56,6 +56,12 @@ Implemented and verified in this checkout:
   TriAttention sidecars, calibration artifact, and two-pass manifest;
 - `./tests/no-gpu-ci.sh`, affected tiny-model GPU coverage, GPU calibration
   reduction/grouped-capture/KLD tests, and mixed/paged expert parity on gfx1151;
+- compile-only portability coverage for the family-neutral raw grouped-expert
+  fallback: `gemm_raw_moe_grouped_portable.hip` builds with `hipcc --genco`
+  for gfx1030, gfx1100, gfx1151, gfx1201, gfx942, and gfx906. This proves the
+  F16/BF16 fallback source is accepted across the intended RDNA2, RDNA3,
+  RDNA4, CDNA3, and older wave64 targets; it is not a substitute for channel
+  execution evidence on those devices;
 - an index-only dry run of the 397B source: 60 layers, 1,038 logical tensors,
   792,692,717,952 unique source bytes across 94 shards, K=10, sequence batch 4,
   time tile 64, and the complete one-read ledger contract;
