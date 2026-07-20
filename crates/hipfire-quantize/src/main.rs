@@ -7369,12 +7369,27 @@ fn main() {
         );
     }
 
-    let can_direct_stream_source_precision = use_source_precision
+    // Zero-copy source streaming is ONLY valid for a *pure* bf16/fp16 passthrough
+    // (raw source bytes copied verbatim). `use_source_precision`/`use_bf16` also
+    // cover the qtip-sim / roughquant-sim / *-real families (line ~5801), which
+    // emit bf16 but only AFTER perturbing/quantizing f32 in the main loop —
+    // streaming them verbatim silently drops that transform (e.g. qtip3-sim KLD
+    // collapses to 0 vs its reference). Restrict the fast path to the pure
+    // passthrough formats.
+    let is_pure_source_passthrough = use_fp16 || format == "bf16" || format == "bfloat16";
+    let can_direct_stream_source_precision = is_pure_source_passthrough
         && rotate_lm_head.is_none()
         && arch_id != ARCH_ID_GEMMA3_TEXT
         && arch_id != ARCH_ID_EMBEDDINGGEMMA
         && vision_quant.is_empty()
-        && !use_deepseek4_source_precision;
+        && !use_deepseek4_source_precision
+        // Stacked-MoE archs (Qwen3.5/Gemma4 `experts.{gate_up,down}_proj` as 3D
+        // [n_exp,N,K]) must NOT zero-copy stream even for pure bf16: the loader
+        // consumes per-expert 2D tensors, so streaming them stacked yields an
+        // unloadable model (`tensor not found: ...experts.0...`, e.g. a bf16 MoE
+        // KLD reference). Route them through the main quantize loop, which splits
+        // per expert and still emits BF16/F16 per expert.
+        && !is_moe;
     if can_direct_stream_source_precision {
         #[derive(Clone)]
         struct DirectSourceJob {
