@@ -251,9 +251,13 @@ hoped-for multiplier on top; the go/no-go says it is not there on this axis.
   `[0..N-1]`, GPU scatter writes the N rows post-accept. Disjointness under
   eviction/`compact_offset` (`:6938`, `:7581`) is **not confirmed from code** —
   verify or add a fence before relying on lock-free overlap.
-- **Async NPU dispatch depth unresolved.** Whether XRT on npu1 supports a clean
-  non-blocking submit+fence (vs. the worker-thread workaround) is undetermined —
-  affects the phase-4 mechanism choice.
+- ~~**Async NPU dispatch depth unresolved.**~~ **RESOLVED (task #30,
+  `990ef9fa0`): async XRT submit+fence DOES exist on npu1** —
+  `NpuKernel::submit_synced` returns a timeline `seq`, `wait(seq)` fences on the
+  syncobj, `sync_output` clears the pipelined read-back hazard. So a clean
+  non-blocking submit is available and a worker thread is not required for
+  NPU/CPU overlap. (Phase 4 is shelved regardless per the phase-2 no-go, but the
+  mechanism question it raised is now answered.)
 
 ## Critical files
 - `crates/hipfire-arch-qwen35/src/speculative.rs` — `spec_step_dflash` (:6756),

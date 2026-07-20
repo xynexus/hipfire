@@ -40,9 +40,17 @@ term measured with the kernel pinned:
 
 **With `--cpu-primitives` the wall is 111.9 ms and context-misses are ZERO**
 (task #29). Made of ~77 ms NPU (r14 GEMM-dominated + ~7 ms attention) + ~35 ms
-host glue. The `M_TILE=16` GEMM double-stream and the ~35 ms host glue
-(overlappable behind streaming, task #30) are the two levers left. NOTE the
-185.4 ms row is the all-NPU path, kept as the flag default and reproducible.
+host glue. **Adding `--pipeline-glue` (task #30, `990ef9fa0`) hides ~15–18 ms of
+that glue behind NPU weight-streaming → warm block ~97 ms** (same-lock A/B:
+serial ~112–115, pipelined ~97–98). Async XRT submit+fence exists on npu1
+(`NpuKernel::submit_synced`/`wait`) — no worker thread needed; this resolves the
+seam scope's §9 open question. Single-in-flight: while dispatch d streams, the
+CPU rescales d−1 and packs d+1's A stripes. Parity **bit-identical** to serial
+(`--pipeline-check`). Caveat: A-pack inflates ~14→20 ms under overlap — CPU
+packing contends with NPU weight streaming on the shared **Phoenix UMA bus** — so
+the win is bounded below the ~77 ms naive ceiling. The `M_TILE=16` GEMM
+double-stream is the remaining lever. NOTE the 185.4 ms row is the all-NPU path,
+kept as the flag default and reproducible.
 
 **TOKENS/S REALITY CHECK (task #31, `benchmarks/results/dflash-npu-tokps-reality-check-20260720.md`) — the 9B is NOT permanently negative on Phoenix.** Measured, no runtime wiring:
 
@@ -309,11 +317,14 @@ by expected payoff, with the GEMM assumed to stay on the NPU:
    Post-state: 112 ms ≈ ~77 ms NPU (r14-dominated + ~7 ms attention) + ~35 ms
    host glue, **0 misses**. That ~35 ms glue is now task #30's clean target.
 
-3. **Overlap remaining glue behind NPU weight-streaming (double-buffer).** ~60 ms
-   of the 102 ms GEMM is pure weight streaming — NPU busy, CPU idle. Pipeline so
-   the CPU quantizes the next activation and rescales the previous int32 output
-   during that window. Hides the glue that is not on the immediate dependency
-   chain.
+3. ~~**Overlap remaining glue behind NPU weight-streaming (double-buffer).**~~
+   **DONE (task #30, `990ef9fa0`, `--pipeline-glue`).** ~15–18 ms of ~23 ms
+   overlappable glue hides → warm block ~112 → **~97 ms**. Async XRT submit+fence
+   exists on npu1 (`NpuKernel::submit_synced`/`wait`); single-in-flight, no worker
+   thread. Bit-identical parity (`--pipeline-check`). What stayed serial: the
+   leading activation quant (~3 ms, on the layer dependency chain) and the submit
+   ioctl (~7 ms/block). Caveat: A-pack contends with weight streaming on the UMA
+   bus (~14→20 ms under overlap), so the win is below the ~77 ms naive ceiling.
 
 4. **Thread the remaining glue across cores.** `quantize_row` and the int32→f32
    rescale are per-row / per-element independent and currently one core. rayon is
