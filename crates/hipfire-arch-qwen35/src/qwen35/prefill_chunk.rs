@@ -440,6 +440,34 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     n,
                 )?;
             }
+            // Opus Quant shared expert: fused gate+up via the dense OQ WMMA keys
+            // (x_rot_batch is FWHT-rotated above, same as the MQ4 arm).
+            DType::Oq4G256 => run_fused_gate_up_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::FusedGateUpOq4G256,
+                &ffn.shared_expert.gate.buf,
+                &ffn.shared_expert.up.buf,
+                &pbs.x_rot_batch,
+                shared_gate,
+                shared_up,
+                ffn.shared_expert.gate.m,
+                ffn.shared_expert.up.m,
+                ffn.shared_expert.gate.k,
+                n,
+            )?,
+            DType::Oq8G256 => run_fused_gate_up_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::FusedGateUpOq8G256,
+                &ffn.shared_expert.gate.buf,
+                &ffn.shared_expert.up.buf,
+                &pbs.x_rot_batch,
+                shared_gate,
+                shared_up,
+                ffn.shared_expert.gate.m,
+                ffn.shared_expert.up.m,
+                ffn.shared_expert.gate.k,
+                n,
+            )?,
             other => panic!(
                 "prefill_moe_ffn_body_batched: unsupported shared_expert.gate dtype {other:?} \
                              — admit predicate should have rejected this layer"
@@ -681,6 +709,50 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     &shared_down_scratch,
                     shared_scalar,
                     ffn.shared_expert.down.m,
+                    n,
+                )?;
+            }
+            // Opus Quant shared-expert down: fused sigmoid-scaled residual GEMV.
+            // W = down.buf (dense OQ combined layout); scales are the sub-offset
+            // view after the packed weights (OQ4: M·K/2 bytes of nibbles; OQ8:
+            // M·K bytes of int8). shared_rot is FWHT(silu·mul) from step 4.
+            DType::Oq4G256 => {
+                let dm = ffn.shared_expert.down.m;
+                let dk = ffn.shared_expert.down.k;
+                let ws = ffn
+                    .shared_expert
+                    .down
+                    .buf
+                    .sub_offset(dm * (dk / 2), dm * (dk / 256) * 4);
+                gpu.gemv_oq4g256_residual_sigmoid_scaled_gpu_batched(
+                    &ffn.shared_expert.down.buf,
+                    &ws,
+                    shared_rot,
+                    &pbs.x_batch,
+                    shared_scalar,
+                    dm,
+                    dk,
+                    256,
+                    n,
+                )?;
+            }
+            DType::Oq8G256 => {
+                let dm = ffn.shared_expert.down.m;
+                let dk = ffn.shared_expert.down.k;
+                let ws = ffn
+                    .shared_expert
+                    .down
+                    .buf
+                    .sub_offset(dm * dk, dm * (dk / 256) * 4);
+                gpu.gemv_oq8g256_residual_sigmoid_scaled_gpu_batched(
+                    &ffn.shared_expert.down.buf,
+                    &ws,
+                    shared_rot,
+                    &pbs.x_batch,
+                    shared_scalar,
+                    dm,
+                    dk,
+                    256,
                     n,
                 )?;
             }
@@ -1114,6 +1186,30 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     n,
                 )?;
             }
+            // Opus Quant routed experts (indexed Path 1; no grouped-WMMA kernel).
+            // x_rot_batch is FWHT-rotated above like the MQ path.
+            DType::Oq4G256 => gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
+                &ffn.expert_gate_up_ptrs,
+                topk_indices,
+                &pbs.x_rot_batch,
+                gate_batch,
+                up_batch,
+                2 * mi,
+                gate_up_k,
+                k_top,
+                n,
+            )?,
+            DType::Oq8G256 => gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+                &ffn.expert_gate_up_ptrs,
+                topk_indices,
+                &pbs.x_rot_batch,
+                gate_batch,
+                up_batch,
+                2 * mi,
+                gate_up_k,
+                k_top,
+                n,
+            )?,
             other => panic!(
                 "prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
                              experts[0].gate_up dtype {other:?} — admit predicate should \
@@ -1464,6 +1560,26 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                 // indexed kernel (existing, shipped in 7c00970d) is
                 // rotation-agnostic; same dispatch shape as G256 sister.
                 DType::ParoQ4G128 => gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
+                    &ffn.expert_down_ptrs,
+                    topk_indices,
+                    rot_batch,
+                    down_expanded,
+                    down_m,
+                    down_k,
+                    k_top,
+                    n,
+                )?,
+                DType::Oq4G256 => gpu.gemv_oq4g256_moe_down_k8_indexed_batched_expanded(
+                    &ffn.expert_down_ptrs,
+                    topk_indices,
+                    rot_batch,
+                    down_expanded,
+                    down_m,
+                    down_k,
+                    k_top,
+                    n,
+                )?,
+                DType::Oq8G256 => gpu.gemv_oq8g256_moe_down_k8_indexed_batched_expanded(
                     &ffn.expert_down_ptrs,
                     topk_indices,
                     rot_batch,

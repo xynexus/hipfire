@@ -500,6 +500,34 @@ pub fn run_moe_decode(
             2 * p.mi,
             gate_up_k,
         ))?;
+    } else if res.routed_indexable_oq4 {
+        // Opus Quant W4A16 indexed gate_up (132 B/group MoE-block kernel; `xr`
+        // is FWHT-rotated above, same basis as the MQ path). Batched variant
+        // with batch=1 (single-token decode).
+        hip!(gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            xr,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            gate_up_k,
+            p.k,
+            1,
+        ))?;
+    } else if res.routed_indexable_oq8 {
+        // Opus Quant W8A16 indexed gate_up (260 B/group, OqPlusCompact-expanded).
+        hip!(gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            xr,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            gate_up_k,
+            p.k,
+            1,
+        ))?;
     } else {
         // routed_indexable_paro
         hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
@@ -556,6 +584,28 @@ pub fn run_moe_decode(
         ))?;
     } else if res.routed_indexable_mq6 {
         hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.rot_batch,
+            p.down_expanded,
+            down_m,
+            down_k,
+            p.k,
+            1,
+        ))?;
+    } else if res.routed_indexable_oq4 {
+        hip!(gpu.gemv_oq4g256_moe_down_k8_indexed_batched_expanded(
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.rot_batch,
+            p.down_expanded,
+            down_m,
+            down_k,
+            p.k,
+            1,
+        ))?;
+    } else if res.routed_indexable_oq8 {
+        hip!(gpu.gemv_oq8g256_moe_down_k8_indexed_batched_expanded(
             p.expert_down_ptrs,
             p.topk_indices,
             p.rot_batch,

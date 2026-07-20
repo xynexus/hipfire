@@ -225,6 +225,10 @@ pub enum KernelKey {
     // Opus Quant W8A8 — prerotated int8 activation + int8 grouped-WMMA weight.
     // x arrives FWHT-rotated; launch quantizes to int8 then dispatches gemm_oq8.
     GemvOq8G256Prerotated,
+    // Opus Quant W4A16 decode — prerotated f32 activation × int4 grouped weight.
+    // x arrives FWHT-rotated; launch dispatches the dense gemv_oq4_grouped (no
+    // activation quant at B=1, mirroring the OQ8 prerotated arm).
+    GemvOq4G256Prerotated,
     // GEMV residual
     GemvHfq4G256Residual,
     GemvHfq3G256Residual,
@@ -598,6 +602,7 @@ impl KernelKey {
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydPrerotated),
             MFP4G32 => Ok(Self::GemvMfp4G32Prerotated),
             Oq8G256 => Ok(Self::GemvOq8G256Prerotated),
+            Oq4G256 => Ok(Self::GemvOq4G256Prerotated),
             // Q8/Paro have no separate "prerotated" kernel: Q8 is not FWHT-rotated
             // (prerotated input == raw input → gemv_q8_0), and Paro's Givens-rotated
             // input feeds the same gemv_hfq4g128 kernel as its Plain path. launch()

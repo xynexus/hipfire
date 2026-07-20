@@ -44,7 +44,7 @@ fn main() {
     assert_eq!(m % 2, 0);
     let ng = k / group;
     let mi = m / 2;
-    let n_exp = 8usize;
+    let n_exp = 256usize;
     let k_top = 8usize;
 
     let mut gpu = Gpu::init().unwrap();
@@ -81,8 +81,9 @@ fn main() {
     let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_le_bytes()).collect();
     let ptr_tensor = gpu.upload_raw(&ptr_bytes, &[n_exp]).unwrap();
 
-    // Routing: distinct experts 0..k_top.
-    let topk: Vec<i32> = (0..k_top as i32).collect();
+    // Routing: scattered distinct experts across the full n_exp range (mirrors a
+    // real router's top-k over 256 experts, not the sequential 0..k_top).
+    let topk: Vec<i32> = vec![0, 50, 100, 150, 200, 255, 17, 99];
     let topk_bytes: Vec<u8> = topk.iter().flat_map(|i| i.to_le_bytes()).collect();
     let topk_tensor = gpu.upload_raw(&topk_bytes, &[k_top]).unwrap();
 

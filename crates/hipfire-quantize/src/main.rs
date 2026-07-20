@@ -8725,6 +8725,32 @@ fn main() {
                         (slice.to_vec(), QuantType::BF16, 0u32)
                     } else if use_fp16 || use_bf16 {
                         (f32_slice_to_f16_bytes(&f32_slice), QuantType::F16, 0u32)
+                    } else if (use_oq4 || use_oq8 || use_oq8_plus) && supports_g256 {
+                        // Opus-quant experts feed the indexed-MoE kernels; the loader
+                        // repacks the on-disk Oq4G256/OqPlusCompact into the 132 B/260 B
+                        // kernel block layout. oq4 → Oq4G256; oq8/oq8+ → OqPlusCompact
+                        // (int4 bulk + top-frac int8 → Oq8G256 at load, default 1%,
+                        // `--w8-top` overrides). Uniform across experts (indexed kernels
+                        // require it), so kmap MQ-promotion is intentionally NOT applied.
+                        let want_oq8 = use_oq8 || use_oq8_plus;
+                        let w8_frac = OQPLUS_W8_FRAC.get().copied().or(if want_oq8 {
+                            Some(0.01)
+                        } else {
+                            None
+                        });
+                        if let Some(frac) = w8_frac {
+                            (
+                                quantize_oqplus_compact(&f32_slice, &signs1, &signs2, frac),
+                                QuantType::OqPlusCompact,
+                                256u32,
+                            )
+                        } else {
+                            (
+                                quantize_oq4g256(&f32_slice, &signs1, &signs2),
+                                QuantType::Oq4G256,
+                                256u32,
+                            )
+                        }
                     } else if expert_lloyd_mq3_native {
                         let q = quantize_mq3g256_lloyd(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ3G256Lloyd, 256u32)
@@ -8827,6 +8853,12 @@ fn main() {
                 "BF16"
             } else if use_fp16 || use_bf16 {
                 "F16"
+            } else if (use_oq4 || use_oq8 || use_oq8_plus) && supports_g256 {
+                if use_oq8 || use_oq8_plus || OQPLUS_W8_FRAC.get().is_some() {
+                    "OQ+C-EXP"
+                } else {
+                    "OQ4-EXP"
+                }
             } else if expert_lloyd_mq3_native {
                 "MQ3G256L"
             } else if expert_lloyd_mq2_native {

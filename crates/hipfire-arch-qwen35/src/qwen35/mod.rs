@@ -1546,6 +1546,8 @@ enum MoeDecodeIndexedRoutedPath {
     Mq6,
     Mq2Lloyd,
     ParoQ4G128,
+    Oq4,
+    Oq8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1564,6 +1566,8 @@ struct MoeDecodeDispatchFlags {
     routed_dtype_indexable_mq6: bool,
     routed_dtype_indexable_mq2_lloyd: bool,
     routed_dtype_indexable_paro: bool,
+    routed_dtype_indexable_oq4: bool,
+    routed_dtype_indexable_oq8: bool,
     routed_path: MoeDecodeIndexedRoutedPath,
     use_gpu_topk: bool,
     needs_x_rot_local: bool,
@@ -1597,10 +1601,21 @@ fn moe_decode_dispatch_flags_for_dtypes(
     let routed_gate_up_paro = dtypes.expert_gate_up == DType::ParoQ4G128
         && dtypes.expert_gate_up_uniform
         && paro_shared_present;
+    // Opus-quant routed experts feed the indexed gemv_oq{4,8}g256_moe_* kernels
+    // (same shape as the MQ path). gate_up and down must share the OQ dtype within
+    // a layer, like the MQ arms — the quantizer emits them uniform.
+    let routed_oq4 = dtypes.expert_down == DType::Oq4G256 && dtypes.expert_down_uniform;
+    let routed_gate_up_oq4 =
+        dtypes.expert_gate_up == DType::Oq4G256 && dtypes.expert_gate_up_uniform;
+    let routed_oq8 = dtypes.expert_down == DType::Oq8G256 && dtypes.expert_down_uniform;
+    let routed_gate_up_oq8 =
+        dtypes.expert_gate_up == DType::Oq8G256 && dtypes.expert_gate_up_uniform;
     let routed_dtype_indexable_mq4 = routed_mq4 && routed_gate_up_mq4;
     let routed_dtype_indexable_mq6 = routed_mq6 && routed_gate_up_mq6;
     let routed_dtype_indexable_mq2_lloyd = routed_mq2_lloyd && routed_gate_up_mq2_lloyd;
     let routed_dtype_indexable_paro = routed_paro && routed_gate_up_paro;
+    let routed_dtype_indexable_oq4 = routed_oq4 && routed_gate_up_oq4;
+    let routed_dtype_indexable_oq8 = routed_oq8 && routed_gate_up_oq8;
     let routed_path = if routed_dtype_indexable_mq4 {
         MoeDecodeIndexedRoutedPath::Mq4
     } else if routed_dtype_indexable_mq6 {
@@ -1609,6 +1624,10 @@ fn moe_decode_dispatch_flags_for_dtypes(
         MoeDecodeIndexedRoutedPath::Mq2Lloyd
     } else if routed_dtype_indexable_paro {
         MoeDecodeIndexedRoutedPath::ParoQ4G128
+    } else if routed_dtype_indexable_oq4 {
+        MoeDecodeIndexedRoutedPath::Oq4
+    } else if routed_dtype_indexable_oq8 {
+        MoeDecodeIndexedRoutedPath::Oq8
     } else {
         MoeDecodeIndexedRoutedPath::None
     };
@@ -1618,7 +1637,9 @@ fn moe_decode_dispatch_flags_for_dtypes(
         || routed_gate_up_mq4
         || routed_gate_up_mq6
         || routed_gate_up_mq2_lloyd
-        || routed_gate_up_paro;
+        || routed_gate_up_paro
+        || routed_gate_up_oq4
+        || routed_gate_up_oq8;
     MoeDecodeDispatchFlags {
         gate_side_mq4,
         shared_gate_up_mq4,
@@ -1634,6 +1655,8 @@ fn moe_decode_dispatch_flags_for_dtypes(
         routed_dtype_indexable_mq6,
         routed_dtype_indexable_mq2_lloyd,
         routed_dtype_indexable_paro,
+        routed_dtype_indexable_oq4,
+        routed_dtype_indexable_oq8,
         routed_path,
         use_gpu_topk,
         needs_x_rot_local,
@@ -1836,6 +1859,11 @@ fn moe_prefill_quant_family_supported_for_arch(dtype: DType, arch: &str) -> bool
         DType::MQ2G256 | DType::MQ8G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd => {
             arch == "gfx1151"
         }
+        // Opus Quant routed experts use the indexed gemv_oq{4,8}g256_moe_* kernels
+        // (RDNA-generic, like MQ4/MQ6); the dense shared expert uses the OQ
+        // grouped-WMMA path + gemv_oq*_residual_sigmoid_scaled down. Admit on RDNA
+        // (exclude CDNA/gfx9, unvalidated).
+        DType::Oq4G256 | DType::Oq8G256 => !arch.starts_with("gfx9"),
         _ => false,
     }
 }
@@ -1848,6 +1876,10 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
         DType::MQ2G256Lloyd => arch == "gfx1151",
         DType::F16 | DType::BF16 => arch == "gfx1151",
         DType::ParoQ4G128 => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
+        // OQ routed experts have NO grouped-WMMA MoE kernel — they use the indexed
+        // Path 1 GEMV. Deliberately absent so path2 eligibility stays false and OQ
+        // prefill routes to the indexed kernels; admissibility for OQ passes via
+        // `shared_matches_routed` (shared + routed both OQ).
         _ => false,
     }
 }

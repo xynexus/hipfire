@@ -537,6 +537,8 @@ pub(crate) fn moe_ffn_decode_impl(
             routed_dtype_indexable_mq6: false,
             routed_dtype_indexable_mq2_lloyd: false,
             routed_dtype_indexable_paro: false,
+            routed_dtype_indexable_oq4: false,
+            routed_dtype_indexable_oq8: false,
             routed_path: MoeDecodeIndexedRoutedPath::None,
             use_gpu_topk: false,
             needs_x_rot_local: gate_side_mq4,
@@ -551,6 +553,8 @@ pub(crate) fn moe_ffn_decode_impl(
     let routed_dtype_indexable_mq6 = dispatch_flags.routed_dtype_indexable_mq6;
     let routed_dtype_indexable_mq2_lloyd = dispatch_flags.routed_dtype_indexable_mq2_lloyd;
     let routed_dtype_indexable_paro = dispatch_flags.routed_dtype_indexable_paro;
+    let routed_dtype_indexable_oq4 = dispatch_flags.routed_dtype_indexable_oq4;
+    let routed_dtype_indexable_oq8 = dispatch_flags.routed_dtype_indexable_oq8;
     // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
     // device and the indexed MoE kernels consume topk_indices /
     // topk_weights directly — no D2H sync, hipGraph-capture-safe.
@@ -934,6 +938,35 @@ pub(crate) fn moe_ffn_decode_impl(
                 gate_up_k,
                 k,
             )?;
+        } else if routed_dtype_indexable_oq4 {
+            // Opus Quant W4A4 indexed gate_up (132 B/group kernel blocks; xr is
+            // FWHT-rotated above, same as the MQ path). Batched variant (batch=1)
+            // — the single-token sibling is unused by the coherent LFM2 path.
+            gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
+                &ffn.expert_gate_up_ptrs,
+                s.topk_indices,
+                xr,
+                s.gate_batch,
+                s.up_batch,
+                2 * mi,
+                gate_up_k,
+                k,
+                1,
+            )?;
+        } else if routed_dtype_indexable_oq8 {
+            // Opus Quant W8A8 indexed gate_up (260 B/group kernel blocks, from
+            // OqPlusCompact-expanded experts).
+            gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+                &ffn.expert_gate_up_ptrs,
+                s.topk_indices,
+                xr,
+                s.gate_batch,
+                s.up_batch,
+                2 * mi,
+                gate_up_k,
+                k,
+                1,
+            )?;
         } else {
             // routed_dtype_indexable_paro — HFQ4G128 (72 B/group) indexed
             // kernel. xr is already Givens-rotated above by rotate_x_paro_for.
@@ -1023,6 +1056,28 @@ pub(crate) fn moe_ffn_decode_impl(
             )?;
         } else if routed_dtype_indexable_mq2_lloyd {
             gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
+                &ffn.expert_down_ptrs,
+                s.topk_indices,
+                s.rot_batch,
+                s.down_expanded,
+                down_m,
+                down_k,
+                k,
+                1,
+            )?;
+        } else if routed_dtype_indexable_oq4 {
+            gpu.gemv_oq4g256_moe_down_k8_indexed_batched_expanded(
+                &ffn.expert_down_ptrs,
+                s.topk_indices,
+                s.rot_batch,
+                s.down_expanded,
+                down_m,
+                down_k,
+                k,
+                1,
+            )?;
+        } else if routed_dtype_indexable_oq8 {
+            gpu.gemv_oq8g256_moe_down_k8_indexed_batched_expanded(
                 &ffn.expert_down_ptrs,
                 s.topk_indices,
                 s.rot_batch,

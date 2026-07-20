@@ -58,6 +58,12 @@ pub struct MoeResolution {
     pub routed_indexable_mq4: bool,
     pub routed_indexable_mq6: bool,
     pub routed_indexable_paro: bool,
+    /// Opus Quant W4A16 routed experts (Oq4G256 gate_up + down). Indexed
+    /// MoE-block kernels (132 B/group) — same FWHT-rotated activation basis as
+    /// the MQ path, so it shares `needs_x_rot_local`/`rotate_x_mq`.
+    pub routed_indexable_oq4: bool,
+    /// Opus Quant W8A16 routed experts (Oq8G256 gate_up + down, 260 B/group).
+    pub routed_indexable_oq8: bool,
     pub use_gpu_topk: bool,
     pub needs_x_rot_local: bool,
 }
@@ -75,30 +81,50 @@ impl MoeResolution {
         let routed_gate_up_mq6 = d.routed_gate_up == MQ6G256;
         let routed_gate_up_paro = d.routed_gate_up == ParoQ4G128 && d.has_paro_shared;
 
+        let routed_gate_up_oq4 = d.routed_gate_up == Oq4G256;
+        let routed_gate_up_oq8 = d.routed_gate_up == Oq8G256;
+
         let routed_indexable_mq4 = (d.routed_down == MQ4G256) && routed_gate_up_mq4;
         let routed_indexable_mq6 = (d.routed_down == MQ6G256) && routed_gate_up_mq6;
         let routed_indexable_paro =
             (d.routed_down == ParoQ4G128 && d.has_paro_shared) && routed_gate_up_paro;
+        let routed_indexable_oq4 = (d.routed_down == Oq4G256) && routed_gate_up_oq4;
+        let routed_indexable_oq8 = (d.routed_down == Oq8G256) && routed_gate_up_oq8;
 
-        let routed_dtype_indexable =
-            routed_indexable_mq4 || routed_indexable_mq6 || routed_indexable_paro;
+        let routed_dtype_indexable = routed_indexable_mq4
+            || routed_indexable_mq6
+            || routed_indexable_paro
+            || routed_indexable_oq4
+            || routed_indexable_oq8;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
-        let needs_x_rot_local =
-            gate_side_mq4 || routed_gate_up_mq4 || routed_gate_up_mq6 || routed_gate_up_paro;
+        // OQ routed experts are FWHT-rotated (same signs as MQ, gen_fwht_signs
+        // 42/1042 uploaded by ensure_mq_signs) → they need x_rot_local too.
+        let needs_x_rot_local = gate_side_mq4
+            || routed_gate_up_mq4
+            || routed_gate_up_mq6
+            || routed_gate_up_paro
+            || routed_gate_up_oq4
+            || routed_gate_up_oq8;
 
         Self {
             gate_side_mq4,
             routed_indexable_mq4,
             routed_indexable_mq6,
             routed_indexable_paro,
+            routed_indexable_oq4,
+            routed_indexable_oq8,
             use_gpu_topk,
             needs_x_rot_local,
         }
     }
 
     pub fn routed_indexable(&self) -> bool {
-        self.routed_indexable_mq4 || self.routed_indexable_mq6 || self.routed_indexable_paro
+        self.routed_indexable_mq4
+            || self.routed_indexable_mq6
+            || self.routed_indexable_paro
+            || self.routed_indexable_oq4
+            || self.routed_indexable_oq8
     }
 }
 

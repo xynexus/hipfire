@@ -5477,6 +5477,139 @@ fn load_shared_moe_weights(
     Ok((shared_expert, shared_expert_gate))
 }
 
+fn sext4_moe(nib: u8) -> i8 {
+    let v = (nib & 0x0f) as i8;
+    if v > 7 {
+        v - 16
+    } else {
+        v
+    }
+}
+
+/// Repack one expert's on-disk Oq4G256 tensor (130 B/group `[f16 scale | 128
+/// nibbles]`) into the indexed-MoE kernel block layout (132 B `[f32 scale | 128
+/// nibbles]`) that `gemv_oq4g256_moe_*` reads. Mirror of minimax
+/// `oq4_ondisk_to_moe_blocks`. DISTINCT from the dense `oq4_arch_load` layout
+/// `load_weight_tensor` produces (that feeds the grouped-WMMA GEMM).
+fn oq4_ondisk_to_moe_blocks(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
+    const SRC_BLK: usize = 130; // Oq4G256: 2 (f16 scale) + 128 nibbles
+    const DST_BLK: usize = 132; // [f32 scale | 128 nibbles]
+    if k % 256 != 0 {
+        return Err(format!("OQ4 expert requires K % 256 == 0 (got K={k})"));
+    }
+    let ng = k / 256;
+    let expect = m * ng * SRC_BLK;
+    if data.len() != expect {
+        return Err(format!(
+            "OQ4 expert byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+            data.len()
+        ));
+    }
+    let mut out = vec![0u8; m * ng * DST_BLK];
+    for blk in 0..(m * ng) {
+        let src = blk * SRC_BLK;
+        let dst = blk * DST_BLK;
+        let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+        out[dst..dst + 4].copy_from_slice(&scale.to_le_bytes());
+        out[dst + 4..dst + DST_BLK].copy_from_slice(&data[src + 2..src + SRC_BLK]);
+    }
+    Ok(out)
+}
+
+/// Expand one expert's on-disk OqPlusCompact tensor (qt=36; per group `[f16 scale
+/// | 128 int4 nibbles | N_out × (u8 idx, i8 val)]`) into the OQ8 indexed-MoE
+/// kernel layout (260 B `[f32 scale | 256 int8]`). Mirror of minimax
+/// `oqplus_compact_to_moe_oq8_blocks`.
+fn oqplus_compact_to_moe_oq8_blocks(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
+    const DST_BLK: usize = 260; // [f32 scale | 256 int8]
+    if k % 256 != 0 {
+        return Err(format!("OQ+C expert requires K % 256 == 0 (got K={k})"));
+    }
+    let ng = k / 256;
+    let n_groups = m * ng;
+    if n_groups == 0 || data.is_empty() || data.len() % n_groups != 0 {
+        return Err(format!(
+            "OQ+C expert byte length {} not divisible by n_groups {n_groups} (M={m} K={k})",
+            data.len()
+        ));
+    }
+    let block_bytes = data.len() / n_groups;
+    if block_bytes < 132 || (block_bytes - 130) % 2 != 0 {
+        return Err(format!(
+            "OQ+C expert block_bytes {block_bytes} invalid (expected 130 + 2·N_out)"
+        ));
+    }
+    let n_out = (block_bytes - 130) / 2;
+    let mut out = vec![0u8; n_groups * DST_BLK];
+    for blk in 0..n_groups {
+        let src = blk * block_bytes;
+        let dst = blk * DST_BLK;
+        let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+        out[dst..dst + 4].copy_from_slice(&scale.to_le_bytes());
+        for i in 0..128 {
+            let byte = data[src + 2 + i];
+            out[dst + 4 + 2 * i] = sext4_moe(byte & 0x0f) as u8;
+            out[dst + 4 + 2 * i + 1] = sext4_moe(byte >> 4) as u8;
+        }
+        let tbl = src + 130;
+        for s in 0..n_out {
+            let idx = data[tbl + 2 * s] as usize;
+            let val = data[tbl + 2 * s + 1];
+            out[dst + 4 + idx] = val;
+        }
+    }
+    Ok(out)
+}
+
+/// Load one routed MoE expert. OQ experts (on-disk Oq4G256=34 / OqPlusCompact=36)
+/// repack per-expert into the indexed-MoE kernel BLOCK layout (132 B / 260 B) and
+/// upload raw tagged Oq4G256 / Oq8G256 — the dense `oq4_arch_load` / `oq8_combined`
+/// layouts `load_weight_tensor` produces are the WRONG contract for the indexed
+/// `gemv_oq{4,8}g256_moe_*` kernels. All other dtypes pass through
+/// `load_weight_tensor`.
+fn load_moe_expert(
+    hfq: &HfqFile,
+    gpu: &Gpu,
+    slabs: Option<&SlabTensorIndex>,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    let qt = qwen35_tensor_name_candidates(name)
+        .into_iter()
+        .find_map(|c| hfq.find_tensor_info(&c).map(|i| i.quant_type));
+    let (dtype, blocks) = match qt {
+        Some(OQ4_CANONICAL_QT) => {
+            let (_info, data) = qwen35_tensor_data_vec(hfq, name)
+                .ok_or_else(|| HipError::new(0, &format!("MoE expert not found: {name}")))?;
+            (
+                DType::Oq4G256,
+                oq4_ondisk_to_moe_blocks(&data, m, k).map_err(|e| HipError::new(0, &e))?,
+            )
+        }
+        // 36 = OqPlusCompact (single-sourced literal, matches the load_weight_tensor arm).
+        Some(36) => {
+            let (_info, data) = qwen35_tensor_data_vec(hfq, name)
+                .ok_or_else(|| HipError::new(0, &format!("MoE expert not found: {name}")))?;
+            (
+                DType::Oq8G256,
+                oqplus_compact_to_moe_oq8_blocks(&data, m, k).map_err(|e| HipError::new(0, &e))?,
+            )
+        }
+        _ => return load_weight_tensor(hfq, gpu, slabs, name, m, k),
+    };
+    let buf = gpu.upload_raw(&blocks, &[blocks.len()])?;
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: dtype,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    })
+}
+
 fn load_moe_ffn(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -5505,7 +5638,7 @@ fn load_moe_ffn(
     // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
     let mut experts = Vec::with_capacity(n_exp);
     for x in 0..n_exp {
-        let gate_up = load_weight_tensor(
+        let gate_up = load_moe_expert(
             hfq,
             gpu,
             slabs,
@@ -5513,7 +5646,7 @@ fn load_moe_ffn(
             2 * mi,
             config.dim,
         )?;
-        let down = load_weight_tensor(
+        let down = load_moe_expert(
             hfq,
             gpu,
             slabs,
@@ -5598,6 +5731,19 @@ fn load_moe_ffn_paged(
             &format!("paged MoE missing routed expert tensor {down_name}"),
         )
     })?;
+    // Paged experts alias on-disk block strides directly; the indexed-MoE OQ
+    // block layout (132 B / 260 B) is NOT threaded through the pager yet, so OQ
+    // (oq4=34 / OqPlusCompact=36) routed experts must use the non-paged loader
+    // (host repack). Refuse rather than silently mis-stride.
+    if matches!(gate_up.quant_type, OQ4_CANONICAL_QT | 36)
+        || matches!(down.quant_type, OQ4_CANONICAL_QT | 36)
+    {
+        return Err(HipError::new(
+            0,
+            "paged MoE experts do not support OQ (oq4/oq8) yet; unset \
+             HIPFIRE_QWEN35_PAGED_EXPERTS to use the non-paged OQ loader",
+        ));
+    }
     if gate_up.shape.as_slice() != [((2 * mi) as u32), config.dim as u32] {
         eprintln!(
             "  warning: paged expert gate_up shape {:?} differs from expected [{}, {}]",
