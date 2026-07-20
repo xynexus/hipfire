@@ -337,6 +337,21 @@ the exact schema-1/no-lookahead recipe resumed from the intact 31/60 boundary.
 Treat this attempt as failure and recovery evidence only; the resumed layer
 must commit before the stream is considered healthy again.
 
+That recovery committed layers 31--34, but the next attempt exposed the same
+host-pressure failure class at the 35/60 boundary. The kernel logged four new
+SVM failures between 06:58:49 and 07:00:02 AWST, including an already-allocated
+SVM address. For the next 37 minutes, checkpoint count and backing reads stayed
+fixed while the main thread consumed one CPU core and GPU activity remained
+zero; this is a wedged HSA queue, not calibration progress. The exact running
+binary and on-disk production binary both hashed to
+`sha256:f56e34d775ac97cca961687b5a4e04bb27728f0f072ae3f71262cabe7ded05af`.
+After the driver released the stopped queue, host availability recovered to
+about 122 GiB and the same schema-1/no-lookahead recipe resumed from the intact
+layer-34 checkpoint as PID 2189465 at 07:39. The 30-minute host watcher now
+reports kernel SVM failures since the current PID started instead of treating
+CPU ticks from HSA busy-wait as forward progress. This remains failure/recovery
+evidence; layer 35 must commit before the new process is considered healthy.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
@@ -1292,7 +1307,7 @@ does not mean the production artifact or admission ladder is complete.
 | Item | Status | Authoritative evidence / missing proof |
 |---|---|---|
 | 1. Family-resolved native CLI | Proven | Qwen3.5 and Gemma3-text registry/factory tests plus successful architecture-selected dry runs and real streams; no family CLI flag exists. |
-| 2. Complete 397B teacher artifact | In progress | The recovered durable production stream has 35 of 60 layer checkpoints and crossed the prior layer-31 SVM-pressure failure with lookahead disabled. No final `.calib.hfq` exists yet, so finalizer, KLDREF, complete ledger, and all-layer telemetry are not proven. |
+| 2. Complete 397B teacher artifact | In progress | The durable production stream has 35 of 60 layer checkpoints. It crossed the prior layer-31 SVM-pressure failure with lookahead disabled, then encountered the same kernel-confirmed SVM/HSA wedge before layer 35; the exact recipe/binary resumed from the intact checkpoint at 07:39 AWST. No final `.calib.hfq` exists yet, so finalizer, KLDREF, complete ledger, and all-layer telemetry are not proven. |
 | 3. Second and only target-source pass | Pending; storage admission proven | The target `Qwen3.5-397B-A17B.oq4.25++.hfq` does not exist. The quantizer join is implemented and bounded Gemma join evidence exists, but the production source pass has not run. Before that pass, the reusable wrapper now computes and persists an index-only mixed-output estimate using the artifact's exact high-precision fallback set and refuses insufficient storage. At 35/60 durable checkpoints, the 4,161 already-preserved experts raise the conservative Q8-ceiling/OQ-expert payload from 219,835,508,704 bytes to at least 300,323,629,024 bytes including alignment/container overhead; the final admission intentionally waits for the complete fallback set. |
 | 4. Per-layer/per-expert floor | Mechanism proven; production pending | Unit/GPU capture tests and all 35 durable production layer journals reconcile K=10 routing. Serialized layer snapshots independently validate routed slots, full/admitted weight counts, quota/slack accounting, and reduction tiles. Preserve-undercovered records real deficits, but the complete 60-layer fallback set is not available until finalization. |
 | 5. Frozen telemetry and quantizer refusal | Mechanism proven; production pending | `artifact audit-calibration` now provides a family-neutral nonzero gate for the complete ledger, Hessian/imatrix index, KLDREF map, per-layer telemetry reconciliation, policy, deficits, and exact high-precision fallback set. The reusable two-pass workflow requires that gate before quantization and persists its fingerprint-bound report; induction will not reuse a target manifest without it. Quantizer enforcement tests pass; the final production artifact and quantizer evidence are absent. |
