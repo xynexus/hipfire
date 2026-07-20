@@ -3173,6 +3173,13 @@ pub const ENV_HIPFIRE_PFLASH_SCORE_LAYER: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-qwen35/src/pflash.rs:1115",
 };
 
+/// `HIPFIRE_PIPE_TRACE` — Runtime variable controlling pipe trace in hipfire
+pub const ENV_HIPFIRE_PIPE_TRACE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_PIPE_TRACE",
+    description: "Runtime variable controlling pipe trace in hipfire",
+    source: "crates/hipfire-xdna/examples/dflash_body_native.rs:1837",
+};
+
 /// `HIPFIRE_PP_DFLASH` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_PP_DFLASH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PP_DFLASH",
@@ -5261,6 +5268,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_PFLASH_NIAH_BENCH_BIN,
     ENV_HIPFIRE_PFLASH_REPORT_TRAIN,
     ENV_HIPFIRE_PFLASH_SCORE_LAYER,
+    ENV_HIPFIRE_PIPE_TRACE,
     ENV_HIPFIRE_PP_DFLASH,
     ENV_HIPFIRE_PP_LAYERS,
     ENV_HIPFIRE_PP_PARITY_MODEL,

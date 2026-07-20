@@ -380,6 +380,31 @@ mod body {
         }
     }
 
+    // Host-glue attribution (HIPFIRE_PIPE_TRACE=1): cumulative ns in the r14
+    // GEMM's host work, split into the on-chain leading activation quant, the
+    // A-stripe pack, and the int32→f32 rescale. Only pack + rescale are
+    // overlappable behind weight streaming; quant depends on the previous op's
+    // output, so it stays on the layer critical path.
+    pub static GLUE_QUANT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static GLUE_PACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static GLUE_RESCALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Pipelined path only: cumulative ns blocked in `submit_p` (the exec_cmd
+    /// ioctl + A flush) and in `wait` (the syncobj fence). If the overlap works,
+    /// `wait` shrinks below the serial device time as host glue fills the window.
+    pub static PIPE_SUBMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static PIPE_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    #[inline]
+    pub fn glue_add(ctr: &std::sync::atomic::AtomicU64, d: std::time::Duration) {
+        ctr.fetch_add(d.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn glue_take_ms() -> (f64, f64, f64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let q = GLUE_QUANT.swap(0, Relaxed) as f64 / 1e6;
+        let p = GLUE_PACK.swap(0, Relaxed) as f64 / 1e6;
+        let r = GLUE_RESCALE.swap(0, Relaxed) as f64 / 1e6;
+        (q, p, r)
+    }
+
     /// Run one full GEMM on the r14 array. Returns (device ns, dispatch count).
     pub fn run_r14(
         g: &mut NpuGemmR14,
@@ -392,7 +417,9 @@ mod body {
         let geom: R14Geometry = g.geom();
         let (mt, nt, kc) = (geom.m_tile(), geom.n_tile(), geom.k_chunk());
         let (rows, m, k, nblk) = (mx.rows, mx.m, mx.k, geom.nblk);
+        let tq = std::time::Instant::now();
         quantize_row_chunked(x, rows, k, kc, qa, sx);
+        glue_add(&GLUE_QUANT, tq.elapsed());
         out[..rows * m].fill(0.0);
 
         let mut ns = 0u64;
@@ -412,6 +439,7 @@ mod body {
                 span.iter().all(|&(m2, c2, _)| m2 == mb && c2 == c).then_some((mb, c))
             }).flatten();
             let skip = uniform.is_some() && uniform == *a_state;
+            let tp = std::time::Instant::now();
             if !skip {
                 let abuf = g.a_mut();
                 let mut prev: Option<(usize, usize, usize)> = None;
@@ -433,11 +461,13 @@ mod body {
                 }
                 *a_state = uniform;
             }
+            glue_add(&GLUE_PACK, tp.elapsed());
             let t = std::time::Instant::now();
             g.dispatch(wbuf).expect("r14 dispatch");
             ns += t.elapsed().as_nanos() as u64;
             disp += 1;
             let c32 = g.read_c().expect("r14 read C");
+            let tr = std::time::Instant::now();
             for (s, &(mb, kchunk, tile)) in mx.plan[lo..hi].iter().enumerate() {
                 let row0 = mb * mt;
                 let col0 = tile * nt;
@@ -455,8 +485,169 @@ mod body {
                     }
                 });
             }
+            glue_add(&GLUE_RESCALE, tr.elapsed());
         }
         (ns, disp)
+    }
+
+    /// Double-buffered twin of [`run_r14`] (`--pipeline-glue`). Overlaps the host
+    /// glue — the int32→f32 rescale of dispatch `d-1` and the A-stripe pack of
+    /// dispatch `d+1` — with dispatch `d`'s weight streaming, using the r14
+    /// array's second argument set. One dispatch is in flight at a time, so the
+    /// 6-hwctx budget is unchanged; only the host A/C buffers double.
+    ///
+    /// Buffer-race safety (the primary risk of this path): each parity's C is
+    /// rescaled, and its A repacked, only after the dispatch that used it has
+    /// been `wait`ed, and always before the next dispatch that reuses that parity
+    /// is submitted. The rescale accumulates into `out` in the SAME dispatch
+    /// order as [`run_r14`], so results are bit-identical (verified by
+    /// `--pipeline-check`), not merely close.
+    ///
+    /// `ns` returned is the time actually spent blocked in [`NpuGemmR14::wait`]
+    /// (NPU time not hidden by host glue), not the fused submit+wait of the
+    /// serial path — so `npu_busy` shrinks toward the true unhidden floor.
+    pub fn run_r14_pipelined(
+        g: &mut NpuGemmR14,
+        mx: &R14Matrix,
+        x: &[f32],
+        out: &mut [f32],
+        qa: &mut [i8],
+        sx: &mut [f32],
+        check: bool,
+    ) -> (u64, u64) {
+        if check {
+            // Same-run parity: compute the serial reference, then the pipelined
+            // result, and assert bit-identity. Proves no buffer race corrupts an
+            // answer (the md5/cos gates would only see a *changed* number).
+            let mut refo = vec![0f32; mx.rows * mx.m];
+            run_r14(g, mx, x, &mut refo, qa, sx);
+            let r = run_r14_pipelined_core(g, mx, x, out, qa, sx);
+            for i in 0..mx.rows * mx.m {
+                assert!(
+                    out[i].to_bits() == refo[i].to_bits(),
+                    "pipeline parity mismatch at {i}: {} (pipe) vs {} (serial)",
+                    out[i],
+                    refo[i]
+                );
+            }
+            return r;
+        }
+        run_r14_pipelined_core(g, mx, x, out, qa, sx)
+    }
+
+    fn run_r14_pipelined_core(
+        g: &mut NpuGemmR14,
+        mx: &R14Matrix,
+        x: &[f32],
+        out: &mut [f32],
+        qa: &mut [i8],
+        sx: &mut [f32],
+    ) -> (u64, u64) {
+        use hipfire_xdna::gemm_r14::GRID;
+        let geom: R14Geometry = g.geom();
+        let (mt, nt, kc) = (geom.m_tile(), geom.n_tile(), geom.k_chunk());
+        let (m, k, nblk) = (mx.m, mx.k, geom.nblk);
+        let tq = std::time::Instant::now();
+        quantize_row_chunked(x, mx.rows, k, kc, qa, sx);
+        glue_add(&GLUE_QUANT, tq.elapsed());
+        out[..mx.rows * m].fill(0.0);
+
+        let ndisp = mx.wbufs.len();
+        if ndisp == 0 {
+            return (0, 0);
+        }
+        g.ensure_pipelined().expect("r14 double-buffer alloc");
+
+        // Pack parity `p`'s A buffer for dispatch `d` — same within-dispatch
+        // replication as run_r14 (consecutive slots sharing (m_block, k_chunk)
+        // copy A rather than repack). A macro, not a closure, so the &mut g and
+        // shared qa/mx borrows are exactly as if written inline.
+        macro_rules! pack_a {
+            ($p:expr, $d:expr) => {{
+                let (p, d) = ($p, $d);
+                let lo = d * nblk;
+                let hi = (lo + nblk).min(mx.plan.len());
+                let tp = std::time::Instant::now();
+                let abuf = g.a_mut_p(p);
+                let mut prev: Option<(usize, usize, usize)> = None;
+                for (s, &(mb, c, _)) in mx.plan[lo..hi].iter().enumerate() {
+                    if let Some((pmb, pc, ps)) = prev {
+                        if pmb == mb && pc == c {
+                            for i in 0..GRID {
+                                let (base, off) = (i * geom.at(), geom.ab());
+                                let (src, dst) = (base + ps * off, base + s * off);
+                                abuf.copy_within(src..src + off, dst);
+                            }
+                            continue;
+                        }
+                    }
+                    geom.pack_a_slot(abuf, s, qa, k, mb * mt, c * kc);
+                    prev = Some((mb, c, s));
+                }
+                glue_add(&GLUE_PACK, tp.elapsed());
+            }};
+        }
+        // Rescale parity `p`'s C (dispatch `d`'s output) into `out`. Same
+        // left-to-right accumulation as run_r14, walked in ascending `d`.
+        macro_rules! rescale {
+            ($p:expr, $d:expr) => {{
+                let (p, d) = ($p, $d);
+                let lo = d * nblk;
+                let hi = (lo + nblk).min(mx.plan.len());
+                let tr = std::time::Instant::now();
+                let c32 = g.read_c_p(p).expect("r14 read C");
+                for (s, &(mb, kchunk, tile)) in mx.plan[lo..hi].iter().enumerate() {
+                    let row0 = mb * mt;
+                    let col0 = tile * nt;
+                    let scol = &mx.scale4t[kchunk * mx.m..(kchunk + 1) * mx.m];
+                    geom.each_c_run(c32, s, |lr, lc0, vals| {
+                        let r = row0 + lr;
+                        let sxr = sx[r * mx.k_chunks + kchunk];
+                        let n0 = col0 + lc0;
+                        let sc = &scol[n0..n0 + vals.len()];
+                        let o = &mut out[r * m + n0..r * m + n0 + vals.len()];
+                        for t in 0..vals.len() {
+                            o[t] += sc[t] * sxr * vals[t] as f32;
+                        }
+                    });
+                }
+                glue_add(&GLUE_RESCALE, tr.elapsed());
+            }};
+        }
+
+        let mut ns = 0u64;
+        // Prime the pipeline: pack + submit dispatch 0.
+        pack_a!(0, 0);
+        let ts0 = std::time::Instant::now();
+        let mut seq = g.submit_p(0, &mx.wbufs[0]).expect("r14 submit");
+        glue_add(&PIPE_SUBMIT, ts0.elapsed());
+        for d in 0..ndisp {
+            // Dispatch `d` (parity d&1) is running on the NPU. Do the glue that
+            // does NOT depend on it, on the other parities:
+            //  - pack A for d+1 (into (d+1)&1; that buffer was last used by d-1,
+            //    already waited) — reads only the already-quantized qa.
+            //  - rescale C for d-1 (from (d-1)&1; synced + read here, and it is
+            //    consumed before the submit below that would overwrite it).
+            if d + 1 < ndisp {
+                pack_a!((d + 1) & 1, d + 1);
+            }
+            if d >= 1 {
+                rescale!((d - 1) & 1, d - 1);
+            }
+            let tw = std::time::Instant::now();
+            g.wait(seq).expect("r14 wait");
+            let w = tw.elapsed();
+            ns += w.as_nanos() as u64;
+            glue_add(&PIPE_WAIT, w);
+            if d + 1 < ndisp {
+                let ts = std::time::Instant::now();
+                seq = g.submit_p((d + 1) & 1, &mx.wbufs[d + 1]).expect("r14 submit");
+                glue_add(&PIPE_SUBMIT, ts.elapsed());
+            }
+        }
+        // Tail: the last dispatch's C was never rescaled inside the loop.
+        rescale!((ndisp - 1) & 1, ndisp - 1);
+        (ns, ndisp as u64)
     }
 
     // ── kernel cache ────────────────────────────────────────────────────────
@@ -609,6 +800,22 @@ fn main() {
     // attention) and deletes their bf16 pack/unpack glue. Opt-in: the all-NPU
     // path stays the default so existing measurements reproduce.
     let cpu_prim = arg("--cpu-primitives").is_some();
+    // `--pipeline-glue` (multicore/W4A8 only) double-buffers the r14 array's A/C
+    // argument set and overlaps the host glue (int32→f32 rescale of dispatch d-1,
+    // A-stripe pack of d+1) with dispatch d's weight streaming. The serial path
+    // stays default and reproducible. `--pipeline-check` additionally recomputes
+    // each GEMM serially in the same run and asserts the pipelined result is
+    // bit-identical (the buffer-race gate — a race changes the number, which the
+    // cos/md5 gates would see as a regression, but this catches it at the GEMM).
+    // Presence check, NOT arg(...).is_some(): `arg` returns the token *after* the
+    // flag, so a boolean flag passed LAST would read as absent.
+    let has = |k: &str| argv.iter().any(|a| a == k);
+    let pipeline_glue = has("--pipeline-glue");
+    let pipeline_check = has("--pipeline-check");
+    // Per-block gate for the bit-identity check, set from the block loop (block 0
+    // is cold — excluded). A Cell so the `gemm!` macro can read it at its
+    // definition-site scope while the loop updates it each block.
+    let pipeline_check_active = std::cell::Cell::new(false);
     // `--parity` (used WITH the all-NPU path) runs each CPU primitive on the
     // SAME input the NPU kernel just consumed and records cos + max|Δ| between
     // the two outputs — the ISOLATED primitive parity the gate wants, since it
@@ -1036,7 +1243,11 @@ fn main() {
             let rows: usize = $rows;
             if let Some(mx) = $mx.as_ref() {
                 let g = r14.as_mut().expect("r14 kernel");
-                let (dt, nd) = run_r14(g, mx, $x, $out, &mut qbuf, &mut sxbuf);
+                let (dt, nd) = if pipeline_glue {
+                    run_r14_pipelined(g, mx, $x, $out, &mut qbuf, &mut sxbuf, pipeline_check_active.get())
+                } else {
+                    run_r14(g, mx, $x, $out, &mut qbuf, &mut sxbuf)
+                };
                 npu_ns_total += dt;
                 dispatches += nd;
                 let name = format!("r14:N{}_K{}_rows{}", gm.m, gm.k, rows);
@@ -1243,6 +1454,12 @@ fn main() {
 
     for blk in 0..blocks {
         let t_block = Instant::now();
+        // Block 0 is cold: the first r14 dispatch pays residency mapping and its
+        // C read-back can be stale (it is discarded from every warm stat, and
+        // each block recomputes from target_hidden so it never propagates). The
+        // bit-identity check compares serial vs pipelined per GEMM, so restrict
+        // it to warm blocks where both sides see an established context.
+        pipeline_check_active.set(pipeline_check && blk >= 1);
         let (d0, m0) = (dispatches, cache.misses);
         let n0 = npu_ns_total;
 
@@ -1614,6 +1831,21 @@ fn main() {
             "  block {blk}: wall={:.1} ms  dispatches={nd}  npu_busy={npu_ms:.1} ms  ctx_misses={nm}",
             wall * 1e3
         );
+        // Host-glue attribution for the r14 GEMM path (serial run only; the
+        // pipelined path interleaves these so the split is not meaningful there).
+        let (gq, gp, gr) = glue_take_ms();
+        if std::env::var("HIPFIRE_PIPE_TRACE").is_ok() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let psub = PIPE_SUBMIT.swap(0, Relaxed) as f64 / 1e6;
+            let pwait = PIPE_WAIT.swap(0, Relaxed) as f64 / 1e6;
+            println!(
+                "    glue: quant(on-chain)={gq:.1} ms  pack={gp:.1} ms  rescale={gr:.1} ms  (pack+rescale overlappable={:.1})",
+                gp + gr
+            );
+            if pipeline_glue {
+                println!("    pipe: submit(serial)={psub:.1} ms  wait(blocked)={pwait:.1} ms");
+            }
+        }
         // Block 0 is cold (first touch of every weight BO + every hwctx). Drop
         // its samples so the per-op table reports the WARM steady state. With the
         // cache on, block 1 is the verify block (recomputes context AND checks

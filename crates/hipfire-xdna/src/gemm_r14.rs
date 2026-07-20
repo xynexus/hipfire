@@ -238,6 +238,12 @@ pub struct NpuGemmR14 {
     geom: R14Geometry,
     a_buf: DeviceBuffer,
     c_buf: DeviceBuffer,
+    /// Second A/C argument set for the pipelined (double-buffered) dispatch
+    /// path. Lazily allocated by [`Self::ensure_pipelined`]; `None` on the plain
+    /// blocking path so callers that never pipeline (the runtime `DflashNpuBody`)
+    /// pay no extra device memory. Parity 0 is `(a_buf, c_buf)`; parity 1 is this.
+    a_buf1: Option<DeviceBuffer>,
+    c_buf1: Option<DeviceBuffer>,
 }
 
 impl NpuGemmR14 {
@@ -275,6 +281,8 @@ impl NpuGemmR14 {
             geom,
             a_buf,
             c_buf,
+            a_buf1: None,
+            c_buf1: None,
         })
     }
 
@@ -312,6 +320,75 @@ impl NpuGemmR14 {
     pub fn read_c(&self) -> Result<&[i32], XdnaError> {
         self.kernel.sync_output(&self.c_buf)?;
         let s = self.c_buf.as_slice();
+        Ok(unsafe { std::slice::from_raw_parts(s.as_ptr() as *const i32, s.len() / 4) })
+    }
+
+    // ── pipelined (double-buffered) dispatch ─────────────────────────────────
+    // The plain path fuses submit + wait per dispatch, so the host glue
+    // (activation pack, int32→f32 rescale) runs serially between blocking
+    // dispatches while the NPU is idle. Weight streaming is ~60% of the r14 GEMM
+    // wall (topology-bandwidth-bound); during it the CPU is idle. These methods
+    // give a second A/C argument set so the caller can, while dispatch `d` runs
+    // on one parity, pack `d+1`'s A and rescale `d-1`'s C on the OTHER parity —
+    // the exact overlap [`NpuKernel::submit`]/[`NpuKernel::sync_output`] document.
+    // Single dispatch in flight at a time (one hwctx), so the 6-context budget is
+    // unchanged; only the host buffers are doubled.
+
+    /// Allocate the second (parity-1) A/C argument buffers if not already present.
+    pub fn ensure_pipelined(&mut self) -> Result<(), XdnaError> {
+        if self.a_buf1.is_none() {
+            self.a_buf1 = Some(self.kernel.alloc_arg(self.geom.a_bytes())?);
+            self.c_buf1 = Some(self.kernel.alloc_arg(self.geom.c_bytes())?);
+        }
+        Ok(())
+    }
+
+    fn a_buf_p(&self, p: usize) -> &DeviceBuffer {
+        if p == 0 {
+            &self.a_buf
+        } else {
+            self.a_buf1.as_ref().expect("ensure_pipelined")
+        }
+    }
+    fn c_buf_p(&self, p: usize) -> &DeviceBuffer {
+        if p == 0 {
+            &self.c_buf
+        } else {
+            self.c_buf1.as_ref().expect("ensure_pipelined")
+        }
+    }
+
+    /// Mutable host view of parity `p`'s A argument buffer, for packing the next
+    /// dispatch's stripes while a dispatch on the other parity is in flight.
+    pub fn a_mut_p(&mut self, p: usize) -> &mut [u8] {
+        if p == 0 {
+            self.a_buf.as_mut_slice()
+        } else {
+            self.a_buf1.as_mut().expect("ensure_pipelined").as_mut_slice()
+        }
+    }
+
+    /// Non-blocking submit of parity `p` against `weights`; flushes only A[p]
+    /// (the host just packed it), not the resident W or the NPU-written C.
+    /// Returns the timeline `seq` to pass to [`Self::wait`].
+    pub fn submit_p(&self, p: usize, weights: &DeviceBuffer) -> Result<u64, XdnaError> {
+        self.kernel.submit_synced(
+            &[self.a_buf_p(p), weights, self.c_buf_p(p)],
+            Some(&[true, false, false]),
+        )
+    }
+
+    /// Block until the dispatch at timeline point `seq` completes.
+    pub fn wait(&self, seq: u64) -> Result<(), XdnaError> {
+        self.kernel.wait(seq)
+    }
+
+    /// Reconcile parity `p`'s C buffer for read-back (clears stale prefetched
+    /// lines from the pipelined overlap) and view it as int32.
+    pub fn read_c_p(&self, p: usize) -> Result<&[i32], XdnaError> {
+        let c = self.c_buf_p(p);
+        self.kernel.sync_output(c)?;
+        let s = c.as_slice();
         Ok(unsafe { std::slice::from_raw_parts(s.as_ptr() as *const i32, s.len() / 4) })
     }
 }
