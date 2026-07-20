@@ -20,6 +20,23 @@ ship to users.
 | `calib-1m.txt` | wikitext-103-raw-v1 test+train shard 0 prefix | 4,798,009 | ~1.2M | `c1879341cb2d4bcf06ead9d1c02ef5fa` |
 | `calib-5m.txt` | wikitext-103-raw-v1 train shard 0 prefix | 19,996,814 | ~5.0M | `5dc7dc29676eb591869378b3ddc17815` |
 
+### Matched layer-prefetch timing
+
+`prefetch-abba.sh` runs fresh two-layer native-calibration trials in an
+order-balanced off/on/on/off sequence. It requires exact layer-part hashes,
+run fingerprints, and engine identities across trials before reporting timing,
+and records the corpus MD5/SHA256 plus the executable SHA256 in `evidence.json`.
+The result proves timing and mechanism parity only; it is not calibration-quality
+evidence. The native calibrator coordinates each GPU trial with the shared lock.
+
+```sh
+benchmarks/calib/prefetch-abba.sh \
+  --model /srv/huggingface/models--Qwen--Qwen3.5-0.8B \
+  --corpus benchmarks/calib/calib-1m.txt \
+  --artifact-stem Qwen3.5-0.8B \
+  --output-dir ~/.hipfire/experiments/calibration-prefetch/Qwen3.5-0.8B
+```
+
 ## Sidecar-quality corpora (built on demand)
 
 These are NOT committed (too large; deterministic via fetch script).

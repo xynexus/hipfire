@@ -380,6 +380,13 @@ Still required before declaring the engine complete or promoting a production
   and quantizer-consumption half are now proven); and
 - admitted-path channel evidence beyond the currently tested gfx1151 host.
 
+The matched prefetch measurement now has a repo-native ABBA runner at
+`benchmarks/calib/prefetch-abba.sh`. It fixes the source, corpus, geometry,
+engine identity, and two layer-part hashes across off/on/on/off trials, records
+background-read versus foreground-load timing, and emits a fingerprinted JSON
+ledger. It is tooling only until run after the production stream releases the
+GPU; no timing claim follows from the script itself.
+
 `/srv` cannot host the production outputs on the current host snapshot: it has
 approximately 4.3 GiB free while the source checkpoint alone is approximately
 807 GB. `/home` is the proposed artifact/spool root and had approximately
