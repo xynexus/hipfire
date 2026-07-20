@@ -35,6 +35,11 @@ Implemented and verified in this checkout:
 - durable per-layer phase timing for source load/upload, teacher execution,
   capture serialization, collector finalization, and part sync/hash, persisted
   in checkpoints and the completed artifact for resume-safe ETA analysis;
+- source materialization timing split into tensor/view accounting, host dtype
+  decode, HIP allocation/copy (including mmap refaults), and mapping/page-cache
+  release, with source and uploaded byte counts; this makes the next buffering
+  decision evidence-driven instead of attributing all foreground load time to
+  the network;
 - bounded family-neutral source lookahead: the engine selects the next owner's
   canonical physical ranges without consuming the read ledger, warms at most
   16 GiB through one fixed 8 MiB worker buffer during current-layer execution,

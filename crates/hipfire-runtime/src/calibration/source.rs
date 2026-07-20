@@ -582,6 +582,56 @@ pub struct PlannedTensorView<'a> {
     release_pages: bool,
 }
 
+/// Aggregate source-materialization phases for one owner-scoped load. The
+/// layer-stream engine persists this beside its wall-clock `load_upload_us` so
+/// a warm-source slowdown can be attributed before changing the buffering
+/// strategy. Times are intentionally inclusive of successful tensors only;
+/// failed loads abort the layer and never produce a checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SourceLoadTimings {
+    pub tensor_count: u64,
+    pub source_bytes: u64,
+    pub gpu_upload_bytes: u64,
+    /// Tensor lookup, logical-ledger consumption, and view construction.
+    pub view_us: u64,
+    /// Host dtype conversion or adjustment before upload.
+    pub decode_us: u64,
+    /// HIP allocation and synchronous host-to-device copy. Any mmap refaults
+    /// incurred while HIP reads the source slice are included here.
+    pub upload_us: u64,
+    /// Mapping/page-cache release after the synchronous upload completes.
+    pub release_us: u64,
+}
+
+impl SourceLoadTimings {
+    fn record(
+        &mut self,
+        source_bytes: usize,
+        gpu_upload_bytes: usize,
+        view_us: u64,
+        decode_us: u64,
+        upload_us: u64,
+        release_us: u64,
+    ) {
+        self.tensor_count = self.tensor_count.saturating_add(1);
+        self.source_bytes = self
+            .source_bytes
+            .saturating_add(u64::try_from(source_bytes).unwrap_or(u64::MAX));
+        self.gpu_upload_bytes = self
+            .gpu_upload_bytes
+            .saturating_add(u64::try_from(gpu_upload_bytes).unwrap_or(u64::MAX));
+        self.view_us = self.view_us.saturating_add(view_us);
+        self.decode_us = self.decode_us.saturating_add(decode_us);
+        self.upload_us = self.upload_us.saturating_add(upload_us);
+        self.release_us = self.release_us.saturating_add(release_us);
+    }
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 impl Drop for PlannedTensorView<'_> {
     fn drop(&mut self) {
         if self.release_pages {
@@ -597,6 +647,7 @@ pub struct PlannedTensorReader<'source, 'ledger, 'plan> {
     source: &'source dyn ModelSource,
     ledger: &'ledger mut ReadLedger<'plan>,
     owner: TensorOwner,
+    timings: SourceLoadTimings,
 }
 
 impl<'source, 'ledger, 'plan> PlannedTensorReader<'source, 'ledger, 'plan> {
@@ -609,7 +660,31 @@ impl<'source, 'ledger, 'plan> PlannedTensorReader<'source, 'ledger, 'plan> {
             source,
             ledger,
             owner,
+            timings: SourceLoadTimings::default(),
         }
+    }
+
+    pub const fn timings(&self) -> SourceLoadTimings {
+        self.timings
+    }
+
+    fn record_load(
+        &mut self,
+        source_bytes: usize,
+        gpu_upload_bytes: usize,
+        view_us: u64,
+        decode_us: u64,
+        upload_us: u64,
+        release_us: u64,
+    ) {
+        self.timings.record(
+            source_bytes,
+            gpu_upload_bytes,
+            view_us,
+            decode_us,
+            upload_us,
+            release_us,
+        );
     }
 
     pub fn read(&mut self, logical_name: &str) -> Result<PlannedTensorView<'_>, CalibError> {
@@ -784,9 +859,7 @@ pub fn load_source_matrix(
     m: usize,
     k: usize,
 ) -> Result<WeightTensor, CalibError> {
-    let view = reader.read(logical_name)?;
-    validate_source_shape(view.info, &[m, k], logical_name)?;
-    let buf = upload_source_payload(gpu, view.info.dtype.as_str(), view.bytes, &[m, k])?;
+    let buf = load_source_tensor(reader, gpu, logical_name, &[m, k])?;
     let gpu_dtype = buf.dtype;
     if gpu_dtype == DType::Raw {
         return Err(CalibError::InvalidSourcePlan(format!(
@@ -804,6 +877,47 @@ pub fn load_source_matrix(
     })
 }
 
+/// Load one typed source tensor while accounting for view, upload/refault, and
+/// release phases. Family adapters use this for stacked/fused tensors as well
+/// as ordinary matrices so the persisted split covers the full layer payload.
+pub fn load_source_tensor(
+    reader: &mut PlannedTensorReader<'_, '_, '_>,
+    gpu: &Gpu,
+    logical_name: &str,
+    shape: &[usize],
+) -> Result<GpuTensor, CalibError> {
+    let view_started = Instant::now();
+    let view = reader.read(logical_name)?;
+    let view_us = elapsed_micros(view_started);
+    validate_source_shape(view.info, shape, logical_name)?;
+    let source_bytes = view.bytes.len();
+    let upload_started = Instant::now();
+    let upload = upload_source_payload(gpu, view.info.dtype.as_str(), view.bytes, shape);
+    let upload_us = elapsed_micros(upload_started);
+    let gpu_upload_bytes = shape
+        .iter()
+        .try_fold(1usize, |total, &dimension| total.checked_mul(dimension))
+        .and_then(|elements| {
+            upload
+                .as_ref()
+                .ok()
+                .and_then(|tensor| elements.checked_mul(tensor.dtype.size()))
+        })
+        .unwrap_or(source_bytes);
+    let release_started = Instant::now();
+    drop(view);
+    let release_us = elapsed_micros(release_started);
+    reader.record_load(
+        source_bytes,
+        gpu_upload_bytes,
+        view_us,
+        0,
+        upload_us,
+        release_us,
+    );
+    upload
+}
+
 pub fn load_source_f32_tensor(
     reader: &mut PlannedTensorReader<'_, '_, '_>,
     gpu: &mut Gpu,
@@ -811,13 +925,17 @@ pub fn load_source_f32_tensor(
     elements: usize,
     add_one: bool,
 ) -> Result<GpuTensor, CalibError> {
+    let view_started = Instant::now();
     let view = reader.read(logical_name)?;
+    let view_us = elapsed_micros(view_started);
     if view.info.shape.iter().product::<usize>() != elements {
         return Err(CalibError::InvalidSourcePlan(format!(
             "tensor {logical_name} has shape {:?}; expected {elements} elements",
             view.info.shape
         )));
     }
+    let source_bytes = view.bytes.len();
+    let decode_started = Instant::now();
     let mut values = source_payload_f32(view.info.dtype.as_str(), view.bytes)?;
     if values.len() != elements {
         return Err(CalibError::InvalidSourcePlan(format!(
@@ -828,8 +946,24 @@ pub fn load_source_f32_tensor(
     if add_one {
         values.iter_mut().for_each(|value| *value += 1.0);
     }
-    gpu.upload_f32(&values, &[elements])
-        .map_err(|error| CalibError::Runtime(error.to_string()))
+    let decode_us = elapsed_micros(decode_started);
+    let upload_started = Instant::now();
+    let upload = gpu
+        .upload_f32(&values, &[elements])
+        .map_err(|error| CalibError::Runtime(error.to_string()));
+    let upload_us = elapsed_micros(upload_started);
+    let release_started = Instant::now();
+    drop(view);
+    let release_us = elapsed_micros(release_started);
+    reader.record_load(
+        source_bytes,
+        elements.saturating_mul(std::mem::size_of::<f32>()),
+        view_us,
+        decode_us,
+        upload_us,
+        release_us,
+    );
+    upload
 }
 
 #[cfg(test)]

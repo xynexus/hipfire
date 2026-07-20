@@ -25,7 +25,7 @@ use hipfire_runtime::calibration::expert_capture::GroupedMoeCalibrationCapture;
 use hipfire_runtime::calibration::schedule::{LayerMicrobatch, MicrobatchGeometry};
 use hipfire_runtime::calibration::source::{
     load_source_f32_tensor as load_f32_tensor, load_source_matrix as load_matrix,
-    source_payload_f32, upload_source_payload, validate_source_shape as validate_shape,
+    load_source_tensor, source_payload_f32, validate_source_shape as validate_shape,
     PlannedTensorReader, TensorLoadRequest, TensorOwner,
 };
 use hipfire_runtime::calibration::stream::{
@@ -1521,9 +1521,7 @@ fn load_stacked_matrix(
     m: usize,
     k: usize,
 ) -> Result<GpuTensor, CalibError> {
-    let view = reader.read(logical_name)?;
-    validate_shape(view.info, &[experts, m, k], logical_name)?;
-    upload_source_payload(gpu, view.info.dtype.as_str(), view.bytes, &[experts, m, k])
+    load_source_tensor(reader, gpu, logical_name, &[experts, m, k])
 }
 
 fn alias_weight(

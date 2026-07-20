@@ -1142,6 +1142,20 @@ pub struct CalibrationLayerTiming {
     pub prefetch_errors: usize,
     /// Time required to plan and start the following layer's lookahead worker.
     pub prefetch_submit_us: u64,
+    /// Successful source tensors materialized for this layer.
+    pub source_tensor_count: u64,
+    pub source_bytes: u64,
+    pub gpu_upload_bytes: u64,
+    /// Source lookup and logical-ledger accounting.
+    pub source_view_us: u64,
+    /// Host-side source dtype conversion/adjustment.
+    pub source_decode_us: u64,
+    /// HIP allocation/copy, including any mmap refaults during the copy.
+    pub source_upload_us: u64,
+    /// Mmap and page-cache release after synchronous upload.
+    pub source_release_us: u64,
+    /// Total adapter layer construction, including all source phases above,
+    /// pointer tables, scratch allocation, and other family setup.
     pub load_upload_us: u64,
     pub execute_us: u64,
     pub capture_write_us: u64,
@@ -1996,10 +2010,12 @@ impl LayerStreamEngine {
                 );
             }
             let load_started = Instant::now();
-            let mut layer = {
+            let (mut layer, source_load) = {
                 let mut reader =
                     PlannedTensorReader::new(source, &mut ledger, TensorOwner::Layer(layer_index));
-                adapter.load_layer(&mut reader, gpu, &model, layer_index, &execution_job)?
+                let layer =
+                    adapter.load_layer(&mut reader, gpu, &model, layer_index, &execution_job)?;
+                (layer, reader.timings())
             };
             let load_upload_us = elapsed_us(load_started);
             let prefetch_submit_started = Instant::now();
@@ -2095,6 +2111,13 @@ impl LayerStreamEngine {
                 prefetch_bytes: prefetch_report.completed_bytes,
                 prefetch_errors: prefetch_report.errors.len(),
                 prefetch_submit_us,
+                source_tensor_count: source_load.tensor_count,
+                source_bytes: source_load.source_bytes,
+                gpu_upload_bytes: source_load.gpu_upload_bytes,
+                source_view_us: source_load.view_us,
+                source_decode_us: source_load.decode_us,
+                source_upload_us: source_load.upload_us,
+                source_release_us: source_load.release_us,
                 load_upload_us,
                 execute_us,
                 capture_write_us,
@@ -2136,12 +2159,16 @@ impl LayerStreamEngine {
                 .map(format_duration_us)
                 .unwrap_or_else(|| "unknown".to_string());
             eprintln!(
-                "calibrate: committed layer {completed}/{} in {} (prefetch {} read/{} wait, load {}, execute {}, capture+sync {}); rolling layer ETA {eta}",
+                "calibrate: committed layer {completed}/{} in {} (prefetch {} read/{} wait, load {} [view {}, decode {}, upload {}, release {}], execute {}, capture+sync {}); rolling layer ETA {eta}",
                 model.num_layers,
                 format_duration_us(latest.total_before_checkpoint_us),
                 format_duration_us(latest.prefetch_read_us),
                 format_duration_us(latest.prefetch_wait_us),
                 format_duration_us(latest.load_upload_us),
+                format_duration_us(latest.source_view_us),
+                format_duration_us(latest.source_decode_us),
+                format_duration_us(latest.source_upload_us),
+                format_duration_us(latest.source_release_us),
                 format_duration_us(latest.execute_us),
                 format_duration_us(
                     latest
@@ -2719,6 +2746,13 @@ mod tests {
         assert_eq!(timing.prefetch_read_us, 0);
         assert_eq!(timing.prefetch_bytes, 0);
         assert_eq!(timing.prefetch_errors, 0);
+        assert_eq!(timing.source_tensor_count, 0);
+        assert_eq!(timing.source_bytes, 0);
+        assert_eq!(timing.gpu_upload_bytes, 0);
+        assert_eq!(timing.source_view_us, 0);
+        assert_eq!(timing.source_decode_us, 0);
+        assert_eq!(timing.source_upload_us, 0);
+        assert_eq!(timing.source_release_us, 0);
     }
 
     #[test]
