@@ -214,6 +214,18 @@ logical tensors with zero duplicates. Treat both the stalled attempt and this
 cold recovery layer as correctness/resume evidence only, not idle-host
 performance samples.
 
+The immediately following warm layer confirmed that bounded lookahead also
+recovered: layer 23/60 committed in 135.34 seconds after reading and retaining
+all 13,150,315,392 planned source bytes in 114.02 seconds during the prior
+layer. Foreground prefetch wait was 4 microseconds, all 18 tensors consumed
+resident staging, upload took 0.79 seconds, execution took 133.31 seconds, and
+prefetch reported zero errors. Its 2,621,440 K=10 routes again had zero invalid
+indices and exact gate-up/down telemetry; 174 undercovered experts were
+explicitly preserved and the duplicate-free ledger advanced to 400/1,038
+logical tensors. The scheduled 30-minute monitor also followed the replacement
+PID and reported the new 23/60 checkpoint, proving the operational watcher
+survives a resumable process restart.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
