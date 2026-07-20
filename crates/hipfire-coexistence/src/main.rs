@@ -35,6 +35,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Some("artifact"), Some("compare-calibration")) => {
             hipfire_coexistence::calibration_compare::run_cli(&args[2..])
         }
+        (Some("artifact"), Some("compare-residuals")) => {
+            hipfire_coexistence::residual_compare::run_cli(&args[2..])
+        }
         (Some("lora"), Some("export")) => lora_export(&args[2..]),
         (Some("lora"), Some("merge")) => lora_merge(&args[2..]),
         (Some("lora"), Some("convert")) => lora_convert(&args[2..]),
@@ -59,11 +62,15 @@ fn usage() {
          [--expert-capture-tile-rows N] [--expert-coverage-policy \
          strict|preserve-undercovered] [--kldref|--no-kldref] \
          [--kldref-topk N] [--boundary-dir DIR|--boundary-ram] [--resume] [--dry-run]\n\
-         [--pause-after-layers N]\n\
+         [--pause-after-layers N] \
+         [--residual-probe-output PATH --residual-probe-rows N]\n\
          artifact inspect --input <artifact.hfq>\n\
          artifact compare-calibration --reference <resident.calib.hfq> \
          --candidate <streamed.calib.hfq> [--atol F] [--rtol F] \
          [--max-reports N] [--allow-unproven-provenance]\n\
+         artifact compare-residuals --reference <resident.residuals.hfq> \
+         --candidate <streamed.residuals.hfq> [--atol F] [--rtol F] \
+         [--max-reports N]\n\
          lora export  --hfq <model.hfq> --data-dir <dir> [--limit N] [--strength S] \
          [--no-orthogonalize] [--max-seq N] --out <adapter.lora.{{hfq,json}}>\n\
          lora merge   --hfq <base.hfq> --adapter <adapter.lora> --out <merged.hfq>\n\

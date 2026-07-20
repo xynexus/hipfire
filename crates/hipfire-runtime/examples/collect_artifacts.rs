@@ -32,7 +32,10 @@
 //!   cargo run --release -p hipfire-runtime --example collect_artifacts -- \
 //!     --model ~/.hipfire/models/qwen3.5-0.8b-bf16.hfq \
 //!     --corpus benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
-//!     --output /tmp/qwen3.5-0.8b.calib.hfq --max-tokens 256 [--kldref]
+//!     --output /tmp/qwen3.5-0.8b.calib.hfq --max-tokens 256 [--kldref] \
+//!     [--job-from /tmp/streamed.calib.hfq \
+//!      --residual-probe-output /tmp/resident.residuals.hfq \
+//!      --residual-probe-rows 16]
 
 use hipfire_arch_embeddinggemma::{self as embeddinggemma, calibration as embeddinggemma_calib};
 use hipfire_arch_gemma3::calibration as gemma3_calib;
@@ -107,6 +110,19 @@ fn main() {
         .parse()
         .unwrap();
     let parity_job = arg("--job-from", None).map(|path| load_resident_parity_job(&path));
+    let residual_probe_output = arg("--residual-probe-output", None);
+    let residual_probe_rows: usize = arg("--residual-probe-rows", Some("16".into()))
+        .unwrap()
+        .parse()
+        .expect("--residual-probe-rows must be an integer");
+    assert!(
+        residual_probe_rows > 0,
+        "--residual-probe-rows must be nonzero"
+    );
+    assert!(
+        residual_probe_output.is_none() || parity_job.is_some(),
+        "--residual-probe-output requires --job-from so row provenance is exact"
+    );
     let cli_kldref = std::env::args().any(|a| a == "--kldref");
     let want_kldref = parity_job
         .as_ref()
@@ -150,6 +166,10 @@ fn main() {
             "--job-from has multiple independent samples, but this resident family has no state-reset oracle"
         );
     }
+    assert!(
+        residual_probe_output.is_none() || matches!(source_arch_id, 5 | 6),
+        "resident residual probes are currently implemented for Qwen3.5 arch 5/6"
+    );
 
     let embedding_metadata =
         hipfire_model::embedding::EmbeddingMetadata::from_hfq_metadata_json(&hfq.metadata_json)
@@ -340,6 +360,18 @@ fn main() {
                 kldref: want_kldref,
                 kldref_topk: kldref_topk,
             };
+            if let (Some(path), Some(parity)) = (&residual_probe_output, &parity_job) {
+                qwen35::collect_residual_probe_job(
+                    &mut gpu,
+                    &weights,
+                    &config,
+                    &parity.job,
+                    source_arch_id,
+                    residual_probe_rows,
+                    Path::new(path),
+                )
+                .expect("collect resident residual probe");
+            }
             let summary = if let Some(parity) = &parity_job {
                 qwen35::collect_calibration_artifacts_samples(
                     &mut gpu,

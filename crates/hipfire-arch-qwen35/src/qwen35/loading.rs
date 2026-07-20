@@ -3408,6 +3408,131 @@ pub fn collect_calibration_artifacts_samples(
     )
 }
 
+/// Emit a bounded resident full-stack post-layer residual probe for the exact
+/// independent-sample job consumed by the layer-stream engine. This is a
+/// parity/debug pass over an already-loaded model; it never reloads weights or
+/// changes the calibration artifact.
+pub fn collect_residual_probe_job(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    job: &hipfire_runtime::calibration::contracts::CalibrationJob,
+    arch_id: u32,
+    max_rows: usize,
+    output: &std::path::Path,
+) -> HipResult<()> {
+    use crate::speculative::HiddenStateRingBuffer;
+    use hipfire_runtime::calibration::residual_probe::ResidualProbe;
+
+    let mut probe = ResidualProbe::new(
+        arch_id,
+        "qwen3.5",
+        "resident-full-stack",
+        job,
+        config.dim,
+        config.n_layers,
+        max_rows,
+    )
+    .map_err(|error| HipError::new(0, &error.to_string()))?;
+    let probe_rows = probe.row_count();
+    let mut layer_values = (0..config.n_layers)
+        .map(|_| Vec::with_capacity(probe_rows * config.dim))
+        .collect::<Vec<_>>();
+    let mut remaining = probe_rows;
+
+    for sample in job.samples.samples() {
+        if remaining == 0 {
+            break;
+        }
+        let take = sample.tokens.len().min(remaining);
+        let tokens = &sample.tokens[..take];
+        let mut kv = kv::KvCache::new_gpu(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            take + 16,
+        )
+        .map_err(|error| HipError::new(0, &format!("resident residual probe KV: {error}")))?;
+        let mut dn = match DeltaNetState::new_with_quant(gpu, config, StateQuant::FP32) {
+            Ok(state) => state,
+            Err(error) => {
+                kv.free_gpu(gpu);
+                return Err(HipError::new(
+                    0,
+                    &format!("resident residual probe DeltaNet state: {error}"),
+                ));
+            }
+        };
+        let scratch = match Qwen35Scratch::new_with_kv_max(gpu, config, 64, take + 16) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                dn.free_gpu(gpu);
+                kv.free_gpu(gpu);
+                return Err(HipError::new(
+                    0,
+                    &format!("resident residual probe scratch: {error}"),
+                ));
+            }
+        };
+        let mut ring = match HiddenStateRingBuffer::new_for_layers(
+            gpu,
+            config.n_layers,
+            (0..config.n_layers).collect(),
+            config.dim,
+            take,
+            1,
+        ) {
+            Ok(ring) => ring,
+            Err(error) => {
+                scratch.free_gpu(gpu);
+                dn.free_gpu(gpu);
+                kv.free_gpu(gpu);
+                return Err(HipError::new(
+                    0,
+                    &format!("resident residual probe ring: {error}"),
+                ));
+            }
+        };
+
+        let result = (|| {
+            for (position, &token) in tokens.iter().enumerate() {
+                forward_scratch_with_hidden(
+                    gpu, weights, config, token, position, &mut kv, &mut dn, &scratch, &mut ring,
+                )?;
+            }
+            for (layer, buffer) in ring.layer_bufs.iter().enumerate() {
+                let values = gpu.download_f32(buffer)?;
+                layer_values[layer].extend_from_slice(&values[..take * config.dim]);
+            }
+            Ok::<(), HipError>(())
+        })();
+        ring.free_gpu(gpu);
+        scratch.free_gpu(gpu);
+        dn.free_gpu(gpu);
+        kv.free_gpu(gpu);
+        result?;
+        remaining -= take;
+    }
+    if remaining != 0 {
+        return Err(HipError::new(
+            0,
+            &format!("resident residual probe is missing {remaining} canonical rows"),
+        ));
+    }
+    for (layer, values) in layer_values.into_iter().enumerate() {
+        probe
+            .push_layer(layer, values)
+            .map_err(|error| HipError::new(0, &error.to_string()))?;
+    }
+    if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|error| HipError::new(0, &error.to_string()))?;
+    }
+    probe
+        .write(output)
+        .map_err(|error| HipError::new(0, &error.to_string()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_calibration_artifacts_sequences(
     gpu: &mut Gpu,
@@ -3469,7 +3594,7 @@ fn collect_calibration_artifacts_sequences(
                     tokens.len() + 16,
                 )
                 .map_err(|e| format!("qwen35 calib kv: {e}"))?;
-                let mut dn = DeltaNetState::new(gpu, config)
+                let mut dn = DeltaNetState::new_with_quant(gpu, config, StateQuant::FP32)
                     .map_err(|e| format!("qwen35 calib dn: {e}"))?;
                 let scratch = Qwen35Scratch::new(gpu, config, 64)
                     .map_err(|e| format!("qwen35 calib scratch: {e}"))?;

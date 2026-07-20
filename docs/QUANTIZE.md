@@ -203,14 +203,30 @@ BF16/F16 preservation.
 For a resident-versus-layer-streamed parity run, generate both calibration
 packages from the same frozen sample set. After the streamed artifact exists,
 the resident oracle consumes its embedded native job rather than retokenizing
-the corpus or concatenating independent sequences:
+the corpus or concatenating independent sequences. A fresh uninterrupted
+streamed run can also write a bounded post-layer residual sidecar; this is
+deliberately separate from the quantizer-facing calibration artifact:
+
+```bash
+target/release/hipfire-coexistence calibrate \
+  --model <same-source-safetensors> \
+  --corpus <same-corpus> \
+  --output /tmp/streamed.calib.hfq \
+  --residual-probe-output /tmp/streamed.residuals.hfq \
+  --residual-probe-rows 16 \
+  <same-calibration-options>
+```
+
+Then run the already-loaded resident model over the exact serialized job:
 
 ```bash
 target/release/hipfire lock acquire resident-calibration --watch-pid "$$"
 cargo run --release -p hipfire-runtime --example collect_artifacts -- \
   --model <same-source-bf16.hfq> \
   --job-from /tmp/streamed.calib.hfq \
-  --output /tmp/resident.calib.hfq
+  --output /tmp/resident.calib.hfq \
+  --residual-probe-output /tmp/resident.residuals.hfq \
+  --residual-probe-rows 16
 target/release/hipfire lock release
 ```
 
@@ -240,6 +256,24 @@ Missing per-layer router telemetry on only one side is a comparison failure. Use
 `--allow-unproven-provenance` only for diagnostic comparison of a legacy
 resident artifact that predates the matched-sample metadata contract. Such a
 run is not admission evidence.
+
+Compare the residual sidecars separately. Their canonical sample/position/token
+map, source family, architecture, corpus/sample fingerprints, layer count, and
+hidden width must match exactly; every finite F32 post-layer value is then
+checked with the requested absolute/relative tolerance:
+
+```bash
+target/release/hipfire-coexistence artifact compare-residuals \
+  --reference /tmp/resident.residuals.hfq \
+  --candidate /tmp/streamed.residuals.hfq \
+  --atol 1e-5 \
+  --rtol 5e-3
+```
+
+Residual probes are parity/debug evidence, not production-calibration payloads.
+The streamed producer refuses probe capture with `--resume` or
+`--pause-after-layers`, because a partial sidecar must never masquerade as a
+complete all-layer comparison.
 
 The routed telemetry includes grouped microbatch count, active-expert
 sum/maximum, padding rows, capture-gather launches, full and final-partial

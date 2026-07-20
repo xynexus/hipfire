@@ -5444,13 +5444,67 @@ impl HiddenStateRingBuffer {
         max_batch: usize,
     ) -> HipResult<Self> {
         let extract_layers = dflash_extract_layer_ids(num_target_layers, num_extract);
-        let mut layer_bufs = Vec::with_capacity(num_extract);
-        let mut staging_bufs = Vec::with_capacity(num_extract);
-        for _ in 0..num_extract {
-            layer_bufs
-                .push(gpu.alloc_tensor(&[max_positions * hidden_dim], hipfire_rdna::DType::F32)?);
-            staging_bufs
-                .push(gpu.alloc_tensor(&[max_batch * hidden_dim], hipfire_rdna::DType::F32)?);
+        Self::new_for_layers(
+            gpu,
+            num_target_layers,
+            extract_layers,
+            hidden_dim,
+            max_positions,
+            max_batch,
+        )
+    }
+
+    /// Allocate a hidden-state ring for explicitly selected logical layers.
+    /// DFlash uses [`Self::new`]'s evenly spaced policy; calibration parity
+    /// uses this constructor to observe every layer without coupling the probe
+    /// to the DFlash extraction policy.
+    pub fn new_for_layers(
+        gpu: &mut Gpu,
+        num_target_layers: usize,
+        extract_layers: Vec<usize>,
+        hidden_dim: usize,
+        max_positions: usize,
+        max_batch: usize,
+    ) -> HipResult<Self> {
+        validate_hidden_extract_layers(
+            num_target_layers,
+            &extract_layers,
+            hidden_dim,
+            max_positions,
+            max_batch,
+        )
+        .map_err(|error| hip_bridge::HipError::new(0, &error))?;
+        let mut layer_bufs = Vec::with_capacity(extract_layers.len());
+        let mut staging_bufs = Vec::with_capacity(extract_layers.len());
+        let ring_elements = max_positions * hidden_dim;
+        let staging_elements = max_batch * hidden_dim;
+        for _ in 0..extract_layers.len() {
+            let layer = match gpu.alloc_tensor(&[ring_elements], hipfire_rdna::DType::F32) {
+                Ok(tensor) => tensor,
+                Err(error) => {
+                    for tensor in layer_bufs {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    for tensor in staging_bufs {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(error);
+                }
+            };
+            layer_bufs.push(layer);
+            let staging = match gpu.alloc_tensor(&[staging_elements], hipfire_rdna::DType::F32) {
+                Ok(tensor) => tensor,
+                Err(error) => {
+                    for tensor in layer_bufs {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    for tensor in staging_bufs {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(error);
+                }
+            };
+            staging_bufs.push(staging);
         }
         Ok(Self {
             layer_bufs,
@@ -5659,6 +5713,43 @@ impl HiddenStateRingBuffer {
         self.head = 0;
         self.written = 0;
     }
+}
+
+fn validate_hidden_extract_layers(
+    num_target_layers: usize,
+    extract_layers: &[usize],
+    hidden_dim: usize,
+    max_positions: usize,
+    max_batch: usize,
+) -> Result<(), String> {
+    if num_target_layers == 0 || hidden_dim == 0 || max_positions == 0 || max_batch == 0 {
+        return Err(
+            "hidden-state ring layer count, width, positions, and batch must be nonzero".into(),
+        );
+    }
+    if max_batch > max_positions {
+        return Err(format!(
+            "hidden-state ring max_batch {max_batch} exceeds max_positions {max_positions}"
+        ));
+    }
+    if max_positions.checked_mul(hidden_dim).is_none()
+        || max_batch.checked_mul(hidden_dim).is_none()
+    {
+        return Err("hidden-state ring allocation shape overflows usize".into());
+    }
+    let mut prior = None;
+    for &layer in extract_layers {
+        if layer >= num_target_layers {
+            return Err(format!(
+                "hidden-state extraction layer {layer} is outside 0..{num_target_layers}"
+            ));
+        }
+        if prior.is_some_and(|previous| layer <= previous) {
+            return Err("hidden-state extraction layers must be unique and increasing".into());
+        }
+        prior = Some(layer);
+    }
+    Ok(())
 }
 
 #[inline]
@@ -11982,6 +12073,15 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn explicit_hidden_extract_layers_require_a_unique_increasing_subset() {
+        assert!(validate_hidden_extract_layers(4, &[0, 1, 3], 8, 16, 4).is_ok());
+        assert!(validate_hidden_extract_layers(4, &[1, 1], 8, 16, 4).is_err());
+        assert!(validate_hidden_extract_layers(4, &[2, 1], 8, 16, 4).is_err());
+        assert!(validate_hidden_extract_layers(4, &[4], 8, 16, 4).is_err());
+        assert!(validate_hidden_extract_layers(4, &[0], 8, 4, 5).is_err());
+    }
 
     #[test]
     fn compact_target_hidden_host_keeps_selected_rows() {

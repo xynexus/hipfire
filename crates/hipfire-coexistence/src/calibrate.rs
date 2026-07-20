@@ -13,6 +13,7 @@ use hipfire_runtime::calibration::contracts::{
     CapturePolicy, CaptureRegistry, ExpertCaptureQuota, ExpertCoveragePolicy, ExpertLayerTelemetry,
     ExpertSamplingPolicy, KldRefBuilder, KldRefPayload, KldRefRow, LayerExpert, SampleSet,
 };
+use hipfire_runtime::calibration::residual_probe::ResidualProbe;
 use hipfire_runtime::calibration::schedule::{MicrobatchGeometry, MicrobatchPlanner};
 use hipfire_runtime::calibration::source::{
     LayerPrefetch, LayerPrefetchReport, PlannedTensorReader, ReadLedger, ReadLedgerSnapshot,
@@ -55,7 +56,8 @@ const CALIBRATE_USAGE: &str = "usage: hipfire-coexistence calibrate \
 [--expert-coverage-policy strict|preserve-undercovered] [--kldref|--no-kldref] \
 [--kldref-topk N] [--layer-prefetch-bytes N (default: 17179869184; 0 disables)] \
 [--boundary-dir DIR|--boundary-ram] [--resume] \
-[--pause-after-layers N] [--dry-run]";
+[--pause-after-layers N] [--residual-probe-output PATH --residual-probe-rows N] \
+[--dry-run]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -276,6 +278,8 @@ struct CalibrateCommand {
     boundary_directory: Option<PathBuf>,
     resume: bool,
     pause_after_layers: Option<usize>,
+    residual_probe_output: Option<PathBuf>,
+    residual_probe_rows: usize,
     dry_run: bool,
 }
 
@@ -302,6 +306,8 @@ impl CalibrateCommand {
         let mut boundary_directory = None;
         let mut resume = false;
         let mut pause_after_layers = None;
+        let mut residual_probe_output = None;
+        let mut residual_probe_rows = 16usize;
         let mut dry_run = false;
         let mut index = 0usize;
         while index < args.len() {
@@ -359,6 +365,10 @@ impl CalibrateCommand {
                         "--pause-after-layers" => {
                             pause_after_layers = Some(parse_value(flag, value)?)
                         }
+                        "--residual-probe-output" => {
+                            residual_probe_output = Some(PathBuf::from(value))
+                        }
+                        "--residual-probe-rows" => residual_probe_rows = parse_value(flag, value)?,
                         _ => return Err(format!("calibrate: unknown flag {flag}")),
                     }
                     index += 1;
@@ -388,6 +398,8 @@ impl CalibrateCommand {
             boundary_directory,
             resume,
             pause_after_layers,
+            residual_probe_output,
+            residual_probe_rows,
             dry_run,
         };
         command
@@ -407,6 +419,20 @@ impl CalibrateCommand {
         }
         if command.pause_after_layers == Some(0) {
             return Err("calibrate: --pause-after-layers must be nonzero".into());
+        }
+        if command.residual_probe_rows == 0 {
+            return Err("calibrate: --residual-probe-rows must be nonzero".into());
+        }
+        if command.residual_probe_output.is_some()
+            && (command.resume || command.pause_after_layers.is_some())
+        {
+            return Err(
+                "calibrate: residual probes require a fresh, uninterrupted run (no --resume or --pause-after-layers)"
+                    .into(),
+            );
+        }
+        if command.residual_probe_output.as_ref() == Some(&command.output) {
+            return Err("calibrate: --residual-probe-output must differ from --output".into());
         }
         Ok(command)
     }
@@ -614,11 +640,16 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
         .with_resume(command.resume)
         .with_pause_after_layers(command.pause_after_layers)
         .with_layer_prefetch_bytes(command.layer_prefetch_bytes)
+        .with_residual_probe(
+            command.residual_probe_output.clone(),
+            command.residual_probe_rows,
+        )
         .run(resolved.adapter.as_mut(), &source, &mut gpu, &job)?;
     let report = match result {
         CalibrationRunOutcome::Complete(result) => serde_json::json!({
             "status": "complete",
             "artifact": result.artifact_path,
+            "residual_probe": command.residual_probe_output,
             "family": result.model.family,
             "layers": result.model.num_layers,
             "hessian_tensors": result.artifact.n_hessian,
@@ -1025,6 +1056,11 @@ fn dry_run_report(
             "calibration": command.output,
             "resume": command.resume,
             "pause_after_layers": command.pause_after_layers,
+            "residual_probe": command.residual_probe_output.as_ref().map(|path| serde_json::json!({
+                "output": path,
+                "rows": command.residual_probe_rows,
+                "requires_fresh_uninterrupted_run": true,
+            })),
             "boundary_checkpoint": if command.boundary_ram {
                 None
             } else {
@@ -1851,6 +1887,8 @@ pub struct LayerStreamEngine {
     resume: bool,
     pause_after_layers: Option<usize>,
     layer_prefetch_bytes: u64,
+    residual_probe_output: Option<PathBuf>,
+    residual_probe_rows: usize,
 }
 
 impl LayerStreamEngine {
@@ -1861,6 +1899,8 @@ impl LayerStreamEngine {
             resume: false,
             pause_after_layers: None,
             layer_prefetch_bytes: CALIBRATION_DEFAULT_LAYER_PREFETCH_BYTES,
+            residual_probe_output: None,
+            residual_probe_rows: 16,
         }
     }
 
@@ -1879,6 +1919,12 @@ impl LayerStreamEngine {
         self
     }
 
+    pub fn with_residual_probe(mut self, output: Option<PathBuf>, rows: usize) -> Self {
+        self.residual_probe_output = output;
+        self.residual_probe_rows = rows;
+        self
+    }
+
     pub fn run(
         self,
         adapter: &mut dyn CalibrationFamilyAdapter,
@@ -1893,6 +1939,24 @@ impl LayerStreamEngine {
                 self.artifact_output.display()
             )));
         }
+        if let Some(path) = &self.residual_probe_output {
+            if self.resume || self.pause_after_layers.is_some() {
+                return Err(CalibError::InvalidOptions(
+                    "residual probes require a fresh, uninterrupted calibration run".into(),
+                ));
+            }
+            if path.exists() {
+                return Err(CalibError::InvalidOptions(format!(
+                    "refusing to overwrite residual probe {}",
+                    path.display()
+                )));
+            }
+            if path == &self.artifact_output {
+                return Err(CalibError::InvalidOptions(
+                    "residual probe output must differ from the calibration artifact".into(),
+                ));
+            }
+        }
         if job.options.boundary_precision != BoundaryPrecision::F32 {
             return Err(CalibError::InvalidOptions(
                 "the native layer-stream engine currently requires F32 boundaries".into(),
@@ -1900,6 +1964,21 @@ impl LayerStreamEngine {
         }
         let model = adapter.inspect(source)?;
         model.validate()?;
+        let mut residual_probe = self
+            .residual_probe_output
+            .as_ref()
+            .map(|_| {
+                ResidualProbe::new(
+                    model.arch_id,
+                    &model.family,
+                    "layer-streamed",
+                    job,
+                    model.hidden_width,
+                    model.num_layers,
+                    self.residual_probe_rows,
+                )
+            })
+            .transpose()?;
         if let Some(limit) = self.pause_after_layers {
             if limit > model.num_layers {
                 return Err(CalibError::InvalidOptions(format!(
@@ -2335,6 +2414,12 @@ impl LayerStreamEngine {
             write_layer_progress(&self.artifact_output, &progress)?;
             drop(layer);
             boundary.commit_layer(layer_index)?;
+            if let Some(probe) = residual_probe.as_mut() {
+                probe.push_layer(
+                    layer_index,
+                    boundary.read_active_rows(0, probe.row_count())?,
+                )?;
+            }
             max_consistency = max_consistency.max(capture_summary.max_consistency);
             descriptors.extend(layer_descriptors);
             if let Some(telemetry) = layer_telemetry {
@@ -2531,8 +2616,32 @@ impl LayerStreamEngine {
             &extra_tensors,
         )
         .map_err(|error| CalibError::Runtime(error.to_string()))?;
-        std::fs::rename(&assembling_path, &self.artifact_output)
-            .map_err(|error| CalibError::Runtime(error.to_string()))?;
+        if let (Some(path), Some(probe)) = (&self.residual_probe_output, &residual_probe) {
+            if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+                fs::create_dir_all(parent)
+                    .map_err(|error| CalibError::Runtime(error.to_string()))?;
+            }
+            let probe_assembling = assembling_residual_probe_path(path);
+            remove_if_exists(&probe_assembling)?;
+            let write_result = (|| {
+                probe.write(&probe_assembling)?;
+                sync_file(&probe_assembling)?;
+                fs::rename(&probe_assembling, path)
+                    .map_err(|error| CalibError::Runtime(error.to_string()))?;
+                sync_parent_directory(path)
+            })();
+            if let Err(error) = write_result {
+                let _ = remove_if_exists(&probe_assembling);
+                let _ = remove_if_exists(path);
+                return Err(error);
+            }
+        }
+        if let Err(error) = std::fs::rename(&assembling_path, &self.artifact_output) {
+            if let Some(path) = &self.residual_probe_output {
+                let _ = remove_if_exists(path);
+            }
+            return Err(CalibError::Runtime(error.to_string()));
+        }
         sync_file(&self.artifact_output)?;
         sync_parent_directory(&self.artifact_output)?;
         drop(ledger);
@@ -2613,6 +2722,14 @@ fn assembling_artifact_path(output: &Path) -> PathBuf {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("calib.hfq");
+    output.with_file_name(format!(".{name}.assembling"))
+}
+
+fn assembling_residual_probe_path(output: &Path) -> PathBuf {
+    let name = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("residuals.hfq");
     output.with_file_name(format!(".{name}.assembling"))
 }
 
@@ -3051,6 +3168,36 @@ mod tests {
         .map(str::to_string);
         let command = CalibrateCommand::parse(&args).unwrap();
         assert_eq!(command.layer_prefetch_bytes, 12345);
+    }
+
+    #[test]
+    fn cli_accepts_a_bounded_residual_probe_only_for_fresh_full_runs() {
+        let base = [
+            "--model",
+            "model",
+            "--corpus",
+            "corpus.txt",
+            "--output",
+            "out.hfq",
+            "--residual-probe-output",
+            "residuals.hfq",
+            "--residual-probe-rows",
+            "8",
+        ]
+        .map(str::to_string);
+        let command = CalibrateCommand::parse(&base).unwrap();
+        assert_eq!(
+            command.residual_probe_output,
+            Some(PathBuf::from("residuals.hfq"))
+        );
+        assert_eq!(command.residual_probe_rows, 8);
+
+        let mut resumed = base.to_vec();
+        resumed.push("--resume".into());
+        assert!(CalibrateCommand::parse(&resumed).is_err());
+        let mut paused = base.to_vec();
+        paused.extend(["--pause-after-layers", "1"].map(str::to_string));
+        assert!(CalibrateCommand::parse(&paused).is_err());
     }
 
     #[test]
