@@ -41,10 +41,14 @@ Implemented and verified in this checkout:
   decision evidence-driven instead of attributing all foreground load time to
   the network;
 - bounded family-neutral source lookahead: the engine selects the next owner's
-  canonical physical ranges without consuming the read ledger, warms at most
-  16 GiB through one fixed 8 MiB worker buffer during current-layer execution,
-  preserves 32 GiB of live host-memory headroom, and persists read/wait/error
-  timing while remaining compatible with older checkpoints;
+  canonical physical ranges without consuming the read ledger, reads at most
+  16 GiB through one fixed 8 MiB worker chunk into resident staging during
+  current-layer execution, preserves 32 GiB of live host-memory headroom,
+  serves complete tensor views directly from those staged bytes, releases the
+  staging immediately after GPU upload, and advises the OS that the redundant
+  file-cache copy is no longer needed;
+  read/wait/staged/consumed byte counts remain compatible with older
+  checkpoints;
 - bounded quantizer storage: completed tensors spill to disk for bounded RSS,
   and Linux final assembly releases each copied-and-hashed spill range with
   hole punching rather than retaining two full artifact-sized payloads;
@@ -119,11 +123,15 @@ The first six steady production Qwen layers read about 13.15 GB each. Layers
 co-limiter or dominant limiter. The first two layers with completed lookahead
 telemetry each read about 13.1 GB in 113.8 seconds while the current layer
 executed for 232.1/234.7 seconds. Foreground prefetch waits were 3/4
-microseconds with zero read errors, proving that one-layer lookahead hides the
-network-read portion on this host. Foreground mapping, conversion, preparation,
-and GPU upload still took 140.1/191.1 seconds, so those phases remain separate
-optimization targets. A matched prefetch-on/off comparison of the same layer is
-still required before claiming an end-to-end speedup.
+microseconds with zero read errors, proving that one-layer lookahead has enough
+time to cover the network transfer on this host. The original page-cache-only
+implementation did not guarantee that those bytes survived later GPU
+allocation: a subsequent layer blocked in `folio_wait_bit_common` and accrued
+new backing reads after its lookahead had completed. Lookahead now retains a
+bounded anonymous staging buffer and feeds it directly to the source reader;
+the new source-phase telemetry distinguishes staged consumption, mmap refaults,
+decode, upload, and release. A matched page-cache/staged/off comparison of the
+same layer is still required before claiming an end-to-end speedup.
 
 The same production checkpoints prove K=10 routing over 262,144 corpus rows
 (2,621,440 routed slots) with zero invalid indices. Coverage is deliberately

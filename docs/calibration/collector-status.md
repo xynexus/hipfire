@@ -81,11 +81,13 @@ Live gfx1151 evidence on 2026-07-20:
   118.1 ms to execution, 1.226 s to capture serialization, 0.5 ms to finish,
   and 1.437 s to part sync/hash (2.846 s before checkpoint commit).
 - Network-backed source lookahead is now family-neutral and ledger-safe. The
-  engine warms the next owner's canonical physical ranges on one background
-  reader while the current layer executes, bounded to 16 GiB with a 32 GiB
-  live host-memory reserve and an 8 MiB staging buffer. Checkpoints record
-  prefetched bytes, background duration, foreground wait, and errors; matched
-  on/off production timings remain to be collected.
+  engine reads the next owner's canonical physical ranges through one 8 MiB
+  worker chunk into resident staging while the current layer executes, bounded
+  to 16 GiB with a 32 GiB live host-memory reserve. Complete tensor views are
+  consumed directly from staging and released after GPU upload. Checkpoints
+  record read/staged/consumed bytes plus background, view, decode, upload,
+  release, foreground-wait, and error telemetry; matched staged/page-cache/off
+  production timings remain to be collected.
 - On the identical 4,096-token Qwen sample set, 256/512/1,024/2,048/4,096-row
   geometries took 7.56/3.76/2.55/2.16/1.89 seconds of layer execution and
   produced identical normalized descriptors and expert telemetry. Total

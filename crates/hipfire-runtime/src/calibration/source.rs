@@ -13,7 +13,10 @@ use std::io::{Read, Seek, SeekFrom};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-const LAYER_PREFETCH_STAGING_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
+pub const LAYER_PREFETCH_WORKER_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum TensorOwner {
@@ -256,18 +259,65 @@ impl TensorLoadPlan {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedSourceRange {
+    pub location: TensorStorageLocation,
+    pub bytes: Vec<u8>,
+}
+
+/// Bounded resident bytes produced by the lookahead worker. A tensor view is
+/// served only when one staged range covers its complete physical payload;
+/// clipped/failed ranges safely fall back to the source mmap.
+#[derive(Debug, Default)]
+pub struct LayerStagingBuffer {
+    ranges: Vec<StagedSourceRange>,
+    byte_len: u64,
+}
+
+impl LayerStagingBuffer {
+    pub fn from_ranges(ranges: Vec<StagedSourceRange>) -> Self {
+        let byte_len = ranges.iter().fold(0u64, |total, range| {
+            total.saturating_add(u64::try_from(range.bytes.len()).unwrap_or(u64::MAX))
+        });
+        Self { ranges, byte_len }
+    }
+
+    pub const fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.byte_len == 0
+    }
+
+    pub fn view(&self, tensor: &TensorStorageLocation) -> Option<&[u8]> {
+        self.ranges.iter().find_map(|range| {
+            if range.location.path != tensor.path || tensor.byte_offset < range.location.byte_offset
+            {
+                return None;
+            }
+            let start = usize::try_from(tensor.byte_offset - range.location.byte_offset).ok()?;
+            let len = usize::try_from(tensor.byte_len).ok()?;
+            let end = start.checked_add(len)?;
+            range.bytes.get(start..end)
+        })
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct LayerPrefetchReport {
     pub requested_bytes: u64,
     pub completed_bytes: u64,
     pub ranges: usize,
     pub elapsed_us: u64,
     pub errors: Vec<String>,
+    pub staging: LayerStagingBuffer,
 }
 
-/// A bounded background read that warms the operating-system page cache for
-/// the next layer. It owns only a fixed-size staging buffer and never touches
-/// tensor payload semantics or the logical read ledger.
+/// A bounded background read that retains the next layer in resident host
+/// memory. The worker reads through one fixed-size scratch chunk, while the
+/// completed staging buffer stays within the engine's configured byte budget
+/// and never touches tensor semantics or the logical read ledger.
 pub struct LayerPrefetch {
     requested_bytes: u64,
     ranges: usize,
@@ -331,7 +381,8 @@ fn prefetch_ranges(ranges: Vec<TensorStorageLocation>) -> LayerPrefetchReport {
     let range_count = ranges.len();
     let mut completed_bytes = 0u64;
     let mut errors = Vec::new();
-    let mut staging = vec![0u8; LAYER_PREFETCH_STAGING_BYTES];
+    let mut scratch = vec![0u8; LAYER_PREFETCH_WORKER_CHUNK_BYTES];
+    let mut staged_ranges = Vec::with_capacity(range_count);
     for range in ranges {
         let mut file = match File::open(&range.path) {
             Ok(file) => file,
@@ -348,10 +399,32 @@ fn prefetch_ranges(ranges: Vec<TensorStorageLocation>) -> LayerPrefetchReport {
             ));
             continue;
         }
+        let requested_len = match usize::try_from(range.byte_len) {
+            Ok(len) => len,
+            Err(_) => {
+                errors.push(format!(
+                    "{}@{}: range length {} exceeds host address space",
+                    range.path.display(),
+                    range.byte_offset,
+                    range.byte_len
+                ));
+                continue;
+            }
+        };
+        let mut bytes = Vec::new();
+        if let Err(error) = bytes.try_reserve_exact(requested_len) {
+            errors.push(format!(
+                "{}@{}: could not reserve {} staged bytes: {error}",
+                range.path.display(),
+                range.byte_offset,
+                range.byte_len
+            ));
+            continue;
+        }
         let mut remaining = range.byte_len;
         while remaining > 0 {
-            let chunk = usize::try_from(remaining.min(staging.len() as u64)).unwrap();
-            match file.read(&mut staging[..chunk]) {
+            let chunk = usize::try_from(remaining.min(scratch.len() as u64)).unwrap();
+            match file.read(&mut scratch[..chunk]) {
                 Ok(0) => {
                     errors.push(format!(
                         "{}@{}: unexpected EOF with {remaining} bytes remaining",
@@ -361,6 +434,7 @@ fn prefetch_ranges(ranges: Vec<TensorStorageLocation>) -> LayerPrefetchReport {
                     break;
                 }
                 Ok(read) => {
+                    bytes.extend_from_slice(&scratch[..read]);
                     completed_bytes = completed_bytes.saturating_add(read as u64);
                     remaining -= read as u64;
                 }
@@ -375,6 +449,28 @@ fn prefetch_ranges(ranges: Vec<TensorStorageLocation>) -> LayerPrefetchReport {
                 }
             }
         }
+        let staged_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if staged_len > 0 {
+            staged_ranges.push(StagedSourceRange {
+                location: TensorStorageLocation {
+                    path: range.path.clone(),
+                    byte_offset: range.byte_offset,
+                    byte_len: staged_len,
+                },
+                bytes,
+            });
+        }
+        #[cfg(unix)]
+        unsafe {
+            // The anonymous staging bytes are now authoritative for this
+            // lookahead. Avoid retaining a second copy in the page cache.
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                range.byte_offset as libc::off_t,
+                staged_len as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
     }
     LayerPrefetchReport {
         requested_bytes,
@@ -384,6 +480,7 @@ fn prefetch_ranges(ranges: Vec<TensorStorageLocation>) -> LayerPrefetchReport {
             .unwrap_or(u64::MAX)
             .max(1),
         errors,
+        staging: LayerStagingBuffer::from_ranges(staged_ranges),
     }
 }
 
@@ -577,7 +674,8 @@ pub struct PlannedTensorView<'a> {
     pub info: &'a TensorInfo,
     pub bytes: &'a [u8],
     pub action: ReadAction,
-    source: &'a dyn ModelSource,
+    pub from_prefetch: bool,
+    source: Option<&'a dyn ModelSource>,
     source_name: String,
     release_pages: bool,
 }
@@ -593,6 +691,8 @@ pub struct SourceLoadTimings {
     pub tensor_count: u64,
     pub source_bytes: u64,
     pub gpu_upload_bytes: u64,
+    pub staged_tensor_count: u64,
+    pub staged_source_bytes: u64,
     /// Tensor lookup, logical-ledger consumption, and view construction.
     pub view_us: u64,
     /// Host dtype conversion or adjustment before upload.
@@ -609,6 +709,7 @@ impl SourceLoadTimings {
         &mut self,
         source_bytes: usize,
         gpu_upload_bytes: usize,
+        from_prefetch: bool,
         view_us: u64,
         decode_us: u64,
         upload_us: u64,
@@ -621,6 +722,12 @@ impl SourceLoadTimings {
         self.gpu_upload_bytes = self
             .gpu_upload_bytes
             .saturating_add(u64::try_from(gpu_upload_bytes).unwrap_or(u64::MAX));
+        if from_prefetch {
+            self.staged_tensor_count = self.staged_tensor_count.saturating_add(1);
+            self.staged_source_bytes = self
+                .staged_source_bytes
+                .saturating_add(u64::try_from(source_bytes).unwrap_or(u64::MAX));
+        }
         self.view_us = self.view_us.saturating_add(view_us);
         self.decode_us = self.decode_us.saturating_add(decode_us);
         self.upload_us = self.upload_us.saturating_add(upload_us);
@@ -635,7 +742,9 @@ fn elapsed_micros(started: Instant) -> u64 {
 impl Drop for PlannedTensorView<'_> {
     fn drop(&mut self) {
         if self.release_pages {
-            self.source.release_tensor_pages(&self.source_name);
+            if let Some(source) = self.source {
+                source.release_tensor_pages(&self.source_name);
+            }
         }
     }
 }
@@ -647,6 +756,7 @@ pub struct PlannedTensorReader<'source, 'ledger, 'plan> {
     source: &'source dyn ModelSource,
     ledger: &'ledger mut ReadLedger<'plan>,
     owner: TensorOwner,
+    staging: Option<&'source LayerStagingBuffer>,
     timings: SourceLoadTimings,
 }
 
@@ -660,6 +770,22 @@ impl<'source, 'ledger, 'plan> PlannedTensorReader<'source, 'ledger, 'plan> {
             source,
             ledger,
             owner,
+            staging: None,
+            timings: SourceLoadTimings::default(),
+        }
+    }
+
+    pub fn new_with_staging(
+        source: &'source dyn ModelSource,
+        ledger: &'ledger mut ReadLedger<'plan>,
+        owner: TensorOwner,
+        staging: &'source LayerStagingBuffer,
+    ) -> Self {
+        Self {
+            source,
+            ledger,
+            owner,
+            staging: Some(staging),
             timings: SourceLoadTimings::default(),
         }
     }
@@ -672,6 +798,7 @@ impl<'source, 'ledger, 'plan> PlannedTensorReader<'source, 'ledger, 'plan> {
         &mut self,
         source_bytes: usize,
         gpu_upload_bytes: usize,
+        from_prefetch: bool,
         view_us: u64,
         decode_us: u64,
         upload_us: u64,
@@ -680,6 +807,7 @@ impl<'source, 'ledger, 'plan> PlannedTensorReader<'source, 'ledger, 'plan> {
         self.timings.record(
             source_bytes,
             gpu_upload_bytes,
+            from_prefetch,
             view_us,
             decode_us,
             upload_us,
@@ -697,30 +825,46 @@ impl<'source, 'ledger, 'plan> PlannedTensorReader<'source, 'ledger, 'plan> {
                 entry.owner, self.owner
             )));
         }
-        let (info, bytes) = self.source.tensor_data(&entry.source_name).ok_or_else(|| {
-            CalibError::ReadLedger(format!(
-                "source tensor {} has metadata but no readable payload",
-                entry.source_name
-            ))
-        })?;
+        let staged_bytes = self
+            .staging
+            .and_then(|staging| staging.view(&entry.storage));
+        let (info, bytes, from_prefetch) = if let Some(bytes) = staged_bytes {
+            let info = self.source.tensor_info(&entry.source_name).ok_or_else(|| {
+                CalibError::ReadLedger(format!(
+                    "source tensor {} has planned storage but no metadata",
+                    entry.source_name
+                ))
+            })?;
+            (info, bytes, true)
+        } else {
+            let (info, bytes) = self.source.tensor_data(&entry.source_name).ok_or_else(|| {
+                CalibError::ReadLedger(format!(
+                    "source tensor {} has metadata but no readable payload",
+                    entry.source_name
+                ))
+            })?;
+            (info, bytes, false)
+        };
         // A canonical tensor with a declared future alias (for example tied
         // embedding/lm-head storage) stays resident until that alias consumes
         // the same pages. Ordinary layer tensors and alias views release their
         // file-backed cache as soon as the upload/conversion scope ends.
-        let release_pages = entry.alias_of.is_some()
-            || !self
-                .ledger
-                .plan
-                .entries()
-                .iter()
-                .any(|candidate| candidate.alias_of.as_deref() == Some(logical_name));
+        let release_pages = !from_prefetch
+            && (entry.alias_of.is_some()
+                || !self
+                    .ledger
+                    .plan
+                    .entries()
+                    .iter()
+                    .any(|candidate| candidate.alias_of.as_deref() == Some(logical_name)));
         let source_name = entry.source_name.clone();
         let action = self.ledger.consume(logical_name)?;
         Ok(PlannedTensorView {
             info,
             bytes,
             action,
-            source: self.source,
+            from_prefetch,
+            source: (!from_prefetch).then_some(self.source),
             source_name,
             release_pages,
         })
@@ -891,6 +1035,7 @@ pub fn load_source_tensor(
     let view_us = elapsed_micros(view_started);
     validate_source_shape(view.info, shape, logical_name)?;
     let source_bytes = view.bytes.len();
+    let from_prefetch = view.from_prefetch;
     let upload_started = Instant::now();
     let upload = upload_source_payload(gpu, view.info.dtype.as_str(), view.bytes, shape);
     let upload_us = elapsed_micros(upload_started);
@@ -910,6 +1055,7 @@ pub fn load_source_tensor(
     reader.record_load(
         source_bytes,
         gpu_upload_bytes,
+        from_prefetch,
         view_us,
         0,
         upload_us,
@@ -935,6 +1081,7 @@ pub fn load_source_f32_tensor(
         )));
     }
     let source_bytes = view.bytes.len();
+    let from_prefetch = view.from_prefetch;
     let decode_started = Instant::now();
     let mut values = source_payload_f32(view.info.dtype.as_str(), view.bytes)?;
     if values.len() != elements {
@@ -958,6 +1105,7 @@ pub fn load_source_f32_tensor(
     reader.record_load(
         source_bytes,
         elements.saturating_mul(std::mem::size_of::<f32>()),
+        from_prefetch,
         view_us,
         decode_us,
         upload_us,
@@ -1115,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_prefetch_reads_ranges_with_a_fixed_size_staging_buffer() {
+    fn layer_prefetch_retains_ranges_for_direct_tensor_views() {
         use std::io::Write;
 
         let path = std::env::temp_dir().join(format!(
@@ -1142,8 +1290,49 @@ mod tests {
         assert_eq!(report.ranges, 1);
         assert!(report.errors.is_empty());
         assert!(report.elapsed_us > 0);
+        assert_eq!(report.staging.byte_len(), 2 * 1024 * 1024);
+        let tensor = TensorStorageLocation {
+            path: path.clone(),
+            byte_offset: 768 * 1024,
+            byte_len: 1024 * 1024,
+        };
+        assert_eq!(
+            report.staging.view(&tensor).unwrap(),
+            vec![0x5a; 1024 * 1024]
+        );
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn owner_reader_prefers_staged_bytes_without_releasing_source_pages() {
+        let source = FakeSource::new();
+        let plan = TensorLoadPlan::build(
+            &source,
+            [TensorLoadRequest::tensor(
+                "layer0.weight",
+                "l0.w",
+                TensorOwner::Layer(0),
+            )],
+        )
+        .unwrap();
+        let storage = plan.entry("layer0.weight").unwrap().storage.clone();
+        let staging = LayerStagingBuffer::from_ranges(vec![StagedSourceRange {
+            location: storage,
+            bytes: vec![0x7b; 24],
+        }]);
+        let mut ledger = ReadLedger::new(&plan);
+        let mut reader = PlannedTensorReader::new_with_staging(
+            &source,
+            &mut ledger,
+            TensorOwner::Layer(0),
+            &staging,
+        );
+        let view = reader.read("layer0.weight").unwrap();
+        assert!(view.from_prefetch);
+        assert_eq!(view.bytes, [0x7b; 24]);
+        drop(view);
+        assert!(source.released.borrow().is_empty());
     }
 
     #[test]

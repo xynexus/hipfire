@@ -71,9 +71,11 @@ also performs live memory estimates and allocation probes before accepting an
 automatic geometry on a different host.
 
 The target pass defaults to a 16 GiB bounded next-layer source prefetch. While
-one layer executes, the native engine warms the following layer's canonical
-safetensor ranges without consuming its read-ledger entries. It retains a 32
-GiB live host-memory reserve and reduces the effective budget when required.
+one layer executes, the native engine reads the following layer's canonical
+safetensor ranges into bounded resident host staging without consuming its
+read-ledger entries. The next layer consumes complete tensor views directly
+from staging, which is freed after synchronous GPU upload. It retains a 32 GiB
+live host-memory reserve and reduces the effective budget when required.
 Override with `--layer-prefetch-bytes N`, or pass zero to disable lookahead;
 the chosen operational budget is recorded in the two-pass recipe.
 

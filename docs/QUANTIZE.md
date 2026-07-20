@@ -227,13 +227,16 @@ artifact for throughput and resume ETA analysis.
 
 Network-backed sources use a bounded one-layer lookahead by default. After
 layer N is GPU-resident, a family-neutral worker reads layer N+1's canonical
-physical source ranges into the operating-system page cache while N executes.
-The worker uses one fixed 8 MiB staging buffer, never consumes the logical read
-ledger, and waits only for any unfinished tail before N+1 uploads. The default
+physical source ranges through one fixed 8 MiB worker chunk into bounded
+resident host staging while N executes. The tensor reader consumes complete
+views directly from staging, then frees it immediately after N+1 uploads; a
+partial range safely falls back to the source mmap. The worker never consumes
+the logical read ledger and waits only for an unfinished tail. The default
 budget is 16 GiB with a live 32 GiB host-memory reserve; use
-`--layer-prefetch-bytes 0` to disable it. Checkpoints record prefetched bytes,
-background read time, foreground wait time, submission time, and errors, while
-older timing checkpoints remain resume-compatible.
+`--layer-prefetch-bytes 0` to disable it. Checkpoints record read and staged
+bytes, direct staged consumption, background and foreground timing, source
+decode/upload/release phases, and errors. Older checkpoints remain
+resume-compatible.
 
 On unified-memory systems, completed safetensor ranges receive mapping-level
 `MADV_DONTNEED` plus a backing-file cache hint after their synchronous GPU

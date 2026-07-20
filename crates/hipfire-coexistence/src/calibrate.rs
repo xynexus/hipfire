@@ -16,7 +16,7 @@ use hipfire_runtime::calibration::contracts::{
 use hipfire_runtime::calibration::schedule::{MicrobatchGeometry, MicrobatchPlanner};
 use hipfire_runtime::calibration::source::{
     LayerPrefetch, LayerPrefetchReport, PlannedTensorReader, ReadLedger, ReadLedgerSnapshot,
-    TensorLoadPlan, TensorOwner,
+    TensorLoadPlan, TensorOwner, LAYER_PREFETCH_WORKER_CHUNK_BYTES,
 };
 use hipfire_runtime::calibration::stream::{CalibrationFamilyAdapter, ModelInspection};
 use hipfire_runtime::calibration::{
@@ -960,6 +960,8 @@ fn dry_run_report(
             "persistent_source_bytes": tensor_plan.bytes_for(TensorOwner::Persistent),
             "max_layer_source_bytes": max_layer_source_bytes,
             "layer_prefetch": {
+                "mode": "resident-staging",
+                "worker_chunk_bytes": LAYER_PREFETCH_WORKER_CHUNK_BYTES,
                 "configured_bytes": command.layer_prefetch_bytes,
                 "host_reserve_bytes": CALIBRATION_PREFETCH_HOST_RESERVE_BYTES,
                 "effective_max_layer_bytes": effective_layer_prefetch_bytes(
@@ -1139,6 +1141,10 @@ pub struct CalibrationLayerTiming {
     /// Total background read duration for this layer's prefetched source bytes.
     pub prefetch_read_us: u64,
     pub prefetch_bytes: u64,
+    /// Bytes retained in anonymous host staging and offered directly to the
+    /// tensor reader. This may be smaller than `prefetch_bytes` after a partial
+    /// read or bounded range that does not cover a complete tensor.
+    pub prefetch_staged_bytes: u64,
     pub prefetch_errors: usize,
     /// Time required to plan and start the following layer's lookahead worker.
     pub prefetch_submit_us: u64,
@@ -1146,6 +1152,8 @@ pub struct CalibrationLayerTiming {
     pub source_tensor_count: u64,
     pub source_bytes: u64,
     pub gpu_upload_bytes: u64,
+    pub staged_source_tensor_count: u64,
+    pub staged_source_bytes: u64,
     /// Source lookup and logical-ledger accounting.
     pub source_view_us: u64,
     /// Host-side source dtype conversion/adjustment.
@@ -1982,7 +1990,7 @@ impl LayerStreamEngine {
         for layer_index in completed_layers..model.num_layers {
             let layer_started = Instant::now();
             let prefetch_wait_started = Instant::now();
-            let prefetch_report = match pending_prefetch.take() {
+            let mut prefetch_report = match pending_prefetch.take() {
                 Some((target_layer, prefetch)) if target_layer == layer_index => prefetch.wait(),
                 Some((target_layer, prefetch)) => {
                     drop(prefetch);
@@ -2011,12 +2019,24 @@ impl LayerStreamEngine {
             }
             let load_started = Instant::now();
             let (mut layer, source_load) = {
-                let mut reader =
-                    PlannedTensorReader::new(source, &mut ledger, TensorOwner::Layer(layer_index));
+                let mut reader = if prefetch_report.staging.is_empty() {
+                    PlannedTensorReader::new(source, &mut ledger, TensorOwner::Layer(layer_index))
+                } else {
+                    PlannedTensorReader::new_with_staging(
+                        source,
+                        &mut ledger,
+                        TensorOwner::Layer(layer_index),
+                        &prefetch_report.staging,
+                    )
+                };
                 let layer =
                     adapter.load_layer(&mut reader, gpu, &model, layer_index, &execution_job)?;
                 (layer, reader.timings())
             };
+            let prefetch_staged_bytes = prefetch_report.staging.byte_len();
+            // Layer weights now own their GPU copies; release the potentially
+            // multi-gigabyte host staging before teacher execution begins.
+            prefetch_report.staging = Default::default();
             let load_upload_us = elapsed_us(load_started);
             let prefetch_submit_started = Instant::now();
             let next_layer = layer_index + 1;
@@ -2109,11 +2129,14 @@ impl LayerStreamEngine {
                 prefetch_wait_us,
                 prefetch_read_us: prefetch_report.elapsed_us,
                 prefetch_bytes: prefetch_report.completed_bytes,
+                prefetch_staged_bytes,
                 prefetch_errors: prefetch_report.errors.len(),
                 prefetch_submit_us,
                 source_tensor_count: source_load.tensor_count,
                 source_bytes: source_load.source_bytes,
                 gpu_upload_bytes: source_load.gpu_upload_bytes,
+                staged_source_tensor_count: source_load.staged_tensor_count,
+                staged_source_bytes: source_load.staged_source_bytes,
                 source_view_us: source_load.view_us,
                 source_decode_us: source_load.decode_us,
                 source_upload_us: source_load.upload_us,
@@ -2745,10 +2768,13 @@ mod tests {
         assert_eq!(timing.prefetch_wait_us, 0);
         assert_eq!(timing.prefetch_read_us, 0);
         assert_eq!(timing.prefetch_bytes, 0);
+        assert_eq!(timing.prefetch_staged_bytes, 0);
         assert_eq!(timing.prefetch_errors, 0);
         assert_eq!(timing.source_tensor_count, 0);
         assert_eq!(timing.source_bytes, 0);
         assert_eq!(timing.gpu_upload_bytes, 0);
+        assert_eq!(timing.staged_source_tensor_count, 0);
+        assert_eq!(timing.staged_source_bytes, 0);
         assert_eq!(timing.source_view_us, 0);
         assert_eq!(timing.source_decode_us, 0);
         assert_eq!(timing.source_upload_us, 0);
