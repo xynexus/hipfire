@@ -293,9 +293,16 @@ admitted-row-to-full/partial-tile identity for both capture roles and record
 routed rows, 1,122,912 gate-up gather launches, 119,770 full gate-up reduction
 tiles, and 5,328 final partial gate-up tiles. Do not fabricate the missing
 launch counts or use this mixed-instrumentation production run as the final
-all-layer capture-cost proof; a future resumable run must bind checkpoints to
-the calibration-engine build identity so a telemetry/schema-changing binary
-cannot silently continue the same semantic recipe fingerprint.
+all-layer capture-cost proof. Progress schema 2 now binds every checkpoint and
+the final artifact to a fingerprint of the exact calibration executable,
+keeps that producer provenance separate from the semantic recipe fingerprint,
+and requires exact executable identity while resuming incomplete progress. A
+telemetry- or schema-changing binary therefore cannot silently continue the
+same semantic recipe fingerprint; historical schema-1 progress must use its
+original binary or restart, while completed compatible artifacts remain valid
+pass-2 inputs. The boundary manifest stores a composite executable/run identity
+before embedding begins, closing the otherwise uncovered crash window before
+the first layer progress file exists.
 
 Still required before declaring the engine complete or promoting a production
 397B quant:

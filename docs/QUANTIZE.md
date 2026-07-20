@@ -245,7 +245,19 @@ disables a transition when Linux reports any full-memory PSI in the latest
 disable it explicitly. Checkpoints record read and staged bytes, direct staged
 consumption, background and foreground timing, source decode/upload/release
 phases, errors, and why the following transition was pressure-disabled. Older
-checkpoints remain resume-compatible.
+schema-1 checkpoints remain inspectable as historical evidence, but a new
+schema-2 binary deliberately refuses to resume them. Schema 2 records the
+calibration engine executable identity separately from the semantic run
+fingerprint, so changing the binary between layers cannot silently mix
+execution semantics or instrumentation. Resume with the original binary or
+restart the calibration under the new engine. A completed artifact remains
+portable to a later compatible quantizer because producer identity is
+provenance, not part of its calibration recipe.
+
+The mmap boundary manifest is bound at creation to both identities, before
+embedding materialization begins. This also closes the pre-layer-0 crash case:
+a different executable, source/recipe fingerprint, or sample set cannot reuse
+an embedding boundary that has no layer progress file yet.
 
 On unified-memory systems, completed safetensor ranges receive mapping-level
 `MADV_DONTNEED` plus a backing-file cache hint after their synchronous GPU
@@ -304,8 +316,11 @@ requires the existing artifact to match its family/adapter/architecture,
 source fingerprint and shard set, tokenizer/corpus/sample fingerprints,
 microbatch and F32 boundary geometry, expert capture policy, and KLDREF recipe.
 It also requires the native run fingerprint, which binds the complete adapter
-tensor plan, calibration job, and geometry. An HFQM header alone is not
-sufficient evidence for reuse; any semantic drift fails before pass 2 starts.
+tensor plan, calibration job, and geometry. The producer executable identity is
+recorded separately in the artifact and copied into the two-pass manifest; it
+guards in-progress checkpoint resume without unnecessarily invalidating a
+completed compatible artifact. An HFQM header alone is not sufficient evidence
+for reuse; any semantic drift fails before pass 2 starts.
 
 Before changing the family-neutral 2,048-row eligibility floor or 4,096-row
 capture target, freeze a one-axis Astrea experiment. A minimum sweep holds the

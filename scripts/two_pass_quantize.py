@@ -232,6 +232,7 @@ def update_manifest(
     quantized_value = quantized or manifest.get("quantized")
     fingerprints = {
         "calibration_artifact": _get(calibration_value, "artifact_fingerprint"),
+        "calibration_engine_build": _get(calibration_value, "metadata", "engine_build"),
         "calibration_run": _get(calibration_value, "metadata", "run_fingerprint"),
         "source": _get(calibration_value, "metadata", "source_manifest", "fingerprint"),
         "samples": _get(calibration_value, "metadata", "job", "samples", "fingerprint"),

@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub const BOUNDARY_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+pub const BOUNDARY_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 const MANIFEST_FILE: &str = "calibration-boundary.json";
 const BUFFER_FILES: [&str; 2] = ["boundary-a.f32", "boundary-b.f32"];
 
@@ -28,13 +28,21 @@ pub struct BoundaryCheckpoint {
     pub completed_layers: usize,
     pub total_layers: usize,
     pub sample_fingerprint: String,
+    /// Exact producer/execution identity required to resume an incomplete job.
+    pub execution_fingerprint: String,
     pub kld_finalized: bool,
     pub artifact_complete: bool,
     pub buffer_files: [String; 2],
 }
 
 impl BoundaryCheckpoint {
-    fn new(rows: usize, width: usize, total_layers: usize, sample_fingerprint: String) -> Self {
+    fn new(
+        rows: usize,
+        width: usize,
+        total_layers: usize,
+        sample_fingerprint: String,
+        execution_fingerprint: String,
+    ) -> Self {
         Self {
             schema_version: BOUNDARY_CHECKPOINT_SCHEMA_VERSION,
             rows,
@@ -43,6 +51,7 @@ impl BoundaryCheckpoint {
             completed_layers: 0,
             total_layers,
             sample_fingerprint,
+            execution_fingerprint,
             kld_finalized: false,
             artifact_complete: false,
             buffer_files: BUFFER_FILES.map(str::to_string),
@@ -106,11 +115,23 @@ impl BoundaryStore {
         width: usize,
         total_layers: usize,
         sample_fingerprint: impl Into<String>,
+        execution_fingerprint: impl Into<String>,
     ) -> Result<Self, CalibError> {
         validate_geometry(rows, width, total_layers)?;
         let bytes_per_buffer = boundary_bytes(rows, width)?;
-        let checkpoint =
-            BoundaryCheckpoint::new(rows, width, total_layers, sample_fingerprint.into());
+        let execution_fingerprint = execution_fingerprint.into();
+        if execution_fingerprint.is_empty() {
+            return Err(CalibError::Checkpoint(
+                "boundary execution fingerprint must not be empty".into(),
+            ));
+        }
+        let checkpoint = BoundaryCheckpoint::new(
+            rows,
+            width,
+            total_layers,
+            sample_fingerprint.into(),
+            execution_fingerprint,
+        );
         match backend {
             BoundaryBackend::Ram => Ok(Self {
                 checkpoint,
@@ -150,13 +171,18 @@ impl BoundaryStore {
     pub fn resume_mmap(
         directory: &Path,
         expected_sample_fingerprint: &str,
+        expected_execution_fingerprint: &str,
     ) -> Result<Self, CalibError> {
         let manifest_path = directory.join(MANIFEST_FILE);
         let bytes =
             fs::read(&manifest_path).map_err(|error| CalibError::Checkpoint(error.to_string()))?;
         let checkpoint: BoundaryCheckpoint = serde_json::from_slice(&bytes)
             .map_err(|error| CalibError::Checkpoint(error.to_string()))?;
-        validate_checkpoint(&checkpoint, expected_sample_fingerprint)?;
+        validate_checkpoint(
+            &checkpoint,
+            expected_sample_fingerprint,
+            expected_execution_fingerprint,
+        )?;
         let bytes_per_buffer = boundary_bytes(checkpoint.rows, checkpoint.width)?;
         let buffers = [
             open_mmap(
@@ -184,10 +210,13 @@ impl BoundaryStore {
         width: usize,
         total_layers: usize,
         sample_fingerprint: impl Into<String>,
+        execution_fingerprint: impl Into<String>,
     ) -> Result<(Self, bool), CalibError> {
         let sample_fingerprint = sample_fingerprint.into();
+        let execution_fingerprint = execution_fingerprint.into();
         if Self::mmap_checkpoint_exists(directory)? {
-            return Self::resume_mmap(directory, &sample_fingerprint).map(|store| (store, true));
+            return Self::resume_mmap(directory, &sample_fingerprint, &execution_fingerprint)
+                .map(|store| (store, true));
         }
         Self::create(
             BoundaryBackend::Mmap {
@@ -197,6 +226,7 @@ impl BoundaryStore {
             width,
             total_layers,
             sample_fingerprint,
+            execution_fingerprint,
         )
         .map(|store| (store, false))
     }
@@ -376,6 +406,7 @@ fn validate_geometry(rows: usize, width: usize, total_layers: usize) -> Result<(
 fn validate_checkpoint(
     checkpoint: &BoundaryCheckpoint,
     expected_sample_fingerprint: &str,
+    expected_execution_fingerprint: &str,
 ) -> Result<(), CalibError> {
     if checkpoint.schema_version != BOUNDARY_CHECKPOINT_SCHEMA_VERSION {
         return Err(CalibError::Checkpoint(format!(
@@ -399,6 +430,17 @@ fn validate_checkpoint(
         return Err(CalibError::Checkpoint(format!(
             "sample fingerprint {} does not match expected {expected_sample_fingerprint}",
             checkpoint.sample_fingerprint
+        )));
+    }
+    if checkpoint.execution_fingerprint.is_empty() || expected_execution_fingerprint.is_empty() {
+        return Err(CalibError::Checkpoint(
+            "boundary execution fingerprint must not be empty".into(),
+        ));
+    }
+    if checkpoint.execution_fingerprint != expected_execution_fingerprint {
+        return Err(CalibError::Checkpoint(format!(
+            "execution fingerprint {} does not match expected {expected_execution_fingerprint}",
+            checkpoint.execution_fingerprint
         )));
     }
     if checkpoint.kld_finalized && checkpoint.completed_layers != checkpoint.total_layers {
@@ -551,7 +593,8 @@ mod tests {
 
     #[test]
     fn ram_boundary_swaps_exact_f32_bytes() {
-        let mut store = BoundaryStore::create(BoundaryBackend::Ram, 3, 2, 2, "samples").unwrap();
+        let mut store =
+            BoundaryStore::create(BoundaryBackend::Ram, 3, 2, 2, "samples", "engine").unwrap();
         let initial = [1.0, -2.0, 3.5, 4.0, 5.0, 6.25];
         store.write_active_rows(0, &initial).unwrap();
         assert_eq!(store.read_active_rows(0, 3).unwrap(), initial);
@@ -565,7 +608,8 @@ mod tests {
 
     #[test]
     fn indexed_rows_preserve_scheduler_order_without_relaying_out_boundary() {
-        let mut store = BoundaryStore::create(BoundaryBackend::Ram, 4, 2, 1, "samples").unwrap();
+        let mut store =
+            BoundaryStore::create(BoundaryBackend::Ram, 4, 2, 1, "samples", "engine").unwrap();
         store
             .write_active_rows(0, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
             .unwrap();
@@ -596,6 +640,7 @@ mod tests {
                 3,
                 2,
                 "sample-fp",
+                "engine-a",
             )
             .unwrap();
             store
@@ -604,7 +649,7 @@ mod tests {
             store.commit_layer(0).unwrap();
         }
         {
-            let mut resumed = BoundaryStore::resume_mmap(&dir, "sample-fp").unwrap();
+            let mut resumed = BoundaryStore::resume_mmap(&dir, "sample-fp", "engine-a").unwrap();
             assert_eq!(resumed.checkpoint().completed_layers, 1);
             assert_eq!(
                 resumed.read_active_rows(0, 2).unwrap(),
@@ -620,7 +665,7 @@ mod tests {
             assert!(!resumed.checkpoint().artifact_complete);
         }
         assert!(BoundaryStore::mmap_checkpoint_exists(&dir).unwrap());
-        let mut final_store = BoundaryStore::resume_mmap(&dir, "sample-fp").unwrap();
+        let mut final_store = BoundaryStore::resume_mmap(&dir, "sample-fp", "engine-a").unwrap();
         assert!(final_store.checkpoint().kld_finalized);
         assert!(!final_store.checkpoint().artifact_complete);
         assert_eq!(
@@ -637,6 +682,7 @@ mod tests {
     #[test]
     fn checkpoint_rejects_wrong_samples_and_early_kld_completion() {
         let dir = temp_checkpoint_dir("reject");
+        assert!(BoundaryStore::create(BoundaryBackend::Ram, 1, 1, 1, "right", "").is_err());
         let mut store = BoundaryStore::create(
             BoundaryBackend::Mmap {
                 directory: dir.clone(),
@@ -645,11 +691,13 @@ mod tests {
             1,
             1,
             "right",
+            "engine-a",
         )
         .unwrap();
         assert!(store.finalize_kld().is_err());
         drop(store);
-        assert!(BoundaryStore::resume_mmap(&dir, "wrong").is_err());
+        assert!(BoundaryStore::resume_mmap(&dir, "wrong", "engine-a").is_err());
+        assert!(BoundaryStore::resume_mmap(&dir, "right", "engine-b").is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -657,14 +705,14 @@ mod tests {
     fn resume_or_create_starts_fresh_then_resumes() {
         let dir = temp_checkpoint_dir("resume-or-create");
         let (mut fresh, resumed) =
-            BoundaryStore::resume_or_create_mmap(&dir, 1, 2, 1, "sample-fp").unwrap();
+            BoundaryStore::resume_or_create_mmap(&dir, 1, 2, 1, "sample-fp", "engine-a").unwrap();
         assert!(!resumed);
         fresh.write_next_rows(0, &[3.0, 4.0]).unwrap();
         fresh.commit_layer(0).unwrap();
         drop(fresh);
 
         let (restored, resumed) =
-            BoundaryStore::resume_or_create_mmap(&dir, 1, 2, 1, "sample-fp").unwrap();
+            BoundaryStore::resume_or_create_mmap(&dir, 1, 2, 1, "sample-fp", "engine-a").unwrap();
         assert!(resumed);
         assert_eq!(restored.checkpoint().completed_layers, 1);
         assert_eq!(restored.read_active_rows(0, 1).unwrap(), [3.0, 4.0]);

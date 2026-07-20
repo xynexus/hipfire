@@ -203,6 +203,7 @@ def test_manifest_consumes_native_read_ledger_and_artifact_fingerprints(tmp_path
     calibration = {
         "artifact_fingerprint": "fnv64:calib",
         "metadata": {
+            "engine_build": "executable:sha256-engine",
             "run_fingerprint": "fnv1a64:run",
             "source_manifest": {"fingerprint": "fnv1a64:source"},
             "job": {"samples": {"fingerprint": "fnv1a64:samples"}},
@@ -235,6 +236,7 @@ def test_manifest_consumes_native_read_ledger_and_artifact_fingerprints(tmp_path
     assert restored["source_reads"] == calibration["metadata"]["read_ledger"]
     assert restored["fingerprints"] == {
         "calibration_artifact": "fnv64:calib",
+        "calibration_engine_build": "executable:sha256-engine",
         "calibration_run": "fnv1a64:run",
         "source": "fnv1a64:source",
         "samples": "fnv1a64:samples",
@@ -269,6 +271,7 @@ def test_interrupted_manifest_resume_preserves_completed_calibration(tmp_path):
 
 def reusable_calibration_contract():
     expected = {
+        "engine_build": "executable:sha256-engine",
         "run_fingerprint": "fnv64:run",
         "model": {"family": "qwen3.5", "adapter_version": "qwen3.5-stream-v1", "arch_id": 6},
         "corpus": {
@@ -297,6 +300,7 @@ def reusable_calibration_contract():
     inspection = {
         "metadata": {
             "artifact_kind": "calibration",
+            "engine_build": "executable:sha256-engine",
             "run_fingerprint": "fnv64:run",
             "family": "qwen3.5",
             "adapter_version": "qwen3.5-stream-v1",
@@ -343,6 +347,10 @@ def test_skip_calibration_recipe_validation_binds_native_identity_and_policy():
     expected, inspection = reusable_calibration_contract()
     two_pass.validate_calibration_inspection(inspection)
     two_pass.validate_reusable_calibration(inspection, expected)
+
+    rebuilt_plan = copy.deepcopy(expected)
+    rebuilt_plan["engine_build"] = "executable:new-producer"
+    two_pass.validate_reusable_calibration(inspection, rebuilt_plan)
 
     mutations = [
         ("run fingerprint", lambda value: value["metadata"].update(run_fingerprint="other")),

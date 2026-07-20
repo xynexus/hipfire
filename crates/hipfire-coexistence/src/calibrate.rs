@@ -36,7 +36,7 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 
 const CORPUS_TOKENIZE_WINDOW_BYTES: usize = 256 * 1024;
-const CALIBRATION_PROGRESS_SCHEMA_VERSION: u32 = 1;
+const CALIBRATION_PROGRESS_SCHEMA_VERSION: u32 = 2;
 const ARTIFACT_ESTIMATE_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024 * 1024;
 const ARTIFACT_ESTIMATE_MIN_SAFETY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 // The CLI treats this as an auto-tuning ceiling, not an unconditional
@@ -546,6 +546,7 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
     let resource_estimate = resolved
         .adapter
         .resource_estimate(&inspection, &job, geometry)?;
+    let engine_build = calibration_engine_build_identity()?;
     let run_fingerprint = calibration_run_fingerprint(
         resolved.adapter.as_ref(),
         &inspection,
@@ -563,6 +564,7 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
         &tensor_plan,
         geometry,
         &job,
+        &engine_build,
         &run_fingerprint,
         &source_manifest,
         resource_estimate.as_ref(),
@@ -914,6 +916,7 @@ fn dry_run_report(
     tensor_plan: &TensorLoadPlan,
     geometry: MicrobatchGeometry,
     job: &CalibrationJob,
+    engine_build: &str,
     run_fingerprint: &str,
     source_manifest: &SourceManifestIdentity,
     resource_estimate: Option<&hipfire_runtime::calibration::stream::CalibrationResourceEstimate>,
@@ -945,6 +948,7 @@ fn dry_run_report(
     Ok(serde_json::json!({
         "command": "calibrate",
         "dry_run": command.dry_run,
+        "engine_build": engine_build,
         "run_fingerprint": run_fingerprint,
         "model": {
             "requested_path": command.model,
@@ -1327,6 +1331,7 @@ fn format_duration_us(microseconds: u64) -> String {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CalibrationLayerProgress {
     schema_version: u32,
+    engine_build: String,
     run_fingerprint: String,
     layer: usize,
     part_file: String,
@@ -1339,6 +1344,41 @@ struct CalibrationLayerProgress {
     read_ledger: ReadLedgerSnapshot,
     #[serde(default)]
     timing: CalibrationLayerTiming,
+}
+
+fn calibration_engine_build_identity() -> Result<String, CalibError> {
+    #[cfg(target_os = "linux")]
+    let executable = PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+    #[cfg(not(target_os = "linux"))]
+    let executable = std::env::current_exe().map_err(|error| {
+        CalibError::Checkpoint(format!(
+            "resolve the running calibration executable for provenance: {error}"
+        ))
+    })?;
+    let fingerprint = file_hash(&executable).ok_or_else(|| {
+        CalibError::Checkpoint(format!(
+            "fingerprint running calibration executable {}",
+            executable.display()
+        ))
+    })?;
+    if fingerprint == "unavailable" {
+        return Err(CalibError::Checkpoint(format!(
+            "fingerprint running calibration executable {} returned unavailable",
+            executable.display()
+        )));
+    }
+    Ok(format!("executable:{fingerprint}"))
+}
+
+fn calibration_checkpoint_execution_fingerprint(
+    engine_build: &str,
+    run_fingerprint: &str,
+) -> String {
+    let mut input = Vec::with_capacity(engine_build.len() + run_fingerprint.len() + 1);
+    input.extend_from_slice(engine_build.as_bytes());
+    input.push(0);
+    input.extend_from_slice(run_fingerprint.as_bytes());
+    stable_hash_bytes(&input)
 }
 
 fn calibration_run_fingerprint(
@@ -1426,6 +1466,7 @@ fn write_layer_progress(
 fn read_layer_progress(
     output: &Path,
     layer: usize,
+    expected_engine_build: &str,
     expected_run_fingerprint: &str,
 ) -> Result<CalibrationLayerProgress, CalibError> {
     let path = calibration_progress_path(output, layer);
@@ -1438,6 +1479,14 @@ fn read_layer_progress(
             "unsupported calibration progress schema {} in {}",
             progress.schema_version,
             path.display()
+        )));
+    }
+    if progress.engine_build != expected_engine_build {
+        return Err(CalibError::Checkpoint(format!(
+            "calibration progress {} was produced by engine {}, expected {}; resume with the original binary or restart the calibration",
+            path.display(),
+            progress.engine_build,
+            expected_engine_build
         )));
     }
     if progress.run_fingerprint != expected_run_fingerprint {
@@ -1565,6 +1614,7 @@ fn validate_completed_artifact(
     expected_arch_id: u32,
     expected_family: &str,
     expected_adapter_version: &str,
+    expected_engine_build: &str,
     expected_source_manifest: &SourceManifestIdentity,
     expected_run_fingerprint: &str,
     expected_job: &CalibrationJob,
@@ -1602,6 +1652,7 @@ fn validate_completed_artifact(
     expect_string("artifact_kind", "calibration")?;
     expect_string("family", expected_family)?;
     expect_string("adapter_version", expected_adapter_version)?;
+    expect_string("engine_build", expected_engine_build)?;
     expect_string("run_fingerprint", expected_run_fingerprint)?;
     if metadata.get("arch_id").and_then(serde_json::Value::as_u64)
         != Some(u64::from(expected_arch_id))
@@ -1888,8 +1939,11 @@ impl LayerStreamEngine {
             adapter.resource_estimate(&model, &execution_job, planner.geometry())?;
         let effective_precision = adapter.effective_precision(gpu);
         let batches = planner.plan(&job.samples);
+        let engine_build = calibration_engine_build_identity()?;
         let run_fingerprint =
             calibration_run_fingerprint(adapter, &model, &tensor_plan, job, geometry)?;
+        let checkpoint_execution_fingerprint =
+            calibration_checkpoint_execution_fingerprint(&engine_build, &run_fingerprint);
         let resuming_existing_checkpoint = match (&self.boundary_backend, self.resume) {
             (BoundaryBackend::Ram, true) => {
                 return Err(CalibError::InvalidOptions(
@@ -1937,6 +1991,7 @@ impl LayerStreamEngine {
                     model.hidden_width,
                     model.num_layers,
                     job.samples.fingerprint(),
+                    &checkpoint_execution_fingerprint,
                 )?;
                 debug_assert_eq!(resumed, resuming_existing_checkpoint);
                 store
@@ -1948,6 +2003,7 @@ impl LayerStreamEngine {
                 model.hidden_width,
                 model.num_layers,
                 job.samples.fingerprint(),
+                &checkpoint_execution_fingerprint,
             )?,
         };
         if boundary.checkpoint().rows != job.samples.total_rows()
@@ -1983,6 +2039,7 @@ impl LayerStreamEngine {
                 model.arch_id,
                 &model.family,
                 adapter.adapter_version(),
+                &engine_build,
                 &source_manifest,
                 &run_fingerprint,
                 job,
@@ -2030,7 +2087,12 @@ impl LayerStreamEngine {
         if resuming_existing_checkpoint {
             let mut prior_consumed = std::collections::BTreeSet::new();
             for layer in 0..completed_layers {
-                let progress = read_layer_progress(&self.artifact_output, layer, &run_fingerprint)?;
+                let progress = read_layer_progress(
+                    &self.artifact_output,
+                    layer,
+                    &engine_build,
+                    &run_fingerprint,
+                )?;
                 if !prior_consumed.is_subset(&progress.read_ledger.consumed_logical) {
                     return Err(CalibError::Checkpoint(format!(
                         "layer {layer} read ledger is not a monotonic continuation"
@@ -2257,6 +2319,7 @@ impl LayerStreamEngine {
             };
             let progress = CalibrationLayerProgress {
                 schema_version: CALIBRATION_PROGRESS_SCHEMA_VERSION,
+                engine_build: engine_build.clone(),
                 run_fingerprint: run_fingerprint.clone(),
                 layer: layer_index,
                 part_file,
@@ -2371,6 +2434,7 @@ impl LayerStreamEngine {
         let read_ledger = ledger.snapshot();
         let static_meta = vec![
             ("artifact_kind", serde_json::json!("calibration")),
+            ("engine_build", serde_json::json!(engine_build)),
             ("family", serde_json::json!(model.family)),
             (
                 "adapter_version",
@@ -3091,6 +3155,27 @@ mod tests {
     }
 
     #[test]
+    fn calibration_engine_build_identity_is_deterministic_and_checkpoint_bound() {
+        let identity = calibration_engine_build_identity().unwrap();
+        assert_eq!(identity, calibration_engine_build_identity().unwrap());
+        assert!(identity.starts_with("executable:"));
+        assert_ne!(identity, "executable:unavailable");
+        let checkpoint = calibration_checkpoint_execution_fingerprint(&identity, "run-a");
+        assert_eq!(
+            checkpoint,
+            calibration_checkpoint_execution_fingerprint(&identity, "run-a")
+        );
+        assert_ne!(
+            checkpoint,
+            calibration_checkpoint_execution_fingerprint(&identity, "run-b")
+        );
+        assert_ne!(
+            checkpoint,
+            calibration_checkpoint_execution_fingerprint("engine-b", "run-a")
+        );
+    }
+
+    #[test]
     fn layer_progress_binds_run_part_and_read_ledger() {
         let output = temp_output("progress");
         fs::create_dir_all(output.parent().unwrap()).unwrap();
@@ -3098,6 +3183,7 @@ mod tests {
         fs::write(&part, b"stable part bytes").unwrap();
         let progress = CalibrationLayerProgress {
             schema_version: CALIBRATION_PROGRESS_SCHEMA_VERSION,
+            engine_build: "engine-a".into(),
             run_fingerprint: "run-a".into(),
             layer: 0,
             part_file: part.file_name().unwrap().to_string_lossy().into_owned(),
@@ -3121,14 +3207,21 @@ mod tests {
             timing: CalibrationLayerTiming::default(),
         };
         write_layer_progress(&output, &progress).unwrap();
-        let restored = read_layer_progress(&output, 0, "run-a").unwrap();
+        let restored = read_layer_progress(&output, 0, "engine-a", "run-a").unwrap();
         assert_eq!(restored.layer, 0);
         assert_eq!(restored.descriptors, progress.descriptors);
         assert_eq!(restored.read_ledger, progress.read_ledger);
-        assert!(read_layer_progress(&output, 0, "run-b").is_err());
+        assert!(read_layer_progress(&output, 0, "engine-b", "run-a").is_err());
+        assert!(read_layer_progress(&output, 0, "engine-a", "run-b").is_err());
+
+        let mut legacy = progress.clone();
+        legacy.schema_version = 1;
+        write_layer_progress(&output, &legacy).unwrap();
+        assert!(read_layer_progress(&output, 0, "engine-a", "run-a").is_err());
+        write_layer_progress(&output, &progress).unwrap();
 
         fs::write(&part, b"corrupt").unwrap();
-        assert!(read_layer_progress(&output, 0, "run-a").is_err());
+        assert!(read_layer_progress(&output, 0, "engine-a", "run-a").is_err());
         fs::remove_dir_all(output.parent().unwrap()).unwrap();
     }
 
@@ -3164,6 +3257,7 @@ mod tests {
         };
         let metadata = serde_json::json!({
             "artifact_kind": "calibration",
+            "engine_build": "engine-a",
             "family": "fixture",
             "adapter_version": "fixture.v1",
             "arch_id": 77,
@@ -3206,6 +3300,7 @@ mod tests {
             1,
             1,
             "sample-fp",
+            "checkpoint-a",
         )
         .unwrap();
         boundary.write_next_rows(0, &[2.0]).unwrap();
@@ -3218,6 +3313,7 @@ mod tests {
             77,
             "fixture",
             "fixture.v1",
+            "engine-a",
             &source_manifest,
             "run-fp",
             &job,
@@ -3232,8 +3328,21 @@ mod tests {
             77,
             "fixture",
             "fixture.v1",
+            "engine-a",
             &source_manifest,
             "wrong-run",
+            &job,
+            geometry,
+        )
+        .is_err());
+        assert!(validate_completed_artifact(
+            &output,
+            77,
+            "fixture",
+            "fixture.v1",
+            "engine-b",
+            &source_manifest,
+            "run-fp",
             &job,
             geometry,
         )

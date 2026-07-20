@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn memory_estimate_matches_tiny_boundary_allocation() {
-        let store = BoundaryStore::create(BoundaryBackend::Ram, 7, 5, 1, "fp").unwrap();
+        let store = BoundaryStore::create(BoundaryBackend::Ram, 7, 5, 1, "fp", "engine").unwrap();
         let estimate = CalibrationMemoryEstimate::checked(7, 5, 11, 13, 17).unwrap();
         assert_eq!(estimate.boundary_bytes as usize, store.allocated_bytes());
         assert_eq!(estimate.peak_bytes, estimate.boundary_bytes + 11 + 13 + 17);

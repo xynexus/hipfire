@@ -119,11 +119,11 @@ evaluation, while Hessian/imatrix records drive AWQ and LDLQ.
 
 The target stage is skipped only when both HFQ outputs are structurally valid
 and `two-pass.json` matches the requested recipe. That atomic manifest embeds
-the native calibration read ledger, source/run/sample fingerprints, the cheap
-HFQ metadata/index fingerprints, and the quantizer's payload hash. A file with
-the right magic but stale or missing provenance is regenerated. DFlash and
-TriAttention stages additionally require their expected magic. Useful controls
-are:
+the native calibration engine-build identity, read ledger,
+source/run/sample fingerprints, the cheap HFQ metadata/index fingerprints, and
+the quantizer's payload hash. A file with the right magic but stale or missing
+provenance is regenerated. DFlash and TriAttention stages additionally require
+their expected magic. Useful controls are:
 
 ```bash
 python3 scripts/induct_model.py --stage dflash
