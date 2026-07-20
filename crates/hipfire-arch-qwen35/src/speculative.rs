@@ -6974,21 +6974,33 @@ pub fn spec_step_dflash(
         };
 
         // ── 4. draft_forward ────────────────────────────────────────────────
-        // noise_embedding = None: we wrote embeddings directly into
-        // draft_scratch.x above via D2D (no host round-trip).
-        dflash::draft_forward_opts(
-            gpu,
-            draft_weights,
-            draft_cfg,
-            None,
-            th_arg,
-            &positions_q,
-            &positions_k,
-            b,
-            effective_ctx_len,
-            draft_scratch,
-            draft_ffn_graph,
-        )?;
+        // Phase 1 seam: when the serial NPU draft is enabled (and the context
+        // has grown to the body's fixed l_ctx window), run the DFlash NPU block
+        // body in place of the GPU draft. It lands block hidden into
+        // draft_scratch.x rows 1..B at the same layout, so everything downstream
+        // (lm_head/argmax/accept/scatter/rollback) is untouched. The block's
+        // target-embedding rows are already in draft_scratch.x[0..B] (step 2),
+        // which the NPU body consumes as its seed. Losslessness is structural:
+        // the target verifies every proposed token regardless of drafter.
+        //
+        // noise_embedding = None: on the GPU path we wrote embeddings directly
+        // into draft_scratch.x above via D2D (no host round-trip).
+        let ran_npu_draft = draft_scratch.npu_draft_forward(gpu, position, b)?;
+        if !ran_npu_draft {
+            dflash::draft_forward_opts(
+                gpu,
+                draft_weights,
+                draft_cfg,
+                None,
+                th_arg,
+                &positions_q,
+                &positions_k,
+                b,
+                effective_ctx_len,
+                draft_scratch,
+                draft_ffn_graph,
+            )?;
+        }
 
         // ── 5. Apply target.lm_head to draft hidden positions 1..B ──────────
         // Fast path: a single batched GEMM against target.weights.output over

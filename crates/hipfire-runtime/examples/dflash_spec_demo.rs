@@ -1040,6 +1040,33 @@ fn main() {
         eprintln!("draft: MQ weights detected, FWHT rotation scratch enabled");
     }
 
+    // ── Phase 1: opt into the serial NPU draft ────────────────────────
+    // HIPFIRE_DFLASH_NPU_DRAFT=1 runs the DFlash NPU block body serially in
+    // place of the GPU draft (behind the flag; the all-GPU path stays the
+    // default and bit-for-bit reproducible). Artifact paths default to the
+    // harness outputs and are overridable via env. Losslessness is structural
+    // (the target verifies every proposed token), so the committed digest is
+    // unchanged whether the NPU or GPU produced the draft.
+    if std::env::var("HIPFIRE_DFLASH_NPU_DRAFT").ok().as_deref() == Some("1") {
+        #[cfg(target_os = "linux")]
+        {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let wdir = std::env::var("HIPFIRE_DFLASH_NPU_WEIGHTS")
+                .unwrap_or_else(|_| "/tmp/dflash_w".to_string());
+            let manifest = std::env::var("HIPFIRE_DFLASH_NPU_MANIFEST")
+                .unwrap_or_else(|_| "/tmp/dflash_manifest_flash.json".to_string());
+            let r14 = std::env::var("HIPFIRE_DFLASH_NPU_R14")
+                .unwrap_or_else(|_| format!("{home}/.hipfire/npu/r14_1x2x128_nb128"));
+            eprintln!("[npu-draft] loading NPU body: weights={wdir} manifest={manifest} r14={r14}");
+            draft_scratch
+                .enable_npu_draft(&wdir, &manifest, &r14)
+                .expect("enable NPU draft");
+            eprintln!("[npu-draft] enabled (serial substitute for GPU draft)");
+        }
+        #[cfg(not(target_os = "linux"))]
+        eprintln!("[npu-draft] HIPFIRE_DFLASH_NPU_DRAFT ignored: not Linux");
+    }
+
     // ── Check vocab compatibility ─────────────────────────────────────
     assert_eq!(
         target.config.vocab_size, draft_cfg.vocab_size,

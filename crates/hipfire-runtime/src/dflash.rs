@@ -754,6 +754,20 @@ pub struct DflashScratch {
     /// Experimental arch integrations use this to avoid async kernel hazards
     /// while keeping the generic DFlash fast path unchanged.
     pub sync_gemm: bool,
+
+    /// Optional NPU draft body (Phase 1 reachability seam). When `Some`, and the
+    /// context has grown to at least its `l_ctx`, `spec_step_dflash` runs this
+    /// serially in place of the GPU `draft_forward_opts`, landing block hidden
+    /// into `self.x` rows `1..B`. Off by default; the all-GPU path is unchanged.
+    #[cfg(target_os = "linux")]
+    pub npu_body: Option<hipfire_xdna::DflashNpuBody>,
+
+    /// Host mirror of the committed-context rows the NPU body needs. Grows by a
+    /// targeted D2H of just the newly-scattered tail rows each cycle (the new
+    /// "GPU-resident context, host-mirror the tail" feed mode). Layout matches
+    /// `target_hidden`: `[rows, num_extract * hidden]` f32. Empty when the NPU
+    /// draft is disabled.
+    pub npu_target_hidden_host: Vec<f32>,
 }
 
 impl DflashScratch {
@@ -874,6 +888,9 @@ impl DflashScratch {
             draft_ffn_graphs,
             draft_ffn_warmed_up,
             sync_gemm,
+            #[cfg(target_os = "linux")]
+            npu_body: None,
+            npu_target_hidden_host: Vec::new(),
         })
     }
 
@@ -886,6 +903,127 @@ impl DflashScratch {
         self.uploaded_target_hidden_rows = 0;
         self.target_hidden_abs_positions.clear();
         self.draft_ctx_cached_rows = 0;
+        // New prompt: the NPU host mirror of committed context is stale too.
+        self.npu_target_hidden_host.clear();
+    }
+
+    /// Enable the Phase-1 serial NPU draft. Loads the DFlash NPU block body from
+    /// the on-disk harness artifacts (multicore W4A8 + flash attention + CPU
+    /// primitives — the validated body). No-op / error-free on non-Linux.
+    ///
+    /// `weights_dir` is the `--weights` dir (index.json + w_*.i8/.scale + g_*.f32),
+    /// `manifest_path` the flash-attention manifest json, `r14_dir` the packed
+    /// r14 array dir. Holds the GPU lock; pins ~3 of npu1's 6 hardware contexts.
+    #[cfg(target_os = "linux")]
+    pub fn enable_npu_draft(
+        &mut self,
+        weights_dir: &str,
+        manifest_path: &str,
+        r14_dir: &str,
+    ) -> Result<(), String> {
+        let body = hipfire_xdna::DflashNpuBody::load(weights_dir, manifest_path, r14_dir)
+            .map_err(|e| format!("load DFlash NPU body: {e:?}"))?;
+        self.npu_body = Some(body);
+        Ok(())
+    }
+
+    /// True when the serial NPU draft is enabled.
+    pub fn npu_draft_enabled(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.npu_body.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// Run the NPU draft block forward as a serial substitute for
+    /// `draft_forward_opts`. Returns `Ok(true)` when the NPU produced the block
+    /// (its hidden landed in `self.x` rows `1..B`), or `Ok(false)` when it
+    /// declined (disabled, or the context is shorter than the body's fixed
+    /// `l_ctx` window) so the caller falls back to the GPU draft.
+    ///
+    /// Feed: the block's target-embedding rows are already in `self.x[0..B]`
+    /// (written by the caller's embedding lookup); this D2Hs them as the seed.
+    /// The committed context is host-mirrored incrementally by a targeted D2H of
+    /// just the tail rows of `self.target_hidden`, then the last `l_ctx` rows are
+    /// windowed and fed to the body. Losslessness holds regardless of the NPU
+    /// draft's numeric quality — the target verifies every proposed token.
+    pub fn npu_draft_forward(
+        &mut self,
+        gpu: &mut Gpu,
+        position: usize,
+        b: usize,
+    ) -> HipResult<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            let (l_ctx, h, ne, body_b) = match self.npu_body.as_ref() {
+                Some(body) => (body.l_ctx(), body.hidden(), body.num_extract(), body.block_size()),
+                None => return Ok(false),
+            };
+            // The body bakes a fixed block size (B) and a fixed l_ctx-row context
+            // window into its kernels. Decline (fall back to the GPU draft) when
+            // this cycle's block size differs — e.g. adaptive-B picked B<16 — or
+            // when the context is shorter than the window (early cycles). Both
+            // fall back losslessly; the committed digest is unaffected.
+            if b != body_b || position < l_ctx {
+                return Ok(false);
+            }
+            let row = ne * h;
+
+            // ── Tail-mirror feed: targeted D2H of the newly-committed rows ─────
+            // `target_hidden` on GPU holds `position` committed rows (populated by
+            // the seed + per-cycle D2D scatter). Download only rows not yet
+            // mirrored. On Phoenix UMA a D2H is a cache-coherent read (cheap).
+            let have = self.npu_target_hidden_host.len() / row;
+            if have < position {
+                let start = have;
+                let nrows = position - start;
+                let view = self.target_hidden.sub_offset(start * row, nrows * row);
+                let tail = gpu.download_f32(&view)?;
+                self.npu_target_hidden_host.extend_from_slice(&tail);
+            } else if have > position {
+                // Rewound/compacted below the mirror — resync the full prefix.
+                let view = self.target_hidden.sub_offset(0, position * row);
+                let full = gpu.download_f32(&view)?;
+                self.npu_target_hidden_host.clear();
+                self.npu_target_hidden_host.extend_from_slice(&full);
+            }
+
+            // Window: the last l_ctx committed rows.
+            let win_start = (position - l_ctx) * row;
+            let window = self.npu_target_hidden_host[win_start..win_start + l_ctx * row].to_vec();
+
+            // Seed/noise: the block's target-embedding rows, already in x[0..B].
+            let noise = gpu.download_f32(&self.x.sub_offset(0, b * h))?;
+
+            // ── NPU forward ──────────────────────────────────────────────────
+            let mut out = vec![0f32; b * h];
+            self.npu_body
+                .as_mut()
+                .expect("npu_body present")
+                .forward_block(&window, &noise, &mut out);
+
+            // Land block hidden into x rows 1..B (row 0 is the seed; lm_head
+            // reads 1..B). Same buffer layout draft_forward_opts writes.
+            let tail_rows = &out[h..b * h];
+            let bytes = unsafe {
+                std::slice::from_raw_parts(tail_rows.as_ptr() as *const u8, tail_rows.len() * 4)
+            };
+            let dst = self.x.sub_offset(h, (b - 1) * h);
+            gpu.hip.memcpy_htod(&dst.buf, bytes)?;
+            if std::env::var("HIPFIRE_DFLASH_NPU_DRAFT_TRACE").ok().as_deref() == Some("1") {
+                eprintln!("[npu-draft] cycle: position={position} b={b} l_ctx={l_ctx} (NPU block forward ran)");
+            }
+            Ok(true)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (gpu, position, b);
+            Ok(false)
+        }
     }
 
     /// Invalidate the per-layer k_ctx/v_ctx projection cache. Called from
