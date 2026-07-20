@@ -133,6 +133,17 @@ the new source-phase telemetry distinguishes staged consumption, mmap refaults,
 decode, upload, and release. A matched page-cache/staged/off comparison of the
 same layer is still required before claiming an end-to-end speedup.
 
+The first production layer completed with resident staging read
+13,124,002,816 bytes in 102.784 seconds with a 3-microsecond foreground wait.
+All 15 source tensors and every planned source byte were consumed directly from
+staging. HIP upload took 1.027 seconds and complete layer construction took
+1.540 seconds; teacher execution took 232.463 seconds and the layer committed
+in 234.757 seconds. The earlier page-cache-only full-attention layer with the
+same 232-second execution class spent 140.060 seconds in load/construction and
+372.979 seconds total. This proves the retained bytes remove the observed
+refault path and provide a production-shaped improvement, while the exact
+same-layer three-mode comparison remains the final controlled perf gate.
+
 The same production checkpoints prove K=10 routing over 262,144 corpus rows
 (2,621,440 routed slots) with zero invalid indices. Coverage is deliberately
 evaluated per layer rather than inferred from the total route count: layer 8

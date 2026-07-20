@@ -87,7 +87,10 @@ Live gfx1151 evidence on 2026-07-20:
   consumed directly from staging and released after GPU upload. Checkpoints
   record read/staged/consumed bytes plus background, view, decode, upload,
   release, foreground-wait, and error telemetry; matched staged/page-cache/off
-  production timings remain to be collected.
+  production timings remain to be collected. The first 397B production layer
+  using resident staging consumed all 13.124 GB across 15 tensors directly,
+  waited 3 microseconds, uploaded in 1.027 seconds, and completed layer
+  construction in 1.540 seconds before 232.463 seconds of teacher execution.
 - On the identical 4,096-token Qwen sample set, 256/512/1,024/2,048/4,096-row
   geometries took 7.56/3.76/2.55/2.16/1.89 seconds of layer execution and
   produced identical normalized descriptors and expert telemetry. Total
