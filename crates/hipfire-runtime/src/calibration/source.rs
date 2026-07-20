@@ -7,6 +7,7 @@ use crate::weights::WeightTensor;
 use hipfire_model::{ModelSource, TensorInfo, TensorStorageLocation};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -17,6 +18,7 @@ use std::time::Instant;
 use std::os::fd::AsRawFd;
 
 pub const LAYER_PREFETCH_WORKER_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+pub const SOURCE_UPLOAD_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum TensorOwner {
@@ -680,6 +682,22 @@ pub struct PlannedTensorView<'a> {
     source: Option<&'a dyn ModelSource>,
     source_name: String,
     release_pages: bool,
+    released_prefix: Cell<usize>,
+}
+
+impl PlannedTensorView<'_> {
+    fn release_copied_range(&self, byte_offset: usize, byte_len: usize) {
+        if !self.release_pages || byte_len == 0 || byte_offset != self.released_prefix.get() {
+            return;
+        }
+        let byte_len = byte_len.min(self.bytes.len().saturating_sub(byte_offset));
+        let Some(source) = self.source else {
+            return;
+        };
+        if source.release_tensor_range_pages(&self.source_name, byte_offset, byte_len) {
+            self.released_prefix.set(byte_offset + byte_len);
+        }
+    }
 }
 
 /// Aggregate source-materialization phases for one owner-scoped load. The
@@ -745,7 +763,16 @@ impl Drop for PlannedTensorView<'_> {
     fn drop(&mut self) {
         if self.release_pages {
             if let Some(source) = self.source {
-                source.release_tensor_pages(&self.source_name);
+                let released_prefix = self.released_prefix.get().min(self.bytes.len());
+                if released_prefix == 0 {
+                    source.release_tensor_pages(&self.source_name);
+                } else if released_prefix < self.bytes.len() {
+                    let _ = source.release_tensor_range_pages(
+                        &self.source_name,
+                        released_prefix,
+                        self.bytes.len() - released_prefix,
+                    );
+                }
             }
         }
     }
@@ -869,6 +896,7 @@ impl<'source, 'ledger, 'plan> PlannedTensorReader<'source, 'ledger, 'plan> {
             source: (!from_prefetch).then_some(self.source),
             source_name,
             release_pages,
+            released_prefix: Cell::new(0),
         })
     }
 }
@@ -998,6 +1026,17 @@ pub fn upload_source_payload(
     }
 }
 
+fn native_source_gpu_dtype(gpu: &Gpu, source_dtype: &str) -> Option<DType> {
+    match source_dtype {
+        "F16" => Some(DType::F16),
+        "BF16" if gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12") => {
+            Some(DType::BF16)
+        }
+        "F32" => Some(DType::F32),
+        _ => None,
+    }
+}
+
 pub fn load_source_matrix(
     reader: &mut PlannedTensorReader<'_, '_, '_>,
     gpu: &Gpu,
@@ -1039,7 +1078,30 @@ pub fn load_source_tensor(
     let source_bytes = view.bytes.len();
     let from_prefetch = view.from_prefetch;
     let upload_started = Instant::now();
-    let upload = upload_source_payload(gpu, view.info.dtype.as_str(), view.bytes, shape);
+    let upload = if let Some(dtype) = native_source_gpu_dtype(gpu, view.info.dtype.as_str()) {
+        validate_source_bytes(
+            view.bytes,
+            shape.iter().product(),
+            dtype.size(),
+            &view.info.dtype,
+        )
+        .and_then(|()| {
+            let mut tensor = gpu
+                .upload_raw_chunked(
+                    view.bytes,
+                    shape,
+                    SOURCE_UPLOAD_CHUNK_BYTES,
+                    |byte_offset, byte_len| {
+                        view.release_copied_range(byte_offset, byte_len);
+                    },
+                )
+                .map_err(|error| CalibError::Runtime(error.to_string()))?;
+            tensor.dtype = dtype;
+            Ok(tensor)
+        })
+    } else {
+        upload_source_payload(gpu, view.info.dtype.as_str(), view.bytes, shape)
+    };
     let upload_us = elapsed_micros(upload_started);
     let gpu_upload_bytes = shape
         .iter()
@@ -1130,6 +1192,7 @@ mod tests {
         locations: BTreeMap<String, TensorStorageLocation>,
         payload: Vec<u8>,
         released: RefCell<Vec<String>>,
+        released_ranges: RefCell<Vec<(String, usize, usize)>>,
     }
 
     impl FakeSource {
@@ -1169,6 +1232,7 @@ mod tests {
                 locations,
                 payload: vec![0; 24],
                 released: RefCell::new(Vec::new()),
+                released_ranges: RefCell::new(Vec::new()),
             }
         }
     }
@@ -1189,6 +1253,17 @@ mod tests {
         }
         fn release_tensor_pages(&self, name: &str) {
             self.released.borrow_mut().push(name.to_string());
+        }
+        fn release_tensor_range_pages(
+            &self,
+            name: &str,
+            byte_offset: usize,
+            byte_len: usize,
+        ) -> bool {
+            self.released_ranges
+                .borrow_mut()
+                .push((name.to_string(), byte_offset, byte_len));
+            true
         }
         fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
             self.infos.get(name)
@@ -1460,5 +1535,31 @@ mod tests {
         }
         assert_eq!(source.released.borrow().as_slice(), ["embed", "l0.w"]);
         ledger.assert_complete().unwrap();
+    }
+
+    #[test]
+    fn planned_view_releases_completed_upload_chunks_and_not_tied_canonical_ranges() {
+        let source = FakeSource::new();
+        let plan = fixture_plan();
+        let mut ledger = ReadLedger::new(&plan);
+        {
+            let mut reader =
+                PlannedTensorReader::new(&source, &mut ledger, TensorOwner::Persistent);
+            let embedding = reader.read("embedding").unwrap();
+            embedding.release_copied_range(0, 8);
+            assert!(source.released_ranges.borrow().is_empty());
+        }
+        {
+            let mut reader = PlannedTensorReader::new(&source, &mut ledger, TensorOwner::Layer(0));
+            let layer = reader.read("layer0.weight").unwrap();
+            layer.release_copied_range(0, 8);
+            layer.release_copied_range(8, 16);
+            assert_eq!(
+                source.released_ranges.borrow().as_slice(),
+                [("l0.w".to_string(), 0, 8), ("l0.w".to_string(), 8, 16)]
+            );
+            drop(layer);
+        }
+        assert!(source.released.borrow().is_empty());
     }
 }

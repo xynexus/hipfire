@@ -63,6 +63,13 @@ Implemented and verified in this checkout:
   release, with source and uploaded byte counts; this makes the next buffering
   decision evidence-driven instead of attributing all foreground load time to
   the network;
+- native F16/BF16/F32 source uploads are split into bounded 64 MiB synchronous
+  copies, and safetensors mappings discard each completed byte range immediately
+  instead of retaining an entire multi-gigabyte tensor until one monolithic HIP
+  copy returns; tied aliases still suppress early release, and unit tests prove
+  exact chunk coverage plus byte-identical refault after partial release. The
+  currently running 397B production binary predates this change, so its live
+  pressure benefit remains an explicit rerun gate rather than claimed evidence;
 - bounded family-neutral source lookahead: the engine selects the next owner's
   canonical physical ranges without consuming the read ledger, reads at most
   16 GiB through one fixed 8 MiB worker chunk into resident staging during

@@ -207,29 +207,44 @@ impl ModelSource for SafetensorsSource {
     }
 
     fn release_tensor_pages(&self, name: &str) {
-        let Some(&(file_idx, tensor_idx)) = self.tensor_map.get(name) else {
+        let Some(&(_file_idx, tensor_idx)) = self.tensor_map.get(name) else {
             return;
         };
+        self.release_tensor_range_pages(name, 0, self.tensors[tensor_idx].data_size);
+    }
+
+    fn release_tensor_range_pages(&self, name: &str, byte_offset: usize, byte_len: usize) -> bool {
+        let Some(&(file_idx, tensor_idx)) = self.tensor_map.get(name) else {
+            return false;
+        };
         let info = &self.tensors[tensor_idx];
+        if byte_len == 0 || byte_offset >= info.data_size {
+            return false;
+        }
+        let byte_len = byte_len.min(info.data_size - byte_offset);
+        let data_offset = info.data_offset + byte_offset;
         #[cfg(unix)]
         {
             // MADV_DONTNEED removes this mapping's resident PTEs immediately;
             // posix_fadvise then gives the page cache the matching backing-file
             // hint. The mapping remains valid and refaults if a declared alias
             // later reads the same source range.
-            let _ =
-                release_mmap_range(&self.files[file_idx].mmap, info.data_offset, info.data_size);
+            let _ = release_mmap_range(&self.files[file_idx].mmap, data_offset, byte_len);
             unsafe {
                 libc::posix_fadvise(
                     self.files[file_idx]._file.as_raw_fd(),
-                    info.data_offset as libc::off_t,
-                    info.data_size as libc::off_t,
+                    data_offset as libc::off_t,
+                    byte_len as libc::off_t,
                     libc::POSIX_FADV_DONTNEED,
                 );
             }
+            true
         }
         #[cfg(not(unix))]
-        let _ = file_idx;
+        {
+            let _ = (file_idx, data_offset, byte_len);
+            false
+        }
     }
 
     fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
@@ -520,15 +535,10 @@ mod tests {
         write_shard(&dir.join("model.safetensors"), "weight", &payload);
 
         let source = SafetensorsSource::open(&dir).unwrap();
-        let &(file_idx, tensor_idx) = source.tensor_map.get("weight").unwrap();
-        let info = &source.tensors[tensor_idx];
         assert_eq!(source.tensor_data("weight").unwrap().1, payload);
-        release_mmap_range(
-            &source.files[file_idx].mmap,
-            info.data_offset,
-            info.data_size,
-        )
-        .unwrap();
+        assert!(source.release_tensor_range_pages("weight", 0, 64 * 1024));
+        assert!(source.release_tensor_range_pages("weight", 64 * 1024, 64 * 1024));
+        assert!(!source.release_tensor_range_pages("weight", 128 * 1024, 1));
         assert_eq!(source.tensor_data("weight").unwrap().1, payload);
 
         drop(source);

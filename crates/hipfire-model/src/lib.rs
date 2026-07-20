@@ -463,6 +463,21 @@ pub trait ModelSource {
     /// The default is a no-op for resident/in-memory sources.
     fn release_tensor_pages(&self, _name: &str) {}
 
+    /// Advise that a byte range within a tensor payload is no longer needed by
+    /// the current streaming consumer. File-backed sources may discard each
+    /// completed synchronous upload chunk instead of retaining the whole
+    /// multi-gigabyte tensor until the final copy returns. `byte_offset` is
+    /// relative to the tensor payload. The default is a no-op; callers still
+    /// invoke [`ModelSource::release_tensor_pages`] when the view is dropped.
+    fn release_tensor_range_pages(
+        &self,
+        _name: &str,
+        _byte_offset: usize,
+        _byte_len: usize,
+    ) -> bool {
+        false
+    }
+
     /// Look up tensor metadata without data (for pre-screening).
     fn tensor_info(&self, name: &str) -> Option<&TensorInfo>;
 

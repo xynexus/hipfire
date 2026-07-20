@@ -19,6 +19,19 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock};
 
+fn raw_upload_chunks(
+    total_bytes: usize,
+    max_chunk_bytes: usize,
+) -> impl Iterator<Item = (usize, usize)> {
+    let max_chunk_bytes = max_chunk_bytes.max(1);
+    (0..total_bytes)
+        .step_by(max_chunk_bytes)
+        .map(move |offset| {
+            let len = (total_bytes - offset).min(max_chunk_bytes);
+            (offset, len)
+        })
+}
+
 /// Build a `[KernArg; N]` argument list for [`Gpu::launch_kernargs`] with one
 /// entry per kernel parameter, tagged by ABI kind so the packed blob and the
 /// pointer array are always derived from the same declaration (review
@@ -1936,6 +1949,39 @@ impl Gpu {
         self.bind_thread()?;
         let buf = self.hip.malloc(data.len())?;
         self.hip.memcpy_htod(&buf, data)?;
+        Ok(GpuTensor {
+            buf,
+            shape: shape.to_vec(),
+            dtype: DType::Raw,
+        })
+    }
+
+    /// Upload raw bytes through bounded synchronous copies. `on_copied` runs
+    /// only after each chunk's H2D copy has completed, allowing an offline
+    /// file-backed source to discard those mmap pages immediately. The final
+    /// tensor is byte-identical to [`Gpu::upload_raw`].
+    pub fn upload_raw_chunked<F>(
+        &self,
+        data: &[u8],
+        shape: &[usize],
+        max_chunk_bytes: usize,
+        mut on_copied: F,
+    ) -> HipResult<GpuTensor>
+    where
+        F: FnMut(usize, usize),
+    {
+        self.bind_thread()?;
+        let buf = self.hip.malloc(data.len())?;
+        for (offset, len) in raw_upload_chunks(data.len(), max_chunk_bytes) {
+            if let Err(error) =
+                self.hip
+                    .memcpy_htod_offset(&buf, offset, &data[offset..offset + len])
+            {
+                let _ = self.hip.free(buf);
+                return Err(error);
+            }
+            on_copied(offset, len);
+        }
         Ok(GpuTensor {
             buf,
             shape: shape.to_vec(),
@@ -4740,7 +4786,20 @@ impl Gpu {
 
 #[cfg(test)]
 mod tests {
-    use super::gen_fwht_signs;
+    use super::{gen_fwht_signs, raw_upload_chunks};
+
+    #[test]
+    fn raw_upload_chunks_cover_payload_once_with_bounded_tail() {
+        assert_eq!(
+            raw_upload_chunks(11, 4).collect::<Vec<_>>(),
+            vec![(0, 4), (4, 4), (8, 3)]
+        );
+        assert!(raw_upload_chunks(0, 4).next().is_none());
+        assert_eq!(
+            raw_upload_chunks(3, 0).collect::<Vec<_>>(),
+            vec![(0, 1), (1, 1), (2, 1)]
+        );
+    }
 
     #[test]
     fn mq_signs_128_deterministic() {
