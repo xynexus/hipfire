@@ -957,6 +957,20 @@ Qwen-specific flag. `--dry-run` prints:
 declared row and memory budgets. It never changes sample order or corpus rows,
 so auto-tuning cannot change the calibration dataset.
 
+After finalization, run the family-neutral structural gate before admitting the
+artifact to the quantizer:
+
+```bash
+target/release/hipfire-coexistence artifact audit-calibration \
+  --input ~/.hipfire/calib/Qwen3.5-397B-A17B.calib.hfq
+```
+
+The index-only report reconciles the read ledger, calibration tensor index,
+job/geometry, KLDREF map, routed full/admitted capture streams, coverage
+deficits, and exact preserve-undercovered set. It deliberately does not claim
+payload-value validation; resident/streamed comparison and held-out quality
+remain separate admission evidence.
+
 ## Implementation phases
 
 ### C0 — Freeze generic artifact and sample contracts
@@ -1245,7 +1259,7 @@ decode, and host-to-device upload before considering pinned host staging or
 GPU double buffering. Kernel changes come after those measurements and land
 one lever at a time.
 
-## Completion audit — 2026-07-21 04:30 AWST
+## Completion audit — 2026-07-21 06:22 AWST
 
 This table evaluates the numbered definition of done below. "Mechanism proven"
 does not mean the production artifact or admission ladder is complete.
@@ -1253,13 +1267,13 @@ does not mean the production artifact or admission ladder is complete.
 | Item | Status | Authoritative evidence / missing proof |
 |---|---|---|
 | 1. Family-resolved native CLI | Proven | Qwen3.5 and Gemma3-text registry/factory tests plus successful architecture-selected dry runs and real streams; no family CLI flag exists. |
-| 2. Complete 397B teacher artifact | In progress | The durable production stream has 31 of 60 layer checkpoints. No final `.calib.hfq` exists yet, so finalizer, KLDREF, complete ledger, and all-layer telemetry are not proven. |
+| 2. Complete 397B teacher artifact | In progress | The recovered durable production stream has 34 of 60 layer checkpoints and crossed the prior layer-31 SVM-pressure failure with lookahead disabled. No final `.calib.hfq` exists yet, so finalizer, KLDREF, complete ledger, and all-layer telemetry are not proven. |
 | 3. Second and only target-source pass | Pending | The target `Qwen3.5-397B-A17B.oq4.25++.hfq` does not exist. The quantizer join is implemented and bounded Gemma join evidence exists, but the production source pass has not run. |
-| 4. Per-layer/per-expert floor | Mechanism proven; production pending | Unit/GPU capture tests and the first 31 production layers reconcile K=10 routing. Preserve-undercovered records real deficits, but the complete 60-layer fallback set is not available until finalization. |
-| 5. Frozen telemetry and quantizer refusal | Mechanism proven; production pending | Artifact schemas, fingerprints, quota telemetry, strict/preserve policy, and high-precision enforcement tests pass. The final production artifact and quantizer evidence are absent. |
+| 4. Per-layer/per-expert floor | Mechanism proven; production pending | Unit/GPU capture tests and all 34 durable production layer journals reconcile K=10 routing. Serialized layer snapshots independently validate routed slots, full/admitted weight counts, quota/slack accounting, and reduction tiles. Preserve-undercovered records real deficits, but the complete 60-layer fallback set is not available until finalization. |
+| 5. Frozen telemetry and quantizer refusal | Mechanism proven; production pending | `artifact audit-calibration` now provides a family-neutral nonzero gate for the complete ledger, Hessian/imatrix index, KLDREF map, per-layer telemetry reconciliation, policy, deficits, and exact high-precision fallback set. Quantizer enforcement tests pass; the final production artifact and quantizer evidence are absent. |
 | 6. Independent batched state and chosen geometry | Proven on gfx1151 | Ragged independent-state scheduler tests and the Qwen layer-0 batch/row sweeps select batch 64, time tile 32, and 2,048 rows for this host. |
 | 7. Shared grouped-MoE substrate | Mechanism proven; serving gate pending | Scratch/routing/capture live in `hipfire-runtime`, the routed executor in `hipfire-dispatch`, and Qwen admits K=8/K=10. Production exercises raw K=10; matched grouped-versus-reference serving parity remains required after the GPU is free. |
-| 8. Second family | Proven | Gemma3-text uses the same engine/CLI, completed a 62-layer pause/resume stream, and completed a bounded calibrated second-pass join without a generic family branch. |
+| 8. Second family | Proven | Gemma3-text uses the same engine/CLI, completed a 62-layer pause/resume stream, and completed a bounded calibrated second-pass join without a generic family branch. The new index-only auditor passes its 434-Hessian/434-imatrix artifact, 809/809 logical ledger, and KLDREF structure without a family branch. |
 | 9. Resident/streamed parity and quality | Tooling complete; evidence pending | `collect_artifacts --job-from <streamed.calib.hfq>` now drives Qwen3.5 and Gemma3 resident oracles from the exact serialized independent-sample job, resetting state per sample and emitting the canonical non-terminal KLD map. `hipfire-coexistence artifact compare-calibration` provides the family-neutral full-tensor gate with mandatory matched corpus/sample provenance, logical dense/compact Hessian comparison, exact KLD indices, finite-value enforcement, normalized resident/streamed per-layer router parity, and bounded mismatch reporting. Opt-in bounded `.residuals.hfq` sidecars plus `artifact compare-residuals` cover exact row provenance and tolerance-bound post-layer residuals without bloating production artifacts; the resident Qwen oracle now explicitly uses the same FP32 DeltaNet-state contract as the streamed teacher. Matched Qwen/Gemma runs, expert floor/cap sweeps, and held-out KLD/PPL comparisons still await the production GPU. |
 | 10. Precision portability | Partial | BF16/F16 conversion tests plus both grouped-expert and family-neutral dense/KLD raw-kernel compile coverage pass for RDNA2/3/4 and CDNA targets. Dense projections now select WMMA only on capable architectures and otherwise use the scalar F16/BF16 fallback. Only gfx1151 has channel execution evidence; admitted-path execution or an honest rejection is still needed on the remaining classes. |
 | 11. Native workflow documentation | Proven | `MODEL-INDUCTION.md` and `QUANTIZE.md` name native calibration as default, Python as oracle/tooling only, and `oq4.25++` as the default quant. |

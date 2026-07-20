@@ -32,6 +32,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Some("artifact"), Some("inspect")) => {
             hipfire_coexistence::artifact::run_inspect_cli(&args[2..])
         }
+        (Some("artifact"), Some("audit-calibration")) => {
+            hipfire_coexistence::calibration_audit::run_cli(&args[2..])
+        }
         (Some("artifact"), Some("compare-calibration")) => {
             hipfire_coexistence::calibration_compare::run_cli(&args[2..])
         }
@@ -65,6 +68,7 @@ fn usage() {
          [--pause-after-layers N] \
          [--residual-probe-output PATH --residual-probe-rows N]\n\
          artifact inspect --input <artifact.hfq>\n\
+         artifact audit-calibration --input <artifact.calib.hfq>\n\
          artifact compare-calibration --reference <resident.calib.hfq> \
          --candidate <streamed.calib.hfq> [--atol F] [--rtol F] \
          [--max-reports N] [--allow-unproven-provenance]\n\

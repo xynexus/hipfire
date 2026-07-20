@@ -200,6 +200,21 @@ captured separately with per-expert coverage and tile-admission telemetry.
 Undercovered experts either fail the strict gate or are explicitly listed for
 BF16/F16 preservation.
 
+Audit a completed native artifact before using it for the second pass:
+
+```bash
+target/release/hipfire-coexistence artifact audit-calibration \
+  --input ~/.hipfire/calib/<model>.calib.hfq
+```
+
+This family-neutral, index-only gate exits nonzero when the tensor index and
+metadata disagree. It reconciles the one-read ledger, Hessian/imatrix counts
+and encodings, job and microbatch geometry, KLDREF shapes/position map, every
+routed expert's full/admitted stream counts, coverage deficits, and the exact
+BF16/F16 preservation set. Its JSON report explicitly sets
+`payload_values_checked` to false: use the full resident/streamed comparator
+and held-out quality gates below to prove numerical finiteness and quality.
+
 For a resident-versus-layer-streamed parity run, generate both calibration
 packages from the same frozen sample set. After the streamed artifact exists,
 the resident oracle consumes its embedded native job rather than retokenizing

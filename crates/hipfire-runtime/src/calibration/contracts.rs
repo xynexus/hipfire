@@ -725,6 +725,195 @@ pub struct ExpertLayerTelemetry {
 }
 
 impl ExpertLayerTelemetry {
+    /// Validate a serialized per-layer telemetry snapshot without requiring
+    /// the live [`ExpertTelemetry`] accumulator that produced it.
+    ///
+    /// This is intentionally family-neutral so offline artifact tooling can
+    /// reject malformed routing/capture accounting before a quantizer trusts
+    /// expert coverage or high-precision fallback metadata.
+    pub fn reconcile(&self) -> Result<(), CalibError> {
+        self.quota.validate()?;
+        if self.num_experts == 0 || self.k_top == 0 || self.k_top > self.num_experts {
+            return Err(CalibError::InvalidRouting(format!(
+                "layer {} has invalid expert geometry: experts={}, K-top={}",
+                self.layer, self.num_experts, self.k_top
+            )));
+        }
+        for (name, actual) in [
+            ("router top-1", self.router.top1_hits.len()),
+            ("router top-k", self.router.topk_hits.len()),
+            ("router weights", self.router.route_weights.len()),
+            ("gate-up capture", self.gate_up.len()),
+            ("down capture", self.down.len()),
+        ] {
+            if actual != self.num_experts {
+                return Err(CalibError::InvalidRouting(format!(
+                    "layer {} {name} length {actual} differs from expert count {}",
+                    self.layer, self.num_experts
+                )));
+            }
+        }
+
+        let expected_slots = self
+            .router
+            .routed_tokens
+            .checked_mul(self.k_top as u64)
+            .ok_or_else(|| {
+                CalibError::InvalidRouting(format!(
+                    "layer {} routed slot count overflows u64",
+                    self.layer
+                ))
+            })?;
+        if self
+            .router
+            .routed_slots
+            .saturating_add(self.router.dropped_indices)
+            != expected_slots
+        {
+            return Err(CalibError::InvalidRouting(format!(
+                "layer {} valid slots {} + dropped indices {} != routed tokens {} * K-top {}",
+                self.layer,
+                self.router.routed_slots,
+                self.router.dropped_indices,
+                self.router.routed_tokens,
+                self.k_top
+            )));
+        }
+        let recorded_slots = self.router.topk_hits.iter().try_fold(0u64, |sum, hits| {
+            sum.checked_add(*hits).ok_or_else(|| {
+                CalibError::InvalidRouting(format!(
+                    "layer {} top-k hit count overflows u64",
+                    self.layer
+                ))
+            })
+        })?;
+        if recorded_slots != self.router.routed_slots {
+            return Err(CalibError::InvalidRouting(format!(
+                "layer {} top-k hits sum to {recorded_slots}, expected {} routed slots",
+                self.layer, self.router.routed_slots
+            )));
+        }
+        let top1_hits = self.router.top1_hits.iter().try_fold(0u64, |sum, hits| {
+            sum.checked_add(*hits).ok_or_else(|| {
+                CalibError::InvalidRouting(format!(
+                    "layer {} top-1 hit count overflows u64",
+                    self.layer
+                ))
+            })
+        })?;
+        if top1_hits > self.router.routed_tokens {
+            return Err(CalibError::InvalidRouting(format!(
+                "layer {} top-1 hits {top1_hits} exceed routed tokens {}",
+                self.layer, self.router.routed_tokens
+            )));
+        }
+        if self.router.max_active_experts > self.num_experts
+            || self.router.active_expert_sum
+                > self
+                    .router
+                    .microbatches
+                    .saturating_mul(self.num_experts as u64)
+        {
+            return Err(CalibError::InvalidRouting(format!(
+                "layer {} grouped-batch active-expert accounting is invalid",
+                self.layer
+            )));
+        }
+        if self
+            .router
+            .saturated_after_routed_tokens
+            .is_some_and(|tokens| tokens > self.router.routed_tokens)
+        {
+            return Err(CalibError::InvalidRouting(format!(
+                "layer {} saturation point exceeds routed token count",
+                self.layer
+            )));
+        }
+
+        let validate_weights =
+            |label: &str, expected_count: u64, weights: &WeightStats| -> Result<(), CalibError> {
+                if weights.count != expected_count
+                    || !weights.sum.is_finite()
+                    || !weights.sum_squared.is_finite()
+                    || weights.sum_squared < 0.0
+                {
+                    return Err(CalibError::InvalidRouting(format!(
+                        "layer {} {label} weight stats count/values are invalid",
+                        self.layer
+                    )));
+                }
+                Ok(())
+            };
+        let limit_rows = self.quota.limit_rows()?;
+        for expert in 0..self.num_experts {
+            let expected = self.router.topk_hits[expert];
+            validate_weights(
+                &format!("expert {expert} router"),
+                expected,
+                &self.router.route_weights[expert],
+            )?;
+            for (role, stats) in [
+                (ExpertCaptureRole::GateUpInput, &self.gate_up[expert]),
+                (ExpertCaptureRole::DownInput, &self.down[expert]),
+            ] {
+                if stats.seen_rows != expected {
+                    return Err(CalibError::InvalidRouting(format!(
+                        "layer {} expert {expert} {role}: saw {} capture rows but router recorded {expected}",
+                        self.layer, stats.seen_rows
+                    )));
+                }
+                if stats.admitted_rows.saturating_add(stats.quota_skipped_rows) != stats.seen_rows {
+                    return Err(CalibError::InvalidRouting(format!(
+                        "layer {} expert {expert} {role}: admitted {} + skipped {} != seen {}",
+                        self.layer, stats.admitted_rows, stats.quota_skipped_rows, stats.seen_rows
+                    )));
+                }
+                if stats.admitted_rows != stats.seen_rows.min(limit_rows) {
+                    return Err(CalibError::InvalidRouting(format!(
+                        "layer {} expert {expert} {role}: admitted {} does not match quota-capped seen rows {}",
+                        self.layer,
+                        stats.admitted_rows,
+                        stats.seen_rows.min(limit_rows)
+                    )));
+                }
+                let expected_slack = stats.admitted_rows.saturating_sub(self.quota.target_rows);
+                if stats.batch_slack_rows != expected_slack {
+                    return Err(CalibError::InvalidRouting(format!(
+                        "layer {} expert {expert} {role}: batch slack {} does not match admitted-above-target rows {expected_slack}",
+                        self.layer, stats.batch_slack_rows
+                    )));
+                }
+                validate_weights(
+                    &format!("expert {expert} {role} full-stream"),
+                    stats.seen_rows,
+                    &stats.full_weight,
+                )?;
+                validate_weights(
+                    &format!("expert {expert} {role} admitted-stream"),
+                    stats.admitted_rows,
+                    &stats.admitted_weight,
+                )?;
+                if stats.launch_telemetry_recorded {
+                    let tile_rows = self.quota.tile_rows as u64;
+                    let expected_full_tiles = stats.admitted_rows / tile_rows;
+                    let expected_partial_tiles = u64::from(stats.admitted_rows % tile_rows != 0);
+                    if stats.full_reduction_tiles != expected_full_tiles
+                        || stats.partial_reduction_tiles != expected_partial_tiles
+                    {
+                        return Err(CalibError::InvalidCapture(format!(
+                            "layer {} expert {expert} {role}: reduction tiles full={} partial={} do not match admitted rows {} at tile width {tile_rows}",
+                            self.layer,
+                            stats.full_reduction_tiles,
+                            stats.partial_reduction_tiles,
+                            stats.admitted_rows,
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn coverage_report(
         &self,
         policy: ExpertCoveragePolicy,
@@ -1117,56 +1306,8 @@ impl ExpertTelemetry {
     }
 
     pub fn reconcile(&self) -> Result<(), CalibError> {
-        let limit_rows = self.quota.limit_rows()?;
         for layer in 0..self.num_layers {
-            for expert in 0..self.num_experts {
-                let expected = self.router[layer].topk_hits[expert];
-                for role in EXPERT_CAPTURE_ROLES {
-                    let stats = self.capture_stats(layer, expert, role);
-                    if stats.seen_rows != expected {
-                        return Err(CalibError::InvalidRouting(format!(
-                            "layer {layer} expert {expert} {role}: saw {} capture rows but router recorded {expected}",
-                            stats.seen_rows
-                        )));
-                    }
-                    if stats.admitted_rows + stats.quota_skipped_rows != stats.seen_rows {
-                        return Err(CalibError::InvalidRouting(format!(
-                            "layer {layer} expert {expert} {role}: admitted {} + skipped {} != seen {}",
-                            stats.admitted_rows, stats.quota_skipped_rows, stats.seen_rows
-                        )));
-                    }
-                    if stats.admitted_rows != stats.seen_rows.min(limit_rows) {
-                        return Err(CalibError::InvalidRouting(format!(
-                            "layer {layer} expert {expert} {role}: admitted {} does not match quota-capped seen rows {}",
-                            stats.admitted_rows,
-                            stats.seen_rows.min(limit_rows)
-                        )));
-                    }
-                    let expected_slack = stats.admitted_rows.saturating_sub(self.quota.target_rows);
-                    if stats.batch_slack_rows != expected_slack {
-                        return Err(CalibError::InvalidRouting(format!(
-                            "layer {layer} expert {expert} {role}: batch slack {} does not match admitted-above-target rows {expected_slack}",
-                            stats.batch_slack_rows
-                        )));
-                    }
-                    if stats.launch_telemetry_recorded {
-                        let tile_rows = self.quota.tile_rows as u64;
-                        let expected_full_tiles = stats.admitted_rows / tile_rows;
-                        let expected_partial_tiles =
-                            u64::from(stats.admitted_rows % tile_rows != 0);
-                        if stats.full_reduction_tiles != expected_full_tiles
-                            || stats.partial_reduction_tiles != expected_partial_tiles
-                        {
-                            return Err(CalibError::InvalidCapture(format!(
-                                "layer {layer} expert {expert} {role}: reduction tiles full={} partial={} do not match admitted rows {} at tile width {tile_rows}",
-                                stats.full_reduction_tiles,
-                                stats.partial_reduction_tiles,
-                                stats.admitted_rows,
-                            )));
-                        }
-                    }
-                }
-            }
+            self.layer_snapshot(layer)?.reconcile()?;
         }
         Ok(())
     }
@@ -1678,6 +1819,38 @@ mod tests {
             .unwrap();
         let error = telemetry.reconcile().unwrap_err().to_string();
         assert!(error.contains("down_input"));
+    }
+
+    #[test]
+    fn serialized_layer_telemetry_reconciles_without_live_accumulator() {
+        let mut telemetry = ExpertTelemetry::new(1, 1, 1, quota(), 8).unwrap();
+        for _ in 0..2 {
+            telemetry.record_router_selection(0, &[0], &[1.0]).unwrap();
+            telemetry
+                .record_capture_route(0, 0, ExpertCaptureRole::GateUpInput, 1.0)
+                .unwrap();
+            telemetry
+                .record_capture_route(0, 0, ExpertCaptureRole::DownInput, 1.0)
+                .unwrap();
+        }
+        let snapshot = telemetry.layer_snapshot(0).unwrap();
+        snapshot.reconcile().unwrap();
+
+        let mut malformed = snapshot.clone();
+        malformed.down.clear();
+        assert!(malformed
+            .reconcile()
+            .unwrap_err()
+            .to_string()
+            .contains("down capture length"));
+
+        let mut malformed = snapshot;
+        malformed.gate_up[0].admitted_weight.count = 1;
+        assert!(malformed
+            .reconcile()
+            .unwrap_err()
+            .to_string()
+            .contains("admitted-stream weight stats"));
     }
 
     #[test]

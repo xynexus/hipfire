@@ -3,5 +3,6 @@
 
 pub mod artifact;
 pub mod calibrate;
+pub mod calibration_audit;
 pub mod calibration_compare;
 pub mod residual_compare;

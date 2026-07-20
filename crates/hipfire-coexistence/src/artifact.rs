@@ -6,13 +6,7 @@ use serde_json::{json, Value};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-/// Return provenance and an index/metadata fingerprint without reading tensor
-/// payloads. The embedded `quantization_hash`, when present, remains the
-/// payload-integrity identity; this fingerprint identifies the artifact's
-/// metadata and tensor layout for cheap resume checks.
-pub fn inspect_artifact(path: &Path) -> Result<Value, Box<dyn Error>> {
-    let hfq = HfqFile::open_index_only(path)?;
-    let metadata: Value = serde_json::from_str(&hfq.metadata_json)?;
+pub(crate) fn index_identity(hfq: &HfqFile, metadata: Value) -> Value {
     let tensors = hfq
         .tensors()
         .iter()
@@ -26,20 +20,35 @@ pub fn inspect_artifact(path: &Path) -> Result<Value, Box<dyn Error>> {
             })
         })
         .collect::<Vec<_>>();
-    let identity = json!({
+    json!({
         "version": hfq.version,
         "arch_id": hfq.arch_id,
         "metadata": metadata,
         "tensors": tensors,
-    });
-    let identity_bytes = serde_json::to_vec(&identity)?;
+    })
+}
+
+pub(crate) fn index_fingerprint(identity: &Value) -> Result<String, serde_json::Error> {
+    Ok(hipfire_hash::stable_hash_bytes(&serde_json::to_vec(
+        identity,
+    )?))
+}
+
+/// Return provenance and an index/metadata fingerprint without reading tensor
+/// payloads. The embedded `quantization_hash`, when present, remains the
+/// payload-integrity identity; this fingerprint identifies the artifact's
+/// metadata and tensor layout for cheap resume checks.
+pub fn inspect_artifact(path: &Path) -> Result<Value, Box<dyn Error>> {
+    let hfq = HfqFile::open_index_only(path)?;
+    let metadata: Value = serde_json::from_str(&hfq.metadata_json)?;
+    let identity = index_identity(&hfq, metadata);
     Ok(json!({
         "artifact": path,
         "bytes": std::fs::metadata(path)?.len(),
         "version": hfq.version,
         "arch_id": hfq.arch_id,
         "tensor_count": hfq.tensors().len(),
-        "artifact_fingerprint": hipfire_hash::stable_hash_bytes(&identity_bytes),
+        "artifact_fingerprint": index_fingerprint(&identity)?,
         "fingerprint_scope": "hfq_metadata_and_tensor_index_v1",
         "metadata": identity["metadata"],
     }))
