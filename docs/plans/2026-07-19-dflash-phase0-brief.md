@@ -23,13 +23,15 @@ NPU DFlash block wall: **726 ms** (native driver,
 |---|---|---|
 | GEMM (weight-bandwidth-bound) | 317 ms | **102.3 ms** (98bbce9b6, r14 W4A8) |
 | attention | 236 ms | **7.0 ms** (flash kernel wired into the body, task #28) |
-| host glue (quant/bf16/packing) | 143 ms | **54.0 ms** (8da5aa5b3) |
-| primitives (norm/rope/swiglu) | 24 ms | 23.7 ms |
-| **warm block wall** | **726 ms** | **185.4 ms** |
+| host glue (quant/bf16/packing) | 143 ms | **54.0 ms** (8da5aa5b3) → **~35 ms** (cpu-prim) |
+| primitives (norm/rope/swiglu) | 24 ms | 23.7 ms → **~0 NPU / 4.85 ms CPU** (8c32a4992) |
+| **warm block wall** | **726 ms** | 185.4 → **111.9 ms** (`--cpu-primitives`) |
 
-**Attention is now the SMALLEST term (3.7% of the wall).** GEMM is 55%, host
-glue 29%, primitives 13%. The `M_TILE=16` double-stream in the GEMM (~40 ms
-above the ~60 ms bandwidth floor) is now the only large single lever left.
+**With `--cpu-primitives` the wall is 111.9 ms and context-misses are ZERO**
+(task #29). Made of ~77 ms NPU (r14 GEMM-dominated + ~7 ms attention) + ~35 ms
+host glue. The `M_TILE=16` GEMM double-stream and the ~35 ms host glue
+(overlappable behind streaming, task #30) are the two levers left. NOTE the
+185.4 ms row is the all-NPU path, kept as the flag default and reproducible.
 
 **⚠ MEASURE WARM-ONLY.** An earlier revision of this table was wrong twice from
 one mistake: per-op means were averaged over ALL blocks including the cold first
@@ -238,24 +240,31 @@ the CPU uses one of ~8 Zen4 cores. On Phoenix UMA there is **no transfer cost** 
 an "upload" is a cache flush — which is what makes host offload cheap. Levers,
 by expected payoff, with the GEMM assumed to stay on the NPU:
 
-1. **Move the 8 primitives (rmsnorm ×2/layer, headnorm q+k, rope q+k, swiglu)
-   to the CPU.** Compounds three ways: (a) removes 23.7 ms of NPU dispatch
-   directly; (b) removes the bf16 pack/unpack glue that exists ONLY to feed them
-   across the NPU boundary (part of the 54 ms), and keeps intermediates f32 on
-   host; (c) **shrinks the NPU working set from ~10 resident kernels to ~2**,
-   which is the real prize — the thrash diagnosis is "10 warm kernels ≫ ≤5 LRU
-   slots" driving 40–46 context-misses/block and up to 2.5× wall inflation.
-   MEASURED part = the 23.7 ms + glue; the thrash recovery is the larger but
-   UNMEASURED part and is the number this work exists to get.
+1. ~~**Move the 8 primitives to the CPU.**~~ + 2. ~~**Pin r14 GEMM array +
+   attention resident.**~~ **BOTH DONE together (task #29, `8c32a4992`,
+   `--cpu-primitives`).** The thesis held — the thrash was the prize:
 
-2. **Fuse / co-resident the r14 GEMM array + attention as the pinned NPU set.**
-   The endpoint of lever 1: once the primitives are gone, the GEMM array and the
-   flash attention kernel are the ONLY NPU consumers. Pin both resident (one
-   persistent hw-context allocation, no LRU eviction between them) so a block
-   never re-faults weight/attention BOs. This is what converts lever 1's
-   working-set shrink into an actual zero-miss steady state — do it together with
-   1, since 1 without pinning still lets the two evict each other. Watch the
-   6-hwctx hard limit (`--ctx-budget 6` EINVALs; the r14 array already pins one).
+   | multicore W4A8, same-lock A/B | all-NPU | `--cpu-primitives` |
+   |---|---|---|
+   | ctx_misses / block | 13–21 | **0** |
+   | warm block wall | 186.0 ms | **111.9 ms (1.66×)** |
+   | dispatches / block | 117 | 80 |
+   | npu_busy | ~132 ms | ~77 ms |
+
+   No cache-code change needed: in multicore the r14 array is already pinned
+   outside the LRU, so removing the 6 primitive kernels leaves attention as the
+   sole LRU entry (resident set = anchor + r14 + attn = **3 of 6 hwctx**), which
+   never evicts. The r14 GEMMs themselves sped up once nothing thrashed the
+   context cache (e.g. N24576 1.12→0.85 ms). CPU primitives cost **4.85 ms/block
+   single-core** (all 36 calls) vs 23.7 ms on the NPU; rayon is net-negative at
+   36 sub-ms calls (confirmed, not built). Int8 path golden cos **rose
+   0.998083→0.998531** — the f32 CPU primitives are the *more accurate* side, so
+   the literal >0.999999 CPU-vs-NPU per-op gate is unachievable by construction
+   (it asks the accurate impl to match a ~2e-5-error kernel); correctness is
+   gated on the improved golden cos, per the brief's own per-path split.
+
+   Post-state: 112 ms ≈ ~77 ms NPU (r14-dominated + ~7 ms attention) + ~35 ms
+   host glue, **0 misses**. That ~35 ms glue is now task #30's clean target.
 
 3. **Overlap remaining glue behind NPU weight-streaming (double-buffer).** ~60 ms
    of the 102 ms GEMM is pure weight streaming — NPU busy, CPU idle. Pipeline so
