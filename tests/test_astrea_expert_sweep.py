@@ -6,6 +6,7 @@
 
 import importlib.util
 import json
+import struct
 import sys
 from pathlib import Path
 
@@ -44,11 +45,11 @@ def common_inputs(tmp_path):
     calibration.write_text("calibration rows\n", encoding="utf-8")
     evaluation.write_text("held-out rows\n", encoding="utf-8")
     return {
-        "model": Path("/srv/huggingface/models--Example--MoE-16B-A2B"),
+        "model": write_safetensors_fixture(tmp_path / "model"),
         "artifact_stem": "Example-16B-A2B",
         "calibration_dataset": calibration,
         "evaluation_dataset": evaluation,
-        "reference_model": Path("/models/Example-16B-A2B.bf16.hfq"),
+        "reference_model": write_hfq_fixture(tmp_path / "Example-16B-A2B.bf16.hfq"),
         "output_dir": tmp_path / "sweep",
         "evaluation_command_template": (
             "hipfire eval --model {candidate} --reference {reference_model} "
@@ -57,6 +58,30 @@ def common_inputs(tmp_path):
         "engine": {"fingerprint_id": "sha256:engine"},
         "command": ["python3", "scripts/astrea.py", "expert-sweep-plan"],
     }
+
+
+def write_safetensors_fixture(root: Path, payload: bytes = b"weights") -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "example_moe", "num_hidden_layers": 1}), encoding="utf-8"
+    )
+    shard = root / "model-00001-of-00001.safetensors"
+    header = json.dumps(
+        {"model.layers.0.weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    shard.write_bytes(struct.pack("<Q", len(header)) + header + payload)
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.layers.0.weight": shard.name}}), encoding="utf-8"
+    )
+    return root
+
+
+def write_hfq_fixture(path: Path, control: bytes = b'{"quantization_hash":"fixture"}\0') -> Path:
+    data_offset = 32 + len(control)
+    header = struct.pack("<4sIIIQQ", b"HFQM", 2, 6, 0, 32, data_offset)
+    path.write_bytes(header + control + b"payload")
+    return path
 
 
 def test_floor_sweep_freezes_one_axis_and_heldout_commands(tmp_path):
@@ -87,9 +112,7 @@ def test_floor_sweep_freezes_one_axis_and_heldout_commands(tmp_path):
     for variant in plan["variants"]:
         run = variant["two_pass_command"]
         assert run[:2] == ["python3", "scripts/two_pass_quantize.py"]
-        assert run[run.index("--min-expert-activations") + 1] == str(
-            variant["minimum_expert_activations"]
-        )
+        assert run[run.index("--min-expert-activations") + 1] == str(variant["minimum_expert_activations"])
         assert run[run.index("--expert-capture-target") + 1] == "4096"
         assert run[-3:] == ["--", "--awq", "--ldlq"]
         assert variant["calibration_artifact"].endswith(f".{variant['id']}.calib.hfq")
@@ -138,9 +161,7 @@ def test_capture_sweep_holds_selected_minimum_fixed(tmp_path):
 def test_sweep_rejects_contaminated_or_nonisolated_experiments(tmp_path):
     sweep = load_module()
     inputs = common_inputs(tmp_path)
-    inputs["evaluation_dataset"].write_text(
-        inputs["calibration_dataset"].read_text(encoding="utf-8"), encoding="utf-8"
-    )
+    inputs["evaluation_dataset"].write_text(inputs["calibration_dataset"].read_text(encoding="utf-8"), encoding="utf-8")
     with pytest.raises(ValueError, match="distinct content"):
         sweep.build_plan(
             **inputs,
@@ -258,7 +279,7 @@ def test_astrea_cli_writes_frozen_expert_sweep_plan(tmp_path):
     assert code == 0, stderr
     assert stdout == ""
     plan = json.loads(output.read_text(encoding="utf-8"))
-    assert plan["schema"] == "hipfire.astrea.expert_calibration_sweep_plan.v0"
+    assert plan["schema"] == "hipfire.astrea.expert_calibration_sweep_plan.v1"
     assert [variant["minimum_expert_activations"] for variant in plan["variants"]] == [512, 1024]
     assert plan["engine"]["schema"] == astrea.ENGINE_SCHEMA
     assert "crates/hipfire-runtime/src/calibration/contracts.rs" in plan["engine"]["source_hashes"]
@@ -272,8 +293,8 @@ def test_verify_plan_rejects_dataset_engine_and_payload_drift(tmp_path):
     inputs = common_inputs(tmp_path)
     inputs["model"] = tmp_path / "model"
     inputs["reference_model"] = tmp_path / "reference.hfq"
-    inputs["model"].mkdir(parents=True)
-    inputs["reference_model"].write_bytes(b"reference")
+    write_safetensors_fixture(inputs["model"])
+    write_hfq_fixture(inputs["reference_model"])
     plan = sweep.build_plan(
         **inputs,
         axis="minimum",
@@ -308,8 +329,8 @@ def test_astrea_cli_verifies_plan_before_execution(tmp_path):
     inputs = common_inputs(tmp_path)
     inputs["model"] = tmp_path / "model"
     inputs["reference_model"] = tmp_path / "reference.hfq"
-    inputs["model"].mkdir(parents=True)
-    inputs["reference_model"].write_bytes(b"reference")
+    write_safetensors_fixture(inputs["model"])
+    write_hfq_fixture(inputs["reference_model"])
     current_engine = astrea.engine_fingerprint()
     inputs["engine"] = current_engine
     plan = sweep.build_plan(
@@ -328,3 +349,55 @@ def test_astrea_cli_verifies_plan_before_execution(tmp_path):
     result = json.loads(stdout)
     assert result["status"] == "verified_not_run"
     assert result["plan_fingerprint"] == plan["plan_fingerprint"]
+
+
+def test_verify_plan_rejects_source_and_reference_identity_drift(tmp_path):
+    sweep = load_module()
+    inputs = common_inputs(tmp_path)
+    inputs["model"] = write_safetensors_fixture(tmp_path / "model")
+    inputs["reference_model"] = write_hfq_fixture(tmp_path / "reference.hfq")
+    plan = sweep.build_plan(
+        **inputs,
+        axis="minimum",
+        minimum_rows=[512, 1024],
+        capture_targets=None,
+        selected_minimum=None,
+        fixed_capture_target=4096,
+    )
+
+    assert plan["model"]["identity"]["kind"] == "safetensors_manifest"
+    assert plan["reference_model"]["identity"]["kind"] == "hfq_control_region"
+
+    shard = inputs["model"] / "model-00001-of-00001.safetensors"
+    original = shard.read_bytes()
+    shard.write_bytes(original.replace(b"F16", b"BF1", 1))
+    with pytest.raises(ValueError, match="source model identity drift"):
+        sweep.verify_plan(plan, current_engine={"fingerprint_id": "sha256:engine"})
+
+    shard.write_bytes(original)
+    write_hfq_fixture(inputs["reference_model"], control=b'{"quantization_hash":"changed"}\0')
+    with pytest.raises(ValueError, match="reference model identity drift"):
+        sweep.verify_plan(plan, current_engine={"fingerprint_id": "sha256:engine"})
+
+
+def test_verify_plan_rejects_command_binding_drift_even_with_refingerprinted_payload(tmp_path):
+    sweep = load_module()
+    inputs = common_inputs(tmp_path)
+    inputs["model"] = write_safetensors_fixture(tmp_path / "model")
+    inputs["reference_model"] = write_hfq_fixture(tmp_path / "reference.hfq")
+    plan = sweep.build_plan(
+        **inputs,
+        axis="minimum",
+        minimum_rows=[512],
+        capture_targets=None,
+        selected_minimum=None,
+        fixed_capture_target=4096,
+    )
+
+    tampered = json.loads(json.dumps(plan))
+    command = tampered["variants"][0]["two_pass_command"]
+    command[command.index("--corpus") + 1] = str(inputs["evaluation_dataset"].resolve())
+    body = {key: value for key, value in tampered.items() if key != "plan_fingerprint"}
+    tampered["plan_fingerprint"] = sweep._plan_fingerprint(body)
+    with pytest.raises(ValueError, match="calibration dataset disagrees"):
+        sweep.verify_plan(tampered, current_engine={"fingerprint_id": "sha256:engine"})

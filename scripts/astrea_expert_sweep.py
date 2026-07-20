@@ -17,12 +17,13 @@ import hashlib
 import json
 import re
 import shlex
+import struct
 from pathlib import Path
 from string import Formatter
 
 
-EXPERT_SWEEP_PLAN_SCHEMA = "hipfire.astrea.expert_calibration_sweep_plan.v0"
-EXPERT_SWEEP_VERIFY_SCHEMA = "hipfire.astrea.expert_calibration_sweep_verify.v0"
+EXPERT_SWEEP_PLAN_SCHEMA = "hipfire.astrea.expert_calibration_sweep_plan.v1"
+EXPERT_SWEEP_VERIFY_SCHEMA = "hipfire.astrea.expert_calibration_sweep_verify.v1"
 DEFAULT_QUANT_FORMAT = "oq4.25++"
 DEFAULT_MINIMUM_ROWS = (512, 1024, 2048, 4096)
 DEFAULT_CAPTURE_TARGETS = (2048, 4096, 8192)
@@ -47,6 +48,7 @@ _REQUIRED_EVAL_FIELDS = {
     "evaluation_dataset",
     "evaluation_output",
 }
+_MAX_CONTROL_REGION_BYTES = 512 * 1024 * 1024
 
 
 def _sha256_file(path: Path) -> str:
@@ -55,6 +57,142 @@ def _sha256_file(path: Path) -> str:
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
     return f"sha256:{digest.hexdigest()}"
+
+
+def _canonical_sha256(value) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _sha256_region(path: Path, length: int) -> str:
+    digest = hashlib.sha256()
+    remaining = int(length)
+    with path.open("rb") as source:
+        while remaining:
+            chunk = source.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValueError(f"short read while fingerprinting {path}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _resolve_safetensors_root(path: Path) -> Path:
+    requested = path.expanduser().resolve()
+    if not requested.is_dir():
+        raise ValueError(f"source model directory does not exist: {requested}")
+    if (requested / "model.safetensors.index.json").is_file() or any(requested.glob("*.safetensors")):
+        return requested
+
+    main_ref = requested / "refs" / "main"
+    if main_ref.is_file():
+        revision = main_ref.read_text(encoding="utf-8").strip()
+        snapshot = requested / "snapshots" / revision
+        if snapshot.is_dir():
+            return snapshot.resolve()
+
+    snapshots = requested / "snapshots"
+    candidates = (
+        sorted(child.resolve() for child in snapshots.iterdir() if child.is_dir()) if snapshots.is_dir() else []
+    )
+    candidates = [
+        child
+        for child in candidates
+        if (child / "model.safetensors.index.json").is_file() or any(child.glob("*.safetensors"))
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    raise ValueError(f"cannot resolve a unique safetensors snapshot under {requested}")
+
+
+def _safetensors_header_identity(path: Path) -> str:
+    size = path.stat().st_size
+    with path.open("rb") as source:
+        prefix = source.read(8)
+        if len(prefix) != 8:
+            raise ValueError(f"safetensors shard is smaller than its header prefix: {path}")
+        header_length = struct.unpack("<Q", prefix)[0]
+        if header_length > size - 8 or header_length > _MAX_CONTROL_REGION_BYTES:
+            raise ValueError(f"safetensors shard has an invalid header length: {path}")
+    return _sha256_region(path, 8 + header_length)
+
+
+def _source_shard_identity(path: Path, root: Path) -> dict:
+    relative = str(path.relative_to(root))
+    size = path.stat().st_size
+    if path.is_symlink():
+        blob = path.readlink().name
+        is_digest = len(blob) in {40, 64} and all(character in "0123456789abcdefABCDEF" for character in blob)
+        if is_digest:
+            return {
+                "file": relative,
+                "bytes": size,
+                "identity_kind": "huggingface_blob_digest",
+                "identity": blob.lower(),
+            }
+    return {
+        "file": relative,
+        "bytes": size,
+        "identity_kind": "safetensors_header_hash",
+        "identity": _safetensors_header_identity(path),
+    }
+
+
+def _safetensors_manifest_identity(path: Path) -> dict:
+    root = _resolve_safetensors_root(path)
+    config = root / "config.json"
+    if not config.is_file():
+        raise ValueError(f"source model has no config.json: {root}")
+    index = root / "model.safetensors.index.json"
+    control_files = [{"file": "config.json", "sha256": _sha256_file(config)}]
+    if index.is_file():
+        parsed = json.loads(index.read_text(encoding="utf-8"))
+        shard_names = sorted(set(parsed.get("weight_map", {}).values()))
+        if not shard_names:
+            raise ValueError(f"safetensors index has no weight_map entries: {index}")
+        control_files.append({"file": index.name, "sha256": _sha256_file(index)})
+        shards = [root / name for name in shard_names]
+    else:
+        shards = sorted(root.glob("*.safetensors"))
+    if not shards or any(not shard.is_file() for shard in shards):
+        raise ValueError(f"source model has missing safetensors shards: {root}")
+    shard_records = [_source_shard_identity(shard, root) for shard in shards]
+    stable = {"control_files": control_files, "shards": shard_records}
+    return {
+        "kind": "safetensors_manifest",
+        "resolved_root": str(root),
+        **stable,
+        "fingerprint": _canonical_sha256(stable),
+    }
+
+
+def _reference_identity(path: Path) -> dict:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        raise ValueError(f"reference model does not exist: {resolved}")
+    size = resolved.stat().st_size
+    with resolved.open("rb") as source:
+        header = source.read(32)
+    if len(header) == 32 and header[:4] == b"HFQM":
+        _, version, arch_id, tensor_count, metadata_offset, data_offset = struct.unpack("<4sIIIQQ", header)
+        if not 32 <= metadata_offset <= data_offset <= size:
+            raise ValueError(f"reference HFQ has invalid metadata/data offsets: {resolved}")
+        if data_offset > _MAX_CONTROL_REGION_BYTES:
+            raise ValueError(f"reference HFQ control region is unreasonably large: {resolved}")
+        return {
+            "kind": "hfq_control_region",
+            "bytes": size,
+            "version": version,
+            "arch_id": arch_id,
+            "tensor_count": tensor_count,
+            "data_offset": data_offset,
+            "sha256": _sha256_region(resolved, data_offset),
+        }
+    return {
+        "kind": "complete_file",
+        "bytes": size,
+        "sha256": _sha256_file(resolved),
+    }
 
 
 def _dataset(path: Path) -> dict:
@@ -76,11 +214,7 @@ def _positive_unique(values, label: str) -> list[int]:
 
 
 def _template_fields(template: str) -> set[str]:
-    return {
-        field_name
-        for _, field_name, _, _ in Formatter().parse(template)
-        if field_name is not None
-    }
+    return {field_name for _, field_name, _, _ in Formatter().parse(template) if field_name is not None}
 
 
 def _render_evaluation_command(template: str, values: dict[str, str]) -> list[str]:
@@ -88,9 +222,7 @@ def _render_evaluation_command(template: str, values: dict[str, str]) -> list[st
     missing = sorted(_REQUIRED_EVAL_FIELDS - fields)
     unknown = sorted(fields - values.keys())
     if missing:
-        raise ValueError(
-            "evaluation command template is missing required placeholders: " + ", ".join(missing)
-        )
+        raise ValueError("evaluation command template is missing required placeholders: " + ", ".join(missing))
     if unknown:
         raise ValueError("evaluation command template has unknown placeholders: " + ", ".join(unknown))
     command = shlex.split(template.format(**values))
@@ -209,26 +341,30 @@ def verify_plan(plan, *, current_engine=None) -> dict:
             raise ValueError(f"{role} dataset is missing: {path}")
         observed = _sha256_file(path)
         if observed != record["sha256"]:
-            raise ValueError(
-                f"{role} dataset hash drift: recorded {record['sha256']}, observed {observed}"
-            )
+            raise ValueError(f"{role} dataset hash drift: recorded {record['sha256']}, observed {observed}")
         observed_datasets[role] = observed
     if observed_datasets["calibration"] == observed_datasets["evaluation"]:
         raise ValueError("calibration and evaluation datasets no longer have distinct content")
 
-    model = Path(plan.get("model", {}).get("path", ""))
-    reference = Path(plan.get("reference_model", {}).get("path", ""))
+    model_record = plan.get("model", {})
+    reference_record = plan.get("reference_model", {})
+    model = Path(model_record.get("path", ""))
+    reference = Path(reference_record.get("path", ""))
     if not model.is_dir():
         raise ValueError(f"source model directory is missing: {model}")
     if not reference.is_file():
         raise ValueError(f"reference model is missing: {reference}")
+    observed_source_identity = _safetensors_manifest_identity(model)
+    if model_record.get("identity") != observed_source_identity:
+        raise ValueError("source model identity drift")
+    observed_reference_identity = _reference_identity(reference)
+    if reference_record.get("identity") != observed_reference_identity:
+        raise ValueError("reference model identity drift")
 
     planned_engine = plan.get("engine", {}).get("fingerprint_id")
     observed_engine = (current_engine or {}).get("fingerprint_id")
     if current_engine is not None and planned_engine != observed_engine:
-        raise ValueError(
-            f"engine fingerprint drift: recorded {planned_engine}, observed {observed_engine}"
-        )
+        raise ValueError(f"engine fingerprint drift: recorded {planned_engine}, observed {observed_engine}")
 
     variants = plan.get("variants")
     if not isinstance(variants, list) or not variants:
@@ -242,7 +378,11 @@ def verify_plan(plan, *, current_engine=None) -> dict:
 
     minimums = set()
     targets = set()
+    source_model = str(model.resolve())
+    reference_model = str(reference.resolve())
+    calibration_dataset = plan["datasets"]["calibration"]["path"]
     evaluation_dataset = plan["datasets"]["evaluation"]["path"]
+    recipe = plan.get("recipe", {})
     for variant in variants:
         minimum = int(variant.get("minimum_expert_activations", 0))
         target = int(variant.get("expert_capture_target", 0))
@@ -258,15 +398,55 @@ def verify_plan(plan, *, current_engine=None) -> dict:
             raise ValueError(f"variant {variant.get('id')} minimum disagrees with its command")
         if _command_value(two_pass, "--expert-capture-target") != str(target):
             raise ValueError(f"variant {variant.get('id')} capture target disagrees with its command")
+        command_bindings = (
+            ("--model", source_model, "source model"),
+            ("--calib", variant["calibration_artifact"], "calibration artifact"),
+            ("--output", variant["quantized_artifact"], "quantized artifact"),
+            ("--manifest", variant["two_pass_manifest"], "two-pass manifest"),
+            ("--format", recipe.get("quant_format"), "quant format"),
+            ("--corpus", calibration_dataset, "calibration dataset"),
+            ("--n-sequences", str(recipe.get("sequences")), "sequence count"),
+            ("--ctx-len", str(recipe.get("context")), "context"),
+            ("--batch-size", str(recipe.get("sequence_batch")), "sequence batch"),
+            ("--time-tile", str(recipe.get("time_tile")), "time tile"),
+            ("--max-rows", str(recipe.get("max_rows")), "row budget"),
+            (
+                "--layer-prefetch-bytes",
+                str(recipe.get("layer_prefetch_bytes")),
+                "layer prefetch bytes",
+            ),
+            ("--kldref-topk", str(recipe.get("kldref_topk")), "KLDREF top-k"),
+            (
+                "--expert-capture-tile-rows",
+                str(recipe.get("expert_capture_tile_rows")),
+                "expert capture tile",
+            ),
+            (
+                "--required-expert-fraction",
+                str(recipe.get("required_expert_fraction")),
+                "required expert fraction",
+            ),
+            ("--sampling-seed", str(recipe.get("sampling_seed")), "sampling seed"),
+            (
+                "--expert-coverage-policy",
+                str(recipe.get("expert_coverage_policy", "")).replace("_", "-"),
+                "expert coverage policy",
+            ),
+        )
+        for flag, expected_value, label in command_bindings:
+            if _command_value(two_pass, flag) != expected_value:
+                raise ValueError(f"variant {variant.get('id')} {label} disagrees with its command")
+        separator = two_pass.index("--") if "--" in two_pass else len(two_pass)
+        if two_pass[separator + 1 :] != recipe.get("quant_args"):
+            raise ValueError(f"variant {variant.get('id')} quant args disagree with its command")
         for expected_path in (
             variant["quantized_artifact"],
             variant["evaluation_output"],
             evaluation_dataset,
+            reference_model,
         ):
             if expected_path not in evaluation:
-                raise ValueError(
-                    f"variant {variant.get('id')} evaluator is not bound to {expected_path}"
-                )
+                raise ValueError(f"variant {variant.get('id')} evaluator is not bound to {expected_path}")
 
     axis = plan.get("axis")
     if axis == "minimum_expert_activations":
@@ -471,8 +651,14 @@ def build_plan(
         "schema": EXPERT_SWEEP_PLAN_SCHEMA,
         "status": "planned_heldout_untouched",
         "axis": canonical_axis,
-        "model": {"path": str(model.resolve())},
-        "reference_model": {"path": str(reference_model.resolve())},
+        "model": {
+            "path": str(model.resolve()),
+            "identity": _safetensors_manifest_identity(model),
+        },
+        "reference_model": {
+            "path": str(reference_model.resolve()),
+            "identity": _reference_identity(reference_model),
+        },
         "artifact_stem": str(artifact_stem),
         "output_dir": str(output_dir.resolve()),
         "datasets": datasets,
