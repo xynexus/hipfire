@@ -372,6 +372,25 @@ ledger has consumed 622 of 1,038 logical tensors with no duplicate reads; all
 416 missing names belong to the not-yet-run suffix or final tensors. No new SVM
 failure was logged between the 07:39 restart and this checkpoint validation.
 
+By 08:07 AWST the resumed stream had committed through layer 38, for 39/60
+durable checkpoints. While layer 39 was loading, the current debug
+`hipfire-coexistence` build was run in dry-run mode against the exact production
+source, corpus, and geometry. It independently resolved the same semantic run
+fingerprint as the schema-1 production journals,
+`fnv64:863d2189c189270a`, while recording its distinct executable identity
+`sha256:21d29778926047ecff36e12e47621dee77ec32511160d7841aeb511b40ac93ed`.
+The running production executable remains
+`sha256:f56e34d775ac97cca961687b5a4e04bb27728f0f072ae3f71262cabe7ded05af`.
+This proves the intended handoff contract: incomplete progress continues only
+under the original producer, but a completed artifact may be audited and
+reused by a different executable whose family adapter, source plan, samples,
+geometry, expert policy, and KLDREF recipe reproduce the exact semantic
+fingerprint. The dry run also reconfirmed 1,038 logical tensors,
+792,692,717,952 unique source bytes, 262,144 independent sample rows, batch 64,
+time tile 32, row budget 2,048, the 2,048/4,096 expert floor/target, and KLDREF
+top-k 64. The induction, two-pass, and frozen-expert-plan unit suites pass
+33/33 against this handoff logic.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
