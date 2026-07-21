@@ -5,7 +5,9 @@
 //! Straightforward and lowered dense Gemma 4 decode over shared weights/state.
 
 use crate::config::{AttentionKind, Gemma4Config, KvProducer, RopePlan, ValueProjection};
-use crate::weights::{Gemma4DenseLayerWeights, Gemma4DenseWeights, Gemma4PleWeights};
+use crate::weights::{
+    Gemma4DenseLayerWeights, Gemma4DenseWeights, Gemma4MoeLayerWeights, Gemma4PleWeights,
+};
 use hip_bridge::{DeviceBuffer, HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
@@ -37,6 +39,8 @@ pub struct Gemma4DenseState {
     x: GpuTensor,
     tmp: GpuTensor,
     o: GpuTensor,
+    ffn_norm: GpuTensor,
+    router_logits: Option<GpuTensor>,
     gate: GpuTensor,
     up: GpuTensor,
     ffn: GpuTensor,
@@ -158,6 +162,14 @@ impl Gemma4DenseState {
         }
         let attention = LayeredAttentionScratch::new(gpu, &plan)?;
         let hidden = config.hidden_size;
+        let max_experts = config
+            .layers
+            .iter()
+            .filter_map(|layer| match layer.ffn {
+                crate::config::FfnPlan::Dense { .. } => None,
+                crate::config::FfnPlan::DensePlusMoe { experts, .. } => Some(experts),
+            })
+            .max();
         let intermediate = config
             .layers
             .iter()
@@ -186,6 +198,10 @@ impl Gemma4DenseState {
             x: gpu.alloc_tensor(&[hidden], DType::F32)?,
             tmp: gpu.alloc_tensor(&[hidden], DType::F32)?,
             o: gpu.alloc_tensor(&[hidden], DType::F32)?,
+            ffn_norm: gpu.alloc_tensor(&[hidden], DType::F32)?,
+            router_logits: max_experts
+                .map(|experts| gpu.alloc_tensor(&[experts], DType::F32))
+                .transpose()?,
             gate: gpu.alloc_tensor(&[intermediate], DType::F32)?,
             up: gpu.alloc_tensor(&[intermediate], DType::F32)?,
             ffn: gpu.alloc_tensor(&[intermediate], DType::F32)?,
@@ -224,6 +240,7 @@ impl Gemma4DenseState {
             self.x,
             self.tmp,
             self.o,
+            self.ffn_norm,
             self.gate,
             self.up,
             self.ffn,
@@ -242,6 +259,7 @@ impl Gemma4DenseState {
             .chain(self.ple_plmp)
             .chain(self.ple_gate)
             .chain(self.ple_proj)
+            .chain(self.router_logits)
             .chain(self.kv_share_saved_k.into_iter().flatten())
             .chain(self.kv_share_saved_v.into_iter().flatten())
         {
@@ -751,11 +769,11 @@ fn ffn_project(
     gpu.rmsnorm_f32(
         &state.x,
         &layer.pre_ffn_norm,
-        &state.tmp,
+        &state.ffn_norm,
         config.rms_norm_eps,
     )?;
-    weight_gemv(gpu, &layer.w_gate, &state.tmp, &state.gate)?;
-    weight_gemv(gpu, &layer.w_up, &state.tmp, &state.up)
+    weight_gemv(gpu, &layer.w_gate, &state.ffn_norm, &state.gate)?;
+    weight_gemv(gpu, &layer.w_up, &state.ffn_norm, &state.up)
 }
 
 fn ffn_activate(
@@ -782,6 +800,86 @@ fn ffn_finish(
         &state.ffn.sub_offset(0, layer.w_down.k),
         &state.o,
     )?;
+    gpu.rmsnorm_f32(
+        &state.o,
+        &layer.post_ffn_norm,
+        &state.tmp,
+        config.rms_norm_eps,
+    )?;
+    gpu.add_f32(&state.x, &state.tmp, &state.x)
+}
+
+fn topk_router_weights(
+    logits: &[f32],
+    per_expert_scale: &[f32],
+    top_k: usize,
+) -> HipResult<Vec<(usize, f32)>> {
+    if logits.len() != per_expert_scale.len() || top_k == 0 || top_k > logits.len() {
+        return Err(HipError::new(0, "Gemma 4 MoE router shape is invalid"));
+    }
+    let max = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+    let mut probs: Vec<(usize, f32)> = logits
+        .iter()
+        .enumerate()
+        .map(|(idx, &logit)| (idx, (logit - max).exp() * per_expert_scale[idx]))
+        .collect();
+    probs.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    probs.truncate(top_k);
+    let denom: f32 = probs.iter().map(|(_, p)| *p).sum();
+    if denom <= 0.0 || !denom.is_finite() {
+        return Err(HipError::new(
+            0,
+            "Gemma 4 MoE router produced invalid weights",
+        ));
+    }
+    for (_, p) in &mut probs {
+        *p /= denom;
+    }
+    Ok(probs)
+}
+
+fn moe_ffn_finish(
+    gpu: &mut Gpu,
+    layer: &Gemma4DenseLayerWeights,
+    moe: &Gemma4MoeLayerWeights,
+    config: &Gemma4Config,
+    state: &Gemma4DenseState,
+) -> HipResult<()> {
+    let router_logits = state
+        .router_logits
+        .as_ref()
+        .ok_or_else(|| HipError::new(0, "Gemma 4 MoE state is missing router logits"))?;
+    gpu.rmsnorm_f32(&state.x, &moe.router_scale, &state.tmp, config.rms_norm_eps)?;
+    weight_gemv(gpu, &moe.router, &state.tmp, router_logits)?;
+    let logits = gpu.download_f32(router_logits)?;
+    let selected = topk_router_weights(&logits, &moe.per_expert_scale, moe.top_k)?;
+
+    weight_gemv(
+        gpu,
+        &layer.w_down,
+        &state.ffn.sub_offset(0, layer.w_down.k),
+        &state.o,
+    )?;
+    for (expert_idx, weight) in selected {
+        let expert = &moe.experts[expert_idx];
+        weight_gemv(gpu, &expert.gate, &state.ffn_norm, &state.gate)?;
+        weight_gemv(gpu, &expert.up, &state.ffn_norm, &state.up)?;
+        gpu.gelu_mul_f32(
+            &state.gate,
+            &state.up,
+            &state.ffn.sub_offset(0, expert.down.k),
+        )?;
+        weight_gemv(
+            gpu,
+            &expert.down,
+            &state.ffn.sub_offset(0, expert.down.k),
+            &state.tmp,
+        )?;
+        gpu.scaled_add_inplace_cpu_scalar_f32(&state.o, &state.tmp, weight)?;
+    }
     gpu.rmsnorm_f32(
         &state.o,
         &layer.post_ffn_norm,
@@ -947,7 +1045,7 @@ fn run_reference_layer(
         gpu.bf16_round_trip_f32(&state.up)?;
     }
     if let Some(capture) = capture.as_deref_mut() {
-        capture_operator(gpu, capture, layer_idx, "pre_ffn_norm", &state.tmp)?;
+        capture_operator(gpu, capture, layer_idx, "pre_ffn_norm", &state.ffn_norm)?;
         capture_operator(gpu, capture, layer_idx, "gate", &state.gate)?;
         capture_operator(gpu, capture, layer_idx, "up", &state.up)?;
     }
@@ -969,7 +1067,11 @@ fn run_reference_layer(
             &state.ffn.sub_offset(0, layer.w_down.k),
         )?;
     }
-    ffn_finish(gpu, layer, config, state)?;
+    if let Some(moe) = &layer.moe {
+        moe_ffn_finish(gpu, layer, moe, config, state)?;
+    } else {
+        ffn_finish(gpu, layer, config, state)?;
+    }
     if let Some(capture) = capture.as_deref_mut() {
         capture_operator(gpu, capture, layer_idx, "post_ffn_norm", &state.tmp)?;
         capture_operator(gpu, capture, layer_idx, "post_ffn_residual", &state.x)?;
@@ -1516,14 +1618,18 @@ pub fn forward_step(
     lowered: &LoweredForward,
     token: u32,
 ) -> HipResult<()> {
-    // PLE + KV-sharing are implemented only on the reference forward so far, so
-    // E2B/E4B must use it regardless of the oracle env; the lowered superop program
-    // is a follow-up. Plain-dense gemma4 (31B) still defaults to lowered.
+    // PLE, KV-sharing, and dense-MoE are implemented only on the reference
+    // forward so far, so those variants must use it regardless of the oracle
+    // env; the lowered superop programs are follow-ups. Plain-dense gemma4
+    // (31B) still defaults to lowered.
     let needs_reference = weights.ple.is_some()
         || config
             .layers
             .iter()
-            .any(|l| !matches!(l.kv_producer, KvProducer::Own));
+            .zip(weights.layers.iter())
+            .any(|(plan, layer)| {
+                !matches!(plan.kv_producer, KvProducer::Own) || layer.moe.is_some()
+            });
     let oracle = std::env::var("HIPFIRE_GEMMA4_FORWARD_ORACLE")
         .ok()
         .as_deref()

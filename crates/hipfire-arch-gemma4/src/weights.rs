@@ -6,7 +6,7 @@
 
 use crate::config::{FfnPlan, Gemma4Config, ValueProjection};
 use hip_bridge::HipResult;
-use hipfire_rdna::{Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::transformer_loader::TransformerLoader;
 use hipfire_runtime::weights::{EmbeddingFormat, WeightTensor};
@@ -53,6 +53,9 @@ pub struct Gemma4DenseLayerWeights {
     /// Per-Layer-Embedding merge weights (E2B/E4B); `None` when the model has no PLE
     /// (`hidden_size_per_layer_input == 0`).
     pub ple: Option<Gemma4PleLayerWeights>,
+    /// Routed experts for Gemma 4 dense-MoE variants. `None` for dense and PLE
+    /// fixtures; present only on the reference path.
+    pub moe: Option<Gemma4MoeLayerWeights>,
 }
 
 /// PLE per-layer merge weights: `h += post_norm(projection(act(gate·h) ⊙ ple[L]))`.
@@ -63,6 +66,27 @@ pub struct Gemma4PleLayerWeights {
     pub projection: WeightTensor,
     /// `[hidden]` RMSNorm.
     pub post_norm: GpuTensor,
+}
+
+pub struct Gemma4MoeExpertWeights {
+    /// `[expert_intermediate, hidden]`.
+    pub gate: WeightTensor,
+    /// `[expert_intermediate, hidden]`.
+    pub up: WeightTensor,
+    /// `[hidden, expert_intermediate]`.
+    pub down: WeightTensor,
+}
+
+pub struct Gemma4MoeLayerWeights {
+    /// Router RMS scale `[hidden]`.
+    pub router_scale: GpuTensor,
+    /// Router projection `[experts, hidden]`.
+    pub router: WeightTensor,
+    /// Per-expert post-router multiplier `[experts]`, kept on host for the tiny
+    /// reference top-k path.
+    pub per_expert_scale: Vec<f32>,
+    pub experts: Vec<Gemma4MoeExpertWeights>,
+    pub top_k: usize,
 }
 
 /// PLE model-level weights: the per-layer embedding table + its projection from the
@@ -121,6 +145,15 @@ impl Gemma4DenseWeights {
                 ple.projection.free_all(gpu);
                 let _ = gpu.free_tensor(ple.post_norm);
             }
+            if let Some(moe) = layer.moe {
+                let _ = gpu.free_tensor(moe.router_scale);
+                moe.router.free_all(gpu);
+                for expert in moe.experts {
+                    expert.gate.free_all(gpu);
+                    expert.up.free_all(gpu);
+                    expert.down.free_all(gpu);
+                }
+            }
         }
         if let Some(ple) = self.ple {
             ple.embed_per_layer.free_all(gpu);
@@ -168,28 +201,13 @@ pub fn load_core_weights(
 
 /// Load the resident dense decoder used by the Phase 4 reference/lowered
 /// forward and Phase 5 31B bring-up. PLE (E2B/E4B per-layer embeddings) and KV
-/// sharing ARE supported; routed experts (MoE) remain an explicit later phase.
+/// sharing ARE supported; routed experts (MoE) are loaded for the reference
+/// forward/tiny gates only.
 pub fn load_dense_weights(
     hfq: &mut HfqFile,
     gpu: &mut Gpu,
     config: &Gemma4Config,
 ) -> HipResult<Gemma4DenseWeights> {
-    // PLE (per-layer embeddings) IS supported (E2B/E4B). The KV-sharing forward is
-    // implemented too, but E2B currently has a coherence bug (semantic next-token
-    // prediction degrades — see docs/plans/2026-07-18-gemma4-effective-ple-kvshare.md),
-    // so KV-sharing stays gated until that is isolated + fixed. Routed experts (MoE)
-    // are not yet supported. Flip this to enable E2B/E4B once coherence is fixed.
-    if config
-        .layers
-        .iter()
-        .any(|layer| !matches!(layer.ffn, FfnPlan::Dense { .. }))
-    {
-        return Err(hip_bridge::HipError::new(
-            0,
-            "Gemma 4 dense loader does not support routed experts (MoE) yet",
-        ));
-    }
-
     let core = load_core_weights(
         hfq,
         gpu,
@@ -204,11 +222,24 @@ pub fn load_dense_weights(
     for (layer_idx, plan) in config.layers.iter().enumerate() {
         let prefix = format!("model.language_model.layers.{layer_idx}");
         let attn = format!("{prefix}.self_attn");
+        let kv_storage_layer = match plan.kv_producer {
+            crate::config::KvProducer::Own => layer_idx,
+            crate::config::KvProducer::SharedFrom { producer_layer } => producer_layer,
+        };
+        let kv_attn = format!("model.language_model.layers.{kv_storage_layer}.self_attn");
         let q_dim = plan.attention.q_heads * plan.attention.head_dim;
         let kv_dim = plan.attention.kv_heads * plan.attention.head_dim;
-        let intermediate = match plan.ffn {
-            FfnPlan::Dense { intermediate } => intermediate,
-            FfnPlan::DensePlusMoe { .. } => unreachable!("rejected above"),
+        let (dense_intermediate, moe_shape) = match plan.ffn {
+            FfnPlan::Dense { intermediate } => (intermediate, None),
+            FfnPlan::DensePlusMoe {
+                dense_intermediate,
+                expert_intermediate,
+                experts,
+                top_k,
+            } => (
+                dense_intermediate,
+                Some((expert_intermediate, experts, top_k)),
+            ),
         };
         let scalar_tensor = loader.load_direct_f32(gpu, &format!("{prefix}.layer_scalar"), &[1])?;
         let layer_scalar = gpu.download_f32(&scalar_tensor)?[0];
@@ -226,7 +257,7 @@ pub fn load_dense_weights(
             )?,
             k_norm: loader.load_direct_f32(
                 gpu,
-                &format!("{attn}.k_norm.weight"),
+                &format!("{kv_attn}.k_norm.weight"),
                 &[plan.attention.head_dim],
             )?,
             wq: loader.load_weight(
@@ -237,14 +268,14 @@ pub fn load_dense_weights(
             )?,
             wk: loader.load_weight(
                 gpu,
-                &format!("{attn}.k_proj.weight"),
+                &format!("{kv_attn}.k_proj.weight"),
                 kv_dim,
                 config.hidden_size,
             )?,
             wv: match plan.value_projection {
                 ValueProjection::Separate => Some(loader.load_weight(
                     gpu,
-                    &format!("{attn}.v_proj.weight"),
+                    &format!("{kv_attn}.v_proj.weight"),
                     kv_dim,
                     config.hidden_size,
                 )?),
@@ -274,20 +305,20 @@ pub fn load_dense_weights(
             w_gate: loader.load_weight(
                 gpu,
                 &format!("{prefix}.mlp.gate_proj.weight"),
-                intermediate,
+                dense_intermediate,
                 config.hidden_size,
             )?,
             w_up: loader.load_weight(
                 gpu,
                 &format!("{prefix}.mlp.up_proj.weight"),
-                intermediate,
+                dense_intermediate,
                 config.hidden_size,
             )?,
             w_down: loader.load_weight(
                 gpu,
                 &format!("{prefix}.mlp.down_proj.weight"),
                 config.hidden_size,
-                intermediate,
+                dense_intermediate,
             )?,
             layer_scalar,
             ple: if config.hidden_size_per_layer_input != 0 {
@@ -314,18 +345,88 @@ pub fn load_dense_weights(
             } else {
                 None
             },
+            moe: if let Some((expert_intermediate, experts, top_k)) = moe_shape {
+                let scale_name = format!("{prefix}.router.per_expert_scale");
+                let (scale_info, scale_data) = loader.required_data(&scale_name, &[experts]);
+                let per_expert_scale =
+                    hipfire_runtime::transformer_loader::decode_direct_f32(scale_info, &scale_data)
+                        .unwrap_or_else(|error| panic!("gemma4: {error}"));
+                let mut expert_weights = Vec::with_capacity(experts);
+                for expert in 0..experts {
+                    let ep = format!("{prefix}.experts.{expert}");
+                    expert_weights.push(Gemma4MoeExpertWeights {
+                        gate: loader.load_weight(
+                            gpu,
+                            &format!("{ep}.gate_proj.weight"),
+                            expert_intermediate,
+                            config.hidden_size,
+                        )?,
+                        up: loader.load_weight(
+                            gpu,
+                            &format!("{ep}.up_proj.weight"),
+                            expert_intermediate,
+                            config.hidden_size,
+                        )?,
+                        down: loader.load_weight(
+                            gpu,
+                            &format!("{ep}.down_proj.weight"),
+                            config.hidden_size,
+                            expert_intermediate,
+                        )?,
+                    });
+                }
+                Some(Gemma4MoeLayerWeights {
+                    router_scale: loader.load_direct_f32(
+                        gpu,
+                        &format!("{prefix}.router.scale"),
+                        &[config.hidden_size],
+                    )?,
+                    router: loader.load_weight(
+                        gpu,
+                        &format!("{prefix}.router.proj.weight"),
+                        experts,
+                        config.hidden_size,
+                    )?,
+                    per_expert_scale,
+                    experts: expert_weights,
+                    top_k,
+                })
+            } else {
+                None
+            },
         });
     }
     let ple = if config.hidden_size_per_layer_input != 0 {
         let ple_dim = config.hidden_size_per_layer_input;
         let num_layers = config.layers.len();
+        let (embed_per_layer, embed_per_layer_format) = loader.load_embedding(
+            gpu,
+            "model.language_model.embed_tokens_per_layer.weight",
+            config.vocab_size,
+            num_layers * ple_dim,
+        )?;
+        let embed_per_layer_dtype = match embed_per_layer_format {
+            EmbeddingFormat::F32 => DType::F32,
+            EmbeddingFormat::Q8_0 => DType::Q8_0,
+            EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
+            EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
+            EmbeddingFormat::Q4K => DType::Q4K,
+            // PLE gather has no native bf16/f16 lookup; keep the true dtype so
+            // embed_lookup_weight rejects it with a clear message rather than
+            // reading the raw table as F32.
+            EmbeddingFormat::BF16 => DType::BF16,
+            EmbeddingFormat::F16 => DType::F16,
+        };
         let p = Gemma4PleWeights {
-            embed_per_layer: loader.load_weight(
-                gpu,
-                "model.language_model.embed_tokens_per_layer.weight",
-                config.vocab_size,
-                num_layers * ple_dim,
-            )?,
+            embed_per_layer: WeightTensor {
+                buf: embed_per_layer,
+                gpu_dtype: embed_per_layer_dtype,
+                m: config.vocab_size,
+                k: num_layers * ple_dim,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            },
             model_projection: loader.load_weight(
                 gpu,
                 "model.language_model.per_layer_model_projection.weight",

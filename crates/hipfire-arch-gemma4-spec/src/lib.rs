@@ -260,6 +260,15 @@ impl Tiny {
                 vec![self.vocab, self.layers * self.ple_dim],
                 Init::Uniform(0.05),
             ));
+            tensors.push(TensorSpec::new(
+                "model.language_model.per_layer_model_projection.weight",
+                vec![self.layers * self.ple_dim, self.hidden],
+                Init::Uniform(0.05),
+            ));
+            tensors.push(Self::norm(
+                "model.language_model.per_layer_projection_norm.weight".into(),
+                self.ple_dim,
+            ));
         }
 
         let shared_start = self
@@ -384,6 +393,24 @@ impl Tiny {
                     vec![self.experts, self.hidden],
                     Init::Uniform(0.05),
                 ));
+                for expert in 0..self.experts {
+                    let ep = format!("{prefix}.experts.{expert}");
+                    tensors.push(TensorSpec::new(
+                        format!("{ep}.gate_proj.weight"),
+                        vec![self.expert_intermediate, self.hidden],
+                        Init::Uniform(0.05),
+                    ));
+                    tensors.push(TensorSpec::new(
+                        format!("{ep}.up_proj.weight"),
+                        vec![self.expert_intermediate, self.hidden],
+                        Init::Uniform(0.05),
+                    ));
+                    tensors.push(TensorSpec::new(
+                        format!("{ep}.down_proj.weight"),
+                        vec![self.hidden, self.expert_intermediate],
+                        Init::Uniform(0.05),
+                    ));
+                }
             }
         }
         tensors
