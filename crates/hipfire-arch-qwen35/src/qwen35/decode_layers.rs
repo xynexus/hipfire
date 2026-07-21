@@ -587,6 +587,8 @@ pub(crate) fn forward_scratch_layers(
                         1,
                         n_v_heads,
                         config.linear_value_head_dim,
+                        pos as u32,
+                        delta_layer_idx as u32,
                     )?,
                     StateQuant::Q4 => gpu.gated_delta_net_q4(
                         &s.dn_q,
@@ -2200,6 +2202,8 @@ pub(crate) fn forward_scratch_layers(
                         1,
                         n_v_heads,
                         config.linear_value_head_dim,
+                        pos as u32,
+                        delta_layer_idx as u32,
                     )?,
                     StateQuant::Q4 => gpu.gated_delta_net_q4(
                         &s.dn_q,

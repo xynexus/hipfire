@@ -42,6 +42,15 @@ static constexpr int SBb = MMUL::size_B / 2;  // 64 bytes / W-tile (int4, packed
 static constexpr int SA = MMUL::size_A;       // 64 int8 / A-tile
 static constexpr int SC = MMUL::size_C;       // 32 i32 / C-tile
 
+// The register-tile sweep below steps im by MT and jn by NT, then unconditionally unrolls
+// MT x NT accumulators. If LM is not a multiple of MT (or LN of NT) the final step reads A
+// rows and writes C tiles past the end of the L1 block -- silently, and WITHOUT failing an
+// all-ones C[0] check, since C[0] only depends on the (i=0, j=0) accumulator. This bites at
+// LM < MT: the defaults are MT=NT=3, so any LM=1 or LM=2 build (e.g. an M=16 DFlash shape,
+// where the 4x4 core grid forces LM=1) overruns L1 unless -DMT=1 is passed. Enforce it.
+static_assert(LM % MT == 0, "LM must be a multiple of MT (pass -DMT to match small LM)");
+static_assert(LN % NT == 0, "LN must be a multiple of NT (pass -DNT to match small LN)");
+
 extern "C" void r11_gemm(const int8 *__restrict A, const int8 *__restrict Wb,
                          int32 *__restrict C) {
   // Sweep the MTxNT register tile over the LMxLN L1 block. A[im..] rows are reused across

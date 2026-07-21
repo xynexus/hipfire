@@ -230,6 +230,18 @@ pub mod gemm_mp;
 #[cfg(target_os = "linux")]
 pub use gemm_mp::{NpuGemmMp, NpuGemmResidentWeights};
 
+// NpuGemmR14 — the 4x4 whole-array broadcast W4A8 GEMM (r14_gen.py), for npu1.
+#[cfg(target_os = "linux")]
+pub mod gemm_r14;
+#[cfg(target_os = "linux")]
+pub use gemm_r14::{NpuGemmR14, R14Geometry};
+
+// DFlash 5-layer NPU block body, lifted from examples/dflash_body_native.rs so
+// the runtime spec-decode loop can call it as a serial draft (Phase 1 seam).
+pub mod dflash_body;
+#[cfg(target_os = "linux")]
+pub use dflash_body::DflashNpuBody;
+
 // One AIE/XRT dispatch over every K=256 group in a complete projection.
 #[cfg(target_os = "linux")]
 pub mod gemm_fullk;

@@ -106,6 +106,12 @@ minijinja = { version = "2", features = ["loop_controls", "json", "preserve_orde
 # template which uses these throughout.
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 
+# DFlash NPU block body (DflashNpuBody) for the Phase-1 serial NPU draft seam.
+# xdna only depends on hipfire-rdna, so this adds no dependency cycle. Linux-only
+# (the NPU path is amdxdna/XRT); referenced behind cfg(target_os = "linux").
+[target.'cfg(target_os = "linux")'.dependencies]
+hipfire-xdna = { path = "../hipfire-xdna" }
+
 # Examples in this crate (daemon, infer_qwen35, infer_qwen3, infer_vl, etc.)
 # consume the arch crates. These are dev-dependencies — cargo refuses
 # optional dev-dependencies AND its cycle checker excludes the dev-dep

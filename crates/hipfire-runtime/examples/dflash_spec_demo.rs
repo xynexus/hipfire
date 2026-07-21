@@ -426,6 +426,8 @@ fn main() {
     let mut ctx_capacity: usize = 512;
     let mut ctx_slice: Option<usize> = None;
     let mut kv_mode_str = String::from("q8");
+    let mut calib_out: Option<String> = None;
+    let mut calib_imatrix_only: Vec<String> = Vec::new();
     let mut block_size_override: Option<usize> = None;
     let mut temp: f32 = 0.0;
     let mut seed: u64 = 42;
@@ -511,8 +513,42 @@ fn main() {
     // for the first N cycles to help diagnose divergence.
     let mut debug_cycles: usize = 0;
     // --no-tape: disable GdnTape capture so spec_step_dflash replays via
-    // forward_prefill_batch on committed tokens (byte-exact vs AR when
-    // combined with HIPFIRE_PREFILL_BATCHED=0).
+    // forward_prefill_batch on committed tokens.
+    //
+    // #17 IS FIXED (2026-07-19). The Q8 GDN stochastic-rounding seed was
+    // GDN_REQUANT_FRAME, a process-global dispatch counter; dispatch count
+    // depends on accept_len, so the DRAFTER perturbed the TARGET's numerics.
+    // The seed is now derived from the absolute sequence position and the
+    // DeltaNet layer index (see `gdn_requant_seed` in hipfire-rdna), so it is
+    // a pure function of WHERE we are, not of how many dispatches ran.
+    //
+    // Measured after the fix, temp 0, 96 tokens, kv_mode=q8 (the live path):
+    //  * --no-tape is BYTE-IDENTICAL to --ar-baseline on the engine prompt
+    //    that previously diverged at index 44.
+    //  * All four drafters (f16, npu.oq8, npu.oq4.25+, mq4) commit the
+    //    IDENTICAL token sequence while genuinely differing in acceptance
+    //    (35/35/36/37 cycles, tau 1.743/1.743/1.667/1.595). A worse drafter
+    //    now changes only HOW MANY tokens are accepted, never WHICH.
+    // Reverting the seed to the counter reproduces the old divergence, so the
+    // causation is confirmed rather than inferred.
+    //
+    // #21 IS FIXED (2026-07-19), and the old #16 note below is STALE. Tape-on
+    // no longer collapses tau (measured tau=2.429 with the tape attached); the
+    // residual tape-on divergence was the *serial-source tape rollback* path
+    // (HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE), which was default-on and is now
+    // default-off. It replayed the BATCHED VERIFY tape over the drafted block,
+    // so the hidden states feeding the replay depended on the drafted tokens
+    // and the committed output followed the drafter. See the rationale on
+    // `dflash_serial_tape_rollback_replay_from_env` in hipfire-arch-qwen35's
+    // speculative.rs for the per-buffer evidence. With it off, tape-on is
+    // byte-identical to --ar-baseline for all four drafters and ~30% faster.
+    //
+    // Still open:
+    //  * A residual DFlash-vs-AR difference remains on SOME prompts and is
+    //    BLOCK-SIZE dependent, not drafter dependent (one prompt matched AR
+    //    exactly at --block-size 4 but not at 2 or the default). That is
+    //    batched-verify vs serial-decode parity, a separate question from
+    //    #17. Cross-drafter identity holds regardless.
     let mut no_tape: bool = false;
     let mut evidence_dir: Option<String> = std::env::var("HIPFIRE_EVAL_EVIDENCE_DIR").ok();
 
@@ -585,6 +621,30 @@ fn main() {
             }
             "--kv-mode" => {
                 kv_mode_str = args[i + 1].clone();
+                i += 2;
+            }
+            // ── DFlash calibration collection ──────────────────────
+            // `--calib-out <path>` arms a CalibCollector over the DRAFTER's
+            // projections only (fc + per-layer q/k/v/o/gate/up/down) for the
+            // whole decode run, then streams the per-tensor GPTQ Hessian +
+            // imatrix to `<path>` as an HFQM `.calib.hfq`. Because the
+            // activations are the drafter's REAL inputs during real spec
+            // decode against the real target, the resulting Hessian carries
+            // the true input covariance LDLQ needs — unlike a synthetic
+            // (`dflash_ref_dump`-style) input, whose Hessian is ~isotropic.
+            "--calib-out" => {
+                calib_out = Some(args[i + 1].clone());
+                i += 2;
+            }
+            // Comma-separated name substrings that keep imatrix only (no
+            // [K,K] Hessian). Use to shed the largest accumulators when the
+            // full set does not fit, e.g. `fc,down_proj`.
+            "--calib-imatrix-only" => {
+                calib_imatrix_only = args[i + 1]
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 i += 2;
             }
             "--block-size" => {
@@ -980,6 +1040,33 @@ fn main() {
         eprintln!("draft: MQ weights detected, FWHT rotation scratch enabled");
     }
 
+    // ── Phase 1: opt into the serial NPU draft ────────────────────────
+    // HIPFIRE_DFLASH_NPU_DRAFT=1 runs the DFlash NPU block body serially in
+    // place of the GPU draft (behind the flag; the all-GPU path stays the
+    // default and bit-for-bit reproducible). Artifact paths default to the
+    // harness outputs and are overridable via env. Losslessness is structural
+    // (the target verifies every proposed token), so the committed digest is
+    // unchanged whether the NPU or GPU produced the draft.
+    if std::env::var("HIPFIRE_DFLASH_NPU_DRAFT").ok().as_deref() == Some("1") {
+        #[cfg(target_os = "linux")]
+        {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let wdir = std::env::var("HIPFIRE_DFLASH_NPU_WEIGHTS")
+                .unwrap_or_else(|_| "/tmp/dflash_w".to_string());
+            let manifest = std::env::var("HIPFIRE_DFLASH_NPU_MANIFEST")
+                .unwrap_or_else(|_| "/tmp/dflash_manifest_flash.json".to_string());
+            let r14 = std::env::var("HIPFIRE_DFLASH_NPU_R14")
+                .unwrap_or_else(|_| format!("{home}/.hipfire/npu/r14_1x2x128_nb128"));
+            eprintln!("[npu-draft] loading NPU body: weights={wdir} manifest={manifest} r14={r14}");
+            draft_scratch
+                .enable_npu_draft(&wdir, &manifest, &r14)
+                .expect("enable NPU draft");
+            eprintln!("[npu-draft] enabled (serial substitute for GPU draft)");
+        }
+        #[cfg(not(target_os = "linux"))]
+        eprintln!("[npu-draft] HIPFIRE_DFLASH_NPU_DRAFT ignored: not Linux");
+    }
+
     // ── Check vocab compatibility ─────────────────────────────────────
     assert_eq!(
         target.config.vocab_size, draft_cfg.vocab_size,
@@ -1159,6 +1246,40 @@ fn main() {
     // (exhaustive)" — anything not zeroed by
     // `seed_target_hidden_from_prompt → target.reset_state(gpu)`
     // (which only touches DeltaNet recurrent state).
+    // ── Calibration capture: arm over the DRAFTER's weights only ──────
+    // `capture_names` is keyed by weight-buffer address, and
+    // `maybe_capture_activation` returns early on an unregistered address —
+    // so registering only `draft_weights` is what guarantees the artifact
+    // contains no target-model tensors, even though target and draft share
+    // this `gpu`. Names are the drafter's canonical HFQ tensor names minus
+    // `.weight`, so the quantizer joins `<name>.{hessian,imatrix}` straight
+    // onto the source weight it is about to encode.
+    let calib_collector = calib_out.as_ref().map(|path| {
+        let mut names: std::collections::HashMap<usize, String> =
+            std::collections::HashMap::new();
+        names.insert(draft_weights.fc.buf.buf.as_ptr() as usize, "fc".to_string());
+        for (li, layer) in draft_weights.layers.iter().enumerate() {
+            let p = format!("layers.{li}");
+            for (w, suffix) in [
+                (&layer.wq, "self_attn.q_proj"),
+                (&layer.wk, "self_attn.k_proj"),
+                (&layer.wv, "self_attn.v_proj"),
+                (&layer.wo, "self_attn.o_proj"),
+                (&layer.w_gate, "mlp.gate_proj"),
+                (&layer.w_up, "mlp.up_proj"),
+                (&layer.w_down, "mlp.down_proj"),
+            ] {
+                names.insert(w.buf.buf.as_ptr() as usize, format!("{p}.{suffix}"));
+            }
+        }
+        eprintln!(
+            "calib: arming over {} drafter tensors → {path} (imatrix_only={:?})",
+            names.len(),
+            calib_imatrix_only,
+        );
+        hipfire_runtime::calibration::arm(&mut gpu, names, calib_imatrix_only.clone())
+    });
+
     for (row_idx, (row_label, row_raw_prompt, row_max_tokens)) in prompts.iter().enumerate() {
         let row_max_tokens: usize = *row_max_tokens;
         if multi_row {
@@ -2657,6 +2778,43 @@ fn main() {
         // ── End of per-row loop body ──────────────────────────────
         if multi_row {
             eprintln!("@@@ ROW {row_idx} END @@@");
+        }
+    }
+
+    // ── Calibration capture: disarm + stream the .calib.hfq ───────────
+    if let Some(collector) = calib_collector {
+        hipfire_runtime::calibration::disarm(&mut gpu);
+        let out = std::path::PathBuf::from(calib_out.as_ref().unwrap());
+        let static_meta: Vec<(&str, serde_json::Value)> = vec![
+            ("source_model", serde_json::json!(target_path)),
+            ("source_drafter", serde_json::json!(draft_path)),
+            ("collector", serde_json::json!("dflash_spec_demo")),
+            ("dflash_block_size", serde_json::json!(draft_cfg.block_size)),
+            (
+                "dflash_target_layer_ids",
+                serde_json::json!(draft_cfg.target_layer_ids),
+            ),
+            ("calib_rows", serde_json::json!(prompts.len())),
+        ];
+        match hipfire_runtime::calibration::finish(
+            &mut gpu,
+            &collector,
+            draft_hfq.arch_id,
+            &out,
+            &static_meta,
+            &hipfire_runtime::calibration::CalibForward::default(),
+        ) {
+            Ok(s) => eprintln!(
+                "calib: wrote {} (n_hessian={} n_imatrix={} max_diag_consistency={:.3e})",
+                out.display(),
+                s.n_hessian,
+                s.n_imatrix,
+                s.max_consistency,
+            ),
+            Err(e) => {
+                eprintln!("calib: FAILED: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }

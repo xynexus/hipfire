@@ -46,6 +46,53 @@ use std::collections::{HashMap, HashSet};
 /// first-call `fc` rotation (one-shot per prompt, negligible vs prefill).
 const MQ_X_ROT_CHUNK_ROWS: usize = 1024;
 
+// ─── Golden per-op dump (bring-up only) ──────────────────────────────────────
+// Gated by `HIPFIRE_DFLASH_GOLDEN_DIR`; writes GPU intermediates as .npy so the
+// NPU bring-up (docs/npu/dflash-drafter-npu-plan.md, Phase A/B) can check each
+// primitive against the F32 GPU reference. No-op when the env var is unset.
+fn dflash_golden_npy(
+    gpu: &mut Gpu,
+    dir: &str,
+    name: &str,
+    t: &GpuTensor,
+    shape: &[usize],
+) {
+    let data = match gpu.download_f32(t) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[dflash-golden] download {name} failed: {e:?}");
+            return;
+        }
+    };
+    let n: usize = shape.iter().product();
+    let data = &data[..n.min(data.len())];
+    let shape_str = if shape.len() == 1 {
+        format!("({},)", shape[0])
+    } else {
+        let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+        format!("({})", dims.join(", "))
+    };
+    let dict = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_str}, }}");
+    let mut header = dict.into_bytes();
+    let unpadded = 10 + header.len() + 1;
+    let pad = (64 - (unpadded % 64)) % 64;
+    header.extend(std::iter::repeat(b' ').take(pad));
+    header.push(b'\n');
+    let mut out = Vec::with_capacity(10 + header.len() + data.len() * 4);
+    out.extend_from_slice(b"\x93NUMPY");
+    out.push(1);
+    out.push(0);
+    out.extend_from_slice(&(header.len() as u16).to_le_bytes());
+    out.extend_from_slice(&header);
+    for &v in data {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    let _ = std::fs::create_dir_all(dir);
+    if let Err(e) = std::fs::write(format!("{dir}/{name}.npy"), &out) {
+        eprintln!("[dflash-golden] write {name} failed: {e}");
+    }
+}
+
 // ─── Config ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -337,6 +384,102 @@ fn hfq_weight(
                 awq_scale: None,
             })
         }
+        45 | 46 | 47 => {
+            // Plain-basis (non-rotated) NPU sidecar formats, dequantized at
+            // load so the GPU spec-decode path can run a drafter that was
+            // built for the AIE2 projection kernels. There is no GPU kernel for
+            // these layouts (they carry no FWHT rotation), so this is a
+            // measurement path: the *weight values* are exactly the quantized
+            // ones, only the arithmetic differs. Decode is staged through f32
+            // and lands in F16 — see the dtype note at the end of this arm.
+            // Layouts are the on-disk
+            // contract documented in hipfire-quantize/src/bin/dflash_convert.rs
+            // (`Oq8Plain = 45`, `Oq4MixedPlain = 46`).
+            const GROUP: usize = 256;
+            let n = m * k;
+            let n_blocks = n.div_ceil(GROUP);
+            let block_bytes = data.len() / n_blocks.max(1);
+            let mut f32_data = vec![0.0f32; n_blocks * GROUP];
+            if info.quant_type == 45 {
+                assert_eq!(
+                    block_bytes,
+                    2 + GROUP,
+                    "dflash {name}: oq8-plain block must be 258 B, got {block_bytes}"
+                );
+                for b in 0..n_blocks {
+                    let off = b * block_bytes;
+                    let scale =
+                        crate::quant::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+                    for i in 0..GROUP {
+                        f32_data[b * GROUP + i] = scale * (data[off + 2 + i] as i8) as f32;
+                    }
+                }
+            } else if info.quant_type == 47 {
+                // PURE int4: block = [f16 scale][128 nibbles] = 130 B/group.
+                // Minimum-bandwidth weight format for the AIE2 W4A8 kernel.
+                assert_eq!(
+                    block_bytes, 130,
+                    "dflash {name}: oq4-plain block must be 130 B, got {block_bytes}"
+                );
+                for b in 0..n_blocks {
+                    let off = b * block_bytes;
+                    let scale =
+                        crate::quant::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+                    let grp = &mut f32_data[b * GROUP..b * GROUP + GROUP];
+                    for i in 0..128 {
+                        let byte = data[off + 2 + i];
+                        grp[2 * i] = scale * (((byte & 0xf) as i8) << 4 >> 4) as f32;
+                        grp[2 * i + 1] = scale * (((byte >> 4) as i8) << 4 >> 4) as f32;
+                    }
+                }
+            } else {
+                // block = [f16 scale][128 nibbles][n_out × (u8 idx, i8 val)]
+                assert!(
+                    block_bytes >= 132 && (block_bytes - 130) % 2 == 0,
+                    "dflash {name}: oq4-mixed-plain block length {block_bytes} is not 130 + 2·n_out"
+                );
+                let n_out = (block_bytes - 130) / 2;
+                for b in 0..n_blocks {
+                    let off = b * block_bytes;
+                    let scale =
+                        crate::quant::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+                    let grp = &mut f32_data[b * GROUP..b * GROUP + GROUP];
+                    // int4 bulk, nibbles sign-extended from 4 bits.
+                    for i in 0..128 {
+                        let byte = data[off + 2 + i];
+                        grp[2 * i] = scale * (((byte & 0xf) as i8) << 4 >> 4) as f32;
+                        grp[2 * i + 1] = scale * (((byte >> 4) as i8) << 4 >> 4) as f32;
+                    }
+                    // sparse int8 overlay wins wherever present.
+                    let tbl = off + 130;
+                    for s in 0..n_out {
+                        let pos = data[tbl + 2 * s] as usize;
+                        grp[pos] = scale * (data[tbl + 2 * s + 1] as i8) as f32;
+                    }
+                }
+            }
+            f32_data.truncate(n);
+            // Land in F16, not F32: the F32 draft dispatch goes through
+            // gemm_f32_batched, which has a known batch>1 transpose bug (the
+            // pure-F32 drafter scores tau=0 for the same reason). F16 is the
+            // golden WMMA path, and f16 round-trip is ~-42 dB of headroom
+            // below the int8 quantization error being measured here, so it
+            // does not perturb the comparison.
+            let f16_bytes: Vec<u8> = f32_data
+                .iter()
+                .flat_map(|&v| crate::quant::f32_to_f16(v).to_le_bytes())
+                .collect();
+            let buf = gpu.upload_raw(&f16_bytes, &[n])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F16,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
     }?;
     // AWQ sidecar attachment — same pattern as hfq.rs::load_weight_tensor
@@ -611,6 +754,20 @@ pub struct DflashScratch {
     /// Experimental arch integrations use this to avoid async kernel hazards
     /// while keeping the generic DFlash fast path unchanged.
     pub sync_gemm: bool,
+
+    /// Optional NPU draft body (Phase 1 reachability seam). When `Some`, and the
+    /// context has grown to at least its `l_ctx`, `spec_step_dflash` runs this
+    /// serially in place of the GPU `draft_forward_opts`, landing block hidden
+    /// into `self.x` rows `1..B`. Off by default; the all-GPU path is unchanged.
+    #[cfg(target_os = "linux")]
+    pub npu_body: Option<hipfire_xdna::DflashNpuBody>,
+
+    /// Host mirror of the committed-context rows the NPU body needs. Grows by a
+    /// targeted D2H of just the newly-scattered tail rows each cycle (the new
+    /// "GPU-resident context, host-mirror the tail" feed mode). Layout matches
+    /// `target_hidden`: `[rows, num_extract * hidden]` f32. Empty when the NPU
+    /// draft is disabled.
+    pub npu_target_hidden_host: Vec<f32>,
 }
 
 impl DflashScratch {
@@ -731,6 +888,9 @@ impl DflashScratch {
             draft_ffn_graphs,
             draft_ffn_warmed_up,
             sync_gemm,
+            #[cfg(target_os = "linux")]
+            npu_body: None,
+            npu_target_hidden_host: Vec::new(),
         })
     }
 
@@ -743,6 +903,127 @@ impl DflashScratch {
         self.uploaded_target_hidden_rows = 0;
         self.target_hidden_abs_positions.clear();
         self.draft_ctx_cached_rows = 0;
+        // New prompt: the NPU host mirror of committed context is stale too.
+        self.npu_target_hidden_host.clear();
+    }
+
+    /// Enable the Phase-1 serial NPU draft. Loads the DFlash NPU block body from
+    /// the on-disk harness artifacts (multicore W4A8 + flash attention + CPU
+    /// primitives — the validated body). No-op / error-free on non-Linux.
+    ///
+    /// `weights_dir` is the `--weights` dir (index.json + w_*.i8/.scale + g_*.f32),
+    /// `manifest_path` the flash-attention manifest json, `r14_dir` the packed
+    /// r14 array dir. Holds the GPU lock; pins ~3 of npu1's 6 hardware contexts.
+    #[cfg(target_os = "linux")]
+    pub fn enable_npu_draft(
+        &mut self,
+        weights_dir: &str,
+        manifest_path: &str,
+        r14_dir: &str,
+    ) -> Result<(), String> {
+        let body = hipfire_xdna::DflashNpuBody::load(weights_dir, manifest_path, r14_dir)
+            .map_err(|e| format!("load DFlash NPU body: {e:?}"))?;
+        self.npu_body = Some(body);
+        Ok(())
+    }
+
+    /// True when the serial NPU draft is enabled.
+    pub fn npu_draft_enabled(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.npu_body.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// Run the NPU draft block forward as a serial substitute for
+    /// `draft_forward_opts`. Returns `Ok(true)` when the NPU produced the block
+    /// (its hidden landed in `self.x` rows `1..B`), or `Ok(false)` when it
+    /// declined (disabled, or the context is shorter than the body's fixed
+    /// `l_ctx` window) so the caller falls back to the GPU draft.
+    ///
+    /// Feed: the block's target-embedding rows are already in `self.x[0..B]`
+    /// (written by the caller's embedding lookup); this D2Hs them as the seed.
+    /// The committed context is host-mirrored incrementally by a targeted D2H of
+    /// just the tail rows of `self.target_hidden`, then the last `l_ctx` rows are
+    /// windowed and fed to the body. Losslessness holds regardless of the NPU
+    /// draft's numeric quality — the target verifies every proposed token.
+    pub fn npu_draft_forward(
+        &mut self,
+        gpu: &mut Gpu,
+        position: usize,
+        b: usize,
+    ) -> HipResult<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            let (l_ctx, h, ne, body_b) = match self.npu_body.as_ref() {
+                Some(body) => (body.l_ctx(), body.hidden(), body.num_extract(), body.block_size()),
+                None => return Ok(false),
+            };
+            // The body bakes a fixed block size (B) and a fixed l_ctx-row context
+            // window into its kernels. Decline (fall back to the GPU draft) when
+            // this cycle's block size differs — e.g. adaptive-B picked B<16 — or
+            // when the context is shorter than the window (early cycles). Both
+            // fall back losslessly; the committed digest is unaffected.
+            if b != body_b || position < l_ctx {
+                return Ok(false);
+            }
+            let row = ne * h;
+
+            // ── Tail-mirror feed: targeted D2H of the newly-committed rows ─────
+            // `target_hidden` on GPU holds `position` committed rows (populated by
+            // the seed + per-cycle D2D scatter). Download only rows not yet
+            // mirrored. On Phoenix UMA a D2H is a cache-coherent read (cheap).
+            let have = self.npu_target_hidden_host.len() / row;
+            if have < position {
+                let start = have;
+                let nrows = position - start;
+                let view = self.target_hidden.sub_offset(start * row, nrows * row);
+                let tail = gpu.download_f32(&view)?;
+                self.npu_target_hidden_host.extend_from_slice(&tail);
+            } else if have > position {
+                // Rewound/compacted below the mirror — resync the full prefix.
+                let view = self.target_hidden.sub_offset(0, position * row);
+                let full = gpu.download_f32(&view)?;
+                self.npu_target_hidden_host.clear();
+                self.npu_target_hidden_host.extend_from_slice(&full);
+            }
+
+            // Window: the last l_ctx committed rows.
+            let win_start = (position - l_ctx) * row;
+            let window = self.npu_target_hidden_host[win_start..win_start + l_ctx * row].to_vec();
+
+            // Seed/noise: the block's target-embedding rows, already in x[0..B].
+            let noise = gpu.download_f32(&self.x.sub_offset(0, b * h))?;
+
+            // ── NPU forward ──────────────────────────────────────────────────
+            let mut out = vec![0f32; b * h];
+            self.npu_body
+                .as_mut()
+                .expect("npu_body present")
+                .forward_block(&window, &noise, &mut out);
+
+            // Land block hidden into x rows 1..B (row 0 is the seed; lm_head
+            // reads 1..B). Same buffer layout draft_forward_opts writes.
+            let tail_rows = &out[h..b * h];
+            let bytes = unsafe {
+                std::slice::from_raw_parts(tail_rows.as_ptr() as *const u8, tail_rows.len() * 4)
+            };
+            let dst = self.x.sub_offset(h, (b - 1) * h);
+            gpu.hip.memcpy_htod(&dst.buf, bytes)?;
+            if std::env::var("HIPFIRE_DFLASH_NPU_DRAFT_TRACE").ok().as_deref() == Some("1") {
+                eprintln!("[npu-draft] cycle: position={position} b={b} l_ctx={l_ctx} (NPU block forward ran)");
+            }
+            Ok(true)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (gpu, position, b);
+            Ok(false)
+        }
     }
 
     /// Invalidate the per-layer k_ctx/v_ctx projection cache. Called from
@@ -829,6 +1110,26 @@ fn gemm_dispatch(
     // atomic load per call rather than an env lookup.
     static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let dump = *DUMP.get_or_init(|| crate::config::get().draft_gemm_dump);
+    // Calibration tap. No-op unless a `CalibCollector` is armed AND `w.buf`'s
+    // address is registered in `gpu.capture_names` — so a drafter-only
+    // registration never picks up the target model's projections even though
+    // both run on the same `gpu`. Placed BEFORE the dtype dispatch so the
+    // captured `x` is the PLAIN-BASIS activation: for MQ3/MQ4 drafters the FWHT
+    // rotation happens below, inside the match, and we deliberately do not
+    // want the rotated basis in the Hessian (the LDLQ consumer works in the
+    // same plain basis as the F16/F32 source weights).
+    //
+    // The `x` handed in is often a WHOLE scratch tensor sized for
+    // `max_block_size` rows while this call only uses `batch ≤ max_block_size`
+    // of them (adaptive-B). `CalibCollector::capture` infers the source row
+    // stride as `input.numel() / n`, which is only correct when the view's
+    // element count is exactly `n × k` — so pass an explicit `batch × w.k`
+    // view rather than the oversized scratch, or every row after the first
+    // would be copied from the wrong offset.
+    if gpu.active_capture.is_some() {
+        let x_rows = x.sub_offset(0, batch * w.k);
+        gpu.maybe_capture_activation(&w.buf, &x_rows, batch, w.k);
+    }
     if dump || sync_after {
         gpu.hip.device_synchronize()?;
     }
@@ -1183,6 +1484,7 @@ pub fn draft_forward_opts(
     let hd = cfg.head_dim;
     let eps = cfg.norm_eps;
     let theta = cfg.rope_theta;
+    let golden_dir = std::env::var("HIPFIRE_DFLASH_GOLDEN_DIR").ok();
 
     assert!(b <= scratch.max_block_size, "block_size > scratch max");
     assert!(l <= scratch.max_ctx_len, "ctx_len > scratch max");
@@ -1278,6 +1580,9 @@ pub fn draft_forward_opts(
         )?;
         gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, delta, h, eps)?;
     }
+    if let Some(dir) = &golden_dir {
+        dflash_golden_npy(gpu, dir, "rust_target_hidden_proj", &scratch.target_hidden_proj, &[l, h]);
+    }
 
     // HIPFIRE_DRAFT_SUBPHASE=1: per-layer-section timing inside draft_forward.
     // Diagnostic only — device_synchronize at each boundary makes this 2-3×
@@ -1314,6 +1619,11 @@ pub fn draft_forward_opts(
 
         // attn_norm.
         gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
+        if li == 0 {
+            if let Some(dir) = &golden_dir {
+                dflash_golden_npy(gpu, dir, "rust_l0_input_norm", &scratch.x_norm, &[b, h]);
+            }
+        }
 
         let t0 = if dbg {
             gpu.hip.device_synchronize()?;
@@ -1502,6 +1812,13 @@ pub fn draft_forward_opts(
             tot,
         )?;
         dflash_subphase_sync(gpu, dbg, li, "rope_k")?;
+        if li == 0 {
+            if let Some(dir) = &golden_dir {
+                dflash_golden_npy(gpu, dir, "rust_l0_q_roped", &scratch.q, &[b, cfg.q_dim()]);
+                dflash_golden_npy(gpu, dir, "rust_l0_k_roped", &scratch.k_cat, &[tot, kvd]);
+                dflash_golden_npy(gpu, dir, "rust_l0_v", &scratch.v_cat, &[tot, kvd]);
+            }
+        }
 
         if let Some(t) = t1 {
             gpu.hip.device_synchronize()?;
@@ -1543,6 +1860,11 @@ pub fn draft_forward_opts(
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
         };
         dflash_subphase_sync(gpu, dbg, li, "attention")?;
+        if li == 0 {
+            if let Some(dir) = &golden_dir {
+                dflash_golden_npy(gpu, dir, "rust_l0_attn_out", &scratch.attn_out, &[b, cfg.q_dim()]);
+            }
+        }
         if let Some(t) = t2 {
             gpu.hip.device_synchronize()?;
             us_attn_kernel += t.elapsed().as_micros();
@@ -1568,11 +1890,24 @@ pub fn draft_forward_opts(
         // x = residual_attn + attn_proj
         gpu.add_f32(&scratch.residual_attn, &scratch.attn_proj, &scratch.x)?;
         dflash_subphase_sync(gpu, dbg, li, "attn_residual_add")?;
+        if li == 0 {
+            if let Some(dir) = &golden_dir {
+                dflash_golden_npy(gpu, dir, "rust_l0_attn_proj", &scratch.attn_proj, &[b, h]);
+                dflash_golden_npy(gpu, dir, "rust_l0_post_attn_residual", &scratch.x, &[b, h]);
+            }
+        }
 
         // Fixed-shape FFN tail. MoE DFlash can optionally capture this as a
         // per-layer/per-B hipGraph; the attention/context work above is left
         // direct because `ctx_len` changes every accepted cycle.
-        let graph_ffn_active = graph_ffn && !dbg && !crate::config::get().draft_gemm_dump;
+        // A captured/replayed hipGraph bypasses the host-side calibration tap
+        // in `gemm_dispatch` (and capturing a graph while the collector
+        // launches its own reduce kernels would be illegal anyway), so the FFN
+        // graph path is disabled whenever a calibration capture is armed.
+        let graph_ffn_active = graph_ffn
+            && !dbg
+            && !crate::config::get().draft_gemm_dump
+            && gpu.active_capture.is_none();
         draft_ffn_layer_maybe_graph(gpu, layer, scratch, li, b, h, eps, graph_ffn_active)?;
         // 2026-04-21: tried target's fused gemm_gate_up_hfq4g256 here (shared
         // FP16-X convert + interleaved gate/up GEMMs). Byte-exact A/B neutral
@@ -1586,6 +1921,9 @@ pub fn draft_forward_opts(
             gpu.hip.device_synchronize()?;
             us_ffn_gemm += t.elapsed().as_micros();
         }
+        if let Some(dir) = &golden_dir {
+            dflash_golden_npy(gpu, dir, &format!("rust_l{li}_out"), &scratch.x, &[b, h]);
+        }
     }
 
     if dbg {
@@ -1598,6 +1936,9 @@ pub fn draft_forward_opts(
 
     // ── 3. Final norm ────────────────────────────────────────────────────
     gpu.rmsnorm_batched(&scratch.x, &weights.norm, &scratch.x, b, h, eps)?;
+    if let Some(dir) = &golden_dir {
+        dflash_golden_npy(gpu, dir, "rust_final_block_hidden", &scratch.x, &[b, h]);
+    }
 
     // ── 4. Advance the draft-ctx projection cache pointer ────────────────
     // All rows [0..l) of target_hidden_proj and every layer's

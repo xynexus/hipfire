@@ -251,6 +251,46 @@ def matmul_npu(A_np, B_np, *, b_col_maj=1, tile=None):
     return C, tile_used
 
 
+# NPU-busy time (µs) of the most recent matmul_npu_resident() call — lets callers
+# separate on-device compute from host/XRT round-trip overhead.
+LAST_NPU_US = 0.0
+
+
+def upload_int8(A_np):
+    """Upload an int8 matrix to the NPU once and keep it resident.
+
+    Returns (A_t, M, K) for use with matmul_npu_resident(). Hoisting this out of
+    the per-call path matters for the DFlash body: its projection weights are
+    ~1 GB of int8 and matmul_npu() would otherwise re-upload them on every
+    dispatch (see docs/npu/dflash-phase-d-fusion-plan.md, lever 4)."""
+    M, K = A_np.shape
+    A_t = iron.tensor(A_np.reshape(-1).astype(np.int8), dtype=np.int8, device="npu")
+    return A_t, M, K
+
+
+def matmul_npu_resident(A_t, M, K, B_np, *, b_col_maj=1, tile=None):
+    """matmul_npu() with A already resident on the NPU (from upload_int8()).
+
+    C[M,N] = A[M,K] · B[N,K]^T, B uploaded per call (it is the small activation
+    side). Returns (C int32 [M,N], tile_used)."""
+    tile = tile or DEFAULT_TILE
+    N = B_np.shape[0]
+    m, k, n = _tiles_for(M, K, N, tile)
+    B_t = iron.tensor(B_np.reshape(-1).astype(np.int8), dtype=np.int8, device="npu")
+    C_t = iron.zeros(M * N, dtype=np.int32, device="npu")
+    global LAST_NPU_US
+    _b = run_iters(
+        int_matmul, A_t, B_t, C_t,
+        M=M, K=K, N=N, m=m, k=k, n=n,
+        dtype_in_str="i8", dtype_out_str="i32", b_col_maj=b_col_maj,
+        warmup=0, iters=1,
+    )
+    LAST_NPU_US = float(getattr(_b, "npu_time_us", 0.0) or 0.0)
+    # C_t.numpy() is a view onto the device buffer freed at return — copy first.
+    C = np.array(C_t.numpy().reshape(M, N), dtype=np.int32)
+    return C, (m, k, n)
+
+
 def bench_npu(A_np, B_np, *, b_col_maj=1, tile=None, warmup=5, iters=20):
     """Benchmark the int8 matmul. Returns (C[M,N] int32, bench) where bench has
     .npu_time_us / .e2e_time_us avg fields from run_iters."""

@@ -355,7 +355,7 @@ fn main() {
         max_seq,
         kv_mode: target_kv_mode,
         repeat_window: 128,
-        state_quant,
+        state_quant: Some(state_quant),
     };
     let mut target_slot = ModelSlot::load(&mut gpu, Path::new(model_path), "target", target_cfg)
         .expect("failed to load target model");
@@ -375,7 +375,7 @@ fn main() {
             max_seq,
             kv_mode: KvMode::Q8,
             repeat_window: 128,
-            state_quant,
+            state_quant: Some(state_quant),
         };
 
         eprintln!("Loading draft {}...", dpath);

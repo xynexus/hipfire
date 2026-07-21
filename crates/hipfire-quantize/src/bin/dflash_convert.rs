@@ -254,6 +254,339 @@ fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     output
 }
 
+/// Non-rotated (plain-basis) OQ8: per-256-group symmetric signed int8, f16 scale.
+/// Block = `[f16 scale][256 int8]` = 258 B/group. NO FWHT — the AIE2 int8 kernel
+/// (W8A16/W8A8) reads these codes directly and needs no activation rotation.
+///
+/// Scale = max_abs / 127 (round-to-nearest-even quantization). At 8-bit,
+/// clip-search is a no-op vs max-abs (measured: identical on the z-lab 9B
+/// drafter — no outliers to clip at 256 levels), so this matches OQ8+ quality
+/// while keeping the runtime activation path a plain per-group int8 quant.
+/// The final partial group (if `n % 256 != 0`) is zero-padded; padded lanes are
+/// never read by the kernel. Dequant oracle: `dequant_oq8_plain`.
+fn quantize_oq8_plain(f32_data: &[f32]) -> Vec<u8> {
+    let group_size = 256usize;
+    let block_bytes = 2 + 256; // f16 scale + 256 signed int8
+    let n = f32_data.len();
+    let n_blocks = n.div_ceil(group_size);
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let grp = &f32_data[start..end];
+        let max_abs = grp.iter().fold(0.0f32, |a, &w| a.max(w.abs()));
+        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        let scale_f16 = hipfire_primitives::conv::f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        for (i, &w) in grp.iter().enumerate() {
+            // round-to-nearest-even, clamp to symmetric signed int8 [-127, 127].
+            let q = (w * inv).round_ties_even().clamp(-127.0, 127.0) as i8;
+            output[out_off + 2 + i] = q as u8;
+        }
+        // trailing lanes of a partial final group stay 0 (== quantized zero).
+    }
+    output
+}
+
+/// Symmetric clip-search: pick the per-group scale minimising round-trip SSE over
+/// a shrink grid, rather than the naive `amax/qmax`. This is the `+` in `oq4.25+`.
+/// Mirrors `codecs::symmetric_clipsearch`, kept local like the other plain codecs.
+fn clipsearch_plain(group: &[f32], qmax: f32) -> f32 {
+    const CLIP_GRID: [f32; 9] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6];
+    let amax = group.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+    let (mut best_scale, mut best_err) = (amax / qmax, f32::INFINITY);
+    for &c in &CLIP_GRID {
+        let scale = (c * amax / qmax).max(1e-12);
+        let inv = 1.0 / scale;
+        let mut err = 0.0f32;
+        for &v in group.iter() {
+            let q = (v * inv).round().clamp(-qmax, qmax);
+            let d = v - q * scale;
+            err += d * d;
+        }
+        if err < best_err {
+            best_err = err;
+            best_scale = scale;
+        }
+    }
+    if best_scale > 0.0 { best_scale } else { 1.0 }
+}
+
+/// Rank group positions by how much promoting them from int4 to int8 reduces
+/// squared error. The top `n_out` become the sparse overlay.
+fn mixed_overlay_indices_plain(group: &[f32; 256], scale: f32) -> [usize; 256] {
+    let inv = 1.0 / scale.max(1e-12);
+    let gain = |index: usize| -> f32 {
+        let value = group[index];
+        let q4 = (value * inv).round().clamp(-7.0, 7.0);
+        let q8 = (value * inv).round().clamp(-127.0, 127.0);
+        let e4 = value - q4 * scale;
+        let e8 = value - q8 * scale;
+        e4 * e4 - e8 * e8
+    };
+    let mut indices: [usize; 256] = core::array::from_fn(|i| i);
+    indices.sort_unstable_by(|&l, &r| {
+        gain(r)
+            .partial_cmp(&gain(l))
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
+    indices
+}
+
+/// SSE of the mixed encoding: outlier slots clamp to int8, the rest to int4.
+fn mixed_overlay_error_plain(
+    group: &[f32; 256],
+    scale: f32,
+    indices: &[usize; 256],
+    n_out: usize,
+) -> f32 {
+    let inv = 1.0 / scale.max(1e-12);
+    let mut is_w8 = [false; 256];
+    for &index in &indices[..n_out] {
+        is_w8[index] = true;
+    }
+    group
+        .iter()
+        .enumerate()
+        .map(|(index, &value)| {
+            let limit = if is_w8[index] { 127.0 } else { 7.0 };
+            let q = (value * inv).round().clamp(-limit, limit);
+            let e = value - q * scale;
+            e * e
+        })
+        .sum()
+}
+
+/// Refit the scale knowing which slots will be int8 — a wider grid than the
+/// int4-only search, because outliers no longer force the scale up.
+fn refit_mixed_scale_plain(
+    group: &[f32; 256],
+    indices: &[usize; 256],
+    n_out: usize,
+    fallback: f32,
+) -> f32 {
+    const CLIP_GRID: [f32; 14] = [
+        1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35,
+    ];
+    let amax = group.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let mut best_scale = fallback.max(1e-12);
+    let mut best_error = mixed_overlay_error_plain(group, best_scale, indices, n_out);
+    for clip in CLIP_GRID {
+        let scale = (clip * amax / 7.0).max(1e-12);
+        let error = mixed_overlay_error_plain(group, scale, indices, n_out);
+        if error < best_error {
+            best_scale = scale;
+            best_error = error;
+        }
+    }
+    best_scale
+}
+
+/// Joint scale/overlay selection: clip-search, pick outliers, refit, repeat once.
+fn mixed_clipsearch_plain(group: &[f32; 256], n_out: usize) -> (f32, [usize; 256]) {
+    let s0 = clipsearch_plain(group, 7.0);
+    let i0 = mixed_overlay_indices_plain(group, s0);
+    let s1 = refit_mixed_scale_plain(group, &i0, n_out, s0);
+    let i1 = mixed_overlay_indices_plain(group, s1);
+    let s2 = refit_mixed_scale_plain(group, &i1, n_out, s1);
+    (s2, i1)
+}
+
+/// Number of int8 overlay slots per 256-group for a requested mixed bit-width.
+///
+/// Base cost is 4.0625 b/w (130 B/group = f16 scale + 128 nibbles); each overlay
+/// entry is 2 B = 0.0625 b/w. So `bits = 4.0625 + n_out/16`, and `oq4.25` → 3.
+/// Matches `hipfire-quantize::main::parse_opus_mixed_format` exactly so the
+/// sidecar and the general HFQ pipeline agree on what a name means.
+fn mixed_outliers_for_bits(bits: f32) -> Option<usize> {
+    let exact = (bits - 4.0625) * 16.0;
+    let n = exact.round() as isize;
+    if !(1..=62).contains(&n) || (exact - n as f32).abs() > 1e-4 {
+        return None;
+    }
+    Some(n as usize)
+}
+
+/// Non-rotated PURE int4 Opus quant — the minimum-bandwidth weight format.
+///
+/// Per 256-group: `[f16 scale][128 int4 nibbles]` = **130 B/group = 4.0625 b/w**.
+/// This is `quantize_oq4_mixed_plain` with zero overlays, and it is the format the
+/// AIE2 W4A8 projection kernel wants: the NPU weight path is bandwidth-bound, so
+/// *bytes* are the only remaining lever (eight feed-side knobs measured null).
+///
+/// Deliberately NOT the mixed format. `Oq4MixedPlain` (qt=46) costs
+/// `130 + 2·n_out` B/group and buys ~1 dB of SNR across the whole
+/// 4.25 → 8.0 b/w range — second-order, while the bytes are first-order. Use this
+/// unless a measured acceptance-rate result says otherwise.
+///
+/// Non-rotated for the same reason as `Oq8Plain`/`Oq4MixedPlain`: a rotated weight
+/// basis requires the *activation* to be rotated per dispatch at runtime, which
+/// cannot be baked in at HFQ creation. Distinct from the canonical rotated
+/// `Oq4G256 = 34` so a rotated consumer can never mis-handle these bytes.
+fn quantize_oq4_plain(f32_data: &[f32]) -> Vec<u8> {
+    let group_size = 256usize;
+    let block_bytes = 130; // [f16 scale][128 nibbles]
+    let n = f32_data.len();
+    let n_blocks = n.div_ceil(group_size);
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        // Partial final group is zero-padded; padded lanes are never read at
+        // inference and zero is exactly representable.
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+
+        // Clip-search over the int4 grid (qmax=7) — the `+` in oq4+.
+        let scale = clipsearch_plain(&group, 7.0);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        let scale_f16 = hipfire_primitives::conv::f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        for i in 0..128 {
+            let qlo = (group[2 * i] * inv).round().clamp(-7.0, 7.0) as i8;
+            let qhi = (group[2 * i + 1] * inv).round().clamp(-7.0, 7.0) as i8;
+            output[out_off + 2 + i] = ((qlo as u8) & 0xf) | (((qhi as u8) & 0xf) << 4);
+        }
+    }
+    output
+}
+
+/// Dequant oracle for `quantize_oq4_plain` — for round-trip validation.
+#[cfg(test)]
+fn dequant_oq4_plain(data: &[u8], n: usize) -> Vec<f32> {
+    let group_size = 256usize;
+    let block_bytes = 130;
+    let n_blocks = n.div_ceil(group_size);
+    let mut out = Vec::with_capacity(n_blocks * group_size);
+    for b in 0..n_blocks {
+        let off = b * block_bytes;
+        let scale =
+            hipfire_primitives::conv::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        for i in 0..128 {
+            let byte = data[off + 2 + i];
+            // sign-extend each nibble from 4 bits
+            out.push(scale * ((((byte & 0xf) as i8) << 4 >> 4) as f32));
+            out.push(scale * ((((byte >> 4) as i8) << 4 >> 4) as f32));
+        }
+    }
+    out.truncate(n);
+    out
+}
+
+/// Non-rotated mixed-precision Opus quant: int4 bulk plus a sparse int8 overlay.
+///
+/// Per 256-group: `[f16 scale][128 int4 nibbles][n_out × (u8 index, i8 value)]`
+/// = `130 + 2·n_out` B. At `n_out = 3` that is 136 B/group = **4.25 b/w**.
+///
+/// Same layout and values as `codecs::quantize_oqplus_compact` (`OqPlusCompact`,
+/// qt=36) but WITHOUT the FWHT rotation, for the same reason `Oq8Plain` exists:
+/// a rotated weight basis requires the *activation* to be rotated per dispatch at
+/// runtime, which cannot be baked in at HFQ creation. The AIE2 W4A8 projection
+/// kernel consumes these bytes directly.
+///
+/// Nibble slots at outlier positions still carry the int4 clamp, so a consumer
+/// that ignores the overlay table degrades gracefully to plain int4 rather than
+/// reading garbage.
+fn quantize_oq4_mixed_plain(f32_data: &[f32], n_out: usize) -> Vec<u8> {
+    assert!(
+        (1..=62).contains(&n_out),
+        "n_out must be 1..=62, got {n_out}"
+    );
+    let group_size = 256usize;
+    let block_bytes = 130 + 2 * n_out;
+    let n = f32_data.len();
+    let n_blocks = n.div_ceil(group_size);
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        // Partial final group is zero-padded; padded lanes are never read at
+        // inference, and zero is exactly representable.
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+
+        let (scale, idx) = mixed_clipsearch_plain(&group, n_out);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        let scale_f16 = hipfire_primitives::conv::f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+
+        // Bulk int4 nibbles at every position (outlier slots overridden on load).
+        for i in 0..128 {
+            let qlo = (group[2 * i] * inv).round().clamp(-7.0, 7.0) as i8;
+            let qhi = (group[2 * i + 1] * inv).round().clamp(-7.0, 7.0) as i8;
+            output[out_off + 2 + i] = ((qlo as u8) & 0xf) | (((qhi as u8) & 0xf) << 4);
+        }
+        // Sparse int8 overlay: (u8 index-in-group, i8 value).
+        let tbl = out_off + 130;
+        for (s, &pos) in idx[..n_out].iter().enumerate() {
+            let q8 = (group[pos] * inv).round().clamp(-127.0, 127.0) as i8;
+            output[tbl + 2 * s] = pos as u8;
+            output[tbl + 2 * s + 1] = q8 as u8;
+        }
+    }
+    output
+}
+
+/// Dequant oracle for `quantize_oq4_mixed_plain` — for round-trip validation.
+#[cfg(test)]
+fn dequant_oq4_mixed_plain(data: &[u8], n: usize, n_out: usize) -> Vec<f32> {
+    let group_size = 256usize;
+    let block_bytes = 130 + 2 * n_out;
+    let n_blocks = n.div_ceil(group_size);
+    let mut out = Vec::with_capacity(n_blocks * group_size);
+    for b in 0..n_blocks {
+        let off = b * block_bytes;
+        let scale =
+            hipfire_primitives::conv::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let mut grp = [0.0f32; 256];
+        // int4 bulk: sign-extend each nibble from 4 bits.
+        for i in 0..128 {
+            let byte = data[off + 2 + i];
+            let lo = ((byte & 0xf) as i8) << 4 >> 4;
+            let hi = ((byte >> 4) as i8) << 4 >> 4;
+            grp[2 * i] = scale * lo as f32;
+            grp[2 * i + 1] = scale * hi as f32;
+        }
+        // int8 overlay wins where present.
+        let tbl = off + 130;
+        for s in 0..n_out {
+            let pos = data[tbl + 2 * s] as usize;
+            let val = data[tbl + 2 * s + 1] as i8;
+            grp[pos] = scale * val as f32;
+        }
+        out.extend_from_slice(&grp);
+    }
+    out.truncate(n);
+    out
+}
+
+/// Dequant oracle for `quantize_oq8_plain` — for the round-trip validation.
+#[cfg(test)]
+fn dequant_oq8_plain(data: &[u8], n: usize) -> Vec<f32> {
+    let group_size = 256usize;
+    let block_bytes = 2 + 256;
+    let n_blocks = n.div_ceil(group_size);
+    let mut out = Vec::with_capacity(n_blocks * group_size);
+    for b in 0..n_blocks {
+        let off = b * block_bytes;
+        let scale =
+            hipfire_primitives::conv::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        for i in 0..group_size {
+            let q = data[off + 2 + i] as i8;
+            out.push(q as f32 * scale);
+        }
+    }
+    out.truncate(n);
+    out
+}
+
 // ─── HFQ File Format ──────────────────────────────────────────────────────
 
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
@@ -270,6 +603,27 @@ enum QuantType {
     MQ4G256 = 13,
     MQ6G256 = 15,
     MQ3G256 = 17,
+    /// Non-rotated (plain-basis) symmetric signed INT8, per-256-group f16 scale.
+    /// On-disk block = [f16 scale][256 int8] = 258 B/group — same bytes as the
+    /// canonical `Oq8G256 = 35` but WITHOUT the FWHT rotation, so the AIE2 int8
+    /// W8A8/W8A16 projection kernel consumes it directly with no per-block
+    /// activation rotation. Distinct id (and `"rotated": false` in metadata) so a
+    /// rotated-OQ8 consumer can never mis-handle these bytes. NPU-only sidecar.
+    Oq8Plain = 45,
+    /// Non-rotated (plain-basis) MIXED Opus quant: int4 bulk + sparse int8
+    /// overlay. Block = [f16 scale][128 nibbles][n_out × (u8 idx, i8 val)] =
+    /// 130 + 2·n_out B/group. At n_out=3 that is 136 B/group = 4.25 b/w.
+    /// Same layout as the canonical `OqPlusCompact = 36` but WITHOUT the FWHT
+    /// rotation (see `Oq8Plain`), so the AIE2 W4A8 projection kernel consumes it
+    /// with no per-block activation rotation. `n_out` is recoverable from the
+    /// block length, and metadata carries it explicitly. NPU-only sidecar.
+    Oq4MixedPlain = 46,
+    /// Non-rotated (plain-basis) PURE int4. Block = [f16 scale][128 nibbles] =
+    /// 130 B/group = 4.0625 b/w — the minimum-bandwidth weight format, and what
+    /// the AIE2 W4A8 projection kernel wants. Distinct from the canonical ROTATED
+    /// `Oq4G256 = 34` so a rotated consumer can never mis-handle these bytes.
+    /// NPU-only sidecar.
+    Oq4Plain = 47,
 }
 
 struct HfqTensor {
@@ -426,6 +780,10 @@ fn main() {
     let mut use_mq4 = false;
     let mut use_mq6 = false;
     let mut use_mq3 = false;
+    let mut use_oq8 = false;
+    let mut use_oq4 = false;
+    // Some(n_out) when a mixed --oq4.<bits> format was requested.
+    let mut oq4_mixed_outliers: Option<usize> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -454,9 +812,48 @@ fn main() {
                 use_mq3 = true;
                 i += 1;
             }
+            "--oq8" => {
+                use_oq8 = true;
+                i += 1;
+            }
+            // PURE int4 (130 B/group, 4.0625 b/w). Matched before the
+            // "--oq4." prefix arm below so it is not shadowed by it.
+            "--oq4" => {
+                use_oq4 = true;
+                i += 1;
+            }
+            // Mixed-precision Opus quant, named by its exact storage width:
+            // bits = 4.0625 + n_out/16, so --oq4.25 => 3 int8 overlays/group.
+            // Accepts the whole canonical family (oq4.125 .. oq7.9375) rather
+            // than hard-coding one width.
+            other_fmt if other_fmt.starts_with("--oq4.") || other_fmt.starts_with("--oq5.") => {
+                let bits_text = &other_fmt[2..].trim_start_matches("oq");
+                match bits_text
+                    .parse::<f32>()
+                    .ok()
+                    .and_then(mixed_outliers_for_bits)
+                {
+                    Some(n) => {
+                        oq4_mixed_outliers = Some(n);
+                        i += 1;
+                    }
+                    None => {
+                        eprintln!(
+                            "invalid mixed format {other_fmt}: storage bits must be \
+                             4.0625 + n/16 for n in 1..=62 (e.g. --oq4.25 => 3 overlays)"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq3 | --mq4 | --mq6]"
+                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> \
+                     [--keep-f32 | --mq3 | --mq4 | --mq6 | --oq8 | --oq4.<bits>]"
+                );
+                eprintln!(
+                    "  --oq4.<bits>  non-rotated mixed int4+int8 (e.g. --oq4.25 = 3 int8 \
+                     overlays per 256-group, 136 B/group)"
                 );
                 std::process::exit(0);
             }
@@ -466,9 +863,17 @@ fn main() {
             }
         }
     }
-    let n_format_flags = (keep_f32 as u8) + (use_mq3 as u8) + (use_mq4 as u8) + (use_mq6 as u8);
+    let n_format_flags = (keep_f32 as u8)
+        + (use_mq3 as u8)
+        + (use_mq4 as u8)
+        + (use_mq6 as u8)
+        + (use_oq8 as u8)
+        + (use_oq4 as u8)
+        + (oq4_mixed_outliers.is_some() as u8);
     if n_format_flags > 1 {
-        eprintln!("--keep-f32, --mq3, --mq4, and --mq6 are mutually exclusive");
+        eprintln!(
+            "--keep-f32, --mq3, --mq4, --mq6, --oq8, --oq4, and --oq4.<bits> are mutually exclusive"
+        );
         std::process::exit(1);
     }
 
@@ -481,7 +886,20 @@ fn main() {
     eprintln!("dflash_convert");
     eprintln!("  input : {}", input_dir.display());
     eprintln!("  output: {}", output_path.display());
-    let dtype_desc = if keep_f32 {
+    let mixed_desc = oq4_mixed_outliers.map(|n| {
+        format!(
+            "OQ{:.4}-plain (non-rotated int4 bulk + {n} int8 overlays per G256, \
+             {} B/group), F32 (norms) — NPU int4 W4A8",
+            4.0625 + n as f32 / 16.0,
+            130 + 2 * n
+        )
+    });
+    let dtype_desc = if use_oq4 {
+        "OQ4-plain (non-rotated PURE int4 G256, 130 B/group = 4.0625 b/w), \
+         F32 (norms) — NPU int4 W4A8, minimum bandwidth"
+    } else if let Some(d) = mixed_desc.as_deref() {
+        d
+    } else if keep_f32 {
         "F32"
     } else if use_mq3 {
         "MQ3-G256 (weights), F32 (norms)"
@@ -489,6 +907,8 @@ fn main() {
         "MQ4-G256 (weights), F32 (norms)"
     } else if use_mq6 {
         "MQ6-G256 (weights), F32 (norms)"
+    } else if use_oq8 {
+        "OQ8-plain (non-rotated int8 G256 weights), F32 (norms) — NPU int8 W8A8/W8A16"
     } else {
         "F16 (weights), F32 (norms)"
     };
@@ -575,6 +995,8 @@ fn main() {
         "mq4"
     } else if use_mq6 {
         "mq6"
+    } else if use_oq8 {
+        "oq8"
     } else {
         "f16"
     };
@@ -610,6 +1032,26 @@ fn main() {
             "rope_theta": config.get("rope_theta").cloned().unwrap_or_else(|| serde_json::Value::from(10_000_000.0)),
             "vocab_size": config.get("vocab_size").cloned(),
             "draft_dtype": draft_dtype,
+            // The -plain codecs (OQ8-plain, OQ4.x-plain) are non-rotated: the AIE2
+            // kernel reads codes directly and must NOT rotate activations. Explicit
+            // so a rotated consumer (canonical Oq8G256=35 / OqPlusCompact=36) can
+            // never mis-handle these bytes.
+            "rotated": if use_oq8 || use_oq4 || oq4_mixed_outliers.is_some() {
+                serde_json::Value::Bool(false)
+            } else {
+                serde_json::Value::Null
+            },
+            // Mixed-precision descriptors. n_out is also recoverable from the block
+            // length (130 + 2*n_out), but carrying it explicitly means a loader never
+            // has to infer geometry from byte arithmetic.
+            "mixed_outliers_per_group": match oq4_mixed_outliers {
+                Some(n) => serde_json::Value::from(n),
+                None => serde_json::Value::Null,
+            },
+            "mixed_storage_bits": match oq4_mixed_outliers {
+                Some(n) => serde_json::Value::from(4.0625 + n as f64 / 16.0),
+                None => serde_json::Value::Null,
+            },
         },
         "tokenizer": serde_json::Value::Null,
     });
@@ -670,6 +1112,15 @@ fn main() {
         } else if use_mq3 && n_elements >= 256 {
             let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ3G256, 256u32, q)
+        } else if use_oq8 && n_elements >= 256 {
+            let q = quantize_oq8_plain(&f32_data);
+            (QuantType::Oq8Plain, 256u32, q)
+        } else if use_oq4 && n_elements >= 256 {
+            let q = quantize_oq4_plain(&f32_data);
+            (QuantType::Oq4Plain, 256u32, q)
+        } else if let (Some(n_out), true) = (oq4_mixed_outliers, n_elements >= 256) {
+            let q = quantize_oq4_mixed_plain(&f32_data, n_out);
+            (QuantType::Oq4MixedPlain, 256u32, q)
         } else {
             (QuantType::F16, 0u32, f32_slice_to_f16_bytes(&f32_data))
         };
@@ -709,4 +1160,221 @@ fn main() {
     .expect("write_hfq failed");
 
     eprintln!("  wrote: {}", output_path.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snr_db(w: &[f32], deq: &[f32]) -> f64 {
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for (a, b) in w.iter().zip(deq) {
+            num += ((*a - *b) as f64).powi(2);
+            den += (*a as f64).powi(2);
+        }
+        10.0 * (den / num.max(1e-30)).log10()
+    }
+
+    #[test]
+    fn oq8_plain_round_trip_smooth_is_near_lossless() {
+        // Realistic (outlier-free) weight distribution: per-group int8 at 256
+        // levels should clear ~45 dB. This is the weight-only quant ceiling the
+        // W8A16 NPU path inherits (real 9B drafter measured ~33 dB end-to-end,
+        // lower because errors compound across 5 layers + activation range).
+        let n = 256 * 4;
+        let w: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.011).sin()) * 0.06).collect();
+        let packed = quantize_oq8_plain(&w);
+        assert_eq!(packed.len(), 4 * (2 + 256));
+        let deq = dequant_oq8_plain(&packed, n);
+        let snr = snr_db(&w, &deq);
+        assert!(snr > 44.0, "oq8-plain smooth SNR {snr:.1} dB too low");
+    }
+
+    #[test]
+    fn oq8_plain_round_trip_with_outlier_is_int8_limited() {
+        // A per-group outlier sets the group scale and crushes bulk resolution —
+        // the known int8 limitation (not a bug). Documents the ~30 dB floor that
+        // clip-search does NOT recover at 8 bits on real weights (measured).
+        let n = 256 * 4;
+        let w: Vec<f32> = (0..n)
+            .map(|i| if i % 256 == 0 { 0.9 } else { (i as f32 * 0.017).sin() * 0.08 })
+            .collect();
+        let deq = dequant_oq8_plain(&quantize_oq8_plain(&w), n);
+        let snr = snr_db(&w, &deq);
+        assert!(snr > 30.0, "oq8-plain outlier SNR {snr:.1} dB unexpectedly low");
+    }
+
+    #[test]
+    fn oq8_plain_zero_group_is_stable() {
+        let w = vec![0.0f32; 256 * 2];
+        let packed = quantize_oq8_plain(&w);
+        let deq = dequant_oq8_plain(&packed, w.len());
+        assert!(deq.iter().all(|&v| v == 0.0));
+    }
+
+    /// Decode the int4 bulk only, ignoring the overlay table. Same bytes, same
+    /// scale — so diffing this against the full decode isolates exactly what the
+    /// sparse int8 overlay contributes.
+    fn dequant_bulk_only(data: &[u8], n: usize, n_out: usize) -> Vec<f32> {
+        let block_bytes = 130 + 2 * n_out;
+        let mut out = Vec::with_capacity(n);
+        for b in 0..n.div_ceil(256) {
+            let off = b * block_bytes;
+            let scale = hipfire_primitives::conv::f16_to_f32(u16::from_le_bytes([
+                data[off],
+                data[off + 1],
+            ]));
+            for i in 0..128 {
+                let byte = data[off + 2 + i];
+                out.push(scale * ((((byte & 0xf) as i8) << 4 >> 4) as f32));
+                out.push(scale * ((((byte >> 4) as i8) << 4 >> 4) as f32));
+            }
+        }
+        out.truncate(n);
+        out
+    }
+
+    #[test]
+    fn mixed_bits_to_outliers_matches_canonical_formula() {
+        // bits = 4.0625 + n_out/16. Must agree with
+        // hipfire-quantize::main::parse_opus_mixed_format, or a sidecar and the
+        // general pipeline would disagree about what "oq4.25" means.
+        assert_eq!(mixed_outliers_for_bits(4.25), Some(3));
+        assert_eq!(mixed_outliers_for_bits(4.125), Some(1));
+        assert_eq!(mixed_outliers_for_bits(4.5), Some(7));
+        // Not on the 1/16 lattice, or out of range.
+        assert_eq!(mixed_outliers_for_bits(4.3), None);
+        assert_eq!(mixed_outliers_for_bits(4.0625), None); // n_out = 0
+        assert_eq!(mixed_outliers_for_bits(8.0), None);
+    }
+
+    #[test]
+    fn oq4_25_block_geometry_is_136_bytes() {
+        let n = 256 * 4;
+        let w: Vec<f32> = (0..n).map(|i| (i as f32 * 0.011).sin() * 0.06).collect();
+        let packed = quantize_oq4_mixed_plain(&w, 3);
+        // 130 + 2*3 = 136 B/group => 4.25 bits/weight.
+        assert_eq!(packed.len(), 4 * 136);
+        assert!((packed.len() as f32 * 8.0 / n as f32 - 4.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn oq4_25_overlay_rescues_outlier_groups() {
+        // THE POINT OF THE FORMAT. One large value per group sets the scale and
+        // crushes int4 resolution for the other 255. Promoting the top-gain slots
+        // to int8 should recover a large amount of SNR for 6 bytes per group.
+        let n = 256 * 4;
+        let w: Vec<f32> = (0..n)
+            .map(|i| {
+                if i % 256 == 0 {
+                    0.9
+                } else {
+                    (i as f32 * 0.017).sin() * 0.08
+                }
+            })
+            .collect();
+        let packed = quantize_oq4_mixed_plain(&w, 3);
+        let bulk = snr_db(&w, &dequant_bulk_only(&packed, n, 3));
+        let full = snr_db(&w, &dequant_oq4_mixed_plain(&packed, n, 3));
+        assert!(
+            full > bulk + 6.0,
+            "overlay bought only {:.1} dB (bulk {bulk:.1} -> full {full:.1}); \
+             the 4.5% byte premium over pure int4 is not being earned",
+            full - bulk
+        );
+    }
+
+    #[test]
+    fn oq4_25_sits_between_int4_and_int8_on_smooth_weights() {
+        // Sanity on ordering: mixed must beat its own int4 bulk, and must not
+        // beat int8 (it stores strictly less information than 8 bits/weight).
+        let n = 256 * 4;
+        let w: Vec<f32> = (0..n).map(|i| (i as f32 * 0.011).sin() * 0.06).collect();
+        let packed = quantize_oq4_mixed_plain(&w, 3);
+        let bulk = snr_db(&w, &dequant_bulk_only(&packed, n, 3));
+        let mixed = snr_db(&w, &dequant_oq4_mixed_plain(&packed, n, 3));
+        let int8 = snr_db(&w, &dequant_oq8_plain(&quantize_oq8_plain(&w), n));
+        assert!(mixed >= bulk, "mixed {mixed:.1} < its own bulk {bulk:.1}");
+        assert!(
+            mixed < int8,
+            "mixed {mixed:.1} dB >= int8 {int8:.1} dB — implausible at 4.25 vs 8 b/w"
+        );
+    }
+
+    #[test]
+    fn oq4_25_zero_group_is_stable() {
+        let w = vec![0.0f32; 256 * 2];
+        let packed = quantize_oq4_mixed_plain(&w, 3);
+        let deq = dequant_oq4_mixed_plain(&packed, w.len(), 3);
+        assert!(deq.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn oq4_plain_block_geometry_is_130_bytes() {
+        let n = 256 * 4;
+        let w: Vec<f32> = (0..n).map(|i| (i as f32 * 0.011).sin() * 0.06).collect();
+        let packed = quantize_oq4_plain(&w);
+        // [f16 scale][128 nibbles] = 130 B/group => 4.0625 bits/weight.
+        assert_eq!(packed.len(), 4 * 130);
+        assert!((packed.len() as f32 * 8.0 / n as f32 - 4.0625).abs() < 1e-6);
+    }
+
+    #[test]
+    fn oq4_plain_is_cheaper_than_mixed_and_worse_than_int8() {
+        // Documents the tradeoff the NPU cares about: pure W4 is the
+        // minimum-BYTES format, and bytes are the binding constraint on the NPU
+        // weight path. Quality ordering must be int4 < mixed < int8; byte
+        // ordering must be the reverse.
+        let n = 256 * 8;
+        let w: Vec<f32> = (0..n).map(|i| (i as f32 * 0.011).sin() * 0.06).collect();
+
+        let p4 = quantize_oq4_plain(&w);
+        let p425 = quantize_oq4_mixed_plain(&w, 3);
+        let p8 = quantize_oq8_plain(&w);
+        assert!(p4.len() < p425.len(), "pure W4 must be smaller than mixed");
+        assert!(p425.len() < p8.len(), "mixed must be smaller than int8");
+
+        let s4 = snr_db(&w, &dequant_oq4_plain(&p4, n));
+        let s425 = snr_db(&w, &dequant_oq4_mixed_plain(&p425, n, 3));
+        let s8 = snr_db(&w, &dequant_oq8_plain(&p8, n));
+        assert!(s4 <= s425, "pure W4 {s4:.1} dB should not beat mixed {s425:.1}");
+        assert!(s425 < s8, "mixed {s425:.1} dB should not beat int8 {s8:.1}");
+        // Sanity floor only. Weight-level int4 round-trip on smooth data; the
+        // ~22 dB int8->int4 gap is textbook (~5.5 dB/bit) and is NOT a defect.
+        assert!(s4 > 15.0, "pure W4 SNR {s4:.1} dB implausibly low");
+    }
+
+    #[test]
+    fn oq4_plain_zero_group_is_stable() {
+        let w = vec![0.0f32; 256 * 2];
+        let packed = quantize_oq4_plain(&w);
+        assert!(dequant_oq4_plain(&packed, w.len())
+            .iter()
+            .all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn oq4_plain_partial_final_group_round_trips() {
+        let n = 256 * 2 + 100;
+        let w: Vec<f32> = (0..n).map(|i| (i as f32 * 0.023).cos() * 0.05).collect();
+        let packed = quantize_oq4_plain(&w);
+        assert_eq!(packed.len(), 3 * 130);
+        let deq = dequant_oq4_plain(&packed, n);
+        assert_eq!(deq.len(), n);
+        assert!(snr_db(&w, &deq) > 12.0);
+    }
+
+    #[test]
+    fn oq4_25_partial_final_group_round_trips() {
+        // 2.5 groups: the tail is zero-padded at encode and must not corrupt the
+        // live lanes or panic on decode.
+        let n = 256 * 2 + 100;
+        let w: Vec<f32> = (0..n).map(|i| (i as f32 * 0.023).cos() * 0.05).collect();
+        let packed = quantize_oq4_mixed_plain(&w, 3);
+        assert_eq!(packed.len(), 3 * 136);
+        let deq = dequant_oq4_mixed_plain(&packed, n, 3);
+        assert_eq!(deq.len(), n);
+        assert!(snr_db(&w, &deq) > 20.0);
+    }
 }

@@ -330,3 +330,60 @@ Both `aie2/` and `aie2p/` subdirectories exist. Available kernels:
 | `mm.cc` | Matrix multiply |
 | `gelu.cc` | GeLU activation |
 | `softmax.cc` | Softmax |
+
+## Under-utilized hardware features (ranked)
+
+Source of truth: `docs/npu/npu-kernel-design-guide.md:779` (op-surface survey vs. actual
+hipfire usage). Value is framed against the documented tax: real W4A8 prefill is pinned at
+~5 TOPS of ~40–55 capacity by per-tile C load/store + objectfifo lock ping-pong, and M512
+batching is blocked by memtile/shim channel saturation.
+
+Most current kernels are SPMD (one program replicated across tiles) fed through
+shim→memtile→core objectfifos. That is one point in the design space, not the hardware's
+model — **each tile has its own program memory, so cores may run entirely different
+programs** (`benchmarks/npu_gemm_tuning/r71/r71_gen.py` places 17 distinct kernel functions
+by `(col,row)`; even columns get output-projection accumulators, all columns get attention
+buffers). Several features below exist specifically to break the walls that the
+SPMD+memtile pattern runs into.
+
+| # | feature (MLIR op) | status | lever |
+|---|---|---|---|
+| 1 | **accumulator cascade** (`aie.cascade_flow`, `put_mcd`/`get_scd`) | unused (r5 proto only) | split K down a column, C stays in the flowing accumulator, stored once → kills the per-tile C reload. **~3–8× prefill.** |
+| 2 | **runtime params** (`aiex.npu.rtp_write`) | unused | one parametric xclbin across tile-count/batch/scale — fixes program-store overflow + M256→M512 without a new image. |
+| 3 | **packet-switched routing** (`aie.packet_flow`, `amsel`, `dma_bd_packet`) | unused | ID-tag multiple streams over one channel → attacks the shim-stream ceiling + saturated memtiles. |
+| 4 | **DMA n-D transform + pad** (`dma_bd bd_dim_layout`/`bd_pad_layout`) | barely used | free transpose/reshape/K-tail-pad in the memtile → frees vector cycles spent on `aie::transpose`. |
+| 5 | **counting-semaphore / lock-free** (`AcquireGreaterEqual`, `disable_synchronization`) | unused | batch-acquire N objects, skip lock gen where static-safe → cuts the per-tile acquire/release tax. |
+| 6 | **wider resident-C tiling** (deeper `aie::mmul` expansion) | partial (2×2) | keep more C sub-tiles in the register file across K → fewer C load/stores (lower-risk partial of #1). |
+| 7 | **core direct stream** (`aie.put_stream`/`get_stream`) | unused | low-latency small-operand path (bias, per-group scales, RMSNorm stats) without a DMA/lock round trip. |
+| 8 | **trace unit** (`aie.trace`, `trace.event`) | unused | per-tile event/PC/cycle trace to host — localizes which stage costs the tax (stalls are otherwise only inferred). |
+| 9 | **parametric BD chains** (`aie.bd_chain`, `dma_start_bd_chain`) | unused | define ping-pong once, concretize at runtime → shrinks runtime_sequence bloat (dispatch-floor lever). |
+| 10 | **fuller weight-replay** (`iter_count`/`repeat_count`) | partial, BLOCKED | one weight object feeds many activation macros; gated on #3 to free the channel it needs. |
+
+**The rule: a feature is "under-utilized" only until measured to help — log the ones that
+don't.** #1 (cascade) is measured at **4–10× over the memtile GEMM** on feed-free compute
+(`npu-kernel-design-guide.md:726`); the cascade stream sits unused in every shipped kernel,
+AMD's included. #2/#3/#4 most directly attack the program-store and channel-saturation
+bottlenecks.
+
+### Constraints that are real (per-tile, not per-design)
+
+- **L1 64 KB per core** — an objectfifo's buffer × depth must fit (depth 2 double-buffering
+  halves your working tile).
+- **Program store 16 KB per core** — binds each core's own text, *not* the sum of a
+  heterogeneous design. Balancing work between cores is how overflow gets fixed.
+- **~2 MM2S channels per column shim** — feeding >1 core/column directly fails aiecc with
+  "number of output DMA channel exceeded"; requires memtile routing (or #3).
+- **npu1 DMA BD dimension cap = 1023** (10-bit). Contiguous stripes larger than that must be
+  split into two dims; `benchmarks/npu_gemm_tuning/r14/r14_gen.py::_split` is the reference
+  implementation. npu2 does not have this cap, so npu2-authored generators often omit it.
+- **DDR ceiling ~13–16 GB/s on npu1, saturating at only ~4–8 cores** — more cores cannot
+  raise aggregate bandwidth (`benchmarks/npu_gemm_tuning/r12/README.md`).
+
+**Do not confuse the aggregate DDR ceiling with the per-kernel weight path.** A W4A8
+multi-core GEMM at DFlash shapes (M=16) measures **~9.3 GB/s on the weight stream** —
+below the aggregate ceiling, and that gap is real headroom, not measurement noise. The
+distinction was established by a control: cutting 1 MB of redundant *activation* traffic
+left the time unmoved (899.3 → 905.5 µs), so weight bytes bind while A and C ride
+concurrently on other channels and are effectively free. Computing aggregate-bytes ÷ time
+and calling it a ceiling will silently overstate how saturated you are — measure the
+binding stream, and prove which one binds by varying the others.
