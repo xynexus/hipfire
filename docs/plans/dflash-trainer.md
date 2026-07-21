@@ -72,7 +72,7 @@ A trained drafter is converted to hfq via the existing `dflash_convert` binary
 2. **Train.** 6-epoch block-diffusion distillation: drafter forward → block of logits
    via target lm_head → block-diffusion loss vs the target's tokens/distribution →
    backward → Adam. ~8 h for 600M on 8×MI300X @ ~35% MFU.
-3. **Convert + validate.** `dflash_convert` → hfq; `scripts/coherence-gate-dflash.sh`
+3. **Convert + validate.** `dflash_convert` → hfq; `tests/coherence-gate-dflash.sh`
    (q8 KV, max=256, byte-identical prompt + md5); measure τ (acceptance length).
 
 ## What hipfire must add (the trainer subsystem)

@@ -52,9 +52,12 @@ correctness coverage on its specific kernel.
 ## Gate 2: Coherence-gate (output sanity)
 
 `scripts/coherence-gate.sh` runs a small fixed AR prompt matrix through
-the daemon and writes a markdown report. `scripts/coherence-gate-dflash.sh`
-is the canonical correctness gate for changes touching kernels, quant
-formats, dispatch, fusion, rotation, rmsnorm, or the spec-decode path.
+the daemon and writes a markdown report. The automatic correctness front tier
+for changes touching kernels, quant formats, dispatch, fusion, rotation,
+rmsnorm, or the spec-decode path is
+`./tests/tiny-affected-gate.sh --require-coverage`;
+`./tests/coherence-gate-dflash.sh` remains an optional manual DFlash/DDTree
+diagnostic.
 
 ### What it tests
 
@@ -71,7 +74,8 @@ ing — the human / agent reviewer reads the report.
 ```bash
 ./scripts/coherence-gate.sh           # AR smoke — 0.8b/4b/9b dense
 ./scripts/coherence-gate.sh --full    # AR smoke plus A3B MoE
-./scripts/coherence-gate-dflash.sh    # canonical gate for affected code
+./tests/tiny-affected-gate.sh --require-coverage  # automatic correctness front tier
+./tests/coherence-gate-dflash.sh      # optional manual DFlash/DDTree diagnostic
 ```
 
 ### Important note for arch ports

@@ -12,9 +12,11 @@ running bring-up or asks for the full matrix.
 ## Current Baseline
 
 - The repo-wide hard rules in `AGENTS.md` apply, especially prompt md5
-  discipline and `./scripts/coherence-gate-dflash.sh` as the canonical
-  correctness gate for kernel/quant/dispatch/fusion/rotation/rmsnorm/spec
-  decode changes.
+  discipline and `./tests/tiny-affected-gate.sh --require-coverage` as the
+  automatic correctness front tier for
+  kernel/quant/dispatch/fusion/rotation/rmsnorm/spec-decode changes, with
+  `./tests/coherence-gate-dflash.sh` as an optional manual DFlash/DDTree
+  diagnostic.
 - DFlash is opt-in by config: use `hipfire config set dflash_mode auto` or a
   per-model setting before expecting paired drafts to fire.
 - Treat benchmark numbers as reportable only with fresh-process runs, prompt

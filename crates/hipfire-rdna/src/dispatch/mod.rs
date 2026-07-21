@@ -2247,6 +2247,37 @@ impl Gpu {
         Ok(())
     }
 
+    /// Alias the shared FWHT rotation scratch (`mq_x_rot`) as an F32 tensor.
+    ///
+    /// Rotated-dtype GEMVs write the rotated activation into this shared
+    /// scratch and read it back within the same dispatch. Callers must have
+    /// allocated the scratch first via [`Gpu::ensure_mq_signs`]; every
+    /// rotated-dtype route does so before reaching here.
+    ///
+    /// The returned tensor *aliases* the scratch buffer — it must not be held
+    /// across a reallocation of `mq_x_rot`, and it is only valid for the
+    /// current dispatch.
+    ///
+    /// # Panics
+    /// Panics with an actionable message if `mq_x_rot` has not been allocated;
+    /// reaching a rotated-dtype dispatch without a sized scratch is a program
+    /// error (`ensure_mq_signs` was not called), not a recoverable input.
+    #[inline]
+    pub fn mq_x_rot_f32(&self) -> GpuTensor {
+        let scratch = self.mq_x_rot.as_ref().expect(
+            "mq_x_rot rotation scratch must be allocated before a rotated-dtype \
+             GEMV; call ensure_mq_signs() first",
+        );
+        GpuTensor {
+            // SAFETY: aliases the shared rotation scratch buffer. The alias is
+            // consumed within the current dispatch and never retained past a
+            // realloc of `mq_x_rot`, so no two live aliases outlive the buffer.
+            buf: unsafe { scratch.buf.alias() },
+            shape: vec![scratch.buf.size() / 4],
+            dtype: DType::F32,
+        }
+    }
+
     /// Lazily allocate the Opus Quant W4A4 persistent decode scratch (B=1).
     /// Sized to 32768-element max (K/M ≤ 32768) — mirrors `mq_x_rot`. Idempotent.
     /// Callers alias these (`oq4_xq`/`oq4_xs`/`oq4_xr`/`oq4_ytmp`) so the per-token

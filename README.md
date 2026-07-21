@@ -188,8 +188,10 @@ See [.github/CONTRIBUTING.md](.github/CONTRIBUTING.md). Install local hooks with
 `./scripts/install-hooks.sh`. The no-GPU CI subset is
 `./tests/no-gpu-ci.sh`; it does not replace the hardware gates. Any
 change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
-or the spec-decode path must pass `./tests/coherence-gate-dflash.sh`
-before commit. Model/runtime evidence should be captured through
+or the spec-decode path must pass
+`./tests/tiny-affected-gate.sh --require-coverage` (the automatic correctness
+front tier) before commit; `./tests/coherence-gate-dflash.sh` remains an
+optional manual DFlash/DDTree diagnostic. Model/runtime evidence should be captured through
 `hipfire eval` batteries where available; the shell gates remain the
 hook/enforcement entrypoints when they still provide baseline comparison.
 Server batching, prefix reuse, KV admission, concurrency, and pipeline-parallel
@@ -592,11 +594,13 @@ This playbook explains how to verify v0.2.0-era branches, what to measure, and w
 
 ## 0 · Hard rules (always apply)
 
-1. **Coherence-gate-dflash is the canonical correctness gate.** Quality-
-   gate.sh is deprecated — its byte-exact baselines drift faster than
-   the engine evolves. Run `./tests/coherence-gate-dflash.sh` after
-   any change touching kernels, quant formats, dispatch, fusion,
-   rotation, rmsnorm, or the spec-decode path.
+1. **`tiny-affected-gate --require-coverage` is the automatic correctness
+   front tier.** Quality-gate.sh is deprecated — its byte-exact baselines
+   drift faster than the engine evolves. Run
+   `./tests/tiny-affected-gate.sh --require-coverage` after any change
+   touching kernels, quant formats, dispatch, fusion, rotation, rmsnorm, or
+   the spec-decode path; `./tests/coherence-gate-dflash.sh` remains an
+   optional manual DFlash/DDTree diagnostic.
 2. **Prompt structure dictates τ.** One newline character can swing τ
    by 17%. Any tok/s comparison across sessions, agents, or commits
    MUST use **byte-identical prompts**. Embed prompts as committed
@@ -827,7 +831,7 @@ Reference numbers in `README.md` "DFlash speculative decode" section.
 Code prompts: 4× win on 27B / 2.6-3× on 9B. Prose prompts: tie or
 small loss on 9B (-20%, draft-target alignment issue, NOT a bug).
 
-### 3.5 — Coherence gate (mandatory before any DFlash claim)
+### 3.5 — Coherence gate (manual DFlash/DDTree diagnostic, run before a DFlash claim)
 
 ```bash
 ./tests/coherence-gate-dflash.sh
@@ -1085,8 +1089,10 @@ cheapest-step first:
    `--kv-mode`, `--no-chatml`, `prompt_normalize`, prompt md5), then
    code-change bisect via `scripts/probe_commits.sh`.
 3. **If real GAIN: coherence MUST be established before ANY claim.**
-   Run `./tests/coherence-gate.sh` and (if spec-decode touched)
-   `./tests/coherence-gate-dflash.sh`. A win that ships an
+   Run `./tests/tiny-affected-gate.sh --require-coverage` (the automatic
+   correctness front tier) and `./tests/coherence-gate.sh`;
+   `./tests/coherence-gate-dflash.sh` is an optional manual DFlash/DDTree
+   diagnostic (run it when spec-decode is touched). A win that ships an
    attractor / token loop / special-token leak / structural repetition
    is not a win — it's a regression on the output axis hiding behind a
    tok/s number. See the multiple "synth-win → prod-falsify" entries
@@ -1110,8 +1116,11 @@ verify the caller actually sets a stream (fix pattern: create
 Any change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
 or the forward pass MUST pass `./tests/coherence-gate.sh` before
 committing. A pre-commit hook in `.githooks/pre-commit` runs it automatically
-when relevant files are staged. Spec-decode changes also trigger
-`./tests/coherence-gate-dflash.sh` (see next section).
+when relevant files are staged. The automatic correctness front tier for
+kernel/quant/dispatch/spec-decode changes is
+`./tests/tiny-affected-gate.sh --require-coverage`;
+`./tests/coherence-gate-dflash.sh` is an optional manual DFlash/DDTree
+diagnostic (see next section).
 
 First-time setup (once per clone):
 ```
@@ -1161,8 +1170,9 @@ now implemented in `hipfire-detect::ngram` as a soft warn.
 ## DFlash Coherence Gate (spec-decode token-attractor guard)
 
 Any DDTree / spec-decode / slow-path-kill change that claims a τ or tok/s
-improvement MUST pass `tests/coherence-gate-dflash.sh` (shipped 9883e98)
-before commit. Enhanced three-tier thresholds (as of 2026-04-26):
+improvement should run `tests/coherence-gate-dflash.sh` (shipped 9883e98) as a
+manual DFlash/DDTree diagnostic before commit; the automatic correctness front
+tier is `./tests/tiny-affected-gate.sh --require-coverage`. Enhanced three-tier thresholds (as of 2026-04-26):
 
 **Tier 1 — First 128 tokens (hard fail, catches single-token attractors):**
 - `unique_token_ratio < 0.15` OR `max_single_token_frequency > 0.50`

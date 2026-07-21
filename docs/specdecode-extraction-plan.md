@@ -113,7 +113,8 @@ only in the `impl SpecDecodeTarget for Qwen35` block.
 - **P4 — dspark scaffold.** Manifest + trait-stub + TODO. Build green.
 - **P5 — GPU validation (blocking, on capable hardware).**
   `./tests/coherence-gate-dflash.sh` must stay CONFIRMED (this gate is the
-  canonical spec-decode correctness check). **Run on a non-LDS-hazard box**
+  manual DFlash/DDTree diff oracle for this spec-decode refactor). **Run on a
+  non-LDS-hazard box**
   (halo/gfx1151 or medusa), not nix1, and coordinate with
   `hipfire lock acquire`. Byte-identical dflash/mtp output vs pre-refactor.
 

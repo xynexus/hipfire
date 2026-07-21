@@ -195,10 +195,12 @@ A new arch port is merge-ready ONLY when:
    hipfire-runtime --example test_kernels` (or the QA variant)
    emits "OK" for every dispatched kernel on the new arch.
 2. **Coherence gates pass.** Run `./scripts/coherence-gate.sh` for AR
-   arch smoke and `./scripts/coherence-gate-dflash.sh` for the canonical
-   correctness gate when the port touches kernels, quant formats, dispatch,
-   fusion, rotation, rmsnorm, or spec-decode behavior. No panics, no
-   zero-tokens, no timeouts, and no attractor-loop failures.
+   arch smoke and `./tests/tiny-affected-gate.sh --require-coverage` as the
+   automatic correctness front tier when the port touches kernels, quant
+   formats, dispatch, fusion, rotation, rmsnorm, or spec-decode behavior;
+   `./tests/coherence-gate-dflash.sh` remains an optional manual DFlash/DDTree
+   diagnostic. No panics, no zero-tokens, no timeouts, and no attractor-loop
+   failures.
 3. **Speed-gate passes** on the regression-baseline arch
    (`./scripts/speed-gate.sh --fast`). The new code path **cannot
    regress gfx1100** (or whichever arch the baseline lives on).

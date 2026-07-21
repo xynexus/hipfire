@@ -11,8 +11,10 @@ low-level GPU execution glue.
   checks over assuming the current development GPU.
 - When changing WMMA/MFMA, lane mappings, launch shapes, or arch-specific
   dispatch, use the AMD matrix calculator skill when instruction details matter.
-- Run `./tests/coherence-gate-dflash.sh` after dispatch or kernel-routing
-  changes that can affect model behavior.
+- Run `./tests/tiny-affected-gate.sh --require-coverage` (the automatic
+  correctness front tier) after dispatch or kernel-routing changes that can
+  affect model behavior; `./tests/coherence-gate-dflash.sh` remains an optional
+  manual DFlash/DDTree diagnostic.
 
 ## GPU Scratch Lifetime
 
