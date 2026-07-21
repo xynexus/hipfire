@@ -108,8 +108,9 @@ Implemented and verified in this checkout:
   other architectures either produce a portable result row or exit with an
   explicit architecture/dtype capability failure. Dispatch admission tests
   cover gfx906, gfx1030, gfx1100, gfx1200/1201, and gfx942. The refreshed
-  gfx1151 channel is queued after production; the other hardware rows remain
-  external evidence, not inferred from compilation;
+  gfx1151 channel is queued after production through the reusable
+  `benchmarks/calib/raw-grouped-channel.sh` evidence writer; the other hardware
+  rows remain external evidence, not inferred from compilation;
 - an index-only dry run of the 397B source: 60 layers, 1,038 logical tensors,
   792,692,717,952 unique source bytes across 94 shards, K=10, sequence batch 4,
   time tile 64, and the complete one-read ledger contract;

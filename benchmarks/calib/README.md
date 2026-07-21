@@ -37,6 +37,19 @@ benchmarks/calib/prefetch-abba.sh \
   --output-dir ~/.hipfire/experiments/calibration-prefetch/Qwen3.5-0.8B
 ```
 
+### Cross-architecture raw grouped channel
+
+`raw-grouped-channel.sh` builds and lock-runs the F16/BF16 routed-expert channel
+test, requires all eight portable CPU-oracle cases, and writes a hashed
+`evidence.json` row. On gfx1151 it also runs the WMMA and compact indexed paths;
+on RDNA2, other RDNA3 devices, RDNA4, and CDNA it exercises the portable kernel
+instead of silently skipping the host.
+
+```sh
+benchmarks/calib/raw-grouped-channel.sh \
+  --output-dir ~/.hipfire/experiments/raw-grouped-channel/$(hostname)-$(date +%Y%m%d-%H%M%S)
+```
+
 ## Sidecar-quality corpora (built on demand)
 
 These are NOT committed (too large; deterministic via fetch script).
