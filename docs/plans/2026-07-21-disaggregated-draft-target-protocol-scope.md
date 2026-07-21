@@ -358,6 +358,41 @@ weights you barely use.
 single-user fine, crossover never bites. halo-streaming → efficient ONLY at high
 concurrency; the target is a batching server or the NVMe is wasted.
 
+## 9.7 The draft-side asymmetry: NPU body batches, serial CPU heads do NOT
+
+§9.6's "batch harder for utilization" applies to the target AND to the NPU draft
+body (one parallel block-diffusion forward covers C concurrent streams' blocks —
+batch dim ~free). **But the DSpark Markov head is a serial per-slot loop** (slot k
+depends on slot k−1's sampled token), so it cannot batch across positions and its
+cost scales **linearly with aggregate committed-token throughput** — it does not
+amortize. On the streaming/multi-tenant deployment this serial CPU work, not the
+NPU body or the target, becomes the **concurrency limiter**. (Same term the
+`aiecost` model undercounts.)
+
+**Estimated CPU head load (soft assumptions — order-of-magnitude):** per Markov
+slot ≈ `markov_w2 @ markov_w1[prev]` ≈ 256×248320 ≈ 64 M MAC (~127 MFLOP) + sample,
+serial over block_size. Per block (bs≈7–16) ≈ 0.9–2 GFLOP serial; on one Zen4
+core at ~10–20 GFLOP/s effective (serial tiny-GEMV, no vectorization) ≈ **45–100 ms
+serial/block**; nix1's 8 cores (streams parallelize, within-block does not) →
+~80–180 blocks/s → at τ≈7 → **~560–1260 committed tok/s.** That ceiling sits *at or
+below* the per-expert crossover throughput the streaming target needs.
+
+**Two draft-side control knobs (a SECOND adaptive controller):**
+1. **Adaptive throttling** — admission control on how many streams run the Markov
+   head; excess streams fall back to plain DFlash marginals (drop the correction —
+   graceful degradation, lower τ, bounded CPU).
+2. **Depth-search adjustment** — shrink serial work/block under load: fewer Markov
+   slots (confidence-trim earlier), lower Markov rank r, shallower tree search, or
+   the cheaper `gated`/`rnn` head vs `vanilla`.
+
+**This conflicts with BASTION's verify-side budget controller and must be solved
+jointly:** BASTION wants wider/deeper trees (verify cheap under streaming); the CPU
+controller wants shallower search + fewer Markov slots (cores bounded). The
+operating point is `max τ` subject to BOTH `verify_bytes(B) ≤ BW·T` AND
+`serial_head_slots(B,C) ≤ core-budget`. **The CPU constraint bites first at high
+concurrency and is modeled by none of the references** (all single-stream,
+co-located). Estimate it before committing to the multi-tenant streaming design.
+
 ## 10. Phased implementation (smallest-first; each verifiable)
 
 1. **Target-side hidden-extraction hook + wire format** — instrument the target
