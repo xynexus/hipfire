@@ -412,6 +412,20 @@ number of down rows over 128 microbatches. Both roles report zero dropped
 indices, zero batch slack, and zero consistency error; 262 experts meet the
 2,048-row floor, the exact remaining 250 are preserved, and 17 have zero hits.
 
+The failures at the 31, 35, and 39 boundaries share a four-layer cadence: each
+target is a full-attention layer reached after three linear-attention layers in
+the same process, while a fresh process completes the affected full-attention
+layer. To keep the schema-1 production run moving without changing its semantic
+job fingerprint or rereading committed logical tensors, the remaining stream
+now uses the native absolute `--pause-after-layers` boundary at 47, 51, 55, and
+59, followed by a final 59--60 segment. A stable outer controller retains the
+induction dependency while each child process exits cleanly and releases SVM
+mappings before the next full-attention layer. The first pressure-bounded child
+accepted the existing fingerprint and resumed from 43/60 at 09:09 AWST. This is
+an operational mitigation for the historical production binary, not evidence
+that the current source still accumulates mappings; the current source release
+and prefetch changes require their own matched validation after the GPU is free.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
