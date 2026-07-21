@@ -27,6 +27,9 @@ cargo test -p hipfire-arch-llama --lib caps
 echo "== Tiny-fixture round-trip (CPU: emit → quantize, no GPU) =="
 bash tests/fixture-roundtrip-nogpu.sh
 
+echo "== Tiny affected-file selector (no GPU) =="
+bash tests/tiny-affected-gate-nogpu.sh
+
 echo "== Eval harness no-GPU smoke =="
 cargo build -p hipfire-eval
 HIPFIRE_EVAL_BIN="$ROOT/target/debug/hipfire-eval" bash tests/smoke/eval-harness-nogpu-smoke.sh
@@ -64,6 +67,7 @@ bash -n tests/smoke/eval-harness-nogpu-smoke.sh
 bash -n tests/smoke/eval-harness-gpu-smoke.sh
 bash -n tests/smoke/eval-harness-model-eval-smoke.sh
 bash -n tests/tiny-affected-gate.sh
+bash -n tests/tiny-affected-gate-nogpu.sh
 bash -n tests/tiny-quant-gate.sh
 bash -n tests/tiny-state-gate.sh
 bash -n tests/tiny-spec-gate.sh

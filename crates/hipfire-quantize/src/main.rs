@@ -10235,8 +10235,18 @@ fn main() {
                     });
                 }
             } // end else (non-Q8HFQ path)
-        } else if is_vision && vision_quant == "hfq4" && n_elements >= 32 {
-            // Quantize vision weights to HFQ4G256 (for speed-critical VL workloads)
+        } else if is_vision
+            && vision_quant == "hfq4"
+            && name.ends_with(".weight")
+            && (name.contains(".proj.")
+                || name.contains(".attn.")
+                || name.contains(".mlp.")
+                || name.contains("patchifier.proj."))
+            && n_elements >= 32
+        {
+            // Quantize vision matrix weights to HFQ4G256/HFQ4G128. Vision norms
+            // and biases stay source precision because the VL loaders upload
+            // them as F32 side inputs, not dequantized matrix operands.
             let f32_data = to_f32(raw_data, &meta.dtype);
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();

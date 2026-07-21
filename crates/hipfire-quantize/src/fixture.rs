@@ -14,7 +14,9 @@
 // The fixture manifest vocabulary (TensorSpec/Init/Dt) lives in hipfire-arch-api so
 // each family's `-spec` crate can DECLARE its ToyModel fixture with only that dep;
 // this crate keeps the writer (seeded RNG → safetensors + shared tokenizer).
-use hipfire_arch_api::{Dt, Init, TensorSpec, ARCH_ID_GEMMA4};
+use hipfire_arch_api::{
+    Dt, Init, TensorSpec, ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_GEMMA4, ARCH_ID_LFM2_MOE,
+};
 use hipfire_primitives::conv::f32_to_bf16_bits as bf16_bits;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -316,9 +318,23 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
         // dispatched by the registered ArchId. `dflash` is a draft sidecar (no arch
         // id / model family), so it keeps its local `DflashTiny` builder.
         "qwen3_5" | "qwen35" | "qwen3_5_text" => toy_fixture_from_registry(5, seed)?,
+        "qwen3_5_vl" | "qwen35_vl" | "qwen3_5_vision_language" => {
+            named_toy_fixture_from_registry(5, "vl", seed)?
+        }
         "qwen3_5_moe" | "qwen35moe" | "qwen3_5_moe_text" => toy_fixture_from_registry(6, seed)?,
+        "deepseek4" | "deepseek_v4" | "deepseek4_flash" | "deepseek_v4_flash" => {
+            toy_fixture_from_registry(ARCH_ID_DEEPSEEK4_FLASH as u16, seed)?
+        }
+        "deepseek4_compressed" | "deepseek4_compressed_kv" | "deepseek_v4_compressed_kv" => {
+            named_toy_fixture_from_registry(ARCH_ID_DEEPSEEK4_FLASH as u16, "compressed-kv", seed)?
+        }
+        "deepseek4_mtp" | "deepseek4_mtp_draft" | "deepseek_v4_mtp" => {
+            named_toy_fixture_from_registry(ARCH_ID_DEEPSEEK4_FLASH as u16, "mtp", seed)?
+        }
         "qwen2" => toy_fixture_from_registry(1, seed)?,
+        "dots_ocr" | "dotsocr" => toy_fixture_from_registry(8, seed)?,
         "gemma3" | "gemma3_text" => toy_fixture_from_registry(12, seed)?,
+        "gemma3_vl" | "gemma3_vl_text" | "gemma3-vl" => toy_fixture_from_registry(13, seed)?,
         "gemma4" | "gemma4_dense" | "gemma4_text" => {
             named_toy_fixture_from_registry(ARCH_ID_GEMMA4 as u16, "dense", seed)?
         }
@@ -327,6 +343,9 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
         }
         "gemma4_moe" | "gemma4_dense_moe" => {
             named_toy_fixture_from_registry(ARCH_ID_GEMMA4 as u16, "dense-moe", seed)?
+        }
+        "lfm2" | "lfm2_moe" | "lfm2moe" | "lfm2_moe_text" => {
+            toy_fixture_from_registry(ARCH_ID_LFM2_MOE as u16, seed)?
         }
         "minimax" | "minimax_m2" => toy_fixture_from_registry(10, seed)?,
         "mamba2" | "mamba_2" => toy_fixture_from_registry(15, seed)?,
@@ -337,12 +356,13 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
         }
         other => {
             return Err(format!(
-                "--emit-fixture: unsupported arch '{other}'. Supported: qwen3_5 \
-                 (arch 5 dense), qwen3_5_moe (arch 6 MoE), qwen2 (arch 7, quantize \
-                 with --arch-id 7), gemma3 (arch 12), minimax (arch 10), mamba2 \
-                 (arch 15), gemma4_dense/gemma4_ple/gemma4_moe (arch 24), \
-                 llama (arch 0), dflash (draft sidecar). Add a tiny \
-                 preset per arch as support lands."
+                "--emit-fixture: unsupported arch '{other}'. Supported: qwen3_5/qwen3_5_vl \
+                 (arch 5 dense), qwen3_5_moe (arch 6 MoE), deepseek4/deepseek4_compressed/deepseek4_mtp (arch 9), \
+                 qwen2 (arch 7, quantize with --arch-id 7), dots_ocr (arch 8), \
+                 gemma3 (arch 12), gemma3_vl (arch 13), \
+                 minimax (arch 10), mamba2 (arch 15), lfm2_moe (arch 11), \
+                 gemma4_dense/gemma4_ple/gemma4_moe (arch 24), llama (arch 0), \
+                 dflash (draft sidecar). Add a tiny preset per arch as support lands."
             ));
         }
     };
@@ -443,6 +463,36 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_vl_manifest_has_nested_text_and_vision_tower() {
+        let (config, specs) = named_toy_fixture_from_registry(5, "vl", 42).unwrap();
+        assert_eq!(
+            config.get("model_type").and_then(|v| v.as_str()),
+            Some("qwen3_5_text")
+        );
+        assert!(
+            config.get("text_config").is_some() && config.get("vision_config").is_some(),
+            "qwen3.5-vl fixture must be a composite config"
+        );
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(
+            has("model.language_model.embed_tokens.weight"),
+            "nested text decoder"
+        );
+        assert!(
+            has("model.visual.patch_embed.proj.weight"),
+            "vision patch embed"
+        );
+        assert!(
+            has("model.visual.merger.linear_fc2.weight"),
+            "vision merger"
+        );
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "qwen3.5-vl fixture must stay <10M params"
+        );
+    }
+
+    #[test]
     fn qwen35_moe_manifest_has_experts_router_shared_and_is_tiny() {
         let specs = toy_fixture_from_registry(6, 42).unwrap().1;
         let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
@@ -479,6 +529,29 @@ mod tests {
     }
 
     #[test]
+    fn dots_ocr_manifest_has_qwen2_text_and_vision_tower() {
+        let (config, specs) = toy_fixture_from_registry(8, 42).unwrap();
+        assert_eq!(
+            config.get("model_type").and_then(|v| v.as_str()),
+            Some("dots_ocr")
+        );
+        assert!(config.get("text_config").is_some(), "nested text config");
+        assert!(config.get("vision_config").is_some(), "vision config");
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(has("model.embed_tokens.weight"), "Qwen2 text decoder");
+        assert!(
+            has("vision_tower.patch_embed.patchifier.proj.weight"),
+            "Dots vision patch embed"
+        );
+        assert!(has("vision_tower.blocks.0.attn.qkv.weight"));
+        assert!(has("vision_tower.merger.mlp.2.weight"));
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "dots-ocr fixture must stay <10M params"
+        );
+    }
+
+    #[test]
     fn gemma3_manifest_has_four_norms_and_qk_norm() {
         let specs = toy_fixture_from_registry(12, 42).unwrap().1;
         let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
@@ -491,6 +564,36 @@ mod tests {
         assert!(
             n_params(&specs) < 10_000_000,
             "gemma3 fixture must stay <10M params"
+        );
+    }
+
+    #[test]
+    fn gemma3_vl_manifest_has_text_vision_and_projector() {
+        let (config, specs) = toy_fixture_from_registry(13, 42).unwrap();
+        assert_eq!(
+            config.get("model_type").and_then(|v| v.as_str()),
+            Some("gemma3")
+        );
+        assert!(
+            config.get("vision_config").is_some(),
+            "gemma3-vl must auto-detect as arch 13"
+        );
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(
+            has("language_model.model.embed_tokens.weight"),
+            "text decoder is nested"
+        );
+        assert!(
+            has("vision_tower.vision_model.embeddings.patch_embedding.weight"),
+            "SigLIP patch embed"
+        );
+        assert!(
+            has("multi_modal_projector.mm_input_projection_weight"),
+            "projector"
+        );
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "gemma3-vl fixture must stay <10M params"
         );
     }
 
@@ -520,6 +623,98 @@ mod tests {
     }
 
     #[test]
+    fn lfm2_manifest_has_conv_attention_dense_and_moe() {
+        let specs = toy_fixture_from_registry(ARCH_ID_LFM2_MOE as u16, 42)
+            .unwrap()
+            .1;
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(has("conv.in_proj.weight"), "short-conv mixer");
+        assert!(has("self_attn.q_proj.weight"), "attention mixer");
+        assert!(has("feed_forward.w1.weight"), "dense FFN");
+        assert!(has("feed_forward.gate.weight"), "router");
+        assert!(has("feed_forward.expert_bias"), "expert bias");
+        assert!(has("feed_forward.experts.0.w1.weight"), "split experts");
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "lfm2 fixture must stay <10M params"
+        );
+    }
+
+    #[test]
+    fn deepseek4_manifest_has_lora_hc_score_router_and_experts() {
+        let specs = toy_fixture_from_registry(ARCH_ID_DEEPSEEK4_FLASH as u16, 42)
+            .unwrap()
+            .1;
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(has("attn.wq_a.weight"), "Q-LoRA A");
+        assert!(has("attn.wq_b.weight"), "Q-LoRA B");
+        assert!(has("attn.wo_a.weight"), "O-LoRA A");
+        assert!(has("attn.wo_b.weight"), "O-LoRA B");
+        assert!(has("hc_attn_fn"), "attention Hyper-Connection matrix");
+        assert!(has("hc_ffn_fn"), "FFN Hyper-Connection matrix");
+        assert!(has("ffn.gate.weight"), "score router");
+        assert!(has("ffn.gate.bias"), "score router bias");
+        assert!(has("ffn.shared_experts.w1.weight"), "shared expert");
+        assert!(has("ffn.experts.0.w1.weight"), "split routed experts");
+        assert!(
+            !specs.iter().any(|s| s.name.contains("compressor")),
+            "default tiny fixture keeps compressed-KV/indexer out of this text-core gate"
+        );
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "deepseek4 fixture must stay <10M params"
+        );
+    }
+
+    #[test]
+    fn deepseek4_compressed_manifest_has_compressor_and_indexer_streams() {
+        let specs =
+            named_toy_fixture_from_registry(ARCH_ID_DEEPSEEK4_FLASH as u16, "compressed-kv", 42)
+                .unwrap()
+                .1;
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(
+            has("layers.1.attn.compressor.wkv.weight"),
+            "main compressor"
+        );
+        assert!(
+            has("layers.1.attn.compressor.wgate.weight"),
+            "main compressor gate"
+        );
+        assert!(has("layers.1.attn.indexer.wq_b.weight"), "indexer Q");
+        assert!(
+            has("layers.1.attn.indexer.weights_proj.weight"),
+            "indexer weights projection"
+        );
+        assert!(
+            has("layers.1.attn.indexer.compressor.wkv.weight"),
+            "indexer compressor"
+        );
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "deepseek4 compressed fixture must stay <10M params"
+        );
+    }
+
+    #[test]
+    fn deepseek4_mtp_manifest_has_mtp_block() {
+        let specs = named_toy_fixture_from_registry(ARCH_ID_DEEPSEEK4_FLASH as u16, "mtp", 42)
+            .unwrap()
+            .1;
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(has("mtp.0.enorm.weight"), "MTP embed norm");
+        assert!(has("mtp.0.hnorm.weight"), "MTP hidden norm");
+        assert!(has("mtp.0.e_proj.weight"), "MTP embed projection");
+        assert!(has("mtp.0.h_proj.weight"), "MTP hidden projection");
+        assert!(has("mtp.0.attn.wq_a.weight"), "MTP attention");
+        assert!(has("mtp.0.ffn.experts.0.w1.weight"), "MTP routed expert");
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "deepseek4 MTP fixture must stay <10M params"
+        );
+    }
+
+    #[test]
     fn mamba2_manifest_has_state_spaces_names_and_is_tiny() {
         let specs = toy_fixture_from_registry(15, 42).unwrap().1;
         let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
@@ -543,7 +738,22 @@ mod tests {
     #[test]
     fn emit_new_families_are_deterministic() {
         let base = std::env::temp_dir().join(format!("hipfire-fx-fam-{}", std::process::id()));
-        for arch in ["qwen2", "gemma3", "minimax", "mamba2", "llama"] {
+        for arch in [
+            "qwen2",
+            "dots_ocr",
+            "deepseek4",
+            "deepseek4_mtp",
+            "gemma3",
+            "gemma3_vl",
+            "qwen3_5_vl",
+            "minimax",
+            "lfm2_moe",
+            "mamba2",
+            "llama",
+            "gemma4_dense",
+            "gemma4_ple",
+            "gemma4_moe",
+        ] {
             let dir = base.join(arch);
             emit_fixture(arch, &dir, 7).unwrap();
             let a = std::fs::read(dir.join("model.safetensors")).unwrap();

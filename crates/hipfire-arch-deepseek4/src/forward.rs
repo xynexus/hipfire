@@ -134,6 +134,7 @@ fn gemv_auto(
     } else {
         x_plain
     };
+    gpu.maybe_capture_activation(weight, x, 1, k);
     let wr = WeightRef {
         buf: weight,
         dtype: weight.dtype,

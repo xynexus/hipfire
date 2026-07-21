@@ -1,8 +1,8 @@
 # Further work: tiny-model testing
 
-Open follow-ups for the tiny-model testing system (the seeded random-init
-fixtures + the `tiny_quant` eval battery / `tests/tiny-quant-gate.sh`). The system
-itself is landed and documented; adding a family is covered by
+Open follow-ups for the tiny-model testing system (working name: **tiny model
+gates**; today this is the seeded random-init fixtures + the `tiny_quant` eval
+battery / `tests/tiny-quant-gate.sh`). The system itself is landed and documented; adding a family is covered by
 [`docs/howto/add-tiny-quant-family.md`](../howto/add-tiny-quant-family.md). These
 are the loose ends, roughly in priority order.
 
@@ -71,10 +71,32 @@ forces baselines to exist but blocks a brand-new GPU arch from going green until
 recorded. We chose Skip (non-blocking, honest, mirrors fixture-golden's
 "inconclusive"). Revisit if drift-without-a-baseline becomes a real foot-gun.
 
-## 6. More families
+## 6. More families / variants
 
-`DeepSeek4` (9 — Q/O LoRA + hyper-connections + compressed-KV indexer),
-`LFM2-MoE` (11 — hybrid short-conv + attention + MoE), and the VL families
-(`dots.ocr` 8, `gemma3-vl` 13 — need image inputs) are not yet covered. Each is
-harder than the dense families; start from the loader-recon checklist in the HOWTO.
-Training-path testing is also out of scope so far.
+DeepSeek4 text-core coverage is now in the tiny gates: the fixture exercises
+Q/O-LoRA, Hyper-Connections, score-routed MoE, shared experts, native MQ2-Lloyd
+routed experts, forward/KLD, state hashing, and collect. DeepSeek4
+compressed-KV/indexer coverage is also in the tiny gates as
+`deepseek4_compressed`, including ratio-4 compressor/indexer tensor loading,
+collect, KLD, and long state hashing. DeepSeek4 MTP draft-forward coverage is
+in the tiny gates as `deepseek4_mtp`: it loads `mtp.0.*`, runs the main decode
+to seed `mtp_last_hidden`, then hashes/KLD-checks logits returned by
+`mtp_forward`.
+
+Gemma4 PLE/KV-sharing is covered by `gemma4_ple`, and Gemma4 dense-MoE is
+covered by `gemma4_moe`; both run forward/KLD, state hashing, and collect. The
+Qwen3.5-VL fixture is covered by `qwen3_5_vl`: it loads the composite
+`text_config` + `vision_config` artifact, runs a synthetic vision-tower forward,
+then feeds the resulting visual embedding through the Qwen35 text decoder's
+embed-splice path. Gemma3-VL multimodal fixture coverage is in `gemma3_vl`: it
+loads the arch-13 multimodal artifact, decodes a deterministic embedded PNG with
+the production image preprocessor, runs `vision_forward` + `project`, splices
+the image-token embeddings through `forward_step_with_embed`, then continues
+forward/KLD, state hashing, and collect. dots.ocr image-path coverage is in the
+tiny gates as `dots_ocr`: it loads the full Qwen2 text + Dots vision artifact,
+normalizes a deterministic synthetic RGB image, extracts production-ordered
+patches, runs `vision_forward`, splices four visual rows through
+`forward_step_with_embed`, then continues forward/KLD, state hashing, and
+collect. No remaining model family/variant gap is known in the current tiny-gate
+scope. Optional higher-level work remains for dots.ocr full decoded-image +
+prompt-template e2e coverage, plus the fleet/arch follow-ups above.

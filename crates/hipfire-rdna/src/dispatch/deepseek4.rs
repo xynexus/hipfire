@@ -351,7 +351,7 @@ impl Gpu {
             self.hip.launch_kernel(
                 func,
                 [n_wgs, 1, 1],
-                [128, 1, 1],
+                [64, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,
@@ -1212,7 +1212,8 @@ impl Gpu {
     /// k_cache is shared across batch. `n_per_batch[b]` gives the per-
     /// batch causal cutoff; cache slots ≥ n_per_batch[b] are written
     /// with -inf so top-K skips them (handles within-chunk commits
-    /// that batch row b shouldn't see).
+    /// that batch row b shouldn't see). Launches 64 reduction lanes so fixtures
+    /// with fewer than 64 index heads zero-fill inactive lanes deterministically.
     #[allow(clippy::too_many_arguments)]
     pub fn indexer_relu_score_batched_f32(
         &mut self,
@@ -1257,7 +1258,7 @@ impl Gpu {
             self.hip.launch_kernel(
                 func,
                 [n_max as u32, batch_size as u32, 1],
-                [n_idx_heads as u32, 1, 1],
+                [64, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,
@@ -1336,8 +1337,9 @@ impl Gpu {
     }
     /// DeepSeek V4 indexer scoring — combined across heads with relu gating.
     /// `scores[n] = sum_h relu(q[h, :] · k_cache[n, :]) * weights[h]`.
-    /// Block per slot N, threads-per-block = H (one head per thread),
-    /// LDS reduction across heads.
+    /// Block per slot N, threads-per-block = 64. Active heads fill their lane;
+    /// inactive lanes contribute zero so tiny fixtures with H < 64 remain
+    /// deterministic.
     /// HIP-graphs-safe twin of `indexer_relu_score_f32`. Reads `N` from
     /// a device buffer and launches with a FIXED grid sized to `max_n`
     /// (typically `HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS = 2048`). Blocks beyond
@@ -1371,7 +1373,7 @@ impl Gpu {
         self.launch_kernargs(
             "indexer_relu_score_f32_buf",
             [max_n as u32, 1, 1],
-            [h as u32, 1, 1],
+            [64, 1, 1],
             0,
             &kernargs![ptr qp, ptr kp, ptr wp, ptr sp, ptr nbp, i32 hi, i32 di],
         )

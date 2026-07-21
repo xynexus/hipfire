@@ -23,16 +23,18 @@ trap 'rm -rf "$TMP"' EXIT
 # auto-detects to the LLaMA-family id=1 (which drops Q/K/V bias); --arch-id 7
 # routes it to the dedicated hipfire-arch-qwen2 loader, so we assert the override
 # message ("to 7") instead of an "id=" line.
-ARCHS=(qwen3_5 qwen3_5_moe qwen2 gemma3 minimax mamba2 llama)
-EXPECT_ID=("id=5" "id=6" "to 7" "id=12" "id=10" "id=15" "id=0")
-ARCH_FLAGS=("" "" "--arch-id 7" "" "" "" "")
+ARCHS=(qwen3_5 qwen3_5_vl qwen3_5_moe deepseek4 deepseek4_compressed deepseek4_mtp qwen2 dots_ocr gemma3 gemma3_vl minimax lfm2_moe mamba2 llama gemma4_dense gemma4_ple gemma4_moe)
+EXPECT_ID=("id=5" "id=5" "id=6" "id=9" "id=9" "id=9" "to 7" "id=8" "id=12" "id=13" "id=10" "id=11" "id=15" "id=0" "id=24" "id=24" "id=24")
+ARCH_FLAGS=("" "--include-vision --vision-quant hfq4" "" "" "" "--allow-mq2-lloyd" "--arch-id 7" "--include-vision --vision-quant hfq4" "" "--include-vision --vision-quant q8f16" "" "" "" "" "" "" "")
+ARCH_FORMATS=("mq4" "mq4" "mq4" "mq4" "mq4" "deepseek4-source-precision" "mq4" "mq4" "mq4" "mq4" "mq4" "mq4" "mq4" "mq4" "mq4" "mq4" "mq4")
 
 for i in "${!ARCHS[@]}"; do
     arch="${ARCHS[$i]}"
     want="${EXPECT_ID[$i]}"
+    fmt="${ARCH_FORMATS[$i]}"
     echo "== fixture round-trip: $arch (expect $want) =="
     "$Q" --emit-fixture "$arch" --out "$TMP/$arch" --seed 42
-    out="$("$Q" --input "$TMP/$arch" --output "$TMP/$arch.hfq" --format mq4 ${ARCH_FLAGS[$i]} 2>&1)"
+    out="$("$Q" --input "$TMP/$arch" --output "$TMP/$arch.hfq" --format "$fmt" ${ARCH_FLAGS[$i]} 2>&1)"
     if ! grep -qiE "Architecture:.*$want" <<<"$out"; then
         echo "FAIL: $arch did not auto-detect $want" >&2
         grep -i architecture <<<"$out" >&2 || true

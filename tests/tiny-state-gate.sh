@@ -30,7 +30,7 @@ SEED="${HIPFIRE_TINYSTATE_SEED:-42}"
 HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 
-ALL_FAMILIES=(llama qwen2 gemma3 minimax qwen3_5 qwen3_5_moe)
+ALL_FAMILIES=(llama qwen2 dots_ocr deepseek4 deepseek4_compressed deepseek4_mtp gemma3 gemma3_vl gemma4_dense gemma4_ple gemma4_moe minimax lfm2_moe mamba2 qwen3_5 qwen3_5_vl qwen3_5_moe)
 families=("${ALL_FAMILIES[@]}")
 if [ -n "${HIPFIRE_TINYQUANT_FAMILIES:-}" ]; then
     IFS=',' read -r -a families <<<"$HIPFIRE_TINYQUANT_FAMILIES"
@@ -39,8 +39,9 @@ fi
 anchor_for() {
     case "$1" in
         llama) echo q8f16 ;;
-        minimax) echo mq6 ;;
-        qwen2 | gemma3 | qwen3_5 | qwen3_5_moe) echo fp16 ;;
+        deepseek4 | deepseek4_compressed | deepseek4_mtp) echo deepseek4-source-precision ;;
+        minimax | lfm2_moe) echo mq6 ;;
+        qwen2 | dots_ocr | gemma3 | gemma3_vl | gemma4_dense | gemma4_ple | gemma4_moe | mamba2 | qwen3_5 | qwen3_5_vl | qwen3_5_moe) echo fp16 ;;
         *) return 1 ;;
     esac
 }
@@ -90,6 +91,12 @@ for raw_family in "${families[@]}"; do
     fi
     extra=()
     [ "$family" = "qwen2" ] && extra=(--arch-id 7)
+    case "$family" in
+        dots_ocr) extra=(--include-vision --vision-quant hfq4) ;;
+        gemma3_vl) extra=(--include-vision --vision-quant q8f16) ;;
+        qwen3_5_vl) extra=(--include-vision --vision-quant hfq4) ;;
+        deepseek4*) extra=(--allow-mq2-lloyd) ;;
+    esac
     if ! "$Q" --input "$hf_dir" --output "$hfq" --format "$fmt" "${extra[@]}" >/dev/null 2>&1; then
         echo "  SKIP $fmt: quantize unsupported"
         skip=$((skip + 1))
@@ -133,12 +140,22 @@ for raw_family in "${families[@]}"; do
 done
 
 if [ "$RECORD" = 1 ]; then
+    tmp_base="$(mktemp)"
     {
         echo "# tiny-state AR hash baselines — gpu_arch family format logit_hash token_hash rel_tol"
         echo "# len=$LEN prompt_len=$PROMPT_LEN seed=$SEED"
+    } >"$tmp_base"
+    {
+        if [ -f "$BASELINES" ]; then
+            awk 'NR==FNR { key[$1" "$2" "$3]=1; next }
+                 /^#/ { next }
+                 !(($1" "$2" "$3) in key) { print }' \
+                <(printf '%s\n' "${RECORDED[@]}") "$BASELINES"
+        fi
         printf '%s\n' "${RECORDED[@]}"
-    } >"$BASELINES"
-    echo "tiny-state-gate: wrote ${#RECORDED[@]} baselines to $BASELINES"
+    } | sort -k1,3 >>"$tmp_base"
+    mv "$tmp_base" "$BASELINES"
+    echo "tiny-state-gate: merged ${#RECORDED[@]} baseline(s) into $BASELINES"
     exit 0
 fi
 if [ "$fail" -gt 0 ]; then

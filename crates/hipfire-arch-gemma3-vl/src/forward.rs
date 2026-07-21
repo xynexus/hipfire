@@ -205,7 +205,7 @@ pub fn vision_forward(
                 .ok()
                 .as_deref()
                 != Some("1");
-        if use_wmma {
+        if use_wmma && n >= 32 {
             let hdp = 128usize;
             let q_pad = gpu.alloc_owned(&[n * num_heads * hdp], DType::F32)?;
             let k_pad = gpu.alloc_owned(&[n * num_heads * hdp], DType::F16)?;

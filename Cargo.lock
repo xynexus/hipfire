@@ -1311,6 +1311,7 @@ name = "hipfire-arch-deepseek4-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -1331,6 +1332,7 @@ name = "hipfire-arch-dots-ocr-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -1448,6 +1450,7 @@ name = "hipfire-arch-lfm2moe-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -2273,6 +2276,7 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-arch-zaya",
  "hipfire-archs",
+ "hipfire-dispatch",
  "hipfire-evidence",
  "hipfire-generate",
  "hipfire-media",

@@ -57,8 +57,8 @@ struct FamilyPlan {
 }
 
 /// The validated matrix. Anchors/candidates are bounded by each arch loader's
-/// supported quant_types (qwen2/gemma3: F16/Q8/HFQ4; minimax MoE kernels need
-/// MQ4/MQ6 experts so its anchor is mq6; qwen3.5 is the broad arch).
+/// supported quant_types (qwen2/gemma3: F16/Q8/HFQ4; minimax/LFM2 MoE kernels
+/// need MQ4/MQ6 experts so their anchors are mq6; qwen3.5 is the broad arch).
 fn families() -> &'static [FamilyPlan] {
     &[
         // LLaMA/Mistral (arch 0): simplest dense family — no bias, no QK-norm.
@@ -79,6 +79,48 @@ fn families() -> &'static [FamilyPlan] {
             quant_flags: &["--arch-id", "7"],
             calibrated: &[],
         },
+        // dots.ocr coverage through the arch-8 loader. The fixture is a complete
+        // Qwen2 text + Dots vision tower artifact; the tiny harness runs
+        // deterministic synthetic image preprocessing, vision_forward, and
+        // image-token embed splicing before continuing the tokenizer-free Qwen2
+        // decoder stream. Vision load currently supports F16/F32/HFQ4 sources,
+        // so q8f16 is intentionally excluded.
+        FamilyPlan {
+            arch: "dots_ocr",
+            anchor: "fp16",
+            candidates: &["hfq4"],
+            quant_flags: &["--include-vision", "--vision-quant", "hfq4"],
+            calibrated: &[],
+        },
+        // DeepSeek4 text-core coverage: Q/O-LoRA, Hyper-Connections,
+        // score-routed MoE, shared experts, and native MQ2-Lloyd routed expert
+        // kernels. The default tiny fixture keeps compressed-KV/indexer and MTP
+        // disabled; those need separate variant gates.
+        FamilyPlan {
+            arch: "deepseek4",
+            anchor: "deepseek4-source-precision",
+            candidates: &["deepseek4-source-precision"],
+            quant_flags: &["--allow-mq2-lloyd"],
+            calibrated: &[],
+        },
+        // DeepSeek4 compressed-KV/indexer coverage: one tiny ratio-4 layer
+        // exercises compressor streams, indexer projections, and mixed attention.
+        FamilyPlan {
+            arch: "deepseek4_compressed",
+            anchor: "deepseek4-source-precision",
+            candidates: &["deepseek4-source-precision"],
+            quant_flags: &["--allow-mq2-lloyd"],
+            calibrated: &[],
+        },
+        // DeepSeek4 MTP coverage: one main layer seeds `mtp_last_hidden`, then
+        // the tiny probe returns logits from the draft MTP layer itself.
+        FamilyPlan {
+            arch: "deepseek4_mtp",
+            anchor: "deepseek4-source-precision",
+            candidates: &["deepseek4-source-precision"],
+            quant_flags: &["--allow-mq2-lloyd"],
+            calibrated: &[],
+        },
         FamilyPlan {
             arch: "gemma3",
             anchor: "fp16",
@@ -86,10 +128,68 @@ fn families() -> &'static [FamilyPlan] {
             quant_flags: &[],
             calibrated: &["oq4++"],
         },
+        // Gemma3-VL multimodal coverage. The fixture is a complete multimodal
+        // artifact (language_model + SigLIP + projector); the tiny harness
+        // decodes a deterministic synthetic PNG, runs preprocessing,
+        // vision_forward, projector, and image-token embed splicing before the
+        // tokenizer-free Gemma3 decoder stream. Vision load supports Q8F16/Oq8
+        // but not HFQ4, so keep vision tensors at q8f16 while the text candidate
+        // may still be hfq4.
+        FamilyPlan {
+            arch: "gemma3_vl",
+            anchor: "fp16",
+            candidates: &["q8f16", "hfq4"],
+            quant_flags: &["--include-vision", "--vision-quant", "q8f16"],
+            calibrated: &[],
+        },
+        // Gemma 4 dense text coverage.
+        FamilyPlan {
+            arch: "gemma4_dense",
+            anchor: "fp16",
+            candidates: &["q8f16", "hfq4"],
+            quant_flags: &[],
+            calibrated: &[],
+        },
+        // Gemma 4 PLE/KV-sharing coverage. The runtime intentionally routes
+        // PLE and shared-KV layers through the reference forward path while the
+        // dense-only fixture uses the lowered path.
+        FamilyPlan {
+            arch: "gemma4_ple",
+            anchor: "fp16",
+            candidates: &["q8f16", "hfq4"],
+            quant_flags: &[],
+            calibrated: &[],
+        },
+        // Gemma 4 dense-MoE coverage. Routed experts run through the reference
+        // path while the dense-only fixture uses the lowered path.
+        FamilyPlan {
+            arch: "gemma4_moe",
+            anchor: "fp16",
+            candidates: &["q8f16", "hfq4"],
+            quant_flags: &[],
+            calibrated: &[],
+        },
         FamilyPlan {
             arch: "minimax",
             anchor: "mq6",
             candidates: &["mq4"],
+            quant_flags: &[],
+            calibrated: &[],
+        },
+        FamilyPlan {
+            arch: "lfm2_moe",
+            anchor: "mq6",
+            candidates: &["mq4"],
+            quant_flags: &[],
+            calibrated: &[],
+        },
+        // Pure Mamba2 (arch 15): recurrent SSM state + State Spaces tensor
+        // naming, loaded through the Mamba-capable Nemotron backend. Keep this
+        // small but present so Mamba2 no longer relies only on fixture ingest.
+        FamilyPlan {
+            arch: "mamba2",
+            anchor: "fp16",
+            candidates: &["q8f16"],
             quant_flags: &[],
             calibrated: &[],
         },
@@ -101,6 +201,16 @@ fn families() -> &'static [FamilyPlan] {
             // qtip3-sim is the runtime format that consumes our HFQM Hessian
             // (LDLQ); emits bf16, which only the qwen3.5 loader accepts.
             calibrated: &["qtip3-sim"],
+        },
+        // Qwen3.5-VL: composite text_config + vision_config artifact. The
+        // tiny harness runs one synthetic vision forward and splices the visual
+        // embedding into the Qwen35 text decoder with forward_scratch_embed.
+        FamilyPlan {
+            arch: "qwen3_5_vl",
+            anchor: "fp16",
+            candidates: &["q8f16", "hfq4"],
+            quant_flags: &["--include-vision", "--vision-quant", "hfq4"],
+            calibrated: &[],
         },
         // MoE path coverage: 3D-stacked expert quant + per-expert decode loop +
         // 99-tensor collect (dense attn + router captured; routed experts are

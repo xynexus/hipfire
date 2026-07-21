@@ -91,12 +91,28 @@ add_family() {
     esac
 }
 
+add_uncovered() {
+    UNCOVERED=1
+    UNCOVERED_REASONS="${UNCOVERED_REASONS}${UNCOVERED_REASONS:+, }$1"
+}
+
 add_all_supported() {
     add_family llama
     add_family qwen2
+    add_family dots_ocr
+    add_family deepseek4
+    add_family deepseek4_compressed
+    add_family deepseek4_mtp
     add_family gemma3
+    add_family gemma3_vl
+    add_family gemma4_dense
+    add_family gemma4_ple
+    add_family gemma4_moe
     add_family minimax
+    add_family lfm2_moe
+    add_family mamba2
     add_family qwen3_5
+    add_family qwen3_5_vl
     add_family qwen3_5_moe
 }
 
@@ -161,24 +177,55 @@ while IFS= read -r path; do
             add_family qwen2
             select_all_tiny
             ;;
+        crates/hipfire-arch-qwen35-vl/*)
+            add_family qwen3_5_vl
+            select_all_tiny
+            ;;
+        crates/hipfire-arch-dots-ocr/*|crates/hipfire-arch-dots-ocr-spec/*|*dots_ocr*.rs|*dots-ocr*.rs)
+            add_family dots_ocr
+            select_all_tiny
+            ;;
+        crates/hipfire-arch-deepseek4/*|*deepseek4*.rs)
+            add_family deepseek4
+            add_family deepseek4_compressed
+            add_family deepseek4_mtp
+            select_all_tiny
+            ;;
         crates/hipfire-arch-gemma3/*|*gemma3*.rs)
             add_family gemma3
+            add_family gemma3_vl
+            select_all_tiny
+            ;;
+        crates/hipfire-arch-gemma3-vl/*|crates/hipfire-arch-gemma3-vl-spec/*)
+            add_family gemma3_vl
+            select_all_tiny
+            ;;
+        crates/hipfire-arch-gemma4/*|*gemma4*.rs)
+            add_family gemma4_dense
+            add_family gemma4_ple
+            add_family gemma4_moe
             select_all_tiny
             ;;
         crates/hipfire-arch-minimax/*|*minimax*.rs)
             add_family minimax
             select_all_tiny
             ;;
+        crates/hipfire-arch-lfm2moe/*|*lfm2moe*.rs|*lfm2*.rs)
+            add_family lfm2_moe
+            select_all_tiny
+            ;;
+        *mamba2*.rs)
+            add_family mamba2
+            select_all_tiny
+            ;;
         crates/hipfire-arch-qwen35/*|crates/hipfire-serving-core/src/qwen35_*|*qwen35*.rs|*qwen3*.rs)
             add_family qwen3_5
+            add_family qwen3_5_vl
             add_family qwen3_5_moe
             select_all_tiny
             ;;
 
-        crates/hipfire-arch-deepseek4/*|*deepseek4*.rs|\
-        crates/hipfire-arch-lfm2moe/*|*lfm2moe*.rs|\
-        crates/hipfire-arch-dots-ocr/*|crates/hipfire-arch-gemma3-vl/*|\
-        crates/hipfire-arch-qwen35-vl/*|*vl*.rs)
+        crates/hipfire-arch-nemotron/*|*nemotron*.rs|*vl*.rs)
             UNCOVERED=1
             UNCOVERED_REASONS="${UNCOVERED_REASONS}${UNCOVERED_REASONS:+, }$path"
             ;;
@@ -205,14 +252,13 @@ done <<<"$PATHS"
 
 FAMILIES="$(printf '%s\n' $FAMILIES | sort -u | paste -sd, -)"
 
-if [ "$UNCOVERED" -eq 1 ]; then
-    echo "tiny-affected-gate: changed paths include tiny-uncovered families/features:"
-    echo "  $UNCOVERED_REASONS"
-    echo "tiny-affected-gate: INCONCLUSIVE -> run large gate suite"
-    exit 3
-fi
-
 if [ -z "$FAMILIES" ]; then
+    if [ "$UNCOVERED" -eq 1 ]; then
+        echo "tiny-affected-gate: changed paths include tiny-uncovered families/features:"
+        echo "  $UNCOVERED_REASONS"
+        echo "tiny-affected-gate: INCONCLUSIVE -> run large gate suite"
+        exit 3
+    fi
     if [ "$REQUIRE_COVERAGE" -eq 1 ]; then
         echo "tiny-affected-gate: no tiny coverage selected for changed paths"
         echo "tiny-affected-gate: INCONCLUSIVE -> run large gate suite"
@@ -225,8 +271,16 @@ fi
 
 echo "tiny-affected-gate: selected families: $FAMILIES"
 echo "tiny-affected-gate: selected gates: quant=$RUN_QUANT state=$RUN_STATE spec=$RUN_SPEC"
+if [ "$UNCOVERED" -eq 1 ]; then
+    echo "tiny-affected-gate: changed paths include tiny-uncovered families/features:"
+    echo "  $UNCOVERED_REASONS"
+    echo "tiny-affected-gate: covered tiny gates will run, then caller should run large gate suite"
+fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
+    if [ "$UNCOVERED" -eq 1 ]; then
+        exit 3
+    fi
     exit 0
 fi
 
@@ -239,5 +293,9 @@ if [ "$status" -eq 0 ] && [ "$RUN_STATE" -eq 1 ]; then
 fi
 if [ "$status" -eq 0 ] && [ "$RUN_SPEC" -eq 1 ]; then
     ./tests/tiny-spec-gate.sh || status=$?
+fi
+if [ "$status" -eq 0 ] && [ "$UNCOVERED" -eq 1 ]; then
+    echo "tiny-affected-gate: INCONCLUSIVE -> run large gate suite"
+    exit 3
 fi
 exit "$status"

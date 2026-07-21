@@ -177,6 +177,10 @@ impl Qwen35Tiny {
         }
     }
 
+    fn vl_preset() -> Self {
+        Self::preset()
+    }
+
     fn is_moe(&self) -> bool {
         self.experts > 0
     }
@@ -414,6 +418,164 @@ impl Qwen35Tiny {
         }
         t
     }
+
+    fn vl_config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["Qwen3_5VLForConditionalGeneration"],
+            "model_type": "qwen3_5_text",
+            "text_config": self.config_json(),
+            "vision_config": {
+                "hidden_size": self.hidden,
+                "num_heads": self.n_heads,
+                "depth": 1,
+                "intermediate_size": self.inter,
+                "patch_size": 4,
+                "temporal_patch_size": 1,
+                "out_hidden_size": self.hidden,
+                "spatial_merge_size": 2,
+                "num_position_embeddings": 4,
+                "rope_theta": 10000.0,
+            },
+            "image_token_id": 101,
+            "video_token_id": 102,
+            "vision_start_token_id": 103,
+            "vision_end_token_id": 104,
+            "_comment": "hipfire tiny random-init Qwen3.5-VL gating fixture - not a real model",
+        })
+    }
+
+    fn vl_manifest(&self) -> Vec<TensorSpec> {
+        let mut t = self
+            .manifest()
+            .into_iter()
+            .map(|mut spec| {
+                if let Some(rest) = spec.name.strip_prefix("model.") {
+                    spec.name = format!("model.language_model.{rest}");
+                }
+                spec
+            })
+            .collect::<Vec<_>>();
+
+        let h = self.hidden;
+        let patch = 4usize;
+        let temporal = 1usize;
+        let patch_dim = 3 * temporal * patch * patch;
+        let mlp = self.inter;
+        let merge_dim = h * 4;
+        let p = "model.visual";
+
+        t.push(TensorSpec::f16(
+            format!("{p}.patch_embed.proj.weight"),
+            vec![h, patch_dim],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            format!("{p}.patch_embed.proj.bias"),
+            vec![h],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{p}.pos_embed.weight"),
+            vec![4, h],
+            Init::Uniform(0.01),
+        ));
+
+        let b = format!("{p}.blocks.0");
+        t.push(TensorSpec::f16(
+            format!("{b}.norm1.weight"),
+            vec![h],
+            Init::NormOnes,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.norm1.bias"),
+            vec![h],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.attn.qkv.weight"),
+            vec![3 * h, h],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.attn.qkv.bias"),
+            vec![3 * h],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.attn.proj.weight"),
+            vec![h, h],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.attn.proj.bias"),
+            vec![h],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.norm2.weight"),
+            vec![h],
+            Init::NormOnes,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.norm2.bias"),
+            vec![h],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.mlp.linear_fc1.weight"),
+            vec![mlp, h],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.mlp.linear_fc1.bias"),
+            vec![mlp],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.mlp.linear_fc2.weight"),
+            vec![h, mlp],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.mlp.linear_fc2.bias"),
+            vec![h],
+            Init::Zeros,
+        ));
+
+        let m = format!("{p}.merger");
+        t.push(TensorSpec::f16(
+            format!("{m}.norm.weight"),
+            vec![h],
+            Init::NormOnes,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{m}.norm.bias"),
+            vec![h],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{m}.linear_fc1.weight"),
+            vec![merge_dim, merge_dim],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            format!("{m}.linear_fc1.bias"),
+            vec![merge_dim],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{m}.linear_fc2.weight"),
+            vec![h, merge_dim],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            format!("{m}.linear_fc2.bias"),
+            vec![h],
+            Init::Zeros,
+        ));
+
+        t
+    }
 }
 
 impl ToyModel for Qwen35Spec {
@@ -424,6 +586,35 @@ impl ToyModel for Qwen35Spec {
                 .expect("serialize qwen3.5 dense toy config"),
             tensors: m.manifest(),
         }
+    }
+
+    fn fixture_names(&self) -> &'static [&'static str] {
+        &["text-core", "vl"]
+    }
+
+    fn fixture_named(&self, name: &str, _seed: u64) -> Option<ToyFixture> {
+        let m = match name {
+            "default" | "text-core" => Qwen35Tiny::preset(),
+            "vl" | "vision-language" => Qwen35Tiny::vl_preset(),
+            _ => return None,
+        };
+        let (config_json, tensors) = if matches!(name, "vl" | "vision-language") {
+            (
+                serde_json::to_string_pretty(&m.vl_config_json())
+                    .expect("serialize qwen3.5-vl toy config"),
+                m.vl_manifest(),
+            )
+        } else {
+            (
+                serde_json::to_string_pretty(&m.config_json())
+                    .expect("serialize qwen3.5 dense toy config"),
+                m.manifest(),
+            )
+        };
+        Some(ToyFixture {
+            config_json,
+            tensors,
+        })
     }
 }
 
@@ -499,6 +690,35 @@ mod tests {
         let f = Qwen35Spec.fixture(0);
         assert!(!f.tensors.is_empty(), "dense fixture must emit tensors");
         assert!(f.config_json.contains("\"model_type\": \"qwen3_5_text\""));
+    }
+
+    #[test]
+    fn vl_toy_fixture_populated() {
+        let f = Qwen35Spec.fixture_named("vl", 0).expect("vl fixture");
+        assert!(
+            f.config_json.contains("\"vision_config\""),
+            "VL fixture must carry vision_config"
+        );
+        let has = |suf: &str| f.tensors.iter().any(|s| s.name.ends_with(suf));
+        assert!(
+            has("model.language_model.embed_tokens.weight"),
+            "text decoder must be nested under model.language_model"
+        );
+        assert!(
+            has("model.visual.patch_embed.proj.weight"),
+            "vision patch embed"
+        );
+        assert!(has("model.visual.blocks.0.attn.qkv.weight"), "vision qkv");
+        assert!(
+            has("model.visual.merger.linear_fc2.weight"),
+            "vision merger"
+        );
+        let n_params: usize = f
+            .tensors
+            .iter()
+            .map(|s| s.shape.iter().product::<usize>())
+            .sum();
+        assert!(n_params < 10_000_000, "VL fixture must stay <10M params");
     }
 
     #[test]

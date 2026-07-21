@@ -34,15 +34,15 @@ void indexer_relu_score_f32_buf(
         if (tid == 0) scores[n] = -1e30f;
         return;
     }
-    if (tid >= H) return;
-
-    const float* qh = q + tid * D;
-    const float* kt = k_cache + n * D;
     float dot = 0.0f;
-    for (int d = 0; d < D; ++d) {
-        dot += qh[d] * kt[d];
+    if (tid < H) {
+        const float* qh = q + tid * D;
+        const float* kt = k_cache + n * D;
+        for (int d = 0; d < D; ++d) {
+            dot += qh[d] * kt[d];
+        }
     }
-    float v = (dot > 0.0f ? dot : 0.0f) * weights[tid];
+    float v = (tid < H) ? (dot > 0.0f ? dot : 0.0f) * weights[tid] : 0.0f;
 
     __shared__ float reduce[MAX_HEADS];
     reduce[tid] = v;

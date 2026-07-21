@@ -181,7 +181,7 @@ impl<'a> TransformerLoader<'a> {
         Self { hfq, family }
     }
 
-    fn required_data(&self, name: &str, shape: &[usize]) -> (&HfqTensorInfo, Vec<u8>) {
+    pub fn required_data(&self, name: &str, shape: &[usize]) -> (&HfqTensorInfo, Vec<u8>) {
         validate_required_info(self.hfq.find_tensor_info(name), name, shape)
             .unwrap_or_else(|error| panic!("{}: {error}", self.family));
         self.hfq
