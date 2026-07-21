@@ -214,14 +214,29 @@ Do **not** run the Qwen3.5 target's own MTP head *and* a block drafter as one
 proposer — DSpark replaces MTP, doesn't stack on it ([[deepspec-notes]],
 [[dspark-notes]]).
 
-## 9. Streaming-MoE economics & the #1 measurement
+## 9. Streaming-MoE economics & the #1 measurement — MEASURED (task #40)
 
 Throughput ≈ `accepted_tokens_per_pass ÷ verify_pass_time`, verify_pass_time set by
 streaming the activated expert set once. The single measurement that governs the
 whole design: **`distinct_experts(B)` — how the activated expert set grows with
-tree width B on the 397B (512 experts, 10 active/token).** It bounds the optimal
-tree size and is what every H200 paper leaves untested. Measure it before building
-the BASTION cost model or committing to a tree width.
+tree width B.**
+
+**Measured (task #40, `86d4703cd`, `benchmarks/results/distinct-experts-vs-tree-width-20260721.md`)** — exact router-argtopk capture on a Wikipedia corpus, decomposed into DEPTH (B consecutive positions) vs WIDTH (B sibling next-token candidates at one prefix), on LFM2.5-8B-A1B (E=32,k=4, nix1) and **Qwen3.6-35B-A3B (E=256,k=8 — same `Qwen3_5Moe` family as the 397B)**:
+
+| B | LFM depth/width | 35B depth/width (%E) |
+|---|---|---|
+| 8 | 41% / 34% | 13% / 11% |
+| 32 | 67% / 53% | 31% / 22% |
+| 64 | 75% / 61% | 43% / 29% |
+| 256 | 86% / 73% | 65% / 43% |
+
+Ordering at every B: **width < depth < random-empirical < analytic-uniform.**
+
+**Verdict: WIDE-OVER-DEEP, and width is materially cheaper — but not free.** Same-prefix branches route alike, so width adds experts at only **~0.6–0.7× the rate of an extra depth position** (width/depth ratio 0.87 at E=32 → 0.66 at E=256 — the advantage *grows* with the expert pool). The strong "width ≈ depth-bounded / free" hypothesis is **refuted**: width still grows with B, just sub-linearly and slower than depth.
+
+**397B implication (extrapolated via the 35B discounts — conservative):** at B=64, width touches ~24% of the 512 experts, depth ~35%; at B=128, ~34% / ~51%. **Free tree-width budget ≈ up to ~64 nodes** touches only ¼–⅓ of the pool per verify — so the §11 "wide trees stream most of the 397B" risk is **NOT realized**. Prefer bushy (wide, shallow) trees.
+
+**Consequences:** the BASTION cost model must price width at a real **~0.6–0.7× depth marginal rate (not zero)**, plus the always-on shared expert and the diffuse-layer tail (per-layer max ≫ mean). Residuals: the 35B run was **first-20-of-40 layers** (halo APU memory; aggregate is first-half, flagged), medusa was unreachable so the **real 397B run is unclosed**, and the full-stack DFlash→DDTree→verify tree number awaits the masked-SDPA verify path (§5).
 
 ## 10. Phased implementation (smallest-first; each verifiable)
 
@@ -241,9 +256,10 @@ the BASTION cost model or committing to a tree width.
 
 ## 11. Risks & open questions
 
-- **`distinct_experts(B)` is unmeasured and load-bearing** — if the expert set
-  grows fast, wide trees stream most of the 397B per cycle and the tree's advantage
-  shrinks. §9 measurement gates everything downstream.
+- ~~**`distinct_experts(B)` is unmeasured and load-bearing.**~~ **MEASURED (task
+  #40) — risk NOT realized.** Wide-over-deep: ~64-node trees touch only ¼–⅓ of the
+  512-expert pool (§9). Residual: extrapolated from the 35B proxy (first-20-of-40
+  layers) — the real 397B run on medusa is still unclosed (medusa was unreachable).
 - **Masked-SDPA tree verify on the target GPU** is a new kernel on gfx906
   (medusa) / gfx1151 (halo); FlashAttention can't do the mask.
 - **BASTION cost model is dense-only** — must be rewritten for MoE streaming, or the
