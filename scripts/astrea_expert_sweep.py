@@ -515,6 +515,64 @@ def _preserve_set(record: dict) -> tuple[tuple[int, int], ...]:
     return tuple(sorted(result))
 
 
+def _statistic_stability(
+    record: dict,
+    variant: dict,
+    reference_variant: dict,
+) -> tuple[float, str]:
+    report = record.get("statistic_stability_report")
+    if not isinstance(report, dict):
+        raise ValueError(
+            f"expert sweep result {record.get('id')!r} has no statistic_stability_report"
+        )
+    if report.get("schema") != "hipfire.calibration_expert_statistic_stability.v1":
+        raise ValueError(
+            f"expert sweep result {record.get('id')!r} has an unsupported stability report"
+        )
+    required_true = (
+        "valid",
+        "provenance_complete",
+        "fallback_set_match",
+        "capture_target_order_valid",
+    )
+    if any(report.get(field) is not True for field in required_true):
+        raise ValueError(
+            f"expert sweep result {record.get('id')!r} stability report is not valid"
+        )
+    if report.get("reference") != reference_variant["calibration_artifact"]:
+        raise ValueError(
+            f"expert sweep result {record.get('id')!r} stability reference does not match the plan"
+        )
+    if report.get("candidate") != variant["calibration_artifact"]:
+        raise ValueError(
+            f"expert sweep result {record.get('id')!r} stability candidate does not match the plan"
+        )
+    if report.get("reference_capture_target") != reference_variant["expert_capture_target"]:
+        raise ValueError(
+            f"expert sweep result {record.get('id')!r} stability reference target does not match the plan"
+        )
+    if report.get("candidate_capture_target") != variant["expert_capture_target"]:
+        raise ValueError(
+            f"expert sweep result {record.get('id')!r} stability candidate target does not match the plan"
+        )
+    tensor_count = report.get("compared_expert_tensors")
+    value_count = report.get("compared_values")
+    if (
+        isinstance(tensor_count, bool)
+        or not isinstance(tensor_count, int)
+        or tensor_count < 1
+        or isinstance(value_count, bool)
+        or not isinstance(value_count, int)
+        or value_count < 1
+        or report.get("non_finite_values") != 0
+    ):
+        raise ValueError(
+            f"expert sweep result {record.get('id')!r} stability report has no finite expert statistics"
+        )
+    metric = _finite_metric(report, "relative_l2_error")
+    return metric, _fingerprint(report)
+
+
 def build_results(plan: dict, variant_records: list[dict]) -> dict:
     """Normalize complete measured rows into a fingerprinted sweep result set."""
 
@@ -541,6 +599,11 @@ def build_results(plan: dict, variant_records: list[dict]) -> dict:
 
     normalized = []
     capture_axis = plan.get("axis") == "expert_capture_target"
+    stability_reference = (
+        max(expected_variants, key=lambda variant: variant["expert_capture_target"])
+        if capture_axis
+        else None
+    )
     for variant in expected_variants:
         record = records_by_id[variant["id"]]
         artifact_size = record.get("artifact_size_bytes")
@@ -564,7 +627,14 @@ def build_results(plan: dict, variant_records: list[dict]) -> dict:
             ],
         }
         if capture_axis:
-            row["statistic_stability"] = _finite_metric(record, "statistic_stability")
+            stability, report_fingerprint = _statistic_stability(
+                record,
+                variant,
+                stability_reference,
+            )
+            row["statistic_stability"] = stability
+            row["statistic_stability_report_fingerprint"] = report_fingerprint
+            row["statistic_stability_report"] = record["statistic_stability_report"]
         normalized.append(row)
 
     body = {

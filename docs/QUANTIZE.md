@@ -472,9 +472,27 @@ After all variants finish, create one measured JSON record per variant. Every
 record must contain `id`, finite `mean_kld` and `ppl`,
 `artifact_size_bytes`, cumulative `calibration_seconds`,
 `reduction_launches`, and the calibration audit's exact
-`preserve_high_precision` list. Capture-target records also require a finite
-`statistic_stability` value. Normalize the complete set and analyze it against
-the frozen plan:
+`preserve_high_precision` list. Capture-target records additionally embed a
+`statistic_stability_report` produced for their calibration artifact against
+the highest-cap artifact:
+
+```bash
+target/release/hipfire-coexistence artifact compare-calibration-stability \
+  --reference <highest-cap.calib.hfq> \
+  --candidate <this-variant.calib.hfq> \
+  > <this-variant.stability.json>
+```
+
+The comparison reads only routed-expert `.imatrix` tensors. It requires the
+same family, source, corpus, sample set, microbatch geometry, eligibility floor,
+tile/sampling policy, required fraction, coverage policy, and exact
+high-precision fallback set. The reference capture target must be at least the
+candidate target, every value must be finite, and both artifacts must contain
+the same expert-statistic tensor set. `relative_l2_error` is the symmetric
+normalized L2 distance over all expert statistics; the report also records the
+worst per-tensor value. Embed the complete report object in the variant record,
+not a hand-entered scalar. Then normalize the complete set and analyze it
+against the frozen plan:
 
 ```bash
 python3 scripts/astrea.py expert-sweep-results \

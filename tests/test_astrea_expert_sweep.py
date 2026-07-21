@@ -84,6 +84,25 @@ def write_hfq_fixture(path: Path, control: bytes = b'{"quantization_hash":"fixtu
     return path
 
 
+def stability_report(plan, variant, relative_l2_error):
+    reference = max(plan["variants"], key=lambda item: item["expert_capture_target"])
+    return {
+        "schema": "hipfire.calibration_expert_statistic_stability.v1",
+        "reference": reference["calibration_artifact"],
+        "candidate": variant["calibration_artifact"],
+        "provenance_complete": True,
+        "fallback_set_match": True,
+        "capture_target_order_valid": True,
+        "reference_capture_target": reference["expert_capture_target"],
+        "candidate_capture_target": variant["expert_capture_target"],
+        "compared_expert_tensors": 4,
+        "compared_values": 16,
+        "non_finite_values": 0,
+        "relative_l2_error": relative_l2_error,
+        "valid": True,
+    }
+
+
 def test_floor_sweep_freezes_one_axis_and_heldout_commands(tmp_path):
     sweep = load_module()
     plan = sweep.build_plan(
@@ -294,11 +313,20 @@ def test_capture_sweep_analysis_requires_statistic_stability(tmp_path):
         sweep.build_results(plan, records)
 
     for index, record in enumerate(records):
-        record["statistic_stability"] = 0.01 / (index + 1)
+        record["statistic_stability_report"] = stability_report(
+            plan,
+            plan["variants"][index],
+            0.01 / (index + 1),
+        )
     analysis = sweep.analyze_results(plan, sweep.build_results(plan, records))
     assert analysis["axis"] == "expert_capture_target"
     assert analysis["low_traffic_cohorts"] == []
     assert analysis["variants"][0]["statistic_stability"] == pytest.approx(0.01)
+    assert analysis["variants"][0]["statistic_stability_report_fingerprint"].startswith("sha256:")
+
+    records[0]["statistic_stability_report"]["candidate"] = "wrong.calib.hfq"
+    with pytest.raises(ValueError, match="stability candidate"):
+        sweep.build_results(plan, records)
 
 
 def test_sweep_rejects_contaminated_or_nonisolated_experiments(tmp_path):

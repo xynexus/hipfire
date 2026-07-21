@@ -57,6 +57,9 @@ Implemented and verified in this checkout:
   before any model load; a fingerprinted result builder rejects incomplete or
   non-finite variant rows, and the analyzer reports quality/cost deltas plus
   newly low-bit expert cohorts while leaving the selection threshold explicit;
+  capture-target statistic stability is derived rather than asserted by a
+  family-neutral artifact comparator over every routed-expert imatrix, with
+  matched source/corpus/sample/geometry/floor policy and fallback-set gates;
 - durable per-layer phase timing for source load/upload, teacher execution,
   capture serialization, collector finalization, and part sync/hash, persisted
   in checkpoints and the completed artifact for resume-safe ETA analysis;
@@ -1393,8 +1396,9 @@ contract, not KLD/PPL or expert-floor selection evidence. The implemented
 `expert-sweep-results` and `expert-sweep-analyze` commands can only report
 `complete_selection_required`: they require the complete frozen variant set,
 finite KLD/PPL and cost rows, exact fallback sets, monotonic minimum-floor
-cohorts, and capture-sweep statistic stability, but do not invent an admission
-threshold. The controlled sweep itself remains pending.
+cohorts, and a valid fingerprinted capture-sweep statistic-stability report,
+but do not invent an admission threshold. The controlled sweep itself remains
+pending.
 
 ## Performance methodology
 

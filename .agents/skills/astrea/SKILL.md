@@ -99,11 +99,16 @@ empty.
    variant to `expert-sweep-results`, then run `expert-sweep-analyze`. The result
    builder requires finite KLD/PPL, artifact size, calibration time, reduction
    launches, and the exact high-precision fallback set; capture-target sweeps
-   additionally require statistic stability. The analyzer verifies the frozen
-   plan again, rejects non-monotonic floor fallback sets or capture-sweep
-   fallback drift, and reports quality/cost deltas plus newly low-bit expert
-   cohorts. Its `complete_selection_required` status is deliberately not an
-   automatic threshold or promotion decision.
+   additionally require a valid `hipfire-coexistence artifact
+   compare-calibration-stability` report against the highest-cap artifact. That
+   family-neutral comparison derives a symmetric relative L2 error from every
+   routed-expert imatrix, requires matched corpus/sample/source/geometry/floor,
+   identical fallback sets, finite values, and the expected target ordering.
+   The analyzer verifies the frozen plan again, rejects non-monotonic floor
+   fallback sets or capture-sweep fallback drift, and reports quality/cost
+   deltas plus newly low-bit expert cohorts. Its
+   `complete_selection_required` status is deliberately not an automatic
+   threshold or promotion decision.
 9. Run `policy` when you want an Unsloth-like dynamic quant policy. It ranks
    tensors by sensitivity per added byte and emits a mixed-format promotion
    recipe under a size budget. Use `--objective moe-probe` for MoE models and

@@ -38,6 +38,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Some("artifact"), Some("compare-calibration")) => {
             hipfire_coexistence::calibration_compare::run_cli(&args[2..])
         }
+        (Some("artifact"), Some("compare-calibration-stability")) => {
+            hipfire_coexistence::calibration_compare::run_stability_cli(&args[2..])
+        }
         (Some("artifact"), Some("compare-residuals")) => {
             hipfire_coexistence::residual_compare::run_cli(&args[2..])
         }
@@ -72,6 +75,8 @@ fn usage() {
          artifact compare-calibration --reference <resident.calib.hfq> \
          --candidate <streamed.calib.hfq> [--atol F] [--rtol F] \
          [--max-reports N] [--allow-unproven-provenance]\n\
+         artifact compare-calibration-stability --reference <higher-cap.calib.hfq> \
+         --candidate <lower-cap.calib.hfq>\n\
          artifact compare-residuals --reference <resident.residuals.hfq> \
          --candidate <streamed.residuals.hfq> [--atol F] [--rtol F] \
          [--max-reports N]\n\

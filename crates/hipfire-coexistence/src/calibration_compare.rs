@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 const F32_QUANT_TYPE: u8 = 2;
 const COMPACT_HESSIAN_QUANT_TYPE: u8 = 130;
+const STABILITY_SCHEMA: &str = "hipfire.calibration_expert_statistic_stability.v1";
 
 #[derive(Debug, Clone, Copy)]
 pub struct CalibrationCompareOptions {
@@ -120,6 +121,31 @@ pub struct CalibrationComparisonReport {
     pub tensor_mismatches: Vec<TensorMismatch>,
     pub reports_truncated: bool,
     pub ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CalibrationStabilityReport {
+    pub schema: &'static str,
+    pub reference: String,
+    pub candidate: String,
+    pub provenance_complete: bool,
+    pub metadata_checks: Vec<MetadataCheck>,
+    pub fallback_set_match: bool,
+    pub capture_target_order_valid: bool,
+    pub reference_capture_target: u64,
+    pub candidate_capture_target: u64,
+    pub reference_expert_tensors: usize,
+    pub candidate_expert_tensors: usize,
+    pub compared_expert_tensors: usize,
+    pub compared_values: u64,
+    pub non_finite_values: u64,
+    pub relative_l2_error: Option<f64>,
+    pub max_tensor_relative_l2_error: Option<f64>,
+    pub worst_tensor: Option<String>,
+    pub missing_from_reference: Vec<String>,
+    pub missing_from_candidate: Vec<String>,
+    pub structural_errors: Vec<String>,
+    pub valid: bool,
 }
 
 /// Compare completed calibration artifacts without loading a model or using a
@@ -338,6 +364,255 @@ pub fn compare_calibration_artifacts(
         reports_truncated,
         ok,
     })
+}
+
+/// Measure routed-expert imatrix stability between two otherwise matched
+/// capture runs. The higher capture target is the reference. This intentionally
+/// excludes dense Hessians, KLDREF, and router telemetry: the sweep varies the
+/// number of admitted expert rows, so the measured signal is the serialized
+/// per-expert calibration statistic itself.
+pub fn compare_calibration_stability(
+    reference_path: &Path,
+    candidate_path: &Path,
+) -> Result<CalibrationStabilityReport, Box<dyn Error>> {
+    let reference = HfqFile::open_index_only(reference_path)?;
+    let candidate = HfqFile::open_index_only(candidate_path)?;
+    let reference_metadata: Value = serde_json::from_str(&reference.metadata_json)?;
+    let candidate_metadata: Value = serde_json::from_str(&candidate.metadata_json)?;
+    validate_calibration_kind("reference", &reference_metadata)?;
+    validate_calibration_kind("candidate", &candidate_metadata)?;
+
+    let metadata_checks = [
+        ("family", "/family"),
+        ("source_manifest", "/source_manifest/fingerprint"),
+        ("source_fingerprint", "/job/source_fingerprint"),
+        ("tokenizer_fingerprint", "/job/tokenizer_fingerprint"),
+        ("corpus_fingerprint", "/job/corpus_fingerprint"),
+        ("sample_fingerprint", "/job/samples/fingerprint"),
+        ("microbatch_geometry", "/microbatch_geometry"),
+        (
+            "minimum_expert_activations",
+            "/job/options/expert_quota/min_rows",
+        ),
+        (
+            "expert_capture_tile_rows",
+            "/job/options/expert_quota/tile_rows",
+        ),
+        ("expert_sampling", "/job/options/expert_quota/sampling"),
+        (
+            "required_expert_fraction",
+            "/job/options/required_expert_fraction",
+        ),
+        (
+            "expert_coverage_policy",
+            "/job/options/expert_coverage_policy",
+        ),
+    ]
+    .into_iter()
+    .map(|(field, pointer)| {
+        metadata_check(
+            field,
+            reference_metadata.pointer(pointer).cloned(),
+            candidate_metadata.pointer(pointer).cloned(),
+            true,
+        )
+    })
+    .collect::<Vec<_>>();
+    let provenance_complete = metadata_checks
+        .iter()
+        .all(|check| matches!(check.status, MetadataCheckStatus::Match));
+    let reference_fallback = reference_metadata.get("preserve_high_precision");
+    let candidate_fallback = candidate_metadata.get("preserve_high_precision");
+    let fallback_set_match =
+        reference_fallback.is_some() && reference_fallback == candidate_fallback;
+    let reference_capture_target = required_metadata_u64(
+        &reference_metadata,
+        "/job/options/expert_quota/target_rows",
+        "reference capture target",
+    )?;
+    let candidate_capture_target = required_metadata_u64(
+        &candidate_metadata,
+        "/job/options/expert_quota/target_rows",
+        "candidate capture target",
+    )?;
+    let capture_target_order_valid = reference_capture_target >= candidate_capture_target;
+
+    let reference_tensors = expert_statistic_tensor_map(reference.tensors());
+    let candidate_tensors = expert_statistic_tensor_map(candidate.tensors());
+    let reference_names = reference_tensors.keys().cloned().collect::<BTreeSet<_>>();
+    let candidate_names = candidate_tensors.keys().cloned().collect::<BTreeSet<_>>();
+    let missing_from_reference = candidate_names
+        .difference(&reference_names)
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_from_candidate = reference_names
+        .difference(&candidate_names)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut structural_errors = Vec::new();
+    let mut compared_expert_tensors = 0usize;
+    let mut compared_values = 0u64;
+    let mut non_finite_values = 0u64;
+    let mut total_squared_error = 0.0f64;
+    let mut total_reference_energy = 0.0f64;
+    let mut total_candidate_energy = 0.0f64;
+    let mut max_tensor_relative_l2_error = None::<f64>;
+    let mut worst_tensor = None;
+
+    for name in reference_names.intersection(&candidate_names) {
+        let reference_info = reference_tensors[name];
+        let candidate_info = candidate_tensors[name];
+        if reference_info.shape != candidate_info.shape {
+            structural_errors.push(format!(
+                "{name}: shape {:?} != {:?}",
+                reference_info.shape, candidate_info.shape
+            ));
+            continue;
+        }
+        if reference_info.group_size != candidate_info.group_size {
+            structural_errors.push(format!(
+                "{name}: group_size {} != {}",
+                reference_info.group_size, candidate_info.group_size
+            ));
+            continue;
+        }
+        let Some((_, reference_data)) = reference.tensor_data_vec(name) else {
+            structural_errors.push(format!("{name}: could not read reference payload"));
+            continue;
+        };
+        let Some((_, candidate_data)) = candidate.tensor_data_vec(name) else {
+            structural_errors.push(format!("{name}: could not read candidate payload"));
+            continue;
+        };
+        let reference_values = match NumericValues::new(reference_info, &reference_data) {
+            Ok(values) => values,
+            Err(error) => {
+                structural_errors.push(format!("{name}: reference {error}"));
+                continue;
+            }
+        };
+        let candidate_values = match NumericValues::new(candidate_info, &candidate_data) {
+            Ok(values) => values,
+            Err(error) => {
+                structural_errors.push(format!("{name}: candidate {error}"));
+                continue;
+            }
+        };
+        if reference_values.len() != candidate_values.len() {
+            structural_errors.push(format!(
+                "{name}: value count {} != {}",
+                reference_values.len(),
+                candidate_values.len()
+            ));
+            continue;
+        }
+
+        let mut tensor_squared_error = 0.0f64;
+        let mut tensor_reference_energy = 0.0f64;
+        let mut tensor_candidate_energy = 0.0f64;
+        let mut tensor_finite = true;
+        for (left, right) in reference_values.zip(candidate_values) {
+            compared_values += 1;
+            if !left.is_finite() || !right.is_finite() {
+                non_finite_values += 1;
+                tensor_finite = false;
+                continue;
+            }
+            let left = f64::from(left);
+            let right = f64::from(right);
+            let difference = left - right;
+            tensor_squared_error += difference * difference;
+            tensor_reference_energy += left * left;
+            tensor_candidate_energy += right * right;
+        }
+        compared_expert_tensors += 1;
+        total_squared_error += tensor_squared_error;
+        total_reference_energy += tensor_reference_energy;
+        total_candidate_energy += tensor_candidate_energy;
+        if tensor_finite {
+            let relative = symmetric_relative_l2(
+                tensor_squared_error,
+                tensor_reference_energy,
+                tensor_candidate_energy,
+            );
+            if max_tensor_relative_l2_error.is_none_or(|current| relative > current) {
+                max_tensor_relative_l2_error = Some(relative);
+                worst_tensor = Some(name.clone());
+            }
+        }
+    }
+
+    let structurally_complete = !reference_names.is_empty()
+        && missing_from_reference.is_empty()
+        && missing_from_candidate.is_empty()
+        && structural_errors.is_empty()
+        && compared_expert_tensors == reference_names.len();
+    let relative_l2_error = (structurally_complete && non_finite_values == 0).then(|| {
+        symmetric_relative_l2(
+            total_squared_error,
+            total_reference_energy,
+            total_candidate_energy,
+        )
+    });
+    let valid = provenance_complete
+        && fallback_set_match
+        && capture_target_order_valid
+        && structurally_complete
+        && non_finite_values == 0
+        && relative_l2_error.is_some();
+
+    Ok(CalibrationStabilityReport {
+        schema: STABILITY_SCHEMA,
+        reference: reference_path.display().to_string(),
+        candidate: candidate_path.display().to_string(),
+        provenance_complete,
+        metadata_checks,
+        fallback_set_match,
+        capture_target_order_valid,
+        reference_capture_target,
+        candidate_capture_target,
+        reference_expert_tensors: reference_names.len(),
+        candidate_expert_tensors: candidate_names.len(),
+        compared_expert_tensors,
+        compared_values,
+        non_finite_values,
+        relative_l2_error,
+        max_tensor_relative_l2_error,
+        worst_tensor,
+        missing_from_reference,
+        missing_from_candidate,
+        structural_errors,
+        valid,
+    })
+}
+
+fn expert_statistic_tensor_map(tensors: &[HfqTensorInfo]) -> BTreeMap<String, &HfqTensorInfo> {
+    tensors
+        .iter()
+        .filter(|tensor| tensor.name.contains(".experts.") && tensor.name.ends_with(".imatrix"))
+        .map(|tensor| (tensor.name.clone(), tensor))
+        .collect()
+}
+
+fn required_metadata_u64(
+    metadata: &Value,
+    pointer: &str,
+    label: &str,
+) -> Result<u64, Box<dyn Error>> {
+    metadata
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("calibration artifact has no valid {label}").into())
+}
+
+fn symmetric_relative_l2(squared_error: f64, left_energy: f64, right_energy: f64) -> f64 {
+    let scale = left_energy.max(right_energy);
+    if scale == 0.0 {
+        0.0
+    } else {
+        (squared_error / scale).sqrt()
+    }
 }
 
 #[derive(Debug)]
@@ -588,6 +863,48 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("{}", serde_json::to_string_pretty(&report)?);
     if !report.ok {
         return Err("calibration artifacts are not within the requested parity contract".into());
+    }
+    Ok(())
+}
+
+pub fn run_stability_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let mut reference = None;
+    let mut candidate = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        let flag = &args[index];
+        match flag.as_str() {
+            "--reference" | "--candidate" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    format!("artifact compare-calibration-stability: {flag} needs a value")
+                })?;
+                match flag.as_str() {
+                    "--reference" => reference = Some(PathBuf::from(value)),
+                    "--candidate" => candidate = Some(PathBuf::from(value)),
+                    _ => unreachable!(),
+                }
+                index += 2;
+            }
+            _ => {
+                return Err(format!(
+                    "artifact compare-calibration-stability: unknown argument {flag}"
+                )
+                .into())
+            }
+        }
+    }
+    let reference = reference.ok_or(
+        "artifact compare-calibration-stability requires --reference <higher-cap.calib.hfq>",
+    )?;
+    let candidate = candidate.ok_or(
+        "artifact compare-calibration-stability requires --candidate <lower-cap.calib.hfq>",
+    )?;
+    let report = compare_calibration_stability(&reference, &candidate)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if !report.valid {
+        return Err(
+            "calibration artifacts do not satisfy the expert-statistic stability contract".into(),
+        );
     }
     Ok(())
 }
@@ -874,6 +1191,65 @@ mod tests {
         .unwrap();
     }
 
+    fn stability_metadata(target_rows: u64, corpus: &str, preserve: Value) -> String {
+        serde_json::json!({
+            "artifact_kind": "calibration",
+            "family": "fixture_moe",
+            "source_manifest": {"fingerprint": "source-a"},
+            "microbatch_geometry": {"sequence_batch": 8, "time_tile": 32, "row_budget": 256},
+            "job": {
+                "corpus_fingerprint": corpus,
+                "source_fingerprint": "source-a",
+                "tokenizer_fingerprint": "tokenizer-a",
+                "samples": {"fingerprint": "samples-a"},
+                "options": {
+                    "expert_quota": {
+                        "min_rows": 512,
+                        "target_rows": target_rows,
+                        "tile_rows": 256,
+                        "sampling": {"kind": "deterministic_first", "seed": 1}
+                    },
+                    "required_expert_fraction": 1.0,
+                    "expert_coverage_policy": "preserve_undercovered"
+                }
+            },
+            "preserve_high_precision": preserve
+        })
+        .to_string()
+    }
+
+    fn write_stability_fixture(path: &Path, meta: &str, first: &[f32], second: &[f32]) {
+        write_hfqm_package_mem(
+            path,
+            6,
+            meta,
+            &[
+                HfqMemTensor {
+                    name: "model.layers.0.mlp.experts.0.gate_up_proj.imatrix".into(),
+                    quant_type: 2,
+                    shape: vec![first.len() as u32],
+                    group_size: 0,
+                    data: f32_bytes(first),
+                },
+                HfqMemTensor {
+                    name: "model.layers.0.mlp.experts.1.down_proj.imatrix".into(),
+                    quant_type: 2,
+                    shape: vec![second.len() as u32],
+                    group_size: 0,
+                    data: f32_bytes(second),
+                },
+                HfqMemTensor {
+                    name: "model.layers.0.self_attn.q_proj.imatrix".into(),
+                    quant_type: 2,
+                    shape: vec![1],
+                    group_size: 0,
+                    data: f32_bytes(&[99.0]),
+                },
+            ],
+        )
+        .unwrap();
+    }
+
     fn fixture_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "hipfire-calibration-compare-{label}-{}-{}",
@@ -934,6 +1310,74 @@ mod tests {
         assert!(!report.provenance_complete);
         assert_eq!(report.mismatched_tensors, 1);
         assert_eq!(report.mismatched_values, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn routed_expert_stability_is_derived_from_matched_capture_artifacts() {
+        let root = fixture_root("expert-stability");
+        let reference = root.join("cap4096.calib.hfq");
+        let candidate = root.join("cap2048.calib.hfq");
+        let preserve = serde_json::json!([{"layer": 0, "expert": 7}]);
+        write_stability_fixture(
+            &reference,
+            &stability_metadata(4096, "corpus-a", preserve.clone()),
+            &[1.0, 2.0],
+            &[3.0],
+        );
+        write_stability_fixture(
+            &candidate,
+            &stability_metadata(2048, "corpus-a", preserve),
+            &[1.1, 1.8],
+            &[3.0],
+        );
+
+        let report = compare_calibration_stability(&reference, &candidate).unwrap();
+        assert!(report.valid);
+        assert!(report.provenance_complete);
+        assert!(report.fallback_set_match);
+        assert_eq!(report.reference_capture_target, 4096);
+        assert_eq!(report.candidate_capture_target, 2048);
+        assert_eq!(report.compared_expert_tensors, 2);
+        assert_eq!(report.compared_values, 3);
+        assert_eq!(report.non_finite_values, 0);
+        assert!((report.relative_l2_error.unwrap() - (0.05f64 / 14.0).sqrt()).abs() < 1.0e-7);
+        assert!((report.max_tensor_relative_l2_error.unwrap() - 0.1).abs() < 1.0e-7);
+        assert_eq!(
+            report.worst_tensor.as_deref(),
+            Some("model.layers.0.mlp.experts.0.gate_up_proj.imatrix")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn routed_expert_stability_rejects_provenance_fallback_and_nonfinite_drift() {
+        let root = fixture_root("expert-stability-reject");
+        let reference = root.join("cap4096.calib.hfq");
+        let candidate = root.join("cap2048.calib.hfq");
+        write_stability_fixture(
+            &reference,
+            &stability_metadata(4096, "corpus-a", serde_json::json!([])),
+            &[1.0, 2.0],
+            &[3.0],
+        );
+        write_stability_fixture(
+            &candidate,
+            &stability_metadata(
+                2048,
+                "corpus-b",
+                serde_json::json!([{"layer": 0, "expert": 7}]),
+            ),
+            &[f32::NAN, 2.0],
+            &[3.0],
+        );
+
+        let report = compare_calibration_stability(&reference, &candidate).unwrap();
+        assert!(!report.valid);
+        assert!(!report.provenance_complete);
+        assert!(!report.fallback_set_match);
+        assert_eq!(report.non_finite_values, 1);
+        assert!(report.relative_l2_error.is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
