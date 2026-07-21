@@ -388,6 +388,7 @@ python3 scripts/two_pass_quantize.py \
   --batch-size 64 \
   --time-tile 32 \
   --max-rows 2048 \
+  --calibration-segment-layers 4 \
   -- --awq --ldlq
 ```
 
@@ -403,6 +404,13 @@ sequence batch, time tile, or row budget. The expert activation floor, capture
 target/tile, required fraction, deterministic sampling seed, and strict versus
 preserve-undercovered policy are also explicit two-pass options and recipe
 fields, so quality-policy changes cannot reuse stale calibration provenance.
+`--calibration-segment-layers N` is an optional process-lifetime bound for
+large models. It uses the native absolute pause boundary and durable layer
+checkpoint, validates that each child advanced exactly as requested, releases
+the process mappings between segments, and leaves the final child unbounded so
+artifact/KLDREF finalization runs. This is execution provenance rather than a
+semantic recipe input; changing it does not invalidate compatible completed
+calibration.
 With `--skip-calib`, the wrapper also executes the native no-GPU dry plan and
 requires the existing artifact to match its family/adapter/architecture,
 source fingerprint and shard set, tokenizer/corpus/sample fingerprints,

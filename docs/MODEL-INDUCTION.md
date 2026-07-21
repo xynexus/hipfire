@@ -83,6 +83,17 @@ with `--layer-prefetch-bytes N`, or pass zero to disable lookahead; the chosen
 operational budget is recorded in the two-pass recipe while pressure decisions
 are recorded per layer.
 
+On hosts where a long-lived process accumulates source mappings or SVM
+pressure, pass `--calibration-segment-layers N`. The offline workflow then
+restarts the native calibrator after every N additional durable layers. Each
+child resumes from the native boundary checkpoint, so committed tensors are
+not reread; the final child runs without a pause boundary so it can finalize
+KLDREF and the unified artifact. The wrapper waits five seconds between
+children to let mappings drain and validates checkpoint progress after every
+successful process. Segmentation is recorded as execution provenance, but is
+not part of the semantic recipe fingerprint: a segmented run is compatible
+with the same uninterrupted calibration recipe.
+
 Expert quality controls are also explicit induction inputs rather than hidden
 calibrator defaults: `--min-expert-activations`,
 `--expert-capture-target`, `--expert-capture-tile-rows`,
@@ -131,6 +142,7 @@ python3 scripts/induct_model.py --stage dflash
 python3 scripts/induct_model.py --stage target
 python3 scripts/induct_model.py --stage triattn
 python3 scripts/induct_model.py --stage target --force
+python3 scripts/induct_model.py --stage target --calibration-segment-layers 4
 ```
 
 When a complete calibration artifact exists but the target quant does not,

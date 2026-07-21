@@ -150,6 +150,7 @@ def test_commands_compose_existing_converters_with_scoped_gpu_stages(tmp_path):
         triattn_bin="target/release/examples/triattn_validate",
         quant_args=["--awq", "--ldlq"],
         reuse_calibration=True,
+        calibration_segment_layers=4,
     )
 
     assert commands["dflash"][0][-4:] == [
@@ -182,6 +183,7 @@ def test_commands_compose_existing_converters_with_scoped_gpu_stages(tmp_path):
     assert target_cmd[target_cmd.index("--required-expert-fraction") + 1] == "1.0"
     assert target_cmd[target_cmd.index("--sampling-seed") + 1] == "1"
     assert target_cmd[target_cmd.index("--expert-coverage-policy") + 1] == "preserve-undercovered"
+    assert target_cmd[target_cmd.index("--calibration-segment-layers") + 1] == "4"
     assert "--skip-calib" in target_cmd
     assert target_cmd[-2:] == ["--awq", "--ldlq"]
     triattn = commands["triattn"][0]
@@ -342,6 +344,8 @@ def test_main_dry_run_prints_native_two_pass_plan_without_running_tools(tmp_path
             str(tmp_path / "artifacts"),
             "--stage",
             "target",
+            "--calibration-segment-layers",
+            "4",
             "--dry-run",
         ],
     )
@@ -364,3 +368,4 @@ def test_main_dry_run_prints_native_two_pass_plan_without_running_tools(tmp_path
     assert "--required-expert-fraction 1.0" in output
     assert "--sampling-seed 1" in output
     assert "--expert-coverage-policy preserve-undercovered" in output
+    assert "--calibration-segment-layers 4" in output

@@ -534,6 +534,135 @@ def test_skip_calibration_validation_command_is_native_dry_run():
     assert two_pass.calibration_validation_command(collect) == [*collect, "--dry-run"]
 
 
+def test_segmented_calibration_resumes_from_durable_checkpoint_and_finalizes(tmp_path):
+    calib = tmp_path / "Tiny.calib.hfq"
+    boundary = two_pass.calibration_boundary_checkpoint(calib)
+    boundary.parent.mkdir(parents=True)
+    boundary.write_text(
+        json.dumps(
+            {
+                "completed_layers": 3,
+                "total_layers": 10,
+                "artifact_complete": False,
+            }
+        )
+    )
+    calls = []
+    progress = []
+
+    def runner(command, *, check):
+        assert check is True
+        calls.append(command)
+        checkpoint = json.loads(boundary.read_text())
+        if "--pause-after-layers" in command:
+            checkpoint["completed_layers"] = int(command[command.index("--pause-after-layers") + 1])
+        else:
+            checkpoint["completed_layers"] = checkpoint["total_layers"]
+            checkpoint["artifact_complete"] = True
+        boundary.write_text(json.dumps(checkpoint))
+
+    execution = two_pass.run_calibration_pass(
+        ["hipfire-coexistence", "calibrate", "--output", str(calib), "--resume"],
+        calib=calib,
+        total_layers=10,
+        segment_layers=4,
+        runner=runner,
+        release_seconds=0,
+        progress=lambda value: progress.append(copy.deepcopy(value)),
+    )
+
+    assert calls == [
+        [
+            "hipfire-coexistence",
+            "calibrate",
+            "--output",
+            str(calib),
+            "--resume",
+            "--pause-after-layers",
+            "7",
+        ],
+        ["hipfire-coexistence", "calibrate", "--output", str(calib), "--resume"],
+    ]
+    assert execution["mode"] == "segmented"
+    assert execution["process_segment_layers"] == 4
+    assert [segment["completed_layers"] for segment in execution["segments"]] == [7, 10]
+    assert execution["artifact_complete"] is True
+    assert [state["segments"][-1]["completed_layers"] for state in progress] == [7, 10]
+
+
+def test_segmented_calibration_rejects_a_successful_process_without_progress(tmp_path):
+    calib = tmp_path / "Tiny.calib.hfq"
+    boundary = two_pass.calibration_boundary_checkpoint(calib)
+    boundary.parent.mkdir(parents=True)
+    boundary.write_text(
+        json.dumps(
+            {
+                "completed_layers": 1,
+                "total_layers": 4,
+                "artifact_complete": False,
+            }
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="did not advance"):
+        two_pass.run_calibration_pass(
+            ["hipfire-coexistence", "calibrate", "--output", str(calib), "--resume"],
+            calib=calib,
+            total_layers=4,
+            segment_layers=2,
+            runner=lambda _command, *, check: None,
+            release_seconds=0,
+        )
+
+
+def test_calibration_segmentation_is_execution_provenance_not_recipe_identity(tmp_path):
+    path = tmp_path / "two-pass.json"
+    recipe = {"recipe_fingerprint": "sha256:recipe"}
+    execution = {
+        "mode": "segmented",
+        "process_segment_layers": 4,
+        "release_seconds": 5,
+    }
+
+    manifest = two_pass.update_manifest(
+        path,
+        recipe=recipe,
+        phase="calibration_running",
+        calibration_execution=execution,
+    )
+
+    assert manifest["recipe_fingerprint"] == "sha256:recipe"
+    assert manifest["calibration_execution"] == execution
+
+    resumed = two_pass.update_manifest(
+        path,
+        recipe=recipe,
+        phase="calibration_running",
+        calibration_execution={
+            "mode": "segmented",
+            "process_segment_layers": 4,
+            "release_seconds": 5,
+            "segments": [
+                {
+                    "started_after_layer": 0,
+                    "pause_after_layer": 4,
+                    "completed_layers": 4,
+                    "artifact_complete": False,
+                }
+            ],
+        },
+    )
+    restarted = two_pass.update_manifest(
+        path,
+        recipe=recipe,
+        phase="calibration_running",
+        calibration_execution=execution,
+    )
+
+    assert resumed["calibration_execution"]["segments"][0]["completed_layers"] == 4
+    assert restarted["calibration_execution"]["segments"] == resumed["calibration_execution"]["segments"]
+
+
 def test_calibration_artifact_audit_command_uses_family_neutral_native_gate():
     assert two_pass.calibration_audit_command(
         "target/release/hipfire-coexistence",

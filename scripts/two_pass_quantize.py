@@ -19,6 +19,7 @@ import re
 import shlex
 import struct
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,6 +32,7 @@ DEFAULT_EXPERT_CAPTURE_TILE_ROWS = 256
 DEFAULT_REQUIRED_EXPERT_FRACTION = 1.0
 DEFAULT_SAMPLING_SEED = 1
 DEFAULT_EXPERT_COVERAGE_POLICY = "preserve-undercovered"
+DEFAULT_CALIBRATION_SEGMENT_RELEASE_SECONDS = 5
 PASS_TWO_FIXED_SAFETY_BYTES = 64 * 1024**3
 PASS_TWO_RELATIVE_SAFETY = 0.10
 PASS_TWO_CONTAINER_OVERHEAD_BYTES = 16 * 1024**2
@@ -510,6 +512,32 @@ def _get(value: dict | None, *keys: str):
     return current
 
 
+def _merge_calibration_execution(previous: dict | None, current: dict) -> dict:
+    if not isinstance(previous, dict):
+        return current
+    identity = ("mode", "process_segment_layers", "release_seconds")
+    if any(previous.get(key) != current.get(key) for key in identity):
+        return current
+    merged = {**previous, **current}
+    segments = []
+    seen = set()
+    for segment in [*previous.get("segments", []), *current.get("segments", [])]:
+        if not isinstance(segment, dict):
+            continue
+        key = (
+            segment.get("started_after_layer"),
+            segment.get("pause_after_layer"),
+            segment.get("completed_layers"),
+            segment.get("artifact_complete"),
+        )
+        if key not in seen:
+            segments.append(segment)
+            seen.add(key)
+    if segments:
+        merged["segments"] = segments
+    return merged
+
+
 def update_manifest(
     path: Path,
     *,
@@ -519,6 +547,7 @@ def update_manifest(
     calibration_audit: dict | None = None,
     storage_preflight: dict | None = None,
     quantized: dict | None = None,
+    calibration_execution: dict | None = None,
 ) -> dict:
     previous = {}
     if path.is_file():
@@ -554,6 +583,12 @@ def update_manifest(
         manifest["quantized"] = quantized
     elif "quantized" in previous:
         manifest["quantized"] = previous["quantized"]
+    if calibration_execution is not None:
+        manifest["calibration_execution"] = _merge_calibration_execution(
+            previous.get("calibration_execution"), calibration_execution
+        )
+    elif "calibration_execution" in previous:
+        manifest["calibration_execution"] = previous["calibration_execution"]
 
     calibration_value = calibration or manifest.get("calibration")
     quantized_value = quantized or manifest.get("quantized")
@@ -607,6 +642,141 @@ def inspect_calibration_plan(collect_cmd: list[str]) -> dict:
         capture_output=True,
     )
     return json.loads(result.stdout)
+
+
+def calibration_boundary_checkpoint(calib: Path) -> Path:
+    return calib.with_name(f".{calib.name}.boundary") / "calibration-boundary.json"
+
+
+def _read_calibration_boundary(calib: Path) -> dict | None:
+    path = calibration_boundary_checkpoint(calib)
+    if not path.is_file():
+        return None
+    try:
+        checkpoint = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid calibration boundary checkpoint {path}: {error}") from error
+    for field in ("completed_layers", "total_layers"):
+        if not isinstance(checkpoint.get(field), int) or checkpoint[field] < 0:
+            raise RuntimeError(f"invalid calibration boundary {field}: {checkpoint.get(field)!r}")
+    if not isinstance(checkpoint.get("artifact_complete"), bool):
+        raise RuntimeError("invalid calibration boundary artifact_complete")
+    return checkpoint
+
+
+def run_calibration_pass(
+    collect_exec: list[str],
+    *,
+    calib: Path,
+    total_layers: int,
+    segment_layers: int,
+    runner=subprocess.run,
+    release_seconds: int = DEFAULT_CALIBRATION_SEGMENT_RELEASE_SECONDS,
+    progress=None,
+) -> dict:
+    """Run the native teacher once or in resumable process-sized segments.
+
+    Process segmentation is deliberately outside the semantic recipe. The
+    native boundary checkpoint remains authoritative for progress and source
+    reads, while process exit releases source mappings before the next segment.
+    """
+
+    if total_layers < 1:
+        raise RuntimeError(f"invalid native calibration layer count {total_layers}")
+    if segment_layers < 0:
+        raise RuntimeError("calibration segment layers must be nonnegative")
+    if release_seconds < 0:
+        raise RuntimeError("calibration segment release seconds must be nonnegative")
+    if "--pause-after-layers" in collect_exec:
+        raise RuntimeError("calibration command already contains --pause-after-layers")
+
+    execution = {
+        "mode": "segmented" if segment_layers else "single_process",
+        "process_segment_layers": segment_layers,
+        "release_seconds": release_seconds if segment_layers else 0,
+        "segments": [],
+    }
+    if segment_layers == 0:
+        runner(collect_exec, check=True)
+        checkpoint = _read_calibration_boundary(calib)
+        if checkpoint is not None:
+            execution.update(
+                completed_layers=checkpoint["completed_layers"],
+                total_layers=checkpoint["total_layers"],
+                artifact_complete=checkpoint["artifact_complete"],
+            )
+        return execution
+
+    while True:
+        before = _read_calibration_boundary(calib)
+        completed = before["completed_layers"] if before is not None else 0
+        checkpoint_total = before["total_layers"] if before is not None else total_layers
+        if checkpoint_total != total_layers:
+            raise RuntimeError(
+                f"calibration boundary total layer mismatch: checkpoint={checkpoint_total}, plan={total_layers}"
+            )
+        if before is not None and before["artifact_complete"]:
+            execution.update(
+                completed_layers=completed,
+                total_layers=checkpoint_total,
+                artifact_complete=True,
+            )
+            return execution
+        if completed > total_layers:
+            raise RuntimeError(
+                f"calibration boundary completed layer count {completed} exceeds plan {total_layers}"
+            )
+
+        pause_after = min(completed + segment_layers, total_layers)
+        final_process = pause_after == total_layers
+        command = list(collect_exec)
+        if not final_process:
+            command.extend(["--pause-after-layers", str(pause_after)])
+        runner(command, check=True)
+
+        after = _read_calibration_boundary(calib)
+        if after is None:
+            raise RuntimeError(
+                f"calibration process returned success without boundary checkpoint {calibration_boundary_checkpoint(calib)}"
+            )
+        if after["total_layers"] != total_layers:
+            raise RuntimeError(
+                f"calibration boundary total layer mismatch: checkpoint={after['total_layers']}, plan={total_layers}"
+            )
+        if after["completed_layers"] <= completed:
+            raise RuntimeError(
+                f"calibration process did not advance durable progress beyond layer {completed}"
+            )
+        if final_process:
+            if after["completed_layers"] != total_layers or not after["artifact_complete"]:
+                raise RuntimeError(
+                    "final calibration process returned success without a complete artifact"
+                )
+        elif after["completed_layers"] != pause_after or after["artifact_complete"]:
+            raise RuntimeError(
+                f"segmented calibration stopped at invalid boundary {after['completed_layers']} (expected {pause_after})"
+            )
+        execution["segments"].append(
+            {
+                "started_after_layer": completed,
+                "pause_after_layer": None if final_process else pause_after,
+                "completed_layers": after["completed_layers"],
+                "artifact_complete": after["artifact_complete"],
+            }
+        )
+        if after["artifact_complete"]:
+            execution.update(
+                completed_layers=after["completed_layers"],
+                total_layers=after["total_layers"],
+                artifact_complete=True,
+            )
+            if progress is not None:
+                progress(execution)
+            return execution
+        if progress is not None:
+            progress(execution)
+        if release_seconds:
+            time.sleep(release_seconds)
 
 
 def _require_equal(label: str, actual, expected) -> None:
@@ -760,6 +930,15 @@ def main() -> None:
         default=DEFAULT_LAYER_PREFETCH_BYTES,
         help=f"Bounded next-layer source lookahead (default: {DEFAULT_LAYER_PREFETCH_BYTES}; 0 disables).",
     )
+    parser.add_argument(
+        "--calibration-segment-layers",
+        type=int,
+        default=0,
+        help=(
+            "Restart the native calibrator after this many additional durable layers "
+            "to release source mappings (default: 0, uninterrupted)."
+        ),
+    )
     parser.add_argument("--kldref-topk", type=int, default=64)
     parser.add_argument(
         "--min-expert-activations",
@@ -823,6 +1002,8 @@ def main() -> None:
         parser.error("--batch-size * --time-tile must not exceed --max-rows")
     if args.layer_prefetch_bytes < 0:
         parser.error("--layer-prefetch-bytes must be nonnegative")
+    if args.calibration_segment_layers < 0:
+        parser.error("--calibration-segment-layers must be nonnegative")
     if args.expert_capture_target < args.min_expert_activations:
         parser.error("--expert-capture-target must be at least --min-expert-activations")
     if not 0.0 < args.required_expert_fraction <= 1.0:
@@ -885,7 +1066,20 @@ def main() -> None:
         print(f"pass 1/2: reusing {args.calib}", flush=True)
     _print_command("pass 2/2", quant_exec)
     if args.dry_run:
-        print(json.dumps({"manifest": str(manifest_path), **recipe}, indent=2), flush=True)
+        print(
+            json.dumps(
+                {
+                    "manifest": str(manifest_path),
+                    "calibration_execution": {
+                        "mode": "segmented" if args.calibration_segment_layers else "single_process",
+                        "process_segment_layers": args.calibration_segment_layers,
+                    },
+                    **recipe,
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
         return
     previous = {}
     if manifest_path.is_file():
@@ -901,11 +1095,51 @@ def main() -> None:
     expected_calibration = None
     if args.skip_calib:
         expected_calibration = inspect_calibration_plan(collect_exec)
-        update_manifest(manifest_path, recipe=recipe, phase="calibration_validating")
+        update_manifest(
+            manifest_path,
+            recipe=recipe,
+            phase="calibration_validating",
+            calibration_execution={"mode": "reused", "process_segment_layers": 0},
+        )
     else:
-        update_manifest(manifest_path, recipe=recipe, phase="calibration_running")
+        expected_calibration = inspect_calibration_plan(collect_exec)
+        update_manifest(
+            manifest_path,
+            recipe=recipe,
+            phase="calibration_running",
+            calibration_execution={
+                "mode": "segmented" if args.calibration_segment_layers else "single_process",
+                "process_segment_layers": args.calibration_segment_layers,
+                "release_seconds": (
+                    DEFAULT_CALIBRATION_SEGMENT_RELEASE_SECONDS
+                    if args.calibration_segment_layers
+                    else 0
+                ),
+            },
+        )
     if not args.skip_calib:
-        subprocess.run(collect_exec, check=True)
+        model_plan = expected_calibration.get("model", {})
+        total_layers = model_plan.get("layers")
+        if not isinstance(total_layers, int) or total_layers < 1:
+            raise RuntimeError(f"native calibration plan has invalid model.layers: {total_layers!r}")
+        calibration_execution = run_calibration_pass(
+            collect_exec,
+            calib=args.calib,
+            total_layers=total_layers,
+            segment_layers=args.calibration_segment_layers,
+            progress=lambda execution: update_manifest(
+                manifest_path,
+                recipe=recipe,
+                phase="calibration_running",
+                calibration_execution=execution,
+            ),
+        )
+        update_manifest(
+            manifest_path,
+            recipe=recipe,
+            phase="calibration_validating",
+            calibration_execution=calibration_execution,
+        )
     calibration = inspect_artifact(args.coexistence, args.calib)
     validate_calibration_inspection(calibration)
     calibration_audit = audit_calibration_artifact(args.coexistence, args.calib)

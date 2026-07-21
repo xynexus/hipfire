@@ -426,6 +426,19 @@ an operational mitigation for the historical production binary, not evidence
 that the current source still accumulates mappings; the current source release
 and prefetch changes require their own matched validation after the GPU is free.
 
+The mitigation is now implemented generically in the offline induction path as
+`--calibration-segment-layers N` on both `two_pass_quantize.py` and
+`induct_model.py`. It derives the model layer count from the family-neutral
+native dry plan, chooses each next absolute pause boundary from the durable
+checkpoint, validates exact progress, allows mappings to drain between child
+processes, and invokes the final child without a pause limit. Segment progress
+is merged into the atomic two-pass manifest across wrapper restarts. The
+process lifetime is deliberately excluded from the semantic recipe
+fingerprint; native run/source/sample/geometry/expert/KLDREF identity remains
+authoritative for resume and completed-artifact reuse. Focused workflow tests
+cover nonzero-checkpoint resume, finalization, no-progress rejection,
+provenance persistence, and induction CLI forwarding.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 

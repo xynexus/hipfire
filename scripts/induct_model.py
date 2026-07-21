@@ -216,6 +216,7 @@ def build_stage_commands(
     triattn_bin: str,
     quant_args: list[str],
     reuse_calibration: bool = False,
+    calibration_segment_layers: int = 0,
 ) -> dict[str, list[list[str]]]:
     dflash_commands = [
         [
@@ -253,6 +254,8 @@ def build_stage_commands(
         str(max_rows),
         "--layer-prefetch-bytes",
         str(layer_prefetch_bytes),
+        "--calibration-segment-layers",
+        str(calibration_segment_layers),
         "--kldref-topk",
         str(kldref_topk),
         "--min-expert-activations",
@@ -520,6 +523,12 @@ def main() -> None:
         default=DEFAULT_LAYER_PREFETCH_BYTES,
         help=f"Bounded next-layer source lookahead (default: {DEFAULT_LAYER_PREFETCH_BYTES}; 0 disables).",
     )
+    parser.add_argument(
+        "--calibration-segment-layers",
+        type=int,
+        default=0,
+        help="Restart calibration after this many additional durable layers (default: 0).",
+    )
     parser.add_argument("--kldref-topk", type=int, default=64)
     parser.add_argument(
         "--min-expert-activations",
@@ -594,6 +603,8 @@ def main() -> None:
         parser.error("--batch-size * --time-tile must not exceed --max-rows")
     if args.layer_prefetch_bytes < 0:
         parser.error("--layer-prefetch-bytes must be nonnegative")
+    if args.calibration_segment_layers < 0:
+        parser.error("--calibration-segment-layers must be nonnegative")
     if args.expert_capture_target < args.min_expert_activations:
         parser.error("--expert-capture-target must be at least --min-expert-activations")
     if not 0.0 < args.required_expert_fraction <= 1.0:
@@ -639,6 +650,7 @@ def main() -> None:
         triattn_bin=str(args.triattn_bin),
         quant_args=quant_args,
         reuse_calibration=should_reuse_calibration(paths, force=args.force),
+        calibration_segment_layers=args.calibration_segment_layers,
     )
     target_recipe_fingerprint = _target_recipe_fingerprint(
         target=target,
