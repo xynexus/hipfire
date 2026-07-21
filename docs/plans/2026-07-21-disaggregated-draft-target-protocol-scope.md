@@ -275,19 +275,41 @@ adaptive controller re-solving the tree shape from the current marginals under t
 `distinct_experts` cost model. BASTION does the inner loop but assumes a fixed
 drafter — we own the outer loop.
 
-**Regime-dependent — the deployment picks the fixed point:**
-- **halo streams** (128 GB < ~200 GB) → streaming-bound → long `T` → big draft
-  budget → wide bushy trees cheap → drafter sized way up. The co-design bites here.
-- **medusa resident** (384 GB) → compute-bound ~17 B-active forward (hundreds of ms)
-  → shorter `T` → smaller draft budget → tree bounded more by attention/compute →
-  closer to the H200-paper regime.
+**`T` is WEIGHT-BANDWIDTH-DERIVED, not a live measurement.** Same principle as the
+NPU drafter (time linear in weight bytes). For a streamed target the compute is
+irrelevant; the wall is set by the weight bytes that stream per pass ÷ the target's
+weight bandwidth (halo ≈ **10 GB/s from NVMe**):
 
-**The load-bearing UNMEASURED quantity is now the step interval `T` itself** — the
-actual verify wall for the streaming 397B (medusa was unreachable, so only
-`distinct_experts` was extrapolated, never `T`). `T` sets the draft budget that
-sizes the drafter; without it, "size the drafter to the interval" has no number.
-Measuring `T` (per deployment: halo-streaming vs medusa-resident) is a prerequisite
-to fixing drafter size, block_size, and tree budget together.
+```
+T(B) = [ dense_bytes + streamed_expert_bytes(B) ] / BW
+```
+
+For the 397B at int4: expert = 3·[4096×1024] = 12.6 M params → 6.3 MB; ×512×60
+layers = **193 GB of experts**; dense ≈ 5.5 GB. **Cold cache** (every activated
+expert streams): `bytes(B) = 5.5 + φ(B)·193 GB` with φ = the measured
+distinct-experts fraction → T ≈ 3.4 s (B≈16, φ~15%) … 8.3 s (B=128, φ~40%).
+
+**⚠ Cold, wider trees LOSE.** Streamed bytes grow with `φ(B)·193 GB` while τ
+saturates, so `τ(B)/T(B)` gets *worse* with width — the opposite of §9's
+"wide-over-deep". On a pure NVMe stream, narrow beats wide.
+
+**What flips it is the resident expert cache.** halo's 128 GB holds ~57% of the
+193 GB pool, so per pass you stream only the **cache MISSES**, not all
+`distinct_experts(B)`. Here §9's sub-linearity pays off: a wider tree adds few
+*new* distinct experts, and if they are mostly resident the marginal traffic is
+tiny. Therefore:
+
+- **The objective is `τ / cache-MISS-bytes(B)`, not `τ / distinct_experts(B)`.**
+  `distinct_experts` is the demand; the cache converts demand → traffic.
+- **The decisive quantity is expert working-set residency / miss rate** — the
+  real follow-up measurement (supersedes "measure T on medusa"; T is now derived).
+- **Weight bytes are the only lever** (same verdict as the NPU path): lower-bit
+  experts (oq4/oq3) → more of the pool fits in 128 GB → fewer misses → wider trees
+  affordable. Quant sets how wide the tree can be, because it sets cache residency.
+
+Deployment still picks the regime: **medusa resident** (384 GB > 200 GB) → ~0
+expert streaming, near-fully-cached, so tree width is bounded by attention/compute
+(the H200 regime); **halo** → NVMe-streaming, and the cache/miss model above governs.
 
 ## 10. Phased implementation (smallest-first; each verifiable)
 
