@@ -1,6 +1,34 @@
 # TODO: embedding table → per-row Lloyd codebook
 
-**Status:** open (proposed 2026-07-21). Pairs with the landed lm_head→QTIP
+**Status: REJECTED 2026-07-21** — measure-before-build killed it. See "Outcome".
+
+## Outcome (2026-07-21): rejected; embed should go HIGHER precision, not lower
+
+Simulated the codec first (unrotated per-group symmetric scale + optimal
+`Ckmeans.1d.dp` codebook — a Lloyd local-search gives bad codebooks on the
+heavily-peaked embedding distribution; use the DP, cf. the Rust `ckmeans` crate).
+On Qwen3.5-35B-A3B embed (`[248320,2048]`, referenced to bf16):
+- Reconstruction: `oq8l g32` (256-level codebook, per-32 scale) BEATS Q8F16 at
+  equal bytes — relL2 0.00492 vs 0.00528, per-row cos 0.99999. `oq8l g64` beats
+  Q8 on BOTH quality and size. (Optimal clusterer essential — a stalled Lloyd
+  inverted this and made oq8l look worse than uniform, which is impossible.)
+- **Downstream KLD vs bf16 (embed-only degradation, everything else bf16) is the
+  decider — reconstruction MSE is NOT a valid proxy:** oq8l-g32 embed = 0.0575
+  mean / 0.0747 p99; Q8-g32 embed = 0.0611 / 0.1027. So oq8l *does* carry
+  through and beats Q8 (esp. p99, ~27%). **BUT both cost ~0.06 KLD — ~40% of the
+  entire oq4 model's 0.139.** The embedding rides the residual stream
+  UNNORMALIZED (RMSNorm only touches the per-layer input copy), so it is far more
+  downstream-sensitive than its near-lossless reconstruction implies.
+
+**Decision:** not worth ~40 sites + a kernel to slightly improve a bad trade
+(~500 MB saved for ~40% of the KLD budget). **Corollary worth acting on: keep
+the embedding at f16/bf16 for quality-sensitive OQ models** — the current
+Q8-embed default is the costly part; +~500 MB likely recovers most of that
+~0.06 KLD. (Sim harness: scratchpad `embed_lloyd_sim.py` / `build_embed_candidate.py`.)
+
+---
+
+_Original proposal (pairs with the landed lm_head→QTIP
 trellis (`HIPFIRE_QTIP_LM_HEAD`, commit 93db157f6): trellis the untied lm_head
 (a matmul), Lloyd-codebook the embedding table (a gather).
 
