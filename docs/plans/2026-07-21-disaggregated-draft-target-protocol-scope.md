@@ -311,6 +311,53 @@ Deployment still picks the regime: **medusa resident** (384 GB > 200 GB) → ~0
 expert streaming, near-fully-cached, so tree width is bounded by attention/compute
 (the H200 regime); **halo** → NVMe-streaming, and the cache/miss model above governs.
 
+## 9.6 Microbatching per expert + batch size — the utilization axis the bandwidth model hides
+
+Efficient streamed MoE executes **per expert module** (gather-scatter): load an
+expert's weights once, run every token — across the tree AND across concurrent
+requests — that routes to it. That is what makes the weight cost
+`distinct_experts(B)·expert_bytes` (each distinct expert streamed once), compute
+amortized. But it adds a second axis the pure `T = bytes/BW` model omits:
+**tokens-per-expert**, i.e. is each streamed expert actually doing work.
+
+**Crossover (halo, int4, ~50 TFLOP/s):** stream one expert = 6.3 MB / 10 GB/s =
+**0.63 ms**; compute `n` tokens through it = `n·2·12.6 M / 50 TFLOP/s` = `n·0.5 µs`.
+Crossover `n* ≈ 1260 tokens/expert`. Below it → memory-bound (wait to load an
+expert, compute it in `<<` the load time); above → compute-bound.
+
+**A single tree is ~300× below crossover.** B=64, k=10, ~154 distinct experts →
+`640/154 ≈ 4` tokens/expert → `2 µs` work vs a `0.63 ms` load → **~0.3% expert
+utilization.** A single-user streaming tree streams a 6.3 MB expert to do 4 tokens
+of work — this is *why* cold-cache wide trees looked bad in §9.5: you pay to move
+weights you barely use.
+
+**Increasing batch (tree width + concurrent request streams, grouped per expert):**
+1. `distinct_experts` **saturates toward E** — enough tokens hit every expert, so
+   you stream the whole 193 GB pool once per pass and it stops growing.
+2. **tokens-per-expert rises** — each additional token rides an already-streamed
+   expert nearly free until `n* ≈ 1260`.
+3. So **aggregate throughput rises with batch** (`tok/s → batch·BW/193 GB` once
+   saturated, linear in batch) while **per-request latency `T` rises**. The classic
+   throughput↔latency serving curve.
+
+**Consequences (architectural):**
+- **A single-user streaming MoE is bandwidth-wasteful regardless of spec-decode**
+  (~0.3% expert utilization). The streaming target MUST be a **multi-tenant
+  batching server** (continuous batching + expert-grouped execution) driving
+  tokens-per-expert up — not a single-stream engine.
+- **Tree width is the WRONG utilization knob** (buys τ, barely moves
+  tokens-per-expert). **Concurrency is the utilization knob** — and concurrent
+  trees *overlap* in expert usage (union sub-linear across users too), so N users
+  cost `≪ N×` the experts; each streamed expert just serves ~N× more tokens. That
+  overlap is what makes streaming viable.
+- **Software-pipeline the stream** (load expert e+1 while computing expert e — the
+  `--pipeline-glue` trick one level up) hides compute under the stream, but only
+  *up to* crossover; below it, compute is too short to hide anything.
+
+**Deployment split sharpens:** medusa-resident → no streaming, compute-bound,
+single-user fine, crossover never bites. halo-streaming → efficient ONLY at high
+concurrency; the target is a batching server or the NVMe is wasted.
+
 ## 10. Phased implementation (smallest-first; each verifiable)
 
 1. **Target-side hidden-extraction hook + wire format** — instrument the target
