@@ -1,8 +1,8 @@
 # Family-agnostic native calibration engine and expert microbatching
 
-Status: implementation in progress; native engine and the 397B teacher artifact
-are complete, while the production second pass is explicitly held and the
-admission ladder remains pending
+Status: implementation in progress; native engine, the 397B teacher artifact,
+and the production second pass are complete, while the quality/admission ladder
+remains pending
 
 Primary validation host: gfx1151, 120 GiB unified aperture
 
@@ -10,7 +10,7 @@ First production adapter: Qwen3.5-397B-A17B
 
 Reference source: `/srv/huggingface/models--Qwen--Qwen3.5-397B-A17B`
 
-## Implementation evidence snapshot — 2026-07-21
+## Implementation evidence snapshot — 2026-07-22
 
 The native mechanism is implemented, but the production quality/admission
 ladder is not complete. Keep this distinction explicit when reporting status.
@@ -481,12 +481,29 @@ imatrices, deficits, fallback identities, and read-ledger evidence remain
 present; the missing cost fields must not be reconstructed or used as an
 all-layer capture-cost claim.
 
+The second and only other logical target-source pass completed at 04:19 AWST on
+2026-07-22. It wrote
+`/home/sadara/.hipfire/models/Qwen3.5-397B-A17B.oq4.25++.hfq` as a
+408,300,824,700-byte HFQ v2 artifact in 8,050.66 seconds. Independent index-only
+inspection reopens all 103,211 tensors and reproduces artifact fingerprint
+`fnv64:7b1546262af42efb`; the embedded critical-index-and-payload identity is
+XXH64 `cf01bc3269ea7474` over 408,210,954,752 tensor payload bytes. The output
+records `oq4.25++` with AWQ and LDLQ, calibration source hash
+`38051d70e2ffd63a`, and the exact 10,368-expert preserve set. An independent
+XXH64 read of the 12,715,654,656-byte calibration artifact reproduces that
+source hash. Quantizer finalization verified that every requested fallback
+expert has both gate-up and down tensors in BF16; the embedded effective list
+contains exactly 10,368 entries. The atomic two-pass and induction manifests
+both report completion with no failure. The quantizer producer metadata
+honestly records commit `2f4b230c3d67d09e04cec7115c0ec0c7fe22defd` and a
+dirty checkout; use the recipe, calibration, index, and payload fingerprints as
+the reproducible artifact identities rather than inferring a clean build.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
 - matched prefetch-on versus prefetch-off layer timings on the same network
   source, separating background read duration, foreground wait, and upload;
-- the second target-source read and completed quantized artifact;
 - full-run performance confirmation that the bounded-layer 2,048-row,
   batch-64 geometry remains the best safe choice;
 - resident-versus-streamed comparison and matched held-out KLD/PPL evidence;
@@ -1450,7 +1467,7 @@ decode, and host-to-device upload before considering pinned host staging or
 GPU double buffering. Kernel changes come after those measurements and land
 one lever at a time.
 
-## Completion audit — 2026-07-21 11:58 AWST
+## Completion audit — 2026-07-22 04:45 AWST
 
 This table evaluates the numbered definition of done below. "Mechanism proven"
 does not mean the production artifact or admission ladder is complete.
@@ -1459,9 +1476,9 @@ does not mean the production artifact or admission ladder is complete.
 |---|---|---|
 | 1. Family-resolved native CLI | Proven | Qwen3.5 and Gemma3-text registry/factory tests plus successful architecture-selected dry runs and real streams; no family CLI flag exists. |
 | 2. Complete 397B teacher artifact | Proven | `/home/sadara/.hipfire/calib/Qwen3.5-397B-A17B.calib.hfq` is a complete 12,715,654,656-byte artifact. The independent index-only audit accepts fingerprint `fnv64:093301497a84bf3b` with 585 Hessians, 61,447 imatrices, top-64 KLDREF records for 262,016 positions, and a 1,038/1,038 duplicate-free logical/canonical ledger over 792,692,717,952 source bytes. The audit explicitly warns that the historical producer omitted `engine_build` and that 10,236 early capture points lack reduction-launch cost telemetry; neither warning is concealed or promoted to stronger evidence. |
-| 3. Second and only target-source pass | Held by operator; incomplete | The target `Qwen3.5-397B-A17B.oq4.25++.hfq` does not exist. The audited fallback set drives an authoritative 415,036,139,488-byte mixed-output estimate and 483,755,616,224-byte free-space requirement. Pass two was stopped at 180/2,924 tensors on operator request; its atomic manifest now records `quantization_interrupted`, and the 48,144,656,640-byte spill remains untouched. No restart is authorized while the hold remains active. |
+| 3. Second and only target-source pass | Proven | The exact `oq4.25++` AWQ+LDLQ pass completed in 8,050.66 seconds and wrote `/home/sadara/.hipfire/models/Qwen3.5-397B-A17B.oq4.25++.hfq` at 408,300,824,700 bytes. Independent index-only inspection reopens 103,211 tensors and matches manifest fingerprint `fnv64:7b1546262af42efb`; the embedded critical-index-and-payload identity is `cf01bc3269ea7474` over 408,210,954,752 payload bytes. The two-pass manifest is atomic and complete with recipe fingerprint `sha256:216c835daed92be98e7a0c0e795b9b439b3c9226004e4ada63f2af4b687874a8`. |
 | 4. Per-layer/per-expert floor | Proven under explicit fallback | The completed K=10 teacher artifact declares all 30,720 experts and 61,440 gate-up/down capture points across 60 layers. The strict 2,048-row floor is not met by every expert: 20,736 capture points are deficient and no layer reaches the required 1.0 fraction. The frozen `preserve-undercovered` policy therefore records the exact 10,368 `(layer, expert)` pairs that pass two must retain at BF16/F16. This satisfies the definition's explicit fallback branch; it is not a claim that the corpus achieved strict coverage. |
-| 5. Frozen telemetry and quantizer refusal | Artifact and enforcement proven; completed quant join pending | The production audit accepts the complete ledger, Hessian/imatrix index, KLDREF map, per-layer routing/count reconciliation, frozen policy, deficits, and exact fallback set. The reusable two-pass workflow required that audit, persisted its fingerprint and storage admission, and the quantizer consumed the fallback list before the operator interruption. Quantizer refusal tests pass. Completed embedded quantization provenance remains absent until pass two is allowed to finish. |
+| 5. Frozen telemetry and quantizer refusal | Proven | The production audit accepts the complete ledger, Hessian/imatrix index, KLDREF map, per-layer routing/count reconciliation, frozen policy, deficits, and exact fallback set. The reusable two-pass workflow required that audit and persisted its fingerprint and storage admission. Quantizer refusal tests pass, and the completed output embeds calibration hash `38051d70e2ffd63a` plus an effective 10,368-entry routed-expert fallback list. Finalization verified both gate-up and down tensors for every requested expert and rejected any non-BF16/F16 fallback tensor. An independent XXH64 read of the calibration artifact matches the embedded hash. |
 | 6. Independent batched state and chosen geometry | Proven on gfx1151 | Ragged independent-state scheduler tests and the Qwen layer-0 batch/row sweeps select batch 64, time tile 32, and 2,048 rows for this host. |
 | 7. Shared grouped-MoE substrate | Mechanism proven; serving gate pending | Scratch/routing/capture live in `hipfire-runtime`, the routed executor in `hipfire-dispatch`, and Qwen admits K=8/K=10. Production exercises raw K=10; matched grouped-versus-reference serving parity remains required after the GPU is free. |
 | 8. Second family | Proven | Gemma3-text uses the same engine/CLI, completed a 62-layer pause/resume stream, and completed a bounded calibrated second-pass join without a generic family branch. The new index-only auditor passes its 434-Hessian/434-imatrix artifact, 809/809 logical ledger, and KLDREF structure without a family branch. |
@@ -1469,11 +1486,11 @@ does not mean the production artifact or admission ladder is complete.
 | 10. Precision portability | Partial; channel-ready | BF16/F16 conversion tests plus both grouped-expert and family-neutral dense/KLD raw-kernel compile coverage pass for RDNA2/3/4 and CDNA targets. Dense projections select WMMA only on capable architectures and otherwise use the scalar F16/BF16 fallback. The raw grouped channel binary no longer skips non-gfx1151 devices: it runs the portable F16/BF16 CPU-oracle comparison everywhere and emits an explicit architecture/dtype failure when the path cannot JIT or launch. Dispatch tests enumerate gfx906, gfx1030, gfx1100, gfx1200/1201, and gfx942. The refreshed gfx1151 row is prepared but paused; real execution or rejection rows from the other classes are still required. |
 | 11. Native workflow documentation | Proven | `MODEL-INDUCTION.md` and `QUANTIZE.md` name native calibration as default, Python as oracle/tooling only, and `oq4.25++` as the default quant. |
 
-Induction artifacts match that audit: both typed DFlash sidecars and the
-calibration artifact exist, and the manifest records DFlash complete. The
-target quant and TriAttention artifacts are absent. The two-pass manifest
-records `quantization_interrupted`, the induction target stage records
-`interrupted`, the GPU lock is free, and no downstream launcher remains armed.
+Induction artifacts match that audit: both typed DFlash sidecars, the
+calibration artifact, and the target quant exist. The two-pass manifest and the
+induction target stage both record `complete`, the GPU lock is free, and no
+failure is recorded. The TriAttention artifact and quality/admission evidence
+remain absent; no downstream launcher is represented as completed evidence.
 
 ## Definition of done
 
