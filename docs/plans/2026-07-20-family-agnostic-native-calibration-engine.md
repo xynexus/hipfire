@@ -402,7 +402,15 @@ seconds; the GPU lock became free and host available memory recovered to about
 08:35 using the unchanged production executable hash
 `f56e34d775ac97cca961687b5a4e04bb27728f0f072ae3f71262cabe7ded05af`.
 The induction waiter, host monitor, and 30-minute agent wake were rebound to the
-new process. Treat this restart as recovery-in-progress until layer 39 commits.
+new process. The recovered layer 39 committed at 08:42 in 6m51s, bringing the
+stream to 40/60 durable checkpoints with no new SVM failures. Its
+196,094,976-byte part independently hashes to
+`4bb404b79970970d29be0fa3d7fd38bc6e77c1b3a750ef55c7a5dbd8f84d30c0`.
+The layer journal consumes 691/1,038 logical tensors with no duplicates and
+reconciles 262,144 routed tokens into 2,621,440 K=10 gate-up rows and the same
+number of down rows over 128 microbatches. Both roles report zero dropped
+indices, zero batch slack, and zero consistency error; 262 experts meet the
+2,048-row floor, the exact remaining 250 are preserved, and 17 have zero hits.
 
 Still required before declaring the engine complete or promoting a production
 397B quant:
