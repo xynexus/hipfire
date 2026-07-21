@@ -6,13 +6,14 @@ use crate::qwen35::{
     dense_prefill_session_batch_host_pointer_tables,
     dense_prefill_session_batch_pointer_table_plan,
     dense_prefill_session_batch_prefix_tokens_positions,
-    expected_dense_prefill_session_state_route_shape, forward_streamed_grouped_moe_layer_batch,
-    free_streamed_layer_weights, upload_dense_prefill_session_batch_pointer_tables,
-    upload_prefill_batch_inputs_with_positions, DeltaNetMoeLayerWeights, DeltaNetState,
-    DensePrefillSessionBatchInput, DensePrefillSessionDeltaStateRoute,
-    DensePrefillSessionKvStateRoute, DensePrefillSessionStateRoute, ExpertWeights,
-    FullAttnMoeLayerWeights, LayerType, LayerWeights, MoeFfnWeights, PrefillBatchScratch,
-    Qwen35Config, RawExpertStorage, SharedExpertWeights, StateQuant,
+    expected_dense_prefill_session_state_route_shape, forward_streamed_dense_layer_batch,
+    forward_streamed_grouped_moe_layer_batch, free_streamed_layer_weights,
+    upload_dense_prefill_session_batch_pointer_tables, upload_prefill_batch_inputs_with_positions,
+    DeltaNetLayerWeights, DeltaNetMoeLayerWeights, DeltaNetState, DensePrefillSessionBatchInput,
+    DensePrefillSessionDeltaStateRoute, DensePrefillSessionKvStateRoute,
+    DensePrefillSessionStateRoute, ExpertWeights, FullAttnLayerWeights, FullAttnMoeLayerWeights,
+    LayerType, LayerWeights, MoeFfnWeights, PrefillBatchScratch, Qwen35Config, RawExpertStorage,
+    SharedExpertWeights, StateQuant,
 };
 use hip_bridge::DeviceBuffer;
 use hipfire_model::ModelSource;
@@ -62,12 +63,7 @@ pub fn inspect_qwen35_stream_source(
     let config = config_from_safetensors(source).ok_or_else(|| {
         CalibError::InvalidSourcePlan("could not parse Qwen3.5 source config".into())
     })?;
-    if config.num_experts == 0 {
-        return Err(CalibError::InvalidSourcePlan(
-            "the first streamed Qwen3.5 adapter requires a grouped-MoE checkpoint".into(),
-        ));
-    }
-    if !matches!(config.num_experts_per_tok, 8 | 10) {
+    if config.num_experts > 0 && !matches!(config.num_experts_per_tok, 8 | 10) {
         return Err(CalibError::InvalidSourcePlan(format!(
             "Qwen3.5 streamed calibration currently admits K-top 8 or 10, got {}",
             config.num_experts_per_tok
@@ -103,6 +99,7 @@ pub fn qwen35_tensor_requests(
         "embed_tokens.weight",
         TensorOwner::Persistent,
     )?;
+    let embedding_source = requests.last().unwrap().source_name.clone();
     push_required(
         source,
         &mut requests,
@@ -110,13 +107,25 @@ pub fn qwen35_tensor_requests(
         "norm.weight",
         TensorOwner::Persistent,
     )?;
-    push_required(
-        source,
-        &mut requests,
-        "lm_head",
-        "lm_head.weight",
-        TensorOwner::Persistent,
-    )?;
+    if qwen35_source_candidates("lm_head.weight")
+        .iter()
+        .any(|candidate| source.tensor_info(candidate).is_some())
+    {
+        push_required(
+            source,
+            &mut requests,
+            "lm_head",
+            "lm_head.weight",
+            TensorOwner::Persistent,
+        )?;
+    } else {
+        requests.push(TensorLoadRequest::alias(
+            "lm_head",
+            embedding_source,
+            TensorOwner::Persistent,
+            "embedding",
+        ));
+    }
 
     for (layer, layer_type) in config.layer_types.iter().enumerate() {
         let owner = TensorOwner::Layer(layer);
@@ -217,52 +226,78 @@ pub fn qwen35_capture_registry(
             CapturePolicy::HessianAndImatrix,
             None,
         )?;
-        register_capture(
-            &mut registry,
-            layer,
-            ProjectionRole::RouterInput,
-            None,
-            vec![
-                format!("{prefix}.mlp.gate"),
-                format!("{prefix}.mlp.shared_expert.gate_proj"),
-                format!("{prefix}.mlp.shared_expert.up_proj"),
-                format!("{prefix}.mlp.shared_expert_gate"),
-            ],
-            config.dim,
-            CapturePolicy::HessianAndImatrix,
-            None,
-        )?;
-        register_capture(
-            &mut registry,
-            layer,
-            ProjectionRole::SharedExpertInput,
-            None,
-            vec![format!("{prefix}.mlp.shared_expert.down_proj")],
-            config.shared_expert_intermediate_size,
-            CapturePolicy::HessianAndImatrix,
-            None,
-        )?;
-        for expert in 0..config.num_experts {
+        if config.num_experts == 0 {
             register_capture(
                 &mut registry,
                 layer,
                 ProjectionRole::GateUpInput,
-                Some(expert),
-                vec![format!("{prefix}.mlp.experts.{expert}.gate_up_proj")],
+                None,
+                vec![
+                    format!("{prefix}.mlp.gate_proj"),
+                    format!("{prefix}.mlp.up_proj"),
+                ],
                 config.dim,
-                CapturePolicy::ImatrixOnly,
-                Some(quota),
+                CapturePolicy::HessianAndImatrix,
+                None,
             )?;
             register_capture(
                 &mut registry,
                 layer,
                 ProjectionRole::DownInput,
-                Some(expert),
-                vec![format!("{prefix}.mlp.experts.{expert}.down_proj")],
-                config.moe_intermediate_size,
-                CapturePolicy::ImatrixOnly,
-                Some(quota),
+                None,
+                vec![format!("{prefix}.mlp.down_proj")],
+                config.hidden_dim,
+                CapturePolicy::HessianAndImatrix,
+                None,
             )?;
+        } else {
+            register_capture(
+                &mut registry,
+                layer,
+                ProjectionRole::RouterInput,
+                None,
+                vec![
+                    format!("{prefix}.mlp.gate"),
+                    format!("{prefix}.mlp.shared_expert.gate_proj"),
+                    format!("{prefix}.mlp.shared_expert.up_proj"),
+                    format!("{prefix}.mlp.shared_expert_gate"),
+                ],
+                config.dim,
+                CapturePolicy::HessianAndImatrix,
+                None,
+            )?;
+            register_capture(
+                &mut registry,
+                layer,
+                ProjectionRole::SharedExpertInput,
+                None,
+                vec![format!("{prefix}.mlp.shared_expert.down_proj")],
+                config.shared_expert_intermediate_size,
+                CapturePolicy::HessianAndImatrix,
+                None,
+            )?;
+            for expert in 0..config.num_experts {
+                register_capture(
+                    &mut registry,
+                    layer,
+                    ProjectionRole::GateUpInput,
+                    Some(expert),
+                    vec![format!("{prefix}.mlp.experts.{expert}.gate_up_proj")],
+                    config.dim,
+                    CapturePolicy::ImatrixOnly,
+                    Some(quota),
+                )?;
+                register_capture(
+                    &mut registry,
+                    layer,
+                    ProjectionRole::DownInput,
+                    Some(expert),
+                    vec![format!("{prefix}.mlp.experts.{expert}.down_proj")],
+                    config.moe_intermediate_size,
+                    CapturePolicy::ImatrixOnly,
+                    Some(quota),
+                )?;
+            }
         }
     }
     Ok(registry)
@@ -467,23 +502,64 @@ pub fn load_qwen35_streamed_layer(
                 config.dim,
                 d_inner,
             )?);
-            // Load the large routed FFN last. Its loader has its own rollback;
-            // after it succeeds, assembling the layer is infallible.
-            let ffn = load_streamed_moe_ffn(reader, gpu, config, layer, &prefix)?;
-            Ok(LayerWeights::DeltaNetMoe(DeltaNetMoeLayerWeights {
-                attn_norm: pending.take_tensor(attn_norm),
-                wqkv: pending.take_weight(wqkv),
-                wz: pending.take_weight(wz),
-                w_alpha: pending.take_weight(w_alpha),
-                w_beta: pending.take_weight(w_beta),
-                a_log: pending.take_tensor(a_log),
-                dt_bias: pending.take_tensor(dt_bias),
-                conv_weight: pending.take_tensor(conv_weight),
-                norm_weight: pending.take_tensor(norm_weight),
-                wo: pending.take_weight(wo),
-                ffn_norm: pending.take_tensor(ffn_norm),
-                ffn,
-            }))
+            if config.num_experts > 0 {
+                // Load the large routed FFN last. Its loader has its own rollback;
+                // after it succeeds, assembling the layer is infallible.
+                let ffn = load_streamed_moe_ffn(reader, gpu, config, layer, &prefix)?;
+                Ok(LayerWeights::DeltaNetMoe(DeltaNetMoeLayerWeights {
+                    attn_norm: pending.take_tensor(attn_norm),
+                    wqkv: pending.take_weight(wqkv),
+                    wz: pending.take_weight(wz),
+                    w_alpha: pending.take_weight(w_alpha),
+                    w_beta: pending.take_weight(w_beta),
+                    a_log: pending.take_tensor(a_log),
+                    dt_bias: pending.take_tensor(dt_bias),
+                    conv_weight: pending.take_tensor(conv_weight),
+                    norm_weight: pending.take_tensor(norm_weight),
+                    wo: pending.take_weight(wo),
+                    ffn_norm: pending.take_tensor(ffn_norm),
+                    ffn,
+                }))
+            } else {
+                let w_gate = pending.push_weight(load_matrix(
+                    reader,
+                    gpu,
+                    &format!("{prefix}.mlp.gate_proj.weight"),
+                    config.hidden_dim,
+                    config.dim,
+                )?);
+                let w_up = pending.push_weight(load_matrix(
+                    reader,
+                    gpu,
+                    &format!("{prefix}.mlp.up_proj.weight"),
+                    config.hidden_dim,
+                    config.dim,
+                )?);
+                let w_down = pending.push_weight(load_matrix(
+                    reader,
+                    gpu,
+                    &format!("{prefix}.mlp.down_proj.weight"),
+                    config.dim,
+                    config.hidden_dim,
+                )?);
+                Ok(LayerWeights::DeltaNet(DeltaNetLayerWeights {
+                    attn_norm: pending.take_tensor(attn_norm),
+                    wqkv: pending.take_weight(wqkv),
+                    wz: pending.take_weight(wz),
+                    w_alpha: pending.take_weight(w_alpha),
+                    w_beta: pending.take_weight(w_beta),
+                    a_log: pending.take_tensor(a_log),
+                    dt_bias: pending.take_tensor(dt_bias),
+                    conv_weight: pending.take_tensor(conv_weight),
+                    norm_weight: pending.take_tensor(norm_weight),
+                    wo: pending.take_weight(wo),
+                    ffn_norm: pending.take_tensor(ffn_norm),
+                    w_gate: pending.take_weight(w_gate),
+                    w_up: pending.take_weight(w_up),
+                    w_down: pending.take_weight(w_down),
+                    bf16_down_shadow: None,
+                }))
+            }
         }
         LayerType::FullAttention => {
             let q_dim = config.n_heads * config.head_dim;
@@ -549,18 +625,56 @@ pub fn load_qwen35_streamed_layer(
                 config.head_dim,
                 true,
             )?);
-            let ffn = load_streamed_moe_ffn(reader, gpu, config, layer, &prefix)?;
-            Ok(LayerWeights::FullAttnMoe(FullAttnMoeLayerWeights {
-                attn_norm: pending.take_tensor(attn_norm),
-                wq: pending.take_weight(wq),
-                wk: pending.take_weight(wk),
-                wv: pending.take_weight(wv),
-                wo: pending.take_weight(wo),
-                q_norm: pending.take_tensor(q_norm),
-                k_norm: pending.take_tensor(k_norm),
-                ffn_norm: pending.take_tensor(ffn_norm),
-                ffn,
-            }))
+            if config.num_experts > 0 {
+                let ffn = load_streamed_moe_ffn(reader, gpu, config, layer, &prefix)?;
+                Ok(LayerWeights::FullAttnMoe(FullAttnMoeLayerWeights {
+                    attn_norm: pending.take_tensor(attn_norm),
+                    wq: pending.take_weight(wq),
+                    wk: pending.take_weight(wk),
+                    wv: pending.take_weight(wv),
+                    wo: pending.take_weight(wo),
+                    q_norm: pending.take_tensor(q_norm),
+                    k_norm: pending.take_tensor(k_norm),
+                    ffn_norm: pending.take_tensor(ffn_norm),
+                    ffn,
+                }))
+            } else {
+                let w_gate = pending.push_weight(load_matrix(
+                    reader,
+                    gpu,
+                    &format!("{prefix}.mlp.gate_proj.weight"),
+                    config.hidden_dim,
+                    config.dim,
+                )?);
+                let w_up = pending.push_weight(load_matrix(
+                    reader,
+                    gpu,
+                    &format!("{prefix}.mlp.up_proj.weight"),
+                    config.hidden_dim,
+                    config.dim,
+                )?);
+                let w_down = pending.push_weight(load_matrix(
+                    reader,
+                    gpu,
+                    &format!("{prefix}.mlp.down_proj.weight"),
+                    config.dim,
+                    config.hidden_dim,
+                )?);
+                Ok(LayerWeights::FullAttn(FullAttnLayerWeights {
+                    attn_norm: pending.take_tensor(attn_norm),
+                    wq: pending.take_weight(wq),
+                    wk: pending.take_weight(wk),
+                    wv: pending.take_weight(wv),
+                    wo: pending.take_weight(wo),
+                    q_norm: pending.take_tensor(q_norm),
+                    k_norm: pending.take_tensor(k_norm),
+                    ffn_norm: pending.take_tensor(ffn_norm),
+                    w_gate: pending.take_weight(w_gate),
+                    w_up: pending.take_weight(w_up),
+                    w_down: pending.take_weight(w_down),
+                    bf16_down_shadow: None,
+                }))
+            }
         }
     })();
     if result.is_err() {
@@ -699,20 +813,26 @@ fn qwen35_resource_estimate(
     let mut scratch_bytes = n * per_row_f32 * 4 + n * 2 * 4;
     scratch_bytes += n * k_top * 4; // routed indices, i32
 
-    let m_total = hipfire_runtime::moe::grouped::grouped_m_total_max(
-        scratch_rows,
-        config.num_experts_per_tok,
-        config.num_experts,
-    )
-    .map_err(|error| CalibError::InvalidOptions(error.to_string()))? as u128;
-    let routed_slots = n * k_top;
-    scratch_bytes += experts * 4
-        + (experts + 1) * 4
-        + m_total * 4
-        + routed_slots * 4
-        + (m_total / 16) * 4
-        + m_total * (2 * moe_intermediate) * 4
-        + m_total * dim * 4;
+    let m_total = if config.num_experts > 0 {
+        hipfire_runtime::moe::grouped::grouped_m_total_max(
+            scratch_rows,
+            config.num_experts_per_tok,
+            config.num_experts,
+        )
+        .map_err(|error| CalibError::InvalidOptions(error.to_string()))? as u128
+    } else {
+        0
+    };
+    if config.num_experts > 0 {
+        let routed_slots = n * k_top;
+        scratch_bytes += experts * 4
+            + (experts + 1) * 4
+            + m_total * 4
+            + routed_slots * 4
+            + (m_total / 16) * 4
+            + m_total * (2 * moe_intermediate) * 4
+            + m_total * dim * 4;
+    }
     scratch_bytes += n * linear_heads * linear_head_dim * linear_head_dim;
     scratch_bytes += n * linear_heads * linear_head_dim * 4;
 
@@ -755,7 +875,7 @@ impl CalibrationFamilyAdapter for Qwen35CalibrationAdapter {
     }
 
     fn adapter_version(&self) -> &'static str {
-        "qwen3.5-stream-v1"
+        "qwen3.5-stream-v2"
     }
 
     fn resource_estimate(
@@ -1001,36 +1121,40 @@ impl Qwen35StreamedCalibrationLayer {
             }
             return Ok(());
         }
-        let quota = registry
-            .get(CaptureId::new(
-                self.logical_layer,
-                ProjectionRole::GateUpInput,
-                Some(0),
-            ))
-            .and_then(|descriptor| descriptor.expert_quota)
-            .ok_or_else(|| {
-                CalibError::InvalidCapture(format!(
-                    "layer {} has no routed expert quota descriptor",
-                    self.logical_layer
-                ))
-            })?;
         let registry = Arc::new(registry.clone());
         let collector = Arc::new(CalibCollector::new());
-        let telemetry = ExpertTelemetry::new(
-            self.total_layers,
-            self.config.num_experts,
-            self.config.num_experts_per_tok,
-            quota,
-            4096,
-        )?;
-        let expert_capture = GroupedMoeCalibrationCapture::with_collector(
-            Arc::clone(&registry),
-            telemetry,
-            Arc::clone(&collector),
-        )?;
+        let expert_capture = if self.config.num_experts > 0 {
+            let quota = registry
+                .get(CaptureId::new(
+                    self.logical_layer,
+                    ProjectionRole::GateUpInput,
+                    Some(0),
+                ))
+                .and_then(|descriptor| descriptor.expert_quota)
+                .ok_or_else(|| {
+                    CalibError::InvalidCapture(format!(
+                        "layer {} has no routed expert quota descriptor",
+                        self.logical_layer
+                    ))
+                })?;
+            let telemetry = ExpertTelemetry::new(
+                self.total_layers,
+                self.config.num_experts,
+                self.config.num_experts_per_tok,
+                quota,
+                4096,
+            )?;
+            Some(GroupedMoeCalibrationCapture::with_collector(
+                Arc::clone(&registry),
+                telemetry,
+                Arc::clone(&collector),
+            )?)
+        } else {
+            None
+        };
         self.capture_registry = Some(registry);
         self.collector = Some(collector);
-        self.expert_capture = Some(expert_capture);
+        self.expert_capture = expert_capture;
         Ok(())
     }
 
@@ -1283,26 +1407,45 @@ impl CalibrationLayer for Qwen35StreamedCalibrationLayer {
             .max()
             .map(|pos| pos + 1)
             .unwrap_or(1);
-        let result = forward_streamed_grouped_moe_layer_batch(
-            gpu,
-            self.weights.as_ref().ok_or_else(|| {
-                CalibError::Runtime("Qwen calibration weights were already freed".into())
-            })?,
-            self.logical_layer,
-            &self.config,
-            pbs,
-            &device_tables,
-            route_shape,
-            batch.rows.len(),
-            inputs.len(),
-            max_ctx_len,
-            self.expert_capture
-                .as_ref()
-                .map(|capture| capture as &dyn hipfire_dispatch::families::moe::MoePrefillCapture),
-            self.collector
-                .as_deref()
-                .zip(self.capture_registry.as_deref()),
-        );
+        let weights = self.weights.as_ref().ok_or_else(|| {
+            CalibError::Runtime("Qwen calibration weights were already freed".into())
+        })?;
+        let dense_capture = self
+            .collector
+            .as_deref()
+            .zip(self.capture_registry.as_deref());
+        let result = if self.config.num_experts > 0 {
+            forward_streamed_grouped_moe_layer_batch(
+                gpu,
+                weights,
+                self.logical_layer,
+                &self.config,
+                pbs,
+                &device_tables,
+                route_shape,
+                batch.rows.len(),
+                inputs.len(),
+                max_ctx_len,
+                self.expert_capture.as_ref().map(|capture| {
+                    capture as &dyn hipfire_dispatch::families::moe::MoePrefillCapture
+                }),
+                dense_capture,
+            )
+        } else {
+            forward_streamed_dense_layer_batch(
+                gpu,
+                weights,
+                self.logical_layer,
+                &self.config,
+                pbs,
+                &device_tables,
+                route_shape,
+                batch.rows.len(),
+                inputs.len(),
+                max_ctx_len,
+                dense_capture,
+            )
+        };
         device_tables.free_gpu(gpu);
         result.map_err(|error| CalibError::Runtime(error.to_string()))?;
         let live_output = pbs.x_batch.sub_offset(0, expected);
@@ -1320,17 +1463,21 @@ impl CalibrationLayer for Qwen35StreamedCalibrationLayer {
         arch_id: u32,
         metadata_json: &str,
     ) -> Result<LayerCapturePartSummary, CalibError> {
-        let capture = self.expert_capture.take().ok_or_else(|| {
-            CalibError::InvalidCapture(format!(
+        let expert_telemetry = if let Some(capture) = self.expert_capture.take() {
+            capture.finalize()?;
+            let snapshot = capture
+                .telemetry_snapshot()
+                .layer_snapshot(self.logical_layer)?;
+            drop(capture);
+            Some(snapshot)
+        } else if self.config.num_experts > 0 {
+            return Err(CalibError::InvalidCapture(format!(
                 "layer {} has no routed capture state",
                 self.logical_layer
-            ))
-        })?;
-        capture.finalize()?;
-        let expert_telemetry = capture
-            .telemetry_snapshot()
-            .layer_snapshot(self.logical_layer)?;
-        drop(capture);
+            )));
+        } else {
+            None
+        };
         let collector = self.collector.take().ok_or_else(|| {
             CalibError::InvalidCapture(format!(
                 "layer {} has no calibration collector",
@@ -1353,7 +1500,7 @@ impl CalibrationLayer for Qwen35StreamedCalibrationLayer {
         Ok(LayerCapturePartSummary {
             descriptors,
             max_consistency,
-            expert_telemetry: Some(expert_telemetry),
+            expert_telemetry,
         })
     }
 
@@ -1569,6 +1716,54 @@ mod tests {
     }
 
     impl FakeSource {
+        fn dense() -> Self {
+            let layer_types = (0..4)
+                .map(|layer| {
+                    if layer % 4 == 3 {
+                        serde_json::Value::String("full_attention".into())
+                    } else {
+                        serde_json::Value::String("linear_attention".into())
+                    }
+                })
+                .collect::<Vec<_>>();
+            let config = serde_json::json!({
+                "model_type": "qwen3_5",
+                "hidden_size": 1024,
+                "intermediate_size": 3072,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 128,
+                "vocab_size": 248320,
+                "layer_types": layer_types,
+            });
+            let metadata = serde_json::json!({"config": config}).to_string();
+            let mut source = Self {
+                root: PathBuf::from("/dense"),
+                metadata,
+                infos: BTreeMap::new(),
+            };
+            let config = config_from_safetensors(&source).unwrap();
+            for request in expected_requests_without_lookup(&config) {
+                let source_name = qwen35_source_candidates(&request)
+                    .into_iter()
+                    .next()
+                    .unwrap();
+                source.infos.insert(
+                    source_name.clone(),
+                    TensorInfo {
+                        name: source_name,
+                        dtype: "BF16".into(),
+                        shape: vec![1],
+                        quant_type: 0xff,
+                        data_offset: source.infos.len() * 2,
+                        data_size: 2,
+                    },
+                );
+            }
+            source
+        }
+
         fn a17b() -> Self {
             let layer_types = (0..60)
                 .map(|layer| {
@@ -1685,15 +1880,23 @@ mod tests {
                     "self_attn.k_norm.weight",
                 ]),
             }
-            suffixes.extend([
-                "mlp.gate.weight",
-                "mlp.experts.gate_up_proj",
-                "mlp.experts.down_proj",
-                "mlp.shared_expert.gate_proj.weight",
-                "mlp.shared_expert.up_proj.weight",
-                "mlp.shared_expert.down_proj.weight",
-                "mlp.shared_expert_gate.weight",
-            ]);
+            if config.num_experts > 0 {
+                suffixes.extend([
+                    "mlp.gate.weight",
+                    "mlp.experts.gate_up_proj",
+                    "mlp.experts.down_proj",
+                    "mlp.shared_expert.gate_proj.weight",
+                    "mlp.shared_expert.up_proj.weight",
+                    "mlp.shared_expert.down_proj.weight",
+                    "mlp.shared_expert_gate.weight",
+                ]);
+            } else {
+                suffixes.extend([
+                    "mlp.gate_proj.weight",
+                    "mlp.up_proj.weight",
+                    "mlp.down_proj.weight",
+                ]);
+            }
             names.extend(
                 suffixes
                     .into_iter()
@@ -1717,6 +1920,48 @@ mod tests {
                 .filter(|request| request.owner == TensorOwner::Layer(59))
                 .count(),
             15
+        );
+    }
+
+    #[test]
+    fn dense_plan_covers_dense_ffn_tensors_without_expert_geometry() {
+        let source = FakeSource::dense();
+        let model = inspect_qwen35_stream_source(&source).unwrap();
+        assert_eq!(model.hidden_width, 1024);
+        assert_eq!(model.num_layers, 4);
+        assert_eq!(model.tensor_requests.len(), 56);
+        assert_eq!(
+            model
+                .tensor_requests
+                .iter()
+                .filter(|request| request.owner == TensorOwner::Layer(3))
+                .count(),
+            11
+        );
+        assert!(model
+            .tensor_requests
+            .iter()
+            .any(|request| request.logical_name == "layers.0.mlp.gate_proj.weight"));
+        assert!(!model
+            .tensor_requests
+            .iter()
+            .any(|request| request.logical_name.contains("mlp.experts")));
+    }
+
+    #[test]
+    fn dense_plan_aliases_a_missing_lm_head_to_tied_embeddings() {
+        let mut source = FakeSource::dense();
+        source.infos.remove("lm_head.weight");
+        let model = inspect_qwen35_stream_source(&source).unwrap();
+        let lm_head = model
+            .tensor_requests
+            .iter()
+            .find(|request| request.logical_name == "lm_head")
+            .unwrap();
+        assert_eq!(lm_head.alias_of.as_deref(), Some("embedding"));
+        assert_eq!(
+            lm_head.source_name,
+            "model.language_model.embed_tokens.weight"
         );
     }
 
@@ -1762,5 +2007,39 @@ mod tests {
         assert_eq!(expert.policy, CapturePolicy::ImatrixOnly);
         assert_eq!(expert.input_width, 1024);
         assert_eq!(expert.expert_quota, Some(quota));
+    }
+
+    #[test]
+    fn dense_capture_registry_aliases_gate_up_and_has_no_expert_quota() {
+        let source = FakeSource::dense();
+        let config = config_from_safetensors(&source).unwrap();
+        let registry = qwen35_capture_registry(&config, ExpertCaptureQuota::default()).unwrap();
+        assert_eq!(registry.len(), 4 * 4);
+
+        let gate = registry
+            .resolve_output("model.language_model.layers.0.mlp.gate_proj")
+            .unwrap();
+        assert_eq!(
+            Some(gate),
+            registry.resolve_output("model.language_model.layers.0.mlp.up_proj")
+        );
+        let gate = registry.get(gate).unwrap();
+        assert_eq!(gate.role, ProjectionRole::GateUpInput);
+        assert_eq!(gate.input_width, 1024);
+        assert_eq!(gate.policy, CapturePolicy::HessianAndImatrix);
+        assert_eq!(gate.expert_quota, None);
+
+        let down = registry
+            .get(CaptureId::new(3, ProjectionRole::DownInput, None))
+            .unwrap();
+        assert_eq!(down.input_width, 3072);
+        assert_eq!(down.policy, CapturePolicy::HessianAndImatrix);
+        assert_eq!(down.expert_quota, None);
+        assert!(registry
+            .get(CaptureId::new(0, ProjectionRole::RouterInput, None))
+            .is_none());
+        assert!(registry
+            .get(CaptureId::new(0, ProjectionRole::GateUpInput, Some(0)))
+            .is_none());
     }
 }

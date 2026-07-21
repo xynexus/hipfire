@@ -494,7 +494,7 @@ const GEMMA3_ARCH_IDS: &[u32] = &[ARCH_ID_GEMMA3_TEXT];
 const ADAPTERS: &[AdapterRegistration] = &[
     AdapterRegistration {
         family: "qwen3.5",
-        version: "qwen3.5-stream-v1",
+        version: "qwen3.5-stream-v2",
         arch_ids: QWEN35_ARCH_IDS,
         factory: || Box::new(Qwen35CalibrationAdapter::default()),
     },

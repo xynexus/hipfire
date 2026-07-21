@@ -1874,9 +1874,9 @@ fn prefill_session_batch_execution_plan_from_rounds(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn forward_prefill_dense_session_batch_prefix_full_precision(
+fn forward_dense_session_batch_layers_full_precision(
     gpu: &mut Gpu,
-    weights: &Qwen35Weights,
+    weights: Option<&Qwen35Weights>,
     config: &Qwen35Config,
     pbs: &PrefillBatchScratch,
     device_tables: &DensePrefillSessionBatchDevicePointerTables,
@@ -1884,6 +1884,14 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
     row_count: usize,
     sessions: usize,
     max_ctx_len: usize,
+    layer_override: Option<&LayerWeights>,
+    logical_layer_idx: Option<usize>,
+    embed_tokens: bool,
+    finalize_logits: bool,
+    dense_capture: Option<(
+        &hipfire_runtime::calibration::CalibCollector,
+        &hipfire_runtime::calibration::contracts::CaptureRegistry,
+    )>,
     // Per-batch KV quant (uniform across rows — see the state-signature contract).
     // true = the sessions' KV caches are plain Q8 (Q8_0); the KV write +
     // attention use the Q8 path. false = full-precision F32 KV.
@@ -1895,53 +1903,79 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
 
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
-            &weights.token_embd,
-            &pbs.x_batch,
-            &pbs.tokens,
-            row_count,
-            dim,
-        )?,
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
-            &weights.token_embd,
-            &pbs.x_batch,
-            &pbs.tokens,
-            row_count,
-            dim,
-        )?,
-        EmbeddingFormat::F32 => gpu.embedding_lookup_f32_batched(
-            &weights.token_embd,
-            &pbs.x_batch,
-            &pbs.tokens,
-            row_count,
-            dim,
-        )?,
-        EmbeddingFormat::BF16 => gpu.embedding_lookup_bf16_batched(
-            &weights.token_embd,
-            &pbs.x_batch,
-            &pbs.tokens,
-            row_count,
-            dim,
-        )?,
-        EmbeddingFormat::F16 => gpu.embedding_lookup_f16_batched(
-            &weights.token_embd,
-            &pbs.x_batch,
-            &pbs.tokens,
-            row_count,
-            dim,
-        )?,
-        other => {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("dense session fused prefix does not support embedding format {other:?}"),
-            ));
+    if embed_tokens {
+        let weights = weights.ok_or_else(|| {
+            hip_bridge::HipError::new(0, "embedding requested without resident Qwen weights")
+        })?;
+        match weights.embd_format {
+            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                row_count,
+                dim,
+            )?,
+            EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                row_count,
+                dim,
+            )?,
+            EmbeddingFormat::F32 => gpu.embedding_lookup_f32_batched(
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                row_count,
+                dim,
+            )?,
+            EmbeddingFormat::BF16 => gpu.embedding_lookup_bf16_batched(
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                row_count,
+                dim,
+            )?,
+            EmbeddingFormat::F16 => gpu.embedding_lookup_f16_batched(
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                row_count,
+                dim,
+            )?,
+            other => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "dense session fused prefix does not support embedding format {other:?}"
+                    ),
+                ));
+            }
         }
     }
 
     let mut delta_layer_idx = 0usize;
     for layer_idx in 0..config.n_layers {
-        match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
+        let layer_weights = if let Some(layer) = layer_override {
+            if layer_idx != 0 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "a streamed dense layer override cannot execute more than one layer",
+                ));
+            }
+            layer
+        } else {
+            weights
+                .and_then(|weights| weights.layers.get(layer_idx))
+                .ok_or_else(|| {
+                    hip_bridge::HipError::new(
+                        0,
+                        &format!("missing resident Qwen layer {layer_idx}"),
+                    )
+                })?
+        };
+        let capture_layer_idx = logical_layer_idx.unwrap_or(layer_idx);
+        match (layer_weights, config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 gpu.rmsnorm_batched(
                     &pbs.x_batch,
@@ -1950,6 +1984,15 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
                     row_count,
                     dim,
                     config.norm_eps,
+                )?;
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::QueryInput,
+                    &pbs.x_rot_batch,
+                    row_count,
+                    dim,
                 )?;
                 dense_session_prefill_gemm_full_precision(
                     gpu,
@@ -2062,6 +2105,15 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
                     config.norm_eps,
                     row_count,
                 )?;
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::AttentionOutputInput,
+                    &pbs.dn_normed_batch,
+                    row_count,
+                    n_v_heads * config.linear_value_head_dim,
+                )?;
                 dense_session_prefill_gemm_full_precision_residual(
                     gpu,
                     &layer.wo,
@@ -2079,6 +2131,15 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
                     dim,
                     config.norm_eps,
                 )?;
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::GateUpInput,
+                    &pbs.x_rot_batch,
+                    row_count,
+                    dim,
+                )?;
                 dense_session_prefill_gemm_full_precision(
                     gpu,
                     &layer.w_gate,
@@ -2094,6 +2155,15 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
                     row_count,
                 )?;
                 gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::DownInput,
+                    &pbs.ffn_hidden_batch,
+                    row_count,
+                    config.hidden_dim,
+                )?;
                 dense_session_prefill_gemm_full_precision_residual(
                     gpu,
                     &layer.w_down,
@@ -2113,6 +2183,15 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
                     row_count,
                     dim,
                     config.norm_eps,
+                )?;
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::QueryInput,
+                    &pbs.x_rot_batch,
+                    row_count,
+                    dim,
                 )?;
                 dense_session_prefill_gemm_full_precision(
                     gpu,
@@ -2230,6 +2309,15 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
                     )?;
                 }
                 qwen35_apply_fa_gate(gpu, config, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::AttentionOutputInput,
+                    &pbs.fa_attn_out_batch,
+                    row_count,
+                    config.n_heads * config.head_dim,
+                )?;
                 dense_session_prefill_gemm_full_precision_residual(
                     gpu,
                     &layer.wo,
@@ -2247,6 +2335,15 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
                     dim,
                     config.norm_eps,
                 )?;
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::GateUpInput,
+                    &pbs.x_rot_batch,
+                    row_count,
+                    dim,
+                )?;
                 dense_session_prefill_gemm_full_precision(
                     gpu,
                     &layer.w_gate,
@@ -2262,6 +2359,15 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
                     row_count,
                 )?;
                 gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+                capture_streamed_dense_input(
+                    gpu,
+                    dense_capture,
+                    capture_layer_idx,
+                    hipfire_runtime::calibration::contracts::ProjectionRole::DownInput,
+                    &pbs.ffn_hidden_batch,
+                    row_count,
+                    config.hidden_dim,
+                )?;
                 dense_session_prefill_gemm_full_precision_residual(
                     gpu,
                     &layer.w_down,
@@ -2280,14 +2386,52 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
         }
     }
 
-    dense_prefill_session_batch_final_logits_full_precision(
+    if finalize_logits {
+        dense_prefill_session_batch_final_logits_full_precision(
+            gpu,
+            weights.ok_or_else(|| {
+                hip_bridge::HipError::new(0, "final logits requested without resident weights")
+            })?,
+            config,
+            pbs,
+            device_tables,
+            row_count,
+            sessions,
+        )
+    } else {
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_dense_session_batch_prefix_full_precision(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    row_count: usize,
+    sessions: usize,
+    max_ctx_len: usize,
+    kv_q8: bool,
+) -> HipResult<()> {
+    forward_dense_session_batch_layers_full_precision(
         gpu,
-        weights,
+        Some(weights),
         config,
         pbs,
         device_tables,
+        route_shape,
         row_count,
         sessions,
+        max_ctx_len,
+        None,
+        None,
+        true,
+        true,
+        None,
+        kv_q8,
     )
 }
 
@@ -2443,6 +2587,51 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
         None,
         true,
         true,
+    )
+}
+
+/// Execute one already-embedded dense Qwen3.5 layer over independent session
+/// rows. The supplied config is a one-layer view, so KV and DeltaNet state
+/// indices are zero while `logical_layer_idx` preserves capture identity.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_streamed_dense_layer_batch(
+    gpu: &mut Gpu,
+    layer: &LayerWeights,
+    logical_layer_idx: usize,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    row_count: usize,
+    sessions: usize,
+    max_ctx_len: usize,
+    dense_capture: Option<(
+        &hipfire_runtime::calibration::CalibCollector,
+        &hipfire_runtime::calibration::contracts::CaptureRegistry,
+    )>,
+) -> HipResult<()> {
+    if config.n_layers != 1 || config.layer_types.len() != 1 || config.num_experts != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "streamed dense execution requires a one-layer dense config view",
+        ));
+    }
+    forward_dense_session_batch_layers_full_precision(
+        gpu,
+        None,
+        config,
+        pbs,
+        device_tables,
+        route_shape,
+        row_count,
+        sessions,
+        max_ctx_len,
+        Some(layer),
+        Some(logical_layer_idx),
+        false,
+        false,
+        dense_capture,
+        false,
     )
 }
 
