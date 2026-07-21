@@ -125,7 +125,7 @@ pub fn validate_qwen35_grouped_moe_decode_session_signatures(
         multi_state_prefix_rows: session_count,
         singleton_tail: None,
     };
-    qwen35::validate_grouped_moe_prefill_session_batch_q8_state_contract(
+    qwen35::validate_grouped_moe_prefill_session_batch_state_contract(
         config,
         signatures,
         &execution_plan,

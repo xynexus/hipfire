@@ -4625,7 +4625,7 @@ mod tests {
     }
 
     #[test]
-    fn grouped_moe_session_fused_prefix_contract_accepts_q8_state_control_path() {
+    fn grouped_moe_session_fused_prefix_contract_accepts_q8_and_fp32_delta_state() {
         let mut config = test_qwen35_config_with_layers(vec![
             LayerType::LinearAttention,
             LayerType::FullAttention,
@@ -4659,13 +4659,25 @@ mod tests {
             dn_quant: StateQuant::Q8,
         };
 
-        validate_grouped_moe_prefill_session_batch_q8_state_contract(
+        validate_grouped_moe_prefill_session_batch_state_contract(
             &config,
             &[q8_sig, q8_sig],
             &plan,
             "gfx1151",
         )
         .expect("A3B MQ4 control path uses grouped MoE with Q8 state");
+
+        let fp32_sig = DensePrefillSessionBatchStateSignature {
+            dn_quant: StateQuant::FP32,
+            ..q8_sig
+        };
+        validate_grouped_moe_prefill_session_batch_state_contract(
+            &config,
+            &[fp32_sig, fp32_sig],
+            &plan,
+            "gfx1151",
+        )
+        .expect("grouped MoE uses its routed FP32 DeltaNet branch when sessions require it");
     }
 
     #[test]
@@ -4701,7 +4713,7 @@ mod tests {
             dn_quant: StateQuant::Q8,
         };
 
-        let dense_err = validate_grouped_moe_prefill_session_batch_q8_state_contract(
+        let dense_err = validate_grouped_moe_prefill_session_batch_state_contract(
             &dense_config,
             &[q8_sig, q8_sig],
             &plan,
@@ -4716,7 +4728,7 @@ mod tests {
             dn_quant: StateQuant::FP32,
             ..q8_sig
         };
-        let fp32_err = validate_grouped_moe_prefill_session_batch_q8_state_contract(
+        let fp32_err = validate_grouped_moe_prefill_session_batch_state_contract(
             &moe_config,
             &[fp32_kv, fp32_kv],
             &plan,
@@ -4725,11 +4737,24 @@ mod tests {
         .unwrap_err();
         assert!(fp32_err.contains("must use Q8 KV state"));
 
+        let q4_delta = DensePrefillSessionBatchStateSignature {
+            dn_quant: StateQuant::Q4,
+            ..q8_sig
+        };
+        let q4_err = validate_grouped_moe_prefill_session_batch_state_contract(
+            &moe_config,
+            &[q4_delta, q4_delta],
+            &plan,
+            "gfx1151",
+        )
+        .unwrap_err();
+        assert!(q4_err.contains("supports Q8 or FP32"));
+
         let asym_kv = DensePrefillSessionBatchStateSignature {
             kv_quant_asym3: true,
             ..q8_sig
         };
-        let asym_err = validate_grouped_moe_prefill_session_batch_q8_state_contract(
+        let asym_err = validate_grouped_moe_prefill_session_batch_state_contract(
             &moe_config,
             &[asym_kv, asym_kv],
             &plan,
@@ -4738,7 +4763,7 @@ mod tests {
         .unwrap_err();
         assert!(asym_err.contains("unsupported KV quantization flags"));
 
-        let arch_err = validate_grouped_moe_prefill_session_batch_q8_state_contract(
+        let arch_err = validate_grouped_moe_prefill_session_batch_state_contract(
             &moe_config,
             &[q8_sig, q8_sig],
             &plan,

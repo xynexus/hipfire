@@ -992,7 +992,7 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_contract
     Ok(())
 }
 
-pub fn validate_grouped_moe_prefill_session_batch_q8_state_contract(
+pub fn validate_grouped_moe_prefill_session_batch_state_contract(
     config: &Qwen35Config,
     signatures: &[DensePrefillSessionBatchStateSignature],
     execution_plan: &DensePrefillSessionBatchExecutionPlan,
@@ -1045,9 +1045,9 @@ pub fn validate_grouped_moe_prefill_session_batch_q8_state_contract(
                 "grouped MoE session fused prefix row {idx} has unsupported KV quantization flags; first MoE target is plain Q8 KV"
             ));
         }
-        if signature.dn_quant != StateQuant::Q8 {
+        if !matches!(signature.dn_quant, StateQuant::Q8 | StateQuant::FP32) {
             return Err(format!(
-                "grouped MoE session fused prefix row {idx} has {:?} DeltaNet state; first MoE target is Q8 DeltaNet state",
+                "grouped MoE session fused prefix row {idx} has unsupported {:?} DeltaNet state; fused grouped MoE supports Q8 or FP32",
                 signature.dn_quant,
             ));
         }
@@ -2558,7 +2558,7 @@ pub fn forward_prefill_dense_session_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
+fn forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -2568,6 +2568,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
     row_count: usize,
     sessions: usize,
     max_ctx_len: usize,
+    delta_q8: bool,
 ) -> HipResult<()> {
     forward_grouped_moe_session_batch_layers(
         gpu,
@@ -2586,7 +2587,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
         None,
         None,
         true,
-        true,
+        delta_q8,
     )
 }
 
@@ -3627,13 +3628,19 @@ pub fn forward_prefill_grouped_moe_session_batch(
             dn_quant: row.dn_state.quant,
         })
         .collect();
-    validate_grouped_moe_prefill_session_batch_q8_state_contract(
+    validate_grouped_moe_prefill_session_batch_state_contract(
         config,
         &signatures,
         &execution_plan,
         gpu.arch.as_str(),
     )
     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    // Signature validation guarantees one state layout for every row. Select
+    // the already-implemented routed recurrence branch once for the batch.
+    let delta_q8 = signatures
+        .first()
+        .map(|signature| signature.dn_quant == StateQuant::Q8)
+        .unwrap_or(false);
     let route_shape = expected_dense_prefill_session_state_route_shape(config);
     let pointer_table_plan =
         dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, rows.len());
@@ -3695,7 +3702,7 @@ pub fn forward_prefill_grouped_moe_session_batch(
             ));
         }
     }
-    let result = forward_prefill_grouped_moe_session_batch_prefix_q8_control(
+    let result = forward_prefill_grouped_moe_session_batch_prefix_q8_kv(
         gpu,
         weights,
         config,
@@ -3705,6 +3712,7 @@ pub fn forward_prefill_grouped_moe_session_batch(
         execution_plan.multi_state_prefix_rows,
         rows.len(),
         max_ctx_len,
+        delta_q8,
     );
     device_pointer_tables.free_gpu(gpu);
     result.map(|()| shape)
