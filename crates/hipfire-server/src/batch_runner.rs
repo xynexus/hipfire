@@ -227,6 +227,9 @@ pub struct BatchTelemetry {
     pub last_chunk_count: u64,
     pub last_chunk_size: u64,
     pub last_decode_ms: Option<f64>,
+    pub compatible_state_kinds: Vec<String>,
+    pub cached_prefix_tokens: Option<u64>,
+    pub fallback_reason: Option<String>,
     pub active_sessions: u64,
     pub resident_runtime_sessions: u64,
     pub resident_decode_sessions: u64,
@@ -343,6 +346,11 @@ pub fn build_batch_decode_request(
     worker_key_id: &str,
     cursors: &[DecodeCursor],
 ) -> serde_json::Value {
+    let cached_prefix_tokens = cursors
+        .iter()
+        .map(|cursor| cursor.logical_position)
+        .min()
+        .unwrap_or_default();
     let sessions: Vec<serde_json::Value> = cursors
         .iter()
         .map(|c| {
@@ -359,7 +367,7 @@ pub fn build_batch_decode_request(
         "id": batch_id,
         "batch_id": batch_id,
         "worker_key_id": worker_key_id,
-        "cached_prefix_tokens": 0,
+        "cached_prefix_tokens": cached_prefix_tokens,
         "session_count": cursors.len(),
         "sessions": sessions,
     })
@@ -388,6 +396,9 @@ impl BatchTelemetry {
             "last_chunk_count": self.last_chunk_count,
             "last_chunk_size": self.last_chunk_size,
             "last_decode_ms": self.last_decode_ms,
+            "compatible_state_kinds": self.compatible_state_kinds,
+            "cached_prefix_tokens": self.cached_prefix_tokens,
+            "fallback_reason": self.fallback_reason,
             "active_sessions": self.active_sessions,
             "preemptions": self.preemptions,
             "image_preemptions": self.image_preemptions,
@@ -987,7 +998,12 @@ async fn run_batch_cycle(
 
     let quantum = min_quantum();
     let mut last_backend: Option<String> = None;
-    let mut chunk_count = 0u64;
+    let mut last_chunk_count = 0u64;
+    let mut last_chunk_size = 0u64;
+    let mut decode_ms = 0.0f64;
+    let mut compatible_state_kinds = Vec::new();
+    let mut cached_prefix_tokens = None;
+    let mut fallback_reason = None;
     let mut steps: u32 = 0;
     while !active.is_empty() {
         // Drop sessions whose client disconnected (response receiver closed):
@@ -1016,7 +1032,6 @@ async fn run_batch_cycle(
                 break;
             }
         };
-        chunk_count += 1;
         steps += 1;
 
         let mut still_active = Vec::new();
@@ -1066,6 +1081,33 @@ async fn run_batch_cycle(
                 .get("backend")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            last_chunk_count = done
+                .get("chunk_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default();
+            last_chunk_size = done
+                .get("chunk_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default();
+            decode_ms += done
+                .get("elapsed_ms")
+                .and_then(|v| v.as_f64())
+                .unwrap_or_default();
+            compatible_state_kinds = done
+                .get("compatible_state_kinds")
+                .and_then(|v| v.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            cached_prefix_tokens = done.get("cached_prefix_tokens").and_then(|v| v.as_u64());
+            fallback_reason = done
+                .get("fallback_reason")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
         }
         active = still_active;
 
@@ -1102,7 +1144,12 @@ async fn run_batch_cycle(
                     .collect();
                 let mut tel = state.batch_telemetry.lock().await;
                 tel.preemptions += 1;
-                tel.last_chunk_count = chunk_count;
+                tel.last_chunk_count = last_chunk_count;
+                tel.last_chunk_size = last_chunk_size;
+                tel.last_decode_ms = Some(decode_ms);
+                tel.compatible_state_kinds = compatible_state_kinds;
+                tel.cached_prefix_tokens = cached_prefix_tokens;
+                tel.fallback_reason = fallback_reason;
                 tel.last_backend = last_backend;
                 return CycleOutcome::Parked(parked);
             }
@@ -1117,8 +1164,16 @@ async fn run_batch_cycle(
 
     let mut tel = state.batch_telemetry.lock().await;
     tel.total_batches += 1;
+    if last_backend.as_deref() == Some("serial_reference") {
+        tel.serial_batches += 1;
+    }
     tel.selected_batch_size = specs.len() as u64;
-    tel.last_chunk_count = chunk_count;
+    tel.last_chunk_count = last_chunk_count;
+    tel.last_chunk_size = last_chunk_size;
+    tel.last_decode_ms = Some(decode_ms);
+    tel.compatible_state_kinds = compatible_state_kinds;
+    tel.cached_prefix_tokens = cached_prefix_tokens;
+    tel.fallback_reason = fallback_reason;
     tel.last_backend = last_backend;
     CycleOutcome::Completed
 }
@@ -1126,6 +1181,14 @@ async fn run_batch_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_health_exposes_daemon_scheduler_metadata() {
+        let health = BatchTelemetry::default().decode_health_json();
+        assert_eq!(health["compatible_state_kinds"], serde_json::json!([]));
+        assert!(health.get("cached_prefix_tokens").is_some());
+        assert!(health.get("fallback_reason").is_some());
+    }
 
     fn spec(id: &str) -> SessionSpec {
         SessionSpec {
@@ -1187,6 +1250,7 @@ mod tests {
         assert_eq!(env.sessions.len(), 2);
         assert_eq!(env.sessions[1].session_id, "req-b");
         assert_eq!(env.sessions[0].logical_position, 7);
+        assert_eq!(env.cached_prefix_tokens, 7);
     }
 
     // Dummy impl exercises the generic seam without a GPU or a real arch:

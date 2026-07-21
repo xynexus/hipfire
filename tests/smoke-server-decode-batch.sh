@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAEMON="${DAEMON:-$ROOT/target/release/hipfire-daemon}"
 MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b-mq4.hfq}"
+REQUEST_MODEL="${REQUEST_MODEL:-$(basename "$MODEL" .hfq)}"
 MAX_SEQ="${MAX_SEQ:-512}"
 DECODE_BACKEND="${HIPFIRE_QWEN35_DECODE_BATCH:-serial}"
 EXPECTED_DECODE_BACKEND="${EXPECTED_DECODE_BACKEND:-}"
@@ -34,7 +35,7 @@ if [[ ! -f "$MODEL" ]]; then
     exit 2
 fi
 
-python3 - "$ROOT" "$DAEMON" "$MODEL" "$MAX_SEQ" "$DECODE_BACKEND" "$EXPECTED_DECODE_BACKEND" <<'PY'
+python3 - "$ROOT" "$DAEMON" "$MODEL" "$REQUEST_MODEL" "$MAX_SEQ" "$DECODE_BACKEND" "$EXPECTED_DECODE_BACKEND" <<'PY'
 import concurrent.futures
 import json
 import os
@@ -49,7 +50,7 @@ import urllib.request
 from math import ceil
 from typing import Any
 
-root, daemon, model, max_seq_s, decode_backend, expected_decode_backend = sys.argv[1:]
+root, daemon, model, request_model, max_seq_s, decode_backend, expected_decode_backend = sys.argv[1:]
 max_seq = int(max_seq_s)
 if not expected_decode_backend:
     if decode_backend in {"auto", "fused", "fused_dense", "fused_dense_layer_chunked"}:
@@ -58,13 +59,17 @@ if not expected_decode_backend:
         expected_decode_backend = "fused_grouped_moe_layer_chunked"
     else:
         expected_decode_backend = "serial_reference"
-default_request_max_tokens = "1" if expected_decode_backend in {"fused_dense_layer_chunked", "fused_grouped_moe_layer_chunked"} else "2"
+# One generated token can be satisfied by the post-prefill sample and therefore
+# does not prove that either decode backend ran. Require a second token so the
+# telemetry assertions below always cover an actual decode step.
+default_request_max_tokens = "2"
 request_max_tokens = int(os.environ.get("HIPFIRE_DECODE_BATCH_MAX_TOKENS", default_request_max_tokens))
 requested_decode_chunk_size = int(os.environ.get("HIPFIRE_QWEN35_DECODE_BATCH_MAX", "0") or "0")
 request_count = int(os.environ.get("HIPFIRE_DECODE_BATCH_REQUESTS", "2"))
 if request_count < 2:
     raise RuntimeError("HIPFIRE_DECODE_BATCH_REQUESTS must be >= 2")
 dense_fused_mode = expected_decode_backend == "fused_dense_layer_chunked"
+kv_cache = "fp32" if dense_fused_mode else "q8"
 native_multirow_enabled = os.environ.get("HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW", "").lower() in {"1", "true", "yes", "on"}
 
 
@@ -103,7 +108,7 @@ def wait_health(base_url: str, proc: subprocess.Popen[str], log_path: str) -> di
 
 def chat_request(base_url: str, label: str) -> dict[str, Any]:
     body = {
-        "model": model,
+        "model": request_model,
         "messages": [
             {"role": "system", "content": "Answer with only one short lowercase word."},
             {"role": "user", "content": f"Return a common color word for {label}."},
@@ -147,8 +152,7 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
     env.update({
         "HIPFIRE_DAEMON_BIN": daemon,
         "HIPFIRE_MODEL": model,
-        "HIPFIRE_KV_MODE": "fp32" if dense_fused_mode else "q8",
-        "HIPFIRE_QWEN35_STATE_QUANT": "fp32" if dense_fused_mode else "q8",
+        "HIPFIRE_KV_MODE": kv_cache,
         "HIPFIRE_NO_PID_FILE": "1",
         "HIPFIRE_SERVER_PREFILL_BATCH": "1",
         "HIPFIRE_SERVER_PREFILL_BATCH_MAX": str(request_count),
@@ -161,7 +165,12 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
     })
 
     proc = subprocess.Popen(
-        ["cargo", "run", "-q", "-p", "hipfire-cli", "--", "serve", "--host", "127.0.0.1", "--port", str(port)],
+        [
+            "cargo", "run", "-q", "-p", "hipfire-cli", "--", "serve",
+            "--host", "127.0.0.1", "--port", str(port),
+            "--max-seq", str(max_seq), "--max-tokens", str(request_max_tokens),
+            "--kv-cache", kv_cache,
+        ],
         cwd=root,
         stdin=subprocess.DEVNULL,
         stdout=log_file,

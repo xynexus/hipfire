@@ -16,6 +16,15 @@ pub struct ServeArgs {
     /// Default model name, shorthand, alias, or path for requests that omit model
     #[arg(long, short)]
     pub model: Option<String>,
+    /// Override the startup-resolved maximum sequence length.
+    #[arg(long)]
+    pub max_seq: Option<u32>,
+    /// Override the startup-resolved maximum generated-token budget.
+    #[arg(long)]
+    pub max_tokens: Option<u32>,
+    /// Override the startup-resolved KV-cache mode.
+    #[arg(long)]
+    pub kv_cache: Option<String>,
     /// Log full raw chat requests and raw model replies.
     #[arg(long)]
     pub debug_chat: bool,
@@ -33,6 +42,21 @@ pub async fn run(args: ServeArgs, config: LoadedConfig) -> anyhow::Result<()> {
         cli_layer
             .values
             .insert("default_model".to_string(), json!(m));
+    }
+    if let Some(max_seq) = args.max_seq {
+        cli_layer
+            .values
+            .insert("max_seq".to_string(), json!(max_seq));
+    }
+    if let Some(max_tokens) = args.max_tokens {
+        cli_layer
+            .values
+            .insert("max_tokens".to_string(), json!(max_tokens));
+    }
+    if let Some(kv_cache) = args.kv_cache {
+        cli_layer
+            .values
+            .insert("kv_cache".to_string(), json!(kv_cache));
     }
     if args.debug_chat {
         std::env::set_var("HIPFIRE_DEBUG_CHAT", "1");
