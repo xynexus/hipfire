@@ -439,6 +439,20 @@ authoritative for resume and completed-artifact reuse. Focused workflow tests
 cover nonzero-checkpoint resume, finalization, no-progress rejection,
 provenance persistence, and induction CLI forwarding.
 
+The first production segment completed at 09:42 AWST. It advanced the durable
+boundary from 43 to 47 layers, exited normally at the requested absolute
+boundary, released its mappings for five seconds, and the stable controller
+started a fresh 47--51 child. No SVM failure occurred. The layer-46 journal
+hash is `04c63cd00ac66d7c8374b76755cfc2c44cddaf529bde55398aff2518f8396166`;
+it records 814/1,038 consumed logical tensors with no duplicates, 2,621,440
+K=10 routed slots with no drops, identical 2,621,440-row gate-up/down seen
+counts, zero capture-role consistency error, 275 experts at the 2,048-row
+floor, and the exact remaining 237 experts preserved. Across all 47 durable
+layer journals, 123,207,680 routed slots reconcile with zero drops and zero
+maximum consistency error, while 7,052 layer-experts are explicitly marked for
+high-precision fallback. This proves the process-lifetime mitigation at a real
+boundary; final artifact completion remains pending.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
@@ -1397,7 +1411,7 @@ decode, and host-to-device upload before considering pinned host staging or
 GPU double buffering. Kernel changes come after those measurements and land
 one lever at a time.
 
-## Completion audit — 2026-07-21 08:04 AWST
+## Completion audit — 2026-07-21 09:43 AWST
 
 This table evaluates the numbered definition of done below. "Mechanism proven"
 does not mean the production artifact or admission ladder is complete.
@@ -1405,9 +1419,9 @@ does not mean the production artifact or admission ladder is complete.
 | Item | Status | Authoritative evidence / missing proof |
 |---|---|---|
 | 1. Family-resolved native CLI | Proven | Qwen3.5 and Gemma3-text registry/factory tests plus successful architecture-selected dry runs and real streams; no family CLI flag exists. |
-| 2. Complete 397B teacher artifact | In progress | The durable production stream has 38 of 60 layer checkpoints. It crossed the prior layer-31 and layer-35 SVM-pressure failures with lookahead disabled; the exact recipe/binary resumed from the intact checkpoint at 07:39 AWST and has since durably committed through layer 37. No final `.calib.hfq` exists yet, so finalizer, KLDREF, complete ledger, and all-layer telemetry are not proven. |
-| 3. Second and only target-source pass | Pending; storage admission proven | The target `Qwen3.5-397B-A17B.oq4.25++.hfq` does not exist. The quantizer join is implemented and bounded Gemma join evidence exists, but the production source pass has not run. Before that pass, the reusable wrapper now computes and persists an index-only mixed-output estimate using the artifact's exact high-precision fallback set and refuses insufficient storage. At 38/60 durable checkpoints, 4,875 layer-experts are already marked for exact high-precision fallback; the final admission intentionally waits for the complete fallback set before producing its authoritative byte estimate. |
-| 4. Per-layer/per-expert floor | Mechanism proven; production pending | Unit/GPU capture tests and all 38 durable production layer journals reconcile K=10 routing. The recovered layer 35 independently reconciles 2,621,440 routed slots across 128 microbatches, zero dropped indices, 274 admitted experts, and the exact 238-expert fallback set; layers 36 and 37 preserve the same exact floor/admission accounting with zero consistency error. Serialized layer snapshots validate routed slots, full/admitted weight counts, quota/slack accounting, and reduction tiles. Preserve-undercovered records real deficits, but the complete 60-layer fallback set is not available until finalization. |
+| 2. Complete 397B teacher artifact | In progress | The durable production stream has 47 of 60 layer checkpoints. The first process-lifetime-bounded child advanced 43--47, exited normally at its requested boundary, released mappings, and the stable controller started a fresh 47--51 child with no SVM failure. No final `.calib.hfq` exists yet, so finalizer, KLDREF, complete ledger, and all-layer telemetry are not proven. |
+| 3. Second and only target-source pass | Pending; storage admission proven | The target `Qwen3.5-397B-A17B.oq4.25++.hfq` does not exist. The quantizer join is implemented and bounded Gemma join evidence exists, but the production source pass has not run. Before that pass, the reusable wrapper now computes and persists an index-only mixed-output estimate using the artifact's exact high-precision fallback set and refuses insufficient storage. At 47/60 durable checkpoints, 7,052 layer-experts are already marked for exact high-precision fallback; the final admission intentionally waits for the complete fallback set before producing its authoritative byte estimate. |
+| 4. Per-layer/per-expert floor | Mechanism proven; production pending | Unit/GPU capture tests and all 47 durable production layer journals reconcile 123,207,680 K=10 routed slots with zero dropped indices and zero maximum consistency error. Layer 46 independently reconciles 2,621,440 routed slots across 128 microbatches, identical gate-up/down accounting, 275 experts at the floor, and the exact remaining 237-expert fallback set. Serialized layer snapshots validate routed slots, full/admitted weight counts, quota/slack accounting, and reduction tiles. Preserve-undercovered records real deficits, but the complete 60-layer fallback set is not available until finalization. |
 | 5. Frozen telemetry and quantizer refusal | Mechanism proven; production pending | `artifact audit-calibration` now provides a family-neutral nonzero gate for the complete ledger, Hessian/imatrix index, KLDREF map, per-layer telemetry reconciliation, policy, deficits, and exact high-precision fallback set. The reusable two-pass workflow requires that gate before quantization and persists its fingerprint-bound report; induction will not reuse a target manifest without it. Quantizer enforcement tests pass; the final production artifact and quantizer evidence are absent. |
 | 6. Independent batched state and chosen geometry | Proven on gfx1151 | Ragged independent-state scheduler tests and the Qwen layer-0 batch/row sweeps select batch 64, time tile 32, and 2,048 rows for this host. |
 | 7. Shared grouped-MoE substrate | Mechanism proven; serving gate pending | Scratch/routing/capture live in `hipfire-runtime`, the routed executor in `hipfire-dispatch`, and Qwen admits K=8/K=10. Production exercises raw K=10; matched grouped-versus-reference serving parity remains required after the GPU is free. |
