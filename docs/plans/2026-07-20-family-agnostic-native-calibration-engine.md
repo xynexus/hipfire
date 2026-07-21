@@ -391,6 +391,19 @@ time tile 32, row budget 2,048, the 2,048/4,096 expert floor/target, and KLDREF
 top-k 64. The induction, two-pass, and frozen-expert-plan unit suites pass
 33/33 against this handoff logic.
 
+The layer-39 attempt then reproduced the same host-pressure failure class. Its
+read counter stopped advancing, the main thread blocked in
+`lock_mm_and_find_vma`/`folio_wait_bit_common`, full I/O pressure exceeded 82%,
+and the kernel logged new SVM mapping failures from 08:31:49 through 08:33:36
+AWST. The durable state remained exactly 39/60 with no layer-39 part or journal.
+After stopping the induction waiter, `SIGTERM` released the process in six
+seconds; the GPU lock became free and host available memory recovered to about
+127.6 GiB. PID 2204576 resumed the exact no-prefetch recipe at layer 39 at
+08:35 using the unchanged production executable hash
+`f56e34d775ac97cca961687b5a4e04bb27728f0f072ae3f71262cabe7ded05af`.
+The induction waiter, host monitor, and 30-minute agent wake were rebound to the
+new process. Treat this restart as recovery-in-progress until layer 39 commits.
+
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
@@ -418,9 +431,13 @@ GPU; no timing claim follows from the script itself.
 `/srv` cannot host the production outputs on the current host snapshot: it has
 approximately 4.3 GiB free while the source checkpoint alone is approximately
 807 GB. `/home` is the proposed artifact/spool root and had approximately
-381 GiB free at the latest check. Treat that number as transient: the native
-production preflight reports live availability and must pass immediately before
-starting each full pass. A dry run is not throughput, coverage, quality, or
+500.8 GB free at the latest check. At 39/60 checkpoints, the 5,141 exact
+high-precision fallback layer-experts imply a partial lower-bound target size
+of 318.4 GB and a conservative 387.2 GB free-space requirement. Extrapolating
+the observed fallback counts by layer type gives about 440 GB required at
+completion, but that is capacity planning only: final admission waits for the
+complete fallback set and live filesystem availability. Treat all free-space
+figures as transient. A dry run is not throughput, coverage, quality, or
 source-payload-read evidence.
 
 ## Outcome
