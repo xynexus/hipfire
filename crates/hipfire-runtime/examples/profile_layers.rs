@@ -231,6 +231,12 @@ fn profile_token(
         weights::EmbeddingFormat::Q8_0 => gpu
             .embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)
             .unwrap(),
+        weights::EmbeddingFormat::BF16 => gpu
+            .embedding_lookup_bf16(&weights.token_embd, &scratch.x, token, dim)
+            .unwrap(),
+        weights::EmbeddingFormat::F16 => gpu
+            .embedding_lookup_f16(&weights.token_embd, &scratch.x, token, dim)
+            .unwrap(),
         weights::EmbeddingFormat::Q4K => gpu
             .embedding_lookup_q4k(&weights.token_embd, &scratch.x, token, dim)
             .unwrap(),

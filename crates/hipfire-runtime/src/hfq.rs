@@ -1999,6 +1999,21 @@ pub fn load_weights_hfq(
             gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
             EmbeddingFormat::Q8_0,
         )
+    } else if embd_info.0.quant_type == 16 {
+        // Native bf16 table: upload raw 2 B/elem; gather converts to f32 inline
+        // (no F32 promotion). Keeps the largest tensor at half the memory.
+        eprintln!("    (bf16 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        (
+            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
+            EmbeddingFormat::BF16,
+        )
+    } else if embd_info.0.quant_type == 1 {
+        // Native f16 table: upload raw; gather converts f16->f32 inline.
+        eprintln!("    (f16 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        (
+            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
+            EmbeddingFormat::F16,
+        )
     } else {
         (
             load_f16_tensor(

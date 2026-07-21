@@ -385,6 +385,11 @@ fn load_lm_head(
             EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
             EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
             EmbeddingFormat::Q8_0 => DType::Q8_0,
+            // BF16/F16 gather tables are kept raw for the embedding lookup, but the
+            // tied lm_head matmul consumes an F32-decoded copy (info.quant_type
+            // 16/1 -> decode_direct_f32 below), matching the pre-existing direct
+            // F16/BF16/F32 handling.
+            EmbeddingFormat::BF16 | EmbeddingFormat::F16 => DType::F32,
             EmbeddingFormat::F32 => DType::F32,
             EmbeddingFormat::Q4K => panic!("qwen2: tied embeddings with Q4K not supported"),
         };
@@ -986,6 +991,12 @@ fn embed_token_into_x(
         }
         EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?
+        }
+        EmbeddingFormat::BF16 => {
+            gpu.embedding_lookup_bf16(&weights.token_embd, &state.x, token, dim)?
+        }
+        EmbeddingFormat::F16 => {
+            gpu.embedding_lookup_f16(&weights.token_embd, &state.x, token, dim)?
         }
         EmbeddingFormat::Q4K => {
             gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?

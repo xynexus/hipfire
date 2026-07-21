@@ -6993,6 +6993,12 @@ pub fn spec_step_dflash(
                 hipfire_runtime::weights::EmbeddingFormat::Q8_0 => {
                     gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
                 }
+                hipfire_runtime::weights::EmbeddingFormat::BF16 => {
+                    gpu.embedding_lookup_bf16(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::weights::EmbeddingFormat::F16 => {
+                    gpu.embedding_lookup_f16(&target.weights.token_embd, &dst, tok, h)?
+                }
                 hipfire_runtime::weights::EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
                 }
@@ -10214,6 +10220,12 @@ fn run_dflash_draft_for_logits(
             hipfire_runtime::weights::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
             }
+            hipfire_runtime::weights::EmbeddingFormat::BF16 => {
+                gpu.embedding_lookup_bf16(&target.weights.token_embd, &dst, tok, h)?
+            }
+            hipfire_runtime::weights::EmbeddingFormat::F16 => {
+                gpu.embedding_lookup_f16(&target.weights.token_embd, &dst, tok, h)?
+            }
             hipfire_runtime::weights::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
             }
@@ -10417,6 +10429,12 @@ fn run_dflash_draft_for_topk_gpu(
             }
             hipfire_runtime::weights::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
+            }
+            hipfire_runtime::weights::EmbeddingFormat::BF16 => {
+                gpu.embedding_lookup_bf16(&target.weights.token_embd, &dst, tok, h)?
+            }
+            hipfire_runtime::weights::EmbeddingFormat::F16 => {
+                gpu.embedding_lookup_f16(&target.weights.token_embd, &dst, tok, h)?
             }
             hipfire_runtime::weights::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?

@@ -313,6 +313,18 @@ fn embed_token(
             token,
             config.hidden_size,
         )?,
+        EmbeddingFormat::BF16 => gpu.embedding_lookup_bf16(
+            &weights.core.token_embd,
+            &state.x,
+            token,
+            config.hidden_size,
+        )?,
+        EmbeddingFormat::F16 => gpu.embedding_lookup_f16(
+            &weights.core.token_embd,
+            &state.x,
+            token,
+            config.hidden_size,
+        )?,
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(
             &weights.core.token_embd,
             &state.x,

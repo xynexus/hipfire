@@ -1071,7 +1071,11 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(
 ) -> Result<(), String> {
     if !matches!(
         weights.embd_format,
-        EmbeddingFormat::F32 | EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ4G256
+        EmbeddingFormat::F32
+            | EmbeddingFormat::Q8_0
+            | EmbeddingFormat::HFQ4G256
+            | EmbeddingFormat::BF16
+            | EmbeddingFormat::F16
     ) {
         return Err(format!(
             "dense session fused prefix does not support embedding format {:?} yet",
@@ -1913,6 +1917,20 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
             row_count,
             dim,
         )?,
+        EmbeddingFormat::BF16 => gpu.embedding_lookup_bf16_batched(
+            &weights.token_embd,
+            &pbs.x_batch,
+            &pbs.tokens,
+            row_count,
+            dim,
+        )?,
+        EmbeddingFormat::F16 => gpu.embedding_lookup_f16_batched(
+            &weights.token_embd,
+            &pbs.x_batch,
+            &pbs.tokens,
+            row_count,
+            dim,
+        )?,
         other => {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -2555,6 +2573,20 @@ fn forward_grouped_moe_session_batch_layers(
                 dim,
             )?,
             EmbeddingFormat::F32 => gpu.embedding_lookup_f32_batched(
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                row_count,
+                dim,
+            )?,
+            EmbeddingFormat::BF16 => gpu.embedding_lookup_bf16_batched(
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                row_count,
+                dim,
+            )?,
+            EmbeddingFormat::F16 => gpu.embedding_lookup_f16_batched(
                 &weights.token_embd,
                 &pbs.x_batch,
                 &pbs.tokens,

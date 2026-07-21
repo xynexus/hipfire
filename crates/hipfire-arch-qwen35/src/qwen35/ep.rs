@@ -92,6 +92,8 @@ pub fn forward_ep(
                 gpu.embedding_lookup_hfq4g128(&w.token_embd, &s.x, token, dim)?
             }
             EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&w.token_embd, &s.x, token, dim)?,
+            EmbeddingFormat::BF16 => gpu.embedding_lookup_bf16(&w.token_embd, &s.x, token, dim)?,
+            EmbeddingFormat::F16 => gpu.embedding_lookup_f16(&w.token_embd, &s.x, token, dim)?,
             EmbeddingFormat::F32 => gpu.embedding_lookup(&w.token_embd, &s.x, token, dim)?,
             other => {
                 return Err(HipError::new(
@@ -2206,6 +2208,12 @@ pub fn forward_scratch_multi(
             }
             EmbeddingFormat::Q8_0 => {
                 gpu0.embedding_lookup_q8(&weights.token_embd, &s0.x, token, dim)?
+            }
+            EmbeddingFormat::BF16 => {
+                gpu0.embedding_lookup_bf16(&weights.token_embd, &s0.x, token, dim)?
+            }
+            EmbeddingFormat::F16 => {
+                gpu0.embedding_lookup_f16(&weights.token_embd, &s0.x, token, dim)?
             }
             EmbeddingFormat::F32 => {
                 gpu0.embedding_lookup(&weights.token_embd, &s0.x, token, dim)?

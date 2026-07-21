@@ -4395,6 +4395,16 @@ impl Gpu {
             "embedding_q8_batched",
             kernels::EMBEDDING_Q8_BATCHED_SRC.to_string(),
         ));
+        specs.push(("embedding_bf16", kernels::EMBEDDING_BF16_SRC.to_string()));
+        specs.push((
+            "embedding_bf16_batched",
+            kernels::EMBEDDING_BF16_BATCHED_SRC.to_string(),
+        ));
+        specs.push(("embedding_f16", kernels::EMBEDDING_F16_SRC.to_string()));
+        specs.push((
+            "embedding_f16_batched",
+            kernels::EMBEDDING_F16_BATCHED_SRC.to_string(),
+        ));
 
         // DeltaNet kernels
         specs.push((

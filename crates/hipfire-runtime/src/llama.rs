@@ -157,6 +157,12 @@ pub fn prefill_forward(
                 EmbeddingFormat::Q8_0 => {
                     gpu.embedding_lookup_q8(&weights.token_embd, &x_single, token, dim)?
                 }
+                EmbeddingFormat::BF16 => {
+                    gpu.embedding_lookup_bf16(&weights.token_embd, &x_single, token, dim)?
+                }
+                EmbeddingFormat::F16 => {
+                    gpu.embedding_lookup_f16(&weights.token_embd, &x_single, token, dim)?
+                }
                 EmbeddingFormat::Q4K => {
                     gpu.embedding_lookup_q4k(&weights.token_embd, &x_single, token, dim)?
                 }
@@ -965,7 +971,10 @@ fn forward_prefill_chunk(
     // 1. Embed N tokens into pbs.x_batch.
     if matches!(
         weights.embd_format,
-        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0
+        EmbeddingFormat::HFQ4G256
+            | EmbeddingFormat::Q8_0
+            | EmbeddingFormat::BF16
+            | EmbeddingFormat::F16
     ) {
         if !pre_uploaded {
             let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
@@ -988,6 +997,20 @@ fn forward_prefill_chunk(
                 n,
                 dim,
             )?,
+            EmbeddingFormat::BF16 => gpu.embedding_lookup_bf16_batched(
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                n,
+                dim,
+            )?,
+            EmbeddingFormat::F16 => gpu.embedding_lookup_f16_batched(
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                n,
+                dim,
+            )?,
             _ => unreachable!(),
         }
     } else {
@@ -1002,7 +1025,10 @@ fn forward_prefill_chunk(
                 EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
                 }
-                EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 => unreachable!(),
+                EmbeddingFormat::HFQ4G256
+                | EmbeddingFormat::Q8_0
+                | EmbeddingFormat::BF16
+                | EmbeddingFormat::F16 => unreachable!(),
             }
             gpu.hip.memcpy_dtod_at(
                 &pbs.x_batch.buf,
@@ -1892,6 +1918,12 @@ pub fn forward_scratch_embed(
         }
         EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::BF16 => {
+            gpu.embedding_lookup_bf16(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::F16 => {
+            gpu.embedding_lookup_f16(&weights.token_embd, &scratch.x, token, dim)?
         }
         EmbeddingFormat::HFQ4G256 => {
             gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?
@@ -3059,6 +3091,8 @@ pub fn forward(
     match weights.embd_format {
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::BF16 => gpu.embedding_lookup_bf16(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::F16 => gpu.embedding_lookup_f16(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::HFQ4G256 => {
             gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?
         }
@@ -3264,6 +3298,8 @@ fn forward_logits_gpu(
     match weights.embd_format {
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::BF16 => gpu.embedding_lookup_bf16(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::F16 => gpu.embedding_lookup_f16(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::HFQ4G256 => {
             gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?
         }

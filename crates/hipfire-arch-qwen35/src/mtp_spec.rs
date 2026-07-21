@@ -885,6 +885,12 @@ fn embed_device_token_into(
         weights::EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8_batched(&weights.token_embd, out, token_id, 1, dim)
         }
+        weights::EmbeddingFormat::BF16 => {
+            gpu.embedding_lookup_bf16_batched(&weights.token_embd, out, token_id, 1, dim)
+        }
+        weights::EmbeddingFormat::F16 => {
+            gpu.embedding_lookup_f16_batched(&weights.token_embd, out, token_id, 1, dim)
+        }
         other => panic!("device-token MTP chain does not support embedding format {other:?}"),
     }
 }
@@ -912,6 +918,12 @@ fn embed_device_token_into_drafter(
         }
         EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8_batched(mirrored_embd, out, token_id, 1, dim)
+        }
+        EmbeddingFormat::BF16 => {
+            gpu.embedding_lookup_bf16_batched(mirrored_embd, out, token_id, 1, dim)
+        }
+        EmbeddingFormat::F16 => {
+            gpu.embedding_lookup_f16_batched(mirrored_embd, out, token_id, 1, dim)
         }
         other => panic!("device-token chain: unsupported drafter embd format {other:?}"),
     }
@@ -3307,6 +3319,18 @@ fn drafter_embed_lookup(
             n_embd,
         ),
         EmbeddingFormat::Q8_0 => drafter_gpu.embedding_lookup_q8(
+            &drafter_state.mirrored_token_embd,
+            &drafter_state.step_embd,
+            token,
+            n_embd,
+        ),
+        EmbeddingFormat::BF16 => drafter_gpu.embedding_lookup_bf16(
+            &drafter_state.mirrored_token_embd,
+            &drafter_state.step_embd,
+            token,
+            n_embd,
+        ),
+        EmbeddingFormat::F16 => drafter_gpu.embedding_lookup_f16(
             &drafter_state.mirrored_token_embd,
             &drafter_state.step_embd,
             token,

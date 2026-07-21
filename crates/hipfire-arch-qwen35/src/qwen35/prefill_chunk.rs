@@ -1990,7 +1990,11 @@ pub(crate) fn forward_prefill_chunk(
     if do_embed
         && matches!(
             weights.embd_format,
-            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::F32
+            EmbeddingFormat::HFQ4G256
+                | EmbeddingFormat::Q8_0
+                | EmbeddingFormat::F32
+                | EmbeddingFormat::BF16
+                | EmbeddingFormat::F16
         )
     {
         if !pre_uploaded {
@@ -2027,6 +2031,24 @@ pub(crate) fn forward_prefill_chunk(
                     dim,
                 )?;
             }
+            EmbeddingFormat::BF16 => {
+                gpu.embedding_lookup_bf16_batched(
+                    &weights.token_embd,
+                    &pbs.x_batch,
+                    &pbs.tokens,
+                    n,
+                    dim,
+                )?;
+            }
+            EmbeddingFormat::F16 => {
+                gpu.embedding_lookup_f16_batched(
+                    &weights.token_embd,
+                    &pbs.x_batch,
+                    &pbs.tokens,
+                    n,
+                    dim,
+                )?;
+            }
             _ => unreachable!(),
         }
     } else if do_embed {
@@ -2038,6 +2060,12 @@ pub(crate) fn forward_prefill_chunk(
                 }
                 EmbeddingFormat::Q8_0 => {
                     gpu.embedding_lookup_q8(&weights.token_embd, &s.x, tok, dim)?
+                }
+                EmbeddingFormat::BF16 => {
+                    gpu.embedding_lookup_bf16(&weights.token_embd, &s.x, tok, dim)?
+                }
+                EmbeddingFormat::F16 => {
+                    gpu.embedding_lookup_f16(&weights.token_embd, &s.x, tok, dim)?
                 }
                 EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?

@@ -404,6 +404,23 @@ fn ldlq_report_and_validate(strict: bool) -> Result<(), String> {
 // alpha=1 is pure activation-magnitude scaling (no smoothing).
 static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
 
+// --embed-precision {q8,bf16,f16}: storage format for the embedding table. The
+// embed seeds the residual stream and rides it unnormalized across every layer,
+// so its quant error is the largest per-tensor KLD cost in an otherwise low-bit
+// (OQ4/OQ8) model. bf16/f16 keep the gather table at source precision instead of
+// dropping it to Q8; the raw bf16/f16 gather kernels convert to f32 in-kernel via
+// portable HIP intrinsics (RDNA2/3/4), so nothing widens to F32 on disk. Set once
+// from main, read deep in the per-tensor quantizers (both the inline OQ loop and
+// the free `quantize_hfq_source_tensor`), avoiding a re-plumb of every arm. 0 =
+// q8 (default, unchanged), 1 = bf16, 2 = f16.
+static EMBED_PRECISION: OnceLock<u8> = OnceLock::new();
+
+/// Embed-table storage policy set by `--embed-precision`. Defaults to Q8 (the
+/// historical behavior) until `main` records the parsed flag.
+fn embed_precision_code() -> u8 {
+    *EMBED_PRECISION.get().unwrap_or(&0)
+}
+
 // --sq-split [<frac>]: outlier-aware SmoothQuant. When set, `compute_awq_scales`
 // partitions input channels into the top-`frac` by activation energy (outliers)
 // and the remaining bulk, and geo-mean-normalizes EACH group SEPARATELY — so the
@@ -3643,6 +3660,14 @@ fn quantize_hfq_source_tensor(
     // `embed_tokens` (llama/qwen/…) and `backbone.embeddings.weight` (nemotron_h)
     // are both embedding tables — keep them Q8 (row-lookup-able; Q4 is too lossy).
     let is_embed = name.contains("embed_tokens") || name.ends_with("embeddings.weight");
+    if is_embed {
+        // --embed-precision bf16|f16: keep the gather table at source precision
+        // instead of Q8 (no-op under the default q8). Only the embed table — the
+        // router/conv1d/non-2D tensors below stay Q8.
+        if let Some(ov) = embed_precision_override(raw, src_dtype, &f32_data) {
+            return Ok(ov);
+        }
+    }
     let is_moe_router =
         name.ends_with("mlp.gate.weight") || name.ends_with("mlp.shared_expert_gate.weight");
     if is_embed || is_moe_router || is_conv1d_tensor(name) || shape.len() != 2 {
@@ -5374,6 +5399,40 @@ fn source_precision_tensor_bytes(
     }
 }
 
+/// Embed-table storage override for `--embed-precision {bf16,f16}`. Returns
+/// `Some((bytes, quant_type, group, label))` when the flag selected a
+/// high-precision embed, so callers can replace their default Q8 embed emission
+/// with a source-precision gather table; returns `None` under the default `q8`
+/// so existing behavior (and golden hashes) are untouched. Group size is 0
+/// (ungrouped source precision). The runtime gathers these via the raw bf16/f16
+/// embedding kernels (f32 in-kernel, portable across RDNA2/3/4).
+fn embed_precision_override(
+    raw_data: &[u8],
+    dtype: &str,
+    f32_data: &[f32],
+) -> Option<(Vec<u8>, QuantType, u32, &'static str)> {
+    match embed_precision_code() {
+        // bf16: keep a bf16/f16/f32 source table at source precision; for a
+        // non-float source (e.g. requant from a Q8 .hfq) only the dequantized
+        // f32 exists, so re-encode it to bf16.
+        1 => match dtype {
+            "BF16" | "F16" | "F32" => {
+                let (data, qt, label) = source_precision_tensor_bytes(raw_data, dtype, f32_data);
+                Some((data, qt, 0, label))
+            }
+            _ => Some((
+                f32_slice_to_bf16_bytes(f32_data),
+                QuantType::BF16,
+                0,
+                "BF16",
+            )),
+        },
+        // f16: always store the table as f16 (readers without a bf16 gather path).
+        2 => Some((f32_slice_to_f16_bytes(f32_data), QuantType::F16, 0, "F16")),
+        _ => None,
+    }
+}
+
 /// Full `--help` / `-h` text. Printed to stdout; exits 0 from `main`.
 fn print_help() {
     print!(
@@ -5436,6 +5495,11 @@ OPTIONS:
     --beam <N>                 QTIP trellis beam-search width (default 128, near-Viterbi); lower =
                                much faster encode on big models, slight quality loss (env HIPFIRE_QTIP_BEAM)
     --arch-id <U32>            override the auto-detected arch id stamped in the .hfq header
+    --embed-precision <P>      embedding-table storage: q8 (default) | bf16 | f16. bf16/f16 keep
+                               the gather table at source precision instead of Q8 — the embed
+                               seeds the residual stream unnormalized, so its quant error is the
+                               largest per-tensor KLD cost in an otherwise low-bit model. Raw
+                               bf16/f16 gather converts to f32 in-kernel (portable RDNA2/3/4).
 
   MoE / K-map:
     --kmap-dense               enable K-map promotion on dense models (default: MoE-only)
@@ -5789,6 +5853,31 @@ fn main() {
     }
     let format = format_storage.as_str();
     eprintln!("Format: {format}");
+
+    // --embed-precision {q8,bf16,f16}: storage format for the embedding table.
+    // Default q8 preserves prior behavior. bf16/f16 keep the gather table at
+    // source precision instead of Q8 — the embed seeds the residual stream and
+    // rides it unnormalized across every layer, so its quant error is the single
+    // largest per-tensor KLD cost in an otherwise low-bit (OQ4/OQ8) model. The
+    // raw bf16/f16 gather kernels convert to f32 in-kernel via portable HIP
+    // intrinsics (RDNA2/3/4), so there is no F32-widening of the table on disk.
+    // bf16 = keep source bf16; f16 = store as f16 (for readers without a bf16
+    // path). Only affects the embedding table; lm_head/router follow their own
+    // policy.
+    let embed_precision = arg_value(&args, "--embed-precision").unwrap_or("q8");
+    let embed_precision_code = match embed_precision {
+        "q8" => 0u8,
+        "bf16" => 1u8,
+        "f16" => 2u8,
+        other => {
+            eprintln!("error: --embed-precision must be one of q8|bf16|f16 (got '{other}')");
+            std::process::exit(1);
+        }
+    };
+    let _ = EMBED_PRECISION.set(embed_precision_code);
+    if embed_precision != "q8" {
+        eprintln!("Embed precision: {embed_precision} (embedding table kept at source precision)");
+    }
 
     // Optional imatrix (llama.cpp GGUF format with .in_sum2 / .counts per-tensor).
     // When provided, MQ2-Lloyd quantization uses per-column importance weights
@@ -9244,7 +9333,16 @@ fn main() {
                 let mut awq_sidecar_scales: Option<Vec<f32>> = None;
                 let is_embed = name.contains("embed_tokens");
 
-                let (quantized, qt, gs, label) = if use_bf16 {
+                let (quantized, qt, gs, label) = if let Some(ov) = is_embed
+                    .then(|| embed_precision_override(raw_data, &meta.dtype, &f32_data))
+                    .flatten()
+                {
+                    // --embed-precision bf16|f16: keep the gather table at source
+                    // precision instead of dropping it to Q8. No-op (None) under
+                    // the default q8, so every format's Q8 embed arm below is
+                    // unchanged then.
+                    ov
+                } else if use_bf16 {
                     let (data, qt, label) =
                         source_precision_tensor_bytes(raw_data, &meta.dtype, &f32_data);
                     (data, qt, 0u32, label)

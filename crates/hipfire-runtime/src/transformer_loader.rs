@@ -239,7 +239,11 @@ impl<'a> TransformerLoader<'a> {
                 EmbeddingFormat::HFQ4G128,
             )),
             3 => Ok((gpu.upload_raw(&data, &[data.len()])?, EmbeddingFormat::Q8_0)),
-            1 | 16 | 2 => {
+            // Native bf16/f16 tables: upload raw 2 B/elem, gather converts to f32
+            // inline (no F32 promotion). F32 (2) stays a direct upload.
+            16 => Ok((gpu.upload_raw(&data, &[data.len()])?, EmbeddingFormat::BF16)),
+            1 => Ok((gpu.upload_raw(&data, &[data.len()])?, EmbeddingFormat::F16)),
+            2 => {
                 let values = decode_direct_f32(info, &data)
                     .unwrap_or_else(|error| panic!("{}: {error}", self.family));
                 Ok((gpu.upload_f32(&values, &shape)?, EmbeddingFormat::F32))

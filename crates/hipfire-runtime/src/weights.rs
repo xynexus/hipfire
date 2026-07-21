@@ -103,6 +103,8 @@ pub enum EmbeddingFormat {
     HFQ4G256, // raw HFQ4-G256 blocks, use GPU dequant kernel
     HFQ4G128, // raw HFQ4-G128 blocks, use GPU dequant kernel
     Q8_0,     // raw Q8_0 blocks, use GPU dequant kernel
+    BF16,     // native bf16 table, gather+convert to F32 inline (no F32 copy)
+    F16,      // native f16 table, gather+convert to F32 inline (no F32 copy)
 }
 
 pub struct LayerWeights {

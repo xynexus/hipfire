@@ -189,6 +189,110 @@ impl Gpu {
             &kernargs![ptr tp, ptr op, ptr tidp, i32 d],
         )
     }
+    /// Native-bf16 embedding lookup (single token): gather one row, convert
+    /// bf16->f32 inline. Table stays 2 B/element (no F32 promotion).
+    pub fn embedding_lookup_bf16(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_id: u32,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "embedding_bf16",
+            kernels::EMBEDDING_BF16_SRC,
+            "embedding_bf16",
+        )?;
+        let tp = table.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let tid = token_id as i32;
+        let d = dim as i32;
+        self.launch_kernargs(
+            "embedding_bf16",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr tp, ptr op, i32 tid, i32 d],
+        )
+    }
+    /// Batched native-bf16 embedding lookup. `output` shape `[n × dim]` f32.
+    pub fn embedding_lookup_bf16_batched(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_ids: &GpuTensor,
+        n: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "embedding_bf16_batched",
+            kernels::EMBEDDING_BF16_BATCHED_SRC,
+            "embedding_bf16_batched",
+        )?;
+        let tp = table.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let tidp = token_ids.buf.as_ptr();
+        let d = dim as i32;
+        self.launch_kernargs(
+            "embedding_bf16_batched",
+            [n as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr tp, ptr op, ptr tidp, i32 d],
+        )
+    }
+    /// Native-f16 embedding lookup (single token): gather one row, convert
+    /// f16->f32 inline (`v_cvt_f32_f16`).
+    pub fn embedding_lookup_f16(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_id: u32,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("embedding_f16", kernels::EMBEDDING_F16_SRC, "embedding_f16")?;
+        let tp = table.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let tid = token_id as i32;
+        let d = dim as i32;
+        self.launch_kernargs(
+            "embedding_f16",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr tp, ptr op, i32 tid, i32 d],
+        )
+    }
+    /// Batched native-f16 embedding lookup. `output` shape `[n × dim]` f32.
+    pub fn embedding_lookup_f16_batched(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_ids: &GpuTensor,
+        n: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "embedding_f16_batched",
+            kernels::EMBEDDING_F16_BATCHED_SRC,
+            "embedding_f16_batched",
+        )?;
+        let tp = table.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let tidp = token_ids.buf.as_ptr();
+        let d = dim as i32;
+        self.launch_kernargs(
+            "embedding_f16_batched",
+            [n as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr tp, ptr op, ptr tidp, i32 d],
+        )
+    }
     /// Batched HFQ4-G256 embedding lookup. Dequantizes N rows in a single
     /// launch, reading token ids from a device buffer. hipGraph-capture-safe:
     /// callers update `token_ids` between replays and replay the same graph.
