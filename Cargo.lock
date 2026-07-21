@@ -2442,6 +2442,7 @@ dependencies = [
  "hipfire-rdna",
  "libc",
  "rayon",
+ "serde_json",
  "sha2",
 ]
 

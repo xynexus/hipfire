@@ -55,8 +55,52 @@ is nearly free.
   redundancy gate (param-count kept as config-parse fallback).
 - Verified: unit test (`deltanet_state_gate_keys_on_redundancy`) + 0.8B
   long-decode coherence (uniq 0.46, no attractor) + daemon logs FP32.
-- Follow-ups in TODO.md: real FP16 state kernel; FP32/FP16 **tree** replay
-  (tree-mode is Q8-only today → MTP draft must stay non-tree, see Phase B).
+- Follow-ups (were "in TODO.md", which no longer exists — tracked here now):
+  real FP16 state kernel; FP32/FP16 **tree** replay (tree-mode is Q8-only today
+  → MTP draft must stay non-tree, see Phase B).
+
+### DeltaNet state quant — POLICY + sizing (2026-07-19)
+
+**DeltaNet state must NEVER be Q8.** FP32 via the redundancy gate is the
+intended default; the only sanctioned alternatives are **FP16** or a
+**purpose-built DeltaNet-state codec** (neither implemented). Recorded at the
+gate in `qwen35/state.rs` (commit 51e1ac078). The earlier advice to lower
+`HIPFIRE_DN_STATE_FP32_BELOW` to 3000 so 9B/27B use Q8 is **withdrawn**.
+
+Every hazard hit so far is Q8-*specific* — FP32 has none of them:
+- long-decode attractors on low-redundancy models (2026-06-15)
+- stochastic-rounding seed leaked execution history into target numerics,
+  breaking spec-decode losslessness (fixed 196375ae0; hazard is inherent to
+  stochastic requant)
+- `s_ef_residual`, the Q8-only error-feedback accumulator, is one of
+  `DeltaNetState`'s five fields but is NOT among the three `DeltaNetSnapshot`
+  saves/restores — a per-token recurrent buffer surviving rollback, which
+  reintroduces drafter-dependent output the moment Q8 is enabled
+
+**Sizing (measured from real configs).** State is **per-sequence**, unlike
+weights, so this is a CONCURRENCY question, not a model-size one. FP32 totals
+(S matrices + conv state):
+
+| model | DN layers | v-heads | total/seq |
+|---|---|---|---|
+| 0.8B / 2B | 18 | 16 | 19.3 MB |
+| 4B / 9B | 24 | 32 | 50.2 MB |
+| 35B-A3B | 30 | 32 | 62.8 MB |
+| 27B / 3.6-27B | 48 | 48 | 149.6 MB |
+| 122B-A10B | 36 | 64 | 149.1 MB |
+| 397B-A17B | 45 | 64 | 186.3 MB |
+
+Spec decode **doubles** it (the rollback snapshot is a second copy) → 27B is
+~300 MB per spec-decoding session. One session is negligible against 45 GB;
+32 concurrent on 27B is ~4.8 GB, 64 is ~9.6 GB. **FP16 halves it and is the
+next step. A real codec only earns its complexity for high-concurrency serving
+of 27B-class models** — a much weaker case than "unknown size" implied.
+
+**Blocker to reconcile:** `gated_delta_net_q8_tree_batch_seq` is the ONLY tree
+DeltaNet kernel (no FP32 variant), so DDTree spec-decode structurally requires
+Q8 and cannot run under this policy. DDTree is opt-in and off by default, so
+nothing regresses today. Fix by adding an FP32/FP16 tree kernel — **not** by
+re-enabling Q8 state.
 
 ## Phase B — MTP draft wiring ✅ DONE + verified
 

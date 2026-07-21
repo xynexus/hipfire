@@ -27,16 +27,24 @@ done
 # R14_W8=1 selects int8 weights (W8A8, quality-preserving) — doubles the per-W-tile
 # bytes (64→128), so halve LN (or KT) to keep the W-stripe within the 32 KB tile SRAM
 # (e.g. LM=6 LN=6 KT=16). Default is int4 weights (W4A8, throughput-optimal).
+# r11_gemm sweeps an MT x NT register tile and requires LM%MT==0, LN%NT==0 (now enforced
+# by static_assert). The kernel defaults are MT=NT=3, which silently overruns L1 at LM<3 --
+# and LM=1 is exactly what an M=16 DFlash shape forces. Derive the largest legal tile here
+# so the cached build can never hit it.
+largest_div() { local v=$1 t; for t in 3 2 1; do if (( v % t == 0 )); then echo "$t"; return; fi; done; echo 1; }
+MT="${R14_MT:-$(largest_div "$LM")}"; NT="${R14_NT:-$(largest_div "$LN")}"
+
 W8="${R14_W8:-0}"
 if [ "$W8" = 1 ]; then WDEF="-DW8"; WBYTES=128; TAG="_w8"; else WDEF=""; WBYTES=64; TAG=""; fi
 OUT="$HOME/.hipfire/npu/r14_${LM}x${LN}x${KT}_nb${NBLK}${TAG}"
 rm -rf "$OUT"; mkdir -p "$OUT"
 "$PEANO/bin/clang++" "$HERE/../r11/r11_gemm.cc" -c -o "$OUT/r11.o" -I"$MA_ROOT/include" \
   -std=c++20 -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body \
-  -O2 -DNDEBUG --target=aie2-none-unknown-elf -DLM="$LM" -DLN="$LN" -DKT="$KT" $WDEF
+  -O2 -DNDEBUG --target=aie2-none-unknown-elf -DLM="$LM" -DLN="$LN" -DKT="$KT" \
+  -DMT="$MT" -DNT="$NT" $WDEF
 python3 "$HERE/r14_gen.py" "$LM" "$LN" "$KT" "$NBLK" "$WBYTES" > "$OUT/aie.mlir"
 aiecc "$OUT/aie.mlir" --no-compile-host --no-xchesscc --no-xbridge --peano="$PEANO" \
   --aie-generate-npu-insts --npu-insts-name="$OUT/insts.bin" \
   --aie-generate-xclbin --xclbin-name="$OUT/final.xclbin" --tmpdir="$OUT" >/dev/null
-echo "cached: $OUT/final.xclbin  $OUT/insts.bin"
+echo "cached: $OUT/final.xclbin  $OUT/insts.bin  (MT=$MT NT=$NT)"
 echo "  block: A=4·N·$((LM*KT*64))  W=4·N·$((LN*KT*64))  C=4·N·$((LM*LN*32))·4B  macs=16·N·${LM}·${LN}·${KT}·512  expect=$((KT*16))  (N=$NBLK)"

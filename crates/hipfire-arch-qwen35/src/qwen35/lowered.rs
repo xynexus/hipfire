@@ -587,6 +587,8 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 1,
                 self.n_v_heads,
                 config.linear_value_head_dim,
+                self.pos as u32,
+                i as u32,
             ),
             StateQuant::Q4 => gpu.gated_delta_net_q4(
                 &s.dn_q,

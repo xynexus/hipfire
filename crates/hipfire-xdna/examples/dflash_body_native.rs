@@ -1,0 +1,2211 @@
+//! DFlash native NPU driver — the 5-layer block body, dispatched from Rust.
+//!
+//! Replaces the Python/XRT harness (`tools/npu/dflash_body_npu.py`) on the hot
+//! path with direct amdxdna DRM submission, and measures the real block
+//! wall-clock. Python stays the parity reference; this is an addition.
+//!
+//! Inputs, all produced by the harness so both sides run identical numerics:
+//!   * `--manifest`  artifact manifest (resolved xclbin/insts per op, incl. the
+//!                   hash-keyed `@iron.jit` cache entries)   [--dump-manifest]
+//!   * `--weights`   pre-quantized int8 GEMM weights + gammas [--dump-weights]
+//!   * `--golden`    Phase-A golden dir (inputs + f16 golden block_hidden)
+//!   * `--ref`       int8/bf16 precision reference             [--dump-ref]
+//!
+//! Two facts shape the design, both measured on nix1:
+//!   1. npu1 (Phoenix) admits only SIX concurrent hardware contexts, and the
+//!      body uses 12 distinct kernels per layer. So kernels are cached with a
+//!      pinned anchor + LRU; a miss costs ~205 us via `load_peer` (vs ~19.5 ms
+//!      via `load`, which re-opens the DRM file and a 64 MiB heap).
+//!   2. Weights are ~1.09 GB of int8. They are uploaded ONCE into buffers
+//!      allocated on the shared device and stay resident across every dispatch
+//!      and every block — they outlive the kernels that consume them, which is
+//!      what makes the LRU affordable.
+//!
+//! Usage (hold the hipfire lock):
+//!   dflash_body_native --manifest M.json --weights DIR --golden GDIR \
+//!                      --ref REF.npy [--blocks N]
+
+#[cfg(target_os = "linux")]
+#[path = "common/npy.rs"]
+mod npy;
+
+#[cfg(target_os = "linux")]
+mod body {
+    use hipfire_xdna::{DeviceBuffer, NpuKernel, XdnaError};
+    use std::collections::HashMap;
+
+    #[allow(dead_code)] // shape constant, kept for readability at call sites
+    pub const HEAD_DIM: usize = 128;
+    const QMAX: f32 = 127.0;
+
+    // ── bf16 <-> f32 ────────────────────────────────────────────────────────
+    // Round-to-nearest-even, matching ml_dtypes' bfloat16 so the native path
+    // rounds identically to the numpy reference.
+    #[inline]
+    pub fn f32_to_bf16(x: f32) -> u16 {
+        let bits = x.to_bits();
+        if x.is_nan() {
+            return ((bits >> 16) as u16) | 0x0040;
+        }
+        let bias = 0x7fff + ((bits >> 16) & 1);
+        ((bits + bias) >> 16) as u16
+    }
+
+    #[inline]
+    pub fn bf16_to_f32(b: u16) -> f32 {
+        f32::from_bits((b as u32) << 16)
+    }
+
+    pub fn write_bf16(buf: &mut DeviceBuffer, src: &[f32]) {
+        let dst = buf.as_mut_slice();
+        assert!(dst.len() >= src.len() * 2, "bf16 dst too small");
+        for (i, &v) in src.iter().enumerate() {
+            dst[i * 2..i * 2 + 2].copy_from_slice(&f32_to_bf16(v).to_le_bytes());
+        }
+    }
+
+    pub fn read_bf16(buf: &DeviceBuffer, out: &mut [f32]) {
+        let src = buf.as_slice();
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = bf16_to_f32(u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]));
+        }
+    }
+
+    // ── int8 per-row symmetric quant (mirrors quantize_row_symmetric) ───────
+    /// One scale per activation row over the whole K. `round_ties_even` matches
+    /// numpy's half-to-even, so the int8 codes agree with the Python path.
+    pub fn quantize_row(x: &[f32], rows: usize, k: usize, q: &mut [i8], scale: &mut [f32]) {
+        for r in 0..rows {
+            let row = &x[r * k..(r + 1) * k];
+            let absmax = row.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            let s = if absmax > 0.0 { absmax / QMAX } else { 1.0 };
+            scale[r] = s;
+            let inv = 1.0 / s;
+            for (i, &v) in row.iter().enumerate() {
+                q[r * k + i] = (v * inv).round_ties_even().clamp(-QMAX, QMAX) as i8;
+            }
+        }
+    }
+
+    /// rope cos/sin table for one position: [cos_0..cos_{hd/2-1}, sin_...].
+    pub fn cs_buf(hd: usize, pos: f64, theta: f64, out: &mut [f32]) {
+        let half = hd / 2;
+        for i in 0..half {
+            let freq = 1.0 / theta.powf(2.0 * i as f64 / hd as f64);
+            let ang = pos * freq;
+            out[i] = ang.cos() as f32;
+            out[half + i] = ang.sin() as f32;
+        }
+    }
+
+    // ── CPU primitives (--cpu-primitives) ──────────────────────────────────
+    // f32 host implementations of the 8 NPU primitive ops, mirroring the numpy
+    // reference (dflash_body_npu.py: ref_rmsnorm/headnorm/rope/swiglu) exactly:
+    // rms over the last dim with KERNEL_EPS, gamma applied post-normalise, neox
+    // split-half rope, silu(gate)*up. Kept in f32 — this deletes the bf16
+    // pack/unpack + DeviceBuffer sync/dispatch that existed ONLY to cross the
+    // NPU boundary for these ops, and moves the numerics toward the f16 golden
+    // (the NPU path rounds every intermediate to bf16; f32 does not).
+
+    /// rmsnorm over H: out[r,i] = x[r,i] / sqrt(mean(x[r]^2)+eps) * gamma[i].
+    pub fn cpu_rmsnorm(x: &[f32], gamma: &[f32], rows: usize, h: usize, eps: f32, out: &mut [f32]) {
+        for r in 0..rows {
+            let row = &x[r * h..(r + 1) * h];
+            let ss: f32 = row.iter().map(|&v| v * v).sum();
+            let inv = 1.0 / (ss / h as f32 + eps).sqrt();
+            let o = &mut out[r * h..(r + 1) * h];
+            for i in 0..h {
+                o[i] = row[i] * inv * gamma[i];
+            }
+        }
+    }
+
+    /// Per-head rmsnorm over HD: gamma is [hd], shared across all heads.
+    pub fn cpu_headnorm(
+        x: &[f32],
+        gamma: &[f32],
+        rows: usize,
+        heads: usize,
+        hd: usize,
+        eps: f32,
+        out: &mut [f32],
+    ) {
+        for t in 0..rows * heads {
+            let head = &x[t * hd..(t + 1) * hd];
+            let ss: f32 = head.iter().map(|&v| v * v).sum();
+            let inv = 1.0 / (ss / hd as f32 + eps).sqrt();
+            let o = &mut out[t * hd..(t + 1) * hd];
+            for i in 0..hd {
+                o[i] = head[i] * inv * gamma[i];
+            }
+        }
+    }
+
+    /// Full-neox rope: for head row at position (pos0+r), rotate the two halves
+    /// out[:half] = xi*c - yi*s ; out[half:] = yi*c + xi*s, with c/s = cs_buf.
+    pub fn cpu_rope(
+        x: &[f32],
+        rows: usize,
+        heads: usize,
+        hd: usize,
+        pos0: usize,
+        theta: f64,
+        out: &mut [f32],
+    ) {
+        let half = hd / 2;
+        let mut cs = vec![0f32; hd];
+        for r in 0..rows {
+            cs_buf(hd, (pos0 + r) as f64, theta, &mut cs);
+            let (c, s) = cs.split_at(half);
+            for hh in 0..heads {
+                let base = (r * heads + hh) * hd;
+                let (xin, xout) = (&x[base..base + hd], &mut out[base..base + hd]);
+                for i in 0..half {
+                    let (xi, yi) = (xin[i], xin[half + i]);
+                    xout[i] = xi * c[i] - yi * s[i];
+                    xout[half + i] = yi * c[i] + xi * s[i];
+                }
+            }
+        }
+    }
+
+    /// swiglu: out[r,i] = silu(gate[r,i]) * up[r,i], reading gate|up from the
+    /// concat GEMM output row [gate(0..I) | up(I..2I)] of stride `m_gu`.
+    pub fn cpu_swiglu(gateup: &[f32], m_gu: usize, i_dim: usize, rows: usize, out: &mut [f32]) {
+        for r in 0..rows {
+            for i in 0..i_dim {
+                let g = gateup[r * m_gu + i];
+                let u = gateup[r * m_gu + i_dim + i];
+                out[r * i_dim + i] = (g / (1.0 + (-g).exp())) * u;
+            }
+        }
+    }
+
+    /// Record an isolated CPU-vs-NPU primitive parity sample (same input fed to
+    /// both). Keeps the worst (min cos, max |Δ|) seen for `name` across a block.
+    pub fn record_parity(
+        map: &mut std::collections::HashMap<String, (f64, f64, u64)>,
+        name: &str,
+        npu: &[f32],
+        cpu: &[f32],
+    ) {
+        let c = cosine(npu, cpu);
+        let maxd = npu
+            .iter()
+            .zip(cpu)
+            .fold(0f64, |a, (&x, &y)| a.max((x - y).abs() as f64));
+        let e = map.entry(name.to_string()).or_insert((1.0, 0.0, 0));
+        e.0 = e.0.min(c);
+        e.1 = e.1.max(maxd);
+        e.2 += 1;
+    }
+
+    pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
+        let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+        for i in 0..a.len().min(b.len()) {
+            let (x, y) = (a[i] as f64, b[i] as f64);
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            dot / (na.sqrt() * nb.sqrt())
+        }
+    }
+
+    // ── multi-core (r14) W4A8 GEMM path ─────────────────────────────────────
+    use hipfire_xdna::gemm_r14::{NpuGemmR14, R14Geometry};
+
+    /// One weight matrix staged for the r14 array: int4 codes packed into
+    /// per-dispatch resident buffers, plus the per-(out-row, k-chunk) dequant
+    /// scale. The group size is pinned to the kernel's `K_CHUNK` — the array
+    /// emits one int32 partial per chunk and the host owns all scaling, so a
+    /// finer group (e.g. the sidecar's 256) cannot be applied without a build
+    /// whose `KT*16` equals it.
+    pub struct R14Matrix {
+        pub m: usize, // output dim (GEMM N)
+        pub k: usize,
+        pub rows: usize,
+        pub k_chunks: usize,
+        /// Per-(out-row, k-chunk) dequant scale, stored `[k_chunks][m]`. The
+        /// dequant accumulate walks output columns contiguously for a fixed
+        /// k-chunk, so this layout turns a stride-`k_chunks` gather into a
+        /// unit-stride load.
+        pub scale4t: Vec<f32>,
+        pub wbufs: Vec<DeviceBuffer>,
+        pub plan: Vec<(usize, usize, usize)>, // per iteration: (m_block, k_chunk, n_tile)
+    }
+
+    impl R14Matrix {
+        /// Requantize a row-scaled int8 `[m][k]` weight to int4 at `K_CHUNK`
+        /// granularity and pack it into resident per-dispatch buffers.
+        #[allow(clippy::too_many_arguments)]
+        pub fn build(
+            g: &NpuGemmR14,
+            raw: &[i8],
+            row_scale: &[f32],
+            m: usize,
+            k: usize,
+            rows: usize,
+        ) -> Result<Self, XdnaError> {
+            let geom = g.geom();
+            let (mt, nt, kc) = (geom.m_tile(), geom.n_tile(), geom.k_chunk());
+            assert_eq!(k % kc, 0, "K={k} must be a multiple of K_CHUNK={kc}");
+            assert_eq!(m % nt, 0, "N={m} must be a multiple of N_TILE={nt}");
+            assert_eq!(rows % mt, 0, "rows={rows} must be a multiple of M_TILE={mt}");
+            let (k_chunks, n_tiles, m_blocks) = (k / kc, m / nt, rows / mt);
+
+            let mut codes = vec![0i8; m * k];
+            let mut scale4 = vec![0f32; m * k_chunks];
+            for n in 0..m {
+                for c in 0..k_chunks {
+                    let seg = &raw[n * k + c * kc..n * k + (c + 1) * kc];
+                    let amax = seg.iter().map(|v| (*v as i32).abs()).max().unwrap_or(0);
+                    if amax == 0 {
+                        continue;
+                    }
+                    scale4[n * k_chunks + c] = row_scale[n] * amax as f32 / 7.0;
+                    let inv = 7.0 / amax as f32;
+                    for (i, &v) in seg.iter().enumerate() {
+                        codes[n * k + c * kc + i] =
+                            (v as f32 * inv).round_ties_even().clamp(-7.0, 7.0) as i8;
+                    }
+                }
+            }
+
+            let mut plan = Vec::with_capacity(m_blocks * k_chunks * n_tiles);
+            for mb in 0..m_blocks {
+                for c in 0..k_chunks {
+                    for t in 0..n_tiles {
+                        plan.push((mb, c, t));
+                    }
+                }
+            }
+            let nblk = geom.nblk;
+            let ndisp = plan.len().div_ceil(nblk);
+            let mut wbufs = Vec::with_capacity(ndisp);
+            for d in 0..ndisp {
+                let mut buf = g.alloc_weights()?;
+                buf.as_mut_slice().fill(0);
+                for s in 0..nblk {
+                    let Some(&(_, c, t)) = plan.get(d * nblk + s) else {
+                        break;
+                    };
+                    geom.pack_w_slot(buf.as_mut_slice(), s, &codes, k, c * kc, t * nt);
+                }
+                g.sync_weights(&buf)?;
+                wbufs.push(buf);
+            }
+            let mut scale4t = vec![0f32; m * k_chunks];
+            for n in 0..m {
+                for c in 0..k_chunks {
+                    scale4t[c * m + n] = scale4[n * k_chunks + c];
+                }
+            }
+            Ok(Self {
+                m,
+                k,
+                rows,
+                k_chunks,
+                scale4t,
+                wbufs,
+                plan,
+            })
+        }
+    }
+
+    /// Per-(row, k-chunk) symmetric int8 activation quant — the chunked twin of
+    /// [`quantize_row`], required because the array contracts one chunk at a time.
+    pub fn quantize_row_chunked(
+        x: &[f32],
+        rows: usize,
+        k: usize,
+        kc: usize,
+        q: &mut [i8],
+        scale: &mut [f32],
+    ) {
+        // `--thread-quant`: the per-row quant is embarrassingly parallel (each row
+        // owns disjoint q/scale slices, no cross-row state), so rayon over rows is
+        // bit-identical to the serial loop — the per-row computation and its
+        // intra-row order are unchanged. MEASURED NET-NEGATIVE at this shape (see
+        // THREAD_QUANT doc); the flag exists only to reproduce that null.
+        if THREAD_QUANT.load(std::sync::atomic::Ordering::Relaxed) {
+            quantize_row_chunked_rayon(x, rows, k, kc, q, scale);
+            return;
+        }
+        // Baseline x86-64 has no round-to-nearest-even instruction, so
+        // `round_ties_even` compiles to a libm call PER ELEMENT and the loop
+        // stays scalar. SSE4.1's `roundps` (mode 0) is exactly ties-to-even, so
+        // an AVX2 clone of the identical source vectorizes with bit-identical
+        // results. Measured on nix1: 28.1 ms -> 3.2 ms per block.
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                // SAFETY: guarded by the runtime feature check above.
+                unsafe { quantize_row_chunked_avx2(x, rows, k, kc, q, scale) };
+                return;
+            }
+        }
+        quantize_row_chunked_scalar(x, rows, k, kc, q, scale)
+    }
+
+    /// Row-parallel twin of [`quantize_row_chunked_scalar`] (`--thread-glue`).
+    /// Bit-identical: each row is computed exactly as the scalar loop, only the
+    /// rows are distributed across the rayon pool.
+    fn quantize_row_chunked_rayon(
+        x: &[f32],
+        rows: usize,
+        k: usize,
+        kc: usize,
+        q: &mut [i8],
+        scale: &mut [f32],
+    ) {
+        use rayon::prelude::*;
+        let chunks = k / kc;
+        q[..rows * k]
+            .par_chunks_mut(k)
+            .zip(scale[..rows * chunks].par_chunks_mut(chunks))
+            .zip(x[..rows * k].par_chunks(k))
+            .for_each(|((qr, sr), xr)| {
+                for c in 0..chunks {
+                    let seg = &xr[c * kc..(c + 1) * kc];
+                    let absmax = seg.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                    let s = if absmax > 0.0 { absmax / QMAX } else { 1.0 };
+                    sr[c] = s;
+                    let inv = 1.0 / s;
+                    for (i, &v) in seg.iter().enumerate() {
+                        qr[c * kc + i] = (v * inv).round_ties_even().clamp(-QMAX, QMAX) as i8;
+                    }
+                }
+            });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn quantize_row_chunked_avx2(
+        x: &[f32],
+        rows: usize,
+        k: usize,
+        kc: usize,
+        q: &mut [i8],
+        scale: &mut [f32],
+    ) {
+        quantize_row_chunked_scalar(x, rows, k, kc, q, scale)
+    }
+
+    #[inline(always)]
+    fn quantize_row_chunked_scalar(
+        x: &[f32],
+        rows: usize,
+        k: usize,
+        kc: usize,
+        q: &mut [i8],
+        scale: &mut [f32],
+    ) {
+        let chunks = k / kc;
+        for r in 0..rows {
+            for c in 0..chunks {
+                let seg = &x[r * k + c * kc..r * k + (c + 1) * kc];
+                let absmax = seg.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                let s = if absmax > 0.0 { absmax / QMAX } else { 1.0 };
+                scale[r * chunks + c] = s;
+                let inv = 1.0 / s;
+                for (i, &v) in seg.iter().enumerate() {
+                    q[r * k + c * kc + i] =
+                        (v * inv).round_ties_even().clamp(-QMAX, QMAX) as i8;
+                }
+            }
+        }
+    }
+
+    // Host-glue attribution (HIPFIRE_PIPE_TRACE=1): cumulative ns in the r14
+    // GEMM's host work, split into the on-chain leading activation quant, the
+    // A-stripe pack, and the int32→f32 rescale. Only pack + rescale are
+    // overlappable behind weight streaming; quant depends on the previous op's
+    // output, so it stays on the layer critical path.
+    // `--thread-glue` threads the per-row activation quant and the int32→f32
+    // rescale across the rayon pool; `--thread-pack` additionally threads the
+    // A-stripe pack (which, under `--pipeline-glue`, contends with NPU weight
+    // streaming on the shared Phoenix UMA bus — measured separately so the
+    // contention verdict is isolated from the safe wait-window glue).
+    pub static THREAD_GLUE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    pub static THREAD_PACK: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    /// Separate from THREAD_GLUE: threading the per-row activation quant is a
+    /// MEASURED REGRESSION on this shape (16 rows/GEMM, 20 GEMMs/block — the rayon
+    /// fork/join overhead exceeds the per-row work, and quant sits on the layer
+    /// critical path so the loss hits the wall directly: 1.7→3.5 ms/block). Kept
+    /// behind its own opt-in flag for reproducibility; NOT folded into thread-glue.
+    pub static THREAD_QUANT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    pub static GLUE_QUANT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static GLUE_PACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static GLUE_RESCALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Pipelined path only: cumulative ns blocked in `submit_p` (the exec_cmd
+    /// ioctl + A flush) and in `wait` (the syncobj fence). If the overlap works,
+    /// `wait` shrinks below the serial device time as host glue fills the window.
+    pub static PIPE_SUBMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static PIPE_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    #[inline]
+    pub fn glue_add(ctr: &std::sync::atomic::AtomicU64, d: std::time::Duration) {
+        ctr.fetch_add(d.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn glue_take_ms() -> (f64, f64, f64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let q = GLUE_QUANT.swap(0, Relaxed) as f64 / 1e6;
+        let p = GLUE_PACK.swap(0, Relaxed) as f64 / 1e6;
+        let r = GLUE_RESCALE.swap(0, Relaxed) as f64 / 1e6;
+        (q, p, r)
+    }
+
+    /// `*mut f32` wrapper so a rayon closure can write disjoint regions of the
+    /// output buffer in parallel. SAFETY contract is per call site: every task
+    /// must write a range that provably aliases no other task's range.
+    #[derive(Clone, Copy)]
+    struct SendMutF32(*mut f32);
+    unsafe impl Send for SendMutF32 {}
+    unsafe impl Sync for SendMutF32 {}
+
+    /// Rescale one dispatch's int32 C into `out` (`+= scale4 * sx * v`). Serial by
+    /// default (bit-identical to the original inline loop). Under `--thread-glue`,
+    /// and only when every slot in the dispatch shares one k-chunk — which makes
+    /// the slots' output column ranges disjoint (distinct tiles) or their rows
+    /// disjoint (distinct m-blocks) — the slots are rescaled in parallel. Each
+    /// output element still receives exactly its one contribution per dispatch, in
+    /// the same value, so the result is bit-identical; only the C-buffer read-back
+    /// hazard order changes, which is already resolved before this call.
+    #[allow(clippy::too_many_arguments)]
+    fn rescale_dispatch(
+        geom: &R14Geometry,
+        span: &[(usize, usize, usize)],
+        c32: &[i32],
+        scale4t: &[f32],
+        sx: &[f32],
+        k_chunks: usize,
+        m: usize,
+        out: &mut [f32],
+    ) {
+        let (mt, nt) = (geom.m_tile(), geom.n_tile());
+        let threaded = THREAD_GLUE.load(std::sync::atomic::Ordering::Relaxed)
+            && span
+                .first()
+                .map(|&(_, c0, _)| span.iter().all(|&(_, c, _)| c == c0))
+                .unwrap_or(false);
+        if threaded {
+            use rayon::prelude::*;
+            let p = SendMutF32(out.as_mut_ptr());
+            span.par_iter().enumerate().for_each(|(s, &(mb, kchunk, tile))| {
+                let p = p; // move the Copy pointer into the task
+                let (row0, col0) = (mb * mt, tile * nt);
+                let scol = &scale4t[kchunk * m..(kchunk + 1) * m];
+                geom.each_c_run(c32, s, |lr, lc0, vals| {
+                    let r = row0 + lr;
+                    let sxr = sx[r * k_chunks + kchunk];
+                    let n0 = col0 + lc0;
+                    let sc = &scol[n0..n0 + vals.len()];
+                    // SAFETY: within a single-k-chunk dispatch, distinct slots
+                    // have distinct (m_block, tile) => disjoint [r*m+n0 ..) runs,
+                    // so no two tasks touch the same element.
+                    let o = unsafe {
+                        std::slice::from_raw_parts_mut(p.0.add(r * m + n0), vals.len())
+                    };
+                    for t in 0..vals.len() {
+                        o[t] += sc[t] * sxr * vals[t] as f32;
+                    }
+                });
+            });
+        } else {
+            for (s, &(mb, kchunk, tile)) in span.iter().enumerate() {
+                let (row0, col0) = (mb * mt, tile * nt);
+                let scol = &scale4t[kchunk * m..(kchunk + 1) * m];
+                geom.each_c_run(c32, s, |lr, lc0, vals| {
+                    let r = row0 + lr;
+                    let sxr = sx[r * k_chunks + kchunk];
+                    let n0 = col0 + lc0;
+                    let sc = &scol[n0..n0 + vals.len()];
+                    let o = &mut out[r * m + n0..r * m + n0 + vals.len()];
+                    for t in 0..vals.len() {
+                        o[t] += sc[t] * sxr * vals[t] as f32;
+                    }
+                });
+            }
+        }
+    }
+
+    /// `--thread-pack`: pack one dispatch's A stripes in parallel across the four
+    /// A-stripe regions (block-rows), which are contiguous and disjoint in the A
+    /// buffer, so `par_chunks_mut` splits them cleanly. NOTE this discards the
+    /// serial path's within-dispatch replication (consecutive slots sharing
+    /// (m_block, k_chunk) copy A instead of repacking): every slot is packed from
+    /// `qa` independently, so the total byte work is higher — the point is to
+    /// measure whether more cores beat the memory-movement cost under UMA
+    /// contention, not to assume it wins. Bit-identical bytes to the serial pack.
+    fn pack_dispatch_threaded(
+        geom: &R14Geometry,
+        span: &[(usize, usize, usize)],
+        qa: &[i8],
+        k: usize,
+        abuf: &mut [u8],
+    ) {
+        use hipfire_xdna::gemm_r14::{GRID, MK, MR};
+        use rayon::prelude::*;
+        let (lm, kt) = (geom.lm, geom.kt);
+        let (at, ab) = (geom.at(), geom.ab());
+        let (mt, kc) = (geom.m_tile(), geom.k_chunk());
+        abuf[..GRID * at]
+            .par_chunks_mut(at)
+            .enumerate()
+            .for_each(|(i, chunk)| {
+                for (s, &(mb, c, _)) in span.iter().enumerate() {
+                    let (m0, k0) = (mb * mt, c * kc);
+                    for im in 0..lm {
+                        for ktile in 0..kt {
+                            let toff = s * ab + (im * kt + ktile) * (MR * MK);
+                            for r in 0..MR {
+                                let row = m0 + i * lm * MR + im * MR + r;
+                                let src = row * k + k0 + ktile * MK;
+                                let s8: &[u8] = unsafe {
+                                    std::slice::from_raw_parts(
+                                        qa[src..src + MK].as_ptr() as *const u8,
+                                        MK,
+                                    )
+                                };
+                                chunk[toff + r * MK..toff + r * MK + MK].copy_from_slice(s8);
+                            }
+                        }
+                    }
+                }
+            });
+    }
+
+    /// Run one full GEMM on the r14 array. Returns (device ns, dispatch count).
+    pub fn run_r14(
+        g: &mut NpuGemmR14,
+        mx: &R14Matrix,
+        x: &[f32],
+        out: &mut [f32],
+        qa: &mut [i8],
+        sx: &mut [f32],
+    ) -> (u64, u64) {
+        let geom: R14Geometry = g.geom();
+        let (mt, kc) = (geom.m_tile(), geom.k_chunk());
+        let (rows, m, k, nblk) = (mx.rows, mx.m, mx.k, geom.nblk);
+        let tq = std::time::Instant::now();
+        quantize_row_chunked(x, rows, k, kc, qa, sx);
+        glue_add(&GLUE_QUANT, tq.elapsed());
+        out[..rows * m].fill(0.0);
+
+        let mut ns = 0u64;
+        let mut disp = 0u64;
+        // Identity of the (m_block, k_chunk) stripe set currently resident in the
+        // array's A buffer, or None when it holds something else.
+        let a_state = &mut None::<(usize, usize)>;
+        for (d, wbuf) in mx.wbufs.iter().enumerate() {
+            let lo = d * nblk;
+            let hi = (lo + nblk).min(mx.plan.len());
+            // Every slot of a dispatch usually shares one (m_block, k_chunk) — the
+            // plan runs n_tile innermost — so the whole A buffer is one stripe set
+            // replicated nblk times. When the NEXT dispatch carries the same pair,
+            // the buffer is already correct and the entire fill is skipped.
+            let span = &mx.plan[lo..hi];
+            let uniform = span.first().map(|&(mb, c, _)| {
+                span.iter().all(|&(m2, c2, _)| m2 == mb && c2 == c).then_some((mb, c))
+            }).flatten();
+            let skip = uniform.is_some() && uniform == *a_state;
+            let tp = std::time::Instant::now();
+            if !skip {
+                if THREAD_PACK.load(std::sync::atomic::Ordering::Relaxed) {
+                    pack_dispatch_threaded(&geom, span, qa, k, g.a_mut());
+                    *a_state = uniform;
+                } else {
+                    let abuf = g.a_mut();
+                    let mut prev: Option<(usize, usize, usize)> = None;
+                    for (s, &(mb, c, _)) in mx.plan[lo..hi].iter().enumerate() {
+                        // A depends only on (m_block, k_chunk); consecutive slots in a
+                        // dispatch usually share both, so replicate instead of repacking.
+                        if let Some((pmb, pc, ps)) = prev {
+                            if pmb == mb && pc == c {
+                                for i in 0..hipfire_xdna::gemm_r14::GRID {
+                                    let (base, off) = (i * geom.at(), geom.ab());
+                                    let (src, dst) = (base + ps * off, base + s * off);
+                                    abuf.copy_within(src..src + off, dst);
+                                }
+                                continue;
+                            }
+                        }
+                        geom.pack_a_slot(abuf, s, qa, k, mb * mt, c * kc);
+                        prev = Some((mb, c, s));
+                    }
+                    *a_state = uniform;
+                }
+            }
+            glue_add(&GLUE_PACK, tp.elapsed());
+            let t = std::time::Instant::now();
+            g.dispatch(wbuf).expect("r14 dispatch");
+            ns += t.elapsed().as_nanos() as u64;
+            disp += 1;
+            let c32 = g.read_c().expect("r14 read C");
+            let tr = std::time::Instant::now();
+            rescale_dispatch(&geom, span, c32, &mx.scale4t, sx, mx.k_chunks, m, out);
+            glue_add(&GLUE_RESCALE, tr.elapsed());
+        }
+        (ns, disp)
+    }
+
+    /// Double-buffered twin of [`run_r14`] (`--pipeline-glue`). Overlaps the host
+    /// glue — the int32→f32 rescale of dispatch `d-1` and the A-stripe pack of
+    /// dispatch `d+1` — with dispatch `d`'s weight streaming, using the r14
+    /// array's second argument set. One dispatch is in flight at a time, so the
+    /// 6-hwctx budget is unchanged; only the host A/C buffers double.
+    ///
+    /// Buffer-race safety (the primary risk of this path): each parity's C is
+    /// rescaled, and its A repacked, only after the dispatch that used it has
+    /// been `wait`ed, and always before the next dispatch that reuses that parity
+    /// is submitted. The rescale accumulates into `out` in the SAME dispatch
+    /// order as [`run_r14`], so results are bit-identical (verified by
+    /// `--pipeline-check`), not merely close.
+    ///
+    /// `ns` returned is the time actually spent blocked in [`NpuGemmR14::wait`]
+    /// (NPU time not hidden by host glue), not the fused submit+wait of the
+    /// serial path — so `npu_busy` shrinks toward the true unhidden floor.
+    pub fn run_r14_pipelined(
+        g: &mut NpuGemmR14,
+        mx: &R14Matrix,
+        x: &[f32],
+        out: &mut [f32],
+        qa: &mut [i8],
+        sx: &mut [f32],
+        check: bool,
+    ) -> (u64, u64) {
+        if check {
+            // Same-run parity: compute the serial reference, then the pipelined
+            // result, and assert bit-identity. Proves no buffer race corrupts an
+            // answer (the md5/cos gates would only see a *changed* number).
+            let mut refo = vec![0f32; mx.rows * mx.m];
+            run_r14(g, mx, x, &mut refo, qa, sx);
+            let r = run_r14_pipelined_core(g, mx, x, out, qa, sx);
+            for i in 0..mx.rows * mx.m {
+                assert!(
+                    out[i].to_bits() == refo[i].to_bits(),
+                    "pipeline parity mismatch at {i}: {} (pipe) vs {} (serial)",
+                    out[i],
+                    refo[i]
+                );
+            }
+            return r;
+        }
+        run_r14_pipelined_core(g, mx, x, out, qa, sx)
+    }
+
+    fn run_r14_pipelined_core(
+        g: &mut NpuGemmR14,
+        mx: &R14Matrix,
+        x: &[f32],
+        out: &mut [f32],
+        qa: &mut [i8],
+        sx: &mut [f32],
+    ) -> (u64, u64) {
+        use hipfire_xdna::gemm_r14::GRID;
+        let geom: R14Geometry = g.geom();
+        let (mt, kc) = (geom.m_tile(), geom.k_chunk());
+        let (m, k, nblk) = (mx.m, mx.k, geom.nblk);
+        let tq = std::time::Instant::now();
+        quantize_row_chunked(x, mx.rows, k, kc, qa, sx);
+        glue_add(&GLUE_QUANT, tq.elapsed());
+        out[..mx.rows * m].fill(0.0);
+
+        let ndisp = mx.wbufs.len();
+        if ndisp == 0 {
+            return (0, 0);
+        }
+        g.ensure_pipelined().expect("r14 double-buffer alloc");
+
+        // Pack parity `p`'s A buffer for dispatch `d` — same within-dispatch
+        // replication as run_r14 (consecutive slots sharing (m_block, k_chunk)
+        // copy A rather than repack). A macro, not a closure, so the &mut g and
+        // shared qa/mx borrows are exactly as if written inline.
+        macro_rules! pack_a {
+            ($p:expr, $d:expr) => {{
+                let (p, d) = ($p, $d);
+                let lo = d * nblk;
+                let hi = (lo + nblk).min(mx.plan.len());
+                let tp = std::time::Instant::now();
+                let span = &mx.plan[lo..hi];
+                if THREAD_PACK.load(std::sync::atomic::Ordering::Relaxed) {
+                    pack_dispatch_threaded(&geom, span, qa, k, g.a_mut_p(p));
+                } else {
+                    let abuf = g.a_mut_p(p);
+                    let mut prev: Option<(usize, usize, usize)> = None;
+                    for (s, &(mb, c, _)) in span.iter().enumerate() {
+                        if let Some((pmb, pc, ps)) = prev {
+                            if pmb == mb && pc == c {
+                                for i in 0..GRID {
+                                    let (base, off) = (i * geom.at(), geom.ab());
+                                    let (src, dst) = (base + ps * off, base + s * off);
+                                    abuf.copy_within(src..src + off, dst);
+                                }
+                                continue;
+                            }
+                        }
+                        geom.pack_a_slot(abuf, s, qa, k, mb * mt, c * kc);
+                        prev = Some((mb, c, s));
+                    }
+                }
+                glue_add(&GLUE_PACK, tp.elapsed());
+            }};
+        }
+        // Rescale parity `p`'s C (dispatch `d`'s output) into `out`. Same
+        // left-to-right accumulation as run_r14, walked in ascending `d`.
+        macro_rules! rescale {
+            ($p:expr, $d:expr) => {{
+                let (p, d) = ($p, $d);
+                let lo = d * nblk;
+                let hi = (lo + nblk).min(mx.plan.len());
+                let tr = std::time::Instant::now();
+                let c32 = g.read_c_p(p).expect("r14 read C");
+                rescale_dispatch(&geom, &mx.plan[lo..hi], c32, &mx.scale4t, sx, mx.k_chunks, m, out);
+                glue_add(&GLUE_RESCALE, tr.elapsed());
+            }};
+        }
+
+        let mut ns = 0u64;
+        // Prime the pipeline: pack + submit dispatch 0.
+        pack_a!(0, 0);
+        let ts0 = std::time::Instant::now();
+        let mut seq = g.submit_p(0, &mx.wbufs[0]).expect("r14 submit");
+        glue_add(&PIPE_SUBMIT, ts0.elapsed());
+        for d in 0..ndisp {
+            // Dispatch `d` (parity d&1) is running on the NPU. Do the glue that
+            // does NOT depend on it, on the other parities:
+            //  - pack A for d+1 (into (d+1)&1; that buffer was last used by d-1,
+            //    already waited) — reads only the already-quantized qa.
+            //  - rescale C for d-1 (from (d-1)&1; synced + read here, and it is
+            //    consumed before the submit below that would overwrite it).
+            if d + 1 < ndisp {
+                pack_a!((d + 1) & 1, d + 1);
+            }
+            if d >= 1 {
+                rescale!((d - 1) & 1, d - 1);
+            }
+            let tw = std::time::Instant::now();
+            g.wait(seq).expect("r14 wait");
+            let w = tw.elapsed();
+            ns += w.as_nanos() as u64;
+            glue_add(&PIPE_WAIT, w);
+            if d + 1 < ndisp {
+                let ts = std::time::Instant::now();
+                seq = g.submit_p((d + 1) & 1, &mx.wbufs[d + 1]).expect("r14 submit");
+                glue_add(&PIPE_SUBMIT, ts.elapsed());
+            }
+        }
+        // Tail: the last dispatch's C was never rescaled inside the loop.
+        rescale!((ndisp - 1) & 1, ndisp - 1);
+        (ns, ndisp as u64)
+    }
+
+    // ── kernel cache ────────────────────────────────────────────────────────
+    /// Kernels under a hardware-context budget. The anchor is pinned (it owns
+    /// the DRM file and device heap every peer shares, and every argument
+    /// buffer is allocated against it), so it must never be evicted.
+    pub struct KernelCache {
+        pub anchor: NpuKernel,
+        #[allow(dead_code)] // read by is_anchor(); kept to document the pinned anchor
+        anchor_name: String,
+        artifacts: HashMap<String, (Vec<u8>, Vec<u8>)>,
+        live: Vec<(String, NpuKernel)>,
+        capacity: usize,
+        clock: u64,
+        last_use: HashMap<String, u64>,
+        pub misses: u64,
+        pub miss_ns: u64,
+        /// Eviction policy. The body touches its primitives in a fixed repeating
+        /// cycle longer than the slot count, which is LRU's pessimal case (every
+        /// access misses). MRU keeps `capacity-1` of the cycle resident instead.
+        pub mru: bool,
+    }
+
+    impl KernelCache {
+        pub fn new(
+            artifacts: HashMap<String, (Vec<u8>, Vec<u8>)>,
+            anchor_name: &str,
+            capacity: usize,
+        ) -> Result<Self, XdnaError> {
+            let (x, i) = artifacts.get(anchor_name).expect("anchor artifact");
+            let anchor = NpuKernel::load(x, i)?;
+            Ok(Self {
+                anchor,
+                anchor_name: anchor_name.to_string(),
+                artifacts,
+                live: Vec::new(),
+                capacity,
+                clock: 0,
+                last_use: HashMap::new(),
+                misses: 0,
+                miss_ns: 0,
+                mru: true,
+            })
+        }
+
+        /// Borrow a loaded kernel, loading (and evicting) as needed. Returns an
+        /// index into `live`, not a reference, so the caller can still touch
+        /// the cache; use [`Self::at`] to dispatch.
+        /// Sentinel index meaning "this is the anchor" — already loaded and
+        /// pinned, so it costs no LRU slot and can never miss.
+        pub const ANCHOR: usize = usize::MAX;
+
+        pub fn get(&mut self, name: &str) -> usize {
+            // The anchor is permanently resident. Loading it again as a peer
+            // would burn a second hardware context on the same program AND make
+            // the body's most frequent kernel a recurring LRU victim.
+            if name == self.anchor_name {
+                return Self::ANCHOR;
+            }
+            self.clock += 1;
+            self.last_use.insert(name.to_string(), self.clock);
+            if let Some(idx) = self.live.iter().position(|(n, _)| n == name) {
+                return idx;
+            }
+            if self.live.len() >= self.capacity {
+                // Evict least-recently-used. Dropping the kernel destroys its
+                // hwctx, freeing a slot; its argument buffers are unaffected
+                // (they belong to the shared device, not the context).
+                let key = |n: &String| self.last_use.get(n).copied().unwrap_or(0);
+                let victim = if self.mru {
+                    self.live
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, (n, _))| key(n))
+                        .map(|(i, _)| i)
+                } else {
+                    self.live
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, (n, _))| key(n))
+                        .map(|(i, _)| i)
+                }
+                .expect("non-empty cache");
+                self.live.remove(victim);
+            }
+            let t0 = std::time::Instant::now();
+            let (x, i) = self.artifacts.get(name).unwrap_or_else(|| panic!("no artifact {name}"));
+            let k = NpuKernel::load_peer(&self.anchor, x, i)
+                .unwrap_or_else(|e| panic!("load_peer {name}: {e:?}"));
+            self.miss_ns += t0.elapsed().as_nanos() as u64;
+            self.misses += 1;
+            self.live.push((name.to_string(), k));
+            self.live.len() - 1
+        }
+
+        pub fn at(&self, idx: usize) -> &NpuKernel {
+            if idx == Self::ANCHOR {
+                return &self.anchor;
+            }
+            &self.live[idx].1
+        }
+
+        #[allow(dead_code)] // guards against evicting the anchor; kept as API
+        pub fn is_anchor(&self, name: &str) -> bool {
+            name == self.anchor_name
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn main() {
+    use body::*;
+    use hipfire_xdna::gemm_r14::NpuGemmR14;
+    use hipfire_xdna::{DeviceBuffer, NpuKernel};
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    // ── args ────────────────────────────────────────────────────────────────
+    let argv: Vec<String> = std::env::args().collect();
+    let arg = |k: &str| -> Option<String> {
+        argv.iter().position(|a| a == k).and_then(|i| argv.get(i + 1)).cloned()
+    };
+    let manifest_path = arg("--manifest").expect("--manifest");
+    let wdir = arg("--weights").expect("--weights");
+    let gdir = arg("--golden").expect("--golden");
+    let refpath = arg("--ref");
+    let blocks: usize = arg("--blocks").and_then(|v| v.parse().ok()).unwrap_or(3);
+    // npu1 (Phoenix) admits only SIX concurrent hardware contexts. The anchor
+    // plus this LRU capacity plus (under `--gemm multicore`) the pinned r14 array
+    // must stay within that. The default was 5, which gives anchor + r14 + 5 = 7
+    // under multicore and panics at load_peer with Ioctl(EINVAL, os code 22) on
+    // the first primitive that misses. 4 is the largest value that fits the
+    // multicore config; the single-core path has one context spare.
+    let capacity: usize = arg("--ctx-budget").and_then(|v| v.parse().ok()).unwrap_or(4);
+    // `--gemm multicore` routes every projection through the r14 4x4 array
+    // (W4A8) instead of the single-core `int_matmul` (W8A8).
+    let mc = arg("--gemm").as_deref() == Some("multicore");
+    // `--ctx-cache` caches the position-invariant context projection across
+    // cycles: thp = rmsnorm(fc(target_hidden)) and each layer's post-headnorm/
+    // post-rope context K plus raw context V. Those depend only on committed
+    // tokens (rope uses absolute pos0=0, so context row r keeps position r as
+    // the context grows), so they are computed once (block 0) and reused. This
+    // removes fc, the per-layer kv GEMMs and rms-b{L} from the warm per-cycle
+    // path. Block 1 recomputes them and directly compares against the cache
+    // (bit-identical gate); blocks >=2 are the timed warm-cached cycles.
+    let ctx_cache = arg("--ctx-cache").is_some();
+    // `--cpu-primitives` runs rmsnorm/headnorm/rope/swiglu on the host in f32
+    // instead of dispatching the 8 primitive NPU kernels. This removes those
+    // kernels from the NPU working set (10 warm kernels -> the GEMM path +
+    // attention) and deletes their bf16 pack/unpack glue. Opt-in: the all-NPU
+    // path stays the default so existing measurements reproduce.
+    let cpu_prim = arg("--cpu-primitives").is_some();
+    // `--pipeline-glue` (multicore/W4A8 only) double-buffers the r14 array's A/C
+    // argument set and overlaps the host glue (int32→f32 rescale of dispatch d-1,
+    // A-stripe pack of d+1) with dispatch d's weight streaming. The serial path
+    // stays default and reproducible. `--pipeline-check` additionally recomputes
+    // each GEMM serially in the same run and asserts the pipelined result is
+    // bit-identical (the buffer-race gate — a race changes the number, which the
+    // cos/md5 gates would see as a regression, but this catches it at the GEMM).
+    // Presence check, NOT arg(...).is_some(): `arg` returns the token *after* the
+    // flag, so a boolean flag passed LAST would read as absent.
+    let has = |k: &str| argv.iter().any(|a| a == k);
+    let pipeline_glue = has("--pipeline-glue");
+    let pipeline_check = has("--pipeline-check");
+    // `--thread-glue` threads the int32→f32 rescale across the rayon pool;
+    // `--thread-pack` additionally threads the A-stripe pack (the UMA-contended
+    // one); `--thread-quant` threads the on-chain per-row quant (measured
+    // regression, opt-in only). All are bit-identical by disjoint-region
+    // construction; the serial path stays the default so prior numbers reproduce.
+    let thread_glue = has("--thread-glue") || has("--thread-pack");
+    let thread_pack = has("--thread-pack");
+    let thread_quant = has("--thread-quant");
+    THREAD_GLUE.store(thread_glue, std::sync::atomic::Ordering::Relaxed);
+    THREAD_PACK.store(thread_pack, std::sync::atomic::Ordering::Relaxed);
+    THREAD_QUANT.store(thread_quant, std::sync::atomic::Ordering::Relaxed);
+    // Per-block gate for the bit-identity check, set from the block loop (block 0
+    // is cold — excluded). A Cell so the `gemm!` macro can read it at its
+    // definition-site scope while the loop updates it each block.
+    let pipeline_check_active = std::cell::Cell::new(false);
+    // `--parity` (used WITH the all-NPU path) runs each CPU primitive on the
+    // SAME input the NPU kernel just consumed and records cos + max|Δ| between
+    // the two outputs — the ISOLATED primitive parity the gate wants, since it
+    // never passes the delta through the int8 GEMM (which would amplify a bf16
+    // vs f32 rounding to the quant floor).
+    let parity = arg("--parity").is_some();
+    // `--parity-bf16` rounds the CPU reference's input, weight and output through
+    // bf16 in the parity probe, matching the NPU kernel's actual I/O contract
+    // (write_bf16 in / read_bf16 out). Confirms the pure-f32 residual is bf16
+    // precision, not an algorithmic difference.
+    let parity_bf16 = arg("--parity-bf16").is_some();
+    let bfr = |s: &[f32]| -> Vec<f32> {
+        s.iter().map(|&v| bf16_to_f32(f32_to_bf16(v))).collect()
+    };
+    // Same-run parity plumbing: --dump-out writes the final block_hidden as raw
+    // little-endian f32; --cmp loads such a file and reports cos against this
+    // run's block_hidden (CPU-vs-NPU primitive parity, GEMM path held fixed).
+    let dump_out = arg("--dump-out");
+    let cmp_path = arg("--cmp");
+    let r14_dir = arg("--r14-dir").unwrap_or_else(|| {
+        format!(
+            "{}/.hipfire/npu/r14_1x2x128_nb128",
+            std::env::var("HOME").unwrap()
+        )
+    });
+
+    // ── config + weights ────────────────────────────────────────────────────
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(format!("{wdir}/index.json")).expect("index.json"))
+            .expect("parse index");
+    let c = &index["cfg"];
+    let g = |k: &str| c[k].as_u64().unwrap() as usize;
+    let (h, i_dim, nh, nkv, hd) = (g("H"), g("I"), g("NH"), g("NKV"), g("HD"));
+    let (nl, b_rows, l_ctx, ne, tot, groups) =
+        (g("NL"), g("B"), g("L"), g("NE"), g("tot"), g("groups"));
+    let theta = c["THETA"].as_f64().unwrap();
+    // The rmsnorm/headnorm NPU kernels bake eps=1e-5 (KERNEL_EPS); mirror it on
+    // the CPU path so the host norms track the device, not the model's ~1e-6.
+    let kernel_eps = c["KERNEL_EPS"].as_f64().unwrap_or(1e-5) as f32;
+    let q_len = groups * b_rows;
+    println!(
+        "[dflash_body_native] H={h} I={i_dim} NH={nh} NKV={nkv} NL={nl} B={b_rows} L={l_ctx} tot={tot}"
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("manifest")).expect("parse");
+    let mkernels = manifest["kernels"].as_object().expect("kernels");
+
+    // Map each body op to its manifest kernel name. GEMMs are identified by
+    // their CompileTime shape, exactly as the JIT cache keys them.
+    let gemm_kernel = |m: usize, k: usize, n: usize| -> String {
+        mkernels
+            .iter()
+            .find(|(_, s)| {
+                let ca = &s["compile_args"];
+                ca["M"].as_u64() == Some(m as u64)
+                    && ca["K"].as_u64() == Some(k as u64)
+                    && ca["N"].as_u64() == Some(n as u64)
+            })
+            .map(|(n, _)| n.clone())
+            .unwrap_or_else(|| panic!("no GEMM kernel M={m} K={k} N={n}"))
+    };
+    // Attention kernel. Two ABIs live side by side:
+    //   sc    (`dflash_attn_all*`)   — one iteration per kv-head, whole KV
+    //                                  resident, plain row-major Q/K/V.
+    //   flash (`dflash_attn_flash*`) — one iteration per q-head, KV streamed in
+    //                                  mmul-tiled tiles, tiled C-layout output.
+    // They are NOT interchangeable by xclbin swap; the host packing differs.
+    // sc stays the default so a flash regression cannot cost the working path.
+    let attn_name = mkernels
+        .keys()
+        .find(|n| n.starts_with("dflash_attn_flash"))
+        .filter(|_| arg("--attn").as_deref() == Some("flash"))
+        .or_else(|| mkernels.keys().find(|n| n.starts_with("dflash_attn_all")))
+        .expect("attn kernel")
+        .clone();
+    let attn_flash = attn_name.starts_with("dflash_attn_flash");
+    // Flash geometry comes from the manifest entry's compile_args, so the host
+    // packing cannot silently disagree with what the kernel was built for.
+    let (fl_q_len, fl_kv_tile, fl_n_tiles, fl_n_iters) = if attn_flash {
+        let ca = &mkernels[&attn_name]["compile_args"];
+        let ga = |k: &str| ca[k].as_u64().unwrap_or_else(|| panic!("compile_args.{k}")) as usize;
+        (ga("q_len"), ga("kv_tile"), ga("n_tiles"), ga("n_iters"))
+    } else {
+        (q_len, 0, 0, nkv)
+    };
+    if attn_flash {
+        let hpi = fl_q_len / b_rows;
+        assert_eq!(fl_q_len % b_rows, 0, "flash q_len must be a multiple of B");
+        assert_eq!(fl_n_iters, nh / hpi, "flash n_iters disagrees with NH");
+        assert!(
+            fl_n_tiles * fl_kv_tile >= tot,
+            "flash n_tiles*kv_tile={} cannot cover tot={tot}",
+            fl_n_tiles * fl_kv_tile
+        );
+        println!(
+            "  [attn] flash: q_len={fl_q_len} kv_tile={fl_kv_tile} n_tiles={fl_n_tiles} \
+             n_iters={fl_n_iters} heads/iter={hpi} tot={tot} (pad {})",
+            fl_n_tiles * fl_kv_tile - tot
+        );
+    }
+
+    let artifacts: HashMap<String, (Vec<u8>, Vec<u8>)> = mkernels
+        .iter()
+        .map(|(n, s)| {
+            (
+                n.clone(),
+                (
+                    std::fs::read(s["xclbin"].as_str().unwrap()).expect("xclbin"),
+                    std::fs::read(s["insts"].as_str().unwrap()).expect("insts"),
+                ),
+            )
+        })
+        .collect();
+
+    // rmsnorm-b16 runs 11x per block (2/layer + the final norm) — pin it.
+    let rms16 = format!("qwen35-rmsnorm-{h}-b{b_rows}");
+    let rms32 = format!("qwen35-rmsnorm-{h}-b{l_ctx}");
+    let hn_q = format!("qwen35-headnorm-q-{nh}h{hd}d-b{b_rows}");
+    let hn_k = format!("qwen35-headnorm-k-{nkv}h{hd}d-b{tot}");
+    let rope_q = format!("dflash-rope-q-{nh}h{hd}d-b{b_rows}");
+    let rope_k = format!("dflash-rope-k-{nkv}h{hd}d-b{tot}");
+    let swiglu = format!("qwen35-swiglu-{i_dim}-b{b_rows}");
+
+    let t_setup = Instant::now();
+    let mut cache = KernelCache::new(artifacts, &rms16, capacity).expect("kernel cache");
+    cache.mru = arg("--evict").as_deref() != Some("lru");
+
+    // ── resident weights: uploaded ONCE, reused across dispatches + blocks ──
+    struct Gemm {
+        w: DeviceBuffer,
+        scale: Vec<f32>,
+        m: usize,
+        k: usize,
+        sizes: Vec<usize>,
+    }
+    let load_gemm = |anchor: &NpuKernel,
+                     key: &str,
+                     r14: Option<(&NpuGemmR14, usize)>|
+     -> (Gemm, Option<R14Matrix>) {
+        let spec = &index["gemms"][key];
+        let (m, k) = (
+            spec["M"].as_u64().unwrap() as usize,
+            spec["K"].as_u64().unwrap() as usize,
+        );
+        let raw = std::fs::read(format!("{wdir}/w_{key}.i8")).expect("weight");
+        assert_eq!(raw.len(), m * k, "{key} weight size");
+        let sraw = std::fs::read(format!("{wdir}/w_{key}.scale")).expect("scale");
+        let scale: Vec<f32> = sraw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let sizes: Vec<usize> = spec["sizes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let raw_i8 =
+            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
+        // In multicore mode the int8 weight never reaches the device — only the
+        // r14 int4 repack does — so the placeholder buffer stays 1 byte.
+        let mx = r14.map(|(g, rows)| {
+            R14Matrix::build(g, raw_i8, &scale, m, k, rows)
+                .unwrap_or_else(|e| panic!("r14 build {key}: {e:?}"))
+        });
+        let mut w = anchor
+            .alloc_arg(if mx.is_some() { 1 } else { m * k })
+            .expect("alloc weight");
+        if mx.is_none() {
+            w.as_mut_slice().copy_from_slice(&raw);
+            // Flush once here; the dispatch path then skips re-flushing this
+            // buffer, which is the point of keeping it resident.
+            anchor.sync_to_device(&w).expect("sync weight");
+        }
+        (
+            Gemm {
+                w,
+                scale,
+                m,
+                k,
+                sizes,
+            },
+            mx,
+        )
+    };
+    let load_gamma = |key: &str| -> Vec<f32> {
+        std::fs::read(format!("{wdir}/g_{key}.f32"))
+            .expect("gamma")
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+
+    // The r14 array shares the anchor's DRM file + device heap, so its argument
+    // buffers survive every LRU eviction exactly like the resident weights do.
+    let mut r14 = if mc {
+        let g = NpuGemmR14::load_peer_dir(&cache.anchor, &r14_dir)
+            .unwrap_or_else(|e| panic!("load r14 {r14_dir}: {e:?}"));
+        let gm = g.geom();
+        println!(
+            "  [r14] {r14_dir}  M_TILE={} N_TILE={} K_CHUNK={}  (W group size = K_CHUNK)",
+            gm.m_tile(),
+            gm.n_tile(),
+            gm.k_chunk()
+        );
+        Some(g)
+    } else {
+        None
+    };
+    let rr = |rows: usize| r14.as_ref().map(|g| (g, rows));
+
+    let (w_fc, mc_fc) = load_gemm(&cache.anchor, "fc", rr(l_ctx));
+    let g_hidden = load_gamma("hidden_norm");
+    let g_final = load_gamma("final_norm");
+    #[allow(clippy::type_complexity)]
+    let (layers, mc_layers): (
+        Vec<(Gemm, Gemm, Gemm, Gemm, Gemm, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>,
+        Vec<[Option<R14Matrix>; 5]>,
+    ) = (0..nl)
+        .map(|li| {
+            let (qkv, m_qkv) = load_gemm(&cache.anchor, &format!("l{li}_qkv"), rr(b_rows));
+            let (kv, m_kv) = load_gemm(&cache.anchor, &format!("l{li}_kv"), rr(l_ctx));
+            let (o, m_o) = load_gemm(&cache.anchor, &format!("l{li}_o"), rr(b_rows));
+            let (gu, m_gu) = load_gemm(&cache.anchor, &format!("l{li}_gateup"), rr(b_rows));
+            let (dn, m_dn) = load_gemm(&cache.anchor, &format!("l{li}_down"), rr(b_rows));
+            (
+                (
+                    qkv,
+                    kv,
+                    o,
+                    gu,
+                    dn,
+                    load_gamma(&format!("l{li}_input")),
+                    load_gamma(&format!("l{li}_post")),
+                    load_gamma(&format!("l{li}_qnorm")),
+                    load_gamma(&format!("l{li}_knorm")),
+                ),
+                [m_qkv, m_kv, m_o, m_gu, m_dn],
+            )
+        })
+        .unzip();
+    println!(
+        "  [setup] weights resident in {:.1} s",
+        t_setup.elapsed().as_secs_f64()
+    );
+
+    // ── scratch argument buffers (allocated once, reused) ───────────────────
+    // Every buffer belongs to the shared device via the pinned anchor, so it
+    // stays valid no matter which kernels the LRU evicts.
+    let a = &cache.anchor;
+    let mk = |n: usize| a.alloc_arg(n).expect("alloc scratch");
+    let max_gemm_m = layers.iter().map(|l| l.3.m).max().unwrap().max(w_fc.m);
+    let max_rows = tot.max(l_ctx).max(b_rows);
+
+    let mut gemm_b = mk(max_rows * (ne * h).max(i_dim).max(h)); // int8 activation
+    let gemm_c = mk(max_gemm_m * max_rows * 4); // int32 result
+    let mut norm_in = mk(max_rows * h * 2);
+    let mut norm_w = mk(max_rows * h * 2);
+    let norm_out = mk(max_rows * h * 2);
+    let mut hn_in = mk(tot * nh * hd * 2);
+    let hn_out = mk(tot * nh * hd * 2);
+    let mut hn_w = mk(hd * 2);
+    let mut rope_in = mk(tot * nh * hd * 2);
+    let mut rope_cs = mk(tot * nh * hd * 2);
+    let rope_out = mk(tot * nh * hd * 2);
+    let mut sw_gate = mk(b_rows * i_dim * 2);
+    let mut sw_up = mk(b_rows * i_dim * 2);
+    let sw_out = mk(b_rows * i_dim * 2);
+    // sc:    Q/O = nkv*q_len*hd, KV = nkv*2*tot*hd
+    // flash: Q/O = n_iters*fl_q_len*hd (identical total), KV is larger — each
+    //        q-head iteration carries its kv-head's whole KV, so KV is replicated
+    //        `groups` times, plus the per-tile f32 mask (2 bf16 slots per row).
+    let (attn_q_elems, attn_kv_elems) = if attn_flash {
+        (
+            fl_n_iters * fl_q_len * hd,
+            fl_n_iters * fl_n_tiles * (2 * fl_kv_tile * hd + 2 * fl_kv_tile),
+        )
+    } else {
+        (nkv * q_len * hd, nkv * 2 * tot * hd)
+    };
+    let mut attn_q = mk(attn_q_elems * 2);
+    let mut attn_kv = mk(attn_kv_elems * 2);
+    let attn_o = mk(attn_q_elems * 2);
+
+    // Host-side staging (f32, mirroring the numpy harness exactly).
+    let mut qbuf = vec![0i8; max_rows * (ne * h).max(i_dim).max(h)];
+    let mut sxbuf = vec![0f32; max_rows * 64]; // rows x k_chunks in multicore mode
+    let mut csrow = vec![0f32; hd];
+
+    // ── inputs + validation targets ─────────────────────────────────────────
+    let noise = npy::read(&format!("{gdir}/noise_embedding.npy")).expect("noise").to_f32();
+    let target_hidden = npy::read(&format!("{gdir}/target_hidden.npy")).expect("th").to_f32();
+    let golden = npy::read(&format!("{gdir}/rust/rust_final_block_hidden.npy"))
+        .expect("golden")
+        .to_f32();
+    let precision_ref = refpath.as_ref().map(|p| npy::read(p).expect("ref").to_f32());
+
+    // ── probe: steady-state dispatch cost with NO context churn ─────────────
+    // Separates the per-dispatch floor from the cost of re-establishing a
+    // ~1 GB resident weight in a freshly created hardware context. Dispatches
+    // one GEMM repeatedly on a kernel that is never evicted.
+    if let Some(key) = arg("--probe-gemm") {
+        let n: usize = arg("--probe-iters").and_then(|v| v.parse().ok()).unwrap_or(50);
+        let gm = load_gemm(&cache.anchor, &key, None).0;
+        let rows = if gm.k == ne * h { l_ctx } else { b_rows };
+        let name = gemm_kernel(gm.m, gm.k, rows);
+        let idx = cache.get(&name);
+        let k = cache.at(idx);
+        let x = vec![0.5f32; rows * gm.k];
+        quantize_row(&x, rows, gm.k, &mut qbuf, &mut sxbuf);
+        gemm_b.as_mut_slice()[..rows * gm.k].copy_from_slice(unsafe {
+            std::slice::from_raw_parts(qbuf.as_ptr() as *const u8, rows * gm.k)
+        });
+        // Warm: the first dispatch on a fresh context pays the residency map.
+        k.dispatch_synced(&[&gm.w, &gemm_b, &gemm_c], &[false, true, false])
+            .expect("probe warm");
+        let t0 = Instant::now();
+        for _ in 0..n {
+            k.dispatch_synced(&[&gm.w, &gemm_b, &gemm_c], &[false, true, false])
+                .expect("probe");
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+        println!(
+            "  probe {key}: M={} K={} rows={rows} weight={:.0} MB  \
+             steady-state dispatch = {us:.0} us  (n={n}, no ctx churn)",
+            gm.m,
+            gm.k,
+            (gm.m * gm.k) as f64 / 1e6
+        );
+        return;
+    }
+
+    // Steady-state cost of ONE matrix on the r14 array, with no other kernel
+    // interleaved: separates the array's stream rate from body interference.
+    if let Some(key) = arg("--probe-r14") {
+        let n: usize = arg("--probe-iters").and_then(|v| v.parse().ok()).unwrap_or(20);
+        let rows: usize = arg("--probe-rows").and_then(|v| v.parse().ok()).unwrap_or(b_rows);
+        let (gm, mx, wb) = {
+            let g = r14.as_ref().expect("--gemm multicore");
+            let wb = g.geom().w_bytes();
+            let (gm, mx) = load_gemm(&cache.anchor, &key, Some((g, rows)));
+            (gm, mx.unwrap(), wb)
+        };
+        let x = vec![0.5f32; rows * gm.k];
+        let mut out = vec![0f32; rows * gm.m];
+        let gr = r14.as_mut().unwrap();
+        let (_, nd) = run_r14(gr, &mx, &x, &mut out, &mut qbuf, &mut sxbuf);
+        let mut ts = Vec::new();
+        for _ in 0..n {
+            let t0 = Instant::now();
+            let (dt, _) = run_r14(gr, &mx, &x, &mut out, &mut qbuf, &mut sxbuf);
+            ts.push((dt as f64 / 1e6, t0.elapsed().as_secs_f64() * 1e3));
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (lo, md, hi) = (ts[0], ts[n / 2], ts[n - 1]);
+        println!(
+            "  probe-r14 {key}: N={} K={} rows={rows}  {nd} dispatches, {:.1} MiB packed W\n\
+             \x20   device  min={:.2} med={:.2} max={:.2} ms   ({:.2} ms/dispatch med, {:.2} GB/s W)\n\
+             \x20   +host   min={:.2} med={:.2} max={:.2} ms   (n={n})",
+            gm.m,
+            gm.k,
+            (nd as usize * wb) as f64 / 1048576.0,
+            lo.0,
+            md.0,
+            hi.0,
+            md.0 / nd as f64,
+            (nd as usize * wb) as f64 / 1e6 / md.0,
+            lo.1,
+            md.1,
+            hi.1
+        );
+        return;
+    }
+
+    // Steady-state cost of the whole-layer attention dispatch (small buffers,
+    // so this isolates compute from the GEMMs' weight streaming).
+    if arg("--probe-attn").is_some() {
+        let n: usize = arg("--probe-iters").and_then(|v| v.parse().ok()).unwrap_or(50);
+        let idx = cache.get(&attn_name);
+        let k = cache.at(idx);
+        k.dispatch(&[&attn_q, &attn_kv, &attn_o]).expect("warm");
+        let t0 = Instant::now();
+        for _ in 0..n {
+            k.dispatch(&[&attn_q, &attn_kv, &attn_o]).expect("probe");
+        }
+        println!(
+            "  probe {attn_name}: Q/KV/O = {:.0}/{:.0}/{:.0} KB  \
+             steady-state dispatch = {:.0} us  (n={n}, no ctx churn)",
+            (nkv * q_len * hd * 2) as f64 / 1e3,
+            (nkv * 2 * tot * hd * 2) as f64 / 1e3,
+            (nkv * q_len * hd * 2) as f64 / 1e3,
+            t0.elapsed().as_secs_f64() * 1e6 / n as f64
+        );
+        return;
+    }
+
+    // ── the block body ──────────────────────────────────────────────────────
+    let mut npu_ns_total: u64 = 0;
+    let mut cpu_prim_ns: u64 = 0; // host time in CPU primitives (--cpu-primitives)
+    let mut dispatches: u64 = 0;
+    // Per-op accounting: which kernels the dispatch time actually goes to, and
+    // how much of it lands on a freshly-(re)loaded context.
+    let mut per_op: HashMap<String, (u64, u64, u64)> = HashMap::new(); // n, ns, ns_after_miss
+    // Isolated CPU-vs-NPU primitive parity: name -> (min cos, max |Δ|, samples).
+    let mut parity_map: HashMap<String, (f64, f64, u64)> = HashMap::new();
+    let mut block_out = vec![0f32; b_rows * h];
+
+    // ── host-side context cache (--ctx-cache) ───────────────────────────────
+    // c_k[li] / c_v[li] hold layer li's post-headnorm/post-rope context K and
+    // raw context V for rows 0..l_ctx. Populated on block 0, checked on block 1,
+    // reused on blocks >=2. block_out_ref snapshots the non-cached result so the
+    // end-to-end cached-vs-recomputed gate can compare directly.
+    let mut c_k: Vec<Vec<f32>> = vec![Vec::new(); nl];
+    let mut c_v: Vec<Vec<f32>> = vec![Vec::new(); nl];
+    let mut block_out_ref: Vec<f32> = Vec::new();
+    let mut cache_k_maxdiff = 0f64;
+    let mut cache_v_maxdiff = 0f64;
+    let mut walls_cached: Vec<f64> = Vec::new();
+
+    // One GEMM: quantize rows, dispatch, rescale into `out` [rows, M].
+    macro_rules! gemm {
+        ($cache:expr, $gm:expr, $mx:expr, $x:expr, $rows:expr, $out:expr) => {{
+            let gm: &Gemm = $gm;
+            let rows: usize = $rows;
+            if let Some(mx) = $mx.as_ref() {
+                let g = r14.as_mut().expect("r14 kernel");
+                let (dt, nd) = if pipeline_glue {
+                    run_r14_pipelined(g, mx, $x, $out, &mut qbuf, &mut sxbuf, pipeline_check_active.get())
+                } else {
+                    run_r14(g, mx, $x, $out, &mut qbuf, &mut sxbuf)
+                };
+                npu_ns_total += dt;
+                dispatches += nd;
+                let name = format!("r14:N{}_K{}_rows{}", gm.m, gm.k, rows);
+                let e = per_op.entry(name).or_insert((0, 0, 0));
+                e.0 += nd;
+                e.1 += dt;
+            } else {
+            quantize_row($x, rows, gm.k, &mut qbuf, &mut sxbuf);
+            gemm_b.as_mut_slice()[..rows * gm.k].copy_from_slice(unsafe {
+                std::slice::from_raw_parts(qbuf.as_ptr() as *const u8, rows * gm.k)
+            });
+            let name = gemm_kernel(gm.m, gm.k, rows);
+            let miss0 = $cache.misses;
+            let idx = $cache.get(&name);
+            let was_miss = $cache.misses > miss0;
+            let k = $cache.at(idx);
+            let t = Instant::now();
+            // The weight was flushed once at upload; only the activation needs
+            // a host->device sync, and the output is written by the NPU.
+            k.dispatch_synced(&[&gm.w, &gemm_b, &gemm_c], &[false, true, false])
+                .expect("gemm dispatch");
+            let dt = t.elapsed().as_nanos() as u64;
+            npu_ns_total += dt;
+            dispatches += 1;
+            let e = per_op.entry(name.clone()).or_insert((0, 0, 0));
+            e.0 += 1;
+            e.1 += dt;
+            if was_miss {
+                e.2 += dt;
+            }
+            k.sync_output(&gemm_c).expect("sync C");
+            let c32 = unsafe {
+                std::slice::from_raw_parts(gemm_c.as_slice().as_ptr() as *const i32, gm.m * rows)
+            };
+            // Y[r, n] = sw[n] * sx[r] * C[n, r]   (C is [M, rows])
+            let out: &mut [f32] = $out;
+            for n in 0..gm.m {
+                let sw = gm.scale[n];
+                for r in 0..rows {
+                    out[r * gm.m + n] = sw * sxbuf[r] * c32[n * rows + r] as f32;
+                }
+            }
+            }
+        }};
+    }
+
+    // rmsnorm: gamma is a TILED input, so replicate it per row.
+    macro_rules! rmsnorm {
+        ($cache:expr, $name:expr, $x:expr, $gamma:expr, $rows:expr, $out:expr) => {{
+            let rows: usize = $rows;
+            let gamma: &[f32] = $gamma;
+            if cpu_prim {
+                let t = Instant::now();
+                cpu_rmsnorm(&$x[..rows * h], gamma, rows, h, kernel_eps, &mut $out[..rows * h]);
+                cpu_prim_ns += t.elapsed().as_nanos() as u64;
+            } else {
+            write_bf16(&mut norm_in, &$x[..rows * h]);
+            {
+                let dst = norm_w.as_mut_slice();
+                for r in 0..rows {
+                    for (i, &gv) in gamma.iter().enumerate() {
+                        let o = (r * h + i) * 2;
+                        dst[o..o + 2].copy_from_slice(&f32_to_bf16(gv).to_le_bytes());
+                    }
+                }
+            }
+            let miss0 = $cache.misses;
+            let idx = $cache.get($name);
+            let was_miss = $cache.misses > miss0;
+            let k = $cache.at(idx);
+            let t = Instant::now();
+            k.dispatch(&[&norm_in, &norm_w, &norm_out]).expect("rmsnorm");
+            let dt = t.elapsed().as_nanos() as u64;
+            npu_ns_total += dt;
+            dispatches += 1;
+            let e = per_op.entry($name.to_string()).or_insert((0, 0, 0));
+            e.0 += 1;
+            e.1 += dt;
+            if was_miss {
+                e.2 += dt;
+            }
+            k.sync_output(&norm_out).expect("sync norm");
+            read_bf16(&norm_out, &mut $out[..rows * h]);
+            if parity {
+                let (inp, gam) = if parity_bf16 {
+                    (bfr(&$x[..rows * h]), bfr(gamma))
+                } else {
+                    ($x[..rows * h].to_vec(), gamma.to_vec())
+                };
+                let mut cpu_o = vec![0f32; rows * h];
+                cpu_rmsnorm(&inp, &gam, rows, h, kernel_eps, &mut cpu_o);
+                if parity_bf16 {
+                    cpu_o = bfr(&cpu_o);
+                }
+                record_parity(&mut parity_map, $name, &$out[..rows * h], &cpu_o);
+            }
+            }
+        }};
+    }
+
+    // headnorm: arg order is in, out, weight (differs from rmsnorm!).
+    macro_rules! headnorm {
+        ($cache:expr, $name:expr, $x:expr, $gamma:expr, $rows:expr, $heads:expr, $out:expr) => {{
+            let rows: usize = $rows;
+            let heads: usize = $heads;
+            let n = rows * heads * hd;
+            if cpu_prim {
+                let t = Instant::now();
+                cpu_headnorm(&$x[..n], $gamma, rows, heads, hd, kernel_eps, &mut $out[..n]);
+                cpu_prim_ns += t.elapsed().as_nanos() as u64;
+            } else {
+            write_bf16(&mut hn_in, &$x[..n]);
+            write_bf16(&mut hn_w, $gamma);
+            let miss0 = $cache.misses;
+            let idx = $cache.get($name);
+            let was_miss = $cache.misses > miss0;
+            let k = $cache.at(idx);
+            let t = Instant::now();
+            k.dispatch(&[&hn_in, &hn_out, &hn_w]).expect("headnorm");
+            let dt = t.elapsed().as_nanos() as u64;
+            npu_ns_total += dt;
+            dispatches += 1;
+            let e = per_op.entry($name.to_string()).or_insert((0, 0, 0));
+            e.0 += 1;
+            e.1 += dt;
+            if was_miss {
+                e.2 += dt;
+            }
+            k.sync_output(&hn_out).expect("sync hn");
+            read_bf16(&hn_out, &mut $out[..n]);
+            if parity {
+                let (inp, gam) = if parity_bf16 {
+                    (bfr(&$x[..n]), bfr($gamma))
+                } else {
+                    ($x[..n].to_vec(), $gamma.to_vec())
+                };
+                let mut cpu_o = vec![0f32; n];
+                cpu_headnorm(&inp, &gam, rows, heads, hd, kernel_eps, &mut cpu_o);
+                if parity_bf16 {
+                    cpu_o = bfr(&cpu_o);
+                }
+                record_parity(&mut parity_map, $name, &$out[..n], &cpu_o);
+            }
+            }
+        }};
+    }
+
+    // rope: cs is a tiled second input — each head-tile gets its row's table.
+    macro_rules! rope {
+        ($cache:expr, $name:expr, $x:expr, $rows:expr, $heads:expr, $pos0:expr, $out:expr) => {{
+            let rows: usize = $rows;
+            let heads: usize = $heads;
+            let n = rows * heads * hd;
+            if cpu_prim {
+                let t = Instant::now();
+                cpu_rope(&$x[..n], rows, heads, hd, $pos0, theta, &mut $out[..n]);
+                cpu_prim_ns += t.elapsed().as_nanos() as u64;
+            } else {
+            write_bf16(&mut rope_in, &$x[..n]);
+            {
+                let dst = rope_cs.as_mut_slice();
+                for r in 0..rows {
+                    cs_buf(hd, ($pos0 + r) as f64, theta, &mut csrow);
+                    for hh in 0..heads {
+                        for (i, &cv) in csrow.iter().enumerate() {
+                            let o = ((r * heads + hh) * hd + i) * 2;
+                            dst[o..o + 2].copy_from_slice(&f32_to_bf16(cv).to_le_bytes());
+                        }
+                    }
+                }
+            }
+            let miss0 = $cache.misses;
+            let idx = $cache.get($name);
+            let was_miss = $cache.misses > miss0;
+            let k = $cache.at(idx);
+            let t = Instant::now();
+            k.dispatch(&[&rope_in, &rope_cs, &rope_out]).expect("rope");
+            let dt = t.elapsed().as_nanos() as u64;
+            npu_ns_total += dt;
+            dispatches += 1;
+            let e = per_op.entry($name.to_string()).or_insert((0, 0, 0));
+            e.0 += 1;
+            e.1 += dt;
+            if was_miss {
+                e.2 += dt;
+            }
+            k.sync_output(&rope_out).expect("sync rope");
+            read_bf16(&rope_out, &mut $out[..n]);
+            if parity {
+                let inp = if parity_bf16 { bfr(&$x[..n]) } else { $x[..n].to_vec() };
+                let mut cpu_o = vec![0f32; n];
+                cpu_rope(&inp, rows, heads, hd, $pos0, theta, &mut cpu_o);
+                if parity_bf16 {
+                    cpu_o = bfr(&cpu_o);
+                }
+                record_parity(&mut parity_map, $name, &$out[..n], &cpu_o);
+            }
+            }
+        }};
+    }
+
+    let mut wall_cold = 0f64;
+    let mut walls = Vec::new();
+
+    for blk in 0..blocks {
+        let t_block = Instant::now();
+        // Block 0 is cold: the first r14 dispatch pays residency mapping and its
+        // C read-back can be stale (it is discarded from every warm stat, and
+        // each block recomputes from target_hidden so it never propagates). The
+        // bit-identity check compares serial vs pipelined per GEMM, so restrict
+        // it to warm blocks where both sides see an established context.
+        pipeline_check_active.set(pipeline_check && blk >= 1);
+        let (d0, m0) = (dispatches, cache.misses);
+        let n0 = npu_ns_total;
+
+        // ── one-time context projection: thp = hidden_norm(fc(target_hidden))
+        // compute_ctx is true when the cache is off, or on the block-0 populate
+        // and the block-1 verify. Warm-cached cycles (blk>=2) skip fc + rms-b{L}
+        // and the per-layer kv GEMMs entirely, reusing c_k/c_v.
+        let compute_ctx = !ctx_cache || blk <= 1;
+        let mut thp = vec![0f32; l_ctx * h];
+        if compute_ctx {
+            let mut thp_raw = vec![0f32; l_ctx * h];
+            gemm!(cache, &w_fc, mc_fc, &target_hidden, l_ctx, &mut thp_raw);
+            rmsnorm!(cache, &rms32, thp_raw, &g_hidden, l_ctx, thp);
+        }
+
+        let mut hidden = noise[..b_rows * h].to_vec();
+        let mut x_norm = vec![0f32; b_rows * h];
+        let mut qkv = vec![0f32; b_rows * (nh * hd + 2 * nkv * hd)];
+        let mut kv_ctx = vec![0f32; l_ctx * 2 * nkv * hd];
+        let mut q = vec![0f32; b_rows * nh * hd];
+        let mut k_all = vec![0f32; tot * nkv * hd];
+        let mut v_all = vec![0f32; tot * nkv * hd];
+        let mut q_tmp = vec![0f32; b_rows * nh * hd];
+        let mut k_tmp = vec![0f32; tot * nkv * hd];
+        let mut ctx = vec![0f32; b_rows * nh * hd];
+        let mut attn_proj = vec![0f32; b_rows * h];
+        let mut gateup = vec![0f32; b_rows * 2 * i_dim];
+        let mut swig = vec![0f32; b_rows * i_dim];
+        let mut down = vec![0f32; b_rows * h];
+
+        for li in 0..nl {
+            let (gm_qkv, gm_kv, gm_o, gm_gu, gm_dn, g_in, g_post, g_qn, g_kn) = (
+                &layers[li].0,
+                &layers[li].1,
+                &layers[li].2,
+                &layers[li].3,
+                &layers[li].4,
+                &layers[li].5,
+                &layers[li].6,
+                &layers[li].7,
+                &layers[li].8,
+            );
+            let residual = hidden.clone();
+            let (nq, nk) = (gm_qkv.sizes[0], gm_qkv.sizes[1]);
+            let m_qkv = gm_qkv.m;
+            let nkd = nkv * hd;
+
+            // input_layernorm -> concat q/k/v projection (one GEMM)
+            rmsnorm!(cache, &rms16, hidden, g_in, b_rows, x_norm);
+            gemm!(cache, gm_qkv, mc_layers[li][0], &x_norm, b_rows, &mut qkv);
+
+            // Context k/v from thp (one GEMM), split into the [ctx rows] prefix.
+            // Warm-cached cycles skip this GEMM: V context comes straight from
+            // the cache, K context is installed after the rope below.
+            if compute_ctx {
+                gemm!(cache, gm_kv, mc_layers[li][1], &thp, l_ctx, &mut kv_ctx);
+                let m_kv = gm_kv.m;
+                for r in 0..l_ctx {
+                    k_all[r * nkd..(r + 1) * nkd]
+                        .copy_from_slice(&kv_ctx[r * m_kv..r * m_kv + nkd]);
+                    v_all[r * nkd..(r + 1) * nkd]
+                        .copy_from_slice(&kv_ctx[r * m_kv + nkd..r * m_kv + 2 * nkd]);
+                }
+            } else {
+                v_all[..l_ctx * nkd].copy_from_slice(&c_v[li]);
+            }
+
+            // q rows + the noise k/v rows are new every cycle (O(B), never cached)
+            for r in 0..b_rows {
+                q[r * nq..(r + 1) * nq].copy_from_slice(&qkv[r * m_qkv..r * m_qkv + nq]);
+            }
+            for r in 0..b_rows {
+                let d = (l_ctx + r) * nkd;
+                k_all[d..d + nkd].copy_from_slice(&qkv[r * m_qkv + nq..r * m_qkv + nq + nk]);
+                v_all[d..d + nkd]
+                    .copy_from_slice(&qkv[r * m_qkv + nq + nk..r * m_qkv + nq + 2 * nk]);
+            }
+
+            // headnorm + rope, q (always) and k.
+            headnorm!(cache, &hn_q, q, g_qn, b_rows, nh, q_tmp);
+            rope!(cache, &rope_q, q_tmp, b_rows, nh, l_ctx, q);
+            // The k-side norm/rope kernels are built only at b{tot}, so the
+            // warm-cached path still dispatches them over all `tot` rows; the
+            // context outputs are discarded and overwritten by the cache below,
+            // and only the noise rows [l_ctx..tot] are kept. A b{B}-shaped build
+            // would run these over the B noise rows alone — accounted for as the
+            // projected column in the report, not measured here.
+            headnorm!(cache, &hn_k, k_all, g_kn, tot, nkv, k_tmp);
+            rope!(cache, &rope_k, k_tmp, tot, nkv, 0, k_all);
+            if ctx_cache {
+                if blk == 0 {
+                    // populate: capture post-rope context K, raw context V
+                    c_k[li] = k_all[..l_ctx * nkd].to_vec();
+                    c_v[li] = v_all[..l_ctx * nkd].to_vec();
+                } else if blk == 1 {
+                    // verify: this block recomputed context fresh — compare it
+                    // directly against the cache captured on block 0.
+                    for i in 0..l_ctx * nkd {
+                        cache_k_maxdiff =
+                            cache_k_maxdiff.max((k_all[i] - c_k[li][i]).abs() as f64);
+                        cache_v_maxdiff =
+                            cache_v_maxdiff.max((v_all[i] - c_v[li][i]).abs() as f64);
+                    }
+                } else {
+                    // reuse: install cached post-rope context K (V already set)
+                    k_all[..l_ctx * nkd].copy_from_slice(&c_k[li]);
+                }
+            }
+
+            // attention: whole layer in ONE dispatch, kv-heads streamed.
+            // Pack Q per kv-head as the `groups` q-heads' rows stacked.
+            {
+                // aie::mmul<4,8,4> block shape, and the padding-row mask value.
+                // Mirrors build_dflash_attention_flash.py's MR/MS/MT/MASK_NEG.
+                const MR: usize = 4;
+                const MS: usize = 8;
+                const MT: usize = 4;
+                const MASK_NEG: f32 = -3.0e30;
+
+                if attn_flash {
+                    let hpi = fl_q_len / b_rows;
+                    // Q: per iteration an A-layout [fl_q_len, hd] of the
+                    // iteration's q-head rows stacked.
+                    let dst = attn_q.as_mut_slice();
+                    for it in 0..fl_n_iters {
+                        let qbase = it * fl_q_len * hd;
+                        for i in 0..hpi {
+                            let head = it * hpi + i;
+                            for r in 0..b_rows {
+                                let (qb, qi) = ((i * b_rows + r) / MR, (i * b_rows + r) % MR);
+                                for d in 0..hd {
+                                    let (db, si) = (d / MS, d % MS);
+                                    let o = (qbase
+                                        + ((qb * (hd / MS) + db) * MR + qi) * MS
+                                        + si)
+                                        * 2;
+                                    let src = q[r * nh * hd + head * hd + d];
+                                    dst[o..o + 2]
+                                        .copy_from_slice(&f32_to_bf16(src).to_le_bytes());
+                                }
+                            }
+                        }
+                    }
+                    // KV: per iteration, n_tiles of [ Kᵀ | V | mask ]. Each
+                    // q-head iteration carries its kv-head's whole KV, so a
+                    // kv-head's KV is packed `groups` times.
+                    let dst = attn_kv.as_mut_slice();
+                    let tile_elems = 2 * fl_kv_tile * hd + 2 * fl_kv_tile;
+                    let (kb_n, ob_n) = (fl_kv_tile / MT, hd / MT);
+                    for it in 0..fl_n_iters {
+                        let kvh = (it * hpi) / groups;
+                        for t in 0..fl_n_tiles {
+                            let base = (it * fl_n_tiles + t) * tile_elems;
+                            // Kᵀ : B-layout of [hd, kv_tile]
+                            for db in 0..(hd / MS) {
+                                for kb in 0..kb_n {
+                                    for si in 0..MS {
+                                        for ti in 0..MT {
+                                            let krow = t * fl_kv_tile + kb * MT + ti;
+                                            let val = if krow < tot {
+                                                k_all[krow * nkd + kvh * hd + db * MS + si]
+                                            } else {
+                                                0.0
+                                            };
+                                            let o = (base
+                                                + ((db * kb_n + kb) * MS + si) * MT
+                                                + ti)
+                                                * 2;
+                                            dst[o..o + 2].copy_from_slice(
+                                                &f32_to_bf16(val).to_le_bytes(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            // V : B-layout of [kv_tile, hd]
+                            let vbase = base + fl_kv_tile * hd;
+                            for vb in 0..(fl_kv_tile / MS) {
+                                for ob in 0..ob_n {
+                                    for si in 0..MS {
+                                        for ti in 0..MT {
+                                            let krow = t * fl_kv_tile + vb * MS + si;
+                                            let val = if krow < tot {
+                                                v_all[krow * nkd + kvh * hd + ob * MT + ti]
+                                            } else {
+                                                0.0
+                                            };
+                                            let o = (vbase
+                                                + ((vb * ob_n + ob) * MS + si) * MT
+                                                + ti)
+                                                * 2;
+                                            dst[o..o + 2].copy_from_slice(
+                                                &f32_to_bf16(val).to_le_bytes(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            // mask : f32 over the trailing 2*kv_tile bf16 slots.
+                            // MUST be additive-negative, not zeroed K/V — a
+                            // zeroed K row scores 0, and exp(0 - m) is an
+                            // ordinary softmax weight that would inflate the
+                            // running sum and scale the output down.
+                            let mbase = (base + 2 * fl_kv_tile * hd) * 2;
+                            for j in 0..fl_kv_tile {
+                                let m = if t * fl_kv_tile + j < tot { 0.0f32 } else { MASK_NEG };
+                                dst[mbase + j * 4..mbase + j * 4 + 4]
+                                    .copy_from_slice(&m.to_le_bytes());
+                            }
+                        }
+                    }
+                } else {
+                    let dst = attn_q.as_mut_slice();
+                    for kvh in 0..nkv {
+                        for i in 0..groups {
+                            let head = kvh * groups + i;
+                            for r in 0..b_rows {
+                                for d in 0..hd {
+                                    let src = q[r * nh * hd + head * hd + d];
+                                    let o = ((kvh * q_len + i * b_rows + r) * hd + d) * 2;
+                                    dst[o..o + 2]
+                                        .copy_from_slice(&f32_to_bf16(src).to_le_bytes());
+                                }
+                            }
+                        }
+                    }
+                    let dst = attn_kv.as_mut_slice();
+                    for kvh in 0..nkv {
+                        let base = kvh * 2 * tot * hd;
+                        for t in 0..tot {
+                            for d in 0..hd {
+                                let o = (base + t * hd + d) * 2;
+                                dst[o..o + 2].copy_from_slice(
+                                    &f32_to_bf16(k_all[t * nkd + kvh * hd + d]).to_le_bytes(),
+                                );
+                                let o2 = (base + tot * hd + t * hd + d) * 2;
+                                dst[o2..o2 + 2].copy_from_slice(
+                                    &f32_to_bf16(v_all[t * nkd + kvh * hd + d]).to_le_bytes(),
+                                );
+                            }
+                        }
+                    }
+                }
+                let miss0 = cache.misses;
+                let idx = cache.get(&attn_name);
+                let was_miss = cache.misses > miss0;
+                let kern = cache.at(idx);
+                let t = Instant::now();
+                kern.dispatch(&[&attn_q, &attn_kv, &attn_o]).expect("attn");
+                let dt = t.elapsed().as_nanos() as u64;
+                npu_ns_total += dt;
+                dispatches += 1;
+                let e = per_op.entry(attn_name.clone()).or_insert((0, 0, 0));
+                e.0 += 1;
+                e.1 += dt;
+                if was_miss {
+                    e.2 += dt;
+                }
+                kern.sync_output(&attn_o).expect("sync attn");
+                let src = attn_o.as_slice();
+                if attn_flash {
+                    // O is C-layout: (fl_q_len/MR) x (hd/MT) tiles of MR x MT.
+                    let hpi = fl_q_len / b_rows;
+                    for it in 0..fl_n_iters {
+                        let obase = it * fl_q_len * hd;
+                        for i in 0..hpi {
+                            let head = it * hpi + i;
+                            for r in 0..b_rows {
+                                let (qb, qi) = ((i * b_rows + r) / MR, (i * b_rows + r) % MR);
+                                for d in 0..hd {
+                                    let (ob, ti) = (d / MT, d % MT);
+                                    let o = (obase
+                                        + ((qb * (hd / MT) + ob) * MR + qi) * MT
+                                        + ti)
+                                        * 2;
+                                    ctx[r * nh * hd + head * hd + d] =
+                                        bf16_to_f32(u16::from_le_bytes([src[o], src[o + 1]]));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for kvh in 0..nkv {
+                        for i in 0..groups {
+                            let head = kvh * groups + i;
+                            for r in 0..b_rows {
+                                for d in 0..hd {
+                                    let o = ((kvh * q_len + i * b_rows + r) * hd + d) * 2;
+                                    ctx[r * nh * hd + head * hd + d] =
+                                        bf16_to_f32(u16::from_le_bytes([src[o], src[o + 1]]));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            gemm!(cache, gm_o, mc_layers[li][2], &ctx, b_rows, &mut attn_proj);
+            for i in 0..b_rows * h {
+                hidden[i] = residual[i] + attn_proj[i];
+            }
+
+            let residual2 = hidden.clone();
+            rmsnorm!(cache, &rms16, hidden, g_post, b_rows, x_norm);
+            gemm!(cache, gm_gu, mc_layers[li][3], &x_norm, b_rows, &mut gateup);
+            // swiglu over the [gate | up] halves of the concat GEMM output
+            if cpu_prim {
+                let t = Instant::now();
+                cpu_swiglu(&gateup, gm_gu.m, i_dim, b_rows, &mut swig[..b_rows * i_dim]);
+                cpu_prim_ns += t.elapsed().as_nanos() as u64;
+            } else {
+                let m_gu = gm_gu.m;
+                let dg = sw_gate.as_mut_slice();
+                for r in 0..b_rows {
+                    for i in 0..i_dim {
+                        let o = (r * i_dim + i) * 2;
+                        dg[o..o + 2]
+                            .copy_from_slice(&f32_to_bf16(gateup[r * m_gu + i]).to_le_bytes());
+                    }
+                }
+                let du = sw_up.as_mut_slice();
+                for r in 0..b_rows {
+                    for i in 0..i_dim {
+                        let o = (r * i_dim + i) * 2;
+                        du[o..o + 2].copy_from_slice(
+                            &f32_to_bf16(gateup[r * m_gu + i_dim + i]).to_le_bytes(),
+                        );
+                    }
+                }
+                let miss0 = cache.misses;
+                let idx = cache.get(&swiglu);
+                let was_miss = cache.misses > miss0;
+                let kern = cache.at(idx);
+                let t = Instant::now();
+                kern.dispatch(&[&sw_gate, &sw_up, &sw_out]).expect("swiglu");
+                let dt = t.elapsed().as_nanos() as u64;
+                npu_ns_total += dt;
+                dispatches += 1;
+                let e = per_op.entry(swiglu.clone()).or_insert((0, 0, 0));
+                e.0 += 1;
+                e.1 += dt;
+                if was_miss {
+                    e.2 += dt;
+                }
+                kern.sync_output(&sw_out).expect("sync swiglu");
+                read_bf16(&sw_out, &mut swig[..b_rows * i_dim]);
+                if parity {
+                    let gu = if parity_bf16 { bfr(&gateup) } else { gateup.clone() };
+                    let mut cpu_o = vec![0f32; b_rows * i_dim];
+                    cpu_swiglu(&gu, gm_gu.m, i_dim, b_rows, &mut cpu_o);
+                    if parity_bf16 {
+                        cpu_o = bfr(&cpu_o);
+                    }
+                    record_parity(&mut parity_map, &swiglu, &swig[..b_rows * i_dim], &cpu_o);
+                }
+            }
+            gemm!(cache, gm_dn, mc_layers[li][4], &swig, b_rows, &mut down);
+            for i in 0..b_rows * h {
+                hidden[i] = residual2[i] + down[i];
+            }
+        }
+
+        rmsnorm!(cache, &rms16, hidden, &g_final, b_rows, block_out);
+
+        let wall = t_block.elapsed().as_secs_f64();
+        let (nd, nm) = (dispatches - d0, cache.misses - m0);
+        let npu_ms = (npu_ns_total - n0) as f64 / 1e6;
+        println!(
+            "  block {blk}: wall={:.1} ms  dispatches={nd}  npu_busy={npu_ms:.1} ms  ctx_misses={nm}",
+            wall * 1e3
+        );
+        // Host-glue attribution for the r14 GEMM path (serial run only; the
+        // pipelined path interleaves these so the split is not meaningful there).
+        let (gq, gp, gr) = glue_take_ms();
+        if std::env::var("HIPFIRE_PIPE_TRACE").is_ok() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let psub = PIPE_SUBMIT.swap(0, Relaxed) as f64 / 1e6;
+            let pwait = PIPE_WAIT.swap(0, Relaxed) as f64 / 1e6;
+            println!(
+                "    glue: quant(on-chain)={gq:.1} ms  pack={gp:.1} ms  rescale={gr:.1} ms  (pack+rescale overlappable={:.1})",
+                gp + gr
+            );
+            if pipeline_glue {
+                println!("    pipe: submit(serial)={psub:.1} ms  wait(blocked)={pwait:.1} ms");
+            }
+        }
+        // Block 0 is cold (first touch of every weight BO + every hwctx). Drop
+        // its samples so the per-op table reports the WARM steady state. With the
+        // cache on, block 1 is the verify block (recomputes context AND checks
+        // it against the cache), so the warm-cached steady state is blk>=2 — drop
+        // per-op through block 1 so the table shows only the cached cycle.
+        if blk == 0 {
+            block_out_ref = block_out.clone();
+        }
+        let warm_start = if ctx_cache { 2 } else { 1 };
+        if blk + 1 == warm_start {
+            per_op.clear();
+        }
+        if blk == 0 {
+            wall_cold = wall;
+        }
+        if blk >= 1 {
+            walls.push(wall);
+        }
+        if ctx_cache && blk >= warm_start {
+            walls_cached.push(wall);
+        }
+    }
+
+    // ── validation ──────────────────────────────────────────────────────────
+    let cos_golden = cosine(&block_out, &golden);
+    println!("\n  final block_hidden:");
+    println!("    cos vs golden        = {cos_golden:.6}");
+    let cos_ref = precision_ref.as_ref().map(|r| cosine(&block_out, r));
+    if let Some(cr) = cos_ref {
+        println!("    cos vs int8/bf16 ref = {cr:.6}");
+    }
+    // Same-run CPU-vs-NPU primitive parity: dump this run's block_hidden and/or
+    // compare it against a previously dumped one (GEMM path held fixed, only
+    // --cpu-primitives toggled, so the cos isolates the primitives).
+    if let Some(p) = dump_out.as_ref() {
+        let mut bytes = Vec::with_capacity(block_out.len() * 4);
+        for &v in &block_out {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(p, &bytes).expect("dump-out");
+        println!("    [dump-out] {} f32 -> {p}", block_out.len());
+    }
+    if let Some(p) = cmp_path.as_ref() {
+        let raw = std::fs::read(p).expect("cmp file");
+        let other: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let c = cosine(&block_out, &other);
+        let maxd = block_out
+            .iter()
+            .zip(&other)
+            .fold(0f64, |a, (&x, &y)| a.max((x - y).abs() as f64));
+        println!(
+            "    [cmp vs {p}] primitive parity cos = {c:.9}  max|Δ| = {maxd:.3e}  (gate > 0.999999)"
+        );
+    }
+
+    let warm = walls.iter().cloned().fold(f64::INFINITY, f64::min);
+    let per_block_dispatches = dispatches as f64 / blocks as f64;
+    if cpu_prim {
+        println!(
+            "\n  CPU primitives (host, single-core) = {:.2} ms/block  ({:.2} ms total over {blocks} blocks)",
+            cpu_prim_ns as f64 / 1e6 / blocks as f64,
+            cpu_prim_ns as f64 / 1e6
+        );
+    }
+    println!("\n  wall (cold) = {:.1} ms", wall_cold * 1e3);
+    if warm.is_finite() {
+        println!(
+            "  wall (warm) = {:.1} ms   [budget: <57 ms/block]",
+            warm * 1e3
+        );
+        println!(
+            "    dispatches/block = {per_block_dispatches:.0}   per-dispatch mean = {:.0} us",
+            warm * 1e6 / per_block_dispatches
+        );
+    }
+
+    // Block-wall latency percentiles over the warm sustained-load samples (the
+    // cached steady state when --ctx-cache is on, else all warm blocks). Decides
+    // whether a tail-latency problem exists that CPU isolation could fix; the
+    // glue-threading A/B is read straight off p50 vs the serial baseline.
+    {
+        let mut samples: Vec<f64> = if ctx_cache && !walls_cached.is_empty() {
+            walls_cached.clone()
+        } else {
+            walls.clone()
+        };
+        if samples.len() >= 3 {
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pct = |q: f64| -> f64 {
+                // nearest-rank on the sorted warm samples
+                let idx = ((q * (samples.len() as f64 - 1.0)).round() as usize).min(samples.len() - 1);
+                samples[idx] * 1e3
+            };
+            let mean = samples.iter().sum::<f64>() / samples.len() as f64 * 1e3;
+            println!(
+                "    [latency] n={} threaded_glue={} threaded_pack={} threaded_quant={}  \
+                 p50={:.1} p90={:.1} p99={:.1} max={:.1} mean={:.1} ms  (spread {:.1}%)",
+                samples.len(),
+                thread_glue,
+                thread_pack,
+                thread_quant,
+                pct(0.50),
+                pct(0.90),
+                pct(0.99),
+                samples.last().unwrap() * 1e3,
+                mean,
+                (samples.last().unwrap() - samples[0]) / samples[0] * 100.0,
+            );
+        }
+    }
+
+    // ── context-cache correctness + cached-vs-recomputed wall ────────────────
+    if ctx_cache {
+        let cos_ref = cosine(&block_out, &block_out_ref);
+        let warm_cached = walls_cached.iter().cloned().fold(f64::INFINITY, f64::min);
+        // block 1 is the non-cached warm reference measured in this same run.
+        let warm_noncached = walls.first().copied().unwrap_or(f64::NAN);
+        println!("\n  === CONTEXT CACHE ({} layers, l_ctx={l_ctx}) ===", nl);
+        println!(
+            "    cache-vs-recompute (block1 direct): max|Δ| K = {:.3e}  V = {:.3e}  {}",
+            cache_k_maxdiff,
+            cache_v_maxdiff,
+            if cache_k_maxdiff == 0.0 && cache_v_maxdiff == 0.0 {
+                "BIT-IDENTICAL"
+            } else {
+                "NON-ZERO — investigate"
+            }
+        );
+        println!(
+            "    final block_hidden cached-vs-recomputed cos = {cos_ref:.9}  (gate > 0.999999)"
+        );
+        if warm_cached.is_finite() {
+            println!(
+                "    warm wall: non-cached (blk1) = {:.1} ms   cached (blk>=2) = {:.1} ms   \
+                 delta = {:.1} ms ({:.1}x)",
+                warm_noncached * 1e3,
+                warm_cached * 1e3,
+                (warm_noncached - warm_cached) * 1e3,
+                warm_noncached / warm_cached
+            );
+        }
+    }
+    println!(
+        "    ctx misses = {} total, {:.1} ms in load_peer",
+        cache.misses,
+        cache.miss_ns as f64 / 1e6
+    );
+
+    let warm_n = blocks.saturating_sub(1).max(1);
+    println!("\n  per-op dispatch time (WARM blocks only, n={warm_n}):");
+    let mut ops: Vec<_> = per_op.iter().collect();
+    ops.sort_by_key(|(_, v)| std::cmp::Reverse(v.1));
+    for (name, (n, ns, ns_miss)) in ops {
+        println!(
+            "    {:44} n={n:3}  mean={:8.2} ms  (post-ctx-miss share {:.0}%)",
+            name,
+            *ns as f64 / 1e6 / *n as f64,
+            if *ns > 0 { *ns_miss as f64 / *ns as f64 * 100.0 } else { 0.0 }
+        );
+    }
+
+    if !parity_map.is_empty() {
+        println!("\n  isolated CPU-vs-NPU primitive parity (same input, per op):");
+        let mut pv: Vec<_> = parity_map.iter().collect();
+        pv.sort_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap());
+        let mut worst = 1.0f64;
+        for (name, (mincos, maxd, n)) in &pv {
+            worst = worst.min(*mincos);
+            println!(
+                "    {:44} n={n:3}  min cos={:.9}  max|Δ|={:.3e}",
+                name, mincos, maxd
+            );
+        }
+        println!(
+            "    -> worst primitive cos = {worst:.9}  {} (gate > 0.999999)",
+            if worst > 0.999999 { "PARITY MET" } else { "PARITY NOT MET" }
+        );
+    }
+
+    let gate = cos_golden > 0.99 && cos_ref.map(|c| c > 0.99).unwrap_or(true);
+    println!(
+        "\n=== NATIVE BODY: {} (need cos_golden>0.99 AND cos_ref>0.99) ===",
+        if gate { "PARITY MET" } else { "PARITY NOT MET" }
+    );
+    if !gate {
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("Linux-only");
+}

@@ -151,19 +151,60 @@ pub fn profile_chat_template(
     (chat_template, profile)
 }
 
-/// Parse the DeltaNet state-quant mode from a load-message param string
-/// (e.g. `q8`/`fp16`), falling back to the arch default when absent/unknown.
+/// Parse the DeltaNet state-quant mode from a load-message param string.
+///
+/// Absent or `auto` resolves through the redundancy gate
+/// (`qwen35::default_state_quant`), which yields **FP32** for all current models.
+///
+/// **Q8 is DEPRECATED (2026-07-19)** — see the policy note on
+/// `qwen35::deltanet_state_fp32_below`. It remains parseable because the tree
+/// DeltaNet replay path (`gated_delta_net_q8_tree_batch_seq`) is Q8-only, but an
+/// explicit request now warns.
+///
+/// This previously mapped absent/`""`/`auto` straight to Q8 — bypassing the gate
+/// entirely — while its own doc comment claimed it fell "back to the arch
+/// default". It did not, and that is why production ran Q8 state despite the gate
+/// being configured (`fp32_below = usize::MAX`) to select FP32 everywhere.
 pub fn parse_state_quant(
     mode: Option<&str>,
+    config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
 ) -> Result<hipfire_arch_qwen35::qwen35::StateQuant, String> {
-    use hipfire_arch_qwen35::qwen35::StateQuant;
-    match mode.unwrap_or("q8").to_ascii_lowercase().as_str() {
-        "" | "auto" | "q8" | "int8" => Ok(StateQuant::Q8),
+    use hipfire_arch_qwen35::qwen35::{default_state_quant, StateQuant};
+    match mode.unwrap_or("auto").to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(default_state_quant(config)),
+        "q8" | "int8" => {
+            warn_deprecated_state_quant("q8");
+            Ok(StateQuant::Q8)
+        }
         "fp32" | "f32" => Ok(StateQuant::FP32),
-        "q4" | "int4" => Ok(StateQuant::Q4),
+        "q4" | "int4" => {
+            warn_deprecated_state_quant("q4");
+            Ok(StateQuant::Q4)
+        }
         other => Err(format!(
-            "unsupported DeltaNet state_quant '{other}' (expected q8|fp32|q4)"
+            "unsupported DeltaNet state_quant '{other}' (expected auto|fp32|q8|q4)"
         )),
+    }
+}
+
+/// One-shot warning for a deprecated quantized DeltaNet state request.
+///
+/// Quantized recurrent state is disallowed by policy: its error compounds across
+/// the sequence, and every DeltaNet-state defect this repo has hit has been
+/// specific to it — long-decode attractors on low-redundancy models, a
+/// stochastic-rounding seed that leaked execution history into target numerics,
+/// and a Q8-only error-feedback buffer that `DeltaNetSnapshot` never restores
+/// (breaking spec-decode losslessness). FP32 has none of them.
+fn warn_deprecated_state_quant(which: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "warning: DeltaNet state_quant '{which}' is DEPRECATED — quantized \
+             recurrent state is disallowed by policy (see qwen35::\
+             deltanet_state_fp32_below). Use 'auto' (=FP32) unless you are \
+             running the Q8-only DDTree tree-replay path."
+        );
     }
 }
 
@@ -2209,7 +2250,7 @@ pub fn load_model(
         let dn_quant = if is_bf16_artifact {
             hipfire_arch_qwen35::qwen35::StateQuant::FP32
         } else {
-            let parsed = parse_state_quant(state_quant_override)?;
+            let parsed = parse_state_quant(state_quant_override, &config)?;
             resolve_tiny_model_state(&hfq, state_quant_override, parsed)
         };
         eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
@@ -3088,6 +3129,9 @@ pub fn load_model_safetensors(
     .map_err(|e| format!("KvCache: {e}"))?;
     let dn_state =
         DeltaNetState::new(gpu, &config).map_err(|e| format!("DeltaNetState::new: {e:?}"))?;
+    // Captured before `dn_state` is moved, so the reported metadata matches the
+    // quant actually allocated.
+    let dn_quant_actual = dn_state.quant;
     let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 256)
         .map_err(|e| format!("Qwen35Scratch::new: {e:?}"))?;
     let (chat_template, chat_template_profile) =
@@ -3114,7 +3158,11 @@ pub fn load_model_safetensors(
         dots_ocr_config: None,
         dots_ocr_weights: None,
         q35_kv_mode: Some(kv_mode.to_string()),
-        q35_state_quant: Some(hipfire_arch_qwen35::qwen35::StateQuant::Q8),
+        // Report the quant the state was ACTUALLY built with. This was
+        // hardcoded to Q8 while `DeltaNetState::new` above resolves through the
+        // redundancy gate (FP32 for all current models), so the recorded label
+        // contradicted the allocation.
+        q35_state_quant: Some(dn_quant_actual),
         q35_registry: SessionRegistry {
             sessions: std::collections::HashMap::new(),
             active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
@@ -3368,7 +3416,7 @@ pub fn load_model_pp(
     let dn_quant = if is_bf16_artifact {
         hipfire_arch_qwen35::qwen35::StateQuant::FP32
     } else {
-        let parsed = parse_state_quant(state_quant_override)?;
+        let parsed = parse_state_quant(state_quant_override, &config)?;
         resolve_tiny_model_state(&hfq, state_quant_override, parsed)
     };
     eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));

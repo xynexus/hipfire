@@ -273,6 +273,7 @@ impl Gpu {
         n_heads: usize,
         head_dim: usize,
         n_sessions: usize,
+        seq_pos: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         Self::ensure_gdn_hd128(head_dim)?;
@@ -295,7 +296,7 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
-        let fr = super::GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
+        let fr = super::gdn_requant_seed(seq_pos, delta_layer_index as u32);
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -320,7 +321,12 @@ impl Gpu {
         result
     }
     /// GDN recurrence with Q8-quantized S state — tiled LDS + warp-shuffle.
+    ///
+    /// `seq_pos` is the absolute sequence position of the first token in this
+    /// block and `delta_layer` the DeltaNet layer index; together they seed the
+    /// stochastic-rounding RNG deterministically. See [`super::gdn_requant_seed`].
     #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
     pub fn gated_delta_net_q8(
         &mut self,
         q: &GpuTensor,
@@ -334,12 +340,15 @@ impl Gpu {
         n_tokens: usize,
         n_heads: usize,
         head_dim: usize,
+        seq_pos: u32,
+        delta_layer: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         Self::ensure_gdn_hd128(head_dim)?;
         if self.gdn_q8_reg_gfx1151_enabled() {
             return self.gated_delta_net_q8_reg_gfx1151(
-                q, k, v, gate, beta, s_q8, s_scales, output, n_tokens, n_heads, head_dim,
+                q, k, v, gate, beta, s_q8, s_scales, output, n_tokens, n_heads, head_dim, seq_pos,
+                delta_layer,
             );
         }
         self.ensure_kernel(
@@ -358,7 +367,7 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
-        let fr = super::GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
+        let fr = super::gdn_requant_seed(seq_pos, delta_layer);
         let ef_null: *const c_void = std::ptr::null();
         let rqt: i32 = 0; // single-end requant (MQ4/HFQ4 fast path; per-token=1 for PARO)
         let n_tiles = (128 / 4) as u32;
@@ -398,7 +407,13 @@ impl Gpu {
     /// wrapper rejects any value other than 128 before launching the kernel.
     /// gate/beta are [N × n_heads] row-major.
     /// S_q8 / s_scales are the shared state (advanced N steps).
+    ///
+    /// `seq_pos` is the absolute sequence position of `q_batch[0]`; the kernel
+    /// adds its intra-block token index to `frame`, so token `t` of this block
+    /// is seeded at absolute position `seq_pos + t`. `delta_layer` is the
+    /// DeltaNet layer index. See [`super::gdn_requant_seed`].
     #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
     pub fn gated_delta_net_q8_batch_seq(
         &mut self,
         q_batch: &GpuTensor,
@@ -412,6 +427,8 @@ impl Gpu {
         n_tokens: usize,
         n_heads: usize,
         head_dim: usize,
+        seq_pos: u32,
+        delta_layer: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         Self::ensure_gdn_hd128(head_dim)?;
@@ -428,6 +445,8 @@ impl Gpu {
                 n_tokens,
                 n_heads,
                 head_dim,
+                seq_pos,
+                delta_layer,
             );
         }
         self.ensure_kernel(
@@ -449,7 +468,7 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
-        let fr = super::GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
+        let fr = super::gdn_requant_seed(seq_pos, delta_layer);
         let ef_null: *const c_void = std::ptr::null();
         let rqt: i32 = 0; // single-end requant (MQ4/HFQ4 fast path)
 
