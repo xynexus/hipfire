@@ -19,7 +19,13 @@ once the per-group numerics are confirmed on device.
 
 Checks per projection shape:
   1. int32 contraction bit-exact vs numpy int64 (per group) — kernel correctness.
-  2. f32 rescale vs f32 reference `X @ W^T` — SNR (the int8 grid error, ~33 dB).
+     This integer check (np.array_equal) is the PASS criterion and is robust.
+  2. f32 rescale vs f32 reference `X @ W^T` — W8A8 SNR (int8 grid error, ~40 dB
+     per projection). CAVEAT: halo's numpy 2.x mis-computes large float ops
+     (`Xf@Wf.T`, big reductions) at N>=4096, so the reported SNR/cos is only
+     reliable at N=1024 (k/v_proj: +40 dB on device). The rescale math is
+     confirmed +40 dB on nix1 numpy 1.26 (tools/npu/dflash_int8_sim.py); the
+     int32 check above is what proves the on-device kernel is correct.
 
 Env (halo): source ~/.venv/bin/activate; export
   PYTHONPATH=~/build/mlir-aie/install/python:$PYTHONPATH; PATH=/opt/xilinx/xrt/bin:$PATH

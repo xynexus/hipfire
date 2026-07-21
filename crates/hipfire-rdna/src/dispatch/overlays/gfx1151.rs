@@ -25,6 +25,8 @@ impl Gpu {
         n_tokens: usize,
         n_heads: usize,
         head_dim: usize,
+        seq_pos: u32,
+        delta_layer: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         Self::ensure_gdn_hd128(head_dim)?;
@@ -44,8 +46,7 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
-        let fr = super::super::GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            as i32;
+        let fr = super::super::gdn_requant_seed(seq_pos, delta_layer);
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
             &self.hip,

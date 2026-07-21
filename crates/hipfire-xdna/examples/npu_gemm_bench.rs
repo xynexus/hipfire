@@ -28,16 +28,33 @@ fn main() {
         let insts = std::fs::read(format!("{dir}/insts.bin")).expect("insts");
         let k = NpuKernel::load(&xclbin, &insts).expect("load");
 
+        // C is over-allocated by GUARD bytes and the whole thing is pre-filled with a
+        // sentinel. C[0] alone is NOT a sufficient gate: it only exercises the (i=0, j=0)
+        // register-tile element, so it stays correct even when the kernel walks off the end
+        // of its buffers. That is exactly how an LM < MT misconfiguration (r11_gemm's
+        // register tile defaults to 3x3, and LM=1 is forced at M=16) hides -- it reads and
+        // writes past A and C while C[0] still reads back clean. So: check EVERY element,
+        // count how many were never written, and canary the bytes past the end.
+        const GUARD: usize = 4096;
+        const SENTINEL: i32 = -559038737; // 0xDEADBEEF
+
         let mut aw = k.alloc_arg(asz).expect("A");
         let mut ww = k.alloc_arg(wsz).expect("W");
-        let mut cw = k.alloc_arg(csz).expect("C");
+        let mut cw = k.alloc_arg(csz + GUARD).expect("C");
         aw.as_mut_slice().fill(1);
         ww.as_mut_slice().fill(0x11);
-        cw.as_mut_slice().fill(0);
+        for b in cw.as_mut_slice().chunks_exact_mut(4) {
+            b.copy_from_slice(&SENTINEL.to_ne_bytes());
+        }
 
-        // Correctness gate: all-ones W4A8 compute.
+        // Correctness gate: all-ones W4A8 compute. Every C element must equal K, because
+        // A is all 1 and each weight decodes to 1 (int4 nibble of 0x11, or int8 17).
         k.dispatch(&[&aw, &ww, &cw]).expect("dispatch");
-        let c0 = unsafe { *(cw.as_slice().as_ptr() as *const i32) };
+        let c: &[i32] = unsafe {
+            std::slice::from_raw_parts(cw.as_slice().as_ptr() as *const i32, (csz + GUARD) / 4)
+        };
+        let n = csz / 4;
+        let c0 = c[0];
         println!(
             "all-ones C[0] = {c0}{}",
             match expect {
@@ -45,11 +62,35 @@ fn main() {
                 None => String::new(),
             }
         );
+
+        // Canary: nothing may touch the bytes past the declared C length.
+        let clobbered = c[n..].iter().filter(|&&v| v != SENTINEL).count();
+        if clobbered > 0 {
+            let first = n + c[n..].iter().position(|&v| v != SENTINEL).unwrap();
+            eprintln!(
+                "OOB WRITE: {clobbered} of {} guard words past C[{n}] clobbered; \
+                 first at C[{first}] = {}",
+                GUARD / 4,
+                c[first]
+            );
+            std::process::exit(5);
+        }
+
         if let Some(e) = expect {
-            if c0 != e {
-                eprintln!("correctness FAIL");
+            let unwritten = c[..n].iter().filter(|&&v| v == SENTINEL).count();
+            let bad = c[..n].iter().filter(|&&v| v != e).count();
+            if bad > 0 {
+                let first = c[..n].iter().position(|&v| v != e).unwrap();
+                eprintln!(
+                    "correctness FAIL: {bad}/{n} elements != {e} \
+                     ({unwritten} never written); first bad at C[{first}] = {}",
+                    c[first]
+                );
                 std::process::exit(4);
             }
+            println!("  full-C gate: {n}/{n} elements == {e}, guard clean");
+        } else if c[..n].iter().all(|&v| v == SENTINEL) {
+            println!("  (C untouched — feed-only probe, no compute; guard clean)");
         }
 
         // Warm up, then time the dispatch loop.

@@ -123,9 +123,42 @@ thread_local! {
 /// instrumented sweep.
 pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
 
-/// Per-launch entropy for Q8 GatedDeltaNet stochastic rounding.
+/// Legacy per-launch entropy counter for Q8 GatedDeltaNet stochastic
+/// rounding. **No longer feeds any kernel** (issue #17): a process-global
+/// monotonic dispatch counter made target numerics a function of execution
+/// history, so in speculative decoding the drafter bled into the target's
+/// output (a different drafter shifted every subsequent frame, changing the
+/// rounding noise → DeltaNet state → target logits). The `frame` kernarg is
+/// now derived from the absolute sequence position and the DeltaNet layer
+/// index via [`gdn_requant_seed`].
+///
+/// Retained only so the env-gated rollback frame-order diagnostics in
+/// `hipfire-arch-qwen35::speculative` still compile. Reading it tells you
+/// nothing about the seeds a kernel actually used.
 #[allow(dead_code)]
 static GDN_REQUANT_FRAME: AtomicU32 = AtomicU32::new(0);
+
+/// Deterministic seed for the Q8 GatedDeltaNet stochastic-rounding RNG.
+///
+/// Must be a pure function of *where we are in the sequence*, never of *how
+/// many dispatches have happened* — two runs that reach the same sequence
+/// position must round identically regardless of how they got there
+/// (issue #17).
+///
+/// - `seq_pos` is the absolute sequence position of the **first** token in
+///   the block being processed. The batched kernel adds its intra-block token
+///   index `t` to `frame`, so `seq_pos + t` is that token's absolute position.
+/// - `delta_layer` is the DeltaNet (linear-attention) layer index. The kernels
+///   already mix head, state row, and lane into the RNG, but **not** the layer;
+///   without this term every LA layer would dither with an identical noise
+///   sequence at a given position (correlated dither across layers). Folding it
+///   in at `2^24` keeps the `frame + t` contract intact and stays collision-free
+///   for sequence positions below ~16.7M.
+#[cfg(feature = "deltanet")]
+#[inline]
+pub(crate) fn gdn_requant_seed(seq_pos: u32, delta_layer: u32) -> i32 {
+    seq_pos.wrapping_add(delta_layer.wrapping_mul(1 << 24)) as i32
+}
 
 /// Minimum batch size at which the FP8 WMMA prefill path is enabled.
 /// Below this, the FP16 WMMA path wins on gfx1201 (measured 0.71-0.94×

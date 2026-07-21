@@ -641,6 +641,26 @@ pub fn grouped_moe_prefill_session_batch_gated_delta_net_q8_layer(
             ),
         ));
     }
+    // #17 — Q8 requant seed. Every other GDN caller passes the absolute
+    // sequence position of the block it is processing. This one CANNOT: the
+    // kernel takes a single `frame` scalar, but this launch covers rows from
+    // MULTIPLE sessions that sit at DIFFERENT absolute positions (the
+    // per-row positions live device-side in `device_tables.row_positions`,
+    // and the kernel mixes `row_session_indices` only for state routing, not
+    // into the RNG). A single scalar cannot represent them.
+    //
+    // Passing a constant here still fixes the actual defect: the seed is no
+    // longer a function of how many dispatches have happened, so execution
+    // history (e.g. a different spec-decode drafter) can no longer perturb
+    // these numerics. What it does NOT give is decorrelation ACROSS sequence
+    // positions within this path — every position in a multi-session prefix
+    // batch dithers from the same base. Layers are still decorrelated, since
+    // `delta_layer_index` is mixed into the seed by the dispatcher.
+    //
+    // Making this per-position correct requires the kernel to read
+    // `row_positions` (a kernel change, deliberately out of scope here).
+    // FLAGGED FOR DESIGN DECISION — do not "fix" by reintroducing a counter.
+    const ROUTED_BATCH_SEQ_POS: u32 = 0;
     gpu.gated_delta_net_q8_routed_batch_seq(
         q_batch,
         k_batch,
@@ -657,6 +677,7 @@ pub fn grouped_moe_prefill_session_batch_gated_delta_net_q8_layer(
         n_heads,
         head_dim,
         sessions,
+        ROUTED_BATCH_SEQ_POS,
     )
 }
 

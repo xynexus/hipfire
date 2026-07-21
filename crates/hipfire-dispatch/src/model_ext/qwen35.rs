@@ -42,6 +42,12 @@ pub struct DeltaNetStepParams<'a> {
     pub n_heads: usize,
     pub head_dim: usize,
     pub quant: StateQuant,
+    /// Absolute sequence position of this token. Seeds the Q8 state-requant
+    /// stochastic rounding deterministically (issue #17).
+    pub seq_pos: usize,
+    /// DeltaNet (linear-attention) layer index; mixed into the same seed so
+    /// layers do not share a dither sequence.
+    pub delta_layer: usize,
 }
 
 /// Parameters for batched sequential DeltaNet updates (prefill path).
@@ -61,6 +67,11 @@ pub struct DeltaNetBatchParams<'a> {
     pub n_heads: usize,
     pub head_dim: usize,
     pub quant: StateQuant,
+    /// Absolute sequence position of `q_batch[0]`; token `i` of the block is
+    /// seeded at `seq_pos + i` (issue #17).
+    pub seq_pos: usize,
+    /// DeltaNet (linear-attention) layer index.
+    pub delta_layer: usize,
 }
 
 /// Parameters for tree-batched DeltaNet (speculative-decode path).
@@ -154,6 +165,7 @@ impl Qwen35ModelExt for () {
                 params.gate, params.beta,
                 params.state, params.s_scales, params.output,
                 1, params.n_heads, params.head_dim,
+                params.seq_pos as u32, params.delta_layer as u32,
             ),
             StateQuant::Q4 => gpu.gated_delta_net_q4(
                 params.q, params.k, params.v,
@@ -176,6 +188,7 @@ impl Qwen35ModelExt for () {
                 params.gate_batch, params.beta_batch,
                 params.state, params.s_scales, params.output_batch,
                 params.n_tokens, params.n_heads, params.head_dim,
+                params.seq_pos as u32, params.delta_layer as u32,
             ),
             _ => {
                 // FP32/Q4: loop single-token kernel.

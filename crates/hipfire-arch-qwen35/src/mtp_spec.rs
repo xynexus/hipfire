@@ -2713,6 +2713,9 @@ pub fn spec_step_mtp_compressed_serial(
         /* moe_router_logits_present — dense trunk: arm never matched */ true,
     );
     let verify_tape: Option<&mut GdnTape> = if tape_captured {
+        // Tape row 0 records verify_tokens[0] at absolute position `cur_pos`;
+        // rollback replay seeds Q8 requant from those positions (issue #17).
+        state.trunk_gdn_tape.set_base_position(cur_pos);
         Some(&mut state.trunk_gdn_tape)
     } else {
         None
@@ -3553,6 +3556,11 @@ pub fn spec_step_mtp_compressed_serial_multi(
     // the full transformer stack.
     let tape_captured = state.trunk_gdn_tape_shards.is_some();
     let _ = tape_captured; // used below in rollback
+    if let Some(shards) = state.trunk_gdn_tape_shards.as_mut() {
+        // Tape row 0 records verify_tokens[0] at absolute position `cur_pos`;
+        // rollback replay seeds Q8 requant from those positions (issue #17).
+        shards.set_base_position(cur_pos);
+    }
 
     // Multi-GPU trunk verify. forward_prefill_batch_multi_with_caps dispatches
     // each layer to its owning band; per_token_hidden_out lands on output_device

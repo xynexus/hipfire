@@ -1356,6 +1356,31 @@ pub fn collect<F>(
 where
     F: FnOnce(&mut Gpu) -> Result<CalibForward, String>,
 {
+    let collector = arm(gpu, capture_names, imatrix_only);
+
+    // Run the arch forward, then ALWAYS disarm the capture before propagating
+    // any error (a half-armed `gpu` would mis-capture a later forward).
+    let forward_out = forward(gpu);
+    disarm(gpu);
+    let forward_out = forward_out?;
+
+    finish(gpu, &collector, arch_id, output, static_meta, &forward_out)
+}
+
+/// Arm `gpu` with a fresh [`CalibCollector`] and the caller's
+/// weight-buffer-addr → tensor-name map. The returned handle must be passed to
+/// [`finish`] after [`disarm`].
+///
+/// This is [`collect`]'s first half, exposed for drivers whose capturing
+/// forward is not expressible as a single `FnOnce` closure — e.g. the DFlash
+/// spec-decode loop, where the drafter's real inputs only exist inside a
+/// long-running target/draft decode loop with borrowed state. Prefer
+/// [`collect`] when a closure works.
+pub fn arm(
+    gpu: &mut Gpu,
+    capture_names: HashMap<usize, String>,
+    imatrix_only: Vec<String>,
+) -> std::sync::Arc<CalibCollector> {
     let collector = std::sync::Arc::new(if imatrix_only.is_empty() {
         CalibCollector::new()
     } else {
@@ -1363,14 +1388,26 @@ where
     });
     gpu.capture_names = capture_names;
     gpu.active_capture = Some(collector.clone());
+    collector
+}
 
-    // Run the arch forward, then ALWAYS disarm the capture before propagating
-    // any error (a half-armed `gpu` would mis-capture a later forward).
-    let forward_out = forward(gpu);
+/// Disarm the capture. Idempotent; always call before dropping the collector
+/// (a half-armed `gpu` would mis-capture a later forward).
+pub fn disarm(gpu: &mut Gpu) {
     gpu.active_capture = None;
     gpu.capture_names = HashMap::new();
-    let forward_out = forward_out?;
+}
 
+/// [`collect`]'s second half: build the standard metadata from the collector's
+/// descriptors, stream the HFQM `.calib.hfq`, and release the GPU accumulators.
+pub fn finish(
+    gpu: &mut Gpu,
+    collector: &CalibCollector,
+    arch_id: u32,
+    output: &std::path::Path,
+    static_meta: &[(&str, serde_json::Value)],
+    forward_out: &CalibForward,
+) -> Result<CalibSummary, String> {
     let descriptors = collector.tensor_descriptors();
     if descriptors.is_empty() {
         return Err("calib: no tensors captured (check capture_names wiring)".to_string());
