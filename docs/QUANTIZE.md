@@ -412,9 +412,15 @@ artifact/KLDREF finalization runs. This is execution provenance rather than a
 semantic recipe input; changing it does not invalidate compatible completed
 calibration.
 The manifest also records cumulative native calibration seconds (including
-segmented wrapper restarts) and quantization seconds. These are execution
-measurements, not semantic recipe fields, and provide the capture-cost input
-required by controlled expert-floor and capture-target sweeps.
+segmented wrapper restarts), successful quantization seconds, and the last
+failed or interrupted quantization-attempt duration. SIGINT/SIGTERM exits are
+recorded as `quantization_interrupted` with their return code and signal;
+ordinary nonzero exits are `quantization_failed`. Retrying clears the old
+failure record but preserves the completed calibration provenance. Partial
+quantizer spills are never deleted implicitly, and every retry repeats storage
+admission before launching pass 2. These are execution measurements, not
+semantic recipe fields, and provide the capture-cost input required by
+controlled expert-floor and capture-target sweeps.
 With `--skip-calib`, the wrapper also executes the native no-GPU dry plan and
 requires the existing artifact to match its family/adapter/architecture,
 source fingerprint and shard set, tokenizer/corpus/sample fingerprints,

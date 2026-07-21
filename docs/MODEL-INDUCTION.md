@@ -156,6 +156,14 @@ binds the complete adapter tensor plan, calibration job, and geometry. Any
 mismatch fails before quantization; `--force` disables automatic reuse and
 regenerates calibration.
 
+If pass 2 exits through SIGINT or SIGTERM, `two-pass.json` records
+`quantization_interrupted` with the return code and signal instead of retaining
+a stale running state. The parent induction target stage mirrors that as
+`interrupted`; non-signal process errors remain `failed`. Neither wrapper
+deletes a partial quantizer spill automatically. A later target retry must use
+the same recipe and pass a fresh storage preflight before the quantizer is
+launched again.
+
 Repo-built tools are rebuilt when missing or older than their defining source.
 Use `--no-auto-build` to require the tools to be current before starting. GPU
 stages use the shared `hipfire lock` path. Native calibration acquires the lock

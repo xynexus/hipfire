@@ -549,6 +549,7 @@ def update_manifest(
     quantized: dict | None = None,
     calibration_execution: dict | None = None,
     phase_timings: dict | None = None,
+    failure: dict | None = None,
 ) -> dict:
     previous = {}
     if path.is_file():
@@ -597,6 +598,8 @@ def update_manifest(
         }
     elif "phase_timings" in previous:
         manifest["phase_timings"] = previous["phase_timings"]
+    if failure is not None:
+        manifest["failure"] = failure
 
     calibration_value = calibration or manifest.get("calibration")
     quantized_value = quantized or manifest.get("quantized")
@@ -785,6 +788,51 @@ def run_calibration_pass(
             progress(execution)
         if release_seconds:
             time.sleep(release_seconds)
+
+
+def _quantization_failure(error: BaseException) -> tuple[str, dict]:
+    failure = {
+        "recorded_at": _utc_now(),
+        "kind": "exception",
+        "message": str(error),
+    }
+    signal_number = None
+    if isinstance(error, KeyboardInterrupt):
+        signal_number = 2
+    elif isinstance(error, subprocess.CalledProcessError):
+        returncode = error.returncode
+        failure["returncode"] = returncode
+        if returncode in (-2, -15):
+            signal_number = -returncode
+        elif returncode in (130, 143):
+            signal_number = returncode - 128
+        else:
+            failure["kind"] = "process_error"
+    if signal_number is not None:
+        failure["kind"] = "signal"
+        failure["signal"] = signal_number
+        return "quantization_interrupted", failure
+    return "quantization_failed", failure
+
+
+def run_quantization_pass(
+    command: list[str],
+    *,
+    runner=subprocess.run,
+    on_failure=None,
+) -> float:
+    """Run pass two and durably report interruption before propagating it."""
+
+    started = time.monotonic()
+    try:
+        runner(command, check=True)
+    except BaseException as error:
+        elapsed = round(time.monotonic() - started, 6)
+        phase, failure = _quantization_failure(error)
+        if on_failure is not None:
+            on_failure(phase, elapsed, failure)
+        raise
+    return round(time.monotonic() - started, 6)
 
 
 def _require_equal(label: str, actual, expected) -> None:
@@ -1199,9 +1247,23 @@ def main() -> None:
         calibration_audit=calibration_audit,
         storage_preflight=storage_preflight,
     )
-    quantization_started = time.monotonic()
-    subprocess.run(quant_exec, check=True)
-    quantization_seconds = round(time.monotonic() - quantization_started, 6)
+
+    def record_quantization_failure(phase: str, elapsed: float, failure: dict) -> None:
+        update_manifest(
+            manifest_path,
+            recipe=recipe,
+            phase=phase,
+            calibration=calibration,
+            calibration_audit=calibration_audit,
+            storage_preflight=storage_preflight,
+            failure=failure,
+            phase_timings={"last_quantization_attempt_seconds": elapsed},
+        )
+
+    quantization_seconds = run_quantization_pass(
+        quant_exec,
+        on_failure=record_quantization_failure,
+    )
     quantized = inspect_artifact(args.coexistence, args.output)
     validate_quantized_inspection(quantized)
     update_manifest(

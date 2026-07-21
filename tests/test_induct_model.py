@@ -369,3 +369,24 @@ def test_main_dry_run_prints_native_two_pass_plan_without_running_tools(tmp_path
     assert "--sampling-seed 1" in output
     assert "--expert-coverage-policy preserve-undercovered" in output
     assert "--calibration-segment-layers 4" in output
+
+
+def test_target_stage_failure_reflects_interrupted_two_pass_manifest(tmp_path):
+    two_pass_manifest = tmp_path / "two-pass.json"
+    two_pass_manifest.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "status": "quantization_interrupted",
+                "failure": {"kind": "signal", "returncode": 143, "signal": 15},
+            }
+        )
+    )
+    paths = {"two_pass_manifest": two_pass_manifest}
+
+    assert (
+        induct._stage_failure_status("target", paths, RuntimeError("wrapper exited"))
+        == "interrupted"
+    )
+    assert induct._stage_failure_status("triattn", paths, RuntimeError("failed")) == "failed"
+    assert induct._stage_failure_status("dflash", paths, KeyboardInterrupt()) == "interrupted"

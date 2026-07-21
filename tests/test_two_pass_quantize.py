@@ -1,7 +1,8 @@
+import copy
 import importlib.util
 import json
-import copy
 import struct
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -427,6 +428,87 @@ def test_interrupted_manifest_resume_preserves_completed_calibration(tmp_path):
         "calibration_seconds": 12.5,
         "quantization_seconds": 7.25,
     }
+
+
+def test_quantization_sigterm_records_interrupted_manifest_and_can_resume(tmp_path):
+    path = tmp_path / "two-pass.json"
+    recipe = {"recipe_fingerprint": "sha256:recipe"}
+    calibration = {
+        "artifact_fingerprint": "fnv64:calib",
+        "metadata": {
+            "run_fingerprint": "run",
+            "read_ledger": {"missing_logical": [], "duplicate_logical": []},
+        },
+    }
+    two_pass.update_manifest(
+        path,
+        recipe=recipe,
+        phase="quantization_running",
+        calibration=calibration,
+    )
+
+    def terminate(_command, *, check):
+        assert check is True
+        raise subprocess.CalledProcessError(143, ["hipfire", "lock", "acquire"])
+
+    def record_failure(phase, elapsed_seconds, failure):
+        two_pass.update_manifest(
+            path,
+            recipe=recipe,
+            phase=phase,
+            failure=failure,
+            phase_timings={"last_quantization_attempt_seconds": elapsed_seconds},
+        )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        two_pass.run_quantization_pass(
+            ["hipfire", "lock", "acquire"],
+            runner=terminate,
+            on_failure=record_failure,
+        )
+
+    interrupted = json.loads(path.read_text())
+    assert interrupted["status"] == "quantization_interrupted"
+    assert interrupted["calibration"] == calibration
+    assert interrupted["failure"]["kind"] == "signal"
+    assert interrupted["failure"]["returncode"] == 143
+    assert interrupted["failure"]["signal"] == 15
+    assert interrupted["phase_timings"]["last_quantization_attempt_seconds"] >= 0
+
+    resumed = two_pass.update_manifest(path, recipe=recipe, phase="quantization_running")
+    assert resumed["status"] == "quantization_running"
+    assert resumed["calibration"] == calibration
+    assert "failure" not in resumed
+
+
+def test_quantization_non_signal_failure_is_not_labeled_interrupted():
+    recorded = []
+
+    def fail(_command, *, check):
+        assert check is True
+        raise subprocess.CalledProcessError(2, ["hipfire-quantize"])
+
+    with pytest.raises(subprocess.CalledProcessError):
+        two_pass.run_quantization_pass(
+            ["hipfire-quantize"],
+            runner=fail,
+            on_failure=lambda phase, elapsed, failure: recorded.append(
+                (phase, elapsed, failure)
+            ),
+        )
+
+    assert len(recorded) == 1
+    phase, elapsed, failure = recorded[0]
+    assert phase == "quantization_failed"
+    assert elapsed >= 0
+    assert failure["kind"] == "process_error"
+    assert failure["returncode"] == 2
+    assert "signal" not in failure
+
+    phase, failure = two_pass._quantization_failure(KeyboardInterrupt())
+    assert phase == "quantization_interrupted"
+    assert failure["kind"] == "signal"
+    assert failure["signal"] == 2
 
 
 def reusable_calibration_contract():

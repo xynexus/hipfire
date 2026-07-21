@@ -325,6 +325,23 @@ def _write_manifest(path: Path, manifest: dict) -> None:
     temporary.replace(path)
 
 
+def _stage_failure_status(stage: str, paths: dict[str, Path], error: BaseException) -> str:
+    if isinstance(error, KeyboardInterrupt):
+        return "interrupted"
+    if stage != "target":
+        return "failed"
+    try:
+        two_pass = json.loads(paths["two_pass_manifest"].read_text())
+    except (KeyError, OSError, json.JSONDecodeError):
+        return "failed"
+    status = two_pass.get("status")
+    return (
+        "interrupted"
+        if isinstance(status, str) and status.endswith("_interrupted")
+        else "failed"
+    )
+
+
 def _required_outputs(stage: str, paths: dict[str, Path]) -> list[tuple[Path, bytes]]:
     if stage == "dflash":
         return [
@@ -762,7 +779,14 @@ def main() -> None:
             if not _stage_complete(stage, paths, target_recipe_fingerprint):
                 raise RuntimeError(f"{stage} command returned success but its output artifact is invalid")
         except BaseException as error:
-            manifest["stages"][stage].update({"status": "failed", "failed_at": utc_now(), "error": str(error)})
+            failure_status = _stage_failure_status(stage, paths, error)
+            manifest["stages"][stage].update(
+                {
+                    "status": failure_status,
+                    f"{failure_status}_at": utc_now(),
+                    "error": str(error),
+                }
+            )
             manifest["updated_at"] = utc_now()
             _write_manifest(paths["manifest"], manifest)
             raise

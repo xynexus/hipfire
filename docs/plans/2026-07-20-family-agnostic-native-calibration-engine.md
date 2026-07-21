@@ -1,7 +1,8 @@
 # Family-agnostic native calibration engine and expert microbatching
 
-Status: implementation in progress; native engine and mechanism gates landed,
-full-scale production/admission runs pending
+Status: implementation in progress; native engine and the 397B teacher artifact
+are complete, while the production second pass is explicitly held and the
+admission ladder remains pending
 
 Primary validation host: gfx1151, 120 GiB unified aperture
 
@@ -9,7 +10,7 @@ First production adapter: Qwen3.5-397B-A17B
 
 Reference source: `/srv/huggingface/models--Qwen--Qwen3.5-397B-A17B`
 
-## Implementation evidence snapshot — 2026-07-20
+## Implementation evidence snapshot — 2026-07-21
 
 The native mechanism is implemented, but the production quality/admission
 ladder is not complete. Keep this distinction explicit when reporting status.
@@ -73,8 +74,9 @@ Implemented and verified in this checkout:
   instead of retaining an entire multi-gigabyte tensor until one monolithic HIP
   copy returns; tied aliases still suppress early release, and unit tests prove
   exact chunk coverage plus byte-identical refault after partial release. The
-  currently running 397B production binary predates this change, so its live
-  pressure benefit remains an explicit rerun gate rather than claimed evidence;
+  completed 397B production artifact was produced by an older binary that
+  predates this change, so its live pressure benefit remains an explicit rerun
+  gate rather than claimed evidence;
 - bounded family-neutral source lookahead: the engine selects the next owner's
   canonical physical ranges without consuming the read ledger, reads at most
   16 GiB through one fixed 8 MiB worker chunk into resident staging during
@@ -112,10 +114,10 @@ Implemented and verified in this checkout:
   gfx1151 additionally runs the grouped-WMMA and compact indexed fast paths;
   other architectures either produce a portable result row or exit with an
   explicit architecture/dtype capability failure. Dispatch admission tests
-  cover gfx906, gfx1030, gfx1100, gfx1200/1201, and gfx942. The refreshed
-  gfx1151 channel is queued after production through the reusable
-  `benchmarks/calib/raw-grouped-channel.sh` evidence writer; the other hardware
-  rows remain external evidence, not inferred from compilation;
+  cover gfx906, gfx1030, gfx1100, gfx1200/1201, and gfx942. The reusable
+  `benchmarks/calib/raw-grouped-channel.sh` evidence writer is ready, but its
+  gfx1151 launcher is paused with the other GPU evidence jobs; the other
+  hardware rows remain external evidence, not inferred from compilation;
 - an index-only dry run of the 397B source: 60 layers, 1,038 logical tensors,
   792,692,717,952 unique source bytes across 94 shards, K=10, sequence batch 4,
   time tile 64, and the complete one-read ledger contract;
@@ -456,18 +458,37 @@ floor, and the exact remaining 237 experts preserved. Across all 47 durable
 layer journals, 123,207,680 routed slots reconcile with zero drops and zero
 maximum consistency error, while 7,052 layer-experts are explicitly marked for
 high-precision fallback. This proves the process-lifetime mitigation at a real
-boundary; final artifact completion remains pending.
+boundary; final artifact completion was still pending at this checkpoint.
+
+The segmented controller subsequently completed all 60 layers and finalized
+`Qwen3.5-397B-A17B.calib.hfq` at 12,715,654,656 bytes. The independent
+family-neutral audit accepts fingerprint `fnv64:093301497a84bf3b` with zero
+errors: 1,038/1,038 logical and canonical source reads cover
+792,692,717,952 bytes without a duplicate or omission; 585 Hessians and 61,447
+imatrices are indexed; and the KLDREF contains top-64 records for 262,016
+positions from the same 128-sample, 262,144-row job. Across 60 expert layers,
+the artifact declares 30,720 experts and 61,440 gate-up/down capture points.
+The frozen preserve-undercovered policy records 20,736 deficient capture
+points and the exact 10,368 `(layer, expert)` pairs that pass two must retain at
+BF16/F16. This completes the teacher and fallback-set evidence; it does not
+complete or admit the quantized candidate.
+
+The audit retains two honest provenance warnings. The historical production
+binary did not write `engine_build` into the final artifact, and the first ten
+layers predate reduction-launch telemetry, leaving 10,236 admitted capture
+points without launch-count fields. Their routing, admitted/full-stream counts,
+imatrices, deficits, fallback identities, and read-ledger evidence remain
+present; the missing cost fields must not be reconstructed or used as an
+all-layer capture-cost claim.
 
 Still required before declaring the engine complete or promoting a production
 397B quant:
 
-- the full Qwen3.5-397B teacher pass and calibration/KLDREF artifact;
 - matched prefetch-on versus prefetch-off layer timings on the same network
   source, separating background read duration, foreground wait, and upload;
 - the second target-source read and completed quantized artifact;
-- full-run confirmation that the bounded-layer 2,048-row, batch-64 winner
-  remains optimal, the full Qwen layer stream, and production per-expert
-  coverage/fallback results from the real corpus;
+- full-run performance confirmation that the bounded-layer 2,048-row,
+  batch-64 geometry remains the best safe choice;
 - resident-versus-streamed comparison and matched held-out KLD/PPL evidence;
 - execution of the now-frozen controlled minimum-coverage and capture-target
   sweeps, including complete held-out quality and capture-cost rows;
@@ -482,17 +503,17 @@ background-read versus foreground-load timing, and emits a fingerprinted JSON
 ledger. It is tooling only until run after the production stream releases the
 GPU; no timing claim follows from the script itself.
 
-`/srv` cannot host the production outputs on the current host snapshot: it has
-approximately 4.3 GiB free while the source checkpoint alone is approximately
-807 GB. `/home` is the proposed artifact/spool root and had approximately
-500.8 GB free at the latest check. At 39/60 checkpoints, the 5,141 exact
-high-precision fallback layer-experts imply a partial lower-bound target size
-of 318.4 GB and a conservative 387.2 GB free-space requirement. Extrapolating
-the observed fallback counts by layer type gives about 440 GB required at
-completion, but that is capacity planning only: final admission waits for the
-complete fallback set and live filesystem availability. Treat all free-space
-figures as transient. A dry run is not throughput, coverage, quality, or
-source-payload-read evidence.
+`/srv` cannot host the production outputs on the current host snapshot: the
+source checkpoint alone is approximately 807 GB. The completed fallback set
+now drives an authoritative index-only pass-two estimate: 415,036,139,488
+bytes for the completed mixed artifact and 483,755,616,224 bytes required free
+after container/alignment overhead and the 64 GiB safety margin. The preflight
+admitted the first attempt with 496,481,157,120 bytes available. That attempt
+was stopped on operator request at 180/2,924 tensors and left an untouched
+48,144,656,640-byte spill, so current free space is below the same admission
+threshold until the spill is deliberately removed or other capacity is
+recovered. Treat all free-space figures as transient and require a fresh
+preflight before any restart.
 
 ## Outcome
 
@@ -1377,10 +1398,13 @@ from the low-bit eligibility rule. Astrea selects the default cap from measured
 quality/cost evidence; a cap is not declared safe merely because every expert
 met the minimum.
 
-The minimum-floor contract is now frozen, but deliberately not executed while
-the 397B production stream owns the GPU. The v1 plan lives at
-`~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-plan.json` with
-fingerprint `sha256:a6a34652657c3007795330ffaf1e500567027c91a02e8012c73113f372836d18`.
+The minimum-floor contract is frozen but not executed. Its current v3 plan
+lives at
+`~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-plan-v3.json`
+with fingerprint
+`sha256:84d6dcc74d14c184af549ff07922bec113798b932f317971169b7b858e9b6e78`
+and engine fingerprint
+`4fe45b0e154e6f98ea08649598517e59dff95efb4092746d9a69c744154e0fd4`.
 It binds Qwen3.5-35B-A3B source manifest
 `sha256:fca57860a6c176240d3dd6112989ff235e77130ed3d0de97034fe36597e8dc55`,
 the local OQ8 reference HFQ control region
@@ -1391,8 +1415,12 @@ held-out corpus
 `sha256:c8b1a1fa66299336f8349e11f2a7679c3f349263f08ff72ea035fac84a3af5bd`,
 the 512/1,024/2,048/4,096 floors, fixed 4,096-row capture target, 64x32
 microbatch geometry, no source lookahead, and 32 daemon-backed quality chunks.
-`expert-sweep-verify` reports `verified_not_run`; this is a reproducibility
-contract, not KLD/PPL or expert-floor selection evidence. The implemented
+`expert-sweep-verify` reported `verified_not_run` immediately after v3 was
+generated. Subsequent workflow source changes intentionally invalidate that
+engine fingerprint, so the plan must be regenerated and verified again before
+execution. This remains a reproducibility contract, not KLD/PPL or
+expert-floor selection evidence. Its launcher is paused under the same
+operator hold as the other downstream GPU jobs. The implemented
 `expert-sweep-results` and `expert-sweep-analyze` commands can only report
 `complete_selection_required`: they require the complete frozen variant set,
 finite KLD/PPL and cost rows, exact fallback sets, monotonic minimum-floor
@@ -1422,7 +1450,7 @@ decode, and host-to-device upload before considering pinned host staging or
 GPU double buffering. Kernel changes come after those measurements and land
 one lever at a time.
 
-## Completion audit — 2026-07-21 09:43 AWST
+## Completion audit — 2026-07-21 11:58 AWST
 
 This table evaluates the numbered definition of done below. "Mechanism proven"
 does not mean the production artifact or admission ladder is complete.
@@ -1430,21 +1458,22 @@ does not mean the production artifact or admission ladder is complete.
 | Item | Status | Authoritative evidence / missing proof |
 |---|---|---|
 | 1. Family-resolved native CLI | Proven | Qwen3.5 and Gemma3-text registry/factory tests plus successful architecture-selected dry runs and real streams; no family CLI flag exists. |
-| 2. Complete 397B teacher artifact | In progress | The durable production stream has 47 of 60 layer checkpoints. The first process-lifetime-bounded child advanced 43--47, exited normally at its requested boundary, released mappings, and the stable controller started a fresh 47--51 child with no SVM failure. No final `.calib.hfq` exists yet, so finalizer, KLDREF, complete ledger, and all-layer telemetry are not proven. |
-| 3. Second and only target-source pass | Pending; storage admission proven | The target `Qwen3.5-397B-A17B.oq4.25++.hfq` does not exist. The quantizer join is implemented and bounded Gemma join evidence exists, but the production source pass has not run. Before that pass, the reusable wrapper now computes and persists an index-only mixed-output estimate using the artifact's exact high-precision fallback set and refuses insufficient storage. At 47/60 durable checkpoints, 7,052 layer-experts are already marked for exact high-precision fallback; the final admission intentionally waits for the complete fallback set before producing its authoritative byte estimate. |
-| 4. Per-layer/per-expert floor | Mechanism proven; production pending | Unit/GPU capture tests and all 47 durable production layer journals reconcile 123,207,680 K=10 routed slots with zero dropped indices and zero maximum consistency error. Layer 46 independently reconciles 2,621,440 routed slots across 128 microbatches, identical gate-up/down accounting, 275 experts at the floor, and the exact remaining 237-expert fallback set. Serialized layer snapshots validate routed slots, full/admitted weight counts, quota/slack accounting, and reduction tiles. Preserve-undercovered records real deficits, but the complete 60-layer fallback set is not available until finalization. |
-| 5. Frozen telemetry and quantizer refusal | Mechanism proven; production pending | `artifact audit-calibration` now provides a family-neutral nonzero gate for the complete ledger, Hessian/imatrix index, KLDREF map, per-layer telemetry reconciliation, policy, deficits, and exact high-precision fallback set. The reusable two-pass workflow requires that gate before quantization and persists its fingerprint-bound report; induction will not reuse a target manifest without it. Quantizer enforcement tests pass; the final production artifact and quantizer evidence are absent. |
+| 2. Complete 397B teacher artifact | Proven | `/home/sadara/.hipfire/calib/Qwen3.5-397B-A17B.calib.hfq` is a complete 12,715,654,656-byte artifact. The independent index-only audit accepts fingerprint `fnv64:093301497a84bf3b` with 585 Hessians, 61,447 imatrices, top-64 KLDREF records for 262,016 positions, and a 1,038/1,038 duplicate-free logical/canonical ledger over 792,692,717,952 source bytes. The audit explicitly warns that the historical producer omitted `engine_build` and that 10,236 early capture points lack reduction-launch cost telemetry; neither warning is concealed or promoted to stronger evidence. |
+| 3. Second and only target-source pass | Held by operator; incomplete | The target `Qwen3.5-397B-A17B.oq4.25++.hfq` does not exist. The audited fallback set drives an authoritative 415,036,139,488-byte mixed-output estimate and 483,755,616,224-byte free-space requirement. Pass two was stopped at 180/2,924 tensors on operator request; its atomic manifest now records `quantization_interrupted`, and the 48,144,656,640-byte spill remains untouched. No restart is authorized while the hold remains active. |
+| 4. Per-layer/per-expert floor | Proven under explicit fallback | The completed K=10 teacher artifact declares all 30,720 experts and 61,440 gate-up/down capture points across 60 layers. The strict 2,048-row floor is not met by every expert: 20,736 capture points are deficient and no layer reaches the required 1.0 fraction. The frozen `preserve-undercovered` policy therefore records the exact 10,368 `(layer, expert)` pairs that pass two must retain at BF16/F16. This satisfies the definition's explicit fallback branch; it is not a claim that the corpus achieved strict coverage. |
+| 5. Frozen telemetry and quantizer refusal | Artifact and enforcement proven; completed quant join pending | The production audit accepts the complete ledger, Hessian/imatrix index, KLDREF map, per-layer routing/count reconciliation, frozen policy, deficits, and exact fallback set. The reusable two-pass workflow required that audit, persisted its fingerprint and storage admission, and the quantizer consumed the fallback list before the operator interruption. Quantizer refusal tests pass. Completed embedded quantization provenance remains absent until pass two is allowed to finish. |
 | 6. Independent batched state and chosen geometry | Proven on gfx1151 | Ragged independent-state scheduler tests and the Qwen layer-0 batch/row sweeps select batch 64, time tile 32, and 2,048 rows for this host. |
 | 7. Shared grouped-MoE substrate | Mechanism proven; serving gate pending | Scratch/routing/capture live in `hipfire-runtime`, the routed executor in `hipfire-dispatch`, and Qwen admits K=8/K=10. Production exercises raw K=10; matched grouped-versus-reference serving parity remains required after the GPU is free. |
 | 8. Second family | Proven | Gemma3-text uses the same engine/CLI, completed a 62-layer pause/resume stream, and completed a bounded calibrated second-pass join without a generic family branch. The new index-only auditor passes its 434-Hessian/434-imatrix artifact, 809/809 logical ledger, and KLDREF structure without a family branch. |
-| 9. Resident/streamed parity and quality | Tooling complete; evidence queued | `collect_artifacts --job-from <streamed.calib.hfq>` now drives Qwen3.5 and Gemma3 resident oracles from the exact serialized independent-sample job, resetting state per sample and emitting the canonical non-terminal KLD map. `hipfire-coexistence artifact compare-calibration` provides the family-neutral full-tensor gate with mandatory matched corpus/sample provenance, logical dense/compact Hessian comparison, exact KLD indices, finite-value enforcement, normalized resident/streamed per-layer router parity, and bounded mismatch reporting. Opt-in bounded `.residuals.hfq` sidecars plus `artifact compare-residuals` cover exact row provenance and tolerance-bound post-layer residuals without bloating production artifacts; the resident Qwen oracle now explicitly uses the same FP32 DeltaNet-state contract as the streamed teacher. A guarded Qwen3.5-0.8B streamed/resident `oq4.25++` parity and 32-chunk held-out quality run is queued at `~/.hipfire/experiments/calibration-parity/Qwen3.5-0.8B/`; it will not rebuild release binaries or acquire the GPU until both 397B production sessions have exited successfully. Matched Gemma runs and the expert floor/cap sweeps remain pending. |
-| 10. Precision portability | Partial; channel-ready | BF16/F16 conversion tests plus both grouped-expert and family-neutral dense/KLD raw-kernel compile coverage pass for RDNA2/3/4 and CDNA targets. Dense projections select WMMA only on capable architectures and otherwise use the scalar F16/BF16 fallback. The raw grouped channel binary no longer skips non-gfx1151 devices: it runs the portable F16/BF16 CPU-oracle comparison everywhere and emits an explicit architecture/dtype failure when the path cannot JIT or launch. Dispatch tests enumerate gfx906, gfx1030, gfx1100, gfx1200/1201, and gfx942. A refreshed gfx1151 row is queued; real execution or rejection rows from the other classes are still required. |
+| 9. Resident/streamed parity and quality | Tooling complete; execution paused | `collect_artifacts --job-from <streamed.calib.hfq>` now drives Qwen3.5 and Gemma3 resident oracles from the exact serialized independent-sample job, resetting state per sample and emitting the canonical non-terminal KLD map. `hipfire-coexistence artifact compare-calibration` provides the family-neutral full-tensor gate with mandatory matched corpus/sample provenance, logical dense/compact Hessian comparison, exact KLD indices, finite-value enforcement, normalized resident/streamed per-layer router parity, and bounded mismatch reporting. Opt-in bounded `.residuals.hfq` sidecars plus `artifact compare-residuals` cover exact row provenance and tolerance-bound post-layer residuals without bloating production artifacts; the resident Qwen oracle explicitly uses the same FP32 DeltaNet-state contract as the streamed teacher. The Qwen3.5-0.8B, Gemma, prefetch, grouped-channel, and expert-sweep launchers were paused when the production pass was held, so no queued plan is represented as measured evidence. |
+| 10. Precision portability | Partial; channel-ready | BF16/F16 conversion tests plus both grouped-expert and family-neutral dense/KLD raw-kernel compile coverage pass for RDNA2/3/4 and CDNA targets. Dense projections select WMMA only on capable architectures and otherwise use the scalar F16/BF16 fallback. The raw grouped channel binary no longer skips non-gfx1151 devices: it runs the portable F16/BF16 CPU-oracle comparison everywhere and emits an explicit architecture/dtype failure when the path cannot JIT or launch. Dispatch tests enumerate gfx906, gfx1030, gfx1100, gfx1200/1201, and gfx942. The refreshed gfx1151 row is prepared but paused; real execution or rejection rows from the other classes are still required. |
 | 11. Native workflow documentation | Proven | `MODEL-INDUCTION.md` and `QUANTIZE.md` name native calibration as default, Python as oracle/tooling only, and `oq4.25++` as the default quant. |
 
-Induction artifacts match that audit: both typed DFlash sidecars exist and the
-manifest records the DFlash stage complete; the calibration, target quant, and
-TriAttention artifacts are absent, while the induction manifest remains a
-valid partial-stage journal rather than claiming overall completion.
+Induction artifacts match that audit: both typed DFlash sidecars and the
+calibration artifact exist, and the manifest records DFlash complete. The
+target quant and TriAttention artifacts are absent. The two-pass manifest
+records `quantization_interrupted`, the induction target stage records
+`interrupted`, the GPU lock is free, and no downstream launcher remains armed.
 
 ## Definition of done
 
