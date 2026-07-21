@@ -1,4 +1,7 @@
-//! Channel test for gfx1151 raw F16/BF16 routed-MoE grouped WMMA kernels.
+//! Cross-architecture channel test for raw F16/BF16 routed-MoE grouped kernels.
+//!
+//! Every GPU runs the portable grouped kernel. gfx1151 additionally runs the
+//! grouped WMMA and compact indexed gate-up paths against the same CPU oracle.
 //!
 //! Run:
 //!   cargo run --release -p hipfire-rdna --example test_moe_grouped_wmma_f16_bf16
@@ -289,10 +292,7 @@ fn run_case(
             return false;
         }
     };
-    if gpu.arch != "gfx1151" {
-        println!("  SKIP - arch {} is not gfx1151", gpu.arch);
-        return false;
-    }
+    println!("  arch={}", gpu.arch);
 
     let mut expert_ptrs = Vec::with_capacity(experts);
     let mut expert_weights = Vec::with_capacity(experts);
@@ -334,78 +334,83 @@ fn run_case(
     let x_gpu = upload_f32(&mut gpu, &x);
     let y_gpu = alloc_f32_zeros(&mut gpu, m_total * m);
 
-    if bf16 {
-        gpu.gemm_bf16_moe_grouped_wmma_gfx1151(
-            &expert_weight_ptrs,
-            &tile_ids_gpu,
-            &sorted_gpu,
-            &x_gpu,
-            &y_gpu,
-            m,
-            k,
-            x_row_div,
-            m_total,
-            x_rows,
-        )
-        .expect("BF16 grouped launch");
-    } else {
-        gpu.gemm_f16_moe_grouped_wmma_gfx1151(
-            &expert_weight_ptrs,
-            &tile_ids_gpu,
-            &sorted_gpu,
-            &x_gpu,
-            &y_gpu,
-            m,
-            k,
-            x_row_div,
-            m_total,
-            x_rows,
-        )
-        .expect("F16 grouped launch");
-    }
-    gpu.hip.device_synchronize().expect("sync");
-    let got = download_f32(&gpu, &y_gpu, m_total * m);
-    let want = cpu_ref(
-        &expert_weights,
-        &sorted,
-        &tile_ids,
-        &x,
-        m,
-        k,
-        x_row_div,
-        m_total,
-        bf16,
-        true,
-    );
-
-    let mut max_abs = 0f32;
-    let mut max_rel = 0f32;
-    let mut argmax = 0usize;
-    for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
-        let d = (a - b).abs();
-        let r = if b.abs() > 1e-5 { d / b.abs() } else { d };
-        if d > max_abs {
-            max_abs = d;
-            argmax = i;
+    if gpu.arch == "gfx1151" {
+        if bf16 {
+            gpu.gemm_bf16_moe_grouped_wmma_gfx1151(
+                &expert_weight_ptrs,
+                &tile_ids_gpu,
+                &sorted_gpu,
+                &x_gpu,
+                &y_gpu,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                x_rows,
+            )
+            .expect("BF16 grouped launch");
+        } else {
+            gpu.gemm_f16_moe_grouped_wmma_gfx1151(
+                &expert_weight_ptrs,
+                &tile_ids_gpu,
+                &sorted_gpu,
+                &x_gpu,
+                &y_gpu,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                x_rows,
+            )
+            .expect("F16 grouped launch");
         }
-        max_rel = max_rel.max(r);
-    }
-    println!(
-        "  max_abs={:.6e} max_rel={:.6e} at {} gpu={:.6} ref={:.6}",
-        max_abs, max_rel, argmax, got[argmax], want[argmax]
-    );
-    let abs_tol = if bf16 { 6e-2 } else { 8e-3 };
-    let rel_tol = if bf16 { 8e-2 } else { 2e-2 };
-    if max_abs > abs_tol && max_rel > rel_tol {
-        eprintln!("  FAIL");
-        std::process::exit(1);
+        gpu.hip.device_synchronize().expect("WMMA sync");
+        let got = download_f32(&gpu, &y_gpu, m_total * m);
+        let want = cpu_ref(
+            &expert_weights,
+            &sorted,
+            &tile_ids,
+            &x,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            bf16,
+            true,
+        );
+
+        let mut max_abs = 0f32;
+        let mut max_rel = 0f32;
+        let mut argmax = 0usize;
+        for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+            let d = (a - b).abs();
+            let r = if b.abs() > 1e-5 { d / b.abs() } else { d };
+            if d > max_abs {
+                max_abs = d;
+                argmax = i;
+            }
+            max_rel = max_rel.max(r);
+        }
+        println!(
+            "  wmma max_abs={:.6e} max_rel={:.6e} at {} gpu={:.6} ref={:.6}",
+            max_abs, max_rel, argmax, got[argmax], want[argmax]
+        );
+        let abs_tol = if bf16 { 6e-2 } else { 8e-3 };
+        let rel_tol = if bf16 { 8e-2 } else { 2e-2 };
+        if max_abs > abs_tol && max_rel > rel_tol {
+            eprintln!("  WMMA FAIL");
+            std::process::exit(1);
+        }
+    } else {
+        println!("  WMMA SKIP - gfx1151-only fast path");
     }
 
     gpu.hip
         .memset(&y_gpu.buf, 0, m_total * m * 4)
         .expect("zero portable y");
+    let dtype = if bf16 { DType::BF16 } else { DType::F16 };
     gpu.gemm_raw_moe_grouped_portable(
-        if bf16 { DType::BF16 } else { DType::F16 },
+        dtype,
         &expert_weight_ptrs,
         &tile_ids_gpu,
         &sorted_gpu,
@@ -416,7 +421,13 @@ fn run_case(
         x_row_div,
         m_total,
     )
-    .expect("portable grouped launch");
+    .unwrap_or_else(|error| {
+        eprintln!(
+            "  portable FAIL - arch {} does not admit raw {dtype:?} grouped execution: {error:?}",
+            gpu.arch
+        );
+        std::process::exit(1);
+    });
     gpu.hip.device_synchronize().expect("portable sync");
     let portable = download_f32(&gpu, &y_gpu, m_total * m);
     let portable_ref = cpu_ref(
@@ -436,7 +447,7 @@ fn run_case(
         .zip(&portable_ref)
         .map(|(got, want)| (got - want).abs())
         .fold(0.0f32, f32::max);
-    println!("  portable max_abs={portable_max_abs:.6e}");
+    println!("  portable {dtype:?} max_abs={portable_max_abs:.6e}");
     if portable_max_abs > 2e-4 {
         eprintln!("  portable FAIL");
         std::process::exit(1);
@@ -561,8 +572,8 @@ fn main() {
         ran += run_indexed_gate_up_case("compact", bf16) as usize;
     }
     if ran == 0 {
-        println!("\nNo F16/BF16 grouped MoE cases ran on this host.");
+        println!("\nNo portable F16/BF16 grouped MoE cases ran on this host.");
     } else {
-        println!("\nAll executed F16/BF16 grouped MoE cases PASS.");
+        println!("\nAll executed portable F16/BF16 grouped MoE cases PASS.");
     }
 }

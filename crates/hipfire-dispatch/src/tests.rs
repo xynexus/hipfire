@@ -1453,16 +1453,18 @@ fn moe_prefill_resolution_raw_f16_bf16_use_fast_or_portable_grouped_path() {
             "{dtype:?} has no indexed fallback and must retain grouped execution"
         );
 
-        let unsupported = crate::context::DispatchCtx::for_test("gfx1100");
-        let resolution = MoePrefillResolution::resolve(
-            &moe_dtypes_raw(dtype),
-            &unsupported.arch,
-            &unsupported.flags,
-        );
-        assert!(
-            resolution.use_path2,
-            "raw experts require the portable grouped fallback off gfx1151"
-        );
+        for arch in ["gfx906", "gfx1030", "gfx1100", "gfx1200", "gfx942"] {
+            let portable = crate::context::DispatchCtx::for_test(arch);
+            let resolution = MoePrefillResolution::resolve(
+                &moe_dtypes_raw(dtype),
+                &portable.arch,
+                &portable.flags,
+            );
+            assert!(
+                resolution.use_path2,
+                "raw {dtype:?} experts require the portable grouped fallback on {arch}"
+            );
+        }
     }
 }
 

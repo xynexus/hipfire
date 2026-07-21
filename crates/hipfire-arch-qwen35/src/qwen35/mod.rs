@@ -5663,7 +5663,7 @@ mod tests {
                 "{dtype:?} routed MoE should force Path 2 even when env disables grouped GEMM"
             );
 
-            for arch in ["gfx1100", "gfx1201", "gfx942"] {
+            for arch in ["gfx906", "gfx1030", "gfx1100", "gfx1201", "gfx942"] {
                 assert!(
                     moe_ffn_batched_admissible_for_dtypes(&dtypes, false, arch),
                     "{dtype:?} routed MoE prefill should use the portable grouped fallback on {arch}"
