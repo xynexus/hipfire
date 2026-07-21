@@ -12,4 +12,5 @@ benchmarks that are not formal test gates.
 - Keep artifact names aligned with the root canonical naming convention. Update
   old spellings found in scripts as part of the fix.
 - Prefer small, composable shell wrappers around existing Rust binaries. Do not
-  put Python in runtime or inference execution paths.
+  put Python in production tooling; Python scripts here should be experiments,
+  benchmarks, diagnostics, or comparison baselines/oracles.

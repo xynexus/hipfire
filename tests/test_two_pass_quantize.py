@@ -186,7 +186,7 @@ def test_build_commands_use_one_layer_streamed_teacher_pass_then_quantize(tmp_pa
     )
 
     assert collect_cmd[:2] == ["target/release/hipfire-coexistence", "calibrate"]
-    assert "scripts/collect_hessian.py" not in collect_cmd
+    assert "scripts/depreciated/collect_hessian.py" not in collect_cmd
     assert "--kldref" in collect_cmd
     assert "--resume" in collect_cmd
     assert collect_cmd[collect_cmd.index("--expert-coverage-policy") + 1] == "preserve-undercovered"

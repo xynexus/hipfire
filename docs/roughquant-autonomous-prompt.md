@@ -28,8 +28,9 @@ OPERATING PRINCIPLES (from CLAUDE.md / AGENTS.md — non-negotiable):
   same offset/ctx/warmup; record the exact invocation. For any token-gen perf
   claim, byte-identical prompts (benchmarks/prompts/*.txt) + recorded md5,
   fresh process, warm the cache first. Treat any Δ≥5% as real signal.
-- No Python in the inference hot path. Python is fine for OFFLINE tooling
-  (Hessian collection, sim glue, analysis); the eventual engine path is Rust-only.
+- No Python in production tooling. Production commands and shipped workflows are
+  Rust/native; Python is fine for experiments, benchmarks, diagnostics, and
+  comparison baselines/oracles.
 - Portability: every design choice must answer "does this hold on RDNA1→RDNA4?"
 
 FIXTURES — you may (and should) generate what you need; don't be blocked on
@@ -49,7 +50,7 @@ missing inputs:
   `target/release/hipfire-coexistence calibrate --model <hf-dir> --corpus <corpus.txt> --output <name>.calib.hfq --sequences 128 --context 2048 --kldref --kldref-topk 64`.
   The canonical HFQM package contains Hessians, imatrices, provenance, and the
   matched KLDREF in one layer-streamed source pass. Use
-  `scripts/collect_hessian.py` only as an explicit parity/debug oracle, never as
+  `scripts/depreciated/collect_hessian.py` only as an explicit parity/debug oracle, never as
   the production forward or a producer for a new legacy sidecar.
 - Generating an .hfq to run PPL: hipfire-quantize --input <model_dir> --output
   <out.hfq> [--format mq4]. Use the existing formats as the 4-bit-uniform and

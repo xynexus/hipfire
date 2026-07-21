@@ -30,7 +30,7 @@ ignore = [
 ]
 
 [tool.pytest.ini_options]
-norecursedirs = ["third_party"]
+norecursedirs = ["third_party", "depreciated"]
 testpaths = ["tests"]
 
 [tool.mypy]

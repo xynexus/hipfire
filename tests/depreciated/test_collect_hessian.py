@@ -5,10 +5,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 
-SCRIPT = Path(__file__).parents[1] / "scripts" / "collect_hessian.py"
+SCRIPT = Path(__file__).parents[2] / "scripts" / "depreciated" / "collect_hessian.py"
 SPEC = importlib.util.spec_from_file_location("collect_hessian", SCRIPT)
 assert SPEC and SPEC.loader
 collect = importlib.util.module_from_spec(SPEC)
@@ -279,7 +280,8 @@ def test_layer_parameter_plan_keeps_shared_tensors_and_natural_layer_order():
 
 def test_layer_stream_executes_tiny_qwen35_checkpoint_with_one_read_per_tensor(tmp_path):
     from safetensors.torch import save_file
-    from transformers import AutoModelForCausalLM
+    transformers = pytest.importorskip("transformers")
+    AutoModelForCausalLM = transformers.AutoModelForCausalLM
     from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
 
     config = Qwen3_5MoeTextConfig(

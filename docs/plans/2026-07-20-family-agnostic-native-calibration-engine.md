@@ -1318,7 +1318,7 @@ Gate:
 Work:
 
 - make the induction workflow call `hipfire-coexistence calibrate` for pass 1;
-- keep `scripts/collect_hessian.py` only as an explicit parity/debug oracle;
+- keep `scripts/depreciated/collect_hessian.py` only as an explicit parity/debug oracle;
 - make the two-pass manifest consume the native read ledger and artifact
   fingerprints;
 - update `docs/MODEL-INDUCTION.md`, `docs/QUANTIZE.md`, and collector status when

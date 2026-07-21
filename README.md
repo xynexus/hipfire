@@ -1,7 +1,7 @@
 # hipfire
 
 A Rust-native inference engine for AMD GPUs, NPUs, and APUs. Single binary,
-HIP/ROCm-direct, no Python in the hot path.
+HIP/ROCm-direct, with production tooling kept out of Python.
 
 hipfire runs a **daemon** that serves concurrent, prioritized batching of
 multi-modal inference, embedding + rerank, and image generation — with
@@ -328,7 +328,7 @@ works across ANY RDNA generation (RDNA1→RDNA4), not just this card.
 This project combines three efforts into one pipeline:
 1. **autorocm** — Map and unlock ROCm on consumer RDNA hardware
 2. **autokernel** — Optimize HIP/compute kernels for the specific hardware
-3. **hipfire** — Rust-native inference engine (no Python in the hot path)
+3. **hipfire** — Rust-native inference engine and production tooling
 
 ## Reference projects for hardware/runtime exploration
 
@@ -495,7 +495,7 @@ Performance doesn't matter yet — correctness first.
 
 ## Project rules
 
-1. **No Python in the inference hot path.** Python is allowed for tooling, benchmarks, comparison baselines. Never in the actual engine.
+1. **No Python in production tooling.** Production commands and shipped workflows should be Rust/native. Python is allowed for experiments, benchmarks, diagnostics, and comparison baselines/oracles.
 2. **Commit meaningful experiment states when asked to commit or when running an explicit experiment series.** Every approach tested should have structured results. Failed approaches are valuable when they narrow the search space.
 3. **Document failures explicitly.** "Approach B failed because HSA_RUNTIME returns error code 0x1013 when initializing on gfx1010 without override" is more valuable than "it didn't work."
 4. **Portability matters.** Every decision should consider: will this work on RDNA2? RDNA3? RDNA4? If it's 5700XT-only it's a hack, not a solution.

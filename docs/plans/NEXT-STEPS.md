@@ -492,7 +492,7 @@ Papers + reference implementations vendored for Phases C/D:
     - **Hessians (superseded 2026-07-21):** use
       `hipfire-coexistence calibrate` to write the canonical `.calib.hfq` with
       Hessians, imatrices, provenance, and optional matched KLDREF in one native
-      layer-streamed pass. `scripts/collect_hessian.py` is now only a parity
+      layer-streamed pass. `scripts/depreciated/collect_hessian.py` is now only a parity
       oracle; do not create new HFHS sidecars.
     - **CORRECTION (2026-06-16): `gptq.rs` + `hessian_io.rs` are ORPHANED** —
       never declared as modules (no `mod gptq;`), and `gptq.rs` uses `faer`

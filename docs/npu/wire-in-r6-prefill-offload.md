@@ -23,8 +23,8 @@ route to the NPU instead of (or concurrently with) the GPU iu4 kernel.
    (MT/NT/KCHUNK compiled). Extend the `r6_gen.py` + `r6_build.sh` flow into a small
    offline tool: given a model's distinct `(K, N)` linear shapes, emit + cache R6
    xclbins (`~/.hipfire/npu/<shape>.xclbin`). Python/aiecc stays offline — the
-   inference binary only *loads* cached bytes (AGENTS.md: no Python in the hot path;
-   compat/build tooling lives outside the daemon).
+   inference binary only *loads* cached bytes (AGENTS.md: no Python in production
+   tooling; compat/build tooling lives outside the daemon).
 
 2. **`NpuGemm` primitive (`hipfire-xdna`, isolated + tested).** A general
    `npu_gemm(M, K, N, a_i8, w_oq4, c_i32)` that: tiles M/N/K into R6's

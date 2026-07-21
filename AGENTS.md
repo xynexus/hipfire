@@ -9,9 +9,9 @@ the relevant docs under `docs/`.
 
 ## Core Invariants
 
-- hipfire is Rust + HIP/ROCm-direct inference. Do not put Python in the
-  inference hot path; Python is allowed for tooling, benchmarks, and comparison
-  baselines.
+- hipfire is Rust + HIP/ROCm-direct inference and production tooling. Do not
+  put Python in production tooling; Python is allowed for experiments,
+  benchmarks, diagnostics, and comparison baselines/oracles.
 - Do not add Vulkan, wgpu, or a cross-vendor compute backend. The backend is
   HIP/ROCm-direct.
 - Treat portability as a design constraint. When touching runtime, dispatch,

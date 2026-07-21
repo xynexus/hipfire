@@ -2393,6 +2393,8 @@ class AstreaTests(unittest.TestCase):
         self.assertTrue(result["layers"][0]["groups"][0]["value_refinement"]["attempted"])
 
     def test_latent_qwen35_forward_identity_preserves_gate_and_wo(self):
+        if importlib.util.find_spec("transformers") is None:
+            self.skipTest("transformers not installed")
         astrea = load_astrea()
         latent = astrea.load_latent_kv_module()
         latent._disable_broken_torchvision_for_text_only_transformers()

@@ -29,7 +29,7 @@ reference offload, layers page from the original safetensor shards rather than
 creating a second disk-offload copy of very large checkpoints.
 
 Usage:
-    .venv/bin/python3 scripts/collect_hessian.py \\
+    .venv/bin/python3 scripts/depreciated/collect_hessian.py \\
         --model    <hf-model-id-or-path> \\
         --output   <Model-Size.calib.hfq> \\
         [--n-sequences 128] \\
@@ -40,7 +40,7 @@ Usage:
 
 Examples:
     # Qwen3.5-9B, 128 sequences × 2048 ctx from wikitext-2 train
-    .venv/bin/python3 scripts/collect_hessian.py \\
+    .venv/bin/python3 scripts/depreciated/collect_hessian.py \\
         --model /data/cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202.../ \\
         --output ~/.hipfire/calib/Qwen3.5-9B.calib.hfq
 """
@@ -61,8 +61,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def _mask_broken_torchvision_for_text_only_calibration() -> None:
@@ -841,7 +839,7 @@ def load_safetensors_model(
     from accelerate import dispatch_model, infer_auto_device_map, init_empty_weights
     from accelerate.utils import set_module_tensor_to_device
     from safetensors import safe_open  # type: ignore[import-not-found]
-    from transformers import AutoConfig
+    from transformers import AutoConfig, AutoModelForCausalLM
 
     root_config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
     config = _text_causal_config(root_config)
@@ -951,6 +949,13 @@ def load_calibration_text(corpus: str, n_sequences: int, ctx_len: int, tokenizer
                 if all_tokens.shape[0] >= needed_tokens:
                     break
     else:
+        try:
+            from datasets import load_dataset
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "collect_hessian HF dataset corpora require the optional `datasets` package; "
+                "install it or pass a local text corpus path"
+            ) from exc
         # HF datasets path. Default: wikitext-2-raw-v1 train split.
         if "/" in corpus or corpus == "wikitext":
             ds_name = corpus if "/" in corpus else "wikitext"
@@ -1010,7 +1015,7 @@ def collect_layer_streamed(
     `microbatches × checkpoint-size` paging behavior into one checkpoint sweep.
     """
     from accelerate import init_empty_weights
-    from transformers import AutoConfig
+    from transformers import AutoConfig, AutoModelForCausalLM
     from transformers.masking_utils import create_causal_mask
 
     if not seqs:
@@ -1180,7 +1185,7 @@ def collect_layer_streamed(
             metadata = {
                 "source_format": "safetensors",
                 "source_model": str(model_path),
-                "collector": "scripts/collect_hessian.py",
+                "collector": "scripts/depreciated/collect_hessian.py",
                 "collector_mode": "layer_stream",
                 "calibration_tokens": n_sequences * ctx_len,
                 "safetensors_teacher_reads": len(loader.loaded),
@@ -1298,6 +1303,8 @@ def main():
     print(f"\n[1/4] Loading tokenizer{' + model' if not args.layer_stream else ''}...")
     t0 = time.time()
     _mask_broken_torchvision_for_text_only_calibration()
+    from transformers import AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
     if args.layer_stream:
         seqs = load_calibration_text(args.corpus, args.n_sequences, args.ctx_len, tokenizer)
@@ -1438,7 +1445,7 @@ def main():
     metadata = {
         "source_format": "safetensors",
         "source_model": str(model_path),
-        "collector": "scripts/collect_hessian.py",
+        "collector": "scripts/depreciated/collect_hessian.py",
         "calibration_tokens": args.n_sequences * args.ctx_len,
     }
     if router_hist.routed_tokens:

@@ -240,7 +240,7 @@ current models, gated on redundancy (`head_dim × n_heads`) via
 The QTIP LDLQ path (Phase C1e) needs per-layer input Hessians. The native
 `crates/hipfire-runtime/src/bin/collect_hessian.rs` is currently a SCAFFOLD
 that panics ("not implemented"); we fall back to the Tier-2 Python collector
-`scripts/collect_hessian.py` (HF transformers + ROCm/CPU torch). The Python
+`scripts/depreciated/collect_hessian.py` (HF transformers + ROCm/CPU torch). The Python
 path WORKS (validated 2026-06-16: 0.8B → 2.21 GB HFHS file, read by
 `hessian_io.rs`), so the HFHS-v1 format + approach are proven.
 
@@ -251,13 +251,13 @@ get GPU speed and drop the torch dependency:
   H += xᵀx over calibration tokens per GPTQ-target linear).
 - `ActivationCapture` wiring at the GPTQ-target dispatch sites in the
   qwen35/generic forward (capture each linear's input activations).
-- HFHS-v1 binary writer matching `scripts/collect_hessian.py` (so
+- HFHS-v1 binary writer matching `scripts/depreciated/collect_hessian.py` (so
   `hessian_io.rs` reads it unchanged).
 
 Benefit: CPU torch is slow (0.8B calibration is minutes; bigger models
 hours); the GPU forward + on-GPU accumulation would be far faster, and it
 removes the Python/torch tooling dependency from the quant pipeline.
-Reference: the validated Tier-2 `scripts/collect_hessian.py` + the existing
+Reference: the validated Tier-2 `scripts/depreciated/collect_hessian.py` + the existing
 scaffold's documented deliverables.
 
 ## MQ4++ Hessian/LDLQ producer track
@@ -457,10 +457,11 @@ Design:
   shape-formula)]"). Modest refactor, but healthy — the same table a fixture
   emitter wants is also what a manifest-validator and per-arch docs want, and
   it's a forcing function to document tensor layout when adding an arch.
-- **Generalizes:** the dense (arch 5) + MoE (arch 6) goldens are just the first
-  two consumers; deepseek4 / minimax / lfm2moe / dots-ocr each get a tiny
-  gating fixture from the same mechanism as support lands. <10M is trivial
-  (hidden ~256, 2–4 layers, 8 experts top-2, small `moe_intermediate`).
+- **Generalizes:** the dense (arch 5) + MoE (arch 6) goldens were just the first
+  two consumers; DeepSeek4 text-core coverage now uses the same mechanism, and
+  dots-ocr / other remaining variants can get tiny gating fixtures as support
+  lands. <10M is practical with family-specific invariants preserved (for
+  example DeepSeek4 keeps `n_heads * head_dim >= hc_mult * hidden`).
 
 Wire the golden runner into `no-gpu-ci.sh` (CPU reference) + a GPU dispatch
 channel-test. Build order: dense arch-5 first (isolates the shared DeltaNet
@@ -470,16 +471,20 @@ LA+FA hybrid manifest, deterministic golden), then MoE arch-6 is additive
 ### TODO: extend tiny-golden coverage to the other model families
 
 **Status:** P1–P3 of `docs/plans/2026-06-20-tiny-golden-tripwire.md` shipped —
-the two-tier gate is live, but it only covers **qwen3.5/3.6 dense (arch 5) +
-MoE (arch 6)**. We now ship many more families; each is a forward-pass path the
-tripwire is blind to, so a regression there falls back on the qualitative 35B
-battery (or nothing, if the heavy gate is skipped on a tiny-pass).
+the two-tier gate is live and has grown beyond qwen3.5. It now covers the dense
+families listed below, but some harder families/variants still fall back on the
+large qualitative batteries.
 
-**Families with no tiny fixture yet** (`crates/hipfire-arch-*`, excl. the
-synthetic `toy`): `llama`, `qwen2`, `gemma3`, `gemma3-vl`, `deepseek4`,
-`minimax`, `lfm2moe`, `qwen35-vl`, `dots-ocr`. The VL ones (`gemma3-vl`,
-`qwen35-vl`, `dots-ocr`) also need a tiny image-feature stub to exercise the
-vision/projector path, or a text-only mode.
+**Families / variants with no tiny forward/KLD fixture yet**
+(`crates/hipfire-arch-*`, excl. the synthetic `toy`): no remaining model
+family/variant gap is known in the current tiny-gate scope. dots.ocr now has
+synthetic RGB preprocessing + `vision_forward` + image-token splice coverage;
+its remaining higher-level gap is full decoded-image + prompt-template e2e
+coverage.
+Tiny forward/KLD coverage now covers `llama`, `qwen2`, `deepseek4` text core,
+`deepseek4_compressed`, `deepseek4_mtp`, `gemma3`, `gemma3_vl` image-path,
+`dots_ocr` image-path, `gemma4_dense`, `gemma4_ple`, `gemma4_moe`, `minimax`,
+`lfm2_moe`, `mamba2`, `qwen3_5`, `qwen3_5_vl`, and `qwen3_5_moe`.
 
 **Each family needs two pieces** (today both hard-code qwen35):
 1. **`emit_fixture` preset** (`hipfire-quantize/src/fixture.rs`) — the `match
@@ -493,9 +498,12 @@ vision/projector path, or a text-only mode.
 
 Then add the family to `ARCHS` in `tests/fixture-golden-gate.sh` and `--record`
 its baselines (×format axis × gpu-arch fleet — see P4). Order by blast radius:
-`llama`/`qwen2` (simplest dense, shared kernels) → `gemma3` → `deepseek4`/
-`minimax`/`lfm2moe` (MoE/hybrid, reuse the arch-6 combine-pin pattern) → the VL
-trio last (need the image stub).
+`llama`/`qwen2` (simplest dense, shared kernels) → `gemma3` →
+`deepseek4`/`minimax`/`lfm2moe` (MoE/hybrid, reuse the arch-6 combine-pin
+pattern) → the VL trio last (need the image stub). (`deepseek4` text core,
+`deepseek4_compressed`, `minimax`, and `lfm2moe` are now covered on gfx1103;
+minimax still needs the gfx1151 topk fault resolved before it can cover that
+GPU.)
 
 ## Deterministic MoE-down reduction (reconsider the atomicAdd default)
 

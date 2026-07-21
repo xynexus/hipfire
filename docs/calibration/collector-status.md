@@ -10,7 +10,7 @@ matched quality/admission evidence remain pending.
 `<model>.calib.hfq` contract directly from Hugging Face BF16 or F16
 safetensors. The Rust engine owns sampling, source planning, layer execution,
 capture reduction, KLDREF, read accounting, and crash-safe resume;
-`scripts/collect_hessian.py` is retained only as a parity/debug oracle.
+`scripts/depreciated/collect_hessian.py` is retained only as a parity/debug oracle.
 
 Large checkpoints can use original-shard reference offload. Disk-owned layers
 are loaded from the existing safetensors files on demand instead of first

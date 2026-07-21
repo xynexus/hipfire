@@ -2,7 +2,7 @@
 
 hipfire is a Rust + HIP/ROCm-direct inference (and increasingly training) engine
 for AMD RDNA/CDNA GPUs (RDNA1→RDNA4, consumer/pro/APU + MI-series), shipped as a
-single binary with no Python in the hot path. This page inventories engine,
+single binary with production tooling kept out of Python. This page inventories engine,
 training, serving, and platform features as verified against `crates/`,
 `kernels/`, and `docs/` on the `chaingun` branch.
 

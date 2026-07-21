@@ -358,7 +358,7 @@ the original read-only bytes.
 
 This is one BF16 source-checkpoint pass. `hipfire-quantize` is the second
 source-checkpoint pass. Later KLD/PPL evaluation reads the quantized HFQ, not
-the BF16 safetensors. `scripts/collect_hessian.py` remains an explicit
+the BF16 safetensors. `scripts/depreciated/collect_hessian.py` remains an explicit
 parity/debug oracle; it is not the production model-forward path.
 
 KLDREF is the teacher signal for comparing quant candidates; it is not an
