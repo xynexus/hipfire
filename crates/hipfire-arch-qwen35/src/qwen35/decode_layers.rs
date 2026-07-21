@@ -72,25 +72,18 @@ pub(crate) fn forward_scratch_layers(
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
-                // ── DeltaNet QKVZA via pipeline ──
-                qkvza_via_execute_steps(
+                // The hand path owns this stage. Prepare the shared normalized
+                // input once; the lowered bridge is a complete alternative,
+                // not a prelude to the manual projections below.
+                let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu,
-                    &ctx,
                     &layer.wqkv,
-                    &layer.wz,
-                    &layer.w_beta,
-                    &layer.w_alpha,
-                    &layer.attn_norm,
                     &s.x,
+                    &layer.attn_norm,
                     &s.tmp,
                     &s.x_rot,
-                    &s.dn_qkv,
-                    &s.dn_z,
-                    &s.dn_beta,
-                    &s.dn_alpha,
                     config.norm_eps,
                 )?;
-                let x_rot: Option<&GpuTensor> = Some(&s.x_rot);
                 // Lever 1 — Fused rmsnorm + PARO per-group rotation for wqkv.
                 let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
                     && layer.wqkv.gpu_dtype == DType::ParoQ4G128
@@ -617,20 +610,6 @@ pub(crate) fn forward_scratch_layers(
                     config.linear_value_head_dim,
                     config.norm_eps,
                 )?;
-                {
-                    let wr = layer.wo.dispatch_ref();
-                    execute_steps(
-                        gpu,
-                        &ctx,
-                        &[Step::GemvResidual {
-                            w: &wr,
-                            input: GemvInput::Raw(&s.dn_normed),
-                            residual: &s.x,
-                            out: &s.x,
-                        }],
-                    )
-                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-                }
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let v_row_bytes = tape.v_dim * 4;
                     gpu.memcpy_dtod_at_auto(
@@ -648,19 +627,6 @@ pub(crate) fn forward_scratch_layers(
                 // contamination that the residual-difference targets had).
                 dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "premlp");
                 // ── FFN ──
-                gate_up_via_execute_steps(
-                    gpu,
-                    &ctx,
-                    &layer.w_gate,
-                    &layer.w_up,
-                    &layer.ffn_norm,
-                    &s.x,
-                    &s.tmp,
-                    &s.x_rot,
-                    &s.gate_ffn,
-                    &s.up,
-                    config.norm_eps,
-                )?;
                 if layer_idx == 0 {
                     trace_finite_if_enabled(gpu, "layer 0 LA gated norm", &s.dn_normed)?;
                 }
@@ -726,14 +692,6 @@ pub(crate) fn forward_scratch_layers(
                     )?;
                 }
 
-                hipfire_runtime::weights::weight_gemv_swiglu_residual(
-                    gpu,
-                    &layer.w_down,
-                    &s.gate_ffn,
-                    &s.up,
-                    &s.ffn_hidden,
-                    &s.x,
-                )?;
                 // Lever 1 — Fused rmsnorm + PARO per-group rotation for w_gate.
                 let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
                     && layer.w_gate.gpu_dtype == DType::ParoQ4G128
@@ -1286,84 +1244,25 @@ pub(crate) fn forward_scratch_layers(
                     config.head_dim,
                     config.norm_eps,
                 )?;
-                qkv_via_execute_steps(
-                    gpu,
-                    &ctx,
-                    &layer.wq,
-                    &layer.wk,
-                    &layer.wv,
-                    &layer.attn_norm,
-                    &s.x,
-                    &s.tmp,
-                    &s.x_rot,
-                    &s.fa_q_full,
-                    &s.fa_k,
-                    &s.fa_v,
-                    config.norm_eps,
-                )?;
-
-                gpu.deinterleave_f32(
-                    &s.fa_q_full,
-                    &s.fa_q,
-                    &s.fa_gate,
-                    config.n_heads,
-                    config.head_dim,
-                )?;
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-                let npu_hnr_ok = if hipfire_runtime::triattn::tap_enabled() {
-                    false
-                } else {
-                    try_npu_headnorm_rope(
-                        gpu,
-                        layer_idx,
-                        &s.fa_q,
-                        &s.fa_k,
-                        &layer.q_norm,
-                        &layer.k_norm,
-                        config.n_heads,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        n_rot,
-                        config.rope_theta,
-                        pos,
-                    )?
-                };
-                if !npu_hnr_ok {
-                    gpu.rmsnorm_batched(
-                        &s.fa_q,
-                        &layer.q_norm,
-                        &s.fa_q,
-                        config.n_heads,
-                        config.head_dim,
-                        config.norm_eps,
-                    )?;
-                    gpu.rmsnorm_batched(
-                        &s.fa_k,
-                        &layer.k_norm,
-                        &s.fa_k,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        config.norm_eps,
-                    )?;
-                    if hipfire_runtime::triattn::tap_enabled() {
-                        triattn_tap(gpu, layer_idx, s, config)?;
-                    }
-                    if kv_cache.compact_offset > 0 {
-                        let abs = (pos + kv_cache.compact_offset) as i32;
-                        gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
-                    }
-                    gpu.rope_partial_interleaved_f32(
-                        &s.fa_q,
-                        &s.fa_k,
-                        &s.pos_buf,
-                        config.n_heads,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        n_rot,
-                        n_rot,
-                        config.rope_theta,
-                    )?;
+                if hipfire_runtime::triattn::tap_enabled() {
+                    triattn_tap(gpu, layer_idx, s, config)?;
                 }
+                if kv_cache.compact_offset > 0 {
+                    let abs = (pos + kv_cache.compact_offset) as i32;
+                    gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
+                }
+                gpu.rope_partial_interleaved_f32(
+                    &s.fa_q,
+                    &s.fa_k,
+                    &s.pos_buf,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n_rot,
+                    n_rot,
+                    config.rope_theta,
+                )?;
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     if delta_layer_idx < tape.fa_bridge_valid.len()
                         && tape.fa_bridge_valid[delta_layer_idx]
@@ -1904,47 +1803,6 @@ pub(crate) fn forward_scratch_layers(
                     drop(inp); // enqueue this layer's RAII scratch, then drain.
                     gpu.reclaim_pending();
                 }
-                kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
-
-                gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
-                {
-                    let wr = layer.wo.dispatch_ref();
-                    execute_steps(
-                        gpu,
-                        &ctx,
-                        &[Step::GemvResidual {
-                            w: &wr,
-                            input: GemvInput::Raw(&s.fa_attn_out),
-                            residual: &s.x,
-                            out: &s.x,
-                        }],
-                    )
-                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-                }
-
-                // ── FFN ──
-                gate_up_via_execute_steps(
-                    gpu,
-                    &ctx,
-                    &layer.w_gate,
-                    &layer.w_up,
-                    &layer.ffn_norm,
-                    &s.x,
-                    &s.tmp,
-                    &s.x_rot,
-                    &s.gate_ffn,
-                    &s.up,
-                    config.norm_eps,
-                )?;
-
-                hipfire_runtime::weights::weight_gemv_swiglu_residual(
-                    gpu,
-                    &layer.w_down,
-                    &s.gate_ffn,
-                    &s.up,
-                    &s.ffn_hidden,
-                    &s.x,
-                )?;
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     if delta_layer_idx < tape.fa_bridge_valid.len()
                         && tape.fa_bridge_valid[delta_layer_idx]
@@ -1975,25 +1833,15 @@ pub(crate) fn forward_scratch_layers(
             }
 
             (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
-                // ── DeltaNetMoe QKVZA via pipeline ──
-                qkvza_via_execute_steps(
+                let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu,
-                    &ctx,
                     &layer.wqkv,
-                    &layer.wz,
-                    &layer.w_beta,
-                    &layer.w_alpha,
-                    &layer.attn_norm,
                     &s.x,
+                    &layer.attn_norm,
                     &s.tmp,
                     &s.x_rot,
-                    &s.dn_qkv,
-                    &s.dn_z,
-                    &s.dn_beta,
-                    &s.dn_alpha,
                     config.norm_eps,
                 )?;
-                let x_rot: Option<&GpuTensor> = Some(&s.x_rot);
                 // Lever 1 — Fused rmsnorm + PARO per-group rotation for wqkv.
                 let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
                     && layer.wqkv.gpu_dtype == DType::ParoQ4G128
@@ -2538,21 +2386,6 @@ pub(crate) fn forward_scratch_layers(
                     config.head_dim,
                     config.norm_eps,
                 )?;
-                qkv_via_execute_steps(
-                    gpu,
-                    &ctx,
-                    &layer.wq,
-                    &layer.wk,
-                    &layer.wv,
-                    &layer.attn_norm,
-                    &s.x,
-                    &s.tmp,
-                    &s.x_rot,
-                    &s.fa_q_full,
-                    &s.fa_k,
-                    &s.fa_v,
-                    config.norm_eps,
-                )?;
                 trace_stage_sync_if_enabled(
                     gpu,
                     &format!("layer {layer_idx} FullAttnMoe q norm done"),
@@ -2571,68 +2404,25 @@ pub(crate) fn forward_scratch_layers(
                     gpu,
                     &format!("layer {layer_idx} FullAttnMoe k norm done"),
                 )?;
-                gpu.deinterleave_f32(
-                    &s.fa_q_full,
-                    &s.fa_q,
-                    &s.fa_gate,
-                    config.n_heads,
-                    config.head_dim,
-                )?;
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-                let npu_hnr_ok = if hipfire_runtime::triattn::tap_enabled() {
-                    false
-                } else {
-                    try_npu_headnorm_rope(
-                        gpu,
-                        layer_idx,
-                        &s.fa_q,
-                        &s.fa_k,
-                        &layer.q_norm,
-                        &layer.k_norm,
-                        config.n_heads,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        n_rot,
-                        config.rope_theta,
-                        pos,
-                    )?
-                };
-                if !npu_hnr_ok {
-                    gpu.rmsnorm_batched(
-                        &s.fa_q,
-                        &layer.q_norm,
-                        &s.fa_q,
-                        config.n_heads,
-                        config.head_dim,
-                        config.norm_eps,
-                    )?;
-                    gpu.rmsnorm_batched(
-                        &s.fa_k,
-                        &layer.k_norm,
-                        &s.fa_k,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        config.norm_eps,
-                    )?;
-                    if hipfire_runtime::triattn::tap_enabled() {
-                        triattn_tap(gpu, layer_idx, s, config)?;
-                    }
-                    if kv_cache.compact_offset > 0 {
-                        let abs = (pos + kv_cache.compact_offset) as i32;
-                        gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
-                    }
-                    gpu.rope_partial_interleaved_f32(
-                        &s.fa_q,
-                        &s.fa_k,
-                        &s.pos_buf,
-                        config.n_heads,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        n_rot,
-                        n_rot,
-                        config.rope_theta,
-                    )?;
+                if hipfire_runtime::triattn::tap_enabled() {
+                    triattn_tap(gpu, layer_idx, s, config)?;
                 }
+                if kv_cache.compact_offset > 0 {
+                    let abs = (pos + kv_cache.compact_offset) as i32;
+                    gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
+                }
+                gpu.rope_partial_interleaved_f32(
+                    &s.fa_q,
+                    &s.fa_k,
+                    &s.pos_buf,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n_rot,
+                    n_rot,
+                    config.rope_theta,
+                )?;
                 trace_stage_sync_if_enabled(
                     gpu,
                     &format!("layer {layer_idx} FullAttnMoe rope done"),

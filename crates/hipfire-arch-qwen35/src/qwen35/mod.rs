@@ -3677,6 +3677,33 @@ mod tests {
     }
 
     #[test]
+    fn hand_decode_does_not_reenter_lowered_stage_bridges() {
+        let source = include_str!("decode_layers.rs");
+        let hand_layers = source
+            .split_once("// Final norm into scratch.tmp")
+            .expect("hand decode final-norm boundary")
+            .0;
+
+        for bridge in [
+            "qkvza_via_execute_steps(",
+            "qkv_via_execute_steps(",
+            "gate_up_via_execute_steps(",
+            "kv_cache_attention_dispatch(",
+        ] {
+            assert!(
+                !hand_layers.contains(bridge),
+                "hand decode must not execute lowered bridge {bridge} in addition to its manual stage"
+            );
+        }
+
+        assert_eq!(
+            hand_layers.matches("Step::GemvResidual {").count(),
+            1,
+            "only the DeltaNet-MoE output projection uses direct dispatch in the hand path"
+        );
+    }
+
+    #[test]
     fn f16_lm_head_mode_defaults_to_native() {
         assert_eq!(parse_f16_lm_head_mode(None), F16LmHeadMode::Native);
         assert_eq!(parse_f16_lm_head_mode(Some("auto")), F16LmHeadMode::Native);
