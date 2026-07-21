@@ -548,6 +548,7 @@ def update_manifest(
     storage_preflight: dict | None = None,
     quantized: dict | None = None,
     calibration_execution: dict | None = None,
+    phase_timings: dict | None = None,
 ) -> dict:
     previous = {}
     if path.is_file():
@@ -589,6 +590,13 @@ def update_manifest(
         )
     elif "calibration_execution" in previous:
         manifest["calibration_execution"] = previous["calibration_execution"]
+    if phase_timings is not None:
+        manifest["phase_timings"] = {
+            **previous.get("phase_timings", {}),
+            **phase_timings,
+        }
+    elif "phase_timings" in previous:
+        manifest["phase_timings"] = previous["phase_timings"]
 
     calibration_value = calibration or manifest.get("calibration")
     quantized_value = quantized or manifest.get("quantized")
@@ -1122,6 +1130,7 @@ def main() -> None:
         total_layers = model_plan.get("layers")
         if not isinstance(total_layers, int) or total_layers < 1:
             raise RuntimeError(f"native calibration plan has invalid model.layers: {total_layers!r}")
+        calibration_started = time.monotonic()
         calibration_execution = run_calibration_pass(
             collect_exec,
             calib=args.calib,
@@ -1134,11 +1143,21 @@ def main() -> None:
                 calibration_execution=execution,
             ),
         )
+        calibration_attempt_seconds = round(time.monotonic() - calibration_started, 6)
+        prior_calibration_seconds = previous.get("phase_timings", {}).get(
+            "calibration_seconds", 0.0
+        )
         update_manifest(
             manifest_path,
             recipe=recipe,
             phase="calibration_validating",
             calibration_execution=calibration_execution,
+            phase_timings={
+                "calibration_seconds": round(
+                    float(prior_calibration_seconds) + calibration_attempt_seconds, 6
+                ),
+                "last_calibration_attempt_seconds": calibration_attempt_seconds,
+            },
         )
     calibration = inspect_artifact(args.coexistence, args.calib)
     validate_calibration_inspection(calibration)
@@ -1180,7 +1199,9 @@ def main() -> None:
         calibration_audit=calibration_audit,
         storage_preflight=storage_preflight,
     )
+    quantization_started = time.monotonic()
     subprocess.run(quant_exec, check=True)
+    quantization_seconds = round(time.monotonic() - quantization_started, 6)
     quantized = inspect_artifact(args.coexistence, args.output)
     validate_quantized_inspection(quantized)
     update_manifest(
@@ -1191,6 +1212,7 @@ def main() -> None:
         calibration_audit=calibration_audit,
         storage_preflight=storage_preflight,
         quantized=quantized,
+        phase_timings={"quantization_seconds": quantization_seconds},
     )
 
 

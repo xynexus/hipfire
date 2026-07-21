@@ -407,6 +407,7 @@ def test_interrupted_manifest_resume_preserves_completed_calibration(tmp_path):
         recipe=recipe,
         phase="calibration_complete",
         calibration=calibration,
+        phase_timings={"calibration_seconds": 12.5},
     )
 
     resumed = two_pass.update_manifest(path, recipe=recipe, phase="quantization_running")
@@ -414,6 +415,18 @@ def test_interrupted_manifest_resume_preserves_completed_calibration(tmp_path):
     assert resumed["calibration"] == calibration
     assert resumed["source_reads"] == calibration["metadata"]["read_ledger"]
     assert resumed["status"] == "quantization_running"
+    assert resumed["phase_timings"] == {"calibration_seconds": 12.5}
+
+    completed = two_pass.update_manifest(
+        path,
+        recipe=recipe,
+        phase="complete",
+        phase_timings={"quantization_seconds": 7.25},
+    )
+    assert completed["phase_timings"] == {
+        "calibration_seconds": 12.5,
+        "quantization_seconds": 7.25,
+    }
 
 
 def reusable_calibration_contract():

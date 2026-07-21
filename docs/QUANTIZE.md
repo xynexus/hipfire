@@ -411,6 +411,10 @@ the process mappings between segments, and leaves the final child unbounded so
 artifact/KLDREF finalization runs. This is execution provenance rather than a
 semantic recipe input; changing it does not invalidate compatible completed
 calibration.
+The manifest also records cumulative native calibration seconds (including
+segmented wrapper restarts) and quantization seconds. These are execution
+measurements, not semantic recipe fields, and provide the capture-cost input
+required by controlled expert-floor and capture-target sweeps.
 With `--skip-calib`, the wrapper also executes the native no-GPU dry plan and
 requires the existing artifact to match its family/adapter/architecture,
 source fingerprint and shard set, tokenizer/corpus/sample fingerprints,
