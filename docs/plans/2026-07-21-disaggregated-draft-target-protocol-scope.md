@@ -238,6 +238,57 @@ Ordering at every B: **width < depth < random-empirical < analytic-uniform.**
 
 **Consequences:** the BASTION cost model must price width at a real **~0.6–0.7× depth marginal rate (not zero)**, plus the always-on shared expert and the diffuse-layer tail (per-layer max ≫ mean). Residuals: the 35B run was **first-20-of-40 layers** (halo APU memory; aggregate is first-half, flagged), medusa was unreachable so the **real 397B run is unclosed**, and the full-stack DFlash→DDTree→verify tree number awaits the masked-SDPA verify path (§5).
 
+## 9.5 The drafter ↔ tree ↔ step-interval co-design (distinct_experts is ONE input, not the answer)
+
+`distinct_experts(B)` bounds the verify side, but the drafter and the tree are not
+independent knobs — they close a loop, and the drafter should be **sized to the
+step interval**, not fixed. The coupled quantities:
+
+- **Step interval `T`** = verify pass time = `f(B)` via `distinct_experts(B)` +
+  tree attention. This is the clock.
+- **Draft budget = `T`.** Disaggregation hides the draft under the verify, so the
+  drafter + tree-build get the *whole* interval to run in.
+- **τ (accepted/cycle)** = `h(drafter quality, tree shape)`, and the **tree shape
+  is a function of the drafter's per-position marginals** — sharper marginals →
+  narrower tree for the same τ.
+
+The loop: `drafter → marginals → tree shape → B → distinct_experts(B) → T → draft
+budget → drafter size → …`. Solve for the fixed point that maximizes `τ / T`.
+
+**Two consequences the fixed-drafter framing (and every co-located paper) misses:**
+
+1. **The 1.29 B drafter is under-sized for the streaming regime.** If the
+   streaming-397B verify is ~1–2 s and the drafter runs in ~98 ms, the NPU is
+   ~95% idle per step. That budget should buy a bigger drafter, the Weaver/DSpark
+   conditional adapter, a **larger `block_size`** (commit >16 tokens/pass), and a
+   deeper tree search — sized to *fill* `T`. **Drafter capacity is an output pinned
+   to the sustainable interval, not a fixed input** (DFlare's "push harder",
+   generalized).
+2. **Drafter investment pays twice.** A better drafter → sharper marginals →
+   narrower tree for the same τ → fewer distinct experts → faster verify → shorter
+   `T`. Quality raises τ AND cheapens verify. `distinct_experts(B)` is the cost
+   curve; its operating point moves when the drafter improves.
+
+Structurally a **two-level optimization**: OUTER loop sizes the drafter (capacity,
+block_size, adapter, tree-search depth) to `T`; INNER per-cycle loop is BASTION's
+adaptive controller re-solving the tree shape from the current marginals under the
+`distinct_experts` cost model. BASTION does the inner loop but assumes a fixed
+drafter — we own the outer loop.
+
+**Regime-dependent — the deployment picks the fixed point:**
+- **halo streams** (128 GB < ~200 GB) → streaming-bound → long `T` → big draft
+  budget → wide bushy trees cheap → drafter sized way up. The co-design bites here.
+- **medusa resident** (384 GB) → compute-bound ~17 B-active forward (hundreds of ms)
+  → shorter `T` → smaller draft budget → tree bounded more by attention/compute →
+  closer to the H200-paper regime.
+
+**The load-bearing UNMEASURED quantity is now the step interval `T` itself** — the
+actual verify wall for the streaming 397B (medusa was unreachable, so only
+`distinct_experts` was extrapolated, never `T`). `T` sets the draft budget that
+sizes the drafter; without it, "size the drafter to the interval" has no number.
+Measuring `T` (per deployment: halo-streaming vs medusa-resident) is a prerequisite
+to fixing drafter size, block_size, and tree budget together.
+
 ## 10. Phased implementation (smallest-first; each verifiable)
 
 1. **Target-side hidden-extraction hook + wire format** — instrument the target
@@ -247,8 +298,10 @@ Ordering at every B: **width < depth < random-empirical < analytic-uniform.**
 2. **Cross-machine bring-up (linear block, no tree)** — draft on nix1, target on
    medusa, over LAN; prove losslessness (AR == drafter, ≥3 repeats) and measure the
    real per-cycle wire volume + RTT. This is the disaggregation proof.
-3. **`distinct_experts(B)` measurement** on the 397B (§9) — the go/no-go for tree
-   width.
+3. **`distinct_experts(B)`** (§9, DONE on proxy) **+ the step interval `T`** (§9.5)
+   — measure the actual streaming-397B verify wall per deployment (halo-streaming
+   vs medusa-resident). `T` is the go/no-go for tree width AND the budget that sizes
+   the drafter; both feed the co-design fixed point.
 4. **Tree verify on the target** — masked-SDPA kernel + DDTree tree build on the
    draft box; widen per §3.
 5. **Conditional corrector (DSpark Markov head)** + confidence pruning.
