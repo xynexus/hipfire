@@ -185,8 +185,10 @@ the work verifiable and keeps it that way as Goals 1–3 land.
   `bench_siglip_attn` kernel guards. Add a parity guard for the daemon serve path
   (Goal 2) and the cache hit==miss equality (Goal 1).
 - **Gates:** `tests/no-gpu-ci.sh` for workflow-only changes;
-  `tests/coherence-gate-dflash.sh` for any KV/forward change (Goal 3 especially);
-  the pre-commit speed+coherence gate already runs per commit.
+  `tests/tiny-affected-gate.sh --require-coverage` (the automatic correctness
+  front tier) for any KV/forward change (Goal 3 especially), with
+  `tests/coherence-gate-dflash.sh` as an optional manual DFlash/DDTree
+  diagnostic; the pre-commit speed+coherence gate already runs per commit.
 - **Docs:** reconcile `docs/plans/2026-06-19-medgemma-vision-bringup.md` follow-ups
   (mark daemon wiring + video/multi-image done; note the encode perf trajectory);
   update `TODO.md` (embedding cache → in-progress when Goal 1 starts); regen
@@ -218,6 +220,8 @@ accumulation (measured free on RDNA3). This keeps the GPU work and the future NP
 port one and the same.
 
 **Verification:** per-goal "done when" above; `tests/no-gpu-ci.sh` for
-workflow-only changes; `tests/coherence-gate-dflash.sh` for any KV/forward change;
+workflow-only changes; `tests/tiny-affected-gate.sh --require-coverage` (the
+automatic correctness front tier) for any KV/forward change, with
+`tests/coherence-gate-dflash.sh` as an optional manual DFlash/DDTree diagnostic;
 re-validate perf claims per-arch (the ~92× is gfx1151-measured — FSR4 shows RDNA3
 optimizations don't transfer 1:1 to gfx1100/gfx1201). Commit per milestone (Rule 2).

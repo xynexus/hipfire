@@ -9,8 +9,11 @@ portable, and covered by the hardware gates that match their blast radius.
   execution.
 - Preserve portability across RDNA2, RDNA3, and RDNA4 when changing dispatch,
   fusion, rotation, rmsnorm, KV/cache behavior, or speculative decode.
-- Run `./tests/coherence-gate-dflash.sh` after changes touching dispatch,
-  fusion, rotation, rmsnorm, quant formats, kernels, or the spec-decode path.
+- Run `./tests/tiny-affected-gate.sh --require-coverage` (the automatic
+  correctness front tier) after changes touching dispatch, fusion, rotation,
+  rmsnorm, quant formats, kernels, or the spec-decode path;
+  `./tests/coherence-gate-dflash.sh` remains an optional manual DFlash/DDTree
+  diagnostic.
 - Runtime examples and microbenches are non-daemon GPU binaries. Document or
   wrap them with `hipfire gpu-lock` when they use GPU resources.
 - Keep artifact parsing and sidecar behavior aligned with the root artifact

@@ -160,7 +160,10 @@ Submit via GitHub issue or PR with:
 | `q8` | 1.06 | Moderate | Reference | Correctness debug |
 
 MQ4 is the production default — FWHT-rotated 4-bit with a byte-exact quality
-lineage but current correctness claims use `./scripts/coherence-gate-dflash.sh`.
+lineage but current correctness claims use
+`./tests/tiny-affected-gate.sh --require-coverage` (the automatic correctness
+front tier), with `./tests/coherence-gate-dflash.sh` as an optional manual
+DFlash/DDTree diagnostic.
 MQ3 is production on gfx11/gfx12 dense models and falls back correctly but more
 slowly on older archs. MQ2 is refused by default unless explicitly opted in for
 known-broken experiments. HF4/HF6 are legacy formats that still load but aren't

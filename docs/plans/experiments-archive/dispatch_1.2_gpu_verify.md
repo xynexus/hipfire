@@ -125,7 +125,7 @@ stderr for the "Paro fused arm fired" messages.
 
 ```bash
 ./scripts/coherence-gate.sh
-./scripts/coherence-gate-dflash.sh  # if DFlash draft is available
+./tests/coherence-gate-dflash.sh  # if DFlash draft is available
 ```
 
 ### 7. Multi-GPU path (if ≥2 GPUs)

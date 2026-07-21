@@ -161,6 +161,9 @@ Verifies HFQM v2 metadata-only load without touching expert payloads:
 ## Coherence gate after kernel/dispatch changes
 
 ```bash
-./scripts/coherence-gate-dflash.sh
+./tests/tiny-affected-gate.sh --require-coverage   # automatic correctness front tier
+./tests/coherence-gate-dflash.sh                   # optional manual DFlash/DDTree diagnostic
 ```
-Always run this after touching kernels, quant formats, or the paged-expert path.
+Run the tiny-affected gate after touching kernels, quant formats, or the
+paged-expert path; the DFlash gate is an optional manual DFlash/DDTree
+diagnostic.

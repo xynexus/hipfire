@@ -117,7 +117,8 @@ that catch C-mapping row swaps.
 
 ```bash
 ./scripts/coherence-gate.sh           # AR runtime smoke, when relevant
-./scripts/coherence-gate-dflash.sh    # canonical correctness gate
+./tests/tiny-affected-gate.sh --require-coverage  # automatic correctness front tier
+./tests/coherence-gate-dflash.sh      # optional manual DFlash/DDTree diagnostic
 ```
 
 Hard fails on panics, zero tokens, timeouts, or attractor-loop

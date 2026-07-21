@@ -508,7 +508,7 @@ Expected: Clean compilation, zero warnings about unused arch predicates.
 
 Expected: All tests pass.
 
-- [ ] **Step 3: Run `./scripts/coherence-gate-dflash.sh`**
+- [ ] **Step 3: Run `./tests/coherence-gate-dflash.sh`**
 
 Expected: All 4 coherence-gate tests pass (per AGENTS.md hard rule #1). This requires a GPU on the machine.
 
@@ -716,7 +716,7 @@ Expected: Clean compilation.
 
 Expected: All tests pass including the new ArchCaps tests.
 
-- [ ] **Step 3: Run `./scripts/coherence-gate-dflash.sh`**
+- [ ] **Step 3: Run `./tests/coherence-gate-dflash.sh`**
 
 Expected: All 4 tests pass.
 
