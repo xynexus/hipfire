@@ -232,6 +232,12 @@ VARIANTS = {
     # Phase D step 1: fused headnorm+rope (supersedes headnorm_* + rope_* pairs).
     "hnrope_q16": lambda ta, rs: build_headnorm_rope("q", 32, 128, 16, ta),
     "hnrope_k48": lambda ta, rs: build_headnorm_rope("k", 8, 128, 48, ta),
+    # Qwen3.6-27B DFlash: H=5120, I=17408 (32q/8kv/128 unchanged, so headnorm/
+    # rope/hnrope variants above transfer as-is). Only the H- and I-shaped
+    # rmsnorm/swiglu kernels change.
+    "rmsnorm16_27b": lambda ta, rs: build_rmsnorm(5120, 16, ta),
+    "rmsnorm32_27b": lambda ta, rs: build_rmsnorm(5120, 32, ta),
+    "swiglu16_27b": lambda ta, rs: build_swiglu(17408, 16, ta, rs),
 }
 
 
