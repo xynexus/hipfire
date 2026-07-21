@@ -33,6 +33,8 @@ python3 scripts/astrea.py metrics --quality-json result-data.json --candidate-va
 python3 scripts/astrea.py expert-sweep-plan --model SAFETENSORS --artifact-stem STEM --calibration-dataset CAL.txt --evaluation-dataset HELDOUT.txt --reference-model REF.hfq --output-dir DIR --evaluation-command-template 'COMMAND {candidate} {reference_model} {evaluation_dataset} {evaluation_output}' --axis minimum [--minimum-rows N] [--fixed-capture-target N] --pretty [--out PATH]
 python3 scripts/astrea.py expert-sweep-plan --model SAFETENSORS --artifact-stem STEM --calibration-dataset CAL.txt --evaluation-dataset HELDOUT.txt --reference-model REF.hfq --output-dir DIR --evaluation-command-template 'COMMAND {candidate} {reference_model} {evaluation_dataset} {evaluation_output}' --axis capture --selected-minimum N [--capture-target N] --pretty [--out PATH]
 python3 scripts/astrea.py expert-sweep-verify --plan PLAN.json [--engine-root REPO] --pretty [--out PATH]
+python3 scripts/astrea.py expert-sweep-results --plan PLAN.json --record VARIANT.json [--record VARIANT.json ...] --pretty [--out PATH]
+python3 scripts/astrea.py expert-sweep-analyze --plan PLAN.json --results RESULTS.json --pretty [--out PATH]
 python3 scripts/astrea.py policy --model MODEL --base-format FORMAT --promotion-format FORMAT (--sensitivity-json SCORES.json | --imatrix IMATRIX) --max-extra-bytes N [--method METHOD] [--objective dynamic-tensor-policy|moe-probe|model-ingress|kv-policy] [--domain weights|kv] [--model-family FAMILY] --pretty [--out PATH]
 python3 scripts/astrea.py promote --policy POLICY.json --source-dir BF16_DIR --output CANDIDATE.hfq [--max-tensors N] [--tensor-filter NAME] --pretty [--out PATH]
 python3 scripts/astrea.py latent-kv-plan --model MODEL --calibration-dataset CAL.jsonl --validation-dataset VAL.jsonl --calibration-length N --validation-length N4X --calibration-position-offset P --validation-position-offset P4X [--calibration-samples-per-stratum N] [--validation-samples-per-stratum N] --rank 32 --rank 64 --rank 96 --max-static-vs-oracle-kld-delta D --max-static-vs-oracle-ppl-ratio R --pretty [--out PATH]
@@ -93,6 +95,15 @@ empty.
    contract, not quality evidence. Run `expert-sweep-verify` immediately before
    execution; it rejects plan-payload, corpus, source, reference, engine,
    one-axis, command-binding, and output-identity drift without loading a model.
+   After every planned variant has completed, pass one measured JSON record per
+   variant to `expert-sweep-results`, then run `expert-sweep-analyze`. The result
+   builder requires finite KLD/PPL, artifact size, calibration time, reduction
+   launches, and the exact high-precision fallback set; capture-target sweeps
+   additionally require statistic stability. The analyzer verifies the frozen
+   plan again, rejects non-monotonic floor fallback sets or capture-sweep
+   fallback drift, and reports quality/cost deltas plus newly low-bit expert
+   cohorts. Its `complete_selection_required` status is deliberately not an
+   automatic threshold or promotion decision.
 9. Run `policy` when you want an Unsloth-like dynamic quant policy. It ranks
    tensors by sensitivity per added byte and emits a mixed-format promotion
    recipe under a size budget. Use `--objective moe-probe` for MoE models and

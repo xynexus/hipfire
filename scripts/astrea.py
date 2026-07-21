@@ -4067,6 +4067,14 @@ def verify_expert_sweep_plan(plan, *, current_engine=None):
     return load_expert_sweep_module().verify_plan(plan, current_engine=current_engine)
 
 
+def build_expert_sweep_results(plan, records):
+    return load_expert_sweep_module().build_results(plan, records)
+
+
+def analyze_expert_sweep_results(plan, results):
+    return load_expert_sweep_module().analyze_results(plan, results)
+
+
 def paro_probe_model(model, *, local_only=False, max_modules=None):
     module = load_paroquant_import_module()
     return module.probe_model(model, local_only=local_only, max_modules=max_modules)
@@ -4257,6 +4265,24 @@ def build_parser():
     expert_sweep_verify.add_argument("--engine-root")
     expert_sweep_verify.add_argument("--pretty", action="store_true")
     expert_sweep_verify.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    expert_sweep_results = sub.add_parser(
+        "expert-sweep-results",
+        help="Normalize a complete set of measured routed-expert sweep rows.",
+    )
+    expert_sweep_results.add_argument("--plan", required=True)
+    expert_sweep_results.add_argument("--record", action="append", required=True)
+    expert_sweep_results.add_argument("--pretty", action="store_true")
+    expert_sweep_results.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    expert_sweep_analyze = sub.add_parser(
+        "expert-sweep-analyze",
+        help="Compare routed-expert sweep variants without choosing a quality threshold.",
+    )
+    expert_sweep_analyze.add_argument("--plan", required=True)
+    expert_sweep_analyze.add_argument("--results", required=True)
+    expert_sweep_analyze.add_argument("--pretty", action="store_true")
+    expert_sweep_analyze.add_argument("--out", help="Write JSON to this path instead of stdout.")
 
     latent_kv_plan = sub.add_parser(
         "latent-kv-plan",
@@ -4570,6 +4596,24 @@ def run(argv=None):
             verify_expert_sweep_plan(
                 load_json(args.plan),
                 current_engine=engine_fingerprint(args.engine_root),
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "expert-sweep-results":
+        write_json(
+            build_expert_sweep_results(
+                load_json(args.plan),
+                [load_json(path) for path in args.record],
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "expert-sweep-analyze":
+        write_json(
+            analyze_expert_sweep_results(
+                load_json(args.plan),
+                load_json(args.results),
             ),
             pretty=args.pretty,
             out=args.out,

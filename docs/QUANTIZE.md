@@ -468,6 +468,39 @@ The plan is a reproducibility contract only; promotion still requires all
 listed KLD, PPL, low-traffic-expert, size, capture-time, and reduction-launch
 evidence.
 
+After all variants finish, create one measured JSON record per variant. Every
+record must contain `id`, finite `mean_kld` and `ppl`,
+`artifact_size_bytes`, cumulative `calibration_seconds`,
+`reduction_launches`, and the calibration audit's exact
+`preserve_high_precision` list. Capture-target records also require a finite
+`statistic_stability` value. Normalize the complete set and analyze it against
+the frozen plan:
+
+```bash
+python3 scripts/astrea.py expert-sweep-results \
+  --plan ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-plan.json \
+  --record ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/min512-cap4096.json \
+  --record ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/min1024-cap4096.json \
+  --record ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/min2048-cap4096.json \
+  --record ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/min4096-cap4096.json \
+  --out ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-results.json
+
+python3 scripts/astrea.py expert-sweep-analyze \
+  --plan ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-plan.json \
+  --results ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-results.json \
+  --pretty \
+  --out ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-analysis.json
+```
+
+The result artifact is fingerprinted and must contain exactly the plan's
+variant set. For a minimum-floor sweep, analysis requires monotonic
+high-precision fallback sets and reports each newly low-bit expert cohort with
+its KLD/PPL cost. For a capture-target sweep, the selected floor and fallback
+set must remain fixed while statistic stability and capture cost change. The
+highest swept value is the comparison reference. A successful analysis reports
+`complete_selection_required`: it proves that the comparison table is complete,
+but never invents the quality threshold or selects a production default.
+
 Large quantization runs spill completed tensors to the output filesystem to
 bound RAM. During final HFQ assembly on Linux, each spill range is hole-punched
 only after its payload has been copied and included in the quantization hash.

@@ -134,7 +134,7 @@ def test_floor_sweep_freezes_one_axis_and_heldout_commands(tmp_path):
         "ppl",
         "low_traffic_expert_sensitivity",
         "artifact_size_bytes",
-        "capture_seconds",
+        "calibration_seconds",
         "reduction_launches",
     ]
     assert plan["plan_fingerprint"].startswith("sha256:")
@@ -153,9 +153,152 @@ def test_capture_sweep_holds_selected_minimum_fixed(tmp_path):
 
     assert plan["axis"] == "expert_capture_target"
     assert {variant["minimum_expert_activations"] for variant in plan["variants"]} == {2048}
+    assert plan["comparison_contract"]["required_metrics"] == [
+        "mean_kld",
+        "ppl",
+        "statistic_stability",
+        "artifact_size_bytes",
+        "calibration_seconds",
+        "reduction_launches",
+    ]
     assert [variant["expert_capture_target"] for variant in plan["variants"]] == [2048, 4096, 8192]
     assert plan["selection_contract"]["selected_minimum"] == 2048
     assert plan["selection_contract"]["selection_evidence_required"] is True
+
+
+def test_analyze_floor_sweep_reports_low_traffic_cohorts_and_costs(tmp_path):
+    sweep = load_module()
+    plan = sweep.build_plan(
+        **common_inputs(tmp_path),
+        axis="minimum",
+        minimum_rows=[512, 1024],
+        capture_targets=None,
+        selected_minimum=None,
+        fixed_capture_target=4096,
+    )
+    records = [
+        {
+            "id": "min512-cap4096",
+            "mean_kld": 0.12,
+            "ppl": 11.0,
+            "artifact_size_bytes": 1000,
+            "calibration_seconds": 20.0,
+            "reduction_launches": 80,
+            "preserve_high_precision": [{"layer": 0, "expert": 3}],
+        },
+        {
+            "id": "min1024-cap4096",
+            "mean_kld": 0.10,
+            "ppl": 10.0,
+            "artifact_size_bytes": 1200,
+            "calibration_seconds": 21.0,
+            "reduction_launches": 80,
+            "preserve_high_precision": [
+                {"layer": 0, "expert": 3},
+                {"layer": 0, "expert": 7},
+            ],
+        },
+    ]
+    results = sweep.build_results(plan, records)
+    analysis = sweep.analyze_results(plan, results)
+
+    assert results["results_fingerprint"].startswith("sha256:")
+    assert analysis["schema"] == sweep.EXPERT_SWEEP_ANALYSIS_SCHEMA
+    assert analysis["status"] == "complete_selection_required"
+    assert analysis["reference_variant"] == "min1024-cap4096"
+    assert analysis["required_metrics_complete"] is True
+    assert analysis["variants"][0]["quality_vs_reference"] == {
+        "mean_kld_delta": pytest.approx(0.02),
+        "ppl_ratio": pytest.approx(1.1),
+    }
+    cohort = analysis["low_traffic_cohorts"][0]
+    assert cohort["newly_low_bit_experts"] == [{"layer": 0, "expert": 7}]
+    assert cohort["expert_count"] == 1
+    assert cohort["mean_kld_penalty"] == pytest.approx(0.02)
+    assert cohort["mean_kld_penalty_per_expert"] == pytest.approx(0.02)
+    assert cohort["ppl_ratio"] == pytest.approx(1.1)
+
+
+def test_sweep_analysis_rejects_missing_metrics_nonmonotonic_fallback_and_drift(tmp_path):
+    sweep = load_module()
+    plan = sweep.build_plan(
+        **common_inputs(tmp_path),
+        axis="minimum",
+        minimum_rows=[512, 1024],
+        capture_targets=None,
+        selected_minimum=None,
+        fixed_capture_target=4096,
+    )
+    records = [
+        {
+            "id": "min512-cap4096",
+            "mean_kld": 0.12,
+            "ppl": 11.0,
+            "artifact_size_bytes": 1000,
+            "calibration_seconds": 20.0,
+            "reduction_launches": 80,
+            "preserve_high_precision": [{"layer": 0, "expert": 7}],
+        },
+        {
+            "id": "min1024-cap4096",
+            "mean_kld": 0.10,
+            "ppl": 10.0,
+            "artifact_size_bytes": 1200,
+            "calibration_seconds": 21.0,
+            "reduction_launches": 80,
+            "preserve_high_precision": [{"layer": 0, "expert": 3}],
+        },
+    ]
+
+    with pytest.raises(ValueError, match="not monotonic"):
+        sweep.analyze_results(plan, sweep.build_results(plan, records))
+
+    missing = [dict(record) for record in records]
+    missing[0].pop("mean_kld")
+    with pytest.raises(ValueError, match="mean_kld"):
+        sweep.build_results(plan, missing)
+
+    valid = [dict(record) for record in records]
+    valid[0]["preserve_high_precision"] = []
+    valid[1]["preserve_high_precision"] = [{"layer": 0, "expert": 3}]
+    results = sweep.build_results(plan, valid)
+    results["variants"][0]["ppl"] = 999.0
+    with pytest.raises(ValueError, match="results fingerprint"):
+        sweep.analyze_results(plan, results)
+
+
+def test_capture_sweep_analysis_requires_statistic_stability(tmp_path):
+    sweep = load_module()
+    plan = sweep.build_plan(
+        **common_inputs(tmp_path),
+        axis="capture",
+        minimum_rows=None,
+        capture_targets=[2048, 4096],
+        selected_minimum=2048,
+        fixed_capture_target=None,
+    )
+    records = [
+        {
+            "id": variant["id"],
+            "mean_kld": 0.1,
+            "ppl": 10.0,
+            "artifact_size_bytes": 1000,
+            "calibration_seconds": 20.0,
+            "reduction_launches": 80,
+            "preserve_high_precision": [{"layer": 0, "expert": 3}],
+        }
+        for variant in plan["variants"]
+    ]
+
+    with pytest.raises(ValueError, match="statistic_stability"):
+        sweep.build_results(plan, records)
+
+    for index, record in enumerate(records):
+        record["statistic_stability"] = 0.01 / (index + 1)
+    analysis = sweep.analyze_results(plan, sweep.build_results(plan, records))
+    assert analysis["axis"] == "expert_capture_target"
+    assert analysis["low_traffic_cohorts"] == []
+    assert analysis["variants"][0]["statistic_stability"] == pytest.approx(0.01)
 
 
 def test_sweep_rejects_contaminated_or_nonisolated_experiments(tmp_path):
@@ -349,6 +492,55 @@ def test_astrea_cli_verifies_plan_before_execution(tmp_path):
     result = json.loads(stdout)
     assert result["status"] == "verified_not_run"
     assert result["plan_fingerprint"] == plan["plan_fingerprint"]
+
+
+def test_astrea_cli_builds_and_analyzes_measured_expert_sweep_results(tmp_path):
+    astrea = load_astrea()
+    sweep = load_module()
+    inputs = common_inputs(tmp_path)
+    plan = sweep.build_plan(
+        **inputs,
+        axis="minimum",
+        minimum_rows=[512, 1024],
+        capture_targets=None,
+        selected_minimum=None,
+        fixed_capture_target=4096,
+    )
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    record_paths = []
+    for index, variant in enumerate(plan["variants"]):
+        record = {
+            "id": variant["id"],
+            "mean_kld": 0.2 - index * 0.05,
+            "ppl": 12.0 - index,
+            "artifact_size_bytes": 1000 + index,
+            "calibration_seconds": 20.0,
+            "reduction_launches": 80,
+            "preserve_high_precision": [
+                {"layer": 0, "expert": expert} for expert in range(index + 1)
+            ],
+        }
+        path = tmp_path / f"{variant['id']}.json"
+        path.write_text(json.dumps(record), encoding="utf-8")
+        record_paths.append(path)
+
+    argv = ["expert-sweep-results", "--plan", str(plan_path)]
+    for path in record_paths:
+        argv.extend(["--record", str(path)])
+    code, stdout, stderr = astrea.main_for_test(argv)
+    assert code == 0, stderr
+    results = json.loads(stdout)
+    results_path = tmp_path / "results.json"
+    results_path.write_text(json.dumps(results), encoding="utf-8")
+
+    code, stdout, stderr = astrea.main_for_test(
+        ["expert-sweep-analyze", "--plan", str(plan_path), "--results", str(results_path)]
+    )
+    assert code == 0, stderr
+    analysis = json.loads(stdout)
+    assert analysis["status"] == "complete_selection_required"
+    assert analysis["required_metrics_complete"] is True
 
 
 def test_verify_plan_rejects_source_and_reference_identity_drift(tmp_path):

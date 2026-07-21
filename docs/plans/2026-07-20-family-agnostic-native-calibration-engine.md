@@ -54,7 +54,9 @@ Implemented and verified in this checkout:
   engine, commands, output paths, and required comparison metrics participate
   in the plan fingerprint; a pre-execution verifier rejects payload, corpus,
   source/reference, engine, one-axis, command-binding, or output-identity drift
-  before any model load;
+  before any model load; a fingerprinted result builder rejects incomplete or
+  non-finite variant rows, and the analyzer reports quality/cost deltas plus
+  newly low-bit expert cohorts while leaving the selection threshold explicit;
 - durable per-layer phase timing for source load/upload, teacher execution,
   capture serialization, collector finalization, and part sync/hash, persisted
   in checkpoints and the completed artifact for resume-safe ETA analysis;
@@ -1387,7 +1389,12 @@ held-out corpus
 the 512/1,024/2,048/4,096 floors, fixed 4,096-row capture target, 64x32
 microbatch geometry, no source lookahead, and 32 daemon-backed quality chunks.
 `expert-sweep-verify` reports `verified_not_run`; this is a reproducibility
-contract, not KLD/PPL or expert-floor selection evidence.
+contract, not KLD/PPL or expert-floor selection evidence. The implemented
+`expert-sweep-results` and `expert-sweep-analyze` commands can only report
+`complete_selection_required`: they require the complete frozen variant set,
+finite KLD/PPL and cost rows, exact fallback sets, monotonic minimum-floor
+cohorts, and capture-sweep statistic stability, but do not invent an admission
+threshold. The controlled sweep itself remains pending.
 
 ## Performance methodology
 

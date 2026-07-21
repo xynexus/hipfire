@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import shlex
 import struct
@@ -24,6 +25,8 @@ from string import Formatter
 
 EXPERT_SWEEP_PLAN_SCHEMA = "hipfire.astrea.expert_calibration_sweep_plan.v1"
 EXPERT_SWEEP_VERIFY_SCHEMA = "hipfire.astrea.expert_calibration_sweep_verify.v1"
+EXPERT_SWEEP_RESULTS_SCHEMA = "hipfire.astrea.expert_calibration_sweep_results.v1"
+EXPERT_SWEEP_ANALYSIS_SCHEMA = "hipfire.astrea.expert_calibration_sweep_analysis.v1"
 DEFAULT_QUANT_FORMAT = "oq4.25++"
 DEFAULT_MINIMUM_ROWS = (512, 1024, 2048, 4096)
 DEFAULT_CAPTURE_TARGETS = (2048, 4096, 8192)
@@ -474,6 +477,185 @@ def verify_plan(plan, *, current_engine=None) -> dict:
     }
 
 
+def _finite_metric(record: dict, field: str, *, positive: bool = False) -> float:
+    value = record.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"expert sweep result {record.get('id')!r} has invalid {field}")
+    value = float(value)
+    if (positive and value <= 0.0) or (not positive and value < 0.0):
+        qualifier = "positive" if positive else "nonnegative"
+        raise ValueError(f"expert sweep result {record.get('id')!r} {field} must be {qualifier}")
+    return value
+
+
+def _preserve_set(record: dict) -> tuple[tuple[int, int], ...]:
+    values = record.get("preserve_high_precision")
+    if not isinstance(values, list):
+        raise ValueError(
+            f"expert sweep result {record.get('id')!r} preserve_high_precision must be a list"
+        )
+    result = []
+    for value in values:
+        if not isinstance(value, dict):
+            raise ValueError("preserve_high_precision entries must be objects")
+        layer = value.get("layer")
+        expert = value.get("expert")
+        if (
+            isinstance(layer, bool)
+            or not isinstance(layer, int)
+            or layer < 0
+            or isinstance(expert, bool)
+            or not isinstance(expert, int)
+            or expert < 0
+        ):
+            raise ValueError(f"invalid preserve_high_precision entry: {value!r}")
+        result.append((layer, expert))
+    if len(set(result)) != len(result):
+        raise ValueError(f"expert sweep result {record.get('id')!r} repeats a preserved expert")
+    return tuple(sorted(result))
+
+
+def build_results(plan: dict, variant_records: list[dict]) -> dict:
+    """Normalize complete measured rows into a fingerprinted sweep result set."""
+
+    if not isinstance(plan, dict) or plan.get("schema") != EXPERT_SWEEP_PLAN_SCHEMA:
+        raise ValueError("unsupported expert sweep plan schema")
+    expected_variants = plan.get("variants")
+    if not isinstance(expected_variants, list) or not expected_variants:
+        raise ValueError("expert sweep plan has no variants")
+    if not isinstance(variant_records, list):
+        raise ValueError("expert sweep variant records must be a list")
+    records_by_id = {}
+    for record in variant_records:
+        if not isinstance(record, dict) or not isinstance(record.get("id"), str):
+            raise ValueError("expert sweep result has no variant id")
+        if record["id"] in records_by_id:
+            raise ValueError(f"duplicate expert sweep result {record['id']}")
+        records_by_id[record["id"]] = record
+    expected_ids = [variant["id"] for variant in expected_variants]
+    if set(records_by_id) != set(expected_ids):
+        raise ValueError(
+            f"expert sweep results do not match plan variants: expected={expected_ids}, "
+            f"observed={sorted(records_by_id)}"
+        )
+
+    normalized = []
+    capture_axis = plan.get("axis") == "expert_capture_target"
+    for variant in expected_variants:
+        record = records_by_id[variant["id"]]
+        artifact_size = record.get("artifact_size_bytes")
+        launches = record.get("reduction_launches")
+        if isinstance(artifact_size, bool) or not isinstance(artifact_size, int) or artifact_size < 1:
+            raise ValueError(f"expert sweep result {record['id']!r} has invalid artifact_size_bytes")
+        if isinstance(launches, bool) or not isinstance(launches, int) or launches < 0:
+            raise ValueError(f"expert sweep result {record['id']!r} has invalid reduction_launches")
+        preserved = _preserve_set(record)
+        row = {
+            "id": record["id"],
+            "minimum_expert_activations": variant["minimum_expert_activations"],
+            "expert_capture_target": variant["expert_capture_target"],
+            "mean_kld": _finite_metric(record, "mean_kld"),
+            "ppl": _finite_metric(record, "ppl", positive=True),
+            "artifact_size_bytes": artifact_size,
+            "calibration_seconds": _finite_metric(record, "calibration_seconds", positive=True),
+            "reduction_launches": launches,
+            "preserve_high_precision": [
+                {"layer": layer, "expert": expert} for layer, expert in preserved
+            ],
+        }
+        if capture_axis:
+            row["statistic_stability"] = _finite_metric(record, "statistic_stability")
+        normalized.append(row)
+
+    body = {
+        "schema": EXPERT_SWEEP_RESULTS_SCHEMA,
+        "plan_fingerprint": plan.get("plan_fingerprint"),
+        "axis": plan.get("axis"),
+        "variants": normalized,
+    }
+    return {**body, "results_fingerprint": _fingerprint(body)}
+
+
+def analyze_results(plan: dict, results: dict) -> dict:
+    """Compare a complete one-axis sweep without inventing a promotion threshold."""
+
+    verify_plan(plan)
+    if not isinstance(results, dict) or results.get("schema") != EXPERT_SWEEP_RESULTS_SCHEMA:
+        raise ValueError("unsupported expert sweep results schema")
+    if results.get("plan_fingerprint") != plan.get("plan_fingerprint"):
+        raise ValueError("expert sweep results plan fingerprint mismatch")
+    body = {key: value for key, value in results.items() if key != "results_fingerprint"}
+    if results.get("results_fingerprint") != _fingerprint(body):
+        raise ValueError("expert sweep results fingerprint mismatch")
+    rebuilt = build_results(plan, results.get("variants"))
+    if rebuilt != results:
+        raise ValueError("expert sweep results are not in canonical plan order")
+
+    axis = plan["axis"]
+    axis_field = (
+        "minimum_expert_activations"
+        if axis == "minimum_expert_activations"
+        else "expert_capture_target"
+    )
+    rows = sorted(results["variants"], key=lambda row: row[axis_field])
+    reference = rows[-1]
+    reference_preserved = set(_preserve_set(reference))
+    analyzed_rows = []
+    for row in rows:
+        analyzed = dict(row)
+        analyzed["quality_vs_reference"] = {
+            "mean_kld_delta": row["mean_kld"] - reference["mean_kld"],
+            "ppl_ratio": row["ppl"] / reference["ppl"],
+        }
+        analyzed["fallback_expert_count"] = len(_preserve_set(row))
+        analyzed_rows.append(analyzed)
+
+    cohorts = []
+    for lower, higher in zip(rows, rows[1:]):
+        lower_preserved = set(_preserve_set(lower))
+        higher_preserved = set(_preserve_set(higher))
+        if axis == "minimum_expert_activations":
+            if not lower_preserved.issubset(higher_preserved):
+                raise ValueError(
+                    f"preserve_high_precision is not monotonic from {lower['id']} to {higher['id']}"
+                )
+            cohort = sorted(higher_preserved - lower_preserved)
+            kld_penalty = lower["mean_kld"] - higher["mean_kld"]
+            cohorts.append(
+                {
+                    "lower_variant": lower["id"],
+                    "higher_variant": higher["id"],
+                    "newly_low_bit_experts": [
+                        {"layer": layer, "expert": expert} for layer, expert in cohort
+                    ],
+                    "expert_count": len(cohort),
+                    "mean_kld_penalty": kld_penalty,
+                    "mean_kld_penalty_per_expert": (
+                        kld_penalty / len(cohort) if cohort else None
+                    ),
+                    "ppl_ratio": lower["ppl"] / higher["ppl"],
+                }
+            )
+        elif lower_preserved != higher_preserved:
+            raise ValueError(
+                f"capture sweep fallback set drifted from {lower['id']} to {higher['id']}"
+            )
+
+    return {
+        "schema": EXPERT_SWEEP_ANALYSIS_SCHEMA,
+        "status": "complete_selection_required",
+        "plan_fingerprint": plan["plan_fingerprint"],
+        "results_fingerprint": results["results_fingerprint"],
+        "axis": axis,
+        "reference_variant": reference["id"],
+        "required_metrics_complete": True,
+        "selection_contract": plan["selection_contract"],
+        "variants": analyzed_rows,
+        "low_traffic_cohorts": cohorts,
+        "reference_preserved_expert_count": len(reference_preserved),
+    }
+
+
 def build_plan(
     *,
     model,
@@ -669,14 +851,25 @@ def build_plan(
             "one_axis_at_a_time": True,
             "evaluation_dataset_frozen_before_execution": True,
             "evaluation_dataset_must_remain_untouched_by_calibration": True,
-            "required_metrics": [
-                "mean_kld",
-                "ppl",
-                "low_traffic_expert_sensitivity",
-                "artifact_size_bytes",
-                "capture_seconds",
-                "reduction_launches",
-            ],
+            "required_metrics": (
+                [
+                    "mean_kld",
+                    "ppl",
+                    "low_traffic_expert_sensitivity",
+                    "artifact_size_bytes",
+                    "calibration_seconds",
+                    "reduction_launches",
+                ]
+                if canonical_axis == "minimum_expert_activations"
+                else [
+                    "mean_kld",
+                    "ppl",
+                    "statistic_stability",
+                    "artifact_size_bytes",
+                    "calibration_seconds",
+                    "reduction_launches",
+                ]
+            ),
             "promotion_eligible_without_complete_metrics": False,
         },
         "variants": variants,
