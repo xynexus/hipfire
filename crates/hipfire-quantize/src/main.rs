@@ -9260,6 +9260,26 @@ fn main() {
                     // directly, while OQ4/OQ8 are GEMV/GEMM weight formats.
                     let q = quantize_q8f16(&f32_data);
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if (use_oq4 || use_opus_mixed || use_oq8 || use_oq8_plus)
+                    && (name.ends_with("mlp.gate.weight")
+                        || name.ends_with("mlp.shared_expert_gate.weight"))
+                    && std::env::var("HIPFIRE_OQ8_ROUTER").ok().as_deref() == Some("1")
+                    && meta.shape.len() == 2
+                    && (meta.shape[1] as usize) % 256 == 0
+                {
+                    // OQ8-W8A16 router promotion (opt-in HIPFIRE_OQ8_ROUTER): keep
+                    // the precision-sensitive MoE router in the Opus family at
+                    // 8-bit (symmetric Oq8G256, the same iu8 GEMV the shared/dense
+                    // OQ path uses) instead of dropping it to Q8. The k-map still
+                    // protects embed/lm_head as Q8 above (gather tables).
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    (
+                        quantize_oq8g256(&f32_data, &signs1, &signs2),
+                        QuantType::Oq8G256,
+                        256u32,
+                        "OQ8-ROUTER",
+                    )
                 } else if kmap_level == QuantLevel::Q8 {
                     // K-map says Q8 (embed, lm_head, router)
                     let q = quantize_q8f16(&f32_data);
