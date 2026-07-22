@@ -83,16 +83,18 @@ with `--layer-prefetch-bytes N`, or pass zero to disable lookahead; the chosen
 operational budget is recorded in the two-pass recipe while pressure decisions
 are recorded per layer.
 
-On hosts where a long-lived process accumulates source mappings or SVM
-pressure, pass `--calibration-segment-layers N`. The offline workflow then
-restarts the native calibrator after every N additional durable layers. Each
-child resumes from the native boundary checkpoint, so committed tensors are
-not reread; the final child runs without a pause boundary so it can finalize
-KLDREF and the unified artifact. The wrapper waits five seconds between
-children to let mappings drain and validates checkpoint progress after every
-successful process. Segmentation is recorded as execution provenance, but is
-not part of the semantic recipe fingerprint: a segmented run is compatible
-with the same uninterrupted calibration recipe.
+Offline induction defaults to `--calibration-segment-layers 4` so long-lived
+calibration cannot accumulate source mappings or SVM pressure across the whole
+model. The workflow restarts the native calibrator after every four additional
+durable layers. Each child resumes from the native boundary checkpoint, so
+committed tensors are not reread; the final child runs without a pause boundary
+so it can finalize KLDREF and the unified artifact. The wrapper waits five
+seconds between children to let mappings drain and validates checkpoint
+progress after every successful process. Segmentation is recorded as execution
+provenance, but is not part of the semantic recipe fingerprint: a segmented
+run is compatible with the same uninterrupted calibration recipe. Pass
+`--calibration-segment-layers 0` only when an uninterrupted process is
+deliberately required.
 
 Expert quality controls are also explicit induction inputs rather than hidden
 calibrator defaults: `--min-expert-activations`,

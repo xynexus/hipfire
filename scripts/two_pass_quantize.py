@@ -26,6 +26,7 @@ from pathlib import Path
 
 DEFAULT_QUANT_FORMAT = "oq4.25++"
 DEFAULT_LAYER_PREFETCH_BYTES = 16 * 1024**3
+DEFAULT_CALIBRATION_SEGMENT_LAYERS = 4
 DEFAULT_MIN_EXPERT_ACTIVATIONS = 2048
 DEFAULT_EXPERT_CAPTURE_TARGET = 4096
 DEFAULT_EXPERT_CAPTURE_TILE_ROWS = 256
@@ -1043,10 +1044,11 @@ def main() -> None:
     parser.add_argument(
         "--calibration-segment-layers",
         type=int,
-        default=0,
+        default=DEFAULT_CALIBRATION_SEGMENT_LAYERS,
         help=(
             "Restart the native calibrator after this many additional durable layers "
-            "to release source mappings (default: 0, uninterrupted)."
+            f"to release source mappings (default: {DEFAULT_CALIBRATION_SEGMENT_LAYERS}; "
+            "0 runs uninterrupted)."
         ),
     )
     parser.add_argument("--kldref-topk", type=int, default=64)

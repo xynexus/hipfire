@@ -25,6 +25,7 @@ DEFAULT_CORPUS = Path("benchmarks/calib/calib-5m.txt")
 DEFAULT_QUANT_FORMAT = "oq4.25++"
 DEFAULT_DFLASH_FORMATS = ("bf16", "f16")
 DEFAULT_LAYER_PREFETCH_BYTES = 16 * 1024**3
+DEFAULT_CALIBRATION_SEGMENT_LAYERS = 4
 DEFAULT_MIN_EXPERT_ACTIVATIONS = 2048
 DEFAULT_EXPERT_CAPTURE_TARGET = 4096
 DEFAULT_EXPERT_CAPTURE_TILE_ROWS = 256
@@ -216,7 +217,7 @@ def build_stage_commands(
     triattn_bin: str,
     quant_args: list[str],
     reuse_calibration: bool = False,
-    calibration_segment_layers: int = 0,
+    calibration_segment_layers: int = DEFAULT_CALIBRATION_SEGMENT_LAYERS,
 ) -> dict[str, list[list[str]]]:
     dflash_commands = [
         [
@@ -555,8 +556,11 @@ def main() -> None:
     parser.add_argument(
         "--calibration-segment-layers",
         type=int,
-        default=0,
-        help="Restart calibration after this many additional durable layers (default: 0).",
+        default=DEFAULT_CALIBRATION_SEGMENT_LAYERS,
+        help=(
+            "Restart calibration after this many additional durable layers "
+            f"(default: {DEFAULT_CALIBRATION_SEGMENT_LAYERS}; 0 runs uninterrupted)."
+        ),
     )
     parser.add_argument("--kldref-topk", type=int, default=64)
     parser.add_argument(

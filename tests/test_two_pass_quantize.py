@@ -32,6 +32,7 @@ def write_safetensors_index(path: Path, tensors: dict[str, tuple[str, list[int],
 def test_default_quant_format_is_mixed_oq425_double_plus():
     assert two_pass.DEFAULT_QUANT_FORMAT == "oq4.25++"
     assert two_pass.DEFAULT_LAYER_PREFETCH_BYTES == 16 * 1024**3
+    assert two_pass.DEFAULT_CALIBRATION_SEGMENT_LAYERS == 4
     assert two_pass.DEFAULT_MIN_EXPERT_ACTIVATIONS == 2048
     assert two_pass.DEFAULT_EXPERT_CAPTURE_TARGET == 4096
     assert two_pass.DEFAULT_EXPERT_CAPTURE_TILE_ROWS == 256

@@ -404,13 +404,13 @@ sequence batch, time tile, or row budget. The expert activation floor, capture
 target/tile, required fraction, deterministic sampling seed, and strict versus
 preserve-undercovered policy are also explicit two-pass options and recipe
 fields, so quality-policy changes cannot reuse stale calibration provenance.
-`--calibration-segment-layers N` is an optional process-lifetime bound for
-large models. It uses the native absolute pause boundary and durable layer
-checkpoint, validates that each child advanced exactly as requested, releases
-the process mappings between segments, and leaves the final child unbounded so
-artifact/KLDREF finalization runs. This is execution provenance rather than a
-semantic recipe input; changing it does not invalidate compatible completed
-calibration.
+`--calibration-segment-layers N` is a process-lifetime bound and defaults to
+four durable layers. It uses the native absolute pause boundary and durable
+layer checkpoint, validates that each child advanced exactly as requested,
+releases the process mappings between segments, and leaves the final child
+unbounded so artifact/KLDREF finalization runs. Pass zero to request one
+uninterrupted process. This is execution provenance rather than a semantic
+recipe input; changing it does not invalidate compatible completed calibration.
 The manifest also records cumulative native calibration seconds (including
 segmented wrapper restarts), successful quantization seconds, and the last
 failed or interrupted quantization-attempt duration. SIGINT/SIGTERM exits are

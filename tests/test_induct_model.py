@@ -96,6 +96,7 @@ def test_default_quant_format_is_mixed_oq425_double_plus():
     assert induct.DEFAULT_QUANT_FORMAT == "oq4.25++"
     assert induct.DEFAULT_DFLASH_FORMATS == ("bf16", "f16")
     assert induct.DEFAULT_LAYER_PREFETCH_BYTES == 16 * 1024**3
+    assert induct.DEFAULT_CALIBRATION_SEGMENT_LAYERS == 4
     assert induct.DEFAULT_MIN_EXPERT_ACTIVATIONS == 2048
     assert induct.DEFAULT_EXPERT_CAPTURE_TARGET == 4096
     assert induct.DEFAULT_EXPERT_CAPTURE_TILE_ROWS == 256
@@ -358,8 +359,6 @@ def test_main_dry_run_prints_native_two_pass_plan_without_running_tools(tmp_path
             str(tmp_path / "artifacts"),
             "--stage",
             "target",
-            "--calibration-segment-layers",
-            "4",
             "--dry-run",
         ],
     )

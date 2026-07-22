@@ -450,11 +450,14 @@ native dry plan, chooses each next absolute pause boundary from the durable
 checkpoint, validates exact progress, allows mappings to drain between child
 processes, and invokes the final child without a pause limit. Segment progress
 is merged into the atomic two-pass manifest across wrapper restarts. The
-process lifetime is deliberately excluded from the semantic recipe
-fingerprint; native run/source/sample/geometry/expert/KLDREF identity remains
-authoritative for resume and completed-artifact reuse. Focused workflow tests
-cover nonzero-checkpoint resume, finalization, no-progress rejection,
-provenance persistence, and induction CLI forwarding.
+offline entry points now default to four-layer segments after both the 397B and
+35B streams reproduced the long-process failure; zero remains an explicit
+uninterrupted override. Process lifetime is deliberately excluded from the
+semantic recipe fingerprint; native run/source/sample/geometry/expert/KLDREF
+identity remains authoritative for resume and completed-artifact reuse.
+Focused workflow tests cover nonzero-checkpoint resume, finalization,
+no-progress rejection, provenance persistence, default/override behavior, and
+induction CLI forwarding.
 
 The first production segment completed at 09:42 AWST. It advanced the durable
 boundary from 43 to 47 layers, exited normally at the requested absolute
@@ -1452,13 +1455,13 @@ from the low-bit eligibility rule. Astrea selects the default cap from measured
 quality/cost evidence; a cap is not declared safe merely because every expert
 met the minimum.
 
-The minimum-floor contract is frozen but not executed. Its current v3 plan
-lives at
-`~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-plan-v3.json`
+The minimum-floor contract is frozen and executing. Its current v5 plan lives
+at
+`~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-plan-v5.json`
 with fingerprint
-`sha256:84d6dcc74d14c184af549ff07922bec113798b932f317971169b7b858e9b6e78`
+`sha256:1cf68e2add20d200dc069c53d549ca8c9750ab23504384abae7c6526110d4b71`
 and engine fingerprint
-`4fe45b0e154e6f98ea08649598517e59dff95efb4092746d9a69c744154e0fd4`.
+`0fd89323e795357d68adfeeef315cc619bad1107f4d0b3093c756388e8425e07`.
 It binds Qwen3.5-35B-A3B source manifest
 `sha256:fca57860a6c176240d3dd6112989ff235e77130ed3d0de97034fe36597e8dc55`,
 the local OQ8 reference HFQ control region
@@ -1469,18 +1472,17 @@ held-out corpus
 `sha256:c8b1a1fa66299336f8349e11f2a7679c3f349263f08ff72ea035fac84a3af5bd`,
 the 512/1,024/2,048/4,096 floors, fixed 4,096-row capture target, 64x32
 microbatch geometry, no source lookahead, and 32 daemon-backed quality chunks.
-`expert-sweep-verify` reported `verified_not_run` immediately after v3 was
-generated. Subsequent workflow source changes intentionally invalidate that
-engine fingerprint, so the plan must be regenerated and verified again before
-execution. This remains a reproducibility contract, not KLD/PPL or
-expert-floor selection evidence. Its launcher is paused under the same
-operator hold as the other downstream GPU jobs. The implemented
-`expert-sweep-results` and `expert-sweep-analyze` commands can only report
-`complete_selection_required`: they require the complete frozen variant set,
-finite KLD/PPL and cost rows, exact fallback sets, monotonic minimum-floor
-cohorts, and a valid fingerprinted capture-sweep statistic-stability report,
-but do not invent an admission threshold. The controlled sweep itself remains
-pending.
+The frozen checkout at commit `8a9255795` still verifies the complete plan,
+engine, dataset, command, and output identity before each variant. The first
+`min512-cap4096` teacher and OQ4.25++ AWQ+LDLQ candidate are complete; its
+held-out quality row is running, while the remaining three variants are not
+yet evidence. This remains an in-progress controlled experiment, not an
+expert-floor selection. The implemented `expert-sweep-results` and
+`expert-sweep-analyze` commands can only report `complete_selection_required`:
+they require the complete frozen variant set, finite KLD/PPL and cost rows,
+exact fallback sets, monotonic minimum-floor cohorts, and a valid fingerprinted
+capture-sweep statistic-stability report, but do not invent an admission
+threshold.
 
 ## Performance methodology
 
