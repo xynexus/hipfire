@@ -38,11 +38,11 @@ the relevant docs under `docs/`.
   The former pre-fork `master` history is preserved as the archival
   `master-prefork` branch; do not base new work on it or merge it wholesale into
   `master` unless the user explicitly requests historical recovery work.
-- Start feature and fix work from an up-to-date `origin/master` on a descriptive
+- Start feature and fix work from an up-to-date `upstream/master` on a descriptive
   topic branch. Prefer reviewed pull requests for integration; commit or push
   directly to `master` only when the user explicitly requests that workflow.
-- Before meaningful changes, fetch `origin` and rebase or merge the topic branch
-  onto the latest `origin/master` when the worktree state allows it. Do not
+- Before meaningful changes, fetch `upstream` and rebase or merge the topic branch
+  onto the latest `upstream/master` when the worktree state allows it. Do not
   rewrite published shared history without explicit approval.
 - Preserve unrelated user changes. When committing or pushing, stage only files
   that belong to the current task and use descriptive messages.
