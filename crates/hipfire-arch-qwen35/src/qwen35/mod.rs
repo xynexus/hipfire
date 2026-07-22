@@ -3514,7 +3514,9 @@ pub fn forward_with_embedding(
 #[cfg(test)]
 mod tests {
     use super::config::{parse_bf16_weight_load_mode, parse_f16_lm_head_mode};
-    use super::prefill_batch::{align_up_usize, moe_grouped_m_total_max};
+    use super::prefill_batch::{
+        align_up_usize, moe_grouped_m_total_max, scatter_dense_post_layer_rows,
+    };
     use super::*;
 
     fn test_qwen35_config_with_layers(layer_types: Vec<LayerType>) -> Qwen35Config {
@@ -3629,6 +3631,22 @@ mod tests {
             &resident,
             &wrong_sample,
         ));
+    }
+
+    #[test]
+    fn resident_post_layer_probe_scatters_only_canonical_rows() {
+        let downloaded = [
+            10.0, 11.0, // batch row 0
+            20.0, 21.0, // batch row 1
+            30.0, 31.0, // batch row 2
+        ];
+        let mut canonical = vec![f32::NAN; 8];
+        scatter_dense_post_layer_rows(&downloaded, 3, 2, &mut canonical, &[(2, 1), (0, 3)])
+            .expect("scatter selected resident rows");
+        assert_eq!(canonical[2..4], [30.0, 31.0]);
+        assert_eq!(canonical[6..8], [10.0, 11.0]);
+        assert!(canonical[..2].iter().all(|value| value.is_nan()));
+        assert!(canonical[4..6].iter().all(|value| value.is_nan()));
     }
 
     #[test]

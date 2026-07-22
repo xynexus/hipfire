@@ -3462,11 +3462,35 @@ pub fn collect_calibration_artifacts_job(
     output: &std::path::Path,
     provenance: &[(&str, serde_json::Value)],
 ) -> HipResult<CalibSummary> {
+    collect_calibration_artifacts_job_with_residual_probe(
+        gpu, weights, config, job, output, provenance, None,
+    )
+}
+
+/// Resident parity oracle with an optional bounded post-layer probe captured
+/// inside the same deterministic batched forward as Hessian/KLD collection.
+pub fn collect_calibration_artifacts_job_with_residual_probe(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    job: &hipfire_runtime::calibration::contracts::CalibrationJob,
+    output: &std::path::Path,
+    provenance: &[(&str, serde_json::Value)],
+    residual_probe: Option<(&std::path::Path, usize)>,
+) -> HipResult<CalibSummary> {
     let opts = CalibOpts {
         kldref: job.options.kldref,
         kldref_topk: job.options.kldref_top_k,
     };
     if config.num_experts != 0 || job.samples.samples().len() < 2 {
+        if let Some((path, rows)) = residual_probe {
+            let arch_id = if config.num_experts == 0 {
+                hipfire_model::ARCH_ID_QWEN35_DENSE
+            } else {
+                hipfire_model::ARCH_ID_QWEN35_MOE
+            };
+            collect_residual_probe_job(gpu, weights, config, job, arch_id, rows, path)?;
+        }
         return collect_calibration_artifacts_samples(
             gpu,
             weights,
@@ -3479,6 +3503,7 @@ pub fn collect_calibration_artifacts_job(
     }
 
     use hipfire_runtime::calibration::contracts::{KldRefBuilder, KldRefRow};
+    use hipfire_runtime::calibration::residual_probe::ResidualProbe;
     use hipfire_runtime::calibration::schedule::MicrobatchPlanner;
     use hipfire_runtime::calibration::{arm, disarm, finish, logsumexp, topk_logits, CalibForward};
     use hipfire_runtime::hfq::HfqMemTensor;
@@ -3514,6 +3539,34 @@ pub fn collect_calibration_artifacts_job(
     let collector = arm(gpu, std::collections::HashMap::new(), Vec::new());
     let mut sessions = Vec::<ResidentCalibrationSessionState>::new();
     let mut active_sequence_start = None;
+    let mut probe = residual_probe
+        .map(|(_, rows)| {
+            ResidualProbe::new(
+                hipfire_model::ARCH_ID_QWEN35_DENSE,
+                "qwen3.5",
+                "resident-batched-full-stack",
+                job,
+                config.dim,
+                config.n_layers,
+                rows,
+            )
+        })
+        .transpose()
+        .map_err(|error| HipError::new(0, &error.to_string()))?;
+    let probe_row_lookup = probe.as_ref().map(|probe| {
+        probe
+            .metadata
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| ((row.sample_index, row.position, row.token), index))
+            .collect::<std::collections::HashMap<_, _>>()
+    });
+    let mut probe_layer_values = probe.as_ref().map(|probe| {
+        (0..config.n_layers)
+            .map(|_| vec![f32::NAN; probe.row_count() * config.dim])
+            .collect::<Vec<_>>()
+    });
 
     let forward_result = (|| -> Result<CalibForward, String> {
         let mut kldref = if opts.kldref {
@@ -3600,8 +3653,37 @@ pub fn collect_calibration_artifacts_job(
                     );
                 }
             }
+            let selected_probe_rows = probe_row_lookup
+                .as_ref()
+                .map(|lookup| {
+                    batch
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(batch_row, row)| {
+                            lookup
+                                .get(&(row.sample_index, row.position, row.token))
+                                .copied()
+                                .map(|probe_row| (batch_row, probe_row))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut post_layer_capture = probe_layer_values.as_mut().and_then(|layer_values| {
+                (!selected_probe_rows.is_empty()).then_some(DensePostLayerCapture {
+                    selected_rows: &selected_probe_rows,
+                    layer_values,
+                })
+            });
             let shape = forward_prefill_dense_session_batch_with_capture(
-                gpu, weights, config, &mut rows, &pbs, &collector, &registry,
+                gpu,
+                weights,
+                config,
+                &mut rows,
+                &pbs,
+                &collector,
+                &registry,
+                post_layer_capture.as_mut(),
             )
             .map_err(|error| format!("resident calibration batch forward: {error}"))?;
             drop(rows);
@@ -3697,6 +3779,22 @@ pub fn collect_calibration_artifacts_job(
             return Err(HipError::new(0, &error));
         }
     };
+    if let (Some((path, _)), Some(mut probe), Some(layer_values)) =
+        (residual_probe, probe.take(), probe_layer_values.take())
+    {
+        for (layer, values) in layer_values.into_iter().enumerate() {
+            probe
+                .push_layer(layer, values)
+                .map_err(|error| HipError::new(0, &error.to_string()))?;
+        }
+        if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| HipError::new(0, &error.to_string()))?;
+        }
+        probe
+            .write(path)
+            .map_err(|error| HipError::new(0, &error.to_string()))?;
+    }
     let summary = finish(
         gpu,
         &collector,

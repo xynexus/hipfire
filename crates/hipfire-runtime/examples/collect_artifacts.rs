@@ -360,26 +360,17 @@ fn main() {
                 kldref: want_kldref,
                 kldref_topk: kldref_topk,
             };
-            if let (Some(path), Some(parity)) = (&residual_probe_output, &parity_job) {
-                qwen35::collect_residual_probe_job(
-                    &mut gpu,
-                    &weights,
-                    &config,
-                    &parity.job,
-                    source_arch_id,
-                    residual_probe_rows,
-                    Path::new(path),
-                )
-                .expect("collect resident residual probe");
-            }
             let summary = if let Some(parity) = &parity_job {
-                qwen35::collect_calibration_artifacts_job(
+                qwen35::collect_calibration_artifacts_job_with_residual_probe(
                     &mut gpu,
                     &weights,
                     &config,
                     &parity.job,
                     Path::new(&output),
                     &provenance,
+                    residual_probe_output
+                        .as_ref()
+                        .map(|path| (Path::new(path), residual_probe_rows)),
                 )
             } else {
                 qwen35::collect_calibration_artifacts(

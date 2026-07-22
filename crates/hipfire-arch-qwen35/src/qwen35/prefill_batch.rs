@@ -1981,6 +1981,54 @@ fn prefill_session_batch_execution_plan_from_rounds(
     }
 }
 
+/// Bounded post-layer rows selected from one resident calibration batch.
+/// `selected_rows` maps `(batch_row, canonical_probe_row)` while
+/// `layer_values` stores sample-major probe rows for every logical layer.
+pub(crate) struct DensePostLayerCapture<'a> {
+    pub selected_rows: &'a [(usize, usize)],
+    pub layer_values: &'a mut [Vec<f32>],
+}
+
+pub(crate) fn scatter_dense_post_layer_rows(
+    downloaded: &[f32],
+    batch_rows: usize,
+    hidden_width: usize,
+    canonical: &mut [f32],
+    selected_rows: &[(usize, usize)],
+) -> Result<(), String> {
+    if hidden_width == 0 {
+        return Err("resident post-layer hidden width must be nonzero".into());
+    }
+    let expected_downloaded = batch_rows
+        .checked_mul(hidden_width)
+        .ok_or_else(|| "resident post-layer download shape overflows usize".to_string())?;
+    if downloaded.len() != expected_downloaded {
+        return Err(format!(
+            "resident post-layer download has {} values, expected {expected_downloaded}",
+            downloaded.len()
+        ));
+    }
+    if !canonical.len().is_multiple_of(hidden_width) {
+        return Err(format!(
+            "resident post-layer destination has {} values, not a multiple of width {hidden_width}",
+            canonical.len()
+        ));
+    }
+    let canonical_rows = canonical.len() / hidden_width;
+    for &(batch_row, canonical_row) in selected_rows {
+        if batch_row >= batch_rows || canonical_row >= canonical_rows {
+            return Err(format!(
+                "resident post-layer row mapping ({batch_row}, {canonical_row}) exceeds batch {batch_rows} or probe {canonical_rows}"
+            ));
+        }
+        let source = batch_row * hidden_width;
+        let destination = canonical_row * hidden_width;
+        canonical[destination..destination + hidden_width]
+            .copy_from_slice(&downloaded[source..source + hidden_width]);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn forward_dense_session_batch_layers_full_precision(
     gpu: &mut Gpu,
@@ -2000,6 +2048,7 @@ fn forward_dense_session_batch_layers_full_precision(
         &hipfire_runtime::calibration::CalibCollector,
         &hipfire_runtime::calibration::contracts::CaptureRegistry,
     )>,
+    mut post_layer_capture: Option<&mut DensePostLayerCapture<'_>>,
     // Per-batch KV quant (uniform across rows — see the state-signature contract).
     // true = the sessions' KV caches are plain Q8 (Q8_0); the KV write +
     // attention use the Q8 path. false = full-precision F32 KV.
@@ -2492,6 +2541,27 @@ fn forward_dense_session_batch_layers_full_precision(
                 ));
             }
         }
+        if let Some(capture) = post_layer_capture.as_deref_mut() {
+            let downloaded =
+                gpu.download_f32(&pbs.x_batch.sub_offset(0, row_count.saturating_mul(dim)))?;
+            let canonical = capture
+                .layer_values
+                .get_mut(capture_layer_idx)
+                .ok_or_else(|| {
+                    hip_bridge::HipError::new(
+                        0,
+                        &format!("resident post-layer capture has no layer {capture_layer_idx}"),
+                    )
+                })?;
+            scatter_dense_post_layer_rows(
+                &downloaded,
+                row_count,
+                dim,
+                canonical,
+                capture.selected_rows,
+            )
+            .map_err(|error| hip_bridge::HipError::new(0, &error))?;
+        }
     }
 
     if finalize_logits {
@@ -2528,6 +2598,7 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
         &hipfire_runtime::calibration::CalibCollector,
         &hipfire_runtime::calibration::contracts::CaptureRegistry,
     )>,
+    post_layer_capture: Option<&mut DensePostLayerCapture<'_>>,
 ) -> HipResult<()> {
     forward_dense_session_batch_layers_full_precision(
         gpu,
@@ -2544,6 +2615,7 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
         true,
         finalize_logits,
         dense_capture,
+        post_layer_capture,
         kv_q8,
     )
 }
@@ -2561,6 +2633,7 @@ fn forward_prefill_dense_session_batch_impl(
         &hipfire_runtime::calibration::CalibCollector,
         &hipfire_runtime::calibration::contracts::CaptureRegistry,
     )>,
+    post_layer_capture: Option<&mut DensePostLayerCapture<'_>>,
 ) -> HipResult<DensePrefillSessionBatchShape> {
     let shape = if calibration_schedule {
         validate_dense_calibration_session_rows_for_config(rows, pbs, config)
@@ -2690,6 +2763,7 @@ fn forward_prefill_dense_session_batch_impl(
         kv_q8,
         finalize_logits,
         dense_capture,
+        post_layer_capture,
     );
     device_pointer_tables.free_gpu(gpu);
     result.map(|()| shape)
@@ -2703,7 +2777,9 @@ pub fn forward_prefill_dense_session_batch(
     _scratch: &Qwen35Scratch,
     pbs: &PrefillBatchScratch,
 ) -> HipResult<DensePrefillSessionBatchShape> {
-    forward_prefill_dense_session_batch_impl(gpu, weights, config, rows, pbs, true, false, None)
+    forward_prefill_dense_session_batch_impl(
+        gpu, weights, config, rows, pbs, true, false, None, None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2715,6 +2791,7 @@ pub(crate) fn forward_prefill_dense_session_batch_with_capture(
     pbs: &PrefillBatchScratch,
     collector: &hipfire_runtime::calibration::CalibCollector,
     registry: &hipfire_runtime::calibration::contracts::CaptureRegistry,
+    post_layer_capture: Option<&mut DensePostLayerCapture<'_>>,
 ) -> HipResult<DensePrefillSessionBatchShape> {
     forward_prefill_dense_session_batch_impl(
         gpu,
@@ -2725,6 +2802,7 @@ pub(crate) fn forward_prefill_dense_session_batch_with_capture(
         false,
         true,
         Some((collector, registry)),
+        post_layer_capture,
     )
 }
 
@@ -2803,6 +2881,7 @@ pub(crate) fn forward_streamed_dense_layer_batch(
         false,
         false,
         dense_capture,
+        None,
         false,
     )
 }
