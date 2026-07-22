@@ -61,6 +61,12 @@ Implemented and verified in this checkout:
   capture-target statistic stability is derived rather than asserted by a
   family-neutral artifact comparator over every routed-expert imatrix, with
   matched source/corpus/sample/geometry/floor policy and fallback-set gates;
+- family-neutral adapter change detection: induction rebuild discovery and the
+  Astrea engine fingerprint find every
+  `crates/hipfire-arch-*/src/calibration_stream.rs` marker without a family
+  allowlist, and bind the complete Rust source tree of each adapter crate so a
+  new family or delegated layer-math change cannot reuse a stale binary or
+  frozen sweep;
 - durable per-layer phase timing for source load/upload, teacher execution,
   capture serialization, collector finalization, and part sync/hash, persisted
   in checkpoints and the completed artifact for resume-safe ETA analysis;

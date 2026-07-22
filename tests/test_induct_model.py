@@ -238,6 +238,20 @@ def test_repo_tool_is_rebuilt_when_a_source_is_newer(tmp_path):
     assert not induct.tool_needs_build(binary, [source])
 
 
+def test_calibration_adapter_source_roots_are_discovered_without_family_list(tmp_path):
+    expected = []
+    for name in ("hipfire-arch-zeta", "hipfire-arch-alpha"):
+        source_root = tmp_path / "crates" / name / "src"
+        source_root.mkdir(parents=True)
+        (source_root / "calibration_stream.rs").write_text("// adapter\n")
+        expected.append(source_root)
+    unrelated = tmp_path / "crates" / "hipfire-arch-unrelated" / "src"
+    unrelated.mkdir(parents=True)
+    (unrelated / "lib.rs").write_text("// no calibration adapter\n")
+
+    assert induct.calibration_adapter_source_roots(tmp_path) == sorted(expected)
+
+
 def test_target_resume_requires_matching_two_pass_provenance(tmp_path):
     paths = induct.artifact_layout(tmp_path, "Qwen3.5-397B-A17B", "oq4++", ["bf16", "f16"])
     for key in ("model", "calib"):

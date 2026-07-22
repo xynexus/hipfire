@@ -460,6 +460,20 @@ def tool_needs_build(binary: Path, sources: list[Path]) -> bool:
     return False
 
 
+def calibration_adapter_source_roots(repo_root: Path = REPO_ROOT) -> list[Path]:
+    """Discover native calibration adapter crates without a family allowlist."""
+    crates = repo_root / "crates"
+    if not crates.is_dir():
+        return []
+    return sorted(
+        {
+            marker.parent
+            for marker in crates.glob("hipfire-arch-*/src/calibration_stream.rs")
+            if marker.is_file()
+        }
+    )
+
+
 def _build_commands_for_tools(
     selected: list[str], *, hipfire: Path, coexistence: Path, quantizer: Path, dflash_converter: Path, triattn_bin: Path
 ) -> list[list[str]]:
@@ -474,9 +488,7 @@ def _build_commands_for_tools(
         Path("crates/hipfire-coexistence/Cargo.toml"),
         Path("crates/hipfire-coexistence/src"),
         Path("crates/hipfire-runtime/src/calibration"),
-        Path("crates/hipfire-arch-qwen35/src/calibration_stream.rs"),
-        Path("crates/hipfire-arch-gemma3/src/calibration_stream.rs"),
-    ]
+    ] + calibration_adapter_source_roots()
     if "target" in selected and tool_needs_build(coexistence, coexistence_inputs):
         commands.append(
             ["cargo", "build", "--release", "-p", "hipfire-coexistence", "--bin", "hipfire-coexistence"]

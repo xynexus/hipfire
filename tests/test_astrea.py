@@ -1911,6 +1911,32 @@ class AstreaTests(unittest.TestCase):
             self.assertEqual(halfsplit["rope_convention_default"], "halfsplit")
             self.assertIn("crates/hipfire-rdna/src/dispatch.rs", halfsplit["source_hashes"])
 
+    def test_engine_fingerprint_discovers_every_calibration_adapter_source(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            adapter_src = root / "crates" / "hipfire-arch-example" / "src"
+            adapter_src.mkdir(parents=True)
+            (adapter_src / "calibration_stream.rs").write_text(
+                "pub struct ExampleCalibrationAdapter;\n", encoding="utf-8"
+            )
+            helper = adapter_src / "layer_math.rs"
+            helper.write_text("pub fn execute() {}\n", encoding="utf-8")
+
+            first = astrea.engine_fingerprint(root)
+            self.assertIn(
+                "crates/hipfire-arch-example/src/calibration_stream.rs",
+                first["source_hashes"],
+            )
+            self.assertIn(
+                "crates/hipfire-arch-example/src/layer_math.rs",
+                first["source_hashes"],
+            )
+
+            helper.write_text("pub fn execute() { let _changed = true; }\n", encoding="utf-8")
+            second = astrea.engine_fingerprint(root)
+            self.assertNotEqual(first["fingerprint_id"], second["fingerprint_id"])
+
     def test_metrics_embeds_engine_fingerprint(self):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:

@@ -228,8 +228,6 @@ ENGINE_HASH_PATHS = [
     "crates/hipfire-runtime/src/calibration/stream.rs",
     "crates/hipfire-runtime/src/moe/grouped.rs",
     "crates/hipfire-rdna/src/dispatch/moe.rs",
-    "crates/hipfire-arch-qwen35/src/calibration_stream.rs",
-    "crates/hipfire-arch-gemma3/src/calibration_stream.rs",
     "crates/hipfire-coexistence/src/calibrate.rs",
     "crates/hipfire-quantize/src/main.rs",
     "crates/hipfire-quantize/src/gptq.rs",
@@ -238,6 +236,32 @@ ENGINE_HASH_PATHS = [
     "scripts/two_pass_quantize.py",
     "scripts/astrea_expert_sweep.py",
 ]
+
+
+def engine_hash_paths(root):
+    """Return every source that can change native calibration or evaluation.
+
+    Calibration adapters are discovered by their common source marker instead
+    of being enumerated by family. Hash the complete adapter crate source tree:
+    a thin ``calibration_stream.rs`` can delegate model math to sibling modules,
+    and those changes must invalidate a frozen experiment too.
+    """
+    root = Path(root)
+    paths = set(ENGINE_HASH_PATHS)
+    crates = root / "crates"
+    if crates.is_dir():
+        adapter_roots = {
+            marker.parent
+            for marker in crates.glob("hipfire-arch-*/src/calibration_stream.rs")
+            if marker.is_file()
+        }
+        for adapter_root in adapter_roots:
+            paths.update(
+                source.relative_to(root).as_posix()
+                for source in adapter_root.rglob("*.rs")
+                if source.is_file()
+            )
+    return sorted(paths)
 
 GGML_TYPE_NAMES = {
     0: "F32",
@@ -2510,7 +2534,7 @@ def detect_rope_convention(root):
 def engine_fingerprint(engine_root=None):
     root = Path(engine_root) if engine_root else Path(__file__).resolve().parents[1]
     source_hashes = {}
-    for rel in ENGINE_HASH_PATHS:
+    for rel in engine_hash_paths(root):
         path = root / rel
         if path.is_file():
             source_hashes[rel] = file_sha256(path)
