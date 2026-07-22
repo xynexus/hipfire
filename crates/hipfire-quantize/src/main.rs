@@ -408,11 +408,11 @@ static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
 // The embed seeds the residual stream and rides it unnormalized across every
 // layer, so its quant error is the largest per-tensor KLD cost in an otherwise
 // low-bit (OQ4/OQ8) model. The CLI default is `source` — keep the gather table at
-// the model's source precision (bf16 -> bf16, f16 -> f16, f32 -> f16) instead of
+// the model's source precision (bf16 -> bf16, f16 -> f16, f32 -> f32) instead of
 // dropping it to Q8 — so the residual seed is un-quantized by default. `q8` opts
 // back down to the historical Q8 table (~500 MB smaller); `bf16`/`f16` force a
 // specific width. The raw bf16/f16 gather kernels convert to f32 in-kernel via
-// portable HIP intrinsics (RDNA2/3/4), so nothing widens to F32 on disk. Set once
+// portable HIP intrinsics (RDNA2/3/4); source-F32 tables remain F32. Set once
 // from main, read deep in the per-tensor quantizers (both the inline OQ loop and
 // the free `quantize_hfq_source_tensor`), avoiding a re-plumb of every arm.
 // Codes: 0 = q8, 1 = bf16 (force), 2 = f16 (force), 3 = source (CLI default).
@@ -5393,12 +5393,12 @@ fn awq_eligible(name: &str) -> bool {
 fn source_precision_tensor_bytes(
     raw_data: &[u8],
     dtype: &str,
-    f32_data: &[f32],
+    _f32_data: &[f32],
 ) -> (Vec<u8>, QuantType, &'static str) {
     match dtype {
         "BF16" => (raw_data.to_vec(), QuantType::BF16, "BF16"),
         "F16" => (raw_data.to_vec(), QuantType::F16, "F16"),
-        "F32" => (f32_slice_to_f16_bytes(f32_data), QuantType::F16, "F16"),
+        "F32" => (raw_data.to_vec(), QuantType::F32, "F32"),
         other => panic!("unsupported dtype for source-precision HFQ: {other}"),
     }
 }
@@ -5429,7 +5429,7 @@ fn embed_precision_override(
         // f16 (force): always store as f16 (readers without a bf16 gather path).
         2 => Some((f32_slice_to_f16_bytes(f32_data), QuantType::F16, 0, "F16")),
         // source (CLI default): keep the table at its source float precision
-        // (bf16 -> bf16, f16 -> f16, f32 -> f16). If the source is ALREADY quantized
+        // (bf16 -> bf16, f16 -> f16, f32 -> f32). If the source is ALREADY quantized
         // (e.g. a GGUF / re-quant .hfq with a Q8 embed), keep the caller's default
         // (None -> Q8) rather than upsampling quantized data to bf16 — this makes
         // `source` idempotent and preserves tiny-fixture / internal-test behavior
@@ -5509,7 +5509,7 @@ OPTIONS:
     --arch-id <U32>            override the auto-detected arch id stamped in the .hfq header
     --embed-precision <P>      embedding-table storage: source (default) | q8 | bf16 | f16.
                                Default `source` keeps the gather table at the model's source
-                               precision (bf16->bf16, f16->f16, f32->f16); `q8` drops it to the
+                               precision (bf16->bf16, f16->f16, f32->f32); `q8` drops it to the
                                ~500 MB-smaller Q8 table; bf16/f16 force a width. The embed seeds
                                the residual stream unnormalized, so its quant error is the largest
                                per-tensor KLD cost in an otherwise low-bit model — hence keeping it
@@ -5873,7 +5873,7 @@ fn main() {
     // table. The embed seeds the residual stream and rides it unnormalized across
     // every layer, so its quant error is the single largest per-tensor KLD cost in
     // an otherwise low-bit (OQ4/OQ8) model. Default `source` keeps the gather table
-    // at the model's source precision (bf16 -> bf16, f16 -> f16, f32 -> f16) instead
+    // at the model's source precision (bf16 -> bf16, f16 -> f16, f32 -> f32) instead
     // of dropping it to Q8, so the residual seed is un-quantized by default. `q8`
     // opts back down to the historical Q8 table (~500 MB smaller); `bf16`/`f16`
     // force a specific width. The raw bf16/f16 gather kernels convert to f32
@@ -5925,7 +5925,7 @@ fn main() {
         );
     }
     // bf16 = source-precision container: BF16 tensors stay raw BF16 (qt=16);
-    //        F16 tensors stay F16; F32 tensors fall back to F16.
+    //        F16 tensors stay F16; F32 tensors stay F32.
     // fp16 = all eligible weights stored as raw F16 (qt=1)
     // q8f16 = all weights Q8 (interleaved blocks)
     // q4f16 = all weights Q4_F16_G64
@@ -10307,15 +10307,15 @@ fn main() {
                 spilled_len: 0,
             });
         } else if use_bf16 || (is_vision && vision_quant == "bf16") {
-            // Non-BF16 source (F16/F32) — store as F16
-            let data = if meta.dtype == "F16" {
-                raw_data.to_vec()
-            } else {
-                let f32_vals = to_f32(raw_data, &meta.dtype);
-                f32_vals
-                    .iter()
-                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                    .collect()
+            // Preserve ordinary source float precision. Exotic/FP8 sources are
+            // decoded to the portable F16 fallback because HFQ has no matching
+            // raw source codec for them.
+            let (data, quant_type, label) = match meta.dtype.as_str() {
+                "F16" | "F32" => source_precision_tensor_bytes(raw_data, &meta.dtype, &[]),
+                _ => {
+                    let f32_vals = to_f32(raw_data, &meta.dtype);
+                    (f32_slice_to_f16_bytes(&f32_vals), QuantType::F16, "F16")
+                }
             };
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
@@ -10325,14 +10325,14 @@ fn main() {
                 "source fallback"
             };
             quant_log!(
-                "  F16:        {} {:?} ({:.1} KB) [{scope}]",
+                "  {label}:        {} {:?} ({:.1} KB) [{scope}]",
                 name,
                 meta.shape,
                 data.len() as f64 / 1024.0
             );
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
-                quant_type: QuantType::F16,
+                quant_type,
                 shape,
                 group_size: 0,
                 data,
@@ -14508,13 +14508,13 @@ mod tests {
     }
 
     #[test]
-    fn source_precision_converts_f32_to_f16_for_same_width_fallback() {
-        let raw = vec![0; 8];
+    fn source_precision_preserves_f32_bytes() {
+        let raw = vec![0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40];
         let f32_data = [1.0, 2.0];
         let (data, quant_type, label) = source_precision_tensor_bytes(&raw, "F32", &f32_data);
-        assert_eq!(data, vec![0x00, 0x3c, 0x00, 0x40]);
-        assert_eq!(quant_type as u8, QuantType::F16 as u8);
-        assert_eq!(label, "F16");
+        assert_eq!(data, raw);
+        assert_eq!(quant_type as u8, QuantType::F32 as u8);
+        assert_eq!(label, "F32");
     }
 
     #[test]
