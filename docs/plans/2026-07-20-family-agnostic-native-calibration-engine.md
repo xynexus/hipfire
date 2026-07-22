@@ -1481,7 +1481,14 @@ global OOM while that third load was resident; systemd killed the evaluator,
 daemon, lock waiter, and their user service before `results.jsonl` was
 published. The kernel journal records the daemon's KFD allocation failure and
 the subsequent SIGKILLs, so neither the surviving HFKSEQ nor the unfinished v5
-row is promoted to controlled sweep evidence.
+row is promoted to controlled sweep evidence. It is still valid diagnostic
+evidence: decoding the 32 complete HFKSEQ v2 chunk records yields mean KLD
+`9.0725784898`, evaluator p99 KLD `19.8141071701`, mean NLL
+`14.7343470156`, and PPL `2,506,372.42` over the expected 65,504 scored
+positions. The `min512-cap4096` candidate is therefore catastrophically poor;
+the evaluator's generic finite-metric `pass` status would not constitute
+admission. The remaining floor variants are needed to measure whether the
+larger high-precision fallback cohorts recover quality.
 
 The replacement v6 plan lives at
 `~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-plan-v6.json`
