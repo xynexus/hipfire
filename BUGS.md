@@ -12,28 +12,40 @@ into full investigations here.
 - Scope: Architectural
 - Confidence: High
 
-## [High] Excessive use of .unwrap() leading to potential panics
+## [Low] Opportunistic .unwrap() → error-handling cleanup (convention, not a tracked bug)
 - Category: Reliability / Maintainability
-- Location: Project-wide (e.g., crates/hipfire-quantize/src/main.rs, crates/hipfire-arch-deepseek4/src/forward.rs)
-- Summary: The codebase heavily relies on `.unwrap()` on Results and Options, which can cause the daemon or CLI to crash abruptly on unexpected inputs.
-- Suggested fix: Replace `.unwrap()` with proper error handling using `Result` and `?`, or provide descriptive `expect()` messages.
-- Scope: Cross-cutting
-- Confidence: High
-- Note (2026-07-21): The flagship instance previously tracked here — the
-  rotated `mq_x_rot` scratch aliasing in `hipfire-runtime/src/weights.rs`
-  (14 raw `unsafe { …as_ref().unwrap().buf.alias() }` sites) — is resolved:
-  routed through a single documented `Gpu::mq_x_rot_f32()` accessor with a
-  SAFETY comment and an actionable `expect()` message. This entry remains as a
-  broad, lower-priority cleanup for the remaining sites; no single reproducible
-  crash is currently tracked.
+- Location: Project-wide (~6.8k non-test `.unwrap()` sites; most guard true
+  invariants, not user input)
+- Summary: Prefer `?`/descriptive `expect()` over bare `.unwrap()` on paths
+  that can fail on user input or external files. This is a fix-as-you-touch
+  convention, not a specific reproducible crash — a blanket sweep is neither
+  feasible (6.8k sites) nor desirable (many unwraps encode real invariants).
+- Named exemplars — both resolved (2026-07-21/22):
+  - `hipfire-runtime/src/weights.rs`: 14 raw
+    `unsafe { …as_ref().unwrap().buf.alias() }` rotated-scratch sites → one
+    documented `Gpu::mq_x_rot_f32()` accessor (SAFETY comment + actionable
+    `expect()`).
+  - `hipfire-quantize/src/main.rs` `SafetensorsFile::open`: the model-load
+    header parse (`from_utf8`/`from_str`/`from_value`/8-byte length) now returns
+    clean `io::Error(InvalidData)` messages instead of panicking on a
+    truncated/malformed `.safetensors` file.
+- Confidence: Low (convention; no open crash tracked)
 
-## [Medium] Excessive global state via OnceLock and thread_local!
+## [Closed] "Excessive" global state via OnceLock — intentional, not a defect
 - Category: Architecture / Maintainability
-- Location: Project-wide (e.g., crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-rdna/src/dispatch/mod.rs, crates/hip-bridge/src/ffi.rs)
-- Summary: `OnceLock` / `thread_local!` are used for environment-derived behavior in hot and shared code paths, hiding explicit configuration inputs and increasing hidden coupling. Makes testing difficult and dependencies implicit.
-- Suggested fix: Inject configuration and state through structs/context objects instead of relying on global statics. When touching a module boundary, list the env-backed globals it reads and move them behind an explicit config context.
-- Scope: Architectural
-- Confidence: High
+- Location: crates/hipfire-arch-deepseek4/src/forward.rs (`mod env_cache`),
+  crates/hipfire-rdna/src/dispatch/mod.rs, crates/hip-bridge/src/ffi.rs
+- Resolution (2026-07-22): Investigated. The flagged `OnceLock`/`thread_local!`
+  statics are a deliberate, documented hot-path optimization: they cache
+  `HIPFIRE_*` env-derived debug/tuning knobs read once, because an uncached
+  `std::env::var` per lookup cost ~200μs/token (43 layers × ~5 lookups × ~1μs
+  syscall). They are set-once, read-only, and idiomatic. Converting them to
+  injected config context would re-add that per-token cost (or require threading
+  a config struct through the entire hot path) for near-zero benefit — these are
+  debug/tuning knobs, not core mutable state. Not a bug.
+- Residual guidance (minor): do not introduce globals for *core mutable state*
+  or *user-facing config*; those belong in explicit context objects. Env
+  debug/tuning knobs behind `OnceLock` remain the accepted pattern.
 
 ## [High] Stale SWA ring-buffer cache slots after speculative reject
 - Category: Reliability / Correctness

@@ -480,22 +480,59 @@ struct SafetensorsFile {
 
 impl SafetensorsFile {
     fn open(path: &Path) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind};
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // First 8 bytes: u64 LE header size
-        let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
-        let header_json = std::str::from_utf8(&mmap[8..8 + header_len]).unwrap();
+        // A malformed / truncated safetensors file must surface as a clean
+        // io::Error, not a bare index/parse panic — `open` already contracts
+        // for errors via its io::Result return.
+        let invalid = |msg: String| Error::new(ErrorKind::InvalidData, msg);
+
+        // First 8 bytes: u64 LE header size.
+        let len_bytes = mmap.get(0..8).ok_or_else(|| {
+            invalid(format!(
+                "{}: safetensors file truncated ({} bytes, need ≥8 for header length)",
+                path.display(),
+                mmap.len()
+            ))
+        })?;
+        // `len_bytes` is a guaranteed-8-byte slice, so try_into cannot fail.
+        let header_len = u64::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+
+        let header_end = 8usize.checked_add(header_len).ok_or_else(|| {
+            invalid(format!(
+                "{}: safetensors header length {header_len} overflows usize",
+                path.display()
+            ))
+        })?;
+        let header_bytes = mmap.get(8..header_end).ok_or_else(|| {
+            invalid(format!(
+                "{}: safetensors header length {header_len} exceeds file size {}",
+                path.display(),
+                mmap.len()
+            ))
+        })?;
+        let header_json = std::str::from_utf8(header_bytes).map_err(|e| {
+            invalid(format!("{}: safetensors header is not valid UTF-8: {e}", path.display()))
+        })?;
 
         // Parse header, filtering out __metadata__ key
-        let raw: serde_json::Value = serde_json::from_str(header_json).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(header_json).map_err(|e| {
+            invalid(format!("{}: safetensors header is not valid JSON: {e}", path.display()))
+        })?;
         let mut tensors = HashMap::new();
         if let serde_json::Value::Object(map) = raw {
             for (k, v) in map {
                 if k == "__metadata__" {
                     continue;
                 }
-                let meta: TensorMeta = serde_json::from_value(v).unwrap();
+                let meta: TensorMeta = serde_json::from_value(v).map_err(|e| {
+                    invalid(format!(
+                        "{}: tensor '{k}' has unexpected metadata schema: {e}",
+                        path.display()
+                    ))
+                })?;
                 tensors.insert(k, meta);
             }
         }
