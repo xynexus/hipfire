@@ -38,6 +38,8 @@ enum Command {
     /// List locally available models
     #[command(alias = "models")]
     List,
+    /// Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
+    Inspect(commands::inspect::InspectArgs),
     /// Run the quant admission/model evaluation harness
     Eval(commands::forward::EvalArgs),
     /// Quick daemon benchmark: load time, TTFT, pp512 prefill t/s, tg128 decode t/s
@@ -210,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
             commands::list::run(loaded_config);
             Ok(())
         }
+        Some(Command::Inspect(args)) => commands::inspect::run(args, loaded_config),
         Some(Command::Eval(args)) => commands::forward::run_eval(args, loaded_config),
         Some(Command::Bench(args)) => commands::bench::run(args, loaded_config).await,
         Some(Command::Doctor(args)) => commands::doctor::run(args, loaded_config).await,

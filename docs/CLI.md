@@ -13,6 +13,7 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire serve`↴](#hipfire-serve)
 * [`hipfire chat`↴](#hipfire-chat)
 * [`hipfire list`↴](#hipfire-list)
+* [`hipfire inspect`↴](#hipfire-inspect)
 * [`hipfire eval`↴](#hipfire-eval)
 * [`hipfire bench`↴](#hipfire-bench)
 * [`hipfire doctor`↴](#hipfire-doctor)
@@ -78,6 +79,7 @@ Use `hipfire <command> help` or `hipfire <command> --help` for detailed command 
 * `serve` — Start the hipfire HTTP server (OpenAI-compatible)
 * `chat` — Load a model and generate a response (one-shot)
 * `list` — List locally available models
+* `inspect` — Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
 * `eval` — Run the quant admission/model evaluation harness
 * `bench` — Quick daemon benchmark: load time, TTFT, pp512 prefill t/s, tg128 decode t/s
 * `doctor` — Diagnose the local Hipfire install, runtime, daemon, and monitoring prerequisites
@@ -230,6 +232,23 @@ Examples:
 List locally available models
 
 **Usage:** `hipfire list`
+
+
+
+## `hipfire inspect`
+
+Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
+
+**Usage:** `hipfire inspect [OPTIONS] <TARGET>`
+
+###### **Arguments:**
+
+* `<TARGET>` — Container to inspect: a `.hfq` file path or a local model alias
+
+###### **Options:**
+
+* `--tensors` — List every tensor (name, quant type, shape, group size, size)
+* `--json` — Emit a machine-readable JSON object (includes the full tensor array and the raw metadata verbatim); ignores `--tensors`
 
 
 
