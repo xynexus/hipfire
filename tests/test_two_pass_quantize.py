@@ -513,6 +513,7 @@ def test_quantization_sigterm_records_interrupted_manifest_and_can_resume(tmp_pa
         recipe=recipe,
         phase="quantization_running",
         calibration=calibration,
+        phase_timings={"quantization_seconds": 12.5},
     )
 
     def terminate(_command, *, check):
@@ -520,12 +521,17 @@ def test_quantization_sigterm_records_interrupted_manifest_and_can_resume(tmp_pa
         raise subprocess.CalledProcessError(143, ["hipfire", "lock", "acquire"])
 
     def record_failure(phase, elapsed_seconds, failure):
+        previous = json.loads(path.read_text())
         two_pass.update_manifest(
             path,
             recipe=recipe,
             phase=phase,
             failure=failure,
-            phase_timings={"last_quantization_attempt_seconds": elapsed_seconds},
+            phase_timings=two_pass.accumulate_attempt_timing(
+                previous,
+                phase_name="quantization",
+                elapsed_seconds=elapsed_seconds,
+            ),
         )
 
     with pytest.raises(subprocess.CalledProcessError):
@@ -541,6 +547,7 @@ def test_quantization_sigterm_records_interrupted_manifest_and_can_resume(tmp_pa
     assert interrupted["failure"]["kind"] == "signal"
     assert interrupted["failure"]["returncode"] == 143
     assert interrupted["failure"]["signal"] == 15
+    assert interrupted["phase_timings"]["quantization_seconds"] >= 12.5
     assert interrupted["phase_timings"]["last_quantization_attempt_seconds"] >= 0
 
     resumed = two_pass.update_manifest(path, recipe=recipe, phase="quantization_running")

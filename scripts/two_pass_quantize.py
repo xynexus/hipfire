@@ -1311,6 +1311,14 @@ def main() -> None:
         storage_preflight=storage_preflight,
     )
 
+    def quantization_attempt_timings(elapsed: float) -> dict:
+        current_manifest = json.loads(manifest_path.read_text())
+        return accumulate_attempt_timing(
+            current_manifest,
+            phase_name="quantization",
+            elapsed_seconds=elapsed,
+        )
+
     def record_quantization_failure(phase: str, elapsed: float, failure: dict) -> None:
         update_manifest(
             manifest_path,
@@ -1320,7 +1328,7 @@ def main() -> None:
             calibration_audit=calibration_audit,
             storage_preflight=storage_preflight,
             failure=failure,
-            phase_timings={"last_quantization_attempt_seconds": elapsed},
+            phase_timings=quantization_attempt_timings(elapsed),
         )
 
     quantization_seconds = run_quantization_pass(
@@ -1337,7 +1345,7 @@ def main() -> None:
         calibration_audit=calibration_audit,
         storage_preflight=storage_preflight,
         quantized=quantized,
-        phase_timings={"quantization_seconds": quantization_seconds},
+        phase_timings=quantization_attempt_timings(quantization_seconds),
     )
 
 
