@@ -3,15 +3,21 @@
 
 use hip_bridge::{HipError, HipResult};
 use hipfire_rdna::Gpu;
-use hipfire_runtime::calibration::contracts::{KldRefBuilder, KldRefRow, SampleSet};
+use hipfire_runtime::calibration::contracts::{
+    CalibError, CalibrationJob, KldRefBuilder, KldRefRow, SampleSet,
+};
+use hipfire_runtime::calibration::residual_probe::ResidualProbe;
 use hipfire_runtime::calibration::{collect_grouped, logsumexp, topk_logits, CalibForward};
+use hipfire_runtime::llama::HiddenCaptureSink;
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weights::WeightTensor;
 
 pub use hipfire_runtime::calibration::CalibSummary;
 
 use crate::config::Gemma3Config;
-use crate::forward::{embed_token, forward_prefill_batch, forward_step, Gemma3State};
+use crate::forward::{
+    embed_token, forward_prefill_batch, forward_step, forward_step_capture, Gemma3State,
+};
 use crate::weights::Gemma3Weights;
 
 pub use hipfire_runtime::calibration::contracts::KldRefOptions as CalibOpts;
@@ -253,6 +259,170 @@ pub fn collect_calibration_artifacts_samples_text_only(
     )
 }
 
+/// Resident Gemma3 parity oracle for a frozen native calibration job.
+///
+/// The optional residual probe reuses the already-loaded resident weights and
+/// captures the same settled post-FFN block boundary as the layer-streamed
+/// engine. It is a bounded debug/parity pass, not a second model load.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_calibration_artifacts_job_text_only_with_residual_probe(
+    gpu: &mut Gpu,
+    weights: &Gemma3Weights,
+    config: &Gemma3Config,
+    tokenizer: &Tokenizer,
+    job: &CalibrationJob,
+    arch_id: u32,
+    output: &std::path::Path,
+    prefix: &str,
+    provenance: &[(&str, serde_json::Value)],
+    residual_probe: Option<(&std::path::Path, usize)>,
+) -> HipResult<CalibSummary> {
+    let opts = CalibOpts {
+        kldref: job.options.kldref,
+        kldref_topk: job.options.kldref_top_k,
+    };
+    let summary = collect_calibration_artifacts_samples_text_only(
+        gpu,
+        weights,
+        config,
+        tokenizer,
+        &job.samples,
+        &opts,
+        output,
+        prefix,
+        provenance,
+    )?;
+    if let Some((path, max_rows)) = residual_probe {
+        collect_residual_probe_job_text_only(gpu, weights, config, job, arch_id, max_rows, path)?;
+    }
+    Ok(summary)
+}
+
+/// Emit a bounded resident full-stack post-layer residual probe for Gemma3.
+/// Rows follow the job's canonical sample-major order; each sample receives a
+/// fresh state so the resident oracle preserves the streamed engine's sequence
+/// independence.
+pub fn collect_residual_probe_job_text_only(
+    gpu: &mut Gpu,
+    weights: &Gemma3Weights,
+    config: &Gemma3Config,
+    job: &CalibrationJob,
+    arch_id: u32,
+    max_rows: usize,
+    output: &std::path::Path,
+) -> HipResult<()> {
+    let family = match arch_id {
+        hipfire_model::ARCH_ID_GEMMA3_TEXT => "gemma3",
+        hipfire_model::ARCH_ID_GEMMA3_VL => "gemma3-vl",
+        _ => {
+            return Err(HipError::new(
+                0,
+                &format!("gemma3 residual probe received unsupported architecture {arch_id}"),
+            ));
+        }
+    };
+    let mut probe = ResidualProbe::new(
+        arch_id,
+        family,
+        "resident-full-stack",
+        job,
+        config.hidden_size,
+        config.num_hidden_layers,
+        max_rows,
+    )
+    .map_err(|error| HipError::new(0, &error.to_string()))?;
+    let probe_rows = probe.row_count();
+    let extract_layers = (0..config.num_hidden_layers).collect::<Vec<_>>();
+    let capture_values = probe_rows
+        .checked_mul(config.num_hidden_layers)
+        .and_then(|values| values.checked_mul(config.hidden_size))
+        .ok_or_else(|| HipError::new(0, "gemma3 residual probe shape overflows usize"))?;
+    let mut position_major = Vec::with_capacity(capture_values);
+    let mut remaining = probe_rows;
+
+    for sample in job.samples.samples() {
+        if remaining == 0 {
+            break;
+        }
+        let take = sample.tokens.len().min(remaining);
+        let mut state = Gemma3State::new(gpu, config)
+            .map_err(|error| HipError::new(0, &format!("gemma3 residual probe state: {error}")))?;
+        let result = (|| {
+            let mut sink = HiddenCaptureSink {
+                extract_layers: &extract_layers,
+                hidden: &mut position_major,
+                hidden_gpu: None,
+            };
+            for &token in &sample.tokens[..take] {
+                forward_step_capture(gpu, weights, config, &mut state, token, Some(&mut sink))?;
+            }
+            Ok::<(), HipError>(())
+        })();
+        state.free_gpu(gpu);
+        result?;
+        remaining -= take;
+    }
+    if remaining != 0 {
+        return Err(HipError::new(
+            0,
+            &format!("gemma3 residual probe is missing {remaining} canonical rows"),
+        ));
+    }
+
+    let layer_values = transpose_position_major_hidden(
+        &position_major,
+        probe_rows,
+        config.num_hidden_layers,
+        config.hidden_size,
+    )
+    .map_err(|error| HipError::new(0, &error.to_string()))?;
+    for (layer, values) in layer_values.into_iter().enumerate() {
+        probe
+            .push_layer(layer, values)
+            .map_err(|error| HipError::new(0, &error.to_string()))?;
+    }
+    if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|error| HipError::new(0, &error.to_string()))?;
+    }
+    probe
+        .write(output)
+        .map_err(|error| HipError::new(0, &error.to_string()))
+}
+
+fn transpose_position_major_hidden(
+    captured: &[f32],
+    rows: usize,
+    layers: usize,
+    hidden_width: usize,
+) -> Result<Vec<Vec<f32>>, CalibError> {
+    let row_stride = layers
+        .checked_mul(hidden_width)
+        .ok_or_else(|| CalibError::InvalidOptions("residual probe shape overflow".into()))?;
+    let expected = rows
+        .checked_mul(row_stride)
+        .ok_or_else(|| CalibError::InvalidOptions("residual probe shape overflow".into()))?;
+    if captured.len() != expected {
+        return Err(CalibError::Runtime(format!(
+            "position-major residual capture has {} values, expected {expected}",
+            captured.len()
+        )));
+    }
+    let layer_values = rows
+        .checked_mul(hidden_width)
+        .ok_or_else(|| CalibError::InvalidOptions("residual probe shape overflow".into()))?;
+    let mut result = (0..layers)
+        .map(|_| vec![0.0; layer_values])
+        .collect::<Vec<_>>();
+    for row in 0..rows {
+        for (layer, values) in result.iter_mut().enumerate() {
+            let src = row * row_stride + layer * hidden_width;
+            let dst = row * hidden_width;
+            values[dst..dst + hidden_width].copy_from_slice(&captured[src..src + hidden_width]);
+        }
+    }
+    Ok(result)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_calibration_artifacts_sequences_text_only(
     gpu: &mut Gpu,
@@ -413,6 +583,8 @@ impl hipfire_runtime::calibration::CalibratableBackend for crate::arch::Gemma3Ba
 
 #[cfg(test)]
 mod tests {
+    use super::transpose_position_major_hidden;
+
     #[test]
     fn capture_names_keep_expected_prefixes() {
         assert_eq!(
@@ -423,5 +595,22 @@ mod tests {
             format!("{}model.layers.7.mlp.down_proj", "language_model."),
             "language_model.model.layers.7.mlp.down_proj"
         );
+    }
+
+    #[test]
+    fn resident_probe_transposes_position_major_capture_to_layer_major_rows() {
+        // Two rows, three layers, two hidden values. `HiddenCaptureSink`
+        // appends [row][layer][hidden], while ResidualProbe stores one
+        // [row][hidden] tensor per layer.
+        let captured = vec![
+            0.0, 1.0, 10.0, 11.0, 20.0, 21.0, // row 0
+            2.0, 3.0, 12.0, 13.0, 22.0, 23.0, // row 1
+        ];
+
+        let layers = transpose_position_major_hidden(&captured, 2, 3, 2).unwrap();
+
+        assert_eq!(layers[0], vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(layers[1], vec![10.0, 11.0, 12.0, 13.0]);
+        assert_eq!(layers[2], vec![20.0, 21.0, 22.0, 23.0]);
     }
 }

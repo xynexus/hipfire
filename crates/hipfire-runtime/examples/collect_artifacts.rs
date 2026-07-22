@@ -167,8 +167,8 @@ fn main() {
         );
     }
     assert!(
-        residual_probe_output.is_none() || matches!(source_arch_id, 5 | 6),
-        "resident residual probes are currently implemented for Qwen3.5 arch 5/6"
+        residual_probe_output.is_none() || matches!(source_arch_id, 5 | 6 | 12 | 13),
+        "resident residual probes are implemented for Qwen3.5 arch 5/6 and Gemma3 arch 12/13"
     );
 
     let embedding_metadata =
@@ -409,16 +409,19 @@ fn main() {
                 .as_ref()
                 .expect("gemma3 text-only collect needs a tokenizer (not --synthetic-tokens)");
             let summary = if let Some(parity) = &parity_job {
-                gemma3_calib::collect_calibration_artifacts_samples_text_only(
+                gemma3_calib::collect_calibration_artifacts_job_text_only_with_residual_probe(
                     &mut gpu,
                     &weights,
                     &config,
                     tokenizer,
-                    &parity.job.samples,
-                    &opts,
+                    &parity.job,
+                    source_arch_id,
                     Path::new(&output),
                     prefix,
                     &provenance,
+                    residual_probe_output
+                        .as_ref()
+                        .map(|path| (Path::new(path), residual_probe_rows)),
                 )
             } else {
                 gemma3_calib::collect_calibration_artifacts_text_only(
