@@ -430,6 +430,74 @@ def test_interrupted_manifest_resume_preserves_completed_calibration(tmp_path):
     }
 
 
+def test_calibration_sigkill_records_attempt_time_and_can_resume(tmp_path):
+    path = tmp_path / "two-pass.json"
+    calib = tmp_path / "Tiny.calib.hfq"
+    recipe = {"recipe_fingerprint": "sha256:recipe"}
+    execution = {
+        "mode": "segmented",
+        "process_segment_layers": 2,
+        "release_seconds": 0,
+        "segments": [
+            {
+                "started_after_layer": 0,
+                "pause_after_layer": 2,
+                "completed_layers": 2,
+                "artifact_complete": False,
+            }
+        ],
+    }
+    two_pass.update_manifest(
+        path,
+        recipe=recipe,
+        phase="calibration_running",
+        calibration_execution=execution,
+        phase_timings={"calibration_seconds": 12.5},
+    )
+
+    def terminate(_command, *, check):
+        assert check is True
+        raise subprocess.CalledProcessError(-9, ["hipfire-coexistence", "calibrate"])
+
+    def record_failure(phase, elapsed_seconds, failure):
+        previous = json.loads(path.read_text())
+        two_pass.update_manifest(
+            path,
+            recipe=recipe,
+            phase=phase,
+            failure=failure,
+            phase_timings=two_pass.accumulate_attempt_timing(
+                previous,
+                phase_name="calibration",
+                elapsed_seconds=elapsed_seconds,
+            ),
+        )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        two_pass.run_calibration_attempt(
+            ["hipfire-coexistence", "calibrate", "--output", str(calib), "--resume"],
+            calib=calib,
+            total_layers=4,
+            segment_layers=0,
+            runner=terminate,
+            on_failure=record_failure,
+        )
+
+    interrupted = json.loads(path.read_text())
+    assert interrupted["status"] == "calibration_interrupted"
+    assert interrupted["calibration_execution"] == execution
+    assert interrupted["failure"]["kind"] == "signal"
+    assert interrupted["failure"]["returncode"] == -9
+    assert interrupted["failure"]["signal"] == 9
+    assert interrupted["phase_timings"]["calibration_seconds"] >= 12.5
+    assert interrupted["phase_timings"]["last_calibration_attempt_seconds"] >= 0
+
+    resumed = two_pass.update_manifest(path, recipe=recipe, phase="calibration_running")
+    assert resumed["status"] == "calibration_running"
+    assert resumed["calibration_execution"] == execution
+    assert "failure" not in resumed
+
+
 def test_quantization_sigterm_records_interrupted_manifest_and_can_resume(tmp_path):
     path = tmp_path / "two-pass.json"
     recipe = {"recipe_fingerprint": "sha256:recipe"}

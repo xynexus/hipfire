@@ -617,6 +617,23 @@ def update_manifest(
     return manifest
 
 
+def accumulate_attempt_timing(
+    manifest: dict,
+    *,
+    phase_name: str,
+    elapsed_seconds: float,
+) -> dict:
+    """Return cumulative and last-attempt timing fields for one workflow phase."""
+
+    timings = manifest.get("phase_timings", {})
+    prior_seconds = timings.get(f"{phase_name}_seconds", 0.0)
+    elapsed_seconds = round(float(elapsed_seconds), 6)
+    return {
+        f"{phase_name}_seconds": round(float(prior_seconds) + elapsed_seconds, 6),
+        f"last_{phase_name}_attempt_seconds": elapsed_seconds,
+    }
+
+
 def inspect_artifact(coexistence: str, path: Path) -> dict:
     result = subprocess.run(
         [coexistence, "artifact", "inspect", "--input", str(path)],
@@ -790,7 +807,7 @@ def run_calibration_pass(
             time.sleep(release_seconds)
 
 
-def _quantization_failure(error: BaseException) -> tuple[str, dict]:
+def _phase_failure(phase_name: str, error: BaseException) -> tuple[str, dict]:
     failure = {
         "recorded_at": _utc_now(),
         "kind": "exception",
@@ -802,17 +819,54 @@ def _quantization_failure(error: BaseException) -> tuple[str, dict]:
     elif isinstance(error, subprocess.CalledProcessError):
         returncode = error.returncode
         failure["returncode"] = returncode
-        if returncode in (-2, -15):
+        if returncode < 0:
             signal_number = -returncode
-        elif returncode in (130, 143):
+        elif 129 <= returncode <= 192:
             signal_number = returncode - 128
         else:
             failure["kind"] = "process_error"
     if signal_number is not None:
         failure["kind"] = "signal"
         failure["signal"] = signal_number
-        return "quantization_interrupted", failure
-    return "quantization_failed", failure
+        return f"{phase_name}_interrupted", failure
+    return f"{phase_name}_failed", failure
+
+
+def _quantization_failure(error: BaseException) -> tuple[str, dict]:
+    return _phase_failure("quantization", error)
+
+
+def run_calibration_attempt(
+    collect_exec: list[str],
+    *,
+    calib: Path,
+    total_layers: int,
+    segment_layers: int,
+    runner=subprocess.run,
+    release_seconds: int = DEFAULT_CALIBRATION_SEGMENT_RELEASE_SECONDS,
+    progress=None,
+    on_failure=None,
+) -> tuple[dict, float]:
+    """Run pass one and durably report its wall time before propagating failure."""
+
+    started = time.monotonic()
+    try:
+        execution = run_calibration_pass(
+            collect_exec,
+            calib=calib,
+            total_layers=total_layers,
+            segment_layers=segment_layers,
+            runner=runner,
+            release_seconds=release_seconds,
+            progress=progress,
+        )
+    except BaseException as error:
+        elapsed = round(time.monotonic() - started, 6)
+        phase, failure = _phase_failure("calibration", error)
+        if on_failure is not None:
+            on_failure(phase, elapsed, failure)
+        raise
+    return execution, round(time.monotonic() - started, 6)
 
 
 def run_quantization_pass(
@@ -1178,8 +1232,25 @@ def main() -> None:
         total_layers = model_plan.get("layers")
         if not isinstance(total_layers, int) or total_layers < 1:
             raise RuntimeError(f"native calibration plan has invalid model.layers: {total_layers!r}")
-        calibration_started = time.monotonic()
-        calibration_execution = run_calibration_pass(
+
+        def calibration_attempt_timings(elapsed: float) -> dict:
+            current_manifest = json.loads(manifest_path.read_text())
+            return accumulate_attempt_timing(
+                current_manifest,
+                phase_name="calibration",
+                elapsed_seconds=elapsed,
+            )
+
+        def record_calibration_failure(phase: str, elapsed: float, failure: dict) -> None:
+            update_manifest(
+                manifest_path,
+                recipe=recipe,
+                phase=phase,
+                failure=failure,
+                phase_timings=calibration_attempt_timings(elapsed),
+            )
+
+        calibration_execution, calibration_attempt_seconds = run_calibration_attempt(
             collect_exec,
             calib=args.calib,
             total_layers=total_layers,
@@ -1190,22 +1261,14 @@ def main() -> None:
                 phase="calibration_running",
                 calibration_execution=execution,
             ),
-        )
-        calibration_attempt_seconds = round(time.monotonic() - calibration_started, 6)
-        prior_calibration_seconds = previous.get("phase_timings", {}).get(
-            "calibration_seconds", 0.0
+            on_failure=record_calibration_failure,
         )
         update_manifest(
             manifest_path,
             recipe=recipe,
             phase="calibration_validating",
             calibration_execution=calibration_execution,
-            phase_timings={
-                "calibration_seconds": round(
-                    float(prior_calibration_seconds) + calibration_attempt_seconds, 6
-                ),
-                "last_calibration_attempt_seconds": calibration_attempt_seconds,
-            },
+            phase_timings=calibration_attempt_timings(calibration_attempt_seconds),
         )
     calibration = inspect_artifact(args.coexistence, args.calib)
     validate_calibration_inspection(calibration)
