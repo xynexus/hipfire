@@ -121,6 +121,10 @@ Implemented and verified in this checkout:
   TriAttention sidecars, calibration artifact, and two-pass manifest;
 - `./tests/no-gpu-ci.sh`, affected tiny-model GPU coverage, GPU calibration
   reduction/grouped-capture/KLD tests, and mixed/paged expert parity on gfx1151;
+  the full no-GPU gate was rerun successfully at branch head `04ee8e499` after
+  the Gemma residual-probe and link-time adapter-registry changes, including all
+  Rust checks/tests, every fixture round-trip, the resident/streamed workflow
+  checks, 160 Python tests, and generated documentation/schema freshness;
 - compile-only portability coverage for the family-neutral raw grouped-expert
   fallback: `gemm_raw_moe_grouped_portable.hip` builds with `hipcc --genco`
   for gfx1030, gfx1100, gfx1151, gfx1201, gfx942, and gfx906. This proves the
@@ -1536,6 +1540,13 @@ KLDREF, 512/1,024/2,048/4,096 floor axis, fixed 4,096-row capture target, and
 64x32 geometry. The verified launcher restarted `min512-cap4096` from layer 0
 at 12:59 AWST on 2026-07-22. No v7 variant is evidence until its complete
 manifest, audit, inspection, and held-out quality row exist.
+
+The durable v7 worktree remains detached at `11fa64067` for every numerical
+variant. Later commits through `04ee8e499` add Gemma resident parity capture,
+documentation, and family-owned link-time adapter registration; they do not
+advance, rebuild, or partially mix the frozen sweep producer. Any future sweep
+that needs those changes must receive a new engine fingerprint and plan rather
+than being compared as another v7 variant.
 
 ## Performance methodology
 
