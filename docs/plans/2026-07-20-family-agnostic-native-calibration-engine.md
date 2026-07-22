@@ -1455,8 +1455,8 @@ from the low-bit eligibility rule. Astrea selects the default cap from measured
 quality/cost evidence; a cap is not declared safe merely because every expert
 met the minimum.
 
-The minimum-floor contract is frozen and executing. Its current v5 plan lives
-at
+The original minimum-floor contract remains preserved as historical v5
+evidence. Its plan lives at
 `~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-plan-v5.json`
 with fingerprint
 `sha256:1cf68e2add20d200dc069c53d549ca8c9750ab23504384abae7c6526110d4b71`
@@ -1473,11 +1473,34 @@ held-out corpus
 the 512/1,024/2,048/4,096 floors, fixed 4,096-row capture target, 64x32
 microbatch geometry, no source lookahead, and 32 daemon-backed quality chunks.
 The frozen checkout at commit `8a9255795` still verifies the complete plan,
-engine, dataset, command, and output identity before each variant. The first
-`min512-cap4096` teacher and OQ4.25++ AWQ+LDLQ candidate are complete; its
-held-out quality row is running, while the remaining three variants are not
-yet evidence. This remains an in-progress controlled experiment, not an
-expert-floor selection. The implemented `expert-sweep-results` and
+engine, dataset, command, and output identity. The first `min512-cap4096`
+teacher and OQ4.25++ AWQ+LDLQ candidate are complete. Candidate scoring wrote a
+complete 32-chunk HFKSEQ, but the v5 evaluator then loaded the OQ8 reference a
+third time to compute a redundant self-score. At 10:23:50 AWST the host entered
+global OOM while that third load was resident; systemd killed the evaluator,
+daemon, lock waiter, and their user service before `results.jsonl` was
+published. The kernel journal records the daemon's KFD allocation failure and
+the subsequent SIGKILLs, so neither the surviving HFKSEQ nor the unfinished v5
+row is promoted to controlled sweep evidence.
+
+The replacement v6 plan lives at
+`~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum-plan-v6.json`
+with fingerprint
+`sha256:63604d79c4fa9fcc7966b342c25404bc05cdca1d34b053dca460020651fcf941`
+and engine fingerprint
+`1b78ff5069f68251b8273e456c2543277dee91738613d3d9cf6f1ebc020a9b8f`.
+It binds the same corpora, recipe axis, and four floor variants, but replaces
+the per-candidate reference-model load with the complete shared 52,657,126-byte
+HFKREF at
+`~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/heldout.oq8.kldref`,
+SHA256
+`6bd59f2e78a2f3685653fe54f44b4084c0db602e1c48e5178bd7533413a3798e`.
+Every v6 evaluation command uses `--kldref` and contains no `--reference`, so
+each held-out row performs one candidate load after the single shared reference
+build. The verified v6 launcher started `min512-cap4096` at 10:27 AWST from a
+clean detached engine worktree at commit `4ef84b4c8`; no v6 quality row is yet
+evidence. This remains an in-progress controlled experiment, not an expert-floor
+selection. The implemented `expert-sweep-results` and
 `expert-sweep-analyze` commands can only report `complete_selection_required`:
 they require the complete frozen variant set, finite KLD/PPL and cost rows,
 exact fallback sets, monotonic minimum-floor cohorts, and a valid fingerprinted
@@ -1521,7 +1544,7 @@ does not mean the production artifact or admission ladder is complete.
 | 6. Independent batched state and chosen geometry | Proven on gfx1151 | Ragged independent-state scheduler tests and the Qwen layer-0 batch/row sweeps select batch 64, time tile 32, and 2,048 rows for this host. |
 | 7. Shared grouped-MoE substrate | Mechanism proven; serving gate blocked by state contract | Scratch/routing/capture live in `hipfire-runtime`, the routed executor in `hipfire-dispatch`, and Qwen admits K=8/K=10. Production exercises raw K=10. The refreshed 35B serving gate now resolves an HFQ path to its catalog request id, applies typed CLI overrides for bounded max-seq/max-tokens/Q8 KV, and preserves daemon decode telemetry through `/health`. Serial-reference execution reaches a real decode step with complete metadata. The fused grouped-MoE arm then fails honestly because the sanctioned DeltaNet state is FP32 while its MQ4 control path requires Q8 (`first MoE target is Q8 DeltaNet state`). The removed `HIPFIRE_QWEN35_STATE_QUANT` variable is not revived to hide that incompatibility; matched grouped-versus-reference serving parity remains pending an admitted FP32/FP16 grouped state path. |
 | 8. Second family | Proven | Gemma3-text uses the same engine/CLI, completed a 62-layer pause/resume stream, and completed a bounded calibrated second-pass join without a generic family branch. The new index-only auditor passes its 434-Hessian/434-imatrix artifact, 809/809 logical ledger, and KLDREF structure without a family branch. |
-| 9. Resident/streamed parity and quality | Streamed dense path and held-out quality proven; resident oracle gate failed | The Qwen3.5 adapter now accepts dense checkpoints, aliases a tied lm-head to the embedding source, loads dense DeltaNet/FullAttention layers, and records the four dense capture roles without expert quotas. A real Qwen3.5-0.8B stream completed 24 layers over 4,096 rows at `sequence_batch=8,time_tile=32`, writing 186 Hessians, 186 imatrices, 4,088 top-64 KLDREF positions, and a clean 321/321 logical read ledger (320 physical reads because the lm-head is tied). The index-only audit accepts the 557,946,848-byte artifact with fingerprint `fnv64:75d42878dcf3b117` and no warnings. A separate `1x1` streamed diagnostic and the `8x32` run are value-identical across all 24 post-layer residual probes for the same first 16 token rows, proving microbatch invariance for this channel. The independent resident gate does **not** pass: its single-token decode oracle double-counts dense down-projection rows (8,192 versus 4,096), differs in 205/375 tensors and 20,163,190 values, and differs in 393,128/393,216 residual values (`max_abs=31.031164`). A freshly regenerated BF16 HFQ produces the same oracle drift. Layer-0 query-input statistics are nearly identical while drift appears after the independent decode-versus-batched attention/output path, so this is recorded as an unresolved oracle/path comparison rather than hidden or promoted to parity. Both calibration artifacts then quantized the same safetensors source as `oq4.25++` with AWQ+LDLQ, with 186/186 successful LDLQ tensors and no missing or shape-mismatched Hessians. On 32 held-out 2,048-token WikiText chunks against one shared BF16 KLD reference, streamed calibration improves mean KLD from `0.0616636` to `0.0606582` (-1.63%), evaluator p99 KLD from `0.0860908` to `0.0813802` (-5.47%), and PPL from `18.5264` to `17.9813` (-2.94%); BF16 PPL is `17.3781`. Streamed wins 19/32 chunks; the paired bootstrap 95% CI for mean-KLD delta is `[-0.002432, 0.000428]`, so the point estimate favors streamed without claiming statistical separation at this sample size. All three quality rows pass. The aggregate admission verdict still rejects both quantized candidates against the exact BF16 self-reference because its zero-KLD comparator treats every positive KLD as a regression; that generic verdict is not used as the resident-versus-streamed decision. |
+| 9. Resident/streamed parity and quality | Streamed dense path and held-out quality proven; refreshed resident oracle pending | The Qwen3.5 adapter now accepts dense checkpoints, aliases a tied lm-head to the embedding source, loads dense DeltaNet/FullAttention layers, and records the four dense capture roles without expert quotas. A real Qwen3.5-0.8B stream completed 24 layers over 4,096 rows at `sequence_batch=8,time_tile=32`, writing 186 Hessians, 186 imatrices, 4,088 top-64 KLDREF positions, and a clean 321/321 logical read ledger (320 physical reads because the lm-head is tied). The index-only audit accepts the 557,946,848-byte artifact with fingerprint `fnv64:75d42878dcf3b117` and no warnings. A separate `1x1` streamed diagnostic and the `8x32` run are value-identical across all 24 post-layer residual probes for the same first 16 token rows, proving microbatch invariance for this channel. The old independent resident gate does **not** pass: its single-token decode oracle double-counts dense down-projection rows (8,192 versus 4,096), differs in 205/375 tensors and 20,163,190 values, and differs in 393,128/393,216 residual values (`max_abs=31.031164`). A freshly regenerated BF16 HFQ produces the same oracle drift. Source inspection found the exact count bug: BF16 `weight_gemv` and `weight_gemm` captured at their generic wrapper and again at the labeled BF16 WMMA chokepoint. Commit `ca6fe7d3b` assigns one capture owner per full-precision dispatch shape and adds a regression contract; all 244 active `hipfire-runtime` unit tests pass. A fresh GPU artifact is still required before the row-count discrepancy is called fixed, and the decode-versus-batched residual drift remains a separate comparison. Both old calibration artifacts quantized the same safetensors source as `oq4.25++` with AWQ+LDLQ, with 186/186 successful LDLQ tensors and no missing or shape-mismatched Hessians. On 32 held-out 2,048-token WikiText chunks against one shared BF16 KLD reference, streamed calibration improves mean KLD from `0.0616636` to `0.0606582` (-1.63%), evaluator p99 KLD from `0.0860908` to `0.0813802` (-5.47%), and PPL from `18.5264` to `17.9813` (-2.94%); BF16 PPL is `17.3781`. Streamed wins 19/32 chunks; the paired bootstrap 95% CI for mean-KLD delta is `[-0.002432, 0.000428]`, so the point estimate favors streamed without claiming statistical separation at this sample size. All three quality rows pass. The aggregate admission verdict still rejects both quantized candidates against the exact BF16 self-reference because its zero-KLD comparator treats every positive KLD as a regression; that generic verdict is not used as the resident-versus-streamed decision. |
 | 10. Precision portability | Partial; channel-ready | BF16/F16 conversion tests plus both grouped-expert and family-neutral dense/KLD raw-kernel compile coverage pass for RDNA2/3/4 and CDNA targets. Dense projections select WMMA only on capable architectures and otherwise use the scalar F16/BF16 fallback. The raw grouped channel binary no longer skips non-gfx1151 devices: it runs the portable F16/BF16 CPU-oracle comparison everywhere and emits an explicit architecture/dtype failure when the path cannot JIT or launch. Dispatch tests enumerate gfx906, gfx1030, gfx1100, gfx1200/1201, and gfx942. The refreshed gfx1151 row is prepared but paused; real execution or rejection rows from the other classes are still required. |
 | 11. Native workflow documentation | Proven | `MODEL-INDUCTION.md` and `QUANTIZE.md` name native calibration as default, Python as oracle/tooling only, and `oq4.25++` as the default quant. |
 
