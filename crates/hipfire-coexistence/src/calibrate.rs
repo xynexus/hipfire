@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Family-neutral native layer-stream calibration orchestration.
 
-use hipfire_arch_gemma3::calibration_stream::Gemma3CalibrationAdapter;
-use hipfire_arch_qwen35::calibration_stream::Qwen35CalibrationAdapter;
+// Rust drops dependency rlibs that have no referenced items. These imports are
+// the coexistence tool's aggregation edge for the family-owned inventory
+// submissions; adapter factories and architecture ownership stay in the family
+// crates rather than a generic CLI table.
+#[allow(unused_imports)]
+use hipfire_arch_gemma3 as _;
+#[allow(unused_imports)]
+use hipfire_arch_qwen35 as _;
 use hipfire_hash::{file_hash, stable_hash_bytes};
 use hipfire_model::tokenizer::Tokenizer;
-use hipfire_model::{ModelSource, ARCH_ID_GEMMA3_TEXT, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE};
+use hipfire_model::ModelSource;
 use hipfire_rdna::Gpu;
 use hipfire_runtime::calibration::boundary::{BoundaryBackend, BoundaryCheckpoint, BoundaryStore};
 use hipfire_runtime::calibration::contracts::{
@@ -19,7 +25,9 @@ use hipfire_runtime::calibration::source::{
     LayerPrefetch, LayerPrefetchReport, PlannedTensorReader, ReadLedger, ReadLedgerSnapshot,
     TensorLoadPlan, TensorOwner, LAYER_PREFETCH_WORKER_CHUNK_BYTES,
 };
-use hipfire_runtime::calibration::stream::{CalibrationFamilyAdapter, ModelInspection};
+use hipfire_runtime::calibration::stream::{
+    registered_calibration_adapter, CalibrationFamilyAdapter, ModelInspection,
+};
 use hipfire_runtime::calibration::{
     build_calibration_metadata, combine_calib_parts, CalibSummary, CalibTensorDesc,
 };
@@ -482,54 +490,18 @@ struct ResolvedAdapter {
     adapter: Box<dyn CalibrationFamilyAdapter>,
 }
 
-struct AdapterRegistration {
-    family: &'static str,
-    version: &'static str,
-    arch_ids: &'static [u32],
-    factory: fn() -> Box<dyn CalibrationFamilyAdapter>,
-}
-
-const QWEN35_ARCH_IDS: &[u32] = &[ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE];
-const GEMMA3_ARCH_IDS: &[u32] = &[ARCH_ID_GEMMA3_TEXT];
-const ADAPTERS: &[AdapterRegistration] = &[
-    AdapterRegistration {
-        family: "qwen3.5",
-        version: "qwen3.5-stream-v2",
-        arch_ids: QWEN35_ARCH_IDS,
-        factory: || Box::new(Qwen35CalibrationAdapter::default()),
-    },
-    AdapterRegistration {
-        family: "gemma3",
-        version: "gemma3-stream-v1",
-        arch_ids: GEMMA3_ARCH_IDS,
-        factory: || Box::new(Gemma3CalibrationAdapter::default()),
-    },
-];
-
 fn resolve_adapter(source: &dyn ModelSource) -> Result<ResolvedAdapter, CalibError> {
-    let registration = ADAPTERS
-        .iter()
-        .find(|registration| registration.arch_ids.contains(&source.arch_id()))
-        .ok_or_else(|| {
-            CalibError::InvalidSourcePlan(format!(
-                "no native calibration adapter is registered for architecture {}",
-                source.arch_id()
-            ))
-        })?;
-    let adapter = (registration.factory)();
-    if adapter.family() != registration.family || adapter.adapter_version() != registration.version
-    {
-        return Err(CalibError::InvalidSourcePlan(format!(
-            "calibration adapter registration {}@{} disagrees with its implementation {}@{}",
-            registration.family,
-            registration.version,
-            adapter.family(),
-            adapter.adapter_version()
-        )));
-    }
+    let adapter = registered_calibration_adapter(source.arch_id())?.ok_or_else(|| {
+        CalibError::InvalidSourcePlan(format!(
+            "no native calibration adapter is registered for architecture {}",
+            source.arch_id()
+        ))
+    })?;
+    let family = adapter.family();
+    let version = adapter.adapter_version();
     Ok(ResolvedAdapter {
-        family: registration.family,
-        version: registration.version,
+        family,
+        version,
         adapter,
     })
 }
@@ -2945,22 +2917,24 @@ mod tests {
     }
 
     #[test]
-    fn calibration_adapter_registry_has_unique_arches_and_matching_factories() {
-        let mut registered_arches = std::collections::BTreeSet::new();
-        for registration in ADAPTERS {
-            assert!(!registration.family.is_empty());
-            assert!(!registration.version.is_empty());
-            assert!(!registration.arch_ids.is_empty());
-            let adapter = (registration.factory)();
-            assert_eq!(adapter.family(), registration.family);
-            assert_eq!(adapter.adapter_version(), registration.version);
-            for &arch_id in registration.arch_ids {
-                assert!(
-                    registered_arches.insert(arch_id),
-                    "architecture {arch_id} has more than one calibration adapter"
-                );
-            }
+    fn linked_calibration_adapters_are_unique_and_resolve_by_architecture() {
+        use hipfire_runtime::calibration::stream::{
+            registered_calibration_adapter, validate_calibration_adapter_registry,
+        };
+
+        validate_calibration_adapter_registry().unwrap();
+        for (arch_id, family, version) in [
+            (5, "qwen3.5", "qwen3.5-stream-v2"),
+            (6, "qwen3.5", "qwen3.5-stream-v2"),
+            (12, "gemma3", "gemma3-stream-v1"),
+        ] {
+            let adapter = registered_calibration_adapter(arch_id)
+                .unwrap()
+                .expect("linked calibration adapter");
+            assert_eq!(adapter.family(), family);
+            assert_eq!(adapter.adapter_version(), version);
         }
+        assert!(registered_calibration_adapter(u32::MAX).unwrap().is_none());
     }
 
     #[test]

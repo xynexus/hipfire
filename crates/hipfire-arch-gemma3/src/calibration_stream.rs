@@ -32,6 +32,19 @@ pub struct Gemma3CalibrationAdapter {
     source_dtypes: Vec<String>,
 }
 
+const GEMMA3_CALIBRATION_ARCH_IDS: &[u32] = &[ARCH_ID_GEMMA3_TEXT];
+
+fn gemma3_calibration_adapter_factory() -> Box<dyn CalibrationFamilyAdapter> {
+    Box::new(Gemma3CalibrationAdapter::default())
+}
+
+hipfire_runtime::register_calibration_adapter!(
+    "gemma3",
+    "gemma3-stream-v1",
+    GEMMA3_CALIBRATION_ARCH_IDS,
+    gemma3_calibration_adapter_factory
+);
+
 impl Gemma3CalibrationAdapter {
     fn config(&self) -> Result<&Gemma3Config, CalibError> {
         self.config.as_ref().ok_or_else(|| {

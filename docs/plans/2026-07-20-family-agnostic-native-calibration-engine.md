@@ -20,8 +20,10 @@ Implemented and verified in this checkout:
 - family-neutral calibration contracts, sample boundaries, deterministic
   scheduling, F32 RAM/mmap boundary stores, tensor plans, read ledger, resume,
   KLDREF packing, and canonical calibration metadata;
-- registered Qwen3.5 and Gemma3-text source adapters selected by architecture
-  metadata rather than a family-specific CLI option, with registry tests for
+- link-time, family-owned Qwen3.5 and Gemma3-text source-adapter registrations
+  selected by architecture metadata rather than a family-specific CLI option;
+  the generic coexistence tool only force-links its compiled adapter crates and
+  no longer owns a Qwen/Gemma factory table, while registry tests enforce
   unique architecture ownership and factory/implementation identity;
 - a Gemma-owned resident parity seam that reuses the already-loaded model to
   capture bounded post-FFN residuals with fresh state per independent sample,

@@ -455,6 +455,87 @@ pub trait CalibrationFamilyAdapter {
     ) -> Result<Box<dyn CalibrationFinalizer>, CalibError>;
 }
 
+/// One link-time calibration-adapter registration. Family crates publish these
+/// beside their tensor naming and layer math so the generic coexistence CLI can
+/// resolve an architecture without maintaining a family factory table.
+#[doc(hidden)]
+pub struct CalibrationAdapterEntry {
+    pub family: &'static str,
+    pub version: &'static str,
+    pub arch_ids: &'static [u32],
+    pub factory: fn() -> Box<dyn CalibrationFamilyAdapter>,
+}
+
+inventory::collect!(CalibrationAdapterEntry);
+
+/// Validate every linked calibration adapter and reject incomplete, mismatched,
+/// or duplicate architecture ownership before a model is loaded.
+pub fn validate_calibration_adapter_registry() -> Result<(), CalibError> {
+    let mut registered_arches = std::collections::BTreeMap::<u32, &'static str>::new();
+    for registration in inventory::iter::<CalibrationAdapterEntry> {
+        if registration.family.is_empty()
+            || registration.version.is_empty()
+            || registration.arch_ids.is_empty()
+        {
+            return Err(CalibError::InvalidSourcePlan(
+                "calibration adapter registration has an empty family, version, or architecture set"
+                    .into(),
+            ));
+        }
+        let adapter = (registration.factory)();
+        if adapter.family() != registration.family
+            || adapter.adapter_version() != registration.version
+        {
+            return Err(CalibError::InvalidSourcePlan(format!(
+                "calibration adapter registration {}@{} disagrees with its implementation {}@{}",
+                registration.family,
+                registration.version,
+                adapter.family(),
+                adapter.adapter_version(),
+            )));
+        }
+        for &arch_id in registration.arch_ids {
+            if let Some(previous) = registered_arches.insert(arch_id, registration.family) {
+                return Err(CalibError::InvalidSourcePlan(format!(
+                    "architecture {arch_id} has calibration adapters from both {previous} and {}",
+                    registration.family,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Construct the single linked calibration adapter that owns `arch_id`.
+pub fn registered_calibration_adapter(
+    arch_id: u32,
+) -> Result<Option<Box<dyn CalibrationFamilyAdapter>>, CalibError> {
+    validate_calibration_adapter_registry()?;
+    let registration = inventory::iter::<CalibrationAdapterEntry>
+        .into_iter()
+        .find(|registration| registration.arch_ids.contains(&arch_id));
+    Ok(registration.map(|registration| (registration.factory)()))
+}
+
+/// Register a family-owned native calibration adapter without adding a family
+/// branch to the generic coexistence tool.
+#[macro_export]
+macro_rules! register_calibration_adapter {
+    ($family:expr, $version:expr, $arch_ids:path, $factory:path) => {
+        $crate::calibration::stream::__private_inventory::submit! {
+            $crate::calibration::stream::CalibrationAdapterEntry {
+                family: $family,
+                version: $version,
+                arch_ids: $arch_ids,
+                factory: $factory,
+            }
+        }
+    };
+}
+
+#[doc(hidden)]
+pub use inventory as __private_inventory;
+
 #[cfg(test)]
 mod tests {
     use super::*;

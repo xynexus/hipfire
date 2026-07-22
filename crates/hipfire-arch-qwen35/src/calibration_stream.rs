@@ -16,7 +16,7 @@ use crate::qwen35::{
     SharedExpertWeights, StateQuant,
 };
 use hip_bridge::DeviceBuffer;
-use hipfire_model::ModelSource;
+use hipfire_model::{ModelSource, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::calibration::contracts::{
     CalibError, CalibrationJob, CaptureDescriptor, CaptureId, CapturePolicy, CaptureRegistry,
@@ -46,6 +46,19 @@ pub struct Qwen35CalibrationAdapter {
     config: Option<Qwen35Config>,
     source_dtypes: Vec<String>,
 }
+
+const QWEN35_CALIBRATION_ARCH_IDS: &[u32] = &[ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE];
+
+fn qwen35_calibration_adapter_factory() -> Box<dyn CalibrationFamilyAdapter> {
+    Box::new(Qwen35CalibrationAdapter::default())
+}
+
+hipfire_runtime::register_calibration_adapter!(
+    "qwen3.5",
+    "qwen3.5-stream-v2",
+    QWEN35_CALIBRATION_ARCH_IDS,
+    qwen35_calibration_adapter_factory
+);
 
 impl Qwen35CalibrationAdapter {
     fn config(&self) -> Result<&Qwen35Config, CalibError> {
