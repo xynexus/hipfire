@@ -32,9 +32,13 @@ Implemented and verified in this checkout:
 - shared grouped-MoE routing/scratch/capture machinery, K=8/K=10 tests and
   normal Qwen grouped-prefill admission (GPU top-K at K=8, deterministic host
   top-K merge/upload at K=10), mixed OQ4 plus BF16/F16 expert execution, and
-  canonical paged OQ4 expert layout;
+  canonical paged OQ4 expert layout; the physical 16-row scatter/GEMM tile is
+  now one `hipfire-rdna` kernel contract consumed by runtime, generic dispatch,
+  Qwen, and DeepSeek instead of independently redeclared family constants;
 - native two-pass orchestration, atomic recipe manifests, artifact fingerprints,
-  interrupted-run resume, and quantizer enforcement of high-precision fallback;
+  interrupted-run resume, cumulative pass-one and pass-two wall timing
+  persisted before propagating process errors or signals, and quantizer
+  enforcement of high-precision fallback;
   explicit calibration reuse derives a fresh no-GPU native plan and requires
   exact family/adapter/architecture, source-shard, tokenizer/corpus/sample,
   geometry/F32-boundary, expert-policy, and KLDREF parity before pass 2, while
@@ -504,6 +508,33 @@ both report completion with no failure. The quantizer producer metadata
 honestly records commit `2f4b230c3d67d09e04cec7115c0ec0c7fe22defd` and a
 dirty checkout; use the recipe, calibration, index, and payload fingerprints as
 the reproducible artifact identities rather than inferring a clean build.
+
+The frozen 35B minimum-floor sweep then reproduced the same long-process
+full-attention failure class on its first `min512-cap4096` variant. After 35/40
+durable layers, the main thread consumed one CPU core for repeated 30- and
+55-second observation windows while GPU busy, source reads, and output writes
+all remained exactly zero. RSS was about 62 GB, host full-memory PSI was zero,
+and no new kernel SVM error was logged, so elapsed CPU time alone was rejected
+as progress. `SIGTERM` did not release the exact calibration child within 30
+seconds; `SIGKILL` released it five seconds later, restored about 128 GB of
+available host memory, and left the schema-2 boundary intact at 35/40. The
+same frozen job resumed with the wrapper's non-semantic four-layer process
+segmentation, crossed the failed full-attention layer in 119 seconds, paused
+cleanly at 39/40, and finalized from a fresh last-layer child. Its completed
+teacher summary reports 693/693 duplicate-free logical/canonical reads,
+69,321,230,976 source bytes, 390 Hessians, 20,862 imatrices, 262,016 KLDREF
+positions, and zero maximum capture consistency. This is further evidence that
+process segmentation is required for reliable long calibration on this host;
+artifact audit and held-out admission remain separate gates.
+
+The pre-fix wrapper recorded only the 731.521932-second successful resumed
+attempt. The launcher's one-second-resolution interval from 07:36:51 to
+08:29:07 recovers 3,136 seconds for the interrupted attempt, so the sweep
+manifest now records 3,867.521932 total calibration seconds plus a separate
+timing-recovery record. Commit `5661d64d6` closes this accounting hole for
+future runs by recording cumulative calibration wall time and signal/process
+failure provenance before re-raising the interruption; `f97e1bbea` applies the
+same cumulative accounting contract to interrupted and resumed pass-two work.
 
 Still required before declaring the engine complete or promoting a production
 397B quant:
