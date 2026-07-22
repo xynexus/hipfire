@@ -47,22 +47,41 @@ into full investigations here.
   or *user-facing config*; those belong in explicit context objects. Env
   debug/tuning knobs behind `OnceLock` remain the accepted pattern.
 
-## [High] Stale SWA ring-buffer cache slots after speculative reject
+## [High] Stale SWA ring-buffer slots after speculative reject (post-wrap corruption)
 - Category: Reliability / Correctness
-- Location: crates/hipfire-arch-deepseek4/src/spec_decode.rs:412-427
-- Summary: After a speculative verify, MTP/main SWA caches hold entries at
-  positions beyond `n_accept` computed from rejected draft tokens. They are
-  normally invalidated when the caller's next forward overwrites the ring
-  slots, but a forward that READS a stale slot before overwriting it (narrow
-  ring-index-alias window) would consume rejected-token state. Documented in
-  code as a production-hardening follow-up; tied to the still-open spec-decode
-  hybrid-state rewind gap.
-- Suggested fix: Speculative verify must write into scratch cache state and
-  commit only the accepted prefix, or explicitly invalidate/rewind every
-  per-layer SWA slot beyond `n_accept` before returning. Moving `n_tokens`
-  alone is insufficient.
+- Location: crates/hipfire-arch-deepseek4/src/spec_decode.rs:224-233,401-428;
+  read side kernels/src/deepseek4_attn_swa.hip; config `sliding_window=128`.
+- Mechanism (code-confirmed 2026-07-22, no empirical run — see blocker):
+  1. The draft/verify loop increments `state.n_tokens` per step so SWA K/V
+     writes land IN THE REAL per-layer ring at draft positions N+1..N+K
+     (spec_decode.rs:224-230). Slot index = `n_tokens % sliding_window`.
+  2. On partial accept only `state.n_tokens` is restored (line 428); the ring
+     DATA at the K−n_accept uncommitted slots is never invalidated.
+  3. The decode SWA kernel reads slots `[0, n_valid)` LINEARLY with no
+     per-slot position mask (deepseek4_attn_swa.hip) — it trusts n_valid.
+  Result: PRE-wrap (total seq < 128) the stale slots sit at indices ≥ n_valid
+  and are excluded → safe. POST-wrap (seq ≥ sliding_window=128) the ring is
+  full; the uncommitted draft writes at slots (M+2..N+K) mod 128 EVICTED
+  positions (Q−128) that are still inside the next forward's 128-wide window,
+  so the linear read consumes rejected-token K/V as if it were those evicted
+  positions → silent attention corruption. Triggers whenever ≥2 draft
+  positions go uncommitted past position 128 — i.e. the COMMON case for
+  spec-decode on >128-token sequences with <100% acceptance, NOT the "narrow
+  window" the in-code comment suggests.
+- Suggested fix: mirror the existing per-arch KV rewind (lfm2moe
+  `save_kv_rows`/`restore_kv_rows`/`apply_eviction_retain_to_draft`): snapshot
+  the K soon-to-be-evicted ring slots (kv_state + score_state) before the draft
+  loop, and on partial accept restore the slots for the uncommitted positions
+  so the ring matches the pure-AR frontier. deepseek4 currently has no such
+  save/restore for its SWA/compressor ring — that is the gap.
+- Empirical status (halo, gfx1151): BLOCKED. The only deepseek4 artifact on
+  halo (`deepseek-v4-flash.mq4.hfq`) will not run on the current daemon build:
+  its MQ4 `compressor.wkv` is rejected by the F16-native compressor path
+  (`HIPFIRE_DEEPSEEK4_COMP_F16_WMMA=1` default), and `=0` routes it to an
+  unsupported `gemv.unknown`. Black-box AR-vs-spec-decode A/B needs a
+  re-quantized compressor-F16 model first.
 - Scope: Architectural
-- Confidence: Medium (latent; no confirmed reproduction yet)
+- Confidence: High on mechanism (code-confirmed); reproduction pending a
+  runnable model.
 - Note: The sibling `forward.rs` chunk/ring path is NOT affected — its
-  non-aligned-with-compress-events case returns an explicit `Err` rather than
-  silently corrupting the ring, so that edge is guarded.
+  non-aligned-with-compress-events case returns an explicit `Err`.
