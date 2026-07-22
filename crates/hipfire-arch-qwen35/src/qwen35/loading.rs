@@ -4082,7 +4082,7 @@ pub fn load_weights(
     #[cfg(unix)]
     hfq.drop_mmap();
 
-    let slab_index = if gpu_slab_load_enabled(gpu) {
+    let slab_index = if gpu_slab_load_enabled(gpu) && hfq.supports_slab_load() {
         if std::env::var("HIPFIRE_GPU_SLAB_LOAD").ok().is_none() {
             eprintln!("  GPU slab load: auto-enabled for integrated/UMA GPU");
         }

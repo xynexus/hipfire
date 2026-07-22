@@ -21,7 +21,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — Tier-1 native single-load artifact collector (thin CLI).
 //
-//! Loads a bf16 `.hfq` once and runs the matching arch collector, writing a
+//! Loads a bf16 `.hfq` OR a HuggingFace safetensors directory once and runs the
+//! matching arch collector, writing a
 //! unified `<model>.calib.hfq` bundling the per-tensor Hessian + imatrix (+
 //! MoE router histogram for MoE models, + KLDREF with `--kldref`). Gemma3-VL
 //! (`arch_id=13`) is collected text-only through the `language_model.` prefix.
@@ -148,7 +149,16 @@ fn main() {
     }
     let seed: u64 = arg("--seed", Some("0".into())).unwrap().parse().unwrap();
 
-    let mut hfq = hipfire_runtime::hfq::HfqFile::open(Path::new(&model)).expect("open model");
+    // `--model` accepts either a bf16 `.hfq` or a HuggingFace safetensors
+    // directory (config.json + *.safetensors). A directory is read directly
+    // into an in-memory HfqFile — no intermediate bf16 `.hfq` on disk.
+    let model_path = Path::new(&model);
+    let mut hfq = if model_path.is_dir() {
+        hipfire_runtime::hfq::HfqFile::from_safetensors(model_path)
+            .expect("open safetensors model directory")
+    } else {
+        hipfire_runtime::hfq::HfqFile::open(model_path).expect("open model")
+    };
     // `--arch <id>` overrides the hfq's stored arch_id. Needed for hfqs that
     // predate proper arch tagging (e.g. some qwen3 MoE bf16 hfqs are stamped
     // arch_id=0/llama but load fine through the qwen35 backend at 5/6).

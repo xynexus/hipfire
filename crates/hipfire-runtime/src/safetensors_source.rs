@@ -181,6 +181,38 @@ impl SafetensorsSource {
             quant_config,
         })
     }
+
+    /// Raw bytes at an absolute byte range within a specific shard mmap.
+    ///
+    /// Used to back an in-memory [`crate::hfq::HfqFile`] over a safetensors
+    /// directory: stacked routed-expert sub-ranges are not exposed as named
+    /// tensors, so the HfqFile builder addresses them directly by
+    /// `(shard, offset, len)` computed from the parent tensor's layout.
+    pub fn shard_bytes(&self, shard_idx: usize, offset: usize, len: usize) -> Option<&[u8]> {
+        let mmap = &self.files.get(shard_idx)?.mmap;
+        mmap.get(offset..offset.checked_add(len)?)
+    }
+
+    /// Per-tensor physical layout as `(name, shard_idx, absolute_offset,
+    /// byte_len, dtype, shape)`. Exposes the shard index the `ModelSource` API
+    /// hides so an `HfqFile` can be built directly over the mmapped shards
+    /// without a temporary bf16 `.hfq` roundtrip.
+    pub fn tensor_layout(&self) -> Vec<(String, usize, usize, usize, String, Vec<usize>)> {
+        self.tensor_map
+            .iter()
+            .map(|(name, &(file_idx, tensor_idx))| {
+                let info = &self.tensors[tensor_idx];
+                (
+                    name.clone(),
+                    file_idx,
+                    info.data_offset,
+                    info.data_size,
+                    info.dtype.clone(),
+                    info.shape.clone(),
+                )
+            })
+            .collect()
+    }
 }
 
 impl ModelSource for SafetensorsSource {
