@@ -1804,28 +1804,28 @@ pub const ENV_HIPFIRE_GDN_Q8_REG_GFX1151: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GEMMA3_CALIB_IMATRIX_ONLY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GEMMA3_CALIB_IMATRIX_ONLY",
     description: "AWQ-style calibration mode: with no K×K outer-product or multi-GB Hessian",
-    source: "crates/hipfire-arch-gemma3/src/calibration.rs:281",
+    source: "crates/hipfire-arch-gemma3/src/calibration.rs:451",
 };
 
 /// `HIPFIRE_GEMMA3_CALIB_LAYERS_PER_PASS` — Runtime variable controlling gemma3 calib layers per pass in hipfire
 pub const ENV_HIPFIRE_GEMMA3_CALIB_LAYERS_PER_PASS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GEMMA3_CALIB_LAYERS_PER_PASS",
     description: "Runtime variable controlling gemma3 calib layers per pass in hipfire",
-    source: "crates/hipfire-arch-gemma3/src/calibration.rs:66",
+    source: "crates/hipfire-arch-gemma3/src/calibration.rs:72",
 };
 
 /// `HIPFIRE_GEMMA3_CALIB_MICROBATCH` — Runtime variable controlling gemma3 calib microbatch in hipfire
 pub const ENV_HIPFIRE_GEMMA3_CALIB_MICROBATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GEMMA3_CALIB_MICROBATCH",
     description: "Runtime variable controlling gemma3 calib microbatch in hipfire",
-    source: "crates/hipfire-arch-gemma3/src/calibration.rs:108",
+    source: "crates/hipfire-arch-gemma3/src/calibration.rs:114",
 };
 
 /// `HIPFIRE_GEMMA3_CALIB_NO_BATCH` — Runtime variable controlling gemma3 calib no batch in hipfire
 pub const ENV_HIPFIRE_GEMMA3_CALIB_NO_BATCH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GEMMA3_CALIB_NO_BATCH",
     description: "Runtime variable controlling gemma3 calib no batch in hipfire",
-    source: "crates/hipfire-arch-gemma3/src/calibration.rs:90",
+    source: "crates/hipfire-arch-gemma3/src/calibration.rs:96",
 };
 
 /// `HIPFIRE_GEMMA3_NO_BATCHED_PREFILL` — Runtime variable controlling gemma3 no batched prefill in hipfire
