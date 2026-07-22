@@ -51,13 +51,7 @@ const MQ_X_ROT_CHUNK_ROWS: usize = 1024;
 // Gated by `HIPFIRE_DFLASH_GOLDEN_DIR`; writes GPU intermediates as .npy so the
 // NPU bring-up (docs/npu/dflash-drafter-npu-plan.md, Phase A/B) can check each
 // primitive against the F32 GPU reference. No-op when the env var is unset.
-fn dflash_golden_npy(
-    gpu: &mut Gpu,
-    dir: &str,
-    name: &str,
-    t: &GpuTensor,
-    shape: &[usize],
-) {
+fn dflash_golden_npy(gpu: &mut Gpu, dir: &str, name: &str, t: &GpuTensor, shape: &[usize]) {
     let data = match gpu.download_f32(t) {
         Ok(d) => d,
         Err(e) => {
@@ -1012,7 +1006,12 @@ impl DflashScratch {
         #[cfg(target_os = "linux")]
         {
             let (l_ctx, h, ne, body_b) = match self.npu_body.as_ref() {
-                Some(body) => (body.l_ctx(), body.hidden(), body.num_extract(), body.block_size()),
+                Some(body) => (
+                    body.l_ctx(),
+                    body.hidden(),
+                    body.num_extract(),
+                    body.block_size(),
+                ),
                 None => return Ok(false),
             };
             // The body bakes a fixed block size (B) and a fixed l_ctx-row context
@@ -1066,7 +1065,11 @@ impl DflashScratch {
             };
             let dst = self.x.sub_offset(h, (b - 1) * h);
             gpu.hip.memcpy_htod(&dst.buf, bytes)?;
-            if std::env::var("HIPFIRE_DFLASH_NPU_DRAFT_TRACE").ok().as_deref() == Some("1") {
+            if std::env::var("HIPFIRE_DFLASH_NPU_DRAFT_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
                 eprintln!("[npu-draft] cycle: position={position} b={b} l_ctx={l_ctx} (NPU block forward ran)");
             }
             Ok(true)
@@ -1634,7 +1637,13 @@ pub fn draft_forward_opts(
         gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, delta, h, eps)?;
     }
     if let Some(dir) = &golden_dir {
-        dflash_golden_npy(gpu, dir, "rust_target_hidden_proj", &scratch.target_hidden_proj, &[l, h]);
+        dflash_golden_npy(
+            gpu,
+            dir,
+            "rust_target_hidden_proj",
+            &scratch.target_hidden_proj,
+            &[l, h],
+        );
     }
 
     // HIPFIRE_DRAFT_SUBPHASE=1: per-layer-section timing inside draft_forward.
@@ -1915,7 +1924,13 @@ pub fn draft_forward_opts(
         dflash_subphase_sync(gpu, dbg, li, "attention")?;
         if li == 0 {
             if let Some(dir) = &golden_dir {
-                dflash_golden_npy(gpu, dir, "rust_l0_attn_out", &scratch.attn_out, &[b, cfg.q_dim()]);
+                dflash_golden_npy(
+                    gpu,
+                    dir,
+                    "rust_l0_attn_out",
+                    &scratch.attn_out,
+                    &[b, cfg.q_dim()],
+                );
             }
         }
         if let Some(t) = t2 {

@@ -1255,8 +1255,7 @@ fn main() {
     // `.weight`, so the quantizer joins `<name>.{hessian,imatrix}` straight
     // onto the source weight it is about to encode.
     let calib_collector = calib_out.as_ref().map(|path| {
-        let mut names: std::collections::HashMap<usize, String> =
-            std::collections::HashMap::new();
+        let mut names: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
         names.insert(draft_weights.fc.buf.buf.as_ptr() as usize, "fc".to_string());
         for (li, layer) in draft_weights.layers.iter().enumerate() {
             let p = format!("layers.{li}");

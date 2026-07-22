@@ -71,10 +71,12 @@ fn main() {
     let mut abuf = kernel.alloc_arg(m_dim * k_dim).expect("alloc A");
     let mut bbuf = kernel.alloc_arg(n_dim * k_dim).expect("alloc B");
     let mut cbuf = kernel.alloc_arg(m_dim * n_dim * 4).expect("alloc C");
-    abuf.as_mut_slice()
-        .copy_from_slice(unsafe { std::slice::from_raw_parts(a_i8.as_ptr() as *const u8, a_i8.len()) });
-    bbuf.as_mut_slice()
-        .copy_from_slice(unsafe { std::slice::from_raw_parts(b_i8.as_ptr() as *const u8, b_i8.len()) });
+    abuf.as_mut_slice().copy_from_slice(unsafe {
+        std::slice::from_raw_parts(a_i8.as_ptr() as *const u8, a_i8.len())
+    });
+    bbuf.as_mut_slice().copy_from_slice(unsafe {
+        std::slice::from_raw_parts(b_i8.as_ptr() as *const u8, b_i8.len())
+    });
     cbuf.as_mut_slice().fill(0);
 
     kernel.dispatch(&[&abuf, &bbuf, &cbuf]).expect("dispatch");
@@ -105,7 +107,9 @@ fn main() {
         println!("=== STEP 2: BIT-EXACT vs Python ===");
     } else {
         let (i, got, want) = first.unwrap();
-        println!("  first mismatch at [{i}]: native={got} python={want}  max_abs_diff={max_abs_diff}");
+        println!(
+            "  first mismatch at [{i}]: native={got} python={want}  max_abs_diff={max_abs_diff}"
+        );
         println!("=== STEP 2: MISMATCH (layout/arg-order bug, not precision) ===");
         std::process::exit(1);
     }

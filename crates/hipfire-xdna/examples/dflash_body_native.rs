@@ -254,7 +254,11 @@ mod body {
             let (mt, nt, kc) = (geom.m_tile(), geom.n_tile(), geom.k_chunk());
             assert_eq!(k % kc, 0, "K={k} must be a multiple of K_CHUNK={kc}");
             assert_eq!(m % nt, 0, "N={m} must be a multiple of N_TILE={nt}");
-            assert_eq!(rows % mt, 0, "rows={rows} must be a multiple of M_TILE={mt}");
+            assert_eq!(
+                rows % mt,
+                0,
+                "rows={rows} must be a multiple of M_TILE={mt}"
+            );
             let (k_chunks, n_tiles, m_blocks) = (k / kc, m / nt, rows / mt);
 
             let mut codes = vec![0i8; m * k];
@@ -413,8 +417,7 @@ mod body {
                 scale[r * chunks + c] = s;
                 let inv = 1.0 / s;
                 for (i, &v) in seg.iter().enumerate() {
-                    q[r * k + c * kc + i] =
-                        (v * inv).round_ties_even().clamp(-QMAX, QMAX) as i8;
+                    q[r * k + c * kc + i] = (v * inv).round_ties_even().clamp(-QMAX, QMAX) as i8;
                 }
             }
         }
@@ -497,26 +500,28 @@ mod body {
         if threaded {
             use rayon::prelude::*;
             let p = SendMutF32(out.as_mut_ptr());
-            span.par_iter().enumerate().for_each(|(s, &(mb, kchunk, tile))| {
-                let p = p; // move the Copy pointer into the task
-                let (row0, col0) = (mb * mt, tile * nt);
-                let scol = &scale4t[kchunk * m..(kchunk + 1) * m];
-                geom.each_c_run(c32, s, |lr, lc0, vals| {
-                    let r = row0 + lr;
-                    let sxr = sx[r * k_chunks + kchunk];
-                    let n0 = col0 + lc0;
-                    let sc = &scol[n0..n0 + vals.len()];
-                    // SAFETY: within a single-k-chunk dispatch, distinct slots
-                    // have distinct (m_block, tile) => disjoint [r*m+n0 ..) runs,
-                    // so no two tasks touch the same element.
-                    let o = unsafe {
-                        std::slice::from_raw_parts_mut(p.0.add(r * m + n0), vals.len())
-                    };
-                    for t in 0..vals.len() {
-                        o[t] += sc[t] * sxr * vals[t] as f32;
-                    }
+            span.par_iter()
+                .enumerate()
+                .for_each(|(s, &(mb, kchunk, tile))| {
+                    let p = p; // move the Copy pointer into the task
+                    let (row0, col0) = (mb * mt, tile * nt);
+                    let scol = &scale4t[kchunk * m..(kchunk + 1) * m];
+                    geom.each_c_run(c32, s, |lr, lc0, vals| {
+                        let r = row0 + lr;
+                        let sxr = sx[r * k_chunks + kchunk];
+                        let n0 = col0 + lc0;
+                        let sc = &scol[n0..n0 + vals.len()];
+                        // SAFETY: within a single-k-chunk dispatch, distinct slots
+                        // have distinct (m_block, tile) => disjoint [r*m+n0 ..) runs,
+                        // so no two tasks touch the same element.
+                        let o = unsafe {
+                            std::slice::from_raw_parts_mut(p.0.add(r * m + n0), vals.len())
+                        };
+                        for t in 0..vals.len() {
+                            o[t] += sc[t] * sxr * vals[t] as f32;
+                        }
+                    });
                 });
-            });
         } else {
             for (s, &(mb, kchunk, tile)) in span.iter().enumerate() {
                 let (row0, col0) = (mb * mt, tile * nt);
@@ -611,9 +616,14 @@ mod body {
             // replicated nblk times. When the NEXT dispatch carries the same pair,
             // the buffer is already correct and the entire fill is skipped.
             let span = &mx.plan[lo..hi];
-            let uniform = span.first().map(|&(mb, c, _)| {
-                span.iter().all(|&(m2, c2, _)| m2 == mb && c2 == c).then_some((mb, c))
-            }).flatten();
+            let uniform = span
+                .first()
+                .map(|&(mb, c, _)| {
+                    span.iter()
+                        .all(|&(m2, c2, _)| m2 == mb && c2 == c)
+                        .then_some((mb, c))
+                })
+                .flatten();
             let skip = uniform.is_some() && uniform == *a_state;
             let tp = std::time::Instant::now();
             if !skip {
@@ -766,7 +776,16 @@ mod body {
                 let hi = (lo + nblk).min(mx.plan.len());
                 let tr = std::time::Instant::now();
                 let c32 = g.read_c_p(p).expect("r14 read C");
-                rescale_dispatch(&geom, &mx.plan[lo..hi], c32, &mx.scale4t, sx, mx.k_chunks, m, out);
+                rescale_dispatch(
+                    &geom,
+                    &mx.plan[lo..hi],
+                    c32,
+                    &mx.scale4t,
+                    sx,
+                    mx.k_chunks,
+                    m,
+                    out,
+                );
                 glue_add(&GLUE_RESCALE, tr.elapsed());
             }};
         }
@@ -797,7 +816,9 @@ mod body {
             glue_add(&PIPE_WAIT, w);
             if d + 1 < ndisp {
                 let ts = std::time::Instant::now();
-                seq = g.submit_p((d + 1) & 1, &mx.wbufs[d + 1]).expect("r14 submit");
+                seq = g
+                    .submit_p((d + 1) & 1, &mx.wbufs[d + 1])
+                    .expect("r14 submit");
                 glue_add(&PIPE_SUBMIT, ts.elapsed());
             }
         }
@@ -890,7 +911,10 @@ mod body {
                 self.live.remove(victim);
             }
             let t0 = std::time::Instant::now();
-            let (x, i) = self.artifacts.get(name).unwrap_or_else(|| panic!("no artifact {name}"));
+            let (x, i) = self
+                .artifacts
+                .get(name)
+                .unwrap_or_else(|| panic!("no artifact {name}"));
             let k = NpuKernel::load_peer(&self.anchor, x, i)
                 .unwrap_or_else(|e| panic!("load_peer {name}: {e:?}"));
             self.miss_ns += t0.elapsed().as_nanos() as u64;
@@ -924,7 +948,10 @@ fn main() {
     // ── args ────────────────────────────────────────────────────────────────
     let argv: Vec<String> = std::env::args().collect();
     let arg = |k: &str| -> Option<String> {
-        argv.iter().position(|a| a == k).and_then(|i| argv.get(i + 1)).cloned()
+        argv.iter()
+            .position(|a| a == k)
+            .and_then(|i| argv.get(i + 1))
+            .cloned()
     };
     let manifest_path = arg("--manifest").expect("--manifest");
     let wdir = arg("--weights").expect("--weights");
@@ -937,7 +964,9 @@ fn main() {
     // under multicore and panics at load_peer with Ioctl(EINVAL, os code 22) on
     // the first primitive that misses. 4 is the largest value that fits the
     // multicore config; the single-core path has one context spare.
-    let capacity: usize = arg("--ctx-budget").and_then(|v| v.parse().ok()).unwrap_or(4);
+    let capacity: usize = arg("--ctx-budget")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
     // `--gemm multicore` routes every projection through the r14 4x4 array
     // (W4A8) instead of the single-core `int_matmul` (W8A8).
     let mc = arg("--gemm").as_deref() == Some("multicore");
@@ -994,9 +1023,7 @@ fn main() {
     // (write_bf16 in / read_bf16 out). Confirms the pure-f32 residual is bf16
     // precision, not an algorithmic difference.
     let parity_bf16 = arg("--parity-bf16").is_some();
-    let bfr = |s: &[f32]| -> Vec<f32> {
-        s.iter().map(|&v| bf16_to_f32(f32_to_bf16(v))).collect()
-    };
+    let bfr = |s: &[f32]| -> Vec<f32> { s.iter().map(|&v| bf16_to_f32(f32_to_bf16(v))).collect() };
     // Same-run parity plumbing: --dump-out writes the final block_hidden as raw
     // little-endian f32; --cmp loads such a file and reports cos against this
     // run's block_hidden (CPU-vs-NPU primitive parity, GEMM path held fixed).
@@ -1141,8 +1168,7 @@ fn main() {
             .iter()
             .map(|v| v.as_u64().unwrap() as usize)
             .collect();
-        let raw_i8 =
-            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
+        let raw_i8 = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
         // In multicore mode the int8 weight never reaches the device — only the
         // r14 int4 repack does — so the placeholder buffer stays 1 byte.
         let mx = r14.map(|(g, rows)| {
@@ -1200,7 +1226,17 @@ fn main() {
     let g_final = load_gamma("final_norm");
     #[allow(clippy::type_complexity)]
     let (layers, mc_layers): (
-        Vec<(Gemm, Gemm, Gemm, Gemm, Gemm, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>,
+        Vec<(
+            Gemm,
+            Gemm,
+            Gemm,
+            Gemm,
+            Gemm,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<f32>,
+        )>,
         Vec<[Option<R14Matrix>; 5]>,
     ) = (0..nl)
         .map(|li| {
@@ -1274,19 +1310,27 @@ fn main() {
     let mut csrow = vec![0f32; hd];
 
     // ── inputs + validation targets ─────────────────────────────────────────
-    let noise = npy::read(&format!("{gdir}/noise_embedding.npy")).expect("noise").to_f32();
-    let target_hidden = npy::read(&format!("{gdir}/target_hidden.npy")).expect("th").to_f32();
+    let noise = npy::read(&format!("{gdir}/noise_embedding.npy"))
+        .expect("noise")
+        .to_f32();
+    let target_hidden = npy::read(&format!("{gdir}/target_hidden.npy"))
+        .expect("th")
+        .to_f32();
     let golden = npy::read(&format!("{gdir}/rust/rust_final_block_hidden.npy"))
         .expect("golden")
         .to_f32();
-    let precision_ref = refpath.as_ref().map(|p| npy::read(p).expect("ref").to_f32());
+    let precision_ref = refpath
+        .as_ref()
+        .map(|p| npy::read(p).expect("ref").to_f32());
 
     // ── probe: steady-state dispatch cost with NO context churn ─────────────
     // Separates the per-dispatch floor from the cost of re-establishing a
     // ~1 GB resident weight in a freshly created hardware context. Dispatches
     // one GEMM repeatedly on a kernel that is never evicted.
     if let Some(key) = arg("--probe-gemm") {
-        let n: usize = arg("--probe-iters").and_then(|v| v.parse().ok()).unwrap_or(50);
+        let n: usize = arg("--probe-iters")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
         let gm = load_gemm(&cache.anchor, &key, None).0;
         let rows = if gm.k == ne * h { l_ctx } else { b_rows };
         let name = gemm_kernel(gm.m, gm.k, rows);
@@ -1319,8 +1363,12 @@ fn main() {
     // Steady-state cost of ONE matrix on the r14 array, with no other kernel
     // interleaved: separates the array's stream rate from body interference.
     if let Some(key) = arg("--probe-r14") {
-        let n: usize = arg("--probe-iters").and_then(|v| v.parse().ok()).unwrap_or(20);
-        let rows: usize = arg("--probe-rows").and_then(|v| v.parse().ok()).unwrap_or(b_rows);
+        let n: usize = arg("--probe-iters")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        let rows: usize = arg("--probe-rows")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(b_rows);
         let (gm, mx, wb) = {
             let g = r14.as_ref().expect("--gemm multicore");
             let wb = g.geom().w_bytes();
@@ -1361,7 +1409,9 @@ fn main() {
     // Steady-state cost of the whole-layer attention dispatch (small buffers,
     // so this isolates compute from the GEMMs' weight streaming).
     if arg("--probe-attn").is_some() {
-        let n: usize = arg("--probe-iters").and_then(|v| v.parse().ok()).unwrap_or(50);
+        let n: usize = arg("--probe-iters")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
         let idx = cache.get(&attn_name);
         let k = cache.at(idx);
         k.dispatch(&[&attn_q, &attn_kv, &attn_o]).expect("warm");
@@ -1387,7 +1437,7 @@ fn main() {
     // Per-op accounting: which kernels the dispatch time actually goes to, and
     // how much of it lands on a freshly-(re)loaded context.
     let mut per_op: HashMap<String, (u64, u64, u64)> = HashMap::new(); // n, ns, ns_after_miss
-    // Isolated CPU-vs-NPU primitive parity: name -> (min cos, max |Δ|, samples).
+                                                                       // Isolated CPU-vs-NPU primitive parity: name -> (min cos, max |Δ|, samples).
     let mut parity_map: HashMap<String, (f64, f64, u64)> = HashMap::new();
     let mut block_out = vec![0f32; b_rows * h];
 
@@ -1411,7 +1461,15 @@ fn main() {
             if let Some(mx) = $mx.as_ref() {
                 let g = r14.as_mut().expect("r14 kernel");
                 let (dt, nd) = if pipeline_glue {
-                    run_r14_pipelined(g, mx, $x, $out, &mut qbuf, &mut sxbuf, pipeline_check_active.get())
+                    run_r14_pipelined(
+                        g,
+                        mx,
+                        $x,
+                        $out,
+                        &mut qbuf,
+                        &mut sxbuf,
+                        pipeline_check_active.get(),
+                    )
                 } else {
                     run_r14(g, mx, $x, $out, &mut qbuf, &mut sxbuf)
                 };
@@ -1422,41 +1480,44 @@ fn main() {
                 e.0 += nd;
                 e.1 += dt;
             } else {
-            quantize_row($x, rows, gm.k, &mut qbuf, &mut sxbuf);
-            gemm_b.as_mut_slice()[..rows * gm.k].copy_from_slice(unsafe {
-                std::slice::from_raw_parts(qbuf.as_ptr() as *const u8, rows * gm.k)
-            });
-            let name = gemm_kernel(gm.m, gm.k, rows);
-            let miss0 = $cache.misses;
-            let idx = $cache.get(&name);
-            let was_miss = $cache.misses > miss0;
-            let k = $cache.at(idx);
-            let t = Instant::now();
-            // The weight was flushed once at upload; only the activation needs
-            // a host->device sync, and the output is written by the NPU.
-            k.dispatch_synced(&[&gm.w, &gemm_b, &gemm_c], &[false, true, false])
-                .expect("gemm dispatch");
-            let dt = t.elapsed().as_nanos() as u64;
-            npu_ns_total += dt;
-            dispatches += 1;
-            let e = per_op.entry(name.clone()).or_insert((0, 0, 0));
-            e.0 += 1;
-            e.1 += dt;
-            if was_miss {
-                e.2 += dt;
-            }
-            k.sync_output(&gemm_c).expect("sync C");
-            let c32 = unsafe {
-                std::slice::from_raw_parts(gemm_c.as_slice().as_ptr() as *const i32, gm.m * rows)
-            };
-            // Y[r, n] = sw[n] * sx[r] * C[n, r]   (C is [M, rows])
-            let out: &mut [f32] = $out;
-            for n in 0..gm.m {
-                let sw = gm.scale[n];
-                for r in 0..rows {
-                    out[r * gm.m + n] = sw * sxbuf[r] * c32[n * rows + r] as f32;
+                quantize_row($x, rows, gm.k, &mut qbuf, &mut sxbuf);
+                gemm_b.as_mut_slice()[..rows * gm.k].copy_from_slice(unsafe {
+                    std::slice::from_raw_parts(qbuf.as_ptr() as *const u8, rows * gm.k)
+                });
+                let name = gemm_kernel(gm.m, gm.k, rows);
+                let miss0 = $cache.misses;
+                let idx = $cache.get(&name);
+                let was_miss = $cache.misses > miss0;
+                let k = $cache.at(idx);
+                let t = Instant::now();
+                // The weight was flushed once at upload; only the activation needs
+                // a host->device sync, and the output is written by the NPU.
+                k.dispatch_synced(&[&gm.w, &gemm_b, &gemm_c], &[false, true, false])
+                    .expect("gemm dispatch");
+                let dt = t.elapsed().as_nanos() as u64;
+                npu_ns_total += dt;
+                dispatches += 1;
+                let e = per_op.entry(name.clone()).or_insert((0, 0, 0));
+                e.0 += 1;
+                e.1 += dt;
+                if was_miss {
+                    e.2 += dt;
                 }
-            }
+                k.sync_output(&gemm_c).expect("sync C");
+                let c32 = unsafe {
+                    std::slice::from_raw_parts(
+                        gemm_c.as_slice().as_ptr() as *const i32,
+                        gm.m * rows,
+                    )
+                };
+                // Y[r, n] = sw[n] * sx[r] * C[n, r]   (C is [M, rows])
+                let out: &mut [f32] = $out;
+                for n in 0..gm.m {
+                    let sw = gm.scale[n];
+                    for r in 0..rows {
+                        out[r * gm.m + n] = sw * sxbuf[r] * c32[n * rows + r] as f32;
+                    }
+                }
             }
         }};
     }
@@ -1468,49 +1529,57 @@ fn main() {
             let gamma: &[f32] = $gamma;
             if cpu_prim {
                 let t = Instant::now();
-                cpu_rmsnorm(&$x[..rows * h], gamma, rows, h, kernel_eps, &mut $out[..rows * h]);
+                cpu_rmsnorm(
+                    &$x[..rows * h],
+                    gamma,
+                    rows,
+                    h,
+                    kernel_eps,
+                    &mut $out[..rows * h],
+                );
                 cpu_prim_ns += t.elapsed().as_nanos() as u64;
             } else {
-            write_bf16(&mut norm_in, &$x[..rows * h]);
-            {
-                let dst = norm_w.as_mut_slice();
-                for r in 0..rows {
-                    for (i, &gv) in gamma.iter().enumerate() {
-                        let o = (r * h + i) * 2;
-                        dst[o..o + 2].copy_from_slice(&f32_to_bf16(gv).to_le_bytes());
+                write_bf16(&mut norm_in, &$x[..rows * h]);
+                {
+                    let dst = norm_w.as_mut_slice();
+                    for r in 0..rows {
+                        for (i, &gv) in gamma.iter().enumerate() {
+                            let o = (r * h + i) * 2;
+                            dst[o..o + 2].copy_from_slice(&f32_to_bf16(gv).to_le_bytes());
+                        }
                     }
                 }
-            }
-            let miss0 = $cache.misses;
-            let idx = $cache.get($name);
-            let was_miss = $cache.misses > miss0;
-            let k = $cache.at(idx);
-            let t = Instant::now();
-            k.dispatch(&[&norm_in, &norm_w, &norm_out]).expect("rmsnorm");
-            let dt = t.elapsed().as_nanos() as u64;
-            npu_ns_total += dt;
-            dispatches += 1;
-            let e = per_op.entry($name.to_string()).or_insert((0, 0, 0));
-            e.0 += 1;
-            e.1 += dt;
-            if was_miss {
-                e.2 += dt;
-            }
-            k.sync_output(&norm_out).expect("sync norm");
-            read_bf16(&norm_out, &mut $out[..rows * h]);
-            if parity {
-                let (inp, gam) = if parity_bf16 {
-                    (bfr(&$x[..rows * h]), bfr(gamma))
-                } else {
-                    ($x[..rows * h].to_vec(), gamma.to_vec())
-                };
-                let mut cpu_o = vec![0f32; rows * h];
-                cpu_rmsnorm(&inp, &gam, rows, h, kernel_eps, &mut cpu_o);
-                if parity_bf16 {
-                    cpu_o = bfr(&cpu_o);
+                let miss0 = $cache.misses;
+                let idx = $cache.get($name);
+                let was_miss = $cache.misses > miss0;
+                let k = $cache.at(idx);
+                let t = Instant::now();
+                k.dispatch(&[&norm_in, &norm_w, &norm_out])
+                    .expect("rmsnorm");
+                let dt = t.elapsed().as_nanos() as u64;
+                npu_ns_total += dt;
+                dispatches += 1;
+                let e = per_op.entry($name.to_string()).or_insert((0, 0, 0));
+                e.0 += 1;
+                e.1 += dt;
+                if was_miss {
+                    e.2 += dt;
                 }
-                record_parity(&mut parity_map, $name, &$out[..rows * h], &cpu_o);
-            }
+                k.sync_output(&norm_out).expect("sync norm");
+                read_bf16(&norm_out, &mut $out[..rows * h]);
+                if parity {
+                    let (inp, gam) = if parity_bf16 {
+                        (bfr(&$x[..rows * h]), bfr(gamma))
+                    } else {
+                        ($x[..rows * h].to_vec(), gamma.to_vec())
+                    };
+                    let mut cpu_o = vec![0f32; rows * h];
+                    cpu_rmsnorm(&inp, &gam, rows, h, kernel_eps, &mut cpu_o);
+                    if parity_bf16 {
+                        cpu_o = bfr(&cpu_o);
+                    }
+                    record_parity(&mut parity_map, $name, &$out[..rows * h], &cpu_o);
+                }
             }
         }};
     }
@@ -1523,41 +1592,49 @@ fn main() {
             let n = rows * heads * hd;
             if cpu_prim {
                 let t = Instant::now();
-                cpu_headnorm(&$x[..n], $gamma, rows, heads, hd, kernel_eps, &mut $out[..n]);
+                cpu_headnorm(
+                    &$x[..n],
+                    $gamma,
+                    rows,
+                    heads,
+                    hd,
+                    kernel_eps,
+                    &mut $out[..n],
+                );
                 cpu_prim_ns += t.elapsed().as_nanos() as u64;
             } else {
-            write_bf16(&mut hn_in, &$x[..n]);
-            write_bf16(&mut hn_w, $gamma);
-            let miss0 = $cache.misses;
-            let idx = $cache.get($name);
-            let was_miss = $cache.misses > miss0;
-            let k = $cache.at(idx);
-            let t = Instant::now();
-            k.dispatch(&[&hn_in, &hn_out, &hn_w]).expect("headnorm");
-            let dt = t.elapsed().as_nanos() as u64;
-            npu_ns_total += dt;
-            dispatches += 1;
-            let e = per_op.entry($name.to_string()).or_insert((0, 0, 0));
-            e.0 += 1;
-            e.1 += dt;
-            if was_miss {
-                e.2 += dt;
-            }
-            k.sync_output(&hn_out).expect("sync hn");
-            read_bf16(&hn_out, &mut $out[..n]);
-            if parity {
-                let (inp, gam) = if parity_bf16 {
-                    (bfr(&$x[..n]), bfr($gamma))
-                } else {
-                    ($x[..n].to_vec(), $gamma.to_vec())
-                };
-                let mut cpu_o = vec![0f32; n];
-                cpu_headnorm(&inp, &gam, rows, heads, hd, kernel_eps, &mut cpu_o);
-                if parity_bf16 {
-                    cpu_o = bfr(&cpu_o);
+                write_bf16(&mut hn_in, &$x[..n]);
+                write_bf16(&mut hn_w, $gamma);
+                let miss0 = $cache.misses;
+                let idx = $cache.get($name);
+                let was_miss = $cache.misses > miss0;
+                let k = $cache.at(idx);
+                let t = Instant::now();
+                k.dispatch(&[&hn_in, &hn_out, &hn_w]).expect("headnorm");
+                let dt = t.elapsed().as_nanos() as u64;
+                npu_ns_total += dt;
+                dispatches += 1;
+                let e = per_op.entry($name.to_string()).or_insert((0, 0, 0));
+                e.0 += 1;
+                e.1 += dt;
+                if was_miss {
+                    e.2 += dt;
                 }
-                record_parity(&mut parity_map, $name, &$out[..n], &cpu_o);
-            }
+                k.sync_output(&hn_out).expect("sync hn");
+                read_bf16(&hn_out, &mut $out[..n]);
+                if parity {
+                    let (inp, gam) = if parity_bf16 {
+                        (bfr(&$x[..n]), bfr($gamma))
+                    } else {
+                        ($x[..n].to_vec(), $gamma.to_vec())
+                    };
+                    let mut cpu_o = vec![0f32; n];
+                    cpu_headnorm(&inp, &gam, rows, heads, hd, kernel_eps, &mut cpu_o);
+                    if parity_bf16 {
+                        cpu_o = bfr(&cpu_o);
+                    }
+                    record_parity(&mut parity_map, $name, &$out[..n], &cpu_o);
+                }
             }
         }};
     }
@@ -1573,45 +1650,49 @@ fn main() {
                 cpu_rope(&$x[..n], rows, heads, hd, $pos0, theta, &mut $out[..n]);
                 cpu_prim_ns += t.elapsed().as_nanos() as u64;
             } else {
-            write_bf16(&mut rope_in, &$x[..n]);
-            {
-                let dst = rope_cs.as_mut_slice();
-                for r in 0..rows {
-                    cs_buf(hd, ($pos0 + r) as f64, theta, &mut csrow);
-                    for hh in 0..heads {
-                        for (i, &cv) in csrow.iter().enumerate() {
-                            let o = ((r * heads + hh) * hd + i) * 2;
-                            dst[o..o + 2].copy_from_slice(&f32_to_bf16(cv).to_le_bytes());
+                write_bf16(&mut rope_in, &$x[..n]);
+                {
+                    let dst = rope_cs.as_mut_slice();
+                    for r in 0..rows {
+                        cs_buf(hd, ($pos0 + r) as f64, theta, &mut csrow);
+                        for hh in 0..heads {
+                            for (i, &cv) in csrow.iter().enumerate() {
+                                let o = ((r * heads + hh) * hd + i) * 2;
+                                dst[o..o + 2].copy_from_slice(&f32_to_bf16(cv).to_le_bytes());
+                            }
                         }
                     }
                 }
-            }
-            let miss0 = $cache.misses;
-            let idx = $cache.get($name);
-            let was_miss = $cache.misses > miss0;
-            let k = $cache.at(idx);
-            let t = Instant::now();
-            k.dispatch(&[&rope_in, &rope_cs, &rope_out]).expect("rope");
-            let dt = t.elapsed().as_nanos() as u64;
-            npu_ns_total += dt;
-            dispatches += 1;
-            let e = per_op.entry($name.to_string()).or_insert((0, 0, 0));
-            e.0 += 1;
-            e.1 += dt;
-            if was_miss {
-                e.2 += dt;
-            }
-            k.sync_output(&rope_out).expect("sync rope");
-            read_bf16(&rope_out, &mut $out[..n]);
-            if parity {
-                let inp = if parity_bf16 { bfr(&$x[..n]) } else { $x[..n].to_vec() };
-                let mut cpu_o = vec![0f32; n];
-                cpu_rope(&inp, rows, heads, hd, $pos0, theta, &mut cpu_o);
-                if parity_bf16 {
-                    cpu_o = bfr(&cpu_o);
+                let miss0 = $cache.misses;
+                let idx = $cache.get($name);
+                let was_miss = $cache.misses > miss0;
+                let k = $cache.at(idx);
+                let t = Instant::now();
+                k.dispatch(&[&rope_in, &rope_cs, &rope_out]).expect("rope");
+                let dt = t.elapsed().as_nanos() as u64;
+                npu_ns_total += dt;
+                dispatches += 1;
+                let e = per_op.entry($name.to_string()).or_insert((0, 0, 0));
+                e.0 += 1;
+                e.1 += dt;
+                if was_miss {
+                    e.2 += dt;
                 }
-                record_parity(&mut parity_map, $name, &$out[..n], &cpu_o);
-            }
+                k.sync_output(&rope_out).expect("sync rope");
+                read_bf16(&rope_out, &mut $out[..n]);
+                if parity {
+                    let inp = if parity_bf16 {
+                        bfr(&$x[..n])
+                    } else {
+                        $x[..n].to_vec()
+                    };
+                    let mut cpu_o = vec![0f32; n];
+                    cpu_rope(&inp, rows, heads, hd, $pos0, theta, &mut cpu_o);
+                    if parity_bf16 {
+                        cpu_o = bfr(&cpu_o);
+                    }
+                    record_parity(&mut parity_map, $name, &$out[..n], &cpu_o);
+                }
             }
         }};
     }
@@ -1725,10 +1806,8 @@ fn main() {
                     // verify: this block recomputed context fresh — compare it
                     // directly against the cache captured on block 0.
                     for i in 0..l_ctx * nkd {
-                        cache_k_maxdiff =
-                            cache_k_maxdiff.max((k_all[i] - c_k[li][i]).abs() as f64);
-                        cache_v_maxdiff =
-                            cache_v_maxdiff.max((v_all[i] - c_v[li][i]).abs() as f64);
+                        cache_k_maxdiff = cache_k_maxdiff.max((k_all[i] - c_k[li][i]).abs() as f64);
+                        cache_v_maxdiff = cache_v_maxdiff.max((v_all[i] - c_v[li][i]).abs() as f64);
                     }
                 } else {
                     // reuse: install cached post-rope context K (V already set)
@@ -1759,13 +1838,10 @@ fn main() {
                                 let (qb, qi) = ((i * b_rows + r) / MR, (i * b_rows + r) % MR);
                                 for d in 0..hd {
                                     let (db, si) = (d / MS, d % MS);
-                                    let o = (qbase
-                                        + ((qb * (hd / MS) + db) * MR + qi) * MS
-                                        + si)
-                                        * 2;
+                                    let o =
+                                        (qbase + ((qb * (hd / MS) + db) * MR + qi) * MS + si) * 2;
                                     let src = q[r * nh * hd + head * hd + d];
-                                    dst[o..o + 2]
-                                        .copy_from_slice(&f32_to_bf16(src).to_le_bytes());
+                                    dst[o..o + 2].copy_from_slice(&f32_to_bf16(src).to_le_bytes());
                                 }
                             }
                         }
@@ -1791,13 +1867,10 @@ fn main() {
                                             } else {
                                                 0.0
                                             };
-                                            let o = (base
-                                                + ((db * kb_n + kb) * MS + si) * MT
-                                                + ti)
-                                                * 2;
-                                            dst[o..o + 2].copy_from_slice(
-                                                &f32_to_bf16(val).to_le_bytes(),
-                                            );
+                                            let o =
+                                                (base + ((db * kb_n + kb) * MS + si) * MT + ti) * 2;
+                                            dst[o..o + 2]
+                                                .copy_from_slice(&f32_to_bf16(val).to_le_bytes());
                                         }
                                     }
                                 }
@@ -1814,13 +1887,11 @@ fn main() {
                                             } else {
                                                 0.0
                                             };
-                                            let o = (vbase
-                                                + ((vb * ob_n + ob) * MS + si) * MT
-                                                + ti)
-                                                * 2;
-                                            dst[o..o + 2].copy_from_slice(
-                                                &f32_to_bf16(val).to_le_bytes(),
-                                            );
+                                            let o =
+                                                (vbase + ((vb * ob_n + ob) * MS + si) * MT + ti)
+                                                    * 2;
+                                            dst[o..o + 2]
+                                                .copy_from_slice(&f32_to_bf16(val).to_le_bytes());
                                         }
                                     }
                                 }
@@ -1832,7 +1903,11 @@ fn main() {
                             // running sum and scale the output down.
                             let mbase = (base + 2 * fl_kv_tile * hd) * 2;
                             for j in 0..fl_kv_tile {
-                                let m = if t * fl_kv_tile + j < tot { 0.0f32 } else { MASK_NEG };
+                                let m = if t * fl_kv_tile + j < tot {
+                                    0.0f32
+                                } else {
+                                    MASK_NEG
+                                };
                                 dst[mbase + j * 4..mbase + j * 4 + 4]
                                     .copy_from_slice(&m.to_le_bytes());
                             }
@@ -1847,8 +1922,7 @@ fn main() {
                                 for d in 0..hd {
                                     let src = q[r * nh * hd + head * hd + d];
                                     let o = ((kvh * q_len + i * b_rows + r) * hd + d) * 2;
-                                    dst[o..o + 2]
-                                        .copy_from_slice(&f32_to_bf16(src).to_le_bytes());
+                                    dst[o..o + 2].copy_from_slice(&f32_to_bf16(src).to_le_bytes());
                                 }
                             }
                         }
@@ -1898,10 +1972,8 @@ fn main() {
                                 let (qb, qi) = ((i * b_rows + r) / MR, (i * b_rows + r) % MR);
                                 for d in 0..hd {
                                     let (ob, ti) = (d / MT, d % MT);
-                                    let o = (obase
-                                        + ((qb * (hd / MT) + ob) * MR + qi) * MT
-                                        + ti)
-                                        * 2;
+                                    let o =
+                                        (obase + ((qb * (hd / MT) + ob) * MR + qi) * MT + ti) * 2;
                                     ctx[r * nh * hd + head * hd + d] =
                                         bf16_to_f32(u16::from_le_bytes([src[o], src[o + 1]]));
                                 }
@@ -1974,7 +2046,11 @@ fn main() {
                 kern.sync_output(&sw_out).expect("sync swiglu");
                 read_bf16(&sw_out, &mut swig[..b_rows * i_dim]);
                 if parity {
-                    let gu = if parity_bf16 { bfr(&gateup) } else { gateup.clone() };
+                    let gu = if parity_bf16 {
+                        bfr(&gateup)
+                    } else {
+                        gateup.clone()
+                    };
                     let mut cpu_o = vec![0f32; b_rows * i_dim];
                     cpu_swiglu(&gu, gm_gu.m, i_dim, b_rows, &mut cpu_o);
                     if parity_bf16 {
@@ -2106,7 +2182,8 @@ fn main() {
             samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let pct = |q: f64| -> f64 {
                 // nearest-rank on the sorted warm samples
-                let idx = ((q * (samples.len() as f64 - 1.0)).round() as usize).min(samples.len() - 1);
+                let idx =
+                    ((q * (samples.len() as f64 - 1.0)).round() as usize).min(samples.len() - 1);
                 samples[idx] * 1e3
             };
             let mean = samples.iter().sum::<f64>() / samples.len() as f64 * 1e3;
@@ -2173,7 +2250,11 @@ fn main() {
             "    {:44} n={n:3}  mean={:8.2} ms  (post-ctx-miss share {:.0}%)",
             name,
             *ns as f64 / 1e6 / *n as f64,
-            if *ns > 0 { *ns_miss as f64 / *ns as f64 * 100.0 } else { 0.0 }
+            if *ns > 0 {
+                *ns_miss as f64 / *ns as f64 * 100.0
+            } else {
+                0.0
+            }
         );
     }
 
@@ -2191,7 +2272,11 @@ fn main() {
         }
         println!(
             "    -> worst primitive cos = {worst:.9}  {} (gate > 0.999999)",
-            if worst > 0.999999 { "PARITY MET" } else { "PARITY NOT MET" }
+            if worst > 0.999999 {
+                "PARITY MET"
+            } else {
+                "PARITY NOT MET"
+            }
         );
     }
 

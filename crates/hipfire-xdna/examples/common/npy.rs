@@ -20,12 +20,20 @@ impl Npy {
     }
 
     pub fn as_i8(&self) -> &[i8] {
-        assert!(self.dtype.ends_with("i1"), "expected int8, got {}", self.dtype);
+        assert!(
+            self.dtype.ends_with("i1"),
+            "expected int8, got {}",
+            self.dtype
+        );
         unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const i8, self.elems()) }
     }
 
     pub fn as_i32(&self) -> &[i32] {
-        assert!(self.dtype.ends_with("i4"), "expected int32, got {}", self.dtype);
+        assert!(
+            self.dtype.ends_with("i4"),
+            "expected int32, got {}",
+            self.dtype
+        );
         assert_eq!(self.data.as_ptr() as usize % 4, 0, "misaligned i32 payload");
         unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const i32, self.elems()) }
     }
@@ -47,7 +55,10 @@ impl Npy {
 
 pub fn read(path: &str) -> std::io::Result<Npy> {
     let raw = std::fs::read(path)?;
-    assert!(raw.len() > 10 && &raw[0..6] == b"\x93NUMPY", "{path}: not a .npy file");
+    assert!(
+        raw.len() > 10 && &raw[0..6] == b"\x93NUMPY",
+        "{path}: not a .npy file"
+    );
     let major = raw[6];
     // v1.0 uses a 2-byte header length, v2.0+ a 4-byte one.
     let (hdr_len, hdr_start) = if major == 1 {
@@ -96,13 +107,17 @@ pub fn read(path: &str) -> std::io::Result<Npy> {
 /// caller narrows it to the actual value (the header is a Python dict literal,
 /// so values end at a quote, a paren, or a comma depending on the field).
 fn extract<'a>(header: &'a str, key: &str) -> &'a str {
-    let at = header.find(key).unwrap_or_else(|| panic!("npy header missing {key}"));
+    let at = header
+        .find(key)
+        .unwrap_or_else(|| panic!("npy header missing {key}"));
     header[at + key.len()..].trim_start()
 }
 
 /// First single-quoted token of `s` (e.g. `'<f4', 'fortran_order': ...` -> `<f4`).
 fn quoted(s: &str) -> &str {
-    let rest = s.strip_prefix('\'').expect("expected quoted npy header value");
+    let rest = s
+        .strip_prefix('\'')
+        .expect("expected quoted npy header value");
     &rest[..rest.find('\'').expect("unterminated npy header value")]
 }
 
@@ -114,12 +129,14 @@ pub fn write_f32(path: &str, shape: &[usize], data: &[f32]) -> std::io::Result<(
     } else {
         format!(
             "({})",
-            shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")
+            shape
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     };
-    let mut header = format!(
-        "{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_str}, }}"
-    );
+    let mut header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_str}, }}");
     // The header (magic + len field included) must be 64-byte aligned.
     while (10 + header.len() + 1) % 64 != 0 {
         header.push(' ');

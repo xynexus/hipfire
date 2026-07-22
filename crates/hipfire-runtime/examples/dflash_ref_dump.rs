@@ -52,9 +52,8 @@ fn main() {
             let dims: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
             format!("({})", dims.join(", "))
         };
-        let dict = format!(
-            "{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape_str}, }}"
-        );
+        let dict =
+            format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape_str}, }}");
         // Total header = 10 (magic+ver+len) + dict + padding, padded to 64.
         let mut header = dict.into_bytes();
         let unpadded = 10 + header.len() + 1; // +1 for trailing '\n'
@@ -71,7 +70,12 @@ fn main() {
     }
     fn write_npy_f32(dir: &Path, name: &str, data: &[f32], shape: &[usize]) {
         let n: usize = shape.iter().product();
-        assert_eq!(n, data.len(), "{name}: shape {shape:?} != len {}", data.len());
+        assert_eq!(
+            n,
+            data.len(),
+            "{name}: shape {shape:?} != len {}",
+            data.len()
+        );
         let mut f = std::fs::File::create(dir.join(format!("{name}.npy"))).unwrap();
         f.write_all(&npy_header("<f4", shape)).unwrap();
         let mut bytes = Vec::with_capacity(data.len() * 4);
@@ -82,7 +86,12 @@ fn main() {
     }
     fn write_npy_i32(dir: &Path, name: &str, data: &[i32], shape: &[usize]) {
         let n: usize = shape.iter().product();
-        assert_eq!(n, data.len(), "{name}: shape {shape:?} != len {}", data.len());
+        assert_eq!(
+            n,
+            data.len(),
+            "{name}: shape {shape:?} != len {}",
+            data.len()
+        );
         let mut f = std::fs::File::create(dir.join(format!("{name}.npy"))).unwrap();
         f.write_all(&npy_header("<i4", shape)).unwrap();
         let mut bytes = Vec::with_capacity(data.len() * 4);
@@ -94,15 +103,16 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: dflash_ref_dump <draft.hfq> [--block B] [--ctx L] [--out DIR] [--seed S]");
+        eprintln!(
+            "Usage: dflash_ref_dump <draft.hfq> [--block B] [--ctx L] [--out DIR] [--seed S]"
+        );
         std::process::exit(1);
     }
     let path = args[1].clone();
     let mut block_size: usize = 16;
     let mut ctx_len: usize = 32;
-    let mut out_dir = PathBuf::from(
-        std::env::var("DFLASH_REF_OUT").unwrap_or_else(|_| "dflash_ref".to_string()),
-    );
+    let mut out_dir =
+        PathBuf::from(std::env::var("DFLASH_REF_OUT").unwrap_or_else(|_| "dflash_ref".to_string()));
     let mut seed: u64 = 0xD1FEA55Eu64;
 
     let mut i = 2;
@@ -167,8 +177,7 @@ fn main() {
     let target_hidden: Vec<f32> = (0..ctx_len * cfg.num_extract() * cfg.hidden)
         .map(|_| rng())
         .collect();
-    let positions_q: Vec<i32> =
-        (ctx_len as i32..ctx_len as i32 + block_size as i32).collect();
+    let positions_q: Vec<i32> = (ctx_len as i32..ctx_len as i32 + block_size as i32).collect();
     let positions_k: Vec<i32> = (0..(ctx_len + block_size) as i32).collect();
 
     dflash::draft_forward(
@@ -189,7 +198,12 @@ fn main() {
     let block_hidden = gpu.download_f32(&scratch.x).expect("download x");
 
     // ── Dump inputs + final output ──────────────────────────────────────────
-    write_npy_f32(&out_dir, "noise_embedding", &noise_embedding, &[block_size, cfg.hidden]);
+    write_npy_f32(
+        &out_dir,
+        "noise_embedding",
+        &noise_embedding,
+        &[block_size, cfg.hidden],
+    );
     write_npy_f32(
         &out_dir,
         "target_hidden",
@@ -197,8 +211,18 @@ fn main() {
         &[ctx_len, cfg.num_extract(), cfg.hidden],
     );
     write_npy_i32(&out_dir, "positions_q", &positions_q, &[block_size]);
-    write_npy_i32(&out_dir, "positions_k", &positions_k, &[ctx_len + block_size]);
-    write_npy_f32(&out_dir, "block_hidden", &block_hidden, &[block_size, cfg.hidden]);
+    write_npy_i32(
+        &out_dir,
+        "positions_k",
+        &positions_k,
+        &[ctx_len + block_size],
+    );
+    write_npy_f32(
+        &out_dir,
+        "block_hidden",
+        &block_hidden,
+        &[block_size, cfg.hidden],
+    );
 
     // Config sidecar for the numpy reference (shapes + rope/eps).
     let meta = serde_json::json!({
@@ -216,12 +240,17 @@ fn main() {
         "target_layer_ids": cfg.target_layer_ids,
         "seed": seed,
     });
-    std::fs::write(out_dir.join("ref_meta.json"), serde_json::to_string_pretty(&meta).unwrap())
-        .unwrap();
+    std::fs::write(
+        out_dir.join("ref_meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
 
     let (mn, mx) = block_hidden
         .iter()
-        .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| {
+            (a.min(v), b.max(v))
+        });
     eprintln!(
         "wrote {} .npy tensors + ref_meta.json (block_hidden min/max {mn:.5e}/{mx:.5e})",
         5

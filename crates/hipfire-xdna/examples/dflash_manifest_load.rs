@@ -53,7 +53,11 @@ fn main() {
         match NpuKernel::load(&xclbin, &insts) {
             Ok(k) => {
                 ok += 1;
-                println!("  [OK]   {name}  (xclbin {} B, insts {} B)", xclbin.len(), insts.len());
+                println!(
+                    "  [OK]   {name}  (xclbin {} B, insts {} B)",
+                    xclbin.len(),
+                    insts.len()
+                );
                 if hold {
                     held.push(k);
                 }

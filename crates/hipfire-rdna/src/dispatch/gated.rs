@@ -347,7 +347,18 @@ impl Gpu {
         Self::ensure_gdn_hd128(head_dim)?;
         if self.gdn_q8_reg_gfx1151_enabled() {
             return self.gated_delta_net_q8_reg_gfx1151(
-                q, k, v, gate, beta, s_q8, s_scales, output, n_tokens, n_heads, head_dim, seq_pos,
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                s_q8,
+                s_scales,
+                output,
+                n_tokens,
+                n_heads,
+                head_dim,
+                seq_pos,
                 delta_layer,
             );
         }

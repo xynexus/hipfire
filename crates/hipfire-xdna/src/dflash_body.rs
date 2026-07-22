@@ -50,7 +50,14 @@ pub fn bf16_to_f32(b: u16) -> f32 {
 // ── int8 per-(row, k-chunk) symmetric activation quant ──────────────────────
 /// Per-(row, k-chunk) symmetric int8 activation quant (the r14 array contracts
 /// one K_CHUNK at a time).
-fn quantize_row_chunked(x: &[f32], rows: usize, k: usize, kc: usize, q: &mut [i8], scale: &mut [f32]) {
+fn quantize_row_chunked(
+    x: &[f32],
+    rows: usize,
+    k: usize,
+    kc: usize,
+    q: &mut [i8],
+    scale: &mut [f32],
+) {
     let chunks = k / kc;
     for r in 0..rows {
         for c in 0..chunks {
@@ -90,7 +97,15 @@ fn cpu_rmsnorm(x: &[f32], gamma: &[f32], rows: usize, h: usize, eps: f32, out: &
     }
 }
 
-fn cpu_headnorm(x: &[f32], gamma: &[f32], rows: usize, heads: usize, hd: usize, eps: f32, out: &mut [f32]) {
+fn cpu_headnorm(
+    x: &[f32],
+    gamma: &[f32],
+    rows: usize,
+    heads: usize,
+    hd: usize,
+    eps: f32,
+    out: &mut [f32],
+) {
     for t in 0..rows * heads {
         let head = &x[t * hd..(t + 1) * hd];
         let ss: f32 = head.iter().map(|&v| v * v).sum();
@@ -102,7 +117,15 @@ fn cpu_headnorm(x: &[f32], gamma: &[f32], rows: usize, heads: usize, hd: usize, 
     }
 }
 
-fn cpu_rope(x: &[f32], rows: usize, heads: usize, hd: usize, pos0: usize, theta: f64, out: &mut [f32]) {
+fn cpu_rope(
+    x: &[f32],
+    rows: usize,
+    heads: usize,
+    hd: usize,
+    pos0: usize,
+    theta: f64,
+    out: &mut [f32],
+) {
     let half = hd / 2;
     let mut cs = vec![0f32; hd];
     for r in 0..rows {
@@ -144,12 +167,23 @@ struct R14Matrix {
 }
 
 impl R14Matrix {
-    fn build(g: &NpuGemmR14, raw: &[i8], row_scale: &[f32], m: usize, k: usize, rows: usize) -> Result<Self, XdnaError> {
+    fn build(
+        g: &NpuGemmR14,
+        raw: &[i8],
+        row_scale: &[f32],
+        m: usize,
+        k: usize,
+        rows: usize,
+    ) -> Result<Self, XdnaError> {
         let geom = g.geom();
         let (mt, nt, kc) = (geom.m_tile(), geom.n_tile(), geom.k_chunk());
         assert_eq!(k % kc, 0, "K={k} must be a multiple of K_CHUNK={kc}");
         assert_eq!(m % nt, 0, "N={m} must be a multiple of N_TILE={nt}");
-        assert_eq!(rows % mt, 0, "rows={rows} must be a multiple of M_TILE={mt}");
+        assert_eq!(
+            rows % mt,
+            0,
+            "rows={rows} must be a multiple of M_TILE={mt}"
+        );
         let (k_chunks, n_tiles, m_blocks) = (k / kc, m / nt, rows / mt);
 
         let mut codes = vec![0i8; m * k];
@@ -164,7 +198,8 @@ impl R14Matrix {
                 scale4[n * k_chunks + c] = row_scale[n] * amax as f32 / 7.0;
                 let inv = 7.0 / amax as f32;
                 for (i, &v) in seg.iter().enumerate() {
-                    codes[n * k + c * kc + i] = (v as f32 * inv).round_ties_even().clamp(-7.0, 7.0) as i8;
+                    codes[n * k + c * kc + i] =
+                        (v as f32 * inv).round_ties_even().clamp(-7.0, 7.0) as i8;
                 }
             }
         }
@@ -198,12 +233,27 @@ impl R14Matrix {
                 scale4t[c * m + n] = scale4[n * k_chunks + c];
             }
         }
-        Ok(Self { m, k, rows, k_chunks, scale4t, wbufs, plan })
+        Ok(Self {
+            m,
+            k,
+            rows,
+            k_chunks,
+            scale4t,
+            wbufs,
+            plan,
+        })
     }
 }
 
 /// Run one full GEMM on the r14 array (device ns discarded — no measurement).
-fn run_r14(g: &mut NpuGemmR14, mx: &R14Matrix, x: &[f32], out: &mut [f32], qa: &mut [i8], sx: &mut [f32]) {
+fn run_r14(
+    g: &mut NpuGemmR14,
+    mx: &R14Matrix,
+    x: &[f32],
+    out: &mut [f32],
+    qa: &mut [i8],
+    sx: &mut [f32],
+) {
     let geom: R14Geometry = g.geom();
     let (mt, nt, kc) = (geom.m_tile(), geom.n_tile(), geom.k_chunk());
     let (rows, m, k, nblk) = (mx.rows, mx.m, mx.k, geom.nblk);
@@ -217,7 +267,11 @@ fn run_r14(g: &mut NpuGemmR14, mx: &R14Matrix, x: &[f32], out: &mut [f32], qa: &
         let span = &mx.plan[lo..hi];
         let uniform = span
             .first()
-            .map(|&(mb, c, _)| span.iter().all(|&(m2, c2, _)| m2 == mb && c2 == c).then_some((mb, c)))
+            .map(|&(mb, c, _)| {
+                span.iter()
+                    .all(|&(m2, c2, _)| m2 == mb && c2 == c)
+                    .then_some((mb, c))
+            })
             .flatten();
         let skip = uniform.is_some() && uniform == *a_state;
         if !skip {
@@ -274,8 +328,14 @@ struct KernelCache {
 impl KernelCache {
     const ANCHOR: usize = usize::MAX;
 
-    fn new(artifacts: HashMap<String, (Vec<u8>, Vec<u8>)>, anchor_name: &str, capacity: usize) -> Result<Self, XdnaError> {
-        let (x, i) = artifacts.get(anchor_name).ok_or_else(|| XdnaError::BadCacheName(anchor_name.into()))?;
+    fn new(
+        artifacts: HashMap<String, (Vec<u8>, Vec<u8>)>,
+        anchor_name: &str,
+        capacity: usize,
+    ) -> Result<Self, XdnaError> {
+        let (x, i) = artifacts
+            .get(anchor_name)
+            .ok_or_else(|| XdnaError::BadCacheName(anchor_name.into()))?;
         let anchor = NpuKernel::load(x, i)?;
         Ok(Self {
             anchor,
@@ -301,15 +361,27 @@ impl KernelCache {
         if self.live.len() >= self.capacity {
             let key = |n: &String| self.last_use.get(n).copied().unwrap_or(0);
             let victim = if self.mru {
-                self.live.iter().enumerate().max_by_key(|(_, (n, _))| key(n)).map(|(i, _)| i)
+                self.live
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, (n, _))| key(n))
+                    .map(|(i, _)| i)
             } else {
-                self.live.iter().enumerate().min_by_key(|(_, (n, _))| key(n)).map(|(i, _)| i)
+                self.live
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (n, _))| key(n))
+                    .map(|(i, _)| i)
             }
             .expect("non-empty cache");
             self.live.remove(victim);
         }
-        let (x, i) = self.artifacts.get(name).unwrap_or_else(|| panic!("no artifact {name}"));
-        let k = NpuKernel::load_peer(&self.anchor, x, i).unwrap_or_else(|e| panic!("load_peer {name}: {e:?}"));
+        let (x, i) = self
+            .artifacts
+            .get(name)
+            .unwrap_or_else(|| panic!("no artifact {name}"));
+        let k = NpuKernel::load_peer(&self.anchor, x, i)
+            .unwrap_or_else(|e| panic!("load_peer {name}: {e:?}"));
         self.live.push((name.to_string(), k));
         self.live.len() - 1
     }
@@ -391,9 +463,10 @@ impl DflashNpuBody {
     /// Fixed to multicore + flash + CPU primitives. Loads ~3 hardware contexts
     /// (anchor + r14 + flash attn); primitives run on the host.
     pub fn load(weights_dir: &str, manifest_path: &str, r14_dir: &str) -> Result<Self, XdnaError> {
-        let index: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(format!("{weights_dir}/index.json")).map_err(XdnaError::Open)?)
-                .map_err(|e| XdnaError::BadCacheName(format!("index.json: {e}")))?;
+        let index: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(format!("{weights_dir}/index.json")).map_err(XdnaError::Open)?,
+        )
+        .map_err(|e| XdnaError::BadCacheName(format!("index.json: {e}")))?;
         let c = &index["cfg"];
         let g = |k: &str| c[k].as_u64().unwrap() as usize;
         let cfg = Cfg {
@@ -426,9 +499,17 @@ impl DflashNpuBody {
             .clone();
         let ca = &mkernels[&attn_name]["compile_args"];
         let ga = |k: &str| ca[k].as_u64().unwrap_or_else(|| panic!("compile_args.{k}")) as usize;
-        let (fl_q_len, fl_kv_tile, fl_n_tiles, fl_n_iters) = (ga("q_len"), ga("kv_tile"), ga("n_tiles"), ga("n_iters"));
-        assert_eq!(fl_q_len % cfg.b_rows, 0, "flash q_len must be a multiple of B");
-        assert!(fl_n_tiles * fl_kv_tile >= cfg.tot, "flash tiles cannot cover tot");
+        let (fl_q_len, fl_kv_tile, fl_n_tiles, fl_n_iters) =
+            (ga("q_len"), ga("kv_tile"), ga("n_tiles"), ga("n_iters"));
+        assert_eq!(
+            fl_q_len % cfg.b_rows,
+            0,
+            "flash q_len must be a multiple of B"
+        );
+        assert!(
+            fl_n_tiles * fl_kv_tile >= cfg.tot,
+            "flash tiles cannot cover tot"
+        );
 
         let artifacts: HashMap<String, (Vec<u8>, Vec<u8>)> = mkernels
             .iter()
@@ -450,18 +531,32 @@ impl DflashNpuBody {
         let r14 = NpuGemmR14::load_peer_dir(&cache.anchor, r14_dir)?;
 
         // Weight loaders (int8 + row-scale -> r14 int4 repack).
-        let load_r14 = |r14: &NpuGemmR14, key: &str, rows: usize| -> (R14Matrix, usize, Vec<usize>) {
-            let spec = &index["gemms"][key];
-            let (m, k) = (spec["M"].as_u64().unwrap() as usize, spec["K"].as_u64().unwrap() as usize);
-            let raw = std::fs::read(format!("{weights_dir}/w_{key}.i8")).expect("weight");
-            assert_eq!(raw.len(), m * k, "{key} weight size");
-            let sraw = std::fs::read(format!("{weights_dir}/w_{key}.scale")).expect("scale");
-            let scale: Vec<f32> = sraw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-            let sizes: Vec<usize> = spec["sizes"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
-            let raw_i8 = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
-            let mx = R14Matrix::build(r14, raw_i8, &scale, m, k, rows).unwrap_or_else(|e| panic!("r14 build {key}: {e:?}"));
-            (mx, m, sizes)
-        };
+        let load_r14 =
+            |r14: &NpuGemmR14, key: &str, rows: usize| -> (R14Matrix, usize, Vec<usize>) {
+                let spec = &index["gemms"][key];
+                let (m, k) = (
+                    spec["M"].as_u64().unwrap() as usize,
+                    spec["K"].as_u64().unwrap() as usize,
+                );
+                let raw = std::fs::read(format!("{weights_dir}/w_{key}.i8")).expect("weight");
+                assert_eq!(raw.len(), m * k, "{key} weight size");
+                let sraw = std::fs::read(format!("{weights_dir}/w_{key}.scale")).expect("scale");
+                let scale: Vec<f32> = sraw
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let sizes: Vec<usize> = spec["sizes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_u64().unwrap() as usize)
+                    .collect();
+                let raw_i8 =
+                    unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
+                let mx = R14Matrix::build(r14, raw_i8, &scale, m, k, rows)
+                    .unwrap_or_else(|e| panic!("r14 build {key}: {e:?}"));
+                (mx, m, sizes)
+            };
         let load_gamma = |key: &str| -> Vec<f32> {
             std::fs::read(format!("{weights_dir}/g_{key}.f32"))
                 .expect("gamma")
@@ -555,13 +650,24 @@ impl DflashNpuBody {
         let nkd = nkv * hd;
         let eps = cfg.kernel_eps;
         let theta = cfg.theta;
-        assert_eq!(target_hidden.len(), l_ctx * cfg.ne * h, "target_hidden shape");
+        assert_eq!(
+            target_hidden.len(),
+            l_ctx * cfg.ne * h,
+            "target_hidden shape"
+        );
         assert!(noise.len() >= b_rows * h, "noise too small");
         assert!(out.len() >= b_rows * h, "out too small");
 
         // Context projection: thp = rmsnorm(fc(target_hidden)) over l_ctx rows.
         let mut thp_raw = vec![0f32; l_ctx * h];
-        run_r14(&mut self.r14, &self.fc, target_hidden, &mut thp_raw, &mut self.qbuf, &mut self.sxbuf);
+        run_r14(
+            &mut self.r14,
+            &self.fc,
+            target_hidden,
+            &mut thp_raw,
+            &mut self.qbuf,
+            &mut self.sxbuf,
+        );
         let mut thp = vec![0f32; l_ctx * h];
         cpu_rmsnorm(&thp_raw, &self.g_hidden, l_ctx, h, eps, &mut thp);
 
@@ -588,14 +694,36 @@ impl DflashNpuBody {
             let m_gu = self.layers[li].m_gu;
 
             // input rmsnorm -> concat qkv projection.
-            cpu_rmsnorm(&hidden[..b_rows * h], &self.layers[li].g_input, b_rows, h, eps, &mut x_norm);
-            run_r14(&mut self.r14, &self.layers[li].qkv, &x_norm, &mut qkv, &mut self.qbuf, &mut self.sxbuf);
+            cpu_rmsnorm(
+                &hidden[..b_rows * h],
+                &self.layers[li].g_input,
+                b_rows,
+                h,
+                eps,
+                &mut x_norm,
+            );
+            run_r14(
+                &mut self.r14,
+                &self.layers[li].qkv,
+                &x_norm,
+                &mut qkv,
+                &mut self.qbuf,
+                &mut self.sxbuf,
+            );
 
             // context k/v from thp (recomputed every cycle — sliding window).
-            run_r14(&mut self.r14, &self.layers[li].kv, &thp, &mut kv_ctx, &mut self.qbuf, &mut self.sxbuf);
+            run_r14(
+                &mut self.r14,
+                &self.layers[li].kv,
+                &thp,
+                &mut kv_ctx,
+                &mut self.qbuf,
+                &mut self.sxbuf,
+            );
             for r in 0..l_ctx {
                 k_all[r * nkd..(r + 1) * nkd].copy_from_slice(&kv_ctx[r * m_kv..r * m_kv + nkd]);
-                v_all[r * nkd..(r + 1) * nkd].copy_from_slice(&kv_ctx[r * m_kv + nkd..r * m_kv + 2 * nkd]);
+                v_all[r * nkd..(r + 1) * nkd]
+                    .copy_from_slice(&kv_ctx[r * m_kv + nkd..r * m_kv + 2 * nkd]);
             }
 
             // q rows + noise k/v rows (new every cycle).
@@ -605,44 +733,103 @@ impl DflashNpuBody {
             for r in 0..b_rows {
                 let d = (l_ctx + r) * nkd;
                 k_all[d..d + nkd].copy_from_slice(&qkv[r * m_qkv + nq..r * m_qkv + nq + nk]);
-                v_all[d..d + nkd].copy_from_slice(&qkv[r * m_qkv + nq + nk..r * m_qkv + nq + 2 * nk]);
+                v_all[d..d + nkd]
+                    .copy_from_slice(&qkv[r * m_qkv + nq + nk..r * m_qkv + nq + 2 * nk]);
             }
 
             // headnorm + rope (CPU).
-            cpu_headnorm(&q, &self.layers[li].g_qnorm, b_rows, nh, hd, eps, &mut q_tmp);
+            cpu_headnorm(
+                &q,
+                &self.layers[li].g_qnorm,
+                b_rows,
+                nh,
+                hd,
+                eps,
+                &mut q_tmp,
+            );
             cpu_rope(&q_tmp, b_rows, nh, hd, l_ctx, theta, &mut q);
-            cpu_headnorm(&k_all, &self.layers[li].g_knorm, tot, nkv, hd, eps, &mut k_tmp);
+            cpu_headnorm(
+                &k_all,
+                &self.layers[li].g_knorm,
+                tot,
+                nkv,
+                hd,
+                eps,
+                &mut k_tmp,
+            );
             cpu_rope(&k_tmp, tot, nkv, hd, 0, theta, &mut k_all);
 
             // attention (flash) — one dispatch, kv-heads streamed.
             self.flash_attention(&q, &k_all, &v_all, &mut ctx);
 
-            run_r14(&mut self.r14, &self.layers[li].o, &ctx, &mut attn_proj, &mut self.qbuf, &mut self.sxbuf);
+            run_r14(
+                &mut self.r14,
+                &self.layers[li].o,
+                &ctx,
+                &mut attn_proj,
+                &mut self.qbuf,
+                &mut self.sxbuf,
+            );
             for i in 0..b_rows * h {
                 hidden[i] = residual[i] + attn_proj[i];
             }
 
             let residual2 = hidden.clone();
-            cpu_rmsnorm(&hidden[..b_rows * h], &self.layers[li].g_post, b_rows, h, eps, &mut x_norm);
-            run_r14(&mut self.r14, &self.layers[li].gateup, &x_norm, &mut gateup, &mut self.qbuf, &mut self.sxbuf);
+            cpu_rmsnorm(
+                &hidden[..b_rows * h],
+                &self.layers[li].g_post,
+                b_rows,
+                h,
+                eps,
+                &mut x_norm,
+            );
+            run_r14(
+                &mut self.r14,
+                &self.layers[li].gateup,
+                &x_norm,
+                &mut gateup,
+                &mut self.qbuf,
+                &mut self.sxbuf,
+            );
             cpu_swiglu(&gateup, m_gu, i_dim, b_rows, &mut swig[..b_rows * i_dim]);
-            run_r14(&mut self.r14, &self.layers[li].down, &swig, &mut down, &mut self.qbuf, &mut self.sxbuf);
+            run_r14(
+                &mut self.r14,
+                &self.layers[li].down,
+                &swig,
+                &mut down,
+                &mut self.qbuf,
+                &mut self.sxbuf,
+            );
             for i in 0..b_rows * h {
                 hidden[i] = residual2[i] + down[i];
             }
         }
 
-        cpu_rmsnorm(&hidden[..b_rows * h], &self.g_final, b_rows, h, eps, &mut out[..b_rows * h]);
+        cpu_rmsnorm(
+            &hidden[..b_rows * h],
+            &self.g_final,
+            b_rows,
+            h,
+            eps,
+            &mut out[..b_rows * h],
+        );
         let _ = groups;
     }
 
     /// Flash attention for one layer, ported from the harness (flash ABI).
     fn flash_attention(&mut self, q: &[f32], k_all: &[f32], v_all: &[f32], ctx: &mut [f32]) {
         let cfg = self.cfg;
-        let (h, hd, nh, nkv, groups, tot, b_rows) = (cfg.h, cfg.hd, cfg.nh, cfg.nkv, cfg.groups, cfg.tot, cfg.b_rows);
+        let (h, hd, nh, nkv, groups, tot, b_rows) = (
+            cfg.h, cfg.hd, cfg.nh, cfg.nkv, cfg.groups, cfg.tot, cfg.b_rows,
+        );
         let _ = h;
         let nkd = nkv * hd;
-        let (fl_q_len, fl_kv_tile, fl_n_tiles, fl_n_iters) = (self.fl_q_len, self.fl_kv_tile, self.fl_n_tiles, self.fl_n_iters);
+        let (fl_q_len, fl_kv_tile, fl_n_tiles, fl_n_iters) = (
+            self.fl_q_len,
+            self.fl_kv_tile,
+            self.fl_n_tiles,
+            self.fl_n_iters,
+        );
         const MR: usize = 4;
         const MS: usize = 8;
         const MT: usize = 4;
@@ -682,7 +869,11 @@ impl DflashNpuBody {
                             for si in 0..MS {
                                 for ti in 0..MT {
                                     let krow = t * fl_kv_tile + kb * MT + ti;
-                                    let val = if krow < tot { k_all[krow * nkd + kvh * hd + db * MS + si] } else { 0.0 };
+                                    let val = if krow < tot {
+                                        k_all[krow * nkd + kvh * hd + db * MS + si]
+                                    } else {
+                                        0.0
+                                    };
                                     let o = (base + ((db * kb_n + kb) * MS + si) * MT + ti) * 2;
                                     dst[o..o + 2].copy_from_slice(&f32_to_bf16(val).to_le_bytes());
                                 }
@@ -695,7 +886,11 @@ impl DflashNpuBody {
                             for si in 0..MS {
                                 for ti in 0..MT {
                                     let krow = t * fl_kv_tile + vb * MS + si;
-                                    let val = if krow < tot { v_all[krow * nkd + kvh * hd + ob * MT + ti] } else { 0.0 };
+                                    let val = if krow < tot {
+                                        v_all[krow * nkd + kvh * hd + ob * MT + ti]
+                                    } else {
+                                        0.0
+                                    };
                                     let o = (vbase + ((vb * ob_n + ob) * MS + si) * MT + ti) * 2;
                                     dst[o..o + 2].copy_from_slice(&f32_to_bf16(val).to_le_bytes());
                                 }
@@ -704,7 +899,11 @@ impl DflashNpuBody {
                     }
                     let mbase = (base + 2 * fl_kv_tile * hd) * 2;
                     for j in 0..fl_kv_tile {
-                        let m = if t * fl_kv_tile + j < tot { 0.0f32 } else { MASK_NEG };
+                        let m = if t * fl_kv_tile + j < tot {
+                            0.0f32
+                        } else {
+                            MASK_NEG
+                        };
                         dst[mbase + j * 4..mbase + j * 4 + 4].copy_from_slice(&m.to_le_bytes());
                     }
                 }
@@ -712,7 +911,8 @@ impl DflashNpuBody {
         }
         let idx = self.cache.get(&self.attn_name);
         let kern = self.cache.at(idx);
-        kern.dispatch(&[&self.attn_q, &self.attn_kv, &self.attn_o]).expect("attn dispatch");
+        kern.dispatch(&[&self.attn_q, &self.attn_kv, &self.attn_o])
+            .expect("attn dispatch");
         kern.sync_output(&self.attn_o).expect("sync attn");
         let src = self.attn_o.as_slice();
         // O is C-layout: (fl_q_len/MR) x (hd/MT) tiles of MR x MT.
@@ -725,7 +925,8 @@ impl DflashNpuBody {
                     for d in 0..hd {
                         let (ob, ti) = (d / MT, d % MT);
                         let o = (obase + ((qb * (hd / MT) + ob) * MR + qi) * MT + ti) * 2;
-                        ctx[r * nh * hd + head * hd + d] = bf16_to_f32(u16::from_le_bytes([src[o], src[o + 1]]));
+                        ctx[r * nh * hd + head * hd + d] =
+                            bf16_to_f32(u16::from_le_bytes([src[o], src[o + 1]]));
                     }
                 }
             }

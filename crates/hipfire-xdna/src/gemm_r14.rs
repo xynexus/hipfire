@@ -364,7 +364,10 @@ impl NpuGemmR14 {
         if p == 0 {
             self.a_buf.as_mut_slice()
         } else {
-            self.a_buf1.as_mut().expect("ensure_pipelined").as_mut_slice()
+            self.a_buf1
+                .as_mut()
+                .expect("ensure_pipelined")
+                .as_mut_slice()
         }
     }
 

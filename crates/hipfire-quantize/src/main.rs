@@ -514,12 +514,18 @@ impl SafetensorsFile {
             ))
         })?;
         let header_json = std::str::from_utf8(header_bytes).map_err(|e| {
-            invalid(format!("{}: safetensors header is not valid UTF-8: {e}", path.display()))
+            invalid(format!(
+                "{}: safetensors header is not valid UTF-8: {e}",
+                path.display()
+            ))
         })?;
 
         // Parse header, filtering out __metadata__ key
         let raw: serde_json::Value = serde_json::from_str(header_json).map_err(|e| {
-            invalid(format!("{}: safetensors header is not valid JSON: {e}", path.display()))
+            invalid(format!(
+                "{}: safetensors header is not valid JSON: {e}",
+                path.display()
+            ))
         })?;
         let mut tensors = HashMap::new();
         if let serde_json::Value::Object(map) = raw {
