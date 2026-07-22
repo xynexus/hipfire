@@ -317,6 +317,13 @@ fn speculative_decode_impl(
                 pbs.max_batch, k
             ));
         }
+        // Spec-decode SWA-ring rewind (opt-in, pending GPU validation): snapshot
+        // the K soon-to-be-evicted main-layer ring slots before the verify pass
+        // overwrites them in place, so a partial accept can revert the
+        // uncommitted ones. `base` = the verify pass's first position below.
+        if swa_rewind::enabled() {
+            swa_rewind::snapshot(cfg, state, gpu, (last_position + 1) as u64, k)?;
+        }
         forward::forward_prefill_batch_chunk(
             cfg,
             weights,
@@ -369,6 +376,22 @@ fn speculative_decode_impl(
             for &tok in &accepted_tokens {
                 advance_matcher_token(g.matcher, g.decoded_vocab, tok);
             }
+        }
+
+        // Spec-decode SWA-ring rewind (opt-in): revert the ring slots the
+        // verify pass wrote for uncommitted, next-decode-unfixed draft
+        // positions (verify columns [accepted_len + 1, k)). No-op on full
+        // accept or when the rewind path is disabled. Same `base`/`k` as the
+        // snapshot above.
+        if swa_rewind::enabled() {
+            swa_rewind::restore(
+                cfg,
+                state,
+                gpu,
+                (last_position + 1) as u64,
+                accepted_tokens.len(),
+                k,
+            )?;
         }
 
         // ── 6. Refresh state.mtp_last_hidden from the verify pass ──────────
@@ -453,6 +476,193 @@ pub fn logits_argmax(logits: &[f32]) -> usize {
         }
     }
     best
+}
+
+/// Spec-decode SWA-ring rewind for DeepSeek V4 — fixes the stale-slot
+/// corruption tracked in BUGS.md ("Stale SWA ring-buffer slots after
+/// speculative reject").
+///
+/// The verify pass writes K draft positions into the *real* per-layer SWA ring
+/// (slot = `pos % sliding_window`). On a partial accept only `state.n_tokens`
+/// is rewound; the uncommitted ring slots keep rejected-draft K/V. The next
+/// decode step overwrites exactly ONE of them (the corrected token's slot, at
+/// verify column `accepted_len`), so the still-stale columns are
+/// `[accepted_len + 1, k)`. Post-wrap (context ≥ `sliding_window`) those alias
+/// positions that are still inside the next forward's window and silently
+/// corrupt attention. We snapshot the soon-to-be-evicted slots before the
+/// verify and restore the uncommitted ones after the accept, so the ring
+/// matches the pure-AR frontier.
+///
+/// Scope: only the modular SWA ring (`swa_k`/`swa_v`) aliases. `full_k_cache`
+/// is absolute-position-indexed and causally safe (a future stale row is never
+/// gathered, and the march overwrites it before it becomes past); the MTP
+/// layer's ring only affects draft acceptance (verify still guarantees correct
+/// output). Neither is touched here.
+///
+/// PENDING GPU VALIDATION — gated OFF by default behind
+/// `HIPFIRE_DEEPSEEK4_SPEC_KV_REWIND=1`. The pure slot arithmetic
+/// ([`slot_subranges`]) is unit-tested; the on-device copy must still be
+/// validated with an AR-vs-spec losslessness A/B on a runnable deepseek4 model
+/// (the divergence appears only post-wrap with k ≥ n_accept + 3) before this is
+/// defaulted on.
+pub mod swa_rewind {
+    use super::{DeepseekV4Config, DeepseekV4State};
+    use hipfire_rdna::{DType, Gpu};
+
+    /// Snapshot column capacity = max supported spec K (spec K is small).
+    const SNAP_COLS: usize = 16;
+
+    #[inline]
+    pub fn enabled() -> bool {
+        std::env::var("HIPFIRE_DEEPSEEK4_SPEC_KV_REWIND")
+            .ok()
+            .as_deref()
+            == Some("1")
+    }
+
+    /// Split the consecutive absolute positions `[p_start, p_end)` into
+    /// `(ring_slot, pack_col, len)` runs. Position `p` maps to ring slot
+    /// `p % win` and snapshot column `p - snap_base`. The ring wraps at `win`,
+    /// so this yields 1..=2 contiguous runs. Pure arithmetic — unit-tested.
+    pub fn slot_subranges(
+        snap_base: u64,
+        p_start: u64,
+        p_end: u64,
+        win: usize,
+    ) -> Vec<(usize, usize, usize)> {
+        let winu = win as u64;
+        let mut out = Vec::new();
+        let mut p = p_start;
+        while p < p_end {
+            let to_wrap = winu - (p % winu);
+            let len = to_wrap.min(p_end - p);
+            out.push(((p % winu) as usize, (p - snap_base) as usize, len as usize));
+            p += len;
+        }
+        out
+    }
+
+    /// Save the K ring slots `[base, base + k)` that the verify pass is about
+    /// to overwrite, for every main layer with an allocated SWA ring. Call
+    /// immediately before the batched verify forward.
+    pub fn snapshot(
+        cfg: &DeepseekV4Config,
+        state: &mut DeepseekV4State,
+        gpu: &mut Gpu,
+        base: u64,
+        k: usize,
+    ) -> Result<(), String> {
+        if k == 0 || k > SNAP_COLS {
+            return Ok(());
+        }
+        let rows = cfg.num_key_value_heads * cfg.head_dim;
+        let win = cfg.sliding_window;
+        let sub = slot_subranges(base, base, base + k as u64, win);
+        for l in 0..cfg.num_hidden_layers {
+            let attn = &mut state._attention[l];
+            if attn.swa_k.is_none() || attn.swa_v.is_none() {
+                continue;
+            }
+            if attn.swa_k_snap.is_none() {
+                attn.swa_k_snap = Some(
+                    gpu.alloc_tensor(&[rows, SNAP_COLS], DType::F32)
+                        .map_err(|e| format!("alloc swa_k_snap l{l}: {e:?}"))?,
+                );
+                attn.swa_v_snap = Some(
+                    gpu.alloc_tensor(&[rows, SNAP_COLS], DType::F32)
+                        .map_err(|e| format!("alloc swa_v_snap l{l}: {e:?}"))?,
+                );
+            }
+            let sk = attn.swa_k.as_ref().unwrap();
+            let sv = attn.swa_v.as_ref().unwrap();
+            let nk = attn.swa_k_snap.as_ref().unwrap();
+            let nv = attn.swa_v_snap.as_ref().unwrap();
+            for &(slot, pack, len) in &sub {
+                gpu.strided_copy_2d(sk, slot, win, nk, pack, SNAP_COLS, rows, len, false)
+                    .map_err(|e| format!("swa_k snapshot l{l}: {e:?}"))?;
+                gpu.strided_copy_2d(sv, slot, win, nv, pack, SNAP_COLS, rows, len, false)
+                    .map_err(|e| format!("swa_v snapshot l{l}: {e:?}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore the uncommitted ring slots after a partial accept. The stale
+    /// verify columns are `[accepted_len + 1, k)` (see module docs); a no-op on
+    /// a full accept, when `accepted_len + 1 >= k`, or before any snapshot ran.
+    /// `base` and `k` MUST match the preceding [`snapshot`] call.
+    pub fn restore(
+        cfg: &DeepseekV4Config,
+        state: &mut DeepseekV4State,
+        gpu: &mut Gpu,
+        base: u64,
+        accepted_len: usize,
+        k: usize,
+    ) -> Result<(), String> {
+        if k == 0 || k > SNAP_COLS {
+            return Ok(());
+        }
+        let lo = accepted_len + 1;
+        if lo >= k {
+            return Ok(());
+        }
+        let rows = cfg.num_key_value_heads * cfg.head_dim;
+        let win = cfg.sliding_window;
+        // Stale positions [base + lo, base + k); snapshot columns [lo, k).
+        let sub = slot_subranges(base, base + lo as u64, base + k as u64, win);
+        for l in 0..cfg.num_hidden_layers {
+            let attn = &state._attention[l];
+            let (Some(sk), Some(sv), Some(nk), Some(nv)) = (
+                attn.swa_k.as_ref(),
+                attn.swa_v.as_ref(),
+                attn.swa_k_snap.as_ref(),
+                attn.swa_v_snap.as_ref(),
+            ) else {
+                continue;
+            };
+            for &(slot, pack, len) in &sub {
+                gpu.strided_copy_2d(nk, pack, SNAP_COLS, sk, slot, win, rows, len, false)
+                    .map_err(|e| format!("swa_k restore l{l}: {e:?}"))?;
+                gpu.strided_copy_2d(nv, pack, SNAP_COLS, sv, slot, win, rows, len, false)
+                    .map_err(|e| format!("swa_v restore l{l}: {e:?}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::slot_subranges;
+
+        #[test]
+        fn subranges_no_wrap() {
+            // base=100, save k=3 → positions 100..103 (win=128): one run.
+            assert_eq!(slot_subranges(100, 100, 103, 128), vec![(100, 0, 3)]);
+        }
+
+        #[test]
+        fn subranges_wrap() {
+            // base=126, k=4 → positions 126..130 wrap at 128.
+            // slots 126,127,0,1 ; packed cols 0,1,2,3.
+            assert_eq!(
+                slot_subranges(126, 126, 130, 128),
+                vec![(126, 0, 2), (0, 2, 2)]
+            );
+        }
+
+        #[test]
+        fn restore_subset_across_wrap() {
+            // Snapshot base=126,k=4; restore stale cols [lo=2,4) → positions
+            // 128..130 → slots 0,1 from packed cols 2,3.
+            assert_eq!(slot_subranges(126, 128, 130, 128), vec![(0, 2, 2)]);
+        }
+
+        #[test]
+        fn empty_range_yields_nothing() {
+            // k=2 always leaves the stale range empty (lo=accepted_len+1>=k).
+            assert!(slot_subranges(100, 102, 102, 128).is_empty());
+        }
+    }
 }
 
 fn apply_grammar_mask(

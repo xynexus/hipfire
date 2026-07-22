@@ -640,6 +640,15 @@ pub struct MainAttentionLayerState {
     /// SWA ring V cache. DeepSeek V4 has tied K=V so this is a copy of swa_k.
     pub swa_v: Option<hipfire_rdna::GpuTensor>,
 
+    /// Spec-decode SWA-ring rewind snapshots, packed `[n_kv_heads * head_dim,
+    /// K_CAP]` F32 (one column per verified draft position). Before a
+    /// speculative verify writes the K draft positions into the ring, the
+    /// soon-to-be-evicted slots are saved here; on a partial accept the
+    /// uncommitted slots are restored so the ring matches the pure-AR frontier.
+    /// See `spec_decode::swa_rewind`. `None` until the rewind path first runs.
+    pub swa_k_snap: Option<hipfire_rdna::GpuTensor>,
+    pub swa_v_snap: Option<hipfire_rdna::GpuTensor>,
+
     /// Full positional K/V cache for indexer-gathered attention. Layout:
     /// `[max_ctx, n_kv_heads * head_dim]` F32. Written at each decode
     /// step (after tail-RoPE). Used by the modified main attention when
@@ -948,6 +957,8 @@ impl DeepseekV4State {
             attention.push(MainAttentionLayerState {
                 swa_k: None,
                 swa_v: None,
+                swa_k_snap: None,
+                swa_v_snap: None,
                 full_k_cache: None,
                 full_v_cache: None,
                 gathered_k: None,
@@ -1163,6 +1174,8 @@ impl DeepseekV4State {
         for mut l in self._attention.drain(..) {
             free_opt(gpu, &mut l.swa_k);
             free_opt(gpu, &mut l.swa_v);
+            free_opt(gpu, &mut l.swa_k_snap);
+            free_opt(gpu, &mut l.swa_v_snap);
             free_opt(gpu, &mut l.full_k_cache);
             free_opt(gpu, &mut l.full_v_cache);
             free_opt(gpu, &mut l.gathered_k);

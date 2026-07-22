@@ -61,19 +61,27 @@ into full investigations here.
      per-slot position mask (deepseek4_attn_swa.hip) — it trusts n_valid.
   Result: PRE-wrap (total seq < 128) the stale slots sit at indices ≥ n_valid
   and are excluded → safe. POST-wrap (seq ≥ sliding_window=128) the ring is
-  full; the uncommitted draft writes at slots (M+2..N+K) mod 128 EVICTED
-  positions (Q−128) that are still inside the next forward's 128-wide window,
-  so the linear read consumes rejected-token K/V as if it were those evicted
-  positions → silent attention corruption. Triggers whenever ≥2 draft
-  positions go uncommitted past position 128 — i.e. the COMMON case for
-  spec-decode on >128-token sequences with <100% acceptance, NOT the "narrow
-  window" the in-code comment suggests.
-- Suggested fix: mirror the existing per-arch KV rewind (lfm2moe
-  `save_kv_rows`/`restore_kv_rows`/`apply_eviction_retain_to_draft`): snapshot
-  the K soon-to-be-evicted ring slots (kv_state + score_state) before the draft
-  loop, and on partial accept restore the slots for the uncommitted positions
-  so the ring matches the pure-AR frontier. deepseek4 currently has no such
-  save/restore for its SWA/compressor ring — that is the gap.
+  full; uncommitted draft writes evict positions still inside the next
+  forward's 128-wide window, so the linear read consumes rejected-token K/V →
+  silent attention corruption.
+  Refined boundary (2026-07-22, from the verify/accept indexing): verify feeds
+  `[last_token, draft[0..k-2]]` at base `last_position+1`, and the NEXT decode
+  overwrites exactly ONE stale slot (the corrected token's, verify column
+  `accepted_len`). So the still-stuck stale columns are `[accepted_len+1, k)`,
+  nonempty only when **k ≥ n_accept+3** (never k=2; k=3 only at n_accept=0) AND
+  post-wrap. Real but narrower than "any partial accept". Only the modular SWA
+  ring aliases; `full_k_cache` is absolute-indexed + causally safe, and the MTP
+  ring only affects draft acceptance (verify still guarantees correct output).
+- Fix: IMPLEMENTED, gated OFF pending GPU validation. `spec_decode::swa_rewind`
+  (behind `HIPFIRE_DEEPSEEK4_SPEC_KV_REWIND=1`) snapshots the K soon-to-be-
+  evicted main-layer SWA slots before the verify (strided per-slot copy into
+  per-layer `swa_k_snap`/`swa_v_snap`) and restores the uncommitted columns
+  `[accepted_len+1, k)` after the accept, wrap-aware. Pure slot arithmetic is
+  unit-tested (`cargo test -p hipfire-arch-deepseek4 swa_rewind`, 4/4). Enable-
+  by-default is blocked on an AR-vs-spec losslessness A/B on a runnable model:
+  a compressor-F16 `deepseek4-q8-mtp` re-quant is in progress on halo (the mq4
+  artifact is unloadable — see below). Validation: pre-fix expect divergence
+  post-128 with k=3; post-fix expect token-identical.
 - Empirical status (halo, gfx1151): BLOCKED. The only deepseek4 artifact on
   halo (`deepseek-v4-flash.mq4.hfq`) will not run on the current daemon build:
   its MQ4 `compressor.wkv` is rejected by the F16-native compressor path
