@@ -5,7 +5,7 @@
 //! so the binaries can report a dev-build identity from `--version`.
 //!
 //! Uses `vergen-gitcl`, which shells out to the `git` CLI — so the embedded
-//! string is byte-identical to the `chaingun-version` GitHub workflow's
+//! string is byte-identical to the `master-version` GitHub workflow's
 //! `git describe` (same tool, same `--tags --dirty --match 'v[0-9]*'` flags).
 //! vergen also emits the `cargo:rerun-if-changed` directives for the active
 //! ref so the embedded SHA refreshes when new commits land.

@@ -1,11 +1,11 @@
-name: chaingun-version
+name: master-version
 
 # Development builds use a Git-derived subpatch identity instead of committing
 # Cargo.toml version bumps on every accepted change. For a checkout described as
 # `v0.3.0-908-g97767a40`, the `908` is the commit count since tag `v0.3.0`.
 on:
   push:
-    branches: [chaingun]
+    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -21,7 +21,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Compute chaingun version
+      - name: Compute master version
         id: version
         shell: bash
         run: |
@@ -84,7 +84,7 @@ jobs:
           EOF
 
           {
-            echo "### Chaingun Version"
+            echo "### Master Version"
             echo
             echo "| Field | Value |"
             echo "| --- | --- |"
@@ -98,7 +98,7 @@ jobs:
       - name: Upload version metadata
         uses: actions/upload-artifact@v4
         with:
-          name: hipfire-chaingun-version-${{ github.sha }}
+          name: hipfire-master-version-${{ github.sha }}
           path: |
             hipfire-version.env
             hipfire-version.json

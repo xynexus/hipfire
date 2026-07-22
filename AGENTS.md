@@ -34,21 +34,16 @@ the relevant docs under `docs/`.
 
 ## Branch And Git
 
-- Branch model: `chaingun` is this fork's main branch — the active development
-  line where all work lands. `master` is NOT downstream of `chaingun`; it is
-  kept only as a landing spot for cherry-picks from `origin`/upstream. The two
-  have diverged and are not meant to be reconciled by merging.
-- Because of that model, do **not** merge `chaingun` into `master` (nor treat a
-  `chaingun`→`master` merge as a routine "merge and push"). Integration flows the
-  other way: cherry-pick specific upstream commits from `master` into `chaingun`
-  when you want them. Only touch `master` when the user explicitly asks to
-  land or cherry-pick an upstream commit there.
-- Use `chaingun` as the reference branch for further work. New work should
-  happen directly on `chaingun` or be explicitly based on and compared against
-  `chaingun`; do not treat `master` as the active baseline unless the user says
-  so.
-- Before meaningful changes, pull/rebase from the `chaingun` reference when the
-  worktree state allows it.
+- `master` is the default integration branch and the reference for new work.
+  The former pre-fork `master` history is preserved as the archival
+  `master-prefork` branch; do not base new work on it or merge it wholesale into
+  `master` unless the user explicitly requests historical recovery work.
+- Start feature and fix work from an up-to-date `origin/master` on a descriptive
+  topic branch. Prefer reviewed pull requests for integration; commit or push
+  directly to `master` only when the user explicitly requests that workflow.
+- Before meaningful changes, fetch `origin` and rebase or merge the topic branch
+  onto the latest `origin/master` when the worktree state allows it. Do not
+  rewrite published shared history without explicit approval.
 - Preserve unrelated user changes. When committing or pushing, stage only files
   that belong to the current task and use descriptive messages.
 

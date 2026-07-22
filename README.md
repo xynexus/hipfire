@@ -23,12 +23,12 @@ hipfire chat -m qwen3.5:9b "What is the capital of France?"
 hipfire serve              # OpenAI-compatible API on 127.0.0.1:11435
 ```
 
-Current release: **v0.3.0** — chaingun runtime, Opus quantization, hierarchical KV, and operator surfaces. DeepSeek V4 Flash support landed in v0.2.0. See [CHANGELOG.md](CHANGELOG.md).
+Current release: **v0.3.0** — modular runtime, Opus quantization, hierarchical KV, and operator surfaces. DeepSeek V4 Flash support landed in v0.2.0. See [CHANGELOG.md](CHANGELOG.md).
 
-`chaingun` development builds use the Git-derived subpatch identity
+`master` development builds use the Git-derived subpatch identity
 `vX.Y.Z-N-gSHA`, where `N` is the commit count since the release tag. The
-`chaingun-version` GitHub Action emits that identity on every accepted
-`chaingun` commit, and the binaries report the same string from `--version`
+`master-version` GitHub Action emits that identity on every accepted
+`master` commit, and the binaries report the same string from `--version`
 (embedded at build time by `hipfire-build-info` via `vergen-gitcl`, falling back
 to the static crate version when built without a `.git`). `Cargo.toml` stays at
 the release SemVer until the next intentional release bump.
@@ -179,10 +179,10 @@ attribute the corresponding inventions per [AGENTS.md](AGENTS.md).
 
 ## Contributing
 
-All further work should use `chaingun` as the reference branch. New work should
-either happen directly on `chaingun` or be explicitly based on and compared
-against `chaingun`; do not treat `master` as the active development baseline
-unless that is called out for a specific task.
+Use `master` as the integration branch. Create feature or fix branches from the
+latest `origin/master`, keep commits focused, and merge through reviewed pull
+requests. The archival `master-prefork` branch preserves the former upstream
+line and is not a development baseline.
 
 See [.github/CONTRIBUTING.md](.github/CONTRIBUTING.md). Install local hooks with
 `./scripts/install-hooks.sh`. The no-GPU CI subset is
