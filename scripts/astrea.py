@@ -4242,6 +4242,10 @@ def build_parser():
     expert_sweep.add_argument("--calibration-dataset", required=True)
     expert_sweep.add_argument("--evaluation-dataset", required=True)
     expert_sweep.add_argument("--reference-model", required=True)
+    expert_sweep.add_argument(
+        "--reference-kldref",
+        help="Reuse one immutable held-out KLD reference for every sweep variant.",
+    )
     expert_sweep.add_argument("--output-dir", required=True)
     expert_sweep.add_argument("--evaluation-command-template", required=True)
     expert_sweep.add_argument("--axis", choices=("minimum", "capture"), required=True)
@@ -4609,6 +4613,7 @@ def run(argv=None):
                 expert_coverage_policy=args.expert_coverage_policy,
                 hipfire=args.hipfire,
                 evaluation_owns_resource_lease=args.evaluation_owns_resource_lease,
+                reference_kldref=args.reference_kldref,
                 engine=engine_fingerprint(args.engine_root),
                 command=["python3", "scripts/astrea.py", *raw_argv],
             ),

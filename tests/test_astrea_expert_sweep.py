@@ -159,6 +159,51 @@ def test_floor_sweep_freezes_one_axis_and_heldout_commands(tmp_path):
     assert plan["plan_fingerprint"].startswith("sha256:")
 
 
+def test_floor_sweep_can_bind_one_shared_kld_reference(tmp_path):
+    sweep = load_module()
+    inputs = common_inputs(tmp_path)
+    shared_kldref = tmp_path / "heldout.oq8.kldref"
+    shared_kldref.write_bytes(b"HFKREF\0shared-reference")
+    inputs["reference_kldref"] = shared_kldref
+    inputs["evaluation_command_template"] = (
+        "hipfire eval --model {candidate} --kldref {reference_kldref} "
+        "--dataset {evaluation_dataset} --out {evaluation_output}"
+    )
+
+    plan = sweep.build_plan(
+        **inputs,
+        axis="minimum",
+        minimum_rows=[512, 1024],
+        capture_targets=None,
+        selected_minimum=None,
+        fixed_capture_target=4096,
+    )
+
+    expected = str(shared_kldref.resolve())
+    assert plan["reference_kldref"]["path"] == expected
+    assert plan["reference_kldref"]["identity"]["kind"] == "complete_file"
+    assert plan["comparison_contract"]["shared_reference_kldref"] is True
+    for variant in plan["variants"]:
+        command = variant["evaluation_command"]
+        assert command[command.index("--kldref") + 1] == expected
+        assert "--reference" not in command
+
+    inputs["evaluation_command_template"] += " --reference {reference_model}"
+    with pytest.raises(ValueError, match="cannot use.*reference_model"):
+        sweep.build_plan(
+            **inputs,
+            axis="minimum",
+            minimum_rows=[512, 1024],
+            capture_targets=None,
+            selected_minimum=None,
+            fixed_capture_target=4096,
+        )
+
+    shared_kldref.write_bytes(b"HFKREF\0changed")
+    with pytest.raises(ValueError, match="reference KLDREF identity drift"):
+        sweep.verify_plan(plan, current_engine={"fingerprint_id": "sha256:engine"})
+
+
 def test_capture_sweep_holds_selected_minimum_fixed(tmp_path):
     sweep = load_module()
     plan = sweep.build_plan(
@@ -457,6 +502,54 @@ def test_astrea_cli_writes_frozen_expert_sweep_plan(tmp_path):
     assert "crates/hipfire-coexistence/src/calibrate.rs" in plan["engine"]["source_hashes"]
     assert "scripts/astrea_expert_sweep.py" in plan["engine"]["source_hashes"]
     assert plan["command_argv"][:3] == ["python3", "scripts/astrea.py", "expert-sweep-plan"]
+
+
+def test_astrea_cli_binds_shared_kld_reference(tmp_path):
+    astrea = load_astrea()
+    inputs = common_inputs(tmp_path)
+    shared_kldref = tmp_path / "heldout.oq8.kldref"
+    shared_kldref.write_bytes(b"HFKREF\0shared-reference")
+    output = tmp_path / "plan.json"
+    code, stdout, stderr = astrea.main_for_test(
+        [
+            "expert-sweep-plan",
+            "--model",
+            str(inputs["model"]),
+            "--artifact-stem",
+            inputs["artifact_stem"],
+            "--calibration-dataset",
+            str(inputs["calibration_dataset"]),
+            "--evaluation-dataset",
+            str(inputs["evaluation_dataset"]),
+            "--reference-model",
+            str(inputs["reference_model"]),
+            "--reference-kldref",
+            str(shared_kldref),
+            "--output-dir",
+            str(inputs["output_dir"]),
+            "--evaluation-command-template",
+            (
+                "hipfire eval --model {candidate} --kldref {reference_kldref} "
+                "--dataset {evaluation_dataset} --out {evaluation_output}"
+            ),
+            "--axis",
+            "minimum",
+            "--minimum-rows",
+            "512",
+            "--fixed-capture-target",
+            "4096",
+            "--out",
+            str(output),
+        ]
+    )
+
+    assert code == 0, stderr
+    assert stdout == ""
+    plan = json.loads(output.read_text(encoding="utf-8"))
+    assert plan["reference_kldref"]["path"] == str(shared_kldref.resolve())
+    command = plan["variants"][0]["evaluation_command"]
+    assert command[command.index("--kldref") + 1] == str(shared_kldref.resolve())
+    assert "--reference" not in command
 
 
 def test_verify_plan_rejects_dataset_engine_and_payload_drift(tmp_path):

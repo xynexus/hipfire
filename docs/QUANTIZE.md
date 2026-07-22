@@ -436,7 +436,21 @@ Before changing the family-neutral 2,048-row eligibility floor or 4,096-row
 capture target, freeze a one-axis Astrea experiment. A minimum sweep holds the
 capture target fixed; a capture sweep requires the already-selected minimum and
 holds it fixed. The calibration and held-out corpora must have different content
-hashes. Planning does not load a model or run the GPU:
+hashes. Build the held-out HFKREF once before planning so every variant compares
+against the identical teacher signal without reloading the reference model:
+
+```bash
+source scripts/lib/kld_daemon.sh
+kld_build_ref \
+  ~/.hipfire/models/qwen3.5-35b-a3b.oq8.hfq \
+  benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
+  ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/heldout.oq8.kldref \
+  32 q8 2048
+```
+
+The daemon owns the shared GPU resource lease for this command. Do not wrap it
+in a second external GPU lock. Planning itself does not load a model or run the
+GPU:
 
 ```bash
 python3 scripts/astrea.py expert-sweep-plan \
@@ -445,9 +459,10 @@ python3 scripts/astrea.py expert-sweep-plan \
   --calibration-dataset benchmarks/calib/calib-1m.txt \
   --evaluation-dataset benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
   --reference-model ~/.hipfire/models/qwen3.5-35b-a3b.oq8.hfq \
+  --reference-kldref ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/heldout.oq8.kldref \
   --output-dir ~/.hipfire/experiments/Qwen3.5-35B-A3B-expert-sweep/minimum \
   --evaluation-command-template \
-    'target/release/hipfire-eval {candidate} --reference {reference_model} --battery quality --corpus {evaluation_dataset} --ctx 2048 --quality-max-chunks 32 --out {evaluation_output}' \
+    'target/release/hipfire-eval {candidate} --kldref {reference_kldref} --battery quality --corpus {evaluation_dataset} --ctx 2048 --quality-max-chunks 32 --out {evaluation_output}' \
   --evaluation-owns-resource-lease \
   --layer-prefetch-bytes 0 \
   --axis minimum \
@@ -463,9 +478,13 @@ python3 scripts/astrea.py expert-sweep-verify \
 The plan fingerprints the native calibration engine, registered adapters,
 grouped-MoE substrate, quantizer, workflow scripts, datasets, commands, source
 safetensors manifest, reference HFQ control region and embedded quantization
-identity, and expert policy. Every variant uses `oq4.25++` with AWQ+LDLQ by
-default and emits canonical native two-pass commands. Non-daemon evaluation
-commands are wrapped in the shared GPU lock. The daemon-backed quality battery
+identity, the complete shared KLDREF file, and expert policy. The reference HFQ
+remains required as provenance for the teacher anchor, but variant evaluation
+commands load only their candidate and reuse the bound KLDREF. The verifier
+rejects a missing or byte-changed KLDREF before execution. Every variant uses
+`oq4.25++` with AWQ+LDLQ by default and emits canonical native two-pass
+commands. Non-daemon evaluation commands are wrapped in the shared GPU lock.
+The daemon-backed quality battery
 owns that lease itself and emits both mean KLD and PPL, hence the explicit
 `--evaluation-owns-resource-lease`. The verifier checks the plan fingerprint,
 current corpus hashes, source/reference identities, engine fingerprint,

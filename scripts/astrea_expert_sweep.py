@@ -47,7 +47,6 @@ DEFAULT_EXPERT_COVERAGE_POLICY = "preserve-undercovered"
 _ARTIFACT_STEM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]*$")
 _REQUIRED_EVAL_FIELDS = {
     "candidate",
-    "reference_model",
     "evaluation_dataset",
     "evaluation_output",
 }
@@ -220,12 +219,25 @@ def _template_fields(template: str) -> set[str]:
     return {field_name for _, field_name, _, _ in Formatter().parse(template) if field_name is not None}
 
 
-def _render_evaluation_command(template: str, values: dict[str, str]) -> list[str]:
+def _render_evaluation_command(
+    template: str,
+    values: dict[str, str],
+    *,
+    reference_field: str,
+) -> list[str]:
     fields = _template_fields(template)
-    missing = sorted(_REQUIRED_EVAL_FIELDS - fields)
+    inactive_reference_field = (
+        "reference_kldref" if reference_field == "reference_model" else "reference_model"
+    )
+    missing = sorted((_REQUIRED_EVAL_FIELDS | {reference_field}) - fields)
     unknown = sorted(fields - values.keys())
     if missing:
         raise ValueError("evaluation command template is missing required placeholders: " + ", ".join(missing))
+    if inactive_reference_field in fields:
+        raise ValueError(
+            "evaluation command template cannot use "
+            f"{{{inactive_reference_field}}} when {{{reference_field}}} is selected"
+        )
     if unknown:
         raise ValueError("evaluation command template has unknown placeholders: " + ", ".join(unknown))
     command = shlex.split(template.format(**values))
@@ -363,6 +375,16 @@ def verify_plan(plan, *, current_engine=None) -> dict:
     observed_reference_identity = _reference_identity(reference)
     if reference_record.get("identity") != observed_reference_identity:
         raise ValueError("reference model identity drift")
+    reference_kldref_record = plan.get("reference_kldref")
+    reference_kldref = None
+    if reference_kldref_record is not None:
+        if not isinstance(reference_kldref_record, dict):
+            raise ValueError("plan reference KLDREF record is malformed")
+        reference_kldref = Path(reference_kldref_record.get("path", ""))
+        if not reference_kldref.is_file():
+            raise ValueError(f"reference KLDREF is missing: {reference_kldref}")
+        if reference_kldref_record.get("identity") != _reference_identity(reference_kldref):
+            raise ValueError("reference KLDREF identity drift")
 
     planned_engine = plan.get("engine", {}).get("fingerprint_id")
     observed_engine = (current_engine or {}).get("fingerprint_id")
@@ -383,6 +405,9 @@ def verify_plan(plan, *, current_engine=None) -> dict:
     targets = set()
     source_model = str(model.resolve())
     reference_model = str(reference.resolve())
+    evaluation_reference = (
+        str(reference_kldref.resolve()) if reference_kldref is not None else reference_model
+    )
     calibration_dataset = plan["datasets"]["calibration"]["path"]
     evaluation_dataset = plan["datasets"]["evaluation"]["path"]
     recipe = plan.get("recipe", {})
@@ -446,7 +471,7 @@ def verify_plan(plan, *, current_engine=None) -> dict:
             variant["quantized_artifact"],
             variant["evaluation_output"],
             evaluation_dataset,
-            reference_model,
+            evaluation_reference,
         ):
             if expected_path not in evaluation:
                 raise ValueError(f"variant {variant.get('id')} evaluator is not bound to {expected_path}")
@@ -755,6 +780,7 @@ def build_plan(
     expert_coverage_policy=DEFAULT_EXPERT_COVERAGE_POLICY,
     hipfire="target/release/hipfire",
     evaluation_owns_resource_lease=False,
+    reference_kldref=None,
     engine=None,
     command=None,
 ) -> dict:
@@ -764,6 +790,7 @@ def build_plan(
     calibration_dataset = Path(calibration_dataset)
     evaluation_dataset = Path(evaluation_dataset)
     reference_model = Path(reference_model)
+    reference_kldref = Path(reference_kldref) if reference_kldref is not None else None
     output_dir = Path(output_dir)
     if not _ARTIFACT_STEM.fullmatch(str(artifact_stem)) or str(artifact_stem).endswith(".hfq"):
         raise ValueError("artifact stem must be a canonical filename stem without a path or .hfq suffix")
@@ -854,7 +881,15 @@ def build_plan(
             "evaluation_output": str(evaluation_output.resolve()),
             "output_dir": str(output_dir.resolve()),
         }
-        evaluation_command = _render_evaluation_command(evaluation_command_template, values)
+        reference_field = "reference_model"
+        if reference_kldref is not None:
+            values["reference_kldref"] = str(reference_kldref.resolve())
+            reference_field = "reference_kldref"
+        evaluation_command = _render_evaluation_command(
+            evaluation_command_template,
+            values,
+            reference_field=reference_field,
+        )
         if not evaluation_owns_resource_lease:
             evaluation_command = [
                 str(hipfire),
@@ -941,8 +976,14 @@ def build_plan(
                 ]
             ),
             "promotion_eligible_without_complete_metrics": False,
+            "shared_reference_kldref": reference_kldref is not None,
         },
         "variants": variants,
         "command_argv": list(command or []),
     }
+    if reference_kldref is not None:
+        body["reference_kldref"] = {
+            "path": str(reference_kldref.resolve()),
+            "identity": _reference_identity(reference_kldref),
+        }
     return {**body, "plan_fingerprint": _plan_fingerprint(body)}
