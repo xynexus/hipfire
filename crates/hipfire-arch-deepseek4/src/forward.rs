@@ -29,7 +29,7 @@ use hipfire_dispatch::pipeline::superop::{
     self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind,
 };
 use hipfire_dispatch::types::DispatchError;
-use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_rdna::{DType, Gpu, GpuTensor, GROUPED_MOE_BLOCK_ROWS};
 
 /// OnceLock-cached env-var lookups for the DeepSeek V4 decode hot path. Each
 /// `std::env::var` is a syscall (~1μs) — at 43 layers × ~5 lookups per
@@ -5565,7 +5565,7 @@ pub struct PrefillBatchScratch {
     // ── SGLang-style scatter-grouped MoE pipeline (chunk_size ≥ 256) ──
     // Outputs of moe_scatter_fused_k8 feed gemm_mq2g256_lloyd_moe_grouped
     // _wmma_k2 and the unscatter/down-combine kernels. Sized for the
-    // worst-case `m_total_max = max_batch * K_TOP + n_exp * BLOCK_M(=16)`
+    // worst-case `m_total_max = max_batch * K_TOP + n_exp * GROUPED_MOE_BLOCK_ROWS`
     // padded scatter layout.
     pub moe_expert_token_counts: GpuTensor, // [n_exp]      i32 (Raw)
     pub moe_expert_offsets: GpuTensor,      // [n_exp + 1]  i32 (Raw)
@@ -5826,14 +5826,14 @@ impl PrefillBatchScratch {
                     .map_err(|e| format!("alloc moe_expert_offsets: {e:?}"))?
             },
             moe_sorted_slot_index: {
-                let block_m = 16;
+                let block_m = GROUPED_MOE_BLOCK_ROWS;
                 let m_total_max =
                     max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
                 gpu.zeros(&[m_total_max * 4], DType::Raw)
                     .map_err(|e| format!("alloc moe_sorted_slot_index: {e:?}"))?
             },
             moe_expert_tile_ids: {
-                let block_m = 16;
+                let block_m = GROUPED_MOE_BLOCK_ROWS;
                 let m_total_max =
                     max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
                 let n_tiles = m_total_max / block_m;
@@ -5846,7 +5846,7 @@ impl PrefillBatchScratch {
                     .map_err(|e| format!("alloc moe_inverse_perm: {e:?}"))?
             },
             moe_y_gate_up_grouped: {
-                let block_m = 16;
+                let block_m = GROUPED_MOE_BLOCK_ROWS;
                 let m_total_max =
                     max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
                 alloc(
@@ -5856,7 +5856,7 @@ impl PrefillBatchScratch {
                 )?
             },
             moe_x_grouped: {
-                let block_m = 16;
+                let block_m = GROUPED_MOE_BLOCK_ROWS;
                 let m_total_max =
                     max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
                 alloc(
@@ -5866,7 +5866,7 @@ impl PrefillBatchScratch {
                 )?
             },
             moe_y_down_grouped: {
-                let block_m = 16;
+                let block_m = GROUPED_MOE_BLOCK_ROWS;
                 let m_total_max =
                     max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
                 alloc(gpu, &[m_total_max, hidden], "moe_y_down_grouped")?
@@ -7583,8 +7583,7 @@ fn ffn_batched(
         && std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
 
     if use_grouped {
-        const BLOCK_M: usize = 16;
-        let m_total_max = batch_size * k_top + n_exp * BLOCK_M;
+        let m_total_max = batch_size * k_top + n_exp * GROUPED_MOE_BLOCK_ROWS;
 
         // Scatter (single launch): histogram + offsets + permute. Writes
         // -1 sentinels into expert_tile_ids and sorted_slot_index for
@@ -7600,7 +7599,7 @@ fn ffn_batched(
             batch_size * k_top,
             n_exp,
             m_total_max,
-            BLOCK_M,
+            GROUPED_MOE_BLOCK_ROWS,
         )
         .map_err(|e| format!("moe_scatter_fused_k8 l{layer_idx}: {e:?}"))?;
 

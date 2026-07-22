@@ -12,7 +12,7 @@ use std::fmt;
 
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
-pub const GROUPED_MOE_BLOCK_ROWS: usize = 16;
+pub use hipfire_rdna::GROUPED_MOE_BLOCK_ROWS;
 
 /// Owned scatter/grouped-GEMM scratch shared by model-family adapters.
 pub struct GroupedMoeScratch {

@@ -27,3 +27,10 @@ pub use kernels::GEMV_SRC;
 // Re-export the result/error types of `Gpu`'s public methods so downstream
 // crates (e.g. hipfire-train) can name them without depending on hip-bridge.
 pub use hip_bridge::{HipError, HipResult};
+
+/// Physical row tile used by the grouped-MoE scatter and GEMM kernels.
+///
+/// Routing planners and higher-level dispatch must use this value when they
+/// allocate padded expert buckets and tile-id tables. Keep the kernel contract
+/// in the lowest shared layer so model families cannot redeclare it differently.
+pub const GROUPED_MOE_BLOCK_ROWS: usize = 16;

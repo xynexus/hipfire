@@ -1164,8 +1164,7 @@ pub fn run_moe_prefill_bias_aware(
     let nosync_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
 
     if use_grouped {
-        const BLOCK_M: usize = 16;
-        let m_total_max = batch_size * k_top + n_exp * BLOCK_M;
+        let m_total_max = batch_size * k_top + n_exp * hipfire_rdna::GROUPED_MOE_BLOCK_ROWS;
 
         // Scatter: histogram + offsets + permute (single launch).
         hip!(gpu.moe_scatter_fused_k8(
@@ -1178,7 +1177,7 @@ pub fn run_moe_prefill_bias_aware(
             batch_size * k_top,
             n_exp,
             m_total_max,
-            BLOCK_M,
+            hipfire_rdna::GROUPED_MOE_BLOCK_ROWS,
         ))?;
 
         // Grouped gate_up GEMM (M=2*im, K=hidden, x_row_div=k_top, rows=B).
@@ -1352,10 +1351,6 @@ pub fn run_moe_prefill_bias_aware(
 }
 
 // ── Qwen3.5 batched MoE prefill (Ship 4.2) ──────────────────────────
-
-/// MoE grouped-GEMM block size (WMMA tile row count). Must match the
-/// constant in qwen35.rs and the scatter kernel.
-const MOE_GROUPED_BLOCK_M: usize = 16;
 
 /// Dispatch one grouped-GEMM for the given routed expert dtype.
 ///
@@ -1599,7 +1594,7 @@ pub fn run_moe_prefill(
             total_slots,
             n_exp,
             m_total_max,
-            MOE_GROUPED_BLOCK_M,
+            hipfire_rdna::GROUPED_MOE_BLOCK_ROWS,
         ))?;
         path2_m_total = m_total_max;
     }
