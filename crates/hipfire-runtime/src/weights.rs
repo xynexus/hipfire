@@ -386,6 +386,24 @@ mod preflight_tests {
     }
 }
 
+#[inline]
+fn capture_at_weight_gemv_wrapper(dtype: DType) -> bool {
+    // Full-precision GEMV routes terminate in capture-aware RDNA entrypoints:
+    // BF16 in `gemm_bf16_x_bf16_wmma_labeled`, F16 in
+    // `gemm_f16_batched_lmhead`. Keeping wrapper capture enabled for either
+    // would count each activation twice. Quantized routes have no universal
+    // lower-level chokepoint and remain owned here.
+    !matches!(dtype, DType::BF16 | DType::F16)
+}
+
+#[inline]
+fn capture_at_weight_gemm_wrapper(dtype: DType) -> bool {
+    // Batched BF16 reaches the same capture-aware labeled WMMA entrypoint.
+    // Batched F16 instead uses `gemm_f16_x_f32_wmma`, which deliberately does
+    // not capture, so its wrapper remains the owner.
+    dtype != DType::BF16
+}
+
 pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
@@ -402,7 +420,9 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
     // This is the single chokepoint that makes activation capture work for
     // every arch that routes its linears through `weight_gemv` (qwen2,
     // gemma3, minimax dense, qwen35 dense) — not just qwen35's fused kernels.
-    gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
+    if capture_at_weight_gemv_wrapper(w.gpu_dtype) {
+        gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
+    }
     let ctx = DispatchCtx::new(gpu);
     let wr = WeightRef {
         buf: &w.buf,
@@ -1405,7 +1425,9 @@ pub fn weight_gemm(
     // This is what makes wide batched-prefill calibration possible — every arch
     // routing its prefill linears through `weight_gemm` (gemma3, qwen2, …) now
     // captures `batch_size`× more samples per launch instead of N=1 per token.
-    gpu.maybe_capture_activation(&w.buf, x, batch_size, w.k);
+    if capture_at_weight_gemm_wrapper(w.gpu_dtype) {
+        gpu.maybe_capture_activation(&w.buf, x, batch_size, w.k);
+    }
     match w.gpu_dtype {
         DType::F16 => gpu.gemm_f16_x_f32_wmma(&w.buf, x, y, w.m, w.k, batch_size),
         DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, batch_size),
@@ -1567,5 +1589,23 @@ mod tests {
             dense_swiglu_residual_route(DType::MQ4G256),
             DenseSwigluResidualRoute::Unclassified
         );
+    }
+
+    #[test]
+    fn full_precision_capture_has_one_owner_per_dispatch_shape() {
+        // BF16 GEMV and GEMM both terminate in the labeled BF16 WMMA
+        // chokepoint, which owns activation capture for direct lowered-super-op
+        // callers too. The generic wrappers must therefore not capture BF16 a
+        // second time. F16 GEMV likewise terminates in the capture-aware scalar
+        // dispatch, while F16 GEMM's WMMA path relies on its wrapper capture.
+        assert!(!capture_at_weight_gemv_wrapper(DType::BF16));
+        assert!(!capture_at_weight_gemv_wrapper(DType::F16));
+        assert!(!capture_at_weight_gemm_wrapper(DType::BF16));
+        assert!(capture_at_weight_gemm_wrapper(DType::F16));
+
+        // Quantized paths do not provide a universal lower-level capture
+        // chokepoint, so their generic wrapper remains the single owner.
+        assert!(capture_at_weight_gemv_wrapper(DType::Oq4G256));
+        assert!(capture_at_weight_gemm_wrapper(DType::Oq4G256));
     }
 }
