@@ -1,8 +1,10 @@
 # Native Tier-1 calibration collector — status & roadmap
 
-Status as of 2026-07-20. The resident collector and family-neutral layer-stream
-engine are built and mechanism-verified. Full-scale Qwen3.5-397B production and
-matched quality/admission evidence remain pending.
+Status as of 2026-07-22. The resident collector and family-neutral layer-stream
+engine are built and mechanism-verified. The full Qwen3.5-397B teacher artifact
+and its `oq4.25++` second pass are complete; the controlled expert sweeps,
+second-family resident parity, and final quality/channel admission evidence
+remain pending.
 
 ## Update (2026-07-20) — family-neutral native safetensors engine
 
@@ -46,9 +48,11 @@ embedding materialization but before the first layer checkpoint.
 
 Qwen3.5 and Gemma3 provide thin adapters to the same engine. Mechanism tests,
 including grouped expert capture and mixed OQ4 plus BF16/F16 execution, pass on
-gfx1151. A full Qwen3.5-397B production artifact and matched quality/admission
-evidence are still pending; the Python oracle is not deleted until those and a
-second-family production run complete.
+gfx1151. The production Qwen3.5-397B teacher and quant artifacts are complete,
+and dense Qwen3.5 resident/streamed calibration and residual probes now match;
+Gemma3 has the same family-owned resident residual seam but still needs its live
+comparison. Python remains parity/debug tooling rather than the production
+calibration path.
 
 Production preflight now estimates compact or dense Hessian payloads including
 activation aliases, KLDREF bytes, the mmap boundary spool, simultaneous layer
