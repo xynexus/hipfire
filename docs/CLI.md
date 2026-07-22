@@ -193,6 +193,9 @@ Examples:
 * `--host <HOST>` — Override bind host
 * `-p`, `--port <PORT>` — Override bind port
 * `-m`, `--model <MODEL>` — Default model name, shorthand, alias, or path for requests that omit model
+* `--max-seq <MAX_SEQ>` — Override the startup-resolved maximum sequence length
+* `--max-tokens <MAX_TOKENS>` — Override the startup-resolved maximum generated-token budget
+* `--kv-cache <KV_CACHE>` — Override the startup-resolved KV-cache mode
 * `--debug-chat` — Log full raw chat requests and raw model replies
 
 
