@@ -1007,7 +1007,10 @@ impl CalibrationFamilyAdapter for Qwen35CalibrationAdapter {
         model: &ModelInspection,
         job: &CalibrationJob,
     ) -> Result<Box<dyn CalibrationFinalizer>, CalibError> {
-        let norm = load_f32_tensor(reader, gpu, "final_norm", model.hidden_width, false)?;
+        // Qwen3.5 uses GemmaRMSNorm semantics for the final norm too: the
+        // safetensors value is an offset and the effective scale is 1 + w.
+        // Match the resident loader and the per-layer streamed norm loads.
+        let norm = load_f32_tensor(reader, gpu, "final_norm", model.hidden_width, true)?;
         let lm_head =
             match load_matrix(reader, gpu, "lm_head", model.vocab_size, model.hidden_width) {
                 Ok(weight) => weight,

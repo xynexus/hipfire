@@ -770,7 +770,7 @@ fn normalize_router_layers(
                 },
             );
         }
-        return Some(("resident_histogram", normalized));
+        return (!normalized.is_empty()).then_some(("resident_histogram", normalized));
     }
     let telemetry = metadata.get("expert_telemetry")?.as_array()?;
     let mut normalized = BTreeMap::new();
@@ -795,7 +795,7 @@ fn normalize_router_layers(
             },
         );
     }
-    Some(("streamed_expert_telemetry", normalized))
+    (!normalized.is_empty()).then_some(("streamed_expert_telemetry", normalized))
 }
 
 fn json_usize(value: &Value, key: &str) -> Option<usize> {
@@ -1484,5 +1484,18 @@ mod tests {
         let mismatch = compare_router_telemetry(&resident, &drifted, 1e-6, 1e-6).unwrap();
         assert!(!mismatch.ok);
         assert_eq!(mismatch.mismatched_layers, 1);
+    }
+
+    #[test]
+    fn router_parity_ignores_empty_dense_telemetry() {
+        let resident = serde_json::json!({});
+        let streamed = serde_json::json!({"expert_telemetry": []});
+
+        assert!(compare_router_telemetry(&resident, &streamed, 1e-6, 1e-6).is_none());
+
+        let resident_empty = serde_json::json!({
+            "moe_router_histogram": {"per_layer": []}
+        });
+        assert!(compare_router_telemetry(&resident_empty, &streamed, 1e-6, 1e-6).is_none());
     }
 }
