@@ -145,6 +145,13 @@ RESIDENT_MODEL_SHA256=$(sha256sum "$RESIDENT_MODEL" | awk '{print $1}')
 RESIDENT_SHA256=$(sha256sum "$RESIDENT_CALIB" | awk '{print $1}')
 COLLECTOR_SHA256=$(sha256sum "$COLLECTOR" | awk '{print $1}')
 COEXISTENCE_SHA256=$(sha256sum "$COEXISTENCE" | awk '{print $1}')
+HIPFIRE_SHA256=$(sha256sum "$HIPFIRE" | awk '{print $1}')
+STREAMED_RESIDUALS_SHA256=
+RESIDENT_RESIDUALS_SHA256=
+if [[ -n $STREAMED_RESIDUALS ]]; then
+    STREAMED_RESIDUALS_SHA256=$(sha256sum "$STREAMED_RESIDUALS" | awk '{print $1}')
+    RESIDENT_RESIDUALS_SHA256=$(sha256sum "$RESIDENT_RESIDUALS" | awk '{print $1}')
+fi
 GIT_COMMIT=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf unknown)
 if [[ -n $(git -C "$ROOT" status --porcelain 2>/dev/null) ]]; then
     GIT_DIRTY=true
@@ -170,11 +177,19 @@ jq -n \
     --arg collector_sha256 "$COLLECTOR_SHA256" \
     --arg coexistence "$COEXISTENCE" \
     --arg coexistence_sha256 "$COEXISTENCE_SHA256" \
+    --arg hipfire "$HIPFIRE" \
+    --arg hipfire_sha256 "$HIPFIRE_SHA256" \
     --arg git_commit "$GIT_COMMIT" \
     --argjson git_dirty "$GIT_DIRTY" \
     --argjson calibration_status "$calibration_status" \
     --argjson residual_status "$residual_status" \
     --arg streamed_residuals "$STREAMED_RESIDUALS" \
+    --arg streamed_residuals_sha256 "$STREAMED_RESIDUALS_SHA256" \
+    --arg resident_residuals "$RESIDENT_RESIDUALS" \
+    --arg resident_residuals_sha256 "$RESIDENT_RESIDUALS_SHA256" \
+    --arg atol "$ATOL" \
+    --arg rtol "$RTOL" \
+    --argjson residual_probe_rows "$RESIDUAL_PROBE_ROWS" \
     --slurpfile calibration "$CALIBRATION_COMPARISON" \
     --slurpfile residual "$RESIDUAL_COMPARISON" \
     '{
@@ -184,16 +199,28 @@ jq -n \
         mechanism: "resident_vs_layer_streamed",
         inputs: {
             streamed_calibration: {path: $streamed_calib, sha256: $streamed_sha256},
-            streamed_residuals: (if $streamed_residuals == "" then null else $streamed_residuals end),
+            streamed_residuals: (if $streamed_residuals == "" then null else {
+                path: $streamed_residuals,
+                sha256: $streamed_residuals_sha256
+            } end),
             resident_model: {path: $resident_model, sha256: $resident_model_sha256}
         },
-        output: {resident_calibration: $resident_calib, sha256: $resident_sha256},
+        output: {
+            resident_calibration: {path: $resident_calib, sha256: $resident_sha256},
+            resident_residuals: (if $streamed_residuals == "" then null else {
+                path: $resident_residuals,
+                sha256: $resident_residuals_sha256
+            } end)
+        },
         producer: {
             git_commit: $git_commit,
             git_dirty: $git_dirty,
             collector: {path: $collector, sha256: $collector_sha256},
-            coexistence: {path: $coexistence, sha256: $coexistence_sha256}
+            coexistence: {path: $coexistence, sha256: $coexistence_sha256},
+            lock_cli: {path: $hipfire, sha256: $hipfire_sha256}
         },
+        tolerances: {atol: $atol, rtol: $rtol},
+        residual_probe_rows: (if $streamed_residuals == "" then null else $residual_probe_rows end),
         comparison: {
             calibration_exit_status: $calibration_status,
             calibration: $calibration[0],
