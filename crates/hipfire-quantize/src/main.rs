@@ -5403,6 +5403,20 @@ fn source_precision_tensor_bytes(
     }
 }
 
+fn direct_source_precision_layout(
+    dtype: &str,
+    source_bytes: u64,
+) -> Result<(QuantType, u64, &'static str), String> {
+    match dtype {
+        "BF16" => Ok((QuantType::BF16, source_bytes, "BF16")),
+        "F16" => Ok((QuantType::F16, source_bytes, "F16")),
+        "F32" => Ok((QuantType::F32, source_bytes, "F32")),
+        other => Err(format!(
+            "unsupported dtype for source-precision stream: {other}"
+        )),
+    }
+}
+
 /// Embed-table storage override for `--embed-precision`. Returns
 /// `Some((bytes, quant_type, group, label))` when the flag keeps the embed above
 /// Q8, so callers replace their default Q8 embed emission with a source-precision
@@ -7664,19 +7678,12 @@ fn main() {
 
             let meta = st_files[*file_idx].tensor_meta(name).unwrap();
             let n_elements: usize = meta.shape.iter().product();
-            let data_len = match meta.dtype.as_str() {
-                "BF16" | "F16" => (meta.data_offsets[1] - meta.data_offsets[0]) as u64,
-                "F32" => (n_elements * 2) as u64,
-                other => {
-                    eprintln!("error: unsupported dtype for source-precision stream: {other}");
+            let source_bytes = (meta.data_offsets[1] - meta.data_offsets[0]) as u64;
+            let (quant_type, data_len, _) =
+                direct_source_precision_layout(&meta.dtype, source_bytes).unwrap_or_else(|error| {
+                    eprintln!("error: {error}");
                     std::process::exit(2);
-                }
-            };
-            let quant_type = match meta.dtype.as_str() {
-                "BF16" => QuantType::BF16,
-                "F16" | "F32" => QuantType::F16,
-                other => unreachable!("validated unsupported dtype: {other}"),
-            };
+                });
             let shape_u32: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             total_params += n_elements as u64;
             quantized_params += n_elements as u64;
@@ -7766,11 +7773,8 @@ fn main() {
             let job = &jobs[entry_idx];
             let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
             let n_elements: usize = meta.shape.iter().product();
-            let label = match job.dtype.as_str() {
-                "BF16" => "BF16",
-                "F16" | "F32" => "F16",
-                other => unreachable!("validated unsupported dtype: {other}"),
-            };
+            let (_, _, label) = direct_source_precision_layout(&job.dtype, entry.data_len)
+                .expect("direct source job dtype was validated while planning");
             if verbose_tensors {
                 quant_progress.detail(
                     true,
@@ -7787,22 +7791,7 @@ fn main() {
                 .write_next(
                     entry,
                     |writer| {
-                        match job.dtype.as_str() {
-                            "BF16" | "F16" => writer.write_all(raw_data)?,
-                            "F32" => {
-                                let f32_data = to_f32(raw_data, "F32");
-                                let bytes = f32_slice_to_f16_bytes(&f32_data);
-                                writer.write_all(&bytes)?;
-                            }
-                            other => {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!(
-                                        "unsupported dtype for source-precision stream: {other}"
-                                    ),
-                                ));
-                            }
-                        }
+                        writer.write_all(raw_data)?;
                         Ok(())
                     },
                     |_| {},
@@ -14514,6 +14503,14 @@ mod tests {
         let (data, quant_type, label) = source_precision_tensor_bytes(&raw, "F32", &f32_data);
         assert_eq!(data, raw);
         assert_eq!(quant_type as u8, QuantType::F32 as u8);
+        assert_eq!(label, "F32");
+    }
+
+    #[test]
+    fn direct_source_precision_preserves_f32_width() {
+        let (quant_type, bytes, label) = direct_source_precision_layout("F32", 512).unwrap();
+        assert_eq!(quant_type as u8, QuantType::F32 as u8);
+        assert_eq!(bytes, 512);
         assert_eq!(label, "F32");
     }
 
