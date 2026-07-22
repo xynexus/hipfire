@@ -1107,6 +1107,7 @@ pub(crate) fn run_examples_embedding_quality_model(
         ("suite".to_string(), json!("embedding_quality")),
         ("dataset".to_string(), json!(dataset.display().to_string())),
     ]);
+    let base_metrics = embedding_quality_oq_metrics(&model, base_metrics);
 
     let skip = |reason: &str| -> Vec<EvalResult> {
         vec![row_for_model(
@@ -1318,6 +1319,33 @@ pub(crate) fn run_examples_embedding_quality_model(
     );
 
     vec![candidate_row, reference_row]
+}
+
+fn embedding_quality_oq_metrics(
+    model: &str,
+    mut metrics: BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
+    let Some(file_name) = Path::new(model).file_name().and_then(|name| name.to_str()) else {
+        return metrics;
+    };
+    let Some(artifact) = parse_canonical_model_artifact_name(file_name) else {
+        return metrics;
+    };
+    if !artifact.quant.starts_with("oq") {
+        return metrics;
+    }
+
+    metrics.insert("quant".to_string(), json!(artifact.quant));
+    metrics.insert("quant_family".to_string(), json!("oq"));
+    metrics.insert("oq_admission_path".to_string(), json!("embedding_quality"));
+    metrics.insert("oq_decode_gate".to_string(), json!("not_ar"));
+    metrics.insert("oq_tiny_quant_gate".to_string(), json!("not_ar"));
+    metrics.insert("oq_fixture_golden_gate".to_string(), json!("not_ar"));
+    metrics.insert("oq_embedding_quality".to_string(), json!("pending"));
+    if artifact.features.iter().any(|feature| feature == "npu") {
+        metrics.insert("oq_npu_parity".to_string(), json!("pending"));
+    }
+    metrics
 }
 
 #[derive(Clone, Copy)]

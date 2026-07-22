@@ -38,6 +38,7 @@ use crate::types::*;
 /// fields use experts[0] as representative (the loader builds all experts in a
 /// layer with matching dtype, so [0] == all — same invariant the original
 /// routed_* checks relied on).
+#[derive(Clone, Copy, Debug)]
 pub struct MoeDtypes {
     pub router: DType,
     pub shared_gate: DType,        // ffn.shared_expert_gate
@@ -70,6 +71,14 @@ pub struct MoeResolution {
 
 impl MoeResolution {
     pub fn resolve(d: &MoeDtypes, k: usize) -> Self {
+        let oq_indexed_decode = std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
+            .ok()
+            .as_deref()
+            == Some("1");
+        Self::resolve_with_oq_indexed(d, k, oq_indexed_decode)
+    }
+
+    pub fn resolve_with_oq_indexed(d: &MoeDtypes, k: usize, oq_indexed_decode: bool) -> Self {
         use DType::*;
         let gate_side_mq4 = d.router == MQ4G256
             && d.shared_gate == MQ4G256
@@ -88,8 +97,10 @@ impl MoeResolution {
         let routed_indexable_mq6 = (d.routed_down == MQ6G256) && routed_gate_up_mq6;
         let routed_indexable_paro =
             (d.routed_down == ParoQ4G128 && d.has_paro_shared) && routed_gate_up_paro;
-        let routed_indexable_oq4 = (d.routed_down == Oq4G256) && routed_gate_up_oq4;
-        let routed_indexable_oq8 = (d.routed_down == Oq8G256) && routed_gate_up_oq8;
+        let routed_indexable_oq4 =
+            oq_indexed_decode && (d.routed_down == Oq4G256) && routed_gate_up_oq4;
+        let routed_indexable_oq8 =
+            oq_indexed_decode && (d.routed_down == Oq8G256) && routed_gate_up_oq8;
 
         let routed_dtype_indexable = routed_indexable_mq4
             || routed_indexable_mq6

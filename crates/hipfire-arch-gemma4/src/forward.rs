@@ -903,6 +903,9 @@ fn embed_lookup_weight(
         DType::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&wt.buf, out, token, dim),
         DType::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&wt.buf, out, token, dim),
         DType::F32 => gpu.embedding_lookup(&wt.buf, out, token, dim),
+        DType::BF16 => gpu.embedding_lookup_bf16(&wt.buf, out, token, dim),
+        DType::F16 => gpu.embedding_lookup_f16(&wt.buf, out, token, dim),
+        DType::Q4K => gpu.embedding_lookup_q4k(&wt.buf, out, token, dim),
         other => Err(HipError::new(
             0,
             &format!("Gemma 4 PLE embed table dtype {other:?} unsupported"),

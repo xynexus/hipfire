@@ -30,6 +30,7 @@ use hipfire_dispatch::pipeline::superop::{
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_rdna::{DType, Gpu, GpuTensor, GROUPED_MOE_BLOCK_ROWS};
+use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 
 /// OnceLock-cached env-var lookups for the DeepSeek V4 decode hot path. Each
 /// `std::env::var` is a syscall (~1μs) — at 43 layers × ~5 lookups per
@@ -125,7 +126,7 @@ fn gemv_auto(
     k: usize,
 ) -> Result<(), String> {
     use hipfire_dispatch::context::DispatchCtx;
-    use hipfire_dispatch::families::gemv::WeightRef;
+    use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
 
     let gemv = hipfire_runtime::dispatch::gemv_family();
     let ctx = DispatchCtx::new(gpu);
@@ -144,8 +145,39 @@ fn gemv_auto(
         rotation: None,
         awq_scale: None,
     };
-    gemv.run_auto(&ctx, gpu, &wr, x, y)
-        .map_err(|e| format!("gemv dispatch: {e}"))
+    let variant = hipfire_dispatch::types::dtype_post_rotation_variant(weight.dtype);
+    gemv.run(
+        &ctx,
+        gpu,
+        &GemvParams {
+            w: &wr,
+            x,
+            y,
+            variant,
+            residual: None,
+            gate: None,
+            up: None,
+        },
+    )
+    .map_err(|e| format!("gemv dispatch: {e}"))
+}
+
+fn weight_tensor_alias(weight: &GpuTensor, m: usize, k: usize) -> WeightTensor {
+    WeightTensor {
+        buf: GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(weight.buf.as_ptr(), weight.buf.size())
+            },
+            shape: weight.shape.clone(),
+            dtype: weight.dtype,
+        },
+        gpu_dtype: weight.dtype,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    }
 }
 
 /// Batched twin of `gemv_auto` for Phase B2 chunk forward.
@@ -328,6 +360,11 @@ fn gemv_auto_batched_wmma(
             } else {
                 Err("F16 weight requires WMMA path with x_f16_scratch".to_string())
             }
+        }
+        DType::Oq4G256 | DType::Oq8G256 => {
+            let wt = weight_tensor_alias(weight, m, k);
+            weight_gemm(gpu, &wt, x_plain_batch, y, batch_size)
+                .map_err(|e| format!("weight_gemm {:?}: {e:?}", weight.dtype))
         }
         _ => {
             let wmma_on = std::env::var("HIPFIRE_DEEPSEEK4_HFQ4_WMMA")
@@ -2055,10 +2092,16 @@ fn ds4_moe_block_core(
     mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
     if !skip_ffn {
         ffn_stub(cfg, weights, state, gpu, layer_idx)?;
+        if let Some(ffn_out) = state.ffn_out.as_ref() {
+            dump_buf(gpu, &format!("decode_l{layer_idx}_after_ffn_stub"), ffn_out);
+        }
         if layer_idx < cfg.num_hash_layers {
             ffn_hash_routed(cfg, weights, state, gpu, layer_idx, token_id, routed_out)?;
         } else {
             ffn_routed(cfg, weights, state, gpu, layer_idx, routed_out)?;
+        }
+        if let Some(ffn_out) = state.ffn_out.as_ref() {
+            dump_buf(gpu, &format!("decode_l{layer_idx}_after_routed"), ffn_out);
         }
     } else {
         if state.ffn_out.is_none() {
@@ -2074,6 +2117,13 @@ fn ds4_moe_block_core(
     }
     if do_mix {
         hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
+        if let Some(streams) = state.residual_streams.as_ref() {
+            dump_buf(
+                gpu,
+                &format!("decode_l{layer_idx}_after_hc_ffn_mix"),
+                streams,
+            );
+        }
     }
     Ok(())
 }
@@ -2104,7 +2154,15 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
             self.layer_idx,
             self.position,
         )
-        .map_err(DispatchError::Hip)
+        .map_err(DispatchError::Hip)?;
+        if let Some(streams) = self.state.residual_streams.as_ref() {
+            dump_buf(
+                gpu,
+                &format!("decode_l{}_after_attn", self.layer_idx),
+                streams,
+            );
+        }
+        Ok(())
     }
     fn run_moe(
         &mut self,
@@ -2121,7 +2179,15 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
             self.token_id,
             self.skip_ffn,
         )
-        .map_err(DispatchError::Hip)
+        .map_err(DispatchError::Hip)?;
+        if let Some(streams) = self.state.residual_streams.as_ref() {
+            dump_buf(
+                gpu,
+                &format!("decode_l{}_after_moe", self.layer_idx),
+                streams,
+            );
+        }
+        Ok(())
     }
     fn run_moe_ep(
         &mut self,
@@ -2284,6 +2350,9 @@ fn decode_step_body_lowered(
         };
         superop::run_layer_program(gpu, &ctx, &program, &mut bind)
             .map_err(|e| format!("ds4 L{layer_idx}: lowered run_layer_program: {e}"))?;
+        if let Some(streams) = state.residual_streams.as_ref() {
+            dump_buf(gpu, &format!("decode_l{layer_idx}_end_streams"), streams);
+        }
     }
     final_norm_and_head(cfg, weights, state, gpu)?;
     state.n_tokens += 1;
@@ -3491,6 +3560,7 @@ fn ffn_stub(
         im,
         cfg.hidden_size,
     )?;
+    dump_buf(gpu, &format!("decode_l{layer_idx}_ffn_gate"), gate);
 
     // 3. up = x @ shared_w3
     gemv_auto(
@@ -3502,6 +3572,7 @@ fn ffn_stub(
         im,
         cfg.hidden_size,
     )?;
+    dump_buf(gpu, &format!("decode_l{layer_idx}_ffn_up"), up);
 
     // 4-5. DeepSeek V4 SwiGLU with swiglu_limit clamp, optionally fused with
     //      the FWHT rotation when shared_w2 is MQ4. The fused kernel
@@ -3522,6 +3593,7 @@ fn ffn_stub(
     // shared_w2: rotated path uses silu_rot (FWHT'd), plain path uses
     // `gate` itself (post-silu_mul, no FWHT).
     gemv_auto(gpu, shared_w2, silu_rot, gate, ffn_out, cfg.hidden_size, im)?;
+    dump_buf(gpu, &format!("decode_l{layer_idx}_ffn_out"), ffn_out);
 
     Ok(())
 }
@@ -4086,6 +4158,8 @@ fn final_norm_and_head(
     let final_norm = state.final_norm.as_ref().unwrap();
     let final_norm_rot = state.final_norm_rot.as_ref().unwrap();
     let logits = state.logits.as_ref().unwrap();
+    dump_buf(gpu, "final_norm", final_norm);
+    dump_buf(gpu, "final_norm_rot", final_norm_rot);
 
     // lm_head GEMV. F16 path uses un-rotated final_norm.
     gemv_auto(
@@ -4097,6 +4171,7 @@ fn final_norm_and_head(
         cfg.vocab_size,
         cfg.hidden_size,
     )?;
+    dump_buf(gpu, "logits", logits);
 
     Ok(())
 }

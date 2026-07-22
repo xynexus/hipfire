@@ -411,9 +411,6 @@ pub fn load_dense_weights(
             EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
             EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
             EmbeddingFormat::Q4K => DType::Q4K,
-            // PLE gather has no native bf16/f16 lookup; keep the true dtype so
-            // embed_lookup_weight rejects it with a clear message rather than
-            // reading the raw table as F32.
             EmbeddingFormat::BF16 => DType::BF16,
             EmbeddingFormat::F16 => DType::F16,
         };

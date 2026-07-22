@@ -803,7 +803,7 @@ Reads an existing diffusion .hfq (weights stored as f32/f16/bf16 source), re-enc
 ###### **Options:**
 
 * `-o`, `--output <OUTPUT>` — Output quantized .hfq artifact path
-* `--format <FORMAT>` — Quant format: q8, q4, q4k, q4+, oq4/oq4++/oq8 (rotated), oq4p/oq8p (plain), a decimal plain-Opus target such as oq4.25, or oq4-mixed for the legacy data-free heuristic. Plain Opus uses int8 activations
+* `--format <FORMAT>` — Quant format: q8, q4, q4k, q4+, oq4/oq4+/oq4++/oq8 (rotated), oq4p/oq8p (plain), a decimal plain-Opus target such as oq4.25, or oq4-mixed for the legacy data-free heuristic. Plain Opus uses int8 activations
 
   Default value: `q8`
 * `--calib <CALIB>` — Optional .calib.hfq sidecar (from `diffusion calibrate`); enables oq4++ LDLQ

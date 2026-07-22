@@ -51,7 +51,7 @@ use hipfire_evidence::{
 use hipfire_hash::{file_hash, stable_hash_bytes, stable_hash_file_fallback};
 use hipfire_model::{
     discover_dflash_draft_for_model, model_artifact_stem, model_hash, model_manifest_entry,
-    ModelLoadParams, ModelLoadedResponse, ModelManifestEntry,
+    parse_canonical_model_artifact_name, ModelLoadParams, ModelLoadedResponse, ModelManifestEntry,
 };
 
 pub(crate) fn eval_models_dir() -> PathBuf {
@@ -8126,6 +8126,53 @@ more noise
                 "bf16.hfq".to_string(),
             ),
         ]
+    }
+
+    #[test]
+    fn embedding_quality_skip_rows_mark_canonical_oq_admission_path() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "/models/EmbeddingGemma-300M.npu.oq8+.hfq",
+            "--battery",
+            "embedding_quality",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+
+        let rows = run_examples_embedding_quality_rows(&cfg, &ctx);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.status, EvalStatus::Skip);
+        assert_eq!(row.metrics.get("quant"), Some(&json!("oq8+")));
+        assert_eq!(row.metrics.get("quant_family"), Some(&json!("oq")));
+        assert_eq!(
+            row.metrics.get("oq_admission_path"),
+            Some(&json!("embedding_quality"))
+        );
+        assert_eq!(row.metrics.get("oq_decode_gate"), Some(&json!("not_ar")));
+        assert_eq!(
+            row.metrics.get("oq_tiny_quant_gate"),
+            Some(&json!("not_ar"))
+        );
+        assert_eq!(
+            row.metrics.get("oq_fixture_golden_gate"),
+            Some(&json!("not_ar"))
+        );
+        assert_eq!(
+            row.metrics.get("oq_embedding_quality"),
+            Some(&json!("pending"))
+        );
+        assert_eq!(row.metrics.get("oq_npu_parity"), Some(&json!("pending")));
     }
 
     #[test]

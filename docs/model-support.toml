@@ -11,8 +11,13 @@
 # fails if runtime ARCH_ID_* coverage is missing or committed artifacts have
 # drifted from this file.
 #
-# support marks: "full" | "partial" | "none"  (rendered ✓ / ~ / · in the chart;
-# `full` is the only value admission gating treats as a pass — see is_full()).
+# support marks:
+#   - "none": no servable runtime path.
+#   - "partial": load/decode or smoke works, but prefill, quality, coverage, or
+#     artifact evidence is incomplete.
+#   - "full": loader, decode, prefill, tiny/golden, eval admission, and artifact
+#     provenance are complete for the family and quant.
+# `full` is the only value admission gating treats as a pass — see is_full().
 
 # ── Per-arch capability matrix (keyed by HFQ arch_id) ──────────────────────────
 
@@ -70,16 +75,16 @@ mtp = "none"
 kv = "no-kv"
 vision = "none"
 
-# ZAYA1 (CCA attention + EDA/MoD-routed MoE). Bring-up: config + taxonomy only
-# (Z0); no servable forward path yet — every capability is "none" until the
-# mixer/MoE land.
+# ZAYA1 (CCA attention + EDA/MoD-routed MoE). The serving backend has
+# ToyModel/tiny fixture, fixture golden, and tiny-quant OQ coverage on gfx1103;
+# keep it partial until model eval/admission evidence lands.
 [[arch]]
 ids = [16]
 label = "zaya"
-prefill = "none"
+prefill = "partial"
 dflash = "none"
 mtp = "none"
-kv = "none"
+kv = "fp32"
 vision = "none"
 
 [[arch]]
@@ -112,15 +117,16 @@ mtp = "none"
 kv = "none"
 vision = "none"
 
-# Gemma 4 identity/ingest is registered, but no runtime forward is admitted yet.
-# Update capabilities only when the corresponding frozen phase gate passes.
+# Gemma 4 text forward is admitted at tiny-fixture level for dense, PLE, and
+# dense-MoE variants. Keep the family partial until full-model eval batteries,
+# batched prefill policy, and artifact admission are recorded.
 [[arch]]
 ids = [24]
 label = "gemma4"
-prefill = "none"
+prefill = "partial"
 dflash = "none"
 mtp = "none"
-kv = "none"
+kv = "fp32+kvarn"
 vision = "none"
 
 [[arch]]
@@ -196,6 +202,20 @@ act_bits = 8
 status = "opt-in"
 
 [[quant]]
+name = "oq4++"
+label = "Opus Quant Plus / OQ4++ (W4A8, Hessian/LDLQ OQ4 weights)"
+weight_bits = 4
+act_bits = 8
+status = "opt-in"
+
+[[quant]]
+name = "oq4.25++"
+label = "Opus Quant mixed OQ4.25++ (compact W4 bulk + sparse W8 outliers)"
+weight_bits = 4.25
+act_bits = 8
+status = "opt-in"
+
+[[quant]]
 name = "oq8"
 label = "Opus Quant / OQ8 (W8A8, int8 activations)"
 weight_bits = 8
@@ -205,6 +225,13 @@ status = "opt-in"
 [[quant]]
 name = "oq8+"
 label = "Opus Quant Plus / OQ8+ (W8A8, calibrated OQ8 weights)"
+weight_bits = 8
+act_bits = 8
+status = "opt-in"
+
+[[quant]]
+name = "oq8++"
+label = "Opus Quant Plus / OQ8++ (W8A8, Hessian/LDLQ OQ8 weights)"
 weight_bits = 8
 act_bits = 8
 status = "opt-in"
@@ -252,56 +279,256 @@ arch = 5
 quant = "oq4"
 feature = "prefill"
 support = "partial"
-note = "OQ4 W4A4 batched prefill is parity-gated / opt-in (iu4 WMMA path)"
+note = "Qwen3.5 dense and Qwen3.5-VL text-side OQ4 W4A4 have finite tiny KLD and fixture golden evidence on gfx1103; batched prefill parity remains gated / opt-in (iu4 WMMA path), and VL keeps the vision tower on hfq4. OQ checklist producer=yes loader=yes decode=smoke prefill=gated tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
 
 [[gate]]
 arch = 5
 quant = "oq4+"
 feature = "prefill"
 support = "partial"
-note = "OQ4+ W4A8 prefill uses the int8-activation path; full quality admission is still gated"
+note = "Qwen3.5 dense and Qwen3.5-VL text-side OQ4+ have calibrated tiny KLD and fixture golden evidence on gfx1103; batched prefill parity and full quality admission remain gated, and VL keeps the vision tower on hfq4. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 5
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "Qwen3.5 dense and Qwen3.5-VL text-side OQ4++ have Hessian-backed tiny KLD and fixture golden evidence on gfx1103; batched prefill parity and full quality admission remain gated, and VL keeps the vision tower on hfq4. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 5
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "Qwen3.5 dense and Qwen3.5-VL text-side mixed OQ4.25++ have calibrated tiny KLD and fixture golden evidence on gfx1103; batched prefill parity and full quality admission remain gated, and VL keeps the vision tower on hfq4. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending; mixed OQ uses per-tensor Oq4G256/OqPlusCompact dispatch"
 
 [[gate]]
 arch = 5
 quant = "oq8"
 feature = "prefill"
 support = "partial"
-note = "OQ8 W8A8 route is experimental / parity-gated"
+note = "Qwen3.5 dense and Qwen3.5-VL text-side OQ8 W8A8 have finite tiny KLD and fixture golden evidence on gfx1103; batched prefill parity remains gated, and VL keeps the vision tower on hfq4. OQ checklist producer=yes loader=yes decode=smoke prefill=gated tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
 
 [[gate]]
 arch = 5
 quant = "oq8+"
 feature = "prefill"
 support = "partial"
-note = "OQ8+ calibrated W8A8 route shares OQ8 kernels; quality admission is still gated"
+note = "Qwen3.5 dense and Qwen3.5-VL text-side OQ8+ have calibrated tiny KLD and fixture golden evidence on gfx1103; batched prefill parity and full quality admission remain gated, and VL keeps the vision tower on hfq4. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 5
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "Qwen3.5 dense and Qwen3.5-VL text-side OQ8++ have Hessian-backed tiny KLD and fixture golden evidence on gfx1103; batched prefill parity and full quality admission remain gated, and VL keeps the vision tower on hfq4. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 6
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "Qwen3.5 MoE OQ4 routed experts load through dense-layout OQ fallback by default while experimental indexed OQ remains opt-in; tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=smoke prefill=gated tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+
+[[gate]]
+arch = 6
+quant = "oq4+"
+feature = "prefill"
+support = "partial"
+note = "Qwen3.5 MoE OQ4+ routed experts use dense-layout OQ fallback by default with Hessian-backed calibration; tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 6
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "Qwen3.5 MoE OQ4++ uses dense-layout OQ fallback by default with Hessian/LDLQ calibration; tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 6
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "Qwen3.5 MoE mixed OQ4.25++ quantizes, loads, and decodes through the dense-layout OQ fallback by default; calibrated tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-mixed eval=pending artifact=pending"
+
+[[gate]]
+arch = 6
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "Qwen3.5 MoE OQ8 routed experts load through dense-layout OQ fallback by default while experimental indexed OQ remains opt-in; tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=smoke prefill=gated tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+
+[[gate]]
+arch = 6
+quant = "oq8+"
+feature = "prefill"
+support = "partial"
+note = "Qwen3.5 MoE OQ8+ uses dense-layout OQ fallback by default with Hessian-backed calibration; tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 6
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "Qwen3.5 MoE OQ8++ uses dense-layout OQ fallback by default with Hessian/LDLQ calibration; tiny KLD and fixture golden are finite on gfx1103, while experimental indexed OQ remains opt-in. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+# DeepSeek4 (arch 9) OQ load now repacks canonical/arch-packed OQ tensors in the
+# native loader before `lowered` execution. OQ dense/shared tensors are emitted
+# in OQ layouts while DeepSeek4 routed experts stay MQ2-Lloyd, matching the
+# only routed-expert kernel family currently wired for this architecture. The
+# rows remain partial until real-model eval and artifact evidence exist, and
+# compressed-KV/MTP role variants are still blocked until their auxiliary tensor
+# dtype policies are implemented.
+[[gate]]
+arch = 9
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "DeepSeek4 text-core OQ4 W4A4 repacks through oq4_arch_load in the native loader while routed experts remain MQ2-Lloyd for the DeepSeek4 MoE kernels; tiny KLD and fixture golden are finite on gfx1103. Compressed-KV and MTP OQ4 role variants remain explicitly blocked until compressor/indexer and native MTP dtype policies exist. OQ checklist producer=hybrid-oq-dense-mq2l-experts loader=yes decode=smoke prefill=gated tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+
+[[gate]]
+arch = 9
+quant = "oq4+"
+feature = "prefill"
+support = "partial"
+note = "DeepSeek4 OQ4+ uses native-loader dense OQ routing with routed experts kept MQ2-Lloyd for the DeepSeek4 MoE kernels; calibrated tiny KLD and fixture golden are finite on gfx1103. Compressed-KV/MTP calibrated OQ remains blocked pending auxiliary tensor dtype policies. OQ checklist producer=hybrid-oq-dense-mq2l-experts loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 9
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "DeepSeek4 OQ4++ uses native-loader dense OQ routing with routed experts kept MQ2-Lloyd for the DeepSeek4 MoE kernels; Hessian-backed tiny KLD and fixture golden are finite on gfx1103. Compressed-KV/MTP Hessian OQ remains blocked until auxiliary tensor dtype policies exist. OQ checklist producer=hybrid-oq-dense-mq2l-experts loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 9
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "DeepSeek4 mixed OQ4.25++ uses native-loader dense OQ8-family routing with routed experts kept MQ2-Lloyd for the DeepSeek4 MoE kernels; mixed tiny KLD and fixture golden are finite on gfx1103. Compressed-KV/MTP mixed OQ remains blocked pending auxiliary tensor dtype policies. OQ checklist producer=hybrid-oq-dense-mq2l-experts loader=yes decode=smoke prefill=gated tiny=gfx1103-calib golden=gfx1103-mixed eval=pending artifact=pending"
+
+[[gate]]
+arch = 9
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "DeepSeek4 text-core OQ8 W8A8 repacks through oq8_arch_load in the native loader while routed experts remain MQ2-Lloyd for the DeepSeek4 MoE kernels; tiny KLD and fixture golden are finite on gfx1103. Compressed-KV OQ8 is blocked on compressor F16 upload policy and MTP OQ8 is blocked because generic OQ artifacts omit packaged mtp.0.* tensors. OQ checklist producer=hybrid-oq-dense-mq2l-experts loader=partial-aux-blocked decode=smoke prefill=smoke tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+
+[[gate]]
+arch = 9
+quant = "oq8+"
+feature = "prefill"
+support = "partial"
+note = "DeepSeek4 text-core OQ8+ has calibrated tiny KLD and fixture golden evidence on gfx1103 through the native-loader OQ8 route with routed experts kept MQ2-Lloyd; compressed-KV/MTP calibrated OQ8 remains blocked pending auxiliary tensor dtype policies. OQ checklist producer=hybrid-oq-dense-mq2l-experts-hessian loader=partial-aux-blocked decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 9
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "DeepSeek4 text-core OQ8++ has Hessian-backed tiny KLD and fixture golden evidence on gfx1103 through the native-loader OQ8 route with routed experts kept MQ2-Lloyd; compressed-KV/MTP Hessian OQ8 remains blocked pending auxiliary tensor dtype policies. OQ checklist producer=hybrid-oq-dense-mq2l-experts-hessian loader=partial-aux-blocked decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
 
 [[gate]]
 arch = 11
 quant = "oq4"
 feature = "prefill"
 support = "partial"
-note = "LFM2 OQ4 W4A4 prefill routes through iu4 WMMA; current evidence is 350M smoke/parity"
+note = "LFM2 OQ4 W4A4 prefill routes through iu4 WMMA; current evidence is 350M smoke/parity plus finite tiny KLD and fixture golden on gfx1103. OQ checklist producer=yes loader=yes decode=yes prefill=smoke tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
 
 [[gate]]
 arch = 11
 quant = "oq4+"
 feature = "prefill"
 support = "partial"
-note = "LFM2 OQ4+ W4A8 prefill routes through int8 activation MMQ; full calibration/quality pending"
+note = "LFM2 OQ4+ W4A8 has calibrated tiny KLD and fixture golden evidence on gfx1103; real-model eval and routed-expert telemetry remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 11
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "LFM2 OQ4++ has Hessian-backed tiny KLD and fixture golden evidence on gfx1103; Hessian/LDLQ routed-expert audit and model eval admission remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 11
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "LFM2 mixed OQ4.25++ has calibrated tiny KLD and fixture golden evidence on gfx1103; tiered assignment is still not promoted without model eval. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-mixed eval=pending artifact=pending; tiered mixed assignment not promoted"
 
 [[gate]]
 arch = 11
 quant = "oq8"
 feature = "prefill"
 support = "partial"
-note = "LFM2 OQ8 W8A8 prefill routes through iu8 WMMA; current evidence is 350M smoke/parity"
+note = "LFM2 OQ8 W8A8 prefill routes through iu8 WMMA; current evidence is 350M smoke/parity plus finite tiny KLD and fixture golden on gfx1103. OQ checklist producer=fallback-required loader=yes decode=yes prefill=smoke tiny=gfx1103-ragged-fallback golden=gfx1103 eval=pending artifact=pending"
 
 [[gate]]
 arch = 11
 quant = "oq8+"
 feature = "prefill"
 support = "partial"
-note = "LFM2 OQ8+ shares OQ8 runtime kernels; calibrated plus artifact quality is pending"
+note = "LFM2 OQ8+ has calibrated tiny KLD and fixture golden evidence on gfx1103; real-model eval and routed-expert telemetry remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 11
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "LFM2 OQ8++ has Hessian-backed tiny KLD and fixture golden evidence on gfx1103; Hessian/LDLQ routed-expert audit and model eval admission remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+# MiniMax-M2 OQ is wired through its native GQA+MoE runtime path. Dense attention
+# and lm_head use the shared OQ dtype mapping/repack; split routed experts use the
+# MiniMax indexed MoE OQ4/OQ8 kernels. Rows stay partial until model eval and
+# calibration audit evidence exist.
+[[gate]]
+arch = 10
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "MiniMax OQ4 W4A4 loads through shared dense OQ4 plus indexed routed-expert OQ4 kernels; tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=smoke prefill=smoke tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+
+[[gate]]
+arch = 10
+quant = "oq4+"
+feature = "prefill"
+support = "partial"
+note = "MiniMax OQ4+ has calibrated tiny KLD and fixture golden evidence on gfx1103 through the dense and indexed routed-expert OQ runtime kernels; real-model eval and routed-expert telemetry remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 10
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "MiniMax OQ4++ has Hessian-backed tiny KLD and fixture golden evidence on gfx1103 through the dense and indexed routed-expert OQ runtime kernels; Hessian/LDLQ routed-expert audit and model eval admission remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 10
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "MiniMax mixed OQ4.25++ now routes dense OqPlusCompact tensors, including lm_head, through the shared OQ8-family loader and has calibrated tiny KLD plus fixture golden evidence on gfx1103; real-model eval and routed-expert telemetry remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-mixed eval=pending artifact=pending"
+
+[[gate]]
+arch = 10
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "MiniMax OQ8 W8A8 loads through shared dense OQ8 plus indexed routed-expert OQ8 kernels; tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=smoke prefill=smoke tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+
+[[gate]]
+arch = 10
+quant = "oq8+"
+feature = "prefill"
+support = "partial"
+note = "MiniMax OQ8+ has calibrated tiny KLD and fixture golden evidence on gfx1103 through the dense and indexed routed-expert OQ runtime kernels; real-model eval and routed-expert telemetry remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 10
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "MiniMax OQ8++ has Hessian-backed tiny KLD and fixture golden evidence on gfx1103 through the dense and indexed routed-expert OQ runtime kernels; Hessian/LDLQ routed-expert audit and model eval admission remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
 
 # Qwen2 (arch 7) gained the OQ loader path: load_weight_tensor now repacks the
 # OQ codes (33/34/35/36/37) via the shared oq4_arch/oq8_arch helpers, so qwen2
@@ -319,28 +546,202 @@ arch = 7
 quant = "oq4"
 feature = "prefill"
 support = "partial"
-note = "Qwen2 OQ4 W4A4 loads via oq4_arch_load into the generic iu4 GEMM route; GPU-validated coherent (Qwen2-0.5B), eval-battery admission pending"
+note = "Qwen2 OQ4 W4A4 loads via oq4_arch_load into the generic iu4 GEMM route; GPU-validated coherent (Qwen2-0.5B), tiny KLD and fixture golden are finite on gfx1103; eval-battery admission pending. OQ checklist producer=yes loader=yes decode=yes prefill=smoke tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
 
 [[gate]]
 arch = 7
 quant = "oq4+"
 feature = "prefill"
 support = "partial"
-note = "Qwen2 OQ4+ W4A8 loads via oq4_to_oq8_combined into the shared int8-activation route; shares the validated oq4/oq8 loader arms, calibrated quality pending"
+note = "Qwen2 OQ4+ W4A8 loads via oq4_to_oq8_combined into the shared int8-activation route and has Hessian-backed calibrated tiny KLD plus fixture golden evidence on gfx1103; real-model eval admission remains pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 7
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "Qwen2 OQ4++ has Hessian-backed calibrated tiny KLD and fixture golden evidence on gfx1103; real-model eval admission remains pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 7
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "Qwen2 mixed OQ4.25++ exercises the ragged OQ8 GPU-compatible fallback and has calibrated tiny KLD plus fixture golden evidence on gfx1103. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-mixed eval=pending artifact=pending; ragged OQ8 must fall back to GPU-compatible Q8"
 
 [[gate]]
 arch = 7
 quant = "oq8"
 feature = "prefill"
 support = "partial"
-note = "Qwen2 OQ8 W8A8 loads via oq8_combined into the shared iu8 GEMM route; GPU-validated coherent (Qwen2-0.5B), eval-battery admission pending"
+note = "Qwen2 OQ8 W8A8 loads via oq8_combined into the shared iu8 GEMM route; GPU-validated coherent (Qwen2-0.5B), tiny KLD and fixture golden are finite on gfx1103; eval-battery admission pending. OQ checklist producer=fallback-required loader=yes decode=yes prefill=smoke tiny=gfx1103-ragged-fallback golden=gfx1103 eval=pending artifact=pending"
 
 [[gate]]
 arch = 7
 quant = "oq8+"
 feature = "prefill"
 support = "partial"
-note = "Qwen2 OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending"
+note = "Qwen2 OQ8+ shares the OQ8 runtime kernels and has Hessian-backed calibrated tiny KLD plus fixture golden evidence on gfx1103; real-model eval admission remains pending. OQ checklist producer=fallback-required-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 7
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "Qwen2 OQ8++ exercises the ragged OQ8 GPU-compatible fallback and has calibrated tiny KLD plus fixture golden evidence on gfx1103. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending; ragged OQ8 must fall back to GPU-compatible Q8 and real-model admission remains pending"
+
+# Gemma3 text (arch 12) is the reference dense OQ path. Keep these rows partial:
+# tiny/golden evidence exists on gfx1103, but full model eval and artifact
+# admission are still pending.
+[[gate]]
+arch = 12
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "Gemma3 text OQ4 W4A4 loads through shared Oq4G256 dispatch; tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=yes prefill=smoke tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+
+[[gate]]
+arch = 12
+quant = "oq4+"
+feature = "prefill"
+support = "partial"
+note = "Gemma3 text OQ4+ shares OQ4/OQ8 runtime dispatch and has Hessian-backed activation-aware tiny KLD plus fixture golden evidence on gfx1103; real-model eval admission remains pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 12
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "Gemma3 text OQ4++ has calibrated tiny KLD and fixture golden evidence on gfx1103; promotion still requires Hessian/LDLQ audit and model eval evidence. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 12
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "Gemma3 text mixed OQ4.25++ has calibrated tiny KLD and fixture golden evidence on gfx1103; calibration audit and model eval evidence are still pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-mixed eval=pending artifact=pending"
+
+[[gate]]
+arch = 12
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "Gemma3 text OQ8 W8A8 loads through shared Oq8G256 dispatch; tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=yes prefill=smoke tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+
+[[gate]]
+arch = 12
+quant = "oq8+"
+feature = "prefill"
+support = "partial"
+note = "Gemma3 text OQ8+ shares OQ8 runtime dispatch and has Hessian-backed activation-aware tiny KLD plus fixture golden evidence on gfx1103; real-model eval admission remains pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 12
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "Gemma3 text OQ8++ has calibrated tiny KLD and fixture golden evidence on gfx1103; Hessian/LDLQ real-model admission remains pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+# Vision-composite text-side OQ. These rows cover autoregressive text tensors
+# only; vision towers intentionally stay on proven q8f16/hfq4 until image
+# preprocessing/projector/splice OQ evidence exists.
+[[gate]]
+arch = 8
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "dots-ocr text-side OQ4 W4A4 loads through the Qwen2 text decoder while the Dots vision tower remains out of the OQ artifact path; synthetic image splice tiny KLD and text-only fixture golden are finite on gfx1103. OQ checklist producer=text-only loader=yes decode=yes prefill=smoke tiny=gfx1103 golden=gfx1103-text eval=pending artifact=pending"
+
+[[gate]]
+arch = 8
+quant = "oq4+"
+feature = "prefill"
+support = "partial"
+note = "dots-ocr text-side OQ4+ has calibrated tiny KLD and fixture golden evidence on gfx1103 while the Dots vision tower remains hfq4. OQ checklist producer=text-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-text-calib eval=pending artifact=pending; separate vision-tower OQ policy remains unadmitted"
+
+[[gate]]
+arch = 8
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "dots-ocr text-side OQ4++ has calibrated tiny KLD and fixture golden evidence on gfx1103 while the Dots vision tower remains hfq4. OQ checklist producer=text-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-text-calib eval=pending artifact=pending; separate vision-tower OQ policy remains unadmitted"
+
+[[gate]]
+arch = 8
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "dots-ocr mixed OQ4.25++ is limited to text tensors and has calibrated tiny KLD plus fixture golden evidence on gfx1103 while the Dots vision tower remains hfq4. OQ checklist producer=text-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-text-calib eval=pending artifact=pending; separate vision-tower OQ policy remains unadmitted"
+
+[[gate]]
+arch = 8
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "dots-ocr text-side OQ8 W8A8 loads through the Qwen2 text decoder while the Dots vision tower remains out of the OQ artifact path; synthetic image splice tiny KLD and text-only fixture golden are finite on gfx1103. OQ checklist producer=text-only loader=yes decode=yes prefill=smoke tiny=gfx1103 golden=gfx1103-text eval=pending artifact=pending"
+
+[[gate]]
+arch = 8
+quant = "oq8+"
+feature = "prefill"
+support = "partial"
+note = "dots-ocr text-side OQ8+ has calibrated tiny KLD and fixture golden evidence on gfx1103 while the Dots vision tower remains hfq4. OQ checklist producer=text-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-text-calib eval=pending artifact=pending; separate vision-tower OQ policy remains unadmitted"
+
+[[gate]]
+arch = 8
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "dots-ocr text-side OQ8++ has calibrated tiny KLD and fixture golden evidence on gfx1103 while the Dots vision tower remains hfq4. OQ checklist producer=text-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-text-calib eval=pending artifact=pending; separate vision-tower OQ policy remains unadmitted"
+
+[[gate]]
+arch = 13
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "Gemma3-VL text-side OQ4 W4A4 loads through the Gemma3 text decoder while SigLIP/projector tensors remain q8f16; synthetic image splice tiny KLD and text-only fixture golden are finite on gfx1103. OQ checklist producer=text-only loader=yes decode=yes prefill=smoke tiny=gfx1103 golden=gfx1103-text eval=pending artifact=pending"
+
+[[gate]]
+arch = 13
+quant = "oq4+"
+feature = "prefill"
+support = "partial"
+note = "Gemma3-VL text-side OQ4+ shares Gemma3 OQ dispatch and has Hessian-backed activation-aware tiny KLD plus fixture golden evidence on gfx1103 while SigLIP/projector tensors remain q8f16. OQ checklist producer=text-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-text-calib eval=pending artifact=pending; separate SigLIP/projector OQ policy remains unadmitted"
+
+[[gate]]
+arch = 13
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "Gemma3-VL text-side OQ4++ has calibrated tiny KLD and fixture golden evidence on gfx1103 while SigLIP/projector tensors remain q8f16. OQ checklist producer=text-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-text-calib eval=pending artifact=pending; separate SigLIP/projector OQ policy remains unadmitted"
+
+[[gate]]
+arch = 13
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "Gemma3-VL mixed OQ4.25++ is limited to text tensors and has calibrated tiny KLD plus fixture golden evidence on gfx1103 while SigLIP/projector tensors remain q8f16. OQ checklist producer=text-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-text-calib eval=pending artifact=pending; separate SigLIP/projector OQ policy remains unadmitted"
+
+[[gate]]
+arch = 13
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "Gemma3-VL text-side OQ8 W8A8 loads through the Gemma3 text decoder while SigLIP/projector tensors remain q8f16; synthetic image splice tiny KLD and text-only fixture golden are finite on gfx1103. OQ checklist producer=text-only loader=yes decode=yes prefill=smoke tiny=gfx1103 golden=gfx1103-text eval=pending artifact=pending"
+
+[[gate]]
+arch = 13
+quant = "oq8+"
+feature = "prefill"
+support = "partial"
+note = "Gemma3-VL text-side OQ8+ shares OQ8 runtime kernels and has Hessian-backed activation-aware tiny KLD plus fixture golden evidence on gfx1103 while SigLIP/projector tensors remain q8f16. OQ checklist producer=text-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-text-calib eval=pending artifact=pending; separate SigLIP/projector OQ policy remains unadmitted"
+
+[[gate]]
+arch = 13
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "Gemma3-VL text-side OQ8++ has calibrated tiny KLD and fixture golden evidence on gfx1103 while SigLIP/projector tensors remain q8f16. OQ checklist producer=text-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-text-calib eval=pending artifact=pending; separate SigLIP/projector OQ policy remains unadmitted"
 
 # LLaMA (arch 0) OQ int8-activation: the shared load_weights_hfq gained the OQ8/OQ+
 # arms (33/35/36) it was missing — it previously only wired OQ4 (34/37), so llama
@@ -353,28 +754,104 @@ arch = 0
 quant = "oq4"
 feature = "prefill"
 support = "partial"
-note = "LLaMA OQ4 W4A4 loads via oq4_arch_load; K must be % 256 else the linear stays BF16; quality admission pending"
+note = "LLaMA OQ4 W4A4 loads via oq4_arch_load; K must be % 256 else the linear stays BF16; tiny KLD and fixture golden are finite on aligned gfx1103 fixture tensors; quality admission pending. OQ checklist producer=aligned-only loader=yes decode=smoke prefill=smoke tiny=gfx1103-aligned golden=gfx1103-aligned eval=pending artifact=pending"
 
 [[gate]]
 arch = 0
 quant = "oq4+"
 feature = "prefill"
 support = "partial"
-note = "LLaMA OQ4+ W4A8 loads via oq4_to_oq8_combined into the shared int8-activation route; quality admission pending"
+note = "LLaMA OQ4+ W4A8 loads via oq4_to_oq8_combined into the shared int8-activation route and has Hessian-backed calibrated tiny KLD plus fixture golden evidence on aligned gfx1103 fixture tensors; real-model eval admission remains pending. OQ checklist producer=aligned-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 0
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "LLaMA OQ4++ has Hessian-backed calibrated tiny KLD and fixture golden evidence on aligned gfx1103 fixture tensors; real-model eval admission remains pending. OQ checklist producer=aligned-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending; ragged linears stay BF16/F16"
+
+[[gate]]
+arch = 0
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "LLaMA mixed OQ4.25++ has Hessian-backed calibrated tiny KLD and fixture golden evidence on aligned gfx1103 fixture tensors; real-model eval admission remains pending. OQ checklist producer=aligned-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-mixed eval=pending artifact=pending; mixed OQ cannot quantize unsupported ragged linears"
 
 [[gate]]
 arch = 0
 quant = "oq8"
 feature = "prefill"
 support = "partial"
-note = "LLaMA OQ8 W8A8 loads via oq8_combined into the shared iu8 GEMM route; GPU-validated coherent (Llama-3.2-1B), eval-battery admission pending"
+note = "LLaMA OQ8 W8A8 loads via oq8_combined into the shared iu8 GEMM route; GPU-validated coherent (Llama-3.2-1B), finite tiny KLD and fixture golden on gfx1103; eval-battery admission pending. OQ checklist producer=yes loader=yes decode=yes prefill=smoke tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
 
 [[gate]]
 arch = 0
 quant = "oq8+"
 feature = "prefill"
 support = "partial"
-note = "LLaMA OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending"
+note = "LLaMA OQ8+ shares the OQ8 runtime kernels and has Hessian-backed calibrated tiny KLD plus fixture golden evidence on gfx1103; real-model eval admission remains pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 0
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "LLaMA OQ8++ has Hessian-backed calibrated tiny KLD and fixture golden evidence on gfx1103; real-model eval admission remains pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+# Qwen3/Qwen2 legacy (arch 1) shares the LLaMA-family serving crate, but it is
+# not the Mistral id. Plain Qwen3 can use the LLaMA-family loader; Qwen2-shaped
+# artifacts with attention Q/K/V bias are intentionally rejected here and must be
+# tagged arch 7 for hipfire-arch-qwen2. Bias-free qwen3_legacy tiny/golden
+# evidence is recorded for all seven required OQ tokens on gfx1103. Rows remain
+# partial until eval-battery admission and artifact provenance exist.
+[[gate]]
+arch = 1
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "Qwen3/Qwen2 legacy OQ4 follows the LLaMA-family loader for bias-free plain Qwen3; Qwen2 attention-bias artifacts are rejected with an arch-id 7 error. OQ checklist producer=aligned-only loader=conditional-qwen3 decode=gfx1103-qwen3-legacy prefill=smoke tiny=gfx1103-qwen3-legacy golden=gfx1103-qwen3-legacy eval=pending artifact=pending"
+
+[[gate]]
+arch = 1
+quant = "oq4+"
+feature = "prefill"
+support = "partial"
+note = "Qwen3/Qwen2 legacy OQ4+ follows the LLaMA-family OQ4-to-OQ8 dispatch for bias-free plain Qwen3 with Hessian-backed activation scaling; Qwen2 attention-bias artifacts must be tagged arch 7. OQ checklist producer=aligned-only-hessian loader=conditional-qwen3 decode=gfx1103-qwen3-legacy-calib prefill=smoke tiny=gfx1103-qwen3-legacy-calib golden=gfx1103-qwen3-legacy-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 1
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "Qwen3/Qwen2 legacy OQ4++ exercises Hessian/LDLQ over aligned tensors through the LLaMA-family loader for bias-free plain Qwen3; Qwen2 attention-bias artifacts must be tagged arch 7. OQ checklist producer=aligned-only-hessian loader=conditional-qwen3 decode=gfx1103-qwen3-legacy-calib prefill=smoke tiny=gfx1103-qwen3-legacy-calib golden=gfx1103-qwen3-legacy-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 1
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "Qwen3/Qwen2 legacy mixed OQ4.25++ exercises Hessian/LDLQ mixed OQ4/OQ8 tensor dispatch through the LLaMA-family loader for bias-free plain Qwen3; Qwen2 attention-bias artifacts are intentionally routed to arch 7. OQ checklist producer=aligned-only-hessian loader=conditional-qwen3 decode=gfx1103-qwen3-legacy-calib prefill=smoke tiny=gfx1103-qwen3-legacy-calib golden=gfx1103-qwen3-legacy-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 1
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "Qwen3/Qwen2 legacy OQ8 follows the LLaMA-family OQ8 dispatch for bias-free plain Qwen3; Qwen2 attention-bias artifacts are rejected with an arch-id 7 error. OQ checklist producer=yes loader=conditional-qwen3 decode=gfx1103-qwen3-legacy prefill=smoke tiny=gfx1103-qwen3-legacy golden=gfx1103-qwen3-legacy eval=pending artifact=pending"
+
+[[gate]]
+arch = 1
+quant = "oq8+"
+feature = "prefill"
+support = "partial"
+note = "Qwen3/Qwen2 legacy OQ8+ shares OQ8 runtime kernels for bias-free plain Qwen3 with Hessian-backed activation scaling; Qwen2 attention-bias artifacts must be tagged arch 7. OQ checklist producer=yes-hessian loader=conditional-qwen3 decode=gfx1103-qwen3-legacy-calib prefill=smoke tiny=gfx1103-qwen3-legacy-calib golden=gfx1103-qwen3-legacy-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 1
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "Qwen3/Qwen2 legacy OQ8++ exercises Hessian/LDLQ through OQ8 runtime kernels for bias-free plain Qwen3; Qwen2 attention-bias artifacts must be tagged arch 7. OQ checklist producer=yes-hessian loader=conditional-qwen3 decode=gfx1103-qwen3-legacy-calib prefill=smoke tiny=gfx1103-qwen3-legacy-calib golden=gfx1103-qwen3-legacy-calib eval=pending artifact=pending"
 
 # Nemotron-H (arch 14, hybrid Mamba-2 + attention) OQ int8-activation: its own
 # loader (loader.rs) and its own prefill GEMM dispatch (weight.rs) each handled
@@ -388,28 +865,261 @@ arch = 14
 quant = "oq4"
 feature = "prefill"
 support = "partial"
-note = "Nemotron OQ4 W4A4 loads via oq4_arch_load; batched prefill via weight_gemm; quality admission pending"
+note = "Nemotron OQ4 W4A4 loads via oq4_arch_load; batched prefill via weight_gemm; hybrid Mamba/MLP/attention tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=smoke prefill=smoke tiny=gfx1103-hybrid golden=gfx1103-hybrid eval=pending artifact=pending"
 
 [[gate]]
 arch = 14
 quant = "oq4+"
 feature = "prefill"
 support = "partial"
-note = "Nemotron OQ4+ W4A8 loads via oq4_to_oq8_combined; AWQ alpha 0.1 for Mamba acts (per calib notes); quality admission pending"
+note = "Nemotron OQ4+ W4A8 loads via oq4_to_oq8_combined and has calibrated hybrid Mamba/MLP/attention tiny KLD plus fixture golden evidence on gfx1103; model eval admission and product artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-hybrid-calib golden=gfx1103-hybrid-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 14
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "Nemotron OQ4++ has Hessian-backed hybrid Mamba/MLP/attention tiny KLD plus fixture golden evidence on gfx1103; model eval admission and product artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-hybrid-calib golden=gfx1103-hybrid-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 14
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "Nemotron mixed OQ4.25++ has Hessian-backed hybrid Mamba/MLP/attention tiny KLD plus fixture golden evidence on gfx1103; model eval admission and product artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-hybrid-calib golden=gfx1103-hybrid-mixed eval=pending artifact=pending"
 
 [[gate]]
 arch = 14
 quant = "oq8"
 feature = "prefill"
 support = "partial"
-note = "Nemotron OQ8 W8A8 loads via oq8_combined + weight_gemm Oq8G256 route; GPU-validated coherent (Nemotron-3-Nano-4B), eval-battery admission pending"
+note = "Nemotron OQ8 W8A8 loads via oq8_combined + weight_gemm Oq8G256 route; GPU-validated coherent (Nemotron-3-Nano-4B), hybrid Mamba/MLP/attention tiny KLD and fixture golden are finite on gfx1103; eval-battery admission pending. OQ checklist producer=yes loader=yes decode=yes prefill=smoke tiny=gfx1103-hybrid golden=gfx1103-hybrid eval=pending artifact=pending"
 
 [[gate]]
 arch = 14
 quant = "oq8+"
 feature = "prefill"
 support = "partial"
-note = "Nemotron OQ8+ shares the OQ8 runtime kernels; calibrated plus artifact quality is pending"
+note = "Nemotron OQ8+ shares the OQ8 runtime kernels and has calibrated hybrid Mamba/MLP/attention tiny KLD plus fixture golden evidence on gfx1103; model eval admission and product artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-hybrid-calib golden=gfx1103-hybrid-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 14
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "Nemotron OQ8++ has Hessian-backed hybrid Mamba/MLP/attention tiny KLD plus fixture golden evidence on gfx1103; model eval admission and product artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-hybrid-calib golden=gfx1103-hybrid-calib eval=pending artifact=pending"
+
+# Mamba2 (arch 15, pure recurrent stack) shares the Nemotron loader path, but is
+# admitted separately because it has no attention KV path and no hybrid blocks.
+[[gate]]
+arch = 15
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "Mamba2 OQ4 W4A4 loads through the Nemotron linear OQ4 route while embeddings remain gather-friendly Q8/source precision; pure recurrent tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=yes prefill=smoke tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+
+[[gate]]
+arch = 15
+quant = "oq4+"
+feature = "prefill"
+support = "partial"
+note = "Mamba2 OQ4+ shares the Nemotron linear OQ4/OQ8 route and has calibrated pure recurrent tiny KLD plus fixture golden evidence on gfx1103; model eval admission and recurrent calibration artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 15
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "Mamba2 OQ4++ has Hessian-backed pure recurrent tiny KLD plus fixture golden evidence on gfx1103; model eval admission and recurrent calibration artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 15
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "Mamba2 mixed OQ4.25++ has Hessian-backed pure recurrent tiny KLD plus fixture golden evidence on gfx1103; model eval admission and recurrent calibration artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-mixed eval=pending artifact=pending"
+
+[[gate]]
+arch = 15
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "Mamba2 OQ8 W8A8 loads through the Nemotron linear OQ8 route while embeddings remain gather-friendly Q8/source precision; pure recurrent tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=yes prefill=smoke tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+
+[[gate]]
+arch = 15
+quant = "oq8+"
+feature = "prefill"
+support = "partial"
+note = "Mamba2 OQ8+ shares the OQ8 runtime kernels and has calibrated pure recurrent tiny KLD plus fixture golden evidence on gfx1103; model eval admission and recurrent calibration artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 15
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "Mamba2 OQ8++ has Hessian-backed pure recurrent tiny KLD plus fixture golden evidence on gfx1103; model eval admission and recurrent calibration artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+# Zaya (arch 16) has a serving backend and OQ repack-on-load in its native GPU
+# loader. Base OQ has tiny/golden fixture evidence; calibrated plus/mixed OQ is
+# blocked because tiny calibration collection currently captures zero tensors
+# (`tiny_quant_probe collect: no tensors captured`) on the Zaya path.
+[[gate]]
+arch = 16
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "Zaya OQ4 W4A4 loads through the native zaya GPU loader via oq4_arch_load; CCA attention, EDA/MoD router, and split experts have finite tiny KLD plus fixture golden evidence on gfx1103. OQ checklist producer=yes loader=yes decode=smoke prefill=smoke tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+
+[[gate]]
+arch = 16
+quant = "oq4+"
+feature = "prefill"
+support = "partial"
+note = "Zaya OQ4+ has calibrated tiny KLD and fixture golden evidence on gfx1103 through the native Zaya CCA/EDA calibration forward; model eval admission and artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 16
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "Zaya OQ4++ has Hessian-backed tiny KLD and fixture golden evidence on gfx1103 through the native Zaya CCA/EDA calibration forward; model eval admission and artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 16
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "Zaya mixed OQ4.25++ has calibrated tiny KLD and fixture golden evidence on gfx1103 through the native Zaya CCA/EDA calibration forward; mixed tier policy is exercised in the tiny artifact, but model eval admission and artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-mixed eval=pending artifact=pending"
+
+[[gate]]
+arch = 16
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "Zaya OQ8 W8A8 loads through the native zaya GPU loader via oq8_arch_load; CCA attention, EDA/MoD router, and split experts have finite tiny KLD plus fixture golden evidence on gfx1103. OQ checklist producer=yes loader=yes decode=smoke prefill=smoke tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+
+[[gate]]
+arch = 16
+quant = "oq8+"
+feature = "prefill"
+support = "partial"
+note = "Zaya OQ8+ has calibrated tiny KLD and fixture golden evidence on gfx1103 through the native Zaya CCA/EDA calibration forward; model eval admission and artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 16
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "Zaya OQ8++ has Hessian-backed tiny KLD and fixture golden evidence on gfx1103 through the native Zaya CCA/EDA calibration forward; model eval admission and artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+# EmbeddingGemma (arch 19) is an encoder path, not autoregressive generation:
+# it has no logits/lm_head, so tiny_quant/fixture_golden are intentionally not
+# the admission gates. GPU fallback uses the Gemma3 backbone OQ loaders plus
+# host Dense-head dequantization; resident NPU Opus has its own row-padded OQ8
+# contract. Rows stay partial until `embedding_quality` STS-B evidence and the
+# relevant NPU/GPU parity checks exist.
+[[gate]]
+arch = 19
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "EmbeddingGemma OQ4 uses the Gemma3 encoder backbone OQ4 route and host Dense-head dequantization, but embedding-quality evidence is pending. OQ checklist producer=yes loader=yes decode=not-ar prefill=encode-smoke tiny=not-ar golden=not-ar eval=embedding_quality-pending artifact=pending"
+
+[[gate]]
+arch = 19
+quant = "oq4+"
+feature = "prefill"
+support = "partial"
+note = "EmbeddingGemma OQ4+ shares the encoder OQ dispatch route, but activation-calibrated embedding quality evidence is pending. OQ checklist producer=pending-calib loader=yes decode=not-ar prefill=encode-smoke tiny=not-ar golden=not-ar eval=embedding_quality-pending artifact=pending"
+
+[[gate]]
+arch = 19
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "EmbeddingGemma OQ4++ requires Hessian/LDLQ calibration audit and embedding quality evidence before promotion. OQ checklist producer=pending-hessian loader=yes decode=not-ar prefill=encode-smoke tiny=not-ar golden=not-ar eval=embedding_quality-pending artifact=pending"
+
+[[gate]]
+arch = 19
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "EmbeddingGemma mixed OQ4.25++ requires encoder tensor-policy audit, Dense-head coverage, and embedding quality evidence before promotion. OQ checklist producer=pending-hessian loader=yes decode=not-ar prefill=encode-smoke tiny=not-ar golden=not-ar eval=embedding_quality-pending artifact=pending"
+
+[[gate]]
+arch = 19
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "EmbeddingGemma OQ8 uses the Gemma3 encoder backbone OQ8 route and host Dense-head dequantization; embedding-quality evidence is pending. OQ checklist producer=yes loader=yes decode=not-ar prefill=encode-smoke tiny=not-ar golden=not-ar eval=embedding_quality-pending artifact=pending"
+
+[[gate]]
+arch = 19
+quant = "oq8+"
+feature = "prefill"
+support = "partial"
+note = "EmbeddingGemma OQ8+ is the target NPU Opus bucket path, but row-padded OQ8 requires resident XDNA or an explicit GPU fallback and embedding quality evidence is pending. OQ checklist producer=pending-calib loader=conditional-xdna decode=not-ar prefill=encode-smoke tiny=not-ar golden=npu-parity-pending eval=embedding_quality-pending artifact=pending"
+
+[[gate]]
+arch = 19
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "EmbeddingGemma OQ8++ requires Hessian/LDLQ calibration audit plus resident NPU/GPU fallback parity before promotion. OQ checklist producer=pending-hessian loader=conditional-xdna decode=not-ar prefill=encode-smoke tiny=not-ar golden=npu-parity-pending eval=embedding_quality-pending artifact=pending"
+
+# Gemma4 (arch 24) has separate dense, PLE, and dense-MoE tiny/golden coverage.
+# Calibrated plus and mixed OQ have gfx1103 tiny/golden fixture evidence across
+# dense, PLE, and dense-MoE. Keep rows partial until model eval admission and
+# product artifact provenance exist.
+[[gate]]
+arch = 24
+quant = "oq4"
+feature = "prefill"
+support = "partial"
+note = "Gemma4 dense/PLE/MoE OQ4 W4A4 loads through shared weight_gemv Oq4G256 dispatch; tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=yes prefill=smoke tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+
+[[gate]]
+arch = 24
+quant = "oq4+"
+feature = "prefill"
+support = "partial"
+note = "Gemma4 dense, PLE, and dense-MoE OQ4+ have calibrated tiny KLD and fixture golden evidence on gfx1103 through the shared OQ dispatch path; model eval admission and product artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 24
+quant = "oq4++"
+feature = "prefill"
+support = "partial"
+note = "Gemma4 dense, PLE, and dense-MoE OQ4++ have Hessian-backed tiny KLD and fixture golden evidence on gfx1103 through the shared OQ dispatch path; model eval admission and product artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 24
+quant = "oq4.25++"
+feature = "prefill"
+support = "partial"
+note = "Gemma4 dense, PLE, and dense-MoE mixed OQ4.25++ have calibrated tiny KLD and fixture golden evidence on gfx1103; dense-MoE strict LDLQ now records finite Hessian attempts. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-mixed eval=pending artifact=pending"
+
+[[gate]]
+arch = 24
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "Gemma4 dense/PLE/MoE OQ8 W8A8 loads through shared weight_gemv Oq8G256 dispatch; tiny KLD and fixture golden are finite on gfx1103. OQ checklist producer=yes loader=yes decode=yes prefill=smoke tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+
+[[gate]]
+arch = 24
+quant = "oq8+"
+feature = "prefill"
+support = "partial"
+note = "Gemma4 dense, PLE, and dense-MoE OQ8+ have calibrated tiny KLD and fixture golden evidence on gfx1103 through the shared OQ8 dispatch path; model eval admission and product artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
+
+[[gate]]
+arch = 24
+quant = "oq8++"
+feature = "prefill"
+support = "partial"
+note = "Gemma4 dense, PLE, and dense-MoE OQ8++ have Hessian-backed tiny KLD and fixture golden evidence on gfx1103 through the shared OQ8 dispatch path; model eval admission and product artifact provenance remain pending. OQ checklist producer=yes-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending"
 
 # ── Diffusion (image/video denoiser) capability matrix ─────────────────────────
 # A SEPARATE matrix from the [[arch]] rows above: diffusion families are graded on
@@ -432,7 +1142,7 @@ denoise = "full"
 sampler = "full"
 vae = "full"
 t2i = "full"
-quant = "bf16·q4f16·q8f16·hfq4/6·oq4/++/8"
+quant = "bf16·q4f16·q8f16·hfq4/6·oq4·oq4+·oq4++·oq8"
 note = "Only end-to-end-wired family: Qwen3 text tower + SeFi dual-time denoise loop, flow-match Euler + DPM schedulers, shared VAE decode; variants Klein (5/20) and SeFi-2B (4/16); img2img + inpaint via the shared pipeline"
 
 [[diffusion]]
@@ -445,7 +1155,7 @@ denoise = "full"
 sampler = "partial"
 vae = "full"
 t2i = "partial"
-quant = "bf16·q4f16·q8f16·hfq4/6·oq4/++/8"
+quant = "bf16·q4f16·q8f16·hfq4/6·oq4·oq4+·oq4++·oq8"
 note = "Denoiser topology + Qwen3-VL tower + text-fusion load and a family-specific mixed-precision policy exist, but the generate-path glue is still `#[allow(dead_code)]`; not yet a wired serve loop"
 
 [[diffusion]]
@@ -458,5 +1168,5 @@ denoise = "partial"
 sampler = "none"
 vae = "partial"
 t2i = "none"
-quant = "bf16·q4f16·q8f16·hfq4/6·oq4/++/8"
+quant = "bf16·q4f16·q8f16·hfq4/6·oq4·oq4+·oq4++·oq8"
 note = "Ingest/identity only: MMDiT backbone topology and the Wan-class per-channel VAE are recognized, but NativeDiffusionRuntime builds no Qwen-Image text conditioner, so there is no servable t2i loop"

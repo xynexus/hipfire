@@ -170,6 +170,121 @@ impl Qwen2Tiny {
     }
 }
 
+/// Bias-free Qwen3 legacy fixture for arch_id 1. Unlike the default Qwen2
+/// fixture above, this one is intentionally compatible with the shared
+/// LLaMA-family runtime path used by the historical arch-1 loader.
+struct Qwen3LegacyTiny {
+    hidden: usize,
+    inter: usize,
+    vocab: usize,
+    layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+}
+
+impl Qwen3LegacyTiny {
+    fn preset() -> Self {
+        Self {
+            hidden: 256,
+            inter: 512,
+            vocab: 4096,
+            layers: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 128,
+        }
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["Qwen3ForCausalLM"],
+            "model_type": "qwen3",
+            "hidden_size": self.hidden,
+            "intermediate_size": self.inter,
+            "vocab_size": self.vocab,
+            "num_hidden_layers": self.layers,
+            "num_attention_heads": self.n_heads,
+            "num_key_value_heads": self.n_kv_heads,
+            "head_dim": self.head_dim,
+            "attention_bias": false,
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1_000_000.0,
+            "max_position_embeddings": 4096,
+            "tie_word_embeddings": true,
+            "dtype": "bfloat16",
+            "_comment": "hipfire tiny random-init gating fixture — not a real model",
+        })
+    }
+
+    fn manifest(&self) -> Vec<TensorSpec> {
+        let h = self.hidden;
+        let q_dim = self.n_heads * self.head_dim;
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        let mut t = Vec::new();
+        t.push(TensorSpec::new(
+            "model.embed_tokens.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        t.push(TensorSpec::f16(
+            "model.norm.weight",
+            vec![h],
+            Init::NormOnes,
+        ));
+        for i in 0..self.layers {
+            let p = format!("model.layers.{i}");
+            t.push(TensorSpec::f16(
+                format!("{p}.input_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.self_attn.q_proj.weight"),
+                vec![q_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.self_attn.k_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.self_attn.v_proj.weight"),
+                vec![kv_dim, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.self_attn.o_proj.weight"),
+                vec![h, q_dim],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::f16(
+                format!("{p}.post_attention_layernorm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.gate_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.up_proj.weight"),
+                vec![self.inter, h],
+                Init::Uniform(0.05),
+            ));
+            t.push(TensorSpec::new(
+                format!("{p}.mlp.down_proj.weight"),
+                vec![h, self.inter],
+                Init::Uniform(0.05),
+            ));
+        }
+        t
+    }
+}
+
 impl ToyModel for Qwen2Spec {
     fn fixture(&self, _seed: u64) -> ToyFixture {
         let m = Qwen2Tiny::preset();
@@ -177,6 +292,25 @@ impl ToyModel for Qwen2Spec {
             config_json: serde_json::to_string_pretty(&m.config_json())
                 .expect("serialize qwen2 toy config"),
             tensors: m.manifest(),
+        }
+    }
+
+    fn fixture_names(&self) -> &'static [&'static str] {
+        &["default", "qwen3-legacy"]
+    }
+
+    fn fixture_named(&self, name: &str, _seed: u64) -> Option<ToyFixture> {
+        match name {
+            "default" => Some(self.fixture(_seed)),
+            "qwen3-legacy" => {
+                let m = Qwen3LegacyTiny::preset();
+                Some(ToyFixture {
+                    config_json: serde_json::to_string_pretty(&m.config_json())
+                        .expect("serialize qwen3 legacy toy config"),
+                    tensors: m.manifest(),
+                })
+            }
+            _ => None,
         }
     }
 }
@@ -202,5 +336,28 @@ mod tests {
         let f = Qwen2Spec.fixture(0);
         assert!(!f.tensors.is_empty(), "fixture must emit tensors");
         assert!(f.config_json.contains("\"model_type\": \"qwen2\""));
+        assert!(f
+            .tensors
+            .iter()
+            .any(|t| t.name == "model.layers.0.self_attn.q_proj.bias"));
+    }
+
+    #[test]
+    fn qwen3_legacy_fixture_is_bias_free() {
+        let f = Qwen2Spec
+            .fixture_named("qwen3-legacy", 0)
+            .expect("qwen3 legacy fixture");
+        assert!(!f.tensors.is_empty(), "fixture must emit tensors");
+        assert!(f.config_json.contains("\"model_type\": \"qwen3\""));
+        assert!(!f.tensors.iter().any(|t| t.name.ends_with(".bias")));
+        let n_params: usize = f
+            .tensors
+            .iter()
+            .map(|t| t.shape.iter().product::<usize>())
+            .sum();
+        assert!(
+            n_params < 10_000_000,
+            "qwen3 legacy fixture must stay <10M params"
+        );
     }
 }

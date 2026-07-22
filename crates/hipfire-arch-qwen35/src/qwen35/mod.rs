@@ -1706,6 +1706,7 @@ fn moe_decode_dispatch_flags_for_dtypes(
     k_top: usize,
     paro_shared_present: bool,
 ) -> MoeDecodeDispatchFlags {
+    let oq_indexed_decode = qwen35_moe_oq_indexed_decode_enabled();
     let gate_side_mq4 = dtypes.router == DType::MQ4G256
         && dtypes.shared_expert_scalar_gate == DType::MQ4G256
         && dtypes.shared_expert_gate == DType::MQ4G256
@@ -1742,8 +1743,8 @@ fn moe_decode_dispatch_flags_for_dtypes(
     let routed_dtype_indexable_mq6 = routed_mq6 && routed_gate_up_mq6;
     let routed_dtype_indexable_mq2_lloyd = routed_mq2_lloyd && routed_gate_up_mq2_lloyd;
     let routed_dtype_indexable_paro = routed_paro && routed_gate_up_paro;
-    let routed_dtype_indexable_oq4 = routed_oq4 && routed_gate_up_oq4;
-    let routed_dtype_indexable_oq8 = routed_oq8 && routed_gate_up_oq8;
+    let routed_dtype_indexable_oq4 = oq_indexed_decode && routed_oq4 && routed_gate_up_oq4;
+    let routed_dtype_indexable_oq8 = oq_indexed_decode && routed_oq8 && routed_gate_up_oq8;
     let routed_path = if routed_dtype_indexable_mq4 {
         MoeDecodeIndexedRoutedPath::Mq4
     } else if routed_dtype_indexable_mq6 {
@@ -1766,8 +1767,8 @@ fn moe_decode_dispatch_flags_for_dtypes(
         || routed_gate_up_mq6
         || routed_gate_up_mq2_lloyd
         || routed_gate_up_paro
-        || routed_gate_up_oq4
-        || routed_gate_up_oq8
+        || routed_dtype_indexable_oq4
+        || routed_dtype_indexable_oq8
         || dtypes.routed_profile.is_mixed();
     MoeDecodeDispatchFlags {
         gate_side_mq4,
@@ -1790,6 +1791,17 @@ fn moe_decode_dispatch_flags_for_dtypes(
         use_gpu_topk,
         needs_x_rot_local,
     }
+}
+
+fn qwen35_moe_oq_indexed_decode_enabled() -> bool {
+    // HIPFIRE_QWEN35_MOE_OQ_INDEXED=1 re-enables the experimental indexed
+    // routed OQ decode kernels while debugging their finite-KLD failure.
+    matches!(
+        std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("on")
+    )
 }
 
 fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
@@ -5583,6 +5595,20 @@ mod tests {
         assert!(flags.routed_dtype_indexable_mq4);
         assert!(flags.use_gpu_topk);
         assert!(flags.needs_x_rot_local);
+    }
+
+    #[test]
+    fn moe_decode_keeps_oq_on_generic_fallback_by_default() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::Oq4G256);
+        dtypes.router = DType::Q8_0;
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+
+        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false);
+
+        assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::None);
+        assert!(!flags.routed_dtype_indexable_oq4);
+        assert!(!flags.use_gpu_topk);
+        assert!(!flags.needs_x_rot_local);
     }
 
     #[test]

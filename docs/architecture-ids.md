@@ -30,7 +30,7 @@ and 4 are historically retired and must not be reused.
 | id | constant | family label | serving crate | detection `arch_str` |
 |----|----------|--------------|---------------|----------------------|
 | 0  | `ARCH_ID_LLAMA_MISTRAL`      | llama        | `hipfire-arch-llama`    | `llama` (+ unknown-arch default) |
-| 1  | `ARCH_ID_QWEN3_QWEN2_LEGACY` | llama        | `hipfire-arch-llama`    | `qwen3`, `qwen2` |
+| 1  | `ARCH_ID_QWEN3_QWEN2_LEGACY` | qwen3-legacy | `hipfire-arch-llama`    | `qwen3`, `qwen2` |
 | 5  | `ARCH_ID_QWEN35_DENSE`       | qwen3.5      | `hipfire-arch-qwen35`   | `qwen3_5`, `qwen3_5_text` |
 | 6  | `ARCH_ID_QWEN35_MOE`         | qwen3.5      | `hipfire-arch-qwen35`   | `qwen3_5_moe`, `qwen3_5_moe_text`, GGUF `qwen3moe` |
 | 7  | `ARCH_ID_QWEN2`              | qwen2        | `hipfire-arch-qwen2`    | via `--arch-id 7` (auto-detect maps plain Qwen2 to 1) |

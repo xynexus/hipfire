@@ -781,6 +781,7 @@ pub fn oqplus_tiered_ldlq_pack(
                     gain(c)
                         .partial_cmp(&gain(a))
                         .unwrap_or(core::cmp::Ordering::Equal)
+                        .then_with(|| a.cmp(&c))
                 });
                 let mut is_w8 = [false; 256];
                 for &i in &idx[..n_out] {
@@ -910,6 +911,7 @@ pub fn oqplus_compact_ldlq_pack(
                     gain(c)
                         .partial_cmp(&gain(a))
                         .unwrap_or(core::cmp::Ordering::Equal)
+                        .then_with(|| a.cmp(&c))
                 });
                 let mut is_w8 = [false; 256];
                 for &i in &idx[..n_out] {

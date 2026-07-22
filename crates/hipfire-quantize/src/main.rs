@@ -312,11 +312,13 @@ static LDLQ_PACK_FAILED: AtomicUsize = AtomicUsize::new(0);
 
 fn ldlq_hessian_for_tensor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option<Vec<f32>> {
     LDLQ_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-    let key = name.strip_suffix(".weight").unwrap_or(name);
-    let hk = idx.k_of(key).or_else(|| idx.k_of(name));
-    let Some(hk) = hk else {
+    let candidates = calibration_tensor_name_candidates(name);
+    let Some((key, hk)) = candidates
+        .iter()
+        .find_map(|key| idx.k_of(key).map(|hk| (key.as_str(), hk)))
+    else {
         LDLQ_MISSING.fetch_add(1, Ordering::Relaxed);
-        eprintln!("  ldlq: skip {name} (no Hessian entry for {key:?})");
+        eprintln!("  ldlq: skip {name} (no Hessian entry for {candidates:?})");
         return None;
     };
     if hk != k {
@@ -324,13 +326,11 @@ fn ldlq_hessian_for_tensor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option
         eprintln!("  ldlq: skip {name} (Hessian K={hk} != weight K={k})");
         return None;
     }
-    idx.get_full(key)
-        .or_else(|| idx.get_full(name))
-        .or_else(|| {
-            LDLQ_MISSING.fetch_add(1, Ordering::Relaxed);
-            eprintln!("  ldlq: skip {name} (Hessian entry existed but payload could not be read)");
-            None
-        })
+    idx.get_full(key).or_else(|| {
+        LDLQ_MISSING.fetch_add(1, Ordering::Relaxed);
+        eprintln!("  ldlq: skip {name} (Hessian entry existed but payload could not be read)");
+        None
+    })
 }
 
 fn ldlq_record_success() {
@@ -3481,6 +3481,25 @@ enum HfqInputFormat {
     Oq8Plus,
 }
 
+fn stacked_expert_oq_format(
+    use_opus_mixed: bool,
+    use_oq4: bool,
+    use_oq8: bool,
+    use_oq8_plus: bool,
+) -> Option<HfqInputFormat> {
+    if use_opus_mixed {
+        Some(HfqInputFormat::OqPlusCompact)
+    } else if use_oq4 {
+        Some(HfqInputFormat::Oq4)
+    } else if use_oq8_plus {
+        Some(HfqInputFormat::Oq8Plus)
+    } else if use_oq8 {
+        Some(HfqInputFormat::Oq8)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Debug)]
 struct TensorFormatOverride {
     pattern: String,
@@ -3698,9 +3717,9 @@ fn quantize_hfq_source_tensor(
         let (data, qt, label) = source_precision_tensor_bytes(raw, src_dtype, &f32_data);
         return Ok((data, qt, 0, label));
     }
-    // `embed_tokens` (llama/qwen/…) and `backbone.embeddings.weight` (nemotron_h)
-    // are both embedding tables — keep them Q8 (row-lookup-able; Q4 is too lossy).
-    let is_embed = name.contains("embed_tokens") || name.ends_with("embeddings.weight");
+    // Embedding tables stay gather-friendly (Q8/source precision); Opus GEMV
+    // layouts are not valid embedding lookup storage.
+    let is_embed = is_embedding_table_name(name);
     if is_embed {
         // --embed-precision bf16|f16: keep the gather table at source precision
         // instead of Q8 (no-op under the default q8). Only the embed table — the
@@ -4989,11 +5008,45 @@ fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
 ///   - the imatrix file doesn't carry this tensor (rare; usually means the
 ///     tensor wasn't exercised by the calibration corpus).
 fn imatrix_direct_name_candidates(safetensors_name: &str) -> Vec<String> {
-    let mut names = vec![safetensors_name.to_string()];
-    if let Some(stripped) = safetensors_name.strip_prefix("model.") {
-        names.push(stripped.to_string());
-    } else {
-        names.push(format!("model.{safetensors_name}"));
+    calibration_tensor_name_candidates(safetensors_name)
+        .into_iter()
+        .flat_map(|name| {
+            let mut names = vec![name.clone()];
+            if let Some(stripped) = name.strip_prefix("model.") {
+                names.push(stripped.to_string());
+            } else {
+                names.push(format!("model.{name}"));
+            }
+            names
+        })
+        .fold(Vec::new(), |mut out, name| {
+            if !out.iter().any(|existing| existing == &name) {
+                out.push(name);
+            }
+            out
+        })
+}
+
+fn calibration_tensor_name_candidates(name: &str) -> Vec<String> {
+    let mut names = Vec::with_capacity(4);
+    fn push_unique(names: &mut Vec<String>, candidate: String) {
+        if !names.iter().any(|existing| existing == &candidate) {
+            names.push(candidate);
+        }
+    }
+
+    push_unique(&mut names, name.to_string());
+
+    if let Some(stripped) = name.strip_suffix(".weight") {
+        push_unique(&mut names, stripped.to_string());
+    }
+
+    for base in names.clone() {
+        if let Some(rest) = base.strip_prefix("model.language_model.") {
+            push_unique(&mut names, format!("model.{rest}"));
+        } else if let Some(rest) = base.strip_prefix("model.") {
+            push_unique(&mut names, format!("model.language_model.{rest}"));
+        }
     }
     names
 }
@@ -5143,10 +5196,13 @@ fn lfm2_layer_awq_scales_from_imatrix(n: usize, alpha: f32) -> Option<(Vec<f32>,
     let mut n_gate_up = 0usize;
     let mut n_down = 0usize;
 
-    for (name, values) in im {
-        if name.ends_with(".weight") || !name.starts_with(&prefix) {
-            continue;
-        }
+    let mut entries: Vec<(&String, &Vec<f32>)> = im
+        .iter()
+        .filter(|(name, _)| !name.ends_with(".weight") && name.starts_with(&prefix))
+        .collect();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    for (name, values) in entries {
         let target = if name.ends_with(".w1") || name.ends_with(".w3") {
             &mut gate_up
         } else if name.ends_with(".w2") {
@@ -5452,6 +5508,12 @@ fn direct_source_precision_layout(
             "unsupported dtype for source-precision stream: {other}"
         )),
     }
+}
+
+fn is_embedding_table_name(name: &str) -> bool {
+    name.contains("embed_tokens")
+        || name.ends_with("embeddings.weight")
+        || name.ends_with("embedding.weight")
 }
 
 /// Embed-table storage override for `--embed-precision`. Returns
@@ -6170,6 +6232,7 @@ fn main() {
     let use_opus_mixed = opus_mixed_spec.is_some();
     let use_oq8 = format == "oq8";
     let use_oq8_plus = format == "oq8+" || format == "oq8++";
+    let use_oq_family = use_opus_mixed || use_oq4 || use_oq8 || use_oq8_plus;
     let lfm2_oq_format = HfqInputFormat::from_flag(format).filter(|fmt| {
         matches!(
             fmt,
@@ -7517,7 +7580,8 @@ fn main() {
     // the K-map default-on path because the routed-expert promotion is
     // the headline win and the empirical regression there is tighter
     // (+1.7% PPL at 2K, gated below the dense regression threshold).
-    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
+    let kmap: HashMap<String, QuantLevel> = if no_kmap || use_oq_family || (!is_moe && !kmap_dense)
+    {
         HashMap::new()
     } else {
         let mut map = HashMap::new();
@@ -8370,11 +8434,14 @@ fn main() {
         // so the engine loader can fish them out by expert index.
         // ── DeepSeek V4 per-expert tensor path ─────────────────────────────────────
         // DeepSeek V4 ships per-expert 2D tensors at `layers.L.ffn.experts.E.{w1,w2,w3}.weight`.
-        // (Not 3D-stacked like Qwen3.5 MoE.) Route them through the MQ-family
-        // quant path directly. No imatrix yet for DeepSeek V4 — pass unit column
-        // weights so the underlying Lloyd codebook fit is uniform; the
-        // GPTQ sequential error-feedback assignment still applies and is
-        // worth +1-2 % coherence (project_gptq_lloyd-mq2_win.md).
+        // (Not 3D-stacked like Qwen3.5 MoE.) Route them through the MQ2-Lloyd
+        // path for every DeepSeek-specialized format, including OQ dense formats:
+        // the DeepSeek4 routed MoE kernels are MQ2-Lloyd-specific, while OQ4/OQ8
+        // expert payloads would be raw-concatenated by the loader and then read
+        // through the wrong kernel family. No imatrix yet for DeepSeek V4 — pass
+        // unit column weights so the Lloyd fit is uniform; the GPTQ sequential
+        // error-feedback assignment still applies and is worth +1-2 % coherence
+        // (project_gptq_lloyd-mq2_win.md).
         if is_deepseek4
             && name.contains(".ffn.experts.")
             && name.ends_with(".weight")
@@ -8416,7 +8483,8 @@ fn main() {
                     || use_mq4_routed_lloyd_mq2_native
                     || use_mq4_routed_lloyd_mq2_imatrix
                     || use_mq4_routed_lloyd_mq_antirez
-                    || use_deepseek4_source_precision)
+                    || use_deepseek4_source_precision
+                    || lfm2_oq_format.is_some())
             {
                 let signs1 = gen_fwht_signs(42, 256);
                 let signs2 = gen_fwht_signs(1042, 256);
@@ -8943,6 +9011,8 @@ fn main() {
                 || tiered_layer_is_mq3
                 || antirez_mq3)
                 && supports_g256;
+            let stacked_oq_format =
+                stacked_expert_oq_format(use_opus_mixed, use_oq4, use_oq8, use_oq8_plus);
             // Per-expert column-weights from the imatrix file, used only by
             // the imatrix variant. Built once per parent (cheap), then sliced
             // per expert inside the rayon loop. Falls back to None when the
@@ -9007,6 +9077,7 @@ fn main() {
                         awq_scales_for(&expert_name).filter(|s| s.len() == inner_k)
                     };
                     let m_expert = inner_shape_clone[0] as usize;
+                    let mut oq_sidecar_scales: Option<Vec<f32>> = None;
                     let (quantized, qt, gs) = if preserve_source_precision && dtype == "BF16" {
                         (slice.to_vec(), QuantType::BF16, 0u32)
                     } else if preserve_source_precision && dtype == "F16" {
@@ -9020,32 +9091,42 @@ fn main() {
                         (slice.to_vec(), QuantType::BF16, 0u32)
                     } else if use_fp16 || use_bf16 {
                         (f32_slice_to_f16_bytes(&f32_slice), QuantType::F16, 0u32)
-                    } else if (use_oq4 || use_oq8 || use_oq8_plus) && supports_g256 {
+                    } else if let Some(oq_format) = stacked_oq_format.filter(|_| supports_g256) {
                         // Opus-quant experts feed the indexed-MoE kernels; the loader
                         // repacks the on-disk Oq4G256/OqPlusCompact into the 132 B/260 B
                         // kernel block layout. oq4 → Oq4G256; oq8/oq8+ → OqPlusCompact
                         // (int4 bulk + top-frac int8 → Oq8G256 at load, default 1%,
                         // `--w8-top` overrides). Uniform across experts (indexed kernels
                         // require it), so kmap MQ-promotion is intentionally NOT applied.
-                        let want_oq8 = use_oq8 || use_oq8_plus;
-                        let w8_frac = OQPLUS_W8_FRAC.get().copied().or(if want_oq8 {
-                            Some(0.01)
-                        } else {
-                            None
+                        // Route through the shared HFQ-source quantizer so calibrated
+                        // mixed OQ (`oq4.25++`) applies AWQ/LDLQ and contributes to
+                        // strict Hessian validation like ordinary 2D weights.
+                        let f32_bytes: Vec<u8> = f32_slice
+                            .iter()
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect();
+                        let (q, qt, gs, _label) = quantize_hfq_source_tensor(
+                            &expert_name,
+                            arch_id,
+                            &f32_bytes,
+                            QuantType::F32 as u8,
+                            &inner_shape_clone,
+                            oq_format,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("Opus expert quantize {expert_name}: {error}")
                         });
-                        if let Some(frac) = w8_frac {
-                            (
-                                quantize_oqplus_compact(&f32_slice, &signs1, &signs2, frac),
-                                QuantType::OqPlusCompact,
-                                256u32,
-                            )
-                        } else {
-                            (
-                                quantize_oq4g256(&f32_slice, &signs1, &signs2),
-                                QuantType::Oq4G256,
-                                256u32,
-                            )
-                        }
+                        oq_sidecar_scales = OQ4_AWQ_SIDECAR.with(|cell| cell.borrow_mut().take());
+                        (q, qt, gs)
+                    } else if stacked_oq_format.is_some()
+                        && std::env::var_os("HIPFIRE_OQ_RAGGED_Q8").is_some()
+                    {
+                        // Keep OQ expert pairs loadable when a tiny/ragged
+                        // fixture has K that is not a 256-group multiple (for
+                        // example Qwen3.5-MoE down_proj K=128). The generic 2D
+                        // path has the same GPU-serving fallback; the split
+                        // expert path needs to mirror it explicitly.
+                        (quantize_q8f16(&f32_slice), QuantType::Q8F16, 32u32)
                     } else if expert_lloyd_mq3_native {
                         let q = quantize_mq3g256_lloyd(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ3G256Lloyd, 256u32)
@@ -9138,6 +9219,25 @@ fn main() {
                             });
                         }
                     }
+                    if let Some(s) = oq_sidecar_scales {
+                        if matches!(
+                            qt,
+                            QuantType::Oq4G256 | QuantType::Oq8G256 | QuantType::OqPlusCompact
+                        ) {
+                            let sidecar_name = expert_name
+                                .strip_suffix(".weight")
+                                .map(|st| format!("{st}.awq_scale.weight"))
+                                .unwrap_or_else(|| format!("{expert_name}.awq_scale.weight"));
+                            produced.push(HfqTensor {
+                                name: sidecar_name,
+                                quant_type: QuantType::F16,
+                                shape: vec![s.len() as u32],
+                                group_size: 0,
+                                data: awq_scales_to_f16_bytes(&s),
+                                spilled_len: 0,
+                            });
+                        }
+                    }
                     produced
                 })
                 .collect::<Vec<Vec<HfqTensor>>>();
@@ -9154,12 +9254,16 @@ fn main() {
                 "BF16"
             } else if use_fp16 || use_bf16 {
                 "F16"
-            } else if (use_oq4 || use_oq8 || use_oq8_plus) && supports_g256 {
-                if use_oq8 || use_oq8_plus || OQPLUS_W8_FRAC.get().is_some() {
+            } else if stacked_oq_format.is_some() && supports_g256 {
+                if use_opus_mixed || use_oq8 || use_oq8_plus || OQPLUS_W8_FRAC.get().is_some() {
                     "OQ+C-EXP"
                 } else {
                     "OQ4-EXP"
                 }
+            } else if stacked_oq_format.is_some()
+                && std::env::var_os("HIPFIRE_OQ_RAGGED_Q8").is_some()
+            {
+                "Q8-RAGGED-OQ"
             } else if expert_lloyd_mq3_native {
                 "MQ3G256L"
             } else if expert_lloyd_mq2_native {
@@ -9313,9 +9417,11 @@ fn main() {
 
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
 
+            let is_embed = is_embedding_table_name(name);
+
             // Q8HFQ path: split-metadata per-row layout (needs M and K)
             // Exclude embeddings — they use a lookup kernel, not GEMV
-            if use_q8hfq && meta.shape.len() == 2 && !name.contains("embed_tokens") {
+            if use_q8hfq && meta.shape.len() == 2 && !is_embed {
                 let m = meta.shape[0];
                 let k = meta.shape[1];
                 let (quantized, row_stride) = quantize_q8hfq(&f32_data, m, k);
@@ -9372,7 +9478,6 @@ fn main() {
                 // the runtime can apply `x / s` before the rotation kernel at
                 // inference time.
                 let mut awq_sidecar_scales: Option<Vec<f32>> = None;
-                let is_embed = name.contains("embed_tokens");
 
                 let (quantized, qt, gs, label) = if let Some(ov) = is_embed
                     .then(|| embed_precision_override(raw_data, &meta.dtype, &f32_data))
@@ -9627,10 +9732,9 @@ fn main() {
 
                     // Embeddings stored as Q8 in HFQ4 mode — Q4 is too lossy for
                     // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
-                    // `embed_tokens` (llama/qwen/…) and `backbone.embeddings.weight` (nemotron_h)
-                    // are both embedding tables — keep them Q8 (row-lookup-able; Q4 is too lossy).
-                    let is_embed =
-                        name.contains("embed_tokens") || name.ends_with("embeddings.weight");
+                    // Embedding tables stay gather-friendly (Q8/source precision);
+                    // Opus GEMV layouts are not valid embedding lookup storage.
+                    let is_embed = is_embedding_table_name(name);
                     let use_mq4_family = use_mq4g256
                         || use_mq4_mq6exp
                         || use_mq4_routed_lloyd_mq2_exp
@@ -14169,6 +14273,27 @@ mod tests {
     }
 
     #[test]
+    fn stacked_expert_oq_format_includes_mixed_opus() {
+        assert_eq!(
+            stacked_expert_oq_format(true, false, false, false),
+            Some(HfqInputFormat::OqPlusCompact)
+        );
+        assert_eq!(
+            stacked_expert_oq_format(false, true, false, false),
+            Some(HfqInputFormat::Oq4)
+        );
+        assert_eq!(
+            stacked_expert_oq_format(false, false, true, false),
+            Some(HfqInputFormat::Oq8)
+        );
+        assert_eq!(
+            stacked_expert_oq_format(false, false, false, true),
+            Some(HfqInputFormat::Oq8Plus)
+        );
+        assert_eq!(stacked_expert_oq_format(false, false, false, false), None);
+    }
+
+    #[test]
     fn tensor_format_overrides_support_globs_and_last_match_wins() {
         let args = vec![
             "hipfire-quantize".to_string(),
@@ -14461,6 +14586,8 @@ mod tests {
             vec![
                 "layers.0.self_attn.q_proj.weight",
                 "model.layers.0.self_attn.q_proj.weight",
+                "layers.0.self_attn.q_proj",
+                "model.layers.0.self_attn.q_proj",
             ]
         );
         assert_eq!(
@@ -14468,6 +14595,40 @@ mod tests {
             vec![
                 "model.layers.0.mlp.down_proj.weight",
                 "layers.0.mlp.down_proj.weight",
+                "model.layers.0.mlp.down_proj",
+                "layers.0.mlp.down_proj",
+                "model.language_model.layers.0.mlp.down_proj.weight",
+                "language_model.layers.0.mlp.down_proj.weight",
+                "model.language_model.layers.0.mlp.down_proj",
+                "language_model.layers.0.mlp.down_proj",
+            ]
+        );
+    }
+
+    #[test]
+    fn calibration_candidates_bridge_qwen35_vl_language_model_prefix() {
+        assert_eq!(
+            calibration_tensor_name_candidates(
+                "model.language_model.layers.0.self_attn.q_proj.weight"
+            ),
+            vec![
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "model.language_model.layers.0.self_attn.q_proj",
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.layers.0.self_attn.q_proj",
+            ]
+        );
+        assert_eq!(
+            imatrix_direct_name_candidates("model.language_model.layers.0.mlp.down_proj.weight"),
+            vec![
+                "model.language_model.layers.0.mlp.down_proj.weight",
+                "language_model.layers.0.mlp.down_proj.weight",
+                "model.language_model.layers.0.mlp.down_proj",
+                "language_model.layers.0.mlp.down_proj",
+                "model.layers.0.mlp.down_proj.weight",
+                "layers.0.mlp.down_proj.weight",
+                "model.layers.0.mlp.down_proj",
+                "layers.0.mlp.down_proj",
             ]
         );
     }
@@ -14718,6 +14879,16 @@ mod tests {
         );
         assert_eq!(kmap_resolve("lm_head.weight", 64, false), QuantLevel::Q8);
         assert_eq!(kmap_resolve("output.weight", 64, false), QuantLevel::Q8);
+    }
+
+    #[test]
+    fn embedding_table_names_cover_nemotron_variants() {
+        assert!(is_embedding_table_name("model.embed_tokens.weight"));
+        assert!(is_embedding_table_name("backbone.embeddings.weight"));
+        assert!(is_embedding_table_name("backbone.embedding.weight"));
+        assert!(!is_embedding_table_name(
+            "backbone.layers.0.mixer.in_proj.weight"
+        ));
     }
 
     #[test]

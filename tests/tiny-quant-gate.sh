@@ -65,13 +65,21 @@ RES="$OUT/results.jsonl"
 # Summarize each cell; count fails.
 fail=0
 skip=0
+blocked=0
 while IFS= read -r line; do
     status="$(grep -oE '"status":"[a-z]+"' <<<"$line" | head -1 | cut -d'"' -f4)"
     case_id="$(grep -oE '"case_id":"[^"]+"' <<<"$line" | head -1 | cut -d'"' -f4)"
     reason="$(grep -oE '"reason":"[^"]*"' <<<"$line" | head -1 | cut -d'"' -f4)"
+    is_blocked="$(grep -oE '"blocked":true' <<<"$line" | head -1 || true)"
     printf '  %-6s %s%s\n' "$status" "$case_id" "${reason:+  — $reason}"
     [ "$status" = "fail" ] && fail=$((fail + 1))
-    [ "$status" = "skip" ] && skip=$((skip + 1))
+    if [ "$status" = "skip" ]; then
+        if [ -n "$is_blocked" ]; then
+            blocked=$((blocked + 1))
+        else
+            skip=$((skip + 1))
+        fi
+    fi
 done <"$RES"
 
 if [ "$RECORD" = 1 ]; then
@@ -85,6 +93,10 @@ fi
 if [ "$skip" -gt 0 ]; then
     echo "tiny-quant-gate: INCONCLUSIVE ($skip skipped cell(s))"
     exit 3
+fi
+if [ "$blocked" -gt 0 ]; then
+    echo "tiny-quant-gate: PASS ($blocked explicitly blocked cell(s))"
+    exit 0
 fi
 echo "tiny-quant-gate: PASS"
 exit 0

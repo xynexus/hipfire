@@ -200,7 +200,7 @@ pub struct DiffusionQuantizeArgs {
     /// Output quantized .hfq artifact path
     #[arg(long, short)]
     pub output: PathBuf,
-    /// Quant format: q8, q4, q4k, q4+, oq4/oq4++/oq8 (rotated), oq4p/oq8p
+    /// Quant format: q8, q4, q4k, q4+, oq4/oq4+/oq4++/oq8 (rotated), oq4p/oq8p
     /// (plain), a decimal plain-Opus target such as oq4.25, or oq4-mixed for
     /// the legacy data-free heuristic. Plain Opus uses int8 activations.
     #[arg(long, default_value = "q8")]
@@ -962,7 +962,7 @@ fn run_quantize(args: DiffusionQuantizeArgs) -> anyhow::Result<()> {
     }
     let format = DiffusionQuantFormat::parse(&args.format).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown quant format {:?}; expected one of: q8, q4, q4k, q4+, oq4, oq4++, oq8, oq4p, oq8p, oq4.N, oq4-mixed",
+            "unknown quant format {:?}; expected one of: q8, q4, q4k, q4+, oq4, oq4+, oq4++, oq8, oq4p, oq8p, oq4.N, oq4-mixed",
             args.format
         )
     })?;

@@ -40,11 +40,13 @@ description = "Inference orchestrator for RDNA GPUs"
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-gemma3", "arch-embeddinggemma", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-minimax", "arch-lfm2moe", "arch-dots-ocr", "deltanet"]
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-gemma3", "arch-gemma3-vl", "arch-gemma4", "arch-embeddinggemma", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-minimax", "arch-lfm2moe", "arch-dots-ocr", "deltanet"]
 deltanet = ["hipfire-rdna/deltanet", "hipfire-dispatch/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
 arch-gemma3 = []
+arch-gemma3-vl = []
+arch-gemma4 = []
 arch-embeddinggemma = []
 arch-llama = []
 arch-qwen2 = []
@@ -125,7 +127,10 @@ hipfire-cpu = { path = "../hipfire-cpu" }
 hipfire-xdna = { path = "../hipfire-xdna" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
+hipfire-arch-api = { path = "../hipfire-arch-api" }
 hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
+hipfire-arch-gemma3-vl = { path = "../hipfire-arch-gemma3-vl" }
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 hipfire-arch-embeddinggemma = { path = "../hipfire-arch-embeddinggemma" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
@@ -133,8 +138,8 @@ hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-zaya = { path = "../hipfire-arch-zaya" }
 hipfire-arch-nemotron = { path = "../hipfire-arch-nemotron" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
-# hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" } # chaingun: needs swa_topk_wmma methods (not yet on this branch)
-# hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }  # chaingun: unclosed delimiter from merge
+hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
+hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-atlas = { path = "../hipfire-atlas" }
 
 # Each example below carries `required-features` listing the cargo
@@ -221,6 +226,10 @@ required-features = ["arch-qwen35"]
 [[example]]
 name = "dflash_spec_demo"
 required-features = ["arch-qwen35"]
+
+[[example]]
+name = "fixture_golden"
+required-features = ["arch-qwen35", "arch-qwen2", "arch-gemma3", "arch-gemma3-vl", "arch-gemma4", "arch-llama", "arch-lfm2moe", "arch-dots-ocr"]
 
 [[example]]
 name = "mtp_probe_demo"

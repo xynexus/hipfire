@@ -12,7 +12,7 @@
 
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::hfq::{
-    oq4_arch_load, HfqFile, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT as OQ4_QT,
+    oq4_arch_load, oq8_arch_load, HfqFile, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT as OQ4_QT,
 };
 use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::quant::f16_to_f32;
@@ -171,7 +171,7 @@ fn load_norm(
         _ => {
             return Err(format!(
                 "minimax: expected F16/F32 norm for {name}, got qt={qt}"
-            ))
+            ));
         }
     };
     gpu.upload_f32(&f32_data, shape)
@@ -208,7 +208,6 @@ fn load_mm_awq_scale(hfq: &HfqFile, gpu: &mut Gpu, name: &str, k: usize) -> Opti
 // the Opus iu8 grouped-WMMA kernel family `weight_gemv` already dispatches.
 // OQ4 canonical (34) is `OQ4_QT` (imported alias of the shared
 // `OQ4_CANONICAL_QT`); arch-packed (37) is `OQ4_ARCH_PACKED_QT`.
-const OQ8_QT: u8 = hipfire_runtime::quant::QuantType::Oq8G256.code();
 const OQPLUS_COMPACT_QT: u8 = hipfire_runtime::quant::QuantType::OqPlusCompact.code();
 const OQ_GROUP: usize = 256;
 
@@ -220,38 +219,6 @@ fn sext4(nib: u8) -> i8 {
     } else {
         v
     }
-}
-
-/// On-disk OQ8 block [f16 scale | 256 i8] → [i8 weights | f32 scales].
-fn pack_oq8(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
-    // Single-sourced from hipfire-quant-format (WP-3.3): Oq8G256 = 258.
-    const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq8G256
-        .block_bytes()
-        .unwrap();
-    if k % OQ_GROUP != 0 {
-        return Err(format!("OQ8G256 requires K % 256 == 0 (got K={k})"));
-    }
-    let ng = k / OQ_GROUP;
-    let expect = m * ng * BLOCK;
-    if data.len() != expect {
-        return Err(format!(
-            "OQ8G256 byte length {} != M*ng*258 = {expect} (M={m} K={k})",
-            data.len()
-        ));
-    }
-    let weight_bytes = m * k;
-    let mut out = vec![0u8; weight_bytes + m * ng * 4];
-    for r in 0..m {
-        for g in 0..ng {
-            let src = (r * ng + g) * BLOCK;
-            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-            let dst = r * k + g * OQ_GROUP;
-            out[dst..dst + OQ_GROUP].copy_from_slice(&data[src + 2..src + BLOCK]);
-            let scale_dst = weight_bytes + (r * ng + g) * 4;
-            out[scale_dst..scale_dst + 4].copy_from_slice(&scale.to_le_bytes());
-        }
-    }
-    Ok(out)
 }
 
 fn upload_wt_oq(
@@ -410,8 +377,10 @@ fn wt_from_raw(
                 .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
             return upload_wt_oq(gpu, &bytes, dtype, m, k);
         }
-        OQ8_QT => return upload_wt_oq(gpu, &pack_oq8(data, m, k)?, DType::Oq8G256, m, k),
         _ => {}
+    }
+    if let Some((bytes, dtype)) = oq8_arch_load(qt, data, m, k) {
+        return upload_wt_oq(gpu, &bytes, dtype, m, k);
     }
     // Pure (upload-and-tag) formats route through the shared canonical map in
     // hipfire_runtime::quant; the OQ arch-repack formats were handled above.

@@ -269,15 +269,72 @@ pub fn dtype_for_quant_type(qt: u8, k: usize) -> Option<hipfire_rdna::DType> {
     })
 }
 
+/// Map Opus-family on-disk quant types to the GPU runtime dtype used after the
+/// loader has performed any required OQ-specific repack.
+///
+/// This helper is deliberately separate from [`dtype_for_quant_type`], because
+/// canonical OQ4/OQ8/OQ+ payloads are not pure slab-upload formats for the
+/// general dense loaders. Callers that already handle the OQ payload contract
+/// can use this single map for dtype classification instead of re-hardcoding
+/// the quant-type bytes family by family.
+pub fn oq_gpu_dtype_for_quant_type(qt: u8) -> Option<hipfire_rdna::DType> {
+    use hipfire_quant_format::QuantType as Q;
+    use hipfire_rdna::DType;
+    Some(match Q::from_code(qt)? {
+        Q::OqPlusG256 | Q::Oq8G256 | Q::OqPlusCompact => DType::Oq8G256,
+        Q::Oq4G256 | Q::Oq4G256ArchPacked => DType::Oq4G256,
+        Q::Oq8G256RowPadded => return None,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
 
     #[test]
-    fn gpu_dtype_map_rejects_row_padded_npu_oq8() {
+    fn pure_gpu_dtype_map_rejects_transformed_oq_layouts() {
+        assert_eq!(dtype_for_quant_type(QuantType::Oq4G256.code(), 256), None);
+        assert_eq!(
+            dtype_for_quant_type(QuantType::Oq4G256ArchPacked.code(), 256),
+            None
+        );
+        assert_eq!(dtype_for_quant_type(QuantType::Oq8G256.code(), 256), None);
+        assert_eq!(
+            dtype_for_quant_type(QuantType::OqPlusCompact.code(), 256),
+            None
+        );
         assert_eq!(
             dtype_for_quant_type(QuantType::Oq8G256RowPadded.code(), 1152),
+            None
+        );
+    }
+
+    #[test]
+    fn oq_gpu_dtype_map_covers_servable_oq_layouts() {
+        assert_eq!(
+            oq_gpu_dtype_for_quant_type(QuantType::Oq4G256.code()),
+            Some(hipfire_rdna::DType::Oq4G256)
+        );
+        assert_eq!(
+            oq_gpu_dtype_for_quant_type(QuantType::Oq4G256ArchPacked.code()),
+            Some(hipfire_rdna::DType::Oq4G256)
+        );
+        assert_eq!(
+            oq_gpu_dtype_for_quant_type(QuantType::Oq8G256.code()),
+            Some(hipfire_rdna::DType::Oq8G256)
+        );
+        assert_eq!(
+            oq_gpu_dtype_for_quant_type(QuantType::OqPlusG256.code()),
+            Some(hipfire_rdna::DType::Oq8G256)
+        );
+        assert_eq!(
+            oq_gpu_dtype_for_quant_type(QuantType::OqPlusCompact.code()),
+            Some(hipfire_rdna::DType::Oq8G256)
+        );
+        assert_eq!(
+            oq_gpu_dtype_for_quant_type(QuantType::Oq8G256RowPadded.code()),
             None
         );
     }

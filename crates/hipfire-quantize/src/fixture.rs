@@ -332,6 +332,9 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
             named_toy_fixture_from_registry(ARCH_ID_DEEPSEEK4_FLASH as u16, "mtp", seed)?
         }
         "qwen2" => toy_fixture_from_registry(1, seed)?,
+        "qwen3_legacy" | "qwen3_legacy_text" | "qwen3" => {
+            named_toy_fixture_from_registry(1, "qwen3-legacy", seed)?
+        }
         "dots_ocr" | "dotsocr" => toy_fixture_from_registry(8, seed)?,
         "gemma3" | "gemma3_text" => toy_fixture_from_registry(12, seed)?,
         "gemma3_vl" | "gemma3_vl_text" | "gemma3-vl" => toy_fixture_from_registry(13, seed)?,
@@ -348,7 +351,9 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
             toy_fixture_from_registry(ARCH_ID_LFM2_MOE as u16, seed)?
         }
         "minimax" | "minimax_m2" => toy_fixture_from_registry(10, seed)?,
+        "nemotron_h" | "nemotron-h" | "nemotron" => toy_fixture_from_registry(14, seed)?,
         "mamba2" | "mamba_2" => toy_fixture_from_registry(15, seed)?,
+        "zaya" | "zaya1" | "zaya1_text" => toy_fixture_from_registry(16, seed)?,
         "llama" | "mistral" => toy_fixture_from_registry(0, seed)?,
         "dflash" | "dflash_draft" | "tiny_dflash" => {
             let m = DflashTiny::preset();
@@ -358,9 +363,9 @@ pub fn emit_fixture(arch: &str, out_dir: &Path, seed: u64) -> Result<(), String>
             return Err(format!(
                 "--emit-fixture: unsupported arch '{other}'. Supported: qwen3_5/qwen3_5_vl \
                  (arch 5 dense), qwen3_5_moe (arch 6 MoE), deepseek4/deepseek4_compressed/deepseek4_mtp (arch 9), \
-                 qwen2 (arch 7, quantize with --arch-id 7), dots_ocr (arch 8), \
+                 qwen2 (arch 7, quantize with --arch-id 7), qwen3_legacy (arch 1), dots_ocr (arch 8), \
                  gemma3 (arch 12), gemma3_vl (arch 13), \
-                 minimax (arch 10), mamba2 (arch 15), lfm2_moe (arch 11), \
+                 minimax (arch 10), nemotron_h (arch 14), mamba2 (arch 15), zaya (arch 16), lfm2_moe (arch 11), \
                  gemma4_dense/gemma4_ple/gemma4_moe (arch 24), llama (arch 0), \
                  dflash (draft sidecar). Add a tiny preset per arch as support lands."
             ));
@@ -525,6 +530,23 @@ mod tests {
         assert!(
             n_params(&specs) < 10_000_000,
             "qwen2 fixture must stay <10M params"
+        );
+    }
+
+    #[test]
+    fn qwen3_legacy_manifest_is_bias_free_and_tiny() {
+        let (config, specs) = named_toy_fixture_from_registry(1, "qwen3-legacy", 42).unwrap();
+        assert_eq!(
+            config.get("model_type").and_then(|v| v.as_str()),
+            Some("qwen3")
+        );
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(!has(".bias"), "legacy qwen3 path must be bias-free");
+        assert!(has("mlp.gate_proj.weight"), "dense SwiGLU");
+        assert!(!has("lm_head.weight"), "tied ⇒ no separate lm_head");
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "qwen3 legacy fixture must stay <10M params"
         );
     }
 
@@ -736,10 +758,46 @@ mod tests {
     }
 
     #[test]
+    fn nemotron_h_manifest_has_hybrid_blocks_and_is_tiny() {
+        let specs = toy_fixture_from_registry(14, 42).unwrap().1;
+        let has = |suf: &str| specs.iter().any(|s| s.name.ends_with(suf));
+        assert!(has("layers.0.mixer.in_proj.weight"), "Mamba mixer");
+        assert!(has("layers.1.mixer.up_proj.weight"), "dense MLP");
+        assert!(has("layers.2.mixer.q_proj.weight"), "attention mixer");
+        assert!(has("layers.3.mixer.down_proj.weight"), "second dense MLP");
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "nemotron-h fixture must stay <10M params"
+        );
+    }
+
+    #[test]
+    fn zaya_manifest_has_cca_eda_mod_and_experts() {
+        let specs = toy_fixture_from_registry(16, 42).unwrap().1;
+        let has = |name: &str| specs.iter().any(|s| s.name == name);
+        assert!(has("model.input_hidden_states_scale"));
+        assert!(has("model.layers.0.self_attn.qkv_proj.q_proj.weight"));
+        assert!(has(
+            "model.layers.0.self_attn.qkv_proj.conv_qk_depthwise.weight"
+        ));
+        assert!(has("model.layers.0.mlp.gate.router_mlp.out_proj.weight"));
+        assert!(has("model.layers.0.mlp.gate.balancing_biases"));
+        assert!(has("model.layers.0.mlp.experts.0.gate_up_proj.weight"));
+        assert!(has("model.layers.0.mlp.experts.0.down_proj.weight"));
+        assert!(!has("model.layers.0.mlp.gate.router_states_scale"));
+        assert!(has("model.layers.1.mlp.gate.router_states_scale"));
+        assert!(
+            n_params(&specs) < 10_000_000,
+            "zaya fixture must stay <10M params"
+        );
+    }
+
+    #[test]
     fn emit_new_families_are_deterministic() {
         let base = std::env::temp_dir().join(format!("hipfire-fx-fam-{}", std::process::id()));
         for arch in [
             "qwen2",
+            "qwen3_legacy",
             "dots_ocr",
             "deepseek4",
             "deepseek4_mtp",
@@ -748,6 +806,7 @@ mod tests {
             "qwen3_5_vl",
             "minimax",
             "lfm2_moe",
+            "nemotron_h",
             "mamba2",
             "llama",
             "gemma4_dense",

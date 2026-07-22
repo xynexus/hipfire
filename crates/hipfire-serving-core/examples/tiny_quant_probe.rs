@@ -98,6 +98,9 @@ fn main() {
             println!("max_kld: {:.8}", out.max_kld);
             println!("n_scored: {}", out.n_scored);
             println!("finite: {}", out.finite);
+            if let Some(reason) = out.first_nonfinite.as_deref() {
+                println!("first_nonfinite: {reason}");
+            }
         }
         "collect" => {
             let model = req(&args, "--model");

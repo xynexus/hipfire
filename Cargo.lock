@@ -1644,6 +1644,7 @@ name = "hipfire-arch-zaya-spec"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -2161,8 +2162,13 @@ dependencies = [
  "base64",
  "csv",
  "hip-bridge",
+ "hipfire-arch-api",
+ "hipfire-arch-deepseek4",
+ "hipfire-arch-dots-ocr",
  "hipfire-arch-embeddinggemma",
  "hipfire-arch-gemma3",
+ "hipfire-arch-gemma3-vl",
+ "hipfire-arch-gemma4",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
  "hipfire-arch-minimax",

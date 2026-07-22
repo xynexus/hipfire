@@ -511,6 +511,7 @@ fn mixed_overlay_indices(group: &[f32; 256], scale: f32, n_out: usize) -> [usize
         gain(right)
             .partial_cmp(&gain(left))
             .unwrap_or(core::cmp::Ordering::Equal)
+            .then_with(|| left.cmp(&right))
     });
     debug_assert!((1..=255).contains(&n_out));
     indices
@@ -1065,6 +1066,7 @@ pub fn quantize_oqplus_tiered(
             gain(c)
                 .partial_cmp(&gain(a))
                 .unwrap_or(core::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(&c))
         });
         let mut is_w8 = [false; 256];
         for &i in &idx[..n_out] {

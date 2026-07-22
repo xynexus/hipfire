@@ -794,8 +794,8 @@ fn load_bf16_matrix_weight(gpu: &Gpu, data: &[u8], m: usize, k: usize) -> HipRes
 // layout version: a future layout change takes a NEW code, so a stale artifact
 // refuses via the loader's catch-all rather than reading as garbage.
 pub use hipfire_runtime::hfq::{
-    oq4_arch_combined_len, oq4_arch_load, oq4_pack_arch_combined, oq4_to_oq8_combined,
-    oq8_combined, oqplus_compact_to_oq8_combined, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
+    oq4_arch_combined_len, oq4_arch_load, oq4_pack_arch_combined, oq8_arch_load,
+    OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
 };
 
 /// TODO(transformer-extraction): cross-arch duplicate. The Qwen2 variant
@@ -1092,43 +1092,17 @@ fn load_weight_tensor_raw(
             }
         },
         16 => load_bf16_matrix_weight(gpu, data, m, k),
-        36 => {
-            // OQ+ compact magnitude-tiered W4A8 (quant_type id 36, ~4 b/w). On-disk
-            // block = [f16 scale][128 int4 nibbles][N_out × (u8 idx, i8 val)] =
-            // 130 + 2·N_out B/256-group (codec `quantize_oqplus_compact`). N_out is
-            // DERIVED from the byte length (no extra metadata): expand the int4 bulk
-            // nibbles to int8, then overlay the sparse int8 outliers at their
-            // in-group indices → the Oq8 kernel buffer [int8 M*K | f32 scales M*ng].
-            // Tagged Oq8G256 → the single iu8 W8A8 forward, unchanged. AWQ sidecar
-            // (when present) is applied to x by the wrapper (Oq8G256 is allow-listed).
-            let combined = oqplus_compact_to_oq8_combined(data, m, k);
-            let buf = gpu.upload_raw(&combined, &[combined.len()])?;
+        33 | 35 | 36 => {
+            // OQ8-family dense tensors (OQ+ W4A8, OQ8 W8A8, and compact mixed
+            // OQ) all resolve through the shared runtime helper to the combined
+            // Oq8G256 device layout consumed by the iu8 GEMV/GEMM kernels. Routed
+            // MoE experts keep their indexed block layout in `load_moe_expert`.
+            let (bytes, gpu_dtype) = oq8_arch_load(quant_type, data, m, k)
+                .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36");
+            let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
             Ok(WeightTensor {
                 buf,
-                gpu_dtype: DType::Oq8G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        33 => {
-            // OQ+ / Opus Plus W4A8 (quant_type id 33). On-disk bytes are IDENTICAL
-            // to Oq4 (qt=34): [f16 scale][128 signed nibbles] per 256-group, from
-            // codec `quantize_oq4g256` (incl. its LDLQ/AWQ calibration). The format
-            // difference is the runtime contract: nibble-EXPAND the int4 weights to
-            // int8 here and tag the tensor Oq8G256 so it dispatches the W8A8 iu8
-            // grouped-WMMA path with int8 ACTIVATIONS. Weight VALUES stay 4-bit (16
-            // levels in [-8,7]); activations gain int8 precision (W4A8). Layout
-            // becomes the Oq8 kernel buffer [int8 M*K | f32 scales M*ng] — the exact
-            // upcast the `quantize_oq4g256` doc names. AWQ smooth, when present, is
-            // applied to x by the wrapper via the awq_scale sidecar (unchanged).
-            let combined = oq4_to_oq8_combined(data, m, k);
-            let buf = gpu.upload_raw(&combined, &[combined.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::Oq8G256,
+                gpu_dtype,
                 m,
                 k,
                 row_stride: 0,
@@ -1155,27 +1129,6 @@ fn load_weight_tensor_raw(
             Ok(WeightTensor {
                 buf,
                 gpu_dtype,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        35 => {
-            // Opus Quant W8A8 (OQ8G256, quant_type id 35). On-disk: [f16 scale]
-            // [256 int8] per 256-group, row-contiguous (codec `quantize_oq8g256`).
-            // Repack to the kernel layout in ONE buffer — int8 weights [M,K]
-            // followed by per-group f32 scales [M,K/256] — so the forward derives
-            // the weight-scale pointer via `sub_offset(M*K, ..)` and feeds
-            // `gemm_oq8_grouped_wmma`. Activations are int8-quantized at runtime
-            // (`quantize_act_oq8`); weights are FWHT-rotated offline so the forward
-            // FWHT-rotates x to match.
-            let combined = oq8_combined(data, m, k);
-            let buf = gpu.upload_raw(&combined, &[combined.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::Oq8G256,
                 m,
                 k,
                 row_stride: 0,
@@ -2472,13 +2425,7 @@ fn slab_dtype_for_quant(qt: u8, k: usize) -> Option<DType> {
 }
 
 pub(super) fn paged_moe_dtype_for_quant(qt: u8, k: usize) -> Option<DType> {
-    match qt {
-        OQ4_CANONICAL_QT => Some(DType::Oq4G256),
-        hipfire_runtime::oq_moe::OQ8_CANONICAL_QT | hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT => {
-            Some(DType::Oq8G256)
-        }
-        _ => slab_dtype_for_quant(qt, k),
-    }
+    hipfire_runtime::quant::oq_gpu_dtype_for_quant_type(qt).or_else(|| slab_dtype_for_quant(qt, k))
 }
 
 fn build_slab_banks(hfq: &HfqFile, bank_size: usize) -> Vec<SlabPlanBank> {
@@ -6102,6 +6049,20 @@ fn load_moe_expert(
     let qt = qwen35_tensor_name_candidates(name)
         .into_iter()
         .find_map(|c| hfq.find_tensor_info(&c).map(|i| i.quant_type));
+    let oq_indexed_decode = std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
+        .ok()
+        .as_deref()
+        == Some("1");
+    if !oq_indexed_decode
+        && matches!(
+            qt,
+            Some(OQ4_CANONICAL_QT)
+                | Some(hipfire_runtime::oq_moe::OQ8_CANONICAL_QT)
+                | Some(hipfire_runtime::oq_moe::OQPLUS_COMPACT_QT)
+        )
+    {
+        return load_weight_tensor(hfq, gpu, slabs, name, m, k);
+    }
     let (dtype, blocks) = match qt {
         Some(OQ4_CANONICAL_QT) => {
             let (_info, data) = qwen35_tensor_data_vec(hfq, name)

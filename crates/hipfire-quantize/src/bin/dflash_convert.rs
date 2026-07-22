@@ -240,7 +240,9 @@ impl DraftFormat {
             Self::Mq3 => "MQ3-G256 (weights), F32 (norms)",
             Self::Mq4 => "MQ4-G256 (weights), F32 (norms)",
             Self::Mq6 => "MQ6-G256 (weights), F32 (norms)",
-            Self::Oq8 => "OQ8-plain (non-rotated int8 G256 weights), F32 (norms) — NPU int8 W8A8/W8A16",
+            Self::Oq8 => {
+                "OQ8-plain (non-rotated int8 G256 weights), F32 (norms) — NPU int8 W8A8/W8A16"
+            }
             Self::Oq4 => {
                 "OQ4-plain (non-rotated PURE int4 G256, 130 B/group = 4.0625 b/w), \
                  F32 (norms) — NPU int4 W4A8, minimum bandwidth"
@@ -293,10 +295,10 @@ mod config_tests {
                 .unwrap(),
             DraftFormat::F16
         );
-        assert!(
-            DraftFormat::from_flags(true, true, false, false, false, false, false, false, None)
-                .is_err()
-        );
+        assert!(DraftFormat::from_flags(
+            true, true, false, false, false, false, false, false, None
+        )
+        .is_err());
     }
 }
 
@@ -491,7 +493,11 @@ fn clipsearch_plain(group: &[f32], qmax: f32) -> f32 {
             best_scale = scale;
         }
     }
-    if best_scale > 0.0 { best_scale } else { 1.0 }
+    if best_scale > 0.0 {
+        best_scale
+    } else {
+        1.0
+    }
 }
 
 /// Rank group positions by how much promoting them from int4 to int8 reduces
@@ -1369,11 +1375,20 @@ mod tests {
         // clip-search does NOT recover at 8 bits on real weights (measured).
         let n = 256 * 4;
         let w: Vec<f32> = (0..n)
-            .map(|i| if i % 256 == 0 { 0.9 } else { (i as f32 * 0.017).sin() * 0.08 })
+            .map(|i| {
+                if i % 256 == 0 {
+                    0.9
+                } else {
+                    (i as f32 * 0.017).sin() * 0.08
+                }
+            })
             .collect();
         let deq = dequant_oq8_plain(&quantize_oq8_plain(&w), n);
         let snr = snr_db(&w, &deq);
-        assert!(snr > 30.0, "oq8-plain outlier SNR {snr:.1} dB unexpectedly low");
+        assert!(
+            snr > 30.0,
+            "oq8-plain outlier SNR {snr:.1} dB unexpectedly low"
+        );
     }
 
     #[test]
@@ -1509,7 +1524,10 @@ mod tests {
         let s4 = snr_db(&w, &dequant_oq4_plain(&p4, n));
         let s425 = snr_db(&w, &dequant_oq4_mixed_plain(&p425, n, 3));
         let s8 = snr_db(&w, &dequant_oq8_plain(&p8, n));
-        assert!(s4 <= s425, "pure W4 {s4:.1} dB should not beat mixed {s425:.1}");
+        assert!(
+            s4 <= s425,
+            "pure W4 {s4:.1} dB should not beat mixed {s425:.1}"
+        );
         assert!(s425 < s8, "mixed {s425:.1} dB should not beat int8 {s8:.1}");
         // Sanity floor only. Weight-level int4 round-trip on smooth data; the
         // ~22 dB int8->int4 gap is textbook (~5.5 dB/bit) and is NOT a defect.

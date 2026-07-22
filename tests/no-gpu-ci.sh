@@ -17,6 +17,7 @@ cargo test -p hipfire-arch-qwen35 --lib moe_prefill
 cargo test -p hipfire-eval --lib
 cargo test -p hipfire-quantize xxh64_provenance_tests
 cargo test -p hipfire-quantize fixture
+cargo test -p hipfire-runtime quant_catalog_matches_derived_gemv_routes
 cargo test -p hipfire-arch-api --lib
 cargo test -p hipfire-arch-specs --lib
 cargo test -p hipfire-arch-template-spec --lib

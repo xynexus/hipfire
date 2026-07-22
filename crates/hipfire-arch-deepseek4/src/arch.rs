@@ -20,7 +20,9 @@ use crate::deepseek4::{
 };
 use hipfire_rdna::Gpu;
 use hipfire_runtime::arch::Architecture;
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::{
+    oq4_arch_load, oq8_arch_load, HfqFile, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
+};
 
 /// Type marker for DeepSeek V4 Flash. `arch_id = 9` — next free slot
 /// after `8 = Qwen2-VL (dots.ocr)` reserved in `docs/architecture-ids.md`.
@@ -63,6 +65,8 @@ impl DeepseekV4 {
     ///     (non-FWHT) input.
     ///   - Q8F16 (quant_type=3): upload raw bytes, set GpuTensor.dtype =
     ///     Q8_0. Forward routes to `gemv_q8_0` with plain input.
+    ///   - OQ4/OQ8-family codes: route through the shared OQ arch-load helpers
+    ///     so DeepSeek4 gets the same GPU-served device layouts as Qwen/Gemma/LFM2.
     ///   - Otherwise (e.g. quant_type=13 MQ4G256 in hypothetical future
     ///     builds; not present in the canonical mq2lloyd file): upload raw
     ///     bytes, dtype stays Raw. Forward routes to
@@ -84,6 +88,25 @@ impl DeepseekV4 {
             .tensor_data_pread(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
         let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
+        if shape.len() == 2 {
+            let (m, k) = (shape[0], shape[1]);
+            if info.quant_type == OQ4_CANONICAL_QT || info.quant_type == OQ4_ARCH_PACKED_QT {
+                let (packed, dtype) = oq4_arch_load(info.quant_type, &bytes, m, k)
+                    .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
+                let mut t = gpu
+                    .upload_raw(&packed, &[packed.len()])
+                    .map_err(|e| format!("deepseek4: upload OQ4 '{name}' failed: {e:?}"))?;
+                t.dtype = dtype;
+                return Ok(t);
+            }
+            if let Some((packed, dtype)) = oq8_arch_load(info.quant_type, &bytes, m, k) {
+                let mut t = gpu
+                    .upload_raw(&packed, &[packed.len()])
+                    .map_err(|e| format!("deepseek4: upload OQ8-family '{name}' failed: {e:?}"))?;
+                t.dtype = dtype;
+                return Ok(t);
+            }
+        }
         if info.quant_type == 1 {
             // F16 source: KEEP F16 on device. Forward routes F16 weights
             // through `gemm_f16_x_f16_wmma` in the batched path and a

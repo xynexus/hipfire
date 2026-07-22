@@ -24,7 +24,7 @@ use std::sync::Arc;
 use hipfire_dispatch::pipeline::superop::LoweredForward;
 use hipfire_rdna::Gpu;
 
-use hipfire_runtime::arch::Architecture;
+use hipfire_runtime::arch::{Architecture, SimpleAr};
 use hipfire_runtime::calibration::CalibCollector;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
@@ -43,6 +43,7 @@ use hipfire_arch_nemotron::{model::NemotronModel, NemotronHConfig};
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_arch_qwen35_vl as qwen35_vl_arch;
+use hipfire_arch_zaya::{arch::ZayaModel, calibration as zaya_calib, gpu as zaya_gpu, ZayaConfig};
 // LLaMA/Mistral (arch 0/1) live in the runtime crate (HFQ config + loader +
 // forward), surfaced via the hipfire-arch-llama Architecture impl.
 use hipfire_runtime::llama::{self, ForwardScratch, LlamaConfig, LlamaWeights};
@@ -67,7 +68,9 @@ pub enum TinyArch {
     #[cfg(feature = "arch-lfm2moe")]
     Lfm2Moe,
     MiniMax,
+    NemotronH,
     Mamba2,
+    Zaya,
     Llama,
 }
 
@@ -99,10 +102,14 @@ impl TinyArch {
             #[cfg(feature = "arch-lfm2moe")]
             "lfm2" | "lfm2_moe" | "lfm2moe" | "lfm2_moe_text" => Ok(Self::Lfm2Moe),
             "minimax" | "minimax_m2" => Ok(Self::MiniMax),
+            "nemotron_h" | "nemotron" => Ok(Self::NemotronH),
             "mamba2" | "mamba_2" => Ok(Self::Mamba2),
-            "llama" | "mistral" => Ok(Self::Llama),
+            "zaya" | "zaya1" | "zaya1_text" => Ok(Self::Zaya),
+            "llama" | "mistral" | "qwen3_legacy" | "qwen3_legacy_text" | "qwen3" => {
+                Ok(Self::Llama)
+            }
             other => Err(format!(
-                "unknown --arch '{other}' (qwen3_5|qwen3_5_vl|qwen3_5_moe|deepseek4|deepseek4_compressed|deepseek4_mtp|dots_ocr|qwen2|gemma3|gemma3_vl|gemma4_dense|gemma4_ple|gemma4_moe|lfm2_moe|minimax|mamba2|llama)"
+                "unknown --arch '{other}' (qwen3_5|qwen3_5_vl|qwen3_5_moe|deepseek4|deepseek4_compressed|deepseek4_mtp|dots_ocr|qwen2|gemma3|gemma3_vl|gemma4_dense|gemma4_ple|gemma4_moe|lfm2_moe|minimax|nemotron_h|mamba2|zaya|llama)"
             )),
         }
     }
@@ -121,7 +128,9 @@ impl TinyArch {
             Self::Lfm2Moe => 11,
             Self::Gemma3 => 12,
             Self::Gemma3Vl => 13,
+            Self::NemotronH => 14,
             Self::Mamba2 => 15,
+            Self::Zaya => 16,
             Self::Gemma4Dense | Self::Gemma4Ple | Self::Gemma4Moe => 24,
         }
     }
@@ -144,7 +153,9 @@ impl TinyArch {
             #[cfg(feature = "arch-lfm2moe")]
             Self::Lfm2Moe => "lfm2_moe",
             Self::MiniMax => "minimax",
+            Self::NemotronH => "nemotron_h",
             Self::Mamba2 => "mamba2",
+            Self::Zaya => "zaya",
             Self::Llama => "llama",
         }
     }
@@ -218,8 +229,14 @@ pub enum TinyModel {
         weights: lfm2moe::Lfm2MoeWeights,
         state: lfm2moe::Lfm2MoeState,
     },
+    NemotronH {
+        model: NemotronModel,
+    },
     Mamba2 {
         model: NemotronModel,
+    },
+    Zaya {
+        model: ZayaModel,
     },
     Llama {
         config: LlamaConfig,
@@ -467,6 +484,18 @@ impl TinyModel {
                     state,
                 })
             }
+            TinyArch::NemotronH => {
+                let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+                    .map_err(|e| format!("nemotron_h metadata parse: {e}"))?;
+                let cfg_json = meta
+                    .get("config")
+                    .ok_or("nemotron_h: metadata_json missing 'config'")?;
+                let config = NemotronHConfig::from_json(cfg_json)
+                    .map_err(|e| format!("nemotron_h config: {e}"))?;
+                let model = NemotronModel::from_hfq(gpu, &hfq, config, max_seq)
+                    .map_err(|e| format!("nemotron_h NemotronModel::from_hfq: {e}"))?;
+                Ok(Self::NemotronH { model })
+            }
             TinyArch::Mamba2 => {
                 let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
                     .map_err(|e| format!("mamba2 metadata parse: {e}"))?;
@@ -478,6 +507,18 @@ impl TinyModel {
                 let model = NemotronModel::from_hfq(gpu, &hfq, config, max_seq)
                     .map_err(|e| format!("mamba2 NemotronModel::from_hfq: {e}"))?;
                 Ok(Self::Mamba2 { model })
+            }
+            TinyArch::Zaya => {
+                let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+                    .map_err(|e| format!("zaya metadata parse: {e}"))?;
+                let cfg_json = meta
+                    .get("config")
+                    .ok_or("zaya: metadata_json missing 'config'")?;
+                let config =
+                    ZayaConfig::from_json(cfg_json).map_err(|e| format!("zaya config: {e}"))?;
+                let model = ZayaModel::from_hfq(gpu, &hfq, config, max_seq)
+                    .map_err(|e| format!("zaya ZayaModel::from_hfq: {e}"))?;
+                Ok(Self::Zaya { model })
             }
             TinyArch::Llama => {
                 let config = hipfire_runtime::hfq::config_from_hfq(&hfq)
@@ -518,7 +559,9 @@ impl TinyModel {
             Self::MiniMax { config, .. } => config.vocab_size,
             #[cfg(feature = "arch-lfm2moe")]
             Self::Lfm2Moe { config, .. } => config.vocab_size,
+            Self::NemotronH { model } => model.config().vocab_size,
             Self::Mamba2 { model } => model.config().vocab_size,
+            Self::Zaya { model } => model.config().vocab_size,
             Self::Llama { config, .. } => config.vocab_size,
         }
     }
@@ -778,9 +821,19 @@ impl TinyModel {
                 weights,
                 state,
             } => lfm2moe::forward::decode_step(config, weights, state, gpu, token, pos as u32),
+            Self::NemotronH { model } => model
+                .forward(gpu, token, pos)
+                .map_err(|e| format!("nemotron_h forward: {e:?}")),
             Self::Mamba2 { model } => model
                 .forward(gpu, token, pos)
                 .map_err(|e| format!("mamba2 forward: {e:?}")),
+            Self::Zaya { model } => model
+                .decode_step(gpu, token, pos)
+                .and_then(|_| {
+                    gpu.download_f32(model.logits())
+                        .map_err(|e| format!("dl logits: {e:?}"))
+                })
+                .map_err(|e| format!("zaya forward: {e:?}")),
             Self::Llama {
                 config,
                 weights,
@@ -1004,7 +1057,8 @@ impl TinyModel {
                 }
                 m
             }
-            Self::Mamba2 { model } => model.build_capture_names(),
+            Self::NemotronH { model } | Self::Mamba2 { model } => model.build_capture_names(),
+            Self::Zaya { model } => zaya_gpu::build_capture_names(model.weights()),
             #[cfg(feature = "arch-lfm2moe")]
             Self::Lfm2Moe { weights, .. } => lfm2moe::calibration::build_capture_names(weights),
             Self::Gemma4 { weights, .. } => {
@@ -1102,6 +1156,7 @@ pub struct KldOut {
     pub max_kld: f64,
     pub n_scored: usize,
     pub finite: bool,
+    pub first_nonfinite: Option<String>,
 }
 
 /// Result of an autoregressive tiny forward pass.
@@ -1224,7 +1279,15 @@ pub fn run_kld(
     let mut sum = 0.0f64;
     let mut max = 0.0f64;
     let mut finite = true;
-    for (rp, qp) in refs.iter().zip(cands.iter()) {
+    let mut first_nonfinite = None;
+    for (pos, (rp, qp)) in refs.iter().zip(cands.iter()).enumerate() {
+        if first_nonfinite.is_none() {
+            if let Some((i, v)) = rp.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                first_nonfinite = Some(format!("ref position {pos} logit {i} = {v}"));
+            } else if let Some((i, v)) = qp.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                first_nonfinite = Some(format!("cand position {pos} logit {i} = {v}"));
+            }
+        }
         let lr = log_softmax(rp);
         let lq = log_softmax(qp);
         // KL = Σ p·(log p − log q), p = exp(lr).
@@ -1249,6 +1312,7 @@ pub fn run_kld(
         max_kld: max,
         n_scored: n,
         finite,
+        first_nonfinite,
     })
 }
 
@@ -1273,6 +1337,32 @@ pub fn run_collect(
 ) -> Result<CollectOut, String> {
     let tokens = synthetic_tokens(len, seed);
     let mut model = TinyModel::load(arch, model_path, gpu, tokens.len() + 16)?;
+
+    if let TinyModel::Zaya { model } = &model {
+        let opts = zaya_calib::CalibOpts {
+            kldref: false,
+            kldref_topk: 64,
+        };
+        let provenance = vec![
+            ("source", serde_json::json!("tiny_quant_probe")),
+            ("arch", serde_json::json!(arch.as_str())),
+            ("n_calib_tokens", serde_json::json!(tokens.len())),
+        ];
+        let summary = zaya_calib::collect_calibration_artifacts(
+            gpu,
+            model.weights(),
+            model.config(),
+            &tokens,
+            &opts,
+            out_path,
+            &provenance,
+        )?;
+        return Ok(CollectOut {
+            n_tensors: summary.n_hessian + summary.n_imatrix,
+            consistency: summary.max_consistency,
+            out_path: out_path.display().to_string(),
+        });
+    }
 
     // Routed experts (if any) would be imatrix-only, but we don't name them, so
     // a plain collector suffices — only the named dense linears are captured.

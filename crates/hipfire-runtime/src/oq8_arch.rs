@@ -211,6 +211,9 @@ mod tests {
         // A non-OQ8-family code (13 = MQ4G256) falls through so callers try their
         // own arms.
         assert!(oq8_arch_load(QuantType::MQ4G256.code(), &data, 1, 256).is_none());
+        // qt 43 is the NPU-only ragged OQ8 layout. GPU loaders must not treat it
+        // as the dense combined Oq8G256 layout.
+        assert!(oq8_arch_load(QuantType::Oq8G256RowPadded.code(), &data, 1, 256).is_none());
     }
 
     #[test]

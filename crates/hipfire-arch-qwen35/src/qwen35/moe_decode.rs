@@ -810,6 +810,95 @@ pub(crate) fn moe_ffn_decode_impl(
     };
     // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
     // the dtype snapshot + k; the executor computes MoeResolution from MoeDtypes.
+    let run_centralized_moe = |gpu: &mut Gpu| -> HipResult<()> {
+        // Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in
+        // `run_moe_decode` (k != 8 OR routed dtype not indexable). Empty in paged
+        // mode (`ffn.experts` is empty — only the indexed GPU-top-K path runs
+        // there), matching master's `ffn.experts[..]` indexing requirement.
+        let routed_experts: Vec<(
+            hipfire_dispatch::families::gemv::WeightRef<'_>,
+            hipfire_dispatch::families::gemv::WeightRef<'_>,
+        )> = ffn
+            .experts
+            .iter()
+            .map(|e| (e.gate_up.dispatch_ref(), e.down.dispatch_ref()))
+            .collect();
+
+        let moe_params = hipfire_dispatch::families::moe::MoeParams {
+            dtypes: moe_dtypes,
+            batch_size: 1,
+            hidden,
+            mi,
+            smi,
+            k,
+            n_exp,
+            norm_topk_prob: config.norm_topk_prob,
+            x_rot_prerotated,
+            x_norm,
+            x_residual,
+            routed_out: ep_routed_out,
+            skip_shared: ep_skip_shared,
+            router: ffn.router.dispatch_ref(),
+            shared_expert_gate: ffn.shared_expert_gate.dispatch_ref(),
+            shared_gate_w: ffn.shared_expert.gate.dispatch_ref(),
+            shared_up_w: ffn.shared_expert.up.dispatch_ref(),
+            shared_down_w: ffn.shared_expert.down.dispatch_ref(),
+            expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
+            expert_down_ptrs: &ffn.expert_down_ptrs,
+            routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
+            routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
+            routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
+            routed_experts: &routed_experts,
+            routed_gate_up_paro: ffn.experts.first().and_then(|e| {
+                e.gate_up
+                    .paro
+                    .as_ref()
+                    .map(|p| hipfire_dispatch::families::gemv::GivensRef {
+                        pairs: &p.pairs,
+                        theta: &p.theta,
+                        scales: &p.channel_scales,
+                        krot: p.krot as usize,
+                    })
+            }),
+            routed_down_paro: ffn.experts.first().and_then(|e| {
+                e.down
+                    .paro
+                    .as_ref()
+                    .map(|p| hipfire_dispatch::families::gemv::GivensRef {
+                        pairs: &p.pairs,
+                        theta: &p.theta,
+                        scales: &p.channel_scales,
+                        krot: p.krot as usize,
+                    })
+            }),
+            router_logits: s.router_logits,
+            scalar_buf: s.scalar_buf,
+            x_rot_local: s.x_rot_local,
+            gate_up_buf: s.gate_up_buf,
+            gate_buf: s.gate_buf,
+            up_buf: s.up_buf,
+            ffn_hidden: s.ffn_hidden,
+            ffn_out: s.ffn_out,
+            gate_batch: s.gate_batch,
+            up_batch: s.up_batch,
+            rot_batch: s.rot_batch,
+            topk_indices: s.topk_indices,
+            topk_weights: s.topk_weights,
+            down_expanded: s.down_expanded,
+        };
+        let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+        hipfire_runtime::dispatch::moe_family()
+            .run(&ctx, gpu, &moe_params)
+            .map_err(HipError::from)?;
+        Ok(())
+    };
+    if std::env::var("HIPFIRE_QWEN35_MOE_LEGACY_INLINE")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return run_centralized_moe(gpu);
+    }
 
     // ── 1+2b+3a. Fused 4-way GEMV (router + shared_expert_gate + shared.gate + shared.up) ──
     // All four read the SAME rotated x_rot_local with the SAME K. Fusing them
@@ -1127,33 +1216,58 @@ pub(crate) fn moe_ffn_decode_impl(
             )?;
         } else if routed_dtype_indexable_oq4 {
             // Opus Quant W4A4 indexed gate_up (132 B/group kernel blocks; xr is
-            // FWHT-rotated above, same as the MQ path). Batched variant (batch=1)
-            // — the single-token sibling is unused by the coherent LFM2 path.
-            gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
-                &ffn.expert_gate_up_ptrs,
-                s.topk_indices,
-                xr,
-                s.gate_batch,
-                s.up_batch,
-                2 * mi,
-                gate_up_k,
-                k,
-                1,
-            )?;
+            // FWHT-rotated above, same as the MQ path). Resident decode is a
+            // single token, so use the single-token kernel; paged decode keeps
+            // the batched layout because its top-k buffer is [N x K_TOP].
+            if ffn.experts.is_empty() {
+                gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
+                    &ffn.expert_gate_up_ptrs,
+                    s.topk_indices,
+                    xr,
+                    s.gate_batch,
+                    s.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    k,
+                    1,
+                )?;
+            } else {
+                gpu.gemv_oq4g256_moe_gate_up_k8_indexed(
+                    &ffn.expert_gate_up_ptrs,
+                    s.topk_indices,
+                    xr,
+                    s.gate_batch,
+                    s.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                )?;
+            }
         } else if routed_dtype_indexable_oq8 {
             // Opus Quant W8A8 indexed gate_up (260 B/group kernel blocks, from
             // OqPlusCompact-expanded experts).
-            gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
-                &ffn.expert_gate_up_ptrs,
-                s.topk_indices,
-                xr,
-                s.gate_batch,
-                s.up_batch,
-                2 * mi,
-                gate_up_k,
-                k,
-                1,
-            )?;
+            if ffn.experts.is_empty() {
+                gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+                    &ffn.expert_gate_up_ptrs,
+                    s.topk_indices,
+                    xr,
+                    s.gate_batch,
+                    s.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    k,
+                    1,
+                )?;
+            } else {
+                gpu.gemv_oq8g256_moe_gate_up_k8_indexed(
+                    &ffn.expert_gate_up_ptrs,
+                    s.topk_indices,
+                    xr,
+                    s.gate_batch,
+                    s.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                )?;
+            }
         } else {
             // routed_dtype_indexable_paro — HFQ4G128 (72 B/group) indexed
             // kernel. xr is already Givens-rotated above by rotate_x_paro_for.
@@ -1435,6 +1549,13 @@ pub(crate) fn moe_ffn_decode_impl(
                 }
             }
         }
+    }
+    if std::env::var("HIPFIRE_QWEN35_MOE_LEGACY_INLINE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        return Ok(());
     }
     // Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in
     // `run_moe_decode` (k != 8 OR routed dtype not indexable). Empty in paged

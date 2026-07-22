@@ -1867,18 +1867,9 @@ mod tests {
     fn drafter_state_quant_defaults_to_auto_with_explicit_overrides() {
         use qwen35::StateQuant;
 
-        assert_eq!(
-            parse_drafter_state_quant(None).unwrap(),
-            None
-        );
-        assert_eq!(
-            parse_drafter_state_quant(Some("auto")).unwrap(),
-            None
-        );
-        assert_eq!(
-            parse_drafter_state_quant(Some("")).unwrap(),
-            None
-        );
+        assert_eq!(parse_drafter_state_quant(None).unwrap(), None);
+        assert_eq!(parse_drafter_state_quant(Some("auto")).unwrap(), None);
+        assert_eq!(parse_drafter_state_quant(Some("")).unwrap(), None);
         assert_eq!(
             parse_drafter_state_quant(Some("q8")).unwrap(),
             Some(StateQuant::Q8)

@@ -854,6 +854,28 @@ fn moe_res_mq6_routed_indexable() {
 }
 
 #[test]
+fn moe_res_oq_routed_defaults_to_cpu_fallback() {
+    let mut d = dtypes_all_mq4();
+    d.routed_gate_up = DType::Oq8G256;
+    d.routed_down = DType::Oq8G256;
+    let r = MoeResolution::resolve_with_oq_indexed(&d, 8, false);
+    assert!(!r.routed_indexable_oq8);
+    assert!(!r.use_gpu_topk);
+    assert!(r.needs_x_rot_local);
+}
+
+#[test]
+fn moe_res_oq_routed_opt_in_uses_indexed_path() {
+    let mut d = dtypes_all_mq4();
+    d.routed_gate_up = DType::Oq4G256;
+    d.routed_down = DType::Oq4G256;
+    let r = MoeResolution::resolve_with_oq_indexed(&d, 8, true);
+    assert!(r.routed_indexable_oq4);
+    assert!(r.use_gpu_topk);
+    assert!(r.needs_x_rot_local);
+}
+
+#[test]
 fn moe_decode_oplist_prefix_matches_gate_side() {
     // The 4-way fused gate-side projection is capturable as a length-1 prefix.
     let oplist = [
