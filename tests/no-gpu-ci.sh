@@ -30,6 +30,9 @@ bash tests/fixture-roundtrip-nogpu.sh
 echo "== Tiny affected-file selector (no GPU) =="
 bash tests/tiny-affected-gate-nogpu.sh
 
+echo "== Resident/streamed parity workflow (no GPU) =="
+bash tests/resident-streamed-parity-nogpu.sh
+
 echo "== Eval harness no-GPU smoke =="
 cargo build -p hipfire-eval
 HIPFIRE_EVAL_BIN="$ROOT/target/debug/hipfire-eval" bash tests/smoke/eval-harness-nogpu-smoke.sh
