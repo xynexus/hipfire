@@ -190,9 +190,16 @@ def _reference_identity(path: Path) -> dict:
             "data_offset": data_offset,
             "sha256": _sha256_region(resolved, data_offset),
         }
+    return _complete_file_identity(resolved, label="reference model")
+
+
+def _complete_file_identity(path: Path, *, label: str) -> dict:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        raise ValueError(f"{label} does not exist: {resolved}")
     return {
         "kind": "complete_file",
-        "bytes": size,
+        "bytes": resolved.stat().st_size,
         "sha256": _sha256_file(resolved),
     }
 
@@ -383,7 +390,10 @@ def verify_plan(plan, *, current_engine=None) -> dict:
         reference_kldref = Path(reference_kldref_record.get("path", ""))
         if not reference_kldref.is_file():
             raise ValueError(f"reference KLDREF is missing: {reference_kldref}")
-        if reference_kldref_record.get("identity") != _reference_identity(reference_kldref):
+        if reference_kldref_record.get("identity") != _complete_file_identity(
+            reference_kldref,
+            label="reference KLDREF",
+        ):
             raise ValueError("reference KLDREF identity drift")
 
     planned_engine = plan.get("engine", {}).get("fingerprint_id")
@@ -984,6 +994,6 @@ def build_plan(
     if reference_kldref is not None:
         body["reference_kldref"] = {
             "path": str(reference_kldref.resolve()),
-            "identity": _reference_identity(reference_kldref),
+            "identity": _complete_file_identity(reference_kldref, label="reference KLDREF"),
         }
     return {**body, "plan_fingerprint": _plan_fingerprint(body)}

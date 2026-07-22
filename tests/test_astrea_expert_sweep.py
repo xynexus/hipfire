@@ -162,8 +162,8 @@ def test_floor_sweep_freezes_one_axis_and_heldout_commands(tmp_path):
 def test_floor_sweep_can_bind_one_shared_kld_reference(tmp_path):
     sweep = load_module()
     inputs = common_inputs(tmp_path)
-    shared_kldref = tmp_path / "heldout.oq8.kldref"
-    shared_kldref.write_bytes(b"HFKREF\0shared-reference")
+    shared_kldref = tmp_path / "heldout.oq8.kldref.hfq"
+    write_hfq_fixture(shared_kldref, control=b'{"kind":"kldref"}\0')
     inputs["reference_kldref"] = shared_kldref
     inputs["evaluation_command_template"] = (
         "hipfire eval --model {candidate} --kldref {reference_kldref} "
@@ -199,7 +199,8 @@ def test_floor_sweep_can_bind_one_shared_kld_reference(tmp_path):
             fixed_capture_target=4096,
         )
 
-    shared_kldref.write_bytes(b"HFKREF\0changed")
+    original = shared_kldref.read_bytes()
+    shared_kldref.write_bytes(original[:-1] + bytes([original[-1] ^ 0xFF]))
     with pytest.raises(ValueError, match="reference KLDREF identity drift"):
         sweep.verify_plan(plan, current_engine={"fingerprint_id": "sha256:engine"})
 
