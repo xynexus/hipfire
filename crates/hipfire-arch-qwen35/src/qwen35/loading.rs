@@ -3340,20 +3340,8 @@ impl hipfire_runtime::calibration::CalibratableBackend for Qwen35CalibBackend<'_
         provenance: &[(&str, serde_json::Value)],
     ) -> Result<CalibSummary, String> {
         let provenance = hipfire_runtime::calibration::calibration_job_provenance(job, provenance)?;
-        let opts = CalibOpts {
-            kldref: job.options.kldref,
-            kldref_topk: job.options.kldref_top_k,
-        };
-        collect_calibration_artifacts_samples(
-            gpu,
-            self.weights,
-            self.config,
-            &job.samples,
-            &opts,
-            output,
-            &provenance,
-        )
-        .map_err(|e| e.to_string())
+        collect_calibration_artifacts_job(gpu, self.weights, self.config, job, output, &provenance)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -3406,6 +3394,320 @@ pub fn collect_calibration_artifacts_samples(
     collect_calibration_artifacts_sequences(
         gpu, weights, config, &sequences, false, opts, output, provenance,
     )
+}
+
+pub(crate) fn resident_calibration_geometry(
+    options: &hipfire_runtime::calibration::contracts::CalibrationOptions,
+) -> Result<
+    hipfire_runtime::calibration::schedule::MicrobatchGeometry,
+    hipfire_runtime::calibration::contracts::CalibError,
+> {
+    use hipfire_runtime::calibration::contracts::CalibError;
+    use hipfire_runtime::calibration::schedule::MicrobatchGeometry;
+
+    let (Some(sequence_batch), Some(time_tile)) = (options.sequence_batch, options.time_tile)
+    else {
+        return Err(CalibError::InvalidOptions(
+            "resident calibration parity requires resolved sequence_batch and time_tile".into(),
+        ));
+    };
+    MicrobatchGeometry {
+        sequence_batch,
+        time_tile,
+        row_budget: options.max_rows,
+    }
+    .validate()
+}
+
+pub(crate) fn resident_calibration_rows_match_frozen_schedule(
+    sequence_start: usize,
+    resident: &[DensePrefillSessionBatchPrefixRowSlot],
+    frozen: &[hipfire_runtime::calibration::contracts::SampleRow],
+) -> bool {
+    resident.len() == frozen.len()
+        && resident.iter().zip(frozen).all(|(resident, frozen)| {
+            sequence_start.checked_add(resident.session_index) == Some(frozen.sample_index)
+                && resident.token == frozen.token
+                && resident.position == frozen.position
+        })
+}
+
+struct ResidentCalibrationSessionState {
+    kv: kv::KvCache,
+    delta: DeltaNetState,
+    logits: GpuTensor,
+}
+
+fn free_resident_calibration_sessions(
+    gpu: &mut Gpu,
+    sessions: &mut Vec<ResidentCalibrationSessionState>,
+) {
+    for session in sessions.drain(..) {
+        session.kv.free_gpu(gpu);
+        session.delta.free_gpu(gpu);
+        let _ = gpu.free_tensor(session.logits);
+    }
+}
+
+/// Resident parity oracle for a frozen native job. Dense Qwen uses the same
+/// family-neutral sequence/time schedule and the same explicit logical capture
+/// registry as the layer-streamed engine, while retaining all model weights in
+/// one load. MoE remains on the historical serial oracle until the resident
+/// grouped path also carries quota telemetry.
+pub fn collect_calibration_artifacts_job(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    job: &hipfire_runtime::calibration::contracts::CalibrationJob,
+    output: &std::path::Path,
+    provenance: &[(&str, serde_json::Value)],
+) -> HipResult<CalibSummary> {
+    let opts = CalibOpts {
+        kldref: job.options.kldref,
+        kldref_topk: job.options.kldref_top_k,
+    };
+    if config.num_experts != 0 || job.samples.samples().len() < 2 {
+        return collect_calibration_artifacts_samples(
+            gpu,
+            weights,
+            config,
+            &job.samples,
+            &opts,
+            output,
+            provenance,
+        );
+    }
+
+    use hipfire_runtime::calibration::contracts::{KldRefBuilder, KldRefRow};
+    use hipfire_runtime::calibration::schedule::MicrobatchPlanner;
+    use hipfire_runtime::calibration::{arm, disarm, finish, logsumexp, topk_logits, CalibForward};
+    use hipfire_runtime::hfq::HfqMemTensor;
+
+    let geometry = resident_calibration_geometry(&job.options)
+        .map_err(|error| HipError::new(0, &error.to_string()))?;
+    let batches = MicrobatchPlanner::new(geometry)
+        .map_err(|error| HipError::new(0, &error.to_string()))?
+        .plan(&job.samples);
+    let registry =
+        crate::calibration_stream::qwen35_capture_registry(config, job.options.expert_quota)
+            .map_err(|error| HipError::new(0, &error.to_string()))?;
+    let pbs = match PrefillBatchScratch::new(gpu, config, geometry.row_budget) {
+        Ok(pbs) => pbs,
+        Err(error) => return Err(error),
+    };
+    let mut batch_logits = if opts.kldref {
+        match geometry
+            .row_budget
+            .checked_mul(config.vocab_size)
+            .ok_or_else(|| HipError::new(0, "resident KLD logits shape overflows usize"))
+            .and_then(|values| gpu.alloc_tensor(&[values], DType::F32))
+        {
+            Ok(logits) => Some(logits),
+            Err(error) => {
+                pbs.free_gpu(gpu);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    let collector = arm(gpu, std::collections::HashMap::new(), Vec::new());
+    let mut sessions = Vec::<ResidentCalibrationSessionState>::new();
+    let mut active_sequence_start = None;
+
+    let forward_result = (|| -> Result<CalibForward, String> {
+        let mut kldref = if opts.kldref {
+            Some(KldRefBuilder::new(opts.kldref_topk).map_err(|error| error.to_string())?)
+        } else {
+            None
+        };
+        let n_tok = job.samples.total_rows();
+        let progress_started = std::time::Instant::now();
+        let mut last_progress = progress_started;
+        let mut completed = 0usize;
+
+        for batch in &batches {
+            if active_sequence_start != Some(batch.sequence_start) {
+                free_resident_calibration_sessions(gpu, &mut sessions);
+                for sample in &job.samples.samples()[batch.sequence_start..batch.sequence_end] {
+                    let kv = kv::KvCache::new_gpu(
+                        gpu,
+                        config.n_layers,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        sample.tokens.len().max(1),
+                    )
+                    .map_err(|error| format!("resident calibration KV: {error}"))?;
+                    let delta = match DeltaNetState::new_with_quant(gpu, config, StateQuant::FP32) {
+                        Ok(delta) => delta,
+                        Err(error) => {
+                            kv.free_gpu(gpu);
+                            return Err(format!("resident calibration DeltaNet state: {error}"));
+                        }
+                    };
+                    let logits = match gpu.zeros(&[config.vocab_size], DType::F32) {
+                        Ok(logits) => logits,
+                        Err(error) => {
+                            kv.free_gpu(gpu);
+                            delta.free_gpu(gpu);
+                            return Err(format!("resident calibration logits: {error}"));
+                        }
+                    };
+                    sessions.push(ResidentCalibrationSessionState { kv, delta, logits });
+                }
+                active_sequence_start = Some(batch.sequence_start);
+            }
+
+            let mut rows = Vec::with_capacity(sessions.len());
+            for (local, session) in sessions.iter_mut().enumerate() {
+                let sample_index = batch.sequence_start + local;
+                let tokens = &job.samples.samples()[sample_index].tokens;
+                let start = batch.time_start.min(tokens.len());
+                let end = batch.time_end.min(tokens.len());
+                if start < end {
+                    rows.push(DensePrefillSessionBatchRow {
+                        tokens: &tokens[start..end],
+                        start_pos: start,
+                        kv_cache: &mut session.kv,
+                        dn_state: &mut session.delta,
+                        logits: &mut session.logits,
+                    });
+                }
+            }
+            {
+                let inputs = rows
+                    .iter()
+                    .map(|row| DensePrefillSessionBatchInput {
+                        tokens: row.tokens,
+                        start_pos: row.start_pos,
+                    })
+                    .collect::<Vec<_>>();
+                let plan =
+                    build_calibration_session_batch_execution_plan(&inputs, geometry.row_budget)?;
+                let pointer_plan = dense_prefill_session_batch_pointer_table_plan(
+                    &plan,
+                    expected_dense_prefill_session_state_route_shape(config),
+                    inputs.len(),
+                );
+                if !resident_calibration_rows_match_frozen_schedule(
+                    batch.sequence_start,
+                    &pointer_plan.prefix_rows,
+                    &batch.rows,
+                ) {
+                    return Err(
+                        "resident calibration row order differs from the frozen native schedule"
+                            .into(),
+                    );
+                }
+            }
+            let shape = forward_prefill_dense_session_batch_with_capture(
+                gpu, weights, config, &mut rows, &pbs, &collector, &registry,
+            )
+            .map_err(|error| format!("resident calibration batch forward: {error}"))?;
+            drop(rows);
+            if shape.total_tokens != batch.rows.len() {
+                return Err(format!(
+                    "resident calibration batch produced {} rows, expected {}",
+                    shape.total_tokens,
+                    batch.rows.len(),
+                ));
+            }
+
+            if let (Some(builder), Some(logits)) = (kldref.as_mut(), batch_logits.as_ref()) {
+                dense_prefill_session_batch_logits_full_precision(
+                    gpu,
+                    weights,
+                    config,
+                    &pbs,
+                    logits,
+                    batch.rows.len(),
+                )
+                .map_err(|error| format!("resident calibration KLD logits: {error}"))?;
+                let values = gpu
+                    .download_f32(&logits.sub_offset(0, batch.rows.len() * config.vocab_size))
+                    .map_err(|error| format!("resident calibration KLD download: {error}"))?;
+                for (row_index, row) in batch.rows.iter().enumerate() {
+                    if row.position + 1 >= job.samples.samples()[row.sample_index].tokens.len() {
+                        continue;
+                    }
+                    let start = row_index * config.vocab_size;
+                    let row_logits = &values[start..start + config.vocab_size];
+                    let topk = topk_logits(row_logits, opts.kldref_topk);
+                    builder
+                        .push(KldRefRow {
+                            sample_index: row.sample_index,
+                            position: row.position,
+                            indices: topk.iter().map(|(index, _)| *index).collect(),
+                            logits: topk.iter().map(|(_, logit)| *logit).collect(),
+                            log_z: logsumexp(row_logits),
+                        })
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+
+            completed += batch.rows.len();
+            if completed == n_tok || last_progress.elapsed() >= std::time::Duration::from_secs(10) {
+                let elapsed = progress_started.elapsed();
+                let rate = completed as f64 / elapsed.as_secs_f64().max(1e-9);
+                eprintln!(
+                    "  resident batch capture: {completed}/{n_tok} tokens ({:.1}%) rate={rate:.2} tok/s",
+                    completed as f64 * 100.0 / n_tok.max(1) as f64,
+                );
+                last_progress = std::time::Instant::now();
+            }
+        }
+
+        let mut artifacts = vec![serde_json::json!("hessian"), serde_json::json!("imatrix")];
+        let mut extra_meta = vec![(
+            "resident_batch_oracle".to_string(),
+            serde_json::json!({
+                "sequence_batch": geometry.sequence_batch,
+                "time_tile": geometry.time_tile,
+                "row_budget": geometry.row_budget,
+                "batches": batches.len(),
+            }),
+        )];
+        let mut extra_tensors = Vec::<HfqMemTensor>::new();
+        if let Some(payload) = kldref
+            .map(KldRefBuilder::finish)
+            .transpose()
+            .map_err(|error| error.to_string())?
+        {
+            extra_tensors = payload.to_hfq_tensors();
+            extra_meta.push(("kldref".to_string(), payload.metadata()));
+            artifacts.push(serde_json::json!("kldref"));
+        }
+        extra_meta.push(("artifacts".to_string(), serde_json::Value::Array(artifacts)));
+        Ok(CalibForward {
+            extra_tensors,
+            extra_meta,
+        })
+    })();
+
+    free_resident_calibration_sessions(gpu, &mut sessions);
+    if let Some(logits) = batch_logits.take() {
+        let _ = gpu.free_tensor(logits);
+    }
+    pbs.free_gpu(gpu);
+    disarm(gpu);
+    let forward_out = match forward_result {
+        Ok(forward_out) => forward_out,
+        Err(error) => {
+            collector.free_gpu(gpu);
+            return Err(HipError::new(0, &error));
+        }
+    };
+    let summary = finish(
+        gpu,
+        &collector,
+        hipfire_model::ARCH_ID_QWEN35_DENSE,
+        output,
+        provenance,
+        &forward_out,
+    )
+    .map_err(|error| HipError::new(0, &error));
+    collector.free_gpu(gpu);
+    summary
 }
 
 /// Emit a bounded resident full-stack post-layer residual probe for the exact

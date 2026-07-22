@@ -697,14 +697,13 @@ pub fn dense_prefill_session_batch_scatter_last_logits(
     )
 }
 
-pub fn dense_prefill_session_batch_final_logits_full_precision(
+pub(crate) fn dense_prefill_session_batch_logits_full_precision(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     pbs: &PrefillBatchScratch,
-    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    batch_logits: &GpuTensor,
     row_count: usize,
-    sessions: usize,
 ) -> HipResult<()> {
     if row_count == 0 {
         return Err(hip_bridge::HipError::new(
@@ -718,6 +717,15 @@ pub fn dense_prefill_session_batch_final_logits_full_precision(
             "dense session prefill final logits row_count exceeds PrefillBatchScratch max_batch",
         ));
     }
+    let expected_logits = row_count.checked_mul(config.vocab_size).ok_or_else(|| {
+        hip_bridge::HipError::new(0, "dense session prefill logits shape overflows usize")
+    })?;
+    if batch_logits.dtype != DType::F32 || batch_logits.numel() < expected_logits {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "dense session prefill logits output is not a large-enough F32 tensor",
+        ));
+    }
 
     let normed_rows = pbs.x_norm_batch.sub_offset(0, row_count * config.dim);
     gpu.rmsnorm_batched(
@@ -729,12 +737,11 @@ pub fn dense_prefill_session_batch_final_logits_full_precision(
         config.norm_eps,
     )?;
 
-    let batch_logits = gpu.alloc_tensor(&[row_count * config.vocab_size], DType::F32)?;
-    let result = match weights.output.gpu_dtype {
+    match weights.output.gpu_dtype {
         DType::F32 => gpu.gemm_f32_register_tiled(
             &weights.output.buf,
             &normed_rows,
-            &batch_logits,
+            batch_logits,
             weights.output.m,
             weights.output.k,
             row_count,
@@ -743,7 +750,7 @@ pub fn dense_prefill_session_batch_final_logits_full_precision(
             gpu,
             &weights.output.buf,
             &normed_rows,
-            &batch_logits,
+            batch_logits,
             weights.output.m,
             weights.output.k,
             row_count,
@@ -751,7 +758,7 @@ pub fn dense_prefill_session_batch_final_logits_full_precision(
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
             &weights.output.buf,
             &normed_rows,
-            &batch_logits,
+            batch_logits,
             weights.output.m,
             weights.output.k,
             row_count,
@@ -764,7 +771,7 @@ pub fn dense_prefill_session_batch_final_logits_full_precision(
                     gpu.gemm_hfq4g256(
                         &weights.output.buf,
                         &rot,
-                        &batch_logits,
+                        batch_logits,
                         weights.output.m,
                         weights.output.k,
                         row_count,
@@ -780,6 +787,26 @@ pub fn dense_prefill_session_batch_final_logits_full_precision(
             ),
         )),
     }
+}
+
+pub fn dense_prefill_session_batch_final_logits_full_precision(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    row_count: usize,
+    sessions: usize,
+) -> HipResult<()> {
+    let batch_logits = gpu.alloc_tensor(&[row_count * config.vocab_size], DType::F32)?;
+    let result = dense_prefill_session_batch_logits_full_precision(
+        gpu,
+        weights,
+        config,
+        pbs,
+        &batch_logits,
+        row_count,
+    )
     .and_then(|()| {
         dense_prefill_session_batch_scatter_last_logits(
             gpu,
@@ -1730,6 +1757,87 @@ pub fn validate_dense_prefill_session_batch_rows_for_config(
     Ok(shape)
 }
 
+fn validate_dense_calibration_session_rows_for_config(
+    rows: &[DensePrefillSessionBatchRow<'_>],
+    pbs: &PrefillBatchScratch,
+    config: &Qwen35Config,
+) -> Result<DensePrefillSessionBatchShape, String> {
+    let Some(first) = rows.first() else {
+        return Err("dense calibration session batch has no active sessions".into());
+    };
+    let expected_signature = DensePrefillSessionBatchStateSignature {
+        kv_physical_cap: first.kv_cache.physical_cap,
+        kv_compact_offset: first.kv_cache.compact_offset,
+        kv_quantized: first.kv_cache.quantized,
+        kv_quant_q8: first.kv_cache.quant_q8,
+        kv_quant_asym2: first.kv_cache.quant_asym2,
+        kv_quant_asym3: first.kv_cache.quant_asym3,
+        kv_quant_asym4: first.kv_cache.quant_asym4,
+        kv_quant_fwht: first.kv_cache.quant_fwht,
+        dn_quant: first.dn_state.quant,
+    };
+    let expected_route = expected_dense_prefill_session_state_route_shape(config);
+    let mut total_tokens = 0usize;
+    let mut max_tokens_per_session = 0usize;
+    for (idx, row) in rows.iter().enumerate() {
+        if row.tokens.is_empty() || row.tokens.len() > pbs.max_batch {
+            return Err(format!(
+                "dense calibration session row {idx} has {} tokens outside 1..={}",
+                row.tokens.len(),
+                pbs.max_batch,
+            ));
+        }
+        if row.logits.numel() == 0 {
+            return Err(format!(
+                "dense calibration session row {idx} has an empty logits tensor"
+            ));
+        }
+        let signature = DensePrefillSessionBatchStateSignature {
+            kv_physical_cap: row.kv_cache.physical_cap,
+            kv_compact_offset: row.kv_cache.compact_offset,
+            kv_quantized: row.kv_cache.quantized,
+            kv_quant_q8: row.kv_cache.quant_q8,
+            kv_quant_asym2: row.kv_cache.quant_asym2,
+            kv_quant_asym3: row.kv_cache.quant_asym3,
+            kv_quant_asym4: row.kv_cache.quant_asym4,
+            kv_quant_fwht: row.kv_cache.quant_fwht,
+            dn_quant: row.dn_state.quant,
+        };
+        if signature != expected_signature {
+            return Err(format!(
+                "dense calibration session row {idx} has incompatible state signature"
+            ));
+        }
+        let route = DensePrefillSessionStateRouteShape {
+            kv_k_layers: row.kv_cache.k_gpu.len(),
+            kv_v_layers: row.kv_cache.v_gpu.len(),
+            dn_s_layers: row.dn_state.s_matrices.len(),
+            dn_scale_layers: row.dn_state.s_scales.len(),
+            dn_conv_layers: row.dn_state.conv_states.len(),
+        };
+        if route != expected_route {
+            return Err(format!(
+                "dense calibration session row {idx} has state route shape {route:?}, expected {expected_route:?}"
+            ));
+        }
+        total_tokens = total_tokens.checked_add(row.tokens.len()).ok_or_else(|| {
+            "dense calibration session total token count overflows usize".to_string()
+        })?;
+        max_tokens_per_session = max_tokens_per_session.max(row.tokens.len());
+    }
+    if total_tokens > pbs.max_batch {
+        return Err(format!(
+            "dense calibration session batch has {total_tokens} rows, exceeding PrefillBatchScratch max_batch={}",
+            pbs.max_batch,
+        ));
+    }
+    Ok(DensePrefillSessionBatchShape {
+        sessions: rows.len(),
+        total_tokens,
+        max_tokens_per_session,
+    })
+}
+
 pub fn build_dense_prefill_session_batch_rounds(
     inputs: &[DensePrefillSessionBatchInput<'_>],
     max_batch: usize,
@@ -2415,6 +2523,11 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
     sessions: usize,
     max_ctx_len: usize,
     kv_q8: bool,
+    finalize_logits: bool,
+    dense_capture: Option<(
+        &hipfire_runtime::calibration::CalibCollector,
+        &hipfire_runtime::calibration::contracts::CaptureRegistry,
+    )>,
 ) -> HipResult<()> {
     forward_dense_session_batch_layers_full_precision(
         gpu,
@@ -2429,23 +2542,49 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
         None,
         None,
         true,
-        true,
-        None,
+        finalize_logits,
+        dense_capture,
         kv_q8,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn forward_prefill_dense_session_batch(
+fn forward_prefill_dense_session_batch_impl(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     rows: &mut [DensePrefillSessionBatchRow<'_>],
-    _scratch: &Qwen35Scratch,
     pbs: &PrefillBatchScratch,
+    finalize_logits: bool,
+    calibration_schedule: bool,
+    dense_capture: Option<(
+        &hipfire_runtime::calibration::CalibCollector,
+        &hipfire_runtime::calibration::contracts::CaptureRegistry,
+    )>,
 ) -> HipResult<DensePrefillSessionBatchShape> {
-    let shape = validate_dense_prefill_session_batch_rows_for_config(rows, pbs, config)
-        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    let shape = if calibration_schedule {
+        validate_dense_calibration_session_rows_for_config(rows, pbs, config)
+    } else {
+        validate_dense_prefill_session_batch_rows_for_config(rows, pbs, config)
+    }
+    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    for (idx, row) in rows.iter().enumerate() {
+        let row_end = row.start_pos.checked_add(row.tokens.len()).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("dense session fused prefix row {idx} position overflows usize"),
+            )
+        })?;
+        if row_end > row.kv_cache.physical_cap {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "dense session fused prefix row {idx} ends at position {row_end}, exceeding KV physical_cap={}",
+                    row.kv_cache.physical_cap,
+                ),
+            ));
+        }
+    }
     let inputs: Vec<DensePrefillSessionBatchInput<'_>> = rows
         .iter()
         .map(|row| DensePrefillSessionBatchInput {
@@ -2453,8 +2592,12 @@ pub fn forward_prefill_dense_session_batch(
             start_pos: row.start_pos,
         })
         .collect();
-    let execution_plan = build_dense_prefill_session_batch_execution_plan(&inputs, pbs.max_batch)
-        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    let execution_plan = if calibration_schedule {
+        build_calibration_session_batch_execution_plan(&inputs, pbs.max_batch)
+    } else {
+        build_dense_prefill_session_batch_execution_plan(&inputs, pbs.max_batch)
+    }
+    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
     let signatures: Vec<DensePrefillSessionBatchStateSignature> = rows
         .iter()
         .map(|row| DensePrefillSessionBatchStateSignature {
@@ -2469,9 +2612,14 @@ pub fn forward_prefill_dense_session_batch(
             dn_quant: row.dn_state.quant,
         })
         .collect();
+    let contract_signatures = if signatures.len() == 1 {
+        vec![signatures[0], signatures[0]]
+    } else {
+        signatures.clone()
+    };
     validate_dense_prefill_session_batch_fused_prefix_full_precision_contract(
         config,
-        &signatures,
+        &contract_signatures,
         &execution_plan,
     )
     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
@@ -2526,18 +2674,6 @@ pub fn forward_prefill_dense_session_batch(
         .max()
         .map(|pos| pos + 1)
         .unwrap_or(1);
-    for (idx, row) in rows.iter().enumerate() {
-        let row_end = row.start_pos + row.tokens.len();
-        if row_end > row.kv_cache.physical_cap {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "dense session fused prefix row {idx} ends at position {row_end}, exceeding KV physical_cap={}",
-                    row.kv_cache.physical_cap,
-                ),
-            ));
-        }
-    }
     // Row signatures are uniform (state-signature contract), so row 0's KV quant
     // decides the per-layer KV write/attention path for the whole batch.
     let kv_q8 = signatures.first().map(|s| s.kv_quant_q8).unwrap_or(false);
@@ -2552,9 +2688,44 @@ pub fn forward_prefill_dense_session_batch(
         rows.len(),
         max_ctx_len,
         kv_q8,
+        finalize_logits,
+        dense_capture,
     );
     device_pointer_tables.free_gpu(gpu);
     result.map(|()| shape)
+}
+
+pub fn forward_prefill_dense_session_batch(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    rows: &mut [DensePrefillSessionBatchRow<'_>],
+    _scratch: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+) -> HipResult<DensePrefillSessionBatchShape> {
+    forward_prefill_dense_session_batch_impl(gpu, weights, config, rows, pbs, true, false, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_prefill_dense_session_batch_with_capture(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    rows: &mut [DensePrefillSessionBatchRow<'_>],
+    pbs: &PrefillBatchScratch,
+    collector: &hipfire_runtime::calibration::CalibCollector,
+    registry: &hipfire_runtime::calibration::contracts::CaptureRegistry,
+) -> HipResult<DensePrefillSessionBatchShape> {
+    forward_prefill_dense_session_batch_impl(
+        gpu,
+        weights,
+        config,
+        rows,
+        pbs,
+        false,
+        true,
+        Some((collector, registry)),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

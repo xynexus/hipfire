@@ -373,12 +373,11 @@ fn main() {
                 .expect("collect resident residual probe");
             }
             let summary = if let Some(parity) = &parity_job {
-                qwen35::collect_calibration_artifacts_samples(
+                qwen35::collect_calibration_artifacts_job(
                     &mut gpu,
                     &weights,
                     &config,
-                    &parity.job.samples,
-                    &opts,
+                    &parity.job,
                     Path::new(&output),
                     &provenance,
                 )

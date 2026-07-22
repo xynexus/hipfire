@@ -3578,6 +3578,60 @@ mod tests {
     }
 
     #[test]
+    fn resident_calibration_geometry_requires_the_frozen_native_batch_shape() {
+        let mut options = hipfire_runtime::calibration::contracts::CalibrationOptions::default();
+        options.sequence_batch = Some(8);
+        options.time_tile = Some(32);
+        options.max_rows = 256;
+        let geometry = resident_calibration_geometry(&options).expect("explicit native geometry");
+        assert_eq!(geometry.sequence_batch, 8);
+        assert_eq!(geometry.time_tile, 32);
+        assert_eq!(geometry.row_budget, 256);
+
+        options.sequence_batch = None;
+        let error = resident_calibration_geometry(&options).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires resolved sequence_batch and time_tile"));
+
+        options.sequence_batch = Some(9);
+        options.time_tile = Some(32);
+        let error = resident_calibration_geometry(&options).unwrap_err();
+        assert!(error.to_string().contains("above row budget"));
+    }
+
+    #[test]
+    fn resident_calibration_row_match_includes_sample_identity() {
+        let resident = [DensePrefillSessionBatchPrefixRowSlot {
+            round_index: 0,
+            round_row_index: 0,
+            session_index: 1,
+            token_index: 0,
+            token: 7,
+            position: 0,
+        }];
+        let correct = [hipfire_runtime::calibration::contracts::SampleRow {
+            sample_index: 5,
+            position: 0,
+            token: 7,
+            reset_state: true,
+        }];
+        assert!(resident_calibration_rows_match_frozen_schedule(
+            4, &resident, &correct
+        ));
+
+        let wrong_sample = [hipfire_runtime::calibration::contracts::SampleRow {
+            sample_index: 4,
+            ..correct[0]
+        }];
+        assert!(!resident_calibration_rows_match_frozen_schedule(
+            4,
+            &resident,
+            &wrong_sample,
+        ));
+    }
+
+    #[test]
     fn moe_router_histogram_records_top1_topk_weights_and_drops() {
         reset_moe_router_histogram(4, 2);
 
