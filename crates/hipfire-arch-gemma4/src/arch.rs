@@ -18,6 +18,7 @@ use hipfire_runtime::arch::{
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvQuantMode;
 use hipfire_runtime::tokenizer::Tokenizer;
+use hipfire_runtime::triattn::LayeredEvictionCtx;
 
 /// Map an operator `kv_mode` string to the gemma4 KV cache mode + KVarN bit width.
 /// gemma4 wires KVarN (variance-normalized K + Q8 V) on the global/full-context
@@ -144,6 +145,7 @@ pub struct Gemma4Backend {
     state: Gemma4DenseState,
     lowered: LoweredForward,
     eos_token_ids: Vec<u32>,
+    eviction: Option<LayeredEvictionCtx>,
 }
 
 impl Gemma4Backend {
@@ -152,6 +154,7 @@ impl Gemma4Backend {
         weights: Gemma4DenseWeights,
         state: Gemma4DenseState,
         mut eos_token_ids: Vec<u32>,
+        eviction: Option<LayeredEvictionCtx>,
     ) -> Self {
         if eos_token_ids.is_empty() {
             eos_token_ids.push(1);
@@ -163,7 +166,17 @@ impl Gemma4Backend {
             state,
             lowered,
             eos_token_ids,
+            eviction,
         }
+    }
+
+    fn maybe_evict(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        if let Some(eviction) = &self.eviction {
+            self.state
+                .maybe_evict(gpu, eviction)
+                .map_err(|error| format!("Gemma 4 CASK eviction: {error:?}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -180,6 +193,7 @@ impl SimpleAr for Gemma4Backend {
                 token,
             )
             .map_err(|error| format!("Gemma 4 prefill: {error:?}"))?;
+            self.maybe_evict(gpu)?;
         }
         Ok(())
     }
@@ -199,7 +213,8 @@ impl SimpleAr for Gemma4Backend {
             &self.lowered,
             token,
         )
-        .map_err(|error| format!("Gemma 4 decode: {error:?}"))
+        .map_err(|error| format!("Gemma 4 decode: {error:?}"))?;
+        self.maybe_evict(gpu)
     }
 
     fn logits(&self) -> &GpuTensor {
@@ -243,7 +258,10 @@ impl ServingBackend for Gemma4Backend {
     }
 
     fn unload(self: Box<Self>, gpu: &mut Gpu) {
-        let backend = *self;
+        let mut backend = *self;
+        if let Some(eviction) = backend.eviction.take() {
+            eviction.free_gpu(gpu);
+        }
         backend.state.free_gpu(gpu);
         backend.weights.free_gpu(gpu);
     }
@@ -278,16 +296,55 @@ impl ServingFactory for Gemma4ServingFactory {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&value| value > 0)
             .unwrap_or(2048);
-        let physical_cap =
-            bounded_physical_cap(options.max_seq, config.max_position_embeddings, default_cap)?;
+        let physical_cap = if options.triattn.is_some() {
+            options
+                .physical_cap
+                .ok_or("Gemma 4 CASK load requires an explicit physical KV capacity")?
+        } else {
+            bounded_physical_cap(options.max_seq, config.max_position_embeddings, default_cap)?
+        };
         let eos_token_ids = generation_eos_ids_from_hfq(hfq);
         let instruction_tuned = eos_token_ids.len() > 1;
         let weights = load_dense_weights(hfq, gpu, &config)
             .map_err(|error| format!("Gemma 4 weights: {error:?}"))?;
         let (kv_mode, kvarn_bits) = gemma4_kv_mode(options.kv_mode);
-        let state =
-            Gemma4DenseState::new_with_kv_mode(gpu, &config, physical_cap, kv_mode, kvarn_bits)
-                .map_err(|error| format!("Gemma 4 state: {error:?}"))?;
+        if options.triattn.is_some() && kv_mode != KvQuantMode::Unquantized {
+            return Err(
+                "Gemma 4 heterogeneous CASK currently requires fp32 KV; packed KVarN scoring is not implemented"
+                    .into(),
+            );
+        }
+        let state = Gemma4DenseState::new_with_kv_mode_capped(
+            gpu,
+            &config,
+            options.max_seq,
+            physical_cap,
+            kv_mode,
+            kvarn_bits,
+        )
+        .map_err(|error| format!("Gemma 4 state: {error:?}"))?;
+        let eviction = options
+            .triattn
+            .map(|artifact| {
+                if artifact.metadata.model_arch_id != Gemma4::arch_id()
+                    || artifact.metadata.model_layers as usize != config.num_hidden_layers
+                {
+                    return Err(format!(
+                        "Gemma 4 CASK identity mismatch: arch={} layers={}, expected arch={} layers={}",
+                        artifact.metadata.model_arch_id,
+                        artifact.metadata.model_layers,
+                        Gemma4::arch_id(),
+                        config.num_hidden_layers
+                    ));
+                }
+                state.build_eviction(
+                    gpu,
+                    artifact,
+                    options.cask_budget,
+                    options.cask_beta,
+                )
+            })
+            .transpose()?;
         let shape = ModelShapeProfile {
             hidden_size: config.hidden_size,
             num_layers: config.num_hidden_layers,
@@ -306,7 +363,13 @@ impl ServingFactory for Gemma4ServingFactory {
             require_official_template: instruction_tuned,
         };
         Ok(FactoryLoadedBackend {
-            backend: Box::new(Gemma4Backend::new(config, weights, state, eos_token_ids)),
+            backend: Box::new(Gemma4Backend::new(
+                config,
+                weights,
+                state,
+                eos_token_ids,
+                eviction,
+            )),
             family: self.family(),
             shape,
             profile,
