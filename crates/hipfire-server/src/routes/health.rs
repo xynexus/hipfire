@@ -34,19 +34,40 @@ pub async fn get_load_progress() -> Json<Value> {
 }
 
 pub async fn get_health(state: State<SharedState>) -> Json<Value> {
+    // Bound health assembly: a busy server (mid-generation, holding the runtime and
+    // the scheduler/telemetry locks this payload reads) answers "alive but busy"
+    // fast instead of blocking. A stall here otherwise reads as a *wedge* to
+    // monitors when the server is merely generating.
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(750),
+        assemble_health_json(&state),
+    )
+    .await
+    {
+        Ok(payload) => Json(payload),
+        Err(_) => Json(json!({
+            "status": "ok",
+            "busy": true,
+            "version": hipfire_build_info::VERSION,
+            "pid": std::process::id(),
+        })),
+    }
+}
+
+async fn assemble_health_json(state: &SharedState) -> Value {
     let loaded = {
         let loaded = state.loaded_model_path.lock().await;
         loaded.clone()
     };
-    let diffusion = diffusion_health_payload(&state).await;
+    let diffusion = diffusion_health_payload(state).await;
     let active_model = loaded
         .clone()
         .or_else(|| diffusion_active_model(&diffusion));
-    let scheduler_resources = scheduler_resource_health_payload(&state).await;
+    let scheduler_resources = scheduler_resource_health_payload(state).await;
     let prefill_queue_size = state.prefill_scheduler.lock().await.size();
     let selected_prefill_requests = state.selected_prefill_requests.lock().await.len();
-    let accelerator_inventory = server_accelerator_inventory(&state).await;
-    let runtime_workers = runtime_workers_health_payload(&state, &accelerator_inventory).await;
+    let accelerator_inventory = server_accelerator_inventory(state).await;
+    let runtime_workers = runtime_workers_health_payload(state, &accelerator_inventory).await;
     let scheduler_env = scheduler_env_from_process();
     // When continuous batching is enabled, the batch runner owns live counters
     // (residency, selected batch size, decode backend). Surface them here so
@@ -92,7 +113,7 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
             );
         }
     }
-    Json(json!({
+    json!({
         "status": "ok",
         "version": hipfire_build_info::VERSION,
         "model": loaded,
@@ -117,8 +138,8 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         "state_cache": server_state_cache_health_json(&scheduler_env),
         "deferred_jobs": crate::deferred_jobs::deferred_jobs_health_json(),
         "runtime_workers": runtime_workers,
-        "batches": batch_health_payload(&state).await,
-    }))
+        "batches": batch_health_payload(state).await,
+    })
 }
 
 async fn diffusion_health_payload(state: &SharedState) -> Value {
