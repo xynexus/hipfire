@@ -372,6 +372,7 @@ def build_commands(
     sampling_seed: int,
     expert_coverage_policy: str,
     quant_args: list[str],
+    cask_output: Path | None = None,
 ) -> tuple[list[str], list[str]]:
     collect_cmd = [
         coexistence,
@@ -409,8 +410,11 @@ def build_commands(
         str(sampling_seed),
         "--expert-coverage-policy",
         expert_coverage_policy,
-        "--resume",
     ]
+    if cask_output is not None:
+        collect_cmd.extend(["--cask-output", str(cask_output)])
+    else:
+        collect_cmd.append("--resume")
     quant_cmd = [
         quantizer,
         "--input",
@@ -435,6 +439,11 @@ def scope_gpu_commands(hipfire: str, collect_cmd: list[str], quant_cmd: list[str
     # another process-level lock would deadlock against its own child. The
     # quantizer has no internal guard, so the workflow owns that lock exactly once.
     return collect_cmd, [hipfire, "lock", "run", "two-pass-quantization", "--", *quant_cmd]
+
+
+def effective_calibration_segment_layers(requested: int, cask_output: Path | None) -> int:
+    """CASK accumulation is process-local and cannot cross resume boundaries."""
+    return 0 if cask_output is not None else requested
 
 
 def _utc_now() -> str:
@@ -470,6 +479,7 @@ def recipe_manifest(
     sampling_seed: int,
     expert_coverage_policy: str,
     quant_args: list[str],
+    cask_output: Path | None = None,
 ) -> dict:
     recipe = {
         "model": str(model.resolve()),
@@ -493,6 +503,8 @@ def recipe_manifest(
         "expert_coverage_policy": expert_coverage_policy.replace("-", "_"),
         "quant_args": quant_args,
     }
+    if cask_output is not None:
+        recipe["cask_artifact"] = str(cask_output.resolve())
     encoded = json.dumps(recipe, sort_keys=True, separators=(",", ":")).encode()
     return {**recipe, "recipe_fingerprint": f"sha256:{hashlib.sha256(encoded).hexdigest()}"}
 
@@ -546,6 +558,7 @@ def update_manifest(
     phase: str,
     calibration: dict | None = None,
     calibration_audit: dict | None = None,
+    cask: dict | None = None,
     storage_preflight: dict | None = None,
     quantized: dict | None = None,
     calibration_execution: dict | None = None,
@@ -578,6 +591,10 @@ def update_manifest(
         manifest["calibration_audit"] = calibration_audit
     elif calibration is None and "calibration_audit" in previous:
         manifest["calibration_audit"] = previous["calibration_audit"]
+    if cask is not None:
+        manifest["cask"] = cask
+    elif "cask" in previous:
+        manifest["cask"] = previous["cask"]
     if storage_preflight is not None:
         manifest["pass_two_storage_preflight"] = storage_preflight
     elif "pass_two_storage_preflight" in previous:
@@ -603,6 +620,7 @@ def update_manifest(
         manifest["failure"] = failure
 
     calibration_value = calibration or manifest.get("calibration")
+    cask_value = cask or manifest.get("cask")
     quantized_value = quantized or manifest.get("quantized")
     fingerprints = {
         "calibration_artifact": _get(calibration_value, "artifact_fingerprint"),
@@ -610,6 +628,7 @@ def update_manifest(
         "calibration_run": _get(calibration_value, "metadata", "run_fingerprint"),
         "source": _get(calibration_value, "metadata", "source_manifest", "fingerprint"),
         "samples": _get(calibration_value, "metadata", "job", "samples", "fingerprint"),
+        "cask_artifact": _get(cask_value, "artifact_fingerprint"),
         "quantized_artifact": _get(quantized_value, "artifact_fingerprint"),
         "quantized_payload": _get(quantized_value, "metadata", "quantization_hash", "value"),
     }
@@ -1009,6 +1028,23 @@ def validate_calibration_audit(audit: dict, inspection: dict) -> None:
         raise RuntimeError("native calibration structural audit has an unknown evidence scope")
 
 
+def validate_cask_inspection(cask: dict, calibration: dict) -> None:
+    metadata = cask.get("metadata")
+    if not isinstance(metadata, dict):
+        raise RuntimeError("CASK artifact has no metadata object")
+    if metadata.get("artifact_kind") != "triattn":
+        raise RuntimeError("CASK artifact does not declare artifact_kind=triattn")
+    if metadata.get("package_schema") != "hipfire.triattn.v2":
+        raise RuntimeError("CASK artifact is not canonical hipfire.triattn.v2 HFQM")
+    if cask.get("arch_id") != calibration.get("arch_id"):
+        raise RuntimeError(
+            f"CASK arch {cask.get('arch_id')!r} differs from calibration arch {calibration.get('arch_id')!r}"
+        )
+    layers = metadata.get("layers")
+    if not isinstance(layers, list) or not layers:
+        raise RuntimeError("CASK artifact has no per-layer center records")
+
+
 def validate_quantized_inspection(inspection: dict) -> None:
     metadata = inspection.get("metadata", {})
     if not _get(metadata, "quantization_hash", "value"):
@@ -1022,6 +1058,11 @@ def main() -> None:
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--calib", required=True, type=Path, help="Output ending in .calib.hfq.")
     parser.add_argument("--output", required=True, type=Path, help="Canonical quantized .hfq output.")
+    parser.add_argument(
+        "--cask-output",
+        type=Path,
+        help="Optional canonical heterogeneous TriAttention HFQM emitted by pass 1.",
+    )
     parser.add_argument("--manifest", type=Path, help="Atomic two-pass provenance manifest output.")
     parser.add_argument(
         "--format",
@@ -1144,6 +1185,7 @@ def main() -> None:
         sampling_seed=args.sampling_seed,
         expert_coverage_policy=args.expert_coverage_policy,
         quant_args=quant_args,
+        cask_output=args.cask_output,
     )
 
     collect_cmd, quant_cmd = build_commands(
@@ -1168,13 +1210,23 @@ def main() -> None:
         sampling_seed=args.sampling_seed,
         expert_coverage_policy=args.expert_coverage_policy,
         quant_args=quant_args,
+        cask_output=args.cask_output,
     )
     collect_exec, quant_exec = scope_gpu_commands(args.hipfire, collect_cmd, quant_cmd)
+    # Layered CASK accumulation is intentionally process-local: a resumed
+    # calibration would have no durable center accumulator for earlier layers.
+    # Selecting CASK therefore implies one uninterrupted pass even though the
+    # ordinary calibration wrapper defaults to segmented execution.
+    effective_segment_layers = effective_calibration_segment_layers(
+        args.calibration_segment_layers, args.cask_output
+    )
     if not args.skip_calib:
         _print_command("pass 1/2", collect_exec)
     else:
         if not args.calib.is_file() and not args.dry_run:
             parser.error(f"--skip-calib requires an existing artifact: {args.calib}")
+        if args.cask_output is not None and not args.cask_output.is_file() and not args.dry_run:
+            parser.error(f"--skip-calib requires an existing CASK artifact: {args.cask_output}")
         print(f"pass 1/2: reusing {args.calib}", flush=True)
     _print_command("pass 2/2", quant_exec)
     if args.dry_run:
@@ -1183,8 +1235,8 @@ def main() -> None:
                 {
                     "manifest": str(manifest_path),
                     "calibration_execution": {
-                        "mode": "segmented" if args.calibration_segment_layers else "single_process",
-                        "process_segment_layers": args.calibration_segment_layers,
+                        "mode": "segmented" if effective_segment_layers else "single_process",
+                        "process_segment_layers": effective_segment_layers,
                     },
                     **recipe,
                 },
@@ -1220,11 +1272,11 @@ def main() -> None:
             recipe=recipe,
             phase="calibration_running",
             calibration_execution={
-                "mode": "segmented" if args.calibration_segment_layers else "single_process",
-                "process_segment_layers": args.calibration_segment_layers,
+                "mode": "segmented" if effective_segment_layers else "single_process",
+                "process_segment_layers": effective_segment_layers,
                 "release_seconds": (
                     DEFAULT_CALIBRATION_SEGMENT_RELEASE_SECONDS
-                    if args.calibration_segment_layers
+                    if effective_segment_layers
                     else 0
                 ),
             },
@@ -1256,7 +1308,7 @@ def main() -> None:
             collect_exec,
             calib=args.calib,
             total_layers=total_layers,
-            segment_layers=args.calibration_segment_layers,
+            segment_layers=effective_segment_layers,
             progress=lambda execution: update_manifest(
                 manifest_path,
                 recipe=recipe,
@@ -1276,6 +1328,12 @@ def main() -> None:
     validate_calibration_inspection(calibration)
     calibration_audit = audit_calibration_artifact(args.coexistence, args.calib)
     validate_calibration_audit(calibration_audit, calibration)
+    cask = None
+    if args.cask_output is not None:
+        if not args.cask_output.is_file():
+            raise RuntimeError(f"calibration completed without CASK output {args.cask_output}")
+        cask = inspect_artifact(args.coexistence, args.cask_output)
+        validate_cask_inspection(cask, calibration)
     if expected_calibration is not None:
         validate_reusable_calibration(calibration, expected_calibration)
     update_manifest(
@@ -1284,6 +1342,7 @@ def main() -> None:
         phase="calibration_complete",
         calibration=calibration,
         calibration_audit=calibration_audit,
+        cask=cask,
     )
     storage_preflight = pass_two_storage_preflight(
         model=args.model,
