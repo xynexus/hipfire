@@ -83,7 +83,7 @@ into full investigations here.
   artifact is unloadable — see below). Validation: pre-fix expect divergence
   post-128 with k=3; post-fix expect token-identical.
 - Empirical status (halo, gfx1151): BLOCKED. The only deepseek4 artifact on
-  halo (`deepseek-v4-flash.mq4.hfq`) will not run on the current daemon build:
+  halo (`deepseek-v4-flash--mq4.hfq`) will not run on the current daemon build:
   its MQ4 `compressor.wkv` is rejected by the F16-native compressor path
   (`HIPFIRE_DEEPSEEK4_COMP_F16_WMMA=1` default), and `=0` routes it to an
   unsupported `gemv.unknown`. Black-box AR-vs-spec-decode A/B needs a

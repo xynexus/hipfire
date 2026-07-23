@@ -152,7 +152,7 @@ pub struct DiffusionCalibEvalArgs {
 pub struct DiffusionQuantDiffArgs {
     /// Reference artifact (typically the bf16 / p0 source .hfq)
     pub reference: PathBuf,
-    /// Candidate artifact (typically the quantized .hfq, e.g. .oq8.hfq)
+    /// Candidate artifact (typically the quantized .hfq, e.g. --oq8.hfq)
     pub candidate: PathBuf,
     /// Print the N worst tensors by relative L2 error
     #[arg(long, default_value_t = 20)]

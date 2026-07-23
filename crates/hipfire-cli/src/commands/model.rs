@@ -67,7 +67,7 @@ pub struct ComposeArgs {
     inputs: Vec<String>,
     /// Output bundle path. Default: the base name with the sidecar feature
     /// dot-groups inserted before the quant token (e.g.
-    /// `Model.mq4.hfq` + `Model.mtp.hfq` -> `Model.mtp.mq4.hfq`).
+    /// `Model--mq4.hfq` + `Model.mtp.hfq` -> `Model--mtp.mq4.hfq`).
     #[arg(short, long)]
     output: Option<PathBuf>,
 }

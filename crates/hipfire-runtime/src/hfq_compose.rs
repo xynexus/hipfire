@@ -8,7 +8,7 @@
 //! sibling sidecar files (`<base>.mtp.hfq`, `.dflash.hfq`, `.triattn.hfq`,
 //! `.calib.hfq`, discovered by `hipfire_model::detect_sidecars`) or as a single
 //! bundled container carrying every feature's tensors (canonical name shape
-//! `Family-Size.mtp.vl.mq4.hfq`).
+//! `Family-Size--mtp.vl.mq4.hfq`).
 //!
 //! [`compose_hfq`] merges a base container and its sidecars into one bundle;
 //! [`decompose_hfq`] splits a bundle back into its component files. They are a
@@ -79,10 +79,15 @@ pub fn sidecar_tag_from_filename(path: &Path) -> Option<String> {
     let fname = path
         .file_name()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())?;
-    let stem = fname.strip_suffix(".hfq").unwrap_or(&fname).to_string();
+    // Normalize the `--` name/machine boundary to a dot so the first feature
+    // group is not glued to the model name.
+    let stem = fname
+        .strip_suffix(".hfq")
+        .unwrap_or(&fname)
+        .replace("--", ".");
     stem.split('.')
         .find(|seg| KNOWN_ROLES.contains(seg))
-        .map(|s| s.to_string())
+        .map(str::to_string)
 }
 
 /// Derive a friendly role tag for a sidecar from its filename dot-groups, then
@@ -376,16 +381,19 @@ fn role_matches(role: &str, tensor_name: &str) -> bool {
 }
 
 /// All known role tokens present in a bundle filename's dot-groups, in order
-/// (e.g. `Model.mtp.vl.mq4.hfq` -> `["mtp", "vl"]`).
+/// (e.g. `Model--mtp.vl.mq4.hfq` -> `["mtp", "vl"]`).
 fn role_tags_from_filename(path: &Path) -> Vec<String> {
     let fname = path
         .file_name()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    let stem = fname.strip_suffix(".hfq").unwrap_or(&fname).to_string();
+    let stem = fname
+        .strip_suffix(".hfq")
+        .unwrap_or(&fname)
+        .replace("--", ".");
     stem.split('.')
         .filter(|seg| KNOWN_ROLES.contains(seg))
-        .map(|s| s.to_string())
+        .map(str::to_string)
         .collect()
 }
 
@@ -405,14 +413,23 @@ fn roles_from_tensor_names(pkg: &HfqPackage) -> Vec<String> {
 }
 
 /// Bundle filename with the given role dot-groups removed (case-insensitive):
-/// `Model.mtp.vl.mq4.hfq` + `[mtp, vl]` -> `Model.mq4.hfq`.
+/// `Model--mtp.vl.mq4.hfq` + `[mtp, vl]` -> `Model--mq4.hfq`.
 fn strip_role_groups(fname: &str, roles: &[String]) -> String {
     let stem = fname.strip_suffix(".hfq").unwrap_or(fname);
-    let kept: Vec<&str> = stem
-        .split('.')
-        .filter(|seg| !roles.iter().any(|r| r.eq_ignore_ascii_case(seg)))
-        .collect();
-    format!("{}.hfq", kept.join("."))
+    let strip = |section: &str| -> String {
+        section
+            .split('.')
+            .filter(|seg| !roles.iter().any(|r| r.eq_ignore_ascii_case(seg)))
+            .collect::<Vec<_>>()
+            .join(".")
+    };
+    // Only the machine section (after the `--` boundary) carries feature groups;
+    // keep the boundary and the model name intact.
+    if let Some((identity, machine)) = stem.split_once("--") {
+        format!("{identity}--{}.hfq", strip(machine))
+    } else {
+        format!("{}.hfq", strip(stem))
+    }
 }
 
 /// Best-effort split of a bundle that has NO [`HFQM_COMPOSE_KEY`] manifest,
@@ -497,10 +514,13 @@ pub fn decompose_hfq_infer_with_config_keys(
     let base_stem = base_fname.strip_suffix(".hfq").unwrap_or(&base_fname);
     // Sidecars are `<family>.<role>.hfq`, where family drops the quant token (the
     // base stem's last dot-group) — matching the compose naming (base
-    // `Model.mq4.hfq` + `Model.mtp.hfq` <-> `Model.mtp.mq4.hfq`).
+    // `Model--mq4.hfq` + `Model.mtp.hfq` <-> `Model--mtp.mq4.hfq`).
+    // Family (for the dotted sidecar name) drops the quant token: the identity
+    // before the `--` boundary, or the stem before the last dot for legacy names.
     let family_stem = base_stem
-        .rsplit_once('.')
+        .split_once("--")
         .map(|(head, _)| head)
+        .or_else(|| base_stem.rsplit_once('.').map(|(head, _)| head))
         .unwrap_or(base_stem);
 
     std::fs::create_dir_all(out_dir)?;
@@ -622,7 +642,7 @@ mod tests {
     fn infer_splits_manifestless_bundle_by_filename_roles() {
         let dir = scratch_dir();
         // A bundle with NO hipfire_compose manifest, name declaring `.mtp`.
-        let bundle = dir.join("Model.mtp.mq4.hfq");
+        let bundle = dir.join("Model--mtp.mq4.hfq");
         write_hfqm_package_mem(
             &bundle,
             5,
@@ -641,7 +661,7 @@ mod tests {
         let out = dir.join("out");
         let written = decompose_hfq_infer(&bundle, &out).unwrap();
         assert_eq!(written.len(), 2);
-        let base = HfqPackage::open(&out.join("Model.mq4.hfq")).unwrap();
+        let base = HfqPackage::open(&out.join("Model--mq4.hfq")).unwrap();
         assert!(base.entry("model.embed.weight").is_some());
         assert!(base.entry("model.mtp.head.weight").is_none());
         let mtp = HfqPackage::open(&out.join("Model.mtp.hfq")).unwrap();
@@ -655,8 +675,8 @@ mod tests {
     #[test]
     fn infer_errors_when_no_roles_in_filename_or_tensors() {
         let dir = scratch_dir();
-        let bundle = dir.join("Model.mq4.hfq"); // no role dot-groups
-                                                // Tensor names carry no role fingerprint either, so nothing to split.
+        let bundle = dir.join("Model--mq4.hfq"); // no role dot-groups
+                                                 // Tensor names carry no role fingerprint either, so nothing to split.
         write_hfqm_package_mem(&bundle, 5, "{}", &[mem_tensor("a", vec![1])]).unwrap();
         let err = decompose_hfq_infer(&bundle, &dir.join("out")).unwrap_err();
         assert!(err.to_string().contains("no role-tagged tensors"));
@@ -668,7 +688,7 @@ mod tests {
         let dir = scratch_dir();
         // Legacy bundle: plain filename, NO role dot-groups and NO manifest,
         // but a vision tensor betrays a `vl` sidecar hiding inside.
-        let bundle = dir.join("Model.mq4.hfq");
+        let bundle = dir.join("Model--mq4.hfq");
         write_hfqm_package_mem(
             &bundle,
             5,
@@ -686,7 +706,7 @@ mod tests {
         assert_eq!(written.len(), 2);
         // Base keeps the original (unstripped) filename; the vl tensor is carved
         // out into `<family>.vl.hfq`.
-        let base = HfqPackage::open(&out.join("Model.mq4.hfq")).unwrap();
+        let base = HfqPackage::open(&out.join("Model--mq4.hfq")).unwrap();
         assert!(base.entry("model.embed.weight").is_some());
         assert!(base.entry("model.vision.patch_embed.weight").is_none());
         let vl = HfqPackage::open(&out.join("Model.vl.hfq")).unwrap();
@@ -699,9 +719,9 @@ mod tests {
     #[test]
     fn compose_then_decompose_round_trips_byte_identical() {
         let dir = scratch_dir();
-        let base = dir.join("Model.mq4.hfq");
+        let base = dir.join("Model--mq4.hfq");
         let mtp = dir.join("Model.mtp.hfq");
-        let bundle = dir.join("Model.mtp.mq4.hfq");
+        let bundle = dir.join("Model--mtp.mq4.hfq");
 
         let base_meta = r#"{"arch_id":5,"role":"base"}"#;
         let mtp_meta = r#"{"arch_id":5,"role":"mtp"}"#;
@@ -741,7 +761,7 @@ mod tests {
         let written = decompose_hfq(&bundle, &out).unwrap();
         assert_eq!(written.len(), 2);
         assert_eq!(
-            std::fs::read(out.join("Model.mq4.hfq")).unwrap(),
+            std::fs::read(out.join("Model--mq4.hfq")).unwrap(),
             std::fs::read(&base).unwrap()
         );
         assert_eq!(
@@ -808,7 +828,7 @@ mod tests {
         let dir = scratch_dir();
         // A VL monolith: metadata advertises `vision_config`, and it holds a
         // vision tensor (so infer carves a `vl` sidecar).
-        let bundle = dir.join("Model.mq4.hfq");
+        let bundle = dir.join("Model--mq4.hfq");
         write_hfqm_package_mem(
             &bundle,
             5,
@@ -828,7 +848,7 @@ mod tests {
         assert_eq!(written.len(), 2);
 
         // Base no longer advertises vision_config, but keeps its other config.
-        let base = HfqPackage::open(&out.join("Model.mq4.hfq")).unwrap();
+        let base = HfqPackage::open(&out.join("Model--mq4.hfq")).unwrap();
         assert!(!base.metadata_json.contains("vision_config"));
         assert!(base.metadata_json.contains("text_only_field"));
         // The vl sidecar now owns vision_config.
@@ -836,9 +856,9 @@ mod tests {
         assert!(vl.metadata_json.contains("vision_config"));
 
         // Recompose base + vl → vision_config travels back to the bundle top level.
-        let rebundled = dir.join("Rebundled.vl.mq4.hfq");
+        let rebundled = dir.join("Rebundled--vl.mq4.hfq");
         compose_hfq_with_config_keys(
-            &[out.join("Model.mq4.hfq"), out.join("Model.vl.hfq")],
+            &[out.join("Model--mq4.hfq"), out.join("Model.vl.hfq")],
             &rebundled,
             &keys,
         )
@@ -858,8 +878,8 @@ mod tests {
             &[mem_tensor("model.mtp.w", vec![4])],
         )
         .unwrap();
-        let swapped = dir.join("Swapped.mtp.mq4.hfq");
-        compose_hfq_with_config_keys(&[out.join("Model.mq4.hfq"), mtp], &swapped, &keys).unwrap();
+        let swapped = dir.join("Swapped--mtp.mq4.hfq");
+        compose_hfq_with_config_keys(&[out.join("Model--mq4.hfq"), mtp], &swapped, &keys).unwrap();
         assert!(!HfqPackage::open(&swapped)
             .unwrap()
             .metadata_json
