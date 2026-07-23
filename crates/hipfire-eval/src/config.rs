@@ -35,6 +35,9 @@ where
     let mut kv_hierarchical = true;
     let mut kvarn_bits: Option<usize> = None;
     let mut hot_bits: Option<usize> = None;
+    let mut cask_sidecar: Option<PathBuf> = None;
+    let mut cask_budget = 512usize;
+    let mut cask_beta = 128usize;
     let mut fixture: Option<String> = None;
     let mut max_tokens = 64usize;
     let mut dflash = DflashMode::Off;
@@ -156,6 +159,19 @@ where
                     return Err(format!("--hot-bits must be 8 or 16 (got {n})"));
                 }
                 hot_bits = Some(n);
+                i += 2;
+            }
+            "--cask-sidecar" => {
+                cask_sidecar = Some(PathBuf::from(take_value(&argv, i, "--cask-sidecar")?));
+                i += 2;
+            }
+            "--cask-budget" => {
+                cask_budget =
+                    parse_usize(&take_value(&argv, i, "--cask-budget")?, "--cask-budget")?;
+                i += 2;
+            }
+            "--cask-beta" => {
+                cask_beta = parse_usize(&take_value(&argv, i, "--cask-beta")?, "--cask-beta")?;
                 i += 2;
             }
             "--ctx" => {
@@ -323,6 +339,12 @@ where
     if runs == 0 {
         return Err("--runs must be at least 1".to_string());
     }
+    if cask_budget == 0 {
+        return Err("--cask-budget must be at least 1".to_string());
+    }
+    if cask_beta == 0 {
+        return Err("--cask-beta must be at least 1".to_string());
+    }
     // A model argument is required for a single run, but --models (sweep), --status, and
     // --fetch supply or don't need it; use a placeholder that run_from_env
     // replaces per sweep iteration. The tiny_quant battery emits + quantizes its
@@ -364,6 +386,9 @@ where
         kv_hierarchical,
         kvarn_bits,
         hot_bits,
+        cask_sidecar,
+        cask_budget,
+        cask_beta,
         fixture,
         max_tokens,
         dflash,
@@ -422,6 +447,9 @@ pub fn usage() -> String {
        --no-kv-hierarchical     disable the two-tier hot/cold KV cache\n\
        --kvarn-bits <2|4|8>     kvarn K precision (default 4; 8 is ~lossless-er, 2x K storage; sets HIPFIRE_KVARN_BITS)\n\
        --hot-bits <8|16>        hierarchical hot-tier precision (default 8 = int8 ring, ~½ hot VRAM; 16 = f16 for A/B; sets HIPFIRE_KV_HOT_BITS)\n\
+       --cask-sidecar <path>    explicit CASK/TriAttention artifact (embedded or canonical sibling is used when omitted)\n\
+       --cask-budget <N>        CASK retained-token budget (default: 512)\n\
+       --cask-beta <N>          CASK eviction growth interval (default: 128)\n\
        --ctx <N>                context length for perplexity/long-context batteries (default: 512; overrides HIPFIRE_EVAL_PERPLEXITY_CTX)\n\
        --corpus <path>          perplexity corpus path (overrides HIPFIRE_EVAL_PERPLEXITY_CORPUS)\n\
        --fixture <a,b>          pflash/longctx NIAH fixture filter (substring match on name, e.g. niah_16k,longcode); default: all\n\
