@@ -165,7 +165,7 @@ end-of-K scale.
 **OQ8 converter — DONE.** `dflash_convert --oq8` emits a non-rotated per-group
 symmetric signed-int8 sidecar (`QuantType::Oq8Plain = 45`, block `[f16 scale]
 [256 int8]` = 258 B/group, `"rotated": false` in metadata). Round-trip unit tests
-pass; real sidecar `~/.hipfire/drafts/Qwen3.5-9B.dflash.npu.oq8.hfq` (1008 MiB)
+pass; real sidecar `~/.hipfire/drafts/Qwen3.5-9B--dflash.npu.oq8.hfq` (1008 MiB)
 validates at ~43 dB weight-only SNR per projection, norms kept F32. This is the
 int8 weight format both int8 kernels consume.
 

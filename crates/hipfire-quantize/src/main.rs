@@ -14102,12 +14102,12 @@ mod tests {
 
     #[test]
     fn npu_embedding_output_name_uses_canonical_feature_and_quant_groups() {
-        validate_npu_embedding_output_name(Path::new("Qwen3-Embedding-0.6B.npu.oq8+.gfx1151.hfq"))
+        validate_npu_embedding_output_name(Path::new("Qwen3-Embedding-0.6B--npu.oq8+.gfx1151.hfq"))
             .unwrap();
         for invalid in [
             "qwen3-embedding-0.6b-npu-oq8+.hfq",
-            "Qwen3-Embedding-0.6B.oq8+.hfq",
-            "Qwen3-Embedding-0.6B.npu.oq8++.hfq",
+            "Qwen3-Embedding-0.6B--oq8+.hfq",
+            "Qwen3-Embedding-0.6B--npu.oq8++.hfq",
         ] {
             assert!(
                 validate_npu_embedding_output_name(Path::new(invalid)).is_err(),

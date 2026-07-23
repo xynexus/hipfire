@@ -10,6 +10,7 @@ pub mod gen_config_schema;
 pub mod gen_docs;
 pub mod gen_env_docs;
 pub mod gen_model_support;
+pub mod induct;
 pub mod inspect;
 pub mod list;
 pub mod lock;

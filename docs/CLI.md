@@ -376,7 +376,7 @@ Merge a base `.hfq` and its role/feature sidecars into one bundled container (re
 
 ###### **Options:**
 
-* `-o`, `--output <OUTPUT>` — Output bundle path. Default: the base name with the sidecar feature dot-groups inserted before the quant token (e.g. `Model.mq4.hfq` + `Model.mtp.hfq` -> `Model.mtp.mq4.hfq`)
+* `-o`, `--output <OUTPUT>` — Output bundle path. Default: the base name with the sidecar feature dot-groups inserted before the quant token (e.g. `Model--mq4.hfq` + `Model.mtp.hfq` -> `Model--mtp.mq4.hfq`)
 
 
 
@@ -877,7 +877,7 @@ Decodes every quantizable `transformer/tensors/*.weight` from both artifacts to 
 ###### **Arguments:**
 
 * `<REFERENCE>` — Reference artifact (typically the bf16 / p0 source .hfq)
-* `<CANDIDATE>` — Candidate artifact (typically the quantized .hfq, e.g. .oq8.hfq)
+* `<CANDIDATE>` — Candidate artifact (typically the quantized .hfq, e.g. --oq8.hfq)
 
 ###### **Options:**
 
