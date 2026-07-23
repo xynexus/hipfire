@@ -54,6 +54,9 @@ enum ModelCommand {
     Compose(ComposeArgs),
     /// Split a bundled `.hfq` back into its base + sidecar files.
     Decompose(DecomposeArgs),
+    /// Interactive wizard: bring an external model (HuggingFace repo or local
+    /// safetensors dir) into a named `.hfq` — calibrate, quantize, fold sidecars.
+    Induct(crate::commands::induct::InductArgs),
 }
 
 #[derive(Debug, Args)]
@@ -88,6 +91,7 @@ pub fn run(args: ModelArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     match args.command {
         ModelCommand::Compose(a) => run_compose(a, &loaded),
         ModelCommand::Decompose(a) => run_decompose(a, &loaded),
+        ModelCommand::Induct(a) => crate::commands::induct::run_induct(a, loaded),
     }
 }
 
