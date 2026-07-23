@@ -7043,10 +7043,20 @@ fn main() {
                     .any(|arch| arch.to_ascii_lowercase().contains("mamba2"))
             })
             .unwrap_or(false);
-    let arch_str = config
-        .get("model_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("llama");
+    let arch_str = match config.get("model_type").and_then(|v| v.as_str()) {
+        Some(model_type) => model_type,
+        // State-spaces Mamba2 configs predate the Hugging Face `model_type`
+        // convention. Accept only the explicit `ssm_cfg.layer=Mamba2` or
+        // `Mamba2ForCausalLM` signature established above; this is a registered
+        // family identity, not an unknown-family fallback.
+        None if is_mamba2_config => "mamba2",
+        None => {
+            eprintln!(
+                "error: model config has no string `model_type`; refusing to guess an architecture"
+            );
+            std::process::exit(2);
+        }
+    };
     // Map the HF `model_type` string to a canonical arch_id. Ids and their
     // `arch_str` detection tokens are documented in `docs/architecture-ids.md`.
     let auto_arch_id = if is_mamba2_config {
@@ -7118,8 +7128,12 @@ fn main() {
             // rides the same is_moe 3D-split path below.
             "zaya" => ARCH_ID_ZAYA,
             other => {
-                eprintln!("Warning: unknown architecture '{other}', treating as llama");
-                ARCH_ID_LLAMA_MISTRAL
+                eprintln!(
+                    "error: unsupported model_type `{other}`; refusing to quantize it as LLaMA. \
+                     Register the family in hipfire-arch-api/hipfire-arch-specs and add its \
+                     tensor/precision policy before conversion."
+                );
+                std::process::exit(2);
             }
         }
     };
@@ -15062,6 +15076,23 @@ mod tests {
         assert_eq!(
             expert_layout_via_ingest(12),
             Some(hipfire_arch_api::ExpertLayout::None)
+        );
+    }
+
+    #[test]
+    fn registry_resolves_cohere2_moe_without_an_architecture_fallback() {
+        assert_eq!(arch_id_via_registry("cohere2_moe"), Some(25));
+        assert_eq!(
+            expert_layout_via_ingest(25),
+            Some(hipfire_arch_api::ExpertLayout::None)
+        );
+        assert_eq!(
+            high_precision_via_ingest(25, "model.layers.1.mlp.experts.3.down_proj.weight", 256,),
+            Some(false)
+        );
+        assert_eq!(
+            high_precision_via_ingest(25, "model.layers.1.mlp.gate.weight", 256),
+            Some(true)
         );
     }
 
