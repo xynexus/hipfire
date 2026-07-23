@@ -447,7 +447,12 @@ pub struct Gpu {
     pub oq4_xq_batch: Option<GpuTensor>, // packed int4 activation, N*K/2 bytes
     pub oq4_xs_batch: Option<GpuTensor>, // per-group f32 activation scales, N*K/256
     pub oq4_ytmp_batch: Option<GpuTensor>, // f32 residual GEMM scratch, M*N
-    pub paro_x_scratch: Option<GpuTensor>, // ParoQuant: scratch for rotated activation copy
+    // Plain-basis DFLASH W4A8/W8A8 staging. The activation is quantized once
+    // per (batch,G256) and reused by every output-row block in the projection.
+    // Capacity grows to the largest bounded chunk seen and is stream-reused.
+    pub dflash_oq_xq_batch: Option<GpuTensor>, // signed int8 activation, N*K bytes
+    pub dflash_oq_xs_batch: Option<GpuTensor>, // per-G256 f32 scales, N*K/256
+    pub paro_x_scratch: Option<GpuTensor>,     // ParoQuant: scratch for rotated activation copy
     pub paro_fused_scratch: Option<Vec<GpuTensor>>, // ParoQuant fused paths: multiple rotation scratch buffers
     pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,  // INT8 quantized rotated x for dp4a
     pub mq_x_scales: Option<hip_bridge::DeviceBuffer>, // per-group f32 scales for x quantization
@@ -848,6 +853,8 @@ impl Gpu {
             oq4_xq_batch: None,
             oq4_xs_batch: None,
             oq4_ytmp_batch: None,
+            dflash_oq_xq_batch: None,
+            dflash_oq_xs_batch: None,
             paro_x_scratch: None,
             paro_fused_scratch: None,
             mq_x_q8: None,

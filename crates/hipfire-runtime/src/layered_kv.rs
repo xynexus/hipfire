@@ -371,16 +371,29 @@ pub struct LayerCacheView<'a> {
 
 impl LayeredKvArena {
     pub fn new_fp32(gpu: &mut Gpu, plan: LayeredKvPlan) -> HipResult<Self> {
+        let full_cap = plan.max_seq;
+        Self::new_fp32_capped(gpu, plan, full_cap)
+    }
+
+    /// Allocate full-context groups at `full_cap` while retaining the plan's
+    /// larger logical `max_seq`. Sliding-window groups keep their fixed ring
+    /// capacity. This is the storage contract used by CASK compaction.
+    pub fn new_fp32_capped(gpu: &mut Gpu, plan: LayeredKvPlan, full_cap: usize) -> HipResult<Self> {
+        assert!(full_cap > 0 && full_cap <= plan.max_seq);
         let mut groups = Vec::with_capacity(plan.groups.len());
         for group in &plan.groups {
             let owned = vec![true; group.owned_layers];
+            let physical_cap = match group.storage {
+                KvStorageKind::Full => full_cap,
+                KvStorageKind::SlidingWindow { window } => window,
+            };
             groups.push(KvCache::new_gpu_capped_filtered(
                 gpu,
                 &owned,
                 group.kv_heads,
                 group.head_dim,
                 plan.max_seq,
-                group.storage.physical_cap(plan.max_seq),
+                physical_cap,
             )?);
         }
         Ok(Self {
@@ -469,12 +482,36 @@ impl LayeredKvArena {
     pub fn view(&self, layer: usize, absolute_pos: usize) -> Result<LayerCacheView<'_>, String> {
         let (producer_layer, group, slot) = self.plan.resolved_binding(layer)?;
         let cache = &self.groups[group];
+        let storage = self.plan.layers[producer_layer].storage;
+        let (physical_position, visible_positions) = match storage {
+            KvStorageKind::Full => {
+                let physical = absolute_pos
+                    .checked_sub(cache.compact_offset)
+                    .ok_or_else(|| {
+                        format!(
+                            "logical position {absolute_pos} precedes compact offset {}",
+                            cache.compact_offset
+                        )
+                    })?;
+                if physical >= cache.physical_cap {
+                    return Err(format!(
+                        "full-cache physical position {physical} exceeds cap {}",
+                        cache.physical_cap
+                    ));
+                }
+                (physical, 0..physical + 1)
+            }
+            KvStorageKind::SlidingWindow { .. } => (
+                self.plan.physical_position(layer, absolute_pos)?,
+                self.plan.visible_positions(layer, absolute_pos)?,
+            ),
+        };
         Ok(LayerCacheView {
             producer_layer,
             group,
             slot,
-            physical_position: self.plan.physical_position(layer, absolute_pos)?,
-            visible_positions: self.plan.visible_positions(layer, absolute_pos)?,
+            physical_position,
+            visible_positions,
             kv_heads: cache.n_kv_heads,
             head_dim: cache.head_dim,
             k: &cache.k_gpu[slot],
@@ -488,6 +525,41 @@ impl LayeredKvArena {
             physical_cap: cache.physical_cap,
             kvarn_bits: cache.kvarn_bits,
         })
+    }
+
+    pub fn cache_binding(&self, layer: usize) -> Result<(usize, usize), String> {
+        let (_, group, slot) = self.plan.resolved_binding(layer)?;
+        Ok((group, slot))
+    }
+
+    pub fn group_cache(&self, group: usize) -> Result<&KvCache, String> {
+        self.groups
+            .get(group)
+            .ok_or_else(|| format!("physical KV group {group} is out of range"))
+    }
+
+    pub fn group_cache_mut(&mut self, group: usize) -> Result<&mut KvCache, String> {
+        self.groups
+            .get_mut(group)
+            .ok_or_else(|| format!("physical KV group {group} is out of range"))
+    }
+
+    pub fn full_group_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.plan
+            .groups
+            .iter()
+            .enumerate()
+            .filter_map(|(group, plan)| (plan.storage == KvStorageKind::Full).then_some(group))
+    }
+
+    pub fn full_physical_len(&self) -> Result<usize, String> {
+        let Some(group) = self.full_group_ids().next() else {
+            return Err("layered KV arena has no full-context group".into());
+        };
+        self.cursor
+            .next_pos()
+            .checked_sub(self.groups[group].compact_offset)
+            .ok_or_else(|| "full-context compact offset exceeds logical cursor".into())
     }
 
     pub fn store_f32(
@@ -508,13 +580,28 @@ impl LayeredKvArena {
         let spec = &self.plan.layers[layer];
         assert_eq!(k.len(), spec.kv_width(), "layer {layer}: K width mismatch");
         assert_eq!(v.len(), spec.kv_width(), "layer {layer}: V width mismatch");
-        let physical_pos = self
-            .plan
-            .physical_position(layer, absolute_pos)
-            .unwrap_or_else(|error| panic!("layered KV store: {error}"));
         match spec.storage {
-            KvStorageKind::Full => self.groups[group].store_kv_pub(gpu, slot, physical_pos, k, v),
+            KvStorageKind::Full => {
+                let physical_pos = absolute_pos
+                    .checked_sub(self.groups[group].compact_offset)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "layered KV store: logical position {absolute_pos} precedes compact offset {}",
+                            self.groups[group].compact_offset
+                        )
+                    });
+                assert!(
+                    physical_pos < self.groups[group].physical_cap,
+                    "layered KV store: full-cache physical position {physical_pos} exceeds cap {}",
+                    self.groups[group].physical_cap
+                );
+                self.groups[group].store_kv_pub(gpu, slot, physical_pos, k, v)
+            }
             KvStorageKind::SlidingWindow { window } => {
+                let physical_pos = self
+                    .plan
+                    .physical_position(layer, absolute_pos)
+                    .unwrap_or_else(|error| panic!("layered KV store: {error}"));
                 // The existing SWA stage/attention kernels consume a head-major
                 // `[kv_head, head_dim, window]` ring. `KvCache` is the flat
                 // physical allocation owner; this diagnostic host-store path
