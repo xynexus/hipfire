@@ -87,9 +87,10 @@ fn source_stem(source: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
 }
 
-/// Default output artifact name: `<stem>.<quant-token>.hfq`.
+/// Default output artifact name: `<stem>--<quant-token>.hfq` (the `--` boundary
+/// separates the model name from the machine-readable quant/feature section).
 fn derive_output_name(source: &str, format: &str) -> String {
-    format!("{}.{}.hfq", source_stem(source), format)
+    format!("{}--{}.hfq", source_stem(source), format)
 }
 
 /// A source string is a local dir if it exists as one; otherwise it is treated
@@ -598,7 +599,7 @@ mod tests {
         assert_eq!(source_stem("/srv/models/foo/"), "foo");
         assert_eq!(
             derive_output_name("Qwen/Qwen3.5-0.8B", "oq4++"),
-            "Qwen3.5-0.8B.oq4++.hfq"
+            "Qwen3.5-0.8B--oq4++.hfq"
         );
     }
 
