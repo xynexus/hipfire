@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use hipfire_arch_cohere2 as _;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_gemma3::{Gemma3Backend, Gemma3State};
 use hipfire_arch_gemma3_vl::{load_vl, Gemma3VlBackend, LoadedVl};
@@ -37,13 +38,16 @@ use hipfire_model::{
 };
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
-use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
+use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashSource, DflashWeights};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
+use hipfire_runtime::hfq_compose::{
+    compose_manifest_from_metadata, file_component_view, ComposeManifest,
+};
 use hipfire_runtime::kv;
 use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::quant::QuantType;
-use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
+use hipfire_runtime::triattn::{EvictionCtx, TriAttnArtifact, TriAttnCenters};
 
 use crate::embedding_runtime::{classify_embedding_workload, EmbeddingRuntimeKind};
 use crate::memory::{hfq_model_memory, unknown_model_memory};
@@ -82,6 +86,171 @@ fn require_arch_feature(
         feature,
         support.mark()
     ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedComponentSource<'a> {
+    Explicit(&'a str),
+    Embedded,
+    Sibling(PathBuf),
+}
+
+impl ResolvedComponentSource<'_> {
+    fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Explicit(path) => Some(Path::new(path)),
+            Self::Sibling(path) => Some(path),
+            Self::Embedded => None,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Explicit(_) => "explicit",
+            Self::Embedded => "embedded",
+            Self::Sibling(_) => "sibling",
+        }
+    }
+}
+
+fn resolve_component_source<'a>(
+    explicit: Option<&'a str>,
+    embedded: bool,
+    sibling: Option<PathBuf>,
+    off: bool,
+) -> Option<ResolvedComponentSource<'a>> {
+    if off {
+        None
+    } else if let Some(explicit) = explicit {
+        Some(ResolvedComponentSource::Explicit(explicit))
+    } else if embedded {
+        Some(ResolvedComponentSource::Embedded)
+    } else {
+        sibling.map(ResolvedComponentSource::Sibling)
+    }
+}
+
+fn manifest_has_role(manifest: Option<&ComposeManifest>, role: &str) -> bool {
+    manifest.is_some_and(|manifest| manifest.components.iter().any(|item| item.tag == role))
+}
+
+enum LoadedTriAttn {
+    Uniform(TriAttnCenters),
+    Layered(TriAttnArtifact),
+}
+
+impl LoadedTriAttn {
+    fn uniform_centers(&self) -> Result<TriAttnCenters, String> {
+        match self {
+            Self::Uniform(centers) => Ok(centers.clone()),
+            Self::Layered(artifact) => artifact
+                .to_uniform_centers()
+                .map_err(|error| format!("CASK package is not uniform: {error}")),
+        }
+    }
+
+    fn layered(&self) -> Option<&TriAttnArtifact> {
+        match self {
+            Self::Layered(artifact) => Some(artifact),
+            Self::Uniform(_) => None,
+        }
+    }
+}
+
+fn load_resolved_triattn(
+    source: &ResolvedComponentSource<'_>,
+    bundle: &HfqFile,
+    manifest: Option<&ComposeManifest>,
+) -> Result<LoadedTriAttn, String> {
+    fn load_path(path: &Path) -> Result<LoadedTriAttn, String> {
+        use std::io::Read as _;
+        let mut file = std::fs::File::open(path)
+            .map_err(|error| format!("open {}: {error}", path.display()))?;
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic)
+            .map_err(|error| format!("read {} magic: {error}", path.display()))?;
+        match &magic {
+            b"TRIA" => TriAttnCenters::load(path)
+                .map(LoadedTriAttn::Uniform)
+                .map_err(|error| format!("parse TRIA v1 {}: {error}", path.display())),
+            b"HFQM" => TriAttnArtifact::load_hfqm(path)
+                .map(LoadedTriAttn::Layered)
+                .map_err(|error| format!("parse TriAttention HFQM {}: {error}", path.display())),
+            _ => Err(format!(
+                "{} is neither a TRIA v1 nor TriAttention HFQM artifact",
+                path.display()
+            )),
+        }
+    }
+    match source {
+        ResolvedComponentSource::Explicit(path) => load_path(Path::new(path))
+            .map_err(|error| format!("explicit CASK/TriAttention load failed ({path}): {error}")),
+        ResolvedComponentSource::Sibling(path) => load_path(path).map_err(|error| {
+            format!(
+                "sibling CASK/TriAttention load failed ({}): {error}",
+                path.display()
+            )
+        }),
+        ResolvedComponentSource::Embedded => {
+            let manifest = manifest.ok_or("embedded triattn selected without a manifest")?;
+            let view = file_component_view(bundle, manifest, "triattn")
+                .map_err(|error| format!("embedded triattn view: {error}"))?
+                .ok_or("embedded triattn role disappeared from manifest")?;
+            view.verify_digest()
+                .map_err(|error| format!("embedded triattn digest: {error}"))?;
+            match view.source_format() {
+                "tria-v1" => {
+                    let bytes = view
+                        .opaque_bytes_vec()
+                        .map_err(|error| format!("embedded triattn payload: {error}"))?
+                        .ok_or("embedded triattn has no opaque payload")?;
+                    TriAttnCenters::from_bytes(&bytes)
+                        .map(LoadedTriAttn::Uniform)
+                        .map_err(|error| format!("embedded triattn parse: {error}"))
+                }
+                "hfqm" => TriAttnArtifact::from_source(&view)
+                    .map(LoadedTriAttn::Layered)
+                    .map_err(|error| format!("embedded TriAttention HFQM parse: {error}")),
+                other => Err(format!(
+                    "embedded triattn uses unsupported source format {other:?}"
+                )),
+            }
+        }
+    }
+}
+
+fn load_resolved_dflash_config(
+    source: &ResolvedComponentSource<'_>,
+    bundle: &HfqFile,
+    manifest: Option<&ComposeManifest>,
+) -> Result<DflashConfig, String> {
+    match source {
+        ResolvedComponentSource::Explicit(path) => {
+            let file = HfqFile::open(Path::new(path))
+                .map_err(|error| format!("open explicit DFLASH {path}: {error}"))?;
+            DflashConfig::from_hfq(&file).ok_or_else(|| {
+                format!("explicit DFLASH {path} has invalid arch or metadata/config")
+            })
+        }
+        ResolvedComponentSource::Sibling(path) => {
+            let file = HfqFile::open(path)
+                .map_err(|error| format!("open sibling DFLASH {}: {error}", path.display()))?;
+            DflashConfig::from_hfq(&file).ok_or_else(|| {
+                format!(
+                    "sibling DFLASH {} has invalid arch or metadata/config",
+                    path.display()
+                )
+            })
+        }
+        ResolvedComponentSource::Embedded => {
+            let manifest = manifest.ok_or("embedded DFLASH selected without a manifest")?;
+            let view = file_component_view(bundle, manifest, "dflash")
+                .map_err(|error| format!("embedded DFLASH view: {error}"))?
+                .ok_or("embedded DFLASH role disappeared from manifest")?;
+            DflashConfig::from_source(&view)
+                .ok_or_else(|| "embedded DFLASH has invalid arch or metadata/config".to_string())
+        }
+    }
 }
 
 #[cfg(feature = "arch-lfm2moe")]
@@ -477,6 +646,7 @@ pub fn load_model(
     max_seq: usize,
     requested_physical_cap: Option<usize>,
     draft_path: Option<&str>,
+    dflash_mode: Option<&str>,
     kv_mode_override: Option<&str>,
     state_quant_override: Option<&str>,
     cask: &CaskConfig,
@@ -488,6 +658,17 @@ pub fn load_model(
         // the "load" event handler so the operator gets a structured error
         // before any HFQ open / weight allocation. By the time we get here
         // with pp>1, draft_path is None and cask.sidecar is None.
+        let index = HfqFile::open_index_only(Path::new(path)).map_err(|error| error.to_string())?;
+        let manifest = compose_manifest_from_metadata(&index.metadata_json)
+            .map_err(|error| format!("embedded component manifest: {error}"))?;
+        if dflash_mode != Some("off") && manifest_has_role(manifest.as_ref(), "dflash") {
+            return Err("embedded DFLASH requires pp=1".to_string());
+        }
+        if std::env::var("HIPFIRE_CASK_OFF").ok().as_deref() != Some("1")
+            && manifest_has_role(manifest.as_ref(), "triattn")
+        {
+            return Err("embedded CASK/TriAttention requires pp=1".to_string());
+        }
         let _ = (draft_path, cask);
         return load_model_pp(
             path,
@@ -514,6 +695,62 @@ pub fn load_model(
     }
 
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let compose_manifest = compose_manifest_from_metadata(&hfq.metadata_json)
+        .map_err(|error| format!("embedded component manifest: {error}"))?;
+    let embedded_dflash = manifest_has_role(compose_manifest.as_ref(), "dflash");
+    let embedded_triattn = manifest_has_role(compose_manifest.as_ref(), "triattn");
+    let dflash_off = dflash_mode.is_some_and(|mode| mode.eq_ignore_ascii_case("off"));
+    let dflash_sibling = if draft_path.is_none() && !embedded_dflash && !dflash_off {
+        hipfire_model::discover_dflash_draft_for_model(Path::new(path))
+    } else {
+        None
+    };
+    let resolved_dflash =
+        resolve_component_source(draft_path, embedded_dflash, dflash_sibling, dflash_off);
+    if dflash_mode.is_some_and(|mode| mode.eq_ignore_ascii_case("on")) && resolved_dflash.is_none()
+    {
+        return Err(
+            "dflash_mode=on but no explicit, embedded, or sibling DFLASH component was found"
+                .to_string(),
+        );
+    }
+    let cask_off = std::env::var("HIPFIRE_CASK_OFF").ok().as_deref() == Some("1");
+    let triattn_sibling = if cask.sidecar.is_none() && !embedded_triattn && !cask_off {
+        hipfire_model::discover_triattn_for_model(Path::new(path))
+    } else {
+        None
+    };
+    let resolved_triattn = resolve_component_source(
+        cask.sidecar.as_deref(),
+        embedded_triattn,
+        triattn_sibling,
+        cask_off,
+    );
+    let dflash_requested = resolved_dflash.is_some();
+    let cask_requested = resolved_triattn.is_some();
+    if matches!(resolved_dflash, Some(ResolvedComponentSource::Embedded)) {
+        let verify_started = std::time::Instant::now();
+        let manifest = compose_manifest
+            .as_ref()
+            .ok_or("embedded DFLASH selected without a manifest")?;
+        let view = file_component_view(&hfq, manifest, "dflash")
+            .map_err(|error| format!("embedded DFLASH view: {error}"))?
+            .ok_or("embedded DFLASH role disappeared from manifest")?;
+        view.verify_digest()
+            .map_err(|error| format!("embedded DFLASH digest: {error}"))?;
+        DflashConfig::from_source(&view).ok_or("embedded DFLASH metadata/config is invalid")?;
+        eprintln!(
+            "  embedded DFLASH verified: encoding={} bytes={} sha256={} elapsed={:.2}s",
+            view.source_format(),
+            view.original_byte_len(),
+            view.sha256(),
+            verify_started.elapsed().as_secs_f64(),
+        );
+    }
+    let resolved_triattn_centers = resolved_triattn
+        .as_ref()
+        .map(|source| load_resolved_triattn(source, &hfq, compose_manifest.as_ref()))
+        .transpose()?;
     let max_seq = clamp_max_seq_to_model_context(max_seq, &hfq.metadata_json);
     let max_seq = cap_gemma3_stopgap_max_seq(max_seq, hfq.arch_id, &kv_mode);
     let model_memory = hfq_model_memory(path, &hfq);
@@ -563,7 +800,7 @@ pub fn load_model(
     // Cover all four; the order mirrors what qwen35::load_weights /
     // hfq::load_weights_hfq do at runtime, so the qt we read here is the
     // qt that will end up driving `weights.output.gpu_dtype`.
-    if draft_path.is_some() {
+    if dflash_requested {
         if hfq.arch_id == ARCH_ID_LFM2_MOE {
             #[cfg(not(feature = "arch-lfm2moe"))]
             {
@@ -685,7 +922,7 @@ pub fn load_model(
         }
     }
 
-    // Derive physical_cap. With eviction (cask.sidecar set), the physical
+    // Derive physical_cap. With eviction selected, the physical
     // buffer only needs to hold budget+beta+safety slots; max_seq is the
     // advertised window the client targets. Without eviction, the server may
     // still request a smaller initial allocation and reload a larger worker
@@ -693,7 +930,7 @@ pub fn load_model(
     //
     // The `HIPFIRE_KV_PHYSICAL_CAP` env var is an explicit operator override —
     // useful for ablations or reproducing dflash_spec_demo settings.
-    let physical_cap = if cask.sidecar.is_some() {
+    let physical_cap = if cask_requested {
         let env_override = std::env::var("HIPFIRE_KV_PHYSICAL_CAP")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
@@ -717,13 +954,13 @@ pub fn load_model(
     let embedding_runtime = classify_embedding_workload(hfq.arch_id, embedding_metadata.as_ref())?;
 
     if embedding_runtime == Some(EmbeddingRuntimeKind::Qwen3) {
-        if draft_path.is_some() {
+        if dflash_requested {
             return Err(
                 "DFlash is not supported by Qwen3 embedding workloads; reload without a draft"
                     .into(),
             );
         }
-        if cask.sidecar.is_some() {
+        if cask_requested {
             return Err(
                 "CASK eviction is not supported by Qwen3 embedding workloads; reload without --cask-sidecar"
                     .into(),
@@ -823,13 +1060,13 @@ pub fn load_model(
     if hfq.arch_id == ARCH_ID_EMBEDDINGGEMMA {
         // embeddinggemma is a non-autoregressive encoder: no KV cache, no
         // decode loop, and no speculative drafter/eviction state.
-        if draft_path.is_some() {
+        if dflash_requested {
             return Err(
                 "DFlash not supported on arch_id=19 (embeddinggemma). Reload without a draft."
                     .to_string(),
             );
         }
-        if cask.sidecar.is_some() {
+        if cask_requested {
             return Err(
                 "CASK eviction not supported on arch_id=19 (embeddinggemma). \
                  Reload without --cask-sidecar."
@@ -979,18 +1216,27 @@ pub fn load_model(
     // then resolve by data rather than growing the central arch-id ladder.
     let _ = hipfire_archs::registry();
     if let Some(factory) = hipfire_runtime::arch::serving_factory(hfq.arch_id)? {
-        if draft_path.is_some() {
+        if dflash_requested {
             return Err(format!(
                 "DFlash is not supported by the registered {} backend; reload without a draft",
                 factory.family()
             ));
         }
-        if cask.sidecar.is_some() {
-            return Err(format!(
-                "CASK eviction is not supported by the registered {} backend; reload without --cask-sidecar",
-                factory.family()
-            ));
-        }
+        let registered_triattn = if cask_requested {
+            Some(
+                resolved_triattn_centers
+                    .as_ref()
+                    .and_then(LoadedTriAttn::layered)
+                    .ok_or_else(|| {
+                        format!(
+                            "registered {} backend requires a heterogeneous TriAttention HFQM package; TRIA v1 is not architecture-safe",
+                            factory.family()
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         let _ = state_quant_override;
         let registered_backend = factory.load(
             &mut hfq,
@@ -998,6 +1244,10 @@ pub fn load_model(
             &hipfire_runtime::arch::ServingFactoryOptions {
                 max_seq,
                 kv_mode: &kv_mode,
+                triattn: registered_triattn,
+                cask_budget: cask.budget,
+                cask_beta: cask.beta,
+                physical_cap: cask_requested.then_some(physical_cap),
             },
         )?;
         let physical_cap = registered_backend.physical_cap;
@@ -1076,7 +1326,7 @@ pub fn load_model(
     if hfq.arch_id == ARCH_ID_ZAYA {
         // ZAYA1 (CCA attention + EDA/MoD-routed MoE). Served through the shared
         // ServingBackend seam on ZayaModel (O(1) KV-cache decode).
-        if draft_path.is_some() {
+        if dflash_requested {
             return Err("DFlash not supported on arch_id=16 (zaya).".to_string());
         }
         let _ = kv_mode;
@@ -1170,7 +1420,7 @@ pub fn load_model(
         // nemotron_h (hybrid Mamba-2 + attention/MLP/MoE) and pure Mamba-2
         // from quantized (or bf16) .hfq artifacts, driven through the same
         // Mamba-capable ServingBackend seam.
-        if draft_path.is_some() {
+        if dflash_requested {
             return Err(format!(
                 "DFlash not supported on arch_id={} ({}). Reload without a draft.",
                 hfq.arch_id,
@@ -1299,13 +1549,13 @@ pub fn load_model(
         // its own decode state in `Gemma3Backend`, served via the same
         // `ServingBackend::serve` seam (delegates to `run_simple_ar`). No
         // vision, eviction, DFlash, CASK, or PP.
-        if draft_path.is_some() {
+        if dflash_requested {
             return Err(
                 "DFlash not supported on arch_id=12 (gemma3 text). Reload without a draft."
                     .to_string(),
             );
         }
-        if cask.sidecar.is_some() {
+        if cask_requested {
             return Err("CASK eviction not supported on arch_id=12 (gemma3 text). \
                        Reload without --cask-sidecar."
                 .to_string());
@@ -1402,13 +1652,13 @@ pub fn load_model(
         // `decode_loop` (greedy). No eviction / DFlash / CASK / PP, and not the
         // qwen35-VL `vision_config` splice path (that field stays None for 13;
         // the `has_vl` gate keys off `gemma3_vl.is_some()`).
-        if draft_path.is_some() {
+        if dflash_requested {
             return Err(
                 "DFlash not supported on arch_id=13 (gemma3-vl). Reload without a draft."
                     .to_string(),
             );
         }
-        if cask.sidecar.is_some() {
+        if cask_requested {
             return Err("CASK eviction not supported on arch_id=13 (gemma3-vl). \
                        Reload without --cask-sidecar."
                 .to_string());
@@ -1512,12 +1762,12 @@ pub fn load_model(
         // is the 42-block DotsVisionTransformer. Both load side-by-side in
         // DotsOcrWeights and stay resident. Single-image, greedy decode at
         // bring-up — no eviction, DFlash, CASK, or PP.
-        if draft_path.is_some() {
+        if dflash_requested {
             return Err(
                 "DFlash not supported on arch_id=8 (dots.ocr). Reload without a draft.".to_string(),
             );
         }
-        if cask.sidecar.is_some() {
+        if cask_requested {
             return Err("CASK eviction not supported on arch_id=8 (dots.ocr). Reload without --cask-sidecar.".to_string());
         }
         if pp > 1 {
@@ -1613,12 +1863,12 @@ pub fn load_model(
         // Architecture trait gives us config + weights + state in three
         // calls; forward goes through `deepseek4::forward::forward_prefill_*` /
         // `decode_step` in the generate hot path.
-        if draft_path.is_some() {
+        if dflash_requested {
             return Err("DFlash not supported on arch_id=9 (DeepSeek V4 Flash). \
                        Reload without a draft."
                 .to_string());
         }
-        if cask.sidecar.is_some() {
+        if cask_requested {
             return Err(
                 "CASK eviction not supported on arch_id=9 (DeepSeek V4 Flash). \
                        Reload without --cask-sidecar."
@@ -1735,12 +1985,12 @@ pub fn load_model(
         // calls; prefill + decode both go through the per-token
         // `minimax::forward::decode_step` in the generate hot path. There
         // is NO PrefillBatchScratch (no batched prefill kernel).
-        if draft_path.is_some() {
+        if dflash_requested {
             return Err("DFlash not supported on arch_id=10 (MiniMax-M2). \
                        Reload without a draft."
                 .to_string());
         }
-        if cask.sidecar.is_some() {
+        if cask_requested {
             return Err("CASK eviction not supported on arch_id=10 (MiniMax-M2). \
                        Reload without --cask-sidecar."
                 .to_string());
@@ -1893,7 +2143,7 @@ pub fn load_model(
                         .to_string(),
                 );
             }
-            if draft_path.is_some() && cask.sidecar.is_some() {
+            if dflash_requested && cask_requested {
                 return Err(
                     "LFM2 DFlash does not support CASK/TriAttention eviction yet; \
                      reload without the draft or without the CASK sidecar"
@@ -1912,34 +2162,38 @@ pub fn load_model(
                 physical_cap,
             )
             .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_physical_cap failed: {e}"))?;
-            let lfm2_dflash = if let Some(dp) = draft_path {
-                Some(load_lfm2_dflash_state(
-                    dp,
+            let lfm2_dflash = match resolved_dflash.as_ref() {
+                Some(source) if source.path().is_some() => Some(load_lfm2_dflash_state(
+                    &source.path().unwrap().to_string_lossy(),
                     physical_cap,
                     &config,
                     &state,
                     gpu,
-                )?)
-            } else {
-                None
+                )?),
+                Some(ResolvedComponentSource::Embedded) => {
+                    let manifest = compose_manifest
+                        .as_ref()
+                        .ok_or("embedded DFLASH selected without a manifest")?;
+                    let view = file_component_view(&hfq, manifest, "dflash")
+                        .map_err(|error| format!("embedded DFLASH view: {error}"))?
+                        .ok_or("embedded DFLASH role disappeared from manifest")?;
+                    Some(load_lfm2_dflash_state_source(
+                        &view,
+                        physical_cap,
+                        &config,
+                        &state,
+                        gpu,
+                    )?)
+                }
+                None => None,
+                Some(_) => unreachable!("path-backed DFLASH handled above"),
             };
-            let eviction = if let Some(ref sidecar_path) = cask.sidecar {
-                let centers = TriAttnCenters::load(Path::new(sidecar_path)).map_err(|e| {
-                    use std::io::ErrorKind;
-                    let p = Path::new(sidecar_path);
-                    let why = match e.kind() {
-                        ErrorKind::NotFound if p.symlink_metadata().is_ok() => {
-                            format!("dangling symlink (target absent): {sidecar_path}")
-                        }
-                        ErrorKind::NotFound => format!("file not found: {sidecar_path}"),
-                        ErrorKind::InvalidData => format!("bad format ({e}): {sidecar_path}"),
-                        ErrorKind::UnexpectedEof => {
-                            format!("truncated/corrupt sidecar: {sidecar_path}")
-                        }
-                        _ => format!("read error ({e}): {sidecar_path}"),
-                    };
-                    format!("lfm2moe cask sidecar load failed — {why} (regen: hipfire sidecar-gen, or HIPFIRE_CASK_OFF=1)")
-                })?;
+            let eviction = if let Some(source) = resolved_triattn.as_ref() {
+                let centers = resolved_triattn_centers
+                    .as_ref()
+                    .expect("resolved TriAttention source has parsed centers")
+                    .uniform_centers()?;
+                eprintln!("  TriAttention component source: {}", source.label());
                 let n_attn = config.num_attention_layers();
                 if centers.n_layers != n_attn
                     || centers.n_heads != config.num_attention_heads
@@ -2101,6 +2355,15 @@ pub fn load_model(
         use hipfire_arch_qwen35_vl::Qwen35Vl;
         use hipfire_runtime::arch::Architecture;
         let config = <Qwen35 as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
+        if let Some(source) = resolved_dflash.as_ref() {
+            let draft = load_resolved_dflash_config(source, &hfq, compose_manifest.as_ref())?;
+            draft.validate_target_geometry(
+                config.n_layers,
+                config.dim,
+                config.vocab_size,
+                config.rope_theta,
+            )?;
+        }
 
         // Detect VL model: vision_config presence (from HFQ metadata) AND
         // actual vision tensors are required. Text-only Qwen3.5 models can
@@ -2270,21 +2533,12 @@ pub fn load_model(
         // lacks the FA/LA hybrid wiring TriAttention needs, so sidecars only take
         // effect on arch_id 5/6 — see the cask.rs docs for why CASK targets full-
         // attention layers only.
-        let eviction = if let Some(ref sidecar_path) = cask.sidecar {
-            let centers = TriAttnCenters::load(Path::new(sidecar_path)).map_err(|e| {
-                use std::io::ErrorKind;
-                let p = Path::new(sidecar_path);
-                let why = match e.kind() {
-                    // os error 2: open failed. Disambiguate missing vs dangling symlink.
-                    ErrorKind::NotFound if p.symlink_metadata().is_ok() =>
-                        format!("dangling symlink (target absent): {sidecar_path}"),
-                    ErrorKind::NotFound => format!("file not found: {sidecar_path}"),
-                    ErrorKind::InvalidData => format!("bad format ({e}): {sidecar_path}"),
-                    ErrorKind::UnexpectedEof => format!("truncated/corrupt sidecar: {sidecar_path}"),
-                    _ => format!("read error ({e}): {sidecar_path}"),
-                };
-                format!("cask sidecar load failed — {why} (regen: hipfire sidecar-gen, or HIPFIRE_CASK_OFF=1)")
-            })?;
+        let eviction = if let Some(source) = resolved_triattn.as_ref() {
+            let centers = resolved_triattn_centers
+                .as_ref()
+                .expect("resolved TriAttention source has parsed centers")
+                .uniform_centers()?;
+            eprintln!("  TriAttention component source: {}", source.label());
             let fa_layer_ids =
                 crate::session::qwen35_mixer_profile(&config.layer_types).kv_layer_indices();
             if fa_layer_ids.is_empty() {
@@ -2329,35 +2583,41 @@ pub fn load_model(
         };
         // Optional DFlash draft: load the draft model's weights + a fresh set
         // of per-cycle scratch buffers (hidden ring, verify scratch, GdnTape,
-        // DeltaNetSnapshot) sized for the target's max_seq. If the draft file
-        // is missing or arch-mismatched, we log and continue without DFlash
-        // (temp==0 requests will fall back to AR sampling).
-        let dflash = if let Some(dp) = draft_path {
+        // DeltaNetSnapshot) sized for the target's max_seq. Once a source wins
+        // precedence, an invalid component fails closed rather than falling
+        // through to AR or a lower-precedence artifact.
+        let dflash = if let Some(source) = resolved_dflash.as_ref() {
             // DFlash state (hidden_rb + target_hidden_host) sizes linearly with
             // the ctx_capacity argument. Pass `physical_cap` instead of
             // `max_seq` so eviction's smaller buffer caps VRAM: a 128K-advertised
             // model with physical_cap=896 allocates an 896-slot ring, not 128K.
             // Without eviction, callers may now choose physical_cap < max_seq;
             // pass the actual allocation size so the draft ring matches.
-            match load_dflash_state(dp, physical_cap, &config, &dn, gpu) {
-                Ok(state) => {
-                    eprintln!(
-                        "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
-                        dp,
-                        state.draft_config.n_layers,
-                        state.draft_config.hidden,
-                        state.draft_config.block_size,
-                    );
-                    Some(state)
+            let state = match source {
+                ResolvedComponentSource::Explicit(dp) => {
+                    load_dflash_state(dp, physical_cap, &config, &dn, gpu)?
                 }
-                Err(e) => {
-                    eprintln!(
-                        "  DFlash draft load failed ({}): {} — falling back to AR only",
-                        dp, e
-                    );
-                    None
+                ResolvedComponentSource::Sibling(dp) => {
+                    load_dflash_state(&dp.to_string_lossy(), physical_cap, &config, &dn, gpu)?
                 }
-            }
+                ResolvedComponentSource::Embedded => {
+                    let manifest = compose_manifest
+                        .as_ref()
+                        .ok_or("embedded DFLASH selected without a manifest")?;
+                    let view = file_component_view(&hfq, manifest, "dflash")
+                        .map_err(|error| format!("embedded DFLASH view: {error}"))?
+                        .ok_or("embedded DFLASH role disappeared from manifest")?;
+                    load_dflash_state_source(&view, physical_cap, &config, &dn, gpu)?
+                }
+            };
+            eprintln!(
+                "  DFlash draft loaded: source={} layers={} hidden={} block={}",
+                source.label(),
+                state.draft_config.n_layers,
+                state.draft_config.hidden,
+                state.draft_config.block_size,
+            );
+            Some(state)
         } else {
             None
         };
@@ -3797,12 +4057,24 @@ pub fn load_lfm2_dflash_state(
     gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<Lfm2DflashState, String> {
     let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open LFM2 draft: {e}"))?;
-    let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse LFM2 DflashConfig")?;
+    load_lfm2_dflash_state_source(&hfq, ctx_capacity, target_config, target_state, gpu)
+}
+
+#[cfg(feature = "arch-lfm2moe")]
+fn load_lfm2_dflash_state_source(
+    source: &(impl DflashSource + ?Sized),
+    ctx_capacity: usize,
+    target_config: &lfm2moe::config::Lfm2MoeConfig,
+    target_state: &lfm2moe::lfm2moe::Lfm2MoeState,
+    gpu: &mut hipfire_rdna::Gpu,
+) -> Result<Lfm2DflashState, String> {
+    let draft_config = DflashConfig::from_source(source).ok_or("parse LFM2 DflashConfig")?;
     lfm2moe::validate_dflash_contract(target_config, &draft_config)
         .map_err(|e| format!("LFM2 DFlash draft contract: {e}"))?;
     let use_f16_weights = lfm2moe::lfm2_dflash_use_f16_weights();
-    let draft_weights = DflashWeights::load_with_f16(gpu, &hfq, &draft_config, use_f16_weights)
-        .map_err(|e| format!("load LFM2 draft weights: {e}"))?;
+    let draft_weights =
+        DflashWeights::load_source_with_f16(gpu, source, &draft_config, use_f16_weights)
+            .map_err(|e| format!("load LFM2 draft weights: {e}"))?;
     let sync_gemm = lfm2moe::lfm2_dflash_sync_gemm();
     let draft_scratch = DflashScratch::new_with_mq_and_sync(
         gpu,
@@ -3968,9 +4240,24 @@ pub fn load_dflash_state(
     gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<DflashState, String> {
     let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open draft: {e}"))?;
-    let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse DflashConfig")?;
-    let draft_weights =
-        DflashWeights::load(gpu, &hfq, &draft_config).map_err(|e| format!("load weights: {e}"))?;
+    load_dflash_state_source(&hfq, ctx_capacity, target_config, target_dn, gpu)
+}
+
+fn load_dflash_state_source(
+    source: &(impl DflashSource + ?Sized),
+    ctx_capacity: usize,
+    target_config: &qwen35::Qwen35Config,
+    target_dn: &DeltaNetState,
+    gpu: &mut hipfire_rdna::Gpu,
+) -> Result<DflashState, String> {
+    let draft_config = DflashConfig::from_source(source).ok_or("parse DflashConfig")?;
+    let weights_started = std::time::Instant::now();
+    let draft_weights = DflashWeights::load_source(gpu, source, &draft_config)
+        .map_err(|e| format!("load weights: {e}"))?;
+    eprintln!(
+        "  DFlash weight upload: {:.2}s",
+        weights_started.elapsed().as_secs_f64()
+    );
     let draft_scratch = DflashScratch::new_with_mq(
         gpu,
         &draft_config,
@@ -4164,6 +4451,27 @@ pub fn load_dflash_state(
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    #[test]
+    fn component_resolution_precedence_and_off_are_stable() {
+        let sibling = PathBuf::from("sibling.hfq");
+        assert_eq!(
+            resolve_component_source(Some("explicit.hfq"), true, Some(sibling.clone()), false),
+            Some(ResolvedComponentSource::Explicit("explicit.hfq"))
+        );
+        assert_eq!(
+            resolve_component_source(None, true, Some(sibling.clone()), false),
+            Some(ResolvedComponentSource::Embedded)
+        );
+        assert_eq!(
+            resolve_component_source(None, false, Some(sibling.clone()), false),
+            Some(ResolvedComponentSource::Sibling(sibling))
+        );
+        assert_eq!(
+            resolve_component_source(Some("explicit.hfq"), true, None, true),
+            None
+        );
+    }
 
     fn tensor_info(name: &str, quant_type: QuantType, rows: u32, cols: u32) -> HfqTensorInfo {
         let data_size = if quant_type == QuantType::Oq8G256RowPadded {

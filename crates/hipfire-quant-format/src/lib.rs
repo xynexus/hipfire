@@ -139,6 +139,22 @@ pub enum QuantType {
     /// and must reject this type before unpacking. Each block has the same
     /// `[f16 scale][256 int8]` bytes as [`QuantType::Oq8G256`].
     Oq8G256RowPadded = 43,
+    /// Opaque component bytes carried inside an HFQM bundle. This is not a
+    /// weight encoding and must never be routed to a numeric kernel. The
+    /// component manifest supplies the source format, byte length, and digest;
+    /// the HFQM entry shape is `[n_bytes]` and `group_size` is zero.
+    OpaqueBytes = 44,
+    /// Non-rotated (plain-basis) Opus W8 storage used by DFLASH/NPU artifacts.
+    /// Per G256 block: `[f16 scale][256 signed int8]` = 258 bytes. Unlike
+    /// [`QuantType::Oq8G256`], neither weights nor activations use FWHT.
+    Oq8Plain = 45,
+    /// Non-rotated mixed Opus storage used by DFLASH/NPU artifacts. Per G256
+    /// block: `[f16 scale][128 int4 nibbles][N * (u8 index, i8 value)]`.
+    /// `N` is recorded in artifact metadata and derivable from payload length.
+    Oq4MixedPlain = 46,
+    /// Non-rotated (plain-basis) Opus W4 storage used by DFLASH/NPU artifacts.
+    /// Per G256 block: `[f16 scale][128 signed int4 nibbles]` = 130 bytes.
+    Oq4Plain = 47,
 }
 
 impl QuantType {
@@ -203,6 +219,10 @@ impl QuantType {
             41 => Qtip2G256,
             42 => Qtip4G256,
             43 => Oq8G256RowPadded,
+            44 => OpaqueBytes,
+            45 => Oq8Plain,
+            46 => Oq4MixedPlain,
+            47 => Oq4Plain,
             _ => return None,
         })
     }
@@ -217,7 +237,7 @@ impl QuantType {
     pub const fn group_size(self) -> usize {
         use QuantType::*;
         match self {
-            F16 | F32 | BF16 => 1,
+            F16 | F32 | BF16 | OpaqueBytes => 1,
             Q8F16 => 32,
             Q4F16G64 => 64,
             HFP4G32 | MFP4G32 => 32,
@@ -262,6 +282,9 @@ impl QuantType {
             Oq2G256 => Some(66),  // 2 (f16 scale) + 64 (2-bit×256, signed ±1)
             Oq6G256 => Some(194), // 2 (f16 scale) + 192 (6-bit×256)
             Oq8G256 | Oq8G256RowPadded => Some(258), // 2 (f16 scale) + 256 int8
+            Oq8Plain => Some(258),
+            Oq4Plain => Some(130),
+            OpaqueBytes => Some(1),
             // QTIP trellis (f32 scale + packed symbols)
             Qtip3G256 => Some(100), // 4 + 96 (256×3-bit)
             Qtip4G256 => Some(132), // 4 + 128 (256×4-bit)
@@ -271,8 +294,8 @@ impl QuantType {
             //  - OqPlusG256 / OqPlusCompact: tiered / 130 + 2·N_out
             //  - Oq4G256ArchPacked / Qtip2G256: geometry unconfirmed
             //  - Paro / TidI32: engine-tiled, arch-specific
-            Q8HFQ | HFP4G32 | MFP4G32 | OqPlusG256 | OqPlusCompact | Oq4G256ArchPacked
-            | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 => None,
+            Q8HFQ | HFP4G32 | MFP4G32 | OqPlusG256 | OqPlusCompact | Oq4MixedPlain
+            | Oq4G256ArchPacked | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 => None,
         }
     }
 
@@ -353,6 +376,9 @@ mod tests {
             (QuantType::Oq6G256, 194),
             (QuantType::Oq8G256, 258),
             (QuantType::Oq8G256RowPadded, 258),
+            (QuantType::OpaqueBytes, 1),
+            (QuantType::Oq8Plain, 258),
+            (QuantType::Oq4Plain, 130),
             (QuantType::Qtip3G256, 100),
             (QuantType::Qtip4G256, 132),
         ];
@@ -369,7 +395,7 @@ mod tests {
             QuantType::MFP4G32,
             QuantType::OqPlusG256,
             QuantType::OqPlusCompact,
-            QuantType::Oq2G256,
+            QuantType::Oq4MixedPlain,
             QuantType::Oq4G256ArchPacked,
             QuantType::Qtip2G256,
             QuantType::PARO4G128,
@@ -404,6 +430,7 @@ mod tests {
             Some(4 * 258)
         );
         assert_eq!(QuantType::Oq8G256RowPadded.tensor_bytes(2 * 384), None);
+        assert_eq!(QuantType::OpaqueBytes.tensor_bytes(17), Some(17));
         // Empty tensor = 0 groups.
         assert_eq!(QuantType::MQ4G256.tensor_bytes(0), Some(0));
     }
@@ -424,5 +451,9 @@ mod tests {
         assert_eq!(QuantType::Qtip2G256.code(), 41);
         assert_eq!(QuantType::Qtip4G256.code(), 42);
         assert_eq!(QuantType::Oq8G256RowPadded.code(), 43);
+        assert_eq!(QuantType::OpaqueBytes.code(), 44);
+        assert_eq!(QuantType::Oq8Plain.code(), 45);
+        assert_eq!(QuantType::Oq4MixedPlain.code(), 46);
+        assert_eq!(QuantType::Oq4Plain.code(), 47);
     }
 }

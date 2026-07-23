@@ -463,6 +463,17 @@ impl CaptureRegistry {
     pub fn descriptors(&self) -> impl Iterator<Item = &CaptureDescriptor> {
         self.descriptors.values()
     }
+
+    /// Preserve the architecture-owned logical capture roster while making
+    /// every known tap a no-op. CASK-only passes still validate that forwards
+    /// emit registered IDs; they simply avoid allocating Hessian/imatrix
+    /// accumulators for those IDs.
+    pub fn skip_all(mut self) -> Self {
+        for descriptor in self.descriptors.values_mut() {
+            descriptor.policy = CapturePolicy::Skip;
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1150,6 +1161,57 @@ impl ExpertTelemetry {
         Ok(())
     }
 
+    /// Record one admitted row captured directly by a sequential expert path.
+    ///
+    /// Grouped expert execution stages multiple rows before reducing them, but
+    /// the streamed reference adapters execute and capture one selected expert
+    /// at a time.  The latter still reports the same logical reduction-tile
+    /// contract: every admitted row requires one gather launch and each exact
+    /// tile boundary accounts for one complete reduction tile.
+    pub fn record_direct_capture_launch(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        role: ExpertCaptureRole,
+    ) -> Result<(), CalibError> {
+        self.validate_layer(layer)?;
+        self.validate_expert(expert)?;
+        let admitted_rows = self.capture_stats(layer, expert, role).admitted_rows;
+        if admitted_rows == 0 {
+            return Err(CalibError::InvalidCapture(format!(
+                "layer {layer} expert {expert} {role}: cannot record a direct capture launch before admitting a row"
+            )));
+        }
+        let tile_rows = self.quota.tile_rows as u64;
+        self.record_capture_launches(
+            layer,
+            expert,
+            role,
+            1,
+            usize::from(admitted_rows % tile_rows == 0),
+        )
+    }
+
+    /// Close any nonempty logical reduction tiles for a sequential expert
+    /// layer. This is idempotent so cleanup and checkpoint paths may both call
+    /// it without corrupting telemetry.
+    pub fn finalize_direct_capture_layer(&mut self, layer: usize) -> Result<(), CalibError> {
+        self.validate_layer(layer)?;
+        let tile_rows = self.quota.tile_rows as u64;
+        for expert in 0..self.num_experts {
+            for role in EXPERT_CAPTURE_ROLES {
+                let stats = self.capture_stats(layer, expert, role);
+                if stats.launch_telemetry_recorded
+                    && stats.admitted_rows % tile_rows != 0
+                    && stats.partial_reduction_tiles == 0
+                {
+                    self.record_partial_reduction_tile(layer, expert, role)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn record_partial_reduction_tile(
         &mut self,
         layer: usize,
@@ -1713,6 +1775,12 @@ mod tests {
             }),
             Err(CalibError::DuplicateOutputName(_))
         ));
+        let skipped = registry.skip_all();
+        assert_eq!(
+            skipped.resolve_output("model.layers.0.experts.3.up_proj"),
+            Some(id)
+        );
+        assert_eq!(skipped.get(id).unwrap().policy, CapturePolicy::Skip);
     }
 
     #[test]
@@ -1778,6 +1846,31 @@ mod tests {
             ),
             (6, 4, 2)
         );
+    }
+
+    #[test]
+    fn sequential_capture_launches_reconcile_full_and_partial_tiles() {
+        let mut telemetry = ExpertTelemetry::new(1, 1, 1, quota(), 8).unwrap();
+        for _ in 0..3 {
+            telemetry.record_router_selection(0, &[0], &[1.0]).unwrap();
+            for role in EXPERT_CAPTURE_ROLES {
+                assert_eq!(
+                    telemetry.record_capture_route(0, 0, role, 1.0).unwrap(),
+                    CaptureAdmission::Capture
+                );
+                telemetry.record_direct_capture_launch(0, 0, role).unwrap();
+            }
+        }
+        telemetry.finalize_direct_capture_layer(0).unwrap();
+        telemetry.finalize_direct_capture_layer(0).unwrap();
+
+        for role in EXPERT_CAPTURE_ROLES {
+            let stats = telemetry.capture_stats(0, 0, role);
+            assert_eq!(stats.capture_gather_launches, 3);
+            assert_eq!(stats.full_reduction_tiles, 1);
+            assert_eq!(stats.partial_reduction_tiles, 1);
+        }
+        telemetry.reconcile().unwrap();
     }
 
     #[test]
