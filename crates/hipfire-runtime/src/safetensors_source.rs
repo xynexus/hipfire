@@ -6,7 +6,7 @@
 
 use hipfire_model::{
     ModelSource, QuantConfig, TensorInfo, TensorStorageLocation, ARCH_ID_GEMMA3_TEXT,
-    ARCH_ID_GEMMA3_VL, ARCH_ID_MAMBA2, ARCH_ID_NEMOTRON_H,
+    ARCH_ID_GEMMA3_VL, ARCH_ID_MAMBA2, ARCH_ID_NEMOTRON_H, ARCH_ID_ZAYA,
 };
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -404,6 +404,7 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         "gemma3" => ARCH_ID_GEMMA3_VL,
         "nemotron_h" => ARCH_ID_NEMOTRON_H,
         "mamba2" => ARCH_ID_MAMBA2,
+        "zaya" => ARCH_ID_ZAYA,
         _ => {
             eprintln!(
                 "warning: unknown model_type '{model_type}', defaulting to arch_id=5 (Qwen3.5)"

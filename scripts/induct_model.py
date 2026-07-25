@@ -143,6 +143,33 @@ def preflight_sources(target: Path, draft: Path) -> dict:
     }
 
 
+def _opt_integer(config: dict, key: str):
+    value = config.get(key)
+    return value if isinstance(value, int) else None
+
+
+def preflight_target_only(target: Path) -> dict:
+    """Summarize the target when no DFlash draft is involved.
+
+    Used for target-only and triattn-only inductions, where the DFlash draft
+    and its target/draft compatibility contract are irrelevant. Fields absent
+    from a given architecture's config are reported as null rather than
+    raising, so any supported family can be inducted without a matching draft.
+    """
+    target = resolve_hf_snapshot(target)
+    target_root = _read_config(target)
+    target_text = target_root.get("text_config") or target_root
+    fields = ("hidden_size", "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size")
+    return {
+        "target": {
+            **_source_summary(target),
+            **{field: _opt_integer(target_text, field) for field in fields},
+            "num_hidden_layers": _opt_integer(target_text, "num_hidden_layers"),
+        },
+        "compatibility": "not-applicable (no DFlash stage)",
+    }
+
+
 def artifact_layout(
     root: Path,
     model_name: str,
@@ -646,8 +673,17 @@ def main() -> None:
         parser.error("--sampling-seed must be nonnegative")
 
     target = resolve_hf_snapshot(args.target)
-    draft = resolve_hf_snapshot(args.dflash_source)
-    preflight = preflight_sources(target, draft)
+    if "dflash" in selected:
+        draft = resolve_hf_snapshot(args.dflash_source)
+        preflight = preflight_sources(target, draft)
+    else:
+        # The DFlash draft (and its target/draft compatibility contract) is
+        # irrelevant when the dflash stage is not selected. Skip resolving and
+        # preflighting it so target-only and triattn-only inductions work for
+        # models that have no matching DFlash draft. `draft` is only referenced
+        # by the (unselected) dflash command, so aliasing it to target is safe.
+        draft = target
+        preflight = preflight_target_only(target)
     artifact_root = args.artifact_root.expanduser().resolve()
     dflash_formats = list(dict.fromkeys(args.dflash_formats or DEFAULT_DFLASH_FORMATS))
     paths = artifact_layout(artifact_root, args.model_name, args.quant_format, dflash_formats)

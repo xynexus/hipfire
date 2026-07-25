@@ -62,8 +62,8 @@ const CALIBRATE_USAGE: &str = "usage: hipfire-coexistence calibrate \
 [--max-rows N (default: 2048)] [--min-expert-activations N] [--expert-capture-target N] \
 [--expert-capture-tile-rows N] [--required-expert-fraction F] \
 [--expert-coverage-policy strict|preserve-undercovered] [--kldref|--no-kldref] \
-[--kldref-topk N] [--layer-prefetch-bytes N (default: 17179869184; 0 disables)] \
-[--boundary-dir DIR|--boundary-ram] [--resume] \
+[--kldref-topk N] [--kldref-rows N] [--layer-prefetch-bytes N (default: 17179869184; 0 disables)] \
+[--boundary-dir DIR|--boundary-ram] [--no-resume] \
 [--pause-after-layers N] [--residual-probe-output PATH --residual-probe-rows N] \
 [--dry-run]";
 
@@ -281,6 +281,7 @@ struct CalibrateCommand {
     expert_coverage_policy: ExpertCoveragePolicy,
     kldref: bool,
     kldref_top_k: usize,
+    kldref_rows: Option<usize>,
     layer_prefetch_bytes: u64,
     boundary_ram: bool,
     boundary_directory: Option<PathBuf>,
@@ -309,10 +310,17 @@ impl CalibrateCommand {
         let mut expert_coverage_policy = ExpertCoveragePolicy::Strict;
         let mut kldref = true;
         let mut kldref_top_k = 64usize;
+        let mut kldref_rows: Option<usize> = None;
         let mut layer_prefetch_bytes = CALIBRATION_DEFAULT_LAYER_PREFETCH_BYTES;
         let mut boundary_ram = false;
         let mut boundary_directory = None;
-        let mut resume = false;
+        // Resume is the default: an interrupted calibration should always be
+        // continuable from its layer checkpoint rather than silently restarting
+        // from layer 0. `resume_explicit` keeps `--resume`'s incompatibility
+        // errors (RAM boundaries, residual probes) hard while letting the
+        // *default* quietly step aside for those modes.
+        let mut resume = true;
+        let mut resume_explicit = false;
         let mut pause_after_layers = None;
         let mut residual_probe_output = None;
         let mut residual_probe_rows = 16usize;
@@ -325,7 +333,14 @@ impl CalibrateCommand {
                 "--kldref" => kldref = true,
                 "--no-kldref" => kldref = false,
                 "--boundary-ram" => boundary_ram = true,
-                "--resume" => resume = true,
+                "--resume" => {
+                    resume = true;
+                    resume_explicit = true;
+                }
+                "--no-resume" => {
+                    resume = false;
+                    resume_explicit = false;
+                }
                 _ => {
                     let value = args
                         .get(index + 1)
@@ -366,6 +381,7 @@ impl CalibrateCommand {
                             }
                         }
                         "--kldref-topk" => kldref_top_k = parse_value(flag, value)?,
+                        "--kldref-rows" => kldref_rows = Some(parse_value(flag, value)?),
                         "--layer-prefetch-bytes" => {
                             layer_prefetch_bytes = parse_value(flag, value)?
                         }
@@ -384,6 +400,13 @@ impl CalibrateCommand {
             }
             index += 1;
         }
+        // Two modes cannot checkpoint: RAM boundaries have nothing to resume
+        // from, and residual probes require one uninterrupted pass. An explicit
+        // `--resume` with either is a user error; the default just yields.
+        let unresumable = boundary_ram || residual_probe_output.is_some();
+        if unresumable && !resume_explicit {
+            resume = false;
+        }
         let command = Self {
             model: model.ok_or("calibrate: --model <path> is required")?,
             corpus: corpus.ok_or("calibrate: --corpus <path> is required")?,
@@ -401,6 +424,7 @@ impl CalibrateCommand {
             expert_coverage_policy,
             kldref,
             kldref_top_k,
+            kldref_rows,
             layer_prefetch_bytes,
             boundary_ram,
             boundary_directory,
@@ -463,6 +487,7 @@ impl CalibrateCommand {
             expert_coverage_policy: self.expert_coverage_policy,
             kldref: self.kldref,
             kldref_top_k: self.kldref_top_k,
+            kldref_rows: self.kldref_rows,
         })
     }
 }
@@ -727,6 +752,17 @@ fn load_corpus_samples(
     context: usize,
 ) -> Result<Vec<CalibrationSample>, Box<dyn Error>> {
     let corpus = fs::read_to_string(corpus_path)?;
+    // A `.jsonl` corpus carries a label per record, which becomes the sample's
+    // stratum and lets the router profiler characterise semantically-routed
+    // layers by *what kind of document* reaches an expert. Plain text has no
+    // labels, so every sample shares one stratum and the profile reports no
+    // signal rather than a spurious finding.
+    if corpus_path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+    {
+        return load_labelled_corpus_samples(&corpus, corpus_path, tokenizer, wanted, context);
+    }
     let mut samples = Vec::with_capacity(wanted);
     for paragraph in corpus
         .split("\n\n")
@@ -778,6 +814,120 @@ fn corpus_tokenize_window_bytes(wanted: usize, produced: usize, context: usize) 
         .saturating_mul(context)
         .saturating_mul(8)
         .clamp(256, CORPUS_TOKENIZE_WINDOW_BYTES)
+}
+
+/// Field names a labelled corpus may use for its text and its label, in
+/// preference order. `messages` is the chat-style shape both `Moe-lab/DBES` and
+/// `allenai/tulu-3-sft-mixture` ship; `source` is their label field.
+const CORPUS_TEXT_FIELDS: &[&str] = &["text", "content", "messages"];
+const CORPUS_LABEL_FIELDS: &[&str] = &["stratum", "label", "source", "domain", "language"];
+
+/// Flatten one JSONL record's text field, accepting either a plain string or a
+/// chat-style `messages` array of `{role, content}`.
+fn corpus_record_text(value: &serde_json::Value) -> Option<String> {
+    for field in CORPUS_TEXT_FIELDS {
+        match value.get(field) {
+            Some(serde_json::Value::String(text)) => return Some(text.clone()),
+            Some(serde_json::Value::Array(turns)) => {
+                let joined = turns
+                    .iter()
+                    .filter_map(|turn| turn.get("content").and_then(serde_json::Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !joined.trim().is_empty() {
+                    return Some(joined);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn corpus_record_label(value: &serde_json::Value) -> String {
+    for field in CORPUS_LABEL_FIELDS {
+        if let Some(label) = value.get(field).and_then(serde_json::Value::as_str) {
+            if !label.trim().is_empty() {
+                return label.trim().to_string();
+            }
+        }
+    }
+    "unlabelled".to_string()
+}
+
+/// One sample per JSONL record, each carrying that record's label as its
+/// stratum. Records are consumed in file order and short records are skipped
+/// rather than concatenated, so a sample never straddles two labels — that would
+/// make the per-expert stratum profile a lie.
+fn load_labelled_corpus_samples(
+    corpus: &str,
+    corpus_path: &Path,
+    tokenizer: &Tokenizer,
+    wanted: usize,
+    context: usize,
+) -> Result<Vec<CalibrationSample>, Box<dyn Error>> {
+    let mut samples = Vec::with_capacity(wanted);
+    let mut skipped_short = 0usize;
+    let mut skipped_unparsable = 0usize;
+    for line in corpus.lines() {
+        if samples.len() == wanted {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let record: serde_json::Value = match serde_json::from_str(line) {
+            Ok(record) => record,
+            Err(_) => {
+                skipped_unparsable += 1;
+                continue;
+            }
+        };
+        let Some(text) = corpus_record_text(&record) else {
+            skipped_unparsable += 1;
+            continue;
+        };
+        let stratum = corpus_record_label(&record);
+        // Bound the encode to what one sample can hold; a long record is
+        // truncated, not split across samples.
+        let budget = (context * 8).min(text.len());
+        let mut end = budget;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut tokens = tokenizer.encode(&text[..end]);
+        if tokens.len() < 2 {
+            skipped_short += 1;
+            continue;
+        }
+        tokens.truncate(context);
+        samples.push(CalibrationSample::new(
+            format!("corpus-{:06}", samples.len()),
+            tokens,
+            stratum,
+        ));
+    }
+    if samples.len() != wanted {
+        return Err(format!(
+            "labelled corpus {} produced {} usable records with at least two tokens; requested {wanted} \
+             (skipped {skipped_short} too-short, {skipped_unparsable} unparsable)",
+            corpus_path.display(),
+            samples.len(),
+        )
+        .into());
+    }
+    let strata = samples
+        .iter()
+        .map(|sample| sample.stratum.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    eprintln!(
+        "calibrate: labelled corpus supplied {} samples across {} strata: {}",
+        samples.len(),
+        strata.len(),
+        strata.into_iter().collect::<Vec<_>>().join(", "),
+    );
+    Ok(samples)
 }
 
 fn push_corpus_sample(samples: &mut Vec<CalibrationSample>, tokens: Vec<u32>) {
@@ -948,6 +1098,7 @@ fn dry_run_report(
         max_layer_source_bytes,
         host_memory,
     );
+    let kld_row_stride = kldref_row_stride(job.samples.total_rows(), job.options.kldref_rows);
     Ok(serde_json::json!({
         "command": "calibrate",
         "dry_run": command.dry_run,
@@ -1022,6 +1173,9 @@ fn dry_run_report(
         "kldref": {
             "enabled": job.options.kldref,
             "top_k": job.options.kldref_top_k,
+            "row_cap": job.options.kldref_rows,
+            "row_stride": kld_row_stride,
+            "projected_rows": job.samples.total_rows().div_ceil(kld_row_stride),
         },
         "output": command.output,
         "expected_artifacts": {
@@ -2450,18 +2604,34 @@ impl LayerStreamEngine {
                 adapter.load_finalizer(&mut reader, gpu, &model, &execution_job)?
             };
             let mut builder = KldRefBuilder::new(job.options.kldref_top_k)?;
+            // Row subsetting has to happen BEFORE the finalizer, not after: the
+            // cost is the full-vocabulary lm-head projection, so dropping rows
+            // from the output would save nothing. `kldref_rows` selects a
+            // deterministic even stride over the boundary row index, spreading
+            // the reference across every sample and position rather than taking
+            // a contiguous head.
+            let kld_stride = kldref_row_stride(job.samples.total_rows(), job.options.kldref_rows);
             let execute_result = (|| {
                 for batch in &batches {
-                    let residual = boundary.read_active_indexed(&batch.boundary_rows)?;
+                    let (batch, residual) = if kld_stride > 1 {
+                        let Some(reduced) = subset_batch_by_stride(batch, kld_stride) else {
+                            continue;
+                        };
+                        let residual = boundary.read_active_indexed(&reduced.boundary_rows)?;
+                        (std::borrow::Cow::Owned(reduced), residual)
+                    } else {
+                        let residual = boundary.read_active_indexed(&batch.boundary_rows)?;
+                        (std::borrow::Cow::Borrowed(batch), residual)
+                    };
                     let mut rows = Vec::new();
                     finalizer.execute_kld(
                         gpu,
-                        batch,
+                        &batch,
                         &residual,
                         job.options.kldref_top_k,
                         &mut rows,
                     )?;
-                    validate_kld_batch_rows(batch, &rows)?;
+                    validate_kld_batch_rows(&batch, &rows)?;
                     for row in rows {
                         if kld_row_has_next_token(job, &row)? {
                             builder.push(row)?;
@@ -2661,6 +2831,43 @@ fn validate_kld_batch_rows(
         }
     }
     Ok(())
+}
+
+/// Stride between retained KLDREF rows. `None` (or a target at least as large as
+/// the corpus) keeps every row, matching the historical behaviour.
+fn kldref_row_stride(total_rows: usize, target: Option<usize>) -> usize {
+    match target {
+        Some(target) if target > 0 && target < total_rows => total_rows.div_ceil(target),
+        _ => 1,
+    }
+}
+
+/// Keep the rows of `batch` whose boundary index is on the stride. Returns `None`
+/// when the stride selects nothing from this batch, which the caller skips
+/// entirely so no lm-head projection runs for it.
+fn subset_batch_by_stride(
+    batch: &hipfire_runtime::calibration::schedule::LayerMicrobatch,
+    stride: usize,
+) -> Option<hipfire_runtime::calibration::schedule::LayerMicrobatch> {
+    let mut rows = Vec::new();
+    let mut boundary_rows = Vec::new();
+    for (row, &boundary) in batch.rows.iter().zip(batch.boundary_rows.iter()) {
+        if boundary % stride == 0 {
+            rows.push(row.clone());
+            boundary_rows.push(boundary);
+        }
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    Some(hipfire_runtime::calibration::schedule::LayerMicrobatch {
+        sequence_start: batch.sequence_start,
+        sequence_end: batch.sequence_end,
+        time_start: batch.time_start,
+        time_end: batch.time_end,
+        rows,
+        boundary_rows,
+    })
 }
 
 fn kld_row_has_next_token(job: &CalibrationJob, row: &KldRefRow) -> Result<bool, CalibError> {
@@ -3172,6 +3379,100 @@ mod tests {
         let mut paused = base.to_vec();
         paused.extend(["--pause-after-layers", "1"].map(str::to_string));
         assert!(CalibrateCommand::parse(&paused).is_err());
+    }
+
+    #[test]
+    fn kldref_row_cap_strides_evenly_and_keeps_every_row_by_default() {
+        // Unset, zero, or a cap at least as large as the corpus keeps every row.
+        assert_eq!(kldref_row_stride(1000, None), 1);
+        assert_eq!(kldref_row_stride(1000, Some(0)), 1);
+        assert_eq!(kldref_row_stride(1000, Some(1000)), 1);
+        assert_eq!(kldref_row_stride(1000, Some(4000)), 1);
+        // A cap below the corpus size rounds the stride up, so the retained count
+        // never exceeds the request.
+        assert_eq!(kldref_row_stride(1000, Some(100)), 10);
+        assert_eq!(kldref_row_stride(1000, Some(300)), 4);
+        for target in [1usize, 7, 99, 512] {
+            let stride = kldref_row_stride(226_506, Some(target));
+            let kept = (0..226_506).filter(|row| row % stride == 0).count();
+            assert!(
+                kept <= target.max(1) * 2 && kept >= target / 2,
+                "target {target} kept {kept} with stride {stride}"
+            );
+        }
+    }
+
+    #[test]
+    fn kldref_subset_spreads_across_samples_and_skips_empty_batches() {
+        use hipfire_runtime::calibration::contracts::SampleRow;
+        use hipfire_runtime::calibration::schedule::LayerMicrobatch;
+
+        let batch = LayerMicrobatch {
+            sequence_start: 0,
+            sequence_end: 4,
+            time_start: 0,
+            time_end: 1,
+            rows: (0..4)
+                .map(|sample_index| SampleRow {
+                    sample_index,
+                    position: 0,
+                    token: 1,
+                    reset_state: true,
+                })
+                .collect(),
+            // Sample-major boundary indices, as the planner emits.
+            boundary_rows: vec![0, 10, 20, 30],
+        };
+        // Stride 20 keeps boundary rows 0 and 20 — one row from two different
+        // samples, not a contiguous head.
+        let reduced = subset_batch_by_stride(&batch, 20).expect("some rows selected");
+        assert_eq!(reduced.boundary_rows, vec![0, 20]);
+        assert_eq!(
+            reduced
+                .rows
+                .iter()
+                .map(|r| r.sample_index)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(reduced.rows.len(), reduced.boundary_rows.len());
+
+        // A batch the stride misses entirely is skipped, so no lm-head
+        // projection runs for it at all.
+        let missed = LayerMicrobatch {
+            boundary_rows: vec![3, 7],
+            rows: batch.rows[..2].to_vec(),
+            ..batch.clone()
+        };
+        assert!(subset_batch_by_stride(&missed, 20).is_none());
+    }
+
+    #[test]
+    fn cli_resumes_by_default_and_yields_to_unresumable_modes() {
+        let base = [
+            "--model",
+            "model",
+            "--corpus",
+            "corpus.txt",
+            "--output",
+            "out.hfq",
+        ]
+        .map(str::to_string);
+        assert!(CalibrateCommand::parse(&base).unwrap().resume);
+
+        let mut opted_out = base.to_vec();
+        opted_out.push("--no-resume".into());
+        assert!(!CalibrateCommand::parse(&opted_out).unwrap().resume);
+
+        // RAM boundaries and residual probes cannot checkpoint; the default
+        // steps aside rather than turning every such run into an error.
+        let mut ram = base.to_vec();
+        ram.push("--boundary-ram".into());
+        assert!(!CalibrateCommand::parse(&ram).unwrap().resume);
+
+        let mut probe = base.to_vec();
+        probe.extend(["--residual-probe-output", "residuals.hfq"].map(str::to_string));
+        assert!(!CalibrateCommand::parse(&probe).unwrap().resume);
     }
 
     #[test]
