@@ -48,14 +48,15 @@ pub(crate) fn ping(daemon_state: &mut DaemonState) {
     daemon_state.out.emit(serde_json::json!({ "type": "pong" }));
 }
 
-pub(crate) fn unsupported_on_request_channel(
-    daemon_state: &mut DaemonState,
-    msg: &serde_json::Value,
-    msg_type: &str,
-) {
-    emit_error_with_id(
-        &mut daemon_state.out.sink,
-        msg.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-        format!("{msg_type} is handled on the control channel, not the request channel"),
-    );
+/// A control frame (`abort` / `force_answer`) that named no request.
+///
+/// Control frames are normally consumed by the reader thread, which is what lets
+/// them reach a running generation instead of queueing behind it. One arrives here
+/// only when it carried no `id` — so there is nothing to stop, and saying so is
+/// more useful than dropping it. This used to be the *only* behaviour: the reply
+/// pointed at a control channel that did not exist.
+pub(crate) fn control_frame_names_no_request(daemon_state: &mut DaemonState, msg_type: &str) {
+    daemon_state.out.error(format!(
+        "{msg_type} requires the 'id' of the request to stop"
+    ));
 }

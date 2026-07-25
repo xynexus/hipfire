@@ -1057,7 +1057,14 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             }
         };
 
-        while generated_count < max_tokens && next_tok != eos_tok {
+        // deepseek4 streams through `emit_stream_event` and drives its own loop, so
+        // it reaches neither of the other cancellation points — the arch-generic
+        // `decode_loop_*` nor `emit_filter_action`. Without this check an `abort`
+        // against a deepseek4 generation would be accepted and then ignored.
+        while generated_count < max_tokens
+            && next_tok != eos_tok
+            && !hipfire_runtime::cancel::is_cancelled(id)
+        {
             let frag = tokenizer.decode(&[next_tok]);
             for ev in parser.feed(&frag) {
                 absorb_event(&ev);

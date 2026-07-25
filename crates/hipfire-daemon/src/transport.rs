@@ -33,12 +33,20 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
+use hipfire_runtime::cancel::{self, StopKind};
+
 /// A cloneable handle to one connection's reply stream.
 ///
 /// Cloneable because every frame from a connection has to be able to answer on
 /// it, and `Write` needs `&mut`. The mutex is effectively uncontended — only the
 /// executor writes, and only one request is in flight at a time — but it is what
 /// lets the handle be shared without handing out `&mut` to the same stream twice.
+///
+/// **Only the executor may write.** The lock is taken per `write` call, and
+/// `writeln!` lowers to several of them, so two threads writing one frame could
+/// interleave mid-line and corrupt the stream. That is why reader threads handle
+/// control frames silently instead of acknowledging them — which also matches
+/// `abort` being fire-and-forget by protocol.
 #[derive(Clone)]
 pub(crate) struct ReplySink(Arc<Mutex<Box<dyn Write + Send>>>);
 
@@ -163,6 +171,27 @@ fn serve_connection(read_half: UnixStream, write_half: UnixStream, tx: &SyncSend
     read_frames(BufReader::new(read_half), tx, &reply);
 }
 
+/// Frames a reader answers itself, without involving the executor.
+///
+/// This is the control channel. The executor may be mid-generation and not
+/// reading the queue at all, so a frame that has to reach a *running* request
+/// cannot travel through it — that is exactly why `abort` was previously
+/// unimplementable and replied that it "is handled on the control channel, not the
+/// request channel".
+///
+/// Returns true when the frame was consumed here. A control frame naming no
+/// request is *not* consumed: it goes to the executor so the caller gets told
+/// their request was malformed, rather than being silently dropped.
+fn handle_control_frame(value: &serde_json::Value) -> bool {
+    let kind = match value.get("type").and_then(|v| v.as_str()) {
+        Some("abort") => StopKind::Abort,
+        Some("force_answer") => StopKind::ForceAnswer,
+        _ => return false,
+    };
+    let target = value.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    cancel::request(target, kind)
+}
+
 /// Read newline-delimited frames from `source` and forward them until EOF, a read
 /// error, or the executor hanging up.
 fn read_frames(source: impl BufRead, tx: &SyncSender<Inbound>, reply: &ReplySink) {
@@ -176,7 +205,15 @@ fn read_frames(source: impl BufRead, tx: &SyncSender<Inbound>, reply: &ReplySink
             continue;
         }
         let payload = match serde_json::from_str::<serde_json::Value>(&line) {
-            Ok(value) => Payload::Request(value),
+            Ok(value) => {
+                // Control frames never enter the queue: with a rendezvous channel
+                // and a busy executor, enqueuing an abort would block until the
+                // generation it wants to stop had already finished.
+                if handle_control_frame(&value) {
+                    continue;
+                }
+                Payload::Request(value)
+            }
             Err(error) => Payload::Malformed(error.to_string()),
         };
         // A send error means the executor is gone, so there is nobody left to

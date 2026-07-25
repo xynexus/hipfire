@@ -16,6 +16,7 @@
 pub mod arch;
 pub mod bf16_loader;
 pub mod calibration;
+pub mod cancel;
 #[cfg(feature = "deltanet")]
 pub mod cask;
 pub mod config;

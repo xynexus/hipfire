@@ -145,8 +145,21 @@ pub fn write_error(stdout: &mut dyn std::io::Write, id: &str, message: &str) {
 /// Act on an [`EosFilter`](hipfire_generate::eos_filter) decision: stream any
 /// emitted/held bytes as a `token` event and return `true` when generation
 /// should stop (`Stop`/`StopEmit`), `false` to continue (`Emit`/`Hold`).
+///
+/// Also where a caller's `abort` / `force_answer` is observed *for the inline
+/// decode loops in `generate.rs`*, which call this once per token and already
+/// honour a `true` return as "stop generating".
+///
+/// This is not the only such point: the arch-generic `arch::decode_loop_*` never
+/// calls this function, so it checks `cancel` itself. Hooking only here looked
+/// sufficient and was not — a gemma3-vl abort test ran to completion before that
+/// second hook existed.
+///
+/// Bytes the filter already produced are still emitted before stopping: the token
+/// was generated, and discarding it would lose output the caller may have
+/// received part of.
 pub fn emit_filter_action(stdout: &mut dyn std::io::Write, id: &str, action: FilterAction) -> bool {
-    match action {
+    let filter_stop = match action {
         FilterAction::Emit(text_bytes) => {
             emit_text_bytes(stdout, id, &text_bytes);
             false
@@ -157,7 +170,8 @@ pub fn emit_filter_action(stdout: &mut dyn std::io::Write, id: &str, action: Fil
         }
         FilterAction::Hold => false,
         FilterAction::Stop => true,
-    }
+    };
+    filter_stop || hipfire_runtime::cancel::is_cancelled(id)
 }
 
 /// Emit a `{"type":"token","id","text"}` event for `text_bytes`. No-op on empty

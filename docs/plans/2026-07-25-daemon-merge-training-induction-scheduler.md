@@ -360,9 +360,42 @@ sends (B asks first, A second, each reply routed correctly), sinks surviving acr
 multiple frames per connection, one client disconnecting without taking the daemon
 down, and socket mode 0600. stdio behaviour unchanged.
 
-**M3d — control channel + real `Abort`.** Needs a cancellation token threaded into
-`generate()` (`serving-core/generate.rs`, 28 positional params, none of them a
-token) and a check the executor honours between decode steps.
+**M3d — control channel + real `Abort`. Done.** Reader threads consume `abort` /
+`force_answer` themselves and record the ask in `hipfire_runtime::cancel`; the
+frames never enter the queue. That is the point — with a rendezvous channel and a
+busy executor, *enqueuing* an abort would block until the generation it wanted to
+stop had already finished, which is exactly why the old reply pointed at a control
+channel that did not exist. A control frame naming no request is still forwarded,
+so the caller gets told rather than ignored.
+
+Cancellation is a process global with an id guard rather than a token parameter.
+`generate` takes 28 positional parameters and immediately delegates to one of
+several decode paths, so a token would have to be plumbed through all of them and
+every future one, and any loop that forgot to check it would silently ignore
+aborts. The id guard is what makes the global safe: an abort names its request, so
+a stale one cannot stop an unrelated successor, and the executor clears the slot as
+it takes up new work.
+
+**The plan's assumption here was wrong, and only a real model exposed it.** The
+first implementation hooked `emit_filter_action` alone, on the stated belief that
+every decode loop passes through it once per token. An end-to-end abort against
+gemma3-vl then ran all 400 tokens to completion: the arch-generic
+`arch::decode_loop_*` — which the gemma3 family and every factory/registered
+backend use — never calls it. Cancellation is now checked at three places, and the
+count is the finding:
+
+1. `arch::decode_loop_*` (the generic loop) — the one that mattered here.
+2. `events::emit_filter_action` — the older inline loops in `generate.rs`.
+3. `generate_deepseek4`'s own loop, which streams via `emit_stream_event` and
+   reaches neither of the above.
+
+*Exit (M3d, partially met):* verified end-to-end on gemma3-vl — abort sent from a
+*second connection* against a generation on the first, 12 tokens emitted of a
+400-token request, stopped **0.16 s** later (one decode step at 6.3 tok/s, i.e.
+one-token granularity), terminal frame `finish_reason: "stop"` with `aborted: true`,
+and the daemon still serving afterwards. Paths (2) and (3) are hooked but **not**
+yet verified against a live model — that needs a qwen35 and a deepseek4 run
+respectively.
 
 **M3e — retire the six `DaemonEngine::spawn` sites** (`server/lib.rs:339`,
 `server/routes/chat.rs:632`, `cli/chat.rs:212`, `cli/bench.rs:68`,

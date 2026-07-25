@@ -365,6 +365,8 @@ pub enum StopReason {
     MaxTokens,
     /// Matched a `GenerateCtx::stop_sequences` entry.
     StopSequence,
+    /// The caller asked for this request to stop (`abort` / `force_answer`).
+    Aborted,
 }
 
 /// Result of a [`ServingBackend::serve`] run.
@@ -976,6 +978,18 @@ pub fn decode_loop_with_timing_terminators(
     let mut emitted_tool_calls = false;
 
     while generated < ctx.max_tokens {
+        // Honour a caller's abort before spending another decode step. This is the
+        // cancellation point for every backend that runs the generic loop, which is
+        // the gemma3 family and all factory/registered ones — they never reach
+        // `emit_filter_action`, so checking only there let aborts be ignored
+        // entirely. Once per token is the right granularity: it is the same
+        // boundary EOS and stop-sequences are honoured at, so nothing is left
+        // half-done.
+        if crate::cancel::is_cancelled(ctx.id) {
+            stop = StopReason::Aborted;
+            break;
+        }
+
         // Stop on explicit EOS or any tokenizer-declared terminator. Feed the
         // decoded terminator only to the native state machine so a structural
         // close token can complete a tool call; it is never emitted as text.
@@ -1071,7 +1085,10 @@ pub fn decode_loop_with_timing_terminators(
         match stop {
             StopReason::MaxTokens if generated >= ctx.max_tokens => "length",
             StopReason::MaxTokens => "stop",
-            StopReason::Eos | StopReason::StopSequence => "stop",
+            // An abort is a stop as far as the OpenAI-shaped vocabulary goes;
+            // `aborted` below is what distinguishes it, since a caller needs to
+            // know whether their cancel landed or the run finished on its own.
+            StopReason::Eos | StopReason::StopSequence | StopReason::Aborted => "stop",
         }
     };
     let done = serde_json::json!({
@@ -1085,6 +1102,7 @@ pub fn decode_loop_with_timing_terminators(
         "decode_tok_s": decode_tok_s,
         "ttft_ms": ttft_ms,
         "finish_reason": finish_reason,
+        "aborted": matches!(stop, StopReason::Aborted),
     });
     let _ = writeln!(ctx.sink, "{done}");
     let _ = ctx.sink.flush();

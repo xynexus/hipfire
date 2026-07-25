@@ -1234,6 +1234,12 @@ fn main() {
             transport::Payload::Malformed(_) => String::new(),
         };
 
+        // Drop any stop that arrived too late for its target. An abort names the
+        // request it is for, so a stale one could not stop this request anyway —
+        // but clearing here means it also cannot linger and stop some later
+        // request that happens to reuse the id.
+        hipfire_runtime::cancel::clear();
+
         let msg = match payload {
             transport::Payload::Request(msg) => msg,
             transport::Payload::Malformed(error) => {
@@ -1449,7 +1455,7 @@ fn main() {
             DaemonRequest::Profile => handlers::diag::profile(&mut daemon_state),
 
             DaemonRequest::Abort(_) | DaemonRequest::ForceAnswer(_) => {
-                handlers::status::unsupported_on_request_channel(&mut daemon_state, &msg, &msg_type)
+                handlers::status::control_frame_names_no_request(&mut daemon_state, msg_type)
             }
         }
     }
