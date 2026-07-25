@@ -827,45 +827,56 @@ pub struct NextBatchInput {
     pub now_ms: u64,
 }
 
-fn fair_ordered_prefill_bucket(
-    bucket: &[QueuedPrefillRequest],
+/// Interleave a priority bucket round-robin across distinct owners, starting
+/// after `last_owner`, so one owner cannot monopolise a bucket.
+///
+/// Entries are returned borrowed and in the chosen order, so the caller clones
+/// only what it actually selects (at most `selection_limit`) rather than the
+/// whole bucket. Grouping is a single pass. The previous shape re-scanned the
+/// bucket with `filter(..).nth(i)` once per emitted element, making every
+/// selection O(bucket²) and deep-cloning each queued request's two token
+/// vectors — on a path that runs for every `next_prefill_batch` call.
+fn fair_ordered_prefill_bucket<'a>(
+    bucket: &'a [QueuedPrefillRequest],
     last_owner: Option<&str>,
-) -> Vec<QueuedPrefillRequest> {
-    let mut owners = Vec::<String>::new();
+) -> Vec<&'a QueuedPrefillRequest> {
+    let mut owners: Vec<&str> = Vec::new();
+    let mut per_owner: Vec<Vec<&QueuedPrefillRequest>> = Vec::new();
     for entry in bucket {
-        let owner = entry.session.owner.fairness_key().to_string();
-        if !owners.contains(&owner) {
-            owners.push(owner);
+        let owner = entry.session.owner.fairness_key();
+        match owners.iter().position(|candidate| *candidate == owner) {
+            Some(index) => per_owner[index].push(entry),
+            None => {
+                owners.push(owner);
+                per_owner.push(vec![entry]);
+            }
         }
     }
     if owners.len() <= 1 {
-        return bucket.to_vec();
+        return bucket.iter().collect();
     }
     let start = last_owner
-        .and_then(|last| owners.iter().position(|owner| owner == last))
+        .and_then(|last| owners.iter().position(|owner| *owner == last))
         .map(|index| (index + 1) % owners.len())
         .unwrap_or(0);
-    owners.rotate_left(start);
+    per_owner.rotate_left(start);
 
-    let mut offsets = vec![0usize; owners.len()];
+    // One entry per owner per round, in rotated owner order. An owner that runs
+    // out is simply skipped, which is what the offset bookkeeping did before.
     let mut ordered = Vec::with_capacity(bucket.len());
+    let mut round = 0usize;
     while ordered.len() < bucket.len() {
         let mut progressed = false;
-        for (owner_index, owner) in owners.iter().enumerate() {
-            let Some(entry) = bucket
-                .iter()
-                .filter(|entry| entry.session.owner.fairness_key() == owner)
-                .nth(offsets[owner_index])
-            else {
-                continue;
-            };
-            offsets[owner_index] += 1;
-            ordered.push(entry.clone());
-            progressed = true;
+        for entries in &per_owner {
+            if let Some(entry) = entries.get(round) {
+                ordered.push(*entry);
+                progressed = true;
+            }
         }
         if !progressed {
             break;
         }
+        round += 1;
     }
     ordered
 }
@@ -1552,11 +1563,15 @@ impl PriorityPrefillScheduler {
             if self.buckets[priority].is_empty() {
                 continue;
             }
-            let ordered = fair_ordered_prefill_bucket(
-                &self.buckets[priority],
-                self.last_scheduled_owner[priority].as_deref(),
-            );
-            let candidate = self.select_from_bucket(priority as u8, &ordered, input.now_ms)?;
+            // Scoped so `ordered`'s borrow of `self.buckets` ends before
+            // `remove_selected` needs `&mut self`.
+            let candidate = {
+                let ordered = fair_ordered_prefill_bucket(
+                    &self.buckets[priority],
+                    self.last_scheduled_owner[priority].as_deref(),
+                );
+                self.select_from_bucket(priority as u8, &ordered, input.now_ms)?
+            };
             self.remove_selected(&candidate.sessions);
             self.last_scheduled_owner[priority] = candidate
                 .sessions
@@ -1570,17 +1585,17 @@ impl PriorityPrefillScheduler {
     fn select_from_bucket(
         &self,
         priority: u8,
-        bucket: &[QueuedPrefillRequest],
+        bucket: &[&QueuedPrefillRequest],
         now_ms: u64,
     ) -> Option<PrefillBatchSelection> {
-        let first = bucket.first()?;
+        let first = *bucket.first()?;
         let policy = scheduler_policy_for_priority(first.session.priority, &self.env);
         let selection_limit = self.selection_limit(&policy);
         let compatible = bucket
             .iter()
+            .copied()
             .filter(|entry| sessions_compatible_for_prefill(&first.session, &entry.session))
             .take(selection_limit)
-            .cloned()
             .collect::<Vec<_>>();
         let total_suffix_tokens = compatible
             .iter()
@@ -1635,7 +1650,6 @@ impl PriorityPrefillScheduler {
                     sessions_compatible_for_prefill(&first_aged.session, &entry.session)
                 })
                 .take(selection_limit)
-                .cloned()
                 .collect::<Vec<_>>();
             return Some(self.selection(&compatible, policy));
         }
@@ -1658,7 +1672,7 @@ impl PriorityPrefillScheduler {
 
     fn selection(
         &self,
-        entries: &[QueuedPrefillRequest],
+        entries: &[&QueuedPrefillRequest],
         policy: SchedulerPriorityPolicy,
     ) -> PrefillBatchSelection {
         let sessions = entries
@@ -2387,6 +2401,51 @@ mod tests {
             batch.sessions[0].owner.user_id,
             batch.sessions[1].owner.user_id
         );
+    }
+
+    /// Pins the round-robin interleave directly, including the case the
+    /// scheduler tests above do not reach: one owner running out of queued
+    /// entries while another still has some, which must let the remainder drain
+    /// in arrival order rather than stalling the round.
+    #[test]
+    fn fair_ordered_bucket_interleaves_owners_and_drains_the_remainder() {
+        let queued = |session| QueuedPrefillRequest {
+            session,
+            enqueued_at_ms: 0,
+        };
+        let bucket = vec![
+            queued(owned_session("a1", "alice", "ta", 64)),
+            queued(owned_session("a2", "alice", "ta", 64)),
+            queued(owned_session("a3", "alice", "ta", 64)),
+            queued(owned_session("b1", "bob", "tb", 64)),
+        ];
+        let ids = |ordered: Vec<&QueuedPrefillRequest>| {
+            ordered
+                .iter()
+                .map(|entry| entry.session.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            ids(fair_ordered_prefill_bucket(&bucket, None)),
+            vec!["a1", "b1", "a2", "a3"]
+        );
+        // Having last served alice, the next round starts with bob.
+        assert_eq!(
+            ids(fair_ordered_prefill_bucket(&bucket, Some("alice"))),
+            vec!["b1", "a1", "a2", "a3"]
+        );
+        // An unknown last owner falls back to the head of the rotation.
+        assert_eq!(
+            ids(fair_ordered_prefill_bucket(&bucket, Some("carol"))),
+            vec!["a1", "b1", "a2", "a3"]
+        );
+        // Single-owner buckets keep arrival order untouched.
+        assert_eq!(
+            ids(fair_ordered_prefill_bucket(&bucket[..3], Some("alice"))),
+            vec!["a1", "a2", "a3"]
+        );
+        assert!(fair_ordered_prefill_bucket(&[], None).is_empty());
     }
 
     #[test]

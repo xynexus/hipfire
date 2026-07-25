@@ -228,9 +228,21 @@ independently revertible.
     `tests/smoke-server-decode-batch.sh` asserts `health.decode_batch.total_batches` and
     `selected_batch_size` — deleting them now would break the exact smoke test M4 uses as
     its exit gate. They get *replaced by real counters* in M4, not removed in M0.
-- Fix two bugs found in passing: `?`-on-`Option` head-of-line blocking at
-  `scheduler/lib.rs:1653`, `:1690`, `:1904`; and O(bucket²) `RequestSessionDraft` cloning
-  in `fair_ordered_prefill_bucket` (`:837`).
+- **The `?`-on-`Option` "head-of-line blocking bug" is not a bug — retracted.** It is
+  deliberate priority protection, and it is test-locked: a test whose variable is literally
+  named `blocked` asserts `next_prefill_batch(..).is_none()` while an interactive request is
+  still inside its coalesce window with an opportunistic request queued behind it. Aborting
+  the bucket scan is what stops the GPU being handed to opportunistic work microseconds
+  before a higher-priority batch forms; cooperative preemption would not get it back
+  cheaply. Two of the three reported sites were in code deleted above, and the third is
+  correct as written. Do not "fix" this.
+- **Fixed for real: `fair_ordered_prefill_bucket` was quadratic** (`:830`). It re-scanned
+  the bucket with `filter(..).nth(i)` once per emitted element, and deep-cloned every
+  queued request's two token vectors on every `next_prefill_batch` call — including via the
+  `owners.len() <= 1` fast path, which did a whole-bucket `to_vec()`. Now a single grouping
+  pass returning borrowed entries, so only the entries actually selected (at most
+  `selection_limit`) are cloned. Ordering is unchanged and now pinned by a direct test
+  covering the uneven-drain and rotation cases the scheduler-level tests never reached.
 
 ### M1 — `DaemonState` hoist
 
