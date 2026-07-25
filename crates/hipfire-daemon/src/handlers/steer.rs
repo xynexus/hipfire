@@ -186,3 +186,21 @@ pub(crate) fn clear(daemon_state: &mut DaemonState) {
     let _ = writeln!(daemon_state.stdout, r#"{{"type":"steer_ok"}}"#);
     let _ = daemon_state.stdout.flush();
 }
+
+pub(crate) fn finish_capture(daemon_state: &mut DaemonState) {
+    match hipfire_steer::finish_capture() {
+        Some(means) => {
+            let resp = serde_json::json!({
+                "type": "steer_captured",
+                "means": means.0,
+            });
+            let _ = writeln!(daemon_state.stdout, "{resp}");
+            let _ = daemon_state.stdout.flush();
+        }
+        None => emit_error_with_id(
+            &mut daemon_state.stdout,
+            "",
+            "steer_finish_capture: no capture session active".to_string(),
+        ),
+    }
+}

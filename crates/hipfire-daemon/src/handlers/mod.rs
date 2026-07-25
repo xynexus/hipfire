@@ -16,9 +16,12 @@
 //!   interleave safely today: each write is a whole locked line on a single
 //!   thread. It is also the thing a multi-client transport has to change.
 
+pub mod batch;
 pub mod calibrate;
 pub mod diag;
+pub mod generate;
 pub mod hneurons;
+pub mod lifecycle;
 pub mod lora;
 pub mod sessions;
 pub mod status;
