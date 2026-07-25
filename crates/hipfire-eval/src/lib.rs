@@ -469,6 +469,16 @@ pub struct EvalConfig {
     /// Sets `HIPFIRE_KV_HOT_BITS` on spawned binaries when kvarn + hierarchical.
     #[serde(default)]
     pub hot_bits: Option<usize>,
+    /// Explicit CASK/TriAttention sidecar for the CASK battery. When absent,
+    /// the runtime resolves an embedded component or canonical sibling.
+    #[serde(default)]
+    pub cask_sidecar: Option<PathBuf>,
+    /// Retained physical-token budget used by the daemon-backed CASK battery.
+    #[serde(default = "default_cask_budget")]
+    pub cask_budget: usize,
+    /// Growth interval between CASK compactions.
+    #[serde(default = "default_cask_beta")]
+    pub cask_beta: usize,
     /// `--fixture <a,b>`: substring filter over pflash/longctx NIAH fixtures
     /// (matched against the fixture path + case label). `None` runs all.
     #[serde(default)]
@@ -514,6 +524,14 @@ pub struct EvalConfig {
     /// `--fetch`: ensure datasets/corpora are present, then exit.
     #[serde(default)]
     pub fetch: bool,
+}
+
+fn default_cask_budget() -> usize {
+    512
+}
+
+fn default_cask_beta() -> usize {
+    128
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2215,6 +2233,12 @@ mod tests {
             "baseline-json",
             "--performance-compare-variant",
             "baseline-perf",
+            "--cask-sidecar",
+            "candidate.triattn.hfq",
+            "--cask-budget",
+            "384",
+            "--cask-beta",
+            "96",
         ])
         .unwrap();
         assert_eq!(cfg.tier, EvalTier::Medium);
@@ -2237,6 +2261,38 @@ mod tests {
             cfg.performance_baseline_variant.as_deref(),
             Some("baseline-perf")
         );
+        assert_eq!(
+            cfg.cask_sidecar.as_deref(),
+            Some(Path::new("candidate.triattn.hfq"))
+        );
+        assert_eq!(cfg.cask_budget, 384);
+        assert_eq!(cfg.cask_beta, 96);
+    }
+
+    #[test]
+    fn cask_recall_requires_needle_and_a_prompt_beyond_the_physical_cap() {
+        let (status, reason) = cask_recall_status(
+            "The bell rings twenty-one times.",
+            "twenty-one",
+            Some(2048),
+            896,
+        );
+        assert_eq!(status, EvalStatus::Pass);
+        assert_eq!(reason, None);
+
+        let (status, reason) =
+            cask_recall_status("The bell rings seven times.", "twenty-one", Some(2048), 896);
+        assert_eq!(status, EvalStatus::Fail);
+        assert!(reason.unwrap().contains("committed needle"));
+
+        let (status, reason) = cask_recall_status(
+            "The bell rings twenty-one times.",
+            "twenty-one",
+            Some(512),
+            896,
+        );
+        assert_eq!(status, EvalStatus::Fail);
+        assert!(reason.unwrap().contains("physical KV cap"));
     }
 
     #[test]
@@ -3298,6 +3354,9 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             kv_hierarchical: false,
             kvarn_bits: None,
             hot_bits: None,
+            cask_sidecar: None,
+            cask_budget: 512,
+            cask_beta: 128,
             fixture: None,
             max_tokens: 8,
             dflash: DflashMode::Off,
@@ -7429,6 +7488,9 @@ more noise
             kv_hierarchical: false,
             kvarn_bits: None,
             hot_bits: None,
+            cask_sidecar: None,
+            cask_budget: 512,
+            cask_beta: 128,
             fixture: None,
             max_tokens: 8,
             dflash: DflashMode::Off,

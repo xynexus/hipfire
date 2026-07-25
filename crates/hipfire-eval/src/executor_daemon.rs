@@ -29,6 +29,7 @@ pub(crate) fn daemon_battery_rows(
         BatteryId::Smoke => Some(run_daemon_smoke_rows(config, ctx)),
         BatteryId::Speed => Some(run_daemon_speed_rows(config, ctx)),
         BatteryId::Profile => Some(run_daemon_profile_rows(config, ctx)),
+        BatteryId::Cask => Some(run_daemon_cask_rows(config, ctx)),
         BatteryId::Coherence | BatteryId::Longctx | BatteryId::Agentic => {
             examples_battery_rows(battery, config, ctx, datasets)
         }
@@ -603,6 +604,25 @@ pub(crate) fn daemon_model_load_params(config: &EvalConfig, max_seq: usize) -> M
     }
 }
 
+pub(crate) fn daemon_cask_load_params(config: &EvalConfig, max_seq: usize) -> ModelLoadParams {
+    ModelLoadParams {
+        max_seq: max_seq.min(u32::MAX as usize) as u32,
+        kv_cache: config.kv_mode.clone(),
+        dflash_mode: Some(config.dflash.as_str().to_string()),
+        draft: config.draft.clone(),
+        cask_sidecar: config
+            .cask_sidecar
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        cask: Some(true),
+        cask_budget: Some(config.cask_budget.min(u32::MAX as usize) as u32),
+        cask_beta: Some(config.cask_beta.min(u32::MAX as usize) as u32),
+        cask_core_frac: Some(0.5),
+        cask_fold_m: Some(2),
+        ..Default::default()
+    }
+}
+
 pub(crate) fn daemon_generate_request(
     id: String,
     prompt_text: String,
@@ -830,6 +850,267 @@ pub(crate) fn daemon_speed_failure_rows_for_model(
             )
         })
         .collect()
+}
+
+pub(crate) fn cask_recall_status(
+    text: &str,
+    expected_answer: &str,
+    prefill_tokens: Option<u32>,
+    physical_cap: usize,
+) -> (EvalStatus, Option<String>) {
+    if text.is_empty() || text.contains('\u{fffd}') {
+        return (
+            EvalStatus::Fail,
+            Some("CASK long-context decode returned empty or replacement-character output".into()),
+        );
+    }
+    let recovered = !expected_answer.is_empty()
+        && text
+            .to_ascii_lowercase()
+            .contains(&expected_answer.to_ascii_lowercase());
+    if !recovered {
+        return (
+            EvalStatus::Fail,
+            Some("CASK long-context decode did not recover the committed needle".into()),
+        );
+    }
+    if !prefill_tokens.is_some_and(|tokens| tokens as usize > physical_cap) {
+        return (
+            EvalStatus::Fail,
+            Some(format!(
+                "CASK probe did not exceed its physical KV cap ({physical_cap} tokens)"
+            )),
+        );
+    }
+    (EvalStatus::Pass, None)
+}
+
+pub(crate) fn run_daemon_cask_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    let model_path = Path::new(&config.model);
+    if !model_path.exists() {
+        return vec![skip_row_with_metrics(
+            BatteryId::Cask,
+            None,
+            "embedded_cask_longctx_recall",
+            None,
+            "CASK daemon executor requires the model to resolve to a local filesystem path",
+            config,
+            ctx,
+            prompt("benchmarks/prompts/longprose_multidoc.jsonl"),
+            BTreeMap::from([("executor".to_string(), json!("daemon"))]),
+        )];
+    }
+    if let Some(sidecar) = config.cask_sidecar.as_ref() {
+        if !sidecar.exists() {
+            return vec![row(
+                BatteryId::Cask,
+                None,
+                "embedded_cask_longctx_recall",
+                None,
+                EvalStatus::Fail,
+                Some(format!(
+                    "explicit CASK sidecar does not exist: {}",
+                    sidecar.display()
+                )),
+                BTreeMap::from([
+                    ("implemented".to_string(), json!(true)),
+                    ("executor".to_string(), json!("daemon")),
+                ]),
+                config,
+                ctx,
+                prompt("benchmarks/prompts/longprose_multidoc.jsonl"),
+                0,
+            )];
+        }
+    } else if !hipfire_model::detect_sidecars(model_path).triattn {
+        return vec![skip_row_with_metrics(
+            BatteryId::Cask,
+            None,
+            "embedded_cask_longctx_recall",
+            None,
+            "model has no embedded or canonical sibling TriAttention component; pass --cask-sidecar for an explicit artifact",
+            config,
+            ctx,
+            prompt("benchmarks/prompts/longprose_multidoc.jsonl"),
+            BTreeMap::from([
+                ("implemented".to_string(), json!(true)),
+                ("executor".to_string(), json!("daemon")),
+            ]),
+        )];
+    }
+    let Some(bin) = hipfire_daemon_adapter::find_daemon_bin() else {
+        return vec![skip_row_with_metrics(
+            BatteryId::Cask,
+            None,
+            "embedded_cask_longctx_recall",
+            None,
+            "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`",
+            config,
+            ctx,
+            prompt("benchmarks/prompts/longprose_multidoc.jsonl"),
+            BTreeMap::from([("executor".to_string(), json!("daemon"))]),
+        )];
+    };
+
+    let started = SystemTime::now();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            return vec![row(
+                BatteryId::Cask,
+                None,
+                "embedded_cask_longctx_recall",
+                None,
+                EvalStatus::Fail,
+                Some(format!("create daemon CASK executor runtime: {err}")),
+                BTreeMap::from([
+                    ("implemented".to_string(), json!(true)),
+                    ("executor".to_string(), json!("daemon")),
+                ]),
+                config,
+                ctx,
+                prompt("benchmarks/prompts/longprose_multidoc.jsonl"),
+                elapsed_since_ms(started),
+            )]
+        }
+    };
+    match runtime.block_on(run_daemon_cask_rows_async(config, ctx, &bin)) {
+        Ok(mut rows) => {
+            let elapsed_ms = elapsed_since_ms(started);
+            for row in &mut rows {
+                row.elapsed_ms = elapsed_ms;
+            }
+            rows
+        }
+        Err(err) => vec![row(
+            BatteryId::Cask,
+            None,
+            "embedded_cask_longctx_recall",
+            None,
+            EvalStatus::Fail,
+            Some(format!("daemon-backed CASK executor failed: {err}")),
+            BTreeMap::from([
+                ("implemented".to_string(), json!(true)),
+                ("executor".to_string(), json!("daemon")),
+                ("daemon_bin".to_string(), json!(bin.display().to_string())),
+            ]),
+            config,
+            ctx,
+            prompt("benchmarks/prompts/longprose_multidoc.jsonl"),
+            elapsed_since_ms(started),
+        )],
+    }
+}
+
+pub(crate) async fn run_daemon_cask_rows_async(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+) -> anyhow::Result<Vec<EvalResult>> {
+    let longctx = materialize_longctx_prompt(config).map_err(anyhow::Error::msg)?;
+    let prompt_text = fs::read_to_string(&longctx.prompt_path)?;
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
+    let loaded = engine
+        .load(
+            &config.model,
+            daemon_cask_load_params(config, longctx.max_seq),
+        )
+        .await?;
+    let worker_key_id = loaded.worker_key_id.clone();
+    let evidence_dir = runtime_evidence_dir(config, "cask-longctx-recall", &config.model);
+    let request = daemon_generate_request(
+        "eval-cask-longctx-recall".to_string(),
+        prompt_text,
+        config.max_tokens,
+        Some(worker_key_id.clone()),
+        Some(&evidence_dir),
+    );
+    let (text, done) = engine.generate(request).await?;
+    let floor = config.cask_budget + config.cask_beta + 4;
+    let physical_cap = (config.cask_budget + config.cask_beta + 256)
+        .max(floor)
+        .min(longctx.max_seq);
+    let (status, reason) = cask_recall_status(
+        &text,
+        &longctx.expected_answer,
+        done.prefill_tokens,
+        physical_cap,
+    );
+    let recovered = text
+        .to_ascii_lowercase()
+        .contains(&longctx.expected_answer.to_ascii_lowercase());
+    let component_source = if config.cask_sidecar.is_some() {
+        "explicit"
+    } else if hipfire_model::read_hfq_metadata(Path::new(&config.model))
+        .ok()
+        .and_then(|metadata| serde_json::from_str::<Value>(&metadata.metadata_json).ok())
+        .and_then(|metadata| metadata.get("hipfire_compose").cloned())
+        .and_then(|manifest| manifest.get("components").cloned())
+        .and_then(|components| components.as_array().cloned())
+        .is_some_and(|components| {
+            components
+                .iter()
+                .any(|component| component.get("tag").and_then(Value::as_str) == Some("triattn"))
+        })
+    {
+        "embedded"
+    } else {
+        "sibling"
+    };
+    let mut metrics = longctx.metrics;
+    metrics.extend([
+        ("implemented".to_string(), json!(true)),
+        ("executor".to_string(), json!("daemon")),
+        ("daemon_bin".to_string(), json!(bin.display().to_string())),
+        ("worker_key_id".to_string(), json!(worker_key_id)),
+        ("component_source".to_string(), json!(component_source)),
+        ("cask_policy".to_string(), json!("cask_mfold")),
+        ("cask_budget".to_string(), json!(config.cask_budget)),
+        ("cask_beta".to_string(), json!(config.cask_beta)),
+        ("physical_cap".to_string(), json!(physical_cap)),
+        ("prefill_tokens".to_string(), json!(done.prefill_tokens)),
+        (
+            "prefill_exceeds_physical_cap".to_string(),
+            json!(done
+                .prefill_tokens
+                .is_some_and(|tokens| tokens as usize > physical_cap)),
+        ),
+        ("generated_tokens".to_string(), json!(done.tokens)),
+        ("text_bytes".to_string(), json!(text.len())),
+        ("expected_answer_recovered".to_string(), json!(recovered)),
+        (
+            "expected_answer_hash".to_string(),
+            json!(stable_hash_bytes(longctx.expected_answer.as_bytes())),
+        ),
+        (
+            "output_hash".to_string(),
+            json!(stable_hash_bytes(text.as_bytes())),
+        ),
+        (
+            "combined_dflash".to_string(),
+            json!(!matches!(config.dflash, DflashMode::Off)),
+        ),
+        (
+            "runtime_evidence_dir".to_string(),
+            json!(evidence_dir.display().to_string()),
+        ),
+    ]);
+    Ok(vec![row(
+        BatteryId::Cask,
+        None,
+        "embedded_cask_longctx_recall",
+        None,
+        status,
+        reason,
+        metrics,
+        config,
+        ctx,
+        Some(longctx.prompt_ref),
+        0,
+    )])
 }
 
 pub(crate) fn resolve_eval_model_path(model: &str) -> Option<PathBuf> {

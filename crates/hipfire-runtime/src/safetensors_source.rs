@@ -4,6 +4,7 @@
 //! Reads config.json for architecture detection and quantization config.
 //! Mmaps .safetensors files and serves tensor data by name.
 
+use hipfire_arch_api::ArchRegistry;
 use hipfire_model::{
     ModelSource, QuantConfig, TensorInfo, TensorStorageLocation, ARCH_ID_GEMMA3_TEXT,
     ARCH_ID_GEMMA3_VL, ARCH_ID_MAMBA2, ARCH_ID_NEMOTRON_H,
@@ -54,7 +55,7 @@ impl SafetensorsSource {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         // Derive arch_id from architectures field
-        let arch_id = derive_arch_id(&config);
+        let arch_id = derive_arch_id(&config)?;
 
         // Parse quantization config
         let quant_config = parse_quant_config(&config);
@@ -295,7 +296,7 @@ fn invalid_safetensors(path: &Path, message: &str) -> std::io::Error {
     )
 }
 
-fn derive_arch_id(config: &serde_json::Value) -> u32 {
+fn derive_arch_id(config: &serde_json::Value) -> std::io::Result<u32> {
     let archs = config
         .get("architectures")
         .and_then(|a| a.as_array())
@@ -313,31 +314,31 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
     for arch in &archs {
         let arch_lower = arch.to_lowercase();
         if arch_lower.contains("gemma3forcausallm") {
-            return ARCH_ID_GEMMA3_TEXT;
+            return Ok(ARCH_ID_GEMMA3_TEXT);
         }
         if arch_lower.contains("gemma3forconditionalgeneration") {
-            return ARCH_ID_GEMMA3_VL;
+            return Ok(ARCH_ID_GEMMA3_VL);
         }
         if arch_lower.contains("qwen3_5")
             || arch_lower.contains("qwen3.5")
             || arch_lower.contains("qwen3_6")
             || arch_lower.contains("qwen3.6")
         {
-            return if has_experts { 6 } else { 5 };
+            return Ok(if has_experts { 6 } else { 5 });
         }
         if arch_lower.contains("qwen3") || arch_lower.contains("qwen2") {
-            return 1;
+            return Ok(1);
         }
         if arch_lower.contains("llama") || arch_lower.contains("mistral") {
-            return 0;
+            return Ok(0);
         }
         // NemotronHForCausalLM (Mamba-2 + attn + MLP hybrid). Match the "H"
         // hybrid specifically so plain (llama-based) Nemotron isn't caught.
         if arch_lower.contains("nemotronh") {
-            return ARCH_ID_NEMOTRON_H;
+            return Ok(ARCH_ID_NEMOTRON_H);
         }
         if arch_lower.contains("mamba2") {
-            return ARCH_ID_MAMBA2;
+            return Ok(ARCH_ID_MAMBA2);
         }
     }
 
@@ -348,37 +349,42 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         .map(|s| s.eq_ignore_ascii_case("mamba2"))
         .unwrap_or(false)
     {
-        return ARCH_ID_MAMBA2;
+        return Ok(ARCH_ID_MAMBA2);
     }
 
-    // Fallback: check model_type
-    let model_type = config
-        .get("model_type")
-        .or_else(|| text_config.get("model_type"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    match model_type {
-        "qwen3_5" | "qwen3.5" | "qwen3_6" | "qwen3.6" => {
-            if has_experts {
-                6
-            } else {
-                5
-            }
-        }
-        "qwen3" | "qwen2" => 1,
-        "llama" | "mistral" => 0,
-        "gemma3_text" => ARCH_ID_GEMMA3_TEXT,
-        "gemma3" => ARCH_ID_GEMMA3_VL,
-        "nemotron_h" => ARCH_ID_NEMOTRON_H,
-        "mamba2" => ARCH_ID_MAMBA2,
-        _ => {
-            eprintln!(
-                "warning: unknown model_type '{model_type}', defaulting to arch_id=5 (Qwen3.5)"
-            );
-            5
+    // Canonical model identity is owned by the linked architecture specs. Check
+    // both the wrapper and text-core model_type because multimodal Hugging Face
+    // configs commonly carry one at each level.
+    let mut model_types = Vec::new();
+    for value in [
+        config.get("model_type").and_then(|v| v.as_str()),
+        text_config.get("model_type").and_then(|v| v.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !model_types.contains(&value) {
+            model_types.push(value);
         }
     }
+    let registry = ArchRegistry::build();
+    for model_type in &model_types {
+        if let Some(registered) = registry.find_by_model_type(model_type) {
+            return Ok(registered.id.0 as u32);
+        }
+    }
+
+    let rendered = if model_types.is_empty() {
+        "<missing>".to_string()
+    } else {
+        model_types.join(", ")
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "unsupported Hugging Face model_type(s) [{rendered}]; no linked hipfire architecture spec accepts this source"
+        ),
+    ))
 }
 
 fn parse_quant_config(config: &serde_json::Value) -> Option<QuantConfig> {
@@ -474,7 +480,8 @@ mod tests {
             derive_arch_id(&serde_json::json!({
                 "architectures": ["Gemma3ForCausalLM"],
                 "model_type": "gemma3_text"
-            })),
+            }))
+            .unwrap(),
             ARCH_ID_GEMMA3_TEXT
         );
         assert_eq!(
@@ -482,9 +489,24 @@ mod tests {
                 "architectures": ["Gemma3ForConditionalGeneration"],
                 "model_type": "gemma3",
                 "text_config": { "model_type": "gemma3_text" }
-            })),
+            }))
+            .unwrap(),
             ARCH_ID_GEMMA3_VL
         );
+    }
+
+    #[test]
+    fn unknown_model_type_is_never_guessed_as_qwen35() {
+        let error = derive_arch_id(&serde_json::json!({
+            "architectures": ["HipfireDefinitelyUnknownForCausalLM"],
+            "model_type": "hipfire_test_unknown"
+        }))
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("hipfire_test_unknown"));
+        assert!(error
+            .to_string()
+            .contains("no linked hipfire architecture spec"));
     }
 
     #[test]
@@ -530,7 +552,11 @@ mod tests {
     fn released_mmap_range_refaults_the_original_tensor_bytes() {
         let dir = temp_dir("madvise-refault");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        )
+        .unwrap();
         let payload = vec![0x5au8; 128 * 1024];
         write_shard(&dir.join("model.safetensors"), "weight", &payload);
 

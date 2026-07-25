@@ -100,6 +100,8 @@ pub const ARCH_ID_FLUX2: u32 = 23;
 /// Gemma 4 text core. Standard, text-only, and unified wrappers share one base
 /// identity; modality and MTP artifacts are roles/capabilities, not base ids.
 pub const ARCH_ID_GEMMA4: u32 = 24;
+/// Cohere2-MoE text models, including CohereLabs BLS Mini Code 1.0.
+pub const ARCH_ID_COHERE2_MOE: u32 = 25;
 
 impl core::fmt::Display for ArchId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

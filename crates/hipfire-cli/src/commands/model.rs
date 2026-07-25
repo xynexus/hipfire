@@ -2,18 +2,19 @@
 //! single bundled container and separate base + role/feature sidecar files.
 //!
 //! Native `.hfq`->`.hfq` manipulation (no tensor-byte transform); the heavy
-//! lifting lives in `hipfire_runtime::hfq_compose`.
+//! lifting lives in the offline `hipfire-hfq-tooling` crate.
 
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use hipfire_arch_api::ArchId;
 use hipfire_config::LoadedConfig;
-use hipfire_runtime::hfq::HfqPackage;
-use hipfire_runtime::hfq_compose::{
-    compose_hfq_with_config_keys, decompose_hfq_auto_with_config_keys, sidecar_tag_from_filename,
-    RoleConfigKeys, KNOWN_ROLES,
+use hipfire_hfq_tooling::{
+    check_compose_inputs, compose_hfq_with_config_keys_options,
+    decompose_hfq_auto_with_config_keys_options, sidecar_tag_from_filename, RoleConfigKeys,
+    KNOWN_ROLES,
 };
+use hipfire_runtime::hfq::HfqPackage;
 
 use crate::model::find_model;
 
@@ -70,6 +71,17 @@ pub struct ComposeArgs {
     /// `Model--mq4.hfq` + `Model.mtp.hfq` -> `Model--mtp.mq4.hfq`).
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Validate component roles, formats, architectures, geometry, lengths,
+    /// digests, and reserved namespaces without writing a bundle.
+    #[arg(long)]
+    check: bool,
+    /// Emit a machine-readable JSON report.
+    #[arg(long)]
+    json: bool,
+    /// Replace an existing output bundle. Without this flag compose fails
+    /// closed when the destination exists.
+    #[arg(long)]
+    overwrite: bool,
 }
 
 #[derive(Debug, Args)]
@@ -85,6 +97,13 @@ pub struct DecomposeArgs {
     /// Bundles that DO carry a manifest still take the exact, lossless path.
     #[arg(long)]
     infer: bool,
+    /// Emit a machine-readable JSON report.
+    #[arg(long)]
+    json: bool,
+    /// Replace existing reconstructed component files. Without this flag
+    /// decompose fails closed before replacing a destination.
+    #[arg(long)]
+    overwrite: bool,
 }
 
 pub fn run(args: ModelArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
@@ -162,12 +181,53 @@ fn run_compose(a: ComposeArgs, loaded: &LoadedConfig) -> anyhow::Result<()> {
         .iter()
         .map(|s| resolve(s, loaded))
         .collect::<anyhow::Result<_>>()?;
+    let report = check_compose_inputs(&inputs)?;
+    if a.check {
+        if a.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!(
+                "compatible: {} component(s), bundle arch {}, manifest {}",
+                report.components.len(),
+                report.bundle_arch_id,
+                report.manifest_format
+            );
+            for component in &report.components {
+                println!(
+                    "  {}: {} ({}, arch {}, {} entries, {} bytes, sha256 {})",
+                    component.role,
+                    component.filename,
+                    component.source_format,
+                    component
+                        .arch_id
+                        .map(|arch| arch.to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    component.entries,
+                    component.byte_len,
+                    component.sha256
+                );
+            }
+        }
+        return Ok(());
+    }
     let out = a.output.unwrap_or_else(|| default_bundle_path(&inputs));
     // Arch owns which config keys belong to each sidecar; the base (first input)
     // determines the arch.
     let role_keys = role_config_keys_for(&inputs[0]);
-    let written = compose_hfq_with_config_keys(&inputs, &out, &role_keys)?;
-    println!("composed {} inputs -> {}", inputs.len(), written.display());
+    let written = compose_hfq_with_config_keys_options(&inputs, &out, &role_keys, a.overwrite)?;
+    if a.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "operation": "compose",
+                "output": written,
+                "inputs": inputs,
+                "check": report,
+            }))?
+        );
+    } else {
+        println!("composed {} inputs -> {}", inputs.len(), written.display());
+    }
     Ok(())
 }
 
@@ -197,7 +257,26 @@ mod tests {
 fn run_decompose(a: DecomposeArgs, loaded: &LoadedConfig) -> anyhow::Result<()> {
     let bundle = resolve(&a.bundle, loaded)?;
     let role_keys = role_config_keys_for(&bundle);
-    let written = decompose_hfq_auto_with_config_keys(&bundle, &a.output_dir, a.infer, &role_keys)?;
+    let written = decompose_hfq_auto_with_config_keys_options(
+        &bundle,
+        &a.output_dir,
+        a.infer,
+        &role_keys,
+        a.overwrite,
+    )?;
+    if a.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "operation": "decompose",
+                "bundle": bundle,
+                "output_dir": a.output_dir,
+                "infer": a.infer,
+                "outputs": written,
+            }))?
+        );
+        return Ok(());
+    }
     println!(
         "decomposed{} {} -> {} file(s) in {}",
         if a.infer { " (heuristic)" } else { "" },

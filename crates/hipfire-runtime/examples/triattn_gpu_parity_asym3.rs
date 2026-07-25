@@ -140,6 +140,7 @@ fn main() {
         n_kv_heads,
         head_dim,
         n_rot,
+        false,
         rope_theta,
         p_q,
         seq_len,

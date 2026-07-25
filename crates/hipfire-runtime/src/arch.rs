@@ -518,6 +518,12 @@ pub struct FactoryLoadedBackend {
 pub struct ServingFactoryOptions<'a> {
     pub max_seq: usize,
     pub kv_mode: &'a str,
+    /// Parsed heterogeneous CASK package selected by the shared component
+    /// resolver. Registered families validate their own per-layer geometry.
+    pub triattn: Option<&'a crate::triattn::TriAttnArtifact>,
+    pub cask_budget: usize,
+    pub cask_beta: usize,
+    pub physical_cap: Option<usize>,
 }
 
 /// Object-safe architecture construction seam. Implementations live beside

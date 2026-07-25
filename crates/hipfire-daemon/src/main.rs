@@ -3818,6 +3818,7 @@ fn main() {
                     max_seq,
                     requested_physical_cap,
                     draft_path.as_deref(),
+                    Some(&dflash_mode),
                     kv_mode_override.as_deref(),
                     state_quant_override.as_deref(),
                     &cask,

@@ -193,7 +193,11 @@ pub(crate) fn coherence_shared_model_load_battery(battery: BatteryId) -> bool {
 pub(crate) fn daemon_executor_available_for(config: &EvalConfig, battery: BatteryId) -> bool {
     if !matches!(
         battery,
-        BatteryId::Smoke | BatteryId::Speed | BatteryId::Profile | BatteryId::Vision
+        BatteryId::Smoke
+            | BatteryId::Speed
+            | BatteryId::Profile
+            | BatteryId::Vision
+            | BatteryId::Cask
     ) {
         return false;
     }
@@ -545,6 +549,8 @@ pub(crate) fn result_cache_key(
             "hardware_bucket": ctx.host_profile.hardware_bucket,
             "executor": config.executor.as_str(),
             "kv_mode": config.kv_mode,
+            "cask_budget": config.cask_budget,
+            "cask_beta": config.cask_beta,
             "max_tokens": config.max_tokens,
             "dflash": config.dflash.as_str(),
             "profile": config.profile.as_str(),
@@ -556,6 +562,10 @@ pub(crate) fn result_cache_key(
             "host_memory_bandwidth_gbps": config.host_memory_bandwidth_gbps,
         },
         "inputs": {
+            "cask_sidecar": config.cask_sidecar.as_ref().map(|path| json!({
+                "path": path.display().to_string(),
+                "hash": file_hash(path),
+            })),
             "quality_json": config.quality_json.as_ref().map(|path| json!({
                 "path": path.display().to_string(),
                 "hash": file_hash(path),
@@ -641,7 +651,8 @@ pub(crate) fn result_cache_prompt_paths(battery: BatteryId) -> Vec<&'static str>
             "benchmarks/prompts/flux2_image_admission_scene.txt",
             "benchmarks/prompts/flux2_image_admission_texture.txt",
         ],
-        BatteryId::Barrage | BatteryId::Cask => Vec::new(),
+        BatteryId::Barrage => Vec::new(),
+        BatteryId::Cask => vec!["benchmarks/prompts/longprose_multidoc.jsonl"],
     }
 }
 
@@ -956,7 +967,7 @@ pub(crate) fn run_battery(
             ctx,
             prompt("benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt"),
         )],
-        BatteryId::Longctx | BatteryId::Vision | BatteryId::Cask | BatteryId::Profile => {
+        BatteryId::Longctx | BatteryId::Vision | BatteryId::Profile => {
             vec![skip_row(
                 battery,
                 None,
@@ -968,6 +979,16 @@ pub(crate) fn run_battery(
                 None,
             )]
         }
+        BatteryId::Cask => vec![skip_row(
+            battery,
+            None,
+            "embedded_cask_longctx_recall",
+            None,
+            "CASK requires the daemon executor and a local model with an embedded, explicit, or sibling TriAttention component",
+            config,
+            ctx,
+            prompt("benchmarks/prompts/longprose_multidoc.jsonl"),
+        )],
         // TinyQuant early-returns at the top of `run_battery`; never reaches here.
         BatteryId::TinyQuant => tiny_quant_rows(config, ctx),
         // EmbeddingQuality early-returns at the top of `run_battery`; never here.

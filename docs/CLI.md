@@ -23,6 +23,7 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire model`↴](#hipfire-model)
 * [`hipfire model compose`↴](#hipfire-model-compose)
 * [`hipfire model decompose`↴](#hipfire-model-decompose)
+* [`hipfire model induct`↴](#hipfire-model-induct)
 * [`hipfire lock`↴](#hipfire-lock)
 * [`hipfire lock acquire`↴](#hipfire-lock-acquire)
 * [`hipfire lock release`↴](#hipfire-lock-release)
@@ -361,6 +362,7 @@ Compose/decompose .hfq packaging: bundle a base + role/feature sidecars into one
 
 * `compose` — Merge a base `.hfq` and its role/feature sidecars into one bundled container (records a provenance manifest so `decompose` is lossless)
 * `decompose` — Split a bundled `.hfq` back into its base + sidecar files
+* `induct` — Interactive wizard: bring an external model (HuggingFace repo or local safetensors dir) into a named `.hfq` — calibrate, quantize, fold sidecars
 
 
 
@@ -377,6 +379,9 @@ Merge a base `.hfq` and its role/feature sidecars into one bundled container (re
 ###### **Options:**
 
 * `-o`, `--output <OUTPUT>` — Output bundle path. Default: the base name with the sidecar feature dot-groups inserted before the quant token (e.g. `Model--mq4.hfq` + `Model.mtp.hfq` -> `Model--mtp.mq4.hfq`)
+* `--check` — Validate component roles, formats, architectures, geometry, lengths, digests, and reserved namespaces without writing a bundle
+* `--json` — Emit a machine-readable JSON report
+* `--overwrite` — Replace an existing output bundle. Without this flag compose fails closed when the destination exists
 
 
 
@@ -394,6 +399,24 @@ Split a bundled `.hfq` back into its base + sidecar files
 ###### **Options:**
 
 * `--infer` — Heuristically split a bundle that has no `hipfire_compose` manifest, using the filename's role dot-groups + tensor-name prefixes. Legacy bundles with a plain filename fall back to inferring roles from tensor names alone. Lossy: output files are not byte-identical to any originals. Bundles that DO carry a manifest still take the exact, lossless path
+* `--json` — Emit a machine-readable JSON report
+* `--overwrite` — Replace existing reconstructed component files. Without this flag decompose fails closed before replacing a destination
+
+
+
+## `hipfire model induct`
+
+Interactive wizard: bring an external model (HuggingFace repo or local safetensors dir) into a named `.hfq` — calibrate, quantize, fold sidecars
+
+**Usage:** `hipfire model induct [OPTIONS] [SOURCE]`
+
+###### **Arguments:**
+
+* `<SOURCE>` — Model source: a HuggingFace repo id (`org/name`) or a local safetensors directory. Omit to be prompted
+
+###### **Options:**
+
+* `--format <FORMAT>` — Quant format token (e.g. `oq4++`, `mq4`, `qtip3`, `bf16`). Omit to be prompted from the known list
 
 
 
