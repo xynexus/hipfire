@@ -2447,6 +2447,11 @@ pub const GEMV_Q8_0_WIDE_SRC: &str = include_str!("../../../kernels/src/gemv_q8_
 
 pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip");
 
+/// Multi-row register-blocked Q8_0 GEMV — raises memory-level parallelism on
+/// large-M gemvs (lm_head) that are latency-bound with one row per wave. See
+/// kernels/src/gemv_q8_0_mrow.hip and docs/perf/zaya-decode-optimization.md EXP-22.
+pub const GEMV_Q8_0_MROW_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0_mrow.hip");
+
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
 /// per-row accumulators in registers, broadcasting each weight load across
 /// all batch elements. Saves the (batch_size - 1)× weight re-reads of the
@@ -4174,6 +4179,12 @@ pub const GEMV_OQ4_GROUPED_SRC: &str = include_str!("../../../kernels/src/gemv_o
 /// `gemv_oq4_grouped` — one wave32 per output row, 8 int8/lane (two int32 loads),
 /// no WMMA N-tile waste, weight-bandwidth-bound. See `kernels/src/gemv_oq8_grouped.hip`.
 pub const GEMV_OQ8_GROUPED_SRC: &str = include_str!("../../../kernels/src/gemv_oq8_grouped.hip");
+/// Bandwidth-optimized W8A16 decode GEMV (128-bit loads + 2 groups/wave ILP).
+/// Requires K % 512 == 0. See `kernels/src/gemv_oq8_grouped_v2.hip`.
+pub const GEMV_OQ8_GROUPED_V2_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq8_grouped_v2.hip");
+pub const GEMV_OQ8_W8A8_GROUPED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq8_w8a8_grouped.hip");
 
 /// OQ+ (W8A8) fused QKVZA: in_proj_qkv/z/beta/alpha grouped-iu8 GEMMs in ONE launch
 /// over a shared int8 activation (int8 generalization of fused_qkvza_oq4_wmma).
@@ -4253,6 +4264,24 @@ pub const KVARN_BUILD_KCACHE_SRC: &str =
 pub const GEMV_F16_F32_SRC: &str = include_str!("../../../kernels/src/gemv_f16_f32.hip");
 pub const GEMV_F16_F16_SRC: &str = include_str!("../../../kernels/src/gemv_f16_f16.hip");
 pub const GEMV_BF16_F32_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_f32.hip");
+/// Per-row symmetric Q4 GEMV — the coarse candidate-scorer for the two-stage
+/// lm_head shortlist. See kernels/src/gemv_q4sym_f32.hip.
+pub const GEMV_Q4SYM_F32_SRC: &str = include_str!("../../../kernels/src/gemv_q4sym_f32.hip");
+/// Per-row symmetric Q2 GEMV — the aggressive coarse scorer (row-norm makes it
+/// viable). See kernels/src/gemv_q2sym_f32.hip.
+pub const GEMV_Q2SYM_F32_SRC: &str = include_str!("../../../kernels/src/gemv_q2sym_f32.hip");
+/// Fine pass of the two-stage lm_head: exact bf16 dot over a shortlist of rows,
+/// scatter-writing into the (pre-masked) logits. See kernels/src/gemv_bf16_gather_f32.hip.
+pub const GEMV_BF16_GATHER_F32_SRC: &str =
+    include_str!("../../../kernels/src/gemv_bf16_gather_f32.hip");
+/// GPU top-K passes for the two-stage lm_head (min/max → histogram → compact); keep the
+/// coarse score device-resident and select the shortlist without a host download.
+pub const LMHEAD_COARSE_MINMAX_SRC: &str =
+    include_str!("../../../kernels/src/lmhead_coarse_minmax.hip");
+pub const LMHEAD_COARSE_HIST_SRC: &str =
+    include_str!("../../../kernels/src/lmhead_coarse_hist.hip");
+pub const LMHEAD_COARSE_COMPACT_SRC: &str =
+    include_str!("../../../kernels/src/lmhead_coarse_compact.hip");
 pub const GEMV_BF16_BF16_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_bf16.hip");
 pub const GEMV_IU8_I32_SRC: &str = include_str!("../../../kernels/src/gemv_iu8_i32.hip");
 pub const GEMV_IU4_I32_SRC: &str = include_str!("../../../kernels/src/gemv_iu4_i32.hip");
