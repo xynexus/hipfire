@@ -139,6 +139,19 @@ pub enum QuantType {
     /// and must reject this type before unpacking. Each block has the same
     /// `[f16 scale][256 int8]` bytes as [`QuantType::Oq8G256`].
     Oq8G256RowPadded = 43,
+    /// Coarse lm_head shortlist tier: row-wise L2-normalized, 3σ-clipped
+    /// symmetric Q4 with one f16 scale per ROW. **Planar**, not blocked:
+    /// `[rows*cols/2 nibble bytes][rows*2 f16 scale bytes]`, nibble `2i` in the
+    /// low half of byte `i` and `2i+1` in the high half, levels `[-7, 7]`.
+    ///
+    /// This is not a general weight format — it is the candidate-*selection*
+    /// stage of the two-pass lm_head (see docs/kernel_work/two-stage-lmhead.md).
+    /// The exact norm is carried by the per-row scale and only the unit
+    /// direction is quantized, which is what makes 4 bits sufficient to keep
+    /// the true argmax inside a small top-K (measured recall@8 = 100%).
+    /// It always accompanies a full-precision fine tier that rescores the
+    /// shortlist; it is never the sole storage for a tensor.
+    CoarseQ4Row = 44,
 }
 
 impl QuantType {
@@ -203,6 +216,7 @@ impl QuantType {
             41 => Qtip2G256,
             42 => Qtip4G256,
             43 => Oq8G256RowPadded,
+            44 => CoarseQ4Row,
             _ => return None,
         })
     }
@@ -218,6 +232,9 @@ impl QuantType {
         use QuantType::*;
         match self {
             F16 | F32 | BF16 => 1,
+            // Per-ROW scale: the group is the row, whose width is shape-dependent,
+            // so there is no constant group width. block_bytes() is None.
+            CoarseQ4Row => 1,
             Q8F16 => 32,
             Q4F16G64 => 64,
             HFP4G32 | MFP4G32 => 32,
@@ -271,8 +288,9 @@ impl QuantType {
             //  - OqPlusG256 / OqPlusCompact: tiered / 130 + 2·N_out
             //  - Oq4G256ArchPacked / Qtip2G256: geometry unconfirmed
             //  - Paro / TidI32: engine-tiled, arch-specific
+            //  - CoarseQ4Row: planar (nibble plane + f16 row-scale plane)
             Q8HFQ | HFP4G32 | MFP4G32 | OqPlusG256 | OqPlusCompact | Oq4G256ArchPacked
-            | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 => None,
+            | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 | CoarseQ4Row => None,
         }
     }
 
@@ -295,6 +313,11 @@ impl QuantType {
     /// row-padded OQ8 format instead starts a new group sequence for each row,
     /// so a ragged tail can never join the next row's leading elements.
     pub fn matrix_tensor_bytes(self, rows: usize, cols: usize) -> Option<usize> {
+        // Planar: a nibble plane (cols/2 per row) followed by an f16 row-scale plane.
+        if self == Self::CoarseQ4Row {
+            let nib = rows.checked_mul(cols.div_ceil(2))?;
+            return nib.checked_add(rows.checked_mul(2)?);
+        }
         let block = self.block_bytes()?;
         let groups = match self {
             Self::Oq8G256RowPadded => rows.checked_mul(cols.div_ceil(self.group_size()))?,
