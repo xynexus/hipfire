@@ -41,6 +41,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Some("artifact"), Some("compare-calibration-stability")) => {
             hipfire_coexistence::calibration_compare::run_stability_cli(&args[2..])
         }
+        (Some("artifact"), Some("moe-router-profile")) => {
+            hipfire_coexistence::router_profile::run_cli(&args[2..])
+        }
         (Some("artifact"), Some("compare-residuals")) => {
             hipfire_coexistence::residual_compare::run_cli(&args[2..])
         }
@@ -48,6 +51,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Some("lora"), Some("merge")) => lora_merge(&args[2..]),
         (Some("lora"), Some("convert")) => lora_convert(&args[2..]),
         (Some("import"), Some("gguf")) => import_gguf(&args[2..]),
+        (Some("import"), Some("safetensors")) => {
+            hipfire_coexistence::import_safetensors::run_cli(&args[2..])
+        }
         #[cfg(target_os = "linux")]
         (Some("npu"), Some("pair-hfp")) => npu_pair_hfp(&args[2..]),
         _ => {

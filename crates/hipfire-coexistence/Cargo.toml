@@ -20,6 +20,7 @@ hipfire-model = { path = "../hipfire-model" }
 hipfire-rdna = { path = "../hipfire-rdna" }
 hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
+hipfire-arch-zaya = { path = "../hipfire-arch-zaya" }
 hipfire-hash = { path = "../hipfire-hash" }
 hipfire-lock = { path = "../hipfire-lock" }
 serde.workspace = true
