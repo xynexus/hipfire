@@ -48,13 +48,13 @@ use hipfire_state::{
     parse_unload_worker_request, parsed_handle_may_target_generic, release_sessions_done_json,
     release_state_done_json, reserve_session_state_done_json, reserve_session_state_rejected_json,
     sequence_state_reservation_plan, sequence_state_reservation_plan_for_reserved_bytes,
-    session_state_reservation_describe_json, unload_worker_done_json, GenericSequenceStateArena,
+    session_state_reservation_describe_json, unload_worker_done_json,
 };
 #[cfg(test)]
 use hipfire_state::{
     generic_state_reservation_descriptors, parse_reserve_session_state_kinds,
     parse_sequence_state_handle, sequence_state_handle_id, sequence_state_handle_parts,
-    sequence_state_page_descriptor_json, SequenceStateHandle,
+    sequence_state_page_descriptor_json, GenericSequenceStateArena, SequenceStateHandle,
 };
 use std::io::{BufRead, Write};
 use std::time::Instant;
@@ -974,6 +974,9 @@ mod resource_reservation_tests {
 #[cfg(test)]
 mod generate_batch_prefill_tests;
 
+mod state;
+use state::DaemonState;
+
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
 /// the panic shape we used to emit (which dumped a Rust backtrace and the
 /// raw HipError debug-format) but turns it into a concrete next-step list.
@@ -1134,46 +1137,19 @@ fn main() {
         llm_registry.templates_dir,
     );
 
-    let mut gpu = match hipfire_rdna::Gpu::init() {
+    let gpu = match hipfire_rdna::Gpu::init() {
         Ok(g) => g,
         Err(e) => {
             report_gpu_init_failure(&e);
             std::process::exit(1);
         }
     };
-    let mut model: Option<LoadedModel> = None;
-    let mut active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
-    let mut resident_models: std::collections::HashMap<String, LoadedModel> =
-        std::collections::HashMap::new();
-    let mut generic_state_arena = GenericSequenceStateArena::new();
-    // PFlash speculative-prefill state. None unless the load message
-    // includes a `prefill_drafter` path AND `prefill_compression` != "off".
-    // Lives alongside `model` so unload_model + this state are paired
-    // teardowns.
-    let mut pflash_state: Option<hipfire_arch_qwen35::pflash::PflashState> = None;
-    // The PflashConfig captured at load time. Per-request `prefill_*`
-    // params override individual fields; the rest fall back to these
-    // load-time defaults. Cleared alongside `pflash_state`.
-    let mut pflash_cfg: Option<hipfire_arch_qwen35::pflash::PflashConfig> = None;
-    // H-Neurons CETT capture: per-layer down_proj column norms (`[n_layers][intermediate]`),
-    // loaded once via `cett_load_colnorms` and reused for every `cett_capture` prefill.
-    let mut cett_colnorms: Option<Vec<Vec<f32>>> = None;
-    // Hetero PFlash: when prefill_drafter_device differs from the target,
-    // the drafter weights/KV/scratch live on a sibling device. The compress
-    // output is a host-side Vec<u32>, so no peer-copy is needed — generate
-    // routes maybe_compress_prompt to this handle, decode stays on target.
-    // None means the drafter shares the target gpu (single-card, unchanged).
-    let mut pflash_drafter_gpu: Option<hipfire_rdna::Gpu> = None;
-    let mut dummy_model: Option<DummyModelState> = None;
-    // Resident micro-step-preemptible LoRA training session (see LoraTrainSession).
-    // Some between quanta of a run; runner drives one quantum per TrainLora request.
-    let mut lora_train_session: Option<LoraTrainSession> = None;
-    // Resident micro-step-preemptible SSM-drafter training session (see
-    // DrafterTrainSession). Some between quanta of a run; runner drives one
-    // quantum of EPOCHS per TrainDrafter request.
-    let mut drafter_train_session: Option<DrafterTrainSession> = None;
-    let mut resource_reservations = ResourceReservationManager::from_env();
-    if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+    // Every field below used to be a separate `let mut` local here. They are one
+    // struct so handlers can be extracted taking `&mut DaemonState`; see
+    // `state.rs` for why that ownership, not the read loop, is what serialises
+    // the daemon.
+    let mut daemon_state = DaemonState::new(gpu);
+    if let Err(err) = daemon_state.reacquire_reservations() {
         hipfire_daemon_adapter::fatal_startup_error(
             &format!("failed to claim configured resource reservations: {err}"),
             None,
@@ -1181,7 +1157,6 @@ fn main() {
     }
 
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -1199,7 +1174,7 @@ fn main() {
                 // not JSON-safe (serde messages can carry quotes/newlines and
                 // echo offending input), so raw interpolation would emit a
                 // malformed line and corrupt the JSONL stream.
-                emit_error_with_id(&mut stdout, "", format!("invalid JSON: {e}"));
+                emit_error_with_id(&mut daemon_state.stdout, "", format!("invalid JSON: {e}"));
                 continue;
             }
         };
@@ -1220,7 +1195,7 @@ fn main() {
                 // JSONL stream.
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 emit_error_with_id(
-                    &mut stdout,
+                    &mut daemon_state.stdout,
                     id,
                     format!("unsupported or malformed request '{msg_type}': {e}"),
                 );
@@ -1231,14 +1206,14 @@ fn main() {
         match request {
             DaemonRequest::ModelRegistry => {
                 let _ = serde_json::to_writer(
-                    &mut stdout,
+                    &mut daemon_state.stdout,
                     &serde_json::json!({
                         "type": "model_registry",
                         "registry": llm_registry
                     }),
                 );
-                let _ = writeln!(stdout);
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout);
+                let _ = daemon_state.stdout.flush();
             }
             DaemonRequest::Load(_) => {
                 // A steer session is process-global and outlives the model it was
@@ -1253,41 +1228,53 @@ fn main() {
                 // drain, leaving drafter VRAM resident across the next
                 // load (the explicit "unload" handler has the same
                 // ordering for the same reason).
-                if requested_worker_id == active_worker_id {
-                    generic_state_arena.release_worker(&requested_worker_id);
-                    if let Some(mut pf) = pflash_state.take() {
-                        if let Some(mut dg) = pflash_drafter_gpu.take() {
+                if requested_worker_id == daemon_state.active_worker_id {
+                    daemon_state
+                        .generic_state_arena
+                        .release_worker(&requested_worker_id);
+                    if let Some(mut pf) = daemon_state.pflash_state.take() {
+                        if let Some(mut dg) = daemon_state.pflash_drafter_gpu.take() {
                             dg.bind_thread_or_warn();
                             pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
-                            gpu.bind_thread_or_warn();
+                            daemon_state.gpu.bind_thread_or_warn();
                         } else {
-                            pf.unload_drafter(&mut gpu);
+                            pf.unload_drafter(&mut daemon_state.gpu);
                         }
                     }
-                    pflash_cfg = None;
-                    if let Some(m) = model.take() {
-                        unload_model(m, &mut gpu);
+                    daemon_state.pflash_cfg = None;
+                    if let Some(m) = daemon_state.model.take() {
+                        unload_model(m, &mut daemon_state.gpu);
                     }
-                    resource_reservations.remove_worker(&requested_worker_id);
+                    daemon_state
+                        .resource_reservations
+                        .remove_worker(&requested_worker_id);
                 } else {
                     if let Err(e) = park_active_model(
-                        &mut model,
-                        &mut gpu,
-                        &active_worker_id,
-                        &mut resident_models,
+                        &mut daemon_state.model,
+                        &mut daemon_state.gpu,
+                        &daemon_state.active_worker_id,
+                        &mut daemon_state.resident_models,
                     ) {
-                        write_error(&mut stdout, "", &format!("worker switch failed: {e}"));
-                        let _ = stdout.flush();
+                        write_error(
+                            &mut daemon_state.stdout,
+                            "",
+                            &format!("worker switch failed: {e}"),
+                        );
+                        let _ = daemon_state.stdout.flush();
                         continue;
                     }
-                    active_worker_id = requested_worker_id.clone();
+                    daemon_state.active_worker_id = requested_worker_id.clone();
                 }
-                if let Some(m) = resident_models.remove(&requested_worker_id) {
-                    generic_state_arena.release_worker(&requested_worker_id);
-                    unload_model(m, &mut gpu);
-                    resource_reservations.remove_worker(&requested_worker_id);
+                if let Some(m) = daemon_state.resident_models.remove(&requested_worker_id) {
+                    daemon_state
+                        .generic_state_arena
+                        .release_worker(&requested_worker_id);
+                    unload_model(m, &mut daemon_state.gpu);
+                    daemon_state
+                        .resource_reservations
+                        .remove_worker(&requested_worker_id);
                 }
-                dummy_model = None;
+                daemon_state.dummy_model = None;
 
                 let path = protocol_load
                     .as_ref()
@@ -1300,18 +1287,21 @@ fn main() {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if dummy_requested {
-                    dummy_model = Some(DummyModelState::default());
-                    if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+                    daemon_state.dummy_model = Some(DummyModelState::default());
+                    if let Err(err) = daemon_state
+                        .resource_reservations
+                        .reacquire_placeholders(&mut daemon_state.gpu)
+                    {
                         write_error(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             &format!("dummy load resource reservation failed: {err}"),
                         );
-                        let _ = stdout.flush();
+                        let _ = daemon_state.stdout.flush();
                         continue;
                     }
                     tracing::info!(
-                        model = "hipfire:dummy",
+                        daemon_state.model = "hipfire:dummy",
                         arch = "qwen35_dummy",
                         "dummy model loaded"
                     );
@@ -1325,8 +1315,8 @@ fn main() {
                         "vocab": 1024,
                         "vl": false,
                     });
-                    let _ = writeln!(stdout, "{line}");
-                    let _ = stdout.flush();
+                    let _ = writeln!(daemon_state.stdout, "{line}");
+                    let _ = daemon_state.stdout.flush();
                     continue;
                 }
 
@@ -1509,14 +1499,14 @@ fn main() {
                     .and_then(|p| p.get("mmq_screen"))
                     .and_then(|v| v.as_bool())
                 {
-                    gpu.mmq_screen = v;
+                    daemon_state.gpu.mmq_screen = v;
                 }
                 if let Some(v) = msg
                     .get("params")
                     .and_then(|p| p.get("mmq_screen_threshold"))
                     .and_then(|v| v.as_f64())
                 {
-                    gpu.mmq_screen_threshold = v as f32;
+                    daemon_state.gpu.mmq_screen_threshold = v as f32;
                 }
 
                 // ── PFlash load-time params (Phase 4.0 #93) ──────────────
@@ -1622,28 +1612,28 @@ fn main() {
                         && std::env::var("HIPFIRE_PP_DFLASH").ok().as_deref() != Some("1")
                     {
                         let _ = writeln!(
-                            stdout,
+                            daemon_state.stdout,
                             r#"{{"type":"error","message":"DFlash speculative decode requires pp=1 in v1 (set HIPFIRE_PP_DFLASH=1 to opt into the experimental pp>1 PRD path; note PR2-4 of docs/plans/hetero-pflash-dflash.prd are not yet implemented — the load message will accept but generate will not run cross-card spec-decode). See issue #58 v1.1 roadmap."}}"#
                         );
-                        let _ = stdout.flush();
+                        let _ = daemon_state.stdout.flush();
                         continue;
                     }
                     if cask.sidecar.is_some() {
                         let _ = writeln!(
-                            stdout,
+                            daemon_state.stdout,
                             r#"{{"type":"error","message":"CASK / TriAttention eviction requires pp=1 in v1; see issue #58 v1.1 roadmap"}}"#
                         );
-                        let _ = stdout.flush();
+                        let _ = daemon_state.stdout.flush();
                         continue;
                     }
                     if (pflash_drafter.is_some() || pflash_mode_str != "off")
                         && std::env::var("HIPFIRE_PP_PFLASH").ok().as_deref() != Some("1")
                     {
                         let _ = writeln!(
-                            stdout,
+                            daemon_state.stdout,
                             r#"{{"type":"error","message":"PFlash prefill compression requires pp=1 in v1 (set HIPFIRE_PP_PFLASH=1 to opt into the experimental pp>1 PoC); see issue #58 v1.1 roadmap"}}"#
                         );
-                        let _ = stdout.flush();
+                        let _ = daemon_state.stdout.flush();
                         continue;
                     }
                 }
@@ -1668,16 +1658,20 @@ fn main() {
                 )));
                 let _qwen_residency_env =
                     qwen_residency_load_env(protocol_load.as_ref().map(|req| &req.params));
-                let planned_resource_usage = resource_reservations
+                let planned_resource_usage = daemon_state
+                    .resource_reservations
                     .planned_usage_for_load(path, protocol_load.as_ref().map(|req| &req.params));
-                if let Err(err) = resource_reservations.release_placeholders(&mut gpu) {
+                if let Err(err) = daemon_state
+                    .resource_reservations
+                    .release_placeholders(&mut daemon_state.gpu)
+                {
                     hipfire_runtime::load_progress::set_sink(None);
                     write_error(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         &format!("resource reservation release failed before load: {err}"),
                     );
-                    let _ = stdout.flush();
+                    let _ = daemon_state.stdout.flush();
                     continue;
                 }
                 let load_result = load_model(
@@ -1689,23 +1683,31 @@ fn main() {
                     state_quant_override.as_deref(),
                     &cask,
                     pp,
-                    &mut gpu,
+                    &mut daemon_state.gpu,
                 );
                 hipfire_runtime::load_progress::set_sink(None);
                 match load_result {
                     Ok(mut m) => {
-                        resource_reservations
+                        daemon_state
+                            .resource_reservations
                             .set_worker_usage(requested_worker_id.clone(), planned_resource_usage);
-                        if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
-                            resource_reservations.remove_worker(&requested_worker_id);
-                            unload_model(m, &mut gpu);
-                            let _ = resource_reservations.reacquire_placeholders(&mut gpu);
+                        if let Err(err) = daemon_state
+                            .resource_reservations
+                            .reacquire_placeholders(&mut daemon_state.gpu)
+                        {
+                            daemon_state
+                                .resource_reservations
+                                .remove_worker(&requested_worker_id);
+                            unload_model(m, &mut daemon_state.gpu);
+                            let _ = daemon_state
+                                .resource_reservations
+                                .reacquire_placeholders(&mut daemon_state.gpu);
                             write_error(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 "",
                                 &format!("resource reservation reacquire failed after load: {err}"),
                             );
-                            let _ = stdout.flush();
+                            let _ = daemon_state.stdout.flush();
                             continue;
                         }
                         let arch = m.registered_backend.as_ref().map_or_else(
@@ -1868,7 +1870,7 @@ fn main() {
                         if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
                             if let Ok(secs) = secs_str.parse::<f32>() {
                                 if secs > 0.0 {
-                                    if let Err(e) = gpu.dpm_warmup(secs) {
+                                    if let Err(e) = daemon_state.gpu.dpm_warmup(secs) {
                                         eprintln!("[daemon] dpm_warmup failed (non-fatal): {e:?}");
                                     }
                                 }
@@ -1880,7 +1882,7 @@ fn main() {
                         let cache_capable = m.arch_id == ARCH_ID_DEEPSEEK4_FLASH
                             || is_qwen35_family_arch_id(m.arch_id);
                         let _ = writeln!(
-                            stdout,
+                            daemon_state.stdout,
                             "{}",
                             serde_json::json!({
                                 "type": "loaded",
@@ -1907,12 +1909,12 @@ fn main() {
                             if pflash_mode_str != "off" {
                                 if let Some(ref reason) = pflash_load_err {
                                     let _ = writeln!(
-                                        stdout,
+                                        daemon_state.stdout,
                                         r#"{{"type":"pflash_load_failed","reason":"invalid load param: {}"}}"#,
                                         reason.replace('"', "'")
                                     );
-                                    let _ = stdout.flush();
-                                    model = Some(m);
+                                    let _ = daemon_state.stdout.flush();
+                                    daemon_state.model = Some(m);
                                     continue;
                                 }
                                 let pf_cfg = hipfire_arch_qwen35::pflash::PflashConfig {
@@ -1952,7 +1954,7 @@ fn main() {
                                             Ok(g) => sibling = Some(g),
                                             Err(e) => {
                                                 let _ = writeln!(
-                                                    stdout,
+                                                    daemon_state.stdout,
                                                     r#"{{"type":"pflash_load_failed","reason":"drafter device {} init: {}"}}"#,
                                                     pflash_drafter_device,
                                                     e.to_string().replace('"', "'")
@@ -1961,7 +1963,7 @@ fn main() {
                                         }
                                     }
                                     let dg: &mut hipfire_rdna::Gpu =
-                                        sibling.as_mut().unwrap_or(&mut gpu);
+                                        sibling.as_mut().unwrap_or(&mut daemon_state.gpu);
                                     dg.bind_thread_or_warn();
                                     match hipfire_arch_qwen35::pflash::load_drafter(
                                         &mut pf_state,
@@ -1975,7 +1977,7 @@ fn main() {
                                                 pf_drafter_path, pflash_drafter_device, pflash_mode_str,
                                                 pf_state.tokenizer_compat, pflash_keep_ratio, pflash_threshold);
                                             let _ = writeln!(
-                                                stdout,
+                                                daemon_state.stdout,
                                                 r#"{{"type":"pflash","mode":"{}","drafter":"{}","drafter_device":{},"tokenizer_compat":{},"keep_ratio":{},"threshold":{}}}"#,
                                                 pflash_mode_str,
                                                 pf_drafter_path,
@@ -1984,14 +1986,15 @@ fn main() {
                                                 pflash_keep_ratio,
                                                 pflash_threshold
                                             );
-                                            pflash_state = Some(pf_state);
-                                            pflash_cfg = Some(pf_cfg);
-                                            pflash_drafter_gpu = sibling; // persist sibling across requests (None if shared)
+                                            daemon_state.pflash_state = Some(pf_state);
+                                            daemon_state.pflash_cfg = Some(pf_cfg);
+                                            daemon_state.pflash_drafter_gpu = sibling;
+                                            // persist sibling across requests (None if shared)
                                         }
                                         Err(e) => {
                                             eprintln!("[pflash] LOAD FAILED: {}", e);
                                             let _ = writeln!(
-                                                stdout,
+                                                daemon_state.stdout,
                                                 r#"{{"type":"pflash_load_failed","reason":"{}"}}"#,
                                                 e.to_string().replace('"', "'")
                                             );
@@ -1999,39 +2002,43 @@ fn main() {
                                     }
                                 } else {
                                     let _ = writeln!(
-                                        stdout,
+                                        daemon_state.stdout,
                                         r#"{{"type":"pflash_load_failed","reason":"target tokenizer unavailable"}}"#
                                     );
                                 }
                             }
                         }
 
-                        model = Some(m);
+                        daemon_state.model = Some(m);
                     }
                     Err(e) => {
-                        if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+                        if let Err(err) = daemon_state
+                            .resource_reservations
+                            .reacquire_placeholders(&mut daemon_state.gpu)
+                        {
                             eprintln!(
                                 "[hipfire-daemon] failed to restore resource reservations after load failure: {err}"
                             );
                         }
-                        let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
+                        let (vram_free, vram_total) =
+                            daemon_state.gpu.hip.get_vram_info().unwrap_or((0, 0));
                         let free_mb = vram_free / (1024 * 1024);
                         let total_mb = vram_total / (1024 * 1024);
                         // serde-escape: raw HipError debug contains { } and "
                         // which corrupt the JSONL protocol if interpolated raw.
-                        write_error(&mut stdout, "", &format!(
-                            "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)", gpu.arch));
+                        write_error(&mut daemon_state.stdout, "", &format!(
+                            "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)", daemon_state.gpu.arch));
                     }
                 }
-                let _ = stdout.flush();
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::Embed(req) => {
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 let target_worker_id = message_worker_id(&msg);
-                if dummy_model.is_some() {
+                if daemon_state.dummy_model.is_some() {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         id,
                         "embed is not supported for the dummy model",
                     );
@@ -2039,52 +2046,62 @@ fn main() {
                 }
                 match activate_model_worker(
                     &target_worker_id,
-                    &mut active_worker_id,
-                    &mut model,
-                    &mut gpu,
-                    &mut resident_models,
+                    &mut daemon_state.active_worker_id,
+                    &mut daemon_state.model,
+                    &mut daemon_state.gpu,
+                    &mut daemon_state.resident_models,
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             id,
                             format!("unknown model worker {target_worker_id}"),
                         );
                         continue;
                     }
                     Err(e) => {
-                        emit_error_with_id(&mut stdout, id, format!("worker switch failed: {e}"));
+                        emit_error_with_id(
+                            &mut daemon_state.stdout,
+                            id,
+                            format!("worker switch failed: {e}"),
+                        );
                         continue;
                     }
                 }
-                let Some(m) = model.as_ref() else {
-                    emit_error_with_id(&mut stdout, id, "no model loaded");
+                let Some(m) = daemon_state.model.as_ref() else {
+                    emit_error_with_id(&mut daemon_state.stdout, id, "no model loaded");
                     continue;
                 };
-                match embeddinggemma_embed(&mut gpu, m, &req.texts, req.input_type, req.dims) {
+                match embeddinggemma_embed(
+                    &mut daemon_state.gpu,
+                    m,
+                    &req.texts,
+                    req.input_type,
+                    req.dims,
+                ) {
                     Ok(embeddings) => {
                         let _ = serde_json::to_writer(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             &serde_json::json!({
                                 "type": "embeddings",
                                 "id": id,
                                 "embeddings": embeddings,
                             }),
                         );
-                        let _ = writeln!(stdout);
-                        let _ = stdout.flush();
+                        let _ = writeln!(daemon_state.stdout);
+                        let _ = daemon_state.stdout.flush();
                     }
-                    Err(e) => emit_error_with_id(&mut stdout, id, e),
+                    Err(e) => emit_error_with_id(&mut daemon_state.stdout, id, e),
                 }
             }
 
             DaemonRequest::Rerank(req) => {
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 let target_worker_id = message_worker_id(&msg);
-                if dummy_model.is_some() {
+                if daemon_state.dummy_model.is_some() {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         id,
                         "rerank is not supported for the dummy model",
                     );
@@ -2092,43 +2109,47 @@ fn main() {
                 }
                 match activate_model_worker(
                     &target_worker_id,
-                    &mut active_worker_id,
-                    &mut model,
-                    &mut gpu,
-                    &mut resident_models,
+                    &mut daemon_state.active_worker_id,
+                    &mut daemon_state.model,
+                    &mut daemon_state.gpu,
+                    &mut daemon_state.resident_models,
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             id,
                             format!("unknown model worker {target_worker_id}"),
                         );
                         continue;
                     }
                     Err(e) => {
-                        emit_error_with_id(&mut stdout, id, format!("worker switch failed: {e}"));
+                        emit_error_with_id(
+                            &mut daemon_state.stdout,
+                            id,
+                            format!("worker switch failed: {e}"),
+                        );
                         continue;
                     }
                 }
-                let Some(m) = model.as_ref() else {
-                    emit_error_with_id(&mut stdout, id, "no model loaded");
+                let Some(m) = daemon_state.model.as_ref() else {
+                    emit_error_with_id(&mut daemon_state.stdout, id, "no model loaded");
                     continue;
                 };
-                match embeddinggemma_rerank(&mut gpu, m, &req.query, &req.documents) {
+                match embeddinggemma_rerank(&mut daemon_state.gpu, m, &req.query, &req.documents) {
                     Ok(results) => {
                         let _ = serde_json::to_writer(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             &serde_json::json!({
                                 "type": "rerank_scores",
                                 "id": id,
                                 "results": results,
                             }),
                         );
-                        let _ = writeln!(stdout);
-                        let _ = stdout.flush();
+                        let _ = writeln!(daemon_state.stdout);
+                        let _ = daemon_state.stdout.flush();
                     }
-                    Err(e) => emit_error_with_id(&mut stdout, id, e),
+                    Err(e) => emit_error_with_id(&mut daemon_state.stdout, id, e),
                 }
             }
 
@@ -2146,18 +2167,18 @@ fn main() {
                     .or_else(|| msg.get("id").and_then(|v| v.as_str()))
                     .unwrap_or("0");
                 let target_worker_id = message_worker_id(&msg);
-                if dummy_model.is_none() {
+                if daemon_state.dummy_model.is_none() {
                     match activate_model_worker(
                         &target_worker_id,
-                        &mut active_worker_id,
-                        &mut model,
-                        &mut gpu,
-                        &mut resident_models,
+                        &mut daemon_state.active_worker_id,
+                        &mut daemon_state.model,
+                        &mut daemon_state.gpu,
+                        &mut daemon_state.resident_models,
                     ) {
                         Ok(true) => {}
                         Ok(false) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 id,
                                 format!("unknown model worker {target_worker_id}"),
                             );
@@ -2165,7 +2186,7 @@ fn main() {
                         }
                         Err(e) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 id,
                                 format!("worker switch failed: {e}"),
                             );
@@ -2182,7 +2203,7 @@ fn main() {
                     .get("prefill_already_done")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if let Some(dummy) = dummy_model.as_mut() {
+                if let Some(dummy) = daemon_state.dummy_model.as_mut() {
                     let prompt = protocol_generate
                         .as_ref()
                         .map(|req| req.prompt.as_str())
@@ -2205,7 +2226,7 @@ fn main() {
                         "dummy generate"
                     );
                     dummy.generate(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         id,
                         session_id,
                         prompt,
@@ -2214,12 +2235,14 @@ fn main() {
                     );
                     continue;
                 }
-                let m = match model.as_mut() {
+                let m = match daemon_state.model.as_mut() {
                     Some(m) => m,
                     None => {
-                        let _ =
-                            writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
-                        let _ = stdout.flush();
+                        let _ = writeln!(
+                            daemon_state.stdout,
+                            r#"{{"type":"error","message":"no model loaded"}}"#
+                        );
+                        let _ = daemon_state.stdout.flush();
                         continue;
                     }
                 };
@@ -2248,13 +2271,13 @@ fn main() {
                 if supports_generate_session {
                     let target_session_id =
                         session_id.unwrap_or_else(|| loaded_model_default_session_id(m));
-                    if let Err(e) = m.activate_session(&mut gpu, target_session_id) {
-                        emit_error_with_id(&mut stdout, id, e);
+                    if let Err(e) = m.activate_session(&mut daemon_state.gpu, target_session_id) {
+                        emit_error_with_id(&mut daemon_state.stdout, id, e);
                         continue;
                     }
                 } else if session_id.is_some() || prefill_already_done {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         id,
                         "session_id/prefill_already_done are only supported for single-GPU qwen35/qwen35-moe/lfm2-moe",
                     );
@@ -2303,12 +2326,12 @@ fn main() {
                         Ok(t) => Some(t),
                         Err(e) => {
                             let _ = writeln!(
-                                stdout,
+                                daemon_state.stdout,
                                 r#"{{"type":"error","id":"{}","message":"invalid tools field: {}"}}"#,
                                 id,
                                 e.to_string().replace('"', "'"),
                             );
-                            let _ = stdout.flush();
+                            let _ = daemon_state.stdout.flush();
                             continue;
                         }
                     }
@@ -2319,12 +2342,12 @@ fn main() {
                                 Ok(t) => Some(t),
                                 Err(e) => {
                                     let _ = writeln!(
-                                        stdout,
+                                        daemon_state.stdout,
                                         r#"{{"type":"error","id":"{}","message":"invalid tools field: {}"}}"#,
                                         id,
                                         e.to_string().replace('"', "'"),
                                     );
-                                    let _ = stdout.flush();
+                                    let _ = daemon_state.stdout.flush();
                                     continue;
                                 }
                             }
@@ -2345,12 +2368,12 @@ fn main() {
                                 Ok(m) => Some(m),
                                 Err(e) => {
                                     let _ = writeln!(
-                                        stdout,
+                                        daemon_state.stdout,
                                         r#"{{"type":"error","id":"{}","message":"invalid messages field: {}"}}"#,
                                         id,
                                         e.to_string().replace('"', "'"),
                                     );
-                                    let _ = stdout.flush();
+                                    let _ = daemon_state.stdout.flush();
                                     continue;
                                 }
                             }
@@ -2593,12 +2616,12 @@ fn main() {
 
                 if video.is_some() && !is_gemma3_vl {
                     write_error(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         id,
                         "video input is only supported on gemma3-vl (arch 13)",
                     );
                 } else if has_media && !has_vl {
-                    write_error(&mut stdout, id, "model has no vision encoder");
+                    write_error(&mut daemon_state.stdout, id, "model has no vision encoder");
                 } else if is_gemma3_vl && has_media {
                     // arch-13 gemma3-vl: decode image / image_base64 / video into raw
                     // frames daemon-side, then serve through Gemma3VlBackend (SigLIP
@@ -2627,14 +2650,14 @@ fn main() {
                             };
                             generate_vl_gemma3(
                                 m,
-                                &mut gpu,
-                                &mut stdout,
+                                &mut daemon_state.gpu,
+                                &mut daemon_state.stdout,
                                 &params,
                                 &frames,
                                 &image_labels,
                             );
                         }
-                        Err(e) => write_error(&mut stdout, id, &e),
+                        Err(e) => write_error(&mut daemon_state.stdout, id, &e),
                     }
                 } else if has_image && has_vl {
                     if image_base64.is_some() && image.is_some() {
@@ -2645,7 +2668,7 @@ fn main() {
                     let source = if let Some(b64) = image_base64 {
                         if b64.len() > MAX_BASE64_ENCODED_LEN {
                             write_error(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 id,
                                 &format!(
                                     "image payload exceeds maximum encoded size ({} bytes)",
@@ -2683,9 +2706,14 @@ fn main() {
                         encode_only: false, // qwen35-vl / dots-ocr always decode
                     };
                     if is_dots_ocr {
-                        generate_vl_dots_ocr(m, &mut gpu, &mut stdout, &params);
+                        generate_vl_dots_ocr(
+                            m,
+                            &mut daemon_state.gpu,
+                            &mut daemon_state.stdout,
+                            &params,
+                        );
                     } else {
-                        generate_vl(m, &mut gpu, &mut stdout, &params);
+                        generate_vl(m, &mut daemon_state.gpu, &mut daemon_state.stdout, &params);
                     }
                 } else {
                     // Per-request PflashConfig: clone the load-time cfg
@@ -2699,7 +2727,7 @@ fn main() {
                     // Reject the request with an explicit error event so
                     // the client gets a clean signal and the daemon stays up.
                     let mut pf_override_err: Option<String> = None;
-                    let pf_cfg_owned = pflash_cfg.as_ref().map(|base| {
+                    let pf_cfg_owned = daemon_state.pflash_cfg.as_ref().map(|base| {
                         let mut c = base.clone();
                         if let Some(s) = msg
                             .get("params")
@@ -2767,19 +2795,19 @@ fn main() {
                     });
                     if let Some(reason) = pf_override_err {
                         let _ = writeln!(
-                            stdout,
+                            daemon_state.stdout,
                             r#"{{"type":"error","id":"{}","message":"invalid pflash override: {}"}}"#,
                             id,
                             reason.replace('"', "'"),
                         );
-                        let _ = stdout.flush();
+                        let _ = daemon_state.stdout.flush();
                         continue;
                     }
                     generate(
                         m,
-                        &mut gpu,
-                        pflash_drafter_gpu.as_mut(),
-                        &mut stdout,
+                        &mut daemon_state.gpu,
+                        daemon_state.pflash_drafter_gpu.as_mut(),
+                        &mut daemon_state.stdout,
                         id,
                         prompt,
                         system,
@@ -2795,7 +2823,7 @@ fn main() {
                         &budget_alert_text,
                         max_think_tokens,
                         assistant_prefix,
-                        pflash_state.as_mut(),
+                        daemon_state.pflash_state.as_mut(),
                         pf_cfg_owned.as_ref(),
                         tools_json.as_deref(),
                         messages_history.as_deref(),
@@ -2814,18 +2842,18 @@ fn main() {
             DaemonRequest::GenerateBatchPrefill => match validate_generate_batch_prefill(&msg) {
                 Ok(envelope) => {
                     let target_worker_id = message_worker_id(&msg);
-                    if dummy_model.is_none() {
+                    if daemon_state.dummy_model.is_none() {
                         match activate_model_worker(
                             &target_worker_id,
-                            &mut active_worker_id,
-                            &mut model,
-                            &mut gpu,
-                            &mut resident_models,
+                            &mut daemon_state.active_worker_id,
+                            &mut daemon_state.model,
+                            &mut daemon_state.gpu,
+                            &mut daemon_state.resident_models,
                         ) {
                             Ok(true) => {}
                             Ok(false) => {
                                 emit_error_with_id(
-                                    &mut stdout,
+                                    &mut daemon_state.stdout,
                                     &envelope.id,
                                     format!("unknown model worker {target_worker_id}"),
                                 );
@@ -2833,7 +2861,7 @@ fn main() {
                             }
                             Err(e) => {
                                 emit_error_with_id(
-                                    &mut stdout,
+                                    &mut daemon_state.stdout,
                                     &envelope.id,
                                     format!("worker switch failed: {e}"),
                                 );
@@ -2842,17 +2870,26 @@ fn main() {
                         }
                     }
                     if envelope.is_probe() {
-                        if dummy_model.is_some() {
-                            emit_dummy_generate_batch_prefill_ready(&mut stdout, &envelope);
+                        if daemon_state.dummy_model.is_some() {
+                            emit_dummy_generate_batch_prefill_ready(
+                                &mut daemon_state.stdout,
+                                &envelope,
+                            );
                             continue;
                         }
-                        match model.as_ref() {
+                        match daemon_state.model.as_ref() {
                             Some(m) if is_qwen35_family_arch_id(m.arch_id) && m.pp == 1 => {
-                                emit_generate_batch_prefill_ready(&mut stdout, &envelope);
+                                emit_generate_batch_prefill_ready(
+                                    &mut daemon_state.stdout,
+                                    &envelope,
+                                );
                             }
                             #[cfg(feature = "arch-lfm2moe")]
                             Some(m) if m.arch_id == ARCH_ID_LFM2_MOE && m.pp == 1 => {
-                                emit_lfm2_generate_batch_prefill_ready(&mut stdout, &envelope);
+                                emit_lfm2_generate_batch_prefill_ready(
+                                    &mut daemon_state.stdout,
+                                    &envelope,
+                                );
                             }
                             Some(m) => {
                                 let reason = format!(
@@ -2860,14 +2897,14 @@ fn main() {
                                     m.arch_id
                                 );
                                 emit_generate_batch_prefill_unsupported(
-                                    &mut stdout,
+                                    &mut daemon_state.stdout,
                                     &envelope,
                                     &reason,
                                 );
                             }
                             None => {
                                 emit_generate_batch_prefill_unsupported(
-                                    &mut stdout,
+                                    &mut daemon_state.stdout,
                                     &envelope,
                                     "no model loaded",
                                 );
@@ -2875,52 +2912,58 @@ fn main() {
                         }
                         continue;
                     }
-                    if let Some(dummy) = dummy_model.as_mut() {
+                    if let Some(dummy) = daemon_state.dummy_model.as_mut() {
                         tracing::info!(
                             request_id = envelope.id,
                             batch_id = envelope.batch_id,
                             sessions = envelope.session_count,
                             "dummy generate_batch_prefill"
                         );
-                        if let Err(e) =
-                            run_generate_batch_prefill_dummy(dummy, &mut stdout, &envelope)
-                        {
-                            emit_error_with_id(&mut stdout, &envelope.id, e);
+                        if let Err(e) = run_generate_batch_prefill_dummy(
+                            dummy,
+                            &mut daemon_state.stdout,
+                            &envelope,
+                        ) {
+                            emit_error_with_id(&mut daemon_state.stdout, &envelope.id, e);
                         }
                         continue;
                     }
-                    let m = match model.as_mut() {
+                    let m = match daemon_state.model.as_mut() {
                         Some(m) => m,
                         None => {
-                            emit_error_with_id(&mut stdout, &envelope.id, "no model loaded");
+                            emit_error_with_id(
+                                &mut daemon_state.stdout,
+                                &envelope.id,
+                                "no model loaded",
+                            );
                             continue;
                         }
                     };
                     if is_qwen35_family_arch_id(m.arch_id) {
                         if let Err(e) = run_generate_batch_prefill_serial_qwen35(
                             m,
-                            &mut gpu,
-                            &mut stdout,
+                            &mut daemon_state.gpu,
+                            &mut daemon_state.stdout,
                             &envelope,
-                            pflash_state.is_some(),
+                            daemon_state.pflash_state.is_some(),
                         ) {
-                            emit_error_with_id(&mut stdout, &envelope.id, e);
+                            emit_error_with_id(&mut daemon_state.stdout, &envelope.id, e);
                         }
                     } else {
                         #[cfg(feature = "arch-lfm2moe")]
                         if m.arch_id == ARCH_ID_LFM2_MOE {
                             if let Err(e) = run_generate_batch_prefill_serial_lfm2(
                                 m,
-                                &mut gpu,
-                                &mut stdout,
+                                &mut daemon_state.gpu,
+                                &mut daemon_state.stdout,
                                 &envelope,
                             ) {
-                                emit_error_with_id(&mut stdout, &envelope.id, e);
+                                emit_error_with_id(&mut daemon_state.stdout, &envelope.id, e);
                             }
                             continue;
                         }
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             &envelope.id,
                             format!(
                                 "generate_batch_prefill currently supports qwen35/qwen35-moe and lfm2-moe only (arch_id={})",
@@ -2931,7 +2974,7 @@ fn main() {
                 }
                 Err(e) => {
                     let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    emit_error_with_id(&mut stdout, id, e);
+                    emit_error_with_id(&mut daemon_state.stdout, id, e);
                 }
             },
 
@@ -2940,15 +2983,15 @@ fn main() {
                     let target_worker_id = message_worker_id(&msg);
                     match activate_model_worker(
                         &target_worker_id,
-                        &mut active_worker_id,
-                        &mut model,
-                        &mut gpu,
-                        &mut resident_models,
+                        &mut daemon_state.active_worker_id,
+                        &mut daemon_state.model,
+                        &mut daemon_state.gpu,
+                        &mut daemon_state.resident_models,
                     ) {
                         Ok(true) => {}
                         Ok(false) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 &envelope.id,
                                 format!("unknown model worker {target_worker_id}"),
                             );
@@ -2956,27 +2999,35 @@ fn main() {
                         }
                         Err(e) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 &envelope.id,
                                 format!("worker switch failed: {e}"),
                             );
                             continue;
                         }
                     }
-                    let m = match model.as_ref() {
+                    let m = match daemon_state.model.as_ref() {
                         Some(m) => m,
                         None => {
-                            emit_error_with_id(&mut stdout, &envelope.id, "no model loaded");
+                            emit_error_with_id(
+                                &mut daemon_state.stdout,
+                                &envelope.id,
+                                "no model loaded",
+                            );
                             continue;
                         }
                     };
                     let preflight_result = if is_qwen35_family_arch_id(m.arch_id) {
-                        run_prefix_hash_preflight_qwen35(m, &mut stdout, &envelope)
+                        run_prefix_hash_preflight_qwen35(m, &mut daemon_state.stdout, &envelope)
                     } else {
                         #[cfg(feature = "arch-lfm2moe")]
                         {
                             if m.arch_id == ARCH_ID_LFM2_MOE {
-                                run_prefix_hash_preflight_lfm2(m, &mut stdout, &envelope)
+                                run_prefix_hash_preflight_lfm2(
+                                    m,
+                                    &mut daemon_state.stdout,
+                                    &envelope,
+                                )
                             } else {
                                 Err(format!(
                                     "prefix_hash_preflight currently supports qwen35/qwen35-moe and lfm2-moe only (arch_id={})",
@@ -2993,12 +3044,12 @@ fn main() {
                         }
                     };
                     if let Err(e) = preflight_result {
-                        emit_error_with_id(&mut stdout, &envelope.id, e);
+                        emit_error_with_id(&mut daemon_state.stdout, &envelope.id, e);
                     }
                 }
                 Err(e) => {
                     let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    emit_error_with_id(&mut stdout, id, e);
+                    emit_error_with_id(&mut daemon_state.stdout, id, e);
                 }
             },
 
@@ -3007,15 +3058,15 @@ fn main() {
                     let target_worker_id = message_worker_id(&msg);
                     match activate_model_worker(
                         &target_worker_id,
-                        &mut active_worker_id,
-                        &mut model,
-                        &mut gpu,
-                        &mut resident_models,
+                        &mut daemon_state.active_worker_id,
+                        &mut daemon_state.model,
+                        &mut daemon_state.gpu,
+                        &mut daemon_state.resident_models,
                     ) {
                         Ok(true) => {}
                         Ok(false) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 &envelope.id,
                                 format!("unknown model worker {target_worker_id}"),
                             );
@@ -3023,47 +3074,54 @@ fn main() {
                         }
                         Err(e) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 &envelope.id,
                                 format!("worker switch failed: {e}"),
                             );
                             continue;
                         }
                     }
-                    let m = match model.as_mut() {
+                    let m = match daemon_state.model.as_mut() {
                         Some(m) => m,
                         None => {
-                            emit_error_with_id(&mut stdout, &envelope.id, "no model loaded");
+                            emit_error_with_id(
+                                &mut daemon_state.stdout,
+                                &envelope.id,
+                                "no model loaded",
+                            );
                             continue;
                         }
                     };
-                    if let Err(e) =
-                        run_generate_batch_decode_step_qwen35(m, &mut gpu, &mut stdout, &envelope)
-                    {
-                        emit_error_with_id(&mut stdout, &envelope.id, e);
+                    if let Err(e) = run_generate_batch_decode_step_qwen35(
+                        m,
+                        &mut daemon_state.gpu,
+                        &mut daemon_state.stdout,
+                        &envelope,
+                    ) {
+                        emit_error_with_id(&mut daemon_state.stdout, &envelope.id, e);
                     }
                 }
                 Err(e) => {
                     let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    emit_error_with_id(&mut stdout, id, e);
+                    emit_error_with_id(&mut daemon_state.stdout, id, e);
                 }
             },
 
             DaemonRequest::ReleaseSessions => {
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("release");
                 let target_worker_id = message_worker_id(&msg);
-                if dummy_model.is_none() {
+                if daemon_state.dummy_model.is_none() {
                     match activate_model_worker(
                         &target_worker_id,
-                        &mut active_worker_id,
-                        &mut model,
-                        &mut gpu,
-                        &mut resident_models,
+                        &mut daemon_state.active_worker_id,
+                        &mut daemon_state.model,
+                        &mut daemon_state.gpu,
+                        &mut daemon_state.resident_models,
                     ) {
                         Ok(true) => {}
                         Ok(false) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 id,
                                 format!("unknown model worker {target_worker_id}"),
                             );
@@ -3071,7 +3129,7 @@ fn main() {
                         }
                         Err(e) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 id,
                                 format!("worker switch failed: {e}"),
                             );
@@ -3082,11 +3140,11 @@ fn main() {
                 let request = match parse_release_sessions_request(&msg, &target_worker_id) {
                     Ok(request) => request,
                     Err(e) => {
-                        emit_error_with_id(&mut stdout, id, e);
+                        emit_error_with_id(&mut daemon_state.stdout, id, e);
                         continue;
                     }
                 };
-                if let Some(dummy) = dummy_model.as_mut() {
+                if let Some(dummy) = daemon_state.dummy_model.as_mut() {
                     let released = dummy.release_sessions(&request.sessions);
                     let done = release_sessions_done_json(
                         id,
@@ -3095,14 +3153,14 @@ fn main() {
                         dummy.session_count(),
                         None,
                     );
-                    let _ = writeln!(stdout, "{done}");
-                    let _ = stdout.flush();
+                    let _ = writeln!(daemon_state.stdout, "{done}");
+                    let _ = daemon_state.stdout.flush();
                     continue;
                 }
-                let m = match model.as_mut() {
+                let m = match daemon_state.model.as_mut() {
                     Some(m) => m,
                     None => {
-                        emit_error_with_id(&mut stdout, id, "no model loaded");
+                        emit_error_with_id(&mut daemon_state.stdout, id, "no model loaded");
                         continue;
                     }
                 };
@@ -3110,7 +3168,7 @@ fn main() {
                 match sequence_state_arena_release_sessions(
                     arena_backend,
                     m,
-                    &mut gpu,
+                    &mut daemon_state.gpu,
                     &request.sessions,
                 ) {
                     Ok(released) => {
@@ -3122,29 +3180,29 @@ fn main() {
                             sequence_state_arena_resident_session_count(arena_backend, m),
                             Some(&worker),
                         );
-                        let _ = writeln!(stdout, "{done}");
-                        let _ = stdout.flush();
+                        let _ = writeln!(daemon_state.stdout, "{done}");
+                        let _ = daemon_state.stdout.flush();
                     }
-                    Err(e) => emit_error_with_id(&mut stdout, id, e),
+                    Err(e) => emit_error_with_id(&mut daemon_state.stdout, id, e),
                 }
             }
 
             DaemonRequest::ReserveSessionState => {
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("reserve");
                 let target_worker_id = message_worker_id(&msg);
-                generic_state_arena.purge_expired();
-                if dummy_model.is_none() {
+                daemon_state.generic_state_arena.purge_expired();
+                if daemon_state.dummy_model.is_none() {
                     match activate_model_worker(
                         &target_worker_id,
-                        &mut active_worker_id,
-                        &mut model,
-                        &mut gpu,
-                        &mut resident_models,
+                        &mut daemon_state.active_worker_id,
+                        &mut daemon_state.model,
+                        &mut daemon_state.gpu,
+                        &mut daemon_state.resident_models,
                     ) {
                         Ok(true) => {}
                         Ok(false) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 id,
                                 format!("unknown model worker {target_worker_id}"),
                             );
@@ -3152,7 +3210,7 @@ fn main() {
                         }
                         Err(e) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 id,
                                 format!("worker switch failed: {e}"),
                             );
@@ -3163,7 +3221,7 @@ fn main() {
                 let request = match parse_reserve_session_state_request(&msg, &target_worker_id) {
                     Ok(request) => request,
                     Err(e) => {
-                        emit_error_with_id(&mut stdout, id, e);
+                        emit_error_with_id(&mut daemon_state.stdout, id, e);
                         continue;
                     }
                 };
@@ -3177,7 +3235,7 @@ fn main() {
                             .unwrap_or(0)
                     )
                 });
-                let reservation_plan = if let Some(m) = model.as_ref() {
+                let reservation_plan = if let Some(m) = daemon_state.model.as_ref() {
                     let budget = request
                         .budget_bytes
                         .unwrap_or_else(resident_state_reservation_budget_bytes);
@@ -3186,16 +3244,18 @@ fn main() {
                     sequence_state_reservation_plan(
                         &descriptors,
                         request.physical_cap,
-                        generic_state_arena.outstanding_bytes_for_worker(&request.worker_id),
+                        daemon_state
+                            .generic_state_arena
+                            .outstanding_bytes_for_worker(&request.worker_id),
                         budget,
                     )
-                } else if dummy_model.is_some() {
+                } else if daemon_state.dummy_model.is_some() {
                     let budget = request
                         .budget_bytes
                         .unwrap_or_else(resident_state_reservation_budget_bytes);
                     sequence_state_reservation_plan_for_reserved_bytes(1024, 0, 0, budget)
                 } else {
-                    emit_error_with_id(&mut stdout, id, "no model loaded");
+                    emit_error_with_id(&mut daemon_state.stdout, id, "no model loaded");
                     continue;
                 };
                 if reservation_plan.rejected_for_memory_pressure {
@@ -3208,11 +3268,11 @@ fn main() {
                         reservation_plan.projected_reserved_bytes,
                         reservation_plan.budget_bytes,
                     );
-                    let _ = writeln!(stdout, "{rejected}");
-                    let _ = stdout.flush();
+                    let _ = writeln!(daemon_state.stdout, "{rejected}");
+                    let _ = daemon_state.stdout.flush();
                     continue;
                 }
-                let reservation = generic_state_arena.reserve(
+                let reservation = daemon_state.generic_state_arena.reserve(
                     &request.worker_id,
                     reservation_id.clone(),
                     &request.state_kinds,
@@ -3228,8 +3288,8 @@ fn main() {
                     reservation_plan.projected_reserved_bytes,
                     reservation_plan.budget_bytes,
                 );
-                let _ = writeln!(stdout, "{done}");
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, "{done}");
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::DescribeState => {
@@ -3237,32 +3297,33 @@ fn main() {
                     .get("id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("describe-state");
-                generic_state_arena.purge_expired();
+                daemon_state.generic_state_arena.purge_expired();
                 let request = match parse_describe_sequence_state_request(&msg) {
                     Ok(request) => request,
                     Err(e) => {
-                        emit_error_with_id(&mut stdout, id, e);
+                        emit_error_with_id(&mut daemon_state.stdout, id, e);
                         continue;
                     }
                 };
                 if parsed_handle_may_target_generic(&request.handle) {
-                    if let Some(reservation) =
-                        generic_state_arena.describe(&request.handle.id, request.handle.generation)
+                    if let Some(reservation) = daemon_state
+                        .generic_state_arena
+                        .describe(&request.handle.id, request.handle.generation)
                     {
                         let done = session_state_reservation_describe_json(id, reservation);
-                        let _ = writeln!(stdout, "{done}");
-                        let _ = stdout.flush();
+                        let _ = writeln!(daemon_state.stdout, "{done}");
+                        let _ = daemon_state.stdout.flush();
                         continue;
                     }
                 }
                 let Some(described) = describe_loaded_sequence_state(
-                    &active_worker_id,
-                    model.as_ref(),
-                    &resident_models,
+                    &daemon_state.active_worker_id,
+                    daemon_state.model.as_ref(),
+                    &daemon_state.resident_models,
                     &request.handle,
                 ) else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         id,
                         format!(
                             "describe_state unknown runtime_state_handle {}",
@@ -3272,8 +3333,8 @@ fn main() {
                     continue;
                 };
                 let done = described_sequence_state_json(id, &described);
-                let _ = writeln!(stdout, "{done}");
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, "{done}");
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::ReleaseState => {
@@ -3289,17 +3350,17 @@ fn main() {
                     .map(|handle| (handle.id.clone(), handle.generation))
                     .collect::<Vec<_>>();
                 let (generic_released, generic_released_bytes) =
-                    generic_state_arena.release(generic_handles);
+                    daemon_state.generic_state_arena.release(generic_handles);
                 let (loaded_released, loaded_released_bytes) =
                     match release_loaded_sequence_state_handles(
-                        &mut model,
-                        &mut resident_models,
-                        &mut gpu,
+                        &mut daemon_state.model,
+                        &mut daemon_state.resident_models,
+                        &mut daemon_state.gpu,
                         &request.handles,
                     ) {
                         Ok(released) => released,
                         Err(e) => {
-                            emit_error_with_id(&mut stdout, id, e);
+                            emit_error_with_id(&mut daemon_state.stdout, id, e);
                             continue;
                         }
                     };
@@ -3311,55 +3372,61 @@ fn main() {
                     loaded_released,
                     loaded_released_bytes,
                 );
-                let _ = writeln!(stdout, "{done}");
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, "{done}");
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::WorkerStatus => {
                 let status = resident_worker_status_json(
-                    &active_worker_id,
-                    model.as_ref(),
-                    &resident_models,
+                    &daemon_state.active_worker_id,
+                    daemon_state.model.as_ref(),
+                    &daemon_state.resident_models,
                 );
-                let _ = writeln!(stdout, "{status}");
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, "{status}");
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::ResourceStatus => {
-                let status = resource_reservations.status_json();
-                let _ = writeln!(stdout, "{status}");
-                let _ = stdout.flush();
+                let status = daemon_state.resource_reservations.status_json();
+                let _ = writeln!(daemon_state.stdout, "{status}");
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::Inventory => {
-                let inventory = daemon_accelerator_inventory(&mut gpu);
+                let inventory = daemon_accelerator_inventory(&mut daemon_state.gpu);
                 let mut payload = serde_json::to_value(inventory)
                     .unwrap_or_else(|_| serde_json::json!({"source": "daemon", "devices": []}));
                 payload["type"] = serde_json::json!("inventory");
-                let _ = writeln!(stdout, "{payload}");
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, "{payload}");
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::Reset => {
-                let target_worker_id = reset_target_worker_id(&msg, &active_worker_id);
-                if reset_has_no_resident_model(&dummy_model, &model, &resident_models) {
-                    generic_state_arena.release_worker(&target_worker_id);
-                    let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
-                    let _ = stdout.flush();
+                let target_worker_id = reset_target_worker_id(&msg, &daemon_state.active_worker_id);
+                if reset_has_no_resident_model(
+                    &daemon_state.dummy_model,
+                    &daemon_state.model,
+                    &daemon_state.resident_models,
+                ) {
+                    daemon_state
+                        .generic_state_arena
+                        .release_worker(&target_worker_id);
+                    let _ = writeln!(daemon_state.stdout, r#"{{"type":"reset","seq_pos":0}}"#);
+                    let _ = daemon_state.stdout.flush();
                     continue;
                 }
-                if dummy_model.is_none() {
+                if daemon_state.dummy_model.is_none() {
                     match activate_model_worker(
                         &target_worker_id,
-                        &mut active_worker_id,
-                        &mut model,
-                        &mut gpu,
-                        &mut resident_models,
+                        &mut daemon_state.active_worker_id,
+                        &mut daemon_state.model,
+                        &mut daemon_state.gpu,
+                        &mut daemon_state.resident_models,
                     ) {
                         Ok(true) => {}
                         Ok(false) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 "",
                                 format!("unknown model worker {target_worker_id}"),
                             );
@@ -3367,7 +3434,7 @@ fn main() {
                         }
                         Err(e) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 "",
                                 format!("worker switch failed: {e}"),
                             );
@@ -3376,17 +3443,21 @@ fn main() {
                     }
                 }
                 // Reset conversation state without unloading the model.
-                if let Some(dummy) = dummy_model.as_mut() {
-                    generic_state_arena.release_worker(&target_worker_id);
+                if let Some(dummy) = daemon_state.dummy_model.as_mut() {
+                    daemon_state
+                        .generic_state_arena
+                        .release_worker(&target_worker_id);
                     dummy.reset();
-                    let _ = writeln!(stdout, r#"{{"type":"reset"}}"#);
-                    let _ = stdout.flush();
+                    let _ = writeln!(daemon_state.stdout, r#"{{"type":"reset"}}"#);
+                    let _ = daemon_state.stdout.flush();
                     continue;
                 }
                 // Under eviction, also zero the compact_offset so absolute
                 // RoPE phase restarts from zero for the fresh conversation.
-                if let Some(ref mut m) = model {
-                    generic_state_arena.release_worker(&target_worker_id);
+                if let Some(ref mut m) = daemon_state.model {
+                    daemon_state
+                        .generic_state_arena
+                        .release_worker(&target_worker_id);
                     m.active.cursor.seq_pos = 0;
                     m.active.cursor.conversation_tokens.clear();
                     m.q35_registry.sessions.clear();
@@ -3438,13 +3509,13 @@ fn main() {
                     {
                         // Zero DeltaNet recurrent state (Qwen3.5)
                         for s in &dn.s_matrices {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                            let _ = daemon_state.gpu.hip.memset(&s.buf, 0, s.buf.size());
                         }
                         for s in &dn.s_scales {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                            let _ = daemon_state.gpu.hip.memset(&s.buf, 0, s.buf.size());
                         }
                         for s in &dn.conv_states {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                            let _ = daemon_state.gpu.hip.memset(&s.buf, 0, s.buf.size());
                         }
                     }
                     if let Some(kv) = m.active.sequence_state.as_mut().and_then(|s| s.kv_mut()) {
@@ -3484,7 +3555,7 @@ fn main() {
                         // `ar_forward_warmed_up = false` in `reset()`
                         // ensures we retrace warmup → capture → replay
                         // rather than jumping straight back to replay.
-                        gpu.invalidate_graph_state();
+                        daemon_state.gpu.invalidate_graph_state();
                     }
                     // arch_id=10 (MiniMax-M2): clear KV cursor between turns.
                     // No captured hipGraph on this path, so no graph
@@ -3498,7 +3569,7 @@ fn main() {
                     #[cfg(feature = "arch-lfm2moe")]
                     {
                         if let Some(ref mut s) = m.active.lfm2moe_state {
-                            let _ = s.reset(&mut gpu);
+                            let _ = s.reset(&mut daemon_state.gpu);
                         }
                         m.lfm2_registry.sessions.clear();
                         if m.arch_id == ARCH_ID_LFM2_MOE
@@ -3525,13 +3596,18 @@ fn main() {
                         b.state.reset();
                     }
                     if let Some(ref mut loaded) = m.registered_backend {
-                        let _ = loaded.backend.reset_session(&mut gpu, "default");
+                        let _ = loaded
+                            .backend
+                            .reset_session(&mut daemon_state.gpu, "default");
                     }
-                    let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
+                    let _ = writeln!(daemon_state.stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
-                    let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
+                    let _ = writeln!(
+                        daemon_state.stdout,
+                        r#"{{"type":"error","message":"no model loaded"}}"#
+                    );
                 }
-                let _ = stdout.flush();
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::Unload => {
@@ -3543,36 +3619,39 @@ fn main() {
                 // drafter buffers cached in the just-emptied pool with
                 // no drain to follow, so the VRAM stays resident until
                 // the next load message arrives. Order matters here.
-                if let Some(mut pf) = pflash_state.take() {
-                    if let Some(mut dg) = pflash_drafter_gpu.take() {
+                if let Some(mut pf) = daemon_state.pflash_state.take() {
+                    if let Some(mut dg) = daemon_state.pflash_drafter_gpu.take() {
                         dg.bind_thread_or_warn();
                         pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
-                        gpu.bind_thread_or_warn();
+                        daemon_state.gpu.bind_thread_or_warn();
                     } else {
-                        pf.unload_drafter(&mut gpu);
+                        pf.unload_drafter(&mut daemon_state.gpu);
                     }
                 }
-                pflash_cfg = None;
-                if let Some(m) = model.take() {
-                    unload_model(m, &mut gpu);
+                daemon_state.pflash_cfg = None;
+                if let Some(m) = daemon_state.model.take() {
+                    unload_model(m, &mut daemon_state.gpu);
                 }
-                for (_, m) in resident_models.drain() {
-                    unload_model(m, &mut gpu);
+                for (_, m) in daemon_state.resident_models.drain() {
+                    unload_model(m, &mut daemon_state.gpu);
                 }
-                resource_reservations.clear_workers();
-                if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+                daemon_state.resource_reservations.clear_workers();
+                if let Err(err) = daemon_state
+                    .resource_reservations
+                    .reacquire_placeholders(&mut daemon_state.gpu)
+                {
                     eprintln!(
                         "[hipfire-daemon] failed to restore resource reservations after unload: {err}"
                     );
                 }
-                generic_state_arena.clear();
-                dummy_model = None;
-                active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
+                daemon_state.generic_state_arena.clear();
+                daemon_state.dummy_model = None;
+                daemon_state.active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
                 // Drop any steer session so a stale capture/apply can't leak its
                 // process-global state across model loads.
                 hipfire_steer::clear();
-                let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, r#"{{"type":"unloaded"}}"#);
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::UnloadWorker => {
@@ -3583,29 +3662,33 @@ fn main() {
                 let request = parse_unload_worker_request(&msg, DEFAULT_MODEL_WORKER_ID);
                 let worker_id = request.worker_id;
                 let mut unloaded = false;
-                generic_state_arena.release_worker(&worker_id);
-                if worker_id == active_worker_id {
-                    if let Some(m) = model.take() {
-                        unload_model(m, &mut gpu);
+                daemon_state.generic_state_arena.release_worker(&worker_id);
+                if worker_id == daemon_state.active_worker_id {
+                    if let Some(m) = daemon_state.model.take() {
+                        unload_model(m, &mut daemon_state.gpu);
                         unloaded = true;
                     }
-                    active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
-                    if let Some((next_worker_id, next_model)) = resident_models
+                    daemon_state.active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
+                    if let Some((next_worker_id, next_model)) = daemon_state
+                        .resident_models
                         .iter()
                         .next()
                         .map(|(k, _)| k.clone())
-                        .and_then(|k| resident_models.remove(&k).map(|m| (k, m)))
+                        .and_then(|k| daemon_state.resident_models.remove(&k).map(|m| (k, m)))
                     {
-                        active_worker_id = next_worker_id;
-                        model = Some(next_model);
+                        daemon_state.active_worker_id = next_worker_id;
+                        daemon_state.model = Some(next_model);
                     }
-                } else if let Some(m) = resident_models.remove(&worker_id) {
-                    unload_model(m, &mut gpu);
+                } else if let Some(m) = daemon_state.resident_models.remove(&worker_id) {
+                    unload_model(m, &mut daemon_state.gpu);
                     unloaded = true;
                 }
                 if unloaded {
-                    resource_reservations.remove_worker(&worker_id);
-                    if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+                    daemon_state.resource_reservations.remove_worker(&worker_id);
+                    if let Err(err) = daemon_state
+                        .resource_reservations
+                        .reacquire_placeholders(&mut daemon_state.gpu)
+                    {
                         eprintln!(
                             "[hipfire-daemon] failed to restore resource reservations after worker unload: {err}"
                         );
@@ -3615,15 +3698,15 @@ fn main() {
                     id,
                     &worker_id,
                     unloaded,
-                    resident_models.len() + usize::from(model.is_some()),
+                    daemon_state.resident_models.len() + usize::from(daemon_state.model.is_some()),
                 );
-                let _ = writeln!(stdout, "{done}");
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, "{done}");
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::Ping => {
-                let _ = writeln!(stdout, r#"{{"type":"pong"}}"#);
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, r#"{{"type":"pong"}}"#);
+                let _ = daemon_state.stdout.flush();
             }
 
             // Calibrate the resident model in place (no reload): run the Tier-1
@@ -3637,12 +3720,20 @@ fn main() {
                 // hipfire-daemon-protocol for clients). Field names must match.
                 let Some(corpus) = msg.get("corpus").and_then(|v| v.as_str()).map(String::from)
                 else {
-                    emit_error_with_id(&mut stdout, "", "collect: missing 'corpus'".to_string());
+                    emit_error_with_id(
+                        &mut daemon_state.stdout,
+                        "",
+                        "collect: missing 'corpus'".to_string(),
+                    );
                     continue;
                 };
                 let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from)
                 else {
-                    emit_error_with_id(&mut stdout, "", "collect: missing 'output'".to_string());
+                    emit_error_with_id(
+                        &mut daemon_state.stdout,
+                        "",
+                        "collect: missing 'output'".to_string(),
+                    );
                     continue;
                 };
                 let max_tokens = msg
@@ -3651,13 +3742,17 @@ fn main() {
                     .map(|v| v as usize)
                     .unwrap_or(512);
                 let kldref = msg.get("kldref").and_then(|v| v.as_bool()).unwrap_or(false);
-                let Some(m) = model.as_ref() else {
-                    emit_error_with_id(&mut stdout, "", "collect: no model loaded".to_string());
+                let Some(m) = daemon_state.model.as_ref() else {
+                    emit_error_with_id(
+                        &mut daemon_state.stdout,
+                        "",
+                        "collect: no model loaded".to_string(),
+                    );
                     continue;
                 };
                 if m.pp != 1 {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "collect: requires a single-GPU resident model (pp == 1)".to_string(),
                     );
@@ -3669,7 +3764,7 @@ fn main() {
                 // seam — no qwen3.5-only gate.
                 let Some(tokenizer) = m.tokenizer.as_ref() else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "collect: resident model has no tokenizer".to_string(),
                     );
@@ -3679,7 +3774,7 @@ fn main() {
                     Ok(t) => t,
                     Err(e) => {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             format!("collect: read corpus {corpus}: {e}"),
                         );
@@ -3710,7 +3805,7 @@ fn main() {
                 let result: Result<hipfire_runtime::calibration::CalibSummary, String> = 'pick: {
                     if let Some(b) = m.zaya_backend.as_ref() {
                         break 'pick b.collect_calibration(
-                            &mut gpu,
+                            &mut daemon_state.gpu,
                             tokenizer,
                             &tokens,
                             kldref,
@@ -3720,7 +3815,7 @@ fn main() {
                     }
                     if let Some(b) = m.gemma3_text.as_ref() {
                         break 'pick b.collect_calibration(
-                            &mut gpu,
+                            &mut daemon_state.gpu,
                             tokenizer,
                             &tokens,
                             kldref,
@@ -3737,7 +3832,7 @@ fn main() {
                             config: c,
                         };
                         break 'pick be.collect_calibration(
-                            &mut gpu,
+                            &mut daemon_state.gpu,
                             tokenizer,
                             &tokens,
                             kldref,
@@ -3751,7 +3846,7 @@ fn main() {
                             config: c,
                         };
                         break 'pick be.collect_calibration(
-                            &mut gpu,
+                            &mut daemon_state.gpu,
                             tokenizer,
                             &tokens,
                             kldref,
@@ -3773,10 +3868,12 @@ fn main() {
                             "n_calib_tokens": n_tok,
                             "max_consistency": summary.max_consistency,
                         });
-                        let _ = writeln!(stdout, "{resp}");
-                        let _ = stdout.flush();
+                        let _ = writeln!(daemon_state.stdout, "{resp}");
+                        let _ = daemon_state.stdout.flush();
                     }
-                    Err(e) => emit_error_with_id(&mut stdout, "", format!("collect: {e}")),
+                    Err(e) => {
+                        emit_error_with_id(&mut daemon_state.stdout, "", format!("collect: {e}"))
+                    }
                 }
             }
 
@@ -3808,13 +3905,17 @@ fn main() {
                     .map(|v| v as usize)
                     .unwrap_or(256);
                 let output = msg.get("output").and_then(|v| v.as_str()).map(String::from);
-                let Some(m) = model.as_mut() else {
-                    emit_error_with_id(&mut stdout, "", "kld_eval: no model loaded".to_string());
+                let Some(m) = daemon_state.model.as_mut() else {
+                    emit_error_with_id(
+                        &mut daemon_state.stdout,
+                        "",
+                        "kld_eval: no model loaded".to_string(),
+                    );
                     continue;
                 };
                 if m.pp != 1 {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "kld_eval: requires a single-GPU resident model (pp == 1)".to_string(),
                     );
@@ -3833,7 +3934,7 @@ fn main() {
                 let tokens: Vec<u32> = if mode == "self_score" || mode == "build_ref" {
                     let Some(corpus_path) = corpus.clone() else {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             format!("kld_eval: mode={mode} requires 'corpus'"),
                         );
@@ -3843,7 +3944,7 @@ fn main() {
                         Ok(t) => t,
                         Err(e) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 "",
                                 format!("kld_eval: read {corpus_path}: {e}"),
                             );
@@ -3852,7 +3953,7 @@ fn main() {
                     };
                     let Some(tk) = m.tokenizer.as_ref() else {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             "kld_eval: resident model has no tokenizer".to_string(),
                         );
@@ -3972,7 +4073,7 @@ fn main() {
                     Some(f) => f,
                     None => {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             format!("kld_eval: arch_id {arch_id} has no KLD-scorable backend"),
                         );
@@ -3985,11 +4086,11 @@ fn main() {
                     () => {
                         |c, n, s, k| {
                             let _ = writeln!(
-                                stdout,
+                                daemon_state.stdout,
                                 "{}",
                                 serde_json::json!({"type":"kld_chunk","chunk":c,"n_chunk":n,"scored":s,"mean_kld":k})
                             );
-                            let _ = stdout.flush();
+                            let _ = daemon_state.stdout.flush();
                         }
                     };
                 }
@@ -4002,8 +4103,8 @@ fn main() {
                             "mean_nll": $out.mean_nll, "ppl": ($out.mean_nll as f64).exp(),
                             "seq_output": $seq, "compat_findings": $findings,
                         });
-                        let _ = writeln!(stdout, "{resp}");
-                        let _ = stdout.flush();
+                        let _ = writeln!(daemon_state.stdout, "{resp}");
+                        let _ = daemon_state.stdout.flush();
                     }};
                 }
 
@@ -4012,7 +4113,7 @@ fn main() {
                         if mode == "self_score" {
                             match hipfire_runtime::kld_eval::kld_self_score(
                                 &mut *fwd,
-                                &mut gpu,
+                                &mut daemon_state.gpu,
                                 &tokens,
                                 n_ctx,
                                 top_k,
@@ -4028,7 +4129,7 @@ fn main() {
                                         ) {
                                             Ok(()) => seq = serde_json::json!(p),
                                             Err(e) => emit_error_with_id(
-                                                &mut stdout,
+                                                &mut daemon_state.stdout,
                                                 "",
                                                 format!("kld_eval: write {p}: {e}"),
                                             ),
@@ -4036,14 +4137,16 @@ fn main() {
                                     }
                                     emit_kld_evaled!("self_score", out, seq, serde_json::json!([]));
                                 }
-                                Err(e) => {
-                                    emit_error_with_id(&mut stdout, "", format!("kld_eval: {e}"))
-                                }
+                                Err(e) => emit_error_with_id(
+                                    &mut daemon_state.stdout,
+                                    "",
+                                    format!("kld_eval: {e}"),
+                                ),
                             }
                         } else {
                             let Some(ref_out) = ref_path.clone() else {
                                 emit_error_with_id(
-                                    &mut stdout,
+                                    &mut daemon_state.stdout,
                                     "",
                                     "kld_eval: build_ref requires 'ref_path'".to_string(),
                                 );
@@ -4051,18 +4154,18 @@ fn main() {
                             };
                             match hipfire_runtime::kld_eval::kld_build_ref(
                                 &mut *fwd,
-                                &mut gpu,
+                                &mut daemon_state.gpu,
                                 &tokens,
                                 n_ctx,
                                 top_k,
                                 max_chunks,
                                 |c, n, s| {
                                     let _ = writeln!(
-                                        stdout,
+                                        daemon_state.stdout,
                                         "{}",
                                         serde_json::json!({"type":"kld_chunk","chunk":c,"n_chunk":n,"scored":s,"mean_kld":0.0})
                                     );
-                                    let _ = stdout.flush();
+                                    let _ = daemon_state.stdout.flush();
                                 },
                             ) {
                                 Ok(p) => {
@@ -4087,7 +4190,7 @@ fn main() {
                                             git_commit: Some(version.clone()),
                                             git_describe: Some(version.clone()),
                                             git_dirty: Some(version.contains("dirty")),
-                                            gpu_arch: gpu.arch.clone(),
+                                            gpu_arch: daemon_state.gpu.arch.clone(),
                                             producer_cmd: None,
                                         },
                                         payload_codecs: Default::default(),
@@ -4104,7 +4207,7 @@ fn main() {
                                     match archive.write_file(std::path::Path::new(&ref_out)) {
                                         Ok(()) => ref_output = serde_json::json!(ref_out),
                                         Err(e) => emit_error_with_id(
-                                            &mut stdout,
+                                            &mut daemon_state.stdout,
                                             "",
                                             format!("kld_eval: write ref {ref_out}: {e}"),
                                         ),
@@ -4115,19 +4218,21 @@ fn main() {
                                         "total_scored": p.n_chunk * p.scored_per_chunk,
                                         "ref_output": ref_output, "compat_findings": [],
                                     });
-                                    let _ = writeln!(stdout, "{resp}");
-                                    let _ = stdout.flush();
+                                    let _ = writeln!(daemon_state.stdout, "{resp}");
+                                    let _ = daemon_state.stdout.flush();
                                 }
-                                Err(e) => {
-                                    emit_error_with_id(&mut stdout, "", format!("kld_eval: {e}"))
-                                }
+                                Err(e) => emit_error_with_id(
+                                    &mut daemon_state.stdout,
+                                    "",
+                                    format!("kld_eval: {e}"),
+                                ),
                             }
                         }
                     }
                     "score" => {
                         let Some(ref_in) = ref_path.clone() else {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 "",
                                 "kld_eval: score requires 'ref_path'".to_string(),
                             );
@@ -4137,7 +4242,7 @@ fn main() {
                             Ok(a) => a,
                             Err(e) => {
                                 emit_error_with_id(
-                                    &mut stdout,
+                                    &mut daemon_state.stdout,
                                     "",
                                     format!("kld_eval: read ref {ref_in}: {e}"),
                                 );
@@ -4146,7 +4251,7 @@ fn main() {
                         };
                         let run = hipfire_kld::RunEnv {
                             git_commit: Some(version.clone()),
-                            gpu_arch: gpu.arch.clone(),
+                            gpu_arch: daemon_state.gpu.arch.clone(),
                             arch_id,
                             n_vocab,
                             tokenizer_sha256: None,
@@ -4159,7 +4264,7 @@ fn main() {
                                 .map(|m| format!("{}: {}", m.field, m.detail))
                                 .collect();
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 "",
                                 format!(
                                     "kld_eval: refusing score — ref incompatible: {}",
@@ -4175,7 +4280,7 @@ fn main() {
                             .collect();
                         match hipfire_runtime::kld_eval::kld_score(
                             &mut *fwd,
-                            &mut gpu,
+                            &mut daemon_state.gpu,
                             &archive,
                             max_chunks,
                             kld_chunk_cb!(),
@@ -4189,7 +4294,7 @@ fn main() {
                                     ) {
                                         Ok(()) => seq = serde_json::json!(p),
                                         Err(e) => emit_error_with_id(
-                                            &mut stdout,
+                                            &mut daemon_state.stdout,
                                             "",
                                             format!("kld_eval: write {p}: {e}"),
                                         ),
@@ -4197,11 +4302,15 @@ fn main() {
                                 }
                                 emit_kld_evaled!("score", out, seq, serde_json::json!(findings));
                             }
-                            Err(e) => emit_error_with_id(&mut stdout, "", format!("kld_eval: {e}")),
+                            Err(e) => emit_error_with_id(
+                                &mut daemon_state.stdout,
+                                "",
+                                format!("kld_eval: {e}"),
+                            ),
                         }
                     }
                     other => emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         format!("kld_eval: unknown mode {other:?}"),
                     ),
@@ -4226,15 +4335,15 @@ fn main() {
                     .map(|v| v as usize);
                 let (Some(num_layers), Some(hidden)) = (num_layers, hidden) else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "steer_begin_capture: missing 'num_layers'/'hidden'".to_string(),
                     );
                     continue;
                 };
                 hipfire_steer::begin_capture(num_layers, hidden);
-                let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, r#"{{"type":"steer_ok"}}"#);
+                let _ = daemon_state.stdout.flush();
             }
 
             // Prefill ONE chat turn through the hooked forward (no decode) and fold
@@ -4249,15 +4358,15 @@ fn main() {
                     .to_string();
                 let Some(user) = msg.get("user").and_then(|v| v.as_str()).map(String::from) else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "steer_capture: missing 'user'".to_string(),
                     );
                     continue;
                 };
-                let Some(m) = model.as_mut() else {
+                let Some(m) = daemon_state.model.as_mut() else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "steer_capture: no model loaded".to_string(),
                     );
@@ -4265,7 +4374,7 @@ fn main() {
                 };
                 if m.pp != 1 {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "steer_capture: requires a single-GPU resident model (pp == 1)".to_string(),
                     );
@@ -4273,7 +4382,7 @@ fn main() {
                 }
                 let Some(tokenizer) = m.tokenizer.as_ref() else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "steer_capture: resident model has no tokenizer".to_string(),
                     );
@@ -4290,7 +4399,11 @@ fn main() {
                     ) {
                         Ok(f) => f,
                         Err(e) => {
-                            emit_error_with_id(&mut stdout, "", format!("steer_capture: {e}"));
+                            emit_error_with_id(
+                                &mut daemon_state.stdout,
+                                "",
+                                format!("steer_capture: {e}"),
+                            );
                             continue;
                         }
                     }
@@ -4300,7 +4413,7 @@ fn main() {
                 let tokens = tokenizer.encode(&framed);
                 if tokens.is_empty() {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "steer_capture: empty prompt after framing".to_string(),
                     );
@@ -4313,13 +4426,13 @@ fn main() {
                 // capture prefill. Both hit `maybe_steer_block[_batched]`.
                 use hipfire_runtime::arch::SimpleAr;
                 let result: Result<(), String> = if is_qwen35_family_arch_id(m.arch_id) {
-                    run_steer_capture_prefill_qwen35(m, &mut gpu, &tokens)
+                    run_steer_capture_prefill_qwen35(m, &mut daemon_state.gpu, &tokens)
                 } else if let Some(b) = m.gemma3_text.as_mut() {
                     b.state.reset();
-                    SimpleAr::prefill(b, &mut gpu, &tokens)
+                    SimpleAr::prefill(b, &mut daemon_state.gpu, &tokens)
                 } else if let Some(b) = m.gemma3_vl.as_mut() {
                     b.state.reset();
-                    SimpleAr::prefill(b, &mut gpu, &tokens)
+                    SimpleAr::prefill(b, &mut daemon_state.gpu, &tokens)
                 } else {
                     Err(format!(
                         "steer_capture: arch_id {} is unsupported (need gemma3 or qwen35)",
@@ -4329,10 +4442,14 @@ fn main() {
                 match result {
                     Ok(()) => {
                         hipfire_steer::commit_capture();
-                        let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
-                        let _ = stdout.flush();
+                        let _ = writeln!(daemon_state.stdout, r#"{{"type":"steer_ok"}}"#);
+                        let _ = daemon_state.stdout.flush();
                     }
-                    Err(e) => emit_error_with_id(&mut stdout, "", format!("steer_capture: {e}")),
+                    Err(e) => emit_error_with_id(
+                        &mut daemon_state.stdout,
+                        "",
+                        format!("steer_capture: {e}"),
+                    ),
                 }
             }
 
@@ -4345,11 +4462,11 @@ fn main() {
                         "type": "steer_captured",
                         "means": means.0,
                     });
-                    let _ = writeln!(stdout, "{resp}");
-                    let _ = stdout.flush();
+                    let _ = writeln!(daemon_state.stdout, "{resp}");
+                    let _ = daemon_state.stdout.flush();
                 }
                 None => emit_error_with_id(
-                    &mut stdout,
+                    &mut daemon_state.stdout,
                     "",
                     "steer_finish_capture: no capture session active".to_string(),
                 ),
@@ -4376,7 +4493,7 @@ fn main() {
                     });
                 let Some(directions) = directions else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "steer_begin_apply: missing 'directions'".to_string(),
                     );
@@ -4387,7 +4504,7 @@ fn main() {
                     "ablate" => hipfire_steer::SteerMode::Ablate,
                     other => {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             format!("steer_begin_apply: unknown mode {other:?} (steer|ablate)"),
                         );
@@ -4408,15 +4525,15 @@ fn main() {
                     strength,
                     layer_range: layer_start..layer_end,
                 });
-                let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, r#"{{"type":"steer_ok"}}"#);
+                let _ = daemon_state.stdout.flush();
             }
 
             // Tear down any active steer session (back to the base model).
             DaemonRequest::SteerClear => {
                 hipfire_steer::clear();
-                let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, r#"{{"type":"steer_ok"}}"#);
+                let _ = daemon_state.stdout.flush();
             }
 
             // ── H-Neurons intervention gain (arXiv 2512.01797) ──────────────
@@ -4438,7 +4555,7 @@ fn main() {
                     .unwrap_or_default();
                 // Mask geometry from the resident model config (immutable borrow,
                 // dropped before the mutable `gpu` use below).
-                let dims = match model.as_ref() {
+                let dims = match daemon_state.model.as_ref() {
                     Some(m) => {
                         if let Some(b) = m.gemma3_text.as_ref() {
                             Some((b.config.num_hidden_layers, b.config.intermediate_size))
@@ -4452,7 +4569,7 @@ fn main() {
                     }
                     None => {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             "hneuron_intervene: no model loaded".to_string(),
                         );
@@ -4461,7 +4578,7 @@ fn main() {
                 };
                 let Some((n_layers, inter)) = dims else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "hneuron_intervene: no resident dense backend (llama|gemma3)".to_string(),
                     );
@@ -4473,7 +4590,11 @@ fn main() {
                     Ok(())
                 } else {
                     hipfire_hneurons::intervene::begin_intervention(
-                        &mut gpu, n_layers, inter, &indices, gain,
+                        &mut daemon_state.gpu,
+                        n_layers,
+                        inter,
+                        &indices,
+                        gain,
                     )
                 };
                 match result {
@@ -4483,12 +4604,14 @@ fn main() {
                             "n_intervened": n_intervened,
                             "gain": gain,
                         });
-                        let _ = writeln!(stdout, "{resp}");
-                        let _ = stdout.flush();
+                        let _ = writeln!(daemon_state.stdout, "{resp}");
+                        let _ = daemon_state.stdout.flush();
                     }
-                    Err(e) => {
-                        emit_error_with_id(&mut stdout, "", format!("hneuron_intervene: {e:?}"))
-                    }
+                    Err(e) => emit_error_with_id(
+                        &mut daemon_state.stdout,
+                        "",
+                        format!("hneuron_intervene: {e:?}"),
+                    ),
                 }
             }
 
@@ -4501,7 +4624,7 @@ fn main() {
             DaemonRequest::CettLoadColnorms(_) => {
                 let Some(path) = msg.get("path").and_then(|v| v.as_str()).map(String::from) else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "cett_load_colnorms: missing 'path'".to_string(),
                     );
@@ -4510,13 +4633,17 @@ fn main() {
                 let bytes = match std::fs::read(&path) {
                     Ok(b) => b,
                     Err(e) => {
-                        emit_error_with_id(&mut stdout, "", format!("cett_load_colnorms: {e}"));
+                        emit_error_with_id(
+                            &mut daemon_state.stdout,
+                            "",
+                            format!("cett_load_colnorms: {e}"),
+                        );
                         continue;
                     }
                 };
                 if bytes.len() < 8 {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "cett_load_colnorms: file too short".to_string(),
                     );
@@ -4528,7 +4655,7 @@ fn main() {
                 let want = 8 + n_layers * inter * 4;
                 if bytes.len() != want {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         format!(
                             "cett_load_colnorms: size mismatch (got {} want {want})",
@@ -4552,14 +4679,14 @@ fn main() {
                     }
                     cn.push(row);
                 }
-                cett_colnorms = Some(cn);
+                daemon_state.cett_colnorms = Some(cn);
                 let resp = serde_json::json!({
                     "type": "cett_ok",
                     "n_layers": n_layers,
                     "intermediate": inter,
                 });
-                let _ = writeln!(stdout, "{resp}");
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, "{resp}");
+                let _ = daemon_state.stdout.flush();
             }
 
             // Prefill (jinja-framed prompt + response) through the CETT-tapped
@@ -4573,7 +4700,11 @@ fn main() {
                     .unwrap_or("")
                     .to_string();
                 let Some(user) = msg.get("user").and_then(|v| v.as_str()).map(String::from) else {
-                    emit_error_with_id(&mut stdout, "", "cett_capture: missing 'user'".to_string());
+                    emit_error_with_id(
+                        &mut daemon_state.stdout,
+                        "",
+                        "cett_capture: missing 'user'".to_string(),
+                    );
                     continue;
                 };
                 let response = msg
@@ -4581,17 +4712,17 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let Some(colnorms) = cett_colnorms.clone() else {
+                let Some(colnorms) = daemon_state.cett_colnorms.clone() else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "cett_capture: no colnorms (call cett_load_colnorms first)".to_string(),
                     );
                     continue;
                 };
-                let Some(m) = model.as_mut() else {
+                let Some(m) = daemon_state.model.as_mut() else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "cett_capture: no model loaded".to_string(),
                     );
@@ -4605,7 +4736,7 @@ fn main() {
                 let framed = {
                     let Some(tokenizer) = m.tokenizer.as_ref() else {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             "cett_capture: resident model has no tokenizer".to_string(),
                         );
@@ -4613,7 +4744,7 @@ fn main() {
                     };
                     let Some(tmpl) = m.chat_template.as_ref() else {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             "cett_capture: model has no chat_template".to_string(),
                         );
@@ -4631,7 +4762,7 @@ fn main() {
                         Ok(t) => t,
                         Err(e) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 "",
                                 format!("cett_capture: jinja render: {e}"),
                             );
@@ -4650,7 +4781,7 @@ fn main() {
                 };
                 if full.len() <= response_start {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "cett_capture: empty response after tokenization".to_string(),
                     );
@@ -4691,7 +4822,7 @@ fn main() {
                                 b.config.n_layers
                             ))
                         } else if let Err(e) = hipfire_hneurons::capture::begin_capture(
-                            &mut gpu,
+                            &mut daemon_state.gpu,
                             colnorms,
                             cap_start,
                             cap_end,
@@ -4703,8 +4834,8 @@ fn main() {
                             // the residual snapshot), not the ~40× slower generic
                             // prefill_forward. Requires a q8 KV cache for batch
                             // eligibility (the probe loads with kv_cache=q8).
-                            match SimpleAr::prefill(b, &mut gpu, &full) {
-                                Ok(()) => finish(&mut gpu),
+                            match SimpleAr::prefill(b, &mut daemon_state.gpu, &full) {
+                                Ok(()) => finish(&mut daemon_state.gpu),
                                 Err(e) => {
                                     hipfire_hneurons::capture::clear();
                                     Err(format!("prefill: {e}"))
@@ -4719,7 +4850,7 @@ fn main() {
                                 b.config.num_hidden_layers
                             ))
                         } else if let Err(e) = hipfire_hneurons::capture::begin_capture(
-                            &mut gpu,
+                            &mut daemon_state.gpu,
                             colnorms,
                             cap_start,
                             cap_end,
@@ -4728,8 +4859,8 @@ fn main() {
                             Err(format!("begin_capture: {e:?}"))
                         } else {
                             b.state.reset();
-                            match SimpleAr::prefill(b, &mut gpu, &full) {
-                                Ok(()) => finish(&mut gpu),
+                            match SimpleAr::prefill(b, &mut daemon_state.gpu, &full) {
+                                Ok(()) => finish(&mut daemon_state.gpu),
                                 Err(e) => {
                                     hipfire_hneurons::capture::clear();
                                     Err(format!("prefill: {e}"))
@@ -4744,7 +4875,7 @@ fn main() {
                                 b.text_cfg.num_hidden_layers
                             ))
                         } else if let Err(e) = hipfire_hneurons::capture::begin_capture(
-                            &mut gpu,
+                            &mut daemon_state.gpu,
                             colnorms,
                             cap_start,
                             cap_end,
@@ -4753,8 +4884,8 @@ fn main() {
                             Err(format!("begin_capture: {e:?}"))
                         } else {
                             b.state.reset();
-                            match SimpleAr::prefill(b, &mut gpu, &full) {
-                                Ok(()) => finish(&mut gpu),
+                            match SimpleAr::prefill(b, &mut daemon_state.gpu, &full) {
+                                Ok(()) => finish(&mut daemon_state.gpu),
                                 Err(e) => {
                                     hipfire_hneurons::capture::clear();
                                     Err(format!("prefill: {e}"))
@@ -4773,10 +4904,14 @@ fn main() {
                             "feature": feature,
                             "count": count,
                         });
-                        let _ = writeln!(stdout, "{resp}");
-                        let _ = stdout.flush();
+                        let _ = writeln!(daemon_state.stdout, "{resp}");
+                        let _ = daemon_state.stdout.flush();
                     }
-                    Err(e) => emit_error_with_id(&mut stdout, "", format!("cett_capture: {e}")),
+                    Err(e) => emit_error_with_id(
+                        &mut daemon_state.stdout,
+                        "",
+                        format!("cett_capture: {e}"),
+                    ),
                 }
             }
 
@@ -4787,7 +4922,11 @@ fn main() {
             // adapter served here. See docs/plans/2026-06-30-abliteration-lora.md.
             DaemonRequest::LoraLoad(_) => {
                 let Some(path) = msg.get("path").and_then(|v| v.as_str()).map(String::from) else {
-                    emit_error_with_id(&mut stdout, "", "lora_load: missing 'path'".to_string());
+                    emit_error_with_id(
+                        &mut daemon_state.stdout,
+                        "",
+                        "lora_load: missing 'path'".to_string(),
+                    );
                     continue;
                 };
                 let scale_override = msg.get("scale").and_then(|v| v.as_f64()).map(|v| v as f32);
@@ -4796,7 +4935,7 @@ fn main() {
                 {
                     Ok(a) => a,
                     Err(e) => {
-                        emit_error_with_id(&mut stdout, "", format!("lora_load: {e}"));
+                        emit_error_with_id(&mut daemon_state.stdout, "", format!("lora_load: {e}"));
                         continue;
                     }
                 };
@@ -4805,7 +4944,7 @@ fn main() {
                 }
                 // The adapter is base-specific (directions sized to the model's
                 // hidden width); reject a mismatched load before it faults at apply.
-                let model_hidden = model.as_ref().and_then(|m| {
+                let model_hidden = daemon_state.model.as_ref().and_then(|m| {
                     m.gemma3_text
                         .as_ref()
                         .map(|b| b.config.hidden_size)
@@ -4814,7 +4953,7 @@ fn main() {
                 if let Some(h) = model_hidden {
                     if adapter.meta.hidden != h {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             format!(
                                 "lora_load: adapter hidden {} != model hidden {h}",
@@ -4826,14 +4965,14 @@ fn main() {
                 }
                 let id = adapter.id.clone();
                 if let Err(e) = hipfire_steer::load_lora_adapter(&adapter) {
-                    emit_error_with_id(&mut stdout, "", format!("lora_load: {e}"));
+                    emit_error_with_id(&mut daemon_state.stdout, "", format!("lora_load: {e}"));
                     continue;
                 }
                 if let Some(s) = scale_override {
                     hipfire_steer::set_adapter_scale(&id, s);
                 }
-                let _ = writeln!(stdout, r#"{{"type":"lora_ok"}}"#);
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, r#"{{"type":"lora_ok"}}"#);
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::LoraSetScale(_) => {
@@ -4841,18 +4980,18 @@ fn main() {
                 let scale = msg.get("scale").and_then(|v| v.as_f64()).map(|v| v as f32);
                 let (Some(id), Some(scale)) = (id, scale) else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "lora_set_scale: missing 'id'/'scale'".to_string(),
                     );
                     continue;
                 };
                 if hipfire_steer::set_adapter_scale(&id, scale) {
-                    let _ = writeln!(stdout, r#"{{"type":"lora_ok"}}"#);
-                    let _ = stdout.flush();
+                    let _ = writeln!(daemon_state.stdout, r#"{{"type":"lora_ok"}}"#);
+                    let _ = daemon_state.stdout.flush();
                 } else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         format!("lora_set_scale: no adapter {id:?} loaded"),
                     );
@@ -4861,15 +5000,19 @@ fn main() {
 
             DaemonRequest::LoraUnload(_) => {
                 let Some(id) = msg.get("id").and_then(|v| v.as_str()).map(String::from) else {
-                    emit_error_with_id(&mut stdout, "", "lora_unload: missing 'id'".to_string());
+                    emit_error_with_id(
+                        &mut daemon_state.stdout,
+                        "",
+                        "lora_unload: missing 'id'".to_string(),
+                    );
                     continue;
                 };
                 if hipfire_steer::unload_adapter(&id) {
-                    let _ = writeln!(stdout, r#"{{"type":"lora_ok"}}"#);
-                    let _ = stdout.flush();
+                    let _ = writeln!(daemon_state.stdout, r#"{{"type":"lora_ok"}}"#);
+                    let _ = daemon_state.stdout.flush();
                 } else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         format!("lora_unload: no adapter {id:?} loaded"),
                     );
@@ -4878,8 +5021,8 @@ fn main() {
 
             DaemonRequest::LoraClear => {
                 hipfire_steer::clear();
-                let _ = writeln!(stdout, r#"{{"type":"lora_ok"}}"#);
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, r#"{{"type":"lora_ok"}}"#);
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::LoraList => {
@@ -4888,8 +5031,8 @@ fn main() {
                     .map(|(id, scale)| serde_json::json!({ "id": id, "scale": scale }))
                     .collect();
                 let resp = serde_json::json!({ "type": "lora_listed", "adapters": adapters });
-                let _ = writeln!(stdout, "{resp}");
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, "{resp}");
+                let _ = daemon_state.stdout.flush();
             }
 
             // PFlash drafter TEACHER: forward the resident qwen3.5 target over a
@@ -4902,7 +5045,7 @@ fn main() {
                 let Some(corpus) = msg.get("corpus").and_then(|v| v.as_str()).map(String::from)
                 else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "pflash_labels: missing 'corpus'".to_string(),
                     );
@@ -4911,7 +5054,7 @@ fn main() {
                 let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from)
                 else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "pflash_labels: missing 'output'".to_string(),
                     );
@@ -4932,9 +5075,9 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .map(|v| v as usize)
                     .unwrap_or(40);
-                let Some(m) = model.as_ref() else {
+                let Some(m) = daemon_state.model.as_ref() else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "pflash_labels: no model loaded".to_string(),
                     );
@@ -4946,7 +5089,7 @@ fn main() {
                     m.tokenizer.as_ref(),
                 ) else {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "pflash_labels: resident model is not a qwen3.5-family model".to_string(),
                     );
@@ -4955,7 +5098,7 @@ fn main() {
                 let fa = qwen35::full_attention_layers(config);
                 if fa.is_empty() {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         "pflash_labels: no FullAttention layers".to_string(),
                     );
@@ -4967,7 +5110,7 @@ fn main() {
                     Ok(t) => t,
                     Err(e) => {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             format!("pflash_labels: read {corpus}: {e}"),
                         );
@@ -4977,7 +5120,7 @@ fn main() {
                 let all = tokenizer.encode(&text);
                 if all.len() < n_chunks * seq {
                     emit_error_with_id(
-                        &mut stdout,
+                        &mut daemon_state.stdout,
                         "",
                         format!(
                             "pflash_labels: corpus too small: {} toks < {}",
@@ -4991,7 +5134,7 @@ fn main() {
                     Ok(f) => std::io::BufWriter::new(f),
                     Err(e) => {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             format!("pflash_labels: create {output}: {e}"),
                         );
@@ -5002,7 +5145,7 @@ fn main() {
                 for ci in 0..n_chunks {
                     let toks = all[ci * seq..(ci + 1) * seq].to_vec();
                     match qwen35::capture_pflash_block_scores(
-                        &mut gpu,
+                        &mut daemon_state.gpu,
                         weights,
                         config,
                         &toks,
@@ -5023,7 +5166,7 @@ fn main() {
                         }
                         Err(e) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 "",
                                 format!("pflash_labels: chunk {ci}: {e}"),
                             );
@@ -5040,14 +5183,18 @@ fn main() {
                 // Dump the shared fp32 embedding once (the drafter shares it RO).
                 let embed_path = format!("{output}.embed.bin");
                 let embed_dims = match qwen35::dump_embed_fp32(
-                    &mut gpu,
+                    &mut daemon_state.gpu,
                     weights,
                     config,
                     std::path::Path::new(&embed_path),
                 ) {
                     Ok(d) => Some(d),
                     Err(e) => {
-                        emit_error_with_id(&mut stdout, "", format!("pflash_labels: embed: {e}"));
+                        emit_error_with_id(
+                            &mut daemon_state.stdout,
+                            "",
+                            format!("pflash_labels: embed: {e}"),
+                        );
                         None
                     }
                 };
@@ -5063,8 +5210,8 @@ fn main() {
                     "shallow_layer": shallow,
                     "mid_layer": mid,
                 });
-                let _ = writeln!(stdout, "{resp}");
-                let _ = stdout.flush();
+                let _ = writeln!(daemon_state.stdout, "{resp}");
+                let _ = daemon_state.stdout.flush();
             }
 
             // Train a PFlash importance-scorer drafter in-process against the
@@ -5101,12 +5248,13 @@ fn main() {
                 // CONTINUE the resident session iff its run_id matches; else START
                 // fresh (loading labels + building drafter/optimizer once).
                 let continue_run = !run_id.is_empty()
-                    && drafter_train_session
+                    && daemon_state
+                        .drafter_train_session
                         .as_ref()
                         .map(|s| s.run_id == run_id)
                         .unwrap_or(false);
                 if !continue_run {
-                    drafter_train_session = None; // drop any stale session, free VRAM
+                    daemon_state.drafter_train_session = None; // drop any stale session, free VRAM
                     let arch = msg
                         .get("arch")
                         .and_then(|v| v.as_str())
@@ -5114,7 +5262,7 @@ fn main() {
                         .to_string();
                     if arch != "ssm" {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             format!(
                                 "train_drafter: arch '{arch}' not implemented (only ssm; step 3)"
@@ -5159,7 +5307,7 @@ fn main() {
                         .unwrap_or("file");
                     if source != "file" {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             format!("train_drafter: label source '{source}' not implemented (only file; capture is step 4)"),
                         );
@@ -5171,7 +5319,7 @@ fn main() {
                         .map(String::from)
                     else {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             "train_drafter: labels.path required for source=file".to_string(),
                         );
@@ -5180,7 +5328,7 @@ fn main() {
                     let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from)
                     else {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             "train_drafter: 'output' (checkpoint path) required".to_string(),
                         );
@@ -5188,18 +5336,21 @@ fn main() {
                     };
 
                     // ── load cached labels + frozen target embedding (file source) ──
-                    let mut ls =
-                        match hipfire_train::labels::load_daemon_labels(&mut gpu, &path, cfg.seq) {
-                            Ok(ls) => ls,
-                            Err(e) => {
-                                emit_error_with_id(
-                                    &mut stdout,
-                                    "",
-                                    format!("train_drafter: load labels {path}: {e}"),
-                                );
-                                continue;
-                            }
-                        };
+                    let mut ls = match hipfire_train::labels::load_daemon_labels(
+                        &mut daemon_state.gpu,
+                        &path,
+                        cfg.seq,
+                    ) {
+                        Ok(ls) => ls,
+                        Err(e) => {
+                            emit_error_with_id(
+                                &mut daemon_state.stdout,
+                                "",
+                                format!("train_drafter: load labels {path}: {e}"),
+                            );
+                            continue;
+                        }
+                    };
                     let shuffle_seed = getu(&labels, "shuffle_seed", 0x5EED) as u64;
                     hipfire_train::labels::shuffle_in_place(
                         &mut ls.chunks,
@@ -5222,12 +5373,17 @@ fn main() {
                     dcfg.head_dim = getu(&dc, "head_dim", 64);
                     let (h_t, vocab) = (ls.h_t, ls.vocab);
                     let drafter = match hipfire_train::ssm_drafter::SsmDrafter::new(
-                        &mut gpu, ls.embed, h_t, vocab, dcfg, cfg.seq,
+                        &mut daemon_state.gpu,
+                        ls.embed,
+                        h_t,
+                        vocab,
+                        dcfg,
+                        cfg.seq,
                     ) {
                         Ok(d) => d,
                         Err(e) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 "",
                                 format!("train_drafter: build drafter: {e}"),
                             );
@@ -5236,7 +5392,7 @@ fn main() {
                     };
                     // Set up the resumable loop state (bar, optimizer, scores scratch).
                     let st = match hipfire_train::train_loop::drafter_loop_init(
-                        &mut gpu,
+                        &mut daemon_state.gpu,
                         &drafter,
                         &ls.chunks,
                         &ls.label_mid,
@@ -5246,7 +5402,7 @@ fn main() {
                         Ok(s) => s,
                         Err(e) => {
                             emit_error_with_id(
-                                &mut stdout,
+                                &mut daemon_state.stdout,
                                 "",
                                 format!("train_drafter: loop init: {e}"),
                             );
@@ -5255,7 +5411,7 @@ fn main() {
                     };
                     let nparams: usize = drafter.param_sizes().iter().sum();
                     let _ = writeln!(
-                        stdout,
+                        daemon_state.stdout,
                         "{}",
                         serde_json::json!({
                             "type": "train_start", "arch": arch, "params": nparams,
@@ -5264,8 +5420,8 @@ fn main() {
                             "run_id": run_id, "quantum": quantum,
                         })
                     );
-                    let _ = stdout.flush();
-                    drafter_train_session = Some(DrafterTrainSession {
+                    let _ = daemon_state.stdout.flush();
+                    daemon_state.drafter_train_session = Some(DrafterTrainSession {
                         run_id: run_id.clone(),
                         drafter,
                         chunks: ls.chunks,
@@ -5279,12 +5435,13 @@ fn main() {
 
                 // ── run ONE quantum of epochs, streaming per-epoch `train_epoch` ──
                 let quantum_result: Result<(), String> = {
-                    let sess = drafter_train_session
+                    let sess = daemon_state
+                        .drafter_train_session
                         .as_mut()
                         .expect("session present after start/continue");
                     let ep_end = (sess.st.ep + sess.quantum).min(sess.cfg.epochs);
                     hipfire_train::train_loop::drafter_loop_run_epochs(
-                        &mut gpu,
+                        &mut daemon_state.gpu,
                         &sess.drafter,
                         sess.chunks.as_slice(),
                         sess.label_mid.as_slice(),
@@ -5299,36 +5456,47 @@ fn main() {
                             if let Some(tc) = train_corr {
                                 ev["train_rho"] = serde_json::json!(tc);
                             }
-                            let _ = writeln!(stdout, "{ev}");
-                            let _ = stdout.flush();
+                            let _ = writeln!(daemon_state.stdout, "{ev}");
+                            let _ = daemon_state.stdout.flush();
                         },
                     )
                     .map_err(|e| e.to_string())
                 };
                 if let Err(e) = quantum_result {
-                    drafter_train_session = None;
-                    emit_error_with_id(&mut stdout, "", format!("train_drafter: train loop: {e}"));
+                    daemon_state.drafter_train_session = None;
+                    emit_error_with_id(
+                        &mut daemon_state.stdout,
+                        "",
+                        format!("train_drafter: train loop: {e}"),
+                    );
                     continue;
                 }
 
-                let done = drafter_train_session
+                let done = daemon_state
+                    .drafter_train_session
                     .as_ref()
                     .map(|s| s.st.ep >= s.cfg.epochs)
                     .unwrap_or(false);
                 if done {
                     // Final quantum: finish (free scratch) → checkpoint best-eval
                     // weights → terminal event. `take()` drops the resident session.
-                    let sess = drafter_train_session.take().expect("done implies present");
+                    let sess = daemon_state
+                        .drafter_train_session
+                        .take()
+                        .expect("done implies present");
                     let output = sess.output.clone();
                     let run_id = sess.run_id.clone();
-                    let report = hipfire_train::train_loop::drafter_loop_finish(&mut gpu, sess.st);
+                    let report = hipfire_train::train_loop::drafter_loop_finish(
+                        &mut daemon_state.gpu,
+                        sess.st,
+                    );
                     let saved = hipfire_train::labels::save_ssm_drafter_weights(
                         &output,
                         &report.best_weights,
                         report.best_epoch as u32,
                     );
                     let _ = writeln!(
-                        stdout,
+                        daemon_state.stdout,
                         "{}",
                         serde_json::json!({
                             "type": "train_done",
@@ -5340,16 +5508,17 @@ fn main() {
                             "run_id": run_id,
                         })
                     );
-                    let _ = stdout.flush();
+                    let _ = daemon_state.stdout.flush();
                 } else {
                     // Quantum done but run unfinished: report progress and keep the
                     // session resident. The runner re-enqueues; training yields to
                     // any pending interactive request before the next quantum.
-                    let sess = drafter_train_session
+                    let sess = daemon_state
+                        .drafter_train_session
                         .as_ref()
                         .expect("unfinished implies present");
                     let _ = writeln!(
-                        stdout,
+                        daemon_state.stdout,
                         "{}",
                         serde_json::json!({
                             "type": "train_progress", "run_id": sess.run_id,
@@ -5358,7 +5527,7 @@ fn main() {
                             "done": false,
                         })
                     );
-                    let _ = stdout.flush();
+                    let _ = daemon_state.stdout.flush();
                 }
             }
 
@@ -5408,16 +5577,17 @@ fn main() {
                 // CONTINUE the resident session iff its run_id matches; else START
                 // fresh (loading the model + building the batch/optimizer once).
                 let continue_run = !run_id.is_empty()
-                    && lora_train_session
+                    && daemon_state
+                        .lora_train_session
                         .as_ref()
                         .map(|s| s.run_id == run_id)
                         .unwrap_or(false);
                 if !continue_run {
-                    lora_train_session = None; // drop any stale session, free VRAM
+                    daemon_state.lora_train_session = None; // drop any stale session, free VRAM
                     let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from)
                     else {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             "train_lora: 'output' (adapter checkpoint path) required".to_string(),
                         );
@@ -5430,7 +5600,7 @@ fn main() {
                         .map(String::from)
                     else {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             "train_lora: 'model' (fp32 base model dir) required".to_string(),
                         );
@@ -5462,14 +5632,14 @@ fn main() {
                         .unwrap_or("overfit");
                     if data_mode != "overfit" {
                         emit_error_with_id(
-                            &mut stdout,
+                            &mut daemon_state.stdout,
                             "",
                             format!("train_lora: data source '{data_mode}' not implemented (only 'overfit' synthetic batch is wired; real-corpus loading is a follow-on)"),
                         );
                         continue;
                     }
                     let _ = writeln!(
-                        stdout,
+                        daemon_state.stdout,
                         "{}",
                         serde_json::json!({
                             "type": "train_start", "op": "train_lora", "base": base_dir,
@@ -5477,17 +5647,23 @@ fn main() {
                             "run_id": run_id, "quantum": quantum,
                         })
                     );
-                    let _ = stdout.flush();
+                    let _ = daemon_state.stdout.flush();
                     let built: Result<LoraTrainSession, String> = (|| {
                         let dir = std::path::Path::new(&base_dir);
                         if !dir.exists() {
                             return Err(format!("base model dir not found: {base_dir}"));
                         }
-                        let (cfg, weights) = hipfire_train::loader::load_llama_fp32(&mut gpu, dir)
-                            .map_err(|e| e.to_string())?;
+                        let (cfg, weights) =
+                            hipfire_train::loader::load_llama_fp32(&mut daemon_state.gpu, dir)
+                                .map_err(|e| e.to_string())?;
                         let vocab = cfg.vocab_size;
                         let model = hipfire_train::model::LlamaModel::from_f32_weights(
-                            &mut gpu, &cfg, weights, seq, rank, alpha,
+                            &mut daemon_state.gpu,
+                            &cfg,
+                            weights,
+                            seq,
+                            rank,
+                            alpha,
                         )
                         .map_err(|e| e.to_string())?;
                         let pos: Vec<f32> = (0..seq).map(|t| t as f32).collect();
@@ -5505,7 +5681,13 @@ fn main() {
                         let target_tokens = (n_seqs * (seq - 1)).max(1) as f32;
                         let sizes = model.lora_param_sizes();
                         let opt = hipfire_train::optim::AdamW::new(
-                            &mut gpu, &sizes, lr, 0.9, 0.999, 1e-8, 0.0,
+                            &mut daemon_state.gpu,
+                            &sizes,
+                            lr,
+                            0.9,
+                            0.999,
+                            1e-8,
+                            0.0,
                         )
                         .map_err(|e| e.to_string())?;
                         // total = steps + 1: the final pass is eval-only (no update),
@@ -5526,9 +5708,13 @@ fn main() {
                         })
                     })();
                     match built {
-                        Ok(sess) => lora_train_session = Some(sess),
+                        Ok(sess) => daemon_state.lora_train_session = Some(sess),
                         Err(e) => {
-                            emit_error_with_id(&mut stdout, "", format!("train_lora: {e}"));
+                            emit_error_with_id(
+                                &mut daemon_state.stdout,
+                                "",
+                                format!("train_lora: {e}"),
+                            );
                             continue;
                         }
                     }
@@ -5539,7 +5725,8 @@ fn main() {
                 // forward/backward (reads `model`) and `opt.step` (mut `opt`) don't
                 // trip the borrow checker through a single `sess`.
                 let quantum_result: Result<(), String> = {
-                    let sess = lora_train_session
+                    let sess = daemon_state
+                        .lora_train_session
                         .as_mut()
                         .expect("session present after start/continue");
                     let LoraTrainSession {
@@ -5561,14 +5748,18 @@ fn main() {
                             let mut total_loss = 0.0f32;
                             for (toks, tgts) in batch.iter() {
                                 let acts = hipfire_train::model::model_forward(
-                                    &mut gpu,
+                                    &mut daemon_state.gpu,
                                     &*model,
                                     toks,
                                     pos.as_slice(),
                                 )
                                 .map_err(|e| e.to_string())?;
                                 let (loss, grads) = hipfire_train::model::model_loss_backward(
-                                    &mut gpu, &*model, &acts, tgts, IGNORE,
+                                    &mut daemon_state.gpu,
+                                    &*model,
+                                    &acts,
+                                    tgts,
+                                    IGNORE,
                                 )
                                 .map_err(|e| e.to_string())?;
                                 total_loss += loss;
@@ -5576,7 +5767,7 @@ fn main() {
                                 if s < *total - 1 {
                                     let params = model.lora_params();
                                     let gflat = hipfire_train::model::flatten_lora_grads(&grads);
-                                    opt.step(&mut gpu, &params, &gflat)
+                                    opt.step(&mut daemon_state.gpu, &params, &gflat)
                                         .map_err(|e| e.to_string())?;
                                 }
                                 // Free per-step activations + grads. model_forward /
@@ -5585,15 +5776,33 @@ fn main() {
                                 // session leaks VRAM across steps → OOM after a few
                                 // hundred steps (the overfit example only "works"
                                 // because it runs alone on a big-VRAM box).
-                                hipfire_train::model::free_model_acts(&mut gpu, acts)
+                                hipfire_train::model::free_model_acts(&mut daemon_state.gpu, acts)
                                     .map_err(|e| e.to_string())?;
                                 for g in grads {
-                                    gpu.free_tensor(g.daq).map_err(|e| e.to_string())?;
-                                    gpu.free_tensor(g.dbq).map_err(|e| e.to_string())?;
-                                    gpu.free_tensor(g.dav).map_err(|e| e.to_string())?;
-                                    gpu.free_tensor(g.dbv).map_err(|e| e.to_string())?;
-                                    gpu.free_tensor(g.dnorm1).map_err(|e| e.to_string())?;
-                                    gpu.free_tensor(g.dnorm2).map_err(|e| e.to_string())?;
+                                    daemon_state
+                                        .gpu
+                                        .free_tensor(g.daq)
+                                        .map_err(|e| e.to_string())?;
+                                    daemon_state
+                                        .gpu
+                                        .free_tensor(g.dbq)
+                                        .map_err(|e| e.to_string())?;
+                                    daemon_state
+                                        .gpu
+                                        .free_tensor(g.dav)
+                                        .map_err(|e| e.to_string())?;
+                                    daemon_state
+                                        .gpu
+                                        .free_tensor(g.dbv)
+                                        .map_err(|e| e.to_string())?;
+                                    daemon_state
+                                        .gpu
+                                        .free_tensor(g.dnorm1)
+                                        .map_err(|e| e.to_string())?;
+                                    daemon_state
+                                        .gpu
+                                        .free_tensor(g.dnorm2)
+                                        .map_err(|e| e.to_string())?;
                                 }
                             }
                             *last_ce = total_loss / *target_tokens;
@@ -5606,19 +5815,23 @@ fn main() {
                     })()
                 };
                 if let Err(e) = quantum_result {
-                    lora_train_session = None;
-                    emit_error_with_id(&mut stdout, "", format!("train_lora: {e}"));
+                    daemon_state.lora_train_session = None;
+                    emit_error_with_id(&mut daemon_state.stdout, "", format!("train_lora: {e}"));
                     continue;
                 }
 
-                let done = lora_train_session
+                let done = daemon_state
+                    .lora_train_session
                     .as_ref()
                     .map(|s| s.step >= s.total)
                     .unwrap_or(false);
                 if done {
                     // Final quantum: dump the adapter and finish. `take()` drops the
                     // resident session (frees VRAM) before we emit the terminal event.
-                    let sess = lora_train_session.take().expect("done implies present");
+                    let sess = daemon_state
+                        .lora_train_session
+                        .take()
+                        .expect("done implies present");
                     // Persist the trained adapter: layer-major [aq,bq,av,bv] f32
                     // tensors. Minimal container (magic + count + per-tensor
                     // shape/data) — a serving-loadable format is a follow-on.
@@ -5628,7 +5841,10 @@ fn main() {
                         buf.extend_from_slice(b"HFLORA01");
                         buf.extend_from_slice(&(params.len() as u32).to_le_bytes());
                         for t in &params {
-                            let data = gpu.download_f32(t).map_err(|e| e.to_string())?;
+                            let data = daemon_state
+                                .gpu
+                                .download_f32(t)
+                                .map_err(|e| e.to_string())?;
                             buf.extend_from_slice(&(t.shape.len() as u32).to_le_bytes());
                             for &d in &t.shape {
                                 buf.extend_from_slice(&(d as u32).to_le_bytes());
@@ -5645,7 +5861,7 @@ fn main() {
                     match dump {
                         Ok(n_trainable) => {
                             let _ = writeln!(
-                                stdout,
+                                daemon_state.stdout,
                                 "{}",
                                 serde_json::json!({
                                     "type": "train_done", "op": "train_lora",
@@ -5657,19 +5873,24 @@ fn main() {
                                     "note": "trained hipfire-train LlamaModel LoRA (overfit synthetic batch); served-qwen35 adapters + real-corpus loading are follow-ons",
                                 })
                             );
-                            let _ = stdout.flush();
+                            let _ = daemon_state.stdout.flush();
                         }
-                        Err(e) => emit_error_with_id(&mut stdout, "", format!("train_lora: {e}")),
+                        Err(e) => emit_error_with_id(
+                            &mut daemon_state.stdout,
+                            "",
+                            format!("train_lora: {e}"),
+                        ),
                     }
                 } else {
                     // Quantum done but run unfinished: report progress and keep the
                     // session resident. The runner re-enqueues; training yields to
                     // any pending interactive request before the next quantum.
-                    let sess = lora_train_session
+                    let sess = daemon_state
+                        .lora_train_session
                         .as_ref()
                         .expect("unfinished implies present");
                     let _ = writeln!(
-                        stdout,
+                        daemon_state.stdout,
                         "{}",
                         serde_json::json!({
                             "type": "train_progress", "run_id": sess.run_id,
@@ -5677,15 +5898,17 @@ fn main() {
                             "per_tok_ce": sess.last_ce, "done": false,
                         })
                     );
-                    let _ = stdout.flush();
+                    let _ = daemon_state.stdout.flush();
                 }
             }
 
             DaemonRequest::Diag => {
-                let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
-                let hip_ver = gpu.hip.runtime_version().unwrap_or((0, 0));
-                let has_model = model.is_some();
-                let model_arch = model
+                let (vram_free, vram_total) =
+                    daemon_state.gpu.hip.get_vram_info().unwrap_or((0, 0));
+                let hip_ver = daemon_state.gpu.hip.runtime_version().unwrap_or((0, 0));
+                let has_model = daemon_state.model.is_some();
+                let model_arch = daemon_state
+                    .model
                     .as_ref()
                     .map(|m| match m.arch_id {
                         5 => "qwen3_5",
@@ -5703,8 +5926,11 @@ fn main() {
                 let kernel_dir = std::env::current_exe()
                     .ok()
                     .and_then(|e| {
-                        e.parent()
-                            .map(|p| p.join("kernels").join("compiled").join(&gpu.arch))
+                        e.parent().map(|p| {
+                            p.join("kernels")
+                                .join("compiled")
+                                .join(&daemon_state.gpu.arch)
+                        })
                     })
                     .filter(|p| p.is_dir());
                 let (hsaco_count, hash_count) = kernel_dir
@@ -5745,9 +5971,9 @@ fn main() {
                     })
                     .unwrap_or((0, 0));
                 let _ = writeln!(
-                    stdout,
+                    daemon_state.stdout,
                     r#"{{"type":"diag","arch":"{}","hip_version":"{}.{}","vram_free_mb":{},"vram_total_mb":{},"model_loaded":{},"model_arch":"{}","kernels":{},"kernel_hashes":{}}}"#,
-                    gpu.arch,
+                    daemon_state.gpu.arch,
                     hip_ver.0,
                     hip_ver.1,
                     vram_free / (1024 * 1024),
@@ -5757,7 +5983,7 @@ fn main() {
                     hsaco_count,
                     hash_count
                 );
-                let _ = stdout.flush();
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::BenchPrefill(_) => {
@@ -5765,12 +5991,14 @@ fn main() {
                 // deterministic tokens from a zeroed state. Used by `hipfire bench`
                 // to produce canonical pp128/pp512/pp1024 numbers that don't depend
                 // on the user's prompt tokenizing to a round number.
-                let m = match model.as_mut() {
+                let m = match daemon_state.model.as_mut() {
                     Some(m) => m,
                     None => {
-                        let _ =
-                            writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
-                        let _ = stdout.flush();
+                        let _ = writeln!(
+                            daemon_state.stdout,
+                            r#"{{"type":"error","message":"no model loaded"}}"#
+                        );
+                        let _ = daemon_state.stdout.flush();
                         continue;
                     }
                 };
@@ -5782,10 +6010,10 @@ fn main() {
                 // for v1.
                 if m.pp > 1 {
                     let _ = writeln!(
-                        stdout,
+                        daemon_state.stdout,
                         r#"{{"type":"error","message":"bench_prefill requires pp=1 (multi-GPU bench not implemented)"}}"#
                     );
-                    let _ = stdout.flush();
+                    let _ = daemon_state.stdout.flush();
                     continue;
                 }
                 let n = msg.get("tokens").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
@@ -5795,11 +6023,11 @@ fn main() {
                 // bench intentionally bypasses eviction to measure raw prefill.
                 if n + 32 > m.physical_cap {
                     let _ = writeln!(
-                        stdout,
+                        daemon_state.stdout,
                         r#"{{"type":"error","message":"bench_prefill tokens={} exceeds loaded physical_cap={}"}}"#,
                         n, m.physical_cap
                     );
-                    let _ = stdout.flush();
+                    let _ = daemon_state.stdout.flush();
                     continue;
                 }
                 // Deterministic synthetic token IDs. Skip 0 (often <pad>) and the
@@ -5819,13 +6047,13 @@ fn main() {
                     .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>())
                 {
                     for s in &dn.s_matrices {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        let _ = daemon_state.gpu.hip.memset(&s.buf, 0, s.buf.size());
                     }
                     for s in &dn.s_scales {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        let _ = daemon_state.gpu.hip.memset(&s.buf, 0, s.buf.size());
                     }
                     for s in &dn.conv_states {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        let _ = daemon_state.gpu.hip.memset(&s.buf, 0, s.buf.size());
                     }
                 }
                 // Qwen2 (arch_id=7) doesn't have a separate KV buffer — the cache
@@ -5843,14 +6071,14 @@ fn main() {
                 // Lfm2MoeState; reset cursors (takes gpu) for a cold bench.
                 #[cfg(feature = "arch-lfm2moe")]
                 if let Some(ref mut s) = m.active.lfm2moe_state {
-                    let _ = s.reset(&mut gpu);
+                    let _ = s.reset(&mut daemon_state.gpu);
                 }
 
                 // Flush any residual GPU work so it doesn't bleed into the
                 // measured interval, then time forward_prefill_batch + a
                 // trailing device_synchronize so we capture actual GPU
                 // completion (kernel launches are async by default).
-                let _ = gpu.hip.device_synchronize();
+                let _ = daemon_state.gpu.hip.device_synchronize();
                 let t0 = Instant::now();
                 let run_ok = if is_qwen35_family_arch_id(m.arch_id) {
                     let config = m.q35_config.as_ref().unwrap();
@@ -5870,8 +6098,18 @@ fn main() {
                         .downcast_mut::<qwen35::DeltaNetState>()
                         .expect("qwen35 active recurrent state is DeltaNetState");
                     qwen35::forward_prefill_batch(
-                        &mut gpu, weights, config, &synthetic, 0, kv, dn, scratch, None, None,
-                        None, None,
+                        &mut daemon_state.gpu,
+                        weights,
+                        config,
+                        &synthetic,
+                        0,
+                        kv,
+                        dn,
+                        scratch,
+                        None,
+                        None,
+                        None,
+                        None,
                     )
                     .is_ok()
                 } else if m.arch_id == ARCH_ID_QWEN2 {
@@ -5883,7 +6121,9 @@ fn main() {
                     let state = m.qwen2_state.as_mut().unwrap();
                     let mut ok = true;
                     for &tok in &synthetic {
-                        if qwen2::forward_step(&mut gpu, weights, config, state, tok).is_err() {
+                        if qwen2::forward_step(&mut daemon_state.gpu, weights, config, state, tok)
+                            .is_err()
+                        {
                             ok = false;
                             break;
                         }
@@ -5902,7 +6142,12 @@ fn main() {
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
                         if deepseek4::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
+                            config,
+                            weights,
+                            state,
+                            &mut daemon_state.gpu,
+                            tok,
+                            i as u32,
                         )
                         .is_err()
                         {
@@ -5922,7 +6167,12 @@ fn main() {
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
                         if minimax::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
+                            config,
+                            weights,
+                            state,
+                            &mut daemon_state.gpu,
+                            tok,
+                            i as u32,
                         )
                         .is_err()
                         {
@@ -5945,7 +6195,12 @@ fn main() {
                         let mut ok = true;
                         for (i, &tok) in synthetic.iter().enumerate() {
                             if lfm2moe::forward::decode_step(
-                                config, weights, state, &mut gpu, tok, i as u32,
+                                config,
+                                weights,
+                                state,
+                                &mut daemon_state.gpu,
+                                tok,
+                                i as u32,
                             )
                             .is_err()
                             {
@@ -5967,7 +6222,7 @@ fn main() {
                     use hipfire_runtime::arch::SimpleAr;
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
-                        if backend.decode_step(&mut gpu, tok, i).is_err() {
+                        if backend.decode_step(&mut daemon_state.gpu, tok, i).is_err() {
                             ok = false;
                             break;
                         }
@@ -5980,7 +6235,7 @@ fn main() {
                     // and panic). Kernels JIT on the first real request.
                     true
                 };
-                let _ = gpu.hip.device_synchronize();
+                let _ = daemon_state.gpu.hip.device_synchronize();
                 let elapsed = t0.elapsed().as_secs_f64();
 
                 // Reset state AFTER measurement — we've written N KV slots and a
@@ -5994,13 +6249,13 @@ fn main() {
                     .and_then(|s| s.recurrent_as::<qwen35::DeltaNetState>())
                 {
                     for s in &dn.s_matrices {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        let _ = daemon_state.gpu.hip.memset(&s.buf, 0, s.buf.size());
                     }
                     for s in &dn.s_scales {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        let _ = daemon_state.gpu.hip.memset(&s.buf, 0, s.buf.size());
                     }
                     for s in &dn.conv_states {
-                        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        let _ = daemon_state.gpu.hip.memset(&s.buf, 0, s.buf.size());
                     }
                 }
 
@@ -6011,7 +6266,7 @@ fn main() {
                         0.0
                     };
                     let _ = writeln!(
-                        stdout,
+                        daemon_state.stdout,
                         r#"{{"type":"prefill_result","tokens":{},"ms":{:.2},"tok_s":{:.1}}}"#,
                         n,
                         elapsed * 1000.0,
@@ -6019,11 +6274,11 @@ fn main() {
                     );
                 } else {
                     let _ = writeln!(
-                        stdout,
+                        daemon_state.stdout,
                         r#"{{"type":"error","message":"bench_prefill forward failed"}}"#
                     );
                 }
-                let _ = stdout.flush();
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::Profile => {
@@ -6034,24 +6289,24 @@ fn main() {
                 for kv in &["q8"] {
                     for wq in &["hfq4", "hfq6", "q8"] {
                         for hd in &[128usize, 256] {
-                            let _ = gpu.precompile_qwen35(wq, kv, *hd);
+                            let _ = daemon_state.gpu.precompile_qwen35(wq, kv, *hd);
                         }
                     }
                 }
-                let (cap, kernels) = gpu.profile();
+                let (cap, kernels) = daemon_state.gpu.profile();
                 let kernels_json: Vec<String> = kernels.iter().map(|k| k.to_json()).collect();
                 let _ = writeln!(
-                    stdout,
+                    daemon_state.stdout,
                     r#"{{"type":"profile","gpu":{},"kernels":[{}]}}"#,
                     cap.to_json(),
                     kernels_json.join(",")
                 );
-                let _ = stdout.flush();
+                let _ = daemon_state.stdout.flush();
             }
 
             DaemonRequest::Abort(_) | DaemonRequest::ForceAnswer(_) => {
                 emit_error_with_id(
-                    &mut stdout,
+                    &mut daemon_state.stdout,
                     msg.get("id").and_then(|v| v.as_str()).unwrap_or(""),
                     format!(
                         "{msg_type} is handled on the control channel, not the request channel"
