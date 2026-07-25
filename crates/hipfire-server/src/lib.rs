@@ -10,6 +10,7 @@ pub mod admin_ui;
 pub mod api_auth;
 pub mod auth;
 pub mod batch_runner;
+pub mod bind;
 pub mod deferred_jobs;
 pub mod model;
 pub mod routes;
@@ -298,7 +299,9 @@ pub async fn serve(config: HipfireConfig) -> anyhow::Result<()> {
 }
 
 pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
-    api_auth::validate_api_auth_config(&config.config).map_err(anyhow::Error::msg)?;
+    let auth_policy =
+        api_auth::validate_api_auth_config(&config.config).map_err(anyhow::Error::msg)?;
+    let auth_mode = config.config.api_auth_mode;
     let addr = format!("{}:{}", config.config.host, config.config.port);
     let cors_allowed_origins = config.config.cors_allowed_origins.clone();
     let state = AppState::new_loaded(config);
@@ -324,12 +327,75 @@ pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
 
     let app = build_router(state.clone(), &cors_allowed_origins);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let bind = bind::BindInfo::capture(listener.local_addr()?);
     tracing::info!("hipfire listening on http://{addr}");
+    log_api_auth_posture(&bind, auth_mode, auth_policy);
+    *state.bind.lock().expect("bind lock") = Some(bind);
     spawn_deferred_prewarm(state.clone());
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(state))
         .await?;
     Ok(())
+}
+
+/// Make the API-auth posture explicit at startup.
+///
+/// `api_auth_mode=auto` changes meaning based on the bind: moving from loopback
+/// to a wildcard silently flips anonymous API calls from allowed to rejected,
+/// and the only prior signal was a 401 at request time — which reads as "the
+/// server isn't up" rather than "auth is now required". Say it once, here.
+fn log_api_auth_posture(
+    bind: &bind::BindInfo,
+    mode: hipfire_config::ApiAuthMode,
+    policy: api_auth::ApiAuthPolicy,
+) {
+    match api_auth_posture_note(bind.addr, mode, policy) {
+        Some((ApiAuthNote::Warn, message)) => tracing::warn!("{message}"),
+        Some((ApiAuthNote::Info, message)) => tracing::info!("{message}"),
+        None => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiAuthNote {
+    Info,
+    Warn,
+}
+
+/// The posture message, split out from logging so the wording is testable.
+fn api_auth_posture_note(
+    addr: std::net::SocketAddr,
+    mode: hipfire_config::ApiAuthMode,
+    policy: api_auth::ApiAuthPolicy,
+) -> Option<(ApiAuthNote, String)> {
+    let reachable = !addr.ip().is_loopback();
+    match policy {
+        api_auth::ApiAuthPolicy::Required => Some((
+            ApiAuthNote::Info,
+            format!(
+                "API auth required on {addr}: /v1/* and /sdapi/* need `Authorization: Bearer <token>`{}",
+                // Naming the cause matters most here: the operator changed the
+                // host, not the auth setting, and `auto` did the rest.
+                match (mode, reachable) {
+                    (hipfire_config::ApiAuthMode::Auto, true) =>
+                        " (api_auth_mode=auto requires credentials on a non-loopback bind)",
+                    _ => "",
+                }
+            ),
+        )),
+        // Reaching either arm below with `reachable` means
+        // `unsafe_allow_unauthenticated_remote` was set;
+        // `validate_api_auth_config` refuses the combination otherwise.
+        api_auth::ApiAuthPolicy::Off if reachable => Some((
+            ApiAuthNote::Warn,
+            format!("API auth is off on {addr}: /v1/* and /sdapi/* are open to every host that can reach this address"),
+        )),
+        api_auth::ApiAuthPolicy::Optional if reachable => Some((
+            ApiAuthNote::Warn,
+            format!("API auth is optional on {addr}: /v1/* and /sdapi/* are open to every host that can reach this address"),
+        )),
+        _ => None,
+    }
 }
 
 async fn spawn_daemon_for_serving(state: &SharedState) -> anyhow::Result<()> {
@@ -574,6 +640,60 @@ mod tests {
         body::Body,
         http::{Method, Request},
     };
+
+    use api_auth::ApiAuthPolicy;
+    use hipfire_config::ApiAuthMode;
+
+    #[test]
+    fn auto_mode_explains_why_a_wildcard_bind_started_requiring_credentials() {
+        let (level, message) = api_auth_posture_note(
+            "0.0.0.0:11435".parse().unwrap(),
+            ApiAuthMode::Auto,
+            ApiAuthPolicy::Required,
+        )
+        .expect("non-loopback required bind must be announced");
+
+        assert_eq!(level, ApiAuthNote::Info);
+        assert!(message.contains("0.0.0.0:11435"));
+        assert!(message.contains("Bearer"));
+        // The cause is the host change, not an auth setting the operator touched.
+        assert!(message.contains("api_auth_mode=auto"));
+    }
+
+    #[test]
+    fn explicitly_required_auth_does_not_blame_auto() {
+        let (_, message) = api_auth_posture_note(
+            "0.0.0.0:11435".parse().unwrap(),
+            ApiAuthMode::Required,
+            ApiAuthPolicy::Required,
+        )
+        .unwrap();
+        assert!(!message.contains("api_auth_mode=auto"));
+    }
+
+    #[test]
+    fn unauthenticated_non_loopback_bind_warns() {
+        for (mode, policy) in [
+            (ApiAuthMode::Optional, ApiAuthPolicy::Optional),
+            (ApiAuthMode::Off, ApiAuthPolicy::Off),
+        ] {
+            let (level, message) =
+                api_auth_posture_note("0.0.0.0:11435".parse().unwrap(), mode, policy)
+                    .expect("an open non-loopback bind must warn");
+            assert_eq!(level, ApiAuthNote::Warn);
+            assert!(message.contains("open to every host"));
+        }
+    }
+
+    #[test]
+    fn loopback_without_auth_is_the_quiet_default() {
+        assert!(api_auth_posture_note(
+            "127.0.0.1:11435".parse().unwrap(),
+            ApiAuthMode::Auto,
+            ApiAuthPolicy::Optional,
+        )
+        .is_none());
+    }
     use hipfire_diffusion::{
         DiffusionBatchMetadata, DiffusionHfqMetadata, DiffusionPipelineMetadata,
         DiffusionQuantizationMetadata, DiffusionTokenizerMetadata, DIFFUSION_ARTIFACT_KIND,
