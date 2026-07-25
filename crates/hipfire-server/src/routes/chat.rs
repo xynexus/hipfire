@@ -3337,7 +3337,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let model = root.join("Qwen3.5-122B-A10B.mq4.hfq");
+        let model = root.join("Qwen3.5-122B-A10B--mq4.hfq");
         std::fs::write(&model, vec![0u8; 128]).unwrap();
         let cfg = HipfireConfig {
             model_residency_mode: "qwen_moe_modules".to_string(),

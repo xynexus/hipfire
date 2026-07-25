@@ -249,9 +249,9 @@ admission into `hipfire-eval` batteries or suites.
 For each promoted artifact:
 
 1. Use canonical names, for example:
-   - `Qwen3.5-9B.oq4++.hfq`
-   - `Gemma-3-4B-it.oq4.25++.hfq`
-   - `LFM2.5-8B-A1B.oq8+.hfq`
+   - `Qwen3.5-9B--oq4++.hfq`
+   - `Gemma-3-4B-it--oq4.25++.hfq`
+   - `LFM2.5-8B-A1B--oq8+.hfq`
 2. Store calibration sidecars under `/srv/hipfire/{calib,imatrix,hessians}`.
 3. Store models under `/srv/hipfire/models`.
 4. Record provenance:

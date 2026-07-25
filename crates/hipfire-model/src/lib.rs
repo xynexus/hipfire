@@ -2041,6 +2041,11 @@ fn draft_matches_model(draft_file: &str, model_file: &str) -> bool {
 
 fn model_sidecar_identity(model_file: &str) -> Option<String> {
     let stem = model_file.strip_suffix(".hfq")?;
+    // New convention: `--` separates the model name from the machine section.
+    if let Some((identity, _machine)) = stem.split_once("--") {
+        return (!identity.is_empty()).then(|| identity.to_string());
+    }
+    // Legacy dotted form: the name ends where the quant group begins.
     let groups = stem.split('.').collect::<Vec<_>>();
     let quant_start = find_canonical_quant_group(&groups)
         .map(|(start, _)| start)
@@ -2075,6 +2080,14 @@ pub fn parse_canonical_model_artifact_name(name: &str) -> Option<ModelArtifactNa
         return None;
     }
 
+    // New convention: `--` separates the human-readable model name from the
+    // machine-readable dotted section (features, quant, arch). Model names use
+    // only single hyphens, so `--` is an unambiguous boundary. Old artifacts
+    // have no `--` and fall through to the all-dotted heuristic below.
+    if let Some((identity, machine)) = id.split_once("--") {
+        return parse_from_machine_section(id, identity, machine);
+    }
+
     let mut groups = id.split('.').collect::<Vec<_>>();
     if groups.is_empty() {
         return None;
@@ -2105,6 +2118,53 @@ pub fn parse_canonical_model_artifact_name(name: &str) -> Option<ModelArtifactNa
         return None;
     }
     let (model, size, tags) = parse_model_identity(&identity)?;
+    Some(ModelArtifactName {
+        id: id.to_string(),
+        model,
+        size,
+        tags,
+        features,
+        quant,
+        arch,
+    })
+}
+
+/// Parse the new `--`-delimited form: `identity` is the human-readable model
+/// name; `machine` is the dotted `[feature...].<quant>[.arch]` section.
+fn parse_from_machine_section(
+    id: &str,
+    identity: &str,
+    machine: &str,
+) -> Option<ModelArtifactName> {
+    let mut groups = machine
+        .split('.')
+        .filter(|g| !g.is_empty())
+        .collect::<Vec<_>>();
+    if groups.is_empty() {
+        return None;
+    }
+
+    let arch = groups
+        .last()
+        .copied()
+        .filter(|group| is_arch_group(group))
+        .map(str::to_string);
+    if arch.is_some() {
+        groups.pop();
+    }
+
+    let (quant_start, quant) = find_canonical_quant_group(&groups)?;
+    let features = groups[..quant_start]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    // Everything left of the quant in the machine section must be a known
+    // feature group; anything else means this is not a canonical name.
+    if !features.iter().all(|f| is_feature_group(f)) {
+        return None;
+    }
+
+    let (model, size, tags) = parse_model_identity(identity)?;
     Some(ModelArtifactName {
         id: id.to_string(),
         model,
@@ -2269,10 +2329,21 @@ pub fn dflash_draft_candidates(filename: &str) -> Vec<String> {
     let Some(identity) = model_sidecar_identity(filename) else {
         return Vec::new();
     };
-    ["oq4+", "oq8+", "bf16", "f16"]
+    // Two sidecar naming generations are accepted, and both resolve so no
+    // on-disk artifact silently stops being discovered:
+    //   * dotted quant group after the role (`Model.dflash.oq4+.hfq`) — the form
+    //     the DFlash tooling in this stack emits, and the only one that can name
+    //     a *quantized* drafter;
+    //   * quant as a dash tag before the role (`Model-BF16.dflash.hfq`) — the
+    //     form `scripts/induct_model.py` and docs/MODEL-INDUCTION.md emit.
+    // Dotted forms are probed first; within each, precision descends.
+    let dotted = ["oq4+", "oq8+", "bf16", "f16"]
         .into_iter()
-        .map(|quant| format!("{identity}.dflash.{quant}.hfq"))
-        .collect()
+        .map(|quant| format!("{identity}.dflash.{quant}.hfq"));
+    let tagged = ["BF16", "F16", "MQ6", "MQ4", "MQ3"]
+        .into_iter()
+        .map(|quant| format!("{identity}-{quant}.dflash.hfq"));
+    dotted.chain(tagged).collect()
 }
 
 /// Discover a DSpark drafter sidecar next to a target model artifact.
@@ -2996,6 +3067,47 @@ mod tests {
         assert_eq!(qwen_embedding.features, vec!["npu"]);
         assert_eq!(qwen_embedding.quant, "oq8+");
         assert_eq!(qwen_embedding.arch.as_deref(), Some("gfx1151"));
+    }
+
+    #[test]
+    fn canonical_model_artifact_name_parses_double_hyphen_boundary() {
+        // New `--` convention parses to the same fields as the legacy dotted form.
+        let parsed =
+            parse_canonical_model_artifact_name("Qwen3.5-122B-A10B-it--mtp.vl.mq2l.gfx1201.hfq")
+                .unwrap();
+        assert_eq!(parsed.model, "Qwen3.5");
+        assert_eq!(parsed.size.as_deref(), Some("122B-A10B"));
+        assert_eq!(parsed.tags, vec!["it"]);
+        assert_eq!(parsed.features, vec!["mtp", "vl"]);
+        assert_eq!(parsed.quant, "mq2l");
+        assert_eq!(parsed.arch.as_deref(), Some("gfx1201"));
+
+        let gemma = parse_canonical_model_artifact_name(
+            "Gemma-4-8B-E4B-it-heretic-QAT--dflash.triattn.oq4++.gfx1151.hfq",
+        )
+        .unwrap();
+        assert_eq!(gemma.features, vec!["dflash", "triattn"]);
+        assert_eq!(gemma.quant, "oq4++");
+        assert_eq!(gemma.arch.as_deref(), Some("gfx1151"));
+
+        let mixed = parse_canonical_model_artifact_name("Gemma-4-8B--oq4.25++.hfq").unwrap();
+        assert_eq!(mixed.quant, "oq4.25++");
+        assert!(mixed.features.is_empty());
+
+        let mini = parse_canonical_model_artifact_name("MiniCPM5-1B--mq4.hfq").unwrap();
+        assert_eq!(mini.model, "MiniCPM5");
+        assert_eq!(mini.size.as_deref(), Some("1B"));
+        assert_eq!(mini.quant, "mq4");
+        assert!(mini.features.is_empty());
+        assert!(mini.arch.is_none());
+
+        // Sidecar identity strips the machine section at the `--` boundary.
+        assert_eq!(
+            model_sidecar_identity("MiniCPM5-1B--mq4.hfq").as_deref(),
+            Some("MiniCPM5-1B")
+        );
+        // A `--` with no valid quant is not a canonical model artifact.
+        assert!(parse_canonical_model_artifact_name("MiniCPM5-1B--nonsense.hfq").is_none());
     }
 
     #[test]
@@ -3793,15 +3905,26 @@ mod tests {
 
     #[test]
     fn dflash_draft_discovery_uses_canonical_independent_sidecar_names() {
+        // Canonical `--` target: dotted-quant sidecars first (the only form that
+        // can name a quantized drafter), then the dash-tag form the induction
+        // scripts emit. Both generations must resolve.
         assert_eq!(
-            dflash_draft_candidates("Qwen3.5-27B.mq4.hfq"),
+            dflash_draft_candidates("Qwen3.5-27B--mq4.hfq"),
             vec![
                 "Qwen3.5-27B.dflash.oq4+.hfq".to_string(),
                 "Qwen3.5-27B.dflash.oq8+.hfq".to_string(),
                 "Qwen3.5-27B.dflash.bf16.hfq".to_string(),
                 "Qwen3.5-27B.dflash.f16.hfq".to_string(),
+                "Qwen3.5-27B-BF16.dflash.hfq".to_string(),
+                "Qwen3.5-27B-F16.dflash.hfq".to_string(),
+                "Qwen3.5-27B-MQ6.dflash.hfq".to_string(),
+                "Qwen3.5-27B-MQ4.dflash.hfq".to_string(),
+                "Qwen3.5-27B-MQ3.dflash.hfq".to_string(),
             ]
         );
+        // Legacy all-dotted target names still parse to the same identity.
+        assert!(dflash_draft_candidates("Qwen3.5-27B.mq4.hfq")
+            .contains(&"Qwen3.5-27B.dflash.oq4+.hfq".to_string()));
         assert!(dflash_draft_candidates("Qwen3.5-35B-A3B.mq4.hfq")
             .contains(&"Qwen3.5-35B-A3B.dflash.oq4+.hfq".to_string()));
 

@@ -66,19 +66,26 @@ the relevant docs under `docs/`.
 
 Canonical artifact shape:
 
-`<family>[-]<version>-<size[-effective/active]>[-tag1][-tag2...][.feature1[.feature2...]].<format>[.arch].hfq`
+`<family>[-]<version>-<size[-effective/active]>[-tag1][-tag2...]--[feature1.[feature2.]...]<quant>[.arch].hfq`
 
-Periods are used to separate groups known to hipfire.
+A double hyphen `--` separates the human-readable model name from the
+machine-readable groups; periods separate groups within the machine section.
 Examples:
-- LFM2.5-1.2B-Thinking.bf16.hfq
-- Qwen3.5-122B-A10B.mtp.vl.mq2l.hfq
-- Gemma-4-8B-E4B-it-heretic-QAT.dflash.triattn.oq4++.gfx1151.hfq
-- MedGemma-27B-it.triattn.hfq
+- LFM2.5-1.2B-Thinking--bf16.hfq
+- Qwen3.5-122B-A10B--mtp.vl.mq2l.hfq
+- Gemma-4-8B-E4B-it-heretic-QAT--dflash.triattn.oq4++.gfx1151.hfq
+- MedGemma-27B-it.triattn.hfq (role sidecar — keeps a dotted role suffix, see below)
 
 This system allows machine parsing by working backwards:
 - last field is always hfq
-- dots separate machine-readable fields
-- dashes separate human-readable fields, aside from size and effective/active size
+- a double hyphen `--` marks the boundary: everything left of it is the
+  human-readable model name, everything right of it is the machine-readable
+  section (features, then quant, then optional arch)
+- within the machine section, dots separate fields
+- single dashes separate human-readable fields in the model name, aside from
+  size and effective/active size
+- role sidecars keep a dotted role suffix (`.dflash.hfq`, `.triattn.hfq`, …);
+  the `--` boundary is only for bundled model artifacts that carry a quant
 
 Quant tokens use this shape:
 
@@ -103,13 +110,17 @@ Notes:
 - Put calibration or transform modifiers that are not part of the quant token
   before it. Lloyd is part of the quant token: use `mq3l`, not `lloyd-mq3`.
 - Do not use `+` for bundled roles or feature sidecars. Encode each feature as
-  its own dot group before the quant token, for example `.mtp.vl.mq4.hfq` or
-  `.dflash.triattn.oq4++.hfq`.
+  its own dot group after the `--` boundary and before the quant token, for
+  example `Model--mtp.vl.mq4.hfq` or `Model--dflash.triattn.oq4++.hfq`.
 - Use role sidecars when loaded independently: `.mtp.hfq`, `.dflash.hfq`,
   `.jinja.`, `.hessian` and `.triattn.hfq`.
-- The quant should detail the weight encoding. eg. Lloyd MQ2 uses `.mq2l.hfq`,
-  Magnum uses `.mq4.hfq`
+- The quant should detail the weight encoding. eg. Lloyd MQ2 uses `--mq2l.hfq`,
+  Magnum uses `--mq4.hfq`
 - `arch` must start with gfx followed by 3 or 4 numbers. eg. gfx906, gfx1103, gfx1151, gfx1201
+- New artifacts use the `--` boundary. The older all-dotted form
+  (`Model.mq4.hfq`) stays parseable so existing on-disk artifacts keep loading;
+  emit `--` for anything you create and rename dotted names to `--` when you
+  touch them.
 - When a script, gate, registry, or doc uses an older format, update it to the
   canonical naming convention as part of the fix.
 - Remove legacy-name fallback whenever you find it

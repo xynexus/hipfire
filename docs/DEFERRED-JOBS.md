@@ -59,7 +59,7 @@ Streaming is forced off for deferred jobs.
   "kind": "http_post",
   "endpoint": "/v1/responses",
   "body": {
-    "model": "Qwen3.5-8B.mq4.hfq",
+    "model": "Qwen3.5-8B--mq4.hfq",
     "input": "Summarize yesterday's local benchmark notes."
   }
 }

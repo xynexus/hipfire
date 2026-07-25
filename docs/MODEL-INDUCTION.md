@@ -17,7 +17,7 @@ The default artifact names match runtime registry discovery for the target
 quant:
 
 ```text
-~/.hipfire/models/Qwen3.5-397B-A17B.oq4.25++.hfq
+~/.hipfire/models/Qwen3.5-397B-A17B--oq4.25++.hfq
 ~/.hipfire/drafts/Qwen3.5-397B-A17B-BF16.dflash.hfq
 ~/.hipfire/drafts/Qwen3.5-397B-A17B-F16.dflash.hfq
 ~/.hipfire/triattn/Qwen3.5-397B-A17B.triattn.hfq

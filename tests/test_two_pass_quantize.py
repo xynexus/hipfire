@@ -226,6 +226,55 @@ def test_build_commands_use_one_layer_streamed_teacher_pass_then_quantize(tmp_pa
     ]
 
 
+def test_build_commands_can_emit_canonical_cask_in_calibration_pass(tmp_path):
+    cask = tmp_path / "Model.triattn.hfq"
+    collect_cmd, _ = two_pass.build_commands(
+        coexistence="coexistence",
+        quantizer="quantizer",
+        model=tmp_path / "source",
+        calib=tmp_path / "Model.calib.hfq",
+        output=tmp_path / "Model.oq4.25++.hfq",
+        quant_format="oq4.25++",
+        corpus="corpus.txt",
+        n_sequences=1,
+        ctx_len=8,
+        batch_size=1,
+        time_tile=1,
+        max_rows=8,
+        layer_prefetch_bytes=0,
+        kldref_topk=4,
+        min_expert_activations=1,
+        expert_capture_target=1,
+        expert_capture_tile_rows=1,
+        required_expert_fraction=1.0,
+        sampling_seed=1,
+        expert_coverage_policy="preserve-undercovered",
+        quant_args=["--awq", "--ldlq"],
+        cask_output=cask,
+    )
+    assert collect_cmd[collect_cmd.index("--cask-output") + 1] == str(cask)
+    assert "--resume" not in collect_cmd
+    assert two_pass.effective_calibration_segment_layers(4, cask) == 0
+    assert two_pass.effective_calibration_segment_layers(4, None) == 4
+
+
+def test_validate_cask_inspection_requires_canonical_matching_arch():
+    calibration = {"arch_id": 24}
+    cask = {
+        "arch_id": 24,
+        "artifact_fingerprint": "fnv64:cask",
+        "metadata": {
+            "artifact_kind": "triattn",
+            "package_schema": "hipfire.triattn.v2",
+            "layers": [{"physical_layer": 0}],
+        },
+    }
+    two_pass.validate_cask_inspection(cask, calibration)
+    cask["arch_id"] = 5
+    with pytest.raises(RuntimeError, match="differs"):
+        two_pass.validate_cask_inspection(cask, calibration)
+
+
 def test_recipe_fingerprint_changes_with_inputs_but_not_dict_order(tmp_path):
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("one\ntwo\n")

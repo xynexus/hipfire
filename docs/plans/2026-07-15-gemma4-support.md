@@ -89,7 +89,7 @@ and is tokenized only with the pinned Gemma 4 tokenizer SHA256
 `12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6`.
 The imatrix HFQM has SHA256
 `ccac739df085d9630589377380b20722bf7a415505aaacbb11f577787c6fe0b2`;
-the produced `Gemma-4-31B.oq8+.hfq` has quantization hash
+the produced `Gemma-4-31B--oq8+.hfq` has quantization hash
 `62964fdf436f3945`, 1,598 tensors, and calibration signature
 `49d723ac0c765b84`.
 
@@ -110,7 +110,7 @@ frozen; SWA, SWA+1, IT, and final OQ8++ promotion were not run.
 A separate residual-write diagnostic retains all 60 language-model FFN
 `down_proj.weight` tensors in BF16 and keeps every other language-model
 projection in OQ8G256. The resulting
-`Gemma-4-31B-downbf16.oq8.hfq` is 38,586,917,272 bytes, has quantization hash
+`Gemma-4-31B-downbf16--oq8.hfq` is 38,586,917,272 bytes, has quantization hash
 `cb8eb6e621917c3d`, and embeds the pinned Gemma 4 tokenizer SHA256
 `12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6`.
 It passes base-short and lifecycle with minimum hidden cosine
@@ -136,7 +136,7 @@ frozen stop rule still defers SWA, SWA+1, IT, and final OQ8++ promotion.
 A second residual-write diagnostic instead retains all 60 language-model
 attention `self_attn.o_proj.weight` tensors in BF16 while keeping the other 350
 language-model projections in OQ8G256. The resulting
-`Gemma-4-31B-attnoutbf16.oq8.hfq` is 34,763,506,072 bytes, has quantization hash
+`Gemma-4-31B-attnoutbf16--oq8.hfq` is 34,763,506,072 bytes, has quantization hash
 `b6a3631e816fe472`, and embeds the pinned Gemma 4 tokenizer SHA256
 `12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6`.
 It passes base-short and lifecycle with minimum hidden cosine
@@ -170,7 +170,7 @@ projections in OQ8G256 across all 60 layers. Its policy SHA256 is
 and the ordered selection SHA256 is
 `ed7be28e40f93e13a049d24d523c821ec8c011b8d41c445e600d3b2e1a92e067`.
 
-The produced `Gemma-4-31B-imatrix-Q8-promotion.oq8.hfq` is 32,241,275,288
+The produced `Gemma-4-31B-imatrix-Q8-promotion--oq8.hfq` is 32,241,275,288
 bytes with quantization hash `549759cd8511b5b9`. Independent validation proves
 that all 216 and only the selected language-layer tensors are Q8F16, every
 unselected calibrated tensor remains OQ8G256, the payload boundary matches the
@@ -359,7 +359,7 @@ head-dimension representation.
    their official Jinja template and channel/tool grammar. A render failure is an
    error; falling back to Gemma 3 or ChatML is silent model corruption.
 9. **No legacy names.** New artifacts follow the canonical names, for example
-   `Gemma-4-31B-it.oq8.hfq`, `Gemma-4-E4B-it.oq8.hfq`, and role sidecars such as
+   `Gemma-4-31B-it--oq8.hfq`, `Gemma-4-E4B-it--oq8.hfq`, and role sidecars such as
    `.vl.hfq`, `.audio.hfq`, `.dspark.hfq`, or `.jinja.hfq` when independently loaded.
 
 ## Code-reuse and cleanup contract
@@ -870,12 +870,12 @@ DSpark exit gate:
 This is the final promotion stage for the dense 31B product after broad OQ8
 functional admission. It does not replace the OQ8 compatibility floor and does
 not weaken the pinned BF16 oracle. In canonical artifact spelling, OQ8++ is
-`.oq8++.hfq`: activation-aware clipping/scaling plus Hessian/LDLQ error feedback
+`--oq8++.hfq`: activation-aware clipping/scaling plus Hessian/LDLQ error feedback
 on the Opus 8-bit weight encoding.
 
 Deliverables:
 
-1. Produce `Gemma-4-31B-it.oq8++.hfq` from the same pinned source revision and
+1. Produce `Gemma-4-31B-it--oq8++.hfq` from the same pinned source revision and
    tokenizer as the admitted OQ8 artifact.
 2. Record calibration corpus, activation-aware method, Hessian/LDLQ settings,
    quantization hash, producer commit, and source revision in durable evidence.

@@ -55,6 +55,9 @@ enum ModelCommand {
     Compose(ComposeArgs),
     /// Split a bundled `.hfq` back into its base + sidecar files.
     Decompose(DecomposeArgs),
+    /// Interactive wizard: bring an external model (HuggingFace repo or local
+    /// safetensors dir) into a named `.hfq` — calibrate, quantize, fold sidecars.
+    Induct(crate::commands::induct::InductArgs),
 }
 
 #[derive(Debug, Args)]
@@ -65,7 +68,7 @@ pub struct ComposeArgs {
     inputs: Vec<String>,
     /// Output bundle path. Default: the base name with the sidecar feature
     /// dot-groups inserted before the quant token (e.g.
-    /// `Model.mq4.hfq` + `Model.mtp.hfq` -> `Model.mtp.mq4.hfq`).
+    /// `Model--mq4.hfq` + `Model.mtp.hfq` -> `Model--mtp.mq4.hfq`).
     #[arg(short, long)]
     output: Option<PathBuf>,
     /// Validate component roles, formats, architectures, geometry, lengths,
@@ -107,6 +110,7 @@ pub fn run(args: ModelArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     match args.command {
         ModelCommand::Compose(a) => run_compose(a, &loaded),
         ModelCommand::Decompose(a) => run_decompose(a, &loaded),
+        ModelCommand::Induct(a) => crate::commands::induct::run_induct(a, loaded),
     }
 }
 
@@ -139,21 +143,32 @@ fn default_bundle_path(inputs: &[PathBuf]) -> PathBuf {
     tags.sort();
     tags.dedup();
 
-    let mut segs: Vec<String> = stem.split('.').map(|s| s.to_string()).collect();
-    // Quant token is the last stem segment by convention; features go before
-    // it. If the stem is a single segment there is no quant token to precede,
-    // so append instead.
-    let insert_at = if segs.len() >= 2 {
-        segs.len() - 1
-    } else {
-        segs.len()
-    };
-    for (i, tag) in tags.into_iter().enumerate() {
-        if !segs.contains(&tag) {
-            segs.insert(insert_at + i, tag);
+    let out_name = if let Some((identity, machine)) = stem.split_once("--") {
+        // New convention: features are dotted groups after the `--` boundary and
+        // before the quant. Insert new tags at the front of the machine section
+        // (still before the quant), skipping any already present.
+        let mut groups: Vec<String> = tags;
+        for g in machine.split('.') {
+            if !groups.iter().any(|existing| existing == g) {
+                groups.push(g.to_string());
+            }
         }
-    }
-    let out_name = format!("{}.hfq", segs.join("."));
+        format!("{identity}--{}.hfq", groups.join("."))
+    } else {
+        // Legacy dotted base: insert features before the last (quant) segment.
+        let mut segs: Vec<String> = stem.split('.').map(|s| s.to_string()).collect();
+        let insert_at = if segs.len() >= 2 {
+            segs.len() - 1
+        } else {
+            segs.len()
+        };
+        for (i, tag) in tags.into_iter().enumerate() {
+            if !segs.contains(&tag) {
+                segs.insert(insert_at + i, tag);
+            }
+        }
+        format!("{}.hfq", segs.join("."))
+    };
     match dir {
         Some(d) if !d.as_os_str().is_empty() => d.join(out_name),
         _ => PathBuf::from(out_name),
@@ -214,6 +229,29 @@ fn run_compose(a: ComposeArgs, loaded: &LoadedConfig) -> anyhow::Result<()> {
         println!("composed {} inputs -> {}", inputs.len(), written.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_bundle_path_uses_double_hyphen_boundary() {
+        // New-form base: the feature is inserted into the machine section,
+        // before the quant, keeping the `--` boundary.
+        let out = default_bundle_path(&[
+            PathBuf::from("/m/MiniCPM5-1B--mq4.hfq"),
+            PathBuf::from("/m/MiniCPM5-1B.mtp.hfq"),
+        ]);
+        assert_eq!(out, PathBuf::from("/m/MiniCPM5-1B--mtp.mq4.hfq"));
+
+        // Legacy dotted base still yields the dotted form (existing artifacts).
+        let legacy = default_bundle_path(&[
+            PathBuf::from("/m/Model.mq4.hfq"),
+            PathBuf::from("/m/Model.mtp.hfq"),
+        ]);
+        assert_eq!(legacy, PathBuf::from("/m/Model.mtp.mq4.hfq"));
+    }
 }
 
 fn run_decompose(a: DecomposeArgs, loaded: &LoadedConfig) -> anyhow::Result<()> {

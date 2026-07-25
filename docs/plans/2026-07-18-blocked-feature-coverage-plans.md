@@ -70,7 +70,7 @@ written against a residual-scale layout that the shipped checkpoint does not use
    `scale_residual_merge`. Remove the `input_hidden_states_scale` pre-scale. Keep
    `residual_in_fp32`. The half-layer ATT/MLP alternation already exists (tests pass), so
    this is a residual-scale rewrite, not a layer-structure change.
-3. **Validate:** the ZAYA1-8B.oq4.125.hfq artifact already exists
+3. **Validate:** the ZAYA1-8B--oq4.125.hfq artifact already exists
    (scratchpad/, 5.25GB) — once loading works, `hipfire chat` coherence check at
    temperature 0 (base model → factual continuation). Also validates the qt-36 OQ
    path end-to-end on GPU (currently only unit-tested). A bf16 zaya quant is the

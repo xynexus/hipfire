@@ -96,8 +96,8 @@ The dev machine has a Radeon 8060S with 512 MB carve-out. Models that fit:
 
 | Model | File | Notes |
 |-------|------|-------|
-| qwen3.5-0.8b | `~/.hipfire/models/qwen3.5-0.8b.mq6.hfq` | Good smoke target |
-| qwen3.5-35b-a3b | `~/.hipfire/models/qwen3.5-35b-a3b.mq6.hfq` | Small MoE, K_TOP=8 |
+| qwen3.5-0.8b | `~/.hipfire/models/qwen3.5-0.8b--mq6.hfq` | Good smoke target |
+| qwen3.5-35b-a3b | `~/.hipfire/models/qwen3.5-35b-a3b--mq6.hfq` | Small MoE, K_TOP=8 |
 
 ## 397B paged-expert model
 

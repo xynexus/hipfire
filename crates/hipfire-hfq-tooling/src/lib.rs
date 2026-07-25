@@ -589,10 +589,15 @@ pub fn sidecar_tag_from_filename(path: &Path) -> Option<String> {
     let fname = path
         .file_name()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())?;
-    let stem = fname.strip_suffix(".hfq").unwrap_or(&fname).to_string();
+    // Normalize the `--` name/machine boundary to a dot so the first feature
+    // group is not glued to the model name.
+    let stem = fname
+        .strip_suffix(".hfq")
+        .unwrap_or(&fname)
+        .replace("--", ".");
     stem.split('.')
         .find(|seg| KNOWN_ROLES.contains(seg))
-        .map(|s| s.to_string())
+        .map(str::to_string)
 }
 
 /// Derive a friendly role tag for a sidecar from its filename dot-groups, then
@@ -2098,10 +2103,13 @@ fn role_tags_from_filename(path: &Path) -> Vec<String> {
         .file_name()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    let stem = fname.strip_suffix(".hfq").unwrap_or(&fname).to_string();
+    let stem = fname
+        .strip_suffix(".hfq")
+        .unwrap_or(&fname)
+        .replace("--", ".");
     stem.split('.')
         .filter(|seg| KNOWN_ROLES.contains(seg))
-        .map(|s| s.to_string())
+        .map(str::to_string)
         .collect()
 }
 
@@ -2124,11 +2132,20 @@ fn roles_from_tensor_names(pkg: &HfqPackage) -> Vec<String> {
 /// `Model.mtp.vl.mq4.hfq` + `[mtp, vl]` -> `Model.mq4.hfq`.
 fn strip_role_groups(fname: &str, roles: &[String]) -> String {
     let stem = fname.strip_suffix(".hfq").unwrap_or(fname);
-    let kept: Vec<&str> = stem
-        .split('.')
-        .filter(|seg| !roles.iter().any(|r| r.eq_ignore_ascii_case(seg)))
-        .collect();
-    format!("{}.hfq", kept.join("."))
+    let strip = |section: &str| -> String {
+        section
+            .split('.')
+            .filter(|seg| !roles.iter().any(|r| r.eq_ignore_ascii_case(seg)))
+            .collect::<Vec<_>>()
+            .join(".")
+    };
+    // Only the machine section (after the `--` boundary) carries feature groups;
+    // keep the boundary and the model name intact.
+    if let Some((identity, machine)) = stem.split_once("--") {
+        format!("{identity}--{}.hfq", strip(machine))
+    } else {
+        format!("{}.hfq", strip(stem))
+    }
 }
 
 /// Best-effort split of a bundle that has NO [`HFQM_COMPOSE_KEY`] manifest,
@@ -2223,10 +2240,13 @@ pub fn decompose_hfq_infer_with_config_keys_options(
     let base_stem = base_fname.strip_suffix(".hfq").unwrap_or(&base_fname);
     // Sidecars are `<family>.<role>.hfq`, where family drops the quant token (the
     // base stem's last dot-group) — matching the compose naming (base
-    // `Model.mq4.hfq` + `Model.mtp.hfq` <-> `Model.mtp.mq4.hfq`).
+    // `Model--mq4.hfq` + `Model.mtp.hfq` <-> `Model--mtp.mq4.hfq`).
+    // Family (for the dotted sidecar name) drops the quant token: the identity
+    // before the `--` boundary, or the stem before the last dot for legacy names.
     let family_stem = base_stem
-        .rsplit_once('.')
+        .split_once("--")
         .map(|(head, _)| head)
+        .or_else(|| base_stem.rsplit_once('.').map(|(head, _)| head))
         .unwrap_or(base_stem);
 
     let mut destinations =

@@ -239,7 +239,7 @@ impl DraftFormat {
             Self::Mq6 => "mq6",
             Self::Oq8 => "oq8",
             // Base token; the mixed overlay count rides in the artifact filename
-            // per the canonical naming (e.g. `.oq4.25+.hfq`). The loader keys on
+            // per the canonical naming (e.g. `--oq4.25+.hfq`). The loader keys on
             // per-tensor QuantType, not this string.
             Self::Oq4 | Self::Oq4Mixed(_) => "oq4",
         }
