@@ -827,13 +827,6 @@ pub struct NextBatchInput {
     pub now_ms: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PreviewPrefillBatchInput {
-    pub now_ms: u64,
-    pub incoming_session: Option<RequestSessionDraft>,
-    pub incoming_enqueued_at_ms: Option<u64>,
-}
-
 fn fair_ordered_prefill_bucket(
     bucket: &[QueuedPrefillRequest],
     last_owner: Option<&str>,
@@ -919,27 +912,6 @@ impl WorkerDeviceCapabilityStatus {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ActiveDecodeSession {
-    pub id: String,
-    pub worker_key_id: String,
-    pub priority: u8,
-    pub runtime_state_handle: String,
-    pub state_kinds: Vec<String>,
-    pub cache_mode: String,
-    pub fused_state_batch: bool,
-    pub logical_position: usize,
-    pub cached_prefix_tokens: usize,
-    pub generated_tokens: usize,
-    pub max_tokens: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DecodeBatchSelection {
-    pub sessions: Vec<ActiveDecodeSession>,
-    pub policy: SchedulerPriorityPolicy,
-}
-
 fn parse_integer(value: Option<&str>, fallback: i64) -> i64 {
     let Some(value) = value else {
         return fallback;
@@ -968,13 +940,6 @@ fn parse_boolean(value: Option<&str>, fallback: bool) -> bool {
 
 pub fn clamp_scheduler_priority(value: i64) -> u8 {
     value.clamp(0, 255) as u8
-}
-
-pub fn clamp_scheduler_priority_f64(value: f64) -> u8 {
-    if !value.is_finite() {
-        return SCHED_PRIORITY_DEFAULT;
-    }
-    clamp_scheduler_priority(value.floor() as i64)
 }
 
 pub fn parse_scheduler_priority(value: Option<&str>, fallback: u8) -> u8 {
@@ -1157,10 +1122,6 @@ pub fn server_state_cache_health_json(env: &SchedulerPolicyEnv) -> serde_json::V
         "evictions_total": 0,
         "recompute_required_total": 0,
     })
-}
-
-pub fn server_batch_health_json() -> serde_json::Value {
-    serde_json::json!({ "enabled": false })
 }
 
 pub fn scheduler_policy_for_priority(
@@ -1355,13 +1316,6 @@ fn state_kinds_have_private_or_mamba(kinds: &[String]) -> bool {
     })
 }
 
-fn state_kinds_have_mamba(kinds: &[String]) -> bool {
-    let normalized = normalize_generate_state_kind_set(kinds);
-    normalized
-        .iter()
-        .any(|kind| matches!(kind.as_str(), "mamba_ssm" | "mamba_conv"))
-}
-
 fn worker_key_requires_token_ordered_recurrent(worker_key: &ModelWorkerKey) -> bool {
     let state_mode = worker_key.state_mode.to_ascii_lowercase();
     state_mode.contains("mamba") || state_mode.contains("lfm2") || state_mode.contains("short_conv")
@@ -1401,54 +1355,6 @@ pub fn sessions_compatible_for_prefill(a: &RequestSessionDraft, b: &RequestSessi
         return false;
     }
     if !prefill_session_multi_session_batchable(a) || !prefill_session_multi_session_batchable(b) {
-        return a.id == b.id;
-    }
-    true
-}
-
-fn inferred_decode_state_kinds(worker_key_id: &str) -> Vec<String> {
-    let lower = worker_key_id.to_ascii_lowercase();
-    if lower.contains("nemotron") || lower.contains("mamba") {
-        return vec![
-            "attention_kv".to_string(),
-            "mamba_ssm".to_string(),
-            "mamba_conv".to_string(),
-        ];
-    }
-    if lower.contains("lfm2") || lower.contains("minimax") {
-        return vec!["attention_kv".to_string(), "backend_private".to_string()];
-    }
-    if lower.contains("qwen") || lower.contains("deltanet") {
-        return vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()];
-    }
-    Vec::new()
-}
-
-fn decode_state_kinds(session: &ActiveDecodeSession) -> Vec<String> {
-    if session.state_kinds.is_empty() {
-        inferred_decode_state_kinds(&session.worker_key_id)
-    } else {
-        session.state_kinds.clone()
-    }
-}
-
-pub fn decode_sessions_compatible_for_batch(
-    a: &ActiveDecodeSession,
-    b: &ActiveDecodeSession,
-) -> bool {
-    if a.worker_key_id != b.worker_key_id {
-        return false;
-    }
-    if a.cache_mode != b.cache_mode {
-        return false;
-    }
-    let a_kinds = decode_state_kinds(a);
-    let b_kinds = decode_state_kinds(b);
-    if !generate_state_kind_sets_match_exactly(&a_kinds, &b_kinds) {
-        return false;
-    }
-    let requires_singleton = state_kinds_have_mamba(&a_kinds) || state_kinds_have_mamba(&b_kinds);
-    if requires_singleton && !(a.fused_state_batch && b.fused_state_batch) {
         return a.id == b.id;
     }
     true
@@ -1661,48 +1567,6 @@ impl PriorityPrefillScheduler {
         None
     }
 
-    pub fn preview_next_prefill_batch(
-        &self,
-        input: PreviewPrefillBatchInput,
-    ) -> Option<PrefillBatchSelection> {
-        for priority in 0..self.buckets.len() {
-            let mut bucket = self.buckets[priority].clone();
-            let already_queued_incoming = input
-                .incoming_session
-                .as_ref()
-                .map(|incoming| bucket.iter().any(|entry| entry.session.id == incoming.id))
-                .unwrap_or(false);
-            if let Some(incoming) = input.incoming_session.as_ref() {
-                if incoming.priority as usize == priority && !already_queued_incoming {
-                    bucket.push(QueuedPrefillRequest {
-                        session: incoming.clone(),
-                        enqueued_at_ms: input.incoming_enqueued_at_ms.unwrap_or(input.now_ms),
-                    });
-                }
-            }
-            if bucket.is_empty() {
-                continue;
-            }
-            let ordered = fair_ordered_prefill_bucket(
-                &bucket,
-                self.last_scheduled_owner[priority].as_deref(),
-            );
-            let candidate = self.select_from_bucket(priority as u8, &ordered, input.now_ms)?;
-            let Some(incoming) = input.incoming_session.as_ref() else {
-                return Some(candidate);
-            };
-            if candidate
-                .sessions
-                .iter()
-                .any(|session| session.id == incoming.id)
-            {
-                return Some(candidate);
-            }
-            return None;
-        }
-        None
-    }
-
     fn select_from_bucket(
         &self,
         priority: u8,
@@ -1827,111 +1691,6 @@ impl PriorityPrefillScheduler {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct PriorityDecodeScheduler {
-    env: SchedulerPolicyEnv,
-    buckets: Vec<Vec<ActiveDecodeSession>>,
-    active_ids: HashSet<String>,
-    active_count: usize,
-}
-
-impl Default for PriorityDecodeScheduler {
-    fn default() -> Self {
-        Self::new(SchedulerPolicyEnv::empty())
-    }
-}
-
-impl PriorityDecodeScheduler {
-    pub fn new(env: SchedulerPolicyEnv) -> Self {
-        Self {
-            env,
-            buckets: (0..=255).map(|_| Vec::new()).collect(),
-            active_ids: HashSet::new(),
-            active_count: 0,
-        }
-    }
-
-    pub fn size(&self) -> usize {
-        self.active_count
-    }
-
-    pub fn has(&self, id: &str) -> bool {
-        self.active_ids.contains(id)
-    }
-
-    pub fn enqueue(&mut self, session: ActiveDecodeSession) -> Result<(), String> {
-        if self.active_ids.contains(&session.id) {
-            return Err(format!("decode session is already active: {}", session.id));
-        }
-        let max_active = self.max_active_sessions();
-        if max_active > 0 && self.active_count >= max_active {
-            return Err(format!(
-                "decode scheduler backpressure: active={} max={max_active}",
-                self.active_count
-            ));
-        }
-        let priority = session.priority as usize;
-        let id = session.id.clone();
-        self.buckets[priority].push(session);
-        self.active_ids.insert(id);
-        self.active_count += 1;
-        Ok(())
-    }
-
-    pub fn cancel(&mut self, id: &str) -> bool {
-        if !self.active_ids.contains(id) {
-            return false;
-        }
-        for bucket in &mut self.buckets {
-            if let Some(index) = bucket.iter().position(|session| session.id == id) {
-                bucket.remove(index);
-                self.active_ids.remove(id);
-                self.active_count = self.active_count.saturating_sub(1);
-                return true;
-            }
-        }
-        self.active_ids.remove(id);
-        self.active_count = self.active_count.saturating_sub(1);
-        true
-    }
-
-    pub fn next_decode_batch(&mut self, _input: NextBatchInput) -> Option<DecodeBatchSelection> {
-        for priority in 0..self.buckets.len() {
-            let bucket = &self.buckets[priority];
-            if bucket.is_empty() {
-                continue;
-            }
-            let first = bucket.first()?;
-            let policy = scheduler_policy_for_priority(first.priority, &self.env);
-            let compatible = bucket
-                .iter()
-                .filter(|session| decode_sessions_compatible_for_batch(first, session))
-                .take(policy.max_batch_size)
-                .cloned()
-                .collect::<Vec<_>>();
-            if compatible.is_empty() {
-                return None;
-            }
-            self.remove_selected(&compatible);
-            return Some(DecodeBatchSelection {
-                sessions: compatible,
-                policy,
-            });
-        }
-        None
-    }
-
-    fn max_active_sessions(&self) -> usize {
-        parse_integer(self.env.get("HIPFIRE_SCHED_DECODE_MAX_ACTIVE"), 256).max(0) as usize
-    }
-
-    fn remove_selected(&mut self, sessions: &[ActiveDecodeSession]) {
-        for session in sessions {
-            self.cancel(&session.id);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2016,56 +1775,9 @@ mod tests {
             .unwrap_or_default()
     }
 
-    fn decode_ids(batch: Option<DecodeBatchSelection>) -> Vec<String> {
-        batch
-            .map(|batch| {
-                batch
-                    .sessions
-                    .into_iter()
-                    .map(|session| session.id)
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn active(id: &str, worker_key_id: &str, priority: u8) -> ActiveDecodeSession {
-        active_with_state(
-            id,
-            worker_key_id,
-            priority,
-            &["attention_kv", "deltanet_recurrent"],
-            "flat",
-            false,
-        )
-    }
-
-    fn active_with_state(
-        id: &str,
-        worker_key_id: &str,
-        priority: u8,
-        state_kinds: &[&str],
-        cache_mode: &str,
-        fused_state_batch: bool,
-    ) -> ActiveDecodeSession {
-        ActiveDecodeSession {
-            id: id.to_string(),
-            worker_key_id: worker_key_id.to_string(),
-            priority,
-            runtime_state_handle: format!("runtime-{id}"),
-            state_kinds: state_kinds.iter().map(|kind| kind.to_string()).collect(),
-            cache_mode: cache_mode.to_string(),
-            fused_state_batch,
-            logical_position: 8,
-            cached_prefix_tokens: 8,
-            generated_tokens: 0,
-            max_tokens: 4,
-        }
-    }
-
     #[test]
     fn priority_parsing_and_classes_match_bun_policy() {
         assert_eq!(clamp_scheduler_priority(-1), 0);
-        assert_eq!(clamp_scheduler_priority_f64(64.9), 64);
         assert_eq!(clamp_scheduler_priority(999), 255);
         assert_eq!(
             parse_default_scheduler_priority(&SchedulerPolicyEnv::empty()),
@@ -2530,19 +2242,13 @@ mod tests {
     }
 
     #[test]
-    fn prefill_scheduler_preview_cancel_aging_and_backpressure() {
+    fn prefill_scheduler_cancel_aging_and_backpressure() {
         let mut scheduler = PriorityPrefillScheduler::new(env(&[
             ("HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE", "0"),
             ("HIPFIRE_SCHED_PREFILL_BATCH_MAX", "2"),
         ]));
         scheduler.enqueue(session("a", 64, 16), 0).unwrap();
         let incoming = session("incoming", 64, 16);
-        let preview = scheduler.preview_next_prefill_batch(PreviewPrefillBatchInput {
-            now_ms: 30,
-            incoming_session: Some(incoming.clone()),
-            incoming_enqueued_at_ms: None,
-        });
-        assert_eq!(ids(preview), vec!["a", "incoming"]);
         assert_eq!(
             ids(scheduler.next_prefill_batch(NextBatchInput { now_ms: 30 })),
             vec!["a"]
@@ -2572,92 +2278,6 @@ mod tests {
             .enqueue(session("second", 64, 16), 0)
             .unwrap_err()
             .contains("backpressure"));
-    }
-
-    #[test]
-    fn decode_scheduler_batches_by_worker_and_enforces_backpressure() {
-        let mut scheduler =
-            PriorityDecodeScheduler::new(env(&[("HIPFIRE_SCHED_PREFILL_BATCH_MAX", "2")]));
-        scheduler.enqueue(active("a", "worker-a", 64)).unwrap();
-        scheduler.enqueue(active("b", "worker-a", 64)).unwrap();
-        scheduler.enqueue(active("c", "worker-b", 64)).unwrap();
-        assert_eq!(
-            decode_ids(scheduler.next_decode_batch(NextBatchInput { now_ms: 0 })),
-            vec!["a", "b"]
-        );
-        assert_eq!(
-            decode_ids(scheduler.next_decode_batch(NextBatchInput { now_ms: 0 })),
-            vec!["c"]
-        );
-
-        let mut capped =
-            PriorityDecodeScheduler::new(env(&[("HIPFIRE_SCHED_DECODE_MAX_ACTIVE", "1")]));
-        capped.enqueue(active("a", "worker-a", 64)).unwrap();
-        assert!(capped
-            .enqueue(active("b", "worker-a", 64))
-            .unwrap_err()
-            .contains("decode scheduler backpressure"));
-    }
-
-    #[test]
-    fn decode_scheduler_respects_state_fingerprint() {
-        let mut scheduler =
-            PriorityDecodeScheduler::new(env(&[("HIPFIRE_SCHED_PREFILL_BATCH_MAX", "4")]));
-        scheduler
-            .enqueue(active_with_state(
-                "mamba-a",
-                "worker-nemotron",
-                64,
-                &["attention_kv", "mamba_ssm", "mamba_conv"],
-                "flat",
-                false,
-            ))
-            .unwrap();
-        scheduler
-            .enqueue(active_with_state(
-                "mamba-b",
-                "worker-nemotron",
-                64,
-                &["mamba_conv", "attention_kv", "mamba_ssm"],
-                "flat",
-                false,
-            ))
-            .unwrap();
-        assert_eq!(
-            decode_ids(scheduler.next_decode_batch(NextBatchInput { now_ms: 0 })),
-            vec!["mamba-a"]
-        );
-        assert_eq!(
-            decode_ids(scheduler.next_decode_batch(NextBatchInput { now_ms: 0 })),
-            vec!["mamba-b"]
-        );
-
-        let mut fused =
-            PriorityDecodeScheduler::new(env(&[("HIPFIRE_SCHED_PREFILL_BATCH_MAX", "4")]));
-        fused
-            .enqueue(active_with_state(
-                "fused-a",
-                "worker-nemotron",
-                64,
-                &["attention_kv", "mamba_ssm", "mamba_conv"],
-                "flat",
-                true,
-            ))
-            .unwrap();
-        fused
-            .enqueue(active_with_state(
-                "fused-b",
-                "worker-nemotron",
-                64,
-                &["mamba_conv", "attention_kv", "mamba_ssm"],
-                "flat",
-                true,
-            ))
-            .unwrap();
-        assert_eq!(
-            decode_ids(fused.next_decode_batch(NextBatchInput { now_ms: 0 })),
-            vec!["fused-a", "fused-b"]
-        );
     }
 
     #[test]

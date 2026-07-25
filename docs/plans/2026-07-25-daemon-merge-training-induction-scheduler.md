@@ -212,10 +212,22 @@ independently revertible.
 - Relocate the 2141-line test module out of `main.rs:974-3115`.
 - Split `main.rs` into the §1.3 modules with `main()` still holding the locals — purely
   mechanical `&mut` threading.
-- **Delete the dead scheduler API before moving it:** `PriorityDecodeScheduler` entirely
-  (never constructed), `preview_next_prefill_batch`, all `SchedulerPriorityPolicy` fields
-  (no caller reads one), ~60 hardcoded-zero health-JSON keys. That is ~700–800 of 1934
-  production lines — a third less to migrate.
+- **Delete the dead scheduler API before moving it.** Done: 3018 → 2638 lines (−380).
+  Removed `PriorityDecodeScheduler` and its whole cluster (`ActiveDecodeSession`,
+  `DecodeBatchSelection`, `decode_sessions_compatible_for_batch`, `decode_state_kinds`,
+  `inferred_decode_state_kinds`, `state_kinds_have_mamba`) plus
+  `preview_next_prefill_batch`/`PreviewPrefillBatchInput`,
+  `clamp_scheduler_priority_f64`, and `server_batch_health_json`.
+
+  The original ~700–800 estimate was wrong, in two directions worth recording:
+  - **`should_dispatch_opportunistic` and `parse_default_scheduler_priority` are live**,
+    called from `select_from_bucket` and a health-JSON builder respectively. Having no
+    caller *outside* the crate is not the same as being dead. They stay (candidates for
+    demotion to private, not deletion).
+  - **The ~60 hardcoded-zero health-JSON keys must not be deleted here.**
+    `tests/smoke-server-decode-batch.sh` asserts `health.decode_batch.total_batches` and
+    `selected_batch_size` — deleting them now would break the exact smoke test M4 uses as
+    its exit gate. They get *replaced by real counters* in M4, not removed in M0.
 - Fix two bugs found in passing: `?`-on-`Option` head-of-line blocking at
   `scheduler/lib.rs:1653`, `:1690`, `:1904`; and O(bucket²) `RequestSessionDraft` cloning
   in `fair_ordered_prefill_bucket` (`:837`).
