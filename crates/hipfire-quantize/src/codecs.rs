@@ -1780,6 +1780,50 @@ pub fn quantize_q4_as_q8(f32_data: &[f32]) -> Vec<u8> {
     output
 }
 
+/// Build the **coarse shortlist tier** of a two-pass lm_head
+/// ([`QuantType::CoarseQ4Row`]) from a row-major `[rows, cols]` weight matrix.
+///
+/// Per row: the exact L2 norm is factored out and stored as the row's f16
+/// scale, and only the *unit direction* is quantized to symmetric Q4 with a
+/// global 3σ clip (`unit_scale = 3 / (7·sqrt(cols))`, levels `[-7, 7]`). Row
+/// normalisation is what makes 4 bits sufficient — a per-row-max Q4 lets a few
+/// outlier channels set the step size and crushes the rest of the direction.
+///
+/// Planar output: `[rows*cols/2 nibble bytes][rows*2 f16 scale bytes]`, nibble
+/// `2i` in the low half of byte `i`, `2i+1` in the high half.
+///
+/// This tier only has to keep the true argmax inside a small top-K (measured
+/// recall@8 = 100% on ZAYA1-8B); the fine tier rescores the shortlist exactly.
+/// See docs/kernel_work/two-stage-lmhead.md.
+pub fn build_coarse_q4row(f32_data: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+    assert_eq!(
+        f32_data.len(),
+        rows * cols,
+        "build_coarse_q4row: shape mismatch"
+    );
+    assert_eq!(cols % 2, 0, "build_coarse_q4row: cols must be even");
+    let nib_bytes = rows * (cols / 2);
+    let mut out = vec![0u8; nib_bytes + rows * 2];
+    let unit_scale = 3.0f32 / (7.0 * (cols as f32).sqrt());
+    let inv_unit = 1.0f32 / unit_scale;
+    for r in 0..rows {
+        let w = &f32_data[r * cols..(r + 1) * cols];
+        let norm = w.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let nib = &mut out[r * (cols / 2)..(r + 1) * (cols / 2)];
+        if norm > 0.0 {
+            let inv = inv_unit / norm;
+            let q = |i: usize| ((w[i] * inv).round().clamp(-7.0, 7.0) as i32) as u8;
+            for i in 0..cols / 2 {
+                nib[i] = (q(2 * i) & 0x0F) | ((q(2 * i + 1) & 0x0F) << 4);
+            }
+        }
+        // Row scale folds the exact norm and the shared unit step together.
+        let s = f32_to_f16(norm * unit_scale).to_le_bytes();
+        out[nib_bytes + r * 2..nib_bytes + r * 2 + 2].copy_from_slice(&s);
+    }
+    out
+}
+
 /// Quantize F32 weights to Q8_0 format (compatible with GGML Q8_0).
 /// Block: f16 scale (2B) + 32 × int8 = 34 bytes per 32 elements (1.0625 bytes/weight).
 /// Symmetric quantization: scale = max(|w|) / 127, q = round(w / scale).

@@ -447,6 +447,46 @@ static OQPLUS_W8_FRAC: OnceLock<f32> = OnceLock::new();
 thread_local! {
     static OQ4_AWQ_SIDECAR: std::cell::RefCell<Option<Vec<f32>>> =
         const { std::cell::RefCell::new(None) };
+    // Carries the two-pass lm_head COARSE tier (QuantType::CoarseQ4Row) out of the
+    // embed arm of `quantize_hfq_source_tensor` to the tensor-write loop, which
+    // emits it as `<embed>.coarse.weight`. Same thread-local rationale as the AWQ
+    // sidecar above. See `emit_coarse_sidecar` / docs/kernel_work/two-stage-lmhead.md.
+    static COARSE_Q4_SIDECAR: std::cell::RefCell<Option<Vec<u8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `--no-coarse-lmhead` (or `HIPFIRE_NO_COARSE_LMHEAD`) disables emission of the
+/// two-pass lm_head coarse tier. Default is ON: the coarse tier is ~0.5 b/weight
+/// on top of the fine embed and makes decode's output projection ~4× cheaper
+/// while the fine pass keeps the logits exact for the shortlisted rows. A model
+/// built without it still serves — the runtime falls back to a single fine pass.
+fn coarse_lmhead_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("HIPFIRE_NO_COARSE_LMHEAD").is_none())
+}
+
+/// Drain the pending coarse tier (if the just-pushed tensor produced one) and
+/// append it as `<stem>.coarse.weight`. Mirrors the AWQ sidecar drain.
+fn emit_coarse_sidecar(tensors: &mut Vec<HfqTensor>, name: &str, shape: &[u32]) {
+    let Some(bytes) = COARSE_Q4_SIDECAR.with(|c| c.borrow_mut().take()) else {
+        return;
+    };
+    let sidecar_name = match name.strip_suffix(".weight") {
+        Some(stem) => format!("{stem}.coarse.weight"),
+        None => format!("{name}.coarse.weight"),
+    };
+    eprintln!(
+        "  COARSE: {sidecar_name} {shape:?} (Q4 row-norm + f16 row scale, {:.1} MB)",
+        bytes.len() as f64 / (1024.0 * 1024.0)
+    );
+    tensors.push(HfqTensor {
+        name: sidecar_name,
+        quant_type: QuantType::CoarseQ4Row,
+        shape: shape.to_vec(),
+        group_size: 0,
+        data: bytes,
+        spilled_len: 0,
+    });
 }
 
 // MQ+ clip-search: when set (by an `mqN+` format), MQ codecs use the MSE-optimal
@@ -3727,6 +3767,16 @@ fn quantize_hfq_source_tensor(
     // layouts are not valid embedding lookup storage.
     let is_embed = is_embedding_table_name(name);
     if is_embed {
+        // Two-pass lm_head: stash the coarse shortlist tier for the write loop.
+        // Built from the SAME f32 the fine tier is quantized from, so the coarse
+        // ranks rows consistently with the fine weights it shortlists for.
+        if coarse_lmhead_enabled() && shape.len() == 2 && shape[1] % 2 == 0 {
+            let (rows, cols) = (shape[0] as usize, shape[1] as usize);
+            if f32_data.len() == rows * cols {
+                let coarse = build_coarse_q4row(&f32_data, rows, cols);
+                COARSE_Q4_SIDECAR.with(|c| *c.borrow_mut() = Some(coarse));
+            }
+        }
         // --embed-precision bf16|f16: keep the gather table at source precision
         // instead of Q8 (no-op under the default q8). Only the embed table — the
         // router/conv1d/non-2D tensors below stay Q8.
@@ -4755,6 +4805,7 @@ fn run_hfq_source_pipeline(
                 spilled_len: 0,
             });
         }
+        emit_coarse_sidecar(&mut hfq_tensors, &t.name, &t.shape);
         if let Some(ref mut output_spill) = spill {
             maybe_spill(&mut hfq_tensors, output_spill, 2 * 1024 * 1024 * 1024);
         }
@@ -8292,6 +8343,7 @@ fn main() {
                         spilled_len: 0,
                     });
                 }
+                emit_coarse_sidecar(&mut hfq_tensors, name, &shape);
                 quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
                 st_files[*file_idx].drop_tensor_pages(name);
                 if let Some(ref mut s) = spill {
@@ -8617,6 +8669,7 @@ fn main() {
                     spilled_len: 0,
                 });
             }
+            emit_coarse_sidecar(&mut hfq_tensors, name, &shape);
             quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
             st_files[*file_idx].drop_tensor_pages(name);
             if let Some(ref mut s) = spill {
