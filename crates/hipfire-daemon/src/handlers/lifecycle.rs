@@ -444,16 +444,28 @@ pub(crate) fn load(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
-    // Stream per-layer load progress to the client on the framed
-    // stdout channel (see `emit_load_progress`). Loaders call
-    // `load_progress::report`, which this sink turns into a
-    // `load_progress` frame. Installed only for the duration of this
-    // load and cleared right after the match, so no stray frames
-    // leak into later ops. `load_model` runs synchronously on this
-    // thread, so the sink writes interleave safely with our own
-    // stdout writes (each is a whole locked line).
-    hipfire_runtime::load_progress::set_sink(Some(Box::new(|current, total, phase| {
-        emit_load_progress(current, total, phase)
+    // Stream per-layer load progress back to the client (see
+    // `emit_load_progress`). Loaders call `load_progress::report`, which this sink
+    // turns into a `load_progress` frame. Installed only for the duration of this
+    // load and cleared right after the match, so no stray frames leak into later
+    // ops. `load_model` runs synchronously on this thread, so the sink's writes
+    // interleave safely with the handler's own (each is a whole line).
+    //
+    // The sink captures *this connection's* writer and request id. It used to call
+    // a free fn that took a fresh process-stdout lock, which worked only because
+    // stdout was the sole destination; on a socket connection that sent progress to
+    // the daemon's stdout and the client saw none. `ReplySink` is Clone + Send +
+    // Sync, which is what lets it live in the `Fn` sink closure.
+    let progress_sink = daemon_state.out.sink.clone();
+    let progress_id = daemon_state.out.request_id.clone();
+    hipfire_runtime::load_progress::set_sink(Some(Box::new(move |current, total, phase| {
+        emit_load_progress(
+            &mut progress_sink.clone(),
+            &progress_id,
+            current,
+            total,
+            phase,
+        )
     })));
     let _qwen_residency_env =
         qwen_residency_load_env(protocol_load.as_ref().map(|req| &req.params));

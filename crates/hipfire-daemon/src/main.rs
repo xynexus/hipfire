@@ -97,20 +97,30 @@ fn invalid_kld_ref(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
 }
 
-/// Emit a `load_progress` frame on the framed stdout channel. Called by the
-/// load-progress sink the `load` handler installs around `load_model`. Takes a
-/// fresh `std::io::stdout()` lock (rather than the handler's local `stdout`) so
-/// it can be a plain free fn invoked from the sink closure; loads run on this
-/// thread, so this never races the handler's own writes. `phase` is a controlled
-/// identifier (e.g. `"weights"`) — no JSON escaping needed.
-fn emit_load_progress(current: u32, total: u32, phase: &str) {
-    use std::io::Write;
-    let mut out = std::io::stdout().lock();
-    let _ = writeln!(
-        out,
-        r#"{{"type":"load_progress","current":{current},"total":{total},"phase":"{phase}"}}"#
-    );
-    let _ = out.flush();
+/// Emit a `load_progress` frame to the caller that asked for the load.
+///
+/// This used to take a fresh `std::io::stdout()` lock so it could be a plain free
+/// fn callable from the progress-sink closure. That was fine while stdout was the
+/// only place a reply could go — and silently wrong the moment it was not: on a
+/// socket connection the frames went to the daemon's own stdout and the client
+/// loading the model saw no progress at all. It now writes to the requesting
+/// connection's sink, and carries the request id like every other frame.
+fn emit_load_progress(
+    sink: &mut dyn std::io::Write,
+    id: &str,
+    current: u32,
+    total: u32,
+    phase: &str,
+) {
+    let frame = serde_json::json!({
+        "type": "load_progress",
+        "id": id,
+        "current": current,
+        "total": total,
+        "phase": phase,
+    });
+    let _ = writeln!(sink, "{frame}");
+    let _ = sink.flush();
 }
 
 fn embeddinggemma_parts<'a>(
@@ -1066,6 +1076,8 @@ fn main() {
              Reads JSON requests from stdin and writes JSON events to stdout.\n\
              \n\
              Options:\n\
+               --listen [PATH]     serve on a unix socket instead of stdin/stdout\n\
+                                   (default ~/.hipfire/daemon.sock, mode 0600)\n\
                --precompile        compile/cache kernels for the current GPU and exit\n\
                --version, -V       print the build version and exit\n\
                --help, -h          print this help"
@@ -1129,6 +1141,16 @@ fn main() {
     // (observed 2026-04-13: two daemons at 100% CPU survived pkill -f rounds
     // because they'd been reparented to PID 1 after their serve parent died).
     // Kept in a binding so the fd lives for the full process lifetime.
+    // `--listen` optionally takes a path; anything starting with `-` after it is
+    // the next flag, not a socket path.
+    let listen_path: Option<std::path::PathBuf> =
+        args.iter().position(|a| a == "--listen").map(|index| {
+            args.get(index + 1)
+                .filter(|next| !next.starts_with('-'))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(transport::default_socket_path)
+        });
+
     let _daemon_lock = acquire_daemon_lock();
     let _resource_lease = hipfire_daemon_adapter::acquire_resource_lease_or_exit();
     hipfire_runtime::logging::init_stderr_logging("daemon");
@@ -1162,12 +1184,38 @@ fn main() {
         );
     }
 
-    // Reading happens on its own thread; this loop is the executor and owns the
+    // Reading happens on its own thread(s); this loop is the executor and owns the
     // GPU. See `transport` for why the split matters and why execution stays on
     // the main thread.
-    let inbound = transport::spawn_stdin_reader();
+    //
+    // stdio stays the default so every existing caller that spawns this binary and
+    // talks over pipes is unaffected. `--listen` is the shared-service mode: the
+    // listener outlives any one client, so the daemon keeps serving across
+    // disconnects rather than exiting with its only pipe.
+    let inbound = match listen_path {
+        None => transport::spawn_stdin_reader(),
+        Some(path) => match transport::spawn_socket_listener(&path) {
+            Ok(inbound) => {
+                eprintln!("hipfire daemon listening on {}", path.display());
+                inbound
+            }
+            // `fatal_startup_error` diverges — it emits a fatal frame and exits.
+            Err(error) => hipfire_daemon_adapter::fatal_startup_error(
+                &format!("failed to listen on {}: {error}", path.display()),
+                None,
+            ),
+        },
+    };
 
     for frame in inbound {
+        let transport::Inbound { payload, reply } = frame;
+
+        // Answer on the connection this frame arrived on, rather than wherever the
+        // previous one came from. With a single stdio client this is a no-op; with
+        // several socket clients it is the whole point, and getting it wrong would
+        // deliver one client's tokens to another.
+        daemon_state.out.sink = reply;
+
         // Set the stamp for this frame in exactly one place, before anything can
         // emit. Every frame the request produces is tagged with it (see
         // `Responder::emit`) so a caller can correlate replies.
@@ -1177,18 +1225,18 @@ fn main() {
         // the *previous* request's id and blame a request that in fact succeeded.
         // Doing it per-branch instead invites exactly that bug back the next time
         // a variant is added.
-        daemon_state.out.request_id = match &frame {
-            transport::Inbound::Request(msg) => msg
+        daemon_state.out.request_id = match &payload {
+            transport::Payload::Request(msg) => msg
                 .get("id")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            transport::Inbound::Malformed(_) => String::new(),
+            transport::Payload::Malformed(_) => String::new(),
         };
 
-        let msg = match frame {
-            transport::Inbound::Request(msg) => msg,
-            transport::Inbound::Malformed(error) => {
+        let msg = match payload {
+            transport::Payload::Request(msg) => msg,
+            transport::Payload::Malformed(error) => {
                 // Reported here rather than in the reader so every write stays on
                 // this thread and keeps its place relative to real responses. The
                 // envelope goes through serde_json because the parse-error text is

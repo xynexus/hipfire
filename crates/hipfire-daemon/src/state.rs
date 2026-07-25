@@ -23,6 +23,7 @@ use hipfire_serving_core::model::LoadedModel;
 use hipfire_serving_core::session::DEFAULT_MODEL_WORKER_ID;
 use hipfire_state::GenericSequenceStateArena;
 
+use crate::transport::ReplySink;
 use crate::{DrafterTrainSession, LoraTrainSession, ResourceReservationManager};
 
 pub(crate) struct DaemonState {
@@ -86,9 +87,10 @@ pub(crate) struct Responder {
     /// Where frames go. Handlers write whole lines, which is why interleaved
     /// progress frames are safe on a single thread.
     ///
-    /// Boxed rather than a concrete `Stdout` so a connection can supply its own
-    /// writer, and so [`Responder::emit`] is testable against a buffer at all.
-    pub sink: Box<dyn Write + Send>,
+    /// Abstract rather than a concrete `Stdout` so each connection can supply its
+    /// own writer, and so [`Responder::emit`] is testable against a buffer at all.
+    /// The executor swaps this per frame to the sink the frame arrived on.
+    pub sink: ReplySink,
     /// The `id` of the request being handled right now, refreshed once per
     /// read-loop iteration; empty when the request carried no id.
     ///
@@ -99,10 +101,11 @@ pub(crate) struct Responder {
 }
 
 impl Responder {
-    /// A responder writing to process stdout — the stdio transport's sink.
+    /// A responder writing to process stdout — the stdio transport's sink, and the
+    /// placeholder the executor holds before the first frame arrives.
     pub fn to_stdout() -> Self {
         Self {
-            sink: Box::new(std::io::stdout()),
+            sink: ReplySink::new(std::io::stdout()),
             request_id: String::new(),
         }
     }
@@ -192,6 +195,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{stamp_request_id, Responder};
+    use crate::transport::ReplySink;
 
     /// A sink that keeps what was written so a test can read it back. This is the
     /// reason `Responder::sink` is boxed rather than a concrete `Stdout`.
@@ -223,7 +227,7 @@ mod tests {
     fn emitted_frames_are_one_json_line_each_and_carry_the_request_id() {
         let captured = Captured::default();
         let mut out = Responder {
-            sink: Box::new(captured.clone()),
+            sink: ReplySink::new(captured.clone()),
             request_id: "req-1".to_string(),
         };
 
@@ -256,7 +260,7 @@ mod tests {
         // hand-written literals in the daemon interpolated raw.
         let captured = Captured::default();
         let mut out = Responder {
-            sink: Box::new(captured.clone()),
+            sink: ReplySink::new(captured.clone()),
             request_id: "evil\"}\n{\"type\":\"injected".to_string(),
         };
 

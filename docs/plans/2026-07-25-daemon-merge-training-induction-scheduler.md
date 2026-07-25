@@ -331,9 +331,34 @@ on the frame, so a new inbound variant cannot reintroduce it.
 become `&mut dyn Write` (or generic). Wide but mechanical; unblocks M3c and also
 makes `Responder` unit-testable, which it currently is not.
 
-**M3c — `UnixListener` + per-connection writers.** One `Responder` per connection.
-Needs M3b. Socket at `~/.hipfire/daemon.sock`, mode 0600 — same-uid only, matching
-the existing `admin.secret` trust model, so no new auth surface.
+**M3c — `UnixListener` + per-connection writers. Done.** `--listen [PATH]`
+(default `~/.hipfire/daemon.sock`, mode 0600) serves many clients; stdio stays the
+default so the six existing spawners are untouched. Each accepted connection gets
+its own reader thread and its own `ReplySink`, which every frame carries; the
+executor swaps `Responder::sink` per frame, so a reply always goes back to the
+connection that asked.
+
+`ReplySink` is an `Arc<Mutex<Box<dyn Write + Send>>>`. The mutex is effectively
+uncontended — one request in flight, one writer — but it is what allows a handle to
+be shared across the many frames of a connection when `Write` needs `&mut`. The
+read and write directions use separate fds via `UnixStream::try_clone`, so a reader
+can block on input while the executor answers.
+
+A stale socket file is removed before bind, and the justification is the flock: we
+already hold the exclusive lock on `daemon.pid`, so no live daemon can own that
+socket, and bind would otherwise fail `EADDRINUSE` against a file nobody is
+listening on. The lock is the authority on singleton-ness, not the socket file.
+
+This is also where socket mode exposed a latent bug: `emit_load_progress` took a
+*fresh process-stdout lock*, which was correct only while stdout was the sole
+destination. On a socket connection every `load_progress` frame went to the
+daemon's own stdout and the client loading the model saw nothing. It now writes to
+the requesting connection's sink and carries the request id, which it never did.
+
+*Exit (M3c, met):* two concurrent clients on one daemon, verified with interleaved
+sends (B asks first, A second, each reply routed correctly), sinks surviving across
+multiple frames per connection, one client disconnecting without taking the daemon
+down, and socket mode 0600. stdio behaviour unchanged.
 
 **M3d — control channel + real `Abort`.** Needs a cancellation token threaded into
 `generate()` (`serving-core/generate.rs`, 28 positional params, none of them a
