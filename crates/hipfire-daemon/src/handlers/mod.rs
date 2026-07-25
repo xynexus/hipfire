@@ -11,7 +11,7 @@
 //!   inside the loop body — so `continue` became `return` with no change in
 //!   behaviour. Only one `break` ever targeted the read loop and it lives in the
 //!   loop preamble, not an arm, so no handler needs to signal loop exit.
-//! - Handlers write their own response frames to `daemon_state.stdout` rather
+//! - Handlers write their own response frames to `daemon_state.out.stdout` rather
 //!   than returning a value to be serialised. That is how progress frames
 //!   interleave safely today: each write is a whole locked line on a single
 //!   thread. It is also the thing a multi-client transport has to change.

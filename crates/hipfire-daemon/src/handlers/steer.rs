@@ -22,16 +22,15 @@ pub(crate) fn begin_capture(daemon_state: &mut DaemonState, msg: &serde_json::Va
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
     let (Some(num_layers), Some(hidden)) = (num_layers, hidden) else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "steer_begin_capture: missing 'num_layers'/'hidden'".to_string(),
-        );
+        daemon_state
+            .out
+            .error("steer_begin_capture: missing 'num_layers'/'hidden'".to_string());
         return;
     };
     hipfire_steer::begin_capture(num_layers, hidden);
-    let _ = writeln!(daemon_state.stdout, r#"{{"type":"steer_ok"}}"#);
-    let _ = daemon_state.stdout.flush();
+    daemon_state
+        .out
+        .emit(serde_json::json!({ "type": "steer_ok" }));
 }
 
 pub(crate) fn capture(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
@@ -41,35 +40,27 @@ pub(crate) fn capture(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
         .unwrap_or("")
         .to_string();
     let Some(user) = msg.get("user").and_then(|v| v.as_str()).map(String::from) else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "steer_capture: missing 'user'".to_string(),
-        );
+        daemon_state
+            .out
+            .error("steer_capture: missing 'user'".to_string());
         return;
     };
     let Some(m) = daemon_state.model.as_mut() else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "steer_capture: no model loaded".to_string(),
-        );
+        daemon_state
+            .out
+            .error("steer_capture: no model loaded".to_string());
         return;
     };
     if m.pp != 1 {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "steer_capture: requires a single-GPU resident model (pp == 1)".to_string(),
-        );
+        daemon_state
+            .out
+            .error("steer_capture: requires a single-GPU resident model (pp == 1)".to_string());
         return;
     }
     let Some(tokenizer) = m.tokenizer.as_ref() else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "steer_capture: resident model has no tokenizer".to_string(),
-        );
+        daemon_state
+            .out
+            .error("steer_capture: resident model has no tokenizer".to_string());
         return;
     };
     // Frame the turn byte-identically to the `generate` path so capture
@@ -81,7 +72,7 @@ pub(crate) fn capture(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
         match hipfire_serving_core::generate_arch::framed_qwen35_prompt(m, &user, system_opt) {
             Ok(f) => f,
             Err(e) => {
-                emit_error_with_id(&mut daemon_state.stdout, "", format!("steer_capture: {e}"));
+                daemon_state.out.error(format!("steer_capture: {e}"));
                 return;
             }
         }
@@ -90,11 +81,9 @@ pub(crate) fn capture(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     };
     let tokens = tokenizer.encode(&framed);
     if tokens.is_empty() {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "steer_capture: empty prompt after framing".to_string(),
-        );
+        daemon_state
+            .out
+            .error("steer_capture: empty prompt after framing".to_string());
         return;
     }
     // Prefill-only through whichever resident arch fires the
@@ -120,10 +109,11 @@ pub(crate) fn capture(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     match result {
         Ok(()) => {
             hipfire_steer::commit_capture();
-            let _ = writeln!(daemon_state.stdout, r#"{{"type":"steer_ok"}}"#);
-            let _ = daemon_state.stdout.flush();
+            daemon_state
+                .out
+                .emit(serde_json::json!({ "type": "steer_ok" }));
         }
-        Err(e) => emit_error_with_id(&mut daemon_state.stdout, "", format!("steer_capture: {e}")),
+        Err(e) => daemon_state.out.error(format!("steer_capture: {e}")),
     }
 }
 
@@ -145,22 +135,18 @@ pub(crate) fn begin_apply(daemon_state: &mut DaemonState, msg: &serde_json::Valu
                     .collect()
             });
     let Some(directions) = directions else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "steer_begin_apply: missing 'directions'".to_string(),
-        );
+        daemon_state
+            .out
+            .error("steer_begin_apply: missing 'directions'".to_string());
         return;
     };
     let mode = match msg.get("mode").and_then(|v| v.as_str()).unwrap_or("ablate") {
         "steer" => hipfire_steer::SteerMode::Steer,
         "ablate" => hipfire_steer::SteerMode::Ablate,
         other => {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                format!("steer_begin_apply: unknown mode {other:?} (steer|ablate)"),
-            );
+            daemon_state.out.error(format!(
+                "steer_begin_apply: unknown mode {other:?} (steer|ablate)"
+            ));
             return;
         }
     };
@@ -177,14 +163,16 @@ pub(crate) fn begin_apply(daemon_state: &mut DaemonState, msg: &serde_json::Valu
         strength,
         layer_range: layer_start..layer_end,
     });
-    let _ = writeln!(daemon_state.stdout, r#"{{"type":"steer_ok"}}"#);
-    let _ = daemon_state.stdout.flush();
+    daemon_state
+        .out
+        .emit(serde_json::json!({ "type": "steer_ok" }));
 }
 
 pub(crate) fn clear(daemon_state: &mut DaemonState) {
     hipfire_steer::clear();
-    let _ = writeln!(daemon_state.stdout, r#"{{"type":"steer_ok"}}"#);
-    let _ = daemon_state.stdout.flush();
+    daemon_state
+        .out
+        .emit(serde_json::json!({ "type": "steer_ok" }));
 }
 
 pub(crate) fn finish_capture(daemon_state: &mut DaemonState) {
@@ -194,13 +182,10 @@ pub(crate) fn finish_capture(daemon_state: &mut DaemonState) {
                 "type": "steer_captured",
                 "means": means.0,
             });
-            let _ = writeln!(daemon_state.stdout, "{resp}");
-            let _ = daemon_state.stdout.flush();
+            daemon_state.out.emit(resp);
         }
-        None => emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "steer_finish_capture: no capture session active".to_string(),
-        ),
+        None => daemon_state
+            .out
+            .error("steer_finish_capture: no capture session active".to_string()),
     }
 }

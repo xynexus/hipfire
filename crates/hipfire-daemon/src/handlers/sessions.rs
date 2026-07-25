@@ -24,7 +24,7 @@ pub(crate) fn release_sessions(daemon_state: &mut DaemonState, msg: &serde_json:
             Ok(true) => {}
             Ok(false) => {
                 emit_error_with_id(
-                    &mut daemon_state.stdout,
+                    &mut daemon_state.out.stdout,
                     id,
                     format!("unknown model worker {target_worker_id}"),
                 );
@@ -32,7 +32,7 @@ pub(crate) fn release_sessions(daemon_state: &mut DaemonState, msg: &serde_json:
             }
             Err(e) => {
                 emit_error_with_id(
-                    &mut daemon_state.stdout,
+                    &mut daemon_state.out.stdout,
                     id,
                     format!("worker switch failed: {e}"),
                 );
@@ -43,7 +43,7 @@ pub(crate) fn release_sessions(daemon_state: &mut DaemonState, msg: &serde_json:
     let request = match parse_release_sessions_request(&msg, &target_worker_id) {
         Ok(request) => request,
         Err(e) => {
-            emit_error_with_id(&mut daemon_state.stdout, id, e);
+            emit_error_with_id(&mut daemon_state.out.stdout, id, e);
             return;
         }
     };
@@ -56,14 +56,13 @@ pub(crate) fn release_sessions(daemon_state: &mut DaemonState, msg: &serde_json:
             dummy.session_count(),
             None,
         );
-        let _ = writeln!(daemon_state.stdout, "{done}");
-        let _ = daemon_state.stdout.flush();
+        daemon_state.out.emit(done);
         return;
     }
     let m = match daemon_state.model.as_mut() {
         Some(m) => m,
         None => {
-            emit_error_with_id(&mut daemon_state.stdout, id, "no model loaded");
+            emit_error_with_id(&mut daemon_state.out.stdout, id, "no model loaded");
             return;
         }
     };
@@ -83,10 +82,9 @@ pub(crate) fn release_sessions(daemon_state: &mut DaemonState, msg: &serde_json:
                 sequence_state_arena_resident_session_count(arena_backend, m),
                 Some(&worker),
             );
-            let _ = writeln!(daemon_state.stdout, "{done}");
-            let _ = daemon_state.stdout.flush();
+            daemon_state.out.emit(done);
         }
-        Err(e) => emit_error_with_id(&mut daemon_state.stdout, id, e),
+        Err(e) => emit_error_with_id(&mut daemon_state.out.stdout, id, e),
     }
 }
 
@@ -105,7 +103,7 @@ pub(crate) fn reserve_session_state(daemon_state: &mut DaemonState, msg: &serde_
             Ok(true) => {}
             Ok(false) => {
                 emit_error_with_id(
-                    &mut daemon_state.stdout,
+                    &mut daemon_state.out.stdout,
                     id,
                     format!("unknown model worker {target_worker_id}"),
                 );
@@ -113,7 +111,7 @@ pub(crate) fn reserve_session_state(daemon_state: &mut DaemonState, msg: &serde_
             }
             Err(e) => {
                 emit_error_with_id(
-                    &mut daemon_state.stdout,
+                    &mut daemon_state.out.stdout,
                     id,
                     format!("worker switch failed: {e}"),
                 );
@@ -124,7 +122,7 @@ pub(crate) fn reserve_session_state(daemon_state: &mut DaemonState, msg: &serde_
     let request = match parse_reserve_session_state_request(&msg, &target_worker_id) {
         Ok(request) => request,
         Err(e) => {
-            emit_error_with_id(&mut daemon_state.stdout, id, e);
+            emit_error_with_id(&mut daemon_state.out.stdout, id, e);
             return;
         }
     };
@@ -158,7 +156,7 @@ pub(crate) fn reserve_session_state(daemon_state: &mut DaemonState, msg: &serde_
             .unwrap_or_else(resident_state_reservation_budget_bytes);
         sequence_state_reservation_plan_for_reserved_bytes(1024, 0, 0, budget)
     } else {
-        emit_error_with_id(&mut daemon_state.stdout, id, "no model loaded");
+        emit_error_with_id(&mut daemon_state.out.stdout, id, "no model loaded");
         return;
     };
     if reservation_plan.rejected_for_memory_pressure {
@@ -171,8 +169,7 @@ pub(crate) fn reserve_session_state(daemon_state: &mut DaemonState, msg: &serde_
             reservation_plan.projected_reserved_bytes,
             reservation_plan.budget_bytes,
         );
-        let _ = writeln!(daemon_state.stdout, "{rejected}");
-        let _ = daemon_state.stdout.flush();
+        daemon_state.out.emit(rejected);
         return;
     }
     let reservation = daemon_state.generic_state_arena.reserve(
@@ -191,8 +188,7 @@ pub(crate) fn reserve_session_state(daemon_state: &mut DaemonState, msg: &serde_
         reservation_plan.projected_reserved_bytes,
         reservation_plan.budget_bytes,
     );
-    let _ = writeln!(daemon_state.stdout, "{done}");
-    let _ = daemon_state.stdout.flush();
+    daemon_state.out.emit(done);
 }
 
 pub(crate) fn describe_state(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
@@ -204,7 +200,7 @@ pub(crate) fn describe_state(daemon_state: &mut DaemonState, msg: &serde_json::V
     let request = match parse_describe_sequence_state_request(&msg) {
         Ok(request) => request,
         Err(e) => {
-            emit_error_with_id(&mut daemon_state.stdout, id, e);
+            emit_error_with_id(&mut daemon_state.out.stdout, id, e);
             return;
         }
     };
@@ -214,8 +210,7 @@ pub(crate) fn describe_state(daemon_state: &mut DaemonState, msg: &serde_json::V
             .describe(&request.handle.id, request.handle.generation)
         {
             let done = session_state_reservation_describe_json(id, reservation);
-            let _ = writeln!(daemon_state.stdout, "{done}");
-            let _ = daemon_state.stdout.flush();
+            daemon_state.out.emit(done);
             return;
         }
     }
@@ -226,7 +221,7 @@ pub(crate) fn describe_state(daemon_state: &mut DaemonState, msg: &serde_json::V
         &request.handle,
     ) else {
         emit_error_with_id(
-            &mut daemon_state.stdout,
+            &mut daemon_state.out.stdout,
             id,
             format!(
                 "describe_state unknown runtime_state_handle {}",
@@ -236,8 +231,7 @@ pub(crate) fn describe_state(daemon_state: &mut DaemonState, msg: &serde_json::V
         return;
     };
     let done = described_sequence_state_json(id, &described);
-    let _ = writeln!(daemon_state.stdout, "{done}");
-    let _ = daemon_state.stdout.flush();
+    daemon_state.out.emit(done);
 }
 
 pub(crate) fn release_state(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
@@ -262,7 +256,7 @@ pub(crate) fn release_state(daemon_state: &mut DaemonState, msg: &serde_json::Va
     ) {
         Ok(released) => released,
         Err(e) => {
-            emit_error_with_id(&mut daemon_state.stdout, id, e);
+            emit_error_with_id(&mut daemon_state.out.stdout, id, e);
             return;
         }
     };
@@ -274,6 +268,5 @@ pub(crate) fn release_state(daemon_state: &mut DaemonState, msg: &serde_json::Va
         loaded_released,
         loaded_released_bytes,
     );
-    let _ = writeln!(daemon_state.stdout, "{done}");
-    let _ = daemon_state.stdout.flush();
+    daemon_state.out.emit(done);
 }

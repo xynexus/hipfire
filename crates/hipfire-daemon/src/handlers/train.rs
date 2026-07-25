@@ -17,19 +17,15 @@ use crate::*;
 
 pub(crate) fn pflash_labels(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     let Some(corpus) = msg.get("corpus").and_then(|v| v.as_str()).map(String::from) else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "pflash_labels: missing 'corpus'".to_string(),
-        );
+        daemon_state
+            .out
+            .error("pflash_labels: missing 'corpus'".to_string());
         return;
     };
     let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from) else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "pflash_labels: missing 'output'".to_string(),
-        );
+        daemon_state
+            .out
+            .error("pflash_labels: missing 'output'".to_string());
         return;
     };
     let seq = msg
@@ -48,11 +44,9 @@ pub(crate) fn pflash_labels(daemon_state: &mut DaemonState, msg: &serde_json::Va
         .map(|v| v as usize)
         .unwrap_or(40);
     let Some(m) = daemon_state.model.as_ref() else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "pflash_labels: no model loaded".to_string(),
-        );
+        daemon_state
+            .out
+            .error("pflash_labels: no model loaded".to_string());
         return;
     };
     let (Some(weights), Some(config), Some(tokenizer)) = (
@@ -60,20 +54,16 @@ pub(crate) fn pflash_labels(daemon_state: &mut DaemonState, msg: &serde_json::Va
         m.q35_config.as_ref(),
         m.tokenizer.as_ref(),
     ) else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "pflash_labels: resident model is not a qwen3.5-family model".to_string(),
-        );
+        daemon_state
+            .out
+            .error("pflash_labels: resident model is not a qwen3.5-family model".to_string());
         return;
     };
     let fa = qwen35::full_attention_layers(config);
     if fa.is_empty() {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "pflash_labels: no FullAttention layers".to_string(),
-        );
+        daemon_state
+            .out
+            .error("pflash_labels: no FullAttention layers".to_string());
         return;
     }
     let shallow = fa[0];
@@ -81,35 +71,27 @@ pub(crate) fn pflash_labels(daemon_state: &mut DaemonState, msg: &serde_json::Va
     let text = match std::fs::read_to_string(&corpus) {
         Ok(t) => t,
         Err(e) => {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                format!("pflash_labels: read {corpus}: {e}"),
-            );
+            daemon_state
+                .out
+                .error(format!("pflash_labels: read {corpus}: {e}"));
             return;
         }
     };
     let all = tokenizer.encode(&text);
     if all.len() < n_chunks * seq {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            format!(
-                "pflash_labels: corpus too small: {} toks < {}",
-                all.len(),
-                n_chunks * seq
-            ),
-        );
+        daemon_state.out.error(format!(
+            "pflash_labels: corpus too small: {} toks < {}",
+            all.len(),
+            n_chunks * seq
+        ));
         return;
     }
     let mut out_file = match std::fs::File::create(&output) {
         Ok(f) => std::io::BufWriter::new(f),
         Err(e) => {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                format!("pflash_labels: create {output}: {e}"),
-            );
+            daemon_state
+                .out
+                .error(format!("pflash_labels: create {output}: {e}"));
             return;
         }
     };
@@ -137,11 +119,9 @@ pub(crate) fn pflash_labels(daemon_state: &mut DaemonState, msg: &serde_json::Va
                 }
             }
             Err(e) => {
-                emit_error_with_id(
-                    &mut daemon_state.stdout,
-                    "",
-                    format!("pflash_labels: chunk {ci}: {e}"),
-                );
+                daemon_state
+                    .out
+                    .error(format!("pflash_labels: chunk {ci}: {e}"));
                 failed = true;
                 break;
             }
@@ -162,11 +142,7 @@ pub(crate) fn pflash_labels(daemon_state: &mut DaemonState, msg: &serde_json::Va
     ) {
         Ok(d) => Some(d),
         Err(e) => {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                format!("pflash_labels: embed: {e}"),
-            );
+            daemon_state.out.error(format!("pflash_labels: embed: {e}"));
             None
         }
     };
@@ -182,8 +158,7 @@ pub(crate) fn pflash_labels(daemon_state: &mut DaemonState, msg: &serde_json::Va
         "shallow_layer": shallow,
         "mid_layer": mid,
     });
-    let _ = writeln!(daemon_state.stdout, "{resp}");
-    let _ = daemon_state.stdout.flush();
+    daemon_state.out.emit(resp);
 }
 
 pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
@@ -229,11 +204,9 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
             .unwrap_or("ssm")
             .to_string();
         if arch != "ssm" {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                format!("train_drafter: arch '{arch}' not implemented (only ssm; step 3)"),
-            );
+            daemon_state.out.error(format!(
+                "train_drafter: arch '{arch}' not implemented (only ssm; step 3)"
+            ));
             return;
         }
         // Parse the train/labels blocks into the SHARED TrainCfg.
@@ -272,10 +245,7 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
             .and_then(|v| v.as_str())
             .unwrap_or("file");
         if source != "file" {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                format!("train_drafter: label source '{source}' not implemented (only file; capture is step 4)"),
+            daemon_state.out.error(format!("train_drafter: label source '{source}' not implemented (only file; capture is step 4)"),
             );
             return;
         }
@@ -284,19 +254,15 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
             .and_then(|v| v.as_str())
             .map(String::from)
         else {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                "train_drafter: labels.path required for source=file".to_string(),
-            );
+            daemon_state
+                .out
+                .error("train_drafter: labels.path required for source=file".to_string());
             return;
         };
         let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from) else {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                "train_drafter: 'output' (checkpoint path) required".to_string(),
-            );
+            daemon_state
+                .out
+                .error("train_drafter: 'output' (checkpoint path) required".to_string());
             return;
         };
 
@@ -308,11 +274,9 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
         ) {
             Ok(ls) => ls,
             Err(e) => {
-                emit_error_with_id(
-                    &mut daemon_state.stdout,
-                    "",
-                    format!("train_drafter: load labels {path}: {e}"),
-                );
+                daemon_state
+                    .out
+                    .error(format!("train_drafter: load labels {path}: {e}"));
                 return;
             }
         };
@@ -346,11 +310,9 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
         ) {
             Ok(d) => d,
             Err(e) => {
-                emit_error_with_id(
-                    &mut daemon_state.stdout,
-                    "",
-                    format!("train_drafter: build drafter: {e}"),
-                );
+                daemon_state
+                    .out
+                    .error(format!("train_drafter: build drafter: {e}"));
                 return;
             }
         };
@@ -365,17 +327,15 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
         ) {
             Ok(s) => s,
             Err(e) => {
-                emit_error_with_id(
-                    &mut daemon_state.stdout,
-                    "",
-                    format!("train_drafter: loop init: {e}"),
-                );
+                daemon_state
+                    .out
+                    .error(format!("train_drafter: loop init: {e}"));
                 return;
             }
         };
         let nparams: usize = drafter.param_sizes().iter().sum();
         let _ = writeln!(
-            daemon_state.stdout,
+            daemon_state.out.stdout,
             "{}",
             serde_json::json!({
                 "type": "train_start", "arch": arch, "params": nparams,
@@ -384,7 +344,7 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
                 "run_id": run_id, "quantum": quantum,
             })
         );
-        let _ = daemon_state.stdout.flush();
+        let _ = daemon_state.out.stdout.flush();
         daemon_state.drafter_train_session = Some(DrafterTrainSession {
             run_id: run_id.clone(),
             drafter,
@@ -420,19 +380,16 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
                 if let Some(tc) = train_corr {
                     ev["train_rho"] = serde_json::json!(tc);
                 }
-                let _ = writeln!(daemon_state.stdout, "{ev}");
-                let _ = daemon_state.stdout.flush();
+                daemon_state.out.emit(ev);
             },
         )
         .map_err(|e| e.to_string())
     };
     if let Err(e) = quantum_result {
         daemon_state.drafter_train_session = None;
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            format!("train_drafter: train loop: {e}"),
-        );
+        daemon_state
+            .out
+            .error(format!("train_drafter: train loop: {e}"));
         return;
     }
 
@@ -457,7 +414,7 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
             report.best_epoch as u32,
         );
         let _ = writeln!(
-            daemon_state.stdout,
+            daemon_state.out.stdout,
             "{}",
             serde_json::json!({
                 "type": "train_done",
@@ -469,7 +426,7 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
                 "run_id": run_id,
             })
         );
-        let _ = daemon_state.stdout.flush();
+        let _ = daemon_state.out.stdout.flush();
     } else {
         // Quantum done but run unfinished: report progress and keep the
         // session resident. The runner re-enqueues; training yields to
@@ -479,7 +436,7 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
             .as_ref()
             .expect("unfinished implies present");
         let _ = writeln!(
-            daemon_state.stdout,
+            daemon_state.out.stdout,
             "{}",
             serde_json::json!({
                 "type": "train_progress", "run_id": sess.run_id,
@@ -488,7 +445,7 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
                 "done": false,
             })
         );
-        let _ = daemon_state.stdout.flush();
+        let _ = daemon_state.out.stdout.flush();
     }
 }
 
@@ -532,11 +489,9 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
     if !continue_run {
         daemon_state.lora_train_session = None; // drop any stale session, free VRAM
         let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from) else {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                "train_lora: 'output' (adapter checkpoint path) required".to_string(),
-            );
+            daemon_state
+                .out
+                .error("train_lora: 'output' (adapter checkpoint path) required".to_string());
             return;
         };
         let Some(base_dir) = msg
@@ -545,11 +500,9 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
             .and_then(|v| v.as_str())
             .map(String::from)
         else {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                "train_lora: 'model' (fp32 base model dir) required".to_string(),
-            );
+            daemon_state
+                .out
+                .error("train_lora: 'model' (fp32 base model dir) required".to_string());
             return;
         };
         let getu = |k: &str, d: usize| -> usize {
@@ -577,15 +530,12 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
             .and_then(|v| v.as_str())
             .unwrap_or("overfit");
         if data_mode != "overfit" {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                format!("train_lora: data source '{data_mode}' not implemented (only 'overfit' synthetic batch is wired; real-corpus loading is a follow-on)"),
+            daemon_state.out.error(format!("train_lora: data source '{data_mode}' not implemented (only 'overfit' synthetic batch is wired; real-corpus loading is a follow-on)"),
             );
             return;
         }
         let _ = writeln!(
-            daemon_state.stdout,
+            daemon_state.out.stdout,
             "{}",
             serde_json::json!({
                 "type": "train_start", "op": "train_lora", "base": base_dir,
@@ -593,7 +543,7 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
                 "run_id": run_id, "quantum": quantum,
             })
         );
-        let _ = daemon_state.stdout.flush();
+        let _ = daemon_state.out.stdout.flush();
         let built: Result<LoraTrainSession, String> = (|| {
             let dir = std::path::Path::new(&base_dir);
             if !dir.exists() {
@@ -654,7 +604,7 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
         match built {
             Ok(sess) => daemon_state.lora_train_session = Some(sess),
             Err(e) => {
-                emit_error_with_id(&mut daemon_state.stdout, "", format!("train_lora: {e}"));
+                daemon_state.out.error(format!("train_lora: {e}"));
                 return;
             }
         }
@@ -756,7 +706,7 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
     };
     if let Err(e) = quantum_result {
         daemon_state.lora_train_session = None;
-        emit_error_with_id(&mut daemon_state.stdout, "", format!("train_lora: {e}"));
+        daemon_state.out.error(format!("train_lora: {e}"));
         return;
     }
 
@@ -801,7 +751,7 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
         match dump {
             Ok(n_trainable) => {
                 let _ = writeln!(
-                    daemon_state.stdout,
+                    daemon_state.out.stdout,
                     "{}",
                     serde_json::json!({
                         "type": "train_done", "op": "train_lora",
@@ -813,9 +763,9 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
                         "note": "trained hipfire-train LlamaModel LoRA (overfit synthetic batch); served-qwen35 adapters + real-corpus loading are follow-ons",
                     })
                 );
-                let _ = daemon_state.stdout.flush();
+                let _ = daemon_state.out.stdout.flush();
             }
-            Err(e) => emit_error_with_id(&mut daemon_state.stdout, "", format!("train_lora: {e}")),
+            Err(e) => daemon_state.out.error(format!("train_lora: {e}")),
         }
     } else {
         // Quantum done but run unfinished: report progress and keep the
@@ -826,7 +776,7 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
             .as_ref()
             .expect("unfinished implies present");
         let _ = writeln!(
-            daemon_state.stdout,
+            daemon_state.out.stdout,
             "{}",
             serde_json::json!({
                 "type": "train_progress", "run_id": sess.run_id,
@@ -834,6 +784,6 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
                 "per_tok_ce": sess.last_ce, "done": false,
             })
         );
-        let _ = daemon_state.stdout.flush();
+        let _ = daemon_state.out.stdout.flush();
     }
 }

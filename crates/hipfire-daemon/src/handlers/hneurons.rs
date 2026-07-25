@@ -36,20 +36,16 @@ pub(crate) fn intervene(daemon_state: &mut DaemonState, msg: &serde_json::Value)
             }
         }
         None => {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                "hneuron_intervene: no model loaded".to_string(),
-            );
+            daemon_state
+                .out
+                .error("hneuron_intervene: no model loaded".to_string());
             return;
         }
     };
     let Some((n_layers, inter)) = dims else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "hneuron_intervene: no resident dense backend (llama|gemma3)".to_string(),
-        );
+        daemon_state
+            .out
+            .error("hneuron_intervene: no resident dense backend (llama|gemma3)".to_string());
         return;
     };
     let n_intervened = indices.len();
@@ -72,57 +68,40 @@ pub(crate) fn intervene(daemon_state: &mut DaemonState, msg: &serde_json::Value)
                 "n_intervened": n_intervened,
                 "gain": gain,
             });
-            let _ = writeln!(daemon_state.stdout, "{resp}");
-            let _ = daemon_state.stdout.flush();
+            daemon_state.out.emit(resp);
         }
-        Err(e) => emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            format!("hneuron_intervene: {e:?}"),
-        ),
+        Err(e) => daemon_state.out.error(format!("hneuron_intervene: {e:?}")),
     }
 }
 
 pub(crate) fn cett_load_colnorms(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     let Some(path) = msg.get("path").and_then(|v| v.as_str()).map(String::from) else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "cett_load_colnorms: missing 'path'".to_string(),
-        );
+        daemon_state
+            .out
+            .error("cett_load_colnorms: missing 'path'".to_string());
         return;
     };
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) => {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                format!("cett_load_colnorms: {e}"),
-            );
+            daemon_state.out.error(format!("cett_load_colnorms: {e}"));
             return;
         }
     };
     if bytes.len() < 8 {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "cett_load_colnorms: file too short".to_string(),
-        );
+        daemon_state
+            .out
+            .error("cett_load_colnorms: file too short".to_string());
         return;
     }
     let n_layers = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
     let inter = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
     let want = 8 + n_layers * inter * 4;
     if bytes.len() != want {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            format!(
-                "cett_load_colnorms: size mismatch (got {} want {want})",
-                bytes.len()
-            ),
-        );
+        daemon_state.out.error(format!(
+            "cett_load_colnorms: size mismatch (got {} want {want})",
+            bytes.len()
+        ));
         return;
     }
     let mut cn = Vec::with_capacity(n_layers);
@@ -146,8 +125,7 @@ pub(crate) fn cett_load_colnorms(daemon_state: &mut DaemonState, msg: &serde_jso
         "n_layers": n_layers,
         "intermediate": inter,
     });
-    let _ = writeln!(daemon_state.stdout, "{resp}");
-    let _ = daemon_state.stdout.flush();
+    daemon_state.out.emit(resp);
 }
 
 pub(crate) fn cett_capture(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
@@ -157,11 +135,9 @@ pub(crate) fn cett_capture(daemon_state: &mut DaemonState, msg: &serde_json::Val
         .unwrap_or("")
         .to_string();
     let Some(user) = msg.get("user").and_then(|v| v.as_str()).map(String::from) else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "cett_capture: missing 'user'".to_string(),
-        );
+        daemon_state
+            .out
+            .error("cett_capture: missing 'user'".to_string());
         return;
     };
     let response = msg
@@ -170,19 +146,15 @@ pub(crate) fn cett_capture(daemon_state: &mut DaemonState, msg: &serde_json::Val
         .unwrap_or("")
         .to_string();
     let Some(colnorms) = daemon_state.cett_colnorms.clone() else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "cett_capture: no colnorms (call cett_load_colnorms first)".to_string(),
-        );
+        daemon_state
+            .out
+            .error("cett_capture: no colnorms (call cett_load_colnorms first)".to_string());
         return;
     };
     let Some(m) = daemon_state.model.as_mut() else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "cett_capture: no model loaded".to_string(),
-        );
+        daemon_state
+            .out
+            .error("cett_capture: no model loaded".to_string());
         return;
     };
     let arch_id = m.arch_id;
@@ -192,19 +164,15 @@ pub(crate) fn cett_capture(daemon_state: &mut DaemonState, msg: &serde_json::Val
     // borrow below (mirrors the steer_capture ordering).
     let framed = {
         let Some(tokenizer) = m.tokenizer.as_ref() else {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                "cett_capture: resident model has no tokenizer".to_string(),
-            );
+            daemon_state
+                .out
+                .error("cett_capture: resident model has no tokenizer".to_string());
             return;
         };
         let Some(tmpl) = m.chat_template.as_ref() else {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                "cett_capture: model has no chat_template".to_string(),
-            );
+            daemon_state
+                .out
+                .error("cett_capture: model has no chat_template".to_string());
             return;
         };
         let frame = prompt_frame::JinjaChatFrame {
@@ -218,11 +186,9 @@ pub(crate) fn cett_capture(daemon_state: &mut DaemonState, msg: &serde_json::Val
         match frame.render() {
             Ok(t) => t,
             Err(e) => {
-                emit_error_with_id(
-                    &mut daemon_state.stdout,
-                    "",
-                    format!("cett_capture: jinja render: {e}"),
-                );
+                daemon_state
+                    .out
+                    .error(format!("cett_capture: jinja render: {e}"));
                 return;
             }
         }
@@ -237,11 +203,9 @@ pub(crate) fn cett_capture(daemon_state: &mut DaemonState, msg: &serde_json::Val
         (full, rs)
     };
     if full.len() <= response_start {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "cett_capture: empty response after tokenization".to_string(),
-        );
+        daemon_state
+            .out
+            .error("cett_capture: empty response after tokenization".to_string());
         return;
     }
     // Optional answer-token span (paper's answer-token CETT). The probe
@@ -361,9 +325,8 @@ pub(crate) fn cett_capture(daemon_state: &mut DaemonState, msg: &serde_json::Val
                 "feature": feature,
                 "count": count,
             });
-            let _ = writeln!(daemon_state.stdout, "{resp}");
-            let _ = daemon_state.stdout.flush();
+            daemon_state.out.emit(resp);
         }
-        Err(e) => emit_error_with_id(&mut daemon_state.stdout, "", format!("cett_capture: {e}")),
+        Err(e) => daemon_state.out.error(format!("cett_capture: {e}")),
     }
 }

@@ -17,19 +17,15 @@ pub(crate) fn collect(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     // server side; the typed CollectRequest contract lives in
     // hipfire-daemon-protocol for clients). Field names must match.
     let Some(corpus) = msg.get("corpus").and_then(|v| v.as_str()).map(String::from) else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "collect: missing 'corpus'".to_string(),
-        );
+        daemon_state
+            .out
+            .error("collect: missing 'corpus'".to_string());
         return;
     };
     let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from) else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "collect: missing 'output'".to_string(),
-        );
+        daemon_state
+            .out
+            .error("collect: missing 'output'".to_string());
         return;
     };
     let max_tokens = msg
@@ -39,19 +35,15 @@ pub(crate) fn collect(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
         .unwrap_or(512);
     let kldref = msg.get("kldref").and_then(|v| v.as_bool()).unwrap_or(false);
     let Some(m) = daemon_state.model.as_ref() else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "collect: no model loaded".to_string(),
-        );
+        daemon_state
+            .out
+            .error("collect: no model loaded".to_string());
         return;
     };
     if m.pp != 1 {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "collect: requires a single-GPU resident model (pp == 1)".to_string(),
-        );
+        daemon_state
+            .out
+            .error("collect: requires a single-GPU resident model (pp == 1)".to_string());
         return;
     }
     // Only the tokenizer is needed up front (to encode the corpus);
@@ -59,21 +51,17 @@ pub(crate) fn collect(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     // with a collector reaches it through the one CalibratableBackend
     // seam — no qwen3.5-only gate.
     let Some(tokenizer) = m.tokenizer.as_ref() else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "collect: resident model has no tokenizer".to_string(),
-        );
+        daemon_state
+            .out
+            .error("collect: resident model has no tokenizer".to_string());
         return;
     };
     let text = match std::fs::read_to_string(&corpus) {
         Ok(t) => t,
         Err(e) => {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                format!("collect: read corpus {corpus}: {e}"),
-            );
+            daemon_state
+                .out
+                .error(format!("collect: read corpus {corpus}: {e}"));
             return;
         }
     };
@@ -162,10 +150,9 @@ pub(crate) fn collect(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                 "n_calib_tokens": n_tok,
                 "max_consistency": summary.max_consistency,
             });
-            let _ = writeln!(daemon_state.stdout, "{resp}");
-            let _ = daemon_state.stdout.flush();
+            daemon_state.out.emit(resp);
         }
-        Err(e) => emit_error_with_id(&mut daemon_state.stdout, "", format!("collect: {e}")),
+        Err(e) => daemon_state.out.error(format!("collect: {e}")),
     }
 }
 
@@ -193,19 +180,15 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
         .unwrap_or(256);
     let output = msg.get("output").and_then(|v| v.as_str()).map(String::from);
     let Some(m) = daemon_state.model.as_mut() else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "kld_eval: no model loaded".to_string(),
-        );
+        daemon_state
+            .out
+            .error("kld_eval: no model loaded".to_string());
         return;
     };
     if m.pp != 1 {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "kld_eval: requires a single-GPU resident model (pp == 1)".to_string(),
-        );
+        daemon_state
+            .out
+            .error("kld_eval: requires a single-GPU resident model (pp == 1)".to_string());
         return;
     }
     let arch_id = m.arch_id;
@@ -220,30 +203,24 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
     // reads its tokens from the reference archive, so it needs none.
     let tokens: Vec<u32> = if mode == "self_score" || mode == "build_ref" {
         let Some(corpus_path) = corpus.clone() else {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                format!("kld_eval: mode={mode} requires 'corpus'"),
-            );
+            daemon_state
+                .out
+                .error(format!("kld_eval: mode={mode} requires 'corpus'"));
             return;
         };
         let text = match std::fs::read_to_string(&corpus_path) {
             Ok(t) => t,
             Err(e) => {
-                emit_error_with_id(
-                    &mut daemon_state.stdout,
-                    "",
-                    format!("kld_eval: read {corpus_path}: {e}"),
-                );
+                daemon_state
+                    .out
+                    .error(format!("kld_eval: read {corpus_path}: {e}"));
                 return;
             }
         };
         let Some(tk) = m.tokenizer.as_ref() else {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                "kld_eval: resident model has no tokenizer".to_string(),
-            );
+            daemon_state
+                .out
+                .error("kld_eval: resident model has no tokenizer".to_string());
             return;
         };
         // Only the first `n_ctx × max_chunks` tokens are ever scored, so
@@ -353,11 +330,9 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
     let mut fwd = match fwd_opt {
         Some(f) => f,
         None => {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                format!("kld_eval: arch_id {arch_id} has no KLD-scorable backend"),
-            );
+            daemon_state.out.error(format!(
+                "kld_eval: arch_id {arch_id} has no KLD-scorable backend"
+            ));
             return;
         }
     };
@@ -367,11 +342,11 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
         () => {
             |c, n, s, k| {
                 let _ = writeln!(
-                    daemon_state.stdout,
+                    daemon_state.out.stdout,
                     "{}",
                     serde_json::json!({"type":"kld_chunk","chunk":c,"n_chunk":n,"scored":s,"mean_kld":k})
                 );
-                let _ = daemon_state.stdout.flush();
+                let _ = daemon_state.out.stdout.flush();
             }
         };
     }
@@ -384,8 +359,7 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
                 "mean_nll": $out.mean_nll, "ppl": ($out.mean_nll as f64).exp(),
                 "seq_output": $seq, "compat_findings": $findings,
             });
-            let _ = writeln!(daemon_state.stdout, "{resp}");
-            let _ = daemon_state.stdout.flush();
+            daemon_state.out.emit(resp);
         }};
     }
 
@@ -409,26 +383,20 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
                                 &out.per_chunk,
                             ) {
                                 Ok(()) => seq = serde_json::json!(p),
-                                Err(e) => emit_error_with_id(
-                                    &mut daemon_state.stdout,
-                                    "",
-                                    format!("kld_eval: write {p}: {e}"),
-                                ),
+                                Err(e) => {
+                                    daemon_state.out.error(format!("kld_eval: write {p}: {e}"))
+                                }
                             }
                         }
                         emit_kld_evaled!("self_score", out, seq, serde_json::json!([]));
                     }
-                    Err(e) => {
-                        emit_error_with_id(&mut daemon_state.stdout, "", format!("kld_eval: {e}"))
-                    }
+                    Err(e) => daemon_state.out.error(format!("kld_eval: {e}")),
                 }
             } else {
                 let Some(ref_out) = ref_path.clone() else {
-                    emit_error_with_id(
-                        &mut daemon_state.stdout,
-                        "",
-                        "kld_eval: build_ref requires 'ref_path'".to_string(),
-                    );
+                    daemon_state
+                        .out
+                        .error("kld_eval: build_ref requires 'ref_path'".to_string());
                     return;
                 };
                 match hipfire_runtime::kld_eval::kld_build_ref(
@@ -440,11 +408,11 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
                     max_chunks,
                     |c, n, s| {
                         let _ = writeln!(
-                            daemon_state.stdout,
+                            daemon_state.out.stdout,
                             "{}",
                             serde_json::json!({"type":"kld_chunk","chunk":c,"n_chunk":n,"scored":s,"mean_kld":0.0})
                         );
-                        let _ = daemon_state.stdout.flush();
+                        let _ = daemon_state.out.stdout.flush();
                     },
                 ) {
                     Ok(p) => {
@@ -485,11 +453,9 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
                         let mut ref_output = serde_json::Value::Null;
                         match archive.write_file(std::path::Path::new(&ref_out)) {
                             Ok(()) => ref_output = serde_json::json!(ref_out),
-                            Err(e) => emit_error_with_id(
-                                &mut daemon_state.stdout,
-                                "",
-                                format!("kld_eval: write ref {ref_out}: {e}"),
-                            ),
+                            Err(e) => daemon_state
+                                .out
+                                .error(format!("kld_eval: write ref {ref_out}: {e}")),
                         }
                         let resp = serde_json::json!({
                             "type": "kld_evaled", "mode": "build_ref",
@@ -497,32 +463,25 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
                             "total_scored": p.n_chunk * p.scored_per_chunk,
                             "ref_output": ref_output, "compat_findings": [],
                         });
-                        let _ = writeln!(daemon_state.stdout, "{resp}");
-                        let _ = daemon_state.stdout.flush();
+                        daemon_state.out.emit(resp);
                     }
-                    Err(e) => {
-                        emit_error_with_id(&mut daemon_state.stdout, "", format!("kld_eval: {e}"))
-                    }
+                    Err(e) => daemon_state.out.error(format!("kld_eval: {e}")),
                 }
             }
         }
         "score" => {
             let Some(ref_in) = ref_path.clone() else {
-                emit_error_with_id(
-                    &mut daemon_state.stdout,
-                    "",
-                    "kld_eval: score requires 'ref_path'".to_string(),
-                );
+                daemon_state
+                    .out
+                    .error("kld_eval: score requires 'ref_path'".to_string());
                 return;
             };
             let archive = match read_kld_ref_archive(std::path::Path::new(&ref_in)) {
                 Ok(a) => a,
                 Err(e) => {
-                    emit_error_with_id(
-                        &mut daemon_state.stdout,
-                        "",
-                        format!("kld_eval: read ref {ref_in}: {e}"),
-                    );
+                    daemon_state
+                        .out
+                        .error(format!("kld_eval: read ref {ref_in}: {e}"));
                     return;
                 }
             };
@@ -540,14 +499,10 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
                     .errors()
                     .map(|m| format!("{}: {}", m.field, m.detail))
                     .collect();
-                emit_error_with_id(
-                    &mut daemon_state.stdout,
-                    "",
-                    format!(
-                        "kld_eval: refusing score — ref incompatible: {}",
-                        errs.join("; ")
-                    ),
-                );
+                daemon_state.out.error(format!(
+                    "kld_eval: refusing score — ref incompatible: {}",
+                    errs.join("; ")
+                ));
                 return;
             }
             let findings: Vec<String> = report
@@ -570,24 +525,16 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
                             &out.per_chunk,
                         ) {
                             Ok(()) => seq = serde_json::json!(p),
-                            Err(e) => emit_error_with_id(
-                                &mut daemon_state.stdout,
-                                "",
-                                format!("kld_eval: write {p}: {e}"),
-                            ),
+                            Err(e) => daemon_state.out.error(format!("kld_eval: write {p}: {e}")),
                         }
                     }
                     emit_kld_evaled!("score", out, seq, serde_json::json!(findings));
                 }
-                Err(e) => {
-                    emit_error_with_id(&mut daemon_state.stdout, "", format!("kld_eval: {e}"))
-                }
+                Err(e) => daemon_state.out.error(format!("kld_eval: {e}")),
             }
         }
-        other => emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            format!("kld_eval: unknown mode {other:?}"),
-        ),
+        other => daemon_state
+            .out
+            .error(format!("kld_eval: unknown mode {other:?}")),
     }
 }

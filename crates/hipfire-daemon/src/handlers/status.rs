@@ -16,15 +16,10 @@ pub(crate) fn registry(
     daemon_state: &mut DaemonState,
     llm_registry: &hipfire_model::LlmModelRegistry,
 ) {
-    let _ = serde_json::to_writer(
-        &mut daemon_state.stdout,
-        &serde_json::json!({
-            "type": "model_registry",
-            "registry": llm_registry
-        }),
-    );
-    let _ = writeln!(daemon_state.stdout);
-    let _ = daemon_state.stdout.flush();
+    daemon_state.out.emit(serde_json::json!({
+        "type": "model_registry",
+        "registry": llm_registry
+    }));
 }
 
 pub(crate) fn worker_status(daemon_state: &mut DaemonState) {
@@ -33,14 +28,12 @@ pub(crate) fn worker_status(daemon_state: &mut DaemonState) {
         daemon_state.model.as_ref(),
         &daemon_state.resident_models,
     );
-    let _ = writeln!(daemon_state.stdout, "{status}");
-    let _ = daemon_state.stdout.flush();
+    daemon_state.out.emit(status);
 }
 
 pub(crate) fn resource_status(daemon_state: &mut DaemonState) {
     let status = daemon_state.resource_reservations.status_json();
-    let _ = writeln!(daemon_state.stdout, "{status}");
-    let _ = daemon_state.stdout.flush();
+    daemon_state.out.emit(status);
 }
 
 pub(crate) fn inventory(daemon_state: &mut DaemonState) {
@@ -48,13 +41,11 @@ pub(crate) fn inventory(daemon_state: &mut DaemonState) {
     let mut payload = serde_json::to_value(inventory)
         .unwrap_or_else(|_| serde_json::json!({"source": "daemon", "devices": []}));
     payload["type"] = serde_json::json!("inventory");
-    let _ = writeln!(daemon_state.stdout, "{payload}");
-    let _ = daemon_state.stdout.flush();
+    daemon_state.out.emit(payload);
 }
 
 pub(crate) fn ping(daemon_state: &mut DaemonState) {
-    let _ = writeln!(daemon_state.stdout, r#"{{"type":"pong"}}"#);
-    let _ = daemon_state.stdout.flush();
+    daemon_state.out.emit(serde_json::json!({ "type": "pong" }));
 }
 
 pub(crate) fn unsupported_on_request_channel(
@@ -63,7 +54,7 @@ pub(crate) fn unsupported_on_request_channel(
     msg_type: &str,
 ) {
     emit_error_with_id(
-        &mut daemon_state.stdout,
+        &mut daemon_state.out.stdout,
         msg.get("id").and_then(|v| v.as_str()).unwrap_or(""),
         format!("{msg_type} is handled on the control channel, not the request channel"),
     );

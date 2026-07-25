@@ -1179,12 +1179,20 @@ fn main() {
                 // not JSON-safe (serde messages can carry quotes/newlines and
                 // echo offending input), so raw interpolation would emit a
                 // malformed line and corrupt the JSONL stream.
-                emit_error_with_id(&mut daemon_state.stdout, "", format!("invalid JSON: {e}"));
+                daemon_state.out.error(format!("invalid JSON: {e}"));
                 continue;
             }
         };
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        // Every frame this request emits is tagged with this id (see
+        // `DaemonState::emit`), so a caller can correlate replies. Refreshed per
+        // iteration; empty when the request carried no id.
+        daemon_state.out.request_id = msg
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
         let protocol_load = if msg_type == "load" {
             serde_json::from_value::<hipfire_model::ModelLoadRequest>(msg.clone()).ok()
         } else {
@@ -1200,7 +1208,7 @@ fn main() {
                 // JSONL stream.
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 emit_error_with_id(
-                    &mut daemon_state.stdout,
+                    &mut daemon_state.out.stdout,
                     id,
                     format!("unsupported or malformed request '{msg_type}': {e}"),
                 );

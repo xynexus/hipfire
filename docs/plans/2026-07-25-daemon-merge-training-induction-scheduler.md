@@ -254,10 +254,44 @@ still serial. Collapse the 25-line `activate_model_worker` block duplicated at
 
 ### M2 — Protocol: id correlation + typed responses
 
-Serialize `DaemonResponse` instead of hand-writing frames; stamp the request id on every
-frame. Prerequisite for M3.
+Splits in two, and only the first half is a genuine M3 prerequisite.
 
-*Exit:* existing single-client callers unaffected.
+**M2a — id correlation. Done.** Every frame now goes out through
+`Responder::emit`, which stamps the current request id (an explicit `id` in the
+frame wins, since batch and session ops answer per-envelope ids that are
+deliberately not the request id). `Responder` is its own struct rather than two
+fields on `DaemonState` because `emit(&mut self)` on the whole state would
+conflict with handlers that legitimately hold a mutable borrow of another field
+across an emit — the drafter loop emits per-epoch progress while holding
+`&mut drafter_train_session`. It is also the seam M3 replaces: one `Responder`
+per connection instead of one per process.
+
+Two things this fixed that were not in the original scope:
+- **85 error frames were emitted with an empty id**, i.e. uncorrelatable. (An
+  early count said 13; `grep -o` undercounts because rustfmt wraps those calls
+  across lines.) They now use `Responder::error`, which stamps.
+- **13 frames were hand-written string literals** (`pong`, `reset`, `steer_ok`,
+  `lora_ok`, `unloaded`) that bypassed `serde_json` entirely. `serving-core::events`
+  already documented why that is unsafe — a user-controlled id containing `"` or a
+  newline desyncs every following line — but the daemon's own literals did not
+  follow it. All frames now serialise.
+
+Backward compatible, which is what made it safe to do first: the adapter parses
+with a plain `serde_json::from_str` and there is no `deny_unknown_fields` anywhere
+in the protocol crate, so an added `id` is ignored by existing readers.
+
+**M2b — typed `DaemonResponse` serialization. Deferred, and it is larger than it
+looks.** The enum is `Deserialize`-only, no variant carries an `id`, and it ends
+in `#[serde(other)] Unknown`. Serialising it means adding `Serialize` to a dozen
+foreign payload types, deciding what `Unknown` does on the write side, and
+inventing variants for the frames that currently fall through to it
+(`train_start`, `train_epoch`, `pflash_labels_*`, `diag`, …). None of that is
+needed for multiplexing — routing needs the id, not the type — so it should not
+block M3.
+
+*Exit (M2a, met):* ids observed on the wire for `pong`, `lora_listed`,
+`resource_status`, `reset` and both protocol-level and handler-level error frames,
+including the escaping case; existing callers unaffected.
 
 ### M3 — Socket transport + control channel
 

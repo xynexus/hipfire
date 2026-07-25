@@ -1,6 +1,6 @@
 //! Token generation, embeddings and reranking — the serving hot path.
 //!
-//! `generate` writes tokens straight to `daemon_state.stdout` as it produces
+//! `generate` writes tokens straight to `daemon_state.out.stdout` as it produces
 //! them and takes no cancellation token, which is why `Abort` cannot currently
 //! interrupt it: the abort would arrive on the same channel this handler is
 //! still occupying.
@@ -18,7 +18,7 @@ pub(crate) fn embed(
     let target_worker_id = message_worker_id(&msg);
     if daemon_state.dummy_model.is_some() {
         emit_error_with_id(
-            &mut daemon_state.stdout,
+            &mut daemon_state.out.stdout,
             id,
             "embed is not supported for the dummy model",
         );
@@ -34,7 +34,7 @@ pub(crate) fn embed(
         Ok(true) => {}
         Ok(false) => {
             emit_error_with_id(
-                &mut daemon_state.stdout,
+                &mut daemon_state.out.stdout,
                 id,
                 format!("unknown model worker {target_worker_id}"),
             );
@@ -42,7 +42,7 @@ pub(crate) fn embed(
         }
         Err(e) => {
             emit_error_with_id(
-                &mut daemon_state.stdout,
+                &mut daemon_state.out.stdout,
                 id,
                 format!("worker switch failed: {e}"),
             );
@@ -50,7 +50,7 @@ pub(crate) fn embed(
         }
     }
     let Some(m) = daemon_state.model.as_ref() else {
-        emit_error_with_id(&mut daemon_state.stdout, id, "no model loaded");
+        emit_error_with_id(&mut daemon_state.out.stdout, id, "no model loaded");
         return;
     };
     match embeddinggemma_embed(
@@ -61,18 +61,13 @@ pub(crate) fn embed(
         req.dims,
     ) {
         Ok(embeddings) => {
-            let _ = serde_json::to_writer(
-                &mut daemon_state.stdout,
-                &serde_json::json!({
-                    "type": "embeddings",
-                    "id": id,
-                    "embeddings": embeddings,
-                }),
-            );
-            let _ = writeln!(daemon_state.stdout);
-            let _ = daemon_state.stdout.flush();
+            daemon_state.out.emit(serde_json::json!({
+                "type": "embeddings",
+                "id": id,
+                "embeddings": embeddings,
+            }));
         }
-        Err(e) => emit_error_with_id(&mut daemon_state.stdout, id, e),
+        Err(e) => emit_error_with_id(&mut daemon_state.out.stdout, id, e),
     }
 }
 
@@ -85,7 +80,7 @@ pub(crate) fn rerank(
     let target_worker_id = message_worker_id(&msg);
     if daemon_state.dummy_model.is_some() {
         emit_error_with_id(
-            &mut daemon_state.stdout,
+            &mut daemon_state.out.stdout,
             id,
             "rerank is not supported for the dummy model",
         );
@@ -101,7 +96,7 @@ pub(crate) fn rerank(
         Ok(true) => {}
         Ok(false) => {
             emit_error_with_id(
-                &mut daemon_state.stdout,
+                &mut daemon_state.out.stdout,
                 id,
                 format!("unknown model worker {target_worker_id}"),
             );
@@ -109,7 +104,7 @@ pub(crate) fn rerank(
         }
         Err(e) => {
             emit_error_with_id(
-                &mut daemon_state.stdout,
+                &mut daemon_state.out.stdout,
                 id,
                 format!("worker switch failed: {e}"),
             );
@@ -117,23 +112,18 @@ pub(crate) fn rerank(
         }
     }
     let Some(m) = daemon_state.model.as_ref() else {
-        emit_error_with_id(&mut daemon_state.stdout, id, "no model loaded");
+        emit_error_with_id(&mut daemon_state.out.stdout, id, "no model loaded");
         return;
     };
     match embeddinggemma_rerank(&mut daemon_state.gpu, m, &req.query, &req.documents) {
         Ok(results) => {
-            let _ = serde_json::to_writer(
-                &mut daemon_state.stdout,
-                &serde_json::json!({
-                    "type": "rerank_scores",
-                    "id": id,
-                    "results": results,
-                }),
-            );
-            let _ = writeln!(daemon_state.stdout);
-            let _ = daemon_state.stdout.flush();
+            daemon_state.out.emit(serde_json::json!({
+                "type": "rerank_scores",
+                "id": id,
+                "results": results,
+            }));
         }
-        Err(e) => emit_error_with_id(&mut daemon_state.stdout, id, e),
+        Err(e) => emit_error_with_id(&mut daemon_state.out.stdout, id, e),
     }
 }
 
@@ -161,7 +151,7 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
             Ok(true) => {}
             Ok(false) => {
                 emit_error_with_id(
-                    &mut daemon_state.stdout,
+                    &mut daemon_state.out.stdout,
                     id,
                     format!("unknown model worker {target_worker_id}"),
                 );
@@ -169,7 +159,7 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
             }
             Err(e) => {
                 emit_error_with_id(
-                    &mut daemon_state.stdout,
+                    &mut daemon_state.out.stdout,
                     id,
                     format!("worker switch failed: {e}"),
                 );
@@ -209,7 +199,7 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
             "dummy generate"
         );
         dummy.generate(
-            &mut daemon_state.stdout,
+            &mut daemon_state.out.stdout,
             id,
             session_id,
             prompt,
@@ -222,10 +212,10 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
         Some(m) => m,
         None => {
             let _ = writeln!(
-                daemon_state.stdout,
+                daemon_state.out.stdout,
                 r#"{{"type":"error","message":"no model loaded"}}"#
             );
-            let _ = daemon_state.stdout.flush();
+            let _ = daemon_state.out.stdout.flush();
             return;
         }
     };
@@ -254,12 +244,12 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     if supports_generate_session {
         let target_session_id = session_id.unwrap_or_else(|| loaded_model_default_session_id(m));
         if let Err(e) = m.activate_session(&mut daemon_state.gpu, target_session_id) {
-            emit_error_with_id(&mut daemon_state.stdout, id, e);
+            emit_error_with_id(&mut daemon_state.out.stdout, id, e);
             return;
         }
     } else if session_id.is_some() || prefill_already_done {
         emit_error_with_id(
-            &mut daemon_state.stdout,
+            &mut daemon_state.out.stdout,
             id,
             "session_id/prefill_already_done are only supported for single-GPU qwen35/qwen35-moe/lfm2-moe",
         );
@@ -307,12 +297,12 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                 Ok(t) => Some(t),
                 Err(e) => {
                     let _ = writeln!(
-                        daemon_state.stdout,
+                        daemon_state.out.stdout,
                         r#"{{"type":"error","id":"{}","message":"invalid tools field: {}"}}"#,
                         id,
                         e.to_string().replace('"', "'"),
                     );
-                    let _ = daemon_state.stdout.flush();
+                    let _ = daemon_state.out.stdout.flush();
                     return;
                 }
             }
@@ -322,12 +312,12 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                     Ok(t) => Some(t),
                     Err(e) => {
                         let _ = writeln!(
-                            daemon_state.stdout,
+                            daemon_state.out.stdout,
                             r#"{{"type":"error","id":"{}","message":"invalid tools field: {}"}}"#,
                             id,
                             e.to_string().replace('"', "'"),
                         );
-                        let _ = daemon_state.stdout.flush();
+                        let _ = daemon_state.out.stdout.flush();
                         return;
                     }
                 },
@@ -346,12 +336,12 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                 Ok(m) => Some(m),
                 Err(e) => {
                     let _ = writeln!(
-                        daemon_state.stdout,
+                        daemon_state.out.stdout,
                         r#"{{"type":"error","id":"{}","message":"invalid messages field: {}"}}"#,
                         id,
                         e.to_string().replace('"', "'"),
                     );
-                    let _ = daemon_state.stdout.flush();
+                    let _ = daemon_state.out.stdout.flush();
                     return;
                 }
             },
@@ -590,12 +580,16 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
 
     if video.is_some() && !is_gemma3_vl {
         write_error(
-            &mut daemon_state.stdout,
+            &mut daemon_state.out.stdout,
             id,
             "video input is only supported on gemma3-vl (arch 13)",
         );
     } else if has_media && !has_vl {
-        write_error(&mut daemon_state.stdout, id, "model has no vision encoder");
+        write_error(
+            &mut daemon_state.out.stdout,
+            id,
+            "model has no vision encoder",
+        );
     } else if is_gemma3_vl && has_media {
         // arch-13 gemma3-vl: decode image / image_base64 / video into raw
         // frames daemon-side, then serve through Gemma3VlBackend (SigLIP
@@ -625,13 +619,13 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                 generate_vl_gemma3(
                     m,
                     &mut daemon_state.gpu,
-                    &mut daemon_state.stdout,
+                    &mut daemon_state.out.stdout,
                     &params,
                     &frames,
                     &image_labels,
                 );
             }
-            Err(e) => write_error(&mut daemon_state.stdout, id, &e),
+            Err(e) => write_error(&mut daemon_state.out.stdout, id, &e),
         }
     } else if has_image && has_vl {
         if image_base64.is_some() && image.is_some() {
@@ -640,7 +634,7 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
         let source = if let Some(b64) = image_base64 {
             if b64.len() > MAX_BASE64_ENCODED_LEN {
                 write_error(
-                    &mut daemon_state.stdout,
+                    &mut daemon_state.out.stdout,
                     id,
                     &format!(
                         "image payload exceeds maximum encoded size ({} bytes)",
@@ -678,9 +672,19 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
             encode_only: false, // qwen35-vl / dots-ocr always decode
         };
         if is_dots_ocr {
-            generate_vl_dots_ocr(m, &mut daemon_state.gpu, &mut daemon_state.stdout, &params);
+            generate_vl_dots_ocr(
+                m,
+                &mut daemon_state.gpu,
+                &mut daemon_state.out.stdout,
+                &params,
+            );
         } else {
-            generate_vl(m, &mut daemon_state.gpu, &mut daemon_state.stdout, &params);
+            generate_vl(
+                m,
+                &mut daemon_state.gpu,
+                &mut daemon_state.out.stdout,
+                &params,
+            );
         }
     } else {
         // Per-request PflashConfig: clone the load-time cfg
@@ -761,19 +765,19 @@ pub(crate) fn text(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
         });
         if let Some(reason) = pf_override_err {
             let _ = writeln!(
-                daemon_state.stdout,
+                daemon_state.out.stdout,
                 r#"{{"type":"error","id":"{}","message":"invalid pflash override: {}"}}"#,
                 id,
                 reason.replace('"', "'"),
             );
-            let _ = daemon_state.stdout.flush();
+            let _ = daemon_state.out.stdout.flush();
             return;
         }
         generate(
             m,
             &mut daemon_state.gpu,
             daemon_state.pflash_drafter_gpu.as_mut(),
-            &mut daemon_state.stdout,
+            &mut daemon_state.out.stdout,
             id,
             prompt,
             system,

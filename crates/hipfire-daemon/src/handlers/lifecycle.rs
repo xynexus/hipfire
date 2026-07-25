@@ -58,11 +58,11 @@ pub(crate) fn load(
             &mut daemon_state.resident_models,
         ) {
             write_error(
-                &mut daemon_state.stdout,
+                &mut daemon_state.out.stdout,
                 "",
                 &format!("worker switch failed: {e}"),
             );
-            let _ = daemon_state.stdout.flush();
+            let _ = daemon_state.out.stdout.flush();
             return;
         }
         daemon_state.active_worker_id = requested_worker_id.clone();
@@ -95,11 +95,11 @@ pub(crate) fn load(
             .reacquire_placeholders(&mut daemon_state.gpu)
         {
             write_error(
-                &mut daemon_state.stdout,
+                &mut daemon_state.out.stdout,
                 "",
                 &format!("dummy load resource reservation failed: {err}"),
             );
-            let _ = daemon_state.stdout.flush();
+            let _ = daemon_state.out.stdout.flush();
             return;
         }
         tracing::info!(
@@ -117,8 +117,7 @@ pub(crate) fn load(
             "vocab": 1024,
             "vl": false,
         });
-        let _ = writeln!(daemon_state.stdout, "{line}");
-        let _ = daemon_state.stdout.flush();
+        daemon_state.out.emit(line);
         return;
     }
 
@@ -412,28 +411,28 @@ pub(crate) fn load(
     if pp > 1 {
         if draft_path.is_some() && std::env::var("HIPFIRE_PP_DFLASH").ok().as_deref() != Some("1") {
             let _ = writeln!(
-                daemon_state.stdout,
+                daemon_state.out.stdout,
                 r#"{{"type":"error","message":"DFlash speculative decode requires pp=1 in v1 (set HIPFIRE_PP_DFLASH=1 to opt into the experimental pp>1 PRD path; note PR2-4 of docs/plans/hetero-pflash-dflash.prd are not yet implemented — the load message will accept but generate will not run cross-card spec-decode). See issue #58 v1.1 roadmap."}}"#
             );
-            let _ = daemon_state.stdout.flush();
+            let _ = daemon_state.out.stdout.flush();
             return;
         }
         if cask.sidecar.is_some() {
             let _ = writeln!(
-                daemon_state.stdout,
+                daemon_state.out.stdout,
                 r#"{{"type":"error","message":"CASK / TriAttention eviction requires pp=1 in v1; see issue #58 v1.1 roadmap"}}"#
             );
-            let _ = daemon_state.stdout.flush();
+            let _ = daemon_state.out.stdout.flush();
             return;
         }
         if (pflash_drafter.is_some() || pflash_mode_str != "off")
             && std::env::var("HIPFIRE_PP_PFLASH").ok().as_deref() != Some("1")
         {
             let _ = writeln!(
-                daemon_state.stdout,
+                daemon_state.out.stdout,
                 r#"{{"type":"error","message":"PFlash prefill compression requires pp=1 in v1 (set HIPFIRE_PP_PFLASH=1 to opt into the experimental pp>1 PoC); see issue #58 v1.1 roadmap"}}"#
             );
-            let _ = daemon_state.stdout.flush();
+            let _ = daemon_state.out.stdout.flush();
             return;
         }
     }
@@ -467,11 +466,11 @@ pub(crate) fn load(
     {
         hipfire_runtime::load_progress::set_sink(None);
         write_error(
-            &mut daemon_state.stdout,
+            &mut daemon_state.out.stdout,
             "",
             &format!("resource reservation release failed before load: {err}"),
         );
-        let _ = daemon_state.stdout.flush();
+        let _ = daemon_state.out.stdout.flush();
         return;
     }
     let load_result = load_model(
@@ -503,11 +502,11 @@ pub(crate) fn load(
                     .resource_reservations
                     .reacquire_placeholders(&mut daemon_state.gpu);
                 write_error(
-                    &mut daemon_state.stdout,
+                    &mut daemon_state.out.stdout,
                     "",
                     &format!("resource reservation reacquire failed after load: {err}"),
                 );
-                let _ = daemon_state.stdout.flush();
+                let _ = daemon_state.out.stdout.flush();
                 return;
             }
             let arch = m.registered_backend.as_ref().map_or_else(
@@ -678,7 +677,7 @@ pub(crate) fn load(
             let cache_capable =
                 m.arch_id == ARCH_ID_DEEPSEEK4_FLASH || is_qwen35_family_arch_id(m.arch_id);
             let _ = writeln!(
-                daemon_state.stdout,
+                daemon_state.out.stdout,
                 "{}",
                 serde_json::json!({
                     "type": "loaded",
@@ -705,11 +704,11 @@ pub(crate) fn load(
                 if pflash_mode_str != "off" {
                     if let Some(ref reason) = pflash_load_err {
                         let _ = writeln!(
-                            daemon_state.stdout,
+                            daemon_state.out.stdout,
                             r#"{{"type":"pflash_load_failed","reason":"invalid load param: {}"}}"#,
                             reason.replace('"', "'")
                         );
-                        let _ = daemon_state.stdout.flush();
+                        let _ = daemon_state.out.stdout.flush();
                         daemon_state.model = Some(m);
                         return;
                     }
@@ -745,7 +744,7 @@ pub(crate) fn load(
                                 Ok(g) => sibling = Some(g),
                                 Err(e) => {
                                     let _ = writeln!(
-                                        daemon_state.stdout,
+                                        daemon_state.out.stdout,
                                         r#"{{"type":"pflash_load_failed","reason":"drafter device {} init: {}"}}"#,
                                         pflash_drafter_device,
                                         e.to_string().replace('"', "'")
@@ -768,7 +767,7 @@ pub(crate) fn load(
                                     pf_drafter_path, pflash_drafter_device, pflash_mode_str,
                                     pf_state.tokenizer_compat, pflash_keep_ratio, pflash_threshold);
                                 let _ = writeln!(
-                                    daemon_state.stdout,
+                                    daemon_state.out.stdout,
                                     r#"{{"type":"pflash","mode":"{}","drafter":"{}","drafter_device":{},"tokenizer_compat":{},"keep_ratio":{},"threshold":{}}}"#,
                                     pflash_mode_str,
                                     pf_drafter_path,
@@ -785,7 +784,7 @@ pub(crate) fn load(
                             Err(e) => {
                                 eprintln!("[pflash] LOAD FAILED: {}", e);
                                 let _ = writeln!(
-                                    daemon_state.stdout,
+                                    daemon_state.out.stdout,
                                     r#"{{"type":"pflash_load_failed","reason":"{}"}}"#,
                                     e.to_string().replace('"', "'")
                                 );
@@ -793,7 +792,7 @@ pub(crate) fn load(
                         }
                     } else {
                         let _ = writeln!(
-                            daemon_state.stdout,
+                            daemon_state.out.stdout,
                             r#"{{"type":"pflash_load_failed","reason":"target tokenizer unavailable"}}"#
                         );
                     }
@@ -817,7 +816,7 @@ pub(crate) fn load(
             // serde-escape: raw HipError debug contains { } and "
             // which corrupt the JSONL protocol if interpolated raw.
             write_error(
-                &mut daemon_state.stdout,
+                &mut daemon_state.out.stdout,
                 "",
                 &format!(
                     "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)",
@@ -826,7 +825,7 @@ pub(crate) fn load(
             );
         }
     }
-    let _ = daemon_state.stdout.flush();
+    let _ = daemon_state.out.stdout.flush();
 }
 
 pub(crate) fn reset(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
@@ -839,8 +838,9 @@ pub(crate) fn reset(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
         daemon_state
             .generic_state_arena
             .release_worker(&target_worker_id);
-        let _ = writeln!(daemon_state.stdout, r#"{{"type":"reset","seq_pos":0}}"#);
-        let _ = daemon_state.stdout.flush();
+        daemon_state
+            .out
+            .emit(serde_json::json!({ "type": "reset", "seq_pos": 0 }));
         return;
     }
     if daemon_state.dummy_model.is_none() {
@@ -853,19 +853,13 @@ pub(crate) fn reset(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
         ) {
             Ok(true) => {}
             Ok(false) => {
-                emit_error_with_id(
-                    &mut daemon_state.stdout,
-                    "",
-                    format!("unknown model worker {target_worker_id}"),
-                );
+                daemon_state
+                    .out
+                    .error(format!("unknown model worker {target_worker_id}"));
                 return;
             }
             Err(e) => {
-                emit_error_with_id(
-                    &mut daemon_state.stdout,
-                    "",
-                    format!("worker switch failed: {e}"),
-                );
+                daemon_state.out.error(format!("worker switch failed: {e}"));
                 return;
             }
         }
@@ -876,8 +870,9 @@ pub(crate) fn reset(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
             .generic_state_arena
             .release_worker(&target_worker_id);
         dummy.reset();
-        let _ = writeln!(daemon_state.stdout, r#"{{"type":"reset"}}"#);
-        let _ = daemon_state.stdout.flush();
+        daemon_state
+            .out
+            .emit(serde_json::json!({ "type": "reset" }));
         return;
     }
     // Under eviction, also zero the compact_offset so absolute
@@ -1024,14 +1019,15 @@ pub(crate) fn reset(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                 .backend
                 .reset_session(&mut daemon_state.gpu, "default");
         }
-        let _ = writeln!(daemon_state.stdout, r#"{{"type":"reset","seq_pos":0}}"#);
+        daemon_state
+            .out
+            .emit(serde_json::json!({ "type": "reset", "seq_pos": 0 }));
     } else {
-        let _ = writeln!(
-            daemon_state.stdout,
-            r#"{{"type":"error","message":"no model loaded"}}"#
-        );
+        daemon_state
+            .out
+            .emit(serde_json::json!({ "type": "error", "message": "no model loaded" }));
     }
-    let _ = daemon_state.stdout.flush();
+    let _ = daemon_state.out.stdout.flush();
 }
 
 pub(crate) fn unload(daemon_state: &mut DaemonState) {
@@ -1072,8 +1068,9 @@ pub(crate) fn unload(daemon_state: &mut DaemonState) {
     // Drop any steer session so a stale capture/apply can't leak its
     // process-global state across model loads.
     hipfire_steer::clear();
-    let _ = writeln!(daemon_state.stdout, r#"{{"type":"unloaded"}}"#);
-    let _ = daemon_state.stdout.flush();
+    daemon_state
+        .out
+        .emit(serde_json::json!({ "type": "unloaded" }));
 }
 
 pub(crate) fn unload_worker(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
@@ -1122,6 +1119,5 @@ pub(crate) fn unload_worker(daemon_state: &mut DaemonState, msg: &serde_json::Va
         unloaded,
         daemon_state.resident_models.len() + usize::from(daemon_state.model.is_some()),
     );
-    let _ = writeln!(daemon_state.stdout, "{done}");
-    let _ = daemon_state.stdout.flush();
+    daemon_state.out.emit(done);
 }

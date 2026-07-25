@@ -12,11 +12,9 @@ use crate::*;
 
 pub(crate) fn load(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     let Some(path) = msg.get("path").and_then(|v| v.as_str()).map(String::from) else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "lora_load: missing 'path'".to_string(),
-        );
+        daemon_state
+            .out
+            .error("lora_load: missing 'path'".to_string());
         return;
     };
     let scale_override = msg.get("scale").and_then(|v| v.as_f64()).map(|v| v as f32);
@@ -24,7 +22,7 @@ pub(crate) fn load(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     let mut adapter = match hipfire_lora_hfq::read_lora_any(std::path::Path::new(&path)) {
         Ok(a) => a,
         Err(e) => {
-            emit_error_with_id(&mut daemon_state.stdout, "", format!("lora_load: {e}"));
+            daemon_state.out.error(format!("lora_load: {e}"));
             return;
         }
     };
@@ -41,77 +39,69 @@ pub(crate) fn load(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     });
     if let Some(h) = model_hidden {
         if adapter.meta.hidden != h {
-            emit_error_with_id(
-                &mut daemon_state.stdout,
-                "",
-                format!(
-                    "lora_load: adapter hidden {} != model hidden {h}",
-                    adapter.meta.hidden
-                ),
-            );
+            daemon_state.out.error(format!(
+                "lora_load: adapter hidden {} != model hidden {h}",
+                adapter.meta.hidden
+            ));
             return;
         }
     }
     let id = adapter.id.clone();
     if let Err(e) = hipfire_steer::load_lora_adapter(&adapter) {
-        emit_error_with_id(&mut daemon_state.stdout, "", format!("lora_load: {e}"));
+        daemon_state.out.error(format!("lora_load: {e}"));
         return;
     }
     if let Some(s) = scale_override {
         hipfire_steer::set_adapter_scale(&id, s);
     }
-    let _ = writeln!(daemon_state.stdout, r#"{{"type":"lora_ok"}}"#);
-    let _ = daemon_state.stdout.flush();
+    daemon_state
+        .out
+        .emit(serde_json::json!({ "type": "lora_ok" }));
 }
 
 pub(crate) fn set_scale(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     let id = msg.get("id").and_then(|v| v.as_str()).map(String::from);
     let scale = msg.get("scale").and_then(|v| v.as_f64()).map(|v| v as f32);
     let (Some(id), Some(scale)) = (id, scale) else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "lora_set_scale: missing 'id'/'scale'".to_string(),
-        );
+        daemon_state
+            .out
+            .error("lora_set_scale: missing 'id'/'scale'".to_string());
         return;
     };
     if hipfire_steer::set_adapter_scale(&id, scale) {
-        let _ = writeln!(daemon_state.stdout, r#"{{"type":"lora_ok"}}"#);
-        let _ = daemon_state.stdout.flush();
+        daemon_state
+            .out
+            .emit(serde_json::json!({ "type": "lora_ok" }));
     } else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            format!("lora_set_scale: no adapter {id:?} loaded"),
-        );
+        daemon_state
+            .out
+            .error(format!("lora_set_scale: no adapter {id:?} loaded"));
     }
 }
 
 pub(crate) fn unload(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
     let Some(id) = msg.get("id").and_then(|v| v.as_str()).map(String::from) else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            "lora_unload: missing 'id'".to_string(),
-        );
+        daemon_state
+            .out
+            .error("lora_unload: missing 'id'".to_string());
         return;
     };
     if hipfire_steer::unload_adapter(&id) {
-        let _ = writeln!(daemon_state.stdout, r#"{{"type":"lora_ok"}}"#);
-        let _ = daemon_state.stdout.flush();
+        daemon_state
+            .out
+            .emit(serde_json::json!({ "type": "lora_ok" }));
     } else {
-        emit_error_with_id(
-            &mut daemon_state.stdout,
-            "",
-            format!("lora_unload: no adapter {id:?} loaded"),
-        );
+        daemon_state
+            .out
+            .error(format!("lora_unload: no adapter {id:?} loaded"));
     }
 }
 
 pub(crate) fn clear(daemon_state: &mut DaemonState) {
     hipfire_steer::clear();
-    let _ = writeln!(daemon_state.stdout, r#"{{"type":"lora_ok"}}"#);
-    let _ = daemon_state.stdout.flush();
+    daemon_state
+        .out
+        .emit(serde_json::json!({ "type": "lora_ok" }));
 }
 
 pub(crate) fn list(daemon_state: &mut DaemonState) {
@@ -120,6 +110,5 @@ pub(crate) fn list(daemon_state: &mut DaemonState) {
         .map(|(id, scale)| serde_json::json!({ "id": id, "scale": scale }))
         .collect();
     let resp = serde_json::json!({ "type": "lora_listed", "adapters": adapters });
-    let _ = writeln!(daemon_state.stdout, "{resp}");
-    let _ = daemon_state.stdout.flush();
+    daemon_state.out.emit(resp);
 }

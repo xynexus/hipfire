@@ -25,7 +25,7 @@ pub(crate) fn prefill(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                     Ok(true) => {}
                     Ok(false) => {
                         emit_error_with_id(
-                            &mut daemon_state.stdout,
+                            &mut daemon_state.out.stdout,
                             &envelope.id,
                             format!("unknown model worker {target_worker_id}"),
                         );
@@ -33,7 +33,7 @@ pub(crate) fn prefill(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                     }
                     Err(e) => {
                         emit_error_with_id(
-                            &mut daemon_state.stdout,
+                            &mut daemon_state.out.stdout,
                             &envelope.id,
                             format!("worker switch failed: {e}"),
                         );
@@ -43,16 +43,22 @@ pub(crate) fn prefill(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
             }
             if envelope.is_probe() {
                 if daemon_state.dummy_model.is_some() {
-                    emit_dummy_generate_batch_prefill_ready(&mut daemon_state.stdout, &envelope);
+                    emit_dummy_generate_batch_prefill_ready(
+                        &mut daemon_state.out.stdout,
+                        &envelope,
+                    );
                     return;
                 }
                 match daemon_state.model.as_ref() {
                     Some(m) if is_qwen35_family_arch_id(m.arch_id) && m.pp == 1 => {
-                        emit_generate_batch_prefill_ready(&mut daemon_state.stdout, &envelope);
+                        emit_generate_batch_prefill_ready(&mut daemon_state.out.stdout, &envelope);
                     }
                     #[cfg(feature = "arch-lfm2moe")]
                     Some(m) if m.arch_id == ARCH_ID_LFM2_MOE && m.pp == 1 => {
-                        emit_lfm2_generate_batch_prefill_ready(&mut daemon_state.stdout, &envelope);
+                        emit_lfm2_generate_batch_prefill_ready(
+                            &mut daemon_state.out.stdout,
+                            &envelope,
+                        );
                     }
                     Some(m) => {
                         let reason = format!(
@@ -60,14 +66,14 @@ pub(crate) fn prefill(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                             m.arch_id
                         );
                         emit_generate_batch_prefill_unsupported(
-                            &mut daemon_state.stdout,
+                            &mut daemon_state.out.stdout,
                             &envelope,
                             &reason,
                         );
                     }
                     None => {
                         emit_generate_batch_prefill_unsupported(
-                            &mut daemon_state.stdout,
+                            &mut daemon_state.out.stdout,
                             &envelope,
                             "no model loaded",
                         );
@@ -83,16 +89,20 @@ pub(crate) fn prefill(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                     "dummy generate_batch_prefill"
                 );
                 if let Err(e) =
-                    run_generate_batch_prefill_dummy(dummy, &mut daemon_state.stdout, &envelope)
+                    run_generate_batch_prefill_dummy(dummy, &mut daemon_state.out.stdout, &envelope)
                 {
-                    emit_error_with_id(&mut daemon_state.stdout, &envelope.id, e);
+                    emit_error_with_id(&mut daemon_state.out.stdout, &envelope.id, e);
                 }
                 return;
             }
             let m = match daemon_state.model.as_mut() {
                 Some(m) => m,
                 None => {
-                    emit_error_with_id(&mut daemon_state.stdout, &envelope.id, "no model loaded");
+                    emit_error_with_id(
+                        &mut daemon_state.out.stdout,
+                        &envelope.id,
+                        "no model loaded",
+                    );
                     return;
                 }
             };
@@ -100,11 +110,11 @@ pub(crate) fn prefill(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                 if let Err(e) = run_generate_batch_prefill_serial_qwen35(
                     m,
                     &mut daemon_state.gpu,
-                    &mut daemon_state.stdout,
+                    &mut daemon_state.out.stdout,
                     &envelope,
                     daemon_state.pflash_state.is_some(),
                 ) {
-                    emit_error_with_id(&mut daemon_state.stdout, &envelope.id, e);
+                    emit_error_with_id(&mut daemon_state.out.stdout, &envelope.id, e);
                 }
             } else {
                 #[cfg(feature = "arch-lfm2moe")]
@@ -112,15 +122,15 @@ pub(crate) fn prefill(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
                     if let Err(e) = run_generate_batch_prefill_serial_lfm2(
                         m,
                         &mut daemon_state.gpu,
-                        &mut daemon_state.stdout,
+                        &mut daemon_state.out.stdout,
                         &envelope,
                     ) {
-                        emit_error_with_id(&mut daemon_state.stdout, &envelope.id, e);
+                        emit_error_with_id(&mut daemon_state.out.stdout, &envelope.id, e);
                     }
                     return;
                 }
                 emit_error_with_id(
-                    &mut daemon_state.stdout,
+                    &mut daemon_state.out.stdout,
                     &envelope.id,
                     format!(
                         "generate_batch_prefill currently supports qwen35/qwen35-moe and lfm2-moe only (arch_id={})",
@@ -131,7 +141,7 @@ pub(crate) fn prefill(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
         }
         Err(e) => {
             let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            emit_error_with_id(&mut daemon_state.stdout, id, e);
+            emit_error_with_id(&mut daemon_state.out.stdout, id, e);
         }
     }
 }
@@ -150,7 +160,7 @@ pub(crate) fn prefix_hash_preflight(daemon_state: &mut DaemonState, msg: &serde_
                 Ok(true) => {}
                 Ok(false) => {
                     emit_error_with_id(
-                        &mut daemon_state.stdout,
+                        &mut daemon_state.out.stdout,
                         &envelope.id,
                         format!("unknown model worker {target_worker_id}"),
                     );
@@ -158,7 +168,7 @@ pub(crate) fn prefix_hash_preflight(daemon_state: &mut DaemonState, msg: &serde_
                 }
                 Err(e) => {
                     emit_error_with_id(
-                        &mut daemon_state.stdout,
+                        &mut daemon_state.out.stdout,
                         &envelope.id,
                         format!("worker switch failed: {e}"),
                     );
@@ -168,17 +178,21 @@ pub(crate) fn prefix_hash_preflight(daemon_state: &mut DaemonState, msg: &serde_
             let m = match daemon_state.model.as_ref() {
                 Some(m) => m,
                 None => {
-                    emit_error_with_id(&mut daemon_state.stdout, &envelope.id, "no model loaded");
+                    emit_error_with_id(
+                        &mut daemon_state.out.stdout,
+                        &envelope.id,
+                        "no model loaded",
+                    );
                     return;
                 }
             };
             let preflight_result = if is_qwen35_family_arch_id(m.arch_id) {
-                run_prefix_hash_preflight_qwen35(m, &mut daemon_state.stdout, &envelope)
+                run_prefix_hash_preflight_qwen35(m, &mut daemon_state.out.stdout, &envelope)
             } else {
                 #[cfg(feature = "arch-lfm2moe")]
                 {
                     if m.arch_id == ARCH_ID_LFM2_MOE {
-                        run_prefix_hash_preflight_lfm2(m, &mut daemon_state.stdout, &envelope)
+                        run_prefix_hash_preflight_lfm2(m, &mut daemon_state.out.stdout, &envelope)
                     } else {
                         Err(format!(
                             "prefix_hash_preflight currently supports qwen35/qwen35-moe and lfm2-moe only (arch_id={})",
@@ -195,12 +209,12 @@ pub(crate) fn prefix_hash_preflight(daemon_state: &mut DaemonState, msg: &serde_
                 }
             };
             if let Err(e) = preflight_result {
-                emit_error_with_id(&mut daemon_state.stdout, &envelope.id, e);
+                emit_error_with_id(&mut daemon_state.out.stdout, &envelope.id, e);
             }
         }
         Err(e) => {
             let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            emit_error_with_id(&mut daemon_state.stdout, id, e);
+            emit_error_with_id(&mut daemon_state.out.stdout, id, e);
         }
     }
 }
@@ -219,7 +233,7 @@ pub(crate) fn decode_step(daemon_state: &mut DaemonState, msg: &serde_json::Valu
                 Ok(true) => {}
                 Ok(false) => {
                     emit_error_with_id(
-                        &mut daemon_state.stdout,
+                        &mut daemon_state.out.stdout,
                         &envelope.id,
                         format!("unknown model worker {target_worker_id}"),
                     );
@@ -227,7 +241,7 @@ pub(crate) fn decode_step(daemon_state: &mut DaemonState, msg: &serde_json::Valu
                 }
                 Err(e) => {
                     emit_error_with_id(
-                        &mut daemon_state.stdout,
+                        &mut daemon_state.out.stdout,
                         &envelope.id,
                         format!("worker switch failed: {e}"),
                     );
@@ -237,22 +251,26 @@ pub(crate) fn decode_step(daemon_state: &mut DaemonState, msg: &serde_json::Valu
             let m = match daemon_state.model.as_mut() {
                 Some(m) => m,
                 None => {
-                    emit_error_with_id(&mut daemon_state.stdout, &envelope.id, "no model loaded");
+                    emit_error_with_id(
+                        &mut daemon_state.out.stdout,
+                        &envelope.id,
+                        "no model loaded",
+                    );
                     return;
                 }
             };
             if let Err(e) = run_generate_batch_decode_step_qwen35(
                 m,
                 &mut daemon_state.gpu,
-                &mut daemon_state.stdout,
+                &mut daemon_state.out.stdout,
                 &envelope,
             ) {
-                emit_error_with_id(&mut daemon_state.stdout, &envelope.id, e);
+                emit_error_with_id(&mut daemon_state.out.stdout, &envelope.id, e);
             }
         }
         Err(e) => {
             let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            emit_error_with_id(&mut daemon_state.stdout, id, e);
+            emit_error_with_id(&mut daemon_state.out.stdout, id, e);
         }
     }
 }
