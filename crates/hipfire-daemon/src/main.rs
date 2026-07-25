@@ -1215,7 +1215,7 @@ fn main() {
                 // JSONL stream.
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 emit_error_with_id(
-                    &mut daemon_state.out.stdout,
+                    &mut daemon_state.out.sink,
                     id,
                     format!("unsupported or malformed request '{msg_type}': {e}"),
                 );

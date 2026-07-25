@@ -54,7 +54,7 @@ pub(crate) fn unsupported_on_request_channel(
     msg_type: &str,
 ) {
     emit_error_with_id(
-        &mut daemon_state.out.stdout,
+        &mut daemon_state.out.sink,
         msg.get("id").and_then(|v| v.as_str()).unwrap_or(""),
         format!("{msg_type} is handled on the control channel, not the request channel"),
     );

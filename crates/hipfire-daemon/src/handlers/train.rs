@@ -335,7 +335,7 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
         };
         let nparams: usize = drafter.param_sizes().iter().sum();
         let _ = writeln!(
-            daemon_state.out.stdout,
+            daemon_state.out.sink,
             "{}",
             serde_json::json!({
                 "type": "train_start", "arch": arch, "params": nparams,
@@ -344,7 +344,7 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
                 "run_id": run_id, "quantum": quantum,
             })
         );
-        let _ = daemon_state.out.stdout.flush();
+        let _ = daemon_state.out.sink.flush();
         daemon_state.drafter_train_session = Some(DrafterTrainSession {
             run_id: run_id.clone(),
             drafter,
@@ -414,7 +414,7 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
             report.best_epoch as u32,
         );
         let _ = writeln!(
-            daemon_state.out.stdout,
+            daemon_state.out.sink,
             "{}",
             serde_json::json!({
                 "type": "train_done",
@@ -426,7 +426,7 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
                 "run_id": run_id,
             })
         );
-        let _ = daemon_state.out.stdout.flush();
+        let _ = daemon_state.out.sink.flush();
     } else {
         // Quantum done but run unfinished: report progress and keep the
         // session resident. The runner re-enqueues; training yields to
@@ -436,7 +436,7 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
             .as_ref()
             .expect("unfinished implies present");
         let _ = writeln!(
-            daemon_state.out.stdout,
+            daemon_state.out.sink,
             "{}",
             serde_json::json!({
                 "type": "train_progress", "run_id": sess.run_id,
@@ -445,7 +445,7 @@ pub(crate) fn train_drafter(daemon_state: &mut DaemonState, msg: &serde_json::Va
                 "done": false,
             })
         );
-        let _ = daemon_state.out.stdout.flush();
+        let _ = daemon_state.out.sink.flush();
     }
 }
 
@@ -535,7 +535,7 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
             return;
         }
         let _ = writeln!(
-            daemon_state.out.stdout,
+            daemon_state.out.sink,
             "{}",
             serde_json::json!({
                 "type": "train_start", "op": "train_lora", "base": base_dir,
@@ -543,7 +543,7 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
                 "run_id": run_id, "quantum": quantum,
             })
         );
-        let _ = daemon_state.out.stdout.flush();
+        let _ = daemon_state.out.sink.flush();
         let built: Result<LoraTrainSession, String> = (|| {
             let dir = std::path::Path::new(&base_dir);
             if !dir.exists() {
@@ -751,7 +751,7 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
         match dump {
             Ok(n_trainable) => {
                 let _ = writeln!(
-                    daemon_state.out.stdout,
+                    daemon_state.out.sink,
                     "{}",
                     serde_json::json!({
                         "type": "train_done", "op": "train_lora",
@@ -763,7 +763,7 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
                         "note": "trained hipfire-train LlamaModel LoRA (overfit synthetic batch); served-qwen35 adapters + real-corpus loading are follow-ons",
                     })
                 );
-                let _ = daemon_state.out.stdout.flush();
+                let _ = daemon_state.out.sink.flush();
             }
             Err(e) => daemon_state.out.error(format!("train_lora: {e}")),
         }
@@ -776,7 +776,7 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
             .as_ref()
             .expect("unfinished implies present");
         let _ = writeln!(
-            daemon_state.out.stdout,
+            daemon_state.out.sink,
             "{}",
             serde_json::json!({
                 "type": "train_progress", "run_id": sess.run_id,
@@ -784,6 +784,6 @@ pub(crate) fn train_lora(daemon_state: &mut DaemonState, msg: &serde_json::Value
                 "per_tok_ce": sess.last_ce, "done": false,
             })
         );
-        let _ = daemon_state.out.stdout.flush();
+        let _ = daemon_state.out.sink.flush();
     }
 }

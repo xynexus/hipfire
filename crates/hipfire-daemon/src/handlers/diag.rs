@@ -65,7 +65,7 @@ pub(crate) fn diag(daemon_state: &mut DaemonState) {
         })
         .unwrap_or((0, 0));
     let _ = writeln!(
-        daemon_state.out.stdout,
+        daemon_state.out.sink,
         r#"{{"type":"diag","arch":"{}","hip_version":"{}.{}","vram_free_mb":{},"vram_total_mb":{},"model_loaded":{},"model_arch":"{}","kernels":{},"kernel_hashes":{}}}"#,
         daemon_state.gpu.arch,
         hip_ver.0,
@@ -77,7 +77,7 @@ pub(crate) fn diag(daemon_state: &mut DaemonState) {
         hsaco_count,
         hash_count
     );
-    let _ = daemon_state.out.stdout.flush();
+    let _ = daemon_state.out.sink.flush();
 }
 
 pub(crate) fn bench_prefill(daemon_state: &mut DaemonState, msg: &serde_json::Value) {
@@ -89,10 +89,10 @@ pub(crate) fn bench_prefill(daemon_state: &mut DaemonState, msg: &serde_json::Va
         Some(m) => m,
         None => {
             let _ = writeln!(
-                daemon_state.out.stdout,
+                daemon_state.out.sink,
                 r#"{{"type":"error","message":"no model loaded"}}"#
             );
-            let _ = daemon_state.out.stdout.flush();
+            let _ = daemon_state.out.sink.flush();
             return;
         }
     };
@@ -104,10 +104,10 @@ pub(crate) fn bench_prefill(daemon_state: &mut DaemonState, msg: &serde_json::Va
     // for v1.
     if m.pp > 1 {
         let _ = writeln!(
-            daemon_state.out.stdout,
+            daemon_state.out.sink,
             r#"{{"type":"error","message":"bench_prefill requires pp=1 (multi-GPU bench not implemented)"}}"#
         );
-        let _ = daemon_state.out.stdout.flush();
+        let _ = daemon_state.out.sink.flush();
         return;
     }
     let n = msg.get("tokens").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
@@ -117,11 +117,11 @@ pub(crate) fn bench_prefill(daemon_state: &mut DaemonState, msg: &serde_json::Va
     // bench intentionally bypasses eviction to measure raw prefill.
     if n + 32 > m.physical_cap {
         let _ = writeln!(
-            daemon_state.out.stdout,
+            daemon_state.out.sink,
             r#"{{"type":"error","message":"bench_prefill tokens={} exceeds loaded physical_cap={}"}}"#,
             n, m.physical_cap
         );
-        let _ = daemon_state.out.stdout.flush();
+        let _ = daemon_state.out.sink.flush();
         return;
     }
     // Deterministic synthetic token IDs. Skip 0 (often <pad>) and the
@@ -358,7 +358,7 @@ pub(crate) fn bench_prefill(daemon_state: &mut DaemonState, msg: &serde_json::Va
             0.0
         };
         let _ = writeln!(
-            daemon_state.out.stdout,
+            daemon_state.out.sink,
             r#"{{"type":"prefill_result","tokens":{},"ms":{:.2},"tok_s":{:.1}}}"#,
             n,
             elapsed * 1000.0,
@@ -366,11 +366,11 @@ pub(crate) fn bench_prefill(daemon_state: &mut DaemonState, msg: &serde_json::Va
         );
     } else {
         let _ = writeln!(
-            daemon_state.out.stdout,
+            daemon_state.out.sink,
             r#"{{"type":"error","message":"bench_prefill forward failed"}}"#
         );
     }
-    let _ = daemon_state.out.stdout.flush();
+    let _ = daemon_state.out.sink.flush();
 }
 
 pub(crate) fn profile(daemon_state: &mut DaemonState) {
@@ -388,10 +388,10 @@ pub(crate) fn profile(daemon_state: &mut DaemonState) {
     let (cap, kernels) = daemon_state.gpu.profile();
     let kernels_json: Vec<String> = kernels.iter().map(|k| k.to_json()).collect();
     let _ = writeln!(
-        daemon_state.out.stdout,
+        daemon_state.out.sink,
         r#"{{"type":"profile","gpu":{},"kernels":[{}]}}"#,
         cap.to_json(),
         kernels_json.join(",")
     );
-    let _ = daemon_state.out.stdout.flush();
+    let _ = daemon_state.out.sink.flush();
 }

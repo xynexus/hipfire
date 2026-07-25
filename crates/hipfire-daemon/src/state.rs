@@ -83,9 +83,12 @@ pub(crate) struct DaemonState {
 /// It is also the seam a multi-client transport replaces: one `Responder` per
 /// connection instead of one per process.
 pub(crate) struct Responder {
-    /// Handlers write whole locked lines here, which is why interleaved progress
-    /// frames are safe on a single thread.
-    pub stdout: std::io::Stdout,
+    /// Where frames go. Handlers write whole lines, which is why interleaved
+    /// progress frames are safe on a single thread.
+    ///
+    /// Boxed rather than a concrete `Stdout` so a connection can supply its own
+    /// writer, and so [`Responder::emit`] is testable against a buffer at all.
+    pub sink: Box<dyn Write + Send>,
     /// The `id` of the request being handled right now, refreshed once per
     /// read-loop iteration; empty when the request carried no id.
     ///
@@ -96,6 +99,14 @@ pub(crate) struct Responder {
 }
 
 impl Responder {
+    /// A responder writing to process stdout — the stdio transport's sink.
+    pub fn to_stdout() -> Self {
+        Self {
+            sink: Box::new(std::io::stdout()),
+            request_id: String::new(),
+        }
+    }
+
     /// Write one JSONL response frame, stamped with the current request id, and
     /// flush.
     ///
@@ -114,8 +125,8 @@ impl Responder {
         stamp_request_id(&mut frame, &self.request_id);
         // `Display for Value` writes incrementally into the writer, so large
         // payloads (embeddings, the model registry) are not materialised first.
-        let _ = writeln!(self.stdout, "{frame}");
-        let _ = self.stdout.flush();
+        let _ = writeln!(self.sink, "{frame}");
+        let _ = self.sink.flush();
     }
 
     /// Emit an error frame tagged with the current request id.
@@ -150,10 +161,7 @@ impl DaemonState {
             lora_train_session: None,
             drafter_train_session: None,
             resource_reservations: ResourceReservationManager::from_env(),
-            out: Responder {
-                stdout: std::io::stdout(),
-                request_id: String::new(),
-            },
+            out: Responder::to_stdout(),
         }
     }
 
@@ -181,7 +189,88 @@ fn stamp_request_id(frame: &mut serde_json::Value, request_id: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::stamp_request_id;
+    use std::sync::{Arc, Mutex};
+
+    use super::{stamp_request_id, Responder};
+
+    /// A sink that keeps what was written so a test can read it back. This is the
+    /// reason `Responder::sink` is boxed rather than a concrete `Stdout`.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn lines(&self) -> Vec<serde_json::Value> {
+            let bytes = self.0.lock().unwrap().clone();
+            String::from_utf8(bytes)
+                .expect("frames are utf8")
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("each frame is one JSON line"))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn emitted_frames_are_one_json_line_each_and_carry_the_request_id() {
+        let captured = Captured::default();
+        let mut out = Responder {
+            sink: Box::new(captured.clone()),
+            request_id: "req-1".to_string(),
+        };
+
+        out.emit(serde_json::json!({ "type": "lora_ok" }));
+        out.error("something broke");
+        // An id already in the frame wins over the current request id.
+        out.emit(serde_json::json!({ "type": "token", "id": "session-9" }));
+
+        let frames = captured.lines();
+        assert_eq!(
+            frames.len(),
+            3,
+            "one line per frame, nothing merged or split"
+        );
+        assert_eq!(
+            frames[0],
+            serde_json::json!({ "type": "lora_ok", "id": "req-1" })
+        );
+        assert_eq!(
+            frames[1],
+            serde_json::json!({ "type": "error", "message": "something broke", "id": "req-1" })
+        );
+        assert_eq!(frames[2]["id"], "session-9");
+    }
+
+    #[test]
+    fn a_hostile_request_id_cannot_desync_the_stream() {
+        // The whole reason frames go through serde_json: an id carrying a quote
+        // and a newline must be escaped, not break the line protocol. Before this,
+        // hand-written literals in the daemon interpolated raw.
+        let captured = Captured::default();
+        let mut out = Responder {
+            sink: Box::new(captured.clone()),
+            request_id: "evil\"}\n{\"type\":\"injected".to_string(),
+        };
+
+        out.emit(serde_json::json!({ "type": "pong" }));
+
+        let frames = captured.lines();
+        assert_eq!(
+            frames.len(),
+            1,
+            "the id must not have injected a second frame"
+        );
+        assert_eq!(frames[0]["type"], "pong");
+        assert_eq!(frames[0]["id"], "evil\"}\n{\"type\":\"injected");
+    }
 
     #[test]
     fn stamping_adds_the_request_id_and_never_overwrites_an_explicit_one() {

@@ -24,7 +24,7 @@ pub(crate) fn release_sessions(daemon_state: &mut DaemonState, msg: &serde_json:
             Ok(true) => {}
             Ok(false) => {
                 emit_error_with_id(
-                    &mut daemon_state.out.stdout,
+                    &mut daemon_state.out.sink,
                     id,
                     format!("unknown model worker {target_worker_id}"),
                 );
@@ -32,7 +32,7 @@ pub(crate) fn release_sessions(daemon_state: &mut DaemonState, msg: &serde_json:
             }
             Err(e) => {
                 emit_error_with_id(
-                    &mut daemon_state.out.stdout,
+                    &mut daemon_state.out.sink,
                     id,
                     format!("worker switch failed: {e}"),
                 );
@@ -43,7 +43,7 @@ pub(crate) fn release_sessions(daemon_state: &mut DaemonState, msg: &serde_json:
     let request = match parse_release_sessions_request(&msg, &target_worker_id) {
         Ok(request) => request,
         Err(e) => {
-            emit_error_with_id(&mut daemon_state.out.stdout, id, e);
+            emit_error_with_id(&mut daemon_state.out.sink, id, e);
             return;
         }
     };
@@ -62,7 +62,7 @@ pub(crate) fn release_sessions(daemon_state: &mut DaemonState, msg: &serde_json:
     let m = match daemon_state.model.as_mut() {
         Some(m) => m,
         None => {
-            emit_error_with_id(&mut daemon_state.out.stdout, id, "no model loaded");
+            emit_error_with_id(&mut daemon_state.out.sink, id, "no model loaded");
             return;
         }
     };
@@ -84,7 +84,7 @@ pub(crate) fn release_sessions(daemon_state: &mut DaemonState, msg: &serde_json:
             );
             daemon_state.out.emit(done);
         }
-        Err(e) => emit_error_with_id(&mut daemon_state.out.stdout, id, e),
+        Err(e) => emit_error_with_id(&mut daemon_state.out.sink, id, e),
     }
 }
 
@@ -103,7 +103,7 @@ pub(crate) fn reserve_session_state(daemon_state: &mut DaemonState, msg: &serde_
             Ok(true) => {}
             Ok(false) => {
                 emit_error_with_id(
-                    &mut daemon_state.out.stdout,
+                    &mut daemon_state.out.sink,
                     id,
                     format!("unknown model worker {target_worker_id}"),
                 );
@@ -111,7 +111,7 @@ pub(crate) fn reserve_session_state(daemon_state: &mut DaemonState, msg: &serde_
             }
             Err(e) => {
                 emit_error_with_id(
-                    &mut daemon_state.out.stdout,
+                    &mut daemon_state.out.sink,
                     id,
                     format!("worker switch failed: {e}"),
                 );
@@ -122,7 +122,7 @@ pub(crate) fn reserve_session_state(daemon_state: &mut DaemonState, msg: &serde_
     let request = match parse_reserve_session_state_request(&msg, &target_worker_id) {
         Ok(request) => request,
         Err(e) => {
-            emit_error_with_id(&mut daemon_state.out.stdout, id, e);
+            emit_error_with_id(&mut daemon_state.out.sink, id, e);
             return;
         }
     };
@@ -156,7 +156,7 @@ pub(crate) fn reserve_session_state(daemon_state: &mut DaemonState, msg: &serde_
             .unwrap_or_else(resident_state_reservation_budget_bytes);
         sequence_state_reservation_plan_for_reserved_bytes(1024, 0, 0, budget)
     } else {
-        emit_error_with_id(&mut daemon_state.out.stdout, id, "no model loaded");
+        emit_error_with_id(&mut daemon_state.out.sink, id, "no model loaded");
         return;
     };
     if reservation_plan.rejected_for_memory_pressure {
@@ -200,7 +200,7 @@ pub(crate) fn describe_state(daemon_state: &mut DaemonState, msg: &serde_json::V
     let request = match parse_describe_sequence_state_request(&msg) {
         Ok(request) => request,
         Err(e) => {
-            emit_error_with_id(&mut daemon_state.out.stdout, id, e);
+            emit_error_with_id(&mut daemon_state.out.sink, id, e);
             return;
         }
     };
@@ -221,7 +221,7 @@ pub(crate) fn describe_state(daemon_state: &mut DaemonState, msg: &serde_json::V
         &request.handle,
     ) else {
         emit_error_with_id(
-            &mut daemon_state.out.stdout,
+            &mut daemon_state.out.sink,
             id,
             format!(
                 "describe_state unknown runtime_state_handle {}",
@@ -256,7 +256,7 @@ pub(crate) fn release_state(daemon_state: &mut DaemonState, msg: &serde_json::Va
     ) {
         Ok(released) => released,
         Err(e) => {
-            emit_error_with_id(&mut daemon_state.out.stdout, id, e);
+            emit_error_with_id(&mut daemon_state.out.sink, id, e);
             return;
         }
     };

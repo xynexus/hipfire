@@ -342,11 +342,11 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
         () => {
             |c, n, s, k| {
                 let _ = writeln!(
-                    daemon_state.out.stdout,
+                    daemon_state.out.sink,
                     "{}",
                     serde_json::json!({"type":"kld_chunk","chunk":c,"n_chunk":n,"scored":s,"mean_kld":k})
                 );
-                let _ = daemon_state.out.stdout.flush();
+                let _ = daemon_state.out.sink.flush();
             }
         };
     }
@@ -408,11 +408,11 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
                     max_chunks,
                     |c, n, s| {
                         let _ = writeln!(
-                            daemon_state.out.stdout,
+                            daemon_state.out.sink,
                             "{}",
                             serde_json::json!({"type":"kld_chunk","chunk":c,"n_chunk":n,"scored":s,"mean_kld":0.0})
                         );
-                        let _ = daemon_state.out.stdout.flush();
+                        let _ = daemon_state.out.sink.flush();
                     },
                 ) {
                     Ok(p) => {
