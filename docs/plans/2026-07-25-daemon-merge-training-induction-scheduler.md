@@ -295,15 +295,61 @@ including the escaping case; existing callers unaffected.
 
 ### M3 — Socket transport + control channel
 
-`Listener` trait, `SocketTransport`, front-end connection tasks feeding an inbound queue,
-executor thread owning `DaemonState`. Implement `Abort`/`ForceAnswer` for real — which
-requires threading a cancellation token into `generate()` (`serving-core/generate.rs:1875`,
-28 positional params, no cancellation today). Retire the six independent
-`DaemonEngine::spawn` sites (`server/lib.rs:339`, `server/routes/chat.rs:632`,
-`cli/chat.rs:212`, `cli/bench.rs:68`, `eval/executor_daemon.rs:174` and `:417`,
-`coherence/lib.rs:528`, `steer-harness/lib.rs:92`) in favour of attach.
+Two measurements set the shape here, and neither was obvious from the original
+sketch:
 
-*Exit:* two concurrent clients on one daemon; an abort mid-generation actually stops it.
+- **The daemon has no async runtime at all** (zero tokio deps). So the front end
+  is threads plus `std::os::unix::net::UnixListener`, not tokio tasks. That suits
+  it: execution must stay on one thread anyway, and adding an async runtime to a
+  fully synchronous binary would be a large change bought for nothing.
+- **`stdout: &mut std::io::Stdout` appears in 42 signatures across 10
+  `serving-core` files**, including `generate`. That concrete type — not the
+  listener — is what actually blocks multiple clients, because per-connection
+  writers cannot exist until it is abstracted. It is the real cost of M3.
+
+Hence five steps, and execution stays on the **main** thread throughout:
+`hipfire_rdna::Gpu` is initialised there and HIP contexts are thread-affine, so
+moving the executor would mean moving GPU init with it. Moving the *reader*
+achieves the same decoupling with none of that risk.
+
+**M3a — split reading from executing. Done.** A named reader thread parses frames
+and forwards them over a rendezvous channel (`transport.rs`); the main loop is now
+an executor consuming it. Behaviour-preserving, and it creates the two things the
+rest needs: somewhere for a scheduler to sit (M4), and a producer a socket
+listener can join. Capacity is deliberately 0 so backpressure is exactly today's
+— the OS pipe stays the queue; M4 raises it, because a scheduler needs several
+pending requests before it has anything to choose between. Malformed input is
+forwarded as a frame rather than reported by the reader, so responses keep a
+single writer and stay ordered against the requests around them.
+
+This is also where an end-to-end run caught a bug unit tests could not: parse
+errors were inheriting the *previous* request's id, blaming a request that had
+succeeded. The id is now assigned in exactly one place, from an exhaustive match
+on the frame, so a new inbound variant cannot reintroduce it.
+
+**M3b — abstract the response sink.** The 42 `&mut std::io::Stdout` signatures
+become `&mut dyn Write` (or generic). Wide but mechanical; unblocks M3c and also
+makes `Responder` unit-testable, which it currently is not.
+
+**M3c — `UnixListener` + per-connection writers.** One `Responder` per connection.
+Needs M3b. Socket at `~/.hipfire/daemon.sock`, mode 0600 — same-uid only, matching
+the existing `admin.secret` trust model, so no new auth surface.
+
+**M3d — control channel + real `Abort`.** Needs a cancellation token threaded into
+`generate()` (`serving-core/generate.rs`, 28 positional params, none of them a
+token) and a check the executor honours between decode steps.
+
+**M3e — retire the six `DaemonEngine::spawn` sites** (`server/lib.rs:339`,
+`server/routes/chat.rs:632`, `cli/chat.rs:212`, `cli/bench.rs:68`,
+`eval/executor_daemon.rs:174` and `:417`, `coherence/lib.rs:528`,
+`steer-harness/lib.rs:92`) in favour of attach. Needs M3c.
+
+*Exit (M3a, met):* identical observable behaviour on stdio, including blank-line
+skipping, malformed-frame ordering and EOF shutdown; reader unit-tested for
+forwarding, blank skipping, deferred parse errors and executor hangup.
+
+*Exit (M3 overall):* two concurrent clients on one daemon; an abort mid-generation
+actually stops it.
 
 ### M4 — Scheduler moves in
 

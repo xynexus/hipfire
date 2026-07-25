@@ -60,7 +60,7 @@ use hipfire_state::{
     parse_sequence_state_handle, sequence_state_handle_id, sequence_state_handle_parts,
     sequence_state_page_descriptor_json, GenericSequenceStateArena, SequenceStateHandle,
 };
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::time::Instant;
 
 // These modules now live in `hipfire-serving-core` (workstream A0). Re-import
@@ -980,6 +980,7 @@ mod generate_batch_prefill_tests;
 
 mod handlers;
 mod state;
+mod transport;
 use state::DaemonState;
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -1161,38 +1162,44 @@ fn main() {
         );
     }
 
-    let stdin = std::io::stdin();
+    // Reading happens on its own thread; this loop is the executor and owns the
+    // GPU. See `transport` for why the split matters and why execution stays on
+    // the main thread.
+    let inbound = transport::spawn_stdin_reader();
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
+    for frame in inbound {
+        // Set the stamp for this frame in exactly one place, before anything can
+        // emit. Every frame the request produces is tagged with it (see
+        // `Responder::emit`) so a caller can correlate replies.
+        //
+        // The match is what makes this safe: a frame that failed to parse has no
+        // id to recover, and clearing it here means a parse error cannot inherit
+        // the *previous* request's id and blame a request that in fact succeeded.
+        // Doing it per-branch instead invites exactly that bug back the next time
+        // a variant is added.
+        daemon_state.out.request_id = match &frame {
+            transport::Inbound::Request(msg) => msg
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            transport::Inbound::Malformed(_) => String::new(),
         };
-        if line.trim().is_empty() {
-            continue;
-        }
 
-        let msg: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                // Build the envelope through serde_json: the parse-error text is
-                // not JSON-safe (serde messages can carry quotes/newlines and
-                // echo offending input), so raw interpolation would emit a
-                // malformed line and corrupt the JSONL stream.
-                daemon_state.out.error(format!("invalid JSON: {e}"));
+        let msg = match frame {
+            transport::Inbound::Request(msg) => msg,
+            transport::Inbound::Malformed(error) => {
+                // Reported here rather than in the reader so every write stays on
+                // this thread and keeps its place relative to real responses. The
+                // envelope goes through serde_json because the parse-error text is
+                // not JSON-safe: serde messages carry quotes/newlines and echo the
+                // offending input, so raw interpolation would corrupt the stream.
+                daemon_state.out.error(format!("invalid JSON: {error}"));
                 continue;
             }
         };
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        // Every frame this request emits is tagged with this id (see
-        // `DaemonState::emit`), so a caller can correlate replies. Refreshed per
-        // iteration; empty when the request carried no id.
-        daemon_state.out.request_id = msg
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
         let protocol_load = if msg_type == "load" {
             serde_json::from_value::<hipfire_model::ModelLoadRequest>(msg.clone()).ok()
         } else {
