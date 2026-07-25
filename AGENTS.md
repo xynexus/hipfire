@@ -31,6 +31,14 @@ the relevant docs under `docs/`.
   crate), not folded into the daemon, server, or runtime hot path. The inference
   path stays lean and HIP-direct; conversion and compatibility concerns are
   offline tooling.
+- The line above is drawn at **format conversion, not at GPU work**. A workload
+  that is a forward (or backward) pass over a model — calibration/induction,
+  Hessian and imatrix capture, KLD evaluation, training and drafter training — is
+  inference-shaped work and may live in the daemon, where it can be scheduled,
+  batched, and preempted against serving traffic. What must stay out is
+  container/format translation and external-ecosystem interop. Test: if it runs
+  kernels over model weights it may be scheduled by the daemon; if it rewrites
+  bytes between container formats it belongs in `hipfire-coexistence`.
 
 ## Branch And Git
 
