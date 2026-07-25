@@ -385,6 +385,341 @@ impl Gpu {
         self.zaya_launch("zaya_rope_partial_f32", s * heads, &mut p)
     }
 
+    // ── Fused decode-glue kernels (one launch replaces a pair/triple) ──
+
+    /// Fused router MLP (single workgroup): down_proj(Oq8) → prep → rmsnorm →
+    /// FWHT→fc1(Oq8)→gelu → FWHT→fc2(Oq8)→gelu → FWHT→out(Oq8) → select. One launch
+    /// replaces ~9. All weight tensors are planar Oq8 `[int8 M*K | f32 scales]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zaya_router_mlp_fused(
+        &mut self,
+        pa_xrot: &GpuTensor,
+        dp_w: &GpuTensor,
+        dp_b: &GpuTensor,
+        rstate: &GpuTensor,
+        escale: Option<&GpuTensor>,
+        rnorm_w: &GpuTensor,
+        fc1_w: &GpuTensor,
+        fc1_b: &GpuTensor,
+        fc2_w: &GpuTensor,
+        fc2_b: &GpuTensor,
+        out_w: &GpuTensor,
+        bbias: &GpuTensor,
+        sel_idx: &GpuTensor,
+        sel_gate: &GpuTensor,
+        h: usize,
+        rh: usize,
+        n_route: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_router_mlp_fused")?;
+        self.ensure_mq_signs()?;
+        let s1 = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let has_eda: i32 = escale.is_some() as i32;
+        let esc = escale.map_or(dp_b.buf.as_ptr(), |e| e.buf.as_ptr());
+        let (pxr, dpw, dpb) = (pa_xrot.buf.as_ptr(), dp_w.buf.as_ptr(), dp_b.buf.as_ptr());
+        let (rst, rnw) = (rstate.buf.as_ptr(), rnorm_w.buf.as_ptr());
+        let (f1w, f1b, f2w, f2b, ow) = (
+            fc1_w.buf.as_ptr(),
+            fc1_b.buf.as_ptr(),
+            fc2_w.buf.as_ptr(),
+            fc2_b.buf.as_ptr(),
+            out_w.buf.as_ptr(),
+        );
+        let (bb, si, sg) = (
+            bbias.buf.as_ptr(),
+            sel_idx.buf.as_ptr(),
+            sel_gate.buf.as_ptr(),
+        );
+        let (hi, rhi, nri) = (h as i32, rh as i32, n_route as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &pxr as *const _ as *mut c_void,
+            &dpw as *const _ as *mut c_void,
+            &dpb as *const _ as *mut c_void,
+            &rst as *const _ as *mut c_void,
+            &esc as *const _ as *mut c_void,
+            &rnw as *const _ as *mut c_void,
+            &f1w as *const _ as *mut c_void,
+            &f1b as *const _ as *mut c_void,
+            &f2w as *const _ as *mut c_void,
+            &f2b as *const _ as *mut c_void,
+            &ow as *const _ as *mut c_void,
+            &bb as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &si as *const _ as *mut c_void,
+            &sg as *const _ as *mut c_void,
+            &hi as *const _ as *mut c_void,
+            &rhi as *const _ as *mut c_void,
+            &nri as *const _ as *mut c_void,
+            &eps as *const _ as *mut c_void,
+            &has_eda as *const _ as *mut c_void,
+        ];
+        let f = &self.functions["zaya_router_mlp_fused"];
+        unsafe {
+            self.hip
+                .launch_kernel(f, [1, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut p)
+        }
+    }
+
+    /// Fused pre-conv prep (single workgroup): qk_residual (both modes) + qk-stream
+    /// column in one launch. Replaces 2× qk_residual + qk_stream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zaya_qk_prep_decode_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        query_res: &GpuTensor,
+        key_res: &GpuTensor,
+        cur_qk: &GpuTensor,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        q_dim: usize,
+        k_dim: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_qk_prep_decode_f32")?;
+        let (qp, kp, qrp, krp, cp) = (
+            q.buf.as_ptr(),
+            k.buf.as_ptr(),
+            query_res.buf.as_ptr(),
+            key_res.buf.as_ptr(),
+            cur_qk.buf.as_ptr(),
+        );
+        let (nqi, nkvi, hdi, qdi, kdi) =
+            (nq as i32, nkv as i32, hd as i32, q_dim as i32, k_dim as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &qrp as *const _ as *mut c_void,
+            &krp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &nqi as *const _ as *mut c_void,
+            &nkvi as *const _ as *mut c_void,
+            &hdi as *const _ as *mut c_void,
+            &qdi as *const _ as *mut c_void,
+            &kdi as *const _ as *mut c_void,
+        ];
+        // Single workgroup (needs __syncthreads between query_res and key_res).
+        let f = &self.functions["zaya_qk_prep_decode_f32"];
+        unsafe {
+            self.hip
+                .launch_kernel(f, [1, 1, 1], [BLOCK, 1, 1], 0, self.stream_ref(), &mut p)
+        }
+    }
+
+    /// Fused broadcast bias-add + exact GELU in place: `x[i] = gelu(x[i]+bias[i%d])`.
+    pub fn zaya_bias_gelu_f32(
+        &mut self,
+        x: &GpuTensor,
+        bias: &GpuTensor,
+        d: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_bias_gelu_f32")?;
+        let (xp, bp) = (x.buf.as_ptr(), bias.buf.as_ptr());
+        let (di, ni) = (d as i32, n as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &di as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_bias_gelu_f32", n, &mut p)
+    }
+
+    /// Fused partial-RoPE over query `[s,nq,hd]` AND key `[s,nkv,hd]` in one launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zaya_rope_partial_qk_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        s: usize,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        n_rot: usize,
+        theta: f32,
+        pos_base: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_rope_partial_qk_f32")?;
+        let (qp, kp) = (q.buf.as_ptr(), k.buf.as_ptr());
+        let (si, nqi, nkvi, hdi, nr, pb) = (
+            s as i32,
+            nq as i32,
+            nkv as i32,
+            hd as i32,
+            n_rot as i32,
+            pos_base as i32,
+        );
+        let mut p: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &si as *const _ as *mut c_void,
+            &nqi as *const _ as *mut c_void,
+            &nkvi as *const _ as *mut c_void,
+            &hdi as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+            &theta as *const _ as *mut c_void,
+            &pb as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_rope_partial_qk_f32", s * (nq + nkv), &mut p)
+    }
+
+    /// Device-position variant of [`zaya_rope_partial_qk_f32`]: base position is
+    /// read from `pos_buf[0]` (device i32), so the launch is capture-safe.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zaya_rope_partial_qk_posbuf_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &hip_bridge::DeviceBuffer,
+        s: usize,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        n_rot: usize,
+        theta: f32,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_rope_partial_qk_posbuf_f32")?;
+        let (qp, kp, pp) = (q.buf.as_ptr(), k.buf.as_ptr(), pos_buf.as_ptr());
+        let (si, nqi, nkvi, hdi, nr) = (s as i32, nq as i32, nkv as i32, hd as i32, n_rot as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &si as *const _ as *mut c_void,
+            &nqi as *const _ as *mut c_void,
+            &nkvi as *const _ as *mut c_void,
+            &hdi as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+            &theta as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_rope_partial_qk_posbuf_f32", s * (nq + nkv), &mut p)
+    }
+
+    /// Fused L2-norm+scale over query (no temp) AND key (per-head `temp`) in one launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zaya_qk_l2norm_qk_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        temp: &GpuTensor,
+        s: usize,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_qk_l2norm_qk_f32")?;
+        let (qp, kp, tp) = (q.buf.as_ptr(), k.buf.as_ptr(), temp.buf.as_ptr());
+        let (si, nqi, nkvi, hdi) = (s as i32, nq as i32, nkv as i32, hd as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &si as *const _ as *mut c_void,
+            &nqi as *const _ as *mut c_void,
+            &nkvi as *const _ as *mut c_void,
+            &hdi as *const _ as *mut c_void,
+            &scale as *const _ as *mut c_void,
+            &eps as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_qk_l2norm_qk_f32", s * (nq + nkv), &mut p)
+    }
+
+    /// Fused add-conv-residual over query AND key in one launch (both modes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn zaya_add_conv_residual_qk_f32(
+        &mut self,
+        query: &GpuTensor,
+        key: &GpuTensor,
+        conv: &GpuTensor,
+        qres: &GpuTensor,
+        kres: &GpuTensor,
+        s: usize,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        q_dim: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_add_conv_residual_qk_f32")?;
+        let (qp, kp, cp) = (query.buf.as_ptr(), key.buf.as_ptr(), conv.buf.as_ptr());
+        let (qrp, krp) = (qres.buf.as_ptr(), kres.buf.as_ptr());
+        let (si, nqi, nkvi, hdi, qdi) = (s as i32, nq as i32, nkv as i32, hd as i32, q_dim as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &qrp as *const _ as *mut c_void,
+            &krp as *const _ as *mut c_void,
+            &si as *const _ as *mut c_void,
+            &nqi as *const _ as *mut c_void,
+            &nkvi as *const _ as *mut c_void,
+            &hdi as *const _ as *mut c_void,
+            &qdi as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_add_conv_residual_qk_f32", s * (nq + nkv) * hd, &mut p)
+    }
+
+    /// Fused router-input prep: `rhid += bias`; if `scale` is `Some`, `rhid +=
+    /// prev*scale` (EDA); then `prev := rhid`. Replaces bias_add + eda_add + copy.
+    pub fn zaya_router_prep_f32(
+        &mut self,
+        rhid: &GpuTensor,
+        bias: &GpuTensor,
+        prev: &GpuTensor,
+        scale: Option<&GpuTensor>,
+        rh: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_router_prep_f32")?;
+        let (rp, bp, pp) = (rhid.buf.as_ptr(), bias.buf.as_ptr(), prev.buf.as_ptr());
+        // Dummy pointer (bias) when no EDA; `has_eda` gates the read.
+        let sp = scale.map_or(bp, |s| s.buf.as_ptr());
+        let has_eda: i32 = scale.is_some() as i32;
+        let (rhi, ni) = (rh as i32, n as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &rp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &rhi as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+            &has_eda as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_router_prep_f32", n, &mut p)
+    }
+
+    /// Fused single-token value assembly + delayed-value advance (decode).
+    pub fn zaya_value_assemble_decode_f32(
+        &mut self,
+        value: &GpuTensor,
+        v_cur: &GpuTensor,
+        delayed_v: &GpuTensor,
+        v_del: &GpuTensor,
+        vh: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_value_assemble_decode_f32")?;
+        let (vp, cp, dp, xp) = (
+            value.buf.as_ptr(),
+            v_cur.buf.as_ptr(),
+            delayed_v.buf.as_ptr(),
+            v_del.buf.as_ptr(),
+        );
+        let vhi = vh as i32;
+        let mut p: Vec<*mut c_void> = vec![
+            &vp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &vhi as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_value_assemble_decode_f32", vh, &mut p)
+    }
+
     /// Strided row copy: `dst[r*dst_stride + j] = src[r*src_stride + src_off + j]`.
     #[allow(clippy::too_many_arguments)]
     pub fn zaya_strided_copy_f32(
@@ -557,5 +892,667 @@ impl Gpu {
             &ni as *const _ as *mut c_void,
         ];
         self.zaya_launch("zaya_eda_add_f32", n, &mut p)
+    }
+
+    /// On-device top-1 router select: softmax over `n_route` logits, argmax over
+    /// (prob + balancing bias), writing the winning expert id to `sel_idx` (i32)
+    /// and its unbiased softmax gate to `sel_gate` (0 for the null slot). Removes
+    /// the per-block `download_f32` host readback from `gpu_decode`. Single-CTA.
+    pub fn zaya_router_select_f32(
+        &mut self,
+        logits: &GpuTensor,
+        bias: &GpuTensor,
+        sel_idx: &GpuTensor,
+        sel_gate: &GpuTensor,
+        n_route: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_router_select_f32")?;
+        let (lp, bp, sip, sgp) = (
+            logits.buf.as_ptr(),
+            bias.buf.as_ptr(),
+            sel_idx.buf.as_ptr(),
+            sel_gate.buf.as_ptr(),
+        );
+        let nr = n_route as i32;
+        let mut p: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sip as *const _ as *mut c_void,
+            &sgp as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        // threads=1 → grid 1, block 256, only tid 0 executes (n_route is tiny).
+        self.zaya_launch("zaya_router_select_f32", 1, &mut p)
+    }
+
+    /// Launch a per-output-row wave32 kernel: grid = `rows`, block = 32 lanes.
+    fn zaya_launch_rows(
+        &self,
+        func: &str,
+        rows: usize,
+        params: &mut Vec<*mut c_void>,
+    ) -> HipResult<()> {
+        let f = &self.functions[func];
+        unsafe {
+            self.hip.launch_kernel(
+                f,
+                [rows as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                params,
+            )
+        }
+    }
+
+    /// Indexed OQ8 top-1 fused gate_up GEMV over zaya's planar `oq8_combined`
+    /// expert buffers. `y_gate`/`y_up` are `[M/2]` each; `M = 2*moe_int`, `K = hidden`.
+    pub fn zaya_moe_gate_up_oq8_planar_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        sel_idx: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_moe_gate_up_oq8_planar_indexed")?;
+        let (pp, sip, xp, ygp, yup) = (
+            expert_ptrs.buf.as_ptr(),
+            sel_idx.buf.as_ptr(),
+            x.buf.as_ptr(),
+            y_gate.buf.as_ptr(),
+            y_up.buf.as_ptr(),
+        );
+        let (mi, ki) = (m as i32, k as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &sip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &mi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+        ];
+        // LDS activation-staged variant (HIPFIRE_ZAYA_MOE_LDS): a block of 8 waves stages
+        // x[K] in LDS once, removing the re-read activation loads from the memory unit so
+        // the latency-bound weight fetches get its full request budget. See zaya_cca.hip.
+        if std::env::var("HIPFIRE_ZAYA_MOE_LDS").is_ok() {
+            self.zaya_ensure("zaya_moe_gate_up_oq8_planar_indexed_lds")?;
+            let grid = m.div_ceil(8) as u32;
+            let lds = (k * 4) as u32;
+            let f = &self.functions["zaya_moe_gate_up_oq8_planar_indexed_lds"];
+            return unsafe {
+                self.hip
+                    .launch_kernel(f, [grid, 1, 1], [256, 1, 1], lds, self.stream_ref(), &mut p)
+            };
+        }
+        // Multi-row register-blocked variant (HIPFIRE_ZAYA_MOE_MROW): 4 rows/wave
+        // for ~4× memory-level parallelism (the one-row kernel is latency-bound).
+        if std::env::var("HIPFIRE_ZAYA_MOE_MROW").is_ok() {
+            self.zaya_ensure("zaya_moe_gate_up_oq8_planar_indexed_mrow")?;
+            let grid = m.div_ceil(4) as u32;
+            let f = &self.functions["zaya_moe_gate_up_oq8_planar_indexed_mrow"];
+            return unsafe {
+                self.hip
+                    .launch_kernel(f, [grid, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut p)
+            };
+        }
+        self.zaya_launch_rows("zaya_moe_gate_up_oq8_planar_indexed", m, &mut p)
+    }
+
+    /// Indexed OQ8 top-1 down GEMV over zaya's planar expert buffers. `y` is
+    /// `[M = hidden]`, `K = moe_int`.
+    pub fn zaya_moe_down_oq8_planar_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        sel_idx: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_moe_down_oq8_planar_indexed")?;
+        let (pp, sip, xp, yp) = (
+            expert_ptrs.buf.as_ptr(),
+            sel_idx.buf.as_ptr(),
+            x.buf.as_ptr(),
+            y.buf.as_ptr(),
+        );
+        let (mi, ki) = (m as i32, k as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &sip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+        ];
+        if std::env::var("HIPFIRE_ZAYA_MOE_LDS").is_ok() {
+            self.zaya_ensure("zaya_moe_down_oq8_planar_indexed_lds")?;
+            let grid = m.div_ceil(8) as u32;
+            let lds = (k * 4) as u32;
+            let f = &self.functions["zaya_moe_down_oq8_planar_indexed_lds"];
+            return unsafe {
+                self.hip
+                    .launch_kernel(f, [grid, 1, 1], [256, 1, 1], lds, self.stream_ref(), &mut p)
+            };
+        }
+        if std::env::var("HIPFIRE_ZAYA_MOE_MROW").is_ok() {
+            self.zaya_ensure("zaya_moe_down_oq8_planar_indexed_mrow")?;
+            let grid = m.div_ceil(4) as u32;
+            let f = &self.functions["zaya_moe_down_oq8_planar_indexed_mrow"];
+            return unsafe {
+                self.hip
+                    .launch_kernel(f, [grid, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut p)
+            };
+        }
+        self.zaya_launch_rows("zaya_moe_down_oq8_planar_indexed", m, &mut p)
+    }
+
+    /// W8A8 int8-activation indexed gate_up: reads an int8-quantized activation `xq`
+    /// (+ per-256-group scales `xs`) instead of f32 — 4× less activation load traffic,
+    /// signed V_DOT4 int8 dot. See zaya_cca.hip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zaya_moe_gate_up_oq8_planar_indexed_w8a8(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        sel_idx: &GpuTensor,
+        xq: &GpuTensor,
+        xs: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_moe_gate_up_oq8_planar_indexed_w8a8")?;
+        let (pp, sip, xqp, xsp, ygp, yup) = (
+            expert_ptrs.buf.as_ptr(),
+            sel_idx.buf.as_ptr(),
+            xq.buf.as_ptr(),
+            xs.buf.as_ptr(),
+            y_gate.buf.as_ptr(),
+            y_up.buf.as_ptr(),
+        );
+        let (mi, ki) = (m as i32, k as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &sip as *const _ as *mut c_void,
+            &xqp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &mi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+        ];
+        self.zaya_launch_rows("zaya_moe_gate_up_oq8_planar_indexed_w8a8", m, &mut p)
+    }
+
+    /// W8A8 int8-activation indexed down projection (see the gate_up variant).
+    #[allow(clippy::too_many_arguments)]
+    pub fn zaya_moe_down_oq8_planar_indexed_w8a8(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        sel_idx: &GpuTensor,
+        xq: &GpuTensor,
+        xs: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_moe_down_oq8_planar_indexed_w8a8")?;
+        let (pp, sip, xqp, xsp, yp) = (
+            expert_ptrs.buf.as_ptr(),
+            sel_idx.buf.as_ptr(),
+            xq.buf.as_ptr(),
+            xs.buf.as_ptr(),
+            y.buf.as_ptr(),
+        );
+        let (mi, ki) = (m as i32, k as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &sip as *const _ as *mut c_void,
+            &xqp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+        ];
+        self.zaya_launch_rows("zaya_moe_down_oq8_planar_indexed_w8a8", m, &mut p)
+    }
+
+    /// Micro-benchmark the cost of one `grid.sync()` cooperative barrier at the
+    /// megakernel launch shape (`grid_blocks` × 256). Returns µs/sync. Diagnostic
+    /// for whether grid.sync overhead dominates the megakernel (EXP-19).
+    pub fn zaya_bench_grid_sync(&mut self, grid_blocks: u32, n_syncs: i32) -> HipResult<f64> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "zaya_megakernel",
+            kernels::ZAYA_MEGAKERNEL_SRC,
+            "zaya_grid_sync_bench",
+        )?;
+        let scratch = self.hip.malloc(4)?;
+        let sp = scratch.as_ptr();
+        let ns = n_syncs;
+        let launch = |g: &Self| -> HipResult<()> {
+            let mut p: Vec<*mut c_void> = vec![
+                &sp as *const _ as *mut c_void,
+                &ns as *const _ as *mut c_void,
+            ];
+            let f = &g.functions["zaya_grid_sync_bench"];
+            unsafe {
+                g.hip.launch_cooperative_kernel(
+                    f,
+                    [grid_blocks, 1, 1],
+                    [256, 1, 1],
+                    0,
+                    g.stream_ref(),
+                    &mut p,
+                )
+            }
+        };
+        // Warmup, then time `iters` launches.
+        launch(self)?;
+        self.hip.device_synchronize()?;
+        let iters = 5;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            launch(self)?;
+        }
+        self.hip.device_synchronize()?;
+        let us = t.elapsed().as_micros() as f64;
+        let _ = self.hip.free(scratch);
+        Ok(us / (iters as f64 * n_syncs as f64))
+    }
+
+    /// ZAYA decode cooperative megakernel — Phase 0 (megakernel-B). Fuses the
+    /// MLP half of one decode block (post-attn rmsnorm+rotate → router MLP+select
+    /// → MoE gate_up → silu_mul+rotate → MoE down + affine residual) into ONE
+    /// cooperative launch, grid-strided over the device's resident workgroups
+    /// with `grid.sync()` between phases. Faithful fusion of the reference op
+    /// chain; env-gated (`HIPFIRE_ZAYA_MEGAKERNEL`) and diffed against it.
+    ///
+    /// `pm_rs` is the 4-element affine-residual scale set `[hs, hb, rs, rb]`.
+    /// `escale` is the EDA cross-layer scale (`None` on layer 0 → `has_eda=0`).
+    /// `mk_norm` is `[h]` scratch (rmsnormed pre-FWHT); `pa_xrot` `[h]`,
+    /// `gate_up` `[2*moe_int]`, `xr_act` `[moe_int]` are the shared scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zaya_decode_megakernel_b(
+        &mut self,
+        g_res2: &GpuTensor,
+        hidden: &GpuTensor,
+        // Phase 2 (fold_oproj): o_proj + attn affine folded into B's head. When
+        // fold_oproj is false these are unused (pass any valid tensors).
+        ctx: &GpuTensor,
+        o_proj_w: &GpuTensor,
+        ctx_rot: &GpuTensor,
+        pa_rs: &[GpuTensor; 4],
+        q_dim: usize,
+        fold_oproj: bool,
+        // Phase 3 (fold_attn): stage 9 KV write + flash attention folded into B.
+        query: &GpuTensor,
+        key: &GpuTensor,
+        value: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        pos_buf: &hip_bridge::DeviceBuffer,
+        nkv: usize,
+        head_dim: usize,
+        max_seq: usize,
+        attn_scale: f32,
+        fold_attn: bool,
+        post_attn_ln: &GpuTensor,
+        pa_xrot: &GpuTensor,
+        mk_norm: &GpuTensor,
+        dp_w: &GpuTensor,
+        dp_b: &GpuTensor,
+        rstate: &GpuTensor,
+        escale: Option<&GpuTensor>,
+        rnorm_w: &GpuTensor,
+        fc1_w: &GpuTensor,
+        fc1_b: &GpuTensor,
+        fc2_w: &GpuTensor,
+        fc2_b: &GpuTensor,
+        out_w: &GpuTensor,
+        bbias: &GpuTensor,
+        sel_idx: &GpuTensor,
+        sel_gate: &GpuTensor,
+        gate_up_ptrs: &GpuTensor,
+        down_ptrs: &GpuTensor,
+        gate_up: &GpuTensor,
+        xr_act: &GpuTensor,
+        pm_rs: &[GpuTensor; 4],
+        h: usize,
+        rh: usize,
+        n_route: usize,
+        moe_int: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "zaya_megakernel",
+            kernels::ZAYA_MEGAKERNEL_SRC,
+            "zaya_decode_megakernel_b",
+        )?;
+        self.ensure_mq_signs()?;
+        // Size the cooperative grid once to the device residency limit
+        // (occupancy/MP × MP count). A cooperative launch that exceeds it fails
+        // loudly with hipErrorCooperativeLaunchTooLarge.
+        let grid_blocks = match self.zaya_megakernel_grid {
+            Some(g) => g,
+            None => {
+                let f = &self.functions["zaya_decode_megakernel_b"];
+                let per_mp = self.hip.occupancy_max_active_blocks_per_mp(f, 256, 0)?;
+                let mp = self.hip.multiprocessor_count(self.device_id)?;
+                let g = (per_mp.max(1) as u32) * (mp.max(1) as u32);
+                self.zaya_megakernel_grid = Some(g);
+                g
+            }
+        };
+
+        let s1 = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let has_eda: i32 = escale.is_some() as i32;
+        let esc = escale.map_or(dp_b.buf.as_ptr(), |e| e.buf.as_ptr());
+        let (gr, hd) = (g_res2.buf.as_ptr(), hidden.buf.as_ptr());
+        let (ctxp, opw, ctxr) = (
+            ctx.buf.as_ptr(),
+            o_proj_w.buf.as_ptr(),
+            ctx_rot.buf.as_ptr(),
+        );
+        let (pahs, pahb, pars2, parb) = (
+            pa_rs[0].buf.as_ptr(),
+            pa_rs[1].buf.as_ptr(),
+            pa_rs[2].buf.as_ptr(),
+            pa_rs[3].buf.as_ptr(),
+        );
+        let qdi = q_dim as i32;
+        let foldi = fold_oproj as i32;
+        let (qy, ky, vy) = (query.buf.as_ptr(), key.buf.as_ptr(), value.buf.as_ptr());
+        let (kc, vc, posp) = (k_cache.buf.as_ptr(), v_cache.buf.as_ptr(), pos_buf.as_ptr());
+        let (nkvi, hdi, msi) = (nkv as i32, head_dim as i32, max_seq as i32);
+        let ascale = attn_scale;
+        let fai = fold_attn as i32;
+        let pal = post_attn_ln.buf.as_ptr();
+        let (pxr, mkn) = (pa_xrot.buf.as_ptr(), mk_norm.buf.as_ptr());
+        let (dpw, dpb, rst, rnw) = (
+            dp_w.buf.as_ptr(),
+            dp_b.buf.as_ptr(),
+            rstate.buf.as_ptr(),
+            rnorm_w.buf.as_ptr(),
+        );
+        let (f1w, f1b, f2w, f2b, ow) = (
+            fc1_w.buf.as_ptr(),
+            fc1_b.buf.as_ptr(),
+            fc2_w.buf.as_ptr(),
+            fc2_b.buf.as_ptr(),
+            out_w.buf.as_ptr(),
+        );
+        let (bb, si, sg) = (
+            bbias.buf.as_ptr(),
+            sel_idx.buf.as_ptr(),
+            sel_gate.buf.as_ptr(),
+        );
+        let (gup_p, dwn_p, gup, xra) = (
+            gate_up_ptrs.buf.as_ptr(),
+            down_ptrs.buf.as_ptr(),
+            gate_up.buf.as_ptr(),
+            xr_act.buf.as_ptr(),
+        );
+        let (phs, phb, prs, prb) = (
+            pm_rs[0].buf.as_ptr(),
+            pm_rs[1].buf.as_ptr(),
+            pm_rs[2].buf.as_ptr(),
+            pm_rs[3].buf.as_ptr(),
+        );
+        let (hi, rhi, nri, mii) = (h as i32, rh as i32, n_route as i32, moe_int as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &gr as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ctxp as *const _ as *mut c_void,
+            &opw as *const _ as *mut c_void,
+            &ctxr as *const _ as *mut c_void,
+            &pahs as *const _ as *mut c_void,
+            &pahb as *const _ as *mut c_void,
+            &pars2 as *const _ as *mut c_void,
+            &parb as *const _ as *mut c_void,
+            &qdi as *const _ as *mut c_void,
+            &foldi as *const _ as *mut c_void,
+            &qy as *const _ as *mut c_void,
+            &ky as *const _ as *mut c_void,
+            &vy as *const _ as *mut c_void,
+            &kc as *const _ as *mut c_void,
+            &vc as *const _ as *mut c_void,
+            &posp as *const _ as *mut c_void,
+            &nkvi as *const _ as *mut c_void,
+            &hdi as *const _ as *mut c_void,
+            &msi as *const _ as *mut c_void,
+            &ascale as *const _ as *mut c_void,
+            &fai as *const _ as *mut c_void,
+            &pal as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &pxr as *const _ as *mut c_void,
+            &mkn as *const _ as *mut c_void,
+            &dpw as *const _ as *mut c_void,
+            &dpb as *const _ as *mut c_void,
+            &rst as *const _ as *mut c_void,
+            &esc as *const _ as *mut c_void,
+            &rnw as *const _ as *mut c_void,
+            &f1w as *const _ as *mut c_void,
+            &f1b as *const _ as *mut c_void,
+            &f2w as *const _ as *mut c_void,
+            &f2b as *const _ as *mut c_void,
+            &ow as *const _ as *mut c_void,
+            &bb as *const _ as *mut c_void,
+            &si as *const _ as *mut c_void,
+            &sg as *const _ as *mut c_void,
+            &gup_p as *const _ as *mut c_void,
+            &dwn_p as *const _ as *mut c_void,
+            &gup as *const _ as *mut c_void,
+            &xra as *const _ as *mut c_void,
+            &phs as *const _ as *mut c_void,
+            &phb as *const _ as *mut c_void,
+            &prs as *const _ as *mut c_void,
+            &prb as *const _ as *mut c_void,
+            &hi as *const _ as *mut c_void,
+            &rhi as *const _ as *mut c_void,
+            &nri as *const _ as *mut c_void,
+            &mii as *const _ as *mut c_void,
+            &eps as *const _ as *mut c_void,
+            &has_eda as *const _ as *mut c_void,
+        ];
+        let f = &self.functions["zaya_decode_megakernel_b"];
+        unsafe {
+            self.hip.launch_cooperative_kernel(
+                f,
+                [grid_blocks, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut p,
+            )
+        }
+    }
+
+    /// ZAYA decode cooperative megakernel — Phase 1 (megakernel-A, the front
+    /// half). Fuses stages 1–8 (input rmsnorm+rotate → fused qkv Oq8 gemv →
+    /// qk-prep → conv window+ring → depthwise/grouped conv1d → add-conv-residual
+    /// + value assemble → q/k L2-norm+scale → partial RoPE) into ONE cooperative
+    /// launch. `w_*` are the four planar Oq8 in-projection weight buffers (K=h).
+    /// Attention + o_proj stay separate launches after this. Env-gated + diffed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zaya_decode_megakernel_a(
+        &mut self,
+        hidden: &GpuTensor,
+        input_ln: &GpuTensor,
+        qkv_xrot: &GpuTensor,
+        w_q: &GpuTensor,
+        w_k: &GpuTensor,
+        w_vc: &GpuTensor,
+        w_vd: &GpuTensor,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        vcur: &GpuTensor,
+        vdel: &GpuTensor,
+        qres: &GpuTensor,
+        kres: &GpuTensor,
+        cur_qk: &GpuTensor,
+        conv_dw_w: &GpuTensor,
+        conv_dw_b: &GpuTensor,
+        conv_gr_w: &GpuTensor,
+        conv_gr_b: &GpuTensor,
+        conv_ring: &GpuTensor,
+        window: &GpuTensor,
+        dw: &GpuTensor,
+        gw: &GpuTensor,
+        delayed_v: &GpuTensor,
+        query: &GpuTensor,
+        key: &GpuTensor,
+        value: &GpuTensor,
+        qk_temp: &GpuTensor,
+        pos_buf: &hip_bridge::DeviceBuffer,
+        h: usize,
+        nq: usize,
+        nkv: usize,
+        hd: usize,
+        q_dim: usize,
+        k_dim: usize,
+        v_half: usize,
+        conv_ch: usize,
+        pad: usize,
+        dwk: usize,
+        grk: usize,
+        dw_len: usize,
+        n_rot: usize,
+        rope_theta: f32,
+        l2_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "zaya_megakernel",
+            kernels::ZAYA_MEGAKERNEL_SRC,
+            "zaya_decode_megakernel_a",
+        )?;
+        self.ensure_mq_signs()?;
+        let grid_blocks = match self.zaya_megakernel_a_grid {
+            Some(g) => g,
+            None => {
+                let f = &self.functions["zaya_decode_megakernel_a"];
+                let per_mp = self.hip.occupancy_max_active_blocks_per_mp(f, 256, 0)?;
+                let mp = self.hip.multiprocessor_count(self.device_id)?;
+                let g = (per_mp.max(1) as u32) * (mp.max(1) as u32);
+                self.zaya_megakernel_a_grid = Some(g);
+                g
+            }
+        };
+        let s1 = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let hidp = hidden.buf.as_ptr();
+        let iln = input_ln.buf.as_ptr();
+        let xrot = qkv_xrot.buf.as_ptr();
+        let (wq, wk, wvc, wvd) = (
+            w_q.buf.as_ptr(),
+            w_k.buf.as_ptr(),
+            w_vc.buf.as_ptr(),
+            w_vd.buf.as_ptr(),
+        );
+        let (qp, kp, vcp, vdp) = (
+            q.buf.as_ptr(),
+            k.buf.as_ptr(),
+            vcur.buf.as_ptr(),
+            vdel.buf.as_ptr(),
+        );
+        let (qrp, krp, cqk) = (qres.buf.as_ptr(), kres.buf.as_ptr(), cur_qk.buf.as_ptr());
+        let (cdw, cdb, cgw, cgb) = (
+            conv_dw_w.buf.as_ptr(),
+            conv_dw_b.buf.as_ptr(),
+            conv_gr_w.buf.as_ptr(),
+            conv_gr_b.buf.as_ptr(),
+        );
+        let (ring, win, dwp, gwp) = (
+            conv_ring.buf.as_ptr(),
+            window.buf.as_ptr(),
+            dw.buf.as_ptr(),
+            gw.buf.as_ptr(),
+        );
+        let (delv, qy, ky, vy) = (
+            delayed_v.buf.as_ptr(),
+            query.buf.as_ptr(),
+            key.buf.as_ptr(),
+            value.buf.as_ptr(),
+        );
+        let (qkt, posp) = (qk_temp.buf.as_ptr(), pos_buf.as_ptr());
+        let (hi, nqi, nkvi, hdi) = (h as i32, nq as i32, nkv as i32, hd as i32);
+        let (qdi, kdi, vhi) = (q_dim as i32, k_dim as i32, v_half as i32);
+        let (cci, padi, dwki, grki, dwli, nri) = (
+            conv_ch as i32,
+            pad as i32,
+            dwk as i32,
+            grk as i32,
+            dw_len as i32,
+            n_rot as i32,
+        );
+        let mut p: Vec<*mut c_void> = vec![
+            &hidp as *const _ as *mut c_void,
+            &iln as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &xrot as *const _ as *mut c_void,
+            &wq as *const _ as *mut c_void,
+            &wk as *const _ as *mut c_void,
+            &wvc as *const _ as *mut c_void,
+            &wvd as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vcp as *const _ as *mut c_void,
+            &vdp as *const _ as *mut c_void,
+            &qrp as *const _ as *mut c_void,
+            &krp as *const _ as *mut c_void,
+            &cqk as *const _ as *mut c_void,
+            &cdw as *const _ as *mut c_void,
+            &cdb as *const _ as *mut c_void,
+            &cgw as *const _ as *mut c_void,
+            &cgb as *const _ as *mut c_void,
+            &ring as *const _ as *mut c_void,
+            &win as *const _ as *mut c_void,
+            &dwp as *const _ as *mut c_void,
+            &gwp as *const _ as *mut c_void,
+            &delv as *const _ as *mut c_void,
+            &qy as *const _ as *mut c_void,
+            &ky as *const _ as *mut c_void,
+            &vy as *const _ as *mut c_void,
+            &qkt as *const _ as *mut c_void,
+            &posp as *const _ as *mut c_void,
+            &hi as *const _ as *mut c_void,
+            &nqi as *const _ as *mut c_void,
+            &nkvi as *const _ as *mut c_void,
+            &hdi as *const _ as *mut c_void,
+            &qdi as *const _ as *mut c_void,
+            &kdi as *const _ as *mut c_void,
+            &vhi as *const _ as *mut c_void,
+            &cci as *const _ as *mut c_void,
+            &padi as *const _ as *mut c_void,
+            &dwki as *const _ as *mut c_void,
+            &grki as *const _ as *mut c_void,
+            &dwli as *const _ as *mut c_void,
+            &nri as *const _ as *mut c_void,
+            &rope_theta as *const _ as *mut c_void,
+            &l2_scale as *const _ as *mut c_void,
+            &eps as *const _ as *mut c_void,
+        ];
+        let f = &self.functions["zaya_decode_megakernel_a"];
+        unsafe {
+            self.hip.launch_cooperative_kernel(
+                f,
+                [grid_blocks, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut p,
+            )
+        }
     }
 }

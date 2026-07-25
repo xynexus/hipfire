@@ -157,6 +157,8 @@ struct HipExternalMemoryBufferDesc {
 const HIP_SUCCESS: u32 = 0;
 /// `hipDeviceAttributeIntegrated` in HIP's cuda-compatible attribute block.
 const HIP_DEVICE_ATTRIBUTE_INTEGRATED: c_int = 16;
+/// `hipDeviceAttributeMultiprocessorCount` (number of CUs / multiprocessors).
+const HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 63;
 
 /// `hipPointerAttribute_t` per ROCm 6.4.3 layout. ROCm 5.x not supported.
 #[repr(C)]
@@ -240,6 +242,23 @@ pub struct HipRuntime {
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> u32,
+    // Cooperative launch (grid.sync-capable). No `extra` blob — kernelParams only.
+    fn_module_launch_cooperative: unsafe extern "C" fn(
+        HipFunction,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        HipStream,
+        *mut *mut c_void,
+    ) -> u32,
+    // Occupancy query for sizing a cooperative grid to the device's resident
+    // workgroup limit. (numBlocks*, func, blockSize, dynSharedMemBytes).
+    fn_occupancy_max_active_blocks:
+        unsafe extern "C" fn(*mut c_int, HipFunction, c_int, usize) -> u32,
 
     // Events
     fn_event_create: unsafe extern "C" fn(*mut HipEvent) -> u32,
@@ -496,6 +515,27 @@ impl HipRuntime {
                         *mut *mut c_void,
                         *mut *mut c_void,
                     ) -> u32
+                ),
+                fn_module_launch_cooperative: load_fn!(
+                    lib,
+                    "hipModuleLaunchCooperativeKernel",
+                    unsafe extern "C" fn(
+                        HipFunction,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        HipStream,
+                        *mut *mut c_void,
+                    ) -> u32
+                ),
+                fn_occupancy_max_active_blocks: load_fn!(
+                    lib,
+                    "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor",
+                    unsafe extern "C" fn(*mut c_int, HipFunction, c_int, usize) -> u32
                 ),
                 fn_event_create: load_fn!(
                     lib,
@@ -1236,6 +1276,60 @@ impl HipRuntime {
         self.check(code, "hipModuleLaunchKernel")
     }
 
+    /// Cooperative launch (enables `cg::this_grid().sync()` / cross-workgroup grid
+    /// sync). The grid must fit the device's resident-workgroup limit for the kernel
+    /// (gfx1151: ~160 blocks of 256 threads); size the grid accordingly and
+    /// grid-stride inside. `params` is the kernelParams array (no `extra` blob path).
+    pub unsafe fn launch_cooperative_kernel(
+        &self,
+        func: &Function,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        stream: Option<&Stream>,
+        params: &mut [*mut c_void],
+    ) -> HipResult<()> {
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let t = std::time::Instant::now();
+        let code = (self.fn_module_launch_cooperative)(
+            func.0,
+            grid[0],
+            grid[1],
+            grid[2],
+            block[0],
+            block[1],
+            block[2],
+            shared_mem,
+            stream_raw,
+            params.as_mut_ptr(),
+        );
+        crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
+        self.check(code, "hipModuleLaunchCooperativeKernel")
+    }
+
+    /// Max resident workgroups per multiprocessor for `func` at the given block
+    /// size and dynamic shared-memory bytes. Multiply by the multiprocessor
+    /// count to size a cooperative grid to the device's residency limit (a
+    /// cooperative launch that exceeds it fails with `hipErrorCooperativeLaunchTooLarge`).
+    pub fn occupancy_max_active_blocks_per_mp(
+        &self,
+        func: &Function,
+        block_size: u32,
+        dyn_shared_mem: usize,
+    ) -> HipResult<i32> {
+        let mut num_blocks: c_int = 0;
+        let code = unsafe {
+            (self.fn_occupancy_max_active_blocks)(
+                &mut num_blocks,
+                func.0,
+                block_size as c_int,
+                dyn_shared_mem,
+            )
+        };
+        self.check(code, "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor")?;
+        Ok(num_blocks as i32)
+    }
+
     /// Launch a kernel using the `extra` path, passing a contiguous kernarg
     /// byte buffer instead of the traditional `void**` pointer-per-arg array.
     ///
@@ -1533,6 +1627,13 @@ impl HipRuntime {
     /// allocation granularity matter differently than on a discrete card.
     pub fn is_integrated_device(&self, device_id: i32) -> HipResult<bool> {
         Ok(self.get_device_attribute(HIP_DEVICE_ATTRIBUTE_INTEGRATED, device_id)? != 0)
+    }
+
+    /// Number of multiprocessors (compute units) on the device. Multiply by the
+    /// per-MP occupancy of a kernel to size a cooperative grid to the residency
+    /// limit (gfx1151: 20 CUs).
+    pub fn multiprocessor_count(&self, device_id: i32) -> HipResult<i32> {
+        self.get_device_attribute(HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device_id)
     }
 
     /// Get VRAM info: (free_bytes, total_bytes).
