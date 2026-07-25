@@ -2286,6 +2286,7 @@ dependencies = [
  "hipfire-state",
  "hipfire-sysinfo",
  "image",
+ "libc",
  "reqwest",
  "rust-embed",
  "serde",

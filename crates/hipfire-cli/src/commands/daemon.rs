@@ -252,18 +252,36 @@ impl ServeStatus {
         } else {
             self.health_label().to_string()
         };
+        // Real bind + API-auth posture reported by the server (#192).
+        let reported = health.as_ref().and_then(health_bind);
         let mut fields = vec![
             ("Status", status_label),
-            ("Address", server_url(loaded)),
+            (
+                "Address",
+                reported
+                    .clone()
+                    .unwrap_or_else(|| address_label(loaded))
+                    .primary,
+            ),
             ("Process", self.process_label()),
             ("Health", health_label),
         ];
+        if let Some(reachable) = reported.as_ref().and_then(|bind| bind.reachable.clone()) {
+            fields.push(("Reachable", reachable));
+        }
         if let Some(version) = health
             .as_ref()
             .and_then(|value| value.get("version"))
             .and_then(serde_json::Value::as_str)
         {
             fields.push(("Version", version.to_string()));
+        }
+        if let Some(auth) = health
+            .as_ref()
+            .and_then(|value| value.get("api_auth"))
+            .and_then(serde_json::Value::as_str)
+        {
+            fields.push(("API auth", auth.to_string()));
         }
         if let Some(model) = health.as_ref().and_then(health_model) {
             fields.push(("Model", model.to_string()));
@@ -346,7 +364,7 @@ fn health_model(value: &serde_json::Value) -> Option<&str> {
 fn render_start_summary(pid: u32, paths: &DaemonPaths, loaded: &LoadedConfig) -> String {
     let mut fields = vec![
         ("Status", "starting".to_string()),
-        ("Address", server_url(loaded)),
+        ("Address", address_label(loaded).primary),
         ("Process", format!("{pid} (running)")),
         ("Health", "not checked".to_string()),
     ];
@@ -473,16 +491,84 @@ fn health_url(loaded: &LoadedConfig) -> String {
     format!("{}/health", server_url(loaded))
 }
 
+/// Dialable URL for probing the server. A wildcard bind has no address to
+/// connect to, so it collapses to the matching loopback.
 fn server_url(loaded: &LoadedConfig) -> String {
     let host = match loaded.config.host.as_str() {
         "" | "0.0.0.0" => "127.0.0.1",
         "::" => "::1",
         other => other,
     };
+    url_for(host, loaded.config.port)
+}
+
+/// The bind as shown to the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddressLabel {
+    /// The bind itself, wildcard kept visible.
+    primary: String,
+    /// Concrete dialable addresses, when the server enumerated them for us.
+    reachable: Option<String>,
+}
+
+/// Bind reported by a running server's `/health`. This is authoritative: it
+/// comes from the listener's own `local_addr`, so it stays correct even when
+/// the local config has since changed or the process was started with flags.
+fn health_bind(value: &serde_json::Value) -> Option<AddressLabel> {
+    let bind = value.get("bind")?.as_object()?;
+    let host = bind.get("host")?.as_str()?;
+    let port = bind.get("port")?.as_u64()? as u16;
+    let addresses = bind
+        .get("addresses")
+        .and_then(serde_json::Value::as_array)
+        .map(|addrs| {
+            addrs
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|addr| format!("http://{addr}"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let wildcard = bind
+        .get("wildcard")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Some(AddressLabel {
+        primary: if wildcard {
+            format!("{} (all interfaces)", url_for(host, port))
+        } else {
+            url_for(host, port)
+        },
+        // For an explicit bind the address list only repeats `primary`.
+        reachable: (wildcard && !addresses.is_empty()).then(|| addresses.join("  ")),
+    })
+}
+
+/// Config-derived fallback for when the server is not answering. Unlike
+/// [`server_url`] this keeps the wildcard visible: collapsing it to loopback
+/// hides that the server is reachable from the network.
+fn address_label(loaded: &LoadedConfig) -> AddressLabel {
+    let host = loaded.config.host.as_str();
+    let bind = if host.is_empty() { "0.0.0.0" } else { host };
+    let primary = match bind {
+        "0.0.0.0" | "::" => format!(
+            "{} (all interfaces, local {})",
+            url_for(bind, loaded.config.port),
+            server_url(loaded)
+        ),
+        _ => url_for(bind, loaded.config.port),
+    };
+    AddressLabel {
+        primary,
+        reachable: None,
+    }
+}
+
+fn url_for(host: &str, port: u16) -> String {
     if host.contains(':') {
-        format!("http://[{host}]:{}", loaded.config.port)
+        format!("http://[{host}]:{port}")
     } else {
-        format!("http://{host}:{}", loaded.config.port)
+        format!("http://{host}:{port}")
     }
 }
 
@@ -548,7 +634,9 @@ mod tests {
 
         assert!(output.starts_with("Hipfire server\n\n  Status"));
         assert!(output.contains("online"));
-        assert!(output.contains("http://127.0.0.1:11435"));
+        assert!(
+            output.contains("http://0.0.0.0:11435 (all interfaces, local http://127.0.0.1:11435)")
+        );
         assert!(output.contains("4242 (running)"));
         assert!(output.contains("v0.3.0-1-gdeadbeef"));
         assert!(output.contains("Qwen3.5-9B"));
@@ -587,6 +675,114 @@ mod tests {
         assert!(output.contains("4242 (running)"));
         assert!(output.contains("Qwen3.5-9B"));
         assert!(output.contains("`hipfire status`"));
+    }
+
+    #[test]
+    fn wildcard_bind_is_reported_as_a_wildcard_but_probed_on_loopback() {
+        let v4 = loaded("0.0.0.0", 11435);
+        assert_eq!(
+            address_label(&v4).primary,
+            "http://0.0.0.0:11435 (all interfaces, local http://127.0.0.1:11435)"
+        );
+        assert_eq!(server_url(&v4), "http://127.0.0.1:11435");
+
+        let v6 = loaded("::", 11435);
+        assert_eq!(
+            address_label(&v6).primary,
+            "http://[::]:11435 (all interfaces, local http://[::1]:11435)"
+        );
+    }
+
+    #[test]
+    fn explicit_bind_is_reported_verbatim() {
+        assert_eq!(
+            address_label(&loaded("172.16.16.21", 11435)).primary,
+            "http://172.16.16.21:11435"
+        );
+        assert_eq!(
+            address_label(&loaded("127.0.0.1", 11435)).primary,
+            "http://127.0.0.1:11435"
+        );
+    }
+
+    #[test]
+    fn health_reported_bind_wins_over_local_config() {
+        // The running process bound loopback; the local config has since been
+        // edited to 0.0.0.0. Reporting the config here is exactly the lie this
+        // field exists to avoid.
+        let status = ServeStatus {
+            pid: Some(4242),
+            pid_alive: true,
+            health_ok: true,
+            health_text: Some(
+                json!({
+                    "status": "ok",
+                    "api_auth": "optional",
+                    "bind": {
+                        "addr": "127.0.0.1:11435",
+                        "host": "127.0.0.1",
+                        "port": 11435,
+                        "wildcard": false,
+                        "addresses": ["127.0.0.1:11435"],
+                    }
+                })
+                .to_string(),
+            ),
+        };
+        let output = status.render("Hipfire server", &paths(), &loaded("0.0.0.0", 11435));
+
+        assert!(output.contains("http://127.0.0.1:11435"));
+        assert!(!output.contains("0.0.0.0"));
+        // An explicit bind adds nothing beyond the address itself.
+        assert!(!output.contains("Reachable"));
+        assert!(output.contains("optional"));
+    }
+
+    #[test]
+    fn health_reported_wildcard_lists_reachable_addresses() {
+        let status = ServeStatus {
+            pid: Some(4242),
+            pid_alive: true,
+            health_ok: true,
+            health_text: Some(
+                json!({
+                    "status": "ok",
+                    "api_auth": "required",
+                    "bind": {
+                        "addr": "0.0.0.0:11435",
+                        "host": "0.0.0.0",
+                        "port": 11435,
+                        "wildcard": true,
+                        "addresses": ["172.16.16.21:11435", "127.0.0.1:11435"],
+                    }
+                })
+                .to_string(),
+            ),
+        };
+        let output = status.render("Hipfire server", &paths(), &loaded("0.0.0.0", 11435));
+
+        assert!(output.contains("http://0.0.0.0:11435 (all interfaces)"));
+        assert!(output.contains("Reachable"));
+        assert!(output.contains("http://172.16.16.21:11435"));
+        assert!(output.contains("http://127.0.0.1:11435"));
+        assert!(output.contains("required"));
+    }
+
+    #[test]
+    fn status_falls_back_to_config_when_health_omits_the_bind() {
+        // Older server, or one that never reached the listener: no `bind` key.
+        let status = ServeStatus {
+            pid: Some(4242),
+            pid_alive: true,
+            health_ok: true,
+            health_text: Some(json!({"status": "ok"}).to_string()),
+        };
+        let output = status.render("Hipfire server", &paths(), &loaded("0.0.0.0", 11435));
+
+        assert!(
+            output.contains("http://0.0.0.0:11435 (all interfaces, local http://127.0.0.1:11435)")
+        );
+        assert!(!output.contains("Reachable"));
     }
 
     #[test]
