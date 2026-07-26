@@ -433,7 +433,10 @@ def _print_command(label: str, command: list[str]) -> None:
 def scope_gpu_commands(hipfire: str, collect_cmd: list[str], quant_cmd: list[str]) -> tuple[list[str], list[str]]:
     # `hipfire-coexistence calibrate` owns a native FlockGuard. Wrapping it in
     # another process-level lock would deadlock against its own child. The
-    # quantizer has no internal guard, so the workflow owns that lock exactly once.
+    # quantizer takes no lock of its own (AGENTS.md: non-daemon GPU binaries do
+    # not self-lock), so the workflow owns that lock exactly once. Keep it that
+    # way: a self-lock in the quantizer would block forever here, because
+    # FlockGuard's fd is O_CLOEXEC and the child cannot inherit our hold.
     return collect_cmd, [hipfire, "lock", "run", "two-pass-quantization", "--", *quant_cmd]
 
 

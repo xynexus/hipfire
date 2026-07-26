@@ -4346,39 +4346,14 @@ fn gpu_encode_symbols(
     Ok(symbols)
 }
 
-/// Acquire the shared GPU flock so the quantizer cooperates with the daemon and
-/// other GPU tools while it runs the trellis encoder — AGENTS.md's one lock
-/// primitive (`hipfire-lock`), acquired automatically rather than by an external
-/// `hipfire lock`. Blocks (with a poll message) until the GPU is free; the guard
-/// is held for the duration of the GPU work via RAII. Returns None only if the
-/// lock file can't be opened, in which case we proceed lock-less rather than fail.
-#[cfg(feature = "gpu")]
-fn acquire_gpu_lock() -> Option<hipfire_lock::FlockGuard> {
-    let path = hipfire_lock::gpu_resource_lock_path();
-    let mut guard = match hipfire_lock::FlockGuard::open(&path) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!(
-                "  qtip: could not open GPU lock {}: {e}; proceeding without it",
-                path.display()
-            );
-            return None;
-        }
-    };
-    let mut waited = 0u64;
-    let acquired = guard
-        .lock_blocking(std::time::Duration::from_secs(2), None, |holder| {
-            waited += 2;
-            let who = if holder.is_empty() { "unknown" } else { holder };
-            eprintln!("  qtip: GPU busy ({who}) — waited {waited}s for the GPU lock…");
-        })
-        .unwrap_or(false);
-    if !acquired {
-        return None;
-    }
-    let _ = guard.write_holder(&format!("{} hipfire-quantize", std::process::id()));
-    Some(guard)
-}
+// The trellis encoder deliberately does NOT take the GPU flock. AGENTS.md:
+// "Non-daemon GPU binaries do not self-lock" — the caller coordinates with
+// `hipfire lock {acquire,release,status}`, and `scripts/two_pass_quantize.py`
+// wraps this binary in `hipfire lock run`. A self-lock here deadlocked under
+// that wrapper: the flock is held by the *parent* process and `FlockGuard`'s fd
+// is O_CLOEXEC, so the child never inherits it and waits forever on a lock its
+// own parent owns. It never fired only because the induction default is
+// `oq4.25++`, not `--format qtip3`/`qtip4`.
 
 /// Pack the real QTIP format (`bits`-bit trellis) over a set of staged BF16
 /// tensors, in place.
@@ -4434,27 +4409,20 @@ fn pack_qtip_real_tensors(
     };
     // Autodetect a GPU for the trellis encode (exact Viterbi, ~250× the CPU beam).
     // The CPU beam remains the fallback + reference; nothing here requires a GPU.
-    // When a device is found we self-acquire the shared GPU flock (`_gpu_lock`,
-    // held via RAII until this function returns) so we cooperate with the daemon
-    // and other GPU tools — no external `hipfire lock` needed.
+    // The GPU flock is the caller's responsibility (see the note above the pack
+    // helpers) — this binary must not take it itself.
     #[cfg(feature = "gpu")]
-    let (mut gpu, _gpu_lock) = match hipfire_rdna::Gpu::init() {
+    let mut gpu = match hipfire_rdna::Gpu::init() {
         Ok(g) => {
-            let lock = acquire_gpu_lock();
             eprintln!(
-                "  qtip{bits} (real): GPU trellis encoder ({}, exact Viterbi){}",
+                "  qtip{bits} (real): GPU trellis encoder ({}, exact Viterbi)",
                 g.arch,
-                if lock.is_some() {
-                    " — GPU lock held"
-                } else {
-                    " — WARNING: proceeding without GPU lock"
-                }
             );
-            (Some(g), lock)
+            Some(g)
         }
         Err(_) => {
             eprintln!("  qtip{bits} (real): no GPU device — CPU beam encoder (beam={beam})");
-            (None, None)
+            None
         }
     };
     #[cfg(not(feature = "gpu"))]
