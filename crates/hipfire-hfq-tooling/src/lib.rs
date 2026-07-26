@@ -48,8 +48,14 @@ pub type RoleConfigKeys = std::collections::BTreeMap<String, Vec<String>>;
 /// Known role/feature tokens used to label a sidecar component. Purely
 /// cosmetic (the exact reconstruction uses `filename`/`metadata_json`); this
 /// only produces a friendly `tag` in the manifest.
+/// Every sidecar tag that may appear as a dot-group in an artifact name.
+///
+/// Broader than [`hipfire_arch_api::Role`]: this list also carries data-only
+/// sidecars (`calib`, `hessian`, `jinja`) that ride beside a model without
+/// changing its architecture. `Role` is the identity-bearing subset — the ones
+/// that change what the artifact *is*.
 pub const KNOWN_ROLES: &[&str] = &[
-    "mtp", "dflash", "triattn", "vl", "calib", "hessian", "jinja",
+    "mtp", "dflash", "triattn", "vl", "audio", "calib", "hessian", "jinja",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

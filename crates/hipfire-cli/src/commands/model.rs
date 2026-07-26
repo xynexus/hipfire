@@ -7,12 +7,11 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
-use hipfire_arch_api::ArchId;
+use hipfire_arch_api::{ArchId, Role};
 use hipfire_config::LoadedConfig;
 use hipfire_hfq_tooling::{
     check_compose_inputs, compose_hfq_with_config_keys_options,
     decompose_hfq_auto_with_config_keys_options, sidecar_tag_from_filename, RoleConfigKeys,
-    KNOWN_ROLES,
 };
 use hipfire_runtime::hfq::HfqPackage;
 
@@ -30,11 +29,14 @@ fn role_config_keys_for(path: &Path) -> RoleConfigKeys {
         return RoleConfigKeys::new();
     };
     let mut map = RoleConfigKeys::new();
-    for role in KNOWN_ROLES {
+    // Only identity-bearing roles own arch config keys. The data-only sidecars
+    // in `KNOWN_ROLES` (calib, hessian, jinja) never did — every arch returned
+    // `&[]` for them — so iterating `Role::ALL` is behaviour-preserving.
+    for &role in Role::ALL {
         let keys = arch.base.sidecar_config_keys(role);
         if !keys.is_empty() {
             map.insert(
-                role.to_string(),
+                role.as_str().to_string(),
                 keys.iter().map(|s| s.to_string()).collect(),
             );
         }

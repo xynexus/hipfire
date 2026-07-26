@@ -27,6 +27,12 @@ impl Arch for Gemma4Spec {
     fn family(&self) -> &'static str {
         "gemma4"
     }
+    /// Dense-FFN or dense+routed-MoE, which the loader already models as
+    /// distinct `FfnPlan` arms (`hipfire-arch-gemma4/src/config.rs`). Different
+    /// weights, different forward, so distinct identities.
+    fn variants(&self) -> &'static [&'static str] {
+        &["dense", "moe"]
+    }
 
     fn model_types(&self) -> &'static [&'static str] {
         &[

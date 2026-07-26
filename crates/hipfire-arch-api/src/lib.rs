@@ -109,6 +109,115 @@ impl core::fmt::Display for ArchId {
     }
 }
 
+/// A sidecar role: a tower or head that ships beside a base model and changes
+/// what the artifact *is*, not merely what it contains.
+///
+/// This is the `role` leg of the `{family, variant, role}` identity triple (see
+/// `docs/architecture-ids.md`). The vocabulary matches the canonical artifact
+/// naming convention in `AGENTS.md` — `.vl.hfq`, `.mtp.hfq`, `.dflash.hfq`,
+/// `.triattn.hfq` — so an artifact name and its declared identity cannot
+/// disagree.
+///
+/// Data-only sidecars (`.jinja.`, `.hessian`) are deliberately absent: they ride
+/// alongside a model without changing its architecture, so they are not identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Role {
+    /// Vision tower spliced into the decoder input.
+    Vl,
+    /// Audio tower.
+    Audio,
+    /// Multi-token-prediction head.
+    Mtp,
+    /// DFlash / DDTree speculative-decode draft head.
+    Dflash,
+    /// Tri-attention sidecar.
+    Triattn,
+}
+
+impl Role {
+    /// Every role, in declaration order. The frozen vocabulary.
+    pub const ALL: &'static [Role] = &[
+        Role::Vl,
+        Role::Audio,
+        Role::Mtp,
+        Role::Dflash,
+        Role::Triattn,
+    ];
+
+    /// The canonical tag, as it appears in an artifact name and on disk.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Role::Vl => "vl",
+            Role::Audio => "audio",
+            Role::Mtp => "mtp",
+            Role::Dflash => "dflash",
+            Role::Triattn => "triattn",
+        }
+    }
+
+    /// Parse a canonical tag. Returns `None` for anything outside the frozen
+    /// vocabulary — callers must treat an unknown role as an error, never as
+    /// "no role", or a typo silently becomes a base model.
+    pub fn parse(tag: &str) -> Option<Role> {
+        Role::ALL.iter().copied().find(|r| r.as_str() == tag)
+    }
+}
+
+impl core::fmt::Display for Role {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A resolved architecture identity: which family, which in-family variant, and
+/// which sidecar role — the replacement for a bare numeric `arch_id`.
+///
+/// `variant` is an opaque label, not a structural description. It exists only
+/// where one family needs different loading or a different forward pass for two
+/// artifacts; see the variant table in `docs/architecture-ids.md`. 11 of 19
+/// surveyed families need none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ArchRef {
+    pub family: &'static str,
+    pub variant: Option<&'static str>,
+    pub role: Option<Role>,
+}
+
+impl ArchRef {
+    /// A base model of `family` with no variant and no role.
+    pub const fn base(family: &'static str) -> Self {
+        ArchRef {
+            family,
+            variant: None,
+            role: None,
+        }
+    }
+
+    pub const fn with_variant(mut self, variant: &'static str) -> Self {
+        self.variant = Some(variant);
+        self
+    }
+
+    pub const fn with_role(mut self, role: Role) -> Self {
+        self.role = Some(role);
+        self
+    }
+}
+
+impl core::fmt::Display for ArchRef {
+    /// `family[/variant][+role]` — stable enough to log and to key a map on.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.family)?;
+        if let Some(v) = self.variant {
+            write!(f, "/{v}")?;
+        }
+        if let Some(r) = self.role {
+            write!(f, "+{r}")?;
+        }
+        Ok(())
+    }
+}
+
 /// The base every architecture implements. Identity only — behaviour lives in the
 /// capability traits so unsupported behaviour is `None`, not a panic.
 pub trait Arch: Sync + 'static {
@@ -116,6 +225,20 @@ pub trait Arch: Sync + 'static {
     fn id(&self) -> ArchId;
     /// Human family name for logs/errors, e.g. `"llama"`, `"nemotron-h"`.
     fn family(&self) -> &'static str;
+
+    /// In-family variant labels, or `&[]` when every artifact of this family
+    /// loads the same way.
+    ///
+    /// A variant is added **only** when two artifacts of one family need
+    /// different loading or a different forward pass — it is not a place to
+    /// record trivia. The labels are opaque: the registry knows they differ,
+    /// and only the family's own loader knows what they mean.
+    ///
+    /// Derived from a survey of 106 models; regenerate the table with
+    /// `scripts/arch_structure_survey.py --with-manifest`.
+    fn variants(&self) -> &'static [&'static str] {
+        &[]
+    }
 
     /// Canonical Hugging Face `model_type` aliases that resolve to this base id.
     /// Wrapper distinctions remain in config; this list only owns offline
@@ -125,15 +248,14 @@ pub trait Arch: Sync + 'static {
         &[]
     }
 
-    /// Config JSON keys that belong to a sidecar `role` (e.g. `"vl"`, `"mtp"`)
-    /// rather than the base model. When a bundle is split (`hipfire model
-    /// decompose`), these keys move OUT of the base config and INTO the role
-    /// sidecar; compose moves them back. This is what keeps a decomposed base
-    /// from advertising a feature whose tensors were carved into a sidecar
-    /// (e.g. a `vision_config` with no vision tensors). Role vocabulary matches
-    /// the compose role tags; unknown roles and arches that carry no
-    /// sidecar-specific config return `&[]` (the default).
-    fn sidecar_config_keys(&self, _role: &str) -> &'static [&'static str] {
+    /// Config JSON keys that belong to a sidecar [`Role`] rather than the base
+    /// model. When a bundle is split (`hipfire model decompose`), these keys
+    /// move OUT of the base config and INTO the role sidecar; compose moves
+    /// them back. This is what keeps a decomposed base from advertising a
+    /// feature whose tensors were carved into a sidecar (e.g. a `vision_config`
+    /// with no vision tensors). Arches that carry no sidecar-specific config
+    /// return `&[]` (the default).
+    fn sidecar_config_keys(&self, _role: Role) -> &'static [&'static str] {
         &[]
     }
 }
@@ -323,6 +445,40 @@ impl ArchRegistry {
                     );
                 }
             }
+            // Identity vocabulary invariants. These are cheap and they run at
+            // registry build, so a malformed declaration fails at startup
+            // rather than becoming an unresolvable artifact later.
+            let family = arch.base.family();
+            assert!(
+                !family.is_empty()
+                    && family.bytes().all(|b| b.is_ascii_lowercase()
+                        || b.is_ascii_digit()
+                        || b"-_.".contains(&b)),
+                "{}: family `{family}` must be lowercase [a-z0-9._-]",
+                arch.id,
+            );
+            let variants = arch.base.variants();
+            for (i, &v) in variants.iter().enumerate() {
+                assert!(
+                    !v.is_empty()
+                        && v.bytes().all(|b| b.is_ascii_lowercase()
+                            || b.is_ascii_digit()
+                            || b"-_.".contains(&b)),
+                    "{}: variant `{v}` must be lowercase [a-z0-9._-]",
+                    arch.id,
+                );
+                assert!(
+                    !variants[..i].contains(&v),
+                    "{}: variant `{v}` declared twice",
+                    arch.id,
+                );
+                assert!(
+                    Role::parse(v).is_none(),
+                    "{}: `{v}` is a role, not a variant — declare towers via Role, \
+                     so `family/{v}` and `family+{v}` cannot both mean the same thing",
+                    arch.id,
+                );
+            }
         }
         ArchRegistry { archs }
     }
@@ -337,6 +493,31 @@ impl ArchRegistry {
         self.archs
             .iter()
             .find(|arch| arch.model_types.contains(&model_type))
+    }
+
+    /// Every valid base identity across linked archs: one [`ArchRef`] per
+    /// family, plus one per declared variant. Roles are orthogonal and are not
+    /// enumerated here — any role may ride any base.
+    ///
+    /// This is the frozen vocabulary, rendered. `docs/architecture-ids.md`
+    /// documents exactly this set, and a test asserts the two agree.
+    pub fn identities(&self) -> Vec<ArchRef> {
+        let mut out = Vec::new();
+        for arch in &self.archs {
+            let family = arch.base.family();
+            let variants = arch.base.variants();
+            if variants.is_empty() {
+                out.push(ArchRef::base(family));
+            } else {
+                out.extend(
+                    variants
+                        .iter()
+                        .map(|&v| ArchRef::base(family).with_variant(v)),
+                );
+            }
+        }
+        out.sort();
+        out
     }
 
     /// True if `id` is a registered diffusion denoiser arch (declares the

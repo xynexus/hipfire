@@ -41,7 +41,67 @@ use hipfire_arch_zaya_spec as _;
 
 #[cfg(test)]
 mod tests {
-    use hipfire_arch_api::{ArchId, ArchRegistry, ExpertLayout};
+    use hipfire_arch_api::{ArchId, ArchRegistry, ExpertLayout, Role};
+
+    /// The body of one `## Heading` section, up to the next `## `.
+    ///
+    /// Checks are scoped per-section on purpose: a whole-file substring search
+    /// passes when a family is missing from the Families table but still
+    /// mentioned in the legacy detection table, which is exactly the drift this
+    /// test exists to catch.
+    fn section<'a>(doc: &'a str, heading: &str) -> &'a str {
+        let start = doc
+            .find(heading)
+            .unwrap_or_else(|| panic!("docs/architecture-ids.md has no `{heading}` section"));
+        let rest = &doc[start + heading.len()..];
+        match rest.find("\n## ") {
+            Some(end) => &rest[..end],
+            None => rest,
+        }
+    }
+
+    /// `docs/architecture-ids.md` is the human-readable rendering of the frozen
+    /// identity vocabulary. Nothing breaks when it drifts, which is exactly why
+    /// it drifts — the file previously advertised a four-step onboarding
+    /// checklist for a change that touches seventy files. Assert the registry
+    /// and the doc agree, so adding an arch without documenting it fails here
+    /// rather than misleading the next reader.
+    #[test]
+    fn identity_vocabulary_matches_the_docs() {
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/architecture-ids.md"),
+        )
+        .expect("docs/architecture-ids.md");
+
+        let roles = section(&doc, "\n## Roles\n");
+        for role in Role::ALL {
+            assert!(
+                roles.contains(&format!("`{}`", role.as_str())),
+                "role `{}` is in the frozen vocabulary but absent from the \
+                 Roles table in docs/architecture-ids.md",
+                role.as_str(),
+            );
+        }
+
+        let families = section(&doc, "\n## Families\n");
+        let variants = section(&doc, "\n## Variants\n");
+        for arch in ArchRegistry::build().iter() {
+            let family = arch.base.family();
+            assert!(
+                families.contains(&format!("`{family}`")),
+                "family `{family}` ({}) is registered but absent from the \
+                 Families table in docs/architecture-ids.md",
+                arch.id,
+            );
+            for variant in arch.base.variants() {
+                assert!(
+                    variants.contains(&format!("`{family}/{variant}`")),
+                    "variant `{family}/{variant}` is declared but absent from \
+                     the Variants table in docs/architecture-ids.md",
+                );
+            }
+        }
+    }
 
     #[test]
     fn all_specs_present_and_declare_ingest() {

@@ -49,6 +49,13 @@ impl Arch for NemotronHSpec {
     fn family(&self) -> &'static str {
         "nemotron-h"
     }
+    /// The stack is dense-FFN or routed-MoE, decided by whether
+    /// `hybrid_override_pattern` contains an `E` block. The loader already
+    /// branches on it (`has_moe`, `hipfire-arch-nemotron/src/lib.rs`), so the
+    /// two need different loading and earn distinct identities.
+    fn variants(&self) -> &'static [&'static str] {
+        &["dense", "moe"]
+    }
 }
 impl Ingest for NemotronHSpec {
     fn role(&self, tensor: &str) -> TensorRole {

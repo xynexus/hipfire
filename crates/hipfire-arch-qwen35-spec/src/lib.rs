@@ -9,7 +9,8 @@
 
 use hipfire_arch_api::{
     default_importance, default_requires, register_arch, transformer_role, Arch, ArchId, CapReq,
-    ContinuousBatching, ExpertLayout, Ingest, Init, TensorRole, TensorSpec, ToyFixture, ToyModel,
+    ContinuousBatching, ExpertLayout, Ingest, Init, Role, TensorRole, TensorSpec, ToyFixture,
+    ToyModel,
 };
 
 /// Qwen3.5 dense header id.
@@ -42,10 +43,10 @@ const QWEN35_MTP_CONFIG_KEYS: &[&str] = &["num_nextn_predict_layers"];
 
 /// Shared role->config-keys mapping for both dense (arch 5) and MoE (arch 6)
 /// Qwen3.5, which cover the VL and MTP variants on the same ids.
-fn qwen35_sidecar_config_keys(role: &str) -> &'static [&'static str] {
+fn qwen35_sidecar_config_keys(role: Role) -> &'static [&'static str] {
     match role {
-        "vl" => QWEN35_VL_CONFIG_KEYS,
-        "mtp" => QWEN35_MTP_CONFIG_KEYS,
+        Role::Vl => QWEN35_VL_CONFIG_KEYS,
+        Role::Mtp => QWEN35_MTP_CONFIG_KEYS,
         _ => &[],
     }
 }
@@ -62,7 +63,7 @@ impl Arch for Qwen35Spec {
     fn model_types(&self) -> &'static [&'static str] {
         &["qwen3_5", "qwen3_5_text"]
     }
-    fn sidecar_config_keys(&self, role: &str) -> &'static [&'static str] {
+    fn sidecar_config_keys(&self, role: Role) -> &'static [&'static str] {
         qwen35_sidecar_config_keys(role)
     }
 }
@@ -90,7 +91,7 @@ impl Arch for Qwen35MoeSpec {
     fn model_types(&self) -> &'static [&'static str] {
         &["qwen3_5_moe", "qwen3_5_moe_text"]
     }
-    fn sidecar_config_keys(&self, role: &str) -> &'static [&'static str] {
+    fn sidecar_config_keys(&self, role: Role) -> &'static [&'static str] {
         qwen35_sidecar_config_keys(role)
     }
 }
@@ -669,19 +670,19 @@ mod tests {
         let dense = reg.get(QWEN35_ARCH_ID).unwrap();
         assert!(dense
             .base
-            .sidecar_config_keys("vl")
+            .sidecar_config_keys(Role::Vl)
             .contains(&"vision_config"));
         assert!(dense
             .base
-            .sidecar_config_keys("mtp")
+            .sidecar_config_keys(Role::Mtp)
             .contains(&"num_nextn_predict_layers"));
-        assert!(dense.base.sidecar_config_keys("triattn").is_empty());
+        assert!(dense.base.sidecar_config_keys(Role::Triattn).is_empty());
         // MoE (arch 6) covers the VL variant on the same id.
         assert!(reg
             .get(QWEN35_MOE_ARCH_ID)
             .unwrap()
             .base
-            .sidecar_config_keys("vl")
+            .sidecar_config_keys(Role::Vl)
             .contains(&"vision_config"));
     }
 
