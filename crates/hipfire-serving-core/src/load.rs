@@ -641,7 +641,53 @@ pub fn resolve_tiny_model_state(
 /// scratch/KV/state for that family, resolve the chat template and eviction
 /// policy, and wire any optional DFlash drafter. The single-GPU entry point
 /// (multi-GPU goes through [`load_model_pp`]).
+/// The container's declared `{family, variant, role}`, or the frozen legacy
+/// mapping of its `arch_id` when it declares none.
+///
+/// Re-reads the header and metadata span rather than threading the value out of
+/// the loader body: `load_model_inner` returns from ten different arms, and one
+/// cheap re-read is a smaller change than ten call-site edits during a
+/// migration. It is a 32-byte header plus a JSON span against a file that was
+/// just read in full.
+fn declared_identity(path: &str, arch_id: u32) -> Option<hipfire_model::ArchRef> {
+    match HfqFile::open_index_only(Path::new(path)) {
+        Ok(index) => hipfire_model::resolve_artifact_identity(arch_id, &index.metadata_json),
+        // Not fatal: the model already loaded, so identity is missing, not
+        // wrong. Callers fall back through `LoadedModel::identity`.
+        Err(_) => hipfire_model::identity_for_legacy_arch_id(arch_id),
+    }
+}
+
 pub fn load_model(
+    path: &str,
+    max_seq: usize,
+    requested_physical_cap: Option<usize>,
+    draft_path: Option<&str>,
+    dflash_mode: Option<&str>,
+    kv_mode_override: Option<&str>,
+    state_quant_override: Option<&str>,
+    cask: &CaskConfig,
+    pp: usize,
+    gpu: &mut hipfire_rdna::Gpu,
+) -> Result<LoadedModel, String> {
+    let mut model = load_model_inner(
+        path,
+        max_seq,
+        requested_physical_cap,
+        draft_path,
+        dflash_mode,
+        kv_mode_override,
+        state_quant_override,
+        cask,
+        pp,
+        gpu,
+    )?;
+    model.identity = declared_identity(path, model.arch_id);
+    Ok(model)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_model_inner(
     path: &str,
     max_seq: usize,
     requested_physical_cap: Option<usize>,
@@ -989,6 +1035,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            identity: None,
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1138,6 +1185,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            identity: None,
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1255,6 +1303,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            identity: None,
             arch_id: hfq.arch_id,
             registered_backend: Some(registered_backend),
             pp: 1,
@@ -1348,6 +1397,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            identity: None,
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1476,6 +1526,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            identity: None,
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1576,6 +1627,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            identity: None,
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1689,6 +1741,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            identity: None,
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1789,6 +1842,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            identity: None,
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1910,6 +1964,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            identity: None,
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -2037,6 +2092,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            identity: None,
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -2273,6 +2329,7 @@ pub fn load_model(
             let (chat_template, chat_template_profile) =
                 profile_chat_template(chat_template, Some(&tokenizer));
             return Ok(LoadedModel {
+                identity: None,
                 arch_id: hfq.arch_id,
                 registered_backend: None,
                 pp: 1,
@@ -2631,6 +2688,7 @@ pub fn load_model(
             Some(Box::new(dn)),
         ));
         Ok(LoadedModel {
+            identity: None,
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -2789,6 +2847,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         Ok(LoadedModel {
+            identity: None,
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -3147,6 +3206,7 @@ pub fn load_model_safetensors(
             hipfire_arch_llama::LlamaBackend::new(arch_id, config, weights, scratch, kv);
 
         return Ok(LoadedModel {
+            identity: None,
             arch_id,
             registered_backend: None,
             pp: 1,
@@ -3264,6 +3324,7 @@ pub fn load_model_safetensors(
             .map_err(|e| format!("mamba-capable NemotronModel::new: {e:?}"))?;
 
         return Ok(LoadedModel {
+            identity: None,
             arch_id,
             registered_backend: None,
             pp: 1,
@@ -3403,6 +3464,7 @@ pub fn load_model_safetensors(
         Some(Box::new(dn_state)),
     ));
     Ok(LoadedModel {
+        identity: None,
         arch_id,
         registered_backend: None,
         pp: 1,
@@ -3708,6 +3770,7 @@ pub fn load_model_pp(
         Some(Box::new(dn)),
     ));
     Ok(LoadedModel {
+        identity: None,
         arch_id: hfq.arch_id,
         registered_backend: None,
         pp,
@@ -4575,5 +4638,29 @@ mod admission_tests {
 
         assert_eq!(config.num_attention_layers(), 2);
         assert_eq!(lfm2_triattn_kv_layer_ids(&config), vec![0, 1]);
+    }
+}
+
+#[cfg(test)]
+mod identity_resolution_tests {
+    use super::*;
+    use hipfire_arch_specs as _;
+
+    /// A container that cannot be re-opened must still yield an identity: the
+    /// model has already loaded by that point, so identity is *missing*, not
+    /// wrong, and the frozen legacy map still answers from the `arch_id`.
+    #[test]
+    fn an_unreadable_container_falls_back_to_the_legacy_map() {
+        assert_eq!(
+            declared_identity("/nonexistent/model.hfq", hipfire_model::ARCH_ID_ZAYA),
+            Some(hipfire_model::ArchRef::base("zaya")),
+        );
+    }
+
+    /// …but an id outside the frozen table is corrupt or from the future, and
+    /// resolving it to anything would be a guess.
+    #[test]
+    fn an_unreadable_container_with_an_unknown_id_resolves_to_nothing() {
+        assert_eq!(declared_identity("/nonexistent/model.hfq", 9999), None);
     }
 }

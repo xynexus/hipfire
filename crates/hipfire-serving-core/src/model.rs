@@ -270,6 +270,16 @@ pub struct ResidentSession {
 /// will eventually collapse this Option-soup into one boxed backend.
 pub struct LoadedModel {
     pub arch_id: u32,
+    /// Resolved `{family, variant, role}` for the loaded container, or `None`
+    /// when it declares an identity this build cannot resolve.
+    ///
+    /// Transitional: `arch_id` above is still the field most call sites branch
+    /// on. This is what they migrate to, one subsystem at a time — see the
+    /// A4 phases in `docs/plans/2026-07-26-arch-identity-structure-descriptor.md`.
+    /// Two representations of one fact is a known cost of the migration, not a
+    /// design; when the last `arch_id ==` comparison is gone, `arch_id` becomes
+    /// write-only for the legacy header and this becomes the identity.
+    pub identity: Option<hipfire_model::ArchRef>,
     /// Factory-loaded text backends share this one coarse-grained slot together
     /// with their prompt/generation policy and host-only shape metadata.
     pub registered_backend: Option<FactoryLoadedBackend>,
@@ -485,6 +495,36 @@ pub struct LoadedModel {
 }
 
 impl LoadedModel {
+    /// The loaded model's identity, falling back to the frozen legacy map when
+    /// the container declared none.
+    ///
+    /// Prefer this over reading `arch_id`: it is the same answer for a legacy
+    /// artifact and a strictly better one for a container that declares its
+    /// variant.
+    pub fn identity(&self) -> Option<hipfire_model::ArchRef> {
+        self.identity
+            .or_else(|| hipfire_model::identity_for_legacy_arch_id(self.arch_id))
+    }
+
+    /// Whether the loaded model belongs to `family`.
+    ///
+    /// The replacement for `arch_id == ARCH_ID_<FAMILY>` at sites that only
+    /// care about the family. Sites that also care about the variant should
+    /// match on [`LoadedModel::identity`] instead, so that a family which
+    /// loads two ways cannot be treated as one.
+    pub fn is_family(&self, family: &str) -> bool {
+        self.identity().is_some_and(|id| id.family == family)
+    }
+
+    /// Whether the loaded model is `family` in the given `variant`.
+    ///
+    /// `false` when the variant is unknown — a legacy artifact declares none,
+    /// and guessing is what the identity work exists to stop.
+    pub fn is_variant(&self, family: &str, variant: &str) -> bool {
+        self.identity()
+            .is_some_and(|id| id.family == family && id.variant == Some(variant))
+    }
+
     /// Active session's KV cache, if any. Replaces the former `kv_cache.as_ref()`
     /// on the unified `sequence_state`. Sites needing KV **and** DeltaNet
     /// simultaneously bind `sequence_state.as_mut()` once, then borrow its

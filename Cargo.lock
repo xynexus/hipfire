@@ -2321,6 +2321,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-arch-specs",
  "hipfire-arch-zaya",
  "hipfire-archs",
  "hipfire-dispatch",

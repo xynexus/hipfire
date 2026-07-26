@@ -46,3 +46,9 @@ hipfire-xdna = { path = "../hipfire-xdna" }
 base64.workspace = true
 serde_json = "1"
 tracing.workspace = true
+
+[dev-dependencies]
+# Force-links the arch `-spec` crates so identity resolution behaves in tests
+# the way it does in a served binary; against an empty registry it returns None
+# and the assertions below would pass vacuously.
+hipfire-arch-specs = { path = "../hipfire-arch-specs" }
