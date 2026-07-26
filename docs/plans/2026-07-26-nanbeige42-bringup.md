@@ -76,10 +76,12 @@ attn(RoPE, GQA) → residual → RMSNorm → SwiGLU → residual). The **only** 
 1. **Outer loop over the layer stack (the whole point).** The reference forward
    iterates `for layer_idx in 0..num_hidden_layers`; Nanbeige wraps that in
    `for loop_idx in 0..num_loops { for layer_idx in 0..num_hidden_layers { … } }`,
-   threading `hidden_states` straight through — the output of pass 0 (after all
-   22 layers, **without** an intermediate final-norm; `skip_loop_final_norm:
-   false` applies the final `model.norm` only once, after the last pass) is the
-   input to pass 1. The final `model.norm` + `lm_head` run once at the end.
+   threading `hidden_states` straight through (`h` is set once from the embedding
+   and carries across passes — no re-embed, no inter-pass residual). **`model.norm`
+   runs at the end of *every* pass** (verified below), so pass 1's input is
+   `model.norm(pass-0 output)` and the final pre-`lm_head` hidden state is
+   `model.norm(pass-1 output)`. `model.norm` therefore executes `num_loops` (=2)
+   times; `lm_head` runs once at the very end.
 
 2. **Loop-aware KV cache = doubled layer count.** The reference cache indexes
    `state.kv_cache.*[layer_idx]` with `num_hidden_layers` slots. Nanbeige must
@@ -163,7 +165,11 @@ Scaffold from `hipfire-arch-template`; model the structure on
   - compute `cache_layer_idx = layer_idx + loop_idx * num_hidden_layers` and use
     it for **every** KV read/write and for the RoPE position (positions are the
     token positions — unchanged across passes; only the cache slot changes);
-  - apply `model.norm` + `lm_head` **once**, after the final pass.
+  - apply `model.norm` at the **end of each loop pass** (this SKU has
+    `skip_loop_final_norm: false`), so the normed pass-0 output feeds pass 1;
+    apply `lm_head` **once** to the final (already-normed) pass-1 output. Do not
+    add a separate terminal norm — the last pass's per-pass norm *is* the final
+    norm.
 - `arch.rs` — `Nanbeige: Architecture` (`arch_id() = 25`, `name() = "nanbeige"`,
   `config_from_hfq`, `load_weights`, `new_state`) and `NanbeigeBackend: SimpleAr`
   (`prefill` / `decode_step` / `logits` / `vocab_size`) delegating to
@@ -210,11 +216,17 @@ nanbeige fixture; `hipfire-eval` fast tier recorded for BF16 and MQ4.
 
 ## Open questions / risks
 
-1. **Loop numerics** — confirm the reference applies `model.norm` only after the
-   final pass and feeds the *un-normed* pass-0 output into pass 1
-   (`skip_loop_final_norm: false` semantics). The logit-parity gate settles this;
-   read `modeling_nanbeige.py` around the `for loop_idx in range(num_loops)`
-   body (lines ~2217 / ~2585) to confirm before coding.
+1. **Loop numerics — RESOLVED (2026-07-26).** Verified against
+   `modeling_nanbeige.py` `NanbeigeModel.forward` (lines 2217–2318): with
+   `skip_loop_final_norm: false` (this SKU), `model.norm` is applied at the **end
+   of every loop pass** (line 2305–2306, the `not skip_loop_final_norm` branch),
+   so pass 1 receives `model.norm(pass-0 output)`. The trailing terminal-only
+   norm (line 2315) runs **only** when `skip_loop_final_norm` is True — the
+   opposite config, which feeds the *un-normed* pass-0 output forward. Net for
+   bring-up: run `model.norm` once per pass (`num_loops` times total), `lm_head`
+   once. The flag name is a trap — do not implement the "norm once at the end"
+   behavior for this default-false SKU. (The second `for loop_idx` at line ~2585
+   is inside the `_get_cache_seq_length` helper, not a forward.)
 2. **Prefill batching across loops** — a batched prefill must fill loop-0 KV for
    all positions across all 22 layers before starting loop-1 (loop-1 layer L
    attends over loop-1 KV history, which depends on loop-1's earlier positions).
