@@ -56,9 +56,10 @@ if [ "$status" -ne 0 ]; then
     cat >&2 <<'EOF'
 check-artifact-names: legacy artifact spelling found.
 Use canonical names such as:
-  qwen3.5-9b-mq4.hfq
-  qwen3.5-9b-mq4.dflash.hfq
-  deepseek-v4-flash-lloyd-mq2.hfq
+  Qwen3.5-9B--mq4.hfq                 (model: `--` before the machine section)
+  Qwen3.5-9B--dflash.oq4+.hfq         (sidecar with a quant: same boundary)
+  Qwen3.5-9B.triattn.hfq              (quant-free sidecar: plain dotted role)
+  DeepSeek-V4-Flash--mq2l.hfq         (Lloyd is part of the quant token)
 EOF
 fi
 

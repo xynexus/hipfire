@@ -188,9 +188,12 @@ def artifact_layout(
     dflash_formats = list(dict.fromkeys(dflash_formats))
     if len(dflash_formats) > 1:
         raise ValueError("one bundle may contain exactly one DFLASH encoding")
-    primary_stem = f"{model_name}.{quant_format}"
+    # Everything carrying a quant token takes the `--` name/machine boundary;
+    # the roles and the quant are dot-separated groups inside the machine
+    # section. See AGENTS.md "Artifact Names".
+    primary_stem = f"{model_name}--{quant_format}"
     roles = (["dflash"] if dflash_formats else []) + ["triattn"]
-    bundle_stem = f"{model_name}.{'.'.join(roles)}.{quant_format}"
+    bundle_stem = f"{model_name}--{'.'.join(roles)}.{quant_format}"
     work_dir = root / "induction" / primary_stem
     model_dir = model_dir or root / "models"
     paths = {
@@ -205,8 +208,10 @@ def artifact_layout(
     }
     for dflash_format in dflash_formats:
         _dflash_format_args(dflash_format)
+        # A DFlash sidecar carries a quant token, so it takes the `--`
+        # name/machine boundary: <model>--dflash.<quant>.hfq
         paths[f"dflash_{dflash_format}"] = (
-            root / "drafts" / f"{model_name}.dflash.{dflash_format}.hfq"
+            root / "drafts" / f"{model_name}--dflash.{dflash_format}.hfq"
         )
     return paths
 

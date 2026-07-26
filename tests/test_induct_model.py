@@ -88,7 +88,7 @@ def test_preflight_and_layout_allow_a_cask_only_target(tmp_path):
 
     assert result["draft"] is None
     assert result["compatibility"] == "not-applicable"
-    assert paths["bundle"].name == "BLS-Mini-Code-1.0.triattn.oq4.25++.hfq"
+    assert paths["bundle"].name == "BLS-Mini-Code-1.0--triattn.oq4.25++.hfq"
     assert not any(key.startswith("dflash_") for key in paths)
 
 
@@ -97,12 +97,12 @@ def test_artifact_layout_matches_registry_sidecar_names(tmp_path):
         tmp_path, "Qwen3.5-397B-A17B", "oq4++", ["oq4+"]
     )
 
-    assert paths["model"].name == "Qwen3.5-397B-A17B.oq4++.hfq"
-    assert paths["dflash_oq4+"] == tmp_path / "drafts" / "Qwen3.5-397B-A17B.dflash.oq4+.hfq"
+    assert paths["model"].name == "Qwen3.5-397B-A17B--oq4++.hfq"
+    assert paths["dflash_oq4+"] == tmp_path / "drafts" / "Qwen3.5-397B-A17B--dflash.oq4+.hfq"
     assert paths["triattn"] == tmp_path / "triattn" / "Qwen3.5-397B-A17B.triattn.hfq"
     assert paths["calib"] == tmp_path / "calib" / "Qwen3.5-397B-A17B.calib.hfq"
-    assert paths["bundle"] == tmp_path / "models" / "Qwen3.5-397B-A17B.dflash.triattn.oq4++.hfq"
-    assert paths["manifest"] == tmp_path / "induction" / "Qwen3.5-397B-A17B.oq4++" / "manifest.json"
+    assert paths["bundle"] == tmp_path / "models" / "Qwen3.5-397B-A17B--dflash.triattn.oq4++.hfq"
+    assert paths["manifest"] == tmp_path / "induction" / "Qwen3.5-397B-A17B--oq4++" / "manifest.json"
 
     staged = induct.artifact_layout(
         tmp_path, "Qwen3.5-397B-A17B", "oq4++", ["oq4+"], tmp_path / "staging"
@@ -127,9 +127,9 @@ def test_default_quant_format_is_mixed_oq425_double_plus():
 def test_mixed_opus_format_keeps_calibration_recipe_and_canonical_name(tmp_path):
     paths = induct.artifact_layout(tmp_path, "Qwen3.5-397B-A17B", "oq4.5++", ["oq4+"])
 
-    assert paths["model"].name == "Qwen3.5-397B-A17B.oq4.5++.hfq"
-    assert paths["dflash_oq4+"].name == "Qwen3.5-397B-A17B.dflash.oq4+.hfq"
-    assert paths["bundle"].name == "Qwen3.5-397B-A17B.dflash.triattn.oq4.5++.hfq"
+    assert paths["model"].name == "Qwen3.5-397B-A17B--oq4.5++.hfq"
+    assert paths["dflash_oq4+"].name == "Qwen3.5-397B-A17B--dflash.oq4+.hfq"
+    assert paths["bundle"].name == "Qwen3.5-397B-A17B--dflash.triattn.oq4.5++.hfq"
     assert induct.default_quant_args("oq4.5++") == ["--awq", "--ldlq"]
 
 
@@ -325,7 +325,7 @@ def test_bundle_inspection_requires_exact_roles_and_strong_digests(tmp_path, mon
 
 
 def test_transfer_refuses_candidate_without_admission(tmp_path):
-    bundle = tmp_path / "Model.triattn.oq4.25++.hfq"
+    bundle = tmp_path / "Model--triattn.oq4.25++.hfq"
     bundle.write_bytes(b"HFQM" + b"candidate")
     manifest = {"admission": {"status": "pending"}}
 
@@ -338,7 +338,7 @@ def test_transfer_refuses_candidate_without_admission(tmp_path):
 
 
 def test_transfer_verifies_temporary_and_final_remote_digest(tmp_path, monkeypatch):
-    bundle = tmp_path / "Model.triattn.oq4.25++.hfq"
+    bundle = tmp_path / "Model--triattn.oq4.25++.hfq"
     bundle.write_bytes(b"HFQM" + b"admitted")
     digest = induct.sha256_file(bundle)
     commands: list[list[str]] = []
@@ -505,9 +505,9 @@ def test_main_dry_run_prints_native_two_pass_plan_without_running_tools(tmp_path
     assert "two_pass_quantize.py" in output
     assert "--manifest" in output
     assert "--python" not in output
-    assert "Qwen3.5-397B-A17B.oq4.25++.hfq" in output
-    assert "Qwen3.5-397B-A17B.dflash.oq4+.hfq" in output
-    assert "Qwen3.5-397B-A17B.dflash.triattn.oq4.25++.hfq" in output
+    assert "Qwen3.5-397B-A17B--oq4.25++.hfq" in output
+    assert "Qwen3.5-397B-A17B--dflash.oq4+.hfq" in output
+    assert "Qwen3.5-397B-A17B--dflash.triattn.oq4.25++.hfq" in output
     assert "--format oq4.25++" in output
     assert f"--layer-prefetch-bytes {16 * 1024**3}" in output
     assert "--min-expert-activations 2048" in output
