@@ -1,13 +1,22 @@
-# Arch Identity: Replacing `arch_id` With a Structure Descriptor
+# Arch Identity: Replacing `arch_id`
 
 Date: 2026-07-26
 
+*(The filename says "structure descriptor" because that is what this document
+set out to scope. Phase 0 refuted its premise and the decision went the other
+way — the structure-descriptor design survives as an appendix. The file is not
+renamed because other documents and PRs already reference this path.)*
+
 ## Goal
 
-Replace the flat numeric `arch_id` with a declared **structure descriptor**, so
-that "which architecture is this artifact, and can this binary serve it?" is a
-checkable property of the container rather than a lookup through a small-integer
-id that carries four orthogonal meanings at once.
+Replace the flat numeric `arch_id` with a **declared identity** — a canonical
+family name plus a variant and role — so that "which architecture is this
+artifact?" is something the container states rather than something a
+small-integer id implies while carrying four orthogonal meanings at once.
+
+Scoped as two options. Phase 0 was run to choose between them and chose
+**Option A** (nominal identity); **Option B** (a structure descriptor) is
+retained as an appendix.
 
 ## Status
 
@@ -18,7 +27,13 @@ structure-descriptor approach (Option B) is **not** being built; its design is
 retained as an appendix because phase 0 was run for it and it remains the
 fallback if nominal identity proves insufficient.
 
-Implementation is **not started**. See [Option A phases](#option-a-phases).
+**A1, A2, A3 and A4a are landed** (PR #194). **A4b is blocked and re-scoped** —
+see `docs/plans/2026-07-26-a4b-loader-dispatch-blocked.md`. A5 is partly landed
+via PR #191; A6 is not started. See [Option A phases](#option-a-phases).
+
+Two things in this document were corrected after implementation contradicted
+them: A2 shipped without a header version bump, and A4's "one exhaustive
+`match`" is not achievable with string families. Both are marked inline.
 
 ## Why `arch_id` Is Being Replaced
 
@@ -196,7 +211,8 @@ mitigated, not solved, by the fixture gate in phase 5.
 ## Option A: Identity
 
 ```jsonc
-// HFQ v3 metadata JSON
+// HFQ metadata JSON. No header version bump: presence of the key is the
+// signal, and readers that predate it ignore it. See the A2 note below.
 "identity": {
   "family":  "qwen3_5",   // canonical; resolved via ArchRegistry
   "variant": "partial",   // small in-family discriminator, or null
@@ -246,23 +262,66 @@ record trivia.
 
 | Phase | Work | Notes |
 |---|---|---|
+| Phase | Work | Status |
+|---|---|---|
 | **0** | Survey and collapse matrix | **DONE** — above |
-| **A1** | Freeze the `family`/`variant`/`role` vocabulary; write the variant table into `docs/architecture-ids.md` (which becomes the identity table, not an id table) | small; the enum already exists as data |
-| **A2** | HFQ v3: write `identity` into the JSON metadata span; keep writing the legacy `arch_id` as a hint. On read, `version >= 3` → JSON authoritative; `< 3` → frozen legacy `u32` → identity map | low risk; v1→v2 precedent exists. See [Migration](#migration) |
-| **A3** | Quantizer emits `identity` for all 20 families | mechanical; the extractor only has to pick a label, not describe a shape |
-| **A4** | `ArchId` → `ArchRef { family, variant, role }`; resolve once at load. Sweep the 33 branching files; `load_model`'s four `if`-chains become one `match` over a real enum | the bulk of the work |
-| **A5** | Kill the dual representation: `ModelWorkerKey.arch_id: String` becomes the family tag it was always pretending to be; delete `ModelArchFamily` in favour of the registry | partly unblocked already — see below |
-| **A6** | One golden fixture per `(family, variant)`; CI gate | the only defence against a mislabelled artifact |
+| **A1** | Freeze the `family`/`variant`/`role` vocabulary; write the variant table into `docs/architecture-ids.md` (which becomes the identity table, not an id table) | **DONE** (PR #194) |
+| **A2** | Write `identity` into the JSON metadata span; keep writing the legacy `arch_id` as a hint. On read, a declared `identity` wins; absent, the frozen legacy `u32` → identity map answers | **DONE** (PR #194) — **no header version bump**, see below |
+| **A3** | Quantizer emits `identity`, with the variant where the family declares one | **DONE** (PR #194) |
+| **A4a** | Resolve identity once at load; `LoadedModel::identity()` / `is_family()` / `is_variant()` as the migration targets | **DONE** (PR #194) |
+| **A4b–e** | Migrate the `arch_id ==` call sites: `load.rs` (20), `session.rs` (18), `quantize/main.rs` (16), `daemon/main.rs` (15), `generate.rs` (8) | **BLOCKED / re-scoped** — see below |
+| **A5** | Kill the dual representation: `ModelWorkerKey.arch_id: String` becomes the family tag it was always pretending to be; delete `ModelArchFamily` in favour of the registry | partly landed — see below |
+| **A6** | One golden fixture per `(family, variant)`; CI gate | not started; the only defence against a mislabelled artifact |
+
+### A2 shipped without a header version bump
+
+This row originally specified HFQ v3 with `version >= 3` selecting the JSON
+identity. **It shipped without one, deliberately.**
+
+Header `version` selects the container's *structural* layout — `per_entry_tail`,
+tensor and data offsets — and is read by two independent parsers
+(`hipfire-model` and `hipfire-runtime::hfq`). An added JSON key changes no
+layout, so **presence of the `identity` key is the signal**, and old readers
+ignore it. A bump would have been safe (every existing check is `>=`) but would
+churn the header bytes of every newly-written artifact for no gain.
+
+The [Migration](#migration) section below still describes the frozen legacy
+`u32` → identity map, which is unaffected: it is what answers when no `identity`
+key is present, regardless of header version.
+
+### A4 was over-promised, and A4b is re-scoped
+
+The original A4 row promised `load_model`'s four `if`-chains would become "one
+`match` over a real enum". Two corrections:
+
+1. **String families are not exhaustively checkable.** Option A made identity
+   nominal, and `match family { "llama" => …, _ => … }` gets no compiler
+   coverage check. The achievable win is an *explicit refusal* for an unhandled
+   identity, not compiler-enforced exhaustiveness. A `Family` enum generated
+   from the registry would give that, but it is a separate decision and was
+   rejected during the A-vs-B choice.
+2. **The dispatch is a symptom, not the cause.** `load_model`'s ten per-arch
+   arms exist because `LoadedModel` carries ~37 per-arch `Option` slots and each
+   arm populates a different subset. Converting the conditions renames the
+   branching without removing it.
+
+A4b is therefore blocked pending a re-scope, and the architecture review's
+ordering — route `generate*` through the `ServingBackend` seam, collapse
+`LoadedModel`, then the loader dispatch mostly deletes itself — probably
+supersedes it. Full analysis, including which review figures are verified on
+`master` and which are inherited and unconfirmed:
+**`docs/plans/2026-07-26-a4b-loader-dispatch-blocked.md`**.
 
 **Already landed toward A5:** `model_arch_family_from_str` now resolves arch
 tags through `ArchRegistry::resolve` rather than parsing only numeric ids, and
 the server threads the daemon-reported tag into `ModelWorkerKey` instead of
 hardcoding `"unknown"` (PR #191). That was a scheduler bug fix, but it is the
-first real consumer of name-based identity and the pattern A4/A5 generalize.
+first real consumer of name-based identity and the pattern A5 generalizes.
 
 ## Migration
 
-Common to either option; required by **A2**.
+Common to either option; required by **A2**. The header layout below is
+unchanged by A2 — only the JSON span gained a key.
 
 44 `.hfq` artifacts exist (13 local, 31 `/srv`), all regenerable. HFQ has a
 version field with a shipped v1→v2 precedent and a JSON metadata span, so
@@ -271,7 +330,7 @@ version field with a shipped v1→v2 precedent and a JSON metadata span, so
 
 ```
 [0..4]   b"HFQM"
-[4..8]   version   u32
+[4..8]   version   u32     <- UNCHANGED by A2; selects structural layout
 [8..12]  arch_id   u32     <- becomes a legacy hint
 [16..24] metadata_offset u64  -> JSON span, where `identity` lands
 [24..32] data_offset     u64
