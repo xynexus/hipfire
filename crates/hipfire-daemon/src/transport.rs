@@ -97,11 +97,10 @@ pub(crate) struct Inbound {
 /// pending requests in hand before it has anything to choose between.
 const INBOUND_CAPACITY: usize = 0;
 
-/// Default socket path. Beside `daemon.pid` on purpose: the flock on that file is
-/// what makes the daemon a singleton, and this is the door to that one daemon.
+/// Default socket path, defined once in the adapter so the listening end and the
+/// connecting end cannot disagree about where the door is.
 pub(crate) fn default_socket_path() -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME environment variable not set");
-    PathBuf::from(home).join(".hipfire").join("daemon.sock")
+    hipfire_daemon_adapter::default_socket_path()
 }
 
 /// Spawn the stdin reader and return the executor's end of the channel.

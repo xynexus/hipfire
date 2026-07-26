@@ -171,6 +171,8 @@ pub(crate) async fn run_daemon_quality_rows_async(
         )]);
     };
 
+    // Spawns a private daemon on purpose: an eval must exercise the build under
+    // test, not whatever happens to be running.
     let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
     let ref_path = match ref_plan {
         ReferencePlan::Existing(path) => path,
@@ -414,6 +416,8 @@ pub(crate) async fn load_daemon_eval_session_for_model(
     max_seq: usize,
     model: &str,
 ) -> anyhow::Result<DaemonEvalSession> {
+    // Spawns a private daemon on purpose: an eval must exercise the build under
+    // test, not whatever happens to be running.
     let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
     let loaded = engine
         .load(model, daemon_model_load_params(config, max_seq))

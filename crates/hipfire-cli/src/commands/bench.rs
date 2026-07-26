@@ -65,6 +65,8 @@ pub async fn run(args: BenchArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     load_params.max_seq = load_params.max_seq.max(needed_seq);
 
     let bin = find_daemon_bin_or_error()?;
+    // Spawns a private daemon on purpose: a benchmark must measure the binary it
+    // was pointed at, and a shared daemon would have another model resident.
     let mut engine = DaemonEngine::spawn(&bin).await?;
 
     progress(format!("loading {}", model_path.display()));

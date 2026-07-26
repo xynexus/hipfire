@@ -397,10 +397,42 @@ and the daemon still serving afterwards. Paths (2) and (3) are hooked but **not*
 yet verified against a live model — that needs a qwen35 and a deepseek4 run
 respectively.
 
-**M3e — retire the six `DaemonEngine::spawn` sites** (`server/lib.rs:339`,
-`server/routes/chat.rs:632`, `cli/chat.rs:212`, `cli/bench.rs:68`,
-`eval/executor_daemon.rs:174` and `:417`, `coherence/lib.rs:528`,
-`steer-harness/lib.rs:92`) in favour of attach. Needs M3c.
+**M3e — attach instead of spawn. Capability done; only one caller could migrate.**
+
+`SocketTransport` + `DaemonEngine::connect(path)` + `attach_or_spawn(bin)` land in
+the adapter, and `default_socket_path()` now lives there so the listening end and
+the connecting end cannot disagree about where the door is.
+
+`hipfire chat` migrates, and it is the caller that was actually broken: it spawned
+a private daemon, which tried to take the same exclusive `daemon.pid` flock a
+running `hipfire serve` already held, so **chatting while serving failed outright**.
+Verified end to end — spawning a second daemon still returns
+`hipfire daemon already running (PID …)`, while `hipfire chat` against the same
+live daemon now attaches and generates.
+
+**The other seven cannot migrate yet, and the reason is a finding rather than an
+oversight.** They split into two kinds:
+
+- **Blocked on configuration channel** — `server/lib.rs` and `server/routes/chat.rs`.
+  Both configure the daemon through the environment the *spawned child* inherits:
+  `apply_daemon_startup_env` sets `HIPFIRE_RESOURCE_LOCK` and the scheduler memory
+  budgets, and the chat route builds a per-model `daemon_spawn_env` (the DFlash
+  n-gram override). Attaching to an already-running daemon would silently drop all
+  of it and leave the daemon on whatever config it started with. **Daemon
+  configuration has to move from spawn-time env onto the wire before the server can
+  attach** — and that is the same constraint M4 hits, since a scheduler in the
+  daemon needs config it can change at runtime, not only at exec.
+- **Correctly private by design** — `cli/bench.rs`, `eval/executor_daemon.rs` (×2),
+  `coherence/lib.rs`, `steer-harness` (×2). These build a daemon and must measure
+  *that* build; attaching would silently exercise whatever was already running, and
+  a shared daemon would have another model resident. The coherence gate literally
+  rebuilds the daemon before running it. Each site now carries a comment saying so,
+  so the next person does not "finish the migration" and quietly break the gates.
+
+*Exit (M3e, partially met):* attach capability verified against a live daemon,
+including that the pre-existing spawn collision still reproduces. Six of eight
+sites stay on `spawn` deliberately; the two server sites are blocked on wire
+configuration.
 
 *Exit (M3a, met):* identical observable behaviour on stdio, including blank-line
 skipping, malformed-frame ordering and EOF shutdown; reader unit-tested for

@@ -628,6 +628,9 @@ pub(crate) async fn ensure_model_loaded(
     }
 
     let bin = find_daemon_bin_or_error().map_err(|e| e.to_string())?;
+    // Spawns rather than attaches: `daemon_spawn_env` is built PER MODEL (e.g. the
+    // DFlash n-gram override) and takes effect only through the spawned child's
+    // environment. An attached daemon would ignore it entirely.
     daemon_spawn_env.apply();
     let mut engine = DaemonEngine::spawn(&bin).await.map_err(|e| e.to_string())?;
     apply_residency_evictions(state, &mut engine, &residency_plan).await?;
