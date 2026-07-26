@@ -18,7 +18,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python test dependencies
-        run: python -m pip install --upgrade pytest numpy
+        # tests/no-gpu-ci.sh runs ruff, mypy and pytest (see its "Python CPU
+        # tests" section); all four are needed or the gate dies partway through.
+        run: python -m pip install --upgrade pytest numpy ruff mypy
 
       - name: Run no-GPU checks
         run: ./tests/no-gpu-ci.sh
