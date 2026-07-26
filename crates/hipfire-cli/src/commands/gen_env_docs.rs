@@ -13,7 +13,8 @@
 //! freshness gate `tests/no-gpu-ci.sh` runs.
 //!
 //! Two deliberate improvements over the Python it replaces:
-//!   * `source:` fields are **repo-relative**, not absolute machine paths.
+//!   * `source:` fields are **repo-relative paths** (no line number), not
+//!     absolute machine paths — stable across unrelated edits.
 //!   * Pipe-escaping on read-back is idempotent (the Python re-escaped `|`
 //!     every run, so its output never stabilized — there was no working
 //!     content gate). The `.rs` output is also piped through `rustfmt` so it
@@ -46,7 +47,8 @@ pub struct GenEnvDocsArgs {
 struct EnvDoc {
     name: String,
     description: String,
-    /// Repo-relative `path:line`.
+    /// Repo-relative path (no line number — line numbers churn on unrelated
+    /// edits and nothing reads them; grep the var name to find the usage).
     source: String,
 }
 
@@ -153,14 +155,14 @@ fn doc_only_entries() -> Vec<EnvDoc> {
             name: "HIPFIRE_LOCAL".to_string(),
             description: "Force local-spawn behavior and skip serve HTTP in documented workflows"
                 .to_string(),
-            source: "README.md:962".to_string(),
+            source: "README.md".to_string(),
         },
         EnvDoc {
             name: "HIPFIRE_PYTHON".to_string(),
             description:
                 "Python interpreter used by the no-GPU CI shell gate for Python tooling and tests"
                     .to_string(),
-            source: ".github/CONTRIBUTING.md:86".to_string(),
+            source: ".github/CONTRIBUTING.md".to_string(),
         },
     ]
 }
@@ -271,15 +273,17 @@ fn collect_env_data(root: &Path) -> anyhow::Result<Vec<EnvDoc>> {
             if best.is_none() || is_helpful_description(&desc) {
                 best = Some(EnvDoc {
                     name: name.clone(),
+                    // Path only, no line: line numbers churn on every unrelated
+                    // edit above the usage and nothing consumes them.
+                    source: source_path(&usage.source).to_string(),
                     description: desc.clone(),
-                    source: usage.source.clone(),
                 });
             }
         }
         let best = best.unwrap_or_else(|| EnvDoc {
             name: name.clone(),
             description: infer_name_from_var(name, &usage_list[0].source),
-            source: usage_list[0].source.clone(),
+            source: source_path(&usage_list[0].source).to_string(),
         });
         docs.push(best);
     }
