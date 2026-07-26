@@ -12195,6 +12195,18 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Serialize the env-var tests without letting one failure take the rest down
+    /// with it. These tests mutate process-global `std::env`, so they must not run
+    /// concurrently — but a panic while holding the guard poisons the mutex, and a
+    /// plain `.lock().unwrap()` then turns every *other* env test into a
+    /// `PoisonError` failure. That inflates one real regression into a shifting
+    /// handful (the count depends on scheduling) and buries the actual cause.
+    /// Nothing is guarded here except the env itself, and every test sets the vars
+    /// it reads before reading them, so recovering the poisoned guard is safe.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn explicit_hidden_extract_layers_require_a_unique_increasing_subset() {
         assert!(validate_hidden_extract_layers(4, &[0, 1, 3], 8, 16, 4).is_ok());
@@ -12234,7 +12246,7 @@ mod tests {
 
     #[test]
     fn dflash_serial_rollback_replay_is_conservative_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         unsafe {
             std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY");
         }
@@ -12262,7 +12274,7 @@ mod tests {
 
     #[test]
     fn dflash_prefix_verify_rollback_replay_is_opt_in() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         unsafe {
             std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY");
         }
@@ -12286,7 +12298,7 @@ mod tests {
 
     #[test]
     fn dflash_verify_frame_rollback_replay_is_opt_in() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         unsafe {
             std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES");
         }
@@ -12308,13 +12320,19 @@ mod tests {
         }
     }
 
+    /// Default-OFF with explicit opt-in. This flipped in 82b537930: the serial
+    /// tape rollback replays the *batched verify* tape, so the hidden states it
+    /// feeds the replay depend on the drafted tokens and committed output followed
+    /// the drafter — it breaks spec-decode losslessness (bug #21) and is ~30%
+    /// slower. The old `defaults_on_with_opt_out` expectation outlived that change
+    /// and asserted the pre-demotion default, which is what made this test fail.
     #[test]
-    fn dflash_serial_tape_rollback_replay_defaults_on_with_opt_out() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn dflash_serial_tape_rollback_replay_defaults_off_with_opt_in() {
+        let _guard = env_guard();
         unsafe {
             std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE");
         }
-        assert!(dflash_serial_tape_rollback_replay_from_env());
+        assert!(!dflash_serial_tape_rollback_replay_from_env());
         unsafe {
             std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE", "1");
         }
@@ -12334,7 +12352,7 @@ mod tests {
 
     #[test]
     fn dflash_rollback_compare_is_opt_in_diagnostic() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         unsafe {
             std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_COMPARE");
         }
@@ -12358,7 +12376,7 @@ mod tests {
 
     #[test]
     fn dflash_rollback_logit_compare_steps_default_and_cap() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         unsafe {
             std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS");
         }
