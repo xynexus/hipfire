@@ -59,6 +59,7 @@ Use canonical names such as:
   Qwen3.5-9B--mq4.hfq                 (model: `--` before the machine section)
   Qwen3.5-9B--dflash.oq4+.hfq         (sidecar with a quant: same boundary)
   Qwen3.5-9B.triattn.hfq              (quant-free sidecar: plain dotted role)
+  Qwen3.5-9B--+dflash.+triattn.mq4.hfq  (bundle: embedded roles take `+`)
   DeepSeek-V4-Flash--mq2l.hfq         (Lloyd is part of the quant token)
 EOF
 fi
