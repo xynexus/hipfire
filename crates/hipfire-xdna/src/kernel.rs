@@ -236,7 +236,9 @@ impl NpuKernel {
             let t0 = std::time::Instant::now();
             let seq = self.submit(args)?;
             let t1 = std::time::Instant::now();
-            let r = self.wait(seq).and_then(|()| self.reconcile_ert_npu_outputs(args));
+            let r = self
+                .wait(seq)
+                .and_then(|()| self.reconcile_ert_npu_outputs(args));
             xdna_trace_record(t1 - t0, t1.elapsed());
             return r;
         }
@@ -267,7 +269,9 @@ impl NpuKernel {
             let t0 = std::time::Instant::now();
             let seq = self.submit_synced(args, Some(sync))?;
             let t1 = std::time::Instant::now();
-            let r = self.wait(seq).and_then(|()| self.reconcile_ert_npu_outputs(args));
+            let r = self
+                .wait(seq)
+                .and_then(|()| self.reconcile_ert_npu_outputs(args));
             xdna_trace_record(t1 - t0, t1.elapsed());
             return r;
         }
