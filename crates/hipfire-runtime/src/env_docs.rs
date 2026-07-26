@@ -396,7 +396,7 @@ pub const ENV_HIPFIRE_CONV1D_TREE_GFX1151: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DAEMON_BIN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DAEMON_BIN",
     description: "Used to configure runtime execution by explicitly setting \"HIPFIRE_DAEMON_BIN\"",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:1618",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:1788",
 };
 
 /// `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` — Runtime variable controlling daemon resident state budget mb in hipfire
@@ -404,6 +404,13 @@ pub const ENV_HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB",
     description: "Runtime variable controlling daemon resident state budget mb in hipfire",
     source: "crates/hipfire-serving-core/src/session.rs:1445",
+};
+
+/// `HIPFIRE_DAEMON_SCHED_DEBUG` — order does NOT report what the daemon actually chose. This trace is the
+pub const ENV_HIPFIRE_DAEMON_SCHED_DEBUG: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DAEMON_SCHED_DEBUG",
+    description: "order does NOT report what the daemon actually chose. This trace is the",
+    source: "crates/hipfire-daemon/src/main.rs:1295",
 };
 
 /// `HIPFIRE_DDTREE_BUDGET` — Selects behavior from recognized values
@@ -914,7 +921,7 @@ pub const ENV_HIPFIRE_DETERMINISTIC: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DEVICES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DEVICES",
     description: "Runtime variable controlling devices in hipfire",
-    source: "crates/hipfire-server/src/lib.rs:761",
+    source: "crates/hipfire-server/src/lib.rs:767",
 };
 
 /// `HIPFIRE_DFLASH_DRAFT` — Runtime variable controlling dflash draft in hipfire
@@ -4111,14 +4118,14 @@ pub const ENV_HIPFIRE_REPLAY_GRAPH: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_RESOURCE_LOCK: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK",
     description: "Runtime variable controlling resource lock in hipfire",
-    source: "crates/hipfire-server/src/lib.rs:760",
+    source: "crates/hipfire-server/src/lib.rs:766",
 };
 
 /// `HIPFIRE_RESOURCE_LOCK_CPU_CORES` — HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores
 pub const ENV_HIPFIRE_RESOURCE_LOCK_CPU_CORES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK_CPU_CORES",
     description: "HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:1342",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:1512",
 };
 
 /// `HIPFIRE_RESOURCE_LOCK_DIR` — Runtime variable controlling resource lock dir in hipfire
@@ -4132,14 +4139,14 @@ pub const ENV_HIPFIRE_RESOURCE_LOCK_DIR: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_RESOURCE_LOCK_NPUS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK_NPUS",
     description: "Runtime variable controlling resource lock npus in hipfire",
-    source: "crates/hipfire-server/src/lib.rs:762",
+    source: "crates/hipfire-server/src/lib.rs:768",
 };
 
 /// `HIPFIRE_RESOURCE_LOCK_WAIT_MS` — Runtime variable controlling resource lock wait ms in hipfire
 pub const ENV_HIPFIRE_RESOURCE_LOCK_WAIT_MS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESOURCE_LOCK_WAIT_MS",
     description: "Runtime variable controlling resource lock wait ms in hipfire",
-    source: "crates/hipfire-server/src/lib.rs:727",
+    source: "crates/hipfire-server/src/lib.rs:733",
 };
 
 /// `HIPFIRE_RESPONSES_STATE_MAX` — Parses "HIPFIRE_RESPONSES_STATE_MAX" with fallback defaults
@@ -4370,28 +4377,28 @@ pub const ENV_HIPFIRE_SAMPLE_COMPARE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_SCHEDULER_SYSTEM_MEMORY_BUDGET_BYTES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SCHEDULER_SYSTEM_MEMORY_BUDGET_BYTES",
     description: "Runtime variable controlling scheduler system memory budget bytes in hipfire",
-    source: "crates/hipfire-server/src/lib.rs:733",
+    source: "crates/hipfire-server/src/lib.rs:739",
 };
 
 /// `HIPFIRE_SCHEDULER_SYSTEM_MEMORY_HEADROOM_BYTES` — Runtime variable controlling scheduler system memory headroom bytes in hipfire
 pub const ENV_HIPFIRE_SCHEDULER_SYSTEM_MEMORY_HEADROOM_BYTES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SCHEDULER_SYSTEM_MEMORY_HEADROOM_BYTES",
     description: "Runtime variable controlling scheduler system memory headroom bytes in hipfire",
-    source: "crates/hipfire-server/src/lib.rs:737",
+    source: "crates/hipfire-server/src/lib.rs:743",
 };
 
 /// `HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES` — Runtime variable controlling scheduler vram budget bytes in hipfire
 pub const ENV_HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES",
     description: "Runtime variable controlling scheduler vram budget bytes in hipfire",
-    source: "crates/hipfire-server/src/lib.rs:741",
+    source: "crates/hipfire-server/src/lib.rs:747",
 };
 
 /// `HIPFIRE_SCHEDULER_VRAM_HEADROOM_BYTES` — Runtime variable controlling scheduler vram headroom bytes in hipfire
 pub const ENV_HIPFIRE_SCHEDULER_VRAM_HEADROOM_BYTES: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_SCHEDULER_VRAM_HEADROOM_BYTES",
     description: "Runtime variable controlling scheduler vram headroom bytes in hipfire",
-    source: "crates/hipfire-server/src/lib.rs:745",
+    source: "crates/hipfire-server/src/lib.rs:751",
 };
 
 /// `HIPFIRE_SCORE_TAIL` — HIPFIRE_SCORE_TAIL=N → score only the last N query positions (leak-free for
@@ -4962,7 +4969,7 @@ pub const ENV_HIP_VISIBLE_DEVICES: EnvVarDoc = EnvVarDoc {
     name: "HIP_VISIBLE_DEVICES",
     description:
         "Used to configure runtime execution by explicitly setting \"HIP_VISIBLE_DEVICES\"",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:2046",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:2216",
 };
 
 /// `HOME` — Runtime variable controlling home in hipfire
@@ -5088,7 +5095,7 @@ pub const ENV_ROCM_PATH: EnvVarDoc = EnvVarDoc {
 pub const ENV_ROCR_VISIBLE_DEVICES: EnvVarDoc = EnvVarDoc {
     name: "ROCR_VISIBLE_DEVICES",
     description: "Runtime variable controlling rocr visible devices in hipfire",
-    source: "crates/hipfire-daemon-adapter/src/lib.rs:1266",
+    source: "crates/hipfire-daemon-adapter/src/lib.rs:1436",
 };
 
 /// `TERM` — Runtime variable controlling term in hipfire
@@ -5176,6 +5183,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_CONV1D_TREE_GFX1151,
     ENV_HIPFIRE_DAEMON_BIN,
     ENV_HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB,
+    ENV_HIPFIRE_DAEMON_SCHED_DEBUG,
     ENV_HIPFIRE_DDTREE_BUDGET,
     ENV_HIPFIRE_DDTREE_FORCE_SLOW,
     ENV_HIPFIRE_DDTREE_LOGW_CUTOFF,

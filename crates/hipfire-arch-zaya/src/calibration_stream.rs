@@ -62,12 +62,15 @@ use hipfire_runtime::calibration::stream::{
     CalibrationResourceEstimate, LayerCapturePartSummary, ModelInspection, RmsNormLmHeadFinalizer,
 };
 use hipfire_runtime::calibration::CalibCollector;
-use hipfire_runtime::weights::{weight_gemv, WeightTensor};
+use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 use std::sync::Arc;
 
 const SOURCE_DTYPES: &[&str] = &["BF16", "F16", "F32"];
 const ZAYA_CALIBRATION_ARCH_IDS: &[u32] = &[ARCH_ID_ZAYA];
-const ADAPTER_VERSION: &str = "zaya-stream-v1";
+// v2 = position-slice batching. The version is part of the run fingerprint, so
+// bumping it deliberately invalidates v1 checkpoints rather than letting a
+// per-token boundary be resumed by batched math.
+const ADAPTER_VERSION: &str = "zaya-stream-v2";
 const FAMILY: &str = "zaya";
 
 /// Router-MLP capture roles. The three router linears all consume distinct
@@ -704,9 +707,23 @@ impl BlockWeights {
     }
 }
 
-/// Single-token scratch, allocated once per resident block.
+/// Position-slice scratch, allocated once per resident block. Every buffer
+/// carries a leading `max_rows` dimension so one slice of same-position tokens
+/// (one per live sequence) flows through the block in a single set of launches.
+///
+/// The boundary row is split in two here rather than kept interleaved as
+/// `[residual | router_state]`: `zaya_router_prep_f32` and
+/// `zaya_affine_residual_f32` index their inputs flatly over `rows * width`, so
+/// they need each field contiguous across rows. De-interleaving costs a host
+/// memcpy per slice (`split_boundary_rows` / `join_boundary_rows`) and saves
+/// writing strided variants of both kernels.
 struct Scratch {
-    boundary: GpuTensor,
+    /// `[max_rows, hidden]` — the residual half of the boundary row.
+    hidden_rows: GpuTensor,
+    /// `[max_rows, router_hidden]` — the EDA router-state half.
+    router_rows: GpuTensor,
+    /// `[max_rows, hidden]` — expert inputs gathered into per-expert runs.
+    expert_in: GpuTensor,
     normed: GpuTensor,
     q: GpuTensor,
     k: GpuTensor,
@@ -736,7 +753,7 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new(gpu: &mut Gpu, config: &ZayaConfig) -> Result<Self, CalibError> {
+    fn new(gpu: &mut Gpu, config: &ZayaConfig, max_rows: usize) -> Result<Self, CalibError> {
         let hidden = config.hidden_size;
         let attn = &config.attn;
         let q_dim = attn.num_heads * attn.head_dim;
@@ -747,12 +764,19 @@ impl Scratch {
         let dw_len = pad + 1 - attn.conv_depthwise_kernel + 1;
         let rh = config.moe.router_hidden_size;
         let moe_int = config.moe.moe_intermediate_size;
-        let mut alloc = |elements: usize| -> Result<GpuTensor, CalibError> {
-            gpu.zeros(&[elements], DType::F32)
+        let rows = max_rows.max(1);
+        // Every buffer is row-major `[rows, width]`; `slice_rows` below indexes
+        // row `r` as `sub_offset(r * width, width)`. Allocating the per-sequence
+        // conv scratch at full width too costs little and keeps one addressing
+        // rule for the whole block instead of two.
+        let mut alloc = |width: usize| -> Result<GpuTensor, CalibError> {
+            gpu.zeros(&[(rows * width).max(1)], DType::F32)
                 .map_err(|error| CalibError::Runtime(error.to_string()))
         };
         Ok(Self {
-            boundary: alloc(boundary_row_width(config))?,
+            hidden_rows: alloc(hidden)?,
+            router_rows: alloc(rh)?,
+            expert_in: alloc(hidden)?,
             normed: alloc(hidden)?,
             q: alloc(q_dim)?,
             k: alloc(k_dim)?,
@@ -784,7 +808,9 @@ impl Scratch {
 
     fn free(self, gpu: &mut Gpu) {
         for tensor in [
-            self.boundary,
+            self.hidden_rows,
+            self.router_rows,
+            self.expert_in,
             self.normed,
             self.q,
             self.k,
@@ -962,6 +988,22 @@ fn load_block_weights(
     })
 }
 
+/// Widest position slice a run can produce: one row per sequence in the group.
+///
+/// The planner walks `for position { for sample in sequence_batch }`, so a slice
+/// never exceeds `sequence_batch` rows however large the row budget is — sizing
+/// the scratch from `max_rows` (which is `sequence_batch * time_tile`) would
+/// over-allocate by the whole time tile.
+fn max_slice_rows(job: &CalibrationJob) -> usize {
+    let sequences = job.samples.samples().len().max(1);
+    job.options
+        .sequence_batch
+        .unwrap_or(1)
+        .min(job.options.max_rows.max(1))
+        .min(sequences)
+        .max(1)
+}
+
 // ── streamed layer ───────────────────────────────────────────────────────────
 
 pub struct ZayaStreamedCalibrationLayer {
@@ -978,6 +1020,13 @@ pub struct ZayaStreamedCalibrationLayer {
     capture_registry: Option<Arc<CaptureRegistry>>,
     collector: Option<Arc<CalibCollector>>,
     telemetry: Option<ExpertTelemetry>,
+    /// Widest position slice the scratch was sized for: one row per sequence in
+    /// the group, since a slice holds at most one token per sequence.
+    max_slice_rows: usize,
+    /// Reused host staging for the boundary de-interleave, so a slice costs no
+    /// allocation per step.
+    hidden_host: Vec<f32>,
+    router_host: Vec<f32>,
 }
 
 impl ZayaStreamedCalibrationLayer {
@@ -995,7 +1044,8 @@ impl ZayaStreamedCalibrationLayer {
             )));
         }
         let weights = load_block_weights(reader, gpu, config, block)?;
-        let scratch = match Scratch::new(gpu, config) {
+        let max_slice_rows = max_slice_rows(job);
+        let scratch = match Scratch::new(gpu, config, max_slice_rows) {
             Ok(scratch) => scratch,
             Err(error) => {
                 weights.free(gpu);
@@ -1007,6 +1057,9 @@ impl ZayaStreamedCalibrationLayer {
             config: config.clone(),
             weights: Some(weights),
             scratch: Some(scratch),
+            max_slice_rows,
+            hidden_host: Vec::with_capacity(max_slice_rows * config.hidden_size),
+            router_host: Vec::with_capacity(max_slice_rows * config.moe.router_hidden_size),
             sample_lengths: job
                 .samples
                 .samples()
@@ -1109,18 +1162,35 @@ impl ZayaStreamedCalibrationLayer {
         Ok(())
     }
 
-    /// One token through the resident hybrid block. `scratch.boundary` already
-    /// holds `[residual | router_state]` and is updated in place.
+    /// One position-slice through the resident hybrid block: `rows` tokens that
+    /// all sit at the SAME position, one per live sequence.
+    ///
+    /// `scratch.hidden_rows` / `scratch.router_rows` already hold the slice's
+    /// boundary halves and are updated in place.
+    ///
+    /// The dense projections run as one `weight_gemm` over all `rows`, which is
+    /// the entire point: at batch 1 every token re-read the whole block's
+    /// weights (37.0 MB/token measured on ZAYA1-8B), and `expert_gate_up` +
+    /// `expert_down` alone were 68% of that. Only the per-sequence state carriers
+    /// stay in a row loop — the CCA convolution, the KV write, attention, and
+    /// RoPE. Their weights are 0.65 MB of the 37, and each sequence must read its
+    /// own history regardless, so looping them costs ~2% of the win.
+    ///
+    /// RoPE is in the row loop for a correctness reason, not a cost one:
+    /// `zaya_rope_partial_qk_posbuf_f32` computes `t = row_index + pos_buf[0]`,
+    /// i.e. it assumes consecutive positions of ONE sequence (prefill shape). A
+    /// position slice is the transpose of that — one position across many
+    /// sequences — so batching it would rotate row `r` by `pos + r`. Called at
+    /// `s = 1` per row it is correct as written.
     #[allow(clippy::too_many_arguments)]
-    fn forward_token(
+    fn forward_position_slice(
         gpu: &mut Gpu,
         config: &ZayaConfig,
         weights: &BlockWeights,
         scratch: &Scratch,
-        state: &mut SeqState,
+        states: &mut [SeqState],
+        rows: &[SliceRow],
         block: usize,
-        token: u32,
-        stratum: &str,
         collector: &CalibCollector,
         registry: &CaptureRegistry,
         telemetry: &mut ExpertTelemetry,
@@ -1141,142 +1211,148 @@ impl ZayaStreamedCalibrationLayer {
         let moe_int = config.moe.moe_intermediate_size;
         let eps = config.rms_norm_eps;
         let l2_scale = (hd as f32).sqrt();
-        let pos = state.next_pos;
+        let s = rows.len();
 
         let run = |result: hipfire_rdna::HipResult<()>| -> Result<(), CalibError> {
             result.map_err(|error| CalibError::Runtime(format!("{error:?}")))
         };
 
-        let hidden = scratch.boundary.sub_offset(0, hidden_dim);
-        let router_state = scratch.boundary.sub_offset(hidden_dim, rh);
-
-        gpu.hip
-            .memcpy_htod(&state.pos_buf, &(pos as i32).to_ne_bytes())
-            .map_err(|error| CalibError::Runtime(error.to_string()))?;
+        let hidden = scratch.hidden_rows.sub_offset(0, s * hidden_dim);
+        let router_state = scratch.router_rows.sub_offset(0, s * rh);
+        let row = |tensor: &GpuTensor, index: usize, width: usize| -> GpuTensor {
+            tensor.sub_offset(index * width, width)
+        };
 
         // ── CCA attention ────────────────────────────────────────────────────
-        run(gpu.rmsnorm_f32(&hidden, &weights.input_ln, &scratch.normed, eps))?;
+        run(gpu.rmsnorm_batched(
+            &hidden,
+            &weights.input_ln,
+            &scratch.normed,
+            s,
+            hidden_dim,
+            eps,
+        ))?;
         collector.capture_by_id(
             gpu,
             registry,
             CaptureId::new(block, ProjectionRole::QueryInput, None),
             &scratch.normed,
-            1,
+            s,
             hidden_dim,
         )?;
-        let gemv = |gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor| {
-            weight_gemv(gpu, w, x, y).map_err(|error| CalibError::Runtime(format!("{error:?}")))
+        let gemm = |gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor, n: usize| {
+            weight_gemm(gpu, w, x, y, n).map_err(|error| CalibError::Runtime(format!("{error:?}")))
         };
-        gemv(gpu, &weights.q_proj, &scratch.normed, &scratch.q)?;
-        gemv(gpu, &weights.k_proj, &scratch.normed, &scratch.k)?;
-        gemv(gpu, &weights.v_cur, &scratch.normed, &scratch.v_cur)?;
-        gemv(gpu, &weights.v_del, &scratch.normed, &scratch.v_del)?;
+        gemm(gpu, &weights.q_proj, &scratch.normed, &scratch.q, s)?;
+        gemm(gpu, &weights.k_proj, &scratch.normed, &scratch.k, s)?;
+        gemm(gpu, &weights.v_cur, &scratch.normed, &scratch.v_cur, s)?;
+        gemm(gpu, &weights.v_del, &scratch.normed, &scratch.v_del, s)?;
 
-        run(gpu.zaya_qk_prep_decode_f32(
-            &scratch.q,
-            &scratch.k,
-            &scratch.q_res,
-            &scratch.k_res,
-            &scratch.cur_qk,
-            nq,
-            nkv,
-            hd,
-            q_dim,
-            k_dim,
-        ))?;
-        run(gpu.zaya_conv_window_f32(
-            &scratch.window,
-            &state.conv_ring,
-            &scratch.cur_qk,
-            conv_ch,
-            pad,
-        ))?;
-        run(gpu.zaya_conv1d_valid_f32(
-            &scratch.dw,
-            &scratch.window,
-            &weights.conv_dw_w,
-            &weights.conv_dw_b,
-            conv_ch,
-            conv_ch,
-            attn.conv_depthwise_kernel,
-            pad + 1,
-            dw_len,
-        ))?;
-        run(gpu.zaya_conv1d_valid_f32(
-            &scratch.gw,
-            &scratch.dw,
-            &weights.conv_gr_w,
-            &weights.conv_gr_b,
-            conv_ch,
-            nq + nkv,
-            attn.conv_grouped_kernel,
-            dw_len,
-            1,
-        ))?;
-        run(gpu.zaya_add_conv_residual_qk_f32(
-            &scratch.query,
-            &scratch.key,
-            &scratch.gw,
-            &scratch.q_res,
-            &scratch.k_res,
-            1,
-            nq,
-            nkv,
-            hd,
-            q_dim,
-        ))?;
-        run(gpu.zaya_value_assemble_decode_f32(
-            &scratch.value,
-            &scratch.v_cur,
-            &state.delayed_v,
-            &scratch.v_del,
-            v_half,
-        ))?;
-        run(gpu.zaya_qk_l2norm_qk_f32(
-            &scratch.query,
-            &scratch.key,
-            &weights.qk_temp,
-            1,
-            nq,
-            nkv,
-            hd,
-            l2_scale,
-            f32::EPSILON,
-        ))?;
-        run(gpu.zaya_rope_partial_qk_posbuf_f32(
-            &scratch.query,
-            &scratch.key,
-            &state.pos_buf,
-            1,
-            nq,
-            nkv,
-            hd,
-            attn.n_rot,
-            attn.rope_theta,
-        ))?;
-        run(gpu.kv_cache_write(&state.k_cache, &scratch.key, &state.pos_buf, kv_dim))?;
-        run(gpu.kv_cache_write(&state.v_cache, &scratch.value, &state.pos_buf, kv_dim))?;
-        run(gpu.attention_f32(
-            &scratch.query,
-            &state.k_cache,
-            &state.v_cache,
-            &scratch.ctx,
-            &state.pos_buf,
-            pos + 1,
-            nq,
-            nkv,
-            hd,
-            state.max_seq,
-        ))?;
+        // Per-sequence region: everything that reads or advances a sequence's own
+        // CCA ring, delayed value, KV cache, or position.
+        for (index, slice_row) in rows.iter().enumerate() {
+            let state = &mut states[slice_row.state_index];
+            let pos = state.next_pos;
+            gpu.hip
+                .memcpy_htod(&state.pos_buf, &(pos as i32).to_ne_bytes())
+                .map_err(|error| CalibError::Runtime(error.to_string()))?;
+            let (q_row, k_row) = (row(&scratch.q, index, q_dim), row(&scratch.k, index, k_dim));
+            let q_res = row(&scratch.q_res, index, q_dim);
+            let k_res = row(&scratch.k_res, index, k_dim);
+            let cur_qk = row(&scratch.cur_qk, index, conv_ch);
+            let window = row(&scratch.window, index, conv_ch * (pad + 1));
+            let dw = row(&scratch.dw, index, conv_ch * dw_len);
+            let gw = row(&scratch.gw, index, conv_ch);
+            let query = row(&scratch.query, index, q_dim);
+            let key = row(&scratch.key, index, k_dim);
+            let value = row(&scratch.value, index, k_dim);
+            let ctx = row(&scratch.ctx, index, q_dim);
+            run(gpu.zaya_qk_prep_decode_f32(
+                &q_row, &k_row, &q_res, &k_res, &cur_qk, nq, nkv, hd, q_dim, k_dim,
+            ))?;
+            run(gpu.zaya_conv_window_f32(&window, &state.conv_ring, &cur_qk, conv_ch, pad))?;
+            run(gpu.zaya_conv1d_valid_f32(
+                &dw,
+                &window,
+                &weights.conv_dw_w,
+                &weights.conv_dw_b,
+                conv_ch,
+                conv_ch,
+                attn.conv_depthwise_kernel,
+                pad + 1,
+                dw_len,
+            ))?;
+            run(gpu.zaya_conv1d_valid_f32(
+                &gw,
+                &dw,
+                &weights.conv_gr_w,
+                &weights.conv_gr_b,
+                conv_ch,
+                nq + nkv,
+                attn.conv_grouped_kernel,
+                dw_len,
+                1,
+            ))?;
+            // s = 1: `conv` is indexed `[channel * s + t]`, so a one-row call
+            // reads the contiguous `gw` this sequence just produced.
+            run(gpu.zaya_add_conv_residual_qk_f32(
+                &query, &key, &gw, &q_res, &k_res, 1, nq, nkv, hd, q_dim,
+            ))?;
+            run(gpu.zaya_value_assemble_decode_f32(
+                &value,
+                &row(&scratch.v_cur, index, v_half),
+                &state.delayed_v,
+                &row(&scratch.v_del, index, v_half),
+                v_half,
+            ))?;
+            run(gpu.zaya_qk_l2norm_qk_f32(
+                &query,
+                &key,
+                &weights.qk_temp,
+                1,
+                nq,
+                nkv,
+                hd,
+                l2_scale,
+                f32::EPSILON,
+            ))?;
+            run(gpu.zaya_rope_partial_qk_posbuf_f32(
+                &query,
+                &key,
+                &state.pos_buf,
+                1,
+                nq,
+                nkv,
+                hd,
+                attn.n_rot,
+                attn.rope_theta,
+            ))?;
+            run(gpu.kv_cache_write(&state.k_cache, &key, &state.pos_buf, kv_dim))?;
+            run(gpu.kv_cache_write(&state.v_cache, &value, &state.pos_buf, kv_dim))?;
+            run(gpu.attention_f32(
+                &query,
+                &state.k_cache,
+                &state.v_cache,
+                &ctx,
+                &state.pos_buf,
+                pos + 1,
+                nq,
+                nkv,
+                hd,
+                state.max_seq,
+            ))?;
+            state.next_pos += 1;
+        }
+
         collector.capture_by_id(
             gpu,
             registry,
             CaptureId::new(block, ProjectionRole::AttentionOutputInput, None),
             &scratch.ctx,
-            1,
+            s,
             q_dim,
         )?;
-        gemv(gpu, &weights.o_proj, &scratch.ctx, &scratch.attn_out)?;
+        gemm(gpu, &weights.o_proj, &scratch.ctx, &scratch.attn_out, s)?;
         run(gpu.zaya_affine_residual_f32(
             &scratch.g_res2,
             &scratch.attn_out,
@@ -1286,134 +1362,208 @@ impl ZayaStreamedCalibrationLayer {
             &weights.pa_rs[2],
             &weights.pa_rs[3],
             hidden_dim,
-            hidden_dim,
+            s * hidden_dim,
         ))?;
 
         // ── EDA router ───────────────────────────────────────────────────────
-        run(gpu.rmsnorm_f32(&scratch.g_res2, &weights.post_attn_ln, &scratch.normed, eps))?;
+        run(gpu.rmsnorm_batched(
+            &scratch.g_res2,
+            &weights.post_attn_ln,
+            &scratch.normed,
+            s,
+            hidden_dim,
+            eps,
+        ))?;
         collector.capture_by_id(
             gpu,
             registry,
             CaptureId::new(block, ProjectionRole::RouterInput, None),
             &scratch.normed,
-            1,
+            s,
             hidden_dim,
         )?;
-        gemv(gpu, &weights.down_proj_w, &scratch.normed, &scratch.rhid)?;
+        gemm(gpu, &weights.down_proj_w, &scratch.normed, &scratch.rhid, s)?;
         // bias add, EDA mix from the previous block's router state, then publish
-        // this block's state back into the boundary row.
+        // this block's state back into the slice's router rows.
         run(gpu.zaya_router_prep_f32(
             &scratch.rhid,
             &weights.down_proj_b,
             &router_state,
             weights.router_states_scale.as_ref(),
             rh,
-            rh,
+            s * rh,
         ))?;
-        run(gpu.rmsnorm_f32(&scratch.rhid, &weights.rnorm_w, &scratch.rnormed, eps))?;
+        run(gpu.rmsnorm_batched(
+            &scratch.rhid,
+            &weights.rnorm_w,
+            &scratch.rnormed,
+            s,
+            rh,
+            eps,
+        ))?;
         collector.capture_by_id(
             gpu,
             registry,
             CaptureId::new(block, ROLE_ROUTER_FC1, None),
             &scratch.rnormed,
-            1,
+            s,
             rh,
         )?;
-        gemv(gpu, &weights.fc1_w, &scratch.rnormed, &scratch.a1)?;
-        run(gpu.zaya_bias_gelu_f32(&scratch.a1, &weights.fc1_b, rh, rh))?;
+        gemm(gpu, &weights.fc1_w, &scratch.rnormed, &scratch.a1, s)?;
+        run(gpu.zaya_bias_gelu_f32(&scratch.a1, &weights.fc1_b, rh, s * rh))?;
         collector.capture_by_id(
             gpu,
             registry,
             CaptureId::new(block, ROLE_ROUTER_FC2, None),
             &scratch.a1,
-            1,
+            s,
             rh,
         )?;
-        gemv(gpu, &weights.fc2_w, &scratch.a1, &scratch.a2)?;
-        run(gpu.zaya_bias_gelu_f32(&scratch.a2, &weights.fc2_b, rh, rh))?;
+        gemm(gpu, &weights.fc2_w, &scratch.a1, &scratch.a2, s)?;
+        run(gpu.zaya_bias_gelu_f32(&scratch.a2, &weights.fc2_b, rh, s * rh))?;
         collector.capture_by_id(
             gpu,
             registry,
             CaptureId::new(block, ROLE_ROUTER_OUT, None),
             &scratch.a2,
-            1,
+            s,
             rh,
         )?;
-        gemv(gpu, &weights.out_proj_w, &scratch.a2, &scratch.rlogits)?;
+        gemm(gpu, &weights.out_proj_w, &scratch.a2, &scratch.rlogits, s)?;
 
         // ── top-1 route (host reduction, matching the resident collector) ────
+        // One download for the whole slice, then the identical per-row softmax /
+        // argmax the single-token path used — the routing decision stays bit-for-bit
+        // what it was, only the arithmetic that produced the logits is batched.
         let logits = gpu
             .download_f32(&scratch.rlogits)
             .map_err(|error| CalibError::Runtime(format!("{error:?}")))?;
-        let max_logit = logits[..n_route]
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        let mut probs = vec![0.0f32; n_route];
-        let mut denom = 0.0f32;
-        for expert in 0..n_route {
-            probs[expert] = (logits[expert] - max_logit).exp();
-            denom += probs[expert];
-        }
-        for prob in probs.iter_mut() {
-            *prob /= denom;
-        }
-        let mut best = 0usize;
-        let mut best_value = f32::NEG_INFINITY;
-        for expert in 0..n_route {
-            let value = probs[expert] + weights.balancing_biases[expert];
-            if value > best_value {
-                best_value = value;
-                best = expert;
+        let mut routes = Vec::with_capacity(s);
+        for index in 0..s {
+            let row_logits = &logits[index * n_route..index * n_route + n_route];
+            let max_logit = row_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut probs = vec![0.0f32; n_route];
+            let mut denom = 0.0f32;
+            for expert in 0..n_route {
+                probs[expert] = (row_logits[expert] - max_logit).exp();
+                denom += probs[expert];
             }
+            for prob in probs.iter_mut() {
+                *prob /= denom;
+            }
+            let mut best = 0usize;
+            let mut best_value = f32::NEG_INFINITY;
+            for expert in 0..n_route {
+                let value = probs[expert] + weights.balancing_biases[expert];
+                if value > best_value {
+                    best_value = value;
+                    best = expert;
+                }
+            }
+            routes.push((best, probs[best]));
         }
-        let weight = probs[best];
-        // The trailing router slot is the MoD skip route, not an expert; the
-        // telemetry contract counts it as a dropped index.
-        telemetry.record_router_selection(
-            block,
-            RoutedRowContext::new(token, stratum),
-            &[best],
-            &[weight],
-        )?;
-
-        run(gpu.fill_f32(&scratch.moe_out, 0.0))?;
-        if best < n_experts {
-            let expert = &weights.experts[best];
-            if telemetry.record_capture_route(
+        // Telemetry is recorded in row order, before any expert grouping, so the
+        // routed-row sequence an artifact records does not depend on batching.
+        for (index, slice_row) in rows.iter().enumerate() {
+            let (best, weight) = routes[index];
+            // The trailing router slot is the MoD skip route, not an expert; the
+            // telemetry contract counts it as a dropped index.
+            telemetry.record_router_selection(
                 block,
-                best,
-                ExpertCaptureRole::GateUpInput,
-                weight,
-            )? == CaptureAdmission::Capture
-            {
-                collector.capture_by_id(
-                    gpu,
-                    registry,
-                    CaptureId::new(block, ProjectionRole::GateUpInput, Some(best)),
-                    &scratch.normed,
-                    1,
-                    hidden_dim,
-                )?;
+                RoutedRowContext::new(slice_row.token, slice_row.stratum.as_str()),
+                &[best],
+                &[weight],
+            )?;
+        }
+
+        run(gpu.fill_f32(&scratch.moe_out.sub_offset(0, s * hidden_dim), 0.0))?;
+        // Group the slice by winning expert so each ACTIVE expert's weights are
+        // read once for all its rows instead of once per row. With 16 experts and
+        // s = 128 that is at most 16 GEMMs of ~8 rows in place of 128 GEMVs — an
+        // 8x cut on the 68% of block traffic the experts own, improving with s.
+        for expert_index in 0..n_experts {
+            let members: Vec<usize> = (0..s)
+                .filter(|&index| routes[index].0 == expert_index)
+                .collect();
+            if members.is_empty() {
+                continue;
             }
-            gemv(gpu, &expert.gate_up, &scratch.normed, &scratch.gate_up)?;
-            let gate = scratch.gate_up.sub_offset(0, moe_int);
-            let up = scratch.gate_up.sub_offset(moe_int, moe_int);
-            run(gpu.silu_mul_f32(&gate, &up, &scratch.act))?;
-            if telemetry.record_capture_route(block, best, ExpertCaptureRole::DownInput, weight)?
-                == CaptureAdmission::Capture
-            {
-                collector.capture_by_id(
-                    gpu,
-                    registry,
-                    CaptureId::new(block, ProjectionRole::DownInput, Some(best)),
-                    &scratch.act,
-                    1,
-                    moe_int,
-                )?;
+            let expert = &weights.experts[expert_index];
+            let count = members.len();
+            // Gather this expert's rows into a contiguous run. Device-to-device,
+            // so the activations never round-trip through the host.
+            for (slot, &index) in members.iter().enumerate() {
+                gpu.hip
+                    .memcpy_dtod_at(
+                        &scratch.expert_in.buf,
+                        slot * hidden_dim * 4,
+                        &scratch.normed.buf,
+                        index * hidden_dim * 4,
+                        hidden_dim * 4,
+                    )
+                    .map_err(|error| CalibError::Runtime(error.to_string()))?;
             }
-            gemv(gpu, &expert.down, &scratch.act, &scratch.down_t)?;
-            run(gpu.scaled_add_inplace_cpu_scalar_f32(&scratch.moe_out, &scratch.down_t, weight))?;
+            // Capture admission is per row and in row order, matching the
+            // single-token path's call sequence for the same set of rows.
+            for (slot, &index) in members.iter().enumerate() {
+                if telemetry.record_capture_route(
+                    block,
+                    expert_index,
+                    ExpertCaptureRole::GateUpInput,
+                    routes[index].1,
+                )? == CaptureAdmission::Capture
+                {
+                    collector.capture_by_id(
+                        gpu,
+                        registry,
+                        CaptureId::new(block, ProjectionRole::GateUpInput, Some(expert_index)),
+                        &row(&scratch.expert_in, slot, hidden_dim),
+                        1,
+                        hidden_dim,
+                    )?;
+                }
+            }
+            gemm(
+                gpu,
+                &expert.gate_up,
+                &scratch.expert_in,
+                &scratch.gate_up,
+                count,
+            )?;
+            // `silu_mul` is elementwise with no weight traffic, and gate/up are
+            // interleaved per row (`[count, 2 * moe_int]`), so it stays per row.
+            for slot in 0..count {
+                let base = slot * 2 * moe_int;
+                let gate = scratch.gate_up.sub_offset(base, moe_int);
+                let up = scratch.gate_up.sub_offset(base + moe_int, moe_int);
+                run(gpu.silu_mul_f32(&gate, &up, &row(&scratch.act, slot, moe_int)))?;
+            }
+            for (slot, &index) in members.iter().enumerate() {
+                if telemetry.record_capture_route(
+                    block,
+                    expert_index,
+                    ExpertCaptureRole::DownInput,
+                    routes[index].1,
+                )? == CaptureAdmission::Capture
+                {
+                    collector.capture_by_id(
+                        gpu,
+                        registry,
+                        CaptureId::new(block, ProjectionRole::DownInput, Some(expert_index)),
+                        &row(&scratch.act, slot, moe_int),
+                        1,
+                        moe_int,
+                    )?;
+                }
+            }
+            gemm(gpu, &expert.down, &scratch.act, &scratch.down_t, count)?;
+            for (slot, &index) in members.iter().enumerate() {
+                run(gpu.scaled_add_inplace_cpu_scalar_f32(
+                    &row(&scratch.moe_out, index, hidden_dim),
+                    &row(&scratch.down_t, slot, hidden_dim),
+                    routes[index].1,
+                ))?;
+            }
         }
         run(gpu.zaya_affine_residual_f32(
             &hidden,
@@ -1424,9 +1574,8 @@ impl ZayaStreamedCalibrationLayer {
             &weights.pm_rs[2],
             &weights.pm_rs[3],
             hidden_dim,
-            hidden_dim,
+            s * hidden_dim,
         ))?;
-        state.next_pos += 1;
         Ok(())
     }
 }
@@ -1472,54 +1621,103 @@ impl CalibrationLayer for ZayaStreamedCalibrationLayer {
             .take()
             .ok_or_else(|| CalibError::Runtime("ZAYA calibration scratch was freed".into()))?;
 
+        let hidden_dim = self.config.hidden_size;
+        let rh = self.config.moe.router_hidden_size;
+        let max_slice = self.max_slice_rows;
         let result = (|| -> Result<(), CalibError> {
-            for (index, row) in batch.rows.iter().enumerate() {
-                if row.sample_index < batch.sequence_start || row.sample_index >= batch.sequence_end
-                {
-                    return Err(CalibError::InvalidOptions(format!(
-                        "sample {} is outside ZAYA scheduler group {}..{}",
-                        row.sample_index, batch.sequence_start, batch.sequence_end
-                    )));
+            // The planner emits rows position-major (`for position { for sample }`),
+            // so each maximal run of equal-position rows is a set of tokens from
+            // DIFFERENT sequences — mutually independent apart from the
+            // within-sequence dependency that attention and the CCA convolution
+            // carry in `SeqState`. That run is the natural batch, and because the
+            // run is contiguous in `batch.rows` it is contiguous in
+            // `input_f32`/`output_f32` too. Ragged tails need no special case: a
+            // slice is however many sequences still have a token at that position.
+            let positions: Vec<usize> = batch.rows.iter().map(|row| row.position).collect();
+            for range in position_slices(&positions, max_slice) {
+                let (start_index, end_index) = (range.start, range.end);
+                let slice = &batch.rows[start_index..end_index];
+                let mut slice_rows = Vec::with_capacity(slice.len());
+                for row in slice {
+                    if row.sample_index < batch.sequence_start
+                        || row.sample_index >= batch.sequence_end
+                    {
+                        return Err(CalibError::InvalidOptions(format!(
+                            "sample {} is outside ZAYA scheduler group {}..{}",
+                            row.sample_index, batch.sequence_start, batch.sequence_end
+                        )));
+                    }
+                    let local = row.sample_index - batch.sequence_start;
+                    let state = &mut self.states[local];
+                    if row.reset_state {
+                        state.reset(gpu)?;
+                    }
+                    if state.next_pos != row.position {
+                        return Err(CalibError::InvalidOptions(format!(
+                            "ZAYA sample {} expected position {}, got {}",
+                            row.sample_index, state.next_pos, row.position
+                        )));
+                    }
+                    slice_rows.push(SliceRow {
+                        state_index: local,
+                        token: row.token,
+                        stratum: self
+                            .sample_strata
+                            .get(row.sample_index)
+                            .cloned()
+                            .unwrap_or_default(),
+                    });
                 }
-                let local = row.sample_index - batch.sequence_start;
-                let state = &mut self.states[local];
-                if row.reset_state {
-                    state.reset(gpu)?;
-                }
-                if state.next_pos != row.position {
-                    return Err(CalibError::InvalidOptions(format!(
-                        "ZAYA sample {} expected position {}, got {}",
-                        row.sample_index, state.next_pos, row.position
-                    )));
-                }
-                let start = index * row_width;
-                let end = start + row_width;
+
+                let start = start_index * row_width;
+                let end = end_index * row_width;
+                split_boundary_rows(
+                    &input_f32[start..end],
+                    row_width,
+                    hidden_dim,
+                    &mut self.hidden_host,
+                    &mut self.router_host,
+                );
                 gpu.hip
                     .memcpy_htod(
-                        &scratch.boundary.buf,
-                        f32_slice_as_bytes(&input_f32[start..end]),
+                        &scratch.hidden_rows.buf,
+                        f32_slice_as_bytes(&self.hidden_host),
                     )
                     .map_err(|error| CalibError::Runtime(error.to_string()))?;
-                Self::forward_token(
+                gpu.hip
+                    .memcpy_htod(
+                        &scratch.router_rows.buf,
+                        f32_slice_as_bytes(&self.router_host),
+                    )
+                    .map_err(|error| CalibError::Runtime(error.to_string()))?;
+
+                Self::forward_position_slice(
                     gpu,
                     &self.config,
                     &weights,
                     &scratch,
-                    state,
+                    &mut self.states,
+                    &slice_rows,
                     self.block,
-                    row.token,
-                    self.sample_strata
-                        .get(row.sample_index)
-                        .map(String::as_str)
-                        .unwrap_or(""),
                     collector.as_ref(),
                     registry.as_ref(),
                     &mut telemetry,
                 )?;
-                let values = gpu
-                    .download_f32(&scratch.boundary)
+
+                let rows = slice_rows.len();
+                let hidden_out = gpu
+                    .download_f32(&scratch.hidden_rows.sub_offset(0, rows * hidden_dim))
                     .map_err(|error| CalibError::Runtime(format!("{error:?}")))?;
-                output_f32[start..end].copy_from_slice(&values[..row_width]);
+                let router_out = gpu
+                    .download_f32(&scratch.router_rows.sub_offset(0, rows * rh))
+                    .map_err(|error| CalibError::Runtime(format!("{error:?}")))?;
+                join_boundary_rows(
+                    &hidden_out,
+                    &router_out,
+                    row_width,
+                    hidden_dim,
+                    &mut output_f32[start..end],
+                );
             }
             Ok(())
         })();
@@ -1582,6 +1780,80 @@ impl CalibrationLayer for ZayaStreamedCalibrationLayer {
             weights.free(gpu);
         }
         Ok(())
+    }
+}
+
+/// Split a microbatch's rows into position slices: maximal runs of rows sharing
+/// one position, capped at `max_slice`.
+///
+/// This encodes the premise the whole batching rests on. `MicrobatchPlanner::plan`
+/// walks `for position { for sample }` and pushes a row only when that sample
+/// still has a token at that position, so a run of equal-position rows is a set
+/// of tokens from DIFFERENT sequences, and ragged tails shrink the run instead of
+/// needing a mask. If that traversal ever became sample-major, runs would be
+/// length 1 and the result would be correct but unbatched — never wrong.
+fn position_slices(positions: &[usize], max_slice: usize) -> Vec<std::ops::Range<usize>> {
+    let max_slice = max_slice.max(1);
+    let mut slices = Vec::new();
+    let mut start = 0usize;
+    while start < positions.len() {
+        let mut end = start;
+        while end < positions.len() && positions[end] == positions[start] && end - start < max_slice
+        {
+            end += 1;
+        }
+        slices.push(start..end);
+        start = end;
+    }
+    slices
+}
+
+/// One token of a position slice, resolved against the resident sequence group.
+struct SliceRow {
+    /// Index into `ZayaStreamedCalibrationLayer::states`.
+    state_index: usize,
+    token: u32,
+    stratum: String,
+}
+
+/// De-interleave `[rows, hidden | router]` boundary rows into two contiguous
+/// runs. The block's batched kernels index flatly over `rows * width`, so each
+/// half has to be contiguous across rows; the boundary store keeps them
+/// interleaved per row because that is the unit the engine checkpoints.
+fn split_boundary_rows(
+    boundary: &[f32],
+    row_width: usize,
+    hidden_dim: usize,
+    hidden_out: &mut Vec<f32>,
+    router_out: &mut Vec<f32>,
+) {
+    let rows = boundary.len() / row_width;
+    hidden_out.clear();
+    router_out.clear();
+    for row in 0..rows {
+        let base = row * row_width;
+        hidden_out.extend_from_slice(&boundary[base..base + hidden_dim]);
+        router_out.extend_from_slice(&boundary[base + hidden_dim..base + row_width]);
+    }
+}
+
+/// Inverse of [`split_boundary_rows`], writing the slice back into the engine's
+/// interleaved boundary layout.
+fn join_boundary_rows(
+    hidden: &[f32],
+    router: &[f32],
+    row_width: usize,
+    hidden_dim: usize,
+    boundary: &mut [f32],
+) {
+    let router_width = row_width - hidden_dim;
+    let rows = boundary.len() / row_width;
+    for row in 0..rows {
+        let base = row * row_width;
+        boundary[base..base + hidden_dim]
+            .copy_from_slice(&hidden[row * hidden_dim..(row + 1) * hidden_dim]);
+        boundary[base + hidden_dim..base + row_width]
+            .copy_from_slice(&router[row * router_width..(row + 1) * router_width]);
     }
 }
 
@@ -1790,20 +2062,27 @@ fn zaya_resource_estimate(
     let pad = attn.conv_state_len() as u128;
     let rh = config.moe.router_hidden_size as u128;
     let moe_int = config.moe.moe_intermediate_size as u128;
-    // Single-token scratch: residual/boundary + attention working set + router +
-    // one expert's gate/up/down staging.
-    let scratch_values = 6 * hidden
-        + 4 * q_dim
-        + 4 * kv_dim
-        + conv_ch * (pad + 4)
+    let active_sequences = geometry
+        .sequence_batch
+        .min(job.samples.samples().len())
+        .max(1) as u128;
+    // Position-slice scratch. Every buffer carries a leading row dimension, and a
+    // slice holds at most one token per sequence, so it scales with the sequence
+    // batch — NOT with `max_rows`, which is the whole `sequence_batch * time_tile`
+    // rectangle. Widths, in order: the two boundary halves + expert gather +
+    // normed/attn_out/g_res2/moe_out/down_t; the router chain; q/k working sets;
+    // the CCA conv staging; and one slice's expert gate/up/act.
+    let scratch_values_per_row = 7 * hidden
         + 5 * rh
-        + 4 * moe_int
+        + 4 * q_dim
+        + 5 * kv_dim
+        + conv_ch * (2 * pad + 5)
+        + 3 * moe_int
         + config.moe.num_router_experts() as u128;
-    let scratch_bytes_total = scratch_values * 4;
+    let scratch_bytes_total = scratch_values_per_row * active_sequences * 4;
     let context = job.samples.context_len() as u128;
     // Per-sequence state: full-context KV plus the CCA conv ring and delayed value.
     let state_bytes_per_sequence = context * kv_dim * 8 + (conv_ch * pad + kv_dim / 2) * 4;
-    let active_sequences = geometry.sequence_batch.min(job.samples.samples().len()) as u128;
     let active_state_bytes = state_bytes_per_sequence * active_sequences + scratch_bytes_total;
     let to_u64 = |label: &str, value: u128| {
         u64::try_from(value).map_err(|_| {
@@ -1865,6 +2144,133 @@ mod tests {
                     seed: 1,
                 },
         }
+    }
+
+    #[test]
+    fn planner_rows_group_into_cross_sequence_position_slices() {
+        use hipfire_runtime::calibration::contracts::{CalibrationSample, SampleSet};
+        use hipfire_runtime::calibration::schedule::{MicrobatchGeometry, MicrobatchPlanner};
+
+        // Ragged on purpose: 4, 2 and 3 tokens. The short sequences must drop out
+        // of the later slices without any masking.
+        let samples = SampleSet::new(
+            vec![
+                CalibrationSample::new("a", vec![1, 2, 3, 4], "text"),
+                CalibrationSample::new("b", vec![5, 6], "text"),
+                CalibrationSample::new("c", vec![7, 8, 9], "text"),
+            ],
+            8,
+            1,
+        )
+        .unwrap();
+        let planner = MicrobatchPlanner::new(MicrobatchGeometry {
+            sequence_batch: 3,
+            time_tile: 4,
+            row_budget: 12,
+        })
+        .unwrap();
+        let batches = planner.plan(&samples);
+        assert_eq!(batches.len(), 1, "one group, one tile");
+        let rows = &batches[0].rows;
+        let positions: Vec<usize> = rows.iter().map(|row| row.position).collect();
+
+        let slices = position_slices(&positions, 3);
+        // Position 0: all three sequences. Position 1: all three. Position 2:
+        // a and c (b ended). Position 3: a alone.
+        let widths: Vec<usize> = slices.iter().map(|range| range.len()).collect();
+        assert_eq!(widths, vec![3, 3, 2, 1]);
+
+        for range in &slices {
+            let slice = &rows[range.clone()];
+            // A slice is one position across DISTINCT sequences — that is what
+            // makes the rows independent enough to batch.
+            let position = slice[0].position;
+            assert!(slice.iter().all(|row| row.position == position));
+            let mut seen: Vec<usize> = slice.iter().map(|row| row.sample_index).collect();
+            let before = seen.len();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), before, "a slice repeats a sequence");
+        }
+    }
+
+    #[test]
+    fn a_narrow_scratch_caps_slice_width_without_dropping_rows() {
+        // Every row still runs, just in narrower slices — the cap is a memory
+        // bound, never a correctness one.
+        let positions = vec![0, 0, 0, 0, 0, 1, 1];
+        let slices = position_slices(&positions, 2);
+        assert_eq!(
+            slices,
+            vec![0..2, 2..4, 4..5, 5..7],
+            "runs split at the cap and never straddle a position change"
+        );
+        let covered: usize = slices.iter().map(|range| range.len()).sum();
+        assert_eq!(covered, positions.len());
+    }
+
+    #[test]
+    fn boundary_halves_round_trip_through_the_de_interleave() {
+        // row_width = 5 = hidden 3 + router 2, three rows.
+        let boundary: Vec<f32> = (0..15).map(|value| value as f32).collect();
+        let (mut hidden, mut router) = (Vec::new(), Vec::new());
+        split_boundary_rows(&boundary, 5, 3, &mut hidden, &mut router);
+        assert_eq!(hidden, vec![0.0, 1.0, 2.0, 5.0, 6.0, 7.0, 10.0, 11.0, 12.0]);
+        assert_eq!(router, vec![3.0, 4.0, 8.0, 9.0, 13.0, 14.0]);
+
+        let mut rejoined = vec![0.0f32; boundary.len()];
+        join_boundary_rows(&hidden, &router, 5, 3, &mut rejoined);
+        assert_eq!(rejoined, boundary, "split/join must be exactly inverse");
+    }
+
+    #[test]
+    fn scratch_rows_follow_the_sequence_batch_not_the_row_budget() {
+        use hipfire_runtime::calibration::contracts::{
+            CalibrationOptions, CalibrationSample, SampleSet,
+        };
+
+        let build = |sequences: usize, options: CalibrationOptions| {
+            let samples: Vec<CalibrationSample> = (0..sequences)
+                .map(|index| CalibrationSample::new(format!("s{index}"), vec![1, 2, 3, 4], "text"))
+                .collect();
+            CalibrationJob::new(
+                "source",
+                "tokenizer",
+                SampleSet::new(samples, 8, 1).unwrap(),
+                options,
+            )
+            .unwrap()
+        };
+
+        // A slice holds at most one token per sequence, so the scratch is sized
+        // by the sequence batch (8) — NOT by max_rows (8 * 16 = 128). Sizing it
+        // from max_rows would over-allocate every buffer by the whole time tile.
+        let options = CalibrationOptions {
+            max_rows: 128,
+            sequence_batch: Some(8),
+            time_tile: Some(16),
+            ..CalibrationOptions::default()
+        };
+        assert_eq!(max_slice_rows(&build(32, options)), 8);
+
+        // Fewer sequences than the batch: the corpus clamps it, since a slice
+        // cannot be wider than the number of live sequences.
+        let options = CalibrationOptions {
+            max_rows: 128,
+            sequence_batch: Some(8),
+            time_tile: Some(16),
+            ..CalibrationOptions::default()
+        };
+        assert_eq!(max_slice_rows(&build(3, options)), 3);
+
+        // Geometry not yet resolved: fall back to one row, never zero.
+        let options = CalibrationOptions {
+            max_rows: 16,
+            sequence_batch: None,
+            time_tile: None,
+            ..CalibrationOptions::default()
+        };
+        assert_eq!(max_slice_rows(&build(4, options)), 1);
     }
 
     #[test]

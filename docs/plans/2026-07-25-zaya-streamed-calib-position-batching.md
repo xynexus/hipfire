@@ -1,7 +1,39 @@
 # ZAYA streamed calibration: position-slice batching
 
-Status: planned 2026-07-25. Supersedes the per-token inner loop in
-`crates/hipfire-arch-zaya/src/calibration_stream.rs` (`zaya-stream-v1`).
+Status: **implemented 2026-07-27** as `zaya-stream-v2`. Supersedes the per-token
+inner loop in `crates/hipfire-arch-zaya/src/calibration_stream.rs`.
+
+## Corrections found during implementation
+
+Three claims below were wrong. They are left in place with this note rather than
+edited away, because each one is a trap the next reader could fall into again.
+
+1. **RoPE cannot be batched over a position slice.** §"No new HIP kernels
+   required" says `zaya_rope_partial_qk_posbuf_f32` needs no change because every
+   token in a slice shares a position. The kernel actually computes
+   `t = (local / heads) + pos_buf[0]` — it derives each row's position from its
+   *row index*, i.e. it assumes consecutive positions of ONE sequence. That is
+   prefill shape; a position slice is its transpose. Batched, it would rotate row
+   `r` by `pos + r`. It now runs at `s = 1` inside the per-sequence loop. This is
+   the same trap the attention/KV-write correction already documents, in a third
+   kernel — when a kernel takes an `s`, check whether `s` means "rows of one
+   sequence" before assuming it means "independent rows".
+2. **`zaya_add_conv_residual_qk_f32` cannot be batched either**, for a related
+   reason: it reads `conv[channel * s + t]`, a channel-major `[conv_ch, s]`
+   layout. The per-sequence convolution writes contiguous `[conv_ch]` rows, which
+   is not that layout, so it also runs at `s = 1`.
+3. **The boundary row has to be de-interleaved.** §"Shape of the change" keeps
+   `boundary` as `[max_rows, row_width]`, but `zaya_router_prep_f32` and
+   `zaya_affine_residual_f32` index flatly over `rows * width`, so each half must
+   be contiguous *across* rows — the interleaved row layout strides them. The
+   halves are split on the host on the way in and rejoined on the way out
+   (`split_boundary_rows` / `join_boundary_rows`), which costs one host memcpy per
+   slice and avoids writing strided variants of both kernels.
+
+Also worth knowing for the gate: **the ZAYA resident collector refuses a
+multi-sample job** ("this resident family has no state-reset oracle"), so the
+resident comparison can only ever run at one sample — it cannot exercise batching
+at all. See the validation section for what was run instead.
 
 ## Why
 
@@ -120,7 +152,49 @@ Kernels already taking an `n`/`s` and needing no change: `zaya_affine_residual_f
    fingerprint, so this **deliberately invalidates existing checkpoints** rather
    than letting a v1 boundary be resumed by v2 math.
 
-## Validation gate
+## Validation results (2026-07-27, halo / gfx1151, ZAYA1-8B)
+
+The gate as written could not be run: the resident oracle is single-sample only,
+so "block 0 identical vs resident" says nothing about batching. What was run
+instead isolates the variable directly — **the same 4-sample job at slice width 1
+and at slice width 4** — plus a v1-vs-v2 regression check.
+
+1. **v2 at slice width 1 is BIT-IDENTICAL to v1.** Same job, zero tolerance:
+   0 mismatched tensors of 1789, **0 mismatched values of 447,272,063**, every
+   metadata field matching including `kldref`. So the restructure itself —
+   `weight_gemv`→`weight_gemm`, `rmsnorm_f32`→`rmsnorm_batched`, the boundary
+   de-interleave, expert grouping, the slice loop — introduces no numerical change
+   at all. Only real batching moves numbers.
+2. **Slice width 4 vs width 1** (1024 rows, 4 sequences x 256 tokens): 287 of
+   1859 tensors differ, in 138,951 of 447,514,108 values (**0.031%**). Every
+   difference is a dense Hessian; **no expert tensor differs**, and
+   `per_tensor_tokens` matches exactly — i.e. **routing did not flip at all** at
+   this scale, so the plan's predicted top-1 route-flip figure is 0/1024 here.
+   Worst dense tensor differs in 9.1e-5 of its values at `max_abs 0.25`; Hessians
+   are stored as bf16 (`quant_type 130`), so these are single-ULP storage
+   differences from GEMM-vs-GEMV reassociation. Block 0 shows 6 such tensors, four
+   of which (`q_proj`, `k_proj`, `v_proj_current`, `v_proj_delayed`) have
+   *identical* 26/2,098,176 counts and magnitudes — they share one input, so the
+   common cause is the batched rmsnorm's reduction order, not the slicing.
+3. **`lm_head.kldref_*` differs almost entirely between the two geometries, and
+   this is NOT a numerical difference.** The two position maps hold the identical
+   *set* of 1020 `(sample, position)` rows in different order — sample-major at
+   width 1, position-major at width 4 — so the comparator, which diffs
+   positionally, reports near-total mismatch on permuted-but-equal data. This
+   follows the microbatch traversal and is therefore a property of the geometry,
+   not of this change; any two geometries would show it.
+4. **Throughput: 6m05s at width 4 vs 9m12s at width 1** for the identical 1024-row
+   job — 1.51x. That understates the kernel win considerably: both runs re-read
+   17.68 GB of source weights from the network mount, which is unaffected by
+   batching and dominates at this size. The plan's own arithmetic (weight bytes
+   per token falling 37.0 MB -> 0.289 MB at batch 128) is where the real win sits,
+   and it needs a full-size run to observe.
+
+Not yet run: a full `--sequences 128 --context 2048` run to re-measure GFLOP/s and
+weight bandwidth against the 0.07%-of-peak baseline, and any check at slice widths
+above 4.
+
+## Validation gate (as originally specified)
 
 Non-negotiable, because this rewrites the numerics' execution order:
 
