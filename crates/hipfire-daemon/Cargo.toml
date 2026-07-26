@@ -34,6 +34,7 @@ hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
 hipfire-build-info = { path = "../hipfire-build-info" }
 hipfire-evidence = { path = "../hipfire-evidence" }
 hipfire-lock = { path = "../hipfire-lock" }
+hipfire-scheduler = { path = "../hipfire-scheduler" }
 hipfire-serving-core = { path = "../hipfire-serving-core" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-model = { path = "../hipfire-model" }

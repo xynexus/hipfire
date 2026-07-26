@@ -30,6 +30,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
@@ -87,15 +88,47 @@ pub(crate) enum Payload {
 pub(crate) struct Inbound {
     pub payload: Payload,
     pub reply: ReplySink,
+    /// Which connection this arrived on.
+    ///
+    /// The scheduler needs it because a connection's frames are a DEPENDENCY
+    /// CHAIN, not independent work: `reserve_session_state` → `generate_batch_prefill`
+    /// → `generate_batch_decode_step` → `release_sessions`, or plain
+    /// `load` → `generate` → `unload`. Reordering within a connection would run a
+    /// request before the one it depends on. Across connections there is no such
+    /// relationship, which is the only place reordering is safe.
+    pub conn: u64,
+    /// Global arrival order, used to break priority ties so equal-priority work
+    /// stays first-come-first-served.
+    pub seq: u64,
+    /// Lower is sooner, matching `hipfire_scheduler`'s numbering (0 realtime,
+    /// 64 default, 255 opportunistic). Absent on the wire means default.
+    pub priority: u8,
 }
 
-/// Rendezvous, so a reader cannot run ahead of the executor and buffer the whole
-/// backlog in memory.
+/// How many frames may sit between the readers and the executor.
 ///
-/// This preserves the stdio path's backpressure exactly — the OS pipe stays the
-/// queue. M4 is what deliberately raises it, because a scheduler needs several
-/// pending requests in hand before it has anything to choose between.
-const INBOUND_CAPACITY: usize = 0;
+/// This was 0 (rendezvous) until the daemon had a scheduler: with nothing to
+/// choose between, buffering bought nothing and the OS pipe was a fine queue.
+/// A scheduler needs several pending requests IN HAND to reorder, so a reader
+/// must be able to deposit a frame while the executor is busy — at capacity 0 a
+/// long generation blocks every reader, and nothing can queue behind it.
+///
+/// Bounded rather than unbounded so a client cannot make the daemon buffer without
+/// limit; past this the readers block again and backpressure returns to the pipe.
+const INBOUND_CAPACITY: usize = 256;
+
+static NEXT_CONN: AtomicU64 = AtomicU64::new(0);
+static NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Read a request's scheduling priority, clamped to the same scale the server
+/// uses so both ends agree on what "high" means.
+fn frame_priority(value: &serde_json::Value) -> u8 {
+    value
+        .get("priority")
+        .and_then(|v| v.as_i64())
+        .map(hipfire_scheduler::clamp_scheduler_priority)
+        .unwrap_or(hipfire_scheduler::SCHED_PRIORITY_DEFAULT)
+}
 
 /// Default socket path, defined once in the adapter so the listening end and the
 /// connecting end cannot disagree about where the door is.
@@ -110,9 +143,10 @@ pub(crate) fn default_socket_path() -> PathBuf {
 pub(crate) fn spawn_stdin_reader() -> Receiver<Inbound> {
     let (tx, rx) = sync_channel(INBOUND_CAPACITY);
     let reply = ReplySink::new(std::io::stdout());
+    let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
     std::thread::Builder::new()
         .name("hipfire-daemon-stdin".to_string())
-        .spawn(move || read_frames(std::io::stdin().lock(), &tx, &reply))
+        .spawn(move || read_frames(std::io::stdin().lock(), &tx, &reply, conn))
         .expect("spawn stdin reader thread");
     rx
 }
@@ -167,7 +201,8 @@ fn accept_loop(listener: UnixListener, tx: SyncSender<Inbound>) {
 
 fn serve_connection(read_half: UnixStream, write_half: UnixStream, tx: &SyncSender<Inbound>) {
     let reply = ReplySink::new(write_half);
-    read_frames(BufReader::new(read_half), tx, &reply);
+    let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
+    read_frames(BufReader::new(read_half), tx, &reply, conn);
 }
 
 /// Frames a reader answers itself, without involving the executor.
@@ -193,7 +228,7 @@ fn handle_control_frame(value: &serde_json::Value) -> bool {
 
 /// Read newline-delimited frames from `source` and forward them until EOF, a read
 /// error, or the executor hanging up.
-fn read_frames(source: impl BufRead, tx: &SyncSender<Inbound>, reply: &ReplySink) {
+fn read_frames(source: impl BufRead, tx: &SyncSender<Inbound>, reply: &ReplySink, conn: u64) {
     for line in source.lines() {
         let Ok(line) = line else {
             // A read error is EOF as far as the protocol is concerned; the old
@@ -203,6 +238,7 @@ fn read_frames(source: impl BufRead, tx: &SyncSender<Inbound>, reply: &ReplySink
         if line.trim().is_empty() {
             continue;
         }
+        let mut priority = hipfire_scheduler::SCHED_PRIORITY_DEFAULT;
         let payload = match serde_json::from_str::<serde_json::Value>(&line) {
             Ok(value) => {
                 // Control frames never enter the queue: with a rendezvous channel
@@ -211,6 +247,7 @@ fn read_frames(source: impl BufRead, tx: &SyncSender<Inbound>, reply: &ReplySink
                 if handle_control_frame(&value) {
                     continue;
                 }
+                priority = frame_priority(&value);
                 Payload::Request(value)
             }
             Err(error) => Payload::Malformed(error.to_string()),
@@ -221,6 +258,9 @@ fn read_frames(source: impl BufRead, tx: &SyncSender<Inbound>, reply: &ReplySink
             .send(Inbound {
                 payload,
                 reply: reply.clone(),
+                conn,
+                seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
+                priority,
             })
             .is_err()
         {
@@ -236,7 +276,7 @@ mod tests {
     fn drain(input: &str) -> Vec<Payload> {
         let (tx, rx) = sync_channel(64);
         let reply = ReplySink::new(Vec::new());
-        read_frames(std::io::Cursor::new(input.to_string()), &tx, &reply);
+        read_frames(std::io::Cursor::new(input.to_string()), &tx, &reply, 0);
         drop(tx);
         rx.into_iter().map(|frame| frame.payload).collect()
     }
@@ -273,6 +313,7 @@ mod tests {
             std::io::Cursor::new("{\"type\":\"ping\"}\n".to_string()),
             &tx,
             &reply,
+            0,
         );
     }
 
@@ -284,11 +325,17 @@ mod tests {
         let (tx, rx) = sync_channel(64);
         let first = ReplySink::new(Vec::new());
         let second = ReplySink::new(Vec::new());
-        read_frames(std::io::Cursor::new("{\"n\":1}\n".to_string()), &tx, &first);
+        read_frames(
+            std::io::Cursor::new("{\"n\":1}\n".to_string()),
+            &tx,
+            &first,
+            1,
+        );
         read_frames(
             std::io::Cursor::new("{\"n\":2}\n".to_string()),
             &tx,
             &second,
+            2,
         );
         drop(tx);
 

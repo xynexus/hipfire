@@ -1046,6 +1046,7 @@ mod resource_reservation_tests {
 mod generate_batch_prefill_tests;
 
 mod handlers;
+mod queue;
 mod state;
 mod transport;
 use state::DaemonState;
@@ -1264,8 +1265,50 @@ fn main() {
         },
     };
 
-    for frame in inbound {
-        let transport::Inbound { payload, reply } = frame;
+    // Drain whatever has arrived, then run whichever pending frame the queue picks.
+    // Draining first is what gives the scheduler a choice: blocking straight on
+    // `recv` would take frames in arrival order and there would be nothing to
+    // choose between. See `queue` for why reordering is safe only across
+    // connections.
+    let mut pending = queue::PendingQueue::default();
+    loop {
+        if pending.is_empty() {
+            // Nothing in hand: block until something arrives, and stop when every
+            // reader has hung up (stdin EOF, or the listener shutting down).
+            match inbound.recv() {
+                Ok(frame) => pending.push(frame),
+                Err(_) => break,
+            }
+        }
+        // Take everything else already queued so the choice is over the whole
+        // backlog rather than just the first arrival.
+        while let Ok(frame) = inbound.try_recv() {
+            pending.push(frame);
+        }
+        let Some(frame) = pending.pop_next() else {
+            continue;
+        };
+        // Scheduling decisions are otherwise unobservable from outside: replies
+        // race each other through the client's sockets, so client-side arrival
+        // order does NOT report what the daemon actually chose. This trace is the
+        // ground truth, and is what the reordering test asserts on.
+        if std::env::var("HIPFIRE_DAEMON_SCHED_DEBUG").as_deref() == Ok("1") {
+            eprintln!(
+                "[sched] chose conn={} seq={} pri={} (queue depth after: {})",
+                frame.conn,
+                frame.seq,
+                frame.priority,
+                pending.len()
+            );
+        }
+
+        let transport::Inbound {
+            payload,
+            reply,
+            conn: _,
+            seq: _,
+            priority: _,
+        } = frame;
 
         // Answer on the connection this frame arrived on, rather than wherever the
         // previous one came from. With a single stdio client this is a no-op; with

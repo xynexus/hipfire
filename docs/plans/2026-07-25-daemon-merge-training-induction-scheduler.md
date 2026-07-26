@@ -474,6 +474,41 @@ reservation.
 per-model DFlash/normalize behaviour by spawning a daemon with that environment, so
 it needs those as request fields before it can attach.
 
+**M4b — the daemon chooses. Done.** `hipfire-scheduler` is now a daemon dependency
+(for its priority scale, so both ends mean the same thing by a number), requests
+carry an optional `priority`, and a `PendingQueue` sits between the readers and the
+executor. The inbound channel goes from rendezvous to bounded-256: a scheduler needs
+several frames *in hand* to reorder, and at capacity 0 a long generation blocked
+every reader so nothing could queue behind it.
+
+**The invariant that makes reordering safe is per-connection ordering.** A
+connection's frames are a dependency chain — `reserve_session_state` →
+`generate_batch_prefill` → `generate_batch_decode_step` → `release_sessions`, or
+`load` → `generate` → `unload` — and nothing in the protocol declares those
+dependencies: the order *is* the declaration. So the queue holds one FIFO per
+connection and chooses only among their heads. Priority decides which *client* goes
+next, never which of a client's own requests goes next. Equal priority falls back to
+arrival order, so connections cannot starve each other by id.
+
+A consequence worth stating: with one connection — all of stdio, and any single
+socket client — selection is a no-op and behaviour is exactly FIFO as before.
+Reordering only becomes observable with concurrent clients, which is also the only
+situation where it is safe.
+
+*Exit (M4b, met):* five ordering invariants unit-tested, and demonstrated live —
+five bulk (priority 200) frames queued on one connection *before* five realtime
+(priority 0) frames on another, both behind a 25 s model load; the daemon chose
+`[0,0,0,0,0,200,200,200,200,200]`.
+
+**A measurement trap worth recording, since it produced two false failures.**
+Client-side reply order does NOT report service order. Replies written microseconds
+apart race through separate sockets, so with one watcher thread per connection the
+recording reflects thread wake order, and with a single `select()` loop it reflects
+iteration order of the fd list. Both said "arrival order, no reordering" while the
+daemon was in fact reordering correctly. Scheduling decisions are only observable
+from inside, which is why the executor now has an env-gated `[sched]` trace
+(`HIPFIRE_DAEMON_SCHED_DEBUG=1`) and why the test asserts on that.
+
 
 `hipfire-scheduler` becomes a daemon dep. `batch_runner_loop`
 (`hipfire-server/src/batch_runner.rs:464`) moves to `daemon/src/executor.rs` with its LIFO
