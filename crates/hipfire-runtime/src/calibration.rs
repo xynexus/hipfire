@@ -833,7 +833,7 @@ where
     )
 }
 
-fn qwen3_embedding_layer_tensor_names(layer_idx: usize) -> [String; 7] {
+fn llama_family_layer_tensor_names(layer_idx: usize) -> [String; 7] {
     let prefix = format!("model.layers.{layer_idx}");
     [
         format!("{prefix}.self_attn.q_proj"),
@@ -870,12 +870,140 @@ fn qwen3_embedding_capture_names_for_layers(
         ];
         for (weight, name) in linears
             .into_iter()
-            .zip(qwen3_embedding_layer_tensor_names(layer_idx))
+            .zip(llama_family_layer_tensor_names(layer_idx))
         {
             names.insert(weight.buf.buf.as_ptr() as usize, name);
         }
     }
     names
+}
+
+/// Capture map for a plain LLaMA/Mistral/Qwen2 (`arch_id` 0/1) layer range:
+/// the seven dense projections per layer, plus `lm_head` registered exactly
+/// once (in the group covering the final layer, so `collect_grouped`'s combine
+/// step never sees a duplicate descriptor).
+fn llama_capture_names_for_layers(
+    weights: &crate::llama::LlamaWeights,
+    start_layer: usize,
+    end_layer: usize,
+    num_layers: usize,
+) -> HashMap<usize, String> {
+    let mut names = HashMap::new();
+    for (layer_idx, layer) in weights
+        .layers
+        .iter()
+        .enumerate()
+        .skip(start_layer)
+        .take(end_layer.saturating_sub(start_layer))
+    {
+        let linears = [
+            &layer.wq,
+            &layer.wk,
+            &layer.wv,
+            &layer.wo,
+            &layer.w_gate,
+            &layer.w_up,
+            &layer.w_down,
+        ];
+        for (weight, name) in linears
+            .into_iter()
+            .zip(llama_family_layer_tensor_names(layer_idx))
+        {
+            names.insert(weight.buf.buf.as_ptr() as usize, name);
+        }
+    }
+    if end_layer >= num_layers {
+        names.insert(weights.output.buf.buf.as_ptr() as usize, "lm_head".to_string());
+    }
+    names
+}
+
+/// Collect a full-Hessian + imatrix `.calib.hfq` for a plain LLaMA/Mistral/
+/// Qwen2 model (`arch_id` 0/1). This is the calibration source for the
+/// activation-aware (`oq*+`) and full-Hessian LDLQ (`oq*++`) Opus-Quant
+/// formats, which `hipfire-quantize` consumes via `--imatrix` / `--hessian`.
+///
+/// Sibling of [`collect_qwen3_embedding_artifacts`] but for causal generation:
+/// every captured projection keeps its full `[K,K]` Hessian (empty
+/// `imatrix_only`), and the corpus is windowed into fixed-length prefill chunks
+/// so an arbitrarily long calibration token stream never needs a full-length KV
+/// cache — the Hessian accumulates across windows. `arch_id` (0 or 1) is
+/// threaded through so the sidecar records the true source family.
+pub fn collect_llama_calibration_artifacts(
+    gpu: &mut Gpu,
+    weights: &crate::llama::LlamaWeights,
+    config: &crate::llama::LlamaConfig,
+    tokens: &[u32],
+    arch_id: u32,
+    output: &std::path::Path,
+    provenance: &[(&str, serde_json::Value)],
+) -> Result<CalibSummary, String> {
+    if tokens.is_empty() {
+        return Err("llama calibration: token set is empty".to_string());
+    }
+
+    // Prefill-window length. A single KV cache spanning the whole corpus is
+    // infeasible and unnecessary — capture is per-token, so we prefill the
+    // corpus in fixed windows and let the Hessian accumulate across them.
+    let ctx = std::env::var("HIPFIRE_LLAMA_CALIB_CTX")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(2048)
+        .min(config.max_seq_len.max(1));
+
+    // Full [K,K] Hessians for all layers of a large model do not fit at once;
+    // capture in layer groups (each group re-runs the windowed forward but
+    // registers only its own tensors), like the gemma3/qwen3-embedding paths.
+    let layers_per_pass = std::env::var("HIPFIRE_LLAMA_CALIB_LAYERS_PER_PASS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(4)
+        .min(config.n_layers.max(1));
+
+    let total_tokens = tokens.len();
+    let window_count = total_tokens.div_ceil(ctx);
+    let mut metadata = provenance.to_vec();
+    metadata.extend([
+        ("arch", serde_json::json!("llama")),
+        ("causal", serde_json::json!(true)),
+        ("text_only", serde_json::json!(true)),
+        ("imatrix_only", serde_json::json!(false)),
+        ("total_tokens", serde_json::json!(total_tokens)),
+        ("context_window", serde_json::json!(ctx)),
+        ("window_count", serde_json::json!(window_count)),
+        ("layers_per_pass", serde_json::json!(layers_per_pass)),
+    ]);
+
+    let mut kv_cache = crate::llama::KvCache::new_gpu(
+        gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        ctx,
+    )
+    .map_err(|error| format!("llama calibration KV cache: {error:?}"))?;
+
+    let result = collect_grouped(
+        gpu,
+        arch_id,
+        config.n_layers,
+        layers_per_pass,
+        Vec::new(), // full [K,K] Hessians for every captured tensor
+        output,
+        &metadata,
+        |start, end| llama_capture_names_for_layers(weights, start, end, config.n_layers),
+        |gpu, _group_idx| {
+            for window in tokens.chunks(ctx) {
+                crate::llama::prefill_forward(gpu, weights, config, window, &mut kv_cache)
+                    .map_err(|error| format!("llama calibration forward: {error:?}"))?;
+            }
+            Ok(CalibForward::default())
+        },
+    );
+    kv_cache.free_gpu(gpu);
+    result
 }
 
 fn validate_qwen3_embedding_samples(
@@ -1816,7 +1944,7 @@ mod tests {
 
     #[test]
     fn qwen3_embedding_capture_names_cover_all_encoder_linears() {
-        let names = qwen3_embedding_layer_tensor_names(3);
+        let names = llama_family_layer_tensor_names(3);
         assert_eq!(names.len(), 7);
         assert_eq!(names[0], "model.layers.3.self_attn.q_proj");
         assert_eq!(names[1], "model.layers.3.self_attn.k_proj");

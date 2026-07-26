@@ -50,7 +50,10 @@ use hipfire_arch_qwen35::qwen35::{self, CalibOpts as QwenCalibOpts};
 use hipfire_arch_zaya::{calibration as zaya_calib, ZayaConfig};
 use hipfire_rdna::Gpu;
 use hipfire_runtime::calibration::contracts::CalibrationJob;
-use hipfire_runtime::calibration::{collect_qwen3_embedding_artifacts, tokenize_embedding_samples};
+use hipfire_runtime::calibration::{
+    collect_llama_calibration_artifacts, collect_qwen3_embedding_artifacts,
+    tokenize_embedding_samples,
+};
 use std::path::Path;
 
 fn arg(flag: &str, default: Option<String>) -> Option<String> {
@@ -584,9 +587,32 @@ fn main() {
                 "nemotron-h",
             )
         }
+        0 | 1 => {
+            // Plain LLaMA/Mistral (0) and Qwen2/Qwen3-legacy (1), non-embedding.
+            // Arch-1 embedding workloads are claimed by the guarded arm above.
+            let config = hipfire_runtime::hfq::config_from_hfq(&hfq).expect("llama config");
+            let weights = hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, &mut gpu)
+                .expect("llama weights");
+            let summary = collect_llama_calibration_artifacts(
+                &mut gpu,
+                &weights,
+                &config,
+                tokens,
+                source_arch_id,
+                Path::new(&output),
+                &provenance,
+            )
+            .expect("collect");
+            (
+                summary.n_hessian,
+                summary.n_imatrix,
+                summary.max_consistency,
+                "llama",
+            )
+        }
         other => {
             panic!(
-                "collect_artifacts: unsupported arch_id {other}; handled 5/6/10/11/12/13/14/16/19"
+                "collect_artifacts: unsupported arch_id {other}; handled 0/1/5/6/10/11/12/13/14/16/19"
             )
         }
     };
