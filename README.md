@@ -1,19 +1,34 @@
 # hipfire
 
-LLM inference for AMD RDNA GPUs. Rust + HIP. Single binary. No Python
-in the hot path. Ollama-style UX.
+A Rust-native inference engine for AMD GPUs, NPUs, and APUs. Single binary,
+HIP/ROCm-direct, with production tooling kept out of Python.
+
+hipfire runs a **daemon** that serves concurrent, prioritized batching of
+multi-modal inference, embedding + rerank, and image generation — with
+opportunistic background training and offline steering. The OpenAI **Responses**
+API is the primary first-class interface (embedding, rerank, and image-gen are
+first-class alongside it); **chat-completions** and **AUTOMATIC1111-style SD**
+endpoints are provided for backwards compatibility. Web-based admin + monitoring
+is included.
+
+**Hardware:** supported GPUs align with ROCm; supported NPUs align with the XDNA
+NPUs in AMD APUs. The RX 5700 XT (RDNA1) bring-up was the origin (see "Historical
+RDNA1 bootstrap" below); the engine now spans RDNA1–4, Vega/CDNA, and XDNA.
+
+**KV:** KVarN and the hierarchical hot/cold cache are the primary KV systems;
+asym is retained only as a baseline to beat.
 
 ```bash
 hipfire chat -m qwen3.5:9b "What is the capital of France?"
-hipfire serve              # OpenAI-compatible API on 0.0.0.0:11435
+hipfire serve              # OpenAI-compatible API on 127.0.0.1:11435
 ```
 
-Current release: **v0.3.0** — chaingun runtime, Opus quantization, hierarchical KV, and operator surfaces. DeepSeek V4 Flash support landed in v0.2.0. See [CHANGELOG.md](CHANGELOG.md).
+Current release: **v0.3.0** — modular runtime, Opus quantization, hierarchical KV, and operator surfaces. DeepSeek V4 Flash support landed in v0.2.0. See [CHANGELOG.md](CHANGELOG.md).
 
-`chaingun` development builds use the Git-derived subpatch identity
+`master` development builds use the Git-derived subpatch identity
 `vX.Y.Z-N-gSHA`, where `N` is the commit count since the release tag. The
-`chaingun-version` GitHub Action emits that identity on every accepted
-`chaingun` commit, and the binaries report the same string from `--version`
+`master-version` GitHub Action emits that identity on every accepted
+`master` commit, and the binaries report the same string from `--version`
 (embedded at build time by `hipfire-build-info` via `vergen-gitcl`, falling back
 to the static crate version when built without a `.git`). `Cargo.toml` stays at
 the release SemVer until the next intentional release bump.
@@ -24,8 +39,9 @@ Discord: <https://discord.gg/F3BaywB8Rs>
 
 `llama.cpp + ROCm` works on RDNA but is painful: upstream ROCm
 officially supports only a handful of datacenter cards; consumer RDNA
-is a second-class citizen. hipfire targets the entire RDNA family
-(RDNA1 → RDNA4, consumer + pro + APU) with a single Rust binary that
+is a second-class citizen. hipfire targets AMD accelerators broadly —
+GPUs across the ROCm-supported range (RDNA1 → RDNA4, Vega/CDNA, consumer +
+pro) plus the XDNA NPUs in AMD APUs — with a single Rust binary that
 ships pre-compiled kernel blobs when possible and JIT-compiles the
 rest through HIP. No Python, no PyTorch, no ROCm userspace stack at
 runtime.
@@ -62,6 +78,24 @@ curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/install.sh
 
 For source builds and verifying the install:
 [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
+
+### gfx1103 / Phoenix LDS status
+
+The known gfx1103 multi-wave barrier/LDS-adjacent HIP-719 failure has been
+treated on hipfire's maintained Phoenix validation hosts by booting with
+`amdgpu.cwsr_enable=0`. This is a host-level workaround for the gfx11 CWSR
+preemption defect, not an upstream driver or firmware fix. Register-tiled,
+no-LDS kernels remain the preferred production default, but guarded LDS
+development and validation may resume on hosts where the live module parameter
+confirms CWSR is off. `hipfire doctor` reports this live state as
+`driver.gpu_cwsr` on gfx1103.
+
+Please report any strange LDS behavior on gfx1103, including hangs, HIP 719,
+MES timeouts/resets, nondeterministic output, or unexpected CPU/GPU parity
+drift—even if the workload appears to recover. Include the reporting evidence
+listed in [CONTRIBUTING.md](.github/CONTRIBUTING.md#gfx1103-lds-reports). The
+full diagnosis and workaround evidence is in
+[the gfx1103 LDS investigation](docs/plans/gfx1103-lds-hip719-investigation.md).
 
 ## Inspiration: Lucebox
 
@@ -117,6 +151,7 @@ the prefill MMQ redesign log is at
 | [QUANTIZE.md](docs/QUANTIZE.md) | `hipfire quantize` for HF / safetensors / GGUF |
 | [CONFIG.md](docs/CONFIG.md) | Every config key, CASK sidecar / KV eviction policies, env overrides |
 | [SERVE.md](docs/SERVE.md) | OpenAI-compatible HTTP API |
+| [API_ACCESS.md](docs/API_ACCESS.md) | API users, scoped tokens, limits, usage, and remote bootstrap |
 | [BENCHMARKS.md](docs/BENCHMARKS.md) | Measured perf per arch, vs ollama |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Engine layout, dispatch, two model paths |
 | [QUANTIZATION.md](docs/QUANTIZATION.md) | MQ4 / HF4 design, asym KV cache, FWHT math |
@@ -144,17 +179,19 @@ attribute the corresponding inventions per [AGENTS.md](AGENTS.md).
 
 ## Contributing
 
-All further work should use `chaingun` as the reference branch. New work should
-either happen directly on `chaingun` or be explicitly based on and compared
-against `chaingun`; do not treat `master` as the active development baseline
-unless that is called out for a specific task.
+Use `master` as the integration branch. Create feature or fix branches from the
+latest `origin/master`, keep commits focused, and merge through reviewed pull
+requests. The archival `master-prefork` branch preserves the former upstream
+line and is not a development baseline.
 
 See [.github/CONTRIBUTING.md](.github/CONTRIBUTING.md). Install local hooks with
 `./scripts/install-hooks.sh`. The no-GPU CI subset is
 `./tests/no-gpu-ci.sh`; it does not replace the hardware gates. Any
 change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
-or the spec-decode path must pass `./tests/coherence-gate-dflash.sh`
-before commit. Model/runtime evidence should be captured through
+or the spec-decode path must pass
+`./tests/tiny-affected-gate.sh --require-coverage` (the automatic correctness
+front tier) before commit; `./tests/coherence-gate-dflash.sh` remains an
+optional manual DFlash/DDTree diagnostic. Model/runtime evidence should be captured through
 `hipfire eval` batteries where available; the shell gates remain the
 hook/enforcement entrypoints when they still provide baseline comparison.
 Server batching, prefix reuse, KV admission, concurrency, and pipeline-parallel
@@ -293,7 +330,7 @@ works across ANY RDNA generation (RDNA1→RDNA4), not just this card.
 This project combines three efforts into one pipeline:
 1. **autorocm** — Map and unlock ROCm on consumer RDNA hardware
 2. **autokernel** — Optimize HIP/compute kernels for the specific hardware
-3. **hipfire** — Rust-native inference engine (no Python in the hot path)
+3. **hipfire** — Rust-native inference engine and production tooling
 
 ## Reference projects for hardware/runtime exploration
 
@@ -460,7 +497,7 @@ Performance doesn't matter yet — correctness first.
 
 ## Project rules
 
-1. **No Python in the inference hot path.** Python is allowed for tooling, benchmarks, comparison baselines. Never in the actual engine.
+1. **No Python in production tooling.** Production commands and shipped workflows should be Rust/native. Python is allowed for experiments, benchmarks, diagnostics, and comparison baselines/oracles.
 2. **Commit meaningful experiment states when asked to commit or when running an explicit experiment series.** Every approach tested should have structured results. Failed approaches are valuable when they narrow the search space.
 3. **Document failures explicitly.** "Approach B failed because HSA_RUNTIME returns error code 0x1013 when initializing on gfx1010 without override" is more valuable than "it didn't work."
 4. **Portability matters.** Every decision should consider: will this work on RDNA2? RDNA3? RDNA4? If it's 5700XT-only it's a hack, not a solution.
@@ -557,11 +594,13 @@ This playbook explains how to verify v0.2.0-era branches, what to measure, and w
 
 ## 0 · Hard rules (always apply)
 
-1. **Coherence-gate-dflash is the canonical correctness gate.** Quality-
-   gate.sh is deprecated — its byte-exact baselines drift faster than
-   the engine evolves. Run `./tests/coherence-gate-dflash.sh` after
-   any change touching kernels, quant formats, dispatch, fusion,
-   rotation, rmsnorm, or the spec-decode path.
+1. **`tiny-affected-gate --require-coverage` is the automatic correctness
+   front tier.** Quality-gate.sh is deprecated — its byte-exact baselines
+   drift faster than the engine evolves. Run
+   `./tests/tiny-affected-gate.sh --require-coverage` after any change
+   touching kernels, quant formats, dispatch, fusion, rotation, rmsnorm, or
+   the spec-decode path; `./tests/coherence-gate-dflash.sh` remains an
+   optional manual DFlash/DDTree diagnostic.
 2. **Prompt structure dictates τ.** One newline character can swing τ
    by 17%. Any tok/s comparison across sessions, agents, or commits
    MUST use **byte-identical prompts**. Embed prompts as committed
@@ -792,7 +831,7 @@ Reference numbers in `README.md` "DFlash speculative decode" section.
 Code prompts: 4× win on 27B / 2.6-3× on 9B. Prose prompts: tie or
 small loss on 9B (-20%, draft-target alignment issue, NOT a bug).
 
-### 3.5 — Coherence gate (mandatory before any DFlash claim)
+### 3.5 — Coherence gate (manual DFlash/DDTree diagnostic, run before a DFlash claim)
 
 ```bash
 ./tests/coherence-gate-dflash.sh
@@ -1050,8 +1089,10 @@ cheapest-step first:
    `--kv-mode`, `--no-chatml`, `prompt_normalize`, prompt md5), then
    code-change bisect via `scripts/probe_commits.sh`.
 3. **If real GAIN: coherence MUST be established before ANY claim.**
-   Run `./tests/coherence-gate.sh` and (if spec-decode touched)
-   `./tests/coherence-gate-dflash.sh`. A win that ships an
+   Run `./tests/tiny-affected-gate.sh --require-coverage` (the automatic
+   correctness front tier) and `./tests/coherence-gate.sh`;
+   `./tests/coherence-gate-dflash.sh` is an optional manual DFlash/DDTree
+   diagnostic (run it when spec-decode is touched). A win that ships an
    attractor / token loop / special-token leak / structural repetition
    is not a win — it's a regression on the output axis hiding behind a
    tok/s number. See the multiple "synth-win → prod-falsify" entries
@@ -1075,8 +1116,11 @@ verify the caller actually sets a stream (fix pattern: create
 Any change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
 or the forward pass MUST pass `./tests/coherence-gate.sh` before
 committing. A pre-commit hook in `.githooks/pre-commit` runs it automatically
-when relevant files are staged. Spec-decode changes also trigger
-`./tests/coherence-gate-dflash.sh` (see next section).
+when relevant files are staged. The automatic correctness front tier for
+kernel/quant/dispatch/spec-decode changes is
+`./tests/tiny-affected-gate.sh --require-coverage`;
+`./tests/coherence-gate-dflash.sh` is an optional manual DFlash/DDTree
+diagnostic (see next section).
 
 First-time setup (once per clone):
 ```
@@ -1126,8 +1170,9 @@ now implemented in `hipfire-detect::ngram` as a soft warn.
 ## DFlash Coherence Gate (spec-decode token-attractor guard)
 
 Any DDTree / spec-decode / slow-path-kill change that claims a τ or tok/s
-improvement MUST pass `tests/coherence-gate-dflash.sh` (shipped 9883e98)
-before commit. Enhanced three-tier thresholds (as of 2026-04-26):
+improvement should run `tests/coherence-gate-dflash.sh` (shipped 9883e98) as a
+manual DFlash/DDTree diagnostic before commit; the automatic correctness front
+tier is `./tests/tiny-affected-gate.sh --require-coverage`. Enhanced three-tier thresholds (as of 2026-04-26):
 
 **Tier 1 — First 128 tokens (hard fail, catches single-token attractors):**
 - `unique_token_ratio < 0.15` OR `max_single_token_frequency > 0.50`

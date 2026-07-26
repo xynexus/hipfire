@@ -1091,6 +1091,10 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str =
 /// when the upcoming linear carries an `awq_scale` sidecar. Math:
 /// (W·s) · (x/s) = W·x — divide before FWHT mirrors the offline pre-scaling.
 pub const ROTATE_X_MQ_AWQ_SRC: &str = include_str!("../../../kernels/src/rotate_x_mq_awq.hip");
+/// GPU side of the shared EmbeddingGemma Opus projection boundary. Packs
+/// AWQ/FWHT/Q8 activations directly into the AIE whole-array input layout and
+/// deblocks the physical f32 output into one to three row-major GPU tensors.
+pub const OPUS_NPU_IO_SRC: &str = include_str!("../../../kernels/src/opus_npu_io.hip");
 /// Phase A Stage A — F2: AWQ-aware variant of `fused_silu_mul_mq_rotate`
 /// for the down_proj / w_down input stage. Dispatched when down_proj
 /// carries an `awq_scale`. Divide happens AFTER silu*up reduction, BEFORE
@@ -1463,6 +1467,12 @@ pub const MOE_SCATTER_PERMUTE_K8_SRC: &str =
 pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma_k2.hip");
 
+/// Family-neutral grouped routed-expert OQ4 W4A16 kernel. Consumes indexed
+/// `[f32 scale | 128 signed-int4]` blocks prepared by the runtime pager/eager
+/// loader and the same scatter/tile descriptors as the MQ grouped kernels.
+pub const GEMM_OQ4G256_MOE_GROUPED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq4g256_moe_grouped_wmma.hip");
+
 /// gfx12 (RDNA4) sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC. Same
 /// dispatch contract; differs in WMMA intrinsic (_gfx12), operand
 /// width (half8_t vs half16_t), and K-lane split (K split across 2
@@ -1622,6 +1632,12 @@ pub const GEMM_F16_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/gemm_f16_moe_grouped_wmma.gfx1151.hip");
 pub const GEMM_BF16_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/gemm_bf16_moe_grouped_wmma.gfx1151.hip");
+
+/// Scalar grouped fallback for raw F16/BF16 routed experts. Uses the same
+/// expert-tile permutation as the fast grouped kernels and compiles on every
+/// supported HIP architecture.
+pub const GEMM_RAW_MOE_GROUPED_PORTABLE_SRC: &str =
+    include_str!("../../../kernels/src/gemm_raw_moe_grouped_portable.hip");
 
 /// i8 MMQ sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC for gfx11 dGPUs
 /// (gfx1100/1101/1102/1103 — 7900 XTX, 7800/7700, 7600, Phoenix mobile).
@@ -2507,6 +2523,9 @@ pub const GEMV_Q6K_SRC: &str = include_str!("../../../kernels/src/gemv_q6k.hip")
 /// RMSNorm: y[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
 pub const RMSNORM_SRC: &str = include_str!("../../../kernels/src/rmsnorm.hip");
 
+/// Generic pointwise `cap * tanh(x / cap)` over an arbitrary F32 vector.
+pub const VECTOR_SOFTCAP_SRC: &str = include_str!("../../../kernels/src/vector_softcap.hip");
+
 /// TriAttention sidecar calibration: GPU band-statistics accumulator.
 /// Replaces the CPU BandAccumulator loop (99% of sidecar cal wall time).
 pub const TRIATTN_ACCUMULATE_SRC: &str =
@@ -2523,8 +2542,9 @@ pub const ADD_INPLACE_SRC: &str = include_str!("../../../kernels/src/add_inplace
 /// space for the real-format correction GEMV (y += R_S·x_S).
 pub const RQ_CORRECTION_SRC: &str = include_str!("../../../kernels/src/rq_correction.hip");
 
-/// Calibration activation reductions (`calib_sumsq_reduce_f32` = per-column Σx²
-/// for imatrix/diag; `calib_hessian_outer_f32` = Σxxᵀ K×K for GPTQ Hessian).
+/// Calibration activation staging/reductions (`calib_gather_rows_f32` = indexed
+/// grouped-MoE row gather, `calib_sumsq_reduce_f32` = per-column Σx² for
+/// imatrix/diag; `calib_hessian_outer_f32` = Σxxᵀ K×K for GPTQ Hessian).
 /// Accumulate-in-place over the calibration corpus. Tier-1 native collector.
 pub const CALIB_REDUCE_SRC: &str = include_str!("../../../kernels/src/calib_reduce.hip");
 
@@ -2797,6 +2817,7 @@ pub const ATTENTION_FLASH_FWHT2_TILE_BATCHED_SRC: &str =
 
 /// TriAttention scoring on Q8 post-RoPE K cache (arXiv:2604.04921).
 pub const TRIATTN_SCORE_Q8_SRC: &str = include_str!("../../../kernels/src/triattn_score_q8.hip");
+pub const TRIATTN_SCORE_F32_SRC: &str = include_str!("../../../kernels/src/triattn_score_f32.hip");
 
 /// TriAttention scoring on asym3 (Givens-rotated 3-bit) K cache.
 pub const TRIATTN_SCORE_ASYM3_SRC: &str =
@@ -2829,6 +2850,11 @@ pub const KV_FOLD_ASYM2_SRC: &str = include_str!("../../../kernels/src/kv_fold_a
 /// Per head: [4B f32 scale][head_dim × int8 values] = head_dim + 4 bytes.
 /// For head_dim=128: 132 bytes vs 512 bytes FP32 = 3.88x compression.
 pub const KV_CACHE_WRITE_Q8_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_q8.hip");
+
+/// 8-bit KV hot-ring codec (hierarchical cache Phase 1): per-token symmetric
+/// absmax int8 quant into a head-major slot-major ring, and its f16 dequant.
+pub const KV_HOT_QUANT_Q8_SRC: &str = include_str!("../../../kernels/src/kv_hot_quant_q8.hip");
+pub const KV_HOT_DEQUANT_Q8_SRC: &str = include_str!("../../../kernels/src/kv_hot_dequant_q8.hip");
 
 /// Attention with Q8 quantized KV cache — symmetric int8, dequant on read.
 pub const ATTENTION_Q8KV_SRC: &str = include_str!("../../../kernels/src/attention_q8kv.hip");
@@ -2910,6 +2936,12 @@ pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str =
 pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str =
     include_str!("../../../kernels/src/rope_partial_halfsplit.hip");
 
+/// Half-split partial RoPE with explicit BF16 product/add staging. Gemma 4's
+/// Transformers reference executes the pointwise expression at model dtype.
+#[cfg(feature = "deltanet")]
+pub const ROPE_PARTIAL_HALFSPLIT_BF16_STAGED_SRC: &str =
+    include_str!("../../../kernels/src/rope_partial_halfsplit_bf16_staged.hip");
+
 /// 2-D spatial RoPE with precomputed per-patch cos/sin tables. Used by
 /// the dots.ocr (Qwen2-VL family) `DotsVisionTransformer` for vision
 /// attention. See `kernels/src/rope_2d_halfsplit.hip` for the layout
@@ -2944,6 +2976,13 @@ pub const QKV_SPLIT_INTERLEAVED_SRC: &str =
 /// block `[32]`. See `kernels/src/attention_dflash_wmma.hip`.
 pub const ATTENTION_DFLASH_WMMA_SRC: &str =
     include_str!("../../../kernels/src/attention_dflash_wmma.hip");
+
+/// BF16 causal prefill parity sibling of `ATTENTION_DFLASH_WMMA_SRC`.
+/// F32 Q/K/V are rounded to BF16 in-register, both matrix products use BF16
+/// wave32 WMMA, and the F32 output is rounded through BF16 on store. See
+/// `kernels/src/attention_dflash_wmma_bf16.hip`.
+pub const ATTENTION_DFLASH_WMMA_BF16_SRC: &str =
+    include_str!("../../../kernels/src/attention_dflash_wmma_bf16.hip");
 
 /// gfx12/RDNA4 sister of `ATTENTION_DFLASH_WMMA_SRC`. Same algorithm; the
 /// WMMA fragments use `half8_t` operands + the `_w32_gfx12` intrinsic (the
@@ -3303,6 +3342,18 @@ pub const EMBEDDING_HFQ4G256_BATCHED_SRC: &str =
 pub const EMBEDDING_F32_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/embedding_f32_batched.hip");
 
+/// Native-bf16 embedding lookup: gather a row and convert bf16->f32 inline (the
+/// table stays 2 B/element, no F32 promotion). Single-token + batched.
+pub const EMBEDDING_BF16_SRC: &str = include_str!("../../../kernels/src/embedding_bf16.hip");
+pub const EMBEDDING_BF16_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/embedding_bf16_batched.hip");
+
+/// Native-f16 embedding lookup: gather a row and convert f16->f32 inline
+/// (`v_cvt_f32_f16`, universal on RDNA). Single-token + batched.
+pub const EMBEDDING_F16_SRC: &str = include_str!("../../../kernels/src/embedding_f16.hip");
+pub const EMBEDDING_F16_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/embedding_f16_batched.hip");
+
 /// Batched Q8_0 embedding: same hipGraph-captureable pattern as the HFQ4-G256
 /// variant. 27B MQ4 targets ship with Q8_0-quantized embedding tables, so the
 /// verify hot path needs this variant to enable graph capture on that model.
@@ -3405,6 +3456,42 @@ pub const GEMM_F32_SRC: &str = include_str!("../../../kernels/src/gemm_f32.hip")
 /// C[M,N] = op(A)·op(B); covers forward + both backward matmuls of a linear.
 /// See `kernels/src/gemm_f32_train.hip` and the hipfire-train Phase 0 plan.
 pub const GEMM_F32_TRAIN_SRC: &str = include_str!("../../../kernels/src/gemm_f32_train.hip");
+
+/// BF16-compute training GEMM forward (NT): `Y[B,M] = X[B,K]·A[M,K]^T`, A/X read
+/// as F32 and cast to BF16 in-register, F32 accumulate + output. Drop-in
+/// bf16-compute replacement for the `gemm_f32_train` forward matmul; leaves
+/// master weights/activations in F32. See `kernels/src/gemm_bf16c_train_nt.hip`.
+pub const GEMM_BF16C_TRAIN_NT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16c_train_nt.hip");
+
+/// F16-compute training GEMM forward (NT): like `GEMM_BF16C_TRAIN_NT_SRC` but
+/// casts to `_Float16` (10 mantissa bits vs bf16's 7) for higher forward
+/// precision at the same WMMA throughput. See `kernels/src/gemm_f16c_train_nt.hip`.
+pub const GEMM_F16C_TRAIN_NT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16c_train_nt.hip");
+
+/// Scaled f16-compute training GEMM (NT) + `abs_max_f32`: f16's 10-bit mantissa
+/// without its range trap, via a per-tensor scale applied around the f16 WMMA
+/// (MXFP16-style software microscaling). See `kernels/src/gemm_f16s_train_nt.hip`.
+pub const GEMM_F16S_TRAIN_NT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16s_train_nt.hip");
+
+/// Phase C2 scaled-f16 backward GEMMs (NN for dX, TN for dW) that read the
+/// strided operand directly — no transpose_f32 pass. See
+/// `kernels/src/gemm_f16s_backward.hip`.
+pub const GEMM_F16S_BACKWARD_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16s_backward.hip");
+
+/// Sum-of-squares reduction for global-norm gradient clipping (training).
+/// See `kernels/src/grad_reduce.hip`.
+pub const GRAD_REDUCE_SRC: &str = include_str!("../../../kernels/src/grad_reduce.hip");
+
+/// Split-precision ("2xbf16") training GEMM forward (NT): near-f32 accuracy on
+/// the WMMA cores by splitting each f32 operand into bf16 hi+lo and accumulating
+/// 3 WMMA passes (~16 mantissa bits). For the precision-sensitive vocab-head
+/// logits. See `kernels/src/gemm_bf16x2_train_nt.hip`.
+pub const GEMM_BF16X2_TRAIN_NT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16x2_train_nt.hip");
 
 /// RMSNorm forward+backward (fp32) for the un-fused training path.
 /// `rmsnorm_train_fwd` saves `1/r` per row for `rmsnorm_train_bwd`.
@@ -3784,6 +3871,13 @@ pub const HC_SPLIT_FINALIZE_BATCHED_SRC: &str =
 pub const SWA_VISIBILITY_STAGE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/swa_visibility_stage_batched.hip");
 
+/// GQA sliding-window batched attention over a staged per-kv-head window cache
+/// ([batch, n_kv_heads, head_dim, window]). GQA twin of
+/// `deepseek4_attn_swa_batched` (per-kv-head indexing, no attention sink, passed
+/// softmax scale) for the gemma3 SWA prefill path.
+pub const ATTENTION_SWA_GQA_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_swa_gqa_batched.hip");
+
 /// DeepSeek V4 top-K K/V gather — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// top-K gather from the shared main compressed-K cache into a
 /// `[B, head_dim, out_stride]` buffer fed to deepseek4_attn_swa_topk_batched.
@@ -3873,11 +3967,35 @@ pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
 pub const GEMM_F16_X_F16_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16_x_f16_wmma.hip");
 
+/// Scalar raw F16/BF16 weight x F32 activation fallback. Unlike the wave32
+/// WMMA kernels, this source compiles on RDNA2, RDNA3/4, CDNA, and older
+/// supported targets.
+pub const GEMM_RAW_X_F32_PORTABLE_SRC: &str =
+    include_str!("../../../kernels/src/gemm_raw_x_f32_portable.hip");
+
 /// WMMA BF16 × BF16 → F32 GEMM with (B, M) output layout.
 /// Targets gfx1100+ wave32 WMMA and consumes raw BF16 weight/input
 /// payloads. See `kernels/src/gemm_bf16_x_bf16_wmma.hip`.
 pub const GEMM_BF16_X_BF16_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_bf16_x_bf16_wmma.hip");
+
+/// Register-tiled, zero-LDS BF16×BF16→F32 WMMA GEMM (gfx1103/RDNA3). MB×NB
+/// output subtiles per wave for ILP + frag reuse. See
+/// `kernels/src/gemm_bf16_tiled_wmma.hip`.
+pub const GEMM_BF16_TILED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_tiled_wmma.hip");
+
+/// Register-tiled, zero-LDS unified Opus-Quant W4A8 / W8A8 GEMM (gfx1103/RDNA3):
+/// dynamic-int8 activation × iu8 WMMA, weight fetched as int8 (W8) or unpacked
+/// from packed int4 (W4) — the only per-format difference. MB×NB subtiles. See
+/// `kernels/src/gemm_opus_tiled_wmma.hip`.
+pub const GEMM_OPUS_TILED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_opus_tiled_wmma.hip");
+
+/// Plain-basis arch-20 DFLASH Opus reference GEMM. Consumes qt=45/46/47
+/// interleaved blocks directly without FWHT, host expansion, or repacking.
+pub const GEMM_DFLASH_OQ_PLAIN_REF_SRC: &str =
+    include_str!("../../../kernels/src/gemm_dflash_oq_plain_ref.hip");
 
 /// Generic kernel library: WMMA BF16 × BF16 → BF16 GEMM, (B, M) output.
 /// gfx1103 (RDNA3 UMA) wave32, register-tiled, zero LDS. F32 accumulation
@@ -3974,6 +4092,11 @@ pub const FUSED_QKVZA_OQ4_DP4A_SRC: &str =
 /// standout decode-gap item vs mq4's gemv_hfq4g256_residual). See the .hip file.
 pub const GEMV_OQ4_GROUPED_RESIDUAL_SRC: &str =
     include_str!("../../../kernels/src/gemv_oq4_grouped_residual.hip");
+
+/// OQ4/OQ8 shared-expert DOWN: N-batched decode GEMV + fused sigmoid-scaled
+/// residual add (the OQ sibling of gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched).
+pub const GEMV_OQ_RESIDUAL_SIGMOID_SCALED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_oq_residual_sigmoid_scaled.hip");
 
 /// OQ4+ W4A16 fused gate+up DECODE (B=1): 2 GEMVs in one launch (blockIdx demux),
 /// cuts the per-token dispatch count vs looping gemv_oq4_grouped. See the .hip.
@@ -4093,9 +4216,19 @@ pub const KVARN_DEQUANT_TILE_SRC: &str =
 pub const ATTENTION_COLD_SLOTS_SRC: &str =
     include_str!("../../../kernels/src/attention_cold_slots.hip");
 
+/// head_dim=128 variant of `attention_cold_slots` (CHD=128/CPL=4). Selected by the
+/// runtime when head_dim==128. See kernels/src/attention_cold_slots_128.hip.
+pub const ATTENTION_COLD_SLOTS_128_SRC: &str =
+    include_str!("../../../kernels/src/attention_cold_slots_128.hip");
+
 /// Phase 2b hot+cold tier merge: fold two flash-attention tiers' (out,m,l)
 /// partials into one via online softmax. See flash_tier_merge.hip.
 pub const FLASH_TIER_MERGE_SRC: &str = include_str!("../../../kernels/src/flash_tier_merge.hip");
+
+/// head_dim=128 variant of `flash_tier_merge` (CHD=128/CPL=4). See
+/// kernels/src/flash_tier_merge_128.hip.
+pub const FLASH_TIER_MERGE_128_SRC: &str =
+    include_str!("../../../kernels/src/flash_tier_merge_128.hip");
 
 /// Phase 2b hot-tier (m,l) extract: re-read the KVarN/asym flash's per-tile
 /// partials and emit the final softmax (max, denom) so the hot tier can feed

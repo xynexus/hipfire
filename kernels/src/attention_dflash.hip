@@ -37,7 +37,8 @@ extern "C" __global__ void attention_dflash_f32(
     float* __restrict__ out,
     int B, int L, int n_heads, int n_kv_heads, int head_dim,
     float scale,
-    int tile_size
+    int tile_size,
+    int bidirectional_window
 ) {
     extern __shared__ float sdata[];
     int head = blockIdx.x;
@@ -70,10 +71,22 @@ extern "C" __global__ void attention_dflash_f32(
     float m_run = -INFINITY;  // running max of all scores seen so far
     float l_run = 0.0f;       // running sum of exp(scores - m_run)
 
-    int n_tiles = (L + tile_size - 1) / tile_size;
+    // A positive window selects symmetric, bidirectional local attention.
+    // `abs(query - key) < window` matches the embedding sequence contract;
+    // zero retains the established full cross-attention behavior.
+    int key_begin = 0;
+    int key_end = L;
+    if (bidirectional_window > 0) {
+        key_begin = qi - (bidirectional_window - 1);
+        if (key_begin < 0) key_begin = 0;
+        key_end = qi + bidirectional_window;
+        if (key_end > L) key_end = L;
+    }
+    int visible_keys = key_end - key_begin;
+    int n_tiles = (visible_keys + tile_size - 1) / tile_size;
     for (int t = 0; t < n_tiles; ++t) {
-        int tile_start = t * tile_size;
-        int tile_len = L - tile_start;
+        int tile_start = key_begin + t * tile_size;
+        int tile_len = key_end - tile_start;
         if (tile_len > tile_size) tile_len = tile_size;
 
         // Phase A: compute scores for this tile, track tile-local max.

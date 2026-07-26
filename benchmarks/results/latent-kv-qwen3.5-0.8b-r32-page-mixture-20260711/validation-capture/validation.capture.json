@@ -1,0 +1,1721 @@
+{
+  "artifact_sha256": "69318c617166fd0ae2159d35943961dfbc0dc3d48dcf0702996412c45460a6de",
+  "command_argv": [
+    "python3",
+    "scripts/astrea.py",
+    "latent-kv-capture",
+    "--plan",
+    "benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/plan.json",
+    "--split",
+    "validation",
+    "--output-dir",
+    "benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture",
+    "--threads",
+    "8",
+    "--out",
+    "benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/result.json"
+  ],
+  "created_at": "2026-07-11T06:17:23.069253+00:00",
+  "dataset": {
+    "bytes": 76673,
+    "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-page-mixture-20260711/c4-realnewslike-validation.jsonl",
+    "sha256": "be72ffdc7669ee9640c118a3cc5b7e6810c693c7c32b93222deb5614bfa54cd3"
+  },
+  "engine_sha256": "dd5dee8f4dbb201d6dbde6751a1c70fa0ad397811559d351475cc32b31163fcb",
+  "model_sha256": "c67aa0d5072cd9569d6adf48eeb1e27d3fdab8d4b59c0a7cc0ce5ceab08e398b",
+  "offline_engine_sha256": "2eb38b6b9a45ef9b9ba0d669ce0b1b212f580f3491fe28f4a47cc43edae62d7f",
+  "plan_path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/plan.json",
+  "plan_sha256": "0c9aa4a57b144a7758f39aa934f3de4eff0f56f044a4ce29c19d25493ce38b05",
+  "records": [
+    {
+      "bytes": 2624952,
+      "content_start": 0,
+      "dataset_line": 1,
+      "layer": 3,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s000.l3.n128.p0.npz",
+      "position_offset": 0,
+      "sample_index": 0,
+      "sha256": "b5380ca5de761849ec578fd1a53ee24c879df3fb2a3b4ee4eed9d3004f2ed58f",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 0
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 0,
+      "dataset_line": 1,
+      "layer": 7,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s000.l7.n128.p0.npz",
+      "position_offset": 0,
+      "sample_index": 0,
+      "sha256": "1fcaae0d941ca5e80157f13f84ee68a92e530fcfb3fd35e37e4f5dbc9927cf01",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 0
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 0,
+      "dataset_line": 1,
+      "layer": 11,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s000.l11.n128.p0.npz",
+      "position_offset": 0,
+      "sample_index": 0,
+      "sha256": "d06a97683dcd662341f7d7e3e3e38af333ef55d208dab0d522581096dc1ba923",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 0
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 0,
+      "dataset_line": 1,
+      "layer": 15,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s000.l15.n128.p0.npz",
+      "position_offset": 0,
+      "sample_index": 0,
+      "sha256": "6e6e0fc764fcac83823d1d52c1d3d0df2281cdf86f17f7b62e90fceffd853cf5",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 0
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 0,
+      "dataset_line": 1,
+      "layer": 19,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s000.l19.n128.p0.npz",
+      "position_offset": 0,
+      "sample_index": 0,
+      "sha256": "f0238aac3b82d75a2cd8a37a9aad90400de71c6ae99b83f5676fa16f073d7ed5",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 0
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 0,
+      "dataset_line": 1,
+      "layer": 23,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s000.l23.n128.p0.npz",
+      "position_offset": 0,
+      "sample_index": 0,
+      "sha256": "140227caa1285a2d2daa7b00d4cd6501dad3229b5ce4d0565590b04de2d6718e",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 0
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 64,
+      "dataset_line": 2,
+      "layer": 3,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s001.l3.n128.p0.npz",
+      "position_offset": 0,
+      "sample_index": 1,
+      "sha256": "bd1c99740cee3dbb1398221a7e63f8189ff53a6862be0a6ce8cf5d7752f2a10d",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 1
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 64,
+      "dataset_line": 2,
+      "layer": 7,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s001.l7.n128.p0.npz",
+      "position_offset": 0,
+      "sample_index": 1,
+      "sha256": "66791968b84686aad5fa08289f10ecb198d2ef6bad06506e7c390661b85e21d2",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 1
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 64,
+      "dataset_line": 2,
+      "layer": 11,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s001.l11.n128.p0.npz",
+      "position_offset": 0,
+      "sample_index": 1,
+      "sha256": "6442277a6c18a28ac582f5d78e66c301f3065d06d96c9afd0eb400ade64cbb3b",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 1
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 64,
+      "dataset_line": 2,
+      "layer": 15,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s001.l15.n128.p0.npz",
+      "position_offset": 0,
+      "sample_index": 1,
+      "sha256": "feaccf9737bba6f52f04f6ab5968efaae1e6747fad7552178108f11a5f31e2d7",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 1
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 64,
+      "dataset_line": 2,
+      "layer": 19,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s001.l19.n128.p0.npz",
+      "position_offset": 0,
+      "sample_index": 1,
+      "sha256": "6c9c79a124ab07fe091ee500c739c874246a34bc6822bfb26e347c52f0f3d5f1",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 1
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 64,
+      "dataset_line": 2,
+      "layer": 23,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s001.l23.n128.p0.npz",
+      "position_offset": 0,
+      "sample_index": 1,
+      "sha256": "716f91fcf6e28303a46229388e250ecca05f61e72eab85a9a9f26354b09e9cbe",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 1
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 128,
+      "dataset_line": 3,
+      "layer": 3,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s002.l3.n128.p256.npz",
+      "position_offset": 256,
+      "sample_index": 0,
+      "sha256": "f35c69c94ae9b499911bfff234aaa3f6b8b73f912e9dbf15e6addeef385e3353",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 2
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 128,
+      "dataset_line": 3,
+      "layer": 7,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s002.l7.n128.p256.npz",
+      "position_offset": 256,
+      "sample_index": 0,
+      "sha256": "f8f954d4c3dc35b1b1b80be1794c02f68922772ddf47e3947ee1edce713356cc",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 2
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 128,
+      "dataset_line": 3,
+      "layer": 11,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s002.l11.n128.p256.npz",
+      "position_offset": 256,
+      "sample_index": 0,
+      "sha256": "65c5f36c695eda290eb15113a85a90132e986705606bc317ea2d74d6af2a7341",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 2
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 128,
+      "dataset_line": 3,
+      "layer": 15,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s002.l15.n128.p256.npz",
+      "position_offset": 256,
+      "sample_index": 0,
+      "sha256": "65a34c36cd0f99504be47f16f52e5d5478d449c1024a5a2cba17bd0927e6861d",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 2
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 128,
+      "dataset_line": 3,
+      "layer": 19,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s002.l19.n128.p256.npz",
+      "position_offset": 256,
+      "sample_index": 0,
+      "sha256": "a8dfb9e8d131eeaf97476538043729269282a310a112588f8f8d425d3f63b1d9",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 2
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 128,
+      "dataset_line": 3,
+      "layer": 23,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s002.l23.n128.p256.npz",
+      "position_offset": 256,
+      "sample_index": 0,
+      "sha256": "0b819057a08a9842cb3435a43e7dba7311b6ee137c27199e6a741908d72f920c",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 2
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 192,
+      "dataset_line": 4,
+      "layer": 3,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s003.l3.n128.p256.npz",
+      "position_offset": 256,
+      "sample_index": 1,
+      "sha256": "83e84f5b1b435dacb0cdde7cb8d07294fd233948809ba9ca1058eacf41ac1c23",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 3
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 192,
+      "dataset_line": 4,
+      "layer": 7,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s003.l7.n128.p256.npz",
+      "position_offset": 256,
+      "sample_index": 1,
+      "sha256": "19b06d762fd87f78657f9a859a064548150b0574b339121ddafd4e3c19db56c0",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 3
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 192,
+      "dataset_line": 4,
+      "layer": 11,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s003.l11.n128.p256.npz",
+      "position_offset": 256,
+      "sample_index": 1,
+      "sha256": "7a08ea2e1003bab00e62bbaab4224a9a18e4be722874a2a8e92c3c8e63cab33b",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 3
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 192,
+      "dataset_line": 4,
+      "layer": 15,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s003.l15.n128.p256.npz",
+      "position_offset": 256,
+      "sample_index": 1,
+      "sha256": "732964680ea436f3426d82753896f8d6a1b6d0f4b9a71c567b3342925150c013",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 3
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 192,
+      "dataset_line": 4,
+      "layer": 19,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s003.l19.n128.p256.npz",
+      "position_offset": 256,
+      "sample_index": 1,
+      "sha256": "1fb11408c9dbbb2546f08e4d7e1b63280ccb6a2eddb6e195dce7b2eb3a1675c9",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 3
+    },
+    {
+      "bytes": 2624952,
+      "content_start": 192,
+      "dataset_line": 4,
+      "layer": 23,
+      "length": 128,
+      "max_relative_offset": 127,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s003.l23.n128.p256.npz",
+      "position_offset": 256,
+      "sample_index": 1,
+      "sha256": "360ba171973695e5d804cc8b5ed81af0dbfe8b1d123266631b17166dc203d65e",
+      "shapes": {
+        "gate": [
+          8,
+          128,
+          256
+        ],
+        "k": [
+          2,
+          128,
+          256
+        ],
+        "q": [
+          8,
+          128,
+          256
+        ],
+        "v": [
+          2,
+          128,
+          256
+        ]
+      },
+      "stratum": 3
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 512,
+      "dataset_line": 5,
+      "layer": 3,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s004.l3.n256.p0.npz",
+      "position_offset": 0,
+      "sample_index": 0,
+      "sha256": "99cecb893490d133e0af038c9a53e120b38fc045417a5445d9e7379da84d6d3f",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 4
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 512,
+      "dataset_line": 5,
+      "layer": 7,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s004.l7.n256.p0.npz",
+      "position_offset": 0,
+      "sample_index": 0,
+      "sha256": "0976a700bb0f9306cd7b257d4fbaf58e4ba7a76ee87b833f45af11a8d224c71f",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 4
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 512,
+      "dataset_line": 5,
+      "layer": 11,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s004.l11.n256.p0.npz",
+      "position_offset": 0,
+      "sample_index": 0,
+      "sha256": "22e5b8d3538d07971951eba5af644f5af84e2c5a60f00eada39c0091aa53a239",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 4
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 512,
+      "dataset_line": 5,
+      "layer": 15,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s004.l15.n256.p0.npz",
+      "position_offset": 0,
+      "sample_index": 0,
+      "sha256": "98254fe5e37ae54e7bff2dfdef2269d3f6ff0af15905fc6a63522d0f8cd67387",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 4
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 512,
+      "dataset_line": 5,
+      "layer": 19,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s004.l19.n256.p0.npz",
+      "position_offset": 0,
+      "sample_index": 0,
+      "sha256": "ef1b1520a6e754e0465facd84605e8cc4fc8766140edbf797f668cab4eb57816",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 4
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 512,
+      "dataset_line": 5,
+      "layer": 23,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s004.l23.n256.p0.npz",
+      "position_offset": 0,
+      "sample_index": 0,
+      "sha256": "e6d76ba871f0edf01939b40f9bb692d6e2919cb56d4fcd3f0bae663ac429db34",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 4
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 640,
+      "dataset_line": 6,
+      "layer": 3,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s005.l3.n256.p0.npz",
+      "position_offset": 0,
+      "sample_index": 1,
+      "sha256": "4450a00f59430f021485244fa7f447fc21b3fabfdb4845b18e71877bf80a5c35",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 5
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 640,
+      "dataset_line": 6,
+      "layer": 7,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s005.l7.n256.p0.npz",
+      "position_offset": 0,
+      "sample_index": 1,
+      "sha256": "686c0ec67ec38efe40f724a78410642b583dbd12fa4def224bf06eacd5e4da7b",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 5
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 640,
+      "dataset_line": 6,
+      "layer": 11,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s005.l11.n256.p0.npz",
+      "position_offset": 0,
+      "sample_index": 1,
+      "sha256": "16693abd0d6bad1c8402d8a00793a2939edf337342fd60e7619dfa3a8de53dfa",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 5
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 640,
+      "dataset_line": 6,
+      "layer": 15,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s005.l15.n256.p0.npz",
+      "position_offset": 0,
+      "sample_index": 1,
+      "sha256": "23424e94c746c798bec5d4b7bbb448a8e0cdb99ca08797aa51a2b2e2fb93dfdd",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 5
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 640,
+      "dataset_line": 6,
+      "layer": 19,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s005.l19.n256.p0.npz",
+      "position_offset": 0,
+      "sample_index": 1,
+      "sha256": "b6fdaeac546f48fde2c905e06aa71ca65bcc272f0e95d8d4798a543aab7d5007",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 5
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 640,
+      "dataset_line": 6,
+      "layer": 23,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s005.l23.n256.p0.npz",
+      "position_offset": 0,
+      "sample_index": 1,
+      "sha256": "8db5bd1abb4b65fdcf910ef42fd3c2ae5fa9204bd90bc304b55c1adc5050dbf3",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 5
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 768,
+      "dataset_line": 7,
+      "layer": 3,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s006.l3.n256.p256.npz",
+      "position_offset": 256,
+      "sample_index": 0,
+      "sha256": "4e1ebe025158b0b902f462aa88fb7d03c77b2f95727a88f46a48b13a309e2fd9",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 6
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 768,
+      "dataset_line": 7,
+      "layer": 7,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s006.l7.n256.p256.npz",
+      "position_offset": 256,
+      "sample_index": 0,
+      "sha256": "5d92d3c2291b662178ced6c31dacbc9a66509df3a55afdbbe6e12cf5136d4381",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 6
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 768,
+      "dataset_line": 7,
+      "layer": 11,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s006.l11.n256.p256.npz",
+      "position_offset": 256,
+      "sample_index": 0,
+      "sha256": "028d71db99a2b7a4e80050a94149187c938b04ab3d53138f67f66d59747784d2",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 6
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 768,
+      "dataset_line": 7,
+      "layer": 15,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s006.l15.n256.p256.npz",
+      "position_offset": 256,
+      "sample_index": 0,
+      "sha256": "f210f242497bc9de7a8759f089054cb28d54f46f85f943f84105980829f6afb7",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 6
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 768,
+      "dataset_line": 7,
+      "layer": 19,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s006.l19.n256.p256.npz",
+      "position_offset": 256,
+      "sample_index": 0,
+      "sha256": "dadb92171a7908249e7a155196934c1e2a1162bfd9e7575c7ec9c8840c4e903f",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 6
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 768,
+      "dataset_line": 7,
+      "layer": 23,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s006.l23.n256.p256.npz",
+      "position_offset": 256,
+      "sample_index": 0,
+      "sha256": "c013f5ce6cfdc3b96547c38eaf9125651b9d43e1532dfcfa0d042778e9047378",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 6
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 896,
+      "dataset_line": 8,
+      "layer": 3,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s007.l3.n256.p256.npz",
+      "position_offset": 256,
+      "sample_index": 1,
+      "sha256": "2990c371c780251f0beb94f88db88157f9a4058c5563787f68c958d1c36d2082",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 7
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 896,
+      "dataset_line": 8,
+      "layer": 7,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s007.l7.n256.p256.npz",
+      "position_offset": 256,
+      "sample_index": 1,
+      "sha256": "e40b71752c15c5f58bacbd5c482b2acf43a44e301b0bcd36561e6b0943f4bf29",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 7
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 896,
+      "dataset_line": 8,
+      "layer": 11,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s007.l11.n256.p256.npz",
+      "position_offset": 256,
+      "sample_index": 1,
+      "sha256": "1565e731ab1442074dbfa0e5d52463d53cc38007f83b30b014ba0eebcd0eece7",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 7
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 896,
+      "dataset_line": 8,
+      "layer": 15,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s007.l15.n256.p256.npz",
+      "position_offset": 256,
+      "sample_index": 1,
+      "sha256": "becbd2f67a414c5b6bfc62db66e79f2dc0821cb1c24c3f6941051c84400c2d65",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 7
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 896,
+      "dataset_line": 8,
+      "layer": 19,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s007.l19.n256.p256.npz",
+      "position_offset": 256,
+      "sample_index": 1,
+      "sha256": "2bc65fe9d154b839d3337e00d103aeca1e86e46966574ef8bb3a37e733f001c0",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 7
+    },
+    {
+      "bytes": 5248440,
+      "content_start": 896,
+      "dataset_line": 8,
+      "layer": 23,
+      "length": 256,
+      "max_relative_offset": 255,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/records/validation.s007.l23.n256.p256.npz",
+      "position_offset": 256,
+      "sample_index": 1,
+      "sha256": "dcecf28e130eb2a939ea837f33afb99a701025d2a1c54f0bf7205af7ab690be3",
+      "shapes": {
+        "gate": [
+          8,
+          256,
+          256
+        ],
+        "k": [
+          2,
+          256,
+          256
+        ],
+        "q": [
+          8,
+          256,
+          256
+        ],
+        "v": [
+          2,
+          256,
+          256
+        ]
+      },
+      "stratum": 7
+    }
+  ],
+  "rope_sha256": "7044372884c06b70ab7c941da48acbece7628f9cc026cd4605e96e834006483e",
+  "schema": "hipfire.astrea.latent_kv_capture.v0",
+  "split": "validation",
+  "status": "captured",
+  "strata": 8,
+  "weights": {
+    "bytes": 50333190,
+    "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/validation-capture/static_weights.npz",
+    "sha256": "484e4dc8f5fafe4d9f280a7d6ce40d0fba1235c37ffc02b328dfe118916f4e92"
+  }
+}

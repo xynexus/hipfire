@@ -1,14 +1,16 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify};
 
+use hipfire_auth::{AccessStore, CredentialSnapshot, RateLimiter, UsageWriter};
 use hipfire_config::{HipfireConfig, LoadedConfig};
 use hipfire_daemon_adapter::DaemonEngine;
 use hipfire_diffusion::{DiffusionGenerationRuntimeOptions, DiffusionPipeline};
 use hipfire_prompt::Message;
-use hipfire_scheduler::{PriorityPrefillScheduler, SchedulerPolicyEnv};
+use hipfire_scheduler::{
+    ContinuousWorkScheduler, PriorityPrefillScheduler, SchedulerPolicyEnv, WorkloadResources,
+};
 
 #[derive(Clone, Debug)]
 pub struct StoredResponsesContext {
@@ -58,6 +60,16 @@ pub struct SdapiProgressState {
     pub completed_at_unix_secs: Option<u64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct LoadedModelState {
+    pub worker_key_id: Option<String>,
+    pub cache_capable: bool,
+    pub max_seq: u32,
+    /// Arch tag reported by the daemon load (a registered model_type), cached
+    /// for batch-eligibility routing.
+    pub arch: Option<String>,
+}
+
 pub struct AppState {
     /// Serializes all daemon I/O. Phase A: one request at a time.
     pub engine: Mutex<Option<DaemonEngine>>,
@@ -69,13 +81,30 @@ pub struct AppState {
     pub loaded_model_cache_capable: Mutex<Option<bool>>,
     /// Effective max_seq used when the current model was loaded.
     pub loaded_model_max_seq: Mutex<Option<u32>>,
+    /// Loaded daemon workers keyed by resolved model path.
+    pub loaded_models: Mutex<HashMap<String, LoadedModelState>>,
     /// Shared prefill scheduler used by Rust request paths when enabled.
     pub prefill_scheduler: Mutex<PriorityPrefillScheduler>,
+    /// Continuous work scheduler: the admission spine the batch runner pulls
+    /// batches from (priority + microbatch grouping + resource leases). Phase 3.
+    pub work_scheduler: Mutex<ContinuousWorkScheduler>,
     /// Request IDs selected by the scheduler and ready to enter daemon I/O.
     pub selected_prefill_requests: Mutex<HashSet<String>>,
     /// Serializes scheduler selection so one request path chooses batches at a time.
     pub prefill_dispatch: Mutex<()>,
     pub prefill_notify: Notify,
+    /// Continuous-batching request registry (Phase 1). Requests park here and
+    /// await the runner instead of taking `engine` directly. Only populated
+    /// when `HIPFIRE_SERVER_PREFILL_BATCH` is enabled and the runner is spawned.
+    pub batch_inbox: crate::batch_runner::BatchInbox,
+    /// True once [`crate::batch_runner::spawn_batch_runner`] has started the
+    /// runner loop. Routes that enqueue + await a runner result (image gen) must
+    /// only do so when this is set — otherwise (e.g. unit tests that build an
+    /// `AppState` without a serve loop) the request would park forever. Text/embed
+    /// are additionally gated by arch-eligibility, but image has no such gate.
+    pub batch_runner_active: std::sync::atomic::AtomicBool,
+    /// Live batch-runner telemetry surfaced by `/health`.
+    pub batch_telemetry: Mutex<crate::batch_runner::BatchTelemetry>,
     pub responses_contexts: Mutex<HashMap<String, StoredResponsesContext>>,
     pub responses_order: Mutex<VecDeque<String>>,
     pub files: Mutex<HashMap<String, StoredFile>>,
@@ -94,16 +123,95 @@ pub struct AppState {
     /// `/sdapi/v1/options` that do not map to native Hipfire config fields.
     pub sdapi_options: Mutex<HashMap<String, serde_json::Value>>,
     pub sdapi_progress: Arc<StdMutex<SdapiProgressState>>,
-    pub last_request_unix_secs: Mutex<u64>,
     pub training_runs_dir: PathBuf,
     /// Server-owned root for images saved by the SD API routes. Derived from
     /// config at construction; request `outdir_*` overrides never reach it.
     pub sdapi_output_root: PathBuf,
+    /// Admin-configured DoS ceiling on SD API request geometry. Derived from
+    /// config at construction; clients may request smaller, never larger.
+    pub(crate) sdapi_geometry_limits: crate::routes::sdapi::SdapiGeometryLimits,
+    /// Primary local model root. Derived from config at construction; network
+    /// model resolution is confined to this root plus `models_network_dir`.
+    pub models_dir: PathBuf,
+    /// Optional admin-configured extra read-only model root (e.g. an NFS
+    /// share). Network model resolution is confined to `models_dir`
+    /// plus this root; unset by default. Derived from config at construction.
+    pub models_network_dir: Option<PathBuf>,
     /// Local admin bearer secret (`~/.hipfire/admin.secret`); same-box
     /// CLI/TUI present this to skip the `/admin` login flow.
     pub admin_secret: String,
     /// Active `/admin` browser sessions: token -> expiry (unix secs).
     pub admin_sessions: Mutex<HashMap<String, u64>>,
+    /// Durable API identities plus the immutable verification snapshot used by
+    /// request middleware. Database errors remain visible and fail closed.
+    pub access: AccessRuntime,
+    pub rate_limiter: RateLimiter,
+    pub usage_writer: Option<UsageWriter>,
+}
+
+pub struct AccessRuntime {
+    store: std::sync::RwLock<Option<AccessStore>>,
+    credentials: std::sync::RwLock<Option<Arc<CredentialSnapshot>>>,
+    init_error: std::sync::RwLock<Option<String>>,
+}
+
+impl AccessRuntime {
+    fn open(directory: &std::path::Path) -> Self {
+        match AccessStore::open_in(directory) {
+            Ok(store) => match CredentialSnapshot::load(&store) {
+                Ok(snapshot) => Self {
+                    store: std::sync::RwLock::new(Some(store)),
+                    credentials: std::sync::RwLock::new(Some(Arc::new(snapshot))),
+                    init_error: std::sync::RwLock::new(None),
+                },
+                Err(error) => Self::failed(error.to_string()),
+            },
+            Err(error) => Self::failed(error.to_string()),
+        }
+    }
+
+    fn failed(error: String) -> Self {
+        Self {
+            store: std::sync::RwLock::new(None),
+            credentials: std::sync::RwLock::new(None),
+            init_error: std::sync::RwLock::new(Some(error)),
+        }
+    }
+
+    pub fn ensure_ready(&self) -> Result<(), String> {
+        if let Some(error) = self.init_error.read().unwrap().clone() {
+            return Err(format!("API access store unavailable: {error}"));
+        }
+        if self.store.read().unwrap().is_none() || self.credentials.read().unwrap().is_none() {
+            return Err("API access store unavailable".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn store(&self) -> Result<AccessStore, String> {
+        self.ensure_ready()?;
+        self.store
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "API access store unavailable".to_string())
+    }
+
+    pub fn credentials(&self) -> Result<Arc<CredentialSnapshot>, String> {
+        self.ensure_ready()?;
+        self.credentials
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "API credential cache unavailable".to_string())
+    }
+
+    pub fn refresh_credentials(&self) -> Result<(), String> {
+        let store = self.store()?;
+        let snapshot = CredentialSnapshot::load(&store).map_err(|error| error.to_string())?;
+        *self.credentials.write().unwrap() = Some(Arc::new(snapshot));
+        Ok(())
+    }
 }
 
 impl AppState {
@@ -121,9 +229,30 @@ impl AppState {
         loaded_config: LoadedConfig,
         training_runs_dir: PathBuf,
     ) -> Arc<Self> {
+        Self::new_loaded_with_directories(
+            loaded_config,
+            training_runs_dir,
+            hipfire_config::hipfire_dir(),
+        )
+    }
+
+    pub fn new_loaded_with_directories(
+        loaded_config: LoadedConfig,
+        training_runs_dir: PathBuf,
+        access_dir: PathBuf,
+    ) -> Arc<Self> {
         let scheduler_env = SchedulerPolicyEnv::from_pairs(std::env::vars());
         let config = loaded_config.config.clone();
         let sdapi_output_root = PathBuf::from(&config.sdapi_output_root);
+        let sdapi_geometry_limits = crate::routes::sdapi::SdapiGeometryLimits::from_config(&config);
+        let models_dir = hipfire_config::configured_models_dir(&config);
+        let models_network_dir = config
+            .models_network_dir
+            .as_deref()
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from);
+        let access = AccessRuntime::open(&access_dir);
+        let usage_writer = access.store().ok().map(UsageWriter::spawn);
         Arc::new(Self {
             engine: Mutex::new(None),
             loaded_config: Mutex::new(loaded_config),
@@ -131,10 +260,29 @@ impl AppState {
             loaded_model_path: Mutex::new(None),
             loaded_model_cache_capable: Mutex::new(None),
             loaded_model_max_seq: Mutex::new(None),
+            loaded_models: Mutex::new(HashMap::new()),
             prefill_scheduler: Mutex::new(PriorityPrefillScheduler::new(scheduler_env)),
+            // Generous capacity: admission is behavior-neutral for now (the
+            // scheduler provides priority ordering, microbatch grouping, and
+            // resource leases; real inventory-based capacity is a follow-up).
+            // Unbounded queue (max_queued=0) mirrors the prior inbox behaviour.
+            work_scheduler: Mutex::new(ContinuousWorkScheduler::new(
+                WorkloadResources {
+                    system_memory_bytes: u64::MAX,
+                    vram_bytes: u64::MAX,
+                    gpu_slots: u32::MAX,
+                    npu_slots: u32::MAX,
+                    cpu_threads: u32::MAX,
+                },
+                0,
+                0,
+            )),
             selected_prefill_requests: Mutex::new(HashSet::new()),
             prefill_dispatch: Mutex::new(()),
             prefill_notify: Notify::new(),
+            batch_inbox: Mutex::new(HashMap::new()),
+            batch_runner_active: std::sync::atomic::AtomicBool::new(false),
+            batch_telemetry: Mutex::new(crate::batch_runner::BatchTelemetry::default()),
             responses_contexts: Mutex::new(HashMap::new()),
             responses_order: Mutex::new(VecDeque::new()),
             files: Mutex::new(HashMap::new()),
@@ -147,11 +295,16 @@ impl AppState {
             ),
             sdapi_options: Mutex::new(HashMap::new()),
             sdapi_progress: Arc::new(StdMutex::new(SdapiProgressState::default())),
-            last_request_unix_secs: Mutex::new(now_secs()),
             training_runs_dir,
             sdapi_output_root,
+            sdapi_geometry_limits,
+            models_dir,
+            models_network_dir,
             admin_secret: hipfire_config::ensure_admin_secret().unwrap_or_default(),
             admin_sessions: Mutex::new(HashMap::new()),
+            access,
+            rate_limiter: RateLimiter::default(),
+            usage_writer,
         })
     }
 
@@ -190,10 +343,3 @@ impl AppState {
 }
 
 pub type SharedState = Arc<AppState>;
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}

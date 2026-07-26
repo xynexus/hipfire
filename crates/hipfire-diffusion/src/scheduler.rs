@@ -21,6 +21,67 @@ pub struct DiffusionSchedule {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SeFiDualScheduleStep {
+    pub(crate) timestep_sem: f32,
+    pub(crate) timestep_tex: f32,
+    pub(crate) sigma_sem: f32,
+    pub(crate) sigma_tex: f32,
+    pub(crate) sigma_sem_next: f32,
+    pub(crate) sigma_tex_next: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SeFiDualSchedule {
+    pub(crate) base_sigmas: Vec<f32>,
+    pub(crate) steps: Vec<SeFiDualScheduleStep>,
+}
+
+impl SeFiDualSchedule {
+    /// Inject flow-match refine noise per stream for MrFlow/draft Stage-2: the
+    /// first `semantic_channels` channels start at `sigma_sem`, the rest at
+    /// `sigma_tex` (from the first refine step), matching the dual schedule's
+    /// semantic-ahead-of-texture invariant. `latents` is NCHW `[b, c, h, w]`.
+    pub(crate) fn add_refine_noise(
+        &self,
+        latents: &mut LatentBatch,
+        noise: &[f32],
+        semantic_channels: usize,
+    ) -> DiffusionResult<()> {
+        if noise.len() != latents.data.len() {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "SeFi refine noise length {} != latent length {}",
+                noise.len(),
+                latents.data.len()
+            )));
+        }
+        let step0 = self.steps.first().ok_or_else(|| {
+            DiffusionError::InvalidRequest("SeFi refine schedule has no steps".to_string())
+        })?;
+        if semantic_channels > latents.channels {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "SeFi semantic_channels {semantic_channels} exceeds latent channels {}",
+                latents.channels
+            )));
+        }
+        let plane = latents.height * latents.width;
+        for b in 0..latents.batch {
+            for c in 0..latents.channels {
+                let sigma = if c < semantic_channels {
+                    step0.sigma_sem
+                } else {
+                    step0.sigma_tex
+                };
+                let base = (b * latents.channels + c) * plane;
+                for i in base..base + plane {
+                    latents.data[i] = (1.0 - sigma) * latents.data[i] + sigma * noise[i];
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SchedulerSolver {
     Euler,
     FlowMatchEuler,
@@ -146,20 +207,25 @@ fn dynamic_threshold_sample(
 
     let ratio = normalize_dynamic_thresholding_ratio(Some(ratio));
     let sample_max_value = normalize_dynamic_thresholding_sample_max(Some(sample_max_value));
-    let mut sorted_abs = Vec::with_capacity(values_per_batch);
+    let mut abs_values = Vec::with_capacity(values_per_batch);
     for chunk in data.chunks_mut(values_per_batch) {
-        sorted_abs.clear();
-        sorted_abs.extend(chunk.iter().map(|value| value.abs()));
-        sorted_abs.sort_by(|left, right| left.total_cmp(right));
+        abs_values.clear();
+        abs_values.extend(chunk.iter().map(|value| value.abs()));
 
-        let threshold = if sorted_abs.len() == 1 {
-            sorted_abs[0]
+        let threshold = if abs_values.len() == 1 {
+            abs_values[0]
         } else {
-            let rank = ratio * (sorted_abs.len() - 1) as f32;
+            let rank = ratio * (abs_values.len() - 1) as f32;
             let lower = rank.floor() as usize;
             let upper = rank.ceil() as usize;
             let frac = rank - lower as f32;
-            sorted_abs[lower] + (sorted_abs[upper] - sorted_abs[lower]) * frac
+            let lower_value = select_order_stat(&mut abs_values, lower);
+            let upper_value = if upper == lower {
+                lower_value
+            } else {
+                select_order_stat(&mut abs_values, upper)
+            };
+            lower_value + (upper_value - lower_value) * frac
         };
         let threshold = threshold.clamp(1.0, sample_max_value);
         for value in chunk {
@@ -168,6 +234,11 @@ fn dynamic_threshold_sample(
     }
 
     Ok(())
+}
+
+fn select_order_stat(values: &mut [f32], rank: usize) -> f32 {
+    let (_, value, _) = values.select_nth_unstable_by(rank, |left, right| left.total_cmp(right));
+    *value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +277,203 @@ impl SchedulerPredictionType {
 }
 
 impl DiffusionSchedule {
+    pub(crate) fn sefi_dual_euler(
+        steps: usize,
+        delta_t: f32,
+        timestep_shift_alpha: f32,
+    ) -> DiffusionResult<SeFiDualSchedule> {
+        if steps == 0 {
+            return Err(DiffusionError::InvalidRequest(
+                "SeFi schedule requires at least one step".to_string(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&delta_t) || !delta_t.is_finite() {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "SeFi delta_t {delta_t} must be finite and in [0, 1]"
+            )));
+        }
+        if !timestep_shift_alpha.is_finite() || timestep_shift_alpha <= 0.0 {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "SeFi timestep_shift_alpha {timestep_shift_alpha} must be finite and positive"
+            )));
+        }
+        let shift = |u: f32| timestep_shift_alpha * u / (1.0 + (timestep_shift_alpha - 1.0) * u);
+        // The SeFi reference indexes the scheduler immediately after
+        // construction. For its 1000-step FlowMatchEuler config those arrays
+        // are timesteps 1000..1 and sigmas 1.0..0.001. Match the reference's
+        // `(u * 999).long()` lookup rather than interpolating.
+        let lookup = |u: f32| {
+            let index = (u.clamp(0.0, 1.0) * 999.0).floor() as usize;
+            let timestep = (1000 - index) as f32;
+            (timestep, timestep / 1000.0)
+        };
+        let coordinates = (0..=steps)
+            .map(|index| {
+                let u_base = index as f32 / steps as f32;
+                let u_sem_raw = shift(u_base) * (1.0 + delta_t);
+                let u_sem = u_sem_raw.min(1.0);
+                let u_tex = (u_sem_raw - delta_t).clamp(0.0, 1.0);
+                let (timestep_sem, sigma_sem) = lookup(u_sem);
+                let (timestep_tex, sigma_tex) = lookup(u_tex);
+                (timestep_sem, timestep_tex, sigma_sem, sigma_tex)
+            })
+            .collect::<Vec<_>>();
+        let base_sigmas = (0..=steps)
+            .map(|index| {
+                let u_base = index as f32 / steps as f32;
+                lookup(shift(u_base)).1
+            })
+            .collect();
+        let mut schedule_steps = Vec::with_capacity(steps);
+        for index in 0..steps {
+            let (timestep_sem, timestep_tex, sigma_sem, sigma_tex) = coordinates[index];
+            let (_, _, sigma_sem_next, sigma_tex_next) = coordinates[index + 1];
+            if sigma_sem > sigma_tex + 1e-6 {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "SeFi dual schedule invariant failed at step {index}: sigma_sem {sigma_sem} > sigma_tex {sigma_tex}"
+                )));
+            }
+            schedule_steps.push(SeFiDualScheduleStep {
+                timestep_sem,
+                timestep_tex,
+                sigma_sem,
+                sigma_tex,
+                sigma_sem_next,
+                sigma_tex_next,
+            });
+        }
+        Ok(SeFiDualSchedule {
+            base_sigmas,
+            steps: schedule_steps,
+        })
+    }
+
+    /// SeFi dual-stream **refine** schedule for MrFlow/draft Stage-2: resume the
+    /// dual trajectory from `first_sigma` (near the end of denoising) to 0 over
+    /// `steps`, preserving the semantic/texture `delta_t` offset. This is the
+    /// dual-stream analogue of [`Self::refine_direct_sigma`]: instead of a fresh
+    /// `u_base ∈ [0, 1]` sweep, it sweeps the tail `u_base ∈ [u_start, 1]` where
+    /// `u_start` is the base coordinate whose base sigma is `first_sigma`.
+    pub(crate) fn sefi_dual_refine(
+        first_sigma: f32,
+        steps: usize,
+        delta_t: f32,
+        timestep_shift_alpha: f32,
+    ) -> DiffusionResult<SeFiDualSchedule> {
+        if steps == 0 {
+            return Err(DiffusionError::InvalidRequest(
+                "SeFi refine schedule requires at least one step".to_string(),
+            ));
+        }
+        if !first_sigma.is_finite() || !(0.0 < first_sigma && first_sigma < 1.0) {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "SeFi refine first_sigma {first_sigma} must be in (0, 1)"
+            )));
+        }
+        if !(0.0..=1.0).contains(&delta_t) || !delta_t.is_finite() {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "SeFi delta_t {delta_t} must be finite and in [0, 1]"
+            )));
+        }
+        if !timestep_shift_alpha.is_finite() || timestep_shift_alpha <= 0.0 {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "SeFi timestep_shift_alpha {timestep_shift_alpha} must be finite and positive"
+            )));
+        }
+        let shift = |u: f32| timestep_shift_alpha * u / (1.0 + (timestep_shift_alpha - 1.0) * u);
+        let lookup = |u: f32| {
+            let index = (u.clamp(0.0, 1.0) * 999.0).floor() as usize;
+            let timestep = (1000 - index) as f32;
+            (timestep, timestep / 1000.0)
+        };
+        // base_sigma(u) = lookup(shift(u)) ≈ 1 - shift(u); pick u_start so its base
+        // sigma is first_sigma, then resume the trajectory over [u_start, 1].
+        let s = (1.0 - first_sigma).clamp(0.0, 1.0);
+        let u_start =
+            (s / (timestep_shift_alpha - s * (timestep_shift_alpha - 1.0))).clamp(0.0, 1.0);
+        let u_at = |index: usize| u_start + (1.0 - u_start) * index as f32 / steps as f32;
+        let coordinates = (0..=steps)
+            .map(|index| {
+                let u_base = u_at(index);
+                let u_sem_raw = shift(u_base) * (1.0 + delta_t);
+                let u_sem = u_sem_raw.min(1.0);
+                let u_tex = (u_sem_raw - delta_t).clamp(0.0, 1.0);
+                let (timestep_sem, sigma_sem) = lookup(u_sem);
+                let (timestep_tex, sigma_tex) = lookup(u_tex);
+                (timestep_sem, timestep_tex, sigma_sem, sigma_tex)
+            })
+            .collect::<Vec<_>>();
+        let base_sigmas = (0..=steps)
+            .map(|index| lookup(shift(u_at(index))).1)
+            .collect();
+        let mut schedule_steps = Vec::with_capacity(steps);
+        for index in 0..steps {
+            let (timestep_sem, timestep_tex, sigma_sem, sigma_tex) = coordinates[index];
+            let (_, _, sigma_sem_next, sigma_tex_next) = coordinates[index + 1];
+            if sigma_sem > sigma_tex + 1e-6 {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "SeFi refine schedule invariant failed at step {index}: sigma_sem {sigma_sem} > sigma_tex {sigma_tex}"
+                )));
+            }
+            schedule_steps.push(SeFiDualScheduleStep {
+                timestep_sem,
+                timestep_tex,
+                sigma_sem,
+                sigma_tex,
+                sigma_sem_next,
+                sigma_tex_next,
+            });
+        }
+        Ok(SeFiDualSchedule {
+            base_sigmas,
+            steps: schedule_steps,
+        })
+    }
+
+    pub(crate) fn flux2_euler(steps: usize, image_seq_len: usize) -> DiffusionResult<Self> {
+        if steps == 0 {
+            return Err(DiffusionError::InvalidRequest(
+                "FLUX.2 schedule requires at least one step".to_string(),
+            ));
+        }
+        let seq = image_seq_len as f32;
+        let a1 = 8.738_095_24e-5f32;
+        let b1 = 1.898_333_33f32;
+        let a2 = 0.000_169_27f32;
+        let b2 = 0.456_666_66f32;
+        let mu = if image_seq_len > 4300 {
+            a2 * seq + b2
+        } else {
+            let m_200 = a2 * seq + b2;
+            let m_10 = a1 * seq + b1;
+            let slope = (m_200 - m_10) / 190.0;
+            slope * steps as f32 + (m_200 - 200.0 * slope)
+        };
+        let exp_mu = mu.exp();
+        let sigmas = (0..=steps)
+            .map(|index| {
+                let t = 1.0 - index as f32 / steps as f32;
+                if t <= 0.0 {
+                    0.0
+                } else {
+                    exp_mu / (exp_mu + (1.0 / t - 1.0))
+                }
+            })
+            .collect::<Vec<_>>();
+        let timesteps = sigmas[..steps].iter().map(|sigma| sigma * 1000.0).collect();
+        Ok(Self {
+            timesteps,
+            sigmas,
+            prediction_type: SchedulerPredictionType::Sample,
+            input_scaling: SchedulerInputScaling::None,
+            solver: SchedulerSolver::FlowMatchEuler,
+            train_timesteps: Vec::new(),
+            alpha_t: Vec::new(),
+            sigma_t: Vec::new(),
+            lambda_t: Vec::new(),
+        })
+    }
+
     pub fn linear(steps: u32) -> DiffusionResult<Self> {
         if steps == 0 {
             return Err(DiffusionError::InvalidRequest(
@@ -239,13 +507,25 @@ impl DiffusionSchedule {
     }
 
     pub fn from_config(config: &SchedulerConfig, steps: u32) -> DiffusionResult<Self> {
+        Self::from_config_with_image_seq_len(config, steps, None)
+    }
+
+    /// Like `from_config`, but forwards the packed image token count to the
+    /// FlowMatchEuler dynamic-shift `mu` (diffusers `calculate_shift`). Passing
+    /// `None` computes `mu` at the config's `base_image_seq_len`, which
+    /// under-shifts higher resolutions.
+    pub fn from_config_with_image_seq_len(
+        config: &SchedulerConfig,
+        steps: u32,
+        image_seq_len: Option<usize>,
+    ) -> DiffusionResult<Self> {
         if steps == 0 {
             return Err(DiffusionError::InvalidRequest(
                 "scheduler steps must be greater than zero".to_string(),
             ));
         }
         if config.class_name == "FlowMatchEulerDiscreteScheduler" {
-            return Self::flow_match_euler(config, steps);
+            return Self::flow_match_euler_with_image_seq_len(config, steps, image_seq_len);
         }
         let (Some(beta_start), Some(beta_end), Some(num_train_timesteps)) = (
             config.beta_start,
@@ -332,10 +612,6 @@ impl DiffusionSchedule {
         })
     }
 
-    pub(crate) fn flow_match_euler(config: &SchedulerConfig, steps: u32) -> DiffusionResult<Self> {
-        Self::flow_match_euler_with_image_seq_len(config, steps, None)
-    }
-
     /// FlowMatchEuler schedule. When `use_dynamic_shifting` is set, the shift is
     /// resolution-dependent: `mu` is interpolated between `base_shift`/`max_shift`
     /// over `[base_image_seq_len, max_image_seq_len]` and applied as an
@@ -363,12 +639,19 @@ impl DiffusionSchedule {
         } else {
             None
         };
+        // diffusers FlowMatchEulerDiscreteScheduler spaces the pre-shift sigmas as
+        // linspace(1, 1/num_train_timesteps, steps) -- the last MODEL-EVALUATION
+        // sigma is 1/num_train_timesteps (~0.001), NOT 0; the terminal 0 is only
+        // appended afterwards. Ending the ramp at 0 makes the model be evaluated
+        // at timestep 0, where a flow-match DiT's velocity is ill-defined; the
+        // step's dt is also 0, so `latent += velocity * 0` becomes 0 * inf = NaN.
+        let sigma_min_frac = 1.0 / train_timesteps as f32;
         let mut sigmas = Vec::with_capacity(steps + 1);
         for idx in 0..steps {
             let frac = if steps == 1 {
                 1.0
             } else {
-                1.0 - idx as f32 / (steps - 1) as f32
+                1.0 - (idx as f32 / (steps - 1) as f32) * (1.0 - sigma_min_frac)
             };
             let sigma = match dynamic_mu {
                 // Exponential time shift; frac == 0 -> sigma 0 (1/frac -> inf).
@@ -402,6 +685,105 @@ impl DiffusionSchedule {
             prediction_type: SchedulerPredictionType::Sample,
             input_scaling: SchedulerInputScaling::None,
             solver: SchedulerSolver::FlowMatchEuler,
+            train_timesteps: Vec::new(),
+            alpha_t: Vec::new(),
+            sigma_t: Vec::new(),
+            lambda_t: Vec::new(),
+        })
+    }
+
+    /// MrFlow "direct sigma" refine schedule: an explicit short sigma ramp from
+    /// `first_sigma` down to 0, independent of the model's base denoise
+    /// schedule. Used for the high-resolution refine pass in staged sampling
+    /// (low-res generate -> pixel-space super-resolution -> re-encode -> short
+    /// refine).
+    ///
+    /// `steps == 1` yields `[first_sigma, 0.0]`. With `shifted` and `steps > 1`
+    /// the interior points follow the flow-match time shift
+    /// (`mu = 0.25 * (steps - 1)`), matching the reference MrFlow refine; a plain
+    /// linear ramp from `first_sigma` to 0 is used otherwise (for a single step
+    /// the two are identical). Timestep values reuse this schedule's
+    /// `sigma -> timestep` scaling so the transformer receives the correct
+    /// timestep embedding. Only defined for flow-match backbones
+    /// (FLUX / Qwen-Image / Z-Image / Krea-2).
+    pub fn refine_direct_sigma(
+        &self,
+        first_sigma: f32,
+        steps: u32,
+        shifted: bool,
+    ) -> DiffusionResult<Self> {
+        if self.solver != SchedulerSolver::FlowMatchEuler {
+            return Err(DiffusionError::InvalidRequest(
+                "MrFlow direct-sigma refine requires a flow-match schedule".to_string(),
+            ));
+        }
+        if !first_sigma.is_finite() || !(0.0 < first_sigma && first_sigma < 1.0) {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "refine first_sigma {first_sigma} must be in (0, 1)"
+            )));
+        }
+        if steps == 0 {
+            return Err(DiffusionError::InvalidRequest(
+                "refine steps must be greater than zero".to_string(),
+            ));
+        }
+        let steps = steps as usize;
+        let sigmas = if steps == 1 {
+            vec![first_sigma, 0.0]
+        } else if shifted {
+            // Flow-match time shift on a linspace(1, 0) base, normalized so the
+            // first interior sigma is `first_sigma` and the tail is 0. Mirrors
+            // the reference MrFlow shifted refine path.
+            let mu = 0.25 * (steps as f32 - 1.0);
+            let e = mu.exp();
+            let shift = |t: f32| {
+                let t = t.clamp(1.0e-6, 1.0 - 1.0e-6);
+                e / (e + (1.0 / t - 1.0))
+            };
+            let mut shifted_vals = (0..=steps)
+                .map(|idx| shift(1.0 - idx as f32 / steps as f32))
+                .collect::<Vec<f32>>();
+            let last = *shifted_vals.last().unwrap();
+            let span = shifted_vals[0] - last;
+            let span = if span.abs() <= f32::EPSILON {
+                1.0
+            } else {
+                span
+            };
+            for value in &mut shifted_vals {
+                *value = (*value - last) / span * first_sigma;
+            }
+            *shifted_vals.first_mut().unwrap() = first_sigma;
+            *shifted_vals.last_mut().unwrap() = 0.0;
+            shifted_vals
+        } else {
+            let mut ramp = (0..=steps)
+                .map(|idx| first_sigma * (1.0 - idx as f32 / steps as f32))
+                .collect::<Vec<f32>>();
+            *ramp.last_mut().unwrap() = 0.0;
+            ramp
+        };
+
+        // Recover the base schedule's sigma -> timestep scale (e.g. 1000 for a
+        // 1000-train-timestep flow-match model) so the refine timesteps match.
+        let scale = self
+            .sigmas
+            .iter()
+            .zip(self.timesteps.iter())
+            .find(|(sigma, _)| **sigma > f32::EPSILON)
+            .map(|(sigma, timestep)| timestep / sigma)
+            .unwrap_or(1000.0);
+        let timesteps = sigmas[..steps]
+            .iter()
+            .map(|sigma| sigma * scale)
+            .collect::<Vec<f32>>();
+
+        Ok(Self {
+            timesteps,
+            sigmas,
+            prediction_type: self.prediction_type,
+            input_scaling: self.input_scaling,
+            solver: self.solver,
             train_timesteps: Vec::new(),
             alpha_t: Vec::new(),
             sigma_t: Vec::new(),
@@ -470,6 +852,37 @@ impl DiffusionSchedule {
         })?;
         for (latent, noise) in latents.data.iter_mut().zip(noise) {
             *latent += *noise * sigma;
+        }
+        Ok(())
+    }
+
+    /// Flow-match forward noising for the MrFlow refine pass:
+    /// `x = (1 - sigma) * x0 + sigma * noise` at the schedule's first sigma.
+    ///
+    /// This is the flow-match interpolation (matching diffusers'
+    /// `FlowMatchEulerDiscreteScheduler::scale_noise`), distinct from the
+    /// additive `x0 + sigma * noise` in [`add_noise_to_latents`] used by the
+    /// epsilon/Euler img2img path. The refine pass re-encodes a super-resolved
+    /// image (a clean `x0`) and injects matched noise before a short flow-match
+    /// denoise; the additive form would leave an `x0`-scaled residual after the
+    /// Euler step, so the refine path must use this interpolation.
+    pub fn add_flow_match_refine_noise(
+        &self,
+        latents: &mut LatentBatch,
+        noise: &[f32],
+    ) -> DiffusionResult<()> {
+        if noise.len() != latents.data.len() {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "noise length {} != latent length {}",
+                noise.len(),
+                latents.data.len()
+            )));
+        }
+        let sigma = *self.sigmas.first().ok_or_else(|| {
+            DiffusionError::InvalidRequest("refine schedule has no sigmas".to_string())
+        })?;
+        for (latent, noise) in latents.data.iter_mut().zip(noise) {
+            *latent = (1.0 - sigma) * *latent + sigma * *noise;
         }
         Ok(())
     }
@@ -1187,15 +1600,21 @@ mod flow_match_dynamic_tests {
         let base =
             DiffusionSchedule::flow_match_euler_with_image_seq_len(&dynamic_config(), 3, Some(256))
                 .unwrap();
+        // Pre-shift sigmas are linspace(1, 1/num_train_timesteps, steps), so for
+        // steps=3 the mid frac is 1 - 0.5*(1 - 1/1000), not exactly 0.5.
+        let mid_frac = 1.0 - 0.5 * (1.0 - 1.0 / 1000.0);
         let e = 0.5f32.exp();
-        let expected_mid = e / (e + 1.0);
+        let expected_mid = e / (e + (1.0 / mid_frac - 1.0));
         assert!(
             (base.sigmas[1] - expected_mid).abs() < 1e-4,
             "mid sigma {} != {expected_mid}",
             base.sigmas[1]
         );
         assert!((base.sigmas[0] - 1.0).abs() < 1e-4);
+        // The terminal sigma (appended after the ramp) is 0, but the last
+        // MODEL-EVALUATION sigma must be > 0 (never evaluate the DiT at t=0).
         assert_eq!(*base.sigmas.last().unwrap(), 0.0);
+        assert!(base.sigmas[base.sigmas.len() - 2] > 0.0);
         // Higher resolution -> larger mu -> larger mid sigma.
         let big = DiffusionSchedule::flow_match_euler_with_image_seq_len(
             &dynamic_config(),
@@ -1215,8 +1634,10 @@ mod flow_match_dynamic_tests {
     fn flow_match_static_shift_one_is_linear() {
         let mut config = dynamic_config();
         config.use_dynamic_shifting = Some(false);
-        let sched = DiffusionSchedule::flow_match_euler(&config, 3).unwrap();
-        // shift 1.0, no dynamic shifting -> sigma == frac (linear schedule).
-        assert!((sched.sigmas[1] - 0.5).abs() < 1e-6);
+        let sched = DiffusionSchedule::from_config(&config, 3).unwrap();
+        // shift 1.0, no dynamic shifting -> sigma == frac (linear schedule). The
+        // ramp is linspace(1, 1/num_train, 3), so the mid frac is 1-0.5*(1-1/1000).
+        let mid = 1.0 - 0.5 * (1.0 - 1.0 / 1000.0);
+        assert!((sched.sigmas[1] - mid).abs() < 1e-6);
     }
 }

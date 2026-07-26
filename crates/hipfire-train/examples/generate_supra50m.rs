@@ -34,9 +34,9 @@
 //!   hipfire gpu-lock release
 
 use hipfire_model::tokenizer::Tokenizer;
+use hipfire_rdna::Gpu;
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_forward, LlamaModel};
-use hipfire_rdna::Gpu;
 use std::path::Path;
 
 const MODEL_DIR: &str =

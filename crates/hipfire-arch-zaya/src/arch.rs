@@ -12,12 +12,12 @@
 use crate::gpu::{gpu_decode, gpu_forward_serve, ZayaDecodeState, ZayaGpuWeights};
 use crate::ZayaConfig;
 use hipfire_model::ARCH_ID_ZAYA;
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::arch::{
     run_simple_ar, ArchCaps, GenerateCtx, ServeOutcome, ServingBackend, SimpleAr,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// A loaded ZAYA1 model with GPU-resident weights and per-layer decode state
 /// (KV cache + conv ring + delayed value), so decode is O(1) per token.

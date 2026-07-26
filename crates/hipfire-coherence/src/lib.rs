@@ -165,8 +165,9 @@ impl CoherenceDaemonSession {
         let loaded = recv_until(&mut child, |_| {})?;
         let ty = loaded.get("type").and_then(Value::as_str).unwrap_or("");
         if ty != "loaded" {
+            let detail = daemon_error_detail(&loaded).unwrap_or_else(|| ty.to_string());
             shutdown_daemon(&mut child);
-            return Err(format!("expected loaded, got {ty}"));
+            return Err(format!("expected loaded, got {detail}"));
         }
 
         Ok(Self {
@@ -199,6 +200,35 @@ impl CoherenceDaemonSession {
         } else {
             Err(format!("expected reset, got {ty}"))
         }
+    }
+}
+
+fn daemon_error_detail(value: &Value) -> Option<String> {
+    let ty = value.get("type").and_then(Value::as_str)?;
+    if ty != "error" {
+        return None;
+    }
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.is_empty())?;
+    Some(format!("error: {message}"))
+}
+
+#[cfg(test)]
+mod daemon_load_error_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_error_detail_preserves_message() {
+        let value = json!({
+            "type": "error",
+            "message": "model already loaded; unload first"
+        });
+        assert_eq!(
+            daemon_error_detail(&value).as_deref(),
+            Some("error: model already loaded; unload first")
+        );
     }
 }
 
@@ -260,6 +290,48 @@ fn coherence_output_from_stats(
         tools_present: config.tools.is_some(),
         force_jinja_chat: config.force_jinja_chat,
     }
+}
+
+pub fn run_coherence_over_text(
+    config: &CoherenceRunConfig,
+    generated_text: String,
+    total_tokens: usize,
+    wall_ms: u64,
+    ttft_ms: u64,
+    daemon_prefill_ms: f64,
+    daemon_prefill_tok_s: f64,
+    daemon_decode_tok_s: f64,
+    daemon_tok_s: f64,
+) -> CoherenceRunOutput {
+    let mut bank = build_detector_bank(&config.profile);
+    let _ = bank.observe(&Event::Token {
+        text: &generated_text,
+        t_ms: ttft_ms,
+        synthetic: false,
+    });
+    let _ = bank.observe(&Event::Done {
+        total_tokens,
+        total_visible_bytes: generated_text.len(),
+        wall_ms,
+        ttft_ms,
+    });
+    coherence_output_from_stats(
+        config,
+        bank,
+        DoneStats {
+            total_tokens,
+            _total_visible_bytes: generated_text.len(),
+            generated_text,
+            token_ids: Vec::new(),
+            wall_ms,
+            ttft_ms,
+            daemon_prefill_ms,
+            daemon_prefill_tok_s,
+            daemon_decode_tok_s,
+            daemon_ttft_ms: ttft_ms as f64,
+            daemon_tok_s,
+        },
+    )
 }
 
 pub fn daemon_binary_available() -> bool {

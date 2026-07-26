@@ -3,20 +3,34 @@ mod model;
 
 use clap::{Parser, Subcommand};
 use hipfire_config::load_config_bundle;
+use std::ffi::OsString;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "hipfire",
     version = hipfire_build_info::VERSION,
-    about = "hipfire LLM inference CLI"
+    about = "hipfire LLM inference CLI",
+    long_about = "hipfire runs the local operator TUI, OpenAI-compatible HTTP server, model chat, eval, benchmark, diagnostics, and artifact tools.",
+    after_help = "Examples:\n  hipfire                         Open the operator TUI\n  hipfire help                    Show the command summary\n  hipfire start                   Start the background server\n  hipfire status                  Show background server status\n  hipfire chat Qwen3.5-30B-A3B \"hello\"\n  hipfire bench --model Qwen3.5-30B-A3B\n\nUse `hipfire <command> help` or `hipfire <command> --help` for detailed command help."
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Open the local operator TUI
+    #[command(alias = "ui")]
+    Tui,
+    /// Start the background hipfire server
+    Start(commands::daemon::StartArgs),
+    /// Stop the background hipfire server
+    Stop(commands::daemon::StopArgs),
+    /// Restart the background hipfire server
+    Restart(commands::daemon::RestartArgs),
+    /// Show background server status
+    Status(commands::daemon::StatusArgs),
     /// Start the hipfire HTTP server (OpenAI-compatible)
     Serve(commands::serve::ServeArgs),
     /// Load a model and generate a response (one-shot)
@@ -24,14 +38,24 @@ enum Command {
     /// List locally available models
     #[command(alias = "models")]
     List,
+    /// Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
+    Inspect(commands::inspect::InspectArgs),
     /// Run the quant admission/model evaluation harness
     Eval(commands::forward::EvalArgs),
+    /// Quick daemon benchmark: load time, TTFT, pp512 prefill t/s, tg128 decode t/s
+    Bench(commands::bench::BenchArgs),
+    /// Diagnose the local Hipfire install, runtime, daemon, and monitoring prerequisites
+    Doctor(commands::doctor::DoctorArgs),
     /// Measure host, GPU-copy, and model storage bandwidth
     HostProfile(commands::forward::HostProfileArgs),
     /// Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
     CollectArtifacts(commands::forward::CollectArtifactsArgs),
     /// Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
-    Repack(commands::forward::RepackArgs),
+    #[command(alias = "repack")]
+    Optimize(commands::forward::OptimizeArgs),
+    /// Compose/decompose .hfq packaging: bundle a base + role/feature sidecars
+    /// into one container, or split a bundle back into its component files.
+    Model(commands::model::ModelArgs),
     /// GPU resource lock for multi-agent coordination (acquire/release/status)
     #[command(alias = "gpu-lock")]
     Lock(commands::lock::LockArgs),
@@ -172,28 +196,53 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalize_help_args());
     let loaded_config = load_config_bundle();
     let config = loaded_config.config.clone();
 
     match cli.command {
-        Command::Serve(args) => commands::serve::run(args, loaded_config).await,
-        Command::Chat(args) => commands::chat::run(args, loaded_config).await,
-        Command::List => {
-            commands::list::run();
+        None | Some(Command::Tui) => hipfire_tui::run(),
+        Some(Command::Start(args)) => commands::daemon::start(args, loaded_config).await,
+        Some(Command::Stop(args)) => commands::daemon::stop(args, loaded_config).await,
+        Some(Command::Restart(args)) => commands::daemon::restart(args, loaded_config).await,
+        Some(Command::Status(args)) => commands::daemon::status(args, loaded_config).await,
+        Some(Command::Serve(args)) => commands::serve::run(args, loaded_config).await,
+        Some(Command::Chat(args)) => commands::chat::run(args, loaded_config).await,
+        Some(Command::List) => {
+            commands::list::run(loaded_config);
             Ok(())
         }
-        Command::Eval(args) => commands::forward::run_eval(args),
-        Command::HostProfile(args) => commands::forward::run_host_profile(args),
-        Command::CollectArtifacts(args) => commands::forward::run_collect_artifacts(args),
-        Command::Repack(args) => commands::forward::run_repack(args),
-        Command::Lock(args) => commands::lock::run(args),
-        Command::Detect(args) => commands::detect::run(args),
-        Command::Diffusion(args) => commands::diffusion::run(args),
-        Command::Admin(args) => commands::admin::run(args, config).await,
-        Command::GenDocs(args) => commands::gen_docs::run(args),
-        Command::GenConfigSchema(args) => commands::gen_config_schema::run(args),
-        Command::GenEnvDocs(args) => commands::gen_env_docs::run(args),
-        Command::GenModelSupport(args) => commands::gen_model_support::run(args),
+        Some(Command::Inspect(args)) => commands::inspect::run(args, loaded_config),
+        Some(Command::Eval(args)) => commands::forward::run_eval(args, loaded_config),
+        Some(Command::Bench(args)) => commands::bench::run(args, loaded_config).await,
+        Some(Command::Doctor(args)) => commands::doctor::run(args, loaded_config).await,
+        Some(Command::HostProfile(args)) => {
+            commands::forward::run_host_profile(args, loaded_config)
+        }
+        Some(Command::CollectArtifacts(args)) => {
+            commands::forward::run_collect_artifacts(args, loaded_config)
+        }
+        Some(Command::Optimize(args)) => commands::forward::run_optimize(args, loaded_config),
+        Some(Command::Model(args)) => commands::model::run(args, loaded_config),
+        Some(Command::Lock(args)) => commands::lock::run(args),
+        Some(Command::Detect(args)) => commands::detect::run(args),
+        Some(Command::Diffusion(args)) => commands::diffusion::run(args, loaded_config),
+        Some(Command::Admin(args)) => commands::admin::run(args, config).await,
+        Some(Command::GenDocs(args)) => commands::gen_docs::run(args),
+        Some(Command::GenConfigSchema(args)) => commands::gen_config_schema::run(args),
+        Some(Command::GenEnvDocs(args)) => commands::gen_env_docs::run(args),
+        Some(Command::GenModelSupport(args)) => commands::gen_model_support::run(args),
     }
+}
+
+fn normalize_help_args() -> Vec<OsString> {
+    let mut args = std::env::args_os().collect::<Vec<_>>();
+    if args.len() >= 2 && args[1] == "help" {
+        args.remove(1);
+        args.push("--help".into());
+    } else if args.len() >= 3 && args.last().is_some_and(|arg| arg == "help") {
+        args.pop();
+        args.push("--help".into());
+    }
+    args
 }

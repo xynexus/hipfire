@@ -16,7 +16,7 @@
 //! - HFQ files contain quantized weights (HFQ4G256 layout, 4-bit packed
 //!   + FP32 scale/zero); calibration needs the FP-precise BF16 source.
 //! - HuggingFace safetensors are the canonical BF16 distribution format
-//!   used by `llama-imatrix` and `collect_hessian.py`. Loading
+//!   used by `llama-imatrix` and `scripts/depreciated/collect_hessian.py`. Loading
 //!   safetensors directly removes the GGUF/HFQ-conversion roundtrip
 //!   that adds quantization error to the calibration signal.
 //! - The captured Hessian / Σx² values produced from a BF16 forward
@@ -48,7 +48,7 @@ use std::path::Path;
 pub struct Bf16Tensor {
     /// Canonical HF safetensors key (e.g.
     /// `model.layers.0.self_attn.q_proj.weight`). Mirror of the
-    /// `GPTQ_TARGET_SUFFIXES` list in `scripts/collect_hessian.py`
+    /// `GPTQ_TARGET_SUFFIXES` list in `scripts/depreciated/collect_hessian.py`
     /// determines which of these get a Hessian collected.
     pub name: String,
     /// Owned device tensor. Always `DType::F16`-tagged for now — the

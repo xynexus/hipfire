@@ -12,9 +12,9 @@ N_TILES = int(os.environ["N_TILES"])                  # tiles streamed from L3
 TOTAL = TILE_N * N_TILES                               # total int8 bytes fed
 DEPTH = int(os.environ.get("DEPTH", 4))
 
-in_ty = np.ndarray[(TOTAL,), np.dtype[np.int8]]
-tile_ty = np.ndarray[(TILE_N,), np.dtype[np.int8]]
-acc_ty = np.ndarray[(64,), np.dtype[np.int32]]
+in_ty: object = np.ndarray[(TOTAL,), np.dtype[np.int8]]
+tile_ty: object = np.ndarray[(TILE_N,), np.dtype[np.int8]]
+acc_ty: object = np.ndarray[(64,), np.dtype[np.int32]]
 
 kern = ExternalFunction(
     "feed_sum", source_file="r1a_feed.cc", arg_types=[tile_ty, acc_ty],

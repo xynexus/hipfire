@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
@@ -12,12 +12,14 @@ use uuid::Uuid;
 
 use crate::routes::{
     chat::{
-        execute_blocking_chat, openai_chat_completion_response_with_tool_calls_json, ChatRequest,
+        execute_blocking_chat_for_principal, openai_chat_completion_response_with_tool_calls_json,
+        ChatRequest,
     },
     files::store_generated_file,
-    responses::{execute_responses, ResponsesRequest},
+    responses::{execute_responses_for_principal, ResponsesRequest},
 };
 use crate::state::{SharedState, StoredBatch};
+use hipfire_auth::RequestPrincipal;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateBatchRequest {
@@ -54,6 +56,7 @@ pub async fn list_batches(State(state): State<SharedState>) -> impl IntoResponse
 
 pub async fn create_batch(
     State(state): State<SharedState>,
+    Extension(principal): Extension<RequestPrincipal>,
     Json(body): Json<CreateBatchRequest>,
 ) -> Response {
     if !matches!(
@@ -83,6 +86,19 @@ pub async fn create_batch(
     }
 
     let parsed = validate_batch_input_for_endpoint(&input_file.content, &body.endpoint);
+    if let Some(entry) = parsed
+        .entries
+        .iter()
+        .find(|entry| !crate::api_auth::principal_has_scope_for_path(&principal, &entry.url))
+    {
+        return error(
+            StatusCode::FORBIDDEN,
+            format!(
+                "API credential is missing the scope required by batch item {}",
+                entry.url
+            ),
+        );
+    }
     let batch = StoredBatch {
         id: format!("batch_{}", Uuid::new_v4().simple()),
         status: if parsed.errors.is_empty() {
@@ -106,7 +122,12 @@ pub async fn create_batch(
     store_batch(&state, batch.clone()).await;
 
     if parsed.errors.is_empty() {
-        tokio::spawn(run_batch(state.clone(), batch_id, parsed.entries));
+        tokio::spawn(run_batch(
+            state.clone(),
+            batch_id,
+            parsed.entries,
+            principal,
+        ));
     } else {
         let error_jsonl = batch_error_jsonl(&parsed.errors);
         let error_file =
@@ -151,7 +172,12 @@ pub async fn cancel_batch(State(state): State<SharedState>, Path(id): Path<Strin
     get_batch(State(state), Path(id)).await
 }
 
-async fn run_batch(state: SharedState, batch_id: String, entries: Vec<BatchEntry>) {
+async fn run_batch(
+    state: SharedState,
+    batch_id: String,
+    entries: Vec<BatchEntry>,
+    principal: RequestPrincipal,
+) {
     let mut output_lines = Vec::new();
     let mut completed = 0;
 
@@ -167,7 +193,7 @@ async fn run_batch(state: SharedState, batch_id: String, entries: Vec<BatchEntry
             return;
         }
 
-        let line = match execute_batch_entry(state.clone(), entry.clone()).await {
+        let line = match execute_batch_entry(state.clone(), entry.clone(), &principal).await {
             Ok(body) => json!({
                 "custom_id": entry.custom_id,
                 "response": {
@@ -205,18 +231,52 @@ async fn run_batch(state: SharedState, batch_id: String, entries: Vec<BatchEntry
     .await;
 }
 
-async fn execute_batch_entry(state: SharedState, entry: BatchEntry) -> Result<Value, Value> {
+async fn execute_batch_entry(
+    state: SharedState,
+    entry: BatchEntry,
+    principal: &RequestPrincipal,
+) -> Result<Value, Value> {
+    state
+        .access
+        .credentials()
+        .map_err(|error| json!({"error": {"message": error, "type": "server_error"}}))?
+        .validate_principal(principal, now_secs())
+        .map_err(|error| {
+            json!({"error": {
+                "message": error.to_string(),
+                "type": "authentication_error",
+                "code": "invalid_api_key",
+            }})
+        })?;
     let mut body = entry.body;
     if let Some(obj) = body.as_object_mut() {
         obj.insert("stream".to_string(), Value::Bool(false));
     }
 
-    match entry.url.as_str() {
+    let (reservation, accounting) = crate::api_auth::reserve_internal_json(
+        &state, principal, &entry.url, &body,
+    )
+    .map_err(|error| {
+        crate::accounting::record_rate_limit_hit(
+            state.usage_writer.as_ref(),
+            principal,
+            hipfire_auth::WorkloadClass::Text,
+        );
+        json!({"error": {
+            "message": format!("rate limit exceeded for {}", error.resource),
+            "type": "rate_limit_error",
+            "code": "rate_limit_exceeded",
+            "retry_after": error.retry_after_secs,
+        }})
+    })?;
+
+    let result = match entry.url.as_str() {
         "/v1/chat/completions" => {
             let request: ChatRequest = serde_json::from_value(body).map_err(
                 |e| json!({"error": {"message": e.to_string(), "type": "invalid_request_error"}}),
             )?;
-            let result = execute_blocking_chat(state, request).await?;
+            let result =
+                execute_blocking_chat_for_principal(state, request, principal, &accounting).await?;
             Ok(openai_chat_completion_response_with_tool_calls_json(
                 &result.req_id,
                 result.created,
@@ -231,7 +291,7 @@ async fn execute_batch_entry(state: SharedState, entry: BatchEntry) -> Result<Va
             let request: ResponsesRequest = serde_json::from_value(body).map_err(
                 |e| json!({"error": {"message": e.to_string(), "type": "invalid_request_error"}}),
             )?;
-            execute_responses(state, request).await
+            execute_responses_for_principal(state, request, principal, &accounting).await
         }
         _ => Err(json!({
             "error": {
@@ -239,6 +299,18 @@ async fn execute_batch_entry(state: SharedState, entry: BatchEntry) -> Result<Va
                 "type": "invalid_request_error",
             }
         })),
+    };
+    match result {
+        Ok(body) => {
+            accounting.complete();
+            reservation.complete();
+            Ok(body)
+        }
+        Err(error) => {
+            accounting.fail();
+            reservation.cancel();
+            Err(error)
+        }
     }
 }
 

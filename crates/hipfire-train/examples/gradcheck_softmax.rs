@@ -29,8 +29,8 @@
 //!   cargo run -p hipfire-train --release --example gradcheck_softmax
 //!   hipfire gpu-lock release
 
-use hipfire_train::ops::softmax::{softmax_backward, softmax_forward};
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_train::ops::softmax::{softmax_backward, softmax_forward};
 
 const ROWS: usize = 3;
 const N: usize = 7;

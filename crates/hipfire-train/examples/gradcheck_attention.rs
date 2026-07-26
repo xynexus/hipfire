@@ -29,8 +29,8 @@
 //!   cargo run -p hipfire-train --release --example gradcheck_attention
 //!   hipfire gpu-lock release
 
-use hipfire_train::ops::attention::{sdpa_backward, sdpa_forward};
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_train::ops::attention::{sdpa_backward, sdpa_forward};
 
 const SEQ: usize = 5;
 const D: usize = 8;

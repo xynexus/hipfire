@@ -11,8 +11,8 @@
 
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward::decode_step;
-use hipfire_runtime::kld_eval::ChunkScoredForward;
 use hipfire_rdna::Gpu;
+use hipfire_runtime::kld_eval::ChunkScoredForward;
 
 /// Teacher-force `chunk` through a FRESH per-call state (MLA / compressed-KV
 /// indexer + SWA + hyper-connection residuals), feeding one token per position

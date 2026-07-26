@@ -35,9 +35,9 @@
 use hip_bridge::HipResult;
 use hipfire_arch_qwen35::mtp_head;
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+use hipfire_rdna::Gpu;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
-use hipfire_rdna::Gpu;
 use std::path::Path;
 
 fn main() -> HipResult<()> {

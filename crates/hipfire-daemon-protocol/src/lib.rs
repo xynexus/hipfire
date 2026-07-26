@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use hipfire_generate::{DoneEvent, ErrorEvent, GenerateTextRequest, TokenEvent, ToolCallsEvent};
 use hipfire_kld::KldConfig;
+pub use hipfire_model::embedding::EmbeddingInputType;
 use hipfire_model::{
     AcceleratorInventory, LlmModelRegistry, ModelLoadRequest, ModelLoadedResponse,
 };
@@ -121,6 +122,20 @@ pub struct KldChunkEvent {
     pub n_chunk: usize,
     pub scored: usize,
     pub mean_kld: f32,
+}
+
+/// Streaming progress for a [`DaemonRequest::Load`] op, emitted by the daemon on
+/// the framed stdout channel as the loader walks phases (weights, then any
+/// post-weight setup). `current == total` (> 0) means that phase's units are all
+/// done. The frontend surfaces this to the chat UI's load bar; unlike scraping
+/// human stderr, this channel is structured and UTF-8-safe.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct LoadProgressEvent {
+    pub current: u32,
+    pub total: u32,
+    /// Coarse phase label (e.g. `"weights"`). Free-form; the UI treats an
+    /// unknown phase as generic progress.
+    pub phase: String,
 }
 
 /// Begin a steering CAPTURE session: the in-forward `maybe_steer_block` hook
@@ -241,6 +256,92 @@ pub struct LoraListResponse {
     pub adapters: Vec<LoraAdapterInfo>,
 }
 
+/// Compute PFlash prefill labels over `corpus` against the resident qwen3.5
+/// model, writing a JSONL score file plus an `.embed.bin` sidecar to `output`.
+/// Runtime preconditions (resident qwen3.5 family, corpus length) are checked
+/// by the daemon, not the wire schema.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PflashLabelsRequest {
+    pub corpus: String,
+    pub output: String,
+    #[serde(default = "default_pflash_seq")]
+    pub seq: usize,
+    #[serde(default = "default_pflash_block")]
+    pub block: usize,
+    #[serde(default = "default_pflash_n_chunks")]
+    pub n_chunks: usize,
+}
+
+fn default_pflash_seq() -> usize {
+    512
+}
+fn default_pflash_block() -> usize {
+    64
+}
+fn default_pflash_n_chunks() -> usize {
+    40
+}
+
+/// Micro-benchmark a single prefill of `tokens` tokens (pp == 1) against the
+/// resident model. Requires a loaded model with `tokens + 32 <= physical_cap`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct BenchPrefillRequest {
+    #[serde(default = "default_bench_tokens")]
+    pub tokens: usize,
+}
+
+fn default_bench_tokens() -> usize {
+    128
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BenchPrefillResponse {
+    pub tokens: usize,
+    pub ms: f64,
+    pub tok_s: f64,
+}
+
+/// Non-autoregressive **embedding** request. Runs one (bidirectional for encoders,
+/// causal for decoder-pooling models) prefill over each text and returns the pooled,
+/// L2-normalized hidden vector — no token sampling. `dims`, when set, truncates the
+/// output to a Matryoshka prefix (embeddinggemma supports 128/256/512/768).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmbedRequest {
+    pub texts: Vec<String>,
+    #[serde(default)]
+    pub input_type: EmbeddingInputType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dims: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_key_id: Option<String>,
+}
+
+/// Non-autoregressive **rerank** request. Scores each `document` against `query`.
+/// For a yes/no-logit reranker (e.g. Qwen3-Reranker) the score is the softmax
+/// probability of the "yes" token at the final position; for an embedding model it
+/// falls back to cosine similarity of the pooled vectors.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RerankRequest {
+    pub query: String,
+    pub documents: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_key_id: Option<String>,
+}
+
+/// One embedding vector plus its position in the request batch.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmbeddingVector {
+    pub index: usize,
+    pub embedding: Vec<f32>,
+}
+
+/// One rerank result: the document's original index and its relevance score.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RerankResult {
+    pub index: usize,
+    pub relevance_score: f32,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
@@ -251,6 +352,8 @@ pub enum DaemonRequest {
     Inventory,
     ModelRegistry,
     Generate(GenerateTextRequest),
+    Embed(EmbedRequest),
+    Rerank(RerankRequest),
     Abort(RequestControl),
     ForceAnswer(RequestControl),
     Collect(CollectRequest),
@@ -268,6 +371,41 @@ pub enum DaemonRequest {
     CettLoadColnorms(CettLoadColnormsRequest),
     CettCapture(CettCaptureRequest),
     HneuronIntervene(HneuronInterveneRequest),
+
+    // Extended control-plane ops driven by internal callers (scheduler, eval,
+    // benches) rather than the `DaemonEngine` adapter. They live in the same
+    // enum so daemon dispatch is one exhaustive match — a new op cannot be
+    // added without the daemon handling it. The batch/prefill/state ops carry
+    // cross-field validation (exactly-one-of, id dedup, multi-key identity
+    // fallback, hex/format checks) that serde cannot express, so those variants
+    // are routing-only markers: the daemon re-runs the authoritative
+    // `validate_*` / `parse_*` parser on the raw message. Ops with a plain
+    // field schema carry a typed payload.
+    GenerateBatchPrefill,
+    PrefixHashPreflight,
+    GenerateBatchDecodeStep,
+    ReleaseSessions,
+    ReserveSessionState,
+    DescribeState,
+    /// Wire tag `release_state` or `release_session_state_reservation`; the two
+    /// share a handler and differ only in the response tag, which the daemon
+    /// selects from the raw `type` string.
+    #[serde(alias = "release_session_state_reservation")]
+    ReleaseState,
+    /// Wire tag `worker_status` or `list_workers` (identical handler).
+    #[serde(alias = "list_workers")]
+    WorkerStatus,
+    ResourceStatus,
+    UnloadWorker,
+    PflashLabels(PflashLabelsRequest),
+    TrainDrafter,
+    /// Wire tag `train_lora`. Raw-JSON op (the daemon re-parses the message);
+    /// mirrors `TrainDrafter`. Terminal event is the shared `train_done`
+    /// ([`DaemonResponse::TrainDone`]).
+    TrainLora,
+    Diag,
+    BenchPrefill(BenchPrefillRequest),
+    Profile,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,13 +419,24 @@ pub enum DaemonResponse {
     ModelRegistry {
         registry: LlmModelRegistry,
     },
+    LoadProgress(LoadProgressEvent),
     Token(TokenEvent),
     ToolCalls(ToolCallsEvent),
+    /// Result of an [`DaemonRequest::Embed`] — one vector per input text, in order.
+    Embeddings {
+        embeddings: Vec<EmbeddingVector>,
+    },
+    /// Result of a [`DaemonRequest::Rerank`] — one score per document, in input order
+    /// (the server sorts for the response).
+    RerankScores {
+        results: Vec<RerankResult>,
+    },
     Done(DoneEvent),
     Error(ErrorEvent),
     Collected(CollectResponse),
     KldChunk(KldChunkEvent),
     KldEvaled(KldEvalResponse),
+    PrefillResult(BenchPrefillResponse),
     SteerCaptured(SteerMeansResponse),
     SteerOk,
     LoraListed(LoraListResponse),
@@ -301,9 +450,62 @@ pub enum DaemonResponse {
         #[serde(default)]
         count: usize,
     },
+    WorkerStatus(serde_json::Value),
+    ResourceStatus(serde_json::Value),
+    UnloadWorkerDone(serde_json::Value),
+    GenerateBatchPrefillReady {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    GenerateBatchPrefillUnsupported {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    GenerateBatchPrefillSessionDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    GenerateBatchPrefillDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    GenerateBatchDecodeStepSessionDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    GenerateBatchDecodeStepDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    ReserveSessionStateDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    ReserveSessionStateRejected {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    ReleaseSessionsDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
     HneuronOk {
         n_intervened: usize,
         gain: f32,
+    },
+    /// Terminal event of a [`DaemonRequest::TrainDrafter`] run. Progress
+    /// (`train_start`/`train_progress`) falls through to `Unknown`; this
+    /// carries the final report (best_eval, checkpoint, ...).
+    TrainDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
+    /// Non-terminal progress event of a micro-step-preemptible `train_lora` run
+    /// (`done: false`). The runner resumes the resident session via `run_id` and
+    /// re-enqueues; the terminal event stays `train_done`.
+    TrainProgress {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
     },
     #[serde(other)]
     Unknown,
@@ -337,8 +539,11 @@ mod tests {
             ]),
             sampling: GenerationSamplingPolicy {
                 temperature: 0.7,
+                temperature_is_default: false,
                 max_tokens: 32,
                 top_p: None,
+                top_p_is_default: false,
+                top_k: None,
                 repeat_penalty: None,
             },
             worker_key_id: Some("worker-a".to_string()),
@@ -595,6 +800,169 @@ mod tests {
     }
 
     #[test]
+    fn extended_ops_route_by_tag() {
+        // Every extended tag must land on its own variant so daemon dispatch is
+        // exhaustive. Marker variants ignore payload fields (the daemon re-runs
+        // the authoritative parser); typed variants deserialize their fields.
+        let cases: &[(serde_json::Value, fn(&DaemonRequest) -> bool)] = &[
+            (
+                json!({"type": "generate_batch_prefill", "batch_id": "b1",
+                       "sessions": [{"id": "s1", "prompt": "hi",
+                                     "state_handle": {"state_kinds": ["attention_kv"],
+                                                      "logical_position": 0}}],
+                       "worker_key_id": "w"}),
+                |r| matches!(r, DaemonRequest::GenerateBatchPrefill),
+            ),
+            (
+                json!({"type": "prefix_hash_preflight", "session": {}}),
+                |r| matches!(r, DaemonRequest::PrefixHashPreflight),
+            ),
+            (
+                json!({"type": "generate_batch_decode_step", "batch_id": "b1", "sessions": []}),
+                |r| matches!(r, DaemonRequest::GenerateBatchDecodeStep),
+            ),
+            (
+                json!({"type": "release_sessions", "sessions": ["s1"]}),
+                |r| matches!(r, DaemonRequest::ReleaseSessions),
+            ),
+            (
+                json!({"type": "reserve_session_state", "physical_cap": 2048}),
+                |r| matches!(r, DaemonRequest::ReserveSessionState),
+            ),
+            (
+                json!({"type": "describe_state", "runtime_state_handle": "h"}),
+                |r| matches!(r, DaemonRequest::DescribeState),
+            ),
+            (json!({"type": "unload_worker", "worker_id": "w"}), |r| {
+                matches!(r, DaemonRequest::UnloadWorker)
+            }),
+            (json!({"type": "resource_status"}), |r| {
+                matches!(r, DaemonRequest::ResourceStatus)
+            }),
+            (json!({"type": "train_drafter", "output": "d.hfq"}), |r| {
+                matches!(r, DaemonRequest::TrainDrafter)
+            }),
+            (json!({"type": "train_lora", "output": "a.hfq"}), |r| {
+                matches!(r, DaemonRequest::TrainLora)
+            }),
+            (json!({"type": "diag"}), |r| {
+                matches!(r, DaemonRequest::Diag)
+            }),
+            (json!({"type": "profile"}), |r| {
+                matches!(r, DaemonRequest::Profile)
+            }),
+        ];
+        for (value, check) in cases {
+            let req: DaemonRequest = serde_json::from_value(value.clone())
+                .unwrap_or_else(|e| panic!("deserialize {value} failed: {e}"));
+            assert!(check(&req), "unexpected variant for {value}");
+        }
+    }
+
+    #[test]
+    fn batch_and_session_events_remain_typed() {
+        let cases: &[(serde_json::Value, fn(&DaemonResponse) -> bool)] = &[
+            (
+                json!({"type": "generate_batch_prefill_ready", "id": "p", "supported": true}),
+                |response| matches!(response, DaemonResponse::GenerateBatchPrefillReady { .. }),
+            ),
+            (
+                json!({"type": "generate_batch_prefill_session_done", "id": "p", "session_id": "s"}),
+                |response| {
+                    matches!(
+                        response,
+                        DaemonResponse::GenerateBatchPrefillSessionDone { .. }
+                    )
+                },
+            ),
+            (
+                json!({"type": "generate_batch_prefill_done", "id": "p", "sessions": 1}),
+                |response| matches!(response, DaemonResponse::GenerateBatchPrefillDone { .. }),
+            ),
+            (
+                json!({"type": "generate_batch_decode_step_session_done", "id": "d", "session_id": "s"}),
+                |response| {
+                    matches!(
+                        response,
+                        DaemonResponse::GenerateBatchDecodeStepSessionDone { .. }
+                    )
+                },
+            ),
+            (
+                json!({"type": "generate_batch_decode_step_done", "id": "d", "sessions": 1}),
+                |response| matches!(response, DaemonResponse::GenerateBatchDecodeStepDone { .. }),
+            ),
+            (
+                json!({"type": "reserve_session_state_done", "id": "r", "session_id": "s"}),
+                |response| matches!(response, DaemonResponse::ReserveSessionStateDone { .. }),
+            ),
+            (
+                json!({"type": "release_sessions_done", "id": "x", "released": 1}),
+                |response| matches!(response, DaemonResponse::ReleaseSessionsDone { .. }),
+            ),
+            (
+                json!({"type": "train_progress", "run_id": "r", "step": 25, "done": false}),
+                |response| matches!(response, DaemonResponse::TrainProgress { .. }),
+            ),
+        ];
+        for (value, matches) in cases {
+            let response: DaemonResponse = serde_json::from_value(value.clone()).unwrap();
+            assert!(matches(&response), "wrong response variant for {value}");
+        }
+    }
+
+    #[test]
+    fn extended_op_tag_aliases_route_to_one_variant() {
+        for tag in ["worker_status", "list_workers"] {
+            let req: DaemonRequest = serde_json::from_value(json!({"type": tag})).unwrap();
+            assert!(matches!(req, DaemonRequest::WorkerStatus), "tag {tag}");
+        }
+        for tag in ["release_state", "release_session_state_reservation"] {
+            let req: DaemonRequest =
+                serde_json::from_value(json!({"type": tag, "id": "x"})).unwrap();
+            assert!(matches!(req, DaemonRequest::ReleaseState), "tag {tag}");
+        }
+    }
+
+    #[test]
+    fn pflash_labels_request_applies_field_defaults() {
+        let DaemonRequest::PflashLabels(req) = serde_json::from_value(json!({
+            "type": "pflash_labels", "corpus": "c.txt", "output": "o.bin"
+        }))
+        .unwrap() else {
+            panic!("expected pflash_labels");
+        };
+        assert_eq!(req.corpus, "c.txt");
+        assert_eq!(req.output, "o.bin");
+        assert_eq!((req.seq, req.block, req.n_chunks), (512, 64, 40));
+
+        let DaemonRequest::PflashLabels(req) = serde_json::from_value(json!({
+            "type": "pflash_labels", "corpus": "c", "output": "o",
+            "seq": 256, "block": 32, "n_chunks": 8
+        }))
+        .unwrap() else {
+            panic!("expected pflash_labels");
+        };
+        assert_eq!((req.seq, req.block, req.n_chunks), (256, 32, 8));
+    }
+
+    #[test]
+    fn bench_prefill_request_defaults_tokens() {
+        let DaemonRequest::BenchPrefill(req) =
+            serde_json::from_value(json!({"type": "bench_prefill"})).unwrap()
+        else {
+            panic!("expected bench_prefill");
+        };
+        assert_eq!(req.tokens, 128);
+        let DaemonRequest::BenchPrefill(req) =
+            serde_json::from_value(json!({"type": "bench_prefill", "tokens": 64})).unwrap()
+        else {
+            panic!("expected bench_prefill");
+        };
+        assert_eq!(req.tokens, 64);
+    }
+
+    #[test]
     fn tool_calls_response_deserializes_daemon_shape() {
         let response: DaemonResponse = serde_json::from_value(json!({
             "type": "tool_calls",
@@ -609,5 +977,27 @@ mod tests {
         assert_eq!(tool_calls.id, "req-1");
         assert_eq!(tool_calls.calls[0].name, "lookup");
         assert_eq!(tool_calls.calls[0].arguments, json!({"q": "hipfire"}));
+    }
+
+    #[test]
+    fn embed_input_type_defaults_to_document_and_rejects_unknown_roles() {
+        let request: EmbedRequest = serde_json::from_value(serde_json::json!({
+            "texts": ["hello"]
+        }))
+        .unwrap();
+        assert_eq!(request.input_type, EmbeddingInputType::Document);
+
+        let query: EmbedRequest = serde_json::from_value(serde_json::json!({
+            "texts": ["hello"],
+            "input_type": "query"
+        }))
+        .unwrap();
+        assert_eq!(query.input_type, EmbeddingInputType::Query);
+
+        assert!(serde_json::from_value::<EmbedRequest>(serde_json::json!({
+            "texts": ["hello"],
+            "input_type": "passage"
+        }))
+        .is_err());
     }
 }

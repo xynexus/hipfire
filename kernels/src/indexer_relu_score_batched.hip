@@ -37,7 +37,6 @@ void indexer_relu_score_batched_f32(
     const int b = blockIdx.y;
     if (n >= N_max || b >= batch_size) return;
     const int tid = threadIdx.x;
-    if (tid >= H) return;
 
     // Per-batch causal cutoff: cache slots ≥ n_per_batch[b] are commits
     // made by LATER batch positions within this chunk and must not be
@@ -48,13 +47,15 @@ void indexer_relu_score_batched_f32(
         return;
     }
 
-    const float* qh = q + ((size_t)b * H + tid) * D;
-    const float* kt = k_cache + (size_t)n * D;
     float dot = 0.0f;
-    for (int d = 0; d < D; ++d) {
-        dot += qh[d] * kt[d];
+    if (tid < H) {
+        const float* qh = q + ((size_t)b * H + tid) * D;
+        const float* kt = k_cache + (size_t)n * D;
+        for (int d = 0; d < D; ++d) {
+            dot += qh[d] * kt[d];
+        }
     }
-    float v = (dot > 0.0f ? dot : 0.0f) * weights[(size_t)b * H + tid];
+    float v = (tid < H) ? (dot > 0.0f ? dot : 0.0f) * weights[(size_t)b * H + tid] : 0.0f;
 
     __shared__ float reduce[MAX_HEADS];
     reduce[tid] = v;

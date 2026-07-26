@@ -4,6 +4,7 @@
 
 //! Shared model artifact identity helpers and model-source contracts.
 
+pub mod embedding;
 /// Generated model-support tables (`ARCH_ROWS`/`QUANT_TABLE`/`GATE_TABLE`).
 /// Source of truth: `docs/model-support.toml`; regenerate with
 /// `cargo run -p hipfire-cli -- gen-model-support`.
@@ -44,6 +45,18 @@ pub struct TensorInfo {
     pub data_offset: usize,
     /// Byte size of the tensor data.
     pub data_size: usize,
+}
+
+/// Physical byte range backing a tensor in a [`ModelSource`].
+///
+/// Offline streaming tools use this to plan shard ownership without reading
+/// tensor payloads. `data_offset` remains source-relative metadata; this type
+/// makes the backing file explicit for multi-shard sources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TensorStorageLocation {
+    pub path: PathBuf,
+    pub byte_offset: u64,
+    pub byte_len: u64,
 }
 
 /// Quantization config parsed from HFQ metadata or HF config.json.
@@ -150,10 +163,11 @@ pub fn has_worker_or_model_identity(msg: &Value) -> bool {
 // Re-exported here so existing `hipfire_model::ARCH_ID_*` callers are unchanged.
 // See `docs/architecture-ids.md` for the id table and where the constants live.
 pub use hipfire_arch_api::{
-    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL,
+    ARCH_ID_COHERE2_MOE, ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA,
+    ARCH_ID_FLUX2, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL, ARCH_ID_GEMMA4, ARCH_ID_KREA2,
     ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
     ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE,
-    ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
+    ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_QWEN_IMAGE, ARCH_ID_ZAYA,
 };
 
 /// Runtime model arch IDs that must appear in `docs/model-support.toml`.
@@ -172,6 +186,20 @@ pub const KNOWN_RUNTIME_ARCH_IDS: &[(u32, &str)] = &[
     (ARCH_ID_NEMOTRON_H, "nemotron_h"),
     (ARCH_ID_MAMBA2, "mamba2"),
     (ARCH_ID_ZAYA, "zaya"),
+    (ARCH_ID_EMBEDDINGGEMMA, "embeddinggemma"),
+    (ARCH_ID_GEMMA4, "gemma4"),
+    (ARCH_ID_COHERE2_MOE, "cohere2-moe"),
+];
+
+/// Diffusion (image/video denoiser) arch IDs that must appear in the separate
+/// `[[diffusion]]` matrix of `docs/model-support.toml`. Kept distinct from
+/// [`KNOWN_RUNTIME_ARCH_IDS`] because diffusion families are graded on a
+/// different capability spine (text-encoder / denoise / sampler / VAE / t2i)
+/// than autoregressive language models — see `gen-model-support`.
+pub const KNOWN_DIFFUSION_ARCH_IDS: &[(u32, &str)] = &[
+    (ARCH_ID_KREA2, "krea2"),
+    (ARCH_ID_QWEN_IMAGE, "qwen-image"),
+    (ARCH_ID_FLUX2, "flux2"),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,6 +218,9 @@ pub enum ModelArchFamily {
     NemotronH,
     Mamba2,
     Zaya,
+    EmbeddingGemma,
+    Gemma4,
+    Cohere2Moe,
     Unknown,
 }
 
@@ -209,6 +240,9 @@ pub fn model_arch_family(arch_id: u32) -> ModelArchFamily {
         ARCH_ID_NEMOTRON_H => ModelArchFamily::NemotronH,
         ARCH_ID_MAMBA2 => ModelArchFamily::Mamba2,
         ARCH_ID_ZAYA => ModelArchFamily::Zaya,
+        ARCH_ID_EMBEDDINGGEMMA => ModelArchFamily::EmbeddingGemma,
+        ARCH_ID_GEMMA4 => ModelArchFamily::Gemma4,
+        ARCH_ID_COHERE2_MOE => ModelArchFamily::Cohere2Moe,
         _ => ModelArchFamily::Unknown,
     }
 }
@@ -426,6 +460,27 @@ pub trait ModelSource {
     /// Look up a tensor by name. Returns metadata + byte slice.
     fn tensor_data(&self, name: &str) -> Option<(&TensorInfo, &[u8])>;
 
+    /// Advise the source that a tensor payload is no longer needed by the
+    /// current streaming consumer. File-backed implementations should release
+    /// page-cache residency without invalidating the mapped address range.
+    /// The default is a no-op for resident/in-memory sources.
+    fn release_tensor_pages(&self, _name: &str) {}
+
+    /// Advise that a byte range within a tensor payload is no longer needed by
+    /// the current streaming consumer. File-backed sources may discard each
+    /// completed synchronous upload chunk instead of retaining the whole
+    /// multi-gigabyte tensor until the final copy returns. `byte_offset` is
+    /// relative to the tensor payload. The default is a no-op; callers still
+    /// invoke [`ModelSource::release_tensor_pages`] when the view is dropped.
+    fn release_tensor_range_pages(
+        &self,
+        _name: &str,
+        _byte_offset: usize,
+        _byte_len: usize,
+    ) -> bool {
+        false
+    }
+
     /// Look up tensor metadata without data (for pre-screening).
     fn tensor_info(&self, name: &str) -> Option<&TensorInfo>;
 
@@ -434,6 +489,18 @@ pub trait ModelSource {
 
     /// Path to the model directory or file (for weight pager, logging).
     fn path(&self) -> &Path;
+
+    /// Physical byte range for a tensor, when the source can expose one.
+    /// Single-file sources get a useful default; multi-shard sources must
+    /// override this method with the actual shard path.
+    fn tensor_storage(&self, name: &str) -> Option<TensorStorageLocation> {
+        let info = self.tensor_info(name)?;
+        Some(TensorStorageLocation {
+            path: self.path().to_path_buf(),
+            byte_offset: info.data_offset as u64,
+            byte_len: info.data_size as u64,
+        })
+    }
 
     /// Path to tokenizer.json (if available in the model directory).
     /// HFQ embeds the tokenizer in metadata; safetensors models ship it
@@ -705,6 +772,54 @@ pub fn arch_features(arch_id: u32) -> ArchFeatures {
     }
 }
 
+/// Per-diffusion-family capability summary, keyed by HFQ diffusion arch_id.
+/// Diffusion denoisers are graded on the image-generation pipeline spine rather
+/// than the autoregressive `ArchFeatures` spine. Mirrors the `[[diffusion]]`
+/// table in `docs/model-support.toml` (kept in sync by `hipfire
+/// gen-model-support`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DiffusionFeatures {
+    pub label: &'static str,
+    /// Stable denoiser family tag, e.g. `"flux2-mmdit"` (matches `Diffusion::denoiser_family`).
+    pub family: &'static str,
+    /// Offline HFQ import + quant precision policy (the `Ingest` capability).
+    pub ingest: FeatureSupport,
+    /// Prompt conditioning / text-encoder pass.
+    pub text_enc: FeatureSupport,
+    /// MMDiT / UNet denoiser forward pass on GPU.
+    pub denoise: FeatureSupport,
+    /// Scheduler / sampling-loop (denoise step schedule).
+    pub sampler: FeatureSupport,
+    /// VAE decode (latent → RGB).
+    pub vae: FeatureSupport,
+    /// End-to-end text-to-image serving.
+    pub t2i: FeatureSupport,
+    /// Diffusion weight-quant menu, e.g. "q4f16g64+f16" / "f16".
+    pub quant: &'static str,
+}
+
+/// Look up the capability summary for a diffusion HFQ arch_id. Backed by the
+/// generated `DIFFUSION_ROWS` table (source of truth: `docs/model-support.toml`,
+/// kept in sync by `hipfire gen-model-support` + the no-gpu-ci `--check` gate).
+pub fn diffusion_features(arch_id: u32) -> DiffusionFeatures {
+    for row in model_support_generated::DIFFUSION_ROWS {
+        if row.ids.contains(&arch_id) {
+            return row.features;
+        }
+    }
+    DiffusionFeatures {
+        label: "unknown",
+        family: "?",
+        ingest: FeatureSupport::Unknown,
+        text_enc: FeatureSupport::Unknown,
+        denoise: FeatureSupport::Unknown,
+        sampler: FeatureSupport::Unknown,
+        vae: FeatureSupport::Unknown,
+        t2i: FeatureSupport::Unknown,
+        quant: "?",
+    }
+}
+
 /// On-disk companion artifacts bundled with or sitting beside a model.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sidecars {
@@ -787,9 +902,11 @@ pub fn detect_sidecars(path: &Path) -> Sidecars {
 
     // Chat template lives in tokenizer_config.chat_template (HF convention);
     // some artifacts stash it top-level. Present + non-empty in either place.
-    let template = read_hfq_metadata(path)
+    let metadata = read_hfq_metadata(path)
         .ok()
-        .and_then(|m| serde_json::from_str::<Value>(&m.metadata_json).ok())
+        .and_then(|m| serde_json::from_str::<Value>(&m.metadata_json).ok());
+    let template = metadata
+        .as_ref()
         .map(|v| {
             let nonempty = |t: Option<&Value>| {
                 t.and_then(|x| x.as_str())
@@ -803,14 +920,104 @@ pub fn detect_sidecars(path: &Path) -> Sidecars {
                 )
         })
         .unwrap_or(false);
+    let has_embedded = |role: &str| {
+        metadata
+            .as_ref()
+            .and_then(|value| value.get("hipfire_compose"))
+            .and_then(|manifest| manifest.get("components"))
+            .and_then(Value::as_array)
+            .is_some_and(|components| {
+                components
+                    .iter()
+                    .any(|component| component.get("tag").and_then(Value::as_str) == Some(role))
+            })
+    };
 
     Sidecars {
         template,
         mtp: sib("mtp") || has_bundled("mtp"),
-        dflash: sib("dflash") || has_bundled("dflash"),
-        triattn: sib("triattn"),
-        hessian: sib("calib"),
+        dflash: sib("dflash") || has_bundled("dflash") || has_embedded("dflash"),
+        triattn: sib("triattn") || has_embedded("triattn"),
+        hessian: sib("calib") || matching_origin_calib_sidecar_exists(path),
     }
+}
+
+fn matching_origin_calib_sidecar_exists(model_path: &Path) -> bool {
+    let model_hashes = origin_weight_hashes(model_path);
+    if model_hashes.is_empty() {
+        return false;
+    }
+    let Some(dir) = model_path.parent() else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        if path == model_path || !path.is_file() {
+            return false;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        if !name.to_ascii_lowercase().ends_with(".calib.hfq") {
+            return false;
+        }
+        let calib_hashes = origin_weight_hashes(&path);
+        calib_hashes.iter().any(|h| model_hashes.contains(h))
+    })
+}
+
+fn origin_weight_hashes(path: &Path) -> std::collections::HashSet<String> {
+    let Some(meta) = read_hfq_metadata(path)
+        .ok()
+        .and_then(|m| serde_json::from_str::<Value>(&m.metadata_json).ok())
+    else {
+        return std::collections::HashSet::new();
+    };
+    let mut hashes = std::collections::HashSet::new();
+    collect_origin_weight_hashes(&meta, "", &mut hashes);
+    hashes
+}
+
+fn collect_origin_weight_hashes(
+    value: &Value,
+    key_path: &str,
+    hashes: &mut std::collections::HashSet<String>,
+) {
+    match value {
+        Value::Object(obj) => {
+            for (key, child) in obj {
+                let next = if key_path.is_empty() {
+                    key.to_ascii_lowercase()
+                } else {
+                    format!("{key_path}.{}", key.to_ascii_lowercase())
+                };
+                collect_origin_weight_hashes(child, &next, hashes);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_origin_weight_hashes(child, key_path, hashes);
+            }
+        }
+        Value::String(s) if key_path_names_origin_weights_hash(key_path) => {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                hashes.insert(trimmed.to_ascii_lowercase());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn key_path_names_origin_weights_hash(key_path: &str) -> bool {
+    let names_origin =
+        key_path.contains("source") || key_path.contains("origin") || key_path.contains("original");
+    let names_weights = key_path.contains("model") || key_path.contains("weight");
+    let names_hash = key_path.contains("sha256") || key_path.contains("hash");
+    names_origin && names_weights && names_hash
 }
 
 /// Full GPU-free description of a local model: identity, quant, arch capability,
@@ -1009,6 +1216,7 @@ pub fn read_hfq_metadata(path: &Path) -> Result<HfqMetadata, String> {
     if &header[0..4] != b"HFQM" {
         return Err("not an HFQ container".to_string());
     }
+    let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
     let arch_id = u32::from_le_bytes(header[8..12].try_into().unwrap());
     let metadata_offset = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
     let data_offset = u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize;
@@ -1025,12 +1233,46 @@ pub fn read_hfq_metadata(path: &Path) -> Result<HfqMetadata, String> {
         .map_err(|e| format!("read HFQ metadata span: {e}"))?;
     let json_end = find_json_object_end(&span)
         .ok_or_else(|| "HFQ metadata JSON object was not terminated".to_string())?;
-    let metadata_json = String::from_utf8(span[..json_end].to_vec())
+    let mut metadata_json = String::from_utf8(span[..json_end].to_vec())
         .map_err(|e| format!("HFQ metadata is not UTF-8: {e}"))?;
+    if version >= 2 {
+        metadata_json = merge_hfq_tail_metadata(&mut f, metadata_json)?;
+    }
     Ok(HfqMetadata {
         arch_id,
         metadata_json,
     })
+}
+
+fn merge_hfq_tail_metadata(f: &mut File, front_json: String) -> Result<String, String> {
+    let mut front: Value = serde_json::from_str(&front_json)
+        .map_err(|e| format!("HFQ v2 front metadata is not valid JSON: {e}"))?;
+    let Some(tail_meta) = front.get("tail_metadata").cloned() else {
+        return Ok(front_json);
+    };
+    let offset = tail_meta
+        .get("offset")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "HFQ v2 tail offset missing".to_string())?;
+    let size = tail_meta
+        .get("size")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "HFQ v2 tail size missing".to_string())? as usize;
+    f.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("seek HFQ v2 tail metadata: {e}"))?;
+    let mut bytes = vec![0u8; size];
+    f.read_exact(&mut bytes)
+        .map_err(|e| format!("read HFQ v2 tail metadata: {e}"))?;
+    let tail: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("HFQ v2 tail metadata is not valid JSON: {e}"))?;
+    if let Some(full) = tail.get("metadata").and_then(Value::as_object) {
+        if let Some(front_map) = front.as_object_mut() {
+            for (k, v) in full {
+                front_map.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+    serde_json::to_string(&front).map_err(|e| format!("serialize merged HFQ metadata: {e}"))
 }
 
 fn read_hfq_inventory(path: &Path) -> Result<(HfqMetadata, Vec<HfqIndexTensor>), String> {
@@ -1041,6 +1283,7 @@ fn read_hfq_inventory(path: &Path) -> Result<(HfqMetadata, Vec<HfqIndexTensor>),
     if &header[0..4] != b"HFQM" {
         return Err("not an HFQ container".to_string());
     }
+    let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
     let arch_id = u32::from_le_bytes(header[8..12].try_into().unwrap());
     let n_tensors = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
     let metadata_offset = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
@@ -1058,8 +1301,11 @@ fn read_hfq_inventory(path: &Path) -> Result<(HfqMetadata, Vec<HfqIndexTensor>),
         .map_err(|e| format!("read HFQ metadata span: {e}"))?;
     let json_end = find_json_object_end(&span)
         .ok_or_else(|| "HFQ metadata JSON object was not terminated".to_string())?;
-    let metadata_json = String::from_utf8(span[..json_end].to_vec())
+    let mut metadata_json = String::from_utf8(span[..json_end].to_vec())
         .map_err(|e| format!("HFQ metadata is not UTF-8: {e}"))?;
+    if version >= 2 {
+        metadata_json = merge_hfq_tail_metadata(&mut f, metadata_json)?;
+    }
 
     if n_tensors == 0 && json_end == span.len() {
         return Ok((
@@ -1100,7 +1346,8 @@ fn read_hfq_inventory(path: &Path) -> Result<(HfqMetadata, Vec<HfqIndexTensor>),
         pos += 1;
         let n_dims = span[pos] as usize;
         pos += 1;
-        if pos + n_dims * 4 + 12 > span.len() {
+        let per_entry_tail = if version >= 2 { 20 } else { 12 };
+        if pos + n_dims * 4 + per_entry_tail > span.len() {
             return Err("HFQ index truncated at shape/data size".to_string());
         }
         let mut shape = Vec::with_capacity(n_dims);
@@ -1110,6 +1357,9 @@ fn read_hfq_inventory(path: &Path) -> Result<(HfqMetadata, Vec<HfqIndexTensor>),
         }
         pos += 4; // group_size
         pos += 8; // data_size
+        if version >= 2 {
+            pos += 8; // offset_div32
+        }
         tensors.push(HfqIndexTensor {
             name,
             quant_type,
@@ -1174,6 +1424,98 @@ pub fn find_model_in(arg: &str, models_dir: &Path, aliases_path: Option<&Path>) 
     candidates.into_iter().next()
 }
 
+/// True if a model identifier is safe to resolve *within* a fixed set of
+/// roots — i.e. it cannot escape a root via an absolute path or a `..`
+/// component. Bare names (`qwen3.5`), `name.hfq`, and `subdir/name` are fine;
+/// `/etc/passwd`, `../secret`, and `a/../../secret` are rejected.
+fn model_identifier_is_confined(arg: &str) -> bool {
+    use std::path::Component;
+    let path = Path::new(arg);
+    if path.is_absolute() {
+        return false;
+    }
+    !path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
+
+/// True once `candidate` exists and canonicalizes to a path inside `root`.
+/// Canonicalizing both defeats symlinks that would otherwise escape the root.
+fn path_confined_to_root(candidate: &Path, root: &Path) -> bool {
+    match (candidate.canonicalize(), root.canonicalize()) {
+        (Ok(candidate), Ok(root)) => candidate.starts_with(&root),
+        _ => false,
+    }
+}
+
+/// Resolve a model identifier to a file path, restricted to a fixed set of
+/// read-only `roots`.
+///
+/// Unlike [`find_model_in`], this NEVER honors an arbitrary absolute path or a
+/// `..`-escaping identifier, and every returned path is canonicalized and
+/// confirmed to live inside one of `roots`. It is the resolver for **untrusted
+/// (network) callers**, which must only reach models under the configured local
+/// model root and any admin-configured extra root — not arbitrary filesystem
+/// locations.
+/// Local CLI/eval callers keep using [`find_model_in`], where naming an
+/// explicit `./path` or absolute path is expected UX.
+///
+/// `aliases_path`, when given, is the admin-authored `models.json`; an alias is
+/// only honored when its target also resolves inside one of `roots`, so an
+/// alias cannot become a second escape vector.
+pub fn find_model_in_roots(
+    arg: &str,
+    roots: &[PathBuf],
+    aliases_path: Option<&Path>,
+) -> Option<PathBuf> {
+    if !model_identifier_is_confined(arg) {
+        return None;
+    }
+    let query = ModelLookupQuery::parse(arg);
+    for root in roots {
+        let mut candidates = vec![root.join(arg), root.join(format!("{arg}.hfq"))];
+        if query.normalized != arg.to_ascii_lowercase() {
+            candidates.push(root.join(&query.normalized));
+            candidates.push(root.join(format!("{}.hfq", query.normalized)));
+        }
+        for candidate in candidates {
+            if candidate.exists() && path_confined_to_root(&candidate, root) {
+                return Some(candidate);
+            }
+        }
+        let mut scanned = scan_models_dir(root, &query);
+        scanned.sort_by_key(|path| model_candidate_rank(path, &query));
+        if let Some(path) = scanned
+            .into_iter()
+            .find(|path| path_confined_to_root(path, root))
+        {
+            return Some(path);
+        }
+    }
+
+    // Admin-authored aliases: honor only when the target stays inside a root.
+    if let Some(aliases_path) = aliases_path {
+        if let Ok(contents) = std::fs::read_to_string(aliases_path) {
+            if let Ok(map) = serde_json::from_str::<serde_json::Value>(&contents) {
+                if let Some(target) = map.get(arg).and_then(|value| value.as_str()) {
+                    let target = PathBuf::from(target);
+                    if target.exists()
+                        && roots
+                            .iter()
+                            .any(|root| path_confined_to_root(&target, root))
+                    {
+                        return Some(target);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// List all non-sidecar `.hfq` files directly under a models directory.
 pub fn list_local_models_in(models_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(models_dir) else {
@@ -1188,7 +1530,17 @@ pub fn list_local_models_in(models_dir: &Path) -> Vec<PathBuf> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_lowercase();
-            n.ends_with(".hfq") && !is_role_sidecar_name(&n)
+            if !n.ends_with(".hfq") || is_role_sidecar_name(&n) {
+                return false;
+            }
+            // Canonical quantized role sidecars such as
+            // `<identity>.dflash.oq4+.hfq` cannot be distinguished from a
+            // feature-bearing primary by filename alone. Their dedicated HFQ
+            // arch ids are authoritative; composed primaries retain the base
+            // arch id and therefore remain listable.
+            !read_hfq_inventory(p)
+                .ok()
+                .is_some_and(|(metadata, _)| matches!(metadata.arch_id, 20..=22))
         })
         .collect();
     out.sort();
@@ -1519,8 +1871,10 @@ fn metadata_artifact_arch(metadata: &Value) -> Option<String> {
 
 pub fn build_local_llm_registry() -> LlmModelRegistry {
     let hipfire = hipfire_config::hipfire_dir();
+    let loaded = hipfire_config::load_config_bundle();
+    let models_dir = hipfire_config::configured_models_dir(&loaded.config);
     build_llm_registry_in(
-        &hipfire_config::models_dir(),
+        &models_dir,
         &hipfire.join("triattn"),
         &hipfire.join("drafts"),
         &hipfire.join("templates"),
@@ -1666,7 +2020,7 @@ fn is_triattn_file_name(file: &str) -> bool {
 
 fn is_draft_file_name(file: &str) -> bool {
     let file = file.to_ascii_lowercase();
-    file.ends_with(".dflash.hfq")
+    file.ends_with(".hfq") && file.split('.').any(|group| group == "dflash")
 }
 
 fn is_chat_template_file_name(file: &str) -> bool {
@@ -1675,19 +2029,39 @@ fn is_chat_template_file_name(file: &str) -> bool {
 }
 
 fn triattn_matches_model(sidecar_file: &str, model_file: &str) -> bool {
-    Path::new(model_file)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .map(|stem| sidecar_file == format!("{stem}.triattn.hfq"))
-        .unwrap_or(false)
+    model_sidecar_identity(model_file)
+        .is_some_and(|identity| sidecar_file == format!("{identity}.triattn.hfq"))
 }
 
 fn draft_matches_model(draft_file: &str, model_file: &str) -> bool {
-    Path::new(model_file)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .map(|stem| draft_file == format!("{stem}.dflash.hfq"))
-        .unwrap_or(false)
+    dflash_draft_candidates(model_file)
+        .iter()
+        .any(|candidate| candidate == draft_file)
+}
+
+fn model_sidecar_identity(model_file: &str) -> Option<String> {
+    let stem = model_file.strip_suffix(".hfq")?;
+    // New convention: `--` separates the model name from the machine section.
+    if let Some((identity, _machine)) = stem.split_once("--") {
+        return (!identity.is_empty()).then(|| identity.to_string());
+    }
+    // Legacy dotted form: the name ends where the quant group begins.
+    let groups = stem.split('.').collect::<Vec<_>>();
+    let quant_start = find_canonical_quant_group(&groups)
+        .map(|(start, _)| start)
+        .unwrap_or(groups.len());
+    let identity = groups[..quant_start]
+        .iter()
+        .filter(|group| {
+            !matches!(
+                group.to_ascii_lowercase().as_str(),
+                "mtp" | "vl" | "dflash" | "triattn" | "jinja" | "hessian" | "npu"
+            )
+        })
+        .copied()
+        .collect::<Vec<_>>()
+        .join(".");
+    (!identity.is_empty()).then_some(identity)
 }
 
 fn template_matches_model(template_file: &str, model_file: &str) -> bool {
@@ -1704,6 +2078,14 @@ pub fn parse_canonical_model_artifact_name(name: &str) -> Option<ModelArtifactNa
         .or_else(|| name.strip_suffix(".hfq.tmp"))?;
     if id.contains(':') || is_role_sidecar_name(name) {
         return None;
+    }
+
+    // New convention: `--` separates the human-readable model name from the
+    // machine-readable dotted section (features, quant, arch). Model names use
+    // only single hyphens, so `--` is an unambiguous boundary. Old artifacts
+    // have no `--` and fall through to the all-dotted heuristic below.
+    if let Some((identity, machine)) = id.split_once("--") {
+        return parse_from_machine_section(id, identity, machine);
     }
 
     let mut groups = id.split('.').collect::<Vec<_>>();
@@ -1736,6 +2118,53 @@ pub fn parse_canonical_model_artifact_name(name: &str) -> Option<ModelArtifactNa
         return None;
     }
     let (model, size, tags) = parse_model_identity(&identity)?;
+    Some(ModelArtifactName {
+        id: id.to_string(),
+        model,
+        size,
+        tags,
+        features,
+        quant,
+        arch,
+    })
+}
+
+/// Parse the new `--`-delimited form: `identity` is the human-readable model
+/// name; `machine` is the dotted `[feature...].<quant>[.arch]` section.
+fn parse_from_machine_section(
+    id: &str,
+    identity: &str,
+    machine: &str,
+) -> Option<ModelArtifactName> {
+    let mut groups = machine
+        .split('.')
+        .filter(|g| !g.is_empty())
+        .collect::<Vec<_>>();
+    if groups.is_empty() {
+        return None;
+    }
+
+    let arch = groups
+        .last()
+        .copied()
+        .filter(|group| is_arch_group(group))
+        .map(str::to_string);
+    if arch.is_some() {
+        groups.pop();
+    }
+
+    let (quant_start, quant) = find_canonical_quant_group(&groups)?;
+    let features = groups[..quant_start]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    // Everything left of the quant in the machine section must be a known
+    // feature group; anything else means this is not a canonical name.
+    if !features.iter().all(|f| is_feature_group(f)) {
+        return None;
+    }
+
+    let (model, size, tags) = parse_model_identity(identity)?;
     Some(ModelArtifactName {
         id: id.to_string(),
         model,
@@ -1803,7 +2232,7 @@ fn is_arch_group(group: &str) -> bool {
 fn is_feature_group(group: &str) -> bool {
     matches!(
         group,
-        "mtp" | "vl" | "dflash" | "triattn" | "jinja" | "hessian"
+        "mtp" | "vl" | "dflash" | "triattn" | "jinja" | "hessian" | "npu"
     )
 }
 
@@ -1861,11 +2290,33 @@ pub fn discover_dflash_draft_for_model(model: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Discover the canonical loose TriAttention/CASK sidecar for a model. The
+/// model identity excludes role and quant dot-groups, so a bundled name and an
+/// unbundled base resolve the same `<identity>.triattn.hfq` sibling.
+pub fn discover_triattn_for_model(model: &Path) -> Option<PathBuf> {
+    if !model.is_file() {
+        return None;
+    }
+    let model_dir = model.parent().unwrap_or_else(|| Path::new("."));
+    let filename = model.file_name().and_then(|name| name.to_str())?;
+    let identity = model_sidecar_identity(filename)?;
+    let candidate = format!("{identity}.triattn.hfq");
+    let mut dirs = vec![
+        model_dir.to_path_buf(),
+        hipfire_config::hipfire_dir().join("triattn"),
+    ];
+    dirs.dedup();
+    dirs.into_iter()
+        .map(|dir| dir.join(&candidate))
+        .find(|path| path.is_file())
+}
+
 fn dflash_draft_search_dirs(model_dir: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![model_dir.to_path_buf()];
     let hipfire = hipfire_config::hipfire_dir();
+    let loaded = hipfire_config::load_config_bundle();
     dirs.push(hipfire.join("drafts"));
-    dirs.push(hipfire.join("models"));
+    dirs.push(hipfire_config::configured_models_dir(&loaded.config));
     if let Ok(cwd) = std::env::current_dir() {
         dirs.push(cwd.join("models"));
         dirs.push(cwd.join("../../models"));
@@ -1875,27 +2326,24 @@ fn dflash_draft_search_dirs(model_dir: &Path) -> Vec<PathBuf> {
 
 /// Return candidate DFlash draft sidecar filenames for a target model filename.
 pub fn dflash_draft_candidates(filename: &str) -> Vec<String> {
-    let Some(target) = parse_dflash_target(filename) else {
+    let Some(identity) = model_sidecar_identity(filename) else {
         return Vec::new();
     };
-
-    let mut quants = vec![target.quant.clone()];
-    if target.family == "qwen3" && target.quant == "mq3" {
-        quants.push("mq4".to_string());
-    } else if target.family == "qwen3" && target.quant == "mq4" {
-        quants.push("mq3".to_string());
-    } else if target.family == "lfm2" {
-        match target.quant.as_str() {
-            "oq4" | "oq4+" => quants.push("mq4".to_string()),
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    for q in quants {
-        out.push(target.format_candidate(&q, "dflash"));
-        out.push(target.format_candidate(&q, "draft"));
-    }
-    out
+    // Two sidecar naming generations are accepted, and both resolve so no
+    // on-disk artifact silently stops being discovered:
+    //   * dotted quant group after the role (`Model.dflash.oq4+.hfq`) — the form
+    //     the DFlash tooling in this stack emits, and the only one that can name
+    //     a *quantized* drafter;
+    //   * quant as a dash tag before the role (`Model-BF16.dflash.hfq`) — the
+    //     form `scripts/induct_model.py` and docs/MODEL-INDUCTION.md emit.
+    // Dotted forms are probed first; within each, precision descends.
+    let dotted = ["oq4+", "oq8+", "bf16", "f16"]
+        .into_iter()
+        .map(|quant| format!("{identity}.dflash.{quant}.hfq"));
+    let tagged = ["BF16", "F16", "MQ6", "MQ4", "MQ3"]
+        .into_iter()
+        .map(|quant| format!("{identity}-{quant}.dflash.hfq"));
+    dotted.chain(tagged).collect()
 }
 
 /// Discover a DSpark drafter sidecar next to a target model artifact.
@@ -2204,6 +2652,8 @@ pub struct ModelLoadRequest {
     pub model: String,
     pub params: ModelLoadParams,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 }
 
@@ -2271,6 +2721,10 @@ pub struct ModelLoadParams {
     pub mtp_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtp_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residency_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module_vram_budget_bytes: Option<u64>,
 }
 
 impl ModelLoadParams {
@@ -2311,6 +2765,9 @@ impl ModelLoadParams {
         }
         params.mtp_mode = non_empty_value(&config.mtp_mode);
         params.mtp_k = Some(config.mtp_k);
+        params.residency_mode = non_empty_value(&config.model_residency_mode);
+        params.module_vram_budget_bytes =
+            (config.scheduler_vram_budget_bytes > 0).then_some(config.scheduler_vram_budget_bytes);
         params
     }
 
@@ -2378,6 +2835,34 @@ mod tests {
     fn normalizes_tag_stems_for_fuzzy_lookup() {
         assert_eq!(normalize_tag_stem("qwen3.6:35b-a3b"), "qwen3.6-35b-a3b");
         assert_eq!(normalize_tag_stem("QWEN3.5:9B"), "qwen3.5-9b");
+    }
+
+    #[test]
+    fn diffusion_features_cover_every_known_diffusion_id() {
+        // Every diffusion arch id that the coverage gate enforces must resolve to
+        // a concrete `[[diffusion]]` row (never the Unknown fallback), and its
+        // ingest axis is `full` — the offline `Ingest` policy is the one
+        // capability all three families already ship.
+        for &(arch_id, label) in KNOWN_DIFFUSION_ARCH_IDS {
+            let f = diffusion_features(arch_id);
+            assert_ne!(
+                f.ingest,
+                FeatureSupport::Unknown,
+                "{label}({arch_id}) should resolve to a concrete DiffusionFeatures row"
+            );
+            assert_eq!(
+                f.ingest,
+                FeatureSupport::Full,
+                "{label}({arch_id}) declares the Ingest capability, so ingest is full"
+            );
+            assert!(
+                f.family.ends_with("-mmdit"),
+                "{label}({arch_id}) family tag {:?} should match denoiser_family()",
+                f.family
+            );
+        }
+        // An unknown id falls back to Unknown, mirroring `arch_features`.
+        assert_eq!(diffusion_features(999).ingest, FeatureSupport::Unknown);
     }
 
     #[test]
@@ -2473,6 +2958,11 @@ mod tests {
             ModelArchFamily::NemotronH
         );
         assert_eq!(model_arch_family(ARCH_ID_MAMBA2), ModelArchFamily::Mamba2);
+        assert_eq!(model_arch_family(ARCH_ID_GEMMA4), ModelArchFamily::Gemma4);
+        assert_eq!(
+            model_arch_family(ARCH_ID_COHERE2_MOE),
+            ModelArchFamily::Cohere2Moe
+        );
         for &(arch_id, label) in KNOWN_RUNTIME_ARCH_IDS {
             assert_ne!(
                 model_arch_family(arch_id),
@@ -2518,7 +3008,20 @@ mod tests {
     fn role_sidecars_are_not_primary_models() {
         assert!(is_role_sidecar_name("qwen3.5-9b-mq4.mtp.hfq"));
         assert!(is_role_sidecar_name("qwen3.5-9b-mq4.triattn.hfq"));
+        assert!(is_role_sidecar_name("Qwen3.5-397B-A17B.dflash.hfq"));
         assert!(!is_role_sidecar_name("qwen3.5-9b-mq4.hfq"));
+        assert!(!draft_matches_model(
+            "Qwen3.5-397B-A17B.dflash.hfq",
+            "Qwen3.5-397B-A17B.oq4++.hfq"
+        ));
+        assert!(draft_matches_model(
+            "Qwen3.5-397B-A17B.dflash.oq4+.hfq",
+            "Qwen3.5-397B-A17B.oq4++.hfq"
+        ));
+        assert!(triattn_matches_model(
+            "Qwen3.5-397B-A17B.triattn.hfq",
+            "Qwen3.5-397B-A17B.oq4++.hfq"
+        ));
     }
 
     #[test]
@@ -2555,6 +3058,56 @@ mod tests {
         assert_eq!(qwen.model, "Qwen3.5");
         assert_eq!(qwen.size.as_deref(), Some("9B"));
         assert_eq!(qwen.quant, "mq4");
+
+        let qwen_embedding =
+            parse_canonical_model_artifact_name("Qwen3-Embedding-0.6B.npu.oq8+.gfx1151.hfq")
+                .unwrap();
+        assert_eq!(qwen_embedding.model, "Qwen3-Embedding");
+        assert_eq!(qwen_embedding.size.as_deref(), Some("0.6B"));
+        assert_eq!(qwen_embedding.features, vec!["npu"]);
+        assert_eq!(qwen_embedding.quant, "oq8+");
+        assert_eq!(qwen_embedding.arch.as_deref(), Some("gfx1151"));
+    }
+
+    #[test]
+    fn canonical_model_artifact_name_parses_double_hyphen_boundary() {
+        // New `--` convention parses to the same fields as the legacy dotted form.
+        let parsed =
+            parse_canonical_model_artifact_name("Qwen3.5-122B-A10B-it--mtp.vl.mq2l.gfx1201.hfq")
+                .unwrap();
+        assert_eq!(parsed.model, "Qwen3.5");
+        assert_eq!(parsed.size.as_deref(), Some("122B-A10B"));
+        assert_eq!(parsed.tags, vec!["it"]);
+        assert_eq!(parsed.features, vec!["mtp", "vl"]);
+        assert_eq!(parsed.quant, "mq2l");
+        assert_eq!(parsed.arch.as_deref(), Some("gfx1201"));
+
+        let gemma = parse_canonical_model_artifact_name(
+            "Gemma-4-8B-E4B-it-heretic-QAT--dflash.triattn.oq4++.gfx1151.hfq",
+        )
+        .unwrap();
+        assert_eq!(gemma.features, vec!["dflash", "triattn"]);
+        assert_eq!(gemma.quant, "oq4++");
+        assert_eq!(gemma.arch.as_deref(), Some("gfx1151"));
+
+        let mixed = parse_canonical_model_artifact_name("Gemma-4-8B--oq4.25++.hfq").unwrap();
+        assert_eq!(mixed.quant, "oq4.25++");
+        assert!(mixed.features.is_empty());
+
+        let mini = parse_canonical_model_artifact_name("MiniCPM5-1B--mq4.hfq").unwrap();
+        assert_eq!(mini.model, "MiniCPM5");
+        assert_eq!(mini.size.as_deref(), Some("1B"));
+        assert_eq!(mini.quant, "mq4");
+        assert!(mini.features.is_empty());
+        assert!(mini.arch.is_none());
+
+        // Sidecar identity strips the machine section at the `--` boundary.
+        assert_eq!(
+            model_sidecar_identity("MiniCPM5-1B--mq4.hfq").as_deref(),
+            Some("MiniCPM5-1B")
+        );
+        // A `--` with no valid quant is not a canonical model artifact.
+        assert!(parse_canonical_model_artifact_name("MiniCPM5-1B--nonsense.hfq").is_none());
     }
 
     #[test]
@@ -2593,6 +3146,60 @@ mod tests {
             model_display_name(Path::new("qwen3.5-9b-mq4.hfq.tmp")),
             "qwen3.5-9b-mq4.hfq"
         );
+    }
+
+    #[test]
+    fn detect_sidecars_finds_calib_by_origin_weight_hash() {
+        let root = temp_dir("hipfire-model-calib-origin-hash");
+        fs::create_dir_all(&root).unwrap();
+        let model = root.join("Qwen3.5-9B.mq4.hfq");
+        let calib = root.join("Qwen3.5-9B.bf16.calib.hfq");
+        write_minimal_hfq(
+            &model,
+            &json!({
+                "origin": {
+                    "weights": {
+                        "sha256": "AbC123"
+                    }
+                }
+            }),
+        );
+        write_minimal_hfq(
+            &calib,
+            &json!({
+                "artifact_kind": "calibration",
+                "source_model_sha256": "abc123"
+            }),
+        );
+
+        assert!(detect_sidecars(&model).hessian);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn detect_sidecars_ignores_mismatched_calib_origin_hash() {
+        let root = temp_dir("hipfire-model-calib-origin-hash-mismatch");
+        fs::create_dir_all(&root).unwrap();
+        let model = root.join("Qwen3.5-9B.mq4.hfq");
+        let calib = root.join("Qwen3.5-9B.bf16.calib.hfq");
+        write_minimal_hfq(
+            &model,
+            &json!({
+                "origin_weights_sha256": "abc123"
+            }),
+        );
+        write_minimal_hfq(
+            &calib,
+            &json!({
+                "artifact_kind": "calibration",
+                "source_model_sha256": "def456"
+            }),
+        );
+
+        assert!(!detect_sidecars(&model).hessian);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2647,7 +3254,7 @@ mod tests {
         fs::write(models.join("Deepseek-v4-Flash.mtp.hfq"), "mtp").unwrap();
         fs::write(models.join("Deepseek-v4-Flash.hfq.triattn.hfq"), "old tri").unwrap();
         fs::write(triattn.join("Deepseek-v4-Flash.triattn.hfq"), "tri").unwrap();
-        fs::write(drafts.join("Deepseek-v4-Flash.dflash.hfq"), "draft").unwrap();
+        fs::write(drafts.join("Deepseek-v4-Flash.dflash.oq4+.hfq"), "draft").unwrap();
         fs::write(drafts.join("Deepseek-v4-Flash.draft.hfq"), "old draft").unwrap();
         fs::write(templates.join("Deepseek-v4-Flash.jinja"), "template").unwrap();
         fs::write(templates.join("Deepseek-v4-Flash.hfq.j2"), "old template").unwrap();
@@ -2672,7 +3279,7 @@ mod tests {
         assert_eq!(model.quant, "mq4");
         assert_eq!(model.hfq_arch_id, Some(1));
         assert_eq!(model.triattn[0].file, "Deepseek-v4-Flash.triattn.hfq");
-        assert_eq!(model.drafts[0].file, "Deepseek-v4-Flash.dflash.hfq");
+        assert_eq!(model.drafts[0].file, "Deepseek-v4-Flash.dflash.oq4+.hfq");
         assert_eq!(model.chat_templates[0].file, "Deepseek-v4-Flash.jinja");
 
         let _ = fs::remove_dir_all(root);
@@ -2737,8 +3344,9 @@ mod tests {
                 "num_experts_per_tok": 1,
             },
         });
+        let model_path = models.join("DeepSeek-V4-671M-E71M.mq4.hfq");
         write_index_hfq(
-            &models.join("Deepseek-v4-Flash.hfq"),
+            &model_path,
             &metadata,
             &[
                 (
@@ -2753,13 +3361,14 @@ mod tests {
                 ),
             ],
         );
+        read_hfq_inventory(&model_path).expect("fixture inventory must be readable");
 
         let registry = build_llm_registry_in(&models, &triattn, &drafts, &templates);
 
         assert_eq!(registry.model_count(), 1);
         let model = &registry.models[0];
-        assert_eq!(model.id, "Deepseek-v4-Flash");
-        assert_eq!(model.model, "Deepseek-v4-Flash");
+        assert_eq!(model.id, "DeepSeek-V4-671M-E71M.mq4");
+        assert_eq!(model.model, "DeepSeek-V4-671M-E71M.mq4");
         assert_eq!(model.size.as_deref(), Some("671M-E71M"));
         assert_eq!(model.quant, "unknown");
         assert_eq!(
@@ -3060,6 +3669,7 @@ mod tests {
                 mtp_k: Some(3),
                 ..Default::default()
             },
+            worker_key_id: Some("worker-a".to_string()),
             request_id: Some("load-1".to_string()),
         };
 
@@ -3074,6 +3684,7 @@ mod tests {
         assert_eq!(value["params"]["mtp_mode"], "auto");
         assert_eq!(value["params"]["mtp_k"], 3);
         assert!(value["params"].get("flash_mode").is_none());
+        assert_eq!(value["worker_key_id"], "worker-a");
         assert_eq!(value["request_id"], "load-1");
     }
 
@@ -3233,24 +3844,94 @@ mod tests {
     }
 
     #[test]
-    fn dflash_draft_discovery_uses_adjacent_qwen_sidecar_names() {
+    fn network_model_resolution_is_confined_to_roots() {
+        let root = temp_dir("hipfire-model-roots");
+        let models = root.join("models");
+        let network = root.join("srv-hipfire");
+        fs::create_dir_all(&models).unwrap();
+        fs::create_dir_all(&network).unwrap();
+        // A secret the network caller must never reach.
+        let secret = root.join("secret.hfq");
+        fs::write(&secret, "").unwrap();
+        let local = models.join("qwen3.5-9b-mq4.hfq");
+        let remote = network.join("gemma-4-8b.oq4.hfq");
+        fs::write(&local, "").unwrap();
+        fs::write(&remote, "").unwrap();
+
+        let roots = vec![models.clone(), network.clone()];
+
+        // Bare names resolve within each allowed root.
         assert_eq!(
-            dflash_draft_candidates("qwen3.5-27b-mq4.hfq"),
+            find_model_in_roots("qwen3.5-9b-mq4.hfq", &roots, None),
+            Some(local.clone())
+        );
+        assert_eq!(
+            find_model_in_roots("gemma-4-8b.oq4.hfq", &roots, None),
+            Some(remote)
+        );
+
+        // Absolute paths are refused even though the file exists.
+        assert_eq!(
+            find_model_in_roots(secret.to_str().unwrap(), &roots, None),
+            None
+        );
+        // `..` traversal out of a root is refused.
+        assert_eq!(find_model_in_roots("../secret.hfq", &roots, None), None);
+        assert_eq!(
+            find_model_in_roots("nested/../../secret.hfq", &roots, None),
+            None
+        );
+
+        // An alias whose target escapes every root is refused; one that stays
+        // inside a root is honored.
+        let aliases = root.join("models.json");
+        fs::write(
+            &aliases,
+            serde_json::to_string(&json!({
+                "escape": secret.display().to_string(),
+                "ok": local.display().to_string(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(find_model_in_roots("escape", &roots, Some(&aliases)), None);
+        assert_eq!(
+            find_model_in_roots("ok", &roots, Some(&aliases)),
+            Some(local)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dflash_draft_discovery_uses_canonical_independent_sidecar_names() {
+        // Canonical `--` target: dotted-quant sidecars first (the only form that
+        // can name a quantized drafter), then the dash-tag form the induction
+        // scripts emit. Both generations must resolve.
+        assert_eq!(
+            dflash_draft_candidates("Qwen3.5-27B--mq4.hfq"),
             vec![
-                "qwen3.5-27b-mq4.dflash.hfq".to_string(),
-                "qwen3.5-27b-mq4.draft.hfq".to_string(),
-                "qwen3.5-27b-mq3.dflash.hfq".to_string(),
-                "qwen3.5-27b-mq3.draft.hfq".to_string(),
+                "Qwen3.5-27B.dflash.oq4+.hfq".to_string(),
+                "Qwen3.5-27B.dflash.oq8+.hfq".to_string(),
+                "Qwen3.5-27B.dflash.bf16.hfq".to_string(),
+                "Qwen3.5-27B.dflash.f16.hfq".to_string(),
+                "Qwen3.5-27B-BF16.dflash.hfq".to_string(),
+                "Qwen3.5-27B-F16.dflash.hfq".to_string(),
+                "Qwen3.5-27B-MQ6.dflash.hfq".to_string(),
+                "Qwen3.5-27B-MQ4.dflash.hfq".to_string(),
+                "Qwen3.5-27B-MQ3.dflash.hfq".to_string(),
             ]
         );
-        assert!(dflash_draft_candidates("qwen3.5-35b-a3b-mq4.hfq")
-            .contains(&"qwen3.5-35b-a3b-mq4.dflash.hfq".to_string()));
-        assert!(dflash_draft_candidates("llama-8b-mq4.hfq").is_empty());
+        // Legacy all-dotted target names still parse to the same identity.
+        assert!(dflash_draft_candidates("Qwen3.5-27B.mq4.hfq")
+            .contains(&"Qwen3.5-27B.dflash.oq4+.hfq".to_string()));
+        assert!(dflash_draft_candidates("Qwen3.5-35B-A3B.mq4.hfq")
+            .contains(&"Qwen3.5-35B-A3B.dflash.oq4+.hfq".to_string()));
 
         let root = temp_dir("hipfire-dflash-draft-discovery");
         fs::create_dir_all(&root).unwrap();
-        let target = root.join("qwen3.5-27b-mq4.hfq");
-        let draft = root.join("qwen3.5-27b-mq4.dflash.hfq");
+        let target = root.join("Qwen3.5-27B.mq4.hfq");
+        let draft = root.join("Qwen3.5-27B.dflash.oq4+.hfq");
         fs::write(&target, "target").unwrap();
         fs::write(&draft, "draft").unwrap();
 
@@ -3264,24 +3945,34 @@ mod tests {
     }
 
     #[test]
-    fn dflash_draft_discovery_uses_lfm2_sidecar_names() {
-        let oq4 = dflash_draft_candidates("LFM2.5-350M-oq4.hfq");
-        assert!(oq4.contains(&"LFM2.5-350M-oq4.dflash.hfq".to_string()));
-        assert!(oq4.contains(&"LFM2.5-350M-mq4.dflash.hfq".to_string()));
+    fn dflash_draft_discovery_is_family_agnostic() {
+        let oq4 = dflash_draft_candidates("LFM2.5-350M.oq4.hfq");
+        assert!(oq4.contains(&"LFM2.5-350M.dflash.oq4+.hfq".to_string()));
 
         let oq4_plus = dflash_draft_candidates("LFM2.5-1.2B-Thinking.oq4+.hfq");
-        assert!(oq4_plus.contains(&"LFM2.5-1.2B-Thinking.oq4+.dflash.hfq".to_string()));
-        assert!(oq4_plus.contains(&"LFM2.5-1.2B-Thinking.mq4.dflash.hfq".to_string()));
+        assert!(oq4_plus.contains(&"LFM2.5-1.2B-Thinking.dflash.f16.hfq".to_string()));
 
         let root = temp_dir("hipfire-lfm2-dflash-draft-discovery");
         fs::create_dir_all(&root).unwrap();
-        let target = root.join("LFM2.5-350M-oq4.hfq");
-        let draft = root.join("LFM2.5-350M-oq4.dflash.hfq");
+        let target = root.join("LFM2.5-350M.oq4.hfq");
+        let draft = root.join("LFM2.5-350M.dflash.oq4+.hfq");
         fs::write(&target, "target").unwrap();
         fs::write(&draft, "draft").unwrap();
 
         assert_eq!(discover_dflash_draft_for_model(&target), Some(draft));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn triattn_discovery_uses_quant_independent_canonical_name() {
+        let root = temp_dir("hipfire-triattn-discovery");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("Qwen3.5-27B.dflash.oq4.25++.hfq");
+        let sidecar = root.join("Qwen3.5-27B.triattn.hfq");
+        fs::write(&target, "target").unwrap();
+        fs::write(&sidecar, "tria").unwrap();
+        assert_eq!(discover_triattn_for_model(&target), Some(sidecar));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3366,6 +4057,7 @@ mod tests {
                 index.extend_from_slice(&dim.to_le_bytes());
             }
             index.extend_from_slice(&0u32.to_le_bytes());
+            index.extend_from_slice(&0u64.to_le_bytes());
             index.extend_from_slice(&0u64.to_le_bytes());
         }
         let metadata_offset = 32u64;

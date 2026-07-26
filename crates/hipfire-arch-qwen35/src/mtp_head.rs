@@ -61,13 +61,13 @@
 
 use crate::qwen35::Qwen35Weights;
 use hip_bridge::{DeviceBuffer, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::{
     self, fused_silu_mul_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for, rotate_x_mq_for,
     weight_gemv, EmbeddingFormat, WeightTensor,
 };
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
 // ─── Config ──────────────────────────────────────────────────────────────
@@ -1692,6 +1692,7 @@ fn mtp_head_block_post_embedding(
         cfg.n_head_kv,
         cfg.head_dim,
         cfg.n_rot,
+        cfg.n_rot,
         cfg.rope_theta,
     )?;
 
@@ -2193,6 +2194,8 @@ fn embed_lookup_into(
             gpu.embedding_lookup_hfq4g128(&weights.token_embd, out, token, dim)
         }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, out, token, dim),
+        EmbeddingFormat::BF16 => gpu.embedding_lookup_bf16(&weights.token_embd, out, token, dim),
+        EmbeddingFormat::F16 => gpu.embedding_lookup_f16(&weights.token_embd, out, token, dim),
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, out, token, dim),
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, out, token, dim),
     }
@@ -2546,6 +2549,7 @@ pub fn mtp_head_forward_block_batched(
         cfg.n_head,
         cfg.n_head_kv,
         cfg.head_dim,
+        cfg.n_rot,
         cfg.n_rot,
         cfg.rope_theta,
         n,

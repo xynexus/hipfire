@@ -33,5 +33,8 @@ specific user-facing path that failed.
   `HIPFIRE_KV_MODE=q8` or `HIPFIRE_ATTN_FLASH=never`, before changing config.
 - If the fix changes code or runtime behavior touching kernels, quant formats,
   dispatch, fusion, rotation, rmsnorm, or spec-decode, run
-  `./scripts/coherence-gate-dflash.sh` before claiming the repair is correct.
+  `./tests/tiny-affected-gate.sh --require-coverage` (the automatic correctness
+  front tier) before claiming the repair is correct;
+  `./tests/coherence-gate-dflash.sh` is an optional manual DFlash/DDTree
+  diagnostic.
 

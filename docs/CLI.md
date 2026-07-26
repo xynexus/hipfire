@@ -5,17 +5,31 @@ This document contains the help content for the `hipfire` command-line program.
 **Command Overview:**
 
 * [`hipfire`↴](#hipfire)
+* [`hipfire tui`↴](#hipfire-tui)
+* [`hipfire start`↴](#hipfire-start)
+* [`hipfire stop`↴](#hipfire-stop)
+* [`hipfire restart`↴](#hipfire-restart)
+* [`hipfire status`↴](#hipfire-status)
 * [`hipfire serve`↴](#hipfire-serve)
 * [`hipfire chat`↴](#hipfire-chat)
 * [`hipfire list`↴](#hipfire-list)
+* [`hipfire inspect`↴](#hipfire-inspect)
 * [`hipfire eval`↴](#hipfire-eval)
+* [`hipfire bench`↴](#hipfire-bench)
+* [`hipfire doctor`↴](#hipfire-doctor)
 * [`hipfire host-profile`↴](#hipfire-host-profile)
 * [`hipfire collect-artifacts`↴](#hipfire-collect-artifacts)
-* [`hipfire repack`↴](#hipfire-repack)
+* [`hipfire optimize`↴](#hipfire-optimize)
+* [`hipfire model`↴](#hipfire-model)
+* [`hipfire model compose`↴](#hipfire-model-compose)
+* [`hipfire model decompose`↴](#hipfire-model-decompose)
+* [`hipfire model induct`↴](#hipfire-model-induct)
 * [`hipfire lock`↴](#hipfire-lock)
 * [`hipfire lock acquire`↴](#hipfire-lock-acquire)
 * [`hipfire lock release`↴](#hipfire-lock-release)
 * [`hipfire lock status`↴](#hipfire-lock-status)
+* [`hipfire lock kill`↴](#hipfire-lock-kill)
+* [`hipfire lock run`↴](#hipfire-lock-run)
 * [`hipfire detect`↴](#hipfire-detect)
 * [`hipfire diffusion`↴](#hipfire-diffusion)
 * [`hipfire diffusion import`↴](#hipfire-diffusion-import)
@@ -26,6 +40,8 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire diffusion smoke`↴](#hipfire-diffusion-smoke)
 * [`hipfire diffusion quantize`↴](#hipfire-diffusion-quantize)
 * [`hipfire diffusion calibrate`↴](#hipfire-diffusion-calibrate)
+* [`hipfire diffusion quant-diff`↴](#hipfire-diffusion-quant-diff)
+* [`hipfire diffusion calib-eval`↴](#hipfire-diffusion-calib-eval)
 * [`hipfire admin`↴](#hipfire-admin)
 * [`hipfire admin status`↴](#hipfire-admin-status)
 * [`hipfire admin chat`↴](#hipfire-admin-chat)
@@ -40,23 +56,126 @@ This document contains the help content for the `hipfire` command-line program.
 
 ## `hipfire`
 
-hipfire LLM inference CLI
+hipfire runs the local operator TUI, OpenAI-compatible HTTP server, model chat, eval, benchmark, diagnostics, and artifact tools.
 
-**Usage:** `hipfire <COMMAND>`
+**Usage:** `hipfire [COMMAND]`
+
+Examples:
+  hipfire                         Open the operator TUI
+  hipfire help                    Show the command summary
+  hipfire start                   Start the background server
+  hipfire status                  Show background server status
+  hipfire chat Qwen3.5-30B-A3B "hello"
+  hipfire bench --model Qwen3.5-30B-A3B
+
+Use `hipfire <command> help` or `hipfire <command> --help` for detailed command help.
 
 ###### **Subcommands:**
 
+* `tui` — Open the local operator TUI
+* `start` — Start the background hipfire server
+* `stop` — Stop the background hipfire server
+* `restart` — Restart the background hipfire server
+* `status` — Show background server status
 * `serve` — Start the hipfire HTTP server (OpenAI-compatible)
 * `chat` — Load a model and generate a response (one-shot)
 * `list` — List locally available models
+* `inspect` — Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
 * `eval` — Run the quant admission/model evaluation harness
+* `bench` — Quick daemon benchmark: load time, TTFT, pp512 prefill t/s, tg128 decode t/s
+* `doctor` — Diagnose the local Hipfire install, runtime, daemon, and monitoring prerequisites
 * `host-profile` — Measure host, GPU-copy, and model storage bandwidth
 * `collect-artifacts` — Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
-* `repack` — Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
+* `optimize` — Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
+* `model` — Compose/decompose .hfq packaging: bundle a base + role/feature sidecars into one container, or split a bundle back into its component files
 * `lock` — GPU resource lock for multi-agent coordination (acquire/release/status)
 * `detect` — Run observational coherence detectors over a captured token stream
 * `diffusion` — Import and inspect diffusion models stored as .hfq artifacts
 * `admin` — Query the running hipfire admin API for scripts and agents
+
+
+
+## `hipfire tui`
+
+Open the local operator TUI
+
+**Usage:** `hipfire tui`
+
+
+
+## `hipfire start`
+
+Start the background hipfire server
+
+**Usage:** `hipfire start [OPTIONS]`
+
+Examples:
+  hipfire start
+  hipfire start --model Qwen3.5-30B-A3B --port 11435
+  hipfire start --host 0.0.0.0
+
+
+###### **Options:**
+
+* `--host <HOST>` — Override bind host for the background server
+* `-p`, `--port <PORT>` — Override bind port for the background server
+* `-m`, `--model <MODEL>` — Pre-load a model on startup by name, shorthand, alias, or path
+* `--debug-chat` — Log full raw chat requests and raw model replies
+* `--wait-secs <WAIT_SECS>` — Seconds to wait for /health before returning. Default 0 returns immediately
+
+  Default value: `0`
+
+
+
+## `hipfire stop`
+
+Stop the background hipfire server
+
+**Usage:** `hipfire stop [OPTIONS]`
+
+Examples:
+  hipfire stop
+  hipfire stop --force
+
+
+###### **Options:**
+
+* `-f`, `--force` — Skip the graceful wait and send SIGKILL immediately
+
+
+
+## `hipfire restart`
+
+Restart the background hipfire server
+
+**Usage:** `hipfire restart [OPTIONS]`
+
+Examples:
+  hipfire restart
+  hipfire restart --model Qwen3.5-30B-A3B
+
+
+###### **Options:**
+
+* `--host <HOST>` — Override bind host for the restarted background server
+* `-p`, `--port <PORT>` — Override bind port for the restarted background server
+* `-m`, `--model <MODEL>` — Pre-load a model on startup by name, shorthand, alias, or path
+* `--debug-chat` — Log full raw chat requests and raw model replies
+* `--wait-secs <WAIT_SECS>` — Seconds to wait for /health before returning. Default 0 returns immediately
+
+  Default value: `0`
+
+
+
+## `hipfire status`
+
+Show background server status
+
+**Usage:** `hipfire status`
+
+Examples:
+  hipfire status
+
 
 
 
@@ -66,11 +185,20 @@ Start the hipfire HTTP server (OpenAI-compatible)
 
 **Usage:** `hipfire serve [OPTIONS]`
 
+Examples:
+  hipfire serve
+  hipfire serve --host 0.0.0.0 --port 11435
+  hipfire serve --model Qwen3.5-30B-A3B
+
+
 ###### **Options:**
 
 * `--host <HOST>` — Override bind host
 * `-p`, `--port <PORT>` — Override bind port
-* `-m`, `--model <MODEL>` — Pre-load a model on startup by name, shorthand, alias, or path
+* `-m`, `--model <MODEL>` — Default model name, shorthand, alias, or path for requests that omit model
+* `--max-seq <MAX_SEQ>` — Override the startup-resolved maximum sequence length
+* `--max-tokens <MAX_TOKENS>` — Override the startup-resolved maximum generated-token budget
+* `--kv-cache <KV_CACHE>` — Override the startup-resolved KV-cache mode
 * `--debug-chat` — Log full raw chat requests and raw model replies
 
 
@@ -80,6 +208,12 @@ Start the hipfire HTTP server (OpenAI-compatible)
 Load a model and generate a response (one-shot)
 
 **Usage:** `hipfire chat [OPTIONS] <PROMPT>`
+
+Examples:
+  hipfire chat --model Qwen3.5-30B-A3B "Explain ROCm in one paragraph"
+  hipfire chat "hello" --max-tokens 64
+  hipfire chat --attach image.png "describe this image"
+
 
 ###### **Arguments:**
 
@@ -102,6 +236,23 @@ List locally available models
 
 
 
+## `hipfire inspect`
+
+Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
+
+**Usage:** `hipfire inspect [OPTIONS] <TARGET>`
+
+###### **Arguments:**
+
+* `<TARGET>` — Container to inspect: a `.hfq` file path or a local model alias
+
+###### **Options:**
+
+* `--tensors` — List every tensor (name, quant type, shape, group size, size)
+* `--json` — Emit a machine-readable JSON object (includes the full tensor array and the raw metadata verbatim); ignores `--tensors`
+
+
+
 ## `hipfire eval`
 
 Run the quant admission/model evaluation harness
@@ -111,6 +262,57 @@ Run the quant admission/model evaluation harness
 ###### **Arguments:**
 
 * `<ARGS>` — Arguments forwarded to hipfire-eval. Use positional <model>; common flags include --compare, --reference, --battery, --suite, --benchmark, --runs, --force, and --regenerate
+
+
+
+## `hipfire bench`
+
+Quick daemon benchmark: load time, TTFT, pp512 prefill t/s, tg128 decode t/s
+
+**Usage:** `hipfire bench [OPTIONS] [MODEL]`
+
+Examples:
+  hipfire bench Qwen3.5-30B-A3B
+  hipfire bench --pp-tokens 512 --tg-tokens 128 --repetitions 5
+  hipfire bench Qwen3.5-30B-A3B --json
+
+
+###### **Arguments:**
+
+* `<MODEL>` — Model name, shorthand, alias, or path. Falls back to default_model
+
+###### **Options:**
+
+* `--pp-tokens <PP_TOKENS>` — Target prompt/prefill token count. The daemon reports the actual count
+
+  Default value: `512`
+* `--tg-tokens <TG_TOKENS>` — Generated token count for the decode-throughput sample
+
+  Default value: `128`
+* `-r`, `--repetitions <REPETITIONS>` — Number of measured repetitions, matching llama-bench's default
+
+  Default value: `5`
+* `--no-warmup` — Skip warmup runs before measuring
+* `--json` — Print JSON instead of a compact text report
+
+
+
+## `hipfire doctor`
+
+Diagnose the local Hipfire install, runtime, daemon, and monitoring prerequisites
+
+**Usage:** `hipfire doctor [OPTIONS]`
+
+Examples:
+  hipfire doctor
+  hipfire doctor --json
+  hipfire doctor --fix
+
+
+###### **Options:**
+
+* `--fix` — Apply safe user-space fixes and invoke hipfire-priv-helper for privileged fixes
+* `--json` — Emit the full report as JSON
 
 
 
@@ -138,15 +340,83 @@ Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one m
 
 
 
-## `hipfire repack`
+## `hipfire optimize`
 
 Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
 
-**Usage:** `hipfire repack [ARGS]...`
+**Usage:** `hipfire optimize [ARGS]...`
 
 ###### **Arguments:**
 
-* `<ARGS>` — Arguments forwarded to the oq4_repack runner
+* `<ARGS>` — Arguments forwarded to the optimize runner
+
+
+
+## `hipfire model`
+
+Compose/decompose .hfq packaging: bundle a base + role/feature sidecars into one container, or split a bundle back into its component files
+
+**Usage:** `hipfire model <COMMAND>`
+
+###### **Subcommands:**
+
+* `compose` — Merge a base `.hfq` and its role/feature sidecars into one bundled container (records a provenance manifest so `decompose` is lossless)
+* `decompose` — Split a bundled `.hfq` back into its base + sidecar files
+* `induct` — Interactive wizard: bring an external model (HuggingFace repo or local safetensors dir) into a named `.hfq` — calibrate, quantize, fold sidecars
+
+
+
+## `hipfire model compose`
+
+Merge a base `.hfq` and its role/feature sidecars into one bundled container (records a provenance manifest so `decompose` is lossless)
+
+**Usage:** `hipfire model compose [OPTIONS] <INPUTS> <INPUTS>...`
+
+###### **Arguments:**
+
+* `<INPUTS>` — Base container first, then one or more sidecars (file paths or model aliases)
+
+###### **Options:**
+
+* `-o`, `--output <OUTPUT>` — Output bundle path. Default: the base name with the sidecar feature dot-groups inserted before the quant token (e.g. `Model--mq4.hfq` + `Model.mtp.hfq` -> `Model--mtp.mq4.hfq`)
+* `--check` — Validate component roles, formats, architectures, geometry, lengths, digests, and reserved namespaces without writing a bundle
+* `--json` — Emit a machine-readable JSON report
+* `--overwrite` — Replace an existing output bundle. Without this flag compose fails closed when the destination exists
+
+
+
+## `hipfire model decompose`
+
+Split a bundled `.hfq` back into its base + sidecar files
+
+**Usage:** `hipfire model decompose [OPTIONS] <BUNDLE> <OUTPUT_DIR>`
+
+###### **Arguments:**
+
+* `<BUNDLE>` — Bundle container to split (file path or model alias)
+* `<OUTPUT_DIR>` — Directory to write the reconstructed component files into
+
+###### **Options:**
+
+* `--infer` — Heuristically split a bundle that has no `hipfire_compose` manifest, using the filename's role dot-groups + tensor-name prefixes. Legacy bundles with a plain filename fall back to inferring roles from tensor names alone. Lossy: output files are not byte-identical to any originals. Bundles that DO carry a manifest still take the exact, lossless path
+* `--json` — Emit a machine-readable JSON report
+* `--overwrite` — Replace existing reconstructed component files. Without this flag decompose fails closed before replacing a destination
+
+
+
+## `hipfire model induct`
+
+Interactive wizard: bring an external model (HuggingFace repo or local safetensors dir) into a named `.hfq` — calibrate, quantize, fold sidecars
+
+**Usage:** `hipfire model induct [OPTIONS] [SOURCE]`
+
+###### **Arguments:**
+
+* `<SOURCE>` — Model source: a HuggingFace repo id (`org/name`) or a local safetensors directory. Omit to be prompted
+
+###### **Options:**
+
+* `--format <FORMAT>` — Quant format token (e.g. `oq4++`, `mq4`, `qtip3`, `bf16`). Omit to be prompted from the known list
 
 
 
@@ -159,8 +429,10 @@ GPU resource lock for multi-agent coordination (acquire/release/status)
 ###### **Subcommands:**
 
 * `acquire` — Acquire the GPU lock (blocks until free). A detached holder keeps it until `release` or the calling shell exits
-* `release` — Release the GPU lock (SIGTERM the holder recorded in the lockfile)
+* `release` — Release the GPU lock (SIGTERM the recorded holder + its `run` process group). With a `label`, only releases a matching holder (a safety guard so `release <name>` never drops another agent's lock); `--all` releases regardless of the recorded label; `--force` escalates to SIGKILL for a wedged holder (and also ignores the label). No-op if the lock is free
 * `status` — Print lock status: "gpu is free" or "gpu BUSY: <holder>"
+* `kill` — Forcibly free the lock by signalling its recorded holder — and, for a `run`-held lock, the whole workload process group. SIGTERM by default; `-f`/`--force` escalates to SIGKILL for a wedged holder. No-op if free or if the recorded holder is already gone
+* `run` — Acquire the lock, run `command` under it, release on exit — the scoped form. The lock lives exactly as long as this process (killing it drops the flock via the kernel); no detached holder or watched pid. Exit code is the command's; 2 on acquire timeout. Usage: `lock run <label> -- cmd…`
 
 
 
@@ -188,9 +460,18 @@ Acquire the GPU lock (blocks until free). A detached holder keeps it until `rele
 
 ## `hipfire lock release`
 
-Release the GPU lock (SIGTERM the holder recorded in the lockfile)
+Release the GPU lock (SIGTERM the recorded holder + its `run` process group). With a `label`, only releases a matching holder (a safety guard so `release <name>` never drops another agent's lock); `--all` releases regardless of the recorded label; `--force` escalates to SIGKILL for a wedged holder (and also ignores the label). No-op if the lock is free
 
-**Usage:** `hipfire lock release`
+**Usage:** `hipfire lock release [OPTIONS] [LABEL]`
+
+###### **Arguments:**
+
+* `<LABEL>` — Only release if the recorded holder label matches (safety guard)
+
+###### **Options:**
+
+* `--all` — Release regardless of which label holds the lock
+* `-f`, `--force` — Escalate to SIGKILL for a wedged holder (also ignores the label)
 
 
 
@@ -199,6 +480,40 @@ Release the GPU lock (SIGTERM the holder recorded in the lockfile)
 Print lock status: "gpu is free" or "gpu BUSY: <holder>"
 
 **Usage:** `hipfire lock status`
+
+
+
+## `hipfire lock kill`
+
+Forcibly free the lock by signalling its recorded holder — and, for a `run`-held lock, the whole workload process group. SIGTERM by default; `-f`/`--force` escalates to SIGKILL for a wedged holder. No-op if free or if the recorded holder is already gone
+
+**Usage:** `hipfire lock kill [OPTIONS]`
+
+###### **Options:**
+
+* `-f`, `--force` — Escalate to SIGKILL instead of SIGTERM
+
+
+
+## `hipfire lock run`
+
+Acquire the lock, run `command` under it, release on exit — the scoped form. The lock lives exactly as long as this process (killing it drops the flock via the kernel); no detached holder or watched pid. Exit code is the command's; 2 on acquire timeout. Usage: `lock run <label> -- cmd…`
+
+**Usage:** `hipfire lock run [OPTIONS] <LABEL> -- <COMMAND>...`
+
+###### **Arguments:**
+
+* `<LABEL>` — Human label recorded in the lockfile (who/what holds it)
+* `<COMMAND>` — The command (and args) to run under the lock — everything after `--`
+
+###### **Options:**
+
+* `--timeout-secs <TIMEOUT_SECS>` — Hard cap in seconds to wait for a busy lock; 0 = wait forever
+
+  Default value: `1800`
+* `--poll-secs <POLL_SECS>` — Cadence of "busy" messages while waiting, in seconds
+
+  Default value: `5`
 
 
 
@@ -268,6 +583,8 @@ The runtime accepts Q4F16_G64, f16, bf16, f32, Q8F16, Q4_K, HFQ4G128, HFQ4G256, 
 * `smoke` — Run an end-to-end diffusion admission smoke and validate output PNGs
 * `quantize` — Re-encode the weight tensors of a source .hfq into a packed quant format
 * `calibrate` — Run an activation-calibration pass and write a .calib.hfq sidecar
+* `quant-diff` — Compare per-tensor weight reconstruction error between two diffusion .hfq artifacts (e.g. a bf16 reference vs its quantized derivative)
+* `calib-eval` — Quantify the activation-aware clip calibration ("+") on the fold format: for each fold-eligible transformer linear, report RTN vs clip weight-space error using a `.calib.hfq` imatrix. Weight-space only (no GPU)
 
 
 
@@ -365,6 +682,7 @@ With `--enable-hr`, the command first generates the requested base batch, decode
 * `-p`, `--prompt <PROMPT>` — Prompt text. Repeat for batched generation, or use --batch-size with one prompt
 * `--negative-prompt <NEGATIVE_PROMPT>` — Negative prompt text. Omit for empty negatives, pass once to reuse, or repeat per prompt
 * `-o`, `--output <OUTPUT>` — Output PNG file for one image, or output directory for batches
+* `--preview-dir <PREVIEW_DIR>` — Directory to write a per-step preview PNG (step_00.png, step_01.png, ...) by decoding the intermediate latent after each denoise pass. Useful for a webui progress strip; adds one VAE decode per step. Single-image runs only
 * `--width <WIDTH>` — Output image width in pixels
 
   Default value: `512`
@@ -402,6 +720,23 @@ With `--enable-hr`, the command first generates the requested base batch, decode
 
   Default value: `0.75`
 * `--rocm-device-id <ROCM_DEVICE_ID>` — Use ROCm for currently GPU-routed generation stages on this device id ROCm device to generate on. Omit to auto-detect (a single GPU is used silently; the first of several with a warning). The CPU reference oracle is opt-in via the HIPFIRE_DIFFUSION_CPU_REFERENCE environment variable
+* `--mrflow <MRFLOW>` — Enable MrFlow staged sampling: a fast low-resolution pass, pixel-space super-resolution, re-encode, and a short direct-sigma refine. --width and --height are the final resolution; the low-res pass runs at those divided by the upscale factor. Flow-match backbones only (FLUX / Qwen-Image / Z-Image / Krea-2). Overrides --enable-hr
+
+  Possible values:
+  - `zit-9plus1`:
+    Z-Image Turbo, 9 low-res + 1 refine, sigma 0.11, no CFG (paper demo)
+  - `krea2-12plus1`:
+    Krea-2 base, 12 low-res + 1 refine, sigma 0.12, cfg 4.0
+  - `krea2-20plus1`:
+    Krea-2 base, 20 low-res + 1 refine, sigma 0.15, cfg 4.0
+  - `krea2-turbo-8plus1`:
+    Krea-2 Turbo, 8 low-res + 1 refine, sigma 0.11, no CFG
+
+* `--mrflow-total-steps <MRFLOW_TOTAL_STEPS>` — Override the total MrFlow denoise budget across the low-resolution and refine passes. The preset's refine count is reserved first; for example, 8 total steps with a 1-step refine runs 7+1
+* `--mrflow-refine-sigma <MRFLOW_REFINE_SIGMA>` — Override the MrFlow refine start sigma (preset default). Larger values (0.16-0.20) can improve text-heavy generations
+* `--mrflow-upscale <MRFLOW_UPSCALE>` — Override the MrFlow pixel-space upscale factor (preset default 2.0)
+* `--mrflow-shifted` — Use the flow-match shifted interior refine schedule (only affects refine passes with more than one step)
+* `--mrflow-sr <MRFLOW_SR>` — RealESRGAN RRDBNet super-resolution .hfq (from `hipfire-coexistence`) for the MrFlow Stage-2 upscale. Without it, Stage 2 falls back to a plain cover-resize (much softer output)
 
 
 
@@ -510,10 +845,12 @@ Reads an existing diffusion .hfq (weights stored as f32/f16/bf16 source), re-enc
 ###### **Options:**
 
 * `-o`, `--output <OUTPUT>` — Output quantized .hfq artifact path
-* `--format <FORMAT>` — Quant format: q8, q4, q4k, q4+ (data-free) or oq4/oq4++/oq8 (Opus, calibrated)
+* `--format <FORMAT>` — Quant format: q8, q4, q4k, q4+, oq4/oq4+/oq4++/oq8 (rotated), oq4p/oq8p (plain), a decimal plain-Opus target such as oq4.25, or oq4-mixed for the legacy data-free heuristic. Plain Opus uses int8 activations
 
   Default value: `q8`
 * `--calib <CALIB>` — Optional .calib.hfq sidecar (from `diffusion calibrate`); enables oq4++ LDLQ
+* `--mix-fraction <MIX_FRACTION>` — For plain-Opus mixed precision: fraction (0.0–1.0) of quantized parameters to place at int8 (highest fan-in first), the rest int4. Overrides the format to mixed; achieved average ≈ 4 + 4·fraction bits. The output name is rewritten to the achieved `oq<avg>` token
+* `--arch-importance` — Rank the int8 promotion by the arch's structural importance prior (embedders/attention/modulation/output over the FFN bulk) instead of the default highest-fan-in heuristic. Same bit budget; different tensor selection. Only affects `--mix-fraction` (plain-Opus mixed)
 
 
 
@@ -521,7 +858,7 @@ Reads an existing diffusion .hfq (weights stored as f32/f16/bf16 source), re-enc
 
 Run an activation-calibration pass and write a .calib.hfq sidecar
 
-Generates a few CPU-reference denoise steps over sample prompts, capturing per-weight activation statistics (imatrix + per-linear Hessian). The resulting .calib.hfq feeds `quantize --format oq4++ --calib`.
+Generates a few instrumented denoise steps over sample prompts, capturing per-weight activation statistics (imatrix + per-linear Hessian). The resulting .calib.hfq feeds `quantize --format oq4++ --calib`.
 
 **Usage:** `hipfire diffusion calibrate [OPTIONS] --output <OUTPUT> <MODEL>`
 
@@ -548,6 +885,52 @@ Generates a few CPU-reference denoise steps over sample prompts, capturing per-w
 * `--hessian-max-k <HESSIAN_MAX_K>` — Max linear input dim K to capture a full [K,K] Hessian for (else imatrix only)
 
   Default value: `2048`
+* `--rocm-device-id <ROCM_DEVICE_ID>` — ROCm device used for instrumented resident calibration
+
+
+
+## `hipfire diffusion quant-diff`
+
+Compare per-tensor weight reconstruction error between two diffusion .hfq artifacts (e.g. a bf16 reference vs its quantized derivative)
+
+Decodes every quantizable `transformer/tensors/*.weight` from both artifacts to f32 and reports per-tensor error, ranked by relative L2. This is the sampler-independent quant-quality check: if the worst tensor is near-lossless, any rendered-image drift is trajectory divergence, not weight corruption. Pairs with `scripts/flux2_trajectory_divergence.py`.
+
+**Usage:** `hipfire diffusion quant-diff [OPTIONS] <REFERENCE> <CANDIDATE>`
+
+###### **Arguments:**
+
+* `<REFERENCE>` — Reference artifact (typically the bf16 / p0 source .hfq)
+* `<CANDIDATE>` — Candidate artifact (typically the quantized .hfq, e.g. --oq8.hfq)
+
+###### **Options:**
+
+* `--top <TOP>` — Print the N worst tensors by relative L2 error
+
+  Default value: `20`
+* `--rel-rms-threshold <REL_RMS_THRESHOLD>` — Relative-L2 threshold above which a tensor is flagged as real corruption
+
+  Default value: `0.05`
+* `--json` — Emit the full per-tensor diff as JSON instead of a table
+
+
+
+## `hipfire diffusion calib-eval`
+
+Quantify the activation-aware clip calibration ("+") on the fold format: for each fold-eligible transformer linear, report RTN vs clip weight-space error using a `.calib.hfq` imatrix. Weight-space only (no GPU)
+
+**Usage:** `hipfire diffusion calib-eval [OPTIONS] <SOURCE> <CALIB>`
+
+###### **Arguments:**
+
+* `<SOURCE>` — Source diffusion .hfq (bf16 weights)
+* `<CALIB>` — Calibration sidecar (.calib.hfq) with per-tensor imatrix
+
+###### **Options:**
+
+* `--bits <BITS>` — Fold bit width to evaluate (1/2/4)
+
+  Default value: `4`
+* `--json` — Emit JSON instead of a table
 
 
 

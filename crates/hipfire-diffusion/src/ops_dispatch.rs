@@ -14,20 +14,19 @@ use crate::gpu_ops::*;
 
 pub(crate) fn scale_model_input_with_runtime_context(
     schedule: &DiffusionSchedule,
-    sample: &CpuTensor,
+    sample: CpuTensor,
     step: usize,
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<(CpuTensor, DiffusionRuntimeKind)> {
     let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return Ok((
-            schedule.scale_model_input(sample, step)?,
-            DiffusionRuntimeKind::CpuSourceReference,
-        ));
+        let sample = match schedule.input_scaling {
+            SchedulerInputScaling::None => sample,
+            SchedulerInputScaling::Sigma => schedule.scale_model_input(&sample, step)?,
+        };
+        return Ok((sample, DiffusionRuntimeKind::CpuSourceReference));
     };
     match schedule.input_scaling {
-        SchedulerInputScaling::None => {
-            Ok((sample.clone(), DiffusionRuntimeKind::CpuSourceReference))
-        }
+        SchedulerInputScaling::None => Ok((sample, DiffusionRuntimeKind::CpuSourceReference)),
         SchedulerInputScaling::Sigma => {
             let sigma = *schedule.sigmas.get(step).ok_or_else(|| {
                 DiffusionError::InvalidRequest(format!("missing sigma for step {step}"))
@@ -37,7 +36,7 @@ pub(crate) fn scale_model_input_with_runtime_context(
                 .with_rocm_gpu(|gpu| scale_model_input_hip_on_gpu(gpu, &sample.data, scale))?;
             Ok((
                 CpuTensor {
-                    shape: sample.shape.clone(),
+                    shape: sample.shape,
                     data,
                 },
                 DiffusionRuntimeKind::RocmHybridReference,
@@ -52,30 +51,67 @@ pub(crate) fn cfg_guidance_with_runtime_context(
     cfg_scale: f32,
     runtime_context: &mut DiffusionGenerationRuntimeContext,
 ) -> DiffusionResult<(CpuTensor, DiffusionRuntimeKind)> {
-    let Some(_device_id) = runtime_context.rocm_device_id() else {
-        return Ok((
-            cfg_guidance(negative_pred, positive_pred, cfg_scale)?,
-            DiffusionRuntimeKind::CpuSourceReference,
-        ));
-    };
     if negative_pred.shape != positive_pred.shape {
         return Err(DiffusionError::InvalidRequest(format!(
             "CFG prediction shape mismatch {:?} vs {:?}",
             negative_pred.shape, positive_pred.shape
         )));
     }
-    {
-        let data = runtime_context.with_rocm_gpu(|gpu| {
-            cfg_guidance_hip_on_gpu(gpu, &negative_pred.data, &positive_pred.data, cfg_scale)
-        })?;
-        Ok((
-            CpuTensor {
-                shape: negative_pred.shape.clone(),
-                data,
-            },
-            DiffusionRuntimeKind::RocmHybridReference,
-        ))
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
+        return Ok((
+            cfg_guidance(negative_pred, positive_pred, cfg_scale)?,
+            DiffusionRuntimeKind::CpuSourceReference,
+        ));
+    };
+    cfg_guidance_slices_with_runtime_context(
+        negative_pred.shape.clone(),
+        &negative_pred.data,
+        &positive_pred.data,
+        cfg_scale,
+        runtime_context,
+    )
+}
+
+pub(crate) fn cfg_guidance_slices_with_runtime_context(
+    shape: Vec<usize>,
+    negative_pred: &[f32],
+    positive_pred: &[f32],
+    cfg_scale: f32,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<(CpuTensor, DiffusionRuntimeKind)> {
+    if negative_pred.len() != positive_pred.len() {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "CFG prediction length mismatch {} vs {}",
+            negative_pred.len(),
+            positive_pred.len()
+        )));
     }
+    let expected = checked_shape_elements("CFG prediction", &shape)?;
+    if negative_pred.len() != expected {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "CFG prediction has {} values but shape {:?} expects {expected}",
+            negative_pred.len(),
+            shape
+        )));
+    }
+    let Some(_device_id) = runtime_context.rocm_device_id() else {
+        let data = negative_pred
+            .iter()
+            .zip(positive_pred)
+            .map(|(negative, positive)| negative + cfg_scale * (positive - negative))
+            .collect();
+        return Ok((
+            CpuTensor { shape, data },
+            DiffusionRuntimeKind::CpuSourceReference,
+        ));
+    };
+    let data = runtime_context.with_rocm_gpu(|gpu| {
+        cfg_guidance_hip_on_gpu(gpu, negative_pred, positive_pred, cfg_scale)
+    })?;
+    Ok((
+        CpuTensor { shape, data },
+        DiffusionRuntimeKind::RocmHybridReference,
+    ))
 }
 
 pub(crate) fn scheduler_step_with_runtime_context(
@@ -188,11 +224,26 @@ pub(crate) fn linear_optional_bias_with_runtime_context(
         calib_observe_linear(weight, input);
         return linear_optional_bias(input, weight, bias).map_err(Into::into);
     };
-    {
-        runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
-            linear_optional_bias_hip_on_gpu(gpu, cache, input, weight, bias)
-        })
+    calib_observe_linear(weight, input);
+    runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
+        linear_optional_bias_hip_on_gpu(gpu, cache, input, weight, bias)
+    })
+}
+
+pub(crate) fn linear_optional_bias_f32_with_runtime_context(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    bias: Option<&CpuTensor>,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    if runtime_context.rocm_device_id().is_none() {
+        calib_observe_linear(weight, input);
+        return linear_optional_bias(input, weight, bias).map_err(Into::into);
     }
+    calib_observe_linear(weight, input);
+    runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
+        linear_optional_bias_f32_hip_on_gpu(gpu, cache, input, weight, bias)
+    })
 }
 
 /// Fold a linear layer's input activations into the calibration accumulators
@@ -467,6 +518,82 @@ pub(crate) fn linear_3d_with_runtime_context(
         data: input.data.clone(),
     };
     let out = linear_optional_bias_with_runtime_context(&flat, weight, bias, runtime_context)?;
+    let [rows, out_features] = shape2(&out)?;
+    if rows != batch * seq {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "linear_3d row count {rows} != batch*seq {}",
+            batch * seq
+        )));
+    }
+    Ok(CpuTensor {
+        shape: vec![batch, seq, out_features],
+        data: out.data,
+    })
+}
+
+pub(crate) fn linear_3d_f32_with_runtime_context(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    bias: Option<&CpuTensor>,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    let [batch, seq, in_features] = shape3(input)?;
+    let flat = CpuTensor {
+        shape: vec![batch * seq, in_features],
+        data: input.data.clone(),
+    };
+    let out = linear_optional_bias_f32_with_runtime_context(&flat, weight, bias, runtime_context)?;
+    let [rows, out_features] = shape2(&out)?;
+    if rows != batch * seq {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "f32 linear_3d row count {rows} != batch*seq {}",
+            batch * seq
+        )));
+    }
+    Ok(CpuTensor {
+        shape: vec![batch, seq, out_features],
+        data: out.data,
+    })
+}
+
+/// Linear over a source-reference [`ResidentWeight`]: on the GPU path the weight
+/// is uploaded once (bf16, keyed by name) and reused across forward steps —
+/// avoiding the per-step decode-to-f32 + re-upload that a decoded `CpuTensor`
+/// weight incurs. Falls back to decoding + the CPU-reference linear when no GPU
+/// is bound.
+pub(crate) fn linear_optional_bias_resident_with_runtime_context(
+    input: &CpuTensor,
+    weight: &ResidentWeight,
+    bias: Option<&CpuTensor>,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    if runtime_context.rocm_device_id().is_none() {
+        let decoded = weight.decode()?;
+        calib_observe_linear(&decoded, input);
+        return linear_optional_bias(input, &decoded, bias).map_err(Into::into);
+    }
+    runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
+        linear_resident_weight_hip_on_gpu(gpu, cache, input, weight, bias)
+    })
+}
+
+/// 3-D (`[batch, seq, in]`) linear over a source-reference [`ResidentWeight`].
+pub(crate) fn linear_3d_resident_with_runtime_context(
+    input: &CpuTensor,
+    weight: &ResidentWeight,
+    bias: Option<&CpuTensor>,
+    runtime_context: &mut DiffusionGenerationRuntimeContext,
+) -> DiffusionResult<CpuTensor> {
+    if runtime_context.rocm_device_id().is_none() {
+        return linear_3d(input, &weight.decode()?, bias);
+    }
+    let [batch, seq, in_features] = shape3(input)?;
+    let flat = CpuTensor {
+        shape: vec![batch * seq, in_features],
+        data: input.data.clone(),
+    };
+    let out =
+        linear_optional_bias_resident_with_runtime_context(&flat, weight, bias, runtime_context)?;
     let [rows, out_features] = shape2(&out)?;
     if rows != batch * seq {
         return Err(DiffusionError::InvalidMetadata(format!(

@@ -65,6 +65,211 @@ impl Ingest for NemotronHSpec {
     }
 }
 
+/// Tiny hybrid Nemotron-H (arch 14) fixture. This is intentionally separate from
+/// the pure Mamba-2 fixture: it includes Mamba, dense MLP, and attention blocks
+/// so OQ rows exercise the hybrid block dispatcher.
+struct NemotronHTiny {
+    hidden: usize,
+    vocab: usize,
+    layers: usize,
+    mamba_heads: usize,
+    mamba_head_dim: usize,
+    d_state: usize,
+    ngroups: usize,
+    conv_kernel: usize,
+    chunk_size: usize,
+    attn_heads: usize,
+    kv_heads: usize,
+    attn_head_dim: usize,
+    mlp_intermediate: usize,
+}
+
+impl NemotronHTiny {
+    fn preset() -> Self {
+        Self {
+            hidden: 256,
+            vocab: 4096,
+            layers: 4,
+            mamba_heads: 8,
+            mamba_head_dim: 64,
+            d_state: 128,
+            ngroups: 1,
+            conv_kernel: 4,
+            chunk_size: 64,
+            attn_heads: 2,
+            kv_heads: 1,
+            attn_head_dim: 128,
+            mlp_intermediate: 512,
+        }
+    }
+
+    fn d_inner(&self) -> usize {
+        self.mamba_heads * self.mamba_head_dim
+    }
+
+    fn conv_dim(&self) -> usize {
+        self.d_inner() + 2 * self.ngroups * self.d_state
+    }
+
+    fn projection_size(&self) -> usize {
+        self.d_inner() + self.conv_dim() + self.mamba_heads
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["NemotronHForCausalLM"],
+            "model_type": "nemotron_h",
+            "hidden_size": self.hidden,
+            "vocab_size": self.vocab,
+            "num_hidden_layers": self.layers,
+            "rms_norm_eps": 1e-5,
+            "tie_word_embeddings": false,
+            "hybrid_override_pattern": "M-*-",
+            "mamba_num_heads": self.mamba_heads,
+            "mamba_head_dim": self.mamba_head_dim,
+            "ssm_state_size": self.d_state,
+            "n_groups": self.ngroups,
+            "conv_kernel": self.conv_kernel,
+            "chunk_size": self.chunk_size,
+            "use_conv_bias": true,
+            "mamba_proj_bias": false,
+            "num_attention_heads": self.attn_heads,
+            "num_key_value_heads": self.kv_heads,
+            "head_dim": self.attn_head_dim,
+            "attention_bias": false,
+            "intermediate_size": self.mlp_intermediate,
+            "mlp_hidden_act": "relu2",
+            "time_step_min": 0.001,
+            "time_step_max": 0.1,
+            "_comment": "hipfire tiny random-init gating fixture — not a real model",
+        })
+    }
+
+    fn manifest(&self) -> Vec<TensorSpec> {
+        let h = self.hidden;
+        let d_inner = self.d_inner();
+        let conv_dim = self.conv_dim();
+        let projection_size = self.projection_size();
+        let q_dim = self.attn_heads * self.attn_head_dim;
+        let kv_dim = self.kv_heads * self.attn_head_dim;
+        let mut t = Vec::new();
+        t.push(TensorSpec::new(
+            "backbone.embeddings.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        t.push(TensorSpec::f16(
+            "backbone.norm_f.weight",
+            vec![h],
+            Init::NormOnes,
+        ));
+        t.push(TensorSpec::new(
+            "lm_head.weight",
+            vec![self.vocab, h],
+            Init::Uniform(0.05),
+        ));
+        for i in 0..self.layers {
+            let p = format!("backbone.layers.{i}");
+            let m = format!("{p}.mixer");
+            t.push(TensorSpec::f16(
+                format!("{p}.norm.weight"),
+                vec![h],
+                Init::NormOnes,
+            ));
+            match i {
+                0 => {
+                    t.push(TensorSpec::new(
+                        format!("{m}.in_proj.weight"),
+                        vec![projection_size, h],
+                        Init::Uniform(0.04),
+                    ));
+                    t.push(TensorSpec::f16(
+                        format!("{m}.conv1d.weight"),
+                        vec![conv_dim, 1, self.conv_kernel],
+                        Init::Uniform(0.03),
+                    ));
+                    t.push(TensorSpec::f16(
+                        format!("{m}.conv1d.bias"),
+                        vec![conv_dim],
+                        Init::Zeros,
+                    ));
+                    t.push(TensorSpec::f16(
+                        format!("{m}.A_log"),
+                        vec![self.mamba_heads],
+                        Init::ALog,
+                    ));
+                    t.push(TensorSpec::f16(
+                        format!("{m}.D"),
+                        vec![self.mamba_heads],
+                        Init::NormOnes,
+                    ));
+                    t.push(TensorSpec::f16(
+                        format!("{m}.dt_bias"),
+                        vec![self.mamba_heads],
+                        Init::Zeros,
+                    ));
+                    t.push(TensorSpec::f16(
+                        format!("{m}.norm.weight"),
+                        vec![d_inner],
+                        Init::NormOnes,
+                    ));
+                    t.push(TensorSpec::new(
+                        format!("{m}.out_proj.weight"),
+                        vec![h, d_inner],
+                        Init::Uniform(0.04),
+                    ));
+                }
+                2 => {
+                    t.push(TensorSpec::new(
+                        format!("{m}.q_proj.weight"),
+                        vec![q_dim, h],
+                        Init::Uniform(0.04),
+                    ));
+                    t.push(TensorSpec::new(
+                        format!("{m}.k_proj.weight"),
+                        vec![kv_dim, h],
+                        Init::Uniform(0.04),
+                    ));
+                    t.push(TensorSpec::new(
+                        format!("{m}.v_proj.weight"),
+                        vec![kv_dim, h],
+                        Init::Uniform(0.04),
+                    ));
+                    t.push(TensorSpec::new(
+                        format!("{m}.o_proj.weight"),
+                        vec![h, q_dim],
+                        Init::Uniform(0.04),
+                    ));
+                }
+                _ => {
+                    t.push(TensorSpec::new(
+                        format!("{m}.up_proj.weight"),
+                        vec![self.mlp_intermediate, h],
+                        Init::Uniform(0.04),
+                    ));
+                    t.push(TensorSpec::new(
+                        format!("{m}.down_proj.weight"),
+                        vec![h, self.mlp_intermediate],
+                        Init::Uniform(0.04),
+                    ));
+                }
+            }
+        }
+        t
+    }
+}
+
+impl ToyModel for NemotronHSpec {
+    fn fixture(&self, _seed: u64) -> ToyFixture {
+        let n = NemotronHTiny::preset();
+        ToyFixture {
+            config_json: serde_json::to_string_pretty(&n.config_json())
+                .expect("serialize nemotron-h toy config"),
+            tensors: n.manifest(),
+        }
+    }
+}
+
 /// Lean identity marker for the pure Mamba-2 offline spec.
 pub struct Mamba2Spec;
 impl Arch for Mamba2Spec {
@@ -257,7 +462,7 @@ impl ToyModel for Mamba2Spec {
 
 static NEMOTRON_H_SPEC: NemotronHSpec = NemotronHSpec;
 static MAMBA2_SPEC: Mamba2Spec = Mamba2Spec;
-register_arch!(NEMOTRON_H_SPEC, Ingest);
+register_arch!(NEMOTRON_H_SPEC, Ingest, ToyModel);
 register_arch!(MAMBA2_SPEC, Ingest, ToyModel);
 
 #[cfg(test)]
@@ -304,8 +509,6 @@ mod tests {
 
     #[test]
     fn mamba2_toy_fixture_is_declared() {
-        // Only the pure Mamba-2 arch emits the toy fixture (ported verbatim from the
-        // quantizer). Nemotron-H declares no ToyModel.
         let f = Mamba2Spec.fixture(0);
         assert!(!f.tensors.is_empty(), "mamba2 fixture emits tensors");
         assert!(
@@ -316,11 +519,33 @@ mod tests {
 
         let reg = ArchRegistry::build();
         assert!(reg.get(MAMBA2_ARCH_ID).unwrap().caps.toy_model.is_some());
+    }
+
+    #[test]
+    fn nemotron_h_toy_fixture_is_hybrid_and_aligned() {
+        let f = NemotronHSpec.fixture(0);
+        assert!(
+            f.config_json
+                .contains("\"hybrid_override_pattern\": \"M-*-\""),
+            "config declares hybrid Nemotron-H blocks: {}",
+            f.config_json
+        );
+        let has = |name: &str| f.tensors.iter().any(|t| t.name == name);
+        assert!(has("backbone.layers.0.mixer.in_proj.weight"));
+        assert!(has("backbone.layers.1.mixer.up_proj.weight"));
+        assert!(has("backbone.layers.2.mixer.q_proj.weight"));
+        assert!(has("backbone.layers.3.mixer.down_proj.weight"));
+        assert!(f.tensors.iter().any(|t| {
+            t.name.ends_with(".weight")
+                && t.shape.last() == Some(&256)
+                && t.name.contains(".mixer.")
+        }));
+        let reg = ArchRegistry::build();
         assert!(reg
             .get(NEMOTRON_H_ARCH_ID)
             .unwrap()
             .caps
             .toy_model
-            .is_none());
+            .is_some());
     }
 }

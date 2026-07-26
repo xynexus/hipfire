@@ -30,6 +30,7 @@
 //!   cargo run -p hipfire-train --release --example pflash_drafter_train
 
 use hipfire_model::tokenizer::Tokenizer;
+use hipfire_rdna::{DType, Gpu};
 use hipfire_train::block::free_block_acts;
 use hipfire_train::checkpoint::{load_drafter, load_labels, save_drafter, save_labels};
 use hipfire_train::drafter::{
@@ -40,7 +41,6 @@ use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_block_activations, LlamaModel};
 use hipfire_train::ops::pflash_score::pflash_score_forward;
 use hipfire_train::optim::AdamW;
-use hipfire_rdna::{DType, Gpu};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 

@@ -21,7 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use hipfire_model::KNOWN_RUNTIME_ARCH_IDS;
+use hipfire_diffusion::{DiffusionQuantFormat, PlainOpusPolicy};
+use hipfire_model::{KNOWN_DIFFUSION_ARCH_IDS, KNOWN_RUNTIME_ARCH_IDS};
 use serde::Deserialize;
 
 #[derive(Debug, clap::Args)]
@@ -54,6 +55,8 @@ struct Spec {
     quant: Vec<QuantEntry>,
     #[serde(default)]
     gate: Vec<GateEntry>,
+    #[serde(default)]
+    diffusion: Vec<DiffusionEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,8 +74,8 @@ struct ArchEntry {
 struct QuantEntry {
     name: String,
     label: String,
-    weight_bits: u32,
-    act_bits: u32,
+    weight_bits: f64,
+    act_bits: f64,
     status: String,
 }
 
@@ -85,8 +88,33 @@ struct GateEntry {
     note: String,
 }
 
+/// One row of the diffusion (image/video denoiser) capability matrix — the
+/// image-generation-pipeline analogue of [`ArchEntry`]. Diffusion families are
+/// graded on the denoise pipeline spine (text-encoder / denoise / sampler / VAE
+/// / t2i) instead of the autoregressive prefill/dflash/mtp/kv/vision spine.
+#[derive(Debug, Deserialize)]
+struct DiffusionEntry {
+    ids: Vec<u32>,
+    label: String,
+    /// Denoiser family tag (matches `Diffusion::denoiser_family`).
+    family: String,
+    ingest: String,
+    text_enc: String,
+    denoise: String,
+    sampler: String,
+    vae: String,
+    t2i: String,
+    /// Diffusion weight-quant menu (free-form, like the arch `kv` axis).
+    quant: String,
+    #[serde(default)]
+    note: String,
+}
+
 const BEGIN_MARK: &str = "<!-- BEGIN GENERATED model-support (source: docs/model-support.toml — run `cargo run -p hipfire-cli -- gen-model-support`) -->";
 const END_MARK: &str = "<!-- END GENERATED model-support -->";
+const OQ_CHECKLIST_FIELDS: &[&str] = &[
+    "producer", "loader", "decode", "prefill", "tiny", "golden", "eval", "artifact",
+];
 
 pub fn run(args: GenModelSupportArgs) -> anyhow::Result<()> {
     let root = repo_root()?;
@@ -166,9 +194,159 @@ fn validate(spec: &Spec) -> anyhow::Result<()> {
             );
         }
     }
+    for d in &spec.diffusion {
+        if d.ids.is_empty() {
+            anyhow::bail!("diffusion {:?} has no ids", d.label);
+        }
+        for (field, v) in [
+            ("ingest", &d.ingest),
+            ("text_enc", &d.text_enc),
+            ("denoise", &d.denoise),
+            ("sampler", &d.sampler),
+            ("vae", &d.vae),
+            ("t2i", &d.t2i),
+        ] {
+            if !ok(v) {
+                anyhow::bail!(
+                    "diffusion {:?} field `{field}` = {v:?}; expected full|partial|none",
+                    d.ids
+                );
+            }
+        }
+    }
     validate_arch_id_coverage(spec)?;
+    validate_diffusion_id_coverage(spec)?;
+    validate_oq_gate_coverage(spec)?;
+    validate_diffusion_quant_semantics(spec)?;
     gfx_class_agreement(spec)?;
     Ok(())
+}
+
+fn validate_oq_gate_coverage(spec: &Spec) -> anyhow::Result<()> {
+    let oq_quants: BTreeSet<&str> = spec
+        .quant
+        .iter()
+        .map(|q| q.name.as_str())
+        .filter(|name| name.starts_with("oq"))
+        .collect();
+    if oq_quants.is_empty() {
+        anyhow::bail!("model-support quant catalog has no OQ formats");
+    }
+
+    let mut gate_keys = BTreeSet::new();
+    for g in &spec.gate {
+        if g.quant.starts_with("oq") {
+            if !oq_quants.contains(g.quant.as_str()) {
+                anyhow::bail!(
+                    "OQ gate arch={} quant={} is not present in the quant catalog",
+                    g.arch,
+                    g.quant
+                );
+            }
+            validate_oq_checklist_note(g)?;
+            if !gate_keys.insert((g.arch, g.quant.as_str())) {
+                anyhow::bail!("duplicate OQ gate arch={} quant={}", g.arch, g.quant);
+            }
+        }
+    }
+
+    let mut missing = Vec::new();
+    for arch in &spec.arch {
+        if arch.prefill == "none" {
+            continue;
+        }
+        for &id in &arch.ids {
+            for &quant in &oq_quants {
+                if !gate_keys.contains(&(id, quant)) {
+                    missing.push(format!("arch={id} quant={quant}"));
+                }
+            }
+        }
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "OQ gate coverage missing for non-`none` runtime families: {}",
+            missing.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_oq_checklist_note(g: &GateEntry) -> anyhow::Result<()> {
+    let Some((_, checklist)) = g.note.split_once("OQ checklist") else {
+        anyhow::bail!(
+            "OQ gate arch={} quant={} is missing `OQ checklist` in its note",
+            g.arch,
+            g.quant
+        );
+    };
+    for field in OQ_CHECKLIST_FIELDS {
+        let needle = format!("{field}=");
+        if !checklist.contains(&needle) {
+            anyhow::bail!(
+                "OQ gate arch={} quant={} checklist is missing `{field}=...`",
+                g.arch,
+                g.quant
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_diffusion_quant_semantics(spec: &Spec) -> anyhow::Result<()> {
+    for d in &spec.diffusion {
+        let lower = d.quant.to_ascii_lowercase();
+        if lower.contains("/++") || lower.contains("/+") {
+            anyhow::bail!(
+                "diffusion {:?} quant {:?} uses ambiguous OQ shorthand; spell every token explicitly",
+                d.label,
+                d.quant
+            );
+        }
+
+        let tokens = diffusion_quant_tokens(&d.quant);
+        for token in tokens.iter().filter(|token| token.starts_with("oq")) {
+            if !diffusion_oq_token_is_supported(token) {
+                anyhow::bail!(
+                    "diffusion {:?} quant token `{token}` is not supported by the diffusion OQ quant parsers",
+                    d.label
+                );
+            }
+        }
+
+        if tokens.iter().any(|token| token.starts_with("oq"))
+            && d.t2i != "full"
+            && !diffusion_note_explains_unservable_oq(d)
+        {
+            anyhow::bail!(
+                "diffusion {:?} advertises OQ quant tokens with t2i={:?}; note must explain the missing servable t2i loop",
+                d.label,
+                d.t2i
+            );
+        }
+    }
+    Ok(())
+}
+
+fn diffusion_quant_tokens(value: &str) -> Vec<String> {
+    value
+        .split(|c: char| c.is_whitespace() || matches!(c, '·' | ',' | ';'))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase().replace(['_', '-'], ""))
+        .collect()
+}
+
+fn diffusion_oq_token_is_supported(token: &str) -> bool {
+    DiffusionQuantFormat::parse(token).is_some() || PlainOpusPolicy::parse(token).is_some()
+}
+
+fn diffusion_note_explains_unservable_oq(d: &DiffusionEntry) -> bool {
+    let note = d.note.to_ascii_lowercase();
+    note.contains("not yet a wired serve loop")
+        || note.contains("no servable t2i loop")
+        || note.contains("no wired serve loop")
 }
 
 fn validate_arch_id_coverage(spec: &Spec) -> anyhow::Result<()> {
@@ -224,6 +402,62 @@ fn validate_arch_id_coverage(spec: &Spec) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Same coverage contract as [`validate_arch_id_coverage`] but for the diffusion
+/// matrix: every `KNOWN_DIFFUSION_ARCH_IDS` id must have a `[[diffusion]]` row,
+/// no id may appear twice, and no row may reference an unknown diffusion id.
+fn validate_diffusion_id_coverage(spec: &Spec) -> anyhow::Result<()> {
+    let known: BTreeMap<u32, &'static str> = KNOWN_DIFFUSION_ARCH_IDS.iter().copied().collect();
+    if known.len() != KNOWN_DIFFUSION_ARCH_IDS.len() {
+        anyhow::bail!("KNOWN_DIFFUSION_ARCH_IDS contains duplicate arch IDs");
+    }
+
+    let mut seen: BTreeMap<u32, &str> = BTreeMap::new();
+    let mut duplicates = Vec::new();
+    for d in &spec.diffusion {
+        for &id in &d.ids {
+            if let Some(previous_label) = seen.insert(id, d.label.as_str()) {
+                duplicates.push(format!("{id} ({previous_label}, {})", d.label));
+            }
+        }
+    }
+    if !duplicates.is_empty() {
+        anyhow::bail!(
+            "docs/model-support.toml contains duplicate diffusion arch IDs: {}",
+            duplicates.join(", ")
+        );
+    }
+
+    let seen_ids: BTreeSet<u32> = seen.keys().copied().collect();
+    let known_ids: BTreeSet<u32> = known.keys().copied().collect();
+    let missing = known_ids
+        .difference(&seen_ids)
+        .map(|id| format!("{}({id})", known[id]))
+        .collect::<Vec<_>>();
+    let unknown = seen_ids
+        .difference(&known_ids)
+        .map(|id| format!("{id} ({})", seen[id]))
+        .collect::<Vec<_>>();
+
+    if !missing.is_empty() || !unknown.is_empty() {
+        let mut parts = Vec::new();
+        if !missing.is_empty() {
+            parts.push(format!("missing diffusion rows: {}", missing.join(", ")));
+        }
+        if !unknown.is_empty() {
+            parts.push(format!(
+                "unknown diffusion rows: {} (add ARCH_ID_* + KNOWN_DIFFUSION_ARCH_IDS if served)",
+                unknown.join(", ")
+            ));
+        }
+        anyhow::bail!(
+            "docs/model-support.toml diffusion coverage mismatch: {}",
+            parts.join("; ")
+        );
+    }
+
+    Ok(())
+}
+
 fn support_variant(m: &str) -> &'static str {
     match m {
         "full" => "FeatureSupport::Full",
@@ -239,6 +473,26 @@ fn support_glyph(m: &str) -> &'static str {
         "partial" => "🟡",
         "none" => "❌",
         _ => "?",
+    }
+}
+
+fn format_bits(bits: f64) -> String {
+    if bits.fract() == 0.0 {
+        format!("{bits:.0}")
+    } else {
+        let mut s = format!("{bits:.3}");
+        while s.ends_with('0') {
+            s.pop();
+        }
+        s
+    }
+}
+
+fn format_bits_rust(bits: f64) -> String {
+    if bits.fract() == 0.0 {
+        format!("{bits:.1}")
+    } else {
+        format_bits(bits)
     }
 }
 
@@ -446,7 +700,7 @@ fn render_rust(spec: &Spec) -> String {
     s.push_str("// @generated by `hipfire gen-model-support` from docs/model-support.toml.\n");
     s.push_str("// DO NOT EDIT BY HAND — edit the .toml and regenerate.\n");
     s.push_str("#![allow(dead_code)]\n\n");
-    s.push_str("use crate::{ArchFeatures, FeatureSupport};\n\n");
+    s.push_str("use crate::{ArchFeatures, DiffusionFeatures, FeatureSupport};\n\n");
 
     // Arch table.
     s.push_str("/// One row of the per-arch capability matrix.\n");
@@ -474,12 +728,16 @@ fn render_rust(spec: &Spec) -> String {
 
     // Quant table.
     s.push_str("/// A quant format and its weight/activation bit-width + maturity.\n");
-    s.push_str("pub struct QuantInfo {\n    pub name: &'static str,\n    pub label: &'static str,\n    pub weight_bits: u32,\n    pub act_bits: u32,\n    pub status: &'static str,\n}\n\n");
+    s.push_str("pub struct QuantInfo {\n    pub name: &'static str,\n    pub label: &'static str,\n    pub weight_bits: f64,\n    pub act_bits: f64,\n    pub status: &'static str,\n}\n\n");
     s.push_str("pub const QUANT_TABLE: &[QuantInfo] = &[\n");
     for q in &spec.quant {
         s.push_str(&format!(
             "    QuantInfo {{ name: {:?}, label: {:?}, weight_bits: {}, act_bits: {}, status: {:?} }},\n",
-            q.name, q.label, q.weight_bits, q.act_bits, q.status,
+            q.name,
+            q.label,
+            format_bits_rust(q.weight_bits),
+            format_bits_rust(q.act_bits),
+            q.status,
         ));
     }
     s.push_str("];\n\n");
@@ -497,6 +755,35 @@ fn render_rust(spec: &Spec) -> String {
             g.feature,
             support_variant(&g.support),
             g.note,
+        ));
+    }
+    s.push_str("];\n\n");
+
+    // Diffusion table.
+    s.push_str("/// One row of the diffusion (image/video denoiser) capability matrix.\n");
+    s.push_str("pub struct DiffusionRow {\n    pub ids: &'static [u32],\n    pub features: DiffusionFeatures,\n}\n\n");
+    s.push_str(
+        "/// Per-diffusion-family capabilities, keyed by HFQ arch_id (see `diffusion_features`).\n",
+    );
+    s.push_str("pub const DIFFUSION_ROWS: &[DiffusionRow] = &[\n");
+    for d in &spec.diffusion {
+        let ids = d
+            .ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.push_str(&format!(
+            "    DiffusionRow {{ ids: &[{ids}], features: DiffusionFeatures {{ label: {:?}, family: {:?}, ingest: {}, text_enc: {}, denoise: {}, sampler: {}, vae: {}, t2i: {}, quant: {:?} }} }},\n",
+            d.label,
+            d.family,
+            support_variant(&d.ingest),
+            support_variant(&d.text_enc),
+            support_variant(&d.denoise),
+            support_variant(&d.sampler),
+            support_variant(&d.vae),
+            support_variant(&d.t2i),
+            d.quant,
         ));
     }
     s.push_str("];\n");
@@ -542,7 +829,11 @@ fn render_chart(spec: &Spec) -> String {
     for q in &spec.quant {
         s.push_str(&format!(
             "| {} ({}) | {} | {} | {} |\n",
-            q.name, q.label, q.weight_bits, q.act_bits, q.status,
+            q.name,
+            q.label,
+            format_bits(q.weight_bits),
+            format_bits(q.act_bits),
+            q.status,
         ));
     }
 
@@ -561,7 +852,65 @@ fn render_chart(spec: &Spec) -> String {
         ));
     }
 
+    s.push_str(&render_diffusion_chart(spec));
     s.push_str(&render_projections(spec));
+    s
+}
+
+/// The diffusion (image/video denoiser) capability matrix — a separate table
+/// because diffusion families are graded on the image-generation pipeline spine
+/// (text-encoder → denoise → sampler → VAE → t2i), not the autoregressive
+/// prefill/dflash/mtp/kv/vision spine. Source: the `[[diffusion]]` rows.
+fn render_diffusion_chart(spec: &Spec) -> String {
+    let mut s = String::new();
+    if spec.diffusion.is_empty() {
+        return s;
+    }
+    s.push_str("\n### Diffusion capability matrix (generated)\n\n");
+    s.push_str(
+        "Image/video denoiser families (keyed by their diffusion `arch_id`), graded on the \
+         generation-pipeline spine rather than the autoregressive spine above. **ingest** = offline \
+         HFQ import + quant precision policy; **text-enc** = prompt conditioning tower; **denoise** \
+         = MMDiT/DiT backbone forward; **sampler** = scheduler / denoise-loop; **vae** = latent→RGB \
+         decode; **t2i** = end-to-end text-to-image serving. Edit `docs/model-support.toml`.\n\n",
+    );
+    s.push_str(
+        "| Family (arch_id) | Denoiser | Ingest | Text-enc | Denoise | Sampler | VAE | t2i | Quant |\n",
+    );
+    s.push_str("|---|---|---|---|---|---|---|---|---|\n");
+    for d in &spec.diffusion {
+        let ids = d
+            .ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.push_str(&format!(
+            "| {} ({}) | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            d.label,
+            ids,
+            d.family,
+            support_glyph(&d.ingest),
+            support_glyph(&d.text_enc),
+            support_glyph(&d.denoise),
+            support_glyph(&d.sampler),
+            support_glyph(&d.vae),
+            support_glyph(&d.t2i),
+            d.quant,
+        ));
+    }
+    // Per-family notes: the pipeline-glue nuance the tri-state marks can't carry.
+    let notes: Vec<&DiffusionEntry> = spec
+        .diffusion
+        .iter()
+        .filter(|d| !d.note.is_empty())
+        .collect();
+    if !notes.is_empty() {
+        s.push('\n');
+        for d in notes {
+            s.push_str(&format!("- **{}**: {}\n", d.label, d.note));
+        }
+    }
     s
 }
 
@@ -611,6 +960,174 @@ fn rustfmt(src: &str) -> anyhow::Result<String> {
         );
     }
     Ok(String::from_utf8(out.stdout)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oq_quant(name: &str) -> QuantEntry {
+        QuantEntry {
+            name: name.to_string(),
+            label: name.to_string(),
+            weight_bits: 4.0,
+            act_bits: 8.0,
+            status: "opt-in".to_string(),
+        }
+    }
+
+    fn arch(id: u32) -> ArchEntry {
+        ArchEntry {
+            ids: vec![id],
+            label: format!("arch-{id}"),
+            prefill: "partial".to_string(),
+            dflash: "none".to_string(),
+            mtp: "none".to_string(),
+            kv: "none".to_string(),
+            vision: "none".to_string(),
+        }
+    }
+
+    fn oq_gate(arch: u32, quant: &str, note: &str) -> GateEntry {
+        GateEntry {
+            arch,
+            quant: quant.to_string(),
+            feature: "prefill".to_string(),
+            support: "partial".to_string(),
+            note: note.to_string(),
+        }
+    }
+
+    fn complete_oq_note() -> &'static str {
+        "OQ checklist producer=yes loader=yes decode=smoke prefill=gated tiny=gfx1103 golden=gfx1103 eval=pending artifact=pending"
+    }
+
+    fn oq_spec(gate: Vec<GateEntry>) -> Spec {
+        Spec {
+            arch: vec![arch(5)],
+            quant: vec![oq_quant("oq4")],
+            gate,
+            diffusion: Vec::new(),
+        }
+    }
+
+    fn diffusion(label: &str, t2i: &str, quant: &str, note: &str) -> DiffusionEntry {
+        DiffusionEntry {
+            ids: vec![23],
+            label: label.to_string(),
+            family: format!("{label}-mmdit"),
+            ingest: "full".to_string(),
+            text_enc: "full".to_string(),
+            denoise: "full".to_string(),
+            sampler: "full".to_string(),
+            vae: "full".to_string(),
+            t2i: t2i.to_string(),
+            quant: quant.to_string(),
+            note: note.to_string(),
+        }
+    }
+
+    fn diffusion_spec(row: DiffusionEntry) -> Spec {
+        Spec {
+            arch: Vec::new(),
+            quant: Vec::new(),
+            gate: Vec::new(),
+            diffusion: vec![row],
+        }
+    }
+
+    #[test]
+    fn oq_gate_validation_requires_complete_checklist_fields() {
+        let spec = oq_spec(vec![oq_gate(
+            5,
+            "oq4",
+            "OQ checklist producer=yes loader=yes decode=smoke prefill=gated tiny=gfx1103 golden=gfx1103 eval=pending",
+        )]);
+        let err = validate_oq_gate_coverage(&spec).unwrap_err().to_string();
+        assert!(err.contains("artifact=..."), "{err}");
+    }
+
+    #[test]
+    fn oq_gate_validation_rejects_unknown_oq_quant() {
+        let spec = oq_spec(vec![
+            oq_gate(5, "oq4", complete_oq_note()),
+            oq_gate(5, "oq6", complete_oq_note()),
+        ]);
+        let err = validate_oq_gate_coverage(&spec).unwrap_err().to_string();
+        assert!(err.contains("not present in the quant catalog"), "{err}");
+    }
+
+    #[test]
+    fn oq_gate_validation_rejects_duplicate_rows() {
+        let spec = oq_spec(vec![
+            oq_gate(5, "oq4", complete_oq_note()),
+            oq_gate(5, "oq4", complete_oq_note()),
+        ]);
+        let err = validate_oq_gate_coverage(&spec).unwrap_err().to_string();
+        assert!(err.contains("duplicate OQ gate"), "{err}");
+    }
+
+    #[test]
+    fn oq_gate_validation_accepts_complete_catalogued_row() {
+        let spec = oq_spec(vec![oq_gate(5, "oq4", complete_oq_note())]);
+        validate_oq_gate_coverage(&spec).unwrap();
+    }
+
+    #[test]
+    fn diffusion_quant_validation_rejects_ambiguous_oq_shorthand() {
+        let spec = diffusion_spec(diffusion(
+            "flux2",
+            "full",
+            "bf16·q4f16·oq4/++/8",
+            "servable loop is wired",
+        ));
+        let err = validate_diffusion_quant_semantics(&spec)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ambiguous OQ shorthand"), "{err}");
+    }
+
+    #[test]
+    fn diffusion_quant_validation_rejects_ar_only_oq_tokens() {
+        let spec = diffusion_spec(diffusion(
+            "flux2",
+            "full",
+            "bf16·q4f16·oq8+",
+            "servable loop is wired",
+        ));
+        let err = validate_diffusion_quant_semantics(&spec)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not supported by the diffusion OQ quant parsers"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn diffusion_quant_validation_requires_unservable_note_for_partial_t2i() {
+        let spec = diffusion_spec(diffusion(
+            "krea2",
+            "partial",
+            "bf16·q4f16·oq4·oq4+·oq4++·oq8",
+            "denoiser topology exists",
+        ));
+        let err = validate_diffusion_quant_semantics(&spec)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing servable t2i loop"), "{err}");
+    }
+
+    #[test]
+    fn diffusion_quant_validation_accepts_explicit_parser_tokens() {
+        let spec = diffusion_spec(diffusion(
+            "krea2",
+            "partial",
+            "bf16·q4f16·q8f16·hfq4/6·oq4·oq4+·oq4++·oq8",
+            "not yet a wired serve loop",
+        ));
+        validate_diffusion_quant_semantics(&spec).unwrap();
+    }
 }
 
 fn repo_root() -> anyhow::Result<PathBuf> {

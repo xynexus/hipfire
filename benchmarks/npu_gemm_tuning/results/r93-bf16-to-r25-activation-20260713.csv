@@ -1,0 +1,4 @@
+mode,run,contexts,q_mismatches,max_q_delta,max_scale_abs,padding_nonzero,iterations,dispatch_ms,source_gib_s,physical_gib_s,decision
+r93-bf16-to-r25-activation,1,1,0,0,0.000000007,0,100,4.0618,0.090,0.266,admit-byte-contract-reject-standalone-phase
+r93-bf16-to-r25-activation,2,1,0,0,0.000000007,0,100,4.1218,0.089,0.262,admit-byte-contract-reject-standalone-phase
+r93-bf16-to-r25-activation,3,1,0,0,0.000000007,0,100,4.1117,0.089,0.263,admit-byte-contract-reject-standalone-phase

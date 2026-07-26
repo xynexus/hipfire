@@ -1,0 +1,6 @@
+route,sync,status,q_mismatches,kv_mismatches,iterations,projection_ms,handoff_sync_ms,pack_ms,chain_ms,note
+amdgpu-gtt-two-imports,none,rejected,1531,703,1,,,,,producer completion not coherent across independent imports
+xdna-shmem-prime-export,none,rejected,,,0,,,,,DRM_IOCTL_PRIME_HANDLE_TO_FD returned EINVAL
+shared-drm-file-one-handle,to_device,pass,0,0,100,2.6898,0.0294,2.7283,5.4478,fresh process 1
+shared-drm-file-one-handle,to_device,rejected,384,0,0,,,,,fresh process 2 failed initial correctness oracle
+shared-drm-file-one-handle,to_device,pass,0,0,100,2.9057,0.0283,2.7257,5.6600,fresh process 3

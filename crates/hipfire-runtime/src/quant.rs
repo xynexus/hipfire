@@ -38,6 +38,113 @@ pub fn dequant_q8f16(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+/// Dequantize an HFQ Oq8G256 (Opus-Quant W8A8) block tensor to **plain** f32.
+/// Block: 2 bytes (f16 scale) + 256 bytes (256 signed int8) = 258 B / 256 weights.
+///
+/// Oq8 is FWHT-256 **rotated** at quantize time (`cpu_fwht_256(group, s1, s2)`
+/// before int8 packing — see `hipfire-quantize::codecs::quantize_oq8g256`). The
+/// Opus iu8 GEMM consumes the rotated weights directly (activations are rotated
+/// to match), so arch loaders that feed the Opus kernel keep them rotated. This
+/// helper is for callers that need the **un-rotated** weight (e.g. the gemma3-vl
+/// vision tower / projector, which use a plain f32/bf16 GEMM): after `int8·scale`
+/// it applies the inverse FWHT (`cpu_fwht_256(grp, s2, s1)` — signs swapped) with
+/// the engine-fixed seeds (42, 1042). Oq8G256 requires K % 256 == 0, so `n` is a
+/// whole number of full 256-groups (no partial group crosses the FWHT boundary).
+pub fn dequant_oq8g256(data: &[u8], n: usize) -> Vec<f32> {
+    use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
+    const GROUP: usize = 256;
+    const BLOCK: usize = 258; // 2 (f16 scale) + 256 int8
+    let s1 = gen_fwht_signs(42, GROUP);
+    let s2 = gen_fwht_signs(1042, GROUP);
+    let nblocks = n / GROUP; // K%256==0 ⇒ n is a whole number of groups
+    let mut out = vec![0.0f32; n];
+
+    for b in 0..nblocks {
+        let off = b * BLOCK;
+        if off + BLOCK > data.len() {
+            break;
+        }
+        let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let mut grp = [0.0f32; GROUP];
+        for j in 0..GROUP {
+            grp[j] = (data[off + 2 + j] as i8) as f32 * scale;
+        }
+        // Inverse rotation back to the original (un-rotated) weight basis.
+        cpu_fwht_256(&mut grp, &s2, &s1);
+        out[b * GROUP..b * GROUP + GROUP].copy_from_slice(&grp);
+    }
+    out
+}
+
+/// Dequantize canonical on-disk Oq4G256 blocks to plain, unrotated f32.
+pub fn dequant_oq4g256(data: &[u8], n: usize) -> Vec<f32> {
+    use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
+    const GROUP: usize = 256;
+    const BLOCK: usize = 130;
+    let signs1 = gen_fwht_signs(42, GROUP);
+    let signs2 = gen_fwht_signs(1042, GROUP);
+    let mut out = vec![0.0f32; n];
+
+    for block_idx in 0..n / GROUP {
+        let offset = block_idx * BLOCK;
+        if offset + BLOCK > data.len() {
+            break;
+        }
+        let scale = f16_to_f32(u16::from_le_bytes([data[offset], data[offset + 1]]));
+        let mut group = [0.0f32; GROUP];
+        for packed_idx in 0..128 {
+            let packed = data[offset + 2 + packed_idx];
+            let low = (packed & 0x0f) as i8;
+            let high = (packed >> 4) as i8;
+            group[2 * packed_idx] = (if low > 7 { low - 16 } else { low }) as f32 * scale;
+            group[2 * packed_idx + 1] = (if high > 7 { high - 16 } else { high }) as f32 * scale;
+        }
+        cpu_fwht_256(&mut group, &signs2, &signs1);
+        out[block_idx * GROUP..(block_idx + 1) * GROUP].copy_from_slice(&group);
+    }
+    out
+}
+
+/// Dequantize compact mixed-precision Opus blocks to plain, unrotated f32.
+pub fn dequant_oqplus_compact(data: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
+    const GROUP: usize = 256;
+    assert_eq!(
+        cols % GROUP,
+        0,
+        "compact mixed Opus requires columns divisible by 256"
+    );
+    let groups = rows * (cols / GROUP);
+    assert!(groups > 0 && data.len() % groups == 0);
+    let block_bytes = data.len() / groups;
+    assert!(block_bytes >= 132 && (block_bytes - 130) % 2 == 0);
+    let outlier_count = (block_bytes - 130) / 2;
+    let signs1 = gen_fwht_signs(42, GROUP);
+    let signs2 = gen_fwht_signs(1042, GROUP);
+    let mut out = vec![0.0f32; rows * cols];
+
+    for block_idx in 0..groups {
+        let offset = block_idx * block_bytes;
+        let scale = f16_to_f32(u16::from_le_bytes([data[offset], data[offset + 1]]));
+        let mut group = [0.0f32; GROUP];
+        for packed_idx in 0..128 {
+            let packed = data[offset + 2 + packed_idx];
+            let low = (packed & 0x0f) as i8;
+            let high = (packed >> 4) as i8;
+            group[2 * packed_idx] = (if low > 7 { low - 16 } else { low }) as f32 * scale;
+            group[2 * packed_idx + 1] = (if high > 7 { high - 16 } else { high }) as f32 * scale;
+        }
+        for outlier_idx in 0..outlier_count {
+            let table_offset = offset + 130 + 2 * outlier_idx;
+            let index = data[table_offset] as usize;
+            group[index] = (data[table_offset + 1] as i8) as f32 * scale;
+        }
+        cpu_fwht_256(&mut group, &signs2, &signs1);
+        out[block_idx * GROUP..(block_idx + 1) * GROUP].copy_from_slice(&group);
+    }
+    out
+}
+
 // f16↔f32 conversions are now the canonical implementations in the shared
 // `hipfire-primitives` leaf (they were byte-identical copies). Re-exported here
 // so the ~20 arch/loader call sites importing `hipfire_runtime::quant::*` stay
@@ -160,4 +267,143 @@ pub fn dtype_for_quant_type(qt: u8, k: usize) -> Option<hipfire_rdna::DType> {
         Q::Qtip4G256 => DType::Qtip4G256,
         _ => return None,
     })
+}
+
+/// Map Opus-family on-disk quant types to the GPU runtime dtype used after the
+/// loader has performed any required OQ-specific repack.
+///
+/// This helper is deliberately separate from [`dtype_for_quant_type`], because
+/// canonical OQ4/OQ8/OQ+ payloads are not pure slab-upload formats for the
+/// general dense loaders. Callers that already handle the OQ payload contract
+/// can use this single map for dtype classification instead of re-hardcoding
+/// the quant-type bytes family by family.
+pub fn oq_gpu_dtype_for_quant_type(qt: u8) -> Option<hipfire_rdna::DType> {
+    use hipfire_quant_format::QuantType as Q;
+    use hipfire_rdna::DType;
+    Some(match Q::from_code(qt)? {
+        Q::OqPlusG256 | Q::Oq8G256 | Q::OqPlusCompact => DType::Oq8G256,
+        Q::Oq4G256 | Q::Oq4G256ArchPacked => DType::Oq4G256,
+        Q::Oq8G256RowPadded => return None,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
+
+    #[test]
+    fn pure_gpu_dtype_map_rejects_transformed_oq_layouts() {
+        assert_eq!(dtype_for_quant_type(QuantType::Oq4G256.code(), 256), None);
+        assert_eq!(
+            dtype_for_quant_type(QuantType::Oq4G256ArchPacked.code(), 256),
+            None
+        );
+        assert_eq!(dtype_for_quant_type(QuantType::Oq8G256.code(), 256), None);
+        assert_eq!(
+            dtype_for_quant_type(QuantType::OqPlusCompact.code(), 256),
+            None
+        );
+        assert_eq!(
+            dtype_for_quant_type(QuantType::Oq8G256RowPadded.code(), 1152),
+            None
+        );
+    }
+
+    #[test]
+    fn oq_gpu_dtype_map_covers_servable_oq_layouts() {
+        assert_eq!(
+            oq_gpu_dtype_for_quant_type(QuantType::Oq4G256.code()),
+            Some(hipfire_rdna::DType::Oq4G256)
+        );
+        assert_eq!(
+            oq_gpu_dtype_for_quant_type(QuantType::Oq4G256ArchPacked.code()),
+            Some(hipfire_rdna::DType::Oq4G256)
+        );
+        assert_eq!(
+            oq_gpu_dtype_for_quant_type(QuantType::Oq8G256.code()),
+            Some(hipfire_rdna::DType::Oq8G256)
+        );
+        assert_eq!(
+            oq_gpu_dtype_for_quant_type(QuantType::OqPlusG256.code()),
+            Some(hipfire_rdna::DType::Oq8G256)
+        );
+        assert_eq!(
+            oq_gpu_dtype_for_quant_type(QuantType::OqPlusCompact.code()),
+            Some(hipfire_rdna::DType::Oq8G256)
+        );
+        assert_eq!(
+            oq_gpu_dtype_for_quant_type(QuantType::Oq8G256RowPadded.code()),
+            None
+        );
+    }
+
+    #[test]
+    fn dequant_oq8g256_inverts_the_fwht_rotation() {
+        // Regression: Oq8 stores FWHT-rotated weights (matches
+        // hipfire-quantize::codecs::quantize_oq8g256). dequant_oq8g256 must
+        // return the *un-rotated* weight, else consumers using a plain GEMM
+        // (gemma3-vl vision/projector) get scrambled values (cosine ~0, which
+        // flipped medgemma's ultrasound→"X-ray"). Build one block the way the
+        // quantizer does and confirm recovery of the original.
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let orig: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.017 - 2.0).sin()).collect();
+        let mut rot = [0.0f32; 256];
+        rot.copy_from_slice(&orig);
+        cpu_fwht_256(&mut rot, &s1, &s2); // rotate, as quantize_oq8g256 does
+        let scale = rot.iter().fold(0.0f32, |m, &v| m.max(v.abs())) / 127.0;
+        let mut block = vec![0u8; 258];
+        let sf16 = f32_to_f16(scale);
+        block[0] = (sf16 & 0xff) as u8;
+        block[1] = (sf16 >> 8) as u8;
+        for i in 0..256 {
+            block[2 + i] = ((rot[i] / scale).round().clamp(-127.0, 127.0) as i8) as u8;
+        }
+        let deq = dequant_oq8g256(&block, 256);
+        // Cosine with the ORIGINAL (un-rotated) must be ~1 (near-lossless);
+        // a non-un-rotating dequant would land near 0.
+        let dot: f32 = deq.iter().zip(&orig).map(|(a, b)| a * b).sum();
+        let na: f32 = deq.iter().map(|a| a * a).sum::<f32>().sqrt();
+        let nb: f32 = orig.iter().map(|b| b * b).sum::<f32>().sqrt();
+        let cos = dot / (na * nb);
+        assert!(cos > 0.999, "dequant_oq8g256 not un-rotating: cosine={cos}");
+    }
+
+    #[test]
+    fn dequant_oq4g256_inverts_the_fwht_rotation() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let original: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.031 - 1.0).sin()).collect();
+        let mut rotated = [0.0f32; 256];
+        rotated.copy_from_slice(&original);
+        cpu_fwht_256(&mut rotated, &signs1, &signs2);
+        let scale = rotated
+            .iter()
+            .fold(0.0f32, |max, &value| max.max(value.abs()))
+            / 7.0;
+        let mut block = vec![0u8; 130];
+        block[..2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
+        for packed_idx in 0..128 {
+            let low = (rotated[2 * packed_idx] / scale).round().clamp(-7.0, 7.0) as i8;
+            let high = (rotated[2 * packed_idx + 1] / scale)
+                .round()
+                .clamp(-7.0, 7.0) as i8;
+            block[2 + packed_idx] = (low as u8 & 0x0f) | ((high as u8 & 0x0f) << 4);
+        }
+        let decoded = dequant_oq4g256(&block, 256);
+        let dot: f32 = decoded.iter().zip(&original).map(|(a, b)| a * b).sum();
+        let decoded_norm = decoded
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        let original_norm = original
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        assert!(dot / (decoded_norm * original_norm) > 0.99);
+    }
 }

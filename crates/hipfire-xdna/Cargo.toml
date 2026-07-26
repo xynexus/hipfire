@@ -9,3 +9,14 @@ description = "AMD XDNA (Ryzen AI NPU) device layer for hipfire: /dev/accel ioct
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
+hipfire-primitives = { path = "../hipfire-primitives" }
+hipfire-quant-format = { path = "../hipfire-quant-format" }
+rayon.workspace = true
+sha2 = "0.10"
+# DflashNpuBody reads the Python harness's artifact manifest + index.json.
+serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+hipfire-rdna = { path = "../hipfire-rdna" }
+# examples only (DFlash native driver reads the Python harness's artifact manifest)
+serde_json = "1"

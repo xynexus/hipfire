@@ -468,6 +468,7 @@ fn sample_one(
         vocab,
         sc.temp,
         top_p_eff,
+        20,
         *sc.rng,
         0,   // repeat_window (no penalty in verify)
         1.0, // repeat_penalty

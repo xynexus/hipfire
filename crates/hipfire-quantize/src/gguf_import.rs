@@ -13,9 +13,7 @@
 //! deprecation shim for `--input *.gguf`.
 
 use crate::codecs::*;
-use crate::hfq_out::{
-    insert_parameter_counts_metadata, metadata_with_quantization_hash, write_hfq, HfqTensor,
-};
+use crate::hfq_out::{insert_parameter_counts_metadata, write_hfq, HfqTensor};
 use crate::quant_plan::{kmap_resolve_mode, GgufFormat, QuantLevel};
 use hipfire_arch_api::{ARCH_ID_LLAMA_MISTRAL, ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY};
 use hipfire_gguf as gguf_input;
@@ -458,7 +456,8 @@ pub fn run_gguf_pipeline(
     );
 
     insert_parameter_counts_metadata(&mut metadata, &hfq_tensors, total_params, quant_params, 0);
-    let metadata_json = metadata_with_quantization_hash(metadata, &hfq_tensors, None)?;
+    let metadata_json = serde_json::to_string(&metadata)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     write_hfq(output, arch_id, &metadata_json, &hfq_tensors, None)?;
     eprintln!("\nWrote: {}", output.display());
     Ok(())

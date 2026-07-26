@@ -16,11 +16,11 @@
 //!   cargo run -p hipfire-train --release --example phase_joint_kld
 //!   hipfire lock release
 
+use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 use hipfire_train::learn_rotation::{learn_rotation_kurtosis, learn_rotation_phase_joint};
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_forward, LlamaModel};
 use hipfire_train::rotation::{apply_r1, bake_for_oq4_recipe, Rotation};
-use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 use std::path::Path;
 
 const DEFAULT_DIR: &str =

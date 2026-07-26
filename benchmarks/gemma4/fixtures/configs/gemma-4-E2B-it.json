@@ -1,0 +1,111 @@
+{
+  "generation_config": {
+    "bos_token_id": 2,
+    "do_sample": true,
+    "eos_token_id": [
+      1,
+      106,
+      50
+    ],
+    "pad_token_id": 0,
+    "temperature": 1.0,
+    "top_k": 64,
+    "top_p": 0.95,
+    "transformers_version": "5.5.0.dev0"
+  },
+  "source": {
+    "local_available_at_freeze": true,
+    "repository": "google/gemma-4-E2B-it",
+    "revision": "70af34e20bd4b7a91f0de6b22675850c43922a03"
+  },
+  "text_config": {
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "attention_k_eq_v": false,
+    "bos_token_id": 2,
+    "dtype": "bfloat16",
+    "enable_moe_block": false,
+    "eos_token_id": 1,
+    "expert_intermediate_size": null,
+    "final_logit_softcapping": 30.0,
+    "global_head_dim": 512,
+    "head_dim": 256,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 1536,
+    "hidden_size_per_layer_input": 256,
+    "initializer_range": 0.02,
+    "intermediate_size": 6144,
+    "layer_types": [
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention"
+    ],
+    "max_position_embeddings": 131072,
+    "model_type": "gemma4_text",
+    "num_attention_heads": 8,
+    "num_experts": null,
+    "num_global_key_value_heads": null,
+    "num_hidden_layers": 35,
+    "num_key_value_heads": 1,
+    "num_kv_shared_layers": 20,
+    "pad_token_id": 0,
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {
+      "full_attention": {
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 1000000.0,
+        "rope_type": "proportional"
+      },
+      "sliding_attention": {
+        "rope_theta": 10000.0,
+        "rope_type": "default"
+      }
+    },
+    "sliding_window": 512,
+    "tie_word_embeddings": true,
+    "top_k_experts": null,
+    "use_bidirectional_attention": null,
+    "use_cache": true,
+    "use_double_wide_mlp": true,
+    "vocab_size": 262144,
+    "vocab_size_per_layer_input": 262144
+  },
+  "wrapper": {
+    "architectures": [
+      "Gemma4ForConditionalGeneration"
+    ],
+    "model_type": "gemma4"
+  }
+}

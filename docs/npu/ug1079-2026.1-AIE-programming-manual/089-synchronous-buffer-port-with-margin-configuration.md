@@ -1,0 +1,11 @@
+---
+title: "Synchronous Buffer Port With Margin Configuration"
+source_url: "https://docs.amd.com/r/en-US/ug1079-ai-engine-kernel-coding/Synchronous-Buffer-Port-With-Margin-Configuration"
+toc_id: cIlJBNABAxGs3Yxve4hWjQ
+content_id: k7IODRCPq~1P9UG6ZmnKhQ
+---
+
+### Synchronous Buffer Port With Margin Configuration
+
+- **Option 1:** Configure with `dimensions()` API in graph.`k = kernel::create(simple); connect netN(in.out[0], k.in[0]); dimensions(k.in[0]) = {INPUT_SAMPLE_SIZE}; dimensions(k.out[0]) = {OUTPUT_SAMPLE_SIZE};` Kernel k's function prototype specifies margin size.Note: You cannot specify the margin in the graph. The margin must be set it in the kernel signature using the buffer’s template parameters. `simple(input_buffer<int32, adf::extents<adf::inherited_extent>, adf::margin<MARGIN_SIZE>> & in0, output_buffer<int32> & out0);`
+- **Option 2:** Configure with kernel function prototype.`k = kernel::create(simple); connect netN(in.out[0], k.in[0]);` Kernel k’s function prototype specifies input buffer size plus margin size and output buffer size. `simple(input_buffer<int32, adf::extents<INPUT_SAMPLE_SIZE>, adf::margin<MARGIN_SIZE>> & in0, output_buffer<int32, adf::extents<OUTPUT_SAMPLE_SIZE>> & out0);` The buffer ports are designed to be accessed sequentially. The kernel program reads the buffer port and starts from the first position of samples. Therefore, a useful model is that of a current position, which can be advanced or rolled back on reads or writes. On starting a kernel, the current position is always in the correct position. For example, the current position for an input buffer port for a filter is on the first sample to restore the delay line. It might be an older sample in the case of filters requiring overlap of incoming data samples. In this case you need to declare the connection using the overlap or margin as described above. Similarly, the current position for an output buffer is on the first sample to send to the next block, irrespective of whether that block requires a duplication of older samples. The kernel can manipulate the current position which does not need to be at the end of the block when the kernel completes. Buffer ports are implemented as linear buffers. Circular buffer port types are also supported. For more information, see Linear and Circular Addressing of Buffer Ports.

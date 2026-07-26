@@ -367,6 +367,7 @@ impl AssistantPrefix {
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
+    Developer,
     User,
     Assistant,
     Tool,
@@ -464,7 +465,7 @@ impl<'a> ChatFrame<'a> {
             match role {
                 Role::User => scaffold.append_user_turn(&mut out, content),
                 Role::Assistant => scaffold.append_assistant_turn(&mut out, content),
-                Role::System | Role::Tool => panic!(
+                Role::System | Role::Developer | Role::Tool => panic!(
                     "ChatFrame::Plain does not support {role:?} role in history. \
                      Use JinjaChatFrame::render_messages for system/tool turns."
                 ),
@@ -664,15 +665,70 @@ pub struct Message {
     pub tool_call_id: Option<String>,
 }
 
+fn native_thought_content(text: &str) -> Option<&str> {
+    const OPEN: &str = "<|channel>thought\n";
+    const CLOSE: &str = "<channel|>";
+    let body = text.strip_prefix(OPEN)?;
+    let end = body.find(CLOSE)?;
+    Some(body[..end].trim_end_matches('\n'))
+}
+
+fn template_message_values(messages: &[Message]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut value = serde_json::to_value(message).expect("Message serialization");
+            if let (Some(reasoning), Some(object)) = (
+                native_thought_content(&message.content),
+                value.as_object_mut(),
+            ) {
+                object.insert(
+                    "reasoning_content".to_string(),
+                    serde_json::Value::String(reasoning.to_string()),
+                );
+            }
+            value
+        })
+        .collect()
+}
+
 /// One assistant-emitted tool call, attached to an assistant `Message`.
 /// `arguments` is a free-form JSON value (typically an object). Templates
 /// that render in XML format (Qwen3.5/3.6's `<function=NAME><parameter=ARG>`
 /// shape) walk this with `arguments | items` under pycompat.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 pub struct ToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub arguments: serde_json::Value,
+}
+
+impl serde::Serialize for ToolCall {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(if self.id.is_some() { 6 } else { 5 }))?;
+        if let Some(id) = &self.id {
+            map.serialize_entry("id", id)?;
+        }
+        map.serialize_entry("type", "function")?;
+        // Preserve the shared flat view consumed by existing templates.
+        map.serialize_entry("name", &self.name)?;
+        map.serialize_entry("arguments", &self.arguments)?;
+        // Also expose the released OpenAI/native view used by Gemma 4.
+        map.serialize_entry(
+            "function",
+            &serde_json::json!({
+                "name": self.name,
+                "arguments": self.arguments,
+            }),
+        )?;
+        map.end()
+    }
 }
 
 /// Runtime facts inferred from a resolved HF chat template by rendering
@@ -849,6 +905,7 @@ pub fn assistant_turn_fingerprint(content: &str, tool_calls: &[ToolCall]) -> u64
 pub fn openai_chat_role_to_prompt_role(role: &str) -> Option<Role> {
     match role {
         "system" => Some(Role::System),
+        "developer" => Some(Role::Developer),
         "user" => Some(Role::User),
         "assistant" => Some(Role::Assistant),
         "tool" => Some(Role::Tool),
@@ -1158,8 +1215,9 @@ impl<'a> JinjaChatFrame<'a> {
             Some(k) => Value::from_serialize(k),
             None => Value::from_serialize(&empty_map),
         };
+        let message_values = template_message_values(messages);
         let ctx = minijinja::context! {
-            messages => Value::from_serialize(messages),
+            messages => Value::from_serialize(&message_values),
             add_generation_prompt => add_generation_prompt,
             enable_thinking => self.enable_thinking,
             bos_token => bos_token,
@@ -2053,10 +2111,12 @@ mod tests {
         assert_ne!(text_a, text_c);
 
         let calls_a = vec![ToolCall {
+            id: None,
             name: "read_file".to_string(),
             arguments: serde_json::json!({"path": "/tmp/a", "opts": {"tail": 5, "raw": false}}),
         }];
         let calls_b = vec![ToolCall {
+            id: None,
             name: "read_file".to_string(),
             arguments: serde_json::json!({"opts": {"raw": false, "tail": 5}, "path": "/tmp/a"}),
         }];
@@ -2273,6 +2333,7 @@ mod tests {
                 role: Role::Assistant,
                 content: "".to_string(),
                 tool_calls: vec![ToolCall {
+                    id: Some("call_1".to_string()),
                     name: "get_weather".to_string(),
                     arguments: serde_json::json!({"city":"SF"}),
                 }],
@@ -2374,5 +2435,96 @@ mod tests {
         let out = normalize_prompt_text(s);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), s);
+    }
+
+    #[test]
+    fn gemma4_official_prompt_fixtures_are_byte_identical() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../benchmarks/gemma4/fixtures/prompts/cases.json"
+        ))
+        .unwrap();
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../benchmarks/gemma4/fixtures/prompts/gemma-4-31B-it.json"
+        ))
+        .unwrap();
+        let template =
+            include_str!("../../../benchmarks/gemma4/fixtures/templates/gemma-4-large-it.jinja");
+        let tokenizer = make_tokenizer();
+
+        for (name, case) in cases.as_object().unwrap() {
+            let messages = case["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|raw| {
+                    let role = match raw["role"].as_str().unwrap() {
+                        "system" => Role::System,
+                        "developer" => Role::Developer,
+                        "user" => Role::User,
+                        "assistant" => Role::Assistant,
+                        "tool" => Role::Tool,
+                        role => panic!("unknown fixture role {role}"),
+                    };
+                    let mut content = raw["content"].as_str().unwrap_or_default().to_string();
+                    if let Some(reasoning) = raw
+                        .get("reasoning_content")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        content = format!("<|channel>thought\n{reasoning}\n<channel|>{content}");
+                    }
+                    let tool_calls = raw
+                        .get("tool_calls")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .map(|call| ToolCall {
+                            id: call
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned),
+                            name: call["function"]["name"].as_str().unwrap().to_string(),
+                            arguments: call["function"]["arguments"].clone(),
+                        })
+                        .collect();
+                    Message {
+                        role,
+                        content,
+                        tool_calls,
+                        tool_call_id: raw
+                            .get("tool_call_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let tools = case
+                .get("tools")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::as_slice);
+            let frame = JinjaChatFrame {
+                tokenizer: &tokenizer,
+                template,
+                system: None,
+                user: "",
+                enable_thinking: case
+                    .get("enable_thinking")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                bos_token: Some("<bos>"),
+            };
+            let rendered = frame
+                .render_messages_with_generation_prompt(
+                    &messages,
+                    tools,
+                    None,
+                    case["add_generation_prompt"].as_bool().unwrap(),
+                )
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(
+                rendered,
+                expected["cases"][name]["rendered"].as_str().unwrap(),
+                "fixture {name}"
+            );
+        }
     }
 }

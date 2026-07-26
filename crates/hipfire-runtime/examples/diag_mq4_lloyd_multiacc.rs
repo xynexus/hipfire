@@ -33,8 +33,8 @@
 //! Reports: max-abs error, top-K rows by |err|, and for those rows the
 //! codebook span + index histogram so we can spot what triggers the drift.
 
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_rdna::Gpu;
+use hipfire_runtime::hfq::HfqFile;
 use std::path::Path;
 
 fn f16_to_f32(bits: u16) -> f32 {

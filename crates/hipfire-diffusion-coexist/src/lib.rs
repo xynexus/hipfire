@@ -15,12 +15,12 @@
 //! (the pipeline reads them); this crate consumes them to emit `.hfq` artifacts.
 
 use hipfire_diffusion::{
-    inspect_hfq, DiffusionBatchMetadata, DiffusionComponentMetadata, DiffusionHfqMetadata,
-    DiffusionModelSummary, DiffusionPipelineMetadata, DiffusionQuantizationMetadata,
-    DiffusionTensorRole, DiffusionTokenizerMetadata, DIFFUSION_ARTIFACT_KIND,
-    DIFFUSION_SCHEMA_VERSION, HFQ_ARCH_DIFFUSION, QT_DIFFUSION_JSON, QT_DIFFUSION_SOURCE_WEIGHTS,
-    QT_DIFFUSION_TENSOR_BF16, QT_DIFFUSION_TENSOR_F16, QT_DIFFUSION_TENSOR_F32,
-    QT_DIFFUSION_TOKENIZER,
+    diffusion_arch_id_for_metadata, inspect_hfq, DiffusionBatchMetadata,
+    DiffusionComponentMetadata, DiffusionHfqMetadata, DiffusionModelSummary,
+    DiffusionPipelineMetadata, DiffusionQuantizationMetadata, DiffusionTensorRole,
+    DiffusionTokenizerMetadata, DIFFUSION_ARTIFACT_KIND, DIFFUSION_SCHEMA_VERSION,
+    QT_DIFFUSION_JSON, QT_DIFFUSION_SOURCE_WEIGHTS, QT_DIFFUSION_TENSOR_BF16,
+    QT_DIFFUSION_TENSOR_F16, QT_DIFFUSION_TENSOR_F32, QT_DIFFUSION_TOKENIZER,
 };
 use hipfire_runtime::hfq::{write_hfqm_package_streaming, HfqStreamEntry};
 use serde_json::{json, Value};
@@ -38,13 +38,189 @@ pub struct DiffusersImportOptions {
     pub metadata_only: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct RealesrganImportOptions {
+    pub source: PathBuf,
+    pub output: PathBuf,
+    pub model_name: Option<String>,
+}
+
+/// RRDBNet topology inferred from a RealESRGAN checkpoint, written into the
+/// output `.hfq` metadata and returned to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealesrganImportSummary {
+    pub scale: u32,
+    pub num_block: u32,
+    pub num_feat: u32,
+    pub num_grow_ch: u32,
+    pub num_in_ch: u32,
+    pub num_out_ch: u32,
+}
+
+/// Import a RealESRGAN / basicsr **RRDBNet** super-resolution checkpoint
+/// (`.pth`) to a hipfire `.hfq` sidecar for the MrFlow staged-sampling
+/// super-resolution stage. The basicsr key names (`conv_first`,
+/// `body.{i}.rdb{1,2,3}.conv{1..5}`, `conv_body`, `conv_up1/2`, `conv_hr`,
+/// `conv_last`) are already what `SuperResRrdbNet::from_hfq` consumes, so tensors
+/// pass through under their own names; only the topology metadata is inferred.
+///
+/// The output scale is `4 / r`, where `r` is the input pixel-unshuffle factor
+/// recovered from `conv_first`'s input channels (`num_in_ch * r*r`): the two
+/// fixed upsample stages give x4, and scale-2/scale-1 nets pre-unshuffle by 2/4.
+pub fn import_realesrgan_to_hfq(
+    options: RealesrganImportOptions,
+) -> anyhow::Result<RealesrganImportSummary> {
+    let source = options.source.canonicalize()?;
+    let tensors = parse_pytorch_state_dict(&source)?;
+    if tensors.is_empty() {
+        anyhow::bail!("RealESRGAN checkpoint {source:?} has no tensors");
+    }
+
+    let find = |name: &str| {
+        tensors
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| anyhow::anyhow!("checkpoint missing {name:?}; not a RRDBNet checkpoint"))
+    };
+    let conv_first = find("conv_first.weight")?;
+    let conv_last = find("conv_last.weight")?;
+    let rdb_conv1 = find("body.0.rdb1.conv1.weight")?;
+    if conv_first.shape.len() != 4 || conv_last.shape.len() != 4 {
+        anyhow::bail!("RRDBNet conv weights must be 4-D NCHW");
+    }
+    let num_feat = conv_first.shape[0];
+    let conv_first_in = conv_first.shape[1];
+    let num_out_ch = conv_last.shape[0];
+    // RealESRGAN is symmetric RGB; use out channels as the pre-unshuffle input
+    // channel count to recover the unshuffle factor.
+    let num_in_ch = num_out_ch;
+    if num_in_ch == 0 || conv_first_in % num_in_ch != 0 {
+        anyhow::bail!(
+            "conv_first input channels {conv_first_in} not a multiple of num_in_ch {num_in_ch}"
+        );
+    }
+    let r_squared = conv_first_in / num_in_ch;
+    let r = (r_squared as f64).sqrt().round() as u32;
+    if r == 0 || r * r != r_squared || !matches!(r, 1 | 2 | 4) {
+        anyhow::bail!(
+            "conv_first input channels {conv_first_in} imply an unsupported unshuffle factor"
+        );
+    }
+    let scale = 4 / r; // r=2 -> scale 2, r=4 -> scale 1, r=1 -> scale 4
+    let num_grow_ch = rdb_conv1.shape[0];
+    let num_block = tensors
+        .iter()
+        .filter_map(|t| {
+            t.name
+                .strip_prefix("body.")
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|idx| idx.parse::<u32>().ok())
+        })
+        .max()
+        .map(|max_idx| max_idx + 1)
+        .ok_or_else(|| anyhow::anyhow!("checkpoint has no body.N RRDB blocks"))?;
+
+    let summary = RealesrganImportSummary {
+        scale,
+        num_block,
+        num_feat,
+        num_grow_ch,
+        num_in_ch,
+        num_out_ch,
+    };
+
+    let model_name = options.model_name.clone().unwrap_or_else(|| {
+        source
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("RealESRGAN")
+            .to_string()
+    });
+    let metadata = json!({
+        "kind": "realesrgan_rrdbnet",
+        "model_name": model_name,
+        "scale": scale,
+        "num_block": num_block,
+        "num_feat": num_feat,
+        "num_grow_ch": num_grow_ch,
+        "num_in_ch": num_in_ch,
+        "num_out_ch": num_out_ch,
+        "tensor_count": tensors.len(),
+    });
+
+    let mut entries = Vec::with_capacity(tensors.len());
+    for tensor in &tensors {
+        let source_entry = if pytorch_tensor_is_contiguous(&tensor.shape, &tensor.stride) {
+            DiffusionImportSource::ZipMember {
+                archive_path: source.clone(),
+                member_name: tensor.member_name.clone(),
+            }
+        } else {
+            let archive = MiniZipArchive::open(&source)?;
+            let storage = archive.read_entry(&tensor.member_name)?;
+            let data = reorder_pytorch_storage_to_contiguous(
+                &storage,
+                &tensor.shape,
+                &tensor.stride,
+                tensor.storage_offset,
+                pytorch_dtype_elem_size(&tensor.dtype),
+            )?;
+            DiffusionImportSource::Inline(data)
+        };
+        entries.push(DiffusionImportEntry {
+            name: tensor.name.clone(),
+            quant_type: tensor.quant_type,
+            shape: tensor.shape.clone(),
+            group_size: 0,
+            source: source_entry,
+        });
+    }
+
+    write_import_entries_to_hfq(&options.output, &metadata.to_string(), &entries)?;
+    Ok(summary)
+}
+
 pub fn import_diffusers_to_hfq(
     options: DiffusersImportOptions,
 ) -> anyhow::Result<DiffusionModelSummary> {
-    let source = options.source.canonicalize()?;
+    // Preserve a checkpoint leaf symlink. Hugging Face snapshots symlink each
+    // named file to a content-addressed blob; resolving the leaf loses both the
+    // `.safetensors` extension and the sibling component directories needed by
+    // native FLUX.2 imports. Canonicalizing only the parent still gives an
+    // absolute, normalized path without discarding that snapshot context.
+    let source = if options.source.is_file() {
+        let file_name = options.source.file_name().ok_or_else(|| {
+            anyhow::anyhow!("checkpoint path {:?} has no file name", options.source)
+        })?;
+        let parent = options.source.parent().unwrap_or_else(|| Path::new("."));
+        parent.canonicalize()?.join(file_name)
+    } else {
+        options.source.canonicalize()?
+    };
     if source.is_file() {
         if options.metadata_only {
             anyhow::bail!("--metadata-only is only supported for Diffusers snapshot directories");
+        }
+        if source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("safetensors"))
+        {
+            let tensors = parse_safetensors_state_dict(&source)?;
+            if tensors.iter().any(|tensor| {
+                tensor.name == "img_in.weight"
+                    && tensors
+                        .iter()
+                        .any(|other| other.name.starts_with("double_blocks."))
+            }) {
+                return import_flux2_native_single_file_to_hfq(
+                    source,
+                    options.output,
+                    options.model_name,
+                    options.max_batch,
+                    tensors,
+                );
+            }
         }
         return import_single_file_checkpoint_to_hfq(
             source,
@@ -60,6 +236,27 @@ pub fn import_diffusers_to_hfq(
         .and_then(Value::as_str)
         .unwrap_or("DiffusionPipeline")
         .to_string();
+    let is_flux2 = matches!(
+        class_name.as_str(),
+        "Flux2KleinPipeline" | "SEFIInferencePipeline"
+    );
+    let is_sefi = class_name == "SEFIInferencePipeline";
+    let sefi = if is_sefi {
+        Some(read_sefi_import_config(&source.join("sefi_config.yaml"))?)
+    } else {
+        None
+    };
+    let text_encoder_dir = model_component_dir(&source, &model_index, "text_encoder");
+    let tokenizer_dir = if is_sefi {
+        text_encoder_dir.clone()
+    } else {
+        source.join("tokenizer")
+    };
+    let mut transformer_config =
+        read_json(source.join("transformer/config.json")).unwrap_or_else(|_| json!({}));
+    if let Some(sefi) = sefi.as_ref() {
+        apply_sefi_transformer_overrides(&mut transformer_config, sefi)?;
+    }
 
     let mut entries = Vec::new();
     let mut components = BTreeMap::new();
@@ -73,8 +270,16 @@ pub fn import_diffusers_to_hfq(
         QT_DIFFUSION_JSON,
         source.join("model_index.json"),
     )?;
-    add_component(
-        &source,
+    if is_sefi {
+        push_import_file_entry(
+            &mut entries,
+            "diffusers/sefi_config.yaml",
+            QT_DIFFUSION_JSON,
+            source.join("sefi_config.yaml"),
+        )?;
+    }
+    add_component_from_dir(
+        &text_encoder_dir,
         &mut entries,
         &mut components,
         "text_encoder",
@@ -87,6 +292,12 @@ pub fn import_diffusers_to_hfq(
         } else {
             &[]
         },
+        if is_flux2 {
+            qwen3_text_tensor_name
+        } else {
+            identity_tensor_name
+        },
+        None,
     )?;
     add_component(
         &source,
@@ -118,8 +329,8 @@ pub fn import_diffusers_to_hfq(
             &[]
         },
     )?;
-    add_component(
-        &source,
+    add_component_from_dir(
+        &source.join("transformer"),
         &mut entries,
         &mut components,
         "transformer",
@@ -132,6 +343,12 @@ pub fn import_diffusers_to_hfq(
         } else {
             &[]
         },
+        if is_flux2 {
+            flux2_transformer_tensor_name
+        } else {
+            identity_tensor_name
+        },
+        is_sefi.then_some(&transformer_config),
     )?;
     add_component(
         &source,
@@ -162,7 +379,7 @@ pub fn import_diffusers_to_hfq(
         "chat_template.jinja",
     ];
     for name in TOKENIZER_FILES {
-        let path = source.join("tokenizer").join(name);
+        let path = tokenizer_dir.join(name);
         if path.is_file() {
             let entry_name = format!("tokenizer/{name}");
             push_import_file_entry(&mut entries, &entry_name, QT_DIFFUSION_TOKENIZER, path)?;
@@ -177,13 +394,22 @@ pub fn import_diffusers_to_hfq(
             tokenizer_2_entries.push(entry_name);
         }
     }
-    let (tokenizer_kind, tokenizer_max_length) = tokenizer_descriptor(&source.join("tokenizer"));
+    let (tokenizer_kind, discovered_tokenizer_max_length) = tokenizer_descriptor(&tokenizer_dir);
+    // Qwen tokenizer configs advertise the language model's generic context
+    // window (131k/262k), not the image pipeline's fixed conditioning length.
+    // Persist the model-family contract so stale artifacts cannot accidentally
+    // allocate enormous padded text tensors at runtime.
+    let tokenizer_max_length = if is_sefi {
+        Some(1024)
+    } else if is_flux2 {
+        Some(512)
+    } else {
+        discovered_tokenizer_max_length
+    };
     let (tokenizer_2_kind, tokenizer_2_max_length) =
         tokenizer_descriptor(&source.join("tokenizer_2"));
 
     let unet_config = read_json(source.join("unet/config.json")).unwrap_or_else(|_| json!({}));
-    let transformer_config =
-        read_json(source.join("transformer/config.json")).unwrap_or_else(|_| json!({}));
     let vae_config = read_json(source.join("vae/config.json")).unwrap_or_else(|_| json!({}));
     // Latent channels = the VAE latent space (what the scheduler denoises).
     // Prefer the VAE's own channel count: for patchified DiTs the transformer
@@ -191,22 +417,27 @@ pub fn import_diffusers_to_hfq(
     // 2x2 patch), and for inpaint UNets `in_channels` folds in mask/masked-latent
     // concat, so the denoiser input width is not the latent width. Fall back to
     // the denoiser channels only when the VAE config lacks a latent-channel field.
-    let latent_channels = vae_config
-        .get("latent_channels")
-        .and_then(Value::as_u64)
-        .or_else(|| vae_config.get("z_dim").and_then(Value::as_u64))
-        .or_else(|| unet_config.get("in_channels").and_then(Value::as_u64))
-        .or_else(|| {
-            transformer_config
-                .get("out_channels")
-                .and_then(Value::as_u64)
-        })
-        .or_else(|| {
+    let latent_channels = (is_flux2
+        .then(|| {
             transformer_config
                 .get("in_channels")
                 .and_then(Value::as_u64)
         })
-        .map(|value| value as u32);
+        .flatten())
+    .or_else(|| vae_config.get("latent_channels").and_then(Value::as_u64))
+    .or_else(|| vae_config.get("z_dim").and_then(Value::as_u64))
+    .or_else(|| unet_config.get("in_channels").and_then(Value::as_u64))
+    .or_else(|| {
+        transformer_config
+            .get("out_channels")
+            .and_then(Value::as_u64)
+    })
+    .or_else(|| {
+        transformer_config
+            .get("in_channels")
+            .and_then(Value::as_u64)
+    })
+    .map(|value| value as u32);
     let latent_size = unet_config
         .get("sample_size")
         .and_then(Value::as_u64)
@@ -227,12 +458,18 @@ pub fn import_diffusers_to_hfq(
         pipeline: DiffusionPipelineMetadata {
             class_name,
             source: source.to_string_lossy().into_owned(),
+            source_revision: huggingface_snapshot_revision(&source),
             model_name,
             latent_channels,
             latent_height: latent_size,
             latent_width: latent_size,
             supported_widths: Vec::new(),
             supported_heights: Vec::new(),
+            sefi: is_sefi,
+            semantic_channels: sefi.as_ref().map(|value| value.semantic_channels),
+            texture_channels: sefi.as_ref().map(|value| value.texture_channels),
+            delta_t: sefi.as_ref().map(|value| value.delta_t),
+            ..DiffusionPipelineMetadata::default()
         },
         tokenizer: DiffusionTokenizerMetadata {
             kind: tokenizer_kind,
@@ -264,6 +501,359 @@ pub fn import_diffusers_to_hfq(
     }
     write_import_entries_to_hfq(&output, &metadata_json, &entries)?;
     inspect_hfq(output).map_err(anyhow::Error::from)
+}
+
+fn import_flux2_native_single_file_to_hfq(
+    source: PathBuf,
+    output: PathBuf,
+    model_name: Option<String>,
+    max_batch: u32,
+    tensors: Vec<SafetensorsTensorEntry>,
+) -> anyhow::Result<DiffusionModelSummary> {
+    let root = source
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("FLUX.2 single file has no parent directory"))?;
+    let model_index = read_json(root.join("model_index.json"))?;
+    let mut entries = Vec::new();
+    let mut components = BTreeMap::new();
+    let mut tokenizer_entries = Vec::new();
+
+    push_import_file_entry(
+        &mut entries,
+        "diffusers/model_index.json",
+        QT_DIFFUSION_JSON,
+        root.join("model_index.json"),
+    )?;
+    add_component_from_dir(
+        &root.join("text_encoder"),
+        &mut entries,
+        &mut components,
+        "text_encoder",
+        &["model.safetensors", "pytorch_model.safetensors"],
+        qwen3_text_tensor_name,
+        None,
+    )?;
+    add_component(
+        root,
+        &mut entries,
+        &mut components,
+        "vae",
+        &["diffusion_pytorch_model.safetensors"],
+    )?;
+    add_component(root, &mut entries, &mut components, "scheduler", &[])?;
+
+    let transformer_config = read_json(root.join("transformer/config.json"))?;
+    let transformer_config_entry = "transformer/config.json".to_string();
+    push_import_file_entry(
+        &mut entries,
+        &transformer_config_entry,
+        QT_DIFFUSION_JSON,
+        root.join("transformer/config.json"),
+    )?;
+    let canonical_tensors = canonicalize_flux2_native_tensors(tensors)?;
+    let mut transformer = DiffusionComponentMetadata {
+        class_name: Some("Flux2Transformer2DModel".to_string()),
+        config_entry: Some(transformer_config_entry),
+        ..DiffusionComponentMetadata::default()
+    };
+    append_safetensors_component_entries(
+        &mut entries,
+        &mut transformer,
+        "transformer",
+        canonical_tensors,
+    );
+    components.insert("transformer".to_string(), transformer);
+
+    add_tokenizer_dir(
+        &root.join("tokenizer"),
+        "tokenizer",
+        &mut entries,
+        &mut tokenizer_entries,
+    )?;
+    let (tokenizer_kind, tokenizer_max_length) = tokenizer_descriptor(&root.join("tokenizer"));
+    let latent_channels = transformer_config
+        .get("in_channels")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    let model_name = model_name
+        .or_else(|| {
+            source
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "FLUX.2".to_string());
+    let class_name = model_index
+        .get("_class_name")
+        .and_then(Value::as_str)
+        .unwrap_or("Flux2KleinPipeline")
+        .to_string();
+    let metadata = DiffusionHfqMetadata {
+        artifact_kind: DIFFUSION_ARTIFACT_KIND.to_string(),
+        schema_version: DIFFUSION_SCHEMA_VERSION,
+        pipeline: DiffusionPipelineMetadata {
+            class_name,
+            source: source.to_string_lossy().into_owned(),
+            source_revision: huggingface_snapshot_revision(&source),
+            model_name,
+            latent_channels,
+            ..DiffusionPipelineMetadata::default()
+        },
+        tokenizer: DiffusionTokenizerMetadata {
+            kind: tokenizer_kind,
+            max_length: tokenizer_max_length,
+            entries: tokenizer_entries,
+        },
+        tokenizer_2: None,
+        batch: DiffusionBatchMetadata {
+            max_batch: max_batch.max(1),
+            batched_runtime: true,
+        },
+        quantization: DiffusionQuantizationMetadata::default(),
+        components,
+    };
+    let metadata_json = serde_json::to_string_pretty(&metadata)?;
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_import_entries_to_hfq(&output, &metadata_json, &entries)?;
+    inspect_hfq(output).map_err(anyhow::Error::from)
+}
+
+fn append_safetensors_component_entries(
+    entries: &mut Vec<DiffusionImportEntry>,
+    metadata: &mut DiffusionComponentMetadata,
+    component: &str,
+    tensors: Vec<SafetensorsTensorEntry>,
+) {
+    for tensor in tensors {
+        let entry_name = format!("{component}/tensors/{}", tensor.name);
+        metadata.tensor_roles.push(DiffusionTensorRole {
+            role: tensor.name,
+            entry: entry_name.clone(),
+            dtype: tensor.dtype,
+            quant_format: None,
+        });
+        metadata.weight_entries.push(entry_name.clone());
+        entries.push(DiffusionImportEntry {
+            name: entry_name,
+            quant_type: tensor.quant_type,
+            shape: tensor.shape,
+            group_size: 0,
+            source: DiffusionImportSource::FileSlice {
+                path: tensor.source_path,
+                offset: tensor.data_offset,
+                len: tensor.data_len,
+            },
+        });
+    }
+}
+
+fn add_tokenizer_dir(
+    tokenizer_dir: &Path,
+    component: &str,
+    entries: &mut Vec<DiffusionImportEntry>,
+    tokenizer_entries: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    const TOKENIZER_FILES: [&str; 6] = [
+        "vocab.json",
+        "merges.txt",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+    ];
+    for name in TOKENIZER_FILES {
+        let path = tokenizer_dir.join(name);
+        if path.is_file() {
+            let entry_name = format!("{component}/{name}");
+            push_import_file_entry(entries, &entry_name, QT_DIFFUSION_TOKENIZER, path)?;
+            tokenizer_entries.push(entry_name);
+        }
+    }
+    Ok(())
+}
+
+fn split_flux2_qkv(
+    tensor: SafetensorsTensorEntry,
+    names: [String; 3],
+) -> anyhow::Result<Vec<SafetensorsTensorEntry>> {
+    if tensor.shape.len() != 2 || tensor.shape[0] % 3 != 0 || tensor.data_len % 3 != 0 {
+        anyhow::bail!(
+            "FLUX.2 fused QKV tensor {:?} has invalid shape {:?} or byte length {}",
+            tensor.name,
+            tensor.shape,
+            tensor.data_len
+        );
+    }
+    let rows = tensor.shape[0] / 3;
+    let chunk_len = tensor.data_len / 3;
+    Ok(names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let mut split = tensor.clone();
+            split.name = name;
+            split.shape[0] = rows;
+            split.data_offset += chunk_len * index as u64;
+            split.data_len = chunk_len;
+            split
+        })
+        .collect())
+}
+
+fn split_flux2_final_norm(
+    tensor: SafetensorsTensorEntry,
+    first_name: String,
+    second_name: String,
+) -> anyhow::Result<Vec<SafetensorsTensorEntry>> {
+    if tensor.shape.len() != 2 || tensor.shape[0] % 2 != 0 || tensor.data_len % 2 != 0 {
+        anyhow::bail!(
+            "FLUX.2 final adaLN tensor {:?} has invalid shape {:?} or byte length {}",
+            tensor.name,
+            tensor.shape,
+            tensor.data_len
+        );
+    }
+    let rows = tensor.shape[0] / 2;
+    let chunk_len = tensor.data_len / 2;
+    Ok([first_name, second_name]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let mut split = tensor.clone();
+            split.name = name;
+            split.shape[0] = rows;
+            split.data_offset += chunk_len * index as u64;
+            split.data_len = chunk_len;
+            split
+        })
+        .collect())
+}
+
+fn canonicalize_flux2_native_tensors(
+    tensors: Vec<SafetensorsTensorEntry>,
+) -> anyhow::Result<Vec<SafetensorsTensorEntry>> {
+    let mut canonical = Vec::with_capacity(tensors.len() + 64);
+    for mut tensor in tensors {
+        let name = tensor.name.as_str();
+        let mapped = match name {
+            "img_in.weight" => "x_embedder.weight".to_string(),
+            "txt_in.weight" => "context_embedder.weight".to_string(),
+            "time_in.in_layer.weight" => {
+                "time_guidance_embed.timestep_embedder.linear_1.weight".to_string()
+            }
+            "time_in.out_layer.weight" => {
+                "time_guidance_embed.timestep_embedder.linear_2.weight".to_string()
+            }
+            "double_stream_modulation_img.lin.weight" => {
+                "double_stream_modulation_img.linear.weight".to_string()
+            }
+            "double_stream_modulation_txt.lin.weight" => {
+                "double_stream_modulation_txt.linear.weight".to_string()
+            }
+            "single_stream_modulation.lin.weight" => {
+                "single_stream_modulation.linear.weight".to_string()
+            }
+            "final_layer.adaLN_modulation.1.weight" => {
+                // BFL native publishes [shift, scale]. Canonical HFQ names the
+                // two semantics explicitly so Diffusers' opposite row order
+                // cannot silently change the forward.
+                canonical.extend(split_flux2_final_norm(
+                    tensor,
+                    "norm_out.shift.weight".to_string(),
+                    "norm_out.scale.weight".to_string(),
+                )?);
+                continue;
+            }
+            "final_layer.linear.weight" => "proj_out.weight".to_string(),
+            _ => {
+                if let Some((index, suffix)) = flux2_native_block_suffix(name, "double_blocks.") {
+                    let prefix = format!("transformer_blocks.{index}");
+                    match suffix {
+                        "img_attn.qkv.weight" => {
+                            canonical.extend(split_flux2_qkv(
+                                tensor,
+                                [
+                                    format!("{prefix}.attn.to_q.weight"),
+                                    format!("{prefix}.attn.to_k.weight"),
+                                    format!("{prefix}.attn.to_v.weight"),
+                                ],
+                            )?);
+                            continue;
+                        }
+                        "txt_attn.qkv.weight" => {
+                            canonical.extend(split_flux2_qkv(
+                                tensor,
+                                [
+                                    format!("{prefix}.attn.add_q_proj.weight"),
+                                    format!("{prefix}.attn.add_k_proj.weight"),
+                                    format!("{prefix}.attn.add_v_proj.weight"),
+                                ],
+                            )?);
+                            continue;
+                        }
+                        "img_attn.proj.weight" => format!("{prefix}.attn.to_out.0.weight"),
+                        "txt_attn.proj.weight" => format!("{prefix}.attn.to_add_out.weight"),
+                        "img_attn.norm.query_norm.scale" => {
+                            format!("{prefix}.attn.norm_q.weight")
+                        }
+                        "img_attn.norm.key_norm.scale" => {
+                            format!("{prefix}.attn.norm_k.weight")
+                        }
+                        "txt_attn.norm.query_norm.scale" => {
+                            format!("{prefix}.attn.norm_added_q.weight")
+                        }
+                        "txt_attn.norm.key_norm.scale" => {
+                            format!("{prefix}.attn.norm_added_k.weight")
+                        }
+                        "img_mlp.0.weight" => format!("{prefix}.ff.linear_in.weight"),
+                        "img_mlp.2.weight" => format!("{prefix}.ff.linear_out.weight"),
+                        "txt_mlp.0.weight" => format!("{prefix}.ff_context.linear_in.weight"),
+                        "txt_mlp.2.weight" => format!("{prefix}.ff_context.linear_out.weight"),
+                        _ => anyhow::bail!("unsupported FLUX.2 native tensor {name:?}"),
+                    }
+                } else if let Some((index, suffix)) =
+                    flux2_native_block_suffix(name, "single_blocks.")
+                {
+                    let prefix = format!("single_transformer_blocks.{index}.attn");
+                    match suffix {
+                        "linear1.weight" => format!("{prefix}.to_qkv_mlp_proj.weight"),
+                        "linear2.weight" => format!("{prefix}.to_out.weight"),
+                        "norm.query_norm.scale" => format!("{prefix}.norm_q.weight"),
+                        "norm.key_norm.scale" => format!("{prefix}.norm_k.weight"),
+                        _ => anyhow::bail!("unsupported FLUX.2 native tensor {name:?}"),
+                    }
+                } else {
+                    anyhow::bail!("unsupported FLUX.2 native tensor {name:?}")
+                }
+            }
+        };
+        tensor.name = mapped;
+        canonical.push(tensor);
+    }
+    canonical.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(canonical)
+}
+
+fn flux2_native_block_suffix<'a>(name: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
+    let rest = name.strip_prefix(prefix)?;
+    let (index, suffix) = rest.split_once('.')?;
+    index.parse::<u32>().ok()?;
+    Some((index, suffix))
+}
+
+fn huggingface_snapshot_revision(path: &Path) -> Option<String> {
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        if component.as_os_str() == "snapshots" {
+            return components
+                .next()
+                .and_then(|revision| revision.as_os_str().to_str())
+                .map(str::to_string);
+        }
+    }
+    None
 }
 
 fn import_single_file_checkpoint_to_hfq(
@@ -386,6 +976,7 @@ fn import_single_file_checkpoint_to_hfq(
             latent_width: None,
             supported_widths: Vec::new(),
             supported_heights: Vec::new(),
+            ..DiffusionPipelineMetadata::default()
         },
         tokenizer: DiffusionTokenizerMetadata {
             kind: "clip-bpe".to_string(),
@@ -905,6 +1496,125 @@ fn tokenizer_descriptor(dir: &Path) -> (String, Option<u32>) {
     (kind, max_length)
 }
 
+fn model_component_dir(source: &Path, model_index: &Value, component: &str) -> PathBuf {
+    model_index
+        .get(component)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| source.join(value))
+        .unwrap_or_else(|| source.join(component))
+}
+
+fn flux2_transformer_tensor_name(name: &str) -> Option<String> {
+    Some(name.strip_prefix("backbone.").unwrap_or(name).to_string())
+}
+
+fn qwen3_text_tensor_name(name: &str) -> Option<String> {
+    if let Some(name) = name.strip_prefix("model.language_model.") {
+        return Some(format!("language_model.{name}"));
+    }
+    if let Some(name) = name.strip_prefix("language_model.") {
+        return Some(format!("language_model.{name}"));
+    }
+    if let Some(name) = name.strip_prefix("model.") {
+        if name.starts_with("embed_tokens.")
+            || name.starts_with("layers.")
+            || name.starts_with("norm.")
+        {
+            return Some(format!("language_model.{name}"));
+        }
+    }
+    // The image pipeline only needs the causal text tower. In particular, omit
+    // Qwen3-VL visual weights and the tied generation head from the HFQ artifact.
+    None
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SeFiImportConfig {
+    transformer_scale: String,
+    semantic_channels: u32,
+    texture_channels: u32,
+    delta_t: f32,
+}
+
+fn read_sefi_import_config(path: &Path) -> anyhow::Result<SeFiImportConfig> {
+    let text = fs::read_to_string(path)?;
+    let scalar = |key: &str| -> Option<String> {
+        text.lines().find_map(|line| {
+            let line = line.trim();
+            let (found, value) = line.split_once(':')?;
+            (found.trim() == key).then(|| value.trim().trim_matches('"').to_string())
+        })
+    };
+    let transformer_scale = scalar("transformer_scale")
+        .ok_or_else(|| anyhow::anyhow!("SeFi config is missing model.transformer_scale"))?;
+    let semantic_channels = scalar("semantic_channels")
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("SeFi config is missing model.semantic_channels"))?;
+    let delta_t_min: f32 = scalar("delta_t_min")
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("SeFi config is missing training.sefi.delta_t_min"))?;
+    let delta_t: f32 = scalar("delta_t_max")
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("SeFi config is missing training.sefi.delta_t_max"))?;
+    if (delta_t_min - delta_t).abs() > f32::EPSILON {
+        anyhow::bail!(
+            "SeFi inference requires a fixed delta_t for canonical metadata; training range is [{delta_t_min}, {delta_t}]"
+        );
+    }
+    let vae = read_json(
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("vae/config.json"),
+    )?;
+    let latent_channels = vae
+        .get("latent_channels")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("SeFi VAE config is missing latent_channels"))?;
+    let patch_size = vae
+        .get("patch_size")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_u64).product::<u64>())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    let texture_channels = latent_channels
+        .checked_mul(patch_size)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| anyhow::anyhow!("SeFi texture channel count overflows u32"))?;
+    Ok(SeFiImportConfig {
+        transformer_scale,
+        semantic_channels,
+        texture_channels,
+        delta_t,
+    })
+}
+
+fn apply_sefi_transformer_overrides(
+    config: &mut Value,
+    sefi: &SeFiImportConfig,
+) -> anyhow::Result<()> {
+    let (heads, double_layers, single_layers, joint_attention_dim) =
+        match sefi.transformer_scale.as_str() {
+            "2b" => (20, 4, 16, 6144),
+            other => anyhow::bail!("unsupported SeFi transformer_scale {other:?}"),
+        };
+    let total_channels = sefi
+        .semantic_channels
+        .checked_add(sefi.texture_channels)
+        .ok_or_else(|| anyhow::anyhow!("SeFi total channel count overflows u32"))?;
+    let object = config
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("SeFi transformer config is not a JSON object"))?;
+    object.insert("in_channels".into(), json!(total_channels));
+    object.insert("out_channels".into(), json!(total_channels));
+    object.insert("num_attention_heads".into(), json!(heads));
+    object.insert("num_layers".into(), json!(double_layers));
+    object.insert("num_single_layers".into(), json!(single_layers));
+    object.insert("joint_attention_dim".into(), json!(joint_attention_dim));
+    object.insert("guidance_embeds".into(), json!(false));
+    Ok(())
+}
+
 fn add_component(
     source: &Path,
     entries: &mut Vec<DiffusionImportEntry>,
@@ -912,7 +1622,58 @@ fn add_component(
     component: &str,
     weight_files: &[&str],
 ) -> anyhow::Result<()> {
-    let component_dir = source.join(component);
+    add_component_from_dir(
+        &source.join(component),
+        entries,
+        components,
+        component,
+        weight_files,
+        identity_tensor_name,
+        None,
+    )
+}
+
+type TensorNameFilter = fn(&str) -> Option<String>;
+
+fn identity_tensor_name(name: &str) -> Option<String> {
+    Some(name.to_string())
+}
+
+fn canonicalize_filtered_safetensors(
+    tensors: Vec<SafetensorsTensorEntry>,
+    tensor_name_filter: TensorNameFilter,
+    split_flux2_norm_out: bool,
+) -> anyhow::Result<Vec<SafetensorsTensorEntry>> {
+    let mut canonical = Vec::with_capacity(tensors.len() + usize::from(split_flux2_norm_out));
+    for mut tensor in tensors {
+        let Some(name) = tensor_name_filter(&tensor.name) else {
+            continue;
+        };
+        tensor.name = name;
+        if split_flux2_norm_out && tensor.name == "norm_out.linear.weight" {
+            // Diffusers/SeFi publishes [scale, shift], the inverse of BFL
+            // native. Split by meaning while the file slices are still cheap.
+            canonical.extend(split_flux2_final_norm(
+                tensor,
+                "norm_out.scale.weight".to_string(),
+                "norm_out.shift.weight".to_string(),
+            )?);
+        } else {
+            canonical.push(tensor);
+        }
+    }
+    Ok(canonical)
+}
+
+fn add_component_from_dir(
+    component_dir: &Path,
+    entries: &mut Vec<DiffusionImportEntry>,
+    components: &mut BTreeMap<String, DiffusionComponentMetadata>,
+    component: &str,
+    weight_files: &[&str],
+    tensor_name_filter: TensorNameFilter,
+    config_override: Option<&Value>,
+) -> anyhow::Result<()> {
     let config_name =
         if component == "scheduler" && component_dir.join("scheduler_config.json").is_file() {
             "scheduler_config.json"
@@ -923,7 +1684,9 @@ fn add_component(
     let mut metadata = DiffusionComponentMetadata::default();
     if config_path.is_file() {
         let entry_name = format!("{component}/{config_name}");
-        let config = read_json(&config_path).unwrap_or_else(|_| json!({}));
+        let config = config_override
+            .cloned()
+            .unwrap_or_else(|| read_json(&config_path).unwrap_or_else(|_| json!({})));
         // Diffusers components use `_class_name`; transformers text encoders
         // (e.g. Qwen3VLModel) declare `architectures: [..]` instead.
         metadata.class_name = config
@@ -938,7 +1701,16 @@ fn add_component(
             })
             .map(str::to_string);
         metadata.config_entry = Some(entry_name.clone());
-        push_import_file_entry(entries, &entry_name, QT_DIFFUSION_JSON, config_path)?;
+        if config_override.is_some() {
+            push_import_inline_entry(
+                entries,
+                &entry_name,
+                QT_DIFFUSION_JSON,
+                serde_json::to_vec_pretty(&config)?,
+            );
+        } else {
+            push_import_file_entry(entries, &entry_name, QT_DIFFUSION_JSON, config_path)?;
+        }
     }
     if let Some(weight_file) = weight_files
         .iter()
@@ -949,10 +1721,17 @@ fn add_component(
         let index_path = component_dir.join(&weight_file);
         match parse_sharded_safetensors_state_dict(&component_dir, &index_path) {
             Ok(tensors) if !tensors.is_empty() => {
-                for tensor in tensors {
-                    let entry_name = format!("{component}/tensors/{}", tensor.name);
+                let split_flux2_norm_out = component == "transformer"
+                    && metadata.class_name.as_deref() == Some("Flux2Transformer2DModel");
+                for tensor in canonicalize_filtered_safetensors(
+                    tensors,
+                    tensor_name_filter,
+                    split_flux2_norm_out,
+                )? {
+                    let canonical_name = tensor.name.clone();
+                    let entry_name = format!("{component}/tensors/{canonical_name}");
                     metadata.tensor_roles.push(DiffusionTensorRole {
-                        role: tensor.name.clone(),
+                        role: canonical_name,
                         entry: entry_name.clone(),
                         dtype: tensor.dtype.clone(),
                         quant_format: None,
@@ -991,10 +1770,17 @@ fn add_component(
             if weight_file.ends_with(".safetensors") {
                 match parse_safetensors_state_dict(&weight_path) {
                     Ok(tensors) if !tensors.is_empty() => {
-                        for tensor in tensors {
-                            let entry_name = format!("{component}/tensors/{}", tensor.name);
+                        let split_flux2_norm_out = component == "transformer"
+                            && metadata.class_name.as_deref() == Some("Flux2Transformer2DModel");
+                        for tensor in canonicalize_filtered_safetensors(
+                            tensors,
+                            tensor_name_filter,
+                            split_flux2_norm_out,
+                        )? {
+                            let canonical_name = tensor.name.clone();
+                            let entry_name = format!("{component}/tensors/{canonical_name}");
                             metadata.tensor_roles.push(DiffusionTensorRole {
-                                role: tensor.name.clone(),
+                                role: canonical_name,
                                 entry: entry_name.clone(),
                                 dtype: tensor.dtype.clone(),
                                 quant_format: None,
@@ -1028,9 +1814,12 @@ fn add_component(
                 match parse_pytorch_state_dict(&weight_path) {
                     Ok(tensors) if !tensors.is_empty() => {
                         for tensor in tensors {
-                            let entry_name = format!("{component}/tensors/{}", tensor.name);
+                            let Some(canonical_name) = tensor_name_filter(&tensor.name) else {
+                                continue;
+                            };
+                            let entry_name = format!("{component}/tensors/{canonical_name}");
                             metadata.tensor_roles.push(DiffusionTensorRole {
-                                role: tensor.name.clone(),
+                                role: canonical_name,
                                 entry: entry_name.clone(),
                                 dtype: tensor.dtype.clone(),
                                 quant_format: None,
@@ -1175,7 +1964,9 @@ fn write_import_entries_to_hfq(
         .collect::<anyhow::Result<Vec<_>>>()?;
     write_hfqm_package_streaming(
         output,
-        HFQ_ARCH_DIFFUSION,
+        // Stamp the first-class per-family diffusion arch id (falls back to the
+        // legacy generic id for families without a dedicated id).
+        diffusion_arch_id_for_metadata(metadata_json),
         metadata_json,
         &stream_entries,
         |i, writer| write_import_entry_payload(&entries[i], writer),
@@ -1304,6 +2095,13 @@ fn parse_safetensors_state_dict(path: &Path) -> anyhow::Result<Vec<SafetensorsTe
             .get("dtype")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("safetensors tensor {name:?} missing dtype"))?;
+        // PyTorch BatchNorm serializes this bookkeeping counter alongside its
+        // floating-point state. It is not consumed by inference and HFQ has no
+        // integer weight encoding; skip only this named non-weight buffer so an
+        // otherwise valid VAE is not demoted to an opaque source blob.
+        if dtype == "I64" && name.ends_with("num_batches_tracked") {
+            continue;
+        }
         let (dtype, quant_type, byte_width) = safetensors_dtype_info(dtype)
             .ok_or_else(|| anyhow::anyhow!("unsupported safetensors dtype {dtype:?}"))?;
         let shape_values = tensor

@@ -27,7 +27,7 @@ use hipfire_generate::sampler::{collect_unclosed_attractor_blocks, SamplerConfig
 use hipfire_model::ARCH_ID_LFM2_MOE;
 use hipfire_model::{
     is_qwen35_family_arch_id, ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL,
-    ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2,
+    ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H,
     ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_ZAYA,
 };
 use hipfire_prompt as prompt_frame;
@@ -44,7 +44,7 @@ use crate::evidence::{
 use crate::generate_arch::generate_lfm2moe;
 use crate::generate_arch::{
     generate_deepseek4, generate_gemma3, generate_gemma3_vl_text, generate_llama, generate_minimax,
-    generate_nemotron, generate_qwen2, generate_zaya,
+    generate_nemotron, generate_registered_backend, generate_zaya,
 };
 use crate::model::{effective_raw, LoadedModel};
 use crate::output_filter::chat_output_filter;
@@ -1504,6 +1504,7 @@ pub fn generate_multi(
     let cfg0 = SamplerConfig {
         temperature: temp,
         top_p,
+        top_k: 20,
         repeat_penalty,
         repeat_window: repeat_buf_cap,
         presence_penalty,
@@ -1695,6 +1696,7 @@ pub fn generate_multi(
                 let cfg = SamplerConfig {
                     temperature: temp,
                     top_p,
+                    top_k: 20,
                     repeat_penalty,
                     repeat_window: repeat_buf_cap,
                     presence_penalty,
@@ -1782,6 +1784,7 @@ pub fn generate_multi(
         let cfg = SamplerConfig {
             temperature: temp,
             top_p,
+            top_k: 20,
             repeat_penalty,
             repeat_window: repeat_buf_cap,
             presence_penalty,
@@ -1879,6 +1882,7 @@ pub fn generate(
     system_prompt: Option<&str>,
     temp: f32,
     top_p: f32,
+    top_k: usize,
     max_tokens: usize,
     repeat_penalty: f32,
     repeat_window: usize,
@@ -1901,6 +1905,44 @@ pub fn generate(
     // Seed the process-global CPU sampler RNG for this request. CPU fallback and
     // grammar/VL-style sampling should not inherit RNG state from prior requests.
     hipfire_runtime::sampler::reset_cpu_sampler_rng(0x13579BDF);
+
+    if m.registered_backend.is_some() {
+        // Factory-loaded text families share one prompt/render/serve path. Fast
+        // speculative and prefill-compression state is deliberately absent from
+        // this capability tier.
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            pflash_state,
+            pflash_cfg,
+            prefill_already_done,
+            prefilled_prompt_tokens,
+            think_mode,
+            evidence_dir,
+        );
+        generate_registered_backend(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            top_k,
+            max_tokens,
+            repeat_penalty,
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
+            max_think_tokens,
+            assistant_prefix,
+            tools,
+            messages_history,
+            request_stop_sequences,
+        );
+        return;
+    }
 
     // Compress runs on the PFlash drafter handle when one is set (hetero
     // sibling device), else on the target gpu. The handle is consumed at
@@ -2000,36 +2042,6 @@ pub fn generate(
             tools,
             messages_history,
             evidence_dir,
-        );
-        return;
-    }
-    if m.arch_id == ARCH_ID_QWEN2 {
-        // Silence the qwen35/llama-only params we deliberately don't
-        // honor on this path. See generate_qwen2 doc for the deferral
-        // list.
-        let _ = (
-            budget_alert_at_tok,
-            budget_alert_text,
-            max_think_tokens,
-            assistant_prefix,
-            pflash_state,
-            pflash_cfg,
-            tools,
-            messages_history,
-            prefill_already_done,
-        );
-        generate_qwen2(
-            m,
-            gpu,
-            stdout,
-            id,
-            prompt,
-            system_prompt,
-            temp,
-            top_p,
-            max_tokens,
-            repeat_penalty,
-            repeat_window,
         );
         return;
     }
@@ -2988,6 +3000,7 @@ pub fn generate(
         let cfg0 = SamplerConfig {
             temperature: temp,
             top_p,
+            top_k: 20,
             repeat_penalty,
             // Window is bounded by the GPU repeat_buf capacity. Pre-PR3 code did this
             // bound by setting `scope_start = len - repeat_buf_cap`
@@ -3269,6 +3282,7 @@ pub fn generate(
                     let cfg = SamplerConfig {
                         temperature: temp,
                         top_p,
+                        top_k: 20,
                         repeat_penalty,
                         repeat_window: repeat_buf_cap,
                         presence_penalty,
@@ -3382,6 +3396,7 @@ pub fn generate(
             let cfg = SamplerConfig {
                 temperature: temp,
                 top_p,
+                top_k: 20,
                 repeat_penalty,
                 repeat_window: repeat_buf_cap,
                 presence_penalty,

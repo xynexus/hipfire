@@ -52,8 +52,8 @@
 //!      env HIPFIRE_ALLOW_MIXED_ARCH=1 HIPFIRE_PP_LAYERS=48,16 \
 //!      ./target/release/examples/pp_boundary_microbench && hipfire gpu-lock release
 
-use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_rdna::{DType, Gpu};
+use hipfire_runtime::multi_gpu::Gpus;
 use std::time::Instant;
 
 const DIM: usize = 5120; // qwen3.6-27b hidden size

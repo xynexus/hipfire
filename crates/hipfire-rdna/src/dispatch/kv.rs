@@ -227,37 +227,19 @@ impl Gpu {
             kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
             "kv_cache_write_q8_0_batched",
         )?;
-        let mut d = dst.buf.as_ptr();
-        let mut s = src.buf.as_ptr();
-        let mut p = positions.buf.as_ptr();
-        let mut nkv = n_kv_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut bs = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut d as *mut _ as *mut c_void,
-            &mut s as *mut _ as *mut c_void,
-            &mut p as *mut _ as *mut c_void,
-            &mut nkv as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut bs as *mut _ as *mut c_void,
-        ];
+        let d = dst.buf.as_ptr();
+        let s = src.buf.as_ptr();
+        let p = positions.buf.as_ptr();
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let bs = batch_size as i32;
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "kv_cache_write_q8_0_batched",
             [total_blocks, batch_size as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(d);
-                b.push_ptr(s);
-                b.push_ptr(p);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(bs);
-                b
-            },
+            &kernargs![ptr d, ptr s, ptr p, i32 nkv, i32 hd, i32 bs],
         )
     }
     /// Write KV vector to Q8_0 quantized cache (same format as GGML Q8_0).
@@ -280,32 +262,16 @@ impl Gpu {
         let p = pos_buf.as_ptr();
         let nkv = n_kv_heads as i32;
         let hd = head_dim as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &d as *const _ as *mut c_void,
-            &s as *const _ as *mut c_void,
-            &p as *const _ as *mut c_void,
-            &nkv as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-        ];
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
         let bytes = crate::profile::kv_cache_write_q8_0_bytes(n_kv_heads, head_dim);
         let timer =
             crate::profile::begin_timer(&self.hip, "kv_write", "kv_cache_write_q8_0", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "kv_cache_write_q8_0",
             [total_blocks, 1, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(d);
-                b.push_ptr(s);
-                b.push_ptr(p);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b
-            },
+            &kernargs![ptr d, ptr s, ptr p, i32 nkv, i32 hd],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -675,43 +641,21 @@ impl Gpu {
             "kv_cache_write_asym_k_givens3_batched",
         )?;
         {
-            let mut kdp = k_dst.buf.as_ptr();
-            let mut ksp = k_src.buf.as_ptr();
-            let mut pp = positions.buf.as_ptr();
-            let mut ctp = cos_theta.buf.as_ptr();
-            let mut stp = sin_theta.buf.as_ptr();
-            let mut nkv = n_kv_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut bs = batch_size as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut kdp as *mut _ as *mut c_void,
-                &mut ksp as *mut _ as *mut c_void,
-                &mut pp as *mut _ as *mut c_void,
-                &mut ctp as *mut _ as *mut c_void,
-                &mut stp as *mut _ as *mut c_void,
-                &mut nkv as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-                &mut bs as *mut _ as *mut c_void,
-            ];
+            let kdp = k_dst.buf.as_ptr();
+            let ksp = k_src.buf.as_ptr();
+            let pp = positions.buf.as_ptr();
+            let ctp = cos_theta.buf.as_ptr();
+            let stp = sin_theta.buf.as_ptr();
+            let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32;
+            let bs = batch_size as i32;
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            self.launch_maybe_blob(
+            self.launch_kernargs(
                 "kv_cache_write_asym_k_givens3_batched",
                 [n_kv_heads as u32, batch_size as u32, 1],
                 [32, 1, 1],
                 shared_mem,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(kdp);
-                    b.push_ptr(ksp);
-                    b.push_ptr(pp);
-                    b.push_ptr(ctp);
-                    b.push_ptr(stp);
-                    b.push_i32(nkv);
-                    b.push_i32(hd);
-                    b.push_i32(bs);
-                    b
-                },
+                &kernargs![ptr kdp, ptr ksp, ptr pp, ptr ctp, ptr stp, i32 nkv, i32 hd, i32 bs],
             )?;
         }
         // V: batched Q8_0 write.
@@ -739,43 +683,21 @@ impl Gpu {
             "kv_cache_write_asym_k_fwht3_batched",
         )?;
         {
-            let mut kdp = k_dst.buf.as_ptr();
-            let mut ksp = k_src.buf.as_ptr();
-            let mut pp = positions.buf.as_ptr();
-            let mut s1p = signs1.buf.as_ptr();
-            let mut s2p = signs2.buf.as_ptr();
-            let mut nkv = n_kv_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut bs = batch_size as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut kdp as *mut _ as *mut c_void,
-                &mut ksp as *mut _ as *mut c_void,
-                &mut pp as *mut _ as *mut c_void,
-                &mut s1p as *mut _ as *mut c_void,
-                &mut s2p as *mut _ as *mut c_void,
-                &mut nkv as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-                &mut bs as *mut _ as *mut c_void,
-            ];
+            let kdp = k_dst.buf.as_ptr();
+            let ksp = k_src.buf.as_ptr();
+            let pp = positions.buf.as_ptr();
+            let s1p = signs1.buf.as_ptr();
+            let s2p = signs2.buf.as_ptr();
+            let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32;
+            let bs = batch_size as i32;
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            self.launch_maybe_blob(
+            self.launch_kernargs(
                 "kv_cache_write_asym_k_fwht3_batched",
                 [n_kv_heads as u32, batch_size as u32, 1],
                 [32, 1, 1],
                 shared_mem,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(kdp);
-                    b.push_ptr(ksp);
-                    b.push_ptr(pp);
-                    b.push_ptr(s1p);
-                    b.push_ptr(s2p);
-                    b.push_i32(nkv);
-                    b.push_i32(hd);
-                    b.push_i32(bs);
-                    b
-                },
+                &kernargs![ptr kdp, ptr ksp, ptr pp, ptr s1p, ptr s2p, i32 nkv, i32 hd, i32 bs],
             )?;
         }
         self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
@@ -1151,6 +1073,112 @@ impl Gpu {
             )
         }
     }
+    /// Quantize one token's KV vector `src` [n_kv_heads × head_dim] (head-major)
+    /// into the 8-bit hot ring at `slot`: per-head symmetric absmax int8 codes
+    /// (head-major slot-major, stride `hb`) + per-slot-per-head f32 scale. Phase 1
+    /// of the 8-bit hot tier — see kernels/src/kv_hot_quant_q8.hip.
+    pub fn kv_hot_quant_q8(
+        &mut self,
+        codes: &GpuTensor,
+        scales: &GpuTensor,
+        src: &GpuTensor,
+        slot: usize,
+        hb: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kv_hot_quant_q8",
+            kernels::KV_HOT_QUANT_Q8_SRC,
+            "kv_hot_quant_q8",
+        )?;
+        let func = &self.functions["kv_hot_quant_q8"];
+        let mut c = codes.buf.as_ptr();
+        let mut sc = scales.buf.as_ptr();
+        let mut s = src.buf.as_ptr();
+        let mut sl = slot as i32;
+        let mut h = hb as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut c as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let block = 256u32.min(head_dim as u32);
+        let shared = block * 4;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_kv_heads as u32, 1, 1],
+                [block, 1, 1],
+                shared,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Dequantize the first `n_slots` live slots of an 8-bit hot ring into a
+    /// head-major slot-major f16 tile [n_kv_heads × hb × head_dim] — exactly the
+    /// `attention_cold_slots` k_layout=2 / v_layout=2 input. Shared by the two-tier
+    /// read and by migrate (download the f16 tile → widen → compact). Tail slots
+    /// [n_slots, hb) are left untouched (the read masks by the live count).
+    /// See kernels/src/kv_hot_dequant_q8.hip.
+    pub fn kv_hot_dequant_q8(
+        &mut self,
+        codes: &GpuTensor,
+        scales: &GpuTensor,
+        out: &GpuTensor,
+        n_slots: usize,
+        hb: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        if n_slots == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kv_hot_dequant_q8",
+            kernels::KV_HOT_DEQUANT_Q8_SRC,
+            "kv_hot_dequant_q8",
+        )?;
+        let func = &self.functions["kv_hot_dequant_q8"];
+        let mut c = codes.buf.as_ptr();
+        let mut sc = scales.buf.as_ptr();
+        let mut o = out.buf.as_ptr();
+        let mut ns = n_slots as i32;
+        let mut h = hb as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut c as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let block = 256u32.min(head_dim as u32);
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_kv_heads as u32, n_slots as u32, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Write KV vector to quantized HFQ4 cache.
     pub fn kv_cache_write_q4(
         &mut self,
@@ -1212,30 +1240,15 @@ impl Gpu {
         let pos_ptr = pos_buf.as_ptr();
         let kd = kv_dim as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &dst_ptr as *const _ as *mut c_void,
-            &src_ptr as *const _ as *mut c_void,
-            &pos_ptr as *const _ as *mut c_void,
-            &kd as *const _ as *mut c_void,
-        ];
-
         let block = 256u32;
         let grid = (kv_dim as u32 + block - 1) / block;
 
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "kv_cache_write",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(dst_ptr);
-                b.push_ptr(src_ptr);
-                b.push_ptr(pos_ptr);
-                b.push_i32(kd);
-                b
-            },
+            &kernargs![ptr dst_ptr, ptr src_ptr, ptr pos_ptr, i32 kd],
         )
     }
     /// Batched F32 KV-cache write: scatter `batch_size` rows of `src`
@@ -1263,31 +1276,14 @@ impl Gpu {
         let kd = kv_dim as i32;
         let bs = batch_size as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &dst_ptr as *const _ as *mut c_void,
-            &src_ptr as *const _ as *mut c_void,
-            &pos_ptr as *const _ as *mut c_void,
-            &kd as *const _ as *mut c_void,
-            &bs as *const _ as *mut c_void,
-        ];
-
         let block = 256u32;
         let grid_x = (kv_dim as u32 + block - 1) / block;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "kv_cache_write_f32_batched",
             [grid_x, batch_size as u32, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(dst_ptr);
-                b.push_ptr(src_ptr);
-                b.push_ptr(pos_ptr);
-                b.push_i32(kd);
-                b.push_i32(bs);
-                b
-            },
+            &kernargs![ptr dst_ptr, ptr src_ptr, ptr pos_ptr, i32 kd, i32 bs],
         )
     }
     /// Routed batched F32 KV-cache write: scatter `batch_size` rows of `src`
@@ -1324,37 +1320,17 @@ impl Gpu {
         let kd = kv_dim as i32;
         let bs = batch_size as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &dst_ptrs_ptr as *const _ as *mut c_void,
-            &src_ptr as *const _ as *mut c_void,
-            &row_session_indices_ptr as *const _ as *mut c_void,
-            &pos_ptr as *const _ as *mut c_void,
-            &ptr_stride as *const _ as *mut c_void,
-            &layer as *const _ as *mut c_void,
-            &kd as *const _ as *mut c_void,
-            &bs as *const _ as *mut c_void,
-        ];
-
         let block = 256u32;
         let grid_x = (kv_dim as u32 + block - 1) / block;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "kv_cache_write_f32_routed_batched",
             [grid_x, batch_size as u32, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(dst_ptrs_ptr);
-                b.push_ptr(src_ptr);
-                b.push_ptr(row_session_indices_ptr);
-                b.push_ptr(pos_ptr);
-                b.push_i32(ptr_stride);
-                b.push_i32(layer);
-                b.push_i32(kd);
-                b.push_i32(bs);
-                b
-            },
+            &kernargs![
+                ptr dst_ptrs_ptr, ptr src_ptr, ptr row_session_indices_ptr, ptr pos_ptr,
+                i32 ptr_stride, i32 layer, i32 kd, i32 bs
+            ],
         )
     }
     /// Routed batched Q8_0 KV-cache write: quantize `batch_size` rows of
@@ -1389,37 +1365,16 @@ impl Gpu {
         let hd = head_dim as i32;
         let bs = batch_size as i32;
 
-        let mut params: Vec<*mut c_void> = vec![
-            &dst_ptrs_ptr as *const _ as *mut c_void,
-            &src_ptr as *const _ as *mut c_void,
-            &row_session_indices_ptr as *const _ as *mut c_void,
-            &pos_ptr as *const _ as *mut c_void,
-            &ptr_stride as *const _ as *mut c_void,
-            &layer as *const _ as *mut c_void,
-            &nkv as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &bs as *const _ as *mut c_void,
-        ];
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "kv_cache_write_q8_0_routed_batched",
             [total_blocks, batch_size as u32, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(dst_ptrs_ptr);
-                b.push_ptr(src_ptr);
-                b.push_ptr(row_session_indices_ptr);
-                b.push_ptr(pos_ptr);
-                b.push_i32(ptr_stride);
-                b.push_i32(layer);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(bs);
-                b
-            },
+            &kernargs![
+                ptr dst_ptrs_ptr, ptr src_ptr, ptr row_session_indices_ptr, ptr pos_ptr,
+                i32 ptr_stride, i32 layer, i32 nkv, i32 hd, i32 bs
+            ],
         )
     }
     /// KVarN tile quantizer: variance-normalize (Sinkhorn) + 4-bit affine + pack
@@ -1434,16 +1389,21 @@ impl Gpu {
         r_dim: usize,
         c_dim: usize,
         record_bytes: usize,
+        bits: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         assert!(
-            r_dim <= 256 && c_dim <= 256,
-            "kvarn_quantize_tile: r,c must be <= 256"
+            r_dim <= 512 && c_dim <= 256,
+            "kvarn_quantize_tile: r must be <= 512, c <= 256"
+        );
+        assert!(
+            matches!(bits, 2 | 4 | 8),
+            "kvarn_quantize_tile: bits must be 2, 4, or 8"
         );
         assert_eq!(
-            c_dim % 2,
+            (c_dim * bits) % 8,
             0,
-            "kvarn_quantize_tile: c_dim must be even (nibble rows)"
+            "kvarn_quantize_tile: c_dim*bits must be a multiple of 8 (rows own whole bytes)"
         );
         self.ensure_kernel(
             "kvarn_quantize_tile",
@@ -1456,6 +1416,7 @@ impl Gpu {
         let mut rd = r_dim as i32;
         let mut cd = c_dim as i32;
         let mut rb = record_bytes as i32;
+        let mut bt = bits as i32;
         let mut params: Vec<*mut c_void> = vec![
             &tp as *const _ as *mut c_void,
             &rp as *const _ as *mut c_void,
@@ -1463,6 +1424,7 @@ impl Gpu {
             &mut rd as *mut _ as *mut c_void,
             &mut cd as *mut _ as *mut c_void,
             &mut rb as *mut _ as *mut c_void,
+            &mut bt as *mut _ as *mut c_void,
         ];
         let func = &self.functions["kvarn_quantize_tile"];
         unsafe {
@@ -1665,11 +1627,15 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        bits: usize,
     ) -> HipResult<()> {
         const GROUP: usize = 128;
         let kv_dim = n_kv_heads * head_dim;
-        // kvarn_record_bytes(head_dim, GROUP), divisible by 4 → expressible as F32 elems.
-        let rec_bytes = (head_dim * GROUP).div_ceil(2) + head_dim * 2 * 2 + GROUP * 2;
+        // kvarn_record_bytes_bits(head_dim, GROUP, bits): 8/bits K codes/byte +
+        // fp16 scale_abs/zp_abs (per channel) + fp16 s_col (per token). Always a
+        // multiple of 4 → expressible as an F32-typed byte-addressed buffer.
+        let cpb = 8 / bits;
+        let rec_bytes = (head_dim * GROUP).div_ceil(cpb) + head_dim * 2 * 2 + GROUP * 2;
         let seq_len = start_pos + n;
 
         // 1. V write (Q8_0) by absolute position.
@@ -1699,7 +1665,9 @@ impl Gpu {
                 self.kvarn_gather_k_tiles(window, tiles, 1, n_kv_heads, head_dim, GROUP)?;
                 let rec_off_elems = block * n_kv_heads * rec_bytes / 4;
                 let rec_view = records.sub_offset(rec_off_elems, n_kv_heads * rec_bytes / 4);
-                self.kvarn_quantize_tile(tiles, &rec_view, n_kv_heads, head_dim, GROUP, rec_bytes)?;
+                self.kvarn_quantize_tile(
+                    tiles, &rec_view, n_kv_heads, head_dim, GROUP, rec_bytes, bits,
+                )?;
             }
         }
 
@@ -1727,6 +1695,7 @@ impl Gpu {
             block_cols,
             n_full_blocks,
             rec_bytes,
+            bits,
         )
     }
 }

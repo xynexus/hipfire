@@ -30,8 +30,19 @@ python3 scripts/astrea.py plan --model MODEL --format FORMAT --method METHOD [--
 python3 scripts/astrea.py calibrate --plan PLAN.json [--source-dir BF16_DIR] [--write-candidate] [--max-tensors N] [--tensor-filter NAME] [--workers N] --pretty [--out PATH]
 python3 scripts/astrea.py eval --plan PLAN.json [--run] --pretty [--out PATH]
 python3 scripts/astrea.py metrics --quality-json result-data.json --candidate-variant NAME [--baseline-variant NAME] [--floor-variant NAME] [--arch ARCH] [--scoring-mode MODE] [--engine-root REPO] --pretty [--out PATH]
+python3 scripts/astrea.py expert-sweep-plan --model SAFETENSORS --artifact-stem STEM --calibration-dataset CAL.txt --evaluation-dataset HELDOUT.txt --reference-model REF.hfq --output-dir DIR --evaluation-command-template 'COMMAND {candidate} {reference_model} {evaluation_dataset} {evaluation_output}' --axis minimum [--minimum-rows N] [--fixed-capture-target N] --pretty [--out PATH]
+python3 scripts/astrea.py expert-sweep-plan --model SAFETENSORS --artifact-stem STEM --calibration-dataset CAL.txt --evaluation-dataset HELDOUT.txt --reference-model REF.hfq --output-dir DIR --evaluation-command-template 'COMMAND {candidate} {reference_model} {evaluation_dataset} {evaluation_output}' --axis capture --selected-minimum N [--capture-target N] --pretty [--out PATH]
+python3 scripts/astrea.py expert-sweep-verify --plan PLAN.json [--engine-root REPO] --pretty [--out PATH]
+python3 scripts/astrea.py expert-sweep-results --plan PLAN.json --record VARIANT.json [--record VARIANT.json ...] --pretty [--out PATH]
+python3 scripts/astrea.py expert-sweep-analyze --plan PLAN.json --results RESULTS.json --pretty [--out PATH]
 python3 scripts/astrea.py policy --model MODEL --base-format FORMAT --promotion-format FORMAT (--sensitivity-json SCORES.json | --imatrix IMATRIX) --max-extra-bytes N [--method METHOD] [--objective dynamic-tensor-policy|moe-probe|model-ingress|kv-policy] [--domain weights|kv] [--model-family FAMILY] --pretty [--out PATH]
 python3 scripts/astrea.py promote --policy POLICY.json --source-dir BF16_DIR --output CANDIDATE.hfq [--max-tensors N] [--tensor-filter NAME] --pretty [--out PATH]
+python3 scripts/astrea.py latent-kv-plan --model MODEL --calibration-dataset CAL.jsonl --validation-dataset VAL.jsonl --calibration-length N --validation-length N4X --calibration-position-offset P --validation-position-offset P4X [--calibration-samples-per-stratum N] [--validation-samples-per-stratum N] --rank 32 --rank 64 --rank 96 --max-static-vs-oracle-kld-delta D --max-static-vs-oracle-ppl-ratio R --pretty [--out PATH]
+python3 scripts/astrea.py latent-kv-capture --plan PLAN.json --split calibration|validation --output-dir DIR [--threads N] --pretty [--out PATH]
+python3 scripts/astrea.py latent-kv-calibrate --plan PLAN.json --capture CALIBRATION_CAPTURE.json --output-dir DIR --pretty [--out PATH]
+python3 scripts/astrea.py latent-kv-reference --plan PLAN.json --calibration CALIBRATION.json --validation-capture VALIDATION_CAPTURE.json --output-dir DIR --pretty [--out PATH]
+python3 scripts/astrea.py latent-kv-model-eval --plan PLAN.json --calibration CALIBRATION.json --validation-capture VALIDATION_CAPTURE.json --output-dir DIR [--rank 32] [--threads N] --pretty [--out PATH]
+python3 scripts/astrea.py latent-kv-feasibility --plan PLAN.json --validation-capture VALIDATION_CAPTURE.json --output-dir DIR [--rank 32] [--threads N] --pretty [--out PATH]
 python3 scripts/astrea.py kv-profile --model MODEL [--mode q8|asym3|triattn|cask|turbo3|rotor] [--triattn PATH] [--model-family FAMILY] [--engine-root REPO] --pretty [--out PATH]
 python3 scripts/astrea.py bundle-plan --model MODEL --output MODEL.hfq [--include weights|paro|kv-policy|triattn|evidence] [--triattn PATH] [--policy-id ID] --pretty [--out PATH]
 python3 scripts/astrea.py report ARTIFACT.json ... --pretty [--out PATH]
@@ -74,7 +85,31 @@ empty.
    report above-floor KLD and recovered quantization damage percentage. Always
    pass `--engine-root` when the evaluated engine is not the checkout running
    Astrea.
-8. Run `policy` when you want an Unsloth-like dynamic quant policy. It ranks
+8. For routed-expert threshold work, run `expert-sweep-plan` before executing
+   any variant. A `minimum` plan holds the capture target fixed while sweeping
+   the low-bit eligibility floor; a `capture` plan requires the already-selected
+   floor and varies only the capture target. The planner rejects identical
+   calibration/held-out content, fingerprints both datasets and the engine,
+   emits canonical per-variant two-pass commands, and scopes non-daemon held-out
+   evaluators under the shared GPU lock. Treat the JSON as a frozen experiment
+   contract, not quality evidence. Run `expert-sweep-verify` immediately before
+   execution; it rejects plan-payload, corpus, source, reference, engine,
+   one-axis, command-binding, and output-identity drift without loading a model.
+   After every planned variant has completed, pass one measured JSON record per
+   variant to `expert-sweep-results`, then run `expert-sweep-analyze`. The result
+   builder requires finite KLD/PPL, artifact size, calibration time, reduction
+   launches, and the exact high-precision fallback set; capture-target sweeps
+   additionally require a valid `hipfire-coexistence artifact
+   compare-calibration-stability` report against the highest-cap artifact. That
+   family-neutral comparison derives a symmetric relative L2 error from every
+   routed-expert imatrix, requires matched corpus/sample/source/geometry/floor,
+   identical fallback sets, finite values, and the expected target ordering.
+   The analyzer verifies the frozen plan again, rejects non-monotonic floor
+   fallback sets or capture-sweep fallback drift, and reports quality/cost
+   deltas plus newly low-bit expert cohorts. Its
+   `complete_selection_required` status is deliberately not an automatic
+   threshold or promotion decision.
+9. Run `policy` when you want an Unsloth-like dynamic quant policy. It ranks
    tensors by sensitivity per added byte and emits a mixed-format promotion
    recipe under a size budget. Use `--objective moe-probe` for MoE models and
    `--objective model-ingress` when bringing up a new model family; these add
@@ -86,27 +121,44 @@ empty.
    automatically bundles runtime anchor projections (`q`, `qkv`, `gate`) with
    dependent projections so mixed-format candidates do not read stale normalized
    activation buffers.
-9. Run `promote` when a policy selects tensors for mixed-format promotion.
+10. Run `promote` when a policy selects tensors for mixed-format promotion.
    Today this writes selected `q8` promotions as runtime-compatible `Q8F16`
    tensor records and rebuilds the HFQ index/data payload. Use `--max-tensors`
    for smoke candidates before writing a full policy. Legacy policies are also
    expanded with required runtime anchors at write time. Re-run `metrics` after
    every promotion candidate because the policy byte model is only a selector,
    not quality evidence.
-10. Run `kv-profile` when a candidate changes KV-cache behavior or when a model
+11. Run `kv-profile` when a candidate changes KV-cache behavior or when a model
    should carry an embedded KV policy. Include at least the current baseline
    (`asym3`) and the candidates being investigated (`triattn`/`cask`,
    `turbo3`, `rotor`, or related modes). The output is the policy/evidence
    shape Atlas should join against AR and DFlash perf rows.
-11. Run `bundle-plan` when the candidate needs a future single-file model
+12. Run `bundle-plan` when the candidate needs a future single-file model
    package. The target is an HFQ package-style container with weights,
    transform metadata, KV policy, and TriAttention/CASK centers embedded inside
    the model artifact. External sidecars are not the target. Loader, daemon,
    CLI, and kernel support remain deferred runtime work until implemented.
-12. If quality improves, run Atlas AR and DFlash perf collection before any
+13. If quality improves, run Atlas AR and DFlash perf collection before any
    promotion claim.
-13. Use `report` to summarize evidence and recommend promote, reject, or
+14. Use `report` to summarize evidence and recommend promote, reject, or
    iterate.
+
+For hierarchical calibrated latent-KV experiments, write and review the
+`latent-kv-plan` artifact before any held-out capture. Freeze the calibration
+and validation corpora, length/position strata, evaluator fingerprints, rank
+set, and admission thresholds in that plan. Capture calibration and validation
+as separate splits, fit factors from calibration capture only, then run both
+`latent-kv-reference` and `latent-kv-model-eval` on the untouched validation
+capture. The reference result is component-level diagnostic evidence; only the
+full-model KLD/PPL result can satisfy the admission gate. Never loosen a frozen
+threshold after reading validation results.
+
+After a rejected held-out run, `latent-kv-feasibility` may fit one global basis
+directly on the already-consumed validation caches to measure an optimistic
+in-sample ceiling for the shared-basis family. Its artifact is deliberately
+marked held-out-contaminated and admission-ineligible. Use it only to determine
+whether a new untouched experiment is technically justified; never promote or
+package its fitted basis.
 
 ## Format Guidance
 

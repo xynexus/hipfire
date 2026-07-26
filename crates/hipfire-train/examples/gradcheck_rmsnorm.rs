@@ -29,8 +29,8 @@
 //!   cargo run -p hipfire-train --release --example gradcheck_rmsnorm
 //!   hipfire gpu-lock release
 
-use hipfire_train::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_train::ops::rmsnorm::{rmsnorm_backward, rmsnorm_forward};
 
 const ROWS: usize = 3;
 const H: usize = 8;

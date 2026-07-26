@@ -1,0 +1,4 @@
+mode,run,contexts,stage_mismatches,q_status,kv_mismatches,output_projection,iterations,fused_ms,decision
+r89-bf16-local-o-stage,1,1,0,external-unused,0,pass,100,5.9044,admitted-capacity-seam
+r89-bf16-local-o-stage,2,1,0,external-unused,0,pass,100,5.5931,admitted-capacity-seam
+r89-bf16-local-o-stage,3,1,0,external-unused,0,pass,100,5.7202,admitted-capacity-seam

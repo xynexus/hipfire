@@ -238,7 +238,7 @@ fn main() {
                 .alloc_tensor(&[n_heads * hd], DType::F32)
                 .map_err(|e| format!("{e}"))?;
             gpu.gated_delta_net_q8(
-                &q, &k, &v, &alpha, &beta, &s_q8, &s_scales, &o, 1, n_heads, hd,
+                &q, &k, &v, &alpha, &beta, &s_q8, &s_scales, &o, 1, n_heads, hd, 0, 0,
             )
             .map_err(|e| format!("{e}"))?;
             let r = gpu.download_f32(&o).map_err(|e| format!("{e}"))?;

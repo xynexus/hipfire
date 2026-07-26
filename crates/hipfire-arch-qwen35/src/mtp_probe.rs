@@ -44,8 +44,8 @@
 use crate::qwen35::{self, MaskEmbedOverride, PrefillBatchScratch, Qwen35Config, Qwen35Weights};
 use crate::speculative::ModelSlot;
 use hip_bridge::HipResult;
-use hipfire_runtime::weights::{self, EmbeddingFormat};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_runtime::weights::{self, EmbeddingFormat};
 
 /// Maximum batch size per MTP probe cycle: 1 last_committed + 1
 /// pending_candidate + 1 mask. v1 never exceeds this.
@@ -462,6 +462,8 @@ fn embed_lookup_to_scratch(
             gpu.embedding_lookup_hfq4g128(&weights.token_embd, out, token, dim)
         }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, out, token, dim),
+        EmbeddingFormat::BF16 => gpu.embedding_lookup_bf16(&weights.token_embd, out, token, dim),
+        EmbeddingFormat::F16 => gpu.embedding_lookup_f16(&weights.token_embd, out, token, dim),
         // Q4K is not currently produced by qwen35.rs embedding-format assignment;
         // kept defensively in case it lands later — verify call convention then.
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, out, token, dim),

@@ -1,0 +1,10 @@
+mode,run,contexts,stage_mismatches,q_mismatches,kv_mismatches,attention_handoff,output_weights,output_compute_finish,output_dma_bytes,iterations,fused_ms,decision
+r84-attention-handoff-drain,1,1,0,0,0,drained,none,none,65536,100,4.2988,control
+r84-attention-handoff-drain,2,1,0,0,0,drained,none,none,65536,100,4.0951,control
+r84-attention-handoff-drain,3,1,0,0,0,drained,none,none,65536,100,4.0730,control
+r84-output-weight-drain,1,1,0,0,0,drained,4718592,none,65536,100,4.6455,control
+r84-output-weight-drain,2,1,0,0,0,drained,4718592,none,65536,100,4.7160,control
+r84-output-weight-drain,3,1,0,0,0,drained,4718592,none,65536,100,4.8099,control
+r84-output-local-finish,1,1,0,0,0,drained,4718592,full-local,65536,100,5.7587,control
+r84-output-local-finish,2,1,0,0,0,drained,4718592,full-local,65536,100,5.8797,control
+r84-output-local-finish,3,1,0,0,0,drained,4718592,full-local,65536,100,5.7761,control

@@ -136,11 +136,11 @@ fn main() {
         );
         let o1 = gpu.zeros(&[1, N_HEADS * HD], DType::F32).unwrap();
         gpu.gated_delta_net_q8_batch_seq(
-            &q1, &k1, &v1, &g1, &b1, &sq_ref, &sc_ref, &o1, 1, N_HEADS, HD,
+            &q1, &k1, &v1, &g1, &b1, &sq_ref, &sc_ref, &o1, 1, N_HEADS, HD, t as u32, 0,
         )
         .unwrap();
         gpu.gated_delta_net_q8_batch_seq(
-            &q1, &k1, &v1, &g1, &b1, &sq_ref, &sc_ref, &o1, 1, N_HEADS, HD,
+            &q1, &k1, &v1, &g1, &b1, &sq_ref, &sc_ref, &o1, 1, N_HEADS, HD, t as u32, 0,
         )
         .unwrap();
         // Scatter o1 back into out_ref[t].

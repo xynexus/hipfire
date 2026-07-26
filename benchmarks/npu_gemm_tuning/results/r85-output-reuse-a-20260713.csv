@@ -1,0 +1,4 @@
+mode,run,contexts,stage_mismatches,q_status,kv_mismatches,output_projection,iterations,fused_ms,decision
+r85-output-reuse-a,1,1,0,external-unused,0,pass,100,5.7945,admitted
+r85-output-reuse-a,2,1,0,external-unused,0,pass,100,5.8026,admitted
+r85-output-reuse-a,3,1,0,external-unused,0,pass,100,5.6847,admitted

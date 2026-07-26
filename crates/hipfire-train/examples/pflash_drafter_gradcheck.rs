@@ -26,9 +26,9 @@
 //!   hipfire gpu-lock acquire "pflash-dgc"
 //!   cargo run -p hipfire-train --release --example pflash_drafter_gradcheck
 
+use hipfire_rdna::{DType, Gpu};
 use hipfire_train::drafter::{drafter_backward, drafter_forward_train, Drafter, DrafterConfig};
 use hipfire_train::ops::pflash_score::pflash_score_forward;
-use hipfire_rdna::{DType, Gpu};
 
 const VOCAB: usize = 32;
 const H_T: usize = 8;

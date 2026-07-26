@@ -9,9 +9,9 @@ INC = os.environ["MLIR_AIE_INC"]
 ITERS = int(os.environ["RITERS"])
 SA, SB = 32, 64
 A_N, B_N, OUT_N = 2 * SA, 2 * SB, 64
-A_ty = np.ndarray[(A_N,), np.dtype[np.int8]]
-B_ty = np.ndarray[(B_N,), np.dtype[np.int8]]
-OUT_ty = np.ndarray[(OUT_N,), np.dtype[np.int32]]
+A_ty: object = np.ndarray[(A_N,), np.dtype[np.int8]]
+B_ty: object = np.ndarray[(B_N,), np.dtype[np.int8]]
+OUT_ty: object = np.ndarray[(OUT_N,), np.dtype[np.int32]]
 
 kern = ExternalFunction(
     "r0b_i8i8", source_file="r0b.cc", arg_types=[A_ty, B_ty, OUT_ty],

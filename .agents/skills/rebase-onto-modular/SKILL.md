@@ -96,7 +96,8 @@ If your branch had perf-sensitive changes:
 If your branch touched kernels / quant / dispatch / fusion / rotation /
 forward-pass:
 ```bash
-./scripts/coherence-gate-dflash.sh
+./tests/tiny-affected-gate.sh --require-coverage   # automatic correctness front tier
+./tests/coherence-gate-dflash.sh                   # optional manual DFlash/DDTree diagnostic
 ```
 
 ### 4. Push

@@ -89,25 +89,36 @@ fn lcg(seed: u32, n: usize) -> Vec<f32> {
 fn main() {
     let mut gpu = Gpu::init().unwrap();
     let mut all_pass = true;
-    for &(nfb, tail) in &[
-        (0usize, 50usize),
-        (0, 127),
-        (1, 0),
-        (1, 13),
-        (2, 40),
-        (3, 1),
-    ] {
-        all_pass &= run_case(&mut gpu, nfb, tail);
+    // head_dim 256 exercises the default kvarn kernels (regression guard for the
+    // MAXDPT template refactor); head_dim 512 exercises the `_hd512` variants
+    // (gemma4 global layers). The v1 f16k_q8v cross-check runs only at 256 (that
+    // path is unrelated to the head_dim-512 kvarn work).
+    for &head_dim in &[256usize, 512usize] {
+        for &(nfb, tail) in &[
+            (0usize, 50usize),
+            (0, 127),
+            (1, 0),
+            (1, 13),
+            (2, 40),
+            (3, 1),
+        ] {
+            all_pass &= run_case(&mut gpu, head_dim, nfb, tail, head_dim <= 256);
+        }
     }
     if !all_pass {
         std::process::exit(1);
     }
 }
 
-fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize) -> bool {
+fn run_case(
+    gpu: &mut Gpu,
+    head_dim: usize,
+    n_full_blocks: usize,
+    tail_len: usize,
+    check_v1: bool,
+) -> bool {
     let n_heads = 4usize;
     let n_kv_heads = 2usize;
-    let head_dim = 256usize;
     let group = 128usize;
     let kv_dim = n_kv_heads * head_dim;
     let n_full = n_full_blocks * group;
@@ -149,7 +160,7 @@ fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize) -> bool {
             .unwrap();
         gpu.kvarn_gather_k_tiles(&kd, &td, n_full_blocks, n_kv_heads, head_dim, group)
             .unwrap();
-        gpu.kvarn_quantize_tile(&td, &rd, n_tiles, head_dim, group, record_bytes)
+        gpu.kvarn_quantize_tile(&td, &rd, n_tiles, head_dim, group, record_bytes, 4)
             .unwrap();
     }
     let recs = gpu.download_raw(&rd, rec_buf_bytes).unwrap();
@@ -272,28 +283,32 @@ fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize) -> bool {
         .zeros(&[n_heads * max_tiles * (2 + head_dim)], DType::F32)
         .unwrap();
 
-    // v1 path.
-    let shadow = gpu.zeros(&[seq_len * kv_dim], DType::F16).unwrap();
-    gpu.kvarn_build_kcache(
-        &rd,
-        &wd,
-        &shadow,
-        n_full_blocks,
-        tail_len,
-        n_kv_heads,
-        head_dim,
-        group,
-        record_bytes,
-    )
-    .unwrap();
-    let out_a = gpu
-        .upload_raw(&vec![0u8; n_heads * head_dim * 4], &[n_heads * head_dim])
+    // v1 path (build f16 shadow K → f16k/Q8v flash). Only run as a cross-check at
+    // head_dim <= 256; the f16k_q8v flash is not part of the head_dim-512 kvarn work.
+    let out_a = check_v1.then(|| {
+        let shadow = gpu.zeros(&[seq_len * kv_dim], DType::F16).unwrap();
+        gpu.kvarn_build_kcache(
+            &rd,
+            &wd,
+            &shadow,
+            n_full_blocks,
+            tail_len,
+            n_kv_heads,
+            head_dim,
+            group,
+            record_bytes,
+        )
         .unwrap();
-    gpu.attention_flash_f16k_q8v_batched_masked(
-        &qd, &shadow, &vd, &out_a, &posd, n_heads, n_kv_heads, head_dim, max_seq, seq_len, 1,
-        &partials, None, 0, 0,
-    )
-    .unwrap();
+        let out_a = gpu
+            .upload_raw(&vec![0u8; n_heads * head_dim * 4], &[n_heads * head_dim])
+            .unwrap();
+        gpu.attention_flash_f16k_q8v_batched_masked(
+            &qd, &shadow, &vd, &out_a, &posd, n_heads, n_kv_heads, head_dim, max_seq, seq_len, 1,
+            &partials, None, 0, 0,
+        )
+        .unwrap();
+        out_a
+    });
 
     // fused path.
     let out_b = gpu
@@ -318,11 +333,11 @@ fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize) -> bool {
         0,
         n_full_blocks,
         record_bytes,
+        4,
     )
     .unwrap();
     gpu.device_synchronize().unwrap();
 
-    let a = gpu.download_f32(&out_a).unwrap();
     let b = gpu.download_f32(&out_b).unwrap();
     let err = |x: &[f32]| {
         let mut m = 0.0f32;
@@ -331,13 +346,27 @@ fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize) -> bool {
         }
         m
     };
-    let v1_err = err(&a);
     let fused_err = err(&b);
-    let mut ab = 0.0f32;
-    for i in 0..a.len() {
-        ab = ab.max((a[i] - b[i]).abs());
-    }
+    // Cross-check vs the v1 f16k/Q8v path when available (head_dim <= 256).
+    let (v1_err, ab) = match &out_a {
+        Some(t) => {
+            let a = gpu.download_f32(t).unwrap();
+            let mut ab = 0.0f32;
+            for i in 0..a.len() {
+                ab = ab.max((a[i] - b[i]).abs());
+            }
+            (err(&a), ab)
+        }
+        None => (fused_err, 0.0f32),
+    };
+    // Primary gate: fused matches the f64 host reference. Where v1 ran, also require
+    // fused to be no worse than ~3× v1 (catches a fused-only regression).
     let pass = fused_err < 2e-3 && fused_err <= v1_err * 3.0 + 1e-4;
-    println!("  n_full={n_full_blocks} tail={tail_len} seq={seq_len}: v1-vs-host={v1_err:.2e}  fused-vs-host={fused_err:.2e}  fused-vs-v1={ab:.2e}  -> {}", if pass { "PASS" } else { "FAIL" });
+    let v1_disp = if out_a.is_some() {
+        format!("{v1_err:.2e}")
+    } else {
+        "n/a".to_string()
+    };
+    println!("  hd={head_dim} n_full={n_full_blocks} tail={tail_len} seq={seq_len}: v1-vs-host={v1_disp}  fused-vs-host={fused_err:.2e}  fused-vs-v1={ab:.2e}  -> {}", if pass { "PASS" } else { "FAIL" });
     pass
 }

@@ -68,13 +68,13 @@ fn fnv1a(ids: &[u32]) -> u64 {
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_rdna::{DType, GpuTensor};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
     use hipfire_runtime::llama;
     use hipfire_runtime::multi_gpu::Gpus;
     use hipfire_runtime::sampler;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
-    use hipfire_rdna::{DType, GpuTensor};
     use std::path::Path;
 
     let args: Vec<String> = std::env::args().collect();

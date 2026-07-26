@@ -23,6 +23,7 @@ extern "C" __global__ void rope_partial_halfsplit_batched_f32(
     int n_heads_k,
     int head_dim,
     int n_rot,
+    int basis_dim,
     float freq_base,
     int batch_size,
     int pos_offset   // added to positions[b] for RoPE angle only;
@@ -30,12 +31,13 @@ extern "C" __global__ void rope_partial_halfsplit_batched_f32(
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int b = blockIdx.y;
-    int half = n_rot / 2;
-    if (i >= half || b >= batch_size) return;
+    int n_pairs = n_rot / 2;
+    int half = basis_dim / 2;
+    if (i >= n_pairs || b >= batch_size) return;
 
     int pos = positions[b] + pos_offset;
 
-    float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)n_rot);
+    float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)basis_dim);
     float angle = (float)pos * freq;
     float cos_a = cosf(angle);
     float sin_a = sinf(angle);

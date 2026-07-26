@@ -269,26 +269,51 @@ fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn resolve_hf_cache_root(path: &Path) -> Option<PathBuf> {
+    let snapshots_dir = path.join("snapshots");
+    if !snapshots_dir.is_dir() {
+        return None;
+    }
+
+    let refs_main = path.join("refs").join("main");
+    if let Ok(revision) = std::fs::read_to_string(&refs_main) {
+        let snapshot = snapshots_dir.join(revision.trim());
+        if snapshot.join("config.json").exists() {
+            return Some(snapshot);
+        }
+    }
+
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(&snapshots_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join("config.json").exists())
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
 fn resolve_model_path(input: &str) -> String {
     let path = Path::new(input);
     if path.join("config.json").exists() {
         return input.to_string();
     }
+
+    if let Some(snapshot) = resolve_hf_cache_root(path) {
+        return snapshot.to_string_lossy().into_owned();
+    }
+
     if input.contains('/') {
         let parts: Vec<&str> = input.splitn(2, '/').collect();
         if parts.len() == 2 {
             let org = parts[0];
             let name = parts[1];
             let home = std::env::var("HOME").unwrap_or_default();
-            let cache_root =
-                format!("{home}/.cache/huggingface/hub/models--{org}--{name}/snapshots");
-            if let Ok(entries) = std::fs::read_dir(&cache_root) {
-                for e in entries.flatten() {
-                    let p = e.path();
-                    if p.join("config.json").exists() {
-                        return p.to_string_lossy().into_owned();
-                    }
-                }
+            let cache_root = PathBuf::from(format!(
+                "{home}/.cache/huggingface/hub/models--{org}--{name}"
+            ));
+            if let Some(snapshot) = resolve_hf_cache_root(&cache_root) {
+                return snapshot.to_string_lossy().into_owned();
             }
         }
     }

@@ -14,6 +14,226 @@ use hip_bridge::HipResult;
 use std::ffi::c_void;
 
 impl Gpu {
+    /// Ensure reusable plain-basis DFLASH activation staging for `n` rows.
+    /// Capacity only grows; sequential projections safely reuse it on the same
+    /// stream. `k` is G256-aligned for the staged W4A8/W8A8 path.
+    fn ensure_dflash_oq_scratch(&mut self, n: usize, k: usize) -> HipResult<()> {
+        let need_xq = n * k;
+        let need_xs = n * (k / 256);
+        if self
+            .dflash_oq_xq_batch
+            .as_ref()
+            .map(|t| t.numel() < need_xq)
+            .unwrap_or(true)
+        {
+            self.dflash_oq_xq_batch = Some(self.alloc_tensor(&[need_xq], DType::Raw)?);
+        }
+        if self
+            .dflash_oq_xs_batch
+            .as_ref()
+            .map(|t| t.numel() < need_xs)
+            .unwrap_or(true)
+        {
+            self.dflash_oq_xs_batch = Some(self.alloc_tensor(&[need_xs], DType::F32)?);
+        }
+        Ok(())
+    }
+
+    /// Packed plain-basis DFLASH Opus production dispatch. G256-aligned rows use
+    /// the fused A8+dot4 path; ragged rows retain the exact scalar-F16 fallback
+    /// because checkpoint blocks can cross logical row boundaries there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_dflash_oq_plain(
+        &mut self,
+        dtype: DType,
+        w_blocks: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const QUANT_CHUNK_ROWS: usize = 64;
+        let aligned = k % 256 == 0;
+        let (kernel_name, expected_stride) = dflash_plain_kernel(dtype, aligned);
+        validate_dflash_plain_stride(kernel_name, block_stride, expected_stride);
+        if aligned {
+            self.ensure_dflash_oq_scratch(batch_size.min(QUANT_CHUNK_ROWS), k)?;
+            self.ensure_kernel(
+                "quantize_dflash_act_g256",
+                kernels::GEMM_DFLASH_OQ_PLAIN_REF_SRC,
+                "quantize_dflash_act_g256",
+            )?;
+        }
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_DFLASH_OQ_PLAIN_REF_SRC,
+            kernel_name,
+        )?;
+        if !aligned {
+            let wp = w_blocks.buf.as_ptr();
+            let xp = x_f32.buf.as_ptr();
+            let yp = y_f32.buf.as_ptr();
+            let mut mi = m as i32;
+            let mut ki = k as i32;
+            let mut bi = batch_size as i32;
+            let mut stride = block_stride as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &wp as *const _ as *mut c_void,
+                &xp as *const _ as *mut c_void,
+                &yp as *const _ as *mut c_void,
+                &mut mi as *mut _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut bi as *mut _ as *mut c_void,
+                &mut stride as *mut _ as *mut c_void,
+            ];
+            let func = &self.functions[kernel_name];
+            return unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [m.div_ceil(8) as u32, batch_size as u32, 1],
+                    [256, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )
+            };
+        }
+
+        let groups = k / 256;
+        let mut row = 0;
+        while row < batch_size {
+            let n = (batch_size - row).min(QUANT_CHUNK_ROWS);
+            let x_chunk = x_f32.sub_offset(row * k, n * k);
+            let y_chunk = y_f32.sub_offset(row * m, n * m);
+            let xq = GpuTensor {
+                // SAFETY: bounded view of persistent scratch, used only by
+                // stream-ordered launches before the next projection reuses it.
+                buf: unsafe { self.dflash_oq_xq_batch.as_ref().unwrap().buf.alias() },
+                shape: vec![n * k],
+                dtype: DType::Raw,
+            };
+            let xs = GpuTensor {
+                // SAFETY: same lifetime/order contract as `xq`.
+                buf: unsafe { self.dflash_oq_xs_batch.as_ref().unwrap().buf.alias() },
+                shape: vec![n * groups],
+                dtype: DType::F32,
+            };
+
+            let xp = x_chunk.buf.as_ptr();
+            let xqp = xq.buf.as_ptr();
+            let xsp = xs.buf.as_ptr();
+            let mut ki = k as i32;
+            let mut ni = n as i32;
+            let mut quant_params: Vec<*mut c_void> = vec![
+                &xp as *const _ as *mut c_void,
+                &xqp as *const _ as *mut c_void,
+                &xsp as *const _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+            ];
+            let quant_func = &self.functions["quantize_dflash_act_g256"];
+            unsafe {
+                self.hip.launch_kernel(
+                    quant_func,
+                    [groups as u32, n as u32, 1],
+                    [256, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut quant_params,
+                )?;
+            }
+
+            let wp = w_blocks.buf.as_ptr();
+            let yp = y_chunk.buf.as_ptr();
+            let mut mi = m as i32;
+            let mut stride = block_stride as i32;
+            let mut gemm_params: Vec<*mut c_void> = vec![
+                &wp as *const _ as *mut c_void,
+                &xqp as *const _ as *mut c_void,
+                &xsp as *const _ as *mut c_void,
+                &yp as *const _ as *mut c_void,
+                &mut mi as *mut _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+                &mut stride as *mut _ as *mut c_void,
+            ];
+            let gemm_func = &self.functions[kernel_name];
+            unsafe {
+                self.hip.launch_kernel(
+                    gemm_func,
+                    [m.div_ceil(8) as u32, n as u32, 1],
+                    [256, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut gemm_params,
+                )?;
+            }
+            row += n;
+        }
+        Ok(())
+    }
+
+    /// Native packed reference GEMM for DFLASH qt=45/46/47 plain-basis Opus
+    /// blocks. This is intentionally separate from the primary-model
+    /// `Oq{4,8}G256` paths: those consume split f32 scales after FWHT, while
+    /// DFLASH preserves interleaved f16-scale NPU blocks and unrotated X.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_dflash_oq_plain_ref(
+        &mut self,
+        dtype: DType,
+        w_blocks: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (kernel_name, expected_stride) = match dtype {
+            DType::DflashOq8Plain => ("gemm_dflash_oq8_plain_ref", Some(258usize)),
+            DType::DflashOq4Plain => ("gemm_dflash_oq4_plain_ref", Some(130usize)),
+            DType::DflashOq4MixedPlain => ("gemm_dflash_oq4_mixed_plain_ref", None),
+            other => panic!("gemm_dflash_oq_plain_ref: unsupported dtype {other:?}"),
+        };
+        validate_dflash_plain_stride(kernel_name, block_stride, expected_stride);
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_DFLASH_OQ_PLAIN_REF_SRC,
+            kernel_name,
+        )?;
+        let wp = w_blocks.buf.as_ptr();
+        let xp = x_f32.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut stride = block_stride as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut stride as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions[kernel_name];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, batch_size as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Opus Quant W4A4: dynamic per-token/group INT4 activation quantizer.
     /// `x_f32` [B,K] → `xq_i4` [B,K/2] (packed signed int4) + `xs` [B,K/group]
     /// (f32 scales). gfx1103 wave32, zero LDS. `group % 32 == 0`, `k % group == 0`.
@@ -138,6 +358,163 @@ impl Gpu {
         }
     }
 
+    /// Register-tiled unified Opus-Quant GEMM for W4A8 (`w_bits == 4`, packed
+    /// int4 weight `[M,K/2]`) and W8A8 (`w_bits == 8`, int8 weight `[M,K]`).
+    /// Dynamic-int8 activation (`X` int8 `[B,K]`, `Xs` `[B,K/group]`), iu8 WMMA,
+    /// per-group rescale → `Y` f32 `[B,M]`. The weight fetch is the only per-width
+    /// difference. `(mb, nb)` ∈ {(2,2),(2,4)}.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_opus_tiled_wmma(
+        &mut self,
+        w_bits: usize,
+        w_packed: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_i8: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+        mb: usize,
+        nb: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            k % group,
+            0,
+            "gemm_opus_tiled_wmma: K must be a multiple of group"
+        );
+        assert_eq!(
+            group % 16,
+            0,
+            "gemm_opus_tiled_wmma: group must be a multiple of 16"
+        );
+        let kname = match (w_bits, mb, nb) {
+            (8, 2, 2) => "gemm_opus_w8a8_tiled_wmma_2x2",
+            (8, 2, 4) => "gemm_opus_w8a8_tiled_wmma_2x4",
+            (4, 2, 2) => "gemm_opus_w4a8_tiled_wmma_2x2",
+            (4, 2, 4) => "gemm_opus_w4a8_tiled_wmma_2x4",
+            _ => panic!("gemm_opus_tiled_wmma: unsupported w{w_bits} tiling {mb}x{nb}"),
+        };
+        self.ensure_kernel(kname, kernels::GEMM_OPUS_TILED_WMMA_SRC, kname)?;
+        let wp = w_packed.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xp = x_i8.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &wsp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_m = m.div_ceil(16 * mb) as u32;
+        let grid_b = batch_size.div_ceil(16 * nb) as u32;
+        let func = &self.functions[kname];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Mixed-precision Opus GEMM (unsigned weight codes + zero-point fold).
+    /// Consumes W{8,4,2,1}A8: dense unsigned codes, the WMMA weight operand flagged
+    /// unsigned, and the symmetric zero-point folded out per group using `x_sum`
+    /// (`Σ_{k∈g} x[b,k]`). One kernel body per width; see `gemm_opus_tiled_wmma.hip`
+    /// and the `hipfire_quantize::opus_lowbit` CPU reference.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_opus_tiled_wmma_u(
+        &mut self,
+        w_bits: usize,
+        w_packed: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_i8: &GpuTensor,
+        x_scales: &GpuTensor,
+        x_sum: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+        mb: usize,
+        nb: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            k % group,
+            0,
+            "gemm_opus_tiled_wmma_u: K must be a multiple of group"
+        );
+        assert_eq!(
+            group % 16,
+            0,
+            "gemm_opus_tiled_wmma_u: group must be a multiple of 16"
+        );
+        let kname = match (w_bits, mb, nb) {
+            (8, 2, 2) => "gemm_opus_w8a8u_tiled_wmma_2x2",
+            (8, 2, 4) => "gemm_opus_w8a8u_tiled_wmma_2x4",
+            (4, 2, 2) => "gemm_opus_w4a8u_tiled_wmma_2x2",
+            (4, 2, 4) => "gemm_opus_w4a8u_tiled_wmma_2x4",
+            (2, 2, 2) => "gemm_opus_w2a8u_tiled_wmma_2x2",
+            (2, 2, 4) => "gemm_opus_w2a8u_tiled_wmma_2x4",
+            (1, 2, 2) => "gemm_opus_w1a8u_tiled_wmma_2x2",
+            (1, 2, 4) => "gemm_opus_w1a8u_tiled_wmma_2x4",
+            _ => panic!("gemm_opus_tiled_wmma_u: unsupported w{w_bits} tiling {mb}x{nb}"),
+        };
+        self.ensure_kernel(kname, kernels::GEMM_OPUS_TILED_WMMA_SRC, kname)?;
+        let wp = w_packed.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xp = x_i8.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let xsump = x_sum.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &wsp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &xsump as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_m = m.div_ceil(16 * mb) as u32;
+        let grid_b = batch_size.div_ceil(16 * nb) as u32;
+        let func = &self.functions[kname];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Opus Quant W8A8 dynamic int8 activation quantizer (f32 → signed int8 +
     /// per-group f32 scales). `xq_i8` is [B,K] int8; `xs` is [B,K/group] f32.
     pub fn quantize_act_oq8(
@@ -182,6 +559,67 @@ impl Gpu {
         let grid_g = (k / group) as u32;
         let grid_b = batch_size as u32;
         let func = &self.functions["quantize_act_oq8"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_g, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// As [`Self::quantize_act_oq8`], but also emits the per-group signed sum
+    /// `x_sum` [B, K/group] (int32) that the mixed-precision fold GEMM
+    /// ([`Self::gemm_opus_tiled_wmma_u`]) uses to cancel the weight zero-point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantize_act_oq8_sum(
+        &mut self,
+        x_f32: &GpuTensor,
+        xq_i8: &GpuTensor,
+        xs: &GpuTensor,
+        x_sum: &GpuTensor,
+        batch_size: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            group % 32,
+            0,
+            "quantize_act_oq8_sum: group must be a multiple of 32"
+        );
+        assert_eq!(
+            k % group,
+            0,
+            "quantize_act_oq8_sum: K must be a multiple of group"
+        );
+        self.ensure_kernel(
+            "quantize_act_oq8_sum",
+            kernels::QUANTIZE_ACT_OQ8_SRC,
+            "quantize_act_oq8_sum",
+        )?;
+        let xp = x_f32.buf.as_ptr();
+        let xqp = xq_i8.buf.as_ptr();
+        let xsp = xs.buf.as_ptr();
+        let xsump = x_sum.buf.as_ptr();
+        let mut bi = batch_size as i32;
+        let mut ki = k as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &xqp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &xsump as *const _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_g = (k / group) as u32;
+        let grid_b = batch_size as u32;
+        let func = &self.functions["quantize_act_oq8_sum"];
         unsafe {
             self.hip.launch_kernel(
                 func,
@@ -383,6 +821,79 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
+        }
+    }
+}
+
+fn dflash_plain_kernel(dtype: DType, aligned: bool) -> (&'static str, Option<usize>) {
+    match (dtype, aligned) {
+        (DType::DflashOq8Plain, true) => ("gemm_dflash_oq8_plain_dp4a_staged_8w", Some(258)),
+        (DType::DflashOq4Plain, true) => ("gemm_dflash_oq4_plain_dp4a_staged_8w", Some(130)),
+        (DType::DflashOq4MixedPlain, true) => ("gemm_dflash_oq4_mixed_plain_dp4a_staged_8w", None),
+        (DType::DflashOq8Plain, false) => ("gemm_dflash_oq8_plain_8w", Some(258)),
+        (DType::DflashOq4Plain, false) => ("gemm_dflash_oq4_plain_8w", Some(130)),
+        (DType::DflashOq4MixedPlain, false) => ("gemm_dflash_oq4_mixed_plain_8w", None),
+        other => panic!("gemm_dflash_oq_plain: unsupported dtype {other:?}"),
+    }
+}
+
+fn validate_dflash_plain_stride(
+    kernel_name: &str,
+    block_stride: usize,
+    expected_stride: Option<usize>,
+) {
+    if let Some(expected) = expected_stride {
+        assert_eq!(
+            block_stride, expected,
+            "{kernel_name}: invalid block stride"
+        );
+    } else {
+        assert!(
+            block_stride >= 132 && (block_stride - 130) % 2 == 0,
+            "{kernel_name}: mixed block stride must be 130 + 2*N"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dflash_plain_aligned_routes_all_formats_through_staged_a8() {
+        for (dtype, expected, stride) in [
+            (
+                DType::DflashOq8Plain,
+                "gemm_dflash_oq8_plain_dp4a_staged_8w",
+                Some(258),
+            ),
+            (
+                DType::DflashOq4Plain,
+                "gemm_dflash_oq4_plain_dp4a_staged_8w",
+                Some(130),
+            ),
+            (
+                DType::DflashOq4MixedPlain,
+                "gemm_dflash_oq4_mixed_plain_dp4a_staged_8w",
+                None,
+            ),
+        ] {
+            assert_eq!(dflash_plain_kernel(dtype, true), (expected, stride));
+        }
+    }
+
+    #[test]
+    fn dflash_plain_ragged_keeps_exact_f16_activation_path() {
+        for (dtype, expected, stride) in [
+            (DType::DflashOq8Plain, "gemm_dflash_oq8_plain_8w", Some(258)),
+            (DType::DflashOq4Plain, "gemm_dflash_oq4_plain_8w", Some(130)),
+            (
+                DType::DflashOq4MixedPlain,
+                "gemm_dflash_oq4_mixed_plain_8w",
+                None,
+            ),
+        ] {
+            assert_eq!(dflash_plain_kernel(dtype, false), (expected, stride));
         }
     }
 }

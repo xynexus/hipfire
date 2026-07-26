@@ -104,7 +104,11 @@ defer the heavy audio/omni/streaming until the text+seam foundation is proven.
   front-ends; `AudioEncoder` (Conformer/Whisper, streaming/cache); STT output;
   then TTS (codec/vocoder); then omni orchestration (thinker+talker+codec) on the
   **Streaming** serving mode + a latency/RTF gate in the perf methodology.
-- **E9 — image-gen (optional, separate engine).** Qwen-Image MMDiT+VAE.
+- **E9 — image-gen. [SHIPPED, first-class — reclassified 2026-07-13.]** No longer
+  "optional / separate engine": `hipfire-diffusion` (+ `hipfire-diffusion-coexist`)
+  ships Krea/FLUX/SD/MRFlow/SeFi with an AUTOMATIC1111-compatible SD API, and
+  image-gen is a first-class daemon capability per the ratified north-star (see
+  root `README.md`). Original note: Qwen-Image MMDiT+VAE.
 - **Anytime:** exotic text archs (hrm_text, zaya) slot in once the shared
   building blocks exist; reuse-only families (llama3.x/minicpm5/qwen2.x) are
   loader/config tasks done on demand.

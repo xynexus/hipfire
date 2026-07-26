@@ -1,0 +1,78 @@
+{
+  "isa": {
+    "(4, 8, 8, 'int8', 'int8')": {
+      "compiles": true,
+      "loop_vmac": 4,
+      "unroll": 1,
+      "mac_calls": 4,
+      "vmac_per_call": 1.0,
+      "macs_per_call": 256,
+      "macs_per_vmac": 256.0,
+      "native": true,
+      "ta": "int8",
+      "tb": "int8"
+    },
+    "(8, 8, 8, 'int8', 'int8')": {
+      "compiles": true,
+      "loop_vmac": 4,
+      "unroll": 1,
+      "mac_calls": 4,
+      "vmac_per_call": 1.0,
+      "macs_per_call": 512,
+      "macs_per_vmac": 512.0,
+      "native": true,
+      "ta": "int8",
+      "tb": "int8"
+    },
+    "(2, 8, 8, 'int8', 'int8')": {
+      "compiles": true,
+      "loop_vmac": 4,
+      "unroll": 1,
+      "mac_calls": 4,
+      "vmac_per_call": 1.0,
+      "macs_per_call": 128,
+      "macs_per_vmac": 128.0,
+      "native": true,
+      "ta": "int8",
+      "tb": "int8"
+    },
+    "(4, 16, 16, 'int8', 'int4')": {
+      "compiles": true,
+      "loop_vmac": 8,
+      "unroll": 1,
+      "mac_calls": 4,
+      "vmac_per_call": 2.0,
+      "macs_per_call": 1024,
+      "macs_per_vmac": 512.0,
+      "native": false,
+      "ta": "int8",
+      "tb": "int4"
+    }
+  },
+  "hw": {
+    "(4, 8, 8, 'int8', 'int8')": {
+      "slope": 3.8538514285714296e-09,
+      "macs_s": 265708219161.83286,
+      "vmac_s": 1037922731.1009096,
+      "macs_per_cycle": 158.5525305458726
+    },
+    "(8, 8, 8, 'int8', 'int8')": {
+      "slope": 3.850785535714284e-09,
+      "macs_s": 531839537934.7231,
+      "vmac_s": 1038749097.528756,
+      "macs_per_cycle": 317.3575316935871
+    },
+    "(2, 8, 8, 'int8', 'int8')": {
+      "slope": 3.761070178571432e-09,
+      "macs_s": 136131466761.00394,
+      "vmac_s": 1063527084.0703433,
+      "macs_per_cycle": 81.23191901991005
+    },
+    "(4, 16, 16, 'int8', 'int4')": {
+      "slope": 4.532780357142857e-09,
+      "macs_s": 903639637765.6886,
+      "vmac_s": 1764921167.5111105,
+      "macs_per_cycle": 539.2168587078693
+    }
+  }
+}

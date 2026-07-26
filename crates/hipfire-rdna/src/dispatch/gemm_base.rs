@@ -5,11 +5,133 @@
 //! Base-dtype GEMM dispatch (f16/bf16/f32, incl. WMMA + train). Pure move (Phase 1 M6).
 
 use super::{DType, Gpu, GpuTensor};
+use crate::arch_caps::ArchCaps;
 use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawXf32Backend {
+    Wmma,
+    Portable,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::feature_flags::FeatureFlags;
+    use std::sync::Arc;
+
+    fn caps(arch: &str) -> ArchCaps {
+        ArchCaps::new(arch, Arc::new(FeatureFlags::from_env_for_test(arch)))
+    }
+
+    #[test]
+    fn raw_x_f32_backend_is_wmma_only_where_the_instruction_is_available() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert_eq!(raw_x_f32_backend(&caps(arch)), RawXf32Backend::Wmma);
+        }
+        for arch in ["gfx1030", "gfx906", "gfx908", "gfx942"] {
+            assert_eq!(raw_x_f32_backend(&caps(arch)), RawXf32Backend::Portable);
+        }
+    }
+}
+
+fn raw_x_f32_backend(arch: &ArchCaps) -> RawXf32Backend {
+    if arch.has_wmma() {
+        RawXf32Backend::Wmma
+    } else {
+        RawXf32Backend::Portable
+    }
+}
+
 impl Gpu {
+    /// Raw F16/BF16 weight x F32 activation GEMM with an architecture-honest
+    /// backend. Wave32 WMMA is retained on RDNA3/4; RDNA2/CDNA/older targets
+    /// use the scalar correctness kernel instead of attempting an unsupported
+    /// WMMA intrinsic.
+    pub fn gemm_raw_x_f32_auto(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        match (weight.dtype, raw_x_f32_backend(&self.arch_caps)) {
+            (DType::F16 | DType::Raw, RawXf32Backend::Wmma) => {
+                self.gemm_f16_x_f32_wmma(weight, x, y, m, k, batch_size)
+            }
+            (DType::BF16, RawXf32Backend::Wmma) => {
+                self.gemm_bf16_x_bf16_wmma(weight, x, y, m, k, batch_size)
+            }
+            (DType::F16 | DType::Raw | DType::BF16, RawXf32Backend::Portable) => {
+                self.gemm_raw_x_f32_portable(weight, x, y, m, k, batch_size)
+            }
+            (dtype, _) => Err(hip_bridge::HipError::new(
+                0,
+                &format!("raw F16/BF16 GEMM does not support weight dtype {dtype:?}"),
+            )),
+        }
+    }
+
+    /// Scalar raw matrix fallback used by [`Self::gemm_raw_x_f32_auto`].
+    pub fn gemm_raw_x_f32_portable(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(matches!(
+            weight.dtype,
+            DType::F16 | DType::Raw | DType::BF16
+        ));
+        assert_eq!(x.dtype, DType::F32);
+        assert_eq!(y.dtype, DType::F32);
+        assert!(m <= i32::MAX as usize && k <= i32::MAX as usize);
+        assert!(batch_size <= i32::MAX as usize);
+        let kernel_name = match weight.dtype {
+            DType::F16 | DType::Raw => "gemm_f16_x_f32_portable",
+            DType::BF16 => "gemm_bf16_x_f32_portable",
+            _ => unreachable!(),
+        };
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_RAW_X_F32_PORTABLE_SRC,
+            kernel_name,
+        )?;
+        let wp = weight.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let block = 256u32;
+        let grid_x = (m as u32).div_ceil(block);
+        let bytes = m
+            .saturating_mul(k)
+            .saturating_mul(2)
+            .saturating_add(batch_size.saturating_mul(k).saturating_mul(4))
+            .saturating_add(batch_size.saturating_mul(m).saturating_mul(4));
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_kernargs(
+            kernel_name,
+            [grid_x, batch_size as u32, 1],
+            [block, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.hip);
+        }
+        result
+    }
+
     /// FP16-weight lm_head fast path for DFlash drafts that ship F16 (not
     /// quantized) weights. Routes through `gemm_mw16_residual_wmma` with the
     /// usual memset-then-atomicAdd residual pattern.
@@ -69,36 +191,18 @@ impl Gpu {
         let mi = m as i32;
         let ki = k as i32;
         let ni = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &wp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &mi as *const _ as *mut c_void,
-            &ki as *const _ as *mut c_void,
-            &ni as *const _ as *mut c_void,
-        ];
         let rows = ((m + 15) / 16) as u32;
         let batches = ((batch_size + 15) / 16) as u32;
         // Bytes: FP16 weight + FP16 x + FP32 y (read+write).
         let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4 * 2;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_mw16_residual_wmma", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemm_mw16_residual_wmma",
             [rows, batches, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(wp);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(ni);
-                b
-            },
+            &kernargs![ptr wp, ptr xp, ptr yp, i32 mi, i32 ki, i32 ni],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -435,6 +539,303 @@ impl Gpu {
             )
         }
     }
+    /// BF16-compute forward of the training linear op:
+    /// `y[m,n] = x[m,k] · w[n,k]^T` (NT). Reads `x`/`w` as F32, casts to BF16
+    /// in-register for a WMMA f32-accumulate multiply, writes F32 `y`. Same
+    /// numerics contract as `gemm_f32_train(x, w, y, m, n, k, k, k, false, true)`
+    /// but on the matrix cores; leaves the F32 master weights/activations and the
+    /// F32 backward untouched. Args mirror `linear_forward`'s `(x, w, y, m, k, n)`.
+    pub fn gemm_bf16c_train_nt(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_bf16c_train_nt",
+            kernels::GEMM_BF16C_TRAIN_NT_SRC,
+            "gemm_bf16c_train_nt",
+        )?;
+        // Kernel computes Y[B,M] = X[B,K]·A[M,K]^T. Map A=w (kernel M=n_out),
+        // X=x (kernel B=m_tok), Y=y stored row-major [B=m, M=n].
+        let ap = w.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mi = n as i32; // kernel M = output cols = n
+        let ki = k as i32;
+        let bi = m as i32; // kernel B = tokens = m
+        let grid_m = ((n + 15) / 16) as u32;
+        let grid_b = ((m + 15) / 16) as u32;
+        self.launch_kernargs(
+            "gemm_bf16c_train_nt",
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        )
+    }
+    /// Split-precision ("2xbf16") forward of the training linear op:
+    /// `y[m,n] = x[m,k] · w[n,k]^T` (NT) at near-f32 accuracy on the WMMA cores.
+    /// Splits each f32 operand into bf16 hi+lo and accumulates 3 WMMA passes
+    /// (~16 mantissa bits vs bf16's 8). Same args as `gemm_bf16c_train_nt`; used
+    /// for the precision-sensitive vocab heads in place of the scalar f32 path.
+    pub fn gemm_bf16x2_train_nt(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let ap = w.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mi = n as i32; // kernel M = output cols = n
+        let ki = k as i32;
+        let bi = m as i32; // kernel B = tokens = m
+                           // gfx1151 M-heavy path (e.g. the vocab head: huge n, small batch): stage
+                           // the split activation in LDS and reuse across warps. Falls back to the
+                           // LDS-free kernel otherwise.
+        if self.arch == "gfx1151" && n >= 128 && m >= 16 && k % 16 == 0 {
+            self.ensure_kernel(
+                "gemm_bf16x2_train_nt_gfx1151_m128",
+                kernels::GEMM_BF16X2_TRAIN_NT_SRC,
+                "gemm_bf16x2_train_nt_gfx1151_m128",
+            )?;
+            let grid_m = ((n + 127) / 128) as u32;
+            let grid_b = ((m + 15) / 16) as u32;
+            return self.launch_kernargs(
+                "gemm_bf16x2_train_nt_gfx1151_m128",
+                [grid_m, grid_b, 1],
+                [256, 1, 1],
+                0,
+                &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+            );
+        }
+        self.ensure_kernel(
+            "gemm_bf16x2_train_nt",
+            kernels::GEMM_BF16X2_TRAIN_NT_SRC,
+            "gemm_bf16x2_train_nt",
+        )?;
+        let grid_m = ((n + 15) / 16) as u32;
+        let grid_b = ((m + 15) / 16) as u32;
+        self.launch_kernargs(
+            "gemm_bf16x2_train_nt",
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        )
+    }
+    /// F16-compute forward of the training linear op (see `gemm_bf16c_train_nt`);
+    /// casts to `_Float16` for higher forward precision at the same WMMA speed.
+    pub fn gemm_f16c_train_nt(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f16c_train_nt",
+            kernels::GEMM_F16C_TRAIN_NT_SRC,
+            "gemm_f16c_train_nt",
+        )?;
+        let ap = w.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mi = n as i32;
+        let ki = k as i32;
+        let bi = m as i32;
+        let grid_m = ((n + 15) / 16) as u32;
+        let grid_b = ((m + 15) / 16) as u32;
+        self.launch_kernargs(
+            "gemm_f16c_train_nt",
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        )
+    }
+    /// Deterministic per-tensor abs-max `max_i |x[i]|`, read back as a scalar.
+    /// Used to pick the per-tensor scale for [`Self::gemm_f16s_train_nt`]. `max`
+    /// is order-independent, so this stays bit-reproducible.
+    pub fn abs_max_f32(&mut self, x: &GpuTensor) -> HipResult<f32> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "abs_max_f32",
+            kernels::GEMM_F16S_TRAIN_NT_SRC,
+            "abs_max_f32",
+        )?;
+        let n = x.numel();
+        // Holds float_as_uint(amax); reinterpreted as f32 on download IS amax.
+        let out = self.zeros(&[1], DType::F32)?;
+        let xptr = x.buf.as_ptr();
+        let outptr = out.buf.as_ptr();
+        let ni = n as i32;
+        let blocks = (n.div_ceil(256)).clamp(1, 1024) as u32;
+        self.launch_kernargs(
+            "abs_max_f32",
+            [blocks, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr xptr, ptr outptr, i32 ni],
+        )?;
+        let v = self.download_f32(&out)?;
+        self.free_tensor(out)?;
+        Ok(v[0])
+    }
+    /// Scaled f16-compute training GEMM (NT): `y[m,n] = x[m,k]·w[n,k]^T` on the
+    /// f16 WMMA cores, but each operand is multiplied by a per-tensor scale
+    /// (`sx`/`sw`) before the f16 cast and the f32 accumulator is unscaled by
+    /// `1/(sx·sw)` — f16's 10-bit mantissa without its range trap. Same args as
+    /// `gemm_f16c_train_nt` plus the scales (pass powers of two for exactness).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16s_train_nt(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        sx: f32,
+        sw: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f16s_train_nt",
+            kernels::GEMM_F16S_TRAIN_NT_SRC,
+            "gemm_f16s_train_nt",
+        )?;
+        let func = &self.functions["gemm_f16s_train_nt"];
+        // Kernel: Y[B,M] = X[B,K]·A[M,K]^T with A=w (M=n), X=x (B=m), scale A by
+        // sw, X by sx.
+        let mut ap = w.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = n as i32;
+        let mut ki = k as i32;
+        let mut bi = m as i32;
+        let mut saf = sw;
+        let mut sxf = sx;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut saf as *mut _ as *mut c_void,
+            &mut sxf as *mut _ as *mut c_void,
+        ];
+        let grid_m = n.div_ceil(16) as u32;
+        let grid_b = m.div_ceil(16) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+    /// Phase C2 scaled-f16 backward dX: `dX[m,k] = Σ_n dY[m,n]·W[n,k]` (contract
+    /// N) on the f16 WMMA cores, reading W strided (no transpose pass). `dy`/`w`
+    /// scaled by `s_dy`/`s_w` before the f16 cast; output unscaled by 1/(s_dy·s_w).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16s_nn_train(
+        &mut self,
+        dy: &GpuTensor,
+        w: &GpuTensor,
+        dx: &GpuTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        s_dy: f32,
+        s_w: f32,
+    ) -> HipResult<()> {
+        self.gemm_f16s_backward_launch("gemm_f16s_nn_train", dy, w, dx, m, n, k, s_dy, s_w)
+    }
+    /// Phase C2 scaled-f16 backward dW: `dW[n,k] = Σ_m dY[m,n]·X[m,k]` (contract
+    /// M) on the f16 WMMA cores, reading both operands strided (no transposes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16s_tn_train(
+        &mut self,
+        dy: &GpuTensor,
+        x: &GpuTensor,
+        dw: &GpuTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        s_dy: f32,
+        s_x: f32,
+    ) -> HipResult<()> {
+        self.gemm_f16s_backward_launch("gemm_f16s_tn_train", dy, x, dw, m, n, k, s_dy, s_x)
+    }
+    /// Shared launcher for the C2 backward kernels: both take
+    /// `(op_a[.,.], op_b[.,.], out, M, N, K, sa, sb)` and grid over (K, out-rows).
+    /// NN out-rows = M; TN out-rows = N; the kernel's blockIdx.y bound handles it.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_f16s_backward_launch(
+        &mut self,
+        kernel: &'static str,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        out: &GpuTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        sa: f32,
+        sb: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(kernel, kernels::GEMM_F16S_BACKWARD_SRC, kernel)?;
+        let func = &self.functions[kernel];
+        let mut ap = a.buf.as_ptr();
+        let mut bp = b.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ni = n as i32;
+        let mut ki = k as i32;
+        let mut saf = sa;
+        let mut sbf = sb;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut saf as *mut _ as *mut c_void,
+            &mut sbf as *mut _ as *mut c_void,
+        ];
+        // grid.x tiles K (b-rows); grid.y tiles the a-rows (M for NN, N for TN).
+        let out_rows = if kernel == "gemm_f16s_tn_train" { n } else { m };
+        let grid_k = k.div_ceil(16) as u32;
+        let grid_r = out_rows.div_ceil(16) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_k, grid_r, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
     pub fn gemm_f16_wmma_mb4(
         &mut self,
         w: &GpuTensor,
@@ -481,35 +882,17 @@ impl Gpu {
         let ap = a_f16.buf.as_ptr();
         let xp = x_f16.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
-        let mut mi = m as i32;
-        let mut ki = k as i32;
-        let mut bi = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &ap as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-            &mut bi as *mut _ as *mut c_void,
-        ];
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
         let grid_m = ((m + 15) / 16) as u32;
         let grid_b = ((batch_size + 15) / 16) as u32;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "gemm_f16_x_f16_wmma",
             [grid_m, grid_b, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(bi);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
         )
     }
     /// WMMA F16 weight × FP32 input → F32 output GEMM with (B, M)
@@ -547,35 +930,17 @@ impl Gpu {
         let ap = a_f16.buf.as_ptr();
         let xp = self.ensure_fp16_x(x_f32, batch_size * k)?;
         let yp = y_f32.buf.as_ptr();
-        let mut mi = m as i32;
-        let mut ki = k as i32;
-        let mut bi = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &ap as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-            &mut bi as *mut _ as *mut c_void,
-        ];
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
         let grid_m = ((m + 15) / 16) as u32;
         let grid_b = ((batch_size + 15) / 16) as u32;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "gemm_f16_x_f16_wmma",
             [grid_m, grid_b, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(bi);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
         )
     }
     /// WMMA BF16 weight × BF16-staged input → F32 output GEMM with
@@ -749,43 +1114,79 @@ impl Gpu {
         let ap = a_bf16.buf.as_ptr();
         let xp = self.ensure_bf16_x(x_f32, batch_size * k)?;
         let yp = y_f32.buf.as_ptr();
-        let mut mi = m as i32;
-        let mut ki = k as i32;
-        let mut bi = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &ap as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-            &mut bi as *mut _ as *mut c_void,
-        ];
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
         let grid_m = ((m + 15) / 16) as u32;
         let grid_b = ((batch_size + 15) / 16) as u32;
         let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", profile_label, bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "gemm_bf16_x_bf16_wmma",
             [grid_m, grid_b, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(bi);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
         result
     }
+
+    /// Register-tiled, zero-LDS BF16×BF16→F32 WMMA GEMM. Same I/O contract as
+    /// `gemm_bf16_x_bf16_wmma` (A[M,K] BF16, X[B,K] F32 staged to BF16, Y[B,M]
+    /// F32) but each wave computes an MB×NB grid of 16×16 output subtiles with
+    /// MB×NB independent accumulators — ILP hides the WMMA latency the baseline's
+    /// single dependent chain cannot. `(mb, nb)` selects the compiled tiling
+    /// entrypoint: (2,2), (4,2) or (4,4).
+    pub fn gemm_bf16_tiled_wmma(
+        &mut self,
+        a_bf16: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        mb: usize,
+        nb: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            a_bf16.dtype,
+            DType::BF16,
+            "gemm_bf16_tiled_wmma: weights BF16"
+        );
+        let kname = match (mb, nb) {
+            (2, 2) => "gemm_bf16_tiled_wmma_2x2",
+            (4, 2) => "gemm_bf16_tiled_wmma_4x2",
+            (4, 4) => "gemm_bf16_tiled_wmma_4x4",
+            _ => panic!("gemm_bf16_tiled_wmma: unsupported tiling {mb}x{nb}"),
+        };
+        self.ensure_kernel(kname, kernels::GEMM_BF16_TILED_WMMA_SRC, kname)?;
+        let ap = a_bf16.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x_f32, batch_size * k)?;
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let grid_m = m.div_ceil(16 * mb) as u32;
+        let grid_b = batch_size.div_ceil(16 * nb) as u32;
+        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let result = self.launch_kernargs(
+            kname,
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Register-tiled F32 batched GEMM. Y[batch, M] = A[M,K] @ x[batch,K]^T.
     /// Each block holds BATCH_TILE=8 accumulators in registers and
     /// reuses each loaded weight element across them — amortizing
@@ -815,40 +1216,16 @@ impl Gpu {
         let mi = m as i32;
         let ki = k as i32;
         let bs = batch_size as i32;
-        let mut ap_m = ap;
-        let mut xp_m = xp;
-        let mut yp_m = yp;
-        let mut mi_m = mi;
-        let mut ki_m = ki;
-        let mut bs_m = bs;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ap_m as *mut _ as *mut c_void,
-            &mut xp_m as *mut _ as *mut c_void,
-            &mut yp_m as *mut _ as *mut c_void,
-            &mut mi_m as *mut _ as *mut c_void,
-            &mut ki_m as *mut _ as *mut c_void,
-            &mut bs_m as *mut _ as *mut c_void,
-        ];
         let grid_y = (batch_size as u32 + batch_tile - 1) / batch_tile;
         let bytes = m * k * 4 + batch_size * k * 4 + batch_size * m * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_f32_register_tiled", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [m as u32, grid_y, 1],
             [block_x, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(bs);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bs],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -882,40 +1259,16 @@ impl Gpu {
         let mi = m as i32;
         let ki = k as i32;
         let bs = batch_size as i32;
-        let mut ap_m = ap;
-        let mut xp_m = xp;
-        let mut yp_m = yp;
-        let mut mi_m = mi;
-        let mut ki_m = ki;
-        let mut bs_m = bs;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ap_m as *mut _ as *mut c_void,
-            &mut xp_m as *mut _ as *mut c_void,
-            &mut yp_m as *mut _ as *mut c_void,
-            &mut mi_m as *mut _ as *mut c_void,
-            &mut ki_m as *mut _ as *mut c_void,
-            &mut bs_m as *mut _ as *mut c_void,
-        ];
         let grid_y = (batch_size as u32 + batch_tile - 1) / batch_tile;
         let bytes = m * k * 4 + batch_size * k * 4 + batch_size * m * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_f32_register_tiled_b16", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [m as u32, grid_y, 1],
             [block_x, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(bs);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bs],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -946,40 +1299,16 @@ impl Gpu {
         let mi = m as i32;
         let ki = k as i32;
         let bs = batch_size as i32;
-        let mut ap_m = ap;
-        let mut xp_m = xp;
-        let mut yp_m = yp;
-        let mut mi_m = mi;
-        let mut ki_m = ki;
-        let mut bs_m = bs;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ap_m as *mut _ as *mut c_void,
-            &mut xp_m as *mut _ as *mut c_void,
-            &mut yp_m as *mut _ as *mut c_void,
-            &mut mi_m as *mut _ as *mut c_void,
-            &mut ki_m as *mut _ as *mut c_void,
-            &mut bs_m as *mut _ as *mut c_void,
-        ];
         let grid_y = (batch_size as u32 + batch_tile - 1) / batch_tile;
         let bytes = m * k * 4 + batch_size * k * 4 + batch_size * m * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_f32_register_tiled_b32", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [m as u32, grid_y, 1],
             [block_x, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(bs);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bs],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -1010,40 +1339,16 @@ impl Gpu {
         let mi = m as i32;
         let ki = k as i32;
         let bs = batch_size as i32;
-        let mut ap_m = ap;
-        let mut xp_m = xp;
-        let mut yp_m = yp;
-        let mut mi_m = mi;
-        let mut ki_m = ki;
-        let mut bs_m = bs;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ap_m as *mut _ as *mut c_void,
-            &mut xp_m as *mut _ as *mut c_void,
-            &mut yp_m as *mut _ as *mut c_void,
-            &mut mi_m as *mut _ as *mut c_void,
-            &mut ki_m as *mut _ as *mut c_void,
-            &mut bs_m as *mut _ as *mut c_void,
-        ];
         let grid_y = (batch_size as u32 + batch_tile - 1) / batch_tile;
         let bytes = m * k * 4 + batch_size * k * 4 + batch_size * m * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_f32_register_tiled_b64", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             kname,
             [m as u32, grid_y, 1],
             [block_x, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(bs);
-                b
-            },
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bs],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);

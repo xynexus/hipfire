@@ -4,156 +4,92 @@ This is a lightweight reminder list. Add a short description, or record
 revision + file + line number with a one-line explanation. Do not turn entries
 into full investigations here.
 
-## BF16 weights + Q8 KV batched-prefill → garbage on gfx1151 (detailed, by request)
-
-**STATUS: GUARDED/FIXED** (`is_batchable_la` now routes BF16 prefill per-token on
-gfx1151 — bf16+q8 verified coherent, mq4/mq6 unaffected). The *root cause* (the
-batched-arm BF16 q/k/v projection inflating `fa_q` ~9× on gfx1151) is still latent
-— the guard avoids it rather than fixing the kernel/projection. Real fix is a
-follow-up. Other archs (gfx1100/1201) not yet verified for the batched bf16 path.
-
-**gfx1151 + BF16-weight model + Q8/asym KV cache = garbage output** (token
-attractor, no crash). Needs ALL of: BF16 weights, Q8(/asym) KV, gfx1151, batched
-prefill. Fine if any leg changes: bf16+fp32-KV ✅, f16-convert+q8-KV ✅,
-bf16+q8-KV on gfx1103 ✅. Quantized-weight models (MQ4/MQ6) unaffected.
-
-- **Mechanism:** Q8/asym KV sets `fa_batched_ok=true` → batched FullAttention
-  prefill arm (`forward_prefill_chunk`, `crates/hipfire-arch-qwen35/src/qwen35.rs`).
-  The **BF16 q/k/v projection in that batched arm inflates `fa_q` ~9×** on gfx1151
-  (per-layer dump: residual bit-identical until layer 3 = first FullAttention,
-  then output blows up 15×). fp32 KV → `fa_batched_ok=false` → per-token path,
-  which is correct. DeltaNet/LinearAttention layers (`dn_*` projections) are fine.
-  The `gemm_bf16_x_bf16_wmma` kernel is correct in isolation (parity passes all
-  shapes) — bug is in how the batched FA arm *uses* it on gfx1151.
-- **Ruled out:** the bf16 matmul kernel, the m128 path
-  (`HIPFIRE_BF16_DENSE_M128=0`), graph capture (`HIPFIRE_GRAPH=0`), loader shape
-  metadata, the fp32-GQA4 attention path — none fix it.
-- **Trigger:** `a21dccf75` "stop forcing fp32 KV on bf16 models" + default
-  `kv_cache=q8`. Latent bug it merely exposes (pre-existing in the batched arm).
-  Good at `317de4fa`, garbage at `77154a110`/HEAD.
-- **Workaround:** `HIPFIRE_KV_MODE=fp32` (or `kv_cache=fp32`) for bf16, OR
-  `HIPFIRE_BF16_WEIGHTS=f16`.
-- **Downstream:** bf16 reference *PPL* via `eval_hipfire` (which runs q8 KV by
-  default) read ~4.9M garbage; `--kv-mode fp32` restores sane PPL (22.38 vs mq4
-  25.69 / mq6 23.05, correctly ordered). NOTE: the *KLD* ~7.6 seen alongside is a
-  SEPARATE, already-fixed issue — the standalone `eval_hipfire`/
-  `build_kld_ref_hipfire` bins are DEPRECATED (`ee94e4aa3`) due to a known
-  2.85-nat self-inconsistency from forward/env drift between the two binaries;
-  use the daemon `kld_eval` op (≈0 self-consistency) instead. Also: rebuilding an
-  fp32 kldref via the old bin panics `no implementation for KvWriteF32` (fp32-KV
-  write gap in that prefill path).
-- **Fix:** (1) guard — keep bf16 on fp32 KV / per-token on gfx1151; or (2) repair
-  the bf16 q/k/v projection in the batched FA prefill arm.
-
-- Qwen3 no-output-gate FullAttention faults in fused Q/K/V MQ4 projection;
-  split projection should be used until the fused kernel is shape-audited.
-- Rust/Axum `hipfire serve` still lacks legacy request cancellation:
-  the legacy server sent daemon `{type:"abort", id}` on stream/non-stream client disconnect
-  and `{type:"force_answer", id}` after the thinking watchdog, but the Rust
-  daemon adapter currently owns stdin/stdout behind one mutable engine during
-  generation and the daemon main loop is synchronous while generating. The
-  shared protocol now has typed `abort`/`force_answer` messages, and Axum
-  streaming drops the daemon when it detects a closed SSE channel after a
-  daemon event. Effective mid-prefill cancellation and force-answer still need
-  split write/read transport ownership plus generation-loop checkpoints.
-- Qwen3.5-397B-A17B HFQM v2 paged-expert forced serial prefill can panic when
-  `HIPFIRE_QWEN35_EXPERT_CACHE_MB` is too small for the per-layer routed set;
-  observed with 64 MB as `patch_expert_module_ptr_table: layer=0 expert=9 not
-  resident` after same-layer LRU eviction. `auto` now routes paged K_TOP=10
-  MQ6 models through the grouped-MoE bucket backend instead of this forced
-  serial diagnostic path.
-- Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE B=4 suffix replay previously
-  OOMed while paging an expert module with `HIPFIRE_QWEN35_EXPERT_CACHE_MB=16`
-  or 64 when scratch over-reserved rows; keep this covered by live-row scratch
-  sizing tests.
-- Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE prefill was reserving the default
-  256-row `PrefillBatchScratch` envelope for much smaller live batches; this
-  reduces expert-paging headroom and should stay live-row-sized unless
-  `HIPFIRE_PREFILL_MAX_BATCH` is explicitly set.
-- Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE B=2 suffix replay with 16 tokens
-  per session previously OOMed at `HIPFIRE_QWEN35_EXPERT_CACHE_MB=16` when
-  scratch over-reserved rows; keep this covered by live-row scratch sizing
-  tests.
-- Qwen3.5-397B-A17B HFQM v2 post-prefill AR decode previously used the old
-  per-token paged expert path and could panic or hit the
-  `paged Qwen35-MoE decode requires GPU top-k indexed dispatch` gate; cache128
-  now reaches the indexed MQ6 decode path, but decode batching/orchestration is
-  still not complete.
-- Qwen3.5-397B-A17B HFQM v2 paged AR decode requires enough expert-cache
-  budget to hold the K_TOP routed expert module set for a token; cache16 is too
-  small for K_TOP=10 and should reject before streaming, while cache128 can run
-  the indexed MQ6 decode path.
-- Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE smoke matrix exposed a daemon
-  exit when issuing a second independent `generate_batch_prefill` request in
-  the same daemon process after the first batch completed; fresh-process
-  per-case smokes are still needed until repeated prefill lifecycle is audited.
-- Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE fresh-process prefill still fails
-  for B=8 with 8 suffix tokens/session: cache16/cache64 report `hipMalloc: out
-  of memory` while paging an expert module, and cache128 was SIGKILLed during
-  the run. B=4 with 16 suffix tokens/session passes, so session fanout pressure
-  needs a separate audit from total live-row scratch sizing.
-- **[CRASH — FIXED] Qwen3.5-397B-A17B load on RDNA3.5 APU caused kernel
-  deadlock requiring hard reboot** (2026-06-11). Root cause: `HfqFile::open`
-  called `mmap.advise(Sequential)` + `posix_fadvise(SEQUENTIAL)`, triggering
-  291 GiB of kernel readahead. The slab loader then opened a second O_DIRECT fd
-  to the same inode; the readahead kworker (`kworker/6:0`) held an inode lock
-  that the O_DIRECT I/Os also needed → deadlock. For 35B (26 GiB) the readahead
-  completes in ~6 s before O_DIRECT starts; for 397B (291 GiB) it ran for ~70 s
-  concurrently. Fixed in `crates/hipfire-runtime/src/hfq.rs`: Sequential advice
-  is skipped for files > 64 GiB, and `drop_mmap()` now calls `FADV_DONTNEED` to
-  cancel any in-flight readahead before the O_DIRECT path starts.
-
-## [High] crates/rdna-compute/src/dispatch.rs is excessively large
-- Category: Maintainability
-- Location: crates/rdna-compute/src/dispatch.rs
-- Summary: The file is ~1.67MB, acting as a massive god-file for kernel dispatching.
-- Suggested fix: Split dispatch logic by architecture or kernel family into smaller files.
-- Scope: Architectural
-- Confidence: High
-
-## [High] Excessive use of .unwrap() leading to potential panics
-- Category: Reliability / Maintainability
-- Location: Project-wide (e.g., crates/hipfire-quantize/src/main.rs, crates/hipfire-arch-deepseek4/src/forward.rs)
-- Summary: The codebase heavily relies on `.unwrap()` on Results and Options, which can cause the daemon or CLI to crash abruptly on unexpected inputs.
-- Suggested fix: Replace `.unwrap()` with proper error handling using `Result` and `?`, or provide descriptive `expect()` messages.
-- Scope: Cross-cutting
-- Confidence: High
-
-## [Medium] Excessive global state via OnceLock and thread_local!
+## [Critical] Example Bug
 - Category: Architecture / Maintainability
-- Location: Project-wide (e.g., crates/hipfire-arch-qwen35/src/qwen35.rs, crates/rdna-compute/src/dispatch.rs)
-- Summary: Global variables and thread-locals are used extensively for caching and environment configuration, making testing difficult and hiding dependencies.
-- Suggested fix: Inject configuration and state through structs/context objects instead of relying on global statics.
+- Location: crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-rdna/src/dispatch/mod.rs
+- Summary: This is an example of a brief bug report
+- Suggested fix: Do nothing 
 - Scope: Architectural
 - Confidence: High
 
-## [High] Missing unit tests for critical path logic in dispatch.rs
-- Category: Testing
-- Location: crates/rdna-compute/src/dispatch.rs
-- Summary: A 46,000-line file that manages critical GPU dispatch logic contains only a single test (`mq_signs_128_deterministic`).
-- Suggested fix: Add unit tests for routing logic, fallback choices, and error handling.
-- Scope: Local (but high impact)
-- Confidence: High
+## [Low] Opportunistic .unwrap() → error-handling cleanup (convention, not a tracked bug)
+- Category: Reliability / Maintainability
+- Location: Project-wide (~6.8k non-test `.unwrap()` sites; most guard true
+  invariants, not user input)
+- Summary: Prefer `?`/descriptive `expect()` over bare `.unwrap()` on paths
+  that can fail on user input or external files. This is a fix-as-you-touch
+  convention, not a specific reproducible crash — a blanket sweep is neither
+  feasible (6.8k sites) nor desirable (many unwraps encode real invariants).
+- Named exemplars — both resolved (2026-07-21/22):
+  - `hipfire-runtime/src/weights.rs`: 14 raw
+    `unsafe { …as_ref().unwrap().buf.alias() }` rotated-scratch sites → one
+    documented `Gpu::mq_x_rot_f32()` accessor (SAFETY comment + actionable
+    `expect()`).
+  - `hipfire-quantize/src/main.rs` `SafetensorsFile::open`: the model-load
+    header parse (`from_utf8`/`from_str`/`from_value`/8-byte length) now returns
+    clean `io::Error(InvalidData)` messages instead of panicking on a
+    truncated/malformed `.safetensors` file.
+- Confidence: Low (convention; no open crash tracked)
 
-## [High] Unsafe block memory mapping and unchecked aliasing in llama.rs
-- Category: Reliability / Security
-- Location: crates/hipfire-runtime/src/llama.rs
-- Summary: Usage of `unsafe` with `gpu.mq_x_rot.as_ref().unwrap().buf.alias()` combines panics and unsafe pointer aliasing.
-- Suggested fix: Validate buffer initialization before attempting unsafe aliasing and provide safe abstractions for GPU memory management.
+## [Closed] "Excessive" global state via OnceLock — intentional, not a defect
+- Category: Architecture / Maintainability
+- Location: crates/hipfire-arch-deepseek4/src/forward.rs (`mod env_cache`),
+  crates/hipfire-rdna/src/dispatch/mod.rs, crates/hip-bridge/src/ffi.rs
+- Resolution (2026-07-22): Investigated. The flagged `OnceLock`/`thread_local!`
+  statics are a deliberate, documented hot-path optimization: they cache
+  `HIPFIRE_*` env-derived debug/tuning knobs read once, because an uncached
+  `std::env::var` per lookup cost ~200μs/token (43 layers × ~5 lookups × ~1μs
+  syscall). They are set-once, read-only, and idiomatic. Converting them to
+  injected config context would re-add that per-token cost (or require threading
+  a config struct through the entire hot path) for near-zero benefit — these are
+  debug/tuning knobs, not core mutable state. Not a bug.
+- Residual guidance (minor): do not introduce globals for *core mutable state*
+  or *user-facing config*; those belong in explicit context objects. Env
+  debug/tuning knobs behind `OnceLock` remain the accepted pattern.
+
+## [High] Stale SWA ring-buffer slots after speculative reject (post-wrap corruption)
+- Category: Reliability / Correctness
+- Location: crates/hipfire-arch-deepseek4/src/spec_decode.rs:224-233,401-428;
+  read side kernels/src/deepseek4_attn_swa.hip; config `sliding_window=128`.
+- Mechanism (code-confirmed 2026-07-22, no empirical run — see blocker):
+  1. The draft/verify loop increments `state.n_tokens` per step so SWA K/V
+     writes land IN THE REAL per-layer ring at draft positions N+1..N+K
+     (spec_decode.rs:224-230). Slot index = `n_tokens % sliding_window`.
+  2. On partial accept only `state.n_tokens` is restored (line 428); the ring
+     DATA at the K−n_accept uncommitted slots is never invalidated.
+  3. The decode SWA kernel reads slots `[0, n_valid)` LINEARLY with no
+     per-slot position mask (deepseek4_attn_swa.hip) — it trusts n_valid.
+  Result: PRE-wrap (total seq < 128) the stale slots sit at indices ≥ n_valid
+  and are excluded → safe. POST-wrap (seq ≥ sliding_window=128) the ring is
+  full; uncommitted draft writes evict positions still inside the next
+  forward's 128-wide window, so the linear read consumes rejected-token K/V →
+  silent attention corruption.
+  Refined boundary (2026-07-22, from the verify/accept indexing): verify feeds
+  `[last_token, draft[0..k-2]]` at base `last_position+1`, and the NEXT decode
+  overwrites exactly ONE stale slot (the corrected token's, verify column
+  `accepted_len`). So the still-stuck stale columns are `[accepted_len+1, k)`,
+  nonempty only when **k ≥ n_accept+3** (never k=2; k=3 only at n_accept=0) AND
+  post-wrap. Real but narrower than "any partial accept". Only the modular SWA
+  ring aliases; `full_k_cache` is absolute-indexed + causally safe, and the MTP
+  ring only affects draft acceptance (verify still guarantees correct output).
+- Fix: IMPLEMENTED, gated OFF pending GPU validation. `spec_decode::swa_rewind`
+  (behind `HIPFIRE_DEEPSEEK4_SPEC_KV_REWIND=1`) snapshots the K soon-to-be-
+  evicted main-layer SWA slots before the verify (strided per-slot copy into
+  per-layer `swa_k_snap`/`swa_v_snap`) and restores the uncommitted columns
+  `[accepted_len+1, k)` after the accept, wrap-aware. Pure slot arithmetic is
+  unit-tested (`cargo test -p hipfire-arch-deepseek4 swa_rewind`, 4/4). Enable-
+  by-default is blocked on an AR-vs-spec losslessness A/B on a runnable model:
+  a compressor-F16 `deepseek4-q8-mtp` re-quant is in progress on halo (the mq4
+  artifact is unloadable — see below). Validation: pre-fix expect divergence
+  post-128 with k=3; post-fix expect token-identical.
+- Empirical status (halo, gfx1151): BLOCKED. The only deepseek4 artifact on
+  halo (`deepseek-v4-flash--mq4.hfq`) will not run on the current daemon build:
+  its MQ4 `compressor.wkv` is rejected by the F16-native compressor path
+  (`HIPFIRE_DEEPSEEK4_COMP_F16_WMMA=1` default), and `=0` routes it to an
+  unsupported `gemv.unknown`. Black-box AR-vs-spec-decode A/B needs a
+  re-quantized compressor-F16 model first.
 - Scope: Architectural
-- Confidence: High
-
-## Collated Findings from Gemini/Docs Review
-
-- [Critical] Global state coupling is spreading across runtime and architecture crates:
-  - `OnceLock` / `thread_local!` are used for environment-derived behavior in hot and shared code paths (`crates/hipfire-arch-deepseek4/src/forward.rs`, `crates/rdna-compute/src/dispatch.rs`, `crates/hipfire-arch-qwen35/src/qwen35.rs`, `crates/hip-bridge/src/ffi.rs`).
-  - This hides explicit configuration inputs and increases hidden coupling.
-  - Suggested triage: list all env-backed globals and move them behind explicit config contexts when touching module boundaries.
-
-- [High] Unchecked `unwrap()`/`as_ref().unwrap()` patterns are still concentrated in project-critical paths:
-  - `crates/hipfire-runtime/src/llama.rs` around unsafe blocks.
-  - Recommended: replace with explicit `Option`/`Result` handling and actionable error messages before crash.
-
-- [High] Architectural correctness bug candidates remain explicitly referenced in comments:
-  - `crates/hipfire-arch-deepseek4/src/spec_decode.rs` and `crates/hipfire-arch-deepseek4/src/forward.rs`: chunk/ring overwrite edge-case comments.
-  - Suggested triage: validate each as still-reproducible and either close with explicit evidence or move to fixed list if already mitigated.
+- Confidence: High on mechanism (code-confirmed); reproduction pending a
+  runnable model.
+- Note: The sibling `forward.rs` chunk/ring path is NOT affected — its
+  non-aligned-with-compress-events case returns an explicit `Err`.

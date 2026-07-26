@@ -1,0 +1,6 @@
+variant,compile_status,hardware_status,output_bytes,max_core_text_bytes,result,notes
+logical_owner_stream_chain,routing_failed,not_run,,,rejected,"Unable to find a legal routing after extended routing search"
+physical_column_major_stream_chain,routing_failed,not_run,,,rejected,"Unable to find a legal routing after extended routing search"
+neighbor_memory_new_shim_route,routing_failed,not_run,,,rejected,"Adjacent ObjectFIFOs compile until the added shim output route; unable to find a legal routing"
+completed_output_zero_stride,compile_failed,not_run,,,rejected,"Compiler reports: Stride 2 must be a positive integer"
+compact_split_planes,passed,failed,589824,11200,rejected,"Builds in about 9 s; 107811 mismatches; max Q delta 254; max scale error 0.034057196; errors span all K256 groups and local-memory owner positions"

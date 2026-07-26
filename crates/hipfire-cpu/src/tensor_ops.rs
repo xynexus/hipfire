@@ -351,9 +351,7 @@ pub fn conv2d_nchw_with_stride(
     stride: usize,
 ) -> CpuResult<CpuTensor> {
     if stride == 0 {
-        return Err(CpuError(
-            "conv2d stride must be positive".to_string(),
-        ));
+        return Err(CpuError("conv2d stride must be positive".to_string()));
     }
     let [batch, in_channels, in_h, in_w] = shape4(input)?;
     let [out_channels, weight_in_channels, kernel_h, kernel_w] = shape4(weight)?;
@@ -487,9 +485,7 @@ pub fn group_norm_nchw(
 
 pub fn upsample_nearest2d_nchw(input: &CpuTensor, scale: usize) -> CpuResult<CpuTensor> {
     if scale == 0 {
-        return Err(CpuError(
-            "upsample scale must be positive".to_string(),
-        ));
+        return Err(CpuError("upsample scale must be positive".to_string()));
     }
     let [batch, channels, height, width] = shape4(input)?;
     let out_h = height * scale;
@@ -503,6 +499,45 @@ pub fn upsample_nearest2d_nchw(input: &CpuTensor, scale: usize) -> CpuResult<Cpu
                     let ix = ox / scale;
                     out.data[nchw_idx(b, c, oy, ox, channels, out_h, out_w)] =
                         input.data[nchw_idx(b, c, iy, ix, channels, height, width)];
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Space-to-depth by `scale` (inverse of pixel-shuffle), NCHW:
+/// `[N, C, H, W] -> [N, C*scale*scale, H/scale, W/scale]`. Output channel
+/// `c*scale*scale + dy*scale + dx` gathers `input[n, c, oh*scale+dy, ow*scale+dx]`,
+/// matching PyTorch/basicsr `pixel_unshuffle`. Used by the RealESRGAN x2 input
+/// stage.
+pub fn pixel_unshuffle_nchw(input: &CpuTensor, scale: usize) -> CpuResult<CpuTensor> {
+    if scale == 0 {
+        return Err(CpuError(
+            "pixel_unshuffle scale must be positive".to_string(),
+        ));
+    }
+    let [batch, channels, height, width] = shape4(input)?;
+    if height % scale != 0 || width % scale != 0 {
+        return Err(CpuError(format!(
+            "pixel_unshuffle input [{height}, {width}] not divisible by scale {scale}"
+        )));
+    }
+    let out_h = height / scale;
+    let out_w = width / scale;
+    let out_channels = channels * scale * scale;
+    let mut out = CpuTensor::zeros(&[batch, out_channels, out_h, out_w]);
+    for b in 0..batch {
+        for c in 0..channels {
+            for y in 0..height {
+                let dy = y % scale;
+                let by = y / scale;
+                for x in 0..width {
+                    let dx = x % scale;
+                    let bx = x / scale;
+                    let c_out = c * scale * scale + dy * scale + dx;
+                    out.data[nchw_idx(b, c_out, by, bx, out_channels, out_h, out_w)] =
+                        input.data[nchw_idx(b, c, y, x, channels, height, width)];
                 }
             }
         }

@@ -500,6 +500,34 @@ pub fn run_moe_decode(
             2 * p.mi,
             gate_up_k,
         ))?;
+    } else if res.routed_indexable_oq4 {
+        // Opus Quant W4A16 indexed gate_up (132 B/group MoE-block kernel; `xr`
+        // is FWHT-rotated above, same basis as the MQ path). Batched variant
+        // with batch=1 (single-token decode).
+        hip!(gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            xr,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            gate_up_k,
+            p.k,
+            1,
+        ))?;
+    } else if res.routed_indexable_oq8 {
+        // Opus Quant W8A16 indexed gate_up (260 B/group, OqPlusCompact-expanded).
+        hip!(gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            xr,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            gate_up_k,
+            p.k,
+            1,
+        ))?;
     } else {
         // routed_indexable_paro
         hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
@@ -556,6 +584,28 @@ pub fn run_moe_decode(
         ))?;
     } else if res.routed_indexable_mq6 {
         hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.rot_batch,
+            p.down_expanded,
+            down_m,
+            down_k,
+            p.k,
+            1,
+        ))?;
+    } else if res.routed_indexable_oq4 {
+        hip!(gpu.gemv_oq4g256_moe_down_k8_indexed_batched_expanded(
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.rot_batch,
+            p.down_expanded,
+            down_m,
+            down_k,
+            p.k,
+            1,
+        ))?;
+    } else if res.routed_indexable_oq8 {
+        hip!(gpu.gemv_oq8g256_moe_down_k8_indexed_batched_expanded(
             p.expert_down_ptrs,
             p.topk_indices,
             p.rot_batch,
@@ -1114,8 +1164,7 @@ pub fn run_moe_prefill_bias_aware(
     let nosync_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
 
     if use_grouped {
-        const BLOCK_M: usize = 16;
-        let m_total_max = batch_size * k_top + n_exp * BLOCK_M;
+        let m_total_max = batch_size * k_top + n_exp * hipfire_rdna::GROUPED_MOE_BLOCK_ROWS;
 
         // Scatter: histogram + offsets + permute (single launch).
         hip!(gpu.moe_scatter_fused_k8(
@@ -1128,7 +1177,7 @@ pub fn run_moe_prefill_bias_aware(
             batch_size * k_top,
             n_exp,
             m_total_max,
-            BLOCK_M,
+            hipfire_rdna::GROUPED_MOE_BLOCK_ROWS,
         ))?;
 
         // Grouped gate_up GEMM (M=2*im, K=hidden, x_row_div=k_top, rows=B).
@@ -1303,10 +1352,6 @@ pub fn run_moe_prefill_bias_aware(
 
 // ── Qwen3.5 batched MoE prefill (Ship 4.2) ──────────────────────────
 
-/// MoE grouped-GEMM block size (WMMA tile row count). Must match the
-/// constant in qwen35.rs and the scatter kernel.
-const MOE_GROUPED_BLOCK_M: usize = 16;
-
 /// Dispatch one grouped-GEMM for the given routed expert dtype.
 ///
 /// Deduplicates the per-dtype×i8×k8 grouped-kernel match for gate_up
@@ -1319,7 +1364,7 @@ const MOE_GROUPED_BLOCK_M: usize = 16;
 /// preamble because `rot_batch` is already Givens-rotated by the
 /// silu+rotate step.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_grouped_gemm(
+pub fn run_grouped_moe_gemm(
     gpu: &mut Gpu,
     dtype: DType,
     ptrs: &GpuTensor,
@@ -1364,6 +1409,84 @@ fn dispatch_grouped_gemm(
             x_row_div,
             m_total,
             rows,
+        )),
+        DType::MQ3G256 => hip!(gpu.gemm_hfq3g256_moe_grouped_wmma(
+            ptrs,
+            tile_ids,
+            sorted_slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            rows,
+        )),
+        DType::MQ2G256Lloyd => hip!(gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+            ptrs,
+            tile_ids,
+            sorted_slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            rows,
+        )),
+        DType::Oq4G256 if gpu.arch.starts_with("gfx11") => {
+            hip!(gpu.gemm_oq4g256_moe_grouped_wmma(
+                ptrs,
+                tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                rows,
+            ))
+        }
+        DType::F16 if gpu.arch == "gfx1151" => {
+            hip!(gpu.gemm_f16_moe_grouped_wmma_gfx1151(
+                ptrs,
+                tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                rows,
+            ))
+        }
+        DType::BF16 if gpu.arch == "gfx1151" => {
+            hip!(gpu.gemm_bf16_moe_grouped_wmma_gfx1151(
+                ptrs,
+                tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                rows,
+            ))
+        }
+        DType::F16 | DType::BF16 => hip!(gpu.gemm_raw_moe_grouped_portable(
+            dtype,
+            ptrs,
+            tile_ids,
+            sorted_slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total,
         )),
         DType::ParoQ4G128 => {
             if paro_i8_k8 {
@@ -1441,6 +1564,11 @@ pub fn run_moe_prefill(
     let (n, mi, k_top, n_exp) = (p.batch_size, p.mi, p.k_top, p.n_exp);
     let (down_m, down_k, gate_up_k) = (p.down_m, p.down_k, p.gate_up_k);
     let total_slots = n * k_top;
+    let gate_up_source = if matches!(p.dtypes.routed_gate_up, DType::F16 | DType::BF16) {
+        p.x_norm_batch
+    } else {
+        p.x_rot_batch
+    };
 
     // EP (Ship 6 substrate-EP prefill): the routed combine accumulates into
     // `out_target` — the zeroed `[batch × dim]` partial when `routed_out` is set
@@ -1454,7 +1582,7 @@ pub fn run_moe_prefill(
 
     // ── Path 2 scatter pipeline ───────────────────────────────────────
     let mut path2_m_total: usize = 0;
-    if res.use_path2 {
+    if res.use_path2 || p.capture.is_some() {
         let m_total_max = p.m_total_max;
         hip!(gpu.moe_scatter_fused_k8(
             p.topk_indices,
@@ -1466,7 +1594,7 @@ pub fn run_moe_prefill(
             total_slots,
             n_exp,
             m_total_max,
-            MOE_GROUPED_BLOCK_M,
+            hipfire_rdna::GROUPED_MOE_BLOCK_ROWS,
         ))?;
         path2_m_total = m_total_max;
     }
@@ -1491,13 +1619,31 @@ pub fn run_moe_prefill(
                 paro.krot,
             ))?;
         }
-        dispatch_grouped_gemm(
+        if let Some(capture) = p.capture {
+            capture.capture(
+                gpu,
+                &crate::families::moe::MoePrefillCaptureBatch {
+                    layer: p.layer,
+                    point: crate::families::moe::MoePrefillCapturePoint::GateUpInput,
+                    source: gate_up_source,
+                    source_width: gate_up_k,
+                    source_row_div: k_top,
+                    topk_indices: p.topk_indices,
+                    topk_weights: p.topk_weights,
+                    sorted_slot_index: p.sorted_slot_index,
+                    batch_size: n,
+                    k_top,
+                    num_experts: n_exp,
+                },
+            )?;
+        }
+        run_grouped_moe_gemm(
             gpu,
             p.dtypes.routed_gate_up,
             p.expert_gate_up_ptrs,
             p.expert_tile_ids,
             p.sorted_slot_index,
-            p.x_rot_batch,
+            gate_up_source,
             p.y_gate_up_grouped,
             2 * mi,
             gate_up_k,
@@ -1534,10 +1680,28 @@ pub fn run_moe_prefill(
                 gate_up_k,
                 paro.krot,
             ))?;
+            if let Some(capture) = p.capture {
+                capture.capture(
+                    gpu,
+                    &crate::families::moe::MoePrefillCaptureBatch {
+                        layer: p.layer,
+                        point: crate::families::moe::MoePrefillCapturePoint::GateUpInput,
+                        source: gate_up_source,
+                        source_width: gate_up_k,
+                        source_row_div: k_top,
+                        topk_indices: p.topk_indices,
+                        topk_weights: p.topk_weights,
+                        sorted_slot_index: p.sorted_slot_index,
+                        batch_size: n,
+                        k_top,
+                        num_experts: n_exp,
+                    },
+                )?;
+            }
             hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed_batched(
                 p.expert_gate_up_ptrs,
                 p.topk_indices,
-                p.x_rot_batch,
+                gate_up_source,
                 p.gate_batch,
                 p.up_batch,
                 2 * mi,
@@ -1548,11 +1712,29 @@ pub fn run_moe_prefill(
         } else {
             // MQ4/MQ6 indexed batched GEMV (x_rot_batch is already FWHT-rotated
             // by the model).
+            if let Some(capture) = p.capture {
+                capture.capture(
+                    gpu,
+                    &crate::families::moe::MoePrefillCaptureBatch {
+                        layer: p.layer,
+                        point: crate::families::moe::MoePrefillCapturePoint::GateUpInput,
+                        source: gate_up_source,
+                        source_width: gate_up_k,
+                        source_row_div: k_top,
+                        topk_indices: p.topk_indices,
+                        topk_weights: p.topk_weights,
+                        sorted_slot_index: p.sorted_slot_index,
+                        batch_size: n,
+                        k_top,
+                        num_experts: n_exp,
+                    },
+                )?;
+            }
             let gate_up_result = match p.dtypes.routed_gate_up {
                 DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
                     p.expert_gate_up_ptrs,
                     p.topk_indices,
-                    p.x_rot_batch,
+                    gate_up_source,
                     p.gate_batch,
                     p.up_batch,
                     2 * mi,
@@ -1564,6 +1746,72 @@ pub fn run_moe_prefill(
                     p.expert_gate_up_ptrs,
                     p.topk_indices,
                     p.x_rot_batch,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    k_top,
+                    n,
+                )),
+                DType::MQ2G256 => hip!(gpu.gemv_hfq2g256_moe_gate_up_k8_indexed_batched(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    gate_up_source,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    k_top,
+                    n,
+                )),
+                DType::MQ8G256 => hip!(gpu.gemv_hfq8g256_moe_gate_up_k8_indexed_batched(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    gate_up_source,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    k_top,
+                    n,
+                )),
+                DType::MQ2G256Lloyd => hip!(gpu.gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    gate_up_source,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    k_top,
+                    n,
+                )),
+                DType::MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    gate_up_source,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    k_top,
+                    n,
+                )),
+                DType::Oq4G256 => hip!(gpu.gemv_oq4g256_moe_gate_up_k8_indexed_batched(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    gate_up_source,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * mi,
+                    gate_up_k,
+                    k_top,
+                    n,
+                )),
+                DType::Oq8G256 => hip!(gpu.gemv_oq8g256_moe_gate_up_k8_indexed_batched(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    gate_up_source,
                     p.gate_batch,
                     p.up_batch,
                     2 * mi,
@@ -1605,7 +1853,18 @@ pub fn run_moe_prefill(
         // MQ4/MQ6: the silu+rotate kernel is weight-agnostic (reads only
         // activations, not weight data). AWQ-aware variant when down has AWQ.
         match p.dtypes.routed_down {
-            DType::MQ4G256 | DType::MQ6G256 => {
+            DType::F16 | DType::BF16 => {
+                hip!(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch,))?
+            }
+            DType::MQ2G256
+            | DType::MQ3G256
+            | DType::MQ4G256
+            | DType::MQ6G256
+            | DType::MQ8G256
+            | DType::MQ2G256Lloyd
+            | DType::MQ3G256Lloyd
+            | DType::Oq4G256
+            | DType::Oq8G256 => {
                 if let Some(awq) = p.down_awq_scale {
                     hip!(gpu.fused_silu_mul_rotate_mq_awq_batched(
                         p.gate_batch,
@@ -1636,10 +1895,29 @@ pub fn run_moe_prefill(
         }
     }
 
+    if let Some(capture) = p.capture {
+        capture.capture(
+            gpu,
+            &crate::families::moe::MoePrefillCaptureBatch {
+                layer: p.layer,
+                point: crate::families::moe::MoePrefillCapturePoint::DownInput,
+                source: p.rot_batch,
+                source_width: down_k,
+                source_row_div: 1,
+                topk_indices: p.topk_indices,
+                topk_weights: p.topk_weights,
+                sorted_slot_index: p.sorted_slot_index,
+                batch_size: n,
+                k_top,
+                num_experts: n_exp,
+            },
+        )?;
+    }
+
     // ── Down projection ───────────────────────────────────────────────
     if res.use_path2 {
         // Path 2: grouped-WMMA-GEMM + non-atomic combine via inverse_perm.
-        dispatch_grouped_gemm(
+        run_grouped_moe_gemm(
             gpu,
             p.dtypes.routed_down,
             p.expert_down_ptrs,
@@ -1707,6 +1985,68 @@ pub fn run_moe_prefill(
                 n,
             )),
             DType::MQ6G256 => hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                k_top,
+                n,
+            )),
+            DType::MQ2G256 => hip!(gpu.gemv_hfq2g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                k_top,
+                n,
+            )),
+            DType::MQ8G256 => hip!(gpu.gemv_hfq8g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                k_top,
+                n,
+            )),
+            DType::MQ2G256Lloyd => hip!(gpu
+                .gemv_mq2g256_lloyd_moe_down_k8_indexed_batched_expanded(
+                    p.expert_down_ptrs,
+                    p.topk_indices,
+                    p.rot_batch,
+                    p.down_expanded,
+                    down_m,
+                    down_k,
+                    k_top,
+                    n,
+                )),
+            DType::MQ3G256Lloyd => hip!(gpu
+                .gemv_mq3g256_lloyd_moe_down_k8_indexed_batched_expanded(
+                    p.expert_down_ptrs,
+                    p.topk_indices,
+                    p.rot_batch,
+                    p.down_expanded,
+                    down_m,
+                    down_k,
+                    k_top,
+                    n,
+                )),
+            DType::Oq4G256 => hip!(gpu.gemv_oq4g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                k_top,
+                n,
+            )),
+            DType::Oq8G256 => hip!(gpu.gemv_oq8g256_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs,
                 p.topk_indices,
                 p.rot_batch,

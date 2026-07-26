@@ -49,10 +49,10 @@ fn main() {
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_rdna::DType;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
     use hipfire_runtime::sampler;
-    use hipfire_rdna::DType;
     use std::path::Path;
     use std::time::Instant;
 

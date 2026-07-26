@@ -1,0 +1,4 @@
+trial,host,cache_dir,iterations,q_cosine,q_max,q_bit_mismatches,k_cosine,k_max,k_bit_mismatches,v_bit_mismatches,dispatch_ms,oracle,stage_layout,q_bytes,kv_bytes
+0,halo,/home/sadara/.hipfire/npu/embgemma_r67_joined_stage_to_qkv_m256,100,0.99999121,0.0078125,98461,0.99999156,0.0078125,32701,0,0.367,pass,r65-inline-10240,393216,262144
+1,halo,/home/sadara/.hipfire/npu/embgemma_r67_joined_stage_to_qkv_m256,100,0.99999121,0.0078125,98461,0.99999156,0.0078125,32701,0,0.3517,pass,r65-inline-10240,393216,262144
+2,halo,/home/sadara/.hipfire/npu/embgemma_r67_joined_stage_to_qkv_m256,100,0.99999121,0.0078125,98461,0.99999156,0.0078125,32701,0,0.3687,pass,r65-inline-10240,393216,262144

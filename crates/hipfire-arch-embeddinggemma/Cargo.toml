@@ -1,0 +1,26 @@
+[package]
+name = "hipfire-arch-embeddinggemma"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "embeddinggemma text-embedding encoder (bidirectional Gemma-3 backbone + mean pooling + Matryoshka Dense heads). arch_id=19. Serves pooled sentence embeddings, not autoregressive logits."
+
+# Bring-up status: Phase 1 — EmbeddingGemmaConfig + config parsing landed and
+# unit-tested (no GPU deps). weights.rs / forward.rs (bidirectional prefill via
+# the masked attention kernel, mean-pool, Dense projection heads) + the pooling
+# serving seam are the remaining Phase 2 GPU work. The quantizer ingest (arch_id
+# 19 + ST pooling/Dense metadata + the (1+w) RMSNorm baking shared with gemma3)
+# ships via hipfire-quantize. Target: google/embeddinggemma-300m.
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-rdna = { path = "../hipfire-rdna" }
+hip-bridge = { path = "../hip-bridge" }
+hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
+serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hipfire-xdna = { path = "../hipfire-xdna" }
+
+[dev-dependencies]
+hipfire-primitives = { path = "../hipfire-primitives" }

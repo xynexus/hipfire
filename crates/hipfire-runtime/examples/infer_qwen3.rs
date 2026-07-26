@@ -305,6 +305,7 @@ fn main() {
     let make_sampler_cfg = |t: f32| SamplerConfig {
         temperature: t,
         top_p,
+        top_k: 20,
         repeat_penalty,
         repeat_window: repeat_buf_cap.min(repeat_window),
         presence_penalty: 0.0,

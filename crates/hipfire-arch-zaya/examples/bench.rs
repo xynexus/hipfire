@@ -30,9 +30,9 @@
 
 use hipfire_arch_zaya::arch::ZayaModel;
 use hipfire_arch_zaya::ZayaConfig;
+use hipfire_rdna::Gpu;
 use hipfire_runtime::arch::SimpleAr;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_rdna::Gpu;
 use std::path::Path;
 use std::time::Instant;
 
@@ -53,7 +53,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let hfq_path = args
         .next()
-        .unwrap_or_else(|| "/home/sadara/zaya1-8b-native.mq4.hfq".to_string());
+        .unwrap_or_else(|| "/home/sadara/zaya1-8b-native--mq4.hfq".to_string());
     let ntok: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(32);
 
     let hfq = HfqFile::open(Path::new(&hfq_path)).expect("open hfq");

@@ -34,18 +34,76 @@ pub struct ColdTier {
     pub n_slots: usize, // padded (even) tile width
     pub n_valid: usize, // real slot count (slots >= n_valid are zero padding — mask in reads)
     pub rotate: bool,
+    /// V tiles are stored PER-SLOT `[n_slots × head_dim]` (row = slot) instead of
+    /// the K per-channel `[head_dim × n_slots]`. V enters attention as a weighted
+    /// average, so its natural quant axis is the token/slot axis (measured ~15-20%
+    /// lower attention-output error than reusing K's per-channel var-norm; probe
+    /// value_quant_treatment.rs). No FWHT on V in this mode (buys nothing for V).
+    pub v_perslot: bool,
+}
+
+/// Greedy K-similarity grouping (CASK-style consolidation). Clusters the non-core
+/// scratch tokens into groups of up to `fold_m` NEAR-DUPLICATE keys (highest cosine
+/// on the full K vector), so the mass-weighted average folds tokens that barely
+/// differ — nearly lossless, unlike position-adjacency which averages distinct
+/// content (the measured merge-loss root cause). O(n²) over scratch; runs off the
+/// latency path (idle/migration). ponytail: O(n²) greedy is fine at migrate/idle
+/// scratch sizes; if long-session drains get huge, cap with a candidate window / LSH.
+fn similarity_groups(k: &[f32], scratch: &[usize], kv_dim: usize, fold_m: usize) -> Vec<Vec<u32>> {
+    let n = scratch.len();
+    let norm: Vec<f32> = scratch
+        .iter()
+        .map(|&t| {
+            let b = t * kv_dim;
+            (0..kv_dim)
+                .map(|d| k[b + d] * k[b + d])
+                .sum::<f32>()
+                .sqrt()
+                .max(1e-12)
+        })
+        .collect();
+    let cos = |i: usize, j: usize| -> f32 {
+        let (bi, bj) = (scratch[i] * kv_dim, scratch[j] * kv_dim);
+        let dot: f32 = (0..kv_dim).map(|d| k[bi + d] * k[bj + d]).sum();
+        dot / (norm[i] * norm[j])
+    };
+    let mut used = vec![false; n];
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    for seed in 0..n {
+        if used[seed] {
+            continue;
+        }
+        used[seed] = true;
+        let mut group = vec![scratch[seed] as u32];
+        if fold_m > 1 {
+            let mut cands: Vec<(f32, usize)> = (0..n)
+                .filter(|&j| !used[j])
+                .map(|j| (cos(seed, j), j))
+                .collect();
+            cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            for &(_, j) in cands.iter().take(fold_m - 1) {
+                used[j] = true;
+                group.push(scratch[j] as u32);
+            }
+        }
+        groups.push(group);
+    }
+    groups
 }
 
 /// Deferred cold-tier compaction. `k`,`v` are `[n_tok, n_kv_heads*head_dim]` f32,
 /// post-RoPE (the cold tokens, contiguous). `importance[t]` is a shared (head-
 /// aggregated) score; higher = keep exact. `core_frac` of tokens stay singleton
 /// (exact), the rest fold `fold_m:1` by importance-weighted average. `rotate` =
-/// FWHT-256 incoherence per head before quantize. head_dim must be 256 (KVarN v1).
+/// FWHT incoherence per head before quantize. head_dim ∈ {128, 256} (the FWHT is
+/// length-general; signs are generated at head_dim).
 ///
-/// `position_local`: when true, the to-be-merged (non-core) tokens are grouped by
-/// adjacent POSITION rather than by importance rank, so each merged slot averages
-/// K vectors with similar RoPE phase (less phase-blur — the dominant cold-merge
-/// quality cost). Core selection stays importance-based either way.
+/// Grouping of the non-core tokens (which fold together):
+/// - `similarity_merge` (CASK): cluster near-DUPLICATE keys by K-cosine → averaging
+///   is ~lossless (fixes the content-merge loss). Takes precedence when set.
+/// - else `position_local`: group by adjacent POSITION (similar RoPE phase); the
+///   original default.
+/// Core selection stays importance-based either way.
 #[allow(clippy::too_many_arguments)]
 pub fn compact_cold_kv(
     k: &[f32],
@@ -58,11 +116,22 @@ pub fn compact_cold_kv(
     fold_m: usize,
     rotate: bool,
     position_local: bool,
-    // Max quant code for the cold tiles: 15 = 4-bit (default), 3 = 2-bit, etc.
-    // Lower = lower-precision cold quant (quality probe; same nibble storage).
-    qmax: f32,
+    similarity_merge: bool,
+    // Max quant code for the cold K / V tiles, independently: 15 = 4-bit, 3 =
+    // 2-bit, etc. Asymmetric (e.g. K2V4: k_qmax=3, v_qmax=15) is supported — V is
+    // the "easy" operand (weighted-average, no outlier channels), so it can carry
+    // more bits than K for the same footprint budget, or match it.
+    k_qmax: f32,
+    v_qmax: f32,
+    // Store V per-slot (row=slot, no FWHT) instead of K's per-channel layout.
+    // V's error enters attention as a weighted average → the slot axis is its
+    // natural quant axis (~15-20% lower output error at the same bits).
+    v_perslot: bool,
 ) -> ColdTier {
-    assert_eq!(head_dim, 256, "KVarN v1 FWHT is 256-wide");
+    assert!(
+        head_dim == 256 || head_dim == 128,
+        "KVarN FWHT supports head_dim 128 or 256 (got {head_dim})"
+    );
     assert!(fold_m >= 1);
     assert_eq!(k.len(), n_tok * n_kv_heads * head_dim);
     let kv_dim = n_kv_heads * head_dim;
@@ -76,30 +145,34 @@ pub fn compact_cold_kv(
     });
     let ncore = ((core_frac * n_tok as f32) as usize).min(n_tok);
     let core = &order[..ncore];
-    // The non-core tokens to merge. Position-local grouping sorts them back into
-    // ascending position so each fold_m group is position-contiguous (similar
-    // RoPE phase); otherwise they stay in importance-rank order.
+    // The non-core tokens to merge. similarity_merge (CASK) clusters near-duplicates;
+    // else position_local sorts into ascending position (RoPE-phase-contiguous groups);
+    // else importance-rank order.
     let mut scratch_owned: Vec<usize> = order[ncore..].to_vec();
-    if position_local {
+    if position_local && !similarity_merge {
         scratch_owned.sort_unstable();
     }
     let scratch = &scratch_owned[..];
-    let nb = scratch.len().checked_div(fold_m).unwrap_or(0);
 
-    let mut slot_members: Vec<Vec<u32>> = Vec::with_capacity(ncore + nb + fold_m);
+    let mut slot_members: Vec<Vec<u32>> = Vec::with_capacity(ncore + scratch.len());
     for &t in core {
         slot_members.push(vec![t as u32]);
     }
-    for g in 0..nb {
-        slot_members.push(
-            scratch[g * fold_m..(g + 1) * fold_m]
-                .iter()
-                .map(|&x| x as u32)
-                .collect(),
-        );
-    }
-    for &t in &scratch[nb * fold_m..] {
-        slot_members.push(vec![t as u32]); // leftover scratch kept singleton
+    if similarity_merge && fold_m > 1 {
+        slot_members.extend(similarity_groups(k, scratch, kv_dim, fold_m));
+    } else {
+        let nb = scratch.len().checked_div(fold_m).unwrap_or(0);
+        for g in 0..nb {
+            slot_members.push(
+                scratch[g * fold_m..(g + 1) * fold_m]
+                    .iter()
+                    .map(|&x| x as u32)
+                    .collect(),
+            );
+        }
+        for &t in &scratch[nb * fold_m..] {
+            slot_members.push(vec![t as u32]); // leftover scratch kept singleton
+        }
     }
     let n_valid = slot_members.len();
     let n_slots = if n_valid.is_multiple_of(2) {
@@ -113,8 +186,8 @@ pub fn compact_cold_kv(
         .collect();
 
     // 2/3. Per head: build [head_dim × n_slots] tile of (rotated) merged K/V, quantize.
-    let s1 = gen_fwht_signs(42, 256);
-    let s2 = gen_fwht_signs(1042, 256);
+    let s1 = gen_fwht_signs(42, head_dim);
+    let s2 = gen_fwht_signs(1042, head_dim);
     let mut k_tiles = Vec::with_capacity(n_kv_heads);
     let mut v_tiles = Vec::with_capacity(n_kv_heads);
     for h in 0..n_kv_heads {
@@ -143,15 +216,29 @@ pub fn compact_cold_kv(
             }
             if rotate {
                 signed_fwht(&mut kvec, &s1, &s2);
-                signed_fwht(&mut vvec, &s1, &s2);
+                // V keeps its original basis in per-slot mode (no incoherence
+                // rotation needed — V has no outlier-channel pathology).
+                if !v_perslot {
+                    signed_fwht(&mut vvec, &s1, &s2);
+                }
             }
             for d in 0..head_dim {
-                ktile[d * n_slots + s] = kvec[d];
-                vtile[d * n_slots + s] = vvec[d];
+                ktile[d * n_slots + s] = kvec[d]; // K: channel-major [head_dim × n_slots]
+                if v_perslot {
+                    vtile[s * head_dim + d] = vvec[d]; // V: slot-major [n_slots × head_dim]
+                } else {
+                    vtile[d * n_slots + s] = vvec[d];
+                }
             }
         }
-        k_tiles.push(kvarn::quantize_tile_qmax(&ktile, head_dim, n_slots, qmax));
-        v_tiles.push(kvarn::quantize_tile_qmax(&vtile, head_dim, n_slots, qmax));
+        k_tiles.push(kvarn::quantize_tile_qmax(&ktile, head_dim, n_slots, k_qmax));
+        // Per-slot V quantizes with slot as the row (per-token min/max grid); the
+        // per-channel path keeps head_dim as the row (reuses the K codec on V).
+        v_tiles.push(if v_perslot {
+            kvarn::quantize_tile_qmax(&vtile, n_slots, head_dim, v_qmax)
+        } else {
+            kvarn::quantize_tile_qmax(&vtile, head_dim, n_slots, v_qmax)
+        });
     }
 
     ColdTier {
@@ -163,6 +250,7 @@ pub fn compact_cold_kv(
         n_slots,
         n_valid,
         rotate,
+        v_perslot,
     }
 }
 
@@ -170,8 +258,8 @@ impl ColdTier {
     /// Dequantize head `h` back to (K, V) as `[n_valid × head_dim]` row-major in the
     /// ORIGINAL (un-rotated) basis — what a cold-tier attention read consumes.
     pub fn dequant_head(&self, h: usize) -> (Vec<f32>, Vec<f32>) {
-        let s1 = gen_fwht_signs(42, 256);
-        let s2 = gen_fwht_signs(1042, 256);
+        let s1 = gen_fwht_signs(42, self.head_dim);
+        let s2 = gen_fwht_signs(1042, self.head_dim);
         let kt = kvarn::dequantize_tile(&self.k_tiles[h]); // [head_dim × n_slots]
         let vt = kvarn::dequantize_tile(&self.v_tiles[h]);
         let (ns, d, nv) = (self.n_slots, self.head_dim, self.n_valid);
@@ -181,12 +269,20 @@ impl ColdTier {
             let mut kv = vec![0.0f32; d];
             let mut vv = vec![0.0f32; d];
             for dd in 0..d {
-                kv[dd] = kt[dd * ns + s];
-                vv[dd] = vt[dd * ns + s];
+                kv[dd] = kt[dd * ns + s]; // K channel-major [head_dim × n_slots]
+                                          // V per-slot is already slot-major [n_slots × head_dim]; the
+                                          // per-channel path reads it transposed like K.
+                vv[dd] = if self.v_perslot {
+                    vt[s * d + dd]
+                } else {
+                    vt[dd * ns + s]
+                };
             }
             if self.rotate {
                 signed_fwht(&mut kv, &s2, &s1); // inverse FWHT: swap sign tables
-                signed_fwht(&mut vv, &s2, &s1);
+                if !self.v_perslot {
+                    signed_fwht(&mut vv, &s2, &s1);
+                }
             }
             for dd in 0..d {
                 k[s * d + dd] = kv[dd];
@@ -357,7 +453,22 @@ mod tests {
         let ref_out = attn(&q, &k, &v, nt, d);
 
         for &(cf, m) in &[(0.25f32, 8usize), (0.125, 16), (0.5, 4)] {
-            let cold = compact_cold_kv(&k, &v, nt, h, d, &importance, cf, m, true, false, 15.0);
+            let cold = compact_cold_kv(
+                &k,
+                &v,
+                nt,
+                h,
+                d,
+                &importance,
+                cf,
+                m,
+                true,
+                false,
+                false,
+                15.0,
+                15.0,
+                false,
+            );
             let (kr, vr) = cold.dequant_head(0);
             let out = attn_slots(&q, &kr, &vr, &cold, d);
             let c = cos(&out, &ref_out);
@@ -395,7 +506,9 @@ mod tests {
             *x = rng.n();
         }
         let imp: Vec<f32> = (0..nt).map(|t| 1.0 + (t % 5) as f32).collect(); // varied weights
-        let cold = compact_cold_kv(&k, &v, nt, 1, d, &imp, 0.0, 8, true, false, 15.0); // all merged
+        let cold = compact_cold_kv(
+            &k, &v, nt, 1, d, &imp, 0.0, 8, true, false, false, 15.0, 15.0, false,
+        ); // all merged
         let (kr, _) = cold.dequant_head(0);
         // recompute the true weighted-average of slot 0's members and compare.
         let mem = &cold.slot_members[0];
@@ -451,7 +564,10 @@ mod tests {
             8,
             true,
             false,
+            false,
             15.0,
+            15.0,
+            false,
         );
         let (ck, cv) = cold.dequant_head(0);
         let hot_k = &k[n_cold * d..];
@@ -489,9 +605,61 @@ mod tests {
         let imp: Vec<f32> = (0..nt)
             .map(|t| (0..d).map(|i| q[i] * k[t * d + i]).sum::<f32>())
             .collect();
-        let cold = compact_cold_kv(&k, &v, nt, h, d, &imp, 0.25, 4, false, false, 15.0);
+        let cold = compact_cold_kv(
+            &k, &v, nt, h, d, &imp, 0.25, 4, false, false, false, 15.0, 15.0, false,
+        );
         let (kr, _vr) = cold.dequant_head(0);
         assert_eq!(kr.len(), cold.n_valid * d);
         assert!(kr.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn v_perslot_lowers_attention_output_error() {
+        // Isolate the V-quant AXIS: no merge (fold_m=1, core_frac=0 → each token
+        // is its own slot), K near-lossless (8-bit) so K error ~0; V at 4-bit.
+        // The only difference between the two ColdTiers is how V is quantized —
+        // per-channel (reuse K codec, current) vs per-slot (V's natural axis).
+        // Per-slot must NOT be worse (measured ~15-20% better attention-output
+        // error; see examples/value_quant_treatment.rs).
+        let (nt, h, d) = (192usize, 1usize, 256usize);
+        let mut rng = Lcg(7);
+        let q: Vec<f32> = (0..d).map(|_| rng.n()).collect();
+        let mut k = vec![0.0f32; nt * d];
+        let mut v = vec![0.0f32; nt * d];
+        for t in 0..nt {
+            for i in 0..d {
+                k[t * d + i] = rng.n();
+                v[t * d + i] = rng.n();
+            }
+        }
+        let imp: Vec<f32> = (0..nt)
+            .map(|t| (0..d).map(|i| q[i] * k[t * d + i]).sum::<f32>())
+            .collect();
+        let refo = attn(&q, &k, &v, nt, d); // full-precision reference
+        let build = |vps: bool| {
+            compact_cold_kv(
+                &k, &v, nt, h, d, &imp, 0.0, 1, true, false, false, 255.0, 15.0, vps,
+            )
+        };
+        let rel = |o: &[f32]| -> f64 {
+            let (mut n, mut den) = (0.0f64, 0.0f64);
+            for (a, b) in o.iter().zip(&refo) {
+                n += (*a as f64 - *b as f64).powi(2);
+                den += (*b as f64).powi(2);
+            }
+            (n / den.max(1e-30)).sqrt()
+        };
+        let pc = build(false);
+        let ps = build(true);
+        let (kc, vc) = pc.dequant_head(0);
+        let (ks, vs) = ps.dequant_head(0);
+        let out_pc = pc.two_tier_attend(&q, &[], &[], 0, &kc, &vc, nt, nt, d);
+        let out_ps = ps.two_tier_attend(&q, &[], &[], 0, &ks, &vs, nt, nt, d);
+        let (e_pc, e_ps) = (rel(&out_pc), rel(&out_ps));
+        eprintln!("V-quant attn-output rel-err: per-channel={e_pc:.5} per-slot={e_ps:.5}");
+        assert!(
+            e_ps <= e_pc + 1e-4,
+            "per-slot V should not be worse than per-channel ({e_ps:.5} vs {e_pc:.5})"
+        );
     }
 }

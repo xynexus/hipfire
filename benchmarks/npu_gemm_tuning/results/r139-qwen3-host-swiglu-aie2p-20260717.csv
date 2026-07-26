@@ -1,0 +1,15 @@
+model,workload,backend,swiglu,run_kind,sample,elapsed_ms,documents,tokens,documents_per_second,tokens_per_second,quality_metric,quality_value,notes
+Qwen3-Embedding-0.6B,length1,xdna,npu,warm,1,2389.120,1,1,0.418564,0.418564,,,baseline
+Qwen3-Embedding-0.6B,length1,xdna,npu,warm,2,2385.570,1,1,0.419187,0.419187,,,baseline
+Qwen3-Embedding-0.6B,length1,xdna,npu,warm,3,2386.808,1,1,0.418969,0.418969,,,baseline median
+Qwen3-Embedding-0.6B,length1,xdna,host-bf16-lut,warm,1,1573.166,1,1,0.635660,0.635660,,,candidate
+Qwen3-Embedding-0.6B,length1,xdna,host-bf16-lut,warm,2,1568.598,1,1,0.637512,0.637512,,,candidate
+Qwen3-Embedding-0.6B,length1,xdna,host-bf16-lut,warm,3,1584.401,1,1,0.631153,0.631153,,,candidate median
+Qwen3-Embedding-0.6B,length1,xdna,host-bf16-lut,warm,4,1601.888,1,1,0.624263,0.624263,,,candidate
+Qwen3-Embedding-0.6B,length1,xdna,host-bf16-lut,warm,5,1578.667,1,1,0.633446,0.633446,,,candidate
+Qwen3-Embedding-0.6B,realistic-127-108,xdna,npu,warm,1,5066.470,2,235,0.394752,46.383383,,,baseline
+Qwen3-Embedding-0.6B,realistic-127-108,xdna,host-bf16-lut,warm,1,2035.114,2,235,0.982746,115.472645,,,candidate
+Qwen3-Embedding-0.6B,realistic-127-108,xdna,host-bf16-lut,quality,1,,2,235,,,dequant-hfq-cosine-min,0.999036193,minimum of the two same-artifact cosines
+Qwen3-Embedding-0.6B,scifact-16q-128d,xdna,npu,end-to-end,1,2738577.008,144,45717,0.052582,16.693706,ndcg-at-10,0.959762949,prior admitted baseline
+Qwen3-Embedding-0.6B,scifact-16q-128d,xdna,host-bf16-lut,end-to-end,1,536455.192,144,45717,0.268429,85.220538,ndcg-at-10,0.959762949,candidate; zero relative degradation
+Qwen3-Embedding-0.6B,scifact-16q-128d,xdna,host-bf16-lut,quality,1,,144,45717,,,reference-output-cosine-min,0.999223471,versus prior admitted NPU embeddings

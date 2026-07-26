@@ -3,6 +3,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 // Import tooling now lives in the offline hipfire-diffusion-coexist crate.
+use super::*;
 use hipfire_diffusion_coexist::{
     import_diffusers_to_hfq, ldm_unet_native_tensor_name, ldm_vae_native_tensor_name,
     parse_pytorch_state_dict, pytorch_tensor_is_contiguous, reorder_pytorch_storage_to_contiguous,
@@ -10,7 +11,39 @@ use hipfire_diffusion_coexist::{
 };
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 use std::fs;
-use super::*;
+
+#[test]
+fn diffusion_opus_step_schedule_never_selects_int4_activations() {
+    assert_eq!(
+        linear_precision_for_thresholds(0, 10, 0.5, 0.0),
+        LinearPrecision::W4A8
+    );
+    assert_eq!(
+        linear_precision_for_thresholds(6, 10, 0.5, 0.8),
+        LinearPrecision::W4A8
+    );
+    assert_eq!(
+        linear_precision_for_thresholds(9, 10, 0.5, 0.8),
+        LinearPrecision::F16
+    );
+}
+
+#[test]
+fn diffusion_opus_layer_policy_promotes_legacy_rungs_to_w4a8() {
+    assert_eq!(
+        linear_precision_for_layer_rung(Some("w4a4")),
+        LinearPrecision::W4A8
+    );
+    assert_eq!(
+        linear_precision_for_layer_rung(Some("w4a16")),
+        LinearPrecision::W4A8
+    );
+    assert_eq!(
+        linear_precision_for_layer_rung(Some("w4a8")),
+        LinearPrecision::W4A8
+    );
+    assert_eq!(linear_precision_for_layer_rung(None), LinearPrecision::W4A8);
+}
 
 #[test]
 fn scaled_dot_product_attention_respects_key_mask() {
@@ -299,6 +332,83 @@ fn cpu_reference_env_toggle_defaults_to_gpu() {
     assert!(cpu_reference_env_enabled(Some("1")));
     assert!(cpu_reference_env_enabled(Some("true")));
     assert!(cpu_reference_env_enabled(Some("yes")));
+}
+
+#[test]
+fn batched_cfg_prediction_slices_guide_without_split_tensors() {
+    let latents = LatentBatch {
+        batch: 1,
+        channels: 1,
+        height: 1,
+        width: 2,
+        data: vec![0.0, 0.0],
+    };
+    let batched = CpuTensor {
+        shape: vec![2, 1, 1, 2],
+        // The batched CFG path predicts `[positive; negative]`.
+        data: vec![0.5, -0.5, 0.0, 0.25],
+    };
+
+    let (shape, positive, negative) = batched_cfg_prediction_slices(&latents, &batched).unwrap();
+
+    assert_eq!(shape, vec![1, 1, 1, 2]);
+    assert_eq!(positive, &[0.5, -0.5]);
+    assert_eq!(negative, &[0.0, 0.25]);
+
+    let mut runtime_context =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+    let (guided, runtime_kind) = cfg_guidance_slices_with_runtime_context(
+        shape,
+        negative,
+        positive,
+        2.0,
+        &mut runtime_context,
+    )
+    .unwrap();
+
+    assert_eq!(runtime_kind, DiffusionRuntimeKind::CpuSourceReference);
+    assert_eq!(guided.shape, vec![1, 1, 1, 2]);
+    assert_eq!(guided.data, vec![1.0, -1.25]);
+}
+
+#[test]
+fn classifier_free_guidance_identity_covers_disabled_and_unit_scales() {
+    assert!(classifier_free_guidance_is_identity(0.0));
+    assert!(classifier_free_guidance_is_identity(-1.0));
+    assert!(classifier_free_guidance_is_identity(1.0));
+    assert!(!classifier_free_guidance_is_identity(0.5));
+    assert!(!classifier_free_guidance_is_identity(2.0));
+}
+
+#[test]
+fn batched_cfg_prediction_slices_reject_malformed_data_length() {
+    let latents = LatentBatch {
+        batch: 1,
+        channels: 1,
+        height: 1,
+        width: 2,
+        data: vec![0.0, 0.0],
+    };
+    let batched = CpuTensor {
+        shape: vec![2, 1, 1, 2],
+        data: vec![0.5, -0.5, 0.0],
+    };
+
+    let error = batched_cfg_prediction_slices(&latents, &batched).unwrap_err();
+
+    assert!(error.to_string().contains("expects 4"));
+}
+
+#[test]
+fn cfg_guidance_rejects_shape_data_length_mismatch() {
+    let pred = CpuTensor {
+        shape: vec![1, 1, 1, 2],
+        data: vec![0.5],
+    };
+
+    let error = cfg_guidance(&pred, &pred, 2.0).unwrap_err();
+
+    assert!(error.to_string().contains("do not match shape"));
 }
 
 #[test]

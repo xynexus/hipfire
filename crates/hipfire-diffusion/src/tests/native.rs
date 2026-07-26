@@ -3,6 +3,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 // Import tooling now lives in the offline hipfire-diffusion-coexist crate.
+use super::*;
 use hipfire_diffusion_coexist::{
     import_diffusers_to_hfq, ldm_unet_native_tensor_name, ldm_vae_native_tensor_name,
     parse_pytorch_state_dict, pytorch_tensor_is_contiguous, reorder_pytorch_storage_to_contiguous,
@@ -10,7 +11,6 @@ use hipfire_diffusion_coexist::{
 };
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 use std::fs;
-use super::*;
 
 #[test]
 fn native_runtime_metadata_support_reports_runtime_boundaries() {
@@ -57,6 +57,49 @@ fn native_source_runtime_support_rejects_incomplete_transformer_weights() {
 
     assert!(error.contains("requires complete"));
     assert!(error.contains("krea2-mmdit"));
+}
+
+#[test]
+fn native_runtime_metadata_supports_complete_flux2_klein_topology() {
+    let mut metadata = minimal_metadata();
+    metadata.pipeline.class_name = "Flux2KleinPipeline".to_string();
+    metadata.components.remove("unet");
+    metadata.components.insert(
+        "transformer".to_string(),
+        DiffusionComponentMetadata {
+            class_name: Some("Flux2Transformer2DModel".to_string()),
+            config_entry: Some("transformer/config.json".to_string()),
+            weight_entries: vec![
+                "transformer/tensors/x_embedder.weight".to_string(),
+                "transformer/tensors/proj_out.weight".to_string(),
+                "transformer/tensors/transformer_blocks.0.attn.add_q_proj.weight".to_string(),
+                "transformer/tensors/single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight"
+                    .to_string(),
+            ],
+            tensor_roles: Vec::new(),
+        },
+    );
+    metadata.components.insert(
+        "vae".to_string(),
+        DiffusionComponentMetadata {
+            class_name: Some("AutoencoderKLFlux2".to_string()),
+            config_entry: Some("vae/config.json".to_string()),
+            weight_entries: Vec::new(),
+            tensor_roles: Vec::new(),
+        },
+    );
+
+    assert!(native_runtime_metadata_support_error(&metadata).is_none());
+
+    metadata
+        .components
+        .get_mut("transformer")
+        .unwrap()
+        .weight_entries
+        .pop();
+    let error = native_runtime_metadata_support_error(&metadata).unwrap();
+    assert!(error.contains("requires complete"));
+    assert!(error.contains("single_blocks=0"));
 }
 
 #[test]
@@ -179,6 +222,16 @@ fn native_transformer_io_projects_krea_final_layer_tokens() {
                 &[4],
                 &[0.0, 1.0, 0.0, -1.0],
             ),
+            f32_mem_tensor(
+                "transformer/tensors/final_layer.norm.weight",
+                &[2],
+                &[0.0, 0.0],
+            ),
+            f32_mem_tensor(
+                "transformer/tensors/final_layer.scale_shift_table",
+                &[2, 2],
+                &[10.0, 20.0, 0.5, 1.0],
+            ),
         ],
     )
     .unwrap();
@@ -231,7 +284,14 @@ fn native_transformer_io_projects_krea_final_layer_tokens() {
             &mut runtime_context,
         )
         .unwrap();
-    assert_eq!(output.data, vec![7.25, 2.25, 6.0, 7.5]);
+    assert_eq!(output.data.len(), 4);
+    let expected = [34.73378, 16.791616, 18.942163, 49.525398];
+    for (index, (actual, expected)) in output.data.iter().zip(expected).enumerate() {
+        assert!(
+            (actual - expected).abs() <= 1e-4,
+            "Krea final scale/shift order mismatch at {index}: got {actual}, expected {expected}"
+        );
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -395,6 +455,71 @@ fn native_transformer_timestep_embedding_loads_qwen_layout() {
 }
 
 #[test]
+fn local_sefi_dual_timestep_embedding_matches_real_checkpoint_reference() {
+    let artifact = Path::new("/srv/huggingface/SeFi-Image-2B-turbo.sefi.bf16.hfq");
+    let reference_path = Path::new("/tmp/hipfire-sefi-timestep-reference.json");
+    if !artifact.is_file() || !reference_path.is_file() {
+        eprintln!("skip: import SeFi and run scripts/sefi_timestep_reference.py");
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&fs::read(reference_path).unwrap()).unwrap();
+    let expected = reference["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_f64().unwrap() as f32)
+        .collect::<Vec<_>>();
+    let hfq = HfqFile::open_index_only(artifact).unwrap();
+    let embedding =
+        NativeTransformerTimestepEmbedding::from_hfq(&hfq, TransformerDenoiserFamily::Flux2)
+            .unwrap();
+    let mut runtime_context =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+    let output = embedding
+        .forward_dual_with_runtime_context(
+            &[reference["semantic_timestep"].as_f64().unwrap() as f32],
+            &[reference["texture_timestep"].as_f64().unwrap() as f32],
+            &mut runtime_context,
+        )
+        .unwrap();
+    assert_eq!(output.shape, vec![1, expected.len()]);
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    for (&actual, expected) in output.data.iter().zip(expected) {
+        let absolute = (actual - expected).abs();
+        max_abs = max_abs.max(absolute);
+        max_rel = max_rel.max(absolute / expected.abs().max(1e-6));
+    }
+    eprintln!("SeFi dual timestep: max_abs={max_abs:.8} max_rel={max_rel:.8}");
+    assert!(max_abs <= 2e-5, "max_abs={max_abs} max_rel={max_rel}");
+}
+
+#[test]
+fn sefi_dual_euler_updates_semantic_and_texture_channels_independently() {
+    let mut latents = LatentBatch {
+        batch: 1,
+        channels: 3,
+        height: 1,
+        width: 2,
+        data: vec![0.0; 6],
+    };
+    let step = SeFiDualScheduleStep {
+        timestep_sem: 1000.0,
+        timestep_tex: 1000.0,
+        sigma_sem: 1.0,
+        sigma_tex: 1.0,
+        sigma_sem_next: 0.5,
+        sigma_tex_next: 0.8,
+    };
+    sefi_dual_euler_step(&mut latents, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 1, &step).unwrap();
+    assert_f32_close(&latents.data, &[-0.5, -1.0, -0.6, -0.8, -1.0, -1.2], 1e-6);
+    let texture = slice_latent_channels(&latents, 1).unwrap();
+    assert_eq!(texture.channels, 2);
+    assert_f32_close(&texture.data, &[-0.6, -0.8, -1.0, -1.2], 1e-6);
+}
+
+#[test]
 fn native_transformer_timestep_embedding_loads_krea_mod_projection() {
     let dir = std::env::temp_dir().join(format!(
         "hipfire-krea-transformer-time-test-{}",
@@ -451,7 +576,11 @@ fn native_transformer_timestep_embedding_loads_krea_mod_projection() {
     let output = embedding
         .forward_with_runtime_context(&[0.0], &mut runtime_context)
         .unwrap();
-    let expected = [silu(1.0) + 0.25, -0.5];
+    // Krea2 time_embed uses tanh-GELU (not SiLU), and the modulation projection
+    // is applied to gelu(temb). Mirror `transformer::gelu_tanh` exactly.
+    let gelu_tanh =
+        |x: f32| 0.5 * x * (1.0 + (0.797_884_560_8_f32 * (x + 0.044715 * x * x * x)).tanh());
+    let expected = [gelu_tanh(1.0) + 0.25, -0.5];
     assert_eq!(output.shape, vec![1, 2]);
     assert!((output.data[0] - expected[0]).abs() < 1e-6);
     assert!((output.data[1] - expected[1]).abs() < 1e-6);
@@ -461,9 +590,9 @@ fn native_transformer_timestep_embedding_loads_krea_mod_projection() {
         .unwrap();
     assert_eq!(modulation.shape, vec![1, 3]);
     let expected_modulation = [
-        expected[0],
-        expected[1] + 1.0,
-        expected[0] + expected[1] - 1.0,
+        gelu_tanh(expected[0]),
+        gelu_tanh(expected[1]) + 1.0,
+        gelu_tanh(expected[0]) + gelu_tanh(expected[1]) - 1.0,
     ];
     for (actual, expected) in modulation.data.iter().zip(expected_modulation) {
         assert!((actual - expected).abs() < 1e-6);
@@ -1004,7 +1133,7 @@ fn native_transformer_attention_applies_qwen_rope_to_image_and_text_qk() {
         shape: vec![1, 1, 6],
         data: vec![0.25, -0.5, 0.75, 1.0, -1.25, 0.5],
     };
-    let rotary = qwen_rotary_embeddings_for_grid([2, 2, 2], 10_000.0, 6, 1, 1, 2, 1).unwrap();
+    let rotary = qwen_rotary_embeddings_for_grid(&[2, 2, 2], 10_000.0, 6, 1, 1, 2, 1).unwrap();
     let mut runtime_context =
         DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
 
@@ -1051,6 +1180,618 @@ fn native_transformer_attention_applies_qwen_rope_to_image_and_text_qk() {
         .zip(no_rope_image.data.iter())
         .any(|(a, b)| (a - b).abs() > 1e-5));
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn krea2_rope_grid_uses_flux_zero_based_coordinates() {
+    // Convention pin per the Krea2 source (Krea2RotaryPosEmbed is "Copied from
+    // FluxPosEmbed"): image tokens use 0-based grid coordinates
+    // `[0, arange(H), arange(W)]` -- NOT Qwen-Image's centered scale_rope. So the
+    // grid-ORIGIN token (y=0, x=0) sits at position 0 (identity rotation) and
+    // off-origin tokens carry rotation. axes=[4,4,4] over head_dim=12 ->
+    // freq_width=6: band layout [frame(2), height(2), width(2)].
+    let (frame, height, width) = (1usize, 4usize, 4usize);
+    let rotary =
+        qwen_rotary_embeddings_for_grid(&[4, 4, 4], 1000.0, 12, frame, height, width, 2).unwrap();
+    let fw = 6usize;
+    let (img_cos, img_sin) = (rotary.image.cos_data(), rotary.image.sin_data());
+    let row = |t: usize| -> (&[f32], &[f32]) {
+        (&img_cos[t * fw..t * fw + fw], &img_sin[t * fw..t * fw + fw])
+    };
+    // Grid origin (y=0, x=0) -> position [0,0,0] -> identity: cos == 1, sin == 0.
+    let (ocos, osin) = row(0);
+    for (i, (&c, &s)) in ocos.iter().zip(osin.iter()).enumerate() {
+        assert!(
+            (c - 1.0).abs() < 1e-6 && s.abs() < 1e-6,
+            "origin token freq {i}: cos={c} sin={s}, expected identity (0-based position 0)"
+        );
+    }
+    // Corner (y=3, x=3) is off-origin -> the height & width bands (freqs 2..6)
+    // carry real rotation (some non-zero sin).
+    let (_, corner_sin) = row(3 * width + 3);
+    assert!(
+        corner_sin[2..6].iter().any(|&s| s.abs() > 1e-6),
+        "off-origin token has no spatial rotation; 0-based coordinates not applied"
+    );
+    // Text tokens use all-zero position ids -> identity rotation everywhere.
+    let (tcos, tsin) = (rotary.text.cos_data(), rotary.text.sin_data());
+    assert!(
+        tcos.iter().all(|&c| (c - 1.0).abs() < 1e-6) && tsin.iter().all(|&s| s.abs() < 1e-6),
+        "text tokens must use all-zero position ids (identity rotation)"
+    );
+}
+
+#[test]
+fn flux2_rope_uses_spatial_image_axes_and_text_sequence_axis() {
+    let rotary = flux2_rotary_embeddings_for_grid(&[2, 2, 2, 2], 2000.0, 8, 2, 2, 3).unwrap();
+    let freq_width = 4;
+    let image_sin = rotary.image.sin_data();
+    let text_sin = rotary.text.sin_data();
+
+    assert!(image_sin[..freq_width]
+        .iter()
+        .all(|value| value.abs() < 1e-6));
+    assert!(image_sin[freq_width..2 * freq_width][1..3]
+        .iter()
+        .any(|value| value.abs() > 1e-6));
+    assert!(image_sin
+        .chunks_exact(freq_width)
+        .all(|row| row[3].abs() < 1e-6));
+    assert!(text_sin[..freq_width]
+        .iter()
+        .all(|value| value.abs() < 1e-6));
+    assert!(text_sin[freq_width..2 * freq_width][..3]
+        .iter()
+        .all(|value| value.abs() < 1e-6));
+    assert!(text_sin[freq_width + 3].abs() > 1e-6);
+}
+
+#[test]
+fn flux2_silu_glu_gates_the_first_half() {
+    let projected = CpuTensor {
+        shape: vec![1, 1, 4],
+        data: vec![1.0, -2.0, 3.0, 5.0],
+    };
+    let output = silu_glu_first_3d(&projected).unwrap();
+    assert_eq!(output.shape, vec![1, 1, 2]);
+    let expected = [
+        1.0 / (1.0 + (-1.0f32).exp()) * 3.0,
+        -2.0 / (1.0 + 2.0f32.exp()) * 5.0,
+    ];
+    assert_f32_close(&output.data, &expected, 1e-6);
+}
+
+#[test]
+fn qwen3_masked_causal_attention_ignores_padded_keys_for_all_queries() {
+    let q = CpuTensor {
+        shape: vec![3, 1],
+        data: vec![1.0, 1.0, 1.0],
+    };
+    let k = CpuTensor {
+        shape: vec![3, 1],
+        data: vec![0.0, 2.0f32.ln(), 100.0],
+    };
+    let v = CpuTensor {
+        shape: vec![3, 1],
+        data: vec![2.0, 6.0, 100.0],
+    };
+    let output =
+        qwen3_causal_self_attention_with_key_mask(&q, &k, &v, 1, &[true, true, false]).unwrap();
+    assert_eq!(output.shape, vec![3, 1]);
+    assert_f32_close(&output.data, &[2.0, 14.0 / 3.0, 14.0 / 3.0], 1e-6);
+}
+
+#[test]
+fn local_flux2_tiny_full_forward_matches_vendored_bfl_reference() {
+    let root = Path::new("/tmp/hipfire-flux2-tiny-reference");
+    let reference_path = root.join("reference.json");
+    let source = root.join("flux-2-tiny.safetensors");
+    if !reference_path.is_file() || !source.is_file() {
+        eprintln!(
+            "skip: run `uv run --no-project --with einops==0.8.1 python scripts/flux2_tiny_reference.py {}`",
+            root.display()
+        );
+        return;
+    }
+    let output = root.join("FLUX.2-tiny.bf16.hfq");
+    import_diffusers_to_hfq(DiffusersImportOptions {
+        source,
+        output: output.clone(),
+        model_name: Some("FLUX.2-tiny".to_string()),
+        max_batch: 1,
+        metadata_only: false,
+    })
+    .unwrap();
+    let reference: serde_json::Value =
+        serde_json::from_slice(&fs::read(reference_path).unwrap()).unwrap();
+    let values = |name: &str| {
+        reference[name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_f64().unwrap() as f32)
+            .collect::<Vec<_>>()
+    };
+    let x = values("x");
+    let mut nchw = vec![0.0; x.len()];
+    for channel in 0..8 {
+        for token in 0..2 {
+            nchw[channel * 2 + token] = x[token * 8 + channel];
+        }
+    }
+    let latents = LatentBatch {
+        batch: 1,
+        channels: 8,
+        height: 1,
+        width: 2,
+        data: nchw,
+    };
+    let text = CpuTensor {
+        shape: vec![1, 2, 6],
+        data: values("ctx"),
+    };
+    let hfq = HfqFile::open_index_only(&output).unwrap();
+    let metadata = parse_diffusion_metadata(&hfq.metadata_json).unwrap();
+    let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
+    let topology = transformer_denoiser_weight_topology(&metadata.components["transformer"]);
+    let denoiser = NativeTransformerDenoiser::from_hfq(&hfq, &config, &topology).unwrap();
+    let mut runtime_context =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+    let trace = denoiser
+        .forward_flux2_trace_with_runtime_context(
+            &latents,
+            &[reference["scheduler_timestep"].as_f64().unwrap() as f32],
+            &text,
+            None,
+            &mut runtime_context,
+        )
+        .unwrap();
+    let compare = |label: &str, actual: &[f32], expected: Vec<f32>| {
+        assert_eq!(actual.len(), expected.len(), "{label} length");
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (&actual, expected) in actual.iter().zip(expected) {
+            let absolute = (actual - expected).abs();
+            max_abs = max_abs.max(absolute);
+            max_rel = max_rel.max(absolute / expected.abs().max(1e-6));
+        }
+        eprintln!("FLUX.2 tiny {label}: max_abs={max_abs:.8} max_rel={max_rel:.8}");
+        assert!(
+            max_abs <= 5e-5,
+            "{label} max_abs={max_abs} max_rel={max_rel}"
+        );
+    };
+    compare(
+        "double_image",
+        &trace.double_image.data,
+        values("double_image"),
+    );
+    compare(
+        "double_text",
+        &trace.double_text.data,
+        values("double_text"),
+    );
+    compare(
+        "single_joint",
+        &trace.single_joint.data,
+        values("single_joint"),
+    );
+    let mut token_major = vec![0.0; trace.output.data.len()];
+    for channel in 0..8 {
+        for token in 0..2 {
+            token_major[token * 8 + channel] = trace.output.data[channel * 2 + token];
+        }
+    }
+    compare("output", &token_major, values("output"));
+    let expected_schedule = values("schedule_50_seq1024");
+    let schedule = DiffusionSchedule::flux2_euler(50, 1024).unwrap();
+    compare("schedule_50_seq1024", &schedule.sigmas, expected_schedule);
+}
+
+fn read_hfdt_tensor(path: &Path) -> CpuTensor {
+    let bytes = fs::read(path).unwrap();
+    assert_eq!(&bytes[..4], b"HFDT", "{} magic", path.display());
+    let rank = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let mut shape = Vec::with_capacity(rank);
+    for index in 0..rank {
+        let offset = 8 + index * 4;
+        shape.push(u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize);
+    }
+    let data_offset = 8 + rank * 4;
+    let data = bytes[data_offset..]
+        .chunks_exact(4)
+        .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(data.len(), shape.iter().product::<usize>());
+    CpuTensor { shape, data }
+}
+
+#[test]
+fn local_flux2_actual_one_step_velocity_matches_vendored_bfl_reference() {
+    let trace_dir = Path::new("/tmp/flux2-bf16-trace");
+    let reference_path = Path::new("/tmp/flux2-bf16-reference-metrics.json");
+    let artifact = Path::new("/srv/huggingface/FLUX.2-klein-base-4B.diffusers.p0.hfq");
+    if !trace_dir.join("latent_000.bin").is_file()
+        || !reference_path.is_file()
+        || !artifact.is_file()
+    {
+        eprintln!("skip: actual FLUX.2 denoise trace/reference/artifact is absent");
+        return;
+    }
+    let latent_tensor = read_hfdt_tensor(&trace_dir.join("latent_000.bin"));
+    let latents = LatentBatch::from_nchw_tensor(latent_tensor).unwrap();
+    let conditioning = read_hfdt_tensor(&trace_dir.join("conditioning_positive.bin"));
+    let reference: serde_json::Value =
+        serde_json::from_slice(&fs::read(reference_path).unwrap()).unwrap();
+    let expected = reference["trace"][0]["reference_velocity"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_f64().unwrap() as f32)
+        .collect::<Vec<_>>();
+    let expected_latent = reference["trace"][0]["reference_latent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_f64().unwrap() as f32)
+        .collect::<Vec<_>>();
+    let hfq = HfqFile::open_index_only(artifact).unwrap();
+    let metadata = parse_diffusion_metadata(&hfq.metadata_json).unwrap();
+    let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
+    let topology = transformer_denoiser_weight_topology(&metadata.components["transformer"]);
+    let denoiser = NativeTransformerDenoiser::from_hfq(&hfq, &config, &topology).unwrap();
+    let mut runtime_context =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions {
+            rocm_device_id: Some(0),
+            ..DiffusionGenerationRuntimeOptions::default()
+        });
+    let actual = denoiser
+        .forward_flux2_with_runtime_context(
+            &latents,
+            &[1_000.0],
+            &conditioning,
+            None,
+            &mut runtime_context,
+        )
+        .unwrap();
+    let mut max_abs = 0.0f32;
+    let mut squared_error = 0.0f32;
+    let mut squared_reference = 0.0f32;
+    for (&actual, expected) in actual.data.iter().zip(&expected) {
+        let delta = actual - expected;
+        max_abs = max_abs.max(delta.abs());
+        squared_error += delta * delta;
+        squared_reference += expected * expected;
+    }
+    let nrmse = (squared_error / squared_reference.max(1e-12)).sqrt();
+    eprintln!("FLUX.2 actual velocity: max_abs={max_abs:.8} nrmse={nrmse:.8}");
+    assert!(max_abs <= 0.5 && nrmse <= 0.02);
+    let dt = -(reference["trace"][0]["timestep"].as_f64().unwrap() as f32);
+    let mut latent_max_abs = 0.0f32;
+    let mut latent_squared_error = 0.0f32;
+    let mut latent_squared_reference = 0.0f32;
+    for ((&initial, &velocity), expected) in
+        latents.data.iter().zip(&actual.data).zip(expected_latent)
+    {
+        let updated = initial + dt * velocity;
+        let delta = updated - expected;
+        latent_max_abs = latent_max_abs.max(delta.abs());
+        latent_squared_error += delta * delta;
+        latent_squared_reference += expected * expected;
+    }
+    let latent_nrmse = (latent_squared_error / latent_squared_reference.max(1e-12)).sqrt();
+    eprintln!("FLUX.2 actual updated latent: max_abs={latent_max_abs:.8} nrmse={latent_nrmse:.8}");
+    assert!(latent_max_abs <= 0.5 && latent_nrmse <= 0.02);
+}
+
+#[test]
+fn local_qwen3_selected_hidden_states_match_transformers_reference() {
+    let root = Path::new("/tmp/hipfire-qwen3-tiny-reference");
+    let reference_path = root.join("reference.json");
+    if !reference_path.is_file() {
+        eprintln!(
+            "skip: run `uv run --no-project --with 'transformers>=4.51,<5' python scripts/qwen3_tiny_text_reference.py {}`",
+            root.display()
+        );
+        return;
+    }
+    let output = root.join("FLUX.2-qwen3-tiny.bf16.hfq");
+    import_diffusers_to_hfq(DiffusersImportOptions {
+        source: root.to_path_buf(),
+        output: output.clone(),
+        model_name: Some("FLUX.2-Qwen3-tiny".to_string()),
+        max_batch: 1,
+        metadata_only: false,
+    })
+    .unwrap();
+    let reference: serde_json::Value =
+        serde_json::from_slice(&fs::read(reference_path).unwrap()).unwrap();
+    let f32_values = |name: &str| {
+        reference[name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_f64().unwrap() as f32)
+            .collect::<Vec<_>>()
+    };
+    let token_ids = reference["token_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_u64().unwrap() as u32)
+        .collect::<Vec<_>>();
+    let attention_mask = reference["attention_mask"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_u64().unwrap() != 0)
+        .collect::<Vec<_>>();
+    let hfq = HfqFile::open_index_only(&output).unwrap();
+    let encoder = NativeQwen3TextEncoder::from_hfq(
+        &hfq,
+        "text_encoder/tensors/language_model",
+        2,
+        1,
+        4,
+        10_000.0,
+    )
+    .unwrap()
+    .unwrap();
+    let mut runtime_context =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+    let layers = encoder
+        .encode_with_attention_mask(
+            &token_ids,
+            Some(&attention_mask),
+            &[9, 18, 27],
+            &mut runtime_context,
+        )
+        .unwrap();
+    let compare = |label: &str, actual: &[f32], expected: Vec<f32>| {
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (&actual, expected) in actual.iter().zip(expected) {
+            let absolute = (actual - expected).abs();
+            max_abs = max_abs.max(absolute);
+            max_rel = max_rel.max(absolute / expected.abs().max(1e-6));
+        }
+        eprintln!("Qwen3 tiny {label}: max_abs={max_abs:.8} max_rel={max_rel:.8}");
+        assert!(
+            max_abs <= 5e-5,
+            "{label} max_abs={max_abs} max_rel={max_rel}"
+        );
+    };
+    for (layer, selected) in layers.iter().zip([9, 18, 27]) {
+        compare(
+            &format!("layer_{selected}"),
+            &layer.data,
+            f32_values(&format!("layer_{selected}")),
+        );
+    }
+    let conditioner = Flux2TextConditioner::from_hfq(
+        &hfq,
+        "text_encoder/tensors/language_model",
+        2,
+        1,
+        4,
+        10_000.0,
+        vec![9, 18, 27],
+    )
+    .unwrap()
+    .unwrap();
+    let concatenated = conditioner
+        .conditioning_from_token_ids(&token_ids, &attention_mask, &mut runtime_context)
+        .unwrap();
+    compare(
+        "concatenated",
+        &concatenated.data,
+        f32_values("concatenated"),
+    );
+}
+
+#[test]
+fn local_flux2_chat_template_tokens_and_mask_match_transformers() {
+    let reference_path = Path::new("/tmp/hipfire-flux2-tokenizer-reference.json");
+    let artifact = Path::new("/srv/huggingface/FLUX.2-klein-base-4B.diffusers.p0.hfq");
+    if !reference_path.is_file() || !artifact.is_file() {
+        eprintln!("skip: local FLUX.2 tokenizer reference or full artifact is absent");
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&fs::read(reference_path).unwrap()).unwrap();
+    let hfq = HfqFile::open_index_only(artifact).unwrap();
+    let (_, tokenizer_json) = hfq.tensor_data_vec("tokenizer/tokenizer.json").unwrap();
+    let tokenizer = hipfire_model::tokenizer::Tokenizer::from_hf_json(
+        std::str::from_utf8(&tokenizer_json).unwrap(),
+    )
+    .unwrap();
+    let chat_text = reference["chat_text"].as_str().unwrap();
+    let mut token_ids = tokenizer.encode(chat_text);
+    token_ids.truncate(512);
+    let real_tokens = token_ids.len();
+    token_ids.resize(512, 151_643);
+    let attention_mask = (0..512)
+        .map(|index| u64::from(index < real_tokens))
+        .collect::<Vec<_>>();
+    let expected_ids = reference["input_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_u64().unwrap() as u32)
+        .collect::<Vec<_>>();
+    let expected_mask = reference["attention_mask"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(token_ids, expected_ids);
+    assert_eq!(attention_mask, expected_mask);
+}
+
+fn assert_local_actual_qwen3_hidden_states(
+    label: &str,
+    reference_path: &Path,
+    artifact: &Path,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    rope_theta: f32,
+) {
+    if !reference_path.is_file() || !artifact.is_file() {
+        eprintln!("skip: local {label} Qwen3 actual-weight reference or artifact is absent");
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&fs::read(reference_path).unwrap()).unwrap();
+    let token_ids = reference["token_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_u64().unwrap() as u32)
+        .collect::<Vec<_>>();
+    let attention_mask = reference["attention_mask"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_u64().unwrap() != 0)
+        .collect::<Vec<_>>();
+    let hfq = HfqFile::open_index_only(artifact).unwrap();
+    let encoder = NativeQwen3TextEncoder::from_hfq(
+        &hfq,
+        "text_encoder/tensors/language_model",
+        heads,
+        kv_heads,
+        head_dim,
+        rope_theta,
+    )
+    .unwrap()
+    .unwrap();
+    let mut runtime_context =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+    let layers = encoder
+        .encode_with_attention_mask(
+            &token_ids,
+            Some(&attention_mask),
+            &[9, 18, 27],
+            &mut runtime_context,
+        )
+        .unwrap();
+    for (layer, selected) in layers.iter().zip([9, 18, 27]) {
+        let expected = reference[format!("layer_{selected}")]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_f64().unwrap() as f32);
+        let mut max_abs = 0.0f32;
+        let mut mean_abs = 0.0f32;
+        for (&actual, expected) in layer.data.iter().zip(expected) {
+            let absolute = (actual - expected).abs();
+            max_abs = max_abs.max(absolute);
+            mean_abs += absolute;
+        }
+        mean_abs /= layer.data.len() as f32;
+        eprintln!(
+            "{label} Qwen3 actual layer {selected}: max_abs={max_abs:.8} mean_abs={mean_abs:.8}"
+        );
+        assert!(
+            max_abs <= 3e-2 && mean_abs <= 3e-3,
+            "layer {selected} max_abs={max_abs} mean_abs={mean_abs}"
+        );
+    }
+    let hidden = layers[0].shape[2];
+    let tokens = layers[0].shape[0] * layers[0].shape[1];
+    let mut actual_concatenated = vec![0.0f32; tokens * hidden * layers.len()];
+    let mut expected_concatenated = vec![0.0f32; actual_concatenated.len()];
+    for (layer_index, (layer, selected)) in layers.iter().zip([9, 18, 27]).enumerate() {
+        let expected = reference[format!("layer_{selected}")].as_array().unwrap();
+        for token in 0..tokens {
+            let destination = token * hidden * layers.len() + layer_index * hidden;
+            let source = token * hidden;
+            actual_concatenated[destination..destination + hidden]
+                .copy_from_slice(&layer.data[source..source + hidden]);
+            for channel in 0..hidden {
+                expected_concatenated[destination + channel] =
+                    expected[source + channel].as_f64().unwrap() as f32;
+            }
+        }
+    }
+    let concat_max_abs = actual_concatenated
+        .iter()
+        .zip(expected_concatenated)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("{label} Qwen3 actual concatenated: max_abs={concat_max_abs:.8}");
+    assert!(
+        concat_max_abs <= 3e-2,
+        "concatenated max_abs={concat_max_abs}"
+    );
+}
+
+#[test]
+fn local_flux2_actual_qwen3_hidden_states_match_transformers() {
+    assert_local_actual_qwen3_hidden_states(
+        "FLUX.2 Klein",
+        Path::new("/tmp/hipfire-flux2-qwen3-actual-reference.json"),
+        Path::new("/srv/huggingface/FLUX.2-klein-base-4B.diffusers.p0.hfq"),
+        32,
+        8,
+        128,
+        1_000_000.0,
+    );
+}
+
+#[test]
+fn local_sefi_actual_qwen3vl_hidden_states_match_transformers() {
+    assert_local_actual_qwen3_hidden_states(
+        "SeFi",
+        Path::new("/tmp/hipfire-sefi-qwen3vl-actual-reference.json"),
+        Path::new("/srv/huggingface/SeFi-Image-2B-turbo.sefi.bf16.hfq"),
+        16,
+        8,
+        128,
+        5_000_000.0,
+    );
+}
+
+#[test]
+fn local_sefi_chat_template_tokens_and_mask_match_transformers() {
+    let reference_path = Path::new("/tmp/hipfire-sefi-tokenizer-reference.json");
+    let artifact = Path::new("/srv/huggingface/SeFi-Image-2B-turbo.sefi.bf16.hfq");
+    if !reference_path.is_file() || !artifact.is_file() {
+        eprintln!("skip: local SeFi tokenizer reference or full artifact is absent");
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&fs::read(reference_path).unwrap()).unwrap();
+    let hfq = HfqFile::open_index_only(artifact).unwrap();
+    let (_, tokenizer_json) = hfq.tensor_data_vec("tokenizer/tokenizer.json").unwrap();
+    let tokenizer = hipfire_model::tokenizer::Tokenizer::from_hf_json(
+        std::str::from_utf8(&tokenizer_json).unwrap(),
+    )
+    .unwrap();
+    let chat_text = reference["chat_text"].as_str().unwrap();
+    let mut token_ids = tokenizer.encode(chat_text);
+    token_ids.truncate(1024);
+    let real_tokens = token_ids.len();
+    token_ids.resize(1024, 151_643);
+    let attention_mask = (0..1024)
+        .map(|index| u64::from(index < real_tokens))
+        .collect::<Vec<_>>();
+    let expected_ids = reference["input_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_u64().unwrap() as u32)
+        .collect::<Vec<_>>();
+    let expected_mask = reference["attention_mask"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(token_ids, expected_ids);
+    assert_eq!(attention_mask, expected_mask);
 }
 
 #[test]
@@ -1219,6 +1960,54 @@ fn native_transformer_feed_forward_runs_krea_image_swiglu_without_text_stream() 
     assert_eq!(image.shape, vec![1, 1, 2]);
     assert_f32_close(&image.data, &[silu(1.0), 2.0 * silu(2.0)], 1e-6);
     assert!(text.is_none());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn native_transformer_feed_forward_runs_flux2_first_half_silu_glu() {
+    let dir = std::env::temp_dir().join(format!(
+        "hipfire-flux2-transformer-ff-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("flux2-transformer-ff.hfq");
+    let block = "transformer/tensors/transformer_blocks.0";
+    let fused = [1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+    let identity = [1.0, 0.0, 0.0, 1.0];
+    let mut tensors = Vec::new();
+    for stream in ["ff", "ff_context"] {
+        tensors.push(f32_mem_tensor(
+            &format!("{block}.{stream}.linear_in.weight"),
+            &[4, 2],
+            &fused,
+        ));
+        tensors.push(f32_mem_tensor(
+            &format!("{block}.{stream}.linear_out.weight"),
+            &[2, 2],
+            &identity,
+        ));
+    }
+    write_hfqm_package_mem(&path, HFQ_ARCH_DIFFUSION, "{}", &tensors).unwrap();
+    let hfq = HfqFile::open_index_only(&path).unwrap();
+    let ff =
+        NativeTransformerFeedForward::from_hfq(&hfq, TransformerDenoiserFamily::Flux2, 0).unwrap();
+    let hidden = CpuTensor {
+        shape: vec![1, 1, 2],
+        data: vec![1.0, 2.0],
+    };
+    let mut runtime_context =
+        DiffusionGenerationRuntimeContext::new(DiffusionGenerationRuntimeOptions::default());
+    let image = ff
+        .forward_image_with_runtime_context(&hidden, &mut runtime_context)
+        .unwrap();
+    let text = ff
+        .forward_text_with_runtime_context(&hidden, &mut runtime_context)
+        .unwrap()
+        .unwrap();
+    let expected = [silu(1.0), 2.0 * silu(2.0)];
+    assert_f32_close(&image.data, &expected, 1e-6);
+    assert_f32_close(&text.data, &expected, 1e-6);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -2305,6 +3094,8 @@ fn native_vae_decoder_decodes_synthetic_latents_to_rgb8() {
         up_block_types: vec!["UpDecoderBlock2D".into()],
         norm_num_groups: Some(1),
         norm_eps: Some(1e-6),
+        patch_size: Vec::new(),
+        batch_norm_eps: None,
     };
     let decoder = NativeVaeDecoder::from_hfq(&hfq, &config).unwrap();
     let latents = LatentBatch {
@@ -2499,6 +3290,8 @@ fn native_vae_decoder_resident_path_matches_cpu_reference() {
         up_block_types: vec!["UpDecoderBlock2D".into()],
         norm_num_groups: Some(1),
         norm_eps: Some(1e-6),
+        patch_size: Vec::new(),
+        batch_norm_eps: None,
     };
     let decoder = NativeVaeDecoder::from_hfq(&hfq, &config).unwrap();
     // Confirm the fixture actually built the optional blocks we mean to test.
@@ -2607,6 +3400,8 @@ fn native_vae_encoder_encodes_synthetic_image_to_latents() {
         up_block_types: Vec::new(),
         norm_num_groups: Some(1),
         norm_eps: Some(1e-6),
+        patch_size: Vec::new(),
+        batch_norm_eps: None,
     };
     let encoder = NativeVaeEncoder::from_hfq(&hfq, &config).unwrap();
     let image = RgbImageBatch {

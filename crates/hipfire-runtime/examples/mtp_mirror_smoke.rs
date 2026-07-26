@@ -36,8 +36,8 @@
 //! Reports VRAM accounting on both devices before / after the mirror.
 
 use hipfire_arch_qwen35::speculative::{ModelSlot, ModelSlotConfig};
-use hipfire_runtime::mtp_mirror::peer_clone_tensor;
 use hipfire_rdna::Gpu;
+use hipfire_runtime::mtp_mirror::peer_clone_tensor;
 use std::path::Path;
 use std::time::Instant;
 

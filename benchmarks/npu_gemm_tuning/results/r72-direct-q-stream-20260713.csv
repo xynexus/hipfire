@@ -1,0 +1,4 @@
+variant,trial,contexts,q_handoff,kv_handoff,stage_mismatches,q_external,kv_mismatches,attention_mismatches,iterations,ms,status,notes
+scalar-core-stream,1,1,graph-local-scalar,external,0,unused,0,0,100,3.9288,rejected,exact output but slower than R71
+scalar-core-stream,2,1,graph-local-scalar,external,0,unused,0,0,100,3.7749,rejected,exact output but slower than R71
+scalar-core-stream,3,1,graph-local-scalar,external,0,unused,0,0,100,3.9272,rejected,exact output but slower than R71

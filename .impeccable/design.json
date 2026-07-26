@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-07-10T11:39:58Z",
+  "title": "Design System: Hipfire Admin Console",
+  "extensions": {
+    "colorMeta": {
+      "canvas": {"role": "neutral", "displayName": "Deep Canvas", "canonical": "#111417", "tonalRamp": ["#080a0c", "#111417", "#1b2025", "#303840", "#56636e", "#87929b", "#c5cbd0", "#f0f2f3"]},
+      "surface": {"role": "neutral", "displayName": "Instrument Surface", "canonical": "#171b20", "tonalRamp": ["#0a0d10", "#171b20", "#242b32", "#3a444e", "#606d78", "#9099a2", "#cbd0d4", "#f2f3f4"]},
+      "accent": {"role": "primary", "displayName": "Signal Teal", "canonical": "#2dd4bf", "tonalRamp": ["#062b27", "#0b4a42", "#107063", "#179887", "#2dd4bf", "#69e2d2", "#a7eee6", "#e6faf7"]},
+      "warning": {"role": "warning", "displayName": "Amber Warning", "canonical": "#f59e0b", "tonalRamp": ["#301c02", "#593405", "#865008", "#b76f0a", "#f59e0b", "#f8bc55", "#fbdaa0", "#fff5df"]},
+      "danger": {"role": "danger", "displayName": "Direct Red", "canonical": "#ef4444", "tonalRamp": ["#310909", "#5b1111", "#871b1b", "#b62929", "#ef4444", "#f47d7d", "#f9b3b3", "#fde8e8"]}
+    },
+    "typographyMeta": {
+      "title": {"displayName": "Title", "purpose": "Page and major pane titles."},
+      "body": {"displayName": "Body", "purpose": "Controls and explanatory prose."},
+      "label": {"displayName": "Label", "purpose": "Filters, headings, and metadata."},
+      "data": {"displayName": "Data", "purpose": "Identifiers, limits, time, and measured values."}
+    },
+    "shadows": [
+      {"name": "overlay", "value": "0 8px 24px rgba(0, 0, 0, 0.32)", "purpose": "Transient dialogs and menus only."}
+    ],
+    "motion": [
+      {"name": "state", "value": "180ms cubic-bezier(0.22, 1, 0.36, 1)", "purpose": "Fast state feedback; disabled under reduced motion."}
+    ],
+    "breakpoints": [
+      {"name": "compact", "value": "720px"}
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The single strongest action in a working region.",
+      "html": "<button class=\"ds-btn-primary\">Save limits</button>",
+      "css": ".ds-btn-primary { background:#2dd4bf; color:#111417; border:0; border-radius:6px; padding:8px 12px; min-height:44px; font:600 12px Inter,system-ui,sans-serif; transition:background 180ms cubic-bezier(.22,1,.36,1); } .ds-btn-primary:hover { background:#69e2d2; } .ds-btn-primary:focus-visible { outline:2px solid #2dd4bf; outline-offset:3px; }"
+    },
+    {
+      "name": "Text Field",
+      "kind": "input",
+      "refersTo": "field",
+      "description": "A compact labelled operational input.",
+      "html": "<label class=\"ds-field-label\">User name<input class=\"ds-field\" value=\"inference-team\"></label>",
+      "css": ".ds-field-label { display:grid; gap:6px; color:#e7ecef; font:600 12px Inter,system-ui,sans-serif; } .ds-field { background:#111417; color:#e7ecef; border:1px solid #29313a; border-radius:6px; min-height:44px; padding:8px 10px; font:400 14px Inter,system-ui,sans-serif; } .ds-field:focus-visible { outline:2px solid #2dd4bf; outline-offset:2px; }"
+    },
+    {
+      "name": "Console Tabs",
+      "kind": "nav",
+      "description": "Persistent navigation between Overview, Access, and Usage.",
+      "html": "<nav class=\"ds-tabs\" aria-label=\"Admin sections\"><button class=\"ds-tab ds-active\">Overview</button><button class=\"ds-tab\">Access</button><button class=\"ds-tab\">Usage</button></nav>",
+      "css": ".ds-tabs { display:flex; gap:4px; border-bottom:1px solid #29313a; } .ds-tab { background:transparent; color:#9aa5af; border:0; border-bottom:2px solid transparent; padding:10px 12px; font:600 12px Inter,system-ui,sans-serif; } .ds-tab:hover { color:#e7ecef; } .ds-tab.ds-active { color:#2dd4bf; border-bottom-color:#2dd4bf; } .ds-tab:focus-visible { outline:2px solid #2dd4bf; outline-offset:2px; }"
+    },
+    {
+      "name": "Status Chip",
+      "kind": "chip",
+      "description": "A textual status indicator that never relies on color alone.",
+      "html": "<span class=\"ds-chip\">Enabled</span>",
+      "css": ".ds-chip { display:inline-flex; align-items:center; border:1px solid #29313a; border-radius:6px; padding:3px 7px; color:#2dd4bf; background:#171b20; font:600 12px Inter,system-ui,sans-serif; }"
+    },
+    {
+      "name": "Instrument Panel",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "A bounded surface used only where grouping needs a persistent edge.",
+      "html": "<section class=\"ds-panel\"><h2>Current bucket</h2><p>42,180 text tokens remain</p></section>",
+      "css": ".ds-panel { background:#171b20; color:#e7ecef; border:1px solid #29313a; border-radius:10px; padding:14px 16px; } .ds-panel h2 { margin:0 0 8px; color:#e7ecef; font:650 14px Inter,system-ui,sans-serif; } .ds-panel p { margin:0; color:#9aa5af; font:400 14px Inter,system-ui,sans-serif; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Quiet Technical Trust",
+    "overview": "The console is a precise instrument used by an operator who may be responding to load, access, or safety issues. Its restrained dark-neutral canvas reduces glare, while a scarce teal accent identifies current selection, healthy state, and primary action. Information is dense but never cramped; hierarchy comes from alignment, type weight, and tonal layers rather than decoration.",
+    "keyCharacteristics": ["Restrained teal on cool charcoal neutrals.", "Compact, repeatable control and table vocabulary.", "Operational state and consequences shown in context.", "Responsive structure with keyboard-complete workflows.", "Motion limited to fast state feedback and always reduced-motion safe."],
+    "rules": [
+      {"name": "Scarce Signal", "body": "Teal identifies action or state on no more than a small minority of the screen; its rarity makes it trustworthy.", "section": "colors"},
+      {"name": "No Color-Only", "body": "Every warning, error, selection, and status also has text, shape, or an accessible state that carries the same meaning.", "section": "colors"},
+      {"name": "Flat-by-Default", "body": "A resting panel never combines a border with a wide decorative shadow.", "section": "elevation"}
+    ],
+    "dos": ["Do put identity, scope, time range, and effective limit beside the data they qualify.", "Do use skeletons, explanatory empty states, and recoverable inline errors.", "Do preserve keyboard order, visible focus, WCAG 2.2 AA contrast, and reduced motion."],
+    "donts": ["Don't build generic SaaS marketing dashboards with decorative hero metrics.", "Don't use cyberpunk control rooms with neon gradients, glass panels, or gratuitous animation.", "Don't create card walls that fragment related data into identical floating tiles."]
+  }
+}

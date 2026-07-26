@@ -41,17 +41,17 @@ fn main() {
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
+    use hipfire_rdna::{DType, Gpu};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
     use hipfire_runtime::sampler;
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::triattn::{self, TriAttnCenters};
-    use hipfire_rdna::{DType, Gpu};
     use std::path::Path;
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: triattn_decode_demo <model-mq4.hfq> <sidecar.triattn.bin> [budget=32] [prefill=64] [gen=30] [kv_mode=q8|asym3]");
+        eprintln!("Usage: triattn_decode_demo <model.hfq> <model.triattn.hfq> [budget=32] [prefill=64] [gen=30] [kv_mode=q8|asym3]");
         std::process::exit(1);
     }
     let model_path = &args[1];
@@ -237,6 +237,7 @@ fn main() {
                         config.n_kv_heads,
                         config.head_dim,
                         n_rot,
+                        false,
                         config.rope_theta,
                         p_q,
                         prompt_len,
@@ -251,6 +252,7 @@ fn main() {
                         config.n_kv_heads,
                         config.head_dim,
                         n_rot,
+                        false,
                         config.rope_theta,
                         p_q,
                         prompt_len,

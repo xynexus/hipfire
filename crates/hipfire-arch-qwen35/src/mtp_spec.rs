@@ -41,8 +41,8 @@ use hipfire_runtime::multi_gpu::Gpus;
 // MERGE-COMBINE: union of OUR EmbeddingFormat (hetero drafter embed) + #352
 // Event/Graph/GraphExec/Stream (proposal-graph device-token-chain helpers).
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
-use hipfire_runtime::weights::{self, EmbeddingFormat};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_runtime::weights::{self, EmbeddingFormat};
 use std::time::Instant;
 
 // ─── Sampling primitives (host-side, used by temp>0 spec-decode path) ────
@@ -885,6 +885,12 @@ fn embed_device_token_into(
         weights::EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8_batched(&weights.token_embd, out, token_id, 1, dim)
         }
+        weights::EmbeddingFormat::BF16 => {
+            gpu.embedding_lookup_bf16_batched(&weights.token_embd, out, token_id, 1, dim)
+        }
+        weights::EmbeddingFormat::F16 => {
+            gpu.embedding_lookup_f16_batched(&weights.token_embd, out, token_id, 1, dim)
+        }
         other => panic!("device-token MTP chain does not support embedding format {other:?}"),
     }
 }
@@ -912,6 +918,12 @@ fn embed_device_token_into_drafter(
         }
         EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8_batched(mirrored_embd, out, token_id, 1, dim)
+        }
+        EmbeddingFormat::BF16 => {
+            gpu.embedding_lookup_bf16_batched(mirrored_embd, out, token_id, 1, dim)
+        }
+        EmbeddingFormat::F16 => {
+            gpu.embedding_lookup_f16_batched(mirrored_embd, out, token_id, 1, dim)
         }
         other => panic!("device-token chain: unsupported drafter embd format {other:?}"),
     }
@@ -2713,6 +2725,9 @@ pub fn spec_step_mtp_compressed_serial(
         /* moe_router_logits_present — dense trunk: arm never matched */ true,
     );
     let verify_tape: Option<&mut GdnTape> = if tape_captured {
+        // Tape row 0 records verify_tokens[0] at absolute position `cur_pos`;
+        // rollback replay seeds Q8 requant from those positions (issue #17).
+        state.trunk_gdn_tape.set_base_position(cur_pos);
         Some(&mut state.trunk_gdn_tape)
     } else {
         None
@@ -3309,6 +3324,18 @@ fn drafter_embed_lookup(
             token,
             n_embd,
         ),
+        EmbeddingFormat::BF16 => drafter_gpu.embedding_lookup_bf16(
+            &drafter_state.mirrored_token_embd,
+            &drafter_state.step_embd,
+            token,
+            n_embd,
+        ),
+        EmbeddingFormat::F16 => drafter_gpu.embedding_lookup_f16(
+            &drafter_state.mirrored_token_embd,
+            &drafter_state.step_embd,
+            token,
+            n_embd,
+        ),
         EmbeddingFormat::Q4K => drafter_gpu.embedding_lookup_q4k(
             &drafter_state.mirrored_token_embd,
             &drafter_state.step_embd,
@@ -3553,6 +3580,11 @@ pub fn spec_step_mtp_compressed_serial_multi(
     // the full transformer stack.
     let tape_captured = state.trunk_gdn_tape_shards.is_some();
     let _ = tape_captured; // used below in rollback
+    if let Some(shards) = state.trunk_gdn_tape_shards.as_mut() {
+        // Tape row 0 records verify_tokens[0] at absolute position `cur_pos`;
+        // rollback replay seeds Q8 requant from those positions (issue #17).
+        shards.set_base_position(cur_pos);
+    }
 
     // Multi-GPU trunk verify. forward_prefill_batch_multi_with_caps dispatches
     // each layer to its owning band; per_token_hidden_out lands on output_device

@@ -3,6 +3,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 // Import tooling now lives in the offline hipfire-diffusion-coexist crate.
+use super::*;
 use hipfire_diffusion_coexist::{
     import_diffusers_to_hfq, ldm_unet_native_tensor_name, ldm_vae_native_tensor_name,
     parse_pytorch_state_dict, pytorch_tensor_is_contiguous, reorder_pytorch_storage_to_contiguous,
@@ -10,7 +11,123 @@ use hipfire_diffusion_coexist::{
 };
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 use std::fs;
-use super::*;
+
+#[test]
+fn sefi_turbo_dual_schedule_matches_pinned_diffusers_reference() {
+    let reference_path = Path::new("/tmp/hipfire-sefi-schedule-reference.json");
+    if !reference_path.is_file() {
+        eprintln!("skip: run scripts/sefi_schedule_reference.py for local parity");
+        return;
+    }
+    let reference: serde_json::Value =
+        serde_json::from_slice(&fs::read(reference_path).unwrap()).unwrap();
+    let values = |step_count: usize, name: &str| {
+        reference[step_count.to_string()][name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_f64().unwrap() as f32)
+            .collect::<Vec<_>>()
+    };
+    for step_count in [4usize, 8, 10] {
+        let schedule = DiffusionSchedule::sefi_dual_euler(step_count, 0.1, 1.0).unwrap();
+        let timestep_sem = schedule
+            .steps
+            .iter()
+            .map(|step| step.timestep_sem)
+            .collect::<Vec<_>>();
+        let timestep_tex = schedule
+            .steps
+            .iter()
+            .map(|step| step.timestep_tex)
+            .collect::<Vec<_>>();
+        let mut sigma_sem = schedule
+            .steps
+            .iter()
+            .map(|step| step.sigma_sem)
+            .collect::<Vec<_>>();
+        let mut sigma_tex = schedule
+            .steps
+            .iter()
+            .map(|step| step.sigma_tex)
+            .collect::<Vec<_>>();
+        sigma_sem.push(schedule.steps.last().unwrap().sigma_sem_next);
+        sigma_tex.push(schedule.steps.last().unwrap().sigma_tex_next);
+        for (label, actual, expected) in [
+            (
+                "base_sigmas",
+                schedule.base_sigmas,
+                values(step_count, "base_sigmas"),
+            ),
+            (
+                "timestep_sem",
+                timestep_sem,
+                values(step_count, "timestep_sem"),
+            ),
+            (
+                "timestep_tex",
+                timestep_tex,
+                values(step_count, "timestep_tex"),
+            ),
+            ("sigma_sem", sigma_sem, values(step_count, "sigma_sem")),
+            ("sigma_tex", sigma_tex, values(step_count, "sigma_tex")),
+        ] {
+            assert_eq!(actual.len(), expected.len(), "{step_count} {label} length");
+            let max_abs = actual
+                .iter()
+                .zip(expected)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= 1e-6,
+                "SeFi {step_count}-step {label} max_abs={max_abs}"
+            );
+        }
+
+        let mut latents = LatentBatch {
+            batch: 1,
+            channels: 3,
+            height: 1,
+            width: 2,
+            data: values(step_count, "integration_initial"),
+        };
+        let trace = reference[step_count.to_string()]["integration_trace"]
+            .as_array()
+            .unwrap();
+        for (index, (step, expected_step)) in schedule.steps.iter().zip(trace.iter()).enumerate() {
+            let mut velocity = vec![0.0f32; latents.data.len()];
+            for channel in 0..latents.channels {
+                let timestep = if channel == 0 {
+                    step.timestep_sem
+                } else {
+                    step.timestep_tex
+                };
+                for element in 0..2 {
+                    let offset = channel * 2 + element;
+                    velocity[offset] = latents.data[offset] * 0.125
+                        + (index + 1) as f32 * 0.01
+                        + offset as f32 * 0.05
+                        + timestep * 1e-5;
+                }
+            }
+            let expected_velocity = expected_step["velocity"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>();
+            assert_f32_close(&velocity, &expected_velocity, 1e-6);
+            sefi_dual_euler_step(&mut latents, &velocity, 1, step).unwrap();
+            let expected_latent = expected_step["latent"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>();
+            assert_f32_close(&latents.data, &expected_latent, 1e-6);
+        }
+    }
+}
 
 #[test]
 fn linear_scheduler_euler_step_moves_toward_next_sigma() {
@@ -168,8 +285,118 @@ fn flow_match_euler_step_uses_model_output_as_velocity() {
         .step(&mut latents, &[0.25, -0.5], 0, &mut state)
         .unwrap();
 
-    assert_eq!(schedule.sigmas, vec![1.0, 0.0, 0.0]);
-    assert_eq!(latents.data, vec![0.75, -0.5]);
+    // Pre-shift sigmas are linspace(1, 1/num_train, steps): the last model-eval
+    // sigma is 1/1000 = 0.001 (never 0), with a terminal 0 appended. Step 0 dt =
+    // 0.001 - 1.0 = -0.999, and latent += velocity * dt.
+    assert_eq!(schedule.sigmas.len(), 3);
+    assert!((schedule.sigmas[0] - 1.0).abs() < 1e-6);
+    assert!((schedule.sigmas[1] - 0.001).abs() < 1e-5 && schedule.sigmas[1] > 0.0);
+    assert_eq!(schedule.sigmas[2], 0.0);
+    let dt = schedule.sigmas[1] - schedule.sigmas[0];
+    assert!((latents.data[0] - (1.0 + 0.25 * dt)).abs() < 1e-6);
+    assert!((latents.data[1] - (-1.0 + -0.5 * dt)).abs() < 1e-6);
+}
+
+fn flow_match_base_schedule_for_refine() -> DiffusionSchedule {
+    let config = SchedulerConfig {
+        class_name: "FlowMatchEulerDiscreteScheduler".into(),
+        num_train_timesteps: Some(1000),
+        shift: Some(1.0),
+        ..SchedulerConfig::default()
+    };
+    DiffusionSchedule::from_config(&config, 12).unwrap()
+}
+
+#[test]
+fn refine_direct_sigma_single_step_is_ramp_to_zero_with_scaled_timestep() {
+    let base = flow_match_base_schedule_for_refine();
+    let refine = base.refine_direct_sigma(0.12, 1, false).unwrap();
+
+    // One step: sigmas [first_sigma, 0]; timestep = sigma * 1000 (base scale).
+    assert_eq!(refine.solver, SchedulerSolver::FlowMatchEuler);
+    assert_eq!(refine.sigmas, vec![0.12, 0.0]);
+    assert_eq!(refine.timesteps.len(), 1);
+    assert!((refine.timesteps[0] - 120.0).abs() < 1e-3);
+}
+
+#[test]
+fn refine_direct_sigma_single_step_ignores_shifted_flag() {
+    let base = flow_match_base_schedule_for_refine();
+    let linear = base.refine_direct_sigma(0.16, 1, false).unwrap();
+    let shifted = base.refine_direct_sigma(0.16, 1, true).unwrap();
+    // For a single refine step the shifted and linear schedules are identical.
+    assert_eq!(linear.sigmas, shifted.sigmas);
+    assert_eq!(linear.sigmas, vec![0.16, 0.0]);
+}
+
+#[test]
+fn refine_direct_sigma_multistep_ramps_from_first_sigma_to_zero() {
+    let base = flow_match_base_schedule_for_refine();
+    let refine = base.refine_direct_sigma(0.2, 4, false).unwrap();
+
+    assert_eq!(refine.sigmas.len(), 5);
+    assert_eq!(refine.timesteps.len(), 4);
+    assert!((refine.sigmas[0] - 0.2).abs() < 1e-6);
+    assert_eq!(*refine.sigmas.last().unwrap(), 0.0);
+    // Monotonically decreasing toward zero.
+    for pair in refine.sigmas.windows(2) {
+        assert!(pair[0] >= pair[1]);
+    }
+
+    // Shifted variant keeps the same endpoints but bends the interior.
+    let shifted = base.refine_direct_sigma(0.2, 4, true).unwrap();
+    assert!((shifted.sigmas[0] - 0.2).abs() < 1e-6);
+    assert_eq!(*shifted.sigmas.last().unwrap(), 0.0);
+    assert_ne!(shifted.sigmas, refine.sigmas);
+}
+
+#[test]
+fn refine_direct_sigma_rejects_bad_params_and_non_flow_match() {
+    let base = flow_match_base_schedule_for_refine();
+    assert!(base.refine_direct_sigma(0.0, 1, false).is_err());
+    assert!(base.refine_direct_sigma(1.0, 1, false).is_err());
+    assert!(base.refine_direct_sigma(0.12, 0, false).is_err());
+
+    // A non-flow-match (linear/Euler) schedule is rejected.
+    let euler = DiffusionSchedule::linear(4).unwrap();
+    assert!(euler.refine_direct_sigma(0.12, 1, false).is_err());
+}
+
+#[test]
+fn flow_match_refine_noise_then_euler_step_recovers_clean_latent() {
+    // The refine round trip: inject flow-match noise into a clean x0, then take
+    // one Euler step with the exact flow-match velocity (noise - x0). The result
+    // must recover x0 -- the property the additive noising would violate.
+    let base = flow_match_base_schedule_for_refine();
+    let refine = base.refine_direct_sigma(0.12, 1, false).unwrap();
+
+    let x0 = vec![0.5_f32, -0.25, 1.0, 0.0];
+    let noise = vec![0.9_f32, 0.1, -0.4, 0.2];
+    let mut latents = LatentBatch {
+        batch: 1,
+        channels: 1,
+        height: 1,
+        width: 4,
+        data: x0.clone(),
+    };
+
+    refine
+        .add_flow_match_refine_noise(&mut latents, &noise)
+        .unwrap();
+    // x = (1 - 0.12) * x0 + 0.12 * noise
+    for ((got, x0v), n) in latents.data.iter().zip(&x0).zip(&noise) {
+        let expected = 0.88 * x0v + 0.12 * n;
+        assert!((got - expected).abs() < 1e-6, "noised: {got} vs {expected}");
+    }
+
+    // Flow-match velocity target for x_t = (1-s) x0 + s noise is (noise - x0).
+    let velocity: Vec<f32> = noise.iter().zip(&x0).map(|(n, x)| n - x).collect();
+    let mut state = SchedulerStepState::default();
+    refine.step(&mut latents, &velocity, 0, &mut state).unwrap();
+
+    for (got, x0v) in latents.data.iter().zip(&x0) {
+        assert!((got - x0v).abs() < 1e-6, "recovered: {got} vs {x0v}");
+    }
 }
 
 #[test]
@@ -425,6 +652,40 @@ fn dpm_solver_dynamic_thresholding_clips_predicted_original_sample() {
         output,
         vec![-0.125, 0.125, 0.5, -1.0, 0.05, -0.75, 1.0, -1.0]
     );
+}
+
+#[test]
+fn dpm_solver_dynamic_thresholding_interpolates_quantile_without_sorting() {
+    let schedule = DiffusionSchedule {
+        timesteps: vec![0.0],
+        sigmas: vec![0.0, 0.0],
+        prediction_type: SchedulerPredictionType::Sample,
+        input_scaling: SchedulerInputScaling::None,
+        solver: SchedulerSolver::DpmSolverMultistep {
+            algorithm_type: DpmSolverAlgorithm::DpmSolverPlusPlus,
+            solver_order: 2,
+            solver_type: DpmSolverType::Midpoint,
+            lower_order_final: true,
+            thresholding: true,
+            dynamic_thresholding_ratio: 0.5,
+            sample_max_value: 4.0,
+        },
+        train_timesteps: vec![0],
+        alpha_t: vec![1.0],
+        sigma_t: vec![0.0],
+        lambda_t: vec![0.0],
+    };
+    let sample = CpuTensor {
+        shape: vec![1, 1, 1, 4],
+        data: vec![0.0; 4],
+    };
+    let model_output = [-0.5, 0.5, 2.0, -4.0];
+
+    let output = schedule
+        .dpm_convert_model_output(&model_output, 0, &sample)
+        .unwrap();
+
+    assert_eq!(output, vec![-0.4, 0.4, 1.0, -1.0]);
 }
 
 #[test]

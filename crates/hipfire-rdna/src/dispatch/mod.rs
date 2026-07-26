@@ -19,6 +19,19 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock};
 
+fn raw_upload_chunks(
+    total_bytes: usize,
+    max_chunk_bytes: usize,
+) -> impl Iterator<Item = (usize, usize)> {
+    let max_chunk_bytes = max_chunk_bytes.max(1);
+    (0..total_bytes)
+        .step_by(max_chunk_bytes)
+        .map(move |offset| {
+            let len = (total_bytes - offset).min(max_chunk_bytes);
+            (offset, len)
+        })
+}
+
 /// Build a `[KernArg; N]` argument list for [`Gpu::launch_kernargs`] with one
 /// entry per kernel parameter, tagged by ABI kind so the packed blob and the
 /// pointer array are always derived from the same declaration (review
@@ -64,6 +77,8 @@ mod mamba2;
 mod misc;
 mod moe;
 mod norm;
+mod npu_io;
+pub use npu_io::OpusNpuIoLayout;
 mod overlays;
 mod quant;
 mod rocblas;
@@ -108,9 +123,42 @@ thread_local! {
 /// instrumented sweep.
 pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
 
-/// Per-launch entropy for Q8 GatedDeltaNet stochastic rounding.
+/// Legacy per-launch entropy counter for Q8 GatedDeltaNet stochastic
+/// rounding. **No longer feeds any kernel** (issue #17): a process-global
+/// monotonic dispatch counter made target numerics a function of execution
+/// history, so in speculative decoding the drafter bled into the target's
+/// output (a different drafter shifted every subsequent frame, changing the
+/// rounding noise → DeltaNet state → target logits). The `frame` kernarg is
+/// now derived from the absolute sequence position and the DeltaNet layer
+/// index via [`gdn_requant_seed`].
+///
+/// Retained only so the env-gated rollback frame-order diagnostics in
+/// `hipfire-arch-qwen35::speculative` still compile. Reading it tells you
+/// nothing about the seeds a kernel actually used.
 #[allow(dead_code)]
 static GDN_REQUANT_FRAME: AtomicU32 = AtomicU32::new(0);
+
+/// Deterministic seed for the Q8 GatedDeltaNet stochastic-rounding RNG.
+///
+/// Must be a pure function of *where we are in the sequence*, never of *how
+/// many dispatches have happened* — two runs that reach the same sequence
+/// position must round identically regardless of how they got there
+/// (issue #17).
+///
+/// - `seq_pos` is the absolute sequence position of the **first** token in
+///   the block being processed. The batched kernel adds its intra-block token
+///   index `t` to `frame`, so `seq_pos + t` is that token's absolute position.
+/// - `delta_layer` is the DeltaNet (linear-attention) layer index. The kernels
+///   already mix head, state row, and lane into the RNG, but **not** the layer;
+///   without this term every LA layer would dither with an identical noise
+///   sequence at a given position (correlated dither across layers). Folding it
+///   in at `2^24` keeps the `frame + t` contract intact and stays collision-free
+///   for sequence positions below ~16.7M.
+#[cfg(feature = "deltanet")]
+#[inline]
+pub(crate) fn gdn_requant_seed(seq_pos: u32, delta_layer: u32) -> i32 {
+    seq_pos.wrapping_add(delta_layer.wrapping_mul(1 << 24)) as i32
+}
 
 /// Minimum batch size at which the FP8 WMMA prefill path is enabled.
 /// Below this, the FP16 WMMA path wins on gfx1201 (measured 0.71-0.94×
@@ -399,7 +447,12 @@ pub struct Gpu {
     pub oq4_xq_batch: Option<GpuTensor>, // packed int4 activation, N*K/2 bytes
     pub oq4_xs_batch: Option<GpuTensor>, // per-group f32 activation scales, N*K/256
     pub oq4_ytmp_batch: Option<GpuTensor>, // f32 residual GEMM scratch, M*N
-    pub paro_x_scratch: Option<GpuTensor>, // ParoQuant: scratch for rotated activation copy
+    // Plain-basis DFLASH W4A8/W8A8 staging. The activation is quantized once
+    // per (batch,G256) and reused by every output-row block in the projection.
+    // Capacity grows to the largest bounded chunk seen and is stream-reused.
+    pub dflash_oq_xq_batch: Option<GpuTensor>, // signed int8 activation, N*K bytes
+    pub dflash_oq_xs_batch: Option<GpuTensor>, // per-G256 f32 scales, N*K/256
+    pub paro_x_scratch: Option<GpuTensor>,     // ParoQuant: scratch for rotated activation copy
     pub paro_fused_scratch: Option<Vec<GpuTensor>>, // ParoQuant fused paths: multiple rotation scratch buffers
     pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,  // INT8 quantized rotated x for dp4a
     pub mq_x_scales: Option<hip_bridge::DeviceBuffer>, // per-group f32 scales for x quantization
@@ -800,6 +853,8 @@ impl Gpu {
             oq4_xq_batch: None,
             oq4_xs_batch: None,
             oq4_ytmp_batch: None,
+            dflash_oq_xq_batch: None,
+            dflash_oq_xs_batch: None,
             paro_x_scratch: None,
             paro_fused_scratch: None,
             mq_x_q8: None,
@@ -1303,57 +1358,6 @@ impl Gpu {
         }
     }
 
-    /// Helper: launch a kernel using the blob path during graph capture,
-    /// or the normal kernelParams path otherwise. The `blob_builder` closure
-    /// constructs the KernargBlob; it's only called when capturing.
-    fn launch_maybe_blob(
-        &mut self,
-        func_name: &str,
-        grid: [u32; 3],
-        block: [u32; 3],
-        shared_mem: u32,
-        params: &mut Vec<*mut std::ffi::c_void>,
-        blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
-    ) -> HipResult<()> {
-        if self.capture_mode || self.flags.force_blob_path {
-            let mut blob = blob_builder();
-            // Pad tail to 16-byte alignment — some kernel struct layouts that
-            // HIP's loader expects have an implicit final pad to the struct's
-            // alignment. gfx1100 typically doesn't care, but under graph
-            // capture on ROCm 7.x the loader is stricter and unpadded tails
-            // have been observed to cause silent argument corruption.
-            blob.pad_to(16);
-            self.capture_blobs.push(blob.into_vec());
-            // Re-borrow fields separately to avoid conflicting borrows on self
-            let buf = self.capture_blobs.last_mut().unwrap();
-            let func = &self.functions[func_name];
-            let stream = self
-                .active_stream
-                .as_ref()
-                .map(|s| s as &hip_bridge::Stream);
-            unsafe {
-                self.hip.launch_kernel_blob(
-                    func,
-                    grid,
-                    block,
-                    shared_mem,
-                    stream,
-                    buf.as_mut_slice(),
-                )
-            }
-        } else {
-            let func = &self.functions[func_name];
-            let stream = self
-                .active_stream
-                .as_ref()
-                .map(|s| s as &hip_bridge::Stream);
-            unsafe {
-                self.hip
-                    .launch_kernel(func, grid, block, shared_mem, stream, params)
-            }
-        }
-    }
-
     /// Launch a kernel from a single `&[KernArg]` list, deriving BOTH launch
     /// ABIs from it: the packed [`hip_bridge::KernargBlob`] on the graph-
     /// capture / `force_blob_path` branch, and the `kernelParams` pointer
@@ -1380,7 +1384,11 @@ impl Gpu {
             for a in args {
                 blob.push_arg(a);
             }
-            // Same tail pad as launch_maybe_blob — see its comment.
+            // Pad tail to 16-byte alignment — some kernel struct layouts that
+            // HIP's loader expects have an implicit final pad to the struct's
+            // alignment. gfx1100 typically doesn't care, but under graph
+            // capture on ROCm 7.x the loader is stricter and unpadded tails
+            // have been observed to cause silent argument corruption.
             blob.pad_to(16);
             self.capture_blobs.push(blob.into_vec());
             let buf = self.capture_blobs.last_mut().unwrap();
@@ -1452,23 +1460,13 @@ impl Gpu {
 
         let out_ptr = output.buf.as_ptr();
         let iters_i32 = iters as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &out_ptr as *const _ as *mut c_void,
-            &iters_i32 as *const _ as *mut c_void,
-        ];
 
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             func_name,
             [blocks as u32, 1, 1],
             [32, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(out_ptr);
-                b.push_i32(iters_i32);
-                b
-            },
+            &kernargs![ptr out_ptr, i32 iters_i32],
         )
     }
 
@@ -1555,28 +1553,13 @@ impl Gpu {
             let in_ptr = src_ptr;
             let out_ptr = self.fp16_x_scratch.as_ref().unwrap().as_ptr();
             let n_val = n_elems as i32;
-            let mut in_ptr_m = in_ptr;
-            let mut out_ptr_m = out_ptr;
-            let mut n_val_m = n_val;
-            let mut conv_params: Vec<*mut c_void> = vec![
-                &mut in_ptr_m as *mut _ as *mut c_void,
-                &mut out_ptr_m as *mut _ as *mut c_void,
-                &mut n_val_m as *mut _ as *mut c_void,
-            ];
             let grid = ((n_elems + 255) / 256) as u32;
-            self.launch_maybe_blob(
+            self.launch_kernargs(
                 "convert_f32_to_f16",
                 [grid, 1, 1],
                 [256, 1, 1],
                 0,
-                &mut conv_params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(in_ptr);
-                    b.push_ptr(out_ptr);
-                    b.push_i32(n_val);
-                    b
-                },
+                &kernargs![ptr in_ptr, ptr out_ptr, i32 n_val],
             )?;
             self.fp16_x_source_ptr = src_ptr;
         }
@@ -1610,28 +1593,13 @@ impl Gpu {
             let in_ptr = src_ptr;
             let out_ptr = self.bf16_x_scratch.as_ref().unwrap().as_ptr();
             let n_val = n_elems as i32;
-            let mut in_ptr_m = in_ptr;
-            let mut out_ptr_m = out_ptr;
-            let mut n_val_m = n_val;
-            let mut conv_params: Vec<*mut c_void> = vec![
-                &mut in_ptr_m as *mut _ as *mut c_void,
-                &mut out_ptr_m as *mut _ as *mut c_void,
-                &mut n_val_m as *mut _ as *mut c_void,
-            ];
             let grid = ((n_elems + 255) / 256) as u32;
-            self.launch_maybe_blob(
+            self.launch_kernargs(
                 "convert_f32_to_bf16",
                 [grid, 1, 1],
                 [256, 1, 1],
                 0,
-                &mut conv_params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(in_ptr);
-                    b.push_ptr(out_ptr);
-                    b.push_i32(n_val);
-                    b
-                },
+                &kernargs![ptr in_ptr, ptr out_ptr, i32 n_val],
             )?;
             self.bf16_x_source_ptr = src_ptr;
         }
@@ -1660,28 +1628,13 @@ impl Gpu {
         let in_ptr = x.buf.as_ptr();
         let out_ptr = self.fp16_x_scratch.as_ref().unwrap().as_ptr();
         let n_val = n_elems as i32;
-        let mut in_ptr_m = in_ptr;
-        let mut out_ptr_m = out_ptr;
-        let mut n_val_m = n_val;
-        let mut conv_params: Vec<*mut c_void> = vec![
-            &mut in_ptr_m as *mut _ as *mut c_void,
-            &mut out_ptr_m as *mut _ as *mut c_void,
-            &mut n_val_m as *mut _ as *mut c_void,
-        ];
         let grid = ((n_elems + 255) / 256) as u32;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "convert_f32_to_f16",
             [grid, 1, 1],
             [256, 1, 1],
             0,
-            &mut conv_params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(in_ptr);
-                b.push_ptr(out_ptr);
-                b.push_i32(n_val);
-                b
-            },
+            &kernargs![ptr in_ptr, ptr out_ptr, i32 n_val],
         )?;
         self.fp16_x_source_ptr = in_ptr;
 
@@ -1713,29 +1666,14 @@ impl Gpu {
             let in_ptr = src_ptr;
             let out_ptr = self.fp8_x_scratch.as_ref().unwrap().as_ptr();
             let n_val = n_elems as i32;
-            let mut in_ptr_m = in_ptr;
-            let mut out_ptr_m = out_ptr;
-            let mut n_val_m = n_val;
-            let mut conv_params: Vec<*mut c_void> = vec![
-                &mut in_ptr_m as *mut _ as *mut c_void,
-                &mut out_ptr_m as *mut _ as *mut c_void,
-                &mut n_val_m as *mut _ as *mut c_void,
-            ];
             // 16 elements per thread, 256 threads per block = 4096 elements/block.
             let grid = ((n_elems + 4095) / 4096) as u32;
-            self.launch_maybe_blob(
+            self.launch_kernargs(
                 "pack_f32_to_fp8_gfx12",
                 [grid, 1, 1],
                 [256, 1, 1],
                 0,
-                &mut conv_params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(in_ptr);
-                    b.push_ptr(out_ptr);
-                    b.push_i32(n_val);
-                    b
-                },
+                &kernargs![ptr in_ptr, ptr out_ptr, i32 n_val],
             )?;
             self.fp8_x_source_ptr = src_ptr;
         }
@@ -1775,32 +1713,16 @@ impl Gpu {
         let must_convert = true;
         if must_convert {
             let out_ptr = self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr();
-            let mut xp = src_ptr;
-            let mut yp = out_ptr;
-            let mut k_val = k as i32;
-            let mut n_val = batch_size as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut xp as *mut _ as *mut c_void,
-                &mut yp as *mut _ as *mut c_void,
-                &mut k_val as *mut _ as *mut c_void,
-                &mut n_val as *mut _ as *mut c_void,
-            ];
+            let k_val = k as i32;
+            let n_val = batch_size as i32;
             let grid_x = ((k + 1023) / 1024) as u32;
             let grid_y = batch_size as u32;
-            self.launch_maybe_blob(
+            self.launch_kernargs(
                 "quantize_q8_1_mmq_ds4",
                 [grid_x, grid_y, 1],
                 [256, 1, 1],
                 0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(src_ptr);
-                    b.push_ptr(out_ptr);
-                    b.push_i32(k_val);
-                    b.push_i32(n_val);
-                    b
-                },
+                &kernargs![ptr src_ptr, ptr out_ptr, i32 k_val, i32 n_val],
             )?;
         }
 
@@ -2074,6 +1996,39 @@ impl Gpu {
         })
     }
 
+    /// Upload raw bytes through bounded synchronous copies. `on_copied` runs
+    /// only after each chunk's H2D copy has completed, allowing an offline
+    /// file-backed source to discard those mmap pages immediately. The final
+    /// tensor is byte-identical to [`Gpu::upload_raw`].
+    pub fn upload_raw_chunked<F>(
+        &self,
+        data: &[u8],
+        shape: &[usize],
+        max_chunk_bytes: usize,
+        mut on_copied: F,
+    ) -> HipResult<GpuTensor>
+    where
+        F: FnMut(usize, usize),
+    {
+        self.bind_thread()?;
+        let buf = self.hip.malloc(data.len())?;
+        for (offset, len) in raw_upload_chunks(data.len(), max_chunk_bytes) {
+            if let Err(error) =
+                self.hip
+                    .memcpy_htod_offset(&buf, offset, &data[offset..offset + len])
+            {
+                let _ = self.hip.free(buf);
+                return Err(error);
+            }
+            on_copied(offset, len);
+        }
+        Ok(GpuTensor {
+            buf,
+            shape: shape.to_vec(),
+            dtype: DType::Raw,
+        })
+    }
+
     pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.pool.free(tensor.buf);
@@ -2297,6 +2252,37 @@ impl Gpu {
         self.mq_x_q8 = Some(x_q8);
         self.mq_x_scales = Some(x_scales);
         Ok(())
+    }
+
+    /// Alias the shared FWHT rotation scratch (`mq_x_rot`) as an F32 tensor.
+    ///
+    /// Rotated-dtype GEMVs write the rotated activation into this shared
+    /// scratch and read it back within the same dispatch. Callers must have
+    /// allocated the scratch first via [`Gpu::ensure_mq_signs`]; every
+    /// rotated-dtype route does so before reaching here.
+    ///
+    /// The returned tensor *aliases* the scratch buffer — it must not be held
+    /// across a reallocation of `mq_x_rot`, and it is only valid for the
+    /// current dispatch.
+    ///
+    /// # Panics
+    /// Panics with an actionable message if `mq_x_rot` has not been allocated;
+    /// reaching a rotated-dtype dispatch without a sized scratch is a program
+    /// error (`ensure_mq_signs` was not called), not a recoverable input.
+    #[inline]
+    pub fn mq_x_rot_f32(&self) -> GpuTensor {
+        let scratch = self.mq_x_rot.as_ref().expect(
+            "mq_x_rot rotation scratch must be allocated before a rotated-dtype \
+             GEMV; call ensure_mq_signs() first",
+        );
+        GpuTensor {
+            // SAFETY: aliases the shared rotation scratch buffer. The alias is
+            // consumed within the current dispatch and never retained past a
+            // realloc of `mq_x_rot`, so no two live aliases outlive the buffer.
+            buf: unsafe { scratch.buf.alias() },
+            shape: vec![scratch.buf.size() / 4],
+            dtype: DType::F32,
+        }
     }
 
     /// Lazily allocate the Opus Quant W4A4 persistent decode scratch (B=1).
@@ -3252,6 +3238,112 @@ impl Gpu {
         }
     }
 
+    /// Calibration: gather `n` routed rows into a persistent F32 staging tile.
+    ///
+    /// `sorted_slot_index[sorted_start + row]` stores the flattened routed slot.
+    /// Gate/up capture passes `x_row_div = K_TOP` to recover the original token
+    /// row; down capture passes `1` because its source is already flattened to
+    /// one row per route. `dst_start` lets the caller carry a partial tile across
+    /// model microbatches without an undersized reduction launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn calib_gather_rows_f32(
+        &mut self,
+        src: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        dst: &GpuTensor,
+        sorted_start: usize,
+        dst_start: usize,
+        n: usize,
+        k: usize,
+        x_row_div: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if n == 0 || k == 0 || x_row_div == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "calib_gather_rows_f32 requires non-zero rows, width, and row divisor",
+            ));
+        }
+        let total = n.checked_mul(k).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "calib_gather_rows_f32 launch size overflow")
+        })?;
+        for (name, value) in [
+            ("sorted_start", sorted_start),
+            ("dst_start", dst_start),
+            ("rows", n),
+            ("width", k),
+            ("x_row_div", x_row_div),
+        ] {
+            if value > i32::MAX as usize {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("calib_gather_rows_f32 {name} exceeds i32 kernel contract"),
+                ));
+            }
+        }
+        if src.dtype != DType::F32 || dst.dtype != DType::F32 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "calib_gather_rows_f32 source and destination must be F32",
+            ));
+        }
+        let sorted_bytes = sorted_start
+            .checked_add(n)
+            .and_then(|rows| rows.checked_mul(std::mem::size_of::<i32>()))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "calib_gather_rows_f32 index range overflow")
+            })?;
+        if sorted_slot_index.buf.size() < sorted_bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "calib_gather_rows_f32 sorted index buffer is too small",
+            ));
+        }
+        let dst_elems = dst_start
+            .checked_add(n)
+            .and_then(|rows| rows.checked_mul(k))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "calib_gather_rows_f32 destination range overflow")
+            })?;
+        if dst.numel() < dst_elems {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "calib_gather_rows_f32 destination buffer is too small",
+            ));
+        }
+        self.ensure_kernel(
+            "calib_reduce",
+            kernels::CALIB_REDUCE_SRC,
+            "calib_gather_rows_f32",
+        )?;
+        let src_ptr = src.buf.as_ptr();
+        let sorted_ptr = sorted_slot_index.buf.as_ptr();
+        let dst_ptr = dst.buf.as_ptr();
+        let sorted_start_i = sorted_start as i32;
+        let dst_start_i = dst_start as i32;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let x_row_div_i = x_row_div as i32;
+        let block = 256u32;
+        let grid = ((total as u64 + block as u64 - 1) / block as u64) as u32;
+        self.launch_kernargs(
+            "calib_gather_rows_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &kernargs![
+                ptr src_ptr,
+                ptr sorted_ptr,
+                ptr dst_ptr,
+                i32 sorted_start_i,
+                i32 dst_start_i,
+                i32 n_i,
+                i32 k_i,
+                i32 x_row_div_i
+            ],
+        )
+    }
+
     /// Calibration: `acc[c] += Σ_n x[n,c]²` (per-column sum-of-squares, the
     /// imatrix / diag(H) signal). `x` is [N, K] F32; `acc` is [K] F32, ADDED into
     /// (caller zeroes once, then accumulates across the calibration corpus).
@@ -3272,28 +3364,14 @@ impl Gpu {
         let acc_ptr = acc.buf.as_ptr();
         let n_i = n as i32;
         let k_i = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &x_ptr as *const _ as *mut c_void,
-            &acc_ptr as *const _ as *mut c_void,
-            &n_i as *const _ as *mut c_void,
-            &k_i as *const _ as *mut c_void,
-        ];
         let block = 256u32;
         let grid = ((k as u32) + block - 1) / block;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "calib_sumsq_reduce_f32",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut bb = hip_bridge::KernargBlob::new();
-                bb.push_ptr(x_ptr);
-                bb.push_ptr(acc_ptr);
-                bb.push_i32(n_i);
-                bb.push_i32(k_i);
-                bb
-            },
+            &kernargs![ptr x_ptr, ptr acc_ptr, i32 n_i, i32 k_i],
         )
     }
 
@@ -3317,29 +3395,15 @@ impl Gpu {
         let h_ptr = h.buf.as_ptr();
         let n_i = n as i32;
         let k_i = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &x_ptr as *const _ as *mut c_void,
-            &h_ptr as *const _ as *mut c_void,
-            &n_i as *const _ as *mut c_void,
-            &k_i as *const _ as *mut c_void,
-        ];
         let tile = 16u32;
         let grid_x = ((k as u32) + tile - 1) / tile;
         let grid_y = ((k as u32) + tile - 1) / tile;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "calib_hessian_outer_f32",
             [grid_x, grid_y, 1],
             [tile, tile, 1],
             0,
-            &mut params,
-            || {
-                let mut bb = hip_bridge::KernargBlob::new();
-                bb.push_ptr(x_ptr);
-                bb.push_ptr(h_ptr);
-                bb.push_i32(n_i);
-                bb.push_i32(k_i);
-                bb
-            },
+            &kernargs![ptr x_ptr, ptr h_ptr, i32 n_i, i32 k_i],
         )
     }
 
@@ -3364,28 +3428,14 @@ impl Gpu {
         let w_ptr = w.buf.as_ptr();
         let n_i = n as i32;
         let k_i = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &d_ptr as *const _ as *mut c_void,
-            &w_ptr as *const _ as *mut c_void,
-            &n_i as *const _ as *mut c_void,
-            &k_i as *const _ as *mut c_void,
-        ];
         let block = 64u32;
         let grid = ((n as u32) + block - 1) / block;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "calib_row_meansq_f32",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut bb = hip_bridge::KernargBlob::new();
-                bb.push_ptr(d_ptr);
-                bb.push_ptr(w_ptr);
-                bb.push_i32(n_i);
-                bb.push_i32(k_i);
-                bb
-            },
+            &kernargs![ptr d_ptr, ptr w_ptr, i32 n_i, i32 k_i],
         )
     }
 
@@ -3411,30 +3461,14 @@ impl Gpu {
         let a_ptr = acc.buf.as_ptr();
         let n_i = n as i32;
         let k_i = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &x_ptr as *const _ as *mut c_void,
-            &w_ptr as *const _ as *mut c_void,
-            &a_ptr as *const _ as *mut c_void,
-            &n_i as *const _ as *mut c_void,
-            &k_i as *const _ as *mut c_void,
-        ];
         let block = 64u32;
         let grid = ((k as u32) + block - 1) / block;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "calib_sumsq_weighted_f32",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut bb = hip_bridge::KernargBlob::new();
-                bb.push_ptr(x_ptr);
-                bb.push_ptr(w_ptr);
-                bb.push_ptr(a_ptr);
-                bb.push_i32(n_i);
-                bb.push_i32(k_i);
-                bb
-            },
+            &kernargs![ptr x_ptr, ptr w_ptr, ptr a_ptr, i32 n_i, i32 k_i],
         )
     }
 
@@ -3459,31 +3493,15 @@ impl Gpu {
         let h_ptr = h.buf.as_ptr();
         let n_i = n as i32;
         let k_i = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &x_ptr as *const _ as *mut c_void,
-            &w_ptr as *const _ as *mut c_void,
-            &h_ptr as *const _ as *mut c_void,
-            &n_i as *const _ as *mut c_void,
-            &k_i as *const _ as *mut c_void,
-        ];
         let tile = 16u32;
         let grid_x = ((k as u32) + tile - 1) / tile;
         let grid_y = ((k as u32) + tile - 1) / tile;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "calib_hessian_outer_weighted_f32",
             [grid_x, grid_y, 1],
             [tile, tile, 1],
             0,
-            &mut params,
-            || {
-                let mut bb = hip_bridge::KernargBlob::new();
-                bb.push_ptr(x_ptr);
-                bb.push_ptr(w_ptr);
-                bb.push_ptr(h_ptr);
-                bb.push_i32(n_i);
-                bb.push_i32(k_i);
-                bb
-            },
+            &kernargs![ptr x_ptr, ptr w_ptr, ptr h_ptr, i32 n_i, i32 k_i],
         )
     }
 
@@ -3534,43 +3552,21 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.ensure_givens4_kernel(kernel_key, src_const, func_name)?;
-        let mut kdp = k_dst.buf.as_ptr();
-        let mut ksp = k_src.buf.as_ptr();
-        let mut pp = positions.buf.as_ptr();
-        let mut ctp = cos_theta.buf.as_ptr();
-        let mut stp = sin_theta.buf.as_ptr();
-        let mut nkv = n_kv_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut bs = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut kdp as *mut _ as *mut c_void,
-            &mut ksp as *mut _ as *mut c_void,
-            &mut pp as *mut _ as *mut c_void,
-            &mut ctp as *mut _ as *mut c_void,
-            &mut stp as *mut _ as *mut c_void,
-            &mut nkv as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut bs as *mut _ as *mut c_void,
-        ];
+        let kdp = k_dst.buf.as_ptr();
+        let ksp = k_src.buf.as_ptr();
+        let pp = positions.buf.as_ptr();
+        let ctp = cos_theta.buf.as_ptr();
+        let stp = sin_theta.buf.as_ptr();
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let bs = batch_size as i32;
         let shared_mem = ((head_dim + 32) * 4) as u32;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             func_name,
             [n_kv_heads as u32, batch_size as u32, 1],
             [32, 1, 1],
             shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(kdp);
-                b.push_ptr(ksp);
-                b.push_ptr(pp);
-                b.push_ptr(ctp);
-                b.push_ptr(stp);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(bs);
-                b
-            },
+            &kernargs![ptr kdp, ptr ksp, ptr pp, ptr ctp, ptr stp, i32 nkv, i32 hd, i32 bs],
         )
     }
 
@@ -3650,54 +3646,31 @@ impl Gpu {
                 let bo = offset as i32;
                 let bs = block_start as i32;
                 let bc = block_cols as i32;
-                let mut params: Vec<*mut c_void> = vec![
-                    &q_ptr as *const _ as *mut c_void,
-                    &k_ptr as *const _ as *mut c_void,
-                    &v_ptr as *const _ as *mut c_void,
-                    &p_ptr as *const _ as *mut c_void,
-                    &pos_ptr as *const _ as *mut c_void,
-                    &ct_ptr as *const _ as *mut c_void,
-                    &st_ptr as *const _ as *mut c_void,
-                    &bias_ptr as *const _ as *mut c_void,
-                    &nh as *const _ as *mut c_void,
-                    &nkv as *const _ as *mut c_void,
-                    &hd as *const _ as *mut c_void,
-                    &ms as *const _ as *mut c_void,
-                    &sc as *const _ as *mut c_void,
-                    &ts as *const _ as *mut c_void,
-                    &mt as *const _ as *mut c_void,
-                    &bo as *const _ as *mut c_void,
-                    &bs as *const _ as *mut c_void,
-                    &bc as *const _ as *mut c_void,
-                ];
-                self.launch_maybe_blob(
+                self.launch_kernargs(
                     tile_func_name,
                     [n_heads as u32, max_tiles as u32, chunk as u32],
                     [32, 1, 1],
                     (TILE_SIZE * 4) as u32,
-                    &mut params,
-                    || {
-                        let mut b = hip_bridge::KernargBlob::new();
-                        b.push_ptr(q_ptr);
-                        b.push_ptr(k_ptr);
-                        b.push_ptr(v_ptr);
-                        b.push_ptr(p_ptr);
-                        b.push_ptr(pos_ptr);
-                        b.push_ptr(ct_ptr);
-                        b.push_ptr(st_ptr);
-                        b.push_ptr(bias_ptr);
-                        b.push_i32(nh);
-                        b.push_i32(nkv);
-                        b.push_i32(hd);
-                        b.push_i32(ms);
-                        b.push_f32(sc);
-                        b.push_i32(ts);
-                        b.push_i32(mt);
-                        b.push_i32(bo);
-                        b.push_i32(bs);
-                        b.push_i32(bc);
-                        b
-                    },
+                    &kernargs![
+                        ptr q_ptr,
+                        ptr k_ptr,
+                        ptr v_ptr,
+                        ptr p_ptr,
+                        ptr pos_ptr,
+                        ptr ct_ptr,
+                        ptr st_ptr,
+                        ptr bias_ptr,
+                        i32 nh,
+                        i32 nkv,
+                        i32 hd,
+                        i32 ms,
+                        f32 sc,
+                        i32 ts,
+                        i32 mt,
+                        i32 bo,
+                        i32 bs,
+                        i32 bc
+                    ],
                 )?;
             }
             {
@@ -3712,38 +3685,23 @@ impl Gpu {
                 let bo = offset as i32;
                 let bs = block_start as i32;
                 let bc = block_cols as i32;
-                let mut params: Vec<*mut c_void> = vec![
-                    &p_ptr as *const _ as *mut c_void,
-                    &o_ptr as *const _ as *mut c_void,
-                    &pos_ptr as *const _ as *mut c_void,
-                    &nh as *const _ as *mut c_void,
-                    &hd as *const _ as *mut c_void,
-                    &ts as *const _ as *mut c_void,
-                    &mt as *const _ as *mut c_void,
-                    &bo as *const _ as *mut c_void,
-                    &bs as *const _ as *mut c_void,
-                    &bc as *const _ as *mut c_void,
-                ];
-                self.launch_maybe_blob(
+                self.launch_kernargs(
                     "attention_flash_asym_reduce_batched",
                     [n_heads as u32, chunk as u32, 1],
                     [32, 1, 1],
                     0,
-                    &mut params,
-                    || {
-                        let mut b = hip_bridge::KernargBlob::new();
-                        b.push_ptr(p_ptr);
-                        b.push_ptr(o_ptr);
-                        b.push_ptr(pos_ptr);
-                        b.push_i32(nh);
-                        b.push_i32(hd);
-                        b.push_i32(ts);
-                        b.push_i32(mt);
-                        b.push_i32(bo);
-                        b.push_i32(bs);
-                        b.push_i32(bc);
-                        b
-                    },
+                    &kernargs![
+                        ptr p_ptr,
+                        ptr o_ptr,
+                        ptr pos_ptr,
+                        i32 nh,
+                        i32 hd,
+                        i32 ts,
+                        i32 mt,
+                        i32 bo,
+                        i32 bs,
+                        i32 bc
+                    ],
                 )?;
             }
             offset += chunk;
@@ -3765,27 +3723,17 @@ impl Gpu {
         )?;
         let xp = x.buf.as_ptr();
         let n = x.numel() as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &xp as *const _ as *mut c_void,
-            &n as *const _ as *mut c_void,
-        ];
         let block_size = 256u32;
         let grid = (((n as u32) + block_size - 1) / block_size).max(1);
         let bytes = crate::profile::elementwise_bytes(n as usize);
         let timer =
             crate::profile::begin_timer(&self.hip, "bf16_round_trip", "bf16_round_trip_f32", bytes);
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "bf16_round_trip_f32",
             [grid, 1, 1],
             [block_size, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp);
-                b.push_i32(n);
-                b
-            },
+            &kernargs![ptr xp, i32 n],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -3918,17 +3866,6 @@ impl Gpu {
         let kd = k_dim as i32;
         let vd = v_dim as i32;
         let nt = n_tokens as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &kd as *const _ as *mut c_void,
-            &vd as *const _ as *mut c_void,
-            &nt as *const _ as *mut c_void,
-        ];
         let n_channels = 2 * k_dim + v_dim;
         let block = 256u32;
         let grid = ((n_channels as u32) + block - 1) / block;
@@ -3939,25 +3876,12 @@ impl Gpu {
             "conv1d_silu_split_f32_n_gfx1151",
             bytes,
         );
-        let result = self.launch_maybe_blob(
+        let result = self.launch_kernargs(
             "conv1d_silu_split_f32_gfx1151",
             [grid, n_tokens as u32, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_ptr(sp);
-                b.push_i32(kd);
-                b.push_i32(vd);
-                b.push_i32(nt);
-                b
-            },
+            &kernargs![ptr qp, ptr kp, ptr vp, ptr ip, ptr wp, ptr sp, i32 kd, i32 vd, i32 nt],
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -3965,12 +3889,6 @@ impl Gpu {
         result?;
 
         let nc = n_channels as i32;
-        let mut update_params: Vec<*mut c_void> = vec![
-            &ip as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &nc as *const _ as *mut c_void,
-            &nt as *const _ as *mut c_void,
-        ];
         let update_bytes = n_channels * 4 * 4;
         let update_timer = crate::profile::begin_timer(
             &self.hip,
@@ -3978,20 +3896,12 @@ impl Gpu {
             "conv1d_silu_split_state_gfx1151",
             update_bytes,
         );
-        let update_result = self.launch_maybe_blob(
+        let update_result = self.launch_kernargs(
             "conv1d_silu_split_update_state_gfx1151",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut update_params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ip);
-                b.push_ptr(sp);
-                b.push_i32(nc);
-                b.push_i32(nt);
-                b
-            },
+            &kernargs![ptr ip, ptr sp, i32 nc, i32 nt],
         );
         if let Some(t) = update_timer {
             t.finish(&self.hip);
@@ -4221,27 +4131,13 @@ impl Gpu {
         let ni = n as i32;
         let total = (batch * n) as i32;
         let ti = total;
-        let mut params: Vec<*mut c_void> = vec![
-            &xp as *const _ as *mut c_void,
-            &bp as *const _ as *mut c_void,
-            &ni as *const _ as *mut c_void,
-            &ti as *const _ as *mut c_void,
-        ];
         let blocks = ((total as usize + 255) / 256) as u32;
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "bias_add_f32",
             [blocks, 1, 1],
             [256, 1, 1],
             0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp);
-                b.push_ptr(bp);
-                b.push_i32(ni);
-                b.push_i32(ti);
-                b
-            },
+            &kernargs![ptr xp, ptr bp, i32 ni, i32 ti],
         )
     }
 
@@ -4536,6 +4432,16 @@ impl Gpu {
         specs.push((
             "embedding_q8_batched",
             kernels::EMBEDDING_Q8_BATCHED_SRC.to_string(),
+        ));
+        specs.push(("embedding_bf16", kernels::EMBEDDING_BF16_SRC.to_string()));
+        specs.push((
+            "embedding_bf16_batched",
+            kernels::EMBEDDING_BF16_BATCHED_SRC.to_string(),
+        ));
+        specs.push(("embedding_f16", kernels::EMBEDDING_F16_SRC.to_string()));
+        specs.push((
+            "embedding_f16_batched",
+            kernels::EMBEDDING_F16_BATCHED_SRC.to_string(),
         ));
 
         // DeltaNet kernels
@@ -4913,32 +4819,17 @@ impl Gpu {
         )?;
         let stp = state.buf.as_ptr();
         let cp = commit_slot_buf.buf.as_ptr();
-        let mut rv = ratio;
-        let mut pd = proj_dim;
-        let mut params: Vec<*mut c_void> = vec![
-            &stp as *const _ as *mut c_void,
-            &cp as *const _ as *mut c_void,
-            &mut rv as *mut _ as *mut c_void,
-            &mut pd as *mut _ as *mut c_void,
-        ];
+        let rv = ratio;
+        let pd = proj_dim;
         let total = (ratio * proj_dim) as u32;
         let block = 256u32;
         let grid = (total + block - 1) / block;
-        let blob_builder = || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(stp);
-            b.push_ptr(cp);
-            b.push_i32(rv);
-            b.push_i32(pd);
-            b
-        };
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "state_overlap_shift_f32_buf",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            blob_builder,
+            &kernargs![ptr stp, ptr cp, i32 rv, i32 pd],
         )
     }
 
@@ -4961,37 +4852,35 @@ impl Gpu {
         let sp = src.buf.as_ptr();
         let stp = state.buf.as_ptr();
         let rp = ring_slot_buf.buf.as_ptr();
-        let mut pd = proj_dim;
-        let mut params: Vec<*mut c_void> = vec![
-            &sp as *const _ as *mut c_void,
-            &stp as *const _ as *mut c_void,
-            &rp as *const _ as *mut c_void,
-            &mut pd as *mut _ as *mut c_void,
-        ];
+        let pd = proj_dim;
         let block = 256u32;
         let grid = ((proj_dim as u32) + block - 1) / block;
-        let blob_builder = || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(sp);
-            b.push_ptr(stp);
-            b.push_ptr(rp);
-            b.push_i32(pd);
-            b
-        };
-        self.launch_maybe_blob(
+        self.launch_kernargs(
             "state_ring_write_f32_buf",
             [grid, 1, 1],
             [block, 1, 1],
             0,
-            &mut params,
-            blob_builder,
+            &kernargs![ptr sp, ptr stp, ptr rp, i32 pd],
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::gen_fwht_signs;
+    use super::{gen_fwht_signs, raw_upload_chunks};
+
+    #[test]
+    fn raw_upload_chunks_cover_payload_once_with_bounded_tail() {
+        assert_eq!(
+            raw_upload_chunks(11, 4).collect::<Vec<_>>(),
+            vec![(0, 4), (4, 4), (8, 3)]
+        );
+        assert!(raw_upload_chunks(0, 4).next().is_none());
+        assert_eq!(
+            raw_upload_chunks(3, 0).collect::<Vec<_>>(),
+            vec![(0, 1), (1, 1), (2, 1)]
+        );
+    }
 
     #[test]
     fn mq_signs_128_deterministic() {

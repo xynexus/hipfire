@@ -1,0 +1,12 @@
+variant,route,pair,order,iterations,active_input_bytes,max_core_text_bytes,core_flows,cosine,max_abs,dispatch_ms,decision
+r112_memtile_x_broadcast,separate_x_via_memtile,0,na,0,1179648,,,0,0,,rejected_memtile_output_dma_channel_limit
+r100,split_x_core_relay,1,first,100,1179648,4208,24,0.99999861,0.0039062,0.321812,control
+r112,joined_x_row_suffix,1,second,100,1179648,3696,0,0.99999861,0.0039062,0.214782,admit
+r112,joined_x_row_suffix,2,first,100,1179648,3696,0,0.99999861,0.0039062,0.209232,admit
+r100,split_x_core_relay,2,second,100,1179648,4208,24,0.99999861,0.0039062,0.325087,control
+r100,split_x_core_relay,3,first,100,1179648,4208,24,0.99999861,0.0039062,0.327537,control
+r112,joined_x_row_suffix,3,second,100,1179648,3696,0,0.99999861,0.0039062,0.214315,admit
+r112,joined_x_row_suffix,4,first,100,1179648,3696,0,0.99999861,0.0039062,0.234754,admit
+r100,split_x_core_relay,4,second,100,1179648,4208,24,0.99999861,0.0039062,0.325424,control
+r100,split_x_core_relay,all,mixed,400,1179648,4208,24,0.99999861,0.0039062,0.324965,control_mean
+r112,joined_x_row_suffix,all,mixed,400,1179648,3696,0,0.99999861,0.0039062,0.218271,admit_mean

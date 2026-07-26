@@ -29,8 +29,8 @@
 //!   cargo run -p hipfire-train --release --example gradcheck_swiglu
 //!   hipfire gpu-lock release
 
-use hipfire_train::ops::swiglu::{swiglu_backward, swiglu_forward};
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_train::ops::swiglu::{swiglu_backward, swiglu_forward};
 
 const N: usize = 16;
 

@@ -1,8 +1,9 @@
-// R5: one core of a K-cascade W4A8 column. The ROWS cores in a column split the K
-// contraction; each computes its K-slice partial and the 512-bit cascade stream
-// carries the running accumulator core->core (put_mcd / get_scd), so C is
-// accumulated in-flight and stored ONCE by the tail core — eliminating the per-tile
-// C load/store that pins the memtile dataflow (and SOTA FastFlowLM) to ~5 TOPS.
+// R5: one core of a K-cascade W4A8 column. Each core computes 4 M-block partials
+// with the R2a II=1 recipe (4 named accumulators sharing ONE resident weight tile
+// — pure register macs, ~1.6 TOPS/core), and the 512-bit cascade stream carries all
+// four accumulators core->core (put_mcd/get_scd) so C accumulates in-flight and the
+// tail stores it ONCE — no per-tile C reload (the trap pinning the memtile dataflow
+// and SOTA FastFlowLM to ~5 TOPS).
 //
 // Cascade API (from aie_kernels/aie2/cascade_mm.cc): the 512-bit cascade moves one
 // v16 per beat via put_mcd / get_scd. The mmul accumulator is size_C acc32 =
@@ -17,11 +18,11 @@
 // XDNA1 with -DNPU_AIE2 -DMMUL_N=8; aie2p is the default.
 #include <aie_api/aie.hpp>
 
-#ifndef KSLICE
-#define KSLICE 16          // 16x16 mmul steps this core contracts (its K-slice)
+#ifndef INNER
+#define INNER 0            // reuse passes of the resident tile (compute-rate knob)
 #endif
 #ifndef ROLE
-#define ROLE 2             // 0=head (put only), 1=middle (get+put), 2=tail (get, store C)
+#define ROLE 2             // 0=head, 1=mid, 2=tail (stores C), 3=solo (no cascade)
 #endif
 #ifndef MMUL_N
 #define MMUL_N 16          // aie2p int8xint4 = <4,16,16>; XDNA1/aie2 = <4,16,8> (-DMMUL_N=8)
@@ -123,17 +124,37 @@ static inline CVEC cascade_get() {
 }
 #endif
 
-#if ROLE == 0   // HEAD: seed the cascade with this slice's partial.
+#ifdef COMBINED_XW
+// COMBINED_XW: one memtile->core fifo carries this core's A then W back to back
+// (A = KSLICE*size_A int8, then W). Lets a ROWS=4 column fit the memtile's 6 out
+// channels (4 combined fifos vs 8 separate A/W fifos). A/W split at compile time.
+static constexpr int R5_AWB = KSLICE * MMUL::size_A;   // A bytes; W starts here
+#if ROLE == 0
+extern "C" void r5_cascade_head(const int8 *__restrict x) {
+  cascade_put(to_cvec(kslice_partial(x, x + R5_AWB)));
+}
+#elif ROLE == 1
+extern "C" void r5_cascade_mid(const int8 *__restrict x) {
+  cascade_put(csum(cascade_get(), to_cvec(kslice_partial(x, x + R5_AWB))));
+}
+#elif ROLE == 2
+extern "C" void r5_cascade_tail(const int8 *__restrict x, int32 *__restrict pC) {
+  store_c(pC, csum(cascade_get(), to_cvec(kslice_partial(x, x + R5_AWB))));
+}
+#endif
+#else  // separate A / W fifos (the default two-arg path)
+#if ROLE == 0   // HEAD: seed the cascade with the four partials.
 extern "C" void r5_cascade_head(const int8 *__restrict pA, const int8 *__restrict wbytes) {
   cascade_put(to_cvec(kslice_partial(pA, wbytes)));
 }
-#elif ROLE == 1 // MIDDLE: add cascade-in + this slice, pass on.
+#elif ROLE == 1 // MIDDLE: add cascade-in + local partials, pass on.
 extern "C" void r5_cascade_mid(const int8 *__restrict pA, const int8 *__restrict wbytes) {
   cascade_put(csum(cascade_get(), to_cvec(kslice_partial(pA, wbytes))));
 }
-#else           // TAIL: add cascade-in + this slice, STORE C once.
+#elif ROLE == 2 // TAIL: add cascade-in + local partials, STORE C once.
 extern "C" void r5_cascade_tail(const int8 *__restrict pA, const int8 *__restrict wbytes,
                                 int32 *__restrict pC) {
   store_c(pC, csum(cascade_get(), to_cvec(kslice_partial(pA, wbytes))));
 }
+#endif
 #endif

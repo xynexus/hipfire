@@ -1,8 +1,12 @@
 use axum::{
     extract::{Query, State},
-    response::{Html, Json},
+    http::StatusCode,
+    response::{Html, IntoResponse, Json},
 };
-use hipfire_config::{config_schema, LoadedConfig};
+use hipfire_config::{
+    apply_config_edit, build_config_editor_snapshot_from_paths, config_schema,
+    configured_models_dir, ConfigEditRequest, ConfigEditorPaths, LoadedConfig,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{fs, path::Path};
@@ -22,7 +26,7 @@ pub async fn get_admin_diagnostics(State(state): State<SharedState>) -> Json<Val
         "host_config_path": loaded.host_config_path.display().to_string(),
         "config_read_error": loaded.read_error,
         "host_config_read_error": loaded.host_read_error,
-        "paths": path_statuses(&root),
+        "paths": path_statuses(&root, &configured_models_dir(&loaded.config)),
         "binaries": binary_statuses(&root.join("bin")),
         "kernel_caches": kernel_cache_statuses(&root.join("kernels")),
         "resource_locks": resource_lock_statuses(&hipfire_lock::resource_lock_root()),
@@ -49,6 +53,106 @@ pub async fn get_admin_stats() -> Json<hipfire_admin_types::AdminStats> {
     Json(hipfire_sysinfo::snapshot(now_unix_secs()))
 }
 
+pub async fn post_runtime_reset(State(state): State<SharedState>) -> impl IntoResponse {
+    let mut engine = state.engine.lock().await;
+    match engine.as_mut() {
+        Some(engine) => match engine.reset().await {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "ok",
+                    "reset": true,
+                })),
+            ),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {
+                        "message": format!("daemon reset failed: {error}"),
+                        "type": "runtime_reset_failed",
+                    }
+                })),
+            ),
+        },
+        None => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "reset": false,
+                "reason": "no daemon engine is loaded",
+            })),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RuntimeUnloadWorkerRequest {
+    pub worker_key_id: String,
+}
+
+pub async fn post_runtime_unload_worker(
+    State(state): State<SharedState>,
+    Json(request): Json<RuntimeUnloadWorkerRequest>,
+) -> impl IntoResponse {
+    let worker_key_id = request.worker_key_id.trim().to_string();
+    if worker_key_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": "worker_key_id is required",
+                    "type": "invalid_request_error",
+                }
+            })),
+        );
+    }
+
+    let mut engine = state.engine.lock().await;
+    let Some(engine) = engine.as_mut() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": {
+                    "message": "daemon engine is not running",
+                    "type": "daemon_unavailable",
+                }
+            })),
+        );
+    };
+
+    match engine.unload_worker(&worker_key_id).await {
+        Ok(done) => {
+            let active_path_still_loaded = {
+                let mut loaded_models = state.loaded_models.lock().await;
+                loaded_models.retain(|_, loaded| {
+                    loaded.worker_key_id.as_deref() != Some(worker_key_id.as_str())
+                });
+                state
+                    .loaded_model_path
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|path| loaded_models.contains_key(path))
+            };
+            if !active_path_still_loaded {
+                *state.loaded_model_path.lock().await = None;
+                *state.loaded_model_cache_capable.lock().await = None;
+                *state.loaded_model_max_seq.lock().await = None;
+            }
+            (StatusCode::OK, Json(done))
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": format!("daemon unload_worker failed: {error}"),
+                    "type": "runtime_unload_failed",
+                }
+            })),
+        ),
+    }
+}
+
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -73,6 +177,40 @@ pub async fn get_resolved_config(
     Json(resolved_config_json(&loaded, query.model.as_deref()))
 }
 
+pub async fn get_config_editor(
+    State(state): State<SharedState>,
+    Query(query): Query<ResolvedConfigQuery>,
+) -> Json<Value> {
+    let loaded = state.loaded_config.lock().await;
+    Json(config_editor_json(&loaded, query.model.as_deref()))
+}
+
+pub async fn patch_config_editor(
+    State(state): State<SharedState>,
+    Json(request): Json<ConfigEditRequest>,
+) -> impl IntoResponse {
+    let loaded = state.loaded_config.lock().await;
+    let paths = ConfigEditorPaths {
+        global: loaded.config_path.clone(),
+        host: loaded.host_config_path.clone(),
+    };
+    match apply_config_edit(&paths, &request, &loaded) {
+        Ok(snapshot) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(snapshot).unwrap_or_else(json_error)),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": error,
+                    "type": "invalid_config_edit",
+                }
+            })),
+        ),
+    }
+}
+
 fn config_schema_json() -> Value {
     serde_json::to_value(config_schema()).unwrap_or_else(|err| {
         json!({
@@ -81,6 +219,26 @@ fn config_schema_json() -> Value {
                 "type": "internal_error"
             }
         })
+    })
+}
+
+fn config_editor_json(loaded: &LoadedConfig, model: Option<&str>) -> Value {
+    let paths = ConfigEditorPaths {
+        global: loaded.config_path.clone(),
+        host: loaded.host_config_path.clone(),
+    };
+    serde_json::to_value(build_config_editor_snapshot_from_paths(
+        &paths, loaded, model,
+    ))
+    .unwrap_or_else(json_error)
+}
+
+fn json_error(err: serde_json::Error) -> Value {
+    json!({
+        "error": {
+            "message": format!("failed to serialize config editor snapshot: {err}"),
+            "type": "internal_error"
+        }
     })
 }
 
@@ -116,10 +274,10 @@ fn resolved_config_json(loaded: &LoadedConfig, model: Option<&str>) -> Value {
     })
 }
 
-fn path_statuses(root: &Path) -> Vec<Value> {
+fn path_statuses(root: &Path, models_dir: &Path) -> Vec<Value> {
     [
         ("hipfire_dir", root.to_path_buf()),
-        ("models", root.join("models")),
+        ("models", models_dir.to_path_buf()),
         ("config", root.join("config.json")),
         ("host_config", root.join("config.local.json")),
         ("per_model_config", root.join("per_model_config.json")),
@@ -344,7 +502,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       font-size: 12px;
       font-weight: 600;
     }
-    input, textarea, button {
+    input, textarea, select, button {
       height: 34px;
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -352,7 +510,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       color: var(--text);
       font: inherit;
     }
-    input, textarea {
+    input, textarea, select {
       width: min(360px, 76vw);
       padding: 0 10px;
     }
@@ -369,6 +527,17 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       cursor: pointer;
     }
     button:hover { border-color: var(--accent); }
+    .inline-actions {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+    .inline-actions input, .inline-actions select {
+      width: min(180px, 34vw);
+    }
+    .inline-actions button {
+      padding: 0 8px;
+    }
     .status {
       margin-left: auto;
       color: var(--muted);
@@ -636,7 +805,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       </div>
       <section class="summary" aria-label="Runtime summary">
         <div class="metric"><span>Status</span><strong id="runtime-status">-</strong></div>
-        <div class="metric"><span>Idle Timeout</span><strong id="runtime-idle">-</strong></div>
+        <div class="metric"><span>Residency</span><strong id="runtime-residency">-</strong></div>
         <div class="metric"><span>Prefill Queue</span><strong id="runtime-prefill">-</strong></div>
         <div class="metric"><span>Batches</span><strong id="runtime-batches">-</strong></div>
       </section>
@@ -671,6 +840,13 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
         <label>Model
           <input id="model" name="model" autocomplete="off" placeholder="optional model tag">
         </label>
+        <label>Write target
+          <select id="config-target" name="config-target">
+            <option value="global">Global</option>
+            <option value="host">Host</option>
+            <option value="model">Model</option>
+          </select>
+        </label>
         <button id="refresh" type="button">Refresh</button>
       </div>
       <section class="summary" aria-label="Config summary">
@@ -683,9 +859,11 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
         <thead>
           <tr>
             <th>Key</th>
-            <th>Value</th>
+            <th>Local</th>
+            <th>Active</th>
             <th>Source</th>
-            <th>Scope</th>
+            <th>Applies</th>
+            <th>Edit</th>
             <th>Description</th>
           </tr>
         </thead>
@@ -765,7 +943,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
     const modelsLoadedEl = document.getElementById("models-loaded");
     const modelsRowsEl = document.getElementById("models-rows");
     const runtimeStatusEl = document.getElementById("runtime-status");
-    const runtimeIdleEl = document.getElementById("runtime-idle");
+    const runtimeResidencyEl = document.getElementById("runtime-residency");
     const runtimePrefillEl = document.getElementById("runtime-prefill");
     const runtimeBatchesEl = document.getElementById("runtime-batches");
     const runtimeJsonEl = document.getElementById("runtime-json");
@@ -774,6 +952,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
     const logsLinesEl = document.getElementById("logs-lines");
     const logsListEl = document.getElementById("logs-list");
     const modelEl = document.getElementById("model");
+    const configTargetEl = document.getElementById("config-target");
     const refreshEl = document.getElementById("refresh");
     const rowsEl = document.getElementById("rows");
     const sourceEl = document.getElementById("source");
@@ -793,6 +972,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
     const trainingEventsEl = document.getElementById("training-events");
     let selectedTrainingRun = null;
     let chatMessages = [];
+    let currentConfigSnapshot = null;
 
     function text(value) {
       if (value === null || value === undefined) return "";
@@ -803,6 +983,15 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
     function sourceLabel(source) {
       if (!source) return "";
       return source.id ? `${source.kind}:${source.id}` : source.kind;
+    }
+
+    function impactLabel(row) {
+      if (row.pending) return "pending reload";
+      if (row.restart_impact && row.restart_impact !== "none") return row.restart_impact.replaceAll("_", " ");
+      if (row.mutability === "request_only") return "new requests";
+      if (row.mutability === "runtime_reloadable") return "runtime reload";
+      if (row.mutability === "load_time") return "reload model";
+      return "restart daemon";
     }
 
     function requireAuthorized(resp) {
@@ -962,7 +1151,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       overviewTrainingEl.textContent = `${runs.filter(isActiveRun).length} active / ${runs.length} runs`;
       overviewRuntimeEl.replaceChildren(...keyValueRows([
         ["Bind", location.origin],
-        ["Idle timeout", `${health.idle_timeout_sec || 0}s`],
+        ["Residency", health.scheduler_resources && health.scheduler_resources.model_residency_mode],
         ["Prefill queue", health.prefill_batch && (health.prefill_batch.queue_size ?? health.prefill_batch.queued)],
         ["Batches", health.batches && `${health.batches.queued || 0} queued / ${health.batches.total || 0} total`],
         ["Kernel caches", (diagnostics.kernel_caches || []).map((k) => `${k.arch}:${k.hsaco}/${k.hash}`).join(", ") || "none"],
@@ -1024,7 +1213,7 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       statusEl.textContent = "loading runtime";
       const health = await fetchJson("/health");
       runtimeStatusEl.textContent = health.status || "-";
-      runtimeIdleEl.textContent = `${health.idle_timeout_sec || 0}s`;
+      runtimeResidencyEl.textContent = health.scheduler_resources ? (health.scheduler_resources.model_residency_mode || "-") : "-";
       runtimePrefillEl.textContent = health.prefill_batch ? `${health.prefill_batch.queue_size || health.prefill_batch.queued || 0}` : "-";
       runtimeBatchesEl.textContent = health.batches ? `${health.batches.queued || 0} queued / ${health.batches.total || 0} total` : "-";
       runtimeJsonEl.textContent = JSON.stringify(health, null, 2);
@@ -1088,18 +1277,9 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       const model = modelEl.value.trim();
       const suffix = model ? `?model=${encodeURIComponent(model)}` : "";
       statusEl.textContent = "loading";
-      const [schemaResp, resolvedResp] = await Promise.all([
-        fetch("/admin/config/schema"),
-        fetch(`/admin/config/resolved${suffix}`),
-      ]);
-      requireAuthorized(schemaResp);
-      requireAuthorized(resolvedResp);
-      if (!schemaResp.ok) throw new Error(`schema ${schemaResp.status}`);
-      if (!resolvedResp.ok) throw new Error(`resolved ${resolvedResp.status}`);
-      const schema = await schemaResp.json();
-      const resolved = await resolvedResp.json();
-      render(schema, resolved);
-      statusEl.textContent = model ? `model ${model}` : "active runtime";
+      const snapshot = await fetchJson(`/admin/config/editor${suffix}`);
+      render(snapshot);
+      statusEl.textContent = model ? `model ${model}` : "config editor";
     }
 
     async function loadTraining() {
@@ -1127,34 +1307,144 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
       renderTrainingDetail(detail);
     }
 
-    function render(schema, resolved) {
-      const fields = new Map(schema.map((field) => [field.key, field]));
-      const values = resolved.resolution.values || [];
-      sourceEl.textContent = resolved.source || "-";
-      pathEl.textContent = resolved.config_path || "-";
-      fieldsEl.textContent = String(values.length);
-      const diagnostics = resolved.diagnostics || [];
-      const readError = resolved.read_error ? [resolved.read_error] : [];
-      diagnosticsEl.textContent = [...readError, ...diagnostics.map((d) => d.message)].join("; ") || "none";
-      diagnosticsEl.className = diagnostics.length || readError.length ? "warn" : "";
-      rowsEl.replaceChildren(...values.map((entry) => {
-        const field = fields.get(entry.key) || {};
+    function selectedConfigTarget() {
+      const target = configTargetEl.value || "global";
+      if (target === "model") {
+        const id = modelEl.value.trim();
+        if (!id) throw new Error("model target requires a model id");
+        return {kind: "model", id};
+      }
+      return {kind: target};
+    }
+
+    function rowEditableForTarget(row) {
+      const target = configTargetEl.value || "global";
+      if (target === "model") return !!row.editable_model;
+      if (target === "host") return !!row.editable_host;
+      return !!row.editable_global;
+    }
+
+    function controlValue(control, row) {
+      const kind = row.type && row.type.kind;
+      if (kind === "bool") return control.checked;
+      if (kind === "u8" || kind === "u16" || kind === "u32" || kind === "i32" || kind === "f64") return control.value;
+      if (kind === "json") {
+        try { return JSON.parse(control.value); } catch (_) { return control.value; }
+      }
+      return control.value;
+    }
+
+    async function saveConfigRow(row, control) {
+      const model = modelEl.value.trim();
+      const body = {
+        target: selectedConfigTarget(),
+        key: row.key,
+        operation: "set",
+        value: controlValue(control, row),
+      };
+      if (model) body.model = model;
+      const resp = requireAuthorized(await fetch("/admin/config/editor", {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body),
+      }));
+      const payload = await resp.json();
+      if (!resp.ok || payload.error) throw new Error((payload.error && payload.error.message) || `config ${resp.status}`);
+      render(payload);
+      statusEl.textContent = `saved ${row.key}`;
+    }
+
+    async function unsetConfigRow(row) {
+      const model = modelEl.value.trim();
+      const body = {
+        target: selectedConfigTarget(),
+        key: row.key,
+        operation: "unset",
+      };
+      if (model) body.model = model;
+      const resp = requireAuthorized(await fetch("/admin/config/editor", {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body),
+      }));
+      const payload = await resp.json();
+      if (!resp.ok || payload.error) throw new Error((payload.error && payload.error.message) || `config ${resp.status}`);
+      render(payload);
+      statusEl.textContent = `unset ${row.key}`;
+    }
+
+    function configControl(row) {
+      const wrap = document.createElement("div");
+      wrap.className = "inline-actions";
+      const kind = row.type && row.type.kind;
+      const value = row.local_value === undefined || row.local_value === null ? "" : row.local_value;
+      let control;
+      if (kind === "bool") {
+        control = document.createElement("input");
+        control.type = "checkbox";
+        control.checked = value === true;
+      } else if (row.enum_choices && row.enum_choices.length) {
+        control = document.createElement("select");
+        for (const choice of row.enum_choices) {
+          const option = document.createElement("option");
+          option.value = choice;
+          option.textContent = choice;
+          option.selected = choice === value;
+          control.append(option);
+        }
+      } else {
+        control = document.createElement("input");
+        control.type = (kind === "u8" || kind === "u16" || kind === "u32" || kind === "i32" || kind === "f64") ? "number" : "text";
+        control.value = kind === "json" ? JSON.stringify(value) : text(value);
+      }
+      control.disabled = !rowEditableForTarget(row);
+      const save = document.createElement("button");
+      save.type = "button";
+      save.textContent = "Save";
+      save.disabled = control.disabled;
+      save.addEventListener("click", () => saveConfigRow(row, control).catch(showError));
+      const unset = document.createElement("button");
+      unset.type = "button";
+      unset.textContent = "Unset";
+      unset.disabled = control.disabled;
+      unset.addEventListener("click", () => unsetConfigRow(row).catch(showError));
+      wrap.append(control, save, unset);
+      return wrap;
+    }
+
+    function render(snapshot) {
+      currentConfigSnapshot = snapshot;
+      const rows = snapshot.rows || [];
+      sourceEl.textContent = snapshot.source || "-";
+      pathEl.textContent = snapshot.config_path || "-";
+      fieldsEl.textContent = String(rows.length);
+      const diagnostics = snapshot.diagnostics || [];
+      const readError = [snapshot.read_error, snapshot.host_read_error].filter(Boolean);
+      const unknown = (snapshot.unknown_keys || []).map((key) => `unknown ${key.key} in ${sourceLabel(key.source)}`);
+      diagnosticsEl.textContent = [...readError, ...diagnostics.map((d) => d.message), ...unknown].join("; ") || "none";
+      diagnosticsEl.className = diagnostics.length || readError.length || unknown.length ? "warn" : "";
+      rowsEl.replaceChildren(...rows.map((entry) => {
         const tr = document.createElement("tr");
         const key = document.createElement("td");
         key.className = "key";
         key.textContent = entry.key;
-        const value = document.createElement("td");
-        value.className = "value";
-        value.textContent = text(entry.value);
+        const local = document.createElement("td");
+        local.className = entry.pending ? "value warn" : "value";
+        local.textContent = text(entry.local_value);
+        const active = document.createElement("td");
+        active.className = "value";
+        active.textContent = text(entry.active_value);
         const source = document.createElement("td");
-        source.className = entry.missing_required ? "warn" : "source";
-        source.textContent = entry.missing_required ? "required" : sourceLabel(entry.source);
-        const scope = document.createElement("td");
-        scope.className = "muted";
-        scope.textContent = (field.scopes || []).join(", ");
+        source.className = "source";
+        source.textContent = `${sourceLabel(entry.local_source) || "-"} / ${sourceLabel(entry.active_source) || "-"}`;
+        const applies = document.createElement("td");
+        applies.className = entry.pending ? "warn" : "muted";
+        applies.textContent = impactLabel(entry);
+        const edit = document.createElement("td");
+        edit.append(configControl(entry));
         const desc = document.createElement("td");
-        desc.textContent = field.description || "";
-        tr.append(key, value, source, scope, desc);
+        desc.textContent = entry.description || "";
+        tr.append(key, local, active, source, applies, edit, desc);
         return tr;
       }));
     }
@@ -1308,6 +1598,9 @@ const ADMIN_INDEX_HTML: &str = r#"<!doctype html>
     document.getElementById("diagnostics-refresh").addEventListener("click", () => loadDiagnostics().catch(showError));
     document.getElementById("logs-refresh").addEventListener("click", () => loadLogs().catch(showError));
     refreshEl.addEventListener("click", () => loadConfig().catch(showError));
+    configTargetEl.addEventListener("change", () => {
+      if (currentConfigSnapshot) render(currentConfigSnapshot);
+    });
     trainingRefreshEl.addEventListener("click", () => loadTraining().catch(showError));
     for (const tab of tabEls) tab.addEventListener("click", () => showTab(tab.dataset.tab));
     modelEl.addEventListener("keydown", (event) => {
@@ -1347,8 +1640,8 @@ mod tests {
 
     #[test]
     fn admin_index_fetches_config_endpoints() {
-        assert!(ADMIN_INDEX_HTML.contains("/admin/config/schema"));
-        assert!(ADMIN_INDEX_HTML.contains("/admin/config/resolved"));
+        assert!(ADMIN_INDEX_HTML.contains("/admin/config/editor"));
+        assert!(ADMIN_INDEX_HTML.contains("method: \"PATCH\""));
     }
 
     #[test]
@@ -1452,6 +1745,39 @@ mod tests {
             .expect("overrode")
             .iter()
             .any(|source| source["kind"] == "global"));
+    }
+
+    #[test]
+    fn config_editor_snapshot_explains_pending_cli_override() {
+        let path = std::env::temp_dir().join(format!(
+            "hipfire-admin-config-editor-{}.json",
+            std::process::id()
+        ));
+        let document = json!({
+            "max_tokens": 256,
+        });
+        std::fs::write(&path, serde_json::to_string(&document).unwrap()).expect("write config");
+        let cli_layer = hipfire_config::ConfigLayer::new(hipfire_config::ConfigLayerKind::Cli)
+            .with_value("max_tokens", 64);
+        let loaded = hipfire_config::loaded_config_from_document(
+            path.clone(),
+            document,
+            None,
+            vec![cli_layer],
+        );
+
+        let payload = config_editor_json(&loaded, None);
+        let _ = std::fs::remove_file(path);
+        let rows = payload["rows"].as_array().expect("rows");
+        let max_tokens = rows
+            .iter()
+            .find(|row| row["key"] == "max_tokens")
+            .expect("max_tokens row");
+
+        assert_eq!(max_tokens["local_value"], json!(256));
+        assert_eq!(max_tokens["active_value"], json!(64));
+        assert_eq!(max_tokens["active_source"]["kind"], "cli");
+        assert_eq!(max_tokens["pending"], json!(true));
     }
 
     #[test]

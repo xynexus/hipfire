@@ -39,13 +39,13 @@
 //!   cargo run -p hipfire-train --release --example kvnoise_recovery_supra50m
 //!   hipfire gpu-lock release
 
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{
     flatten_recovery_grads, model_distill_backward, model_forward, LlamaModel,
 };
 use hipfire_train::ops::softmax::softmax_forward;
 use hipfire_train::optim::AdamW;
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
 const MODEL_DIR: &str =

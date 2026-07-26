@@ -6,3 +6,4 @@
 // there.
 pub mod kv_compact;
 pub mod kvarn;
+pub mod lowrank;

@@ -15,9 +15,9 @@ use crate::config::Lfm2MoeConfig;
 use crate::forward::{prefill_batch, prefill_batch_with_hidden_logits, Lfm2HiddenCapture};
 use crate::lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
 use hip_bridge::{DeviceBuffer, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::weights::weight_gemm;
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// LFM2 DFlash is still experimental on the F16 draft GEMM path. Default to the
 /// stable F16-on-disk -> F32-on-GPU lift unless explicitly opted in.
@@ -373,8 +373,12 @@ pub fn run_dflash_draft_for_logits(
                 draft_cfg.mask_token_id
             };
             let dst = draft_scratch.x.sub_offset(row * h, h);
-            gpu.embedding_lookup_q8(&target_weights.embed, &dst, tok, h)
-                .map_err(|e| format!("lfm2 dflash: target embedding row {row}: {e:?}"))?;
+            if target_weights.embed_is_f32 {
+                gpu.embedding_lookup(&target_weights.embed, &dst, tok, h)
+            } else {
+                gpu.embedding_lookup_q8(&target_weights.embed, &dst, tok, h)
+            }
+            .map_err(|e| format!("lfm2 dflash: target embedding row {row}: {e:?}"))?;
         }
     }
 

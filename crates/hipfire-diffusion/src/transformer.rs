@@ -18,14 +18,16 @@ pub(crate) struct NativeTransformerDenoiserIo {
     hidden_width: usize,
     output_token_width: usize,
     img_in_weight: CpuTensor,
-    img_in_bias: CpuTensor,
+    img_in_bias: Option<CpuTensor>,
     output_weight: CpuTensor,
-    output_bias: CpuTensor,
+    output_bias: Option<CpuTensor>,
     text_norm_weight: Option<CpuTensor>,
     text_in_weight: Option<CpuTensor>,
     text_in_bias: Option<CpuTensor>,
     output_norm_weight: Option<CpuTensor>,
     output_norm_bias: Option<CpuTensor>,
+    output_norm_shift_weight: Option<CpuTensor>,
+    output_norm_scale_weight: Option<CpuTensor>,
     // Krea2 final adaLN: weighted RMSNorm + a `[2, hidden]` scale/shift table
     // combined with the timestep embedding. QwenImage uses `norm_out.linear`
     // (above) instead, so these are None there.
@@ -83,18 +85,31 @@ impl NativeTransformerDenoiserIo {
                 )
             })?;
 
-        let img_in_weight = cpu_tensor_from_hfq(hfq, "transformer/tensors/img_in.weight")?;
-        let img_in_bias = cpu_tensor_from_hfq(hfq, "transformer/tensors/img_in.bias")?;
+        let (img_in_entry, img_in_bias_entry) = match topology.family {
+            TransformerDenoiserFamily::Flux2 => (
+                "transformer/tensors/x_embedder.weight",
+                "transformer/tensors/x_embedder.bias",
+            ),
+            _ => (
+                "transformer/tensors/img_in.weight",
+                "transformer/tensors/img_in.bias",
+            ),
+        };
+        let img_in_weight = cpu_tensor_from_hfq(hfq, img_in_entry)?;
+        let img_in_bias = optional_tensor(hfq, img_in_bias_entry)?;
         let [hidden_width, input_token_width] = shape2(&img_in_weight)?;
         if input_token_width != input_channels {
             return Err(DiffusionError::InvalidMetadata(format!(
                 "transformer img_in input width {input_token_width} != configured in_channels {input_channels}"
             )));
         }
-        if img_in_bias.shape.as_slice() != [hidden_width] {
+        if img_in_bias
+            .as_ref()
+            .is_some_and(|bias| bias.shape.as_slice() != [hidden_width])
+        {
             return Err(DiffusionError::InvalidMetadata(format!(
                 "transformer img_in bias shape {:?} != [{hidden_width}]",
-                img_in_bias.shape
+                img_in_bias.as_ref().map(|bias| &bias.shape)
             )));
         }
 
@@ -107,9 +122,13 @@ impl NativeTransformerDenoiserIo {
                 "transformer/tensors/final_layer.linear.weight",
                 "transformer/tensors/final_layer.linear.bias",
             ),
+            TransformerDenoiserFamily::Flux2 => (
+                "transformer/tensors/proj_out.weight",
+                "transformer/tensors/proj_out.bias",
+            ),
         };
         let output_weight = cpu_tensor_from_hfq(hfq, output_weight_entry)?;
-        let output_bias = cpu_tensor_from_hfq(hfq, output_bias_entry)?;
+        let output_bias = optional_tensor(hfq, output_bias_entry)?;
         let [output_token_width, output_hidden_width] = shape2(&output_weight)?;
         if output_hidden_width != hidden_width {
             return Err(DiffusionError::InvalidMetadata(format!(
@@ -121,10 +140,13 @@ impl NativeTransformerDenoiserIo {
                 "transformer output token width {output_token_width} is smaller than output patch feature width {output_patch_feature_width}"
             )));
         }
-        if output_bias.shape.as_slice() != [output_token_width] {
+        if output_bias
+            .as_ref()
+            .is_some_and(|bias| bias.shape.as_slice() != [output_token_width])
+        {
             return Err(DiffusionError::InvalidMetadata(format!(
                 "transformer output projection bias shape {:?} != [{output_token_width}]",
-                output_bias.shape
+                output_bias.as_ref().map(|bias| &bias.shape)
             )));
         }
         let text_norm_weight = optional_tensor(hfq, "transformer/tensors/txt_norm.weight")?;
@@ -140,9 +162,19 @@ impl NativeTransformerDenoiserIo {
                 )));
             }
         }
-        let text_in_weight = optional_tensor(hfq, "transformer/tensors/txt_in.weight")?;
+        let (text_in_weight_entry, text_in_bias_entry) = match topology.family {
+            TransformerDenoiserFamily::Flux2 => (
+                "transformer/tensors/context_embedder.weight",
+                "transformer/tensors/context_embedder.bias",
+            ),
+            _ => (
+                "transformer/tensors/txt_in.weight",
+                "transformer/tensors/txt_in.bias",
+            ),
+        };
+        let text_in_weight = optional_tensor(hfq, text_in_weight_entry)?;
         let text_in_bias = if text_in_weight.is_some() {
-            Some(cpu_tensor_from_hfq(hfq, "transformer/tensors/txt_in.bias")?)
+            optional_tensor(hfq, text_in_bias_entry)?
         } else {
             None
         };
@@ -161,7 +193,9 @@ impl NativeTransformerDenoiserIo {
                     )));
                 }
             }
-            if text_in_bias.as_ref().map(|bias| bias.shape.as_slice()) != Some(&[hidden_width][..])
+            if text_in_bias
+                .as_ref()
+                .is_some_and(|bias| bias.shape.as_slice() != [hidden_width])
             {
                 return Err(DiffusionError::InvalidMetadata(format!(
                     "transformer txt_in bias shape {:?} != [{hidden_width}]",
@@ -169,16 +203,33 @@ impl NativeTransformerDenoiserIo {
                 )));
             }
         }
-        let output_norm_weight =
-            optional_tensor(hfq, "transformer/tensors/norm_out.linear.weight")?;
+        let is_flux2 = matches!(topology.family, TransformerDenoiserFamily::Flux2);
+        let output_norm_weight = if is_flux2 {
+            None
+        } else {
+            optional_tensor(hfq, "transformer/tensors/norm_out.linear.weight")?
+        };
         let output_norm_bias = if output_norm_weight.is_some() {
-            Some(cpu_tensor_from_hfq(
-                hfq,
-                "transformer/tensors/norm_out.linear.bias",
-            )?)
+            optional_tensor(hfq, "transformer/tensors/norm_out.linear.bias")?
         } else {
             None
         };
+        let output_norm_shift_weight = if is_flux2 {
+            optional_tensor(hfq, "transformer/tensors/norm_out.shift.weight")?
+        } else {
+            None
+        };
+        let output_norm_scale_weight = if is_flux2 {
+            optional_tensor(hfq, "transformer/tensors/norm_out.scale.weight")?
+        } else {
+            None
+        };
+        if is_flux2 && (output_norm_shift_weight.is_none() || output_norm_scale_weight.is_none()) {
+            return Err(DiffusionError::InvalidMetadata(
+                "FLUX.2 requires canonical norm_out.shift.weight and norm_out.scale.weight tensors"
+                    .to_string(),
+            ));
+        }
         if let Some(weight) = output_norm_weight.as_ref() {
             let [norm_rows, norm_cols] = shape2(weight)?;
             if norm_rows != hidden_width * 2 || norm_cols != hidden_width {
@@ -188,8 +239,9 @@ impl NativeTransformerDenoiserIo {
                     hidden_width * 2
                 )));
             }
-            if output_norm_bias.as_ref().map(|bias| bias.shape.as_slice())
-                != Some(&[hidden_width * 2][..])
+            if output_norm_bias
+                .as_ref()
+                .is_some_and(|bias| bias.shape.as_slice() != [hidden_width * 2])
             {
                 return Err(DiffusionError::InvalidMetadata(format!(
                     "transformer norm_out.linear bias shape {:?} != [{}]",
@@ -198,10 +250,26 @@ impl NativeTransformerDenoiserIo {
                 )));
             }
         }
+        for (name, weight) in [
+            ("shift", output_norm_shift_weight.as_ref()),
+            ("scale", output_norm_scale_weight.as_ref()),
+        ] {
+            if let Some(weight) = weight {
+                let [rows, cols] = shape2(weight)?;
+                if rows != hidden_width || cols != hidden_width {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "transformer norm_out.{name} weight shape {:?} != [{hidden_width}, {hidden_width}]",
+                        weight.shape
+                    )));
+                }
+            }
+        }
 
         // Krea2 final adaLN: RMSNorm weight + a [2, hidden] scale/shift table.
-        let krea_final_norm_weight =
-            optional_tensor(hfq, "transformer/tensors/final_layer.norm.weight")?;
+        let krea_final_norm_weight = rms_gain_plus_one_opt(optional_tensor(
+            hfq,
+            "transformer/tensors/final_layer.norm.weight",
+        )?);
         let krea_final_scale_shift =
             optional_tensor(hfq, "transformer/tensors/final_layer.scale_shift_table")?;
         if let Some(table) = krea_final_scale_shift.as_ref() {
@@ -223,7 +291,10 @@ impl NativeTransformerDenoiserIo {
         }
 
         // Krea2 two-layer text-input projection (`txt_in.norm`/`linear_1`/`linear_2`).
-        let krea_txt_norm_weight = optional_tensor(hfq, "transformer/tensors/txt_in.norm.weight")?;
+        let krea_txt_norm_weight = rms_gain_plus_one_opt(optional_tensor(
+            hfq,
+            "transformer/tensors/txt_in.norm.weight",
+        )?);
         let krea_txt_linear1_weight =
             optional_tensor(hfq, "transformer/tensors/txt_in.linear_1.weight")?;
         let (krea_txt_linear1_bias, krea_txt_linear2_weight, krea_txt_linear2_bias) =
@@ -254,6 +325,8 @@ impl NativeTransformerDenoiserIo {
             text_in_bias,
             output_norm_weight,
             output_norm_bias,
+            output_norm_shift_weight,
+            output_norm_scale_weight,
             krea_final_norm_weight,
             krea_final_scale_shift,
             krea_txt_norm_weight,
@@ -274,7 +347,7 @@ impl NativeTransformerDenoiserIo {
         linear_3d_with_runtime_context(
             &tokens,
             &self.img_in_weight,
-            Some(&self.img_in_bias),
+            self.img_in_bias.as_ref(),
             runtime_context,
         )
     }
@@ -290,12 +363,21 @@ impl NativeTransformerDenoiserIo {
     ) -> DiffusionResult<LatentBatch> {
         let hidden =
             self.output_norm_with_runtime_context(hidden, timestep_embedding, runtime_context)?;
-        let tokens = linear_3d_with_runtime_context(
-            &hidden,
-            &self.output_weight,
-            Some(&self.output_bias),
-            runtime_context,
-        )?;
+        let tokens = if matches!(self.family, TransformerDenoiserFamily::Flux2) {
+            linear_3d_f32_with_runtime_context(
+                &hidden,
+                &self.output_weight,
+                self.output_bias.as_ref(),
+                runtime_context,
+            )?
+        } else {
+            linear_3d_with_runtime_context(
+                &hidden,
+                &self.output_weight,
+                self.output_bias.as_ref(),
+                runtime_context,
+            )?
+        };
         patch_tokens_to_latent_batch(
             &tokens,
             batch,
@@ -326,6 +408,8 @@ impl NativeTransformerDenoiserIo {
                 self.krea_txt_linear1_bias.as_ref(),
                 runtime_context,
             )?;
+            // Krea2 txt_in: linear_2(gelu(linear_1(norm(x)))) (tanh-GELU).
+            let hidden = gelu_tanh(hidden);
             let linear2 = self.krea_txt_linear2_weight.as_ref().ok_or_else(|| {
                 DiffusionError::InvalidMetadata("Krea txt_in.linear_2 weight is missing".into())
             })?;
@@ -356,12 +440,12 @@ impl NativeTransformerDenoiserIo {
             }
             return Ok(text_hidden);
         };
-        let bias = self.text_in_bias.as_ref().ok_or_else(|| {
-            DiffusionError::InvalidMetadata(
-                "transformer txt_in weight is present but bias is missing".to_string(),
-            )
-        })?;
-        linear_3d_with_runtime_context(&text_hidden, weight, Some(bias), runtime_context)
+        linear_3d_with_runtime_context(
+            &text_hidden,
+            weight,
+            self.text_in_bias.as_ref(),
+            runtime_context,
+        )
     }
 
     pub(crate) fn output_norm_with_runtime_context(
@@ -371,10 +455,10 @@ impl NativeTransformerDenoiserIo {
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
         // Krea2 final adaLN: RMSNorm(hidden) then modulate by the [2, hidden]
-        // scale/shift table combined with the timestep embedding. NOTE: the
-        // (scale, shift) chunk order and the time-embedding modulation source
-        // follow the per-block adaLN convention; verify against the Krea2
-        // reference during numerical parity before trusting decoded pixels.
+        // scale/shift table combined with the timestep embedding. Chunk order is
+        // [scale, shift] (row 0 = scale, row 1 = shift), per the official Krea2
+        // SimpleModulation.forward. The same timestep embedding is added to both
+        // rows, matching the source (temb broadcasts over the 2 rows).
         if matches!(self.family, TransformerDenoiserFamily::Krea2) {
             let Some(norm_weight) = self.krea_final_norm_weight.as_ref() else {
                 return Ok(hidden.clone());
@@ -412,14 +496,11 @@ impl NativeTransformerDenoiserIo {
             }
             return modulate_3d(&normalized, &shift, &scale);
         }
-        let Some(weight) = self.output_norm_weight.as_ref() else {
+        if !matches!(self.family, TransformerDenoiserFamily::Flux2)
+            && self.output_norm_weight.is_none()
+        {
             return Ok(hidden.clone());
-        };
-        let bias = self.output_norm_bias.as_ref().ok_or_else(|| {
-            DiffusionError::InvalidMetadata(
-                "transformer norm_out.linear weight is present but bias is missing".to_string(),
-            )
-        })?;
+        }
         let [batch, _, width] = shape3(hidden)?;
         if width != self.hidden_width {
             return Err(DiffusionError::InvalidMetadata(format!(
@@ -434,8 +515,54 @@ impl NativeTransformerDenoiserIo {
                 timestep_embedding.shape, self.hidden_width
             )));
         }
+        if matches!(self.family, TransformerDenoiserFamily::Flux2) {
+            let activated = CpuTensor {
+                shape: timestep_embedding.shape.clone(),
+                data: timestep_embedding.data.iter().copied().map(silu).collect(),
+            };
+            let shift_weight = self.output_norm_shift_weight.as_ref().ok_or_else(|| {
+                DiffusionError::InvalidMetadata(
+                    "FLUX.2 final norm shift projection is missing".to_string(),
+                )
+            })?;
+            let scale_weight = self.output_norm_scale_weight.as_ref().ok_or_else(|| {
+                DiffusionError::InvalidMetadata(
+                    "FLUX.2 final norm scale projection is missing".to_string(),
+                )
+            })?;
+            let shift = linear_optional_bias_f32_with_runtime_context(
+                &activated,
+                shift_weight,
+                None,
+                runtime_context,
+            )?;
+            let scale = linear_optional_bias_f32_with_runtime_context(
+                &activated,
+                scale_weight,
+                None,
+                runtime_context,
+            )?;
+            let ones = CpuTensor {
+                shape: vec![width],
+                data: vec![1.0; width],
+            };
+            let zeros = CpuTensor {
+                shape: vec![width],
+                data: vec![0.0; width],
+            };
+            let normalized = layer_norm_3d(hidden, &ones, &zeros, 1e-6)?;
+            return modulate_3d(&normalized, &shift, &scale);
+        }
         let activated = silu_with_runtime_context(timestep_embedding, runtime_context)?;
-        let projected = linear_with_runtime_context(&activated, weight, bias, runtime_context)?;
+        let Some(weight) = self.output_norm_weight.as_ref() else {
+            return Ok(hidden.clone());
+        };
+        let projected = linear_optional_bias_with_runtime_context(
+            &activated,
+            weight,
+            self.output_norm_bias.as_ref(),
+            runtime_context,
+        )?;
         let [projected_batch, projected_width] = shape2(&projected)?;
         if projected_batch != batch || projected_width != width * 2 {
             return Err(DiffusionError::InvalidMetadata(format!(
@@ -464,9 +591,13 @@ impl NativeTransformerDenoiserIo {
 pub(crate) struct NativeTransformerTimestepEmbedding {
     family: TransformerDenoiserFamily,
     linear_1_weight: CpuTensor,
-    linear_1_bias: CpuTensor,
+    linear_1_bias: Option<CpuTensor>,
     linear_2_weight: CpuTensor,
-    linear_2_bias: CpuTensor,
+    linear_2_bias: Option<CpuTensor>,
+    texture_linear_1_weight: Option<CpuTensor>,
+    texture_linear_1_bias: Option<CpuTensor>,
+    texture_linear_2_weight: Option<CpuTensor>,
+    texture_linear_2_bias: Option<CpuTensor>,
     modulation_weight: Option<CpuTensor>,
     modulation_bias: Option<CpuTensor>,
 }
@@ -477,10 +608,23 @@ impl NativeTransformerTimestepEmbedding {
         hfq: &HfqFile,
         family: TransformerDenoiserFamily,
     ) -> DiffusionResult<Self> {
-        let prefix = match family {
-            TransformerDenoiserFamily::Krea2 => "transformer/tensors/time_embed",
-            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
-                "transformer/tensors/time_text_embed.timestep_embedder"
+        let dual_semantic_prefix = "transformer/tensors/dual_time_embed.semantic_embedder";
+        let dual_texture_prefix = "transformer/tensors/dual_time_embed.texture_embedder";
+        let is_sefi = matches!(family, TransformerDenoiserFamily::Flux2)
+            && hfq
+                .find_tensor_info(&format!("{dual_semantic_prefix}.linear_1.weight"))
+                .is_some();
+        let prefix = if is_sefi {
+            dual_semantic_prefix
+        } else {
+            match family {
+                TransformerDenoiserFamily::Krea2 => "transformer/tensors/time_embed",
+                TransformerDenoiserFamily::Flux2 => {
+                    "transformer/tensors/time_guidance_embed.timestep_embedder"
+                }
+                TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
+                    "transformer/tensors/time_text_embed.timestep_embedder"
+                }
             }
         };
         let modulation_weight = optional_tensor(hfq, "transformer/tensors/time_mod_proj.weight")?;
@@ -495,9 +639,29 @@ impl NativeTransformerTimestepEmbedding {
         Ok(Self {
             family,
             linear_1_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.linear_1.weight"))?,
-            linear_1_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.linear_1.bias"))?,
+            linear_1_bias: optional_tensor(hfq, &format!("{prefix}.linear_1.bias"))?,
             linear_2_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.linear_2.weight"))?,
-            linear_2_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.linear_2.bias"))?,
+            linear_2_bias: optional_tensor(hfq, &format!("{prefix}.linear_2.bias"))?,
+            texture_linear_1_weight: is_sefi
+                .then(|| {
+                    cpu_tensor_from_hfq(hfq, &format!("{dual_texture_prefix}.linear_1.weight"))
+                })
+                .transpose()?,
+            texture_linear_1_bias: if is_sefi {
+                optional_tensor(hfq, &format!("{dual_texture_prefix}.linear_1.bias"))?
+            } else {
+                None
+            },
+            texture_linear_2_weight: is_sefi
+                .then(|| {
+                    cpu_tensor_from_hfq(hfq, &format!("{dual_texture_prefix}.linear_2.weight"))
+                })
+                .transpose()?,
+            texture_linear_2_bias: if is_sefi {
+                optional_tensor(hfq, &format!("{dual_texture_prefix}.linear_2.bias"))?
+            } else {
+                None
+            },
             modulation_weight,
             modulation_bias,
         })
@@ -513,26 +677,125 @@ impl NativeTransformerTimestepEmbedding {
         timesteps: &[f32],
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
-        let input = timestep_embedding_with_runtime_context(
-            timesteps,
-            self.embedding_dim()?,
-            true,
-            0.0,
-            runtime_context,
-        )?;
-        let hidden = linear_with_runtime_context(
+        if self.texture_linear_1_weight.is_some() {
+            return Err(DiffusionError::InvalidRequest(
+                "SeFi timestep embedding requires semantic and texture timesteps".to_string(),
+            ));
+        }
+        // FlowMatch schedules expose model timesteps as sigma * 1000. That is
+        // already the BFL `time_factor=1000` convention, so FLUX.2 must not
+        // multiply these values a second time.
+        let input = if matches!(self.family, TransformerDenoiserFamily::Flux2) {
+            timestep_embedding(timesteps, self.embedding_dim()?, true, 0.0)?
+        } else {
+            timestep_embedding_with_runtime_context(
+                timesteps,
+                self.embedding_dim()?,
+                true,
+                0.0,
+                runtime_context,
+            )?
+        };
+        if matches!(self.family, TransformerDenoiserFamily::Flux2) {
+            let hidden = linear_optional_bias_f32_with_runtime_context(
+                &input,
+                &self.linear_1_weight,
+                self.linear_1_bias.as_ref(),
+                runtime_context,
+            )?;
+            let hidden = CpuTensor {
+                shape: hidden.shape.clone(),
+                data: hidden.data.iter().copied().map(silu).collect(),
+            };
+            return linear_optional_bias_f32_with_runtime_context(
+                &hidden,
+                &self.linear_2_weight,
+                self.linear_2_bias.as_ref(),
+                runtime_context,
+            );
+        }
+        let hidden = linear_optional_bias_with_runtime_context(
             &input,
             &self.linear_1_weight,
-            &self.linear_1_bias,
+            self.linear_1_bias.as_ref(),
             runtime_context,
         )?;
-        let hidden = silu_with_runtime_context(&hidden, runtime_context)?;
-        linear_with_runtime_context(
+        // Krea2 time_embed uses tanh-GELU (not SiLU): linear_2(gelu(linear_1)).
+        let hidden = if matches!(self.family, TransformerDenoiserFamily::Krea2) {
+            gelu_tanh(hidden)
+        } else {
+            silu_with_runtime_context(&hidden, runtime_context)?
+        };
+        linear_optional_bias_with_runtime_context(
             &hidden,
             &self.linear_2_weight,
-            &self.linear_2_bias,
+            self.linear_2_bias.as_ref(),
             runtime_context,
         )
+    }
+
+    pub(crate) fn forward_dual_with_runtime_context(
+        &self,
+        timesteps_sem: &[f32],
+        timesteps_tex: &[f32],
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        if timesteps_sem.len() != timesteps_tex.len() {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "SeFi semantic/texture timestep batches {}/{} disagree",
+                timesteps_sem.len(),
+                timesteps_tex.len()
+            )));
+        }
+        let texture_linear_1 = self.texture_linear_1_weight.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("SeFi texture timestep embedder is missing".into())
+        })?;
+        let texture_linear_2 = self.texture_linear_2_weight.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("SeFi texture timestep output layer is missing".into())
+        })?;
+        let branch = |timesteps: &[f32],
+                      linear_1: &CpuTensor,
+                      bias_1: Option<&CpuTensor>,
+                      linear_2: &CpuTensor,
+                      bias_2: Option<&CpuTensor>,
+                      runtime_context: &mut DiffusionGenerationRuntimeContext|
+         -> DiffusionResult<CpuTensor> {
+            let (_, input_width) = linear_1.rows_cols()?;
+            let input = timestep_embedding(timesteps, input_width, true, 0.0)?;
+            let hidden = linear_optional_bias_f32_with_runtime_context(
+                &input,
+                linear_1,
+                bias_1,
+                runtime_context,
+            )?;
+            let hidden = CpuTensor {
+                shape: hidden.shape.clone(),
+                data: hidden.data.iter().copied().map(silu).collect(),
+            };
+            linear_optional_bias_f32_with_runtime_context(
+                &hidden,
+                linear_2,
+                bias_2,
+                runtime_context,
+            )
+        };
+        let semantic = branch(
+            timesteps_sem,
+            &self.linear_1_weight,
+            self.linear_1_bias.as_ref(),
+            &self.linear_2_weight,
+            self.linear_2_bias.as_ref(),
+            runtime_context,
+        )?;
+        let texture = branch(
+            timesteps_tex,
+            texture_linear_1,
+            self.texture_linear_1_bias.as_ref(),
+            texture_linear_2,
+            self.texture_linear_2_bias.as_ref(),
+            runtime_context,
+        )?;
+        concat_last_dim_2d_with_runtime_context(&semantic, &texture, runtime_context)
     }
 
     pub(crate) fn modulation_with_runtime_context(
@@ -548,7 +811,10 @@ impl NativeTransformerTimestepEmbedding {
                 "transformer time_mod_proj weight is present but bias is missing".to_string(),
             )
         })?;
-        linear_with_runtime_context(timestep_embedding, weight, bias, runtime_context).map(Some)
+        // Krea2: temb_mod = time_mod_proj(gelu(temb)) (main forward applies a
+        // tanh-GELU to the timestep embedding before the modulation projection).
+        let activated = gelu_tanh(timestep_embedding.clone());
+        linear_with_runtime_context(&activated, weight, bias, runtime_context).map(Some)
     }
 }
 
@@ -561,6 +827,186 @@ pub(crate) struct TransformerModulationChunks {
     pub(crate) shift_mlp: CpuTensor,
     pub(crate) scale_mlp: CpuTensor,
     pub(crate) gate_mlp: CpuTensor,
+}
+
+pub(crate) struct ResidentTransformerModulationChunks {
+    shift_msa: hipfire_rdna::GpuTensor,
+    scale_msa: hipfire_rdna::GpuTensor,
+    gate_msa: hipfire_rdna::GpuTensor,
+    shift_mlp: hipfire_rdna::GpuTensor,
+    scale_mlp: hipfire_rdna::GpuTensor,
+    gate_mlp: hipfire_rdna::GpuTensor,
+}
+
+impl ResidentTransformerModulationChunks {
+    fn upload(
+        gpu: &mut hipfire_rdna::Gpu,
+        chunks: &TransformerModulationChunks,
+    ) -> DiffusionResult<Self> {
+        let upload = |gpu: &mut hipfire_rdna::Gpu,
+                      tensor: &CpuTensor|
+         -> DiffusionResult<hipfire_rdna::GpuTensor> {
+            gpu.upload_f32(&tensor.data, &tensor.shape)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))
+        };
+        Ok(Self {
+            shift_msa: upload(gpu, &chunks.shift_msa)?,
+            scale_msa: upload(gpu, &chunks.scale_msa)?,
+            gate_msa: upload(gpu, &chunks.gate_msa)?,
+            shift_mlp: upload(gpu, &chunks.shift_mlp)?,
+            scale_mlp: upload(gpu, &chunks.scale_mlp)?,
+            gate_mlp: upload(gpu, &chunks.gate_mlp)?,
+        })
+    }
+
+    fn free(self, gpu: &mut hipfire_rdna::Gpu) -> DiffusionResult<()> {
+        for tensor in [
+            self.shift_msa,
+            self.scale_msa,
+            self.gate_msa,
+            self.shift_mlp,
+            self.scale_mlp,
+            self.gate_mlp,
+        ] {
+            free_resident(gpu, tensor)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NativeFlux2Modulation {
+    image_weight: CpuTensor,
+    image_bias: Option<CpuTensor>,
+    text_weight: CpuTensor,
+    text_bias: Option<CpuTensor>,
+    single_weight: CpuTensor,
+    single_bias: Option<CpuTensor>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Flux2SingleModulationChunks {
+    pub(crate) shift: CpuTensor,
+    pub(crate) scale: CpuTensor,
+    pub(crate) gate: CpuTensor,
+}
+
+pub(crate) struct ResidentFlux2SingleModulationChunks {
+    shift: hipfire_rdna::GpuTensor,
+    scale: hipfire_rdna::GpuTensor,
+    gate: hipfire_rdna::GpuTensor,
+}
+
+impl ResidentFlux2SingleModulationChunks {
+    fn upload(
+        gpu: &mut hipfire_rdna::Gpu,
+        chunks: &Flux2SingleModulationChunks,
+    ) -> DiffusionResult<Self> {
+        let upload = |gpu: &mut hipfire_rdna::Gpu,
+                      tensor: &CpuTensor|
+         -> DiffusionResult<hipfire_rdna::GpuTensor> {
+            gpu.upload_f32(&tensor.data, &tensor.shape)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))
+        };
+        Ok(Self {
+            shift: upload(gpu, &chunks.shift)?,
+            scale: upload(gpu, &chunks.scale)?,
+            gate: upload(gpu, &chunks.gate)?,
+        })
+    }
+
+    fn free(self, gpu: &mut hipfire_rdna::Gpu) -> DiffusionResult<()> {
+        for tensor in [self.shift, self.scale, self.gate] {
+            free_resident(gpu, tensor)?;
+        }
+        Ok(())
+    }
+}
+
+impl NativeFlux2Modulation {
+    pub(crate) fn from_hfq(hfq: &HfqFile) -> DiffusionResult<Self> {
+        let load = |name: &str| {
+            cpu_tensor_from_hfq(hfq, &format!("transformer/tensors/{name}.linear.weight"))
+        };
+        let bias =
+            |name: &str| optional_tensor(hfq, &format!("transformer/tensors/{name}.linear.bias"));
+        Ok(Self {
+            image_weight: load("double_stream_modulation_img")?,
+            image_bias: bias("double_stream_modulation_img")?,
+            text_weight: load("double_stream_modulation_txt")?,
+            text_bias: bias("double_stream_modulation_txt")?,
+            single_weight: load("single_stream_modulation")?,
+            single_bias: bias("single_stream_modulation")?,
+        })
+    }
+
+    fn project(
+        &self,
+        timestep_embedding: &CpuTensor,
+        weight: &CpuTensor,
+        bias: Option<&CpuTensor>,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let activated = CpuTensor {
+            shape: timestep_embedding.shape.clone(),
+            data: timestep_embedding.data.iter().copied().map(silu).collect(),
+        };
+        linear_optional_bias_f32_with_runtime_context(&activated, weight, bias, runtime_context)
+    }
+
+    pub(crate) fn double_chunks(
+        &self,
+        timestep_embedding: &CpuTensor,
+        stream: TransformerModulationStream,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<TransformerModulationChunks> {
+        let (weight, bias) = match stream {
+            TransformerModulationStream::Image => (&self.image_weight, self.image_bias.as_ref()),
+            TransformerModulationStream::Text => (&self.text_weight, self.text_bias.as_ref()),
+        };
+        split_modulation_chunks(
+            self.project(timestep_embedding, weight, bias, runtime_context)?,
+            6,
+        )
+    }
+
+    pub(crate) fn single_chunks(
+        &self,
+        timestep_embedding: &CpuTensor,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<Flux2SingleModulationChunks> {
+        let projected = self.project(
+            timestep_embedding,
+            &self.single_weight,
+            self.single_bias.as_ref(),
+            runtime_context,
+        )?;
+        let [batch, width] = shape2(&projected)?;
+        if width % 3 != 0 {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "FLUX.2 single modulation width {width} is not divisible by 3"
+            )));
+        }
+        let chunk_width = width / 3;
+        let chunk = |index: usize| {
+            let mut data = vec![0.0; batch * chunk_width];
+            for b in 0..batch {
+                let src = b * width + index * chunk_width;
+                let dst = b * chunk_width;
+                data[dst..dst + chunk_width]
+                    .copy_from_slice(&projected.data[src..src + chunk_width]);
+            }
+            CpuTensor {
+                shape: vec![batch, chunk_width],
+                data,
+            }
+        };
+        Ok(Flux2SingleModulationChunks {
+            shift: chunk(0),
+            scale: chunk(1),
+            gate: chunk(2),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -585,6 +1031,29 @@ impl NativeTransformerBlockModulation {
     ) -> DiffusionResult<Self> {
         let block_prefix = format!("transformer/tensors/transformer_blocks.{block_index}");
         match family {
+            TransformerDenoiserFamily::Flux2 => {
+                let weight = cpu_tensor_from_hfq(
+                    hfq,
+                    "transformer/tensors/double_stream_modulation_img.linear.weight",
+                )?;
+                let [rows, hidden_width] = shape2(&weight)?;
+                if rows != hidden_width * 6 {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "FLUX.2 image modulation shape {:?} != [6*hidden, hidden]",
+                        weight.shape
+                    )));
+                }
+                Ok(Self {
+                    family,
+                    block_index,
+                    hidden_width,
+                    img_mod_weight: None,
+                    img_mod_bias: None,
+                    txt_mod_weight: None,
+                    txt_mod_bias: None,
+                    scale_shift_table: None,
+                })
+            }
             TransformerDenoiserFamily::Krea2 => {
                 let scale_shift_table =
                     cpu_tensor_from_hfq(hfq, &format!("{block_prefix}.scale_shift_table"))?;
@@ -695,6 +1164,33 @@ impl NativeTransformerBlockModulation {
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
         let _ = runtime_context;
+        self.krea_scale_shift(time_modulation)
+    }
+
+    /// Test-only: Krea modulation with just a scale_shift_table `[6, hidden]`.
+    #[cfg(test)]
+    pub(crate) fn krea_for_test(hidden_width: usize, table: &[f32]) -> Self {
+        Self {
+            family: TransformerDenoiserFamily::Krea2,
+            block_index: 0,
+            hidden_width,
+            img_mod_weight: None,
+            img_mod_bias: None,
+            txt_mod_weight: None,
+            txt_mod_bias: None,
+            scale_shift_table: Some(CpuTensor {
+                shape: vec![6, hidden_width],
+                data: table.to_vec(),
+            }),
+        }
+    }
+
+    /// CPU-only Krea adaLN chunks: `[batch, chunks, hidden]` = broadcast add of
+    /// `scale_shift_table[chunk, hidden]` to the reshaped `time_modulation`.
+    pub(crate) fn krea_scale_shift(
+        &self,
+        time_modulation: &CpuTensor,
+    ) -> DiffusionResult<CpuTensor> {
         let table = self.scale_shift_table.as_ref().ok_or_else(|| {
             DiffusionError::InvalidMetadata("Krea transformer scale_shift_table is missing".into())
         })?;
@@ -776,6 +1272,36 @@ pub(crate) struct TransformerAttentionStreamProjection {
     out_bias: Option<CpuTensor>,
 }
 
+/// Krea2 (Qwen3.5 lineage) RMSNorm stores the gain as an offset from 1: the
+/// effective scale is `1 + weight` (the Gemma / Qwen3.5 convention where the
+/// affine is zero-initialized), unlike Qwen-Image which uses a plain `weight`.
+/// Bake the +1 into the loaded gain so the shared plain-weight `rms_norm`
+/// applies the correct scale. Skipping this multiplies by a ~0-centred (often
+/// negative) gain, collapsing the residual stream into noise.
+pub(crate) fn rms_gain_plus_one(mut weight: CpuTensor) -> CpuTensor {
+    for v in &mut weight.data {
+        *v += 1.0;
+    }
+    weight
+}
+
+/// Tanh-approximate GELU, matching PyTorch `F.gelu(x, approximate="tanh")`.
+/// Krea2 uses this in `time_embed`, `time_mod_proj` (on temb) and `txt_in`
+/// (where hipfire previously used SiLU or no activation). Operates elementwise
+/// on the (small) embedding tensors, so a plain CPU pass is fine.
+pub(crate) fn gelu_tanh(mut input: CpuTensor) -> CpuTensor {
+    const C: f32 = 0.797_884_560_8; // sqrt(2/pi)
+    for v in &mut input.data {
+        let x = *v;
+        *v = 0.5 * x * (1.0 + (C * (x + 0.044715 * x * x * x)).tanh());
+    }
+    input
+}
+
+pub(crate) fn rms_gain_plus_one_opt(weight: Option<CpuTensor>) -> Option<CpuTensor> {
+    weight.map(rms_gain_plus_one)
+}
+
 #[allow(dead_code)]
 impl TransformerAttentionStreamProjection {
     #[allow(clippy::too_many_arguments)]
@@ -797,6 +1323,7 @@ impl TransformerAttentionStreamProjection {
         expected_hidden_width: Option<usize>,
         expected_inner_width: Option<usize>,
         expected_head_dim: Option<usize>,
+        gemma_gain: bool,
     ) -> DiffusionResult<Option<Self>> {
         if hfq.find_tensor_info(q_weight_entry).is_none() {
             if required {
@@ -815,8 +1342,16 @@ impl TransformerAttentionStreamProjection {
             k_bias: optional_tensor(hfq, k_bias_entry)?,
             v_weight: ResidentWeight::from_hfq(hfq, v_weight_entry)?,
             v_bias: optional_tensor(hfq, v_bias_entry)?,
-            norm_q_weight: optional_tensor(hfq, norm_q_entry)?,
-            norm_k_weight: optional_tensor(hfq, norm_k_entry)?,
+            norm_q_weight: if gemma_gain {
+                rms_gain_plus_one_opt(optional_tensor(hfq, norm_q_entry)?)
+            } else {
+                optional_tensor(hfq, norm_q_entry)?
+            },
+            norm_k_weight: if gemma_gain {
+                rms_gain_plus_one_opt(optional_tensor(hfq, norm_k_entry)?)
+            } else {
+                optional_tensor(hfq, norm_k_entry)?
+            },
             out_weight: ResidentWeight::from_hfq(hfq, out_weight_entry)?,
             out_bias: optional_tensor(hfq, out_bias_entry)?,
         };
@@ -962,21 +1497,21 @@ impl TransformerAttentionStreamProjection {
     ) -> DiffusionResult<TransformerAttentionQkv> {
         // Decode the packed weights to f32 transiently for this op; each is
         // dropped before the next so only one is expanded at a time.
-        let q = linear_3d_with_runtime_context(
+        let q = linear_3d_resident_with_runtime_context(
             hidden,
-            &self.q_weight.decode()?,
+            &self.q_weight,
             self.q_bias.as_ref(),
             runtime_context,
         )?;
-        let k = linear_3d_with_runtime_context(
+        let k = linear_3d_resident_with_runtime_context(
             hidden,
-            &self.k_weight.decode()?,
+            &self.k_weight,
             self.k_bias.as_ref(),
             runtime_context,
         )?;
-        let v = linear_3d_with_runtime_context(
+        let v = linear_3d_resident_with_runtime_context(
             hidden,
-            &self.v_weight.decode()?,
+            &self.v_weight,
             self.v_bias.as_ref(),
             runtime_context,
         )?;
@@ -1014,11 +1549,162 @@ impl TransformerAttentionStreamProjection {
         attention: &CpuTensor,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
-        linear_3d_with_runtime_context(
+        linear_3d_resident_with_runtime_context(
             attention,
-            &self.out_weight.decode()?,
+            &self.out_weight,
             self.out_bias.as_ref(),
             runtime_context,
+        )
+    }
+
+    /// Test-only: minimal MHA stream (no biases/norms) from raw f32 weights.
+    #[cfg(test)]
+    pub(crate) fn mha_for_test(
+        inner: usize,
+        hidden: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &[f32],
+    ) -> Self {
+        Self {
+            stream_label: "test",
+            q_weight: ResidentWeight::from_bf16_parts("attn.q", vec![inner, hidden], q),
+            q_bias: None,
+            k_weight: ResidentWeight::from_bf16_parts("attn.k", vec![inner, hidden], k),
+            k_bias: None,
+            v_weight: ResidentWeight::from_bf16_parts("attn.v", vec![inner, hidden], v),
+            v_bias: None,
+            norm_q_weight: None,
+            norm_k_weight: None,
+            out_weight: ResidentWeight::from_bf16_parts("attn.out", vec![hidden, inner], out),
+            out_bias: None,
+        }
+    }
+
+    /// Test-only: a GQA stream with per-head QK-norm. `inner_q = heads*head_dim`,
+    /// `inner_kv = kv_heads*head_dim` (kv_heads <= heads). `norm_q`/`norm_k` are
+    /// per-head-dim RMSNorm weights (length `head_dim`). Exercises the real Krea2
+    /// op set (QK-norm + grouped-query expand) that `mha_for_test` skips.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gqa_qknorm_for_test(
+        inner_q: usize,
+        inner_kv: usize,
+        hidden: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &[f32],
+        norm_q: &[f32],
+        norm_k: &[f32],
+        head_dim: usize,
+    ) -> Self {
+        Self {
+            stream_label: "test",
+            q_weight: ResidentWeight::from_bf16_parts("attn.q", vec![inner_q, hidden], q),
+            q_bias: None,
+            k_weight: ResidentWeight::from_bf16_parts("attn.k", vec![inner_kv, hidden], k),
+            k_bias: None,
+            v_weight: ResidentWeight::from_bf16_parts("attn.v", vec![inner_kv, hidden], v),
+            v_bias: None,
+            norm_q_weight: Some(CpuTensor {
+                shape: vec![head_dim],
+                data: norm_q.to_vec(),
+            }),
+            norm_k_weight: Some(CpuTensor {
+                shape: vec![head_dim],
+                data: norm_k.to_vec(),
+            }),
+            out_weight: ResidentWeight::from_bf16_parts("attn.out", vec![hidden, inner_q], out),
+            out_bias: None,
+        }
+    }
+
+    /// Fully resident Q/K/V projection: resident hidden -> (q, k, v) resident,
+    /// each `[batch, seq, heads*head_dim]`, with per-head QK-norm and GQA expand
+    /// applied on-device. Mirrors project_qkv_with_runtime_context.
+    #[allow(dead_code)]
+    pub(crate) fn project_qkv_resident(
+        &self,
+        hidden: &hipfire_rdna::GpuTensor,
+        heads: usize,
+        head_dim: usize,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<(
+        hipfire_rdna::GpuTensor,
+        hipfire_rdna::GpuTensor,
+        hipfire_rdna::GpuTensor,
+    )> {
+        let q = linear_resident_weight_resident(
+            gpu,
+            cache,
+            hidden,
+            &self.q_weight,
+            self.q_bias.as_ref(),
+        )?;
+        let k = linear_resident_weight_resident(
+            gpu,
+            cache,
+            hidden,
+            &self.k_weight,
+            self.k_bias.as_ref(),
+        )?;
+        let v = linear_resident_weight_resident(
+            gpu,
+            cache,
+            hidden,
+            &self.v_weight,
+            self.v_bias.as_ref(),
+        )?;
+        let kv_width = *k.shape.last().expect("k has a last dim");
+        let kv_heads = if head_dim == 0 {
+            heads
+        } else {
+            kv_width / head_dim
+        };
+
+        let q = qk_norm_heads_resident(
+            gpu,
+            cache,
+            q,
+            self.norm_q_weight.as_ref(),
+            heads,
+            head_dim,
+            1e-6,
+        )?;
+        let k = qk_norm_heads_resident(
+            gpu,
+            cache,
+            k,
+            self.norm_k_weight.as_ref(),
+            kv_heads,
+            head_dim,
+            1e-6,
+        )?;
+
+        let k_exp = repeat_kv_heads_resident(gpu, &k, heads, kv_heads, head_dim)?;
+        free_resident(gpu, k)?;
+        let v_exp = repeat_kv_heads_resident(gpu, &v, heads, kv_heads, head_dim)?;
+        free_resident(gpu, v)?;
+        Ok((q, k_exp, v_exp))
+    }
+
+    /// Fully resident output projection.
+    #[allow(dead_code)]
+    pub(crate) fn project_output_resident(
+        &self,
+        attention: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+        linear_resident_weight_resident(
+            gpu,
+            cache,
+            attention,
+            &self.out_weight,
+            self.out_bias.as_ref(),
         )
     }
 }
@@ -1045,6 +1731,33 @@ pub(crate) struct NativeTransformerAttentionProjection {
 pub(crate) struct RotaryFrequencies {
     cos: CpuTensor,
     sin: CpuTensor,
+}
+
+impl RotaryFrequencies {
+    /// Test-only: build frequencies from raw `[seq, head_dim/2]` cos/sin tables.
+    #[cfg(test)]
+    pub(crate) fn for_test(seq: usize, freq_width: usize, cos: &[f32], sin: &[f32]) -> Self {
+        Self {
+            cos: CpuTensor {
+                shape: vec![seq, freq_width],
+                data: cos.to_vec(),
+            },
+            sin: CpuTensor {
+                shape: vec![seq, freq_width],
+                data: sin.to_vec(),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cos_data(&self) -> &[f32] {
+        &self.cos.data
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sin_data(&self) -> &[f32] {
+        &self.sin.data
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1081,6 +1794,8 @@ impl NativeTransformerAttentionProjection {
             None,
             None,
             None,
+            // Krea2 uses (1+weight) QK-norm; Qwen-Image uses plain weight.
+            matches!(family, TransformerDenoiserFamily::Krea2),
         )?
         .ok_or_else(|| {
             DiffusionError::InvalidMetadata(format!(
@@ -1092,7 +1807,9 @@ impl NativeTransformerAttentionProjection {
 
         let text_required = matches!(
             family,
-            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown
+            TransformerDenoiserFamily::QwenImage
+                | TransformerDenoiserFamily::Flux2
+                | TransformerDenoiserFamily::Unknown
         );
         let text = TransformerAttentionStreamProjection::from_hfq(
             hfq,
@@ -1112,6 +1829,8 @@ impl NativeTransformerAttentionProjection {
             Some(hidden_width),
             Some(inner_width),
             Some(head_dim),
+            // The add_* text stream exists only for Qwen-Image (plain QK-norm).
+            false,
         )?;
 
         // Krea2 single-stream attention carries a sigmoid output gate; QwenImage
@@ -1173,6 +1892,8 @@ impl NativeTransformerAttentionProjection {
             None,
             None,
             None,
+            // text_fusion is Krea2-only: (1+weight) QK-norm.
+            true,
         )?
         .ok_or_else(|| {
             DiffusionError::InvalidMetadata(format!("attention stream {attn_prefix:?} is missing"))
@@ -1231,9 +1952,9 @@ impl NativeTransformerAttentionProjection {
         )?;
         let gated = match self.gate_weight.as_ref() {
             Some(weight) => {
-                let gate = linear_3d_with_runtime_context(
+                let gate = linear_3d_resident_with_runtime_context(
                     hidden,
-                    &weight.decode()?,
+                    weight,
                     self.gate_bias.as_ref(),
                     runtime_context,
                 )?;
@@ -1242,6 +1963,243 @@ impl NativeTransformerAttentionProjection {
             None => attention,
         };
         self.project_image_output_with_runtime_context(&gated, runtime_context)
+    }
+
+    /// Test-only: minimal Krea2 MHA attention (no gate) around an mha_for_test
+    /// stream.
+    #[cfg(test)]
+    pub(crate) fn krea_mha_for_test(
+        heads: usize,
+        head_dim: usize,
+        image: TransformerAttentionStreamProjection,
+    ) -> Self {
+        let inner = heads * head_dim;
+        Self {
+            family: TransformerDenoiserFamily::Krea2,
+            block_index: 0,
+            heads,
+            head_dim,
+            hidden_width: inner,
+            inner_width: inner,
+            image,
+            text: None,
+            gate_weight: None,
+            gate_bias: None,
+        }
+    }
+
+    /// Test-only: Krea2 self-gated GQA attention with a `to_gate` sigmoid gate.
+    /// `kv_heads` (<= `heads`) is derived at runtime from the stream's narrower
+    /// K/V weights; `gate` is the `[heads*head_dim, heads*head_dim]` gate weight.
+    #[cfg(test)]
+    pub(crate) fn krea_gqa_gated_for_test(
+        heads: usize,
+        head_dim: usize,
+        image: TransformerAttentionStreamProjection,
+        gate: &[f32],
+    ) -> Self {
+        let inner = heads * head_dim;
+        Self {
+            family: TransformerDenoiserFamily::Krea2,
+            block_index: 0,
+            heads,
+            head_dim,
+            hidden_width: inner,
+            inner_width: inner,
+            image,
+            text: None,
+            gate_weight: Some(ResidentWeight::from_bf16_parts(
+                "attn.to_gate",
+                vec![inner, inner],
+                gate,
+            )),
+            gate_bias: None,
+        }
+    }
+
+    /// Fully device-resident Krea2 self-gated attention: resident hidden in/out,
+    /// no host round-trip. project_qkv -> rope(q,k) -> sdpa -> sigmoid gate ->
+    /// out proj, freeing intermediates as it goes.
+    #[allow(dead_code)]
+    pub(crate) fn attend_krea_self_gated_resident(
+        &self,
+        hidden: &hipfire_rdna::GpuTensor,
+        rotary: Option<&RotaryFrequencies>,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+        let (mut q, mut k, v) =
+            self.image
+                .project_qkv_resident(hidden, self.heads, self.head_dim, gpu, cache)?;
+        if let Some(freqs) = rotary {
+            let q_rot = rope_qwen_resident(
+                gpu,
+                cache,
+                &q,
+                &freqs.cos,
+                &freqs.sin,
+                self.heads,
+                self.head_dim,
+            )?;
+            free_resident(gpu, q)?;
+            q = q_rot;
+            let k_rot = rope_qwen_resident(
+                gpu,
+                cache,
+                &k,
+                &freqs.cos,
+                &freqs.sin,
+                self.heads,
+                self.head_dim,
+            )?;
+            free_resident(gpu, k)?;
+            k = k_rot;
+        }
+        let attn_start = if crate::gpu_ops::profile::enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let attention = scaled_dot_product_attention_resident(gpu, &q, &k, &v, self.heads)?;
+        if let Some(start) = attn_start {
+            let _ = gpu.hip.device_synchronize();
+            crate::gpu_ops::profile::add(
+                &crate::gpu_ops::profile::ATTN_NS,
+                start.elapsed().as_nanos() as u64,
+            );
+        }
+        free_resident(gpu, q)?;
+        free_resident(gpu, k)?;
+        free_resident(gpu, v)?;
+
+        let gated = match self.gate_weight.as_ref() {
+            Some(weight) => {
+                let gate = linear_resident_weight_resident(
+                    gpu,
+                    cache,
+                    hidden,
+                    weight,
+                    self.gate_bias.as_ref(),
+                )?;
+                // Debug: HIPFIRE_DUMP_GATE prints sigmoid(gate) stats. If the gate
+                // collapses toward 0 the attention output is suppressed and tokens
+                // stop mixing (a candidate for the residual token-grid).
+                if std::env::var("HIPFIRE_DUMP_GATE").is_ok_and(|v| !v.is_empty()) {
+                    if let Ok(g_host) = download_resident(gpu, &gate) {
+                        let n = g_host.data.len().max(1);
+                        let (mut s, mut lo, mut hi) = (0.0f64, 1.0f32, 0.0f32);
+                        for v in &g_host.data {
+                            let sg = 1.0f32 / (1.0 + (-v).exp());
+                            s += sg as f64;
+                            lo = lo.min(sg);
+                            hi = hi.max(sg);
+                        }
+                        eprintln!(
+                            "[gate] sigmoid(gate) mean={:.4} min={:.4} max={:.4}",
+                            s / n as f64,
+                            lo,
+                            hi
+                        );
+                    }
+                }
+                let g = sigmoid_gate_3d_resident(gpu, &attention, &gate)?;
+                free_resident(gpu, gate)?;
+                free_resident(gpu, attention)?;
+                g
+            }
+            None => attention,
+        };
+        let out = self.image.project_output_resident(&gated, gpu, cache)?;
+        free_resident(gpu, gated)?;
+        Ok(out)
+    }
+
+    pub(crate) fn attend_flux2_image_text_resident(
+        &self,
+        image_hidden: &hipfire_rdna::GpuTensor,
+        text_hidden: &hipfire_rdna::GpuTensor,
+        rotary: &QwenRotaryEmbeddings,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<(hipfire_rdna::GpuTensor, hipfire_rdna::GpuTensor)> {
+        let text = self.text.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata(
+                "FLUX.2 resident attention is missing the text projection".into(),
+            )
+        })?;
+        let (image_q, image_k, image_v) =
+            self.image
+                .project_qkv_resident(image_hidden, self.heads, self.head_dim, gpu, cache)?;
+        let (text_q, text_k, text_v) =
+            text.project_qkv_resident(text_hidden, self.heads, self.head_dim, gpu, cache)?;
+        let image_q_rot = rope_qwen_resident(
+            gpu,
+            cache,
+            &image_q,
+            &rotary.image.cos,
+            &rotary.image.sin,
+            self.heads,
+            self.head_dim,
+        )?;
+        let image_k_rot = rope_qwen_resident(
+            gpu,
+            cache,
+            &image_k,
+            &rotary.image.cos,
+            &rotary.image.sin,
+            self.heads,
+            self.head_dim,
+        )?;
+        let text_q_rot = rope_qwen_resident(
+            gpu,
+            cache,
+            &text_q,
+            &rotary.text.cos,
+            &rotary.text.sin,
+            self.heads,
+            self.head_dim,
+        )?;
+        let text_k_rot = rope_qwen_resident(
+            gpu,
+            cache,
+            &text_k,
+            &rotary.text.cos,
+            &rotary.text.sin,
+            self.heads,
+            self.head_dim,
+        )?;
+        for tensor in [image_q, image_k, text_q, text_k] {
+            free_resident(gpu, tensor)?;
+        }
+        let joint_k = concat_sequence_3d_resident(gpu, &text_k_rot, &image_k_rot)?;
+        let joint_v = concat_sequence_3d_resident(gpu, &text_v, &image_v)?;
+        for tensor in [text_k_rot, image_k_rot, text_v, image_v] {
+            free_resident(gpu, tensor)?;
+        }
+        let image_attention = scaled_dot_product_attention_resident(
+            gpu,
+            &image_q_rot,
+            &joint_k,
+            &joint_v,
+            self.heads,
+        )?;
+        let text_attention = scaled_dot_product_attention_resident(
+            gpu,
+            &text_q_rot,
+            &joint_k,
+            &joint_v,
+            self.heads,
+        )?;
+        for tensor in [image_q_rot, text_q_rot, joint_k, joint_v] {
+            free_resident(gpu, tensor)?;
+        }
+        let image_output = self
+            .image
+            .project_output_resident(&image_attention, gpu, cache)?;
+        let text_output = text.project_output_resident(&text_attention, gpu, cache)?;
+        free_resident(gpu, image_attention)?;
+        free_resident(gpu, text_attention)?;
+        Ok((image_output, text_output))
     }
 
     pub(crate) fn project_image_qkv_with_runtime_context(
@@ -1419,6 +2377,28 @@ impl NativeTransformerAttentionProjection {
 pub(crate) enum TransformerFeedForwardActivation {
     GeGlu,
     SwiGlu,
+    SiLuGlu,
+}
+
+pub(crate) fn silu_glu_first_3d(projected: &CpuTensor) -> DiffusionResult<CpuTensor> {
+    let [batch, seq, width] = shape3(projected)?;
+    if width == 0 || width % 2 != 0 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "SiLU-GLU projected width {width} is not positive and even"
+        )));
+    }
+    let inner = width / 2;
+    let mut output = CpuTensor::zeros(&[batch, seq, inner]);
+    for token in 0..batch * seq {
+        let src = token * width;
+        let dst = token * inner;
+        for index in 0..inner {
+            let first = projected.data[src + index];
+            let second = projected.data[src + inner + index];
+            output.data[dst + index] = first / (1.0 + (-first).exp()) * second;
+        }
+    }
+    Ok(output)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1440,6 +2420,52 @@ pub(crate) struct TransformerFeedForwardStream {
 
 #[allow(dead_code)]
 impl TransformerFeedForwardStream {
+    pub(crate) fn flux2_silu_glu_from_hfq(
+        hfq: &HfqFile,
+        stream_label: &'static str,
+        prefix: &str,
+    ) -> DiffusionResult<Self> {
+        let proj_weight = ResidentWeight::from_hfq(hfq, &format!("{prefix}.linear_in.weight"))?;
+        let proj_bias = optional_tensor(hfq, &format!("{prefix}.linear_in.bias"))?;
+        let down_weight = ResidentWeight::from_hfq(hfq, &format!("{prefix}.linear_out.weight"))?;
+        let down_bias = optional_tensor(hfq, &format!("{prefix}.linear_out.bias"))?;
+        let [projected_width, hidden_width] = shape2_slice(proj_weight.shape())?;
+        if projected_width == 0 || projected_width % 2 != 0 {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "{stream_label} FLUX.2 SiLU-GLU projection shape {:?} is not [2*inner, hidden]",
+                proj_weight.shape()
+            )));
+        }
+        let inner_width = projected_width / 2;
+        validate_attention_bias_shape(
+            stream_label,
+            "ff.linear_in",
+            proj_bias.as_ref(),
+            projected_width,
+        )?;
+        validate_transformer_ff_down_shape(
+            stream_label,
+            down_weight.shape(),
+            down_bias.as_ref(),
+            hidden_width,
+            inner_width,
+        )?;
+        Ok(Self {
+            stream_label,
+            activation: TransformerFeedForwardActivation::SiLuGlu,
+            hidden_width,
+            inner_width,
+            proj_weight: Some(proj_weight),
+            proj_bias,
+            up_weight: None,
+            up_bias: None,
+            gate_weight: None,
+            gate_bias: None,
+            down_weight,
+            down_bias,
+        })
+    }
+
     pub(crate) fn qwen_geglu_from_hfq(
         hfq: &HfqFile,
         stream_label: &'static str,
@@ -1559,9 +2585,9 @@ impl TransformerFeedForwardStream {
                         "GEGLU transformer feed-forward projection bias is missing".into(),
                     )
                 })?;
-                let projected = linear_3d_with_runtime_context(
+                let projected = linear_3d_resident_with_runtime_context(
                     hidden,
-                    &proj_weight.decode()?,
+                    proj_weight,
                     Some(proj_bias),
                     runtime_context,
                 )?;
@@ -1578,27 +2604,164 @@ impl TransformerFeedForwardStream {
                         "SwiGLU transformer feed-forward gate weight is missing".into(),
                     )
                 })?;
-                let up = linear_3d_with_runtime_context(
+                let up = linear_3d_resident_with_runtime_context(
                     hidden,
-                    &up_weight.decode()?,
+                    up_weight,
                     self.up_bias.as_ref(),
                     runtime_context,
                 )?;
-                let gate = linear_3d_with_runtime_context(
+                let gate = linear_3d_resident_with_runtime_context(
                     hidden,
-                    &gate_weight.decode()?,
+                    gate_weight,
                     self.gate_bias.as_ref(),
                     runtime_context,
                 )?;
                 swiglu_gate_3d(&up, &gate)?
             }
+            TransformerFeedForwardActivation::SiLuGlu => {
+                let proj_weight = self.proj_weight.as_ref().ok_or_else(|| {
+                    DiffusionError::InvalidMetadata(
+                        "SiLU-GLU transformer feed-forward projection weight is missing".into(),
+                    )
+                })?;
+                let projected = linear_3d_resident_with_runtime_context(
+                    hidden,
+                    proj_weight,
+                    self.proj_bias.as_ref(),
+                    runtime_context,
+                )?;
+                silu_glu_first_3d(&projected)?
+            }
         };
-        linear_3d_with_runtime_context(
+        linear_3d_resident_with_runtime_context(
             &activated,
-            &self.down_weight.decode()?,
+            &self.down_weight,
             self.down_bias.as_ref(),
             runtime_context,
         )
+    }
+
+    /// Test-only: build a bias-free SwiGLU stream from raw f32 weights (bf16
+    /// source), for exercising the resident FFN chain.
+    #[cfg(test)]
+    pub(crate) fn swiglu_for_test(
+        hidden_width: usize,
+        inner_width: usize,
+        up_f32: &[f32],
+        gate_f32: &[f32],
+        down_f32: &[f32],
+    ) -> Self {
+        Self {
+            stream_label: "test",
+            activation: TransformerFeedForwardActivation::SwiGlu,
+            hidden_width,
+            inner_width,
+            proj_weight: None,
+            proj_bias: None,
+            up_weight: Some(ResidentWeight::from_bf16_parts(
+                "test.up",
+                vec![inner_width, hidden_width],
+                up_f32,
+            )),
+            up_bias: None,
+            gate_weight: Some(ResidentWeight::from_bf16_parts(
+                "test.gate",
+                vec![inner_width, hidden_width],
+                gate_f32,
+            )),
+            gate_bias: None,
+            down_weight: ResidentWeight::from_bf16_parts(
+                "test.down",
+                vec![hidden_width, inner_width],
+                down_f32,
+            ),
+            down_bias: None,
+        }
+    }
+
+    /// Fully device-resident FFN forward: a resident `GpuTensor` in/out with no
+    /// host round-trip. Composes the resident linear/gate ops; frees each
+    /// intermediate as it goes (mirrors the VAE resident chains).
+    #[allow(dead_code)]
+    pub(crate) fn forward_resident(
+        &self,
+        hidden: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+        let activated = match self.activation {
+            TransformerFeedForwardActivation::GeGlu => {
+                let proj_weight = self.proj_weight.as_ref().ok_or_else(|| {
+                    DiffusionError::InvalidMetadata(
+                        "GEGLU feed-forward projection weight missing".into(),
+                    )
+                })?;
+                let projected = linear_resident_weight_resident(
+                    gpu,
+                    cache,
+                    hidden,
+                    proj_weight,
+                    self.proj_bias.as_ref(),
+                )?;
+                let gated = geglu_gate_3d_resident(gpu, &projected)?;
+                free_resident(gpu, projected)?;
+                gated
+            }
+            TransformerFeedForwardActivation::SiLuGlu => {
+                let proj_weight = self.proj_weight.as_ref().ok_or_else(|| {
+                    DiffusionError::InvalidMetadata(
+                        "SiLU-GLU feed-forward projection weight missing".into(),
+                    )
+                })?;
+                let projected = linear_resident_weight_resident(
+                    gpu,
+                    cache,
+                    hidden,
+                    proj_weight,
+                    self.proj_bias.as_ref(),
+                )?;
+                let gated = silu_glu_first_3d_resident(gpu, &projected)?;
+                free_resident(gpu, projected)?;
+                gated
+            }
+            TransformerFeedForwardActivation::SwiGlu => {
+                let up_weight = self.up_weight.as_ref().ok_or_else(|| {
+                    DiffusionError::InvalidMetadata("SwiGLU feed-forward up weight missing".into())
+                })?;
+                let gate_weight = self.gate_weight.as_ref().ok_or_else(|| {
+                    DiffusionError::InvalidMetadata(
+                        "SwiGLU feed-forward gate weight missing".into(),
+                    )
+                })?;
+                let up = linear_resident_weight_resident(
+                    gpu,
+                    cache,
+                    hidden,
+                    up_weight,
+                    self.up_bias.as_ref(),
+                )?;
+                let gate = linear_resident_weight_resident(
+                    gpu,
+                    cache,
+                    hidden,
+                    gate_weight,
+                    self.gate_bias.as_ref(),
+                )?;
+                let gated = swiglu_gate_3d_resident(gpu, &up, &gate)?;
+                free_resident(gpu, up)?;
+                free_resident(gpu, gate)?;
+                gated
+            }
+        };
+        let out = linear_resident_weight_resident(
+            gpu,
+            cache,
+            &activated,
+            &self.down_weight,
+            self.down_bias.as_ref(),
+        )?;
+        free_resident(gpu, activated)?;
+        Ok(out)
     }
 }
 
@@ -1633,6 +2796,31 @@ impl NativeTransformerFeedForward {
                     hidden_width: image.hidden_width,
                     image,
                     text: None,
+                })
+            }
+            TransformerDenoiserFamily::Flux2 => {
+                let image = TransformerFeedForwardStream::flux2_silu_glu_from_hfq(
+                    hfq,
+                    "image",
+                    &format!("{block_prefix}.ff"),
+                )?;
+                let text = TransformerFeedForwardStream::flux2_silu_glu_from_hfq(
+                    hfq,
+                    "text",
+                    &format!("{block_prefix}.ff_context"),
+                )?;
+                if text.hidden_width != image.hidden_width {
+                    return Err(DiffusionError::InvalidMetadata(format!(
+                        "FLUX.2 block {block_index} text MLP hidden width {} != image hidden width {}",
+                        text.hidden_width, image.hidden_width
+                    )));
+                }
+                Ok(Self {
+                    family,
+                    block_index,
+                    hidden_width: image.hidden_width,
+                    image,
+                    text: Some(text),
                 })
             }
             TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
@@ -1672,6 +2860,35 @@ impl NativeTransformerFeedForward {
             .forward_with_runtime_context(hidden, runtime_context)
     }
 
+    /// Test-only: Krea SwiGLU FFN wrapping an image stream.
+    #[cfg(test)]
+    pub(crate) fn krea_swiglu_for_test(
+        hidden: usize,
+        inner: usize,
+        up: &[f32],
+        gate: &[f32],
+        down: &[f32],
+    ) -> Self {
+        Self {
+            family: TransformerDenoiserFamily::Krea2,
+            block_index: 0,
+            hidden_width: hidden,
+            image: TransformerFeedForwardStream::swiglu_for_test(hidden, inner, up, gate, down),
+            text: None,
+        }
+    }
+
+    /// Fully resident image-stream FFN forward.
+    #[allow(dead_code)]
+    pub(crate) fn forward_image_resident(
+        &self,
+        hidden: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+        self.image.forward_resident(hidden, gpu, cache)
+    }
+
     pub(crate) fn forward_text_with_runtime_context(
         &self,
         hidden: &CpuTensor,
@@ -1682,6 +2899,18 @@ impl NativeTransformerFeedForward {
         };
         text.forward_with_runtime_context(hidden, runtime_context)
             .map(Some)
+    }
+
+    pub(crate) fn forward_text_resident(
+        &self,
+        hidden: &hipfire_rdna::GpuTensor,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<Option<hipfire_rdna::GpuTensor>> {
+        self.text
+            .as_ref()
+            .map(|text| text.forward_resident(hidden, gpu, cache))
+            .transpose()
     }
 }
 
@@ -1710,18 +2939,18 @@ impl NativeTransformerBlock {
         let block_prefix = format!("transformer/tensors/transformer_blocks.{block_index}");
         let (norm1_weight, norm2_weight) = match family {
             TransformerDenoiserFamily::Krea2 => (
-                Some(cpu_tensor_from_hfq(
+                Some(rms_gain_plus_one(cpu_tensor_from_hfq(
                     hfq,
                     &format!("{block_prefix}.norm1.weight"),
-                )?),
-                Some(cpu_tensor_from_hfq(
+                )?)),
+                Some(rms_gain_plus_one(cpu_tensor_from_hfq(
                     hfq,
                     &format!("{block_prefix}.norm2.weight"),
-                )?),
+                )?)),
             ),
-            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Unknown => {
-                (None, None)
-            }
+            TransformerDenoiserFamily::QwenImage
+            | TransformerDenoiserFamily::Flux2
+            | TransformerDenoiserFamily::Unknown => (None, None),
         };
         Ok(Self {
             family,
@@ -1769,6 +2998,11 @@ impl NativeTransformerBlock {
         let modulation = self
             .modulation
             .krea_scale_shift_with_runtime_context(time_modulation, runtime_context)?;
+        // adaLN chunk order is [scale, shift, gate] per stream, per the Krea2
+        // source (transformer_krea2.py Krea2TransformerBlock.forward:
+        // `prescale, preshift, pregate, postscale, postshift, postgate =
+        // modulation.unbind(-2)` then `(1 + prescale) * norm1(x) + preshift`).
+        // Chunk 0 is SCALE, chunk 1 is SHIFT. (Krea2 differs from Sana/Qwen-Image.)
         let prescale = extract_modulation_chunk_2d(&modulation, 0)?;
         let preshift = extract_modulation_chunk_2d(&modulation, 1)?;
         let pregate = extract_modulation_chunk_2d(&modulation, 2)?;
@@ -1797,6 +3031,95 @@ impl NativeTransformerBlock {
             .feed_forward
             .forward_image_with_runtime_context(&ff_input, runtime_context)?;
         gated_residual_3d(&hidden, &feed_forward, &postgate)
+    }
+
+    /// Test-only: assemble a minimal Krea2 block from constructed parts.
+    #[cfg(test)]
+    pub(crate) fn krea_for_test(
+        modulation: NativeTransformerBlockModulation,
+        attention: NativeTransformerAttentionProjection,
+        feed_forward: NativeTransformerFeedForward,
+        norm1: CpuTensor,
+        norm2: CpuTensor,
+    ) -> Self {
+        Self {
+            family: TransformerDenoiserFamily::Krea2,
+            block_index: 0,
+            modulation,
+            attention,
+            feed_forward,
+            norm1_weight: Some(norm1),
+            norm2_weight: Some(norm2),
+        }
+    }
+
+    /// Fully device-resident Krea2 block forward: resident hidden in/out, no host
+    /// round-trip for the per-token activation. The six small adaLN chunks are
+    /// computed on CPU and uploaded once. Mirrors forward_krea_with_runtime_context.
+    #[allow(dead_code)]
+    pub(crate) fn forward_krea_resident(
+        &self,
+        hidden: &hipfire_rdna::GpuTensor,
+        time_modulation: &CpuTensor,
+        rotary: Option<&RotaryFrequencies>,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+        if !matches!(self.family, TransformerDenoiserFamily::Krea2) {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer block {} family {:?} is not Krea2-style",
+                self.block_index, self.family
+            )));
+        }
+        let norm1_weight = self.norm1_weight.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("Krea transformer block norm1 weight is missing".into())
+        })?;
+        let norm2_weight = self.norm2_weight.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("Krea transformer block norm2 weight is missing".into())
+        })?;
+        // adaLN chunks (CPU) -> upload the six [batch, width] tensors once.
+        let modulation = self.modulation.krea_scale_shift(time_modulation)?;
+        let mut upload = |i: usize| -> DiffusionResult<hipfire_rdna::GpuTensor> {
+            let chunk = extract_modulation_chunk_2d(&modulation, i)?;
+            gpu.upload_f32(&chunk.data, &chunk.shape)
+                .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))
+        };
+        // adaLN chunk order [scale, shift, gate] per stream (see the CpuTensor
+        // path): chunk 0 is SCALE, chunk 1 is SHIFT, per the Krea2 source.
+        let prescale = upload(0)?;
+        let preshift = upload(1)?;
+        let pregate = upload(2)?;
+        let postscale = upload(3)?;
+        let postshift = upload(4)?;
+        let postgate = upload(5)?;
+
+        // Attention: modulate(rms_norm(norm1)) -> attn -> gated residual.
+        let normed1 = rms_norm_resident(gpu, cache, hidden, norm1_weight, 1e-5)?;
+        let attn_input = modulate_3d_resident(gpu, &normed1, &preshift, &prescale)?;
+        free_resident(gpu, normed1)?;
+        let attention =
+            self.attention
+                .attend_krea_self_gated_resident(&attn_input, rotary, gpu, cache)?;
+        free_resident(gpu, attn_input)?;
+        let hidden2 = gated_residual_3d_resident(gpu, hidden, &attention, &pregate)?;
+        free_resident(gpu, attention)?;
+
+        // FFN: modulate(rms_norm(norm2)) -> ffn -> gated residual.
+        let normed2 = rms_norm_resident(gpu, cache, &hidden2, norm2_weight, 1e-5)?;
+        let ff_input = modulate_3d_resident(gpu, &normed2, &postshift, &postscale)?;
+        free_resident(gpu, normed2)?;
+        let feed_forward = self
+            .feed_forward
+            .forward_image_resident(&ff_input, gpu, cache)?;
+        free_resident(gpu, ff_input)?;
+        let out = gated_residual_3d_resident(gpu, &hidden2, &feed_forward, &postgate)?;
+        free_resident(gpu, hidden2)?;
+        free_resident(gpu, feed_forward)?;
+
+        for chunk in [prescale, preshift, pregate, postscale, postshift, postgate] {
+            free_resident(gpu, chunk)?;
+        }
+        Ok(out)
     }
 
     pub(crate) fn forward_qwen_with_runtime_context(
@@ -1890,6 +3213,387 @@ impl NativeTransformerBlock {
         let text_out = gated_residual_3d(&text_after_attention, &text_mlp, &text_mod.gate_mlp)?;
         Ok((image_out, text_out))
     }
+
+    pub(crate) fn forward_flux2_double_with_runtime_context(
+        &self,
+        image_hidden: &CpuTensor,
+        text_hidden: &CpuTensor,
+        text_attention_mask: Option<&CpuTensor>,
+        image_mod: &TransformerModulationChunks,
+        text_mod: &TransformerModulationChunks,
+        rotary: Option<&QwenRotaryEmbeddings>,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<(CpuTensor, CpuTensor)> {
+        if !matches!(self.family, TransformerDenoiserFamily::Flux2) {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "transformer block {} family {:?} is not FLUX.2 double-stream",
+                self.block_index, self.family
+            )));
+        }
+        let image_attention_input = modulate_3d(
+            &layer_norm_3d_no_affine_with_runtime_context(image_hidden, 1e-6, runtime_context)?,
+            &image_mod.shift_msa,
+            &image_mod.scale_msa,
+        )?;
+        let text_attention_input = modulate_3d(
+            &layer_norm_3d_no_affine_with_runtime_context(text_hidden, 1e-6, runtime_context)?,
+            &text_mod.shift_msa,
+            &text_mod.scale_msa,
+        )?;
+        let (image_attention, text_attention) =
+            self.attention.attend_image_text_with_runtime_context(
+                &image_attention_input,
+                Some(&text_attention_input),
+                text_attention_mask,
+                rotary,
+                runtime_context,
+            )?;
+        let image_hidden = gated_residual_3d(image_hidden, &image_attention, &image_mod.gate_msa)?;
+        let text_hidden = gated_residual_3d(
+            text_hidden,
+            &text_attention.ok_or_else(|| {
+                DiffusionError::InvalidMetadata(
+                    "FLUX.2 double block attention returned no text stream".to_string(),
+                )
+            })?,
+            &text_mod.gate_msa,
+        )?;
+        let image_mlp_input = modulate_3d(
+            &layer_norm_3d_no_affine_with_runtime_context(&image_hidden, 1e-6, runtime_context)?,
+            &image_mod.shift_mlp,
+            &image_mod.scale_mlp,
+        )?;
+        let text_mlp_input = modulate_3d(
+            &layer_norm_3d_no_affine_with_runtime_context(&text_hidden, 1e-6, runtime_context)?,
+            &text_mod.shift_mlp,
+            &text_mod.scale_mlp,
+        )?;
+        let image_mlp = self
+            .feed_forward
+            .forward_image_with_runtime_context(&image_mlp_input, runtime_context)?;
+        let text_mlp = self
+            .feed_forward
+            .forward_text_with_runtime_context(&text_mlp_input, runtime_context)?
+            .ok_or_else(|| {
+                DiffusionError::InvalidMetadata(
+                    "FLUX.2 double block feed-forward returned no text stream".to_string(),
+                )
+            })?;
+        Ok((
+            gated_residual_3d(&image_hidden, &image_mlp, &image_mod.gate_mlp)?,
+            gated_residual_3d(&text_hidden, &text_mlp, &text_mod.gate_mlp)?,
+        ))
+    }
+
+    pub(crate) fn forward_flux2_double_resident(
+        &self,
+        image_hidden: &hipfire_rdna::GpuTensor,
+        text_hidden: &hipfire_rdna::GpuTensor,
+        image_mod: &ResidentTransformerModulationChunks,
+        text_mod: &ResidentTransformerModulationChunks,
+        rotary: &QwenRotaryEmbeddings,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<(hipfire_rdna::GpuTensor, hipfire_rdna::GpuTensor)> {
+        let image_norm = layer_norm_no_affine_resident(gpu, image_hidden, 1e-6)?;
+        let image_attention_input =
+            modulate_3d_resident(gpu, &image_norm, &image_mod.shift_msa, &image_mod.scale_msa)?;
+        free_resident(gpu, image_norm)?;
+        let text_norm = layer_norm_no_affine_resident(gpu, text_hidden, 1e-6)?;
+        let text_attention_input =
+            modulate_3d_resident(gpu, &text_norm, &text_mod.shift_msa, &text_mod.scale_msa)?;
+        free_resident(gpu, text_norm)?;
+        let (image_attention, text_attention) = self.attention.attend_flux2_image_text_resident(
+            &image_attention_input,
+            &text_attention_input,
+            rotary,
+            gpu,
+            cache,
+        )?;
+        free_resident(gpu, image_attention_input)?;
+        free_resident(gpu, text_attention_input)?;
+        let image_after_attention =
+            gated_residual_3d_resident(gpu, image_hidden, &image_attention, &image_mod.gate_msa)?;
+        let text_after_attention =
+            gated_residual_3d_resident(gpu, text_hidden, &text_attention, &text_mod.gate_msa)?;
+        free_resident(gpu, image_attention)?;
+        free_resident(gpu, text_attention)?;
+
+        let image_norm = layer_norm_no_affine_resident(gpu, &image_after_attention, 1e-6)?;
+        let image_mlp_input =
+            modulate_3d_resident(gpu, &image_norm, &image_mod.shift_mlp, &image_mod.scale_mlp)?;
+        free_resident(gpu, image_norm)?;
+        let text_norm = layer_norm_no_affine_resident(gpu, &text_after_attention, 1e-6)?;
+        let text_mlp_input =
+            modulate_3d_resident(gpu, &text_norm, &text_mod.shift_mlp, &text_mod.scale_mlp)?;
+        free_resident(gpu, text_norm)?;
+        let image_mlp = self
+            .feed_forward
+            .forward_image_resident(&image_mlp_input, gpu, cache)?;
+        let text_mlp = self
+            .feed_forward
+            .forward_text_resident(&text_mlp_input, gpu, cache)?
+            .ok_or_else(|| {
+                DiffusionError::InvalidMetadata(
+                    "FLUX.2 resident double block has no text feed-forward".into(),
+                )
+            })?;
+        free_resident(gpu, image_mlp_input)?;
+        free_resident(gpu, text_mlp_input)?;
+        let image_out = gated_residual_3d_resident(
+            gpu,
+            &image_after_attention,
+            &image_mlp,
+            &image_mod.gate_mlp,
+        )?;
+        let text_out =
+            gated_residual_3d_resident(gpu, &text_after_attention, &text_mlp, &text_mod.gate_mlp)?;
+        for tensor in [
+            image_after_attention,
+            text_after_attention,
+            image_mlp,
+            text_mlp,
+        ] {
+            free_resident(gpu, tensor)?;
+        }
+        Ok((image_out, text_out))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NativeFlux2SingleBlock {
+    block_index: usize,
+    heads: usize,
+    head_dim: usize,
+    hidden_width: usize,
+    linear1_weight: ResidentWeight,
+    linear1_bias: Option<CpuTensor>,
+    norm_q_weight: CpuTensor,
+    norm_k_weight: CpuTensor,
+    linear2_weight: ResidentWeight,
+    linear2_bias: Option<CpuTensor>,
+}
+
+impl NativeFlux2SingleBlock {
+    pub(crate) fn from_hfq(
+        hfq: &HfqFile,
+        block_index: usize,
+        heads: usize,
+    ) -> DiffusionResult<Self> {
+        let prefix = format!("transformer/tensors/single_transformer_blocks.{block_index}.attn");
+        let linear1_weight =
+            ResidentWeight::from_hfq(hfq, &format!("{prefix}.to_qkv_mlp_proj.weight"))?;
+        let linear1_bias = optional_tensor(hfq, &format!("{prefix}.to_qkv_mlp_proj.bias"))?;
+        let linear2_weight = ResidentWeight::from_hfq(hfq, &format!("{prefix}.to_out.weight"))?;
+        let linear2_bias = optional_tensor(hfq, &format!("{prefix}.to_out.bias"))?;
+        let [linear1_rows, hidden_width] = shape2_slice(linear1_weight.shape())?;
+        if heads == 0 || hidden_width % heads != 0 || linear1_rows != hidden_width * 9 {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "FLUX.2 single block {block_index} linear1 shape {:?} is not [9*hidden, hidden] for {heads} heads",
+                linear1_weight.shape()
+            )));
+        }
+        if linear2_weight.shape() != [hidden_width, hidden_width * 4] {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "FLUX.2 single block {block_index} linear2 shape {:?} != [{hidden_width}, {}]",
+                linear2_weight.shape(),
+                hidden_width * 4
+            )));
+        }
+        let head_dim = hidden_width / heads;
+        let norm_q_weight = cpu_tensor_from_hfq(hfq, &format!("{prefix}.norm_q.weight"))?;
+        let norm_k_weight = cpu_tensor_from_hfq(hfq, &format!("{prefix}.norm_k.weight"))?;
+        validate_attention_norm_shape("FLUX.2 single", "norm_q", Some(&norm_q_weight), head_dim)?;
+        validate_attention_norm_shape("FLUX.2 single", "norm_k", Some(&norm_k_weight), head_dim)?;
+        Ok(Self {
+            block_index,
+            heads,
+            head_dim,
+            hidden_width,
+            linear1_weight,
+            linear1_bias,
+            norm_q_weight,
+            norm_k_weight,
+            linear2_weight,
+            linear2_bias,
+        })
+    }
+
+    pub(crate) fn forward_with_runtime_context(
+        &self,
+        hidden: &CpuTensor,
+        modulation: &Flux2SingleModulationChunks,
+        rotary: Option<&RotaryFrequencies>,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let normalized =
+            layer_norm_3d_no_affine_with_runtime_context(hidden, 1e-6, runtime_context)?;
+        let input = modulate_3d(&normalized, &modulation.shift, &modulation.scale)?;
+        let projected = linear_3d_resident_with_runtime_context(
+            &input,
+            &self.linear1_weight,
+            self.linear1_bias.as_ref(),
+            runtime_context,
+        )?;
+        let q = slice_width_3d(&projected, 0, self.hidden_width)?;
+        let k = slice_width_3d(&projected, self.hidden_width, self.hidden_width)?;
+        let v = slice_width_3d(&projected, self.hidden_width * 2, self.hidden_width)?;
+        let mlp = slice_width_3d(&projected, self.hidden_width * 3, self.hidden_width * 6)?;
+        let mut q =
+            rms_norm_attention_heads_3d(&q, &self.norm_q_weight, self.heads, self.head_dim, 1e-6)?;
+        let mut k =
+            rms_norm_attention_heads_3d(&k, &self.norm_k_weight, self.heads, self.head_dim, 1e-6)?;
+        if let Some(rotary) = rotary {
+            q = apply_qwen_rotary_embedding(&q, rotary, self.heads, self.head_dim)?;
+            k = apply_qwen_rotary_embedding(&k, rotary, self.heads, self.head_dim)?;
+        }
+        let attention = scaled_dot_product_attention_with_runtime_context(
+            &q,
+            &k,
+            &v,
+            self.heads,
+            runtime_context,
+        )?;
+        let mlp = silu_glu_first_3d(&mlp)?;
+        let combined = concat_width_3d(&attention, &mlp)?;
+        let output = linear_3d_resident_with_runtime_context(
+            &combined,
+            &self.linear2_weight,
+            self.linear2_bias.as_ref(),
+            runtime_context,
+        )?;
+        gated_residual_3d(hidden, &output, &modulation.gate)
+    }
+
+    pub(crate) fn forward_resident(
+        &self,
+        hidden: &hipfire_rdna::GpuTensor,
+        modulation: &ResidentFlux2SingleModulationChunks,
+        rotary: &RotaryFrequencies,
+        gpu: &mut hipfire_rdna::Gpu,
+        cache: &mut RocmWeightCache,
+    ) -> DiffusionResult<hipfire_rdna::GpuTensor> {
+        let normalized = layer_norm_no_affine_resident(gpu, hidden, 1e-6)?;
+        let input = modulate_3d_resident(gpu, &normalized, &modulation.shift, &modulation.scale)?;
+        free_resident(gpu, normalized)?;
+        let projected = linear_resident_weight_resident(
+            gpu,
+            cache,
+            &input,
+            &self.linear1_weight,
+            self.linear1_bias.as_ref(),
+        )?;
+        free_resident(gpu, input)?;
+        let q = slice_last_dim_3d_resident(gpu, &projected, 0, self.hidden_width)?;
+        let k = slice_last_dim_3d_resident(gpu, &projected, self.hidden_width, self.hidden_width)?;
+        let v =
+            slice_last_dim_3d_resident(gpu, &projected, self.hidden_width * 2, self.hidden_width)?;
+        let mlp_projected = slice_last_dim_3d_resident(
+            gpu,
+            &projected,
+            self.hidden_width * 3,
+            self.hidden_width * 6,
+        )?;
+        free_resident(gpu, projected)?;
+        let q = qk_norm_heads_resident(
+            gpu,
+            cache,
+            q,
+            Some(&self.norm_q_weight),
+            self.heads,
+            self.head_dim,
+            1e-6,
+        )?;
+        let k = qk_norm_heads_resident(
+            gpu,
+            cache,
+            k,
+            Some(&self.norm_k_weight),
+            self.heads,
+            self.head_dim,
+            1e-6,
+        )?;
+        let q_rot = rope_qwen_resident(
+            gpu,
+            cache,
+            &q,
+            &rotary.cos,
+            &rotary.sin,
+            self.heads,
+            self.head_dim,
+        )?;
+        let k_rot = rope_qwen_resident(
+            gpu,
+            cache,
+            &k,
+            &rotary.cos,
+            &rotary.sin,
+            self.heads,
+            self.head_dim,
+        )?;
+        free_resident(gpu, q)?;
+        free_resident(gpu, k)?;
+        let attention = scaled_dot_product_attention_resident(gpu, &q_rot, &k_rot, &v, self.heads)?;
+        for tensor in [q_rot, k_rot, v] {
+            free_resident(gpu, tensor)?;
+        }
+        let mlp = silu_glu_first_3d_resident(gpu, &mlp_projected)?;
+        free_resident(gpu, mlp_projected)?;
+        let combined = concat_last_dim_3d_resident(gpu, &attention, &mlp)?;
+        free_resident(gpu, attention)?;
+        free_resident(gpu, mlp)?;
+        let output = linear_resident_weight_resident(
+            gpu,
+            cache,
+            &combined,
+            &self.linear2_weight,
+            self.linear2_bias.as_ref(),
+        )?;
+        free_resident(gpu, combined)?;
+        let result = gated_residual_3d_resident(gpu, hidden, &output, &modulation.gate)?;
+        free_resident(gpu, output)?;
+        Ok(result)
+    }
+}
+
+fn slice_width_3d(input: &CpuTensor, start: usize, len: usize) -> DiffusionResult<CpuTensor> {
+    let [batch, seq, width] = shape3(input)?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| DiffusionError::InvalidMetadata("3-D width slice overflow".to_string()))?;
+    if end > width {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "3-D width slice [{start}..{end}] exceeds width {width}"
+        )));
+    }
+    let mut output = CpuTensor::zeros(&[batch, seq, len]);
+    for token in 0..batch * seq {
+        let src = token * width + start;
+        let dst = token * len;
+        output.data[dst..dst + len].copy_from_slice(&input.data[src..src + len]);
+    }
+    Ok(output)
+}
+
+fn concat_width_3d(left: &CpuTensor, right: &CpuTensor) -> DiffusionResult<CpuTensor> {
+    let [batch, seq, left_width] = shape3(left)?;
+    let [right_batch, right_seq, right_width] = shape3(right)?;
+    if batch != right_batch || seq != right_seq {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "3-D width concat shapes {:?} and {:?} disagree on batch/sequence",
+            left.shape, right.shape
+        )));
+    }
+    let width = left_width + right_width;
+    let mut output = CpuTensor::zeros(&[batch, seq, width]);
+    for token in 0..batch * seq {
+        let dst = token * width;
+        output.data[dst..dst + left_width]
+            .copy_from_slice(&left.data[token * left_width..(token + 1) * left_width]);
+        output.data[dst + left_width..dst + width]
+            .copy_from_slice(&right.data[token * right_width..(token + 1) * right_width]);
+    }
+    Ok(output)
 }
 
 /// Krea2 text-fusion refinement block: a plain pre-norm transformer block
@@ -1914,8 +3618,14 @@ impl NativeTextFusionBlock {
         heads: usize,
     ) -> DiffusionResult<Self> {
         Ok(Self {
-            norm1_weight: cpu_tensor_from_hfq(hfq, &format!("{block_prefix}.norm1.weight"))?,
-            norm2_weight: cpu_tensor_from_hfq(hfq, &format!("{block_prefix}.norm2.weight"))?,
+            norm1_weight: rms_gain_plus_one(cpu_tensor_from_hfq(
+                hfq,
+                &format!("{block_prefix}.norm1.weight"),
+            )?),
+            norm2_weight: rms_gain_plus_one(cpu_tensor_from_hfq(
+                hfq,
+                &format!("{block_prefix}.norm2.weight"),
+            )?),
             attention: NativeTransformerAttentionProjection::single_stream_from_prefix(
                 hfq,
                 &format!("{block_prefix}.attn"),
@@ -2123,9 +3833,19 @@ pub(crate) struct NativeTransformerDenoiser {
     io: NativeTransformerDenoiserIo,
     timestep_embedding: NativeTransformerTimestepEmbedding,
     blocks: Vec<NativeTransformerBlock>,
+    flux2_single_blocks: Vec<NativeFlux2SingleBlock>,
+    flux2_modulation: Option<NativeFlux2Modulation>,
     heads: usize,
-    qwen_rope_axes: Option<[usize; 3]>,
+    qwen_rope_axes: Option<Vec<usize>>,
     qwen_rope_theta: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Flux2ForwardTrace {
+    pub(crate) double_image: CpuTensor,
+    pub(crate) double_text: CpuTensor,
+    pub(crate) single_joint: CpuTensor,
+    pub(crate) output: LatentBatch,
 }
 
 #[allow(dead_code)]
@@ -2137,7 +3857,9 @@ impl NativeTransformerDenoiser {
     ) -> DiffusionResult<Self> {
         if !matches!(
             topology.family,
-            TransformerDenoiserFamily::QwenImage | TransformerDenoiserFamily::Krea2
+            TransformerDenoiserFamily::QwenImage
+                | TransformerDenoiserFamily::Krea2
+                | TransformerDenoiserFamily::Flux2
         ) {
             return Err(DiffusionError::InvalidMetadata(format!(
                 "native transformer denoiser assembly currently supports Qwen image / Krea2 MMDiT only; got {}",
@@ -2178,6 +3900,19 @@ impl NativeTransformerDenoiser {
                 heads,
             )?);
         }
+        let mut flux2_single_blocks = Vec::with_capacity(topology.single_block_count);
+        if matches!(topology.family, TransformerDenoiserFamily::Flux2) {
+            for block_index in 0..topology.single_block_count {
+                flux2_single_blocks.push(NativeFlux2SingleBlock::from_hfq(
+                    hfq,
+                    block_index,
+                    heads,
+                )?);
+            }
+        }
+        let flux2_modulation = matches!(topology.family, TransformerDenoiserFamily::Flux2)
+            .then(|| NativeFlux2Modulation::from_hfq(hfq))
+            .transpose()?;
         let head_dim = blocks
             .first()
             .map(|block| block.attention.head_dim)
@@ -2193,6 +3928,8 @@ impl NativeTransformerDenoiser {
             io,
             timestep_embedding,
             blocks,
+            flux2_single_blocks,
+            flux2_modulation,
             heads,
             qwen_rope_axes,
             qwen_rope_theta,
@@ -2328,13 +4065,75 @@ impl NativeTransformerDenoiser {
             })?;
 
         let mut joint = concat_sequence_3d(&text_hidden, &image_hidden)?;
-        for block in &self.blocks {
-            joint = block.forward_krea_with_runtime_context(
-                &joint,
-                &time_modulation,
-                joint_rotary.as_ref(),
-                runtime_context,
-            )?;
+        if runtime_context.rocm_device_id().is_some() {
+            // Resident block stack: upload the joint activation once, run the
+            // whole block stack on-device (no per-op host round-trip), download
+            // once. This is what removes the ~450-syncs-per-block cost.
+            let blocks = &self.blocks;
+            let time_modulation_ref = &time_modulation;
+            let joint_rotary_ref = joint_rotary.as_ref();
+            joint = runtime_context.with_rocm_gpu_weighted(move |gpu, cache| {
+                let mut resident = gpu
+                    .upload_f32(&joint.data, &joint.shape)
+                    .map_err(|e| DiffusionError::BackendUnavailable(e.to_string()))?;
+                for block in blocks {
+                    let next = block.forward_krea_resident(
+                        &resident,
+                        time_modulation_ref,
+                        joint_rotary_ref,
+                        gpu,
+                        cache,
+                    )?;
+                    free_resident(gpu, resident)?;
+                    resident = next;
+                }
+                let out = download_resident(gpu, &resident)?;
+                free_resident(gpu, resident)?;
+                if crate::gpu_ops::profile::enabled() {
+                    use crate::gpu_ops::profile;
+                    let prep = profile::take(&profile::PREP_NS) as f64 / 1e6;
+                    let prep_read = profile::take(&profile::PREP_READ_NS) as f64 / 1e6;
+                    let prep_quant = profile::take(&profile::PREP_QUANT_NS) as f64 / 1e6;
+                    let gemm = profile::take(&profile::GEMM_NS) as f64 / 1e6;
+                    let attn = profile::take(&profile::ATTN_NS) as f64 / 1e6;
+                    let bytes = profile::take(&profile::PREP_BYTES);
+                    let flops = profile::take(&profile::GEMM_FLOPS);
+                    let miss = profile::take(&profile::CACHE_MISS);
+                    let hit = profile::take(&profile::CACHE_HIT);
+                    let total = prep + gemm + attn;
+                    let tflops = if gemm > 0.0 {
+                        (flops as f64) / (gemm / 1e3) / 1e12
+                    } else {
+                        0.0
+                    };
+                    let gib = (bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+                    eprintln!(
+                        "[profile] DiT block-stack step: prep={:.1}ms ({:.1}%) [read={:.1}ms quant={:.1}ms] gemm={:.1}ms ({:.1}%) attn={:.1}ms ({:.1}%) | cache {}hit/{}miss, prep-read={:.2}GiB, gemm={:.2} TFLOP/s effective",
+                        prep,
+                        100.0 * prep / total.max(1e-9),
+                        prep_read,
+                        prep_quant,
+                        gemm,
+                        100.0 * gemm / total.max(1e-9),
+                        attn,
+                        100.0 * attn / total.max(1e-9),
+                        hit,
+                        miss,
+                        gib,
+                        tflops,
+                    );
+                }
+                Ok(out)
+            })?;
+        } else {
+            for block in &self.blocks {
+                joint = block.forward_krea_with_runtime_context(
+                    &joint,
+                    &time_modulation,
+                    joint_rotary.as_ref(),
+                    runtime_context,
+                )?;
+            }
         }
         let image_hidden = slice_sequence_3d(&joint, text_seq, image_seq)?;
         self.io.project_hidden_to_latents_with_runtime_context(
@@ -2347,12 +4146,372 @@ impl NativeTransformerDenoiser {
         )
     }
 
+    pub(crate) fn forward_flux2_trace_with_runtime_context(
+        &self,
+        latents: &LatentBatch,
+        timesteps: &[f32],
+        text_hidden: &CpuTensor,
+        text_attention_mask: Option<&CpuTensor>,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<Flux2ForwardTrace> {
+        self.forward_flux2_trace_impl_with_runtime_context(
+            latents,
+            timesteps,
+            None,
+            text_hidden,
+            text_attention_mask,
+            runtime_context,
+        )
+    }
+
+    pub(crate) fn forward_sefi_trace_with_runtime_context(
+        &self,
+        latents: &LatentBatch,
+        timesteps_sem: &[f32],
+        timesteps_tex: &[f32],
+        text_hidden: &CpuTensor,
+        text_attention_mask: Option<&CpuTensor>,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<Flux2ForwardTrace> {
+        self.forward_flux2_trace_impl_with_runtime_context(
+            latents,
+            timesteps_sem,
+            Some(timesteps_tex),
+            text_hidden,
+            text_attention_mask,
+            runtime_context,
+        )
+    }
+
+    fn forward_flux2_trace_impl_with_runtime_context(
+        &self,
+        latents: &LatentBatch,
+        timesteps: &[f32],
+        texture_timesteps: Option<&[f32]>,
+        text_hidden: &CpuTensor,
+        text_attention_mask: Option<&CpuTensor>,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<Flux2ForwardTrace> {
+        if !matches!(self.family, TransformerDenoiserFamily::Flux2) {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "native transformer family {:?} is not FLUX.2",
+                self.family
+            )));
+        }
+        if timesteps.len() != latents.batch {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "FLUX.2 timestep batch {} != latent batch {}",
+                timesteps.len(),
+                latents.batch
+            )));
+        }
+        if texture_timesteps.is_some_and(|values| values.len() != latents.batch) {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "SeFi texture timestep batch {} != latent batch {}",
+                texture_timesteps.unwrap().len(),
+                latents.batch
+            )));
+        }
+        let mut image_hidden = self
+            .io
+            .project_latents_to_hidden_with_runtime_context(latents, runtime_context)?;
+        let mut text_hidden = self
+            .io
+            .project_text_to_hidden_with_runtime_context(text_hidden, runtime_context)?;
+        let [text_batch, text_seq, _] = shape3(&text_hidden)?;
+        if text_batch != latents.batch {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "FLUX.2 text batch {text_batch} != latent batch {}",
+                latents.batch
+            )));
+        }
+        if let Some(mask) = text_attention_mask {
+            validate_text_attention_mask(mask, latents.batch, text_seq, "FLUX.2 text")?;
+        }
+        let axes = self.qwen_rope_axes.as_deref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("FLUX.2 requires axes_dims_rope".to_string())
+        })?;
+        let rotary = flux2_rotary_embeddings_for_grid(
+            axes,
+            self.qwen_rope_theta,
+            self.blocks[0].attention.head_dim,
+            latents.height / self.io.patch_size,
+            latents.width / self.io.patch_size,
+            text_seq,
+        )?;
+        let timestep_embedding = if let Some(texture_timesteps) = texture_timesteps {
+            self.timestep_embedding.forward_dual_with_runtime_context(
+                timesteps,
+                texture_timesteps,
+                runtime_context,
+            )?
+        } else {
+            self.timestep_embedding
+                .forward_with_runtime_context(timesteps, runtime_context)?
+        };
+        let modulation = self.flux2_modulation.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("FLUX.2 top-level modulation is missing".to_string())
+        })?;
+        let image_mod = modulation.double_chunks(
+            &timestep_embedding,
+            TransformerModulationStream::Image,
+            runtime_context,
+        )?;
+        let text_mod = modulation.double_chunks(
+            &timestep_embedding,
+            TransformerModulationStream::Text,
+            runtime_context,
+        )?;
+        for block in &self.blocks {
+            (image_hidden, text_hidden) = block.forward_flux2_double_with_runtime_context(
+                &image_hidden,
+                &text_hidden,
+                // The Qwen mask is consumed inside the text tower. The BFL
+                // FLUX.2/SeFi transformer receives all fixed-length context
+                // tokens and exposes no attention-mask argument.
+                None,
+                &image_mod,
+                &text_mod,
+                Some(&rotary),
+                runtime_context,
+            )?;
+        }
+        let double_image = image_hidden.clone();
+        let double_text = text_hidden.clone();
+        let [_, image_seq, _] = shape3(&image_hidden)?;
+        let mut joint = concat_sequence_3d(&text_hidden, &image_hidden)?;
+        let joint_rotary = combined_joint_rotary(&rotary)?;
+        let single_mod = modulation.single_chunks(&timestep_embedding, runtime_context)?;
+        for block in &self.flux2_single_blocks {
+            joint = block.forward_with_runtime_context(
+                &joint,
+                &single_mod,
+                Some(&joint_rotary),
+                runtime_context,
+            )?;
+        }
+        let single_joint = joint.clone();
+        let image_hidden = slice_sequence_3d(&joint, text_seq, image_seq)?;
+        let output = self.io.project_hidden_to_latents_with_runtime_context(
+            &image_hidden,
+            &timestep_embedding,
+            latents.batch,
+            latents.height,
+            latents.width,
+            runtime_context,
+        )?;
+        Ok(Flux2ForwardTrace {
+            double_image,
+            double_text,
+            single_joint,
+            output,
+        })
+    }
+
+    pub(crate) fn forward_flux2_with_runtime_context(
+        &self,
+        latents: &LatentBatch,
+        timesteps: &[f32],
+        text_hidden: &CpuTensor,
+        text_attention_mask: Option<&CpuTensor>,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<LatentBatch> {
+        if runtime_context.rocm_device_id().is_some() {
+            return self.forward_flux2_resident_with_runtime_context(
+                latents,
+                timesteps,
+                None,
+                text_hidden,
+                text_attention_mask,
+                runtime_context,
+            );
+        }
+        self.forward_flux2_trace_with_runtime_context(
+            latents,
+            timesteps,
+            text_hidden,
+            text_attention_mask,
+            runtime_context,
+        )
+        .map(|trace| trace.output)
+    }
+
+    pub(crate) fn forward_sefi_with_runtime_context(
+        &self,
+        latents: &LatentBatch,
+        timesteps_sem: &[f32],
+        timesteps_tex: &[f32],
+        text_hidden: &CpuTensor,
+        text_attention_mask: Option<&CpuTensor>,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<LatentBatch> {
+        if runtime_context.rocm_device_id().is_some() {
+            return self.forward_flux2_resident_with_runtime_context(
+                latents,
+                timesteps_sem,
+                Some(timesteps_tex),
+                text_hidden,
+                text_attention_mask,
+                runtime_context,
+            );
+        }
+        self.forward_sefi_trace_with_runtime_context(
+            latents,
+            timesteps_sem,
+            timesteps_tex,
+            text_hidden,
+            text_attention_mask,
+            runtime_context,
+        )
+        .map(|trace| trace.output)
+    }
+
+    fn forward_flux2_resident_with_runtime_context(
+        &self,
+        latents: &LatentBatch,
+        timesteps: &[f32],
+        texture_timesteps: Option<&[f32]>,
+        text_hidden: &CpuTensor,
+        text_attention_mask: Option<&CpuTensor>,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<LatentBatch> {
+        if timesteps.len() != latents.batch
+            || texture_timesteps.is_some_and(|values| values.len() != latents.batch)
+        {
+            return Err(DiffusionError::InvalidRequest(
+                "FLUX.2 resident timestep batch does not match latent batch".into(),
+            ));
+        }
+        let image_hidden = self
+            .io
+            .project_latents_to_hidden_with_runtime_context(latents, runtime_context)?;
+        let text_hidden = self
+            .io
+            .project_text_to_hidden_with_runtime_context(text_hidden, runtime_context)?;
+        dump_denoise_trace_tensor("flux2_input_image", &image_hidden.shape, &image_hidden.data);
+        dump_denoise_trace_tensor("flux2_input_text", &text_hidden.shape, &text_hidden.data);
+        let [text_batch, text_seq, _] = shape3(&text_hidden)?;
+        if text_batch != latents.batch {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "FLUX.2 text batch {text_batch} != latent batch {}",
+                latents.batch
+            )));
+        }
+        if let Some(mask) = text_attention_mask {
+            validate_text_attention_mask(mask, latents.batch, text_seq, "FLUX.2 text")?;
+        }
+        let axes = self.qwen_rope_axes.as_deref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("FLUX.2 requires axes_dims_rope".into())
+        })?;
+        let rotary = flux2_rotary_embeddings_for_grid(
+            axes,
+            self.qwen_rope_theta,
+            self.blocks[0].attention.head_dim,
+            latents.height / self.io.patch_size,
+            latents.width / self.io.patch_size,
+            text_seq,
+        )?;
+        let timestep_embedding = if let Some(texture_timesteps) = texture_timesteps {
+            self.timestep_embedding.forward_dual_with_runtime_context(
+                timesteps,
+                texture_timesteps,
+                runtime_context,
+            )?
+        } else {
+            self.timestep_embedding
+                .forward_with_runtime_context(timesteps, runtime_context)?
+        };
+        let modulation = self.flux2_modulation.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("FLUX.2 top-level modulation is missing".into())
+        })?;
+        let image_mod = modulation.double_chunks(
+            &timestep_embedding,
+            TransformerModulationStream::Image,
+            runtime_context,
+        )?;
+        let text_mod = modulation.double_chunks(
+            &timestep_embedding,
+            TransformerModulationStream::Text,
+            runtime_context,
+        )?;
+        let single_mod = modulation.single_chunks(&timestep_embedding, runtime_context)?;
+        let joint_rotary = combined_joint_rotary(&rotary)?;
+        let image_seq = shape3(&image_hidden)?[1];
+        let image_hidden = runtime_context.with_rocm_gpu_weighted(|gpu, cache| {
+            let mut image = gpu
+                .upload_f32(&image_hidden.data, &image_hidden.shape)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let mut text = gpu
+                .upload_f32(&text_hidden.data, &text_hidden.shape)
+                .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+            let image_mod = ResidentTransformerModulationChunks::upload(gpu, &image_mod)?;
+            let text_mod = ResidentTransformerModulationChunks::upload(gpu, &text_mod)?;
+            for (index, block) in self.blocks.iter().enumerate() {
+                let (next_image, next_text) = block.forward_flux2_double_resident(
+                    &image, &text, &image_mod, &text_mod, &rotary, gpu, cache,
+                )?;
+                free_resident(gpu, image)?;
+                free_resident(gpu, text)?;
+                image = next_image;
+                text = next_text;
+                if denoise_trace_enabled() {
+                    let image_trace = download_resident(gpu, &image)?;
+                    let text_trace = download_resident(gpu, &text)?;
+                    dump_denoise_trace_tensor(
+                        &format!("flux2_double_{index:02}_image"),
+                        &image_trace.shape,
+                        &image_trace.data,
+                    );
+                    dump_denoise_trace_tensor(
+                        &format!("flux2_double_{index:02}_text"),
+                        &text_trace.shape,
+                        &text_trace.data,
+                    );
+                }
+            }
+            let mut joint = concat_sequence_3d_resident(gpu, &text, &image)?;
+            free_resident(gpu, text)?;
+            free_resident(gpu, image)?;
+            image_mod.free(gpu)?;
+            text_mod.free(gpu)?;
+            let single_mod = ResidentFlux2SingleModulationChunks::upload(gpu, &single_mod)?;
+            for (index, block) in self.flux2_single_blocks.iter().enumerate() {
+                let next =
+                    block.forward_resident(&joint, &single_mod, &joint_rotary, gpu, cache)?;
+                free_resident(gpu, joint)?;
+                joint = next;
+                if denoise_trace_enabled() {
+                    let joint_trace = download_resident(gpu, &joint)?;
+                    dump_denoise_trace_tensor(
+                        &format!("flux2_single_{index:02}"),
+                        &joint_trace.shape,
+                        &joint_trace.data,
+                    );
+                }
+            }
+            single_mod.free(gpu)?;
+            let image = slice_sequence_3d_resident(gpu, &joint, text_seq, image_seq)?;
+            free_resident(gpu, joint)?;
+            let image_host = download_resident(gpu, &image)?;
+            free_resident(gpu, image)?;
+            Ok(image_host)
+        })?;
+        self.io.project_hidden_to_latents_with_runtime_context(
+            &image_hidden,
+            &timestep_embedding,
+            latents.batch,
+            latents.height,
+            latents.width,
+            runtime_context,
+        )
+    }
+
     pub(crate) fn qwen_rotary_embeddings(
         &self,
         latents: &LatentBatch,
         text_seq_len: usize,
     ) -> DiffusionResult<Option<QwenRotaryEmbeddings>> {
-        let Some(axes) = self.qwen_rope_axes else {
+        let Some(axes) = self.qwen_rope_axes.as_deref() else {
             return Ok(None);
         };
         if latents.height % self.io.patch_size != 0 || latents.width % self.io.patch_size != 0 {
@@ -2423,6 +4582,13 @@ impl DiffusionNoiseBackend for NativeTransformerDenoiser {
             |sample, timesteps, encoder_states, attention_mask, _sdxl, runtime_context| {
                 let model_latents = LatentBatch::from_nchw_tensor(sample.clone())?;
                 let prediction = match self.family {
+                    TransformerDenoiserFamily::Flux2 => self.forward_flux2_with_runtime_context(
+                        &model_latents,
+                        timesteps,
+                        encoder_states,
+                        attention_mask,
+                        runtime_context,
+                    )?,
                     TransformerDenoiserFamily::Krea2 => self.forward_krea_with_runtime_context(
                         &model_latents,
                         timesteps,
@@ -2452,6 +4618,176 @@ impl DiffusionNoiseBackend for NativeTransformerDenoiser {
             progress,
         )
     }
+
+    fn denoise_sefi_latents_with_runtime_context(
+        &self,
+        mut latents: LatentBatch,
+        schedule: &SeFiDualSchedule,
+        semantic_channels: usize,
+        cfg_scale: f32,
+        positive_embeddings: &CpuTensor,
+        negative_embeddings: &CpuTensor,
+        positive_attention_mask: Option<&CpuTensor>,
+        negative_attention_mask: Option<&CpuTensor>,
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+        mut progress: Option<&mut dyn FnMut(DiffusionProgress) -> DiffusionResult<()>>,
+    ) -> DiffusionResult<DenoiseLatentsOutput> {
+        if !matches!(self.family, TransformerDenoiserFamily::Flux2) {
+            return Err(DiffusionError::InvalidRequest(
+                "SeFi dual-stream denoising requires a FLUX.2 transformer".to_string(),
+            ));
+        }
+        validate_conditioning_for_latents(&latents, positive_embeddings)?;
+        validate_conditioning_for_latents(&latents, negative_embeddings)?;
+        let total_channels = latents.channels;
+        if semantic_channels == 0 || semantic_channels >= total_channels {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "SeFi semantic channel count {semantic_channels} is invalid for {total_channels} total channels"
+            )));
+        }
+        if schedule.steps.is_empty() {
+            return Err(DiffusionError::InvalidMetadata(
+                "SeFi dual schedule is empty".to_string(),
+            ));
+        }
+        if let Some(mask) = positive_attention_mask {
+            let [batch, seq, _] = shape3(positive_embeddings)?;
+            validate_text_attention_mask(mask, batch, seq, "SeFi positive conditioning")?;
+        }
+        if let Some(mask) = negative_attention_mask {
+            let [batch, seq, _] = shape3(negative_embeddings)?;
+            validate_text_attention_mask(mask, batch, seq, "SeFi negative conditioning")?;
+        }
+        configure_layer_policy(&mut runtime_context.rocm_weights);
+        let cfg_is_identity = classifier_free_guidance_is_identity(cfg_scale);
+        dump_denoise_trace_tensor(
+            "latent_000",
+            &[
+                latents.batch,
+                latents.channels,
+                latents.height,
+                latents.width,
+            ],
+            &latents.data,
+        );
+        dump_denoise_trace_tensor(
+            "conditioning_positive",
+            &positive_embeddings.shape,
+            &positive_embeddings.data,
+        );
+        for (index, step) in schedule.steps.iter().enumerate() {
+            let timestep_sem = vec![step.timestep_sem; latents.batch];
+            let timestep_tex = vec![step.timestep_tex; latents.batch];
+            let predict = |embeddings: &CpuTensor,
+                           mask: Option<&CpuTensor>,
+                           runtime_context: &mut DiffusionGenerationRuntimeContext|
+             -> DiffusionResult<LatentBatch> {
+                self.forward_sefi_with_runtime_context(
+                    &latents,
+                    &timestep_sem,
+                    &timestep_tex,
+                    embeddings,
+                    mask,
+                    runtime_context,
+                )
+            };
+            let positive = predict(
+                positive_embeddings,
+                positive_attention_mask,
+                runtime_context,
+            )?;
+            let velocity = if cfg_is_identity {
+                positive.data
+            } else {
+                let negative = predict(
+                    negative_embeddings,
+                    negative_attention_mask,
+                    runtime_context,
+                )?;
+                negative
+                    .data
+                    .iter()
+                    .zip(positive.data)
+                    .map(|(base, conditioned)| base + cfg_scale * (conditioned - base))
+                    .collect()
+            };
+            dump_denoise_trace_tensor(
+                &format!("velocity_{:03}", index + 1),
+                &[
+                    latents.batch,
+                    latents.channels,
+                    latents.height,
+                    latents.width,
+                ],
+                &velocity,
+            );
+            sefi_dual_euler_step(&mut latents, &velocity, semantic_channels, step)?;
+            dump_denoise_trace_tensor(
+                &format!("latent_{:03}", index + 1),
+                &[
+                    latents.batch,
+                    latents.channels,
+                    latents.height,
+                    latents.width,
+                ],
+                &latents.data,
+            );
+            if let Some(progress) = progress.as_deref_mut() {
+                progress(DiffusionProgress {
+                    completed_steps: index + 1,
+                    total_steps: schedule.steps.len(),
+                    timestep: step.timestep_sem.round().max(0.0) as usize,
+                    preview_latents: Some(slice_latent_channels(&latents, semantic_channels)?),
+                })?;
+            }
+        }
+        Ok(DenoiseLatentsOutput {
+            latents,
+            runtime_kind: if runtime_context.rocm_device_id().is_some() {
+                DiffusionRuntimeKind::RocmHybridReference
+            } else {
+                DiffusionRuntimeKind::CpuSourceReference
+            },
+        })
+    }
+}
+
+pub(crate) fn sefi_dual_euler_step(
+    latents: &mut LatentBatch,
+    velocity: &[f32],
+    semantic_channels: usize,
+    step: &SeFiDualScheduleStep,
+) -> DiffusionResult<()> {
+    if velocity.len() != latents.data.len() {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "SeFi velocity length {} != latent length {}",
+            velocity.len(),
+            latents.data.len()
+        )));
+    }
+    if semantic_channels == 0 || semantic_channels >= latents.channels {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "SeFi semantic channel count {semantic_channels} is invalid for {} total channels",
+            latents.channels
+        )));
+    }
+    let spatial = latents.height * latents.width;
+    let dt_sem = step.sigma_sem_next - step.sigma_sem;
+    let dt_tex = step.sigma_tex_next - step.sigma_tex;
+    for batch in 0..latents.batch {
+        for channel in 0..latents.channels {
+            let dt = if channel < semantic_channels {
+                dt_sem
+            } else {
+                dt_tex
+            };
+            let offset = (batch * latents.channels + channel) * spatial;
+            for element in 0..spatial {
+                latents.data[offset + element] += dt * velocity[offset + element];
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2476,7 +4812,7 @@ pub(crate) fn attention_norm_weight_dim(weight: &CpuTensor) -> DiffusionResult<u
 pub(crate) fn qwen_rope_axes_from_transformer_config(
     transformer: &TransformerDenoiserConfig,
     head_dim: usize,
-) -> DiffusionResult<Option<[usize; 3]>> {
+) -> DiffusionResult<Option<Vec<usize>>> {
     let axes = if transformer.axes_dims_rope.is_empty() {
         if head_dim == 128 {
             vec![16, 56, 56]
@@ -2486,9 +4822,9 @@ pub(crate) fn qwen_rope_axes_from_transformer_config(
     } else {
         transformer.axes_dims_rope.clone()
     };
-    if axes.len() != 3 {
+    if !matches!(axes.len(), 3 | 4) {
         return Err(DiffusionError::InvalidMetadata(format!(
-            "Qwen axes_dims_rope {:?} must contain exactly 3 axes",
+            "transformer axes_dims_rope {:?} must contain 3 or 4 axes",
             axes
         )));
     }
@@ -2505,12 +4841,12 @@ pub(crate) fn qwen_rope_axes_from_transformer_config(
             axes
         )));
     }
-    Ok(Some([axes[0], axes[1], axes[2]]))
+    Ok(Some(axes))
 }
 
 #[allow(dead_code)]
 pub(crate) fn qwen_rotary_embeddings_for_grid(
-    axes: [usize; 3],
+    axes: &[usize],
     theta: f32,
     head_dim: usize,
     frame: usize,
@@ -2518,6 +4854,11 @@ pub(crate) fn qwen_rotary_embeddings_for_grid(
     width: usize,
     text_seq_len: usize,
 ) -> DiffusionResult<QwenRotaryEmbeddings> {
+    if axes.len() != 3 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "Qwen/Krea RoPE requires 3 axes, got {axes:?}"
+        )));
+    }
     if frame == 0 || height == 0 || width == 0 || text_seq_len == 0 {
         return Err(DiffusionError::InvalidRequest(
             "Qwen RoPE requires non-empty frame, height, width, and text sequence".to_string(),
@@ -2544,7 +4885,11 @@ pub(crate) fn qwen_rotary_embeddings_for_grid(
         })?;
     let mut image_cos = CpuTensor::zeros(&[image_seq_len, freq_width]);
     let mut image_sin = CpuTensor::zeros(&[image_seq_len, freq_width]);
-    let max_vid_index = height.max(width);
+    // Krea2 RoPE follows Flux (Krea2RotaryPosEmbed is "Copied from FluxPosEmbed"):
+    // the pipeline's prepare_position_ids gives image tokens 0-based grid
+    // coordinates `[0, arange(grid_height), arange(grid_width)]` (frame axis 0,
+    // NOT centered), and text tokens all-zero position ids `[0, 0, 0]` (identity
+    // rotation). This differs from Qwen-Image's scale_rope centered coordinates.
     let mut token = 0usize;
     for f in 0..frame {
         for y in 0..height {
@@ -2556,13 +4901,14 @@ pub(crate) fn qwen_rotary_embeddings_for_grid(
                     freq_width,
                     axes,
                     theta,
-                    [f as isize, y as isize, x as isize],
+                    &[f as isize, y as isize, x as isize],
                 );
                 token += 1;
             }
         }
     }
 
+    // Text tokens use all-zero position ids -> identity rotation (cos 1, sin 0).
     let mut text_cos = CpuTensor::zeros(&[text_seq_len, freq_width]);
     let mut text_sin = CpuTensor::zeros(&[text_seq_len, freq_width]);
     for token in 0..text_seq_len {
@@ -2573,14 +4919,82 @@ pub(crate) fn qwen_rotary_embeddings_for_grid(
             freq_width,
             axes,
             theta,
-            [
-                (max_vid_index + token) as isize,
-                (max_vid_index + token) as isize,
-                (max_vid_index + token) as isize,
-            ],
+            &[0, 0, 0],
         );
     }
 
+    Ok(QwenRotaryEmbeddings {
+        image: RotaryFrequencies {
+            cos: image_cos,
+            sin: image_sin,
+        },
+        text: RotaryFrequencies {
+            cos: text_cos,
+            sin: text_sin,
+        },
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn flux2_rotary_embeddings_for_grid(
+    axes: &[usize],
+    theta: f32,
+    head_dim: usize,
+    height: usize,
+    width: usize,
+    text_seq_len: usize,
+) -> DiffusionResult<QwenRotaryEmbeddings> {
+    if axes.len() != 4 || height == 0 || width == 0 || text_seq_len == 0 {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "FLUX.2 RoPE requires four axes and non-empty H/W/text, got axes={axes:?}, H={height}, W={width}, text={text_seq_len}"
+        )));
+    }
+    if axes.iter().any(|dim| *dim == 0 || dim % 2 != 0)
+        || axes.iter().sum::<usize>() != head_dim
+        || head_dim % 2 != 0
+    {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "FLUX.2 RoPE axes {axes:?} are incompatible with head_dim {head_dim}"
+        )));
+    }
+    if theta <= 0.0 {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "FLUX.2 rope_theta {theta} must be positive"
+        )));
+    }
+    let freq_width = head_dim / 2;
+    let image_seq_len = height.checked_mul(width).ok_or_else(|| {
+        DiffusionError::InvalidRequest("FLUX.2 RoPE image size overflow".to_string())
+    })?;
+    let mut image_cos = CpuTensor::zeros(&[image_seq_len, freq_width]);
+    let mut image_sin = CpuTensor::zeros(&[image_seq_len, freq_width]);
+    for y in 0..height {
+        for x in 0..width {
+            let token = y * width + x;
+            write_qwen_rope_token(
+                &mut image_cos.data,
+                &mut image_sin.data,
+                token,
+                freq_width,
+                axes,
+                theta,
+                &[0, y as isize, x as isize, 0],
+            );
+        }
+    }
+    let mut text_cos = CpuTensor::zeros(&[text_seq_len, freq_width]);
+    let mut text_sin = CpuTensor::zeros(&[text_seq_len, freq_width]);
+    for token in 0..text_seq_len {
+        write_qwen_rope_token(
+            &mut text_cos.data,
+            &mut text_sin.data,
+            token,
+            freq_width,
+            axes,
+            theta,
+            &[0, 0, 0, token as isize],
+        );
+    }
     Ok(QwenRotaryEmbeddings {
         image: RotaryFrequencies {
             cos: image_cos,
@@ -2598,12 +5012,13 @@ pub(crate) fn write_qwen_rope_token(
     sin: &mut [f32],
     token: usize,
     freq_width: usize,
-    axes: [usize; 3],
+    axes: &[usize],
     theta: f32,
-    positions: [isize; 3],
+    positions: &[isize],
 ) {
+    debug_assert_eq!(axes.len(), positions.len());
     let mut dst = token * freq_width;
-    for (axis_index, axis_dim) in axes.into_iter().enumerate() {
+    for (axis_index, axis_dim) in axes.iter().copied().enumerate() {
         let axis_freqs = axis_dim / 2;
         for freq_index in 0..axis_freqs {
             let exponent = (2 * freq_index) as f32 / axis_dim as f32;
@@ -3201,6 +5616,69 @@ pub(crate) fn apply_rope_halfsplit_3d(
     Ok(out)
 }
 
+pub(crate) fn qwen3_causal_self_attention_with_key_mask(
+    q: &CpuTensor,
+    k: &CpuTensor,
+    v: &CpuTensor,
+    heads: usize,
+    key_mask: &[bool],
+) -> DiffusionResult<CpuTensor> {
+    let [seq, hidden] = shape2(q)?;
+    if k.shape.as_slice() != [seq, hidden]
+        || v.shape.as_slice() != [seq, hidden]
+        || key_mask.len() != seq
+        || heads == 0
+        || hidden % heads != 0
+    {
+        return Err(DiffusionError::InvalidMetadata(format!(
+            "Qwen3 masked causal attention shapes {:?}/{:?}/{:?}, mask {}, heads {heads} are incompatible",
+            q.shape,
+            k.shape,
+            v.shape,
+            key_mask.len()
+        )));
+    }
+    let head_dim = hidden / heads;
+    let scale = (head_dim as f32).sqrt().recip();
+    let mut output = CpuTensor::zeros(&[seq, hidden]);
+    for head in 0..heads {
+        let head_offset = head * head_dim;
+        for query in 0..seq {
+            let mut scores = Vec::with_capacity(query + 1);
+            let mut max_score = f32::NEG_INFINITY;
+            for key in 0..=query {
+                if !key_mask[key] {
+                    continue;
+                }
+                let mut dot = 0.0f32;
+                for dim in 0..head_dim {
+                    dot += q.data[query * hidden + head_offset + dim]
+                        * k.data[key * hidden + head_offset + dim];
+                }
+                let score = dot * scale;
+                max_score = max_score.max(score);
+                scores.push((key, score));
+            }
+            if !max_score.is_finite() {
+                continue;
+            }
+            let mut denominator = 0.0f32;
+            for (_, score) in &mut scores {
+                *score = (*score - max_score).exp();
+                denominator += *score;
+            }
+            for dim in 0..head_dim {
+                let mut value = 0.0f32;
+                for &(key, score) in &scores {
+                    value += score / denominator * v.data[key * hidden + head_offset + dim];
+                }
+                output.data[query * hidden + head_offset + dim] = value;
+            }
+        }
+    }
+    Ok(output)
+}
+
 /// One Qwen3 decoder layer: RMSNorm -> GQA attention (QK-norm, RoPE, causal) ->
 /// residual -> RMSNorm -> SwiGLU -> residual.
 #[derive(Debug, Clone, PartialEq)]
@@ -3252,6 +5730,7 @@ impl Qwen3EncoderLayer {
         heads: usize,
         kv_heads: usize,
         head_dim: usize,
+        attention_mask: Option<&[bool]>,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
         let normed = rms_norm_3d_with_runtime_context(
@@ -3267,11 +5746,11 @@ impl Qwen3EncoderLayer {
             runtime_context,
         )?;
         let mut q =
-            linear_3d_with_runtime_context(&normed, &self.q_proj.decode()?, None, runtime_context)?;
+            linear_3d_resident_with_runtime_context(&normed, &self.q_proj, None, runtime_context)?;
         let mut k =
-            linear_3d_with_runtime_context(&normed, &self.k_proj.decode()?, None, runtime_context)?;
+            linear_3d_resident_with_runtime_context(&normed, &self.k_proj, None, runtime_context)?;
         let v =
-            linear_3d_with_runtime_context(&normed, &self.v_proj.decode()?, None, runtime_context)?;
+            linear_3d_resident_with_runtime_context(&normed, &self.v_proj, None, runtime_context)?;
         q = rms_norm_attention_heads_3d(
             &q,
             &CpuTensor {
@@ -3302,20 +5781,28 @@ impl Qwen3EncoderLayer {
             shape: vec![seq, inner],
             data: t.data,
         };
-        let attention = clip_causal_self_attention_with_runtime_context(
-            &squeeze(q),
-            &squeeze(k),
-            &squeeze(v),
-            heads,
-            runtime_context,
-        )?;
+        let q = squeeze(q);
+        let k = squeeze(k);
+        let v = squeeze(v);
+        let attention = if attention_mask.is_some_and(|mask| mask.iter().any(|keep| !keep)) {
+            let mask = attention_mask.unwrap();
+            if runtime_context.rocm_device_id().is_some() {
+                runtime_context.with_rocm_gpu(|gpu| {
+                    qwen3_masked_causal_self_attention_hip_on_gpu(gpu, &q, &k, &v, heads, mask)
+                })?
+            } else {
+                qwen3_causal_self_attention_with_key_mask(&q, &k, &v, heads, mask)?
+            }
+        } else {
+            clip_causal_self_attention_with_runtime_context(&q, &k, &v, heads, runtime_context)?
+        };
         let attention = CpuTensor {
             shape: vec![1, seq, inner],
             data: attention.data,
         };
-        let attention = linear_3d_with_runtime_context(
+        let attention = linear_3d_resident_with_runtime_context(
             &attention,
-            &self.o_proj.decode()?,
+            &self.o_proj,
             None,
             runtime_context,
         )?;
@@ -3330,15 +5817,15 @@ impl Qwen3EncoderLayer {
             Self::EPS,
             runtime_context,
         )?;
-        let gate = linear_3d_with_runtime_context(
+        let gate = linear_3d_resident_with_runtime_context(
             &normed2,
-            &self.gate_proj.decode()?,
+            &self.gate_proj,
             None,
             runtime_context,
         )?;
-        let up = linear_3d_with_runtime_context(
+        let up = linear_3d_resident_with_runtime_context(
             &normed2,
-            &self.up_proj.decode()?,
+            &self.up_proj,
             None,
             runtime_context,
         )?;
@@ -3347,9 +5834,9 @@ impl Qwen3EncoderLayer {
             let g = gate.data[idx];
             *slot = (g / (1.0 + (-g).exp())) * up.data[idx];
         }
-        let ff = linear_3d_with_runtime_context(
+        let ff = linear_3d_resident_with_runtime_context(
             &swish,
-            &self.down_proj.decode()?,
+            &self.down_proj,
             None,
             runtime_context,
         )?;
@@ -3420,11 +5907,27 @@ impl NativeQwen3TextEncoder {
         select_layers: &[usize],
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<Vec<CpuTensor>> {
+        self.encode_with_attention_mask(token_ids, None, select_layers, runtime_context)
+    }
+
+    pub(crate) fn encode_with_attention_mask(
+        &self,
+        token_ids: &[u32],
+        attention_mask: Option<&[bool]>,
+        select_layers: &[usize],
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<Vec<CpuTensor>> {
         let seq = token_ids.len();
         if seq == 0 {
             return Err(DiffusionError::InvalidRequest(
                 "text encoder requires at least one token".to_string(),
             ));
+        }
+        if attention_mask.is_some_and(|mask| mask.len() != seq) {
+            return Err(DiffusionError::InvalidRequest(format!(
+                "Qwen3 attention mask length {} != token length {seq}",
+                attention_mask.unwrap().len()
+            )));
         }
         let mut hidden = CpuTensor::zeros(&[1, seq, self.hidden]);
         for (pos, &token) in token_ids.iter().enumerate() {
@@ -3447,6 +5950,7 @@ impl NativeQwen3TextEncoder {
                 self.heads,
                 self.kv_heads,
                 self.head_dim,
+                attention_mask,
                 runtime_context,
             )?;
             if select_layers.contains(&(index + 1)) {
@@ -3457,10 +5961,103 @@ impl NativeQwen3TextEncoder {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Flux2TextConditioner {
+    encoder: NativeQwen3TextEncoder,
+    select_layers: Vec<usize>,
+}
+
+impl Flux2TextConditioner {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_hfq(
+        hfq: &HfqFile,
+        encoder_prefix: &str,
+        encoder_heads: usize,
+        encoder_kv_heads: usize,
+        head_dim: usize,
+        rope_theta: f32,
+        select_layers: Vec<usize>,
+    ) -> DiffusionResult<Option<Self>> {
+        let Some(encoder) = NativeQwen3TextEncoder::from_hfq(
+            hfq,
+            encoder_prefix,
+            encoder_heads,
+            encoder_kv_heads,
+            head_dim,
+            rope_theta,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            encoder,
+            select_layers,
+        }))
+    }
+
+    pub(crate) fn conditioning_from_token_ids(
+        &self,
+        token_ids: &[u32],
+        attention_mask: &[bool],
+        runtime_context: &mut DiffusionGenerationRuntimeContext,
+    ) -> DiffusionResult<CpuTensor> {
+        let layers = self.encoder.encode_with_attention_mask(
+            token_ids,
+            Some(attention_mask),
+            &self.select_layers,
+            runtime_context,
+        )?;
+        if layers.len() != self.select_layers.len() || layers.is_empty() {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "FLUX.2 requested hidden states {:?}, captured {}",
+                self.select_layers,
+                layers.len()
+            )));
+        }
+        for (layer, selected) in layers.iter().zip(&self.select_layers) {
+            dump_debug_tensor(&format!("flux2_encoder_layer_{selected}"), layer);
+        }
+        let mut concatenated = layers[0].clone();
+        for layer in &layers[1..] {
+            concatenated = concat_width_3d(&concatenated, layer)?;
+        }
+        dump_debug_tensor("flux2_text_conditioning", &concatenated);
+        Ok(concatenated)
+    }
+}
+
 /// Krea2 text conditioning: the Qwen3-VL encoder + text_fusion, producing the
 /// `[1, seq, text_hidden]` conditioning the DiT denoiser's `txt_in` consumes.
 /// This is the object the pipeline drives for a `Krea2Pipeline` (tokenize ->
 /// this -> external-conditioning seam -> denoiser).
+/// Drop the first `drop` tokens from an encoder layer, accepting either
+/// `[seq, hidden]` or `[1, seq, hidden]`. Batch is assumed 1 (single prompt),
+/// so the leading `drop * hidden` values are simply removed.
+pub(crate) fn drop_leading_tokens(layer: &CpuTensor, drop: usize) -> DiffusionResult<CpuTensor> {
+    let (leading, seq, hidden) = match layer.shape.as_slice() {
+        [seq, hidden] => (None, *seq, *hidden),
+        [1, seq, hidden] => (Some(1usize), *seq, *hidden),
+        other => {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "Krea2 encoder layer must be [seq, hidden] or [1, seq, hidden], got {other:?}"
+            )))
+        }
+    };
+    if drop >= seq {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "Krea2 conditioning prefix drop {drop} >= sequence length {seq}"
+        )));
+    }
+    let shape = match leading {
+        Some(b) => vec![b, seq - drop, hidden],
+        None => vec![seq - drop, hidden],
+    };
+    Ok(CpuTensor {
+        shape,
+        data: layer.data[drop * hidden..].to_vec(),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct Krea2TextConditioner {
@@ -3503,15 +6100,28 @@ impl Krea2TextConditioner {
         }))
     }
 
-    /// Encode already-tokenized prompt ids into DiT conditioning.
+    /// Encode already-tokenized prompt ids into DiT conditioning. `drop_prefix`
+    /// tokens are removed from the front of every captured layer BEFORE fusion:
+    /// the Krea2 text path wraps the prompt in a chat template whose system
+    /// prefix (34 tokens) provides encoder context but is dropped from the
+    /// conditioning (`get_text_hidden_states` slices `[:, prefix_idx:]`).
     pub(crate) fn conditioning_from_token_ids(
         &self,
         token_ids: &[u32],
+        drop_prefix: usize,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
-        let layers = self
+        let raw_layers = self
             .encoder
             .encode(token_ids, &self.select_layers, runtime_context)?;
+        let layers = if drop_prefix > 0 {
+            raw_layers
+                .iter()
+                .map(|layer| drop_leading_tokens(layer, drop_prefix))
+                .collect::<DiffusionResult<Vec<_>>>()?
+        } else {
+            raw_layers
+        };
         // Parity-debug: dump the selected encoder hidden states + the fused
         // conditioning when HIPFIRE_DIFFUSION_DUMP_DIR is set.
         for (index, layer) in layers.iter().enumerate() {

@@ -50,9 +50,9 @@ use std::time::Instant;
 
 use hipfire_arch_dots_ocr::{dots_ocr, image as preprocess};
 use hipfire_arch_qwen2::qwen2::{self, Qwen2State, Qwen2Weights};
+use hipfire_rdna::{profile, Gpu};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use hipfire_rdna::{profile, Gpu};
 
 struct Args {
     hfq: PathBuf,

@@ -15,11 +15,11 @@
 //! minimax convention). lm_head is tied to embed_tokens.
 
 use crate::config::{Lfm2MoeConfig, MixerKind};
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_runtime::hfq::{oq4_arch_load, HfqFile, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT};
 use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::quant::f16_to_f32;
 use hipfire_runtime::weights::WeightTensor;
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 // ───────────────────────── HFQ load helpers ─────────────────────────
 
@@ -57,6 +57,30 @@ fn load_lfm2_awq_scale(hfq: &HfqFile, gpu: &mut Gpu, name: &str, k: usize) -> Op
         .collect();
     let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
     gpu.upload_raw(&f32_bytes, &[f32_data.len()]).ok()
+}
+
+/// Decode a per-element float tensor (F16=1, F32=2, BF16=16) to F32. Returns
+/// None for any other quant code. Shared by the embedding-table loader so a
+/// bf16/f16 embed is not misread by the Q8 lookup path.
+fn plain_to_f32(qt: u8, data: &[u8]) -> Option<Vec<f32>> {
+    match qt {
+        1 => Some(
+            data.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+        ),
+        2 => Some(
+            data.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        ),
+        16 => Some(
+            data.chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// Load a 1D/raw F16/F32 vector → F32 GpuTensor with the given shape.
@@ -144,16 +168,12 @@ fn load_wt_with_awq(
 }
 
 const OQ_PLUS_QT: u8 = hipfire_runtime::quant::QuantType::OqPlusG256.code();
-const OQ4_QT: u8 = hipfire_runtime::quant::QuantType::Oq4G256.code();
 const OQ8_QT: u8 = hipfire_runtime::quant::QuantType::Oq8G256.code();
 const OQ_PLUS_COMPACT_QT: u8 = hipfire_runtime::quant::QuantType::OqPlusCompact.code();
-const OQ4_ARCH_PACKED_QT: u8 = hipfire_runtime::quant::QuantType::Oq4G256ArchPacked.code();
+const OQ2_QT: u8 = hipfire_runtime::quant::QuantType::Oq2G256.code();
 const OQ_GROUP: usize = 256;
-
-fn oq4_arch_combined_len(m: usize, k: usize) -> usize {
-    let ng = k / OQ_GROUP;
-    m * (k / 2) + m * ng * 4 + m * ng * (4 + 128)
-}
+// OQ4 canonical (34) / arch-packed (37) codes + transform come from the shared
+// `hipfire_runtime::oq4_arch` (imported above).
 
 fn sext4(nib: u8) -> i8 {
     let v = (nib & 0x0f) as i8;
@@ -164,41 +184,48 @@ fn sext4(nib: u8) -> i8 {
     }
 }
 
-fn pack_oq4_arch_combined(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
-    // Single-sourced from hipfire-quant-format (WP-3.3): Oq4G256 = 130.
-    const BLOCK: usize = hipfire_runtime::quant::QuantType::Oq4G256
-        .block_bytes()
-        .unwrap();
-    const INTERLEAVED_BLOCK: usize = 132; // [f32 scale][128 nibbles]
+fn sext2(bits: u8) -> i8 {
+    let v = (bits & 0x03) as i8;
+    if v > 1 {
+        v - 4
+    } else {
+        v
+    }
+}
+
+/// Upcast on-disk Oq2G256 (`[f16 scale][64 B 2-bit×256]`, 66 B/group) to the
+/// runtime Oq8G256 layout (`[m*k int8 weights][m*ng f32 scale]`). The stored
+/// 2-bit weights (signed ±1, FWHT-rotated) sign-extend into int8 containers so
+/// the existing iu8 W8A8 grouped-WMMA kernels run them directly — no dedicated
+/// W2 decode GEMV. Mirror of [`expand_oq_plus_compact_to_oq8`].
+fn expand_oq2_to_oq8(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
+    const BLOCK: usize = 66; // 2 (f16 scale) + 64 (2-bit×256); Oq2G256.block_bytes()
     if k % OQ_GROUP != 0 {
-        return Err(format!("OQ4G256 requires K % 256 == 0 (got K={k})"));
+        return Err(format!("Oq2 requires K % 256 == 0 (got K={k})"));
     }
     let ng = k / OQ_GROUP;
-    let expect = m * ng * BLOCK;
-    if data.len() != expect {
+    let n_groups = m * ng;
+    if n_groups == 0 || data.len() != n_groups * BLOCK {
         return Err(format!(
-            "OQ4G256 byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+            "Oq2 byte length {} != n_groups {n_groups} * {BLOCK}",
             data.len()
         ));
     }
-    let packed_bytes = m * (k / 2);
-    let scales_bytes = m * ng * 4;
-    let il_base = packed_bytes + scales_bytes;
-    let mut out = vec![0u8; oq4_arch_combined_len(m, k)];
+    let weight_bytes = m * k;
+    let mut out = vec![0u8; weight_bytes + m * ng * 4];
     for r in 0..m {
         for g in 0..ng {
             let src = (r * ng + g) * BLOCK;
             let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
-            let split_dst = r * (k / 2) + g * (OQ_GROUP / 2);
-            out[split_dst..split_dst + 128].copy_from_slice(&data[src + 2..src + BLOCK]);
-
-            let scale_dst = packed_bytes + (r * ng + g) * 4;
+            let dst = r * k + g * OQ_GROUP;
+            for byte_i in 0..64 {
+                let packed = data[src + 2 + byte_i];
+                for j in 0..4 {
+                    out[dst + byte_i * 4 + j] = sext2(packed >> (2 * j)) as u8;
+                }
+            }
+            let scale_dst = weight_bytes + (r * ng + g) * 4;
             out[scale_dst..scale_dst + 4].copy_from_slice(&scale.to_le_bytes());
-
-            let il_dst = il_base + (r * ng + g) * INTERLEAVED_BLOCK;
-            out[il_dst..il_dst + 4].copy_from_slice(&scale.to_le_bytes());
-            out[il_dst + 4..il_dst + INTERLEAVED_BLOCK]
-                .copy_from_slice(&data[src + 2..src + BLOCK]);
         }
     }
     Ok(out)
@@ -315,6 +342,86 @@ fn expand_oq_plus_compact_to_oq8(data: &[u8], m: usize, k: usize) -> Result<Vec<
     Ok(out)
 }
 
+/// Repack one expert's on-disk Oq4G256 tensor (130 B/group `[f16 scale | 128
+/// nibbles]`) into the indexed-MoE kernel block layout (132 B `[f32 scale | 128
+/// nibbles]`) that `gemv_oq4g256_moe_*` reads. The nibble payload is
+/// byte-identical; only the scale widens f16 → f32. Called per expert before
+/// byte-fusing w1/w3 → gate_up (row-concatenation of these blocks is valid — the
+/// layout is per-row-group contiguous). Mirror of minimax `oq4_ondisk_to_moe_blocks`.
+fn oq4_ondisk_to_moe_blocks(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
+    const SRC_BLK: usize = hipfire_runtime::quant::QuantType::Oq4G256
+        .block_bytes()
+        .unwrap(); // 130
+    const DST_BLK: usize = 132; // [f32 scale | 128 nibbles]
+    if k % OQ_GROUP != 0 {
+        return Err(format!("OQ4 expert requires K % 256 == 0 (got K={k})"));
+    }
+    let ng = k / OQ_GROUP;
+    let expect = m * ng * SRC_BLK;
+    if data.len() != expect {
+        return Err(format!(
+            "OQ4 expert byte length {} != M*ng*130 = {expect} (M={m} K={k})",
+            data.len()
+        ));
+    }
+    let mut out = vec![0u8; m * ng * DST_BLK];
+    for blk in 0..(m * ng) {
+        let src = blk * SRC_BLK;
+        let dst = blk * DST_BLK;
+        let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+        out[dst..dst + 4].copy_from_slice(&scale.to_le_bytes());
+        out[dst + 4..dst + DST_BLK].copy_from_slice(&data[src + 2..src + SRC_BLK]);
+    }
+    Ok(out)
+}
+
+/// Expand one expert's on-disk OqPlusCompact tensor (qt=36; per group `[f16 scale
+/// | 128 int4 nibbles | N_out × (u8 idx, i8 val)]`, 130 + 2·N_out B) into the OQ8
+/// indexed-MoE kernel layout (260 B `[f32 scale | 256 int8]`). The int4 bulk is
+/// sign-extended into int8 and the sparse int8 outliers overlaid — the
+/// "top-w8_frac weights → int8" tier expanded to a uniform int8 runtime weight
+/// `gemv_oq8g256_moe_*` reads. Mirror of minimax `oqplus_compact_to_moe_oq8_blocks`.
+fn oqplus_compact_to_moe_oq8_blocks(data: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
+    const DST_BLK: usize = 260; // [f32 scale | 256 int8]
+    if k % OQ_GROUP != 0 {
+        return Err(format!("OQ+C expert requires K % 256 == 0 (got K={k})"));
+    }
+    let ng = k / OQ_GROUP;
+    let n_groups = m * ng;
+    if n_groups == 0 || data.is_empty() || data.len() % n_groups != 0 {
+        return Err(format!(
+            "OQ+C expert byte length {} not divisible by n_groups {n_groups} (M={m} K={k})",
+            data.len()
+        ));
+    }
+    let block_bytes = data.len() / n_groups;
+    if block_bytes < 132 || (block_bytes - 130) % 2 != 0 {
+        return Err(format!(
+            "OQ+C expert block_bytes {block_bytes} invalid (expected 130 + 2·N_out)"
+        ));
+    }
+    let n_out = (block_bytes - 130) / 2;
+    let mut out = vec![0u8; n_groups * DST_BLK];
+    for blk in 0..n_groups {
+        let src = blk * block_bytes;
+        let dst = blk * DST_BLK;
+        let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+        out[dst..dst + 4].copy_from_slice(&scale.to_le_bytes());
+        for i in 0..128 {
+            let byte = data[src + 2 + i];
+            out[dst + 4 + 2 * i] = sext4(byte & 0x0f) as u8;
+            out[dst + 4 + 2 * i + 1] = sext4(byte >> 4) as u8;
+        }
+        let tbl = src + 130;
+        for s in 0..n_out {
+            let idx = data[tbl + 2 * s] as usize;
+            let val = data[tbl + 2 * s + 1];
+            out[dst + 4 + idx] = val;
+        }
+    }
+    Ok(out)
+}
+
 fn upload_wt_raw(
     gpu: &mut Gpu,
     data: &[u8],
@@ -356,16 +463,15 @@ fn wt_from_raw(
                 k,
             )
         }
-        OQ4_QT => {
-            return upload_wt_raw(
-                gpu,
-                &pack_oq4_arch_combined(data, m, k)?,
-                DType::Oq4G256,
-                m,
-                k,
-            )
+        // OQ4 canonical (34, repack) / arch-packed (37, verbatim) via the shared
+        // decision helper (single source of truth).
+        OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {
+            let (bytes, dtype) = oq4_arch_load(qt, data, m, k)
+                .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
+            return upload_wt_raw(gpu, &bytes, dtype, m, k);
         }
         OQ8_QT => return upload_wt_raw(gpu, &pack_oq8(data, m, k)?, DType::Oq8G256, m, k),
+        OQ2_QT => return upload_wt_raw(gpu, &expand_oq2_to_oq8(data, m, k)?, DType::Oq8G256, m, k),
         OQ_PLUS_COMPACT_QT => {
             return upload_wt_raw(
                 gpu,
@@ -374,16 +480,6 @@ fn wt_from_raw(
                 m,
                 k,
             )
-        }
-        OQ4_ARCH_PACKED_QT => {
-            let expect = oq4_arch_combined_len(m, k);
-            if data.len() != expect {
-                return Err(format!(
-                    "OQ4 arch-packed byte length {} != combined len {expect} (M={m} K={k})",
-                    data.len()
-                ));
-            }
-            return upload_wt_raw(gpu, data, DType::Oq4G256, m, k);
         }
         _ => {}
     }
@@ -464,7 +560,8 @@ pub struct Lfm2MoeLayerWeights {
 }
 
 pub struct Lfm2MoeWeights {
-    pub embed: GpuTensor, // model.embed_tokens.weight (raw, for embedding_lookup)
+    pub embed: GpuTensor, // model.embed_tokens.weight (raw Q8_0, or decoded F32 table)
+    pub embed_is_f32: bool, // true = F32 table (float formats), false = raw Q8_0
     pub embedding_norm: GpuTensor, // model.embedding_norm.weight (final norm)
     pub lm_head: WeightTensor, // tied = embed_tokens (loaded as Q8 weight)
     pub layers: Vec<Lfm2MoeLayerWeights>,
@@ -572,11 +669,23 @@ impl Lfm2MoeWeights {
         let n_exp = cfg.num_experts;
         let k_conv = cfg.conv_kernel_size;
 
-        // Globals. embed_tokens is the shared (tied) lm_head.
-        let (_eqt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
-        let embed = gpu
-            .upload_raw(&embed_bytes, &[embed_bytes.len()])
-            .map_err(|e| format!("lfm2moe: upload embed: {e:?}"))?;
+        // Globals. embed_tokens is the shared (tied) lm_head. The embedding
+        // TABLE keeps its stored format: Q8_0 stays raw for the GPU dequant
+        // lookup; per-element float formats (F16/F32/BF16) are decoded to an F32
+        // table so the F32 D2D lookup reads them correctly. Reading a bf16/f16
+        // table with the Q8 lookup produced garbage (RMS ~66 vs ~0.02) — the
+        // format was previously ignored (`_eqt` discarded).
+        let (embed_qt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
+        let embed_is_f32 = matches!(embed_qt, 1 | 2 | 16);
+        let embed = if embed_is_f32 {
+            let f32_data = plain_to_f32(embed_qt, &embed_bytes)
+                .ok_or_else(|| format!("lfm2moe: embed decode failed for qt={embed_qt}"))?;
+            gpu.upload_f32(&f32_data, &[cfg.vocab_size, hidden])
+                .map_err(|e| format!("lfm2moe: upload embed(f32): {e:?}"))?
+        } else {
+            gpu.upload_raw(&embed_bytes, &[embed_bytes.len()])
+                .map_err(|e| format!("lfm2moe: upload embed: {e:?}"))?
+        };
         let embedding_norm = load_f32(hfq, gpu, "model.embedding_norm.weight", &[hidden])?;
         // lm_head: tied → reuse embed_tokens.weight as a Q8 weight tensor.
         let lm_head = load_wt(
@@ -592,6 +701,11 @@ impl Lfm2MoeWeights {
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
+            hipfire_runtime::load_progress::report(
+                l as u32 + 1,
+                cfg.num_hidden_layers as u32,
+                "weights",
+            );
             let p = format!("model.layers.{l}");
             let operator_norm =
                 load_f32(hfq, gpu, &format!("{p}.operator_norm.weight"), &[hidden])?;
@@ -726,13 +840,48 @@ impl Lfm2MoeWeights {
                     let ep = format!("{p}.feed_forward.experts.{e}");
                     let (qt1, w1) = read_tensor(hfq, &format!("{ep}.w1.weight"))?;
                     let (_qt3, w3) = read_tensor(hfq, &format!("{ep}.w3.weight"))?;
+                    let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
+                    // OQ experts ship on-disk and repack per-expert into the indexed-MoE
+                    // kernel block layout before fusing (dense pack_oq8 is the WRONG,
+                    // planar layout for these kernels): OQ4G256 (130 B) → 132 B int4
+                    // blocks; OqPlusCompact (36) → 260 B int8 blocks. w1/w3 are
+                    // [moe_inter, hidden]; w2 is [hidden, moe_inter]. Row-concatenation
+                    // of these per-row-group blocks stays valid for the fused gate_up.
+                    let (w1, w3, w2) = if qt1 == OQ4_CANONICAL_QT {
+                        (
+                            oq4_ondisk_to_moe_blocks(&w1, moe_inter, hidden)?,
+                            oq4_ondisk_to_moe_blocks(&w3, moe_inter, hidden)?,
+                            oq4_ondisk_to_moe_blocks(&w2, hidden, moe_inter)?,
+                        )
+                    } else if qt1 == OQ_PLUS_COMPACT_QT {
+                        (
+                            oqplus_compact_to_moe_oq8_blocks(&w1, moe_inter, hidden)?,
+                            oqplus_compact_to_moe_oq8_blocks(&w3, moe_inter, hidden)?,
+                            oqplus_compact_to_moe_oq8_blocks(&w2, hidden, moe_inter)?,
+                        )
+                    } else {
+                        (w1, w3, w2)
+                    };
                     let mut gate_up_bytes = w1;
                     gate_up_bytes.extend_from_slice(&w3);
-                    let mut gate_up = wt_from_raw(gpu, qt1, &gate_up_bytes, 2 * moe_inter, hidden)
-                        .map_err(|e2| format!("lfm2moe: fuse gate_up L{l}E{e}: {e2}"))?;
-                    let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
-                    let mut down = wt_from_raw(gpu, qt2, &w2, hidden, moe_inter)
-                        .map_err(|e2| format!("lfm2moe: down L{l}E{e}: {e2}"))?;
+                    // OQ blobs are already in kernel-block layout → upload raw tagged
+                    // Oq4/Oq8 (NOT wt_from_raw, whose OQ arm runs the dense repack).
+                    let mut gate_up = if qt1 == OQ4_CANONICAL_QT {
+                        upload_wt_raw(gpu, &gate_up_bytes, DType::Oq4G256, 2 * moe_inter, hidden)
+                    } else if qt1 == OQ_PLUS_COMPACT_QT {
+                        upload_wt_raw(gpu, &gate_up_bytes, DType::Oq8G256, 2 * moe_inter, hidden)
+                    } else {
+                        wt_from_raw(gpu, qt1, &gate_up_bytes, 2 * moe_inter, hidden)
+                    }
+                    .map_err(|e2| format!("lfm2moe: fuse gate_up L{l}E{e}: {e2}"))?;
+                    let mut down = if qt2 == OQ4_CANONICAL_QT {
+                        upload_wt_raw(gpu, &w2, DType::Oq4G256, hidden, moe_inter)
+                    } else if qt2 == OQ_PLUS_COMPACT_QT {
+                        upload_wt_raw(gpu, &w2, DType::Oq8G256, hidden, moe_inter)
+                    } else {
+                        wt_from_raw(gpu, qt2, &w2, hidden, moe_inter)
+                    }
+                    .map_err(|e2| format!("lfm2moe: down L{l}E{e}: {e2}"))?;
                     // AWQ scales: shared per layer, emitted once on expert 0 by the
                     // quantizer (full port of minimax 3c676d00 BOTH-projection AWQ).
                     // Attach the gate_up scale (len hidden) to expert 0's gate_up and
@@ -806,6 +955,7 @@ impl Lfm2MoeWeights {
         let _ = (conv_state_count, kv_count);
         Ok(Lfm2MoeWeights {
             embed,
+            embed_is_f32,
             embedding_norm,
             lm_head,
             layers,
@@ -1028,21 +1178,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn oq4_pack_combined_preserves_split_and_interleaved_regions() {
-        let mut data = vec![0u8; 130];
-        data[0..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // f16 1.0
-        for i in 0..128 {
-            data[2 + i] = i as u8;
-        }
-
-        let packed = pack_oq4_arch_combined(&data, 1, 256).unwrap();
-        assert_eq!(packed.len(), oq4_arch_combined_len(1, 256));
-        assert_eq!(&packed[0..128], &data[2..130]);
-        assert_eq!(&packed[128..132], &1.0f32.to_le_bytes());
-        assert_eq!(&packed[132..136], &1.0f32.to_le_bytes());
-        assert_eq!(&packed[136..264], &data[2..130]);
-    }
+    // The OQ4 arch-pack transform is now single-sourced + golden-tested in
+    // `hipfire_runtime::oq4_arch` (`pack_matches_golden_layout`).
 
     #[test]
     fn oqplus_expands_signed_nibbles_to_oq8_layout() {
@@ -1083,6 +1220,22 @@ mod tests {
         assert_eq!(expanded.len(), 256 + 4);
         assert_eq!(expanded[0] as i8, 1);
         assert_eq!(expanded[1] as i8, -5);
+        assert_eq!(&expanded[256..260], &1.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn oq2_expands_signed_2bit_to_oq8_layout() {
+        let mut data = vec![0u8; 66]; // 2 (f16 scale) + 64 (2-bit×256)
+        data[0..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // f16 1.0
+                                                              // First byte packs q = [1, -1, 0, 1] at 2 bits each, LSB-first.
+        data[2] = 0b01_00_11_01; // j3=1, j2=0, j1=-1(0b11), j0=1
+
+        let expanded = expand_oq2_to_oq8(&data, 1, 256).unwrap();
+        assert_eq!(expanded.len(), 256 + 4);
+        assert_eq!(expanded[0] as i8, 1);
+        assert_eq!(expanded[1] as i8, -1);
+        assert_eq!(expanded[2] as i8, 0);
+        assert_eq!(expanded[3] as i8, 1);
         assert_eq!(&expanded[256..260], &1.0f32.to_le_bytes());
     }
 }

@@ -9,7 +9,7 @@
 
 use hipfire_arch_api::{
     default_importance, default_requires, register_arch, transformer_role, Arch, ArchId, CapReq,
-    Ingest, Init, TensorRole, TensorSpec, ToyFixture, ToyModel,
+    ContinuousBatching, ExpertLayout, Ingest, Init, TensorRole, TensorSpec, ToyFixture, ToyModel,
 };
 
 /// Qwen3.5 dense header id.
@@ -26,6 +26,30 @@ fn qwen35_requires(tensor: &str) -> CapReq {
     default_requires(transformer_role(tensor))
 }
 
+/// Config keys the vision (`vl`) sidecar owns in a Qwen3.5(-VL) checkpoint.
+/// hipfire only *parses* `vision_config`, but the token-id fields must travel
+/// with the vision sidecar too so a vision-less base never advertises them.
+const QWEN35_VL_CONFIG_KEYS: &[&str] = &[
+    "vision_config",
+    "image_token_id",
+    "video_token_id",
+    "vision_start_token_id",
+    "vision_end_token_id",
+];
+
+/// Config keys the multi-token-prediction (`mtp`) sidecar owns.
+const QWEN35_MTP_CONFIG_KEYS: &[&str] = &["num_nextn_predict_layers"];
+
+/// Shared role->config-keys mapping for both dense (arch 5) and MoE (arch 6)
+/// Qwen3.5, which cover the VL and MTP variants on the same ids.
+fn qwen35_sidecar_config_keys(role: &str) -> &'static [&'static str] {
+    match role {
+        "vl" => QWEN35_VL_CONFIG_KEYS,
+        "mtp" => QWEN35_MTP_CONFIG_KEYS,
+        _ => &[],
+    }
+}
+
 /// Lean identity marker for the Qwen3.5 dense offline spec.
 pub struct Qwen35Spec;
 impl Arch for Qwen35Spec {
@@ -34,6 +58,12 @@ impl Arch for Qwen35Spec {
     }
     fn family(&self) -> &'static str {
         "qwen3.5"
+    }
+    fn model_types(&self) -> &'static [&'static str] {
+        &["qwen3_5", "qwen3_5_text"]
+    }
+    fn sidecar_config_keys(&self, role: &str) -> &'static [&'static str] {
+        qwen35_sidecar_config_keys(role)
     }
 }
 impl Ingest for Qwen35Spec {
@@ -57,6 +87,12 @@ impl Arch for Qwen35MoeSpec {
     fn family(&self) -> &'static str {
         "qwen3.5-moe"
     }
+    fn model_types(&self) -> &'static [&'static str] {
+        &["qwen3_5_moe", "qwen3_5_moe_text"]
+    }
+    fn sidecar_config_keys(&self, role: &str) -> &'static [&'static str] {
+        qwen35_sidecar_config_keys(role)
+    }
 }
 impl Ingest for Qwen35MoeSpec {
     fn role(&self, tensor: &str) -> TensorRole {
@@ -67,6 +103,9 @@ impl Ingest for Qwen35MoeSpec {
     }
     fn requires(&self, tensor: &str) -> CapReq {
         qwen35_requires(tensor)
+    }
+    fn expert_layout(&self) -> ExpertLayout {
+        ExpertLayout::StackedGateUpDown
     }
 }
 
@@ -136,6 +175,10 @@ impl Qwen35Tiny {
             shared_inter: 128,
             ..Self::preset()
         }
+    }
+
+    fn vl_preset() -> Self {
+        Self::preset()
     }
 
     fn is_moe(&self) -> bool {
@@ -375,6 +418,164 @@ impl Qwen35Tiny {
         }
         t
     }
+
+    fn vl_config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["Qwen3_5VLForConditionalGeneration"],
+            "model_type": "qwen3_5_text",
+            "text_config": self.config_json(),
+            "vision_config": {
+                "hidden_size": self.hidden,
+                "num_heads": self.n_heads,
+                "depth": 1,
+                "intermediate_size": self.inter,
+                "patch_size": 4,
+                "temporal_patch_size": 1,
+                "out_hidden_size": self.hidden,
+                "spatial_merge_size": 2,
+                "num_position_embeddings": 4,
+                "rope_theta": 10000.0,
+            },
+            "image_token_id": 101,
+            "video_token_id": 102,
+            "vision_start_token_id": 103,
+            "vision_end_token_id": 104,
+            "_comment": "hipfire tiny random-init Qwen3.5-VL gating fixture - not a real model",
+        })
+    }
+
+    fn vl_manifest(&self) -> Vec<TensorSpec> {
+        let mut t = self
+            .manifest()
+            .into_iter()
+            .map(|mut spec| {
+                if let Some(rest) = spec.name.strip_prefix("model.") {
+                    spec.name = format!("model.language_model.{rest}");
+                }
+                spec
+            })
+            .collect::<Vec<_>>();
+
+        let h = self.hidden;
+        let patch = 4usize;
+        let temporal = 1usize;
+        let patch_dim = 3 * temporal * patch * patch;
+        let mlp = self.inter;
+        let merge_dim = h * 4;
+        let p = "model.visual";
+
+        t.push(TensorSpec::f16(
+            format!("{p}.patch_embed.proj.weight"),
+            vec![h, patch_dim],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            format!("{p}.patch_embed.proj.bias"),
+            vec![h],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{p}.pos_embed.weight"),
+            vec![4, h],
+            Init::Uniform(0.01),
+        ));
+
+        let b = format!("{p}.blocks.0");
+        t.push(TensorSpec::f16(
+            format!("{b}.norm1.weight"),
+            vec![h],
+            Init::NormOnes,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.norm1.bias"),
+            vec![h],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.attn.qkv.weight"),
+            vec![3 * h, h],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.attn.qkv.bias"),
+            vec![3 * h],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.attn.proj.weight"),
+            vec![h, h],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.attn.proj.bias"),
+            vec![h],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.norm2.weight"),
+            vec![h],
+            Init::NormOnes,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.norm2.bias"),
+            vec![h],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.mlp.linear_fc1.weight"),
+            vec![mlp, h],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.mlp.linear_fc1.bias"),
+            vec![mlp],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.mlp.linear_fc2.weight"),
+            vec![h, mlp],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            format!("{b}.mlp.linear_fc2.bias"),
+            vec![h],
+            Init::Zeros,
+        ));
+
+        let m = format!("{p}.merger");
+        t.push(TensorSpec::f16(
+            format!("{m}.norm.weight"),
+            vec![h],
+            Init::NormOnes,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{m}.norm.bias"),
+            vec![h],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{m}.linear_fc1.weight"),
+            vec![merge_dim, merge_dim],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            format!("{m}.linear_fc1.bias"),
+            vec![merge_dim],
+            Init::Zeros,
+        ));
+        t.push(TensorSpec::f16(
+            format!("{m}.linear_fc2.weight"),
+            vec![h, merge_dim],
+            Init::Uniform(0.03),
+        ));
+        t.push(TensorSpec::f16(
+            format!("{m}.linear_fc2.bias"),
+            vec![h],
+            Init::Zeros,
+        ));
+
+        t
+    }
 }
 
 impl ToyModel for Qwen35Spec {
@@ -385,6 +586,35 @@ impl ToyModel for Qwen35Spec {
                 .expect("serialize qwen3.5 dense toy config"),
             tensors: m.manifest(),
         }
+    }
+
+    fn fixture_names(&self) -> &'static [&'static str] {
+        &["text-core", "vl"]
+    }
+
+    fn fixture_named(&self, name: &str, _seed: u64) -> Option<ToyFixture> {
+        let m = match name {
+            "default" | "text-core" => Qwen35Tiny::preset(),
+            "vl" | "vision-language" => Qwen35Tiny::vl_preset(),
+            _ => return None,
+        };
+        let (config_json, tensors) = if matches!(name, "vl" | "vision-language") {
+            (
+                serde_json::to_string_pretty(&m.vl_config_json())
+                    .expect("serialize qwen3.5-vl toy config"),
+                m.vl_manifest(),
+            )
+        } else {
+            (
+                serde_json::to_string_pretty(&m.config_json())
+                    .expect("serialize qwen3.5 dense toy config"),
+                m.manifest(),
+            )
+        };
+        Some(ToyFixture {
+            config_json,
+            tensors,
+        })
     }
 }
 
@@ -399,10 +629,25 @@ impl ToyModel for Qwen35MoeSpec {
     }
 }
 
+// Qwen3.5 dense + MoE are served through the server-side continuous-batching
+// runner (fused generate_batch_prefill + batched decode over N co-resident
+// sessions). Declaring the capability is how the serving layer decides a
+// request is safe to route through the batch path.
+impl ContinuousBatching for Qwen35Spec {
+    fn max_batch_sessions(&self) -> usize {
+        8
+    }
+}
+impl ContinuousBatching for Qwen35MoeSpec {
+    fn max_batch_sessions(&self) -> usize {
+        8
+    }
+}
+
 static QWEN35_SPEC: Qwen35Spec = Qwen35Spec;
 static QWEN35_MOE_SPEC: Qwen35MoeSpec = Qwen35MoeSpec;
-register_arch!(QWEN35_SPEC, Ingest, ToyModel);
-register_arch!(QWEN35_MOE_SPEC, Ingest, ToyModel);
+register_arch!(QWEN35_SPEC, Ingest, ToyModel, ContinuousBatching);
+register_arch!(QWEN35_MOE_SPEC, Ingest, ToyModel, ContinuousBatching);
 
 #[cfg(test)]
 mod tests {
@@ -419,10 +664,61 @@ mod tests {
     }
 
     #[test]
+    fn vl_and_mtp_sidecars_own_their_config_keys() {
+        let reg = ArchRegistry::build();
+        let dense = reg.get(QWEN35_ARCH_ID).unwrap();
+        assert!(dense
+            .base
+            .sidecar_config_keys("vl")
+            .contains(&"vision_config"));
+        assert!(dense
+            .base
+            .sidecar_config_keys("mtp")
+            .contains(&"num_nextn_predict_layers"));
+        assert!(dense.base.sidecar_config_keys("triattn").is_empty());
+        // MoE (arch 6) covers the VL variant on the same id.
+        assert!(reg
+            .get(QWEN35_MOE_ARCH_ID)
+            .unwrap()
+            .base
+            .sidecar_config_keys("vl")
+            .contains(&"vision_config"));
+    }
+
+    #[test]
     fn dense_toy_fixture_populated() {
         let f = Qwen35Spec.fixture(0);
         assert!(!f.tensors.is_empty(), "dense fixture must emit tensors");
         assert!(f.config_json.contains("\"model_type\": \"qwen3_5_text\""));
+    }
+
+    #[test]
+    fn vl_toy_fixture_populated() {
+        let f = Qwen35Spec.fixture_named("vl", 0).expect("vl fixture");
+        assert!(
+            f.config_json.contains("\"vision_config\""),
+            "VL fixture must carry vision_config"
+        );
+        let has = |suf: &str| f.tensors.iter().any(|s| s.name.ends_with(suf));
+        assert!(
+            has("model.language_model.embed_tokens.weight"),
+            "text decoder must be nested under model.language_model"
+        );
+        assert!(
+            has("model.visual.patch_embed.proj.weight"),
+            "vision patch embed"
+        );
+        assert!(has("model.visual.blocks.0.attn.qkv.weight"), "vision qkv");
+        assert!(
+            has("model.visual.merger.linear_fc2.weight"),
+            "vision merger"
+        );
+        let n_params: usize = f
+            .tensors
+            .iter()
+            .map(|s| s.shape.iter().product::<usize>())
+            .sum();
+        assert!(n_params < 10_000_000, "VL fixture must stay <10M params");
     }
 
     #[test]

@@ -3,6 +3,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 // Import tooling now lives in the offline hipfire-diffusion-coexist crate.
+use super::*;
 use hipfire_diffusion_coexist::{
     import_diffusers_to_hfq, ldm_unet_native_tensor_name, ldm_vae_native_tensor_name,
     parse_pytorch_state_dict, pytorch_tensor_is_contiguous, reorder_pytorch_storage_to_contiguous,
@@ -10,7 +11,6 @@ use hipfire_diffusion_coexist::{
 };
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 use std::fs;
-use super::*;
 
 #[test]
 fn parses_diffusion_metadata() {
@@ -176,6 +176,444 @@ fn imports_transformer_pipeline_metadata_without_marking_runtime_supported() {
         .as_deref()
         .unwrap()
         .contains("requires complete"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imports_flux2_diffusers_components_into_canonical_roles() {
+    let dir = std::env::temp_dir().join(format!(
+        "hipfire-flux2-diffusers-import-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    let source = dir.join("snapshot");
+    for component in [
+        "text_encoder",
+        "transformer",
+        "vae",
+        "scheduler",
+        "tokenizer",
+    ] {
+        fs::create_dir_all(source.join(component)).unwrap();
+    }
+    fs::write(
+        source.join("model_index.json"),
+        br#"{"_class_name":"Flux2KleinPipeline","text_encoder":["transformers","Qwen3ForCausalLM"],"transformer":["diffusers","Flux2Transformer2DModel"],"vae":["diffusers","AutoencoderKLFlux2"],"scheduler":["diffusers","FlowMatchEulerDiscreteScheduler"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        source.join("text_encoder/config.json"),
+        br#"{"architectures":["Qwen3ForCausalLM"],"hidden_size":2560}"#,
+    )
+    .unwrap();
+    fs::write(
+        source.join("transformer/config.json"),
+        br#"{"_class_name":"Flux2Transformer2DModel","in_channels":128,"num_layers":5,"num_single_layers":20,"num_attention_heads":24,"joint_attention_dim":7680,"axes_dims_rope":[32,32,32,32]}"#,
+    )
+    .unwrap();
+    fs::write(
+        source.join("vae/config.json"),
+        br#"{"_class_name":"AutoencoderKLFlux2","latent_channels":32,"patch_size":[2,2],"block_out_channels":[128,256,512,512]}"#,
+    )
+    .unwrap();
+    fs::write(
+        source.join("scheduler/scheduler_config.json"),
+        br#"{"_class_name":"FlowMatchEulerDiscreteScheduler","num_train_timesteps":1000}"#,
+    )
+    .unwrap();
+    fs::write(source.join("tokenizer/tokenizer.json"), b"{}").unwrap();
+    fs::write(
+        source.join("tokenizer/tokenizer_config.json"),
+        br#"{"tokenizer_class":"Qwen2TokenizerFast","model_max_length":512}"#,
+    )
+    .unwrap();
+    write_safetensors_fixture(
+        &source.join("transformer/diffusion_pytorch_model.safetensors"),
+        &[
+            ("x_embedder.weight", "F32", &[1], &[0, 0, 0, 0]),
+            (
+                "transformer_blocks.0.attn.to_q.weight",
+                "F32",
+                &[1],
+                &[0, 0, 0, 0],
+            ),
+        ],
+    );
+    write_safetensors_fixture(
+        &source.join("text_encoder/model.safetensors"),
+        &[
+            ("model.embed_tokens.weight", "F32", &[1], &[0, 0, 0, 0]),
+            ("lm_head.weight", "F32", &[1], &[0, 0, 0, 0]),
+        ],
+    );
+    write_safetensors_fixture(
+        &source.join("vae/diffusion_pytorch_model.safetensors"),
+        &[
+            ("bn.num_batches_tracked", "I64", &[1], &[0; 8]),
+            ("decoder.conv_in.weight", "BF16", &[1], &[0; 2]),
+        ],
+    );
+
+    let output = dir.join("flux2.hfq");
+    import_diffusers_to_hfq(DiffusersImportOptions {
+        source,
+        output: output.clone(),
+        model_name: Some("FLUX.2-klein-base-4B".into()),
+        max_batch: 1,
+        metadata_only: false,
+    })
+    .unwrap();
+
+    let hfq = HfqFile::open_index_only(&output).unwrap();
+    assert_eq!(hfq.arch_id, hipfire_arch_api::ARCH_ID_FLUX2);
+    let metadata = parse_diffusion_metadata(&hfq.metadata_json).unwrap();
+    let config = StableDiffusionConfig::from_hfq(&hfq, &metadata).unwrap();
+    assert_eq!(metadata.pipeline.latent_channels, Some(128));
+    assert_eq!(config.vae_scale_factor, 16);
+    assert_eq!(metadata.tokenizer.kind, "qwen2-bpe");
+    assert_eq!(metadata.tokenizer.max_length, Some(512));
+    assert!(hfq
+        .find_tensor_info("transformer/tensors/x_embedder.weight")
+        .is_some());
+    assert!(hfq
+        .find_tensor_info("text_encoder/tensors/language_model.embed_tokens.weight")
+        .is_some());
+    assert!(hfq
+        .find_tensor_info("text_encoder/tensors/lm_head.weight")
+        .is_none());
+    assert!(hfq
+        .find_tensor_info("vae/tensors/decoder.conv_in.weight")
+        .is_some());
+    assert!(hfq
+        .find_tensor_info("vae/tensors/bn.num_batches_tracked")
+        .is_none());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn imports_flux2_native_single_file_into_diffusers_canonical_roles() {
+    let dir = std::env::temp_dir().join(format!(
+        "hipfire-flux2-native-import-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    for component in [
+        "text_encoder",
+        "transformer",
+        "vae",
+        "scheduler",
+        "tokenizer",
+    ] {
+        fs::create_dir_all(dir.join(component)).unwrap();
+    }
+    fs::write(
+        dir.join("model_index.json"),
+        br#"{"_class_name":"Flux2KleinPipeline"}"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("text_encoder/config.json"),
+        br#"{"architectures":["Qwen3ForCausalLM"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("transformer/config.json"),
+        br#"{"_class_name":"Flux2Transformer2DModel","in_channels":128,"num_layers":5,"num_single_layers":20,"num_attention_heads":24,"joint_attention_dim":7680,"axes_dims_rope":[32,32,32,32]}"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("vae/config.json"),
+        br#"{"_class_name":"AutoencoderKLFlux2","latent_channels":32}"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("scheduler/scheduler_config.json"),
+        br#"{"_class_name":"FlowMatchEulerDiscreteScheduler"}"#,
+    )
+    .unwrap();
+    fs::write(dir.join("tokenizer/tokenizer.json"), b"{}").unwrap();
+    let source = dir.join("flux-2-klein-base-4b.safetensors");
+    let qkv = [
+        0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x40, 0x40,
+    ];
+    write_safetensors_fixture(
+        &source,
+        &[
+            ("img_in.weight", "F32", &[1, 1], &[0, 0, 0, 0]),
+            ("double_blocks.0.img_attn.qkv.weight", "F32", &[3, 1], &qkv),
+            ("double_blocks.0.txt_attn.qkv.weight", "F32", &[3, 1], &qkv),
+            (
+                "double_blocks.0.img_attn.proj.weight",
+                "F32",
+                &[1, 1],
+                &[0; 4],
+            ),
+            (
+                "double_blocks.0.txt_attn.proj.weight",
+                "F32",
+                &[1, 1],
+                &[0; 4],
+            ),
+            ("double_blocks.0.img_mlp.0.weight", "F32", &[1, 1], &[0; 4]),
+            ("double_blocks.0.img_mlp.2.weight", "F32", &[1, 1], &[0; 4]),
+            ("single_blocks.0.linear1.weight", "F32", &[1, 1], &[0; 4]),
+            ("single_blocks.0.linear2.weight", "F32", &[1, 1], &[0; 4]),
+            (
+                "final_layer.adaLN_modulation.1.weight",
+                "F32",
+                &[2, 1],
+                &[0; 8],
+            ),
+            ("final_layer.linear.weight", "F32", &[1, 1], &[0; 4]),
+        ],
+    );
+
+    let output = dir.join("FLUX.2-klein-base-4B.bf16.hfq");
+    import_diffusers_to_hfq(DiffusersImportOptions {
+        source,
+        output: output.clone(),
+        model_name: None,
+        max_batch: 1,
+        metadata_only: false,
+    })
+    .unwrap();
+
+    let hfq = HfqFile::open_index_only(&output).unwrap();
+    assert_eq!(hfq.arch_id, hipfire_arch_api::ARCH_ID_FLUX2);
+    for name in [
+        "transformer/tensors/x_embedder.weight",
+        "transformer/tensors/transformer_blocks.0.attn.to_q.weight",
+        "transformer/tensors/transformer_blocks.0.attn.to_k.weight",
+        "transformer/tensors/transformer_blocks.0.attn.to_v.weight",
+        "transformer/tensors/transformer_blocks.0.attn.add_q_proj.weight",
+        "transformer/tensors/transformer_blocks.0.attn.to_out.0.weight",
+        "transformer/tensors/transformer_blocks.0.ff.linear_in.weight",
+        "transformer/tensors/single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight",
+        "transformer/tensors/norm_out.shift.weight",
+        "transformer/tensors/norm_out.scale.weight",
+        "transformer/tensors/proj_out.weight",
+    ] {
+        assert!(hfq.find_tensor_info(name).is_some(), "missing {name}");
+    }
+    assert!(hfq
+        .find_tensor_info("transformer/tensors/double_blocks.0.img_attn.qkv.weight")
+        .is_none());
+    let q = cpu_tensor_from_hfq(
+        &hfq,
+        "transformer/tensors/transformer_blocks.0.attn.to_q.weight",
+    )
+    .unwrap();
+    let k = cpu_tensor_from_hfq(
+        &hfq,
+        "transformer/tensors/transformer_blocks.0.attn.to_k.weight",
+    )
+    .unwrap();
+    let v = cpu_tensor_from_hfq(
+        &hfq,
+        "transformer/tensors/transformer_blocks.0.attn.to_v.weight",
+    )
+    .unwrap();
+    assert_eq!(q.data, vec![1.0]);
+    assert_eq!(k.data, vec![2.0]);
+    assert_eq!(v.data, vec![3.0]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn local_flux2_native_and_diffusers_artifacts_have_identical_canonical_roles() {
+    let native = Path::new("/srv/huggingface/FLUX.2-klein-base-4B.bf16.p0.hfq");
+    let diffusers = Path::new("/srv/huggingface/FLUX.2-klein-base-4B.diffusers.p0.hfq");
+    if !native.is_file() || !diffusers.is_file() {
+        eprintln!("skip: local full FLUX.2 P0 artifacts are not present");
+        return;
+    }
+    let native_hfq = HfqFile::open_index_only(native).unwrap();
+    let diffusers_hfq = HfqFile::open_index_only(diffusers).unwrap();
+    assert_eq!(native_hfq.arch_id, hipfire_arch_api::ARCH_ID_FLUX2);
+    assert_eq!(native_hfq.arch_id, diffusers_hfq.arch_id);
+    let native_metadata = parse_diffusion_metadata(&native_hfq.metadata_json).unwrap();
+    let diffusers_metadata = parse_diffusion_metadata(&diffusers_hfq.metadata_json).unwrap();
+    let revision = Some("a3b4f4849157f664bdbc776fd7453c2783562f4d".to_string());
+    assert_eq!(native_metadata.pipeline.source_revision, revision);
+    assert_eq!(
+        native_metadata.pipeline.source_revision,
+        diffusers_metadata.pipeline.source_revision
+    );
+    assert_eq!(native_metadata.pipeline.latent_channels, Some(128));
+    assert_eq!(
+        native_metadata.pipeline.latent_channels,
+        diffusers_metadata.pipeline.latent_channels
+    );
+    for component in ["transformer", "text_encoder", "vae"] {
+        let roles = |metadata: &DiffusionHfqMetadata| {
+            metadata.components[component]
+                .tensor_roles
+                .iter()
+                .map(|role| role.role.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(
+            roles(&native_metadata),
+            roles(&diffusers_metadata),
+            "{component}"
+        );
+        assert!(
+            !roles(&native_metadata).is_empty(),
+            "{component} roles are empty"
+        );
+    }
+}
+
+#[test]
+fn local_sefi_full_artifact_has_canonical_flux2_and_text_tower_roles() {
+    let artifact = Path::new("/srv/huggingface/SeFi-Image-2B-turbo.sefi.bf16.hfq");
+    if !artifact.is_file() {
+        eprintln!("skip: local full SeFi artifact is not present");
+        return;
+    }
+    let hfq = HfqFile::open_index_only(artifact).unwrap();
+    assert_eq!(hfq.arch_id, hipfire_arch_api::ARCH_ID_FLUX2);
+    let metadata = parse_diffusion_metadata(&hfq.metadata_json).unwrap();
+    assert_eq!(metadata.pipeline.class_name, "SEFIInferencePipeline");
+    assert_eq!(
+        metadata.pipeline.source_revision.as_deref(),
+        Some("fa04be3b555fc5385e822a12f75e271d763f4d59")
+    );
+    assert!(metadata.pipeline.sefi);
+    assert_eq!(metadata.pipeline.semantic_channels, Some(16));
+    assert_eq!(metadata.pipeline.texture_channels, Some(128));
+    assert_eq!(metadata.pipeline.latent_channels, Some(144));
+    assert_eq!(metadata.pipeline.delta_t, Some(0.1));
+    assert_eq!(metadata.tokenizer.max_length, Some(1024));
+    let topology = transformer_denoiser_weight_topology(&metadata.components["transformer"]);
+    assert_eq!(topology.family, TransformerDenoiserFamily::Flux2);
+    assert_eq!(topology.block_count, 4);
+    assert_eq!(topology.single_block_count, 16);
+    for entry in [
+        "transformer/tensors/dual_time_embed.semantic_embedder.linear_1.weight",
+        "transformer/tensors/dual_time_embed.texture_embedder.linear_1.weight",
+        "text_encoder/tensors/language_model.embed_tokens.weight",
+        "vae/tensors/bn.running_mean",
+    ] {
+        assert!(hfq.find_tensor_info(entry).is_some(), "missing {entry}");
+    }
+    assert!(metadata.components["text_encoder"]
+        .weight_entries
+        .iter()
+        .all(|entry| !entry.contains("visual")));
+}
+
+#[test]
+fn imports_sefi_aliases_and_overrides_misleading_flux2_config() {
+    let dir = std::env::temp_dir().join(format!("hipfire-sefi-import-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let source = dir.join("snapshot");
+    for component in ["Qwen3-VL-2B-Instruct", "transformer", "vae", "scheduler"] {
+        fs::create_dir_all(source.join(component)).unwrap();
+    }
+    fs::write(
+        source.join("model_index.json"),
+        br#"{"_class_name":"SEFIInferencePipeline","transformer":"transformer/diffusion_pytorch_model*.safetensors","scheduler":"scheduler/scheduler_config.json","vae":"vae/","text_encoder":"Qwen3-VL-2B-Instruct","variant":"turbo"}"#,
+    )
+    .unwrap();
+    fs::write(
+        source.join("sefi_config.yaml"),
+        b"model:\n  transformer_scale: 2b\n  semantic_channels: 16\ntraining:\n  sefi:\n    delta_t_min: 0.1\n    delta_t_max: 0.1\n",
+    )
+    .unwrap();
+    fs::write(
+        source.join("Qwen3-VL-2B-Instruct/config.json"),
+        br#"{"architectures":["Qwen3VLForConditionalGeneration"],"text_config":{"hidden_size":2048}}"#,
+    )
+    .unwrap();
+    fs::write(source.join("Qwen3-VL-2B-Instruct/tokenizer.json"), b"{}").unwrap();
+    fs::write(
+        source.join("Qwen3-VL-2B-Instruct/tokenizer_config.json"),
+        br#"{"tokenizer_class":"Qwen2TokenizerFast","model_max_length":1024}"#,
+    )
+    .unwrap();
+    fs::write(
+        source.join("transformer/config.json"),
+        br#"{"_class_name":"Flux2Transformer2DModel","in_channels":128,"num_layers":5,"num_single_layers":20,"num_attention_heads":24,"joint_attention_dim":7680,"guidance_embeds":false}"#,
+    )
+    .unwrap();
+    fs::write(
+        source.join("vae/config.json"),
+        br#"{"_class_name":"AutoencoderKLFlux2","latent_channels":32,"patch_size":[2,2],"block_out_channels":[128,256,512,512]}"#,
+    )
+    .unwrap();
+    fs::write(
+        source.join("scheduler/scheduler_config.json"),
+        br#"{"_class_name":"FlowMatchEulerDiscreteScheduler","num_train_timesteps":1000}"#,
+    )
+    .unwrap();
+    write_safetensors_fixture(
+        &source.join("transformer/diffusion_pytorch_model.safetensors"),
+        &[
+            ("backbone.x_embedder.weight", "F32", &[1], &[0, 0, 0, 0]),
+            (
+                "dual_time_embed.semantic_embedder.linear_1.weight",
+                "F32",
+                &[1],
+                &[0, 0, 0, 0],
+            ),
+        ],
+    );
+    write_safetensors_fixture(
+        &source.join("Qwen3-VL-2B-Instruct/model.safetensors"),
+        &[
+            (
+                "model.language_model.embed_tokens.weight",
+                "F32",
+                &[1],
+                &[0, 0, 0, 0],
+            ),
+            (
+                "model.visual.patch_embed.weight",
+                "F32",
+                &[1],
+                &[0, 0, 0, 0],
+            ),
+        ],
+    );
+
+    let output = dir.join("sefi.hfq");
+    import_diffusers_to_hfq(DiffusersImportOptions {
+        source,
+        output: output.clone(),
+        model_name: Some("SeFi-Image-2B-turbo".into()),
+        max_batch: 1,
+        metadata_only: false,
+    })
+    .unwrap();
+
+    let hfq = HfqFile::open_index_only(&output).unwrap();
+    assert_eq!(hfq.arch_id, hipfire_arch_api::ARCH_ID_FLUX2);
+    let metadata = parse_diffusion_metadata(&hfq.metadata_json).unwrap();
+    assert!(metadata.pipeline.sefi);
+    assert_eq!(metadata.pipeline.latent_channels, Some(144));
+    assert_eq!(metadata.pipeline.semantic_channels, Some(16));
+    assert_eq!(metadata.pipeline.texture_channels, Some(128));
+    assert_eq!(metadata.pipeline.delta_t, Some(0.1));
+    assert_eq!(metadata.tokenizer.max_length, Some(1024));
+    assert!(hfq
+        .find_tensor_info("text_encoder/tensors/language_model.embed_tokens.weight")
+        .is_some());
+    assert!(hfq
+        .find_tensor_info("text_encoder/tensors/visual.patch_embed.weight")
+        .is_none());
+    assert!(hfq
+        .find_tensor_info("transformer/tensors/x_embedder.weight")
+        .is_some());
+    assert!(hfq.find_tensor_info("diffusers/sefi_config.yaml").is_some());
+    let (_, config_bytes) = hfq.tensor_data_vec("transformer/config.json").unwrap();
+    let config: serde_json::Value = serde_json::from_slice(&config_bytes).unwrap();
+    assert_eq!(config["in_channels"], 144);
+    assert_eq!(config["out_channels"], 144);
+    assert_eq!(config["num_attention_heads"], 20);
+    assert_eq!(config["num_layers"], 4);
+    assert_eq!(config["num_single_layers"], 16);
+    assert_eq!(config["joint_attention_dim"], 6144);
     let _ = fs::remove_dir_all(&dir);
 }
 

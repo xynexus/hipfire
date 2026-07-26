@@ -41,8 +41,9 @@
 
 pub mod ingest;
 pub use ingest::{
-    allocate, default_importance, default_precision_class, default_requires, target_bits,
-    transformer_role, CapReq, CodecCaps, Ingest, PrecisionClass, TensorRole,
+    allocate, default_importance, default_precision_class, default_requires, mmdit_role,
+    target_bits, transformer_role, CapReq, CodecCaps, ExpertLayout, Ingest, PrecisionClass,
+    TensorRole,
 };
 
 pub mod toy;
@@ -75,12 +76,32 @@ pub const ARCH_ID_GEMMA3_VL: u32 = 13;
 pub const ARCH_ID_NEMOTRON_H: u32 = 14;
 pub const ARCH_ID_MAMBA2: u32 = 15;
 pub const ARCH_ID_ZAYA: u32 = 16;
+// Diffusion denoiser families (image/video MMDiT). First-class arch ids: the
+// container header carries these instead of the legacy generic-diffusion marker.
+pub const ARCH_ID_KREA2: u32 = 17;
+pub const ARCH_ID_QWEN_IMAGE: u32 = 18;
+/// Legacy generic-diffusion container marker (ASCII-ish "DIF0"), pre-A2. Still
+/// recognized as diffusion for backward compat; never written for new containers.
+pub const ARCH_ID_DIFFUSION_LEGACY: u32 = 0x3046_4944;
+/// embeddinggemma-300m and siblings: a **bidirectional** Gemma3 encoder (non-causal
+/// attention, mean-pooling, Matryoshka dense projection heads). Serves text
+/// embeddings, not autoregressive logits — see `docs/architecture-ids.md`.
+/// (17/18 are the diffusion denoisers KREA2/QWEN_IMAGE upstream; 19 is next free.)
+pub const ARCH_ID_EMBEDDINGGEMMA: u32 = 19;
 // Speculative-decode drafter sidecar ids (NOT loadable base architectures — a
 // `.hfq` header carries one of these only when the file is a draft sidecar
 // discovered next to a base target). DFlash draft = 20 and the Qwen3.5 MTP head
 // = 21 already exist as local consts in the quantize bins (`dflash_convert.rs`,
 // `mtp_extract.rs`); the DSpark drafter sidecar takes the next free id.
 pub const ARCH_ID_DSPARK_DRAFT: u32 = 22;
+/// FLUX.2 MMDiT image denoisers, including Klein and the SeFi semantic-first
+/// variant. Pipeline metadata distinguishes the vanilla and dual-time drivers.
+pub const ARCH_ID_FLUX2: u32 = 23;
+/// Gemma 4 text core. Standard, text-only, and unified wrappers share one base
+/// identity; modality and MTP artifacts are roles/capabilities, not base ids.
+pub const ARCH_ID_GEMMA4: u32 = 24;
+/// Cohere2-MoE text models, including CohereLabs BLS Mini Code 1.0.
+pub const ARCH_ID_COHERE2_MOE: u32 = 25;
 
 impl core::fmt::Display for ArchId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -95,6 +116,26 @@ pub trait Arch: Sync + 'static {
     fn id(&self) -> ArchId;
     /// Human family name for logs/errors, e.g. `"llama"`, `"nemotron-h"`.
     fn family(&self) -> &'static str;
+
+    /// Canonical Hugging Face `model_type` aliases that resolve to this base id.
+    /// Wrapper distinctions remain in config; this list only owns offline
+    /// identity. Empty by default for families not yet migrated to name-based
+    /// detection.
+    fn model_types(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Config JSON keys that belong to a sidecar `role` (e.g. `"vl"`, `"mtp"`)
+    /// rather than the base model. When a bundle is split (`hipfire model
+    /// decompose`), these keys move OUT of the base config and INTO the role
+    /// sidecar; compose moves them back. This is what keeps a decomposed base
+    /// from advertising a feature whose tensors were carved into a sidecar
+    /// (e.g. a `vision_config` with no vision tensors). Role vocabulary matches
+    /// the compose role tags; unknown roles and arches that carry no
+    /// sidecar-specific config return `&[]` (the default).
+    fn sidecar_config_keys(&self, _role: &str) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +150,18 @@ pub trait Arch: Sync + 'static {
 pub trait BatchedPrefill: Sync + 'static {
     /// Largest prompt length accepted in a single batched prefill call.
     fn max_prefill_batch(&self) -> usize;
+}
+
+/// The arch can be served through the server-side continuous-batching runner:
+/// concurrent same-model requests fused into one `generate_batch_prefill` plus a
+/// batched decode-step lifecycle over N co-resident sessions. Distinct from
+/// [`BatchedPrefill`] (single-request prompt-in-one-forward). Presence is the
+/// "yes" that lets the serving layer route requests through the batch runner
+/// rather than the per-request path; the method carries the batch-size ceiling.
+pub trait ContinuousBatching: Sync + 'static {
+    /// Default upper bound on sessions fused into one batch (a starting value;
+    /// `HIPFIRE_SERVER_PREFILL_BATCH_MAX` still overrides at runtime).
+    fn max_batch_sessions(&self) -> usize;
 }
 
 /// The arch supports a speculative-decode *chain* drafter (linear draft of N
@@ -127,15 +180,37 @@ pub trait ToyModel: Sync + 'static {
     /// quantizer renders it into a loadable HF model dir (safetensors + config +
     /// shared tokenizer) and then quantizes it on the normal `--input` path.
     fn fixture(&self, seed: u64) -> ToyFixture;
+
+    /// Named fixture variants. Most architectures expose only `default`; a
+    /// family may keep multiple structurally distinct tinies local to its spec.
+    fn fixture_names(&self) -> &'static [&'static str] {
+        &["default"]
+    }
+
+    /// Resolve a named variant without growing a quantizer family match arm.
+    fn fixture_named(&self, name: &str, seed: u64) -> Option<ToyFixture> {
+        (name == "default").then(|| self.fixture(seed))
+    }
+}
+
+/// The arch is a diffusion (image/video) denoiser rather than a text LM. Presence
+/// of this capability is how routing tells diffusion containers apart from language
+/// models — a data-driven replacement for the legacy magic `arch_id` constant, so
+/// diffusion families can share the small-integer id space with LLMs.
+pub trait Diffusion: Sync + 'static {
+    /// Stable denoiser family tag, e.g. `"krea2-mmdit"`, `"qwen-image-mmdit"`.
+    fn denoiser_family(&self) -> &'static str;
 }
 
 /// Per-arch capability table: `Some(&dyn Cap)` iff the arch declared it. Built at
 /// registry construction from the arch's `register_arch!` list.
 pub struct Caps {
     pub batched_prefill: Option<&'static dyn BatchedPrefill>,
+    pub continuous_batching: Option<&'static dyn ContinuousBatching>,
     pub spec_decode_chain: Option<&'static dyn SpecDecodeChain>,
     pub toy_model: Option<&'static dyn ToyModel>,
     pub ingest: Option<&'static dyn Ingest>,
+    pub diffusion: Option<&'static dyn Diffusion>,
 }
 
 impl Caps {
@@ -143,9 +218,11 @@ impl Caps {
     pub const fn none() -> Self {
         Caps {
             batched_prefill: None,
+            continuous_batching: None,
             spec_decode_chain: None,
             toy_model: None,
             ingest: None,
+            diffusion: None,
         }
     }
 
@@ -167,9 +244,11 @@ impl Caps {
             };
         }
         merge_field!(batched_prefill);
+        merge_field!(continuous_batching);
         merge_field!(spec_decode_chain);
         merge_field!(toy_model);
         merge_field!(ingest);
+        merge_field!(diffusion);
     }
 }
 
@@ -193,6 +272,7 @@ pub use inventory;
 pub struct RegisteredArch {
     pub id: ArchId,
     pub family: &'static str,
+    pub model_types: Vec<&'static str>,
     pub base: &'static dyn Arch,
     pub caps: Caps,
 }
@@ -216,13 +296,32 @@ impl ArchRegistry {
             // unioning their capability tables. Conflicting claims panic.
             if let Some(existing) = archs.iter_mut().find(|a| a.id == id) {
                 existing.caps.merge_from(caps, id);
+                for &model_type in entry.base.model_types() {
+                    if !existing.model_types.contains(&model_type) {
+                        existing.model_types.push(model_type);
+                    }
+                }
             } else {
                 archs.push(RegisteredArch {
                     id,
                     family: entry.base.family(),
+                    model_types: entry.base.model_types().to_vec(),
                     base: entry.base,
                     caps,
                 });
+            }
+        }
+        for arch in &archs {
+            for &model_type in &arch.model_types {
+                if let Some(other) = archs
+                    .iter()
+                    .find(|other| other.id != arch.id && other.model_types.contains(&model_type))
+                {
+                    panic!(
+                        "model_type `{model_type}` registered for both {} and {}",
+                        arch.id, other.id
+                    );
+                }
             }
         }
         ArchRegistry { archs }
@@ -231,6 +330,26 @@ impl ArchRegistry {
     /// The registered arch for `id`, if any is linked in.
     pub fn get(&self, id: ArchId) -> Option<&RegisteredArch> {
         self.archs.iter().find(|a| a.id == id)
+    }
+
+    /// Resolve a canonical Hugging Face `model_type` through linked arch specs.
+    pub fn find_by_model_type(&self, model_type: &str) -> Option<&RegisteredArch> {
+        self.archs
+            .iter()
+            .find(|arch| arch.model_types.contains(&model_type))
+    }
+
+    /// True if `id` is a registered diffusion denoiser arch (declares the
+    /// [`Diffusion`] capability). Routing uses this instead of a magic id.
+    pub fn is_diffusion(&self, id: ArchId) -> bool {
+        self.get(id).is_some_and(|a| a.caps.diffusion.is_some())
+    }
+
+    /// The denoiser family tag for `id`, if it is a registered diffusion arch.
+    pub fn diffusion_family(&self, id: ArchId) -> Option<&'static str> {
+        self.get(id)
+            .and_then(|a| a.caps.diffusion)
+            .map(|d| d.denoiser_family())
     }
 
     /// Iterate every registered arch (used by the completeness gate).
@@ -257,6 +376,10 @@ macro_rules! __set_cap {
         $caps.batched_prefill =
             ::core::option::Option::Some($inst as &'static dyn $crate::BatchedPrefill);
     };
+    ($caps:ident, $inst:expr, ContinuousBatching) => {
+        $caps.continuous_batching =
+            ::core::option::Option::Some($inst as &'static dyn $crate::ContinuousBatching);
+    };
     ($caps:ident, $inst:expr, SpecDecodeChain) => {
         $caps.spec_decode_chain =
             ::core::option::Option::Some($inst as &'static dyn $crate::SpecDecodeChain);
@@ -266,6 +389,9 @@ macro_rules! __set_cap {
     };
     ($caps:ident, $inst:expr, Ingest) => {
         $caps.ingest = ::core::option::Option::Some($inst as &'static dyn $crate::Ingest);
+    };
+    ($caps:ident, $inst:expr, Diffusion) => {
+        $caps.diffusion = ::core::option::Option::Some($inst as &'static dyn $crate::Diffusion);
     };
     ($caps:ident, $inst:expr, $other:ident) => {
         ::core::compile_error!(::core::concat!(

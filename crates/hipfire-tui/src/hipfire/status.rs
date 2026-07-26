@@ -193,35 +193,35 @@ fn parse_etc_hosts() -> Vec<(String, String)> {
 }
 
 pub fn start_background_serve() -> Result<()> {
-    Command::new("hipfire")
-        .arg("serve")
+    run_hipfire_control(&["start", "--wait-secs", "0"])
+}
+
+pub fn stop_background_serve() -> Result<()> {
+    run_hipfire_control(&["stop"])
+}
+
+pub fn restart_background_serve() -> Result<()> {
+    run_hipfire_control(&["restart", "--wait-secs", "0"])
+}
+
+fn run_hipfire_control(args: &[&str]) -> Result<()> {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hipfire"));
+    let status = Command::new(&exe)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| anyhow!("failed to launch `hipfire serve`: {err}"))?;
-    Ok(())
-}
-
-/// Send SIGTERM to the given PIDs (graceful stop). Returns how many signals
-/// were dispatched without error.
-pub fn stop_pids(pids: &[u32]) -> Result<usize> {
-    if pids.is_empty() {
-        return Err(anyhow!("no running process to stop"));
+        .status()
+        .map_err(|err| anyhow!("failed to run `{}`: {err}", exe.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "`{} {}` exited with {status}",
+            exe.display(),
+            args.join(" ")
+        ))
     }
-    let mut stopped = 0;
-    for pid in pids {
-        let ok = Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            stopped += 1;
-        }
-    }
-    Ok(stopped)
 }
 
 fn probe_health(config: &ConfigState) -> (bool, String) {

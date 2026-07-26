@@ -38,8 +38,8 @@
 #   ./tests/coherence-gate-dflash.sh --fast   # 2 tests (1 prose + 1 code, dflash only) — ~1 min
 #   ./tests/coherence-gate-dflash.sh --full   # add ddtree b22-k4 + b8-k2 — ~6-8 min
 #
-# --fast is for pre-commit on $SPEC_HOTSPOT match (down from full short battery).
-# Force-full via HIPFIRE_FORCE_SPEC_GATE=1.
+# This is an explicit diagnostic, not an automatic commit gate. Use --fast for
+# a quick manual probe and --full for the extended DDTree variants.
 #
 # Set HIPFIRE_DFLASH_AR_PARITY=1 to rerun DFlash cases through --ar-baseline
 # and hard-fail on token-list mismatch. This is stricter than the default
@@ -122,7 +122,7 @@ rebuild=0
 if [ ! -x "$EXE" ]; then
     rebuild=1
 else
-    for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
+    for src in crates/hipfire-arch-qwen35/src/qwen35/*.rs crates/hipfire-runtime/src/llama.rs \
                crates/hipfire-runtime/src/dflash.rs crates/hipfire-arch-qwen35/src/speculative.rs \
                crates/hipfire-runtime/src/ddtree.rs crates/hipfire-runtime/examples/dflash_spec_demo.rs \
                crates/hipfire-rdna/src/dispatch.rs; do

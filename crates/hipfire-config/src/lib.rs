@@ -4,6 +4,7 @@
 
 //! Shared CLI/server configuration and local filesystem paths.
 
+pub mod editor;
 pub mod resolve;
 pub mod schema;
 
@@ -12,6 +13,11 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+pub use editor::{
+    apply_config_edit, build_config_editor_snapshot, build_config_editor_snapshot_from_paths,
+    cycle_editor_value, encode_editor_value, ConfigEditOperation, ConfigEditRequest,
+    ConfigEditTarget, ConfigEditorPaths, ConfigEditorRow, ConfigEditorSnapshot,
+};
 pub use resolve::{
     config_layers_from_document, config_layers_from_documents, resolve_config_layers, ConfigLayer,
     ConfigLayerKind, ConfigResolution, ConfigValueSource, ResolvedConfigValue, UnknownConfigKey,
@@ -33,14 +39,40 @@ fn default_cors_allowed_origins() -> Vec<String> {
 fn default_admin_user() -> String {
     "admin".to_string()
 }
+fn default_api_auth_mode() -> ApiAuthMode {
+    ApiAuthMode::Auto
+}
 fn default_sdapi_output_root() -> String {
     "/tmp/hipfire-sdapi".to_string()
+}
+// SD API request-geometry caps. These bound `batch × channels × height ×
+// width` allocations on the network-facing routes, so they are the admin's
+// DoS ceiling. Defaults are portability-safe for the smallest supported GPU
+// class (UMA APUs); clients may request smaller, never larger. `pub` so the
+// server can reuse them as the canonical default for its in-memory limits.
+pub fn default_sdapi_max_dimension() -> u32 {
+    4096
+}
+pub fn default_sdapi_max_steps() -> u32 {
+    200
+}
+pub fn default_sdapi_max_batch_size() -> u32 {
+    8
+}
+pub fn default_sdapi_max_n_iter() -> u32 {
+    16
+}
+pub fn default_sdapi_max_total_batches() -> u32 {
+    32
 }
 fn default_max_seq() -> u32 {
     8192
 }
 fn default_max_tokens() -> u32 {
     512
+}
+fn default_prewarm_priority() -> u32 {
+    0
 }
 fn default_temperature() -> f64 {
     0.3
@@ -51,8 +83,23 @@ fn default_top_p() -> f64 {
 fn default_repeat_penalty() -> f64 {
     1.05
 }
-fn default_idle_timeout() -> u32 {
-    300
+fn default_resource_lock_enabled() -> bool {
+    true
+}
+fn default_resource_lock_gpus() -> Vec<String> {
+    vec!["auto".to_string()]
+}
+fn default_resource_lock_npus() -> Vec<String> {
+    Vec::new()
+}
+fn default_resource_lock_wait_ms() -> u32 {
+    0
+}
+fn default_scheduler_memory_budget_bytes() -> u64 {
+    0
+}
+fn default_model_residency_mode() -> String {
+    "auto".to_string()
 }
 fn default_kv_cache() -> String {
     "auto".to_string()
@@ -139,6 +186,26 @@ fn default_prefill_sparse_threshold() -> u32 {
     32768
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiAuthMode {
+    Auto,
+    Off,
+    Optional,
+    Required,
+}
+
+impl std::fmt::Display for ApiAuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+            Self::Optional => "optional",
+            Self::Required => "required",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HipfireConfig {
     #[serde(default = "default_host")]
@@ -155,13 +222,49 @@ pub struct HipfireConfig {
     /// lands in `~/.hipfire/admin.passwd`).
     #[serde(default = "default_admin_user")]
     pub admin_user: String,
+    /// API credential rollout policy. `auto` preserves anonymous loopback
+    /// compatibility and requires credentials for non-loopback binds.
+    #[serde(default = "default_api_auth_mode")]
+    pub api_auth_mode: ApiAuthMode,
+    /// Explicitly acknowledge an unauthenticated non-loopback bind when
+    /// `api_auth_mode` is `off` or `optional`.
+    #[serde(default)]
+    pub unsafe_allow_unauthenticated_remote: bool,
     /// Root directory for images saved by the SD API compatibility routes
     /// (`save_images: true`). Client-supplied `outdir_*` override_settings
     /// are ignored; every SD API image write stays under this root.
     #[serde(default = "default_sdapi_output_root")]
     pub sdapi_output_root: String,
+    /// Upper bound on any single SD API dimension (width/height and their
+    /// highres/firstphase variants). Client requests above it get a 400.
+    #[serde(default = "default_sdapi_max_dimension")]
+    pub sdapi_max_dimension: u32,
+    /// Upper bound on SD API step counts (steps and hr_second_pass_steps).
+    #[serde(default = "default_sdapi_max_steps")]
+    pub sdapi_max_steps: u32,
+    /// Upper bound on SD API `batch_size`.
+    #[serde(default = "default_sdapi_max_batch_size")]
+    pub sdapi_max_batch_size: u32,
+    /// Upper bound on SD API `n_iter`.
+    #[serde(default = "default_sdapi_max_n_iter")]
+    pub sdapi_max_n_iter: u32,
+    /// Upper bound on `batch_size × n_iter` (total images per request).
+    #[serde(default = "default_sdapi_max_total_batches")]
+    pub sdapi_max_total_batches: u32,
+    /// Primary local model root. When unset, Hipfire uses
+    /// `~/.hipfire/models`.
+    #[serde(default)]
+    pub models_dir: Option<String>,
+    /// Optional extra read-only model root (e.g. an NFS share such as
+    /// `/srv/hipfire`). When set, the network-facing server routes resolve
+    /// model identifiers within this root in addition to `models_dir`.
+    /// Unset by default; local CLI/eval callers are unaffected.
+    #[serde(default)]
+    pub models_network_dir: Option<String>,
     #[serde(default)]
     pub default_model: Option<String>,
+    #[serde(default = "default_prewarm_priority")]
+    pub prewarm_priority: u32,
     #[serde(default = "default_max_seq")]
     pub max_seq: u32,
     #[serde(default = "default_max_tokens")]
@@ -172,8 +275,24 @@ pub struct HipfireConfig {
     pub top_p: f64,
     #[serde(default = "default_repeat_penalty")]
     pub repeat_penalty: f64,
-    #[serde(default = "default_idle_timeout")]
-    pub idle_timeout: u32,
+    #[serde(default = "default_resource_lock_enabled")]
+    pub resource_lock_enabled: bool,
+    #[serde(default = "default_resource_lock_gpus")]
+    pub resource_lock_gpus: Vec<String>,
+    #[serde(default = "default_resource_lock_npus")]
+    pub resource_lock_npus: Vec<String>,
+    #[serde(default = "default_resource_lock_wait_ms")]
+    pub resource_lock_wait_ms: u32,
+    #[serde(default = "default_scheduler_memory_budget_bytes")]
+    pub scheduler_system_memory_budget_bytes: u64,
+    #[serde(default = "default_scheduler_memory_budget_bytes")]
+    pub scheduler_system_memory_headroom_bytes: u64,
+    #[serde(default = "default_scheduler_memory_budget_bytes")]
+    pub scheduler_vram_budget_bytes: u64,
+    #[serde(default = "default_scheduler_memory_budget_bytes")]
+    pub scheduler_vram_headroom_bytes: u64,
+    #[serde(default = "default_model_residency_mode")]
+    pub model_residency_mode: String,
     #[serde(default = "default_kv_cache")]
     pub kv_cache: String,
     #[serde(default = "default_kv_adaptive")]
@@ -331,14 +450,32 @@ impl Default for HipfireConfig {
             port: default_port(),
             cors_allowed_origins: default_cors_allowed_origins(),
             admin_user: default_admin_user(),
+            api_auth_mode: default_api_auth_mode(),
+            unsafe_allow_unauthenticated_remote: false,
             sdapi_output_root: default_sdapi_output_root(),
+            sdapi_max_dimension: default_sdapi_max_dimension(),
+            sdapi_max_steps: default_sdapi_max_steps(),
+            sdapi_max_batch_size: default_sdapi_max_batch_size(),
+            sdapi_max_n_iter: default_sdapi_max_n_iter(),
+            sdapi_max_total_batches: default_sdapi_max_total_batches(),
+            models_dir: None,
+            models_network_dir: None,
             default_model: None,
+            prewarm_priority: default_prewarm_priority(),
             max_seq: default_max_seq(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
             top_p: default_top_p(),
             repeat_penalty: default_repeat_penalty(),
-            idle_timeout: default_idle_timeout(),
+            resource_lock_enabled: default_resource_lock_enabled(),
+            resource_lock_gpus: default_resource_lock_gpus(),
+            resource_lock_npus: default_resource_lock_npus(),
+            resource_lock_wait_ms: default_resource_lock_wait_ms(),
+            scheduler_system_memory_budget_bytes: default_scheduler_memory_budget_bytes(),
+            scheduler_system_memory_headroom_bytes: default_scheduler_memory_budget_bytes(),
+            scheduler_vram_budget_bytes: default_scheduler_memory_budget_bytes(),
+            scheduler_vram_headroom_bytes: default_scheduler_memory_budget_bytes(),
+            model_residency_mode: default_model_residency_mode(),
             kv_cache: default_kv_cache(),
             kv_adaptive: default_kv_adaptive(),
             flash_mode: default_flash_mode(),
@@ -392,6 +529,15 @@ pub fn host_config_path() -> PathBuf {
 
 pub fn models_dir() -> PathBuf {
     hipfire_dir().join("models")
+}
+
+pub fn configured_models_dir(config: &HipfireConfig) -> PathBuf {
+    config
+        .models_dir
+        .as_deref()
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(models_dir)
 }
 
 /// Path to the local admin bearer secret. Same-box clients (CLI/TUI) read
@@ -711,12 +857,22 @@ mod tests {
         assert_eq!(cfg.port, 11435);
         assert!(cfg.cors_allowed_origins.is_empty());
         assert_eq!(cfg.admin_user, "admin");
+        assert_eq!(cfg.api_auth_mode, ApiAuthMode::Auto);
+        assert!(!cfg.unsafe_allow_unauthenticated_remote);
         assert_eq!(cfg.max_seq, 8192);
         assert_eq!(cfg.max_tokens, 512);
         assert_eq!(cfg.temperature, 0.3);
         assert_eq!(cfg.top_p, 0.8);
         assert_eq!(cfg.repeat_penalty, 1.05);
-        assert_eq!(cfg.idle_timeout, 300);
+        assert!(cfg.resource_lock_enabled);
+        assert_eq!(cfg.resource_lock_gpus, vec!["auto".to_string()]);
+        assert!(cfg.resource_lock_npus.is_empty());
+        assert_eq!(cfg.resource_lock_wait_ms, 0);
+        assert_eq!(cfg.scheduler_system_memory_budget_bytes, 0);
+        assert_eq!(cfg.scheduler_system_memory_headroom_bytes, 0);
+        assert_eq!(cfg.scheduler_vram_budget_bytes, 0);
+        assert_eq!(cfg.scheduler_vram_headroom_bytes, 0);
+        assert_eq!(cfg.model_residency_mode, "auto");
         assert_eq!(cfg.kv_cache, "auto");
         assert_eq!(cfg.kv_adaptive, "off");
         assert_eq!(cfg.flash_mode, "auto");
@@ -747,6 +903,53 @@ mod tests {
         assert_eq!(cfg.prefill_drafter_device, -1);
         assert!(!cfg.prefill_profile);
         assert_eq!(cfg.prefill_sparse_threshold, 32768);
+        assert_eq!(cfg.sdapi_max_dimension, 4096);
+        assert_eq!(cfg.sdapi_max_steps, 200);
+        assert_eq!(cfg.sdapi_max_batch_size, 8);
+        assert_eq!(cfg.sdapi_max_n_iter, 16);
+        assert_eq!(cfg.sdapi_max_total_batches, 32);
+        assert_eq!(cfg.models_dir, None);
+        assert_eq!(cfg.models_network_dir, None);
+        assert_eq!(configured_models_dir(&cfg), models_dir());
+    }
+
+    #[test]
+    fn loaded_config_preserves_sdapi_caps_and_model_dirs() {
+        // Regression: these fields must be registered in `config_schema()`, or
+        // the schema-driven `from_config` round-trip silently drops any
+        // admin-set value and the SD API caps / model roots never take
+        // effect. Set non-default values and require they survive.
+        let mut cfg = HipfireConfig::default();
+        cfg.sdapi_max_dimension = 2048;
+        cfg.sdapi_max_steps = 40;
+        cfg.sdapi_max_batch_size = 4;
+        cfg.sdapi_max_n_iter = 4;
+        cfg.sdapi_max_total_batches = 8;
+        cfg.api_auth_mode = ApiAuthMode::Required;
+        cfg.unsafe_allow_unauthenticated_remote = true;
+        cfg.models_dir = Some("/data/hipfire/models".to_string());
+        cfg.models_network_dir = Some("/srv/hipfire".to_string());
+
+        let loaded = LoadedConfig::from_config(cfg);
+        assert_eq!(loaded.config.sdapi_max_dimension, 2048);
+        assert_eq!(loaded.config.sdapi_max_steps, 40);
+        assert_eq!(loaded.config.sdapi_max_batch_size, 4);
+        assert_eq!(loaded.config.sdapi_max_n_iter, 4);
+        assert_eq!(loaded.config.sdapi_max_total_batches, 8);
+        assert_eq!(loaded.config.api_auth_mode, ApiAuthMode::Required);
+        assert!(loaded.config.unsafe_allow_unauthenticated_remote);
+        assert_eq!(
+            loaded.config.models_dir.as_deref(),
+            Some("/data/hipfire/models")
+        );
+        assert_eq!(
+            loaded.config.models_network_dir.as_deref(),
+            Some("/srv/hipfire")
+        );
+        assert_eq!(
+            configured_models_dir(&loaded.config),
+            PathBuf::from("/data/hipfire/models")
+        );
     }
 
     #[test]

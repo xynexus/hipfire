@@ -1,0 +1,2 @@
+variant,max_core_text_bytes,headroom_vs_r25_bytes,cosine,max_abs,status,notes
+r96-compact-down-fragment-ring,12944,3440,0.99999662,0.0041370,capacity-admitted,full-FFN oracle retained; no sustained timing claim

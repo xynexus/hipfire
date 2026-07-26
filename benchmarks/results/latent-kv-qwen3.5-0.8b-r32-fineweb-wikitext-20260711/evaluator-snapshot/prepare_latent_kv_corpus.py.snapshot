@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Build deterministic latent-KV calibration/validation JSONL corpora."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+from pathlib import Path
+
+import pyarrow.parquet as pq
+
+
+FINEWEB_REVISION = "9bb295ddab0e05d785b879661af7260fed5140fc"
+WIKITEXT_REVISION = "b08601e04326c79dfdd32d625aee71d232d685c3"
+TOP_HEADING = re.compile(r"^ = [^=].* = \n$")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def fineweb_records(path: Path, *, min_chars: int, limit: int) -> list[dict]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    records = []
+    for source_index, wrapped in enumerate(payload.get("rows", [])):
+        row = wrapped.get("row") or {}
+        text = row.get("text")
+        if not isinstance(text, str) or len(text) < min_chars:
+            continue
+        records.append(
+            {
+                "text": text,
+                "source": "HuggingFaceFW/fineweb",
+                "source_revision": FINEWEB_REVISION,
+                "source_config": "sample-10BT",
+                "source_split": "train",
+                "source_row": 40000 + source_index,
+                "source_id": row.get("id"),
+                "source_url": row.get("url"),
+            }
+        )
+        if len(records) == limit:
+            break
+    if len(records) < limit:
+        raise ValueError(f"FineWeb input yielded {len(records)} records, need {limit}")
+    return records
+
+
+def wikitext_articles(path: Path, *, min_chars: int, limit: int) -> list[dict]:
+    lines = pq.read_table(path, columns=["text"]).column("text").to_pylist()
+    articles: list[str] = []
+    current: list[str] = []
+    for line in lines:
+        if TOP_HEADING.match(line):
+            if current:
+                articles.append("\n".join(current))
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        articles.append("\n".join(current))
+
+    records = []
+    for source_index, text in enumerate(articles):
+        if len(text) < min_chars:
+            continue
+        records.append(
+            {
+                "text": text,
+                "source": "Salesforce/wikitext",
+                "source_revision": WIKITEXT_REVISION,
+                "source_config": "wikitext-103-raw-v1",
+                "source_split": "test",
+                "source_article": source_index,
+                "source_title": text.splitlines()[0].strip(),
+            }
+        )
+        if len(records) == limit:
+            break
+    if len(records) < limit:
+        raise ValueError(f"WikiText input yielded {len(records)} records, need {limit}")
+    return records
+
+
+def write_jsonl(path: Path, records: list[dict]) -> None:
+    content = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+    path.write_text(content, encoding="utf-8")
+
+
+def file_record(path: Path, records: int) -> dict:
+    return {
+        "path": str(path.resolve()),
+        "bytes": path.stat().st_size,
+        "sha256": sha256_file(path),
+        "records": records,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fineweb-rows", type=Path, required=True)
+    parser.add_argument("--wikitext-parquet", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--calibration-records", type=int, default=64)
+    parser.add_argument("--validation-records", type=int, default=16)
+    parser.add_argument("--min-calibration-chars", type=int, default=1024)
+    parser.add_argument("--min-validation-chars", type=int, default=4096)
+    args = parser.parse_args()
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    calibration = fineweb_records(
+        args.fineweb_rows,
+        min_chars=args.min_calibration_chars,
+        limit=args.calibration_records,
+    )
+    validation = wikitext_articles(
+        args.wikitext_parquet,
+        min_chars=args.min_validation_chars,
+        limit=args.validation_records,
+    )
+    calibration_path = args.output_dir / "fineweb-calibration.jsonl"
+    validation_path = args.output_dir / "wikitext103-test-validation.jsonl"
+    write_jsonl(calibration_path, calibration)
+    write_jsonl(validation_path, validation)
+
+    manifest = {
+        "schema": "hipfire.latent_kv_corpus.v0",
+        "strict_split": True,
+        "sources": {
+            "calibration": {
+                "dataset": "HuggingFaceFW/fineweb",
+                "revision": FINEWEB_REVISION,
+                "config": "sample-10BT",
+                "split": "train",
+                "viewer_offset": 40000,
+                "license": "ODC-By-1.0; also subject to CommonCrawl Terms of Use",
+                "raw": file_record(args.fineweb_rows, 100),
+            },
+            "validation": {
+                "dataset": "Salesforce/wikitext",
+                "revision": WIKITEXT_REVISION,
+                "config": "wikitext-103-raw-v1",
+                "split": "test",
+                "license": "CC-BY-SA-3.0 and GFDL",
+                "raw": file_record(args.wikitext_parquet, 4358),
+            },
+        },
+        "outputs": {
+            "calibration": file_record(calibration_path, len(calibration)),
+            "validation": file_record(validation_path, len(validation)),
+        },
+    }
+    manifest_path = args.output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"manifest": str(manifest_path), **manifest["outputs"]}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

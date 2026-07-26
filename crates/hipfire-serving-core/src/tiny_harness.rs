@@ -21,17 +21,29 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use hipfire_dispatch::pipeline::superop::LoweredForward;
 use hipfire_rdna::Gpu;
 
+use hipfire_runtime::arch::{Architecture, SimpleAr};
 use hipfire_runtime::calibration::CalibCollector;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::weights::WeightTensor;
 
+use hipfire_arch_deepseek4 as deepseek4;
+use hipfire_arch_dots_ocr as dots_ocr_arch;
+use hipfire_arch_dots_ocr::image as dots_image;
 use hipfire_arch_gemma3 as gemma3;
+use hipfire_arch_gemma3_vl as gemma3_vl;
+use hipfire_arch_gemma4 as gemma4;
+#[cfg(feature = "arch-lfm2moe")]
+use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
+use hipfire_arch_nemotron::{model::NemotronModel, NemotronHConfig};
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+use hipfire_arch_qwen35_vl as qwen35_vl_arch;
+use hipfire_arch_zaya::{arch::ZayaModel, calibration as zaya_calib, gpu as zaya_gpu, ZayaConfig};
 // LLaMA/Mistral (arch 0/1) live in the runtime crate (HFQ config + loader +
 // forward), surfaced via the hipfire-arch-llama Architecture impl.
 use hipfire_runtime::llama::{self, ForwardScratch, LlamaConfig, LlamaWeights};
@@ -41,10 +53,24 @@ use hipfire_runtime::llama::{self, ForwardScratch, LlamaConfig, LlamaWeights};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TinyArch {
     Qwen35,
+    Qwen35Vl,
     Qwen35Moe,
+    Deepseek4,
+    Deepseek4Compressed,
+    Deepseek4Mtp,
+    DotsOcr,
     Qwen2,
     Gemma3,
+    Gemma3Vl,
+    Gemma4Dense,
+    Gemma4Ple,
+    Gemma4Moe,
+    #[cfg(feature = "arch-lfm2moe")]
+    Lfm2Moe,
     MiniMax,
+    NemotronH,
+    Mamba2,
+    Zaya,
     Llama,
 }
 
@@ -57,13 +83,33 @@ impl TinyArch {
             .as_str()
         {
             "qwen3_5" | "qwen35" | "qwen3_5_text" => Ok(Self::Qwen35),
+            "qwen3_5_vl" | "qwen35_vl" | "qwen3_5_vision_language" => Ok(Self::Qwen35Vl),
             "qwen3_5_moe" | "qwen35moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35Moe),
+            "deepseek4" | "deepseek_v4" | "deepseek4_flash" | "deepseek_v4_flash" => {
+                Ok(Self::Deepseek4)
+            }
+            "deepseek4_compressed" | "deepseek4_compressed_kv" => Ok(Self::Deepseek4Compressed),
+            "deepseek4_mtp" | "deepseek4_mtp_draft" | "deepseek_v4_mtp" => {
+                Ok(Self::Deepseek4Mtp)
+            }
+            "dots_ocr" | "dotsocr" | "dots_ocr_text" => Ok(Self::DotsOcr),
             "qwen2" => Ok(Self::Qwen2),
             "gemma3" | "gemma3_text" => Ok(Self::Gemma3),
+            "gemma3_vl" | "gemma3_vl_text" => Ok(Self::Gemma3Vl),
+            "gemma4" | "gemma4_dense" | "gemma4_text" => Ok(Self::Gemma4Dense),
+            "gemma4_ple" | "gemma4_ple_sharing" | "gemma4_ple_text" => Ok(Self::Gemma4Ple),
+            "gemma4_moe" | "gemma4_dense_moe" | "gemma4_moe_text" => Ok(Self::Gemma4Moe),
+            #[cfg(feature = "arch-lfm2moe")]
+            "lfm2" | "lfm2_moe" | "lfm2moe" | "lfm2_moe_text" => Ok(Self::Lfm2Moe),
             "minimax" | "minimax_m2" => Ok(Self::MiniMax),
-            "llama" | "mistral" => Ok(Self::Llama),
+            "nemotron_h" | "nemotron" => Ok(Self::NemotronH),
+            "mamba2" | "mamba_2" => Ok(Self::Mamba2),
+            "zaya" | "zaya1" | "zaya1_text" => Ok(Self::Zaya),
+            "llama" | "mistral" | "qwen3_legacy" | "qwen3_legacy_text" | "qwen3" => {
+                Ok(Self::Llama)
+            }
             other => Err(format!(
-                "unknown --arch '{other}' (qwen3_5|qwen3_5_moe|qwen2|gemma3|minimax|llama)"
+                "unknown --arch '{other}' (qwen3_5|qwen3_5_vl|qwen3_5_moe|deepseek4|deepseek4_compressed|deepseek4_mtp|dots_ocr|qwen2|gemma3|gemma3_vl|gemma4_dense|gemma4_ple|gemma4_moe|lfm2_moe|minimax|nemotron_h|mamba2|zaya|llama)"
             )),
         }
     }
@@ -72,21 +118,44 @@ impl TinyArch {
     pub fn arch_id(self) -> u32 {
         match self {
             Self::Llama => 0,
-            Self::Qwen35 => 5,
+            Self::Qwen35 | Self::Qwen35Vl => 5,
             Self::Qwen35Moe => 6,
+            Self::Deepseek4 | Self::Deepseek4Compressed | Self::Deepseek4Mtp => 9,
+            Self::DotsOcr => 8,
             Self::Qwen2 => 7,
             Self::MiniMax => 10,
+            #[cfg(feature = "arch-lfm2moe")]
+            Self::Lfm2Moe => 11,
             Self::Gemma3 => 12,
+            Self::Gemma3Vl => 13,
+            Self::NemotronH => 14,
+            Self::Mamba2 => 15,
+            Self::Zaya => 16,
+            Self::Gemma4Dense | Self::Gemma4Ple | Self::Gemma4Moe => 24,
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Qwen35 => "qwen3_5",
+            Self::Qwen35Vl => "qwen3_5_vl",
             Self::Qwen35Moe => "qwen3_5_moe",
+            Self::Deepseek4 => "deepseek4",
+            Self::Deepseek4Compressed => "deepseek4_compressed",
+            Self::Deepseek4Mtp => "deepseek4_mtp",
+            Self::DotsOcr => "dots_ocr",
             Self::Qwen2 => "qwen2",
             Self::Gemma3 => "gemma3",
+            Self::Gemma3Vl => "gemma3_vl",
+            Self::Gemma4Dense => "gemma4_dense",
+            Self::Gemma4Ple => "gemma4_ple",
+            Self::Gemma4Moe => "gemma4_moe",
+            #[cfg(feature = "arch-lfm2moe")]
+            Self::Lfm2Moe => "lfm2_moe",
             Self::MiniMax => "minimax",
+            Self::NemotronH => "nemotron_h",
+            Self::Mamba2 => "mamba2",
+            Self::Zaya => "zaya",
             Self::Llama => "llama",
         }
     }
@@ -102,20 +171,72 @@ pub enum TinyModel {
         dn: DeltaNetState,
         scratch: Qwen35Scratch,
     },
+    Qwen35Vl {
+        config: qwen35::Qwen35Config,
+        weights: qwen35::Qwen35Weights,
+        kv: KvCache,
+        dn: DeltaNetState,
+        scratch: Qwen35Scratch,
+        vision_config: qwen35_vl_arch::qwen35_vl::VisionConfig,
+        vision_weights: qwen35_vl_arch::qwen35_vl::VisionWeights,
+        visual_tokens: Option<Vec<f32>>,
+    },
     Qwen2 {
         config: qwen2::Qwen2Config,
         weights: qwen2::Qwen2Weights,
         state: qwen2::Qwen2State,
+    },
+    DotsOcr {
+        config: dots_ocr_arch::dots_ocr::DotsOcrConfig,
+        weights: dots_ocr_arch::dots_ocr::DotsOcrWeights,
+        state: qwen2::Qwen2State,
+        visual_tokens: Option<Vec<f32>>,
+    },
+    Deepseek4 {
+        config: deepseek4::DeepseekV4Config,
+        weights: deepseek4::DeepseekV4Weights,
+        state: deepseek4::DeepseekV4State,
+    },
+    Deepseek4Mtp {
+        config: deepseek4::DeepseekV4Config,
+        weights: deepseek4::DeepseekV4Weights,
+        state: deepseek4::DeepseekV4State,
     },
     Gemma3 {
         config: gemma3::Gemma3Config,
         weights: gemma3::Gemma3Weights,
         state: gemma3::Gemma3State,
     },
+    Gemma3Vl {
+        loaded: gemma3_vl::LoadedVl,
+        state: gemma3::Gemma3State,
+        image_embeddings: Option<Vec<f32>>,
+    },
+    Gemma4 {
+        config: gemma4::Gemma4Config,
+        weights: gemma4::Gemma4DenseWeights,
+        state: gemma4::Gemma4DenseState,
+        lowered: LoweredForward,
+    },
     MiniMax {
         config: minimax::MiniMaxConfig,
         weights: minimax::MiniMaxWeights,
         state: minimax::MiniMaxState,
+    },
+    #[cfg(feature = "arch-lfm2moe")]
+    Lfm2Moe {
+        config: lfm2moe::Lfm2MoeConfig,
+        weights: lfm2moe::Lfm2MoeWeights,
+        state: lfm2moe::Lfm2MoeState,
+    },
+    NemotronH {
+        model: NemotronModel,
+    },
+    Mamba2 {
+        model: NemotronModel,
+    },
+    Zaya {
+        model: ZayaModel,
     },
     Llama {
         config: LlamaConfig,
@@ -123,6 +244,72 @@ pub enum TinyModel {
         kv: KvCache,
         scratch: ForwardScratch,
     },
+}
+
+fn qwen35_vl_synthetic_patches(config: &qwen35_vl_arch::qwen35_vl::VisionConfig) -> Vec<f32> {
+    let grid_h = config.spatial_merge_size;
+    let grid_w = config.spatial_merge_size;
+    let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
+    let n = grid_h * grid_w * patch_dim;
+    (0..n)
+        .map(|i| {
+            let x = ((i as u32)
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223)
+                & 0xffff) as f32
+                / 65_535.0;
+            x * 0.2 - 0.1
+        })
+        .collect()
+}
+
+fn dots_ocr_synthetic_image_patches(
+    config: &dots_ocr_arch::dots_ocr::DotsVisionConfig,
+) -> Result<(Vec<f32>, usize, usize), String> {
+    if config.patch_size != dots_image::PATCH_SIZE
+        || config.spatial_merge_size != dots_image::SPATIAL_MERGE_SIZE
+        || config.temporal_patch_size != dots_image::TEMPORAL_PATCH_SIZE
+        || config.num_channels != 3
+    {
+        return Err(format!(
+            "dots-ocr tiny image path requires production preprocessing dims \
+             patch={} sm={} temporal={} channels=3; got patch={} sm={} temporal={} channels={}",
+            dots_image::PATCH_SIZE,
+            dots_image::SPATIAL_MERGE_SIZE,
+            dots_image::TEMPORAL_PATCH_SIZE,
+            config.patch_size,
+            config.spatial_merge_size,
+            config.temporal_patch_size,
+            config.num_channels
+        ));
+    }
+
+    let h = dots_image::PATCH_SIZE * dots_image::SPATIAL_MERGE_SIZE * 2;
+    let w = h;
+    let mut rgb = vec![0u8; h * w * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let base = (y * w + x) * 3;
+            rgb[base] = ((x * 9 + y * 3) & 0xff) as u8;
+            rgb[base + 1] = ((x * 5 + y * 11 + 17) & 0xff) as u8;
+            rgb[base + 2] = ((x * 13 + y * 7 + 29) & 0xff) as u8;
+        }
+    }
+    let chw = dots_image::clip_normalise(&rgb, h, w);
+    let patches = dots_image::extract_patches(&chw, h, w);
+    Ok((
+        patches,
+        h / dots_image::PATCH_SIZE,
+        w / dots_image::PATCH_SIZE,
+    ))
+}
+
+fn gemma3_vl_synthetic_png_bytes() -> &'static [u8] {
+    &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2,
+        0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207, 208, 0, 0,
+        3, 129, 1, 128, 162, 173, 150, 129, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ]
 }
 
 impl TinyModel {
@@ -135,9 +322,18 @@ impl TinyModel {
     ) -> Result<Self, String> {
         let mut hfq = HfqFile::open(path).map_err(|e| format!("open {path:?}: {e:?}"))?;
         match arch {
-            TinyArch::Qwen35 | TinyArch::Qwen35Moe => {
+            TinyArch::Qwen35 | TinyArch::Qwen35Moe | TinyArch::Qwen35Vl => {
                 let config =
                     qwen35::config_from_hfq(&hfq).ok_or("qwen35: config_from_hfq failed")?;
+                let vision = if arch == TinyArch::Qwen35Vl {
+                    let vc = qwen35_vl_arch::qwen35_vl::vision_config_from_hfq(&hfq)
+                        .ok_or("qwen35-vl: vision_config_from_hfq failed")?;
+                    let vw = qwen35_vl_arch::qwen35_vl::load_vision_weights(&mut hfq, &vc, gpu)
+                        .map_err(|e| format!("qwen35-vl load_vision_weights: {e:?}"))?;
+                    Some((vc, vw))
+                } else {
+                    None
+                };
                 let weights = qwen35::load_weights(&mut hfq, &config, gpu)
                     .map_err(|e| format!("qwen35 load_weights: {e:?}"))?;
                 let kv = KvCache::new_gpu_q8(
@@ -152,13 +348,26 @@ impl TinyModel {
                     DeltaNetState::new(gpu, &config).map_err(|e| format!("qwen35 dn: {e:?}"))?;
                 let scratch = Qwen35Scratch::new(gpu, &config, 64)
                     .map_err(|e| format!("qwen35 scratch: {e:?}"))?;
-                Ok(Self::Qwen35 {
-                    config,
-                    weights,
-                    kv,
-                    dn,
-                    scratch,
-                })
+                if let Some((vision_config, vision_weights)) = vision {
+                    Ok(Self::Qwen35Vl {
+                        config,
+                        weights,
+                        kv,
+                        dn,
+                        scratch,
+                        vision_config,
+                        vision_weights,
+                        visual_tokens: None,
+                    })
+                } else {
+                    Ok(Self::Qwen35 {
+                        config,
+                        weights,
+                        kv,
+                        dn,
+                        scratch,
+                    })
+                }
             }
             TinyArch::Qwen2 => {
                 let config = qwen2::config_from_hfq(&hfq).ok_or("qwen2: config_from_hfq failed")?;
@@ -172,17 +381,86 @@ impl TinyModel {
                     state,
                 })
             }
+            TinyArch::DotsOcr => {
+                let config = dots_ocr_arch::DotsOcr::config_from_hfq(&hfq)?;
+                let weights = dots_ocr_arch::DotsOcr::load_weights(&mut hfq, &config, gpu)
+                    .map_err(|e| format!("dots-ocr load_weights: {e:?}"))?;
+                let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config.text, max_seq)
+                    .map_err(|e| format!("dots-ocr state: {e:?}"))?;
+                Ok(Self::DotsOcr {
+                    config,
+                    weights,
+                    state,
+                    visual_tokens: None,
+                })
+            }
+            TinyArch::Deepseek4 | TinyArch::Deepseek4Compressed | TinyArch::Deepseek4Mtp => {
+                let config = deepseek4::DeepseekV4Config::from_hfq(&hfq)?;
+                let weights = deepseek4::DeepseekV4::load_weights(&mut hfq, &config, gpu)
+                    .map_err(|e| format!("deepseek4 load_weights: {e:?}"))?;
+                let state = deepseek4::DeepseekV4State::new(&config)
+                    .map_err(|e| format!("deepseek4 state: {e:?}"))?;
+                match arch {
+                    TinyArch::Deepseek4Mtp => Ok(Self::Deepseek4Mtp {
+                        config,
+                        weights,
+                        state,
+                    }),
+                    _ => Ok(Self::Deepseek4 {
+                        config,
+                        weights,
+                        state,
+                    }),
+                }
+            }
             TinyArch::Gemma3 => {
                 let config =
                     gemma3::config_from_hfq(&hfq).ok_or("gemma3: config_from_hfq failed")?;
                 let weights = gemma3::load_weights(&mut hfq, &config, gpu)
                     .map_err(|e| format!("gemma3 load_weights: {e:?}"))?;
-                let state = gemma3::Gemma3State::new_with_max_seq(gpu, &config, max_seq, false)
-                    .map_err(|e| format!("gemma3 state: {e:?}"))?;
+                let state = gemma3::Gemma3State::new_with_max_seq(
+                    gpu,
+                    &config,
+                    max_seq,
+                    hipfire_runtime::kv::KvQuantMode::Unquantized,
+                    4,
+                )
+                .map_err(|e| format!("gemma3 state: {e:?}"))?;
                 Ok(Self::Gemma3 {
                     config,
                     weights,
                     state,
+                })
+            }
+            TinyArch::Gemma3Vl => {
+                let loaded = gemma3_vl::load_vl(&mut hfq, gpu)?;
+                let state = gemma3::Gemma3State::new_with_max_seq(
+                    gpu,
+                    &loaded.text_cfg,
+                    max_seq,
+                    hipfire_runtime::kv::KvQuantMode::Unquantized,
+                    4,
+                )
+                .map_err(|e| format!("gemma3-vl state: {e:?}"))?;
+                Ok(Self::Gemma3Vl {
+                    loaded,
+                    state,
+                    image_embeddings: None,
+                })
+            }
+            TinyArch::Gemma4Dense | TinyArch::Gemma4Ple | TinyArch::Gemma4Moe => {
+                let config = gemma4::Gemma4::config_from_hfq(&hfq)
+                    .map_err(|e| format!("gemma4 config_from_hfq: {e}"))?;
+                let weights = gemma4::load_dense_weights(&mut hfq, gpu, &config)
+                    .map_err(|e| format!("gemma4 load_dense_weights: {e:?}"))?;
+                let state = gemma4::Gemma4DenseState::new(gpu, &config, max_seq)
+                    .map_err(|e| format!("gemma4 state: {e:?}"))?;
+                let lowered = gemma4::lower_dense_forward(&config, &state);
+                Ok(Self::Gemma4 {
+                    config,
+                    weights,
+                    state,
+                    lowered,
                 })
             }
             TinyArch::MiniMax => {
@@ -194,6 +472,53 @@ impl TinyModel {
                     weights,
                     state,
                 })
+            }
+            #[cfg(feature = "arch-lfm2moe")]
+            TinyArch::Lfm2Moe => {
+                let config = lfm2moe::Lfm2MoeConfig::from_hfq(&hfq)?;
+                let weights = lfm2moe::Lfm2MoeWeights::load(&mut hfq, &config, gpu)?;
+                let state = lfm2moe::Lfm2MoeState::new_with_max_seq(gpu, &config, max_seq)?;
+                Ok(Self::Lfm2Moe {
+                    config,
+                    weights,
+                    state,
+                })
+            }
+            TinyArch::NemotronH => {
+                let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+                    .map_err(|e| format!("nemotron_h metadata parse: {e}"))?;
+                let cfg_json = meta
+                    .get("config")
+                    .ok_or("nemotron_h: metadata_json missing 'config'")?;
+                let config = NemotronHConfig::from_json(cfg_json)
+                    .map_err(|e| format!("nemotron_h config: {e}"))?;
+                let model = NemotronModel::from_hfq(gpu, &hfq, config, max_seq)
+                    .map_err(|e| format!("nemotron_h NemotronModel::from_hfq: {e}"))?;
+                Ok(Self::NemotronH { model })
+            }
+            TinyArch::Mamba2 => {
+                let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+                    .map_err(|e| format!("mamba2 metadata parse: {e}"))?;
+                let cfg_json = meta
+                    .get("config")
+                    .ok_or("mamba2: metadata_json missing 'config'")?;
+                let config = NemotronHConfig::from_mamba2_json(cfg_json)
+                    .map_err(|e| format!("mamba2 config: {e}"))?;
+                let model = NemotronModel::from_hfq(gpu, &hfq, config, max_seq)
+                    .map_err(|e| format!("mamba2 NemotronModel::from_hfq: {e}"))?;
+                Ok(Self::Mamba2 { model })
+            }
+            TinyArch::Zaya => {
+                let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+                    .map_err(|e| format!("zaya metadata parse: {e}"))?;
+                let cfg_json = meta
+                    .get("config")
+                    .ok_or("zaya: metadata_json missing 'config'")?;
+                let config =
+                    ZayaConfig::from_json(cfg_json).map_err(|e| format!("zaya config: {e}"))?;
+                let model = ZayaModel::from_hfq(gpu, &hfq, config, max_seq)
+                    .map_err(|e| format!("zaya ZayaModel::from_hfq: {e}"))?;
+                Ok(Self::Zaya { model })
             }
             TinyArch::Llama => {
                 let config = hipfire_runtime::hfq::config_from_hfq(&hfq)
@@ -223,9 +548,20 @@ impl TinyModel {
     pub fn vocab(&self) -> usize {
         match self {
             Self::Qwen35 { config, .. } => config.vocab_size,
+            Self::Qwen35Vl { config, .. } => config.vocab_size,
             Self::Qwen2 { config, .. } => config.vocab_size,
+            Self::DotsOcr { config, .. } => config.text.vocab_size,
+            Self::Deepseek4 { config, .. } => config.vocab_size,
+            Self::Deepseek4Mtp { config, .. } => config.vocab_size,
             Self::Gemma3 { config, .. } => config.vocab_size,
+            Self::Gemma3Vl { loaded, .. } => loaded.text_cfg.vocab_size,
+            Self::Gemma4 { config, .. } => config.vocab_size,
             Self::MiniMax { config, .. } => config.vocab_size,
+            #[cfg(feature = "arch-lfm2moe")]
+            Self::Lfm2Moe { config, .. } => config.vocab_size,
+            Self::NemotronH { model } => model.config().vocab_size,
+            Self::Mamba2 { model } => model.config().vocab_size,
+            Self::Zaya { model } => model.config().vocab_size,
             Self::Llama { config, .. } => config.vocab_size,
         }
     }
@@ -253,6 +589,47 @@ impl TinyModel {
                 gpu.download_f32(&scratch.logits)
                     .map_err(|e| format!("dl logits: {e:?}"))
             }
+            Self::Qwen35Vl {
+                config,
+                weights,
+                kv,
+                dn,
+                scratch,
+                vision_config,
+                vision_weights,
+                visual_tokens,
+            } => {
+                if pos == 0 {
+                    if visual_tokens.is_none() {
+                        let patches = qwen35_vl_synthetic_patches(vision_config);
+                        let tokens = qwen35_vl_arch::qwen35_vl::vision_forward(
+                            gpu,
+                            vision_weights,
+                            vision_config,
+                            &patches,
+                            vision_config.spatial_merge_size,
+                            vision_config.spatial_merge_size,
+                        )
+                        .map_err(|e| format!("qwen35-vl vision forward: {e:?}"))?;
+                        if tokens.len() != config.dim {
+                            return Err(format!(
+                                "qwen35-vl synthetic vision emitted {} floats, expected one token of dim {}",
+                                tokens.len(),
+                                config.dim
+                            ));
+                        }
+                        *visual_tokens = Some(tokens);
+                    }
+                    let emb = visual_tokens.as_ref().unwrap();
+                    qwen35::forward_scratch_embed(gpu, weights, config, emb, pos, kv, dn, scratch)
+                        .map_err(|e| format!("qwen35-vl forward_scratch_embed: {e:?}"))?;
+                } else {
+                    qwen35::forward_scratch(gpu, weights, config, token, pos, kv, dn, scratch)
+                        .map_err(|e| format!("qwen35-vl forward: {e:?}"))?;
+                }
+                gpu.download_f32(&scratch.logits)
+                    .map_err(|e| format!("dl logits: {e:?}"))
+            }
             Self::Qwen2 {
                 config,
                 weights,
@@ -262,6 +639,83 @@ impl TinyModel {
                     .map_err(|e| format!("qwen2 forward: {e:?}"))?;
                 gpu.download_f32(&state.logits)
                     .map_err(|e| format!("dl logits: {e:?}"))
+            }
+            Self::DotsOcr {
+                config,
+                weights,
+                state,
+                visual_tokens,
+            } => {
+                let dim = config.text.hidden_size;
+                if visual_tokens.is_none() && pos == 0 {
+                    let (patches, grid_h, grid_w) =
+                        dots_ocr_synthetic_image_patches(&config.vision)?;
+                    let n_patches = grid_h * grid_w;
+                    let n_visual = n_patches
+                        / (config.vision.spatial_merge_size * config.vision.spatial_merge_size);
+                    let patch_dim = patches.len() / n_patches;
+                    let patches_gpu = gpu
+                        .upload_f32(&patches, &[n_patches, patch_dim])
+                        .map_err(|e| format!("dots-ocr upload synthetic patches: {e:?}"))?;
+                    let merged_gpu = dots_ocr_arch::dots_ocr::vision_forward(
+                        gpu,
+                        &weights.vision,
+                        &config.vision,
+                        &patches_gpu,
+                        grid_h,
+                        grid_w,
+                    )
+                    .map_err(|e| format!("dots-ocr vision forward: {e:?}"))?;
+                    gpu.free_tensor(patches_gpu)
+                        .map_err(|e| format!("dots-ocr free patches: {e:?}"))?;
+                    let merged = gpu
+                        .download_f32(&merged_gpu)
+                        .map_err(|e| format!("dots-ocr dl visual tokens: {e:?}"))?;
+                    gpu.free_tensor(merged_gpu)
+                        .map_err(|e| format!("dots-ocr free visual tokens: {e:?}"))?;
+                    if merged.len() != n_visual * dim {
+                        return Err(format!(
+                            "dots-ocr synthetic image emitted {} floats, expected {n_visual} visual tokens of dim {}",
+                            merged.len(),
+                            dim
+                        ));
+                    }
+                    *visual_tokens = Some(merged);
+                }
+                let n_visual = visual_tokens.as_ref().map_or(0, |v| v.len() / dim);
+                if pos < n_visual {
+                    let rows = visual_tokens.as_ref().unwrap();
+                    let emb = &rows[pos * dim..(pos + 1) * dim];
+                    qwen2::forward_step_with_embed(gpu, &weights.text, &config.text, state, emb)
+                        .map_err(|e| format!("dots-ocr image-token splice forward: {e:?}"))?;
+                } else {
+                    qwen2::forward_step(gpu, &weights.text, &config.text, state, token)
+                        .map_err(|e| format!("dots-ocr forward: {e:?}"))?;
+                }
+                gpu.download_f32(&state.logits)
+                    .map_err(|e| format!("dl logits: {e:?}"))
+            }
+            Self::Deepseek4 {
+                config,
+                weights,
+                state,
+            } => deepseek4::forward::decode_step(config, weights, state, gpu, token, pos as u32),
+            Self::Deepseek4Mtp {
+                config,
+                weights,
+                state,
+            } => {
+                deepseek4::forward::decode_step(config, weights, state, gpu, token, pos as u32)?;
+                let h_n_ptr = state
+                    .mtp_last_hidden
+                    .as_ref()
+                    .ok_or("deepseek4 MTP: decode_step did not capture mtp_last_hidden")?
+                    as *const hipfire_rdna::GpuTensor;
+                // `mtp_forward` mutates scratch and refreshes `mtp_last_hidden`,
+                // but it only reads the initial hidden. Keep the borrow shape
+                // identical to the production speculative decoder.
+                let h_n = unsafe { &*h_n_ptr };
+                deepseek4::forward::mtp_forward(config, weights, state, gpu, h_n, token, pos as u32)
             }
             Self::Gemma3 {
                 config,
@@ -273,11 +727,113 @@ impl TinyModel {
                 gpu.download_f32(&state.logits)
                     .map_err(|e| format!("dl logits: {e:?}"))
             }
+            Self::Gemma3Vl {
+                loaded,
+                state,
+                image_embeddings,
+            } => {
+                let dim = loaded.text_cfg.hidden_size;
+                if image_embeddings.is_none() && pos == 0 {
+                    let patches = gemma3_vl::preprocess_image_bytes(
+                        gemma3_vl_synthetic_png_bytes(),
+                        &loaded.vl_cfg.vision,
+                    )?;
+                    let vis = gemma3_vl::vision_forward(
+                        gpu,
+                        &loaded.weights.vision,
+                        &loaded.vl_cfg.vision,
+                        &patches,
+                    )
+                    .map_err(|e| format!("gemma3-vl vision forward: {e:?}"))?;
+                    let projected = match gemma3_vl::project(
+                        gpu,
+                        &loaded.weights.projector,
+                        &loaded.vl_cfg,
+                        &vis,
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let _ = gpu.free_tensor(vis);
+                            return Err(format!("gemma3-vl projector: {e:?}"));
+                        }
+                    };
+                    gpu.free_tensor(vis)
+                        .map_err(|e| format!("gemma3-vl free vision output: {e:?}"))?;
+                    let embeds = gpu
+                        .download_f32(&projected)
+                        .map_err(|e| format!("gemma3-vl dl image embeddings: {e:?}"))?;
+                    gpu.free_tensor(projected)
+                        .map_err(|e| format!("gemma3-vl free image embeddings: {e:?}"))?;
+                    let expected = loaded.vl_cfg.mm_tokens_per_image * dim;
+                    if embeds.len() != expected {
+                        return Err(format!(
+                            "gemma3-vl synthetic image emitted {} floats, expected {} image tokens of dim {}",
+                            embeds.len(),
+                            loaded.vl_cfg.mm_tokens_per_image,
+                            dim
+                        ));
+                    }
+                    *image_embeddings = Some(embeds);
+                }
+                let n_image_tokens = image_embeddings.as_ref().map_or(0, |v| v.len() / dim);
+                if pos < n_image_tokens {
+                    let rows = image_embeddings.as_ref().unwrap();
+                    let emb = &rows[pos * dim..(pos + 1) * dim];
+                    gemma3::forward::forward_step_with_embed(
+                        gpu,
+                        &loaded.weights.text,
+                        &loaded.text_cfg,
+                        state,
+                        emb,
+                    )
+                    .map_err(|e| format!("gemma3-vl image-token splice forward: {e:?}"))?;
+                } else {
+                    gemma3::forward::forward_step(
+                        gpu,
+                        &loaded.weights.text,
+                        &loaded.text_cfg,
+                        state,
+                        token,
+                    )
+                    .map_err(|e| format!("gemma3-vl forward: {e:?}"))?;
+                }
+                gpu.download_f32(&state.logits)
+                    .map_err(|e| format!("dl logits: {e:?}"))
+            }
+            Self::Gemma4 {
+                config,
+                weights,
+                state,
+                lowered,
+            } => {
+                gemma4::forward_step(gpu, weights, config, state, lowered, token)
+                    .map_err(|e| format!("gemma4 forward: {e:?}"))?;
+                gemma4::logits(gpu, state).map_err(|e| format!("dl logits: {e:?}"))
+            }
             Self::MiniMax {
                 config,
                 weights,
                 state,
             } => minimax::forward::decode_step(config, weights, state, gpu, token, pos as u32),
+            #[cfg(feature = "arch-lfm2moe")]
+            Self::Lfm2Moe {
+                config,
+                weights,
+                state,
+            } => lfm2moe::forward::decode_step(config, weights, state, gpu, token, pos as u32),
+            Self::NemotronH { model } => model
+                .forward(gpu, token, pos)
+                .map_err(|e| format!("nemotron_h forward: {e:?}")),
+            Self::Mamba2 { model } => model
+                .forward(gpu, token, pos)
+                .map_err(|e| format!("mamba2 forward: {e:?}")),
+            Self::Zaya { model } => model
+                .decode_step(gpu, token, pos)
+                .and_then(|_| {
+                    gpu.download_f32(model.logits())
+                        .map_err(|e| format!("dl logits: {e:?}"))
+                })
+                .map_err(|e| format!("zaya forward: {e:?}")),
             Self::Llama {
                 config,
                 weights,
@@ -310,16 +866,18 @@ impl TinyModel {
             // here, else qtip3-sim LDLQ matches 0 tensors and silently falls back
             // to plain QTIP. (The real collect path keeps the long prefix; both
             // sides agree there.)
-            Self::Qwen35 { weights, .. } => qwen35::build_capture_names(weights)
-                .into_iter()
-                .map(|(ptr, name)| {
-                    let short = name
-                        .strip_prefix("model.language_model.")
-                        .map(|rest| format!("model.{rest}"))
-                        .unwrap_or(name);
-                    (ptr, short)
-                })
-                .collect(),
+            Self::Qwen35 { weights, .. } | Self::Qwen35Vl { weights, .. } => {
+                qwen35::build_capture_names(weights)
+                    .into_iter()
+                    .map(|(ptr, name)| {
+                        let short = name
+                            .strip_prefix("model.language_model.")
+                            .map(|rest| format!("model.{rest}"))
+                            .unwrap_or(name);
+                        (ptr, short)
+                    })
+                    .collect()
+            }
             Self::Qwen2 { weights, .. } => {
                 let mut m = HashMap::new();
                 let mut put = |w: &WeightTensor, n: String| {
@@ -337,6 +895,119 @@ impl TinyModel {
                 }
                 m
             }
+            Self::DotsOcr { weights, .. } => {
+                let mut m = HashMap::new();
+                let mut put = |w: &WeightTensor, n: String| {
+                    m.insert(w.buf.buf.as_ptr() as usize, n);
+                };
+                for (i, l) in weights.text.layers.iter().enumerate() {
+                    let p = format!("model.layers.{i}");
+                    put(&l.wq, format!("{p}.self_attn.q_proj"));
+                    put(&l.wk, format!("{p}.self_attn.k_proj"));
+                    put(&l.wv, format!("{p}.self_attn.v_proj"));
+                    put(&l.wo, format!("{p}.self_attn.o_proj"));
+                    put(&l.w_gate, format!("{p}.mlp.gate_proj"));
+                    put(&l.w_up, format!("{p}.mlp.up_proj"));
+                    put(&l.w_down, format!("{p}.mlp.down_proj"));
+                }
+                m
+            }
+            Self::Deepseek4 { weights, .. } | Self::Deepseek4Mtp { weights, .. } => {
+                let mut m = HashMap::new();
+                let mut put = |w: &hipfire_rdna::GpuTensor, n: String| {
+                    m.insert(w.buf.as_ptr() as usize, n);
+                };
+                if let Some(w) = &weights.head {
+                    put(w, "head".to_string());
+                }
+                for (i, l) in weights.layers.iter().enumerate() {
+                    let p = format!("layers.{i}");
+                    let attn = format!("{p}.attn");
+                    if let Some(w) = &l.wq_a {
+                        put(w, format!("{attn}.wq_a"));
+                    }
+                    if let Some(w) = &l.wq_b {
+                        put(w, format!("{attn}.wq_b"));
+                    }
+                    if let Some(w) = &l.wkv {
+                        put(w, format!("{attn}.wkv"));
+                    }
+                    if let Some(w) = &l.wo_a {
+                        put(w, format!("{attn}.wo_a"));
+                    }
+                    if let Some(w) = &l.wo_b {
+                        put(w, format!("{attn}.wo_b"));
+                    }
+                    if let Some(w) = &l.compressor_wkv {
+                        put(w, format!("{attn}.compressor.wkv"));
+                    }
+                    if let Some(w) = &l.compressor_wgate {
+                        put(w, format!("{attn}.compressor.wgate"));
+                    }
+                    if let Some(w) = &l.indexer_wq_b {
+                        put(w, format!("{attn}.indexer.wq_b"));
+                    }
+                    if let Some(w) = &l.indexer_weights_proj {
+                        put(w, format!("{attn}.indexer.weights_proj"));
+                    }
+                    if let Some(w) = &l.indexer_compressor_wkv {
+                        put(w, format!("{attn}.indexer.compressor.wkv"));
+                    }
+                    if let Some(w) = &l.indexer_compressor_wgate {
+                        put(w, format!("{attn}.indexer.compressor.wgate"));
+                    }
+                    if let Some(w) = &l.gate_weight {
+                        put(w, format!("{p}.ffn.gate"));
+                    }
+                    if let Some(w) = &l.shared_w1 {
+                        put(w, format!("{p}.ffn.shared_experts.w1"));
+                    }
+                    if let Some(w) = &l.shared_w2 {
+                        put(w, format!("{p}.ffn.shared_experts.w2"));
+                    }
+                    if let Some(w) = &l.shared_w3 {
+                        put(w, format!("{p}.ffn.shared_experts.w3"));
+                    }
+                }
+                if let Some(l) = &weights.mtp_layer {
+                    let p = "mtp.0";
+                    let attn = format!("{p}.attn");
+                    if let Some(w) = &l.wq_a {
+                        put(w, format!("{attn}.wq_a"));
+                    }
+                    if let Some(w) = &l.wq_b {
+                        put(w, format!("{attn}.wq_b"));
+                    }
+                    if let Some(w) = &l.wkv {
+                        put(w, format!("{attn}.wkv"));
+                    }
+                    if let Some(w) = &l.wo_a {
+                        put(w, format!("{attn}.wo_a"));
+                    }
+                    if let Some(w) = &l.wo_b {
+                        put(w, format!("{attn}.wo_b"));
+                    }
+                    if let Some(w) = &l.mtp_e_proj {
+                        put(w, format!("{p}.e_proj"));
+                    }
+                    if let Some(w) = &l.mtp_h_proj {
+                        put(w, format!("{p}.h_proj"));
+                    }
+                    if let Some(w) = &l.gate_weight {
+                        put(w, format!("{p}.ffn.gate"));
+                    }
+                    if let Some(w) = &l.shared_w1 {
+                        put(w, format!("{p}.ffn.shared_experts.w1"));
+                    }
+                    if let Some(w) = &l.shared_w2 {
+                        put(w, format!("{p}.ffn.shared_experts.w2"));
+                    }
+                    if let Some(w) = &l.shared_w3 {
+                        put(w, format!("{p}.ffn.shared_experts.w3"));
+                    }
+                }
+                m
+            }
             Self::Gemma3 { weights, .. } => {
                 let mut m = HashMap::new();
                 let mut put = |w: &WeightTensor, n: String| {
@@ -344,6 +1015,23 @@ impl TinyModel {
                 };
                 for (i, l) in weights.layers.iter().enumerate() {
                     let p = format!("model.layers.{i}");
+                    put(&l.wq, format!("{p}.self_attn.q_proj"));
+                    put(&l.wk, format!("{p}.self_attn.k_proj"));
+                    put(&l.wv, format!("{p}.self_attn.v_proj"));
+                    put(&l.wo, format!("{p}.self_attn.o_proj"));
+                    put(&l.w_gate, format!("{p}.mlp.gate_proj"));
+                    put(&l.w_up, format!("{p}.mlp.up_proj"));
+                    put(&l.w_down, format!("{p}.mlp.down_proj"));
+                }
+                m
+            }
+            Self::Gemma3Vl { loaded, .. } => {
+                let mut m = HashMap::new();
+                let mut put = |w: &WeightTensor, n: String| {
+                    m.insert(w.buf.buf.as_ptr() as usize, n);
+                };
+                for (i, l) in loaded.weights.text.layers.iter().enumerate() {
+                    let p = format!("language_model.model.layers.{i}");
                     put(&l.wq, format!("{p}.self_attn.q_proj"));
                     put(&l.wk, format!("{p}.self_attn.k_proj"));
                     put(&l.wv, format!("{p}.self_attn.v_proj"));
@@ -366,6 +1054,53 @@ impl TinyModel {
                     put(&l.wv, format!("{p}.self_attn.v_proj"));
                     put(&l.wo, format!("{p}.self_attn.o_proj"));
                     put(&l.router, format!("{p}.block_sparse_moe.gate"));
+                }
+                m
+            }
+            Self::NemotronH { model } | Self::Mamba2 { model } => model.build_capture_names(),
+            Self::Zaya { model } => zaya_gpu::build_capture_names(model.weights()),
+            #[cfg(feature = "arch-lfm2moe")]
+            Self::Lfm2Moe { weights, .. } => lfm2moe::calibration::build_capture_names(weights),
+            Self::Gemma4 { weights, .. } => {
+                let mut m = HashMap::new();
+                let mut put = |w: &WeightTensor, n: String| {
+                    m.insert(w.buf.buf.as_ptr() as usize, n);
+                };
+                for (i, l) in weights.layers.iter().enumerate() {
+                    let p = format!("model.language_model.layers.{i}");
+                    let attn = format!("{p}.self_attn");
+                    put(&l.wq, format!("{attn}.q_proj"));
+                    put(&l.wk, format!("{attn}.k_proj"));
+                    if let Some(wv) = &l.wv {
+                        put(wv, format!("{attn}.v_proj"));
+                    }
+                    put(&l.wo, format!("{attn}.o_proj"));
+                    put(&l.w_gate, format!("{p}.mlp.gate_proj"));
+                    put(&l.w_up, format!("{p}.mlp.up_proj"));
+                    put(&l.w_down, format!("{p}.mlp.down_proj"));
+                    if let Some(ple) = &l.ple {
+                        put(&ple.input_gate, format!("{p}.per_layer_input_gate"));
+                        put(&ple.projection, format!("{p}.per_layer_projection"));
+                    }
+                    if let Some(moe) = &l.moe {
+                        put(&moe.router, format!("{p}.router.proj"));
+                        for (expert, weights) in moe.experts.iter().enumerate() {
+                            let ep = format!("{p}.experts.{expert}");
+                            put(&weights.gate, format!("{ep}.gate_proj"));
+                            put(&weights.up, format!("{ep}.up_proj"));
+                            put(&weights.down, format!("{ep}.down_proj"));
+                        }
+                    }
+                }
+                if let Some(ple) = &weights.ple {
+                    put(
+                        &ple.embed_per_layer,
+                        "model.language_model.embed_tokens_per_layer".to_string(),
+                    );
+                    put(
+                        &ple.model_projection,
+                        "model.language_model.per_layer_model_projection".to_string(),
+                    );
                 }
                 m
             }
@@ -421,6 +1156,7 @@ pub struct KldOut {
     pub max_kld: f64,
     pub n_scored: usize,
     pub finite: bool,
+    pub first_nonfinite: Option<String>,
 }
 
 /// Result of an autoregressive tiny forward pass.
@@ -543,7 +1279,15 @@ pub fn run_kld(
     let mut sum = 0.0f64;
     let mut max = 0.0f64;
     let mut finite = true;
-    for (rp, qp) in refs.iter().zip(cands.iter()) {
+    let mut first_nonfinite = None;
+    for (pos, (rp, qp)) in refs.iter().zip(cands.iter()).enumerate() {
+        if first_nonfinite.is_none() {
+            if let Some((i, v)) = rp.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                first_nonfinite = Some(format!("ref position {pos} logit {i} = {v}"));
+            } else if let Some((i, v)) = qp.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                first_nonfinite = Some(format!("cand position {pos} logit {i} = {v}"));
+            }
+        }
         let lr = log_softmax(rp);
         let lq = log_softmax(qp);
         // KL = Σ p·(log p − log q), p = exp(lr).
@@ -568,6 +1312,7 @@ pub fn run_kld(
         max_kld: max,
         n_scored: n,
         finite,
+        first_nonfinite,
     })
 }
 
@@ -592,6 +1337,32 @@ pub fn run_collect(
 ) -> Result<CollectOut, String> {
     let tokens = synthetic_tokens(len, seed);
     let mut model = TinyModel::load(arch, model_path, gpu, tokens.len() + 16)?;
+
+    if let TinyModel::Zaya { model } = &model {
+        let opts = zaya_calib::CalibOpts {
+            kldref: false,
+            kldref_topk: 64,
+        };
+        let provenance = vec![
+            ("source", serde_json::json!("tiny_quant_probe")),
+            ("arch", serde_json::json!(arch.as_str())),
+            ("n_calib_tokens", serde_json::json!(tokens.len())),
+        ];
+        let summary = zaya_calib::collect_calibration_artifacts(
+            gpu,
+            model.weights(),
+            model.config(),
+            &tokens,
+            &opts,
+            out_path,
+            &provenance,
+        )?;
+        return Ok(CollectOut {
+            n_tensors: summary.n_hessian + summary.n_imatrix,
+            consistency: summary.max_consistency,
+            out_path: out_path.display().to_string(),
+        });
+    }
 
     // Routed experts (if any) would be imatrix-only, but we don't name them, so
     // a plain collector suffices — only the named dense linears are captured.

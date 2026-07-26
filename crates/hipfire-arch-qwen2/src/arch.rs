@@ -13,14 +13,23 @@
 //! reach the hot path via [`crate::qwen2::forward_step`] /
 //! [`crate::qwen2::forward_step_greedy`] directly.
 
-use crate::qwen2::{forward_step, Qwen2Config, Qwen2State, Qwen2Weights};
+use crate::qwen2::{forward_prefill_batch, forward_step, Qwen2Config, Qwen2State, Qwen2Weights};
+use hipfire_rdna::{Gpu, GpuTensor};
 use hipfire_runtime::arch::{
-    run_simple_ar, ArchCaps, Architecture, EosFilterOverrides, GenerateCtx, LoopGuardOverrides,
-    PromptFrameOverrides, SamplerOverrides, ServeOutcome, ServingBackend, SimpleAr,
+    run_simple_ar, ArchCaps, Architecture, EosFilterOverrides, FactoryLoadedBackend, GenerateCtx,
+    LoopGuardOverrides, ModelShapeProfile, OutputProtocol, PromptFrameOverrides,
+    PromptGenerationProfile, SamplerOverrides, ServeOutcome, ServingBackend, ServingFactory,
+    ServingFactoryOptions, SimpleAr,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use hipfire_rdna::{Gpu, GpuTensor};
+
+/// Prompt length at or above which prefill takes the batched multi-token path
+/// (`forward_prefill_batch`) instead of the per-token `forward_step` loop.
+/// Below this the per-token loop wins: the batched path pays a fixed setup cost
+/// (batch scratch alloc + per-row embed copy) that only amortizes once several
+/// positions share each weight read.
+const MIN_PREFILL_BATCH: usize = 8;
 
 /// Zero-sized type marker for the Qwen2 arch.
 pub struct Qwen2;
@@ -123,12 +132,28 @@ impl Qwen2Backend {
 
 impl SimpleAr for Qwen2Backend {
     fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {
-        // Qwen2's forward_step has no batched prefill — run the prompt one token
-        // at a time (it tracks the KV write slot in state.next_pos). The final
-        // call leaves the next-token logits in state.logits.
-        for &t in tokens {
-            forward_step(gpu, &self.weights, &self.config, &mut self.state, t)
-                .map_err(|e| format!("qwen2 prefill forward_step: {e:?}"))?;
+        self.state.reset();
+        // Batched multi-token prefill (mirrors gemma3) reads each weight once for
+        // the whole prompt via batched GEMM / RoPE / causal attention; short
+        // prompts stay on the per-token `forward_step` loop, which tracks the KV
+        // write slot in state.next_pos. Either way the final position's
+        // next-token logits land in state.logits.
+        if tokens.len() >= MIN_PREFILL_BATCH {
+            let start_pos = self.state.next_pos;
+            forward_prefill_batch(
+                gpu,
+                &self.weights,
+                &self.config,
+                &mut self.state,
+                tokens,
+                start_pos,
+            )
+            .map_err(|e| format!("qwen2 prefill forward_prefill_batch: {e:?}"))?;
+        } else {
+            for &t in tokens {
+                forward_step(gpu, &self.weights, &self.config, &mut self.state, t)
+                    .map_err(|e| format!("qwen2 prefill forward_step: {e:?}"))?;
+            }
         }
         Ok(())
     }
@@ -192,7 +217,62 @@ impl ServingBackend for Qwen2Backend {
         b.weights.free_gpu(gpu);
         b.state.free_gpu(gpu);
     }
+
+    fn kld_forward(&mut self) -> Option<&mut dyn hipfire_runtime::kld_eval::ChunkScoredForward> {
+        Some(self)
+    }
 }
+
+pub struct Qwen2ServingFactory;
+
+pub static QWEN2_SERVING_FACTORY: Qwen2ServingFactory = Qwen2ServingFactory;
+
+impl ServingFactory for Qwen2ServingFactory {
+    fn arch_id(&self) -> u32 {
+        Qwen2::arch_id()
+    }
+
+    fn family(&self) -> &'static str {
+        Qwen2::name()
+    }
+
+    fn load(
+        &self,
+        hfq: &mut HfqFile,
+        gpu: &mut Gpu,
+        options: &ServingFactoryOptions<'_>,
+    ) -> Result<FactoryLoadedBackend, String> {
+        let config = Qwen2::config_from_hfq(hfq)?;
+        let weights = Qwen2::load_weights(hfq, &config, gpu)?;
+        let state = Qwen2State::new_with_max_seq(gpu, &config, options.max_seq)
+            .map_err(|error| format!("qwen2 state: {error:?}"))?;
+        let shape = ModelShapeProfile {
+            hidden_size: config.hidden_size,
+            num_layers: config.num_hidden_layers,
+            vocab_size: config.vocab_size,
+            intermediate_size: config.intermediate_size,
+        };
+        let profile = PromptGenerationProfile {
+            prompt: Qwen2::prompt_frame_overrides(&config),
+            sampler: Qwen2::sampler_overrides(&config),
+            loop_guard: Qwen2::loop_guard_overrides(&config),
+            eos_filter: Qwen2::eos_filter_overrides(&config),
+            output_protocol: OutputProtocol::Plain,
+            bos_token: None,
+            require_official_template: false,
+        };
+        let _ = options.kv_mode;
+        Ok(FactoryLoadedBackend {
+            backend: Box::new(Qwen2Backend::new(config, weights, state)),
+            family: self.family(),
+            shape,
+            profile,
+            physical_cap: options.max_seq,
+        })
+    }
+}
+
+hipfire_runtime::register_serving_factory!(QWEN2_SERVING_FACTORY);
 
 #[cfg(test)]
 mod tests {

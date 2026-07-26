@@ -1,0 +1,1080 @@
+{
+  "key": "RyzenAI-npu1_xrt2.25.0_fw1.5.5.391",
+  "meta": {
+    "device": "npu1",
+    "note": "K1 established; see benches/k1_clock.py"
+  },
+  "constants": {
+    "f_h_hz": {
+      "name": "f_h_hz",
+      "value": 1015000000.0,
+      "unit": "Hz",
+      "bench": "K1",
+      "method": "saturated VMAC issue rate; CHAINS sweep 1/2/4/8, ITERS slope fit on npu_time",
+      "admissible": true,
+      "evidence": [
+        "plateau: 1.015/1.019/1.013 G VMAC/s at chains=2/4/8 (within 0.6%) -> pipe saturated, latency hidden",
+        "chains=1 (1.92 ns/iter) == chains=2 (1.97 ns/iter): 1 chain is latency-bound, 2 fill the pipe",
+        "chains=4 -> 8 throughput ratio 0.994x: plateau, not still-scaling",
+        "disassembly (llvm-objdump, aie2): loop .LBB0_1 unrolled 4x (r5=0x3e8=ITERS, add r5,r5,#-0x4); 16 bundles / 16 vmac in body incl. branch delay slots => exactly 1 VMAC per bundle",
+        "bundle count x measured slope: 4 cycles/iter / 3.9244 ns = 1.019 GHz, agrees with the plateau independently"
+      ],
+      "caveats": [
+        "assumes 1 bundle/cycle issue (standard VLIW model); the plateau corroborates but does not prove it",
+        "measured at pmode=default; setting pmode needs CAP_SYS_ADMIN. Do not assume clock-invariance across modes.",
+        "npu_time basis; cold-vs-warm does not affect the slope (fixed cost cancels)"
+      ],
+      "measured_utc": "2026-07-16T18:59:40+00:00"
+    },
+    "c_cmd_s": {
+      "name": "c_cmd_s",
+      "value": 0.000155,
+      "unit": "s",
+      "bench": "C1",
+      "method": "near-null kernel (touch each input once, write one word), warmed, median device npu_time",
+      "admissible": true,
+      "evidence": [
+        "run A (reps=30):  n_bos=2 -> 153.781 us, n_bos=3 -> 148.651 us",
+        "run B (reps=150): n_bos=2 -> 157.362 us, n_bos=3 -> 161.962 us",
+        "across both runs the floor sits in 148.7-162.0 us; point estimate 155 us (+/-5%)",
+        "independent corroboration: K1 chains=1 fit intercept ~236 us on a larger graph, same order"
+      ],
+      "caveats": [
+        "THIS IS THE DOMINANT TERM ON npu1: a do-nothing dispatch costs ~155 us of device time. For scale, R64 measured aie2p full production QKV device span at 241 us.",
+        "warmed medians; cold first-command values are far higher (R63 saw 3.5-4.2 ms cold vs 1.03 ms warm)",
+        "measured at n_bos 2-3 only; see c_bo_s"
+      ],
+      "measured_utc": "2026-07-16T19:04:28+00:00"
+    },
+    "c_bo_s": {
+      "name": "c_bo_s",
+      "value": 0.0,
+      "unit": "s",
+      "bench": "C1",
+      "method": "BO-count sweep slope; not separable from noise",
+      "admissible": true,
+      "evidence": [
+        "run A slope = -5.130 us/BO (negative => unphysical => noise-dominated)",
+        "run B slope = +4.600 us/BO; the sign flips between runs",
+        "conclusion: |c_bo| < ~5 us, indistinguishable from zero, and <3% of the 155 us floor"
+      ],
+      "caveats": [
+        "value 0.0 is a bounded measurement (|c_bo| < 5 us), not an extrapolation",
+        "sweep is BLOCKED above n_bos=3: nargs>=3 fails aiecc with \"Resource allocation pipeline failed\" at tile(0,2) \u2014 a core tile cannot source that many input DMA channels. The 5-slot H4 limit is never reached because the per-core DMA channel limit binds first."
+      ],
+      "measured_utc": "2026-07-16T19:04:28+00:00"
+    },
+    "c_call_s": {
+      "name": "c_call_s",
+      "value": 7.716595090388244e-06,
+      "unit": "s",
+      "bench": "C7",
+      "method": "byte-independent intercept of pack + deblock (direct, not by subtraction)",
+      "admissible": true,
+      "evidence": [
+        "    4096 B: pack=    4.48 us deblock=    2.12 us (alloc=24559.72 sync=4.48 back=1.30 numpy=0.82)",
+        "   16384 B: pack=    4.13 us deblock=    1.80 us (alloc=16732.06 sync=4.13 back=1.04 numpy=0.76)",
+        "   65536 B: pack=    5.31 us deblock=    2.26 us (alloc=16805.13 sync=5.31 back=1.51 numpy=0.75)",
+        "  262144 B: pack=   10.64 us deblock=    4.79 us (alloc=17437.30 sync=10.64 back=3.92 numpy=0.87)",
+        " 1048576 B: pack=   25.96 us deblock=   13.65 us (alloc=17746.45 sync=25.96 back=12.66 numpy=0.99)",
+        " 4194304 B: pack=   63.04 us deblock=   48.83 us (alloc=18275.31 sync=63.04 back=47.96 numpy=0.87)"
+      ],
+      "caveats": [
+        "supersedes C1's unstable 48-75 us wall-minus-device estimate, which was measured by subtraction"
+      ],
+      "measured_utc": "2026-07-16T19:07:46+00:00"
+    },
+    "c_bo_alloc_s": {
+      "name": "c_bo_alloc_s",
+      "value": 0.01759187349853164,
+      "unit": "s",
+      "bench": "C7",
+      "method": "XRTTensor construction (BO allocation), median across the byte sweep",
+      "admissible": true,
+      "evidence": [
+        "    4096 B: pack=    4.48 us deblock=    2.12 us (alloc=24559.72 sync=4.48 back=1.30 numpy=0.82)",
+        "   16384 B: pack=    4.13 us deblock=    1.80 us (alloc=16732.06 sync=4.13 back=1.04 numpy=0.76)",
+        "   65536 B: pack=    5.31 us deblock=    2.26 us (alloc=16805.13 sync=5.31 back=1.51 numpy=0.75)",
+        "  262144 B: pack=   10.64 us deblock=    4.79 us (alloc=17437.30 sync=10.64 back=3.92 numpy=0.87)",
+        " 1048576 B: pack=   25.96 us deblock=   13.65 us (alloc=17746.45 sync=25.96 back=12.66 numpy=0.99)",
+        " 4194304 B: pack=   63.04 us deblock=   48.83 us (alloc=18275.31 sync=63.04 back=47.96 numpy=0.87)",
+        "size-independent: 24.6 ms at 4096 B vs 18.3 ms at 4194304 B"
+      ],
+      "caveats": [
+        "SETUP ONLY \u2014 never add this to a per-dispatch prediction. Real code allocates once and reuses.",
+        "A first cut of this bench folded alloc into pack and got a negative c_pack (-9 GB/s); size-independence is what proves it is not a per-byte cost."
+      ],
+      "measured_utc": "2026-07-16T19:07:46+00:00"
+    },
+    "c_pack_s_per_byte": {
+      "name": "c_pack_s_per_byte",
+      "value": 1.3945061372417357e-11,
+      "unit": "s/byte",
+      "bench": "C7",
+      "method": ".to('npu') host->device sync, byte sweep slope, medians (BO alloc excluded)",
+      "admissible": true,
+      "evidence": [
+        "    4096 B: pack=    4.48 us deblock=    2.12 us (alloc=24559.72 sync=4.48 back=1.30 numpy=0.82)",
+        "   16384 B: pack=    4.13 us deblock=    1.80 us (alloc=16732.06 sync=4.13 back=1.04 numpy=0.76)",
+        "   65536 B: pack=    5.31 us deblock=    2.26 us (alloc=16805.13 sync=5.31 back=1.51 numpy=0.75)",
+        "  262144 B: pack=   10.64 us deblock=    4.79 us (alloc=17437.30 sync=10.64 back=3.92 numpy=0.87)",
+        " 1048576 B: pack=   25.96 us deblock=   13.65 us (alloc=17746.45 sync=25.96 back=12.66 numpy=0.99)",
+        " 4194304 B: pack=   63.04 us deblock=   48.83 us (alloc=18275.31 sync=63.04 back=47.96 numpy=0.87)"
+      ],
+      "caveats": [
+        "host->device path only; no kernel runs",
+        "excludes any workload-specific block-layout transform"
+      ],
+      "measured_utc": "2026-07-16T19:07:46+00:00"
+    },
+    "c_deblock_s_per_byte": {
+      "name": "c_deblock_s_per_byte",
+      "value": 1.1222336272966609e-11,
+      "unit": "s/byte",
+      "bench": "C7",
+      "method": ".to('cpu') + .numpy(), byte sweep slope, medians",
+      "admissible": true,
+      "evidence": [
+        "    4096 B: pack=    4.48 us deblock=    2.12 us (alloc=24559.72 sync=4.48 back=1.30 numpy=0.82)",
+        "   16384 B: pack=    4.13 us deblock=    1.80 us (alloc=16732.06 sync=4.13 back=1.04 numpy=0.76)",
+        "   65536 B: pack=    5.31 us deblock=    2.26 us (alloc=16805.13 sync=5.31 back=1.51 numpy=0.75)",
+        "  262144 B: pack=   10.64 us deblock=    4.79 us (alloc=17437.30 sync=10.64 back=3.92 numpy=0.87)",
+        " 1048576 B: pack=   25.96 us deblock=   13.65 us (alloc=17746.45 sync=25.96 back=12.66 numpy=0.99)",
+        " 4194304 B: pack=   63.04 us deblock=   48.83 us (alloc=18275.31 sync=63.04 back=47.96 numpy=0.87)"
+      ],
+      "caveats": [
+        "device->host path only"
+      ],
+      "measured_utc": "2026-07-16T19:07:46+00:00"
+    },
+    "bw_feed_bytes_s": {
+      "name": "bw_feed_bytes_s",
+      "value": 16147410475.518131,
+      "unit": "bytes/s",
+      "bench": "C2",
+      "method": "tile stream, 1 word touched per tile; slope of npu_time vs bytes at 4 columns",
+      "admissible": false,
+      "evidence": [
+        "cols=1: 4.097 GB/s (fixed 228.2 us)",
+        "cols=2: 7.637 GB/s (fixed 176.7 us)",
+        "cols=4: 16.147 GB/s (fixed 181.9 us)"
+      ],
+      "caveats": [
+        "RETIRED - MISLABELLED. This is a per-STREAM feed rate, not per-column: c2_feed/c5_drain build ONE fifo per column, so '4 columns' meant 4 streams. One column with 4 fifos reaches 15.8 GB/s; 8 streams reach 30.8 GB/s, still scaling. Use bw_feed_per_stream_bytes_s.",
+        "slope basis: the C1 dispatch floor lands in the intercept, not the bandwidth",
+        "cheapest possible consumer; a real kernel may not reach this feed rate",
+        "halo's 14.4/56.5 GB/s are aie2p on Strix Halo and do not transfer"
+      ],
+      "measured_utc": "2026-07-16T19:10:40+00:00"
+    },
+    "bw_drain_bytes_s": {
+      "name": "bw_drain_bytes_s",
+      "value": 15915537435.026638,
+      "unit": "bytes/s",
+      "bench": "C5",
+      "method": "core writes 1 word/tile, DMA drains; slope of npu_time vs bytes at 4 columns",
+      "admissible": false,
+      "evidence": [
+        "cols=1: 4.140 GB/s (fixed 210.5 us)",
+        "cols=2: 8.149 GB/s (fixed 183.4 us)",
+        "cols=4: 15.916 GB/s (fixed 172.2 us)"
+      ],
+      "caveats": [
+        "RETIRED - MISLABELLED. This is a per-STREAM drain rate, not per-column: c2_feed/c5_drain build ONE fifo per column, so '4 columns' meant 4 streams. One column with 4 fifos reaches 15.8 GB/s; 8 streams reach 30.8 GB/s, still scaling. Use bw_feed_per_stream_bytes_s.",
+        "slope basis; C1 floor lands in the intercept",
+        "measured separately from feed because R64 found drain, not feed, was the limiter"
+      ],
+      "measured_utc": "2026-07-16T19:12:07+00:00"
+    },
+    "c_task_issue_s": {
+      "name": "c_task_issue_s",
+      "value": 5e-09,
+      "unit": "s",
+      "bench": "C3",
+      "method": "8 MiB payload held constant; tile-size sweep varies task count 8x (4096 -> 512). Slope of npu_time vs task count.",
+      "admissible": true,
+      "evidence": [
+        "run A: n_tiles 4096/2048/1024/512 -> 2276.52/2274.86/2244.65/2241.37 us (8x fewer tasks = 1.5% faster)",
+        "run B: n_tiles 4096/2048/1024/512 -> 2335.27/2279.08/2383.50/2281.78 us (NON-MONOTONIC: 1024 tiles slower than 4096)",
+        "fitted slope moved 9.8 ns -> 3.3 ns/task between runs; point estimate 5 ns with the sign stable but the magnitude not",
+        "even at 4096 tasks this is ~20 us against a ~2280 us transfer: under 1%"
+      ],
+      "caveats": [
+        "FINDING \u2014 THE aie2p PRIOR DOES NOT TRANSFER. R68 cut tasks ~3x on halo for 24% less time; on npu1 an 8x cut buys ~1.5%. Reason: npu1 feeds at ~3.7 GB/s/column, so a 2 KiB tile takes ~553 ns to move while task issue costs ~5 ns \u2014 the overhead hides completely behind the transfer. halo moves bytes ~3.5x faster per column, which is what made per-task cost visible there. Task-count optimisation is NOT a lever on npu1.",
+        "value is an upper bound, not a fit: below the noise floor at these sizes",
+        "single column; concurrent multi-column issue is unmeasured",
+        "tile=32 KiB failed to build: 32 KiB x depth-2 double buffer = 64 KiB = exactly L1 (M1). M1 binds the tile size."
+      ],
+      "measured_utc": "2026-07-16T19:13:58+00:00"
+    },
+    "fill_drain_s": {
+      "name": "fill_drain_s",
+      "value": 0.0,
+      "unit": "s",
+      "bench": "C6",
+      "method": "fifo-depth sweep at constant payload; per-depth residual over the best pipelined time",
+      "admissible": true,
+      "evidence": [
+        "depth=1: 1252.06 us",
+        "depth=2: 1231.90 us",
+        "depth=3: 1228.28 us",
+        "depth=4: 1225.03 us",
+        "depth=8: 1229.91 us",
+        "depth1 -> best(4): 1.022x"
+      ],
+      "caveats": [
+        "small term on npu1: the C1 dispatch floor (~155 us) dwarfs it",
+        "L1 (M1) bounds depth*tile_bytes; aie2p saw depth-4 build failures for the same reason (R58/E2)"
+      ],
+      "measured_utc": "2026-07-16T19:14:53+00:00"
+    },
+    "bw_feed_per_col_bytes_s": {
+      "name": "bw_feed_per_col_bytes_s",
+      "value": 4030000000.0,
+      "unit": "bytes/s/column",
+      "bench": "C2",
+      "method": "per-column feed rate; C2 column sweep is near-linear so bandwidth is modelled as per_col * columns",
+      "admissible": false,
+      "evidence": [
+        "cols=1: 4.097 GB/s",
+        "cols=2: 7.637 GB/s (1.86x)",
+        "cols=4: 16.147 GB/s (3.94x)",
+        "linear within ~4%: 4.03 GB/s/col x 4 = 16.1 GB/s, matches the measured 4-col roof"
+      ],
+      "caveats": [
+        "RETIRED - MISLABELLED. This is a per-STREAM feed rate, not per-column: c2_feed/c5_drain build ONE fifo per column, so '4 columns' meant 4 streams. One column with 4 fifos reaches 15.8 GB/s; 8 streams reach 30.8 GB/s, still scaling. Use bw_feed_per_stream_bytes_s.",
+        "broadcast pattern (every column reads the same stream); R56 found shared vs distinct made no difference on aie2p, unverified here",
+        "cheapest possible consumer \u2014 a real kernel may not reach this rate"
+      ],
+      "measured_utc": "2026-07-16T19:15:37+00:00"
+    },
+    "bw_drain_per_col_bytes_s": {
+      "name": "bw_drain_per_col_bytes_s",
+      "value": 3980000000.0,
+      "unit": "bytes/s/column",
+      "bench": "C5",
+      "method": "per-column drain rate from the C5 column sweep",
+      "admissible": false,
+      "evidence": [
+        "cols=1: 4.140 GB/s",
+        "cols=2: 8.149 GB/s (1.97x)",
+        "cols=4: 15.916 GB/s (3.84x)",
+        "feed and drain are SYMMETRIC on npu1 (16.147 vs 15.916 GB/s at 4 cols) \u2014 unlike halo, where R64 found the output DMA starved 198 us of a 241 us span"
+      ],
+      "caveats": [
+        "RETIRED - MISLABELLED. This is a per-STREAM drain rate, not per-column: c2_feed/c5_drain build ONE fifo per column, so '4 columns' meant 4 streams. One column with 4 fifos reaches 15.8 GB/s; 8 streams reach 30.8 GB/s, still scaling. Use bw_feed_per_stream_bytes_s.",
+        "near-linear in columns, same as feed"
+      ],
+      "measured_utc": "2026-07-16T19:15:37+00:00"
+    },
+    "cyc_per_vmac": {
+      "name": "cyc_per_vmac",
+      "value": 1.0,
+      "unit": "cycles",
+      "bench": "C4",
+      "method": "ISA: 1 vmac per bundle in the unrolled chain loop; hardware: VMAC/s == f_H at saturation",
+      "admissible": true,
+      "evidence": [
+        "(4, 8, 8): vmac/call=1.00, MACs/vmac=256",
+        "(8, 8, 8): vmac/call=2.00, MACs/vmac=256",
+        "(4, 16, 8): vmac/call=2.00, MACs/vmac=256",
+        "(2, 8, 8): vmac/call=1.00, MACs/vmac=128",
+        "(4, 8, 8): 268.17 G MACs/s/core (264 MACs/cycle)",
+        "(8, 8, 8): 258.05 G MACs/s/core (254 MACs/cycle)",
+        "(4, 16, 8): 260.59 G MACs/s/core (257 MACs/cycle)",
+        "(2, 8, 8): 129.85 G MACs/s/core (128 MACs/cycle)"
+      ],
+      "caveats": [
+        "int8 x int8 only; other dtypes unmeasured"
+      ],
+      "measured_utc": "2026-07-17T05:02:50+00:00"
+    },
+    "macs_per_native_vmac_int8_int4": {
+      "name": "macs_per_native_vmac_int8_int4",
+      "value": 512.0,
+      "unit": "MACs",
+      "bench": "C4",
+      "method": "int8 x int4 (mmul_8_4): MACs per source mac() / native vmacs; confirmed by measured MACs/s",
+      "admissible": true,
+      "evidence": [
+        "ISA <4,16,8,int8,int4>: 1 vmac/call, 512 MACs => 512 MACs/VMAC (NATIVE)",
+        "HW <4,16,8,int8,int4>: 520.09 G MACs/s = 512.4 MACs/cycle \u2014 exactly 2x int8 x int8",
+        "HW <8,16,8>: 522.82 G MACs/s; HW <4,32,8>: 524.98 G MACs/s (both VIRTUAL, same rate)",
+        "VMAC/s is ~1.01-1.03 G across every shape AND dtype: the issue rate is fixed at f_H, only MACs-per-VMAC changes"
+      ],
+      "caveats": [
+        "THIS IS WHERE >16 TOPS COMES FROM: 16 x 512 x 2 x 1.015 GHz = 16.63 TOPS, matching the ~16 TOPS marketing figure. The claim is int8 x int4, NOT dense int8 x int8.",
+        "directly relevant to hipfire: OQ4/MQ4 are 4-bit weight formats, so the quant path gets 2x",
+        "mmul_8_4 has its OWN shape family (4x16x8, 8x16x8, 4x32x8); int8 shapes are invalid for it",
+        "optimal shape is <4,16,8,int8,int4> \u2014 native and fills the VMAC"
+      ],
+      "measured_utc": "2026-07-17T05:19:29+00:00"
+    },
+    "f_h_pmode_invariant": {
+      "name": "f_h_pmode_invariant",
+      "value": 1.0,
+      "unit": "bool",
+      "bench": "K1/K4",
+      "method": "re-ran K1 chains=4 under pmode=turbo via passwordless sudo, compared against default",
+      "admissible": true,
+      "evidence": [
+        "default: 1019.3 MHz (0.981 ns/VMAC)",
+        "turbo: 988.5 MHz (1.011 ns/VMAC)",
+        "turbo is a NO-OP for the AIE compute clock \u2014 3% slower, within run-to-run noise",
+        "matches halo/aie2p findings: turbo 15.21 vs 15.7 TOPS, compute clock already maxed under load"
+      ],
+      "caveats": [
+        "pmode restored to default after the test",
+        "rules OUT clock as the explanation for >16 TOPS; the answer is int4 (see macs_per_native_vmac_int8_int4)"
+      ],
+      "measured_utc": "2026-07-17T05:19:29+00:00"
+    },
+    "macs_per_native_vmac_int8_int8": {
+      "name": "macs_per_native_vmac_int8_int8",
+      "value": 256.0,
+      "unit": "MACs",
+      "bench": "C4",
+      "method": "int8 x int8: MACs per source mac() / native vmacs emitted; confirmed by measured MACs/s",
+      "admissible": true,
+      "evidence": [
+        "ISA <4,8,8>: 1 vmac/call, 256 MACs => 256 MACs/VMAC (NATIVE)",
+        "ISA <8,8,8>: 2 vmac/call, 512 MACs => 256 MACs/VMAC (VIRTUAL)",
+        "HW <4,8,8>: 258.68 G MACs/s = 254.9 MACs/cycle",
+        "HW <8,8,8>: 258.84 G MACs/s = 255.0 MACs/cycle \u2014 2x the time per call, IDENTICAL throughput",
+        "HW <2,8,8>: 130.47 G MACs/s = 128.5 MACs/cycle (half-fills the VMAC)"
+      ],
+      "caveats": [
+        "mmul<8,8,8> is VIRTUAL on AIE2 (native on AIE2P) \u2014 it buys nothing here",
+        "optimal int8 x int8 shape is <4,8,8>",
+        "dense int8 peak = 16 x 256 x 2 x 1.015 GHz = 8.31 TOPS \u2014 HALF the ~16 TOPS figure"
+      ],
+      "measured_utc": "2026-07-17T05:19:29+00:00"
+    },
+    "j_per_byte_external": {
+      "name": "j_per_byte_external",
+      "value": 1.9508e-10,
+      "unit": "J/byte",
+      "bench": "E1",
+      "method": "matched-rate marginal of C2 feed kernel over null, per external byte",
+      "admissible": true,
+      "evidence": [
+        "matched-rate 50 disp/s, 500 dispatches, 10 s windows, RAPL package-0 integration",
+        "null 0.337 W / feed 0.664 W / compute 0.773 W package delta; marginals subtract null so host submit cancels",
+        "feed marginal 0.327 W = 6.546 mJ/dispatch over 33.6 MB -> 1.9508e-10 J/byte (5.13 GB/J)",
+        "compute marginal 0.436 W = 8.721 mJ/dispatch over 1.638 G MACs -> 5.3227e-12 J/MAC (187.9 G MACs/J)"
+      ],
+      "caveats": [
+        "PACKAGE-DELTA basis on an APU: CPU+GPU+NPU share rails and there is no NPU power sensor. Never report as NPU power.",
+        "MATCHED RATE IS LOAD-BEARING. Free-running, package power tracks dispatch rate: a null kernel at 4326/s burns 10.343 W doing nothing, vs compute 1.082 W at 133/s. Free-run even INVERTS the ordering (free-run says feed >> compute; matched-rate says compute > feed). Any energy number taken without rate matching is measuring the host submit loop.",
+        "measured at pmode=default; f_H is pmode-invariant (turbo is a no-op) but energy may not be",
+        "feed = external DDR->array DMA (C2 tile stream). Does not cover memtile->core or core->core movement."
+      ],
+      "measured_utc": "2026-07-17T08:35:24+00:00"
+    },
+    "j_per_mac_int8": {
+      "name": "j_per_mac_int8",
+      "value": 5.3227e-12,
+      "unit": "J/MAC",
+      "bench": "E1",
+      "method": "matched-rate marginal of K1/C4 VMAC chain over null, per int8 MAC",
+      "admissible": false,
+      "evidence": [
+        "matched-rate 50 disp/s, 500 dispatches, 10 s windows, RAPL package-0 integration",
+        "null 0.337 W / feed 0.664 W / compute 0.773 W package delta; marginals subtract null so host submit cancels",
+        "feed marginal 0.327 W = 6.546 mJ/dispatch over 33.6 MB -> 1.9508e-10 J/byte (5.13 GB/J)",
+        "compute marginal 0.436 W = 8.721 mJ/dispatch over 1.638 G MACs -> 5.3227e-12 J/MAC (187.9 G MACs/J)"
+      ],
+      "caveats": [
+        "RETIRED \u2014 DO NOT USE. 1-CORE figure \u2014 5.5x pessimistic. Fixed costs (0.36 W) do not amortise at 1 core. This is the constant that made the GPU look 2.29x more efficient than the NPU. Use j_per_mac_int8_int8_16core.",
+        "PACKAGE-DELTA basis on an APU: CPU+GPU+NPU share rails and there is no NPU power sensor. Never report as NPU power.",
+        "MATCHED RATE IS LOAD-BEARING. Free-running, package power tracks dispatch rate: a null kernel at 4326/s burns 10.343 W doing nothing, vs compute 1.082 W at 133/s. Free-run even INVERTS the ordering (free-run says feed >> compute; matched-rate says compute > feed). Any energy number taken without rate matching is measuring the host submit loop.",
+        "measured at pmode=default; f_H is pmode-invariant (turbo is a no-op) but energy may not be",
+        "feed = external DDR->array DMA (C2 tile stream). Does not cover memtile->core or core->core movement.",
+        "int8 x int8 via mmul<4,8,8>; int4 does 2x MACs per VMAC so J/MAC should halve \u2014 unmeasured"
+      ],
+      "measured_utc": "2026-07-17T08:35:24+00:00"
+    },
+    "byte_mac_energy_ratio": {
+      "name": "byte_mac_energy_ratio",
+      "value": 36.7,
+      "unit": "MACs/byte",
+      "bench": "E1",
+      "method": "J/byte divided by J/MAC \u2014 the break-even arithmetic intensity",
+      "admissible": false,
+      "evidence": [
+        "matched-rate 50 disp/s, 500 dispatches, 10 s windows, RAPL package-0 integration",
+        "null 0.337 W / feed 0.664 W / compute 0.773 W package delta; marginals subtract null so host submit cancels",
+        "feed marginal 0.327 W = 6.546 mJ/dispatch over 33.6 MB -> 1.9508e-10 J/byte (5.13 GB/J)",
+        "compute marginal 0.436 W = 8.721 mJ/dispatch over 1.638 G MACs -> 5.3227e-12 J/MAC (187.9 G MACs/J)",
+        "1.9508e-10 / 5.3227e-12 = 36.7"
+      ],
+      "caveats": [
+        "RETIRED \u2014 DO NOT USE. ARTIFACT of the 1-core J/MAC. Divided J/byte by 5.32e-12 (1 core, where the fixed 0.36 W dominates) giving 37 MACs/byte. The correct value from the 16-core J/MAC is 183 (int8) / 401 (int4). Use byte_mac_energy_ratio_<dtype_pair>. Retired so no dtype pair can silently fall back to it.",
+        "PACKAGE-DELTA basis on an APU: CPU+GPU+NPU share rails and there is no NPU power sensor. Never report as NPU power.",
+        "MATCHED RATE IS LOAD-BEARING. Free-running, package power tracks dispatch rate: a null kernel at 4326/s burns 10.343 W doing nothing, vs compute 1.082 W at 133/s. Free-run even INVERTS the ordering (free-run says feed >> compute; matched-rate says compute > feed). Any energy number taken without rate matching is measuring the host submit loop.",
+        "measured at pmode=default; f_H is pmode-invariant (turbo is a no-op) but energy may not be",
+        "feed = external DDR->array DMA (C2 tile stream). Does not cover memtile->core or core->core movement.",
+        "THE tok/J DESIGN LAW: below ~37 MACs per byte fed, energy is dominated by data movement, not arithmetic. Decode (AI~1) is 37x movement-dominated => bit-width is the energy lever. Prefill (AI~M) is compute-dominated => MMUL rate is the energy lever. This is why power-shaped and speed-shaped kernels diverge."
+      ],
+      "measured_utc": "2026-07-17T08:35:24+00:00"
+    },
+    "gpu_gb_per_j": {
+      "name": "gpu_gb_per_j",
+      "value": 3.73,
+      "unit": "GB/J",
+      "bench": "G1",
+      "method": "gfx1103 grid-stride read of 256 MiB, marginal over null launch at matched 50/s",
+      "admissible": true,
+      "evidence": [
+        "GPU gfx1103 (Radeon 780M, 12 CU) and the NPU are on the SAME die and share package rails,",
+        "so RAPL package-0 measures both. Same instrument, same matched-rate padding, same null subtraction.",
+        "matched rate 50/s, 10 s windows; all kernels verified to MEET the rate (a first run had GPU compute at",
+        "311/500 launches @30.8/s \u2014 the harness now refuses results whose rate target was missed).",
+        "GPU null 0.735 W / feed 4.323 W -> marginal 3.588 W -> 3.73 GB/J",
+        "NPU E1 feed: 5.13 GB/J => NPU is 1.37x more energy-efficient at moving bytes"
+      ],
+      "caveats": [
+        "FAIR COMPARISON: C2 uses 4 workers = full NPU width; this uses all 12 CUs.",
+        "256 MiB working set, far beyond cache, so it is real DDR traffic on both sides."
+      ],
+      "measured_utc": "2026-07-17T08:48:06+00:00"
+    },
+    "gpu_gmacs_per_j_int8": {
+      "name": "gpu_gmacs_per_j_int8",
+      "value": 430.24,
+      "unit": "G MACs/J",
+      "bench": "G1",
+      "method": "gfx1103 v_wmma_i32_16x16x16_iu8 resident chain, marginal over null at matched 50/s, all 12 CUs",
+      "admissible": true,
+      "evidence": [
+        "GPU null 0.735 W / compute 9.479 W -> marginal 8.744 W -> 430.24 G MACs/J",
+        "vs NPU 4-core 379.7 (GPU 1.13x ahead) and NPU 16-core extrapolated 551.6 (NPU 1.28x ahead)"
+      ],
+      "caveats": [
+        "NOW ADMISSIBLE: the NPU side has a 4-core datapoint and a validated core-scaling fit, so this is no longer 12 CUs vs 1 core.",
+        "The 16-core NPU comparison remains an EXTRAPOLATION (blocked by the 5-BO arg limit)."
+      ],
+      "measured_utc": "2026-07-17T08:58:23+00:00"
+    },
+    "j_per_mac_int8_4core": {
+      "name": "j_per_mac_int8_4core",
+      "value": 2.634e-12,
+      "unit": "J/MAC",
+      "bench": "E1",
+      "method": "4-core NPU VMAC chain, matched-rate marginal over null",
+      "admissible": false,
+      "evidence": [
+        "matched rate 50/s, 10 s windows, RAPL package-0, null-subtracted marginals",
+        "cores=1: 0.487 W -> 169.0 G MACs/J   cores=2: 0.607 W -> 268.2   cores=4: 0.864 W -> 379.7",
+        "fit W = 0.358 + 0.1261*cores; residuals -0.5%/+0.6%/-0.1% across the three points",
+        "throughput scales near-perfectly: 237.4 / 472.9 / 939.7 G MACs/s at 1/2/4 cores (3.96x at 4)",
+        "so 4x the MACs costs only 1.77x the power: a 0.358 W FIXED component amortises across cores",
+        "379.7 G MACs/J at 4 cores vs 169.0 at 1 core \u2014 2.25x better per MAC"
+      ],
+      "caveats": [
+        "RETIRED \u2014 DO NOT USE. Superseded by the 16-core measurement AND measured on the old per-core-BO topology, which the broadcast+join layout replaced. Not comparable to current numbers.",
+        "4 cores of 16. H4 caps DPU data-args at 5 BOs; the multi-core build spends 1 on a shared source and 1 per core output, so 4 is the ceiling without a memtile output join.",
+        "SUPERSEDES the 1-core j_per_mac_int8 (5.32e-12) for any device comparison \u2014 the 1-core figure is 2.25x pessimistic and was what made the GPU look 2.29x better."
+      ],
+      "measured_utc": "2026-07-17T08:58:23+00:00"
+    },
+    "npu_core_power_fit": {
+      "name": "npu_core_power_fit",
+      "value": 0.1261,
+      "unit": "W/core",
+      "bench": "E1",
+      "method": "slope of marginal package delta vs core count at matched 50/s; intercept 0.358 W",
+      "admissible": false,
+      "evidence": [
+        "matched rate 50/s, 10 s windows, RAPL package-0, null-subtracted marginals",
+        "cores=1: 0.487 W -> 169.0 G MACs/J   cores=2: 0.607 W -> 268.2   cores=4: 0.864 W -> 379.7",
+        "fit W = 0.358 + 0.1261*cores; residuals -0.5%/+0.6%/-0.1% across the three points",
+        "throughput scales near-perfectly: 237.4 / 472.9 / 939.7 G MACs/s at 1/2/4 cores (3.96x at 4)",
+        "so 4x the MACs costs only 1.77x the power: a 0.358 W FIXED component amortises across cores"
+      ],
+      "caveats": [
+        "RETIRED \u2014 DO NOT USE. The fit W = 0.358 + 0.1261*cores was excellent (+/-0.6%) over 1-4 cores but ONLY for the per-core-BO topology. Reaching 16 cores required broadcast+join, which costs far less DMA, so extrapolating this fit predicted 551.6 G MACs/J where 929 was measured. Fitting across a topology change is invalid.",
+        "fitted over cores=1..4 only; 8/16-core values are EXTRAPOLATION, not measurement"
+      ],
+      "measured_utc": "2026-07-17T08:58:23+00:00"
+    },
+    "j_per_mac_int8_16core_gmacs_j": {
+      "name": "j_per_mac_int8_16core_gmacs_j",
+      "value": 929.15,
+      "unit": "G MACs/J",
+      "bench": "E1",
+      "method": "full 16-core NPU VMAC chain, matched-rate marginal over null, median of 4 runs",
+      "admissible": false,
+      "evidence": [
+        "4 runs: [994.6, 965.3, 884.2, 893.0] G MACs/J -> median 929.1, range 884-995 (+/-6%)",
+        "package delta 1.318/1.358/1.482/1.468 W \u2014 well clear of the ~0.3 W idle drift, unlike the",
+        "2/4-core points whose small deltas came out NON-MONOTONIC (4c read lower than 2c), not usable",
+        "throughput 3718 G MACs/s = 3.72 T MACs/s = 7.4 TOPS, 89% of the 4.16 T MACs/s theoretical peak",
+        "topology: broadcast a/b fifos + per-column memtile join -> 1 source + 4 column outputs = 5 BOs"
+      ],
+      "caveats": [
+        "RETIRED \u2014 DO NOT USE. Redundant duplicate of j_per_mac_int8_int8_16core in inverse units. Kept only as the reference g1_gpu prints; superseded to avoid two sources of truth for one quantity.",
+        "SUPERSEDES both the 1-core figure (169) and the 16-core EXTRAPOLATION (551.6). The extrapolation",
+        "was pessimistic ~1.7x because the TOPOLOGY changed: broadcast+join costs far less DMA than the",
+        "per-core-BO layout the fit was taken on. Fitting a trend across a topology change is invalid.",
+        "still a package delta on shared rails; not NPU-only power"
+      ],
+      "measured_utc": "2026-07-17T09:19:23+00:00"
+    },
+    "gpu_ref_npu_gb_per_j": {
+      "name": "gpu_ref_npu_gb_per_j",
+      "value": 5.13,
+      "unit": "GB/J",
+      "bench": "E1",
+      "method": "NPU feed reference used by g1_gpu for its verdict line",
+      "admissible": true,
+      "evidence": [
+        "C2 4-column feed, matched rate"
+      ],
+      "caveats": [
+        "reference only"
+      ],
+      "measured_utc": "2026-07-17T09:19:23+00:00"
+    },
+    "j_per_mac_int8_int8_16core": {
+      "name": "j_per_mac_int8_int8_16core",
+      "value": 1.0658708164570455e-12,
+      "unit": "J/MAC",
+      "bench": "E1",
+      "method": "16-core VMAC chain, matched-rate marginal over null, median of 7 runs",
+      "admissible": true,
+      "evidence": [
+        "int8 x int8 <4,8,8>, 16 cores, 7 runs: median 938.2 G MACs/J, range 869-1035 (+/-9%)",
+        "int8 x int4 <4,16,8>, 16 cores, 3 runs: median 2054.6 G MACs/J, range 1900-2222 (+/-8%)",
+        "ratio 2.19x \u2014 int4 does 2x the MACs (52.4 vs 26.2 G/dispatch) for slightly LESS power (1.276 vs 1.397 W)",
+        "matched rate 50/s, RAPL package-0, null-subtracted; broadcast+join topology across all 16 cores"
+      ],
+      "caveats": [
+        "combined noise puts the ratio interval at roughly [1.93, 2.45]; the model previously ASSUMED exactly 2.0x, which sits inside that range \u2014 the assumption is validated, if slightly conservative.",
+        "CONTRAST WITH AIE2P: 8bf799233 found W4A8 gives NO compute win on AIE2P. On AIE2 int4 wins ~2x on BOTH speed (C4: 512 vs 256 MACs/native VMAC) and energy (2.19x). The int4 lever is arch-specific \u2014 do not carry either result across generations.",
+        "package delta on shared rails; not NPU-only power"
+      ],
+      "measured_utc": "2026-07-17T09:30:30+00:00"
+    },
+    "j_per_mac_int8_int4_16core": {
+      "name": "j_per_mac_int8_int4_16core",
+      "value": 4.867127421395892e-13,
+      "unit": "J/MAC",
+      "bench": "E1",
+      "method": "16-core int8xint4 mmul<4,16,8> chain, matched-rate marginal over null, median of 3 runs",
+      "admissible": true,
+      "evidence": [
+        "int8 x int8 <4,8,8>, 16 cores, 7 runs: median 938.2 G MACs/J, range 869-1035 (+/-9%)",
+        "int8 x int4 <4,16,8>, 16 cores, 3 runs: median 2054.6 G MACs/J, range 1900-2222 (+/-8%)",
+        "ratio 2.19x \u2014 int4 does 2x the MACs (52.4 vs 26.2 G/dispatch) for slightly LESS power (1.276 vs 1.397 W)",
+        "matched rate 50/s, RAPL package-0, null-subtracted; broadcast+join topology across all 16 cores"
+      ],
+      "caveats": [
+        "combined noise puts the ratio interval at roughly [1.93, 2.45]; the model previously ASSUMED exactly 2.0x, which sits inside that range \u2014 the assumption is validated, if slightly conservative.",
+        "CONTRAST WITH AIE2P: 8bf799233 found W4A8 gives NO compute win on AIE2P. On AIE2 int4 wins ~2x on BOTH speed (C4: 512 vs 256 MACs/native VMAC) and energy (2.19x). The int4 lever is arch-specific \u2014 do not carry either result across generations.",
+        "package delta on shared rails; not NPU-only power"
+      ],
+      "measured_utc": "2026-07-17T09:30:30+00:00"
+    },
+    "byte_mac_energy_ratio_int8_int8": {
+      "name": "byte_mac_energy_ratio_int8_int8",
+      "value": 183.0,
+      "unit": "MACs/byte",
+      "bench": "E1",
+      "method": "J/byte divided by 16-core int8 J/MAC",
+      "admissible": true,
+      "evidence": [
+        "J/byte 1.9508e-10 (C2 feed, 4 columns) / J/MAC 16-core measured",
+        "int8 x int8: 1.9508e-10 / 1.0659e-12 = 183 MACs per byte",
+        "int8 x int4: 1.9508e-10 / 4.8671e-13 = 401 MACs per byte"
+      ],
+      "caveats": [
+        "SUPERSEDES the 36.7 figure, which divided by the 1-CORE J/MAC (5.32e-12). At 1 core the fixed 0.36 W dominates, making each MAC look 5.5x more expensive than it is at full width. The law was an artifact of an under-parallelised bench.",
+        "CONSEQUENCE: prefill (AI 82-101) is NOT compute-dominated as previously stated \u2014 it sits well below the 183 break-even, so on npu1 BOTH LLM phases are movement-dominated for energy. The array is simply very efficient (929 G MACs/J) relative to DDR bytes (5.13 GB/J).",
+        "a kernel needs AI > 183 (int8) or > 401 (int4) before arithmetic dominates its energy at all"
+      ],
+      "measured_utc": "2026-07-17T09:31:50+00:00"
+    },
+    "byte_mac_energy_ratio_int8_int4": {
+      "name": "byte_mac_energy_ratio_int8_int4",
+      "value": 400.8,
+      "unit": "MACs/byte",
+      "bench": "E1",
+      "method": "J/byte divided by 16-core int4 J/MAC",
+      "admissible": true,
+      "evidence": [
+        "J/byte 1.9508e-10 (C2 feed, 4 columns) / J/MAC 16-core measured",
+        "int8 x int8: 1.9508e-10 / 1.0659e-12 = 183 MACs per byte",
+        "int8 x int4: 1.9508e-10 / 4.8671e-13 = 401 MACs per byte"
+      ],
+      "caveats": [
+        "SUPERSEDES the 36.7 figure, which divided by the 1-CORE J/MAC (5.32e-12). At 1 core the fixed 0.36 W dominates, making each MAC look 5.5x more expensive than it is at full width. The law was an artifact of an under-parallelised bench.",
+        "CONSEQUENCE: prefill (AI 82-101) is NOT compute-dominated as previously stated \u2014 it sits well below the 183 break-even, so on npu1 BOTH LLM phases are movement-dominated for energy. The array is simply very efficient (929 G MACs/J) relative to DDR bytes (5.13 GB/J).",
+        "a kernel needs AI > 183 (int8) or > 401 (int4) before arithmetic dominates its energy at all"
+      ],
+      "measured_utc": "2026-07-17T09:31:50+00:00"
+    },
+    "bw_feed_per_stream_bytes_s": {
+      "name": "bw_feed_per_stream_bytes_s",
+      "value": 3950000000.0,
+      "unit": "bytes/s/stream",
+      "bench": "C2-audit",
+      "method": "per-fifo feed rate; linear in stream count",
+      "admissible": true,
+      "evidence": [
+        "1 column, 1/2/4 fifos: 3.972 / 8.071 / 15.803 GB/s (floor-corrected) - 3.98x for 4x the fifos,",
+        "  span FLAT at 2267/2234/2278 us. One column with 4 fifos matches C2's entire 4-column roof.",
+        "4 columns, 1/2 fifos each (4/8 streams): 15.40 / 30.79 GB/s - 2.0x for 2x the streams",
+        "per-stream rate ~3.85-4.03 GB/s, linear in STREAM count, not column count",
+        "16 streams (4 col x 4) failed placement: 'Failed to find a tile matching column 2'"
+      ],
+      "caveats": [
+        "THE ROOF IS NOT 16.1 GB/s. That was 4 STREAMS (c2_feed builds one fifo per column). Measured >=30.8 GB/s at 8 streams and still scaling linearly; the true ceiling is unmeasured (16-stream placement fails).",
+        "Same error class as the 1-core compute bug: the constant described the BENCH topology, not the device.",
+        "The aie2p corpus used the right language all along ('one active receive stream is 14.4 GB/s') - the per-column mislabel was introduced here.",
+        "DOES NOT affect J/byte or the 183 law: energy per byte is independent of how fast the bytes move. It DOES mean t_feed is up to ~4x pessimistic for multi-stream schedules."
+      ],
+      "measured_utc": "2026-07-17T09:57:51+00:00"
+    },
+    "feed_roof_bytes_s": {
+      "name": "feed_roof_bytes_s",
+      "value": 30800000000.0,
+      "unit": "bytes/s",
+      "bench": "C2-audit",
+      "method": "8 concurrent shim input streams x ~3.85 GB/s; shim-channel limited",
+      "admissible": true,
+      "evidence": [
+        "toolchain (device.get_num_connections): shim in=2/out=2 per tile x 4 shim tiles => 8 streams max;",
+        "  memtile in=6/out=6 x4; core in=2/out=2 x16",
+        "measured: 4 streams 15.40 GB/s; 8 streams 30.79 GB/s (4col x2) and 28.31 (2col x4) - both work;",
+        "  12 streams (4col x3) and 16 (4col x4) FAIL placement: shim channels exhausted",
+        "measurement and the toolchain channel budget agree exactly: the wall is at 8"
+      ],
+      "caveats": [
+        "This is the DEVICE feed ceiling, not a bench artifact: ~3.95 GB/s x 8 streams = ~30.8 GB/s.",
+        "Shim channels are the binding resource, NOT columns and NOT cores. 2 col x 4 fifos works as well as",
+        " 4 col x 2 - only the total stream count matters.",
+        "core in=2/out=2 also explains C1's earlier 'nargs>=3 fails Resource allocation pipeline failed':",
+        " 3 inputs + 1 output needs 4 core in-channels and a core has 2.",
+        "memtile in=6/out=6 is why the per-column join works (<=6 sub-fifos gathered per memtile)."
+      ],
+      "measured_utc": "2026-07-17T10:14:39+00:00"
+    },
+    "max_shim_input_streams": {
+      "name": "max_shim_input_streams",
+      "value": 8,
+      "unit": "streams",
+      "bench": "C2-audit",
+      "method": "toolchain get_num_connections(shim, in)=2 x 4 shim tiles; confirmed by placement failure at 12",
+      "admissible": true,
+      "evidence": [
+        "toolchain (device.get_num_connections): shim in=2/out=2 per tile x 4 shim tiles => 8 streams max;",
+        "  memtile in=6/out=6 x4; core in=2/out=2 x16",
+        "measured: 4 streams 15.40 GB/s; 8 streams 30.79 GB/s (4col x2) and 28.31 (2col x4) - both work;",
+        "  12 streams (4col x3) and 16 (4col x4) FAIL placement: shim channels exhausted",
+        "measurement and the toolchain channel budget agree exactly: the wall is at 8"
+      ],
+      "caveats": [
+        "This is the DEVICE feed ceiling, not a bench artifact: ~3.95 GB/s x 8 streams = ~30.8 GB/s.",
+        "Shim channels are the binding resource, NOT columns and NOT cores. 2 col x 4 fifos works as well as",
+        " 4 col x 2 - only the total stream count matters.",
+        "core in=2/out=2 also explains C1's earlier 'nargs>=3 fails Resource allocation pipeline failed':",
+        " 3 inputs + 1 output needs 4 core in-channels and a core has 2.",
+        "memtile in=6/out=6 is why the per-column join works (<=6 sub-fifos gathered per memtile)."
+      ],
+      "measured_utc": "2026-07-17T10:14:39+00:00"
+    },
+    "core_dma_channels_in": {
+      "name": "core_dma_channels_in",
+      "value": 2,
+      "unit": "channels",
+      "bench": "C0",
+      "method": "device.get_num_connections(core_tile, input)",
+      "admissible": true,
+      "evidence": [
+        "core in=2 out=2"
+      ],
+      "caveats": [
+        "Explains C1's nargs>=3 build failure: 3 inputs + 1 output exceeds a core's 2 in-channels.",
+        "Caps fifos per core, which is why multi-stream schedules need more CORES, not more fifos/core."
+      ],
+      "measured_utc": "2026-07-17T10:14:39+00:00"
+    },
+    "memtile_dma_channels_in": {
+      "name": "memtile_dma_channels_in",
+      "value": 6,
+      "unit": "channels",
+      "bench": "C0",
+      "method": "device.get_num_connections(mem_tile, input)",
+      "admissible": true,
+      "evidence": [
+        "memtile in=6 out=6"
+      ],
+      "caveats": [
+        "Bounds the per-column output join at 6 sub-fifos."
+      ],
+      "measured_utc": "2026-07-17T10:14:39+00:00"
+    },
+    "gpu_feed_peak_bytes_s": {
+      "name": "gpu_feed_peak_bytes_s",
+      "value": 79500000000.0,
+      "unit": "bytes/s",
+      "bench": "G1",
+      "method": "free-run grid-stride read of 256 MiB, gfx1103, 12 CU",
+      "admissible": true,
+      "evidence": [
+        "free-run (rate=0), 8 s windows: GPU feed 296.1 launches/s x 256 MiB = 79.5 GB/s;",
+        "  GPU compute 100.0 launches/s x 7.55e10 MACs = 7.55 T MACs/s = 15.1 TOPS",
+        "NPU (measured, full width): feed 30.8 GB/s (8 shim streams); compute 3.72 T MACs/s = 7.4 TOPS (16 cores)",
+        "GPU free-run package delta: feed 24.0 W, compute 27.8 W; NPU full-width ~1.4 W => ~17x the power"
+      ],
+      "caveats": [
+        "THE SPEED GAP IS UNDERSTATED. The NPU compute figure is 89% of its 4.16 T MACs/s theoretical peak, but the GPU's 15.1 TOPS is only ~42% of gfx1103's ~35 TOPS theoretical - the g1 chain kernel is not tuned for the GPU (4 chains, occupancy unexplored). A tuned GPU kernel widens the gap.",
+        "GPU feed 79.5 GB/s is ~78% of LPDDR5-6400 dual-channel theoretical (~102 GB/s) - near roofline, trustworthy.",
+        "NPU feed 30.8 GB/s is a HARD shim-channel ceiling (8 streams), not a tuning artifact.",
+        "Speed is free-run; energy is matched-rate. Do not mix: free-run energy tracks dispatch rate (see E1)."
+      ],
+      "measured_utc": "2026-07-17T10:22:28+00:00"
+    },
+    "gpu_compute_peak_macs_s": {
+      "name": "gpu_compute_peak_macs_s",
+      "value": 7550000000000.0,
+      "unit": "MACs/s",
+      "bench": "G1",
+      "method": "free-run v_wmma_i32_16x16x16_iu8 chain, gfx1103",
+      "admissible": true,
+      "evidence": [
+        "free-run (rate=0), 8 s windows: GPU feed 296.1 launches/s x 256 MiB = 79.5 GB/s;",
+        "  GPU compute 100.0 launches/s x 7.55e10 MACs = 7.55 T MACs/s = 15.1 TOPS",
+        "NPU (measured, full width): feed 30.8 GB/s (8 shim streams); compute 3.72 T MACs/s = 7.4 TOPS (16 cores)",
+        "GPU free-run package delta: feed 24.0 W, compute 27.8 W; NPU full-width ~1.4 W => ~17x the power"
+      ],
+      "caveats": [
+        "THE SPEED GAP IS UNDERSTATED. The NPU compute figure is 89% of its 4.16 T MACs/s theoretical peak, but the GPU's 15.1 TOPS is only ~42% of gfx1103's ~35 TOPS theoretical - the g1 chain kernel is not tuned for the GPU (4 chains, occupancy unexplored). A tuned GPU kernel widens the gap.",
+        "GPU feed 79.5 GB/s is ~78% of LPDDR5-6400 dual-channel theoretical (~102 GB/s) - near roofline, trustworthy.",
+        "NPU feed 30.8 GB/s is a HARD shim-channel ceiling (8 streams), not a tuning artifact.",
+        "Speed is free-run; energy is matched-rate. Do not mix: free-run energy tracks dispatch rate (see E1).",
+        "NOT the GPU's peak: ~42% of theoretical. A lower bound on GPU speed."
+      ],
+      "measured_utc": "2026-07-17T10:22:28+00:00"
+    },
+    "npu_feed_peak_bytes_s": {
+      "name": "npu_feed_peak_bytes_s",
+      "value": 30800000000.0,
+      "unit": "bytes/s",
+      "bench": "C2-audit",
+      "method": "8 shim input streams, the hard channel ceiling",
+      "admissible": true,
+      "evidence": [
+        "free-run (rate=0), 8 s windows: GPU feed 296.1 launches/s x 256 MiB = 79.5 GB/s;",
+        "  GPU compute 100.0 launches/s x 7.55e10 MACs = 7.55 T MACs/s = 15.1 TOPS",
+        "NPU (measured, full width): feed 30.8 GB/s (8 shim streams); compute 3.72 T MACs/s = 7.4 TOPS (16 cores)",
+        "GPU free-run package delta: feed 24.0 W, compute 27.8 W; NPU full-width ~1.4 W => ~17x the power"
+      ],
+      "caveats": [
+        "THE SPEED GAP IS UNDERSTATED. The NPU compute figure is 89% of its 4.16 T MACs/s theoretical peak, but the GPU's 15.1 TOPS is only ~42% of gfx1103's ~35 TOPS theoretical - the g1 chain kernel is not tuned for the GPU (4 chains, occupancy unexplored). A tuned GPU kernel widens the gap.",
+        "GPU feed 79.5 GB/s is ~78% of LPDDR5-6400 dual-channel theoretical (~102 GB/s) - near roofline, trustworthy.",
+        "NPU feed 30.8 GB/s is a HARD shim-channel ceiling (8 streams), not a tuning artifact.",
+        "Speed is free-run; energy is matched-rate. Do not mix: free-run energy tracks dispatch rate (see E1)."
+      ],
+      "measured_utc": "2026-07-17T10:22:28+00:00"
+    },
+    "npu_compute_peak_macs_s": {
+      "name": "npu_compute_peak_macs_s",
+      "value": 3720000000000.0,
+      "unit": "MACs/s",
+      "bench": "E1/C4",
+      "method": "16 cores, int8 mmul<4,8,8>; 89% of theoretical",
+      "admissible": true,
+      "evidence": [
+        "free-run (rate=0), 8 s windows: GPU feed 296.1 launches/s x 256 MiB = 79.5 GB/s;",
+        "  GPU compute 100.0 launches/s x 7.55e10 MACs = 7.55 T MACs/s = 15.1 TOPS",
+        "NPU (measured, full width): feed 30.8 GB/s (8 shim streams); compute 3.72 T MACs/s = 7.4 TOPS (16 cores)",
+        "GPU free-run package delta: feed 24.0 W, compute 27.8 W; NPU full-width ~1.4 W => ~17x the power"
+      ],
+      "caveats": [
+        "THE SPEED GAP IS UNDERSTATED. The NPU compute figure is 89% of its 4.16 T MACs/s theoretical peak, but the GPU's 15.1 TOPS is only ~42% of gfx1103's ~35 TOPS theoretical - the g1 chain kernel is not tuned for the GPU (4 chains, occupancy unexplored). A tuned GPU kernel widens the gap.",
+        "GPU feed 79.5 GB/s is ~78% of LPDDR5-6400 dual-channel theoretical (~102 GB/s) - near roofline, trustworthy.",
+        "NPU feed 30.8 GB/s is a HARD shim-channel ceiling (8 streams), not a tuning artifact.",
+        "Speed is free-run; energy is matched-rate. Do not mix: free-run energy tracks dispatch rate (see E1)."
+      ],
+      "measured_utc": "2026-07-17T10:22:28+00:00"
+    },
+    "batching_tok_j_gain_b512": {
+      "name": "batching_tok_j_gain_b512",
+      "value": 64.4,
+      "unit": "x",
+      "bench": "design",
+      "method": "tok/J at B=512 divided by tok/J at B=1, 768x1280 int8 projection, fastest candidate",
+      "admissible": true,
+      "evidence": [
+        "768x1280 projection, int8xint8, int32 out, fastest candidate per batch (npu1):",
+        "  B=1    AI 1.0   217.9us  0.194mJ    4589 tok/s   5144 tok/J  194.4 uJ/tok",
+        "  B=64   AI 41.7  230.1us  0.361mJ  278090 tok/s 177232 tok/J    5.6 uJ/tok",
+        "  B=512  AI 97.2  320.9us  1.546mJ 1595443 tok/s 331077 tok/J    3.0 uJ/tok",
+        "  B=2048 AI 113.4 818.7us  5.611mJ 2501662 tok/s 365026 tok/J    2.7 uJ/tok",
+        "AI saturates because the OUTPUT scales with batch: byte share w=32%/a=26%/out=43% at B=256",
+        "  -> w=6%/a=35%/out=59% at B=2048 (int32, 4col); 80% out at 1 col.",
+        "bf16 out at B=2048: AI 113.4->160.8, device 818.7->639.3us, tok/J 365026->446404 (+22% both axes)",
+        "only bf16 out AND minimal activation replication crosses 183: B=512 1col bf16 = 187.3; B=2048 1col bf16 = 258.2"
+      ],
+      "caveats": [
+        "BATCHING IS THE BIGGEST SINGLE LEVER MEASURED: 64x tok/J and 348x tok/s from B=1 to B=512. It amortises WEIGHTS across the batch (weight byte share falls 32% -> 6%).",
+        "But batching does NOT amortise the OUTPUT, which scales with batch and comes to dominate the byte count (up to 80%), capping arithmetic intensity around 97-113 with an int32 accumulator. BATCHING ALONE CANNOT CROSS THE 183 BREAK-EVEN.",
+        "It also does NOT amortise the KV cache - each sequence carries its own - so decode attention stays movement-bound at ANY batch size. Batch the projections; the KV read is irreducible.",
+        "CONSEQUENCE: on npu1 the LLM hot path is movement-bound at every batch size in the practical range, so 'energy is bytes' holds throughout. bf16 output is the cheapest way to buy back both axes (+22% at B=2048), and R65 reached the same conclusion by hand on aie2p.",
+        "Model-derived, not measured on hardware: rests on the calibrated J/byte, J/MAC and bw_feed_per_stream."
+      ],
+      "measured_utc": "2026-07-17T11:11:36+00:00"
+    },
+    "gemm_ai_ceiling_int32_out": {
+      "name": "gemm_ai_ceiling_int32_out",
+      "value": 113.4,
+      "unit": "MACs/byte",
+      "bench": "design",
+      "method": "AI at B=2048 with an int32 accumulator output, 4 columns; output dominates bytes",
+      "admissible": true,
+      "evidence": [
+        "768x1280 projection, int8xint8, int32 out, fastest candidate per batch (npu1):",
+        "  B=1    AI 1.0   217.9us  0.194mJ    4589 tok/s   5144 tok/J  194.4 uJ/tok",
+        "  B=64   AI 41.7  230.1us  0.361mJ  278090 tok/s 177232 tok/J    5.6 uJ/tok",
+        "  B=512  AI 97.2  320.9us  1.546mJ 1595443 tok/s 331077 tok/J    3.0 uJ/tok",
+        "  B=2048 AI 113.4 818.7us  5.611mJ 2501662 tok/s 365026 tok/J    2.7 uJ/tok",
+        "AI saturates because the OUTPUT scales with batch: byte share w=32%/a=26%/out=43% at B=256",
+        "  -> w=6%/a=35%/out=59% at B=2048 (int32, 4col); 80% out at 1 col.",
+        "bf16 out at B=2048: AI 113.4->160.8, device 818.7->639.3us, tok/J 365026->446404 (+22% both axes)",
+        "only bf16 out AND minimal activation replication crosses 183: B=512 1col bf16 = 187.3; B=2048 1col bf16 = 258.2"
+      ],
+      "caveats": [
+        "BATCHING IS THE BIGGEST SINGLE LEVER MEASURED: 64x tok/J and 348x tok/s from B=1 to B=512. It amortises WEIGHTS across the batch (weight byte share falls 32% -> 6%).",
+        "But batching does NOT amortise the OUTPUT, which scales with batch and comes to dominate the byte count (up to 80%), capping arithmetic intensity around 97-113 with an int32 accumulator. BATCHING ALONE CANNOT CROSS THE 183 BREAK-EVEN.",
+        "It also does NOT amortise the KV cache - each sequence carries its own - so decode attention stays movement-bound at ANY batch size. Batch the projections; the KV read is irreducible.",
+        "CONSEQUENCE: on npu1 the LLM hot path is movement-bound at every batch size in the practical range, so 'energy is bytes' holds throughout. bf16 output is the cheapest way to buy back both axes (+22% at B=2048), and R65 reached the same conclusion by hand on aie2p.",
+        "Model-derived, not measured on hardware: rests on the calibrated J/byte, J/MAC and bw_feed_per_stream.",
+        "Below the 183 int8 break-even at every batch size => an int32-output projection is movement-bound no matter how much you batch."
+      ],
+      "measured_utc": "2026-07-17T11:11:36+00:00"
+    },
+    "cpu_gb_per_j": {
+      "name": "cpu_gb_per_j",
+      "value": 1.48,
+      "unit": "GB/J",
+      "bench": "P1",
+      "method": "7840HS 16-thread streaming read of 256 MiB, RAPL package delta over idle",
+      "admissible": true,
+      "evidence": [
+        "7840HS, 8 cores / 16 threads, AVX-512 VNNI (_mm512_dpbusd_epi32 = 64 int8 MACs/instr), OpenMP x16",
+        "feed:    idle 3.92 W load 41.67 W delta 37.75 W -> 55.83 GB/s, 1.48 GB/J (256 MiB streaming read)",
+        "compute: idle 4.09 W load 42.35 W delta 38.26 W -> 2.07 T MACs/s (4.1 TOPS), 54.0 G MACs/J",
+        "compute is AT Zen 4 peak: 8 cores x 64 MACs x 4.05 GHz = 2.07e12 exactly (AVX-512 is double-pumped,",
+        "  so 1 dpbusd/cycle/core is the ceiling; SMT does not help a port-limited op)",
+        "same package, same rails, same RAPL counter as E1 (NPU) and G1 (GPU) -> directly comparable"
+      ],
+      "caveats": [
+        "THE CPU IS DOMINATED ON BOTH AXES: slower than the GPU on feed (55.8 vs 79.5 GB/s) and compute (4.1 vs 15.1 TOPS), and far worse on energy than either (1.48 GB/J vs NPU 5.13; 54 G MACs/J vs NPU 938 \u2014 17x). It is never the throughput-optimal or energy-optimal choice for LLM work on this SoC.",
+        "The one thing the CPU beats the NPU at is movement SPEED (55.8 vs 30.8 GB/s) \u2014 the NPU is capped by its 8-stream shim ceiling while the CPU has the full DDR path. If a kernel is movement-bound and latency-critical, CPU > NPU on speed, though at 3.5x the energy per byte.",
+        "Unlike the GPU compute leg (~42% of theoretical), this is at ~100% of peak, so it is not understated.",
+        "No rate-matching needed: E1's confound was the HOST submit loop, and here the host IS the workload."
+      ],
+      "measured_utc": "2026-07-17T11:18:09+00:00"
+    },
+    "cpu_gmacs_per_j_int8": {
+      "name": "cpu_gmacs_per_j_int8",
+      "value": 54.0,
+      "unit": "G MACs/J",
+      "bench": "P1",
+      "method": "AVX-512 VNNI resident dot chain, 16 threads, RAPL package delta over idle",
+      "admissible": true,
+      "evidence": [
+        "7840HS, 8 cores / 16 threads, AVX-512 VNNI (_mm512_dpbusd_epi32 = 64 int8 MACs/instr), OpenMP x16",
+        "feed:    idle 3.92 W load 41.67 W delta 37.75 W -> 55.83 GB/s, 1.48 GB/J (256 MiB streaming read)",
+        "compute: idle 4.09 W load 42.35 W delta 38.26 W -> 2.07 T MACs/s (4.1 TOPS), 54.0 G MACs/J",
+        "compute is AT Zen 4 peak: 8 cores x 64 MACs x 4.05 GHz = 2.07e12 exactly (AVX-512 is double-pumped,",
+        "  so 1 dpbusd/cycle/core is the ceiling; SMT does not help a port-limited op)",
+        "same package, same rails, same RAPL counter as E1 (NPU) and G1 (GPU) -> directly comparable"
+      ],
+      "caveats": [
+        "THE CPU IS DOMINATED ON BOTH AXES: slower than the GPU on feed (55.8 vs 79.5 GB/s) and compute (4.1 vs 15.1 TOPS), and far worse on energy than either (1.48 GB/J vs NPU 5.13; 54 G MACs/J vs NPU 938 \u2014 17x). It is never the throughput-optimal or energy-optimal choice for LLM work on this SoC.",
+        "The one thing the CPU beats the NPU at is movement SPEED (55.8 vs 30.8 GB/s) \u2014 the NPU is capped by its 8-stream shim ceiling while the CPU has the full DDR path. If a kernel is movement-bound and latency-critical, CPU > NPU on speed, though at 3.5x the energy per byte.",
+        "Unlike the GPU compute leg (~42% of theoretical), this is at ~100% of peak, so it is not understated.",
+        "No rate-matching needed: E1's confound was the HOST submit loop, and here the host IS the workload."
+      ],
+      "measured_utc": "2026-07-17T11:18:09+00:00"
+    },
+    "cpu_feed_peak_bytes_s": {
+      "name": "cpu_feed_peak_bytes_s",
+      "value": 55830000000.0,
+      "unit": "bytes/s",
+      "bench": "P1",
+      "method": "16-thread streaming read",
+      "admissible": true,
+      "evidence": [
+        "7840HS, 8 cores / 16 threads, AVX-512 VNNI (_mm512_dpbusd_epi32 = 64 int8 MACs/instr), OpenMP x16",
+        "feed:    idle 3.92 W load 41.67 W delta 37.75 W -> 55.83 GB/s, 1.48 GB/J (256 MiB streaming read)",
+        "compute: idle 4.09 W load 42.35 W delta 38.26 W -> 2.07 T MACs/s (4.1 TOPS), 54.0 G MACs/J",
+        "compute is AT Zen 4 peak: 8 cores x 64 MACs x 4.05 GHz = 2.07e12 exactly (AVX-512 is double-pumped,",
+        "  so 1 dpbusd/cycle/core is the ceiling; SMT does not help a port-limited op)",
+        "same package, same rails, same RAPL counter as E1 (NPU) and G1 (GPU) -> directly comparable"
+      ],
+      "caveats": [
+        "THE CPU IS DOMINATED ON BOTH AXES: slower than the GPU on feed (55.8 vs 79.5 GB/s) and compute (4.1 vs 15.1 TOPS), and far worse on energy than either (1.48 GB/J vs NPU 5.13; 54 G MACs/J vs NPU 938 \u2014 17x). It is never the throughput-optimal or energy-optimal choice for LLM work on this SoC.",
+        "The one thing the CPU beats the NPU at is movement SPEED (55.8 vs 30.8 GB/s) \u2014 the NPU is capped by its 8-stream shim ceiling while the CPU has the full DDR path. If a kernel is movement-bound and latency-critical, CPU > NPU on speed, though at 3.5x the energy per byte.",
+        "Unlike the GPU compute leg (~42% of theoretical), this is at ~100% of peak, so it is not understated.",
+        "No rate-matching needed: E1's confound was the HOST submit loop, and here the host IS the workload."
+      ],
+      "measured_utc": "2026-07-17T11:18:09+00:00"
+    },
+    "cpu_compute_peak_macs_s": {
+      "name": "cpu_compute_peak_macs_s",
+      "value": 2070000000000.0,
+      "unit": "MACs/s",
+      "bench": "P1",
+      "method": "AVX-512 VNNI, at Zen 4 theoretical peak",
+      "admissible": true,
+      "evidence": [
+        "7840HS, 8 cores / 16 threads, AVX-512 VNNI (_mm512_dpbusd_epi32 = 64 int8 MACs/instr), OpenMP x16",
+        "feed:    idle 3.92 W load 41.67 W delta 37.75 W -> 55.83 GB/s, 1.48 GB/J (256 MiB streaming read)",
+        "compute: idle 4.09 W load 42.35 W delta 38.26 W -> 2.07 T MACs/s (4.1 TOPS), 54.0 G MACs/J",
+        "compute is AT Zen 4 peak: 8 cores x 64 MACs x 4.05 GHz = 2.07e12 exactly (AVX-512 is double-pumped,",
+        "  so 1 dpbusd/cycle/core is the ceiling; SMT does not help a port-limited op)",
+        "same package, same rails, same RAPL counter as E1 (NPU) and G1 (GPU) -> directly comparable"
+      ],
+      "caveats": [
+        "THE CPU IS DOMINATED ON BOTH AXES: slower than the GPU on feed (55.8 vs 79.5 GB/s) and compute (4.1 vs 15.1 TOPS), and far worse on energy than either (1.48 GB/J vs NPU 5.13; 54 G MACs/J vs NPU 938 \u2014 17x). It is never the throughput-optimal or energy-optimal choice for LLM work on this SoC.",
+        "The one thing the CPU beats the NPU at is movement SPEED (55.8 vs 30.8 GB/s) \u2014 the NPU is capped by its 8-stream shim ceiling while the CPU has the full DDR path. If a kernel is movement-bound and latency-critical, CPU > NPU on speed, though at 3.5x the energy per byte.",
+        "Unlike the GPU compute leg (~42% of theoretical), this is at ~100% of peak, so it is not understated.",
+        "No rate-matching needed: E1's confound was the HOST submit loop, and here the host IS the workload."
+      ],
+      "measured_utc": "2026-07-17T11:18:09+00:00"
+    },
+    "composition_is_max": {
+      "name": "composition_is_max",
+      "value": 1.0,
+      "unit": "bool",
+      "bench": "D1",
+      "method": "stream tiles AND compute per tile; sweep MMULS across the feed/compute crossover",
+      "admissible": true,
+      "evidence": [
+        "1 stream, 1024 x 4 KiB tiles, C1 floor subtracted, per-tile times (npu1):",
+        "  MMULS   t_core/tile   MEASURED   max model    sum model",
+        "      0            0n      1044n       1037n        1037n",
+        "     64          252n      1057n       1037n        1289n",
+        "    256         1009n      1151n       1037n        2046n   <- crossover",
+        "    512         2018n      2142n       2018n        3055n",
+        "   1024         4035n      4136n       4035n        5072n",
+        "mean |error|: max 4.1%, sum 33.2%; max closer on 4/5 points (the 5th is MMULS=0 where both agree)",
+        "shape is the prediction: FLAT (1044->1057->1151) while t_core < t_feed, then slope 1"
+      ],
+      "caveats": [
+        "This validates the model's CENTRAL design decision, which nothing had tested: family B is feed-only (trivial core) and family C is compute-only (no feed). Both terms were validated in ISOLATION; the composition never was.",
+        "KNOWN LIMIT: at the crossover (t_core ~= t_feed) the hard max() UNDER-predicts by ~10% \u2014 a real pipeline has a soft knee where neither term fully dominates. Away from the knee the error is 2-6%.",
+        "Single stream, single core. Whether the overlap holds with 8 streams x 16 cores contending is unmeasured."
+      ],
+      "measured_utc": "2026-07-17T11:47:39+00:00"
+    },
+    "composition_max_mean_err": {
+      "name": "composition_max_mean_err",
+      "value": 0.041,
+      "unit": "fraction",
+      "bench": "D1",
+      "method": "mean |error| of the max model across the MMULS sweep",
+      "admissible": true,
+      "evidence": [
+        "1 stream, 1024 x 4 KiB tiles, C1 floor subtracted, per-tile times (npu1):",
+        "  MMULS   t_core/tile   MEASURED   max model    sum model",
+        "      0            0n      1044n       1037n        1037n",
+        "     64          252n      1057n       1037n        1289n",
+        "    256         1009n      1151n       1037n        2046n   <- crossover",
+        "    512         2018n      2142n       2018n        3055n",
+        "   1024         4035n      4136n       4035n        5072n",
+        "mean |error|: max 4.1%, sum 33.2%; max closer on 4/5 points (the 5th is MMULS=0 where both agree)",
+        "shape is the prediction: FLAT (1044->1057->1151) while t_core < t_feed, then slope 1"
+      ],
+      "caveats": [
+        "This validates the model's CENTRAL design decision, which nothing had tested: family B is feed-only (trivial core) and family C is compute-only (no feed). Both terms were validated in ISOLATION; the composition never was.",
+        "KNOWN LIMIT: at the crossover (t_core ~= t_feed) the hard max() UNDER-predicts by ~10% \u2014 a real pipeline has a soft knee where neither term fully dominates. Away from the knee the error is 2-6%.",
+        "Single stream, single core. Whether the overlap holds with 8 streams x 16 cores contending is unmeasured.",
+        "sum model: 33.2% \u2014 8x worse. The composition is not a sum."
+      ],
+      "measured_utc": "2026-07-17T11:47:39+00:00"
+    },
+    "model_vs_oqgemm_ordinal": {
+      "name": "model_vs_oqgemm_ordinal",
+      "value": 1.0,
+      "unit": "kendall_tau",
+      "bench": "validate",
+      "method": "design.py single-core predictions vs oq_gemm measured, B sweep",
+      "admissible": true,
+      "evidence": [
+        "oq_gemm (independent, hand-written single-core int_matmul), M=512 K=512, vs model single-core spec:",
+        "  B=32  pred 190.3 meas 370.1 (-49%);  B=64 220 vs 405 (-46%);  B=128 284 vs 617 (-54%);  B=256 413 vs 1062 (-61%)",
+        "ORDINAL: perfect (pred and meas both monotonic 32<64<128<256, Kendall tau=1.0)",
+        "MAGNITUDE: model under-predicts 46-61%, worsening as t_core dominates",
+        "root cause: t_core assumes peak (1 VMAC/cyc saturated); oq_gemm reaches ~28% of one core's peak",
+        "  (63 GMAC/s vs 260 GMAC/s single-core peak) due to small tiles + per-tile objectfifo acquire/release + K-loop C re-zero"
+      ],
+      "caveats": [
+        "FIRST validation against an INDEPENDENT real kernel (design.py specs were previously derived, never validated).",
+        "The model is a PEAK LOWER-BOUND for tiled compute, not a magnitude predictor. Families B/C/D validated it on the SAME tight-resident-chain structure it was calibrated on (which DOES saturate the VMAC pipe); a differently-structured hand-written GEMM does not, so t_core is ~2.3x optimistic.",
+        "ORDINAL still holds against the real kernel \u2014 so ranking (the model's stated product) works; absolute numbers do not.",
+        "THE IMPROVEMENT LEVER: a calibrated core-efficiency factor for tiled kernels (t_core /= eta). eta~0.28 for oq_gemm's tile(32,64,32); would need calibrating across real GEMM shapes/tilings, not fitting from one point.",
+        "single-core comparison; design.py's full-array specs (broadcast+join) are still unvalidated against a real multi-core kernel."
+      ],
+      "measured_utc": "2026-07-17T16:11:36+00:00"
+    },
+    "t_core_efficiency_tiled_gemm": {
+      "name": "t_core_efficiency_tiled_gemm",
+      "value": 0.28,
+      "unit": "fraction",
+      "bench": "validate",
+      "method": "measured single-core GMAC/s / peak across 4 shapes (256x512,512x512,1024x512,768x768), tile(32,64,64)",
+      "admissible": true,
+      "evidence": [
+        "eta_core (fixed floor removed) at compute-bound points: 512x512 B256=0.285, 1024x512 B256=0.287,",
+        "  768x768 B256=0.292, 512x512 B128=0.280 -> clusters 0.28-0.29",
+        "applying t_core /= 0.28: B=64 -5%, B=128 -0%, B=256 +1% vs measured (was -46..-61% at eff=1)",
+        "MULTI-CORE whole_array (mlir-aie example, 4 cols/16 cores, i8, floor-removed, npu1):",
+        "  512^3 tile32^3: 108 GFLOP/s -> eff 0.014;  1024^3 t64: 685 -> 0.086;  2048^3 t64: 1955 -> 0.239",
+        "=> efficiency is TILE+SIZE dependent (aie2p tilesweep law), NOT constant. 0.28 is the large-tile asymptote,",
+        "   reached by single-core oq_gemm (tile 32,64,64) and multi-core 2048^3; small tiles/problems are far lower.",
+        "TILE ISOLATED at fixed 2048^3 (npu1, 4 cols): tile 32^3 -> 0.075, tile 64^3 -> 0.239, tile 128^3 -> L1-BLOCKED",
+        "  (128x128 int32 output = 64KB = full L1, no double-buffer room -> 'Resource allocation pipeline failed')",
+        "=> efficiency is TILE-AREA-driven; npu1 practical ceiling ~0.24 for this kernel, capped by L1 at 64^3 with i32 out",
+        "=> bf16 output (2B) halves the output tile, freeing L1 for a bigger tile: a DOUBLE win (movement + efficiency)",
+        "EFFICIENCY IS A 2-D SURFACE (tile area x problem size), not a 1-D eff(area) curve:",
+        "  tile 64 (area 4096) at 1024^3/1536^3/2048^3 -> 0.086/0.141/0.209 (rises with problem size = tile count)",
+        "  attempted eff = 0.334*A/(A+2287) fit 2048^3 area 256-4096 within +-12%, but over-predicts smaller problems",
+        "BUILDABLE TILE CEILING is tile 64 for i32 output: tile 96 and 128 FAIL placement (L1), tighter than a naive sum"
+      ],
+      "caveats": [
+        "design.py uses a FLAT 0.209 = whole_array 2048^3 tile 64 (max buildable, large problem). Defensible for prefill-scale GEMMs (large K,N -> many tiles -> well amortised); optimistic for small problems (down to 0.014).",
+        "A proper model is eff(tile_area, tile_count) + a real L1-placement budget -- a 2-D surface, NOT built. The 1-D eff(area) curve was tried and rejected: it ignored problem-size and picked unbuildable tiles (96/128).",
+        "SINGLE-CORE oq_gemm is a different regime (0.28 at its tile) -- do not conflate with the multi-core 0.209.",
+        "eff=1.0 remains correct for tight resident chains (K1/C4 saturate the pipe)."
+      ],
+      "measured_utc": "2026-07-17T16:11:36+00:00"
+    },
+    "gemm_efficiency_surface": {
+      "name": "gemm_efficiency_surface",
+      "value": 0.8,
+      "unit": "Cmax",
+      "bench": "whole_array-2d",
+      "method": "fit eff = Cmax*area/(area+A)*n^2/(n^2+N^2) to whole_array grid (tile 32/48/64 x problem 128..2304 + 2048^3 anchors, 13 points)",
+      "admissible": true,
+      "evidence": [
+        "params: Cmax=0.800, A=9775, N=23.5 (area=m*n, n=tiles per core); amortization is SQUARED in n",
+        "low-n sweep added: t32 area1024 n4->0.0016 n16->0.0133; t48 area2304 n4->0.0059 n16->0.0400; t64 area4096 n4->0.0134 n16->0.0835",
+        "grid eff: t32 area1024 -> 0.038/0.080/0.081 (n 36/144/324); t48 area2304 -> 0.041/0.139/0.141 (n 16/64/144); t64 area4096 -> 0.168 (n36), 0.209 (n64 @2048^3)",
+        "squared form: mean |err| 22%, max 80% (vs linear n/(n+N): mean 92%, +543% at n=4). well-behaved for n>=16",
+        "design.py tile-64 eff: P=768(n9)->0.03, 1536(n36)->0.17, 4096(n256)->0.23, 8192->0.24"
+      ],
+      "caveats": [
+        "n=4 (tiny 256-512^3 problems) still noisy: model +33%/-27%/-51% across the three areas, mixed-sign (measurement noise, not bias).",
+        "MULTI-CORE (4 cols) i8 whole_array; single-core oq_gemm is a separate regime (~0.28).",
+        "tile 64 = max buildable for i32 output (96/128 fail placement); bf16 could allow larger (unverified).",
+        "whole_array tiling constraint: P/t must be a multiple of 8 to build, so odd n (1/9/25) could not be measured \u2014 surface uses the 13 buildable points."
+      ],
+      "measured_utc": "2026-07-18T05:40:00+00:00"
+    }
+  }
+}

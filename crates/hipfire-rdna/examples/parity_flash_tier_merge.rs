@@ -82,8 +82,10 @@ fn main() {
         let od = gpu.alloc_tensor(&[nh * d], DType::F32).unwrap();
         let md = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
         let ld = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
-        gpu.attention_cold_slots(&qd, &kd, &vd, &od, &md, &ld, nh, nkv, ns, scale, 0, 0, None)
-            .unwrap();
+        gpu.attention_cold_slots(
+            &qd, &kd, &vd, &od, &md, &ld, nh, nkv, ns, scale, 0, 0, 0, None, 256,
+        )
+        .unwrap();
         (od, md, ld)
     };
 
@@ -94,7 +96,7 @@ fn main() {
     let omr = gpu.alloc_tensor(&[nh * d], DType::F32).unwrap();
     let mmr = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
     let lmr = gpu.alloc_tensor(&[nh], DType::F32).unwrap();
-    gpu.flash_tier_merge(&oa, &ma, &la, &ob, &mb, &lb, &omr, &mmr, &lmr, nh)
+    gpu.flash_tier_merge(&oa, &ma, &la, &ob, &mb, &lb, &omr, &mmr, &lmr, nh, 256)
         .unwrap();
 
     // Reference: full attention over all nt slots.

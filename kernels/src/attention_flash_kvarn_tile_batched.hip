@@ -28,12 +28,19 @@
 //   [ GROUP*2   ]             s_col[c]     fp16   (per token-in-block)
 //
 // Grid: [n_heads, max_tiles, sub_batch_size]. Block: [32, 1, 1].
+//
+// The per-thread register arrays are sized by the MAXDPT template parameter =
+// max(head_dim)/32: the default entry point uses MAXDPT=8 (head_dim <= 256, e.g.
+// gemma3/qwen35 — BYTE-IDENTICAL to before) and `_hd512` uses MAXDPT=16 for
+// gemma4's head_dim-512 global layers. The loop bound `dpt = head_dim/32` is the
+// real work extent; MAXDPT only sizes the storage so head_dim-256 keeps its low
+// register pressure.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-extern "C" __launch_bounds__(32, 16)
-__global__ void attention_flash_kvarn_tile_batched(
+template <int MAXDPT>
+__device__ __forceinline__ void kvarn_tile_body(
     const float* __restrict__ q,               // [sub_batch × n_heads × head_dim]
     const uint8_t* __restrict__ records,       // block-tiled KVarN K records
     const float* __restrict__ window,          // [GROUP × kv_dim] f32 recent window
@@ -52,13 +59,19 @@ __global__ void attention_flash_kvarn_tile_batched(
     int block_start,                           // ignored when tree_bias == nullptr
     int block_cols,                            // ignored when tree_bias == nullptr
     int n_full_blocks,                         // record tiles before the window tile
-    int rec_bytes                              // kvarn_record_bytes(head_dim, GROUP)
+    int rec_bytes,                             // kvarn_record_bytes_bits(head_dim, GROUP, bits)
+    int bits                                   // K code bits in {2,4,8}; 8/bits codes/byte
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
     const int local_bid = blockIdx.z;
     if (h >= n_heads) return;
     const int tid = threadIdx.x;
+    // dims-per-thread: 32-thread block covers head_dim (128 -> 4, 256 -> 8). This
+    // (not a hardcoded 8) is what makes the kernel correct for head_dim != 256.
+    const int dpt = head_dim / 32;
+    const int cpb = 8 / bits;                  // K codes per byte
+    const int codemask = (1 << bits) - 1;
 
     const int global_bid = batch_offset + local_bid;
     const bool tree_mode = (tree_bias != nullptr);
@@ -83,28 +96,26 @@ __global__ void attention_flash_kvarn_tile_batched(
     extern __shared__ float sdata[];
     float* scores = sdata;
 
-    // Load Q for this batch position: 8 consecutive dims per thread.
+    // Load Q for this batch position: `dpt` consecutive dims per thread.
     const float* q_head = q + local_bid * q_dim + h * head_dim;
-    const int d0 = tid * 8;
-    float mq[8];
-    #pragma unroll
-    for (int i = 0; i < 8; i++) mq[i] = q_head[d0 + i];
+    const int d0 = tid * dpt;
+    float mq[MAXDPT];                          // dpt <= MAXDPT (head_dim <= 32*MAXDPT)
+    for (int i = 0; i < dpt; i++) mq[i] = q_head[d0 + i];
 
     // ── Phase A: Q·K with inline KVarN dequant (records) or f32 window. ──
     const bool is_window = (tile_id >= n_full_blocks);
     if (!is_window) {
         // Record tile `tile_id`, kv-head `kv_h`. Channel-major [head_dim × GROUP].
         const uint8_t* rec = records + (size_t)(tile_id * n_kv_heads + kv_h) * rec_bytes;
-        const int off_scale = (head_dim * group + 1) / 2;
+        const int off_scale = (head_dim * group + cpb - 1) / cpb;
         const int off_zp = off_scale + head_dim * 2;
         const int off_scol = off_zp + head_dim * 2;
         const __half* scale_abs = (const __half*)(rec + off_scale);
         const __half* zp_abs = (const __half*)(rec + off_zp);
         const __half* s_col = (const __half*)(rec + off_scol);
-        // Per-channel scale/zp for this thread's 8 dims — load once per tile.
-        float sa[8], za[8];
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
+        // Per-channel scale/zp for this thread's dpt dims — load once per tile.
+        float sa[MAXDPT], za[MAXDPT];
+        for (int i = 0; i < dpt; i++) {
             sa[i] = __half2float(scale_abs[d0 + i]);
             za[i] = __half2float(zp_abs[d0 + i]);
         }
@@ -112,11 +123,10 @@ __global__ void attention_flash_kvarn_tile_batched(
             const int t = tile_start + t_local;
             const float sc = __half2float(s_col[t_local]);
             float partial = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < 8; i++) {
+            for (int i = 0; i < dpt; i++) {
                 const int idx = (d0 + i) * group + t_local;    // channel-major flat index
-                const uint8_t byte = rec[idx >> 1];
-                const float qd = (float)((idx & 1) == 0 ? (byte & 0xf) : (byte >> 4));
+                const uint8_t byte = rec[idx / cpb];
+                const float qd = (float)((byte >> ((idx % cpb) * bits)) & codemask);
                 const float k = (qd * sa[i] + za[i]) * sc;
                 partial += mq[i] * k;
             }
@@ -136,8 +146,7 @@ __global__ void attention_flash_kvarn_tile_batched(
             const int t = tile_start + t_local;
             const float* kt = window + (size_t)(t - win_base) * kv_dim + kv_h * head_dim;
             float partial = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < 8; i++) {
+            for (int i = 0; i < dpt; i++) {
                 partial += mq[i] * kt[d0 + i];
             }
             for (int off = 16; off > 0; off >>= 1)
@@ -173,13 +182,13 @@ __global__ void attention_flash_kvarn_tile_batched(
     __syncthreads();
 
     // ── Phase D: V-weighted accumulation (Q8_0) — identical to the Q8 tile. ──
-    float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    float out_vec[MAXDPT];
+    for (int i = 0; i < MAXDPT; i++) out_vec[i] = 0.0f;
     for (int t_local = 0; t_local < tile_len; t_local++) {
         float w = scores[t_local];
         int t = tile_start + t_local;
         const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < dpt; i++) {
             const int d = d0 + i;
             const int bi = d / 32;
             const int bj = d % 32;
@@ -195,7 +204,36 @@ __global__ void attention_flash_kvarn_tile_batched(
         p[0] = tile_max;
         p[1] = tile_sum;
     }
-    #pragma unroll
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < dpt; i++)
         p[2 + d0 + i] = out_vec[i];
+}
+
+// head_dim <= 256 (dpt <= 8): the original entry point, byte-identical register
+// footprint (gemma3/qwen35 kvarn).
+extern "C" __launch_bounds__(32, 16) __global__ void attention_flash_kvarn_tile_batched(
+    const float* __restrict__ q, const uint8_t* __restrict__ records,
+    const float* __restrict__ window, const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials, const int* __restrict__ positions,
+    const float* __restrict__ tree_bias, int n_heads, int n_kv_heads, int head_dim,
+    int max_seq, float scale_attn, int tile_size, int max_tiles, int batch_offset,
+    int block_start, int block_cols, int n_full_blocks, int rec_bytes, int bits) {
+    kvarn_tile_body<8>(q, records, window, v_cache, partials, positions, tree_bias,
+                       n_heads, n_kv_heads, head_dim, max_seq, scale_attn, tile_size,
+                       max_tiles, batch_offset, block_start, block_cols, n_full_blocks,
+                       rec_bytes, bits);
+}
+
+// head_dim == 512 (dpt == 16): gemma4 global layers. Lower min-blocks hint since
+// the register arrays double.
+extern "C" __launch_bounds__(32, 8) __global__ void attention_flash_kvarn_tile_batched_hd512(
+    const float* __restrict__ q, const uint8_t* __restrict__ records,
+    const float* __restrict__ window, const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials, const int* __restrict__ positions,
+    const float* __restrict__ tree_bias, int n_heads, int n_kv_heads, int head_dim,
+    int max_seq, float scale_attn, int tile_size, int max_tiles, int batch_offset,
+    int block_start, int block_cols, int n_full_blocks, int rec_bytes, int bits) {
+    kvarn_tile_body<16>(q, records, window, v_cache, partials, positions, tree_bias,
+                        n_heads, n_kv_heads, head_dim, max_seq, scale_attn, tile_size,
+                        max_tiles, batch_offset, block_start, block_cols, n_full_blocks,
+                        rec_bytes, bits);
 }

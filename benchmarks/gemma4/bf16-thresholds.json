@@ -1,0 +1,42 @@
+{
+  "frozen_at": "2026-07-15",
+  "frozen_before_first_hipfire_full_model_comparison": true,
+  "scope": "Gemma 4 BF16 full-model comparisons against pinned Transformers BF16 captures",
+  "hidden_states": {
+    "minimum_cosine": 0.999,
+    "maximum_normalized_rmse": 0.045,
+    "non_finite_values_allowed": 0
+  },
+  "final_logits": {
+    "minimum_cosine": 0.999,
+    "maximum_absolute_error": 0.5,
+    "require_argmax_match": true,
+    "minimum_top5_overlap": 4,
+    "non_finite_values_allowed": 0
+  },
+  "greedy_generation": {
+    "require_exact_token_ids": true
+  },
+  "application": {
+    "hidden_capture_points": "Every selected decoder boundary, including local and global layers and the final pre-norm state",
+    "logit_positions": "Every committed comparison position, not only the final prompt token",
+    "required_prompt_classes": [
+      "short",
+      "sliding_window_minus_one",
+      "sliding_window",
+      "sliding_window_plus_one",
+      "multiple_global_layers"
+    ]
+  },
+  "reference_variability_diagnostic": {
+    "admission_use": "diagnostic only; the post-freeze measurement does not modify these thresholds",
+    "tool": "benchmarks/gemma4/control_noise_bf16.py",
+    "artifact": "benchmarks/gemma4/control-noise-31B.json",
+    "method": "Compare the pinned unpadded SDPA reference with alternate Transformers BF16 attention and padding executions, and also record all pairwise variability. This is a finite observed control band for one prompt, not an irreducible numerical floor.",
+    "checkpoint": "google/gemma-4-31B @ 02e15e4990e8c452f8543fb26beff15b1daf8f3d",
+    "prompt": "The capital of France is",
+    "env": "torch 2.11.0+rocm7.13.0, transformers 5.10.2 (the oracle capture env)",
+    "samples": ["sdpa", "sdpa_pad16", "eager", "eager_pad16"]
+  },
+  "rationale": "The limits allow accumulated BF16 reduction-order noise while requiring near-identical vector direction, bounded absolute logit drift, identical greedy decisions, and no non-finite masking. They are frozen before observing Hipfire Gemma 4 whole-model output and may not be weakened after results are seen. Post-freeze reference-variability measurements are retained as diagnostics only."
+}

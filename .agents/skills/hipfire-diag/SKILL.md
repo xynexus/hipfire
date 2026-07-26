@@ -29,6 +29,8 @@ signals, then maps failures to concrete next steps.
   explicitly approves that remediation.
 - If diagnostics touch kernels, quant formats, dispatch, fusion, rotation,
   rmsnorm, or DFlash/spec-decode behavior, verify with
-  `./scripts/coherence-gate-dflash.sh` before claiming correctness.
+  `./tests/tiny-affected-gate.sh --require-coverage` (the automatic correctness
+  front tier) before claiming correctness; `./tests/coherence-gate-dflash.sh`
+  is an optional manual DFlash/DDTree diagnostic.
 - Treat one smoke run as diagnosis only, not a performance claim.
 

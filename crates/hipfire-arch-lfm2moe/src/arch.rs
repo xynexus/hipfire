@@ -26,12 +26,12 @@
 use crate::config::Lfm2MoeConfig;
 use crate::lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
 use crate::{forward, ARCH_ID};
+use hipfire_rdna::{Gpu, GpuTensor};
 use hipfire_runtime::arch::{
     run_simple_ar, ArchCaps, GenerateCtx, ServeOutcome, ServingBackend, SimpleAr,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use hipfire_rdna::{Gpu, GpuTensor};
 
 /// A loaded LFM2.5-MoE model with GPU-resident weights and per-decode state
 /// (KV cache + short-conv rolling state + logits), so decode is O(1) per token.

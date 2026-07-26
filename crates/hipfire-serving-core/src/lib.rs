@@ -27,6 +27,8 @@
 )]
 
 pub mod dummy;
+pub mod embedding_batch;
+pub mod embedding_runtime;
 pub mod events;
 pub mod evidence;
 pub mod generate;
@@ -38,8 +40,10 @@ pub mod load;
 pub mod memory;
 pub mod model;
 pub mod output_filter;
+pub mod pooling;
 pub mod qwen35_decode;
 pub mod qwen35_prefill;
+pub mod qwen3_embedding;
 pub mod request;
 pub mod session;
 pub mod spec_metrics;

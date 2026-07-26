@@ -1,0 +1,10 @@
+{
+  "name": "hipfire-admin-ui-browser-tests",
+  "private": true,
+  "scripts": {
+    "test:browser": "playwright test --reporter=line"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1"
+  }
+}

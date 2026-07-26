@@ -105,6 +105,7 @@ SUPPORTED_FORMATS = {
     "hfp4",
     "mfp4",
     "paro4",
+    "oq8",
     "q8",
     "f16",
 }
@@ -210,14 +211,57 @@ MIXED_G256_BYTES_PER_GROUP = {
 
 ENGINE_HASH_PATHS = [
     "crates/hipfire-rdna/src/dispatch.rs",
+    "crates/hipfire-rdna/src/dispatch/rope.rs",
     "crates/hipfire-rdna/src/kernels.rs",
     "crates/hipfire-arch-qwen35/src/qwen35.rs",
+    "crates/hipfire-arch-qwen35/src/qwen35/mod.rs",
     "crates/hipfire-runtime/examples/eval_hipfire.rs",
     "kernels/src/rope_partial_interleaved.hip",
     "kernels/src/rope_partial_interleaved_batched.hip",
     "kernels/src/rope_partial_halfsplit.hip",
     "kernels/src/rope_partial_halfsplit_batched.hip",
+    "crates/hipfire-runtime/src/calibration/boundary.rs",
+    "crates/hipfire-runtime/src/calibration/contracts.rs",
+    "crates/hipfire-runtime/src/calibration/expert_capture.rs",
+    "crates/hipfire-runtime/src/calibration/schedule.rs",
+    "crates/hipfire-runtime/src/calibration/source.rs",
+    "crates/hipfire-runtime/src/calibration/stream.rs",
+    "crates/hipfire-runtime/src/moe/grouped.rs",
+    "crates/hipfire-rdna/src/dispatch/moe.rs",
+    "crates/hipfire-coexistence/src/calibrate.rs",
+    "crates/hipfire-quantize/src/main.rs",
+    "crates/hipfire-quantize/src/gptq.rs",
+    "crates/hipfire-quantize/src/ldlq.rs",
+    "crates/hipfire-quantize/src/mixed_precision.rs",
+    "scripts/two_pass_quantize.py",
+    "scripts/astrea_expert_sweep.py",
 ]
+
+
+def engine_hash_paths(root):
+    """Return every source that can change native calibration or evaluation.
+
+    Calibration adapters are discovered by their common source marker instead
+    of being enumerated by family. Hash the complete adapter crate source tree:
+    a thin ``calibration_stream.rs`` can delegate model math to sibling modules,
+    and those changes must invalidate a frozen experiment too.
+    """
+    root = Path(root)
+    paths = set(ENGINE_HASH_PATHS)
+    crates = root / "crates"
+    if crates.is_dir():
+        adapter_roots = {
+            marker.parent
+            for marker in crates.glob("hipfire-arch-*/src/calibration_stream.rs")
+            if marker.is_file()
+        }
+        for adapter_root in adapter_roots:
+            paths.update(
+                source.relative_to(root).as_posix()
+                for source in adapter_root.rglob("*.rs")
+                if source.is_file()
+            )
+    return sorted(paths)
 
 GGML_TYPE_NAMES = {
     0: "F32",
@@ -254,6 +298,7 @@ HFQ_QUANT_TYPE_NAMES = {
     13: "MQ4G256",
     14: "MQ8G256",
     15: "MQ6G256",
+    16: "BF16",
     17: "MQ3G256",
     18: "MQ2G256",
     19: "MQ2G256_LLOYD",
@@ -263,10 +308,20 @@ HFQ_QUANT_TYPE_NAMES = {
     28: "PARO4G128",
     29: "PARO4G128T",
     30: "MQ4G256_LLOYD",
+    31: "QTIP3G256",
+    33: "OQ_PLUS_G256",
+    34: "OQ4G256",
+    35: "OQ8G256",
+    36: "OQ_PLUS_COMPACT",
+    37: "OQ4G256_ARCH_PACKED",
+    38: "OQ3G256",
+    39: "OQ2G256",
+    40: "OQ6G256",
 }
 
 HFQ_QUANT_TYPE_FORMATS = {
     "F16": "f16",
+    "BF16": "bf16",
     "Q8F16": "q8",
     "Q8HFQ": "q8",
     "MQ8G256": "q8",
@@ -282,6 +337,15 @@ HFQ_QUANT_TYPE_FORMATS = {
     "MQ4G256_LLOYD": "mq4",
     "HFP4G32": "hfp4",
     "MFP4G32": "mfp4",
+    "QTIP3G256": "qtip3",
+    "OQ_PLUS_G256": "oq4+",
+    "OQ4G256": "oq4",
+    "OQ8G256": "oq8",
+    "OQ_PLUS_COMPACT": "oq4+",
+    "OQ4G256_ARCH_PACKED": "oq4",
+    "OQ3G256": "oq3",
+    "OQ2G256": "oq2",
+    "OQ6G256": "oq6",
 }
 
 
@@ -575,6 +639,7 @@ def read_hfq_index(path, *, max_tensors=32):
             tensor_map = {}
             all_names = []
             quant_type_counts = {}
+            data_end = data_offset
             cumulative_offset = data_offset
             for i in range(n_tensors):
                 name_len = struct.unpack_from("<H", mm, pos)[0]
@@ -593,6 +658,20 @@ def read_hfq_index(path, *, max_tensors=32):
                 pos += 4
                 data_size = struct.unpack_from("<Q", mm, pos)[0]
                 pos += 8
+                if version >= 2:
+                    if pos + 8 > data_offset:
+                        raise ValueError(f"HFQ v2 tensor {name} is missing its payload offset")
+                    offset_div32 = struct.unpack_from("<Q", mm, pos)[0]
+                    pos += 8
+                    tensor_data_offset = offset_div32 * 32
+                else:
+                    tensor_data_offset = cumulative_offset
+                tensor_data_end = tensor_data_offset + data_size
+                if tensor_data_offset < data_offset or tensor_data_end > len(mm):
+                    raise ValueError(
+                        f"HFQ tensor {name} payload range "
+                        f"{tensor_data_offset}..{tensor_data_end} exceeds the file"
+                    )
 
                 quant_type_name = HFQ_QUANT_TYPE_NAMES.get(quant_type, f"UNKNOWN_{quant_type}")
                 item = {
@@ -601,7 +680,7 @@ def read_hfq_index(path, *, max_tensors=32):
                     "quant_type_name": quant_type_name,
                     "shape": shape,
                     "group_size": group_size,
-                    "data_offset": cumulative_offset,
+                    "data_offset": tensor_data_offset,
                     "data_size": data_size,
                 }
                 all_names.append(name)
@@ -609,7 +688,8 @@ def read_hfq_index(path, *, max_tensors=32):
                 quant_type_counts[quant_type_name] = quant_type_counts.get(quant_type_name, 0) + 1
                 if i < max_tensors:
                     tensors.append(dict(item))
-                cumulative_offset += data_size
+                cumulative_offset = tensor_data_end
+                data_end = max(data_end, tensor_data_end)
 
             names_md5 = hashlib.md5("\n".join(all_names).encode("utf-8")).hexdigest()
             summary = {
@@ -620,9 +700,9 @@ def read_hfq_index(path, *, max_tensors=32):
                 "tensor_count": n_tensors,
                 "metadata_offset": metadata_offset,
                 "data_offset": data_offset,
-                "data_end": cumulative_offset,
+                "data_end": data_end,
                 "file_bytes": len(mm),
-                "data_end_matches_file_size": cumulative_offset == len(mm),
+                "data_end_matches_file_size": data_end == len(mm),
                 "metadata": metadata_summary(metadata),
                 "quant_type_counts": dict(sorted(quant_type_counts.items())),
                 "tensor_names_md5": names_md5,
@@ -2430,8 +2510,15 @@ def file_sha256(path):
 
 def detect_rope_convention(root):
     root = Path(root)
-    dispatch_path = root / "crates" / "hipfire-rdna" / "src" / "dispatch.rs"
-    text = dispatch_path.read_text(encoding="utf-8", errors="ignore") if dispatch_path.exists() else ""
+    dispatch_paths = [
+        root / "crates" / "hipfire-rdna" / "src" / "dispatch.rs",
+        root / "crates" / "hipfire-rdna" / "src" / "dispatch" / "rope.rs",
+    ]
+    text = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore")
+        for path in dispatch_paths
+        if path.exists()
+    )
     has_halfsplit_source = (root / "kernels" / "src" / "rope_partial_halfsplit.hip").exists() or (
         root / "kernels" / "src" / "rope_partial_halfsplit_batched.hip"
     ).exists()
@@ -2447,7 +2534,7 @@ def detect_rope_convention(root):
 def engine_fingerprint(engine_root=None):
     root = Path(engine_root) if engine_root else Path(__file__).resolve().parents[1]
     source_hashes = {}
-    for rel in ENGINE_HASH_PATHS:
+    for rel in engine_hash_paths(root):
         path = root / rel
         if path.is_file():
             source_hashes[rel] = file_sha256(path)
@@ -2937,6 +3024,8 @@ def estimate_format_data_size(shape, quant_format):
         return elements * 2
     if fmt == "q8":
         return q8f16_data_size_for_shape(shape)
+    if fmt == "oq8":
+        return ceil_div(elements, 256) * 258
     if fmt in {"mq4", "hfq4"}:
         return ceil_div(elements, 256) * 136
     if fmt == "mq3":
@@ -2991,6 +3080,11 @@ def load_json_sensitivity(path):
 
 
 def load_imatrix_sensitivity(model, imatrix):
+    with Path(imatrix).open("rb") as f:
+        magic = f.read(4)
+    if magic == b"HFQM":
+        return load_hfqm_imatrix_sensitivity(model, imatrix)
+
     join = match_imatrix_to_hfq(model, imatrix, max_tensors=0)
     scores = {}
     aliases = {}
@@ -3012,6 +3106,72 @@ def load_imatrix_sensitivity(model, imatrix):
         "path": str(imatrix),
         "matched_count": join["matched_count"],
         "unmatched_count": join["unmatched_count"],
+        "errors": errors[:16],
+        "score_count": len(scores),
+        "scores": scores,
+        "aliases": aliases,
+    }
+
+
+def load_hfqm_imatrix_sensitivity(model, imatrix):
+    _, model_tensors = read_hfq_index(model, max_tensors=0)
+    calibration_summary, calibration_tensors = read_hfq_index(imatrix, max_tensors=0)
+    scores = {}
+    aliases = {}
+    errors = []
+    unmatched = []
+
+    path = Path(imatrix)
+    with path.open("rb") as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            metadata_offset = struct.unpack_from("<Q", mm, 16)[0]
+            data_offset = struct.unpack_from("<Q", mm, 24)[0]
+            metadata_region = mm[metadata_offset:data_offset]
+            metadata_end = json_object_end(metadata_region)
+            metadata = json.loads(metadata_region[:metadata_end].decode("utf-8"))
+            per_tensor_tokens = metadata.get("per_tensor_tokens") or {}
+            default_tokens = float(metadata.get("input_token_count") or 1.0)
+
+            for name, tensor in sorted(calibration_tensors.items()):
+                if not name.endswith(".imatrix"):
+                    continue
+                if tensor["quant_type_name"] != "F32":
+                    errors.append({"imatrix_name": name, "error": "native imatrix tensor is not F32"})
+                    continue
+                count = tensor_element_count(tensor["shape"])
+                if count <= 0 or tensor["data_size"] != count * 4:
+                    errors.append({"imatrix_name": name, "error": "native imatrix tensor has invalid shape or byte count"})
+                    continue
+
+                base_name = name[: -len(".imatrix")]
+                hfq_name = next(
+                    (candidate for candidate in (f"{base_name}.weight", base_name) if candidate in model_tensors),
+                    None,
+                )
+                if hfq_name is None:
+                    unmatched.append(name)
+                    continue
+
+                tokens = float(per_tensor_tokens.get(base_name) or default_tokens)
+                if not math.isfinite(tokens) or tokens <= 0.0:
+                    errors.append({"imatrix_name": name, "error": "native imatrix token count is not positive and finite"})
+                    continue
+                values = struct.unpack_from(f"<{count}f", mm, tensor["data_offset"])
+                if any(not math.isfinite(value) for value in values):
+                    errors.append({"imatrix_name": name, "error": "native imatrix contains non-finite values"})
+                    continue
+                score = sum(max(float(value) / tokens, 0.0) for value in values) / count
+                scores[hfq_name] = score
+                aliases[hfq_name] = name
+
+    return {
+        "source": "hfqm-imatrix",
+        "path": str(imatrix),
+        "tensor_names_md5": calibration_summary["tensor_names_md5"],
+        "token_normalization": "per_tensor_tokens",
+        "matched_count": len(scores),
+        "unmatched_count": len(unmatched),
+        "unmatched": unmatched[:16],
         "errors": errors[:16],
         "score_count": len(scores),
         "scores": scores,
@@ -3717,7 +3877,9 @@ def build_bundle_plan(
 def build_report(paths):
     items = [load_json(path) for path in paths]
     metric_items = [item for item in items if item.get("schema") == METRICS_SCHEMA]
-    if any(item.get("verdict") == "quality_improved" for item in metric_items):
+    if any(item.get("status") in {"fail", "rejected"} for item in items):
+        recommendation = "candidate rejected; do not promote or package"
+    elif any(item.get("verdict") == "quality_improved" for item in metric_items):
         recommendation = "quality improved; run Atlas AR/DFlash perf gates before promotion"
     elif metric_items:
         recommendation = "quality evidence does not justify promotion yet"
@@ -3755,6 +3917,148 @@ def load_paroquant_import_module():
     return module
 
 
+def load_latent_kv_module():
+    try:
+        import astrea_latent_kv
+    except Exception as exc:
+        raise ValueError(f"unable to load Astrea latent-KV module: {exc}") from exc
+    return astrea_latent_kv
+
+
+def build_latent_kv_plan(
+    *,
+    model,
+    calibration_dataset,
+    validation_dataset,
+    calibration_lengths,
+    validation_lengths,
+    calibration_position_offsets,
+    validation_position_offsets,
+    calibration_samples_per_stratum=1,
+    validation_samples_per_stratum=1,
+    max_static_vs_oracle_kld_delta,
+    max_static_vs_oracle_ppl_ratio,
+    ranks=None,
+    engine_root=None,
+    plan_id=None,
+    command=None,
+    basis_family="shared_static_v0",
+    basis_experts=1,
+    basis_selector="kv_layer_head_mean_abs_rms_v1",
+):
+    module = load_latent_kv_module()
+    return module.build_plan(
+        model=model,
+        calibration_dataset=calibration_dataset,
+        validation_dataset=validation_dataset,
+        calibration_lengths=calibration_lengths,
+        validation_lengths=validation_lengths,
+        calibration_position_offsets=calibration_position_offsets,
+        validation_position_offsets=validation_position_offsets,
+        calibration_samples_per_stratum=calibration_samples_per_stratum,
+        validation_samples_per_stratum=validation_samples_per_stratum,
+        max_static_vs_oracle_kld_delta=max_static_vs_oracle_kld_delta,
+        max_static_vs_oracle_ppl_ratio=max_static_vs_oracle_ppl_ratio,
+        ranks=ranks or module.SUPPORTED_RANKS,
+        engine=engine_fingerprint(engine_root),
+        evaluator_files=[Path(__file__), Path(module.__file__)],
+        command=command,
+        plan_id=plan_id,
+        basis_family=basis_family,
+        basis_experts=basis_experts,
+        basis_selector=basis_selector,
+    )
+
+
+def capture_latent_kv(
+    plan,
+    *,
+    split,
+    output_dir,
+    threads=None,
+    command=None,
+):
+    return load_latent_kv_module().capture_hf(
+        plan,
+        split=split,
+        output_dir=output_dir,
+        threads=threads,
+        command=command,
+    )
+
+
+def calibrate_latent_kv(
+    plan,
+    capture,
+    *,
+    output_dir,
+    command=None,
+):
+    return load_latent_kv_module().calibrate_capture(
+        plan,
+        capture,
+        output_dir=output_dir,
+        command=command,
+    )
+
+
+def reference_latent_kv(
+    plan,
+    calibration,
+    validation_capture,
+    *,
+    output_dir,
+    command=None,
+):
+    return load_latent_kv_module().evaluate_reference(
+        plan,
+        calibration,
+        validation_capture,
+        output_dir=output_dir,
+        command=command,
+    )
+
+
+def evaluate_latent_kv_model(
+    plan,
+    calibration,
+    validation_capture,
+    *,
+    output_dir,
+    rank=32,
+    threads=None,
+    command=None,
+):
+    return load_latent_kv_module().evaluate_model(
+        plan,
+        calibration,
+        validation_capture,
+        output_dir=output_dir,
+        rank=rank,
+        threads=threads,
+        command=command,
+    )
+
+
+def evaluate_latent_kv_feasibility(
+    plan,
+    validation_capture,
+    *,
+    output_dir,
+    rank=32,
+    threads=None,
+    command=None,
+):
+    return load_latent_kv_module().evaluate_feasibility_ceiling(
+        plan,
+        validation_capture,
+        output_dir=output_dir,
+        rank=rank,
+        threads=threads,
+        command=command,
+    )
+
+
 def load_paroquant_oracle_module():
     import importlib.util
 
@@ -3765,6 +4069,34 @@ def load_paroquant_oracle_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def load_expert_sweep_module():
+    import importlib.util
+
+    script_path = Path(__file__).with_name("astrea_expert_sweep.py")
+    spec = importlib.util.spec_from_file_location("hipfire_astrea_expert_sweep", script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def build_expert_sweep_plan(**kwargs):
+    return load_expert_sweep_module().build_plan(**kwargs)
+
+
+def verify_expert_sweep_plan(plan, *, current_engine=None):
+    return load_expert_sweep_module().verify_plan(plan, current_engine=current_engine)
+
+
+def build_expert_sweep_results(plan, records):
+    return load_expert_sweep_module().build_results(plan, records)
+
+
+def analyze_expert_sweep_results(plan, results):
+    return load_expert_sweep_module().analyze_results(plan, results)
 
 
 def paro_probe_model(model, *, local_only=False, max_modules=None):
@@ -3901,6 +4233,191 @@ def build_parser():
     promote.add_argument("--pretty", action="store_true")
     promote.add_argument("--out", help="Write JSON to this path instead of stdout.")
 
+    expert_sweep = sub.add_parser(
+        "expert-sweep-plan",
+        help="Freeze a one-axis routed-expert calibration and held-out quality sweep.",
+    )
+    expert_sweep.add_argument("--model", required=True)
+    expert_sweep.add_argument("--artifact-stem", required=True)
+    expert_sweep.add_argument("--calibration-dataset", required=True)
+    expert_sweep.add_argument("--evaluation-dataset", required=True)
+    expert_sweep.add_argument("--reference-model", required=True)
+    expert_sweep.add_argument(
+        "--reference-kldref",
+        help="Reuse one immutable held-out KLD reference for every sweep variant.",
+    )
+    expert_sweep.add_argument("--output-dir", required=True)
+    expert_sweep.add_argument("--evaluation-command-template", required=True)
+    expert_sweep.add_argument("--axis", choices=("minimum", "capture"), required=True)
+    expert_sweep.add_argument("--minimum-rows", dest="minimum_rows", type=int, action="append")
+    expert_sweep.add_argument("--capture-target", dest="capture_targets", type=int, action="append")
+    expert_sweep.add_argument("--selected-minimum", type=int)
+    expert_sweep.add_argument("--fixed-capture-target", type=int)
+    expert_sweep.add_argument("--quant-format", default="oq4.25++")
+    expert_sweep.add_argument(
+        "--quant-arg",
+        dest="quant_args",
+        action="append",
+        help="Quantizer option; use --quant-arg=--flag for values beginning with a dash.",
+    )
+    expert_sweep.add_argument("--sequences", type=int, default=128)
+    expert_sweep.add_argument("--context", type=int, default=2048)
+    expert_sweep.add_argument("--sequence-batch", type=int, default=64)
+    expert_sweep.add_argument("--time-tile", type=int, default=32)
+    expert_sweep.add_argument("--max-rows", type=int, default=2048)
+    expert_sweep.add_argument("--layer-prefetch-bytes", type=int, default=16 * 1024**3)
+    expert_sweep.add_argument("--kldref-topk", type=int, default=64)
+    expert_sweep.add_argument("--expert-capture-tile-rows", type=int, default=256)
+    expert_sweep.add_argument("--required-expert-fraction", type=float, default=1.0)
+    expert_sweep.add_argument("--sampling-seed", type=int, default=1)
+    expert_sweep.add_argument(
+        "--expert-coverage-policy",
+        choices=("strict", "preserve-undercovered"),
+        default="preserve-undercovered",
+    )
+    expert_sweep.add_argument("--hipfire", default="target/release/hipfire")
+    expert_sweep.add_argument(
+        "--evaluation-owns-resource-lease",
+        action="store_true",
+        help="Do not add a hipfire flock wrapper around the held-out evaluator.",
+    )
+    expert_sweep.add_argument("--engine-root")
+    expert_sweep.add_argument("--pretty", action="store_true")
+    expert_sweep.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    expert_sweep_verify = sub.add_parser(
+        "expert-sweep-verify",
+        help="Reject sweep plan, corpus, model, reference, or engine drift before execution.",
+    )
+    expert_sweep_verify.add_argument("--plan", required=True)
+    expert_sweep_verify.add_argument("--engine-root")
+    expert_sweep_verify.add_argument("--pretty", action="store_true")
+    expert_sweep_verify.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    expert_sweep_results = sub.add_parser(
+        "expert-sweep-results",
+        help="Normalize a complete set of measured routed-expert sweep rows.",
+    )
+    expert_sweep_results.add_argument("--plan", required=True)
+    expert_sweep_results.add_argument("--record", action="append", required=True)
+    expert_sweep_results.add_argument("--pretty", action="store_true")
+    expert_sweep_results.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    expert_sweep_analyze = sub.add_parser(
+        "expert-sweep-analyze",
+        help="Compare routed-expert sweep variants without choosing a quality threshold.",
+    )
+    expert_sweep_analyze.add_argument("--plan", required=True)
+    expert_sweep_analyze.add_argument("--results", required=True)
+    expert_sweep_analyze.add_argument("--pretty", action="store_true")
+    expert_sweep_analyze.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    latent_kv_plan = sub.add_parser(
+        "latent-kv-plan",
+        help="Freeze a reproducible hierarchical calibrated latent-KV experiment contract.",
+    )
+    latent_kv_plan.add_argument("--model", required=True)
+    latent_kv_plan.add_argument("--calibration-dataset", required=True)
+    latent_kv_plan.add_argument("--validation-dataset", required=True)
+    latent_kv_plan.add_argument(
+        "--calibration-length", dest="calibration_lengths", type=int, action="append", required=True
+    )
+    latent_kv_plan.add_argument(
+        "--validation-length", dest="validation_lengths", type=int, action="append", required=True
+    )
+    latent_kv_plan.add_argument(
+        "--calibration-position-offset",
+        dest="calibration_position_offsets",
+        type=int,
+        action="append",
+        required=True,
+    )
+    latent_kv_plan.add_argument(
+        "--validation-position-offset",
+        dest="validation_position_offsets",
+        type=int,
+        action="append",
+        required=True,
+    )
+    latent_kv_plan.add_argument("--calibration-samples-per-stratum", type=int, default=1)
+    latent_kv_plan.add_argument("--validation-samples-per-stratum", type=int, default=1)
+    latent_kv_plan.add_argument("--rank", dest="ranks", type=int, action="append", default=[])
+    latent_kv_plan.add_argument("--max-static-vs-oracle-kld-delta", type=float, required=True)
+    latent_kv_plan.add_argument("--max-static-vs-oracle-ppl-ratio", type=float, required=True)
+    latent_kv_plan.add_argument("--engine-root")
+    latent_kv_plan.add_argument("--plan-id")
+    latent_kv_plan.add_argument(
+        "--basis-family",
+        choices=("shared_static_v0", "page_local_mixture_v1"),
+        default="shared_static_v0",
+    )
+    latent_kv_plan.add_argument("--basis-experts", type=int, default=1)
+    latent_kv_plan.add_argument(
+        "--basis-selector",
+        choices=("kv_layer_head_mean_abs_rms_v1", "length_x_position_v1"),
+        default="kv_layer_head_mean_abs_rms_v1",
+        help="Page-mixture selector: kv moments (8 experts) or length x position regime.",
+    )
+    latent_kv_plan.add_argument("--pretty", action="store_true")
+    latent_kv_plan.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    latent_kv_capture = sub.add_parser(
+        "latent-kv-capture",
+        help="Capture post-RoPE Q/K and V/output evidence for a frozen latent-KV plan.",
+    )
+    latent_kv_capture.add_argument("--plan", required=True)
+    latent_kv_capture.add_argument("--split", choices=("calibration", "validation"), required=True)
+    latent_kv_capture.add_argument("--output-dir", required=True)
+    latent_kv_capture.add_argument("--threads", type=int)
+    latent_kv_capture.add_argument("--pretty", action="store_true")
+    latent_kv_capture.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    latent_kv_calibrate = sub.add_parser(
+        "latent-kv-calibrate",
+        help="Fit KQ-SVD/value factors from a calibration capture.",
+    )
+    latent_kv_calibrate.add_argument("--plan", required=True)
+    latent_kv_calibrate.add_argument("--capture", required=True)
+    latent_kv_calibrate.add_argument("--output-dir", required=True)
+    latent_kv_calibrate.add_argument("--pretty", action="store_true")
+    latent_kv_calibrate.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    latent_kv_reference = sub.add_parser(
+        "latent-kv-reference",
+        help="Compare static and same-cache KQ-SVD arms on held-out captures.",
+    )
+    latent_kv_reference.add_argument("--plan", required=True)
+    latent_kv_reference.add_argument("--calibration", required=True)
+    latent_kv_reference.add_argument("--validation-capture", required=True)
+    latent_kv_reference.add_argument("--output-dir", required=True)
+    latent_kv_reference.add_argument("--pretty", action="store_true")
+    latent_kv_reference.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    latent_kv_model_eval = sub.add_parser(
+        "latent-kv-model-eval",
+        help="Run full-model baseline/static/same-cache-oracle KLD and PPL.",
+    )
+    latent_kv_model_eval.add_argument("--plan", required=True)
+    latent_kv_model_eval.add_argument("--calibration", required=True)
+    latent_kv_model_eval.add_argument("--validation-capture", required=True)
+    latent_kv_model_eval.add_argument("--output-dir", required=True)
+    latent_kv_model_eval.add_argument("--rank", type=int, default=32)
+    latent_kv_model_eval.add_argument("--threads", type=int)
+    latent_kv_model_eval.add_argument("--pretty", action="store_true")
+    latent_kv_model_eval.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    latent_kv_feasibility = sub.add_parser(
+        "latent-kv-feasibility",
+        help="Fit the consumed validation caches to measure a non-admission shared-basis ceiling.",
+    )
+    latent_kv_feasibility.add_argument("--plan", required=True)
+    latent_kv_feasibility.add_argument("--validation-capture", required=True)
+    latent_kv_feasibility.add_argument("--output-dir", required=True)
+    latent_kv_feasibility.add_argument("--rank", type=int, default=32)
+    latent_kv_feasibility.add_argument("--threads", type=int)
+    latent_kv_feasibility.add_argument("--pretty", action="store_true")
+    latent_kv_feasibility.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
     kv_profile = sub.add_parser("kv-profile", help="Emit a KV cache policy/profile artifact.")
     kv_profile.add_argument("--model", required=True)
     kv_profile.add_argument("--mode", dest="modes", action="append", default=[])
@@ -3963,7 +4480,8 @@ def build_parser():
 
 
 def run(argv=None):
-    args = build_parser().parse_args(argv)
+    raw_argv = list(argv if argv is not None else sys.argv[1:])
+    args = build_parser().parse_args(raw_argv)
     if args.command == "inspect":
         write_json(
             inspect_model(args.model, imatrix=args.imatrix, quant_format=args.quant_format),
@@ -4061,6 +4579,157 @@ def run(argv=None):
                 output=args.output,
                 max_tensors=args.max_tensors,
                 tensor_filter=args.tensor_filter,
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "expert-sweep-plan":
+        write_json(
+            build_expert_sweep_plan(
+                model=args.model,
+                artifact_stem=args.artifact_stem,
+                calibration_dataset=args.calibration_dataset,
+                evaluation_dataset=args.evaluation_dataset,
+                reference_model=args.reference_model,
+                output_dir=args.output_dir,
+                evaluation_command_template=args.evaluation_command_template,
+                axis=args.axis,
+                minimum_rows=args.minimum_rows,
+                capture_targets=args.capture_targets,
+                selected_minimum=args.selected_minimum,
+                fixed_capture_target=args.fixed_capture_target,
+                quant_format=args.quant_format,
+                quant_args=args.quant_args,
+                sequences=args.sequences,
+                context=args.context,
+                sequence_batch=args.sequence_batch,
+                time_tile=args.time_tile,
+                max_rows=args.max_rows,
+                layer_prefetch_bytes=args.layer_prefetch_bytes,
+                kldref_topk=args.kldref_topk,
+                capture_tile_rows=args.expert_capture_tile_rows,
+                required_expert_fraction=args.required_expert_fraction,
+                sampling_seed=args.sampling_seed,
+                expert_coverage_policy=args.expert_coverage_policy,
+                hipfire=args.hipfire,
+                evaluation_owns_resource_lease=args.evaluation_owns_resource_lease,
+                reference_kldref=args.reference_kldref,
+                engine=engine_fingerprint(args.engine_root),
+                command=["python3", "scripts/astrea.py", *raw_argv],
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "expert-sweep-verify":
+        write_json(
+            verify_expert_sweep_plan(
+                load_json(args.plan),
+                current_engine=engine_fingerprint(args.engine_root),
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "expert-sweep-results":
+        write_json(
+            build_expert_sweep_results(
+                load_json(args.plan),
+                [load_json(path) for path in args.record],
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "expert-sweep-analyze":
+        write_json(
+            analyze_expert_sweep_results(
+                load_json(args.plan),
+                load_json(args.results),
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "latent-kv-plan":
+        write_json(
+            build_latent_kv_plan(
+                model=args.model,
+                calibration_dataset=args.calibration_dataset,
+                validation_dataset=args.validation_dataset,
+                calibration_lengths=args.calibration_lengths,
+                validation_lengths=args.validation_lengths,
+                calibration_position_offsets=args.calibration_position_offsets,
+                validation_position_offsets=args.validation_position_offsets,
+                calibration_samples_per_stratum=args.calibration_samples_per_stratum,
+                validation_samples_per_stratum=args.validation_samples_per_stratum,
+                max_static_vs_oracle_kld_delta=args.max_static_vs_oracle_kld_delta,
+                max_static_vs_oracle_ppl_ratio=args.max_static_vs_oracle_ppl_ratio,
+                ranks=args.ranks or None,
+                engine_root=args.engine_root,
+                plan_id=args.plan_id,
+                basis_family=args.basis_family,
+                basis_experts=args.basis_experts,
+                basis_selector=args.basis_selector,
+                command=["python3", "scripts/astrea.py", *raw_argv],
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "latent-kv-capture":
+        write_json(
+            capture_latent_kv(
+                args.plan,
+                split=args.split,
+                output_dir=args.output_dir,
+                threads=args.threads,
+                command=["python3", "scripts/astrea.py", *raw_argv],
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "latent-kv-calibrate":
+        write_json(
+            calibrate_latent_kv(
+                args.plan,
+                args.capture,
+                output_dir=args.output_dir,
+                command=["python3", "scripts/astrea.py", *raw_argv],
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "latent-kv-reference":
+        write_json(
+            reference_latent_kv(
+                args.plan,
+                args.calibration,
+                args.validation_capture,
+                output_dir=args.output_dir,
+                command=["python3", "scripts/astrea.py", *raw_argv],
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "latent-kv-model-eval":
+        write_json(
+            evaluate_latent_kv_model(
+                args.plan,
+                args.calibration,
+                args.validation_capture,
+                output_dir=args.output_dir,
+                rank=args.rank,
+                threads=args.threads,
+                command=["python3", "scripts/astrea.py", *raw_argv],
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "latent-kv-feasibility":
+        write_json(
+            evaluate_latent_kv_feasibility(
+                args.plan,
+                args.validation_capture,
+                output_dir=args.output_dir,
+                rank=args.rank,
+                threads=args.threads,
+                command=["python3", "scripts/astrea.py", *raw_argv],
             ),
             pretty=args.pretty,
             out=args.out,

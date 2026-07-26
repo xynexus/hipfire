@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-arch-embeddinggemma-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lean offline spec for embeddinggemma (arch_id 19): a bidirectional Gemma-3 encoder for text embeddings. Arch identity + Ingest quant-policy, no runtime/kernel deps. The quantizer links this; the serving crate (hipfire-arch-embeddinggemma) adds runtime capabilities on the same ArchId."
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }

@@ -1,8 +1,136 @@
 # Native Tier-1 calibration collector — status & roadmap
 
-Status as of the 2026-06-18 build session. The native single-load calibration
-artifact collector is built and verified; the remaining work is daemon/scheduler
-integration + cross-model capture, flagged below.
+Status as of 2026-07-22. The resident collector and family-neutral layer-stream
+engine are built and mechanism-verified. The full Qwen3.5-397B teacher artifact
+and its `oq4.25++` second pass are complete; the controlled expert sweeps,
+second-family resident parity, and final quality/channel admission evidence
+remain pending.
+
+## Update (2026-07-20) — family-neutral native safetensors engine
+
+`hipfire-coexistence calibrate` now emits the canonical HFQM v2
+`<model>.calib.hfq` contract directly from Hugging Face BF16 or F16
+safetensors. The Rust engine owns sampling, source planning, layer execution,
+capture reduction, KLDREF, read accounting, and crash-safe resume;
+`scripts/depreciated/collect_hessian.py` is retained only as a parity/debug oracle.
+
+Large checkpoints can use original-shard reference offload. Disk-owned layers
+are loaded from the existing safetensors files on demand instead of first
+copying hundreds of GiB into an Accelerate `.dat` offload directory. Dense
+projections known to consume the same activation (Q/K/V, linear-attention input
+projections, and gate/up pairs) share one accumulator while retaining separate
+HFQM entries. This reduces the 397B model's estimated dense accumulator memory
+from about 36.8 GiB to roughly 23 GiB.
+
+The 397B path uses the native layer stream with KLDREF: embedding and host boundary
+activations are materialized once, each Qwen3.5 layer consumes every corpus
+microbatch while resident, and finalized layer statistics are spooled before
+the weights are released. Routed-expert capture is quota- and tile-aware while
+teacher routes always execute. Final norm/lm-head tensors are read once to
+append KLDREF. The native read ledger rejects a duplicate teacher read, so
+calibration is one source-checkpoint pass. `scripts/two_pass_quantize.py`
+composes it with the existing safetensors quantizer pass and records the ledger
+and artifact fingerprints in an atomic resume manifest.
+
+Layer telemetry also persists the cost shape behind routed capture: grouped
+microbatch count, active-expert sum/maximum, padding rows, gather launches,
+full reduction tiles, final partial tiles, and the routed-token point where all
+expert roles reached the capture limit. Historical schema-1 records remain
+explicitly distinguishable with `launch_telemetry_recorded=false`, but new
+schema-2 checkpoints additionally bind the calibration engine executable
+identity into every layer and record it in the final artifact separately from
+the semantic run fingerprint. A schema-2 binary refuses to continue schema-1
+progress rather than silently mixing execution semantics or instrumentation
+across binaries, while a completed compatible artifact remains reusable.
+The boundary manifest stores a composite of executable and semantic run
+identity at job creation, so the same guarantee also covers a crash after
+embedding materialization but before the first layer checkpoint.
+
+Qwen3.5 and Gemma3 provide thin adapters to the same engine. Mechanism tests,
+including grouped expert capture and mixed OQ4 plus BF16/F16 execution, pass on
+gfx1151. The production Qwen3.5-397B teacher and quant artifacts are complete,
+and dense Qwen3.5 resident/streamed calibration and residual probes now match;
+Gemma3 has the same family-owned resident residual seam but still needs its live
+comparison. Python remains parity/debug tooling rather than the production
+calibration path.
+
+Production preflight now estimates compact or dense Hessian payloads including
+activation aliases, KLDREF bytes, the mmap boundary spool, simultaneous layer
+parts plus final assembly, fixed container overhead, and a safety margin. It
+reports filesystem availability during `--dry-run` and refuses an insufficient
+fresh run. `--pause-after-layers N` provides a durable bounded-layer check that
+can be continued with `--resume`; no partial artifact is published.
+
+Live gfx1151 evidence on 2026-07-20:
+
+- Qwen3.5-397B-A17B layer 0 streamed from the real 94-shard checkpoint with
+  K=10 routing: 2 tokens produced 20 routed slots at both gate-up and down,
+  zero dropped indices, a 203,066,368-byte capture part, 19 canonical logical
+  reads totaling 15,184,552,832 bytes, and zero duplicate reads. The deliberately
+  undercovered smoke correctly preserved all 512 experts.
+- Gemma3-text (`medgemma-27b-text-it`) committed layer 0 and then resumed through
+  layer 1. The ledger grew monotonically from 14 to 27 canonical reads and from
+  3,644,369,408 to 4,470,166,528 bytes, with zero duplicates and no embedding or
+  layer-0 reread.
+- The same Gemma job subsequently completed all 62 layers and published a
+  38,692,740,100-byte artifact with 434 Hessians, 434 imatrices, one KLDREF row,
+  and a complete 809-logical/808-canonical, 54,018,004,480-byte ledger. A bounded
+  `oq4++` second pass joined all seven layer-0 Hessians through AWQ+LDLQ with no
+  missing/mismatched records and wrote a 249,080,134-byte HFQ.
+- Qwen layer-0 fresh-process sequence-batch 1/4/8/16/32 wall times on the same
+  32x8-token sample set were 6.06/4.89/4.48/4.31/4.18 seconds. All geometries
+  recorded exactly 2,560 K=10 routes at gate-up and down, zero drops/duplicates,
+  identical part sizes, and zero diagonal consistency error. Batch 32 is the
+  bounded-layer winner, not yet the declared full-run optimum.
+- A longer Qwen batch-32 layer-0 run processed 4,096 tokens and observed all
+  40,960 K=10 routes at both capture roles without invalid, duplicate, or
+  quota-dropped rows. It took 138.88 seconds cold with 15.1 GB maximum RSS, but
+  remained deliberately undercovered: 31 experts had zero routes, only one met
+  the 2,048-row floor, and 511 were preserved at high precision.
+- Resume checkpoints and final artifacts now retain per-layer phase timings. A
+  fresh two-token Gemma layer-0 check attributed 64.6 ms to load/upload,
+  118.1 ms to execution, 1.226 s to capture serialization, 0.5 ms to finish,
+  and 1.437 s to part sync/hash (2.846 s before checkpoint commit).
+- Network-backed source lookahead is now family-neutral and ledger-safe. The
+  engine reads the next owner's canonical physical ranges through one 8 MiB
+  worker chunk into resident staging while the current layer executes, bounded
+  to 16 GiB with a 32 GiB live host-memory reserve plus the next layer's upload
+  footprint. Any recent full-memory PSI or less than 25% free swap disables the
+  transition, and only complete tensor ranges are retained. Complete tensor
+  views are consumed directly from staging and released after GPU upload. Checkpoints
+  record read/staged/consumed bytes plus background, view, decode, upload,
+  release, foreground-wait, pressure-disable reason, and error telemetry;
+  matched staged/page-cache/off
+  production timings remain to be collected. The first 397B production layer
+  using resident staging consumed all 13.124 GB across 15 tensors directly,
+  waited 3 microseconds, uploaded in 1.027 seconds, and completed layer
+  construction in 1.540 seconds before 232.463 seconds of teacher execution.
+  After resident staging reproduced a second swap/SVM stall at layer 27/60,
+  the same run resumed with lookahead disabled and committed layer 28 in 336
+  seconds: 115 seconds of foreground load/upload and 220 seconds of teacher
+  execution. This proves the recovery path and motivates the pressure gate; it
+  is not a same-layer controlled performance comparison.
+- On the identical 4,096-token Qwen sample set, 256/512/1,024/2,048/4,096-row
+  geometries took 7.56/3.76/2.55/2.16/1.89 seconds of layer execution and
+  produced identical normalized descriptors and expert telemetry. Total
+  pre-checkpoint time was best at 2,048 rows due capture-write variance. At that
+  row count, sequence batches 32/64/128 took 2.55/2.15/2.27 seconds; batch 64 is
+  the bounded-layer target. The native CLI now uses 2,048 as its auto-tuning
+  ceiling while retaining live memory estimates and allocation fallback.
+
+The full Gemma run found a unified-memory residency hazard: mmap-backed source
+pages accumulated to about 57 GB RSS and blocked ROCm SVM setup in the finalizer.
+Planned safetensor views release completed ranges while canonical tied-weight
+pages remain until their declared alias is consumed. Gemma completed after an
+initial `posix_fadvise(DONTNEED)` fix, but Qwen's larger shard mappings proved
+that file advice alone did not evict mapped PTEs: RSS reached 44.8 GB after two
+layers. Adding mapping-level `MADV_DONTNEED` bounded the next production layer
+to a 21.9 GB peak; a refault test verifies that released read-only bytes remain
+available if a declared alias needs them later.
+
+The tiny-corpus artifacts are mechanism/read-accounting evidence, and the batch
+figures are bounded-layer throughput evidence. None establish production expert
+coverage, matched KLD/PPL quality, or model admission.
 
 ## Done + verified (committed)
 
@@ -134,19 +262,12 @@ verified**. Final-session work:
   Correctness is token-count-independent (the consistency check holds at any N),
   so this is a full-size, real-disk validation of the focus model.
 
-- **Importance/KLD sweep re-run — DEFERRED (scoped follow-up, not done).** The
-  prior sweep tooling (`scripts/roughquant_ablation_oracle.sh`, task #9) reads the
-  **old binary** Hessian (`HIPFIRE_QTIP_HESSIAN=<model>.hessian.bin`) and is
-  0.8B-specific (hard-coded model path, 39-rank per-channel ablation × full
-  `perplexity` KLD eval). Re-running it on a fresh model needs, in order:
-  1. a **format bridge** — the quantizer/`perplexity` path consumes the legacy
-     `.hessian.bin`, not the new `.calib.hfq`; either teach them to read the HFQM
-     `<name>.hessian` tensors (preferred) or add a `hfq extract`→`.hessian.bin`
-     shim;
-  2. a per-model `DUMP_RANK` diag rank-map (the sweep's input);
-  3. the ablation loop itself (expensive on 9B/A3B: ~39 quant+PPL evals).
-  This is a research investigation (not autonomous build work) and is gated on
-  step 1 — left as a documented follow-up rather than rabbit-holed.
+- **Importance/KLD sweep bridge — RESOLVED.** The quantizer reads canonical
+  `<name>.hessian` tensors directly from `.calib.hfq`; no HFHS extraction shim
+  is needed. `scripts/roughquant_ablation_oracle.sh` was parameterized and the
+  9B rerun is recorded in `docs/roughquant/9b-importance-generality.md`. Legacy
+  `.hessian.bin` inputs remain historical fixtures only and must not be produced
+  by new workflows.
 
 ## f32 vs f64 Hessian accumulation (measured — f32 is sufficient)
 

@@ -520,6 +520,15 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
             let _ = gpu.free_tensor(xs);
             res
         }
+        // Opus Quant W4A16 decode: x is FWHT-rotated f32; multiply the int4 grouped
+        // weight by the full-precision activation (no act quant at B=1). Weight
+        // buffer: [int4 M*K/2 | f32 scales M*ng]; the dense gemv reads both.
+        K::GemvOq4G256Prerotated => {
+            const GROUP: usize = 256;
+            let ng = k / GROUP;
+            let ws = w.buf.sub_offset(m * (k / 2), m * ng * 4);
+            hip!(gpu.gemv_oq4_grouped(w.buf, &ws, x, y, m, k, GROUP))
+        }
         other => return Err(DispatchError::MissingImpl { key: other }),
     }
 }

@@ -1,0 +1,60 @@
+{
+  "schema": "hipfire.gemma4.full-model-admission-plan.v1",
+  "frozen_at": "2026-07-15",
+  "candidate": {
+    "artifact": "Gemma-4-31B--oq8.hfq",
+    "quantization_hash": "705685e2d7993d57"
+  },
+  "oracle": {
+    "checkpoint": "google/gemma-4-31B",
+    "revision": "02e15e4990e8c452f8543fb26beff15b1daf8f3d",
+    "dtype": "bfloat16"
+  },
+  "tokenizer_sha256": "12bac982b793c44b03d52a250a9f0d0b666813da566b910c24a6da0695fd11e6",
+  "thresholds": "benchmarks/gemma4/oq8-thresholds.json",
+  "required_prompt_classes": [
+    "short",
+    "sliding_window_minus_one",
+    "sliding_window",
+    "sliding_window_plus_one",
+    "multiple_global_layers"
+  ],
+  "cases": [
+    {
+      "id": "base-short",
+      "classes": ["short", "multiple_global_layers"],
+      "input": "benchmarks/gemma4/fixtures/admission/base-short.ids.json",
+      "oracle_mode": "resident",
+      "layers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59],
+      "max_new_tokens": 8,
+      "require_lifecycle": true
+    },
+    {
+      "id": "swa-minus-one",
+      "classes": ["sliding_window_minus_one"],
+      "input": "benchmarks/gemma4/fixtures/admission/swa-minus-one.ids.json",
+      "oracle_mode": "streaming",
+      "layers": [0, 4, 5, 10, 11, 58, 59],
+      "max_new_tokens": 1,
+      "require_lifecycle": false
+    },
+    {
+      "id": "swa",
+      "classes": ["sliding_window"],
+      "input": "benchmarks/gemma4/fixtures/admission/swa.ids.json",
+      "oracle_mode": "streaming",
+      "layers": [0, 4, 5, 10, 11, 58, 59],
+      "max_new_tokens": 1,
+      "require_lifecycle": false
+    },
+    {
+      "id": "swa-plus-one",
+      "classes": ["sliding_window_plus_one"],
+      "input": "benchmarks/gemma4/fixtures/admission/swa-plus-one.ids.json",
+      "oracle_mode": "streaming",
+      "layers": [0, 4, 5, 10, 11, 58, 59],
+      "max_new_tokens": 1,
+      "require_lifecycle": false
+    }
+  ]
+}

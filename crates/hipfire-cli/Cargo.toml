@@ -24,8 +24,15 @@ hipfire-generate = { path = "../hipfire-generate" }
 hipfire-diffusion = { path = "../hipfire-diffusion" }
 hipfire-diffusion-coexist = { path = "../hipfire-diffusion-coexist" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
+hipfire-sysinfo = { path = "../hipfire-sysinfo" }
+hipfire-tui = { path = "../hipfire-tui" }
+hipfire-xdna = { path = "../hipfire-xdna" }
+hip-bridge = { path = "../hip-bridge" }
+hipfire-arch-api = { path = "../hipfire-arch-api" }
+hipfire-archs = { path = "../hipfire-archs" }
 hipfire-lock = { path = "../hipfire-lock" }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-hfq-tooling = { path = "../hipfire-hfq-tooling" }
 hipfire-server = { path = "../hipfire-server" }
 clap = { version = "4", features = ["derive", "cargo"] }
 regex.workspace = true

@@ -244,7 +244,7 @@ fits 2 cards, or a small DN model). TP=2 sharded-DN ≡ TP=1.
 
 **API drift**
 - Current `mtp_spec.rs` (122 KB) has its own drift since merge-base. `spec_step_mtp_tp` must wrap the **current** `spec_step_mtp` draft/verify loop, threading `forward_scratch_tp` / `forward_prefill_chunk_tp` for target verification.
-- DFlash/MTP coherence gate applies (`scripts/coherence-gate-dflash.sh`).
+- DFlash/MTP coherence gate applies (`tests/coherence-gate-dflash.sh`).
 
 **Validation:** **hiptrx 0+1:** `tp_mtp_demo` τ + token stream; TP=2 MTP committed-token stream ≡ TP=1 AR-greedy (byte-identical commits). Pass DFlash coherence gate (Tier 1/2/3).
 

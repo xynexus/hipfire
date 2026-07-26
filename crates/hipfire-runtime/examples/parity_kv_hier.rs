@@ -30,12 +30,13 @@
 //!   cargo run --release -p hipfire-runtime --example parity_kv_hier [n_tokens]
 
 use hipfire_kvquant::kvarn::{dequantize_tile, unpack_kvarn_tile_bits};
-use hipfire_runtime::kv_hier::HierKvState;
 use hipfire_rdna::{DType, Gpu};
+use hipfire_runtime::kv_hier::HierKvState;
 
 const NH: usize = 8;
 const NKV: usize = 2;
-const HD: usize = 256;
+// head_dim is runtime (PARITY_HEAD_DIM, default 256) so this oracle covers both the
+// FWHT-256 and FWHT-128 hier paths. head counts are independent of head_dim.
 
 fn lcg(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed.max(1);
@@ -52,15 +53,19 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(40);
-    let kv_dim = NKV * HD;
-    let scale = 1.0f32 / (HD as f32).sqrt();
+    let hd: usize = std::env::var("PARITY_HEAD_DIM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    let kv_dim = NKV * hd;
+    let scale = 1.0f32 / (hd as f32).sqrt();
 
     std::env::set_var("HIPFIRE_KV_HIERARCHICAL", "1");
     std::env::set_var("HIPFIRE_KV_HOT_BUDGET", "16");
     std::env::set_var("HIPFIRE_KV_MIGRATE_BATCH", "8");
 
     let mut gpu = Gpu::init().unwrap();
-    let mut hier = HierKvState::from_env(&mut gpu, 1, NH, NKV, HD).unwrap();
+    let mut hier = HierKvState::from_env(&mut gpu, &[true], NH, NKV, hd).unwrap();
     assert!(hier.enabled, "hierarchical not enabled");
 
     // Feed N tokens (layer 0). Keep host copies for nothing — we read back GPU state.
@@ -87,31 +92,92 @@ fn main() {
         );
     }
 
-    let q = lcg(7, NH * HD);
-    let qd = gpu.upload_f32(&q, &[NH, HD]).unwrap();
-    let out = gpu.alloc_tensor(&[NH * HD], DType::F32).unwrap();
+    let q = lcg(7, NH * hd);
+    let qd = gpu.upload_f32(&q, &[NH, hd]).unwrap();
+
+    // Optional: exercise cold-segment defrag. Read BEFORE folding, then fold every
+    // accumulated segment into one wider tile, then let the main read + oracle below
+    // run on the defragged state. defrag is a pure repack, so the read must be
+    // preserved up to one extra quant round on the repacked slots (looser tol).
+    let out_before: Option<Vec<f32>> =
+        if std::env::var("HIPFIRE_KV_HIER_TEST_DEFRAG").ok().as_deref() == Some("1") {
+            let ob = gpu.alloc_tensor(&[NH * hd], DType::F32).unwrap();
+            hier.two_tier_read(&mut gpu, 0, &qd, &ob).unwrap();
+            gpu.device_synchronize().unwrap();
+            let before = hier.cold[0].len();
+            hier.defrag(&mut gpu, 1).unwrap(); // threshold 1 → fold all (>1) into one
+            eprintln!(
+                "after defrag(max_segments=1): cold_segs {before} -> {}",
+                hier.cold[0].len()
+            );
+            assert!(
+                hier.cold[0].len() <= 1,
+                "defrag should leave at most one segment"
+            );
+            Some(gpu.download_f32(&ob).unwrap())
+        } else {
+            None
+        };
+
+    let out = gpu.alloc_tensor(&[NH * hd], DType::F32).unwrap();
     hier.two_tier_read(&mut gpu, 0, &qd, &out).unwrap();
     gpu.device_synchronize().unwrap();
     let got = gpu.download_f32(&out).unwrap();
 
+    // Oracle query. With `HIPFIRE_KV_HOT_ROTATE=1` the hot ring — and the cold
+    // segments it migrates into — store K in the FWHT-rotated frame, and the GPU
+    // read rotates the query to match (q_rot·K_rot = q·K). The CPU oracle scores
+    // the raw stored (rotated) K, so it must use the SAME rotated query; rotate via
+    // the same GPU kernel to guarantee identical signs. V is un-rotated either way.
+    let q_ref = if hier.hot_rotate {
+        let qr = gpu.zeros(&[NH * hd], DType::F32).unwrap();
+        // Match the GPU's head_dim-selected FWHT (256 vs 128 variant).
+        if hd == 128 {
+            gpu.rotate_x_mq_128(&qd, &qr, NH * hd).unwrap();
+        } else {
+            gpu.rotate_x_mq(&qd, &qr, NH * hd).unwrap();
+        }
+        gpu.download_f32(&qr).unwrap()
+    } else {
+        q.clone()
+    };
+
+    // Defrag preservation: the read after folding must match the read before, up to
+    // one extra quant round on the repacked slots.
+    if let Some(before) = &out_before {
+        let mut dmax = 0.0f32;
+        for i in 0..NH * hd {
+            dmax = dmax.max((got[i] - before[i]).abs());
+        }
+        // Informational only: the before/after delta is requant coarsening (one wide
+        // per-channel scale vs many narrow ones), NOT corruption — the post-defrag
+        // oracle below is the correctness gate. ~1.6% of output magnitude for a
+        // fold-6→1 is expected; a much larger delta would flag a geometry bug.
+        let dinfo = 3.0e-2f32;
+        println!(
+            "defrag preservation (requant coarsening): max_abs(before,after)={dmax:.6} expect<{dinfo:.3} -> {}",
+            if dmax <= dinfo { "OK" } else { "SUSPECT-BUG" }
+        );
+        if dmax > dinfo {
+            std::process::exit(1); // only a gross delta (geometry bug) fails
+        }
+    }
+
     // ── CPU oracle over the SAME stored data.
-    // Hot: first hot_count slots of the slot-major ring [nkv × hot_budget × HD].
+    // Hot: first hot_count slots of the slot-major ring [nkv × hot_budget × hd].
     let hot_count = hier.hot_count[0];
     let hb = hier.hot_budget;
-    let hk = gpu.download_f32(&hier.hot_k[0]).unwrap();
-    let hv = gpu.download_f32(&hier.hot_v[0]).unwrap();
+    // Read back the hot tier as f32 (f16 ring → widen; 8-bit ring → GPU dequant),
+    // so the oracle scores the SAME stored values the GPU read saw in either codec.
+    let (hk, hv) = hier.hot_tier_f32(&mut gpu, 0).unwrap();
     // Per kv-head list of (k,v) slots in attention order (hot then each cold seg).
-    let mut k_slots: Vec<Vec<[f32; HD]>> = vec![Vec::new(); NKV];
-    let mut v_slots: Vec<Vec<[f32; HD]>> = vec![Vec::new(); NKV];
+    let mut k_slots: Vec<Vec<Vec<f32>>> = vec![Vec::new(); NKV];
+    let mut v_slots: Vec<Vec<Vec<f32>>> = vec![Vec::new(); NKV];
     for kv in 0..NKV {
         for s in 0..hot_count {
-            let base = (kv * hb + s) * HD;
-            let mut ka = [0.0f32; HD];
-            let mut va = [0.0f32; HD];
-            ka.copy_from_slice(&hk[base..base + HD]);
-            va.copy_from_slice(&hv[base..base + HD]);
-            k_slots[kv].push(ka);
-            v_slots[kv].push(va);
+            let base = (kv * hb + s) * hd;
+            k_slots[kv].push(hk[base..base + hd].to_vec());
+            v_slots[kv].push(hv[base..base + hd].to_vec());
         }
     }
     // Cold: dequantize each segment's 4-bit records (rotate=false → directly usable).
@@ -131,20 +197,20 @@ fn main() {
             let off = kv * seg.rec_bytes;
             let kt = dequantize_tile(&unpack_kvarn_tile_bits(
                 &krec[off..off + seg.rec_bytes],
-                HD,
+                hd,
                 seg.n_slots,
                 seg.bits,
-            )); // [HD × n_slots]
+            )); // [hd × n_slots]
             let vt = dequantize_tile(&unpack_kvarn_tile_bits(
                 &vrec[off..off + seg.rec_bytes],
-                HD,
+                hd,
                 seg.n_slots,
                 seg.bits,
             ));
             for s in 0..seg.n_valid {
-                let mut ka = [0.0f32; HD];
-                let mut va = [0.0f32; HD];
-                for d in 0..HD {
+                let mut ka = vec![0.0f32; hd];
+                let mut va = vec![0.0f32; hd];
+                for d in 0..hd {
                     ka[d] = kt[d * seg.n_slots + s];
                     va[d] = vt[d * seg.n_slots + s];
                 }
@@ -154,16 +220,16 @@ fn main() {
         }
     }
 
-    let mut oracle = vec![0.0f32; NH * HD];
+    let mut oracle = vec![0.0f32; NH * hd];
     for hq in 0..NH {
         let kvh = hq / (NH / NKV);
-        let qh = &q[hq * HD..hq * HD + HD];
+        let qh = &q_ref[hq * hd..hq * hd + hd];
         let ks = &k_slots[kvh];
         let vs = &v_slots[kvh];
         let n = ks.len();
         let mut logits = vec![0.0f32; n];
         for s in 0..n {
-            logits[s] = (0..HD).map(|i| qh[i] * ks[s][i]).sum::<f32>() * scale;
+            logits[s] = (0..hd).map(|i| qh[i] * ks[s][i]).sum::<f32>() * scale;
         }
         let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
         let mut p: Vec<f32> = logits.iter().map(|x| (x - mx).exp()).collect();
@@ -172,15 +238,15 @@ fn main() {
             *x /= z;
         }
         for s in 0..n {
-            for i in 0..HD {
-                oracle[hq * HD + i] += p[s] * vs[s][i];
+            for i in 0..hd {
+                oracle[hq * hd + i] += p[s] * vs[s][i];
             }
         }
     }
 
     let mut maxd = 0.0f32;
     let mut mag = 0.0f32;
-    for i in 0..NH * HD {
+    for i in 0..NH * hd {
         maxd = maxd.max((got[i] - oracle[i]).abs());
         mag = mag.max(oracle[i].abs());
     }

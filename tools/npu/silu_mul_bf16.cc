@@ -15,7 +15,7 @@
 //   n      : int32               — tile_size (auto-appended by IRON)
 //
 // ── Computation ──────────────────────────────────────────────────────────────
-//   sigmoid(g) = 0.5 * (1 + tanh(0.5 * g))
+//   sigmoid(g) = 1 / (1 + exp(-g))
 //   silu(g)    = g * sigmoid(g)
 //   out[i]     = silu(gate[i]) * up[i]
 //
@@ -45,7 +45,9 @@
 //
 // ── AIE2 vs AIE2P ───────────────────────────────────────────────────────────
 //   AIE2  (__AIE_ARCH__==20, NPU1/Phoenix): getTanhBf16() LUT-based tanh
-//   AIE2P (__AIE_ARCH__==21, NPU2/Strix+): aie::tanh() hardware instruction
+//   AIE2P (__AIE_ARCH__==21, NPU2/Strix+): scalar F32 exp/sigmoid with BF16
+//          rounding after SiLU and after the final multiply. This matches the
+//          PyTorch BF16 reference closely enough for full-encoder admission.
 
 #include "aie_kernels/aie_kernel_utils.h"
 #include <aie_api/aie.hpp>
@@ -62,14 +64,41 @@
 
 using namespace aie;
 
+#if __AIE_ARCH__ == 21
+__attribute__((noinline)) float exp2_f32(float value) {
+  if (value <= -126.0f)
+    return 0.0f;
+  if (value >= 0.0f)
+    return 1.0f;
+  int exponent = (int)value;
+  if ((float)exponent > value)
+    --exponent;
+  const float z = (value - (float)exponent) * 0.6931471805599453f;
+  const float polynomial =
+      1.0f +
+      z * (1.0f +
+           z * (0.5f +
+                z * (0.1666666666666667f +
+                     z * (0.0416666666666667f +
+                          z * (0.0083333333333333f +
+                               z * 0.0013888888888889f)))));
+  float scale = 1.0f;
+  for (int power = 0; power < -exponent; ++power)
+    scale *= 0.5f;
+  return scale * polynomial;
+}
+#endif
+
 static void silu_mul_bf16_inner(bfloat16 *restrict gate, bfloat16 *restrict up,
                                 bfloat16 *restrict output, const int32_t n) {
+  aie::set_rounding(aie::rounding_mode::conv_even);
   auto it_gate = aie::begin_restrict_vector<16>(gate);
   auto it_up   = aie::begin_restrict_vector<16>(up);
-  auto it_out  = aie::begin_restrict_vector<16>(output);
-
+#if __AIE_ARCH__ == 20
+  auto it_out = aie::begin_restrict_vector<16>(output);
   aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
   aie::vector<bfloat16, 16> one  = aie::broadcast<bfloat16, 16>(1.0f);
+#endif
 
   AIE_PREPARE_FOR_PIPELINING
   AIE_LOOP_MIN_ITERATION_COUNT(1)
@@ -82,33 +111,31 @@ static void silu_mul_bf16_inner(bfloat16 *restrict gate, bfloat16 *restrict up,
     // accum<__accfloat,16> and using auto keeps it as accum, which breaks chained
     // mul/add calls (no vec×accum overload exists).
     //
-    // The two paths have different intermediate types so the whole block is
-    // gated.  AIE2: aie::mul returns accum but we must use explicit
-    // vector<bfloat16,16> for all intermediates to keep the chess scheduler
-    // happy (no accum→vector bypass stalls pipeline).  AIE2P: auto is fine;
-    // the hardware tanh takes vector<float> in and returns vector<bfloat16>
-    // out, and to_vector<float>() is a method on accum not on vector.
+    // AIE2 uses the runtime LUT. AIE2P uses the scalar stable sigmoid so its
+    // BF16 rounding points match the framework oracle.
 #if __AIE_ARCH__ == 20
     aie::vector<bfloat16, 16> half_g     = aie::mul(g, half);
     aie::vector<bfloat16, 16> tanh_hg    = getTanhBf16(half_g);
     aie::vector<bfloat16, 16> tanh_plus1 = aie::add(tanh_hg, one);
     aie::vector<bfloat16, 16> sig_g      = aie::mul(tanh_plus1, half);
-#else
-    // Use auto for tanh/add intermediates (they're vectors); force explicit
-    // vector<bfloat16,16> for sig_g so the subsequent mul(g, sig_g) resolves —
-    // aie::mul(vec,vec) returns accum and there's no mul(vec,accum) overload.
-    auto half_g_acc  = aie::mul(g, half);
-    auto tanh_hg     = aie::tanh<bfloat16>(half_g_acc.to_vector<float>());
-    auto tanh_plus1  = aie::add(tanh_hg, one);
-    aie::vector<bfloat16, 16> sig_g = aie::mul(tanh_plus1, half);
-#endif
-
-    // silu(g) = g * sigmoid(g)
     aie::vector<bfloat16, 16> silu_g = aie::mul(g, sig_g);
-
-    // out = silu(gate) * up
     auto result = aie::mul(silu_g, u);
     *it_out++ = result.to_vector<bfloat16>();
+#else
+    for (int lane = 0; lane < 16; ++lane) {
+      const float gate_f32 = float(g[lane]);
+      const float exponential =
+          exp2_f32(-__builtin_fabsf(gate_f32) * 1.4426950408889634f);
+      const float reciprocal = exponential == 0.0f
+                                   ? 1.0f
+                                   : aie::inv(aie::broadcast<float, 16>(
+                                                  1.0f + exponential))[0];
+      const float sigmoid = gate_f32 >= 0.0f ? reciprocal
+                                              : exponential * reciprocal;
+      const bfloat16 silu = bfloat16(gate_f32 * sigmoid);
+      output[i + lane] = bfloat16(float(silu) * float(u[lane]));
+    }
+#endif
   }
 }
 

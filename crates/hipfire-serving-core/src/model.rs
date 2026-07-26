@@ -14,6 +14,7 @@
 use hip_bridge::HipResult;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
+use hipfire_arch_embeddinggemma as embeddinggemma;
 use hipfire_arch_gemma3::Gemma3Backend;
 use hipfire_arch_gemma3_vl::Gemma3VlBackend;
 #[cfg(feature = "arch-lfm2moe")]
@@ -27,6 +28,7 @@ use hipfire_arch_qwen35::speculative::{
 };
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_prompt as prompt_frame;
+use hipfire_runtime::arch::FactoryLoadedBackend;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::kv;
@@ -36,6 +38,7 @@ use hipfire_runtime::sequence_state::SequenceState;
 use hipfire_runtime::triattn::EvictionCtx;
 use hipfire_state::ModelArtifactMemory;
 
+use crate::qwen3_embedding::Qwen3EmbeddingState;
 #[cfg(feature = "arch-lfm2moe")]
 use crate::session::Lfm2RequestSessionState;
 use crate::session::Qwen35RequestSessionState;
@@ -137,6 +140,15 @@ pub struct DsparkState {
     pub speculator: Box<dyn hipfire_specdecode_dspark::spec::Speculator>,
 }
 
+/// Resident non-autoregressive embedding model state (arch_id=19).
+pub struct EmbeddingGemmaState {
+    pub config: embeddinggemma::EmbeddingGemmaConfig,
+    pub embedding_metadata: Option<hipfire_model::embedding::EmbeddingMetadata>,
+    pub weights: embeddinggemma::EmbeddingGemmaWeights,
+    #[cfg(target_os = "linux")]
+    pub npu_projector: Option<std::sync::Mutex<embeddinggemma::NpuOpusProjector>>,
+}
+
 /// Optional LFM2 DFlash speculative-decoding state. LFM2 has no DeltaNet
 /// recurrent state, so it carries the generic DFlash draft plus an arch-local
 /// target snapshot and host hidden-history rows.
@@ -205,6 +217,11 @@ thread_local! {
 pub fn effective_raw(m: &LoadedModel) -> bool {
     RAW_OVERRIDE
         .with(|c| c.get())
+        .or_else(|| {
+            m.registered_backend
+                .as_ref()
+                .and_then(|loaded| loaded.profile.prompt.raw)
+        })
         .unwrap_or(m.chat_template.is_none())
 }
 
@@ -253,6 +270,9 @@ pub struct ResidentSession {
 /// will eventually collapse this Option-soup into one boxed backend.
 pub struct LoadedModel {
     pub arch_id: u32,
+    /// Factory-loaded text backends share this one coarse-grained slot together
+    /// with their prompt/generation policy and host-only shape metadata.
+    pub registered_backend: Option<FactoryLoadedBackend>,
     /// Pipeline-parallel degree. 1 = single-GPU (all existing fields below in
     /// use, q35_scratch populated). >1 = multi-GPU (pp_gpus + pp_scratch_set
     /// populated; q35_scratch stays None; kv_cache + dn_state still hold the
@@ -306,12 +326,8 @@ pub struct LoadedModel {
     pub qwen2_config: Option<qwen2::Qwen2Config>,
     pub qwen2_weights: Option<qwen2::Qwen2Weights>,
     pub qwen2_state: Option<qwen2::Qwen2State>,
-    /// Assembled Qwen2 serving backend (arch_id=7), driven through the shared
-    /// `ServingBackend::serve` seam — mirrors `gemma3_text`. Owns its own
-    /// config/weights/state; the separate `qwen2_*` fields above stay `None` on
-    /// the arch-7 path and are retained only for dots-ocr's reuse of
-    /// `qwen2_state`. P3.1.
-    pub qwen2_backend: Option<hipfire_arch_qwen2::Qwen2Backend>,
+    // The separate qwen2 fields above remain only for dots-ocr's text tower.
+    // Standalone Qwen2 is factory-loaded into `registered_backend`.
     // DeepSeek V4 Flash state (arch_id=9 — hipfire-arch-deepseek4).
     // Hyper-Connections + compressed-KV indexer + tail-only RoPE + raw
     // SWA cache. KV cache lives inside DeepseekV4State; no separate
@@ -389,6 +405,12 @@ pub struct LoadedModel {
     // behind the same `ServingBackend::serve` seam (delegates to `run_simple_ar`);
     // its KV/decode state lives inside `Gemma3Backend`. None on every other arch.
     pub gemma3_text: Option<Gemma3Backend>,
+    // embeddinggemma (arch_id=19). Bidirectional encoder for embeddings/rerank;
+    // no KV cache and no autoregressive decode state.
+    pub embeddinggemma: Option<EmbeddingGemmaState>,
+    /// Qwen3 (arch_id=1) embedding workload. Holds no lm_head, generation
+    /// scratch, or persistent KV state; all encoder execution is XDNA-only.
+    pub qwen3_embedding: Option<Qwen3EmbeddingState>,
     // Shared
     pub tokenizer: Option<hipfire_model::tokenizer::Tokenizer>,
     /// Advertised context window — client-facing capacity, the upper bound on

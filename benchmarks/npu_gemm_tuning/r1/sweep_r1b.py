@@ -45,7 +45,7 @@ def run_point(tile_n, n_tiles, depth, minimal):
     best, total_b = None, None
     for i in range(REPEAT + 1):                       # i==0 is the discarded warmup
         p = subprocess.run([sys.executable, "r1b_run.py"], cwd=HERE, env=env,
-                           capture_output=True, text=True, timeout=600)
+                           capture_output=True, text=True, timeout=600, check=False)
         m = LINE.search(p.stdout)
         if not m:
             sys.stderr.write(f"  point tile={tile_n} nt={n_tiles} d={depth} m={minimal} FAILED\n{p.stderr[-400:]}\n")

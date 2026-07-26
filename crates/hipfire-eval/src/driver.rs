@@ -126,6 +126,9 @@ pub(crate) fn run_eval_batteries(
 }
 
 pub(crate) fn daemon_shared_model_load_enabled(config: &EvalConfig) -> bool {
+    if eval_server_url().is_some() {
+        return false;
+    }
     matches!(
         config.executor,
         EvalExecutorMode::Auto | EvalExecutorMode::Daemon
@@ -155,6 +158,15 @@ pub(crate) fn daemon_shared_model_load_battery(battery: BatteryId) -> bool {
 }
 
 pub(crate) fn coherence_shared_model_load_enabled(config: &EvalConfig) -> bool {
+    if eval_server_url().is_some() {
+        return config.runs == 1
+            && config.warmup_runs == 0
+            && !config.benchmark
+            && config
+                .batteries
+                .iter()
+                .any(|battery| coherence_shared_model_load_battery(*battery));
+    }
     matches!(
         config.executor,
         EvalExecutorMode::Auto | EvalExecutorMode::Daemon | EvalExecutorMode::Examples
@@ -181,7 +193,11 @@ pub(crate) fn coherence_shared_model_load_battery(battery: BatteryId) -> bool {
 pub(crate) fn daemon_executor_available_for(config: &EvalConfig, battery: BatteryId) -> bool {
     if !matches!(
         battery,
-        BatteryId::Smoke | BatteryId::Speed | BatteryId::Profile | BatteryId::Vision
+        BatteryId::Smoke
+            | BatteryId::Speed
+            | BatteryId::Profile
+            | BatteryId::Vision
+            | BatteryId::Cask
     ) {
         return false;
     }
@@ -533,6 +549,8 @@ pub(crate) fn result_cache_key(
             "hardware_bucket": ctx.host_profile.hardware_bucket,
             "executor": config.executor.as_str(),
             "kv_mode": config.kv_mode,
+            "cask_budget": config.cask_budget,
+            "cask_beta": config.cask_beta,
             "max_tokens": config.max_tokens,
             "dflash": config.dflash.as_str(),
             "profile": config.profile.as_str(),
@@ -544,6 +562,10 @@ pub(crate) fn result_cache_key(
             "host_memory_bandwidth_gbps": config.host_memory_bandwidth_gbps,
         },
         "inputs": {
+            "cask_sidecar": config.cask_sidecar.as_ref().map(|path| json!({
+                "path": path.display().to_string(),
+                "hash": file_hash(path),
+            })),
             "quality_json": config.quality_json.as_ref().map(|path| json!({
                 "path": path.display().to_string(),
                 "hash": file_hash(path),
@@ -621,7 +643,16 @@ pub(crate) fn result_cache_prompt_paths(battery: BatteryId) -> Vec<&'static str>
         // TinyQuant has no committed prompt — its inputs are the seeded presets +
         // the baselines file, not a corpus.
         BatteryId::TinyQuant => Vec::new(),
-        BatteryId::Barrage | BatteryId::Cask => Vec::new(),
+        // EmbeddingQuality inputs are HFQ paths + the STS-Benchmark dataset,
+        // not a committed prompt corpus.
+        BatteryId::EmbeddingQuality => Vec::new(),
+        BatteryId::Diffusion => vec![
+            "benchmarks/prompts/flux2_image_admission_object.txt",
+            "benchmarks/prompts/flux2_image_admission_scene.txt",
+            "benchmarks/prompts/flux2_image_admission_texture.txt",
+        ],
+        BatteryId::Barrage => Vec::new(),
+        BatteryId::Cask => vec!["benchmarks/prompts/longprose_multidoc.jsonl"],
     }
 }
 
@@ -676,12 +707,23 @@ pub(crate) fn run_battery(
     ctx: &EvalContext,
     datasets: &[DatasetManifestEntry],
 ) -> Vec<EvalResult> {
+    if battery == BatteryId::Diffusion {
+        return diffusion_battery_rows(config, ctx);
+    }
     if battery == BatteryId::TinyQuant {
         // Self-contained pipeline (emit → quantize → collect → KLD), driven by
         // the `hipfire-quantize` + `tiny_quant_probe` binaries regardless of the
         // `--executor` mode. Not a daemon/prompt battery, so it bypasses the
         // executor cascade entirely.
         return tiny_quant_rows(config, ctx);
+    }
+    if battery == BatteryId::EmbeddingQuality {
+        // Self-contained STS-Benchmark similarity comparison, driven by the
+        // embeddinggemma `quality_compare` example. Emits a candidate row and a
+        // reference row that share a comparison key, both carrying a raw
+        // `spearman` (correlation vs human gold) metric; the admission engine
+        // computes the delta and gates it. Not a daemon/prompt battery.
+        return run_examples_embedding_quality_rows(config, ctx);
     }
     if battery == BatteryId::Quality {
         if let Some(rows) = quality_json_rows(config, ctx) {
@@ -925,7 +967,7 @@ pub(crate) fn run_battery(
             ctx,
             prompt("benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt"),
         )],
-        BatteryId::Longctx | BatteryId::Vision | BatteryId::Cask | BatteryId::Profile => {
+        BatteryId::Longctx | BatteryId::Vision | BatteryId::Profile => {
             vec![skip_row(
                 battery,
                 None,
@@ -937,7 +979,21 @@ pub(crate) fn run_battery(
                 None,
             )]
         }
+        BatteryId::Cask => vec![skip_row(
+            battery,
+            None,
+            "embedded_cask_longctx_recall",
+            None,
+            "CASK requires the daemon executor and a local model with an embedded, explicit, or sibling TriAttention component",
+            config,
+            ctx,
+            prompt("benchmarks/prompts/longprose_multidoc.jsonl"),
+        )],
         // TinyQuant early-returns at the top of `run_battery`; never reaches here.
         BatteryId::TinyQuant => tiny_quant_rows(config, ctx),
+        // EmbeddingQuality early-returns at the top of `run_battery`; never here.
+        BatteryId::EmbeddingQuality => run_examples_embedding_quality_rows(config, ctx),
+        // Diffusion early-returns at the top of `run_battery`; never here.
+        BatteryId::Diffusion => diffusion_battery_rows(config, ctx),
     }
 }

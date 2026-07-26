@@ -71,7 +71,7 @@ proxy. attention-mass was a documented negative (recent-window bias) — don't r
 - `eval_hipfire --kv-mode kvarn` KLD/PPL vs gold BF16, **≥16 chunks** (2-chunk top-K
   KLD is noisy — trust NLL/PPL). Headline configs + a larger model (9B/27B) where
   long-context compression actually matters.
-- **Coherence**: `scripts/coherence-gate-dflash.sh` (KV changes touch the attractor
+- **Coherence**: `tests/coherence-gate-dflash.sh` (KV changes touch the attractor
   surface). The kv-compression memory notes occasional mangled multibyte emoji on
   the hier path — watch output integrity.
 - **Decode-perf A/B**: two-tier read cost vs single-tier (`scripts/probe_commits.sh`,

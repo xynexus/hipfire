@@ -134,7 +134,10 @@ fn main() {
         4,
         true,
         false,
+        false, // similarity_merge
         15.0,
+        15.0,
+        false,
     );
     let nvc = cold.n_valid;
 
@@ -200,8 +203,10 @@ fn main() {
         let od = gpu.alloc_tensor(&[NH * HD], DType::F32).unwrap();
         let md = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
         let ld = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
-        gpu.attention_cold_slots(&qd, &kd, &vd, &od, &md, &ld, NH, NKV, ns, scale, 0, 0, None)
-            .unwrap();
+        gpu.attention_cold_slots(
+            &qd, &kd, &vd, &od, &md, &ld, NH, NKV, ns, scale, 0, 0, 0, None, 256,
+        )
+        .unwrap();
         (od, md, ld)
     };
 
@@ -211,7 +216,7 @@ fn main() {
     let om = gpu.alloc_tensor(&[NH * HD], DType::F32).unwrap();
     let mm = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
     let lm = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
-    gpu.flash_tier_merge(&oh, &mh, &lh, &oc, &mc, &lc, &om, &mm, &lm, NH)
+    gpu.flash_tier_merge(&oh, &mh, &lh, &oc, &mc, &lc, &om, &mm, &lm, NH, 256)
         .unwrap();
 
     gpu.device_synchronize().unwrap();

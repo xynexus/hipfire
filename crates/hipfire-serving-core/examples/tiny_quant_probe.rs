@@ -40,8 +40,8 @@
 
 use std::path::Path;
 
-use hipfire_serving_core::tiny_harness::{run_ar_hash, run_collect, run_kld, TinyArch};
 use hipfire_rdna::Gpu;
+use hipfire_serving_core::tiny_harness::{run_ar_hash, run_collect, run_kld, TinyArch};
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -98,6 +98,9 @@ fn main() {
             println!("max_kld: {:.8}", out.max_kld);
             println!("n_scored: {}", out.n_scored);
             println!("finite: {}", out.finite);
+            if let Some(reason) = out.first_nonfinite.as_deref() {
+                println!("first_nonfinite: {reason}");
+            }
         }
         "collect" => {
             let model = req(&args, "--model");
@@ -150,6 +153,7 @@ fn main() {
             let mut m = hipfire_serving_core::load::load_model(
                 &model,
                 len + 16,
+                None,
                 None,
                 None,
                 None,

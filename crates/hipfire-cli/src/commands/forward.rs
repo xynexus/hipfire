@@ -1,10 +1,14 @@
 use std::{
     ffi::OsString,
+    io::{Read, Write},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Duration,
 };
 
 use clap::Args;
+use hipfire_config::LoadedConfig;
 
 use crate::model::find_model;
 
@@ -22,8 +26,15 @@ Common options:
   --compare <model>         Model to compare against the candidate
   --baseline <model>        Deprecated alias for --compare
   --reference <model>       Higher precision reference model or fixture
-  --battery <a,b>           Batteries such as smoke,quality,speed,barrage
-  --suite <a,b>             Dataset/eval suites such as gpqa,lm_eval_micro
+  --battery <a,b>           Batteries such as smoke,quality,speed,barrage,perplexity,longctx
+  --suite <a,b>             Dataset/eval suites such as gpqa,ruler,niah,nolima
+  --kv-mode <mode>          KV cache mode: f32,q8,asym2,asym3,asym4,kvarn,fwht2,fwht3,fwht4
+  --kv-hierarchical         Enable the two-tier hot/cold KV cache (HIPFIRE_KV_HIERARCHICAL=1)
+  --kvarn-bits <2|4|8>      kvarn K precision (default 4; 8 ~= lossless-er, 2x K storage)
+  --hot-bits <8|16>         hierarchical hot-tier precision (default 8 = int8 ring, ~1/2 hot VRAM; 16 = f16)
+  --ctx <N>                 Context length for perplexity/long-context batteries (default: 512)
+  --corpus <path>           Perplexity corpus path
+  --fixture <a,b>           pflash/longctx NIAH fixture filter (e.g. niah_16k,longcode)
   --benchmark               Run repeated samples and emit aggregate rows
   --runs <N>                Repeat each scored battery N times
   --force                   Ignore cache hits for this run
@@ -44,7 +55,7 @@ Usage:
 
 Common options:
   --out <path>              Write report JSON there
-  --models-dir <dir>        Model storage directory to test, default ~/.hipfire/models
+  --models-dir <dir>        Model storage directory to test, default configured models_dir
   --size-mib <N>            CPU/GPU copy test size in MiB, default 128
   --storage-size-mib <N>    Storage test size in MiB, default 128
   --runs <N>                Samples per test, default 3
@@ -52,7 +63,7 @@ Common options:
   --gpu-max-size-mib <N>    Cap largest GPU read/write sweep payload size
   --gpu-sweep-mib-step <N>  Override default GPU MiB payload spacing
   --skip-gpu                Skip HIP copy tests
-  --skip-storage            Skip ~/.hipfire/models storage tests
+  --skip-storage            Skip model storage tests
   --json                    Print report JSON to stdout
 
 Build runner:
@@ -98,77 +109,103 @@ pub struct CollectArtifactsArgs {
     pub args: Vec<OsString>,
 }
 
-const REPACK_HELP: &str = r#"hipfire repack - reshuffle a .hfq into an arch-optimal weight layout
+const OPTIMIZE_HELP: &str = r#"hipfire optimize - reshuffle a .hfq into an arch-optimal weight layout
 
 Takes a canonical (general, portable) .hfq and writes an arch-tagged
 <model>.<arch>.hfq whose weights are pre-packed into the device layout that
 arch's kernels want — so the model loads with no per-load repack. The canonical
 file is the source of truth and is never modified.
 
-Currently repacks Opus W4A4 (op4 / op4-4) tensors into the combined interleaved-decode
+Currently optimizes Opus W4A4 (oq4) tensors into the combined interleaved-decode
 layout (quant_type 34 -> 37). Other tensors are copied through.
 
 Usage:
-  hipfire repack <model.hfq> [--arch <gfx>] [-o <out.hfq>]
+  hipfire optimize <model.hfq> [--arch <gfx>] [-o <out.hfq>]
 
   --arch defaults to the live GPU (probed read-only). Default output is
   <model>.<arch>.hfq beside the input, e.g.
-    qwen3.5-0.8b-op4.hfq -> qwen3.5-0.8b-op4.gfx1103.hfq
+    qwen3.5-0.8b-oq4.hfq -> qwen3.5-0.8b-oq4.gfx1103.hfq
 
 The positional model accepts a local name, shorthand, alias, or path.
+(Alias: `hipfire repack`.)
 
 Build runner:
-  cargo build --release -p hipfire-runtime --example oq4_repack"#;
+  cargo build --release -p hipfire-runtime --example optimize"#;
 
 #[derive(Debug, Args)]
 #[command(disable_help_flag = true, trailing_var_arg = true)]
-pub struct RepackArgs {
-    /// Arguments forwarded to the oq4_repack runner
+pub struct OptimizeArgs {
+    /// Arguments forwarded to the optimize runner
     #[arg(allow_hyphen_values = true)]
     pub args: Vec<OsString>,
 }
 
-pub fn run_eval(args: EvalArgs) -> anyhow::Result<()> {
+pub fn run_eval(args: EvalArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
+    let server_env = running_server_env(&loaded);
     run_forwarded(
         Runner::eval(),
-        resolve_forwarded_model_args(args.args, false),
+        resolve_forwarded_model_args(args.args, true, &loaded),
         "HIPFIRE_EVAL_BIN",
         "hipfire-eval",
         EVAL_HELP,
         "cargo build --release -p hipfire-eval",
+        &server_env,
     )
 }
 
-pub fn run_host_profile(args: HostProfileArgs) -> anyhow::Result<()> {
+pub fn run_host_profile(args: HostProfileArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     run_forwarded(
         Runner::host_profile(),
-        args.args,
+        host_profile_args_with_models_dir(args.args, &loaded),
         "HIPFIRE_HOST_PROFILE_BIN",
         "hipfire-host-profile",
         HOST_PROFILE_HELP,
         "cargo build --release -p hipfire-runtime --bin hipfire-host-profile",
+        &[],
     )
 }
 
-pub fn run_collect_artifacts(args: CollectArtifactsArgs) -> anyhow::Result<()> {
+fn host_profile_args_with_models_dir(
+    mut args: Vec<OsString>,
+    loaded: &LoadedConfig,
+) -> Vec<OsString> {
+    let has_models_dir = args.iter().any(|arg| {
+        arg == "--models-dir"
+            || arg
+                .to_str()
+                .is_some_and(|value| value.starts_with("--models-dir="))
+    });
+    if !has_models_dir {
+        args.push("--models-dir".into());
+        args.push(hipfire_config::configured_models_dir(&loaded.config).into_os_string());
+    }
+    args
+}
+
+pub fn run_collect_artifacts(
+    args: CollectArtifactsArgs,
+    loaded: LoadedConfig,
+) -> anyhow::Result<()> {
     run_forwarded(
         Runner::collect_artifacts(),
-        resolve_forwarded_model_args(args.args, false),
+        resolve_forwarded_model_args(args.args, false, &loaded),
         "HIPFIRE_COLLECT_ARTIFACTS_BIN",
         "collect_artifacts",
         COLLECT_ARTIFACTS_HELP,
         "cargo build --release -p hipfire-runtime --example collect_artifacts",
+        &[],
     )
 }
 
-pub fn run_repack(args: RepackArgs) -> anyhow::Result<()> {
+pub fn run_optimize(args: OptimizeArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     run_forwarded(
-        Runner::repack(),
-        resolve_forwarded_model_args(args.args, true),
-        "HIPFIRE_REPACK_BIN",
-        "oq4_repack",
-        REPACK_HELP,
-        "cargo build --release -p hipfire-runtime --example oq4_repack",
+        Runner::optimize(),
+        resolve_forwarded_model_args(args.args, true, &loaded),
+        "HIPFIRE_OPTIMIZE_BIN",
+        "optimize",
+        OPTIMIZE_HELP,
+        "cargo build --release -p hipfire-runtime --example optimize",
+        &[],
     )
 }
 
@@ -179,6 +216,7 @@ fn run_forwarded(
     bin_name: &str,
     help: &str,
     build_hint: &str,
+    envs: &[(&'static str, String)],
 ) -> anyhow::Result<()> {
     if is_help(&args) {
         println!("{help}");
@@ -187,12 +225,16 @@ fn run_forwarded(
 
     let bin = resolve_runner_binary(&runner, env_var, bin_name)
         .ok_or_else(|| anyhow::anyhow!("{bin_name} not found.\nBuild it with: {build_hint}"))?;
-    let status = Command::new(&bin)
+    let mut command = Command::new(&bin);
+    command
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
+        .stderr(Stdio::inherit());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let status = command.status()?;
 
     if let Some(code) = status.code() {
         if code == 0 {
@@ -205,6 +247,52 @@ fn run_forwarded(
     }
 }
 
+fn running_server_env(loaded: &LoadedConfig) -> Vec<(&'static str, String)> {
+    let url = configured_server_url(loaded);
+    if server_health_ok(&url) {
+        vec![("HIPFIRE_EVAL_SERVER_URL", url)]
+    } else {
+        Vec::new()
+    }
+}
+
+fn configured_server_url(loaded: &LoadedConfig) -> String {
+    let host = if loaded.config.host == "0.0.0.0" {
+        "127.0.0.1"
+    } else {
+        loaded.config.host.as_str()
+    };
+    format!("http://{}:{}", host, loaded.config.port)
+}
+
+fn server_health_ok(url: &str) -> bool {
+    let Some(addr) = url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.parse::<SocketAddr>().ok())
+    else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(150)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    if write!(
+        stream,
+        "GET /health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        addr
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let mut buf = [0_u8; 64];
+    stream
+        .read(&mut buf)
+        .ok()
+        .is_some_and(|n| String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"))
+}
+
 fn is_help(args: &[OsString]) -> bool {
     args.is_empty() || args.iter().any(|arg| arg == "-h" || arg == "--help")
 }
@@ -212,6 +300,7 @@ fn is_help(args: &[OsString]) -> bool {
 fn resolve_forwarded_model_args(
     args: Vec<OsString>,
     resolve_first_positional: bool,
+    loaded: &LoadedConfig,
 ) -> Vec<OsString> {
     const MODEL_VALUE_FLAGS: &[&str] = &["--model", "--baseline", "--reference", "--draft"];
     let mut out = Vec::with_capacity(args.len());
@@ -220,7 +309,7 @@ fn resolve_forwarded_model_args(
 
     for arg in args {
         if resolve_next {
-            out.push(resolve_model_os(arg));
+            out.push(resolve_model_os(arg, loaded));
             resolve_next = false;
             continue;
         }
@@ -238,14 +327,14 @@ fn resolve_forwarded_model_args(
 
         if let Some((flag, value)) = s.split_once('=') {
             if MODEL_VALUE_FLAGS.contains(&flag) {
-                let resolved = resolve_model_str(value);
+                let resolved = resolve_model_str(value, loaded);
                 out.push(OsString::from(format!("{flag}={resolved}")));
                 continue;
             }
         }
 
         if resolve_first_positional && !resolved_positional && !s.starts_with('-') {
-            out.push(resolve_model_str(s).into());
+            out.push(resolve_model_str(s, loaded).into());
             resolved_positional = true;
             continue;
         }
@@ -256,15 +345,15 @@ fn resolve_forwarded_model_args(
     out
 }
 
-fn resolve_model_os(arg: OsString) -> OsString {
+fn resolve_model_os(arg: OsString, loaded: &LoadedConfig) -> OsString {
     arg.to_str()
-        .map(resolve_model_str)
+        .map(|value| resolve_model_str(value, loaded))
         .map(OsString::from)
         .unwrap_or(arg)
 }
 
-fn resolve_model_str(value: &str) -> String {
-    find_model(value)
+fn resolve_model_str(value: &str, loaded: &LoadedConfig) -> String {
+    find_model(value, &loaded.config)
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| value.to_string())
 }
@@ -303,10 +392,10 @@ impl Runner {
         }
     }
 
-    fn repack() -> Self {
+    fn optimize() -> Self {
         Self {
-            release_name: "oq4_repack",
-            debug_name: Some("oq4_repack"),
+            release_name: "optimize",
+            debug_name: Some("optimize"),
             is_example: true,
         }
     }
@@ -355,6 +444,30 @@ fn runner_candidates(runner: &Runner, env_var: &str, bin_name: &str) -> Vec<Path
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hipfire_config::{HipfireConfig, LoadedConfig};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_config() -> LoadedConfig {
+        LoadedConfig::from_config(HipfireConfig::default())
+    }
+
+    fn test_config_with_model(name: &str) -> (LoadedConfig, PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-cli-forward-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let model = dir.join(format!("{name}.hfq"));
+        fs::write(&model, b"placeholder").unwrap();
+        let mut config = HipfireConfig::default();
+        config.models_dir = Some(dir.display().to_string());
+        (LoadedConfig::from_config(config), model)
+    }
 
     #[test]
     fn help_matches_empty_and_help_flags() {
@@ -424,6 +537,7 @@ mod tests {
                     OsString::from("speed"),
                 ],
                 false,
+                &test_config(),
             ),
             vec![
                 OsString::from("--model=missing-model"),
@@ -439,11 +553,34 @@ mod tests {
                     OsString::from("gfx1151")
                 ],
                 true,
+                &test_config(),
             ),
             vec![
                 OsString::from("missing-model"),
                 OsString::from("--arch"),
                 OsString::from("gfx1151")
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_resolves_first_positional_model() {
+        let (loaded, model) = test_config_with_model("tiny");
+        let args = resolve_forwarded_model_args(
+            vec![
+                OsString::from("tiny"),
+                OsString::from("--battery"),
+                OsString::from("speed"),
+            ],
+            true,
+            &loaded,
+        );
+        assert_eq!(
+            args,
+            vec![
+                OsString::from(model.display().to_string()),
+                OsString::from("--battery"),
+                OsString::from("speed"),
             ]
         );
     }

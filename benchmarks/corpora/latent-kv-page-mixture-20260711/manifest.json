@@ -1,0 +1,48 @@
+{
+  "schema": "hipfire.latent_kv_corpus.v0",
+  "strict_split": true,
+  "sources": {
+    "calibration": {
+      "dataset": "HuggingFaceFW/fineweb-edu",
+      "revision": "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9",
+      "config": "sample-10BT",
+      "split": "train",
+      "viewer_offset": 60000,
+      "license": "ODC-By-1.0; also subject to CommonCrawl Terms of Use",
+      "raw": {
+        "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-page-mixture-20260711/raw/fineweb-edu-sample-10BT-offset60000-length100.rows.json",
+        "bytes": 529953,
+        "sha256": "ba6f36244154456e617f991d629125f26e9cbb95706c83500f1e4179222eef03",
+        "records": 100
+      }
+    },
+    "validation": {
+      "dataset": "allenai/c4",
+      "revision": "1588ec454efa1a09f29cd18ddd04fe05fc8653a2",
+      "config": "realnewslike",
+      "split": "validation",
+      "viewer_offset": 5000,
+      "license": "ODC-By-1.0; also subject to CommonCrawl Terms of Use",
+      "raw": {
+        "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-page-mixture-20260711/raw/c4-realnewslike-validation-offset5000-length100.rows.json",
+        "bytes": 261739,
+        "sha256": "e72d43d4dd33e9aa0a9588861cee6dbc05a6671f99647eb97a25bba2c33616fd",
+        "records": 100
+      }
+    }
+  },
+  "outputs": {
+    "calibration": {
+      "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-page-mixture-20260711/fineweb-edu-calibration.jsonl",
+      "bytes": 391999,
+      "sha256": "3da7e7f0d9e83d628b855a6975180674977f6a06e4b0fd9beffec33cad333ca2",
+      "records": 64
+    },
+    "validation": {
+      "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-page-mixture-20260711/c4-realnewslike-validation.jsonl",
+      "bytes": 76673,
+      "sha256": "be72ffdc7669ee9640c118a3cc5b7e6810c693c7c32b93222deb5614bfa54cd3",
+      "records": 12
+    }
+  }
+}

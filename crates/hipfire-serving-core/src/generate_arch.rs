@@ -34,6 +34,166 @@ use crate::spec_metrics::emit_spec_done;
 use hipfire_specdecode::SpecMetrics;
 use hipfire_specdecode_dspark::spec::PrefillOutcome;
 
+/// Generic request driver for an inventory/factory-loaded text backend. Prompt
+/// rendering is resolved from the returned profile plus the model's embedded
+/// official Jinja template; generation itself crosses the one boxed seam.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_registered_backend(
+    m: &mut LoadedModel,
+    gpu: &mut hipfire_rdna::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    max_think_tokens: usize,
+    assistant_prefix: prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[prompt_frame::Message]>,
+    request_stop_sequences: &[String],
+) {
+    let Some(tokenizer) = m.tokenizer.as_ref() else {
+        emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
+        return;
+    };
+    let Some(loaded) = m.registered_backend.as_ref() else {
+        emit_error_with_id(stdout, id, "registered backend not loaded".to_string());
+        return;
+    };
+    let raw = effective_raw(m);
+    let bos_token = loaded.profile.bos_token;
+    let require_official_template = loaded.profile.require_official_template;
+    let family = loaded.family;
+    let output_holdback_prefixes = loaded.profile.eos_filter.holdback_prefixes.clone();
+    let strip_think = loaded.profile.eos_filter.strip_think.unwrap_or(false);
+    let output_protocol = loaded.profile.output_protocol;
+    let framed = if raw {
+        // Base models (raw, no chat template) still need the model's mandatory
+        // leading BOS — e.g. gemma requires `<bos>` or next-token prediction
+        // degrades badly. The tokenizer's `encode` recognizes the special-token
+        // text but never auto-prepends it, and the instruction-tuned path only
+        // gets BOS via the jinja template. Prepend it here when the profile
+        // declares one (no-op for models without a `bos_token`).
+        match bos_token {
+            Some(bos) if !prompt.starts_with(bos) => format!("{bos}{prompt}"),
+            _ => prompt.to_string(),
+        }
+    } else if let Some(template) = m.chat_template.as_deref() {
+        let frame = prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: max_think_tokens > 0,
+            bos_token,
+        };
+        let rendered = if let Some(messages) = messages_history {
+            frame.render_messages(messages, tools, None)
+        } else {
+            frame.render()
+        };
+        match rendered {
+            Ok(rendered) => rendered,
+            Err(error) if require_official_template => {
+                emit_error_with_id(
+                    stdout,
+                    id,
+                    format!("{family} official prompt render failed: {error}"),
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("[{family}] prompt render failed ({error}); using shared fallback");
+                let ids = prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: prompt,
+                    assistant_prefix,
+                    raw: false,
+                }
+                .build();
+                tokenizer.decode(&ids)
+            }
+        }
+    } else if require_official_template {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!("{family} instruction request has no official chat template"),
+        );
+        return;
+    } else {
+        let ids = prompt_frame::ChatFrame {
+            tokenizer,
+            system: system_prompt,
+            user: prompt,
+            assistant_prefix,
+            raw: false,
+        }
+        .build();
+        tokenizer.decode(&ids)
+    };
+
+    let mut stop_sequences = request_stop_sequences.to_vec();
+    for stop in &loaded.profile.eos_filter.stop_at {
+        if let Ok(stop) = std::str::from_utf8(stop) {
+            if !stop_sequences.iter().any(|existing| existing == stop) {
+                stop_sequences.push(stop.to_string());
+            }
+        }
+    }
+    if let Some(profile) = &m.chat_template_profile {
+        for stop in &profile.stop_at {
+            if !stop_sequences.contains(stop) {
+                stop_sequences.push(stop.clone());
+            }
+        }
+    }
+    let repeat_penalty = loaded
+        .profile
+        .sampler
+        .repeat_penalty
+        .unwrap_or(repeat_penalty);
+
+    let no_images: [&[u8]; 0] = [];
+    let mut ctx = GenerateCtx {
+        id,
+        prompt: &framed,
+        temperature: temp,
+        top_p,
+        top_k,
+        max_tokens,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        max_think_tokens,
+        stop_sequences: &stop_sequences,
+        output_holdback_prefixes: &output_holdback_prefixes,
+        strip_think,
+        output_protocol,
+        images: &no_images,
+        sink: stdout,
+    };
+    let result = m
+        .registered_backend
+        .as_mut()
+        .expect("checked registered backend")
+        .backend
+        .serve(gpu, tokenizer, &mut ctx);
+    drop(ctx);
+    if let Err(error) = result {
+        emit_error_with_id(stdout, id, format!("{family} serve: {error}"));
+    }
+}
+
 /// DeepSeek V4 Flash generate path: prefill via the batched scratch, then a
 /// per-token decode loop that parses the model's DSML stream into
 /// token/reasoning/tool-call events ([`emit_stream_event`]). Honors think-mode
@@ -185,7 +345,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         let mut pending_tool_result = false;
         for msg in &history[..end] {
             match msg.role {
-                Role::System => {
+                Role::System | Role::Developer => {
                     // Already handled via effective_system; skip.
                 }
                 Role::User => {
@@ -635,6 +795,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             if let StreamEvent::ToolCalls(calls) = ev {
                 for c in calls {
                     emit_tool_calls_buf.push(prompt_frame::ToolCall {
+                        id: None,
                         name: c.name.clone(),
                         arguments: c.arguments.clone(),
                     });
@@ -888,6 +1049,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                 StreamEvent::ToolCalls(calls) => {
                     for c in calls {
                         emit_tool_calls_buf.push(prompt_frame::ToolCall {
+                            id: None,
                             name: c.name.clone(),
                             arguments: c.arguments.clone(),
                         });
@@ -1099,63 +1261,6 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
 ///
 /// P3.1: now routed through `ServingBackend::serve` (the shared
 /// `run_simple_ar` / `decode_loop` seam, mirroring `generate_gemma3`). The
-/// per-token prefill/decode loop and streaming live inside `Qwen2Backend`.
-pub fn generate_qwen2(
-    m: &mut LoadedModel,
-    gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    _system_prompt: Option<&str>,
-    temp: f32,
-    top_p: f32,
-    max_tokens: usize,
-    repeat_penalty: f32,
-    repeat_window: usize,
-) {
-    // P3.1: route through the shared `ServingBackend::serve` seam
-    // (`run_simple_ar` → tokenize → prefill → `decode_loop`), mirroring
-    // `generate_gemma3`. `decode_loop` honors `repeat_penalty`; greedy otherwise.
-    if m.tokenizer.is_none() {
-        emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
-        return;
-    }
-    if m.qwen2_backend.is_none() {
-        emit_error_with_id(
-            stdout,
-            id,
-            "qwen2 backend not loaded (arch 7 not active)".to_string(),
-        );
-        return;
-    }
-    // Disjoint field borrows: tokenizer (shared) + backend (mut).
-    let tok = m.tokenizer.as_ref().unwrap();
-    let backend = m.qwen2_backend.as_mut().unwrap();
-
-    let no_images: [&[u8]; 0] = [];
-    let mut ctx = GenerateCtx {
-        id,
-        prompt,
-        temperature: temp,
-        top_p,
-        max_tokens,
-        repeat_penalty,
-        repeat_window,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
-        max_think_tokens: 0,
-        stop_sequences: &[],
-        images: &no_images,
-        sink: stdout,
-    };
-    let result = backend.serve(gpu, tok, &mut ctx);
-    // `ctx` mutably borrows `stdout`; drop before reusing it for errors.
-    drop(ctx);
-    if let Err(e) = result {
-        emit_error_with_id(stdout, id, format!("qwen2 serve: {e}"));
-    }
-}
-
 /// LLaMA / Mistral / plain-Qwen3 (arch_id 0/1) generate path — routes through the
 /// `ServingBackend` seam (P3.2). Unlike qwen2, llama needs chat-framing, so this
 /// builds `prompt_tokens` (the model's jinja `chat_template` when
@@ -1298,6 +1403,7 @@ pub fn generate_nemotron(
         prompt: "", // unused: prefill already consumed the framed tokens
         temperature: temp,
         top_p,
+        top_k: 20,
         max_tokens,
         repeat_penalty,
         repeat_window,
@@ -1305,6 +1411,9 @@ pub fn generate_nemotron(
         frequency_penalty: 0.0,
         max_think_tokens: 0,
         stop_sequences: &[],
+        output_holdback_prefixes: &[],
+        strip_think: false,
+        output_protocol: hipfire_runtime::arch::OutputProtocol::Plain,
         images: &no_images,
         sink: stdout,
     };
@@ -1471,6 +1580,7 @@ pub fn generate_zaya(
         prompt: "", // unused: prefill already consumed the framed tokens
         temperature: temp,
         top_p,
+        top_k: 20,
         max_tokens,
         repeat_penalty,
         repeat_window,
@@ -1478,6 +1588,9 @@ pub fn generate_zaya(
         frequency_penalty: 0.0,
         max_think_tokens: 0,
         stop_sequences: &[],
+        output_holdback_prefixes: &[],
+        strip_think: false,
+        output_protocol: hipfire_runtime::arch::OutputProtocol::Plain,
         images: &no_images,
         sink: stdout,
     };
@@ -1802,6 +1915,7 @@ pub fn generate_llama(
         prompt: "", // unused: prefill already consumed the framed tokens
         temperature: temp,
         top_p,
+        top_k: 20,
         max_tokens,
         repeat_penalty,
         repeat_window,
@@ -1809,6 +1923,9 @@ pub fn generate_llama(
         frequency_penalty: 0.0,
         max_think_tokens: 0,
         stop_sequences: &[],
+        output_holdback_prefixes: &[],
+        strip_think: false,
+        output_protocol: hipfire_runtime::arch::OutputProtocol::Plain,
         images: &no_images,
         sink: stdout,
     };
@@ -1907,8 +2024,12 @@ pub fn generate_minimax(
     let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        // Prefer the model's own jinja template when present (opt out with
+        // HIPFIRE_JINJA_CHAT=0). The hand-rolled ChatScaffold never emits a
+        // leading BOS and can misframe non-Qwen ChatML variants; the real
+        // template is authoritative. A render failure falls back to Plain below.
+        let try_jinja = m.chat_template.is_some()
+            && std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
@@ -2193,8 +2314,12 @@ pub fn generate_lfm2moe(
     // ── Prompt build (same two-path branch as the minimax AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        // LFM2's chat template begins with `{{ bos_token }}` (`<|startoftext|>`),
+        // which the hand-rolled ChatScaffold does not emit — omitting the leading
+        // BOS yields incoherent output. Default to the jinja template when present
+        // (opt out with HIPFIRE_JINJA_CHAT=0); the Plain ChatFrame stays the fallback.
+        let try_jinja = m.chat_template.is_some()
+            && std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
@@ -2537,8 +2662,11 @@ fn generate_lfm2moe_dflash(
     }
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        // LFM2's chat template leads with `{{ bos_token }}` (`<|startoftext|>`);
+        // the hand-rolled ChatScaffold drops that BOS. Default to the jinja
+        // template when present (opt out with HIPFIRE_JINJA_CHAT=0).
+        let try_jinja = m.chat_template.is_some()
+            && std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
@@ -2973,6 +3101,35 @@ pub fn framed_gemma3_prompt(prompt: &str, system_prompt: Option<&str>) -> String
     framed
 }
 
+/// Frame a `{system, user}` turn into the qwen35 jinja `chat_template` the
+/// serving prefill path uses, so the daemon's steer-capture op templates a turn
+/// byte-identically to serving. Mirrors `qwen35_materialize_batch_prefill_prompt`'s
+/// single-turn render (bos folded by the template; `enable_thinking` on).
+pub fn framed_qwen35_prompt(
+    m: &LoadedModel,
+    user: &str,
+    system: Option<&str>,
+) -> Result<String, String> {
+    let tokenizer = m
+        .tokenizer
+        .as_ref()
+        .ok_or_else(|| "tokenizer not loaded".to_string())?;
+    let template = m
+        .chat_template
+        .as_deref()
+        .ok_or_else(|| "qwen35 steer-capture requires a jinja chat_template".to_string())?;
+    prompt_frame::JinjaChatFrame {
+        tokenizer,
+        template,
+        system,
+        user,
+        enable_thinking: true,
+        bos_token: None,
+    }
+    .render()
+    .map_err(|e| format!("qwen35 chat_template render failed: {e}"))
+}
+
 /// Gemma3 text (arch_id=12, e.g. medgemma-*-text) generate path.
 ///
 /// Frames the gemma chat prompt (bos + user turn + model turn; `<bos>` /
@@ -3034,6 +3191,7 @@ pub fn generate_gemma3(
         prompt: "",
         temperature: temp,
         top_p,
+        top_k: 20,
         max_tokens,
         repeat_penalty,
         repeat_window,
@@ -3041,6 +3199,9 @@ pub fn generate_gemma3(
         frequency_penalty: 0.0,
         max_think_tokens: 0,
         stop_sequences: &[],
+        output_holdback_prefixes: &[],
+        strip_think: false,
+        output_protocol: hipfire_runtime::arch::OutputProtocol::Plain,
         images: &no_images,
         sink: stdout,
     };
@@ -3124,6 +3285,7 @@ pub fn generate_gemma3_vl_text(
         prompt: "",
         temperature: temp,
         top_p,
+        top_k: 20,
         max_tokens,
         repeat_penalty,
         repeat_window,
@@ -3131,6 +3293,9 @@ pub fn generate_gemma3_vl_text(
         frequency_penalty: 0.0,
         max_think_tokens: 0,
         stop_sequences: &[],
+        output_holdback_prefixes: &[],
+        strip_think: false,
+        output_protocol: hipfire_runtime::arch::OutputProtocol::Plain,
         images: &no_images,
         sink: stdout,
     };

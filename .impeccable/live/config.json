@@ -1,0 +1,6 @@
+{
+  "files": ["crates/hipfire-admin-ui/index.html"],
+  "insertBefore": "</body>",
+  "commentSyntax": "html",
+  "cspChecked": true
+}

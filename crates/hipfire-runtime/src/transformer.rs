@@ -151,9 +151,9 @@ pub fn dtype_always_batchable(dt: DType) -> bool {
 /// prefill availability is governed by a quality `[[gate]]` instead:
 ///   - `bf16` is `None` here but is handled as always-batchable (plain GEMM on
 ///     every arch) by [`quant_prefill_batchable`];
-///   - the OQ W4A4 / W8A8 activation-quant formats (`oq4`, `oq4+`, `oq8`,
-///     `oq8+`) route through parity-gated activation paths, not the weight-only
-///     `is_batchable_la` GEMM kernels.
+///   - the OQ W4A4 / W8A8 activation-quant formats (`oq4`, `oq4+`, `oq4++`,
+///     `oq4.25++`, `oq8`, `oq8+`, `oq8++`) route through parity-gated activation
+///     paths, not the weight-only `is_batchable_la` GEMM kernels.
 fn quant_repr_dtype(quant: &str) -> Option<DType> {
     Some(match quant {
         "q8" => DType::Q8_0,

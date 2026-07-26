@@ -22,8 +22,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-use hipfire_runtime::quant::f32_to_f16;
 use hipfire_rdna::{DType, Gpu};
+use hipfire_runtime::quant::f32_to_f16;
 use std::time::Instant;
 
 fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {

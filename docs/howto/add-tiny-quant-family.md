@@ -176,13 +176,23 @@ hand-tuned `rel_tol` (5th column).
 |--------|--------|------------|-------|
 | llama (0) | q8f16 | hfq4, mq4, mq3 | no bias/qk-norm; loader rejects F16/BF16/MQ6 weights |
 | qwen2 (7) | fp16 | q8f16, hfq4 | needs `--arch-id 7` (model_type auto-detects to arch 1); has QKV bias |
+| dots_ocr (8) | fp16 | hfq4 | complete Qwen2 text + Dots vision artifact load; synthetic RGB preprocessing feeds `vision_forward`, then visual rows splice through `forward_step_with_embed`; vision tensors included with `--include-vision --vision-quant hfq4` |
+| deepseek4 (9) | deepseek4-source-precision | deepseek4-source-precision | text core: Q/O-LoRA, Hyper-Connections, score-routed MoE, shared experts, native MQ2-Lloyd routed experts; needs `--allow-mq2-lloyd` |
+| deepseek4_compressed (9) | deepseek4-source-precision | deepseek4-source-precision | compressed-KV/indexer variant: ratio-4 compressor/indexer tensors plus long state hashing; needs `--allow-mq2-lloyd` |
+| deepseek4_mtp (9) | deepseek4-source-precision | deepseek4-source-precision | MTP variant: loads `mtp.0.*`, seeds `mtp_last_hidden` with main decode, then drives `mtp_forward`; needs `--allow-mq2-lloyd` |
 | gemma3 (12) | fp16 | q8f16, hfq4 | (1+w) norm baked at ingest; GeGLU |
+| gemma3_vl (13) | fp16 | q8f16, hfq4 | complete multimodal artifact load; embedded-PNG preprocessing feeds `vision_forward` + `project`, then image-token embeddings splice through `forward_step_with_embed`; vision tensors included with `--include-vision --vision-quant q8f16` |
+| gemma4_dense (24) | fp16 | q8f16, hfq4 | dense text only |
+| gemma4_ple (24) | fp16 | q8f16, hfq4 | PLE/KV-sharing text coverage through the reference forward path |
+| gemma4_moe (24) | fp16 | q8f16, hfq4 | dense-MoE text coverage through the reference forward path |
 | minimax (10) | mq6 | mq4 | MoE experts MQ4/MQ6 only; **topk GPU-faults on gfx1151** (excluded there) |
+| lfm2_moe (11) | mq6 | mq4 | hybrid short-conv + attention + MoE; experts MQ4/MQ6 only |
+| mamba2 (15) | fp16 | q8f16 | State Spaces naming, loaded through the Mamba-capable Nemotron backend |
 | qwen3_5 (5) | fp16 | q8f16, mq6, mq4, mq3 | + calibrated `qtip3-sim` cell (loads bf16) |
+| qwen3_5_vl (5) | fp16 | q8f16, hfq4 | composite Qwen35 text + SigLIP vision artifact; synthetic vision forward feeds `forward_scratch_embed`; vision tensors included with `--include-vision --vision-quant hfq4` |
 | qwen3_5_moe (6) | fp16 | q8f16, mq6, mq4, mq3 | 3D-stacked experts; was the cross-arch MoE NaN fix |
 
 ## Follow-ups / not yet added
 
-DeepSeek4 (9, LoRA + hyper-connections + compressed KV), LFM2-MoE (11, hybrid
-conv), and the VL families (8/13, need image inputs) are harder — each needs its
-loader recon per Step 0. minimax has no gfx1151 baseline pending the topk fault fix.
+The remaining dots.ocr gap is full decoded-image + prompt-template e2e coverage;
+minimax has no gfx1151 baseline pending the topk fault fix.

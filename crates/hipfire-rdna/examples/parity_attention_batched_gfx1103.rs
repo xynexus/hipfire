@@ -14,7 +14,9 @@ fn lcg(seed: u64, n: usize) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
         })
         .collect()
@@ -26,11 +28,19 @@ fn f16_to_f32(bits: u16) -> f32 {
     let v = if e == 0 {
         (f as f32) * 2f32.powi(-24)
     } else if e == 0x1f {
-        if f == 0 { f32::INFINITY } else { f32::NAN }
+        if f == 0 {
+            f32::INFINITY
+        } else {
+            f32::NAN
+        }
     } else {
         (1.0 + f as f32 / 1024.0) * 2f32.powi(e as i32 - 15)
     };
-    if s == 1 { -v } else { v }
+    if s == 1 {
+        -v
+    } else {
+        v
+    }
 }
 
 const NH: usize = 8;
@@ -43,7 +53,14 @@ const B: usize = 5;
 fn main() {
     let forced = std::env::var("HIPFIRE_FORCE_GENERIC").is_ok();
     let mut gpu = Gpu::init().expect("gpu init");
-    println!("force_generic={forced} (path: {})", if forced { "generic LDS" } else { "arch-selected" });
+    println!(
+        "force_generic={forced} (path: {})",
+        if forced {
+            "generic LDS"
+        } else {
+            "arch-selected"
+        }
+    );
     let scale = 1.0f64 / (HD as f64).sqrt();
     let bph = HD / 32;
     let total_bpp = NKV * bph;
@@ -77,15 +94,18 @@ fn main() {
     let pos_all: Vec<u8> = (0..MAXS as i32).flat_map(|p| p.to_ne_bytes()).collect();
     let pos_all_t = gpu.alloc_tensor(&[MAXS], DType::F32).unwrap();
     gpu.hip.memcpy_htod(&pos_all_t.buf, &pos_all).unwrap();
-    gpu.kv_cache_write_q8_0_batched(&d_kq, &d_kf, &pos_all_t, NKV, HD, MAXS).unwrap();
-    gpu.kv_cache_write_q8_0_batched(&d_vq, &d_vf, &pos_all_t, NKV, HD, MAXS).unwrap();
+    gpu.kv_cache_write_q8_0_batched(&d_kq, &d_kf, &pos_all_t, NKV, HD, MAXS)
+        .unwrap();
+    gpu.kv_cache_write_q8_0_batched(&d_vq, &d_vf, &pos_all_t, NKV, HD, MAXS)
+        .unwrap();
     // Only positions [0, max_pos] are ever read; download just those blocks.
     let max_pos = *positions.iter().max().unwrap() as usize + 1;
     let kqb = gpu.download_raw(&d_kq, max_pos * total_bpp * 34).unwrap();
     let vqb = gpu.download_raw(&d_vq, max_pos * total_bpp * 34).unwrap();
     let deqk = |b: &[u8], t: usize, kvh: usize, d: usize| -> f64 {
         let blk = (t * total_bpp + kvh * bph + d / 32) * 34;
-        f16_to_f32(u16::from_le_bytes([b[blk], b[blk + 1]])) as f64 * b[blk + 2 + d % 32] as i8 as f64
+        f16_to_f32(u16::from_le_bytes([b[blk], b[blk + 1]])) as f64
+            * b[blk + 2 + d % 32] as i8 as f64
     };
 
     let max_ctx = *positions.iter().max().unwrap() as usize + 1;
@@ -95,7 +115,8 @@ fn main() {
     let cpu_ref = |kget: &dyn Fn(usize, usize, usize) -> f64,
                    vget: &dyn Fn(usize, usize, usize) -> f64,
                    seqfn: &dyn Fn(usize) -> usize,
-                   bias: Option<&(Vec<f32>, usize, usize)>| -> Vec<f32> {
+                   bias: Option<&(Vec<f32>, usize, usize)>|
+     -> Vec<f32> {
         let mut r = vec![0f32; B * NH * HD];
         for bb in 0..B {
             let sl = seqfn(bb);
@@ -105,45 +126,70 @@ fn main() {
                 let mut mx = f64::MIN;
                 for t in 0..sl {
                     let mut dot = 0f64;
-                    for d in 0..HD { dot += q[(bb * NH + h) * HD + d] as f64 * kget(t, kvh, d); }
+                    for d in 0..HD {
+                        dot += q[(bb * NH + h) * HD + d] as f64 * kget(t, kvh, d);
+                    }
                     let mut s = dot * scale;
                     if let Some((bv, bstart, bcols)) = bias {
-                        if t >= *bstart { s += bv[bb * bcols + (t - bstart)] as f64; }
+                        if t >= *bstart {
+                            s += bv[bb * bcols + (t - bstart)] as f64;
+                        }
                     }
                     sc[t] = s;
                     mx = mx.max(s);
                 }
                 let mut den = 0f64;
-                for x in sc.iter_mut() { *x = (*x - mx).exp(); den += *x; }
+                for x in sc.iter_mut() {
+                    *x = (*x - mx).exp();
+                    den += *x;
+                }
                 for d in 0..HD {
                     let mut acc = 0f64;
-                    for t in 0..sl { acc += sc[t] * vget(t, kvh, d); }
+                    for t in 0..sl {
+                        acc += sc[t] * vget(t, kvh, d);
+                    }
                     r[(bb * NH + h) * HD + d] = (acc / den) as f32;
                 }
             }
         }
         r
     };
-    let cmp = |gpu: &Gpu, out: &hipfire_rdna::GpuTensor, refv: &[f32], name: &str, fails: &mut i32| {
-        let got = gpu.download_f32(out).unwrap();
-        let err = got.iter().zip(refv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        let ok = err < 5e-4;
-        if !ok { *fails += 1; }
-        println!("  {name:28} max_abs_err={err:.3e} {}", if ok { "OK" } else { "FAIL" });
-    };
+    let cmp =
+        |gpu: &Gpu, out: &hipfire_rdna::GpuTensor, refv: &[f32], name: &str, fails: &mut i32| {
+            let got = gpu.download_f32(out).unwrap();
+            let err = got
+                .iter()
+                .zip(refv)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let ok = err < 5e-4;
+            if !ok {
+                *fails += 1;
+            }
+            println!(
+                "  {name:28} max_abs_err={err:.3e} {}",
+                if ok { "OK" } else { "FAIL" }
+            );
+        };
 
     let kf = |t: usize, kvh: usize, d: usize| k_src[t][kvh * HD + d] as f64;
     let vf = |t: usize, kvh: usize, d: usize| v_src[t][kvh * HD + d] as f64;
     let seq_causal = |bb: usize| positions[bb] as usize + 1;
 
     // ── f32 batched, causal ──
-    gpu.attention_f32_batched(&d_q, &d_kf, &d_vf, &d_out, &d_pos, NH, NKV, HD, MAXS, max_ctx, B).unwrap();
+    gpu.attention_f32_batched(
+        &d_q, &d_kf, &d_vf, &d_out, &d_pos, NH, NKV, HD, MAXS, max_ctx, B,
+    )
+    .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let r = cpu_ref(&kf, &vf, &seq_causal, None);
     cmp(&gpu, &d_out, &r, "f32_batched causal", &mut fails);
 
     // ── q8_0 batched, causal ──
-    gpu.attention_q8_0_kv_batched(&d_q, &d_kq, &d_vq, &d_out, &d_pos, NH, NKV, HD, MAXS, max_ctx, B).unwrap();
+    gpu.attention_q8_0_kv_batched(
+        &d_q, &d_kq, &d_vq, &d_out, &d_pos, NH, NKV, HD, MAXS, max_ctx, B,
+    )
+    .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let kq = |t: usize, kvh: usize, d: usize| deqk(&kqb, t, kvh, d);
     let vq = |t: usize, kvh: usize, d: usize| deqk(&vqb, t, kvh, d);
@@ -157,13 +203,35 @@ fn main() {
     let bias_vals = lcg(0x5151, B * block_cols); // arbitrary finite per-key bias
     let d_bias = gpu.upload_f32(&bias_vals, &[B * block_cols]).unwrap();
     gpu.attention_q8_0_kv_batched_masked(
-        &d_q, &d_kq, &d_vq, &d_out, &d_pos, NH, NKV, HD, MAXS, block_start + block_cols, B,
-        Some(&d_bias), block_start, block_cols,
-    ).unwrap();
+        &d_q,
+        &d_kq,
+        &d_vq,
+        &d_out,
+        &d_pos,
+        NH,
+        NKV,
+        HD,
+        MAXS,
+        block_start + block_cols,
+        B,
+        Some(&d_bias),
+        block_start,
+        block_cols,
+    )
+    .unwrap();
     gpu.hip.device_synchronize().unwrap();
-    let r = cpu_ref(&kq, &vq, &seq_tree, Some(&(bias_vals.clone(), block_start, block_cols)));
+    let r = cpu_ref(
+        &kq,
+        &vq,
+        &seq_tree,
+        Some(&(bias_vals.clone(), block_start, block_cols)),
+    );
     cmp(&gpu, &d_out, &r, "q8_0_batched tree", &mut fails);
 
-    if fails == 0 { println!("OK — all batched cases within tol"); }
-    else { eprintln!("PARITY FAIL — {fails} case(s)"); std::process::exit(1); }
+    if fails == 0 {
+        println!("OK — all batched cases within tol");
+    } else {
+        eprintln!("PARITY FAIL — {fails} case(s)");
+        std::process::exit(1);
+    }
 }

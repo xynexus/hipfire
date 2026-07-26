@@ -12,6 +12,7 @@ deltanet = []
 hip-bridge = { path = "../hip-bridge" }
 hipfire-gpu-types = { path = "../hipfire-gpu-types" }
 hipfire-primitives = { path = "../hipfire-primitives" }
+libc.workspace = true
 
 [dev-dependencies]
 hipfire-kvquant = { path = "../hipfire-kvquant" }

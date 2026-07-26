@@ -38,7 +38,7 @@ use hipfire_generate::{
 };
 use hipfire_model::{
     build_local_llm_registry, is_qwen35_family_arch_id, ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR,
-    ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_MINIMAX_M2, ARCH_ID_QWEN2,
+    ARCH_ID_EMBEDDINGGEMMA, ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_MINIMAX_M2, ARCH_ID_QWEN2,
 };
 use hipfire_prompt as prompt_frame;
 use hipfire_state::{
@@ -69,6 +69,7 @@ use dummy::{
 use events::{emit_error_with_id, write_error, MAX_BASE64_ENCODED_LEN};
 use generate::*;
 use generate_vl::{decode_vl_frames, generate_vl, generate_vl_dots_ocr, generate_vl_gemma3};
+use hipfire_daemon_protocol::{DaemonRequest, EmbeddingInputType, EmbeddingVector, RerankResult};
 #[cfg(feature = "arch-lfm2moe")]
 use hipfire_serving_core::lfm2_prefill;
 use hipfire_serving_core::{
@@ -78,7 +79,7 @@ use hipfire_serving_core::{
 #[cfg(feature = "arch-lfm2moe")]
 use lfm2_prefill::*;
 use load::*;
-use model::{CaskConfig, LoadedModel, RAW_OVERRIDE};
+use model::{CaskConfig, EmbeddingGemmaState, LoadedModel, RAW_OVERRIDE};
 use output_filter::{normalize_daemon_prompt, normalize_request_stop_sequences};
 use qwen35_decode::*;
 use qwen35_prefill::*;
@@ -90,6 +91,246 @@ use hipfire_runtime::arch::SessionServingBackend;
 
 fn invalid_kld_ref(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
+}
+
+/// Emit a `load_progress` frame on the framed stdout channel. Called by the
+/// load-progress sink the `load` handler installs around `load_model`. Takes a
+/// fresh `std::io::stdout()` lock (rather than the handler's local `stdout`) so
+/// it can be a plain free fn invoked from the sink closure; loads run on this
+/// thread, so this never races the handler's own writes. `phase` is a controlled
+/// identifier (e.g. `"weights"`) — no JSON escaping needed.
+fn emit_load_progress(current: u32, total: u32, phase: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(
+        out,
+        r#"{{"type":"load_progress","current":{current},"total":{total},"phase":"{phase}"}}"#
+    );
+    let _ = out.flush();
+}
+
+fn embeddinggemma_parts<'a>(
+    m: &'a LoadedModel,
+    op: &str,
+) -> Result<
+    (
+        &'a EmbeddingGemmaState,
+        &'a hipfire_model::tokenizer::Tokenizer,
+    ),
+    String,
+> {
+    let state = m.embeddinggemma.as_ref().ok_or_else(|| {
+        format!(
+            "{op}: loaded model is arch_id={}, expected embeddinggemma arch_id=19",
+            m.arch_id
+        )
+    })?;
+    let tokenizer = m
+        .tokenizer
+        .as_ref()
+        .ok_or_else(|| format!("{op}: loaded embeddinggemma model has no tokenizer"))?;
+    Ok((state, tokenizer))
+}
+
+fn embeddinggemma_encode_prefixed(
+    gpu: &mut hipfire_rdna::Gpu,
+    state: &EmbeddingGemmaState,
+    tokenizer: &hipfire_model::tokenizer::Tokenizer,
+    texts: &[String],
+    prefix: &str,
+    dims: Option<usize>,
+) -> Result<Vec<Vec<f32>>, String> {
+    let tokenized = texts
+        .iter()
+        .map(|text| {
+            if prefix.is_empty() {
+                tokenizer.encode(text)
+            } else {
+                tokenizer.encode(&format!("{prefix}{text}"))
+            }
+        })
+        .collect::<Vec<_>>();
+    if let Some(metadata) = state.embedding_metadata.as_ref() {
+        for (index, tokens) in tokenized.iter().enumerate() {
+            metadata
+                .sequence
+                .bucket_for_len(tokens.len())
+                .map_err(|error| format!("embedding input {index}: {error}"))?;
+        }
+    } else {
+        for (index, tokens) in tokenized.iter().enumerate() {
+            if tokens.len() > 2048 {
+                return Err(format!(
+                    "embedding input {index} has {} tokens; maximum supported length is 2048",
+                    tokens.len()
+                ));
+            }
+        }
+    }
+    let dims = state.config.resolve_dims(dims);
+    hipfire_serving_core::pooling::embed_batch_embeddinggemma(gpu, state, &tokenized, dims)
+}
+
+fn qwen3_embedding_encode_prefixed(
+    state: &hipfire_serving_core::qwen3_embedding::Qwen3EmbeddingState,
+    tokenizer: &hipfire_model::tokenizer::Tokenizer,
+    texts: &[String],
+    prefix: &str,
+    dims: Option<usize>,
+) -> Result<Vec<Vec<f32>>, String> {
+    let tokenized = texts
+        .iter()
+        .map(|text| {
+            if prefix.is_empty() {
+                tokenizer.encode(text)
+            } else {
+                tokenizer.encode(&format!("{prefix}{text}"))
+            }
+        })
+        .collect::<Vec<_>>();
+    let dimensions = dims.unwrap_or(state.metadata.output.native_dimensions);
+    if dimensions != state.metadata.output.native_dimensions
+        && !state
+            .metadata
+            .output
+            .matryoshka_dimensions
+            .contains(&dimensions)
+    {
+        return Err(format!(
+            "unsupported embedding dimensions {dimensions}; native={} supported_matryoshka={:?}",
+            state.metadata.output.native_dimensions, state.metadata.output.matryoshka_dimensions
+        ));
+    }
+    let mut embeddings = state.encode_token_batches(&tokenized)?;
+    if dimensions != state.metadata.output.native_dimensions {
+        for embedding in &mut embeddings {
+            embedding.truncate(dimensions);
+            let norm = embedding
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+            if norm > 0.0 {
+                for value in embedding {
+                    *value /= norm;
+                }
+            }
+        }
+    }
+    Ok(embeddings)
+}
+
+fn embeddinggemma_embed(
+    gpu: &mut hipfire_rdna::Gpu,
+    m: &LoadedModel,
+    texts: &[String],
+    input_type: EmbeddingInputType,
+    dims: Option<usize>,
+) -> Result<Vec<EmbeddingVector>, String> {
+    if let Some(state) = m.qwen3_embedding.as_ref() {
+        let tokenizer = m
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| "embed: loaded Qwen3 embedding model has no tokenizer".to_string())?;
+        let prefix = state.metadata.prompt(input_type);
+        let embeddings = qwen3_embedding_encode_prefixed(state, tokenizer, texts, prefix, dims)?;
+        return Ok(embeddings
+            .into_iter()
+            .enumerate()
+            .map(|(index, embedding)| EmbeddingVector { index, embedding })
+            .collect());
+    }
+    let (state, tokenizer) = embeddinggemma_parts(m, "embed")?;
+    let prefix = state
+        .embedding_metadata
+        .as_ref()
+        .map(|metadata| metadata.prompt(input_type))
+        .unwrap_or_else(|| match input_type {
+            EmbeddingInputType::Query => &state.config.query_prompt,
+            EmbeddingInputType::Document => &state.config.document_prompt,
+        });
+    let embeddings = embeddinggemma_encode_prefixed(gpu, state, tokenizer, texts, prefix, dims)?;
+    Ok(embeddings
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| EmbeddingVector { index, embedding })
+        .collect())
+}
+
+fn embeddinggemma_rerank(
+    gpu: &mut hipfire_rdna::Gpu,
+    m: &LoadedModel,
+    query: &str,
+    documents: &[String],
+) -> Result<Vec<RerankResult>, String> {
+    if let Some(state) = m.qwen3_embedding.as_ref() {
+        let tokenizer = m
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| "rerank: loaded Qwen3 embedding model has no tokenizer".to_string())?;
+        let query_texts = vec![query.to_string()];
+        let query_embedding = qwen3_embedding_encode_prefixed(
+            state,
+            tokenizer,
+            &query_texts,
+            state
+                .metadata
+                .prompt(hipfire_model::embedding::EmbeddingInputType::Query),
+            None,
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "rerank: query produced no embedding".to_string())?;
+        let document_embeddings = qwen3_embedding_encode_prefixed(
+            state,
+            tokenizer,
+            documents,
+            state
+                .metadata
+                .prompt(hipfire_model::embedding::EmbeddingInputType::Document),
+            None,
+        )?;
+        return Ok(hipfire_serving_core::pooling::rank_by_cosine(
+            &query_embedding,
+            &document_embeddings,
+        )
+        .into_iter()
+        .map(|(index, relevance_score)| RerankResult {
+            index,
+            relevance_score,
+        })
+        .collect());
+    }
+    let (state, tokenizer) = embeddinggemma_parts(m, "rerank")?;
+    let query_texts = vec![query.to_string()];
+    let query_embedding = embeddinggemma_encode_prefixed(
+        gpu,
+        state,
+        tokenizer,
+        &query_texts,
+        &state.config.query_prompt,
+        None,
+    )?
+    .into_iter()
+    .next()
+    .ok_or_else(|| "rerank: query produced no embedding".to_string())?;
+    let doc_embeddings = embeddinggemma_encode_prefixed(
+        gpu,
+        state,
+        tokenizer,
+        documents,
+        &state.config.document_prompt,
+        None,
+    )?;
+    Ok(
+        hipfire_serving_core::pooling::rank_by_cosine(&query_embedding, &doc_embeddings)
+            .into_iter()
+            .map(|(index, relevance_score)| RerankResult {
+                index,
+                relevance_score,
+            })
+            .collect(),
+    )
 }
 
 fn json_u64(meta: &serde_json::Value, key: &str) -> std::io::Result<u64> {
@@ -123,6 +364,320 @@ fn json_opt_usize(meta: &serde_json::Value, key: &str) -> Option<usize> {
             .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
             .map(|n| n as usize)
     })
+}
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+fn qwen_residency_load_env(params: Option<&hipfire_model::ModelLoadParams>) -> Vec<ScopedEnvVar> {
+    let mut guards = Vec::new();
+    let Some(params) = params else {
+        return guards;
+    };
+    if let Some(mode) = params
+        .residency_mode
+        .as_deref()
+        .filter(|mode| !mode.is_empty())
+    {
+        guards.push(ScopedEnvVar::set("HIPFIRE_QWEN35_RESIDENCY_MODE", mode));
+    }
+    if let Some(bytes) = params.module_vram_budget_bytes.filter(|bytes| *bytes > 0) {
+        guards.push(ScopedEnvVar::set(
+            "HIPFIRE_QWEN35_EXPERT_CACHE_BYTES",
+            bytes.to_string(),
+        ));
+    }
+    guards
+}
+
+const SYSTEM_RESERVATION_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+const VRAM_RESERVATION_CHUNK_BYTES: usize = 512 * 1024 * 1024;
+
+#[derive(Clone, Debug, Default)]
+struct ResidentResourceUsage {
+    model_path: String,
+    system_memory_bytes: u64,
+    vram_bytes: u64,
+    residency_mode: String,
+}
+
+struct ResourceReservationManager {
+    system_memory_budget_bytes: u64,
+    system_memory_headroom_bytes: u64,
+    vram_budget_bytes: u64,
+    vram_headroom_bytes: u64,
+    system_chunks: Vec<Vec<u8>>,
+    vram_chunks: Vec<hip_bridge::DeviceBuffer>,
+    resident_usage: std::collections::HashMap<String, ResidentResourceUsage>,
+}
+
+impl ResourceReservationManager {
+    fn from_env() -> Self {
+        Self::from_env_reader(|key| std::env::var(key).ok())
+    }
+
+    fn from_env_reader(mut get: impl FnMut(&str) -> Option<String>) -> Self {
+        Self {
+            system_memory_budget_bytes: parse_env_u64(get(
+                "HIPFIRE_SCHEDULER_SYSTEM_MEMORY_BUDGET_BYTES",
+            )),
+            system_memory_headroom_bytes: parse_env_u64(get(
+                "HIPFIRE_SCHEDULER_SYSTEM_MEMORY_HEADROOM_BYTES",
+            )),
+            vram_budget_bytes: parse_env_u64(get("HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES")),
+            vram_headroom_bytes: parse_env_u64(get("HIPFIRE_SCHEDULER_VRAM_HEADROOM_BYTES")),
+            system_chunks: Vec::new(),
+            vram_chunks: Vec::new(),
+            resident_usage: std::collections::HashMap::new(),
+        }
+    }
+
+    fn system_target_bytes(&self) -> u64 {
+        reservation_target_bytes(
+            self.system_memory_budget_bytes,
+            self.system_memory_headroom_bytes,
+        )
+    }
+
+    fn vram_target_bytes(&self) -> u64 {
+        reservation_target_bytes(self.vram_budget_bytes, self.vram_headroom_bytes)
+    }
+
+    fn resident_system_memory_bytes(&self) -> u64 {
+        self.resident_usage
+            .values()
+            .map(|usage| usage.system_memory_bytes)
+            .sum()
+    }
+
+    fn resident_vram_bytes(&self) -> u64 {
+        self.resident_usage
+            .values()
+            .map(|usage| usage.vram_bytes)
+            .sum()
+    }
+
+    fn held_system_memory_placeholder_bytes(&self) -> u64 {
+        self.system_chunks
+            .iter()
+            .map(|chunk| chunk.len() as u64)
+            .sum()
+    }
+
+    fn held_vram_placeholder_bytes(&self) -> u64 {
+        self.vram_chunks
+            .iter()
+            .map(|chunk| chunk.size() as u64)
+            .sum()
+    }
+
+    fn planned_usage_for_load(
+        &self,
+        path: &str,
+        params: Option<&hipfire_model::ModelLoadParams>,
+    ) -> ResidentResourceUsage {
+        let residency_mode = params
+            .and_then(|params| params.residency_mode.as_deref())
+            .filter(|mode| !mode.is_empty())
+            .unwrap_or("full")
+            .to_string();
+        let file_bytes = std::fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let module_budget = params
+            .and_then(|params| params.module_vram_budget_bytes)
+            .filter(|bytes| *bytes > 0);
+        let vram_bytes = if residency_mode == "qwen_moe_modules" {
+            module_budget.unwrap_or(file_bytes)
+        } else {
+            file_bytes
+        };
+        ResidentResourceUsage {
+            model_path: path.to_string(),
+            system_memory_bytes: 0,
+            vram_bytes,
+            residency_mode,
+        }
+    }
+
+    fn set_worker_usage(&mut self, worker_id: impl Into<String>, usage: ResidentResourceUsage) {
+        self.resident_usage.insert(worker_id.into(), usage);
+    }
+
+    fn remove_worker(&mut self, worker_id: &str) {
+        self.resident_usage.remove(worker_id);
+    }
+
+    fn clear_workers(&mut self) {
+        self.resident_usage.clear();
+    }
+
+    fn release_placeholders(&mut self, gpu: &mut hipfire_rdna::Gpu) -> Result<(), String> {
+        self.system_chunks.clear();
+        let mut errors = Vec::new();
+        for chunk in self.vram_chunks.drain(..) {
+            if let Err(err) = gpu.hip.free(chunk) {
+                errors.push(err.to_string());
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "failed to release {} VRAM reservation chunk(s): {}",
+                errors.len(),
+                errors.join("; ")
+            ))
+        }
+    }
+
+    fn reacquire_placeholders(&mut self, gpu: &mut hipfire_rdna::Gpu) -> Result<(), String> {
+        self.release_placeholders(gpu)?;
+        let system_target = self
+            .system_target_bytes()
+            .saturating_sub(self.resident_system_memory_bytes());
+        let vram_target = self
+            .vram_target_bytes()
+            .saturating_sub(self.resident_vram_bytes());
+        self.allocate_system_placeholders(system_target)?;
+        self.allocate_vram_placeholders(gpu, vram_target)?;
+        Ok(())
+    }
+
+    fn allocate_system_placeholders(&mut self, mut bytes: u64) -> Result<(), String> {
+        while bytes > 0 {
+            let chunk_len = bytes.min(SYSTEM_RESERVATION_CHUNK_BYTES as u64);
+            let chunk_len = usize::try_from(chunk_len).map_err(|_| {
+                format!("system reservation chunk {chunk_len} exceeds addressable usize")
+            })?;
+            let mut chunk = vec![0u8; chunk_len];
+            touch_system_memory(&mut chunk);
+            self.system_chunks.push(chunk);
+            bytes = bytes.saturating_sub(chunk_len as u64);
+        }
+        Ok(())
+    }
+
+    fn allocate_vram_placeholders(
+        &mut self,
+        gpu: &mut hipfire_rdna::Gpu,
+        mut bytes: u64,
+    ) -> Result<(), String> {
+        while bytes > 0 {
+            let chunk_len = bytes.min(VRAM_RESERVATION_CHUNK_BYTES as u64);
+            let chunk_len = usize::try_from(chunk_len)
+                .map_err(|_| format!("VRAM reservation chunk {chunk_len} exceeds usize"))?;
+            let chunk = gpu
+                .hip
+                .malloc(chunk_len)
+                .map_err(|err| format!("hipMalloc reservation {chunk_len} bytes: {err}"))?;
+            if let Err(err) = gpu.hip.memset(&chunk, 0, chunk_len) {
+                let _ = gpu.hip.free(chunk);
+                return Err(format!(
+                    "hipMemset reservation {chunk_len} bytes failed: {err}"
+                ));
+            }
+            self.vram_chunks.push(chunk);
+            bytes = bytes.saturating_sub(chunk_len as u64);
+        }
+        Ok(())
+    }
+
+    fn status_json(&self) -> serde_json::Value {
+        let mut workers = self
+            .resident_usage
+            .iter()
+            .map(|(worker_id, usage)| {
+                serde_json::json!({
+                    "worker_key_id": worker_id,
+                    "model_path": usage.model_path,
+                    "residency_mode": usage.residency_mode,
+                    "system_memory_bytes": usage.system_memory_bytes,
+                    "vram_bytes": usage.vram_bytes,
+                })
+            })
+            .collect::<Vec<_>>();
+        workers.sort_by(|a, b| {
+            a.get("worker_key_id")
+                .and_then(|value| value.as_str())
+                .cmp(&b.get("worker_key_id").and_then(|value| value.as_str()))
+        });
+        serde_json::json!({
+            "type": "resource_status",
+            "system_memory_budget_bytes": self.system_memory_budget_bytes,
+            "system_memory_headroom_bytes": self.system_memory_headroom_bytes,
+            "system_memory_target_bytes": self.system_target_bytes(),
+            "held_system_memory_placeholder_bytes": self.held_system_memory_placeholder_bytes(),
+            "resident_system_memory_bytes": self.resident_system_memory_bytes(),
+            "vram_budget_bytes": self.vram_budget_bytes,
+            "vram_headroom_bytes": self.vram_headroom_bytes,
+            "vram_target_bytes": self.vram_target_bytes(),
+            "held_vram_placeholder_bytes": self.held_vram_placeholder_bytes(),
+            "resident_vram_bytes": self.resident_vram_bytes(),
+            "resident_workers": workers.len(),
+            "workers": workers,
+        })
+    }
+}
+
+fn parse_env_u64(value: Option<String>) -> u64 {
+    value
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn reservation_target_bytes(budget_bytes: u64, headroom_bytes: u64) -> u64 {
+    budget_bytes.saturating_sub(headroom_bytes)
+}
+
+fn touch_system_memory(bytes: &mut [u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        bytes[offset] = bytes[offset].wrapping_add(1);
+        offset = offset.saturating_add(4096);
+    }
+    let last = bytes.len() - 1;
+    bytes[last] = bytes[last].wrapping_add(1);
+}
+
+fn reset_has_no_resident_model(
+    dummy_model: &Option<DummyModelState>,
+    model: &Option<LoadedModel>,
+    resident_models: &std::collections::HashMap<String, LoadedModel>,
+) -> bool {
+    dummy_model.is_none() && model.is_none() && resident_models.is_empty()
+}
+
+fn reset_target_worker_id(msg: &serde_json::Value, active_worker_id: &str) -> String {
+    if hipfire_model::has_worker_or_model_identity(msg) {
+        message_worker_id(msg)
+    } else {
+        active_worker_id.to_string()
+    }
 }
 
 fn le_u32_vec(bytes: &[u8], name: &str, expected: usize) -> std::io::Result<Vec<u32>> {
@@ -328,6 +883,92 @@ fn acquire_daemon_lock() -> hipfire_lock::FlockGuard {
     // open fd, so rewriting the contents doesn't drop the lock.
     let _ = guard.write_holder(&std::process::id().to_string());
     guard
+}
+
+#[cfg(test)]
+mod resource_reservation_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn resource_reservation_env_applies_budget_headroom_targets() {
+        let values = HashMap::from([
+            (
+                "HIPFIRE_SCHEDULER_SYSTEM_MEMORY_BUDGET_BYTES",
+                "4096".to_string(),
+            ),
+            (
+                "HIPFIRE_SCHEDULER_SYSTEM_MEMORY_HEADROOM_BYTES",
+                "512".to_string(),
+            ),
+            ("HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES", "8192".to_string()),
+            ("HIPFIRE_SCHEDULER_VRAM_HEADROOM_BYTES", "1024".to_string()),
+        ]);
+        let manager = ResourceReservationManager::from_env_reader(|key| values.get(key).cloned());
+
+        assert_eq!(manager.system_target_bytes(), 3584);
+        assert_eq!(manager.vram_target_bytes(), 7168);
+        assert_eq!(
+            manager.status_json()["held_system_memory_placeholder_bytes"],
+            0
+        );
+    }
+
+    #[test]
+    fn resource_reservation_usage_prefers_module_budget_for_qwen_moe_modules() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-resource-reservation-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model_path = dir.join("Qwen3.5-122B-A10B--mq4.hfq");
+        std::fs::write(&model_path, vec![0u8; 1234]).unwrap();
+
+        let manager = ResourceReservationManager::from_env_reader(|_| None);
+        let params = hipfire_model::ModelLoadParams {
+            residency_mode: Some("qwen_moe_modules".to_string()),
+            module_vram_budget_bytes: Some(256),
+            ..Default::default()
+        };
+        let usage = manager.planned_usage_for_load(model_path.to_str().unwrap(), Some(&params));
+
+        assert_eq!(usage.residency_mode, "qwen_moe_modules");
+        assert_eq!(usage.vram_bytes, 256);
+
+        let _ = std::fs::remove_file(&model_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn reset_without_resident_model_is_idempotent() {
+        let dummy_model = None;
+        let model = None;
+        let resident_models = HashMap::new();
+
+        assert!(reset_has_no_resident_model(
+            &dummy_model,
+            &model,
+            &resident_models
+        ));
+    }
+
+    #[test]
+    fn bare_reset_targets_active_worker() {
+        let msg = serde_json::json!({"type": "reset"});
+        assert_eq!(
+            reset_target_worker_id(&msg, "server-model:active"),
+            "server-model:active"
+        );
+    }
+
+    #[test]
+    fn explicit_reset_worker_overrides_active_worker() {
+        let msg = serde_json::json!({"type": "reset", "worker_key_id": "worker-a"});
+        assert_eq!(
+            reset_target_worker_id(&msg, "server-model:active"),
+            "worker-a"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2497,6 +3138,43 @@ fn report_gpu_init_failure(err: &hip_bridge::HipError) {
     eprintln!("  Run `hipfire diag` for a full environment report.");
 }
 
+/// Resident state of a micro-step-preemptible `train_lora` run. The daemon runs
+/// one `quantum` of steps per `TrainLora` request and keeps this alive between
+/// requests (keyed by `run_id`); the runner re-enqueues the training lease each
+/// quantum so lower-priority training time-slices with interactive serving.
+struct LoraTrainSession {
+    run_id: String,
+    model: hipfire_train::model::LlamaModel,
+    opt: hipfire_train::optim::AdamW,
+    batch: Vec<(Vec<u32>, Vec<f32>)>,
+    pos: Vec<f32>,
+    target_tokens: f32,
+    step: usize,
+    total: usize,
+    initial_ce: f32,
+    last_ce: f32,
+    output: String,
+    vocab: usize,
+}
+
+/// Resident state of a micro-step-preemptible `train_drafter` run. The daemon
+/// runs one `quantum` of EPOCHS per `TrainDrafter` request and keeps this alive
+/// between requests (keyed by `run_id`); the runner re-enqueues the training
+/// lease each quantum so drafter training time-slices with interactive serving.
+/// `embed` is moved into `drafter`, so we hold the label tensors still needed
+/// across quanta (chunks + mid labels; base_shallow was consumed by init for the
+/// `bar` baseline) rather than the whole LabelSet.
+struct DrafterTrainSession {
+    run_id: String,
+    drafter: hipfire_train::ssm_drafter::SsmDrafter,
+    chunks: Vec<Vec<u32>>,
+    label_mid: Vec<Vec<f32>>,
+    cfg: hipfire_train::train_loop::TrainCfg,
+    st: hipfire_train::train_loop::DrafterLoopState,
+    output: String,
+    quantum: usize,
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -2620,6 +3298,20 @@ fn main() {
     // None means the drafter shares the target gpu (single-card, unchanged).
     let mut pflash_drafter_gpu: Option<hipfire_rdna::Gpu> = None;
     let mut dummy_model: Option<DummyModelState> = None;
+    // Resident micro-step-preemptible LoRA training session (see LoraTrainSession).
+    // Some between quanta of a run; runner drives one quantum per TrainLora request.
+    let mut lora_train_session: Option<LoraTrainSession> = None;
+    // Resident micro-step-preemptible SSM-drafter training session (see
+    // DrafterTrainSession). Some between quanta of a run; runner drives one
+    // quantum of EPOCHS per TrainDrafter request.
+    let mut drafter_train_session: Option<DrafterTrainSession> = None;
+    let mut resource_reservations = ResourceReservationManager::from_env();
+    if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+        hipfire_daemon_adapter::fatal_startup_error(
+            &format!("failed to claim configured resource reservations: {err}"),
+            None,
+        );
+    }
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -2636,12 +3328,11 @@ fn main() {
         let msg: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"error","message":"invalid JSON: {}"}}"#,
-                    e
-                );
-                let _ = stdout.flush();
+                // Build the envelope through serde_json: the parse-error text is
+                // not JSON-safe (serde messages can carry quotes/newlines and
+                // echo offending input), so raw interpolation would emit a
+                // malformed line and corrupt the JSONL stream.
+                emit_error_with_id(&mut stdout, "", format!("invalid JSON: {e}"));
                 continue;
             }
         };
@@ -2653,8 +3344,25 @@ fn main() {
             None
         };
 
-        match msg_type {
-            "model_registry" => {
+        let request: DaemonRequest = match serde_json::from_value(msg.clone()) {
+            Ok(request) => request,
+            Err(e) => {
+                // Unknown "type" tag, or a known tag whose payload the typed
+                // contract rejects. Build the envelope through serde_json
+                // (emit_error_with_id) so the error text can't corrupt the
+                // JSONL stream.
+                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                emit_error_with_id(
+                    &mut stdout,
+                    id,
+                    format!("unsupported or malformed request '{msg_type}': {e}"),
+                );
+                continue;
+            }
+        };
+
+        match request {
+            DaemonRequest::ModelRegistry => {
                 let _ = serde_json::to_writer(
                     &mut stdout,
                     &serde_json::json!({
@@ -2665,7 +3373,7 @@ fn main() {
                 let _ = writeln!(stdout);
                 let _ = stdout.flush();
             }
-            "load" => {
+            DaemonRequest::Load(_) => {
                 // A steer session is process-global and outlives the model it was
                 // captured/applied against; drop it before swapping models so a
                 // stale apply can't perturb the freshly-loaded one.
@@ -2693,6 +3401,7 @@ fn main() {
                     if let Some(m) = model.take() {
                         unload_model(m, &mut gpu);
                     }
+                    resource_reservations.remove_worker(&requested_worker_id);
                 } else {
                     if let Err(e) = park_active_model(
                         &mut model,
@@ -2709,6 +3418,7 @@ fn main() {
                 if let Some(m) = resident_models.remove(&requested_worker_id) {
                     generic_state_arena.release_worker(&requested_worker_id);
                     unload_model(m, &mut gpu);
+                    resource_reservations.remove_worker(&requested_worker_id);
                 }
                 dummy_model = None;
 
@@ -2724,6 +3434,15 @@ fn main() {
                     .unwrap_or(false);
                 if dummy_requested {
                     dummy_model = Some(DummyModelState::default());
+                    if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+                        write_error(
+                            &mut stdout,
+                            "",
+                            &format!("dummy load resource reservation failed: {err}"),
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
                     tracing::info!(
                         model = "hipfire:dummy",
                         arch = "qwen35_dummy",
@@ -3069,41 +3788,99 @@ fn main() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
-                match load_model(
+                // Stream per-layer load progress to the client on the framed
+                // stdout channel (see `emit_load_progress`). Loaders call
+                // `load_progress::report`, which this sink turns into a
+                // `load_progress` frame. Installed only for the duration of this
+                // load and cleared right after the match, so no stray frames
+                // leak into later ops. `load_model` runs synchronously on this
+                // thread, so the sink writes interleave safely with our own
+                // stdout writes (each is a whole locked line).
+                hipfire_runtime::load_progress::set_sink(Some(Box::new(
+                    |current, total, phase| emit_load_progress(current, total, phase),
+                )));
+                let _qwen_residency_env =
+                    qwen_residency_load_env(protocol_load.as_ref().map(|req| &req.params));
+                let planned_resource_usage = resource_reservations
+                    .planned_usage_for_load(path, protocol_load.as_ref().map(|req| &req.params));
+                if let Err(err) = resource_reservations.release_placeholders(&mut gpu) {
+                    hipfire_runtime::load_progress::set_sink(None);
+                    write_error(
+                        &mut stdout,
+                        "",
+                        &format!("resource reservation release failed before load: {err}"),
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                let load_result = load_model(
                     path,
                     max_seq,
                     requested_physical_cap,
                     draft_path.as_deref(),
+                    Some(&dflash_mode),
                     kv_mode_override.as_deref(),
                     state_quant_override.as_deref(),
                     &cask,
                     pp,
                     &mut gpu,
-                ) {
+                );
+                hipfire_runtime::load_progress::set_sink(None);
+                match load_result {
                     Ok(mut m) => {
-                        let arch = match m.arch_id {
-                            5 => "qwen3_5",
-                            6 => "qwen3_5_moe",
-                            7 => "qwen2",
-                            8 => "dots-ocr",
-                            9 => "deepseek4",
-                            10 => "minimax_m2",
-                            11 => "lfm2moe",
-                            12 => "gemma3",
-                            13 => "gemma3_vl",
-                            14 => "nemotron_h",
-                            15 => "mamba2",
-                            16 => "zaya",
-                            _ => "qwen3",
-                        };
+                        resource_reservations
+                            .set_worker_usage(requested_worker_id.clone(), planned_resource_usage);
+                        if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+                            resource_reservations.remove_worker(&requested_worker_id);
+                            unload_model(m, &mut gpu);
+                            let _ = resource_reservations.reacquire_placeholders(&mut gpu);
+                            write_error(
+                                &mut stdout,
+                                "",
+                                &format!("resource reservation reacquire failed after load: {err}"),
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                        let arch = m.registered_backend.as_ref().map_or_else(
+                            || match m.arch_id {
+                                5 => "qwen3_5",
+                                6 => "qwen3_5_moe",
+                                7 => "qwen2",
+                                8 => "dots-ocr",
+                                9 => "deepseek4",
+                                10 => "minimax_m2",
+                                11 => "lfm2moe",
+                                12 => "gemma3",
+                                13 => "gemma3_vl",
+                                14 => "nemotron_h",
+                                15 => "mamba2",
+                                16 => "zaya",
+                                ARCH_ID_EMBEDDINGGEMMA => "embeddinggemma",
+                                _ => "qwen3",
+                            },
+                            |loaded| loaded.family,
+                        );
                         let vl = m.vision_config.is_some()
                             || m.dots_ocr_config.is_some()
                             || m.gemma3_vl.is_some();
-                        let (dim, layers, vocab) = if let Some(ref b) = m.gemma3_vl {
+                        let (dim, layers, vocab) = if let Some(ref loaded) = m.registered_backend {
+                            (
+                                loaded.shape.hidden_size,
+                                loaded.shape.num_layers,
+                                loaded.shape.vocab_size,
+                            )
+                        } else if let Some(ref b) = m.gemma3_vl {
                             (
                                 b.text_cfg.hidden_size,
                                 b.text_cfg.num_hidden_layers,
                                 b.text_cfg.vocab_size,
+                            )
+                        } else if let Some(ref e) = m.embeddinggemma {
+                            (
+                                e.config.max_output_dim(),
+                                e.config.num_hidden_layers,
+                                e.config.vocab_size,
                             )
                         } else if let Some(ref b) = m.gemma3_text {
                             (
@@ -3366,6 +4143,11 @@ fn main() {
                         model = Some(m);
                     }
                     Err(e) => {
+                        if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+                            eprintln!(
+                                "[hipfire-daemon] failed to restore resource reservations after load failure: {err}"
+                            );
+                        }
                         let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                         let free_mb = vram_free / (1024 * 1024);
                         let total_mb = vram_total / (1024 * 1024);
@@ -3378,7 +4160,113 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "generate" => {
+            DaemonRequest::Embed(req) => {
+                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let target_worker_id = message_worker_id(&msg);
+                if dummy_model.is_some() {
+                    emit_error_with_id(
+                        &mut stdout,
+                        id,
+                        "embed is not supported for the dummy model",
+                    );
+                    continue;
+                }
+                match activate_model_worker(
+                    &target_worker_id,
+                    &mut active_worker_id,
+                    &mut model,
+                    &mut gpu,
+                    &mut resident_models,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        emit_error_with_id(
+                            &mut stdout,
+                            id,
+                            format!("unknown model worker {target_worker_id}"),
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, id, format!("worker switch failed: {e}"));
+                        continue;
+                    }
+                }
+                let Some(m) = model.as_ref() else {
+                    emit_error_with_id(&mut stdout, id, "no model loaded");
+                    continue;
+                };
+                match embeddinggemma_embed(&mut gpu, m, &req.texts, req.input_type, req.dims) {
+                    Ok(embeddings) => {
+                        let _ = serde_json::to_writer(
+                            &mut stdout,
+                            &serde_json::json!({
+                                "type": "embeddings",
+                                "id": id,
+                                "embeddings": embeddings,
+                            }),
+                        );
+                        let _ = writeln!(stdout);
+                        let _ = stdout.flush();
+                    }
+                    Err(e) => emit_error_with_id(&mut stdout, id, e),
+                }
+            }
+
+            DaemonRequest::Rerank(req) => {
+                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let target_worker_id = message_worker_id(&msg);
+                if dummy_model.is_some() {
+                    emit_error_with_id(
+                        &mut stdout,
+                        id,
+                        "rerank is not supported for the dummy model",
+                    );
+                    continue;
+                }
+                match activate_model_worker(
+                    &target_worker_id,
+                    &mut active_worker_id,
+                    &mut model,
+                    &mut gpu,
+                    &mut resident_models,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        emit_error_with_id(
+                            &mut stdout,
+                            id,
+                            format!("unknown model worker {target_worker_id}"),
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, id, format!("worker switch failed: {e}"));
+                        continue;
+                    }
+                }
+                let Some(m) = model.as_ref() else {
+                    emit_error_with_id(&mut stdout, id, "no model loaded");
+                    continue;
+                };
+                match embeddinggemma_rerank(&mut gpu, m, &req.query, &req.documents) {
+                    Ok(results) => {
+                        let _ = serde_json::to_writer(
+                            &mut stdout,
+                            &serde_json::json!({
+                                "type": "rerank_scores",
+                                "id": id,
+                                "results": results,
+                            }),
+                        );
+                        let _ = writeln!(stdout);
+                        let _ = stdout.flush();
+                    }
+                    Err(e) => emit_error_with_id(&mut stdout, id, e),
+                }
+            }
+
+            DaemonRequest::Generate(_) => {
                 // Explicit per-request raw-prompt override (optional `"raw"`
                 // bool). Absent → None → auto default (raw iff no chat_template).
                 // Always set, so it resets every request (no cross-request leak).
@@ -3616,7 +4504,7 @@ fn main() {
                 // model. Pick arch-shaped defaults so a vanilla
                 // `/v1/chat/completions` POST (no sampling fields) works on
                 // both. Explicit per-request values still override either.
-                let (default_temp, default_top_p) = if m.arch_id == ARCH_ID_LFM2_MOE {
+                let (mut default_temp, mut default_top_p) = if m.arch_id == ARCH_ID_LFM2_MOE {
                     // LFM2.5-MoE (11): Liquid's model card recommends specific
                     // sampling — temperature=0.2, top_p=0.80 (+ repetition_penalty
                     // 1.05, set below). Use those exact values, not the generic
@@ -3633,11 +4521,24 @@ fn main() {
                 } else {
                     (0.3_f64, 0.8_f64)
                 };
-                let temp = protocol_generate
+                let mut default_top_k = 20_usize;
+                if let Some(sampler) = m
+                    .registered_backend
                     .as_ref()
-                    .map(|req| req.sampling.temperature)
-                    .or_else(|| msg.get("temperature").and_then(|v| v.as_f64()))
-                    .unwrap_or(default_temp) as f32;
+                    .map(|loaded| &loaded.profile.sampler)
+                {
+                    default_temp = sampler.temperature.map(f64::from).unwrap_or(default_temp);
+                    default_top_p = sampler.top_p.map(f64::from).unwrap_or(default_top_p);
+                    default_top_k = sampler.top_k.unwrap_or(default_top_k);
+                }
+                let temp_override = match protocol_generate.as_ref() {
+                    Some(req) if !req.sampling.temperature_is_default => {
+                        Some(req.sampling.temperature)
+                    }
+                    Some(_) => None,
+                    None => msg.get("temperature").and_then(|v| v.as_f64()),
+                };
+                let temp = temp_override.unwrap_or(default_temp) as f32;
                 let max_tokens = protocol_generate
                     .as_ref()
                     .map(|req| req.sampling.max_tokens as usize)
@@ -3647,11 +4548,21 @@ fn main() {
                             .map(|v| v as usize)
                     })
                     .unwrap_or(512);
-                let top_p = protocol_generate
+                let top_p_override = match protocol_generate.as_ref() {
+                    Some(req) if !req.sampling.top_p_is_default => req.sampling.top_p,
+                    Some(_) => None,
+                    None => msg.get("top_p").and_then(|v| v.as_f64()),
+                };
+                let top_p = top_p_override.unwrap_or(default_top_p) as f32;
+                let top_k = protocol_generate
                     .as_ref()
-                    .and_then(|req| req.sampling.top_p)
-                    .or_else(|| msg.get("top_p").and_then(|v| v.as_f64()))
-                    .unwrap_or(default_top_p) as f32;
+                    .and_then(|req| req.sampling.top_k)
+                    .or_else(|| {
+                        msg.get("top_k")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                    })
+                    .unwrap_or(default_top_k);
                 // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
                 // and HF transformers `generate(repetition_penalty=1.0)`
                 // defaults. The prior 1.3 default suppressed legitimately
@@ -4008,6 +4919,7 @@ fn main() {
                         system,
                         temp,
                         top_p,
+                        top_k,
                         max_tokens,
                         repeat_penalty,
                         repeat_window,
@@ -4033,7 +4945,7 @@ fn main() {
                 }
             }
 
-            "generate_batch_prefill" => match validate_generate_batch_prefill(&msg) {
+            DaemonRequest::GenerateBatchPrefill => match validate_generate_batch_prefill(&msg) {
                 Ok(envelope) => {
                     let target_worker_id = message_worker_id(&msg);
                     if dummy_model.is_none() {
@@ -4157,7 +5069,7 @@ fn main() {
                 }
             },
 
-            "prefix_hash_preflight" => match validate_prefix_hash_preflight(&msg) {
+            DaemonRequest::PrefixHashPreflight => match validate_prefix_hash_preflight(&msg) {
                 Ok(envelope) => {
                     let target_worker_id = message_worker_id(&msg);
                     match activate_model_worker(
@@ -4224,7 +5136,7 @@ fn main() {
                 }
             },
 
-            "generate_batch_decode_step" => match validate_generate_batch_decode(&msg) {
+            DaemonRequest::GenerateBatchDecodeStep => match validate_generate_batch_decode(&msg) {
                 Ok(envelope) => {
                     let target_worker_id = message_worker_id(&msg);
                     match activate_model_worker(
@@ -4271,7 +5183,7 @@ fn main() {
                 }
             },
 
-            "release_sessions" => {
+            DaemonRequest::ReleaseSessions => {
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("release");
                 let target_worker_id = message_worker_id(&msg);
                 if dummy_model.is_none() {
@@ -4351,7 +5263,7 @@ fn main() {
                 }
             }
 
-            "reserve_session_state" => {
+            DaemonRequest::ReserveSessionState => {
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("reserve");
                 let target_worker_id = message_worker_id(&msg);
                 generic_state_arena.purge_expired();
@@ -4454,7 +5366,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "describe_state" => {
+            DaemonRequest::DescribeState => {
                 let id = msg
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -4498,7 +5410,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "release_session_state_reservation" | "release_state" => {
+            DaemonRequest::ReleaseState => {
                 let id = msg
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -4537,7 +5449,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "worker_status" | "list_workers" => {
+            DaemonRequest::WorkerStatus => {
                 let status = resident_worker_status_json(
                     &active_worker_id,
                     model.as_ref(),
@@ -4547,7 +5459,13 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "inventory" => {
+            DaemonRequest::ResourceStatus => {
+                let status = resource_reservations.status_json();
+                let _ = writeln!(stdout, "{status}");
+                let _ = stdout.flush();
+            }
+
+            DaemonRequest::Inventory => {
                 let inventory = daemon_accelerator_inventory(&mut gpu);
                 let mut payload = serde_json::to_value(inventory)
                     .unwrap_or_else(|_| serde_json::json!({"source": "daemon", "devices": []}));
@@ -4556,8 +5474,14 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "reset" => {
-                let target_worker_id = message_worker_id(&msg);
+            DaemonRequest::Reset => {
+                let target_worker_id = reset_target_worker_id(&msg, &active_worker_id);
+                if reset_has_no_resident_model(&dummy_model, &model, &resident_models) {
+                    generic_state_arena.release_worker(&target_worker_id);
+                    let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if dummy_model.is_none() {
                     match activate_model_worker(
                         &target_worker_id,
@@ -4734,6 +5658,9 @@ fn main() {
                     if let Some(ref mut b) = m.gemma3_vl {
                         b.state.reset();
                     }
+                    if let Some(ref mut loaded) = m.registered_backend {
+                        let _ = loaded.backend.reset_session(&mut gpu, "default");
+                    }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
@@ -4741,7 +5668,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "unload" => {
+            DaemonRequest::Unload => {
                 // PFlash drafter goes FIRST: its weights/scratch/KV
                 // tensors are released via Gpu::free_tensor, which only
                 // queues into the GPU pool. The actual hipFree happens
@@ -4766,6 +5693,12 @@ fn main() {
                 for (_, m) in resident_models.drain() {
                     unload_model(m, &mut gpu);
                 }
+                resource_reservations.clear_workers();
+                if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+                    eprintln!(
+                        "[hipfire-daemon] failed to restore resource reservations after unload: {err}"
+                    );
+                }
                 generic_state_arena.clear();
                 dummy_model = None;
                 active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
@@ -4776,7 +5709,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "unload_worker" => {
+            DaemonRequest::UnloadWorker => {
                 let id = msg
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -4804,6 +5737,14 @@ fn main() {
                     unload_model(m, &mut gpu);
                     unloaded = true;
                 }
+                if unloaded {
+                    resource_reservations.remove_worker(&worker_id);
+                    if let Err(err) = resource_reservations.reacquire_placeholders(&mut gpu) {
+                        eprintln!(
+                            "[hipfire-daemon] failed to restore resource reservations after worker unload: {err}"
+                        );
+                    }
+                }
                 let done = unload_worker_done_json(
                     id,
                     &worker_id,
@@ -4814,7 +5755,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "ping" => {
+            DaemonRequest::Ping => {
                 let _ = writeln!(stdout, r#"{{"type":"pong"}}"#);
                 let _ = stdout.flush();
             }
@@ -4824,7 +5765,7 @@ fn main() {
             // daemon-internal — only the request + the resulting path/summary cross
             // JSONL. Single-GPU qwen3.5-family bf16 only (capture fires at the
             // bf16 chokepoints); additive and gated, never on the decode hot path.
-            "collect" => {
+            DaemonRequest::Collect(_) => {
                 // Parse fields directly from the JSON message (the daemon is the
                 // server side; the typed CollectRequest contract lives in
                 // hipfire-daemon-protocol for clients). Field names must match.
@@ -4978,7 +5919,7 @@ fn main() {
             // it through one forward path → ≈0 on a healthy run; the guard that
             // catches the historical two-binary drift. build_ref/score (with the
             // .kldref container) land next.
-            "kld_eval" => {
+            DaemonRequest::KldEval(_) => {
                 let mode = msg.get("mode").and_then(|v| v.as_str()).unwrap_or("");
                 let corpus = msg.get("corpus").and_then(|v| v.as_str()).map(String::from);
                 let ref_path = msg
@@ -5117,8 +6058,10 @@ fn main() {
                     if let Some(b) = m.gemma3_vl.as_mut() {
                         break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
                     }
-                    if let Some(b) = m.qwen2_backend.as_mut() {
-                        break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
+                    if let Some(loaded) = m.registered_backend.as_mut() {
+                        if let Some(forward) = loaded.backend.kld_forward() {
+                            break 'pick Some(Box::new(forward));
+                        }
                     }
                     if let Some(b) = m.nemotron_backend.as_mut() {
                         break 'pick Some(Box::new(b as &mut dyn ChunkScoredForward));
@@ -5406,7 +6349,7 @@ fn main() {
             // capture→derive→apply→score through the daemon's correct inference +
             // templating instead of a reimplemented harness. See
             // docs/plans/2026-06-30-steer-daemon-pivot.md.
-            "steer_begin_capture" => {
+            DaemonRequest::SteerBeginCapture(_) => {
                 let num_layers = msg
                     .get("num_layers")
                     .and_then(|v| v.as_u64())
@@ -5432,7 +6375,7 @@ fn main() {
             // its last-prompt-token residuals into the capture means. Prefill-only:
             // a decoded token's forward would overwrite the residual the hook just
             // recorded (the `collect` arm is prefill-only for the same reason).
-            "steer_capture" => {
+            DaemonRequest::SteerCapture(_) => {
                 let system = msg
                     .get("system")
                     .and_then(|v| v.as_str())
@@ -5471,10 +6414,23 @@ fn main() {
                     continue;
                 };
                 // Frame the turn byte-identically to the `generate` path so capture
-                // sees the exact residuals serving would (BOS + gemma3 turn frame).
+                // sees the exact residuals serving would. gemma3 uses its literal
+                // turn frame; qwen35 (loose-slot) uses its jinja `chat_template`
+                // single-turn render.
                 let system_opt = (!system.is_empty()).then_some(system.as_str());
-                let framed =
-                    hipfire_serving_core::generate_arch::framed_gemma3_prompt(&user, system_opt);
+                let framed = if is_qwen35_family_arch_id(m.arch_id) {
+                    match hipfire_serving_core::generate_arch::framed_qwen35_prompt(
+                        m, &user, system_opt,
+                    ) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            emit_error_with_id(&mut stdout, "", format!("steer_capture: {e}"));
+                            continue;
+                        }
+                    }
+                } else {
+                    hipfire_serving_core::generate_arch::framed_gemma3_prompt(&user, system_opt)
+                };
                 let tokens = tokenizer.encode(&framed);
                 if tokens.is_empty() {
                     emit_error_with_id(
@@ -5484,12 +6440,15 @@ fn main() {
                     );
                     continue;
                 }
-                // Prefill-only through whichever gemma3 backend is resident; both
-                // fire the block-boundary hook (batched last-position for arch 12,
-                // per-token last-wins for arch 13), so the hook observes the
-                // last-prompt-token residual per block. No decode loop.
+                // Prefill-only through whichever resident arch fires the
+                // block-boundary hook so it observes the last-prompt-token residual
+                // per block. No decode loop. gemma3 (12/13) folds via its backend
+                // prefill; qwen35 (loose-slot) folds via a fresh single-sequence
+                // capture prefill. Both hit `maybe_steer_block[_batched]`.
                 use hipfire_runtime::arch::SimpleAr;
-                let result: Result<(), String> = if let Some(b) = m.gemma3_text.as_mut() {
+                let result: Result<(), String> = if is_qwen35_family_arch_id(m.arch_id) {
+                    run_steer_capture_prefill_qwen35(m, &mut gpu, &tokens)
+                } else if let Some(b) = m.gemma3_text.as_mut() {
                     b.state.reset();
                     SimpleAr::prefill(b, &mut gpu, &tokens)
                 } else if let Some(b) = m.gemma3_vl.as_mut() {
@@ -5497,7 +6456,7 @@ fn main() {
                     SimpleAr::prefill(b, &mut gpu, &tokens)
                 } else {
                     Err(format!(
-                        "steer_capture: arch_id {} is not gemma3 (12|13)",
+                        "steer_capture: arch_id {} is unsupported (need gemma3 or qwen35)",
                         m.arch_id
                     ))
                 };
@@ -5514,7 +6473,7 @@ fn main() {
             // End the capture session and return the per-block means as a
             // num_layers × hidden f32 matrix (the client derives directions from
             // the +/- means it collected).
-            "steer_finish_capture" => match hipfire_steer::finish_capture() {
+            DaemonRequest::SteerFinishCapture => match hipfire_steer::finish_capture() {
                 Some(means) => {
                     let resp = serde_json::json!({
                         "type": "steer_captured",
@@ -5532,7 +6491,7 @@ fn main() {
 
             // Begin an apply session: steer (additive) or ablate (projective) each
             // block in [layer_start, layer_end) along the per-block `directions`.
-            "steer_begin_apply" => {
+            DaemonRequest::SteerBeginApply(_) => {
                 let directions: Option<Vec<Vec<f32>>> = msg
                     .get("directions")
                     .and_then(|v| v.as_array())
@@ -5588,7 +6547,7 @@ fn main() {
             }
 
             // Tear down any active steer session (back to the base model).
-            "steer_clear" => {
+            DaemonRequest::SteerClear => {
                 hipfire_steer::clear();
                 let _ = writeln!(stdout, r#"{{"type":"steer_ok"}}"#);
                 let _ = stdout.flush();
@@ -5600,7 +6559,7 @@ fn main() {
             // is scaled by `gain` in the FFN forward (prefill + decode); every
             // other neuron by 1.0. `gain == 1.0` or an empty set clears the
             // session — the identity control point of the dose-response sweep.
-            "hneuron_intervene" => {
+            DaemonRequest::HneuronIntervene(_) => {
                 let gain = msg.get("gain").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
                 let indices: Vec<usize> = msg
                     .get("indices")
@@ -5673,7 +6632,7 @@ fn main() {
             // source fp16 weights:
             //   [u32 n_layers][u32 intermediate][f32 × n_layers*intermediate].
             // Cached in `cett_colnorms` and reused for every `cett_capture`.
-            "cett_load_colnorms" => {
+            DaemonRequest::CettLoadColnorms(_) => {
                 let Some(path) = msg.get("path").and_then(|v| v.as_str()).map(String::from) else {
                     emit_error_with_id(
                         &mut stdout,
@@ -5741,7 +6700,7 @@ fn main() {
             // llama forward and return the per-layer mean-over-response-tokens
             // CETT feature (`[n_layers][intermediate]`). Requires a resident
             // llama backend (arch 10) and a prior `cett_load_colnorms`.
-            "cett_capture" => {
+            DaemonRequest::CettCapture(_) => {
                 let system = msg
                     .get("system")
                     .and_then(|v| v.as_str())
@@ -5960,7 +6919,7 @@ fn main() {
             // remove adapters, and list — all without reload. The abliteration
             // directions materialized by `lora_export`/the harness become a portable
             // adapter served here. See docs/plans/2026-06-30-abliteration-lora.md.
-            "lora_load" => {
+            DaemonRequest::LoraLoad(_) => {
                 let Some(path) = msg.get("path").and_then(|v| v.as_str()).map(String::from) else {
                     emit_error_with_id(&mut stdout, "", "lora_load: missing 'path'".to_string());
                     continue;
@@ -6011,7 +6970,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "lora_set_scale" => {
+            DaemonRequest::LoraSetScale(_) => {
                 let id = msg.get("id").and_then(|v| v.as_str()).map(String::from);
                 let scale = msg.get("scale").and_then(|v| v.as_f64()).map(|v| v as f32);
                 let (Some(id), Some(scale)) = (id, scale) else {
@@ -6034,7 +6993,7 @@ fn main() {
                 }
             }
 
-            "lora_unload" => {
+            DaemonRequest::LoraUnload(_) => {
                 let Some(id) = msg.get("id").and_then(|v| v.as_str()).map(String::from) else {
                     emit_error_with_id(&mut stdout, "", "lora_unload: missing 'id'".to_string());
                     continue;
@@ -6051,13 +7010,13 @@ fn main() {
                 }
             }
 
-            "lora_clear" => {
+            DaemonRequest::LoraClear => {
                 hipfire_steer::clear();
                 let _ = writeln!(stdout, r#"{{"type":"lora_ok"}}"#);
                 let _ = stdout.flush();
             }
 
-            "lora_list" => {
+            DaemonRequest::LoraList => {
                 let adapters: Vec<_> = hipfire_steer::loaded_adapters()
                     .into_iter()
                     .map(|(id, scale)| serde_json::json!({ "id": id, "scale": scale }))
@@ -6073,7 +7032,7 @@ fn main() {
             // (teacher/student split, docs/plans/2026-06-19-training-via-daemon-forward.md).
             // Output is JSONL, one line per chunk; the trainer's daemon-label
             // loader converts it to the v2 label cache.
-            "pflash_labels" => {
+            DaemonRequest::PflashLabels(_) => {
                 let Some(corpus) = msg.get("corpus").and_then(|v| v.as_str()).map(String::from)
                 else {
                     emit_error_with_id(
@@ -6246,201 +7205,617 @@ fn main() {
             // resident target (teacher/student split). STEP 1: plumbing only —
             // validates args + the hipfire-train link; the loop wiring lands in
             // step 3. See docs/plans/2026-06-19-train-as-daemon-op.md.
-            "train_drafter" => {
-                let arch = msg
-                    .get("arch")
+            DaemonRequest::TrainDrafter => {
+                // Micro-step-PREEMPTIBLE SSM-drafter training as a daemon op. Runs
+                // up to `quantum` EPOCHS per request and keeps a resident
+                // DrafterTrainSession alive between requests (keyed by `run_id`);
+                // the runner re-enqueues the low-priority training lease each
+                // quantum so it time-slices with interactive serving. Numerics are
+                // verbatim from the whole-run loop (drafter_loop_init/run_epochs/
+                // finish reproduce train_ssm_drafter_loop). Per-eval-epoch stream
+                // uses type `train_epoch` (not `train_progress`) so the runner's
+                // adapter only sees ONE quantum-boundary `train_progress`/`train_done`.
+                let run_id = msg
+                    .get("run_id")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("ssm")
+                    .unwrap_or("")
                     .to_string();
-                if arch != "ssm" {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        format!("train_drafter: arch '{arch}' not implemented (only ssm; step 3)"),
-                    );
-                    continue;
-                }
-                // Parse the train block into the SHARED TrainCfg.
                 let t = msg
                     .get("train")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                let labels = msg
-                    .get("labels")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let getu = |o: &serde_json::Value, k: &str, d: usize| -> usize {
-                    o.get(k)
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as usize)
-                        .unwrap_or(d)
-                };
-                let getf = |o: &serde_json::Value, k: &str, d: f32| -> f32 {
-                    o.get(k)
-                        .and_then(|v| v.as_f64())
-                        .map(|v| v as f32)
-                        .unwrap_or(d)
-                };
-                let cfg = hipfire_train::train_loop::TrainCfg {
-                    seq: getu(&labels, "seq", 512),
-                    block: getu(&labels, "block", 64),
-                    n_eval: getu(&labels, "n_eval", 20),
-                    epochs: getu(&t, "epochs", 300),
-                    lr: getf(&t, "lr", 1e-3),
-                    wd: getf(&t, "wd", 0.0),
-                    tau: getf(&t, "tau", 0.1),
-                    eval_every: getu(&t, "eval_every", 15),
-                    report_train: t
-                        .get("report_train")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                };
-                let source = labels
-                    .get("source")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("file");
-                if source != "file" {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        format!("train_drafter: label source '{source}' not implemented (only file; capture is step 4)"),
-                    );
-                    continue;
-                }
-                let Some(path) = labels
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                else {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        "train_drafter: labels.path required for source=file".to_string(),
-                    );
-                    continue;
-                };
-                let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from)
-                else {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        "train_drafter: 'output' (checkpoint path) required".to_string(),
-                    );
-                    continue;
-                };
+                let quantum = msg
+                    .get("quantum")
+                    .or_else(|| t.get("quantum"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(25)
+                    .max(1);
 
-                // ── load cached labels + frozen target embedding (file source) ──
-                let mut ls =
-                    match hipfire_train::labels::load_daemon_labels(&mut gpu, &path, cfg.seq) {
-                        Ok(ls) => ls,
+                // CONTINUE the resident session iff its run_id matches; else START
+                // fresh (loading labels + building drafter/optimizer once).
+                let continue_run = !run_id.is_empty()
+                    && drafter_train_session
+                        .as_ref()
+                        .map(|s| s.run_id == run_id)
+                        .unwrap_or(false);
+                if !continue_run {
+                    drafter_train_session = None; // drop any stale session, free VRAM
+                    let arch = msg
+                        .get("arch")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ssm")
+                        .to_string();
+                    if arch != "ssm" {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!(
+                                "train_drafter: arch '{arch}' not implemented (only ssm; step 3)"
+                            ),
+                        );
+                        continue;
+                    }
+                    // Parse the train/labels blocks into the SHARED TrainCfg.
+                    let labels = msg
+                        .get("labels")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let getu = |o: &serde_json::Value, k: &str, d: usize| -> usize {
+                        o.get(k)
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                            .unwrap_or(d)
+                    };
+                    let getf = |o: &serde_json::Value, k: &str, d: f32| -> f32 {
+                        o.get(k)
+                            .and_then(|v| v.as_f64())
+                            .map(|v| v as f32)
+                            .unwrap_or(d)
+                    };
+                    let cfg = hipfire_train::train_loop::TrainCfg {
+                        seq: getu(&labels, "seq", 512),
+                        block: getu(&labels, "block", 64),
+                        n_eval: getu(&labels, "n_eval", 20),
+                        epochs: getu(&t, "epochs", 300),
+                        lr: getf(&t, "lr", 1e-3),
+                        wd: getf(&t, "wd", 0.0),
+                        tau: getf(&t, "tau", 0.1),
+                        eval_every: getu(&t, "eval_every", 15),
+                        report_train: t
+                            .get("report_train")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                    };
+                    let source = labels
+                        .get("source")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("file");
+                    if source != "file" {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("train_drafter: label source '{source}' not implemented (only file; capture is step 4)"),
+                        );
+                        continue;
+                    }
+                    let Some(path) = labels
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                    else {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            "train_drafter: labels.path required for source=file".to_string(),
+                        );
+                        continue;
+                    };
+                    let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from)
+                    else {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            "train_drafter: 'output' (checkpoint path) required".to_string(),
+                        );
+                        continue;
+                    };
+
+                    // ── load cached labels + frozen target embedding (file source) ──
+                    let mut ls =
+                        match hipfire_train::labels::load_daemon_labels(&mut gpu, &path, cfg.seq) {
+                            Ok(ls) => ls,
+                            Err(e) => {
+                                emit_error_with_id(
+                                    &mut stdout,
+                                    "",
+                                    format!("train_drafter: load labels {path}: {e}"),
+                                );
+                                continue;
+                            }
+                        };
+                    let shuffle_seed = getu(&labels, "shuffle_seed", 0x5EED) as u64;
+                    hipfire_train::labels::shuffle_in_place(
+                        &mut ls.chunks,
+                        &mut ls.label_mid,
+                        &mut ls.base_shallow,
+                        shuffle_seed,
+                    );
+
+                    // ── build the SSM drafter from the request config ──
+                    let dc = msg
+                        .get("config")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let mut dcfg =
+                        hipfire_train::ssm_drafter::SsmDrafterConfig::tiny(10000.0, 1e-5);
+                    dcfg.h_draft = getu(&dc, "h_draft", 512);
+                    dcfg.n_layers = getu(&dc, "n_layers", 3);
+                    dcfg.inter = getu(&dc, "inter", 1024);
+                    dcfg.n_kv = getu(&dc, "n_kv", 4);
+                    dcfg.head_dim = getu(&dc, "head_dim", 64);
+                    let (h_t, vocab) = (ls.h_t, ls.vocab);
+                    let drafter = match hipfire_train::ssm_drafter::SsmDrafter::new(
+                        &mut gpu, ls.embed, h_t, vocab, dcfg, cfg.seq,
+                    ) {
+                        Ok(d) => d,
                         Err(e) => {
                             emit_error_with_id(
                                 &mut stdout,
                                 "",
-                                format!("train_drafter: load labels {path}: {e}"),
+                                format!("train_drafter: build drafter: {e}"),
                             );
                             continue;
                         }
                     };
-                let shuffle_seed = getu(&labels, "shuffle_seed", 0x5EED) as u64;
-                hipfire_train::labels::shuffle_in_place(
-                    &mut ls.chunks,
-                    &mut ls.label_mid,
-                    &mut ls.base_shallow,
-                    shuffle_seed,
-                );
-
-                // ── build the SSM drafter from the request config ──
-                let dc = msg
-                    .get("config")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let mut dcfg = hipfire_train::ssm_drafter::SsmDrafterConfig::tiny(10000.0, 1e-5);
-                dcfg.h_draft = getu(&dc, "h_draft", 512);
-                dcfg.n_layers = getu(&dc, "n_layers", 3);
-                dcfg.inter = getu(&dc, "inter", 1024);
-                dcfg.n_kv = getu(&dc, "n_kv", 4);
-                dcfg.head_dim = getu(&dc, "head_dim", 64);
-                let (h_t, vocab) = (ls.h_t, ls.vocab);
-                let drafter = match hipfire_train::ssm_drafter::SsmDrafter::new(
-                    &mut gpu, ls.embed, h_t, vocab, dcfg, cfg.seq,
-                ) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        emit_error_with_id(
-                            &mut stdout,
-                            "",
-                            format!("train_drafter: build drafter: {e}"),
-                        );
-                        continue;
-                    }
-                };
-                let nparams: usize = drafter.param_sizes().iter().sum();
-                let _ = writeln!(
-                    stdout,
-                    "{}",
-                    serde_json::json!({
-                        "type": "train_start", "arch": arch, "params": nparams,
-                        "chunks": ls.chunks.len(), "n_train": ls.chunks.len().saturating_sub(cfg.n_eval),
-                        "n_eval": cfg.n_eval, "epochs": cfg.epochs,
-                    })
-                );
-                let _ = stdout.flush();
-
-                // ── run the SHARED training loop, streaming progress JSONL ──
-                let train_res = hipfire_train::train_loop::train_ssm_drafter_loop(
-                    &mut gpu,
-                    &drafter,
-                    &ls.chunks,
-                    &ls.label_mid,
-                    &ls.base_shallow,
-                    &cfg,
-                    |ep, train_loss, corr, best, best_ep, train_corr| {
-                        let mut ev = serde_json::json!({
-                            "type": "train_progress", "epoch": ep, "train_loss": train_loss,
-                            "eval": corr, "best": best, "best_epoch": best_ep,
-                        });
-                        if let Some(tc) = train_corr {
-                            ev["train_rho"] = serde_json::json!(tc);
+                    // Set up the resumable loop state (bar, optimizer, scores scratch).
+                    let st = match hipfire_train::train_loop::drafter_loop_init(
+                        &mut gpu,
+                        &drafter,
+                        &ls.chunks,
+                        &ls.label_mid,
+                        &ls.base_shallow,
+                        &cfg,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                "",
+                                format!("train_drafter: loop init: {e}"),
+                            );
+                            continue;
                         }
-                        let _ = writeln!(stdout, "{ev}");
-                        let _ = stdout.flush();
-                    },
-                );
-                let report = match train_res {
-                    Ok(r) => r,
-                    Err(e) => {
-                        emit_error_with_id(
-                            &mut stdout,
-                            "",
-                            format!("train_drafter: train loop: {e}"),
-                        );
-                        continue;
-                    }
-                };
+                    };
+                    let nparams: usize = drafter.param_sizes().iter().sum();
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "train_start", "arch": arch, "params": nparams,
+                            "chunks": ls.chunks.len(), "n_train": ls.chunks.len().saturating_sub(cfg.n_eval),
+                            "n_eval": cfg.n_eval, "epochs": cfg.epochs,
+                            "run_id": run_id, "quantum": quantum,
+                        })
+                    );
+                    let _ = stdout.flush();
+                    drafter_train_session = Some(DrafterTrainSession {
+                        run_id: run_id.clone(),
+                        drafter,
+                        chunks: ls.chunks,
+                        label_mid: ls.label_mid,
+                        cfg,
+                        st,
+                        output,
+                        quantum,
+                    });
+                }
 
-                // ── checkpoint the best-eval weights ──
-                let saved = hipfire_train::labels::save_ssm_drafter_weights(
-                    &output,
-                    &report.best_weights,
-                    report.best_epoch as u32,
-                );
-                let _ = writeln!(
-                    stdout,
-                    "{}",
-                    serde_json::json!({
-                        "type": "train_done",
-                        "best_eval": report.best_eval, "best_epoch": report.best_epoch,
-                        "bar": report.bar, "final_eval": report.final_eval,
-                        "beat_bar": report.best_eval > report.bar,
-                        "checkpoint": if saved.is_ok() { Some(output.clone()) } else { None },
-                        "checkpoint_error": saved.err().map(|e| e.to_string()),
-                    })
-                );
-                let _ = stdout.flush();
+                // ── run ONE quantum of epochs, streaming per-epoch `train_epoch` ──
+                let quantum_result: Result<(), String> = {
+                    let sess = drafter_train_session
+                        .as_mut()
+                        .expect("session present after start/continue");
+                    let ep_end = (sess.st.ep + sess.quantum).min(sess.cfg.epochs);
+                    hipfire_train::train_loop::drafter_loop_run_epochs(
+                        &mut gpu,
+                        &sess.drafter,
+                        sess.chunks.as_slice(),
+                        sess.label_mid.as_slice(),
+                        &sess.cfg,
+                        &mut sess.st,
+                        ep_end,
+                        |ep, train_loss, corr, best, best_ep, train_corr| {
+                            let mut ev = serde_json::json!({
+                                "type": "train_epoch", "epoch": ep, "train_loss": train_loss,
+                                "eval": corr, "best": best, "best_epoch": best_ep,
+                            });
+                            if let Some(tc) = train_corr {
+                                ev["train_rho"] = serde_json::json!(tc);
+                            }
+                            let _ = writeln!(stdout, "{ev}");
+                            let _ = stdout.flush();
+                        },
+                    )
+                    .map_err(|e| e.to_string())
+                };
+                if let Err(e) = quantum_result {
+                    drafter_train_session = None;
+                    emit_error_with_id(&mut stdout, "", format!("train_drafter: train loop: {e}"));
+                    continue;
+                }
+
+                let done = drafter_train_session
+                    .as_ref()
+                    .map(|s| s.st.ep >= s.cfg.epochs)
+                    .unwrap_or(false);
+                if done {
+                    // Final quantum: finish (free scratch) → checkpoint best-eval
+                    // weights → terminal event. `take()` drops the resident session.
+                    let sess = drafter_train_session.take().expect("done implies present");
+                    let output = sess.output.clone();
+                    let run_id = sess.run_id.clone();
+                    let report = hipfire_train::train_loop::drafter_loop_finish(&mut gpu, sess.st);
+                    let saved = hipfire_train::labels::save_ssm_drafter_weights(
+                        &output,
+                        &report.best_weights,
+                        report.best_epoch as u32,
+                    );
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "train_done",
+                            "best_eval": report.best_eval, "best_epoch": report.best_epoch,
+                            "bar": report.bar, "final_eval": report.final_eval,
+                            "beat_bar": report.best_eval > report.bar,
+                            "checkpoint": if saved.is_ok() { Some(output.clone()) } else { None },
+                            "checkpoint_error": saved.err().map(|e| e.to_string()),
+                            "run_id": run_id,
+                        })
+                    );
+                    let _ = stdout.flush();
+                } else {
+                    // Quantum done but run unfinished: report progress and keep the
+                    // session resident. The runner re-enqueues; training yields to
+                    // any pending interactive request before the next quantum.
+                    let sess = drafter_train_session
+                        .as_ref()
+                        .expect("unfinished implies present");
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "train_progress", "run_id": sess.run_id,
+                            "epoch": sess.st.ep, "total": sess.cfg.epochs,
+                            "eval": sess.st.final_eval, "best": sess.st.best_eval,
+                            "done": false,
+                        })
+                    );
+                    let _ = stdout.flush();
+                }
             }
 
-            "diag" => {
+            // Train a LoRA adapter on a frozen bf16 base, in-process on the
+            // resident engine. SCAFFOLD: this validates args + the hipfire-train
+            // link and reserves the wire/runner/route path (mirrors TrainDrafter),
+            // but the ASSEMBLED, data-driven, adapter-SAVING LoRA loop is not yet
+            // wired — hipfire-train has the proven primitives (model::from_f32_weights
+            // → model_forward → model_loss_backward → optim::AdamW, demonstrated in
+            // examples/overfit_supra50m.rs) but no reusable loop that loads real
+            // data/labels and serializes an adapter checkpoint. Emits a clear
+            // not-implemented error until that lands.
+            //
+            // NOTE: even when assembled, this trains hipfire-train's OWN un-fused
+            // LlamaModel — NOT the served qwen35 arch's adapters. Training the
+            // served forward via activation-save at the in-forward HOOK sites is
+            // the large P3 follow-on. See docs/plans/2026-07-19-daemon-training-steering.md.
+            DaemonRequest::TrainLora => {
+                // Micro-step-PREEMPTIBLE LoRA-on-frozen training as a daemon op.
+                // Runs up to `quantum` steps per request and keeps a resident
+                // LoraTrainSession alive between requests (keyed by `run_id`); the
+                // runner re-enqueues the low-priority training lease each quantum so
+                // it time-slices with interactive serving. Compute is verbatim from
+                // the validated whole-run loop (hipfire_train, overfit_supra50m.rs):
+                // forward → loss → backward-THROUGH-ADAPTERS → AdamW, then a final
+                // HFLORA01 adapter dump. NOTE: trains hipfire-train's own un-fused
+                // LlamaModel, NOT the served qwen35 adapters (a follow-on).
+                // `data=overfit` is a deterministic synthetic batch.
+                const IGNORE: i32 = -100;
+                let run_id = msg
+                    .get("run_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let train = msg
+                    .get("train")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let quantum = msg
+                    .get("quantum")
+                    .or_else(|| train.get("quantum"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(25)
+                    .max(1);
+
+                // CONTINUE the resident session iff its run_id matches; else START
+                // fresh (loading the model + building the batch/optimizer once).
+                let continue_run = !run_id.is_empty()
+                    && lora_train_session
+                        .as_ref()
+                        .map(|s| s.run_id == run_id)
+                        .unwrap_or(false);
+                if !continue_run {
+                    lora_train_session = None; // drop any stale session, free VRAM
+                    let Some(output) = msg.get("output").and_then(|v| v.as_str()).map(String::from)
+                    else {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            "train_lora: 'output' (adapter checkpoint path) required".to_string(),
+                        );
+                        continue;
+                    };
+                    let Some(base_dir) = msg
+                        .get("model")
+                        .or_else(|| msg.get("base"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                    else {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            "train_lora: 'model' (fp32 base model dir) required".to_string(),
+                        );
+                        continue;
+                    };
+                    let getu = |k: &str, d: usize| -> usize {
+                        train
+                            .get(k)
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                            .unwrap_or(d)
+                    };
+                    let getf = |k: &str, d: f32| -> f32 {
+                        train
+                            .get(k)
+                            .and_then(|v| v.as_f64())
+                            .map(|v| v as f32)
+                            .unwrap_or(d)
+                    };
+                    let steps = getu("steps", 200);
+                    let rank = getu("rank", 16);
+                    let seq = getu("seq", 8);
+                    let n_seqs = getu("n_seqs", 3);
+                    let alpha = getf("alpha", 32.0);
+                    let lr = getf("lr", 5e-3);
+                    let data_mode = msg
+                        .get("data")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("overfit");
+                    if data_mode != "overfit" {
+                        emit_error_with_id(
+                            &mut stdout,
+                            "",
+                            format!("train_lora: data source '{data_mode}' not implemented (only 'overfit' synthetic batch is wired; real-corpus loading is a follow-on)"),
+                        );
+                        continue;
+                    }
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "train_start", "op": "train_lora", "base": base_dir,
+                            "steps": steps, "rank": rank, "alpha": alpha, "lr": lr,
+                            "run_id": run_id, "quantum": quantum,
+                        })
+                    );
+                    let _ = stdout.flush();
+                    let built: Result<LoraTrainSession, String> = (|| {
+                        let dir = std::path::Path::new(&base_dir);
+                        if !dir.exists() {
+                            return Err(format!("base model dir not found: {base_dir}"));
+                        }
+                        let (cfg, weights) = hipfire_train::loader::load_llama_fp32(&mut gpu, dir)
+                            .map_err(|e| e.to_string())?;
+                        let vocab = cfg.vocab_size;
+                        let model = hipfire_train::model::LlamaModel::from_f32_weights(
+                            &mut gpu, &cfg, weights, seq, rank, alpha,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        let pos: Vec<f32> = (0..seq).map(|t| t as f32).collect();
+                        let batch: Vec<(Vec<u32>, Vec<f32>)> = (0..n_seqs)
+                            .map(|s| {
+                                let toks: Vec<u32> = (0..seq)
+                                    .map(|t| (((t + 1) * 2654435761 + s * 40503) % vocab) as u32)
+                                    .collect();
+                                let mut tgts: Vec<f32> =
+                                    (0..seq).map(|t| toks[(t + 1) % seq] as f32).collect();
+                                tgts[seq - 1] = IGNORE as f32;
+                                (toks, tgts)
+                            })
+                            .collect();
+                        let target_tokens = (n_seqs * (seq - 1)).max(1) as f32;
+                        let sizes = model.lora_param_sizes();
+                        let opt = hipfire_train::optim::AdamW::new(
+                            &mut gpu, &sizes, lr, 0.9, 0.999, 1e-8, 0.0,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        // total = steps + 1: the final pass is eval-only (no update),
+                        // matching the validated whole-run `for step in 0..=steps`.
+                        Ok(LoraTrainSession {
+                            run_id: run_id.clone(),
+                            model,
+                            opt,
+                            batch,
+                            pos,
+                            target_tokens,
+                            step: 0,
+                            total: steps + 1,
+                            initial_ce: 0.0,
+                            last_ce: 0.0,
+                            output,
+                            vocab,
+                        })
+                    })();
+                    match built {
+                        Ok(sess) => lora_train_session = Some(sess),
+                        Err(e) => {
+                            emit_error_with_id(&mut stdout, "", format!("train_lora: {e}"));
+                            continue;
+                        }
+                    }
+                }
+
+                // Run ONE quantum of steps on the resident session. Destructure the
+                // &mut session into disjoint field bindings so the per-step
+                // forward/backward (reads `model`) and `opt.step` (mut `opt`) don't
+                // trip the borrow checker through a single `sess`.
+                let quantum_result: Result<(), String> = {
+                    let sess = lora_train_session
+                        .as_mut()
+                        .expect("session present after start/continue");
+                    let LoraTrainSession {
+                        model,
+                        opt,
+                        batch,
+                        pos,
+                        target_tokens,
+                        step,
+                        total,
+                        initial_ce,
+                        last_ce,
+                        ..
+                    } = sess;
+                    (|| {
+                        let end = (*step + quantum).min(*total);
+                        while *step < end {
+                            let s = *step;
+                            let mut total_loss = 0.0f32;
+                            for (toks, tgts) in batch.iter() {
+                                let acts = hipfire_train::model::model_forward(
+                                    &mut gpu,
+                                    &*model,
+                                    toks,
+                                    pos.as_slice(),
+                                )
+                                .map_err(|e| e.to_string())?;
+                                let (loss, grads) = hipfire_train::model::model_loss_backward(
+                                    &mut gpu, &*model, &acts, tgts, IGNORE,
+                                )
+                                .map_err(|e| e.to_string())?;
+                                total_loss += loss;
+                                // Last pass (step == total-1) is eval-only.
+                                if s < *total - 1 {
+                                    let params = model.lora_params();
+                                    let gflat = hipfire_train::model::flatten_lora_grads(&grads);
+                                    opt.step(&mut gpu, &params, &gflat)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                                // Free per-step activations + grads. model_forward /
+                                // model_loss_backward allocate fresh GPU scratch each
+                                // step and neither frees it; without this the resident
+                                // session leaks VRAM across steps → OOM after a few
+                                // hundred steps (the overfit example only "works"
+                                // because it runs alone on a big-VRAM box).
+                                hipfire_train::model::free_model_acts(&mut gpu, acts)
+                                    .map_err(|e| e.to_string())?;
+                                for g in grads {
+                                    gpu.free_tensor(g.daq).map_err(|e| e.to_string())?;
+                                    gpu.free_tensor(g.dbq).map_err(|e| e.to_string())?;
+                                    gpu.free_tensor(g.dav).map_err(|e| e.to_string())?;
+                                    gpu.free_tensor(g.dbv).map_err(|e| e.to_string())?;
+                                    gpu.free_tensor(g.dnorm1).map_err(|e| e.to_string())?;
+                                    gpu.free_tensor(g.dnorm2).map_err(|e| e.to_string())?;
+                                }
+                            }
+                            *last_ce = total_loss / *target_tokens;
+                            if s == 0 {
+                                *initial_ce = *last_ce;
+                            }
+                            *step += 1;
+                        }
+                        Ok(())
+                    })()
+                };
+                if let Err(e) = quantum_result {
+                    lora_train_session = None;
+                    emit_error_with_id(&mut stdout, "", format!("train_lora: {e}"));
+                    continue;
+                }
+
+                let done = lora_train_session
+                    .as_ref()
+                    .map(|s| s.step >= s.total)
+                    .unwrap_or(false);
+                if done {
+                    // Final quantum: dump the adapter and finish. `take()` drops the
+                    // resident session (frees VRAM) before we emit the terminal event.
+                    let sess = lora_train_session.take().expect("done implies present");
+                    // Persist the trained adapter: layer-major [aq,bq,av,bv] f32
+                    // tensors. Minimal container (magic + count + per-tensor
+                    // shape/data) — a serving-loadable format is a follow-on.
+                    let dump: Result<usize, String> = (|| {
+                        let params = sess.model.lora_params();
+                        let mut buf: Vec<u8> = Vec::new();
+                        buf.extend_from_slice(b"HFLORA01");
+                        buf.extend_from_slice(&(params.len() as u32).to_le_bytes());
+                        for t in &params {
+                            let data = gpu.download_f32(t).map_err(|e| e.to_string())?;
+                            buf.extend_from_slice(&(t.shape.len() as u32).to_le_bytes());
+                            for &d in &t.shape {
+                                buf.extend_from_slice(&(d as u32).to_le_bytes());
+                            }
+                            buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                            for &f in &data {
+                                buf.extend_from_slice(&f.to_le_bytes());
+                            }
+                        }
+                        std::fs::write(&sess.output, &buf)
+                            .map_err(|e| format!("write adapter {}: {e}", sess.output))?;
+                        Ok(params.len())
+                    })();
+                    match dump {
+                        Ok(n_trainable) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                serde_json::json!({
+                                    "type": "train_done", "op": "train_lora",
+                                    "initial_per_tok_ce": sess.initial_ce,
+                                    "final_per_tok_ce": sess.last_ce,
+                                    "steps": sess.total - 1, "trainable_tensors": n_trainable,
+                                    "baseline_ce_ln_vocab": (sess.vocab as f32).ln(),
+                                    "output": sess.output, "run_id": sess.run_id,
+                                    "note": "trained hipfire-train LlamaModel LoRA (overfit synthetic batch); served-qwen35 adapters + real-corpus loading are follow-ons",
+                                })
+                            );
+                            let _ = stdout.flush();
+                        }
+                        Err(e) => emit_error_with_id(&mut stdout, "", format!("train_lora: {e}")),
+                    }
+                } else {
+                    // Quantum done but run unfinished: report progress and keep the
+                    // session resident. The runner re-enqueues; training yields to
+                    // any pending interactive request before the next quantum.
+                    let sess = lora_train_session
+                        .as_ref()
+                        .expect("unfinished implies present");
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "train_progress", "run_id": sess.run_id,
+                            "step": sess.step, "total": sess.total,
+                            "per_tok_ce": sess.last_ce, "done": false,
+                        })
+                    );
+                    let _ = stdout.flush();
+                }
+            }
+
+            DaemonRequest::Diag => {
                 let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                 let hip_ver = gpu.hip.runtime_version().unwrap_or((0, 0));
                 let has_model = model.is_some();
@@ -6519,7 +7894,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "bench_prefill" => {
+            DaemonRequest::BenchPrefill(_) => {
                 // Synthetic prefill benchmark — measures forward_prefill_batch on N
                 // deterministic tokens from a zeroed state. Used by `hipfire bench`
                 // to produce canonical pp128/pp512/pp1024 numbers that don't depend
@@ -6785,7 +8160,7 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "profile" => {
+            DaemonRequest::Profile => {
                 // Precompile kernels for common configurations so we have something to profile.
                 // If a model is loaded its kernels are already compiled; this fills in the rest.
                 // Cover all KV modes × weight formats × head_dims to catch all kernel variants.
@@ -6808,13 +8183,14 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            _ => {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"error","message":"unknown type: {}"}}"#,
-                    msg_type
+            DaemonRequest::Abort(_) | DaemonRequest::ForceAnswer(_) => {
+                emit_error_with_id(
+                    &mut stdout,
+                    msg.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                    format!(
+                        "{msg_type} is handled on the control channel, not the request channel"
+                    ),
                 );
-                let _ = stdout.flush();
             }
         }
     }

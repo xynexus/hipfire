@@ -79,8 +79,8 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_rdna::{DType, Gpu};
+use hipfire_runtime::multi_gpu::Gpus;
 use std::time::Instant;
 
 const DIM: usize = 5120; // qwen3.6-27b hidden size (M = K)

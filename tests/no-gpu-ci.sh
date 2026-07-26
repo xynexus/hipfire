@@ -17,6 +17,7 @@ cargo test -p hipfire-arch-qwen35 --lib moe_prefill
 cargo test -p hipfire-eval --lib
 cargo test -p hipfire-quantize xxh64_provenance_tests
 cargo test -p hipfire-quantize fixture
+cargo test -p hipfire-runtime quant_catalog_matches_derived_gemv_routes
 cargo test -p hipfire-arch-api --lib
 cargo test -p hipfire-arch-specs --lib
 cargo test -p hipfire-arch-template-spec --lib
@@ -27,9 +28,18 @@ cargo test -p hipfire-arch-llama --lib caps
 echo "== Tiny-fixture round-trip (CPU: emit → quantize, no GPU) =="
 bash tests/fixture-roundtrip-nogpu.sh
 
+echo "== Tiny affected-file selector (no GPU) =="
+bash tests/tiny-affected-gate-nogpu.sh
+
+echo "== Resident/streamed parity workflow (no GPU) =="
+bash tests/resident-streamed-parity-nogpu.sh
+
 echo "== Eval harness no-GPU smoke =="
 cargo build -p hipfire-eval
 HIPFIRE_EVAL_BIN="$ROOT/target/debug/hipfire-eval" bash tests/smoke/eval-harness-nogpu-smoke.sh
+
+echo "== Installer link layout =="
+bash tests/install-links.sh
 
 echo "== Python CPU tests =="
 "$PYTHON" -m ruff check .
@@ -61,6 +71,7 @@ bash -n tests/smoke/eval-harness-nogpu-smoke.sh
 bash -n tests/smoke/eval-harness-gpu-smoke.sh
 bash -n tests/smoke/eval-harness-model-eval-smoke.sh
 bash -n tests/tiny-affected-gate.sh
+bash -n tests/tiny-affected-gate-nogpu.sh
 bash -n tests/tiny-quant-gate.sh
 bash -n tests/tiny-state-gate.sh
 bash -n tests/tiny-spec-gate.sh

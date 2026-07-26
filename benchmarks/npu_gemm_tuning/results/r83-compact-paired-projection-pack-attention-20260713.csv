@@ -1,0 +1,4 @@
+variant,trial,contexts,max_odd_text_bytes,max_even_text_bytes,stage_mismatches,q_mismatches,kv_mismatches,attention_mismatches,iterations,ms,status,notes
+compact-paired-projection-pack-attention,1,1,15888,10912,0,0,0,0,100,4.1666,capacity-admitted-speed-rejected,exact full boundary
+compact-paired-projection-pack-attention,2,1,15888,10912,0,0,0,0,100,4.0493,capacity-admitted-speed-rejected,exact full boundary
+compact-paired-projection-pack-attention,3,1,15888,10912,0,0,0,0,100,4.0535,capacity-admitted-speed-rejected,exact full boundary

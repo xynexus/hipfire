@@ -1,8 +1,8 @@
 use axum::{extract::State, response::Json};
 use hipfire_model::AcceleratorInventory;
 use hipfire_scheduler::{
-    server_decode_batch_health_json, server_prefill_batch_health_json,
-    server_state_cache_health_json, SchedulerPolicyEnv,
+    server_decode_batch_health_json, server_prefill_batch_enabled,
+    server_prefill_batch_health_json, server_state_cache_health_json, SchedulerPolicyEnv,
 };
 use hipfire_state::runtime_workers_health_json_with_inventory;
 use serde_json::{json, Value};
@@ -10,6 +10,28 @@ use std::env;
 
 use crate::scheduler::server_accelerator_inventory;
 use crate::state::SharedState;
+
+/// Model-load progress for the chat UI's loading bar. Reflects the daemon's
+/// per-layer weight-load stream (parsed from its stderr by the daemon adapter).
+/// `loading` is true only while actively loading (`current < total`); once
+/// weights are in (`current == total`) prefill follows, for which no per-step
+/// progress exists (the UI falls back to an indeterminate bar).
+pub async fn get_load_progress() -> Json<Value> {
+    let (current, total, phase) = hipfire_daemon_adapter::model_load_progress();
+    let loading = total > 0 && current < total;
+    let fraction = if total > 0 {
+        current as f64 / total as f64
+    } else {
+        0.0
+    };
+    Json(json!({
+        "current": current,
+        "total": total,
+        "phase": phase,
+        "loading": loading,
+        "fraction": fraction,
+    }))
+}
 
 pub async fn get_health(state: State<SharedState>) -> Json<Value> {
     let loaded = {
@@ -20,14 +42,20 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
     let active_model = loaded
         .clone()
         .or_else(|| diffusion_active_model(&diffusion));
-    let idle_timeout_sec = {
-        let cfg = state.config.lock().await;
-        cfg.idle_timeout
-    };
+    let scheduler_resources = scheduler_resource_health_payload(&state).await;
     let prefill_queue_size = state.prefill_scheduler.lock().await.size();
     let selected_prefill_requests = state.selected_prefill_requests.lock().await.len();
     let accelerator_inventory = server_accelerator_inventory(&state).await;
+    let runtime_workers = runtime_workers_health_payload(&state, &accelerator_inventory).await;
     let scheduler_env = scheduler_env_from_process();
+    // When continuous batching is enabled, the batch runner owns live counters
+    // (residency, selected batch size, decode backend). Surface them here so
+    // `/health` and smoke-server-decode-batch.sh see real values instead of the
+    // static metadata. With the flag off the legacy metadata view is kept.
+    let batch_enabled = server_prefill_batch_enabled(&scheduler_env);
+    let batch_telemetry = state.batch_telemetry.lock().await.clone();
+    let batch_pending = state.batch_inbox.lock().await.len();
+    let work_snapshot = state.work_scheduler.lock().await.snapshot();
     let mut prefill_batch = server_prefill_batch_health_json(&scheduler_env);
     if let Some(obj) = prefill_batch.as_object_mut() {
         obj.insert("queue_size".to_string(), json!(prefill_queue_size));
@@ -36,6 +64,27 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
             "selected_pending_dispatch".to_string(),
             json!(selected_prefill_requests),
         );
+        if batch_enabled {
+            if let Some(tel) = batch_telemetry.prefill_health_json().as_object() {
+                for (k, v) in tel {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            // Live gauge: requests parked in the batch inbox right now.
+            obj.insert("pending_requests".to_string(), json!(batch_pending));
+            // The continuous-batching runner is active, so the server drives the
+            // daemon's fused batch-prefill lifecycle. Capability is a static
+            // property of the enabled runner, not of any currently-resident model
+            // (models load on demand per request).
+            obj.insert(
+                "generate_batch_prefill_capability".to_string(),
+                json!("supported"),
+            );
+            obj.insert(
+                "generate_batch_prefill_capability_reason".to_string(),
+                json!("continuous_batch_runner_active"),
+            );
+        }
         if prefill_queue_size > 0 || selected_prefill_requests > 0 {
             obj.insert(
                 "runtime_dispatch_skipped_reason".to_string(),
@@ -49,12 +98,25 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         "model": loaded,
         "active_model": active_model,
         "diffusion": diffusion,
-        "idle_timeout_sec": idle_timeout_sec,
         "pid": std::process::id(),
+        "scheduler_resources": scheduler_resources,
+        "work_scheduler": json!({
+            "queued": work_snapshot.queued,
+            "active_batches": work_snapshot.active_batches,
+            "active_workloads": work_snapshot.active_workloads,
+            "exclusive_active": work_snapshot.exclusive_active,
+            "active_vram_bytes": work_snapshot.active_resources.vram_bytes,
+            "active_gpu_slots": work_snapshot.active_resources.gpu_slots,
+        }),
         "prefill_batch": prefill_batch,
-        "decode_batch": server_decode_batch_health_json(&scheduler_env),
+        "decode_batch": if batch_enabled {
+            batch_telemetry.decode_health_json()
+        } else {
+            server_decode_batch_health_json(&scheduler_env)
+        },
         "state_cache": server_state_cache_health_json(&scheduler_env),
-        "runtime_workers": runtime_workers_health_payload(&accelerator_inventory),
+        "deferred_jobs": crate::deferred_jobs::deferred_jobs_health_json(),
+        "runtime_workers": runtime_workers,
         "batches": batch_health_payload(&state).await,
     }))
 }
@@ -102,7 +164,81 @@ fn scheduler_env_from_process() -> SchedulerPolicyEnv {
     SchedulerPolicyEnv::from_pairs(env::vars())
 }
 
-fn runtime_workers_health_payload(inventory: &AcceleratorInventory) -> serde_json::Value {
+async fn scheduler_resource_health_payload(state: &SharedState) -> serde_json::Value {
+    let cfg = state.config.lock().await.clone();
+    let locks = hipfire_daemon_adapter::resource_lock_report(&hipfire_lock::resource_lock_root())
+        .into_iter()
+        .map(|(resource, path, state)| {
+            let (locked, holder) = match state {
+                hipfire_daemon_adapter::LockState::Free => (false, String::new()),
+                hipfire_daemon_adapter::LockState::Busy(holder) => (true, holder),
+            };
+            json!({
+                "resource": resource,
+                "path": path,
+                "locked": locked,
+                "holder": holder,
+            })
+        })
+        .collect::<Vec<_>>();
+    let daemon_resource_status = {
+        let mut engine = state.engine.lock().await;
+        if let Some(engine) = engine.as_mut() {
+            match engine.resource_status().await {
+                Ok(status) => Some(status),
+                Err(err) => {
+                    tracing::warn!("daemon resource_status failed for health route: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+    let mut payload = json!({
+        "resource_lock_enabled": cfg.resource_lock_enabled,
+        "resource_lock_gpus": cfg.resource_lock_gpus,
+        "resource_lock_npus": cfg.resource_lock_npus,
+        "resource_lock_wait_ms": cfg.resource_lock_wait_ms,
+        "system_memory_budget_bytes": cfg.scheduler_system_memory_budget_bytes,
+        "system_memory_headroom_bytes": cfg.scheduler_system_memory_headroom_bytes,
+        "vram_budget_bytes": cfg.scheduler_vram_budget_bytes,
+        "vram_headroom_bytes": cfg.scheduler_vram_headroom_bytes,
+        "model_residency_mode": cfg.model_residency_mode,
+        "locks": locks,
+    });
+    if let Some(status) = daemon_resource_status {
+        for key in [
+            "system_memory_target_bytes",
+            "held_system_memory_placeholder_bytes",
+            "resident_system_memory_bytes",
+            "vram_target_bytes",
+            "held_vram_placeholder_bytes",
+            "resident_vram_bytes",
+            "resident_workers",
+        ] {
+            if let Some(value) = status.get(key).cloned() {
+                payload[key] = value;
+            }
+        }
+        payload["daemon_resource_status"] = status;
+    }
+    payload
+}
+
+async fn runtime_workers_health_payload(
+    state: &SharedState,
+    inventory: &AcceleratorInventory,
+) -> serde_json::Value {
+    let mut engine = state.engine.lock().await;
+    if let Some(engine) = engine.as_mut() {
+        match engine.list_workers().await {
+            Ok(status) => return status,
+            Err(err) => {
+                tracing::warn!("daemon worker_status failed for health route: {err}");
+            }
+        }
+    }
     runtime_workers_health_json_with_inventory(&[], 0, None, 0, 0, "none", inventory)
 }
 
@@ -139,7 +275,12 @@ async fn batch_health_payload(state: &SharedState) -> serde_json::Value {
         "cancelled": cancelled,
         "completed": completed,
         "completion_window_supported": true,
-        "supported_endpoints": ["/v1/chat/completions", "/v1/responses"],
+        "supported_endpoints": [
+            "/v1/chat/completions",
+            "/v1/embeddings",
+            "/v1/rerank",
+            "/v1/responses"
+        ],
         "execution_mode": "serial_fallback",
         "last_fallback_reason": "daemon_serialized_request_path",
         "batch_capability": "supported",
@@ -168,17 +309,34 @@ mod tests {
 
     #[test]
     fn health_route_uses_disabled_shared_scheduler_payloads() {
+        let runtime_workers = runtime_workers_health_json_with_inventory(
+            &[],
+            0,
+            None,
+            0,
+            0,
+            "none",
+            &AcceleratorInventory::not_probed(),
+        );
+        // Continuous batching is on by default (Phase 2); use the kill switch to
+        // exercise the disabled batch payload shapes.
+        let batch_off = SchedulerPolicyEnv::from_pairs([("HIPFIRE_SERVER_PREFILL_BATCH", "0")]);
         let payload = json!({
-            "prefill_batch": server_prefill_batch_health_json(&SchedulerPolicyEnv::empty()),
-            "decode_batch": server_decode_batch_health_json(&SchedulerPolicyEnv::empty()),
-            "state_cache": server_state_cache_health_json(&SchedulerPolicyEnv::empty()),
-            "runtime_workers": runtime_workers_health_payload(&AcceleratorInventory::not_probed()),
+            "prefill_batch": server_prefill_batch_health_json(&batch_off),
+            "decode_batch": server_decode_batch_health_json(&batch_off),
+            "state_cache": server_state_cache_health_json(&batch_off),
+            "deferred_jobs": crate::deferred_jobs::deferred_jobs_health_json(),
+            "runtime_workers": runtime_workers,
             "batches": json!({ "enabled": true }),
         });
 
         assert_eq!(payload["prefill_batch"], json!({ "enabled": false }));
         assert_eq!(payload["decode_batch"], json!({ "enabled": false }));
         assert_eq!(payload["state_cache"], json!({ "enabled": false }));
+        assert_eq!(
+            payload["deferred_jobs"]["execution_mode"],
+            "continuous_sequential"
+        );
         assert_eq!(payload["runtime_workers"]["resident_workers"], 0);
         assert_eq!(payload["runtime_workers"]["state_arena_backend"], "none");
         assert_eq!(
@@ -206,7 +364,8 @@ mod tests {
                 Some("HIP 6.4".to_string()),
             )],
         );
-        let payload = runtime_workers_health_payload(&inventory);
+        let payload =
+            runtime_workers_health_json_with_inventory(&[], 0, None, 0, 0, "none", &inventory);
 
         assert_eq!(payload["accelerator_inventory"]["source"], "daemon");
         assert_eq!(payload["accelerator_inventory"]["device_count"], 1);
@@ -268,6 +427,7 @@ mod tests {
                 latent_width: Some(64),
                 supported_widths: vec![512],
                 supported_heights: vec![512],
+                ..DiffusionPipelineMetadata::default()
             },
             tokenizer: DiffusionTokenizerMetadata::default(),
             tokenizer_2: None,

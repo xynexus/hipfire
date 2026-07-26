@@ -3,6 +3,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 // Import tooling now lives in the offline hipfire-diffusion-coexist crate.
+use super::*;
 use hipfire_diffusion_coexist::{
     import_diffusers_to_hfq, ldm_unet_native_tensor_name, ldm_vae_native_tensor_name,
     parse_pytorch_state_dict, pytorch_tensor_is_contiguous, reorder_pytorch_storage_to_contiguous,
@@ -10,7 +11,6 @@ use hipfire_diffusion_coexist::{
 };
 use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 use std::fs;
-use super::*;
 
 #[test]
 fn rejects_non_diffusion_metadata() {
@@ -383,7 +383,10 @@ fn diffusion_pipeline_generate_batch_returns_sdapi_png_images_with_test_backend(
             encoder: None,
             decoder: Box::new(TestImageDecoder),
             text_conditioner: None,
+            flux2_text_conditioner: None,
             krea2_tokenizer: None,
+            flux2_tokenizer: None,
+            flux2_text_max_length: 512,
         }),
         native_runtime_error: None,
     };
@@ -922,7 +925,10 @@ fn diffusion_pipeline_passes_sdxl_conditioning_to_noise_backend() {
             encoder: None,
             decoder: Box::new(TestImageDecoder),
             text_conditioner: None,
+            flux2_text_conditioner: None,
             krea2_tokenizer: None,
+            flux2_tokenizer: None,
+            flux2_text_max_length: 512,
         }),
         native_runtime_error: None,
     };
@@ -1000,6 +1006,7 @@ fn diffusion_pipeline_img2img_uses_inpaint_conditioning_for_inpaint_channel_mode
         inpainting_fill: None,
         resize_mode: DiffusionImg2ImgResizeMode::Image,
         denoising_strength: 1.0,
+        refine_sigma: None,
     };
 
     let output = pipeline.generate_img2img_batch(request).unwrap();
@@ -1049,6 +1056,7 @@ fn diffusion_pipeline_img2img_resizes_init_and_mask_to_request_dimensions() {
         inpainting_fill: None,
         resize_mode: DiffusionImg2ImgResizeMode::Image,
         denoising_strength: 1.0,
+        refine_sigma: None,
     };
 
     let output = pipeline.generate_img2img_batch(request).unwrap();
@@ -1106,6 +1114,7 @@ fn diffusion_pipeline_img2img_latent_resize_mode_resizes_encoded_latents() {
         inpainting_fill: None,
         resize_mode: DiffusionImg2ImgResizeMode::Latent,
         denoising_strength: 1.0,
+        refine_sigma: None,
     };
 
     let output = pipeline.generate_img2img_batch(request).unwrap();
@@ -1429,6 +1438,7 @@ fn generate_img2img_runtime_options_route_vae_mask_boundaries_when_gpu_is_availa
         inpainting_fill: None,
         resize_mode: DiffusionImg2ImgResizeMode::Image,
         denoising_strength: 1.0,
+        refine_sigma: None,
     };
 
     let output = pipeline
@@ -2078,6 +2088,7 @@ fn diffusion_pipeline_open_hfq_generates_img2img_png_with_native_tiny_components
         inpainting_fill: None,
         resize_mode: DiffusionImg2ImgResizeMode::Image,
         denoising_strength: 1.0,
+        refine_sigma: None,
     };
 
     let output = pipeline.generate_img2img_batch(request).unwrap();

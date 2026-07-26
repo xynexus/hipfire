@@ -9,9 +9,9 @@ the relevant docs under `docs/`.
 
 ## Core Invariants
 
-- hipfire is Rust + HIP/ROCm-direct inference. Do not put Python in the
-  inference hot path; Python is allowed for tooling, benchmarks, and comparison
-  baselines.
+- hipfire is Rust + HIP/ROCm-direct inference and production tooling. Do not
+  put Python in production tooling; Python is allowed for experiments,
+  benchmarks, diagnostics, and comparison baselines/oracles.
 - Do not add Vulkan, wgpu, or a cross-vendor compute backend. The backend is
   HIP/ROCm-direct.
 - Treat portability as a design constraint. When touching runtime, dispatch,
@@ -34,30 +34,26 @@ the relevant docs under `docs/`.
 
 ## Branch And Git
 
-- Branch model: `chaingun` is this fork's main branch — the active development
-  line where all work lands. `master` is NOT downstream of `chaingun`; it is
-  kept only as a landing spot for cherry-picks from `origin`/upstream. The two
-  have diverged and are not meant to be reconciled by merging.
-- Because of that model, do **not** merge `chaingun` into `master` (nor treat a
-  `chaingun`→`master` merge as a routine "merge and push"). Integration flows the
-  other way: cherry-pick specific upstream commits from `master` into `chaingun`
-  when you want them. Only touch `master` when the user explicitly asks to
-  land or cherry-pick an upstream commit there.
-- Use `chaingun` as the reference branch for further work. New work should
-  happen directly on `chaingun` or be explicitly based on and compared against
-  `chaingun`; do not treat `master` as the active baseline unless the user says
-  so.
-- Before meaningful changes, pull/rebase from the `chaingun` reference when the
-  worktree state allows it.
+- `master` is the default integration branch and the reference for new work.
+  The former pre-fork `master` history is preserved as the archival
+  `master-prefork` branch; do not base new work on it or merge it wholesale into
+  `master` unless the user explicitly requests historical recovery work.
+- Start feature and fix work from an up-to-date `upstream/master` on a descriptive
+  topic branch. Prefer reviewed pull requests for integration; commit or push
+  directly to `master` only when the user explicitly requests that workflow.
+- Before meaningful changes, fetch `upstream` and rebase or merge the topic branch
+  onto the latest `upstream/master` when the worktree state allows it. Do not
+  rewrite published shared history without explicit approval.
 - Preserve unrelated user changes. When committing or pushing, stage only files
   that belong to the current task and use descriptive messages.
 
 ## Verification
 
 - Run `./tests/no-gpu-ci.sh` before handing off workflow-only changes.
-- `./tests/coherence-gate-dflash.sh` is the canonical correctness gate after
-  changes touching kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
-  or the spec-decode path.
+- `./tests/tiny-affected-gate.sh --require-coverage` is the automatic GPU
+  correctness front tier for covered runtime and quantization changes.
+- `./tests/coherence-gate-dflash.sh` remains available as a manual
+  DFlash/DDTree diagnostic; it is not an automatic or mandatory gate.
 - Model/runtime admission evidence belongs in `hipfire-eval` batteries or
   suites first. Shell gates should remain enforcement wrappers when they still
   provide baseline comparison or hook integration.
@@ -70,19 +66,26 @@ the relevant docs under `docs/`.
 
 Canonical artifact shape:
 
-`<family>[-]<version>-<size[-effective/active]>[-tag1][-tag2...][.feature1[.feature2...]].<format>[.arch].hfq`
+`<family>[-]<version>-<size[-effective/active]>[-tag1][-tag2...]--[feature1.[feature2.]...]<quant>[.arch].hfq`
 
-Periods are used to separate groups known to hipfire.
+A double hyphen `--` separates the human-readable model name from the
+machine-readable groups; periods separate groups within the machine section.
 Examples:
-- LFM2.5-1.2B-Thinking.bf16.hfq
-- Qwen3.5-122B-A10B.mtp.vl.mq2l.hfq
-- Gemma-4-8B-E4B-it-heretic-QAT.dflash.triattn.oq4++.gfx1151.hfq
-- MedGemma-27B-it.triattn.hfq
+- LFM2.5-1.2B-Thinking--bf16.hfq
+- Qwen3.5-122B-A10B--mtp.vl.mq2l.hfq
+- Gemma-4-8B-E4B-it-heretic-QAT--dflash.triattn.oq4++.gfx1151.hfq
+- MedGemma-27B-it.triattn.hfq (role sidecar — keeps a dotted role suffix, see below)
 
 This system allows machine parsing by working backwards:
 - last field is always hfq
-- dots separate machine-readable fields
-- dashes separate human-readable fields, aside from size and effective/active size
+- a double hyphen `--` marks the boundary: everything left of it is the
+  human-readable model name, everything right of it is the machine-readable
+  section (features, then quant, then optional arch)
+- within the machine section, dots separate fields
+- single dashes separate human-readable fields in the model name, aside from
+  size and effective/active size
+- role sidecars keep a dotted role suffix (`.dflash.hfq`, `.triattn.hfq`, …);
+  the `--` boundary is only for bundled model artifacts that carry a quant
 
 Quant tokens use this shape:
 
@@ -107,13 +110,17 @@ Notes:
 - Put calibration or transform modifiers that are not part of the quant token
   before it. Lloyd is part of the quant token: use `mq3l`, not `lloyd-mq3`.
 - Do not use `+` for bundled roles or feature sidecars. Encode each feature as
-  its own dot group before the quant token, for example `.mtp.vl.mq4.hfq` or
-  `.dflash.triattn.oq4++.hfq`.
+  its own dot group after the `--` boundary and before the quant token, for
+  example `Model--mtp.vl.mq4.hfq` or `Model--dflash.triattn.oq4++.hfq`.
 - Use role sidecars when loaded independently: `.mtp.hfq`, `.dflash.hfq`,
   `.jinja.`, `.hessian` and `.triattn.hfq`.
-- The quant should detail the weight encoding. eg. Lloyd MQ2 uses `.mq2l.hfq`,
-  Magnum uses `.mq4.hfq`
+- The quant should detail the weight encoding. eg. Lloyd MQ2 uses `--mq2l.hfq`,
+  Magnum uses `--mq4.hfq`
 - `arch` must start with gfx followed by 3 or 4 numbers. eg. gfx906, gfx1103, gfx1151, gfx1201
+- New artifacts use the `--` boundary. The older all-dotted form
+  (`Model.mq4.hfq`) stays parseable so existing on-disk artifacts keep loading;
+  emit `--` for anything you create and rename dotted names to `--` when you
+  touch them.
 - When a script, gate, registry, or doc uses an older format, update it to the
   canonical naming convention as part of the fix.
 - Remove legacy-name fallback whenever you find it

@@ -96,7 +96,10 @@ fn main() {
         4,
         false,
         false,
+        false, // similarity_merge
         15.0,
+        15.0,
+        false,
     );
     let nvc = cold.n_valid;
     let ns = cold.n_slots; // padded even — tile width
@@ -162,7 +165,7 @@ fn main() {
     let md = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
     let ld = gpu.alloc_tensor(&[NH], DType::F32).unwrap();
     gpu.attention_cold_slots(
-        &qd, &kdq, &vdq, &od, &md, &ld, NH, NKV, nvc, scale, 1, ns, None,
+        &qd, &kdq, &vdq, &od, &md, &ld, NH, NKV, nvc, scale, 1, 1, ns, None, 256,
     )
     .unwrap();
 

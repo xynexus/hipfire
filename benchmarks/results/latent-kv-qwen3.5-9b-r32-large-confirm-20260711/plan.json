@@ -1,0 +1,335 @@
+{
+  "admission_thresholds": {
+    "frozen_before_heldout": true,
+    "heldout_evaluated": false,
+    "max_static_vs_oracle_kld_delta": 0.05,
+    "max_static_vs_oracle_ppl_ratio": 1.05
+  },
+  "artifact_sha256": "eeaa03d51cde4d57fc23a92736cb5b9cb37fd62224cf67c0e836f7845718ac53",
+  "calibration_contract": {
+    "basis_family": {
+      "assignment": "model_package_static",
+      "experts": 1,
+      "fit_split": "calibration_only",
+      "name": "shared_static_v0",
+      "runtime_stable_at_page_seal": true,
+      "selector_features": null,
+      "selector_fit": null
+    },
+    "calibration_lengths": [
+      32,
+      64
+    ],
+    "calibration_max_relative_offset": 63,
+    "calibration_position_offsets": [
+      0,
+      64
+    ],
+    "calibration_samples_per_stratum": 16,
+    "methods": {
+      "keys_queries": "post_rope_gqa_stacked_kq_svd",
+      "refinement": "measured_recal_kv_alternating_closed_form",
+      "same_cache_oracle": "per_cache_kq_svd_same_rank_same_capture",
+      "values": "kq_svd_closed_form_stacked_wo"
+    },
+    "prefix_stable": true,
+    "project_after_rope": true,
+    "ranks": [
+      32
+    ],
+    "stack_all_gqa_output_slices": true,
+    "stack_all_gqa_query_heads": true,
+    "stripe_width": 32,
+    "temperature_denominator": "sqrt(256)",
+    "validation_lengths": [
+      128,
+      256
+    ],
+    "validation_max_relative_offset": 255,
+    "validation_position_offsets": [
+      0,
+      256
+    ],
+    "validation_samples_per_stratum": 2
+  },
+  "created_at": "2026-07-11T09:17:39.978131+00:00",
+  "dataset": {
+    "calibration": {
+      "bytes": 229592,
+      "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-large-confirm-4b-20260711/c4-realnewslike-train-calibration.jsonl",
+      "sha256": "a2f116e44fe8e6617018432089f51801fbc27d7438c244f11e59ebb436686576"
+    },
+    "strict_split": true,
+    "validation": {
+      "bytes": 114710,
+      "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-large-confirm-4b-20260711/c4-realnewslike-validation.jsonl",
+      "sha256": "21f7fda4af8c313cb0bd10f3d7e71792b2cd86954df9487b5f8f4ecc56b2cecb"
+    }
+  },
+  "engine": {
+    "captured_at_utc": "2026-07-11T09:16:45Z",
+    "env": {
+      "HIPFIRE_ROPE_INTERLEAVED_LEGACY": null
+    },
+    "fingerprint_id": "868a910454c5ff5db6cb21bcb83be80f7577dc526ab0fca2c57d6a9c6ef5e36a",
+    "git": {
+      "branch": "chaingun",
+      "dirty": true,
+      "dirty_paths": [
+        "M .agents/skills/astrea/SKILL.md",
+        " M crates/hipfire-monitor/src/lib.rs",
+        " M scripts/astrea.py",
+        " M tests/test_astrea.py",
+        "?? benchmarks/corpora/",
+        "?? benchmarks/results/latent-kv-evaluator-invalidation-20260711.json",
+        "?? benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/",
+        "?? benchmarks/results/latent-kv-qwen3.5-0.8b-r32-c4-balanced-page-mixture-20260711/",
+        "?? benchmarks/results/latent-kv-qwen3.5-0.8b-r32-fineweb-wikitext-20260711/",
+        "?? benchmarks/results/latent-kv-qwen3.5-0.8b-r32-page-mixture-20260711/",
+        "?? benchmarks/results/latent-kv-qwen3.5-4b-r32-large-confirm-20260711/",
+        "?? docs/plans/2026-07-10-hierarchical-calibrated-latent-kv.md",
+        "?? docs/plans/2026-07-11-latent-kv-large-model-confirmation.md",
+        "?? scripts/astrea_latent_kv.py",
+        "?? scripts/prepare_latent_kv_corpus.py"
+      ],
+      "sha": "b0104d20fa28a3846fe7a08fb2ee85d5c6925cf6",
+      "short": "b0104d20f"
+    },
+    "root": "/home/sadara/hipfire",
+    "rope_convention_default": "halfsplit",
+    "schema": "hipfire.astrea.engine_fingerprint.v0",
+    "source_hashes": {
+      "crates/hipfire-arch-qwen35/src/qwen35/mod.rs": "05f175596aff95460b0909b03440b48447e16831d3274e331af83398a87c9759",
+      "crates/hipfire-rdna/src/dispatch/rope.rs": "7eaa882fbb477d30b387df14f66c7bbe92ce55330bb0b679d4d5a6f3e33223d0",
+      "crates/hipfire-rdna/src/kernels.rs": "1bf8fc0d1f59c630b1485a484f53df430deba894caeddb28558afe147ae6c28b",
+      "kernels/src/rope_partial_halfsplit.hip": "f7fed145f0b497e0e7100de678c2606ca0f80ff3b118ce342734526ac02182a1",
+      "kernels/src/rope_partial_halfsplit_batched.hip": "064c73d5919f4304ec88f1caf3a112a5924fc613853f1442b9640b9e7b4f4e62",
+      "kernels/src/rope_partial_interleaved.hip": "361c340a8244ef10190b5b8d9ae30fa70919656e7fa161995ce8ea0551c8f356",
+      "kernels/src/rope_partial_interleaved_batched.hip": "4084d575124df9a7bfc4c74599ec3e4335a41ec091bd2e49f890adfa21e6a4cc"
+    }
+  },
+  "model": {
+    "combined_sha256": "33acc6bc7b9874d4f1f75f7d7dc4cee23bf08e0dc7f9c5737109812524975167",
+    "config": {
+      "bytes": 3126,
+      "path": "/srv/huggingface/models--Qwen--Qwen3.5-9B/blobs/273ce437e01baf96a07cd9eb3d5f48bac8d7c657",
+      "sha256": "d0883072e01861ed0b2d47be3c16c36a8e81c224c7ffaa310c6558fb3f932b05"
+    },
+    "files": [
+      {
+        "bytes": 3126,
+        "path": "/srv/huggingface/models--Qwen--Qwen3.5-9B/blobs/273ce437e01baf96a07cd9eb3d5f48bac8d7c657",
+        "sha256": "d0883072e01861ed0b2d47be3c16c36a8e81c224c7ffaa310c6558fb3f932b05"
+      },
+      {
+        "bytes": 79657,
+        "path": "/srv/huggingface/models--Qwen--Qwen3.5-9B/blobs/e4c1cb7dba5096b43b9d92bc781aba5e3aa8acd8",
+        "sha256": "26d3539b516be613f39563617cb9d33b3f83d401298125be392c80cefb8f7fe5"
+      },
+      {
+        "bytes": 5276436216,
+        "path": "/srv/huggingface/models--Qwen--Qwen3.5-9B/blobs/db6f444b43d318c92f360a13a25561a6a65b10c0631b8ed305a426dbaa6c380e",
+        "sha256": "db6f444b43d318c92f360a13a25561a6a65b10c0631b8ed305a426dbaa6c380e"
+      },
+      {
+        "bytes": 5335161512,
+        "path": "/srv/huggingface/models--Qwen--Qwen3.5-9B/blobs/31c7d7e2dd5d207840b31cc59083c8f4c4718959149e0358c0364052bb9a0330",
+        "sha256": "31c7d7e2dd5d207840b31cc59083c8f4c4718959149e0358c0364052bb9a0330"
+      },
+      {
+        "bytes": 5368717440,
+        "path": "/srv/huggingface/models--Qwen--Qwen3.5-9B/blobs/7ec36ba3a4176a44c3c0876ad80c56a2f70c84bf008d82e9501df642f17dadec",
+        "sha256": "7ec36ba3a4176a44c3c0876ad80c56a2f70c84bf008d82e9501df642f17dadec"
+      },
+      {
+        "bytes": 3325995712,
+        "path": "/srv/huggingface/models--Qwen--Qwen3.5-9B/blobs/b62b0c4cd7e44edee103ee8f4fe225f246d5e768e07bfd5f25b63a8aa1fdd0c6",
+        "sha256": "b62b0c4cd7e44edee103ee8f4fe225f246d5e768e07bfd5f25b63a8aa1fdd0c6"
+      }
+    ],
+    "path": "/srv/huggingface/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a"
+  },
+  "model_contract": {
+    "attention_output_gate": true,
+    "family": "Qwen3.5",
+    "full_attention_layers": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23,
+      27,
+      31
+    ],
+    "gqa_query_heads_per_kv_head": 4,
+    "head_dim": 256,
+    "layer_types": [
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention"
+    ],
+    "num_attention_heads": 16,
+    "num_key_value_heads": 4,
+    "unsupported_contracts_fail_closed": true,
+    "value_output_contract": "gated_current_output_reconstruction"
+  },
+  "offline_engine": {
+    "evaluator_files": [
+      {
+        "bytes": 168217,
+        "path": "/home/sadara/hipfire/scripts/astrea.py",
+        "sha256": "018a3abd14143cd3bd6e2c7f9b101572daecedefbc374b7f2433c23364c50857"
+      },
+      {
+        "bytes": 93455,
+        "path": "/home/sadara/hipfire/scripts/astrea_latent_kv.py",
+        "sha256": "f51a711281a7523ff6e4baa19acda88adeeb00d3c657e1ad4ac17b10c234be6a"
+      }
+    ],
+    "fingerprint_id": "8e45df98071740c3422acb334e215e3e8e6bbd0c72fe2a2d76f5f7eeefee8319",
+    "kind": "transformers_cpu_text_reference",
+    "packages": {
+      "numpy": "1.26.4",
+      "safetensors": "0.8.0",
+      "torch": "2.9.0a0+gite101411",
+      "transformers": "5.10.2"
+    },
+    "torchvision_policy": "process_local_disabled_text_only"
+  },
+  "plan_id": "latent-kv-qwen3.5-9b-r32-large-confirm-20260711",
+  "reproducibility": {
+    "command_argv": [
+      "python3",
+      "scripts/astrea.py",
+      "latent-kv-plan",
+      "--model",
+      "/srv/huggingface/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+      "--calibration-dataset",
+      "benchmarks/corpora/latent-kv-large-confirm-4b-20260711/c4-realnewslike-train-calibration.jsonl",
+      "--validation-dataset",
+      "benchmarks/corpora/latent-kv-large-confirm-4b-20260711/c4-realnewslike-validation.jsonl",
+      "--calibration-length",
+      "32",
+      "--calibration-length",
+      "64",
+      "--calibration-position-offset",
+      "0",
+      "--calibration-position-offset",
+      "64",
+      "--validation-length",
+      "128",
+      "--validation-length",
+      "256",
+      "--validation-position-offset",
+      "0",
+      "--validation-position-offset",
+      "256",
+      "--calibration-samples-per-stratum",
+      "16",
+      "--validation-samples-per-stratum",
+      "2",
+      "--rank",
+      "32",
+      "--max-static-vs-oracle-kld-delta",
+      "0.05",
+      "--max-static-vs-oracle-ppl-ratio",
+      "1.05",
+      "--basis-family",
+      "shared_static_v0",
+      "--basis-experts",
+      "1",
+      "--plan-id",
+      "latent-kv-qwen3.5-9b-r32-large-confirm-20260711",
+      "--pretty",
+      "--out",
+      "benchmarks/results/latent-kv-qwen3.5-9b-r32-large-confirm-20260711/plan.json"
+    ],
+    "command_shell": "python3 scripts/astrea.py latent-kv-plan --model /srv/huggingface/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a --calibration-dataset benchmarks/corpora/latent-kv-large-confirm-4b-20260711/c4-realnewslike-train-calibration.jsonl --validation-dataset benchmarks/corpora/latent-kv-large-confirm-4b-20260711/c4-realnewslike-validation.jsonl --calibration-length 32 --calibration-length 64 --calibration-position-offset 0 --calibration-position-offset 64 --validation-length 128 --validation-length 256 --validation-position-offset 0 --validation-position-offset 256 --calibration-samples-per-stratum 16 --validation-samples-per-stratum 2 --rank 32 --max-static-vs-oracle-kld-delta 0.05 --max-static-vs-oracle-ppl-ratio 1.05 --basis-family shared_static_v0 --basis-experts 1 --plan-id latent-kv-qwen3.5-9b-r32-large-confirm-20260711 --pretty --out benchmarks/results/latent-kv-qwen3.5-9b-r32-large-confirm-20260711/plan.json",
+    "evaluator_files": [
+      {
+        "bytes": 168217,
+        "path": "/home/sadara/hipfire/scripts/astrea.py",
+        "sha256": "018a3abd14143cd3bd6e2c7f9b101572daecedefbc374b7f2433c23364c50857"
+      },
+      {
+        "bytes": 93455,
+        "path": "/home/sadara/hipfire/scripts/astrea_latent_kv.py",
+        "sha256": "f51a711281a7523ff6e4baa19acda88adeeb00d3c657e1ad4ac17b10c234be6a"
+      }
+    ],
+    "evaluator_sha256": "159d5e1f9f2b637dd331a3d4699871c16e89d6652c6b354b27563fd47b276646",
+    "python": "3.12.3 (main, Jun 19 2026, 12:46:00) [GCC 13.3.0]"
+  },
+  "rope": {
+    "attention_temperature": "1/sqrt(head_dim)",
+    "engine_convention": "halfsplit",
+    "mrope_interleaved": true,
+    "mrope_section": [
+      11,
+      11,
+      10
+    ],
+    "partial_rotary_factor": 0.25,
+    "projection_position": "post_rope",
+    "rope_theta": 10000000,
+    "rope_type": "default",
+    "sha256": "7044372884c06b70ab7c941da48acbece7628f9cc026cd4605e96e834006483e"
+  },
+  "runtime_contract": {
+    "cache_representation": "latent_only",
+    "default_enabled": false,
+    "full_context_kv_reconstruction_forbidden": true,
+    "gated_exception": {
+      "enabled": true,
+      "order": [
+        "latent_attention",
+        "R_v",
+        "sigmoid_gate",
+        "W_o"
+      ],
+      "scope": "current_query_head_attention_result_only"
+    },
+    "page_local_basis_exception": {
+      "arbitrary_late_reselection_forbidden": false,
+      "basis_id_stored_per_page": false,
+      "decision_point": null,
+      "enabled": false,
+      "open_page_source": null,
+      "post_seal_full_kv_retained": false,
+      "query_projection": "once_per_model_basis",
+      "source_retention_accounting_required": false
+    }
+  },
+  "schema": "hipfire.astrea.latent_kv_plan.v0",
+  "status": "planned_pre_heldout"
+}

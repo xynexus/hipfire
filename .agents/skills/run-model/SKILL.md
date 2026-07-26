@@ -96,8 +96,8 @@ The dev machine has a Radeon 8060S with 512 MB carve-out. Models that fit:
 
 | Model | File | Notes |
 |-------|------|-------|
-| qwen3.5-0.8b | `~/.hipfire/models/qwen3.5-0.8b.mq6.hfq` | Good smoke target |
-| qwen3.5-35b-a3b | `~/.hipfire/models/qwen3.5-35b-a3b.mq6.hfq` | Small MoE, K_TOP=8 |
+| qwen3.5-0.8b | `~/.hipfire/models/qwen3.5-0.8b--mq6.hfq` | Good smoke target |
+| qwen3.5-35b-a3b | `~/.hipfire/models/qwen3.5-35b-a3b--mq6.hfq` | Small MoE, K_TOP=8 |
 
 ## 397B paged-expert model
 
@@ -161,6 +161,9 @@ Verifies HFQM v2 metadata-only load without touching expert payloads:
 ## Coherence gate after kernel/dispatch changes
 
 ```bash
-./scripts/coherence-gate-dflash.sh
+./tests/tiny-affected-gate.sh --require-coverage   # automatic correctness front tier
+./tests/coherence-gate-dflash.sh                   # optional manual DFlash/DDTree diagnostic
 ```
-Always run this after touching kernels, quant formats, or the paged-expert path.
+Run the tiny-affected gate after touching kernels, quant formats, or the
+paged-expert path; the DFlash gate is an optional manual DFlash/DDTree
+diagnostic.

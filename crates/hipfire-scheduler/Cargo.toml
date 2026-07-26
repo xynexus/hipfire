@@ -8,4 +8,7 @@ description = "Priority scheduling and session batching policy for hipfire"
 [dependencies]
 hipfire-model = { path = "../hipfire-model" }
 hipfire-state = { path = "../hipfire-state" }
+# For the canonical WorkloadClass -> billing (auth) class mapping. auth has no
+# hipfire deps, so this stays acyclic.
+hipfire-auth = { path = "../hipfire-auth" }
 serde_json = "1"

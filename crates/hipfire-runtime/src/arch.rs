@@ -46,11 +46,13 @@
 //!      time.
 
 use crate::hfq::HfqFile;
+use crate::tool_call::{Gemma4OutputEvent, Gemma4OutputState};
+use hipfire_generate::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
+use hipfire_rdna::{Gpu, GpuTensor};
 use hipfire_state::{
     SequenceStateArenaBackend, SequenceStateCheckpointRequest, SequenceStateForkRequest,
     SequenceStatePageDescriptor,
 };
-use hipfire_rdna::{Gpu, GpuTensor};
 use std::time::Instant;
 
 /// Bring-up contract for a hipfire architecture.
@@ -233,6 +235,12 @@ pub struct LoopGuardOverrides {
 /// to (don't replace) the runtime config.
 #[derive(Debug, Clone, Default)]
 pub struct SamplerOverrides {
+    /// Checkpoint-recommended temperature used when the request leaves it unset.
+    pub temperature: Option<f32>,
+    /// Checkpoint-recommended nucleus cutoff used when the request leaves it unset.
+    pub top_p: Option<f32>,
+    /// Checkpoint-recommended candidate cutoff used when the request leaves it unset.
+    pub top_k: Option<usize>,
     /// Tokens to add to `SamplerConfig::blocked_tokens` for this arch
     /// (e.g. arch-specific `<tool_call>` opener IDs that the model
     /// emits in attractor loops). Appended to the runtime list, not
@@ -267,7 +275,7 @@ pub struct EosFilterOverrides {
     /// Byte sequences that signal end-of-turn for this arch. Streaming
     /// stops (and the marker is not emitted) when the decoded byte
     /// stream contains any sequence here.
-    /// Examples: Gemma4's `<end_of_turn>` (when forward-ported).
+    /// Example: a profile whose terminators share a textual prefix.
     pub stop_at: Vec<Vec<u8>>,
     /// Byte prefixes the streamer holds back until disambiguated.
     /// Required so a partial decode of a `stop_at` marker doesn't leak
@@ -391,6 +399,7 @@ pub struct GenerateCtx<'a> {
     pub prompt: &'a str,
     pub temperature: f32,
     pub top_p: f32,
+    pub top_k: usize,
     pub max_tokens: usize,
     pub repeat_penalty: f32,
     pub repeat_window: usize,
@@ -399,6 +408,13 @@ pub struct GenerateCtx<'a> {
     pub max_think_tokens: usize,
     /// Visible-stream stop sequences (in addition to EOS).
     pub stop_sequences: &'a [String],
+    /// Prefixes held by the shared EOS filter until a possible stop marker is
+    /// disambiguated across token/UTF-8 boundaries.
+    pub output_holdback_prefixes: &'a [Vec<u8>],
+    /// Whether the shared legacy `<think>` filter is active. Native channel
+    /// grammars use `output_protocol` instead.
+    pub strip_think: bool,
+    pub output_protocol: OutputProtocol,
     /// Raw encoded image bytes for a multimodal request — one entry per image,
     /// in prompt order (empty for a text-only request). A video is decoded to a
     /// stack of frames upstream, each frame appearing here as one image. The
@@ -438,7 +454,132 @@ pub trait ServingBackend: Send {
     fn reset_session(&mut self, gpu: &mut Gpu, session_id: &str) -> Result<(), String>;
     /// Release GPU resources (consumes the boxed backend on unload).
     fn unload(self: Box<Self>, gpu: &mut Gpu);
+
+    /// Optional evaluation view for plain autoregressive backends. Keeping this
+    /// on the boxed seam lets capability consumers avoid downcasts or a second
+    /// typed slot in `LoadedModel`.
+    fn kld_forward(&mut self) -> Option<&mut dyn crate::kld_eval::ChunkScoredForward> {
+        None
+    }
 }
+
+/// Shape metadata returned alongside a boxed backend. This is deliberately
+/// host-only: status, admission, and intervention routing can inspect a model
+/// without recovering its concrete architecture type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModelShapeProfile {
+    pub hidden_size: usize,
+    pub num_layers: usize,
+    pub vocab_size: usize,
+    pub intermediate_size: usize,
+}
+
+/// Prompt and generation policy paired with a factory-loaded backend.
+///
+/// `bos_token` is an optional literal override for upstream Jinja templates
+/// whose tokenizer metadata exposes a cosmetic/noncanonical BOS decoding.
+#[derive(Clone, Debug, Default)]
+pub struct PromptGenerationProfile {
+    pub prompt: PromptFrameOverrides,
+    pub sampler: SamplerOverrides,
+    pub loop_guard: LoopGuardOverrides,
+    pub eos_filter: EosFilterOverrides,
+    /// Registry-selected output grammar. The shared decode loop uses this to
+    /// separate visible text, hidden reasoning, and structured tool calls
+    /// without architecture-id branches in the daemon.
+    pub output_protocol: OutputProtocol,
+    pub bos_token: Option<&'static str>,
+    /// Refuse a missing or failed embedded Jinja render instead of silently
+    /// substituting the shared ChatML/plain approximation.
+    pub require_official_template: bool,
+}
+
+/// Structured-output grammar selected by a registered backend profile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputProtocol {
+    #[default]
+    Plain,
+    Gemma4Native,
+}
+
+/// One generic resident slot: the coarse-grained serving object plus all
+/// architecture policy needed by the serving layer.
+pub struct FactoryLoadedBackend {
+    pub backend: Box<dyn ServingBackend>,
+    pub family: &'static str,
+    pub shape: ModelShapeProfile,
+    pub profile: PromptGenerationProfile,
+    pub physical_cap: usize,
+}
+
+/// Load-time inputs shared by every registered factory. Physical context is
+/// explicit so a family with a very large advertised context cannot silently
+/// allocate it in full during bring-up.
+pub struct ServingFactoryOptions<'a> {
+    pub max_seq: usize,
+    pub kv_mode: &'a str,
+    /// Parsed heterogeneous CASK package selected by the shared component
+    /// resolver. Registered families validate their own per-layer geometry.
+    pub triattn: Option<&'a crate::triattn::TriAttnArtifact>,
+    pub cask_budget: usize,
+    pub cask_beta: usize,
+    pub physical_cap: Option<usize>,
+}
+
+/// Object-safe architecture construction seam. Implementations live beside
+/// their typed config/weights/state and register through inventory; the daemon
+/// performs a data lookup instead of adding an `arch_id` branch.
+pub trait ServingFactory: Sync + 'static {
+    fn arch_id(&self) -> u32;
+    fn family(&self) -> &'static str;
+    fn load(
+        &self,
+        hfq: &mut HfqFile,
+        gpu: &mut Gpu,
+        options: &ServingFactoryOptions<'_>,
+    ) -> Result<FactoryLoadedBackend, String>;
+}
+
+#[doc(hidden)]
+pub struct ServingFactoryEntry {
+    pub factory: &'static dyn ServingFactory,
+}
+
+inventory::collect!(ServingFactoryEntry);
+
+/// Resolve the single registered factory for an on-disk architecture id.
+/// Duplicate registrations are an explicit error rather than link-order
+/// dependent behavior.
+pub fn serving_factory(arch_id: u32) -> Result<Option<&'static dyn ServingFactory>, String> {
+    let mut matches = inventory::iter::<ServingFactoryEntry>
+        .into_iter()
+        .filter(|entry| entry.factory.arch_id() == arch_id);
+    let Some(first) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "multiple serving factories registered for arch_id={arch_id}"
+        ));
+    }
+    Ok(Some(first.factory))
+}
+
+/// Register a serving-heavy architecture factory without adding it to the
+/// leaf/offline `hipfire-arch-api` capability crate.
+#[macro_export]
+macro_rules! register_serving_factory {
+    ($factory:path) => {
+        $crate::arch::__private_inventory::submit! {
+            $crate::arch::ServingFactoryEntry {
+                factory: &$factory as &'static dyn $crate::arch::ServingFactory,
+            }
+        }
+    };
+}
+
+#[doc(hidden)]
+pub use inventory as __private_inventory;
 
 /// Rich, **stateful** serving surface for the multi-session arches — qwen3.5
 /// (5/6) and lfm2-moe (11) — layered on top of [`ServingBackend`]. Where the
@@ -544,13 +685,12 @@ pub trait SessionServingBackend {
 const _: Option<&dyn SessionServingBackend> = None;
 
 /// Shared dense-AR serving loop: tokenize the (pre-framed) prompt → prefill →
-/// greedy-decode, streaming JSONL `token` events to `ctx.sink` and a final
+/// decode, streaming JSONL `token` events to `ctx.sink` and a final
 /// `done`, stopping on EOS / `max_tokens` / a `stop_sequences` match. Every
 /// `SimpleAr` backend's `ServingBackend::serve` delegates here, so the loop
 /// lives in ONE place instead of per-arch `generate_*` copies.
 ///
-/// Greedy for now (matches the bring-up examples); top-p / repeat-penalty /
-/// loop-guard thread in as the daemon's sampler is migrated behind this driver.
+/// Sampling uses the shared sampler and remains greedy when temperature is zero.
 pub fn run_simple_ar(
     gpu: &mut Gpu,
     backend: &mut dyn SimpleAr,
@@ -558,12 +698,26 @@ pub fn run_simple_ar(
     eos: u32,
     ctx: &mut GenerateCtx,
 ) -> Result<ServeOutcome, String> {
+    run_simple_ar_with_terminators(gpu, backend, tok, &[eos], ctx)
+}
+
+/// Multi-terminator form of [`run_simple_ar`]. This is required by checkpoints
+/// whose generation metadata declares more than one EOS id (for example Gemma 4
+/// instruction models use `[1, 106, 50]`). The explicit set augments the
+/// tokenizer's own `eos_id`/`eot_id` pair instead of replacing it.
+pub fn run_simple_ar_with_terminators(
+    gpu: &mut Gpu,
+    backend: &mut dyn SimpleAr,
+    tok: &crate::tokenizer::Tokenizer,
+    terminators: &[u32],
+    ctx: &mut GenerateCtx,
+) -> Result<ServeOutcome, String> {
     let ids = tok.encode(ctx.prompt);
     if ids.is_empty() {
         return Err("run_simple_ar: empty prompt after tokenize".to_string());
     }
     backend.prefill(gpu, &ids)?;
-    decode_loop(gpu, backend, tok, eos, ctx, ids.len(), ids.len())
+    decode_loop_with_terminators(gpu, backend, tok, terminators, ctx, ids.len(), ids.len())
 }
 
 /// Shared post-prefill greedy decode loop: from the just-prefilled
@@ -613,6 +767,81 @@ fn pick_next(
     ))
 }
 
+fn emit_output_bytes(
+    sink: &mut dyn std::io::Write,
+    id: &str,
+    protocol: OutputProtocol,
+    native: &mut Option<Gemma4OutputState>,
+    bytes: &[u8],
+) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    match protocol {
+        OutputProtocol::Plain => {
+            if !text.is_empty() {
+                let event = serde_json::json!({ "type": "token", "id": id, "text": text });
+                let _ = writeln!(sink, "{event}");
+                let _ = sink.flush();
+            }
+            false
+        }
+        OutputProtocol::Gemma4Native => native
+            .as_mut()
+            .map(|state| emit_gemma4_output_events(sink, id, state.observe(text)))
+            .unwrap_or(false),
+    }
+}
+
+fn emit_gemma4_output_events(
+    sink: &mut dyn std::io::Write,
+    id: &str,
+    events: Vec<Gemma4OutputEvent>,
+) -> bool {
+    let mut emitted_tool_calls = false;
+    for event in events {
+        let envelope = match event {
+            Gemma4OutputEvent::Visible(text) => {
+                serde_json::json!({ "type": "token", "id": id, "text": text })
+            }
+            Gemma4OutputEvent::Reasoning(text) => {
+                serde_json::json!({ "type": "reasoning", "id": id, "text": text })
+            }
+            Gemma4OutputEvent::ToolCalls(calls) => {
+                emitted_tool_calls = true;
+                let calls = calls
+                    .into_iter()
+                    .map(|call| {
+                        serde_json::json!({
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::json!({ "type": "tool_calls", "id": id, "calls": calls })
+            }
+        };
+        let _ = writeln!(sink, "{envelope}");
+    }
+    let _ = sink.flush();
+    emitted_tool_calls
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DecodedNext {
+    Terminator(String),
+    Content(String),
+}
+
+fn decode_next(tok: &crate::tokenizer::Tokenizer, token: u32, terminators: &[u32]) -> DecodedNext {
+    let decoded = tok.decode(&[token]);
+    if terminators.contains(&token) || tok.is_terminator(token) {
+        DecodedNext::Terminator(decoded)
+    } else {
+        DecodedNext::Content(decoded)
+    }
+}
+
 /// Shared post-prefill decode loop: from the just-prefilled `backend.logits()`,
 /// pick the next token → stream a JSONL `token` event → `decode_step`, until EOS
 /// / `max_tokens` / a `stop_sequences` match / a single-token attractor, then a
@@ -629,11 +858,24 @@ pub fn decode_loop(
     start_pos: usize,
     prompt_tokens: usize,
 ) -> Result<ServeOutcome, String> {
-    decode_loop_with_timing(
+    decode_loop_with_terminators(gpu, backend, tok, &[eos], ctx, start_pos, prompt_tokens)
+}
+
+/// Multi-terminator form of [`decode_loop`].
+pub fn decode_loop_with_terminators(
+    gpu: &mut Gpu,
+    backend: &mut dyn SimpleAr,
+    tok: &crate::tokenizer::Tokenizer,
+    terminators: &[u32],
+    ctx: &mut GenerateCtx,
+    start_pos: usize,
+    prompt_tokens: usize,
+) -> Result<ServeOutcome, String> {
+    decode_loop_with_timing_terminators(
         gpu,
         backend,
         tok,
-        eos,
+        terminators,
         ctx,
         start_pos,
         prompt_tokens,
@@ -648,6 +890,30 @@ pub fn decode_loop_with_timing(
     backend: &mut dyn SimpleAr,
     tok: &crate::tokenizer::Tokenizer,
     eos: u32,
+    ctx: &mut GenerateCtx,
+    start_pos: usize,
+    prompt_tokens: usize,
+    timing: DecodeLoopTiming,
+) -> Result<ServeOutcome, String> {
+    decode_loop_with_timing_terminators(
+        gpu,
+        backend,
+        tok,
+        &[eos],
+        ctx,
+        start_pos,
+        prompt_tokens,
+        timing,
+    )
+}
+
+/// Multi-terminator form of [`decode_loop_with_timing`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_loop_with_timing_terminators(
+    gpu: &mut Gpu,
+    backend: &mut dyn SimpleAr,
+    tok: &crate::tokenizer::Tokenizer,
+    terminators: &[u32],
     ctx: &mut GenerateCtx,
     start_pos: usize,
     prompt_tokens: usize,
@@ -676,6 +942,7 @@ pub fn decode_loop_with_timing(
     let cfg = crate::sampler::SamplerConfig {
         temperature: ctx.temperature,
         top_p: ctx.top_p,
+        top_k: ctx.top_k,
         repeat_penalty: ctx.repeat_penalty,
         repeat_window: window,
         presence_penalty: ctx.presence_penalty,
@@ -699,38 +966,65 @@ pub fn decode_loop_with_timing(
         &mut rng_state,
     )?;
     let mut generated = 0usize;
-    let mut text = String::new();
     let mut stop = StopReason::MaxTokens;
+    let mut output_filter = EosFilter::new(EosFilterConfig {
+        strip_think: ctx.strip_think,
+        stop_at: ctx
+            .stop_sequences
+            .iter()
+            .filter(|stop| !stop.is_empty())
+            .map(|stop| stop.as_bytes().to_vec())
+            .collect(),
+        holdback_prefixes: ctx.output_holdback_prefixes.to_vec(),
+    });
+    let mut native_output = matches!(ctx.output_protocol, OutputProtocol::Gemma4Native)
+        .then(Gemma4OutputState::default);
+    let mut emitted_tool_calls = false;
 
     while generated < ctx.max_tokens {
-        // Stop on the explicit eos AND any tokenizer terminator (eos OR the
-        // end-of-turn token). gemma3's chat terminator is `<end_of_turn>`, which
-        // differs from `config.eos_token_id` (`<eos>`) — without the
-        // `is_terminator` check it would leak as literal text and the model would
-        // keep generating past the turn boundary.
-        if next == eos || tok.is_terminator(next) {
-            stop = StopReason::Eos;
-            break;
-        }
+        // Stop on explicit EOS or any tokenizer-declared terminator. Feed the
+        // decoded terminator only to the native state machine so a structural
+        // close token can complete a tool call; it is never emitted as text.
+        let frag = match decode_next(tok, next, terminators) {
+            DecodedNext::Terminator(marker) => {
+                if matches!(ctx.output_protocol, OutputProtocol::Gemma4Native) {
+                    if let Some(state) = native_output.as_mut() {
+                        emitted_tool_calls |=
+                            emit_gemma4_output_events(ctx.sink, ctx.id, state.observe(&marker));
+                    }
+                }
+                stop = StopReason::Eos;
+                break;
+            }
+            DecodedNext::Content(frag) => frag,
+        };
         // Safety net for a single-token attractor that slips past the penalty
         // (or when penalty is off): if the same token would extend a run of 12,
         // stop rather than emit a wall of garbage.
         if committed.len() >= 11 && committed[committed.len() - 11..].iter().all(|&t| t == next) {
             break;
         }
-        let frag = tok.decode(&[next]);
-        text.push_str(&frag);
-        if ctx
-            .stop_sequences
-            .iter()
-            .any(|s| !s.is_empty() && text.contains(s.as_str()))
-        {
+        let filter_action = output_filter.observe(frag.as_bytes());
+        let stop_after_emit = matches!(
+            filter_action,
+            FilterAction::Stop | FilterAction::StopEmit(_)
+        );
+        match filter_action {
+            FilterAction::Emit(bytes) | FilterAction::StopEmit(bytes) => {
+                emitted_tool_calls |= emit_output_bytes(
+                    ctx.sink,
+                    ctx.id,
+                    ctx.output_protocol,
+                    &mut native_output,
+                    &bytes,
+                );
+            }
+            FilterAction::Hold | FilterAction::Stop => {}
+        }
+        if stop_after_emit {
             stop = StopReason::StopSequence;
             break;
         }
-        let ev = serde_json::json!({ "type": "token", "id": ctx.id, "text": frag });
-        let _ = writeln!(ctx.sink, "{ev}");
-        let _ = ctx.sink.flush();
         if first_token_ms.is_none() {
             first_token_ms = Some(decode_t0.elapsed().as_secs_f64() * 1000.0);
         }
@@ -751,6 +1045,20 @@ pub fn decode_loop_with_timing(
         )?;
     }
 
+    if !matches!(stop, StopReason::StopSequence) {
+        let pending = output_filter.flush_pending();
+        emitted_tool_calls |= emit_output_bytes(
+            ctx.sink,
+            ctx.id,
+            ctx.output_protocol,
+            &mut native_output,
+            &pending,
+        );
+    }
+    if let Some(state) = native_output.as_mut() {
+        emitted_tool_calls |= emit_gemma4_output_events(ctx.sink, ctx.id, state.finish());
+    }
+
     let _ = gpu.hip.device_synchronize();
     let decode_ms = decode_t0.elapsed().as_secs_f64() * 1000.0;
     let decode_secs = (decode_ms / 1000.0).max(1.0e-9);
@@ -763,10 +1071,14 @@ pub fn decode_loop_with_timing(
         (None, Some(first)) => Some(first),
         _ => None,
     };
-    let finish_reason = match stop {
-        StopReason::MaxTokens if generated >= ctx.max_tokens => "length",
-        StopReason::MaxTokens => "stop",
-        StopReason::Eos | StopReason::StopSequence => "stop",
+    let finish_reason = if emitted_tool_calls {
+        "tool_calls"
+    } else {
+        match stop {
+            StopReason::MaxTokens if generated >= ctx.max_tokens => "length",
+            StopReason::MaxTokens => "stop",
+            StopReason::Eos | StopReason::StopSequence => "stop",
+        }
     };
     let done = serde_json::json!({
         "type": "done",
@@ -791,4 +1103,40 @@ pub fn decode_loop_with_timing(
         decode_ms: Some(decode_ms),
         ttft_ms,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_next, DecodedNext};
+    use crate::tokenizer::Tokenizer;
+
+    #[test]
+    fn metadata_terminators_are_never_classified_as_visible_content() {
+        let json = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {"<unk>": 0, "</s>": 1, "x": 2, "<end_of_turn>": 50, "<end_of_message>": 106},
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 1, "content": "</s>", "special": true},
+                {"id": 50, "content": "<end_of_turn>", "special": true},
+                {"id": 106, "content": "<end_of_message>", "special": true}
+            ]
+        })
+        .to_string();
+        let tok = Tokenizer::from_hf_json(&json).unwrap();
+        let terminators = [1, 106, 50];
+
+        for token in terminators {
+            assert!(matches!(
+                decode_next(&tok, token, &terminators),
+                DecodedNext::Terminator(_)
+            ));
+        }
+        assert_eq!(
+            decode_next(&tok, 2, &terminators),
+            DecodedNext::Content("x".to_string())
+        );
+    }
 }

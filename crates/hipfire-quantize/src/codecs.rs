@@ -496,6 +496,82 @@ pub fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
     }
 }
 
+fn mixed_overlay_indices(group: &[f32; 256], scale: f32, n_out: usize) -> [usize; 256] {
+    let inv = 1.0 / scale.max(1e-12);
+    let gain = |index: usize| -> f32 {
+        let value = group[index];
+        let q4 = (value * inv).round().clamp(-7.0, 7.0);
+        let q8 = (value * inv).round().clamp(-127.0, 127.0);
+        let error4 = value - q4 * scale;
+        let error8 = value - q8 * scale;
+        error4 * error4 - error8 * error8
+    };
+    let mut indices: [usize; 256] = core::array::from_fn(|index| index);
+    indices[..].sort_unstable_by(|&left, &right| {
+        gain(right)
+            .partial_cmp(&gain(left))
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then_with(|| left.cmp(&right))
+    });
+    debug_assert!((1..=255).contains(&n_out));
+    indices
+}
+
+fn mixed_overlay_error(
+    group: &[f32; 256],
+    scale: f32,
+    indices: &[usize; 256],
+    n_out: usize,
+) -> f32 {
+    let inv = 1.0 / scale.max(1e-12);
+    let mut is_w8 = [false; 256];
+    for &index in &indices[..n_out] {
+        is_w8[index] = true;
+    }
+    group
+        .iter()
+        .enumerate()
+        .map(|(index, &value)| {
+            let limit = if is_w8[index] { 127.0 } else { 7.0 };
+            let quantized = (value * inv).round().clamp(-limit, limit);
+            let error = value - quantized * scale;
+            error * error
+        })
+        .sum()
+}
+
+fn refit_mixed_scale(
+    group: &[f32; 256],
+    indices: &[usize; 256],
+    n_out: usize,
+    fallback: f32,
+) -> f32 {
+    const CLIP_GRID: [f32; 14] = [
+        1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35,
+    ];
+    let amax = group.iter().fold(0.0f32, |max, value| max.max(value.abs()));
+    let mut best_scale = fallback.max(1e-12);
+    let mut best_error = mixed_overlay_error(group, best_scale, indices, n_out);
+    for clip in CLIP_GRID {
+        let scale = (clip * amax / 7.0).max(1e-12);
+        let error = mixed_overlay_error(group, scale, indices, n_out);
+        if error < best_error {
+            best_scale = scale;
+            best_error = error;
+        }
+    }
+    best_scale
+}
+
+fn mixed_clipsearch(group: &[f32; 256], n_out: usize) -> (f32, [usize; 256]) {
+    let initial_scale = symmetric_clipsearch(group, 7.0);
+    let initial_indices = mixed_overlay_indices(group, initial_scale, n_out);
+    let first_scale = refit_mixed_scale(group, &initial_indices, n_out, initial_scale);
+    let refined_indices = mixed_overlay_indices(group, first_scale, n_out);
+    let refined_scale = refit_mixed_scale(group, &refined_indices, n_out, first_scale);
+    (refined_scale, refined_indices)
+}
+
 /// MQ6+ : MQ6G256 with clip-searched affine range (identical 200-byte layout).
 pub fn quantize_mq6g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let (group_size, block_bytes) = (256usize, bb(QuantType::MQ6G256));
@@ -766,6 +842,73 @@ pub fn dequant_oq3g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) ->
     out
 }
 
+/// Opus-Quant W2 weight codec (Oq2G256). Per 256-group block =
+/// `[f16 scale][64 B 2-bit-packed]` = 66 B/group (2.0625 b/w). FWHT-256 rotated,
+/// symmetric clip-searched scale, `q in [-1, 1]` (signed 2-bit → 3 levels; the
+/// −2 code is unused to keep the range symmetric). 4 weights per byte. Dequant:
+/// `scale · sext2`, inverse FWHT. Quality-marginal on its own (see
+/// project_lowbit_quant_findings); intended for the Oq8-upcast serving path
+/// (`expand_oq2_to_oq8`), so the existing iu8 W8A8 kernels serve it without a
+/// dedicated W2 decode GEMV.
+pub fn quantize_oq2g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let (group_size, block_bytes) = (256usize, bb(QuantType::Oq2G256)); // 2 (f16 scale) + 64 (2-bit×256)
+    let n = f32_data.len();
+    let n_blocks = n.div_ceil(group_size);
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let scale = symmetric_clipsearch(&group, 1.0);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        let scale_f16 = f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        for byte_i in 0..64 {
+            let mut packed = 0u8;
+            for j in 0..4 {
+                let q = (group[byte_i * 4 + j] * inv).round().clamp(-1.0, 1.0) as i8;
+                packed |= ((q as u8) & 3) << (2 * j);
+            }
+            output[out_off + 2 + byte_i] = packed;
+        }
+    }
+    output
+}
+
+/// Dequantize OQ2G256 (round-trip oracle for the Opus W2 codec / tests).
+/// `[f16 scale][64 B 2-bit-packed]` per 256-group → reconstruct signed 2-bit
+/// two's-complement `scale·sext2`, inverse FWHT.
+pub fn dequant_oq2g256(data: &[u8], n: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+    let (group_size, block_bytes) = (256usize, bb(QuantType::Oq2G256));
+    let n_blocks = n.div_ceil(group_size);
+    let mut out = Vec::with_capacity(n_blocks * group_size);
+    for b in 0..n_blocks {
+        let off = b * block_bytes;
+        if off + block_bytes > data.len() {
+            break;
+        }
+        let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let mut grp = [0.0f32; 256];
+        for byte_i in 0..64 {
+            let packed = data[off + 2 + byte_i];
+            for j in 0..4 {
+                let u = (packed >> (2 * j)) & 3;
+                let signed = if u >= 2 { u as i32 - 4 } else { u as i32 };
+                grp[byte_i * 4 + j] = scale * signed as f32;
+            }
+        }
+        // inverse FWHT (forward with signs swapped)
+        cpu_fwht_256(&mut grp, signs2, signs1);
+        out.extend_from_slice(&grp);
+    }
+    out.truncate(n);
+    out
+}
+
 /// Opus-Quant W8A8 weight codec (Oq8G256). Per 256-group block =
 /// `[f16 scale][256 signed int8]` = 258 B/group (8.0625 b/w). FWHT-256 rotated,
 /// symmetric clip-searched scale, `q in [-127, 127]` (signed 8-bit, avoid -128 to
@@ -923,6 +1066,7 @@ pub fn quantize_oqplus_tiered(
             gain(c)
                 .partial_cmp(&gain(a))
                 .unwrap_or(core::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(&c))
         });
         let mut is_w8 = [false; 256];
         for &i in &idx[..n_out] {
@@ -968,23 +1112,8 @@ pub fn quantize_oqplus_compact(
         let mut group = [0.0f32; 256];
         group[..end - start].copy_from_slice(&f32_data[start..end]);
         cpu_fwht_256(&mut group, signs1, signs2);
-        let scale = symmetric_clipsearch(&group, 7.0);
+        let (scale, idx) = mixed_clipsearch(&group, n_out);
         let inv = 1.0 / scale;
-        // Top n_out by int8-upgrade gain (= the tiered codec's criterion).
-        let gain = |i: usize| -> f32 {
-            let v = group[i];
-            let q4 = (v * inv).round().clamp(-7.0, 7.0);
-            let q8 = (v * inv).round().clamp(-127.0, 127.0);
-            let e4 = v - q4 * scale;
-            let e8 = v - q8 * scale;
-            e4 * e4 - e8 * e8
-        };
-        let mut idx: [usize; 256] = core::array::from_fn(|i| i);
-        idx.sort_unstable_by(|&a, &c| {
-            gain(c)
-                .partial_cmp(&gain(a))
-                .unwrap_or(core::cmp::Ordering::Equal)
-        });
         let out_off = b * block_bytes;
         let scale_f16 = f32_to_f16(scale);
         output[out_off] = (scale_f16 & 0xFF) as u8;
@@ -2430,6 +2559,29 @@ mod tests {
     // (orthonormal FWHT preserves RMSE across the rotation).
 
     #[test]
+    fn oq2g256_roundtrip_and_geometry() {
+        let (s1, s2) = test_signs();
+        let data = test_data(600); // 2 full blocks + partial → 3 blocks
+        let encoded = quantize_oq2g256(&data, &s1, &s2);
+        assert_eq!(
+            encoded.len(),
+            3 * 66,
+            "oq2 block geometry (2 scale + 64 packed)"
+        );
+        let decoded = dequant_oq2g256(&encoded, data.len(), &s1, &s2);
+        assert_eq!(decoded.len(), data.len());
+        // 2-bit / 3-level is coarse; the round-trip must at least not diverge
+        // past the signal magnitude (std ~0.58 for U[-1,1)).
+        let e = rmse(&data, &decoded);
+        assert!(e < 0.7, "oq2 round-trip rmse too high: {e}");
+        assert_eq!(
+            encoded,
+            quantize_oq2g256(&data, &s1, &s2),
+            "oq2 encode nondeterministic"
+        );
+    }
+
+    #[test]
     fn mq4g256_roundtrip_within_tolerance() {
         let (s1, s2) = test_signs();
         let data = test_data(600); // 2 full blocks + partial
@@ -2616,5 +2768,24 @@ mod tests {
         assert!(one.is_finite() && one >= 0.0);
         let zeros = symmetric_clipsearch(&[0.0; 256], 7.0);
         assert!(zeros.is_finite());
+    }
+
+    #[test]
+    fn mixed_clipsearch_never_worsens_q4_seeded_overlay_error() {
+        let mut group = [0.0f32; 256];
+        for (index, value) in group.iter_mut().enumerate() {
+            *value = ((index as f32 * 0.173).sin() * 1.7) + if index % 47 == 0 { 9.0 } else { 0.0 };
+        }
+        for n_out in [1, 3, 7, 15] {
+            let initial_scale = symmetric_clipsearch(&group, 7.0);
+            let initial_indices = mixed_overlay_indices(&group, initial_scale, n_out);
+            let initial_error = mixed_overlay_error(&group, initial_scale, &initial_indices, n_out);
+            let (refined_scale, refined_indices) = mixed_clipsearch(&group, n_out);
+            let refined_error = mixed_overlay_error(&group, refined_scale, &refined_indices, n_out);
+            assert!(
+                refined_error <= initial_error + 1e-6,
+                "n_out={n_out}: refined {refined_error} > initial {initial_error}"
+            );
+        }
     }
 }

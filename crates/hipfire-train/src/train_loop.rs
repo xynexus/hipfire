@@ -14,7 +14,7 @@ use crate::ssm_drafter::{
     free_ssm_drafter_acts, free_ssm_drafter_grads, ssm_drafter_backward, ssm_drafter_forward_train,
     SsmDrafter,
 };
-use hipfire_rdna::{DType, Gpu, HipResult};
+use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
 
 /// Training hyperparameters. The eval split is the LAST `n_eval` chunks (the
 /// caller is expected to have shuffled, so that tail is a random hold-out).
@@ -137,20 +137,39 @@ pub fn eval_ssm_drafter(
     )
 }
 
-/// Train an SSM drafter to reproduce the target's mid-layer block ranking.
-/// `on_epoch(epoch, train_loss, eval, best, best_epoch)` fires on eval epochs.
-/// Returns the best-eval/bar/final report; the drafter's weights are left at
-/// their FINAL (not necessarily best) state — caller checkpoints on best if it
-/// wants the generalizing model.
-pub fn train_ssm_drafter_loop(
+/// Cross-epoch state for a resumable drafter training run. Held resident by the
+/// daemon between micro-step quanta so `train_drafter` time-slices with
+/// interactive serving. `drafter_loop_init` → N× `drafter_loop_run_epochs` →
+/// `drafter_loop_finish` reproduces `train_ssm_drafter_loop` byte-for-byte.
+pub struct DrafterLoopState {
+    pub opt: AdamW,
+    pub scores_dev: GpuTensor,
+    pub best_eval: f32,
+    pub best_epoch: usize,
+    pub final_eval: f32,
+    pub best_weights: Vec<Vec<f32>>,
+    pub bar: f32,
+    /// Next epoch to run (0..cfg.epochs).
+    pub ep: usize,
+    // Derived constants (computed once in init, constant for the run).
+    n_train: usize,
+    nb: usize,
+    last: usize,
+    kvd: usize,
+    pos: Vec<f32>,
+}
+
+/// Set up the loop: compute `bar`, build the optimizer + scores scratch, and
+/// init best-eval tracking. Verbatim from the pre-`for ep` head of the whole-run
+/// loop; `st.ep` starts at 0.
+pub fn drafter_loop_init(
     gpu: &mut Gpu,
     drafter: &SsmDrafter,
     chunks: &[Vec<u32>],
     label_mid: &[Vec<f32>],
     base_shallow: &[Vec<f32>],
     cfg: &TrainCfg,
-    mut on_epoch: impl FnMut(usize, f32, f32, f32, usize, Option<f32>),
-) -> HipResult<DrafterTrainReport> {
+) -> HipResult<DrafterLoopState> {
     let nb = cfg.seq / cfg.block;
     let last = cfg.seq - 1;
     let n_chunks = chunks.len();
@@ -164,42 +183,69 @@ pub fn train_ssm_drafter_loop(
         / cfg.n_eval as f32;
 
     let sizes = drafter.param_sizes();
-    let mut opt = AdamW::new(gpu, &sizes, cfg.lr, 0.9, 0.999, 1e-8, cfg.wd)?;
+    let opt = AdamW::new(gpu, &sizes, cfg.lr, 0.9, 0.999, 1e-8, cfg.wd)?;
     let scores_dev = gpu.zeros(&[nb], DType::F32)?;
 
-    let mut best_eval = f32::NEG_INFINITY;
-    let mut best_epoch = 0usize;
-    let mut final_eval = 0.0f32;
-    let mut best_weights: Vec<Vec<f32>> = Vec::new();
+    Ok(DrafterLoopState {
+        opt,
+        scores_dev,
+        best_eval: f32::NEG_INFINITY,
+        best_epoch: 0,
+        final_eval: 0.0,
+        best_weights: Vec::new(),
+        bar,
+        ep: 0,
+        n_train,
+        nb,
+        last,
+        kvd,
+        pos,
+    })
+}
 
-    for ep in 0..cfg.epochs {
+/// Run epochs `st.ep .. ep_end` (advancing `st.ep`). The per-epoch body is
+/// verbatim from the whole-run loop. `on_epoch(epoch, train_loss, eval, best,
+/// best_epoch, train_corr)` fires on eval epochs.
+pub fn drafter_loop_run_epochs(
+    gpu: &mut Gpu,
+    drafter: &SsmDrafter,
+    chunks: &[Vec<u32>],
+    label_mid: &[Vec<f32>],
+    cfg: &TrainCfg,
+    st: &mut DrafterLoopState,
+    ep_end: usize,
+    mut on_epoch: impl FnMut(usize, f32, f32, f32, usize, Option<f32>),
+) -> HipResult<()> {
+    while st.ep < ep_end {
+        let ep = st.ep;
         let mut ep_loss = 0.0f32;
-        for i in 0..n_train {
-            let acts = ssm_drafter_forward_train(gpu, drafter, &chunks[i], &pos)?;
+        for i in 0..st.n_train {
+            let acts = ssm_drafter_forward_train(gpu, drafter, &chunks[i], &st.pos)?;
             pflash_score_forward(
                 gpu,
                 &acts.score_k,
-                &scores_dev,
+                &st.scores_dev,
                 cfg.seq,
-                kvd,
+                st.kvd,
                 cfg.block,
-                nb,
-                last,
+                st.nb,
+                st.last,
             )?;
-            let pred = gpu.download_f32(&scores_dev)?;
+            let pred = gpu.download_f32(&st.scores_dev)?;
             // ListNet top-1: L = -Σ p_label log p_pred ; dL/dpred = (p_pred - p_label)/τ
             let pl = softmax_t(&label_mid[i], cfg.tau);
             let pp = softmax_t(&pred, cfg.tau);
-            let mut ds = vec![0.0f32; nb];
+            let mut ds = vec![0.0f32; st.nb];
             let mut l = 0.0f32;
-            for b in 0..nb {
+            for b in 0..st.nb {
                 l -= pl[b] * pp[b].max(1e-12).ln();
                 ds[b] = (pp[b] - pl[b]) / cfg.tau;
             }
             ep_loss += l;
-            let dscores = gpu.upload_f32(&ds, &[nb])?;
-            let grads = ssm_drafter_backward(gpu, drafter, &acts, &dscores, cfg.block, nb, last)?;
-            opt.step(gpu, &drafter.params(), &grads.flat())?;
+            let dscores = gpu.upload_f32(&ds, &[st.nb])?;
+            let grads =
+                ssm_drafter_backward(gpu, drafter, &acts, &dscores, cfg.block, st.nb, st.last)?;
+            st.opt.step(gpu, &drafter.params(), &grads.flat())?;
             free_ssm_drafter_acts(gpu, acts)?;
             free_ssm_drafter_grads(gpu, grads)?;
             gpu.free_tensor(dscores)?;
@@ -212,18 +258,18 @@ pub fn train_ssm_drafter_loop(
                 "\r  [train] ep {:>4}/{}  loss {:.4}   ",
                 ep + 1,
                 cfg.epochs,
-                ep_loss / n_train as f32
+                ep_loss / st.n_train as f32
             );
             let _ = std::io::stderr().flush();
         }
         if ep % cfg.eval_every == 0 || ep == cfg.epochs - 1 {
             let corr = eval_ssm_drafter(gpu, drafter, chunks, label_mid, cfg);
-            final_eval = corr;
-            if corr > best_eval {
-                best_eval = corr;
-                best_epoch = ep;
+            st.final_eval = corr;
+            if corr > st.best_eval {
+                st.best_eval = corr;
+                st.best_epoch = ep;
                 // Snapshot the generalizing weights (host) for checkpointing.
-                best_weights = drafter
+                st.best_weights = drafter
                     .params()
                     .iter()
                     .map(|t| gpu.download_f32(t))
@@ -231,28 +277,57 @@ pub fn train_ssm_drafter_loop(
             }
             let train_corr = if cfg.report_train {
                 Some(eval_ssm_drafter_range(
-                    gpu, drafter, chunks, label_mid, 0, n_train, cfg,
+                    gpu, drafter, chunks, label_mid, 0, st.n_train, cfg,
                 ))
             } else {
                 None
             };
             on_epoch(
                 ep,
-                ep_loss / n_train as f32,
+                ep_loss / st.n_train as f32,
                 corr,
-                best_eval,
-                best_epoch,
+                st.best_eval,
+                st.best_epoch,
                 train_corr,
             );
         }
+        st.ep += 1;
     }
+    Ok(())
+}
 
-    let _ = gpu.free_tensor(scores_dev);
-    Ok(DrafterTrainReport {
-        best_eval,
-        best_epoch,
-        bar,
-        final_eval,
-        best_weights,
-    })
+/// Free the scores scratch and produce the report from the accumulated state.
+pub fn drafter_loop_finish(gpu: &mut Gpu, st: DrafterLoopState) -> DrafterTrainReport {
+    let _ = gpu.free_tensor(st.scores_dev);
+    DrafterTrainReport {
+        best_eval: st.best_eval,
+        best_epoch: st.best_epoch,
+        bar: st.bar,
+        final_eval: st.final_eval,
+        best_weights: st.best_weights,
+    }
+}
+
+/// Train an SSM drafter to reproduce the target's mid-layer block ranking.
+/// `on_epoch(epoch, train_loss, eval, best, best_epoch)` fires on eval epochs.
+/// Returns the best-eval/bar/final report; the drafter's weights are left at
+/// their FINAL (not necessarily best) state — caller checkpoints on best if it
+/// wants the generalizing model.
+///
+/// Thin wrapper over the resumable `drafter_loop_{init,run_epochs,finish}` form:
+/// init → run all epochs in one shot → finish.
+pub fn train_ssm_drafter_loop(
+    gpu: &mut Gpu,
+    drafter: &SsmDrafter,
+    chunks: &[Vec<u32>],
+    label_mid: &[Vec<f32>],
+    base_shallow: &[Vec<f32>],
+    cfg: &TrainCfg,
+    on_epoch: impl FnMut(usize, f32, f32, f32, usize, Option<f32>),
+) -> HipResult<DrafterTrainReport> {
+    let mut st = drafter_loop_init(gpu, drafter, chunks, label_mid, base_shallow, cfg)?;
+    drafter_loop_run_epochs(
+        gpu, drafter, chunks, label_mid, cfg, &mut st, cfg.epochs, on_epoch,
+    )?;
+    Ok(drafter_loop_finish(gpu, st))
 }

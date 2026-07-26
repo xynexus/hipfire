@@ -18,6 +18,691 @@ pub const SCHED_PRIORITY_DEFAULT: u8 = 64;
 pub const SCHED_PRIORITY_OPPORTUNISTIC: u8 = 255;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceBudget {
+    pub system_memory_budget_bytes: u64,
+    pub system_memory_headroom_bytes: u64,
+    pub vram_budget_bytes: u64,
+    pub vram_headroom_bytes: u64,
+}
+
+impl ResourceBudget {
+    pub fn disabled() -> Self {
+        Self {
+            system_memory_budget_bytes: 0,
+            system_memory_headroom_bytes: 0,
+            vram_budget_bytes: 0,
+            vram_headroom_bytes: 0,
+        }
+    }
+
+    fn effective_system_limit(self) -> Option<u64> {
+        effective_limit(
+            self.system_memory_budget_bytes,
+            self.system_memory_headroom_bytes,
+        )
+    }
+
+    fn effective_vram_limit(self) -> Option<u64> {
+        effective_limit(self.vram_budget_bytes, self.vram_headroom_bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceUsage {
+    pub system_memory_bytes: u64,
+    pub vram_bytes: u64,
+}
+
+impl ResourceUsage {
+    pub fn zero() -> Self {
+        Self {
+            system_memory_bytes: 0,
+            vram_bytes: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidencyMode {
+    Auto,
+    Full,
+    QwenMoeModules,
+}
+
+impl ResidencyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Full => "full",
+            Self::QwenMoeModules => "qwen_moe_modules",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "full" => Some(Self::Full),
+            "qwen_moe_modules" | "qwen35_moe_modules" | "qwen3.5_moe_modules" => {
+                Some(Self::QwenMoeModules)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResidentWorkerLedgerEntry {
+    pub worker_key_id: String,
+    pub model_path: String,
+    pub residency_mode: ResidencyMode,
+    pub resource_usage: ResourceUsage,
+    pub last_used_seq: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelResidencyRequest {
+    pub worker_key_id: String,
+    pub model_path: String,
+    pub requested_mode: ResidencyMode,
+    pub estimated_full: ResourceUsage,
+    pub estimated_qwen_moe_modules: Option<ResourceUsage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelResidencyPlan {
+    pub worker_key_id: String,
+    pub residency_mode: ResidencyMode,
+    pub module_vram_budget_bytes: Option<u64>,
+    pub resource_usage: ResourceUsage,
+    pub unload_worker_key_ids: Vec<String>,
+    pub reason: String,
+}
+
+fn effective_limit(budget: u64, headroom: u64) -> Option<u64> {
+    (budget > 0).then_some(budget.saturating_sub(headroom))
+}
+
+fn usage_fits(budget: ResourceBudget, usage: ResourceUsage) -> bool {
+    budget
+        .effective_system_limit()
+        .is_none_or(|limit| usage.system_memory_bytes <= limit)
+        && budget
+            .effective_vram_limit()
+            .is_none_or(|limit| usage.vram_bytes <= limit)
+}
+
+fn add_usage(a: ResourceUsage, b: ResourceUsage) -> ResourceUsage {
+    ResourceUsage {
+        system_memory_bytes: a.system_memory_bytes.saturating_add(b.system_memory_bytes),
+        vram_bytes: a.vram_bytes.saturating_add(b.vram_bytes),
+    }
+}
+
+fn subtract_usage(a: ResourceUsage, b: ResourceUsage) -> ResourceUsage {
+    ResourceUsage {
+        system_memory_bytes: a.system_memory_bytes.saturating_sub(b.system_memory_bytes),
+        vram_bytes: a.vram_bytes.saturating_sub(b.vram_bytes),
+    }
+}
+
+fn ledger_usage(workers: &[ResidentWorkerLedgerEntry]) -> ResourceUsage {
+    workers.iter().fold(ResourceUsage::zero(), |sum, worker| {
+        add_usage(sum, worker.resource_usage)
+    })
+}
+
+pub fn plan_model_residency(
+    budget: ResourceBudget,
+    request: ModelResidencyRequest,
+    resident_workers: &[ResidentWorkerLedgerEntry],
+) -> Result<ModelResidencyPlan, String> {
+    if resident_workers
+        .iter()
+        .any(|worker| worker.worker_key_id == request.worker_key_id)
+    {
+        return Ok(ModelResidencyPlan {
+            worker_key_id: request.worker_key_id,
+            residency_mode: ResidencyMode::Full,
+            module_vram_budget_bytes: None,
+            resource_usage: ResourceUsage::zero(),
+            unload_worker_key_ids: Vec::new(),
+            reason: "worker_already_resident".to_string(),
+        });
+    }
+
+    let (mode, usage) = match request.requested_mode {
+        ResidencyMode::Full => (ResidencyMode::Full, request.estimated_full),
+        ResidencyMode::QwenMoeModules => {
+            let Some(usage) = request.estimated_qwen_moe_modules else {
+                return Err(
+                    "qwen_moe_modules residency requested but module metadata is unavailable"
+                        .to_string(),
+                );
+            };
+            (ResidencyMode::QwenMoeModules, usage)
+        }
+        ResidencyMode::Auto => {
+            if usage_fits(
+                budget,
+                add_usage(ledger_usage(resident_workers), request.estimated_full),
+            ) {
+                (ResidencyMode::Full, request.estimated_full)
+            } else if let Some(module_usage) = request.estimated_qwen_moe_modules {
+                (ResidencyMode::QwenMoeModules, module_usage)
+            } else {
+                (ResidencyMode::Full, request.estimated_full)
+            }
+        }
+    };
+
+    if !usage_fits(budget, usage) {
+        return Err(format!(
+            "requested {} residency exceeds configured budget/headroom",
+            mode.as_str()
+        ));
+    }
+
+    let mut current = ledger_usage(resident_workers);
+    let mut unload = Vec::new();
+    if !usage_fits(budget, add_usage(current, usage)) {
+        let mut victims = resident_workers.to_vec();
+        victims.sort_by_key(|worker| worker.last_used_seq);
+        for victim in victims {
+            current = subtract_usage(current, victim.resource_usage);
+            unload.push(victim.worker_key_id);
+            if usage_fits(budget, add_usage(current, usage)) {
+                break;
+            }
+        }
+    }
+
+    if !usage_fits(budget, add_usage(current, usage)) {
+        return Err("insufficient budget after evicting all eligible resident workers".to_string());
+    }
+
+    Ok(ModelResidencyPlan {
+        worker_key_id: request.worker_key_id,
+        residency_mode: mode,
+        module_vram_budget_bytes: (mode == ResidencyMode::QwenMoeModules)
+            .then_some(usage.vram_bytes),
+        resource_usage: usage,
+        unload_worker_key_ids: unload,
+        reason: "admitted".to_string(),
+    })
+}
+
+/// Work classes coordinated by the long-lived accelerator orchestrator.
+///
+/// Token and image work may be microbatched when callers provide the same
+/// compatibility key. Training and maintenance remain singleton operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkloadClass {
+    TokenPrefill,
+    TokenDecode,
+    ImageGeneration,
+    Training,
+    Maintenance,
+}
+
+/// Opaque scheduler attribution. Identity influences fairness and queued
+/// cancellation, never runtime compatibility or model inputs.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub struct WorkloadOwner {
+    pub user_id: Option<String>,
+    pub token_id: Option<String>,
+}
+
+impl WorkloadOwner {
+    pub fn authenticated(user_id: impl Into<String>, token_id: Option<String>) -> Self {
+        Self {
+            user_id: Some(user_id.into()),
+            token_id,
+        }
+    }
+
+    pub fn fairness_key(&self) -> &str {
+        self.user_id.as_deref().unwrap_or("anonymous-local")
+    }
+}
+
+impl WorkloadClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TokenPrefill => "token_prefill",
+            Self::TokenDecode => "token_decode",
+            Self::ImageGeneration => "image_generation",
+            Self::Training => "training",
+            Self::Maintenance => "maintenance",
+        }
+    }
+
+    fn supports_microbatching(self) -> bool {
+        matches!(
+            self,
+            Self::TokenPrefill | Self::TokenDecode | Self::ImageGeneration
+        )
+    }
+
+    /// The coarse billing / rate-limit class this scheduling class rolls up to.
+    /// This is the single source of truth that unifies the two taxonomies: a
+    /// request classified once (as a scheduler `WorkloadClass`) derives its
+    /// `hipfire_auth::WorkloadClass` here rather than being classified twice and
+    /// risking drift.
+    pub fn billing_class(self) -> hipfire_auth::WorkloadClass {
+        match self {
+            Self::TokenPrefill | Self::TokenDecode => hipfire_auth::WorkloadClass::Text,
+            Self::ImageGeneration => hipfire_auth::WorkloadClass::Image,
+            Self::Training => hipfire_auth::WorkloadClass::Training,
+            Self::Maintenance => hipfire_auth::WorkloadClass::Other,
+        }
+    }
+}
+
+/// Conservatively additive resources used for admission and active leases.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WorkloadResources {
+    pub system_memory_bytes: u64,
+    pub vram_bytes: u64,
+    pub gpu_slots: u32,
+    pub npu_slots: u32,
+    pub cpu_threads: u32,
+}
+
+impl WorkloadResources {
+    fn add(self, other: Self) -> Self {
+        Self {
+            system_memory_bytes: self
+                .system_memory_bytes
+                .saturating_add(other.system_memory_bytes),
+            vram_bytes: self.vram_bytes.saturating_add(other.vram_bytes),
+            gpu_slots: self.gpu_slots.saturating_add(other.gpu_slots),
+            npu_slots: self.npu_slots.saturating_add(other.npu_slots),
+            cpu_threads: self.cpu_threads.saturating_add(other.cpu_threads),
+        }
+    }
+
+    fn subtract(self, other: Self) -> Self {
+        Self {
+            system_memory_bytes: self
+                .system_memory_bytes
+                .saturating_sub(other.system_memory_bytes),
+            vram_bytes: self.vram_bytes.saturating_sub(other.vram_bytes),
+            gpu_slots: self.gpu_slots.saturating_sub(other.gpu_slots),
+            npu_slots: self.npu_slots.saturating_sub(other.npu_slots),
+            cpu_threads: self.cpu_threads.saturating_sub(other.cpu_threads),
+        }
+    }
+
+    fn fits_within(self, capacity: Self) -> bool {
+        self.system_memory_bytes <= capacity.system_memory_bytes
+            && self.vram_bytes <= capacity.vram_bytes
+            && self.gpu_slots <= capacity.gpu_slots
+            && self.npu_slots <= capacity.npu_slots
+            && self.cpu_threads <= capacity.cpu_threads
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkloadSpec {
+    pub id: String,
+    pub class: WorkloadClass,
+    pub priority: u8,
+    pub enqueued_at_ms: u64,
+    pub resources: WorkloadResources,
+    pub owner: WorkloadOwner,
+    /// Stable caller-defined compatibility key. It must include every property
+    /// that affects a shared runtime invocation, such as worker, model, shape,
+    /// quant/state mode, sampler, and precision.
+    pub microbatch_key: Option<String>,
+    pub max_microbatch_size: usize,
+    pub exclusive: bool,
+}
+
+impl WorkloadSpec {
+    pub fn singleton(
+        id: impl Into<String>,
+        class: WorkloadClass,
+        priority: u8,
+        enqueued_at_ms: u64,
+        resources: WorkloadResources,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            class,
+            priority,
+            enqueued_at_ms,
+            resources,
+            owner: WorkloadOwner::default(),
+            microbatch_key: None,
+            max_microbatch_size: 1,
+            exclusive: class == WorkloadClass::Training,
+        }
+    }
+
+    pub fn microbatchable(
+        id: impl Into<String>,
+        class: WorkloadClass,
+        priority: u8,
+        enqueued_at_ms: u64,
+        resources: WorkloadResources,
+        microbatch_key: impl Into<String>,
+        max_microbatch_size: usize,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            class,
+            priority,
+            enqueued_at_ms,
+            resources,
+            owner: WorkloadOwner::default(),
+            microbatch_key: Some(microbatch_key.into()),
+            max_microbatch_size: max_microbatch_size.max(1),
+            exclusive: false,
+        }
+    }
+
+    pub fn with_owner(mut self, owner: WorkloadOwner) -> Self {
+        self.owner = owner;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkloadBatchLease {
+    pub lease_id: u64,
+    pub class: WorkloadClass,
+    pub workloads: Vec<WorkloadSpec>,
+    pub resources: WorkloadResources,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContinuousSchedulerSnapshot {
+    pub queued: usize,
+    pub active_batches: usize,
+    pub active_workloads: usize,
+    pub active_resources: WorkloadResources,
+    pub exclusive_active: bool,
+}
+
+/// Priority scheduler for continuous heterogeneous accelerator work.
+///
+/// The scheduler owns admission and leases, not execution. A server-owned
+/// orchestrator repeatedly calls [`Self::next_batch`], dispatches the returned
+/// work through the appropriate runtime, and completes the lease afterward.
+#[derive(Debug)]
+pub struct ContinuousWorkScheduler {
+    capacity: WorkloadResources,
+    max_queued: usize,
+    aging_ms: u64,
+    buckets: Vec<Vec<WorkloadSpec>>,
+    queued_ids: HashSet<String>,
+    active: BTreeMap<u64, WorkloadBatchLease>,
+    next_lease_id: u64,
+    last_scheduled_owner: Vec<Option<String>>,
+}
+
+impl ContinuousWorkScheduler {
+    pub fn new(capacity: WorkloadResources, max_queued: usize, aging_ms: u64) -> Self {
+        Self {
+            capacity,
+            max_queued,
+            aging_ms,
+            buckets: (0..=255).map(|_| Vec::new()).collect(),
+            queued_ids: HashSet::new(),
+            active: BTreeMap::new(),
+            next_lease_id: 1,
+            last_scheduled_owner: vec![None; 256],
+        }
+    }
+
+    pub fn enqueue(&mut self, mut workload: WorkloadSpec) -> Result<(), String> {
+        if workload.id.trim().is_empty() {
+            return Err("workload id must not be empty".to_string());
+        }
+        if self.queued_ids.contains(&workload.id)
+            || self
+                .active
+                .values()
+                .any(|lease| lease.workloads.iter().any(|item| item.id == workload.id))
+        {
+            return Err(format!(
+                "workload is already queued or active: {}",
+                workload.id
+            ));
+        }
+        if self.max_queued > 0 && self.queued_ids.len() >= self.max_queued {
+            return Err(format!(
+                "continuous scheduler backpressure: queued={} max={}",
+                self.queued_ids.len(),
+                self.max_queued
+            ));
+        }
+        if !workload.resources.fits_within(self.capacity) {
+            return Err(format!(
+                "workload {} resource request exceeds scheduler capacity",
+                workload.id
+            ));
+        }
+        if workload.class == WorkloadClass::Training {
+            workload.exclusive = true;
+            workload.microbatch_key = None;
+            workload.max_microbatch_size = 1;
+        }
+        workload.max_microbatch_size = workload.max_microbatch_size.max(1);
+        let id = workload.id.clone();
+        self.buckets[workload.priority as usize].push(workload);
+        self.queued_ids.insert(id);
+        Ok(())
+    }
+
+    pub fn cancel_pending(&mut self, id: &str) -> bool {
+        if !self.queued_ids.contains(id) {
+            return false;
+        }
+        for bucket in &mut self.buckets {
+            if let Some(index) = bucket.iter().position(|workload| workload.id == id) {
+                bucket.remove(index);
+                self.queued_ids.remove(id);
+                return true;
+            }
+        }
+        self.queued_ids.remove(id);
+        false
+    }
+
+    pub fn cancel_pending_by_user(&mut self, user_id: &str) -> Vec<WorkloadSpec> {
+        self.cancel_pending_where(|owner| owner.user_id.as_deref() == Some(user_id))
+    }
+
+    pub fn cancel_pending_by_token(&mut self, token_id: &str) -> Vec<WorkloadSpec> {
+        self.cancel_pending_where(|owner| owner.token_id.as_deref() == Some(token_id))
+    }
+
+    fn cancel_pending_where(
+        &mut self,
+        predicate: impl Fn(&WorkloadOwner) -> bool,
+    ) -> Vec<WorkloadSpec> {
+        let mut removed = Vec::new();
+        for bucket in &mut self.buckets {
+            let mut index = 0;
+            while index < bucket.len() {
+                if predicate(&bucket[index].owner) {
+                    let workload = bucket.remove(index);
+                    self.queued_ids.remove(&workload.id);
+                    removed.push(workload);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        removed
+    }
+
+    pub fn next_batch(&mut self, now_ms: u64) -> Option<WorkloadBatchLease> {
+        if self
+            .active
+            .values()
+            .any(|lease| lease.workloads.iter().any(|workload| workload.exclusive))
+        {
+            return None;
+        }
+
+        let (priority, seed_index) = self.next_seed(now_ms)?;
+        let seed = self.buckets[priority].get(seed_index)?.clone();
+        if seed.exclusive && !self.active.is_empty() {
+            return None;
+        }
+
+        let available = self.capacity.subtract(self.active_resources());
+        if !seed.resources.fits_within(available) {
+            return None;
+        }
+
+        let mut selected_indices = vec![seed_index];
+        let mut resources = seed.resources;
+        let mut microbatch_limit = seed.max_microbatch_size;
+        if seed.class.supports_microbatching() && seed.microbatch_key.is_some() {
+            for (index, candidate) in self.buckets[priority].iter().enumerate() {
+                if selected_indices.len() >= microbatch_limit || index == seed_index {
+                    continue;
+                }
+                if !workloads_microbatch_compatible(&seed, candidate) {
+                    continue;
+                }
+                let candidate_limit = microbatch_limit.min(candidate.max_microbatch_size);
+                if selected_indices.len() >= candidate_limit {
+                    continue;
+                }
+                let combined = resources.add(candidate.resources);
+                if combined.fits_within(available) {
+                    resources = combined;
+                    microbatch_limit = candidate_limit;
+                    selected_indices.push(index);
+                }
+            }
+        }
+
+        selected_indices.sort_unstable();
+        let mut workloads = Vec::with_capacity(selected_indices.len());
+        for index in selected_indices.into_iter().rev() {
+            workloads.push(self.buckets[priority].remove(index));
+        }
+        workloads.reverse();
+        for workload in &workloads {
+            self.queued_ids.remove(&workload.id);
+        }
+
+        let lease = WorkloadBatchLease {
+            lease_id: self.next_lease_id,
+            class: seed.class,
+            workloads,
+            resources,
+        };
+        self.next_lease_id = self.next_lease_id.saturating_add(1);
+        self.active.insert(lease.lease_id, lease.clone());
+        self.last_scheduled_owner[priority] = Some(seed.owner.fairness_key().to_string());
+        Some(lease)
+    }
+
+    pub fn complete(&mut self, lease_id: u64) -> Option<WorkloadBatchLease> {
+        self.active.remove(&lease_id)
+    }
+
+    /// The priority bucket the next `next_batch` call would draw from (honouring
+    /// aging), without removing anything. Lower = served sooner. A running batch
+    /// polls this to decide whether a higher-priority workload is waiting: if the
+    /// peeked priority is strictly less than the running batch's own priority, a
+    /// more-urgent workload would be granted next, so the batch should yield.
+    pub fn peek_next_priority(&self, now_ms: u64) -> Option<u8> {
+        self.next_seed(now_ms).map(|(priority, _)| priority as u8)
+    }
+
+    pub fn snapshot(&self) -> ContinuousSchedulerSnapshot {
+        ContinuousSchedulerSnapshot {
+            queued: self.queued_ids.len(),
+            active_batches: self.active.len(),
+            active_workloads: self
+                .active
+                .values()
+                .map(|lease| lease.workloads.len())
+                .sum(),
+            active_resources: self.active_resources(),
+            exclusive_active: self
+                .active
+                .values()
+                .any(|lease| lease.workloads.iter().any(|workload| workload.exclusive)),
+        }
+    }
+
+    fn active_resources(&self) -> WorkloadResources {
+        self.active
+            .values()
+            .fold(WorkloadResources::default(), |total, lease| {
+                total.add(lease.resources)
+            })
+    }
+
+    fn next_seed(&self, now_ms: u64) -> Option<(usize, usize)> {
+        if self.aging_ms > 0 {
+            let mut oldest: Option<(u64, usize, usize)> = None;
+            for (priority, bucket) in self.buckets.iter().enumerate() {
+                for (index, workload) in bucket.iter().enumerate() {
+                    if now_ms.saturating_sub(workload.enqueued_at_ms) < self.aging_ms {
+                        continue;
+                    }
+                    let candidate = (workload.enqueued_at_ms, priority, index);
+                    if oldest.is_none_or(|current| candidate < current) {
+                        oldest = Some(candidate);
+                    }
+                }
+            }
+            if let Some((_, priority, index)) = oldest {
+                return Some((priority, index));
+            }
+        }
+        self.buckets
+            .iter()
+            .enumerate()
+            .find_map(|(priority, bucket)| {
+                if bucket.is_empty() {
+                    return None;
+                }
+                let owners = distinct_owner_keys(bucket);
+                let selected_index = self.last_scheduled_owner[priority]
+                    .as_ref()
+                    .and_then(|last| owners.iter().position(|owner| owner == last))
+                    .map(|index| (index + 1) % owners.len())
+                    .unwrap_or(0);
+                let selected = &owners[selected_index];
+                bucket
+                    .iter()
+                    .position(|workload| workload.owner.fairness_key() == selected)
+                    .map(|index| (priority, index))
+            })
+    }
+}
+
+fn distinct_owner_keys(bucket: &[WorkloadSpec]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    bucket
+        .iter()
+        .filter_map(|workload| {
+            let owner = workload.owner.fairness_key().to_string();
+            seen.insert(owner.clone()).then_some(owner)
+        })
+        .collect()
+}
+
+fn workloads_microbatch_compatible(a: &WorkloadSpec, b: &WorkloadSpec) -> bool {
+    !a.exclusive
+        && !b.exclusive
+        && a.class == b.class
+        && a.class.supports_microbatching()
+        && a.microbatch_key.is_some()
+        && a.microbatch_key == b.microbatch_key
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulerPriorityClass {
     Realtime,
     High,
@@ -111,6 +796,7 @@ pub struct SessionStateHandle {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestSessionDraft {
     pub id: String,
+    pub owner: WorkloadOwner,
     pub worker_key: ModelWorkerKey,
     pub priority: u8,
     pub prompt_tokens: Vec<u32>,
@@ -122,6 +808,7 @@ pub struct RequestSessionDraft {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateRequestSessionInput {
     pub id: String,
+    pub owner: WorkloadOwner,
     pub worker_key: ModelWorkerKey,
     pub prompt_tokens: Vec<u32>,
     pub cached_prefix_tokens: Option<usize>,
@@ -145,6 +832,49 @@ pub struct PreviewPrefillBatchInput {
     pub now_ms: u64,
     pub incoming_session: Option<RequestSessionDraft>,
     pub incoming_enqueued_at_ms: Option<u64>,
+}
+
+fn fair_ordered_prefill_bucket(
+    bucket: &[QueuedPrefillRequest],
+    last_owner: Option<&str>,
+) -> Vec<QueuedPrefillRequest> {
+    let mut owners = Vec::<String>::new();
+    for entry in bucket {
+        let owner = entry.session.owner.fairness_key().to_string();
+        if !owners.contains(&owner) {
+            owners.push(owner);
+        }
+    }
+    if owners.len() <= 1 {
+        return bucket.to_vec();
+    }
+    let start = last_owner
+        .and_then(|last| owners.iter().position(|owner| owner == last))
+        .map(|index| (index + 1) % owners.len())
+        .unwrap_or(0);
+    owners.rotate_left(start);
+
+    let mut offsets = vec![0usize; owners.len()];
+    let mut ordered = Vec::with_capacity(bucket.len());
+    while ordered.len() < bucket.len() {
+        let mut progressed = false;
+        for (owner_index, owner) in owners.iter().enumerate() {
+            let Some(entry) = bucket
+                .iter()
+                .filter(|entry| entry.session.owner.fairness_key() == owner)
+                .nth(offsets[owner_index])
+            else {
+                continue;
+            };
+            offsets[owner_index] += 1;
+            ordered.push(entry.clone());
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    ordered
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -301,14 +1031,18 @@ pub fn parse_server_prefill_policy_controls(
 }
 
 pub fn server_prefill_batch_enabled(env: &SchedulerPolicyEnv) -> bool {
+    // On by default (Phase 2). The continuous-batching runner only takes effect
+    // for batch-eligible requests (see `batch_runner::batch_eligible`); everything
+    // else falls back to the legacy per-request path. `HIPFIRE_SERVER_PREFILL_BATCH=0`
+    // (or `off`/`false`/`no`) is the kill switch back to the legacy path for all.
     env.get("HIPFIRE_SERVER_PREFILL_BATCH")
         .map(|value| {
-            matches!(
+            !matches!(
                 value.trim().to_ascii_lowercase().as_str(),
-                "1" | "on" | "true"
+                "0" | "off" | "false" | "no"
             )
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 pub fn server_prefill_batch_health_json(env: &SchedulerPolicyEnv) -> serde_json::Value {
@@ -535,6 +1269,7 @@ pub fn create_request_session_draft(input: CreateRequestSessionInput) -> Request
         .unwrap_or(SCHED_PRIORITY_DEFAULT);
     RequestSessionDraft {
         id: input.id,
+        owner: input.owner,
         worker_key: worker_key.clone(),
         priority,
         prompt_tokens: input.prompt_tokens,
@@ -753,6 +1488,7 @@ pub struct PriorityPrefillScheduler {
     buckets: Vec<Vec<QueuedPrefillRequest>>,
     queued_ids: HashSet<String>,
     queued_count: usize,
+    last_scheduled_owner: Vec<Option<String>>,
 }
 
 impl Default for PriorityPrefillScheduler {
@@ -769,6 +1505,7 @@ impl PriorityPrefillScheduler {
             buckets: (0..=255).map(|_| Vec::new()).collect(),
             queued_ids: HashSet::new(),
             queued_count: 0,
+            last_scheduled_owner: vec![None; 256],
         }
     }
 
@@ -863,8 +1600,41 @@ impl PriorityPrefillScheduler {
         false
     }
 
+    pub fn cancel_by_user(&mut self, user_id: &str) -> Vec<RequestSessionDraft> {
+        self.cancel_where(|owner| owner.user_id.as_deref() == Some(user_id))
+    }
+
+    pub fn cancel_by_token(&mut self, token_id: &str) -> Vec<RequestSessionDraft> {
+        self.cancel_where(|owner| owner.token_id.as_deref() == Some(token_id))
+    }
+
+    fn cancel_where(
+        &mut self,
+        predicate: impl Fn(&WorkloadOwner) -> bool,
+    ) -> Vec<RequestSessionDraft> {
+        let mut removed = Vec::new();
+        for bucket in &mut self.buckets {
+            let mut index = 0;
+            while index < bucket.len() {
+                if predicate(&bucket[index].session.owner) {
+                    let entry = bucket.remove(index);
+                    self.queued_ids.remove(&entry.session.id);
+                    self.queued_count = self.queued_count.saturating_sub(1);
+                    removed.push(entry.session);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        removed
+    }
+
     pub fn next_prefill_batch(&mut self, input: NextBatchInput) -> Option<PrefillBatchSelection> {
         if let Some(aged) = self.select_aged_candidate(input.now_ms) {
+            if let Some(first) = aged.sessions.first() {
+                self.last_scheduled_owner[first.priority as usize] =
+                    Some(first.owner.fairness_key().to_string());
+            }
             self.remove_selected(&aged.sessions);
             return Some(aged);
         }
@@ -873,9 +1643,16 @@ impl PriorityPrefillScheduler {
             if self.buckets[priority].is_empty() {
                 continue;
             }
-            let candidate =
-                self.select_from_bucket(priority as u8, &self.buckets[priority], input.now_ms)?;
+            let ordered = fair_ordered_prefill_bucket(
+                &self.buckets[priority],
+                self.last_scheduled_owner[priority].as_deref(),
+            );
+            let candidate = self.select_from_bucket(priority as u8, &ordered, input.now_ms)?;
             self.remove_selected(&candidate.sessions);
+            self.last_scheduled_owner[priority] = candidate
+                .sessions
+                .first()
+                .map(|session| session.owner.fairness_key().to_string());
             return Some(candidate);
         }
         None
@@ -903,7 +1680,11 @@ impl PriorityPrefillScheduler {
             if bucket.is_empty() {
                 continue;
             }
-            let candidate = self.select_from_bucket(priority as u8, &bucket, input.now_ms)?;
+            let ordered = fair_ordered_prefill_bucket(
+                &bucket,
+                self.last_scheduled_owner[priority].as_deref(),
+            );
+            let candidate = self.select_from_bucket(priority as u8, &ordered, input.now_ms)?;
             let Some(incoming) = input.incoming_session.as_ref() else {
                 return Some(candidate);
             };
@@ -1195,6 +1976,12 @@ mod tests {
         )
     }
 
+    fn owned_session(id: &str, user: &str, token: &str, priority: u8) -> RequestSessionDraft {
+        let mut session = session(id, priority, 8);
+        session.owner = WorkloadOwner::authenticated(user, Some(token.to_string()));
+        session
+    }
+
     fn session_with(
         id: &str,
         priority: u8,
@@ -1205,6 +1992,7 @@ mod tests {
     ) -> RequestSessionDraft {
         create_request_session_draft(CreateRequestSessionInput {
             id: id.to_string(),
+            owner: WorkloadOwner::default(),
             worker_key,
             prompt_tokens: (1..=tokens as u32).collect(),
             cached_prefix_tokens: Some(cached_prefix_tokens),
@@ -1321,11 +2109,17 @@ mod tests {
     }
 
     #[test]
-    fn server_prefill_batch_health_is_disabled_by_default() {
-        let payload = server_prefill_batch_health_json(&SchedulerPolicyEnv::empty());
+    fn server_prefill_batch_enabled_by_default_with_kill_switch() {
+        // Phase 2: on by default (unset -> enabled).
+        assert!(server_prefill_batch_enabled(&SchedulerPolicyEnv::empty()));
 
-        assert_eq!(payload, serde_json::json!({ "enabled": false }));
-        assert!(!server_prefill_batch_enabled(&SchedulerPolicyEnv::empty()));
+        // The kill switch disables it and collapses the health JSON.
+        let off = env(&[("HIPFIRE_SERVER_PREFILL_BATCH", "0")]);
+        assert!(!server_prefill_batch_enabled(&off));
+        assert_eq!(
+            server_prefill_batch_health_json(&off),
+            serde_json::json!({ "enabled": false })
+        );
     }
 
     #[test]
@@ -1861,5 +2655,361 @@ mod tests {
             decode_ids(fused.next_decode_batch(NextBatchInput { now_ms: 0 })),
             vec!["fused-a", "fused-b"]
         );
+    }
+
+    #[test]
+    fn residency_planner_selects_modules_when_full_does_not_fit_auto() {
+        let budget = ResourceBudget {
+            system_memory_budget_bytes: 0,
+            system_memory_headroom_bytes: 0,
+            vram_budget_bytes: 1_000,
+            vram_headroom_bytes: 100,
+        };
+        let request = ModelResidencyRequest {
+            worker_key_id: "worker-new".to_string(),
+            model_path: "qwen.hfq".to_string(),
+            requested_mode: ResidencyMode::Auto,
+            estimated_full: ResourceUsage {
+                system_memory_bytes: 0,
+                vram_bytes: 1_200,
+            },
+            estimated_qwen_moe_modules: Some(ResourceUsage {
+                system_memory_bytes: 0,
+                vram_bytes: 700,
+            }),
+        };
+
+        let plan = plan_model_residency(budget, request, &[]).unwrap();
+        assert_eq!(plan.residency_mode, ResidencyMode::QwenMoeModules);
+        assert_eq!(plan.module_vram_budget_bytes, Some(700));
+    }
+
+    #[test]
+    fn residency_planner_evicts_oldest_workers_for_budget() {
+        let budget = ResourceBudget {
+            system_memory_budget_bytes: 0,
+            system_memory_headroom_bytes: 0,
+            vram_budget_bytes: 1_000,
+            vram_headroom_bytes: 0,
+        };
+        let resident_workers = vec![
+            ResidentWorkerLedgerEntry {
+                worker_key_id: "old".to_string(),
+                model_path: "old.hfq".to_string(),
+                residency_mode: ResidencyMode::Full,
+                resource_usage: ResourceUsage {
+                    system_memory_bytes: 0,
+                    vram_bytes: 500,
+                },
+                last_used_seq: 1,
+            },
+            ResidentWorkerLedgerEntry {
+                worker_key_id: "newer".to_string(),
+                model_path: "newer.hfq".to_string(),
+                residency_mode: ResidencyMode::Full,
+                resource_usage: ResourceUsage {
+                    system_memory_bytes: 0,
+                    vram_bytes: 300,
+                },
+                last_used_seq: 2,
+            },
+        ];
+        let request = ModelResidencyRequest {
+            worker_key_id: "incoming".to_string(),
+            model_path: "incoming.hfq".to_string(),
+            requested_mode: ResidencyMode::Full,
+            estimated_full: ResourceUsage {
+                system_memory_bytes: 0,
+                vram_bytes: 600,
+            },
+            estimated_qwen_moe_modules: None,
+        };
+
+        let plan = plan_model_residency(budget, request, &resident_workers).unwrap();
+        assert_eq!(plan.unload_worker_key_ids, vec!["old"]);
+    }
+
+    #[test]
+    fn prefill_scheduler_round_robins_users_and_microbatches_across_them() {
+        let mut fair =
+            PriorityPrefillScheduler::new(env(&[("HIPFIRE_SCHED_PREFILL_BATCH_MAX", "1")]));
+        fair.enqueue(owned_session("a1", "alice", "ta", 0), 0)
+            .unwrap();
+        fair.enqueue(owned_session("a2", "alice", "ta", 0), 1)
+            .unwrap();
+        fair.enqueue(owned_session("b1", "bob", "tb", 0), 2)
+            .unwrap();
+        let first = fair
+            .next_prefill_batch(NextBatchInput { now_ms: 10 })
+            .unwrap();
+        let second = fair
+            .next_prefill_batch(NextBatchInput { now_ms: 11 })
+            .unwrap();
+        assert_eq!(first.sessions[0].owner.user_id.as_deref(), Some("alice"));
+        assert_eq!(second.sessions[0].owner.user_id.as_deref(), Some("bob"));
+
+        let mut batched =
+            PriorityPrefillScheduler::new(env(&[("HIPFIRE_SCHED_PREFILL_BATCH_MAX", "2")]));
+        batched
+            .enqueue(owned_session("a", "alice", "ta", 64), 0)
+            .unwrap();
+        batched
+            .enqueue(owned_session("b", "bob", "tb", 64), 0)
+            .unwrap();
+        let batch = batched
+            .next_prefill_batch(NextBatchInput { now_ms: 10 })
+            .unwrap();
+        assert_eq!(batch.sessions.len(), 2);
+        assert_ne!(
+            batch.sessions[0].owner.user_id,
+            batch.sessions[1].owner.user_id
+        );
+    }
+
+    #[test]
+    fn prefill_scheduler_cancels_pending_credential_owners() {
+        let mut scheduler = PriorityPrefillScheduler::default();
+        scheduler
+            .enqueue(owned_session("a1", "alice", "ta", 64), 0)
+            .unwrap();
+        scheduler
+            .enqueue(owned_session("a2", "alice", "other", 64), 0)
+            .unwrap();
+        scheduler
+            .enqueue(owned_session("b", "bob", "tb", 64), 0)
+            .unwrap();
+        assert_eq!(scheduler.cancel_by_token("ta").len(), 1);
+        assert_eq!(scheduler.cancel_by_user("alice").len(), 1);
+        assert_eq!(scheduler.size(), 1);
+    }
+
+    fn continuous_capacity() -> WorkloadResources {
+        WorkloadResources {
+            system_memory_bytes: 64_000,
+            vram_bytes: 24_000,
+            gpu_slots: 4,
+            npu_slots: 1,
+            cpu_threads: 16,
+        }
+    }
+
+    fn token_workload(id: &str, priority: u8, enqueued_at_ms: u64) -> WorkloadSpec {
+        WorkloadSpec::microbatchable(
+            id,
+            WorkloadClass::TokenDecode,
+            priority,
+            enqueued_at_ms,
+            WorkloadResources {
+                vram_bytes: 1_000,
+                gpu_slots: 1,
+                ..WorkloadResources::default()
+            },
+            "worker:qwen|state:q8+deltanet|decode",
+            4,
+        )
+    }
+
+    fn owned_token_workload(
+        id: &str,
+        user: &str,
+        token: &str,
+        priority: u8,
+        enqueued_at_ms: u64,
+    ) -> WorkloadSpec {
+        token_workload(id, priority, enqueued_at_ms)
+            .with_owner(WorkloadOwner::authenticated(user, Some(token.to_string())))
+    }
+
+    #[test]
+    fn workload_class_billing_class_rolls_up_to_auth_taxonomy() {
+        use hipfire_auth::WorkloadClass as Auth;
+        assert_eq!(WorkloadClass::TokenPrefill.billing_class(), Auth::Text);
+        assert_eq!(WorkloadClass::TokenDecode.billing_class(), Auth::Text);
+        assert_eq!(WorkloadClass::ImageGeneration.billing_class(), Auth::Image);
+        assert_eq!(WorkloadClass::Training.billing_class(), Auth::Training);
+        assert_eq!(WorkloadClass::Maintenance.billing_class(), Auth::Other);
+    }
+
+    #[test]
+    fn peek_next_priority_reports_most_urgent_queued_without_dequeuing() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        assert_eq!(scheduler.peek_next_priority(0), None);
+        scheduler.enqueue(token_workload("low", 128, 0)).unwrap();
+        assert_eq!(scheduler.peek_next_priority(1), Some(128));
+        // A more urgent (lower-number) workload takes over the peek.
+        scheduler.enqueue(token_workload("high", 8, 1)).unwrap();
+        assert_eq!(scheduler.peek_next_priority(2), Some(8));
+        // Peek is non-destructive: the queue is untouched.
+        assert_eq!(scheduler.snapshot().queued, 2);
+    }
+
+    #[test]
+    fn continuous_scheduler_microbatches_compatible_token_work() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        scheduler.enqueue(token_workload("a", 64, 0)).unwrap();
+        scheduler.enqueue(token_workload("b", 64, 1)).unwrap();
+        let mut incompatible = token_workload("c", 64, 2);
+        incompatible.microbatch_key = Some("worker:other|decode".to_string());
+        scheduler.enqueue(incompatible).unwrap();
+        let mut singleton_limit = token_workload("d", 64, 3);
+        singleton_limit.max_microbatch_size = 1;
+        scheduler.enqueue(singleton_limit).unwrap();
+
+        let lease = scheduler.next_batch(10).unwrap();
+
+        assert_eq!(
+            lease
+                .workloads
+                .iter()
+                .map(|workload| workload.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(lease.resources.gpu_slots, 2);
+        assert_eq!(scheduler.snapshot().queued, 2);
+        scheduler.complete(lease.lease_id).unwrap();
+        assert_eq!(scheduler.snapshot().active_batches, 0);
+    }
+
+    #[test]
+    fn continuous_scheduler_microbatches_compatible_image_work() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        for id in ["image-a", "image-b"] {
+            scheduler
+                .enqueue(WorkloadSpec::microbatchable(
+                    id,
+                    WorkloadClass::ImageGeneration,
+                    128,
+                    0,
+                    WorkloadResources {
+                        vram_bytes: 4_000,
+                        gpu_slots: 1,
+                        ..WorkloadResources::default()
+                    },
+                    "krea2|1024x1024|flow_match|20|bf16",
+                    2,
+                ))
+                .unwrap();
+        }
+
+        let lease = scheduler.next_batch(0).unwrap();
+
+        assert_eq!(lease.class, WorkloadClass::ImageGeneration);
+        assert_eq!(lease.workloads.len(), 2);
+    }
+
+    #[test]
+    fn continuous_scheduler_drains_before_exclusive_training() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        scheduler.enqueue(token_workload("decode", 0, 0)).unwrap();
+        let decode = scheduler.next_batch(0).unwrap();
+        scheduler
+            .enqueue(WorkloadSpec::singleton(
+                "train",
+                WorkloadClass::Training,
+                1,
+                1,
+                WorkloadResources {
+                    vram_bytes: 20_000,
+                    gpu_slots: 4,
+                    cpu_threads: 8,
+                    ..WorkloadResources::default()
+                },
+            ))
+            .unwrap();
+
+        assert!(scheduler.next_batch(2).is_none());
+        scheduler.complete(decode.lease_id).unwrap();
+        let training = scheduler.next_batch(3).unwrap();
+        assert_eq!(training.class, WorkloadClass::Training);
+        assert!(scheduler.snapshot().exclusive_active);
+        assert!(scheduler.next_batch(4).is_none());
+    }
+
+    #[test]
+    fn continuous_scheduler_ages_waiting_background_work() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 100);
+        scheduler
+            .enqueue(token_workload("background", 192, 0))
+            .unwrap();
+        scheduler
+            .enqueue(token_workload("interactive", 64, 150))
+            .unwrap();
+
+        let lease = scheduler.next_batch(200).unwrap();
+
+        assert_eq!(lease.workloads[0].id, "background");
+    }
+
+    #[test]
+    fn continuous_scheduler_rejects_duplicate_and_over_capacity_work() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 1, 0);
+        scheduler.enqueue(token_workload("a", 64, 0)).unwrap();
+        assert!(scheduler.enqueue(token_workload("a", 64, 0)).is_err());
+        assert!(scheduler.enqueue(token_workload("b", 64, 0)).is_err());
+
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 0, 0);
+        let oversized = WorkloadSpec::singleton(
+            "oversized",
+            WorkloadClass::ImageGeneration,
+            64,
+            0,
+            WorkloadResources {
+                vram_bytes: 25_000,
+                gpu_slots: 1,
+                ..WorkloadResources::default()
+            },
+        );
+        assert!(scheduler.enqueue(oversized).is_err());
+    }
+
+    #[test]
+    fn continuous_scheduler_round_robins_users_within_priority() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        for workload in [
+            owned_token_workload("a1", "alice", "ta", 64, 0),
+            owned_token_workload("a2", "alice", "ta", 64, 1),
+            owned_token_workload("b1", "bob", "tb", 64, 2),
+        ] {
+            let mut workload = workload;
+            workload.max_microbatch_size = 1;
+            scheduler.enqueue(workload).unwrap();
+        }
+        let first = scheduler.next_batch(10).unwrap();
+        scheduler.complete(first.lease_id).unwrap();
+        let second = scheduler.next_batch(11).unwrap();
+        assert_eq!(first.workloads[0].owner.user_id.as_deref(), Some("alice"));
+        assert_eq!(second.workloads[0].owner.user_id.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn continuous_scheduler_microbatches_across_users_and_cancels_by_owner() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        scheduler
+            .enqueue(owned_token_workload("a", "alice", "ta", 64, 0))
+            .unwrap();
+        scheduler
+            .enqueue(owned_token_workload("b", "bob", "tb", 64, 1))
+            .unwrap();
+        let lease = scheduler.next_batch(10).unwrap();
+        assert_eq!(lease.workloads.len(), 2);
+        assert_ne!(
+            lease.workloads[0].owner.user_id,
+            lease.workloads[1].owner.user_id
+        );
+        scheduler.complete(lease.lease_id).unwrap();
+
+        scheduler
+            .enqueue(owned_token_workload("a2", "alice", "ta", 64, 2))
+            .unwrap();
+        scheduler
+            .enqueue(owned_token_workload("a3", "alice", "other", 64, 3))
+            .unwrap();
+        scheduler
+            .enqueue(owned_token_workload("b2", "bob", "tb", 64, 4))
+            .unwrap();
+        assert_eq!(scheduler.cancel_pending_by_token("ta").len(), 1);
+        assert_eq!(scheduler.cancel_pending_by_user("alice").len(), 1);
+        assert_eq!(scheduler.snapshot().queued, 1);
     }
 }

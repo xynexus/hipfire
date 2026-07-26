@@ -1,0 +1,9 @@
+variant,m,layers,iters,gate_cosine,ffn_cosine,tail_cosine,complete_cosine,max_abs,mean_abs,total_ms,input_tok_s,package_w,tok_per_j,status
+r104_standalone_fresh,256,1,1,1.00000000,0.99996707,,,0.0737100,0.01499078,6.4926,,,,pass
+r104_standalone_recycle7,256,1,100,1.00000000,0.99996707,,,0.0737100,0.01499078,6.5401,,,,pass
+r104_default_layer0,256,1,1,,0.99991494,0.99999844,0.99996658,,,,,,,pass
+r99_paired_a,256,24,1,,,,,,,892.708,286.8,18.09,15.9,control
+r104_paired_a,256,24,1,,,,,,,859.599,297.8,19.09,15.6,pass
+r99_paired_b,256,24,1,,,,,,,909.986,281.3,20.04,14.0,control
+r104_paired_b,256,24,1,,,,,,,869.015,294.6,20.06,14.7,pass
+r104_default_current,256,24,1,,,,,,,894.222,286.3,18.07,15.8,pass

@@ -35,6 +35,7 @@ futures = "0.3"
 async-stream = "0.3"
 anyhow.workspace = true
 hipfire-admin-types = { path = "../hipfire-admin-types" }
+hipfire-auth = { path = "../hipfire-auth" }
 hipfire-sysinfo = { path = "../hipfire-sysinfo" }
 hipfire-build-info = { path = "../hipfire-build-info" }
 hipfire-config = { path = "../hipfire-config" }
@@ -44,6 +45,10 @@ hipfire-generate = { path = "../hipfire-generate" }
 hipfire-diffusion = { path = "../hipfire-diffusion" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-arch-api = { path = "../hipfire-arch-api" }
+# Force-links every arch `-spec` crate so ArchRegistry sees their capability
+# registrations (e.g. ContinuousBatching) for batch-eligibility routing.
+hipfire-arch-specs = { path = "../hipfire-arch-specs" }
 hipfire-operator = { path = "../hipfire-operator" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-scheduler = { path = "../hipfire-scheduler" }
@@ -55,3 +60,4 @@ image = { version = "0.25", default-features = false, features = [
 
 [dev-dependencies]
 tower = "0.5"
+tempfile = "3"

@@ -9,7 +9,7 @@
 
 use crate::{
     box_muller_pair, shape4, CpuTensor, DiffusionResult, DiffusionRuntimeKind, DiffusionSchedule,
-    SplitMix64,
+    SeFiDualSchedule, SplitMix64,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -73,6 +73,27 @@ pub struct DiffusionImg2ImgRequest {
     #[serde(default)]
     pub resize_mode: DiffusionImg2ImgResizeMode,
     pub denoising_strength: f32,
+    /// When set, overrides `denoising_strength` with an explicit MrFlow
+    /// direct-sigma refine schedule: the high-resolution refine pass of staged
+    /// sampling (low-res generate -> pixel-space SR -> re-encode -> short
+    /// refine). Flow-match backbones only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refine_sigma: Option<RefineSigmaSchedule>,
+}
+
+/// MrFlow "direct sigma" refine schedule parameters. See
+/// [`DiffusionSchedule::refine_direct_sigma`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct RefineSigmaSchedule {
+    /// Direct start sigma for the refine pass; `0 < first_sigma < 1`. MrFlow
+    /// Krea-2 presets use `0.11`-`0.16`.
+    pub first_sigma: f32,
+    /// Number of refine denoise steps. MrFlow uses `1`.
+    pub steps: u32,
+    /// Use the flow-match shifted interior schedule. Only differs from the
+    /// linear ramp when `steps > 1`.
+    #[serde(default)]
+    pub shifted: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -160,6 +181,7 @@ pub struct DiffusionRunPlan {
     pub latent_shape: DiffusionLatentShape,
     pub latents: LatentBatch,
     pub schedule: DiffusionSchedule,
+    pub(crate) sefi_dual_schedule: Option<SeFiDualSchedule>,
     pub conditioning: DiffusionConditioningBatch,
 }
 
@@ -178,6 +200,33 @@ pub struct LatentBatch {
     pub height: usize,
     pub width: usize,
     pub data: Vec<f32>,
+}
+
+pub(crate) fn slice_latent_channels(
+    input: &LatentBatch,
+    start_channel: usize,
+) -> DiffusionResult<LatentBatch> {
+    if start_channel >= input.channels {
+        return Err(crate::DiffusionError::InvalidMetadata(format!(
+            "latent channel slice start {start_channel} is outside {} channels",
+            input.channels
+        )));
+    }
+    let channels = input.channels - start_channel;
+    let spatial = input.height * input.width;
+    let mut data = Vec::with_capacity(input.batch * channels * spatial);
+    for batch in 0..input.batch {
+        let start = (batch * input.channels + start_channel) * spatial;
+        let end = start + channels * spatial;
+        data.extend_from_slice(&input.data[start..end]);
+    }
+    Ok(LatentBatch {
+        batch: input.batch,
+        channels,
+        height: input.height,
+        width: input.width,
+        data,
+    })
 }
 
 impl LatentBatch {

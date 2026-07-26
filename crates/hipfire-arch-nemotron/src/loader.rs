@@ -64,6 +64,7 @@ pub fn load_nemotron_weights(
     let mut layer_norm = Vec::with_capacity(cfg.num_layers);
     let mut blocks = Vec::with_capacity(cfg.num_layers);
     for (l, kind) in cfg.blocks.iter().enumerate() {
+        hipfire_runtime::load_progress::report(l as u32 + 1, cfg.num_layers as u32, "weights");
         let p = format!("backbone.layers.{l}");
         layer_norm.push(get(src, &format!("{p}.norm.weight"))?);
         let m = format!("{p}.mixer");
@@ -131,9 +132,9 @@ pub fn load_nemotron_weights(
 // ── HFQ (quantized) loading ──────────────────────────────────────────────────
 
 use crate::weight::{EmbeddingTable, LinearWeight};
+use hipfire_rdna::{DType, Gpu};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::weights::WeightTensor;
-use hipfire_rdna::{DType, Gpu};
 
 /// quant_type byte → quantized linear `DType` (None ⇒ stored as a plain
 /// precision, handle via `dequant_qt`). See `qt_name` in hipfire-quantize.
@@ -178,7 +179,7 @@ pub fn first_hfq_tensor<'a>(hfq: &HfqFile, names: &[&'a str]) -> Result<&'a str,
 
 // OQ4 arch-combined repack moved to `hipfire_runtime::hfq::oq4_pack_arch_combined`
 // (the single source of truth shared by the llama/qwen35/nemotron qt=34 loaders and
-// the oq4_repack tool). nemotron already depends on hipfire_runtime.
+// the `hipfire optimize` tool). nemotron already depends on hipfire_runtime.
 
 /// Load one linear weight as a `LinearWeight` (quantized when 4-bit/Q8, else an
 /// F32 upload). `m`=out rows, `k`=in cols. The nemotron HFQ has no awq sidecars,
@@ -191,16 +192,31 @@ pub fn load_linear_hfq(
     k: usize,
 ) -> Result<LinearWeight, String> {
     let (qt, data) = hfq_tensor(hfq, name)?;
+    // Opus int8-activation family (OQ8 W8A8 qt=35, OQ+ W4A8 qt=33, OQ+ compact
+    // qt=36) → arch-combined `Oq8G256` via the shared repack helpers, dispatched by
+    // the generic iu8 GEMV/GEMM. Nemotron previously handled only OQ4 (34/37) and
+    // errored on qt 35. Mirrors the hfq.rs LLaMA loader.
+    if let Some((bytes, gpu_dtype)) = hipfire_runtime::hfq::oq8_arch_load(qt, &data, m, k) {
+        let buf = gpu
+            .upload_raw(&bytes, &[bytes.len()])
+            .map_err(|e| format!("nemotron hfq oq8 upload {name}: {e:?}"))?;
+        // oq8+/oq8++ carry the per-input-channel awq_scale sidecar; plain oq8 has none.
+        let awq_scale = hipfire_runtime::hfq::load_awq_scale(hfq, gpu, name, k);
+        return Ok(LinearWeight::Quant(Box::new(WeightTensor {
+            buf,
+            gpu_dtype,
+            m,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale,
+        })));
+    }
     // OQ4 (Opus Quant, symmetric W4): qt=34 is the row-major grouped on-disk form
     // that needs the arch-combined repack; qt=37 is already arch-packed. Both
     // dispatch as `DType::Oq4G256` (gemv via the shared dispatch, batched prefill
     // via `hipfire_runtime::weights::weight_gemm`). Mirrors the hfq.rs LLaMA loader.
-    if qt == 34 || qt == 37 {
-        let packed = if qt == 34 {
-            hipfire_runtime::hfq::oq4_pack_arch_combined(&data, m, k)
-        } else {
-            data
-        };
+    if let Some((packed, gpu_dtype)) = hipfire_runtime::hfq::oq4_arch_load(qt, &data, m, k) {
         let buf = gpu
             .upload_raw(&packed, &[packed.len()])
             .map_err(|e| format!("nemotron hfq oq4 upload {name}: {e:?}"))?;
@@ -209,7 +225,7 @@ pub fn load_linear_hfq(
         let awq_scale = hipfire_runtime::hfq::load_awq_scale(hfq, gpu, name, k);
         return Ok(LinearWeight::Quant(Box::new(WeightTensor {
             buf,
-            gpu_dtype: DType::Oq4G256,
+            gpu_dtype,
             m,
             k,
             row_stride: 0,

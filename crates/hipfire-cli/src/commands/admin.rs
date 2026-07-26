@@ -143,7 +143,7 @@ pub async fn run(args: AdminArgs, config: HipfireConfig) -> anyhow::Result<()> {
         AdminCommand::Config { model } => {
             let path = match model {
                 Some(model) => {
-                    let model = resolve_model_display_tag(&model);
+                    let model = resolve_model_display_tag(&model, &config);
                     format!("/admin/config/resolved?model={}", url_encode(&model))
                 }
                 None => "/admin/config/resolved".to_string(),
@@ -285,8 +285,8 @@ fn url_encode(value: &str) -> String {
     encoded
 }
 
-fn resolve_model_display_tag(model: &str) -> String {
-    find_model(model)
+fn resolve_model_display_tag(model: &str, config: &HipfireConfig) -> String {
+    find_model(model, config)
         .map(|path| model_display_name(&path))
         .unwrap_or_else(|| model.to_string())
 }

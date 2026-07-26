@@ -534,7 +534,16 @@ pub struct ModelSlotConfig {
     pub max_seq: usize,
     pub kv_mode: KvMode,
     pub repeat_window: usize,
-    pub state_quant: qwen35::StateQuant,
+    /// DeltaNet recurrent-state precision. `None` = **auto**, resolved at load
+    /// through the redundancy gate (`qwen35::default_state_quant`), which yields
+    /// FP32 for all current models.
+    ///
+    /// This was `StateQuant::Q8` hardcoded, which bypassed the gate entirely —
+    /// every `ModelSlot` (including every spec-decode harness) silently ran Q8
+    /// recurrent state despite the gate being configured to select FP32.
+    /// Quantized DeltaNet state is deprecated; see the policy note on
+    /// `qwen35::deltanet_state_fp32_below`.
+    pub state_quant: Option<qwen35::StateQuant>,
 }
 
 impl Default for ModelSlotConfig {
@@ -543,7 +552,7 @@ impl Default for ModelSlotConfig {
             max_seq: 2048,
             kv_mode: KvMode::Q8,
             repeat_window: 128,
-            state_quant: qwen35::StateQuant::Q8,
+            state_quant: None, // auto -> redundancy gate (FP32 today)
         }
     }
 }
@@ -659,9 +668,22 @@ impl ModelSlot {
                 config.head_dim,
                 slot_config.max_seq,
             )?,
+            // KVarN 4-bit K + Q8 V. The two-tier hot/cold hierarchical cache
+            // (HIPFIRE_KV_HIERARCHICAL=1) layers on top of this base tier.
+            KvMode::Kvarn => KvCache::new_gpu_kvarn_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+                KvCache::kvarn_bits_from_env(),
+            )?,
         };
 
-        let dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;
+        let dn_quant = slot_config
+            .state_quant
+            .unwrap_or_else(|| qwen35::default_state_quant(&config));
+        let dn_state = DeltaNetState::new_with_quant(gpu, &config, dn_quant)?;
         let scratch = Qwen35Scratch::new(gpu, &config, slot_config.repeat_window)?;
 
         Ok(Self {
@@ -940,19 +962,38 @@ fn dflash_verify_frame_rollback_replay_from_env() -> bool {
     )
 }
 
-/// `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=0` opts out of the conservative
-/// serial-source tape rollback path. Default-on: capture the committed prefix
-/// through the serial target path, then commit DN state through token-major
-/// GDN tape replay instead of trusting the serial/full-prefill DN result
-/// directly.
+/// `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=1` opts IN to the serial-source tape
+/// rollback path: capture the committed prefix through the serial target path,
+/// then commit DN state through token-major GDN tape replay instead of trusting
+/// the serial/full-prefill DN result directly.
+///
+/// **Default-off as of 2026-07-19 — this path breaks spec-decode losslessness
+/// (bug #21).** It was default-on as a "conservative" DN-commit, but the tape it
+/// replays is the *batched verify* tape over the drafted block, so the hidden
+/// states it feeds the replay depend on the drafted tokens. Committed output
+/// therefore followed the drafter. Measured on qwen3.5-9b-mq4 + the engine
+/// prompt, `HIPFIRE_DFLASH_ROLLBACK_COMPARE=1` at the most trivial possible
+/// rollback (`pos=18 accepted=0 replay_steps=1` — zero accepted tokens, so no
+/// speculative logic is involved at all):
+///
+/// * `serial-tape-state-compare` → **match** (the DN S/conv state is fine), but
+/// * `input-compare` → mismatch `wo_residual_in[0]`, mean_abs 1.30e-2, max_abs 6.59
+/// * `x-in-compare`  → mismatch `x_in[1]`, mean_abs 4.75e-2
+/// * `wo-delta-compare` → 6 of 4096 words, max_abs 9.3e-10 (pure rounding, fine)
+///
+/// So the replay's *inputs* are wrong, not its arithmetic or the DN state it
+/// produces. Turning it off makes all four drafters (f16, npu.oq8, npu.oq4.25+,
+/// mq4) commit byte-identical tokens matching `--ar-baseline` while genuinely
+/// differing in acceptance (30/31/33/30 cycles, τ 2.200/2.097/1.879/2.200), and
+/// is also ~30% FASTER (≈6.1 vs ≈4.5 tok/s) since it skips the replay entirely.
 fn dflash_serial_tape_rollback_replay_from_env() -> bool {
-    !matches!(
-        // HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE: default-on conservative
-        // serial-source GDN tape rollback; set 0/false/off/no to opt out.
+    matches!(
+        // HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE: default-OFF; set 1/true/on/yes to
+        // opt in to the (lossy) serial-source GDN tape rollback.
         std::env::var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE")
             .ok()
             .as_deref(),
-        Some("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+        Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
     )
 }
 
@@ -2087,6 +2128,14 @@ pub struct GdnTape {
     /// token-major stochastic requant frames.
     pub q8_requant_frame_base: Option<u32>,
     pub q8_requant_frame_layers: usize,
+    /// Absolute sequence position of tape row 0. Every replay derives the Q8
+    /// requant seed from `base_position + step`, so replayed rounding matches
+    /// what an AR run at those same positions would produce (issue #17).
+    ///
+    /// Set at capture time — see [`GdnTape::set_base_position`], called from
+    /// `verify_dflash_block_inner` with the verify block's `start_pos` and
+    /// from every diagnostic capture that fills a fresh tape.
+    pub base_position: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -2291,7 +2340,15 @@ impl GdnTape {
             attn_scratch: gpu.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?,
             q8_requant_frame_base: None,
             q8_requant_frame_layers: n_la_layers,
+            base_position: 0,
         })
+    }
+
+    /// Record the absolute sequence position of tape row 0. Must be called by
+    /// whatever fills the tape, before any replay: the Q8 requant seed for
+    /// replay step `s` is `base_position + s` (issue #17).
+    pub fn set_base_position(&mut self, base_position: usize) {
+        self.base_position = base_position;
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -2619,6 +2676,7 @@ impl GdnTapeShards {
                 attn_scratch: g.alloc_tensor(&[max_n * v_dim], hipfire_rdna::DType::F32)?,
                 q8_requant_frame_base: None,
                 q8_requant_frame_layers: n_la_total,
+                base_position: 0,
             });
         }
 
@@ -3196,6 +3254,14 @@ impl GdnTapeShards {
     ///
     /// Caller must have restored the DN snapshot to the pre-verify point
     /// before calling this.
+    /// Record the absolute sequence position of tape row 0 on every band.
+    /// Mirrors [`GdnTape::set_base_position`]; see issue #17.
+    pub fn set_base_position(&mut self, base_position: usize) {
+        for shard in &mut self.shards {
+            shard.base_position = base_position;
+        }
+    }
+
     pub fn replay_gdn_multi(
         &self,
         gpus: &mut Gpus,
@@ -3317,6 +3383,10 @@ impl GdnTapeShards {
                 n_steps,
                 n_v_heads,
                 config.linear_value_head_dim,
+                // Block base: the batched kernel adds its intra-block token
+                // index `t`, so token `t` is seeded at `base_position + t`.
+                shard.base_position as u32,
+                global_la_idx as u32,
             )?;
 
             global_la_idx += 1;
@@ -4594,6 +4664,8 @@ impl GdnTape {
                         1,
                         n_v_heads,
                         value_head_dim,
+                        (self.base_position + step) as u32,
+                        la_idx as u32,
                     )?,
                     qwen35::StateQuant::Q4 => gpu.gated_delta_net_q4(
                         &q,
@@ -4742,6 +4814,8 @@ impl GdnTape {
                         1,
                         n_v_heads,
                         value_head_dim,
+                        (self.base_position + step) as u32,
+                        la_idx as u32,
                     )?,
                     qwen35::StateQuant::Q4 => gpu.gated_delta_net_q4(
                         &q,
@@ -5026,6 +5100,10 @@ impl GdnTape {
                             1,
                             n_v_heads,
                             value_head_dim,
+                            // Replay row `step` is the token at absolute
+                            // position `base_position + step` (issue #17).
+                            (self.base_position + step) as u32,
+                            la_idx as u32,
                         )?;
                     }
                 }
@@ -5434,13 +5512,67 @@ impl HiddenStateRingBuffer {
         max_batch: usize,
     ) -> HipResult<Self> {
         let extract_layers = dflash_extract_layer_ids(num_target_layers, num_extract);
-        let mut layer_bufs = Vec::with_capacity(num_extract);
-        let mut staging_bufs = Vec::with_capacity(num_extract);
-        for _ in 0..num_extract {
-            layer_bufs
-                .push(gpu.alloc_tensor(&[max_positions * hidden_dim], hipfire_rdna::DType::F32)?);
-            staging_bufs
-                .push(gpu.alloc_tensor(&[max_batch * hidden_dim], hipfire_rdna::DType::F32)?);
+        Self::new_for_layers(
+            gpu,
+            num_target_layers,
+            extract_layers,
+            hidden_dim,
+            max_positions,
+            max_batch,
+        )
+    }
+
+    /// Allocate a hidden-state ring for explicitly selected logical layers.
+    /// DFlash uses [`Self::new`]'s evenly spaced policy; calibration parity
+    /// uses this constructor to observe every layer without coupling the probe
+    /// to the DFlash extraction policy.
+    pub fn new_for_layers(
+        gpu: &mut Gpu,
+        num_target_layers: usize,
+        extract_layers: Vec<usize>,
+        hidden_dim: usize,
+        max_positions: usize,
+        max_batch: usize,
+    ) -> HipResult<Self> {
+        validate_hidden_extract_layers(
+            num_target_layers,
+            &extract_layers,
+            hidden_dim,
+            max_positions,
+            max_batch,
+        )
+        .map_err(|error| hip_bridge::HipError::new(0, &error))?;
+        let mut layer_bufs = Vec::with_capacity(extract_layers.len());
+        let mut staging_bufs = Vec::with_capacity(extract_layers.len());
+        let ring_elements = max_positions * hidden_dim;
+        let staging_elements = max_batch * hidden_dim;
+        for _ in 0..extract_layers.len() {
+            let layer = match gpu.alloc_tensor(&[ring_elements], hipfire_rdna::DType::F32) {
+                Ok(tensor) => tensor,
+                Err(error) => {
+                    for tensor in layer_bufs {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    for tensor in staging_bufs {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(error);
+                }
+            };
+            layer_bufs.push(layer);
+            let staging = match gpu.alloc_tensor(&[staging_elements], hipfire_rdna::DType::F32) {
+                Ok(tensor) => tensor,
+                Err(error) => {
+                    for tensor in layer_bufs {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    for tensor in staging_bufs {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(error);
+                }
+            };
+            staging_bufs.push(staging);
         }
         Ok(Self {
             layer_bufs,
@@ -5649,6 +5781,43 @@ impl HiddenStateRingBuffer {
         self.head = 0;
         self.written = 0;
     }
+}
+
+fn validate_hidden_extract_layers(
+    num_target_layers: usize,
+    extract_layers: &[usize],
+    hidden_dim: usize,
+    max_positions: usize,
+    max_batch: usize,
+) -> Result<(), String> {
+    if num_target_layers == 0 || hidden_dim == 0 || max_positions == 0 || max_batch == 0 {
+        return Err(
+            "hidden-state ring layer count, width, positions, and batch must be nonzero".into(),
+        );
+    }
+    if max_batch > max_positions {
+        return Err(format!(
+            "hidden-state ring max_batch {max_batch} exceeds max_positions {max_positions}"
+        ));
+    }
+    if max_positions.checked_mul(hidden_dim).is_none()
+        || max_batch.checked_mul(hidden_dim).is_none()
+    {
+        return Err("hidden-state ring allocation shape overflows usize".into());
+    }
+    let mut prior = None;
+    for &layer in extract_layers {
+        if layer >= num_target_layers {
+            return Err(format!(
+                "hidden-state extraction layer {layer} is outside 0..{num_target_layers}"
+            ));
+        }
+        if prior.is_some_and(|previous| layer <= previous) {
+            return Err("hidden-state extraction layers must be unique and increasing".into());
+        }
+        prior = Some(layer);
+    }
+    Ok(())
 }
 
 #[inline]
@@ -6121,6 +6290,16 @@ fn verify_dflash_block_inner(
     graph_policy: VerifyGraphPolicy,
     verify_scratch: &VerifyScratch,
 ) -> HipResult<DflashVerifyOutput> {
+    // Tape row 0 records `draft_tokens[0]`, which occupies absolute sequence
+    // position `start_pos`. Stamping it here means every replay of this tape
+    // (including the branch re-capture in Path C, which passes its own
+    // `branch_start_pos`) derives Q8 requant seeds from real positions rather
+    // than dispatch history (issue #17).
+    let mut gdn_tape = gdn_tape;
+    if let Some(tape) = gdn_tape.as_deref_mut() {
+        tape.set_base_position(start_pos);
+    }
+
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
     let dim = target.config.dim;
@@ -6814,6 +6993,12 @@ pub fn spec_step_dflash(
                 hipfire_runtime::weights::EmbeddingFormat::Q8_0 => {
                     gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
                 }
+                hipfire_runtime::weights::EmbeddingFormat::BF16 => {
+                    gpu.embedding_lookup_bf16(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::weights::EmbeddingFormat::F16 => {
+                    gpu.embedding_lookup_f16(&target.weights.token_embd, &dst, tok, h)?
+                }
                 hipfire_runtime::weights::EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
                 }
@@ -6886,21 +7071,33 @@ pub fn spec_step_dflash(
         };
 
         // ── 4. draft_forward ────────────────────────────────────────────────
-        // noise_embedding = None: we wrote embeddings directly into
-        // draft_scratch.x above via D2D (no host round-trip).
-        dflash::draft_forward_opts(
-            gpu,
-            draft_weights,
-            draft_cfg,
-            None,
-            th_arg,
-            &positions_q,
-            &positions_k,
-            b,
-            effective_ctx_len,
-            draft_scratch,
-            draft_ffn_graph,
-        )?;
+        // Phase 1 seam: when the serial NPU draft is enabled (and the context
+        // has grown to the body's fixed l_ctx window), run the DFlash NPU block
+        // body in place of the GPU draft. It lands block hidden into
+        // draft_scratch.x rows 1..B at the same layout, so everything downstream
+        // (lm_head/argmax/accept/scatter/rollback) is untouched. The block's
+        // target-embedding rows are already in draft_scratch.x[0..B] (step 2),
+        // which the NPU body consumes as its seed. Losslessness is structural:
+        // the target verifies every proposed token regardless of drafter.
+        //
+        // noise_embedding = None: on the GPU path we wrote embeddings directly
+        // into draft_scratch.x above via D2D (no host round-trip).
+        let ran_npu_draft = draft_scratch.npu_draft_forward(gpu, position, b)?;
+        if !ran_npu_draft {
+            dflash::draft_forward_opts(
+                gpu,
+                draft_weights,
+                draft_cfg,
+                None,
+                th_arg,
+                &positions_q,
+                &positions_k,
+                b,
+                effective_ctx_len,
+                draft_scratch,
+                draft_ffn_graph,
+            )?;
+        }
 
         // ── 5. Apply target.lm_head to draft hidden positions 1..B ──────────
         // Fast path: a single batched GEMM against target.weights.output over
@@ -7597,6 +7794,8 @@ pub fn spec_step_dflash(
                 &target.config,
                 replay_tokens.len(),
             )?);
+            // Tape row 0 = absolute sequence position `position` (issue #17).
+            serial_tape.set_base_position(position);
             for (i, &tok) in replay_tokens.iter().enumerate() {
                 qwen35::forward_scratch_capture_gdn_tape(
                     gpu,
@@ -8323,6 +8522,8 @@ pub fn spec_step_dflash(
                 gpu.debug_set_gdn_requant_frame(serial_frame_start);
                 let mut prefill_tape =
                     GdnTape::new_for_config(gpu, &target.config, accept_len + 1)?;
+                // Tape row 0 = absolute sequence position `position` (issue #17).
+                prefill_tape.set_base_position(position);
                 qwen35::forward_prefill_batch_force_q8_gdn_per_token(
                     gpu,
                     &target.weights,
@@ -8384,6 +8585,8 @@ pub fn spec_step_dflash(
                 target_snap.restore_to(&mut target.dn_state, gpu)?;
                 gpu.debug_set_gdn_requant_frame(serial_frame_start);
                 let mut serial_tape = GdnTape::new_for_config(gpu, &target.config, accept_len + 1)?;
+                // Tape row 0 = absolute sequence position `position` (issue #17).
+                serial_tape.set_base_position(position);
                 let mut serial_prefix_result: Option<DeltaNetSnapshot> = None;
                 for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
                     qwen35::forward_scratch_capture_gdn_tape(
@@ -8813,6 +9016,9 @@ pub fn spec_step_dflash(
                 {
                     let mut repaired_tape =
                         GdnTape::new_for_config(gpu, &target.config, accept_len + 1)?;
+                    // Repaired rows mirror the source tape's rows 0..accept_len+1,
+                    // which start at absolute position `position` (issue #17).
+                    repaired_tape.set_base_position(position);
                     match repaired_tape.repair_qkvza_from_captured_x_single_row(
                         gpu,
                         &target.weights,
@@ -9266,6 +9472,8 @@ pub fn spec_step_dflash(
             let serial_frame_start = gpu.debug_gdn_requant_frame();
             target_snap.restore_to(&mut target.dn_state, gpu)?;
             let mut serial_tape = GdnTape::new_for_config(gpu, &target.config, accept_len + 1)?;
+            // Tape row 0 = absolute sequence position `position` (issue #17).
+            serial_tape.set_base_position(position);
             let mut serial_prefix_result: Option<DeltaNetSnapshot> = None;
             for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
                 qwen35::forward_scratch_capture_gdn_tape(
@@ -9768,6 +9976,8 @@ pub fn spec_step_dflash(
             gpu.debug_set_gdn_requant_frame(serial_frame_start);
             let mut token_major_tape =
                 GdnTape::new_for_config(gpu, &target.config, accept_len + 1)?;
+            // Tape row 0 = absolute sequence position `position` (issue #17).
+            token_major_tape.set_base_position(position);
             for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
                 qwen35::forward_scratch_capture_gdn_tape(
                     gpu,
@@ -10010,6 +10220,12 @@ fn run_dflash_draft_for_logits(
             hipfire_runtime::weights::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
             }
+            hipfire_runtime::weights::EmbeddingFormat::BF16 => {
+                gpu.embedding_lookup_bf16(&target.weights.token_embd, &dst, tok, h)?
+            }
+            hipfire_runtime::weights::EmbeddingFormat::F16 => {
+                gpu.embedding_lookup_f16(&target.weights.token_embd, &dst, tok, h)?
+            }
             hipfire_runtime::weights::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
             }
@@ -10213,6 +10429,12 @@ fn run_dflash_draft_for_topk_gpu(
             }
             hipfire_runtime::weights::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
+            }
+            hipfire_runtime::weights::EmbeddingFormat::BF16 => {
+                gpu.embedding_lookup_bf16(&target.weights.token_embd, &dst, tok, h)?
+            }
+            hipfire_runtime::weights::EmbeddingFormat::F16 => {
+                gpu.embedding_lookup_f16(&target.weights.token_embd, &dst, tok, h)?
             }
             hipfire_runtime::weights::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
@@ -11199,6 +11421,7 @@ pub fn spec_step_ddtree_batched(
                 target.config.n_kv_heads,
                 target.config.head_dim,
                 n_rot,
+                n_rot,
                 target.config.rope_theta,
                 n_positions,
                 0,
@@ -11971,6 +12194,15 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn explicit_hidden_extract_layers_require_a_unique_increasing_subset() {
+        assert!(validate_hidden_extract_layers(4, &[0, 1, 3], 8, 16, 4).is_ok());
+        assert!(validate_hidden_extract_layers(4, &[1, 1], 8, 16, 4).is_err());
+        assert!(validate_hidden_extract_layers(4, &[2, 1], 8, 16, 4).is_err());
+        assert!(validate_hidden_extract_layers(4, &[4], 8, 16, 4).is_err());
+        assert!(validate_hidden_extract_layers(4, &[0], 8, 4, 5).is_err());
+    }
 
     #[test]
     fn compact_target_hidden_host_keeps_selected_rows() {

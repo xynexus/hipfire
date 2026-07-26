@@ -30,8 +30,8 @@
 //!   cargo run -p hipfire-train --release --example gradcheck_lora
 //!   hipfire gpu-lock release
 
-use hipfire_train::ops::lora::{lora_backward, lora_forward};
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipResult};
+use hipfire_train::ops::lora::{lora_backward, lora_forward};
 
 const M: usize = 4; // tokens
 const K: usize = 6; // in

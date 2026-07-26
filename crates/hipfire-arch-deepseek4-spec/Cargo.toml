@@ -7,3 +7,4 @@ description = "Lean offline spec for the DeepSeek-V4 family (arch_id 9): identit
 
 [dependencies]
 hipfire-arch-api = { path = "../hipfire-arch-api" }
+serde_json = "1"

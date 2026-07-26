@@ -38,6 +38,7 @@ use crate::types::*;
 /// fields use experts[0] as representative (the loader builds all experts in a
 /// layer with matching dtype, so [0] == all — same invariant the original
 /// routed_* checks relied on).
+#[derive(Clone, Copy, Debug)]
 pub struct MoeDtypes {
     pub router: DType,
     pub shared_gate: DType,        // ffn.shared_expert_gate
@@ -58,12 +59,26 @@ pub struct MoeResolution {
     pub routed_indexable_mq4: bool,
     pub routed_indexable_mq6: bool,
     pub routed_indexable_paro: bool,
+    /// Opus Quant W4A16 routed experts (Oq4G256 gate_up + down). Indexed
+    /// MoE-block kernels (132 B/group) — same FWHT-rotated activation basis as
+    /// the MQ path, so it shares `needs_x_rot_local`/`rotate_x_mq`.
+    pub routed_indexable_oq4: bool,
+    /// Opus Quant W8A16 routed experts (Oq8G256 gate_up + down, 260 B/group).
+    pub routed_indexable_oq8: bool,
     pub use_gpu_topk: bool,
     pub needs_x_rot_local: bool,
 }
 
 impl MoeResolution {
     pub fn resolve(d: &MoeDtypes, k: usize) -> Self {
+        let oq_indexed_decode = std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
+            .ok()
+            .as_deref()
+            == Some("1");
+        Self::resolve_with_oq_indexed(d, k, oq_indexed_decode)
+    }
+
+    pub fn resolve_with_oq_indexed(d: &MoeDtypes, k: usize, oq_indexed_decode: bool) -> Self {
         use DType::*;
         let gate_side_mq4 = d.router == MQ4G256
             && d.shared_gate == MQ4G256
@@ -75,30 +90,52 @@ impl MoeResolution {
         let routed_gate_up_mq6 = d.routed_gate_up == MQ6G256;
         let routed_gate_up_paro = d.routed_gate_up == ParoQ4G128 && d.has_paro_shared;
 
+        let routed_gate_up_oq4 = d.routed_gate_up == Oq4G256;
+        let routed_gate_up_oq8 = d.routed_gate_up == Oq8G256;
+
         let routed_indexable_mq4 = (d.routed_down == MQ4G256) && routed_gate_up_mq4;
         let routed_indexable_mq6 = (d.routed_down == MQ6G256) && routed_gate_up_mq6;
         let routed_indexable_paro =
             (d.routed_down == ParoQ4G128 && d.has_paro_shared) && routed_gate_up_paro;
+        let routed_indexable_oq4 =
+            oq_indexed_decode && (d.routed_down == Oq4G256) && routed_gate_up_oq4;
+        let routed_indexable_oq8 =
+            oq_indexed_decode && (d.routed_down == Oq8G256) && routed_gate_up_oq8;
 
-        let routed_dtype_indexable =
-            routed_indexable_mq4 || routed_indexable_mq6 || routed_indexable_paro;
+        let routed_dtype_indexable = routed_indexable_mq4
+            || routed_indexable_mq6
+            || routed_indexable_paro
+            || routed_indexable_oq4
+            || routed_indexable_oq8;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
-        let needs_x_rot_local =
-            gate_side_mq4 || routed_gate_up_mq4 || routed_gate_up_mq6 || routed_gate_up_paro;
+        // OQ routed experts are FWHT-rotated (same signs as MQ, gen_fwht_signs
+        // 42/1042 uploaded by ensure_mq_signs) → they need x_rot_local too.
+        let needs_x_rot_local = gate_side_mq4
+            || routed_gate_up_mq4
+            || routed_gate_up_mq6
+            || routed_gate_up_paro
+            || routed_gate_up_oq4
+            || routed_gate_up_oq8;
 
         Self {
             gate_side_mq4,
             routed_indexable_mq4,
             routed_indexable_mq6,
             routed_indexable_paro,
+            routed_indexable_oq4,
+            routed_indexable_oq8,
             use_gpu_topk,
             needs_x_rot_local,
         }
     }
 
     pub fn routed_indexable(&self) -> bool {
-        self.routed_indexable_mq4 || self.routed_indexable_mq6 || self.routed_indexable_paro
+        self.routed_indexable_mq4
+            || self.routed_indexable_mq6
+            || self.routed_indexable_paro
+            || self.routed_indexable_oq4
+            || self.routed_indexable_oq8
     }
 }
 
@@ -292,6 +329,37 @@ pub struct MoeBiasAwarePrefillParams<'a> {
 
 // ── Qwen3.5 softmax-top-k MoE prefill parameters (Ship 4.2) ──
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoePrefillCapturePoint {
+    GateUpInput,
+    DownInput,
+}
+
+/// Family-neutral view of a routed-expert activation seam. The callback sees
+/// the complete teacher routing plus the already-built grouped permutation;
+/// it may filter rows for calibration, but must not mutate execution routing.
+pub struct MoePrefillCaptureBatch<'a> {
+    pub layer: usize,
+    pub point: MoePrefillCapturePoint,
+    pub source: &'a GpuTensor,
+    pub source_width: usize,
+    pub source_row_div: usize,
+    pub topk_indices: &'a GpuTensor,
+    pub topk_weights: &'a GpuTensor,
+    pub sorted_slot_index: &'a GpuTensor,
+    pub batch_size: usize,
+    pub k_top: usize,
+    pub num_experts: usize,
+}
+
+pub trait MoePrefillCapture: Send + Sync {
+    fn capture(
+        &self,
+        gpu: &mut hipfire_rdna::Gpu,
+        batch: &MoePrefillCaptureBatch<'_>,
+    ) -> Result<(), DispatchError>;
+}
+
 /// Parameters for the qwen35 batched/prefill MoE routed-expert block.
 ///
 /// Distinct from [`MoeBiasAwarePrefillParams`] — qwen35 uses softmax top-k
@@ -306,6 +374,8 @@ pub struct MoeBiasAwarePrefillParams<'a> {
 /// All tensor refs are `&'a GpuTensor` (shared, not `&mut` — GpuTensor is Copy).
 /// Scratch tensors are model-owned; the family holds only references.
 pub struct MoePrefillParams<'a> {
+    pub layer: usize,
+    pub capture: Option<&'a dyn MoePrefillCapture>,
     // dtype snapshot
     pub dtypes: MoeDtypes,
     // dims
@@ -392,15 +462,23 @@ impl MoePrefillResolution {
         arch: &hipfire_rdna::arch_caps::ArchCaps,
         flags: &hipfire_rdna::feature_flags::FeatureFlags,
     ) -> Self {
-        let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
-        let use_path2 = flags.moe_grouped_gemm && arch.has_wmma();
-        // MQ6 grouped-WMMA (`gemm_hfq6g256_moe_grouped_wmma`) is gfx12-only
-        // (no gfx11 variant yet). Fall back to Path 1 (indexed batched GEMV)
-        // on gfx11 to avoid the gfx12-only kernel panic. Path 1 MQ6 indexed
-        // kernels exist on all WMMA archs.
-        let mq6_on_non_gfx12 =
-            d.routed_gate_up == DType::MQ6G256 && !(arch.is_gfx1200() || arch.is_gfx1201());
-        let use_path2 = use_path2 && !mq6_on_non_gfx12;
+        let routed_dtype = d.routed_gate_up;
+        let paro_mode = routed_dtype == DType::ParoQ4G128 && d.has_paro_shared;
+        let is_gfx12 = arch.is_gfx1200() || arch.is_gfx1201();
+        let grouped_supported = match routed_dtype {
+            DType::MQ4G256 | DType::ParoQ4G128 => arch.has_wmma(),
+            DType::MQ6G256 | DType::MQ3G256 => arch.is_gfx1151() || is_gfx12,
+            DType::MQ2G256Lloyd => arch.is_gfx1151(),
+            // gfx1151 uses the admitted raw WMMA kernels. Other architectures
+            // retain the same grouped routing and use the portable active-route
+            // fallback rather than rejecting source-model calibration.
+            DType::F16 | DType::BF16 => true,
+            _ => false,
+        };
+        // MQ3 and raw F16/BF16 have no indexed fallback, so do not let a tuning
+        // opt-out route them into a nonexistent path.
+        let grouped_required = matches!(routed_dtype, DType::MQ3G256 | DType::F16 | DType::BF16);
+        let use_path2 = grouped_supported && (flags.moe_grouped_gemm || grouped_required);
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.
         let down_path0 = arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna3();

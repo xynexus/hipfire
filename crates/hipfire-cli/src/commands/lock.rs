@@ -23,6 +23,13 @@
 //! - `status` takes a non-blocking probe lock: success ⇒ free, EWOULDBLOCK ⇒
 //!   busy (prints the holder metadata line).
 //!
+//! Preferred form — `run <label> -- <cmd>`: acquire, spawn `<cmd>` as a child
+//! while holding the fd, and release on exit. The lock lives exactly as long as
+//! this process — no detached holder, no watched pid, no polling: if the wrapper
+//! (or its whole tree) is killed for any reason, the kernel drops the flock.
+//! `acquire`/`release`/`hold` remain for the split-across-processes pattern but
+//! `run` is the scoped, footgun-free way to hold the GPU for a unit of work.
+//!
 //! NB: the lockfile is never unlinked — unlinking a flock'd file lets the next
 //! acquirer lock a different inode and yields two simultaneous holders.
 
@@ -30,6 +37,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use clap::{Args, Subcommand};
 
@@ -56,10 +64,49 @@ enum LockAction {
         #[arg(long, default_value_t = default_poll())]
         poll_secs: u64,
     },
-    /// Release the GPU lock (SIGTERM the holder recorded in the lockfile).
-    Release,
+    /// Release the GPU lock (SIGTERM the recorded holder + its `run` process
+    /// group). With a `label`, only releases a matching holder (a safety guard so
+    /// `release <name>` never drops another agent's lock); `--all` releases
+    /// regardless of the recorded label; `--force` escalates to SIGKILL for a
+    /// wedged holder (and also ignores the label). No-op if the lock is free.
+    Release {
+        /// Only release if the recorded holder label matches (safety guard).
+        label: Option<String>,
+        /// Release regardless of which label holds the lock.
+        #[arg(long)]
+        all: bool,
+        /// Escalate to SIGKILL for a wedged holder (also ignores the label).
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Print lock status: "gpu is free" or "gpu BUSY: <holder>".
     Status,
+    /// Forcibly free the lock by signalling its recorded holder — and, for a
+    /// `run`-held lock, the whole workload process group. SIGTERM by default;
+    /// `-f`/`--force` escalates to SIGKILL for a wedged holder. No-op if free
+    /// or if the recorded holder is already gone.
+    Kill {
+        /// Escalate to SIGKILL instead of SIGTERM.
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Acquire the lock, run `command` under it, release on exit — the scoped
+    /// form. The lock lives exactly as long as this process (killing it drops
+    /// the flock via the kernel); no detached holder or watched pid. Exit code
+    /// is the command's; 2 on acquire timeout. Usage: `lock run <label> -- cmd…`.
+    Run {
+        /// Human label recorded in the lockfile (who/what holds it).
+        label: String,
+        /// Hard cap in seconds to wait for a busy lock; 0 = wait forever.
+        #[arg(long, default_value_t = default_timeout())]
+        timeout_secs: u64,
+        /// Cadence of "busy" messages while waiting, in seconds.
+        #[arg(long, default_value_t = default_poll())]
+        poll_secs: u64,
+        /// The command (and args) to run under the lock — everything after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     /// INTERNAL: the detached lock holder spawned by `acquire`. Not for direct use.
     #[command(hide = true)]
     Hold {
@@ -111,10 +158,20 @@ pub fn run(args: LockArgs) -> anyhow::Result<()> {
             timeout_secs,
             poll_secs,
         } => acquire(&label, watch_pid, timeout_secs, poll_secs.max(1)),
-        LockAction::Release => release(),
+        LockAction::Release { label, all, force } => release_lock(label.as_deref(), all, force),
         LockAction::Status => {
             println!("{}", status_line());
             Ok(())
+        }
+        LockAction::Kill { force } => kill_holder(force),
+        LockAction::Run {
+            label,
+            timeout_secs,
+            poll_secs,
+            command,
+        } => {
+            let code = run_scoped(&label, timeout_secs, poll_secs.max(1), &command)?;
+            std::process::exit(code);
         }
         LockAction::Hold {
             lock_fd,
@@ -206,17 +263,217 @@ fn acquire(
     Ok(())
 }
 
-fn release() -> anyhow::Result<()> {
-    let path = lockfile_path();
-    let Some(holder_pid) = read_holder_pid(&path) else {
+fn release_lock(label: Option<&str>, all: bool, force: bool) -> anyhow::Result<()> {
+    release_lock_at(&lockfile_path(), label, all, force)
+}
+
+/// Release the GPU lock. When `label` is named and neither `--all` nor `--force`
+/// is set, only a holder whose recorded label matches is released (so
+/// `release <name>` cannot drop another agent's lock); otherwise the recorded
+/// holder (and its `run` process group) is signalled — SIGKILL under `--force`,
+/// else SIGTERM. No-op if the lock is free. Parameterized on `path` for tests.
+fn release_lock_at(
+    path: &std::path::Path,
+    label: Option<&str>,
+    all: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    if matches!(hipfire_lock::probe(path), Ok(hipfire_lock::LockState::Free)) {
         eprintln!("[gpu-lock] no lock held");
         return Ok(());
-    };
-    if pid_alive(holder_pid) {
-        unsafe { libc::kill(holder_pid, libc::SIGTERM) };
     }
-    eprintln!("[gpu-lock] released");
+    if let (Some(want), false, false) = (label, all, force) {
+        let holder = read_holder(path).unwrap_or_default();
+        // The label is the first whitespace-delimited field of the holder line.
+        let held_label = holder.split_whitespace().next().unwrap_or("");
+        if held_label != want {
+            eprintln!(
+                "[gpu-lock] held by '{held_label}', not '{want}'; use --all to release regardless or --force to SIGKILL"
+            );
+            return Ok(());
+        }
+    }
+    kill_holder_at(path, force)
+}
+
+fn kill_holder(force: bool) -> anyhow::Result<()> {
+    kill_holder_at(&lockfile_path(), force)
+}
+
+/// Signal the lock's recorded holder to free it. For a `run`-held lock the
+/// holder line also carries `pgid=`, so the whole workload group is signalled
+/// (the GPU work actually stops, not just the wrapper). No-op if the lock is
+/// free or the recorded holder is already gone — never signals a stale/reused
+/// pid. Parameterized on `path` for tests.
+fn kill_holder_at(path: &std::path::Path, force: bool) -> anyhow::Result<()> {
+    if matches!(hipfire_lock::probe(path), Ok(hipfire_lock::LockState::Free)) {
+        eprintln!("[gpu-lock] free — nothing to kill");
+        return Ok(());
+    }
+    let Some(pid) = read_holder_pid(path) else {
+        eprintln!(
+            "[gpu-lock] held, but no holder pid is recorded in the lockfile — cannot target it"
+        );
+        return Ok(());
+    };
+    if !pid_alive(pid) {
+        eprintln!(
+            "[gpu-lock] recorded holder pid {pid} is already gone; the lock will free itself"
+        );
+        return Ok(());
+    }
+    let holder = read_holder(path).unwrap_or_default();
+    let (sig, name) = if force {
+        (libc::SIGKILL, "SIGKILL")
+    } else {
+        (libc::SIGTERM, "SIGTERM")
+    };
+    eprintln!("[gpu-lock] {name} holder pid {pid} ({holder})");
+    unsafe {
+        // A `run` wrapper records the child's process group; signal the whole
+        // workload tree first so the GPU work stops, then the holder itself.
+        if let Some(pgid) = read_holder_field(path, "pgid") {
+            if pgid > 1 {
+                libc::kill(-pgid, sig);
+            }
+        }
+        libc::kill(pid, sig);
+    }
     Ok(())
+}
+
+/// Process-group id of the child spawned by `lock run`, for the signal
+/// forwarder to target. 0 = no child yet.
+static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
+
+/// Signal handler installed by `lock run`: forward the received signal to the
+/// child's whole process group, then let `wait` reap it and propagate the code.
+/// Async-signal-safe: only an atomic load + `kill(2)`.
+extern "C" fn forward_signal(sig: i32) {
+    let pgid = CHILD_PGID.load(Ordering::SeqCst);
+    if pgid > 0 {
+        unsafe {
+            libc::kill(-pgid, sig);
+        }
+    }
+}
+
+fn install_signal_forwarder() -> anyhow::Result<()> {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = forward_signal as extern "C" fn(i32) as libc::sighandler_t;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = libc::SA_RESTART;
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            if libc::sigaction(sig, &sa, std::ptr::null_mut()) == -1 {
+                anyhow::bail!("sigaction({sig}): {}", std::io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Map a child's exit status to a process exit code: its own code, or the
+/// shell convention `128 + signal` when it was terminated by a signal.
+fn exit_code_from(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        code
+    } else if let Some(sig) = status.signal() {
+        128 + sig
+    } else {
+        1
+    }
+}
+
+fn run_scoped(
+    label: &str,
+    timeout_secs: u64,
+    poll_secs: u64,
+    command: &[String],
+) -> anyhow::Result<i32> {
+    run_scoped_at(
+        &lockfile_path(),
+        label,
+        timeout_secs,
+        poll_secs,
+        command,
+        true,
+    )
+}
+
+/// Core of `lock run`, parameterized on the lockfile path and whether to install
+/// the process-wide signal forwarder (tests pass `false` to avoid mutating the
+/// harness's signal disposition). Returns the exit code to surface.
+fn run_scoped_at(
+    path: &std::path::Path,
+    label: &str,
+    timeout_secs: u64,
+    poll_secs: u64,
+    command: &[String],
+    install_signals: bool,
+) -> anyhow::Result<i32> {
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("lock run requires a command after `--`"))?;
+
+    // Block (poll) until we hold LOCK_EX via the shared `hipfire-lock` primitive.
+    let mut guard = hipfire_lock::FlockGuard::open(path)?;
+    let timeout = (timeout_secs > 0).then(|| std::time::Duration::from_secs(timeout_secs));
+    let mut waited = 0u64;
+    let acquired = guard.lock_blocking(
+        std::time::Duration::from_secs(poll_secs),
+        timeout,
+        |holder| {
+            waited += poll_secs;
+            let who = if holder.is_empty() { "unknown" } else { holder };
+            eprintln!("[gpu-lock] busy: {who} — waited {waited}s, still waiting…");
+        },
+    )?;
+    if !acquired {
+        eprintln!(
+            "[gpu-lock] TIMEOUT after {timeout_secs}s; holder still alive: {}",
+            guard.holder().unwrap_or_else(|| "unknown".into())
+        );
+        // Exit code 2 on timeout — the historical gpu-lock.sh contract.
+        return Ok(2);
+    }
+
+    // We hold it. FlockGuard's fd is O_CLOEXEC, so the child does NOT inherit
+    // it: THIS process is the sole owner, and when it dies for any reason the
+    // kernel drops the lock — no detached holder, no watch-pid. Put the child in
+    // its own process group so we are the sole recipient of terminal/kill
+    // signals and can forward them to the whole workload tree.
+    let mut cmd = Command::new(program);
+    cmd.args(args).process_group(0);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn {program:?}: {e}"))?;
+    // `process_group(0)` made the child a group leader, so pgid == child pid.
+    CHILD_PGID.store(child.id() as i32, Ordering::SeqCst);
+
+    // Record holder metadata: OUR pid is the holder (`release`/`kill` find it via
+    // `holder=`), and `pgid=` is the child's process group so `kill` can signal
+    // the whole workload tree. Written under the held flock — rewriting contents
+    // can't drop it.
+    let meta = format!(
+        "{label} host={} acquired_epoch={} holder={} pgid={} mode=run",
+        hostname(),
+        now_iso(),
+        std::process::id(),
+        child.id()
+    );
+    let _ = guard.write_holder(&meta);
+
+    if install_signals {
+        install_signal_forwarder()?;
+    }
+    eprintln!("[gpu-lock] acquired by {label} (run)");
+
+    let status = child.wait()?;
+    CHILD_PGID.store(0, Ordering::SeqCst);
+    // Returning drops `guard` (closes our fd) → the kernel releases the flock.
+    Ok(exit_code_from(status))
 }
 
 fn hold(lock_fd: i32, watch_pid: i32, poll_secs: u64) -> anyhow::Result<()> {
@@ -261,9 +518,35 @@ fn read_holder(path: &std::path::Path) -> Option<String> {
 }
 
 fn read_holder_pid(path: &std::path::Path) -> Option<i32> {
-    let line = read_holder(path)?;
+    read_holder_pid_from_line(&read_holder(path)?)
+}
+
+/// Extract the holder pid, tolerating the shapes different writers use:
+/// `holder=<pid>` (CLI acquire/run), `pid=<pid>`, or a bare leading `<pid>`
+/// (the daemon's singleton-lock style). `holder=` wins over `pid=` because in
+/// the acquire line `pid=` is the *watched* process (often the shell), not the
+/// lock holder.
+fn read_holder_pid_from_line(line: &str) -> Option<i32> {
+    for key in ["holder=", "pid="] {
+        if let Some(pid) = line
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix(key))
+            .and_then(|v| v.parse::<i32>().ok())
+        {
+            return Some(pid);
+        }
+    }
     line.split_whitespace()
-        .find_map(|tok| tok.strip_prefix("holder="))
+        .next()
+        .and_then(|tok| tok.parse::<i32>().ok())
+}
+
+/// A `key=<int>` field from the holder line (e.g. `pgid`), if present.
+fn read_holder_field(path: &std::path::Path, key: &str) -> Option<i32> {
+    let line = read_holder(path)?;
+    let prefix = format!("{key}=");
+    line.split_whitespace()
+        .find_map(|tok| tok.strip_prefix(prefix.as_str()))
         .and_then(|v| v.parse().ok())
 }
 
@@ -297,4 +580,149 @@ fn now_iso() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_lock(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-lock-run-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("gpu.lock")
+    }
+
+    #[test]
+    fn run_scoped_propagates_child_exit_code_and_records_holder() {
+        let path = temp_lock("code");
+        // A successful command returns its own 0.
+        let code = run_scoped_at(&path, "t-ok", 5, 1, &["true".into()], false).unwrap();
+        assert_eq!(code, 0);
+        // The holder line the run wrapper wrote names our pid + mode=run, and is
+        // parseable by the same `holder=` reader `release`/`status` use.
+        let holder = read_holder(&path).unwrap();
+        assert!(holder.contains("mode=run"), "holder: {holder}");
+        assert_eq!(read_holder_pid(&path), Some(std::process::id() as i32));
+
+        // A failing command's non-zero code is surfaced. (Lock is free again —
+        // the previous guard dropped at return, so this re-acquires cleanly.)
+        let code = run_scoped_at(&path, "t-fail", 5, 1, &["false".into()], false).unwrap();
+        assert_eq!(code, 1);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn run_scoped_times_out_with_code_2_when_lock_is_held() {
+        let path = temp_lock("busy");
+        // Hold the lock out-of-band; the run wrapper must not steal it.
+        let mut held = hipfire_lock::FlockGuard::open(&path).unwrap();
+        assert!(held.try_lock().unwrap());
+
+        let code = run_scoped_at(&path, "waiter", 1, 1, &["true".into()], false).unwrap();
+        assert_eq!(
+            code, 2,
+            "a held lock must make `run` time out, not run the child"
+        );
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn run_scoped_reports_signal_death_as_128_plus_signal() {
+        let path = temp_lock("signal");
+        // Child SIGKILLs itself → 128 + 9 = 137.
+        let code = run_scoped_at(
+            &path,
+            "t-sig",
+            5,
+            1,
+            &["sh".into(), "-c".into(), "kill -9 $$".into()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(code, 137);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn empty_command_is_rejected() {
+        let path = temp_lock("empty");
+        assert!(run_scoped_at(&path, "t", 5, 1, &[], false).is_err());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn read_holder_pid_tolerates_writer_formats() {
+        // run/acquire: `holder=` wins over `pid=` (pid= is the watched shell).
+        assert_eq!(
+            read_holder_pid_from_line("job pid=555 host=h holder=4242 pgid=4242 mode=run"),
+            Some(4242)
+        );
+        // acquire without a holder yet → fall back to pid=.
+        assert_eq!(read_holder_pid_from_line("job pid=555 host=h"), Some(555));
+        // daemon style: a bare pid.
+        assert_eq!(read_holder_pid_from_line("31337"), Some(31337));
+        assert_eq!(read_holder_pid_from_line("no numbers here"), None);
+    }
+
+    #[test]
+    fn kill_on_free_lock_is_noop() {
+        let path = temp_lock("kill-free");
+        assert!(kill_holder_at(&path, false).is_ok());
+        assert!(kill_holder_at(&path, true).is_ok());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn kill_does_not_signal_a_dead_or_reused_holder_pid() {
+        // A held lock whose recorded holder pid is not alive: kill must detect
+        // that and do nothing (never signal a random/reused pid).
+        let path = temp_lock("kill-dead");
+        let mut guard = hipfire_lock::FlockGuard::open(&path).unwrap();
+        assert!(guard.try_lock().unwrap());
+        guard
+            .write_holder("job holder=2147483646 pgid=2147483646 mode=run")
+            .unwrap();
+        // We still hold the flock, so probe() sees Busy; the recorded pid is dead.
+        assert!(kill_holder_at(&path, true).is_ok());
+        assert!(guard.is_locked(), "our own lock must be untouched");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn release_on_free_lock_is_noop() {
+        let path = temp_lock("rel-free");
+        assert!(release_lock_at(&path, Some("x"), false, false).is_ok());
+        assert!(release_lock_at(&path, None, true, true).is_ok());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn release_label_guard_matches_and_overrides() {
+        // Holder pid is a dead sentinel, so kill_holder_at never signals — we
+        // only exercise the label-guard control flow.
+        let path = temp_lock("rel-guard");
+        let mut guard = hipfire_lock::FlockGuard::open(&path).unwrap();
+        assert!(guard.try_lock().unwrap());
+        guard
+            .write_holder("job holder=2147483646 pgid=2147483646 mode=run")
+            .unwrap();
+        // Named a different label, no override → refuse (our lock stays held).
+        assert!(release_lock_at(&path, Some("other"), false, false).is_ok());
+        assert!(guard.is_locked(), "mismatched label must not release");
+        // Matching label proceeds; --all and --force bypass the label guard.
+        assert!(release_lock_at(&path, Some("job"), false, false).is_ok());
+        assert!(release_lock_at(&path, Some("other"), true, false).is_ok());
+        assert!(release_lock_at(&path, Some("other"), false, true).is_ok());
+        assert!(
+            guard.is_locked(),
+            "our own flock stays held (recorded holder pid is dead)"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }

@@ -207,6 +207,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_seq,
+                4,
             )
             .unwrap()
         }
@@ -343,6 +344,7 @@ fn main() {
         let cfg = SamplerConfig {
             temperature: sc.think_temp,
             top_p: sc.top_p,
+            top_k: 20,
             repeat_penalty: sc.repeat_penalty,
             repeat_window: repeat_buf_cap.min(sc.repeat_window),
             presence_penalty: 0.0,
@@ -456,6 +458,7 @@ fn main() {
             let cfg = SamplerConfig {
                 temperature: temp,
                 top_p: sc.top_p,
+                top_k: 20,
                 repeat_penalty: sc.repeat_penalty,
                 repeat_window: repeat_buf_cap.min(sc.repeat_window),
                 presence_penalty: 0.0,

@@ -18,9 +18,11 @@
 use crate::deepseek4::{
     DeepseekV4Config, DeepseekV4LayerWeights, DeepseekV4State, DeepseekV4Weights,
 };
-use hipfire_runtime::arch::Architecture;
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_rdna::Gpu;
+use hipfire_runtime::arch::Architecture;
+use hipfire_runtime::hfq::{
+    oq4_arch_load, oq8_arch_load, HfqFile, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
+};
 
 /// Type marker for DeepSeek V4 Flash. `arch_id = 9` — next free slot
 /// after `8 = Qwen2-VL (dots.ocr)` reserved in `docs/architecture-ids.md`.
@@ -63,6 +65,8 @@ impl DeepseekV4 {
     ///     (non-FWHT) input.
     ///   - Q8F16 (quant_type=3): upload raw bytes, set GpuTensor.dtype =
     ///     Q8_0. Forward routes to `gemv_q8_0` with plain input.
+    ///   - OQ4/OQ8-family codes: route through the shared OQ arch-load helpers
+    ///     so DeepSeek4 gets the same GPU-served device layouts as Qwen/Gemma/LFM2.
     ///   - Otherwise (e.g. quant_type=13 MQ4G256 in hypothetical future
     ///     builds; not present in the canonical mq2lloyd file): upload raw
     ///     bytes, dtype stays Raw. Forward routes to
@@ -84,6 +88,25 @@ impl DeepseekV4 {
             .tensor_data_pread(name)
             .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
         let shape: Vec<usize> = info.shape.iter().map(|&s| s as usize).collect();
+        if shape.len() == 2 {
+            let (m, k) = (shape[0], shape[1]);
+            if info.quant_type == OQ4_CANONICAL_QT || info.quant_type == OQ4_ARCH_PACKED_QT {
+                let (packed, dtype) = oq4_arch_load(info.quant_type, &bytes, m, k)
+                    .expect("oq4_arch_load resolves the OQ4 canonical/arch-packed codes");
+                let mut t = gpu
+                    .upload_raw(&packed, &[packed.len()])
+                    .map_err(|e| format!("deepseek4: upload OQ4 '{name}' failed: {e:?}"))?;
+                t.dtype = dtype;
+                return Ok(t);
+            }
+            if let Some((packed, dtype)) = oq8_arch_load(info.quant_type, &bytes, m, k) {
+                let mut t = gpu
+                    .upload_raw(&packed, &[packed.len()])
+                    .map_err(|e| format!("deepseek4: upload OQ8-family '{name}' failed: {e:?}"))?;
+                t.dtype = dtype;
+                return Ok(t);
+            }
+        }
         if info.quant_type == 1 {
             // F16 source: KEEP F16 on device. Forward routes F16 weights
             // through `gemm_f16_x_f16_wmma` in the batched path and a
@@ -709,8 +732,12 @@ impl DeepseekV4 {
             weights.hc_head_scale = scale;
         }
 
-        // Per-layer.
+        // Per-layer. Phase 1 of the load bar: attention + norms + shared expert
+        // for every layer (the routed-expert pass below is the separate, much
+        // larger phase 2).
+        let n_layers_prog = weights.layers.len();
         for (l, layer) in weights.layers.iter_mut().enumerate() {
+            hipfire_runtime::load_progress::report(l as u32 + 1, n_layers_prog as u32, "weights");
             // Norms (F16 on disk → F32 on GPU).
             layer.attn_norm = Some(Self::upload_global_f16_as_f32(
                 hfq,
@@ -1221,11 +1248,21 @@ impl DeepseekV4 {
         // stride_w1 × n_exp + stride_w2 × n_exp ≈ 1.2 GB — bounded,
         // well below the pressure threshold.
         if upload_experts {
+            // Phase 2 of the load bar: routed experts (the ~40-80 GB pass that
+            // dominates load time). Only layers `< expert_layer_end` are
+            // uploaded (partial-MoE budget), and those are a prefix, so the
+            // per-layer count stays monotonic against `expert_total`.
+            let expert_total = expert_layer_end.unwrap_or(weights.layers.len());
             for (l, layer) in weights.layers.iter_mut().enumerate() {
                 let upload_this_layer = expert_layer_end.is_none_or(|end| l < end);
                 if !upload_this_layer {
                     continue;
                 }
+                hipfire_runtime::load_progress::report(
+                    l as u32 + 1,
+                    expert_total as u32,
+                    "experts",
+                );
                 let n_exp = cfg.n_routed_experts;
                 Self::upload_layer_routed_experts(
                     hfq,

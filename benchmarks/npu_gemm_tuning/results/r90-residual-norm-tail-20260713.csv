@@ -1,0 +1,4 @@
+mode,run,contexts,stage_mismatches,q_status,kv_mismatches,global_cosine,min_row_cosine,max_abs,nonfinite,nonzero,iterations,fused_ms,decision
+r90-residual-norm-tail,1,1,0,external-unused,0,0.99995399,0.99994058,0.09375,0,196608,100,6.6044,admitted-correctness-tail
+r90-residual-norm-tail,2,1,0,external-unused,0,0.99995399,0.99994058,0.09375,0,196608,100,6.2915,admitted-correctness-tail
+r90-residual-norm-tail,3,1,0,external-unused,0,0.99995399,0.99994058,0.09375,0,196608,100,6.3890,admitted-correctness-tail

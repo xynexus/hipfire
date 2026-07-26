@@ -1,22 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — see LICENSE and NOTICE in the project root.
 
+use anyhow::Context;
 use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use base64::Engine;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
+use hipfire_config::LoadedConfig;
 use hipfire_diffusion::DiffusionHipRuntimeOptions;
 // GGUF-style split: the diffusers/checkpoint importer (pickle + zip parsing)
 // now lives in the offline hipfire-diffusion-coexist crate, out of the
 // server-linked hipfire-diffusion.
 use hipfire_diffusion::{
-    calibrate_diffusion_hfq, inspect_hfq_with_runtime_support, quantize_diffusion_hfq,
-    resize_rgb_batch_to_cover_nearest, DiffusionBatchRequest, DiffusionGenerationRuntimeOptions,
+    calibrate_diffusion_hfq, diff_quantized_transformer_tensors, eval_fold_calibration,
+    inspect_hfq_with_runtime_support, quantize_diffusion_hfq, resize_rgb_batch_to_cover_nearest,
+    DiffusionBatchRequest, DiffusionError, DiffusionGenerationRuntimeOptions,
     DiffusionHfqInspection, DiffusionImg2ImgRequest, DiffusionPipeline, DiffusionProgress,
-    DiffusionPrompt, DiffusionQuantFormat, DiffusionResult, RgbImageBatch,
+    DiffusionPrompt, DiffusionQuantFormat, DiffusionResult, RefineSigmaSchedule, RgbImageBatch,
+    TensorQuantDiff, QT_DIFFUSION_TENSOR_BF16, QT_DIFFUSION_TENSOR_F16, QT_DIFFUSION_TENSOR_F32,
+    QT_DIFFUSION_TENSOR_OQ4_G256, QT_DIFFUSION_TENSOR_OQ4_PLAIN, QT_DIFFUSION_TENSOR_OQ8_G256,
+    QT_DIFFUSION_TENSOR_OQ8_PLAIN, QT_DIFFUSION_TENSOR_Q8F16,
 };
 use hipfire_diffusion_coexist::{import_diffusers_to_hfq, DiffusersImportOptions};
 use serde::Serialize;
@@ -109,10 +115,54 @@ pub enum DiffusionCommand {
     Quantize(DiffusionQuantizeArgs),
     /// Run an activation-calibration pass and write a .calib.hfq sidecar
     ///
-    /// Generates a few CPU-reference denoise steps over sample prompts, capturing
+    /// Generates a few instrumented denoise steps over sample prompts, capturing
     /// per-weight activation statistics (imatrix + per-linear Hessian). The
     /// resulting .calib.hfq feeds `quantize --format oq4++ --calib`.
     Calibrate(DiffusionCalibrateArgs),
+    /// Compare per-tensor weight reconstruction error between two diffusion .hfq
+    /// artifacts (e.g. a bf16 reference vs its quantized derivative)
+    ///
+    /// Decodes every quantizable `transformer/tensors/*.weight` from both
+    /// artifacts to f32 and reports per-tensor error, ranked by relative L2. This
+    /// is the sampler-independent quant-quality check: if the worst tensor is
+    /// near-lossless, any rendered-image drift is trajectory divergence, not
+    /// weight corruption. Pairs with `scripts/flux2_trajectory_divergence.py`.
+    QuantDiff(DiffusionQuantDiffArgs),
+    /// Quantify the activation-aware clip calibration ("+") on the fold format:
+    /// for each fold-eligible transformer linear, report RTN vs clip weight-space
+    /// error using a `.calib.hfq` imatrix. Weight-space only (no GPU).
+    CalibEval(DiffusionCalibEvalArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DiffusionCalibEvalArgs {
+    /// Source diffusion .hfq (bf16 weights)
+    pub source: PathBuf,
+    /// Calibration sidecar (.calib.hfq) with per-tensor imatrix
+    pub calib: PathBuf,
+    /// Fold bit width to evaluate (1/2/4)
+    #[arg(long, default_value_t = 4)]
+    pub bits: u32,
+    /// Emit JSON instead of a table
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DiffusionQuantDiffArgs {
+    /// Reference artifact (typically the bf16 / p0 source .hfq)
+    pub reference: PathBuf,
+    /// Candidate artifact (typically the quantized .hfq, e.g. --oq8.hfq)
+    pub candidate: PathBuf,
+    /// Print the N worst tensors by relative L2 error
+    #[arg(long, default_value_t = 20)]
+    pub top: usize,
+    /// Relative-L2 threshold above which a tensor is flagged as real corruption
+    #[arg(long, default_value_t = 0.05)]
+    pub rel_rms_threshold: f64,
+    /// Emit the full per-tensor diff as JSON instead of a table
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -138,6 +188,9 @@ pub struct DiffusionCalibrateArgs {
     /// Max linear input dim K to capture a full [K,K] Hessian for (else imatrix only)
     #[arg(long, default_value_t = 2048)]
     pub hessian_max_k: usize,
+    /// ROCm device used for instrumented resident calibration
+    #[arg(long)]
+    pub rocm_device_id: Option<i32>,
 }
 
 #[derive(Debug, Args)]
@@ -147,12 +200,26 @@ pub struct DiffusionQuantizeArgs {
     /// Output quantized .hfq artifact path
     #[arg(long, short)]
     pub output: PathBuf,
-    /// Quant format: q8, q4, q4k, q4+ (data-free) or oq4/oq4++/oq8 (Opus, calibrated)
+    /// Quant format: q8, q4, q4k, q4+, oq4/oq4+/oq4++/oq8 (rotated), oq4p/oq8p
+    /// (plain), a decimal plain-Opus target such as oq4.25, or oq4-mixed for
+    /// the legacy data-free heuristic. Plain Opus uses int8 activations.
     #[arg(long, default_value = "q8")]
     pub format: String,
     /// Optional .calib.hfq sidecar (from `diffusion calibrate`); enables oq4++ LDLQ
     #[arg(long)]
     pub calib: Option<PathBuf>,
+    /// For plain-Opus mixed precision: fraction (0.0–1.0) of quantized parameters
+    /// to place at int8 (highest fan-in first), the rest int4. Overrides the
+    /// format to mixed; achieved average ≈ 4 + 4·fraction bits. The output name is
+    /// rewritten to the achieved `oq<avg>` token.
+    #[arg(long)]
+    pub mix_fraction: Option<f32>,
+    /// Rank the int8 promotion by the arch's structural importance prior
+    /// (embedders/attention/modulation/output over the FFN bulk) instead of the
+    /// default highest-fan-in heuristic. Same bit budget; different tensor
+    /// selection. Only affects `--mix-fraction` (plain-Opus mixed).
+    #[arg(long)]
+    pub arch_importance: bool,
 }
 
 #[derive(Debug, Args)]
@@ -239,6 +306,11 @@ pub struct DiffusionTxt2ImgArgs {
     /// Output PNG file for one image, or output directory for batches
     #[arg(long, short)]
     pub output: PathBuf,
+    /// Directory to write a per-step preview PNG (step_00.png, step_01.png, ...)
+    /// by decoding the intermediate latent after each denoise pass. Useful for a
+    /// webui progress strip; adds one VAE decode per step. Single-image runs only.
+    #[arg(long)]
+    pub preview_dir: Option<PathBuf>,
     /// Output image width in pixels
     #[arg(long, default_value_t = 512)]
     pub width: u32,
@@ -299,6 +371,129 @@ pub struct DiffusionTxt2ImgArgs {
     /// is opt-in via the HIPFIRE_DIFFUSION_CPU_REFERENCE environment variable.
     #[arg(long)]
     pub rocm_device_id: Option<i32>,
+    /// Enable MrFlow staged sampling: a fast low-resolution pass, pixel-space
+    /// super-resolution, re-encode, and a short direct-sigma refine. --width and
+    /// --height are the final resolution; the low-res pass runs at those divided
+    /// by the upscale factor. Flow-match backbones only (FLUX / Qwen-Image /
+    /// Z-Image / Krea-2). Overrides --enable-hr.
+    #[arg(long, value_enum)]
+    pub mrflow: Option<MrFlowPreset>,
+    /// Override the total MrFlow denoise budget across the low-resolution and
+    /// refine passes. The preset's refine count is reserved first; for example,
+    /// 8 total steps with a 1-step refine runs 7+1.
+    #[arg(long)]
+    pub mrflow_total_steps: Option<u32>,
+    /// Override the MrFlow refine start sigma (preset default). Larger values
+    /// (0.16-0.20) can improve text-heavy generations.
+    #[arg(long)]
+    pub mrflow_refine_sigma: Option<f32>,
+    /// Override the MrFlow pixel-space upscale factor (preset default 2.0).
+    #[arg(long)]
+    pub mrflow_upscale: Option<f64>,
+    /// Use the flow-match shifted interior refine schedule (only affects refine
+    /// passes with more than one step).
+    #[arg(long)]
+    pub mrflow_shifted: bool,
+    /// RealESRGAN RRDBNet super-resolution .hfq (from `hipfire-coexistence`) for
+    /// the MrFlow Stage-2 upscale. Without it, Stage 2 falls back to a plain
+    /// cover-resize (much softer output).
+    #[arg(long)]
+    pub mrflow_sr: Option<PathBuf>,
+}
+
+/// MrFlow staged-sampling presets. The numbers follow the reference MrFlow /
+/// Rebels ports: `stageN + 1` denotes N low-resolution steps and one
+/// high-resolution direct-sigma refine step.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum MrFlowPreset {
+    /// Z-Image Turbo, 9 low-res + 1 refine, sigma 0.11, no CFG (paper demo).
+    #[value(name = "zit-9plus1")]
+    Zit9Plus1,
+    /// Krea-2 base, 12 low-res + 1 refine, sigma 0.12, cfg 4.0.
+    #[value(name = "krea2-12plus1")]
+    Krea2Base12Plus1,
+    /// Krea-2 base, 20 low-res + 1 refine, sigma 0.15, cfg 4.0.
+    #[value(name = "krea2-20plus1")]
+    Krea2Base20Plus1,
+    /// Krea-2 Turbo, 8 low-res + 1 refine, sigma 0.11, no CFG.
+    #[value(name = "krea2-turbo-8plus1")]
+    Krea2Turbo8Plus1,
+}
+
+struct MrFlowPresetParams {
+    stage1_steps: u32,
+    refine_steps: u32,
+    refine_sigma: f32,
+    cfg_scale: f32,
+    upscale_factor: f64,
+}
+
+impl MrFlowPreset {
+    fn params(self) -> MrFlowPresetParams {
+        match self {
+            MrFlowPreset::Zit9Plus1 => MrFlowPresetParams {
+                stage1_steps: 9,
+                refine_steps: 1,
+                refine_sigma: 0.11,
+                cfg_scale: 1.0,
+                upscale_factor: 2.0,
+            },
+            MrFlowPreset::Krea2Base12Plus1 => MrFlowPresetParams {
+                stage1_steps: 12,
+                refine_steps: 1,
+                refine_sigma: 0.12,
+                cfg_scale: 4.0,
+                upscale_factor: 2.0,
+            },
+            MrFlowPreset::Krea2Base20Plus1 => MrFlowPresetParams {
+                stage1_steps: 20,
+                refine_steps: 1,
+                refine_sigma: 0.15,
+                cfg_scale: 4.0,
+                upscale_factor: 2.0,
+            },
+            MrFlowPreset::Krea2Turbo8Plus1 => MrFlowPresetParams {
+                stage1_steps: 8,
+                refine_steps: 1,
+                refine_sigma: 0.11,
+                cfg_scale: 1.0,
+                upscale_factor: 2.0,
+            },
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            MrFlowPreset::Zit9Plus1 => "zit-9plus1",
+            MrFlowPreset::Krea2Base12Plus1 => "krea2-12plus1",
+            MrFlowPreset::Krea2Base20Plus1 => "krea2-20plus1",
+            MrFlowPreset::Krea2Turbo8Plus1 => "krea2-turbo-8plus1",
+        }
+    }
+}
+
+/// Round a low-resolution dimension to the nearest multiple of 16 (min 16), so
+/// the stage-1 latent grid is valid. Mirrors the Rebels preset node.
+fn mrflow_round16(value: f64) -> u32 {
+    let snapped = (value / 16.0).round() * 16.0;
+    (snapped as u32).max(16)
+}
+
+fn mrflow_stage1_steps(
+    preset_stage1_steps: u32,
+    refine_steps: u32,
+    total_steps: Option<u32>,
+) -> anyhow::Result<u32> {
+    let Some(total_steps) = total_steps else {
+        return Ok(preset_stage1_steps);
+    };
+    let stage1_steps = total_steps.checked_sub(refine_steps).unwrap_or(0);
+    if stage1_steps == 0 {
+        anyhow::bail!(
+            "--mrflow-total-steps {total_steps} must exceed the {refine_steps}-step refine pass"
+        );
+    }
+    Ok(stage1_steps)
 }
 
 #[derive(Debug, Args)]
@@ -417,7 +612,7 @@ pub struct DiffusionSmokeArgs {
     pub skip_masked_img2img: bool,
 }
 
-pub fn run(args: DiffusionArgs) -> anyhow::Result<()> {
+pub fn run(args: DiffusionArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     match args.command {
         DiffusionCommand::Import(args) => {
             let summary = import_diffusers_to_hfq(DiffusersImportOptions {
@@ -435,20 +630,114 @@ pub fn run(args: DiffusionArgs) -> anyhow::Result<()> {
             Ok(())
         }
         DiffusionCommand::Inspect(args) => {
-            let inspection = inspect_hfq_with_runtime_support(resolve_model_path(args.model))?;
+            let inspection =
+                inspect_hfq_with_runtime_support(resolve_model_path(args.model, &loaded))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&inspection_json(inspection))?
             );
             Ok(())
         }
-        DiffusionCommand::Preflight(args) => run_preflight(args),
-        DiffusionCommand::Txt2Img(args) => run_txt2img(args),
-        DiffusionCommand::Img2Img(args) => run_img2img(args),
-        DiffusionCommand::Smoke(args) => run_smoke(args),
+        DiffusionCommand::Preflight(args) => run_preflight(args, &loaded),
+        DiffusionCommand::Txt2Img(args) => run_txt2img(args, &loaded),
+        DiffusionCommand::Img2Img(args) => run_img2img(args, &loaded),
+        DiffusionCommand::Smoke(args) => run_smoke(args, &loaded),
         DiffusionCommand::Quantize(args) => run_quantize(args),
         DiffusionCommand::Calibrate(args) => run_calibrate(args),
+        DiffusionCommand::QuantDiff(args) => run_quant_diff(args),
+        DiffusionCommand::CalibEval(args) => run_calib_eval(args),
     }
+}
+
+fn run_calib_eval(args: DiffusionCalibEvalArgs) -> anyhow::Result<()> {
+    if !matches!(args.bits, 1 | 2 | 4) {
+        anyhow::bail!("--bits must be 1, 2, or 4");
+    }
+    let mut rows = eval_fold_calibration(&args.source, &args.calib, args.bits)?;
+    if rows.is_empty() {
+        println!(
+            "no fold-eligible transformer linears in {}",
+            args.source.display()
+        );
+        return Ok(());
+    }
+    if args.json {
+        let out: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "name": r.name, "elements": r.elements, "has_imatrix": r.has_imatrix,
+                    "rtn_weighted": r.rtn_weighted, "clip_weighted": r.clip_weighted,
+                    "rtn_unweighted": r.rtn_unweighted, "clip_unweighted": r.clip_unweighted,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source": args.source, "calib": args.calib, "bits": args.bits, "tensors": out,
+            }))?
+        );
+        return Ok(());
+    }
+    // Rank by weighted improvement (best-calibrated first).
+    rows.sort_by(|a, b| {
+        let ra = if a.rtn_weighted > 0.0 {
+            a.clip_weighted / a.rtn_weighted
+        } else {
+            1.0
+        };
+        let rb = if b.rtn_weighted > 0.0 {
+            b.clip_weighted / b.rtn_weighted
+        } else {
+            1.0
+        };
+        ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let with_im = rows.iter().filter(|r| r.has_imatrix).count();
+    println!("source: {}", args.source.display());
+    println!("calib:  {}", args.calib.display());
+    println!(
+        "bits:   {}   fold tensors: {} ({} with imatrix)",
+        args.bits,
+        rows.len(),
+        with_im
+    );
+    println!();
+    println!(
+        "{:>12} {:>12} {:>8}  {:>12} {:>12}  {:>3}  {}",
+        "rtn_wErr", "clip_wErr", "wRedux", "rtn_uErr", "clip_uErr", "im", "tensor"
+    );
+    for r in &rows {
+        let redux = if r.rtn_weighted > 0.0 {
+            100.0 * (1.0 - r.clip_weighted / r.rtn_weighted)
+        } else {
+            0.0
+        };
+        println!(
+            "{:>12.6} {:>12.6} {:>7.1}%  {:>12.6} {:>12.6}  {:>3}  {}",
+            r.rtn_weighted,
+            r.clip_weighted,
+            redux,
+            r.rtn_unweighted,
+            r.clip_unweighted,
+            if r.has_imatrix { "y" } else { "-" },
+            r.name
+        );
+    }
+    let n = rows.len() as f64;
+    let mean_rtn = rows.iter().map(|r| r.rtn_weighted).sum::<f64>() / n;
+    let mean_clip = rows.iter().map(|r| r.clip_weighted).sum::<f64>() / n;
+    let redux = if mean_rtn > 0.0 {
+        100.0 * (1.0 - mean_clip / mean_rtn)
+    } else {
+        0.0
+    };
+    println!();
+    println!(
+        "mean weighted rel-RMSE: RTN={mean_rtn:.6}  clip={mean_clip:.6}  ({redux:.1}% reduction)"
+    );
+    Ok(())
 }
 
 fn run_calibrate(args: DiffusionCalibrateArgs) -> anyhow::Result<()> {
@@ -461,6 +750,7 @@ fn run_calibrate(args: DiffusionCalibrateArgs) -> anyhow::Result<()> {
     } else {
         args.prompts.clone()
     };
+    let runtime_options = resolve_runtime_options(args.rocm_device_id)?;
     let summary = calibrate_diffusion_hfq(
         &args.model,
         &args.output,
@@ -470,6 +760,7 @@ fn run_calibrate(args: DiffusionCalibrateArgs) -> anyhow::Result<()> {
         args.height,
         args.cfg_scale,
         args.hessian_max_k,
+        runtime_options,
     )?;
     println!(
         "{}",
@@ -486,10 +777,195 @@ fn run_calibrate(args: DiffusionCalibrateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn quant_type_label(q: u8) -> &'static str {
+    match q {
+        QT_DIFFUSION_TENSOR_F16 => "f16",
+        QT_DIFFUSION_TENSOR_F32 => "f32",
+        QT_DIFFUSION_TENSOR_Q8F16 => "q8f16",
+        QT_DIFFUSION_TENSOR_OQ4_G256 => "oq4g256",
+        QT_DIFFUSION_TENSOR_OQ8_G256 => "oq8g256",
+        QT_DIFFUSION_TENSOR_OQ4_PLAIN => "oq4plain",
+        QT_DIFFUSION_TENSOR_OQ8_PLAIN => "oq8plain",
+        QT_DIFFUSION_TENSOR_BF16 => "bf16",
+        _ => "other",
+    }
+}
+
+fn run_quant_diff(args: DiffusionQuantDiffArgs) -> anyhow::Result<()> {
+    let (mut diffs, warnings) =
+        diff_quantized_transformer_tensors(&args.reference, &args.candidate)?;
+    // Rank worst-first by relative L2.
+    diffs.sort_by(|a, b| {
+        b.rel_rms
+            .partial_cmp(&a.rel_rms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if args.json {
+        let rows: Vec<_> = diffs
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "name": d.name,
+                    "elements": d.elements,
+                    "quant_type_ref": quant_type_label(d.quant_type_ref),
+                    "quant_type_cand": quant_type_label(d.quant_type_cand),
+                    "mae": d.mae,
+                    "max_abs": d.max_abs,
+                    "rms": d.rms,
+                    "rel_rms": d.rel_rms,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "reference": args.reference,
+                "candidate": args.candidate,
+                "tensors": rows,
+                "warnings": warnings,
+            }))?
+        );
+        return Ok(());
+    }
+
+    let compared = diffs.len();
+    // "Changed" = the quantizer actually touched it (verbatim-copied bf16 tensors
+    // reconstruct exactly and report rms 0).
+    let changed: Vec<&TensorQuantDiff> = diffs.iter().filter(|d| d.rms > 0.0).collect();
+    let worst_rel = diffs.first().map(|d| d.rel_rms).unwrap_or(0.0);
+    // Element-weighted global MAE over every compared tensor.
+    let total_elems: u128 = diffs.iter().map(|d| d.elements as u128).sum();
+    let global_mae = if total_elems > 0 {
+        diffs.iter().map(|d| d.mae * d.elements as f64).sum::<f64>() / total_elems as f64
+    } else {
+        0.0
+    };
+
+    println!("reference:  {}", args.reference.display());
+    println!("candidate:  {}", args.candidate.display());
+    println!(
+        "tensors:    {compared} compared, {} changed (quantizer touched), {} verbatim",
+        changed.len(),
+        compared - changed.len()
+    );
+    println!("global element-weighted MAE: {global_mae:.6}");
+    println!("worst relative-L2:           {worst_rel:.6}");
+    println!();
+    println!(
+        "{:>10}  {:>10}  {:>10}  {:>12}  {:>16}  {}",
+        "rel_L2", "max_abs", "mae", "elements", "qtype ref->cand", "tensor"
+    );
+    for d in diffs.iter().take(args.top) {
+        println!(
+            "{:>10.6}  {:>10.6}  {:>10.6}  {:>12}  {:>7}->{:<8}  {}",
+            d.rel_rms,
+            d.max_abs,
+            d.mae,
+            d.elements,
+            quant_type_label(d.quant_type_ref),
+            quant_type_label(d.quant_type_cand),
+            d.name,
+        );
+    }
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    println!();
+    if worst_rel <= args.rel_rms_threshold {
+        println!(
+            "VERDICT: quantization is faithful in weight space (worst rel-L2 {worst_rel:.4} <= {:.4}).",
+            args.rel_rms_threshold
+        );
+        println!("         Any rendered-image drift vs the reference is trajectory divergence");
+        println!(
+            "         (sampler chaos), NOT weight corruption. Gate on perceptual/early-latent"
+        );
+        println!("         metrics, not exact pixel comparison.");
+    } else {
+        println!(
+            "VERDICT: {} tensor(s) exceed rel-L2 {:.4} (worst {worst_rel:.4}) — real quant",
+            changed
+                .iter()
+                .filter(|d| d.rel_rms > args.rel_rms_threshold)
+                .count(),
+            args.rel_rms_threshold
+        );
+        println!("         corruption. Investigate the encode path for the top-ranked tensor(s).");
+    }
+    Ok(())
+}
+
+/// Rewrite the output filename so it carries the achieved `oq<avg>` token: replace
+/// the requested format token if it appears in the name, else insert the token
+/// before the `.hfq` extension.
+fn rewrite_output_token(output: &Path, requested_format: &str, token: &str) -> PathBuf {
+    let Some(fname) = output.file_name().and_then(|f| f.to_str()) else {
+        return output.to_path_buf();
+    };
+    if !requested_format.is_empty() && fname.contains(requested_format) {
+        return output.with_file_name(fname.replacen(requested_format, token, 1));
+    }
+    let newf = match fname.strip_suffix(".hfq") {
+        // Already has a machine section (`--`): the token joins it with a dot.
+        Some(stem) if stem.contains("--") => format!("{stem}.{token}.hfq"),
+        // Bare model name: open the machine section with the `--` boundary.
+        Some(stem) => format!("{stem}--{token}.hfq"),
+        None => format!("{fname}.{token}"),
+    };
+    output.with_file_name(newf)
+}
+
 fn run_quantize(args: DiffusionQuantizeArgs) -> anyhow::Result<()> {
+    // Plain (unrotated) Opus W4A8/W8A8 + mixed — the artifact the tiled
+    // gemm_opus_tiled_wmma kernels load directly (no runtime requant).
+    let plain_policy = match args.mix_fraction {
+        Some(f) => Some(hipfire_diffusion::PlainOpusPolicy::with_fraction(f)),
+        None => hipfire_diffusion::PlainOpusPolicy::parse(&args.format),
+    };
+    if let Some(policy) = plain_policy {
+        let summary = hipfire_diffusion::quantize_diffusion_hfq_plain(
+            &args.source,
+            &args.output,
+            policy,
+            args.arch_importance,
+        )?;
+        // The canonical name is computed from the ACHIEVED average, not the
+        // request. Rewrite the output filename's oq* token (or insert one) and
+        // rename the file so the artifact name reflects what it actually is.
+        let token = hipfire_diffusion::opus_quant_token(summary.avg_bits);
+        let final_output = rewrite_output_token(&args.output, &args.format, &token);
+        if final_output != args.output {
+            std::fs::rename(&args.output, &final_output)
+                .with_context(|| format!("rename {:?} -> {:?}", args.output, final_output))?;
+        }
+        let ratio = if summary.output_bytes > 0 {
+            summary.source_bytes as f64 / summary.output_bytes as f64
+        } else {
+            0.0
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source": args.source,
+                "output": final_output,
+                "requested_format": args.format,
+                "quant_token": token,
+                "w4_tensors": summary.w4_tensors,
+                "w8_tensors": summary.w8_tensors,
+                "copied_tensors": summary.copied_tensors,
+                "avg_bits": (summary.avg_bits * 100.0).round() / 100.0,
+                "source_bytes": summary.source_bytes,
+                "output_bytes": summary.output_bytes,
+                "compression_ratio": (ratio * 100.0).round() / 100.0,
+            }))?
+        );
+        return Ok(());
+    }
     let format = DiffusionQuantFormat::parse(&args.format).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown quant format {:?}; expected one of: q8, q4, q4k, q4+, oq4, oq4++, oq8",
+            "unknown quant format {:?}; expected one of: q8, q4, q4k, q4+, oq4, oq4+, oq4++, oq8, oq4p, oq8p, oq4.N, oq4-mixed",
             args.format
         )
     })?;
@@ -540,7 +1016,7 @@ fn inspection_json(inspection: DiffusionHfqInspection) -> serde_json::Value {
     })
 }
 
-fn run_preflight(args: DiffusionPreflightArgs) -> anyhow::Result<()> {
+fn run_preflight(args: DiffusionPreflightArgs, loaded: &LoadedConfig) -> anyhow::Result<()> {
     let prompts = build_diffusion_prompts(
         &args.prompt,
         &args.negative_prompt,
@@ -569,7 +1045,7 @@ fn run_preflight(args: DiffusionPreflightArgs) -> anyhow::Result<()> {
         send_images: false,
         save_images: false,
     };
-    let model = resolve_model_path(args.model);
+    let model = resolve_model_path(args.model, loaded);
     let pipeline = DiffusionPipeline::open_hfq(&model)?;
     let memory_plan = pipeline.hip_memory_plan(&request)?;
     let rocm = match pipeline.preflight_hip_runtime(
@@ -601,7 +1077,7 @@ fn run_preflight(args: DiffusionPreflightArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
+fn run_txt2img(args: DiffusionTxt2ImgArgs, loaded: &LoadedConfig) -> anyhow::Result<()> {
     let prompts = build_diffusion_prompts(
         &args.prompt,
         &args.negative_prompt,
@@ -630,13 +1106,50 @@ fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
         send_images: true,
         save_images: false,
     };
-    let model = resolve_model_path(args.model.clone());
+    let model = resolve_model_path(args.model.clone(), loaded);
     let pipeline = DiffusionPipeline::open_hfq(&model)?;
     let runtime_options = resolve_runtime_options(args.rocm_device_id)?;
     let batch_images = request.prompts.len();
     let wall_start = Instant::now();
-    let output = if args.enable_hr {
+    let output = if let Some(preset) = args.mrflow {
+        generate_mrflow_txt2img(&pipeline, request, &args, preset, runtime_options, loaded)?
+    } else if args.enable_hr {
         generate_highres_txt2img(&pipeline, request, &args, runtime_options)?
+    } else if let Some(preview_dir) = args.preview_dir.clone() {
+        // Per-pass previews: decode preview_latents after each denoise step and
+        // write step_NN.png. Mirrors the webui hook (DiffusionProgress carries
+        // the intermediate latent; the pipeline decodes it to a PNG). Batches
+        // would collide on one file per step, so restrict to single-image runs.
+        if batch_images != 1 {
+            anyhow::bail!("--preview-dir is only supported for single-image runs (batch size 1)");
+        }
+        fs::create_dir_all(&preview_dir)?;
+        let mut timing = step_timing_progress("txt2img", batch_images);
+        let mut progress = |progress: DiffusionProgress| -> DiffusionResult<()> {
+            if let Some(latents) = progress.preview_latents.as_ref() {
+                let step = progress.completed_steps;
+                let b64 = pipeline.decode_preview_latents_png_base64_with_runtime_options(
+                    latents,
+                    runtime_options,
+                )?;
+                let bytes = decode_base64_png(&b64).map_err(|e| {
+                    DiffusionError::InvalidRequest(format!("preview PNG decode failed: {e}"))
+                })?;
+                let path = preview_dir.join(format!("step_{step:02}.png"));
+                fs::write(&path, bytes).map_err(|e| {
+                    DiffusionError::InvalidRequest(format!(
+                        "failed to write preview {}: {e}",
+                        path.display()
+                    ))
+                })?;
+            }
+            timing(progress)
+        };
+        pipeline.generate_batch_with_progress_and_runtime_options(
+            request,
+            runtime_options,
+            &mut progress,
+        )?
     } else {
         let mut progress = step_timing_progress("txt2img", batch_images);
         pipeline.generate_batch_with_progress_and_runtime_options(
@@ -661,6 +1174,176 @@ fn run_txt2img(args: DiffusionTxt2ImgArgs) -> anyhow::Result<()> {
         }))?
     );
     Ok(())
+}
+
+/// MrFlow staged sampling: fast low-resolution generate, pixel-space
+/// super-resolution to the target size, re-encode, then a short direct-sigma
+/// refine. Reuses the same decode/upscale/img2img plumbing as the high-res
+/// path, but the second pass runs the flow-match direct-sigma refine schedule
+/// instead of a strength-based img2img.
+///
+/// The pixel-space super-resolution here is a placeholder cover-resize; a
+/// native SR model (RealESRGAN-class) is the intended Stage-2 upgrade. The
+/// staging, re-encode, noise injection, and refine schedule are otherwise the
+/// production path.
+fn generate_mrflow_txt2img(
+    pipeline: &DiffusionPipeline,
+    mut first_pass_request: DiffusionBatchRequest,
+    args: &DiffusionTxt2ImgArgs,
+    preset: MrFlowPreset,
+    runtime_options: DiffusionGenerationRuntimeOptions,
+    loaded: &LoadedConfig,
+) -> anyhow::Result<hipfire_diffusion::DiffusionBatchOutput> {
+    let params = preset.params();
+    let target_width = args.width;
+    let target_height = args.height;
+    if target_width == 0 || target_height == 0 {
+        anyhow::bail!("MrFlow requires non-zero --width and --height (the final resolution)");
+    }
+    let upscale = args.mrflow_upscale.unwrap_or(params.upscale_factor);
+    if !upscale.is_finite() || upscale <= 1.0 {
+        anyhow::bail!("--mrflow-upscale {upscale} must be greater than 1");
+    }
+    let refine_sigma = args.mrflow_refine_sigma.unwrap_or(params.refine_sigma);
+    if !refine_sigma.is_finite() || !(0.0 < refine_sigma && refine_sigma < 1.0) {
+        anyhow::bail!("--mrflow-refine-sigma {refine_sigma} must be in (0, 1)");
+    }
+    let low_width = mrflow_round16(target_width as f64 / upscale);
+    let low_height = mrflow_round16(target_height as f64 / upscale);
+    let batch_images = first_pass_request.prompts.len();
+    let stage1_steps = mrflow_stage1_steps(
+        params.stage1_steps,
+        params.refine_steps.max(1),
+        args.mrflow_total_steps,
+    )?;
+
+    // Draft-mode Stage-2 is latent-space by default (model-agnostic, SeFi-safe).
+    // Pixel-space super-resolution (`--mrflow-sr`) is an opt-in overlay that only
+    // works for fully pixel-derivable latents; SeFi's semantic channels cannot be
+    // recovered from pixels, so guard it with a clear error rather than a hang.
+    let is_sefi = pipeline.metadata().pipeline.sefi;
+    let use_pixel_sr = args.mrflow_sr.is_some();
+    if use_pixel_sr && is_sefi {
+        anyhow::bail!(
+            "--mrflow-sr pixel-space super-resolution is not supported for SeFi models: the \
+             semantic latent channels cannot be recovered from RGB. Run --mrflow without \
+             --mrflow-sr to use the latent-space refine."
+        );
+    }
+
+    // Stage 1: fast low-resolution generate with the preset step count and CFG.
+    // Capture the FULL latent (all channels, e.g. SeFi's 144) for the
+    // latent-space Stage-2 refine.
+    first_pass_request.width = low_width;
+    first_pass_request.height = low_height;
+    first_pass_request.steps = stage1_steps;
+    first_pass_request.cfg_scale = params.cfg_scale;
+    first_pass_request.send_images = true;
+    let mut stage1_progress = step_timing_progress("mrflow-stage1", batch_images);
+    let (first_pass, stage1_full_latent) = pipeline.generate_batch_capturing_latent(
+        first_pass_request.clone(),
+        runtime_options,
+        Some(&mut stage1_progress),
+    )?;
+
+    let refine_steps = params.refine_steps.max(1);
+    let (mut output, sr_label) = if use_pixel_sr {
+        // Stage 2 (SR overlay): decode + pixel-space upscale to the target
+        // resolution with a RealESRGAN model, then re-encode and run the
+        // direct-sigma refine via img2img. Pixel-derivable latents only.
+        let decoded = decode_png_images_to_rgb_batch(&first_pass.images)?;
+        let sr_path = args
+            .mrflow_sr
+            .as_ref()
+            .expect("mrflow_sr checked present above");
+        let sr_model = hipfire_diffusion::DiffusionSuperResModel::open_hfq(&resolve_model_path(
+            sr_path.clone(),
+            loaded,
+        ))?;
+        let sr_start = Instant::now();
+        let sr_upscaled = sr_model.upscale_rgb_batch(&decoded, args.rocm_device_id)?;
+        eprintln!(
+            "[mrflow-superres] RealESRGAN x{} on {batch_images} image(s) in {:.1}s",
+            sr_model.scale(),
+            sr_start.elapsed().as_secs_f64(),
+        );
+        let upscaled =
+            resize_rgb_batch_to_cover_nearest(&sr_upscaled, target_width, target_height)?;
+
+        let mut refine_batch = first_pass_request.clone();
+        refine_batch.width = target_width;
+        refine_batch.height = target_height;
+        refine_batch.steps = refine_steps;
+        refine_batch.send_images = true;
+        let mut refine_progress = step_timing_progress("mrflow-refine", batch_images);
+        let output = pipeline.generate_img2img_batch_with_progress_and_runtime_options(
+            DiffusionImg2ImgRequest {
+                batch: refine_batch,
+                init_image: upscaled,
+                mask: None,
+                inpainting_fill: None,
+                resize_mode: Default::default(),
+                // Ignored when refine_sigma is set; the direct-sigma schedule
+                // drives the refine.
+                denoising_strength: 1.0,
+                refine_sigma: Some(RefineSigmaSchedule {
+                    first_sigma: refine_sigma,
+                    steps: refine_steps,
+                    shifted: args.mrflow_shifted,
+                }),
+            },
+            runtime_options,
+            &mut refine_progress,
+        )?;
+        (output, format!("realesrgan-x{}", sr_model.scale()))
+    } else {
+        // Stage 2 (default): generic latent-space refine. Upscale the Stage-1
+        // latent in latent space, add refine noise, and re-denoise with the
+        // model's own denoiser (SeFi dual-stream or standard). No pixel
+        // re-encode, so model-specific latent channels are carried through.
+        let mut refine_batch = first_pass_request.clone();
+        refine_batch.width = target_width;
+        refine_batch.height = target_height;
+        refine_batch.steps = refine_steps;
+        refine_batch.send_images = true;
+        let mut refine_progress = step_timing_progress("mrflow-refine", batch_images);
+        let output = pipeline.generate_draft_refine(
+            refine_batch,
+            stage1_full_latent,
+            refine_sigma,
+            refine_steps,
+            args.mrflow_shifted,
+            runtime_options,
+            Some(&mut refine_progress),
+        )?;
+        (output, "latent-space (no pixel SR)".to_string())
+    };
+    if let Some(map) = output.info.as_object_mut() {
+        map.insert("mode".to_string(), serde_json::json!("txt2img-mrflow"));
+        map.insert(
+            "mrflow_preset".to_string(),
+            serde_json::json!(preset.as_str()),
+        );
+        map.insert("stage1_width".to_string(), serde_json::json!(low_width));
+        map.insert("stage1_height".to_string(), serde_json::json!(low_height));
+        map.insert("stage1_steps".to_string(), serde_json::json!(stage1_steps));
+        map.insert("refine_sigma".to_string(), serde_json::json!(refine_sigma));
+        map.insert("refine_steps".to_string(), serde_json::json!(refine_steps));
+        map.insert(
+            "total_steps".to_string(),
+            serde_json::json!(stage1_steps + refine_steps),
+        );
+        map.insert("upscale_factor".to_string(), serde_json::json!(upscale));
+        map.insert("target_width".to_string(), serde_json::json!(target_width));
+        map.insert(
+            "target_height".to_string(),
+            serde_json::json!(target_height),
+        );
+        // Records the Stage-2 super-resolution path: the RealESRGAN model (by
+        // native factor) or the cover-resize placeholder.
+        map.insert("super_resolution".to_string(), serde_json::json!(sr_label));
+    }
+    Ok(output)
 }
 
 fn generate_highres_txt2img(
@@ -718,6 +1401,7 @@ fn generate_highres_txt2img(
             inpainting_fill: None,
             resize_mode: Default::default(),
             denoising_strength: args.hr_denoising_strength,
+            refine_sigma: None,
         },
         runtime_options,
     )?;
@@ -844,7 +1528,7 @@ fn aspect_scaled_dimension(
     u32::try_from(value).map_err(|_| anyhow::anyhow!("high-res target {label} is out of range"))
 }
 
-fn run_img2img(args: DiffusionImg2ImgArgs) -> anyhow::Result<()> {
+fn run_img2img(args: DiffusionImg2ImgArgs, loaded: &LoadedConfig) -> anyhow::Result<()> {
     let init_image = load_rgb_image_batch(&args.init_image)?;
     let prompt_batch_size = args.batch_size.max(init_image.batch);
     let prompts = build_diffusion_prompts(
@@ -892,8 +1576,9 @@ fn run_img2img(args: DiffusionImg2ImgArgs) -> anyhow::Result<()> {
         inpainting_fill: None,
         resize_mode: Default::default(),
         denoising_strength: args.denoising_strength,
+        refine_sigma: None,
     };
-    let model = resolve_model_path(args.model);
+    let model = resolve_model_path(args.model, loaded);
     let pipeline = DiffusionPipeline::open_hfq(&model)?;
     let batch_images = request.batch.prompts.len();
     let runtime_options = resolve_runtime_options(args.rocm_device_id)?;
@@ -936,15 +1621,17 @@ fn resolve_runtime_options(
     Ok(DiffusionGenerationRuntimeOptions::rocm_hybrid(device))
 }
 
-fn resolve_model_path(path: PathBuf) -> PathBuf {
+fn resolve_model_path(path: PathBuf, loaded: &LoadedConfig) -> PathBuf {
     if path.exists() {
         return path;
     }
-    path.to_str().and_then(find_model).unwrap_or(path)
+    path.to_str()
+        .and_then(|path| find_model(path, &loaded.config))
+        .unwrap_or(path)
 }
 
-fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
-    let model = resolve_model_path(args.model.clone());
+fn run_smoke(args: DiffusionSmokeArgs, loaded: &LoadedConfig) -> anyhow::Result<()> {
+    let model = resolve_model_path(args.model.clone(), loaded);
     let inspection = inspect_hfq_with_runtime_support(&model)?;
     if !inspection.runtime_support.supported {
         let reason = inspection
@@ -973,6 +1660,7 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
             inpainting_fill: None,
             resize_mode: Default::default(),
             denoising_strength: args.denoising_strength,
+            refine_sigma: None,
         };
         let img2img_output = pipeline
             .generate_img2img_batch_with_runtime_options(img2img_request, runtime_options)?;
@@ -996,6 +1684,7 @@ fn run_smoke(args: DiffusionSmokeArgs) -> anyhow::Result<()> {
                 inpainting_fill: None,
                 resize_mode: Default::default(),
                 denoising_strength: args.denoising_strength,
+                refine_sigma: None,
             };
             let masked_output = pipeline
                 .generate_img2img_batch_with_runtime_options(masked_request, runtime_options)?;
@@ -1403,7 +2092,49 @@ mod tests {
             hr_second_pass_steps: None,
             hr_denoising_strength: 0.75,
             rocm_device_id: None,
+            preview_dir: None,
+            mrflow: None,
+            mrflow_total_steps: None,
+            mrflow_refine_sigma: None,
+            mrflow_upscale: None,
+            mrflow_shifted: false,
+            mrflow_sr: None,
         }
+    }
+
+    #[test]
+    fn mrflow_round16_snaps_to_multiple_of_16_with_floor() {
+        assert_eq!(mrflow_round16(512.0), 512);
+        assert_eq!(mrflow_round16(1024.0 / 2.0), 512);
+        // Rounds to nearest multiple of 16.
+        assert_eq!(mrflow_round16(520.0), 528);
+        assert_eq!(mrflow_round16(519.0), 512);
+        // Never below 16 even for tiny targets.
+        assert_eq!(mrflow_round16(1.0), 16);
+    }
+
+    #[test]
+    fn mrflow_presets_match_reference_numbers() {
+        let turbo = MrFlowPreset::Krea2Turbo8Plus1.params();
+        assert_eq!(turbo.stage1_steps, 8);
+        assert_eq!(turbo.refine_steps, 1);
+        assert!((turbo.refine_sigma - 0.11).abs() < 1e-6);
+        assert!((turbo.cfg_scale - 1.0).abs() < 1e-6);
+
+        let base = MrFlowPreset::Krea2Base12Plus1.params();
+        assert_eq!(base.stage1_steps, 12);
+        assert!((base.refine_sigma - 0.12).abs() < 1e-6);
+        assert!((base.cfg_scale - 4.0).abs() < 1e-6);
+
+        assert_eq!(MrFlowPreset::Zit9Plus1.params().stage1_steps, 9);
+        assert_eq!(MrFlowPreset::Krea2Base20Plus1.params().stage1_steps, 20);
+    }
+
+    #[test]
+    fn mrflow_total_steps_override_reserves_the_refine_pass() {
+        assert_eq!(mrflow_stage1_steps(8, 1, Some(8)).unwrap(), 7);
+        assert_eq!(mrflow_stage1_steps(8, 1, None).unwrap(), 8);
+        assert!(mrflow_stage1_steps(8, 1, Some(1)).is_err());
     }
 
     fn smoke_args() -> DiffusionSmokeArgs {

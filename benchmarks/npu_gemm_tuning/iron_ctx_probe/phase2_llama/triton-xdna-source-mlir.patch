@@ -1,0 +1,17 @@
+diff --git a/setup.py b/setup.py
+index 11956c7..0925719 100644
+--- a/setup.py
++++ b/setup.py
+@@ -324,6 +324,12 @@ def get_install_requires():
+         f"{mlir_air_version}.{mlir_air_timestamp}+{mlir_air_short_commit}.no.rtti"
+     )
+ 
++    # TRITON_XDNA_SOURCE_MLIR: mlir-aie / mlir-air / llvm-aie are provided from a
++    # source build via env (MLIR_AIE_INSTALL_DIR, PYTHONPATH, PEANO_INSTALL_DIR),
++    # so do not pin/pull the wheels. Default keeps the original pinned wheel.
++    if os.environ.get("TRITON_XDNA_SOURCE_MLIR"):
++        return []
++
+     return [
+         f"mlir-air[aie]=={mlir_air_full_version}",
+     ]

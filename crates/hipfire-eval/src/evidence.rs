@@ -697,16 +697,31 @@ pub(crate) fn build_admission_artifact(
                         && required_evidence_row_matches(kind, batteries, row)
                 })
                 .count();
+            let failed_rows = rows
+                .iter()
+                .filter(|row| {
+                    row.status == EvalStatus::Fail
+                        && required_evidence_row_matches(kind, batteries, row)
+                })
+                .count();
             AdmissionEvidence {
                 kind: (*kind).to_string(),
                 status: if pass_rows > 0 {
                     EvalStatus::Pass
+                } else if *kind == "diffusion" && failed_rows > 0 {
+                    EvalStatus::Fail
                 } else {
                     EvalStatus::Skip
                 },
-                rows: pass_rows,
+                rows: if pass_rows > 0 {
+                    pass_rows
+                } else {
+                    failed_rows
+                },
                 reason: if pass_rows > 0 {
                     None
+                } else if *kind == "diffusion" && failed_rows > 0 {
+                    Some(format!("{failed_rows} failing diffusion evidence row(s)"))
                 } else {
                     Some(format!("no passing {kind} evidence rows"))
                 },
@@ -719,6 +734,30 @@ pub(crate) fn build_admission_artifact(
         .iter()
         .filter(|e| e.status != EvalStatus::Pass)
         .count();
+    if config
+        .batteries
+        .iter()
+        .all(|battery| *battery == BatteryId::Diffusion)
+    {
+        let failed = rows
+            .iter()
+            .filter(|row| row.battery == BatteryId::Diffusion && row.status == EvalStatus::Fail)
+            .count();
+        if failed > 0 {
+            return AdmissionArtifact {
+                schema: 1,
+                provenance: run_provenance(ctx),
+                status: EvalStatus::Fail,
+                verdict: "reject".to_string(),
+                reason: Some(format!(
+                    "{failed} frozen diffusion RGB baseline comparison(s) failed"
+                )),
+                required_evidence,
+                observed_evidence,
+                findings: Vec::new(),
+            };
+        }
+    }
     if missing > 0 {
         return AdmissionArtifact {
             schema: 1,
@@ -726,6 +765,22 @@ pub(crate) fn build_admission_artifact(
             status: EvalStatus::Skip,
             verdict: "incomplete".to_string(),
             reason: Some(format!("{missing} required evidence kind(s) missing")),
+            required_evidence,
+            observed_evidence,
+            findings: Vec::new(),
+        };
+    }
+    if config
+        .batteries
+        .iter()
+        .all(|battery| *battery == BatteryId::Diffusion)
+    {
+        return AdmissionArtifact {
+            schema: 1,
+            provenance: run_provenance(ctx),
+            status: EvalStatus::Pass,
+            verdict: "promote".to_string(),
+            reason: Some("all frozen diffusion RGB baseline comparisons passed".to_string()),
             required_evidence,
             observed_evidence,
             findings: Vec::new(),

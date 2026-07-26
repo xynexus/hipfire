@@ -51,8 +51,17 @@ use hipfire_evidence::{
 use hipfire_hash::{file_hash, stable_hash_bytes, stable_hash_file_fallback};
 use hipfire_model::{
     discover_dflash_draft_for_model, model_artifact_stem, model_hash, model_manifest_entry,
-    ModelLoadParams, ModelLoadedResponse, ModelManifestEntry,
+    parse_canonical_model_artifact_name, ModelLoadParams, ModelLoadedResponse, ModelManifestEntry,
 };
+
+pub(crate) fn eval_models_dir() -> PathBuf {
+    std::env::var_os("HIPFIRE_MODELS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let loaded = hipfire_config::load_config_bundle();
+            hipfire_config::configured_models_dir(&loaded.config)
+        })
+}
 
 mod config;
 pub use config::*;
@@ -62,6 +71,8 @@ mod driver;
 use driver::*;
 mod executor_daemon;
 use executor_daemon::*;
+mod executor_diffusion;
+use executor_diffusion::*;
 mod executor_examples;
 use executor_examples::*;
 mod executor_mock;
@@ -84,6 +95,8 @@ mod result;
 use result::*;
 mod run;
 pub use run::*;
+mod server_client;
+use server_client::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -175,6 +188,8 @@ pub enum BatteryId {
     Calibrate,
     Perplexity,
     TinyQuant,
+    EmbeddingQuality,
+    Diffusion,
 }
 
 impl BatteryId {
@@ -199,6 +214,10 @@ impl BatteryId {
             "calibrate" | "calibration" => Ok(Self::Calibrate),
             "perplexity" | "ppl" => Ok(Self::Perplexity),
             "tinyquant" | "tiny_quant" | "tiny-quant" => Ok(Self::TinyQuant),
+            "embedding_quality" | "embed_quality" | "embedding-quality" | "sts" => {
+                Ok(Self::EmbeddingQuality)
+            }
+            "diffusion" | "image" | "image_quality" | "image-quality" => Ok(Self::Diffusion),
             other => Err(format!("unknown battery: {other}")),
         }
     }
@@ -224,6 +243,8 @@ impl BatteryId {
             Self::Calibrate => "calibrate",
             Self::Perplexity => "perplexity",
             Self::TinyQuant => "tiny_quant",
+            Self::EmbeddingQuality => "embedding_quality",
+            Self::Diffusion => "diffusion",
         }
     }
 }
@@ -427,6 +448,41 @@ pub struct EvalConfig {
     pub suites: Vec<SuiteId>,
     pub out_dir: PathBuf,
     pub kv_mode: Option<String>,
+    /// `--ctx N`: context length for perplexity / long-context batteries.
+    /// Supersedes the `HIPFIRE_EVAL_PERPLEXITY_CTX` env fallback.
+    #[serde(default)]
+    pub ctx: Option<usize>,
+    /// `--corpus PATH`: perplexity corpus. Supersedes the
+    /// `HIPFIRE_EVAL_PERPLEXITY_CORPUS` env fallback.
+    #[serde(default)]
+    pub corpus: Option<PathBuf>,
+    /// `--kv-hierarchical`: enable the two-tier hot/cold KV cache in spawned
+    /// model binaries (sets `HIPFIRE_KV_HIERARCHICAL=1`). The two-tier cache is
+    /// env-gated, not a `--kv-mode` value.
+    #[serde(default)]
+    pub kv_hierarchical: bool,
+    /// `--kvarn-bits <2|4|8>`: kvarn K precision (default 4). Sets
+    /// `HIPFIRE_KVARN_BITS` on spawned binaries when the mode is kvarn.
+    #[serde(default)]
+    pub kvarn_bits: Option<usize>,
+    /// `--hot-bits <8|16>`: hierarchical hot-tier precision (default 8 = int8 ring).
+    /// Sets `HIPFIRE_KV_HOT_BITS` on spawned binaries when kvarn + hierarchical.
+    #[serde(default)]
+    pub hot_bits: Option<usize>,
+    /// Explicit CASK/TriAttention sidecar for the CASK battery. When absent,
+    /// the runtime resolves an embedded component or canonical sibling.
+    #[serde(default)]
+    pub cask_sidecar: Option<PathBuf>,
+    /// Retained physical-token budget used by the daemon-backed CASK battery.
+    #[serde(default = "default_cask_budget")]
+    pub cask_budget: usize,
+    /// Growth interval between CASK compactions.
+    #[serde(default = "default_cask_beta")]
+    pub cask_beta: usize,
+    /// `--fixture <a,b>`: substring filter over pflash/longctx NIAH fixtures
+    /// (matched against the fixture path + case label). `None` runs all.
+    #[serde(default)]
+    pub fixture: Option<String>,
     pub max_tokens: usize,
     pub dflash: DflashMode,
     pub profile: ProfileMode,
@@ -468,6 +524,14 @@ pub struct EvalConfig {
     /// `--fetch`: ensure datasets/corpora are present, then exit.
     #[serde(default)]
     pub fetch: bool,
+}
+
+fn default_cask_budget() -> usize {
+    512
+}
+
+fn default_cask_beta() -> usize {
+    128
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1003,10 +1067,7 @@ fn run_host_capability_profile_anchor(config: &EvalConfig, ctx: &EvalContext) ->
         );
     };
     let out = config.out_dir.join("artifacts").join("host_profile.json");
-    let models_dir = home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".hipfire")
-        .join("models");
+    let models_dir = eval_models_dir();
     let started = SystemTime::now();
     let output = match Command::new(&bin)
         .args([
@@ -1232,6 +1293,21 @@ fn resolve_perplexity_bin() -> Option<PathBuf> {
     newest_existing_path([
         repo.join(format!("target/release/examples/perplexity{exe}")),
         repo.join(format!("target/debug/examples/perplexity{exe}")),
+    ])
+}
+
+fn resolve_quality_compare_bin() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("HIPFIRE_QUALITY_COMPARE_BIN") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::consts::EXE_SUFFIX;
+    let repo = repo_root()?;
+    newest_existing_path([
+        repo.join(format!("target/release/examples/quality_compare{exe}")),
+        repo.join(format!("target/debug/examples/quality_compare{exe}")),
     ])
 }
 
@@ -1576,10 +1652,19 @@ fn barrage_rows(
                 };
             }
 
-            let reason = d
-                .reason
-                .clone()
-                .unwrap_or_else(|| "native barrage runner is not implemented yet".to_string());
+            let reason = d.reason.clone().unwrap_or_else(|| match d.suite {
+                // These are implemented under the examples executor; this
+                // fallback only fires when a non-examples executor is selected.
+                SuiteId::Niah
+                | SuiteId::SequentialNiah
+                | SuiteId::NeedleChain
+                | SuiteId::NoLiMa
+                | SuiteId::Ruler => {
+                    "long-context retrieval runs under the examples executor (use --executor examples)"
+                        .to_string()
+                }
+                _ => "native barrage runner is not implemented yet".to_string(),
+            });
             selected_item_ids(d.suite)
                 .into_iter()
                 .map(move |id| {
@@ -2148,6 +2233,12 @@ mod tests {
             "baseline-json",
             "--performance-compare-variant",
             "baseline-perf",
+            "--cask-sidecar",
+            "candidate.triattn.hfq",
+            "--cask-budget",
+            "384",
+            "--cask-beta",
+            "96",
         ])
         .unwrap();
         assert_eq!(cfg.tier, EvalTier::Medium);
@@ -2170,6 +2261,38 @@ mod tests {
             cfg.performance_baseline_variant.as_deref(),
             Some("baseline-perf")
         );
+        assert_eq!(
+            cfg.cask_sidecar.as_deref(),
+            Some(Path::new("candidate.triattn.hfq"))
+        );
+        assert_eq!(cfg.cask_budget, 384);
+        assert_eq!(cfg.cask_beta, 96);
+    }
+
+    #[test]
+    fn cask_recall_requires_needle_and_a_prompt_beyond_the_physical_cap() {
+        let (status, reason) = cask_recall_status(
+            "The bell rings twenty-one times.",
+            "twenty-one",
+            Some(2048),
+            896,
+        );
+        assert_eq!(status, EvalStatus::Pass);
+        assert_eq!(reason, None);
+
+        let (status, reason) =
+            cask_recall_status("The bell rings seven times.", "twenty-one", Some(2048), 896);
+        assert_eq!(status, EvalStatus::Fail);
+        assert!(reason.unwrap().contains("committed needle"));
+
+        let (status, reason) = cask_recall_status(
+            "The bell rings twenty-one times.",
+            "twenty-one",
+            Some(512),
+            896,
+        );
+        assert_eq!(status, EvalStatus::Fail);
+        assert!(reason.unwrap().contains("physical KV cap"));
     }
 
     #[test]
@@ -2211,8 +2334,8 @@ mod tests {
     fn dflash_auto_discovers_matching_qwen_draft() {
         let dir = temp_path("dflash-autodiscover");
         fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("qwen3.5-27b-mq4.hfq");
-        let draft = dir.join("qwen3.5-27b-mq4.dflash.hfq");
+        let target = dir.join("Qwen3.5-27B--mq4.hfq");
+        let draft = dir.join("Qwen3.5-27B-BF16.dflash.hfq");
         fs::write(&target, b"target").unwrap();
         fs::write(&draft, b"draft").unwrap();
 
@@ -2235,8 +2358,8 @@ mod tests {
     fn explicit_dflash_draft_overrides_auto_discovery() {
         let dir = temp_path("dflash-explicit-draft");
         fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("qwen3.5-27b-mq4.hfq");
-        let discovered = dir.join("qwen3.5-27b-mq4.dflash.hfq");
+        let target = dir.join("Qwen3.5-27B--mq4.hfq");
+        let discovered = dir.join("Qwen3.5-27B-BF16.dflash.hfq");
         let explicit = dir.join("custom-draft.hfq");
         fs::write(&target, b"target").unwrap();
         fs::write(&discovered, b"draft").unwrap();
@@ -2633,6 +2756,15 @@ mod tests {
             BatteryId::Runtime
         );
         assert_eq!(BatteryId::Runtime.as_str(), "runtime");
+        assert_eq!(
+            BatteryId::parse("embedding_quality").unwrap(),
+            BatteryId::EmbeddingQuality
+        );
+        assert_eq!(
+            BatteryId::parse("sts").unwrap(),
+            BatteryId::EmbeddingQuality
+        );
+        assert_eq!(BatteryId::EmbeddingQuality.as_str(), "embedding_quality");
     }
 
     #[test]
@@ -3217,6 +3349,15 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             suites: vec![],
             out_dir: PathBuf::from("out"),
             kv_mode: Some("q8".to_string()),
+            ctx: None,
+            corpus: None,
+            kv_hierarchical: false,
+            kvarn_bits: None,
+            hot_bits: None,
+            cask_sidecar: None,
+            cask_budget: 512,
+            cask_beta: 128,
+            fixture: None,
             max_tokens: 8,
             dflash: DflashMode::Off,
             profile: ProfileMode::Off,
@@ -7342,6 +7483,15 @@ more noise
             suites: vec![],
             out_dir: PathBuf::from("out"),
             kv_mode: None,
+            ctx: None,
+            corpus: None,
+            kv_hierarchical: false,
+            kvarn_bits: None,
+            hot_bits: None,
+            cask_sidecar: None,
+            cask_budget: 512,
+            cask_beta: 128,
+            fixture: None,
             max_tokens: 8,
             dflash: DflashMode::Off,
             profile: ProfileMode::Off,
@@ -7578,6 +7728,67 @@ more noise
         assert_eq!(admission.status, EvalStatus::Pass);
         assert_eq!(admission.verdict, "promote");
         assert!(admission.findings.is_empty());
+    }
+
+    #[test]
+    fn diffusion_admission_uses_internal_frozen_baseline_verdict() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "candidate.hfq",
+            "--baseline",
+            "baseline.hfq",
+            "--battery",
+            "diffusion",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+        let passing = row_for_model(
+            BatteryId::Diffusion,
+            None,
+            "rgb_baseline_0",
+            None,
+            EvalStatus::Pass,
+            None,
+            BTreeMap::from([("rgb_mae_u8".to_string(), json!(0.5))]),
+            &cfg,
+            &ctx,
+            None,
+            0,
+            "candidate.hfq".to_string(),
+        );
+        let comparison = build_comparison_artifact(&cfg, std::slice::from_ref(&passing), &ctx);
+        let admission = build_admission_artifact(&cfg, &[passing], &comparison, &ctx);
+        assert_eq!(admission.status, EvalStatus::Pass);
+        assert_eq!(admission.verdict, "promote");
+
+        let failing = row_for_model(
+            BatteryId::Diffusion,
+            None,
+            "rgb_baseline_0",
+            None,
+            EvalStatus::Fail,
+            Some("frozen RGB threshold exceeded".to_string()),
+            BTreeMap::from([("rgb_mae_u8".to_string(), json!(1.5))]),
+            &cfg,
+            &ctx,
+            None,
+            0,
+            "candidate.hfq".to_string(),
+        );
+        let comparison = build_comparison_artifact(&cfg, std::slice::from_ref(&failing), &ctx);
+        let admission = build_admission_artifact(&cfg, &[failing], &comparison, &ctx);
+        assert_eq!(admission.status, EvalStatus::Fail);
+        assert_eq!(admission.verdict, "reject");
     }
 
     #[test]
@@ -7936,6 +8147,159 @@ more noise
         assert_eq!(admission.verdict, "reject");
         assert_eq!(admission.findings[0].severity, "reject");
         assert_eq!(admission.findings[0].metric, "mean_kld");
+    }
+
+    /// A candidate + reference `spearman` pair sharing one comparison key: a
+    /// beyond-tolerance drop rejects; a sub-tolerance drop is admitted. This is
+    /// the wiring the embedding_quality battery emits.
+    fn embedding_quality_rows_pair(
+        cfg: &EvalConfig,
+        ctx: &EvalContext,
+        candidate_spearman: f64,
+        reference_spearman: f64,
+    ) -> Vec<EvalResult> {
+        vec![
+            row_for_model(
+                BatteryId::EmbeddingQuality,
+                None,
+                "sts_benchmark",
+                Some("candidate".to_string()),
+                EvalStatus::Pass,
+                None,
+                BTreeMap::from([("spearman".to_string(), json!(candidate_spearman))]),
+                cfg,
+                ctx,
+                None,
+                0,
+                "candidate.hfq".to_string(),
+            ),
+            row_for_model(
+                BatteryId::EmbeddingQuality,
+                None,
+                "sts_benchmark",
+                Some("candidate".to_string()),
+                EvalStatus::Pass,
+                None,
+                BTreeMap::from([("spearman".to_string(), json!(reference_spearman))]),
+                cfg,
+                ctx,
+                None,
+                0,
+                "bf16.hfq".to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn embedding_quality_skip_rows_mark_canonical_oq_admission_path() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "/models/EmbeddingGemma-300M--npu.oq8+.hfq",
+            "--battery",
+            "embedding_quality",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+
+        let rows = run_examples_embedding_quality_rows(&cfg, &ctx);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.status, EvalStatus::Skip);
+        assert_eq!(row.metrics.get("quant"), Some(&json!("oq8+")));
+        assert_eq!(row.metrics.get("quant_family"), Some(&json!("oq")));
+        assert_eq!(
+            row.metrics.get("oq_admission_path"),
+            Some(&json!("embedding_quality"))
+        );
+        assert_eq!(row.metrics.get("oq_decode_gate"), Some(&json!("not_ar")));
+        assert_eq!(
+            row.metrics.get("oq_tiny_quant_gate"),
+            Some(&json!("not_ar"))
+        );
+        assert_eq!(
+            row.metrics.get("oq_fixture_golden_gate"),
+            Some(&json!("not_ar"))
+        );
+        assert_eq!(
+            row.metrics.get("oq_embedding_quality"),
+            Some(&json!("pending"))
+        );
+        assert_eq!(row.metrics.get("oq_npu_parity"), Some(&json!("pending")));
+    }
+
+    #[test]
+    fn admission_rejects_embedding_quality_spearman_regression() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "candidate.hfq",
+            "--reference",
+            "bf16.hfq",
+            "--battery",
+            "embedding_quality",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+        // delta = 0.80 - 0.82 = -0.02, beyond the 0.01 dead-band ⇒ reject.
+        let rows = embedding_quality_rows_pair(&cfg, &ctx, 0.80, 0.82);
+        let comparison = build_comparison_artifact(&cfg, &rows, &ctx);
+        let admission = build_admission_artifact(&cfg, &rows, &comparison, &ctx);
+        assert_eq!(admission.status, EvalStatus::Fail);
+        assert_eq!(admission.verdict, "reject");
+        assert!(admission
+            .findings
+            .iter()
+            .any(|f| f.metric == "spearman" && f.severity == "reject"));
+    }
+
+    #[test]
+    fn admission_admits_embedding_quality_within_tolerance() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "candidate.hfq",
+            "--reference",
+            "bf16.hfq",
+            "--battery",
+            "embedding_quality",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+        // delta = 0.8576 - 0.8615 = -0.0039, within the 0.01 dead-band ⇒ admit.
+        // (These are the measured OQ4++ vs BF16 STS-Benchmark Spearman values.)
+        let rows = embedding_quality_rows_pair(&cfg, &ctx, 0.8576, 0.8615);
+        let comparison = build_comparison_artifact(&cfg, &rows, &ctx);
+        let admission = build_admission_artifact(&cfg, &rows, &comparison, &ctx);
+        assert_ne!(admission.status, EvalStatus::Fail);
+        assert!(admission.findings.iter().all(|f| f.severity != "reject"));
     }
 
     #[test]

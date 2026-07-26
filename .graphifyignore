@@ -1,10 +1,14 @@
 /*
 
-# Keep only the runtime crates and HIP kernel tree in graphify scans.
+# Keep the runtime crates, HIP kernel tree, and workflow/test tooling in graphify scans.
 !/crates/
 !/crates/**
 !/kernels/
 !/kernels/**
+!/scripts/
+!/scripts/**
+!/tests/
+!/tests/**
 
 # Drop generated and validation-heavy material that dominates graph topology.
 /crates/**/target/**

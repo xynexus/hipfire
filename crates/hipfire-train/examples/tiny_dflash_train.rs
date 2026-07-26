@@ -31,9 +31,9 @@
 //!   cargo run -p hipfire-train --example tiny_dflash_train -- \
 //!     --out /tmp/tiny-dflash-trained --steps 80
 
+use hipfire_rdna::{DType, Gpu};
 use hipfire_train::ops::linear::{linear_backward_w, linear_forward};
 use hipfire_train::optim::AdamW;
-use hipfire_rdna::{DType, Gpu};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::Write;

@@ -5,13 +5,13 @@
 //! `Gemma3Backend: SimpleAr` serving impl (the dense-AR output strategy seed
 //! for E2's `ServingBackend` seam). Mirrors `hipfire-arch-qwen2::arch`.
 
+use hipfire_rdna::{Gpu, GpuTensor};
 use hipfire_runtime::arch::{
     run_simple_ar, ArchCaps, Architecture, EosFilterOverrides, GenerateCtx, PromptFrameOverrides,
     ServeOutcome, ServingBackend, SimpleAr,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use hipfire_rdna::{Gpu, GpuTensor};
 
 use crate::config::Gemma3Config;
 use crate::forward::{embed_token, forward_prefill_batch, forward_step, Gemma3State};
@@ -82,6 +82,11 @@ pub struct Gemma3Backend {
     pub config: Gemma3Config,
     pub weights: Gemma3Weights,
     pub state: Gemma3State,
+    /// Extract-layer residual indices captured for a DSpark/DFlash drafter
+    /// (ascending). Empty = not configured as a spec-decode target; the
+    /// `SpecTarget::dflash_extract_layers` accessor then reports `None`. Set via
+    /// `SpecTarget::set_dflash_extract_layers` at speculator build time.
+    pub dflash_extract_layers: Vec<usize>,
 }
 
 impl Gemma3Backend {
@@ -90,6 +95,7 @@ impl Gemma3Backend {
             config,
             weights,
             state,
+            dflash_extract_layers: Vec::new(),
         }
     }
 }

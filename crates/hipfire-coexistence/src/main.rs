@@ -28,10 +28,28 @@ fn main() -> Result<(), Box<dyn Error>> {
     let group = args.first().map(String::as_str);
     let op = args.get(1).map(String::as_str);
     match (group, op) {
+        (Some("calibrate"), _) => hipfire_coexistence::calibrate::run_cli(&args[1..]),
+        (Some("artifact"), Some("inspect")) => {
+            hipfire_coexistence::artifact::run_inspect_cli(&args[2..])
+        }
+        (Some("artifact"), Some("audit-calibration")) => {
+            hipfire_coexistence::calibration_audit::run_cli(&args[2..])
+        }
+        (Some("artifact"), Some("compare-calibration")) => {
+            hipfire_coexistence::calibration_compare::run_cli(&args[2..])
+        }
+        (Some("artifact"), Some("compare-calibration-stability")) => {
+            hipfire_coexistence::calibration_compare::run_stability_cli(&args[2..])
+        }
+        (Some("artifact"), Some("compare-residuals")) => {
+            hipfire_coexistence::residual_compare::run_cli(&args[2..])
+        }
         (Some("lora"), Some("export")) => lora_export(&args[2..]),
         (Some("lora"), Some("merge")) => lora_merge(&args[2..]),
         (Some("lora"), Some("convert")) => lora_convert(&args[2..]),
         (Some("import"), Some("gguf")) => import_gguf(&args[2..]),
+        #[cfg(target_os = "linux")]
+        (Some("npu"), Some("pair-hfp")) => npu_pair_hfp(&args[2..]),
         _ => {
             usage();
             std::process::exit(2);
@@ -43,13 +61,50 @@ fn usage() {
     eprintln!(
         "usage: hipfire-coexistence <group> <op> [flags]\n\
          \n\
+         calibrate --model <safetensors-dir-or-cache-root> --corpus <text> \
+         --output <model.calib.hfq> [--sequences N] [--context N] \
+         [--sequence-batch auto|N] [--time-tile auto|N] [--max-rows N] \
+         [--min-expert-activations N] [--expert-capture-target N] \
+         [--expert-capture-tile-rows N] [--expert-coverage-policy \
+         strict|preserve-undercovered] [--kldref|--no-kldref] \
+         [--kldref-topk N] [--boundary-dir DIR|--boundary-ram] [--resume] \
+         [--finalize-completed] [--dry-run]\n\
+         [--pause-after-layers N] \
+         [--residual-probe-output PATH --residual-probe-rows N] \
+         [--cask-output <model.triattn.hfq>] [--cask-only]\n\
+         artifact inspect --input <artifact.hfq>\n\
+         artifact audit-calibration --input <artifact.calib.hfq>\n\
+         artifact compare-calibration --reference <resident.calib.hfq> \
+         --candidate <streamed.calib.hfq> [--atol F] [--rtol F] \
+         [--max-reports N] [--allow-unproven-provenance]\n\
+         artifact compare-calibration-stability --reference <higher-cap.calib.hfq> \
+         --candidate <lower-cap.calib.hfq>\n\
+         artifact compare-residuals --reference <resident.residuals.hfq> \
+         --candidate <streamed.residuals.hfq> [--atol F] [--rtol F] \
+         [--max-reports N]\n\
          lora export  --hfq <model.hfq> --data-dir <dir> [--limit N] [--strength S] \
          [--no-orthogonalize] [--max-seq N] --out <adapter.lora.{{hfq,json}}>\n\
          lora merge   --hfq <base.hfq> --adapter <adapter.lora> --out <merged.hfq>\n\
          lora convert --in <adapter.lora.{{hfq,json}}> --out <adapter.lora.{{hfq,json}}>\n\
          import gguf  --in <model.gguf> --out <model.hfq> --format <FMT> \
-         [--no-kmap] [--kmap-dense] [--kmap-mode full|alt|typed] [--arch-id N]"
+         [--no-kmap] [--kmap-dense] [--kmap-mode full|alt|typed] [--arch-id N]\n\
+         npu pair-hfp --in <whole-scaled.rdna2.hfp> --out <paired.rdna2.hfp>"
     );
+}
+
+#[cfg(target_os = "linux")]
+fn npu_pair_hfp(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let flags = Flags::parse(args)?;
+    let input = PathBuf::from(flags.req("in")?);
+    let output = PathBuf::from(flags.req("out")?);
+    let payload =
+        hipfire_xdna::NpuOpusExecutor::prepack_paired_whole_scaled_cached(&output, &input)?;
+    eprintln!(
+        "wrote paired whole-scaled NPU HFP: {} payload bytes -> {}",
+        payload.len(),
+        output.display()
+    );
+    Ok(())
 }
 
 /// Import a GGUF checkpoint, re-quantizing its weights to a native `.hfq`

@@ -36,9 +36,9 @@ use crate::qwen35::{
     config_from_hfq as qwen35_config_from_hfq, load_weights as qwen35_load_weights, DeltaNetState,
     Qwen35Config, Qwen35Weights,
 };
+use hipfire_rdna::Gpu;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_rdna::Gpu;
 
 /// Type marker for Qwen3.5 architecture (dense Qwen3.5 0.8B/4B/9B/27B,
 /// MoE Qwen3.5-A3B/A10B/A17B, dense Qwen3.6, MoE Qwen3.6-A3B). All share

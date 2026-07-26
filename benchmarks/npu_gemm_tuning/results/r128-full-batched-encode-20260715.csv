@@ -1,0 +1,5 @@
+date,host,arch,model,documents,rows,iterations,reported_ms_per_document,derived_ms_per_command,tokens_per_second,mean_cosine_vs_separate_m256,min_cosine_vs_separate_m256,max_abs_vs_separate_m256,status,notes
+2026-07-15,halo,gfx1151,EmbeddingGemma-300M.npu.oq8.hfq,1,256,3,774.491,774.491,330.5,,,,pass,fresh process; M256 resident route
+2026-07-15,halo,gfx1151,EmbeddingGemma-300M.npu.oq8.hfq,2,512,3,633.625,1267.250,404.0,,,,pass,fresh process; M512 resident route; 1.22x row throughput
+2026-07-15,halo,gfx1151,EmbeddingGemma-300M.npu.oq8.hfq,2,512,1,645.466,1290.932,396.6,0.99999845,0.99999797,0.00025596,pass,two distinct 256-token documents; separate M256 hardware references
+2026-07-15,halo,gfx1151,EmbeddingGemma-300M.npu.oq8.hfq,2,512,10,612.439,1224.878,418.0,0.99999845,0.99999797,0.00025596,pass,ten-command context-reuse stability; final output checked

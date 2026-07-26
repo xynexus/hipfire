@@ -1,0 +1,858 @@
+{
+  "artifact_sha256": "d3f4436388f2eb72d48d64c71f7616610b44a5a14f170b4ed5d56090753d9876",
+  "command_argv": [
+    "python3",
+    "scripts/astrea.py",
+    "latent-kv-capture",
+    "--plan",
+    "benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/plan.json",
+    "--split",
+    "calibration",
+    "--output-dir",
+    "benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture",
+    "--threads",
+    "8",
+    "--pretty",
+    "--out",
+    "benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/result.json"
+  ],
+  "created_at": "2026-07-10T19:38:45.953266+00:00",
+  "dataset": {
+    "bytes": 46765,
+    "path": "/home/sadara/hipfire/benchmarks/prompts/longcode_pflash.jsonl",
+    "sha256": "d5414d539c7e69166c72c4ef67865ed196d9137a07f359d1bda5d3208ab4e37d"
+  },
+  "engine_sha256": "7cfc66d05eeeb248945b33b75e9581ec6851ed2fc684011e154f684790271a4e",
+  "model_sha256": "c67aa0d5072cd9569d6adf48eeb1e27d3fdab8d4b59c0a7cc0ce5ceab08e398b",
+  "offline_engine_sha256": "72c04624c23de608da459f077c64684ad6378d2f2702a2f14017c0705655d871",
+  "plan_path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/plan.json",
+  "plan_sha256": "4cf9c6df5673771de7621ef7304f0a5e2e57e780ba8c79788aa4bb3612c2b569",
+  "records": [
+    {
+      "bytes": 657336,
+      "content_start": 0,
+      "dataset_line": 1,
+      "layer": 3,
+      "length": 32,
+      "max_relative_offset": 31,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s000.l3.n32.p0.npz",
+      "position_offset": 0,
+      "sha256": "7caa9386745448d05c52f1f7393d117b244c1f242e6b931c8043e65d4999a777",
+      "shapes": {
+        "gate": [
+          8,
+          32,
+          256
+        ],
+        "k": [
+          2,
+          32,
+          256
+        ],
+        "q": [
+          8,
+          32,
+          256
+        ],
+        "v": [
+          2,
+          32,
+          256
+        ]
+      },
+      "stratum": 0
+    },
+    {
+      "bytes": 657336,
+      "content_start": 0,
+      "dataset_line": 1,
+      "layer": 7,
+      "length": 32,
+      "max_relative_offset": 31,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s000.l7.n32.p0.npz",
+      "position_offset": 0,
+      "sha256": "29eb36706b4190195c44b0b1d9e4de04e4e242cb3b3fa940dc87232e709b8cef",
+      "shapes": {
+        "gate": [
+          8,
+          32,
+          256
+        ],
+        "k": [
+          2,
+          32,
+          256
+        ],
+        "q": [
+          8,
+          32,
+          256
+        ],
+        "v": [
+          2,
+          32,
+          256
+        ]
+      },
+      "stratum": 0
+    },
+    {
+      "bytes": 657336,
+      "content_start": 0,
+      "dataset_line": 1,
+      "layer": 11,
+      "length": 32,
+      "max_relative_offset": 31,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s000.l11.n32.p0.npz",
+      "position_offset": 0,
+      "sha256": "c9947db6d9adba7cd75d5de6f5ddd0a5abb9615f914f351a2dcbbd2f227ff38c",
+      "shapes": {
+        "gate": [
+          8,
+          32,
+          256
+        ],
+        "k": [
+          2,
+          32,
+          256
+        ],
+        "q": [
+          8,
+          32,
+          256
+        ],
+        "v": [
+          2,
+          32,
+          256
+        ]
+      },
+      "stratum": 0
+    },
+    {
+      "bytes": 657336,
+      "content_start": 0,
+      "dataset_line": 1,
+      "layer": 15,
+      "length": 32,
+      "max_relative_offset": 31,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s000.l15.n32.p0.npz",
+      "position_offset": 0,
+      "sha256": "eebe5646dd80b957919565a469907ec142c71878314a8f1ebc56f7d23bb48cf8",
+      "shapes": {
+        "gate": [
+          8,
+          32,
+          256
+        ],
+        "k": [
+          2,
+          32,
+          256
+        ],
+        "q": [
+          8,
+          32,
+          256
+        ],
+        "v": [
+          2,
+          32,
+          256
+        ]
+      },
+      "stratum": 0
+    },
+    {
+      "bytes": 657336,
+      "content_start": 0,
+      "dataset_line": 1,
+      "layer": 19,
+      "length": 32,
+      "max_relative_offset": 31,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s000.l19.n32.p0.npz",
+      "position_offset": 0,
+      "sha256": "de3759c449ab9b5a13ff25cbc56736a6a31aba548b3cdbf68fff691fcdba1ca8",
+      "shapes": {
+        "gate": [
+          8,
+          32,
+          256
+        ],
+        "k": [
+          2,
+          32,
+          256
+        ],
+        "q": [
+          8,
+          32,
+          256
+        ],
+        "v": [
+          2,
+          32,
+          256
+        ]
+      },
+      "stratum": 0
+    },
+    {
+      "bytes": 657336,
+      "content_start": 0,
+      "dataset_line": 1,
+      "layer": 23,
+      "length": 32,
+      "max_relative_offset": 31,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s000.l23.n32.p0.npz",
+      "position_offset": 0,
+      "sha256": "b219fbceaced66b5ca21d29e1ea85c0c867337eeb158e6a67ae21850836078f1",
+      "shapes": {
+        "gate": [
+          8,
+          32,
+          256
+        ],
+        "k": [
+          2,
+          32,
+          256
+        ],
+        "q": [
+          8,
+          32,
+          256
+        ],
+        "v": [
+          2,
+          32,
+          256
+        ]
+      },
+      "stratum": 0
+    },
+    {
+      "bytes": 657336,
+      "content_start": 16,
+      "dataset_line": 1,
+      "layer": 3,
+      "length": 32,
+      "max_relative_offset": 31,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s001.l3.n32.p64.npz",
+      "position_offset": 64,
+      "sha256": "04b4f7cb89ca694af5657a07b1383976c9d214cb28a6fceac3976c7ab261e8ab",
+      "shapes": {
+        "gate": [
+          8,
+          32,
+          256
+        ],
+        "k": [
+          2,
+          32,
+          256
+        ],
+        "q": [
+          8,
+          32,
+          256
+        ],
+        "v": [
+          2,
+          32,
+          256
+        ]
+      },
+      "stratum": 1
+    },
+    {
+      "bytes": 657336,
+      "content_start": 16,
+      "dataset_line": 1,
+      "layer": 7,
+      "length": 32,
+      "max_relative_offset": 31,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s001.l7.n32.p64.npz",
+      "position_offset": 64,
+      "sha256": "f3a46c889e8aaf4871f8e8f372551946af5bdd04c71acb59cc4e8101e3fcca2a",
+      "shapes": {
+        "gate": [
+          8,
+          32,
+          256
+        ],
+        "k": [
+          2,
+          32,
+          256
+        ],
+        "q": [
+          8,
+          32,
+          256
+        ],
+        "v": [
+          2,
+          32,
+          256
+        ]
+      },
+      "stratum": 1
+    },
+    {
+      "bytes": 657336,
+      "content_start": 16,
+      "dataset_line": 1,
+      "layer": 11,
+      "length": 32,
+      "max_relative_offset": 31,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s001.l11.n32.p64.npz",
+      "position_offset": 64,
+      "sha256": "63590383dfc09720ee7706478c18b86edafc5560d4cececf83be20cd8660b070",
+      "shapes": {
+        "gate": [
+          8,
+          32,
+          256
+        ],
+        "k": [
+          2,
+          32,
+          256
+        ],
+        "q": [
+          8,
+          32,
+          256
+        ],
+        "v": [
+          2,
+          32,
+          256
+        ]
+      },
+      "stratum": 1
+    },
+    {
+      "bytes": 657336,
+      "content_start": 16,
+      "dataset_line": 1,
+      "layer": 15,
+      "length": 32,
+      "max_relative_offset": 31,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s001.l15.n32.p64.npz",
+      "position_offset": 64,
+      "sha256": "7abd2ae1b351b0f53c2b4497e0d359258f4643a2a7580087415043d0b7d3eb6f",
+      "shapes": {
+        "gate": [
+          8,
+          32,
+          256
+        ],
+        "k": [
+          2,
+          32,
+          256
+        ],
+        "q": [
+          8,
+          32,
+          256
+        ],
+        "v": [
+          2,
+          32,
+          256
+        ]
+      },
+      "stratum": 1
+    },
+    {
+      "bytes": 657336,
+      "content_start": 16,
+      "dataset_line": 1,
+      "layer": 19,
+      "length": 32,
+      "max_relative_offset": 31,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s001.l19.n32.p64.npz",
+      "position_offset": 64,
+      "sha256": "caeb6dde31793f7b8182880c05ffcbf265204582599fdbff904c5d595658dd20",
+      "shapes": {
+        "gate": [
+          8,
+          32,
+          256
+        ],
+        "k": [
+          2,
+          32,
+          256
+        ],
+        "q": [
+          8,
+          32,
+          256
+        ],
+        "v": [
+          2,
+          32,
+          256
+        ]
+      },
+      "stratum": 1
+    },
+    {
+      "bytes": 657336,
+      "content_start": 16,
+      "dataset_line": 1,
+      "layer": 23,
+      "length": 32,
+      "max_relative_offset": 31,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s001.l23.n32.p64.npz",
+      "position_offset": 64,
+      "sha256": "04f883d53eac97997fc0bc584b39b5593c0e612f114605f6fd5084eb7ae2e8c8",
+      "shapes": {
+        "gate": [
+          8,
+          32,
+          256
+        ],
+        "k": [
+          2,
+          32,
+          256
+        ],
+        "q": [
+          8,
+          32,
+          256
+        ],
+        "v": [
+          2,
+          32,
+          256
+        ]
+      },
+      "stratum": 1
+    },
+    {
+      "bytes": 1313208,
+      "content_start": 64,
+      "dataset_line": 1,
+      "layer": 3,
+      "length": 64,
+      "max_relative_offset": 63,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s002.l3.n64.p0.npz",
+      "position_offset": 0,
+      "sha256": "cbd345ba1bf9079b497b2416af27edf3bbcb6aec89cc38a3f34ccdc16a8e6aea",
+      "shapes": {
+        "gate": [
+          8,
+          64,
+          256
+        ],
+        "k": [
+          2,
+          64,
+          256
+        ],
+        "q": [
+          8,
+          64,
+          256
+        ],
+        "v": [
+          2,
+          64,
+          256
+        ]
+      },
+      "stratum": 2
+    },
+    {
+      "bytes": 1313208,
+      "content_start": 64,
+      "dataset_line": 1,
+      "layer": 7,
+      "length": 64,
+      "max_relative_offset": 63,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s002.l7.n64.p0.npz",
+      "position_offset": 0,
+      "sha256": "35fa25bc024ff64b0826c128575af22f0fece03a58d953b4d34c8e101d9d9bd2",
+      "shapes": {
+        "gate": [
+          8,
+          64,
+          256
+        ],
+        "k": [
+          2,
+          64,
+          256
+        ],
+        "q": [
+          8,
+          64,
+          256
+        ],
+        "v": [
+          2,
+          64,
+          256
+        ]
+      },
+      "stratum": 2
+    },
+    {
+      "bytes": 1313208,
+      "content_start": 64,
+      "dataset_line": 1,
+      "layer": 11,
+      "length": 64,
+      "max_relative_offset": 63,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s002.l11.n64.p0.npz",
+      "position_offset": 0,
+      "sha256": "cc290e302d66244257b6f0f23a657ef9a840baacb0a59feb864f450df23b4e6d",
+      "shapes": {
+        "gate": [
+          8,
+          64,
+          256
+        ],
+        "k": [
+          2,
+          64,
+          256
+        ],
+        "q": [
+          8,
+          64,
+          256
+        ],
+        "v": [
+          2,
+          64,
+          256
+        ]
+      },
+      "stratum": 2
+    },
+    {
+      "bytes": 1313208,
+      "content_start": 64,
+      "dataset_line": 1,
+      "layer": 15,
+      "length": 64,
+      "max_relative_offset": 63,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s002.l15.n64.p0.npz",
+      "position_offset": 0,
+      "sha256": "58ed6243b64c093b2784b7acb5194b6b76c1bcb5cdcea9943cf3fc15c757c3c5",
+      "shapes": {
+        "gate": [
+          8,
+          64,
+          256
+        ],
+        "k": [
+          2,
+          64,
+          256
+        ],
+        "q": [
+          8,
+          64,
+          256
+        ],
+        "v": [
+          2,
+          64,
+          256
+        ]
+      },
+      "stratum": 2
+    },
+    {
+      "bytes": 1313208,
+      "content_start": 64,
+      "dataset_line": 1,
+      "layer": 19,
+      "length": 64,
+      "max_relative_offset": 63,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s002.l19.n64.p0.npz",
+      "position_offset": 0,
+      "sha256": "5e1b162c0298968e2431843efd5be2d0af7bda46321c20dd67d99edcdbe7006a",
+      "shapes": {
+        "gate": [
+          8,
+          64,
+          256
+        ],
+        "k": [
+          2,
+          64,
+          256
+        ],
+        "q": [
+          8,
+          64,
+          256
+        ],
+        "v": [
+          2,
+          64,
+          256
+        ]
+      },
+      "stratum": 2
+    },
+    {
+      "bytes": 1313208,
+      "content_start": 64,
+      "dataset_line": 1,
+      "layer": 23,
+      "length": 64,
+      "max_relative_offset": 63,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s002.l23.n64.p0.npz",
+      "position_offset": 0,
+      "sha256": "520bfbbf2c649bc26306fcc3c687fcb443ff25aa918e51c103690c2a86fa1037",
+      "shapes": {
+        "gate": [
+          8,
+          64,
+          256
+        ],
+        "k": [
+          2,
+          64,
+          256
+        ],
+        "q": [
+          8,
+          64,
+          256
+        ],
+        "v": [
+          2,
+          64,
+          256
+        ]
+      },
+      "stratum": 2
+    },
+    {
+      "bytes": 1313208,
+      "content_start": 96,
+      "dataset_line": 1,
+      "layer": 3,
+      "length": 64,
+      "max_relative_offset": 63,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s003.l3.n64.p64.npz",
+      "position_offset": 64,
+      "sha256": "744612805bb2a93fdc1b8f5294f56d09495261a453434536082f46740b125645",
+      "shapes": {
+        "gate": [
+          8,
+          64,
+          256
+        ],
+        "k": [
+          2,
+          64,
+          256
+        ],
+        "q": [
+          8,
+          64,
+          256
+        ],
+        "v": [
+          2,
+          64,
+          256
+        ]
+      },
+      "stratum": 3
+    },
+    {
+      "bytes": 1313208,
+      "content_start": 96,
+      "dataset_line": 1,
+      "layer": 7,
+      "length": 64,
+      "max_relative_offset": 63,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s003.l7.n64.p64.npz",
+      "position_offset": 64,
+      "sha256": "255d620a9d1662f35c25421dbd3154e465d7e171c08089bf34bca5ad8427c208",
+      "shapes": {
+        "gate": [
+          8,
+          64,
+          256
+        ],
+        "k": [
+          2,
+          64,
+          256
+        ],
+        "q": [
+          8,
+          64,
+          256
+        ],
+        "v": [
+          2,
+          64,
+          256
+        ]
+      },
+      "stratum": 3
+    },
+    {
+      "bytes": 1313208,
+      "content_start": 96,
+      "dataset_line": 1,
+      "layer": 11,
+      "length": 64,
+      "max_relative_offset": 63,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s003.l11.n64.p64.npz",
+      "position_offset": 64,
+      "sha256": "5c8f873b897f5ac86b8d7a3c5697e5a81f2435d88ba8c405fbd14b03c1a845f0",
+      "shapes": {
+        "gate": [
+          8,
+          64,
+          256
+        ],
+        "k": [
+          2,
+          64,
+          256
+        ],
+        "q": [
+          8,
+          64,
+          256
+        ],
+        "v": [
+          2,
+          64,
+          256
+        ]
+      },
+      "stratum": 3
+    },
+    {
+      "bytes": 1313208,
+      "content_start": 96,
+      "dataset_line": 1,
+      "layer": 15,
+      "length": 64,
+      "max_relative_offset": 63,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s003.l15.n64.p64.npz",
+      "position_offset": 64,
+      "sha256": "356e5e5eb18e8608a5819469cdea87cd2d0ea995b4f9c2b4515071f1c8e810e5",
+      "shapes": {
+        "gate": [
+          8,
+          64,
+          256
+        ],
+        "k": [
+          2,
+          64,
+          256
+        ],
+        "q": [
+          8,
+          64,
+          256
+        ],
+        "v": [
+          2,
+          64,
+          256
+        ]
+      },
+      "stratum": 3
+    },
+    {
+      "bytes": 1313208,
+      "content_start": 96,
+      "dataset_line": 1,
+      "layer": 19,
+      "length": 64,
+      "max_relative_offset": 63,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s003.l19.n64.p64.npz",
+      "position_offset": 64,
+      "sha256": "a5f1679d3e6db3393f8a62af151f8280f15eaab4844873184cefdb9fdf5e5c52",
+      "shapes": {
+        "gate": [
+          8,
+          64,
+          256
+        ],
+        "k": [
+          2,
+          64,
+          256
+        ],
+        "q": [
+          8,
+          64,
+          256
+        ],
+        "v": [
+          2,
+          64,
+          256
+        ]
+      },
+      "stratum": 3
+    },
+    {
+      "bytes": 1313208,
+      "content_start": 96,
+      "dataset_line": 1,
+      "layer": 23,
+      "length": 64,
+      "max_relative_offset": 63,
+      "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/records/calibration.s003.l23.n64.p64.npz",
+      "position_offset": 64,
+      "sha256": "a458beddec11087527803035591f5aaf916d4d899459387fc5c23bb03ebe139b",
+      "shapes": {
+        "gate": [
+          8,
+          64,
+          256
+        ],
+        "k": [
+          2,
+          64,
+          256
+        ],
+        "q": [
+          8,
+          64,
+          256
+        ],
+        "v": [
+          2,
+          64,
+          256
+        ]
+      },
+      "stratum": 3
+    }
+  ],
+  "rope_sha256": "7044372884c06b70ab7c941da48acbece7628f9cc026cd4605e96e834006483e",
+  "schema": "hipfire.astrea.latent_kv_capture.v0",
+  "split": "calibration",
+  "status": "captured",
+  "strata": 4,
+  "weights": {
+    "bytes": 50333190,
+    "path": "/home/sadara/hipfire/benchmarks/results/latent-kv-qwen3.5-0.8b-r32-20260710/calibration-capture/static_weights.npz",
+    "sha256": "484e4dc8f5fafe4d9f280a7d6ce40d0fba1235c37ffc02b328dfe118916f4e92"
+  }
+}

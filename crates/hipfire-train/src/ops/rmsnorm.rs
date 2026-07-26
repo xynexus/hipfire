@@ -3,7 +3,8 @@
 //!
 //! Thin wrappers over the `rmsnorm_train_{fwd,bwd}` kernels. The forward saves
 //! `1/r` per row into `rinv`, which the backward consumes (no recompute). `dw`
-//! is atomic-accumulated, so zero it before calling backward.
+//! is accumulated (`+=`) by a deterministic column-reduction kernel, so zero it
+//! before the first backward call.
 
 use hipfire_rdna::{Gpu, GpuTensor, HipResult};
 
@@ -22,7 +23,8 @@ pub fn rmsnorm_forward(
     gpu.rmsnorm_train_fwd(x, w, y, rinv, rows, h, eps)
 }
 
-/// Backward. Writes `dx` `[rows*h]`; atomic-accumulates `dw` `[h]` (zero first).
+/// Backward. Writes `dx` `[rows*h]`; deterministically accumulates `dw` `[h]`
+/// (`+=`; zero first). dw uses a fixed-order per-column reduction, not atomics.
 #[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_backward(
     gpu: &mut Gpu,

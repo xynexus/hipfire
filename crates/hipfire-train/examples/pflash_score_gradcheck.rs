@@ -25,8 +25,8 @@
 //!   hipfire gpu-lock acquire "pflash-gradcheck"
 //!   cargo run -p hipfire-train --release --example pflash_score_gradcheck
 
-use hipfire_train::ops::pflash_score::{pflash_score_backward, pflash_score_forward};
 use hipfire_rdna::{DType, Gpu};
+use hipfire_train::ops::pflash_score::{pflash_score_backward, pflash_score_forward};
 
 const N_POS: usize = 8;
 const KV_DIM: usize = 16;

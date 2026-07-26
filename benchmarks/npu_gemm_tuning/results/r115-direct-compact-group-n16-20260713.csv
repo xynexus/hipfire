@@ -1,0 +1,10 @@
+sample,parity,mismatches,max_abs,dispatch_ms,activation_physical_bytes,activation_unique_bytes,nmacro_replicas,max_core_text_bytes,status
+initial,pass,0,0.000000002,0.206793,196608,66560,0,1692,warmup-scale-only
+fresh_zero,fail,4087,0.021135990,,196608,66560,0,1692,context-transition-diagnostic
+fresh_1,pass,0,0.000000002,0.092138,196608,66560,0,1692,admitted
+fresh_2,pass,0,0.000000002,0.090826,196608,66560,0,1692,admitted
+fresh_3,pass,0,0.000000002,0.094342,196608,66560,0,1692,admitted
+fresh_4,pass,0,0.000000002,0.093423,196608,66560,0,1692,admitted
+fresh_5,pass,0,0.000000002,0.091734,196608,66560,0,1692,admitted
+fresh_6,pass,0,0.000000002,0.092571,196608,66560,0,1692,admitted
+fresh_mean,pass,0,0.000000002,0.092506,196608,66560,0,1692,admitted

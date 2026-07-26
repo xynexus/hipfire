@@ -20,6 +20,7 @@ use std::path::Path;
 
 use hipfire_admin_types::AdminStats;
 
+mod amdgpu_regs;
 mod fdinfo;
 mod gpu;
 mod gpu_metrics;
@@ -27,6 +28,7 @@ mod host;
 mod host_profile;
 mod npu;
 
+pub use amdgpu_regs::{AmdgpuRegDevice, AmdgpuRegLib, ChipClass, GRBM2_OFFSET, GRBM_OFFSET};
 pub use fdinfo::read_clients;
 pub use gpu::read_gpu_telemetry;
 pub use gpu_metrics::read_gpu_metrics;

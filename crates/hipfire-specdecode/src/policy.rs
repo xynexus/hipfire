@@ -40,6 +40,10 @@ pub enum KvMode {
     /// leverage tier — Asym2 is doc'd "most lossy" and 2-bit centroid quant
     /// suffers most from outliers. Opt-in via `--kv-mode fwht2`.
     Fwht2,
+    /// KVarN: Sinkhorn variance-normalized 4-bit K + Q8 V. The quant-quality
+    /// winner (dominates asym); the base tier for the two-tier hot/cold
+    /// hierarchical cache (`HIPFIRE_KV_HIERARCHICAL=1`). Opt-in via `--kv-mode kvarn`.
+    Kvarn,
 }
 
 impl Default for KvMode {

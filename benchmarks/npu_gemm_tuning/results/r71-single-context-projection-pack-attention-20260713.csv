@@ -1,0 +1,12 @@
+variant,trial,contexts,pack_owners,attention_columns,stage_mismatches,q_mismatches,kv_mismatches,attention_mismatches,iterations,ms,status,notes
+two-column-row-waves,1,1,columns-0-5,6-7,0,0,0,0,100,5.8417,rejected,half-width attention feed
+two-column-row-waves,2,1,columns-0-5,6-7,0,0,0,0,100,5.7243,rejected,half-width attention feed
+two-column-row-waves,3,1,columns-0-5,6-7,0,0,0,0,100,5.8228,rejected,half-width attention feed
+full-width-shared-shims,1,1,columns-0-3,4-7,0,0,0,0,100,3.5951,correct-not-admitted,input and output share shim columns
+full-width-shared-shims,2,1,columns-0-3,4-7,0,0,0,0,100,3.2617,correct-not-admitted,input and output share shim columns
+full-width-shared-shims,3,1,columns-0-3,4-7,0,0,0,0,100,3.3118,correct-not-admitted,input and output share shim columns
+redistributed-pack-control,1,1,columns-0-3,none,0,0,0,na,100,1.5446,control,primed isolated reference
+redistributed-pack-control,2,1,columns-0-3,none,0,0,0,na,100,1.5423,control,primed isolated reference
+redistributed-pack-control,3,1,columns-0-3,none,0,0,0,na,100,1.5960,control,primed isolated reference
+isolated-r27-attention-control,1,1,na,1-3-5-7,na,na,na,0,100,0.9141,control,cpu cosine 0.99999410 max_abs 0.0002527
+split-direction-memtile-control,1,1,columns-0-3,4-7,na,na,na,na,0,na,rejected,memory-tile input DMA channels exceeded

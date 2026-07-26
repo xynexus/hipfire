@@ -4,6 +4,9 @@
 
 //! Async daemon JSONL process adapter.
 
+pub use hipfire_daemon_protocol::{
+    EmbedRequest, EmbeddingVector, RerankRequest, RerankResult, SteerApplyRequest,
+};
 /// Re-exported so resource-lock status consumers (admin API, TUI) can match the
 /// live flock state without a direct `hipfire-lock` dependency.
 pub use hipfire_lock::LockState;
@@ -15,23 +18,96 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
 use hipfire_daemon_protocol::{
-    CettCaptureRequest, CettLoadColnormsRequest, CollectRequest, CollectResponse, DaemonRequest,
-    DaemonResponse, HneuronInterveneRequest, KldChunkEvent, KldEvalRequest, KldEvalResponse,
-    LoraLoadRequest, LoraSetScaleRequest, LoraUnloadRequest, RequestControl, SteerApplyRequest,
-    SteerBeginCaptureRequest, SteerCaptureRequest,
+    BenchPrefillRequest, BenchPrefillResponse, CettCaptureRequest, CettLoadColnormsRequest,
+    CollectRequest, CollectResponse, DaemonRequest, DaemonResponse, HneuronInterveneRequest,
+    KldChunkEvent, KldEvalRequest, KldEvalResponse, LoraLoadRequest, LoraSetScaleRequest,
+    LoraUnloadRequest, RequestControl, SteerBeginCaptureRequest, SteerCaptureRequest,
 };
 use hipfire_generate::{DoneEvent, GenerateTextRequest, ToolCall};
 use hipfire_model::{
     AcceleratorInventory, LlmModelRegistry, ModelLoadParams, ModelLoadRequest, ModelLoadedResponse,
 };
+use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::debug;
+
+// ── Model-load progress ──────────────────────────────────────────────────────
+// The daemon streams structured per-layer progress as `load_progress` frames on
+// its framed stdout channel (see `Daemon::load`), which we store here so the
+// HTTP server can surface a real progress bar to the chat UI during the (often
+// multi-second) load. One daemon loads one model at a time, so a single global
+// suffices. `phase` is a coarse label (e.g. "weights", "experts") so multi-phase
+// loaders (deepseek4: attn/shared then routed experts) can name the current
+// pass; each phase has its own `current`/`total`, so the bar restarts per phase.
+//
+// This used to be scraped from the daemon's human "loading layer N/M" stderr —
+// fragile (coupled to log wording across arches) and, on a piped stderr,
+// deadlock-prone on non-UTF-8. The stdout frame is structured and UTF-8-safe.
+// `spawn_stderr_progress_reader` still drains + re-emits daemon stderr for
+// operator logs, but no longer parses progress from it.
+static LOAD_PROGRESS: Mutex<(u32, u32, String)> = Mutex::new((0, 0, String::new()));
+
+/// Current model-load progress as `(current, total, phase)`. `(_, 0, _)` means no
+/// load in progress / not reported. `current == total` (> 0) means the current
+/// phase's units are done (for single-phase loaders, weights are in; state/KV
+/// allocation may still follow before the first token).
+pub fn model_load_progress() -> (u32, u32, String) {
+    LOAD_PROGRESS
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or((0, 0, String::new()))
+}
+
+fn set_load_progress(current: u32, total: u32, phase: &str) {
+    if let Ok(mut g) = LOAD_PROGRESS.lock() {
+        *g = (current, total, phase.to_string());
+    }
+}
+
+/// Drain the daemon's piped stderr and re-emit every line to our own stderr so
+/// operator logs are unchanged. Draining is required regardless — an unread
+/// piped stderr fills (~64 KB) and blocks the daemon on its next write.
+///
+/// We read raw bytes, not `.lines()`: `Lines::next_line()` errors on the first
+/// non-UTF-8 byte, and `while let Ok(_)` would treat that as EOF — silently
+/// ending the drain and deadlocking the daemon. Model load, hipcc compiles, and
+/// HIP errors can all emit non-UTF-8, so we drain via `read_until` + lossy
+/// decode; only a true EOF (0 bytes) or a hard IO error stops us. Load progress
+/// no longer comes from here — it arrives as structured `load_progress` frames
+/// on stdout (see `Daemon::load`).
+fn spawn_stderr_progress_reader(stderr: ChildStderr) {
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr);
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) => break, // EOF: daemon closed stderr / exited.
+                Ok(_) => {}
+                Err(_) => break, // Hard IO error on the pipe.
+            }
+            // Trim the trailing newline for re-emit.
+            if buf.last() == Some(&b'\n') {
+                buf.pop();
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+            }
+            // Re-emit to our real stderr so operator logs are unchanged.
+            eprintln!("{}", String::from_utf8_lossy(&buf));
+        }
+    });
+}
 
 trait DaemonTransport: Send {
     #[cfg(test)]
     fn as_any(&self) -> &dyn std::any::Any;
     fn send_json<'a>(&'a mut self, req: &'a DaemonRequest) -> BoxFuture<'a, anyhow::Result<()>>;
+    fn send_value<'a>(
+        &'a mut self,
+        value: &'a serde_json::Value,
+    ) -> BoxFuture<'a, anyhow::Result<()>>;
     fn recv_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<DaemonResponse>>;
 }
 
@@ -46,13 +122,19 @@ impl StdioTransport {
         let mut child = Command::new(bin)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            // Piped (not inherited) so we can parse per-layer load progress; the
+            // reader task below re-emits every line to our stderr, so operator
+            // logs are unchanged.
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| anyhow::anyhow!("failed to spawn daemon at {}: {e}", bin.display()))?;
 
         let stdin = BufWriter::new(child.stdin.take().expect("piped stdin"));
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+        if let Some(stderr) = child.stderr.take() {
+            spawn_stderr_progress_reader(stderr);
+        }
 
         Ok(Self {
             _child: child,
@@ -71,6 +153,20 @@ impl DaemonTransport for StdioTransport {
     fn send_json<'a>(&'a mut self, req: &'a DaemonRequest) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let line = serde_json::to_string(req)?;
+            debug!("> {line}");
+            self.stdin.write_all(line.as_bytes()).await?;
+            self.stdin.write_all(b"\n").await?;
+            self.stdin.flush().await?;
+            Ok(())
+        })
+    }
+
+    fn send_value<'a>(
+        &'a mut self,
+        value: &'a serde_json::Value,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let line = serde_json::to_string(value)?;
             debug!("> {line}");
             self.stdin.write_all(line.as_bytes()).await?;
             self.stdin.write_all(b"\n").await?;
@@ -128,6 +224,10 @@ impl DaemonEngine {
         self.transport.send_json(req).await
     }
 
+    async fn send_value(&mut self, value: &serde_json::Value) -> anyhow::Result<()> {
+        self.transport.send_value(value).await
+    }
+
     async fn recv(&mut self) -> anyhow::Result<DaemonResponse> {
         self.transport.recv_response().await
     }
@@ -160,10 +260,21 @@ impl DaemonEngine {
         model_path: &str,
         params: ModelLoadParams,
     ) -> anyhow::Result<ModelLoadedResponse> {
+        self.load_with_worker_key_id(model_path, params, None).await
+    }
+
+    /// Send `load` for a specific daemon worker and wait for `loaded`.
+    pub async fn load_with_worker_key_id(
+        &mut self,
+        model_path: &str,
+        params: ModelLoadParams,
+        worker_key_id: Option<String>,
+    ) -> anyhow::Result<ModelLoadedResponse> {
         let request_id = uuid::Uuid::new_v4().to_string();
         self.send(&DaemonRequest::Load(ModelLoadRequest {
             model: model_path.to_string(),
             params,
+            worker_key_id,
             request_id: Some(request_id.clone()),
         }))
         .await?;
@@ -184,6 +295,11 @@ impl DaemonEngine {
                     }
                     self.worker_key_id = Some(r.worker_key_id.clone());
                     return Ok(r);
+                }
+                DaemonResponse::LoadProgress(p) => {
+                    // Structured per-layer progress from the daemon's framed
+                    // stdout channel — the correct source (vs. scraping stderr).
+                    set_load_progress(p.current, p.total, &p.phase);
                 }
                 DaemonResponse::Error(e) => anyhow::bail!("daemon load error: {}", e.message),
                 DaemonResponse::Unknown => {}
@@ -212,6 +328,208 @@ impl DaemonEngine {
         }
     }
 
+    /// Send `worker_status` / `list_workers` and return the daemon's resident
+    /// worker status payload.
+    pub async fn list_workers(&mut self) -> anyhow::Result<serde_json::Value> {
+        self.send(&DaemonRequest::WorkerStatus).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::WorkerStatus(status) => return Ok(status),
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon worker_status error: {}", e.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during worker_status: {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Send `resource_status` and return the daemon's resource reservation
+    /// payload.
+    pub async fn resource_status(&mut self) -> anyhow::Result<serde_json::Value> {
+        self.send(&DaemonRequest::ResourceStatus).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::ResourceStatus(status) => return Ok(status),
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon resource_status error: {}", e.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during resource_status: {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Send `unload_worker` for one resident worker and return the daemon's
+    /// unload acknowledgement.
+    pub async fn unload_worker(
+        &mut self,
+        worker_key_id: impl Into<String>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let worker_key_id = worker_key_id.into();
+        self.send_value(&serde_json::json!({
+            "type": "unload_worker",
+            "worker_key_id": worker_key_id,
+        }))
+        .await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::UnloadWorkerDone(done) => {
+                    if done
+                        .get("worker_key_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|actual| actual != worker_key_id)
+                    {
+                        tracing::warn!(
+                            "stale unload_worker response: got worker_key_id={:?} expected={worker_key_id}",
+                            done.get("worker_key_id")
+                        );
+                        continue;
+                    }
+                    return Ok(done);
+                }
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon unload_worker error: {}", e.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during unload_worker: {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Execute one daemon batch-prefill envelope and retain every per-session
+    /// event plus the terminal batch event. The caller owns compatibility and
+    /// scheduling; the adapter owns the JSONL request/response transaction.
+    pub async fn generate_batch_prefill(
+        &mut self,
+        request: serde_json::Value,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        require_extended_request_type(&request, "generate_batch_prefill")?;
+        self.send_value(&request).await?;
+        let mut events = Vec::new();
+        loop {
+            match self.recv().await? {
+                DaemonResponse::GenerateBatchPrefillSessionDone { payload } => events.push(
+                    tagged_extended_event("generate_batch_prefill_session_done", payload),
+                ),
+                DaemonResponse::GenerateBatchPrefillDone { payload } => {
+                    events.push(tagged_extended_event(
+                        "generate_batch_prefill_done",
+                        payload,
+                    ));
+                    return Ok(events);
+                }
+                DaemonResponse::GenerateBatchPrefillReady { payload } => {
+                    events.push(tagged_extended_event(
+                        "generate_batch_prefill_ready",
+                        payload,
+                    ));
+                    return Ok(events);
+                }
+                DaemonResponse::GenerateBatchPrefillUnsupported { payload } => {
+                    events.push(tagged_extended_event(
+                        "generate_batch_prefill_unsupported",
+                        payload,
+                    ));
+                    return Ok(events);
+                }
+                DaemonResponse::Error(error) => {
+                    anyhow::bail!("daemon generate_batch_prefill error: {}", error.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during generate_batch_prefill: {other:?}")
+                }
+            }
+        }
+    }
+
+    /// Execute one continuous-batching decode step for already-resident
+    /// sessions and return the terminal per-session token payload.
+    pub async fn generate_batch_decode_step(
+        &mut self,
+        request: serde_json::Value,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        require_extended_request_type(&request, "generate_batch_decode_step")?;
+        self.send_value(&request).await?;
+        let mut events = Vec::new();
+        loop {
+            match self.recv().await? {
+                DaemonResponse::GenerateBatchDecodeStepSessionDone { payload } => events.push(
+                    tagged_extended_event("generate_batch_decode_step_session_done", payload),
+                ),
+                DaemonResponse::GenerateBatchDecodeStepDone { payload } => {
+                    events.push(tagged_extended_event(
+                        "generate_batch_decode_step_done",
+                        payload,
+                    ));
+                    return Ok(events);
+                }
+                DaemonResponse::Error(error) => {
+                    anyhow::bail!("daemon generate_batch_decode_step error: {}", error.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => tracing::warn!(
+                    "unexpected response during generate_batch_decode_step: {other:?}"
+                ),
+            }
+        }
+    }
+
+    pub async fn reserve_session_state(
+        &mut self,
+        request: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        require_extended_request_type(&request, "reserve_session_state")?;
+        self.send_value(&request).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::ReserveSessionStateDone { payload } => {
+                    return Ok(tagged_extended_event("reserve_session_state_done", payload));
+                }
+                DaemonResponse::ReserveSessionStateRejected { payload } => {
+                    return Ok(tagged_extended_event(
+                        "reserve_session_state_rejected",
+                        payload,
+                    ));
+                }
+                DaemonResponse::Error(error) => {
+                    anyhow::bail!("daemon reserve_session_state error: {}", error.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during reserve_session_state: {other:?}")
+                }
+            }
+        }
+    }
+
+    pub async fn release_sessions(
+        &mut self,
+        request: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        require_extended_request_type(&request, "release_sessions")?;
+        self.send_value(&request).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::ReleaseSessionsDone { payload } => {
+                    return Ok(tagged_extended_event("release_sessions_done", payload));
+                }
+                DaemonResponse::Error(error) => {
+                    anyhow::bail!("daemon release_sessions error: {}", error.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => tracing::warn!("unexpected response during release_sessions: {other:?}"),
+            }
+        }
+    }
+
     /// Send `reset` and wait for the daemon to confirm state reset.
     pub async fn reset(&mut self) -> anyhow::Result<()> {
         self.send(&DaemonRequest::Reset).await?;
@@ -222,6 +540,24 @@ impl DaemonEngine {
                 DaemonResponse::Unknown => {}
                 other => {
                     tracing::warn!("unexpected response during reset: {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Run the daemon's synthetic exact-token prefill benchmark.
+    pub async fn bench_prefill(&mut self, tokens: usize) -> anyhow::Result<BenchPrefillResponse> {
+        self.send(&DaemonRequest::BenchPrefill(BenchPrefillRequest { tokens }))
+            .await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::PrefillResult(result) => return Ok(result),
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon bench_prefill error: {}", e.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during bench_prefill: {other:?}");
                 }
             }
         }
@@ -268,6 +604,38 @@ impl DaemonEngine {
                 DaemonResponse::Unknown => {}
                 other => {
                     tracing::warn!("unexpected response during model_registry: {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Send `embed` and wait for the pooled, L2-normalized embedding vectors — one
+    /// per input text, in request order.
+    pub async fn embed(&mut self, req: EmbedRequest) -> anyhow::Result<Vec<EmbeddingVector>> {
+        self.send(&DaemonRequest::Embed(req)).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::Embeddings { embeddings } => return Ok(embeddings),
+                DaemonResponse::Error(e) => anyhow::bail!("daemon embed error: {}", e.message),
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during embed: {other:?}");
+                }
+            }
+        }
+    }
+
+    /// Send `rerank` and wait for the daemon-sorted relevance scores. Each result
+    /// preserves the document's original input index.
+    pub async fn rerank(&mut self, req: RerankRequest) -> anyhow::Result<Vec<RerankResult>> {
+        self.send(&DaemonRequest::Rerank(req)).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::RerankScores { results } => return Ok(results),
+                DaemonResponse::Error(e) => anyhow::bail!("daemon rerank error: {}", e.message),
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during rerank: {other:?}");
                 }
             }
         }
@@ -366,6 +734,68 @@ impl DaemonEngine {
     pub async fn steer_clear(&mut self) -> anyhow::Result<()> {
         self.send(&DaemonRequest::SteerClear).await?;
         self.expect_steer_ok("steer_clear").await
+    }
+
+    /// Run ONE micro-step quantum of a preemptible SSM-drafter training run.
+    /// `req` is the raw `train_drafter` request (carrying `run_id` so the daemon
+    /// resumes the resident session). The daemon runs up to `quantum` epochs and
+    /// returns: `train_progress` (`(false, payload)` — session still resident,
+    /// runner re-enqueues) or the terminal `train_done` (`(true, payload)`).
+    /// `train_start` on a fresh run falls through to `Unknown` and is skipped.
+    pub async fn train_drafter_step(
+        &mut self,
+        req: serde_json::Value,
+    ) -> anyhow::Result<(bool, serde_json::Value)> {
+        self.send_value(&req).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::TrainProgress { payload } => {
+                    return Ok((false, serde_json::Value::Object(payload)));
+                }
+                DaemonResponse::TrainDone { payload } => {
+                    return Ok((true, serde_json::Value::Object(payload)));
+                }
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon train_drafter error: {}", e.message)
+                }
+                // train_start lands here; keep waiting for progress/done.
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during train_drafter: {other:?}")
+                }
+            }
+        }
+    }
+
+    /// Run ONE micro-step quantum of a preemptible LoRA-adapter training run.
+    /// `req` is the raw `train_lora` request (carrying `run_id` so the daemon
+    /// resumes the resident session). The daemon runs up to `quantum` steps and
+    /// returns: `train_progress` (`(false, payload)` — session still resident,
+    /// runner re-enqueues) or the terminal `train_done` (`(true, payload)`).
+    /// `train_start` on a fresh run falls through to `Unknown` and is skipped.
+    pub async fn train_lora_step(
+        &mut self,
+        req: serde_json::Value,
+    ) -> anyhow::Result<(bool, serde_json::Value)> {
+        self.send_value(&req).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::TrainProgress { payload } => {
+                    return Ok((false, serde_json::Value::Object(payload)));
+                }
+                DaemonResponse::TrainDone { payload } => {
+                    return Ok((true, serde_json::Value::Object(payload)));
+                }
+                DaemonResponse::Error(e) => {
+                    anyhow::bail!("daemon train_lora error: {}", e.message)
+                }
+                // train_start lands here; keep waiting for progress/done.
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during train_lora: {other:?}")
+                }
+            }
+        }
     }
 
     /// Load per-layer `down_proj` column norms (H-Neurons CETT) from a host-side
@@ -669,6 +1099,31 @@ impl DaemonEngine {
             }
         }
     }
+}
+
+fn require_extended_request_type(
+    request: &serde_json::Value,
+    expected: &str,
+) -> anyhow::Result<()> {
+    let actual = request
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if actual != expected {
+        anyhow::bail!("expected daemon request type {expected}, got {actual:?}");
+    }
+    Ok(())
+}
+
+fn tagged_extended_event(
+    event_type: &str,
+    mut payload: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    payload.insert(
+        "type".to_string(),
+        serde_json::Value::String(event_type.to_string()),
+    );
+    serde_json::Value::Object(payload)
 }
 
 /// Locate the daemon binary. Priority:
@@ -1123,6 +1578,16 @@ mod tests {
             })
         }
 
+        fn send_value<'a>(
+            &'a mut self,
+            value: &'a serde_json::Value,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async move {
+                self.sent.push(serde_json::to_string(value)?);
+                Ok(())
+            })
+        }
+
         fn recv_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<DaemonResponse>> {
             Box::pin(async move {
                 self.responses
@@ -1140,6 +1605,10 @@ mod tests {
             }),
             worker_key_id: None,
         }
+    }
+
+    fn event_payload(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().cloned().unwrap()
     }
 
     #[test]
@@ -1222,6 +1691,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_prefill_collects_session_and_terminal_events() {
+        let mut engine = mock_engine(vec![
+            DaemonResponse::GenerateBatchPrefillSessionDone {
+                payload: event_payload(serde_json::json!({
+                    "id": "request-a",
+                    "batch_id": "batch-a",
+                    "session_id": "session-a"
+                })),
+            },
+            DaemonResponse::GenerateBatchPrefillDone {
+                payload: event_payload(serde_json::json!({
+                    "id": "request-a",
+                    "batch_id": "batch-a",
+                    "sessions": 1
+                })),
+            },
+        ]);
+
+        let events = engine
+            .generate_batch_prefill(serde_json::json!({
+                "type": "generate_batch_prefill",
+                "id": "request-a",
+                "batch_id": "batch-a",
+                "worker_key_id": "worker-a",
+                "sessions": [{"id": "session-a"}]
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "generate_batch_prefill_session_done");
+        assert_eq!(events[1]["type"], "generate_batch_prefill_done");
+    }
+
+    #[tokio::test]
+    async fn decode_and_session_lifecycle_ops_return_typed_events() {
+        let mut decode = mock_engine(vec![
+            DaemonResponse::GenerateBatchDecodeStepSessionDone {
+                payload: event_payload(serde_json::json!({
+                    "id": "decode-a",
+                    "batch_id": "batch-a",
+                    "session_id": "a",
+                    "token": 42
+                })),
+            },
+            DaemonResponse::GenerateBatchDecodeStepDone {
+                payload: event_payload(serde_json::json!({
+                    "id": "decode-a",
+                    "batch_id": "batch-a",
+                    "sessions": 2
+                })),
+            },
+        ]);
+        let decoded = decode
+            .generate_batch_decode_step(serde_json::json!({
+                "type": "generate_batch_decode_step",
+                "id": "decode-a",
+                "batch_id": "batch-a",
+                "sessions": [{"id": "a"}, {"id": "b"}]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(
+            decoded[0]["type"],
+            "generate_batch_decode_step_session_done"
+        );
+        assert_eq!(decoded[0]["token"], 42);
+        assert_eq!(decoded[1]["type"], "generate_batch_decode_step_done");
+
+        let mut release = mock_engine(vec![DaemonResponse::ReleaseSessionsDone {
+            payload: event_payload(serde_json::json!({
+                "id": "release-a",
+                "released": 2
+            })),
+        }]);
+        let released = release
+            .release_sessions(serde_json::json!({
+                "type": "release_sessions",
+                "id": "release-a",
+                "sessions": ["a", "b"]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(released["type"], "release_sessions_done");
+    }
+
+    #[tokio::test]
     async fn generate_collects_only_matching_tokens_until_matching_done() {
         let mut engine = mock_engine(vec![
             DaemonResponse::Token(hipfire_generate::TokenEvent {
@@ -1271,8 +1828,11 @@ mod tests {
             messages: None,
             sampling: GenerationSamplingPolicy {
                 temperature: 0.7,
+                temperature_is_default: false,
                 max_tokens: 8,
                 top_p: None,
+                top_p_is_default: false,
+                top_k: None,
                 repeat_penalty: None,
             },
             worker_key_id: Some("worker-a".to_string()),
@@ -1305,6 +1865,61 @@ mod tests {
     async fn reset_waits_for_reset_response() {
         let mut engine = mock_engine(vec![DaemonResponse::Reset]);
         engine.reset().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bench_prefill_waits_for_prefill_result() {
+        let mut engine = mock_engine(vec![DaemonResponse::PrefillResult(BenchPrefillResponse {
+            tokens: 512,
+            ms: 10.0,
+            tok_s: 51_200.0,
+        })]);
+        let result = engine.bench_prefill(512).await.unwrap();
+        assert_eq!(result.tokens, 512);
+        assert_eq!(result.ms, 10.0);
+        assert_eq!(result.tok_s, 51_200.0);
+    }
+
+    #[tokio::test]
+    async fn worker_status_resource_status_and_unload_worker_use_worker_control_protocol() {
+        let mut engine = mock_engine(vec![
+            DaemonResponse::WorkerStatus(serde_json::json!({
+                "type": "worker_status",
+                "resident_workers": 1,
+                "workers": []
+            })),
+            DaemonResponse::ResourceStatus(serde_json::json!({
+                "type": "resource_status",
+                "held_vram_placeholder_bytes": 256,
+                "resident_workers": 1,
+                "workers": []
+            })),
+            DaemonResponse::UnloadWorkerDone(serde_json::json!({
+                "type": "unload_worker_done",
+                "worker_key_id": "worker-a",
+                "unloaded": true,
+                "resident_workers": 0
+            })),
+        ]);
+
+        let status = engine.list_workers().await.unwrap();
+        assert_eq!(status["resident_workers"], 1);
+        let resources = engine.resource_status().await.unwrap();
+        assert_eq!(resources["held_vram_placeholder_bytes"], 256);
+        let done = engine.unload_worker("worker-a").await.unwrap();
+        assert_eq!(done["unloaded"], true);
+
+        let mock = engine
+            .transport
+            .as_any()
+            .downcast_ref::<MockTransport>()
+            .unwrap();
+        assert_eq!(mock.sent[0], r#"{"type":"worker_status"}"#);
+        assert_eq!(mock.sent[1], r#"{"type":"resource_status"}"#);
+        assert_eq!(
+            mock.sent[2],
+            r#"{"type":"unload_worker","worker_key_id":"worker-a"}"#
+        );
     }
 
     #[tokio::test]

@@ -1,10 +1,12 @@
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::convert::Infallible;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::{Body, Bytes},
-    extract::State,
+    extract::{Extension, State},
     http::{header, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -17,7 +19,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::model::discovery::find_model;
-use crate::state::SharedState;
+use crate::state::{LoadedModelState, SharedState};
 use hipfire_config::HipfireConfig;
 use hipfire_daemon_adapter::{
     find_daemon_bin_or_error, DaemonEngine, GenerateStreamControl, GenerateStreamEvent,
@@ -25,11 +27,12 @@ use hipfire_daemon_adapter::{
 use hipfire_generate::{
     openai_chat_completion_done_chunk_json, GenerateTextRequest, GenerationSamplingPolicy,
 };
-use hipfire_model::{discover_dflash_draft_for_model, ModelLoadParams, ModelWorkerKey};
+use hipfire_model::{ModelLoadParams, ModelWorkerKey};
 use hipfire_prompt::{Message as PromptMessage, Role, ToolCall as PromptToolCall};
 use hipfire_scheduler::{
-    create_request_session_draft, server_prefill_batch_enabled, CreateRequestSessionInput,
-    NextBatchInput, SchedulerPolicyEnv,
+    create_request_session_draft, plan_model_residency, server_prefill_batch_enabled,
+    CreateRequestSessionInput, ModelResidencyRequest, NextBatchInput, ResidencyMode,
+    ResidentWorkerLedgerEntry, ResourceBudget, ResourceUsage, SchedulerPolicyEnv, WorkloadOwner,
 };
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -40,6 +43,7 @@ pub struct ChatRequest {
     pub stream: bool,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub top_k: Option<usize>,
     pub repeat_penalty: Option<f64>,
     pub presence_penalty: Option<f64>,
     pub frequency_penalty: Option<f64>,
@@ -67,17 +71,27 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<Value>>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
 }
 
 pub async fn post_chat_completions(
     State(state): State<SharedState>,
+    accounting: Option<Extension<crate::accounting::RequestAccounting>>,
     Json(body): Json<ChatRequest>,
 ) -> Response {
+    let accounting = accounting.map(|Extension(accounting)| accounting);
+    let owner = accounting
+        .as_ref()
+        .map(|accounting| scheduler_owner_from_principal(&accounting.principal()))
+        .unwrap_or_default();
     maybe_dump_request(&body);
     if body.stream {
-        stream_chat(state, body).await.into_response()
+        stream_chat(state, body, owner, accounting)
+            .await
+            .into_response()
     } else {
-        blocking_chat(state, body).await
+        blocking_chat(state, body, owner, accounting).await
     }
 }
 
@@ -218,35 +232,16 @@ fn load_params_for_model_config(
 
 fn maybe_attach_dflash_draft(
     cfg: &HipfireConfig,
-    model_path: Option<&Path>,
+    _model_path: Option<&Path>,
     params: &mut ModelLoadParams,
 ) {
     if cfg.dflash_mode == "off" {
-        return;
-    }
-    let is_a3b = model_path
-        .and_then(|path| path.file_name())
-        .and_then(|name| name.to_str())
-        .map(|name| name.to_ascii_lowercase().contains("a3b"))
-        .unwrap_or(false);
-    let has_explicit_sidecar = cfg
-        .cask_sidecar
-        .as_deref()
-        .filter(|sidecar| !sidecar.is_empty())
-        .is_some_and(|sidecar| Path::new(sidecar).is_file());
-    let allowed =
-        cfg.dflash_mode == "on" || (cfg.dflash_mode == "auto" && (!is_a3b || has_explicit_sidecar));
-    if !allowed {
         return;
     }
     if let Ok(explicit) = std::env::var("HIPFIRE_DFLASH_DRAFT") {
         if !explicit.is_empty() {
             params.draft = Some(explicit);
         }
-        return;
-    }
-    if let Some(path) = model_path.and_then(discover_dflash_draft_for_model) {
-        params.draft = Some(path.to_string_lossy().into_owned());
     }
 }
 
@@ -266,33 +261,20 @@ fn maybe_attach_cask_sidecar(
     }
 
     if let Some(sidecar) = cfg.cask_sidecar.as_deref().filter(|s| !s.is_empty()) {
-        if Path::new(sidecar).is_file() {
-            params.cask_sidecar = Some(sidecar.to_string());
-            attach_cask_policy(cfg, params);
-        } else {
-            params.cask_sidecar = None;
-            clear_cask_policy(params);
-        }
+        params.cask_sidecar = Some(sidecar.to_string());
+        attach_cask_policy(cfg, params);
         return;
     }
 
     if !cfg.cask_auto_attach {
         return;
     }
-    let Some(model_path) = model_path else {
-        return;
-    };
-    let filename = model_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    if filename.to_ascii_lowercase().contains("a3b") {
-        return;
-    }
-    if let Some(sidecar) = discover_triattn_sidecar(model_path) {
-        params.cask_sidecar = Some(sidecar.to_string_lossy().into_owned());
-        attach_cask_policy(cfg, params);
-    }
+    let _ = model_path;
+    // Embedded and canonical sibling resolution happens in serving-core so
+    // every caller shares explicit > embedded > sibling precedence. Forward
+    // the policy here without turning an auto-discovered sibling into a fake
+    // explicit override.
+    attach_cask_policy(cfg, params);
 }
 
 fn attach_cask_policy(cfg: &HipfireConfig, params: &mut ModelLoadParams) {
@@ -303,46 +285,15 @@ fn attach_cask_policy(cfg: &HipfireConfig, params: &mut ModelLoadParams) {
     params.cask_fold_m = Some(cfg.cask_fold_m);
 }
 
-fn clear_cask_policy(params: &mut ModelLoadParams) {
-    params.cask = None;
-    params.cask_budget = None;
-    params.cask_beta = None;
-    params.cask_core_frac = None;
-    params.cask_fold_m = None;
-}
-
-fn discover_triattn_sidecar(model_path: &Path) -> Option<std::path::PathBuf> {
-    let filename = model_path.file_name().and_then(|name| name.to_str())?;
-    let model_dir = model_path.parent().unwrap_or_else(|| Path::new("."));
-    let mut dirs = vec![
-        model_dir.to_path_buf(),
-        hipfire_config::hipfire_dir().join("triattn"),
-    ];
-    dirs.dedup();
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if name.starts_with(&format!("{filename}.triattn"))
-                && (name.ends_with(".bin") || name.ends_with(".hfq"))
-            {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct LoadedModelContext {
     pub(crate) model_path: String,
     pub(crate) worker_key_id: Option<String>,
     pub(crate) cache_capable: bool,
+    /// Arch tag reported by the daemon load (a registered model_type, e.g.
+    /// `qwen3_5`). Used to resolve the ContinuousBatching capability for
+    /// batch-eligibility routing.
+    pub(crate) arch: Option<String>,
 }
 
 const MAX_REQUEST_TOKENS: u32 = 131_072;
@@ -401,6 +352,18 @@ pub(crate) fn generate_request_from_chat(
         )
 }
 
+/// Text of the last user turn — used as the batch-prefill session's `prompt`
+/// (the daemon renders the full conversation from `messages_history`; the prompt
+/// field is the current-turn placeholder the validator requires).
+fn last_user_text(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| openai_chat_content_to_text(m.content.as_ref()))
+        .unwrap_or_default()
+}
+
 fn chat_messages_to_prompt_messages(messages: &[ChatMessage]) -> Vec<PromptMessage> {
     messages
         .iter()
@@ -413,6 +376,9 @@ fn chat_message_to_prompt_message(message: &ChatMessage) -> Option<PromptMessage
     let mut content = openai_chat_content_to_text(message.content.as_ref());
     if matches!(role, Role::Assistant) {
         content = strip_visible_thinking(content, false, false);
+        if let Some(reasoning) = message.reasoning_content.as_deref() {
+            content = format!("<|channel>thought\n{reasoning}\n<channel|>{content}");
+        }
     }
     Some(PromptMessage {
         role,
@@ -430,7 +396,8 @@ fn chat_message_to_prompt_message(message: &ChatMessage) -> Option<PromptMessage
 
 fn chat_role_to_prompt_role(role: &str) -> Option<Role> {
     match role {
-        "developer" | "system" => Some(Role::System),
+        "developer" => Some(Role::Developer),
+        "system" => Some(Role::System),
         "user" => Some(Role::User),
         "assistant" => Some(Role::Assistant),
         "tool" | "toolResult" | "tool_result" => Some(Role::Tool),
@@ -471,7 +438,14 @@ fn parse_openai_tool_calls(calls: Option<&[Value]>) -> Vec<PromptToolCall> {
                 Some(value) => value.clone(),
                 None => json!({}),
             };
-            Some(PromptToolCall { name, arguments })
+            Some(PromptToolCall {
+                id: call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                name,
+                arguments,
+            })
         })
         .collect()
 }
@@ -481,11 +455,15 @@ pub(crate) async fn ensure_model_loaded(
     model_arg: &str,
     required_max_seq: u32,
 ) -> Result<LoadedModelContext, String> {
-    let model_path =
-        find_model(model_arg).ok_or_else(|| format!("model not found: {model_arg}"))?;
+    let model_path = find_model(
+        model_arg,
+        &state.models_dir,
+        state.models_network_dir.as_deref(),
+    )
+    .ok_or_else(|| format!("model not found: {model_arg}"))?;
     let model_str = model_path.to_string_lossy().into_owned();
 
-    let (params, daemon_spawn_env) = {
+    let (mut params, daemon_spawn_env) = {
         let cfg = state.config.lock().await;
         let resolved_cfg = cfg.resolve_for_model(model_arg);
         let mut params = load_params_for_model_config(&cfg, model_arg, Some(&model_path));
@@ -498,86 +476,319 @@ pub(crate) async fn ensure_model_loaded(
         )
     };
 
-    let mut engine_guard = state.engine.lock().await;
-    let mut loaded_guard = state.loaded_model_path.lock().await;
+    let requested_worker_key_id = server_model_worker_key_id(&model_str);
+    let residency_plan = plan_residency_for_load(state, &model_str, &requested_worker_key_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    params.residency_mode = Some(residency_plan.residency_mode.as_str().to_string());
+    params.module_vram_budget_bytes = residency_plan.module_vram_budget_bytes;
 
-    if loaded_guard.as_deref() == Some(&model_str) {
-        if let Some(eng) = engine_guard.as_mut() {
-            if eng.ping().await.is_ok() {
-                let cache_capable = state
-                    .loaded_model_cache_capable
-                    .lock()
-                    .await
-                    .unwrap_or(false);
-                let loaded_max_seq = state.loaded_model_max_seq.lock().await.unwrap_or(0);
-                if loaded_max_seq >= params.max_seq {
-                    return Ok(LoadedModelContext {
-                        model_path: model_str,
-                        worker_key_id: eng.worker_key_id.clone(),
-                        cache_capable,
-                    });
-                }
-                tracing::info!(
-                    model = %model_arg,
-                    loaded_max_seq,
-                    required_max_seq = params.max_seq,
-                    "reloading model with larger max_seq for request"
-                );
-                eng.unload().await.map_err(|e| e.to_string())?;
-                *loaded_guard = None;
-                *state.loaded_model_cache_capable.lock().await = None;
-                *state.loaded_model_max_seq.lock().await = None;
-            }
+    // Fast path: the model is already loaded with sufficient max_seq. Return its
+    // context without touching the engine mutex. The batch runner takes the
+    // engine out of the mutex (leaving None) for the duration of an in-flight
+    // prefill+decode cycle, so a request that arrives mid-batch — e.g. a
+    // high-priority request meant to preempt a running low-priority one — would
+    // otherwise see None here and wrongly try to spawn a second daemon. A
+    // concurrent request only needs the loaded-model metadata to enqueue.
+    if let Some(loaded) = state.loaded_models.lock().await.get(&model_str).cloned() {
+        if loaded.max_seq >= params.max_seq {
+            return Ok(LoadedModelContext {
+                model_path: model_str,
+                worker_key_id: loaded.worker_key_id,
+                cache_capable: loaded.cache_capable,
+                arch: loaded.arch,
+            });
         }
     }
 
+    let mut engine_guard = state.engine.lock().await;
+
     if let Some(eng) = engine_guard.as_mut() {
-        if eng.ping().await.is_ok() {
-            if loaded_guard.is_some() {
-                eng.unload().await.map_err(|e| e.to_string())?;
-                *loaded_guard = None;
-                *state.loaded_model_cache_capable.lock().await = None;
-                *state.loaded_model_max_seq.lock().await = None;
+        match eng.ping().await {
+            Ok(()) => {
+                if let Some(loaded) = state.loaded_models.lock().await.get(&model_str).cloned() {
+                    if loaded.max_seq >= params.max_seq {
+                        return Ok(LoadedModelContext {
+                            model_path: model_str,
+                            worker_key_id: loaded.worker_key_id,
+                            cache_capable: loaded.cache_capable,
+                            arch: loaded.arch,
+                        });
+                    }
+                    tracing::info!(
+                        model = %model_arg,
+                        loaded_max_seq = loaded.max_seq,
+                        required_max_seq = params.max_seq,
+                        "reloading model worker with larger max_seq for request"
+                    );
+                }
+                apply_residency_evictions(state, eng, &residency_plan).await?;
+                let loaded = eng
+                    .load_with_worker_key_id(
+                        &model_str,
+                        params.clone(),
+                        Some(requested_worker_key_id.clone()),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let cache_capable = loaded_response_cache_capable(&loaded);
+                let arch = loaded.arch.clone();
+                let worker_key_id = Some(loaded.worker_key_id);
+                set_loaded_model_state(
+                    state,
+                    model_str.clone(),
+                    LoadedModelState {
+                        worker_key_id: worker_key_id.clone(),
+                        cache_capable,
+                        max_seq: params.max_seq,
+                        arch: arch.clone(),
+                    },
+                )
+                .await;
+                return Ok(LoadedModelContext {
+                    model_path: model_str,
+                    worker_key_id,
+                    cache_capable,
+                    arch,
+                });
             }
-            let loaded = eng
-                .load(&model_str, params.clone())
-                .await
-                .map_err(|e| e.to_string())?;
-            let cache_capable = loaded_response_cache_capable(&loaded);
-            let worker_key_id = Some(loaded.worker_key_id);
-            *loaded_guard = Some(model_str.clone());
-            *state.loaded_model_cache_capable.lock().await = Some(cache_capable);
-            *state.loaded_model_max_seq.lock().await = Some(params.max_seq);
-            return Ok(LoadedModelContext {
-                model_path: model_str,
-                worker_key_id,
-                cache_capable,
-            });
+            Err(e) => {
+                tracing::warn!("daemon ping failed before model load: {e}; respawning daemon");
+                *engine_guard = None;
+                clear_loaded_model_state_for_failed_daemon(state).await;
+            }
         }
     }
 
     let bin = find_daemon_bin_or_error().map_err(|e| e.to_string())?;
     daemon_spawn_env.apply();
     let mut engine = DaemonEngine::spawn(&bin).await.map_err(|e| e.to_string())?;
+    apply_residency_evictions(state, &mut engine, &residency_plan).await?;
     let loaded = engine
-        .load(&model_str, params.clone())
+        .load_with_worker_key_id(
+            &model_str,
+            params.clone(),
+            Some(requested_worker_key_id.clone()),
+        )
         .await
         .map_err(|e| e.to_string())?;
 
     let cache_capable = loaded_response_cache_capable(&loaded);
+    let arch = loaded.arch.clone();
     let worker_key_id = Some(loaded.worker_key_id);
-    *loaded_guard = Some(model_str);
-    *state.loaded_model_cache_capable.lock().await = Some(cache_capable);
-    *state.loaded_model_max_seq.lock().await = Some(params.max_seq);
+    set_loaded_model_state(
+        state,
+        model_str.clone(),
+        LoadedModelState {
+            worker_key_id: worker_key_id.clone(),
+            cache_capable,
+            max_seq: params.max_seq,
+            arch: arch.clone(),
+        },
+    )
+    .await;
     *engine_guard = Some(engine);
     Ok(LoadedModelContext {
-        model_path: loaded_guard
-            .as_ref()
-            .expect("loaded model path set")
-            .clone(),
+        model_path: model_str,
         worker_key_id,
         cache_capable,
+        arch,
     })
+}
+
+fn server_model_worker_key_id(model_path: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    model_path.hash(&mut hasher);
+    format!("server-model:{:016x}", hasher.finish())
+}
+
+async fn plan_residency_for_load(
+    state: &SharedState,
+    model_path: &str,
+    worker_key_id: &str,
+) -> Result<hipfire_scheduler::ModelResidencyPlan, String> {
+    let cfg = state.config.lock().await.clone();
+    let budget = ResourceBudget {
+        system_memory_budget_bytes: cfg.scheduler_system_memory_budget_bytes,
+        system_memory_headroom_bytes: cfg.scheduler_system_memory_headroom_bytes,
+        vram_budget_bytes: cfg.scheduler_vram_budget_bytes,
+        vram_headroom_bytes: cfg.scheduler_vram_headroom_bytes,
+    };
+    let requested_mode = ResidencyMode::parse(&cfg.model_residency_mode)
+        .ok_or_else(|| format!("invalid model_residency_mode {}", cfg.model_residency_mode))?;
+    let estimated_full = ResourceUsage {
+        system_memory_bytes: 0,
+        vram_bytes: model_file_bytes(model_path),
+    };
+    let effective_module_budget = cfg
+        .scheduler_vram_budget_bytes
+        .saturating_sub(cfg.scheduler_vram_headroom_bytes);
+    let estimated_qwen_moe_modules =
+        qwen_moe_module_capable_model(model_path).then_some(ResourceUsage {
+            system_memory_bytes: 0,
+            vram_bytes: if effective_module_budget > 0 {
+                effective_module_budget
+            } else {
+                estimated_full.vram_bytes
+            },
+        });
+    let resident_workers = resident_workers_for_planning(state).await;
+    plan_model_residency(
+        budget,
+        ModelResidencyRequest {
+            worker_key_id: worker_key_id.to_string(),
+            model_path: model_path.to_string(),
+            requested_mode,
+            estimated_full,
+            estimated_qwen_moe_modules,
+        },
+        &resident_workers,
+    )
+}
+
+async fn resident_workers_for_planning(state: &SharedState) -> Vec<ResidentWorkerLedgerEntry> {
+    let loaded_models = state.loaded_models.lock().await.clone();
+    let daemon_status = {
+        let mut engine = state.engine.lock().await;
+        match engine.as_mut() {
+            Some(engine) => match engine.resource_status().await {
+                Ok(status) => Some(status),
+                Err(err) => {
+                    tracing::warn!(
+                        "daemon resource_status failed during residency planning; falling back to server ledger: {err}"
+                    );
+                    None
+                }
+            },
+            None => None,
+        }
+    };
+    daemon_status
+        .as_ref()
+        .and_then(|status| resident_workers_from_daemon_resource_status(status, &loaded_models))
+        .unwrap_or_else(|| resident_workers_from_loaded_models(&loaded_models))
+}
+
+fn resident_workers_from_loaded_models(
+    loaded_models: &HashMap<String, LoadedModelState>,
+) -> Vec<ResidentWorkerLedgerEntry> {
+    loaded_models
+        .iter()
+        .filter_map(|(path, loaded)| {
+            Some(ResidentWorkerLedgerEntry {
+                worker_key_id: loaded.worker_key_id.clone()?,
+                model_path: path.clone(),
+                residency_mode: ResidencyMode::Full,
+                resource_usage: ResourceUsage {
+                    system_memory_bytes: 0,
+                    vram_bytes: model_file_bytes(path),
+                },
+                last_used_seq: u64::from(loaded.max_seq),
+            })
+        })
+        .collect()
+}
+
+fn resident_workers_from_daemon_resource_status(
+    status: &Value,
+    loaded_models: &HashMap<String, LoadedModelState>,
+) -> Option<Vec<ResidentWorkerLedgerEntry>> {
+    let workers = status.get("workers")?.as_array()?;
+    let loaded_by_worker = loaded_models
+        .iter()
+        .filter_map(|(path, loaded)| {
+            Some((
+                loaded.worker_key_id.as_deref()?.to_string(),
+                (path.clone(), u64::from(loaded.max_seq)),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut resident = Vec::with_capacity(workers.len());
+    for (index, worker) in workers.iter().enumerate() {
+        let worker_key_id = worker
+            .get("worker_key_id")
+            .and_then(Value::as_str)?
+            .to_string();
+        let (fallback_path, fallback_seq) = loaded_by_worker
+            .get(&worker_key_id)
+            .cloned()
+            .unwrap_or_else(|| (worker_key_id.clone(), index as u64));
+        let model_path = worker
+            .get("model_path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or(fallback_path);
+        let residency_mode = worker
+            .get("residency_mode")
+            .and_then(Value::as_str)
+            .and_then(ResidencyMode::parse)
+            .unwrap_or(ResidencyMode::Full);
+        resident.push(ResidentWorkerLedgerEntry {
+            worker_key_id,
+            model_path,
+            residency_mode,
+            resource_usage: ResourceUsage {
+                system_memory_bytes: worker
+                    .get("system_memory_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                vram_bytes: worker
+                    .get("vram_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            },
+            last_used_seq: fallback_seq,
+        });
+    }
+    Some(resident)
+}
+
+fn model_file_bytes(model_path: &str) -> u64 {
+    std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn qwen_moe_module_capable_model(model_path: &str) -> bool {
+    let lower = model_path.to_ascii_lowercase();
+    (lower.contains("qwen3.5") || lower.contains("qwen35") || lower.contains("qwen3"))
+        && (lower.contains("a") || lower.contains("moe"))
+}
+
+async fn apply_residency_evictions(
+    state: &SharedState,
+    engine: &mut DaemonEngine,
+    plan: &hipfire_scheduler::ModelResidencyPlan,
+) -> Result<(), String> {
+    for worker_key_id in &plan.unload_worker_key_ids {
+        engine
+            .unload_worker(worker_key_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        state
+            .loaded_models
+            .lock()
+            .await
+            .retain(|_, loaded| loaded.worker_key_id.as_deref() != Some(worker_key_id.as_str()));
+    }
+    Ok(())
+}
+
+async fn set_loaded_model_state(state: &SharedState, model_path: String, loaded: LoadedModelState) {
+    state
+        .loaded_models
+        .lock()
+        .await
+        .insert(model_path.clone(), loaded.clone());
+    *state.loaded_model_path.lock().await = Some(model_path);
+    *state.loaded_model_cache_capable.lock().await = Some(loaded.cache_capable);
+    *state.loaded_model_max_seq.lock().await = Some(loaded.max_seq);
+}
+
+async fn clear_loaded_model_state_for_failed_daemon(state: &SharedState) {
+    state.loaded_models.lock().await.clear();
+    *state.loaded_model_path.lock().await = None;
+    *state.loaded_model_cache_capable.lock().await = None;
+    *state.loaded_model_max_seq.lock().await = None;
 }
 
 fn loaded_response_cache_capable(loaded: &hipfire_model::ModelLoadedResponse) -> bool {
@@ -888,7 +1099,8 @@ pub(crate) fn openai_chat_completion_response_with_tool_calls_json(
         "created": created,
         "model": model,
         "choices": [choice],
-        "usage": openai_nonstream_usage_json(done)
+        "usage": openai_nonstream_usage_json(done),
+        "timings": openai_timings_json(done)
     });
     if tool_calls.is_empty() {
         if let Some(truncation) = detect_tool_call_truncation(text, done.tokens, request_max_tokens)
@@ -1364,6 +1576,7 @@ pub(crate) async fn wait_for_prefill_scheduler_turn(
     model_path: &str,
     messages: &[ChatMessage],
     priority: Option<i64>,
+    owner: WorkloadOwner,
 ) -> Result<(), String> {
     let env = SchedulerPolicyEnv::from_pairs(std::env::vars());
     if !server_prefill_batch_enabled(&env) {
@@ -1376,6 +1589,7 @@ pub(crate) async fn wait_for_prefill_scheduler_turn(
     };
     let session = create_request_session_draft(CreateRequestSessionInput {
         id: req_id.to_string(),
+        owner,
         worker_key,
         prompt_tokens: estimated_prompt_tokens(messages),
         cached_prefix_tokens: None,
@@ -1432,15 +1646,36 @@ pub(crate) async fn execute_blocking_chat(
     state: SharedState,
     body: ChatRequest,
 ) -> Result<BlockingChatResult, Value> {
-    match execute_blocking_chat_cancellable(state, body, || false).await? {
+    execute_blocking_chat_owned(state, body, WorkloadOwner::default()).await
+}
+
+pub(crate) async fn execute_blocking_chat_owned(
+    state: SharedState,
+    body: ChatRequest,
+    owner: WorkloadOwner,
+) -> Result<BlockingChatResult, Value> {
+    match execute_blocking_chat_cancellable(state, body, owner, || false).await? {
         Some(result) => Ok(result),
         None => Err(json!({"error": {"message": "request cancelled", "type": "server_error"}})),
     }
 }
 
+pub(crate) async fn execute_blocking_chat_for_principal(
+    state: SharedState,
+    body: ChatRequest,
+    principal: &hipfire_auth::RequestPrincipal,
+    accounting: &crate::accounting::RequestAccounting,
+) -> Result<BlockingChatResult, Value> {
+    let result =
+        execute_blocking_chat_owned(state, body, scheduler_owner_from_principal(principal)).await?;
+    report_done_usage(accounting, &result.done);
+    Ok(result)
+}
+
 async fn execute_blocking_chat_cancellable<F>(
     state: SharedState,
     body: ChatRequest,
+    owner: WorkloadOwner,
     mut should_cancel: F,
 ) -> Result<Option<BlockingChatResult>, Value>
 where
@@ -1488,12 +1723,140 @@ where
         Err(e) => return Err(json!({"error": {"message": e, "type": "server_error"}})),
     };
 
+    // Continuous-batching path: hand the request to the batch runner (which owns
+    // the engine and fuses concurrent same-model requests) and await its streamed
+    // tokens, instead of taking the engine per-request. Gated by the flag that
+    // spawns the runner AND by batch-eligibility (arch declares ContinuousBatching
+    // + runtime envelope) — ineligible models fall through to the legacy path.
+    if server_prefill_batch_enabled(&SchedulerPolicyEnv::from_pairs(std::env::vars()))
+        && crate::batch_runner::batch_eligible(loaded.arch.as_deref())
+    {
+        let controls = {
+            let cfg = state.config.lock().await;
+            let resolved = cfg.resolve_for_model(&model_arg);
+            request_generation_controls(
+                &resolved,
+                body.chat_template_kwargs.as_ref(),
+                body.reasoning_effort.as_deref(),
+                body.reasoning.as_ref(),
+                body.presence_penalty,
+                body.frequency_penalty,
+            )
+        };
+        let assistant_prefix = controls
+            .assistant_prefix
+            .clone()
+            .unwrap_or_else(|| "plain".to_string());
+        // `controls.max_think_tokens` already encodes the batch-prefill daemon's
+        // `enable_thinking = (max_think_tokens != 1)` convention: it is Some(1)
+        // when thinking is disabled and Some(budget)/None otherwise. Pass it
+        // through unchanged (None → 0, which the daemon reads as thinking-on).
+        let max_think_tokens: u32 = controls.max_think_tokens.unwrap_or(0);
+        let messages_history =
+            serde_json::to_value(chat_messages_to_prompt_messages(&body.messages)).ok();
+        let spec = crate::batch_runner::SessionSpec {
+            id: req_id.clone(),
+            prompt: last_user_text(&body.messages),
+            messages_history,
+            system_prompt: body.system.clone(),
+            state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+            assistant_prefix,
+            max_think_tokens,
+            max_tokens: request_max_tokens as usize,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker_key_id = loaded.worker_key_id.clone().unwrap_or_default();
+        // Register the pending request first so the runner can always resolve a
+        // granted lease's workload ids back to their session inputs + channel.
+        {
+            let mut inbox = state.batch_inbox.lock().await;
+            inbox.insert(
+                req_id.clone(),
+                crate::batch_runner::ScheduledJob::Text(crate::batch_runner::PendingRequest {
+                    spec,
+                    worker_key_id: worker_key_id.clone(),
+                    tx,
+                    resume_position: None,
+                }),
+            );
+        }
+        // Admit through the ContinuousWorkScheduler (the batch runner's front-end):
+        // same worker key = microbatch-compatible, up to the batch max. On backpressure
+        // or duplicate id, unregister and surface the error.
+        let workload = hipfire_scheduler::WorkloadSpec::microbatchable(
+            req_id.clone(),
+            hipfire_scheduler::WorkloadClass::TokenPrefill,
+            hipfire_scheduler::clamp_scheduler_priority(body.priority.unwrap_or(64)),
+            now_ms(),
+            hipfire_scheduler::WorkloadResources::default(),
+            worker_key_id,
+            crate::batch_runner::batch_max(),
+        )
+        .with_owner(owner.clone());
+        if let Err(e) = state.work_scheduler.lock().await.enqueue(workload) {
+            state.batch_inbox.lock().await.remove(&req_id);
+            return Err(
+                json!({"error": {"message": format!("scheduler admission: {e}"), "type": "server_error"}}),
+            );
+        }
+        state.prefill_notify.notify_waiters();
+
+        let mut text = String::new();
+        let mut finish_reason = "stop".to_string();
+        loop {
+            if should_cancel() {
+                state.batch_inbox.lock().await.remove(&req_id);
+                return Ok(None);
+            }
+            match rx.recv().await {
+                Some(crate::batch_runner::BatchEvent::Token(t)) => text.push_str(&t),
+                Some(crate::batch_runner::BatchEvent::Done(done)) => {
+                    finish_reason = done
+                        .get("finish_reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("stop")
+                        .to_string();
+                    break;
+                }
+                Some(crate::batch_runner::BatchEvent::Error(e)) => {
+                    return Err(json!({"error": {"message": e, "type": "server_error"}}));
+                }
+                None => break,
+            }
+        }
+        let token_count = text.split_whitespace().count() as u32;
+        let final_text = strip_visible_thinking(text, preserve_thinking, true);
+        let done = hipfire_generate::DoneEvent {
+            id: req_id.clone(),
+            tokens: token_count,
+            tok_s: None,
+            prefill_tokens: None,
+            prefill_ms: None,
+            prefill_tok_s: None,
+            decode_tok_s: None,
+            ttft_ms: None,
+            finish_reason: Some(finish_reason),
+            response_id: None,
+            extra: std::collections::HashMap::new(),
+        };
+        return Ok(Some(BlockingChatResult {
+            req_id,
+            created,
+            model: model_arg,
+            text: final_text,
+            done,
+            tool_calls: Vec::new(),
+            request_max_tokens,
+        }));
+    }
+
     if let Err(e) = wait_for_prefill_scheduler_turn(
         &state,
         &req_id,
         &loaded.model_path,
         &body.messages,
         body.priority,
+        owner,
     )
     .await
     {
@@ -1521,6 +1884,7 @@ where
                 resolved.max_tokens,
                 body.temperature,
                 body.top_p,
+                body.top_k,
                 body.repeat_penalty,
                 Some(request_max_tokens),
             ),
@@ -1617,15 +1981,23 @@ fn blocking_chat_response_json(result: Result<BlockingChatResult, Value>) -> Val
     }
 }
 
-async fn blocking_chat(state: SharedState, body: ChatRequest) -> Response {
+async fn blocking_chat(
+    state: SharedState,
+    body: ChatRequest,
+    owner: WorkloadOwner,
+    accounting: Option<crate::accounting::RequestAccounting>,
+) -> Response {
     if let Some((status, error)) = blocking_chat_preflight_error(&state, &body).await {
         return (status, Json(error)).into_response();
     }
 
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
     tokio::spawn(async move {
-        match execute_blocking_chat_cancellable(state, body, || tx.is_closed()).await {
+        match execute_blocking_chat_cancellable(state, body, owner, || tx.is_closed()).await {
             Ok(Some(result)) => {
+                if let Some(accounting) = &accounting {
+                    report_done_usage(accounting, &result.done);
+                }
                 let payload = blocking_chat_response_json(Ok(result));
                 if let Ok(bytes) = serde_json::to_vec(&payload) {
                     let _ = tx.send(bytes).await;
@@ -1691,7 +2063,13 @@ async fn blocking_chat_preflight_error(
             json!({"error": {"message": message, "type": "invalid_request_error"}}),
         ));
     }
-    if find_model(&model_arg).is_none() {
+    if find_model(
+        &model_arg,
+        &state.models_dir,
+        state.models_network_dir.as_deref(),
+    )
+    .is_none()
+    {
         return Some((
             StatusCode::NOT_FOUND,
             json!({"error": {"message": format!("model not found: {model_arg}"), "type": "invalid_request_error"}}),
@@ -1729,7 +2107,12 @@ async fn blocking_chat_buffered_for_tests(state: SharedState, body: ChatRequest)
     }
 }
 
-async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse {
+async fn stream_chat(
+    state: SharedState,
+    body: ChatRequest,
+    owner: WorkloadOwner,
+    accounting: Option<crate::accounting::RequestAccounting>,
+) -> impl IntoResponse {
     let (tx, mut rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::spawn(async move {
@@ -1796,6 +2179,7 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
             &loaded.model_path,
             &body.messages,
             body.priority,
+            owner,
         )
         .await
         {
@@ -1825,6 +2209,7 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
                     resolved.max_tokens,
                     body.temperature,
                     body.top_p,
+                    body.top_k,
                     body.repeat_penalty,
                     Some(request_max_tokens),
                 ),
@@ -1940,6 +2325,9 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
 
         match result {
             Ok(Some(done)) => {
+                if let Some(accounting) = &accounting {
+                    report_done_usage(accounting, &done);
+                }
                 *engine_guard = Some(engine);
                 let mut final_chunk = if has_tools {
                     if !structured_tool_calls_emitted {
@@ -2064,6 +2452,26 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
     )
 }
 
+fn report_done_usage(
+    accounting: &crate::accounting::RequestAccounting,
+    done: &hipfire_generate::DoneEvent,
+) {
+    let cached_tokens = done_extra_u64(done, "cached_tokens").unwrap_or(0);
+    let input_tokens = done_extra_u64(done, "prompt_tokens")
+        .unwrap_or(cached_tokens + done.prefill_tokens.unwrap_or(0) as u64);
+    accounting.report_text(input_tokens, done.tokens as u64, cached_tokens);
+}
+
+pub(crate) fn scheduler_owner_from_principal(
+    principal: &hipfire_auth::RequestPrincipal,
+) -> WorkloadOwner {
+    principal
+        .user_id
+        .as_ref()
+        .map(|user_id| WorkloadOwner::authenticated(user_id.clone(), principal.token_id.clone()))
+        .unwrap_or_default()
+}
+
 fn sse_error(msg: &str) -> Event {
     Event::default().data(serde_json::to_string(&json!({"error": {"message": msg}})).unwrap())
 }
@@ -2103,8 +2511,11 @@ mod tests {
             &messages,
             GenerationSamplingPolicy {
                 temperature: 0.3,
+                temperature_is_default: false,
                 max_tokens: 16,
                 top_p: Some(0.8),
+                top_p_is_default: false,
+                top_k: None,
                 repeat_penalty: Some(1.0),
             },
             Some("worker-a".to_string()),
@@ -2281,12 +2692,16 @@ mod tests {
         );
 
         let daemon_messages = req.messages.unwrap();
-        assert_eq!(daemon_messages[0].role, Role::System);
+        assert_eq!(daemon_messages[0].role, Role::Developer);
         assert_eq!(daemon_messages[0].content, "follow policy");
         assert_eq!(daemon_messages[2].role, Role::Assistant);
         assert_eq!(daemon_messages[2].content, "");
         assert_eq!(daemon_messages[2].tool_calls.len(), 1);
         assert_eq!(daemon_messages[2].tool_calls[0].name, "lookup");
+        assert_eq!(
+            daemon_messages[2].tool_calls[0].id.as_deref(),
+            Some("call_1")
+        );
         assert_eq!(
             daemon_messages[2].tool_calls[0].arguments,
             json!({"q":"hipfire"})
@@ -2828,7 +3243,7 @@ mod tests {
     }
 
     #[test]
-    fn load_params_attach_discovered_dflash_draft_like_bun() {
+    fn load_params_leave_dflash_discovery_to_shared_load_resolver() {
         let root = std::env::temp_dir().join(format!(
             "hipfire-server-dflash-draft-{}",
             std::process::id()
@@ -2846,12 +3261,12 @@ mod tests {
         };
         let params = load_params_for_model_config(&cfg, "qwen3.5-27b-mq4", Some(&target));
 
-        assert_eq!(params.draft.as_deref(), Some(draft.to_str().unwrap()));
+        assert_eq!(params.draft, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn load_params_drop_missing_explicit_cask_sidecar_like_bun() {
+    fn load_params_preserve_missing_explicit_cask_for_fail_closed_load() {
         let cfg = HipfireConfig {
             cask_sidecar: Some("/definitely/missing/model.triattn.hfq".to_string()),
             cask: true,
@@ -2860,12 +3275,15 @@ mod tests {
 
         let params = load_params_for_model_config(&cfg, "qwen3.5-27b-mq4", None);
 
-        assert_eq!(params.cask_sidecar, None);
-        assert_eq!(params.cask, None);
+        assert_eq!(
+            params.cask_sidecar.as_deref(),
+            Some("/definitely/missing/model.triattn.hfq")
+        );
+        assert_eq!(params.cask, Some(true));
     }
 
     #[test]
-    fn load_params_auto_attach_triattn_sidecar_like_bun() {
+    fn load_params_leave_triattn_discovery_to_shared_load_resolver() {
         let root = std::env::temp_dir().join(format!(
             "hipfire-server-triattn-sidecar-{}",
             std::process::id()
@@ -2884,10 +3302,7 @@ mod tests {
 
         let params = load_params_for_model_config(&cfg, "qwen3.5-27b-mq4", Some(&target));
 
-        assert_eq!(
-            params.cask_sidecar.as_deref(),
-            Some(sidecar.to_str().unwrap())
-        );
+        assert_eq!(params.cask_sidecar, None);
         assert_eq!(params.cask_budget, Some(2048));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2912,6 +3327,139 @@ mod tests {
 
         assert_eq!(request_max_tokens, 8192);
         assert_eq!(required_max_seq, 16384);
+    }
+
+    #[tokio::test]
+    async fn residency_plan_passes_qwen_module_mode_and_budget() {
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-server-residency-modules-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let model = root.join("Qwen3.5-122B-A10B--mq4.hfq");
+        std::fs::write(&model, vec![0u8; 128]).unwrap();
+        let cfg = HipfireConfig {
+            model_residency_mode: "qwen_moe_modules".to_string(),
+            scheduler_vram_budget_bytes: 1024,
+            scheduler_vram_headroom_bytes: 256,
+            ..Default::default()
+        };
+        let state = crate::AppState::new(cfg);
+
+        let plan = plan_residency_for_load(&state, model.to_str().unwrap(), "worker-qwen")
+            .await
+            .unwrap();
+
+        assert_eq!(plan.residency_mode, ResidencyMode::QwenMoeModules);
+        assert_eq!(plan.module_vram_budget_bytes, Some(768));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn residency_plan_selects_loaded_worker_victims_under_budget_pressure() {
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-server-residency-victims-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let old = root.join("old.hfq");
+        let incoming = root.join("incoming.hfq");
+        std::fs::write(&old, vec![0u8; 700]).unwrap();
+        std::fs::write(&incoming, vec![0u8; 500]).unwrap();
+        let cfg = HipfireConfig {
+            scheduler_vram_budget_bytes: 1000,
+            ..Default::default()
+        };
+        let state = crate::AppState::new(cfg);
+        state.loaded_models.lock().await.insert(
+            old.to_string_lossy().into_owned(),
+            LoadedModelState {
+                worker_key_id: Some("worker-old".to_string()),
+                cache_capable: false,
+                max_seq: 1024,
+                arch: None,
+            },
+        );
+
+        let plan = plan_residency_for_load(&state, incoming.to_str().unwrap(), "worker-new")
+            .await
+            .unwrap();
+
+        assert_eq!(plan.residency_mode, ResidencyMode::Full);
+        assert_eq!(plan.unload_worker_key_ids, vec!["worker-old"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn daemon_resource_status_builds_authoritative_resident_ledger() {
+        let mut loaded_models = HashMap::new();
+        loaded_models.insert(
+            "/tmp/stale-size.hfq".to_string(),
+            LoadedModelState {
+                worker_key_id: Some("worker-old".to_string()),
+                cache_capable: false,
+                max_seq: 4096,
+                arch: None,
+            },
+        );
+        let status = json!({
+            "type": "resource_status",
+            "workers": [{
+                "worker_key_id": "worker-old",
+                "model_path": "/tmp/actual.hfq",
+                "residency_mode": "qwen_moe_modules",
+                "system_memory_bytes": 32,
+                "vram_bytes": 256
+            }]
+        });
+
+        let workers =
+            resident_workers_from_daemon_resource_status(&status, &loaded_models).unwrap();
+
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].worker_key_id, "worker-old");
+        assert_eq!(workers[0].model_path, "/tmp/actual.hfq");
+        assert_eq!(workers[0].residency_mode, ResidencyMode::QwenMoeModules);
+        assert_eq!(
+            workers[0].resource_usage,
+            ResourceUsage {
+                system_memory_bytes: 32,
+                vram_bytes: 256,
+            }
+        );
+        assert_eq!(workers[0].last_used_seq, 4096);
+    }
+
+    #[test]
+    fn server_loaded_models_fallback_builds_resident_ledger_from_file_size() {
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-server-residency-fallback-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let model = root.join("resident.hfq");
+        std::fs::write(&model, vec![0u8; 321]).unwrap();
+        let mut loaded_models = HashMap::new();
+        loaded_models.insert(
+            model.to_string_lossy().into_owned(),
+            LoadedModelState {
+                worker_key_id: Some("worker-resident".to_string()),
+                cache_capable: false,
+                max_seq: 2048,
+                arch: None,
+            },
+        );
+
+        let workers = resident_workers_from_loaded_models(&loaded_models);
+
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].worker_key_id, "worker-resident");
+        assert_eq!(workers[0].resource_usage.vram_bytes, 321);
+        assert_eq!(workers[0].last_used_seq, 2048);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

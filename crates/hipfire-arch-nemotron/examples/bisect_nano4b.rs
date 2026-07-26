@@ -39,8 +39,8 @@ use hipfire_arch_nemotron::loader::load_nemotron_weights;
 use hipfire_arch_nemotron::model::NemotronModel;
 use hipfire_arch_nemotron::NemotronHConfig;
 use hipfire_model::ModelSource;
-use hipfire_runtime::safetensors_source::SafetensorsSource;
 use hipfire_rdna::Gpu;
+use hipfire_runtime::safetensors_source::SafetensorsSource;
 use std::io::Write;
 use std::path::PathBuf;
 

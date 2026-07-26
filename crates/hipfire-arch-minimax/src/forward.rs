@@ -33,11 +33,11 @@ use hipfire_dispatch::pipeline::superop::{
     self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind,
 };
 use hipfire_dispatch::types::DispatchError;
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::weights::{
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
     weight_gemv_residual,
 };
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 /// Calibration-only: download a small i32 routing tensor to host.
 fn download_i32_tensor(gpu: &mut Gpu, tensor: &GpuTensor, len: usize) -> Result<Vec<i32>, String> {
@@ -273,6 +273,7 @@ fn decode_step_body(
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
             cfg.head_dim,
+            cfg.rotary_dim,
             cfg.rotary_dim,
             cfg.rope_theta,
         )
@@ -753,6 +754,7 @@ fn minimax_attn_block(
         cfg.num_attention_heads,
         cfg.num_key_value_heads,
         cfg.head_dim,
+        cfg.rotary_dim,
         cfg.rotary_dim,
         cfg.rope_theta,
     )
@@ -1353,6 +1355,7 @@ pub fn forward_batch(
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
             cfg.head_dim,
+            cfg.rotary_dim,
             cfg.rotary_dim,
             cfg.rope_theta,
             b,

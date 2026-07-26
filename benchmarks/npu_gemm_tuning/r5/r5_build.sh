@@ -8,9 +8,10 @@
 # Usage: r5_build.sh <mlir-file> <workdir> [KSLICE]
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MLIR="${1:?usage: r5_build.sh <mlir> <workdir> [KSLICE]}"
+MLIR="${1:?usage: r5_build.sh <mlir> <workdir> [KSLICE] [INNER]}"
 W="${2:?workdir}"
 KSLICE="${3:-16}"
+INNER="${4:-0}"
 
 # R5_ARCH selects the NPU: aie2p = Strix Halo/npu2 (default, the validated line);
 # aie2 = XDNA1/Phoenix/npu1 (gfx1103 boxes). The generator that produced <mlir> must
@@ -41,6 +42,9 @@ done
 : "${R5_NACC:=4}"    # R7: independent K-partial accumulators (II~1). 1 = old single-accumulator chain.
 CF=(-std=c++20 -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body
     -O2 -DNDEBUG --target="$TGT" "${ARCHDEF[@]}" "-DKSLICE=$KSLICE" "-DINNER=$R5_INNER" "-DNACC=$R5_NACC")
+# R5_COMBINED=1: kernels take ONE combined A|W buffer per core (for r5_ksplit_gen.py
+# --combined, so a ROWS=4 column fits the memtile's 6 out channels).
+[ -n "${R5_COMBINED:-}" ] && CF+=(-DCOMBINED_XW)
 
 rm -rf "$W"; mkdir -p "$W"
 # One object per cascade role (the .mlir's link_with picks which each core needs).

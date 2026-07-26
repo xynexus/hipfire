@@ -1,0 +1,11 @@
+variant,protocol,round,order,encodes,hybrid_ms,hybrid_tok_s,package_w,package_tok_j,mean_cosine,decision
+r109,counterbalanced-full-model,1,first,3,759.011,337.3,18.71,18.0,0.92839295,control
+r111,counterbalanced-full-model,1,second,3,746.671,342.9,19.03,18.0,0.92839295,admit
+r111,counterbalanced-full-model,2,first,3,758.025,337.7,18.39,18.4,0.92839295,admit
+r109,counterbalanced-full-model,2,second,3,765.282,334.5,18.72,17.9,0.92839295,control
+r109,counterbalanced-full-model,3,first,3,757.321,338.0,19.39,17.4,0.92839295,control
+r111,counterbalanced-full-model,3,second,3,742.275,344.9,19.35,17.8,0.92839295,admit
+r111,counterbalanced-full-model,4,first,3,750.663,341.0,18.69,18.2,0.92839295,admit
+r109,counterbalanced-full-model,4,second,3,759.679,337.0,18.70,18.0,0.92839295,control
+r109,counterbalanced-mean,all,mixed,12,760.323,336.7,18.88,17.83,0.92839295,control
+r111,counterbalanced-mean,all,mixed,12,749.409,341.6,18.87,18.10,0.92839295,admit-artifact-present-default

@@ -289,11 +289,41 @@ fi
 # hipfire: the CLI (serve / run / list)
 cargo install "${INSTALL_OPTS[@]}" "${UI_FEATURES[@]}" --path crates/hipfire-cli --root "$HIPFIRE_DIR"
 
-# hipfire-tui: optional terminal operator UI
-cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-tui --root "$HIPFIRE_DIR"
+# hipfire-quantize: public offline model quantizer
+cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-quantize \
+    --bin hipfire-quantize \
+    --root "$HIPFIRE_DIR"
 
-# hipfire-system-monitor: standalone terminal hardware telemetry view
-cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-system-monitor --root "$HIPFIRE_DIR"
+# hipfire-monitor: standalone terminal hardware telemetry view
+cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-monitor --root "$HIPFIRE_DIR"
+
+# hipfire-priv-helper: narrow helper used by `hipfire doctor --fix` for
+# explicitly-approved privileged repairs. Installed non-SUID by default.
+cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-priv-helper --root "$HIPFIRE_DIR"
+
+# Optional polkit policy for `hipfire doctor --fix`. Normal user installs cannot
+# write the system policy directory, so render the exact installed helper path
+# and print the explicit admin command when needed.
+POLKIT_TEMPLATE="packaging/polkit/com.hipfire.priv-helper.policy.in"
+POLKIT_RENDERED="$HIPFIRE_DIR/share/polkit-1/actions/com.hipfire.priv-helper.policy"
+POLKIT_SYSTEM_DIR="/usr/share/polkit-1/actions"
+if [ -f "$POLKIT_TEMPLATE" ] && [ -x "$BIN_DIR/hipfire-priv-helper" ]; then
+    mkdir -p "$(dirname "$POLKIT_RENDERED")"
+    POLKIT_HELPER_PATH=$(readlink -f "$BIN_DIR/hipfire-priv-helper" 2>/dev/null || printf '%s' "$BIN_DIR/hipfire-priv-helper")
+    POLKIT_HELPER_ESCAPED=$(printf '%s' "$POLKIT_HELPER_PATH" | sed 's/[&|\]/\\&/g')
+    sed "s|@HIPFIRE_PRIV_HELPER@|$POLKIT_HELPER_ESCAPED|g" \
+        "$POLKIT_TEMPLATE" >"$POLKIT_RENDERED"
+    echo ""
+    echo "Rendered polkit policy:"
+    echo "  $POLKIT_RENDERED"
+    if [ -w "$POLKIT_SYSTEM_DIR" ]; then
+        install -m 0644 "$POLKIT_RENDERED" "$POLKIT_SYSTEM_DIR/com.hipfire.priv-helper.policy"
+        echo "  Installed polkit policy to $POLKIT_SYSTEM_DIR ✓"
+    else
+        echo "  To enable polkit-backed doctor fixes, run:"
+        echo "    sudo install -m 0644 '$POLKIT_RENDERED' '$POLKIT_SYSTEM_DIR/com.hipfire.priv-helper.policy'"
+    fi
+fi
 
 # Auxiliary eval/runtime tools
 cargo install --path crates/hipfire-eval \
@@ -310,14 +340,8 @@ ls -1 "$BIN_DIR"/
 
 # ─── Symlinks in ~/.local/bin ────────────────────────────
 echo ""
-echo "Creating symlinks in $LOCAL_BIN..."
-mkdir -p "$LOCAL_BIN"
-for bin in hipfire hipfire-daemon hipfire-tui hipfire-system-monitor hipfire-eval hipfire-host-profile; do
-    if [ -f "$BIN_DIR/$bin" ]; then
-        ln -sf "$BIN_DIR/$bin" "$LOCAL_BIN/$bin"
-        echo "  $LOCAL_BIN/$bin -> $BIN_DIR/$bin ✓"
-    fi
-done
+HIPFIRE_DIR="$HIPFIRE_DIR" LOCAL_BIN="$LOCAL_BIN" \
+    bash scripts/sync-install-links.sh
 
 # ─── Kernels ─────────────────────────────────────────────
 echo ""
@@ -387,8 +411,8 @@ echo "Quick start:"
 echo "  hipfire list                        # see local models"
 echo "  hipfire run <model> \"Hello\"         # generate text"
 echo "  hipfire serve                       # start OpenAI-compatible API"
-echo "  hipfire-tui                         # open terminal operator UI"
-echo "  hipfire-system-monitor              # open standalone system monitor"
+echo "  hipfire                             # open terminal operator UI"
+echo "  hipfire-monitor                     # open standalone system monitor"
 echo ""
 echo "To reinstall (force rebuild): re-run with CARGO_INSTALL_OPTS=--force ./install.sh"
 echo "Models go in ~/.hipfire/models/"

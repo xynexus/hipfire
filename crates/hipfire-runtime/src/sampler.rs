@@ -129,6 +129,7 @@ pub fn sample(
             vocab_size,
             cfg.temperature,
             cfg.top_p,
+            cfg.top_k,
             *rng_state,
             scope.len(),
             cfg.repeat_penalty,
@@ -204,7 +205,7 @@ pub fn sample_cpu(logits: &mut [f32], history: &[u32], cfg: &SamplerConfig) -> u
             logits[tok as usize] = f32::NEG_INFINITY;
         }
     }
-    sample_top_p(logits, cfg.temperature, cfg.top_p)
+    sample_top_k_top_p(logits, cfg.temperature, cfg.top_k, cfg.top_p)
 }
 
 // ─── CPU sampling primitives (relocated from llama.rs in the de-llama cleanup) ───
@@ -409,18 +410,27 @@ pub fn apply_unclosed_attractor_block(
 }
 
 pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
+    sample_top_k_top_p(logits, temperature, 20, top_p)
+}
+
+/// Sample with a caller-selected top-k cutoff before nucleus truncation.
+///
+/// The shared GPU sampler supports up to 64 candidates. Clamp the CPU path to
+/// the same range so CPU fallback and GPU execution retain the same candidate
+/// set. `top_k == 0` selects the backend maximum (64).
+pub fn sample_top_k_top_p(logits: &[f32], temperature: f32, top_k: usize, top_p: f32) -> u32 {
     if temperature <= 0.0 {
         return argmax(logits);
     }
     let top_p = top_p.clamp(0.0, 1.0);
-    const TOP_K: usize = 20;
+    let top_k = if top_k == 0 { 64 } else { top_k.clamp(1, 64) };
 
     let inv_temp = 1.0 / temperature;
 
     // Single pass: find max AND top-K indices from raw logits simultaneously.
     // Uses a fixed-size array (no heap alloc) with manual min-tracking.
-    let mut topk_val = [f32::NEG_INFINITY; TOP_K];
-    let mut topk_idx = [0u32; TOP_K];
+    let mut topk_val = vec![f32::NEG_INFINITY; top_k];
+    let mut topk_idx = vec![0u32; top_k];
     let mut min_pos = 0usize; // index of smallest element in topk
     let mut min_val = f32::NEG_INFINITY;
     let mut max_logit = f32::NEG_INFINITY;
@@ -434,7 +444,7 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
             topk_idx[min_pos] = i as u32;
             // Find new min
             min_val = f32::INFINITY;
-            for j in 0..TOP_K {
+            for j in 0..top_k {
                 if topk_val[j] < min_val {
                     min_val = topk_val[j];
                     min_pos = j;
@@ -444,17 +454,17 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     }
 
     // Softmax only the K candidates (temperature-scaled)
-    let mut probs = [0.0f32; TOP_K];
+    let mut probs = vec![0.0f32; top_k];
     let mut sum = 0.0f32;
-    for i in 0..TOP_K {
+    for i in 0..top_k {
         let p = ((topk_val[i] - max_logit) * inv_temp).exp();
         probs[i] = p;
         sum += p;
     }
 
     // Sort descending by probability (insertion sort on 20 elements)
-    let mut order: [usize; TOP_K] = core::array::from_fn(|i| i);
-    for i in 1..TOP_K {
+    let mut order: Vec<usize> = (0..top_k).collect();
+    for i in 1..top_k {
         let mut j = i;
         while j > 0 && probs[order[j]] > probs[order[j - 1]] {
             order.swap(j, j - 1);
@@ -462,34 +472,27 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
         }
     }
 
-    // Top-p filtering + sampling in one pass
-    let r = simple_rand() * sum; // pre-scale by total sum
-    let mut cumulative = 0.0f32;
-    let mut sample_acc = 0.0f32;
+    // Match the GPU kernel exactly: find the nucleus cutoff first, then draw
+    // once from the renormalized retained mass with one xorshift32 advance.
     let threshold = top_p * sum;
-    for &k in &order {
-        cumulative += probs[k];
-        sample_acc += probs[k];
-        if sample_acc >= r {
-            return topk_idx[k];
-        }
-        if cumulative >= threshold {
-            // Past top_p — sample from what we have
-            let r2 = simple_rand() * cumulative;
-            let mut acc2 = 0.0f32;
-            for &k2 in &order {
-                acc2 += probs[k2];
-                if acc2 >= r2 {
-                    return topk_idx[k2];
-                }
-                if acc2 >= cumulative {
-                    break;
-                }
-            }
-            return topk_idx[order[0]];
+    let mut trunc_sum = 0.0_f32;
+    let mut trunc_k = top_k;
+    for (i, &k) in order.iter().enumerate() {
+        trunc_sum += probs[k];
+        if trunc_sum >= threshold {
+            trunc_k = i + 1;
+            break;
         }
     }
-    topk_idx[order[0]]
+    let r = simple_rand() * trunc_sum;
+    let mut cumulative = 0.0_f32;
+    for &k in order.iter().take(trunc_k) {
+        cumulative += probs[k];
+        if cumulative >= r {
+            return topk_idx[k];
+        }
+    }
+    topk_idx[order[trunc_k - 1]]
 }
 
 /// Apply the repeat penalty in-place to a specific subset of (token_id, value)
@@ -716,6 +719,7 @@ mod tests {
         let cfg = SamplerConfig {
             temperature: 0.0,
             top_p: 1.0,
+            top_k: 20,
             repeat_penalty: 1.0,
             repeat_window: 8,
             presence_penalty: 1.0,
@@ -738,6 +742,17 @@ mod tests {
         let cfg = SamplerConfig::greedy();
         let tok = sample_cpu(&mut logits, &[], &cfg);
         assert_eq!(tok, 3);
+    }
+
+    #[test]
+    fn top_k_64_is_seeded_and_excludes_the_tail() {
+        let logits: Vec<f32> = (0..96).map(|index| index as f32 * 0.03125).collect();
+        reset_cpu_sampler_rng(0x1357_9bdf);
+        let first = sample_top_k_top_p(&logits, 1.0, 64, 0.95);
+        reset_cpu_sampler_rng(0x1357_9bdf);
+        let second = sample_top_k_top_p(&logits, 1.0, 64, 0.95);
+        assert_eq!(first, second);
+        assert!(first >= 32, "top-k 64 admitted tail token {first}");
     }
 
     #[test]

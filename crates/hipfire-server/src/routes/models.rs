@@ -9,14 +9,14 @@ use std::path::Path;
 use crate::model::discovery::local_llm_registry;
 use crate::state::SharedState;
 
-pub async fn get_models(_state: State<SharedState>) -> Json<Value> {
-    let registry = local_llm_registry();
+pub async fn get_models(State(state): State<SharedState>) -> Json<Value> {
+    let registry = local_llm_registry(&state.models_dir);
     Json(model_registry_openai_json(registry.models.iter()))
 }
 
-pub async fn get_model_registry(_state: State<SharedState>) -> Json<Value> {
+pub async fn get_model_registry(State(state): State<SharedState>) -> Json<Value> {
     Json(
-        serde_json::to_value(local_llm_registry()).unwrap_or_else(|err| {
+        serde_json::to_value(local_llm_registry(&state.models_dir)).unwrap_or_else(|err| {
             serde_json::json!({
                 "error": {
                     "message": format!("failed to serialize model registry: {err}"),

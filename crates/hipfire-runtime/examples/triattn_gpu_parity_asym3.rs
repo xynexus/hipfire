@@ -44,10 +44,10 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_rdna::{DType, Gpu};
     use hipfire_runtime::kv::KvCache;
     use hipfire_runtime::quant::f16_to_f32;
     use hipfire_runtime::triattn::{self, BandCenter, TriAttnCenters};
-    use hipfire_rdna::{DType, Gpu};
 
     // ── Config matching Qwen3.5 FA layer shape ─────────────────────────
     let n_heads = 16usize;
@@ -140,6 +140,7 @@ fn main() {
         n_kv_heads,
         head_dim,
         n_rot,
+        false,
         rope_theta,
         p_q,
         seq_len,

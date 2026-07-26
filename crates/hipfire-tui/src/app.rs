@@ -13,9 +13,11 @@ use ratatui::layout::Rect;
 
 use crate::hipfire::{
     chat::{stream_chat, ChatEvent, ChatMessage},
-    config::ConfigState,
+    config::{ConfigEditDirection, ConfigState},
     registry::{RegistryAction, RegistryState},
-    status::{start_background_serve, stop_pids, StatusState},
+    status::{
+        restart_background_serve, start_background_serve, stop_background_serve, StatusState,
+    },
     training::TrainingState,
     HipfirePaths,
 };
@@ -181,17 +183,15 @@ impl App {
                 self.status = StatusState::load(&self.paths, &self.config);
             }
             ControlAction::StopServe => {
-                match stop_pids(&self.status.serve_pids) {
-                    Ok(n) => self.last_reload = format!("sent SIGTERM to {n} serve process(es)"),
+                match stop_background_serve() {
+                    Ok(()) => self.last_reload = "requested background serve stop".into(),
                     Err(err) => self.last_reload = format!("{err}"),
                 }
                 self.status = StatusState::load(&self.paths, &self.config);
             }
             ControlAction::RestartServe => {
-                let _ = stop_pids(&self.status.serve_pids);
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                match start_background_serve() {
-                    Ok(()) => self.last_reload = "serve restart requested (stop + start)".into(),
+                match restart_background_serve() {
+                    Ok(()) => self.last_reload = "requested background serve restart".into(),
                     Err(err) => self.last_reload = format!("restart: {err}"),
                 }
                 self.status = StatusState::load(&self.paths, &self.config);
@@ -391,7 +391,7 @@ impl App {
         let len = if self.settings_easy {
             self.config.easy_rows().len()
         } else {
-            self.config.values.len()
+            self.config.advanced_rows().len()
         }
         .max(1);
         match key.code {
@@ -401,7 +401,62 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.settings_selected = self.settings_selected.saturating_sub(1);
             }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.edit_selected_setting(ConfigEditDirection::Previous);
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => {
+                self.edit_selected_setting(ConfigEditDirection::Next);
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                self.unset_selected_setting();
+            }
             _ => {}
+        }
+    }
+
+    fn edit_selected_setting(&mut self, direction: ConfigEditDirection) {
+        let result = if self.settings_easy {
+            self.config.edit_easy_row(
+                &self.paths,
+                self.settings_selected,
+                &self.active_model,
+                direction,
+            )
+        } else {
+            self.config
+                .edit_advanced_row(&self.paths, self.settings_selected, direction)
+        };
+        match result {
+            Ok(message) => {
+                self.last_reload = message;
+                self.config = ConfigState::load(&self.paths);
+                self.registry = RegistryState::load(&self.paths, &self.config);
+                self.status = StatusState::load(&self.paths, &self.config);
+            }
+            Err(err) => {
+                self.last_reload = err;
+            }
+        }
+    }
+
+    fn unset_selected_setting(&mut self) {
+        let result = if self.settings_easy {
+            self.config
+                .unset_easy_row(&self.paths, self.settings_selected)
+        } else {
+            self.config
+                .unset_advanced_row(&self.paths, self.settings_selected)
+        };
+        match result {
+            Ok(message) => {
+                self.last_reload = message;
+                self.config = ConfigState::load(&self.paths);
+                self.registry = RegistryState::load(&self.paths, &self.config);
+                self.status = StatusState::load(&self.paths, &self.config);
+            }
+            Err(err) => {
+                self.last_reload = err;
+            }
         }
     }
 

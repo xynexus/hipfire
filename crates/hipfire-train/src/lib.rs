@@ -21,6 +21,7 @@ pub mod dspark_train;
 pub mod hfq_patch;
 pub mod kv_noise;
 pub mod labels;
+pub mod latent_kv;
 pub mod learn_rotation;
 pub mod loader;
 pub mod model;

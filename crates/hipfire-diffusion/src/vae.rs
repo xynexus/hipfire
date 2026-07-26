@@ -167,21 +167,43 @@ impl VaeEncoderDownBlock {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeVaeEncoder {
-    pub conv_in: Conv2dLayer,
+    pub conv_in: Option<Conv2dLayer>,
     pub down_blocks: Vec<VaeEncoderDownBlock>,
     pub mid_resnet_0: Option<ResnetBlock2D>,
     pub mid_attention: Option<VaeAttentionBlock>,
     pub mid_resnet_1: Option<ResnetBlock2D>,
-    pub conv_norm_out: GroupNormLayer,
-    pub conv_out: Conv2dLayer,
+    pub conv_norm_out: Option<GroupNormLayer>,
+    pub conv_out: Option<Conv2dLayer>,
     pub quant_conv: Option<Conv2dLayer>,
+    // Wan / Qwen-Image (`AutoencoderKLQwenImage`) encoder: 3D causal convs +
+    // RMSNorm, a distinct encode path. When present the SD body is unused.
+    wan_encoder: Option<WanImageEncoder>,
     latent_norm: VaeLatentNorm,
+    // FLUX.2 (`AutoencoderKLFlux2`): patchify + BatchNorm the encoder output into
+    // the packed latent the DiT consumes. Symmetric to the decoder's patch norm.
+    flux2_patch_norm: Option<Flux2VaePatchNorm>,
 }
 
 impl NativeVaeEncoder {
     pub fn from_hfq(hfq: &HfqFile, config: &VaeConfig) -> DiffusionResult<Self> {
         let groups = config.norm_num_groups.unwrap_or(32);
         let eps = config.norm_eps.unwrap_or(1e-6);
+        // Wan / Qwen-Image encoder takes a distinct path; the SD body is skipped.
+        if let Some(wan) = WanImageEncoder::from_hfq(hfq, "vae/tensors/encoder")? {
+            return Ok(Self {
+                conv_in: None,
+                down_blocks: Vec::new(),
+                mid_resnet_0: None,
+                mid_attention: None,
+                mid_resnet_1: None,
+                conv_norm_out: None,
+                conv_out: None,
+                quant_conv: None,
+                wan_encoder: Some(wan),
+                latent_norm: VaeLatentNorm::from_config(config)?,
+                flux2_patch_norm: None,
+            });
+        }
         let block_count = config
             .down_block_types
             .len()
@@ -241,31 +263,33 @@ impl NativeVaeEncoder {
             None
         };
         Ok(Self {
-            conv_in: Conv2dLayer::from_hfq(
+            conv_in: Some(Conv2dLayer::from_hfq(
                 hfq,
                 "vae/tensors/encoder.conv_in.weight",
                 Some("vae/tensors/encoder.conv_in.bias"),
                 1,
-            )?,
+            )?),
             down_blocks,
             mid_resnet_0,
             mid_attention,
             mid_resnet_1,
-            conv_norm_out: GroupNormLayer::from_hfq(
+            conv_norm_out: Some(GroupNormLayer::from_hfq(
                 hfq,
                 "vae/tensors/encoder.conv_norm_out.weight",
                 "vae/tensors/encoder.conv_norm_out.bias",
                 groups,
                 eps,
-            )?,
-            conv_out: Conv2dLayer::from_hfq(
+            )?),
+            conv_out: Some(Conv2dLayer::from_hfq(
                 hfq,
                 "vae/tensors/encoder.conv_out.weight",
                 Some("vae/tensors/encoder.conv_out.bias"),
                 1,
-            )?,
+            )?),
             quant_conv,
+            wan_encoder: None,
             latent_norm: VaeLatentNorm::from_config(config)?,
+            flux2_patch_norm: Flux2VaePatchNorm::from_hfq(hfq, config)?,
         })
     }
 
@@ -290,9 +314,21 @@ impl NativeVaeEncoder {
         image: &CpuTensor,
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
-        let mut hidden = self
-            .conv_in
-            .forward_with_runtime_context(image, runtime_context)?;
+        // Wan / Qwen-Image path (3D causal, CPU — mirrors the wan_decoder path).
+        if let Some(wan) = &self.wan_encoder {
+            let _ = runtime_context;
+            return wan.encode(image);
+        }
+        let conv_in = self.conv_in.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("VAE encoder conv_in missing".to_string())
+        })?;
+        let conv_norm_out = self.conv_norm_out.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("VAE encoder conv_norm_out missing".to_string())
+        })?;
+        let conv_out = self.conv_out.as_ref().ok_or_else(|| {
+            DiffusionError::InvalidMetadata("VAE encoder conv_out missing".to_string())
+        })?;
+        let mut hidden = conv_in.forward_with_runtime_context(image, runtime_context)?;
         for block in &self.down_blocks {
             hidden = block.forward_with_runtime_context(hidden, runtime_context)?;
         }
@@ -305,22 +341,57 @@ impl NativeVaeEncoder {
         if let Some(resnet) = &self.mid_resnet_1 {
             hidden = resnet.forward_with_runtime_context(&hidden, runtime_context)?;
         }
-        hidden = self
-            .conv_norm_out
-            .forward_with_runtime_context(&hidden, runtime_context)?;
+        hidden = conv_norm_out.forward_with_runtime_context(&hidden, runtime_context)?;
         hidden = silu_with_runtime_context(&hidden, runtime_context)?;
-        hidden = self
-            .conv_out
-            .forward_with_runtime_context(&hidden, runtime_context)?;
+        hidden = conv_out.forward_with_runtime_context(&hidden, runtime_context)?;
         if let Some(quant_conv) = &self.quant_conv {
             hidden = quant_conv.forward_with_runtime_context(&hidden, runtime_context)?;
         }
         Ok(hidden)
     }
 
+    /// FLUX.2 encode: take the distribution mode (mean = first half of the moment
+    /// channels), patchify + BatchNorm-normalize into the packed latent the DiT
+    /// consumes. Mirrors the reference `mean = chunk(moments)[0]; rearrange(...);
+    /// bn.normalize`, and is the inverse of the decoder's `inverse_and_unpatchify`.
+    /// Returns `None` when this is not a FLUX.2 VAE (caller falls back to SD).
+    fn flux2_moments_to_latents(
+        &self,
+        moments: &CpuTensor,
+    ) -> DiffusionResult<Option<LatentBatch>> {
+        let Some(patch_norm) = &self.flux2_patch_norm else {
+            return Ok(None);
+        };
+        let [batch, channels, height, width] = shape4(moments)?;
+        let z = channels / 2; // mean occupies the first half
+        let mut mean = CpuTensor::zeros(&[batch, z, height, width]);
+        for b in 0..batch {
+            for c in 0..z {
+                for y in 0..height {
+                    for x in 0..width {
+                        mean.data[((b * z + c) * height + y) * width + x] =
+                            moments.data[nchw_idx(b, c, y, x, channels, height, width)];
+                    }
+                }
+            }
+        }
+        let packed = patch_norm.patchify_and_normalize(&mean)?;
+        let [pb, pc, ph, pw] = shape4(&packed)?;
+        Ok(Some(LatentBatch {
+            batch: pb,
+            channels: pc,
+            height: ph,
+            width: pw,
+            data: packed.data,
+        }))
+    }
+
     pub fn encode_to_latents(&self, image: &RgbImageBatch) -> DiffusionResult<LatentBatch> {
         let image = rgb_batch_to_vae_tensor(image)?;
         let moments = self.encode_tensor_moments(&image)?;
+        if let Some(latents) = self.flux2_moments_to_latents(&moments)? {
+            return Ok(latents);
+        }
         vae_moments_to_latents(&moments, &self.latent_norm)
     }
 
@@ -342,6 +413,9 @@ impl NativeVaeEncoder {
         let image_tensor = rgb_batch_to_vae_tensor_with_runtime_context(image, runtime_context)?;
         let moments =
             self.encode_tensor_moments_with_runtime_context(&image_tensor, runtime_context)?;
+        if let Some(latents) = self.flux2_moments_to_latents(&moments)? {
+            return Ok(latents);
+        }
         vae_moments_to_latents_with_runtime_context(&moments, &self.latent_norm, runtime_context)
     }
 
@@ -356,6 +430,12 @@ impl NativeVaeEncoder {
         let image_tensor = rgb_batch_to_vae_tensor_with_runtime_context(image, runtime_context)?;
         let moments =
             self.encode_tensor_moments_with_runtime_context(&image_tensor, runtime_context)?;
+        // FLUX.2 uses the distribution mode (mean) + patch-norm; the stochastic
+        // path does not apply to its BatchNorm-packed latent.
+        if let Some(latents) = self.flux2_moments_to_latents(&moments)? {
+            let _ = seeds;
+            return Ok(latents);
+        }
         vae_moments_to_latents_sampled(&moments, &self.latent_norm, seeds)
     }
 }
@@ -609,6 +689,149 @@ pub struct NativeVaeDecoder {
     // decode when present.
     wan_decoder: Option<WanImageDecoder>,
     latent_norm: VaeLatentNorm,
+    flux2_patch_norm: Option<Flux2VaePatchNorm>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Flux2VaePatchNorm {
+    running_mean: Vec<f32>,
+    running_var: Vec<f32>,
+    patch_height: usize,
+    patch_width: usize,
+    eps: f32,
+}
+
+impl Flux2VaePatchNorm {
+    pub(crate) fn from_hfq(hfq: &HfqFile, config: &VaeConfig) -> DiffusionResult<Option<Self>> {
+        if config.class_name != "AutoencoderKLFlux2" {
+            return Ok(None);
+        }
+        let running_mean = cpu_tensor_from_hfq(hfq, "vae/tensors/bn.running_mean")?.data;
+        let running_var = cpu_tensor_from_hfq(hfq, "vae/tensors/bn.running_var")?.data;
+        if running_mean.len() != running_var.len() {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "FLUX.2 VAE BatchNorm mean/var lengths {}/{} disagree",
+                running_mean.len(),
+                running_var.len()
+            )));
+        }
+        let (patch_height, patch_width) = match config.patch_size.as_slice() {
+            [height, width] if *height > 0 && *width > 0 => (*height, *width),
+            _ => {
+                return Err(DiffusionError::InvalidMetadata(format!(
+                    "FLUX.2 VAE patch_size {:?} must be [height, width]",
+                    config.patch_size
+                )))
+            }
+        };
+        Ok(Some(Self {
+            running_mean,
+            running_var,
+            patch_height,
+            patch_width,
+            eps: config.batch_norm_eps.unwrap_or(1e-4),
+        }))
+    }
+
+    /// Forward: patchify the `[b, channels, H, W]` VAE-encoder output into the
+    /// `[b, channels*patch_area, H/ph, W/pw]` packed latent, then BatchNorm-
+    /// normalize it — the exact inverse of [`Self::inverse_and_unpatchify`], and
+    /// the encode-side complement the reference applies as
+    /// `rearrange("c (i pi)(j pj) -> (c pi pj) i j")` then `bn.normalize`.
+    pub(crate) fn patchify_and_normalize(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
+        let [batch, channels, in_height, in_width] = shape4(input)?;
+        let patch_area = self
+            .patch_height
+            .checked_mul(self.patch_width)
+            .ok_or_else(|| DiffusionError::InvalidMetadata("VAE patch area overflow".into()))?;
+        if in_height % self.patch_height != 0 || in_width % self.patch_width != 0 {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "FLUX.2 encode latent {in_height}x{in_width} not divisible by patch {}x{}",
+                self.patch_height, self.patch_width
+            )));
+        }
+        let packed_channels = channels.checked_mul(patch_area).ok_or_else(|| {
+            DiffusionError::InvalidMetadata("FLUX.2 packed channel overflow".into())
+        })?;
+        if packed_channels != self.running_mean.len() {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "FLUX.2 packed latent channels {packed_channels} do not match BatchNorm {}",
+                self.running_mean.len()
+            )));
+        }
+        let height = in_height / self.patch_height;
+        let width = in_width / self.patch_width;
+        let mut output = CpuTensor::zeros(&[batch, packed_channels, height, width]);
+        for b in 0..batch {
+            for channel in 0..channels {
+                for patch_y in 0..self.patch_height {
+                    for patch_x in 0..self.patch_width {
+                        let packed_channel =
+                            (channel * self.patch_height + patch_y) * self.patch_width + patch_x;
+                        let scale = (self.running_var[packed_channel] + self.eps).sqrt();
+                        let mean = self.running_mean[packed_channel];
+                        for y in 0..height {
+                            for x in 0..width {
+                                let in_y = y * self.patch_height + patch_y;
+                                let in_x = x * self.patch_width + patch_x;
+                                let src =
+                                    ((b * channels + channel) * in_height + in_y) * in_width + in_x;
+                                let dst = ((b * packed_channels + packed_channel) * height + y)
+                                    * width
+                                    + x;
+                                output.data[dst] = (input.data[src] - mean) / scale;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn inverse_and_unpatchify(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
+        let [batch, packed_channels, height, width] = shape4(input)?;
+        let patch_area = self
+            .patch_height
+            .checked_mul(self.patch_width)
+            .ok_or_else(|| DiffusionError::InvalidMetadata("VAE patch area overflow".into()))?;
+        if packed_channels != self.running_mean.len() || packed_channels % patch_area != 0 {
+            return Err(DiffusionError::InvalidMetadata(format!(
+                "FLUX.2 packed latent channels {packed_channels} do not match BatchNorm {} and patch area {patch_area}",
+                self.running_mean.len()
+            )));
+        }
+        let channels = packed_channels / patch_area;
+        let out_height = height * self.patch_height;
+        let out_width = width * self.patch_width;
+        let mut output = CpuTensor::zeros(&[batch, channels, out_height, out_width]);
+        for b in 0..batch {
+            for channel in 0..channels {
+                for patch_y in 0..self.patch_height {
+                    for patch_x in 0..self.patch_width {
+                        let packed_channel =
+                            (channel * self.patch_height + patch_y) * self.patch_width + patch_x;
+                        let scale = (self.running_var[packed_channel] + self.eps).sqrt();
+                        let mean = self.running_mean[packed_channel];
+                        for y in 0..height {
+                            for x in 0..width {
+                                let src = ((b * packed_channels + packed_channel) * height + y)
+                                    * width
+                                    + x;
+                                let out_y = y * self.patch_height + patch_y;
+                                let out_x = x * self.patch_width + patch_x;
+                                let dst = ((b * channels + channel) * out_height + out_y)
+                                    * out_width
+                                    + out_x;
+                                output.data[dst] = input.data[src] * scale + mean;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
 }
 
 impl NativeVaeDecoder {
@@ -631,6 +854,7 @@ impl NativeVaeDecoder {
                 conv_out: None,
                 wan_decoder: Some(wan),
                 latent_norm: VaeLatentNorm::from_config(config)?,
+                flux2_patch_norm: None,
             });
         }
         let post_quant_conv = if hfq
@@ -720,6 +944,7 @@ impl NativeVaeDecoder {
             )?),
             wan_decoder: None,
             latent_norm: VaeLatentNorm::from_config(config)?,
+            flux2_patch_norm: Flux2VaePatchNorm::from_hfq(hfq, config)?,
         })
     }
 
@@ -745,7 +970,11 @@ impl NativeVaeDecoder {
         runtime_context: &mut DiffusionGenerationRuntimeContext,
     ) -> DiffusionResult<CpuTensor> {
         let mut hidden = latents.as_nchw_tensor();
-        hidden = denormalize_decode_latents(&hidden, &self.latent_norm, runtime_context)?;
+        hidden = if let Some(flux2) = &self.flux2_patch_norm {
+            flux2.inverse_and_unpatchify(&hidden)?
+        } else {
+            denormalize_decode_latents(&hidden, &self.latent_norm, runtime_context)?
+        };
         // Wan / Qwen-Image decoder: 3D-causal CPU path (no resident kernels yet).
         if let Some(wan) = &self.wan_decoder {
             return wan.decode(&hidden);
@@ -957,15 +1186,23 @@ pub(crate) fn wan_causal_conv2d(
             "wan_causal_conv2d only supports square spatial kernels, got {kh}x{kw}"
         )));
     }
-    let tap = kt - 1;
+    // T=1 causal-conv temporal collapse. QwenImageCausalConv3d pads the temporal
+    // axis CAUSALLY with ZEROS: `_padding = (.., 2*padding[0], 0)` and F.pad's
+    // default constant(0) mode. So a single frame is padded to `[0, .., 0, x]`
+    // and the Conv3d output is `sum_t weight[t] * padded[t] = weight[KT-1] * x` --
+    // only the LAST temporal tap survives (the earlier taps multiply zeros). The
+    // replication `cache_x` path only applies in video mode with a feat_cache,
+    // not still-image decode. (Summing all taps over-weights every kt=3 conv ~3x
+    // and biases/brightens the whole decode -> a per-channel color cast.)
+    let last_t = kt - 1;
     let mut weight2d = CpuTensor::zeros(&[out_c, in_c, kh, kw]);
     for o in 0..out_c {
         for i in 0..in_c {
             for y in 0..kh {
                 for x in 0..kw {
-                    let src = (((o * in_c + i) * kt + tap) * kh + y) * kw + x;
                     let dst = ((o * in_c + i) * kh + y) * kw + x;
-                    weight2d.data[dst] = weight3d.data[src];
+                    weight2d.data[dst] =
+                        weight3d.data[(((o * in_c + i) * kt + last_t) * kh + y) * kw + x];
                 }
             }
         }
@@ -1198,6 +1435,12 @@ pub(crate) struct WanUpBlock {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct WanImageDecoder {
+    // post_quant_conv (z_dim -> z_dim, 1x1x1) applied to the denormalized latent
+    // before the decoder proper, matching AutoencoderKLQwenImage._decode
+    // (`x = self.post_quant_conv(z)`). Skipping it leaves a per-channel colour
+    // cast / streaking in the output.
+    post_quant_conv_weight: Option<CpuTensor>,
+    post_quant_conv_bias: Option<CpuTensor>,
     conv_in_weight: CpuTensor,
     conv_in_bias: CpuTensor,
     mid_resnet0: WanResnetBlock,
@@ -1251,7 +1494,13 @@ impl WanImageDecoder {
                 WanUpsample::from_hfq(hfq, &format!("{prefix}.up_blocks.{ub}.upsamplers.0"))?;
             up_blocks.push(WanUpBlock { resnets, upsampler });
         }
+        // post_quant_conv is a VAE-level tensor (sibling of `decoder`), not under
+        // the decoder prefix.
+        let post_quant_conv_weight = optional_tensor(hfq, "vae/tensors/post_quant_conv.weight")?;
+        let post_quant_conv_bias = optional_tensor(hfq, "vae/tensors/post_quant_conv.bias")?;
         Ok(Some(Self {
+            post_quant_conv_weight,
+            post_quant_conv_bias,
             conv_in_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_in.weight"))?,
             conv_in_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_in.bias"))?,
             mid_resnet0: WanResnetBlock::from_hfq(hfq, &format!("{prefix}.mid_block.resnets.0"))?,
@@ -1268,16 +1517,109 @@ impl WanImageDecoder {
     }
 
     pub(crate) fn decode(&self, latent: &CpuTensor) -> DiffusionResult<CpuTensor> {
+        let dbg = std::env::var("HIPFIRE_DEBUG_VAE_STAGES").is_ok_and(|v| !v.is_empty());
+        let dump_dir = std::env::var("HIPFIRE_DEBUG_VAE_DUMP")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let report = |name: &str, t: &CpuTensor| {
+            if let Some(dir) = &dump_dir {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&(t.shape.len() as u32).to_le_bytes());
+                for d in &t.shape {
+                    bytes.extend_from_slice(&(*d as u32).to_le_bytes());
+                }
+                for v in &t.data {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let _ = std::fs::write(format!("{dir}/stage_{name}.bin"), &bytes);
+            }
+            if !dbg {
+                return;
+            }
+            // mean |horizontal neighbor diff| over the last dim (smoothness proxy).
+            let (h, w) = match t.shape.as_slice() {
+                [_, _, h, w] => (*h, *w),
+                _ => (1, t.data.len()),
+            };
+            let mut acc = 0.0f64;
+            let mut n = 0usize;
+            let stride = t.data.len() / (h.max(1));
+            let _ = stride;
+            for row in t.data.chunks(w.max(1)) {
+                for pair in row.windows(2) {
+                    acc += (pair[0] - pair[1]).abs() as f64;
+                    n += 1;
+                }
+            }
+            eprintln!(
+                "[vae] {name}: shape={:?} smoothness(|dx|)={:.4}",
+                t.shape,
+                acc / n.max(1) as f64
+            );
+        };
+        if let Ok(dir) = std::env::var("HIPFIRE_DEBUG_VAE_DUMP") {
+            if !dir.is_empty() {
+                let dump = |name: &str, t: &CpuTensor| {
+                    let mut bytes = Vec::with_capacity(4 + t.shape.len() * 4 + t.data.len() * 4);
+                    bytes.extend_from_slice(&(t.shape.len() as u32).to_le_bytes());
+                    for d in &t.shape {
+                        bytes.extend_from_slice(&(*d as u32).to_le_bytes());
+                    }
+                    for v in &t.data {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    let _ = std::fs::write(format!("{dir}/{name}.bin"), &bytes);
+                };
+                dump("conv_in_input", latent);
+                dump(
+                    "conv_in_weight",
+                    &CpuTensor {
+                        shape: self.conv_in_weight.shape.clone(),
+                        data: self.conv_in_weight.data.clone(),
+                    },
+                );
+            }
+        }
+        // post_quant_conv (1x1x1 channel-mix) on the denormalized latent, before
+        // conv_in -- matches AutoencoderKLQwenImage._decode's `post_quant_conv(z)`.
+        let post_quant = match &self.post_quant_conv_weight {
+            Some(w) => Some(wan_causal_conv2d(
+                latent,
+                w,
+                self.post_quant_conv_bias.as_ref(),
+            )?),
+            None => None,
+        };
+        let latent = post_quant.as_ref().unwrap_or(latent);
         let mut hidden = wan_causal_conv2d(latent, &self.conv_in_weight, Some(&self.conv_in_bias))?;
+        if let Ok(dir) = std::env::var("HIPFIRE_DEBUG_VAE_DUMP") {
+            if !dir.is_empty() {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&(hidden.shape.len() as u32).to_le_bytes());
+                for d in &hidden.shape {
+                    bytes.extend_from_slice(&(*d as u32).to_le_bytes());
+                }
+                for v in &hidden.data {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let _ = std::fs::write(format!("{dir}/conv_in_output.bin"), &bytes);
+            }
+        }
+        report("conv_in", &hidden);
         hidden = self.mid_resnet0.forward(&hidden)?;
+        report("mid_resnet0", &hidden);
         hidden = self.mid_attention.forward(&hidden)?;
+        report("mid_attention", &hidden);
         hidden = self.mid_resnet1.forward(&hidden)?;
-        for up_block in &self.up_blocks {
+        report("mid_resnet1", &hidden);
+        for (bi, up_block) in self.up_blocks.iter().enumerate() {
             for resnet in &up_block.resnets {
                 hidden = resnet.forward(&hidden)?;
             }
+            report(&format!("up_block{bi}_resnets"), &hidden);
             if let Some(upsampler) = &up_block.upsampler {
                 hidden = upsampler.forward(&hidden)?;
+                report(&format!("up_block{bi}_upsample"), &hidden);
             }
         }
         hidden = wan_silu(&wan_rms_norm_nchw(
@@ -1285,13 +1627,227 @@ impl WanImageDecoder {
             &self.norm_out_gamma,
             Self::EPS,
         )?);
-        wan_causal_conv2d(&hidden, &self.conv_out_weight, Some(&self.conv_out_bias))
+        report("norm_out", &hidden);
+        let out = wan_causal_conv2d(&hidden, &self.conv_out_weight, Some(&self.conv_out_bias))?;
+        report("conv_out", &out);
+        Ok(out)
+    }
+}
+
+/// Wan / Qwen-Image VAE spatial downsampler (still-image path): asymmetric
+/// zero-pad (right+bottom) then the `resample` 3x3 stride-2 conv, halving H/W.
+/// The temporal `time_conv` is a no-op for T=1 and is skipped.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct WanDownsample {
+    resample_weight: CpuTensor,
+    resample_bias: CpuTensor,
+}
+
+fn pad_nchw_right_bottom_zeros(
+    input: &CpuTensor,
+    right: usize,
+    bottom: usize,
+) -> DiffusionResult<CpuTensor> {
+    let [batch, channels, height, width] = shape4(input)?;
+    let output_height = height.checked_add(bottom).ok_or_else(|| {
+        DiffusionError::InvalidMetadata("right/bottom padding height overflow".to_string())
+    })?;
+    let output_width = width.checked_add(right).ok_or_else(|| {
+        DiffusionError::InvalidMetadata("right/bottom padding width overflow".to_string())
+    })?;
+    let mut output = CpuTensor::zeros(&[batch, channels, output_height, output_width]);
+    for batch_idx in 0..batch {
+        for channel in 0..channels {
+            for y in 0..height {
+                let source_row = ((batch_idx * channels + channel) * height + y) * width;
+                let target_row =
+                    ((batch_idx * channels + channel) * output_height + y) * output_width;
+                output.data[target_row..target_row + width]
+                    .copy_from_slice(&input.data[source_row..source_row + width]);
+            }
+        }
+    }
+    Ok(output)
+}
+
+#[allow(dead_code)]
+impl WanDownsample {
+    pub(crate) fn from_hfq(hfq: &HfqFile, prefix: &str) -> DiffusionResult<Option<Self>> {
+        for index in 0..4 {
+            let weight_entry = format!("{prefix}.resample.{index}.weight");
+            if hfq.find_tensor_info(&weight_entry).is_some() {
+                return Ok(Some(Self {
+                    resample_weight: cpu_tensor_from_hfq(hfq, &weight_entry)?,
+                    resample_bias: cpu_tensor_from_hfq(
+                        hfq,
+                        &format!("{prefix}.resample.{index}.bias"),
+                    )?,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn forward(&self, input: &CpuTensor) -> DiffusionResult<CpuTensor> {
+        // QwenImageResample uses ZeroPad2d((0, 1, 0, 1)) before its unpadded
+        // 3x3 stride-2 convolution. Symmetric padding shifts every encoded
+        // feature one input pixel toward the bottom/right at each scale.
+        let padded = pad_nchw_right_bottom_zeros(input, 1, 1)?;
+        conv2d_nchw_with_stride(
+            &padded,
+            &self.resample_weight,
+            Some(&self.resample_bias),
+            0,
+            2,
+        )
+        .map_err(Into::into)
+    }
+}
+
+/// One encoder down-step: either a residual block or a spatial downsampler
+/// (the flat `down_blocks` list mixes them).
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum WanEncoderDownStep {
+    Resnet(WanResnetBlock),
+    Downsample(WanDownsample),
+}
+
+/// Full Wan / Qwen-Image (`AutoencoderKLQwenImage`) VAE encoder, still-image
+/// (T=1) path — the mirror of `WanImageDecoder`: `conv_in -> down_blocks ->
+/// mid(resnet, attn, resnet) -> norm_out -> SiLU -> conv_out -> quant_conv`,
+/// mapping `[B, 3, H, W]` pixels to `[B, 2*z_dim, H/8, W/8]` diagonal-Gaussian
+/// moments. Reuses the tested Wan building blocks.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct WanImageEncoder {
+    conv_in_weight: CpuTensor,
+    conv_in_bias: CpuTensor,
+    down_steps: Vec<WanEncoderDownStep>,
+    mid_resnet0: WanResnetBlock,
+    mid_attention: WanMidAttention,
+    mid_resnet1: WanResnetBlock,
+    norm_out_gamma: Vec<f32>,
+    conv_out_weight: CpuTensor,
+    conv_out_bias: CpuTensor,
+    quant_conv_weight: CpuTensor,
+    quant_conv_bias: CpuTensor,
+}
+
+#[allow(dead_code)]
+impl WanImageEncoder {
+    const EPS: f32 = 1e-6;
+
+    /// Load from an hfq under `prefix` (`vae/tensors/encoder`). Returns `None`
+    /// when this is not a Wan / Qwen-Image encoder. Discriminated by
+    /// `{prefix}.norm_out.gamma` (RMSNorm), like the decoder.
+    pub(crate) fn from_hfq(hfq: &HfqFile, prefix: &str) -> DiffusionResult<Option<Self>> {
+        if hfq
+            .find_tensor_info(&format!("{prefix}.norm_out.gamma"))
+            .is_none()
+        {
+            return Ok(None);
+        }
+        // Parse the flat down_blocks list: each index is a resnet (conv1) or a
+        // downsample (resample). Stop at the first missing index.
+        let mut down_steps = Vec::new();
+        let mut idx = 0;
+        loop {
+            let block_prefix = format!("{prefix}.down_blocks.{idx}");
+            if hfq
+                .find_tensor_info(&format!("{block_prefix}.conv1.weight"))
+                .is_some()
+            {
+                down_steps.push(WanEncoderDownStep::Resnet(WanResnetBlock::from_hfq(
+                    hfq,
+                    &block_prefix,
+                )?));
+            } else if let Some(down) = WanDownsample::from_hfq(hfq, &block_prefix)? {
+                down_steps.push(WanEncoderDownStep::Downsample(down));
+            } else {
+                break;
+            }
+            idx += 1;
+        }
+        Ok(Some(Self {
+            conv_in_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_in.weight"))?,
+            conv_in_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_in.bias"))?,
+            down_steps,
+            mid_resnet0: WanResnetBlock::from_hfq(hfq, &format!("{prefix}.mid_block.resnets.0"))?,
+            mid_attention: WanMidAttention::from_hfq(
+                hfq,
+                &format!("{prefix}.mid_block.attentions.0"),
+            )?,
+            mid_resnet1: WanResnetBlock::from_hfq(hfq, &format!("{prefix}.mid_block.resnets.1"))?,
+            norm_out_gamma: cpu_tensor_from_hfq(hfq, &format!("{prefix}.norm_out.gamma"))?.data,
+            conv_out_weight: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_out.weight"))?,
+            conv_out_bias: cpu_tensor_from_hfq(hfq, &format!("{prefix}.conv_out.bias"))?,
+            quant_conv_weight: cpu_tensor_from_hfq(hfq, "vae/tensors/quant_conv.weight")?,
+            quant_conv_bias: cpu_tensor_from_hfq(hfq, "vae/tensors/quant_conv.bias")?,
+        }))
+    }
+
+    /// Encode `[B, 3, H, W]` pixels to `[B, 2*z_dim, H/8, W/8]` moments.
+    pub(crate) fn encode(&self, image: &CpuTensor) -> DiffusionResult<CpuTensor> {
+        let mut hidden = wan_causal_conv2d(image, &self.conv_in_weight, Some(&self.conv_in_bias))?;
+        for step in &self.down_steps {
+            hidden = match step {
+                WanEncoderDownStep::Resnet(resnet) => resnet.forward(&hidden)?,
+                WanEncoderDownStep::Downsample(down) => down.forward(&hidden)?,
+            };
+        }
+        hidden = self.mid_resnet0.forward(&hidden)?;
+        hidden = self.mid_attention.forward(&hidden)?;
+        hidden = self.mid_resnet1.forward(&hidden)?;
+        hidden = wan_silu(&wan_rms_norm_nchw(
+            &hidden,
+            &self.norm_out_gamma,
+            Self::EPS,
+        )?);
+        hidden = wan_causal_conv2d(&hidden, &self.conv_out_weight, Some(&self.conv_out_bias))?;
+        // quant_conv is a 1x1x1 Conv3d (per-channel affine); wan_causal_conv2d
+        // handles it directly.
+        wan_causal_conv2d(
+            &hidden,
+            &self.quant_conv_weight,
+            Some(&self.quant_conv_bias),
+        )
     }
 }
 
 #[cfg(test)]
 mod wan_vae_tests {
     use super::*;
+
+    #[test]
+    fn wan_downsample_matches_qwen_image_right_bottom_padding() {
+        let mut weight = vec![0.0f32; 9];
+        weight[4] = 1.0;
+        let downsample = WanDownsample {
+            resample_weight: CpuTensor {
+                shape: vec![1, 1, 3, 3],
+                data: weight,
+            },
+            resample_bias: CpuTensor {
+                shape: vec![1],
+                data: vec![0.0],
+            },
+        };
+        let input = CpuTensor {
+            shape: vec![1, 1, 4, 4],
+            data: (1..=16).map(|value| value as f32).collect(),
+        };
+
+        let out = downsample.forward(&input).unwrap();
+
+        assert_eq!(out.shape, vec![1, 1, 2, 2]);
+        // ZeroPad2d((0, 1, 0, 1)) leaves the top/left origin untouched, so a
+        // center-only 3x3 kernel samples input coordinates (1,1), (1,3),
+        // (3,1), and (3,3). Symmetric padding would incorrectly yield
+        // [1, 3, 9, 11], shifting the encoded image toward the bottom/right.
+        assert_eq!(out.data, vec![6.0, 8.0, 14.0, 16.0]);
+    }
 
     #[test]
     fn wan_upsample_doubles_spatial_dims() {
@@ -1319,7 +1875,9 @@ mod wan_vae_tests {
 
     #[test]
     fn wan_causal_conv2d_uses_last_temporal_tap() {
-        // 1x1 spatial, 3 temporal taps [5, 7, 11]; only the last (11) is used.
+        // 1x1 spatial, 3 temporal taps [5, 7, 11]. QwenImageCausalConv3d pads the
+        // temporal axis causally with ZEROS, so a single (T=1) frame sees
+        // [0, 0, x] and only the LAST tap (11) survives: 11 * input.
         let weight3d = CpuTensor {
             shape: vec![1, 1, 3, 1, 1],
             data: vec![5.0, 7.0, 11.0],

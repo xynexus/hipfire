@@ -50,6 +50,7 @@ mod tests {
     fn session(id: &str, device_id: &str) -> hipfire_scheduler::RequestSessionDraft {
         create_request_session_draft(CreateRequestSessionInput {
             id: id.to_string(),
+            owner: hipfire_scheduler::WorkloadOwner::default(),
             worker_key: worker(device_id),
             prompt_tokens: vec![1, 2, 3],
             cached_prefix_tokens: None,

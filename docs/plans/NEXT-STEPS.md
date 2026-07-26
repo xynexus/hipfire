@@ -55,8 +55,52 @@ is nearly free.
   redundancy gate (param-count kept as config-parse fallback).
 - Verified: unit test (`deltanet_state_gate_keys_on_redundancy`) + 0.8B
   long-decode coherence (uniq 0.46, no attractor) + daemon logs FP32.
-- Follow-ups in TODO.md: real FP16 state kernel; FP32/FP16 **tree** replay
-  (tree-mode is Q8-only today → MTP draft must stay non-tree, see Phase B).
+- Follow-ups (were "in TODO.md", which no longer exists — tracked here now):
+  real FP16 state kernel; FP32/FP16 **tree** replay (tree-mode is Q8-only today
+  → MTP draft must stay non-tree, see Phase B).
+
+### DeltaNet state quant — POLICY + sizing (2026-07-19)
+
+**DeltaNet state must NEVER be Q8.** FP32 via the redundancy gate is the
+intended default; the only sanctioned alternatives are **FP16** or a
+**purpose-built DeltaNet-state codec** (neither implemented). Recorded at the
+gate in `qwen35/state.rs` (commit 51e1ac078). The earlier advice to lower
+`HIPFIRE_DN_STATE_FP32_BELOW` to 3000 so 9B/27B use Q8 is **withdrawn**.
+
+Every hazard hit so far is Q8-*specific* — FP32 has none of them:
+- long-decode attractors on low-redundancy models (2026-06-15)
+- stochastic-rounding seed leaked execution history into target numerics,
+  breaking spec-decode losslessness (fixed 196375ae0; hazard is inherent to
+  stochastic requant)
+- `s_ef_residual`, the Q8-only error-feedback accumulator, is one of
+  `DeltaNetState`'s five fields but is NOT among the three `DeltaNetSnapshot`
+  saves/restores — a per-token recurrent buffer surviving rollback, which
+  reintroduces drafter-dependent output the moment Q8 is enabled
+
+**Sizing (measured from real configs).** State is **per-sequence**, unlike
+weights, so this is a CONCURRENCY question, not a model-size one. FP32 totals
+(S matrices + conv state):
+
+| model | DN layers | v-heads | total/seq |
+|---|---|---|---|
+| 0.8B / 2B | 18 | 16 | 19.3 MB |
+| 4B / 9B | 24 | 32 | 50.2 MB |
+| 35B-A3B | 30 | 32 | 62.8 MB |
+| 27B / 3.6-27B | 48 | 48 | 149.6 MB |
+| 122B-A10B | 36 | 64 | 149.1 MB |
+| 397B-A17B | 45 | 64 | 186.3 MB |
+
+Spec decode **doubles** it (the rollback snapshot is a second copy) → 27B is
+~300 MB per spec-decoding session. One session is negligible against 45 GB;
+32 concurrent on 27B is ~4.8 GB, 64 is ~9.6 GB. **FP16 halves it and is the
+next step. A real codec only earns its complexity for high-concurrency serving
+of 27B-class models** — a much weaker case than "unknown size" implied.
+
+**Blocker to reconcile:** `gated_delta_net_q8_tree_batch_seq` is the ONLY tree
+DeltaNet kernel (no FP32 variant), so DDTree spec-decode structurally requires
+Q8 and cannot run under this policy. DDTree is opt-in and off by default, so
+nothing regresses today. Fix by adding an FP32/FP16 tree kernel — **not** by
+re-enabling Q8 state.
 
 ## Phase B — MTP draft wiring ✅ DONE + verified
 
@@ -118,6 +162,19 @@ This is the known reason QTIP/trellis is the *only* viable 2-bit path. Do
 - **Gate:** coherence + fresh-process `scripts/probe_commits.sh`.
 
 ## Phase D — KVarN KV (long-context bandwidth)
+
+> **REALITY (2026-07-23): SHIPPED, not skipped.** The "SKIP the GPU Sinkhorn
+> subsystem" verdict below (2026-06-16, scoped to single-tier per-token KVarN on
+> the 780M) was **overridden by the 2026-07-14 KV-default directive** once the
+> hot/cold hierarchical cache reframed KVarN as the *cold-tier codec*. KVarN now
+> lives in its own crate `crates/hipfire-kvquant/` (kvarn.rs moved there) with a
+> real **GPU kvarn kernel** (`170443011`, head_dim-512 for gemma4 global layers),
+> **selectable K bits 2/4/8, default 4** (`55af8e316`), an **8-bit hot ring**
+> (`db7891bca`), and the hierarchical cache (`crates/hipfire-runtime/src/kv_hier.rs`).
+> It is wired into run/perplexity/pflash/infer examples and the qwen35 prefill
+> path. **KVarN + hierarchical are the primary KV systems; asym is the retained
+> baseline-to-beat.** The 2026-06-16 skip reasoning is preserved below as history
+> (it was correct *for the per-token variant on this box*); do not act on it.
 
 Reference now in-tree: `./Quantization/KVarN…/` — paper + full repo (spec
 `KVARN_MLA_BACKEND_SPEC.md`, Python refs `kvarn_mla_*`, Rust). Algorithm:
@@ -183,6 +240,33 @@ row scale, GROUP=128 tile records, dequant-to-fp16-scratch then stock decode.
       loss on REAL K (mechanism confirmed, not just synthetic). But the margin
       is modest at short ctx (asym4's per-channel scales already capture most
       skew).
+    - ⚠️ **SUPERSEDED (2026-07-13):** the verdict below was for *single-tier
+      per-token* KVarN (per-token Sinkhorn s_col on the whole cache). The **hot/cold
+      hierarchical cache** (2026-07) is a different system — KVarN is only the
+      *cold-tier* codec while recent tokens stay exact (f16 hot ring) — and per the
+      ratified north-star (root `README.md`) **KVarN + the hierarchical cache are now
+      the primary KV systems**, with asym retained as the baseline to beat. Long-ctx
+      hierarchical results (0.8B, ctx=16384): a larger f16 hot window nearly
+      eliminates the merge penalty (KLD 0.247→0.146 at hot=512→2048).
+    - ✅ **HEAD-TO-HEAD SETTLED (2026-07-13)** (0.8B mq4+, PPL/KLD vs bf16;
+      `benchmarks/results/hier-kv-rebaseline-20260712/asym_headtohead.md`):
+      | ctx | asym4 | asym3 | single-tier KVarN | hierarchical |
+      | --- | --- | --- | --- | --- |
+      | 2048 | 27.04 / 0.095 | 27.82 / 0.115 | **26.38 / 0.083** | 27.54 / 0.153 |
+      | 16384 | 18.15 / 0.096 | 19.22 / 0.125 | **17.71 / 0.085** | 18.41 / 0.149 |
+      - **Single-tier KVarN strictly dominates asym4** (better PPL *and* KLD at both
+        ctx) at **iso-memory** (both 4-bit K + Q8 V; Sinkhorn var-norm beats Givens
+        rotation). This overturns the 2026-06-16 "ship asym4" verdict on the real
+        runtime — **asym is now dominated by KVarN and can be deprecated.**
+      - **Hierarchical is a memory play, not a pure-quality one.** Its quality-per-token
+        is *worse* than asym4/KVarN (it merges tokens), but it reaches near-asym4 PPL
+        (18.41 vs 18.15) at **~4× less memory** (hot f16 + 4:1-merged 2-bit cold ≈ 85 MB
+        vs asym4 ~350 MB at 16k) — it wins quality-per-byte, not absolute quality.
+      - Net: "KVarN + hierarchical are the primary KV systems" holds — KVarN for best
+        4-bit quality (beats asym), hierarchical for long-context memory compression.
+        The blanket "outperforms asym in every way" is accurate for KVarN, and for
+        hierarchical only on the memory axis. Full detail:
+        `docs/plans/2026-07-12-hot-cold-hierarchical-kv-implementation.md`.
     - ✅ **VERDICT — SKIP the GPU Sinkhorn subsystem (2026-06-16).** Long-ctx
       test (calib-5m, fair within-run): f32 ctx1024=11.51 ctx4096=24.27; asym4
       11.60 / 24.80; KVarN-K 11.56 / **28.66**. KVarN-K helps +0.5% at ctx1024
@@ -201,6 +285,41 @@ row scale, GROUP=128 tile records, dequant-to-fp16-scratch then stock decode.
 - **Gate:** long-context coherence + τ stability under compressed KV.
 
 ## Phase E — MTP spec-decode optimization (moved from Phase B follow-up)
+
+> **REALITY (2026-07-23): MTP is SUPERSEDED by DFlash for qwen3.5 — wind Phase E
+> down.** In the live serving path (`hipfire-serving-core/src/generate.rs`)
+> DFlash takes priority; `generate_mtp` only runs when *no* DFlash sidecar is
+> loaded (`generate.rs:2337`, guarded on `m.dflash.is_none()`). Measured
+> acceptance settles it: **DFlash τ≈5.7 on qwen3.5-9B, lossless**
+> (`benchmarks/results/dflash-phasef-acceptance-20260719.md`) vs **MTP's best
+> qwen τ=1.66** — and MTP is still net-negative on wall-clock (13.1 vs 57.7
+> tok/s AR on 0.8B). The repo's own design note is explicit: an MTP head and a
+> DFlash/DSpark block drafter are *competing* drafters for one target, with
+> DFlash "the higher-τ replacement" and MTP at best "the cheap MTP-1-style
+> fallback" (`docs/references/specdecode/deepspec-notes.md:236-240`).
+>
+> Status of the individual items:
+> - **E1 (GDN-tape replay elimination): LANDED.** MTP now carries a
+>   `trunk_gdn_tape` (`mtp_spec.rs:418/606/644`) — the plan's premise that "MTP
+>   passes `gdn_tape: None`" no longer holds.
+> - **E2 (compressed-vocab draft lm_head): LANDED.** `spec_step_mtp_compressed`
+>   + `--vocab-sidecar` wired (`mtp_spec.rs:1789`).
+> - **E3 (MTP verify-graph capture): SUPERSEDED — do not build.** E3 was defined
+>   as porting `verify_dflash_block_with_graph_policy` *onto MTP*; that DFlash
+>   facility already exists and is the maintained path qwen3.5 routes through
+>   first. Graphing the displaced drafter is redundant.
+> - **E4 (tree MTP): DEAD twice over.** Blocked on an unwritten FP32/FP16
+>   tree-replay kernel, *and* the tree approach itself was measured and rejected:
+>   DDTree net-loses to linear chain on every drafter (`78b96e6ce`), so DFlash's
+>   default is linear chain. A tree MTP inherits the same "independent
+>   per-position marginals → no joint to exploit" loss.
+>
+> **Go-forward if any spec-decode effort continues:** it belongs on DFlash
+> (actively developed, default, lossless) or on finishing **DSpark's qwen35
+> integration** (wired 2026-07-03 `3d42af18d` but left "tau=0 pending"), **not**
+> on MTP. Keep `generate_mtp` only as the cheap fallback for models that ship an
+> MTP head but no DFlash sidecar. The MTP-perf analysis below is retained as
+> history.
 
 Phase B wired MTP and fixed DFlash's τ<1, but the **warmed A/B shows MTP is
 net-negative on the 0.8B**: AR 57.7 tok/s vs MTP 13.1 tok/s (~4.4× slower),
@@ -418,9 +537,11 @@ Papers + reference implementations vendored for Phases C/D:
     2-bit Lloyd). So QTIP-LDLQ = **swap that path's Lloyd scalar quantizer
     for the trellis `beam_encode_group` on the feedback-adjusted target.**
     Steps & exact design (scoped 2026-06-16):
-    - **Hessians:** native `collect_hessian` is a SCAFFOLD (panics) — use the
-      Tier-2 Python collector `scripts/collect_hessian.py` (torch CPU-only
-      here, so slow; offline tooling, Rule-1-OK). HFHS read by `hessian_io.rs`.
+    - **Hessians (superseded 2026-07-21):** use
+      `hipfire-coexistence calibrate` to write the canonical `.calib.hfq` with
+      Hessians, imatrices, provenance, and optional matched KLDREF in one native
+      layer-streamed pass. `scripts/depreciated/collect_hessian.py` is now only a parity
+      oracle; do not create new HFHS sidecars.
     - **CORRECTION (2026-06-16): `gptq.rs` + `hessian_io.rs` are ORPHANED** —
       never declared as modules (no `mod gptq;`), and `gptq.rs` uses `faer`
       which isn't a dependency, so they don't compile. NOT reusable infra as-is.
@@ -446,7 +567,16 @@ Papers + reference implementations vendored for Phases C/D:
   - **3-bit QTIP fallback (plan default):** make bits configurable, quantize
     qtip3-sim, PPL. Quick; modest bandwidth win vs MQ4.
   Then C2 decode kernel (only worth building once a bit-rate passes PPL).
-- **Phase D: clean-room CPU core LANDED (2026-06-16).** `hipfire-quantize/src/
+- **Phase D: ✅ SHIPPED as the default KV path (2026-07, supersedes the
+  2026-06-16 skip).** KVarN moved to its own crate `crates/hipfire-kvquant/`
+  with a GPU kvarn kernel (head_dim-512, `170443011`), selectable K bits 2/4/8
+  default 4 (`55af8e316`), 8-bit hot ring (`db7891bca`), and the hot/cold
+  hierarchical cache (`kv_hier.rs`). KVarN + hierarchical are the primary KV
+  systems; asym is the retained baseline. See the REALITY banner under
+  "## Phase D" and memory `project-hot-cold-hier-kv-impl` /
+  `project-kv-default-kvarn-hier`. The clean-room CPU-core note below is the
+  2026-06-16 origin point, kept as history.
+- **Phase D (origin, 2026-06-16): clean-room CPU core LANDED.** `hipfire-quantize/src/
   kvarn.rs` — log-domain Sinkhorn `variance_normalize` (imbalance 167→3.5,
   perfect=2.0) + per-channel 4-bit `quantize_tile`/`dequantize_tile`
   (`deq=(q*scale_abs+zp_abs)*s_col`, per-row Sinkhorn scale absorbed). Tests:
@@ -457,5 +587,10 @@ Papers + reference implementations vendored for Phases C/D:
   head_dim, share engine FWHT) + long-context coherence gate.
 - **Phase D (ref):** KVarN paper + repo in `./Quantization/` — algorithm ported
   clean-room; MLA tile layout (R=512 latent) intentionally NOT ported (GQA).
-- **Phase E: scoped + instrumented** — MTP perf (phase split measured; E1
-  GDN-tape replay, E2 compressed draft lm_head, E3 verify graph).
+- **Phase E: WINDING DOWN — MTP superseded by DFlash for qwen3.5 (2026-07-23).**
+  E1 (GDN-tape replay) and E2 (compressed draft lm_head) LANDED. E3 (MTP verify
+  graph) and E4 (tree MTP) SUPERSEDED — do not build (DFlash already owns
+  graph-capture and beats MTP at τ≈5.7 vs 1.66; tree drafting net-loses per
+  `78b96e6ce`). `generate_mtp` retained only as the no-DFlash-sidecar fallback.
+  See the REALITY banner under "## Phase E". Go-forward spec-decode effort =
+  DFlash or DSpark qwen35 integration, not MTP.

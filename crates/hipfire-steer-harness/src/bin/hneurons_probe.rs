@@ -825,7 +825,10 @@ async fn selfgen_split(
     // Generate every answer, then label.
     let sampling = GenerationSamplingPolicy {
         temperature: 0.0,
+        temperature_is_default: false,
         top_p: None,
+        top_p_is_default: false,
+        top_k: None,
         repeat_penalty: None,
         max_tokens,
     };
@@ -941,7 +944,10 @@ async fn run_sweep(
     );
     let sampling = GenerationSamplingPolicy {
         temperature: 0.0,
+        temperature_is_default: false,
         top_p: None,
+        top_p_is_default: false,
+        top_k: None,
         repeat_penalty: None,
         max_tokens,
     };

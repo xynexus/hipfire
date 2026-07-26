@@ -38,12 +38,12 @@ fn main() {
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
+    use hipfire_rdna::Gpu;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv::KvCache;
     use hipfire_runtime::sampler;
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
-    use hipfire_rdna::Gpu;
     use std::path::Path;
 
     let args: Vec<String> = std::env::args().collect();

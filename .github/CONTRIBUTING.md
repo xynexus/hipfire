@@ -46,6 +46,33 @@ fix-catalog walkthrough that an agent can apply on your behalf for
 common runtime issues; if it doesn't resolve cleanly, that's exactly
 the case we want filed.
 
+#### gfx1103 LDS reports
+
+The known Phoenix/gfx1103 multi-wave barrier/LDS-adjacent HIP-719 issue is
+treated on hipfire's maintained validation hosts with
+`amdgpu.cwsr_enable=0`, but the underlying gfx11 CWSR defect is not fixed
+upstream. Report any unusual LDS behavior—including a hang, HIP 719, MES
+timeout/reset, nondeterministic result, or parity drift—even when the process or
+GPU recovers.
+
+In addition to the normal bug-report fields above, include:
+
+```bash
+hipfire doctor --json
+cat /proc/cmdline
+cat /sys/module/amdgpu/parameters/cwsr_enable
+uname -r
+rocminfo | grep -m1 -A2 'Name:.*gfx'
+sudo dmesg | grep -E 'amdgpu|MES|GPU reset' | tail -200
+```
+
+Also provide the kernel name, launch dimensions, LDS byte count, repetition
+count, and whether a CPU-reference/parity check failed. Stop repeated stress
+testing after the first MES timeout or reset and preserve the first failure's
+logs. See the
+[gfx1103 investigation](../docs/plans/gfx1103-lds-hip719-investigation.md)
+for the known signature and validated workaround boundary.
+
 ---
 
 ## Developer workflow
@@ -106,7 +133,8 @@ files match the hotspot regex.
 
 ```bash
 ./tests/coherence-gate.sh             # AR coherence (panic / zero-tokens / timeout = hard fail)
-./tests/coherence-gate-dflash.sh      # spec-decode token-attractor detection
+./tests/tiny-affected-gate.sh --require-coverage  # automatic affected-model coverage
+./tests/coherence-gate-dflash.sh      # optional manual spec-decode diagnostic
 ./tests/speed-gate.sh --fast          # 4B prefill+decode regression vs tests/speed-baselines/<arch>.txt
 ```
 

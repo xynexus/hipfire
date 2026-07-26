@@ -11,9 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 hipfire-coherence = { path = "../hipfire-coherence" }
+hipfire-config = { path = "../hipfire-config" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
 hipfire-evidence = { path = "../hipfire-evidence" }
+hipfire-diffusion = { path = "../hipfire-diffusion" }
 # Host-profile collection (relocated out of this crate's lib.rs).
 hipfire-sysinfo = { path = "../hipfire-sysinfo" }
 hipfire-generate = { path = "../hipfire-generate" }
@@ -21,8 +23,15 @@ hipfire-hash = { path = "../hipfire-hash" }
 hipfire-model = { path = "../hipfire-model" }
 anyhow.workspace = true
 base64.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
 csv.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json = "1"
+# Read the NeedleChain HF dataset (parquet). default-features=false drops the
+# heavy arrow dep — we use the record reader. See memory
+# `project-parquet-crate-training-port`: hipfire-train's data loading should port
+# onto this crate too.
+parquet = { version = "54", default-features = false, features = ["snap", "zstd", "flate2"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }

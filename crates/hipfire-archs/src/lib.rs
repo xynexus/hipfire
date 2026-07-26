@@ -28,6 +28,12 @@ mod force_link {
     // nemotron, …), via the lean bundle.
     #[allow(unused_imports)]
     use hipfire_arch_specs as _;
+    // Serving-heavy factory registrations are kept out of the lean spec bundle,
+    // but must be force-linked into daemon/eval binaries through this aggregate.
+    #[allow(unused_imports)]
+    use hipfire_arch_gemma4 as _;
+    #[allow(unused_imports)]
+    use hipfire_arch_qwen2 as _;
     // The template's two halves (serving ToyModel + offline Ingest) on one id.
     #[allow(unused_imports)]
     use hipfire_arch_template as _;
@@ -44,9 +50,34 @@ pub fn registry() -> &'static ArchRegistry {
     REGISTRY.get_or_init(ArchRegistry::build)
 }
 
+/// True if `arch_id` (an on-disk `u32` header value) denotes a diffusion
+/// container: the legacy generic-diffusion marker
+/// ([`hipfire_arch_api::ARCH_ID_DIFFUSION_LEGACY`]) or any registered per-family
+/// diffusion arch (declares the `Diffusion` capability). Routing/detection uses
+/// this instead of a magic constant.
+pub fn is_diffusion_arch(arch_id: u32) -> bool {
+    arch_id == hipfire_arch_api::ARCH_ID_DIFFUSION_LEGACY
+        || u16::try_from(arch_id)
+            .ok()
+            .is_some_and(|id| registry().is_diffusion(ArchId(id)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_diffusion_arch_covers_legacy_and_per_family() {
+        assert!(is_diffusion_arch(
+            hipfire_arch_api::ARCH_ID_DIFFUSION_LEGACY
+        ));
+        assert!(is_diffusion_arch(hipfire_arch_api::ARCH_ID_KREA2));
+        assert!(is_diffusion_arch(hipfire_arch_api::ARCH_ID_QWEN_IMAGE));
+        assert!(is_diffusion_arch(hipfire_arch_api::ARCH_ID_FLUX2));
+        // A text LM arch is not diffusion.
+        assert!(!is_diffusion_arch(hipfire_arch_api::ARCH_ID_QWEN35_DENSE));
+        assert!(!is_diffusion_arch(999));
+    }
 
     #[test]
     fn bundle_merges_template_spec_and_serving() {
@@ -79,6 +110,18 @@ mod tests {
         assert!(llama.caps.ingest.is_some(), "llama declares Ingest");
     }
 
+    #[test]
+    fn serving_factory_bundle_has_two_consumers() {
+        let qwen2 = hipfire_runtime::arch::serving_factory(7)
+            .expect("unique qwen2 factory")
+            .expect("qwen2 factory linked");
+        let gemma4 = hipfire_runtime::arch::serving_factory(24)
+            .expect("unique Gemma 4 factory")
+            .expect("Gemma 4 factory linked");
+        assert_eq!(qwen2.family(), "qwen2");
+        assert_eq!(gemma4.family(), "gemma4");
+    }
+
     /// Completeness gate. Two invariants that hold today and guard migration:
     ///  1. no two archs claim the same id, and every arch has a family name;
     ///  2. a migration LEDGER — the exact set of ids on the capability layer.
@@ -107,10 +150,14 @@ mod tests {
         // it moves over; a mismatch means either a dropped registration or an
         // untracked addition. Ids: 0 llama, 1 qwen2/3, 5 qwen3.5, 6 qwen3.5-moe,
         // 8 dots-ocr, 9 deepseek4, 10 minimax, 11 lfm2, 12 gemma3, 13 gemma3-vl,
-        // 14 nemotron-h, 15 mamba2, 16 zaya, 0xFF template.
-        let expected: BTreeSet<u16> = [0, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0xFF]
-            .into_iter()
-            .collect();
+        // 14 nemotron-h, 15 mamba2, 16 zaya, 17 krea2 (diffusion),
+        // 18 qwen-image (diffusion), 19 embeddinggemma, 23 flux2 (diffusion),
+        // 24 gemma4, 25 cohere2-moe, 0xFF template.
+        let expected: BTreeSet<u16> = [
+            0, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23, 24, 25, 0xFF,
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
             unique, expected,
             "arch migration ledger drift — update the expected set as families \

@@ -265,7 +265,7 @@ Stage 2 (single pre-attention dispatch per layer).
 ## Inference Integration — Qwen3.5-0.8B SwiGLU NPU Bench
 
 - **Date**: 2026-06-14
-- **Model**: `qwen3.5-0.8b.mq4.hfq` (MQ4 quantized, 0.50 GiB HFQ payload)
+- **Model**: `qwen3.5-0.8b--mq4.hfq` (MQ4 quantized, 0.50 GiB HFQ payload)
 - **xclbin**: `qwen35-swiglu-3584.xclbin` (hidden_size=3584, intermediate FFN dim)
 - **Activation**: `HIPFIRE_QWEN35_FFN_BF16=xdna1 HIPFIRE_QWEN35_FFN_BF16_LAYER=all`
 - **Path**: `forward_scratch_layers` → `weight_gemv_swiglu_residual_bf16_probe` → xdna1
@@ -351,3 +351,1366 @@ Hardcoded `let use_graph = false;` at qwen35.rs:8331 (disabled 2026-05-15, token
 ### Takeaway
 
 The daemon already uses Q8 state by default. The 60.8 tok/s in the previous session was from `run.rs` which forced FP32 state. Real decode ceiling with current code: **~62 tok/s on gfx1103 MQ4**. Further gains require re-enabling hipGraph (needs bug investigation) or kernel-level optimization.
+
+## Branch integration history — `NpuKernel` API union (2026-07-06)
+
+When the local NPU line (R5–R15 + async dispatch) was rebased onto `chaingun`,
+it met a parallel NPU effort already upstream. Both had independently extended
+`NpuKernel` from the same base:
+
+- **upstream**: blocking `submit(-> u64)` / `wait(seq)`, `submit_synced`
+  (selective per-arg flush), `sync_output` (pipelined read-back cache reconcile),
+  `import_dmabuf`, multi-slot command-BO cache.
+- **local (kept)**: the async `NpuInFlight` owning-handle path for GPU∥NPU
+  overlap with scheduler correlation tags.
+
+Both were kept (union, nothing dropped). The only clash was the `submit`/`wait`
+names, resolved by renaming the async pair to **`submit_inflight` /
+`wait_inflight`** (`submit_tagged` / `poll` / `NpuInFlight` unchanged). The sole
+async caller is `examples/async_smoke.rs`.
+
+**Bisect note:** the reconciliation landed as a separate tip commit (`merge-fix(npu):
+unify local async NpuKernel API …`), so the three commits that introduce/inherit
+the async API before it — `feat(npu): async NPU dispatch split …` through
+`refactor(rdna): single-source kernarg lists …` — do **not** individually compile
+(duplicate `submit`/`wait` in `hipfire-xdna`). This is inherent to the divergent
+rebase; the branch tip is green. `git bisect skip` that span when bisecting a
+`hipfire-xdna` build across it.
+
+---
+
+## XDNA2 memory hierarchy and MALL characterization (2026-07-12)
+
+The full 297-chapter local UG1079 manual was audited and the R1 feed probe was
+extended across working-set sizes and CPU/GPU contention controls.
+
+Headline results on Strix Halo:
+
+- 14.4 GB/s active per receive stream;
+- about 56.5 GB/s aggregate across eight columns;
+- no throughput knee from 64 KiB through 64 MiB, including the 2 MiB and 32 MiB
+  capacities reported by `rocminfo` for the DSP agent;
+- 56.35 GB/s for one region shared by eight columns versus 55.65 GB/s for eight
+  distinct regions;
+- 43.04 GB/s under CPU DRAM pressure, 18.21 GB/s under a 512 MiB GPU stream, but
+  no degradation under GPU hot-copy sets totaling 16 or 32 MiB.
+
+The current amdxdna SHMEM path has no observed usable access to GPU MALL. The
+resident EmbeddingGemma attention and FFN phases also achieve only about 0.9
+GB/s against this 56.5-GB/s feed roof, so their current 9-14 ms phase costs are
+not explained by global memory saturation.
+
+See
+[`npu-memory-bandwidth-cache-characterization.md`](npu-memory-bandwidth-cache-characterization.md)
+for methods, limitations, manual references, roofline calculations, raw-result
+links, and the qualified MALL conclusion.
+
+## EmbeddingGemma bandwidth-first packed-W4 ladder (2026-07-12)
+
+The projection-weight path now converts tensor-block order once in the loader
+and persists a versioned, source/payload-SHA-validated `.rdna2.hfp` artifact.
+W4 stays nibble-packed through external and memory-tile DMA; the AIE core owns
+only representation-local nibble/lane handling. The real layer-0 combined QKV
+payload is 2,359,296 bytes across eight columns.
+
+Trace-timed medians from three locked trials per accumulated mode:
+
+| mode | wire GB/s | useful TOPS | key evidence |
+|---|---:|---:|---|
+| packed feed only | 56.173 | — | same real HFP/topology control |
+| signed nibble decode | 56.061 | — | lane-sum + byte-exact vector parity |
+| first MMUL per W tile | 55.933 | 2.685 | exact int32 MMUL parity |
+| production 6x16 K-group compute | 39.919 | 11.497 | exact parity; 57.45% receive stalls |
+
+Decode retains 99.80% of the feed-only roof, and the first MMUL retains 99.77%
+of decode. The 6x16 stage deliberately increases arithmetic work 6x: feed
+retention falls to 71.37%, but useful TOPS rises 4.28x and receive stalls
+identify compute backpressure. This is an explained roofline transition, not a
+memory-system regression. Scaling, distinct output placement, end-to-end
+projection integration, tok/s, and tok/J remain open.
+
+Production scale/output correctness subsequently passed on the real packed
+layer-0 QKV artifact: 327,680 outputs, zero mismatches, `max_abs=2e-7`. The
+0.8635-ms wrapper timing includes CPU activation packing, NPU dispatch/sync, and
+output deblocking, so it is not comparable to the trace-derived table and does
+not establish model tok/s.
+
+On 2026-07-13 the same checksummed offline-layout contract was extended to the
+full-K slab schedule used by compact mixed Opus. A 26-case locked hardware
+matrix passed W4, W8, and mixed `qt=36` across plain/`+`/`++`, overlay counts
+1/3/7/39, and N=256/768/1152/1280/2304 with zero mismatches. W4/W8 maximum
+absolute error was 2e-7; direct mixed full-K matched exactly. An OQ6.5 cache-hit
+run preserved mtime, size, and SHA. This proves generic HFP projection
+correctness and offline layout reuse, not resident-layer integration or model
+tok/s. Rows:
+`benchmarks/npu_gemm_tuning/results/r58-opus-hfp-format-matrix-20260713.csv`.
+
+R59 then validated the packed-resident argument boundary. Because the DPU
+regmap has five data-argument slots, final R34/R35 kernels require one offline
+HFP bundle per destination context rather than separate projection and
+parameter BOs. A generic `ResidentContextBundleV1` now preserves each role's
+block order and records segment lengths plus source/payload hashes.
+
+Locked three-trial medians were 56.121/56.053 GB/s for the R34/R35 separate-BO
+controls and 55.884/56.018 GB/s for their production-shaped bundles. Both
+bundles retain at least 99.48% of R58 feed-only with zero receive stalls; all role and
+4-KiB parameter guards pass. This proves the weight ABI/DMA seam only, not R34
+compute, resident-layer correctness, or model tok/s. Rows:
+`benchmarks/npu_gemm_tuning/results/r59-resident-weight-abi-20260713.csv`.
+
+Implementation and raw rows:
+
+- `benchmarks/npu_gemm_tuning/r58/`
+- `benchmarks/npu_gemm_tuning/results/r58-nibble-decode-20260712.csv`
+
+R60 moves the same method into the actual R34 destination-context ABI. It
+consumes the unchanged shared activation argument and the bundled QKV/O/params
+HFP together. Locked three-trial medians are 53.838 GB/s for one exact MMUL,
+54.252 GB/s for a complete K=256 group, and 50.912 GB/s for all three groups
+plus real activation/weight scaling. These retain 96.34%, 97.08%, and 91.10%
+of R59's 55.884-GB/s bundled baseline. All eight-column output checks pass;
+the scaled stage covers the first 4x16 QKV output tile and shows about 9.9%
+receive stalls. It remains a partial projection result, not model tok/s.
+
+- `benchmarks/npu_gemm_tuning/r60/`
+- `benchmarks/npu_gemm_tuning/results/r60-first-shared-input-mmul-20260713.csv`
+
+R61 completes the corresponding QKV projection and direct row-major output.
+All 327,680 M256/N1280 values and padded cells pass at `max_abs=3.8147e-6`.
+The result is not performance-admitted: final median NPU time is 4.114 ms
+(0.122 useful TOPS), about 4.8x slower than the 0.8635-ms whole-scaled control.
+Native vector interleave reduced a 6.870-ms scalar version to 4.238 ms, but a
+tile-local 6-KiB transformed activation cache did not improve the median. This
+initially implicated legacy R34 activation compatibility, but R62/R63 later
+falsified that conclusion: the apparent gap was dominated by comparing a cold
+Python raw-runtime command with a warmed production wrapper.
+
+- `benchmarks/npu_gemm_tuning/r61/`
+- `benchmarks/npu_gemm_tuning/results/r61-full-qkv-rowmajor-20260713.csv`
+
+R62 supplies producer-native W4 activations and preserves complete parity, but
+only moves the cold raw-runtime median to 3.850 ms (row-major) or 3.856 ms
+(physical output and canonical R15 loop). R63 makes the MLIR identical to R15
+and uses the compact 2,359,296-byte QKV `.rdna2.hfp`; its cold raw median is
+still 3.964 ms. In contrast, the production Rust/C++ wrapper measures current
+R63 at 1.0292 ms median, the old spill binary at 1.0288 ms, and the historical
+cache at 1.0596 ms. All nine production-wrapper runs pass 327,680 outputs with
+`max_abs=2e-7`.
+
+This admits the compact offline HFP plus current production executor for the
+next resident-integration step. It does not admit the Python cold-command
+number as a kernel ceiling or imply model tok/s.
+
+- `benchmarks/npu_gemm_tuning/r62/`
+- `benchmarks/npu_gemm_tuning/r63/`
+- `benchmarks/npu_gemm_tuning/results/r63-production-wrapper-ab-20260713.csv`
+
+R64 traces that exact R63/R15 device graph without changing its existing core,
+FIFO, or DMA operations. Twelve locked fresh-process rows across shim columns
+0-3 pass all 327,680 outputs with `max_abs=3.8147e-6`. Median device
+input-to-output span is 241.248 us (240.189-243.356 us), effective aggregate
+traffic is 19.559 GB/s, output-DMA starvation is 198.240 us, and padded/useful
+compute rates are 2.817/2.086 TOPS. Columns 4-7 lack a terminal S2MM event at
+trace stop and are not used for timing.
+
+The traced device span is about 23.4% of the 1.0292-ms warm production-wrapper
+time. The approximately 788-us remainder includes preparation, submission,
+synchronization, and f32 output deblocking and is not assigned to one component
+without further evidence. The next bandwidth-first step is a shared-BO mutable
+BF16 attention-layout handoff, while immutable block conversion stays in the
+loader/on-disk `.rdna2.hfp` path.
+
+- `benchmarks/npu_gemm_tuning/r64/`
+- `benchmarks/npu_gemm_tuning/results/r64-full-qkv-shim-trace-20260713.csv`
+
+R65 replaces the physical f32 return with the exact BF16 raw-attention staging
+prefix used by R29. The compact W4 HFP, activation ABI, and R15 compute are
+unchanged. Three locked warmed fresh-process runs pass all 327,680 BF16 values
+bit-for-bit, preserve every preseeded cos/sin/norm byte, and leave all padding
+records zero. Median NPU time is 0.487964 ms (0.485649-0.490328), median host
+call is 0.551481 ms, useful projection rate is 1.0315 TOPS, and maximum linked
+core text is 9,280 bytes.
+
+This measures projection through mutable BF16 staging, not headnorm/RoPE or
+attention. R66 must attach the existing R29 packers and verify the 393,216-byte
+Q and 262,144-byte KV layouts before the stage is admitted as a complete
+attention handoff.
+
+- `benchmarks/npu_gemm_tuning/r65/`
+- `benchmarks/npu_gemm_tuning/results/r65-w4-bf16-raw-attention-20260713.csv`
+
+R66 consumes the exact R65 inline records and emits canonical packed Q/KV.
+Correctness matches the R28 gate: Q cosine 0.99999121/max error 0.0078125, K
+cosine 0.99999156/max error 0.0078125, and bit-exact V. Three fresh locked
+100-command runs measure 0.9511, 0.9915, and 0.9984 ms (median 0.9915 ms).
+
+The schedule is not admitted. Its record broadcast serializes four core-pair
+packers; R28's joined input executes them concurrently and is substantially
+faster. R67 must recover the joined mutable layout before this handoff enters
+the resident layer.
+
+- `benchmarks/npu_gemm_tuning/r66/`
+- `benchmarks/npu_gemm_tuning/results/r66-r65-stage-to-qkv-20260713.csv`
+
+R67 changes mutable staging to 36 joined 8-KiB records per role, allowing the
+R28 split FIFO to run all four packer pairs concurrently. Projection remains
+bit-exact across 327,680 BF16 values and preserves every preseeded tail byte.
+Three warmed runs measure 0.725232, 0.751200, and 1.152343 ms (median 0.751200
+ms). Pack runs measure 0.3517, 0.3670, and 0.3687 ms (median 0.3670 ms) with the
+established Q/K/V oracle.
+
+Sequential medians are about 1.1182 ms before attention. This is faster than
+R65+R66 but still dominated by approximately 360 small projection-output DMA
+tasks; R68 targets a threefold task-count reduction without changing immutable
+HFP order or pack math.
+
+- `benchmarks/npu_gemm_tuning/r67/`
+- `benchmarks/npu_gemm_tuning/results/r67-w4-joined-stage-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r67-joined-stage-to-qkv-20260713.csv`
+
+R68 uses overlapping padded 24-token writes to cut the joined-stage producer's
+output task count roughly threefold. Projection remains bit-exact and measures
+0.465281, 0.494605, and 1.067005 ms (median 0.494605 ms). Pack measures 0.3435,
+0.3579, and 0.3627 ms (median 0.3579 ms) with unchanged Q/K/V parity.
+Sequential medians total about 0.8525 ms before attention.
+
+R69 must verify a real shared-BO two-context chain; the isolated timing sum is
+not yet a resident-layer measurement.
+
+- `benchmarks/npu_gemm_tuning/r68/`
+- `benchmarks/npu_gemm_tuning/results/r68-w4-overlap-joined-stage-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r68-overlap-joined-stage-to-qkv-20260713.csv`
+
+R69 rejects the two-context boundary. Independent dma-buf imports are
+incoherent, native XDNA SHMEM PRIME export returns `EINVAL`, and the direct
+single-GEM-handle path is intermittent. Passing shared-handle runs take
+5.45-5.66 ms; context scheduling, not the 0.03-ms BO sync, dominates.
+
+R70 keeps projection and pack in one graph. Its two-channel, role-specialized
+build matches the isolated R65 stage and R66 Q/KV byte-for-byte in three fresh
+primed 100-command runs. Times are 1.3076, 1.3108, and 1.3006 ms (median 1.3076
+ms), with maximum core text of 13,504 bytes. This proves the single-context
+native-W4 projection/pack seam only; attention and full-model throughput remain
+open.
+
+- `benchmarks/npu_gemm_tuning/r69/`
+- `benchmarks/npu_gemm_tuning/r70/`
+- `benchmarks/npu_gemm_tuning/results/r69-cross-context-shared-qkv-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r70-single-context-projection-pack-20260713.csv`
+
+R71 proves the complete projection/pack/attention boundary in one context, but
+does not pass the speed gate. Moving all Q/V pack ownership to columns 0-3
+leaves columns 4-7 for attention and fits at 15,888 bytes maximum core text.
+The isolated R70 stage, Q, KV, and R27 attention outputs all match byte-for-byte.
+Three primed 100-command runs measure 3.5951, 3.2617, and 3.3118 ms (median
+3.3118 ms). Its redistributed pack-only control is 1.5446 ms median and isolated
+attention is 0.9141 ms, so the fused attention/feed phase still costs about
+1.77 ms. Attempts to split input/output shim columns exceed memory-tile input
+DMA channels. Resident integration waits for a graph-local Q/KV stream or an
+equivalent existing-channel reuse that preserves the exact result.
+
+- `benchmarks/npu_gemm_tuning/r71/`
+- `benchmarks/npu_gemm_tuning/results/r71-single-context-projection-pack-attention-20260713.csv`
+
+R72 proves that Q can remain graph-local, but rejects scalar core streams as
+the handoff. The external Q BO is unused while projection stage, external KV,
+and final attention remain byte-exact. The fitting graph reuses 24 KiB of
+projection-accumulator storage as the query cache and links at 15,248 bytes
+maximum core text. Three primed 100-command runs measure 3.9288, 3.7749, and
+3.9272 ms (median 3.9272 ms), 18.6% slower than R71. Removing 393,216 bytes of
+external Q traffic does not repay per-word stream synchronization and cache
+pressure. K/V should not use this scalar topology; the next handoff must retain
+burst/vector DMA or reuse an existing graph FIFO.
+
+- `benchmarks/npu_gemm_tuning/r72/`
+- `benchmarks/npu_gemm_tuning/results/r72-direct-q-stream-20260713.csv`
+
+R73 replaces scalar Q words with one adjacent-core, depth-one 24-KiB
+ObjectFIFO. The Q BO remains unused and projection stage, external KV, and
+attention are byte-exact. The producer-local precursor exceeded the 16-KiB
+program limit; the adjacent topology fits with a 2-KiB producer stack and
+14,912/14,352-byte maximum producer/consumer core text.
+
+Three primed 100-command runs measure 3.6449, 3.7165, and 3.7205 ms (median
+3.7165 ms). This recovers 5.4% from scalar R72 but remains 12.2% slower than
+R71, so the serial six-group handoff is rejected. Shared tile memory itself is
+not implicated as a correctness restriction: the added kernel parameter is the
+workaround that stops the platform issue and must remain enabled. Local-memory
+use is a separate capacity/performance choice; it does not replace that
+workaround.
+
+- `benchmarks/npu_gemm_tuning/r73/`
+- `benchmarks/npu_gemm_tuning/results/r73-adjacent-q-objectfifo-20260713.csv`
+
+R74 keeps two query groups and four accumulator/stat sets live per attention
+core, reducing full 262-KiB KV replays from six to three while preserving the
+observable R71 Q/KV boundary. A 4-KiB stack exceeds the 64-KiB active-tile
+allocation by 1,184 bytes; the measured 2-KiB setting fits at 64,672 bytes with
+864 bytes spare. Maximum core text is 15,248 bytes.
+
+Projection stage, Q, KV, and attention remain byte-exact. Three primed
+100-command runs measure 3.4496, 3.4242, and 3.2867 ms (median 3.4242 ms), 3.4%
+slower than R71. Halving KV replay and DMA tasks does not repay the extra live
+state, so this topology is rejected. The next rung targets phase scheduling or
+core utilization rather than more tile-resident attention state. The added
+kernel parameter remains the separate correctness workaround.
+
+- `benchmarks/npu_gemm_tuning/r74/`
+- `benchmarks/npu_gemm_tuning/results/r74-qgroup2-kv-replay-20260713.csv`
+
+R75 changes only task scheduling: two groups' ordered Q, KV, and output tasks
+are started before await/free, reducing six group barriers to three. A
+six-group window exhausts static BD IDs at group 4; a four-group image links but
+fails Q parity with 392,405 of 393,216 bytes wrong.
+
+The two-group window is byte-exact. Three primed 100-command runs measure
+3.2580, 3.2775, and 3.3314 ms (median 3.2775 ms), 1.0% faster than R71. Because
+kernels, tile buffers, traffic, and math are unchanged, R75 is admitted as a
+small command-stream scheduling win and the next projection/pack/attention
+baseline.
+
+- `benchmarks/npu_gemm_tuning/r75/`
+- `benchmarks/npu_gemm_tuning/results/r75-attention-window2-20260713.csv`
+
+R76 increases the correct task window from two groups to three. Projection
+stage, Q, KV, and attention remain byte-exact. Three primed 100-command runs
+measure 3.4199, 3.2222, and 3.2604 ms (median 3.2604 ms), 0.52% faster than R75
+and 1.55% faster than R71. Three is the maximum correct queue window: four
+corrupts Q and six exhausts static BD IDs. R76 is the admitted schedule for
+resident-weight integration.
+
+- `benchmarks/npu_gemm_tuning/r76/`
+- `benchmarks/npu_gemm_tuning/results/r76-attention-window3-20260713.csv`
+
+R77 consumes the real layer-0 QKV `.rdna2.hfp` through the production
+`NpuEmbeddingQkvAttentionOpus` executor. It validates the HFP descriptor,
+length, and payload SHA-256, allocates the compact weight BO in the destination
+R76 context, uploads once, and reuses it across dispatches. No extracted weight
+payload is used by the fused path.
+
+Projection stage, Q, KV, and attention remain byte-exact. Three primed
+100-command runs measure 3.2753, 3.3165, and 3.2137 ms (median 3.2753 ms),
+within 0.46% of raw R76. This admits resident QKV/attention weights only; O
+projection, tails, FFN, full-model tokens/s, and package tokens/J remain open.
+
+- `benchmarks/npu_gemm_tuning/r77/`
+- `benchmarks/npu_gemm_tuning/results/r77-resident-hfp-r76-20260713.csv`
+
+R78 moves attention to odd columns and external Q/K/V packing to adjacent even
+columns as a direct-output topology control. Projection stage, Q, KV, and
+attention remain byte-exact; odd cores fit at 15,888 bytes. Three primed
+100-command runs measure 3.8331, 3.7729, and 3.7959 ms (median 3.7959 ms), 16.4%
+slower than R76, so the remap is rejected as a schedule.
+
+Even cores still carry compact-W4 projection and pack code, leaving
+insufficient program space for R32 output projection. The next capacity rung
+requires loader-created pair-major compact-W4 HFP weights and paired projection
+on odd cores so even cores can specialize in K/V, O projection, and tails.
+
+- `benchmarks/npu_gemm_tuning/r78/`
+- `benchmarks/npu_gemm_tuning/results/r78-odd-attention-remap-20260713.csv`
+
+R79 adds the offline `PairedWholeScaledV1` layout needed for compact paired
+projection. The loader moves complete schedule blocks from `(column, block)`
+to `(pair, block, lane)` order, preserving every encoded byte. Cache identity,
+source payload metadata, exact ordering, full block coverage, and reuse are
+unit-tested. This is a loader/layout checkpoint only; no NPU timing or kernel
+correctness is claimed.
+
+- `benchmarks/npu_gemm_tuning/r79/`
+
+R80 consumes the paired HFP with two accumulators per odd core and no even-core
+projection image. After rejecting a six-task output queue that timed out, the
+R65 per-slice cadence matches all 327,680 BF16 outputs bit-for-bit and preserves
+all tail/padding guards. Three warm process medians are 0.818433, 0.833471, and
+0.789289 ms (median 0.818433 ms). Maximum odd-core text is 11,872 bytes; even
+cores are free. R80 is a capacity admission, not a speed win.
+
+- `benchmarks/npu_gemm_tuning/r80/`
+- `benchmarks/npu_gemm_tuning/results/r80-paired-w4-projection-20260713.csv`
+
+R81 adds external Q/K/V packing to the paired projection and remains exact.
+Three 100-command runs have a 1.8370-ms median; maximum odd/even text is
+14,032/10,912 bytes. It is capacity-admitted but 40.5% slower than R70.
+
+R82 then adds attention and fails before hardware execution: odd columns 1/3
+need 22,416 bytes, 6,032 over the physical program store. The overflow is
+program text, not tile SRAM, and carries no correctness or speed claim.
+
+R83 uses the exact R70 single-group projection ABI plus non-LTO attention and
+finish trip-count helpers. It packages at 15,888/10,912 bytes maximum odd/even
+text and passes stage, Q, KV, and attention byte-for-byte. Three fresh
+100-command runs measure 4.1666, 4.0493, and 4.0535 ms (median 4.0535 ms).
+This is the first fitting paired projection/pack/attention capacity image, but
+it is slower than R78 and R76 and is not the speed baseline. The separate
+kernel parameter remains the correctness workaround; LDS avoidance is not.
+
+- `benchmarks/npu_gemm_tuning/r81/`
+- `benchmarks/npu_gemm_tuning/r82/`
+- `benchmarks/npu_gemm_tuning/r83/`
+- `benchmarks/npu_gemm_tuning/results/r81-paired-w4-projection-pack-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r82-program-capacity-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r83-compact-paired-projection-pack-attention-20260713.csv`
+
+R84-R86 add direct O projection and isolate its cost. R85's activation-reuse
+kernel is the admitted compute baseline at 5.7945 ms; R86 regresses. R87's
+depth-two shim-to-memory-tile O-weight FIFO improves the median to 5.7450 ms,
+while R88 depth three is saturated and rejected at 5.7343 ms.
+
+R89 reuses 8 KiB of the final dead 10 KiB activation FIFO object on each even
+core and adds a 4 KiB tail to stage three block-aligned 8x256 BF16 tiles. The corrected DMA-only
+scatter uses `active_column * 32 + core_row * 8`. Stage and KV are bit-exact;
+O reaches 0.99999225 cosine and 0.0625 maximum absolute error. Three fresh
+100-command runs have a 5.7202-ms median. This admits local tail storage, not
+residual/norm or end-to-end model execution. Maximum even-core program text is
+14,544 bytes. The existing
+kernel parameter remains the correctness workaround; LDS avoidance is not.
+
+R90 adds post-attention RMSNorm, residual addition, and pre-FFN RMSNorm without
+an external tensor round trip. A Q-pack loop rewrite fit but failed the output
+oracle and is rejected. Making only the existing 18-record projection-drain
+bound runtime-stable preserves all 12 Q-pack calls and fits at 15,952/16,048
+bytes maximum even/odd text. Stage and KV remain bit-exact. The 196,608-value
+tail has 0.99995399 global cosine, 0.99994058 minimum row cosine, 0.09375
+maximum error, and no zeros or non-finite values. Three fresh 100-command runs
+measure 6.6044, 6.2915, and 6.3890 ms (median 6.3890 ms). Admit this as the
+local residual/norm correctness boundary and feed it directly into FFN next;
+it is not yet a full-layer or speed admission.
+
+R91 moves the complete stage ABI forward by one 393,216-byte canonical BF16
+tensor and writes normalized H at offset zero. The shift is required because a
+literal prefix overwrite destroys 65,536 bytes of immutable pack state that
+projection does not regenerate on the next command. Both SHMEM and PRIME/GTT
+controls pass sustained tail and KV oracles. The zero-copy resident R35 FFN
+reaches 0.99989925 cosine and 0.0118408 maximum error. Producer/FFN/alternating
+chain medians are 6.3727/9.7654/22.1772 ms; 6.0391 ms (27.2%) is context
+alternation. This is 11,543 M256 rows/s for one layer boundary, not end-to-end
+model tokens/s. The data contract is admitted; the cadence is rejected.
+
+R92 loads the same R91/R35 images as peer contexts sharing one DRM file and
+device heap. PRIME-exporting producer-owned XDNA SHMEM is rejected with
+`EINVAL`, so the physical handoff remains GTT. Correctness is unchanged, while
+producer/FFN/chain medians are 6.4109/9.7080/22.1542 ms. The 6.0353-ms context
+tax is unchanged from R91. Same-DRM ownership is rejected; optimize the native
+FFN bandwidth/compute phase or graph partition instead.
+
+R93 establishes the exact native W4 FFN activation boundary. Canonical
+M256xK768 BF16 pre-FFN state is transformed on AIE2P into R25's 108x6,656-byte
+input layout with zero int8 mismatches across 589,824 replicated values,
+`7e-9` maximum scale error, and clean padding. Core text is 7,856-9,040 bytes.
+Three fresh 100-command runs measure 4.0618, 4.1218, and 4.1117 ms (median
+4.1117 ms), only 0.263 GiB/s of physical source-plus-output traffic. The byte
+contract is admitted, while a separate producer context is rejected; the next
+rung must overlap preparation with the first gate/up weight-DMA/compute phase
+and avoid materializing replicas externally. The kernel parameter remains the
+platform workaround; this result imposes no LDS-avoidance rule.
+
+- `benchmarks/npu_gemm_tuning/r84/`
+- `benchmarks/npu_gemm_tuning/r85/`
+- `benchmarks/npu_gemm_tuning/r86/`
+- `benchmarks/npu_gemm_tuning/r87/`
+- `benchmarks/npu_gemm_tuning/r88/`
+- `benchmarks/npu_gemm_tuning/r89/`
+- `benchmarks/npu_gemm_tuning/r90/`
+- `benchmarks/npu_gemm_tuning/r91/`
+- `benchmarks/npu_gemm_tuning/r92/`
+- `benchmarks/npu_gemm_tuning/r93/`
+- `benchmarks/npu_gemm_tuning/results/r87-output-weight-shim-depth2-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r88-output-weight-shim-depth3-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r89-bf16-local-o-stage-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r90-residual-norm-tail-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r91-zero-copy-ffn-handoff-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r92-peer-context-control-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r93-bf16-to-r25-activation-20260713.csv`
+
+R94 vectorizes the admitted activation transform and retains the R25 ABI with
+three one-code q differences, `7e-9` maximum scale error, and clean padding.
+Its 2.1320-ms fresh-process median is 48.1% below R93 but still only 0.507
+GiB/s, so it is a fusion building block rather than a standalone phase.
+
+R95 and R96 recover program capacity without changing the full-FFN oracle.
+The dynamic W4 init/accumulate body reduces maximum core text from 16,320 to
+13,968 bytes; the compact down-fragment ring reduces it again to 12,944 bytes.
+
+R97 proves canonical-BF16 input DMA, all weight objects, and the complete
+256-row activation preparation boundary. Groups 1-2 have zero q mismatches;
+group 0 has one one-code difference, with only float-rounding scale differences.
+The first fused image contained NaNs because its gate fragment exchange
+overwrote R25's still-live partial down spill in the shared `own`/`transit`
+buffers. Giving gate preparation two dedicated 784-byte buffers fixes that
+kernel state-lifetime alias. The full oracle then reaches gate cosine
+`1.00000000`, final cosine `0.99998228`, maximum absolute error `0.2597733`, and
+mean absolute error `0.03750710` at 15,456 bytes maximum core text. A fresh
+6.4095-ms dispatch corresponds to 39,941 M256 rows/s. R97 already inherits
+R15's required `rounding=floor` and `saturation=none` numerical controls. A
+20-command run nevertheless reaches the separate four-second command timeout
+cadence. Recycling the context every seven commands is a sufficient independent
+mitigation: three 100-command runs preserve the full oracle at 6.4974, 6.4844,
+and 6.3388 ms (median 6.4844 ms, 39,479 M256 rows/s). This admits sustained
+standalone R97, not complete-layer or end-to-end encoder throughput.
+
+The separately added kernel parameter remains the platform-issue workaround;
+it is not LDS avoidance and is not the R15 rounding/saturation configuration.
+R97's buffer separation is an independent kernel correctness fix. The command timeout,
+tile-memory use, capacity refactors, fresh command objects, and context
+recycling remain separate issues or choices.
+
+R98-R100 establish the native-W4 output/tail seam. R98 emits compensated BF16
+high/low pairs in place at unchanged physical byte volume, fits at 16,032 bytes,
+and sustains 38,886 M256 rows/s. R99 scatters the same 884,736 bytes into the
+resident tail's existing 1,327,104-byte combined-row BO and sustains 38,788
+rows/s. R100 consumes that interleaved prefix with split architectural X and
+passes at `0.99999861` cosine and `0.0039062` maximum error. Host-written
+split-X verification now explicitly flushes both combined and residual BOs;
+the production NPU-to-NPU path does not add that host synchronization.
+
+- `benchmarks/npu_gemm_tuning/r94/`
+- `benchmarks/npu_gemm_tuning/r95/`
+- `benchmarks/npu_gemm_tuning/r96/`
+- `benchmarks/npu_gemm_tuning/r97/`
+- `benchmarks/npu_gemm_tuning/r98/`
+- `benchmarks/npu_gemm_tuning/r99/`
+- `benchmarks/npu_gemm_tuning/r100/`
+- `benchmarks/npu_gemm_tuning/results/r94-vector-activation-prep-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r95-dynamic-w4-capacity-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r96-compact-fragment-ring-capacity-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r97-inline-canonical-gate-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r98-interleaved-bf16x2-output-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r99-combined-row-scatter-20260713.csv`
+- `benchmarks/npu_gemm_tuning/results/r100-interleaved-tail-20260713.csv`
+
+R99/R100 are now wired into the reusable native-W4 completed-layer path. A
+layer-0 hardware comparison reports FFN cosine `0.99997024`, tail cosine
+`0.99999873`, and completed-layer cosine `0.99998514`. The integration must
+preserve direct architectural X in a separate 442,368-byte shared BO because
+the temporary host normalization bridge rewrites the attention hidden buffer
+with pre-FFN-normalized H. Reusing that buffer for both roles produced the
+rejected `0.90738614` tail cosine.
+
+The resident-only 24-layer OQ4 path completes at M256, measuring 878.003 ms or
+291.6 input tok/s in the current bridge implementation. This is a functional
+checkpoint, not an admitted performance result: host readback, normalization,
+and preparation/output still consume about 10-12 ms per layer. R15's
+`rounding=floor` and `saturation=none` remain numerical controls. The separately
+added kernel parameter remains the platform-issue workaround; this integration
+does not replace it with an LDS-avoidance rule.
+
+R101-R103 reject three attempted host-bridge removals without weakening that
+functional checkpoint. The literal R101 row-state relay reaches 16,444 bytes;
+a compact shim-DMA scatter fits at 16,380 bytes but produces misaddressed
+inverse RMS state and only 0.50248530 layer-0 cosine. Relocating the metadata
+object to the even normalized-X FIFO fits at 16,268 bytes but reaches the
+separate four-second command timeout and produces invalid state. R102 becomes
+allocation-clean at 16,064 bytes after reducing its 15,872-byte weight FIFO to
+depth one, but cannot be admitted without a correct producer. The first R104
+implementation recomputed RMS inside the FFN but overflowed at 18,352 bytes
+(`-Oz`: 20,032 bytes).
+
+These are program-capacity, DMA-layout, and scheduling failures. They do not
+implicate LDS or replace the separately added platform-workaround kernel
+parameter. R15's `rounding=floor` plus `saturation=none` remain independent
+numerical controls. The next bandwidth-first rung keeps R44's
+known-good direct-X output and R99/R100's correct W4/tail seam, then performs
+only the mutable X-times-inverse activation preparation on device. It must
+preserve X for R100, fold immutable pre-FFN norm into loader-side W4 scaling,
+and beat the current two 5.1-MiB host synchronizations before integration.
+
+R105/R106 implements that boundary as a separate device context and proves
+correctness, but rejects the topology for performance. Standalone R105 reaches
+cosine `0.99999122` at a 0.1295-ms median. Integrated layer 0 reaches unit-RMS,
+FFN, tail, and completed-layer cosines of `0.99999269`, `0.99990930`,
+`0.99999862`, and `0.99996179`. Across all 24 layers, however, explicit
+cross-context cache maintenance raises the R105 phase to 2.35-4.14 ms per layer
+and regresses execution from 878.003 ms / 291.6 tok/s to 901.432 ms / 284.0
+tok/s (about 21 W and 13.5 tok/J). Runtime selection therefore requires
+`HIPFIRE_EMBED_UNIT_RMS_BRIDGE=1`; at this checkpoint R99/R100 remains the
+default while RMS is compacted into the resident W4 context.
+
+R104 now completes that compaction. Source-level vector mean scaling, inverse
+fusion, one runtime-stride FWHT body, and a full `3 x 768` BF16 object per core
+bring every core to exactly 16,384 bytes under the normal `-O2` aiecc flow. The
+full object is transferred once (442,368 bytes total), scanned once for RMS,
+and reused by group. Standalone correctness is `1.00000000` gate cosine and
+`0.99996707` final cosine; 100 recycled commands sustain the same oracle at
+6.5401 ms. Default layer-0 integration reaches `0.99991494` FFN,
+`0.99999844` tail, and `0.99996658` completed-layer cosine.
+
+Paired full-model controls measure R99 at 892.708/909.986 ms and R104 at
+859.599/869.015 ms, a 4.1% paired-mean latency reduction. A fresh default R104
+run completes all 24 layers in 894.222 ms (286.3 input tok/s, 18.07 W,
+15.8 tok/J). R104 is therefore admitted as the default native-W4 resident FFN
+when its artifact exists. The next dominant boundary remains the distinct
+next-layer/residual preparation contexts at roughly 9-12 ms per layer. The
+added kernel parameter remains the platform workaround; no LDS-avoidance rule
+is inferred from this result.
+
+R108/R109 remove the next separate residual-copy context. The rejected R107
+fusion exceeded memory-tile DMA channels; a six-argument R108 exceeded the DPU
+register map; and importing one BO twice in R109 returned `EALREADY`. The
+admitted layout keeps completed BF16x2 in an 884,736-byte prefix and R34
+activation records in a disjoint suffix of one shared five-argument attention
+BO. R109 prepares the suffix in place, while R108 feeds the existing attention
+residual FIFO from the rounded high BF16 plane.
+
+Layer-0 FFN/tail/completed cosines are `0.99991644`, `0.99999886`, and
+`0.99996836`. Preparation drops from about 9-12 ms to 7-9 ms per layer.
+Alternating full-model controls average 815.294 ms for R48 and 804.722 ms for
+R108/R109, a 1.30% latency win. Energy samples are inconclusive and are not an
+admission claim. The kernel-parameter workaround and LDS placement remain
+independent.
+
+R110 refreshes format-generic execution on that path. Native OQ8, calibrated
+OQ8+, freshly generated OQ8++, and compact mixed OQ6.5 all pass the locked M256
+layer-0 component oracle; completed-layer cosine spans `0.99996270-0.99997103`.
+The OQ8++ offline package reports 168/168 successful LDLQ projection packs.
+Full 24-layer results are:
+
+| artifact | BF16 embedding cosine | ms | input tok/s | W | tok/J |
+|---|---:|---:|---:|---:|---:|
+| `--npu.oq8.hfq` | 0.99547863 | 864.929 | 296.0 | 21.05 | 14.1 |
+| `--npu.oq8+.hfq` | 0.99584466 | 855.854 | 299.1 | 20.04 | 14.9 |
+| `--npu.oq8++.hfq` | 0.99571574 | 838.997 | 305.1 | 21.05 | 14.5 |
+| `--npu.oq6.5.hfq` | 0.95821863 | 868.020 | 294.9 | 21.00 | 14.0 |
+
+OQ6.5 is arbitrary mixed-width execution evidence, not OQ8-level quality.
+The matrix validates generic dispatch and suffix handling but remains roughly
+33x short of 10k tok/s. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r110-generic-opus-formats-20260713.csv`.
+
+R111 applies the next bandwidth-first reduction without changing R109's
+in-place ABI or immutable `.rdna2.hfp` order. One 3,072-byte completed row is
+copied into tile memory, its FIFO is released immediately, and all three K256
+activation chunks are produced from the local row. The completed allocation is
+884,736 bytes including padding, while each sweep reads 786,432 active bytes.
+R111 therefore cuts active completed-state reads from 3,145,728 to 786,432
+bytes per layer and completed-input shim tasks from 32 to 8.
+
+The held-FIFO schedule is rejected because it reproduces R54. The first
+copy/release build also exposed a distinct alignment error: packer-owned groups
+1-2 were only 32-byte aligned but used a 64-byte vector load. Switching that Q
+copy to the guaranteed 32-byte alignment passes with five one-code Q
+differences and `7e-9` maximum scale error. Core text is 9,072-10,592 bytes.
+
+Four counterbalanced full-model pairs, each averaging three encodes, measure
+R109 at 760.323 ms / 336.7 tok/s / 17.83 tok/J and R111 at 749.409 ms / 341.6
+tok/s / 18.10 tok/J. R111 wins all four latency pairs with identical BF16
+embedding cosine `0.92839295`, and is selected by default when the artifact is
+present; R109 remains the fallback. Removing 2.36 MB of active reads yields
+only a 1.44% end-to-end latency win, evidence that this boundary is not purely
+external-bandwidth limited. The next larger opportunity is context/route
+consolidation around the R100 tail; R108 cannot absorb it with only 16 bytes of
+program headroom.
+
+The platform workaround remains the separately added kernel parameter. It is
+not LDS avoidance, the R15 numerical settings, or R111's alignment correction.
+Durable rows:
+`benchmarks/npu_gemm_tuning/results/r111-one-pass-next-prep-20260713.csv`.
+
+R112 prepares the R100 tail for in-context R111 fusion without changing
+immutable layout or total input traffic. A second split-X memory-tile
+broadcast is rejected at compile time because it exceeds the tile output-DMA
+channel budget. The admitted graph instead uses the third plane already
+reserved in R99's mutable 4,608-byte row for canonical token-major X. Strided
+DMA gives each core eight contiguous tokens and returns completed rows in
+canonical order; it performs no tensor-block conversion.
+
+R100 and R112 both transfer 1,179,648 active input bytes. R112 removes 24 core
+flows and reduces maximum core text from 4,208 to 3,696 bytes. Both hardware
+oracles report cosine `0.99999861` and maximum error `0.0039062`. Across four
+counterbalanced 100-command pairs, R100 averages `0.324965 ms` and R112
+averages `0.218271 ms`; R112 wins every pair and is 32.84% faster. This is
+standalone tail admission and route headroom for fusion, not end-to-end encoder
+throughput. The separately added kernel parameter remains the platform
+workaround; LDS placement is independent. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r112-fusion-ready-tail-20260713.csv`.
+
+R113 fuses R111's exact next-layer RMS/AWQ/FWHT/int8 preparation into R112's
+tail context. Each core preloads 9,216 bytes of next-layer parameters and packs
+each two-row output while it is still local; the rejected literal design kept
+an extra 24,576-byte eight-row completed buffer and failed bank allocation.
+The admitted phase-local form fits every core at 9,984 text bytes and removes
+the separate 786,432-byte completed-state input pass.
+
+Seven simultaneous shim output tasks are not viable: four completed outputs
+plus three diagnostic groups leave group 2 all zero. R113 launches all stripes,
+retires one completed task per stripe, then queues the three diagnostics. This
+passes at tail cosine `1.00000000`, `0.0000310` maximum error, three one-code Q
+differences, and `7e-9` scale error. A correct but stripe-serial retirement
+schedule took 13.3578 ms and is rejected.
+
+Four live 50-command samples average 5.056325 ms. Current R112 and R111 control
+means are 0.236051 and 5.024850 ms, totaling 5.260901 ms, so the fused rung is
+3.8886% faster while transferring fewer dynamic bytes. One transient fresh
+context returned all-zero output; four immediate fresh contexts and the full
+repeat passed, so it remains context-transition evidence rather than an LDS
+or platform-workaround diagnosis. R114 next tests in-context R34 suffix
+assembly; the now-dominant RMS/FWHT pack body remains an optimization target.
+
+The separately added kernel parameter remains the platform workaround. It is
+not LDS avoidance, the queue schedule, R111's alignment fix, or context
+recycling. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r113-tail-next-pack-fusion-20260713.csv`.
+
+R114 does not admit the next assembly step. Logical-owner stream chains,
+physical column-major stream chains, and adjacent neighbor-memory assembly with
+a new shim route all fail compilation with `Unable to find a legal routing`.
+A zero-destination-stride reuse attempt is invalid because DMA strides must be
+positive. Reusing the existing completed-output route for separate Q and scale
+planes does build in about nine seconds and fits at 11,200 bytes maximum core
+text. Its compact ABI transfers 589,824 bytes, with neither 16 KiB padding nor
+five materialized N-macro replicas.
+
+Locked hardware parity rejects that build: the completed tail can pass while
+the compact pack has 107,811 mismatches, maximum Q delta 254, and maximum scale
+error 0.034057196. Failures span every K256 group and local-memory owner
+position, so the assembly/mapping is wrong without yet identifying a single
+bad predecessor. Do not select R114.
+
+Proceed by treating R113's correct per-core output as the dynamic compact ABI.
+Its 589,824-byte padded diagnostic surface contains 199,680 unique chunk bytes.
+The next resident R34 consumer should read those chunks directly and reuse each
+across five N-macros rather than building the canonical 2,949,120-byte
+replicated activation tensor. Immutable `.rdna2.hfp` tensor blocks stay in
+their offline/loader-provided order.
+
+An intervening fresh context produced an all-zero completed tail and the
+immediate repeat produced the distributed compact-pack failure. Retain this as
+separate context-transition evidence. The added kernel parameter is the
+platform workaround that stops the platform issue; LDS avoidance is not the
+workaround. Local-memory placement, output routing, R111 alignment, and context
+lifetime remain independent. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r114-r34-compact-boundary-20260713.csv`.
+
+R115 validates the consumer-side alternative. All 32 cores read their R113
+eight-token group-0 chunks directly and execute a scaled K256-by-N16 int8
+matrix stage. Outputs scatter to canonical `[256,16]` f32. The graph neither
+assembles 24-token records nor materializes N-macro activation replicas, and
+immutable weights remain in loader/offline `.rdna2.hfp` order.
+
+The mapping-isolation build still reads each 6,144-byte diagnostic slot:
+196,608 physical activation bytes carry 66,560 unique bytes. Maximum core text
+is 1,692 bytes. Hardware parity is zero mismatches with `2e-9` maximum absolute
+error. Six fresh 1,000-dispatch runs pass at 0.090826-0.094342 ms, mean
+0.092506 ms. One preceding fresh process returned mostly zero output; the next
+six fresh processes passed. Retain that as separate context-transition
+evidence.
+
+R115 admits direct chunk consumption and one compute group only. Add the other
+two K256 groups with local f32 accumulation before extending N. The added kernel
+parameter is still the workaround that stops the platform issue. It is not LDS
+avoidance, and the transient fresh-context result does not change that.
+Durable rows:
+`benchmarks/npu_gemm_tuning/results/r115-direct-compact-group-n16-20260713.csv`.
+
+R116 extends the direct consumer to all K768 while retaining N16. Each token
+owner consumes three R113 chunks and accumulates locally in f32. It reads the
+589,824-byte padded compact ABI containing 199,680 unique bytes, not the
+2,949,120-byte five-N-macro activation materialization.
+
+The initial group-1 failure affected only columns 0-7. A 128-byte padded weight
+record does not change it; per-group DMA tasks and core-loop unrolling produce
+zeros. The admitted math stages the prior 8x16 f32 output into a 512-byte local
+array before the next MMUL. K512 unit-scale parity is bit-exact and K768 reports
+zero mismatches with `4e-9` maximum error. Core text is 2,220 bytes.
+
+Eight passing 1,000-dispatch fresh processes average 0.096384 ms. Two other
+fresh processes returned all-zero output before subsequent fresh processes
+passed. Therefore the full-K computation and compact ABI are admitted as a
+correct rung, but the image is not a context-stable runtime default. The next
+compute step is another N slice, preserving zero activation replicas. The added
+kernel parameter remains the distinct workaround that stops the platform issue;
+the local prior-output stage is not that workaround and is not LDS avoidance.
+Durable rows:
+`benchmarks/npu_gemm_tuning/results/r116-direct-compact-fullk-n16-20260713.csv`.
+
+R117 produces N32 from the same compact activation transfer. Each activation
+load feeds four 8-column MMUL halves; physical/unique activation bytes remain
+589,824/199,680 and N-macro replicas remain zero. Both N16 halves pass with zero
+mismatches and `3e-9` maximum error. Maximum core text is 3,192 bytes.
+
+Eight passing fresh 1,000-dispatch samples average 0.086916 ms, versus R116's
+0.096384 ms for N16. Thus twice the useful N work is 9.82% faster at this
+boundary, showing fixed dispatch/traffic costs dominate. Two other fresh
+contexts returned all-zero output, so context-stable runtime admission remains
+open.
+
+Proceed by staging the three compact chunks once per token-owner core and
+streaming multiple N32 weight/output blocks. Do not replay activation DMA as N
+grows. The added kernel parameter remains the platform workaround; this wider
+consumer and its local prior-output array are independent of LDS avoidance.
+Durable rows:
+`benchmarks/npu_gemm_tuning/results/r117-direct-compact-fullk-n32-20260713.csv`.
+
+R118 proves activation-once N64. Each core stages three compact chunks, then
+streams two N32 weight/output records. A 6,240-byte concatenation is rejected:
+group 1 begins at offset 2,080 and violates the 64-byte MMUL load alignment.
+Using a 2,112-byte stride and 6,336-byte stage fixes the compute path.
+
+The first repeated S2MM descriptor emits only block 0. Two explicit output
+tasks fit queue depth two and pass both blocks with zero mismatches and `5e-9`
+maximum error. Core text is 3,736 bytes. Activation DMA remains exactly one
+589,824-byte pass with 199,680 unique bytes and no N-macro replicas.
+
+Nine passing fresh 1,000-dispatch samples average 0.106058 ms, 22.0% slower
+than N32 for twice the useful N work. One sample returns the known all-zero
+context symptom. The next gate combines outer DMA tiling with task
+`repeat_count`; this is required for many output blocks without excessive task
+queues. The platform-workaround kernel parameter remains distinct from both the
+alignment fix and deliberate local-memory staging. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r118-staged-fullk-n64-20260713.csv`.
+
+R119 supplies the missing scalable output schedule. An outer DMA tiling
+dimension of two plus task `repeat_count=1` consumes both N32 objects with one
+output task per stream. R118's outer dimension without task repeat consumed
+only block 0.
+
+R119 has zero parity mismatches and `5e-9` maximum error. Eight passing fresh
+1,000-dispatch samples average 0.102308 ms, 3.54% faster than R118's explicit
+two-task schedule. Two contexts return all zeros. The schedule is admitted for
+increasing N32 block count while activation remains one 589,824-byte pass; it is
+not yet a context-stable runtime default. The platform workaround remains the
+separate kernel parameter. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r119-repeat-output-task-20260713.csv`.
+
+R120 increases the admitted schedule to four N32 blocks (N128). Output strides,
+outer tiling, and task `repeat_count=3` scale while the kernel and one 589,824
+byte activation pass remain unchanged. All four blocks pass with zero
+mismatches and `7e-9` maximum error. Four passing fresh 1,000-dispatch contexts
+average 0.115102 ms; six other fresh contexts return the known whole-output
+zero symptom. This admits topology, not context-stable selection. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r120-staged-fullk-n128-20260713.csv`.
+
+R121 completes the 40-block N1280 projection schedule. It reads 7,987,200 W8
+diagnostic weight bytes, preserves the one-pass 589,824-byte compact activation
+input, and writes 1,310,720 f32 output bytes. The full M256 K768 N1280 oracle
+passes with zero mismatches and `6e-9` maximum error in all ten fresh contexts.
+The 1,000-dispatch range is 0.319049-0.325542 ms and the mean is 0.320640 ms,
+about 798,402 M256 projection rows/s and 30.84 GB/s over the measured payloads.
+
+This is an admitted full-width single-projection schedule, not a full-layer or
+encoder tok/s result. Next connect generic runtime Opus packed records to this
+schedule and retain the byte oracle through OQ4, arbitrary mixed bitwidths,
+OQ8, and +/++ metadata. The kernel parameter remains the platform workaround;
+LDS placement and repeated DMA scheduling are independent. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r121-staged-fullk-n1280-20260713.csv`.
+
+## R122 — resident component characterization before batched M (2026-07-15)
+
+The active EmbeddingGemma completed-layer route now exposes decision-level
+timings for attention prepare/pack/run, unit RMS, FFN, tail, next activation
+prep, residual prep, output materialization, final norm/mean, and Dense/L2. A
+new trace summarizer assigns repeated encodes to cold/primed samples and derives
+per-encode XDNA submit/wait deltas from the cumulative dispatch trace.
+
+One fresh oq8 process ran three M256 encodes; the two primed samples averaged
+746.822 ms across the 24 layers plus 20.976 ms finalization. Component totals
+were 269.042 ms FFN, 212.178 ms attention (11.540 prepare and 200.629 NPU run),
+168.409 ms next-layer prep, 86.612 ms tail, 8.322 ms setup, 2.575 ms final
+norm/mean, 18.392 ms Dense/L2, and 1.992 ms final host materialization. The
+active route bypasses separate unit-RMS, residual-prep, and interior GPU-pack
+work; zeroes in those columns describe route selection, not alternate-kernel
+latency.
+
+The same primed samples used 98 XDNA dispatches and averaged 1.894 ms submit vs
+744.854 ms wait. A repeated batched FFN hardware check remained bit-exact and
+measured M256 10.520 ms vs M512 19.929 ms, only 1.06x row throughput. Therefore
+launch batching and naive FFN M growth are rejected. Continue with FFN weight
+reuse and next-prep/tail context consolidation; postpone final Dense/L2 work.
+
+Durable rows:
+`benchmarks/npu_gemm_tuning/results/embeddinggemma-resident-components-m256-20260715.csv`
+and
+`benchmarks/npu_gemm_tuning/results/embeddinggemma-resident-samples-m256-20260715.csv`.
+
+## R123 — core-stationary resident FFN weights rejected (2026-07-15)
+
+The one-FIFO object-FIFO replay path is not hardware-correct. `iter_count`
+repeated the memtile MM2S BD chain but re-acquired a source lock produced only
+once; a normal primed run returned zeros, and a no-prime discriminator delivered
+only the first row macro (cosine 0.61336109). Object-FIFO `repeat_count` instead
+exhausted the memtile's 24 BD IDs during allocation.
+
+R123 replaced replay with a core-stationary weight-major loop. One 28-record,
+15,552-byte-per-record sequence is uploaded per column. M512 uses two
+three-macro f32 accumulator buffers and rolls at most three output DMA tasks per
+channel. The final M256 absolute oracle passes at cosine 0.99984681, and both
+duplicated M512 documents are bit-exact with M256.
+
+Performance rejects promotion: stationary M256/M512 measured 20.111/33.500 ms,
+only 1.20x row throughput and slower in absolute time than replicated weights at
+10.520/19.929 ms. Continue with next-prep/tail consolidation rather than more
+FFN M growth. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r123-weight-stationary-m-scaling-20260715.csv`.
+
+## R124 — document-padded direct-X M512 FFN (2026-07-15)
+
+The resident dense-W8 direct-X/gate-reuse path now accepts two documents in one
+dispatch. Each document occupies an M288 physical slot and owns a separate
+inverse-RMS record plane; this prevents the second document's first 32 physical
+rows from aliasing the first document's inverse selectors. The host input,
+scratch, and BF16x2 output decoders now preserve this layout, while the
+canonical M512 input allocation scales to two M288 slots.
+
+On hardware, direct M256 versus the canonical BF16x2 oracle reaches cosine
+0.99988810 and maximum absolute error 0.0147171. Direct M512 `[X;X]` is
+bit-exact against direct M256 for both documents. M256/M512 timing is
+8.366/16.489 ms, or only 1.01x row-throughput gain. Admit the batch ABI and
+correctness contract, not an FFN throughput claim. Continue at the post-FFN
+tail/next-prep boundary. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r124-direct-x-batched-ffn-20260715.csv`.
+
+## R125 — batched post-FFN tail and next-prep (2026-07-15)
+
+The R100 tail and R111 next-layer preparation now accept M512 as two padded
+M288 documents. A naive tail schedule exhausted shim BD IDs; the admitted form
+keeps four phase descriptors and uses a document dimension plus task repetition.
+It preserves the 0.99999861 absolute cosine, produces bit-exact duplicated
+documents, and measures 0.381335/0.600561 ms at M256/M512 (1.27x row-throughput
+gain).
+
+Next-prep repeats its fixed eight-row local transaction per document without a
+second dispatch. Both output regions are byte-identical for duplicated input;
+the oracle sees ten one-code Q differences, maximum Q delta 1, and `7e-9`
+maximum scale error. M256/M512 timing is 5.0606/10.0303 ms, only 1.01x
+row-throughput gain. The batch boundary is correct, but next-prep remains
+row-linear. Continue with segmented attention. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r125-batched-tail-next-prep-20260715.csv`.
+
+## R126 — segmented M512 BF16 attention (2026-07-15)
+
+R27 now runs two independent M256 bidirectional-attention segments in one
+dispatch. A naive concatenated packed-Q descriptor was rejected at aggregate
+cosine 0.99867145 because the physical Q layout is row-major outside query
+groups. Explicit per-document Q, K/V, and output descriptors restore the block
+diagonal contract.
+
+With distinct inputs, doc0/doc1 cosines are 0.99999410/0.99999464 and maximum
+absolute errors are 0.0002527/0.0002543. M256/M512 timing is 1.4303/2.8932 ms,
+or 0.99x row-throughput scaling. Admit the segmentation seam, not a fused-layer
+or throughput claim. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r126-segmented-bf16-attention-20260715.csv`.
+
+## R127/R128 — fused segmented attention and full batched encode (2026-07-15)
+
+The resident R108 attention/output/norm image now accepts M512 as two independent
+M256 segments in one command. Its final state uses the compact direct-X handoff
+expected by the already-batched dense-W8 FFN and tail: padded X documents first,
+then one inverse plane per document. Both distinct documents are bit-exact
+against separate fused M256 hardware runs. Fused timing is 6.405/11.615 ms at
+M256/M512, a 1.10x row-throughput gain.
+
+`NpuOpusProjector` can select a consistent resident batch across attention,
+FFN, tail, and next-prep. The encoder API carries explicit fixed 256-row segment
+offsets and performs final pooling independently per segment. On the oq8 model,
+one M512 run matches two separate M256 embeddings at mean cosine 0.99999845,
+minimum cosine 0.99999797, and maximum absolute error 0.00025596. The same result
+holds after ten reused commands.
+
+M256 measures 774.491 ms/document; M512 measures 633.625 ms/document
+(1267.250 ms per command), a 1.22x throughput improvement. This admits full B2
+encode batching but shows that replicated schedules remain mostly row-linear.
+Durable rows:
+`benchmarks/npu_gemm_tuning/results/r127-fused-segmented-attention-20260715.csv`
+and
+`benchmarks/npu_gemm_tuning/results/r128-full-batched-encode-20260715.csv`.
+
+## R129 — staged-full-K weight reuse across documents (2026-07-16)
+
+R129 extends R121 from M256 to explicit B2/M512 and B4/M1024 schedules. Every
+core stages one compact full-K activation image per document, acquires each N32
+weight record once, applies it to every document, and then releases it. The
+N1280 immutable payload stays single-copy at 7,987,200 bytes with one DMA pass.
+B1 MLIR remains byte-identical to R121.
+
+Both batch sizes compile and are hardware-correct. Deliberately distinct
+documents match separately recreated M256 R121 contexts bit-for-bit; changing
+the last document never changes doc0. Three fresh contexts and twenty reused
+commands pass. B2 activation/output traffic is 1,179,648/2,621,440 bytes and B4
+traffic is 2,359,296/5,242,880 bytes.
+
+The performance target is missed but the reuse is measurably sublinear. Three
+final B2 paired runs give 1.2532x, 1.2735x, and 1.2681x row-throughput gains.
+B4's median paired gain is 1.2564x. Deeper tile-local reuse with eight live
+accumulators fails parity; a correct four-accumulator, two-pass form falls to
+1.2596x because it reloads activations. Promote only the proven B2/B4 geometry
+and fallback contracts; do not infer B32/B128 performance or capacity.
+
+Durable rows:
+`benchmarks/npu_gemm_tuning/results/r129-staged-fullk-batched-weight-reuse-20260716.csv`.
+
+## R130/R131 — fused reuse boundary and production serving (2026-07-16)
+
+The R129 acquire-once topology was transplanted into R108 with two QKV
+accumulator pairs and block/group/document activation ordering. The direct
+form exceeds AIE2P program memory: its odd-core ELF is 16,876 bytes and CDO
+generation fails. Balancing Q packing and inverse relay across even/odd cores
+fits at 16,236/16,368 bytes, but the resulting hardware image emits an all-zero
+completed state. Two follow-up corrections—norm outputs before inverse metadata,
+and an explicit record-interleaved activation ABI—retain the failure. This is a
+concrete fused-image boundary, not an admitted performance result; R130 is never
+selected by the runtime. Durable rejection rows are in
+`benchmarks/npu_gemm_tuning/results/r130-fused-qkv-weight-reuse-20260716.csv`.
+
+The admitted serving configuration is resolved at model load. Row-padded OQ8
+storage (`qt=43`, plus shape/byte-validated legacy ragged `qt=35`) requests the
+NPU automatically; `HIPFIRE_EMBED_RESIDENT_LAYER=1` remains an explicit opt-in
+for portable artifacts and `=0` forces it off. Set `HIPFIRE_EMBED_NPU_BATCH=2`
+and optionally `HIPFIRE_EMBED_NPU_CACHE`; the loader constructs one long-lived
+projector and checks attention, FFN, tail, and next-prep geometry. A GPU fallback
+is used only when `HIPFIRE_EMBED_GPU_FALLBACK_MODEL` explicitly names it; the
+old `.npu.` filename-to-BF16-sibling inference is removed. Without an explicit
+fallback, a row-padded artifact requires the complete resident-layer cache and
+NPU execution failures return an error rather than entering the incompatible
+GPU OQ8 unpacker.
+
+The projector selects R129 when the non-fused B2 QKV projection is used. When
+the complete M512 resident layer is available, `project_layer` deliberately
+prefers the admitted R128 fused encoder. The full-encoder serving numbers below
+therefore validate production batching and fallback, but are not attributed to
+R129 or to the rejected R130 fused topology.
+
+On `halo`, one daemon JSONL M512 request with two distinct M256 documents
+matches separate B1 daemon requests at minimum cosine 0.999998523 and maximum
+absolute error 0.000389665. Three B1 two-command totals are
+1683.955/1632.666/1625.189 ms; B2 one-command totals are
+1345.645/1282.725/1297.020 ms. The primed median improves from 1628.928 to
+1289.873 ms, or 1.2629x document throughput (approximately 314.3 to 397.0
+tokens/s). A two-short-document request returns two unit-normalized 128-D
+embeddings through fallback. Durable rows:
+`benchmarks/npu_gemm_tuning/results/r131-serving-batched-npu-20260716.csv`.
+
+## R132 — full-encoder capacity and variable-length HTTP admission (2026-07-16/17)
+
+The isolated staged-full-K projection remains correct through B4, but the
+production resident encoder only has complete cache sets for B1/M256 and
+B2/M512. Median full-encoder latency is 800.970 ms at B1 and 1274.406 ms per
+B2 command (637.203 ms/document), improving estimated input-token throughput
+from 319.612 to 401.756 tokens/s, or 1.2570x. B4 is not admitted because no
+complete M1024 attention, FFN, tail, and next-prep cache set exists. Durable
+rows are in
+`benchmarks/npu_gemm_tuning/results/r132-embeddinggemma-batch-sweep-20260716.csv`.
+
+The daemon recognizes the legacy row-padded OQ8 storage from tensor shape and
+payload metadata, loads the B2 resident projector, and never enters the
+incompatible GPU unpacker. Exact M256/M512 segments retain the fused resident
+path. Other row counts now use the canonical variable-length encoder: every
+quantized linear remains on the NPU, while attention, normalization, residuals,
+and pooling operate over only the real rows on the GPU. This avoids semantic
+padding and preserves exact bidirectional-attention and mean-pooling lengths.
+
+Two specialized components were initially over-admitted for arbitrary rows.
+Using the M512 staged combined-QKV and resident FFN paths for an 11-token input
+produced cosine 0.00850622 against BF16. Restricting only the resident FFN to
+its exact loaded geometry improved cosine to 0.14972219 but still failed.
+Restricting both resident FFN and staged combined-QKV to exact loaded rows, and
+using the general NPU projection executors otherwise, reached cosine 0.99974084
+and maximum absolute error 0.00266806. A two-document variable-length request
+then reached per-document cosines 0.99979071 and 0.99973855 with matching token
+counts.
+
+The FIQA HTTP sweep completed at batches 1, 2, 4, 8, 16, 32, and 64 with one
+warmup and three timed requests per size. Throughput remained nearly flat at
+2.789-2.929 documents/s because variable-length documents currently execute
+independently rather than through the exact-256 fused batch ABI. BF16 measured
+54.112-85.336 documents/s on the same corpus, so this correctness fallback is
+approximately 20-29x slower and is not a performance promotion. Durable HTTP
+results are in
+`benchmarks/results/http-embeddings/fiqa-batch-sweep-npu-oq8-20260717.json`.
+
+## R133 — Qwen3 geometry-driven segmented causal attention (2026-07-17)
+
+A new AIE2P component uses explicit bucket, batch, query-head, KV-head, and
+head-dimension geometry. One KV head maps to each of the eight columns; both
+the 0.6B 16/8 GQA topology and the larger-model 32/8 topology use the same
+physical ABI. A 512-byte trailer on every two-column Q object carries the real
+document length while preserving representable DMA blocks. Q, K/V, and output
+regions are disjoint per document.
+
+Real Peano/aiecc builds succeeded for sequence buckets 128, 256, 512, 1024,
+and 2048. Dense-oracle S128/B1 reached cosine 0.99991863 and maximum absolute
+error 0.0038886; S128/B2 with distinct lengths 127/110 reached cosine
+0.99990557 and maximum error 0.0043560. Replacing document 1 left document 0
+bit-identical. The 32/8 topology reached cosine 0.99992292 and maximum error
+0.0038326.
+
+A zero-Q/K closed-form oracle exercised the full bucket range, where causal
+attention reduces to a prefix mean. Cosines for S256/S512/S1024/S2048 were
+0.99999729/0.99999517/0.99999536/0.99999542; maximum errors stayed at or below
+0.0019531. Boundary lengths 1 and 128 passed together in one B2 dispatch.
+Measured wrapper-level times were 9.34/31.86/73.58/262.13 ms respectively.
+
+This admits the segmented-attention component and its bucket ABI only. It is
+not a full Qwen3 encoder, calibrated OQ8+ model, HTTP, quality, or throughput
+promotion; Q/K normalization, RoPE, projections, FFN, final norm, pooling, and
+full-model image composition remain required before model admission.
+
+## R134 — Qwen3 NPU layout chain and OQ8+ projection (2026-07-17)
+
+Directly replaying token-major K/V into the segmented-attention graph was
+rejected: the nested token/head DMA schedule delivered only 16 rows per
+document. The admitted boundary uses three geometry-driven AIE2P transforms:
+token-major Q packing, token-major K/V packing, and attention-output unpacking.
+At S128/B2/QH16/KVH8/D128, Q packing accepted changing real lengths across
+reused commands, K/V packing and output unpacking were byte-exact, and the
+complete pack -> segmented attention -> unpack chain matched the canonical
+segmented path byte-for-byte for lengths 127/110.
+
+A generic dense OQ8+ projection image now covers M in 256-row increments,
+K in G256 groups, and N in 16-column tiles. The NPU performs AWQ division,
+the two signed FWHT passes, dynamic int8 activation quantization, AIE2P
+`mmul<8,8,8>`, group accumulation, scaling, and BF16 output. M256/K256/N16
+reached cosine 0.99999464 and maximum absolute error 0.2481651 against the
+existing `OpusPackedMatrix` oracle. M256/K512/N32 exercised two K groups and
+two output tiles at cosine 0.99999464 and maximum error 0.2490158.
+
+The 32-core projection runtime sequence does not reliably re-arm every
+object-FIFO consumer on the current amdxdna stack: without an array reset,
+reused commands intermittently complete in about 0.6 ms with partial or zero
+output. The failure persists with row-local/four-core weight broadcasts,
+double-buffered FIFOs, a 16 KiB stack, scalar quantization, and a constant core
+body, so it is not projection arithmetic. Recreating only the hardware context
+before a public dispatch preserves PDI, instructions, resident weights, and
+argument BOs and passed 30 fresh processes with two dispatches each, plus ten
+M256/K512/N32 processes. This admits the component correctness seam, not a
+full-encoder or performance result; full-image composition should place all
+layer projections inside one request sequence rather than reset per projection.
+
+## R135 — Qwen3 0.6B full encoder matrix and admission hold (2026-07-17)
+
+The Qwen3-Embedding-0.6B implementation now composes every encoder operation:
+host embedding lookup, 28 resident causal-attention/SwiGLU layers, final
+RMSNorm, last-real-token pooling, and L2 normalization. The compiled AIE2P
+matrix covers S128 B1/2/4/8/16/32, S256 B1/2/4/8/16, S512 B1/2/4/8, S1024
+B1/2/4, and S2048 B1/2, preserving the 4096-padded-row ceiling. A three-input
+S128/B4 run with a repeated first document produced bit-exact embeddings for
+the duplicate slots and bit-exact agreement with the same documents in the
+S128/B2 run. This admits padding isolation and batch invariance for that
+geometry.
+
+Several initially compiled large-batch images exceeded live DMA descriptor or
+program-memory limits. Query packing, KV packing, attention unpacking, and
+segmented attention now phase transfers per document; S2048 transfers use at
+most 64 chunks. The final pool uses four reusable pair lanes instead of one
+core/FIFO pair per document pair. The resulting S128/B4 attention layout chain
+is byte-exact, and the S2048/B1 query pack and unpack transforms are byte-exact.
+
+The first matrix rebuild exposed a cache correctness bug: component readiness
+checked only for `final.xclbin` and `insts.bin`, so an image compiled before a
+builder fix could be silently repackaged. Every component now records a
+source-and-command SHA-256 manifest; absent, malformed, source-stale, or
+command-stale manifests force recompilation. A clean rebuild produced 155
+stamped component images and 20 bundles containing 260 copied component build
+records.
+
+Full-model admission remains **held**. A tooling-only ROCm oracle inverse-
+transformed the exact HFQ OQ8 payload and folded each AWQ sidecar back into an
+ordinary BF16 linear weight. On two realistic 127/108-token inputs, dequantized
+HFQ versus source BF16 reached cosine 0.99886274/0.99932420, passing the 0.995
+weight-quality target. The resident NPU output versus that same-artifact GPU
+oracle reached only 0.98727685/0.98817223; NPU versus source BF16 reached
+0.98777235/0.98806179. Thus calibration/weight quantization is not the current
+limiter, and the required 0.999 same-artifact execution threshold is not met.
+Do not promote the 8K-calibrated candidate or infer 4B/8B admission.
+
+Switching sequence buckets initially failed with `aie2_alloc_resource` because
+the runtime constructed a new thirteen-context encoder before dropping the old
+thirteen-context encoder. It now releases the old geometry first. An isolated
+S128/B1 length-1 full encode then completed on XDNA in 37,627.689 ms with a
+0.99999994 output norm. This is correctness evidence only; the per-projection
+hardware-context recreation makes it unsuitable for a throughput promotion.
+
+The complete boundary sweep subsequently passed at lengths
+1/127/128/255/256/257/511/512/1024/2048. All ten 1024-D outputs were finite
+and unit-normalized within 4e-7. The confirmed-XDNA command took
+1,232,387.216 ms for 4.153727 actual tokens/s and 0.008114 documents/s at a
+0.166829 padding ratio. The result record is
+`/tmp/qwen3-boundary-matrix.json` (SHA-256
+`0445852ae01a153eefa4af8eebde92fad8f0b4eea0b9b339ae4daeb128a10e8c`).
+This closes bucket-boundary execution coverage, but the latency is explicitly
+not a performance admission.
+
+An explicit diagnostic trace retained the last-real-token residual after every
+layer and the final layer's component boundaries without adding allocations to
+normal serving. On a length-1 input, same-artifact GPU/NPU cosine remained at
+least 0.9999209 through layer 26, then fell to 0.6061212 after layer 27;
+final RMSNorm/L2 normalization recovered only to 0.9313588. Replaying the exact
+dequantized-HFQ last layer from the NPU's own layer-26 state showed that each
+component bank was selecting the intended tensor: Q/K/V projections were
+0.9999884/0.9999907/0.9998902, attention was 0.9998904, the down projection was
+0.9999788, and the cancellation-sensitive completed residual was 0.9997571.
+The large final error therefore comes from amplification of small accumulated
+activation error, not a last-bank selector or tensor-order bug. The detailed
+record is `/tmp/qwen3-length1-stage-parity-replay.json`.
+
+Two follow-up precision hypotheses were rejected. Reusing an earlier RMSNorm
+parameter bank for the final residual produced a byte-identical trace, proving
+that the unused normalized half and 57th norm parameter were not the cause. A
+two-term dynamic-int8 residual activation projection compiled and repeated
+stably, but regressed the isolated component from the admitted 0.9999946 cosine
+and approximately 0.248 maximum error to 0.9999787 and 0.3903656. That kernel
+was reverted. Full-model admission remains held pending a precision strategy
+that improves accumulated state without regressing the component contract.
+
+The production HTTP path was exercised through `hipfire serve` and the daemon
+using the registry ID `Qwen3-Embedding-0.6B.npu.oq8+.gfx1151`. A three-document
+request returned HTTP 200 with indices 0/1/2 in order, requested 256-D output,
+unit norms, and bit-exact embeddings for duplicate documents. Explicit
+document and query roles both returned HTTP 200; the query prompt changed the
+same text's embedding as expected (cosine 0.9570363). An unknown `passage` role
+was rejected with HTTP 422. A 3001-token input was rejected in 29 ms with HTTP
+400 and the explicit 2048-token maximum, without NPU dispatch. `/v1/rerank`
+returned HTTP 200 and ranked the directly relevant passage first at
+0.6655046 versus 0.4955520. API correctness is therefore covered even though
+model-quality and performance admission remain held.
+
+## R136 — Qwen3 output coherency and BF16-equivalent component numerics (2026-07-17)
+
+The R135 drift investigation first found an execution-coherency defect rather
+than a model equation defect. Several XDNA component wrappers synchronized an
+output BO only after dispatch, but did not reconcile an output BO that had been
+written by a preceding HIP or host producer before reusing it as an in/out
+argument. Explicit pre-dispatch output synchronization in segmented attention,
+SwiGLU, projection, headnorm/RoPE, residual/RMSNorm, and final pool removed the
+intermittent stale/partial state. Repeated length-1 full encodes then became
+byte-exact.
+
+Round-to-nearest-even BF16 conversion replaced truncation in the Qwen3 OQ8
+projection, residual/RMSNorm, headnorm/RoPE, segmented-attention, and SwiGLU
+images. Exact NPU-input replay showed that projection and residual stages were
+then exact enough for admission, while the remaining accumulated drift was
+concentrated in Q/K head normalization and SwiGLU. The admitted headnorm path
+keeps the reciprocal RMS in F32 for the input product, rounds the normalized
+value to BF16, and then performs the BF16 weight product, matching the PyTorch
+Qwen3 RMSNorm order. The direct component reached Q cosine 1.0 with maximum
+absolute error 0.0078125; K was exact.
+
+The vector approximation in the AIE2P SwiGLU image was replaced by a stable
+scalar F32 exponential/sigmoid path with BF16 rounding at the SiLU and final
+multiply boundaries. Its direct component reached cosine 1.0 and maximum
+absolute error 8, versus 16 for the previous vector path. This costs about 7%
+on the short realistic pair and 16.7% on the boundary sweep, so it is a
+correctness promotion rather than a speed claim.
+
+Rejected precision experiments are retained as negative evidence. BF16 score
+rounding in attention catastrophically reduced full-model cosine to about
+0.60/0.78. A final-pool RNE change was a no-op. Lane-wise headnorm reduction,
+explicit BF16 RoPE products, dynamic-int8 residual projection, K8 projection
+accumulation, and alternate residual/RMSNorm orderings all regressed or failed
+to improve the admitted result and were reverted.
+
+## R137 — Qwen3 0.6B correctness and quality pass, performance hold (2026-07-17)
+
+With the R136 numerics, the final boundary matrix passed at lengths
+1/127/128/255/256/257/511/512/1024/2048. All outputs were finite and
+unit-normalized. Same-artifact GPU/NPU cosines were
+0.99998564/0.99973524/0.99976194/0.99971539/0.99980199/0.99970651/
+0.99972665/0.99969709/0.99965811/0.99961793, so the minimum passes the
+0.999 admission threshold. The minimum NPU-versus-source-BF16 cosine was
+0.99765217, passing the 0.995 threshold. The confirmed-XDNA command took
+496,192.065 ms for 0.020153 documents/s and 10.316570 actual tokens/s at a
+0.166829 padding ratio. The result is `/tmp/qwen3-final-boundary.json`
+(SHA-256 `960af1e525ff527fd0d74e00346e1262192c6b2ce40819780ef09a354c14e710`)
+and its parity record is `/tmp/qwen3-final-boundary-parity.json` (SHA-256
+`991d0f65df73a8ec7a5db011d899dcceb6fe176625028a07e849b8800b2c0ab7`).
+
+The realistic 127/108-token pair independently passed: same-artifact cosine
+0.99958104/0.99952483 and NPU-versus-BF16 cosine
+0.99868560/0.99936408. It took 47,225.276 ms, or 4.976 actual tokens/s.
+
+The quality fixture pins `mteb/scifact` revision
+`cf10ab6856b15b0e670ef8ae5dae4e266c12d035`. Source SHA-256 values are
+`9db7df096f7414435d52bafcbacf814c30cea50eb565c1e8fa6d11440759bba8`
+for queries, `f0d32db0d156b526d75921ed7a76f2cb912902631c87248c5c97c617bad0b60c`
+for corpus, and `da33fc0edc7447d43908ea92bf11de010e361ac43228295f09bdcd33ce14730c`
+for test qrels. A deterministic 16-query/128-document subset retains every
+relevant document and fills distractors by stable SHA ordering. Both the BF16
+reference and NPU candidate reached nDCG@10 0.9597629492, for zero measured
+degradation. This is a deliberately small deterministic admission fixture, not
+a claim for the full SciFact leaderboard.
+
+Performance does not pass. Encoding the 144 SciFact inputs, with real lengths
+28 through 1002, took 2,738,577.008 ms: 0.052582 documents/s and 16.693706
+actual tokens/s at a 0.323553 padding ratio. Consequently the 0.6B artifact is
+admitted for correctness, API behavior, and the fixed quality fixture only;
+it is held from performance promotion. The plan's 4B/8B gate remains closed,
+and neither larger model is downloaded or packaged.
+
+## R138 — exact EmbeddingGemma local attention through 2048 (2026-07-17)
+
+The shared embedding scheduler already assigns the 128/256/512/1024/2048
+buckets, rejects inputs above 2048, and limits dispatches to 4096 padded rows.
+The remaining EmbeddingGemma correctness gap was below that scheduler: for
+sequences longer than its 512-token local window, local layers warned and ran
+full bidirectional attention. A HIP-direct online-softmax entry point now
+restricts visible keys to `abs(query - key) < window`. Short local layers and
+all global layers retain the existing full-attention path. A direct gfx1151
+hardware oracle at sequence 17/window 4 reached maximum absolute error
+1.5e-8 against the CPU reference.
+
+Real model checks used `EmbeddingGemma-300M--npu.oq8+.hfq` for the calibrated
+NPU projections and `EmbeddingGemma-300M.bf16.hfq` as the reference. At the
+first clipped length, 513 tokens, cosine was 0.99979591 with maximum absolute
+error 0.00254500; the hybrid path took 687.027 ms and 746.7 tokens/s. At the
+2048-token cap, cosine was 0.99962610 with maximum absolute error 0.00327036;
+the hybrid path took 1,467.896 ms and 1,395.2 tokens/s. The BF16 GPU references
+took 44.025 and 242.379 ms respectively.
+
+These long-sequence results are deliberately classified as hybrid: every
+quantized linear projection remains on XDNA, while exact sliding/global
+attention, normalization, residuals, and pooling use the HIP bridge. The only
+fully fused resident images remain exact 256-token document geometries (B1 and
+B2). No full-AIE 512/1024/2048 image or performance promotion is inferred.
+
+## R139 — Qwen3 host-boundary SwiGLU removes an AIE2P bottleneck (2026-07-17)
+
+Aggregate stage timing showed that the scalar, correctness-first AIE2P SwiGLU
+image consumed about 808 ms of a 2,387 ms warm length-1 encode. Its inputs and
+outputs were already materialized as host BF16 vectors between independently
+submitted projection images, so keeping this elementwise boundary on NPU added
+dispatch, transfer, and scalar-exp cost without preserving residency. The
+default path now uses a 65,536-entry BF16 SiLU lookup table followed by a BF16
+multiply on the host; `HIPFIRE_QWEN3_SWIGLU=npu` retains the old path for
+comparison and diagnosis.
+
+Warm length-1 median latency fell from **2,386.808 ms to 1,578.667 ms**
+(**1.512×**, 33.9% lower). A realistic 127/108-token pair fell from
+**5,066.470 ms to 2,035.114 ms** (**2.490×**, 59.8% lower), increasing actual
+throughput from 46.38 to 115.47 tokens/s. The complete pinned SciFact subset
+fell from **2,738,577.008 ms to 536,455.192 ms** (**5.105×**), reaching 0.2684
+documents/s and 85.22 tokens/s.
+
+Quality remained admitted. The realistic pair's minimum same-artifact cosine
+against the dequantized-HFQ GPU oracle was **0.99903619**. On all 144 SciFact
+embeddings, cosine versus the prior admitted scalar-NPU output was at least
+**0.99922347**, and both candidates produced exactly the same nDCG@10,
+**0.9597629492** (zero relative degradation). A faster vector-tanh AIE2P image
+was rejected because its realistic-pair cosines, 0.998655/0.998817, missed the
+0.999 execution gate. Raw timings are in
+`benchmarks/npu_gemm_tuning/results/r139-qwen3-host-swiglu-aie2p-20260717.csv`.
+
+## R140 — aiecost gains an NPU2/AIE2P calibration target (2026-07-17)
+
+The version-keyed AIE cost harness now supports `--device auto|npu1|npu2`,
+resolves both generations of IRON APIs, selects the AIE2P runtime library, and
+uses NPU2-specific compiler targets and cache identities. Live detection on
+Strix Halo records 8 compute columns / 32 cores, 64 KiB tile L1, eight 512 KiB
+memory tiles, and 16 BDs and locks per core. All seven probes build and run on
+AIE2P.
+
+The calibrated warm dispatch floor is 72.55 µs; pack/deblock are
+63.78/129.76 GB/s; feed reaches 50.01 GB/s at four columns and drain reaches
+48.46 GB/s at five columns, their respective ABI limits. The task-count slope
+is below noise. FIFO depth 2 won the latest sweep
+by 1.118× over depth 1, but ordering changed across repeats, so this is a hint
+rather than a universal optimum. K1 is now admissible at **f_H = 1.68 GHz**: the
+throughput-plateau method fails on AIE2P (the accumulator register file spills at
+8 chains before the pipe saturates, so II=1 is never reached), so the clock is
+read from C4's disassembly route instead — the statically-scheduled VLIW loop is
+`add` + `jnz` + a 5-slot branch shadow = 7 bundles per iteration for the native
+`mmul<4,8,8>` int8 shape, and f_H = 7 cyc ÷ (ns/iter) cross-checks to 1.68 GHz
+(chains=4) / 1.74 GHz (chains=2), just under the 1800 MHz nominal — clock maxed
+but throttled under sustained load. Both `<4,8,8>` and `<8,8,8>` are native int8
+on AIE2P. The full target notes are in
+`docs/npu/aie2-cost-model-plan.md`; raw probe records are the
+`aiecost-aie2p-*-20260717.json` files under
+`benchmarks/npu_gemm_tuning/results/`.

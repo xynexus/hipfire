@@ -1,0 +1,668 @@
+// Complete resident dense-W8 gate/up + GeGLU -> activation pack -> down FFN.
+#include "aie_kernels/aie_kernel_utils.h"
+#include <aie_api/aie.hpp>
+
+constexpr int R26_LM = 3;
+constexpr int R26_LN = 3;
+constexpr int R26_KT = 32;
+using R26_MMUL = aie::mmul<8, 8, 8, int8, int8>;
+constexpr int R26_SA = R26_MMUL::size_A;
+constexpr int R26_SB = 2 * R26_MMUL::size_B;
+constexpr int R26_SC = 2 * R26_MMUL::size_C;
+constexpr int R26_A_DATA = R26_LM * R26_KT * R26_SA;
+constexpr int R26_W_DATA = R26_LN * R26_KT * R26_SB;
+constexpr int R26_GROUP = 256;
+constexpr int R26_W_COLS = 48;
+constexpr int R26_PARAM_OFFSET = R26_W_DATA + R26_W_COLS * sizeof(float);
+constexpr int R45_PRE_NORM_OFFSET =
+    R26_PARAM_OFFSET + 3 * R26_GROUP * sizeof(float);
+constexpr int R26_FRAGMENT_ROWS = 3;
+constexpr int R26_FRAGMENT_BYTES = R26_FRAGMENT_ROWS * R26_GROUP + 16;
+constexpr int R26_FRAGMENT_WORDS = R26_FRAGMENT_BYTES / sizeof(int);
+
+static inline aie::vector<int32, 16>
+r26_join_rows(aie::vector<int32, R26_MMUL::size_C> lo,
+              aie::vector<int32, R26_MMUL::size_C> hi, int row) {
+  switch (row) {
+  case 0: return aie::concat(lo.template extract<8>(0), hi.template extract<8>(0));
+  case 1: return aie::concat(lo.template extract<8>(1), hi.template extract<8>(1));
+  case 2: return aie::concat(lo.template extract<8>(2), hi.template extract<8>(2));
+  case 3: return aie::concat(lo.template extract<8>(3), hi.template extract<8>(3));
+  case 4: return aie::concat(lo.template extract<8>(4), hi.template extract<8>(4));
+  case 5: return aie::concat(lo.template extract<8>(5), hi.template extract<8>(5));
+  case 6: return aie::concat(lo.template extract<8>(6), hi.template extract<8>(6));
+  default: return aie::concat(lo.template extract<8>(7), hi.template extract<8>(7));
+  }
+}
+
+// `output_ln=3,nmacro=0` is the gate/up tile. `output_ln=6,nmacro=0/1`
+// retains both N=384 down macros in one DMA-friendly accumulator.
+template <int OUTPUT_LN, int NMACRO>
+__attribute__((noinline, minsize)) static void
+r26_w8_scaled(const int8 *__restrict activations,
+              const int8 *__restrict weights, int32 *__restrict output_bits,
+              int accumulate) {
+  const float *activation_scales =
+      reinterpret_cast<const float *>(activations + R26_A_DATA);
+  const float *weight_scales =
+      reinterpret_cast<const float *>(weights + R26_W_DATA);
+  float *output = reinterpret_cast<float *>(output_bits);
+  for (int im = 0; im < R26_LM; im++)
+    for (int jn = 0; jn < R26_LN; jn++) {
+      R26_MMUL lo, hi;
+      auto a = aie::load_v<R26_SA>(activations + (im * R26_KT) * R26_SA);
+      const int8 *w = weights + (jn * R26_KT) * R26_SB;
+      lo.mul(a, aie::load_v<R26_MMUL::size_B>(w));
+      hi.mul(a, aie::load_v<R26_MMUL::size_B>(w + R26_MMUL::size_B));
+      for (int k = 1; k < R26_KT; k++) {
+        a = aie::load_v<R26_SA>(activations + (im * R26_KT + k) * R26_SA);
+        w = weights + (jn * R26_KT + k) * R26_SB;
+        lo.mac(a, aie::load_v<R26_MMUL::size_B>(w));
+        hi.mac(a, aie::load_v<R26_MMUL::size_B>(w + R26_MMUL::size_B));
+      }
+      auto vlo = lo.template to_vector<int32>();
+      auto vhi = hi.template to_vector<int32>();
+      auto weight_scale = aie::load_v<16>(weight_scales + jn * 16);
+      for (int row = 0; row < 8; row++) {
+        const int offset = [&] {
+          if constexpr (OUTPUT_LN == 2 * R26_LN)
+            return (im * 8 + row) * 96 + NMACRO * 48 + jn * 16;
+          else
+            return (im * OUTPUT_LN + NMACRO * R26_LN + jn) * R26_SC +
+                   row * 16;
+        }();
+        auto values = aie::to_float(r26_join_rows(vlo, vhi, row));
+        auto scaled = aie::mul(values, weight_scale).template to_vector<float>();
+        scaled = aie::mul(
+                     scaled,
+                     aie::broadcast<float, 16>(activation_scales[im * 8 + row]))
+                     .template to_vector<float>();
+        if (accumulate) scaled = aie::add(scaled, aie::load_v<16>(output + offset));
+        aie::store_v(output + offset, scaled);
+      }
+    }
+}
+
+extern "C" void r26_gate_scaled(const int8 *a, const int8 *w, int32 *c,
+                                int accumulate) {
+  r26_w8_scaled<R26_LN, 0>(a, w, c, accumulate);
+}
+
+extern "C" void r26_down0_scaled(const int8 *a, const int8 *w, int32 *c,
+                                 int accumulate) {
+  r26_w8_scaled<2 * R26_LN, 0>(a, w, c, accumulate);
+}
+
+extern "C" void r26_down1_scaled(const int8 *a, const int8 *w, int32 *c,
+                                 int accumulate) {
+  r26_w8_scaled<2 * R26_LN, 1>(a, w, c, accumulate);
+}
+
+constexpr int R26_ACCUMULATOR_WORDS = 1152;
+
+extern "C" __attribute__((noinline, minsize)) void
+r26_gate_scaled_at(const int8 *a, const int8 *w, int32 *c, int accumulate,
+                   int slot) {
+  r26_gate_scaled(a, w, c + slot * R26_ACCUMULATOR_WORDS, accumulate);
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r26_gate_scaled_split(const int8 *a, const int8 *w, int32 *lo, int32 *hi,
+                      int accumulate, int slot) {
+  int32 *c = slot < 3 ? lo + slot * R26_ACCUMULATOR_WORDS
+                       : hi + (slot - 3) * R26_ACCUMULATOR_WORDS;
+  r26_gate_scaled(a, w, c, accumulate);
+}
+
+static inline aie::vector<float, 16>
+r26_geglu16(aie::vector<float, 16> gate, aie::vector<float, 16> up) {
+  auto one = aie::broadcast<float, 16>(1.0f);
+  auto half = aie::broadcast<float, 16>(0.5f);
+  auto beta = aie::broadcast<float, 16>(0.044715f);
+  auto factor = aie::broadcast<float, 16>(0.7978845608028654f);
+  auto g2 = aie::mul(gate, gate).template to_vector<float>();
+  auto g3 = aie::mul(g2, gate).template to_vector<float>();
+  auto inner = aie::add(gate, aie::mul(g3, beta).template to_vector<float>());
+  auto arg = aie::mul(inner, factor).template to_vector<float>();
+  auto tanh_bf16 = aie::tanh<bfloat16>(arg);
+  auto tanh_f32 =
+      aie::mul(tanh_bf16, aie::broadcast<bfloat16, 16>(1.0f))
+          .template to_vector<float>();
+  auto cdf = aie::mul(aie::add(one, tanh_f32), half).template to_vector<float>();
+  return aie::mul(aie::mul(gate, cdf).template to_vector<float>(), up)
+      .template to_vector<float>();
+}
+
+// Store each core's 24 logical columns in a 96-wide physical row. The last
+// eight lanes use scalar
+// stores only after the MMUL accumulator has been materialized, avoiding the
+// unstable live-register 8-lane store attempted in R18.
+extern "C" __attribute__((noinline, minsize)) void
+r26_geglu_padded(const int32 *__restrict accumulator_bits,
+#ifdef R35_CANONICAL_BF16
+                 int8 *__restrict output_bytes) {
+  bfloat16 *output = reinterpret_cast<bfloat16 *>(output_bytes);
+#else
+                 float *__restrict output) {
+#endif
+  const float *accumulator = reinterpret_cast<const float *>(accumulator_bits);
+  for (int im = 0; im < 3; im++)
+    for (int row = 0; row < 8; row++) {
+      const int j0 = (im * 3) * R26_SC + row * 16;
+      const int j1 = (im * 3 + 1) * R26_SC + row * 16;
+      const int j2 = (im * 3 + 2) * R26_SC + row * 16;
+      auto *destination = output + (im * 8 + row) *
+#ifdef R35_CANONICAL_BF16
+                                      32;
+#else
+                                      96;
+#endif
+#ifdef R35_CANONICAL_BF16
+      const auto head_bf16 =
+          aie::mul(r26_geglu16(aie::load_v<16>(accumulator + j0),
+                               aie::load_v<16>(accumulator + j1)),
+                   1.0f)
+              .template to_vector<bfloat16>();
+      aie::store_v(destination, head_bf16);
+#else
+      aie::store_v(destination,
+                   r26_geglu16(aie::load_v<16>(accumulator + j0),
+                               aie::load_v<16>(accumulator + j1)));
+#endif
+      auto gate = aie::concat(aie::load_v<8>(accumulator + j2),
+                              aie::zeros<float, 8>());
+      auto up = aie::concat(aie::load_v<8>(accumulator + j2 + 8),
+                            aie::zeros<float, 8>());
+      auto tail = r26_geglu16(gate, up);
+#ifdef R35_CANONICAL_BF16
+      const auto tail_bf16 = aie::mul(tail, 1.0f).to_vector<bfloat16>();
+      const auto bridge = aie::concat(head_bf16.template extract<8>(1),
+                                      tail_bf16.template extract<8>(0));
+      aie::store_v(destination + 16, bridge);
+#else
+      for (int lane = 0; lane < 8; lane++)
+        destination[16 + lane] = tail[lane];
+#endif
+  }
+}
+
+#ifdef R35_CANONICAL_BF16
+extern "C" __attribute__((noinline, minsize)) void
+r26_geglu_padded_at(const int32 *__restrict accumulator_bits,
+                    int8 *__restrict output_bytes, int slot) {
+  r26_geglu_padded(accumulator_bits + slot * R26_ACCUMULATOR_WORDS,
+                   output_bytes);
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r26_geglu_padded_split(const int32 *__restrict lo,
+                       const int32 *__restrict hi,
+                       int8 *__restrict output_bytes, int slot) {
+  const int32 *accumulator =
+      slot < 3 ? lo + slot * R26_ACCUMULATOR_WORDS
+               : hi + (slot - 3) * R26_ACCUMULATOR_WORDS;
+  r26_geglu_padded(accumulator, output_bytes);
+}
+#endif
+
+#ifdef R35_CANONICAL_BF16
+static inline aie::vector<bfloat16, 16>
+r41_bf16_component(aie::vector<float, 16> values, int component) {
+  const auto high = aie::mul(values, 1.0f).template to_vector<bfloat16>();
+  if (component == 0) return high;
+  const auto high_float =
+      aie::mul(high, aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+          .template to_vector<float>();
+  return aie::mul(aie::sub(values, high_float), 1.0f)
+      .template to_vector<bfloat16>();
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r35_finish_down48_bf16(const int32 *__restrict accumulator_bits,
+                       int8 *__restrict output_bytes, int lane
+#ifdef R41_CANONICAL_BF16X2_OUTPUT
+                       , int component
+#endif
+                       ) {
+  const float *accumulator = reinterpret_cast<const float *>(accumulator_bits);
+  bfloat16 *output = reinterpret_cast<bfloat16 *>(output_bytes);
+  for (int im = 0; im < 3; ++im)
+    for (int row = 0; row < 8; ++row) {
+      bfloat16 *destination = output + (im * 8 + row) * 32;
+      const int j0 = (im * 3) * R26_SC + row * 16;
+      const int j1 = (im * 3 + 1) * R26_SC + row * 16;
+      const int j2 = (im * 3 + 2) * R26_SC + row * 16;
+      if (lane == 0) {
+#ifdef R41_CANONICAL_BF16X2_OUTPUT
+        const auto head = r41_bf16_component(
+            aie::load_v<16>(accumulator + j0), component);
+        const auto j1_values = r41_bf16_component(
+            aie::load_v<16>(accumulator + j1), component);
+#else
+        const auto head =
+            aie::mul(aie::load_v<16>(accumulator + j0), 1.0f)
+                .template to_vector<bfloat16>();
+        const auto j1_values =
+            aie::mul(aie::load_v<16>(accumulator + j1), 1.0f)
+                .template to_vector<bfloat16>();
+#endif
+        const auto bridge = aie::concat(head.template extract<8>(1),
+                                        j1_values.template extract<8>(0));
+        aie::store_v(destination, head);
+        aie::store_v(destination + 16, bridge);
+      } else {
+#ifdef R41_CANONICAL_BF16X2_OUTPUT
+        const auto j1_values = r41_bf16_component(
+            aie::load_v<16>(accumulator + j1), component);
+        const auto j2_values = r41_bf16_component(
+            aie::load_v<16>(accumulator + j2), component);
+#else
+        const auto j1_values =
+            aie::mul(aie::load_v<16>(accumulator + j1), 1.0f)
+                .template to_vector<bfloat16>();
+        const auto j2_values =
+            aie::mul(aie::load_v<16>(accumulator + j2), 1.0f)
+                .template to_vector<bfloat16>();
+#endif
+        const auto head = aie::concat(j1_values.template extract<8>(1),
+                                      j2_values.template extract<8>(0));
+        aie::store_v(destination, head);
+        aie::store_v(destination + 16, j2_values);
+      }
+    }
+}
+
+#ifdef R41_CANONICAL_BF16X2_OUTPUT
+extern "C" __attribute__((noinline, minsize)) void
+r35_finish_down48_bf16_pair(const int32 *__restrict accumulator_bits,
+                            int8 *__restrict lane0_bytes,
+                            int8 *__restrict lane1_bytes, int component) {
+  const float *accumulator = reinterpret_cast<const float *>(accumulator_bits);
+  bfloat16 *lane0 = reinterpret_cast<bfloat16 *>(lane0_bytes);
+  bfloat16 *lane1 = reinterpret_cast<bfloat16 *>(lane1_bytes);
+  for (int block = 0; block < 24; ++block) {
+      const int im = block >> 3;
+      const int row = block & 7;
+      bfloat16 *destination0 = lane0 + block * 32;
+      bfloat16 *destination1 = lane1 + block * 32;
+      const int j0 = (im * 3) * R26_SC + row * 16;
+      const int j1 = (im * 3 + 1) * R26_SC + row * 16;
+      const int j2 = (im * 3 + 2) * R26_SC + row * 16;
+      const auto j0_values = r41_bf16_component(
+          aie::load_v<16>(accumulator + j0), component);
+      const auto j1_values = r41_bf16_component(
+          aie::load_v<16>(accumulator + j1), component);
+      const auto j2_values = r41_bf16_component(
+          aie::load_v<16>(accumulator + j2), component);
+      aie::store_v(destination0, j0_values);
+      aie::store_v(destination0 + 16,
+                   aie::concat(j0_values.template extract<8>(1),
+                               j1_values.template extract<8>(0)));
+      aie::store_v(destination1,
+                   aie::concat(j1_values.template extract<8>(1),
+                               j2_values.template extract<8>(0)));
+      aie::store_v(destination1 + 16, j2_values);
+  }
+}
+
+#endif
+
+extern "C" __attribute__((noinline, minsize)) void
+r35_finish_down48_bf16_at(const int32 *__restrict accumulator_bits,
+                          int8 *__restrict output_bytes, int lane, int slot) {
+  r35_finish_down48_bf16(
+      accumulator_bits + slot * R26_ACCUMULATOR_WORDS, output_bytes, lane
+#ifdef R41_CANONICAL_BF16X2_OUTPUT
+      , 0
+#endif
+  );
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r35_finish_down48_bf16_split(const int32 *__restrict lo,
+                             const int32 *__restrict hi,
+                             int8 *__restrict output_bytes, int lane,
+                             int slot) {
+  const int32 *accumulator =
+      slot < 3 ? lo + slot * R26_ACCUMULATOR_WORDS
+               : hi + (slot - 3) * R26_ACCUMULATOR_WORDS;
+  r35_finish_down48_bf16(
+      accumulator, output_bytes, lane
+#ifdef R41_CANONICAL_BF16X2_OUTPUT
+      , 0
+#endif
+  );
+}
+#endif
+
+template <unsigned STRIDE>
+__attribute__((noinline)) static void r26_fwht16(float *__restrict scratch) {
+  for (int block = 0; block < R26_GROUP; block += 16) {
+    auto values = aie::load_v<16>(scratch + block);
+    auto a = aie::filter_even(values, STRIDE);
+    auto b = aie::filter_odd(values, STRIDE);
+    aie::store_v(scratch + block,
+                 aie::concat(aie::interleave_zip(aie::add(a, b),
+                                                 aie::sub(a, b), STRIDE)));
+  }
+}
+
+#ifdef R123_WEIGHT_STATIONARY
+#define R26_PACK_RESTRICT
+#else
+#define R26_PACK_RESTRICT __restrict
+#endif
+
+static void r26_pack_row(
+#ifdef R35_CANONICAL_BF16
+                         const int8 *R26_PACK_RESTRICT input_bytes,
+#ifdef R45_DIRECT_X_PRE_NORM
+                         float inverse,
+#endif
+#else
+                         const float *__restrict input,
+#endif
+                         const int8 *__restrict weight_payload,
+                         int8 *R26_PACK_RESTRICT quantized,
+                         float *R26_PACK_RESTRICT scratch,
+                         float &scale) {
+  const float *params = reinterpret_cast<const float *>(
+      weight_payload + R26_PARAM_OFFSET);
+  const float *awq = params;
+  const float *signs1 = awq + R26_GROUP;
+  const float *signs2 = signs1 + R26_GROUP;
+  for (int i = 0; i < R26_GROUP; i += 16) {
+#ifdef R35_CANONICAL_BF16
+    aie::vector<float, 16> input =
+        aie::mul(aie::load_unaligned_v<16>(
+                     reinterpret_cast<const bfloat16 *>(input_bytes) + i),
+                 aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+            .template to_vector<float>();
+#ifdef R45_DIRECT_X_PRE_NORM
+    if (inverse >= 0.0f) {
+      const auto *pre_norm = reinterpret_cast<const bfloat16 *>(
+          weight_payload + R45_PRE_NORM_OFFSET);
+      const auto norm =
+          aie::mul(aie::load_v<16>(pre_norm + i),
+                   aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+              .template to_vector<float>();
+      const auto weighted = aie::mul(input, norm).template to_vector<float>();
+      const auto normalized_bf16 =
+          aie::mul(weighted, aie::broadcast<float, 16>(inverse))
+              .template to_vector<bfloat16>();
+      input = aie::mul(normalized_bf16,
+                       aie::broadcast<bfloat16, 16>((bfloat16)1.0f))
+                  .template to_vector<float>();
+    }
+#endif
+    auto divided = aie::div(input, aie::load_v<16>(awq + i))
+                       .template to_vector<float>();
+#else
+    auto divided = aie::div(aie::load_unaligned_v<16>(input + i),
+                            aie::load_v<16>(awq + i))
+                       .template to_vector<float>();
+#endif
+    aie::store_v(scratch + i,
+                 aie::mul(divided, aie::load_v<16>(signs1 + i))
+                     .template to_vector<float>());
+  }
+  r26_fwht16<1>(scratch);
+  r26_fwht16<2>(scratch);
+  r26_fwht16<4>(scratch);
+  r26_fwht16<8>(scratch);
+  for (int stride = 16; stride < R26_GROUP; stride <<= 1)
+    for (int block = 0; block < R26_GROUP; block += 2 * stride)
+      for (int i = 0; i < stride; i += 16) {
+        auto a = aie::load_v<16>(scratch + block + i);
+        auto b = aie::load_v<16>(scratch + block + i + stride);
+        aie::store_v(scratch + block + i, aie::add(a, b));
+        aie::store_v(scratch + block + i + stride, aie::sub(a, b));
+      }
+  float max_abs = 0.0f;
+  for (int i = 0; i < R26_GROUP; i += 16) {
+    auto scaled =
+        aie::mul(aie::mul(aie::load_v<16>(scratch + i),
+                          aie::load_v<16>(signs2 + i))
+                     .template to_vector<float>(),
+                 aie::broadcast<float, 16>(0.0625f))
+            .template to_vector<float>();
+    aie::store_v(scratch + i, scaled);
+    const float local_max = aie::reduce_max(aie::abs(scaled));
+    if (local_max > max_abs) max_abs = local_max;
+  }
+  scale = max_abs > 0.0f ? max_abs / 127.0f : 0.0f;
+  const auto old_rounding = aie::swap_rounding(aie::rounding_mode::symmetric_inf);
+  const auto old_saturation = aie::swap_saturation(aie::saturation_mode::symmetric);
+  for (int i = 0; i < R26_GROUP; i += 16) {
+    auto values = scale > 0.0f
+                      ? aie::to_fixed<int8>(
+                            aie::div(aie::load_v<16>(scratch + i), scale)
+                                .template to_vector<float>())
+                      : aie::zeros<int8, 16>();
+    aie::store_v(quantized + i, values);
+  }
+  aie::set_saturation(old_saturation);
+  aie::set_rounding(old_rounding);
+}
+
+extern "C" __attribute__((minsize)) void
+r26_pack3(const int8 *R26_PACK_RESTRICT input_bytes,
+#ifdef R45_DIRECT_X_PRE_NORM
+          const float *__restrict inverse_table,
+#endif
+          const int8 *__restrict weight_payload,
+          int8 *__restrict activation_payload, float *__restrict scratch,
+          int8 *R26_PACK_RESTRICT fragment, int owner, int group) {
+  (void)activation_payload;
+#ifdef R35_CANONICAL_BF16
+  const int mblock = group < 0 ?
+#ifdef R55_REUSE_GATE_ACTIVATION
+      -group - 1
+#else
+      (-group - 1) / 6
+#endif
+      : -1;
+  const int8 *owned = input_bytes + owner * R26_FRAGMENT_ROWS * R26_GROUP * 2;
+  constexpr int ROW_BYTES = R26_GROUP * 2;
+#else
+  const float *input = reinterpret_cast<const float *>(input_bytes);
+  constexpr int ROW_WINDOW = 288;
+  const int skip = (group * R26_GROUP) % 24;
+  const float *owned = input + (owner & 1) * R26_FRAGMENT_ROWS * ROW_WINDOW;
+#endif
+  float *scales = reinterpret_cast<float *>(fragment + 3 * R26_GROUP);
+  for (int row = 0; row < R26_FRAGMENT_ROWS; row++)
+    r26_pack_row(
+#ifdef R35_CANONICAL_BF16
+                 owned + row * ROW_BYTES,
+#ifdef R45_DIRECT_X_PRE_NORM
+                 mblock < 0 ? -1.0f
+                            : inverse_table[mblock * R26_FRAGMENT_ROWS + row],
+#endif
+#else
+                 owned + row * ROW_WINDOW + skip,
+#endif
+                 weight_payload,
+                 fragment + row * R26_GROUP, scratch, scales[row]);
+  reinterpret_cast<int *>(fragment)[R26_FRAGMENT_WORDS - 1] = 0;
+}
+
+#ifdef R123_WEIGHT_STATIONARY
+extern "C" __attribute__((noinline, minsize)) void
+r123_pack3_owned(const int8 *__restrict input_bytes,
+                 const int8 *__restrict weight_payload,
+                 int8 *__restrict activation_payload, int owner, int group) {
+  const int8 *owned =
+      input_bytes + owner * R26_FRAGMENT_ROWS * R26_GROUP * 2;
+  float *scratch = reinterpret_cast<float *>(
+      const_cast<int8 *>(input_bytes) + (owner == 0 ? 1536 : 0));
+  int8 *quantized = reinterpret_cast<int8 *>(scratch);
+  float *scales =
+      reinterpret_cast<float *>(activation_payload + R26_A_DATA);
+  for (int row = 0; row < R26_FRAGMENT_ROWS; ++row) {
+    float scale;
+    r26_pack_row(owned + row * R26_GROUP * 2, weight_payload, quantized,
+                 scratch, scale);
+    const int local_row = owner * R26_FRAGMENT_ROWS + row;
+    const int im = local_row / 8;
+    const int rr = local_row % 8;
+    for (int kt = 0; kt < R26_KT; ++kt) {
+      const int target = (im * R26_KT + kt) * R26_SA + rr * 8;
+      reinterpret_cast<int *>(activation_payload + target)[0] =
+          reinterpret_cast<const int *>(quantized + kt * 8)[0];
+      reinterpret_cast<int *>(activation_payload + target)[1] =
+          reinterpret_cast<const int *>(quantized + kt * 8)[1];
+    }
+    scales[local_row] = scale;
+  }
+}
+#endif
+
+#undef R26_PACK_RESTRICT
+
+#ifdef R45_DIRECT_X_PRE_NORM
+extern "C" __attribute__((minsize)) void
+r45_select_inverses(const int8 *__restrict physical_records,
+                    float *__restrict selected, int core_row, int owner) {
+  for (int mblock = 0; mblock < 3; ++mblock)
+    for (int row = 0; row < R26_FRAGMENT_ROWS; ++row) {
+      const int token = mblock * 96 + core_row * 24
+                        + owner * R26_FRAGMENT_ROWS + row;
+      const int wave = token >> 7;
+      const int within_wave = token & 127;
+      const int source_core_row = within_wave >> 5;
+      const int within_core = within_wave & 31;
+      const int column = wave * 4 + (within_core >> 3);
+      const int lane = within_core & 7;
+      const int record = source_core_row * 8 + column;
+      selected[mblock * R26_FRAGMENT_ROWS + row] =
+          reinterpret_cast<const float *>(physical_records + record * 512)[lane];
+    }
+}
+
+extern "C" __attribute__((minsize)) void
+r45_select_inverses_batch(const int8 *__restrict physical_records,
+                          float *__restrict selected, int core_row, int owner,
+                          int macro_chunk) {
+  for (int mblock = 0; mblock < 3; ++mblock)
+    for (int row = 0; row < R26_FRAGMENT_ROWS; ++row) {
+      const int token = mblock * 96 + core_row * 24
+                        + owner * R26_FRAGMENT_ROWS + row;
+      const int wave = token >> 7;
+      const int within_wave = token & 127;
+      const int source_core_row = within_wave >> 5;
+      const int within_core = within_wave & 31;
+      const int column = wave * 4 + (within_core >> 3);
+      const int lane = within_core & 7;
+      const int record = source_core_row * 8 + column;
+      selected[(macro_chunk * 3 + mblock) * R26_FRAGMENT_ROWS + row] =
+          reinterpret_cast<const float *>(physical_records + record * 512)[lane];
+    }
+}
+#endif
+
+extern "C" __attribute__((minsize)) void
+r26_insert_fragment(const int8 *__restrict fragment_base,
+                    int8 *__restrict activation_payload, int owner
+#ifdef R55_REUSE_GATE_ACTIVATION
+                    , int group
+#endif
+                    ) {
+#ifdef R55_REUSE_GATE_ACTIVATION
+  const int8 *fragment = fragment_base + group * R26_FRAGMENT_BYTES;
+#else
+  const int8 *fragment = fragment_base;
+#endif
+  float *scales = reinterpret_cast<float *>(activation_payload + R26_A_DATA);
+  for (int row = 0; row < 3; row++) {
+    const int local_row = owner * 3 + row;
+    const int im = local_row / 8;
+    const int rr = local_row % 8;
+    for (int kt = 0; kt < 32; kt++) {
+      const int target = (im * 32 + kt) * 64 + rr * 8;
+      const int source = row * R26_GROUP + kt * 8;
+      reinterpret_cast<int *>(activation_payload + target)[0] =
+          reinterpret_cast<const int *>(fragment + source)[0];
+      reinterpret_cast<int *>(activation_payload + target)[1] =
+          reinterpret_cast<const int *>(fragment + source)[1];
+    }
+    scales[local_row] =
+        reinterpret_cast<const float *>(fragment + 3 * R26_GROUP)[row];
+  }
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r26_send_fragment(const int8 *__restrict fragment_base
+#ifdef R55_REUSE_GATE_ACTIVATION
+                  , int group
+#endif
+                  ) {
+#ifdef R55_REUSE_GATE_ACTIVATION
+  const int8 *fragment = fragment_base + group * R26_FRAGMENT_BYTES;
+#else
+  const int8 *fragment = fragment_base;
+#endif
+  const int *words = reinterpret_cast<const int *>(fragment);
+  for (int word = 0; word < R26_FRAGMENT_WORDS; word++) put_ms(words[word]);
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r26_receive_fragment(int8 *__restrict fragment) {
+  int *words = reinterpret_cast<int *>(fragment);
+  for (int word = 0; word < R26_FRAGMENT_WORDS; word++) words[word] = get_ss_int();
+}
+
+#ifdef R123_WEIGHT_STATIONARY
+__attribute__((noinline, minsize)) static void
+r123_send_owned_activation(const int8 *__restrict activation_payload,
+                           int owner) {
+  const float *scales =
+      reinterpret_cast<const float *>(activation_payload + R26_A_DATA);
+  for (int row = 0; row < R26_FRAGMENT_ROWS; ++row) {
+    const int local_row = owner * R26_FRAGMENT_ROWS + row;
+    const int im = local_row / 8;
+    const int rr = local_row % 8;
+    for (int kt = 0; kt < R26_KT; ++kt) {
+      const int source = (im * R26_KT + kt) * R26_SA + rr * 8;
+      const int *words =
+          reinterpret_cast<const int *>(activation_payload + source);
+      put_ms(words[0]);
+      put_ms(words[1]);
+    }
+  }
+  for (int row = 0; row < R26_FRAGMENT_ROWS; ++row) {
+    const int local_row = owner * R26_FRAGMENT_ROWS + row;
+    put_ms(reinterpret_cast<const int *>(scales + local_row)[0]);
+  }
+  put_ms(0);
+}
+
+extern "C" __attribute__((noinline, minsize)) void
+r123_exchange_fragments(int8 *__restrict input_workspace,
+                        int8 *__restrict activation_payload, int owner) {
+  int8 *transit = input_workspace + (owner == 0 ? 1536 : 0);
+  for (int broadcast_owner = 0; broadcast_owner < 8; ++broadcast_owner) {
+    if (owner == broadcast_owner) {
+      r123_send_owned_activation(activation_payload, owner);
+    } else {
+      r26_receive_fragment(transit);
+      r26_insert_fragment(transit, activation_payload, broadcast_owner);
+      if (owner != (broadcast_owner + 7) % 8)
+        r26_send_fragment(transit);
+    }
+  }
+}
+#endif
+
+#ifdef R55_REUSE_GATE_ACTIVATION
+extern "C" __attribute__((noinline, minsize)) void
+r55_pack3_cached(const int8 *__restrict input_bytes,
+                 const float *__restrict inverse_table,
+                 const int8 *__restrict weight_payload,
+                 int8 *__restrict activation_payload, float *__restrict scratch,
+                 int8 *__restrict cached, int owner, int mblock_token,
+                 int group) {
+  r26_pack3(input_bytes, inverse_table, weight_payload, activation_payload,
+            scratch, cached + group * R26_FRAGMENT_BYTES, owner, mblock_token);
+}
+#endif

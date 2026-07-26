@@ -40,11 +40,14 @@ description = "Inference orchestrator for RDNA GPUs"
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-gemma3", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-minimax", "arch-lfm2moe", "arch-dots-ocr", "deltanet"]
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-gemma3", "arch-gemma3-vl", "arch-gemma4", "arch-embeddinggemma", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-minimax", "arch-lfm2moe", "arch-dots-ocr", "deltanet"]
 deltanet = ["hipfire-rdna/deltanet", "hipfire-dispatch/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
 arch-gemma3 = []
+arch-gemma3-vl = []
+arch-gemma4 = []
+arch-embeddinggemma = []
 arch-llama = []
 arch-qwen2 = []
 arch-deepseek4 = []
@@ -53,6 +56,7 @@ arch-lfm2moe = []
 arch-dots-ocr = []
 experimental-examples = []
 [dependencies]
+inventory = "0.3"
 hipfire-kvquant = { path = "../hipfire-kvquant" }
 hipfire-quant-format = { path = "../hipfire-quant-format" }
 hipfire-primitives = { path = "../hipfire-primitives" }
@@ -64,7 +68,9 @@ hipfire-evidence = { path = "../hipfire-evidence" }
 # the inference hot path for one symbol (collect_default_host_profile).
 hipfire-sysinfo = { path = "../hipfire-sysinfo" }
 hipfire-generate = { path = "../hipfire-generate" }
+hipfire-config = { path = "../hipfire-config" }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-arch-api = { path = "../hipfire-arch-api" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-state = { path = "../hipfire-state" }
 hip-bridge = { path = "../hip-bridge" }
@@ -85,6 +91,7 @@ base64.workspace = true
 libc.workspace = true
 rayon.workspace = true
 twox-hash = { version = "2", default-features = false, features = ["xxhash64", "xxhash3_128"] }
+sha2 = "0.10"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 hipfire-detect = { path = "../hipfire-detect" }
@@ -103,6 +110,12 @@ minijinja = { version = "2", features = ["loop_controls", "json", "preserve_orde
 # template which uses these throughout.
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 
+# DFlash NPU block body (DflashNpuBody) for the Phase-1 serial NPU draft seam.
+# xdna only depends on hipfire-rdna, so this adds no dependency cycle. Linux-only
+# (the NPU path is amdxdna/XRT); referenced behind cfg(target_os = "linux").
+[target.'cfg(target_os = "linux")'.dependencies]
+hipfire-xdna = { path = "../hipfire-xdna" }
+
 # Examples in this crate (daemon, infer_qwen35, infer_qwen3, infer_vl, etc.)
 # consume the arch crates. These are dev-dependencies — cargo refuses
 # optional dev-dependencies AND its cycle checker excludes the dev-dep
@@ -113,17 +126,22 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 # below.
 [dev-dependencies]
 hipfire-cpu = { path = "../hipfire-cpu" }
+hipfire-xdna = { path = "../hipfire-xdna" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
+hipfire-arch-api = { path = "../hipfire-arch-api" }
 hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
+hipfire-arch-gemma3-vl = { path = "../hipfire-arch-gemma3-vl" }
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
+hipfire-arch-embeddinggemma = { path = "../hipfire-arch-embeddinggemma" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-zaya = { path = "../hipfire-arch-zaya" }
 hipfire-arch-nemotron = { path = "../hipfire-arch-nemotron" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
-# hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" } # chaingun: needs swa_topk_wmma methods (not yet on this branch)
-# hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }  # chaingun: unclosed delimiter from merge
+hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
+hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-atlas = { path = "../hipfire-atlas" }
 
 # Each example below carries `required-features` listing the cargo
@@ -156,7 +174,7 @@ name = "load_transport_probe"
 required-features = ["deltanet"]
 
 [[example]]
-name = "oq4_repack"
+name = "optimize"
 required-features = ["arch-qwen35"]
 
 [[example]]
@@ -210,6 +228,10 @@ required-features = ["arch-qwen35"]
 [[example]]
 name = "dflash_spec_demo"
 required-features = ["arch-qwen35"]
+
+[[example]]
+name = "fixture_golden"
+required-features = ["arch-qwen35", "arch-qwen2", "arch-gemma3", "arch-gemma3-vl", "arch-gemma4", "arch-llama", "arch-lfm2moe", "arch-dots-ocr"]
 
 [[example]]
 name = "mtp_probe_demo"
@@ -349,7 +371,7 @@ required-features = ["experimental-examples", "arch-qwen35"]
 
 [[example]]
 name = "collect_artifacts"
-required-features = ["arch-qwen35", "arch-gemma3", "arch-lfm2moe"]
+required-features = ["arch-qwen35", "arch-gemma3", "arch-embeddinggemma", "arch-lfm2moe"]
 
 # Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
 # No GPU / arch features needed (tokenizer is pure CPU).

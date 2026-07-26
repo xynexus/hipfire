@@ -1,0 +1,48 @@
+{
+  "schema": "hipfire.latent_kv_corpus.v0",
+  "strict_split": true,
+  "sources": {
+    "calibration": {
+      "dataset": "allenai/c4",
+      "revision": "1588ec454efa1a09f29cd18ddd04fe05fc8653a2",
+      "config": "realnewslike",
+      "split": "train",
+      "viewer_offset": 50000,
+      "license": "ODC-By-1.0; also subject to CommonCrawl Terms of Use",
+      "raw": {
+        "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-c4-balanced-page-mixture-20260711/raw/c4-realnewslike-train-offset50000-length100.rows.json",
+        "bytes": 279250,
+        "sha256": "a3009d94ee62730bd1672811e3cd4d69b822bb04add7901911520b8992b4ee04",
+        "records": 100
+      }
+    },
+    "validation": {
+      "dataset": "allenai/c4",
+      "revision": "1588ec454efa1a09f29cd18ddd04fe05fc8653a2",
+      "config": "realnewslike",
+      "split": "validation",
+      "viewer_offset": 10000,
+      "license": "ODC-By-1.0; also subject to CommonCrawl Terms of Use",
+      "raw": {
+        "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-c4-balanced-page-mixture-20260711/raw/c4-realnewslike-validation-offset10000-length100.rows.json",
+        "bytes": 328991,
+        "sha256": "440ab8bc938688593a38093dcfa506c98b19a124235a85447c7c2eaf7c7aad2c",
+        "records": 100
+      }
+    }
+  },
+  "outputs": {
+    "calibration": {
+      "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-c4-balanced-page-mixture-20260711/c4-realnewslike-train-calibration.jsonl",
+      "bytes": 242292,
+      "sha256": "aa0240de0250edc0c9f1ff8324d0d99de1184dbe55990236dc838f01625d6255",
+      "records": 64
+    },
+    "validation": {
+      "path": "/home/sadara/hipfire/benchmarks/corpora/latent-kv-c4-balanced-page-mixture-20260711/c4-realnewslike-validation.jsonl",
+      "bytes": 149879,
+      "sha256": "ba33a0151bcee50a62e78dcda1afde259ceb9e87f20dc8af297db064cbfd710b",
+      "records": 16
+    }
+  }
+}

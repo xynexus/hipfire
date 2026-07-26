@@ -36,7 +36,7 @@ pub struct WeightTensor {
     pub gpu_dtype: DType,  // dispatch type for kernel selection
     pub m: usize,          // output dim (rows)
     pub k: usize,          // input dim (cols)
-    pub row_stride: usize, // padded row bytes (Q8HFQ only, 0 for others)
+    pub row_stride: usize, // byte stride/layout discriminator for packed formats; 0 otherwise
     /// ParoQuant Givens rotation metadata. None for all non-ParoQuant formats.
     pub paro: Option<ParoRotation>,
     /// Phase A Stage A — AWQ per-channel scale vector, length K, dtype F16.
@@ -103,6 +103,8 @@ pub enum EmbeddingFormat {
     HFQ4G256, // raw HFQ4-G256 blocks, use GPU dequant kernel
     HFQ4G128, // raw HFQ4-G128 blocks, use GPU dequant kernel
     Q8_0,     // raw Q8_0 blocks, use GPU dequant kernel
+    BF16,     // native bf16 table, gather+convert to F32 inline (no F32 copy)
+    F16,      // native f16 table, gather+convert to F32 inline (no F32 copy)
 }
 
 pub struct LayerWeights {
@@ -342,16 +344,10 @@ mod preflight_tests {
                 "oq4" => DType::Oq4G256,
                 "oq4+" => DType::Oq4G256,
                 "oq4++" => DType::Oq4G256,
-                "op4" => DType::Oq4G256,
-                "op4-4" => DType::Oq4G256,
-                "op4-4+" => DType::Oq4G256,
-                "op4-8+" => DType::Oq4G256,
+                "oq4.25++" => DType::Oq8G256,
                 "oq8" => DType::Oq8G256,
                 "oq8+" => DType::Oq8G256,
                 "oq8++" => DType::Oq8G256,
-                "op8" => DType::Oq8G256,
-                "op8-16" => DType::Oq8G256,
-                "op8-16+" => DType::Oq8G256,
                 "mq3" => DType::MQ3G256,
                 "qtip3" => DType::Qtip3G256,
                 "qtip4" => DType::Qtip4G256,
@@ -384,6 +380,24 @@ mod preflight_tests {
     }
 }
 
+#[inline]
+fn capture_at_weight_gemv_wrapper(dtype: DType) -> bool {
+    // Full-precision GEMV routes terminate in capture-aware RDNA entrypoints:
+    // BF16 in `gemm_bf16_x_bf16_wmma_labeled`, F16 in
+    // `gemm_f16_batched_lmhead`. Keeping wrapper capture enabled for either
+    // would count each activation twice. Quantized routes have no universal
+    // lower-level chokepoint and remain owned here.
+    !matches!(dtype, DType::BF16 | DType::F16)
+}
+
+#[inline]
+fn capture_at_weight_gemm_wrapper(dtype: DType) -> bool {
+    // Batched BF16 reaches the same capture-aware labeled WMMA entrypoint.
+    // Batched F16 instead uses `gemm_f16_x_f32_wmma`, which deliberately does
+    // not capture, so its wrapper remains the owner.
+    dtype != DType::BF16
+}
+
 pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
@@ -400,7 +414,9 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
     // This is the single chokepoint that makes activation capture work for
     // every arch that routes its linears through `weight_gemv` (qwen2,
     // gemma3, minimax dense, qwen35 dense) — not just qwen35's fused kernels.
-    gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
+    if capture_at_weight_gemv_wrapper(w.gpu_dtype) {
+        gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
+    }
     let ctx = DispatchCtx::new(gpu);
     let wr = WeightRef {
         buf: &w.buf,
@@ -424,11 +440,7 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
 
     macro_rules! xr {
         () => {{
-            GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            }
+            gpu.mq_x_rot_f32()
         }};
     }
 
@@ -1124,11 +1136,7 @@ pub fn weight_gemv_residual(
             // hfq6g256_residual against the rotated activations. Saves one
             // add_inplace_f32 launch per layer per token vs the generic path.
             gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
+            let x_rot_alias = gpu.mq_x_rot_f32();
             // F2: AWQ-aware routing. `w` is the downstream linear that
             // consumes x_rot; route via _for helper so its awq_scale (if
             // any) is applied via the AWQ kernel variant.
@@ -1150,11 +1158,7 @@ pub fn weight_gemv_residual(
         }
         DType::ParoQ4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
             gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
+            let x_rot_alias = gpu.mq_x_rot_f32();
             gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
             gpu.gemv_paro4g128_residual_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
         }
@@ -1168,11 +1172,7 @@ pub fn weight_gemv_residual(
         }
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
+            let x_rot_alias = gpu.mq_x_rot_f32();
             // F2: AWQ-aware routing. `w` is the downstream linear that
             // consumes x_rot; route via _for helper so its awq_scale (if
             // any) is applied via the AWQ kernel variant.
@@ -1187,11 +1187,7 @@ pub fn weight_gemv_residual(
             // path. gfx1100 picks the K4-unrolled chip variant (commit
             // 0003103, 9B MQ3 decode 114 to 141 tok/s).
             gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
+            let x_rot_alias = gpu.mq_x_rot_f32();
             // F2: AWQ-aware routing. `w` is the downstream linear that
             // consumes x_rot; route via _for helper so its awq_scale (if
             // any) is applied via the AWQ kernel variant.
@@ -1206,11 +1202,7 @@ pub fn weight_gemv_residual(
             // 9B Lloyd-MQ3 per the 2026-05-06 decode profile). gfx1100
             // picks the K4 + LDS-codebook chip variant.
             gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
+            let x_rot_alias = gpu.mq_x_rot_f32();
             // F2: AWQ-aware routing. `w` is the downstream linear that
             // consumes x_rot; route via _for helper so its awq_scale (if
             // any) is applied via the AWQ kernel variant.
@@ -1222,11 +1214,7 @@ pub fn weight_gemv_residual(
             // Same fusion shape as MQ3-Lloyd; gfx1100 picks the K4 + LDS +
             // single-acc fast variant (see kernel header for why single-acc).
             gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
+            let x_rot_alias = gpu.mq_x_rot_f32();
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
             gpu.maybe_capture_activation(&w.buf, &x_rot_alias, 1, w.k);
             gpu.gemv_mq4g256_lloyd_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
@@ -1272,11 +1260,7 @@ pub fn weight_gemv_swiglu_residual(
         // MQ6 down + residual fusion: same FWHT rotate + fused-residual
         // pattern as MQ3 / MQ4, dispatched against the HFQ6 kernel.
         gpu.ensure_mq_signs()?;
-        let x_rot_alias = GpuTensor {
-            buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-            shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-            dtype: DType::F32,
-        };
+        let x_rot_alias = gpu.mq_x_rot_f32();
         // F2: AWQ-aware routing for the down_proj input stage.
         // `w_down` IS the downstream weight; route through _for helper.
         fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
@@ -1285,11 +1269,7 @@ pub fn weight_gemv_swiglu_residual(
     match w_down.gpu_dtype {
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
+            let x_rot_alias = gpu.mq_x_rot_f32();
             // F2: AWQ-aware routing for the down_proj input stage.
             // `w_down` IS the downstream weight; route through _for helper.
             fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
@@ -1302,11 +1282,7 @@ pub fn weight_gemv_swiglu_residual(
             // one silu_mul_f32 launch and one add_inplace_f32 launch versus
             // the four-step generic path.
             gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
+            let x_rot_alias = gpu.mq_x_rot_f32();
             // F2: AWQ-aware routing for the down_proj input stage.
             // `w_down` IS the downstream weight; route through _for helper.
             fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
@@ -1318,11 +1294,7 @@ pub fn weight_gemv_swiglu_residual(
             // residual in one launch. Saves one silu_mul_f32 launch versus
             // the generic three-step path (silu_mul + rotate + gemv_residual).
             gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
+            let x_rot_alias = gpu.mq_x_rot_f32();
             // F2: AWQ-aware routing for the down_proj input stage.
             // `w_down` IS the downstream weight; route through _for helper.
             fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
@@ -1332,21 +1304,13 @@ pub fn weight_gemv_swiglu_residual(
             // Same fusion shape as MQ3-Lloyd; gfx1100 picks the K4 + LDS +
             // single-acc fast variant of the residual GEMV.
             gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
+            let x_rot_alias = gpu.mq_x_rot_f32();
             fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_mq4g256_lloyd_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
         }
         DType::ParoQ4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
             gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
+            let x_rot_alias = gpu.mq_x_rot_f32();
             gpu.gemv_paro4g128_swiglu_residual_with_prerotate(
                 &w_down.buf,
                 gate,
@@ -1362,11 +1326,7 @@ pub fn weight_gemv_swiglu_residual(
         }
         DType::ParoQ4G128 => {
             gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
+            let x_rot_alias = gpu.mq_x_rot_f32();
             gpu.gemv_paro4g128t_swiglu_residual_with_prerotate(
                 &w_down.buf,
                 gate,
@@ -1403,7 +1363,9 @@ pub fn weight_gemm(
     // This is what makes wide batched-prefill calibration possible — every arch
     // routing its prefill linears through `weight_gemm` (gemma3, qwen2, …) now
     // captures `batch_size`× more samples per launch instead of N=1 per token.
-    gpu.maybe_capture_activation(&w.buf, x, batch_size, w.k);
+    if capture_at_weight_gemm_wrapper(w.gpu_dtype) {
+        gpu.maybe_capture_activation(&w.buf, x, batch_size, w.k);
+    }
     match w.gpu_dtype {
         DType::F16 => gpu.gemm_f16_x_f32_wmma(&w.buf, x, y, w.m, w.k, batch_size),
         DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, batch_size),
@@ -1565,5 +1527,23 @@ mod tests {
             dense_swiglu_residual_route(DType::MQ4G256),
             DenseSwigluResidualRoute::Unclassified
         );
+    }
+
+    #[test]
+    fn full_precision_capture_has_one_owner_per_dispatch_shape() {
+        // BF16 GEMV and GEMM both terminate in the labeled BF16 WMMA
+        // chokepoint, which owns activation capture for direct lowered-super-op
+        // callers too. The generic wrappers must therefore not capture BF16 a
+        // second time. F16 GEMV likewise terminates in the capture-aware scalar
+        // dispatch, while F16 GEMM's WMMA path relies on its wrapper capture.
+        assert!(!capture_at_weight_gemv_wrapper(DType::BF16));
+        assert!(!capture_at_weight_gemv_wrapper(DType::F16));
+        assert!(!capture_at_weight_gemm_wrapper(DType::BF16));
+        assert!(capture_at_weight_gemm_wrapper(DType::F16));
+
+        // Quantized paths do not provide a universal lower-level capture
+        // chokepoint, so their generic wrapper remains the single owner.
+        assert!(capture_at_weight_gemv_wrapper(DType::Oq4G256));
+        assert!(capture_at_weight_gemm_wrapper(DType::Oq4G256));
     }
 }

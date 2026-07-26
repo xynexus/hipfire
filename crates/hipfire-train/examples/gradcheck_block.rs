@@ -29,8 +29,8 @@
 //!   cargo run -p hipfire-train --release --example gradcheck_block
 //!   hipfire gpu-lock release
 
-use hipfire_train::block::{block_backward, block_forward, BlockDims, BlockLora, BlockWeights};
 use hipfire_rdna::{Gpu, GpuTensor, HipResult};
+use hipfire_train::block::{block_backward, block_forward, BlockDims, BlockLora, BlockWeights};
 
 const SEQ: usize = 3;
 const H: usize = 8;
@@ -74,7 +74,7 @@ fn loss(
     pos: &[f32],
 ) -> HipResult<f32> {
     let lora = BlockLora { aq, bq, av, bv };
-    let (x_out, _) = block_forward(gpu, x, w, &lora, &dims(), pos)?;
+    let (x_out, _) = block_forward(gpu, x, w, &lora, &dims(), pos, 0)?;
     let ov = gpu.download_f32(&x_out)?;
     Ok(ov.iter().zip(g).map(|(p, q)| p * q).sum())
 }
@@ -129,7 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         av: &av,
         bv: &bv,
     };
-    let (_xo, acts) = block_forward(&mut gpu, &x, &w, &lora, &dims(), &pos)?;
+    let (_xo, acts) = block_forward(&mut gpu, &x, &w, &lora, &dims(), &pos, 0)?;
     let d_x_out = up(&mut gpu, &gh)?;
     let (_dx, grads) = block_backward(&mut gpu, &d_x_out, &x, &w, &lora, &acts, &dims())?;
     let daq = gpu.download_f32(&grads.daq)?;

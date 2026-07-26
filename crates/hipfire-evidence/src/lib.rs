@@ -615,6 +615,7 @@ pub const QUALITY_TRIGGER_METRICS: &[&str] = &[
     "argmax_match_rate",
     "accuracy",
     "exact_match",
+    "spearman",
 ];
 
 pub const DFLASH_TRACE_NUMERIC_METRICS: &[&str] =
@@ -1339,6 +1340,22 @@ pub fn evidence_record_json(record: EvidenceRecord) -> Value {
     })
 }
 
+/// Per-metric admission dead-band: a delta whose magnitude is within the
+/// tolerance is treated as `unchanged` instead of `improved`/`regressed`, so a
+/// tiny quantization wobble does not auto-reject. Metrics absent from the map
+/// use `0.0`, preserving the historical exact-equality semantics for every
+/// existing metric. `spearman` (STS-Benchmark correlation vs human gold) gets a
+/// ~1.0-point band because sub-point drops are within run-to-run noise and do
+/// not reflect real retrieval-quality loss.
+fn admission_metric_tolerance(metric: &str) -> f64 {
+    const TOLERANCE: &[(&str, f64)] = &[("spearman", 0.01)];
+    TOLERANCE
+        .iter()
+        .find(|(name, _)| metric == *name || metric.ends_with(name))
+        .map(|(_, tol)| *tol)
+        .unwrap_or(0.0)
+}
+
 pub fn evidence_metric_direction(metric: &str, delta: f64) -> String {
     let lower_is_better = [
         "mean_kld",
@@ -1359,22 +1376,24 @@ pub fn evidence_metric_direction(metric: &str, delta: f64) -> String {
         "tau",
         "accuracy",
         "exact_match",
+        "spearman",
     ]
     .iter()
     .any(|prefix| metric == *prefix || metric.ends_with(prefix));
 
+    let tol = admission_metric_tolerance(metric);
     if lower_is_better {
-        if delta < 0.0 {
+        if delta < -tol {
             "improved".to_string()
-        } else if delta > 0.0 {
+        } else if delta > tol {
             "regressed".to_string()
         } else {
             "unchanged".to_string()
         }
     } else if higher_is_better {
-        if delta > 0.0 {
+        if delta > tol {
             "improved".to_string()
-        } else if delta < 0.0 {
+        } else if delta < -tol {
             "regressed".to_string()
         } else {
             "unchanged".to_string()
@@ -1390,7 +1409,7 @@ pub fn admission_metric_is_quality(battery: &str, metric: &str) -> bool {
     matches!(battery, "quality" | "barrage")
         || matches!(
             metric,
-            "mean_kld" | "p99_kld" | "ppl" | "nll" | "accuracy" | "exact_match"
+            "mean_kld" | "p99_kld" | "ppl" | "nll" | "accuracy" | "exact_match" | "spearman"
         )
 }
 
@@ -1424,6 +1443,12 @@ pub fn required_admission_evidence_requirements(
         required.push(AdmissionEvidenceRequirement {
             kind: "barrage",
             batteries: vec!["barrage"],
+        });
+    }
+    if selected.iter().any(|battery| battery == "diffusion") {
+        required.push(AdmissionEvidenceRequirement {
+            kind: "diffusion",
+            batteries: vec!["diffusion"],
         });
     }
     required
@@ -2307,6 +2332,14 @@ mod tests {
         );
         assert_eq!(evidence_metric_direction("custom_metric", 1.0), "changed");
         assert_eq!(evidence_metric_direction("custom_metric", 0.0), "unchanged");
+        // spearman is higher-is-better with a ~1.0-point dead-band: sub-point
+        // drops are `unchanged`, beyond-band drops `regressed`.
+        assert_eq!(evidence_metric_direction("spearman", 0.02), "improved");
+        assert_eq!(evidence_metric_direction("spearman", -0.02), "regressed");
+        assert_eq!(evidence_metric_direction("spearman", -0.004), "unchanged");
+        assert_eq!(evidence_metric_direction("spearman", 0.004), "unchanged");
+        // The dead-band is per-metric; zero-tolerance metrics are unaffected.
+        assert_eq!(evidence_metric_direction("tok_s", -0.004), "regressed");
     }
 
     #[test]
@@ -2319,6 +2352,8 @@ mod tests {
         assert!(!admission_metric_is_quality("speed", "tok_s"));
         assert!(!admission_metric_is_quality("dflash", "accept_rate"));
         assert!(!admission_metric_is_quality("coherence", "hard_fails"));
+        // A spearman regression on the embedding_quality battery is a hard reject.
+        assert!(admission_metric_is_quality("embedding_quality", "spearman"));
     }
 
     #[test]
@@ -2351,6 +2386,15 @@ mod tests {
         assert_eq!(with_barrage.len(), 2);
         assert_eq!(with_barrage[1].kind, "barrage");
         assert_eq!(with_barrage[1].batteries, vec!["barrage"]);
+
+        let diffusion = required_admission_evidence_requirements(["diffusion"]);
+        assert_eq!(
+            diffusion,
+            vec![AdmissionEvidenceRequirement {
+                kind: "diffusion",
+                batteries: vec!["diffusion"],
+            }]
+        );
     }
 
     #[test]

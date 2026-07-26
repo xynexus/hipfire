@@ -9,11 +9,11 @@
 //! contract that builds recurrent/KV state before decode.
 
 use crate::model::NemotronModel;
+use hipfire_rdna::{Gpu, GpuTensor};
 use hipfire_runtime::arch::{
     run_simple_ar, ArchCaps, GenerateCtx, ServeOutcome, ServingBackend, SimpleAr,
 };
 use hipfire_runtime::tokenizer::Tokenizer;
-use hipfire_rdna::{Gpu, GpuTensor};
 
 impl SimpleAr for NemotronModel {
     fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {

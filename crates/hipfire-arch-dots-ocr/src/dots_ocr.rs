@@ -41,9 +41,9 @@
 use hip_bridge::HipResult;
 use hipfire_arch_qwen2::qwen2::{Qwen2Config, Qwen2Weights};
 use hipfire_model::tokenizer::Tokenizer;
+use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::{f16_to_f32, f32_to_f16};
-use hipfire_rdna::{DType, Gpu, GpuTensor};
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -1307,7 +1307,7 @@ pub fn vision_forward(
             gpu.attention_dflash_wmma_m32_f32(
                 &q_buf, &k_buf, &v_buf, &attn, n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;
-        } else if use_wmma && head_dim.is_multiple_of(16) {
+        } else if use_wmma && head_dim.is_multiple_of(16) && n_patches >= 32 {
             gpu.attention_dflash_wmma_f32(
                 &q_buf, &k_buf, &v_buf, &attn, n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;

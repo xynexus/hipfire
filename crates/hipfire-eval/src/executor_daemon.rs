@@ -29,6 +29,7 @@ pub(crate) fn daemon_battery_rows(
         BatteryId::Smoke => Some(run_daemon_smoke_rows(config, ctx)),
         BatteryId::Speed => Some(run_daemon_speed_rows(config, ctx)),
         BatteryId::Profile => Some(run_daemon_profile_rows(config, ctx)),
+        BatteryId::Cask => Some(run_daemon_cask_rows(config, ctx)),
         BatteryId::Coherence | BatteryId::Longctx | BatteryId::Agentic => {
             examples_battery_rows(battery, config, ctx, datasets)
         }
@@ -603,6 +604,25 @@ pub(crate) fn daemon_model_load_params(config: &EvalConfig, max_seq: usize) -> M
     }
 }
 
+pub(crate) fn daemon_cask_load_params(config: &EvalConfig, max_seq: usize) -> ModelLoadParams {
+    ModelLoadParams {
+        max_seq: max_seq.min(u32::MAX as usize) as u32,
+        kv_cache: config.kv_mode.clone(),
+        dflash_mode: Some(config.dflash.as_str().to_string()),
+        draft: config.draft.clone(),
+        cask_sidecar: config
+            .cask_sidecar
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        cask: Some(true),
+        cask_budget: Some(config.cask_budget.min(u32::MAX as usize) as u32),
+        cask_beta: Some(config.cask_beta.min(u32::MAX as usize) as u32),
+        cask_core_frac: Some(0.5),
+        cask_fold_m: Some(2),
+        ..Default::default()
+    }
+}
+
 pub(crate) fn daemon_generate_request(
     id: String,
     prompt_text: String,
@@ -832,15 +852,269 @@ pub(crate) fn daemon_speed_failure_rows_for_model(
         .collect()
 }
 
+pub(crate) fn cask_recall_status(
+    text: &str,
+    expected_answer: &str,
+    prefill_tokens: Option<u32>,
+    physical_cap: usize,
+) -> (EvalStatus, Option<String>) {
+    if text.is_empty() || text.contains('\u{fffd}') {
+        return (
+            EvalStatus::Fail,
+            Some("CASK long-context decode returned empty or replacement-character output".into()),
+        );
+    }
+    let recovered = !expected_answer.is_empty()
+        && text
+            .to_ascii_lowercase()
+            .contains(&expected_answer.to_ascii_lowercase());
+    if !recovered {
+        return (
+            EvalStatus::Fail,
+            Some("CASK long-context decode did not recover the committed needle".into()),
+        );
+    }
+    if !prefill_tokens.is_some_and(|tokens| tokens as usize > physical_cap) {
+        return (
+            EvalStatus::Fail,
+            Some(format!(
+                "CASK probe did not exceed its physical KV cap ({physical_cap} tokens)"
+            )),
+        );
+    }
+    (EvalStatus::Pass, None)
+}
+
+pub(crate) fn run_daemon_cask_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    let model_path = Path::new(&config.model);
+    if !model_path.exists() {
+        return vec![skip_row_with_metrics(
+            BatteryId::Cask,
+            None,
+            "embedded_cask_longctx_recall",
+            None,
+            "CASK daemon executor requires the model to resolve to a local filesystem path",
+            config,
+            ctx,
+            prompt("benchmarks/prompts/longprose_multidoc.jsonl"),
+            BTreeMap::from([("executor".to_string(), json!("daemon"))]),
+        )];
+    }
+    if let Some(sidecar) = config.cask_sidecar.as_ref() {
+        if !sidecar.exists() {
+            return vec![row(
+                BatteryId::Cask,
+                None,
+                "embedded_cask_longctx_recall",
+                None,
+                EvalStatus::Fail,
+                Some(format!(
+                    "explicit CASK sidecar does not exist: {}",
+                    sidecar.display()
+                )),
+                BTreeMap::from([
+                    ("implemented".to_string(), json!(true)),
+                    ("executor".to_string(), json!("daemon")),
+                ]),
+                config,
+                ctx,
+                prompt("benchmarks/prompts/longprose_multidoc.jsonl"),
+                0,
+            )];
+        }
+    } else if !hipfire_model::detect_sidecars(model_path).triattn {
+        return vec![skip_row_with_metrics(
+            BatteryId::Cask,
+            None,
+            "embedded_cask_longctx_recall",
+            None,
+            "model has no embedded or canonical sibling TriAttention component; pass --cask-sidecar for an explicit artifact",
+            config,
+            ctx,
+            prompt("benchmarks/prompts/longprose_multidoc.jsonl"),
+            BTreeMap::from([
+                ("implemented".to_string(), json!(true)),
+                ("executor".to_string(), json!("daemon")),
+            ]),
+        )];
+    }
+    let Some(bin) = hipfire_daemon_adapter::find_daemon_bin() else {
+        return vec![skip_row_with_metrics(
+            BatteryId::Cask,
+            None,
+            "embedded_cask_longctx_recall",
+            None,
+            "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`",
+            config,
+            ctx,
+            prompt("benchmarks/prompts/longprose_multidoc.jsonl"),
+            BTreeMap::from([("executor".to_string(), json!("daemon"))]),
+        )];
+    };
+
+    let started = SystemTime::now();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            return vec![row(
+                BatteryId::Cask,
+                None,
+                "embedded_cask_longctx_recall",
+                None,
+                EvalStatus::Fail,
+                Some(format!("create daemon CASK executor runtime: {err}")),
+                BTreeMap::from([
+                    ("implemented".to_string(), json!(true)),
+                    ("executor".to_string(), json!("daemon")),
+                ]),
+                config,
+                ctx,
+                prompt("benchmarks/prompts/longprose_multidoc.jsonl"),
+                elapsed_since_ms(started),
+            )]
+        }
+    };
+    match runtime.block_on(run_daemon_cask_rows_async(config, ctx, &bin)) {
+        Ok(mut rows) => {
+            let elapsed_ms = elapsed_since_ms(started);
+            for row in &mut rows {
+                row.elapsed_ms = elapsed_ms;
+            }
+            rows
+        }
+        Err(err) => vec![row(
+            BatteryId::Cask,
+            None,
+            "embedded_cask_longctx_recall",
+            None,
+            EvalStatus::Fail,
+            Some(format!("daemon-backed CASK executor failed: {err}")),
+            BTreeMap::from([
+                ("implemented".to_string(), json!(true)),
+                ("executor".to_string(), json!("daemon")),
+                ("daemon_bin".to_string(), json!(bin.display().to_string())),
+            ]),
+            config,
+            ctx,
+            prompt("benchmarks/prompts/longprose_multidoc.jsonl"),
+            elapsed_since_ms(started),
+        )],
+    }
+}
+
+pub(crate) async fn run_daemon_cask_rows_async(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+) -> anyhow::Result<Vec<EvalResult>> {
+    let longctx = materialize_longctx_prompt(config).map_err(anyhow::Error::msg)?;
+    let prompt_text = fs::read_to_string(&longctx.prompt_path)?;
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
+    let loaded = engine
+        .load(
+            &config.model,
+            daemon_cask_load_params(config, longctx.max_seq),
+        )
+        .await?;
+    let worker_key_id = loaded.worker_key_id.clone();
+    let evidence_dir = runtime_evidence_dir(config, "cask-longctx-recall", &config.model);
+    let request = daemon_generate_request(
+        "eval-cask-longctx-recall".to_string(),
+        prompt_text,
+        config.max_tokens,
+        Some(worker_key_id.clone()),
+        Some(&evidence_dir),
+    );
+    let (text, done) = engine.generate(request).await?;
+    let floor = config.cask_budget + config.cask_beta + 4;
+    let physical_cap = (config.cask_budget + config.cask_beta + 256)
+        .max(floor)
+        .min(longctx.max_seq);
+    let (status, reason) = cask_recall_status(
+        &text,
+        &longctx.expected_answer,
+        done.prefill_tokens,
+        physical_cap,
+    );
+    let recovered = text
+        .to_ascii_lowercase()
+        .contains(&longctx.expected_answer.to_ascii_lowercase());
+    let component_source = if config.cask_sidecar.is_some() {
+        "explicit"
+    } else if hipfire_model::read_hfq_metadata(Path::new(&config.model))
+        .ok()
+        .and_then(|metadata| serde_json::from_str::<Value>(&metadata.metadata_json).ok())
+        .and_then(|metadata| metadata.get("hipfire_compose").cloned())
+        .and_then(|manifest| manifest.get("components").cloned())
+        .and_then(|components| components.as_array().cloned())
+        .is_some_and(|components| {
+            components
+                .iter()
+                .any(|component| component.get("tag").and_then(Value::as_str) == Some("triattn"))
+        })
+    {
+        "embedded"
+    } else {
+        "sibling"
+    };
+    let mut metrics = longctx.metrics;
+    metrics.extend([
+        ("implemented".to_string(), json!(true)),
+        ("executor".to_string(), json!("daemon")),
+        ("daemon_bin".to_string(), json!(bin.display().to_string())),
+        ("worker_key_id".to_string(), json!(worker_key_id)),
+        ("component_source".to_string(), json!(component_source)),
+        ("cask_policy".to_string(), json!("cask_mfold")),
+        ("cask_budget".to_string(), json!(config.cask_budget)),
+        ("cask_beta".to_string(), json!(config.cask_beta)),
+        ("physical_cap".to_string(), json!(physical_cap)),
+        ("prefill_tokens".to_string(), json!(done.prefill_tokens)),
+        (
+            "prefill_exceeds_physical_cap".to_string(),
+            json!(done
+                .prefill_tokens
+                .is_some_and(|tokens| tokens as usize > physical_cap)),
+        ),
+        ("generated_tokens".to_string(), json!(done.tokens)),
+        ("text_bytes".to_string(), json!(text.len())),
+        ("expected_answer_recovered".to_string(), json!(recovered)),
+        (
+            "expected_answer_hash".to_string(),
+            json!(stable_hash_bytes(longctx.expected_answer.as_bytes())),
+        ),
+        (
+            "output_hash".to_string(),
+            json!(stable_hash_bytes(text.as_bytes())),
+        ),
+        (
+            "combined_dflash".to_string(),
+            json!(!matches!(config.dflash, DflashMode::Off)),
+        ),
+        (
+            "runtime_evidence_dir".to_string(),
+            json!(evidence_dir.display().to_string()),
+        ),
+    ]);
+    Ok(vec![row(
+        BatteryId::Cask,
+        None,
+        "embedded_cask_longctx_recall",
+        None,
+        status,
+        reason,
+        metrics,
+        config,
+        ctx,
+        Some(longctx.prompt_ref),
+        0,
+    )])
+}
+
 pub(crate) fn resolve_eval_model_path(model: &str) -> Option<PathBuf> {
-    let models_dir = std::env::var_os("HIPFIRE_MODELS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".hipfire")
-                .join("models")
-        });
+    let models_dir = eval_models_dir();
     find_model_in(model, &models_dir, None)
 }
 
@@ -893,6 +1167,9 @@ pub(crate) fn daemon_profile_skip_rows(
 }
 
 pub(crate) fn run_daemon_smoke_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    if let Some(server_url) = eval_server_url() {
+        return run_server_smoke_rows(config, ctx, &server_url);
+    }
     if !Path::new(&config.model).exists() {
         return daemon_smoke_skip_rows(
             config,
@@ -981,6 +1258,9 @@ pub(crate) fn run_daemon_smoke_rows(config: &EvalConfig, ctx: &EvalContext) -> V
 }
 
 pub(crate) fn run_daemon_speed_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    if let Some(server_url) = eval_server_url() {
+        return run_server_speed_rows(config, ctx, &server_url);
+    }
     if resolve_eval_model_path(&config.model).is_none() {
         return daemon_speed_skip_rows(
             config,
@@ -1043,6 +1323,398 @@ pub(crate) fn run_daemon_speed_rows(config: &EvalConfig, ctx: &EvalContext) -> V
                 )
             })
             .collect(),
+    }
+}
+
+fn run_server_smoke_rows(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    server_url: &str,
+) -> Vec<EvalResult> {
+    let started = SystemTime::now();
+    let prompt_path = "benchmarks/prompts/qwen2_smoke.txt";
+    let prompt_text = match read_repo_prompt_text(prompt_path) {
+        Ok(text) => text,
+        Err(err) => {
+            return daemon_smoke_skip_rows(config, ctx, &err.to_string(), &err.to_string());
+        }
+    };
+    let first = server_chat_completion(
+        server_url,
+        &config.model,
+        &prompt_text,
+        None,
+        None,
+        config.max_tokens,
+    );
+    let elapsed_ms = elapsed_since_ms(started);
+    let result = match first {
+        Ok(result) => result,
+        Err(err) => {
+            return vec![
+                row(
+                    BatteryId::Smoke,
+                    None,
+                    "load_metadata",
+                    None,
+                    EvalStatus::Fail,
+                    Some(format!("server-backed smoke executor failed: {err}")),
+                    BTreeMap::from([
+                        ("executor".to_string(), json!("server")),
+                        ("server_url".to_string(), json!(server_url)),
+                    ]),
+                    config,
+                    ctx,
+                    None,
+                    elapsed_ms,
+                ),
+                skip_row_with_metrics(
+                    BatteryId::Smoke,
+                    None,
+                    "finite_greedy_decode",
+                    None,
+                    "server-backed load failed before decode",
+                    config,
+                    ctx,
+                    prompt(prompt_path),
+                    BTreeMap::from([("executor".to_string(), json!("server"))]),
+                ),
+                skip_row_with_metrics(
+                    BatteryId::Smoke,
+                    None,
+                    "multi_turn_reset_recall",
+                    None,
+                    "server-backed load failed before session reset/recall",
+                    config,
+                    ctx,
+                    prompt("benchmarks/prompts/trains-meet.txt"),
+                    BTreeMap::from([("executor".to_string(), json!("server"))]),
+                ),
+            ];
+        }
+    };
+    let finite = !result.text.is_empty() && !result.text.contains('\u{fffd}');
+    let decode_status = if finite {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+    let decode_reason =
+        (!finite).then(|| "server returned empty or replacement-character output".to_string());
+    let mut decode_metrics = BTreeMap::from([
+        ("executor".to_string(), json!("server")),
+        ("server_url".to_string(), json!(server_url)),
+        (
+            "tokens".to_string(),
+            json!(timing_u64(&result.timings, "tokens")),
+        ),
+        ("text_bytes".to_string(), json!(result.text.len())),
+        ("max_tokens".to_string(), json!(config.max_tokens)),
+    ]);
+    insert_timing_metrics(&mut decode_metrics, &result.timings);
+    let session_row = server_reset_recall_row(config, ctx, server_url, started);
+    vec![
+        row(
+            BatteryId::Smoke,
+            None,
+            "load_metadata",
+            None,
+            EvalStatus::Pass,
+            None,
+            BTreeMap::from([
+                ("executor".to_string(), json!("server")),
+                ("server_url".to_string(), json!(server_url)),
+            ]),
+            config,
+            ctx,
+            None,
+            elapsed_ms,
+        ),
+        row(
+            BatteryId::Smoke,
+            None,
+            "finite_greedy_decode",
+            None,
+            decode_status,
+            decode_reason,
+            decode_metrics,
+            config,
+            ctx,
+            prompt(prompt_path),
+            elapsed_ms,
+        ),
+        session_row,
+    ]
+}
+
+fn server_reset_recall_row(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    server_url: &str,
+    started: SystemTime,
+) -> EvalResult {
+    let session_prompt_path = "benchmarks/prompts/trains-meet.txt";
+    let session_prompt_text = match read_repo_prompt_text(session_prompt_path) {
+        Ok(text) => text,
+        Err(err) => {
+            return skip_row_with_metrics(
+                BatteryId::Smoke,
+                None,
+                "multi_turn_reset_recall",
+                None,
+                &err.to_string(),
+                config,
+                ctx,
+                prompt(session_prompt_path),
+                BTreeMap::from([
+                    ("executor".to_string(), json!("server")),
+                    ("implemented".to_string(), json!(true)),
+                    ("server_url".to_string(), json!(server_url)),
+                ]),
+            );
+        }
+    };
+    let fail = |reason: String| {
+        row(
+            BatteryId::Smoke,
+            None,
+            "multi_turn_reset_recall",
+            None,
+            EvalStatus::Fail,
+            Some(reason),
+            BTreeMap::from([
+                ("executor".to_string(), json!("server")),
+                ("implemented".to_string(), json!(true)),
+                ("server_url".to_string(), json!(server_url)),
+                ("reset_count".to_string(), json!(2)),
+                ("kv_reset".to_string(), json!(true)),
+                ("dn_state_reset".to_string(), json!(true)),
+                ("max_tokens".to_string(), json!(config.max_tokens)),
+            ]),
+            config,
+            ctx,
+            prompt(session_prompt_path),
+            elapsed_since_ms(started),
+        )
+    };
+    if let Err(err) = server_reset(server_url) {
+        return fail(format!(
+            "server reset failed before first session turn: {err}"
+        ));
+    }
+    let first = match server_chat_completion(
+        server_url,
+        &config.model,
+        &session_prompt_text,
+        None,
+        None,
+        config.max_tokens,
+    ) {
+        Ok(result) => result,
+        Err(err) => return fail(format!("first session turn failed: {err}")),
+    };
+    let distractor = match server_chat_completion(
+        server_url,
+        &config.model,
+        "Remember this unrelated code word for the next turn: orchid. Reply with only OK.",
+        None,
+        None,
+        config.max_tokens,
+    ) {
+        Ok(result) => result,
+        Err(err) => return fail(format!("distractor session turn failed: {err}")),
+    };
+    if let Err(err) = server_reset(server_url) {
+        return fail(format!(
+            "server reset failed before repeated session turn: {err}"
+        ));
+    }
+    let second = match server_chat_completion(
+        server_url,
+        &config.model,
+        &session_prompt_text,
+        None,
+        None,
+        config.max_tokens,
+    ) {
+        Ok(result) => result,
+        Err(err) => return fail(format!("repeated session turn failed: {err}")),
+    };
+    let session_finite = !first.text.is_empty()
+        && !second.text.is_empty()
+        && !first.text.contains('\u{fffd}')
+        && !second.text.contains('\u{fffd}');
+    let session_match = first.text == second.text;
+    let status = if session_finite && session_match {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+    let reason = if !session_finite {
+        Some(
+            "server session reset smoke returned empty or replacement-character output".to_string(),
+        )
+    } else if !session_match {
+        Some("server repeated greedy session request produced different output".to_string())
+    } else {
+        None
+    };
+    row(
+        BatteryId::Smoke,
+        None,
+        "multi_turn_reset_recall",
+        None,
+        status,
+        reason,
+        BTreeMap::from([
+            ("executor".to_string(), json!("server")),
+            ("implemented".to_string(), json!(true)),
+            ("server_url".to_string(), json!(server_url)),
+            ("reset_count".to_string(), json!(2)),
+            ("kv_reset".to_string(), json!(true)),
+            ("dn_state_reset".to_string(), json!(true)),
+            ("session_turns".to_string(), json!(3)),
+            (
+                "first_tokens".to_string(),
+                json!(timing_u64(&first.timings, "tokens")),
+            ),
+            (
+                "distractor_tokens".to_string(),
+                json!(timing_u64(&distractor.timings, "tokens")),
+            ),
+            (
+                "second_tokens".to_string(),
+                json!(timing_u64(&second.timings, "tokens")),
+            ),
+            (
+                "first_text_hash".to_string(),
+                json!(stable_hash_bytes(first.text.as_bytes())),
+            ),
+            (
+                "second_text_hash".to_string(),
+                json!(stable_hash_bytes(second.text.as_bytes())),
+            ),
+            (
+                "distractor_text_hash".to_string(),
+                json!(stable_hash_bytes(distractor.text.as_bytes())),
+            ),
+            ("outputs_match".to_string(), json!(session_match)),
+            ("max_tokens".to_string(), json!(config.max_tokens)),
+        ]),
+        config,
+        ctx,
+        prompt(session_prompt_path),
+        elapsed_since_ms(started),
+    )
+}
+
+fn run_server_speed_rows(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    server_url: &str,
+) -> Vec<EvalResult> {
+    let started = SystemTime::now();
+    let prompt_path = "benchmarks/prompts/lru_cache_single_blank.txt";
+    let prompt_text = match read_repo_prompt_text(prompt_path) {
+        Ok(text) => text,
+        Err(err) => return daemon_speed_skip_rows(config, ctx, &err.to_string()),
+    };
+    let max_tokens = config.max_tokens.max(50);
+    daemon_speed_cases()
+        .iter()
+        .map(|case| {
+            let result = server_chat_completion(
+                server_url,
+                &config.model,
+                &prompt_text,
+                None,
+                None,
+                max_tokens,
+            );
+            match result {
+                Ok(result) => {
+                    let tokens = timing_u64(&result.timings, "tokens").unwrap_or(0);
+                    let finite = !result.text.is_empty()
+                        && !result.text.contains('\u{fffd}')
+                        && tokens > 0
+                        && (timing_f64(&result.timings, "decode_tok_s")
+                            .or_else(|| timing_f64(&result.timings, "tok_s")))
+                        .is_some_and(|value| value.is_finite() && value > 0.0);
+                    let status = if finite {
+                        EvalStatus::Pass
+                    } else {
+                        EvalStatus::Fail
+                    };
+                    let reason = (!finite).then(|| {
+                        "server speed anchor returned empty output or missing throughput metrics"
+                            .to_string()
+                    });
+                    let mut metrics = BTreeMap::from([
+                        ("implemented".to_string(), json!(true)),
+                        ("executor".to_string(), json!("server")),
+                        ("suite".to_string(), json!("daemon_speed_anchor")),
+                        ("server_url".to_string(), json!(server_url)),
+                        ("max_tokens".to_string(), json!(max_tokens)),
+                        ("tokens".to_string(), json!(tokens)),
+                        ("text_bytes".to_string(), json!(result.text.len())),
+                    ]);
+                    insert_timing_metrics(&mut metrics, &result.timings);
+                    row_for_model(
+                        BatteryId::Speed,
+                        None,
+                        case.label,
+                        None,
+                        status,
+                        reason,
+                        metrics,
+                        config,
+                        ctx,
+                        prompt(prompt_path),
+                        elapsed_since_ms(started),
+                        config.model.clone(),
+                    )
+                }
+                Err(err) => row_for_model(
+                    BatteryId::Speed,
+                    None,
+                    case.label,
+                    None,
+                    EvalStatus::Fail,
+                    Some(format!("server-backed speed executor failed: {err}")),
+                    BTreeMap::from([
+                        ("implemented".to_string(), json!(true)),
+                        ("executor".to_string(), json!("server")),
+                        ("suite".to_string(), json!("daemon_speed_anchor")),
+                        ("server_url".to_string(), json!(server_url)),
+                    ]),
+                    config,
+                    ctx,
+                    prompt(prompt_path),
+                    elapsed_since_ms(started),
+                    config.model.clone(),
+                ),
+            }
+        })
+        .collect()
+}
+
+fn insert_timing_metrics(metrics: &mut BTreeMap<String, Value>, timings: &Value) {
+    for key in [
+        "tok_s",
+        "prefill_tokens",
+        "prefill_ms",
+        "prefill_tok_s",
+        "decode_tok_s",
+        "ttft_ms",
+    ] {
+        if let Some(value) = timings.get(key) {
+            metrics.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(value) = timings.get("decode_tok_s") {
+        metrics
+            .entry("gen_tok_s".to_string())
+            .or_insert(value.clone());
     }
 }
 

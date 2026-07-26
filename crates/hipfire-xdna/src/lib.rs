@@ -47,6 +47,11 @@ pub enum XdnaError {
     Xclbin(xclbin::XclbinError),
     /// The xclbin has no AIE_PARTITION section (no PDI to load).
     NoAiePartition,
+    /// A cache directory name did not match the expected `..._{MT}x{NT}x{KCHUNK}_c{COLS}_nb{NB}`
+    /// shape (or was a whole-GEMM `_r{ROUNDS}` build the primitive can't consume).
+    BadCacheName(String),
+    /// Opus bytes, dimensions, encoding, or NPU cache shapes were invalid.
+    InvalidOpus(String),
 }
 
 impl From<xclbin::XclbinError> for XdnaError {
@@ -66,6 +71,15 @@ impl fmt::Display for XdnaError {
             XdnaError::DevBoOutsideHeap => write!(f, "DEV BO device address outside heap mapping"),
             XdnaError::Xclbin(e) => write!(f, "xclbin parse: {e}"),
             XdnaError::NoAiePartition => write!(f, "xclbin has no AIE_PARTITION section"),
+            XdnaError::BadCacheName(n) => {
+                write!(
+                    f,
+                    "cache dir '{n}' not a NpuGemmMp config (want ..._MTxNTxKCHUNK_cCOLS_nbNB)"
+                )
+            }
+            XdnaError::InvalidOpus(message) => {
+                write!(f, "invalid Opus input: {message}")
+            }
         }
     }
 }
@@ -148,9 +162,216 @@ pub mod kernel;
 pub use kernel::{NpuInFlight, NpuKernel};
 
 #[cfg(target_os = "linux")]
+pub mod full_embedding_encoder;
+#[cfg(target_os = "linux")]
+pub use full_embedding_encoder::{FullEmbeddingIoGeometry, NpuFullEmbeddingEncoder};
+
+pub mod embedding_attention;
+pub use embedding_attention::EmbeddingGemmaAttentionLayout;
+
+pub mod segmented_attention;
+#[cfg(target_os = "linux")]
+pub use segmented_attention::NpuSegmentedAttention;
+pub use segmented_attention::SegmentedAttentionGeometry;
+
+#[cfg(target_os = "linux")]
+pub mod qwen3_pack;
+#[cfg(target_os = "linux")]
+pub use qwen3_pack::{NpuQwen3AttentionUnpack, NpuQwen3KvPack, NpuQwen3QueryPack};
+
+#[cfg(target_os = "linux")]
+pub mod qwen3_projection;
+#[cfg(target_os = "linux")]
+pub use qwen3_projection::NpuQwen3Oq8Projection;
+
+#[cfg(target_os = "linux")]
+mod qwen3_residual_rmsnorm;
+#[cfg(target_os = "linux")]
+pub use qwen3_residual_rmsnorm::NpuQwen3ResidualRmsNorm;
+
+#[cfg(target_os = "linux")]
+mod qwen3_headnorm_rope;
+#[cfg(target_os = "linux")]
+pub use qwen3_headnorm_rope::{NpuQwen3HeadNormRope, Qwen3HeadNormRopeGeometry};
+
+#[cfg(target_os = "linux")]
+mod qwen3_swiglu;
+#[cfg(target_os = "linux")]
+pub use qwen3_swiglu::NpuQwen3SwiGlu;
+
+#[cfg(target_os = "linux")]
+mod qwen3_final_pool_l2;
+#[cfg(target_os = "linux")]
+pub use qwen3_final_pool_l2::NpuQwen3FinalPoolL2;
+
+#[cfg(target_os = "linux")]
+mod qwen3_encoder_blob;
+
+#[cfg(target_os = "linux")]
+pub mod attention_output_bf16;
+#[cfg(target_os = "linux")]
+pub use attention_output_bf16::{NpuAttentionOutputBf16, NpuAttentionOutputBf16Weights};
+
+#[cfg(target_os = "linux")]
+pub mod geglu;
+#[cfg(target_os = "linux")]
+pub use geglu::NpuGeGlu;
+
+// Wire-in step 2: NpuGemm — W4A8 GEMM primitive over the R6 kernel (tile marshaling).
+#[cfg(target_os = "linux")]
+pub mod gemm;
+#[cfg(target_os = "linux")]
+pub use gemm::NpuGemm;
+
+// NpuGemmMp — the productionized best path: M-parallel W-broadcast, row-major A/C via
+// tensor streams, weights broadcast once. One xclbin, any M. ~1.45 TOPS e2e on halo.
+#[cfg(target_os = "linux")]
+pub mod gemm_mp;
+#[cfg(target_os = "linux")]
+pub use gemm_mp::{NpuGemmMp, NpuGemmResidentWeights};
+
+// NpuGemmR14 — the 4x4 whole-array broadcast W4A8 GEMM (r14_gen.py), for npu1.
+#[cfg(target_os = "linux")]
+pub mod gemm_r14;
+#[cfg(target_os = "linux")]
+pub use gemm_r14::{NpuGemmR14, R14Geometry};
+
+// DFlash 5-layer NPU block body, lifted from examples/dflash_body_native.rs so
+// the runtime spec-decode loop can call it as a serial draft (Phase 1 seam).
+pub mod dflash_body;
+#[cfg(target_os = "linux")]
+pub use dflash_body::DflashNpuBody;
+
+// One AIE/XRT dispatch over every K=256 group in a complete projection.
+#[cfg(target_os = "linux")]
+pub mod gemm_fullk;
+#[cfg(target_os = "linux")]
+pub use gemm_fullk::{NpuFullKMode, NpuFullKResidentWeights, NpuGemmFullK};
+
+// Activation-once full-K projection schedule. Complete immutable records are
+// prepared offline; each AIE core reuses one compact activation stage across N.
+#[cfg(target_os = "linux")]
+pub mod gemm_staged_fullk;
+#[cfg(target_os = "linux")]
+pub use gemm_staged_fullk::{NpuGemmStagedFullK, NpuStagedFullKResidentWeights};
+
+// AIE2P 4x4 whole-array W4A8 GEMM. Each dispatch reuses four activation and
+// four weight stripes across all 16 compute tiles and returns K-group partials.
+#[cfg(target_os = "linux")]
+pub mod gemm_whole;
+#[cfg(target_os = "linux")]
+pub use gemm_whole::{NpuGemmWholeArray, NpuWholeMode, NpuWholeResidentWeights};
+
+#[cfg(target_os = "linux")]
+pub mod gemm_whole_scaled;
+#[cfg(target_os = "linux")]
+pub use gemm_whole_scaled::{
+    NpuGemmWholeScaled, NpuWholeScaledIoLayout, NpuWholeScaledResidentWeights,
+};
+
+#[cfg(target_os = "linux")]
+pub mod opus;
+#[cfg(target_os = "linux")]
+pub mod opus_hfp;
+#[cfg(target_os = "linux")]
+pub use opus::{
+    NpuOpusExecutor, NpuOpusGemmMp, OpusMatrixEncoding, OpusPackedMatrix, OpusResidentMode,
+};
+
+#[cfg(target_os = "linux")]
+pub mod resident_ffn;
+#[cfg(target_os = "linux")]
+pub use resident_ffn::{NpuResidentFfnW4, NpuResidentFfnW4IoMode, NpuResidentFfnW4Weights};
+
+#[cfg(target_os = "linux")]
+pub mod resident_ffn_w8;
+#[cfg(target_os = "linux")]
+pub use resident_ffn_w8::{
+    NpuResidentFfnDenseW8, NpuResidentFfnDenseW8IoMode, NpuResidentFfnDenseW8Weights,
+};
+
+#[cfg(target_os = "linux")]
+pub mod post_ffn_tail;
+#[cfg(target_os = "linux")]
+pub use post_ffn_tail::{NpuEmbeddingPostFfnTail, NpuEmbeddingPostFfnTailParams};
+
+#[cfg(target_os = "linux")]
+pub mod post_ffn_direct_tail;
+#[cfg(target_os = "linux")]
+pub use post_ffn_direct_tail::{
+    NpuEmbeddingPostFfnDirectTail, NpuEmbeddingPostFfnDirectTailParams,
+};
+pub mod post_ffn_direct_tail_bf16x2;
+pub use post_ffn_direct_tail_bf16x2::{
+    NpuEmbeddingPostFfnDirectTailBf16x2, NpuEmbeddingPostFfnDirectTailBf16x2Params,
+};
+
+#[cfg(target_os = "linux")]
+pub mod embedding_next_layer_prep;
+#[cfg(target_os = "linux")]
+pub use embedding_next_layer_prep::{
+    NpuEmbeddingNextLayerPrepW8, NpuEmbeddingNextLayerPrepW8Params,
+};
+
+#[cfg(target_os = "linux")]
+pub mod embedding_ffn_activation_prep;
+#[cfg(target_os = "linux")]
+pub use embedding_ffn_activation_prep::{
+    NpuEmbeddingFfnActivationPrepW4, NpuEmbeddingFfnActivationPrepW4Params,
+};
+
+#[cfg(target_os = "linux")]
+pub mod embedding_pre_ffn_unit_rms;
+#[cfg(target_os = "linux")]
+pub use embedding_pre_ffn_unit_rms::NpuEmbeddingPreFfnUnitRms;
+
+#[cfg(target_os = "linux")]
+pub mod embedding_residual_prep;
+#[cfg(target_os = "linux")]
+pub use embedding_residual_prep::NpuEmbeddingResidualPrep;
+
+#[cfg(target_os = "linux")]
+pub mod embedding_qkv_attention_opus;
+#[cfg(target_os = "linux")]
+pub use embedding_qkv_attention_opus::{
+    NpuEmbeddingQkvAttentionOpus, NpuEmbeddingQkvAttentionOpusOutput,
+    NpuEmbeddingQkvAttentionOpusWeights,
+};
+
+#[cfg(target_os = "linux")]
+pub mod embedding_final_norm_mean;
+#[cfg(target_os = "linux")]
+pub use embedding_final_norm_mean::{NpuEmbeddingFinalNormMean, NpuEmbeddingFinalNormMeanParams};
+
+#[cfg(target_os = "linux")]
+pub mod embedding_dense_l2;
+#[cfg(target_os = "linux")]
+pub use embedding_dense_l2::NpuEmbeddingDenseL2;
+
+#[cfg(target_os = "linux")]
+mod r34_prepacked;
+#[cfg(target_os = "linux")]
+pub mod resident_embedding_layer;
+#[cfg(target_os = "linux")]
+pub use resident_embedding_layer::{
+    NpuEmbeddingLayerAttentionDenseW8, NpuEmbeddingLayerAttentionDenseW8Weights,
+    NpuEmbeddingPreFfnException, NpuEmbeddingPreFfnState,
+};
+
+#[cfg(target_os = "linux")]
+pub mod resident_attention_w8;
+#[cfg(target_os = "linux")]
+pub use resident_attention_w8::{NpuResidentAttentionDenseW8, NpuResidentAttentionDenseW8Weights};
+
+#[cfg(target_os = "linux")]
+pub mod sparse3_mp;
+#[cfg(target_os = "linux")]
+pub use sparse3_mp::{NpuSparse3Mp, NpuSparse3ResidentWeights};
+
+#[cfg(target_os = "linux")]
 mod imp {
     use super::*; // brings the crate-root `submit` module into scope
-    use std::os::fd::{IntoRawFd, RawFd};
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
     #[repr(C)]
     struct GetInfo {
@@ -656,11 +877,56 @@ mod imp {
             })
         }
 
+        /// PRIME-export an XDNA-owned SHMEM BO as a dma-buf. A second XDNA
+        /// context can import the returned fd and address the same physical
+        /// pages without routing the handoff through amdgpu or host copies.
+        pub fn export_dmabuf(&self, buffer: &DeviceBuffer) -> Result<OwnedFd, XdnaError> {
+            if buffer.fd != self.fd {
+                return Err(XdnaError::Ioctl(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "cannot export a buffer owned by another XDNA device fd",
+                )));
+            }
+            let mut prime = submit::PrimeHandle {
+                handle: buffer.handle,
+                flags: submit::DRM_CLOEXEC | submit::DRM_RDWR,
+                fd: -1,
+            };
+            self.submit_ioctl(
+                submit::PRIME_HANDLE_TO_FD_REQUEST,
+                &mut prime as *mut _ as *mut libc::c_void,
+            )?;
+            if prime.fd < 0 {
+                return Err(XdnaError::Ioctl(std::io::Error::other(
+                    "PRIME export succeeded without returning a dma-buf fd",
+                )));
+            }
+            // SAFETY: a successful PRIME_HANDLE_TO_FD ioctl returns a new fd
+            // owned by the caller. OwnedFd closes that reference exactly once.
+            Ok(unsafe { OwnedFd::from_raw_fd(prime.fd) })
+        }
+
         /// Allocate + map the device heap the way XRT does: CREATE_BO(DEV_HEAP),
         /// then mmap at the fixed DEV_HEAP offset 0x1_0000_0000 with MAP_LOCKED so
         /// the firmware host-buffer map in aie2_hwctx_init succeeds. Returns the
         /// mapped DeviceBuffer (keep it alive for the hwctx's lifetime).
         pub fn alloc_dev_heap(&self, size: usize) -> Result<DeviceBuffer, XdnaError> {
+            self.alloc_dev_heap_at(size, DEV_HEAP_VA)
+        }
+
+        /// Allocate a device heap at a caller-selected, firmware-safe fixed VA.
+        /// Distinct live NPU kernels must not map their heaps over one another.
+        pub fn alloc_dev_heap_at(
+            &self,
+            size: usize,
+            fixed_va: usize,
+        ) -> Result<DeviceBuffer, XdnaError> {
+            if fixed_va % (2 * 1024 * 1024) != 0 {
+                return Err(XdnaError::Ioctl(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "NPU device heap VA must be 2 MiB aligned",
+                )));
+            }
             let mut cb = submit::CreateBo {
                 size: size as u64,
                 bo_type: submit::AMDXDNA_BO_DEV_HEAP,
@@ -685,7 +951,7 @@ mod imp {
             // (~0x7f..) and `aie2_hwctx_init`'s firmware host-buffer map is rejected;
             // any moderate 2 MiB-aligned VA (~0x70..-0x7b..) is accepted — XRT does the
             // same. Confirmed against the driver (dev_addr = AIE2_DEVM_BASE, 64-bit DMA).
-            let fixed_va = DEV_HEAP_VA as *mut libc::c_void;
+            let fixed_va = fixed_va as *mut libc::c_void;
             let ptr = unsafe {
                 libc::mmap(
                     fixed_va,
@@ -735,10 +1001,21 @@ mod imp {
 
         /// Sync a BO's cache to/from the device (`submit::SYNC_DIRECT_*`).
         pub fn sync_bo(&self, handle: u32, direction: u32, size: usize) -> Result<(), XdnaError> {
+            self.sync_bo_range(handle, direction, 0, size)
+        }
+
+        /// Sync a byte range of a BO's cache to/from the device.
+        pub fn sync_bo_range(
+            &self,
+            handle: u32,
+            direction: u32,
+            offset: usize,
+            size: usize,
+        ) -> Result<(), XdnaError> {
             let mut s = submit::SyncBo {
                 handle,
                 direction,
-                offset: 0,
+                offset: offset as u64,
                 size: size as u64,
             };
             self.submit_ioctl(

@@ -48,10 +48,10 @@
 #![allow(clippy::doc_lazy_continuation, clippy::needless_range_loop)]
 
 use hipfire_model::tokenizer::Tokenizer;
+use hipfire_rdna::Gpu;
 use hipfire_train::block::BlockActivations;
 use hipfire_train::loader::load_llama_fp32;
 use hipfire_train::model::{model_forward, LlamaModel, ModelActivations};
-use hipfire_rdna::Gpu;
 use std::path::{Path, PathBuf};
 
 /// Return every tensor of a forward's activations to the pool. `GpuTensor` has no

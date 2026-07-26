@@ -1,0 +1,5 @@
+artifact,source_mode,suffix,m,layers,layer0_residual_cosine,layer0_tail_cosine,layer0_hidden_cosine,layer0_ffn_cosine,layer0_complete_cosine,embedding_cosine,max_abs,total_ms,input_tok_s,package_w,tok_per_j,status
+EmbeddingGemma-300M.npu.oq8.hfq,dense_w8,base,256,24,0.99999866,0.99999811,0.99991855,0.99990620,0.99997103,0.99547863,0.01092630,864.929,296.0,21.05,14.1,pass
+EmbeddingGemma-300M.npu.oq8+.hfq,dense_w8,awq,256,24,0.99999866,0.99999847,0.99991672,0.99991502,0.99996270,0.99584466,0.01073230,855.854,299.1,20.04,14.9,pass
+EmbeddingGemma-300M.npu.oq8++.hfq,dense_w8,awq_ldlq,256,24,0.99999866,0.99999809,0.99991483,0.99991702,0.99996579,0.99571574,0.01081422,838.997,305.1,21.05,14.5,pass
+EmbeddingGemma-300M.npu.oq6.5.hfq,compact_mixed,base,256,24,0.99999866,0.99999856,0.99992250,0.99990987,0.99996804,0.95821863,0.04120442,868.020,294.9,21.00,14.0,pass_execution_quality_below_oq8

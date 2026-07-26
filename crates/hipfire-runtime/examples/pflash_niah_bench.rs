@@ -804,7 +804,18 @@ fn main() {
             kv_seq,
         )
         .expect("kv fwht2"),
-        other => panic!("unknown --kv-mode: {other} (q8|asym4|asym3|asym2|fwht4|fwht3|fwht2)"),
+        "kvarn" => KvCache::new_gpu_kvarn_filtered(
+            &mut gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+            KvCache::kvarn_bits_from_env(),
+        )
+        .expect("kv kvarn"),
+        other => {
+            panic!("unknown --kv-mode: {other} (q8|asym4|asym3|asym2|fwht4|fwht3|fwht2|kvarn)")
+        }
     };
     let mut dn_state =
         DeltaNetState::new_with_quant(&mut gpu, &config, state_quant).expect("dn_state");

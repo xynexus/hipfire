@@ -7,7 +7,7 @@
 
 use serde::Serialize;
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigScope {
     Global,
@@ -21,7 +21,7 @@ pub enum ConfigScope {
     Request,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigMutability {
     Static,
@@ -30,7 +30,7 @@ pub enum ConfigMutability {
     RequestOnly,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RestartImpact {
     None,
@@ -40,13 +40,14 @@ pub enum RestartImpact {
     ReconnectClients,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConfigType {
     Bool,
     U8,
     U16,
     U32,
+    U64,
     I32,
     F64,
     String,
@@ -55,7 +56,7 @@ pub enum ConfigType {
     Json,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "condition", rename_all = "snake_case")]
 pub enum Requirement {
     Optional,
@@ -173,6 +174,27 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Username for the /admin console login. The password is set separately with `hipfire admin set-password` (argon2id hash stored in ~/.hipfire/admin.passwd, never in config)."
     ),
     field!(
+        "api_auth_mode",
+        ConfigType::Enum {
+            values: &["auto", "off", "optional", "required"]
+        },
+        Requirement::Optional,
+        Some("auto"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "API credential policy. auto allows anonymous API calls only on loopback and requires credentials on non-loopback binds; off, optional, and required are explicit overrides.",
+        validation: "one of: auto, off, optional, required"
+    ),
+    field!(
+        "unsafe_allow_unauthenticated_remote",
+        ConfigType::Bool,
+        Requirement::Optional,
+        Some("false"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Explicit acknowledgement required before off or optional API authentication may bind to a non-loopback address."
+    ),
+    field!(
         "sdapi_output_root",
         ConfigType::String,
         Requirement::Optional,
@@ -182,13 +204,85 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Root directory for images saved by the SD API compatibility routes (save_images: true). Client-supplied outdir_* override_settings are ignored; every SD API image write stays under this root."
     ),
     field!(
+        "sdapi_max_dimension",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("4096"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Upper bound on any single SD API dimension (width/height and their highres/firstphase variants). Requests above it get a 400. The admin's DoS ceiling; clients may request smaller, never larger."
+    ),
+    field!(
+        "sdapi_max_steps",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("200"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Upper bound on SD API step counts (steps and hr_second_pass_steps)."
+    ),
+    field!(
+        "sdapi_max_batch_size",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("8"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Upper bound on SD API batch_size."
+    ),
+    field!(
+        "sdapi_max_n_iter",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("16"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Upper bound on SD API n_iter."
+    ),
+    field!(
+        "sdapi_max_total_batches",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("32"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Upper bound on batch_size × n_iter (total images generated per request)."
+    ),
+    field!(
+        "models_dir",
+        ConfigType::Path,
+        Requirement::Optional,
+        None,
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Primary local model root. When unset, Hipfire uses ~/.hipfire/models."
+    ),
+    field!(
+        "models_network_dir",
+        ConfigType::Path,
+        Requirement::Optional,
+        None,
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Optional extra read-only model root (e.g. an NFS share such as /srv/hipfire). When set, the network-facing server routes resolve model identifiers within this root in addition to models_dir. Unset by default; local CLI/eval callers are unaffected."
+    ),
+    field!(
         "default_model",
         ConfigType::String,
         Requirement::Optional,
         None,
         GLOBAL_RUNTIME,
         ConfigMutability::LoadTime,
-        "Model tag, alias, or path to pre-load or use by default."
+        "Model tag, alias, or path to use when a request omits the model."
+    ),
+    field!(
+        "prewarm_priority",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("0"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Startup background prewarm priority for a model. Set per model under model_overrides; 0 disables prewarm, higher values load earlier."
     ),
     field!(
         "max_seq",
@@ -239,24 +333,102 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         validation: "0.0.."
     ),
     field!(
-        "idle_timeout",
-        ConfigType::U32,
+        "resource_lock_enabled",
+        ConfigType::Bool,
         Requirement::Optional,
-        Some("300"),
+        Some("true"),
         GLOBAL_RUNTIME,
-        ConfigMutability::RuntimeReloadable,
-        "Seconds of inactivity before the server may evict an idle model."
+        ConfigMutability::Static,
+        "Whether hipfire serve asks the daemon to acquire physical accelerator resource locks at startup."
     ),
     field!(
-        "kv_cache",
+        "resource_lock_gpus",
+        ConfigType::Json,
+        Requirement::Optional,
+        Some("[\"auto\"]"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "GPU resources to lease before HIP initialization. [\"auto\"] maps to the daemon's detected/visible HIP device."
+    ),
+    field!(
+        "resource_lock_npus",
+        ConfigType::Json,
+        Requirement::Optional,
+        Some("[]"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "NPU resources to lease before accelerator initialization. [] disables NPU leases; [\"auto\"] leases every detected NPU."
+    ),
+    field!(
+        "resource_lock_wait_ms",
+        ConfigType::U32,
+        Requirement::Optional,
+        Some("0"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "Milliseconds to wait for busy resource leases during daemon startup; 0 fails fast."
+    ),
+    field!(
+        "scheduler_system_memory_budget_bytes",
+        ConfigType::U64,
+        Requirement::Optional,
+        Some("0"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "System-memory budget claimed by the residency scheduler. 0 disables the budget guard."
+    ),
+    field!(
+        "scheduler_system_memory_headroom_bytes",
+        ConfigType::U64,
+        Requirement::Optional,
+        Some("0"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "System-memory headroom preserved by residency admission. 0 disables the headroom guard."
+    ),
+    field!(
+        "scheduler_vram_budget_bytes",
+        ConfigType::U64,
+        Requirement::Optional,
+        Some("0"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "VRAM budget claimed by the residency scheduler. 0 disables the budget guard."
+    ),
+    field!(
+        "scheduler_vram_headroom_bytes",
+        ConfigType::U64,
+        Requirement::Optional,
+        Some("0"),
+        GLOBAL_RUNTIME,
+        ConfigMutability::Static,
+        "VRAM headroom preserved by residency admission. 0 disables the headroom guard."
+    ),
+    field!(
+        "model_residency_mode",
         ConfigType::Enum {
-            values: &["auto", "q8", "asym2", "asym3", "asym4"]
+            values: &["auto", "full", "qwen_moe_modules"]
         },
         Requirement::Optional,
         Some("auto"),
         GLOBAL_MODEL_RUNTIME,
         ConfigMutability::LoadTime,
-        "KV-cache precision and memory policy."
+        "Model residency strategy selected by the scheduler."
+    ),
+    field!(
+        "kv_cache",
+        ConfigType::Enum {
+            values: &["auto", "q8", "asym2", "asym3", "asym4", "kvarn2", "kvarn", "kvarn4", "kvarn8"]
+        },
+        Requirement::Optional,
+        Some("auto"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "KV-cache precision and memory policy. NOTE: asym2/asym3/asym4 are DEPRECATED — \
+         single-tier KVarN strictly dominates them (better PPL+KLD at iso-memory, both \
+         short and long ctx; see docs/plans/2026-07-12-hot-cold-hierarchical-kv-implementation.md \
+         and NEXT-STEPS Phase D). Prefer kvarn. asym is retained only for back-compat and \
+         because TriAttention/CASK eviction scoring reads the asym format."
     ),
     field!(
         "kv_adaptive",

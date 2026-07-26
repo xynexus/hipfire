@@ -11,6 +11,42 @@
 
 use super::*;
 
+/// Debug-only tensor trace used by the pinned Flux.2/SeFi reference scripts.
+/// Format: `HFDT`, u32 rank, u32 dimensions, then little-endian f32 data.
+pub(crate) fn dump_denoise_trace_tensor(name: &str, shape: &[usize], data: &[f32]) {
+    let Ok(dir) = std::env::var("HIPFIRE_DUMP_DENOISE_TRACE") else {
+        return;
+    };
+    if dir.is_empty() {
+        return;
+    }
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!("[dump] failed to create denoise trace directory {dir}: {error}");
+        return;
+    }
+    let mut bytes = Vec::with_capacity(8 + shape.len() * 4 + data.len() * 4);
+    bytes.extend_from_slice(b"HFDT");
+    bytes.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+    for &dim in shape {
+        bytes.extend_from_slice(&(dim as u32).to_le_bytes());
+    }
+    for &value in data {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let path = std::path::Path::new(&dir).join(format!("{name}.bin"));
+    match std::fs::write(&path, bytes) {
+        Ok(()) => eprintln!("[dump] denoise trace {name} -> {}", path.display()),
+        Err(error) => eprintln!(
+            "[dump] failed to write denoise trace {name} to {}: {error}",
+            path.display()
+        ),
+    }
+}
+
+pub(crate) fn denoise_trace_enabled() -> bool {
+    std::env::var("HIPFIRE_DUMP_DENOISE_TRACE").is_ok_and(|dir| !dir.is_empty())
+}
+
 pub(crate) fn seeded_latents_for_request(
     config: &StableDiffusionConfig,
     request: &DiffusionBatchRequest,
@@ -76,7 +112,6 @@ pub(crate) fn blend_subseed_latents(
     }
     Ok(())
 }
-
 
 pub fn denoise_latents_with_cfg(
     latents: LatentBatch,
@@ -213,36 +248,75 @@ pub(crate) fn concat_batch_dim(a: &CpuTensor, b: &CpuTensor) -> DiffusionResult<
     Ok(CpuTensor { shape, data })
 }
 
-/// Split a batched CFG prediction `[2N, ...]` back into the positive `[0..N]`
-/// and negative `[N..2N]` halves.
-pub(crate) fn split_batched_cfg_prediction(batched: &CpuTensor) -> DiffusionResult<(CpuTensor, CpuTensor)> {
-    if batched.shape.first().copied().unwrap_or(0) % 2 != 0 || batched.shape.is_empty() {
+/// Borrow the positive `[0..N]` and negative `[N..2N]` halves of a batched CFG
+/// prediction without materializing two temporary tensors.
+pub(crate) fn batched_cfg_prediction_slices<'a>(
+    latents: &LatentBatch,
+    batched: &'a CpuTensor,
+) -> DiffusionResult<(Vec<usize>, &'a [f32], &'a [f32])> {
+    let [batch, channels, height, width] = shape4(batched)?;
+    if batch % 2 != 0 {
         return Err(DiffusionError::InvalidMetadata(format!(
             "batched CFG prediction must have an even leading dim, got {:?}",
             batched.shape
         )));
     }
-    let mut half_shape = batched.shape.clone();
-    half_shape[0] = batched.shape[0] / 2;
-    let half = batched.data.len() / 2;
-    let positive = CpuTensor {
-        shape: half_shape.clone(),
-        data: batched.data[..half].to_vec(),
+    let half_shape = vec![batch / 2, channels, height, width];
+    let expected = [
+        latents.batch,
+        latents.channels,
+        latents.height,
+        latents.width,
+    ];
+    if half_shape.as_slice() != expected {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "batched CFG prediction half shape {:?} != latent shape {:?}",
+            half_shape, expected
+        )));
+    }
+    let half = checked_shape_elements("batched CFG half prediction", &half_shape)?;
+    let expected_len = half.checked_mul(2).ok_or_else(|| {
+        DiffusionError::InvalidRequest("batched CFG prediction length overflows".to_string())
+    })?;
+    if batched.data.len() != expected_len {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "batched CFG prediction has {} values but shape {:?} expects {expected_len}",
+            batched.data.len(),
+            batched.shape
+        )));
+    }
+    let (positive, negative) = batched.data.split_at(half);
+    Ok((half_shape, positive, negative))
+}
+
+/// Resolve the resident-linear activation precision for explicit schedule
+/// thresholds. The legacy W4A4 threshold is folded into W4A8 so no Opus image
+/// generation path can select int4 activations.
+pub(crate) fn linear_precision_for_thresholds(
+    step: usize,
+    total: usize,
+    legacy_w4a4_until: f32,
+    w4a8_until: f32,
+) -> LinearPrecision {
+    let w4a8_until = w4a8_until.max(legacy_w4a4_until).clamp(0.0, 1.0);
+    let frac = if total <= 1 {
+        0.0
+    } else {
+        step as f32 / total as f32
     };
-    let negative = CpuTensor {
-        shape: half_shape,
-        data: batched.data[half..].to_vec(),
-    };
-    Ok((positive, negative))
+    if frac < w4a8_until {
+        LinearPrecision::W4A8
+    } else {
+        LinearPrecision::F16
+    }
 }
 
 /// Resolve the resident-linear activation precision for denoise `step` of
 /// `total`, from the progressive schedule. Env-driven (opt-in; default is all
 /// F16, so behavior is unchanged unless set):
-///   `HIPFIRE_DIFFUSION_W4A4_UNTIL` — fraction of steps (0..1) to run at W4A4
-///   `HIPFIRE_DIFFUSION_W4A8_UNTIL` — fraction (0..1) to run at W4A8 (after W4A4)
-/// e.g. `W4A4_UNTIL=0.5 W4A8_UNTIL=0.8` → first 50% W4A4, next 30% W4A8, last
-/// 20% F16. Only affects linears with `in % 256 == 0`; others stay F16.
+///   `HIPFIRE_DIFFUSION_W4A8_UNTIL` — fraction of steps (0..1) to run at W4A8
+///   `HIPFIRE_DIFFUSION_W4A4_UNTIL` — legacy alias, promoted to W4A8
+/// Only affects linears with `in % 256 == 0`; others stay F16.
 pub(crate) fn linear_precision_for_step(step: usize, total: usize) -> LinearPrecision {
     let frac_env = |name: &str| -> f32 {
         std::env::var(name)
@@ -251,31 +325,30 @@ pub(crate) fn linear_precision_for_step(step: usize, total: usize) -> LinearPrec
             .unwrap_or(0.0)
             .clamp(0.0, 1.0)
     };
-    let w4a4_until = frac_env("HIPFIRE_DIFFUSION_W4A4_UNTIL");
-    let w4a8_until = frac_env("HIPFIRE_DIFFUSION_W4A8_UNTIL").max(w4a4_until);
-    let frac = if total <= 1 {
-        0.0
-    } else {
-        step as f32 / total as f32
-    };
-    if frac < w4a4_until {
-        LinearPrecision::W4A4
-    } else if frac < w4a8_until {
-        LinearPrecision::W4A8
-    } else {
-        LinearPrecision::F16
-    }
+    linear_precision_for_thresholds(
+        step,
+        total,
+        frac_env("HIPFIRE_DIFFUSION_W4A4_UNTIL"),
+        frac_env("HIPFIRE_DIFFUSION_W4A8_UNTIL"),
+    )
+}
+
+/// Resolve a configured Opus layer rung. Historical W4A4/W4A16 values are
+/// accepted for compatibility but promoted to the only supported Opus compute
+/// policy for image generation: W4A8.
+pub(crate) fn linear_precision_for_layer_rung(_value: Option<&str>) -> LinearPrecision {
+    LinearPrecision::W4A8
 }
 
 /// Configure the per-layer precision policy on the weight cache from env (opt-in;
 /// `HIPFIRE_DIFFUSION_LAYER_STRIDE=0` = off, the default). When active, every
-/// `STRIDE`-th resident linear runs `RUNG` (default W4A4), except the first
+/// `STRIDE`-th resident linear runs W4A8, except the first
 /// `SKIP_FIRST` and last `SKIP_LAST` linears (kept F16). This is orthogonal to the
 /// per-step schedule and overrides it when `STRIDE > 0`.
 ///   `HIPFIRE_DIFFUSION_LAYER_STRIDE`     — N (every Nth linear; 0=off)
 ///   `HIPFIRE_DIFFUSION_LAYER_SKIP_FIRST` — keep the first X linears F16
 ///   `HIPFIRE_DIFFUSION_LAYER_SKIP_LAST`  — keep the last Y linears F16 (from step 1)
-///   `HIPFIRE_DIFFUSION_LAYER_RUNG`       — w4a4 | w4a8 | w4a16 (default w4a4)
+///   `HIPFIRE_DIFFUSION_LAYER_RUNG`       — legacy setting; all values use W4A8
 pub(crate) fn configure_layer_policy(cache: &mut RocmWeightCache) {
     let usize_env = |name: &str| -> usize {
         std::env::var(name)
@@ -286,15 +359,11 @@ pub(crate) fn configure_layer_policy(cache: &mut RocmWeightCache) {
     cache.layer_stride = usize_env("HIPFIRE_DIFFUSION_LAYER_STRIDE");
     cache.layer_skip_first = usize_env("HIPFIRE_DIFFUSION_LAYER_SKIP_FIRST");
     cache.layer_skip_last = usize_env("HIPFIRE_DIFFUSION_LAYER_SKIP_LAST");
-    cache.layer_rung = match std::env::var("HIPFIRE_DIFFUSION_LAYER_RUNG")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "w4a8" => LinearPrecision::W4A8,
-        "w4a16" => LinearPrecision::W4A16,
-        _ => LinearPrecision::W4A4,
-    };
+    cache.layer_rung = linear_precision_for_layer_rung(
+        std::env::var("HIPFIRE_DIFFUSION_LAYER_RUNG")
+            .ok()
+            .as_deref(),
+    );
     cache.linear_total = 0;
 }
 
@@ -342,6 +411,26 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
     let cfg_is_identity = classifier_free_guidance_is_identity(cfg_scale);
     configure_layer_policy(&mut runtime_context.rocm_weights);
     let total_steps = schedule.timesteps.len();
+    dump_denoise_trace_tensor(
+        "latent_000",
+        &[
+            latents.batch,
+            latents.channels,
+            latents.height,
+            latents.width,
+        ],
+        &latents.data,
+    );
+    dump_denoise_trace_tensor(
+        "conditioning_positive",
+        &positive_embeddings.shape,
+        &positive_embeddings.data,
+    );
+    dump_denoise_trace_tensor(
+        "conditioning_negative",
+        &negative_embeddings.shape,
+        &negative_embeddings.data,
+    );
     for step in 0..total_steps {
         // Progressive precision schedule: pick the resident-linear activation
         // precision for this step (early/high-noise steps tolerate cheaper rungs).
@@ -355,7 +444,7 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
             linear_precision_for_step(step, total_steps);
         let (sample, scale_runtime_kind) = scale_model_input_with_runtime_context(
             schedule,
-            &latents.as_nchw_tensor(),
+            latents.as_nchw_tensor(),
             step,
             runtime_context,
         )?;
@@ -374,10 +463,22 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
         // GEMMs. SDXL / mixed-mask cases fall back to the sequential path.
         let masks_batchable =
             positive_attention_mask.is_none() == negative_attention_mask.is_none();
+        // Batching stacks the two conditioning tensors (and their masks) along the
+        // batch dim, so their trailing dims must match. Prompts that tokenize to
+        // different sequence lengths (e.g. a short/empty negative vs a longer
+        // positive) are not batch-compatible and fall back to the sequential path
+        // below instead of hitting the `concat_batch_dim` shape error.
+        let conditioning_batchable = positive_embeddings.shape[1..]
+            == negative_embeddings.shape[1..]
+            && match (positive_attention_mask, negative_attention_mask) {
+                (Some(p), Some(n)) => p.shape[1..] == n.shape[1..],
+                _ => true,
+            };
         let batched_cfg = !cfg_is_identity
             && positive_sdxl_conditioning.is_none()
             && negative_sdxl_conditioning.is_none()
-            && masks_batchable;
+            && masks_batchable
+            && conditioning_batchable;
         let guided = if cfg_is_identity {
             let positive_pred = predict_noise(
                 &model_sample,
@@ -406,12 +507,12 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
                 None,
                 runtime_context,
             )?;
-            let (positive_pred, negative_pred) = split_batched_cfg_prediction(&batched_pred)?;
-            validate_noise_prediction(&latents, &positive_pred)?;
-            validate_noise_prediction(&latents, &negative_pred)?;
-            let (guided, guidance_runtime_kind) = cfg_guidance_with_runtime_context(
-                &negative_pred,
-                &positive_pred,
+            let (prediction_shape, positive_pred, negative_pred) =
+                batched_cfg_prediction_slices(&latents, &batched_pred)?;
+            let (guided, guidance_runtime_kind) = cfg_guidance_slices_with_runtime_context(
+                prediction_shape,
+                negative_pred,
+                positive_pred,
                 cfg_scale,
                 runtime_context,
             )?;
@@ -445,6 +546,42 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
             runtime_kind = merge_runtime_kind(runtime_kind, guidance_runtime_kind);
             guided
         };
+        dump_denoise_trace_tensor(
+            &format!("velocity_{:03}", step + 1),
+            &[
+                latents.batch,
+                latents.channels,
+                latents.height,
+                latents.width,
+            ],
+            &guided.data,
+        );
+        // Debug hook: HIPFIRE_DUMP_VELOCITY=<dir> writes the per-step model
+        // velocity (the flow-match prediction, before the scheduler integrates
+        // it) as <dir>/vel_<step>.bin (4x u32 LE header [b,c,h,w] + f32 data).
+        // Lets us see whether a single forward already carries the token-grid
+        // (attention not mixing) or whether the grid only builds up over steps.
+        if let Ok(dir) = std::env::var("HIPFIRE_DUMP_VELOCITY") {
+            if !dir.is_empty() {
+                let mut bytes = Vec::with_capacity(16 + guided.data.len() * 4);
+                for dim in [
+                    latents.batch,
+                    latents.channels,
+                    latents.height,
+                    latents.width,
+                ] {
+                    bytes.extend_from_slice(&(dim as u32).to_le_bytes());
+                }
+                for v in &guided.data {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let path = format!("{dir}/vel_{step}.bin");
+                match std::fs::write(&path, &bytes) {
+                    Ok(()) => eprintln!("[dump] step {step} velocity -> {path}"),
+                    Err(e) => eprintln!("[dump] velocity write to {path} failed: {e}"),
+                }
+            }
+        }
         let step_runtime_kind = scheduler_step_with_runtime_context(
             schedule,
             &mut latents,
@@ -454,6 +591,16 @@ pub(crate) fn denoise_latents_with_cfg_progress_and_runtime_context(
             runtime_context,
         )?;
         runtime_kind = merge_runtime_kind(runtime_kind, step_runtime_kind);
+        dump_denoise_trace_tensor(
+            &format!("latent_{:03}", step + 1),
+            &[
+                latents.batch,
+                latents.channels,
+                latents.height,
+                latents.width,
+            ],
+            &latents.data,
+        );
         if let Some(masked_reference) = masked_reference {
             let masked_reference_runtime_kind =
                 apply_masked_denoise_reference_with_runtime_context(
@@ -703,7 +850,10 @@ pub(crate) fn apply_masked_denoise_reference_with_runtime_context(
     )
 }
 
-pub(crate) fn validate_noise_prediction(latents: &LatentBatch, noise: &CpuTensor) -> DiffusionResult<()> {
+pub(crate) fn validate_noise_prediction(
+    latents: &LatentBatch,
+    noise: &CpuTensor,
+) -> DiffusionResult<()> {
     let expected = [
         latents.batch,
         latents.channels,
@@ -731,6 +881,15 @@ pub(crate) fn cfg_guidance(
             negative_pred.shape, positive_pred.shape
         )));
     }
+    let expected = checked_shape_elements("CFG prediction", &negative_pred.shape)?;
+    if negative_pred.data.len() != expected || positive_pred.data.len() != expected {
+        return Err(DiffusionError::InvalidRequest(format!(
+            "CFG prediction data lengths {}/{} do not match shape {:?} ({expected} values)",
+            negative_pred.data.len(),
+            positive_pred.data.len(),
+            negative_pred.shape
+        )));
+    }
     Ok(CpuTensor {
         shape: negative_pred.shape.clone(),
         data: negative_pred
@@ -743,7 +902,7 @@ pub(crate) fn cfg_guidance(
 }
 
 pub(crate) fn classifier_free_guidance_is_identity(cfg_scale: f32) -> bool {
-    (cfg_scale - 1.0).abs() <= f32::EPSILON
+    cfg_scale <= 0.0 || (cfg_scale - 1.0).abs() <= f32::EPSILON
 }
 
 /// Stack per-prompt Krea2 conditioning `[1, seq, hidden]` tensors into a

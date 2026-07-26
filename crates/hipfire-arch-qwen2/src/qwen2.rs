@@ -34,11 +34,14 @@ use hipfire_dispatch::pipeline::superop::{
 };
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
-use hipfire_runtime::dispatch::gemv_family;
-use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::quant::f16_to_f32;
-use hipfire_runtime::weights::{weight_gemm, EmbeddingFormat, WeightTensor};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
+use hipfire_runtime::dispatch::gemv_family;
+use hipfire_runtime::hfq::{
+    oq4_arch_load, oq8_arch_load, HfqFile, OQ4_ARCH_PACKED_QT, OQ4_CANONICAL_QT,
+};
+use hipfire_runtime::quant::f16_to_f32;
+use hipfire_runtime::transformer_loader::decode_direct_f32;
+use hipfire_runtime::weights::{weight_gemm, EmbeddingFormat, WeightTensor};
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
 ///
@@ -285,6 +288,11 @@ pub fn load_weights(
             i + 1,
             cfg.num_hidden_layers
         );
+        hipfire_runtime::load_progress::report(
+            i as u32 + 1,
+            cfg.num_hidden_layers as u32,
+            "weights",
+        );
         layers.push(load_layer(hfq, gpu, cfg, i)?);
     }
 
@@ -324,17 +332,19 @@ fn load_embed_tokens(
             let buf = gpu.upload_raw(&data, &[data.len()])?;
             Ok((buf, EmbeddingFormat::Q8_0))
         }
-        1 => {
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
+        // Direct-decodable source (F16 / BF16 / F32) → F32 on host. Uses the
+        // shared runtime decoder so qwen2 accepts exactly the direct-source set
+        // TransformerLoader does (bf16 = qt 16 is the common Diffusers/HF dtype).
+        1 | 16 | 2 => {
+            let f32_data = decode_direct_f32(&info, &data).map_err(|e| {
+                hip_bridge::HipError::new(0, &format!("qwen2 embed decode {name}: {e:?}"))
+            })?;
             let buf = gpu.upload_f32(&f32_data, &[cfg.vocab_size, cfg.hidden_size])?;
             Ok((buf, EmbeddingFormat::F32))
         }
         qt => panic!(
-            "qwen2: unsupported embedding quant_type {qt}; \
-                     handled: 1 (F16→F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128). \
+            "qwen2: unsupported embedding quant_type {qt}; handled: 1 (F16), 16 (BF16), \
+                     2 (F32) → F32; 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128). \
                      Extend load_embed_tokens to handle this format."
         ),
     }
@@ -375,19 +385,25 @@ fn load_lm_head(
             EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
             EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
             EmbeddingFormat::Q8_0 => DType::Q8_0,
+            // BF16/F16 gather tables are kept raw for the embedding lookup, but the
+            // tied lm_head matmul consumes an F32-decoded copy (info.quant_type
+            // 16/1 -> decode_direct_f32 below), matching the pre-existing direct
+            // F16/BF16/F32 handling.
+            EmbeddingFormat::BF16 | EmbeddingFormat::F16 => DType::F32,
             EmbeddingFormat::F32 => DType::F32,
             EmbeddingFormat::Q4K => panic!("qwen2: tied embeddings with Q4K not supported"),
         };
         let buf = match info.quant_type {
             6 | 7 | 3 => gpu.upload_raw(&data, &[data.len()])?,
-            1 => {
-                // F16 source: load_embed_tokens promoted to F32 on host.
-                // We must do the same so gpu_dtype=F32 matches the actual
-                // buffer contents. Mirror qwen35.rs:1438-1447.
-                let f32_data: Vec<f32> = data
-                    .chunks_exact(2)
-                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                    .collect();
+            1 | 16 | 2 => {
+                // Direct source (F16 / BF16 / F32): load_embed_tokens promoted it
+                // to F32 on host, so we must upload F32 bytes here too — raw
+                // F16/BF16 bytes tagged gpu_dtype=F32 corrupt the matmul (R4 in
+                // dots-ocr-devlog §7). Shared decoder keeps the accepted set in
+                // sync with load_embed_tokens.
+                let f32_data = decode_direct_f32(&info, &data).map_err(|e| {
+                    hip_bridge::HipError::new(0, &format!("qwen2 tied lm_head decode: {e:?}"))
+                })?;
                 let bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
                 };
@@ -673,9 +689,71 @@ fn load_weight_tensor(
                 awq_scale: None,
             })
         }
+        16 => {
+            // BF16 weights (the common HF/Diffusers source dtype). Upload raw and
+            // tag BF16 — the generic weight_gemv/weight_gemm dispatch on gpu_dtype,
+            // mirroring the shared TransformerLoader bf16 arm.
+            let mut buf = gpu.upload_raw(&data, &[data.len()])?;
+            buf.dtype = DType::BF16;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::BF16,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        // Opus Quant int8-activation family (33 = OQ+ W4A8, 35 = OQ8 W8A8, 36 =
+        // OQ+ compact) via the shared `oq8_arch_load` — the single arch-agnostic
+        // entry point so qwen2 serves OQ through the same dtype-dispatched
+        // weight_gemv/weight_gemm kernels as every other simple-AR family, without
+        // re-deriving the repack (the recurring gap fixed once in oq8_arch).
+        qt @ (33 | 35 | 36) => {
+            let (bytes, gpu_dtype) = oq8_arch_load(qt, &data, m, k)
+                .expect("oq8_arch_load resolves the OQ8-family codes 33/35/36");
+            let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        // 34 (canonical) / 37 (arch-packed) = OQ4 W4A4; `oq4_arch_load` returns the
+        // repacked bytes + the concrete `Oq4G256` dtype.
+        OQ4_CANONICAL_QT | OQ4_ARCH_PACKED_QT => {
+            let (bytes, gpu_dtype) = oq4_arch_load(info.quant_type, &data, m, k)
+                .expect("OQ4 canonical/arch-packed handled by oq4_arch_load");
+            let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        // qt 43 = Oq8G256RowPadded: the NPU-only ragged layout the GPU path can't
+        // load. `--format oq8` emits it for tensors with k % 256 != 0 (e.g.
+        // Qwen2-0.5B hidden=896). Re-quantize with HIPFIRE_OQ_RAGGED_Q8=1 so those
+        // fall back to Q8 while the % 256 tensors stay Oq8G256 (qt 35).
+        43 => panic!(
+            "qwen2: weight {name} is Oq8G256RowPadded (qt 43), an NPU-only ragged OQ8 \
+                     layout the GPU loader cannot consume. Re-quantize with \
+                     HIPFIRE_OQ_RAGGED_Q8=1 so ragged (k % 256 != 0) tensors fall back to Q8 \
+                     and the aligned tensors stay Oq8G256 (qt 35)."
+        ),
         qt => panic!(
             "qwen2: unsupported weight quant_type {qt} for {name}. \
-                     This loader handles qt ∈ {{1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128)}}. \
+                     This loader handles qt ∈ {{1 (F16), 16 (BF16), 3 (Q8F16), 6 (HFQ4G256), \
+                     7 (HFQ4G128), 33/35/36 (OQ+ W4A8 / OQ8 W8A8 / OQ+ compact), 34/37 (OQ4 W4A4)}}. \
                      Extend load_weight_tensor or wait for the Transformer-extraction PR \
                      to pick up qwen35's full quant_type matrix."
         ),
@@ -888,6 +966,21 @@ pub fn forward_step(
     let pos = forward_step_prelude(gpu, state)?;
 
     // Embedding lookup → state.x.
+    embed_token_into_x(gpu, weights, cfg, state, token)?;
+
+    forward_step_after_x(gpu, weights, cfg, state, pos)
+}
+
+/// Format-dispatched token-embedding lookup into `state.x` (`hidden_size` F32).
+/// Shared by [`forward_step`], [`embed_token_row`], and the batched-prefill
+/// embed loop so the per-`EmbeddingFormat` match lives in exactly one place.
+fn embed_token_into_x(
+    gpu: &mut Gpu,
+    weights: &Qwen2Weights,
+    cfg: &Qwen2Config,
+    state: &Qwen2State,
+    token: u32,
+) -> HipResult<()> {
     let dim = cfg.hidden_size;
     match weights.embd_format {
         EmbeddingFormat::HFQ4G256 => {
@@ -899,13 +992,18 @@ pub fn forward_step(
         EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?
         }
+        EmbeddingFormat::BF16 => {
+            gpu.embedding_lookup_bf16(&weights.token_embd, &state.x, token, dim)?
+        }
+        EmbeddingFormat::F16 => {
+            gpu.embedding_lookup_f16(&weights.token_embd, &state.x, token, dim)?
+        }
         EmbeddingFormat::Q4K => {
             gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?
         }
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
     }
-
-    forward_step_after_x(gpu, weights, cfg, state, pos)
+    Ok(())
 }
 
 /// Variant of [`forward_step`] that consumes a pre-built F32 embedding row
@@ -951,22 +1049,7 @@ pub fn embed_token_row(
     state: &mut Qwen2State,
     token: u32,
 ) -> HipResult<Vec<f32>> {
-    let dim = cfg.hidden_size;
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::Q4K => {
-            gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
-    }
+    embed_token_into_x(gpu, weights, cfg, state, token)?;
     gpu.download_f32(&state.x)
 }
 
@@ -1243,6 +1326,74 @@ pub fn forward_step_greedy(
     gpu.argmax_f32(&state.logits, cfg.vocab_size)
 }
 
+/// Batched (multi-token) prefill for a plain-text prompt. Mirrors gemma3's
+/// [`forward_prefill_batch`](../../hipfire_arch_gemma3/forward/fn.forward_prefill_batch.html):
+/// per layer it runs RMSNorm → batched QKV GEMM → **QKV bias-add over all M
+/// rows** (qwen2 sets `attention_bias=true`, unlike gemma3) → batched RoPE →
+/// batched F32 KV-cache write → causal batched attention → o_proj+residual →
+/// FFN norm → batched gate/up GEMM → SwiGLU → w_down+residual, then a final
+/// norm + lm_head on the LAST prompt token only.
+///
+/// Embeds each token into an on-device `[M, hidden]` batch tensor (the same
+/// format-dispatched lookup [`forward_step`] uses), then hands off to the
+/// shared [`forward_prefill_batch_core`] — the identical batched body the VL
+/// splice path ([`forward_prefill_batch_embeds`]) runs. `start_pos` is the
+/// absolute position of the first token (KV slots `[start_pos, start_pos+M)`);
+/// it must equal `state.next_pos`. On return `state.logits` holds the
+/// next-token logits for the last prompt token and `state.next_pos ==
+/// start_pos + tokens.len()`, matching the per-token `forward_step` loop.
+pub fn forward_prefill_batch(
+    gpu: &mut Gpu,
+    weights: &Qwen2Weights,
+    cfg: &Qwen2Config,
+    state: &mut Qwen2State,
+    tokens: &[u32],
+    start_pos: usize,
+) -> HipResult<()> {
+    if tokens.is_empty() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "qwen2: forward_prefill_batch called with an empty token slice",
+        ));
+    }
+    if start_pos != state.next_pos {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "qwen2: forward_prefill_batch start_pos={start_pos} != next_pos={} \
+                 (KV slots are written at next_pos)",
+                state.next_pos
+            ),
+        ));
+    }
+    let dim = cfg.hidden_size;
+    let batch = tokens.len();
+    if start_pos + batch > state.max_seq {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "qwen2: prefill batch={batch} + start_pos={start_pos} > max_seq={}",
+                state.max_seq
+            ),
+        ));
+    }
+
+    // Embed the prompt into an on-device [M, hidden] batch, mirroring gemma3:
+    // per token, look up into the single-token `state.x` scratch then copy that
+    // row into the batch tensor.
+    let x_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+    let embed_result = (|| {
+        for (i, &t) in tokens.iter().enumerate() {
+            embed_token_into_x(gpu, weights, cfg, state, t)?;
+            gpu.hip
+                .memcpy_dtod_at(&x_batch.buf, i * dim * 4, &state.x.buf, 0, dim * 4)?;
+        }
+        forward_prefill_batch_core(gpu, weights, cfg, state, &x_batch, batch, start_pos)
+    })();
+    gpu.free_tensor(x_batch)?;
+    embed_result
+}
+
 /// Batched prefill over a pre-built `[batch × dim]` embedding matrix
 /// (row-major F32). The caller resolves every prompt position to an
 /// embedding row — token-embedding lookups for text positions, spliced
@@ -1250,22 +1401,48 @@ pub fn forward_step_greedy(
 /// plain Qwen2 and the dots.ocr VL splice without an embedding-lookup
 /// branch inside the hot loop.
 ///
-/// Processes the whole prompt in one pass with batched GEMM / RoPE /
-/// causal-attention kernels instead of the per-token `forward_step`
-/// loop. Fills `state.k_cache` / `state.v_cache` for positions
-/// `[next_pos, next_pos + batch)`, advances `state.next_pos`, and leaves
-/// the LAST position's logits in `state.logits` (ready for argmax →
+/// Uploads the matrix to the device and runs the shared
+/// [`forward_prefill_batch_core`] at base position `state.next_pos`: one pass
+/// of batched GEMM / RoPE / causal-attention / batched F32 KV-cache writes
+/// instead of the per-token `forward_step` loop. Advances `state.next_pos` and
+/// leaves the LAST position's logits in `state.logits` (ready for argmax → the
 /// first generated token). Decode then continues with `forward_step`.
-///
-/// KV-cache writes use a per-position F32 loop (the cache is F32 and only
-/// a single-position `kv_cache_write` exists); a batched-F32 KV kernel is
-/// the follow-up if that loop dominates prefill time.
 pub fn forward_prefill_batch_embeds(
     gpu: &mut Gpu,
     weights: &Qwen2Weights,
     cfg: &Qwen2Config,
     state: &mut Qwen2State,
     embeds: &[f32],
+) -> HipResult<()> {
+    let dim = cfg.hidden_size;
+    assert_eq!(
+        embeds.len() % dim,
+        0,
+        "forward_prefill_batch_embeds: embeds.len()={} not a multiple of dim={dim}",
+        embeds.len()
+    );
+    let batch = embeds.len() / dim;
+    let base = state.next_pos;
+    let x_batch = gpu.upload_f32(embeds, &[batch, dim])?;
+    let result = forward_prefill_batch_core(gpu, weights, cfg, state, &x_batch, batch, base);
+    gpu.free_tensor(x_batch)?;
+    result
+}
+
+/// Shared batched-prefill layer stack. Runs the full decoder over the `batch`
+/// rows already resident in `x_batch` (`[batch, hidden]` F32), whose absolute
+/// positions are `[base, base+batch)`. Fills `state.k_cache` / `state.v_cache`
+/// at those slots, writes the LAST row's next-token logits into `state.logits`,
+/// and advances `state.next_pos` to `base + batch`. Owns/frees only its own
+/// per-call scratch — the caller owns `x_batch`.
+fn forward_prefill_batch_core(
+    gpu: &mut Gpu,
+    weights: &Qwen2Weights,
+    cfg: &Qwen2Config,
+    state: &mut Qwen2State,
+    x_batch: &GpuTensor,
+    batch: usize,
+    base: usize,
 ) -> HipResult<()> {
     let dim = cfg.hidden_size;
     let n_heads = cfg.num_attention_heads;
@@ -1275,23 +1452,6 @@ pub fn forward_prefill_batch_embeds(
     let kv_dim = n_kv_heads * head_dim;
     let hidden_dim = cfg.intermediate_size;
 
-    assert_eq!(
-        embeds.len() % dim,
-        0,
-        "forward_prefill_batch_embeds: embeds.len()={} not a multiple of dim={dim}",
-        embeds.len()
-    );
-    let gemv = gemv_family();
-    let ctx = DispatchCtx::new(gpu);
-
-    assert_eq!(
-        embeds.len() % dim,
-        0,
-        "forward_prefill_batch_embeds: embeds.len()={} not a multiple of dim={dim}",
-        embeds.len()
-    );
-    let batch = embeds.len() / dim;
-    let base = state.next_pos;
     if base + batch > state.max_seq {
         return Err(hip_bridge::HipError::new(
             0,
@@ -1301,6 +1461,9 @@ pub fn forward_prefill_batch_embeds(
             ),
         ));
     }
+
+    let gemv = gemv_family();
+    let ctx = DispatchCtx::new(gpu);
 
     // Batched projection: Q8 weights get a true batched GEMM; other dtypes
     // fall back to weight_gemm (HFQ4 batched, else a per-row GEMV loop).
@@ -1317,7 +1480,6 @@ pub fn forward_prefill_batch_embeds(
         }
     }
 
-    let x_batch = gpu.upload_f32(embeds, &[batch, dim])?;
     let tmp_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
     let q_batch = gpu.alloc_tensor(&[batch, q_dim], DType::F32)?;
     let k_batch = gpu.alloc_tensor(&[batch, kv_dim], DType::F32)?;
@@ -1351,7 +1513,7 @@ pub fn forward_prefill_batch_embeds(
         let layer = &weights.layers[layer_idx];
 
         gpu.rmsnorm_batched(
-            &x_batch,
+            x_batch,
             &layer.attn_norm,
             &tmp_batch,
             batch,
@@ -1427,10 +1589,10 @@ pub fn forward_prefill_batch_embeds(
         }
 
         proj(gpu, &layer.wo, &attn_out_batch, &o_batch, batch)?;
-        gpu.add_inplace_f32(&x_batch, &o_batch)?;
+        gpu.add_inplace_f32(x_batch, &o_batch)?;
 
         gpu.rmsnorm_batched(
-            &x_batch,
+            x_batch,
             &layer.ffn_norm,
             &tmp_batch,
             batch,
@@ -1442,7 +1604,7 @@ pub fn forward_prefill_batch_embeds(
         proj(gpu, &layer.w_up, &tmp_batch, &up_batch, batch)?;
         gpu.silu_mul_f32(&gate_batch, &up_batch, &ffn_hidden_batch)?;
         proj(gpu, &layer.w_down, &ffn_hidden_batch, &ffn_out_batch, batch)?;
-        gpu.add_inplace_f32(&x_batch, &ffn_out_batch)?;
+        gpu.add_inplace_f32(x_batch, &ffn_out_batch)?;
     }
 
     // Final norm + lm_head for the LAST position only → state.logits.
@@ -1462,7 +1624,6 @@ pub fn forward_prefill_batch_embeds(
     state.next_pos = base + batch;
 
     for t in [
-        x_batch,
         tmp_batch,
         q_batch,
         k_batch,

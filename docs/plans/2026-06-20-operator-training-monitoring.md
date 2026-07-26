@@ -23,7 +23,7 @@ or mutating runs.
 - Do not make the WebUI or TUI own trainer lifecycle in this phase.
 - Do not duplicate training interpretation logic between the clients.
 - Do not scrape terminal logs as the primary state source.
-- Do not put Python in the inference hot path.
+- Do not put Python in production tooling.
 - Do not require the TUI or WebUI to use hipfire training.
 - Do not assume the daemon is locally owned; it may be supervised by systemd,
   launchd, a container, or a remote process.

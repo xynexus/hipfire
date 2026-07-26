@@ -203,6 +203,7 @@ pub(crate) fn minimal_metadata() -> DiffusionHfqMetadata {
             latent_width: Some(64),
             supported_widths: vec![512],
             supported_heights: vec![512],
+            ..DiffusionPipelineMetadata::default()
         },
         tokenizer: DiffusionTokenizerMetadata::default(),
         tokenizer_2: None,
@@ -342,6 +343,8 @@ pub(crate) fn tiny_runtime_config() -> StableDiffusionConfig {
             up_block_types: vec!["UpDecoderBlock2D".into()],
             norm_num_groups: Some(1),
             norm_eps: Some(1e-6),
+            patch_size: Vec::new(),
+            batch_norm_eps: None,
         },
         scheduler: SchedulerConfig::default(),
         latent_channels: 1,
@@ -944,7 +947,9 @@ impl SolidTensorImageDecoder {
     }
 }
 
-pub(crate) fn tiny_txt2img_test_pipeline(decoder: Box<dyn DiffusionImageDecoder>) -> DiffusionPipeline {
+pub(crate) fn tiny_txt2img_test_pipeline(
+    decoder: Box<dyn DiffusionImageDecoder>,
+) -> DiffusionPipeline {
     let metadata = tiny_runtime_metadata();
     let config = tiny_runtime_config();
     let tokenizer = ClipTokenizer::from_bytes(
@@ -995,7 +1000,10 @@ pub(crate) fn tiny_txt2img_test_pipeline(decoder: Box<dyn DiffusionImageDecoder>
             encoder: None,
             decoder,
             text_conditioner: None,
+            flux2_text_conditioner: None,
             krea2_tokenizer: None,
+            flux2_tokenizer: None,
+            flux2_text_max_length: 512,
         }),
         native_runtime_error: None,
     }
@@ -1075,7 +1083,10 @@ pub(crate) fn tiny_inpaint_test_pipeline(
             encoder: Some(encoder),
             decoder,
             text_conditioner: None,
+            flux2_text_conditioner: None,
             krea2_tokenizer: None,
+            flux2_tokenizer: None,
+            flux2_text_max_length: 512,
         }),
         native_runtime_error: None,
     };
@@ -1458,7 +1469,10 @@ pub(crate) fn write_safetensors_fixture(path: &Path, tensors: &[(&str, &str, &[u
     fs::write(path, bytes).unwrap();
 }
 
-pub(crate) fn write_safetensors_fixture_owned(path: &Path, tensors: &[(String, String, Vec<u64>, Vec<u8>)]) {
+pub(crate) fn write_safetensors_fixture_owned(
+    path: &Path,
+    tensors: &[(String, String, Vec<u64>, Vec<u8>)],
+) {
     let borrowed = tensors
         .iter()
         .map(|(name, dtype, shape, data)| {
@@ -1764,7 +1778,9 @@ pub(crate) fn write_tiny_ldm_unet_safetensors(path: &Path) {
     write_safetensors_fixture_owned(path, &tensors);
 }
 
-pub(crate) fn push_tiny_ldm_clip_text_encoder_tensors(tensors: &mut Vec<(String, String, Vec<u64>, Vec<u8>)>) {
+pub(crate) fn push_tiny_ldm_clip_text_encoder_tensors(
+    tensors: &mut Vec<(String, String, Vec<u64>, Vec<u8>)>,
+) {
     let prefix = "cond_stage_model.transformer.text_model";
     tensors.extend([
         f32_safetensors_tensor(

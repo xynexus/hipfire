@@ -1,0 +1,6 @@
+date,host,arch,experiment,batch,rows,stage,odd_core_text_bytes,even_core_text_bytes,parity_cosine,max_abs,status,notes
+2026-07-16,halo,AIE2P,R130-direct-qkv-reuse,2,512,aiecc-elf,16876,15024,,,reject,"four-dimensional shim transpose lowers; CDO generation fails: Overflow of program memory; AIE program store is 16384 bytes"
+2026-07-16,halo,AIE2P,R130-even-q-pack,2,512,aiecc-elf,13628,16848,,,reject,"moving both Q lanes to even cores moves the same program-memory overflow"
+2026-07-16,halo,AIE2P,R130-balanced-q-pack,2,512,aiecc-xclbin,16236,16368,,,pass,"Q lanes split across even/odd pair; inverse relay emitted by even core"
+2026-07-16,halo,AIE2P,R130-balanced-q-pack,2,512,hardware-parity,,,NaN,3.5781250,reject,"distinct documents versus separate R108 M256 references; completed X and inverse state are all zero; inverse max_abs=1.2935559"
+2026-07-16,halo,AIE2P,R130-record-interleaved-input,2,512,hardware-parity,,,NaN,3.5781250,reject,"explicit block-group-document input ABI and corrected norm-before-metadata DMA order retain all-zero completed state"

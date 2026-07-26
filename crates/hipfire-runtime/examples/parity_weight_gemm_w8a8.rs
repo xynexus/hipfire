@@ -33,8 +33,8 @@
 //!
 //!   cargo run --release -p hipfire-runtime --example parity_weight_gemm_w8a8 [M K B]
 
-use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 use hipfire_rdna::{DType, Gpu};
+use hipfire_runtime::weights::{weight_gemm, WeightTensor};
 
 fn lcg(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed.max(1);

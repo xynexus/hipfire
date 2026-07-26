@@ -23,11 +23,25 @@ use hipfire_state::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct GenerationSamplingPolicy {
     pub temperature: f64,
+    /// True when `temperature` came from a server/default profile rather than
+    /// an explicit request field. A registered checkpoint profile may replace
+    /// it; explicit request values always win.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub temperature_is_default: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
+    /// See [`Self::temperature_is_default`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub top_p_is_default: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repeat_penalty: Option<f64>,
     pub max_tokens: u32,
@@ -37,7 +51,10 @@ impl GenerationSamplingPolicy {
     pub fn greedy(max_tokens: u32) -> Self {
         Self {
             temperature: 0.0,
+            temperature_is_default: false,
             top_p: None,
+            top_p_is_default: false,
+            top_k: None,
             repeat_penalty: None,
             max_tokens,
         }
@@ -51,16 +68,46 @@ impl GenerationSamplingPolicy {
         default_max_tokens: u32,
         temperature: Option<f64>,
         top_p: Option<f64>,
+        top_k: Option<usize>,
         repeat_penalty: Option<f64>,
         max_tokens: Option<u32>,
     ) -> Self {
         Self {
             temperature: temperature.unwrap_or(default_temperature),
+            temperature_is_default: temperature.is_none(),
             top_p: Some(top_p.unwrap_or(default_top_p)),
+            top_p_is_default: top_p.is_none(),
+            top_k,
             repeat_penalty: Some(repeat_penalty.unwrap_or(default_repeat_penalty)),
             max_tokens: max_tokens.unwrap_or(default_max_tokens),
         }
     }
+}
+
+/// Deserialize a `thinking`-style mode field leniently: accept a string
+/// (`"high"`, `"none"`, …), a bool (`true` → `"thinking"`, `false` → `"none"`),
+/// or null/absent (→ `None`). Some clients — and `tests/agentic-gate.sh` — send
+/// `"thinking": true`. Before the typed protocol extraction (556b2c11b) the
+/// daemon read this field untyped and silently ignored a non-string; the typed
+/// contract then hard-rejected the whole request on a bool. Accepting either
+/// shape restores that tolerance and honors the boolean's intent
+/// (`ThinkMode::from_str`: `"thinking"` → think, `"none"` → don't).
+fn de_thinking_opt<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrBool {
+        Str(String),
+        Bool(bool),
+    }
+    Ok(match Option::<StringOrBool>::deserialize(deserializer)? {
+        None => None,
+        Some(StringOrBool::Str(s)) => Some(s),
+        Some(StringOrBool::Bool(true)) => Some("thinking".to_string()),
+        Some(StringOrBool::Bool(false)) => Some("none".to_string()),
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -81,7 +128,11 @@ pub struct GenerateTextRequest {
     pub stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_base64: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_thinking_opt"
+    )]
     pub thinking: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_mode: Option<String>,
@@ -1584,6 +1635,27 @@ mod tests {
     }
 
     #[test]
+    fn thinking_field_accepts_bool_or_string() {
+        // Regression (agentic-gate zero-tokens): clients send `thinking: true`.
+        // The typed contract must accept a bool without rejecting the request;
+        // true → "thinking" (ThinkMode::High), false → "none" (NonThink).
+        fn think(v: serde_json::Value) -> Option<String> {
+            let mut m =
+                serde_json::json!({"id": "r", "prompt": "p", "temperature": 0.0, "max_tokens": 8});
+            if !v.is_null() {
+                m.as_object_mut().unwrap().insert("thinking".into(), v);
+            }
+            serde_json::from_value::<GenerateTextRequest>(m)
+                .unwrap()
+                .thinking
+        }
+        assert_eq!(think(serde_json::json!(true)), Some("thinking".to_string()));
+        assert_eq!(think(serde_json::json!(false)), Some("none".to_string()));
+        assert_eq!(think(serde_json::json!("high")), Some("high".to_string()));
+        assert_eq!(think(serde_json::Value::Null), None); // absent → None
+    }
+
+    #[test]
     fn openai_chat_generate_request_preserves_structured_prompt_boundary() {
         let system = serde_json::Value::String("be brief".to_string());
         let first = serde_json::Value::String("first".to_string());
@@ -1599,8 +1671,11 @@ mod tests {
             ],
             GenerationSamplingPolicy {
                 temperature: 0.3,
+                temperature_is_default: false,
                 max_tokens: 16,
                 top_p: Some(0.8),
+                top_p_is_default: false,
+                top_k: None,
                 repeat_penalty: Some(1.0),
             },
         );
@@ -1651,6 +1726,7 @@ mod tests {
             1.05,
             128,
             Some(0.2),
+            None,
             None,
             None,
             Some(8),
@@ -1802,7 +1878,10 @@ mod tests {
             messages: None,
             sampling: GenerationSamplingPolicy {
                 temperature: 0.3,
+                temperature_is_default: false,
                 top_p: Some(0.8),
+                top_p_is_default: false,
+                top_k: None,
                 repeat_penalty: Some(1.05),
                 max_tokens: 128,
             },

@@ -27,12 +27,12 @@ N_CORES = ROWS * COLS
 SZ_A, SZ_C, SZ_Bb = 64, 64, 128
 MACS = N_CORES * N_BTILES * (INNER + 1) * NACC * 1024
 
-a_ty = np.ndarray[(NACC * SZ_A,), np.dtype[np.int8]]           # per-core A block
-w_ty = np.ndarray[(SZ_Bb,), np.dtype[np.int8]]                 # one int4 weight tile
-in_w_ty = np.ndarray[(N_BTILES * SZ_Bb,), np.dtype[np.int8]]   # W stream (per column)
-c_ty = np.ndarray[(NACC * SZ_C,), np.dtype[np.int32]]          # per-core C block
-a_col_ty = np.ndarray[(ROWS * NACC * SZ_A,), np.dtype[np.int8]]  # ROWS A blocks / column
-c_col_ty = np.ndarray[(ROWS * NACC * SZ_C,), np.dtype[np.int32]]  # ROWS C blocks / column
+a_ty: object = np.ndarray[(NACC * SZ_A,), np.dtype[np.int8]]           # per-core A block
+w_ty: object = np.ndarray[(SZ_Bb,), np.dtype[np.int8]]                 # one int4 weight tile
+in_w_ty: object = np.ndarray[(N_BTILES * SZ_Bb,), np.dtype[np.int8]]   # W stream (per column)
+c_ty: object = np.ndarray[(NACC * SZ_C,), np.dtype[np.int32]]          # per-core C block
+a_col_ty: object = np.ndarray[(ROWS * NACC * SZ_A,), np.dtype[np.int8]]  # ROWS A blocks / column
+c_col_ty: object = np.ndarray[(ROWS * NACC * SZ_C,), np.dtype[np.int32]]  # ROWS C blocks / column
 
 flags = ["-std=c++20", "-O2", f"-DNACC={NACC}", f"-DINNER={INNER}"]
 kern = ExternalFunction("r2a_mac", source_file="../r2/r2a_gemm.cc",

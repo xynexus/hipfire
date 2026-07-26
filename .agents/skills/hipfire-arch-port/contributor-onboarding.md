@@ -152,16 +152,18 @@ positive sources). Do NOT split the diff into "add new arch" +
 `crates/hipfire-runtime/examples/test_kernels.rs`: add a test case
 that exercises your new kernel on the new arch.
 
-### 6. Run all three gates locally
+### 6. Run the gates locally
 
 ```bash
 ./scripts/coherence-gate.sh
-./scripts/coherence-gate-dflash.sh
+./tests/tiny-affected-gate.sh --require-coverage   # automatic correctness front tier
 ./scripts/speed-gate.sh --fast
 cargo run --release -p hipfire-runtime --example test_kernels
+# optional manual DFlash/DDTree diagnostic:
+./tests/coherence-gate-dflash.sh
 ```
 
-All three must pass. If channel-test fails, you've got a per-lane
+These must pass. If channel-test fails, you've got a per-lane
 mapping wrong — go back to step 4 and instrument with `eprintln!`s
 of `(tid, output_index)` to derive the correct mapping.
 
@@ -226,10 +228,11 @@ review the plan before any code is written, then iterate.
 - The agent **cannot bypass the speed-gate with `--no-verify`**.
   This is enforced by repo policy. If the agent suggests
   `--no-verify`, push back — it's almost always wrong.
-- The agent **must run `./scripts/coherence-gate-dflash.sh` after kernel
-  changes**, not just claim "should be fine". `./scripts/coherence-gate.sh`
-  is still useful as an AR smoke gate, but the DFlash gate is the canonical
-  correctness gate for the silent-corruption class.
+- The agent **must run `./tests/tiny-affected-gate.sh --require-coverage`
+  after kernel changes** (the automatic correctness front tier), not just
+  claim "should be fine". `./scripts/coherence-gate.sh` is still useful as an
+  AR smoke gate, and `./tests/coherence-gate-dflash.sh` remains an optional
+  manual DFlash/DDTree diagnostic for the silent-corruption class.
 - The agent **must check git status before each commit** to make
   sure no stray test files / debug prints land.
 

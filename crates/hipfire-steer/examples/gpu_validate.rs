@@ -36,11 +36,11 @@
 //!
 //! Exits non-zero if any case exceeds tolerance, so it can gate a GPU smoke run.
 
+use hipfire_rdna::Gpu;
 use hipfire_steer::{
     apply_direction, begin_apply, begin_capture, clear, commit_capture, derive_directions,
     finish_capture, maybe_steer_block, CaptureMeans, SteerMode, SteerSpec,
 };
-use hipfire_rdna::Gpu;
 
 const NUM_LAYERS: usize = 4;
 // Non-power-of-two and > 256 so the gemv tree reduction exercises both the

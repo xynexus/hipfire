@@ -29,8 +29,8 @@ and 4 are historically retired and must not be reused.
 
 | id | constant | family label | serving crate | detection `arch_str` |
 |----|----------|--------------|---------------|----------------------|
-| 0  | `ARCH_ID_LLAMA_MISTRAL`      | llama        | `hipfire-arch-llama`    | `llama` (+ unknown-arch default) |
-| 1  | `ARCH_ID_QWEN3_QWEN2_LEGACY` | llama        | `hipfire-arch-llama`    | `qwen3`, `qwen2` |
+| 0  | `ARCH_ID_LLAMA_MISTRAL`      | llama        | `hipfire-arch-llama`    | `llama`, `mistral` |
+| 1  | `ARCH_ID_QWEN3_QWEN2_LEGACY` | qwen3-legacy | `hipfire-arch-llama`    | `qwen3`, `qwen2` |
 | 5  | `ARCH_ID_QWEN35_DENSE`       | qwen3.5      | `hipfire-arch-qwen35`   | `qwen3_5`, `qwen3_5_text` |
 | 6  | `ARCH_ID_QWEN35_MOE`         | qwen3.5      | `hipfire-arch-qwen35`   | `qwen3_5_moe`, `qwen3_5_moe_text`, GGUF `qwen3moe` |
 | 7  | `ARCH_ID_QWEN2`              | qwen2        | `hipfire-arch-qwen2`    | via `--arch-id 7` (auto-detect maps plain Qwen2 to 1) |
@@ -43,6 +43,10 @@ and 4 are historically retired and must not be reused.
 | 14 | `ARCH_ID_NEMOTRON_H`        | nemotron_h   | `hipfire-arch-nemotron` | `nemotron_h` |
 | 15 | `ARCH_ID_MAMBA2`            | mamba2       | `hipfire-arch-nemotron` | `mamba2` (+ `is_mamba2_config`) |
 | 16 | `ARCH_ID_ZAYA`             | zaya         | `hipfire-arch-zaya`     | `zaya` |
+| 19 | `ARCH_ID_EMBEDDINGGEMMA`   | embeddinggemma | `hipfire-arch-embeddinggemma` | `gemma3_text`/`gemma3` bidirectional encoder w/ ST pooling+Dense modules (embeddinggemma) |
+| 23 | `ARCH_ID_FLUX2`             | flux2        | `hipfire-diffusion` | `Flux2Transformer2DModel` / `Flux2KleinPipeline` / `SEFIInferencePipeline` |
+| 24 | `ARCH_ID_GEMMA4`            | gemma4       | `hipfire-arch-gemma4` | `gemma4`, `gemma4_text`, `gemma4_unified`, `gemma4_unified_text` (one text-core id; wrappers remain typed config distinctions) |
+| 25 | `ARCH_ID_COHERE2_MOE`       | cohere2-moe  | not yet served | `cohere2_moe` (BLS Mini Code; offline identity and ingest are registered before serving bring-up) |
 
 The per-arch capability matrix (prefill / dflash / mtp / kv / vision support)
 lives in `docs/model-support.toml`, keyed by these same ids.

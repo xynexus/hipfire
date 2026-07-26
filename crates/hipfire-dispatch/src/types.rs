@@ -225,6 +225,10 @@ pub enum KernelKey {
     // Opus Quant W8A8 — prerotated int8 activation + int8 grouped-WMMA weight.
     // x arrives FWHT-rotated; launch quantizes to int8 then dispatches gemm_oq8.
     GemvOq8G256Prerotated,
+    // Opus Quant W4A16 decode — prerotated f32 activation × int4 grouped weight.
+    // x arrives FWHT-rotated; launch dispatches the dense gemv_oq4_grouped (no
+    // activation quant at B=1, mirroring the OQ8 prerotated arm).
+    GemvOq4G256Prerotated,
     // GEMV residual
     GemvHfq4G256Residual,
     GemvHfq3G256Residual,
@@ -508,6 +512,7 @@ pub enum DispatchError {
         key: KernelKey,
     },
     Hip(String),
+    Capture(String),
 }
 
 impl std::fmt::Display for DispatchError {
@@ -525,6 +530,7 @@ impl std::fmt::Display for DispatchError {
             Self::NotFound { key } => write!(f, "kernel not registered: {key:?}"),
             Self::EmptyEntry { key } => write!(f, "kernel registry entry empty: {key:?}"),
             Self::Hip(msg) => write!(f, "HIP error: {msg}"),
+            Self::Capture(msg) => write!(f, "calibration capture error: {msg}"),
         }
     }
 }
@@ -598,6 +604,7 @@ impl KernelKey {
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydPrerotated),
             MFP4G32 => Ok(Self::GemvMfp4G32Prerotated),
             Oq8G256 => Ok(Self::GemvOq8G256Prerotated),
+            Oq4G256 => Ok(Self::GemvOq4G256Prerotated),
             // Q8/Paro have no separate "prerotated" kernel: Q8 is not FWHT-rotated
             // (prerotated input == raw input → gemv_q8_0), and Paro's Givens-rotated
             // input feeds the same gemv_hfq4g128 kernel as its Plain path. launch()
@@ -701,7 +708,9 @@ impl KernelKey {
             Oq4G256 | Oq8G256 => ArchPredicate::HasWmma,
             // W8A8 reference — int8 weights + per-token int8 activations via iu8 WMMA.
             W8A8Ref => ArchPredicate::HasWmma,
-            Q8HFQ | Raw => ArchPredicate::Always,
+            Q8HFQ | DflashOq8Plain | DflashOq4Plain | DflashOq4MixedPlain | Raw => {
+                ArchPredicate::Always
+            }
         }
     }
 

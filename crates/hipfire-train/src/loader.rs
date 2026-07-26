@@ -8,8 +8,8 @@
 
 use crate::config::LlamaConfig;
 use hipfire_model::ModelSource;
-use hipfire_runtime::safetensors_source::SafetensorsSource;
 use hipfire_rdna::{Gpu, GpuTensor};
+use hipfire_runtime::safetensors_source::SafetensorsSource;
 use std::path::Path;
 
 /// Per-layer frozen weights (HF row-major `[out, in]`, ready for
@@ -143,6 +143,40 @@ fn decode_hfq_tensor(quant_type: u8, data: &[u8], n: usize) -> Result<Vec<f32>, 
     }
 }
 
+/// Parallel HFQ Q8F16 dequant (34-byte blocks: f16 scale + 32×i8). The gemma3
+/// embedding table is ~671M elements and the serial `dequant_q8f16` is a
+/// multi-minute single-threaded startup tax on every training run; blocks are
+/// independent, so split the block stream across cores. Falls back to the serial
+/// path if the byte length doesn't match the 34-B block layout (layout guard).
+fn dequant_q8f16_parallel(data: &[u8], n: usize) -> Vec<f32> {
+    const BYTES_PER_BLOCK: usize = 34;
+    if n % 32 != 0 || data.len() != (n / 32) * BYTES_PER_BLOCK {
+        return hipfire_runtime::quant::dequant_q8f16(data, n);
+    }
+    let total_blocks = n / 32;
+    let threads = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(8)
+        .clamp(1, total_blocks.max(1));
+    let blocks_per = total_blocks.div_ceil(threads);
+    let mut out = vec![0.0f32; n];
+    std::thread::scope(|s| {
+        let mut rest = out.as_mut_slice();
+        let mut b0 = 0usize;
+        while b0 < total_blocks {
+            let nb = blocks_per.min(total_blocks - b0);
+            let (chunk, tail) = rest.split_at_mut(nb * 32);
+            rest = tail;
+            let dslice = &data[b0 * BYTES_PER_BLOCK..(b0 + nb) * BYTES_PER_BLOCK];
+            s.spawn(move || {
+                chunk.copy_from_slice(&hipfire_runtime::quant::dequant_q8f16(dslice, nb * 32));
+            });
+            b0 += nb;
+        }
+    });
+    out
+}
+
 /// Load a dense LLaMA model's base weights directly from a `.hfq` artifact,
 /// decoded to fp32 — so the training "student" IS the served model (no
 /// re-quantize / format-matching). Config comes from the HFQM metadata.
@@ -212,6 +246,129 @@ pub fn load_llama_from_hfq(
             lm_head,
         },
     ))
+}
+
+/// Load a **gemma3** target's shared embedding (+ tied lm-head) as fp32 for
+/// DSpark training. The trainer only reads `embed_tokens` (and `lm_head`, which
+/// gemma3 ties → `None` ⇒ the loop falls back to `embed_tokens`); the `layers` /
+/// `final_norm` fields are unused by the drafter training and left empty/zero.
+///
+/// The returned [`LlamaConfig`] carries gemma3's decoder dims so
+/// `init_dspark_model` shapes the 5-layer drafter body as a dense GQA version of
+/// the gemma3 block (h, n_heads, n_kv, head_dim, inter). gemma3's **global**
+/// `rope_theta` is used (the drafter body is all-global dense; it does not model
+/// the sliding-window local layers). The multimodal wrapper (`architecture ==
+/// "gemma3"`) nests the decoder under `text_config` / `language_model.`.
+pub fn load_gemma3_target_f32(
+    gpu: &mut Gpu,
+    path: &Path,
+) -> Result<(LlamaConfig, LlamaWeightsF32), String> {
+    use std::collections::HashMap;
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let (entries, meta) = crate::hfq_patch::parse_hfq(&bytes)?;
+    let v: serde_json::Value =
+        serde_json::from_str(&meta).map_err(|e| format!("gemma3 meta json: {e}"))?;
+    let arch = v.get("architecture").and_then(|a| a.as_str()).unwrap_or("");
+    let config = v.get("config").ok_or("gemma3 meta: no config")?;
+    let tc = config.get("text_config").unwrap_or(config);
+    let u = |k: &str| tc.get(k).and_then(|x| x.as_u64()).map(|x| x as usize);
+
+    let hidden_size = u("hidden_size").ok_or("gemma3: no hidden_size")?;
+    let num_attention_heads = u("num_attention_heads").ok_or("gemma3: no num_attention_heads")?;
+    let num_key_value_heads = u("num_key_value_heads").unwrap_or(num_attention_heads);
+    let head_dim = u("head_dim").unwrap_or(hidden_size / num_attention_heads);
+    let intermediate_size = u("intermediate_size").ok_or("gemma3: no intermediate_size")?;
+    let vocab_size = u("vocab_size").ok_or("gemma3: no vocab_size")?;
+    let num_hidden_layers = u("num_hidden_layers").unwrap_or(1);
+    let max_position_embeddings = u("max_position_embeddings").unwrap_or(131072);
+    let rms_norm_eps = tc
+        .get("rms_norm_eps")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(1e-6) as f32;
+    let rope_theta = tc
+        .get("rope_theta")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(1_000_000.0) as f32;
+
+    let cfg = LlamaConfig {
+        hidden_size,
+        intermediate_size,
+        num_hidden_layers,
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim,
+        vocab_size,
+        rms_norm_eps,
+        rope_theta,
+        tie_word_embeddings: true,
+        max_position_embeddings,
+    };
+
+    // Dequantize the (possibly Q8/HFQ4-packed) embedding table to fp32.
+    let prefix = if arch == "gemma3_text" {
+        ""
+    } else {
+        "language_model."
+    };
+    let embed_name = format!("{prefix}model.embed_tokens.weight");
+    let map: HashMap<&str, &crate::hfq_patch::HfqEntry> =
+        entries.iter().map(|e| (e.name.as_str(), e)).collect();
+    let e = map
+        .get(embed_name.as_str())
+        .ok_or_else(|| format!("gemma3: missing tensor {embed_name}"))?;
+    let data = &bytes[e.data_offset..e.data_offset + e.data_size];
+    let n = vocab_size * hidden_size;
+    // Q8F16 (the common embed format) uses the parallel dequant to avoid a
+    // multi-minute single-threaded startup; other formats go through the shared
+    // decoder.
+    let f32s = if e.quant_type == 3 {
+        dequant_q8f16_parallel(data, n)
+    } else {
+        decode_hfq_tensor(e.quant_type, data, n).map_err(|x| format!("{embed_name}: {x}"))?
+    };
+    if f32s.len() != n {
+        return Err(format!("{embed_name}: {} elems != {n}", f32s.len()));
+    }
+    let embed_tokens = gpu
+        .upload_f32(&f32s, &[vocab_size, hidden_size])
+        .map_err(|x| format!("upload embed: {x:?}"))?;
+    let final_norm = gpu
+        .zeros(&[hidden_size], hipfire_rdna::DType::F32)
+        .map_err(|x| format!("gemma3 final_norm: {x:?}"))?;
+
+    Ok((
+        cfg,
+        LlamaWeightsF32 {
+            embed_tokens,
+            layers: Vec::new(),
+            final_norm,
+            lm_head: None,
+        },
+    ))
+}
+
+/// Load a DSpark target's shared embed/lm-head + decoder dims from a `.hfq`,
+/// dispatching on the artifact's `architecture`: `gemma3*` →
+/// [`load_gemma3_target_f32`], everything else → [`load_llama_from_hfq`].
+pub fn load_target_f32(
+    gpu: &mut Gpu,
+    path: &Path,
+) -> Result<(LlamaConfig, LlamaWeightsF32), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let (_entries, meta) = crate::hfq_patch::parse_hfq(&bytes)?;
+    let arch = serde_json::from_str::<serde_json::Value>(&meta)
+        .ok()
+        .and_then(|v| {
+            v.get("architecture")
+                .and_then(|a| a.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_default();
+    if arch.starts_with("gemma3") {
+        load_gemma3_target_f32(gpu, path)
+    } else {
+        load_llama_from_hfq(gpu, path)
+    }
 }
 
 /// Convert little-endian safetensors bytes of the given dtype to fp32.

@@ -28,6 +28,17 @@ where
     let mut suites: Vec<SuiteId> = Vec::new();
     let mut out_dir: Option<PathBuf> = None;
     let mut kv_mode: Option<String> = None;
+    let mut ctx: Option<usize> = None;
+    let mut corpus: Option<PathBuf> = None;
+    // Default KV is kvarn + the two-tier hierarchical cache (the quality winner);
+    // `--no-kv-hierarchical` opts out. asym/mq are no longer the defaults.
+    let mut kv_hierarchical = true;
+    let mut kvarn_bits: Option<usize> = None;
+    let mut hot_bits: Option<usize> = None;
+    let mut cask_sidecar: Option<PathBuf> = None;
+    let mut cask_budget = 512usize;
+    let mut cask_beta = 128usize;
+    let mut fixture: Option<String> = None;
     let mut max_tokens = 64usize;
     let mut dflash = DflashMode::Off;
     let mut profile = ProfileMode::Off;
@@ -121,7 +132,58 @@ where
                 i += 2;
             }
             "--kv-mode" => {
-                kv_mode = Some(take_value(&argv, i, "--kv-mode")?);
+                let mode = take_value(&argv, i, "--kv-mode")?;
+                validate_kv_mode(&mode)?;
+                kv_mode = Some(mode);
+                i += 2;
+            }
+            "--kv-hierarchical" => {
+                kv_hierarchical = true;
+                i += 1;
+            }
+            "--no-kv-hierarchical" => {
+                kv_hierarchical = false;
+                i += 1;
+            }
+            "--kvarn-bits" => {
+                let n = parse_usize(&take_value(&argv, i, "--kvarn-bits")?, "--kvarn-bits")?;
+                if !matches!(n, 2 | 4 | 8) {
+                    return Err(format!("--kvarn-bits must be 2, 4, or 8 (got {n})"));
+                }
+                kvarn_bits = Some(n);
+                i += 2;
+            }
+            "--hot-bits" => {
+                let n = parse_usize(&take_value(&argv, i, "--hot-bits")?, "--hot-bits")?;
+                if !matches!(n, 8 | 16) {
+                    return Err(format!("--hot-bits must be 8 or 16 (got {n})"));
+                }
+                hot_bits = Some(n);
+                i += 2;
+            }
+            "--cask-sidecar" => {
+                cask_sidecar = Some(PathBuf::from(take_value(&argv, i, "--cask-sidecar")?));
+                i += 2;
+            }
+            "--cask-budget" => {
+                cask_budget =
+                    parse_usize(&take_value(&argv, i, "--cask-budget")?, "--cask-budget")?;
+                i += 2;
+            }
+            "--cask-beta" => {
+                cask_beta = parse_usize(&take_value(&argv, i, "--cask-beta")?, "--cask-beta")?;
+                i += 2;
+            }
+            "--ctx" => {
+                ctx = Some(parse_usize(&take_value(&argv, i, "--ctx")?, "--ctx")?);
+                i += 2;
+            }
+            "--corpus" => {
+                corpus = Some(PathBuf::from(take_value(&argv, i, "--corpus")?));
+                i += 2;
+            }
+            "--fixture" => {
+                fixture = Some(take_value(&argv, i, "--fixture")?);
                 i += 2;
             }
             "--max-tokens" => {
@@ -277,6 +339,12 @@ where
     if runs == 0 {
         return Err("--runs must be at least 1".to_string());
     }
+    if cask_budget == 0 {
+        return Err("--cask-budget must be at least 1".to_string());
+    }
+    if cask_beta == 0 {
+        return Err("--cask-beta must be at least 1".to_string());
+    }
     // A model argument is required for a single run, but --models (sweep), --status, and
     // --fetch supply or don't need it; use a placeholder that run_from_env
     // replaces per sweep iteration. The tiny_quant battery emits + quantizes its
@@ -313,6 +381,15 @@ where
         suites,
         out_dir,
         kv_mode,
+        ctx,
+        corpus,
+        kv_hierarchical,
+        kvarn_bits,
+        hot_bits,
+        cask_sidecar,
+        cask_budget,
+        cask_beta,
+        fixture,
         max_tokens,
         dflash,
         profile,
@@ -357,7 +434,7 @@ pub fn usage() -> String {
        --dry-run                plan only: resolve models/batteries/cache/artifacts and report (no tests run, nothing fetched/generated)\n\
        --status                 print cache/dataset/hardware status and exit\n\
        --fetch                  ensure datasets are present (HF fetch), then exit\n\
-       --battery <a,b>          smoke,coherence,quality,retrieval,speed,dflash,pflash,agentic,runtime,prompt_shape,structured,barrage,longctx,vision,cask,profile,perplexity,calibrate\n\
+       --battery <a,b>          smoke,coherence,quality,retrieval,speed,dflash,pflash,agentic,runtime,prompt_shape,structured,barrage,longctx,vision,cask,profile,perplexity,calibrate,embedding_quality,diffusion\n\
        --suite <a,b>            gpqa,lm_eval_micro,humaneval,deep_swe,swe_bench,ruler,nolima,needle_chain,niah,sequential_niah\n\
        --compare <model>        model to compare against the candidate\n\
        --baseline <model>       deprecated alias for --compare\n\
@@ -365,7 +442,17 @@ pub fn usage() -> String {
        --out <dir>              output directory\n\
        --draft <path>           DFlash draft artifact\n\
        --dflash <off|auto|on>   DFlash mode (default: off)\n\
-       --kv-mode <mode>         KV mode metadata to record\n\
+       --kv-mode <mode>         KV cache mode: f32,q8,asym2,asym3,asym4,kvarn,fwht2,fwht3,fwht4 (default: kvarn)\n\
+       --kv-hierarchical        force the two-tier hot/cold KV cache on (default: on for kvarn; sets HIPFIRE_KV_HIERARCHICAL=1)\n\
+       --no-kv-hierarchical     disable the two-tier hot/cold KV cache\n\
+       --kvarn-bits <2|4|8>     kvarn K precision (default 4; 8 is ~lossless-er, 2x K storage; sets HIPFIRE_KVARN_BITS)\n\
+       --hot-bits <8|16>        hierarchical hot-tier precision (default 8 = int8 ring, ~½ hot VRAM; 16 = f16 for A/B; sets HIPFIRE_KV_HOT_BITS)\n\
+       --cask-sidecar <path>    explicit CASK/TriAttention artifact (embedded or canonical sibling is used when omitted)\n\
+       --cask-budget <N>        CASK retained-token budget (default: 512)\n\
+       --cask-beta <N>          CASK eviction growth interval (default: 128)\n\
+       --ctx <N>                context length for perplexity/long-context batteries (default: 512; overrides HIPFIRE_EVAL_PERPLEXITY_CTX)\n\
+       --corpus <path>          perplexity corpus path (overrides HIPFIRE_EVAL_PERPLEXITY_CORPUS)\n\
+       --fixture <a,b>          pflash/longctx NIAH fixture filter (substring match on name, e.g. niah_16k,longcode); default: all\n\
        --max-tokens <N>         short decode cap for execution batteries (default: 64)\n\
        --profile <off|passive>  profiling mode (default: off)\n\
        --quality-max-chunks <N> quality canary chunk cap\n\
@@ -453,6 +540,32 @@ fn parse_csv<T>(raw: &str, parse: fn(&str) -> Result<T, String>) -> Result<Vec<T
         .filter(|s| !s.trim().is_empty())
         .map(|s| parse(s.trim()))
         .collect()
+}
+
+/// Canonical KV-cache modes surfaced in help (human-facing set).
+pub(crate) const KV_MODE_CANONICAL: &[&str] = &[
+    "f32", "q8", "asym2", "asym3", "asym4", "kvarn", "fwht2", "fwht3", "fwht4",
+];
+
+/// Validate `--kv-mode` against the union of tokens the spawned binaries accept
+/// (`perplexity` and the `run` example). This only catches typos: the two
+/// binaries accept overlapping-but-not-identical sets (e.g. `kvarn` is
+/// perplexity-only; `turbo*` are `run` aliases), so we accept the union and let
+/// each binary reject a mode it does not implement. `--kv-hierarchical` gates
+/// the two-tier cache separately (it is not a `--kv-mode` value).
+fn validate_kv_mode(mode: &str) -> Result<(), String> {
+    const ACCEPTED: &[&str] = &[
+        "f32", "fp16", "fp32", "q8", "asym2", "asym3", "asym4", "turbo", "turbo2", "turbo3",
+        "turbo4", "kvarn", "fwht2", "fwht3", "fwht4",
+    ];
+    if ACCEPTED.contains(&mode) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown --kv-mode: {mode}\nvalid modes: {}",
+            KV_MODE_CANONICAL.join(", ")
+        ))
+    }
 }
 
 fn parse_usize(raw: &str, flag: &str) -> Result<usize, String> {

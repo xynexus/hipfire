@@ -14,6 +14,8 @@ description = "Gemma3 text decoder (GQA + per-head QK-norm + 4 norms/layer + GeG
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-model = { path = "../hipfire-model" }
+hipfire-specdecode-dspark = { path = "../hipfire-specdecode-dspark" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 hip-bridge = { path = "../hip-bridge" }
 hipfire-rdna = { path = "../hipfire-rdna" }

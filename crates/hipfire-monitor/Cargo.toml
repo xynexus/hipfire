@@ -1,0 +1,14 @@
+[package]
+name = "hipfire-monitor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone terminal system monitor backed by HIP-independent sysfs/proc telemetry."
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.28"
+libc = "0.2"
+ratatui = "0.29"
+hipfire-admin-types = { path = "../hipfire-admin-types" }
+hipfire-sysinfo = { path = "../hipfire-sysinfo" }

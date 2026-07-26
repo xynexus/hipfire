@@ -311,6 +311,12 @@ fn run_shared_prepared_coherence_cases(
     ctx: &EvalContext,
     cases: Vec<SharedCoherenceEvalCase>,
 ) -> Vec<EvalResult> {
+    if let Some(server_url) = eval_server_url() {
+        return cases
+            .into_iter()
+            .map(|case| run_prepared_server_coherence_case(config, ctx, &case, &server_url))
+            .collect();
+    }
     let daemon = hipfire_daemon_adapter::find_daemon_bin();
     let mut max_seq_by_key: BTreeMap<(String, bool), usize> = BTreeMap::new();
     for case in &cases {
@@ -357,6 +363,131 @@ fn run_shared_prepared_coherence_cases(
         }
     }
     rows
+}
+
+fn run_prepared_server_coherence_case(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    case: &SharedCoherenceEvalCase,
+    server_url: &str,
+) -> EvalResult {
+    let mut metrics = case.metrics.clone();
+    metrics.insert("executor".to_string(), json!("server"));
+    metrics.insert("runtime_path".to_string(), json!("server_http"));
+    metrics.insert("server_url".to_string(), json!(server_url));
+    metrics.insert("implemented".to_string(), json!(true));
+    metrics.insert("shared_coherence_session".to_string(), json!(true));
+    let Some(resolved_prompt) = resolve_repo_path(&case.prompt_path) else {
+        return prepared_daemon_coherence_failure_row(
+            config,
+            ctx,
+            case,
+            &format!("prompt not found: {}", case.prompt_path),
+        );
+    };
+    let prompt_text = match fs::read_to_string(&resolved_prompt) {
+        Ok(text) => text,
+        Err(err) => {
+            return prepared_daemon_coherence_failure_row(
+                config,
+                ctx,
+                case,
+                &format!("read prompt {}: {err}", resolved_prompt.display()),
+            );
+        }
+    };
+    let system_text = if let Some(path) = case.system_path {
+        let Some(resolved_system) = resolve_repo_path(path) else {
+            return prepared_daemon_coherence_failure_row(
+                config,
+                ctx,
+                case,
+                &format!("system prompt not found: {path}"),
+            );
+        };
+        match fs::read_to_string(&resolved_system) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                return prepared_daemon_coherence_failure_row(
+                    config,
+                    ctx,
+                    case,
+                    &format!("read system prompt {}: {err}", resolved_system.display()),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let profile = case.profile.clone().unwrap_or_else(|| {
+        hipfire_coherence::DetectorProfile::default_for_prompt(&prompt_text, system_text.as_deref())
+    });
+    let run_config = hipfire_coherence::CoherenceRunConfig {
+        model: case.model.clone(),
+        prompt: prompt_text.clone(),
+        prompt_label: case.prompt_path.clone(),
+        system: system_text.clone(),
+        tools: case.tools.clone(),
+        assistant_prefix: case.assistant_prefix.map(str::to_string),
+        force_jinja_chat: case.force_jinja_chat,
+        max_tokens: case.max_tokens,
+        temperature: 0.0,
+        repeat_penalty: None,
+        repeat_window: None,
+        max_seq: case.max_seq,
+        state: None,
+        profile,
+    };
+    let started = SystemTime::now();
+    let result = server_chat_completion(
+        server_url,
+        &case.model,
+        &prompt_text,
+        system_text.as_deref(),
+        case.tools.clone(),
+        case.max_tokens,
+    );
+    let chat = match result {
+        Ok(result) => result,
+        Err(err) => {
+            return row_for_model(
+                case.battery,
+                None,
+                &case.case_id,
+                None,
+                EvalStatus::Fail,
+                Some(format!("server coherence probe failed: {err}")),
+                metrics,
+                config,
+                ctx,
+                case.prompt_ref.clone(),
+                elapsed_since_ms(started),
+                case.model.clone(),
+            );
+        }
+    };
+    let output = hipfire_coherence::run_coherence_over_text(
+        &run_config,
+        chat.text,
+        timing_u64(&chat.timings, "tokens").unwrap_or(0) as usize,
+        elapsed_since_ms(started).min(u64::MAX as u128) as u64,
+        timing_f64(&chat.timings, "ttft_ms").unwrap_or(0.0) as u64,
+        timing_f64(&chat.timings, "prefill_ms").unwrap_or(0.0),
+        timing_f64(&chat.timings, "prefill_tok_s").unwrap_or(0.0),
+        timing_f64(&chat.timings, "decode_tok_s").unwrap_or(0.0),
+        timing_f64(&chat.timings, "tok_s").unwrap_or(0.0),
+    );
+    finish_coherence_row(
+        config,
+        ctx,
+        case.battery,
+        &case.case_id,
+        case.prompt_ref.clone(),
+        case.model.clone(),
+        metrics,
+        elapsed_since_ms(started),
+        output,
+    )
 }
 
 fn run_prepared_daemon_coherence_case(
@@ -708,15 +839,64 @@ pub(crate) fn parse_labeled_f64(s: &str, label: &str) -> Option<f64> {
         .ok()
 }
 
+/// Extract the haystack text of a NIAH-family `.jsonl` fixture into a plain-text
+/// corpus the perplexity harness can score. Returns the written corpus path.
+/// This is the long-context KLD bridge: it lets `--battery perplexity --corpus
+/// <fixture.jsonl> --ctx N` measure PPL/KLD over a long sequence.
+pub(crate) fn longctx_corpus_from_fixture(
+    fixture: &Path,
+    out_dir: &Path,
+) -> Result<PathBuf, String> {
+    let v = crate::datasets::read_first_jsonl_object(fixture)?;
+    let text = v
+        .get("filler_text")
+        .and_then(|x| x.as_str())
+        .ok_or("fixture missing filler_text (not a NIAH-family fixture?)")?;
+    let dir = out_dir.join("artifacts").join("perplexity_corpus");
+    fs::create_dir_all(&dir).map_err(|e| format!("create corpus dir: {e}"))?;
+    let stem = fixture
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("fixture");
+    let path = dir.join(format!("{stem}.txt"));
+    fs::write(&path, text).map_err(|e| format!("write corpus: {e}"))?;
+    Ok(path)
+}
+
+/// Apply KV-cache environment to a spawned model subprocess. The two-tier
+/// hot/cold cache is env-gated (`HIPFIRE_KV_HIERARCHICAL`) and layers on top of
+/// the KVarN base tier, so it is only set when the effective mode is `kvarn`
+/// (setting it under a non-kvarn cache would be a no-op at best). Other
+/// `HIPFIRE_KV_*` knobs are inherited from the caller's env.
+pub(crate) fn apply_kv_env(cmd: &mut Command, config: &EvalConfig, kv_mode: &str) {
+    if kv_mode == "kvarn" {
+        if config.kv_hierarchical {
+            cmd.env("HIPFIRE_KV_HIERARCHICAL", "1");
+            // Hot-tier precision only applies to the hierarchical cache (default 8;
+            // 16 selects the f16 ring for A/B).
+            if let Some(bits) = config.hot_bits {
+                cmd.env("HIPFIRE_KV_HOT_BITS", bits.to_string());
+            }
+        }
+        if let Some(bits) = config.kvarn_bits {
+            cmd.env("HIPFIRE_KVARN_BITS", bits.to_string());
+        }
+    }
+}
+
 pub(crate) fn run_examples_perplexity_model(
     config: &EvalConfig,
     ctx: &EvalContext,
     model: String,
 ) -> EvalResult {
     let label = "corpus_perplexity";
-    let corpus_rel = std::env::var("HIPFIRE_EVAL_PERPLEXITY_CORPUS").unwrap_or_else(|_| {
-        "benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt".into()
-    });
+    // Corpus: --corpus flag wins, then the env fallback, then the frozen slice.
+    let corpus_rel = config
+        .corpus
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or_else(|| std::env::var("HIPFIRE_EVAL_PERPLEXITY_CORPUS").ok())
+        .unwrap_or_else(|| "benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt".into());
     let prompt_ref = prompt(&corpus_rel);
     // KLD needs a reference; absent ⇒ PPL-only (not a failure). See resolve_kldref.
     let kldref = resolve_kldref(&model, config);
@@ -761,11 +941,29 @@ pub(crate) fn run_examples_perplexity_model(
         ));
     }
 
-    let ctx_len = std::env::var("HIPFIRE_EVAL_PERPLEXITY_CTX")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
+    // Long-context KLD bridge: a NIAH-family `.jsonl` fixture is scored by
+    // extracting its haystack text into a plain-text corpus, so the perplexity
+    // harness emits PPL + KLD/tok over the long sequence (the graded
+    // long-context KV-quality metric). Plain-text corpora pass through.
+    let corpus = if corpus.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+        match longctx_corpus_from_fixture(&corpus, &config.out_dir) {
+            Ok(p) => p,
+            Err(e) => return skip(&format!("extract long-context corpus from fixture: {e}")),
+        }
+    } else {
+        corpus
+    };
+
+    // Context length: --ctx flag wins, then the env fallback, then 512.
+    let ctx_len = config
+        .ctx
+        .or_else(|| {
+            std::env::var("HIPFIRE_EVAL_PERPLEXITY_CTX")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+        })
         .unwrap_or(512);
-    let kv_mode = config.kv_mode.as_deref().unwrap_or("q8").to_string();
+    let kv_mode = config.kv_mode.as_deref().unwrap_or("kvarn").to_string();
     let mut args = vec![
         model.clone(),
         corpus.display().to_string(),
@@ -784,7 +982,10 @@ pub(crate) fn run_examples_perplexity_model(
     }
     let command_display = format!("{} {}", bin.display(), args.join(" "));
     let started = SystemTime::now();
-    let output = match Command::new(&bin).args(&args).output() {
+    let mut cmd = Command::new(&bin);
+    cmd.args(&args);
+    apply_kv_env(&mut cmd, config, &kv_mode);
+    let output = match cmd.output() {
         Ok(o) => o,
         Err(err) => {
             let mut m = base_metrics.clone();
@@ -866,6 +1067,287 @@ pub(crate) fn run_examples_perplexity_model(
     )
 }
 
+/// STS-Benchmark embedding-quality battery. Spawns the embeddinggemma
+/// `quality_compare` example once (it encodes the reference and the candidate),
+/// then emits two rows sharing a comparison key: a candidate row carrying the
+/// gated `spearman` (Spearman correlation vs human gold labels) and a reference
+/// row carrying the reference's `spearman`. The admission engine computes
+/// `delta = candidate - reference` and rejects only when it drops beyond the
+/// per-metric tolerance band (see `admission_metric_tolerance`). Cross-model
+/// cosine and rank-agreement are recorded on the candidate row for evidence but
+/// are deliberately NOT gated — a rotated-but-equally-good embedding space
+/// deflates those without any real retrieval-quality loss.
+pub(crate) fn run_examples_embedding_quality_rows(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+) -> Vec<EvalResult> {
+    run_examples_embedding_quality_model(config, ctx, config.model.clone())
+}
+
+pub(crate) fn run_examples_embedding_quality_model(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    model: String,
+) -> Vec<EvalResult> {
+    let battery = BatteryId::EmbeddingQuality;
+    let case_id = "sts_benchmark";
+    // Distinct dataset_item_id per candidate keeps comparison keys from
+    // colliding when several candidates are swept; the paired reference row
+    // reuses the candidate's stem so the two rows share one comparison key.
+    let item = model_artifact_stem(&model);
+    let dataset = match std::env::var("HIPFIRE_EVAL_STS_DATASET") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => home_dir()
+            .map(|h| h.join(".hipfire/corpora/sts-b/STS-B/dev.tsv"))
+            .unwrap_or_else(|| PathBuf::from("dev.tsv")),
+    };
+    let base_metrics = BTreeMap::from([
+        ("implemented".to_string(), json!(true)),
+        ("executor".to_string(), json!("examples")),
+        ("suite".to_string(), json!("embedding_quality")),
+        ("dataset".to_string(), json!(dataset.display().to_string())),
+    ]);
+    let base_metrics = embedding_quality_oq_metrics(&model, base_metrics);
+
+    let skip = |reason: &str| -> Vec<EvalResult> {
+        vec![row_for_model(
+            battery,
+            None,
+            case_id,
+            Some(item.clone()),
+            EvalStatus::Skip,
+            Some(reason.to_string()),
+            base_metrics.clone(),
+            config,
+            ctx,
+            None,
+            0,
+            model.clone(),
+        )]
+    };
+
+    let Some(reference) = config.reference.clone() else {
+        return skip(
+            "embedding_quality requires --reference <BF16.hfq> to gate the spearman delta",
+        );
+    };
+    if !Path::new(&model).exists() {
+        return skip("embedding_quality requires the candidate model to resolve to a local path");
+    }
+    if !Path::new(&reference).exists() {
+        return skip("embedding_quality requires the reference model to resolve to a local path");
+    }
+    let Some(bin) = resolve_quality_compare_bin() else {
+        return skip(
+            "quality_compare example not found; build with `cargo build --release -p hipfire-arch-embeddinggemma --example quality_compare`",
+        );
+    };
+    if !dataset.exists() {
+        return skip(&format!(
+            "STS dataset not found: {} — set HIPFIRE_EVAL_STS_DATASET",
+            dataset.display()
+        ));
+    }
+
+    let max_pairs = std::env::var("HIPFIRE_EVAL_STS_MAX_PAIRS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1500);
+    let selection_queries = std::env::var("HIPFIRE_EVAL_STS_SELECTION_QUERIES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(500);
+    let args = vec![
+        "--reference".to_string(),
+        reference.clone(),
+        "--candidate".to_string(),
+        model.clone(),
+        "--dataset".to_string(),
+        dataset.display().to_string(),
+        "--max-pairs".to_string(),
+        max_pairs.to_string(),
+        "--selection-queries".to_string(),
+        selection_queries.to_string(),
+    ];
+    let command_display = format!("{} {}", bin.display(), args.join(" "));
+    let started = SystemTime::now();
+    let output = match Command::new(&bin).args(&args).output() {
+        Ok(o) => o,
+        Err(err) => {
+            let mut m = base_metrics.clone();
+            m.insert("command".to_string(), json!(command_display));
+            return vec![row_for_model(
+                battery,
+                None,
+                case_id,
+                Some(item.clone()),
+                EvalStatus::Fail,
+                Some(format!("spawn quality_compare: {err}")),
+                m,
+                config,
+                ctx,
+                None,
+                elapsed_since_ms(started),
+                model,
+            )];
+        }
+    };
+    let elapsed_ms = elapsed_since_ms(started);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // One JSON object per candidate; we pass a single candidate. Take the last
+    // parseable object carrying candidate_spearman.
+    let report = stdout.lines().rev().find_map(|line| {
+        serde_json::from_str::<Value>(line.trim())
+            .ok()
+            .filter(|v| v.get("candidate_spearman").is_some())
+    });
+
+    let Some(report) = report else {
+        let mut m = base_metrics.clone();
+        m.insert("command".to_string(), json!(command_display));
+        m.insert(
+            "stdout_hash".to_string(),
+            json!(stable_hash_bytes(stdout.as_bytes())),
+        );
+        let reason = if output.status.success() {
+            "quality_compare produced no parseable JSON report".to_string()
+        } else {
+            format!("quality_compare exited with {}", output.status)
+        };
+        return vec![row_for_model(
+            battery,
+            None,
+            case_id,
+            Some(item.clone()),
+            EvalStatus::Fail,
+            Some(reason),
+            m,
+            config,
+            ctx,
+            None,
+            elapsed_ms,
+            model,
+        )];
+    };
+
+    let candidate_spearman = report.get("candidate_spearman").and_then(Value::as_f64);
+    let reference_spearman = report.get("reference_spearman").and_then(Value::as_f64);
+
+    // Candidate row: gated `spearman` plus recorded (ungated) evidence metrics.
+    let mut cand_metrics = base_metrics.clone();
+    cand_metrics.insert("command".to_string(), json!(command_display));
+    cand_metrics.insert(
+        "stdout_hash".to_string(),
+        json!(stable_hash_bytes(stdout.as_bytes())),
+    );
+    for key in [
+        "candidate_spearman",
+        "candidate_pearson",
+        "reference_spearman",
+        "spearman_delta_vs_reference",
+        "spearman_delta_ci95_low",
+        "spearman_delta_ci95_high",
+        "selection_top1_agreement",
+        "selection_top5_overlap",
+        "selection_top10_overlap",
+        "embedding_cosine_mean_vs_reference",
+        "embedding_cosine_min_vs_reference",
+        "pair_cosine_mae_vs_reference",
+        "pairs",
+    ] {
+        if let Some(v) = report.get(key) {
+            cand_metrics.insert(key.to_string(), v.clone());
+        }
+    }
+    if let Some(v) = candidate_spearman {
+        // Gated metric name; only this overlaps the reference row numerically.
+        cand_metrics.insert("spearman".to_string(), json!(v));
+    }
+
+    let cand_ok = candidate_spearman.is_some_and(f64::is_finite);
+    let cand_status = if output.status.success() && cand_ok {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+    let cand_reason = if cand_status == EvalStatus::Pass {
+        None
+    } else if !output.status.success() {
+        Some(format!("quality_compare exited with {}", output.status))
+    } else {
+        Some("quality_compare produced no finite candidate spearman".to_string())
+    };
+    let candidate_row = row_for_model(
+        battery,
+        None,
+        case_id,
+        Some(item.clone()),
+        cand_status,
+        cand_reason,
+        cand_metrics,
+        config,
+        ctx,
+        None,
+        elapsed_ms,
+        model.clone(),
+    );
+
+    // Reference row: carries only the gated `spearman`, so the admission engine
+    // compares exactly one metric (candidate_spearman − reference_spearman).
+    let mut ref_metrics = base_metrics.clone();
+    if let Some(v) = reference_spearman {
+        ref_metrics.insert("spearman".to_string(), json!(v));
+    }
+    let ref_status = if reference_spearman.is_some_and(f64::is_finite) {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Skip
+    };
+    let reference_row = row_for_model(
+        battery,
+        None,
+        case_id,
+        Some(item),
+        ref_status,
+        None,
+        ref_metrics,
+        config,
+        ctx,
+        None,
+        elapsed_ms,
+        reference,
+    );
+
+    vec![candidate_row, reference_row]
+}
+
+fn embedding_quality_oq_metrics(
+    model: &str,
+    mut metrics: BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
+    let Some(file_name) = Path::new(model).file_name().and_then(|name| name.to_str()) else {
+        return metrics;
+    };
+    let Some(artifact) = parse_canonical_model_artifact_name(file_name) else {
+        return metrics;
+    };
+    if !artifact.quant.starts_with("oq") {
+        return metrics;
+    }
+
+    metrics.insert("quant".to_string(), json!(artifact.quant));
+    metrics.insert("quant_family".to_string(), json!("oq"));
+    metrics.insert("oq_admission_path".to_string(), json!("embedding_quality"));
+    metrics.insert("oq_decode_gate".to_string(), json!("not_ar"));
+    metrics.insert("oq_tiny_quant_gate".to_string(), json!("not_ar"));
+    metrics.insert("oq_fixture_golden_gate".to_string(), json!("not_ar"));
+    metrics.insert("oq_embedding_quality".to_string(), json!("pending"));
+    if artifact.features.iter().any(|feature| feature == "npu") {
+        metrics.insert("oq_npu_parity".to_string(), json!("pending"));
+    }
+    metrics
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Qwen35SpeedCase {
     pub(crate) label: &'static str,
@@ -918,7 +1400,16 @@ pub(crate) fn run_examples_qwen35_speed_model(
 ) -> Vec<EvalResult> {
     let cases = qwen35_speed_cases();
     let prompt_ref = prompt("benchmarks/prompts/lru_cache_single_blank.txt");
-    let kv_mode = config.kv_mode.as_deref().unwrap_or("asym3").to_string();
+    // Speed battery defaults to q8, NOT the global `kvarn` default: the perf
+    // baseline (benchmarks/perf-baselines/gfx1151-*.json) is a legacy q8/fp32-era
+    // capture, and kvarn batched prefill — now correct (it routes through
+    // `kvarn_attend` in prefill_chunk.rs, no longer faulting in `kv_cache_write`)
+    // — is meaningfully SLOWER than q8 (window append + per-block flush vs the
+    // batched q8 write), so measuring kvarn against the q8 baseline would spuriously
+    // fail the gate. Restore the kvarn default here once the baseline is re-captured
+    // under kvarn. An explicit config.kv_mode still wins (bench_qwen35_speed
+    // understands the kvarn* modes).
+    let kv_mode = config.kv_mode.as_deref().unwrap_or("q8").to_string();
     let mut rows = Vec::new();
     let base_metrics = BTreeMap::from([
         ("implemented".to_string(), json!(true)),
@@ -1034,6 +1525,21 @@ pub(crate) fn run_examples_qwen35_speed_model(
     let shared_metrics = parse_summary_kv_metrics(&stderr);
     let stdout_hash = stable_hash_bytes(stdout.as_bytes());
     let stderr_hash = stable_hash_bytes(stderr.as_bytes());
+    // The child writes ALL bench output (incl. the SUMMARY/CASE_SUMMARY metric
+    // lines) to stderr; on failure we otherwise keep only stderr_hash, which is
+    // useless for triage. Surface a bounded tail so a single battery run shows
+    // *why* the child emitted no metrics (panic, HIP error, missing deltanet
+    // feature, OOM) instead of forcing a standalone repro hunt.
+    // ponytail: tail only; full stderr stays in the child's own logs.
+    let stderr_tail = {
+        let trimmed = stderr.trim_end();
+        let start = trimmed.len().saturating_sub(1200);
+        trimmed
+            .get(start..)
+            .unwrap_or(trimmed)
+            .trim_start()
+            .to_string()
+    };
 
     for case in cases {
         let mut metrics = base_metrics.clone();
@@ -1070,7 +1576,7 @@ pub(crate) fn run_examples_qwen35_speed_model(
         } else {
             EvalStatus::Fail
         };
-        let reason = if let Some(error) = &baseline_error {
+        let mut reason = if let Some(error) = &baseline_error {
             Some(error.to_string())
         } else if baseline_failed {
             Some("bench_qwen35_speed fell below perf baseline floor".to_string())
@@ -1084,6 +1590,13 @@ pub(crate) fn run_examples_qwen35_speed_model(
         } else {
             None
         };
+        if matches!(status, EvalStatus::Fail) {
+            metrics.insert("stderr_tail".to_string(), json!(stderr_tail.clone()));
+            if !stderr_tail.is_empty() {
+                let base = reason.take().unwrap_or_default();
+                reason = Some(format!("{base} | child stderr tail: {stderr_tail}"));
+            }
+        }
         rows.push(row_for_model(
             BatteryId::Speed,
             None,
@@ -1992,6 +2505,13 @@ pub(crate) fn pflash_niah_cases() -> &'static [PflashNiahCase] {
     ]
 }
 
+/// KV modes the `pflash_niah_bench` binary implements (see its `--kv-mode`
+/// resolution). `kvarn`/`f32`/`fp16` and the two-tier hierarchical cache are not
+/// among them — those are measured through the perplexity battery instead.
+pub(crate) const PFLASH_KV_MODES: &[&str] = &[
+    "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "kvarn",
+];
+
 pub(crate) fn pflash_maxgen_for_fixture(fixture: &str) -> usize {
     if fixture.contains("multi") {
         80
@@ -2002,9 +2522,26 @@ pub(crate) fn pflash_maxgen_for_fixture(fixture: &str) -> usize {
     }
 }
 
+/// A pflash case is selected when the `--fixture` filter is unset, or any
+/// comma-separated token is a (case-insensitive) substring of the case's
+/// fixture path or label. Lets `--fixture niah_16k` or `--fixture longcode,niah`
+/// narrow the default 12-case sweep.
+pub(crate) fn pflash_case_selected(case: &PflashNiahCase, filter: Option<&str>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let hay = format!("{} {}", case.fixture, case.label).to_lowercase();
+    filter
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .any(|t| hay.contains(&t.to_lowercase()))
+}
+
 pub(crate) fn run_examples_pflash_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
     pflash_niah_cases()
         .iter()
+        .filter(|case| pflash_case_selected(case, config.fixture.as_deref()))
         .map(|case| run_examples_pflash_case(config, ctx, *case))
         .collect()
 }
@@ -2016,19 +2553,42 @@ pub(crate) fn run_examples_pflash_case(
 ) -> EvalResult {
     let model = config.model.clone();
     let prompt_ref = prompt(case.fixture);
+    // pflash battery defaults to asym3 (the bench default) when --kv-mode is unset.
+    let kv_mode = config.kv_mode.as_deref().unwrap_or("kvarn").to_string();
     let mut base_metrics = BTreeMap::from([
         ("implemented".to_string(), json!(true)),
         ("executor".to_string(), json!("examples")),
         ("suite".to_string(), json!("pflash_niah")),
         ("fixture".to_string(), json!(case.fixture)),
         ("mode".to_string(), json!(case.mode)),
-        ("kv_mode".to_string(), json!("asym3")),
+        ("kv_mode".to_string(), json!(kv_mode)),
         ("pretok".to_string(), json!(true)),
         (
             "maxgen".to_string(),
             json!(pflash_maxgen_for_fixture(case.fixture)),
         ),
     ]);
+
+    if !PFLASH_KV_MODES.contains(&kv_mode.as_str()) {
+        return row_for_model(
+            BatteryId::Pflash,
+            None,
+            case.label,
+            None,
+            EvalStatus::Skip,
+            Some(format!(
+                "pflash_niah_bench does not implement --kv-mode {kv_mode} (supported: {}); \
+                 use the perplexity battery for kvarn/hierarchical",
+                PFLASH_KV_MODES.join(", ")
+            )),
+            base_metrics,
+            config,
+            ctx,
+            prompt_ref,
+            0,
+            model,
+        );
+    }
 
     if !Path::new(&model).exists() {
         return row_for_model(
@@ -2087,7 +2647,8 @@ pub(crate) fn run_examples_pflash_case(
         fixture_path.display().to_string(),
         "--maxgen".to_string(),
         pflash_maxgen_for_fixture(case.fixture).to_string(),
-        "--asym3".to_string(),
+        "--kv-mode".to_string(),
+        kv_mode.clone(),
         "--pretok".to_string(),
     ];
     if case.mode == "pflash" {
@@ -2140,7 +2701,10 @@ pub(crate) fn run_examples_pflash_case(
 
     let command_display = format!("{} {}", bin.display(), args.join(" "));
     let started = SystemTime::now();
-    let output = match Command::new(&bin).args(&args).output() {
+    let mut cmd = Command::new(&bin);
+    cmd.args(&args);
+    apply_kv_env(&mut cmd, config, &kv_mode);
+    let output = match cmd.output() {
         Ok(output) => output,
         Err(err) => {
             base_metrics.insert("command".to_string(), json!(command_display));
@@ -2566,10 +3130,131 @@ fn run_daemon_coherence_anchor_inner(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn finish_coherence_row(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    battery: BatteryId,
+    case_id: &str,
+    prompt_ref: Option<PromptRef>,
+    model: String,
+    mut metrics: BTreeMap<String, Value>,
+    elapsed_ms: u128,
+    output: hipfire_coherence::CoherenceRunOutput,
+) -> EvalResult {
+    let artifact_dir = config.out_dir.join("artifacts").join("coherence");
+    if let Err(err) = fs::create_dir_all(&artifact_dir) {
+        return row_for_model(
+            battery,
+            None,
+            case_id,
+            None,
+            EvalStatus::Fail,
+            Some(format!("create coherence artifact dir: {err}")),
+            metrics,
+            config,
+            ctx,
+            prompt_ref,
+            elapsed_ms,
+            model,
+        );
+    }
+    let artifact_name = format!(
+        "{}-{}.json",
+        sanitize_path_component(case_id),
+        stable_hash_bytes(model.as_bytes())
+    );
+    let artifact_path = artifact_dir.join(artifact_name);
+    let artifact_value = output.artifact_value();
+    if let Err(err) = write_json_pretty(&artifact_path, &artifact_value) {
+        return row_for_model(
+            battery,
+            None,
+            case_id,
+            None,
+            EvalStatus::Fail,
+            Some(format!("write coherence artifact: {err}")),
+            metrics,
+            config,
+            ctx,
+            prompt_ref,
+            elapsed_ms,
+            model,
+        );
+    }
+    metrics.insert("hard_fails".to_string(), json!(output.hard_fails() as f64));
+    metrics.insert("soft_warns".to_string(), json!(output.soft_warns() as f64));
+    metrics.insert(
+        "detector_count".to_string(),
+        json!(output.report.rows.len() as f64),
+    );
+    metrics.insert(
+        "detectors".to_string(),
+        json!(hipfire_coherence::detector_rows(&output.report)),
+    );
+    metrics.insert(
+        "generated_text_hash".to_string(),
+        json!(stable_hash_bytes(output.generated_text.as_bytes())),
+    );
+    metrics.insert(
+        "generated_visible_bytes".to_string(),
+        json!(output.generated_text.len()),
+    );
+    metrics.insert(
+        "generated_tokens".to_string(),
+        json!(output.token_ids.len()),
+    );
+    metrics.insert("tok_s".to_string(), json!(output.report.header.tok_s));
+    metrics.insert(
+        "gen_tok_s".to_string(),
+        json!(output.report.header.gen_tok_s),
+    );
+    metrics.insert("ttft_ms".to_string(), json!(output.report.header.ttft_ms));
+    metrics.insert(
+        "daemon_prefill_ms".to_string(),
+        json!(output.report.header.daemon_prefill_ms),
+    );
+    metrics.insert(
+        "daemon_decode_tok_s".to_string(),
+        json!(output.report.header.daemon_decode_tok_s),
+    );
+    metrics.insert(
+        "coherence_artifact_path".to_string(),
+        json!(artifact_path.display().to_string()),
+    );
+    metrics.insert(
+        "coherence_status".to_string(),
+        json!(if output.hard_fails() > 0 {
+            "fail"
+        } else {
+            "pass"
+        }),
+    );
+    let status = if output.hard_fails() > 0 {
+        EvalStatus::Fail
+    } else {
+        EvalStatus::Pass
+    };
+    let reason = if output.hard_fails() > 0 {
+        Some(format!(
+            "{} detector hard fail(s); see {}",
+            output.hard_fails(),
+            artifact_path.display()
+        ))
+    } else {
+        None
+    };
+    row_for_model(
+        battery, None, case_id, None, status, reason, metrics, config, ctx, prompt_ref, elapsed_ms,
+        model,
+    )
+}
+
 pub(crate) struct LongctxPrompt {
     pub(crate) prompt_path: String,
     pub(crate) prompt_ref: PromptRef,
     pub(crate) max_seq: usize,
+    pub(crate) expected_answer: String,
     pub(crate) metrics: BTreeMap<String, Value>,
 }
 
@@ -2641,6 +3326,7 @@ pub(crate) fn materialize_longctx_prompt(config: &EvalConfig) -> Result<LongctxP
         prompt_path: prompt_path_string,
         prompt_ref,
         max_seq,
+        expected_answer: expected.to_string(),
         metrics,
     })
 }
@@ -2760,6 +3446,99 @@ pub(crate) fn examples_barrage_rows(
                                 BatteryId::Barrage,
                                 Some(d.suite),
                                 "builtin_software_eval_materialize_failed",
+                                Some(id),
+                                &reason,
+                                config,
+                                ctx,
+                                None,
+                                metrics,
+                            )
+                        }));
+                    }
+                }
+            }
+            (SuiteId::NoLiMa, EvalStatus::Pass) => {
+                match nolima_materialized_items(Path::new(&d.cache_path), &d.selected_item_ids) {
+                    Ok(items) => {
+                        rows.extend(items.into_iter().flat_map(|item| {
+                            evaluation_models(config).into_iter().map(move |model| {
+                                run_examples_longctx_item(config, ctx, d, item.clone(), model)
+                            })
+                        }));
+                    }
+                    Err(reason) => {
+                        rows.extend(d.selected_item_ids.iter().cloned().map(|id| {
+                            let mut metrics = BTreeMap::new();
+                            add_dataset_provenance_metrics(&mut metrics, d);
+                            skip_row_with_metrics(
+                                BatteryId::Barrage,
+                                Some(SuiteId::NoLiMa),
+                                "nolima_materialize_failed",
+                                Some(id),
+                                &reason,
+                                config,
+                                ctx,
+                                None,
+                                metrics,
+                            )
+                        }));
+                    }
+                }
+            }
+            (SuiteId::NeedleChain, EvalStatus::Pass) => {
+                match needlechain_materialized_items(Path::new(&d.cache_path), &d.selected_item_ids)
+                {
+                    Ok(items) => {
+                        rows.extend(items.into_iter().flat_map(|item| {
+                            evaluation_models(config).into_iter().map(move |model| {
+                                run_examples_longctx_item(config, ctx, d, item.clone(), model)
+                            })
+                        }));
+                    }
+                    Err(reason) => {
+                        rows.extend(d.selected_item_ids.iter().cloned().map(|id| {
+                            let mut metrics = BTreeMap::new();
+                            add_dataset_provenance_metrics(&mut metrics, d);
+                            skip_row_with_metrics(
+                                BatteryId::Barrage,
+                                Some(SuiteId::NeedleChain),
+                                "needle_chain_materialize_failed",
+                                Some(id),
+                                &reason,
+                                config,
+                                ctx,
+                                None,
+                                metrics,
+                            )
+                        }));
+                    }
+                }
+            }
+            (SuiteId::Niah | SuiteId::SequentialNiah | SuiteId::Ruler, EvalStatus::Pass) => {
+                let materialized = match d.suite {
+                    SuiteId::SequentialNiah => {
+                        sequential_niah_materialized_items(&d.selected_item_ids)
+                    }
+                    SuiteId::Ruler => ruler_materialized_items(&d.selected_item_ids),
+                    _ => niah_materialized_items(&d.selected_item_ids),
+                };
+                match materialized {
+                    Ok(items) => {
+                        rows.extend(items.into_iter().flat_map(|item| {
+                            evaluation_models(config).into_iter().map(move |model| {
+                                run_examples_longctx_item(config, ctx, d, item.clone(), model)
+                            })
+                        }));
+                    }
+                    Err(reason) => {
+                        let cid = format!("{}_materialize_failed", d.suite.as_str());
+                        rows.extend(d.selected_item_ids.iter().cloned().map(|id| {
+                            let mut metrics = BTreeMap::new();
+                            add_dataset_provenance_metrics(&mut metrics, d);
+                            skip_row_with_metrics(
+                                BatteryId::Barrage,
+                                Some(d.suite),
+                                &cid,
                                 Some(id),
                                 &reason,
                                 config,
@@ -2901,7 +3680,10 @@ pub(crate) fn run_examples_lm_eval_micro_item(
         "--max-tokens".to_string(),
         config.max_tokens.to_string(),
         "--kv".to_string(),
-        config.kv_mode.clone().unwrap_or_else(|| "q8".to_string()),
+        config
+            .kv_mode
+            .clone()
+            .unwrap_or_else(|| "kvarn".to_string()),
         "--temp".to_string(),
         "0.0".to_string(),
     ];
@@ -3121,7 +3903,10 @@ pub(crate) fn run_examples_builtin_barrage_item(
         "--max-tokens".to_string(),
         config.max_tokens.to_string(),
         "--kv".to_string(),
-        config.kv_mode.clone().unwrap_or_else(|| "q8".to_string()),
+        config
+            .kv_mode
+            .clone()
+            .unwrap_or_else(|| "kvarn".to_string()),
         "--temp".to_string(),
         "0.0".to_string(),
     ];
@@ -3338,7 +4123,10 @@ pub(crate) fn run_examples_humaneval_item(
         "--max-tokens".to_string(),
         config.max_tokens.to_string(),
         "--kv".to_string(),
-        config.kv_mode.clone().unwrap_or_else(|| "q8".to_string()),
+        config
+            .kv_mode
+            .clone()
+            .unwrap_or_else(|| "kvarn".to_string()),
         "--temp".to_string(),
         "0.0".to_string(),
     ];
@@ -3534,7 +4322,10 @@ pub(crate) fn run_examples_gpqa_item(
         "--max-tokens".to_string(),
         config.max_tokens.to_string(),
         "--kv".to_string(),
-        config.kv_mode.clone().unwrap_or_else(|| "q8".to_string()),
+        config
+            .kv_mode
+            .clone()
+            .unwrap_or_else(|| "kvarn".to_string()),
         "--temp".to_string(),
         "0.0".to_string(),
     ];
@@ -3638,6 +4429,205 @@ pub(crate) fn run_examples_gpqa_item(
             model,
         )
     }
+}
+
+/// Shared executor for the long-context retrieval suites (Niah, SequentialNiah,
+/// NeedleChain). Mirrors `run_examples_gpqa_item` (prompt-file → `run` example
+/// binary → parse stderr metrics) but sizes the KV window to the fixture and
+/// scores by substring recall: PASS-row iff the run executed; `accuracy`
+/// reflects whether ≥ `min_recovered` expected substrings appear in the answer.
+pub(crate) fn run_examples_longctx_item(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    dataset: &DatasetManifestEntry,
+    item: LongCtxItem,
+    model: String,
+) -> EvalResult {
+    let suite = item.suite;
+    let case_id = item.case_id.clone();
+    let item_id = item.item_id.clone();
+    let prompt_ref = PromptRef::from_content(
+        format!("dataset:{}:{item_id}", suite.as_str()),
+        item.prompt.as_bytes(),
+    );
+    let kv_mode = config
+        .kv_mode
+        .clone()
+        .unwrap_or_else(|| "kvarn".to_string());
+    let mut base_metrics = BTreeMap::from([
+        ("prompt_format".to_string(), json!("longctx_retrieval_v1")),
+        ("task".to_string(), json!(item.task.clone())),
+        ("expected_count".to_string(), json!(item.expected.len())),
+        ("min_recovered".to_string(), json!(item.min_recovered)),
+        ("context_tokens".to_string(), json!(item.context_tokens)),
+        ("dataset_file".to_string(), json!(item.dataset_file.clone())),
+        ("executor".to_string(), json!("examples")),
+        ("kv_mode".to_string(), json!(kv_mode.clone())),
+    ]);
+    add_dataset_provenance_metrics(&mut base_metrics, dataset);
+
+    let row = |status: EvalStatus,
+               reason: Option<String>,
+               metrics: BTreeMap<String, Value>,
+               elapsed: u128|
+     -> EvalResult {
+        row_for_model(
+            BatteryId::Barrage,
+            Some(suite),
+            &case_id,
+            Some(item_id.clone()),
+            status,
+            reason,
+            metrics,
+            config,
+            ctx,
+            Some(prompt_ref.clone()),
+            elapsed,
+            model.clone(),
+        )
+    };
+
+    if !Path::new(&model).exists() {
+        return row(
+            EvalStatus::Skip,
+            Some(
+                "examples executor requires each evaluated model to be a local filesystem path"
+                    .to_string(),
+            ),
+            base_metrics,
+            0,
+        );
+    }
+    let Some(bin) = resolve_run_example_bin() else {
+        return row(
+            EvalStatus::Skip,
+            Some("run example binary not found; build with `cargo build --release --features deltanet -p hipfire-runtime --example run`".to_string()),
+            base_metrics,
+            0,
+        );
+    };
+
+    let prompt_dir = config.out_dir.join("artifacts").join("runtime_prompts");
+    if let Err(err) = fs::create_dir_all(&prompt_dir) {
+        return row(
+            EvalStatus::Fail,
+            Some(format!("create runtime prompt dir: {err}")),
+            base_metrics,
+            0,
+        );
+    }
+    let prompt_file = prompt_dir.join(format!(
+        "{}-{}.txt",
+        suite.as_str(),
+        sanitize_path_component(&item_id)
+    ));
+    if let Err(err) = fs::write(&prompt_file, &item.prompt) {
+        return row(
+            EvalStatus::Fail,
+            Some(format!("write runtime prompt: {err}")),
+            base_metrics,
+            0,
+        );
+    }
+
+    let evidence_dir =
+        runtime_evidence_dir(config, &format!("{}-{item_id}", suite.as_str()), &model);
+    // Long prompts: size the KV window to the fixture plus generation headroom
+    // (4096 floor for short chains, matching the default execution window).
+    let max_seq = (item.context_tokens + config.max_tokens + 512).max(4096);
+    let mut args = vec![
+        model.clone(),
+        "--prompt-file".to_string(),
+        prompt_file.display().to_string(),
+        "--max-tokens".to_string(),
+        config.max_tokens.to_string(),
+        "--kv".to_string(),
+        kv_mode.clone(),
+        "--temp".to_string(),
+        "0.0".to_string(),
+        "--max-seq".to_string(),
+        max_seq.to_string(),
+    ];
+    add_runtime_evidence_arg(&mut args, &evidence_dir);
+    let command_display = format!("{} {}", bin.display(), args.join(" "));
+    let started = SystemTime::now();
+    let mut cmd = Command::new(&bin);
+    cmd.args(&args);
+    apply_kv_env(&mut cmd, config, &kv_mode);
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(err) => {
+            base_metrics.insert("command".to_string(), json!(command_display));
+            return row(
+                EvalStatus::Fail,
+                Some(format!("spawn run example: {err}")),
+                base_metrics,
+                elapsed_since_ms(started),
+            );
+        }
+    };
+    let elapsed_ms = elapsed_since_ms(started);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut metrics = parse_bench_metrics(&stderr);
+    metrics.extend(base_metrics);
+    metrics.insert("implemented".to_string(), json!(true));
+    metrics.insert("command".to_string(), json!(command_display));
+    metrics.insert(
+        "runtime_prompt_path".to_string(),
+        json!(prompt_file.display().to_string()),
+    );
+    metrics.insert(
+        "runtime_evidence_dir".to_string(),
+        json!(evidence_dir.display().to_string()),
+    );
+    metrics.insert(
+        "stdout_hash".to_string(),
+        json!(stable_hash_bytes(stdout.as_bytes())),
+    );
+    metrics.insert(
+        "stderr_hash".to_string(),
+        json!(stable_hash_bytes(stderr.as_bytes())),
+    );
+    if let Some(v) = metrics.get("decode_tok_s").cloned() {
+        metrics.entry("tok_s".to_string()).or_insert(v);
+    }
+
+    // Substring-recall scoring (case-insensitive). The row PASSes when the eval
+    // executed; correctness lives in `accuracy`/`retrieved` (GPQA semantics).
+    let recovered = count_recovered(&stdout, &item.expected);
+    let recall = recovered as f64 / item.expected.len().max(1) as f64;
+    let retrieved = recovered >= item.min_recovered;
+    metrics.insert("recovered".to_string(), json!(recovered));
+    metrics.insert("recall".to_string(), json!(recall));
+    metrics.insert(
+        "retrieved".to_string(),
+        json!(if retrieved { 1.0 } else { 0.0 }),
+    );
+    metrics.insert(
+        "accuracy".to_string(),
+        json!(if retrieved { 1.0 } else { 0.0 }),
+    );
+
+    if output.status.success() && metrics.contains_key("decode_tok_s") {
+        row(EvalStatus::Pass, None, metrics, elapsed_ms)
+    } else {
+        let reason = if output.status.success() {
+            "run example did not emit BENCH METRICS".to_string()
+        } else {
+            format!("run example exited with {}", output.status)
+        };
+        row(EvalStatus::Fail, Some(reason), metrics, elapsed_ms)
+    }
+}
+
+/// Count how many `expected` substrings appear (case-insensitively) in `stdout`.
+pub(crate) fn count_recovered(stdout: &str, expected: &[String]) -> usize {
+    let hay = stdout.to_lowercase();
+    expected
+        .iter()
+        .filter(|e| hay.contains(&e.to_lowercase()))
+        .count()
 }
 
 pub(crate) fn extract_answer_letter(stdout: &str) -> Option<String> {
@@ -3763,7 +4753,10 @@ pub(crate) fn run_dflash_spec_demo_anchor(
         "--ctx".to_string(),
         "2048".to_string(),
         "--kv-mode".to_string(),
-        config.kv_mode.clone().unwrap_or_else(|| "q8".to_string()),
+        config
+            .kv_mode
+            .clone()
+            .unwrap_or_else(|| "kvarn".to_string()),
         "--no-adaptive-b".to_string(),
         "--no-chatml".to_string(),
     ];
@@ -4052,7 +5045,10 @@ pub(crate) fn run_examples_run_anchor_with_prompt_ref_for_model(
         "--max-tokens".to_string(),
         config.max_tokens.to_string(),
         "--kv".to_string(),
-        config.kv_mode.clone().unwrap_or_else(|| "q8".to_string()),
+        config
+            .kv_mode
+            .clone()
+            .unwrap_or_else(|| "kvarn".to_string()),
         "--temp".to_string(),
         "0.0".to_string(),
     ];
@@ -4215,7 +5211,10 @@ pub(crate) fn run_direct_session_reset_recall(
         "--prompt-file".to_string(),
         prompt_path.to_string(),
         "--kv".to_string(),
-        config.kv_mode.clone().unwrap_or_else(|| "q8".to_string()),
+        config
+            .kv_mode
+            .clone()
+            .unwrap_or_else(|| "kvarn".to_string()),
         "--temp".to_string(),
         "0.0".to_string(),
     ];
@@ -4307,4 +5306,63 @@ pub(crate) fn run_direct_session_reset_recall(
         elapsed_ms,
         model,
     )
+}
+
+#[cfg(test)]
+mod pflash_filter_tests {
+    use super::{pflash_case_selected, pflash_niah_cases, PflashNiahCase};
+
+    fn case(fixture: &'static str, label: &'static str) -> PflashNiahCase {
+        PflashNiahCase {
+            label,
+            fixture,
+            mode: "baseline",
+        }
+    }
+
+    #[test]
+    fn no_filter_selects_all() {
+        let c = case(
+            "benchmarks/longctx/niah/niah_16k.jsonl",
+            "niah_16k_baseline",
+        );
+        assert!(pflash_case_selected(&c, None));
+    }
+
+    #[test]
+    fn substring_matches_fixture_or_label() {
+        let c = case(
+            "benchmarks/longctx/niah/niah_16k.jsonl",
+            "niah_16k_baseline",
+        );
+        assert!(pflash_case_selected(&c, Some("niah_16k")));
+        assert!(pflash_case_selected(&c, Some("NIAH_16K"))); // case-insensitive
+        assert!(pflash_case_selected(&c, Some("longcode,niah_16k"))); // any csv token
+        assert!(!pflash_case_selected(&c, Some("niah_32k")));
+        assert!(!pflash_case_selected(&c, Some("longcode")));
+    }
+
+    #[test]
+    fn filter_narrows_the_default_sweep() {
+        let all = pflash_niah_cases().len();
+        let niah16 = pflash_niah_cases()
+            .iter()
+            .filter(|c| pflash_case_selected(c, Some("niah_16k")))
+            .count();
+        assert!(niah16 > 0 && niah16 < all);
+    }
+
+    #[test]
+    fn longctx_corpus_extracts_haystack_from_fixture() {
+        let fixture = crate::resolve_repo_path("benchmarks/longctx/niah/niah_8k.jsonl")
+            .expect("niah_8k fixture should resolve");
+        let tmp = std::env::temp_dir().join(format!("hipfire-corpus-test-{}", std::process::id()));
+        let corpus = super::longctx_corpus_from_fixture(&fixture, &tmp)
+            .expect("extract long-context corpus");
+        let text = std::fs::read_to_string(&corpus).expect("read extracted corpus");
+        // The haystack is a large plain-text blob (not the jsonl wrapper).
+        assert!(text.len() > 10_000);
+        assert!(!text.trim_start().starts_with('{'));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
