@@ -277,6 +277,74 @@ pub fn model_arch_family_from_str(arch_id: &str) -> ModelArchFamily {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Artifact identity: `{family, variant, role}` in the HFQ metadata JSON.
+//
+// Deliberately NOT gated on a header version bump. `version` in the HFQM header
+// selects the container's structural layout (`per_entry_tail`, tensor offsets)
+// and is read by two independent parsers; adding an optional JSON key changes
+// no layout, so presence of `identity` is the signal. Old readers ignore the
+// key, and artifacts written before it fall back to the frozen legacy map.
+//
+// Encoding lives here rather than in `hipfire-arch-api` because that crate is a
+// leaf on `std` + `inventory` and must not gain a serde dependency.
+// ---------------------------------------------------------------------------
+
+/// The `identity` object for an artifact's HFQ metadata JSON.
+pub fn identity_json(identity: hipfire_arch_api::ArchRef) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("family".into(), Value::from(identity.family));
+    if let Some(variant) = identity.variant {
+        obj.insert("variant".into(), Value::from(variant));
+    }
+    if let Some(role) = identity.role {
+        obj.insert("role".into(), Value::from(role.as_str()));
+    }
+    Value::Object(obj)
+}
+
+/// Parse and **resolve** the `identity` object from an artifact's metadata.
+///
+/// Resolution is exact-or-refuse. A family no linked arch claims, or a variant
+/// the family does not declare, returns `None` rather than a partial identity —
+/// a container asking for something this binary cannot serve must fail to
+/// resolve, not silently degrade to the base model.
+///
+/// Requires the arch `-spec` crates to be linked (see `hipfire-arch-specs`); a
+/// binary without them resolves nothing, which is correct, since it cannot
+/// serve those families either.
+pub fn identity_from_metadata(metadata_json: &str) -> Option<hipfire_arch_api::ArchRef> {
+    let meta: Value = serde_json::from_str(metadata_json).ok()?;
+    let obj = meta.get("identity")?.as_object()?;
+
+    let arch = hipfire_arch_api::registry().resolve(obj.get("family")?.as_str()?)?;
+    let mut identity = hipfire_arch_api::ArchRef::base(arch.base.family());
+
+    if let Some(declared) = obj.get("variant") {
+        // Match against the family's own declarations to recover a `'static`
+        // label, and to reject a variant this build does not know about.
+        let declared = declared.as_str()?;
+        identity.variant = Some(*arch.base.variants().iter().find(|v| **v == declared)?);
+    }
+    if let Some(declared) = obj.get("role") {
+        identity.role = Some(hipfire_arch_api::Role::parse(declared.as_str()?)?);
+    }
+    Some(identity)
+}
+
+/// An artifact's identity: the declared `identity` when present and resolvable,
+/// otherwise the frozen legacy `arch_id` map.
+///
+/// This is the read path callers should use. It is the one place that knows a
+/// pre-identity artifact is still valid.
+pub fn resolve_artifact_identity(
+    arch_id: u32,
+    metadata_json: &str,
+) -> Option<hipfire_arch_api::ArchRef> {
+    identity_from_metadata(metadata_json)
+        .or_else(|| hipfire_arch_api::identity_for_legacy_arch_id(arch_id))
+}
+
 pub fn normalize_feature_flags(flags: &[String]) -> Vec<String> {
     let mut flags = flags.to_vec();
     flags.sort();

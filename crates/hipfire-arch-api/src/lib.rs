@@ -218,6 +218,56 @@ impl core::fmt::Display for ArchRef {
     }
 }
 
+/// The frozen legacy `arch_id` → family map.
+///
+/// Every artifact written before identity landed carries only a numeric id, so
+/// this is the compatibility contract for everything already on disk. It is
+/// **append-only**: entries are never removed, never renumbered, and retired
+/// ids are never reused.
+///
+/// Kept as a plain table rather than derived from the registry on purpose — the
+/// registry only contains archs linked into the current binary, and a legacy id
+/// must map the same way in every binary, including ones that cannot serve it.
+const LEGACY_ARCH_ID_FAMILY: &[(u32, &str)] = &[
+    (ARCH_ID_LLAMA_MISTRAL, "llama"),
+    (ARCH_ID_QWEN3_QWEN2_LEGACY, "llama"),
+    (ARCH_ID_QWEN35_DENSE, "qwen3.5"),
+    (ARCH_ID_QWEN35_MOE, "qwen3.5-moe"),
+    (ARCH_ID_QWEN2, "qwen2"),
+    (ARCH_ID_DOTS_OCR, "dots-ocr"),
+    (ARCH_ID_DEEPSEEK4_FLASH, "deepseek4"),
+    (ARCH_ID_MINIMAX_M2, "minimax"),
+    (ARCH_ID_LFM2_MOE, "lfm2"),
+    (ARCH_ID_GEMMA3_TEXT, "gemma3"),
+    (ARCH_ID_GEMMA3_VL, "gemma3-vl"),
+    (ARCH_ID_NEMOTRON_H, "nemotron-h"),
+    (ARCH_ID_MAMBA2, "mamba2"),
+    (ARCH_ID_ZAYA, "zaya"),
+    (ARCH_ID_KREA2, "krea2"),
+    (ARCH_ID_QWEN_IMAGE, "qwen-image"),
+    (ARCH_ID_EMBEDDINGGEMMA, "embeddinggemma"),
+    (ARCH_ID_FLUX2, "flux2"),
+    (ARCH_ID_GEMMA4, "gemma4"),
+    (ARCH_ID_COHERE2_MOE, "cohere2-moe"),
+];
+
+/// Identity for an artifact that predates the `identity` metadata key.
+///
+/// Returns the family only. A legacy header cannot express a variant or a role,
+/// so both come back `None` — and for a family that *does* declare variants
+/// (`nemotron-h`, `gemma4`) `variant: None` means **"unspecified, derive it"**,
+/// which is exactly what the loaders already do from config. It does not mean
+/// "no variant".
+///
+/// `None` for an unknown id: an id absent from the frozen table is not a legacy
+/// artifact, it is a corrupt or future one, and callers must not guess.
+pub fn identity_for_legacy_arch_id(arch_id: u32) -> Option<ArchRef> {
+    LEGACY_ARCH_ID_FAMILY
+        .iter()
+        .find(|(id, _)| *id == arch_id)
+        .map(|(_, family)| ArchRef::base(family))
+}
+
 /// The base every architecture implements. Identity only — behaviour lives in the
 /// capability traits so unsupported behaviour is `None`, not a panic.
 pub trait Arch: Sync + 'static {
