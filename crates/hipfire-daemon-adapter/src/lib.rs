@@ -315,6 +315,20 @@ impl DaemonEngine {
         })
     }
 
+    /// Ask the daemon what its scheduler has done.
+    ///
+    /// These counters only exist inside the daemon: reply ordering observed by a
+    /// client reflects socket races rather than service order, so scheduling
+    /// behaviour cannot be reconstructed from outside.
+    pub async fn scheduler_status(&mut self) -> anyhow::Result<serde_json::Value> {
+        self.send(&DaemonRequest::SchedulerStatus).await?;
+        match self.transport.recv_response().await? {
+            DaemonResponse::SchedulerStatus(status) => Ok(status),
+            DaemonResponse::Error(e) => anyhow::bail!("scheduler_status: {}", e.message),
+            other => anyhow::bail!("scheduler_status: unexpected response {other:?}"),
+        }
+    }
+
     /// Push memory budgets to the daemon and get the resulting reservation back.
     ///
     /// This is what makes attaching viable for a caller that would otherwise have

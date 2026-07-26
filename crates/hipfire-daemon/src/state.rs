@@ -23,6 +23,7 @@ use hipfire_serving_core::model::LoadedModel;
 use hipfire_serving_core::session::DEFAULT_MODEL_WORKER_ID;
 use hipfire_state::GenericSequenceStateArena;
 
+use crate::queue::SchedulerStats;
 use crate::transport::ReplySink;
 use crate::{DrafterTrainSession, LoraTrainSession, ResourceReservationManager};
 
@@ -69,6 +70,14 @@ pub(crate) struct DaemonState {
     pub resource_reservations: ResourceReservationManager,
     /// Where replies go, and what they are tagged with.
     pub out: Responder,
+    /// Snapshot of the scheduler's counters, refreshed by the executor as it takes
+    /// up each frame.
+    ///
+    /// A snapshot rather than a live borrow because the queue lives in the
+    /// executor loop, not in the state: a handler answering `scheduler_status`
+    /// cannot hold the queue while the executor is mid-dispatch. Taken after the
+    /// current frame is popped, so `queue_depth` is what remains behind it.
+    pub scheduler_stats: SchedulerStats,
 }
 
 /// The response sink plus the id every frame written through it is stamped with.
@@ -165,6 +174,7 @@ impl DaemonState {
             drafter_train_session: None,
             resource_reservations: ResourceReservationManager::from_env(),
             out: Responder::to_stdout(),
+            scheduler_stats: SchedulerStats::default(),
         }
     }
 

@@ -1302,6 +1302,8 @@ fn main() {
             );
         }
 
+        daemon_state.scheduler_stats = pending.stats().clone();
+
         let transport::Inbound {
             payload,
             reply,
@@ -1422,6 +1424,7 @@ fn main() {
             DaemonRequest::WorkerStatus => handlers::status::worker_status(&mut daemon_state),
 
             DaemonRequest::ResourceStatus => handlers::status::resource_status(&mut daemon_state),
+            DaemonRequest::SchedulerStatus => handlers::status::scheduler_status(&mut daemon_state),
             DaemonRequest::SetResourceBudget(req) => {
                 handlers::status::set_resource_budget(&mut daemon_state, req)
             }

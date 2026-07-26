@@ -36,6 +36,21 @@ pub(crate) fn resource_status(daemon_state: &mut DaemonState) {
     daemon_state.out.emit(status);
 }
 
+/// Report what the scheduler has done.
+///
+/// These are the daemon's own counters, unlike the server-side batching figures in
+/// `/health`, which are still placeholders until the batch runner moves across.
+pub(crate) fn scheduler_status(daemon_state: &mut DaemonState) {
+    let mut payload = daemon_state.scheduler_stats.to_json();
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "type".to_string(),
+            serde_json::Value::String("scheduler_status".to_string()),
+        );
+    }
+    daemon_state.out.emit(payload);
+}
+
 /// Revise the memory budgets and re-apply the ballast reservation.
 ///
 /// The release/reacquire pair is the whole point: changing the numbers without

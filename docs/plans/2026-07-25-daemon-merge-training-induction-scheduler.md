@@ -526,8 +526,34 @@ Add a lease reaper while you are here: `complete(lease_id)` must be called exact
 has no timeout, so a dropped exclusive `Training` lease wedges `next_batch` forever
 (`scheduler/lib.rs:542`). Today that is held together by discipline across 10 call sites.
 
-*Exit:* `/health` scheduler telemetry served from real daemon counters, not the current
-hardcoded zeros and `"fallback_reason": "rust_server_scheduler_metadata_only"`.
+**M4c — real scheduler telemetry. Done.** The daemon counts what it schedules —
+`scheduled_total`, `queue_depth`, `queue_depth_max`, per-priority-class totals, and
+`overtaken_total` — served over a new `scheduler_status` request that `/health`
+surfaces as `daemon_scheduler`.
+
+`overtaken_total` is the counter that earns its place: it counts frames chosen ahead
+of an older waiting head, so it is the only figure distinguishing a working scheduler
+from an idle one — totals and depth look identical either way. It deliberately does
+NOT increment when equal-priority work is served in arrival order, since that is
+plain FIFO and counting it would make the scheduler look busy while doing nothing.
+
+**The hardcoded zeros in `prefill_batch` / `decode_batch` / `state_cache` are left
+alone on purpose.** They describe SERVER-side batching, which has not moved yet;
+back-filling them with daemon numbers would report one subsystem's activity under
+another's name, and `tests/smoke-server-decode-batch.sh` asserts on those exact keys.
+They become real in M4d when the batch runner crosses over. An honest new block beats
+making a misleading old one look populated.
+
+`/health` degrades rather than fails: an absent or unreachable daemon reports
+`{"available": false, "reason": …}`, because that is a fact worth showing and the
+endpoint has to answer regardless.
+
+*Exit (M4c, met):* verified live — four priority-200 pings and two default-priority
+status queries classified `bulk: 4` / `interactive: 2`, `overtaken_total: 0` on a
+single connection (no phantom overtakes), complementing the M4b run where
+cross-connection priority produced real ones.
+
+*Remaining for M4:* the server-side batching figures above, which need M4d.
 
 ### M5 — Training collapses to one path
 

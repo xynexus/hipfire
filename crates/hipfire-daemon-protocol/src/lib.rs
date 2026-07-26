@@ -396,6 +396,10 @@ pub enum DaemonRequest {
     #[serde(alias = "list_workers")]
     WorkerStatus,
     ResourceStatus,
+    /// What the daemon's scheduler has actually done: totals, queue depth, and how
+    /// often priority changed the outcome. Distinct from `ResourceStatus`, which
+    /// reports memory rather than work.
+    SchedulerStatus,
     /// Set the daemon's memory budgets at runtime and re-apply the ballast
     /// reservation. Answers with the same payload as [`DaemonRequest::ResourceStatus`].
     ///
@@ -475,6 +479,7 @@ pub enum DaemonResponse {
     },
     WorkerStatus(serde_json::Value),
     ResourceStatus(serde_json::Value),
+    SchedulerStatus(serde_json::Value),
     UnloadWorkerDone(serde_json::Value),
     GenerateBatchPrefillReady {
         #[serde(flatten)]

@@ -30,7 +30,38 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 
+use hipfire_scheduler::scheduler_priority_class;
+
 use crate::transport::Inbound;
+
+/// What the scheduler has actually done, for `/health`.
+///
+/// `overtaken_total` is the one that answers "is the scheduler earning its
+/// keep": it counts frames chosen ahead of an older waiting head, so zero means
+/// priority never changed an outcome and the daemon is effectively still FIFO.
+/// Without it the other counters cannot distinguish a working scheduler from an
+/// idle one.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SchedulerStats {
+    pub scheduled_total: u64,
+    pub overtaken_total: u64,
+    pub queue_depth: usize,
+    pub queue_depth_max: usize,
+    /// Frames chosen per priority class, keyed by `SchedulerPriorityClass::as_str`.
+    pub by_class: BTreeMap<&'static str, u64>,
+}
+
+impl SchedulerStats {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "scheduled_total": self.scheduled_total,
+            "overtaken_total": self.overtaken_total,
+            "queue_depth": self.queue_depth,
+            "queue_depth_max": self.queue_depth_max,
+            "by_priority_class": self.by_class,
+        })
+    }
+}
 
 /// Pending work, grouped into one first-come-first-served queue per connection.
 #[derive(Default)]
@@ -38,6 +69,7 @@ pub(crate) struct PendingQueue {
     /// `BTreeMap` rather than `HashMap` so that when priority and arrival order
     /// both tie, selection is still deterministic instead of hash-order.
     per_connection: BTreeMap<u64, VecDeque<Inbound>>,
+    stats: SchedulerStats,
 }
 
 impl PendingQueue {
@@ -46,6 +78,12 @@ impl PendingQueue {
             .entry(frame.conn)
             .or_default()
             .push_back(frame);
+        self.stats.queue_depth = self.len();
+        self.stats.queue_depth_max = self.stats.queue_depth_max.max(self.stats.queue_depth);
+    }
+
+    pub fn stats(&self) -> &SchedulerStats {
+        &self.stats
     }
 
     pub fn is_empty(&self) -> bool {
@@ -66,21 +104,36 @@ impl PendingQueue {
     /// work stays first-come-first-served rather than favouring whichever
     /// connection happens to sort first.
     pub fn pop_next(&mut self) -> Option<Inbound> {
-        let chosen = self
+        let heads: Vec<(u64, u8, u64)> = self
             .per_connection
             .iter()
             .filter_map(|(conn, queue)| queue.front().map(|head| (*conn, head.priority, head.seq)))
-            .min_by_key(|(_, priority, seq)| (*priority, *seq))
-            .map(|(conn, _, _)| conn)?;
+            .collect();
+        let (chosen, _, chosen_seq) = *heads.iter().min_by_key(|(_, p, s)| (*p, *s))?;
+        // Oldest waiting head, ignoring priority. If that is not what we picked,
+        // priority actually changed the outcome — which is the only direct evidence
+        // the scheduler is doing anything at all.
+        let oldest_seq = heads.iter().map(|(_, _, s)| *s).min();
 
         let queue = self.per_connection.get_mut(&chosen)?;
-        let frame = queue.pop_front();
+        let frame = queue.pop_front()?;
         // Drop the connection's slot once drained so a long-lived daemon does not
         // accumulate an entry per connection it has ever served.
         if queue.is_empty() {
             self.per_connection.remove(&chosen);
         }
-        frame
+
+        self.stats.scheduled_total += 1;
+        if oldest_seq.is_some_and(|oldest| oldest != chosen_seq) {
+            self.stats.overtaken_total += 1;
+        }
+        *self
+            .stats
+            .by_class
+            .entry(scheduler_priority_class(frame.priority).as_str())
+            .or_insert(0) += 1;
+        self.stats.queue_depth = self.len();
+        Some(frame)
     }
 }
 
@@ -164,6 +217,36 @@ mod tests {
                 "urgent-but-stuck-behind"
             ]
         );
+    }
+
+    #[test]
+    fn stats_count_overtakes_only_when_priority_changed_the_outcome() {
+        let mut q = PendingQueue::default();
+        // Same priority: selection follows arrival, so nothing is overtaken.
+        q.push(frame(1, 0, 64, "a"));
+        q.push(frame(2, 1, 64, "b"));
+        drain(&mut q);
+        assert_eq!(q.stats().scheduled_total, 2);
+        assert_eq!(
+            q.stats().overtaken_total,
+            0,
+            "equal priority is plain FIFO — reporting an overtake here would make \
+             the scheduler look busy while doing nothing"
+        );
+
+        let mut q = PendingQueue::default();
+        q.push(frame(1, 0, 200, "bulk"));
+        q.push(frame(2, 1, 0, "realtime"));
+        drain(&mut q);
+        assert_eq!(
+            q.stats().overtaken_total,
+            1,
+            "realtime jumped an older head"
+        );
+        assert_eq!(q.stats().by_class.get("realtime").copied(), Some(1));
+        assert_eq!(q.stats().by_class.get("bulk").copied(), Some(1));
+        assert_eq!(q.stats().queue_depth, 0);
+        assert_eq!(q.stats().queue_depth_max, 2);
     }
 
     #[test]

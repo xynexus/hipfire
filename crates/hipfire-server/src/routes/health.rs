@@ -77,6 +77,12 @@ async fn assemble_health_json(state: &SharedState) -> Value {
     let batch_telemetry = state.batch_telemetry.lock().await.clone();
     let batch_pending = state.batch_inbox.lock().await.len();
     let work_snapshot = state.work_scheduler.lock().await.snapshot();
+    // The daemon's own scheduler counters. Deliberately a separate block from the
+    // `prefill_batch` / `decode_batch` / `state_cache` views below: those describe
+    // SERVER-side batching, which still lives here, so back-filling them with
+    // daemon numbers would report one subsystem's activity under another's name.
+    // They stay placeholders until the batch runner moves across.
+    let daemon_scheduler = daemon_scheduler_health_payload(state).await;
     let mut prefill_batch = server_prefill_batch_health_json(&scheduler_env);
     if let Some(obj) = prefill_batch.as_object_mut() {
         obj.insert("queue_size".to_string(), json!(prefill_queue_size));
@@ -121,6 +127,7 @@ async fn assemble_health_json(state: &SharedState) -> Value {
         "diffusion": diffusion,
         "pid": std::process::id(),
         "scheduler_resources": scheduler_resources,
+        "daemon_scheduler": daemon_scheduler,
         "work_scheduler": json!({
             "queued": work_snapshot.queued,
             "active_batches": work_snapshot.active_batches,
@@ -183,6 +190,28 @@ fn diffusion_active_model(diffusion: &Value) -> Option<String> {
 
 fn scheduler_env_from_process() -> SchedulerPolicyEnv {
     SchedulerPolicyEnv::from_pairs(env::vars())
+}
+
+/// Read the daemon's scheduler counters, or say why they are unavailable.
+///
+/// `/health` must answer even when the daemon is absent or busy, so a failure here
+/// reports itself rather than propagating: an unreachable daemon is a fact about
+/// the system worth showing, not a reason for the endpoint to fail.
+async fn daemon_scheduler_health_payload(state: &SharedState) -> serde_json::Value {
+    let mut engine = state.engine.lock().await;
+    let Some(engine) = engine.as_mut() else {
+        return json!({ "available": false, "reason": "daemon not running" });
+    };
+    match engine.scheduler_status().await {
+        Ok(mut status) => {
+            if let Some(obj) = status.as_object_mut() {
+                obj.remove("type");
+                obj.insert("available".to_string(), json!(true));
+            }
+            status
+        }
+        Err(error) => json!({ "available": false, "reason": error.to_string() }),
+    }
 }
 
 async fn scheduler_resource_health_payload(state: &SharedState) -> serde_json::Value {
