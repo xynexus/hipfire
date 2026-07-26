@@ -42,8 +42,15 @@ pub fn run(args: GenDocsArgs) -> anyhow::Result<()> {
             &markdown,
             &mut stale,
         );
+        // `man/` is gitignored (.gitignore `/man/`), so the pages are generated on
+        // demand and a clean checkout — CI included — has none. Only enforce
+        // freshness for pages that are actually present; a stale one still counts.
+        // `docs/CLI.md` above is tracked and is always checked.
         for (name, bytes) in &man_pages {
-            check_file(Path::new(&args.man_dir).join(name), bytes, &mut stale);
+            let path = Path::new(&args.man_dir).join(name);
+            if path.exists() {
+                check_file(path, bytes, &mut stale);
+            }
         }
         if !stale.is_empty() {
             anyhow::bail!(
