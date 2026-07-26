@@ -74,7 +74,9 @@ Examples:
 - LFM2.5-1.2B-Thinking--bf16.hfq
 - Qwen3.5-122B-A10B--mtp.vl.mq2l.hfq
 - Gemma-4-8B-E4B-it-heretic-QAT--dflash.triattn.oq4++.gfx1151.hfq
-- MedGemma-27B-it.triattn.hfq (role sidecar — keeps a dotted role suffix, see below)
+- ModelName3.5-20B-it--dflash.oq4+.hfq (DFlash drafter sidecar — carries a quant,
+  so it takes the boundary)
+- MedGemma-27B-it.triattn.hfq (quant-free role sidecar — plain dotted suffix, see below)
 
 This system allows machine parsing by working backwards:
 - last field is always hfq
@@ -84,8 +86,13 @@ This system allows machine parsing by working backwards:
 - within the machine section, dots separate fields
 - single dashes separate human-readable fields in the model name, aside from
   size and effective/active size
-- role sidecars keep a dotted role suffix (`.dflash.hfq`, `.triattn.hfq`, …);
-  the `--` boundary is only for bundled model artifacts that carry a quant
+- the `--` boundary applies to any artifact that carries a quant token,
+  including role sidecars: a DFlash drafter is
+  `ModelName3.5-20B-it--dflash.oq4+.hfq`, because `dflash` and `oq4+` are both
+  machine-section groups
+- role sidecars that carry NO quant keep a plain dotted role suffix
+  (`.triattn.hfq`, `.jinja.`, `.hessian`) — with no machine section there is no
+  boundary to mark
 
 Quant tokens use this shape:
 
@@ -112,8 +119,10 @@ Notes:
 - Do not use `+` for bundled roles or feature sidecars. Encode each feature as
   its own dot group after the `--` boundary and before the quant token, for
   example `Model--mtp.vl.mq4.hfq` or `Model--dflash.triattn.oq4++.hfq`.
-- Use role sidecars when loaded independently: `.mtp.hfq`, `.dflash.hfq`,
-  `.jinja.`, `.hessian` and `.triattn.hfq`.
+- Use role sidecars when loaded independently. A sidecar carrying its own quant
+  takes the boundary and the quant as machine groups
+  (`Model--dflash.oq4+.hfq`, `Model--mtp.mq4.hfq`); a quant-free sidecar keeps
+  the plain dotted role suffix (`.triattn.hfq`, `.jinja.`, `.hessian`).
 - The quant should detail the weight encoding. eg. Lloyd MQ2 uses `--mq2l.hfq`,
   Magnum uses `--mq4.hfq`
 - `arch` must start with gfx followed by 3 or 4 numbers. eg. gfx906, gfx1103, gfx1151, gfx1201

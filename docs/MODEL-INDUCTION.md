@@ -18,12 +18,12 @@ quant:
 
 ```text
 ~/.hipfire/models/Qwen3.5-397B-A17B--oq4.25++.hfq
-~/.hipfire/drafts/Qwen3.5-397B-A17B-BF16.dflash.hfq
-~/.hipfire/drafts/Qwen3.5-397B-A17B-F16.dflash.hfq
+~/.hipfire/drafts/Qwen3.5-397B-A17B--dflash.bf16.hfq
+~/.hipfire/drafts/Qwen3.5-397B-A17B--dflash.f16.hfq
 ~/.hipfire/triattn/Qwen3.5-397B-A17B.triattn.hfq
 ~/.hipfire/calib/Qwen3.5-397B-A17B.calib.hfq
-~/.hipfire/induction/Qwen3.5-397B-A17B.oq4.25++/manifest.json
-~/.hipfire/induction/Qwen3.5-397B-A17B.oq4.25++/two-pass.json
+~/.hipfire/induction/Qwen3.5-397B-A17B--oq4.25++/manifest.json
+~/.hipfire/induction/Qwen3.5-397B-A17B--oq4.25++/two-pass.json
 ```
 
 ## Qwen3.5 397B workflow

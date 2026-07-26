@@ -2329,22 +2329,36 @@ pub fn dflash_draft_candidates(filename: &str) -> Vec<String> {
     let Some(identity) = model_sidecar_identity(filename) else {
         return Vec::new();
     };
-    // Two sidecar naming generations are accepted, and both resolve so no
-    // on-disk artifact silently stops being discovered:
-    //   * dotted quant group after the role (`Model.dflash.oq4+.hfq`) — the form
-    //     the DFlash tooling in this stack emits, and the only one that can name
-    //     a *quantized* drafter;
-    //   * quant as a dash tag before the role (`Model-BF16.dflash.hfq`) — the
-    //     form `scripts/induct_model.py` and docs/MODEL-INDUCTION.md emit.
-    // Dotted forms are probed first; within each, precision descends.
-    let dotted = ["oq4+", "oq8+", "bf16", "f16"]
-        .into_iter()
+    // Canonical: `<identity>--dflash.<quant>.hfq`. A DFlash sidecar carries a
+    // quant token, so it has a machine section and takes the `--` name/machine
+    // boundary like any other quant-bearing artifact (AGENTS.md "Artifact
+    // Names"). Role sidecars WITHOUT a quant (`.triattn.hfq`, `.jinja.`) keep
+    // their plain dotted role suffix.
+    let canonical = DFLASH_SIDECAR_QUANTS
+        .iter()
+        .map(|quant| format!("{identity}--dflash.{quant}.hfq"));
+    // Transition fallbacks, probed after the canonical names so a rename always
+    // wins. Both spellings predate the boundary and still exist on disk:
+    //   * `Model.dflash.oq4+.hfq` — dotted, no boundary;
+    //   * `Model-BF16.dflash.hfq` — quant as a dash tag before the role, which
+    //     `scripts/induct_model.py` emitted.
+    // Same dual-mode transition #183 used when it introduced `--`. Delete these
+    // once no `~/.hipfire/drafts` artifact uses them.
+    let legacy_dotted = DFLASH_SIDECAR_QUANTS
+        .iter()
         .map(|quant| format!("{identity}.dflash.{quant}.hfq"));
-    let tagged = ["BF16", "F16", "MQ6", "MQ4", "MQ3"]
+    let legacy_tagged = ["BF16", "F16", "MQ6", "MQ4", "MQ3"]
         .into_iter()
         .map(|quant| format!("{identity}-{quant}.dflash.hfq"));
-    dotted.chain(tagged).collect()
+    canonical
+        .chain(legacy_dotted)
+        .chain(legacy_tagged)
+        .collect()
 }
+
+/// Drafter quant tokens probed for a DFlash sidecar, best precision first.
+/// Lowercase because they are machine-section groups, like any quant token.
+const DFLASH_SIDECAR_QUANTS: [&str; 4] = ["oq4+", "oq8+", "bf16", "f16"];
 
 /// Discover a DSpark drafter sidecar next to a target model artifact.
 ///
@@ -3905,12 +3919,16 @@ mod tests {
 
     #[test]
     fn dflash_draft_discovery_uses_canonical_independent_sidecar_names() {
-        // Canonical `--` target: dotted-quant sidecars first (the only form that
-        // can name a quantized drafter), then the dash-tag form the induction
-        // scripts emit. Both generations must resolve.
+        // Canonical `<identity>--dflash.<quant>.hfq` first — the sidecar carries a
+        // quant, so it takes the `--` boundary — then the two older spellings
+        // that still exist on disk, so a rename always wins over them.
         assert_eq!(
             dflash_draft_candidates("Qwen3.5-27B--mq4.hfq"),
             vec![
+                "Qwen3.5-27B--dflash.oq4+.hfq".to_string(),
+                "Qwen3.5-27B--dflash.oq8+.hfq".to_string(),
+                "Qwen3.5-27B--dflash.bf16.hfq".to_string(),
+                "Qwen3.5-27B--dflash.f16.hfq".to_string(),
                 "Qwen3.5-27B.dflash.oq4+.hfq".to_string(),
                 "Qwen3.5-27B.dflash.oq8+.hfq".to_string(),
                 "Qwen3.5-27B.dflash.bf16.hfq".to_string(),
@@ -3922,11 +3940,14 @@ mod tests {
                 "Qwen3.5-27B-MQ3.dflash.hfq".to_string(),
             ]
         );
-        // Legacy all-dotted target names still parse to the same identity.
-        assert!(dflash_draft_candidates("Qwen3.5-27B.mq4.hfq")
-            .contains(&"Qwen3.5-27B.dflash.oq4+.hfq".to_string()));
+        // Legacy all-dotted target names still parse to the same identity, and
+        // still yield the canonical sidecar name first.
+        assert_eq!(
+            dflash_draft_candidates("Qwen3.5-27B.mq4.hfq").first(),
+            Some(&"Qwen3.5-27B--dflash.oq4+.hfq".to_string())
+        );
         assert!(dflash_draft_candidates("Qwen3.5-35B-A3B.mq4.hfq")
-            .contains(&"Qwen3.5-35B-A3B.dflash.oq4+.hfq".to_string()));
+            .contains(&"Qwen3.5-35B-A3B--dflash.oq4+.hfq".to_string()));
 
         let root = temp_dir("hipfire-dflash-draft-discovery");
         fs::create_dir_all(&root).unwrap();
