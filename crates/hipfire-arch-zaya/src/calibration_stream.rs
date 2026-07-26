@@ -724,6 +724,11 @@ struct Scratch {
     router_rows: GpuTensor,
     /// `[max_rows, hidden]` — expert inputs gathered into per-expert runs.
     expert_in: GpuTensor,
+    /// `[max_rows]` i32 — slice-row index of each member of the current expert
+    /// group, driving the gather and the scatter-accumulate.
+    expert_rows: hip_bridge::DeviceBuffer,
+    /// `[max_rows]` f32 — that group's per-row router weights.
+    expert_scale: GpuTensor,
     normed: GpuTensor,
     q: GpuTensor,
     k: GpuTensor,
@@ -769,6 +774,11 @@ impl Scratch {
         // row `r` as `sub_offset(r * width, width)`. Allocating the per-sequence
         // conv scratch at full width too costs little and keeps one addressing
         // rule for the whole block instead of two.
+        // Claimed before `alloc` borrows the GPU for the rest of the function.
+        let expert_rows = gpu
+            .hip
+            .malloc(rows * 4)
+            .map_err(|error| CalibError::Runtime(error.to_string()))?;
         let mut alloc = |width: usize| -> Result<GpuTensor, CalibError> {
             gpu.zeros(&[(rows * width).max(1)], DType::F32)
                 .map_err(|error| CalibError::Runtime(error.to_string()))
@@ -777,6 +787,9 @@ impl Scratch {
             hidden_rows: alloc(hidden)?,
             router_rows: alloc(rh)?,
             expert_in: alloc(hidden)?,
+            expert_rows,
+            // Width 1: one scalar per row, not one per element.
+            expert_scale: alloc(1)?,
             normed: alloc(hidden)?,
             q: alloc(q_dim)?,
             k: alloc(k_dim)?,
@@ -811,6 +824,7 @@ impl Scratch {
             self.hidden_rows,
             self.router_rows,
             self.expert_in,
+            self.expert_scale,
             self.normed,
             self.q,
             self.k,
@@ -840,6 +854,7 @@ impl Scratch {
         ] {
             let _ = gpu.free_tensor(tensor);
         }
+        let _ = gpu.hip.free(self.expert_rows);
     }
 }
 
@@ -1490,19 +1505,26 @@ impl ZayaStreamedCalibrationLayer {
             }
             let expert = &weights.experts[expert_index];
             let count = members.len();
-            // Gather this expert's rows into a contiguous run. Device-to-device,
-            // so the activations never round-trip through the host.
-            for (slot, &index) in members.iter().enumerate() {
-                gpu.hip
-                    .memcpy_dtod_at(
-                        &scratch.expert_in.buf,
-                        slot * hidden_dim * 4,
-                        &scratch.normed.buf,
-                        index * hidden_dim * 4,
-                        hidden_dim * 4,
-                    )
-                    .map_err(|error| CalibError::Runtime(error.to_string()))?;
-            }
+            // Publish this group's membership and router weights once, then do
+            // the gather, the SwiGLU and the scatter-accumulate as one launch
+            // each. The per-row form issued three launches per row, which at a
+            // slice width of 128 dominated the block's launch count even though
+            // all the weight traffic was already batched.
+            let row_indices: Vec<i32> = members.iter().map(|&index| index as i32).collect();
+            let row_scales: Vec<f32> = members.iter().map(|&index| routes[index].1).collect();
+            gpu.hip
+                .memcpy_htod(&scratch.expert_rows, i32_slice_as_bytes(&row_indices))
+                .map_err(|error| CalibError::Runtime(error.to_string()))?;
+            gpu.hip
+                .memcpy_htod(&scratch.expert_scale.buf, f32_slice_as_bytes(&row_scales))
+                .map_err(|error| CalibError::Runtime(error.to_string()))?;
+            run(gpu.zaya_gather_rows_f32(
+                &scratch.expert_in,
+                &scratch.normed,
+                &scratch.expert_rows,
+                hidden_dim,
+                count * hidden_dim,
+            ))?;
             // Capture admission is per row and in row order, matching the
             // single-token path's call sequence for the same set of rows.
             for (slot, &index) in members.iter().enumerate() {
@@ -1530,14 +1552,12 @@ impl ZayaStreamedCalibrationLayer {
                 &scratch.gate_up,
                 count,
             )?;
-            // `silu_mul` is elementwise with no weight traffic, and gate/up are
-            // interleaved per row (`[count, 2 * moe_int]`), so it stays per row.
-            for slot in 0..count {
-                let base = slot * 2 * moe_int;
-                let gate = scratch.gate_up.sub_offset(base, moe_int);
-                let up = scratch.gate_up.sub_offset(base + moe_int, moe_int);
-                run(gpu.silu_mul_f32(&gate, &up, &row(&scratch.act, slot, moe_int)))?;
-            }
+            run(gpu.zaya_silu_mul_gate_up_f32(
+                &scratch.act,
+                &scratch.gate_up,
+                moe_int,
+                count * moe_int,
+            ))?;
             for (slot, &index) in members.iter().enumerate() {
                 if telemetry.record_capture_route(
                     block,
@@ -1557,13 +1577,17 @@ impl ZayaStreamedCalibrationLayer {
                 }
             }
             gemm(gpu, &expert.down, &scratch.act, &scratch.down_t, count)?;
-            for (slot, &index) in members.iter().enumerate() {
-                run(gpu.scaled_add_inplace_cpu_scalar_f32(
-                    &row(&scratch.moe_out, index, hidden_dim),
-                    &row(&scratch.down_t, slot, hidden_dim),
-                    routes[index].1,
-                ))?;
-            }
+            // Top-1 routing means each slice row belongs to exactly one expert
+            // group, so no two source rows name the same destination and the
+            // scatter needs no atomics.
+            run(gpu.zaya_scatter_scaled_add_f32(
+                &scratch.moe_out,
+                &scratch.down_t,
+                &scratch.expert_rows,
+                &scratch.expert_scale,
+                hidden_dim,
+                count * hidden_dim,
+            ))?;
         }
         run(gpu.zaya_affine_residual_f32(
             &hidden,
@@ -1854,6 +1878,14 @@ fn join_boundary_rows(
             .copy_from_slice(&hidden[row * hidden_dim..(row + 1) * hidden_dim]);
         boundary[base + hidden_dim..base + row_width]
             .copy_from_slice(&router[row * router_width..(row + 1) * router_width]);
+    }
+}
+
+fn i32_slice_as_bytes(values: &[i32]) -> &[u8] {
+    // SAFETY: i32 has no padding or invalid bit patterns, and the result
+    // borrows `values`, so the slice cannot outlive its owner.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     }
 }
 
