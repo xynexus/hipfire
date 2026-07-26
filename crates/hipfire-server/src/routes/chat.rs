@@ -1556,11 +1556,21 @@ fn estimated_prompt_tokens(messages: &[ChatMessage]) -> Vec<u32> {
     tokens
 }
 
-fn scheduler_worker_key(model_path: &str, cfg: &HipfireConfig) -> ModelWorkerKey {
+/// Build the scheduler's view of the current model.
+///
+/// `arch` is the tag the daemon reported on load ([`LoadedModelState::arch`]).
+/// It must be threaded through: the scheduler classifies recurrent and
+/// arena-private families from it to decide whether two sessions may share a
+/// fused prefill batch, and with no tag it fails closed and disables batching.
+fn scheduler_worker_key(
+    model_path: &str,
+    cfg: &HipfireConfig,
+    arch: Option<String>,
+) -> ModelWorkerKey {
     ModelWorkerKey {
         artifact_path: model_path.to_string(),
         artifact_digest: None,
-        arch_id: "unknown".to_string(),
+        arch_id: arch.unwrap_or_else(|| "unknown".to_string()),
         quant_family: "unknown".to_string(),
         state_mode: cfg.kv_cache.clone(),
         max_seq_bucket: cfg.max_seq as usize,
@@ -1583,9 +1593,16 @@ pub(crate) async fn wait_for_prefill_scheduler_turn(
         return Ok(());
     }
 
+    // Taken before `config` and released immediately — never hold both.
+    let arch = state
+        .loaded_models
+        .lock()
+        .await
+        .get(model_path)
+        .and_then(|loaded| loaded.arch.clone());
     let worker_key = {
         let cfg = state.config.lock().await;
-        scheduler_worker_key(model_path, &cfg)
+        scheduler_worker_key(model_path, &cfg, arch)
     };
     let session = create_request_session_draft(CreateRequestSessionInput {
         id: req_id.to_string(),

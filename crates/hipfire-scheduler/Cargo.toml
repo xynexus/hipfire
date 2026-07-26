@@ -12,3 +12,9 @@ hipfire-state = { path = "../hipfire-state" }
 # hipfire deps, so this stays acyclic.
 hipfire-auth = { path = "../hipfire-auth" }
 serde_json = "1"
+tracing.workspace = true
+
+[dev-dependencies]
+# Force-links the arch -spec crates so `model_arch_family_from_str` can resolve
+# arch tags in unit tests the same way a served binary does.
+hipfire-arch-specs = { path = "../hipfire-arch-specs" }

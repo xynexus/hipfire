@@ -11,7 +11,8 @@ use hipfire_model::{
     AcceleratorDeviceInfo, AcceleratorInventory, ModelArchFamily, ModelWorkerKey,
 };
 use hipfire_state::{generate_state_kind_sets_match_exactly, normalize_generate_state_kind_set};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 pub const SCHED_PRIORITY_REALTIME: u8 = 0;
 pub const SCHED_PRIORITY_DEFAULT: u8 = 64;
@@ -1326,13 +1327,19 @@ fn worker_key_is_qwen35(worker_key: &ModelWorkerKey) -> bool {
 }
 
 fn worker_key_is_state_arena_conservative(worker_key: &ModelWorkerKey) -> bool {
-    // Canonical arch-family table (arch_id 10/11/14) + legacy name fallbacks.
+    // Canonical arch-family table (arch_id 10/11/14/15) + legacy name fallbacks.
+    // `Mamba2` (15) belongs here for the same reason as `NemotronH`: it carries
+    // recurrent SSM state, so two sessions must not share a fused prefill.
     matches!(
         worker_key_arch_family(worker_key),
-        ModelArchFamily::MiniMaxM2 | ModelArchFamily::Lfm2Moe | ModelArchFamily::NemotronH
+        ModelArchFamily::MiniMaxM2
+            | ModelArchFamily::Lfm2Moe
+            | ModelArchFamily::NemotronH
+            | ModelArchFamily::Mamba2
     ) || worker_key_family_contains(worker_key, "minimax")
         || worker_key_family_contains(worker_key, "lfm2")
         || worker_key_family_contains(worker_key, "nemotron")
+        || worker_key_family_contains(worker_key, "mamba")
 }
 
 fn worker_key_has_hierarchical_kv(worker_key: &ModelWorkerKey) -> bool {
@@ -1364,6 +1371,31 @@ fn worker_key_requires_token_ordered_recurrent(worker_key: &ModelWorkerKey) -> b
     state_mode.contains("mamba") || state_mode.contains("lfm2") || state_mode.contains("short_conv")
 }
 
+/// Warn once per distinct unresolved arch tag.
+///
+/// The backstop fires on the per-request prefill path, so an unconditional
+/// warn would emit once per request for the whole life of a served model.
+/// One line per tag is enough to act on.
+fn warn_unclassified_arch_once(worker_key: &ModelWorkerKey) {
+    static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let Ok(mut seen) = seen.lock() else {
+        return;
+    };
+    if !seen.insert(worker_key.arch_id.clone()) {
+        return;
+    }
+    tracing::warn!(
+        arch_id = %worker_key.arch_id,
+        artifact_path = %worker_key.artifact_path,
+        "prefill scheduler could not resolve an arch family; \
+         refusing multi-session prefill batching for this model. \
+         Expected a numeric HFQ arch_id or an arch tag registered by a linked \
+         arch spec — check that the daemon reports `arch` on load and that the \
+         family's -spec crate is linked into this binary."
+    );
+}
+
 fn prefill_session_multi_session_batchable(session: &RequestSessionDraft) -> bool {
     if worker_key_has_feature(&session.worker_key, "multi_session_state_batch")
         || worker_key_has_feature(&session.worker_key, "fused_state_batch")
@@ -1377,6 +1409,15 @@ fn prefill_session_multi_session_batchable(session: &RequestSessionDraft) -> boo
         || worker_key_requires_token_ordered_recurrent(&session.worker_key)
         || state_kinds_have_private_or_mamba(&session.state_handle.state_kinds)
     {
+        return false;
+    }
+    // Backstop. Reaching here means no classifier claimed this model. If we
+    // also could not resolve its arch family, we do not know whether fusing
+    // two of its sessions into one prefill batch is safe — and a model that
+    // carries recurrent or arena-private state is corrupted by guessing wrong.
+    // Fail closed: an unclassifiable model does not opt into the optimization.
+    if worker_key_arch_family(&session.worker_key) == ModelArchFamily::Unknown {
+        warn_unclassified_arch_once(&session.worker_key);
         return false;
     }
     true
@@ -1932,6 +1973,12 @@ impl PriorityDecodeScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Force-links the arch `-spec` crates so their `register_arch!`
+    // registrations survive rlib pruning and `ArchRegistry` is populated —
+    // the same thing a served binary must do. Without this the registry is
+    // empty and every arch tag resolves to `Unknown`.
+    use hipfire_arch_specs as _;
 
     fn env(pairs: &[(&str, &str)]) -> SchedulerPolicyEnv {
         SchedulerPolicyEnv::from_pairs(pairs.iter().copied())
@@ -3011,5 +3058,149 @@ mod tests {
         assert_eq!(scheduler.cancel_pending_by_token("ta").len(), 1);
         assert_eq!(scheduler.cancel_pending_by_user("alice").len(), 1);
         assert_eq!(scheduler.snapshot().queued, 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // Server-shaped worker keys.
+    //
+    // Every helper above builds a worker key with a NUMERIC `arch_id` ("6",
+    // "10"), so the canonical `model_arch_family_from_str` table resolves and
+    // the classifiers work. The server's only production construction site
+    // does not: `hipfire-server/src/routes/chat.rs:1629` hardcodes
+    // `arch_id: "unknown"`. These tests build keys the way the server
+    // actually does, so they exercise the path production takes.
+    // ---------------------------------------------------------------------
+
+    /// Byte-for-byte the shape of `scheduler_worker_key` in
+    /// `hipfire-server/src/routes/chat.rs`, with `arch` threaded through as
+    /// the daemon reports it on load. `None` reproduces the pre-fix shape.
+    fn server_worker_key_with_arch(model_path: &str, arch: Option<&str>) -> ModelWorkerKey {
+        ModelWorkerKey {
+            artifact_path: model_path.to_string(),
+            artifact_digest: None,
+            arch_id: arch.unwrap_or("unknown").to_string(),
+            quant_family: "unknown".to_string(),
+            // cfg.kv_cache — a KV cache mode, never a family name.
+            state_mode: "q8".to_string(),
+            max_seq_bucket: 4096,
+            accelerator_kind: Some("hip".to_string()),
+            device_id: Some("0".to_string()),
+            feature_flags: vec!["rust-server".to_string(), "prefill-queue".to_string()],
+        }
+    }
+
+    /// Mirrors `wait_for_prefill_scheduler_turn`, including the hardcoded
+    /// `state_kinds: vec!["kv"]`.
+    fn server_session(id: &str, model_path: &str, arch: Option<&str>) -> RequestSessionDraft {
+        create_request_session_draft(CreateRequestSessionInput {
+            id: id.to_string(),
+            owner: WorkloadOwner {
+                user_id: None,
+                token_id: None,
+            },
+            worker_key: server_worker_key_with_arch(model_path, arch),
+            prompt_tokens: vec![1, 2, 3, 4],
+            cached_prefix_tokens: None,
+            priority: None,
+            state_kinds: vec!["kv".to_string()],
+        })
+    }
+
+    #[test]
+    fn arch_tags_resolve_through_the_registry_not_just_numeric_ids() {
+        // Numeric header ids keep working.
+        assert_eq!(
+            model_arch_family_from_str("15"),
+            ModelArchFamily::Mamba2,
+            "legacy numeric arch_id must still resolve",
+        );
+        // Arch tags reported by the daemon now resolve too. `mamba2` and
+        // `nemotron-h` declare no `model_types`, so they match on family name.
+        assert_eq!(
+            model_arch_family_from_str("mamba2"),
+            ModelArchFamily::Mamba2
+        );
+        assert_eq!(
+            model_arch_family_from_str("nemotron-h"),
+            ModelArchFamily::NemotronH,
+        );
+        // Separator- and case-insensitive.
+        assert_eq!(
+            model_arch_family_from_str("Nemotron_H"),
+            ModelArchFamily::NemotronH,
+        );
+        // A tag no linked arch claims stays Unknown — the backstop's cue.
+        assert_eq!(
+            model_arch_family_from_str("unknown"),
+            ModelArchFamily::Unknown,
+        );
+    }
+
+    #[test]
+    fn mamba2_sessions_are_never_batched_together() {
+        // A pure Mamba-2 artifact (ARCH_ID_MAMBA2 = 15) is a token-ordered
+        // recurrent model: two sessions must NOT share a fused prefill batch.
+        let a = server_session("a", "/models/mamba2-2.7B.oq4.hfq", Some("mamba2"));
+        let b = server_session("b", "/models/mamba2-2.7B.oq4.hfq", Some("mamba2"));
+
+        assert!(
+            !prefill_session_multi_session_batchable(&a),
+            "a Mamba-2 session must not be multi-session batchable",
+        );
+        assert!(
+            !sessions_compatible_for_prefill(&a, &b),
+            "two distinct Mamba-2 sessions must not be fused into one prefill batch",
+        );
+    }
+
+    #[test]
+    fn recurrent_classification_does_not_depend_on_the_filename() {
+        // Same model, same arch tag, same state — only the filename differs.
+        // Before the fix, only the left-hand case was classified correctly,
+        // and purely by luck of the naming convention.
+        let named = server_session("a", "/models/Nemotron-H-8B.oq4.hfq", Some("nemotron-h"));
+        let renamed = server_session("b", "/models/model.oq4.hfq", Some("nemotron-h"));
+
+        assert!(!prefill_session_multi_session_batchable(&named));
+        assert!(
+            !prefill_session_multi_session_batchable(&renamed),
+            "classification must not depend on the artifact filename",
+        );
+    }
+
+    #[test]
+    fn unclassifiable_model_fails_closed_instead_of_batching() {
+        // The backstop: no classifier claimed it and the family would not
+        // resolve, so it must not opt into fused prefill batching.
+        let a = server_session("a", "/models/model.oq4.hfq", None);
+        let b = server_session("b", "/models/model.oq4.hfq", None);
+
+        assert_eq!(
+            worker_key_arch_family(&a.worker_key),
+            ModelArchFamily::Unknown
+        );
+        assert!(
+            !prefill_session_multi_session_batchable(&a),
+            "an unclassifiable model must fail closed",
+        );
+        assert!(!sessions_compatible_for_prefill(&a, &b));
+    }
+
+    #[test]
+    fn resolvable_non_recurrent_model_still_batches() {
+        // The backstop must not disable batching for models we CAN classify.
+        // llama is a plain transformer: fusing two prefills is safe.
+        let a = server_session("a", "/models/Llama-3-8B.oq4.hfq", Some("llama"));
+        let b = server_session("b", "/models/Llama-3-8B.oq4.hfq", Some("llama"));
+
+        assert_eq!(
+            worker_key_arch_family(&a.worker_key),
+            ModelArchFamily::LlamaMistral,
+        );
+        assert!(
+            prefill_session_multi_session_batchable(&a),
+            "a classifiable non-recurrent model must remain batchable",
+        );
+        assert!(sessions_compatible_for_prefill(&a, &b));
     }
 }

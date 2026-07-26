@@ -1333,3 +1333,20 @@ mod tests {
         assert_eq!(req["sessions"], serde_json::json!(["h1", "h2"]));
     }
 }
+
+#[cfg(test)]
+mod arch_registry_link_tests {
+    use super::*;
+
+    /// The registry is only populated if the arch `-spec` crates survive rlib
+    /// pruning. A Cargo.toml dependency alone is not enough — something must
+    /// reference them. If this fails, `batch_eligible` silently reports
+    /// `false` for every model and continuous batching never engages.
+    #[test]
+    fn arch_specs_are_linked_into_the_server_binary() {
+        assert!(
+            arch_registry().len() > 0,
+            "arch registry is empty: the -spec crates were pruned from the link",
+        );
+    }
+}

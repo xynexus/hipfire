@@ -264,17 +264,30 @@ pub fn is_qwen35_family_arch_id(arch_id: u32) -> bool {
 
 /// Resolve an `arch_id` *string* to its canonical [`ModelArchFamily`].
 ///
-/// The production form is the numeric arch_id stringified from the HFQ header
-/// (`hfq.arch_id: u32`), so this parses that and defers to [`model_arch_family`]
-/// — the single source of truth. Non-numeric strings (legacy names) return
-/// [`ModelArchFamily::Unknown`]; callers that still accept names should apply
-/// their own fallback. Lets control-plane crates (e.g. the scheduler) classify
-/// arch families through the canonical table instead of magic arch_id literals.
+/// Accepts either form the control plane actually carries:
+///
+/// - a numeric arch_id stringified from the HFQ header (`hfq.arch_id: u32`),
+/// - an arch **tag** — a canonical HF `model_type`, or a family name for the
+///   specs that declare no `model_types` (`nemotron-h`, `mamba2`) — which is
+///   what the daemon reports on load.
+///
+/// Tags resolve through [`hipfire_arch_api::registry`], so family identity
+/// stays in the arch specs rather than in a second name table here. A tag no
+/// linked arch claims returns [`ModelArchFamily::Unknown`]; callers must treat
+/// that as "cannot classify" and fail closed, not as a benign default.
 pub fn model_arch_family_from_str(arch_id: &str) -> ModelArchFamily {
-    match arch_id.trim().parse::<u32>() {
-        Ok(id) => model_arch_family(id),
-        Err(_) => ModelArchFamily::Unknown,
+    let tag = arch_id.trim();
+    // Legacy: a stringified numeric header id.
+    if let Ok(id) = tag.parse::<u32>() {
+        return model_arch_family(id);
     }
+    // Current: an arch tag — a canonical `model_type` or a family name — as
+    // reported by the daemon on load. Resolved through the arch registry so
+    // this stays a single source of truth rather than a second name table.
+    hipfire_arch_api::registry()
+        .resolve(tag)
+        .map(|arch| model_arch_family(u32::from(arch.id.0)))
+        .unwrap_or(ModelArchFamily::Unknown)
 }
 
 pub fn normalize_feature_flags(flags: &[String]) -> Vec<String> {

@@ -2251,10 +2251,12 @@ dependencies = [
 name = "hipfire-scheduler"
 version = "0.3.0"
 dependencies = [
+ "hipfire-arch-specs",
  "hipfire-auth",
  "hipfire-model",
  "hipfire-state",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
