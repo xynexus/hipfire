@@ -139,6 +139,25 @@ pub enum QuantType {
     /// and must reject this type before unpacking. Each block has the same
     /// `[f16 scale][256 int8]` bytes as [`QuantType::Oq8G256`].
     Oq8G256RowPadded = 43,
+    /// Raw opaque byte segment — NOT a quantized weight format, and NOT the
+    /// intended way to carry structured component data. A flat `u8` payload
+    /// (`shape = [byte_len]`, ungrouped) seen on `__segment/<n>` tensors inside
+    /// HFQM v2 component bundles (names shaped
+    /// `__hipfire_component/<role>/<idx>/__segment/<n>`). The arch loaders never
+    /// resolve these by name, so the bytes are handed through verbatim: 1
+    /// B/element, no block geometry, no dequant.
+    ///
+    /// This variant is a **read-compat shim** so such artifacts `inspect` and
+    /// load without choking on an unknown code — a tolerance for legacy or
+    /// foreign producers, not a blessed encoding. New components MUST NOT emit
+    /// qt=44: a component's *structured config* (e.g. a triattn sidecar's `TRIA`
+    /// geometry — `rope_theta`, `partial_rotary_factor`, head/band counts,
+    /// version) belongs in the container's **metadata JSON** as typed keys, and
+    /// its *numeric arrays* (e.g. triattn centers) belong as **typed tensors**
+    /// (`F16`/`BF16`/`F32`). Flattening a self-describing, model-matched asset
+    /// into an opaque byte blob discards its schema and its provenance — see
+    /// `hipfire_runtime::triattn` and the `~/.hipfire/triattn` sidecar registry.
+    RawSegment = 44,
 }
 
 impl QuantType {
@@ -203,6 +222,7 @@ impl QuantType {
             41 => Qtip2G256,
             42 => Qtip4G256,
             43 => Oq8G256RowPadded,
+            44 => RawSegment,
             _ => return None,
         })
     }
@@ -217,7 +237,7 @@ impl QuantType {
     pub const fn group_size(self) -> usize {
         use QuantType::*;
         match self {
-            F16 | F32 | BF16 => 1,
+            F16 | F32 | BF16 | RawSegment => 1,
             Q8F16 => 32,
             Q4F16G64 => 64,
             HFP4G32 | MFP4G32 => 32,
@@ -242,6 +262,7 @@ impl QuantType {
             // Dense / GGUF-style
             F32 => Some(4),
             F16 | BF16 => Some(2),
+            RawSegment => Some(1), // flat u8 byte stream: tensor_bytes(n) = n
             Q8F16 => Some(34),    // 2 (f16 scale) + 32 int8
             Q4F16G64 => Some(36), // 4 (f16 scale+min) + 32 nibbles
             Q4K => Some(144),     // llama.cpp Q4_K superblock
@@ -350,11 +371,13 @@ mod tests {
             (QuantType::MQ4G256Lloyd, 160),
             (QuantType::Oq4G256, 130),
             (QuantType::Oq3G256, 98),
+            (QuantType::Oq2G256, 66),
             (QuantType::Oq6G256, 194),
             (QuantType::Oq8G256, 258),
             (QuantType::Oq8G256RowPadded, 258),
             (QuantType::Qtip3G256, 100),
             (QuantType::Qtip4G256, 132),
+            (QuantType::RawSegment, 1),
         ];
         for (qt, bytes) in cases {
             assert_eq!(qt.block_bytes(), Some(bytes), "{qt:?} block_bytes");
@@ -369,7 +392,6 @@ mod tests {
             QuantType::MFP4G32,
             QuantType::OqPlusG256,
             QuantType::OqPlusCompact,
-            QuantType::Oq2G256,
             QuantType::Oq4G256ArchPacked,
             QuantType::Qtip2G256,
             QuantType::PARO4G128,

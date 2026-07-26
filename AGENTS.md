@@ -19,6 +19,17 @@ the relevant docs under `docs/`.
   RDNA4.
 - Document meaningful experiment results, including failures. Failed approaches
   are useful when they narrow the search space.
+- Match numeric precision to the data, not to habit. Do not default to `f32`/
+  `f64` for compute or storage when a narrower type (`f16`, `bf16`, or int) loses
+  nothing that matters. Coding agents reach for wide floats reflexively; on this
+  project wide types cost bandwidth, VRAM, and kernel throughput for no benefit
+  when the values don't need the range or mantissa. Decide from the data: what is
+  its actual dynamic range, how much error does the downstream consumer tolerate,
+  and is the value already an approximation (a calibration statistic, a mean, a
+  score) whose intrinsic noise dwarfs the rounding? Reserve `f64` for
+  accumulation and genuinely ill-conditioned math; prefer `f16`/`bf16` (or int)
+  for stored arrays and hot-path compute unless a precision need is demonstrated.
+  Keep exact config/geometry scalars wide; narrow the bulk numeric payloads.
 - Use one lock primitive: `hipfire-lock` `flock(2)`. Rust callers use
   `FlockGuard` and the shared path helpers. Shell, script, and external callers
   use `hipfire lock {acquire,release,status}`; `gpu-lock` is only an alias. Do

@@ -143,24 +143,34 @@ impl TriAttnCenters {
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        use crate::quant::f32_to_f16;
         let mut f = std::fs::File::create(path)?;
-        // Header: magic=TRIA, version=1, then geometry.
+        // Header: magic=TRIA, version=2, then geometry.
+        //
+        // v2 stores each center triple as f16 (v1 used f32). Centers are
+        // calibration sample means, accumulated in f64 and consumed as f32 on
+        // GPU; f16 rounding (~5e-4 rel) sits below their corpus sampling noise,
+        // and the concentration weighting down-weights exactly the low-‖E[q]‖
+        // bands where the phase (atan2) is precision-sensitive. Geometry scalars
+        // (rope_theta, partial_rotary_factor) stay f32 — they are exact config,
+        // not statistics.
         f.write_all(b"TRIA")?;
-        f.write_all(&1u32.to_le_bytes())?;
+        f.write_all(&2u32.to_le_bytes())?;
         f.write_all(&(self.n_layers as u32).to_le_bytes())?;
         f.write_all(&(self.n_heads as u32).to_le_bytes())?;
         f.write_all(&(self.head_dim as u32).to_le_bytes())?;
         f.write_all(&self.rope_theta.to_le_bytes())?;
         f.write_all(&self.partial_rotary_factor.to_le_bytes())?;
         for c in &self.centers {
-            f.write_all(&c.eq_re.to_le_bytes())?;
-            f.write_all(&c.eq_im.to_le_bytes())?;
-            f.write_all(&c.e_abs_q.to_le_bytes())?;
+            f.write_all(&f32_to_f16(c.eq_re).to_le_bytes())?;
+            f.write_all(&f32_to_f16(c.eq_im).to_le_bytes())?;
+            f.write_all(&f32_to_f16(c.e_abs_q).to_le_bytes())?;
         }
         Ok(())
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
+        use crate::quant::f16_to_f32;
         let mut f = std::fs::File::open(path)?;
         let mut magic = [0u8; 4];
         f.read_exact(&mut magic)?;
@@ -172,7 +182,7 @@ impl TriAttnCenters {
         }
         let mut u32buf = [0u8; 4];
         f.read_exact(&mut u32buf)?;
-        let _ver = u32::from_le_bytes(u32buf);
+        let ver = u32::from_le_bytes(u32buf);
         f.read_exact(&mut u32buf)?;
         let n_layers = u32::from_le_bytes(u32buf) as usize;
         f.read_exact(&mut u32buf)?;
@@ -186,18 +196,38 @@ impl TriAttnCenters {
         let n_bands = head_dim / 2;
         let n = n_layers * n_heads * n_bands;
         let mut centers = Vec::with_capacity(n);
-        for _ in 0..n {
-            f.read_exact(&mut u32buf)?;
-            let eq_re = f32::from_le_bytes(u32buf);
-            f.read_exact(&mut u32buf)?;
-            let eq_im = f32::from_le_bytes(u32buf);
-            f.read_exact(&mut u32buf)?;
-            let e_abs_q = f32::from_le_bytes(u32buf);
-            centers.push(BandCenter {
-                eq_re,
-                eq_im,
-                e_abs_q,
-            });
+        if ver >= 2 {
+            // v2: f16 center triples.
+            let mut u16buf = [0u8; 2];
+            for _ in 0..n {
+                f.read_exact(&mut u16buf)?;
+                let eq_re = f16_to_f32(u16::from_le_bytes(u16buf));
+                f.read_exact(&mut u16buf)?;
+                let eq_im = f16_to_f32(u16::from_le_bytes(u16buf));
+                f.read_exact(&mut u16buf)?;
+                let e_abs_q = f16_to_f32(u16::from_le_bytes(u16buf));
+                centers.push(BandCenter {
+                    eq_re,
+                    eq_im,
+                    e_abs_q,
+                });
+            }
+        } else {
+            // v1 (legacy): f32 center triples. Read-compat only; save() always
+            // emits v2.
+            for _ in 0..n {
+                f.read_exact(&mut u32buf)?;
+                let eq_re = f32::from_le_bytes(u32buf);
+                f.read_exact(&mut u32buf)?;
+                let eq_im = f32::from_le_bytes(u32buf);
+                f.read_exact(&mut u32buf)?;
+                let e_abs_q = f32::from_le_bytes(u32buf);
+                centers.push(BandCenter {
+                    eq_re,
+                    eq_im,
+                    e_abs_q,
+                });
+            }
         }
         Ok(Self {
             n_layers,
@@ -1193,10 +1223,13 @@ mod tests {
                         l,
                         h,
                         f,
+                        // Non-integer values so the f16 (v2) store path is
+                        // actually exercised — small integers are exact in f16
+                        // and would hide any rounding.
                         BandCenter {
-                            eq_re: (l * 100 + h * 10 + f) as f32,
-                            eq_im: -((l * 100 + h * 10 + f) as f32),
-                            e_abs_q: (l + h + f) as f32 + 1.0,
+                            eq_re: (l * 100 + h * 10 + f) as f32 * 0.3137 + 0.123,
+                            eq_im: -((l * 100 + h * 10 + f) as f32) * 0.271 - 0.077,
+                            e_abs_q: (l + h + f) as f32 * 0.51 + 1.019,
                         },
                     );
                 }
@@ -1207,11 +1240,46 @@ mod tests {
         assert_eq!(d.n_layers, c.n_layers);
         assert_eq!(d.n_heads, c.n_heads);
         assert_eq!(d.head_dim, c.head_dim);
+        // v2 stores centers as f16, so compare with an f16-appropriate
+        // tolerance (~5e-4 relative) rather than bit-exact.
+        let close = |a: f32, b: f32| (a - b).abs() <= b.abs() * 1e-3 + 1e-3;
         for i in 0..c.centers.len() {
-            assert!((d.centers[i].eq_re - c.centers[i].eq_re).abs() < 1e-6);
-            assert!((d.centers[i].eq_im - c.centers[i].eq_im).abs() < 1e-6);
-            assert!((d.centers[i].e_abs_q - c.centers[i].e_abs_q).abs() < 1e-6);
+            assert!(close(d.centers[i].eq_re, c.centers[i].eq_re));
+            assert!(close(d.centers[i].eq_im, c.centers[i].eq_im));
+            assert!(close(d.centers[i].e_abs_q, c.centers[i].e_abs_q));
         }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_reads_legacy_v1_f32_sidecar() {
+        // A hand-written v1 sidecar (f32 center triples) must still load, since
+        // save() now emits v2 (f16). n_layers=1, n_heads=1, head_dim=4 -> 2 bands.
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join("triattn_v1_compat_test.bin");
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"TRIA");
+        buf.extend_from_slice(&1u32.to_le_bytes()); // version 1
+        buf.extend_from_slice(&1u32.to_le_bytes()); // n_layers
+        buf.extend_from_slice(&1u32.to_le_bytes()); // n_heads
+        buf.extend_from_slice(&4u32.to_le_bytes()); // head_dim -> 2 bands
+        buf.extend_from_slice(&500_000.0f32.to_le_bytes()); // rope_theta
+        buf.extend_from_slice(&1.0f32.to_le_bytes()); // partial_rotary_factor
+        let vals = [(1.5f32, -2.25f32, 3.0f32), (0.125f32, 0.5f32, 1.75f32)];
+        for (re, im, ab) in vals {
+            buf.extend_from_slice(&re.to_le_bytes());
+            buf.extend_from_slice(&im.to_le_bytes());
+            buf.extend_from_slice(&ab.to_le_bytes());
+        }
+        std::fs::File::create(&tmp).unwrap().write_all(&buf).unwrap();
+        let d = TriAttnCenters::load(&tmp).unwrap();
+        assert_eq!(d.n_layers, 1);
+        assert_eq!(d.n_heads, 1);
+        assert_eq!(d.head_dim, 4);
+        assert_eq!(d.centers.len(), 2);
+        // v1 values are read as exact f32 (all here are f16-exact anyway).
+        assert_eq!(d.centers[0].eq_re, 1.5);
+        assert_eq!(d.centers[1].e_abs_q, 1.75);
         let _ = std::fs::remove_file(&tmp);
     }
 
