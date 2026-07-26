@@ -2033,45 +2033,85 @@ fn load_weight_tensor(
             })
         }
         1 => {
-            // F16 — dequant to F32 for F32 GEMV
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-            };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::F32,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            // F16 — keep native so `weight_gemm` takes the batched
+            // `gemm_f16_x_f32_wmma` path instead of upcasting to F32 and falling
+            // back to a per-token GEMV. Needs K % 16 == 0 (16-wide WMMA K
+            // fragments); non-aligned linears stay on the F32 upcast path.
+            // `HIPFIRE_BF16_WEIGHTS=f32` forces the old upcast (rollback).
+            let force_f32 = std::env::var("HIPFIRE_BF16_WEIGHTS").ok().as_deref() == Some("f32");
+            if k % 16 == 0 && !force_f32 {
+                let mut buf = gpu.upload_raw(data, &[data.len()])?;
+                buf.dtype = DType::F16;
+                Ok(WeightTensor {
+                    buf,
+                    gpu_dtype: DType::F16,
+                    m,
+                    k,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                })
+            } else {
+                let f32_data: Vec<f32> = data
+                    .chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+                };
+                let buf = gpu.upload_raw(bytes, &[m, k])?;
+                Ok(WeightTensor {
+                    buf,
+                    gpu_dtype: DType::F32,
+                    m,
+                    k,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                })
+            }
         }
         16 => {
-            // BF16 — dequant to F32 for F32 GEMV. The qtip3 path leaves
-            // non-256-divisible linears (e.g. down_proj, k=1408) as BF16.
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-                .collect();
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-            };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::F32,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            // BF16 — keep native so `weight_gemm` takes the batched
+            // `gemm_bf16_x_bf16_wmma` path (+ the m128 overlay) and decode uses
+            // the bf16 `weight_gemv`, instead of upcasting to F32 and falling
+            // back to a per-token GEMV loop (the arch-0 prefill bottleneck).
+            // The bf16 WMMA kernel reads 16-wide K fragments, so it needs
+            // K % 16 == 0; the rare non-aligned linear stays on the F32 upcast
+            // path for correctness. `HIPFIRE_BF16_WEIGHTS=f32` forces the old
+            // upcast everywhere (rollback / debugging).
+            let force_f32 = std::env::var("HIPFIRE_BF16_WEIGHTS").ok().as_deref() == Some("f32");
+            if k % 16 == 0 && !force_f32 {
+                let mut buf = gpu.upload_raw(data, &[data.len()])?;
+                buf.dtype = DType::BF16;
+                Ok(WeightTensor {
+                    buf,
+                    gpu_dtype: DType::BF16,
+                    m,
+                    k,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                })
+            } else {
+                let f32_data: Vec<f32> = data
+                    .chunks_exact(2)
+                    .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                    .collect();
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+                };
+                let buf = gpu.upload_raw(bytes, &[m, k])?;
+                Ok(WeightTensor {
+                    buf,
+                    gpu_dtype: DType::F32,
+                    m,
+                    k,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                })
+            }
         }
         31 => {
             // Qtip3G256 — packed bitshift-trellis (100 B/group), served by the
