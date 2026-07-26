@@ -74,9 +74,16 @@ fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     println!("arch={}", gpu.arch);
 
-    let m = 32usize;
-    let k = 32usize;
-    let b = 32usize;
+    // Optional `m k b` args so the same channel test can exercise the m128
+    // overlay path (m>=128, b>=16, k%16==0) as well as the 32/32/32 default.
+    let args: Vec<usize> = std::env::args()
+        .skip(1)
+        .filter_map(|a| a.parse().ok())
+        .collect();
+    let m = args.first().copied().unwrap_or(32);
+    let k = args.get(1).copied().unwrap_or(32);
+    let b = args.get(2).copied().unwrap_or(32);
+    println!("shape m={m} k={k} b={b}");
 
     let weights: Vec<f32> = (0..m * k)
         .map(|i| {

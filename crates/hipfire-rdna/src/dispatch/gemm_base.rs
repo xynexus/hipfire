@@ -1074,7 +1074,12 @@ impl Gpu {
         // path's bf16 gemv funnels here via gemm_bf16_x_bf16_wmma). Captures the
         // input activation before the compute. No-op when unarmed.
         self.maybe_capture_activation(a_bf16, x_f32, batch_size, k);
-        if self.arch == "gfx1151"
+        // The m128 overlay is a plain RDNA3 wave32 WMMA kernel (8 KB LDS, no
+        // `__gfx1151__` guard), so it runs on gfx1103 (Phoenix) as well as
+        // gfx1151 (Strix). Originally gfx1151-only out of caution around the
+        // gfx1103 LDS-wedge hazard, which has since been nullified. The kernel
+        // entry keeps its historical `_gfx1151_` name.
+        if matches!(self.arch.as_str(), "gfx1151" | "gfx1103")
             && m >= 128
             && batch_size >= 16
             && k % 16 == 0

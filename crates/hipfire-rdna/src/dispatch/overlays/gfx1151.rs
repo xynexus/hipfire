@@ -223,9 +223,12 @@ impl Gpu {
         profile_label: &'static str,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert_eq!(
-            self.arch, "gfx1151",
-            "gemm_bf16_x_bf16_wmma_gfx1151_m128 is gfx1151-only"
+        // Plain RDNA3 wave32 WMMA (8 KB LDS, no `__gfx1151__` guard): runs on
+        // gfx1103 too. Name is historical.
+        assert!(
+            matches!(self.arch.as_str(), "gfx1151" | "gfx1103"),
+            "gemm_bf16_x_bf16_wmma_gfx1151_m128: unsupported arch {}",
+            self.arch
         );
         assert_eq!(
             a_bf16.dtype,
