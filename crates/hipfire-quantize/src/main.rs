@@ -3784,6 +3784,24 @@ fn quantize_hfq_source_tensor(
             return Ok(ov);
         }
     }
+    // Untied decode output head (`lm_head.weight`/`output.weight`): also stash the
+    // coarse shortlist tier so two-stage decode applies to UNTIED models (e.g.
+    // MiniCPM), not only tied embeddings. `is_embedding_table_name` above matches
+    // only `embed_tokens`/`*embeddings`, so on an untied model the fine head would
+    // otherwise get no coarse tier. Purely additive: the fine tier is still
+    // quantized normally below (Oq8/OqPlus), same contract as the tied path.
+    if !is_embed
+        && coarse_lmhead_enabled()
+        && is_untied_lm_head_name(name)
+        && shape.len() == 2
+        && shape[1] % 2 == 0
+    {
+        let (rows, cols) = (shape[0] as usize, shape[1] as usize);
+        if f32_data.len() == rows * cols {
+            let coarse = build_coarse_q4row(&f32_data, rows, cols);
+            COARSE_Q4_SIDECAR.with(|c| *c.borrow_mut() = Some(coarse));
+        }
+    }
     let is_moe_router =
         name.ends_with("mlp.gate.weight") || name.ends_with("mlp.shared_expert_gate.weight");
     if is_embed || is_moe_router || is_conv1d_tensor(name) || shape.len() != 2 {
@@ -5571,6 +5589,15 @@ fn is_embedding_table_name(name: &str) -> bool {
     name.contains("embed_tokens")
         || name.ends_with("embeddings.weight")
         || name.ends_with("embedding.weight")
+}
+
+/// Untied decode output head — the separate `lm_head.weight` / `output.weight`
+/// that untied models (e.g. MiniCPM) use instead of reusing `embed_tokens`. The
+/// two-pass coarse shortlist tier must attach here so it covers the matrix that
+/// decode actually projects through; `is_embedding_table_name` handles the tied
+/// case where `embed_tokens` IS the head.
+fn is_untied_lm_head_name(name: &str) -> bool {
+    name.ends_with("lm_head.weight") || name.ends_with("output.weight")
 }
 
 /// Embed-table storage override for `--embed-precision`. Returns
