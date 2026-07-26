@@ -2077,6 +2077,7 @@ version = "0.3.0"
 dependencies = [
  "byteorder",
  "hipfire-arch-api",
+ "hipfire-arch-specs",
  "hipfire-config",
  "hipfire-hash",
  "hipfire-prompt",

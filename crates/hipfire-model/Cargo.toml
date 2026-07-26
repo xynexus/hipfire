@@ -17,3 +17,8 @@ serde.workspace = true
 serde_json = "1"
 
 [dev-dependencies]
+# Force-links the arch `-spec` crates so `ArchRegistry` is populated in tests
+# the same way it is in a served binary. Identity resolution returns None
+# against an empty registry, so without this the round-trip tests would pass
+# vacuously.
+hipfire-arch-specs = { path = "../hipfire-arch-specs" }

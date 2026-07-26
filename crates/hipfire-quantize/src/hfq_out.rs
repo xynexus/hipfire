@@ -897,6 +897,38 @@ impl Drop for TensorSpill {
     }
 }
 
+/// Stamp `identity` into the metadata JSON so the container declares what it is
+/// rather than leaving readers to infer it from the numeric header id.
+///
+/// Three deliberate behaviours:
+///
+/// - An `identity` the caller already supplied is left alone. The caller knows
+///   the variant and role; this only derives the family from `arch`.
+/// - An `arch` outside the frozen legacy map is left unstamped. Sidecar ids
+///   (DFlash draft, MTP head) are tooling-only and never name a servable
+///   family, so inventing one for them would be a lie.
+/// - No header version bump. `version` selects the container's structural
+///   layout and is read by two independent parsers; an added JSON key changes
+///   no layout, so presence of `identity` is the signal instead.
+fn stamp_identity(metadata_json: &str, arch: u32) -> std::io::Result<String> {
+    let mut meta: serde_json::Value = serde_json::from_str(metadata_json)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let Some(object) = meta.as_object_mut() else {
+        return Ok(metadata_json.to_string());
+    };
+    if object.contains_key("identity") {
+        return Ok(metadata_json.to_string());
+    }
+    let Some(identity) = hipfire_arch_api::identity_for_legacy_arch_id(arch) else {
+        return Ok(metadata_json.to_string());
+    };
+    object.insert(
+        "identity".to_string(),
+        hipfire_model::identity_json(identity),
+    );
+    Ok(meta.to_string())
+}
+
 pub fn write_hfq(
     path: &Path,
     arch: u32,
@@ -925,6 +957,7 @@ pub fn write_hfq_with_progress(
     if let Some(spill) = spill.as_mut() {
         spill.flush()?;
     }
+    let metadata_json = &stamp_identity(metadata_json, arch)?;
     let metadata_base: serde_json::Value = serde_json::from_str(metadata_json)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let ordered = canonical_tensor_order(tensors);
@@ -1124,6 +1157,7 @@ pub fn write_hfq_streaming_with_progress(
     mut write_tensor: impl FnMut(usize, &mut dyn Write) -> std::io::Result<()>,
     mut progress: impl FnMut(HfqWriteProgress),
 ) -> std::io::Result<()> {
+    let metadata_json = &stamp_identity(metadata_json, arch)?;
     let (front_base, tail_bytes) = split_front_tail_metadata(metadata_json)?;
     let metadata_offset = HEADER_SIZE;
 
@@ -1598,6 +1632,62 @@ fn write_zeroes(f: &mut File, mut n: u64) -> std::io::Result<()> {
         n -= chunk as u64;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod identity_stamp_tests {
+    use super::*;
+
+    fn identity_of(json: &str) -> Option<serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(json)
+            .unwrap()
+            .get("identity")
+            .cloned()
+    }
+
+    #[test]
+    fn a_known_arch_id_stamps_its_family() {
+        let out = stamp_identity(r#"{"config":{}}"#, hipfire_arch_api::ARCH_ID_ZAYA).unwrap();
+        assert_eq!(
+            identity_of(&out),
+            Some(serde_json::json!({ "family": "zaya" })),
+        );
+    }
+
+    #[test]
+    fn a_caller_supplied_identity_is_left_alone() {
+        // A3 will pass variant and role down from detection; the writer must
+        // not flatten that back to a bare family.
+        let rich = r#"{"identity":{"family":"gemma4","variant":"moe","role":"vl"},"config":{}}"#;
+        let out = stamp_identity(rich, hipfire_arch_api::ARCH_ID_ZAYA).unwrap();
+        assert_eq!(
+            identity_of(&out),
+            Some(serde_json::json!({"family":"gemma4","variant":"moe","role":"vl"})),
+        );
+    }
+
+    #[test]
+    fn a_tooling_only_arch_id_is_not_stamped() {
+        // Sidecar ids (DFlash draft, MTP head) name no servable family;
+        // inventing one for them would be a lie.
+        for sidecar in [20u32, 21, 9999] {
+            let out = stamp_identity(r#"{"config":{}}"#, sidecar).unwrap();
+            assert_eq!(
+                identity_of(&out),
+                None,
+                "arch {sidecar} must not be stamped"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stamped_container_resolves_back_to_the_same_identity() {
+        let out = stamp_identity(r#"{"config":{}}"#, hipfire_arch_api::ARCH_ID_GEMMA4).unwrap();
+        assert_eq!(
+            hipfire_model::identity_from_metadata(&out),
+            Some(hipfire_arch_api::ArchRef::base("gemma4")),
+        );
+    }
 }
 
 #[cfg(test)]

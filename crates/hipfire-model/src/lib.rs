@@ -2912,6 +2912,98 @@ pub struct ModelLoadedResponse {
 }
 
 #[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use hipfire_arch_api::{ArchRef, Role};
+    use serde_json::json;
+
+    // Populate the registry the way a served binary does; without this every
+    // resolution returns None and these tests would pass vacuously.
+    use hipfire_arch_specs as _;
+
+    fn meta(identity: serde_json::Value) -> String {
+        json!({ "identity": identity, "config": { "hidden_size": 8 } }).to_string()
+    }
+
+    #[test]
+    fn identity_round_trips_through_the_metadata_json() {
+        for identity in [
+            ArchRef::base("llama"),
+            ArchRef::base("gemma4").with_variant("moe"),
+            ArchRef::base("qwen3.5").with_role(Role::Mtp),
+            ArchRef::base("nemotron-h")
+                .with_variant("dense")
+                .with_role(Role::Vl),
+        ] {
+            let json = meta(identity_json(identity));
+            assert_eq!(
+                identity_from_metadata(&json),
+                Some(identity),
+                "round trip failed for {identity}",
+            );
+        }
+    }
+
+    #[test]
+    fn absent_identity_falls_back_to_the_frozen_legacy_map() {
+        let legacy = json!({ "config": { "hidden_size": 8 } }).to_string();
+        assert_eq!(identity_from_metadata(&legacy), None);
+        assert_eq!(
+            resolve_artifact_identity(ARCH_ID_ZAYA, &legacy),
+            Some(ArchRef::base("zaya")),
+        );
+        // A declared identity wins over the numeric id when both are present.
+        let declared = meta(identity_json(ArchRef::base("gemma4").with_variant("moe")));
+        assert_eq!(
+            resolve_artifact_identity(ARCH_ID_ZAYA, &declared),
+            Some(ArchRef::base("gemma4").with_variant("moe")),
+        );
+    }
+
+    #[test]
+    fn unresolvable_identity_is_refused_not_degraded() {
+        // Unknown family: not this binary's to serve.
+        assert_eq!(
+            identity_from_metadata(&meta(json!({"family": "not-an-arch"}))),
+            None,
+        );
+        // Variant the family does not declare — must not silently drop to base.
+        assert_eq!(
+            identity_from_metadata(&meta(json!({"family": "gemma4", "variant": "quantum"}))),
+            None,
+        );
+        // Role outside the frozen vocabulary.
+        assert_eq!(
+            identity_from_metadata(&meta(json!({"family": "llama", "role": "sidecar"}))),
+            None,
+        );
+        // An id absent from the frozen table is corrupt or from the future.
+        assert_eq!(resolve_artifact_identity(9999, "{}"), None);
+    }
+
+    #[test]
+    fn every_legacy_id_maps_to_a_registered_family() {
+        // The frozen map is hand-maintained and cannot be derived from the
+        // registry. This catches a typo in it, which would otherwise surface as
+        // an artifact that suddenly stops resolving.
+        for (id, _) in KNOWN_RUNTIME_ARCH_IDS
+            .iter()
+            .chain(KNOWN_DIFFUSION_ARCH_IDS)
+        {
+            let identity = hipfire_arch_api::identity_for_legacy_arch_id(*id)
+                .unwrap_or_else(|| panic!("arch_id {id} missing from the frozen legacy map"));
+            assert!(
+                hipfire_arch_api::registry()
+                    .resolve(identity.family)
+                    .is_some(),
+                "legacy arch_id {id} maps to family `{}`, which no linked arch claims",
+                identity.family,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
