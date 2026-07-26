@@ -7355,6 +7355,13 @@ fn main() {
         "tokenizer_config": tokenizer_config,
         "generation_config": generation_config,
     });
+    // Declared identity: family plus the variant where the family declares one.
+    // Written here rather than left to the writer's fallback because detection
+    // has the config, and the writer only has the numeric id. `stamp_identity`
+    // preserves whatever it finds.
+    if let Some(identity) = hipfire_quantize::hfq_out::detect_identity(arch_id, &config) {
+        metadata["identity"] = hipfire_model::identity_json(identity);
+    }
     let embedding_metadata = sentence_transformers_embedding_metadata(
         input_dir,
         &config,

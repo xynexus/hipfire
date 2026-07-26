@@ -897,6 +897,75 @@ impl Drop for TensorSpill {
     }
 }
 
+/// The decoder stack of a config, which multimodal wrappers nest.
+fn decoder_config(config: &serde_json::Value) -> &serde_json::Value {
+    for key in ["text_config", "llm_config", "language_config"] {
+        if let Some(nested) = config.get(key) {
+            if nested.get("num_hidden_layers").is_some() {
+                return nested;
+            }
+        }
+    }
+    config
+}
+
+/// Whether a decoder config describes routed experts.
+fn has_routed_experts(decoder: &serde_json::Value) -> bool {
+    ["num_experts", "n_routed_experts", "num_local_experts"]
+        .iter()
+        .filter_map(|key| decoder.get(*key))
+        .filter_map(serde_json::Value::as_u64)
+        .any(|count| count > 0)
+}
+
+/// Detect the identity to stamp into an artifact: the family from the legacy
+/// `arch_id`, plus the variant where the family declares one.
+///
+/// Variant detection is deliberately narrow. Only families that declare
+/// variants in the registry get one, and each rule mirrors a branch the loader
+/// already takes — the label names a distinction that exists, it does not
+/// invent one. Families whose variants are not yet distinguishable stay bare;
+/// see the variant table in `docs/architecture-ids.md`.
+///
+/// `role` is always `None` here. A role marks a *decomposed sidecar* artifact
+/// (`.vl.hfq`, `.mtp.hfq`), and this path writes base models — `hipfire model
+/// decompose` is what mints a sidecar, so it is what should set the role.
+pub fn detect_identity(
+    arch_id: u32,
+    config: &serde_json::Value,
+) -> Option<hipfire_arch_api::ArchRef> {
+    let identity = hipfire_arch_api::identity_for_legacy_arch_id(arch_id)?;
+    let decoder = decoder_config(config);
+
+    let variant = match identity.family {
+        // Blocks are dense-MLP or routed-MoE, selected per layer by
+        // `hybrid_override_pattern` ('E' is an MoE block). Mirrors `has_moe`.
+        "nemotron-h" => {
+            let pattern_has_moe = decoder
+                .get("hybrid_override_pattern")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|pattern| pattern.contains('E'));
+            Some(if pattern_has_moe || has_routed_experts(decoder) {
+                "moe"
+            } else {
+                "dense"
+            })
+        }
+        // Mirrors `FfnPlan::DensePlusMoe` vs the dense arm.
+        "gemma4" => Some(if has_routed_experts(decoder) {
+            "moe"
+        } else {
+            "dense"
+        }),
+        _ => None,
+    };
+
+    Some(match variant {
+        Some(variant) => identity.with_variant(variant),
+        None => identity,
+    })
+}
+
 /// Stamp `identity` into the metadata JSON so the container declares what it is
 /// rather than leaving readers to infer it from the numeric header id.
 ///
@@ -1676,6 +1745,93 @@ mod identity_stamp_tests {
                 identity_of(&out),
                 None,
                 "arch {sidecar} must not be stamped"
+            );
+        }
+    }
+
+    #[test]
+    fn variant_detection_mirrors_the_loader_branch() {
+        use hipfire_arch_api::{ArchRef, ARCH_ID_GEMMA4, ARCH_ID_NEMOTRON_H, ARCH_ID_ZAYA};
+
+        // nemotron-h: 'E' in the block pattern is an MoE block.
+        let moe = serde_json::json!({"hybrid_override_pattern": "M-M*E-", "num_hidden_layers": 6});
+        let dense = serde_json::json!({"hybrid_override_pattern": "M-M*-", "num_hidden_layers": 5});
+        assert_eq!(
+            detect_identity(ARCH_ID_NEMOTRON_H, &moe),
+            Some(ArchRef::base("nemotron-h").with_variant("moe")),
+        );
+        assert_eq!(
+            detect_identity(ARCH_ID_NEMOTRON_H, &dense),
+            Some(ArchRef::base("nemotron-h").with_variant("dense")),
+        );
+        // …or an expert count, when the pattern is absent.
+        let by_count = serde_json::json!({"n_routed_experts": 8, "num_hidden_layers": 4});
+        assert_eq!(
+            detect_identity(ARCH_ID_NEMOTRON_H, &by_count),
+            Some(ArchRef::base("nemotron-h").with_variant("moe")),
+        );
+
+        // gemma4, through a multimodal wrapper that nests the decoder.
+        let nested = serde_json::json!({
+            "vision_config": {"patch_size": 14},
+            "text_config": {"num_experts": 128, "num_hidden_layers": 34},
+        });
+        assert_eq!(
+            detect_identity(ARCH_ID_GEMMA4, &nested),
+            Some(ArchRef::base("gemma4").with_variant("moe")),
+        );
+        // `num_experts: 0` is dense, not MoE.
+        let zeroed = serde_json::json!({"num_experts": 0, "num_hidden_layers": 34});
+        assert_eq!(
+            detect_identity(ARCH_ID_GEMMA4, &zeroed),
+            Some(ArchRef::base("gemma4").with_variant("dense")),
+        );
+
+        // A family that declares no variants gets none invented for it.
+        let zaya = serde_json::json!({"num_experts": 64, "num_hidden_layers": 24});
+        assert_eq!(
+            detect_identity(ARCH_ID_ZAYA, &zaya),
+            Some(ArchRef::base("zaya")),
+        );
+        // Unknown id: nothing to declare.
+        assert_eq!(detect_identity(9999, &zaya), None);
+    }
+
+    #[test]
+    fn every_detected_variant_is_one_the_family_declares() {
+        // Detection returning a label the registry does not know would make the
+        // artifact unresolvable by `identity_from_metadata` — a write/read
+        // mismatch that only shows up when someone tries to load the file.
+        use hipfire_arch_specs as _;
+        for (id, config) in [
+            (
+                hipfire_arch_api::ARCH_ID_NEMOTRON_H,
+                serde_json::json!({"hybrid_override_pattern": "M-E", "num_hidden_layers": 3}),
+            ),
+            (
+                hipfire_arch_api::ARCH_ID_NEMOTRON_H,
+                serde_json::json!({"hybrid_override_pattern": "M-*", "num_hidden_layers": 3}),
+            ),
+            (
+                hipfire_arch_api::ARCH_ID_GEMMA4,
+                serde_json::json!({"num_experts": 8, "num_hidden_layers": 4}),
+            ),
+            (
+                hipfire_arch_api::ARCH_ID_GEMMA4,
+                serde_json::json!({"num_hidden_layers": 4}),
+            ),
+        ] {
+            let identity = detect_identity(id, &config).expect("identity");
+            let stamped = stamp_identity(
+                &serde_json::json!({ "identity": hipfire_model::identity_json(identity) })
+                    .to_string(),
+                id,
+            )
+            .unwrap();
+            assert_eq!(
+                hipfire_model::identity_from_metadata(&stamped),
+                Some(identity),
+                "detected {identity} does not resolve back",
             );
         }
     }
