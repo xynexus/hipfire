@@ -466,6 +466,39 @@ impl ResourceReservationManager {
         }
     }
 
+    /// Replace the memory budgets at runtime. Unset fields keep their value.
+    ///
+    /// These four are the only part of the daemon's startup environment that is
+    /// *not* fixed at exec: `HIPFIRE_DEVICES` and the resource-lock settings are
+    /// consumed before `Gpu::init()` and before the process takes its flocks, so
+    /// they describe locks already held and cannot be revised. The budgets only
+    /// size the ballast allocation, which `release_placeholders` /
+    /// `reacquire_placeholders` already re-apply — so they can travel over the
+    /// wire instead of only through a spawned child's environment.
+    ///
+    /// That distinction is what a caller attaching to a running daemon needs:
+    /// it can push its budgets, and must accept the daemon's locks as given.
+    fn set_budgets(
+        &mut self,
+        system_memory_budget_bytes: Option<u64>,
+        system_memory_headroom_bytes: Option<u64>,
+        vram_budget_bytes: Option<u64>,
+        vram_headroom_bytes: Option<u64>,
+    ) {
+        if let Some(v) = system_memory_budget_bytes {
+            self.system_memory_budget_bytes = v;
+        }
+        if let Some(v) = system_memory_headroom_bytes {
+            self.system_memory_headroom_bytes = v;
+        }
+        if let Some(v) = vram_budget_bytes {
+            self.vram_budget_bytes = v;
+        }
+        if let Some(v) = vram_headroom_bytes {
+            self.vram_headroom_bytes = v;
+        }
+    }
+
     fn system_target_bytes(&self) -> u64 {
         reservation_target_bytes(
             self.system_memory_budget_bytes,
@@ -904,6 +937,30 @@ mod resource_reservation_tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// A budget update names only what it changes. Without this, a caller adjusting
+    /// headroom alone would silently zero the budget it did not mention — and the
+    /// daemon would release its whole reservation in response.
+    #[test]
+    fn set_budgets_leaves_unnamed_fields_alone() {
+        let mut mgr = ResourceReservationManager::from_env_reader(|_| None);
+        mgr.set_budgets(Some(8), Some(2), Some(64), Some(16));
+        assert_eq!(mgr.system_memory_budget_bytes, 8);
+        assert_eq!(mgr.vram_budget_bytes, 64);
+        assert_eq!(mgr.vram_headroom_bytes, 16);
+
+        // Change one field; the other three must survive.
+        mgr.set_budgets(None, None, None, Some(32));
+        assert_eq!(mgr.vram_headroom_bytes, 32);
+        assert_eq!(mgr.vram_budget_bytes, 64, "budget must not be zeroed");
+        assert_eq!(mgr.system_memory_budget_bytes, 8);
+        assert_eq!(mgr.system_memory_headroom_bytes, 2);
+
+        // Zero is a value, not "unset" — clearing a budget has to be expressible.
+        mgr.set_budgets(None, None, Some(0), Some(0));
+        assert_eq!(mgr.vram_budget_bytes, 0);
+        assert_eq!(mgr.vram_headroom_bytes, 0);
+    }
+
     #[test]
     fn resource_reservation_env_applies_budget_headroom_targets() {
         let values = HashMap::from([
@@ -1322,6 +1379,9 @@ fn main() {
             DaemonRequest::WorkerStatus => handlers::status::worker_status(&mut daemon_state),
 
             DaemonRequest::ResourceStatus => handlers::status::resource_status(&mut daemon_state),
+            DaemonRequest::SetResourceBudget(req) => {
+                handlers::status::set_resource_budget(&mut daemon_state, req)
+            }
 
             DaemonRequest::Inventory => handlers::status::inventory(&mut daemon_state),
 

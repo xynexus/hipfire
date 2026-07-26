@@ -5,7 +5,8 @@
 //! Async daemon JSONL process adapter.
 
 pub use hipfire_daemon_protocol::{
-    EmbedRequest, EmbeddingVector, RerankRequest, RerankResult, SteerApplyRequest,
+    EmbedRequest, EmbeddingVector, RerankRequest, RerankResult, SetResourceBudgetRequest,
+    SteerApplyRequest,
 };
 /// Re-exported so resource-lock status consumers (admin API, TUI) can match the
 /// live flock state without a direct `hipfire-lock` dependency.
@@ -312,6 +313,25 @@ impl DaemonEngine {
             transport: Box::new(transport),
             worker_key_id: None,
         })
+    }
+
+    /// Push memory budgets to the daemon and get the resulting reservation back.
+    ///
+    /// This is what makes attaching viable for a caller that would otherwise have
+    /// configured the daemon by spawning it with an environment: budgets are the
+    /// part of that configuration which is not fixed at exec. Device selection and
+    /// resource locking are — the daemon consumed them before HIP init and before
+    /// taking its flocks — so an attaching caller accepts those as the daemon's.
+    pub async fn set_resource_budget(
+        &mut self,
+        req: SetResourceBudgetRequest,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.send(&DaemonRequest::SetResourceBudget(req)).await?;
+        match self.transport.recv_response().await? {
+            DaemonResponse::ResourceStatus(status) => Ok(status),
+            DaemonResponse::Error(e) => anyhow::bail!("set_resource_budget: {}", e.message),
+            other => anyhow::bail!("set_resource_budget: unexpected response {other:?}"),
+        }
     }
 
     /// Attach to the daemon already listening on `path`.

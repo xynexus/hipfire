@@ -396,6 +396,15 @@ pub enum DaemonRequest {
     #[serde(alias = "list_workers")]
     WorkerStatus,
     ResourceStatus,
+    /// Set the daemon's memory budgets at runtime and re-apply the ballast
+    /// reservation. Answers with the same payload as [`DaemonRequest::ResourceStatus`].
+    ///
+    /// These are the only startup settings that can be revised after exec: device
+    /// selection and the resource-lock settings are consumed before HIP init and
+    /// before the process takes its flocks, so they describe locks already held.
+    /// A caller attaching to a running daemon pushes budgets with this and accepts
+    /// the daemon's locks as given.
+    SetResourceBudget(SetResourceBudgetRequest),
     UnloadWorker,
     PflashLabels(PflashLabelsRequest),
     TrainDrafter,
@@ -406,6 +415,20 @@ pub enum DaemonRequest {
     Diag,
     BenchPrefill(BenchPrefillRequest),
     Profile,
+}
+
+/// Runtime memory-budget update. Every field is optional; an omitted field leaves
+/// that budget unchanged, so a caller can adjust one without restating the rest.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SetResourceBudgetRequest {
+    #[serde(default)]
+    pub system_memory_budget_bytes: Option<u64>,
+    #[serde(default)]
+    pub system_memory_headroom_bytes: Option<u64>,
+    #[serde(default)]
+    pub vram_budget_bytes: Option<u64>,
+    #[serde(default)]
+    pub vram_headroom_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -443,6 +443,38 @@ actually stops it.
 
 ### M4 — Scheduler moves in
 
+**M4a — daemon configuration on the wire. Done.** M3e found that the server
+configures the daemon through the spawned child's environment, which blocks both
+attaching *and* a daemon-resident scheduler that needs runtime-changeable config.
+Examining what is actually passed splits it three ways, and only one third needed
+moving:
+
+| kind | settings | movable? |
+|---|---|---|
+| exec-time | `HIPFIRE_DEVICES`, `HIPFIRE_RESOURCE_LOCK*` | **no** — consumed before `Gpu::init()` and before the process takes its flocks, so they describe locks already held |
+| runtime | the four `HIPFIRE_SCHEDULER_*_BYTES` budgets | **yes** — they only size the ballast, which `release_placeholders`/`reacquire_placeholders` already re-apply |
+| per-request | `HIPFIRE_DFLASH_NGRAM_BLOCK`, `HIPFIRE_NORMALIZE_PROMPT` | belongs in the request, not in config |
+
+So `set_resource_budget` carries the middle row: optional fields (an omitted field
+leaves that budget alone), applied by release → update → reacquire, answering with
+the same payload as `resource_status`. The release/reacquire pair is the point —
+changing the numbers without re-applying would leave the daemon holding the old
+reservation while reporting the new budget.
+
+An attaching caller therefore pushes its budgets and accepts the daemon's locks as
+given, which is the correct division: the daemon holds those locks.
+
+Verified against a live daemon: 4 GiB budget / 1 GiB headroom → 3 GiB actually
+held; a headroom-only update left the budget intact and moved held to 2 GiB;
+restoring zero released it. Partial-update semantics are unit-tested, because a
+caller adjusting one field must not silently zero the others and drop the whole
+reservation.
+
+*Still blocking a server attach:* the per-request row. `routes/chat.rs` sets
+per-model DFlash/normalize behaviour by spawning a daemon with that environment, so
+it needs those as request fields before it can attach.
+
+
 `hipfire-scheduler` becomes a daemon dep. `batch_runner_loop`
 (`hipfire-server/src/batch_runner.rs:464`) moves to `daemon/src/executor.rs` with its LIFO
 `parked` stack and `Dispatch` classification. `batch_inbox` becomes the daemon's inbound

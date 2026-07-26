@@ -36,6 +36,45 @@ pub(crate) fn resource_status(daemon_state: &mut DaemonState) {
     daemon_state.out.emit(status);
 }
 
+/// Revise the memory budgets and re-apply the ballast reservation.
+///
+/// The release/reacquire pair is the whole point: changing the numbers without
+/// re-applying would leave the daemon holding the *old* reservation while
+/// reporting the new budget, so the figure a caller reads would not describe the
+/// memory actually held.
+///
+/// A release failure is reported and returns without reacquiring — better to hold
+/// nothing and say so than to reacquire against a budget whose old placeholders
+/// were never freed.
+pub(crate) fn set_resource_budget(
+    daemon_state: &mut DaemonState,
+    req: hipfire_daemon_protocol::SetResourceBudgetRequest,
+) {
+    if let Err(error) = daemon_state
+        .resource_reservations
+        .release_placeholders(&mut daemon_state.gpu)
+    {
+        daemon_state
+            .out
+            .error(format!("set_resource_budget: release failed: {error}"));
+        return;
+    }
+    daemon_state.resource_reservations.set_budgets(
+        req.system_memory_budget_bytes,
+        req.system_memory_headroom_bytes,
+        req.vram_budget_bytes,
+        req.vram_headroom_bytes,
+    );
+    if let Err(error) = daemon_state.reacquire_reservations() {
+        daemon_state
+            .out
+            .error(format!("set_resource_budget: reacquire failed: {error}"));
+        return;
+    }
+    let status = daemon_state.resource_reservations.status_json();
+    daemon_state.out.emit(status);
+}
+
 pub(crate) fn inventory(daemon_state: &mut DaemonState) {
     let inventory = daemon_accelerator_inventory(&mut daemon_state.gpu);
     let mut payload = serde_json::to_value(inventory)
