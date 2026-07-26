@@ -98,7 +98,14 @@ pub fn run(args: GenEnvDocsArgs) -> anyhow::Result<()> {
 
     if args.check {
         let mut stale = Vec::new();
-        check_file(&doc_path, markdown.as_bytes(), &mut stale);
+        // `docs/env-vars.md` is gitignored (185af67ab: it conflicted on every
+        // rebase) and regenerated on demand, so a clean checkout legitimately does
+        // not have it — CI included. Only enforce freshness when it is actually
+        // present; a stale copy is still worth reporting. The tracked registry
+        // module is always checked.
+        if doc_path.exists() {
+            check_file(&doc_path, markdown.as_bytes(), &mut stale);
+        }
         check_file(&rust_path, rust.as_bytes(), &mut stale);
         let missing = coverage_gaps(&root, &markdown);
 
