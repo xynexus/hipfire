@@ -192,7 +192,9 @@ def artifact_layout(
     # the roles and the quant are dot-separated groups inside the machine
     # section. See AGENTS.md "Artifact Names".
     primary_stem = f"{model_name}--{quant_format}"
-    roles = (["dflash"] if dflash_formats else []) + ["triattn"]
+    # Roles folded INTO the bundle are `+`-marked, so the bundle is not mistaken
+    # for a standalone sidecar of that role (AGENTS.md "Artifact Names").
+    roles = (["+dflash"] if dflash_formats else []) + ["+triattn"]
     bundle_stem = f"{model_name}--{'.'.join(roles)}.{quant_format}"
     work_dir = root / "induction" / primary_stem
     model_dir = model_dir or root / "models"

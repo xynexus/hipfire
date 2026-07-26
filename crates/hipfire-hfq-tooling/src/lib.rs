@@ -52,6 +52,25 @@ pub const KNOWN_ROLES: &[&str] = &[
     "mtp", "dflash", "triattn", "vl", "calib", "hessian", "jinja",
 ];
 
+/// Marks a role group as *embedded in this artifact* rather than naming the
+/// artifact's own role. `Model--dflash.oq8.hfq` IS a DFlash sidecar;
+/// `Model--+dflash.+triattn.oq8.hfq` is a model that CARRIES DFlash and
+/// TriAttention. Without the marker the two are indistinguishable by name.
+pub const EMBEDDED_ROLE_PREFIX: char = '+';
+
+/// The role named by a group that carries the embedded marker (`+dflash` ->
+/// `dflash`). `None` for unmarked groups and for unknown roles.
+pub fn embedded_role_group(group: &str) -> Option<&str> {
+    let role = group.strip_prefix(EMBEDDED_ROLE_PREFIX)?;
+    KNOWN_ROLES.contains(&role).then_some(role)
+}
+
+/// The role named by an *unmarked* group (`dflash` -> `dflash`), i.e. the
+/// artifact's own role. `None` for embedded-marked groups and unknown roles.
+pub fn sidecar_role_group(group: &str) -> Option<&str> {
+    (!group.starts_with(EMBEDDED_ROLE_PREFIX) && KNOWN_ROLES.contains(&group)).then_some(group)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ComposeCheckComponent {
     pub role: String,
@@ -595,8 +614,10 @@ pub fn sidecar_tag_from_filename(path: &Path) -> Option<String> {
         .strip_suffix(".hfq")
         .unwrap_or(&fname)
         .replace("--", ".");
+    // Only an UNMARKED role group names this file's own role. A `+`-marked group
+    // means the role is embedded in a bundle, which is not a sidecar.
     stem.split('.')
-        .find(|seg| KNOWN_ROLES.contains(seg))
+        .find_map(sidecar_role_group)
         .map(str::to_string)
 }
 
@@ -2107,8 +2128,19 @@ fn role_tags_from_filename(path: &Path) -> Vec<String> {
         .strip_suffix(".hfq")
         .unwrap_or(&fname)
         .replace("--", ".");
+    // Roles a BUNDLE carries are `+`-marked. Fall back to unmarked groups when
+    // the name has no marked ones, so bundles written before the marker existed
+    // still decompose.
+    let marked: Vec<String> = stem
+        .split('.')
+        .filter_map(embedded_role_group)
+        .map(str::to_string)
+        .collect();
+    if !marked.is_empty() {
+        return marked;
+    }
     stem.split('.')
-        .filter(|seg| KNOWN_ROLES.contains(seg))
+        .filter_map(sidecar_role_group)
         .map(str::to_string)
         .collect()
 }
@@ -2135,7 +2167,12 @@ fn strip_role_groups(fname: &str, roles: &[String]) -> String {
     let strip = |section: &str| -> String {
         section
             .split('.')
-            .filter(|seg| !roles.iter().any(|r| r.eq_ignore_ascii_case(seg)))
+            .filter(|seg| {
+                // A role group may be `+`-marked (embedded in a bundle) or bare
+                // (pre-marker bundles); strip either spelling.
+                let bare = seg.strip_prefix(EMBEDDED_ROLE_PREFIX).unwrap_or(seg);
+                !roles.iter().any(|r| r.eq_ignore_ascii_case(bare))
+            })
             .collect::<Vec<_>>()
             .join(".")
     };

@@ -2052,12 +2052,7 @@ fn model_sidecar_identity(model_file: &str) -> Option<String> {
         .unwrap_or(groups.len());
     let identity = groups[..quant_start]
         .iter()
-        .filter(|group| {
-            !matches!(
-                group.to_ascii_lowercase().as_str(),
-                "mtp" | "vl" | "dflash" | "triattn" | "jinja" | "hessian" | "npu"
-            )
-        })
+        .filter(|group| !is_feature_group(&group.to_ascii_lowercase()))
         .copied()
         .collect::<Vec<_>>()
         .join(".");
@@ -2230,8 +2225,12 @@ fn is_arch_group(group: &str) -> bool {
 }
 
 fn is_feature_group(group: &str) -> bool {
+    // A group may carry the embedded marker (`+dflash`) when the role lives
+    // inside a bundle rather than naming the artifact; either spelling is a
+    // feature group and neither belongs to the model identity.
+    let bare = group.strip_prefix('+').unwrap_or(group);
     matches!(
-        group,
+        bare,
         "mtp" | "vl" | "dflash" | "triattn" | "jinja" | "hessian" | "npu"
     )
 }

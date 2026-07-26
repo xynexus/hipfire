@@ -378,7 +378,7 @@ Merge a base `.hfq` and its role/feature sidecars into one bundled container (re
 
 ###### **Options:**
 
-* `-o`, `--output <OUTPUT>` — Output bundle path. Default: the base name with the sidecar feature dot-groups inserted before the quant token (e.g. `Model--mq4.hfq` + `Model.mtp.hfq` -> `Model--mtp.mq4.hfq`)
+* `-o`, `--output <OUTPUT>` — Output bundle path. Default: the base name with the sidecar feature dot-groups inserted before the quant token, each marked `+` because the role is now embedded rather than standalone (e.g. `Model--mq4.hfq` + `Model.mtp.hfq` -> `Model--+mtp.mq4.hfq`)
 * `--check` — Validate component roles, formats, architectures, geometry, lengths, digests, and reserved namespaces without writing a bundle
 * `--json` — Emit a machine-readable JSON report
 * `--overwrite` — Replace an existing output bundle. Without this flag compose fails closed when the destination exists

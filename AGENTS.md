@@ -72,8 +72,8 @@ A double hyphen `--` separates the human-readable model name from the
 machine-readable groups; periods separate groups within the machine section.
 Examples:
 - LFM2.5-1.2B-Thinking--bf16.hfq
-- Qwen3.5-122B-A10B--mtp.vl.mq2l.hfq
-- Gemma-4-8B-E4B-it-heretic-QAT--dflash.triattn.oq4++.gfx1151.hfq
+- Qwen3.5-122B-A10B--+mtp.+vl.mq2l.hfq (embedded MTP + VL)
+- Gemma-4-8B-E4B-it-heretic-QAT--+dflash.+triattn.oq4++.gfx1151.hfq
 - ModelName3.5-20B-it--dflash.oq4+.hfq (DFlash drafter sidecar — carries a quant,
   so it takes the boundary)
 - MedGemma-27B-it.triattn.hfq (quant-free role sidecar — plain dotted suffix, see below)
@@ -116,12 +116,17 @@ Notes:
 - Use dotted model versions such as `Qwen3.5`. do not use qwen35 for example.
 - Put calibration or transform modifiers that are not part of the quant token
   before it. Lloyd is part of the quant token: use `mq3l`, not `lloyd-mq3`.
-- Do not use `+` for bundled roles or feature sidecars. Encode each feature as
-  its own dot group after the `--` boundary and before the quant token, for
-  example `Model--mtp.vl.mq4.hfq` or `Model--dflash.triattn.oq4++.hfq`.
+- Prefix a role group with `+` when the role is EMBEDDED in the artifact rather
+  than naming it. `Model--dflash.oq8.hfq` *is* a DFlash sidecar;
+  `Model--+dflash.+triattn.oq8.hfq` is a model that *carries* DFlash and
+  TriAttention. Without the marker the two are indistinguishable by filename.
+  Each embedded feature is its own `+`-marked dot group after the `--` boundary
+  and before the quant token, e.g. `Model--+mtp.+vl.mq4.hfq`.
+  The `+` here is a prefix on a role; the `+`/`++` in a quant token
+  (`oq4+`, `oq4++`) is a suffix on the quant, so the two never collide.
 - Use role sidecars when loaded independently. A sidecar carrying its own quant
   takes the boundary and the quant as machine groups
-  (`Model--dflash.oq4+.hfq`, `Model--mtp.mq4.hfq`); a quant-free sidecar keeps
+  (`Model--dflash.oq4+.hfq`, `Model--mtp.mq4.hfq`; embedded in a bundle they become `+dflash` / `+mtp`); a quant-free sidecar keeps
   the plain dotted role suffix (`.triattn.hfq`, `.jinja.`, `.hessian`).
 - The quant should detail the weight encoding. eg. Lloyd MQ2 uses `--mq2l.hfq`,
   Magnum uses `--mq4.hfq`
