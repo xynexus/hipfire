@@ -250,7 +250,21 @@ independently revertible.
 still serial. Collapse the 25-line `activate_model_worker` block duplicated at
 `main.rs:4173, 4226, 4283, 4951, 5074, 5141, 5189, 5270, 5427, 5485` into one helper.
 
-*Exit:* byte-identical generation output; no behavior change.
+*Exit (met):* byte-identical generation, verified on GPU. Pre-hoist `0b53dd402`
+against `a29618ba6`, greedy on medgemma-27b-vl, three prompts x 64 tokens — 27/48/41
+tokens and 27/263/152 chars, identical on every one.
+
+The span is wider than this stage: it covers the whole branch (hoist, handler split,
+id stamping, `dyn Write` sink, socket transport, cancellation hooks, priority
+scheduler), so all of it leaves generation unchanged, not just the hoist.
+
+Compared the token STREAM rather than raw frames deliberately — M2a added an `id` to
+frames that previously had none, so frame-level equality would report protocol
+metadata as a behavioural difference.
+
+Not covered: one model family only (gemma3-vl), greedy only, short generations. The
+qwen35/deepseek4/lfm2 paths, sampling, long contexts and the batched prefill/decode
+RPCs are untested by this.
 
 ### M2 — Protocol: id correlation + typed responses
 
