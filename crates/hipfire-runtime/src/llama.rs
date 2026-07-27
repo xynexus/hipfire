@@ -20,6 +20,70 @@ use hipfire_rdna::{DType, Gpu, GpuTensor};
 pub use crate::dispatch::gemv_family;
 pub use hipfire_primitives::conv::f16_to_f32;
 
+use hipfire_rdna::lmhead_twostage::{
+    build_lmhead_coarse_bf16, lmhead_twostage_serve_bf16, LmheadCoarse,
+};
+use std::cell::RefCell;
+
+thread_local! {
+    // (lm_head buf ptr, coarse tier, vocab, hidden) — the coarse shortlist tier is
+    // built once per resident bf16 lm_head and reused across decode steps. Rebuilt
+    // when the head pointer changes (model swap).
+    static LMHEAD_COARSE: RefCell<Option<(usize, LmheadCoarse, usize, usize)>> =
+        const { RefCell::new(None) };
+}
+
+/// Parse `HIPFIRE_LMHEAD_TWOSTAGE` → (coarse bits, top-K). Presets: `q4` / `1` =
+/// 4-bit coarse, K=32; `q2` = 2-bit, K=2048. Append `:<K>` to override K
+/// (e.g. `q4:64`). Absent → the exact full lm_head. OFF by default.
+fn lmhead_twostage_cfg() -> Option<(usize, usize)> {
+    let v = std::env::var("HIPFIRE_LMHEAD_TWOSTAGE").ok()?;
+    let (bits, base_k, rest) = if let Some(r) = v.strip_prefix("q2") {
+        (2usize, 2048usize, r)
+    } else if let Some(r) = v.strip_prefix("q4") {
+        (4, 32, r)
+    } else if v == "1" {
+        (4, 32, "")
+    } else {
+        return None;
+    };
+    let k = rest
+        .strip_prefix(':')
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(base_k)
+        .max(1);
+    Some((bits, k))
+}
+
+/// lm_head projection with an optional coarse-shortlist + fine-rescore fast path
+/// gated by `HIPFIRE_LMHEAD_TWOSTAGE`. Falls back to the exact `weight_gemv` when
+/// the env is unset or the head is not bf16. The two-stage path is **greedy-exact**
+/// (recall@1 = 1.0 at K=32 on real lm_heads) but truncates the tail to the
+/// shortlist, so it is a decode/argmax fast path — the eval/scoring paths simply
+/// leave the env unset to keep full-distribution logits.
+fn lmhead_project(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
+    if let Some((bits, topk)) = lmhead_twostage_cfg() {
+        if w.gpu_dtype == DType::BF16 {
+            let (vocab, hidden) = (w.m, w.k);
+            let ptr = w.buf.buf.as_ptr() as usize;
+            let stale =
+                LMHEAD_COARSE.with(|c| c.borrow().as_ref().map(|(p, ..)| *p) != Some(ptr));
+            if stale {
+                let coarse = build_lmhead_coarse_bf16(gpu, &w.buf, vocab, hidden, bits)
+                    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+                LMHEAD_COARSE.with(|c| *c.borrow_mut() = Some((ptr, coarse, vocab, hidden)));
+            }
+            return LMHEAD_COARSE.with(|c| {
+                let b = c.borrow();
+                let (_, coarse, v, h) = b.as_ref().unwrap();
+                lmhead_twostage_serve_bf16(gpu, &w.buf, coarse, x, y, *v, *h, topk)
+                    .map_err(|e| hip_bridge::HipError::new(0, &e))
+            });
+        }
+    }
+    weight_gemv(gpu, w, x, y)
+}
+
 /// Model architecture type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelArch {
@@ -347,7 +411,7 @@ pub fn prefill_forward(
         gpu.hip
             .memcpy_dtod_at(&x_last.buf, 0, &x_batch.buf, last_off, dim * 4)?;
         gpu.rmsnorm_f32(&x_last, &weights.output_norm, &tmp, config.norm_eps)?;
-        weight_gemv(gpu, &weights.output, &tmp, &logits)?;
+        lmhead_project(gpu, &weights.output, &tmp, &logits)?;
         gpu.download_f32(&logits)
     })();
 
@@ -639,7 +703,7 @@ pub fn forward_prefill_batch(
             &scratch.tmp,
             config.norm_eps,
         )?;
-        weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+        lmhead_project(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
         Ok(())
     })();
 
@@ -740,7 +804,7 @@ pub fn forward_prefill_batch_capture(
             &scratch.tmp,
             config.norm_eps,
         )?;
-        weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+        lmhead_project(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
         Ok(())
     })();
 
@@ -2221,7 +2285,7 @@ pub fn forward_scratch_layers(
         &scratch.tmp,
         config.norm_eps,
     )?;
-    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+    lmhead_project(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
 
     // GPU-side sampling (includes sync readback — can't be in graph capture)
     gpu.sample_top_p(
@@ -2417,7 +2481,7 @@ pub fn forward_early_exit(
                 &scratch.tmp,
                 config.norm_eps,
             )?;
-            weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+            lmhead_project(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
 
             // GPU-side confidence check: compute max(softmax) on GPU, download 4 bytes
             gpu.max_prob(&scratch.logits, &scratch.sample_buf, config.vocab_size)?;
@@ -2452,7 +2516,7 @@ pub fn forward_early_exit(
         &scratch.tmp,
         config.norm_eps,
     )?;
-    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+    lmhead_project(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
     let (tok, rng) = gpu.sample_top_p(
         &scratch.logits,
         &scratch.sample_buf,
@@ -2744,7 +2808,7 @@ pub fn forward_scratch_compute(
         &scratch.tmp,
         config.norm_eps,
     )?;
-    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+    lmhead_project(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
     Ok(())
 }
 
@@ -3064,7 +3128,7 @@ pub fn forward_scratch_compute_capture(
         &scratch.tmp,
         config.norm_eps,
     )?;
-    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+    lmhead_project(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
     Ok(())
 }
 
@@ -3231,7 +3295,7 @@ pub fn forward(
 
         // Logits: output = output_weight * x
         let logits = gpu.alloc_owned(&[config.vocab_size], DType::F32)?;
-        weight_gemv(gpu, &weights.output, &tmp, &logits)?;
+        lmhead_project(gpu, &weights.output, &tmp, &logits)?;
         gpu.download_f32(&logits)
     })();
 
@@ -3419,7 +3483,7 @@ fn forward_logits_gpu(
         // `logits` is returned to the caller, so it stays a plain pooled tensor
         // (the caller owns + frees it); free it here only on the gemv error path.
         let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
-        match weight_gemv(gpu, &weights.output, &tmp, &logits) {
+        match lmhead_project(gpu, &weights.output, &tmp, &logits) {
             Ok(()) => Ok(logits),
             Err(e) => {
                 let _ = gpu.free_tensor(logits);
