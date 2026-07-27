@@ -73,6 +73,7 @@ mod gemm_misc;
 mod gemm_qkv;
 mod gemv;
 mod kv;
+pub mod lmhead_twostage;
 mod mamba2;
 mod misc;
 mod moe;
