@@ -1539,6 +1539,13 @@ pub fn generate_multi(
     let loop_guard = loop_guard_from_runtime_config();
 
     while generated < max_tokens {
+        // Cooperative cancellation (SIGUSR1). Same KV-safe top-of-loop chokepoint
+        // as the single-GPU path: all committed tokens are already written across
+        // the pipeline, the pending `next_token` is not — dropping it leaves the
+        // multi-GPU KV consistent, identical to a natural `max_tokens` stop.
+        if hipfire_runtime::take_generation_cancel() {
+            break;
+        }
         generated += 1;
         m.active.cursor.conversation_tokens.push(next_token);
         streamed_tokens.push(next_token);
@@ -3063,6 +3070,16 @@ pub fn generate(
         // (which increments `generated` beyond the iteration count) can't
         // push generated past max_tokens: each loop start rechecks the cap.
         while generated < max_tokens {
+            // Cooperative cancellation (SIGUSR1 → GENERATION_CANCEL). KV-safe
+            // chokepoint: at loop top every prior token's K/V has been written
+            // via forward_scratch and seq_pos advanced; the pending `next_token`
+            // is sampled but not yet written. Breaking here drops only that
+            // unwritten sample, so the cache/session stay consistent — identical
+            // to a natural `max_tokens` stop — and the done frame below is
+            // emitted normally.
+            if hipfire_runtime::take_generation_cancel() {
+                break;
+            }
             generated += 1;
             session.cursor.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);

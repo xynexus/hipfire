@@ -3176,6 +3176,14 @@ struct DrafterTrainSession {
 }
 
 fn main() {
+    // Cooperative generation cancellation: install the SIGUSR1 handler so the
+    // HTTP server can abort an in-flight generation (on client disconnect)
+    // without SIGKILL-ing this worker and destroying the loaded model. The
+    // handler only sets a process-global atomic (async-signal-safe); the
+    // per-token decode loops poll it and stop cleanly. See
+    // `hipfire_runtime::GENERATION_CANCEL`.
+    hipfire_runtime::install_generation_cancel_handler();
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -4267,6 +4275,13 @@ fn main() {
             }
 
             DaemonRequest::Generate(_) => {
+                // Clear any stale cancel request before starting a fresh
+                // generation. A SIGUSR1 delivered after the previous request
+                // already finished (e.g. a disconnect that raced the terminal
+                // `done`) must not immediately cancel this new request. The
+                // single serial worker guarantees no other generation is in
+                // flight here, so this reset is race-free.
+                hipfire_runtime::reset_generation_cancel();
                 // Explicit per-request raw-prompt override (optional `"raw"`
                 // bool). Absent → None → auto default (raw iff no chat_template).
                 // Always set, so it resets every request (no cross-request leak).

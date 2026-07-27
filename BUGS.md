@@ -39,7 +39,32 @@ into full investigations here.
   re-injected, weights byte-identical); with this fix, re-quantizing from a v2
   bf16 source now embeds them correctly at emit time.
 - Confidence: High (root-caused, unit-tested; re-quant end-to-end recommended).
-## [Open] hipfire-daemon inference worker crashes under model-swap churn (GPU fault)
+## [RESOLVED] hipfire-daemon inference worker killed on client disconnect (was theorized as "GPU fault under model-swap churn")
+- TRUE ROOT CAUSE (confirmed): a client closing the socket mid-generation, NOT
+  model-swap churn. On cancel, chat.rs `execute_blocking_chat_cancellable` hits
+  `Ok(None)` and `drop(engine)`s the `DaemonEngine`; `StdioTransport` is spawned
+  `kill_on_drop(true)`, so the drop SIGKILLs the whole worker (destroying the
+  loaded model; recovery was a lazy reload / "Broken pipe"). Intermittent because
+  the disconnect must land while generating; no dmesg trace because SIGKILL(9)
+  leaves none. The "model-swap churn / GPU fault" below was a red herring from an
+  aggressive repro hammer — real trigger is disconnect (e.g. a coding agent
+  `pkill`ing a request, or a client timeout).
+- FIX: cooperative cancellation. The daemon installs a SIGUSR1 handler that sets
+  a process-global `GENERATION_CANCEL: AtomicBool` (async-signal-safe: atomic
+  store only); the shared decode loop (`arch.rs decode_loop_with_timing_terminators`
+  + the qwen35 / multi-GPU loops) checks it at loop TOP (KV-safe: identical to a
+  natural max_tokens stop, drops only the un-written pending sample) and stops,
+  emitting a normal terminal `done`. The frontend, on disconnect, sends SIGUSR1 to
+  the worker (`DaemonEngine::abort_and_drain` → `libc::kill`) and drains to the
+  (now-fast) terminal event, then RESTORES the engine instead of dropping it —
+  worker + model stay resident. Verified on gfx1103: worker PID stable across
+  10+ disconnects (was killed in 1–2), post-disconnect request in ~0.16–0.78 s
+  (proves the gen was cancelled, not run to max on the serial worker), normal gen
+  unaffected. NOT covered (fall back to the old drop): spec-decode (mtp/dflash)
+  and VL loops (multi-token-per-iter, not provably KV-safe to break) — a
+  follow-up. Related: the worker still does not auto-respawn; #204 added durable
+  `~/.hipfire/daemon.log` + honest `degraded` status.
+- --- earlier (INCORRECT) hypothesis, kept for the record ---
 - Category: Reliability / Correctness (worker process)
 - Location: hipfire-daemon worker (spawned by `hipfire serve` via
   crates/hipfire-daemon-adapter/src/lib.rs); GPU load/unload + decode path.
