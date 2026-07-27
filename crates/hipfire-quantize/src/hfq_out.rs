@@ -59,6 +59,94 @@ pub struct HfqStreamTensor {
     pub data_len: u64,
 }
 
+/// Lossless BF16 storage codec, selected by `hipfire-quantize --bf16-codec`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bf16Codec {
+    /// Store plain `QuantType::BF16` (the historical behavior).
+    None,
+    /// Huffman-coded exponent, `QuantType::Bf16Huff` — ~1.5x, the disk format.
+    Huff,
+    /// 3-bit-LUT exponent, `QuantType::Bf16Lut3` — ~1.38x, also GPU-decodable.
+    Lut3,
+}
+
+impl Bf16Codec {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "none" | "off" => Some(Self::None),
+            "huff" | "huffman" => Some(Self::Huff),
+            "lut3" => Some(Self::Lut3),
+            _ => None,
+        }
+    }
+}
+
+/// Outcome of [`compress_bf16_tensors`], for the caller's log line.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Bf16CompressStats {
+    pub compressed: usize,
+    /// Tensors left as plain BF16 because packing them would not be smaller.
+    pub not_smaller: usize,
+    /// Tensors whose bytes were already spilled to disk and so could not be
+    /// recoded in place.
+    pub skipped_spilled: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+/// Recode plain-BF16 tensors with the selected lossless codec, in place.
+///
+/// Run this **immediately before writing** and after every transform pass.
+/// Several passes (AWQ pre-scale, roughquant PCA rotation) read `t.data` back as
+/// raw bf16 pairs and are gated on `quant_type == BF16`; compressing earlier
+/// would make them silently skip the tensor rather than fail loudly.
+///
+/// Both codecs are exactly lossless and the loader expands them back to plain
+/// BF16, so this changes file size only — never model behavior. A tensor that
+/// does not actually get smaller (an `XᵀX` Hessian spreads over too many
+/// exponents to win) is left as plain BF16.
+///
+/// Tensors already spilled to disk are skipped: `TensorSpill` is append-only and
+/// rejects re-spilling a name, so their bytes cannot be replaced in place. The
+/// count is reported so a caller can see when spilling cost it compression.
+pub fn compress_bf16_tensors(tensors: &mut [HfqTensor], codec: Bf16Codec) -> Bf16CompressStats {
+    let mut stats = Bf16CompressStats::default();
+    if codec == Bf16Codec::None {
+        return stats;
+    }
+    for t in tensors.iter_mut() {
+        if t.quant_type != QuantType::BF16 {
+            continue;
+        }
+        if t.spilled_len > 0 {
+            stats.skipped_spilled += 1;
+            continue;
+        }
+        if t.data.is_empty() {
+            continue;
+        }
+        let packed = match codec {
+            Bf16Codec::Huff => hipfire_primitives::bf16_huff::encode_if_smaller(&t.data),
+            Bf16Codec::Lut3 => hipfire_primitives::bf16_lut3::encode_if_smaller(&t.data),
+            Bf16Codec::None => None,
+        };
+        match packed {
+            Some(packed) => {
+                stats.compressed += 1;
+                stats.bytes_before += t.data.len() as u64;
+                stats.bytes_after += packed.len() as u64;
+                t.data = packed;
+                t.quant_type = match codec {
+                    Bf16Codec::Huff => QuantType::Bf16Huff,
+                    _ => QuantType::Bf16Lut3,
+                };
+            }
+            None => stats.not_smaller += 1,
+        }
+    }
+    stats
+}
+
 pub fn tensor_param_count(t: &HfqTensor) -> u64 {
     t.shape
         .iter()
@@ -1761,5 +1849,110 @@ mod tests {
         assert_eq!(offsets[1] % 4096, 0);
         assert_eq!(offsets[2] % 32, 0);
         assert_eq!(modules["modules"][0]["data_offset"], offsets[1]);
+    }
+
+    /// Deterministic Gaussian-ish bf16 weights — realistic exponent spread.
+    fn bf16_weights(n: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed;
+        let mut out = Vec::with_capacity(n * 2);
+        for _ in 0..n {
+            let mut acc = 0i64;
+            for _ in 0..4 {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                acc += (s % 2048) as i64;
+            }
+            let bits = hipfire_primitives::conv::f32_to_bf16_bits((acc - 4094) as f32 * 1e-4);
+            out.extend_from_slice(&bits.to_le_bytes());
+        }
+        out
+    }
+
+    fn tensor(name: &str, data: Vec<u8>, qt: QuantType) -> HfqTensor {
+        let n = (data.len() / 2) as u32;
+        HfqTensor {
+            name: name.to_string(),
+            quant_type: qt,
+            shape: vec![n],
+            group_size: 1,
+            data,
+            spilled_len: 0,
+        }
+    }
+
+    #[test]
+    fn bf16_codec_recodes_losslessly_and_leaves_others_alone() {
+        for (codec, want_qt) in [
+            (Bf16Codec::Huff, QuantType::Bf16Huff),
+            (Bf16Codec::Lut3, QuantType::Bf16Lut3),
+        ] {
+            let raw = bf16_weights(40_000, 0x1234_5678);
+            let f32ish = vec![7u8; 4096];
+            let mut tensors = vec![
+                tensor("w", raw.clone(), QuantType::BF16),
+                // A non-BF16 tensor must pass through completely untouched.
+                tensor("other", f32ish.clone(), QuantType::F32),
+            ];
+            let stats = compress_bf16_tensors(&mut tensors, codec);
+
+            assert_eq!(stats.compressed, 1, "{codec:?}");
+            assert_eq!(tensors[0].quant_type, want_qt);
+            assert_eq!(tensors[1].quant_type, QuantType::F32);
+            assert_eq!(tensors[1].data, f32ish, "non-BF16 tensor was modified");
+            assert!(
+                tensors[0].data.len() < raw.len(),
+                "{codec:?} did not shrink the tensor"
+            );
+
+            // The whole contract: decoding must reproduce the input exactly.
+            let n = raw.len() / 2;
+            let back = match codec {
+                Bf16Codec::Huff => hipfire_primitives::bf16_huff::decode(&tensors[0].data, n),
+                _ => hipfire_primitives::bf16_lut3::decode(&tensors[0].data, n),
+            };
+            assert_eq!(back.as_deref(), Some(raw.as_slice()), "{codec:?} lossy");
+        }
+    }
+
+    #[test]
+    fn bf16_codec_none_is_a_no_op() {
+        let raw = bf16_weights(4_000, 99);
+        let mut tensors = vec![tensor("w", raw.clone(), QuantType::BF16)];
+        let stats = compress_bf16_tensors(&mut tensors, Bf16Codec::None);
+        assert_eq!(stats.compressed, 0);
+        assert_eq!(tensors[0].quant_type, QuantType::BF16);
+        assert_eq!(tensors[0].data, raw);
+    }
+
+    #[test]
+    fn bf16_codec_declines_when_it_would_not_shrink() {
+        // Every exponent used uniformly: too many symbols to win. Storing a
+        // larger "compressed" tensor would be strictly worse, so it must stay
+        // plain BF16 rather than grow.
+        let raw: Vec<u8> = (0..40_000u32)
+            .flat_map(|i| ((((i % 256) as u16) << 7) | 0x3f).to_le_bytes())
+            .collect();
+        let mut tensors = vec![tensor("w", raw.clone(), QuantType::Bf16Lut3)];
+        tensors[0].quant_type = QuantType::BF16;
+        let stats = compress_bf16_tensors(&mut tensors, Bf16Codec::Lut3);
+        assert_eq!(stats.compressed, 0);
+        assert_eq!(stats.not_smaller, 1);
+        assert_eq!(tensors[0].quant_type, QuantType::BF16);
+        assert_eq!(tensors[0].data, raw);
+    }
+
+    #[test]
+    fn bf16_codec_skips_spilled_tensors_rather_than_corrupting_them() {
+        // A spilled tensor's bytes live in the spill file and cannot be replaced
+        // in place; recoding the empty `data` would emit a zero-length tensor.
+        let mut t = tensor("w", Vec::new(), QuantType::BF16);
+        t.spilled_len = 4096;
+        let mut tensors = vec![t];
+        let stats = compress_bf16_tensors(&mut tensors, Bf16Codec::Huff);
+        assert_eq!(stats.compressed, 0);
+        assert_eq!(stats.skipped_spilled, 1);
+        assert_eq!(tensors[0].quant_type, QuantType::BF16);
+        assert_eq!(tensors[0].spilled_len, 4096);
     }
 }

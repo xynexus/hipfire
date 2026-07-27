@@ -15,5 +15,7 @@
 //! Keep this crate a zero-dependency leaf: only add primitives that are
 //! genuinely cross-cutting and free of external deps.
 
+pub mod bf16_huff;
+pub mod bf16_lut3;
 pub mod conv;
 pub mod fwht;

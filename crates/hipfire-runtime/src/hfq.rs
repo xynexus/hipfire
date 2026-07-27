@@ -11,6 +11,7 @@ use crate::safetensors_source::SafetensorsSource;
 use crate::weights::{EmbeddingFormat, LayerWeights, WeightTensor};
 use hip_bridge::{HipError, HipResult};
 use hipfire_model::{ModelSource, QuantConfig, TensorInfo};
+use hipfire_quant_format::{storage, QuantType};
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -727,6 +728,72 @@ pub struct HfqFile {
     /// Parallel to `tensors`: the physical `(shard, offset, len)` of each
     /// tensor's bytes within `st_source`. Empty for file-backed HFQM opens.
     st_locs: Vec<StLoc>,
+    /// Parallel to `tensors`: for a compressed-BF16 tensor being transparently
+    /// expanded, the `(stored quant_type, offset, len)` of its packed bytes in
+    /// the file. `None` for every normally-stored tensor.
+    ///
+    /// Lives here rather than on [`HfqTensorInfo`] so the index entry can present
+    /// the *logical* view — `quant_type == 16`, `data_size == n * 2` — and every
+    /// existing BF16 consumer keeps working untouched, while file-range users
+    /// (layer paging, pread) still get the real compressed extent.
+    bf16_packed: Vec<Option<(u8, usize, usize)>>,
+}
+
+/// Keep GPU-decodable recodings packed in RAM instead of expanding them at load.
+///
+/// Off by default: expanding costs more RAM but needs no kernel support, so every
+/// existing consumer keeps working. Turn it on only for models served through
+/// kernels that decode the packed form natively (`gemv_bf16l3`), where it also
+/// buys ~1.18x weight bandwidth — but only once the working set exceeds the GPU's
+/// last-level cache; below that it is a measured slowdown.
+///
+/// Only [`QuantType::Bf16Lut3`] can stay resident. Huffman codes are bit-serial,
+/// so `Bf16Huff` is always expanded regardless of this flag.
+fn bf16l3_resident() -> bool {
+    std::env::var_os("HIPFIRE_BF16L3_RESIDENT").is_some_and(|v| v != "0")
+}
+
+/// Rewrite losslessly-recoded index entries to their logical view, returning the
+/// physical extents. Which types are recodings, what they expand to, and how long
+/// the expansion is all come from `hipfire_quant_format::storage` — the one place
+/// that knowledge lives, so a new codec cannot be invisible here.
+fn expand_bf16_index(tensors: &mut [HfqTensorInfo]) -> Vec<Option<(u8, usize, usize)>> {
+    let resident = bf16l3_resident();
+    tensors
+        .iter_mut()
+        .map(|t| {
+            let stored = QuantType::from_code(t.quant_type)?;
+            if !stored.is_lossless_recoding() {
+                return None;
+            }
+            // Residency opts a GPU-decodable coding out of expansion.
+            if resident && stored == QuantType::Bf16Lut3 {
+                return None;
+            }
+            let physical = (t.quant_type, t.data_offset, t.data_size);
+            let n: usize = t.shape.iter().map(|&d| d as usize).product();
+            t.data_size = stored.logical_byte_len(n)?;
+            t.quant_type = stored.logical() as u8;
+            Some(physical)
+        })
+        .collect()
+}
+
+/// Decode a recoded payload back to its logical bytes.
+///
+/// Huffman decode is bit-serial (~600 MB/s/core), so a full artifact would take
+/// minutes on one thread; it is spread across cores using the format's chunk
+/// table. Byte-aligned codings ignore the thread count.
+fn decode_bf16_packed(stored_qt: u8, packed: &[u8], n: usize) -> Option<Vec<u8>> {
+    let stored = QuantType::from_code(stored_qt)?;
+    storage::expand(stored, packed, n, decode_threads()).map(|b| b.into_owned())
+}
+
+/// Threads used to expand a bit-serial payload. Every core, always — decode is
+/// pure compute over independent chunks and reaches ~21 GB/s here, well past any
+/// disk it overlaps with, so there is nothing worth tuning.
+fn decode_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |p| p.get())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -793,6 +860,8 @@ impl HfqFile {
         if !modules.is_empty() {
             validate_modules(&modules, file_len)?;
         }
+        let mut tensors = tensors;
+        let bf16_packed = expand_bf16_index(&mut tensors);
         Ok(Self {
             _file: file,
             path: path.to_path_buf(),
@@ -806,6 +875,7 @@ impl HfqFile {
             modules,
             st_source: None,
             st_locs: Vec::new(),
+            bf16_packed,
         })
     }
 
@@ -900,6 +970,8 @@ impl HfqFile {
             validate_modules(&modules, mmap.len())?;
         }
 
+        let mut tensors = tensors;
+        let bf16_packed = expand_bf16_index(&mut tensors);
         Ok(Self {
             _file: file,
             path: path.to_path_buf(),
@@ -913,6 +985,7 @@ impl HfqFile {
             modules,
             st_source: None,
             st_locs: Vec::new(),
+            bf16_packed,
         })
     }
 
@@ -1028,12 +1101,15 @@ impl HfqFile {
             mmap: None,
             arch_id,
             metadata_json,
-            tensors,
             tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
             version: HFQM_VERSION,
             modules: Vec::new(),
             st_source: Some(source),
+            // Safetensors-backed tensors are never compressed: the dtype comes
+            // straight from the shard headers.
+            bf16_packed: vec![None; tensors.len()],
+            tensors,
             st_locs,
         })
     }
@@ -1164,6 +1240,17 @@ impl HfqFile {
     pub fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
+        // A BF16L3 tensor's bytes are compressed; there is no BF16 buffer in the
+        // file to borrow. Returning the packed bytes here would hand back
+        // garbage tagged as BF16, so refuse and make the caller use the owned
+        // path (`tensor_data_vec` / `tensor_data_pread`), which decodes.
+        if self.bf16_packed[idx].is_some() {
+            debug_assert!(
+                false,
+                "tensor_data() on compressed-BF16 tensor {name} — use tensor_data_vec()/_pread()"
+            );
+            return None;
+        }
         if let Some(source) = &self.st_source {
             let loc = self.st_locs[idx];
             return Some((info, source.shard_bytes(loc.shard, loc.offset, loc.len)?));
@@ -1205,17 +1292,20 @@ impl HfqFile {
             return Some((info, self.pread_buf.borrow()));
         }
         let fd = self._file.as_raw_fd();
+        // Read the physical extent — compressed for a BF16L3 tensor, whose
+        // `info.data_size` already advertises the expanded length.
+        let (phys_off, phys_len) = self.physical_range(idx);
         {
             let mut buf = self.pread_buf.borrow_mut();
-            buf.resize(info.data_size, 0);
+            buf.resize(phys_len, 0);
             let mut total_read = 0usize;
-            while total_read < info.data_size {
+            while total_read < phys_len {
                 let n = unsafe {
                     libc::pread(
                         fd,
                         buf[total_read..].as_mut_ptr() as *mut libc::c_void,
-                        info.data_size - total_read,
-                        (info.data_offset + total_read) as libc::off_t,
+                        phys_len - total_read,
+                        (phys_off + total_read) as libc::off_t,
                     )
                 };
                 if n <= 0 {
@@ -1224,7 +1314,10 @@ impl HfqFile {
                 total_read += n as usize;
             }
             // Evict these pages from cache — works because pread doesn't hold a mapping.
-            fadvise_dontneed(fd, info.data_offset, info.data_size);
+            fadvise_dontneed(fd, phys_off, phys_len);
+            if let Some((qt, _, _)) = self.bf16_packed[idx] {
+                *buf = decode_bf16_packed(qt, &buf, info.data_size / 2)?;
+            }
         }
         Some((info, self.pread_buf.borrow()))
     }
@@ -1254,15 +1347,18 @@ impl HfqFile {
         {
             use std::os::unix::io::AsRawFd;
             let fd = self._file.as_raw_fd();
-            let mut buf = vec![0u8; info.data_size];
+            // Physical extent: compressed for BF16L3, whose `info.data_size`
+            // already advertises the expanded length.
+            let (phys_off, phys_len) = self.physical_range(idx);
+            let mut buf = vec![0u8; phys_len];
             let mut total_read = 0usize;
-            while total_read < info.data_size {
+            while total_read < phys_len {
                 let n = unsafe {
                     libc::pread(
                         fd,
                         buf[total_read..].as_mut_ptr() as *mut libc::c_void,
-                        info.data_size - total_read,
-                        (info.data_offset + total_read) as libc::off_t,
+                        phys_len - total_read,
+                        (phys_off + total_read) as libc::off_t,
                     )
                 };
                 if n <= 0 {
@@ -1270,7 +1366,10 @@ impl HfqFile {
                 }
                 total_read += n as usize;
             }
-            fadvise_dontneed(fd, info.data_offset, info.data_size);
+            fadvise_dontneed(fd, phys_off, phys_len);
+            if let Some((qt, _, _)) = self.bf16_packed[idx] {
+                buf = decode_bf16_packed(qt, &buf, info.data_size / 2)?;
+            }
             return Some((info, buf));
         }
 
@@ -1310,10 +1409,14 @@ impl HfqFile {
         let needle = format!("{prefix}.");
         let mut lo = usize::MAX;
         let mut hi = 0usize;
-        for t in &self.tensors {
+        for (i, t) in self.tensors.iter().enumerate() {
             if t.name.contains(&needle) {
-                lo = lo.min(t.data_offset);
-                hi = hi.max(t.data_offset + t.data_size);
+                // Physical extent: a BF16L3 tensor's file range is its
+                // compressed length, not the expanded `data_size`. Using the
+                // latter would over-cover and evict the next tensor's pages.
+                let (off, len) = self.physical_range(i);
+                lo = lo.min(off);
+                hi = hi.max(off + len);
             }
         }
         if lo < hi {
@@ -1321,6 +1424,29 @@ impl HfqFile {
         } else {
             None
         }
+    }
+
+    /// The tensor's real byte extent in the file. For a transparently expanded
+    /// BF16L3 tensor this is the compressed range, which is what page-eviction
+    /// hints and raw reads need — `info.data_size` is the expanded length.
+    fn physical_range(&self, idx: usize) -> (usize, usize) {
+        match self.bf16_packed[idx] {
+            Some((_, off, len)) => (off, len),
+            None => (self.tensors[idx].data_offset, self.tensors[idx].data_size),
+        }
+    }
+
+    /// Whether this tensor is stored BF16L3-compressed on disk and expanded on
+    /// read. Such a tensor cannot be slab-loaded or mmap-borrowed: its file
+    /// bytes are not the BF16 buffer the index advertises.
+    pub fn is_bf16_expanded(&self, name: &str) -> bool {
+        self.resolve_idx(name)
+            .is_some_and(|i| self.bf16_packed[i].is_some())
+    }
+
+    /// True if any tensor is a transparently expanded compressed-BF16 tensor.
+    pub fn has_bf16_expanded(&self) -> bool {
+        self.bf16_packed.iter().any(|p| p.is_some())
     }
 
     fn find_tensor(&self, name: &str) -> Option<&HfqTensorInfo> {
@@ -1353,7 +1479,11 @@ impl HfqFile {
     /// fall back to the per-tensor `tensor_data_vec` path, which serves from
     /// the shard mmaps.
     pub fn supports_slab_load(&self) -> bool {
-        self.st_source.is_none()
+        // A BF16L3 tensor needs a CPU decode between file and VRAM, which the
+        // slab loader's raw file→GPU copy cannot do. Fall back to the
+        // per-tensor path for the whole file rather than silently uploading
+        // compressed bytes tagged as BF16.
+        self.st_source.is_none() && !self.has_bf16_expanded()
     }
 
     pub fn modules(&self) -> &[HfqModuleRecord] {
