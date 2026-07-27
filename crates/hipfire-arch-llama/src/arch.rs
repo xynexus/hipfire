@@ -157,20 +157,23 @@ impl LlamaBackend {
 
 impl SimpleAr for LlamaBackend {
     fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {
-        // Leaves the final-position logits in `scratch.logits`; the batched path
-        // falls back to a per-token embed+compute loop for short/ineligible
-        // prompts, so any token slice is safe.
-        llama::forward_prefill_batch(
-            gpu,
-            &self.weights,
-            &self.config,
-            tokens,
-            0,
-            &mut self.kv_cache,
-            &self.scratch,
-            None,
-        )
-        .map_err(|e| format!("llama prefill forward_prefill_batch: {e:?}"))
+        // Route through `prefill_forward` (attention_causal_batched) rather than
+        // `forward_prefill_batch` (the flash/masked `forward_prefill_chunk` path).
+        // BOTH are batched and — since the bf16/f16 projection gap in
+        // `forward_prefill_chunk` was fixed (BUGS.md) — numerically correct
+        // (bisection cosine 0.9998+ vs the per-token reference). `prefill_forward`
+        // is kept because it benches marginally faster: a clean same-build A/B on
+        // gfx1103 / MiniCPM5-1B.bf16 gave pp512 602 t/s here vs 581 t/s for the
+        // chunked path (tg128 identical).
+        let logits =
+            llama::prefill_forward(gpu, &self.weights, &self.config, tokens, &mut self.kv_cache)
+                .map_err(|e| format!("llama prefill_forward: {e:?}"))?;
+        // Land the last-position logits in `scratch.logits` for the SimpleAr seam.
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(logits.as_ptr() as *const u8, logits.len() * 4) };
+        gpu.hip
+            .memcpy_htod(&self.scratch.logits.buf, bytes)
+            .map_err(|e| format!("llama prefill logits upload: {e:?}"))
     }
 
     fn decode_step(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> Result<(), String> {
