@@ -1441,6 +1441,22 @@ impl HfqFile {
     /// Whether this tensor is stored BF16L3-compressed on disk and expanded on
     /// read. Such a tensor cannot be slab-loaded or mmap-borrowed: its file
     /// bytes are not the BF16 buffer the index advertises.
+    /// The encoding actually stored on disk for `name`: its `quant_type` byte
+    /// and its on-disk byte length.
+    ///
+    /// For a losslessly-recoded tensor both differ from the index's reported
+    /// `quant_type`/`data_size`, which this reader rewrites to the expanded
+    /// view so consumers need no per-codec branch. Inspection tooling wants the
+    /// stored truth instead — without this it cannot tell a compressed artifact
+    /// from a plain one.
+    pub fn stored_encoding(&self, name: &str) -> Option<(u8, usize)> {
+        let idx = self.resolve_idx(name)?;
+        Some(match self.bf16_packed[idx] {
+            Some((qt, _, len)) => (qt, len),
+            None => (self.tensors[idx].quant_type, self.tensors[idx].data_size),
+        })
+    }
+
     pub fn is_bf16_expanded(&self, name: &str) -> bool {
         self.resolve_idx(name)
             .is_some_and(|i| self.bf16_packed[i].is_some())
