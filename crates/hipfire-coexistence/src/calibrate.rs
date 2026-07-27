@@ -20,13 +20,16 @@ use hipfire_runtime::calibration::contracts::{
     ExpertSamplingPolicy, KldRefBuilder, KldRefPayload, KldRefRow, LayerExpert, SampleSet,
 };
 use hipfire_runtime::calibration::residual_probe::ResidualProbe;
-use hipfire_runtime::calibration::schedule::{MicrobatchGeometry, MicrobatchPlanner};
+use hipfire_runtime::calibration::schedule::{
+    LayerMicrobatch, MicrobatchGeometry, MicrobatchPlanner,
+};
 use hipfire_runtime::calibration::source::{
     LayerPrefetch, LayerPrefetchReport, PlannedTensorReader, ReadLedger, ReadLedgerSnapshot,
     TensorLoadPlan, TensorOwner, LAYER_PREFETCH_WORKER_CHUNK_BYTES,
 };
 use hipfire_runtime::calibration::stream::{
-    registered_calibration_adapter, CalibrationFamilyAdapter, ModelInspection,
+    registered_calibration_adapter, CalibrationFamilyAdapter, CalibrationResourceEstimate,
+    ModelInspection,
 };
 use hipfire_runtime::calibration::{
     build_calibration_metadata, combine_calib_parts, CalibSummary, CalibTensorDesc,
@@ -2011,6 +2014,66 @@ fn validate_completed_artifact(
     })
 }
 
+/// The long-lived state of a layer-streamed calibration run.
+///
+/// `LayerStreamEngine::run` is a wrapper over `begin` → `step`* → `finish`, and
+/// this is what lives between those calls. It exists so a caller can treat one
+/// layer as a schedulable quantum instead of holding the GPU for the whole run.
+///
+/// The read ledger is held as a [`ReadLedgerSnapshot`] rather than as a live
+/// `ReadLedger`, which borrows the `TensorLoadPlan` it was built from: a struct
+/// owning both would be self-referential. Each phase reconstitutes the ledger
+/// from the snapshot and writes it back.
+pub struct CalibrationSession {
+    // Configuration, carried over from the engine.
+    artifact_output: PathBuf,
+    pause_after_layers: Option<usize>,
+    layer_prefetch_bytes: u64,
+    residual_probe_output: Option<PathBuf>,
+    // Derived once by `begin`.
+    model: ModelInspection,
+    tensor_plan: TensorLoadPlan,
+    capture: CaptureRegistry,
+    geometry: MicrobatchGeometry,
+    geometry_tuning: GeometryTuningReport,
+    execution_job: CalibrationJob,
+    batches: Vec<LayerMicrobatch>,
+    resource_estimate: Option<CalibrationResourceEstimate>,
+    effective_precision: serde_json::Value,
+    engine_build: String,
+    run_fingerprint: String,
+    source_manifest: SourceManifestIdentity,
+    resuming_existing_checkpoint: bool,
+    // Advanced by `step`.
+    boundary: BoundaryStore,
+    ledger_snapshot: ReadLedgerSnapshot,
+    residual_probe: Option<ResidualProbe>,
+    next_layer: usize,
+    pending_prefetch: Option<(usize, LayerPrefetch)>,
+    part_paths: Vec<PathBuf>,
+    descriptors: Vec<CalibTensorDesc>,
+    expert_telemetry: Vec<ExpertLayerTelemetry>,
+    preserve_high_precision: Vec<LayerExpert>,
+    max_consistency: f32,
+    layer_timings: Vec<CalibrationLayerTiming>,
+}
+
+/// What `begin` produced: an artifact recovered from a prior completed run, or
+/// a live session parked at its first uncompleted layer.
+pub enum CalibrationSessionStart {
+    Complete(CalibrationRunResult),
+    Session(CalibrationSession),
+}
+
+/// What one `step` did.
+pub enum CalibrationStep {
+    /// A layer was committed and more remain.
+    Advanced,
+    /// A layer was committed and `--pause-after-layers` was reached.
+    Paused,
+    /// No layer remained; the caller should call `finish`.
+    LayersComplete,
+}
 pub struct LayerStreamEngine {
     boundary_backend: BoundaryBackend,
     artifact_output: PathBuf,
@@ -2055,6 +2118,9 @@ impl LayerStreamEngine {
         self
     }
 
+    /// Run a calibration to completion, or to its `--pause-after-layers`
+    /// boundary. A wrapper over the session phases: every caller that does not
+    /// need to interleave other GPU work stays on this entry point.
     pub fn run(
         self,
         adapter: &mut dyn CalibrationFamilyAdapter,
@@ -2062,6 +2128,38 @@ impl LayerStreamEngine {
         gpu: &mut Gpu,
         job: &CalibrationJob,
     ) -> Result<CalibrationRunOutcome, CalibError> {
+        let mut session = match self.begin(adapter, source, gpu, job)? {
+            CalibrationSessionStart::Complete(result) => {
+                return Ok(CalibrationRunOutcome::Complete(result))
+            }
+            CalibrationSessionStart::Session(session) => session,
+        };
+        loop {
+            match session.step(adapter, source, gpu, job)? {
+                CalibrationStep::Advanced => {}
+                CalibrationStep::Paused => {
+                    return Ok(CalibrationRunOutcome::Paused(session.into_paused()))
+                }
+                CalibrationStep::LayersComplete => break,
+            }
+        }
+        session
+            .finish(adapter, source, gpu, job)
+            .map(CalibrationRunOutcome::Complete)
+    }
+
+    /// Validate the request, plan the run, open the boundary store, replay any
+    /// resumable checkpoint, and execute the embedding pass.
+    ///
+    /// The completed-artifact recovery path returns before any layer work, so
+    /// this yields either a finished result or a session.
+    pub fn begin(
+        self,
+        adapter: &mut dyn CalibrationFamilyAdapter,
+        source: &dyn ModelSource,
+        gpu: &mut Gpu,
+        job: &CalibrationJob,
+    ) -> Result<CalibrationSessionStart, CalibError> {
         job.options.validate()?;
         if self.artifact_output.exists() && !self.resume {
             return Err(CalibError::InvalidOptions(format!(
@@ -2094,7 +2192,7 @@ impl LayerStreamEngine {
         }
         let model = adapter.inspect(source)?;
         model.validate()?;
-        let mut residual_probe = self
+        let residual_probe = self
             .residual_probe_output
             .as_ref()
             .map(|_| {
@@ -2260,7 +2358,7 @@ impl LayerStreamEngine {
                 boundary.finalize_artifact()?;
             }
             cleanup_calibration_spools(&self.artifact_output, model.num_layers)?;
-            return Ok(CalibrationRunOutcome::Complete(CalibrationRunResult {
+            return Ok(CalibrationSessionStart::Complete(CalibrationRunResult {
                 model,
                 tensor_plan,
                 read_ledger: recovered.read_ledger,
@@ -2291,7 +2389,7 @@ impl LayerStreamEngine {
         let mut max_consistency = 0.0f32;
         let mut layer_timings = Vec::with_capacity(model.num_layers);
         let mut resume_ledger = None;
-        let mut pending_prefetch: Option<(usize, LayerPrefetch)> = None;
+        let pending_prefetch: Option<(usize, LayerPrefetch)> = None;
 
         if resuming_existing_checkpoint {
             let mut prior_consumed = std::collections::BTreeSet::new();
@@ -2361,270 +2459,337 @@ impl LayerStreamEngine {
             ledger_snapshot = ledger.snapshot();
         }
 
-        for layer_index in completed_layers..model.num_layers {
-            // One layer is the quantum: the ledger lives for exactly this
-            // iteration and is handed back as a snapshot, so the loop body has no
-            // borrow reaching across layers.
-            let mut ledger = ReadLedger::resume(&tensor_plan, ledger_snapshot.clone())?;
-            let layer_started = Instant::now();
-            let prefetch_wait_started = Instant::now();
-            let mut prefetch_report = match pending_prefetch.take() {
-                Some((target_layer, prefetch)) if target_layer == layer_index => prefetch.wait(),
-                Some((target_layer, prefetch)) => {
-                    drop(prefetch);
-                    LayerPrefetchReport {
-                        errors: vec![format!(
-                            "prefetch target layer {target_layer} reached engine layer {layer_index}"
-                        )],
-                        ..LayerPrefetchReport::default()
-                    }
-                }
-                None => LayerPrefetchReport::default(),
-            };
-            let prefetch_wait_us = if prefetch_report.requested_bytes == 0 {
-                0
-            } else {
-                elapsed_us(prefetch_wait_started)
-            };
-            if !prefetch_report.errors.is_empty() {
-                eprintln!(
-                    "calibrate: layer {layer_index} prefetch completed {}/{} bytes with {} error(s): {}",
-                    prefetch_report.completed_bytes,
-                    prefetch_report.requested_bytes,
-                    prefetch_report.errors.len(),
-                    prefetch_report.errors.join("; "),
-                );
-            }
-            let load_started = Instant::now();
-            let (mut layer, source_load) = {
-                let mut reader = if prefetch_report.staging.is_empty() {
-                    PlannedTensorReader::new(source, &mut ledger, TensorOwner::Layer(layer_index))
-                } else {
-                    PlannedTensorReader::new_with_staging(
-                        source,
-                        &mut ledger,
-                        TensorOwner::Layer(layer_index),
-                        &prefetch_report.staging,
-                    )
-                };
-                let layer =
-                    adapter.load_layer(&mut reader, gpu, &model, layer_index, &execution_job)?;
-                (layer, reader.timings())
-            };
-            let prefetch_staged_bytes = prefetch_report.staging.byte_len();
-            // Layer weights now own their GPU copies; release the potentially
-            // multi-gigabyte host staging before teacher execution begins.
-            prefetch_report.staging = Default::default();
-            let load_upload_us = elapsed_us(load_started);
-            let prefetch_submit_started = Instant::now();
-            let next_layer = layer_index + 1;
-            let pausing_after_this_layer = self.pause_after_layers == Some(next_layer);
-            let mut next_prefetch_disabled_reason = None;
-            if next_layer < model.num_layers {
-                if pausing_after_this_layer {
-                    next_prefetch_disabled_reason = Some("pause_boundary".into());
-                } else if self.layer_prefetch_bytes == 0 {
-                    next_prefetch_disabled_reason = Some("disabled_by_configuration".into());
-                } else {
-                    let layer_source_bytes = tensor_plan.bytes_for(TensorOwner::Layer(next_layer));
-                    let decision = layer_prefetch_decision(
-                        self.layer_prefetch_bytes,
-                        layer_source_bytes,
-                        host_memory_snapshot(),
-                    );
-                    let ranges = tensor_plan
-                        .prefetch_ranges_for(TensorOwner::Layer(next_layer), decision.bytes);
-                    if !ranges.is_empty() {
-                        match LayerPrefetch::spawn(ranges) {
-                            Ok(prefetch) => pending_prefetch = Some((next_layer, prefetch)),
-                            Err(error) => {
-                                next_prefetch_disabled_reason = Some("worker_spawn_failed".into());
-                                eprintln!(
-                                    "calibrate: layer {next_layer} prefetch disabled for this transition: {error}"
-                                );
-                            }
-                        }
-                    } else {
-                        let reason = decision
-                            .disabled_reason
-                            .unwrap_or("no_complete_tensor_fits_budget");
-                        next_prefetch_disabled_reason = Some(reason.to_string());
-                        eprintln!(
-                            "calibrate: layer {next_layer} prefetch disabled for this transition: {reason}"
-                        );
-                    }
+        Ok(CalibrationSessionStart::Session(CalibrationSession {
+            artifact_output: self.artifact_output,
+            pause_after_layers: self.pause_after_layers,
+            layer_prefetch_bytes: self.layer_prefetch_bytes,
+            residual_probe_output: self.residual_probe_output,
+            model,
+            tensor_plan,
+            capture,
+            geometry,
+            geometry_tuning,
+            execution_job,
+            batches,
+            resource_estimate,
+            effective_precision,
+            engine_build,
+            run_fingerprint,
+            source_manifest,
+            resuming_existing_checkpoint,
+            boundary,
+            ledger_snapshot,
+            residual_probe,
+            next_layer: completed_layers,
+            pending_prefetch,
+            part_paths,
+            descriptors,
+            expert_telemetry,
+            preserve_high_precision,
+            max_consistency,
+            layer_timings,
+        }))
+    }
+}
+
+impl CalibrationSession {
+    /// Run one layer: the calibration quantum. Loads the layer's weights,
+    /// executes every microbatch through it, writes and syncs the capture part,
+    /// and commits the boundary checkpoint.
+    pub fn step(
+        &mut self,
+        adapter: &mut dyn CalibrationFamilyAdapter,
+        source: &dyn ModelSource,
+        gpu: &mut Gpu,
+        job: &CalibrationJob,
+    ) -> Result<CalibrationStep, CalibError> {
+        let layer_index = self.next_layer;
+        if layer_index >= self.model.num_layers {
+            return Ok(CalibrationStep::LayersComplete);
+        }
+        // One layer is the quantum: the ledger lives for exactly this step and
+        // is handed back as a snapshot, so no borrow reaches across layers.
+        let mut ledger = ReadLedger::resume(&self.tensor_plan, self.ledger_snapshot.clone())?;
+        let layer_started = Instant::now();
+        let prefetch_wait_started = Instant::now();
+        let mut prefetch_report = match self.pending_prefetch.take() {
+            Some((target_layer, prefetch)) if target_layer == layer_index => prefetch.wait(),
+            Some((target_layer, prefetch)) => {
+                drop(prefetch);
+                LayerPrefetchReport {
+                    errors: vec![format!(
+                        "prefetch target layer {target_layer} reached engine layer {layer_index}"
+                    )],
+                    ..LayerPrefetchReport::default()
                 }
             }
-            let prefetch_submit_us = elapsed_us(prefetch_submit_started);
-            let execute_started = Instant::now();
-            let execute_result = (|| {
-                for batch in &batches {
-                    let input = boundary.read_active_indexed(&batch.boundary_rows)?;
-                    let mut output = vec![0.0f32; input.len()];
-                    layer.execute(gpu, batch, &input, &mut output, &capture)?;
-                    boundary.write_next_indexed(&batch.boundary_rows, &output)?;
-                }
-                Ok::<(), CalibError>(())
-            })();
-            let execute_us = elapsed_us(execute_started);
-            let part_path = calibration_part_path(&self.artifact_output, layer_index);
-            let capture_started = Instant::now();
-            let capture_result = if execute_result.is_ok() {
-                let part_metadata = serde_json::json!({
-                    "artifact_kind": "calibration-part",
-                    "family": model.family,
-                    "layer": layer_index,
-                    "sample_fingerprint": job.samples.fingerprint(),
-                    "expert_capture_target": job.options.expert_quota.target_rows,
-                    "expert_capture_limit": job.options.expert_quota.limit_rows()?,
-                    "expert_capture_tile_rows": job.options.expert_quota.tile_rows,
-                })
-                .to_string();
-                layer.write_capture_part(gpu, &part_path, model.arch_id, &part_metadata)
-            } else {
-                Err(CalibError::Runtime(
-                    "layer execution failed before capture part assembly".into(),
-                ))
-            };
-            let capture_write_us = elapsed_us(capture_started);
-            let finish_started = Instant::now();
-            let finish_result = layer.finish(gpu);
-            let finish_us = elapsed_us(finish_started);
-            execute_result?;
-            let capture_summary = capture_result?;
-            finish_result?;
-            let layer_descriptors = capture_summary.descriptors;
-            let layer_telemetry = capture_summary.expert_telemetry;
-            let mut layer_preserve = Vec::new();
-            if let Some(telemetry) = layer_telemetry.as_ref() {
-                let outcome = telemetry
-                    .coverage_report(
-                        job.options.expert_coverage_policy,
-                        job.options.required_expert_fraction,
-                    )
-                    .finalize()?;
-                layer_preserve = outcome.preserve_high_precision;
-            }
-            let part_sync_started = Instant::now();
-            sync_file(&part_path)?;
-            let part_bytes = fs::metadata(&part_path)
-                .map_err(|error| CalibError::Checkpoint(error.to_string()))?
-                .len();
-            let part_hash = file_hash(&part_path).unwrap_or_else(|| "unavailable".into());
-            let part_file = part_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_string();
-            let part_sync_hash_us = elapsed_us(part_sync_started);
-            let timing = CalibrationLayerTiming {
-                layer: layer_index,
-                prefetch_wait_us,
-                prefetch_read_us: prefetch_report.elapsed_us,
-                prefetch_bytes: prefetch_report.completed_bytes,
-                prefetch_staged_bytes,
-                prefetch_errors: prefetch_report.errors.len(),
-                prefetch_submit_us,
-                next_prefetch_disabled_reason,
-                source_tensor_count: source_load.tensor_count,
-                source_bytes: source_load.source_bytes,
-                gpu_upload_bytes: source_load.gpu_upload_bytes,
-                staged_source_tensor_count: source_load.staged_tensor_count,
-                staged_source_bytes: source_load.staged_source_bytes,
-                source_view_us: source_load.view_us,
-                source_decode_us: source_load.decode_us,
-                source_upload_us: source_load.upload_us,
-                source_release_us: source_load.release_us,
-                load_upload_us,
-                execute_us,
-                capture_write_us,
-                finish_us,
-                part_sync_hash_us,
-                total_before_checkpoint_us: elapsed_us(layer_started),
-            };
-            let progress = CalibrationLayerProgress {
-                schema_version: CALIBRATION_PROGRESS_SCHEMA_VERSION,
-                engine_build: engine_build.clone(),
-                run_fingerprint: run_fingerprint.clone(),
-                layer: layer_index,
-                part_file,
-                part_bytes,
-                part_hash,
-                descriptors: layer_descriptors.clone(),
-                expert_telemetry: layer_telemetry.clone(),
-                preserve_high_precision: layer_preserve.clone(),
-                max_consistency: capture_summary.max_consistency,
-                read_ledger: ledger.snapshot(),
-                timing: timing.clone(),
-            };
-            ledger_snapshot = ledger.snapshot();
-            write_layer_progress(&self.artifact_output, &progress)?;
-            drop(layer);
-            boundary.commit_layer(layer_index)?;
-            if let Some(probe) = residual_probe.as_mut() {
-                probe.push_layer(
-                    layer_index,
-                    boundary.read_active_rows(0, probe.row_count())?,
-                )?;
-            }
-            max_consistency = max_consistency.max(capture_summary.max_consistency);
-            descriptors.extend(layer_descriptors);
-            if let Some(telemetry) = layer_telemetry {
-                expert_telemetry.push(telemetry);
-            }
-            preserve_high_precision.extend(layer_preserve);
-            part_paths.push(part_path);
-            layer_timings.push(timing);
-            let completed = boundary.checkpoint().completed_layers;
-            let remaining = model.num_layers.saturating_sub(completed);
-            let latest = layer_timings
-                .last()
-                .expect("the committed layer timing was just appended");
-            let eta = estimated_remaining_layer_us(&layer_timings, remaining)
-                .map(format_duration_us)
-                .unwrap_or_else(|| "unknown".to_string());
+            None => LayerPrefetchReport::default(),
+        };
+        let prefetch_wait_us = if prefetch_report.requested_bytes == 0 {
+            0
+        } else {
+            elapsed_us(prefetch_wait_started)
+        };
+        if !prefetch_report.errors.is_empty() {
             eprintln!(
-                "calibrate: committed layer {completed}/{} in {} (prefetch {} read/{} wait, load {} [view {}, decode {}, upload {}, release {}], execute {}, capture+sync {}); rolling layer ETA {eta}",
-                model.num_layers,
-                format_duration_us(latest.total_before_checkpoint_us),
-                format_duration_us(latest.prefetch_read_us),
-                format_duration_us(latest.prefetch_wait_us),
-                format_duration_us(latest.load_upload_us),
-                format_duration_us(latest.source_view_us),
-                format_duration_us(latest.source_decode_us),
-                format_duration_us(latest.source_upload_us),
-                format_duration_us(latest.source_release_us),
-                format_duration_us(latest.execute_us),
-                format_duration_us(
-                    latest
-                        .capture_write_us
-                        .saturating_add(latest.part_sync_hash_us)
-                ),
+                "calibrate: layer {layer_index} prefetch completed {}/{} bytes with {} error(s): {}",
+                prefetch_report.completed_bytes,
+                prefetch_report.requested_bytes,
+                prefetch_report.errors.len(),
+                prefetch_report.errors.join("; "),
             );
-            if self
-                .pause_after_layers
-                .is_some_and(|limit| boundary.checkpoint().completed_layers == limit)
-            {
-                return Ok(CalibrationRunOutcome::Paused(CalibrationPauseResult {
-                    model,
-                    tensor_plan: tensor_plan.clone(),
-                    read_ledger: ledger_snapshot,
-                    boundary_checkpoint: boundary.checkpoint().clone(),
-                    artifact_path: self.artifact_output,
-                    geometry,
-                    geometry_tuning,
-                    layer_timings,
-                }));
+        }
+        let load_started = Instant::now();
+        let (mut layer, source_load) = {
+            let mut reader = if prefetch_report.staging.is_empty() {
+                PlannedTensorReader::new(source, &mut ledger, TensorOwner::Layer(layer_index))
+            } else {
+                PlannedTensorReader::new_with_staging(
+                    source,
+                    &mut ledger,
+                    TensorOwner::Layer(layer_index),
+                    &prefetch_report.staging,
+                )
+            };
+            let layer = adapter.load_layer(
+                &mut reader,
+                gpu,
+                &self.model,
+                layer_index,
+                &self.execution_job,
+            )?;
+            (layer, reader.timings())
+        };
+        let prefetch_staged_bytes = prefetch_report.staging.byte_len();
+        // Layer weights now own their GPU copies; release the potentially
+        // multi-gigabyte host staging before teacher execution begins.
+        prefetch_report.staging = Default::default();
+        let load_upload_us = elapsed_us(load_started);
+        let prefetch_submit_started = Instant::now();
+        let next_layer = layer_index + 1;
+        let pausing_after_this_layer = self.pause_after_layers == Some(next_layer);
+        let mut next_prefetch_disabled_reason = None;
+        if next_layer < self.model.num_layers {
+            if pausing_after_this_layer {
+                next_prefetch_disabled_reason = Some("pause_boundary".into());
+            } else if self.layer_prefetch_bytes == 0 {
+                next_prefetch_disabled_reason = Some("disabled_by_configuration".into());
+            } else {
+                let layer_source_bytes = self.tensor_plan.bytes_for(TensorOwner::Layer(next_layer));
+                let decision = layer_prefetch_decision(
+                    self.layer_prefetch_bytes,
+                    layer_source_bytes,
+                    host_memory_snapshot(),
+                );
+                let ranges = self
+                    .tensor_plan
+                    .prefetch_ranges_for(TensorOwner::Layer(next_layer), decision.bytes);
+                if !ranges.is_empty() {
+                    match LayerPrefetch::spawn(ranges) {
+                        Ok(prefetch) => self.pending_prefetch = Some((next_layer, prefetch)),
+                        Err(error) => {
+                            next_prefetch_disabled_reason = Some("worker_spawn_failed".into());
+                            eprintln!(
+                                "calibrate: layer {next_layer} prefetch disabled for this transition: {error}"
+                            );
+                        }
+                    }
+                } else {
+                    let reason = decision
+                        .disabled_reason
+                        .unwrap_or("no_complete_tensor_fits_budget");
+                    next_prefetch_disabled_reason = Some(reason.to_string());
+                    eprintln!(
+                        "calibrate: layer {next_layer} prefetch disabled for this transition: {reason}"
+                    );
+                }
             }
         }
+        let prefetch_submit_us = elapsed_us(prefetch_submit_started);
+        let execute_started = Instant::now();
+        let execute_result = (|| {
+            for batch in &self.batches {
+                let input = self.boundary.read_active_indexed(&batch.boundary_rows)?;
+                let mut output = vec![0.0f32; input.len()];
+                layer.execute(gpu, batch, &input, &mut output, &self.capture)?;
+                self.boundary
+                    .write_next_indexed(&batch.boundary_rows, &output)?;
+            }
+            Ok::<(), CalibError>(())
+        })();
+        let execute_us = elapsed_us(execute_started);
+        let part_path = calibration_part_path(&self.artifact_output, layer_index);
+        let capture_started = Instant::now();
+        let capture_result = if execute_result.is_ok() {
+            let part_metadata = serde_json::json!({
+                "artifact_kind": "calibration-part",
+                "family": self.model.family,
+                "layer": layer_index,
+                "sample_fingerprint": job.samples.fingerprint(),
+                "expert_capture_target": job.options.expert_quota.target_rows,
+                "expert_capture_limit": job.options.expert_quota.limit_rows()?,
+                "expert_capture_tile_rows": job.options.expert_quota.tile_rows,
+            })
+            .to_string();
+            layer.write_capture_part(gpu, &part_path, self.model.arch_id, &part_metadata)
+        } else {
+            Err(CalibError::Runtime(
+                "layer execution failed before capture part assembly".into(),
+            ))
+        };
+        let capture_write_us = elapsed_us(capture_started);
+        let finish_started = Instant::now();
+        let finish_result = layer.finish(gpu);
+        let finish_us = elapsed_us(finish_started);
+        execute_result?;
+        let capture_summary = capture_result?;
+        finish_result?;
+        let layer_descriptors = capture_summary.descriptors;
+        let layer_telemetry = capture_summary.expert_telemetry;
+        let mut layer_preserve = Vec::new();
+        if let Some(telemetry) = layer_telemetry.as_ref() {
+            let outcome = telemetry
+                .coverage_report(
+                    job.options.expert_coverage_policy,
+                    job.options.required_expert_fraction,
+                )
+                .finalize()?;
+            layer_preserve = outcome.preserve_high_precision;
+        }
+        let part_sync_started = Instant::now();
+        sync_file(&part_path)?;
+        let part_bytes = fs::metadata(&part_path)
+            .map_err(|error| CalibError::Checkpoint(error.to_string()))?
+            .len();
+        let part_hash = file_hash(&part_path).unwrap_or_else(|| "unavailable".into());
+        let part_file = part_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let part_sync_hash_us = elapsed_us(part_sync_started);
+        let timing = CalibrationLayerTiming {
+            layer: layer_index,
+            prefetch_wait_us,
+            prefetch_read_us: prefetch_report.elapsed_us,
+            prefetch_bytes: prefetch_report.completed_bytes,
+            prefetch_staged_bytes,
+            prefetch_errors: prefetch_report.errors.len(),
+            prefetch_submit_us,
+            next_prefetch_disabled_reason,
+            source_tensor_count: source_load.tensor_count,
+            source_bytes: source_load.source_bytes,
+            gpu_upload_bytes: source_load.gpu_upload_bytes,
+            staged_source_tensor_count: source_load.staged_tensor_count,
+            staged_source_bytes: source_load.staged_source_bytes,
+            source_view_us: source_load.view_us,
+            source_decode_us: source_load.decode_us,
+            source_upload_us: source_load.upload_us,
+            source_release_us: source_load.release_us,
+            load_upload_us,
+            execute_us,
+            capture_write_us,
+            finish_us,
+            part_sync_hash_us,
+            total_before_checkpoint_us: elapsed_us(layer_started),
+        };
+        let progress = CalibrationLayerProgress {
+            schema_version: CALIBRATION_PROGRESS_SCHEMA_VERSION,
+            engine_build: self.engine_build.clone(),
+            run_fingerprint: self.run_fingerprint.clone(),
+            layer: layer_index,
+            part_file,
+            part_bytes,
+            part_hash,
+            descriptors: layer_descriptors.clone(),
+            expert_telemetry: layer_telemetry.clone(),
+            preserve_high_precision: layer_preserve.clone(),
+            max_consistency: capture_summary.max_consistency,
+            read_ledger: ledger.snapshot(),
+            timing: timing.clone(),
+        };
+        self.ledger_snapshot = ledger.snapshot();
+        write_layer_progress(&self.artifact_output, &progress)?;
+        drop(layer);
+        self.boundary.commit_layer(layer_index)?;
+        if let Some(probe) = self.residual_probe.as_mut() {
+            probe.push_layer(
+                layer_index,
+                self.boundary.read_active_rows(0, probe.row_count())?,
+            )?;
+        }
+        self.max_consistency = self.max_consistency.max(capture_summary.max_consistency);
+        self.descriptors.extend(layer_descriptors);
+        if let Some(telemetry) = layer_telemetry {
+            self.expert_telemetry.push(telemetry);
+        }
+        self.preserve_high_precision.extend(layer_preserve);
+        self.part_paths.push(part_path);
+        self.layer_timings.push(timing);
+        self.next_layer = next_layer;
+        let completed = self.boundary.checkpoint().completed_layers;
+        let remaining = self.model.num_layers.saturating_sub(completed);
+        let latest = self
+            .layer_timings
+            .last()
+            .expect("the committed layer timing was just appended");
+        let eta = estimated_remaining_layer_us(&self.layer_timings, remaining)
+            .map(format_duration_us)
+            .unwrap_or_else(|| "unknown".to_string());
+        eprintln!(
+            "calibrate: committed layer {completed}/{} in {} (prefetch {} read/{} wait, load {} [view {}, decode {}, upload {}, release {}], execute {}, capture+sync {}); rolling layer ETA {eta}",
+            self.model.num_layers,
+            format_duration_us(latest.total_before_checkpoint_us),
+            format_duration_us(latest.prefetch_read_us),
+            format_duration_us(latest.prefetch_wait_us),
+            format_duration_us(latest.load_upload_us),
+            format_duration_us(latest.source_view_us),
+            format_duration_us(latest.source_decode_us),
+            format_duration_us(latest.source_upload_us),
+            format_duration_us(latest.source_release_us),
+            format_duration_us(latest.execute_us),
+            format_duration_us(
+                latest
+                    .capture_write_us
+                    .saturating_add(latest.part_sync_hash_us)
+            ),
+        );
+        if self.pause_after_layers == Some(completed) {
+            return Ok(CalibrationStep::Paused);
+        }
+        Ok(CalibrationStep::Advanced)
+    }
 
+    /// Consume a session that [`Self::step`] reported as `Paused`.
+    pub fn into_paused(self) -> CalibrationPauseResult {
+        CalibrationPauseResult {
+            model: self.model,
+            tensor_plan: self.tensor_plan,
+            read_ledger: self.ledger_snapshot,
+            boundary_checkpoint: self.boundary.checkpoint().clone(),
+            artifact_path: self.artifact_output,
+            geometry: self.geometry,
+            geometry_tuning: self.geometry_tuning,
+            layer_timings: self.layer_timings,
+        }
+    }
+
+    /// Run the KLD finalizer and assemble the artifact. Call once [`Self::step`]
+    /// has reported `LayersComplete`.
+    pub fn finish(
+        mut self,
+        adapter: &mut dyn CalibrationFamilyAdapter,
+        source: &dyn ModelSource,
+        gpu: &mut Gpu,
+        job: &CalibrationJob,
+    ) -> Result<CalibrationRunResult, CalibError> {
         // Final phase: reconstitute once more for the finalizer's planned reads.
-        let mut ledger = ReadLedger::resume(&tensor_plan, ledger_snapshot)?;
+        let mut ledger = ReadLedger::resume(&self.tensor_plan, self.ledger_snapshot.clone())?;
         let kldref = if job.options.kldref {
             let mut finalizer = {
                 let mut reader =
                     PlannedTensorReader::new(source, &mut ledger, TensorOwner::Persistent);
-                adapter.load_finalizer(&mut reader, gpu, &model, &execution_job)?
+                adapter.load_finalizer(&mut reader, gpu, &self.model, &self.execution_job)?
             };
             let mut builder = KldRefBuilder::new(job.options.kldref_top_k)?;
             // Row subsetting has to happen BEFORE the finalizer, not after: the
@@ -2635,15 +2800,15 @@ impl LayerStreamEngine {
             // a contiguous head.
             let kld_stride = kldref_row_stride(job.samples.total_rows(), job.options.kldref_rows);
             let execute_result = (|| {
-                for batch in &batches {
+                for batch in &self.batches {
                     let (batch, residual) = if kld_stride > 1 {
                         let Some(reduced) = subset_batch_by_stride(batch, kld_stride) else {
                             continue;
                         };
-                        let residual = boundary.read_active_indexed(&reduced.boundary_rows)?;
+                        let residual = self.boundary.read_active_indexed(&reduced.boundary_rows)?;
                         (std::borrow::Cow::Owned(reduced), residual)
                     } else {
-                        let residual = boundary.read_active_indexed(&batch.boundary_rows)?;
+                        let residual = self.boundary.read_active_indexed(&batch.boundary_rows)?;
                         (std::borrow::Cow::Borrowed(batch), residual)
                     };
                     let mut rows = Vec::new();
@@ -2670,7 +2835,8 @@ impl LayerStreamEngine {
         } else {
             // The finalizer may still own planned final-norm/lm-head tensors.
             let mut reader = PlannedTensorReader::new(source, &mut ledger, TensorOwner::Persistent);
-            let mut finalizer = adapter.load_finalizer(&mut reader, gpu, &model, &execution_job)?;
+            let mut finalizer =
+                adapter.load_finalizer(&mut reader, gpu, &self.model, &self.execution_job)?;
             finalizer.finish(gpu)?;
             None
         };
@@ -2679,46 +2845,46 @@ impl LayerStreamEngine {
             .as_ref()
             .map(KldRefPayload::to_hfq_tensors)
             .unwrap_or_default();
-        boundary.finalize_kld()?;
+        self.boundary.finalize_kld()?;
         ledger.assert_complete()?;
         let read_ledger = ledger.snapshot();
         let static_meta = vec![
             ("artifact_kind", serde_json::json!("calibration")),
-            ("engine_build", serde_json::json!(engine_build)),
-            ("family", serde_json::json!(model.family)),
+            ("engine_build", serde_json::json!(self.engine_build)),
+            ("family", serde_json::json!(self.model.family)),
             (
                 "adapter_version",
                 serde_json::json!(adapter.adapter_version()),
             ),
-            ("arch_id", serde_json::json!(model.arch_id)),
+            ("arch_id", serde_json::json!(self.model.arch_id)),
             (
                 "source_manifest",
-                serde_json::to_value(&source_manifest)
+                serde_json::to_value(&self.source_manifest)
                     .map_err(|error| CalibError::Runtime(error.to_string()))?,
             ),
-            ("effective_precision", effective_precision),
+            ("effective_precision", self.effective_precision.clone()),
             (
                 "resource_estimate",
-                serde_json::to_value(&resource_estimate)
+                serde_json::to_value(&self.resource_estimate)
                     .map_err(|error| CalibError::Runtime(error.to_string()))?,
             ),
             (
                 "microbatch_geometry",
-                serde_json::to_value(geometry)
+                serde_json::to_value(self.geometry)
                     .map_err(|error| CalibError::Runtime(error.to_string()))?,
             ),
             (
                 "geometry_tuning",
-                serde_json::to_value(&geometry_tuning)
+                serde_json::to_value(&self.geometry_tuning)
                     .map_err(|error| CalibError::Runtime(error.to_string()))?,
             ),
             (
                 "layer_timings",
-                serde_json::to_value(&layer_timings)
+                serde_json::to_value(&self.layer_timings)
                     .map_err(|error| CalibError::Runtime(error.to_string()))?,
             ),
-            ("run_fingerprint", serde_json::json!(run_fingerprint)),
-            ("max_consistency", serde_json::json!(max_consistency)),
+            ("run_fingerprint", serde_json::json!(self.run_fingerprint)),
+            ("max_consistency", serde_json::json!(self.max_consistency)),
             (
                 "job",
                 serde_json::to_value(job)
@@ -2726,7 +2892,7 @@ impl LayerStreamEngine {
             ),
             (
                 "expert_telemetry",
-                serde_json::to_value(&expert_telemetry)
+                serde_json::to_value(&self.expert_telemetry)
                     .map_err(|error| CalibError::Runtime(error.to_string()))?,
             ),
             (
@@ -2742,7 +2908,7 @@ impl LayerStreamEngine {
             ),
             (
                 "preserve_high_precision",
-                serde_json::to_value(&preserve_high_precision)
+                serde_json::to_value(&self.preserve_high_precision)
                     .map_err(|error| CalibError::Runtime(error.to_string()))?,
             ),
             (
@@ -2760,11 +2926,11 @@ impl LayerStreamEngine {
             .map(|payload| vec![("kldref".to_string(), payload.metadata())])
             .unwrap_or_default();
         let metadata =
-            build_calibration_metadata(&descriptors, Some(1), &static_meta_refs, &extra_meta)
+            build_calibration_metadata(&self.descriptors, Some(1), &static_meta_refs, &extra_meta)
                 .map_err(CalibError::Runtime)?;
         let assembling_path = assembling_artifact_path(&self.artifact_output);
         if assembling_path.exists() {
-            if resuming_existing_checkpoint {
+            if self.resuming_existing_checkpoint {
                 remove_if_exists(&assembling_path)?;
             } else {
                 return Err(CalibError::Checkpoint(format!(
@@ -2775,13 +2941,13 @@ impl LayerStreamEngine {
         }
         combine_calib_parts(
             &assembling_path,
-            model.arch_id,
+            self.model.arch_id,
             &metadata.json,
-            &part_paths,
+            &self.part_paths,
             &extra_tensors,
         )
         .map_err(|error| CalibError::Runtime(error.to_string()))?;
-        if let (Some(path), Some(probe)) = (&self.residual_probe_output, &residual_probe) {
+        if let (Some(path), Some(probe)) = (&self.residual_probe_output, &self.residual_probe) {
             if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
                 fs::create_dir_all(parent)
                     .map_err(|error| CalibError::Runtime(error.to_string()))?;
@@ -2810,27 +2976,27 @@ impl LayerStreamEngine {
         sync_file(&self.artifact_output)?;
         sync_parent_directory(&self.artifact_output)?;
         drop(ledger);
-        boundary.finalize_artifact()?;
-        cleanup_calibration_spools(&self.artifact_output, model.num_layers)?;
+        self.boundary.finalize_artifact()?;
+        cleanup_calibration_spools(&self.artifact_output, self.model.num_layers)?;
         let kldref_positions = kldref.as_ref().map(KldRefPayload::n_positions);
-        Ok(CalibrationRunOutcome::Complete(CalibrationRunResult {
-            model,
-            tensor_plan,
+        Ok(CalibrationRunResult {
+            model: self.model,
+            tensor_plan: self.tensor_plan,
             read_ledger,
-            boundary_checkpoint: boundary.checkpoint().clone(),
+            boundary_checkpoint: self.boundary.checkpoint().clone(),
             kldref,
             kldref_positions,
             artifact_path: self.artifact_output,
             artifact: CalibSummary {
                 n_hessian: metadata.n_hessian,
                 n_imatrix: metadata.n_imatrix,
-                max_consistency,
+                max_consistency: self.max_consistency,
             },
-            expert_telemetry,
-            geometry,
-            geometry_tuning,
-            layer_timings,
-        }))
+            expert_telemetry: self.expert_telemetry,
+            geometry: self.geometry,
+            geometry_tuning: self.geometry_tuning,
+            layer_timings: self.layer_timings,
+        })
     }
 }
 
