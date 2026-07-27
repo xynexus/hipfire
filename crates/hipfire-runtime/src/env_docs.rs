@@ -4883,14 +4883,14 @@ pub const ENV_HIPFIRE_ZAYA_MEGAKERNEL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_ZAYA_MOE_LDS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ZAYA_MOE_LDS",
     description: "Runtime variable controlling zaya moe lds in hipfire",
-    source: "crates/hipfire-rdna/src/dispatch/zaya_cca.rs:1032",
+    source: "crates/hipfire-rdna/src/dispatch/zaya_cca.rs:1117",
 };
 
 /// `HIPFIRE_ZAYA_MOE_MROW` — Runtime variable controlling zaya moe mrow in hipfire
 pub const ENV_HIPFIRE_ZAYA_MOE_MROW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ZAYA_MOE_MROW",
     description: "Runtime variable controlling zaya moe mrow in hipfire",
-    source: "crates/hipfire-rdna/src/dispatch/zaya_cca.rs:1042",
+    source: "crates/hipfire-rdna/src/dispatch/zaya_cca.rs:1127",
 };
 
 /// `HIPFIRE_ZAYA_MOE_W8A8` — W8A8 MoE (HIPFIRE_ZAYA_MOE_W8A8): int8-quantize the down-proj activation (gate_up
