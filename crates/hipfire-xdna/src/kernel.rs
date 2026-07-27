@@ -70,6 +70,10 @@ pub struct NpuKernel {
     instr_bo: u32,
     instr_addr: u64,
     instr_size: usize,
+    // ERT_START_NPU command format + cached-SHMEM output invalidation for the
+    // out-of-tree/upstream amdxdna driver (env HIPFIRE_XDNA_ERT_NPU); default false =
+    // the stock mainline driver's ERT_START_CU format with coherent SHMEM.
+    ert_npu: bool,
     // Reused across dispatches; one entry per distinct argument set (e.g. the two
     // C-buffers of a pipelined loop), so alternating arg sets don't thrash the cache.
     cmd_cache: RefCell<Vec<CachedCmd>>,
@@ -143,6 +147,7 @@ impl NpuKernel {
             instr_bo,
             instr_addr,
             instr_size: insts.len(),
+            ert_npu: std::env::var_os("HIPFIRE_XDNA_ERT_NPU").is_some(),
             cmd_cache: RefCell::new(Vec::new()),
             dev,
         })
@@ -231,12 +236,31 @@ impl NpuKernel {
             let t0 = std::time::Instant::now();
             let seq = self.submit(args)?;
             let t1 = std::time::Instant::now();
-            let r = self.wait(seq);
+            let r = self
+                .wait(seq)
+                .and_then(|()| self.reconcile_ert_npu_outputs(args));
             xdna_trace_record(t1 - t0, t1.elapsed());
             return r;
         }
         let seq = self.submit(args)?;
-        self.wait(seq)
+        self.wait(seq)?;
+        self.reconcile_ert_npu_outputs(args)
+    }
+
+    /// Under the out-of-tree/upstream amdxdna driver (`HIPFIRE_XDNA_ERT_NPU`) SHMEM BOs are
+    /// mapped cached (`map_wc=false`), so a blocking caller would read stale bytes straight
+    /// after the timeline signals. Reconcile every argument once the dispatch completes, so
+    /// `dispatch` keeps its "outputs are readable on return" contract on that driver too.
+    /// No-op on the stock mainline driver, which keeps SHMEM coherent — the per-dispatch
+    /// cache op is not paid there.
+    fn reconcile_ert_npu_outputs(&self, args: &[&DeviceBuffer]) -> Result<(), XdnaError> {
+        if !self.ert_npu {
+            return Ok(());
+        }
+        for a in args {
+            self.sync_output(a)?;
+        }
+        Ok(())
     }
 
     /// Blocking dispatch with explicit host-to-device synchronization flags.
@@ -245,12 +269,15 @@ impl NpuKernel {
             let t0 = std::time::Instant::now();
             let seq = self.submit_synced(args, Some(sync))?;
             let t1 = std::time::Instant::now();
-            let r = self.wait(seq);
+            let r = self
+                .wait(seq)
+                .and_then(|()| self.reconcile_ert_npu_outputs(args));
             xdna_trace_record(t1 - t0, t1.elapsed());
             return r;
         }
         let seq = self.submit_synced(args, Some(sync))?;
-        self.wait(seq)
+        self.wait(seq)?;
+        self.reconcile_ert_npu_outputs(args)
     }
 
     /// Enqueue several fixed-buffer invocations and wait once for the final
@@ -309,7 +336,8 @@ impl NpuKernel {
         let mut cache = self.cmd_cache.borrow_mut();
         if !cache.iter().any(|c| c.arg_handles == arg_handles) {
             let addrs: Vec<u64> = args.iter().map(|b| b.host_addr()).collect();
-            let packet = submit::dpu_cmd_packet(self.instr_addr, self.instr_size, &addrs);
+            let packet =
+                submit::dpu_cmd_packet(self.instr_addr, self.instr_size, &addrs, self.ert_npu);
             let mut cmd_bo = self.dev.alloc_buffer(4096, AMDXDNA_BO_CMD)?;
             cmd_bo.as_mut_slice()[..packet.len()].copy_from_slice(&packet);
             // One physical BO may intentionally back multiple DPU arguments
@@ -388,7 +416,7 @@ impl NpuKernel {
                 .sync_bo(a.handle(), submit::SYNC_DIRECT_TO_DEVICE, a.len())?;
         }
         let addrs: Vec<u64> = args.iter().map(|b| b.host_addr()).collect();
-        let packet = submit::dpu_cmd_packet(self.instr_addr, self.instr_size, &addrs);
+        let packet = submit::dpu_cmd_packet(self.instr_addr, self.instr_size, &addrs, self.ert_npu);
         let mut cmd_bo = self.dev.alloc_buffer(4096, AMDXDNA_BO_CMD)?;
         cmd_bo.as_mut_slice()[..packet.len()].copy_from_slice(&packet);
         let mut exec_handles: Vec<u32> = args.iter().map(|b| b.handle()).collect();

@@ -81,7 +81,7 @@ is `0.020617408105029177` and the minimum cosine is
 propagation sensitivity, not a discrete cache, SWA-geometry, or layer-operator
 failure.
 
-The remediation candidate is a real activation-aware `Gemma-4-31B.oq8+.hfq`.
+The remediation candidate is a real activation-aware `Gemma-4-31B--oq8+.hfq`.
 The collector immediately reduces each projection input to per-channel sum of
 squares, so no layer activation is retained. It covers all 410 real text
 projections over 1,024 exact tokens from 12 committed benchmark prompts. The
@@ -129,7 +129,7 @@ is requantized to OQ8 with exactly these overrides:
 - all 350 other language-model projection tensors are OQ8G256;
 - all small norm and scalar tensors retain their source precision.
 
-The resulting `Gemma-4-31B-downbf16.oq8.hfq` is 38,586,917,272 bytes with
+The resulting `Gemma-4-31B-downbf16--oq8.hfq` is 38,586,917,272 bytes with
 1,188 tensors, 31,273,088,876 source parameters, 24,311,703,552 rewritten
 parameters, and quantization hash `cb8eb6e621917c3d`. Its embedded tokenizer is
 the pinned Gemma 4 tokenizer, SHA256
@@ -178,7 +178,7 @@ The next bounded residual-write diagnostic instead retains all 60
 `model.language_model.layers.*.self_attn.o_proj.weight` tensors in BF16. The
 other 350 language-model projections are OQ8G256, while norms and small scalar
 tensors retain their source precision. The resulting
-`Gemma-4-31B-attnoutbf16.oq8.hfq` is 34,763,506,072 bytes with 1,188 tensors,
+`Gemma-4-31B-attnoutbf16--oq8.hfq` is 34,763,506,072 bytes with 1,188 tensors,
 31,273,088,876 source parameters, 28,165,220,352 rewritten parameters, and
 quantization hash `b6a3631e816fe472`. Its embedded tokenizer is the pinned
 Gemma 4 tokenizer, SHA256
@@ -232,7 +232,7 @@ the experiment froze a 512 MiB maximum extra-byte budget. The selected policy:
   and ordered-selection SHA256
   `ed7be28e40f93e13a049d24d523c821ec8c011b8d41c445e600d3b2e1a92e067`.
 
-The resulting `Gemma-4-31B-imatrix-Q8-promotion.oq8.hfq` is 32,241,275,288
+The resulting `Gemma-4-31B-imatrix-Q8-promotion--oq8.hfq` is 32,241,275,288
 bytes with 1,188 tensors, payload size 32,204,050,840 bytes, and quantization
 hash `549759cd8511b5b9`. Its format counts are 586 BF16, 385 OQ8G256, and 217
 Q8F16 tensors; the extra Q8F16 tensor is the existing language embedding.

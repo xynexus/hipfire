@@ -36,7 +36,7 @@ pub struct WeightTensor {
     pub gpu_dtype: DType,  // dispatch type for kernel selection
     pub m: usize,          // output dim (rows)
     pub k: usize,          // input dim (cols)
-    pub row_stride: usize, // padded row bytes (Q8HFQ only, 0 for others)
+    pub row_stride: usize, // byte stride/layout discriminator for packed formats; 0 otherwise
     /// ParoQuant Givens rotation metadata. None for all non-ParoQuant formats.
     pub paro: Option<ParoRotation>,
     /// Phase A Stage A — AWQ per-channel scale vector, length K, dtype F16.

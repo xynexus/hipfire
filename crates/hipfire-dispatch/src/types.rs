@@ -708,7 +708,9 @@ impl KernelKey {
             Oq4G256 | Oq8G256 => ArchPredicate::HasWmma,
             // W8A8 reference — int8 weights + per-token int8 activations via iu8 WMMA.
             W8A8Ref => ArchPredicate::HasWmma,
-            Q8HFQ | Raw => ArchPredicate::Always,
+            Q8HFQ | DflashOq8Plain | DflashOq4Plain | DflashOq4MixedPlain | Raw => {
+                ArchPredicate::Always
+            }
         }
     }
 

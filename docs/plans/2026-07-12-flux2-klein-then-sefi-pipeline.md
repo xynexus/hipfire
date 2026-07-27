@@ -200,8 +200,8 @@ shared `time_modulation`), not recompute per block.
 Per `AGENTS.md` naming:
 - `FLUX.2-klein-base-4B.bf16.hfq` (+ `.oq8`/`.oq4++` quant variants later).
 - `SeFi-Image-2B-turbo.sefi.bf16.hfq` (feature dot-group `.sefi` for the
-  dual-time / split-denoise role; quant token after, e.g. `.sefi.oq8.hfq` or
-  `.sefi.oq4.25.hfq`).
+  dual-time / split-denoise role; quant token after, e.g. `.sefi--oq8.hfq` or
+  `.sefi--oq4.25.hfq`).
 
 ## 5. Phasing
 
