@@ -12,6 +12,34 @@ into full investigations here.
 - Scope: Architectural
 - Confidence: High
 
+## [RESOLVED] Quantized-from-HFQ artifacts lose config/tokenizer (dangling v2 tail pointer)
+- Category: Correctness / Tooling (hipfire-quantize)
+- Location: crates/hipfire-quantize/src/main.rs `HfqInputFile::open`
+- Root cause: an HFQ v2 source keeps `config` / `tokenizer` / `tokenizer_config`
+  / `generation_config` / `gguf_meta` in a TAIL blob addressed by a
+  `tail_metadata` = `{offset, size, hash}` pointer in the FRONT metadata, where
+  `offset` is a byte offset into that source file. `HfqInputFile::open` read only
+  the front JSON (stopping at brace depth 0) and never dereferenced the tail, so
+  the quantizer forwarded the front metadata verbatim to the derived artifact
+  (main.rs ~L4705 builds the output metadata from `hfq.metadata_json`). The
+  forwarded `tail_metadata.offset` then points PAST the (smaller) derived file,
+  into the original source — dangling. Result: every bf16→oq/mq artifact loaded
+  with NO config and NO tokenizer (`Tokenizer::from_hfq_metadata` → "tokenizer |
+  gguf_meta" missing; and `config_from_hfq` → "failed to parse config"). Hit on
+  all four MiniCPM5-1B.oq* variants produced 2026-07-27.
+- Fix: `merge_source_tail_metadata` resolves and inlines the source tail into the
+  front metadata at open time (mirrors the runtime's `merge_tail_metadata`:
+  read+hash-verify the tail blob, merge its `metadata` object with front-wins
+  semantics), and strips the container-level `tail_metadata` / `hfq_format` keys
+  so `hfq_out::write_hfq` regenerates a correct tail for the OUTPUT. No-op for v1
+  or already-inlined sources. Unit tests: `merge_source_tail_*` (inline,
+  front-wins, no-op, hash-mismatch). Weights are untouched — the bug was
+  metadata-only.
+- Note: existing broken artifacts were repaired out-of-band (tokenizer/config
+  re-injected, weights byte-identical); with this fix, re-quantizing from a v2
+  bf16 source now embeds them correctly at emit time.
+- Confidence: High (root-caused, unit-tested; re-quant end-to-end recommended).
+
 ## [RESOLVED] Batched prefill garbage for bf16/f16 llama models (was: "attention_q8_0_kv_batched masked prefill garbage for decoupled head_dim")
 - Category: Correctness / Dispatch
 - Location: crates/hipfire-runtime/src/llama.rs `forward_prefill_chunk`
