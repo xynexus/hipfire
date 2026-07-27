@@ -602,8 +602,27 @@ autograd and deliberately does not differentiate the fused inference kernels
 and the §1.6 memory-budget unification plus the quantizer self-lock deletion merged
 (`0b78c9dd2`).
 
+**Sessionization LANDED 2026-07-27.** `LayerStreamEngine::run` is now a wrapper over
+`begin` → `step`* → `finish`, and the state between layers is `CalibrationSession`
+(28 fields). `begin` returns either a live session or an already-complete result;
+`step` runs one layer and reports `Advanced` / `Paused` / `LayersComplete`;
+`into_paused` consumes a paused session. `adapter`, `source`, `gpu` and `job` stayed
+parameters rather than fields.
+
+Verified rather than argued, on Qwen3.5-0.8B (24 layers, 4 sequences × 64 context) with
+`artifact compare-calibration --atol 0 --rtol 0`:
+
+| candidate | vs. pre-refactor `run` |
+|---|---|
+| refactored, uninterrupted | 0 / 277,271,292 values mismatched |
+| refactored, 3 quanta (pause at 5, at 11, then to completion) | 0 / 277,271,292 values mismatched |
+
+The second row is also the M6 exit criterion below — an interrupted-and-resumed run is
+bit-identical to an uninterrupted one — met a stage early, since the layer loop was
+already checkpoint-resumable before the split.
+
 **Sessionization design, surveyed 2026-07-27.** The split points in
-`LayerStreamEngine::run` (`calibrate.rs:2058`, ~750 lines) are clean:
+`LayerStreamEngine::run` (~750 lines) were clean:
 
 | phase | lines | becomes |
 |---|---|---|
@@ -640,10 +659,12 @@ advanced per step (`boundary`, `ledger_snapshot`, `residual_probe`, `next_layer`
 The completed-artifact recovery path (2238–2277) returns before any layer work, so
 `begin` returns an either-type: an already-`Complete` result, or a live session.
 
-- Sessionize `calibrate::run_cli` (`calibrate.rs:534`) into `new`/`step`/`finish`, modelled
-  on `LoraTrainSession` — **not** on `Dispatch::Train`, which holds the runner turn to
-  completion. `--pause-after-layers` becomes the quantum; the layer loop at `:2348` is the
-  yield point.
+- ~~Sessionize the layer-stream engine into `begin`/`step`/`finish`~~ — **done**, see above.
+  Modelled on `LoraTrainSession`, **not** on `Dispatch::Train`, which holds the runner turn
+  to completion. One layer is the quantum.
+- Make the session a daemon op: a `Dispatch` variant that calls `step` once per GPU turn
+  and parks the `CalibrationSession` in `DaemonState` between turns. Nothing in the session
+  is borrowed from a caller, so parking it is a move.
 - Delete the self-lock on the daemon path (`calibrate.rs:693`).
 - Unify the memory budget (§1.6) — worth landing on its own, ahead of everything else.
 - Port the load-bearing Python: ~700–900 semantic lines of the 2200 in
