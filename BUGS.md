@@ -12,6 +12,37 @@ into full investigations here.
 - Scope: Architectural
 - Confidence: High
 
+## [High] `attention_q8_0_kv_batched` masked prefill: garbage for decoupled head_dim
+- Category: Correctness / Kernels
+- Location: crates/hipfire-runtime/src/llama.rs `forward_prefill_chunk` (~L980) →
+  crates/hipfire-rdna/src/dispatch/attention.rs `attention_q8_0_kv_batched_masked`,
+  kernels/src/attention_q8_0_kv_batched.hip and
+  kernels/src/gfx1103/attention_q8_0_kv_batched.gfx1103.hip
+- Summary: The batched masked Q8-KV attention used by the serving prefill chunk
+  produces garbage logits for models with a DECOUPLED head_dim (q_dim =
+  n_heads·head_dim ≠ hidden), e.g. MiniCPM5-1B (hidden 1536, n_heads 16,
+  n_kv_heads 2, head_dim 128 → q_dim 2048). Numerical bisection vs a per-token
+  reference (example `debug_batched_prefill_divergence`): `prefill_forward`
+  (attention_causal_batched) is correct (cosine 0.99977, argmax match); the
+  `forward_prefill_batch` → `forward_prefill_chunk` flash/masked path diverges
+  hard (cosine −0.18, disjoint top-5), garbage from its first real batch (n≥4).
+  NOT the gfx1103 register-softmax variant alone (forcing the generic LDS kernel
+  is also garbage), NOT the KV write, NOT the Rust dispatch (head_dim/q_dim are
+  threaded correctly and the scratch buffers are q_dim-sized). So the defect is
+  in the attention_q8_0_kv_batched compute for the q_dim≠hidden / GQA geometry
+  (both kernel variants) or a shared upstream in the chunk. Only surfaced once
+  bf16 llama weights became batchable (native-bf16 loader + is_batchable_la bf16);
+  previously such models ran per-token and never hit this path.
+- Suggested fix: Root-cause the q_dim≠hidden handling in attention_q8_0_kv_batched
+  (generic + gfx1103) and add a decoupled-head_dim parity test (mirror
+  parity_kvarn_fused_flash). WORKAROUND IN PLACE: LlamaBackend::prefill routes
+  through prefill_forward (attention_causal_batched, verified correct + batched)
+  instead of forward_prefill_batch — crates/hipfire-arch-llama/src/arch.rs.
+- Scope: arch-0/1 (llama family) serving prefill with quantized KV on
+  decoupled-head_dim models. Standard head_dim (q_dim==hidden) untested but
+  likely unaffected.
+- Confidence: High (numerically bisected)
+
 ## [Low] Opportunistic .unwrap() → error-handling cleanup (convention, not a tracked bug)
 - Category: Reliability / Maintainability
 - Location: Project-wide (~6.8k non-test `.unwrap()` sites; most guard true
