@@ -2378,12 +2378,23 @@ impl LayerStreamEngine {
                 );
             }
         }
-        let mut ledger = match resume_ledger {
+        // The ledger is carried between phases as its SNAPSHOT rather than as a
+        // live `ReadLedger`, which borrows the `TensorLoadPlan` it was built from
+        // (`calibration/source.rs`). That borrow is what stops the run state from
+        // being hoisted into a session struct — a struct owning both the plan and
+        // a ledger over it is self-referential. Reconstituting per phase costs one
+        // clone of a few BTreeSets of tensor names against a layer of GPU work,
+        // and `ReadLedger::resume` is already called repeatedly by the checkpoint
+        // replay above, so round-tripping is an established operation rather than
+        // a new one.
+        let mut ledger_snapshot = match resume_ledger {
             Some(snapshot) => ReadLedger::resume(&tensor_plan, snapshot)?,
             None => ReadLedger::new(&tensor_plan),
-        };
+        }
+        .snapshot();
 
         if completed_layers == 0 {
+            let mut ledger = ReadLedger::resume(&tensor_plan, ledger_snapshot.clone())?;
             let mut reader = PlannedTensorReader::new(source, &mut ledger, TensorOwner::Persistent);
             let mut embedding = adapter.load_embedding(&mut reader, gpu, &model, &execution_job)?;
             let execute_result = (|| {
@@ -2404,9 +2415,14 @@ impl LayerStreamEngine {
             // enough exact-size buckets to OOM a 60-layer CASK-only pass.
             gpu.invalidate_weight_caches();
             gpu.drain_pool();
+            ledger_snapshot = ledger.snapshot();
         }
 
         for layer_index in completed_layers..model.num_layers {
+            // One layer is the quantum: the ledger lives for exactly this
+            // iteration and is handed back as a snapshot, so the loop body has no
+            // borrow reaching across layers.
+            let mut ledger = ReadLedger::resume(&tensor_plan, ledger_snapshot.clone())?;
             let layer_started = Instant::now();
             let prefetch_wait_started = Instant::now();
             let mut prefetch_report = match pending_prefetch.take() {
@@ -2601,6 +2617,7 @@ impl LayerStreamEngine {
                 read_ledger: ledger.snapshot(),
                 timing: timing.clone(),
             };
+            ledger_snapshot = ledger.snapshot();
             write_layer_progress(&self.artifact_output, &progress)?;
             drop(layer);
             boundary.commit_layer(layer_index)?;
@@ -2651,7 +2668,7 @@ impl LayerStreamEngine {
                 return Ok(CalibrationRunOutcome::Paused(CalibrationPauseResult {
                     model,
                     tensor_plan: tensor_plan.clone(),
-                    read_ledger: ledger.snapshot(),
+                    read_ledger: ledger_snapshot,
                     boundary_checkpoint: boundary.checkpoint().clone(),
                     artifact_path: self.artifact_output,
                     geometry,
@@ -2661,6 +2678,8 @@ impl LayerStreamEngine {
             }
         }
 
+        // Final phase: reconstitute once more for the finalizer's planned reads.
+        let mut ledger = ReadLedger::resume(&tensor_plan, ledger_snapshot)?;
         let kldref = if job.options.kldref {
             let mut finalizer = {
                 let mut reader =
