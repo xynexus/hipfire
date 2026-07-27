@@ -4339,9 +4339,26 @@ impl Gpu {
             );
         }
 
+        // Multi-row register-blocked variant (HIPFIRE_GEMV_MROW): each wave owns
+        // ZMROW=8 rows and interleaves their loads for ~8× memory-level parallelism.
+        // The single-row kernel is latency-bound on huge M (lm_head): max clocks +
+        // 100% busy yet ~24% of peak BW (docs/perf EXP-22).
+        if std::env::var("HIPFIRE_GEMV_MROW").is_ok() {
+            self.ensure_kernel(
+                "gemv_q8_0_mrow",
+                kernels::GEMV_Q8_0_MROW_SRC,
+                "gemv_q8_0_mrow",
+            )?;
+            let grid = (m.div_ceil(8) as u32).min(8192);
+            return self.launch_kernargs("gemv_q8_0_mrow", [grid, 1, 1], [32, 1, 1], 0, &args);
+        }
         self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0")?;
         let block_size = 32u32;
-        self.launch_kernargs("gemv_q8_0", [m as u32, 1, 1], [block_size, 1, 1], 0, &args)
+        // Cap the grid and grid-stride over rows: at huge M (lm_head, 262k rows)
+        // dispatching one workgroup/row dominates. 8192 blocks saturate the GPU while
+        // slashing the command-processor dispatch cost.
+        let grid = (m as u32).min(8192);
+        self.launch_kernargs("gemv_q8_0", [grid, 1, 1], [block_size, 1, 1], 0, &args)
     }
     /// y = A_q8hfq * x (split-metadata Q8 GEMV, row_stride = padded row bytes)
     pub fn gemv_q8hfq(
@@ -4600,6 +4617,197 @@ impl Gpu {
     ) -> HipResult<()> {
         self.launch_gemv_generic("gemv_bf16_f32", kernels::GEMV_BF16_F32_SRC, w, x, y, m, k)
     }
+
+    /// Per-row symmetric Q4 GEMV (coarse lm_head scorer): `w4` [M, K/2] bytes +
+    /// `scale` [M], `x` [K] f32 → `y` [M] f32. Grid capped + strided over rows.
+    pub fn gemv_q4sym_f32(
+        &mut self,
+        w4: &GpuTensor,
+        scale: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_q4sym_f32",
+            kernels::GEMV_Q4SYM_F32_SRC,
+            "gemv_q4sym_f32",
+        )?;
+        let (w4p, sp, xp, yp) = (
+            w4.buf.as_ptr(),
+            scale.buf.as_ptr(),
+            x.buf.as_ptr(),
+            y.buf.as_ptr(),
+        );
+        let (mv, kv) = (m as i32, k as i32);
+        // One block per row (like gemv_bf16_f32) for full memory-level parallelism.
+        // Capping the grid + row-striding serialized 32 rows/block → ~105 GB/s vs
+        // ~170 at grid=M. The kernel still grid-strides, so a cap stays correct.
+        let grid = (m as u32).max(1);
+        self.launch_kernargs(
+            "gemv_q4sym_f32",
+            [grid, 1, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr w4p, ptr sp, ptr xp, ptr yp, i32 mv, i32 kv],
+        )
+    }
+
+    /// Per-row symmetric Q2 GEMV (aggressive coarse lm_head scorer): `w2` [M, K/4]
+    /// bytes + `scale` [M], `x` [K] f32 → `y` [M] f32. Grid capped + row-strided.
+    pub fn gemv_q2sym_f32(
+        &mut self,
+        w2: &GpuTensor,
+        scale: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_q2sym_f32",
+            kernels::GEMV_Q2SYM_F32_SRC,
+            "gemv_q2sym_f32",
+        )?;
+        let (w2p, sp, xp, yp) = (
+            w2.buf.as_ptr(),
+            scale.buf.as_ptr(),
+            x.buf.as_ptr(),
+            y.buf.as_ptr(),
+        );
+        let (mv, kv) = (m as i32, k as i32);
+        // One block per row (see gemv_q4sym_f32) — grid=M for full MLP, not capped.
+        let grid = (m as u32).max(1);
+        self.launch_kernargs(
+            "gemv_q2sym_f32",
+            [grid, 1, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr w2p, ptr sp, ptr xp, ptr yp, i32 mv, i32 kv],
+        )
+    }
+    /// Fine pass of the two-stage lm_head: exact bf16 dot for `k_sel` shortlisted
+    /// rows of `w` [V,H] against `xb` [H] (bf16), scatter-written to `out[idx[k]]`.
+    /// `out` must be pre-filled with -inf (unselected vocab → dropped by softmax).
+    pub fn gemv_bf16_gather_f32(
+        &mut self,
+        w: &GpuTensor,
+        idx: &GpuTensor,
+        xb: &GpuTensor,
+        out: &GpuTensor,
+        k_sel: usize,
+        h: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_bf16_gather_f32",
+            kernels::GEMV_BF16_GATHER_F32_SRC,
+            "gemv_bf16_gather_f32",
+        )?;
+        let (wp, ip, xp, op) = (
+            w.buf.as_ptr(),
+            idx.buf.as_ptr(),
+            xb.buf.as_ptr(),
+            out.buf.as_ptr(),
+        );
+        let (kv, hv) = (k_sel as i32, h as i32);
+        let grid = (k_sel as u32).min(8192);
+        self.launch_kernargs(
+            "gemv_bf16_gather_f32",
+            [grid, 1, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr ip, ptr xp, ptr op, i32 kv, i32 hv],
+        )
+    }
+    /// GPU top-K pass 1/3: global min/max of `coarse` [V] as order-preserving u32 keys,
+    /// written to the tail of `stats` [nbins+2] (`stats[nbins]` init 0xFFFFFFFF,
+    /// `stats[nbins+1]` init 0). See kernels/src/lmhead_coarse_minmax.hip.
+    pub fn lmhead_coarse_minmax(
+        &mut self,
+        coarse: &GpuTensor,
+        stats: &GpuTensor,
+        v: usize,
+        nbins: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "lmhead_coarse_minmax",
+            kernels::LMHEAD_COARSE_MINMAX_SRC,
+            "lmhead_coarse_minmax",
+        )?;
+        let (cp, sp) = (coarse.buf.as_ptr(), stats.buf.as_ptr());
+        let (vv, nb) = (v as i32, nbins as i32);
+        let grid = ((v as u32).div_ceil(256)).clamp(1, 2048);
+        self.launch_kernargs(
+            "lmhead_coarse_minmax",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr cp, i32 vv, ptr sp, i32 nb],
+        )
+    }
+
+    /// GPU top-K pass 2/3: histogram `coarse` [V] into `stats[0..nbins)` linear bins over
+    /// the key range read from `stats[nbins..nbins+2]` (device-side, no host round-trip).
+    /// `stats` bins pre-zeroed. See kernels/src/lmhead_coarse_hist.hip.
+    pub fn lmhead_coarse_hist(
+        &mut self,
+        coarse: &GpuTensor,
+        stats: &GpuTensor,
+        v: usize,
+        nbins: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "lmhead_coarse_hist",
+            kernels::LMHEAD_COARSE_HIST_SRC,
+            "lmhead_coarse_hist",
+        )?;
+        let (cp, sp) = (coarse.buf.as_ptr(), stats.buf.as_ptr());
+        let (vv, nb) = (v as i32, nbins as i32);
+        let grid = ((v as u32).div_ceil(256)).clamp(1, 2048);
+        self.launch_kernargs(
+            "lmhead_coarse_hist",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr cp, i32 vv, ptr sp, i32 nb],
+        )
+    }
+
+    /// GPU top-K pass 3/3: compact indices with key >= `tau` (u32 bits) into `idx`,
+    /// bumping `counter`. See kernels/src/lmhead_coarse_compact.hip.
+    pub fn lmhead_coarse_compact(
+        &mut self,
+        coarse: &GpuTensor,
+        idx: &GpuTensor,
+        counter: &GpuTensor,
+        v: usize,
+        tau: u32,
+        cap: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "lmhead_coarse_compact",
+            kernels::LMHEAD_COARSE_COMPACT_SRC,
+            "lmhead_coarse_compact",
+        )?;
+        let (cp, ip, np) = (coarse.buf.as_ptr(), idx.buf.as_ptr(), counter.buf.as_ptr());
+        let (vv, tv, capv) = (v as i32, tau as i32, cap as i32);
+        let grid = ((v as u32).div_ceil(256)).clamp(1, 2048);
+        self.launch_kernargs(
+            "lmhead_coarse_compact",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr cp, i32 vv, i32 tv, ptr ip, ptr np, i32 capv],
+        )
+    }
+
     /// Generic GEMV BF16×BF16 → BF16: `w` [M,K], `x` [K], `y` [M]. gfx1103 wave32.
     pub fn gemv_bf16_bf16(
         &mut self,
@@ -4801,11 +5009,6 @@ impl Gpu {
             0,
             "gemv_oq8_grouped: K must be a multiple of group"
         );
-        self.ensure_kernel(
-            "gemv_oq8_grouped",
-            kernels::GEMV_OQ8_GROUPED_SRC,
-            "gemv_oq8_grouped",
-        )?;
         let wp = w_i8.buf.as_ptr();
         let wsp = w_scales.buf.as_ptr();
         let xp = x_f32.buf.as_ptr();
@@ -4813,6 +5016,26 @@ impl Gpu {
         let mi = m as i32;
         let ki = k as i32;
         let gi = group as i32;
+        // Bandwidth-optimized v2 (128-bit loads + 2 groups/wave) when K % 512 == 0.
+        if k % 512 == 0 {
+            self.ensure_kernel(
+                "gemv_oq8_grouped_v2",
+                kernels::GEMV_OQ8_GROUPED_V2_SRC,
+                "gemv_oq8_grouped_v2",
+            )?;
+            return self.launch_kernargs(
+                "gemv_oq8_grouped_v2",
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &kernargs![ptr wp, ptr wsp, ptr xp, ptr yp, i32 mi, i32 ki, i32 gi],
+            );
+        }
+        self.ensure_kernel(
+            "gemv_oq8_grouped",
+            kernels::GEMV_OQ8_GROUPED_SRC,
+            "gemv_oq8_grouped",
+        )?;
         self.launch_kernargs(
             "gemv_oq8_grouped",
             [m as u32, 1, 1],
@@ -4821,11 +5044,82 @@ impl Gpu {
             &kernargs![ptr wp, ptr wsp, ptr xp, ptr yp, i32 mi, i32 ki, i32 gi],
         )
     }
+
+    /// Opus Quant **W8A8** decode GEMV (batch=1): int8 weight × int8 activation,
+    /// per-group scales on both sides, `sdot4` int32 dot. `xq_i8`/`xs` are the
+    /// shared pre-quantized (FWHT-rotated) activation from `quantize_act_oq8`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_oq8_w8a8_grouped(
+        &mut self,
+        w_i8: &GpuTensor,
+        w_scales: &GpuTensor,
+        xq_i8: &GpuTensor,
+        xs: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(group, 256, "gemv_oq8_w8a8_grouped: group must be 256");
+        assert_eq!(
+            k % group,
+            0,
+            "gemv_oq8_w8a8_grouped: K must be a multiple of group"
+        );
+        self.ensure_kernel(
+            "gemv_oq8_w8a8_grouped",
+            kernels::GEMV_OQ8_W8A8_GROUPED_SRC,
+            "gemv_oq8_w8a8_grouped",
+        )?;
+        let wp = w_i8.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xqp = xq_i8.buf.as_ptr();
+        let xsp = xs.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let gi = group as i32;
+        self.launch_kernargs(
+            "gemv_oq8_w8a8_grouped",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr wp, ptr wsp, ptr xqp, ptr xsp, ptr yp, i32 mi, i32 ki, i32 gi],
+        )
+    }
     /// y = A_q8_0 * x (quantized GEMV for Q8_0)
     /// F16-weight × F32-input GEMV. y[m] = W_f16[m, k] @ x_f32[k].
     /// Keeps full F32 input precision — use this for full-precision F16
     /// weights instead of the WMMA F16×F16 path (which converts the F32
     /// input to F16 first, losing ~13 bits of mantissa).
+    /// Convert `n` f32 elements in `src` to f16 in `dst` (persistent buffers).
+    /// Used to build an untied F16 lm_head from the F32 tied-embed table.
+    pub fn convert_f32_to_f16_into(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "convert_f32_to_f16",
+            kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC,
+            "convert_f32_to_f16",
+        )?;
+        let in_ptr = src.buf.as_ptr();
+        let out_ptr = dst.buf.as_ptr();
+        let n_val = n as i32;
+        let grid = n.div_ceil(256) as u32;
+        self.launch_kernargs(
+            "convert_f32_to_f16",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr in_ptr, ptr out_ptr, i32 n_val],
+        )
+    }
+
     pub fn gemv_f16_xf32(
         &mut self,
         weight: &GpuTensor,
@@ -4843,9 +5137,12 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
 
+        // Cap the grid and grid-stride over rows: at huge M (lm_head, 262k rows)
+        // one workgroup/row makes the command processor dominate (dispatch-bound).
+        let grid = (m as u32).min(8192);
         let r = self.launch_kernargs(
             "gemv_f16_xf32",
-            [m as u32, 1, 1],
+            [grid, 1, 1],
             [32, 1, 1],
             0,
             &kernargs![ptr w_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val],
