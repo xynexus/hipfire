@@ -4285,6 +4285,8 @@ pub const LMHEAD_COARSE_HIST_SRC: &str =
 pub const LMHEAD_COARSE_COMPACT_SRC: &str =
     include_str!("../../../kernels/src/lmhead_coarse_compact.hip");
 pub const GEMV_BF16_BF16_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_bf16.hip");
+pub const GEMV_BF16L3_SRC: &str = include_str!("../../../kernels/src/gemv_bf16l3.hip");
+pub const GEMV_BF16_VEC8_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_vec8.hip");
 pub const GEMV_IU8_I32_SRC: &str = include_str!("../../../kernels/src/gemv_iu8_i32.hip");
 pub const GEMV_IU4_I32_SRC: &str = include_str!("../../../kernels/src/gemv_iu4_i32.hip");
 

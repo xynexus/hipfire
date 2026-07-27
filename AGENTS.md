@@ -46,12 +46,24 @@ the relevant docs under `docs/`.
   The former pre-fork `master` history is preserved as the archival
   `master-prefork` branch; do not base new work on it or merge it wholesale into
   `master` unless the user explicitly requests historical recovery work.
-- Start feature and fix work from an up-to-date `upstream/master` on a descriptive
+- **`origin` (github.com/xynexus/hipfire) is the only baseline.** `upstream`
+  (github.com/Kaden-Schutt/hipfire) is the pre-fork original and is
+  **disconnected** — we do not track, fetch, rebase onto, or merge from it. If
+  the remote is still configured locally, ignore it. Comparing against it is
+  actively misleading: it has 23 crates to our ~99, differs by 1500+ files, and
+  lacks whole crates this tree depends on, so a diff against `upstream/master`
+  will report an unrelated codebase rather than in-flight work.
+- Start feature and fix work from an up-to-date `origin/master` on a descriptive
   topic branch. Prefer reviewed pull requests for integration; commit or push
   directly to `master` only when the user explicitly requests that workflow.
-- Before meaningful changes, fetch `upstream` and rebase or merge the topic branch
-  onto the latest `upstream/master` when the worktree state allows it. Do not
-  rewrite published shared history without explicit approval.
+- Before meaningful changes, fetch `origin` and rebase or merge the topic branch
+  onto the latest `origin/master` when the worktree state allows it. Check
+  `origin/master` — never `upstream` — for competing in-flight work before a
+  refactor. Do not rewrite published shared history without explicit approval.
+- `git stash` is unusable in this repo: the untracked `.agents/` symlink tree
+  makes it fail, and a failed `stash` followed by `stash pop` will restore an
+  unrelated older stash over your work. Use `git show HEAD:<path>` or
+  `git diff <path>` to compare against HEAD instead.
 - Preserve unrelated user changes. When committing or pushing, stage only files
   that belong to the current task and use descriptive messages.
 

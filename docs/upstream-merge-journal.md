@@ -1,5 +1,11 @@
 # Upstream Merge Journal — feature/dispatch-unification
 
+> **HISTORICAL — superseded.** Kaden-Schutt/hipfire has since been disconnected
+> as an upstream; `origin` (xynexus/hipfire) is the only baseline. The sync state
+> recorded below ("0 commits behind", "identical to our local master") has not
+> been true for a long time — the fork has diverged by 700+ commits and 1500+
+> files. Do not act on this document. See AGENTS.md § Branch And Git.
+
 **Date:** 2026-06-05  
 **Upstream remote:** https://github.com/Kaden-Schutt/hipfire.git  
 **Upstream/master HEAD:** `02634f4c` (same as our local master — fully in sync)  
