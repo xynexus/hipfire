@@ -190,9 +190,68 @@ and at slice width 4** — plus a v1-vs-v2 regression check.
    per token falling 37.0 MB -> 0.289 MB at batch 128) is where the real win sits,
    and it needs a full-size run to observe.
 
-Not yet run: a full `--sequences 128 --context 2048` run to re-measure GFLOP/s and
-weight bandwidth against the 0.07%-of-peak baseline, and any check at slice widths
-above 4.
+### Full-size measurement (128 seq x 2048 ctx, 262,144 rows, 40 blocks)
+
+| | v1 baseline | v2 @ slice 128 | |
+|---|---|---|---|
+| per block | 4m04s | **1m24s** (execute 1m21s, load 3s) | 2.90x |
+| per token per block | 1.077 ms | **0.320 ms** | **3.36x** |
+| whole run | 2h35m (block work) | **1h08m33s** incl. pre-flight + KLD | |
+
+Execute time was flat across all 40 layers (mean 80.9s, min 79, max 83) and load is
+3s of each, so the prefetch being disabled on this box
+(`swap_free_below_25_percent`) does not distort it.
+
+**The change did what it was designed to do and the bottleneck moved.** Weight
+traffic per block fell 9.70 TB -> 75.8 GB (128x, matching the arithmetic at the top
+of this document), taking implied weight bandwidth from ~35 GB/s to ~0.90 GB/s.
+This document predicted that would leave a ~0.25 s/block bandwidth floor; measured
+execute is 84 s/block, **336x above it**. On the same accounting the effective rate
+goes 34 GFLOP/s (0.07% of peak) -> ~114 GFLOP/s (**0.24% of peak**).
+
+### What the remaining time is NOT
+
+Two hypotheses were tested and both failed, so neither should be re-proposed
+without new evidence:
+
+1. **Launch count is not the bottleneck.** The MoE path was issuing three launches
+   per row (gather, SwiGLU, scattered scaled-add); counted from the code, ~1,664 of
+   ~1,720 launches per slice (97%) were per-row at width 128, ~3.5M per block.
+   Batching those three (`zaya_gather_rows_f32`, `zaya_silu_mul_gate_up_f32`,
+   `zaya_scatter_scaled_add_f32`) removed ~20% of all launches and **execute time
+   did not move** — 1m22s before, 1m20-1m22s after. The kernels are kept: they are
+   bit-identical, strictly fewer launches, and the right structure. They are not a
+   speedup.
+2. **Slice width is nearly exhausted at 128.** The same job at width 32 vs 128
+   (identical 262,144 rows, only the width differing) gives 115.2s vs 80.9s execute
+   per block. Fitting `T(w) = A + B/w` over those two points:
+
+   | width | execute/block | width-dependent share |
+   |---|---|---|
+   | 32 | 115.2s *(measured)* | 39.7% |
+   | 64 | 92.3s *(predicted, untested)* | 24.8% |
+   | **128** | **80.9s** *(measured)* | **14.1%** |
+   | 256 | 75.2s *(predicted)* | 7.6% |
+
+   Width genuinely matters from 32 to 128 (1.42x), but by 128 only 14% of execute is
+   width-dependent, so doubling to 256 would buy ~7%. **Two points fit a
+   two-parameter model exactly**, so the `1/w` form is assumed, not verified — the
+   cheap falsification is a width-64 run, which the model says should land at ~92s
+   execute per block. Per-layer timing is flat, so ~5 layers suffice.
+
+### What it probably IS
+
+The `A = 69.5s` floor is **86% of execute at width 128** and is width-independent by
+construction. Against this document's own estimate of ~1.1e13 FLOP/block for Hessian
+accumulation that implies ~160 GFLOP/s, a plausible rate for a memory-bound `XᵀX`.
+So the prediction in "Why" — that Hessian accumulation would dominate once the
+forward was batched — appears to be correct. Batching `capture_by_id` to `n=S` cut
+its launch count but not its arithmetic, which is O(rows x hidden²) however the rows
+are grouped. Attacking that floor, not the dispatch shape, is the next lever.
+
+Not run: slice widths above 128 (capped by sequence count — needs e.g.
+`--sequences 256 --context 1024`), the width-64 falsification, and any profile that
+would confirm the Hessian attribution directly.
 
 ## Validation gate (as originally specified)
 
