@@ -229,20 +229,29 @@ without new evidence:
    | width | execute/block | width-dependent share |
    |---|---|---|
    | 32 | 115.2s *(measured)* | 39.7% |
-   | 64 | 92.3s *(predicted, untested)* | 24.8% |
+   | **64** | **~95s** *(predicted 95.0, **measured 97.3**)* | 26.8% |
    | **128** | **80.9s** *(measured)* | **14.1%** |
    | 256 | 75.2s *(predicted)* | 7.6% |
 
    Width genuinely matters from 32 to 128 (1.42x), but by 128 only 14% of execute is
-   width-dependent, so doubling to 256 would buy ~7%. **Two points fit a
-   two-parameter model exactly**, so the `1/w` form is assumed, not verified — the
-   cheap falsification is a width-64 run, which the model says should land at ~92s
-   execute per block. Per-layer timing is flat, so ~5 layers suffice.
+   width-dependent, so doubling to 256 would buy ~7%.
+
+   **The `1/w` form was a two-point fit, so it was falsified rather than assumed.**
+   Prediction committed before the run: width 64 lands at ~95s execute per block,
+   from a fit that had only seen widths 32 and 128. Measured: 97, 98, 97s — mean
+   **97.3s, +2.5%**. The model survives a point it never saw.
+
+   Compare early layers against early layers. Early layers run hot in every run
+   (width 32 drifts -4.2% from early to 40-layer mean, width 128 -1.7%), so testing a
+   width-64 early reading against a 40-layer-mean fit understates the agreement — it
+   would have shown +5.4% against a 92.3s prediction and looked like a near-miss.
 
 ### What it probably IS
 
-The `A = 69.5s` floor is **86% of execute at width 128** and is width-independent by
-construction. Against this document's own estimate of ~1.1e13 FLOP/block for Hessian
+The `A` floor is **86% of execute at width 128** and is width-independent by
+construction. It is also robust to how the fit is done — 69.5s from the
+40-layer-mean fit, 69.7s from the early-layer fit — so it is a real term rather than
+an artifact of fitting two points to two parameters. Against this document's own estimate of ~1.1e13 FLOP/block for Hessian
 accumulation that implies ~160 GFLOP/s, a plausible rate for a memory-bound `XᵀX`.
 So the prediction in "Why" — that Hessian accumulation would dominate once the
 forward was batched — appears to be correct. Batching `capture_by_id` to `n=S` cut
@@ -250,8 +259,8 @@ its launch count but not its arithmetic, which is O(rows x hidden²) however the
 are grouped. Attacking that floor, not the dispatch shape, is the next lever.
 
 Not run: slice widths above 128 (capped by sequence count — needs e.g.
-`--sequences 256 --context 1024`), the width-64 falsification, and any profile that
-would confirm the Hessian attribution directly.
+`--sequences 256 --context 1024`), and any profile that would confirm the Hessian
+attribution directly.
 
 ## Validation gate (as originally specified)
 
