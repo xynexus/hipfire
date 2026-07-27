@@ -1263,16 +1263,16 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
 /// `run_simple_ar` / `decode_loop` seam, mirroring `generate_gemma3`). The
 /// LLaMA / Mistral / plain-Qwen3 (arch_id 0/1) generate path — routes through the
 /// `ServingBackend` seam (P3.2). Unlike qwen2, llama needs chat-framing, so this
-/// builds `prompt_tokens` (the model's jinja `chat_template` when
-/// `HIPFIRE_JINJA_CHAT=1`, else the hand-rolled `ChatFrame` scaffold honoring
+/// builds `prompt_tokens` (the model's jinja `chat_template` by default, opt out
+/// with `HIPFIRE_JINJA_CHAT=0` for the hand-rolled `ChatFrame` scaffold honoring
 /// `assistant_prefix` / raw-completion) — the same framing the qwen35-shared
 /// `generate()` applied — then prefills those tokens and runs the shared
 /// `decode_loop` (full temperature/top-p sampling via P3.3). Fast paths
 /// (DFlash/MTP/tools-execution) are out of scope here; correctness first.
 /// nemotron_h (arch_id 14) / pure Mamba-2 (arch_id 15) generate path — the same
 /// dense-AR `ServingBackend` seam as `generate_llama`, driving the Mamba-capable
-/// `NemotronModel` backend. Frames the prompt (jinja `chat_template` when
-/// `HIPFIRE_JINJA_CHAT=1`, else the hand-rolled `ChatFrame`), prefills the
+/// `NemotronModel` backend. Frames the prompt (jinja `chat_template` by default,
+/// opt out with `HIPFIRE_JINJA_CHAT=0` for the hand-rolled `ChatFrame`), prefills the
 /// framed tokens (which builds per-block recurrent/KV state), then runs the
 /// shared `decode_loop`. Fast paths are out of scope; correctness first.
 #[allow(clippy::too_many_arguments)]
@@ -1666,8 +1666,13 @@ pub fn generate_llama(
     let raw = effective_raw(m);
     let prompt_tokens: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let try_jinja = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1")
-            && m.chat_template.is_some();
+        // Prefer the model's own jinja template when present (opt out with
+        // HIPFIRE_JINJA_CHAT=0). The hand-rolled ChatFrame never emits a leading
+        // BOS, which makes BOS-sensitive arch-0/1 models (e.g. MiniCPM5-1B)
+        // degenerate; the real template is authoritative. A render failure falls
+        // back to Plain below. Matches the opt-out gate used by every other arm.
+        let try_jinja = m.chat_template.is_some()
+            && std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = prompt_frame::JinjaChatFrame {
