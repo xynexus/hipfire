@@ -15,6 +15,6 @@ hipfire-lock = { path = "../hipfire-lock" }
 hipfire-model = { path = "../hipfire-model" }
 libc.workspace = true
 serde_json = "1"
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt"] }
 tracing.workspace = true
 uuid.workspace = true

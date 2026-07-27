@@ -39,6 +39,40 @@ into full investigations here.
   re-injected, weights byte-identical); with this fix, re-quantizing from a v2
   bf16 source now embeds them correctly at emit time.
 - Confidence: High (root-caused, unit-tested; re-quant end-to-end recommended).
+## [Open] hipfire-daemon inference worker crashes under model-swap churn (GPU fault)
+- Category: Reliability / Correctness (worker process)
+- Location: hipfire-daemon worker (spawned by `hipfire serve` via
+  crates/hipfire-daemon-adapter/src/lib.rs); GPU load/unload + decode path.
+- Summary: The `hipfire-daemon` inference worker (a child of the `hipfire serve`
+  front-end) dies intermittently. Reproduced under sustained model-swap churn on
+  gfx1103: crash at req 308 (`MiniCPM5-1B.oq4.25++.coarse`, a 48-token decode)
+  after 307 clean reloads; also observed under a single coding agent's light
+  normal use. It is cumulative, not a leak (worker RSS flat), not a concurrency
+  race (a `text_concurrency` limiter serializes loads), and not a plain OOM
+  (45 GB GTT budget). Signature: GPU-state accumulation across many model
+  load/unload cycles, tripping a fault on a subsequent decode. Exact fault line
+  still UNCAPTURED at the time of filing — now capturable, see below.
+- Two contributing DEFECTS, both FIXED (observability, PR
+  `fix/daemon-crash-logging-and-worker-health`):
+  1. The worker died SILENTLY — its stderr was only re-emitted to the front-end's
+     (variably-routed) stderr and its death was a silent EOF `break`, so the
+     backtrace/signal evaporated. FIX: set `RUST_BACKTRACE=1` on the worker, tee
+     its stderr to a durable `~/.hipfire/daemon.log`, log an EOF death marker, and
+     log the exit status/signal via `DaemonEngine::worker_alive`
+     (`try_wait`). Verified: a SIGKILL now logs `signal: 9 (SIGKILL)` + a
+     daemon.log marker.
+  2. `hipfire status` reported `healthy` while the worker was dead — it only pinged
+     the HTTP front-end. FIX: `/health` now probes the worker and reports
+     `status:degraded` + `worker_alive:false`; `hipfire status` renders
+     `degraded (inference worker down)` with a pointer to daemon.log.
+- Also found (NOT fixed — follow-up): the worker does NOT auto-respawn. After it
+  dies, requests fail with raw `Broken pipe (os error 32)` until `hipfire restart`.
+  Needs: respawn-on-death + a clean "worker down" error (crash-handling, #3).
+- Next: re-run under the durable log to capture the real signal/backtrace, then
+  fix the GPU fault. Mitigation: the `*.coarse` variants load heavier FP32 KV
+  (no `q8` override) which raises swap-churn stress.
+- Confidence: High on reproduction + the two observability fixes; root cause of
+  the GPU fault itself pending a captured trace.
 
 ## [RESOLVED] Batched prefill garbage for bf16/f16 llama models (was: "attention_q8_0_kv_batched masked prefill garbage for decoupled head_dim")
 - Category: Correctness / Dispatch

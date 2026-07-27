@@ -76,16 +76,69 @@ fn set_load_progress(current: u32, total: u32, phase: &str) {
 /// decode; only a true EOF (0 bytes) or a hard IO error stops us. Load progress
 /// no longer comes from here — it arrives as structured `load_progress` frames
 /// on stdout (see `Daemon::load`).
+/// Durable log for the inference worker's stderr, alongside `serve.log`. The
+/// worker's output — including any panic backtrace or HIP fault — is teed here
+/// so a crash trace survives the worker's death regardless of how the
+/// front-end's own stderr happens to be routed (pidfile daemon, foreground,
+/// captured pipe, …). This is the file to read after a silent worker crash.
+fn daemon_log_path() -> Option<PathBuf> {
+    // Mirror `hipfire_config::hipfire_dir()` (`$HOME/.hipfire`) without taking a
+    // dependency on that crate from the adapter.
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire").join("daemon.log"))
+}
+
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn spawn_stderr_progress_reader(stderr: ChildStderr) {
+    let log_path = daemon_log_path();
     tokio::spawn(async move {
+        // Best-effort: open the durable daemon log in append mode so successive
+        // worker (re)spawns accumulate a continuous crash history. A failure to
+        // open it must not disrupt the required drain below.
+        let mut log = match log_path.as_ref() {
+            Some(p) => tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .await
+                .ok(),
+            None => None,
+        };
         let mut reader = BufReader::new(stderr);
         let mut buf: Vec<u8> = Vec::with_capacity(256);
         loop {
             buf.clear();
             match reader.read_until(b'\n', &mut buf).await {
-                Ok(0) => break, // EOF: daemon closed stderr / exited.
+                Ok(0) => {
+                    // EOF: the worker closed stderr / exited. Record a durable
+                    // marker so a silent (signal) death is not invisible — the
+                    // exit status itself is logged separately via
+                    // `is_worker_alive` when the engine is next probed.
+                    if let Some(log) = log.as_mut() {
+                        let marker = format!(
+                            "[hipfire-daemon] {} worker stderr closed — inference worker exited (crash or shutdown)\n",
+                            unix_secs()
+                        );
+                        let _ = log.write_all(marker.as_bytes()).await;
+                        let _ = log.flush().await;
+                    }
+                    tracing::error!(
+                        "hipfire-daemon inference worker stderr closed — worker exited (crash or shutdown); see ~/.hipfire/daemon.log"
+                    );
+                    break;
+                }
                 Ok(_) => {}
                 Err(_) => break, // Hard IO error on the pipe.
+            }
+            // Tee the raw line (newline included) to the durable log before any
+            // trimming, so the on-disk record is byte-faithful.
+            if let Some(log) = log.as_mut() {
+                let _ = log.write_all(&buf).await;
             }
             // Trim the trailing newline for re-emit.
             if buf.last() == Some(&b'\n') {
@@ -109,22 +162,35 @@ trait DaemonTransport: Send {
         value: &'a serde_json::Value,
     ) -> BoxFuture<'a, anyhow::Result<()>>;
     fn recv_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<DaemonResponse>>;
+    /// Whether the underlying worker process is still alive. Non-process
+    /// transports (mocks) are always considered alive.
+    fn is_worker_alive(&mut self) -> bool {
+        true
+    }
 }
 
 struct StdioTransport {
-    _child: Child,
+    child: Child,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    /// Set once the worker's exit status has been logged, so a dead worker is
+    /// reported exactly once rather than on every liveness probe.
+    exit_logged: bool,
 }
 
 impl StdioTransport {
     async fn spawn(bin: &Path) -> anyhow::Result<Self> {
+        // Ensure the worker emits a backtrace on panic; an operator-provided
+        // value (e.g. `full`) wins so deeper traces can be requested.
+        let backtrace = std::env::var("RUST_BACKTRACE").unwrap_or_else(|_| "1".to_string());
         let mut child = Command::new(bin)
+            .env("RUST_BACKTRACE", backtrace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Piped (not inherited) so we can parse per-layer load progress; the
-            // reader task below re-emits every line to our stderr, so operator
-            // logs are unchanged.
+            // reader task below re-emits every line to our stderr and tees it to
+            // ~/.hipfire/daemon.log, so operator logs are unchanged and a crash
+            // trace is durably captured.
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
@@ -137,9 +203,10 @@ impl StdioTransport {
         }
 
         Ok(Self {
-            _child: child,
+            child,
             stdin,
             stdout,
+            exit_logged: false,
         })
     }
 }
@@ -187,6 +254,24 @@ impl DaemonTransport for StdioTransport {
             Ok(serde_json::from_str(line)?)
         })
     }
+
+    fn is_worker_alive(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(None) => true, // still running
+            Ok(Some(status)) => {
+                if !self.exit_logged {
+                    self.exit_logged = true;
+                    tracing::error!(
+                        "hipfire-daemon inference worker exited: {status}; see ~/.hipfire/daemon.log for its output and any backtrace"
+                    );
+                }
+                false
+            }
+            // Can't determine the state (e.g. already reaped) — assume alive to
+            // avoid a false "worker down" report.
+            Err(_) => true,
+        }
+    }
 }
 
 pub struct DaemonEngine {
@@ -218,6 +303,13 @@ impl DaemonEngine {
             transport: Box::new(transport),
             worker_key_id: None,
         })
+    }
+
+    /// Whether the inference worker process is still alive. Logs the worker's
+    /// exit status once when it is first observed dead. Used by `/health` so the
+    /// server reports `degraded` instead of `ok` when the worker has crashed.
+    pub fn worker_alive(&mut self) -> bool {
+        self.transport.is_worker_alive()
     }
 
     async fn send(&mut self, req: &DaemonRequest) -> anyhow::Result<()> {
