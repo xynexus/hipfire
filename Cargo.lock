@@ -2124,7 +2124,6 @@ dependencies = [
  "hipfire-arch-specs",
  "hipfire-gguf",
  "hipfire-kvquant",
- "hipfire-lock",
  "hipfire-model",
  "hipfire-primitives",
  "hipfire-quant-format",
