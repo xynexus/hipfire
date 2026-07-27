@@ -2779,6 +2779,16 @@ impl HfqInputFile {
             cumulative_offset = tensor_data_offset + data_size;
         }
 
+        // v2 sources keep config/tokenizer/tokenizer_config/generation_config in
+        // a TAIL blob addressed by a `tail_metadata` pointer in the front
+        // metadata. That pointer is a byte offset into THIS source file, so
+        // forwarding the front metadata verbatim to a derived (quantized)
+        // artifact leaves it dangling into the source and the derived model loads
+        // with no config or tokenizer (BUGS.md). Inline the tail's real values
+        // now so the writer re-splits them into the output's own tail. No-op for
+        // v1 or already-inlined sources.
+        let metadata_json = merge_source_tail_metadata(metadata_json, &mmap)?;
+
         Ok(Self {
             _file: file,
             mmap,
@@ -2791,6 +2801,87 @@ impl HfqInputFile {
     fn tensor_data(&self, t: &HfqInputTensor) -> &[u8] {
         &self.mmap[t.data_offset..t.data_offset + t.data_size]
     }
+}
+
+/// Resolve a v2 HFQ source's tail-metadata blob and inline its values into the
+/// front metadata. In v2, `config` / `tokenizer` / `tokenizer_config` /
+/// `generation_config` / `gguf_meta` live in a tail blob addressed by a
+/// `tail_metadata` = `{offset, size, hash}` pointer whose `offset` is a byte
+/// offset into THIS source file. Forwarding that pointer verbatim into a derived
+/// artifact leaves it dangling (it points past the derived file, into the
+/// source), so the derived model loads with no config or tokenizer. Inlining the
+/// real values here — and dropping the container-level `tail_metadata` /
+/// `hfq_format` keys that the writer regenerates — lets `hfq_out::write_hfq`
+/// rebuild a correct tail for the output. Mirrors the runtime's
+/// `merge_tail_metadata`. A v1 source (or one with no tail pointer) is returned
+/// unchanged.
+fn merge_source_tail_metadata(front_json: String, mmap: &[u8]) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind};
+    let mut front: serde_json::Value = serde_json::from_str(&front_json).map_err(|e| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("HFQM front metadata not JSON: {e}"),
+        )
+    })?;
+    let Some(tail_meta) = front.get("tail_metadata").cloned() else {
+        return Ok(front_json);
+    };
+    let offset = tail_meta
+        .get("offset")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "HFQM v2 tail offset missing"))?
+        as usize;
+    let size = tail_meta
+        .get("size")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "HFQM v2 tail size missing"))?
+        as usize;
+    let end = offset
+        .checked_add(size)
+        .filter(|&e| e <= mmap.len())
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "HFQM v2 tail range {offset}..+{size} exceeds source size {}",
+                    mmap.len()
+                ),
+            )
+        })?;
+    let bytes = &mmap[offset..end];
+    if let Some(expected) = tail_meta
+        .get("hash")
+        .and_then(|h| h.get("value"))
+        .and_then(|v| v.as_str())
+    {
+        let actual = hipfire_quantize::hfq_out::xxh64_hex_bytes(bytes);
+        if actual != expected {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("HFQM v2 tail hash mismatch: expected {expected}, got {actual}"),
+            ));
+        }
+    }
+    let tail: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("HFQM v2 tail metadata not JSON: {e}"),
+        )
+    })?;
+    if let Some(full) = tail.get("metadata").cloned() {
+        if let (Some(front_map), Some(full_map)) = (front.as_object_mut(), full.as_object()) {
+            for (k, v) in full_map {
+                front_map.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+    // The writer regenerates these container-level keys from the inlined values;
+    // dropping them here prevents a stale source pointer from riding along.
+    if let Some(map) = front.as_object_mut() {
+        map.remove("tail_metadata");
+        map.remove("hfq_format");
+    }
+    serde_json::to_string(&front).map_err(|e| Error::new(ErrorKind::InvalidData, e))
 }
 
 // ─── XXH64 provenance hashing ───────────────────────────────────────────────
@@ -14093,6 +14184,82 @@ mod hfq_block_diag {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Build a fake source mmap with a v2 tail blob at `offset`, plus the
+    /// matching front `tail_metadata` pointer. Returns (front_json, mmap_bytes).
+    fn synthetic_v2_source(front_extra: serde_json::Value, tail_meta: serde_json::Value) -> (String, Vec<u8>) {
+        let tail = json!({ "format": "hipfire.hfq.tail.v1", "metadata": tail_meta });
+        let tail_bytes = serde_json::to_vec(&tail).unwrap();
+        let offset = 64usize; // arbitrary padded start
+        let mut mmap = vec![0u8; offset];
+        mmap.extend_from_slice(&tail_bytes);
+        let hash = hipfire_quantize::hfq_out::xxh64_hex_bytes(&tail_bytes);
+        let mut front = json!({
+            "architecture": "llama",
+            "hfq_format": "hipfire.hfq.v2",
+            "tail_metadata": {
+                "format": "hipfire.hfq.tail.v1",
+                "offset": offset as u64,
+                "size": tail_bytes.len() as u64,
+                "hash": { "algorithm": "xxh64", "seed": 0, "value": hash },
+            },
+        });
+        for (k, v) in front_extra.as_object().unwrap() {
+            front.as_object_mut().unwrap().insert(k.clone(), v.clone());
+        }
+        (serde_json::to_string(&front).unwrap(), mmap)
+    }
+
+    #[test]
+    fn merge_source_tail_inlines_config_and_tokenizer() {
+        let (front, mmap) = synthetic_v2_source(
+            json!({}),
+            json!({
+                "config": { "hidden_size": 1536 },
+                "tokenizer": "TOKENIZER_JSON_BLOB",
+                "generation_config": { "eos_token_id": 1 },
+            }),
+        );
+        let merged = merge_source_tail_metadata(front, &mmap).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        // Tail values are inlined as proper JSON values...
+        assert_eq!(v["config"]["hidden_size"], 1536);
+        assert_eq!(v["tokenizer"], "TOKENIZER_JSON_BLOB");
+        assert_eq!(v["generation_config"]["eos_token_id"], 1);
+        // ...front keys survive...
+        assert_eq!(v["architecture"], "llama");
+        // ...and the container-level keys the writer regenerates are stripped.
+        assert!(v.get("tail_metadata").is_none());
+        assert!(v.get("hfq_format").is_none());
+    }
+
+    #[test]
+    fn merge_source_tail_front_wins_on_conflict() {
+        // A key present in BOTH front and tail keeps the FRONT value.
+        let (front, mmap) = synthetic_v2_source(
+            json!({ "config": { "hidden_size": 9999 } }),
+            json!({ "config": { "hidden_size": 1536 } }),
+        );
+        let merged = merge_source_tail_metadata(front, &mmap).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["config"]["hidden_size"], 9999);
+    }
+
+    #[test]
+    fn merge_source_tail_noop_without_pointer() {
+        // v1 / already-inlined source: no tail_metadata → returned unchanged.
+        let front = json!({ "architecture": "llama", "config": { "hidden_size": 1536 } }).to_string();
+        let merged = merge_source_tail_metadata(front.clone(), &[]).unwrap();
+        assert_eq!(merged, front);
+    }
+
+    #[test]
+    fn merge_source_tail_rejects_hash_mismatch() {
+        let (front, mut mmap) = synthetic_v2_source(json!({}), json!({ "config": { "hidden_size": 1536 } }));
+        // Corrupt the tail bytes so the stored hash no longer matches.
+        *mmap.last_mut().unwrap() ^= 0xFF;
+        assert!(merge_source_tail_metadata(front, &mmap).is_err());
+    }
 
     #[test]
     fn sentence_transformers_sidecars_are_ingested_from_disk() {
