@@ -12,36 +12,47 @@ into full investigations here.
 - Scope: Architectural
 - Confidence: High
 
-## [High] `attention_q8_0_kv_batched` masked prefill: garbage for decoupled head_dim
-- Category: Correctness / Kernels
-- Location: crates/hipfire-runtime/src/llama.rs `forward_prefill_chunk` (~L980) →
-  crates/hipfire-rdna/src/dispatch/attention.rs `attention_q8_0_kv_batched_masked`,
-  kernels/src/attention_q8_0_kv_batched.hip and
-  kernels/src/gfx1103/attention_q8_0_kv_batched.gfx1103.hip
-- Summary: The batched masked Q8-KV attention used by the serving prefill chunk
-  produces garbage logits for models with a DECOUPLED head_dim (q_dim =
-  n_heads·head_dim ≠ hidden), e.g. MiniCPM5-1B (hidden 1536, n_heads 16,
-  n_kv_heads 2, head_dim 128 → q_dim 2048). Numerical bisection vs a per-token
-  reference (example `debug_batched_prefill_divergence`): `prefill_forward`
-  (attention_causal_batched) is correct (cosine 0.99977, argmax match); the
-  `forward_prefill_batch` → `forward_prefill_chunk` flash/masked path diverges
-  hard (cosine −0.18, disjoint top-5), garbage from its first real batch (n≥4).
-  NOT the gfx1103 register-softmax variant alone (forcing the generic LDS kernel
-  is also garbage), NOT the KV write, NOT the Rust dispatch (head_dim/q_dim are
-  threaded correctly and the scratch buffers are q_dim-sized). So the defect is
-  in the attention_q8_0_kv_batched compute for the q_dim≠hidden / GQA geometry
-  (both kernel variants) or a shared upstream in the chunk. Only surfaced once
-  bf16 llama weights became batchable (native-bf16 loader + is_batchable_la bf16);
-  previously such models ran per-token and never hit this path.
-- Suggested fix: Root-cause the q_dim≠hidden handling in attention_q8_0_kv_batched
-  (generic + gfx1103) and add a decoupled-head_dim parity test (mirror
-  parity_kvarn_fused_flash). WORKAROUND IN PLACE: LlamaBackend::prefill routes
-  through prefill_forward (attention_causal_batched, verified correct + batched)
-  instead of forward_prefill_batch — crates/hipfire-arch-llama/src/arch.rs.
-- Scope: arch-0/1 (llama family) serving prefill with quantized KV on
-  decoupled-head_dim models. Standard head_dim (q_dim==hidden) untested but
-  likely unaffected.
-- Confidence: High (numerically bisected)
+## [RESOLVED] Batched prefill garbage for bf16/f16 llama models (was: "attention_q8_0_kv_batched masked prefill garbage for decoupled head_dim")
+- Category: Correctness / Dispatch
+- Location: crates/hipfire-runtime/src/llama.rs `forward_prefill_chunk`
+  (QKV / wo / gate+up / down projection dispatch)
+- Root cause (CONFIRMED, not the attention kernel): `is_batchable_la`
+  (crates/hipfire-runtime/src/dispatch.rs L100 `bf16_f16_wmma` arm) marks BF16/F16
+  weights batchable on every WMMA arch incl. gfx1103, so a native-bf16 llama model
+  (e.g. MiniCPM5-1B.bf16) routes into `forward_prefill_chunk`. But the chunk's four
+  per-linear projection blocks only had arms for the quantized formats
+  (6bit / q8 / mq3 / fp4 / else=HFQ4). BF16/F16 matched NONE, so every projection
+  fell through the `else` to `gemm_qkv_hfq4g256` / `gemm_*_hfq4g256_residual`, which
+  reinterpret the raw bf16 weight bytes as 4-bit HFQ4 blocks — garbage from layer 0.
+  Only q_dim≠hidden was incidental (MiniCPM happens to be both bf16 AND decoupled);
+  the true trigger is the bf16/f16 weight dtype. The attention kernels
+  (attention_q8_0_kv_batched generic + gfx1103), the Q8 KV write, and the KV read
+  stride were all verified CORRECT. The original bisection couldn't isolate it
+  because BOTH the mis-projection and the attention live inside path C and it only
+  compared final logits; path B (`prefill_forward`) uses the dtype-dispatched
+  `weight_gemm`, which handles bf16 — that's why B was clean.
+- Fix: add BF16/F16 arms to all four projection blocks in `forward_prefill_chunk`,
+  routing through `crate::weights::weight_gemm` (identical to the correct
+  `prefill_forward` path). Verified with `debug_batched_prefill_divergence` on
+  MiniCPM5-1B.bf16 / gfx1103: path C (flash/masked) cosine vs per-token reference
+  went from **−0.194 → 0.99996**, argmax now matches at every prefix length
+  (n=4/6/8). Regression guard: `chunk_projection_handles_dtype` helper + a
+  `debug_assert` in the chunk + the no-GPU unit test
+  `llama::tests::chunk_projection_covers_all_batchable_dtypes`, which asserts every
+  dtype `is_batchable_la` accepts has an explicit projection arm (so batchability
+  and projection coverage can't drift apart again).
+- Serving route (measured, decided): with the projection fix BOTH batched
+  prefill paths are correct, so the earlier `prefill_forward` route in
+  LlamaBackend::prefill (crates/hipfire-arch-llama/src/arch.rs) is no longer a
+  correctness workaround. A clean same-build A/B on gfx1103 / MiniCPM5-1B.bf16
+  (`hipfire bench`, 5 reps) shows `prefill_forward` (attention_causal_batched) at
+  pp512 **602.3 ± 2.4 t/s** vs the fixed chunked path (attention_q8_0_kv_batched)
+  at **580.8 ± 2.3 t/s** — the `prefill_forward` route is ~3.6% faster (tg128
+  identical, ~11.9 t/s). So it is RETAINED on perf grounds, and the chunk-path
+  projection fix stands as correctness + the coverage guard. (The one-time "1227
+  t/s garbage" figure was the mis-dispatched HFQ4 kernel reading half the bytes,
+  never a real correct speed.)
+- Confidence: High (root-caused + numerically verified end-to-end + benchmarked).
 
 ## [Low] Opportunistic .unwrap() → error-handling cleanup (convention, not a tracked bug)
 - Category: Reliability / Maintainability

@@ -157,13 +157,14 @@ impl LlamaBackend {
 
 impl SimpleAr for LlamaBackend {
     fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {
-        // Route through `prefill_forward` (attention_causal_batched), NOT
-        // `forward_prefill_batch` (the flash/masked `forward_prefill_chunk` path):
-        // the latter is numerically broken for decoupled-head_dim models
-        // (q_dim != hidden, e.g. MiniCPM 2048 vs 1536) — it produces garbage
-        // logits from its first real batch (n>=4). See BUGS.md. `prefill_forward`
-        // is also batched and is bisection-verified correct (cosine 0.9998 vs the
-        // per-token reference).
+        // Route through `prefill_forward` (attention_causal_batched) rather than
+        // `forward_prefill_batch` (the flash/masked `forward_prefill_chunk` path).
+        // BOTH are batched and — since the bf16/f16 projection gap in
+        // `forward_prefill_chunk` was fixed (BUGS.md) — numerically correct
+        // (bisection cosine 0.9998+ vs the per-token reference). `prefill_forward`
+        // is kept because it benches marginally faster: a clean same-build A/B on
+        // gfx1103 / MiniCPM5-1B.bf16 gave pp512 602 t/s here vs 581 t/s for the
+        // chunked path (tg128 identical).
         let logits =
             llama::prefill_forward(gpu, &self.weights, &self.config, tokens, &mut self.kv_cache)
                 .map_err(|e| format!("llama prefill_forward: {e:?}"))?;
