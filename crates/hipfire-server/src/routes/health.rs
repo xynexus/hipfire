@@ -38,6 +38,17 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         let loaded = state.loaded_model_path.lock().await;
         loaded.clone()
     };
+    // Probe the inference worker so a crashed worker surfaces as `degraded`
+    // instead of the front-end reporting a blanket `ok`. `None` = no worker has
+    // been spawned yet (e.g. a diffusion-only server), which is not a fault.
+    let worker_alive: Option<bool> = {
+        let mut engine = state.engine.lock().await;
+        engine.as_mut().map(|e| e.worker_alive())
+    };
+    let status = match worker_alive {
+        Some(false) => "degraded",
+        _ => "ok",
+    };
     let diffusion = diffusion_health_payload(&state).await;
     let active_model = loaded
         .clone()
@@ -93,7 +104,8 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         }
     }
     Json(json!({
-        "status": "ok",
+        "status": status,
+        "worker_alive": worker_alive,
         "version": hipfire_build_info::VERSION,
         "model": loaded,
         "active_model": active_model,
