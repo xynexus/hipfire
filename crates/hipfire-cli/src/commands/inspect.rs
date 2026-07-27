@@ -13,6 +13,9 @@ use std::path::PathBuf;
 use clap::Args;
 use hipfire_arch_api::ArchId;
 use hipfire_config::LoadedConfig;
+use hipfire_hfq_tooling::{
+    ComposeManifest, HFQM_COMPOSE_FORMAT, HFQM_COMPOSE_FORMAT_V1, HFQM_COMPOSE_KEY,
+};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::quant::QuantType;
 use serde_json::{json, Value};
@@ -54,14 +57,15 @@ pub fn run(args: InspectArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", path.display()))?;
 
     let meta: Value = serde_json::from_str(&hfq.metadata_json).unwrap_or_else(|_| json!({}));
+    let components = component_summary(&meta)?;
     let arch_name = hipfire_archs::registry()
         .get(ArchId(hfq.arch_id as u16))
         .map(|a| a.family);
 
     if args.json {
-        print_json(&args.target, &path, &hfq, &meta, arch_name);
+        print_json(&args.target, &path, &hfq, &meta, arch_name, &components);
     } else {
-        print_human(&path, &hfq, &meta, arch_name, args.tensors);
+        print_human(&path, &hfq, &meta, arch_name, args.tensors, &components);
     }
     Ok(())
 }
@@ -168,12 +172,48 @@ fn module_kind_counts(hfq: &HfqFile) -> BTreeMap<String, usize> {
     counts
 }
 
+/// Decode the compose manifest using metadata/index bytes only. This remains
+/// cheap for model-sized bundles and makes corrupt manifests visible instead
+/// of silently presenting the artifact as an ordinary monolith.
+fn component_summary(meta: &Value) -> anyhow::Result<Vec<Value>> {
+    let Some(value) = meta.get(HFQM_COMPOSE_KEY) else {
+        return Ok(Vec::new());
+    };
+    let manifest: ComposeManifest = serde_json::from_value(value.clone())
+        .map_err(|error| anyhow::anyhow!("invalid {HFQM_COMPOSE_KEY} manifest: {error}"))?;
+    if manifest.format != HFQM_COMPOSE_FORMAT && manifest.format != HFQM_COMPOSE_FORMAT_V1 {
+        anyhow::bail!("unsupported compose manifest format {:?}", manifest.format);
+    }
+    Ok(manifest
+        .components
+        .into_iter()
+        .map(|component| {
+            let encoding = match component.source_format.as_str() {
+                "tria-v1" => "opaque-bytes",
+                "hfqm" => "hfqm-mapped-entries",
+                _ => "unknown",
+            };
+            json!({
+                "role": component.tag,
+                "filename": component.filename,
+                "source_format": component.source_format,
+                "original_arch_id": component.arch_id,
+                "encoding": encoding,
+                "byte_len": component.byte_len,
+                "sha256": component.sha256,
+                "entries": component.stored_entries.len(),
+            })
+        })
+        .collect())
+}
+
 fn print_human(
     path: &std::path::Path,
     hfq: &HfqFile,
     meta: &Value,
     arch_name: Option<&str>,
     list_tensors: bool,
+    components: &[Value],
 ) {
     let name = path
         .file_name()
@@ -196,6 +236,23 @@ fn print_human(
     let sidecars = sidecar_tags(meta);
     if !sidecars.is_empty() {
         println!("sidecars: {}", sidecars.join(", "));
+    }
+    if !components.is_empty() {
+        println!("\ncomponents:");
+        for component in components {
+            println!(
+                "  {}: {} ({}, arch {}, {}, {}, sha256 {})",
+                component["role"].as_str().unwrap_or("?"),
+                component["filename"].as_str().unwrap_or("?"),
+                component["source_format"].as_str().unwrap_or("?"),
+                component["original_arch_id"],
+                component["encoding"].as_str().unwrap_or("?"),
+                fmt_bytes(component["byte_len"].as_u64().unwrap_or(0)),
+                component["sha256"]
+                    .as_str()
+                    .unwrap_or("legacy-v1-unavailable"),
+            );
+        }
     }
 
     // Model shape.
@@ -267,6 +324,7 @@ fn print_json(
     hfq: &HfqFile,
     meta: &Value,
     arch_name: Option<&str>,
+    components: &[Value],
 ) {
     let shape: serde_json::Map<String, Value> = SHAPE_FIELDS
         .iter()
@@ -321,6 +379,7 @@ fn print_json(
         "quant_family": meta_get(meta, "quant_family"),
         "kv_mode": meta_get(meta, "kv_mode"),
         "sidecars": sidecar_tags(meta),
+        "components": components,
         "shape": shape,
         "quant_histogram": histogram,
         "totals": { "tensors": total_tensors, "bytes": total_bytes },
@@ -329,4 +388,39 @@ fn print_json(
         "metadata": meta,
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compose_component_summary_is_index_only_and_role_aware() {
+        let metadata = json!({
+            HFQM_COMPOSE_KEY: {
+                "format": HFQM_COMPOSE_FORMAT,
+                "components": [{
+                    "tag": "dflash",
+                    "filename": "Model.dflash.oq4+.hfq",
+                    "arch_id": 20,
+                    "tensors": ["fc.weight"],
+                    "metadata_json": "{}",
+                    "source_format": "hfqm",
+                    "byte_len": 1024,
+                    "sha256": "abc",
+                    "stored_entries": [{
+                        "stored_name": "__hipfire_component/dflash/1/fc.weight",
+                        "original_name": "fc.weight",
+                        "original_offset": 4096
+                    }]
+                }]
+            }
+        });
+        let components = component_summary(&metadata).unwrap();
+        assert_eq!(components[0]["role"], "dflash");
+        assert_eq!(components[0]["original_arch_id"], 20);
+        assert_eq!(components[0]["encoding"], "hfqm-mapped-entries");
+        assert_eq!(components[0]["byte_len"], 1024);
+        assert_eq!(components[0]["sha256"], "abc");
+    }
 }

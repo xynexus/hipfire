@@ -1295,6 +1295,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-cohere2"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-model",
+ "hipfire-rdna",
+ "hipfire-runtime",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-cohere2-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-deepseek4"
 version = "0.3.0"
 dependencies = [
@@ -1413,6 +1433,7 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-dispatch",
+ "hipfire-model",
  "hipfire-rdna",
  "hipfire-runtime",
  "serde_json",
@@ -1589,6 +1610,7 @@ name = "hipfire-arch-specs"
 version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
+ "hipfire-arch-cohere2-spec",
  "hipfire-arch-deepseek4-spec",
  "hipfire-arch-dots-ocr-spec",
  "hipfire-arch-embeddinggemma-spec",
@@ -1712,6 +1734,7 @@ dependencies = [
  "hipfire-diffusion",
  "hipfire-diffusion-coexist",
  "hipfire-generate",
+ "hipfire-hfq-tooling",
  "hipfire-lock",
  "hipfire-model",
  "hipfire-runtime",
@@ -1737,7 +1760,9 @@ dependencies = [
 name = "hipfire-coexistence"
 version = "0.3.0"
 dependencies = [
+ "hipfire-arch-cohere2",
  "hipfire-arch-gemma3",
+ "hipfire-arch-gemma4",
  "hipfire-arch-qwen35",
  "hipfire-arch-zaya",
  "hipfire-daemon-adapter",
@@ -1984,6 +2009,17 @@ name = "hipfire-hash"
 version = "0.3.0"
 
 [[package]]
+name = "hipfire-hfq-tooling"
+version = "0.3.0"
+dependencies = [
+ "hipfire-quant-format",
+ "hipfire-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "hipfire-hneurons"
 version = "0.3.0"
 dependencies = [
@@ -2212,6 +2248,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "tracing",
  "tracing-subscriber",
  "twox-hash 2.1.2",
@@ -2274,6 +2311,7 @@ version = "0.3.0"
 dependencies = [
  "base64",
  "hip-bridge",
+ "hipfire-arch-cohere2",
  "hipfire-arch-deepseek4",
  "hipfire-arch-dots-ocr",
  "hipfire-arch-embeddinggemma",

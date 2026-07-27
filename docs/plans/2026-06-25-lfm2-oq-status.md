@@ -17,8 +17,8 @@ Artifacts:
 | `/srv/huggingface/_Hipfire/lfm2.5-350m-oqplus.hfq` | 222,740,208 B | legacy OQ+ W4A8 tag; distinct from calibrated public `oq4+` |
 | `/srv/huggingface/_Hipfire/lfm2.5-350m-conv0-in-proj-smoke.hessian.bin` | 4,194,371 B | HFHS v1 smoke Hessian for `model.layers.0.conv.in_proj` only; 1 sequence x 16 tokens |
 | `/srv/huggingface/_Hipfire/lfm2.5-350m-oq4plus-smoke.hfq` | 222,742,256 B | OQ4 storage from the old `oq4+` LDLQ spelling; under the current parser this is `oq4++` semantics (`--format oq4++ --hessian`), and only `model.layers.0.conv.in_proj.weight` has real LDLQ+AWQ calibration |
-| `/srv/huggingface/_Hipfire/LFM2.5-350M-awq-smoke.oq4+.hfq` | 222,740,208 B | canonical public `oq4+` spelling; AWQ/activation-aware smoke artifact derived from the one-tensor Hessian diagonal, without LDLQ error feedback |
-| `/srv/huggingface/_Hipfire/LFM2.5-350M-awq-smoke.oq8+.hfq` | 366,395,120 B | canonical public `oq8+` spelling; AWQ/activation-aware smoke artifact derived from the one-tensor Hessian diagonal, without LDLQ error feedback |
+| `/srv/huggingface/_Hipfire/LFM2.5-350M-awq-smoke--oq4+.hfq` | 222,740,208 B | canonical public `oq4+` spelling; AWQ/activation-aware smoke artifact derived from the one-tensor Hessian diagonal, without LDLQ error feedback |
+| `/srv/huggingface/_Hipfire/LFM2.5-350M-awq-smoke--oq8+.hfq` | 366,395,120 B | canonical public `oq8+` spelling; AWQ/activation-aware smoke artifact derived from the one-tensor Hessian diagonal, without LDLQ error feedback |
 
 No full-model LFM2 `*.hessian.bin`, `*.calib.hfq`, or imatrix sidecar was found
 under `/srv/huggingface` during the initial pass. The smoke HFHS sidecar above
@@ -30,7 +30,7 @@ admission artifacts.
 
 On 2026-06-26, `collect_artifacts` gained arch 11 (`lfm2`) support for text
 decoder calibration. A four-token plumbing smoke on
-`/srv/huggingface/_Hipfire/LFM2.5-350M-awq-smoke.oq8+.hfq` wrote
+`/srv/huggingface/_Hipfire/LFM2.5-350M-awq-smoke--oq8+.hfq` wrote
 `/tmp/lfm2-350m-collector-smoke.calib.hfq` (402 MiB) with 92 Hessian tensors
 and 92 imatrix tensors; max `diag(H)` versus `sum(x^2)` relative error was
 `0.000e0`. This proves the collector path and residual-GEMV capture hook for
@@ -69,9 +69,9 @@ Short prompt: `The capital of France is a city with`
 | legacy OQ+ W4A8 | `prefill_parity_lfm2moe` | passed; prompt cosine 0.99925757, continuation cosine 0.99959501 |
 | OQ4+ smoke act8 | `HIPFIRE_OQ4_PREFILL_ACT_BITS=8 prefill_parity_lfm2moe` | passed; loader attached `model.layers.0.conv.in_proj.awq_scale.weight`; prompt cosine 0.99970197, continuation cosine 0.99974224 |
 | OQ4+ smoke act4 | `HIPFIRE_OQ4_PREFILL_ACT_BITS=4 infer_lfm2moe --max 2` | smoke passed with AWQ sidecar attached, IDs `[523,523]` |
-| canonical OQ4+ AWQ smoke act8 | `HIPFIRE_OQ4_PREFILL_ACT_BITS=8 prefill_parity_lfm2moe` on `LFM2.5-350M-awq-smoke.oq4+.hfq` | passed; loader attached `model.layers.0.conv.in_proj.awq_scale.weight`; prompt cosine 0.99949416, continuation cosine 0.99976073 |
-| canonical OQ4+ AWQ smoke act4 | `HIPFIRE_OQ4_PREFILL_ACT_BITS=4 infer_lfm2moe --max 2` on `LFM2.5-350M-awq-smoke.oq4+.hfq` | smoke passed with AWQ sidecar attached, IDs `[574,574]` |
-| canonical OQ8+ AWQ smoke act8 | `prefill_parity_lfm2moe` on `LFM2.5-350M-awq-smoke.oq8+.hfq` | passed; loader attached `model.layers.0.conv.in_proj.awq_scale.weight`; prompt cosine 0.99933023, continuation cosine 0.99911341 |
+| canonical OQ4+ AWQ smoke act8 | `HIPFIRE_OQ4_PREFILL_ACT_BITS=8 prefill_parity_lfm2moe` on `LFM2.5-350M-awq-smoke--oq4+.hfq` | passed; loader attached `model.layers.0.conv.in_proj.awq_scale.weight`; prompt cosine 0.99949416, continuation cosine 0.99976073 |
+| canonical OQ4+ AWQ smoke act4 | `HIPFIRE_OQ4_PREFILL_ACT_BITS=4 infer_lfm2moe --max 2` on `LFM2.5-350M-awq-smoke--oq4+.hfq` | smoke passed with AWQ sidecar attached, IDs `[574,574]` |
+| canonical OQ8+ AWQ smoke act8 | `prefill_parity_lfm2moe` on `LFM2.5-350M-awq-smoke--oq8+.hfq` | passed; loader attached `model.layers.0.conv.in_proj.awq_scale.weight`; prompt cosine 0.99933023, continuation cosine 0.99911341 |
 
 The vendored AMD Matrix Instruction Calculator reports both required gfx11
 integer WMMA instructions:
@@ -84,8 +84,8 @@ integer WMMA instructions:
 Measured 2026-06-26 on gfx1103 with repo-built `infer_lfm2moe` dev example,
 `HIPFIRE_PREFILL_BATCHED=1`, and GPU lock held through the repo-built
 `hipfire lock` command. Artifacts:
-`/srv/huggingface/_Hipfire/LFM2.5-350M-awq-smoke.oq4+.hfq` and
-`/srv/huggingface/_Hipfire/LFM2.5-350M-awq-smoke.oq8+.hfq`.
+`/srv/huggingface/_Hipfire/LFM2.5-350M-awq-smoke--oq4+.hfq` and
+`/srv/huggingface/_Hipfire/LFM2.5-350M-awq-smoke--oq8+.hfq`.
 
 Prompt: `The capital of France is a city with` (8 embedded-tokenizer tokens).
 Timings include the example's printed model-load, prefill, and decode windows;
@@ -188,7 +188,7 @@ cargo run -q -p hipfire-daemon --features arch-lfm2moe
 ```
 
 Model:
-`/srv/huggingface/_Hipfire/LFM2.5-350M-awq-smoke.oq4+.hfq`.
+`/srv/huggingface/_Hipfire/LFM2.5-350M-awq-smoke--oq4+.hfq`.
 
 The probe returned `generate_batch_prefill_ready` with
 `mode=lfm2_serial_prefill_batch`. A two-session prompt batch completed with
@@ -218,7 +218,7 @@ prefilled the remaining 18 tokens, and reached the same final logical position
 
 The direct daemon handoff from `generate_batch_prefill` to `generate` now also
 works for LFM2 AR sessions. A host smoke loaded
-`/srv/huggingface/_Hipfire/LFM2.5-350M-awq-smoke.oq4+.hfq`, prefetched a session
+`/srv/huggingface/_Hipfire/LFM2.5-350M-awq-smoke--oq4+.hfq`, prefetched a session
 to logical position 18, then decoded through `session_id` +
 `prefill_already_done=true` with `prefill_ms=0` and one generated token (`sky`).
 
@@ -427,9 +427,9 @@ Two 2026-06-26 probes make that distinction clear:
 
 | Probe | Artifact | Result |
 |---|---|---|
-| Spread prompt windows | `/tmp/LFM2.5-350M.dflash.fcfit-normscan-spread8.oq4+.hfq` from `/tmp/lfm2-dflash-teacher-dump-spread8` | block replay improved to `argmax_hits=14/24`, `topk_hits=19/24`, `weighted_ce=1.519566820625048`; same-prompt EOS loop can accept under `--ignore-eos`, but two non-EOS prompts still had `accepted=0`, `drafted=42` |
-| Generation-boundary window | `/tmp/LFM2.5-350M.dflash.fcfit-normscan-genstart-testcode.oq4+.hfq` from `/tmp/lfm2-dflash-teacher-dump-genstart-testcode` with `--positions 11` | block replay at `position=11`, `seed_token=523` hit `argmax_hits=3/3`, `topk_hits=3/3`, `weighted_ce=1.2733865757292784`; real acceptance on the same non-EOS prompt reached `accepted=3`, `drafted=12`, `accept_rate=0.25` |
-| Two-prompt generation-boundary windows | `/tmp/LFM2.5-350M.dflash.fcfit-normscan-genstart-2prompt.oq4+.hfq` from `/tmp/lfm2-dflash-teacher-dump-genstart-2prompt` with `--prompt-mode separate --position-mode generation` | metadata recorded `prompt_offsets=[0,11]`, `prompt_lengths=[11,5]`, `prompt_indices=[0,1]`, `positions=[11,5]`; block replay hit `argmax_hits=4/6`, `topk_hits=6/6`, `weighted_ce=1.47687549959154`; real acceptance on the two non-EOS prompts reached `accepted=12`, `drafted=15`, `accept_rate=0.8` |
+| Spread prompt windows | `/tmp/LFM2.5-350M.dflash.fcfit-normscan-spread8--oq4+.hfq` from `/tmp/lfm2-dflash-teacher-dump-spread8` | block replay improved to `argmax_hits=14/24`, `topk_hits=19/24`, `weighted_ce=1.519566820625048`; same-prompt EOS loop can accept under `--ignore-eos`, but two non-EOS prompts still had `accepted=0`, `drafted=42` |
+| Generation-boundary window | `/tmp/LFM2.5-350M.dflash.fcfit-normscan-genstart-testcode--oq4+.hfq` from `/tmp/lfm2-dflash-teacher-dump-genstart-testcode` with `--positions 11` | block replay at `position=11`, `seed_token=523` hit `argmax_hits=3/3`, `topk_hits=3/3`, `weighted_ce=1.2733865757292784`; real acceptance on the same non-EOS prompt reached `accepted=3`, `drafted=12`, `accept_rate=0.25` |
+| Two-prompt generation-boundary windows | `/tmp/LFM2.5-350M.dflash.fcfit-normscan-genstart-2prompt--oq4+.hfq` from `/tmp/lfm2-dflash-teacher-dump-genstart-2prompt` with `--prompt-mode separate --position-mode generation` | metadata recorded `prompt_offsets=[0,11]`, `prompt_lengths=[11,5]`, `prompt_indices=[0,1]`, `positions=[11,5]`; block replay hit `argmax_hits=4/6`, `topk_hits=6/6`, `weighted_ce=1.47687549959154`; real acceptance on the two non-EOS prompts reached `accepted=12`, `drafted=15`, `accept_rate=0.8` |
 
 The fit/eval tools now have explicit split controls so overfit progress can be
 separated from held-out evidence:
@@ -442,7 +442,7 @@ separated from held-out evidence:
 
 A train-one/hold-one split on the two-prompt dump is the first useful negative
 held-out result. Training only prompt 0 rows and block 0 wrote
-`/tmp/LFM2.5-350M.dflash.fcfit-normscan-genstart-train1.oq4+.hfq`. Replay on
+`/tmp/LFM2.5-350M.dflash.fcfit-normscan-genstart-train1--oq4+.hfq`. Replay on
 the training block remained perfect (`argmax_hits=3/3`, `topk_hits=3/3`,
 `weighted_ce=1.2733865757292784`), but replay on held-out block 1 failed
 (`argmax_hits=0/3`, `topk_hits=0/3`, `weighted_ce=4.883694050832167`,
@@ -475,7 +475,7 @@ lfm2_dflash_fit_norm \
 ```
 
 The scorer selected `max_scale=1.0`, wrote
-`/tmp/LFM2.5-350M.dflash.fcfit-normscore-genstart-train1-heldout.oq4+.hfq`,
+`/tmp/LFM2.5-350M.dflash.fcfit-normscore-genstart-train1-heldout--oq4+.hfq`,
 and recorded `train_topk_hits=3/3`, `train_weighted_ce=1.6965071768019788`,
 `score_topk_hits=0/3`, `score_weighted_ce=2.0648041856145696`,
 `score_hidden_cosine=0.1259602825514884`. Replaying held-out block 1 with
@@ -489,7 +489,7 @@ raw plain-text prompt dump
 `prompt_lengths=[13,11,11,12,10,9,18,11]`; the first six prompts were used for
 FC/norm fitting and the last two blocks for scoring. The held-out scorer
 selected `max_scale=2.0` and wrote
-`/tmp/LFM2.5-350M.dflash.fcfit-normscore-genstart-8prompt-train6-score2.oq4+.hfq`.
+`/tmp/LFM2.5-350M.dflash.fcfit-normscore-genstart-8prompt-train6-score2--oq4+.hfq`.
 Replay showed strong training fit but weak held-out agreement:
 `train_argmax_hits=14/18`, `train_topk_hits=15/18`,
 `train_weighted_ce=1.117955096017171`; held-out was `argmax_hits=0/6`,
@@ -503,10 +503,10 @@ Repeating the same split with hand-rendered ChatML prompts produced a
 non-degenerate acceptance surface. The dump
 `/tmp/lfm2-dflash-teacher-dump-genstart-chat8` recorded
 `prompt_lengths=[21,19,19,20,18,17,26,19]`. The FC fit on the first six prompts
-wrote `/tmp/LFM2.5-350M.dflash.fcfit-genstart-chat8-train6.oq4+.hfq`
+wrote `/tmp/LFM2.5-350M.dflash.fcfit-genstart-chat8-train6--oq4+.hfq`
 (`train_mse=1.766190e-6`). Held-out norm scoring selected `max_scale=8.0` and
 wrote
-`/tmp/LFM2.5-350M.dflash.fcfit-normscore-genstart-chat8-train6-score2.oq4+.hfq`.
+`/tmp/LFM2.5-350M.dflash.fcfit-normscore-genstart-chat8-train6-score2--oq4+.hfq`.
 The final candidate improved held-out hidden alignment and top-k agreement over
 both the seed and FC-only sidecars, but still had zero held-out argmax hits:
 
@@ -550,7 +550,7 @@ on blocks `6..8`, scanned `--scan-max-scale 1,2,4,8`, and swept
 (`epochs=8`, `lr=0.5`, `max=2`) because it preserved the best held-out top-k
 while lowering held-out CE versus the more aggressive no-demote candidates.
 The output
-`/tmp/LFM2.5-350M.dflash.fitnorm-logitgrid-genstart-chat8-train6-score2.oq4+.hfq`
+`/tmp/LFM2.5-350M.dflash.fitnorm-logitgrid-genstart-chat8-train6-score2--oq4+.hfq`
 replayed as `train_argmax_hits=6/18`, `train_topk_hits=15/18`,
 `train_weighted_ce=2.0112734864721213`; held-out replay was
 `argmax_hits=0/6`, `topk_hits=4/6`, `weighted_ce=3.0941116705143004`,
@@ -567,7 +567,7 @@ A larger 32-prompt ChatML-style corpus now lives at
 `/tmp/lfm2-dflash-teacher-dump-chat32` has 578 prompt rows and 32
 generation-boundary DFlash blocks. `lfm2_dflash_fit_fc` fit all prompt rows
 from the seed block-CE sidecar and wrote
-`/tmp/LFM2.5-350M.dflash.fcfit-chat32.oq4+.hfq`
+`/tmp/LFM2.5-350M.dflash.fcfit-chat32--oq4+.hfq`
 (`train_mse=2.711137e-6`). The integrated norm/logit-bias grid then trained on
 blocks `0..24`, scored on blocks `24..32`, selected `max_scale=4`, and selected
 a no-demote bias candidate (`epochs=4`, `lr=0.25`, `max=4`). Held-out score
@@ -586,7 +586,7 @@ The same 32-prompt bundle also tested a final-layer `down_proj` fit and a
 demoting logit-bias variant. `lfm2_dflash_fit_down` solved
 `down_proj(gate_up) ~= dflash_block_target_hidden - residual_ffn` on the
 training split and wrote
-`/tmp/LFM2.5-350M.dflash.fcdownfit-chat32-train24.oq4+.hfq`
+`/tmp/LFM2.5-350M.dflash.fcdownfit-chat32-train24--oq4+.hfq`
 (`delta_mse=1.785100e-1`). Re-fitting norm/logit bias after that selected
 `max_scale=2` and a no-demote bias candidate (`epochs=4`, `lr=0.25`, `max=4`).
 Independent replay was slightly better on held-out CE but not acceptance:
