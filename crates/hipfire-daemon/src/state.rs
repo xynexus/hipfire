@@ -25,7 +25,9 @@ use hipfire_state::GenericSequenceStateArena;
 
 use crate::queue::SchedulerStats;
 use crate::transport::ReplySink;
-use crate::{DrafterTrainSession, LoraTrainSession, ResourceReservationManager};
+use crate::{
+    CalibrateDaemonSession, DrafterTrainSession, LoraTrainSession, ResourceReservationManager,
+};
 
 pub(crate) struct DaemonState {
     /// The single GPU handle. Threaded as `&mut` into every GPU-touching
@@ -67,6 +69,12 @@ pub(crate) struct DaemonState {
     /// DrafterTrainSession). Some between quanta of a run; runner drives one
     /// quantum of EPOCHS per TrainDrafter request.
     pub drafter_train_session: Option<DrafterTrainSession>,
+    /// Resident layer-preemptible calibration/induction session (see
+    /// CalibrateDaemonSession). Some between layers of a run, keyed by `run_id`;
+    /// the runner drives exactly one layer per Calibrate request. One layer is
+    /// the calibration quantum; the parked session carries the boxed adapter,
+    /// source, and job the engine borrows each turn.
+    pub calibrate_session: Option<CalibrateDaemonSession>,
     pub resource_reservations: ResourceReservationManager,
     /// Where replies go, and what they are tagged with.
     pub out: Responder,
@@ -172,6 +180,7 @@ impl DaemonState {
             dummy_model: None,
             lora_train_session: None,
             drafter_train_session: None,
+            calibrate_session: None,
             resource_reservations: ResourceReservationManager::from_env(),
             out: Responder::to_stdout(),
             scheduler_stats: SchedulerStats::default(),

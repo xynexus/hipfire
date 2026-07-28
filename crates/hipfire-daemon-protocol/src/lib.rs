@@ -416,6 +416,13 @@ pub enum DaemonRequest {
     /// mirrors `TrainDrafter`. Terminal event is the shared `train_done`
     /// ([`DaemonResponse::TrainDone`]).
     TrainLora,
+    /// Wire tag `calibrate`. Raw-JSON op (the daemon re-parses the message into
+    /// the same `CalibrateCommand` the CLI parses); mirrors `TrainLora`. Runs one
+    /// calibration layer per request and parks the `DaemonCalibration` session
+    /// keyed by `run_id` between turns. Non-terminal reply is `calibrate_progress`;
+    /// terminal is `calibrate_done` (or `calibrate_paused` at a
+    /// `--pause-after-layers` boundary). The caller re-enqueues until terminal.
+    Calibrate,
     Diag,
     BenchPrefill(BenchPrefillRequest),
     Profile,

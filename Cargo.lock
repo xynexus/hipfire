@@ -2188,6 +2188,7 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-evidence",
  "hipfire-generate",
+ "hipfire-hash",
  "hipfire-hneurons",
  "hipfire-kld",
  "hipfire-kvquant",

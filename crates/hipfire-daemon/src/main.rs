@@ -1119,6 +1119,20 @@ struct DrafterTrainSession {
     quantum: usize,
 }
 
+/// Resident state of a layer-preemptible `calibrate` (induction) run. The daemon
+/// runs exactly one calibration layer per `Calibrate` request and keeps this
+/// alive between requests (keyed by `run_id`); the caller re-enqueues per layer,
+/// so induction time-slices with interactive serving. The engine lives in
+/// `hipfire_runtime::calibration::layer_stream`; `DaemonCalibration` owns the
+/// boxed native adapter, the safetensors source, and the calibration job the
+/// engine borrows each turn, so parking it here is a move. No GPU self-lock is
+/// taken (unlike the daemon-free `hipfire-coexistence calibrate` CLI): the daemon
+/// already holds the process-lifetime GPU lease.
+struct CalibrateDaemonSession {
+    run_id: String,
+    session: hipfire_runtime::calibration::layer_stream::DaemonCalibration,
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -1551,6 +1565,14 @@ fn main() {
             // served forward via activation-save at the in-forward HOOK sites is
             // the large P3 follow-on. See docs/plans/2026-07-19-daemon-training-steering.md.
             DaemonRequest::TrainLora => handlers::train::train_lora(&mut daemon_state, &msg),
+
+            // Layer-preemptible calibration/induction as a daemon op. Runs one
+            // calibration layer per request against a resident DaemonCalibration
+            // session (keyed by `run_id`); the caller re-enqueues per layer so
+            // induction time-slices with interactive serving. The artifact is
+            // byte-identical to the daemon-free `hipfire-coexistence calibrate`
+            // CLI path (both feed the same `build_calibration_run_inputs`).
+            DaemonRequest::Calibrate => handlers::calibrate::calibrate(&mut daemon_state, &msg),
 
             DaemonRequest::Diag => handlers::diag::diag(&mut daemon_state),
 
