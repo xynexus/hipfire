@@ -69,35 +69,67 @@ pub trait ToolGrammar {
 
 /// Whether `text` keeps `grammar` on a legal path — i.e. `partial + text` is a prefix
 /// of (or extends past) at least one allowed continuation.
+///
+/// Convenience for single queries. [`token_mask`] does not call this per token: it
+/// hoists the continuation work out of the vocab loop, which is the difference between
+/// microseconds and milliseconds per position.
 pub fn is_token_allowed<G: ToolGrammar + ?Sized>(grammar: &G, text: &str) -> bool {
     if grammar.is_free() {
         return true;
     }
-    let combined = format!("{}{}", grammar.partial(), text);
     let conts = grammar.allowed_continuations();
-    if matches_any(&combined, &conts) {
-        return true;
-    }
-    if grammar.allows_leading_ws() {
-        return matches_any(combined.trim_start_matches(['\n', ' ']), &conts);
-    }
-    false
+    let matcher = PositionMatcher::new(grammar.partial(), &conts);
+    matcher.allows(text)
+        || (grammar.allows_leading_ws() && matcher.allows(text.trim_start_matches(['\n', ' '])))
 }
 
-/// A candidate is viable if it is a prefix of a continuation, or already extends past
-/// one (the surplus belongs to the next state).
-fn matches_any(s: &str, conts: &[String]) -> bool {
-    conts
-        .iter()
-        .any(|cont| cont.starts_with(s) || s.starts_with(cont.as_str()))
+/// The legal-token test for one grammar position, with the per-position work done once.
+///
+/// Measured motivation: the naive form allocated a `String` per vocab entry (`partial +
+/// text`) and rebuilt the continuation list per entry, costing 8.6ms per constrained
+/// token at one candidate and ~3.9s at a thousand — which put value-level constraints out
+/// of reach. Hoisting both out of the loop leaves a byte comparison per entry.
+struct PositionMatcher<'a> {
+    /// A continuation already completed by `partial` alone: everything is legal, the
+    /// surplus belongs to the next state.
+    satisfied: bool,
+    /// For each continuation still viable from `partial`, the bytes still outstanding.
+    remainders: Vec<&'a str>,
+}
+
+impl<'a> PositionMatcher<'a> {
+    fn new(partial: &str, conts: &'a [String]) -> Self {
+        let satisfied = conts.iter().any(|c| partial.starts_with(c.as_str()));
+        let remainders = if satisfied {
+            Vec::new()
+        } else {
+            conts
+                .iter()
+                .filter_map(|c| c.strip_prefix(partial))
+                .collect()
+        };
+        Self {
+            satisfied,
+            remainders,
+        }
+    }
+
+    fn allows(&self, text: &str) -> bool {
+        // Empty tokens (placeholders) extend nothing and keep every path viable.
+        self.satisfied
+            || text.is_empty()
+            || self
+                .remainders
+                .iter()
+                .any(|r| r.starts_with(text) || text.starts_with(*r))
+    }
 }
 
 /// Populate a boolean mask over `vocab`: which tokens are legal at the current
 /// position. `out` must be at least `vocab.len()` long; entries past that are untouched.
 ///
 /// Fast path: when the grammar is free the whole mask is set true and the caller can
-/// skip masking. Hot path is an O(vocab) scan — with ~129k entries and a handful of
-/// alternatives per state it stays sub-millisecond per sample step.
+/// skip masking — which is almost every token of a normal generation.
 pub fn token_mask<G: ToolGrammar + ?Sized>(grammar: &G, vocab: &[String], out: &mut [bool]) {
     debug_assert!(out.len() >= vocab.len());
     if grammar.is_free() {
@@ -106,8 +138,15 @@ pub fn token_mask<G: ToolGrammar + ?Sized>(grammar: &G, vocab: &[String], out: &
         }
         return;
     }
+    // Hoisted: the continuation list and the prefix arithmetic are per-position, not
+    // per-token. Doing this inside the loop is what made constrained positions cost
+    // milliseconds each.
+    let conts = grammar.allowed_continuations();
+    let matcher = PositionMatcher::new(grammar.partial(), &conts);
+    let ws = grammar.allows_leading_ws();
     for (id, text) in vocab.iter().enumerate() {
-        out[id] = is_token_allowed(grammar, text);
+        out[id] =
+            matcher.allows(text) || (ws && matcher.allows(text.trim_start_matches(['\n', ' '])));
     }
 }
 
@@ -550,5 +589,120 @@ mod minicpm_tests {
             feed(&mut g, frag);
         }
         assert_eq!(g.state, XmlState::InBody, "reassembled across 7 tokens");
+    }
+}
+
+#[cfg(test)]
+mod cost_measurements {
+    use super::*;
+    use std::time::Instant;
+
+    /// A vocab shaped like a real BPE one: mostly short fragments, a realistic count.
+    /// Byte-comparison cost is what we're measuring, so fragment length matters more
+    /// than the exact strings.
+    fn synthetic_vocab(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| match i % 5 {
+                0 => format!("tok{i}"),
+                1 => format!(" {i}"),
+                2 => format!("<{i}"),
+                3 => format!("</{i}"),
+                _ => format!("_{i}ing"),
+            })
+            .collect()
+    }
+
+    /// Schema with `k` params, standing in for a value set of size `k` — the same shape
+    /// the proposed `allowed_values` constraint would produce.
+    fn schema_with(k: usize) -> Vec<ToolSchema> {
+        vec![ToolSchema {
+            name: "write_file".to_string(),
+            params: (0..k).map(|i| format!("p{i}")).collect(),
+            required: Vec::new(),
+        }]
+    }
+
+    // Measures the per-token cost at a CONSTRAINED position as the candidate set grows —
+    // the caveat in docs/todo/tool-call-judgement.md item 4. Ignored by default; run:
+    //   cargo test -p hipfire-runtime -- --ignored --nocapture grammar_cost
+    #[test]
+    #[ignore = "measurement, not a pass/fail test"]
+    fn grammar_cost_scales_with_the_candidate_set() {
+        const VOCAB: usize = 129_000;
+        let vocab = synthetic_vocab(VOCAB);
+        let mut mask = vec![false; vocab.len()];
+
+        println!("\nvocab = {VOCAB} tokens\n");
+        println!(
+            "{:>10}  {:>12}  {:>14}",
+            "candidates", "per-token", "per 20-token call"
+        );
+        println!("{}", "-".repeat(42));
+        for k in [1usize, 4, 16, 64, 256, 1_024] {
+            let mut g = MiniCpmXmlGrammar::new(schema_with(k));
+            // park it at a constrained position: choosing a param name
+            g.advance("<function name=\"write_file\"><param name=\"");
+            assert!(!g.is_free(), "must be constrained to measure the hot path");
+
+            let reps = 20;
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                token_mask(&g, &vocab, &mut mask);
+            }
+            let per = t0.elapsed() / reps;
+            println!(
+                "{k:>10}  {:>10.2}ms  {:>12.2}ms",
+                per.as_secs_f64() * 1e3,
+                per.as_secs_f64() * 1e3 * 20.0
+            );
+        }
+
+        // The free path is the one that runs for almost every token of a generation.
+        let mut g = MiniCpmXmlGrammar::new(schema_with(10));
+        g.advance("plain prose, nowhere near a call");
+        assert!(g.is_free());
+        let reps = 1000;
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            token_mask(&g, &vocab, &mut mask);
+        }
+        println!(
+            "\nfree position (the common case): {:.4}ms per token",
+            (t0.elapsed() / reps).as_secs_f64() * 1e3
+        );
+    }
+
+    // How many tokens of a real call are actually constrained: the multiplier that turns
+    // per-token cost into per-call cost.
+    #[test]
+    #[ignore = "measurement, not a pass/fail test"]
+    fn grammar_constrained_token_share_of_a_real_call() {
+        let call = "<function name=\"write_file\"><param name=\"path\">src/util.rs</param>\
+                    <param name=\"contents\"><![CDATA[pub fn double(x: i64) -> i64 {\n    x * 2\n}]]>\
+                    </param></function>";
+        let mut g = MiniCpmXmlGrammar::new(vec![ToolSchema {
+            name: "write_file".to_string(),
+            params: vec!["path".to_string(), "contents".to_string()],
+            required: vec!["path".to_string()],
+        }]);
+        // Feed it the way a tokenizer would: small fragments.
+        let (mut constrained, mut total) = (0usize, 0usize);
+        let mut buf = String::new();
+        for ch in call.chars() {
+            buf.push(ch);
+            if buf.len() < 4 {
+                continue;
+            }
+            total += 1;
+            if !g.is_free() {
+                constrained += 1;
+            }
+            g.advance(&buf);
+            buf.clear();
+        }
+        println!(
+            "\nreal call: {constrained}/{total} pseudo-tokens constrained ({:.0}%)",
+            100.0 * constrained as f64 / total as f64
+        );
     }
 }
