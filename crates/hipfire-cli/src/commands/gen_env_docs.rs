@@ -8,9 +8,10 @@
 //!
 //! This is the Rust-native replacement for the former `scripts/gen-env-docs.py`
 //! + `scripts/check-env-docs.py`. With `--check` it regenerates to memory and
-//! diffs against the committed files (plus verifies that every `HIPFIRE_*` var
+//! diffs against what is on disk (plus verifies that every `HIPFIRE_*` var
 //! named in the top-level docs is covered), exiting non-zero on drift — the
-//! freshness gate `tests/no-gpu-ci.sh` runs.
+//! freshness gate `tests/no-gpu-ci.sh` runs. Only `env_docs.rs` is tracked; the
+//! Markdown is gitignored, so its absence is not drift. See `check_file`.
 //!
 //! Two deliberate improvements over the Python it replaces:
 //!   * `source:` fields are **repo-relative**, not absolute machine paths.
@@ -98,8 +99,12 @@ pub fn run(args: GenEnvDocsArgs) -> anyhow::Result<()> {
 
     if args.check {
         let mut stale = Vec::new();
-        check_file(&doc_path, markdown.as_bytes(), &mut stale);
-        check_file(&rust_path, rust.as_bytes(), &mut stale);
+        // The Markdown is generated and gitignored, so a clean checkout simply
+        // does not have it. Requiring it made this gate unsatisfiable anywhere
+        // but a tree where someone had already run the writer. Drift detection
+        // rides on the tracked `env_docs.rs` instead.
+        check_file(&doc_path, markdown.as_bytes(), false, &mut stale);
+        check_file(&rust_path, rust.as_bytes(), true, &mut stale);
         let missing = coverage_gaps(&root, &markdown);
 
         if !stale.is_empty() || !missing.is_empty() {
@@ -768,12 +773,18 @@ fn rustfmt(src: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8(out.stdout)?)
 }
 
-fn check_file(path: &Path, expected: &[u8], stale: &mut Vec<String>) {
-    let matches = std::fs::read(path)
-        .map(|got| got == expected)
-        .unwrap_or(false);
-    if !matches {
-        stale.push(path.display().to_string());
+/// Record `path` as stale unless it matches freshly generated `expected`.
+///
+/// `required` separates the two outputs. `env_docs.rs` is tracked, so a missing
+/// file is real drift. `docs/env-vars.md` is generated and gitignored, so its
+/// absence is the normal state of a clean checkout — but if it is present it
+/// still has to match, or a stale local copy would quietly mislead whoever read
+/// it. Only `NotFound` is forgiven; an unreadable file is still a failure.
+fn check_file(path: &Path, expected: &[u8], required: bool, stale: &mut Vec<String>) {
+    match std::fs::read(path) {
+        Ok(got) if got == expected => {}
+        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => stale.push(path.display().to_string()),
     }
 }
 
@@ -799,4 +810,36 @@ fn coverage_gaps(root: &Path, markdown: &str) -> Vec<(String, String)> {
         }
     }
     missing
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_file;
+
+    /// A missing optional file is not drift, but a missing required one is —
+    /// the distinction the `--check` gate rests on. Present-and-different stays
+    /// stale either way.
+    #[test]
+    fn absent_optional_output_is_not_drift() {
+        let dir = std::env::temp_dir().join(format!("hipfire-env-docs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        let absent = dir.join("absent.md");
+        let present = dir.join("present.md");
+        std::fs::write(&present, b"stale").expect("write the scratch file");
+
+        let mut stale = Vec::new();
+        check_file(&absent, b"fresh", false, &mut stale);
+        assert!(stale.is_empty(), "an absent generated file is not drift");
+
+        check_file(&absent, b"fresh", true, &mut stale);
+        assert_eq!(stale.len(), 1, "an absent tracked file is drift");
+
+        check_file(&present, b"fresh", false, &mut stale);
+        assert_eq!(stale.len(), 2, "a present file must still match");
+
+        check_file(&present, b"stale", false, &mut stale);
+        assert_eq!(stale.len(), 2, "a matching file is never drift");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
