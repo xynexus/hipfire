@@ -64,3 +64,65 @@ pub mod triattn;
 #[cfg(feature = "deltanet")]
 pub mod weight_pager;
 pub mod weights;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Process-global "cancel the current generation" flag.
+///
+/// The daemon serves one request at a time (single serial worker), so a single
+/// process-global boolean is sufficient to signal "stop the in-flight
+/// generation". A SIGUSR1 handler (installed via
+/// [`install_generation_cancel_handler`]) sets this to `true`; the per-token
+/// decode loops poll it at their top-of-loop chokepoint and, when set, break
+/// out exactly as a natural end-of-generation would (KV cache and session state
+/// stay fully consistent — the pending, unwritten sample is simply dropped).
+///
+/// The flag is reset to `false` at the start of each generation request (see the
+/// daemon's `Generate` handler) and is also cleared by the decode-loop poll
+/// itself (via `swap(false)`), so a cancel never leaks into the next request.
+pub static GENERATION_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Poll-and-clear the generation-cancel flag. Returns `true` exactly once per
+/// SIGUSR1 delivery (the flag is atomically reset to `false`), so a decode loop
+/// that observes `true` should treat it as a natural stop and break.
+#[inline]
+pub fn take_generation_cancel() -> bool {
+    GENERATION_CANCEL.swap(false, Ordering::Relaxed)
+}
+
+/// Clear any pending cancel request. Call at the start of a generation so a
+/// stale SIGUSR1 (delivered after the previous request already finished) can't
+/// immediately cancel the fresh request.
+#[inline]
+pub fn reset_generation_cancel() {
+    GENERATION_CANCEL.store(false, Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+extern "C" fn hipfire_generation_cancel_sigusr1(_sig: libc::c_int) {
+    // Async-signal-safe: the ONLY thing this handler does is a relaxed atomic
+    // store. No allocation, no I/O, no locks — safe to run in signal context.
+    GENERATION_CANCEL.store(true, Ordering::Relaxed);
+}
+
+/// Install the SIGUSR1 handler that requests cancellation of the in-flight
+/// generation. Idempotent; safe to call once at process startup. On non-unix
+/// targets this is a no-op (the fleet is Linux).
+#[cfg(unix)]
+pub fn install_generation_cancel_handler() {
+    // SAFETY: `sigaction` with a handler that only performs an async-signal-safe
+    // atomic store. SA_RESTART so a signal delivered mid-syscall (e.g. a
+    // blocking read on the request channel) transparently restarts rather than
+    // failing with EINTR.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = hipfire_generation_cancel_sigusr1 as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+    }
+}
+
+/// No-op on non-unix targets.
+#[cfg(not(unix))]
+pub fn install_generation_cancel_handler() {}

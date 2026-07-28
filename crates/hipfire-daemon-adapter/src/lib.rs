@@ -167,6 +167,12 @@ trait DaemonTransport: Send {
     fn is_worker_alive(&mut self) -> bool {
         true
     }
+    /// OS process id of the underlying worker, if this transport is backed by a
+    /// child process. `None` for non-process transports (mocks) or once the
+    /// child has been reaped.
+    fn worker_pid(&self) -> Option<u32> {
+        None
+    }
 }
 
 struct StdioTransport {
@@ -255,6 +261,10 @@ impl DaemonTransport for StdioTransport {
         })
     }
 
+    fn worker_pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     fn is_worker_alive(&mut self) -> bool {
         match self.child.try_wait() {
             Ok(None) => true, // still running
@@ -333,6 +343,81 @@ impl DaemonEngine {
             id: request_id.into(),
         }))
         .await
+    }
+
+    /// OS process id of the inference worker, if backed by a child process.
+    pub fn worker_pid(&self) -> Option<u32> {
+        self.transport.worker_pid()
+    }
+
+    /// Cooperatively cancel the in-flight generation and drain the daemon
+    /// stream back to a clean state so this engine can be reused.
+    ///
+    /// The daemon's request channel is busy generating and cannot service an
+    /// in-band `abort`, so we signal out-of-band with SIGUSR1: the worker's
+    /// signal handler sets a process-global cancel flag that its per-token
+    /// decode loop polls and honors within ~1 token, then emits the normal
+    /// terminal `done` frame. We drain events (discarding any late tokens)
+    /// until that `done` (or an `error`) for `request_id` arrives, bounded by a
+    /// short timeout since cancellation is now fast.
+    ///
+    /// On success the worker and its loaded model stay resident and the engine
+    /// is ready for the next request. On any failure (no pid, signal failure,
+    /// timeout, or a transport read error) an `Err` is returned so the caller
+    /// can fall back to discarding the engine (the old SIGKILL-on-drop path).
+    pub async fn abort_and_drain(&mut self, request_id: &str) -> anyhow::Result<()> {
+        let pid = self
+            .worker_pid()
+            .ok_or_else(|| anyhow::anyhow!("cannot cancel: worker pid unavailable"))?;
+
+        // SAFETY: `kill(2)` with SIGUSR1 to the worker we spawned. The worker's
+        // handler only sets an atomic; delivery is harmless even if the worker
+        // has just finished (the flag is reset at the next request start).
+        #[cfg(unix)]
+        {
+            let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGUSR1) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                anyhow::bail!("failed to SIGUSR1 worker pid {pid}: {err}");
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            anyhow::bail!("cooperative cancel unsupported on this platform");
+        }
+
+        // Drain until the terminal frame for this request. Cancellation is fast,
+        // so a short bound is enough; on timeout the caller discards the engine.
+        let drain = async {
+            loop {
+                match self.recv().await? {
+                    DaemonResponse::Done(d) => {
+                        if d.id == request_id {
+                            return Ok(());
+                        }
+                        // Stale done from an earlier request; keep draining.
+                    }
+                    DaemonResponse::Error(e) => {
+                        // A terminal error for the aborted request also leaves the
+                        // stream drained; treat it as a clean stop for reuse.
+                        if e.id.as_deref() == Some(request_id) {
+                            return Ok(());
+                        }
+                        // Unrelated error frame — keep draining.
+                    }
+                    // Late tokens / tool-calls / other frames: discard and keep
+                    // draining until the terminal done/error.
+                    _ => {}
+                }
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(5), drain).await {
+            Ok(result) => result,
+            Err(_) => anyhow::bail!(
+                "timed out draining worker after cancel of request {request_id}"
+            ),
+        }
     }
 
     /// Ask the daemon to close an active thinking block and answer.

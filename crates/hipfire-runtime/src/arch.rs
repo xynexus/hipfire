@@ -982,6 +982,18 @@ pub fn decode_loop_with_timing_terminators(
     let mut emitted_tool_calls = false;
 
     while generated < ctx.max_tokens {
+        // Cooperative cancellation (SIGUSR1 → GENERATION_CANCEL). Checked at the
+        // top of the loop, which is the KV-safe chokepoint: every committed
+        // token's K/V has already been written by `decode_step` in the prior
+        // iteration, and the pending `next` sample is not yet written. Breaking
+        // here drops only that unwritten sample, leaving the cache and `pos`
+        // exactly as a natural `max_tokens` stop would — so the next request
+        // resumes on a consistent context. Treated as a natural stop
+        // (generated < max_tokens → "stop" finish_reason).
+        if crate::take_generation_cancel() {
+            stop = StopReason::MaxTokens;
+            break;
+        }
         // Stop on explicit EOS or any tokenizer-declared terminator. Feed the
         // decoded terminator only to the native state machine so a structural
         // close token can complete a tool call; it is never emitted as text.
