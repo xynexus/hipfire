@@ -105,6 +105,11 @@ pub struct AppState {
     pub batch_runner_active: std::sync::atomic::AtomicBool,
     /// Live batch-runner telemetry surfaced by `/health`.
     pub batch_telemetry: Mutex<crate::batch_runner::BatchTelemetry>,
+    /// What the listener actually bound to, recorded by `serve_loaded` once the
+    /// socket is up. `/health` reports this so clients read the real bind
+    /// instead of re-deriving it from their own (possibly newer) config. `None`
+    /// in unit tests and any context without a serve loop.
+    pub bind: StdMutex<Option<crate::bind::BindInfo>>,
     pub responses_contexts: Mutex<HashMap<String, StoredResponsesContext>>,
     pub responses_order: Mutex<VecDeque<String>>,
     pub files: Mutex<HashMap<String, StoredFile>>,
@@ -282,6 +287,7 @@ impl AppState {
             prefill_notify: Notify::new(),
             batch_inbox: Mutex::new(HashMap::new()),
             batch_runner_active: std::sync::atomic::AtomicBool::new(false),
+            bind: StdMutex::new(None),
             batch_telemetry: Mutex::new(crate::batch_runner::BatchTelemetry::default()),
             responses_contexts: Mutex::new(HashMap::new()),
             responses_order: Mutex::new(VecDeque::new()),
