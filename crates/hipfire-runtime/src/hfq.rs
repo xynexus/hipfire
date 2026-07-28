@@ -780,6 +780,7 @@ impl HfqFile {
             &meta_index,
             metadata_offset,
             data_offset,
+            base,
             n_tensors,
             file_len,
             version,
@@ -875,6 +876,7 @@ impl HfqFile {
             meta_index,
             metadata_offset,
             data_offset,
+            base,
             n_tensors,
             mmap.len(),
             version,
@@ -1361,10 +1363,18 @@ impl HfqFile {
     }
 }
 
+/// Parse the metadata+index block of one HFQM container.
+///
+/// `base` is the container's start within the file — nonzero for a container
+/// embedded in another file (a bundled LoRA or MTP head). `metadata_offset` and
+/// `data_offset` arrive already rebased by it; `base` is needed here because a
+/// v2 index stores each tensor's offset relative to the container, so it has to
+/// be rebased the same way. `base` is 0 for a standalone file.
 fn parse_hfqm_meta_index(
     meta_index: &[u8],
     metadata_offset: usize,
     data_offset: usize,
+    base: usize,
     n_tensors: usize,
     file_len: usize,
     version: u32,
@@ -1442,22 +1452,33 @@ fn parse_hfqm_meta_index(
             let offset_div32 =
                 u64::from_le_bytes(meta_index[pos..pos + 8].try_into().unwrap()) as usize;
             pos += 8;
-            offset_div32
+            // Stored relative to the container, so rebase like the header
+            // offsets. Without this an embedded container reads every tensor
+            // `base` bytes early — out of the host file's own data — returning
+            // plausible-looking garbage instead of failing.
+            //
+            // Alignment is a property of the container's own layout, so it is
+            // checked before rebasing: `base` is where the host file happened to
+            // end and is under no obligation to be 32-byte aligned.
+            let relative = offset_div32
                 .checked_mul(HFQM_V2_OFFSET_ALIGN)
                 .ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM v2 offset overflow")
-                })?
+                })?;
+            if relative % HFQM_V2_OFFSET_ALIGN != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("HFQM tensor {name} offset {relative} is not 32-byte aligned"),
+                ));
+            }
+            relative.checked_add(base).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM v2 offset overflow")
+            })?
         } else {
             let offset = cumulative_offset;
             cumulative_offset = cumulative_offset.saturating_add(data_size);
             offset
         };
-        if version >= 2 && tensor_offset % HFQM_V2_OFFSET_ALIGN != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("HFQM tensor {name} offset {tensor_offset} is not 32-byte aligned"),
-            ));
-        }
         if tensor_offset + data_size > file_len {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
