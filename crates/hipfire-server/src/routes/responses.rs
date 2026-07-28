@@ -17,8 +17,7 @@ use crate::routes::chat::{
     effective_request_max_tokens, ensure_model_loaded, execute_blocking_chat_owned,
     extract_request_image_base64, generate_request_from_chat, normalize_stop_sequences,
     request_generation_controls, required_load_max_seq, scheduler_owner_from_principal,
-    strip_visible_thinking, wait_for_prefill_scheduler_turn, AssistantDelta, ChatMessage,
-    ChatRequest, ThinkStreamFilter,
+    wait_for_prefill_scheduler_turn, AssistantDelta, ChatMessage, ChatRequest, ThinkStreamFilter,
 };
 use crate::state::{SharedState, StoredResponsesContext};
 use hipfire_auth::{RequestPrincipal, ResponseContextRecord};
@@ -63,6 +62,81 @@ pub struct ResponsesRequest {
     pub reasoning_effort: Option<String>,
     pub reasoning: Option<Value>,
     pub chat_template_kwargs: Option<Value>,
+    /// Tool declarations. Forwarded to the chat path so the model's chat template
+    /// renders its tool block — without this the template's `{% if tools %}` branch
+    /// never fires and the model is never told any tools exist.
+    pub tools: Option<Value>,
+}
+
+/// Whether the client asked to keep reasoning inline in the visible text. Mirrors the
+/// chat route's `preserve_thinking` kwarg so both routes read the same switch.
+fn preserve_thinking_kwarg(kwargs: Option<&Value>) -> bool {
+    kwargs
+        .and_then(|v| v.get("preserve_thinking"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Split a raw generation into (reasoning, visible answer).
+///
+/// Mirrors `strip_visible_thinking`'s scan exactly, but keeps the reasoning instead of
+/// discarding it, so the route can return it as its own field rather than forcing the
+/// caller to choose between "gone" and "inline". `started_in_think` covers the usual
+/// case where the template opened `<think>` in the generation prompt, so the stream has
+/// a closing marker but no opening one.
+fn split_thinking(text: &str, started_in_think: bool) -> (String, String) {
+    let mut content = text.to_string();
+    if started_in_think && !content.contains("<think>") && content.contains("</think>") {
+        content = format!("<think>{content}");
+    }
+    let (mut reasoning, mut visible) = (String::new(), String::new());
+    let mut rest = content.as_str();
+    loop {
+        let Some(open) = rest.find("<think>") else {
+            visible.push_str(rest);
+            break;
+        };
+        visible.push_str(&rest[..open]);
+        let after_open = &rest[open + "<think>".len()..];
+        let Some(close) = after_open.find("</think>") else {
+            // Unterminated block: everything after the opener is reasoning.
+            reasoning.push_str(after_open);
+            break;
+        };
+        reasoning.push_str(&after_open[..close]);
+        rest = &after_open[close + "</think>".len()..];
+    }
+    (
+        reasoning.trim().to_string(),
+        visible.replace("<|im_end|>", "").trim().to_string(),
+    )
+}
+
+/// Normalize Responses-API tool declarations to the Chat-Completions shape chat
+/// templates expect. The Responses API hoists the function fields to the top of the
+/// tool object (`{"type":"function","name":…,"parameters":…}`); HF templates emit
+/// `tool | tojson` verbatim and models are trained on the nested
+/// `{"type":"function","function":{…}}` form. Already-nested entries, non-function
+/// tool types (`web_search`, `mcp`, …) and non-array values pass through untouched.
+fn normalize_tools(tools: Option<Value>) -> Option<Value> {
+    let Some(Value::Array(items)) = tools else {
+        return tools;
+    };
+    let normalized = items
+        .into_iter()
+        .map(|tool| {
+            let flat = tool.get("type").and_then(Value::as_str) == Some("function")
+                && tool.get("function").is_none();
+            match (flat, tool) {
+                (true, Value::Object(mut inner)) => {
+                    inner.remove("type");
+                    json!({ "type": "function", "function": Value::Object(inner) })
+                }
+                (_, tool) => tool,
+            }
+        })
+        .collect();
+    Some(Value::Array(normalized))
 }
 
 pub async fn post_responses(
@@ -165,7 +239,7 @@ async fn execute_responses_owned(
         max_tokens: body.max_output_tokens.or(body.max_tokens),
         stop: body.stop.clone(),
         priority: None,
-        tools: None,
+        tools: normalize_tools(body.tools.clone()),
         system: None,
         reasoning_effort: body.reasoning_effort.clone(),
         reasoning: body.reasoning.clone(),
@@ -177,17 +251,38 @@ async fn execute_responses_owned(
     // execute_blocking_chat.
     apply_vision_content(&mut chat_body.messages, &body.input);
 
+    // Take the raw generation (reasoning included) from the chat path, then split it
+    // here. What the client asked for decides *presentation*; it no longer decides
+    // whether the reasoning is recoverable at all.
+    let client_preserve = preserve_thinking_kwarg(body.chat_template_kwargs.as_ref());
+    let mut internal_kwargs = body
+        .chat_template_kwargs
+        .clone()
+        .unwrap_or_else(|| json!({}));
+    if let Some(map) = internal_kwargs.as_object_mut() {
+        map.insert("preserve_thinking".to_string(), Value::Bool(true));
+    }
+    chat_body.chat_template_kwargs = Some(internal_kwargs);
+
     let generated =
         match execute_blocking_chat_owned(state.clone(), chat_body, scheduler_owner).await {
             Ok(generated) => generated,
             Err(error) => return Err(error),
         };
+    let (reasoning, visible) = split_thinking(&generated.text, true);
+    let text = if client_preserve {
+        generated.text.clone()
+    } else {
+        visible.clone()
+    };
 
     let response_id = format!("resp_{}", Uuid::new_v4().simple());
     let mut stored = messages;
+    // History carries the answer only — these models are trained not to re-see their
+    // own prior reasoning (the templates drop it too).
     stored.push(Message {
         role: Role::Assistant,
-        content: generated.text.clone(),
+        content: visible,
         tool_calls: Vec::new(),
         tool_call_id: None,
     });
@@ -203,7 +298,8 @@ async fn execute_responses_owned(
     Ok(response_json(
         &response_id,
         &generated.model,
-        &generated.text,
+        &text,
+        &reasoning,
         &generated.done,
     ))
 }
@@ -244,26 +340,34 @@ fn response_json(
     response_id: &str,
     model: &str,
     text: &str,
+    reasoning: &str,
     done: &hipfire_generate::DoneEvent,
 ) -> Value {
     let prompt_tokens = done.prefill_tokens.unwrap_or(0);
     let completion_tokens = done.tokens;
+    let mut message = json!({
+        "id": format!("msg_{response_id}"),
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": text,
+            "annotations": []
+        }]
+    });
+    // Reasoning rides alongside the answer rather than being folded into it, so a
+    // caller can keep it (provenance, debugging) or ignore it without re-parsing
+    // `<think>` back out of the prose. Omitted entirely when the model didn't think.
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = Value::String(reasoning.to_string());
+    }
     json!({
         "id": response_id,
         "object": "response",
         "model": model,
         "status": "completed",
-        "output": [{
-            "id": format!("msg_{response_id}"),
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "text": text,
-                "annotations": []
-            }]
-        }],
+        "output": [message],
         "output_text": text,
         "usage": {
             "input_tokens": prompt_tokens,
@@ -407,7 +511,7 @@ async fn stream_responses(
                     Some(request_max_tokens),
                 ),
                 loaded.worker_key_id,
-                None,
+                normalize_tools(body.tools.clone()),
                 None,
                 stop,
                 image_base64,
@@ -456,27 +560,39 @@ async fn stream_responses(
         }
 
         let mut output_text = String::new();
-        let mut think_filter = ThinkStreamFilter::default();
+        let client_preserve = preserve_thinking_kwarg(body.chat_template_kwargs.as_ref());
+        // The template opens `<think>` in the generation prompt, so the stream starts
+        // mid-reasoning and no opening marker ever arrives — default() would misread
+        // the whole reasoning block as answer text.
+        let mut think_filter = ThinkStreamFilter::started_in_think();
+        let mut reasoning_text = String::new();
         let result = engine
             .generate_streaming_events_controlled(gen_req, |event| {
                 if tx.is_closed() {
                     return GenerateStreamControl::Cancel;
                 }
                 if let GenerateStreamEvent::Token(token) = event {
-                    for delta in think_filter.observe(&token, false) {
-                        if let AssistantDelta::Content(text) = delta {
-                            output_text.push_str(&text);
-                            let event =
-                                response_output_text_delta_json(&response_id, &message_id, &text);
-                            match tx
-                                .try_send(Ok(sse_json_event("response.output_text.delta", event)))
-                            {
-                                Ok(()) => {}
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                    return GenerateStreamControl::Cancel;
-                                }
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                    for delta in think_filter.observe(&token, client_preserve) {
+                        // Reasoning streams on its own event so a client can render or
+                        // drop it; previously these deltas were discarded outright.
+                        let (text, event_name) = match delta {
+                            AssistantDelta::Content(text) => {
+                                output_text.push_str(&text);
+                                (text, "response.output_text.delta")
                             }
+                            AssistantDelta::Reasoning(text) => {
+                                reasoning_text.push_str(&text);
+                                (text, "response.reasoning.delta")
+                            }
+                        };
+                        let event =
+                            response_output_text_delta_json(&response_id, &message_id, &text);
+                        match tx.try_send(Ok(sse_json_event(event_name, event))) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                return GenerateStreamControl::Cancel;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
                         }
                     }
                 }
@@ -494,7 +610,8 @@ async fn stream_responses(
                     );
                 }
                 *engine_guard = Some(engine);
-                let output_text = strip_visible_thinking(output_text, false, true);
+                // Already split by the stream filter — reasoning went out on its own
+                // event, so there is nothing left to strip here.
                 let mut stored = messages;
                 stored.push(Message {
                     role: Role::Assistant,
@@ -530,7 +647,13 @@ async fn stream_responses(
                 let _ = tx
                     .send(Ok(sse_json_event(
                         "response.completed",
-                        response_json(&response_id, &model_arg, &output_text, &done),
+                        response_json(
+                            &response_id,
+                            &model_arg,
+                            &output_text,
+                            &reasoning_text,
+                            &done,
+                        ),
                     )))
                     .await;
             }
@@ -987,6 +1110,8 @@ fn responses_state_max() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // only the split test needs this — the route itself no longer strips
+    use crate::routes::chat::strip_visible_thinking;
     use std::collections::BTreeSet;
 
     use hipfire_auth::{AuthKind, NewUser, RatePolicyOverride, Scope};
@@ -1014,6 +1139,79 @@ mod tests {
             )
             .unwrap()
             .id
+    }
+
+    // Reasoning must come back as its own value, not be destroyed or left inline for the
+    // caller to re-parse. The split has to agree with `strip_visible_thinking` on the
+    // visible half, or the two routes would disagree about what the answer is.
+    #[test]
+    fn split_thinking_separates_reasoning_from_the_answer() {
+        // the usual shape: template opened <think>, so only the closer is in the stream
+        let (r, v) = split_thinking("weighing it up\n</think>\n\nThe answer is 391.", true);
+        assert_eq!(r, "weighing it up");
+        assert_eq!(v, "The answer is 391.");
+        assert_eq!(
+            v,
+            strip_visible_thinking(
+                "weighing it up\n</think>\n\nThe answer is 391.".into(),
+                false,
+                true
+            )
+        );
+
+        // explicit block mid-stream
+        let (r, v) = split_thinking("a<think>hmm</think>b", false);
+        assert_eq!((r.as_str(), v.as_str()), ("hmm", "ab"));
+
+        // no thinking at all -> empty reasoning, answer untouched
+        let (r, v) = split_thinking("just an answer", true);
+        assert!(r.is_empty());
+        assert_eq!(v, "just an answer");
+
+        // unterminated block (budget/limit cut it): keep it as reasoning, not as answer
+        let (r, v) = split_thinking("still reasoning when the cap hit", true);
+        assert!(r.is_empty(), "no closer and no opener -> not reasoning");
+        assert_eq!(v, "still reasoning when the cap hit");
+        let (r, v) = split_thinking("<think>cut off mid thought", false);
+        assert_eq!(r, "cut off mid thought");
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn preserve_thinking_kwarg_reads_the_same_switch_as_the_chat_route() {
+        assert!(preserve_thinking_kwarg(Some(
+            &json!({"preserve_thinking": true})
+        )));
+        assert!(!preserve_thinking_kwarg(Some(
+            &json!({"preserve_thinking": false})
+        )));
+        assert!(!preserve_thinking_kwarg(Some(
+            &json!({"enable_thinking": true})
+        )));
+        assert!(!preserve_thinking_kwarg(None));
+    }
+
+    // Responses-API tools arrive flat; chat templates render `tool | tojson` verbatim and
+    // models are trained on the nested form, so the flat shape must be lifted. Built-in
+    // tool types and already-nested entries must survive untouched.
+    #[test]
+    fn responses_tools_are_normalized_to_the_nested_chat_shape() {
+        let flat = json!([{"type": "function", "name": "read_file",
+                           "parameters": {"type": "object", "properties": {}}}]);
+        let out = normalize_tools(Some(flat)).unwrap();
+        assert_eq!(out[0]["type"], "function");
+        assert_eq!(out[0]["function"]["name"], "read_file");
+        // the hoisted `type` must not be duplicated inside the nested object
+        assert!(out[0]["function"].get("type").is_none());
+
+        // already nested -> unchanged
+        let nested = json!([{"type": "function", "function": {"name": "list_dir"}}]);
+        assert_eq!(normalize_tools(Some(nested.clone())).unwrap(), nested);
+
+        // non-function tool types and absent tools pass through
+        let builtin = json!([{"type": "web_search"}]);
+        assert_eq!(normalize_tools(Some(builtin.clone())).unwrap(), builtin);
+        assert!(normalize_tools(None).is_none());
     }
 
     #[test]
@@ -1076,10 +1274,16 @@ mod tests {
             response_id: None,
             extra: Default::default(),
         };
-        let body = response_json("resp_1", "qwen", "hi", &done);
+        let body = response_json("resp_1", "qwen", "hi", "", &done);
         assert_eq!(body["id"], "resp_1");
         assert_eq!(body["object"], "response");
         assert_eq!(body["output_text"], "hi");
+        // no reasoning -> the field is absent entirely, not an empty string
+        assert!(body["output"][0].get("reasoning_content").is_none());
+        // with reasoning -> carried alongside the answer, answer unchanged
+        let body = response_json("resp_1", "qwen", "hi", "because 2+2=4", &done);
+        assert_eq!(body["output_text"], "hi");
+        assert_eq!(body["output"][0]["reasoning_content"], "because 2+2=4");
         assert_eq!(body["usage"]["input_tokens"], 7);
         assert_eq!(body["usage"]["output_tokens"], 3);
     }
