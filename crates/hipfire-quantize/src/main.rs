@@ -14187,7 +14187,10 @@ mod tests {
 
     /// Build a fake source mmap with a v2 tail blob at `offset`, plus the
     /// matching front `tail_metadata` pointer. Returns (front_json, mmap_bytes).
-    fn synthetic_v2_source(front_extra: serde_json::Value, tail_meta: serde_json::Value) -> (String, Vec<u8>) {
+    fn synthetic_v2_source(
+        front_extra: serde_json::Value,
+        tail_meta: serde_json::Value,
+    ) -> (String, Vec<u8>) {
         let tail = json!({ "format": "hipfire.hfq.tail.v1", "metadata": tail_meta });
         let tail_bytes = serde_json::to_vec(&tail).unwrap();
         let offset = 64usize; // arbitrary padded start
@@ -14248,14 +14251,16 @@ mod tests {
     #[test]
     fn merge_source_tail_noop_without_pointer() {
         // v1 / already-inlined source: no tail_metadata → returned unchanged.
-        let front = json!({ "architecture": "llama", "config": { "hidden_size": 1536 } }).to_string();
+        let front =
+            json!({ "architecture": "llama", "config": { "hidden_size": 1536 } }).to_string();
         let merged = merge_source_tail_metadata(front.clone(), &[]).unwrap();
         assert_eq!(merged, front);
     }
 
     #[test]
     fn merge_source_tail_rejects_hash_mismatch() {
-        let (front, mut mmap) = synthetic_v2_source(json!({}), json!({ "config": { "hidden_size": 1536 } }));
+        let (front, mut mmap) =
+            synthetic_v2_source(json!({}), json!({ "config": { "hidden_size": 1536 } }));
         // Corrupt the tail bytes so the stored hash no longer matches.
         *mmap.last_mut().unwrap() ^= 0xFF;
         assert!(merge_source_tail_metadata(front, &mmap).is_err());

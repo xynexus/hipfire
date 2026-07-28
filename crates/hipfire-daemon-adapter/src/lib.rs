@@ -414,9 +414,9 @@ impl DaemonEngine {
         };
         match tokio::time::timeout(Duration::from_secs(5), drain).await {
             Ok(result) => result,
-            Err(_) => anyhow::bail!(
-                "timed out draining worker after cancel of request {request_id}"
-            ),
+            Err(_) => {
+                anyhow::bail!("timed out draining worker after cancel of request {request_id}")
+            }
         }
     }
 
