@@ -21,7 +21,7 @@ execute on the NPU. OQ8+ is the initial production format.
   filenames.
 - Extend safetensors preparation and quantization to ingest SentenceTransformers
   modules and prompts. Produce canonical artifacts such as
-  `Qwen3-Embedding-0.6B.npu.oq8+.gfx1151.hfq`.
+  `Qwen3-Embedding-0.6B--npu.oq8+.gfx1151.hfq`.
 - Add a Qwen embedding state that loads only encoder-required tensors and avoids
   autoregressive output projection, generation scratch, and persistent KV
   allocation.

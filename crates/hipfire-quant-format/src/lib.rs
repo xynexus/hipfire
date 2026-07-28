@@ -20,6 +20,8 @@
 //! `hipfire_runtime::quant::dtype_for_quant_type`, which matches on the
 //! variants here.
 
+pub mod storage;
+
 /// On-disk HFQ weight encoding id (`#[repr(u8)]`; the stored byte is the
 /// discriminant). Reserved/retired ids are documented inline — DO NOT REUSE.
 #[repr(u8)]
@@ -139,6 +141,29 @@ pub enum QuantType {
     /// and must reject this type before unpacking. Each block has the same
     /// `[f16 scale][256 int8]` bytes as [`QuantType::Oq8G256`].
     Oq8G256RowPadded = 43,
+    /// Opaque component bytes carried inside an HFQM bundle. This is not a
+    /// weight encoding and must never be routed to a numeric kernel. The
+    /// component manifest supplies the source format, byte length, and digest;
+    /// the HFQM entry shape is `[n_bytes]` and `group_size` is zero.
+    OpaqueBytes = 44,
+    /// Non-rotated (plain-basis) Opus W8 storage used by DFLASH/NPU artifacts.
+    /// Per G256 block: `[f16 scale][256 signed int8]` = 258 bytes. Unlike
+    /// [`QuantType::Oq8G256`], neither weights nor activations use FWHT.
+    Oq8Plain = 45,
+    /// Non-rotated mixed Opus storage used by DFLASH/NPU artifacts. Per G256
+    /// block: `[f16 scale][128 int4 nibbles][N * (u8 index, i8 value)]`.
+    /// `N` is recorded in artifact metadata and derivable from payload length.
+    Oq4MixedPlain = 46,
+    /// Non-rotated (plain-basis) Opus W4 storage used by DFLASH/NPU artifacts.
+    /// Per G256 block: `[f16 scale][128 signed int4 nibbles]` = 130 bytes.
+    Oq4Plain = 47,
+    // Renumbered 44/45/46 -> 48/49/50 when this topic branch merged
+    // origin/master, which had independently assigned 44-47 to the
+    // OpaqueBytes/Oq*Plain family below. origin/master won the contested bytes
+    // because artifacts already exist carrying them (a DFlash artifact stores
+    // qt=47); no artifact had ever been written with 44/45/46 from this branch,
+    // so renumbering here was free. Ids 44-47 belong to the block below — DO NOT
+    // REUSE them for these types.
     /// Coarse lm_head shortlist tier: row-wise L2-normalized, 3σ-clipped
     /// symmetric Q4 with one f16 scale per ROW. **Planar**, not blocked:
     /// `[rows*cols/2 nibble bytes][rows*2 f16 scale bytes]`, nibble `2i` in the
@@ -151,7 +176,47 @@ pub enum QuantType {
     /// the true argmax inside a small top-K (measured recall@8 = 100%).
     /// It always accompanies a full-precision fine tier that rescores the
     /// shortlist; it is never the sole storage for a tensor.
-    CoarseQ4Row = 44,
+    CoarseQ4Row = 48,
+    /// BF16 with the exponent coded as a 3-bit per-block LUT index + escape —
+    /// **losslessly** the same weights as [`QuantType::BF16`], ~1.38× smaller.
+    /// Measured bit-exact end-to-end: 1.401× on a pure-BF16 artifact, 1.377× on
+    /// a MedGemma-27B VL tower. Ceiling is 1.4066× (zero escapes).
+    ///
+    /// Payload = `[u32 n_blocks][u32 × n_blocks offsets]` then, per 256-element
+    /// block, `[8 B LUT][256 B sign+mantissa][96 B codes][e B escapes]`; codec
+    /// `hipfire_primitives::bf16_lut3`. Blocks are independently decodable so a
+    /// kernel can consume this **compressed in VRAM** — the ratio applies to
+    /// weight bandwidth, not just file size. The escape plane is data-dependent,
+    /// so byte length does not follow from the shape: `block_bytes() == None`.
+    ///
+    /// Readers must take an owned copy (`tensor_data_vec`), never the zero-copy
+    /// `tensor_data` mmap slice, unless they decode blockwise on the GPU.
+    ///
+    /// Do NOT apply to Hessians: measured only 1.075× on a MedGemma-27B
+    /// `.calib.hfq` bf16 tril, because `XᵀX` spans far more octaves than
+    /// weights. `bf16_lut3::encode_if_smaller` is the guard.
+    Bf16Lut3 = 49,
+    /// BF16 with the exponent **Huffman**-coded — losslessly the same weights as
+    /// [`QuantType::BF16`], ~1.50× smaller. The sibling of
+    /// [`QuantType::Bf16Lut3`]: same idea (code the exponent, leave sign and
+    /// mantissa as a raw byte), better coder. Measured 1.4995× on Qwen3-1.7B
+    /// against a 1.521× order-0 entropy floor.
+    ///
+    /// Alphabet is the 15 most frequent exponents plus an escape carrying a raw
+    /// 8-bit literal — indistinguishable from coding all 256 exponents (1.4995×
+    /// vs 1.4997×) but it caps code depth at 13 instead of 26, which is what
+    /// keeps the decode table small. Codec `hipfire_primitives::bf16_huff`.
+    ///
+    /// **This is the format to write to disk.** Variable-length codes are
+    /// bit-serial, so it is decoded once at load and expanded to plain BF16 in
+    /// RAM; it is chunked every 8192 elements so that expansion parallelises.
+    /// When weights must stay compressed in VRAM and be decoded inside a GEMV,
+    /// use [`QuantType::Bf16Lut3`] — its byte-aligned fixed-width code is what
+    /// makes in-kernel decode affordable.
+    ///
+    /// Byte length is data-dependent, so `block_bytes() == None`. Readers must
+    /// take an owned copy (`tensor_data_vec`), never the zero-copy mmap slice.
+    Bf16Huff = 50,
 }
 
 impl QuantType {
@@ -216,7 +281,13 @@ impl QuantType {
             41 => Qtip2G256,
             42 => Qtip4G256,
             43 => Oq8G256RowPadded,
-            44 => CoarseQ4Row,
+            44 => OpaqueBytes,
+            45 => Oq8Plain,
+            46 => Oq4MixedPlain,
+            47 => Oq4Plain,
+            48 => CoarseQ4Row,
+            49 => Bf16Lut3,
+            50 => Bf16Huff,
             _ => return None,
         })
     }
@@ -231,7 +302,7 @@ impl QuantType {
     pub const fn group_size(self) -> usize {
         use QuantType::*;
         match self {
-            F16 | F32 | BF16 => 1,
+            F16 | F32 | BF16 | OpaqueBytes | Bf16Lut3 | Bf16Huff => 1,
             // Per-ROW scale: the group is the row, whose width is shape-dependent,
             // so there is no constant group width. block_bytes() is None.
             CoarseQ4Row => 1,
@@ -279,6 +350,9 @@ impl QuantType {
             Oq2G256 => Some(66),  // 2 (f16 scale) + 64 (2-bit×256, signed ±1)
             Oq6G256 => Some(194), // 2 (f16 scale) + 192 (6-bit×256)
             Oq8G256 | Oq8G256RowPadded => Some(258), // 2 (f16 scale) + 256 int8
+            Oq8Plain => Some(258),
+            Oq4Plain => Some(130),
+            OpaqueBytes => Some(1),
             // QTIP trellis (f32 scale + packed symbols)
             Qtip3G256 => Some(100), // 4 + 96 (256×3-bit)
             Qtip4G256 => Some(132), // 4 + 128 (256×4-bit)
@@ -289,8 +363,10 @@ impl QuantType {
             //  - Oq4G256ArchPacked / Qtip2G256: geometry unconfirmed
             //  - Paro / TidI32: engine-tiled, arch-specific
             //  - CoarseQ4Row: planar (nibble plane + f16 row-scale plane)
-            Q8HFQ | HFP4G32 | MFP4G32 | OqPlusG256 | OqPlusCompact | Oq4G256ArchPacked
-            | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 | CoarseQ4Row => None,
+            //  - Bf16Lut3 / Bf16Huff: coded-exponent length is data-dependent
+            Q8HFQ | HFP4G32 | MFP4G32 | OqPlusG256 | OqPlusCompact | Oq4MixedPlain
+            | Oq4G256ArchPacked | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 | CoarseQ4Row
+            | Bf16Lut3 | Bf16Huff => None,
         }
     }
 
@@ -376,6 +452,9 @@ mod tests {
             (QuantType::Oq6G256, 194),
             (QuantType::Oq8G256, 258),
             (QuantType::Oq8G256RowPadded, 258),
+            (QuantType::OpaqueBytes, 1),
+            (QuantType::Oq8Plain, 258),
+            (QuantType::Oq4Plain, 130),
             (QuantType::Qtip3G256, 100),
             (QuantType::Qtip4G256, 132),
         ];
@@ -392,12 +471,14 @@ mod tests {
             QuantType::MFP4G32,
             QuantType::OqPlusG256,
             QuantType::OqPlusCompact,
-            QuantType::Oq2G256,
+            QuantType::Oq4MixedPlain,
             QuantType::Oq4G256ArchPacked,
             QuantType::Qtip2G256,
             QuantType::PARO4G128,
             QuantType::PARO4G128T,
             QuantType::TidI32,
+            QuantType::Bf16Lut3,
+            QuantType::Bf16Huff,
         ] {
             assert_eq!(qt.block_bytes(), None, "{qt:?} must be variable-layout");
             assert_eq!(qt.tensor_bytes(1024), None, "{qt:?} tensor_bytes");
@@ -427,6 +508,7 @@ mod tests {
             Some(4 * 258)
         );
         assert_eq!(QuantType::Oq8G256RowPadded.tensor_bytes(2 * 384), None);
+        assert_eq!(QuantType::OpaqueBytes.tensor_bytes(17), Some(17));
         // Empty tensor = 0 groups.
         assert_eq!(QuantType::MQ4G256.tensor_bytes(0), Some(0));
     }
@@ -447,5 +529,12 @@ mod tests {
         assert_eq!(QuantType::Qtip2G256.code(), 41);
         assert_eq!(QuantType::Qtip4G256.code(), 42);
         assert_eq!(QuantType::Oq8G256RowPadded.code(), 43);
+        assert_eq!(QuantType::OpaqueBytes.code(), 44);
+        assert_eq!(QuantType::Oq8Plain.code(), 45);
+        assert_eq!(QuantType::Oq4MixedPlain.code(), 46);
+        assert_eq!(QuantType::Oq4Plain.code(), 47);
+        assert_eq!(QuantType::CoarseQ4Row.code(), 48);
+        assert_eq!(QuantType::Bf16Lut3.code(), 49);
+        assert_eq!(QuantType::Bf16Huff.code(), 50);
     }
 }

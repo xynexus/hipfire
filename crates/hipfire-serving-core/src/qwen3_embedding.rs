@@ -635,7 +635,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("Qwen3-Embedding-0.6B.npu.oq8+.hfq");
+        let path = root.join("Qwen3-Embedding-0.6B--npu.oq8+.hfq");
         let mut tensors = vec![
             oq8("model.embed_tokens.weight", 2, 256),
             bf16("model.norm.weight", vec![256]),

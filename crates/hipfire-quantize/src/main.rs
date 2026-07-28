@@ -45,8 +45,8 @@ pub use hipfire_quantize::{codecs, fixture, gptq, hessian_io, hfhs_diag, ldlq, q
 // GGUF import pipeline (owned by hipfire-coexistence) can produce byte-identical
 // artifacts through the same code path the native quantizer uses.
 use hipfire_quantize::hfq_out::{
-    insert_parameter_counts_metadata, write_hfq_with_progress, HfqStreamTensor, HfqTensor,
-    LiveHfqWriter, TensorSpill, Xxh64, HFQ_MAGIC,
+    compress_bf16_tensors, insert_parameter_counts_metadata, write_hfq_with_progress, Bf16Codec,
+    HfqStreamTensor, HfqTensor, LiveHfqWriter, TensorSpill, Xxh64, HFQ_MAGIC,
 };
 // Helpers exercised only by this binary's unit tests.
 #[cfg(test)]
@@ -423,6 +423,20 @@ static EMBED_PRECISION: OnceLock<u8> = OnceLock::new();
 /// behavior — so only the CLI path picks up the new `source` default.
 fn embed_precision_code() -> u8 {
     *EMBED_PRECISION.get().unwrap_or(&0)
+}
+
+// --bf16-codec none|huff|lut3: lossless recoding of BF16 tensors on disk.
+// Both codecs reproduce every input bit exactly and are expanded back to plain
+// BF16 by the loader, so this only changes file size, never model behavior.
+// Applied by `compress_bf16_tensors` just before the write — see its docs for
+// why it cannot be applied when the tensor is first produced.
+static BF16_CODEC: OnceLock<Bf16Codec> = OnceLock::new();
+
+/// BF16 storage codec set by `--bf16-codec`. Defaults to `None` so library and
+/// unit-test callers — and anyone who does not ask for it — keep emitting plain
+/// `QuantType::BF16` bytes.
+fn bf16_codec() -> Bf16Codec {
+    *BF16_CODEC.get().unwrap_or(&Bf16Codec::None)
 }
 
 // --sq-split [<frac>]: outlier-aware SmoothQuant. When set, `compute_awq_scales`
@@ -2603,7 +2617,13 @@ fn insert_quant_format_metadata(metadata: &mut serde_json::Value, format: &str) 
 
 struct HfqInputTensor {
     name: String,
+    /// LOGICAL encoding. A compressed-BF16 tensor reports plain BF16 here and
+    /// `tensor_data` expands it, so every consumer of a re-quantized `.hfq`
+    /// keeps working without knowing the codec exists.
     quant_type: u8,
+    /// PHYSICAL on-disk encoding; differs from `quant_type` only for the
+    /// compressed-BF16 types, whose bytes must be decoded before use.
+    stored_quant_type: u8,
     shape: Vec<u32>,
     group_size: u32,
     data_offset: usize,
@@ -2768,9 +2788,17 @@ impl HfqInputFile {
                     ),
                 ));
             }
+            // A losslessly-recoded tensor is presented as the type it expands
+            // to; `tensor_data` decodes. Keeps the re-quantize path (bf16
+            // artifact -> oq4) working with no per-codec branches downstream.
+            // The rule lives in `hipfire_quant_format::storage`, shared with the
+            // runtime loader, so the two cannot drift apart.
+            let logical =
+                QuantType::from_code(quant_type).map_or(quant_type, |qt| qt.logical() as u8);
             tensors.push(HfqInputTensor {
                 name,
-                quant_type,
+                quant_type: logical,
+                stored_quant_type: quant_type,
                 shape,
                 group_size,
                 data_offset: tensor_data_offset,
@@ -2788,8 +2816,16 @@ impl HfqInputFile {
         })
     }
 
-    fn tensor_data(&self, t: &HfqInputTensor) -> &[u8] {
-        &self.mmap[t.data_offset..t.data_offset + t.data_size]
+    /// Tensor bytes, expanding any lossless recoding to its logical encoding.
+    /// Borrowed for every ordinary tensor; owned only when a decode happened.
+    fn tensor_data(&self, t: &HfqInputTensor) -> std::borrow::Cow<'_, [u8]> {
+        let raw = &self.mmap[t.data_offset..t.data_offset + t.data_size];
+        let Some(stored) = QuantType::from_code(t.stored_quant_type) else {
+            return std::borrow::Cow::Borrowed(raw);
+        };
+        let n: usize = t.shape.iter().map(|&d| d as usize).product();
+        hipfire_quant_format::storage::expand(stored, raw, n, 1)
+            .unwrap_or_else(|| panic!("corrupt {stored:?} tensor {}", t.name))
     }
 }
 
@@ -4717,6 +4753,7 @@ fn run_hfq_source_pipeline(
     let mut quantized_params = 0u64;
     for t in &hfq.tensors {
         let raw = hfq.tensor_data(t);
+        let raw = raw.as_ref();
         let n_elements = t.shape.iter().map(|&d| d as u64).product::<u64>();
         total_params += n_elements;
         let tensor_override = tensor_format_override(tensor_overrides, &t.name);
@@ -4855,6 +4892,29 @@ fn run_hfq_source_pipeline(
         if let Some(obj) = metadata.as_object_mut() {
             obj.insert("calibration".to_string(), prov);
         }
+    }
+    // Recode BF16 tensors with the lossless disk codec. Must run after every
+    // transform pass (they read bf16 bytes back in place) and before any spill
+    // (spilled bytes cannot be replaced).
+    let bf16_stats = compress_bf16_tensors(&mut hfq_tensors, bf16_codec());
+    if bf16_stats.compressed > 0 || bf16_stats.skipped_spilled > 0 {
+        eprintln!(
+            "  bf16 codec: {} tensors {:.1} MB -> {:.1} MB ({:.4}x){}{}",
+            bf16_stats.compressed,
+            bf16_stats.bytes_before as f64 / 1e6,
+            bf16_stats.bytes_after as f64 / 1e6,
+            bf16_stats.bytes_before as f64 / bf16_stats.bytes_after.max(1) as f64,
+            if bf16_stats.not_smaller > 0 {
+                format!(", {} left plain (no win)", bf16_stats.not_smaller)
+            } else {
+                String::new()
+            },
+            if bf16_stats.skipped_spilled > 0 {
+                format!(", {} skipped (already spilled)", bf16_stats.skipped_spilled)
+            } else {
+                String::new()
+            },
+        );
     }
     if let Some(ref mut output_spill) = spill {
         maybe_spill(&mut hfq_tensors, output_spill, 0);
@@ -5514,6 +5574,11 @@ fn source_precision_tensor_bytes(
     _f32_data: &[f32],
 ) -> (Vec<u8>, QuantType, &'static str) {
     match dtype {
+        // Deliberately NOT the place to apply the BF16 codec: several later
+        // passes (AWQ pre-scale, roughquant PCA rotation) read `t.data` back as
+        // raw bf16 pairs and are gated on `quant_type == BF16`. Compressing here
+        // would make them silently skip the tensor. See `compress_bf16_tensors`,
+        // which runs after every transform, immediately before the write.
         "BF16" => (raw_data.to_vec(), QuantType::BF16, "BF16"),
         "F16" => (raw_data.to_vec(), QuantType::F16, "F16"),
         "F32" => (raw_data.to_vec(), QuantType::F32, "F32"),
@@ -5526,6 +5591,10 @@ fn direct_source_precision_layout(
     source_bytes: u64,
 ) -> Result<(QuantType, u64, &'static str), String> {
     match dtype {
+        // NOTE: this is the *streaming* planner — it reports a byte length from
+        // the source size without ever materializing the tensor, so a
+        // data-dependent codec cannot be applied here. Streamed source-precision
+        // tensors therefore stay plain BF16 regardless of --bf16-codec.
         "BF16" => Ok((QuantType::BF16, source_bytes, "BF16")),
         "F16" => Ok((QuantType::F16, source_bytes, "F16")),
         "F32" => Ok((QuantType::F32, source_bytes, "F32")),
@@ -6018,6 +6087,24 @@ fn main() {
     // in-kernel via portable HIP intrinsics (RDNA2/3/4), so there is no F32-widening
     // of the table on disk. Only affects the embedding table; lm_head/router follow
     // their own policy.
+    // --bf16-codec huff|lut3|none: losslessly recode BF16 tensors on disk.
+    // Defaults to `huff` (~1.5x). Every reader expands compressed BF16 back to
+    // plain BF16 transparently — the runtime loader and this binary's own
+    // re-quantize input path — so nothing downstream can tell the difference and
+    // there is no reason to make callers ask for it. `lut3` (~1.38x) trades some
+    // ratio for a byte-aligned layout a GPU kernel can decode in place; `none`
+    // is the escape hatch for reproducing a pre-codec artifact byte-for-byte.
+    let bf16_codec_arg = arg_value(&args, "--bf16-codec").unwrap_or("huff");
+    match Bf16Codec::parse(bf16_codec_arg) {
+        Some(c) => {
+            let _ = BF16_CODEC.set(c);
+        }
+        None => {
+            eprintln!("error: --bf16-codec must be one of none|huff|lut3 (got '{bf16_codec_arg}')");
+            std::process::exit(1);
+        }
+    }
+
     let embed_precision = arg_value(&args, "--embed-precision").unwrap_or("source");
     let embed_precision_code = match embed_precision {
         "source" | "auto" => 3u8,
@@ -7062,10 +7149,20 @@ fn main() {
                     .any(|arch| arch.to_ascii_lowercase().contains("mamba2"))
             })
             .unwrap_or(false);
-    let arch_str = config
-        .get("model_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("llama");
+    let arch_str = match config.get("model_type").and_then(|v| v.as_str()) {
+        Some(model_type) => model_type,
+        // State-spaces Mamba2 configs predate the Hugging Face `model_type`
+        // convention. Accept only the explicit `ssm_cfg.layer=Mamba2` or
+        // `Mamba2ForCausalLM` signature established above; this is a registered
+        // family identity, not an unknown-family fallback.
+        None if is_mamba2_config => "mamba2",
+        None => {
+            eprintln!(
+                "error: model config has no string `model_type`; refusing to guess an architecture"
+            );
+            std::process::exit(2);
+        }
+    };
     // Map the HF `model_type` string to a canonical arch_id. Ids and their
     // `arch_str` detection tokens are documented in `docs/architecture-ids.md`.
     let auto_arch_id = if is_mamba2_config {
@@ -7137,8 +7234,12 @@ fn main() {
             // rides the same is_moe 3D-split path below.
             "zaya" => ARCH_ID_ZAYA,
             other => {
-                eprintln!("Warning: unknown architecture '{other}', treating as llama");
-                ARCH_ID_LLAMA_MISTRAL
+                eprintln!(
+                    "error: unsupported model_type `{other}`; refusing to quantize it as LLaMA. \
+                     Register the family in hipfire-arch-api/hipfire-arch-specs and add its \
+                     tensor/precision policy before conversion."
+                );
+                std::process::exit(2);
             }
         }
     };
@@ -7759,7 +7860,13 @@ fn main() {
         // unloadable model (`tensor not found: ...experts.0...`, e.g. a bf16 MoE
         // KLD reference). Route them through the main quantize loop, which splits
         // per expert and still emits BF16/F16 per expert.
-        && !is_moe;
+        && !is_moe
+        // A lossless BF16 codec has to see the bytes to encode them, and this
+        // path deliberately never materializes a tensor — it plans each output
+        // length straight from the source size. Asking for --bf16-codec opts out
+        // of the zero-copy stream in favour of the main loop, which produces
+        // in-memory BF16 tensors that `compress_bf16_tensors` can recode.
+        && bf16_codec() == Bf16Codec::None;
     if can_direct_stream_source_precision {
         #[derive(Clone)]
         struct DirectSourceJob {
@@ -11901,6 +12008,30 @@ fn main() {
         }
     }
 
+    // Recode BF16 tensors with the lossless disk codec. Must run after every
+    // transform pass (they read bf16 bytes back in place) and before any spill
+    // (spilled bytes cannot be replaced).
+    let bf16_stats = compress_bf16_tensors(&mut hfq_tensors, bf16_codec());
+    if bf16_stats.compressed > 0 || bf16_stats.skipped_spilled > 0 {
+        eprintln!(
+            "  bf16 codec: {} tensors {:.1} MB -> {:.1} MB ({:.4}x){}{}",
+            bf16_stats.compressed,
+            bf16_stats.bytes_before as f64 / 1e6,
+            bf16_stats.bytes_after as f64 / 1e6,
+            bf16_stats.bytes_before as f64 / bf16_stats.bytes_after.max(1) as f64,
+            if bf16_stats.not_smaller > 0 {
+                format!(", {} left plain (no win)", bf16_stats.not_smaller)
+            } else {
+                String::new()
+            },
+            if bf16_stats.skipped_spilled > 0 {
+                format!(", {} skipped (already spilled)", bf16_stats.skipped_spilled)
+            } else {
+                String::new()
+            },
+        );
+    }
+
     // Write .hfq file
     eprintln!("\nWriting: {}", output_path.display());
     let metadata_json = serde_json::to_string(&metadata).unwrap();
@@ -14123,12 +14254,12 @@ mod tests {
 
     #[test]
     fn npu_embedding_output_name_uses_canonical_feature_and_quant_groups() {
-        validate_npu_embedding_output_name(Path::new("Qwen3-Embedding-0.6B.npu.oq8+.gfx1151.hfq"))
+        validate_npu_embedding_output_name(Path::new("Qwen3-Embedding-0.6B--npu.oq8+.gfx1151.hfq"))
             .unwrap();
         for invalid in [
             "qwen3-embedding-0.6b-npu-oq8+.hfq",
-            "Qwen3-Embedding-0.6B.oq8+.hfq",
-            "Qwen3-Embedding-0.6B.npu.oq8++.hfq",
+            "Qwen3-Embedding-0.6B--oq8+.hfq",
+            "Qwen3-Embedding-0.6B--npu.oq8++.hfq",
         ] {
             assert!(
                 validate_npu_embedding_output_name(Path::new(invalid)).is_err(),
@@ -15083,6 +15214,23 @@ mod tests {
         assert_eq!(
             expert_layout_via_ingest(12),
             Some(hipfire_arch_api::ExpertLayout::None)
+        );
+    }
+
+    #[test]
+    fn registry_resolves_cohere2_moe_without_an_architecture_fallback() {
+        assert_eq!(arch_id_via_registry("cohere2_moe"), Some(25));
+        assert_eq!(
+            expert_layout_via_ingest(25),
+            Some(hipfire_arch_api::ExpertLayout::None)
+        );
+        assert_eq!(
+            high_precision_via_ingest(25, "model.layers.1.mlp.experts.3.down_proj.weight", 256,),
+            Some(false)
+        );
+        assert_eq!(
+            high_precision_via_ingest(25, "model.layers.1.mlp.gate.weight", 256),
+            Some(true)
         );
     }
 

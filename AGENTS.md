@@ -46,12 +46,24 @@ the relevant docs under `docs/`.
   The former pre-fork `master` history is preserved as the archival
   `master-prefork` branch; do not base new work on it or merge it wholesale into
   `master` unless the user explicitly requests historical recovery work.
-- Start feature and fix work from an up-to-date `upstream/master` on a descriptive
+- **`origin` (github.com/xynexus/hipfire) is the only baseline.** `upstream`
+  (github.com/Kaden-Schutt/hipfire) is the pre-fork original and is
+  **disconnected** — we do not track, fetch, rebase onto, or merge from it. If
+  the remote is still configured locally, ignore it. Comparing against it is
+  actively misleading: it has 23 crates to our ~99, differs by 1500+ files, and
+  lacks whole crates this tree depends on, so a diff against `upstream/master`
+  will report an unrelated codebase rather than in-flight work.
+- Start feature and fix work from an up-to-date `origin/master` on a descriptive
   topic branch. Prefer reviewed pull requests for integration; commit or push
   directly to `master` only when the user explicitly requests that workflow.
-- Before meaningful changes, fetch `upstream` and rebase or merge the topic branch
-  onto the latest `upstream/master` when the worktree state allows it. Do not
-  rewrite published shared history without explicit approval.
+- Before meaningful changes, fetch `origin` and rebase or merge the topic branch
+  onto the latest `origin/master` when the worktree state allows it. Check
+  `origin/master` — never `upstream` — for competing in-flight work before a
+  refactor. Do not rewrite published shared history without explicit approval.
+- `git stash` is unusable in this repo: the untracked `.agents/` symlink tree
+  makes it fail, and a failed `stash` followed by `stash pop` will restore an
+  unrelated older stash over your work. Use `git show HEAD:<path>` or
+  `git diff <path>` to compare against HEAD instead.
 - Preserve unrelated user changes. When committing or pushing, stage only files
   that belong to the current task and use descriptive messages.
 
@@ -74,19 +86,33 @@ the relevant docs under `docs/`.
 
 Canonical artifact shape:
 
-`<family>[-]<version>-<size[-effective/active]>[-tag1][-tag2...][.feature1[.feature2...]].<format>[.arch].hfq`
+`<family>[-]<version>-<size[-effective/active]>[-tag1][-tag2...]--[feature1.[feature2.]...]<quant>[.arch].hfq`
 
-Periods are used to separate groups known to hipfire.
+A double hyphen `--` separates the human-readable model name from the
+machine-readable groups; periods separate groups within the machine section.
 Examples:
-- LFM2.5-1.2B-Thinking.bf16.hfq
-- Qwen3.5-122B-A10B.mtp.vl.mq2l.hfq
-- Gemma-4-8B-E4B-it-heretic-QAT.dflash.triattn.oq4++.gfx1151.hfq
-- MedGemma-27B-it.triattn.hfq
+- LFM2.5-1.2B-Thinking--bf16.hfq
+- Qwen3.5-122B-A10B--+mtp.+vl.mq2l.hfq (embedded MTP + VL)
+- Gemma-4-8B-E4B-it-heretic-QAT--+dflash.+triattn.oq4++.gfx1151.hfq
+- ModelName3.5-20B-it--dflash.oq4+.hfq (DFlash drafter sidecar — carries a quant,
+  so it takes the boundary)
+- MedGemma-27B-it.triattn.hfq (quant-free role sidecar — plain dotted suffix, see below)
 
 This system allows machine parsing by working backwards:
 - last field is always hfq
-- dots separate machine-readable fields
-- dashes separate human-readable fields, aside from size and effective/active size
+- a double hyphen `--` marks the boundary: everything left of it is the
+  human-readable model name, everything right of it is the machine-readable
+  section (features, then quant, then optional arch)
+- within the machine section, dots separate fields
+- single dashes separate human-readable fields in the model name, aside from
+  size and effective/active size
+- the `--` boundary applies to any artifact that carries a quant token,
+  including role sidecars: a DFlash drafter is
+  `ModelName3.5-20B-it--dflash.oq4+.hfq`, because `dflash` and `oq4+` are both
+  machine-section groups
+- role sidecars that carry NO quant keep a plain dotted role suffix
+  (`.triattn.hfq`, `.jinja.`, `.hessian`) — with no machine section there is no
+  boundary to mark
 
 Quant tokens use this shape:
 
@@ -110,14 +136,25 @@ Notes:
 - Use dotted model versions such as `Qwen3.5`. do not use qwen35 for example.
 - Put calibration or transform modifiers that are not part of the quant token
   before it. Lloyd is part of the quant token: use `mq3l`, not `lloyd-mq3`.
-- Do not use `+` for bundled roles or feature sidecars. Encode each feature as
-  its own dot group before the quant token, for example `.mtp.vl.mq4.hfq` or
-  `.dflash.triattn.oq4++.hfq`.
-- Use role sidecars when loaded independently: `.mtp.hfq`, `.dflash.hfq`,
-  `.jinja.`, `.hessian` and `.triattn.hfq`.
-- The quant should detail the weight encoding. eg. Lloyd MQ2 uses `.mq2l.hfq`,
-  Magnum uses `.mq4.hfq`
+- Prefix a role group with `+` when the role is EMBEDDED in the artifact rather
+  than naming it. `Model--dflash.oq8.hfq` *is* a DFlash sidecar;
+  `Model--+dflash.+triattn.oq8.hfq` is a model that *carries* DFlash and
+  TriAttention. Without the marker the two are indistinguishable by filename.
+  Each embedded feature is its own `+`-marked dot group after the `--` boundary
+  and before the quant token, e.g. `Model--+mtp.+vl.mq4.hfq`.
+  The `+` here is a prefix on a role; the `+`/`++` in a quant token
+  (`oq4+`, `oq4++`) is a suffix on the quant, so the two never collide.
+- Use role sidecars when loaded independently. A sidecar carrying its own quant
+  takes the boundary and the quant as machine groups
+  (`Model--dflash.oq4+.hfq`, `Model--mtp.mq4.hfq`; embedded in a bundle they become `+dflash` / `+mtp`); a quant-free sidecar keeps
+  the plain dotted role suffix (`.triattn.hfq`, `.jinja.`, `.hessian`).
+- The quant should detail the weight encoding. eg. Lloyd MQ2 uses `--mq2l.hfq`,
+  Magnum uses `--mq4.hfq`
 - `arch` must start with gfx followed by 3 or 4 numbers. eg. gfx906, gfx1103, gfx1151, gfx1201
+- New artifacts use the `--` boundary. The older all-dotted form
+  (`Model.mq4.hfq`) stays parseable so existing on-disk artifacts keep loading;
+  emit `--` for anything you create and rename dotted names to `--` when you
+  touch them.
 - When a script, gate, registry, or doc uses an older format, update it to the
   canonical naming convention as part of the fix.
 - Remove legacy-name fallback whenever you find it

@@ -6,7 +6,11 @@
 // submissions; adapter factories and architecture ownership stay in the family
 // crates rather than a generic CLI table.
 #[allow(unused_imports)]
+use hipfire_arch_cohere2 as _;
+#[allow(unused_imports)]
 use hipfire_arch_gemma3 as _;
+#[allow(unused_imports)]
+use hipfire_arch_gemma4 as _;
 #[allow(unused_imports)]
 use hipfire_arch_qwen35 as _;
 use hipfire_hash::{file_hash, stable_hash_bytes};
@@ -63,8 +67,9 @@ const CALIBRATE_USAGE: &str = "usage: hipfire-coexistence calibrate \
 [--expert-capture-tile-rows N] [--required-expert-fraction F] \
 [--expert-coverage-policy strict|preserve-undercovered] [--kldref|--no-kldref] \
 [--kldref-topk N] [--kldref-rows N] [--layer-prefetch-bytes N (default: 17179869184; 0 disables)] \
-[--boundary-dir DIR|--boundary-ram] [--no-resume] \
+[--boundary-dir DIR|--boundary-ram] [--no-resume] [--finalize-completed] \
 [--pause-after-layers N] [--residual-probe-output PATH --residual-probe-rows N] \
+[--cask-output <model.triattn.hfq>] [--cask-only] \
 [--dry-run]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -286,9 +291,12 @@ struct CalibrateCommand {
     boundary_ram: bool,
     boundary_directory: Option<PathBuf>,
     resume: bool,
+    finalize_completed: bool,
     pause_after_layers: Option<usize>,
     residual_probe_output: Option<PathBuf>,
     residual_probe_rows: usize,
+    cask_output: Option<PathBuf>,
+    cask_only: bool,
     dry_run: bool,
 }
 
@@ -321,9 +329,12 @@ impl CalibrateCommand {
         // *default* quietly step aside for those modes.
         let mut resume = true;
         let mut resume_explicit = false;
+        let mut finalize_completed = false;
         let mut pause_after_layers = None;
         let mut residual_probe_output = None;
         let mut residual_probe_rows = 16usize;
+        let mut cask_output = None;
+        let mut cask_only = false;
         let mut dry_run = false;
         let mut index = 0usize;
         while index < args.len() {
@@ -341,6 +352,8 @@ impl CalibrateCommand {
                     resume = false;
                     resume_explicit = false;
                 }
+                "--finalize-completed" => finalize_completed = true,
+                "--cask-only" => cask_only = true,
                 _ => {
                     let value = args
                         .get(index + 1)
@@ -393,6 +406,7 @@ impl CalibrateCommand {
                             residual_probe_output = Some(PathBuf::from(value))
                         }
                         "--residual-probe-rows" => residual_probe_rows = parse_value(flag, value)?,
+                        "--cask-output" => cask_output = Some(PathBuf::from(value)),
                         _ => return Err(format!("calibrate: unknown flag {flag}")),
                     }
                     index += 1;
@@ -429,9 +443,12 @@ impl CalibrateCommand {
             boundary_ram,
             boundary_directory,
             resume,
+            finalize_completed,
             pause_after_layers,
             residual_probe_output,
             residual_probe_rows,
+            cask_output,
+            cask_only,
             dry_run,
         };
         command
@@ -449,6 +466,19 @@ impl CalibrateCommand {
         if command.resume && command.boundary_ram {
             return Err("calibrate: --resume requires an mmap boundary store".into());
         }
+        if command.finalize_completed && !command.resume {
+            return Err("calibrate: --finalize-completed requires --resume".into());
+        }
+        if command.finalize_completed
+            && (command.cask_output.is_some()
+                || command.pause_after_layers.is_some()
+                || command.residual_probe_output.is_some())
+        {
+            return Err(
+                "calibrate: --finalize-completed only publishes already-complete calibration spools"
+                    .into(),
+            );
+        }
         if command.pause_after_layers == Some(0) {
             return Err("calibrate: --pause-after-layers must be nonzero".into());
         }
@@ -465,6 +495,31 @@ impl CalibrateCommand {
         }
         if command.residual_probe_output.as_ref() == Some(&command.output) {
             return Err("calibrate: --residual-probe-output must differ from --output".into());
+        }
+        if command.cask_output.is_some() && (command.resume || command.pause_after_layers.is_some())
+        {
+            return Err(
+                "calibrate: CASK generation currently requires a fresh, uninterrupted run (no --resume or --pause-after-layers)"
+                    .into(),
+            );
+        }
+        if let Some(cask) = command.cask_output.as_ref() {
+            if cask == &command.output || command.residual_probe_output.as_ref() == Some(cask) {
+                return Err("calibrate: --cask-output must be distinct from other outputs".into());
+            }
+        }
+        if command.cask_only
+            && (command.cask_output.is_none()
+                || !command.boundary_ram
+                || command.kldref
+                || command.resume
+                || command.pause_after_layers.is_some()
+                || command.residual_probe_output.is_some())
+        {
+            return Err(
+                "calibrate: --cask-only requires --cask-output, --boundary-ram, --no-kldref, and a fresh uninterrupted run"
+                    .into(),
+            );
         }
         Ok(command)
     }
@@ -484,7 +539,11 @@ impl CalibrateCommand {
                 },
             },
             required_expert_fraction: self.required_expert_fraction,
-            expert_coverage_policy: self.expert_coverage_policy,
+            expert_coverage_policy: if self.cask_only {
+                ExpertCoveragePolicy::PreserveUndercovered
+            } else {
+                self.expert_coverage_policy
+            },
             kldref: self.kldref,
             kldref_top_k: self.kldref_top_k,
             kldref_rows: self.kldref_rows,
@@ -563,7 +622,26 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
     let mut resolved = resolve_adapter(&source)?;
     let inspection = resolved.adapter.inspect(&source)?;
     inspection.validate()?;
-    let capture = resolved.adapter.capture_plan(&inspection, &job)?;
+    let capture = if command.cask_only {
+        resolved.adapter.capture_plan(&inspection, &job)?.skip_all()
+    } else {
+        resolved.adapter.capture_plan(&inspection, &job)?
+    };
+    let cask_metadata = if command.cask_output.is_some() {
+        Some(
+            resolved
+                .adapter
+                .cask_metadata(&inspection, &job)?
+                .ok_or_else(|| {
+                    CalibError::InvalidSourcePlan(format!(
+                        "{} has no native CASK generator",
+                        inspection.family
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
     let tensor_plan = TensorLoadPlan::build(&source, inspection.tensor_requests.clone())?;
     let geometry = resolve_geometry(&job)?;
     let resource_estimate = resolved
@@ -577,7 +655,7 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
         &job,
         geometry,
     )?;
-    let dry_run = dry_run_report(
+    let mut dry_run = dry_run_report(
         &command,
         &snapshot,
         &source,
@@ -593,6 +671,20 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
         resource_estimate.as_ref(),
         &capture,
     )?;
+    if let Some(metadata) = cask_metadata.as_ref() {
+        dry_run["cask"] = serde_json::json!({
+            "output": command.cask_output,
+            "package_schema": metadata.package_schema,
+            "model_arch_id": metadata.model_arch_id,
+            "model_layers": metadata.model_layers,
+            "eligible_layers": metadata.layers.len(),
+            "layers": metadata.layers,
+            "model_fingerprint": metadata.model_fingerprint,
+            "corpus_fingerprint": metadata.corpus_fingerprint,
+            "adapter": metadata.adapter,
+            "engine": metadata.engine,
+        });
+    }
     if command.dry_run {
         println!("{}", serde_json::to_string_pretty(&dry_run)?);
         return Ok(());
@@ -611,6 +703,15 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
                 )
                 .into());
             }
+        }
+    }
+
+    if let Some(path) = &command.cask_output {
+        if path.exists() {
+            return Err(format!("refusing to overwrite CASK artifact {}", path.display()).into());
+        }
+        if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
         }
     }
 
@@ -633,19 +734,63 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
     };
     let _gpu_lock = acquire_gpu_lock()?;
     let mut gpu = Gpu::init()?;
-    let result = LayerStreamEngine::new(boundary_backend, &command.output)
+    if let Some(metadata) = cask_metadata {
+        hipfire_runtime::triattn::install_layered_tap(
+            hipfire_runtime::triattn::LayeredTriAttnCalibState::new(metadata)?,
+        );
+    }
+    let run_result = LayerStreamEngine::new(boundary_backend, &command.output)
         .with_resume(command.resume)
+        .with_finalize_completed(command.finalize_completed)
+        .with_cask_only(command.cask_only)
         .with_pause_after_layers(command.pause_after_layers)
         .with_layer_prefetch_bytes(command.layer_prefetch_bytes)
         .with_residual_probe(
             command.residual_probe_output.clone(),
             command.residual_probe_rows,
         )
-        .run(resolved.adapter.as_mut(), &source, &mut gpu, &job)?;
+        .run(resolved.adapter.as_mut(), &source, &mut gpu, &job);
+    let cask_state = command
+        .cask_output
+        .as_ref()
+        .map(|_| {
+            hipfire_runtime::triattn::take_layered_tap().ok_or_else(|| {
+                CalibError::Runtime("CASK tap disappeared during calibration".into())
+            })
+        })
+        .transpose()?;
+    let result = match run_result {
+        Ok(result) => result,
+        Err(error) if command.cask_only => {
+            // CASK-only is deliberately non-resumable. Its calibration parts
+            // are scratch identity/ledger records, so retaining them after a
+            // failed run only makes the next fresh retry fail on stale state.
+            if let Err(cleanup) = cleanup_calibration_spools(&command.output, inspection.num_layers)
+                .and_then(|_| remove_if_exists(&command.output))
+            {
+                return Err(CalibError::Runtime(format!(
+                    "{error}; additionally failed to clean CASK-only scratch: {cleanup}"
+                ))
+                .into());
+            }
+            return Err(error.into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if let (Some(path), Some(state)) = (&command.cask_output, cask_state) {
+        state.finalize()?.save_hfqm(path)?;
+    }
+    if command.cask_only {
+        let CalibrationRunOutcome::Complete(completed) = &result else {
+            return Err(CalibError::Runtime("CASK-only run did not complete".into()).into());
+        };
+        fs::remove_file(&completed.artifact_path)?;
+    }
     let report = match result {
         CalibrationRunOutcome::Complete(result) => serde_json::json!({
-            "status": "complete",
-            "artifact": result.artifact_path,
+            "status": if command.cask_only { "cask_complete" } else { "complete" },
+            "artifact": if command.cask_only { None::<PathBuf> } else { Some(result.artifact_path) },
+            "cask_artifact": command.cask_output,
             "residual_probe": command.residual_probe_output,
             "family": result.model.family,
             "layers": result.model.num_layers,
@@ -662,6 +807,7 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
         CalibrationRunOutcome::Paused(result) => serde_json::json!({
             "status": "paused",
             "artifact": null,
+            "cask_artifact": null,
             "intended_artifact": result.artifact_path,
             "family": result.model.family,
             "layers": result.model.num_layers,
@@ -1702,6 +1848,35 @@ fn read_layer_progress(
     Ok(progress)
 }
 
+fn completed_spool_engine_build(
+    output: &Path,
+    expected_run_fingerprint: &str,
+) -> Result<String, CalibError> {
+    let path = calibration_progress_path(output, 0);
+    let bytes = fs::read(&path)
+        .map_err(|error| CalibError::Checkpoint(format!("read {}: {error}", path.display())))?;
+    let progress: CalibrationLayerProgress = serde_json::from_slice(&bytes)
+        .map_err(|error| CalibError::Checkpoint(format!("parse {}: {error}", path.display())))?;
+    if progress.schema_version != CALIBRATION_PROGRESS_SCHEMA_VERSION || progress.layer != 0 {
+        return Err(CalibError::Checkpoint(format!(
+            "completed-spool finalization requires a valid layer-0 progress record at {}",
+            path.display()
+        )));
+    }
+    if progress.run_fingerprint != expected_run_fingerprint {
+        return Err(CalibError::Checkpoint(format!(
+            "completed spools belong to run {}, expected {}",
+            progress.run_fingerprint, expected_run_fingerprint
+        )));
+    }
+    if progress.engine_build.is_empty() {
+        return Err(CalibError::Checkpoint(
+            "completed-spool engine identity is empty".into(),
+        ));
+    }
+    Ok(progress.engine_build)
+}
+
 fn remove_stale_layer_progress(
     output: &Path,
     start: usize,
@@ -2015,6 +2190,8 @@ pub struct LayerStreamEngine {
     boundary_backend: BoundaryBackend,
     artifact_output: PathBuf,
     resume: bool,
+    finalize_completed: bool,
+    cask_only: bool,
     pause_after_layers: Option<usize>,
     layer_prefetch_bytes: u64,
     residual_probe_output: Option<PathBuf>,
@@ -2027,6 +2204,8 @@ impl LayerStreamEngine {
             boundary_backend,
             artifact_output: artifact_output.into(),
             resume: false,
+            finalize_completed: false,
+            cask_only: false,
             pause_after_layers: None,
             layer_prefetch_bytes: CALIBRATION_DEFAULT_LAYER_PREFETCH_BYTES,
             residual_probe_output: None,
@@ -2036,6 +2215,16 @@ impl LayerStreamEngine {
 
     pub const fn with_resume(mut self, resume: bool) -> Self {
         self.resume = resume;
+        self
+    }
+
+    pub const fn with_finalize_completed(mut self, finalize_completed: bool) -> Self {
+        self.finalize_completed = finalize_completed;
+        self
+    }
+
+    pub const fn with_cask_only(mut self, cask_only: bool) -> Self {
+        self.cask_only = cask_only;
         self
     }
 
@@ -2139,7 +2328,11 @@ impl LayerStreamEngine {
                 source_manifest.fingerprint, job.source_fingerprint
             )));
         }
-        let capture = adapter.capture_plan(&model, job)?;
+        let capture = if self.cask_only {
+            adapter.capture_plan(&model, job)?.skip_all()
+        } else {
+            adapter.capture_plan(&model, job)?
+        };
         let geometry_tuning = tune_geometry_for_gpu(adapter, &model, &tensor_plan, job, gpu)?;
         let geometry = geometry_tuning.selected;
         let execution_job = execution_job(job, geometry);
@@ -2148,9 +2341,14 @@ impl LayerStreamEngine {
             adapter.resource_estimate(&model, &execution_job, planner.geometry())?;
         let effective_precision = adapter.effective_precision(gpu);
         let batches = planner.plan(&job.samples);
-        let engine_build = calibration_engine_build_identity()?;
+        let current_engine_build = calibration_engine_build_identity()?;
         let run_fingerprint =
             calibration_run_fingerprint(adapter, &model, &tensor_plan, job, geometry)?;
+        let engine_build = if self.finalize_completed {
+            completed_spool_engine_build(&self.artifact_output, &run_fingerprint)?
+        } else {
+            current_engine_build
+        };
         let checkpoint_execution_fingerprint =
             calibration_checkpoint_execution_fingerprint(&engine_build, &run_fingerprint);
         let resuming_existing_checkpoint = match (&self.boundary_backend, self.resume) {
@@ -2228,6 +2426,16 @@ impl LayerStreamEngine {
                 model.hidden_width,
                 model.num_layers
             )));
+        }
+        if self.finalize_completed
+            && (boundary.checkpoint().completed_layers != boundary.checkpoint().total_layers
+                || !boundary.checkpoint().kld_finalized
+                || boundary.checkpoint().artifact_complete)
+        {
+            return Err(CalibError::Checkpoint(
+                "--finalize-completed requires all layers and KLD state committed, with the artifact still unpublished"
+                    .into(),
+            ));
         }
         if boundary.checkpoint().artifact_complete && !self.artifact_output.exists() {
             return Err(CalibError::Checkpoint(
@@ -2347,6 +2555,13 @@ impl LayerStreamEngine {
             let finish_result = embedding.finish(gpu);
             execute_result?;
             finish_result?;
+            // A streamed phase has no device-resident state after `finish`.
+            // Return pooled scratch/weights to HIP here instead of retaining
+            // one free-list bucket per source shape across the whole model.
+            // Gemma 4's per-layer projection shapes otherwise accumulated
+            // enough exact-size buckets to OOM a 60-layer CASK-only pass.
+            gpu.invalidate_weight_caches();
+            gpu.drain_pool();
         }
 
         for layer_index in completed_layers..model.num_layers {
@@ -2477,10 +2692,13 @@ impl LayerStreamEngine {
             execute_result?;
             let capture_summary = capture_result?;
             finish_result?;
+            gpu.invalidate_weight_caches();
+            gpu.drain_pool();
             let layer_descriptors = capture_summary.descriptors;
             let layer_telemetry = capture_summary.expert_telemetry;
             let mut layer_preserve = Vec::new();
             if let Some(telemetry) = layer_telemetry.as_ref() {
+                telemetry.reconcile()?;
                 let outcome = telemetry
                     .coverage_report(
                         job.options.expert_coverage_policy,
@@ -2647,12 +2865,16 @@ impl LayerStreamEngine {
             let finish_result = finalizer.finish(gpu);
             execute_result?;
             finish_result?;
+            gpu.invalidate_weight_caches();
+            gpu.drain_pool();
             Some(builder.finish()?)
         } else {
             // The finalizer may still own planned final-norm/lm-head tensors.
             let mut reader = PlannedTensorReader::new(source, &mut ledger, TensorOwner::Persistent);
             let mut finalizer = adapter.load_finalizer(&mut reader, gpu, &model, &execution_job)?;
             finalizer.finish(gpu)?;
+            gpu.invalidate_weight_caches();
+            gpu.drain_pool();
             None
         };
 
@@ -3477,6 +3699,67 @@ mod tests {
     }
 
     #[test]
+    fn cli_limits_finalize_completed_to_explicit_resume_without_side_outputs() {
+        let base = [
+            "--model",
+            "model",
+            "--corpus",
+            "corpus.txt",
+            "--output",
+            "out.hfq",
+        ]
+        .map(str::to_string);
+        let mut valid = base.to_vec();
+        valid.extend(["--resume", "--finalize-completed"].map(str::to_string));
+        let command = CalibrateCommand::parse(&valid).unwrap();
+        assert!(command.resume);
+        assert!(command.finalize_completed);
+
+        let mut without_resume = base.to_vec();
+        without_resume.push("--finalize-completed".into());
+        assert!(CalibrateCommand::parse(&without_resume).is_err());
+
+        let mut with_cask = valid;
+        with_cask.extend(["--cask-output", "sidecar.hfq"].map(str::to_string));
+        assert!(CalibrateCommand::parse(&with_cask).is_err());
+    }
+
+    #[test]
+    fn cli_requires_cask_only_to_be_fresh_ram_backed_and_without_kld() {
+        let valid = [
+            "--model",
+            "model",
+            "--corpus",
+            "corpus.txt",
+            "--output",
+            "scratch.hfq",
+            "--cask-output",
+            "sidecar.hfq",
+            "--cask-only",
+            "--boundary-ram",
+            "--no-kldref",
+        ]
+        .map(str::to_string);
+        let command = CalibrateCommand::parse(&valid).unwrap();
+        assert!(command.cask_only);
+        assert!(command.boundary_ram);
+        assert!(!command.kldref);
+
+        for omitted in ["--cask-output", "--boundary-ram", "--no-kldref"] {
+            let mut invalid = valid.to_vec();
+            let index = invalid.iter().position(|arg| arg == omitted).unwrap();
+            invalid.remove(index);
+            if omitted == "--cask-output" {
+                invalid.remove(index);
+            }
+            assert!(
+                CalibrateCommand::parse(&invalid).is_err(),
+                "omitted {omitted}"
+            );
+        }
+    }
+
+    #[test]
     fn cli_accepts_a_bounded_residual_probe_only_for_fresh_full_runs() {
         let base = [
             "--model",
@@ -3769,6 +4052,39 @@ mod tests {
 
         fs::write(&part, b"corrupt").unwrap();
         assert!(read_layer_progress(&output, 0, "engine-a", "run-a").is_err());
+        fs::remove_dir_all(output.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn completed_spool_finalization_recovers_original_engine_for_same_run_only() {
+        let output = temp_output("finalize-engine");
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
+        let progress = CalibrationLayerProgress {
+            schema_version: CALIBRATION_PROGRESS_SCHEMA_VERSION,
+            engine_build: "executable:original".into(),
+            run_fingerprint: "run-a".into(),
+            layer: 0,
+            part_file: calibration_part_path(&output, 0)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            part_bytes: 1,
+            part_hash: "unused-by-identity-recovery".into(),
+            descriptors: Vec::new(),
+            expert_telemetry: None,
+            preserve_high_precision: Vec::new(),
+            max_consistency: 0.0,
+            read_ledger: ReadLedgerSnapshot::default(),
+            timing: CalibrationLayerTiming::default(),
+        };
+        write_layer_progress(&output, &progress).unwrap();
+
+        assert_eq!(
+            completed_spool_engine_build(&output, "run-a").unwrap(),
+            "executable:original"
+        );
+        assert!(completed_spool_engine_build(&output, "run-b").is_err());
         fs::remove_dir_all(output.parent().unwrap()).unwrap();
     }
 

@@ -3056,6 +3056,63 @@ impl Gpu {
     /// `(Re(E[q_f]), Im(E[q_f]), E[||q_f||])`. `scores`: `[n_heads × seq_len]`
     /// float32 output. One block per (pos, head); 32 threads reduce across
     /// the head's frequency bands.
+    pub fn triattn_score_f32(
+        &mut self,
+        k_cache: &GpuTensor,
+        centers: &GpuTensor,
+        scores: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_rot: usize,
+        half_split: bool,
+        rope_theta: f32,
+        p_q: f32,
+        seq_len: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "triattn_score_f32",
+            kernels::TRIATTN_SCORE_F32_SRC,
+            "triattn_score_f32",
+        )?;
+        let func = &self.functions["triattn_score_f32"];
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut c_ptr = centers.buf.as_ptr();
+        let mut s_ptr = scores.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut nr = n_rot as i32;
+        let mut layout = i32::from(half_split);
+        let mut th = rope_theta;
+        let mut pq = p_q;
+        let mut sl = seq_len as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut c_ptr as *mut _ as *mut c_void,
+            &mut s_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut layout as *mut _ as *mut c_void,
+            &mut th as *mut _ as *mut c_void,
+            &mut pq as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [seq_len as u32, n_heads as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     pub fn triattn_score_q8(
         &mut self,
         k_cache: &GpuTensor,
@@ -3065,6 +3122,7 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         n_rot: usize,
+        half_split: bool,
         rope_theta: f32,
         p_q: f32,
         seq_len: usize,
@@ -3083,6 +3141,7 @@ impl Gpu {
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut nr = n_rot as i32;
+        let mut layout = i32::from(half_split);
         let mut th = rope_theta;
         let mut pq = p_q;
         let mut sl = seq_len as i32;
@@ -3094,6 +3153,7 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut nr as *mut _ as *mut c_void,
+            &mut layout as *mut _ as *mut c_void,
             &mut th as *mut _ as *mut c_void,
             &mut pq as *mut _ as *mut c_void,
             &mut sl as *mut _ as *mut c_void,
@@ -3123,6 +3183,7 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         n_rot: usize,
+        half_split: bool,
         rope_theta: f32,
         p_q: f32,
         seq_len: usize,
@@ -3143,6 +3204,7 @@ impl Gpu {
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut nr = n_rot as i32;
+        let mut layout = i32::from(half_split);
         let mut th = rope_theta;
         let mut pq = p_q;
         let mut sl = seq_len as i32;
@@ -3156,6 +3218,7 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut nr as *mut _ as *mut c_void,
+            &mut layout as *mut _ as *mut c_void,
             &mut th as *mut _ as *mut c_void,
             &mut pq as *mut _ as *mut c_void,
             &mut sl as *mut _ as *mut c_void,
@@ -3185,6 +3248,7 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         n_rot: usize,
+        half_split: bool,
         rope_theta: f32,
         p_q: f32,
         seq_len: usize,
@@ -3205,6 +3269,7 @@ impl Gpu {
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut nr = n_rot as i32;
+        let mut layout = i32::from(half_split);
         let mut th = rope_theta;
         let mut pq = p_q;
         let mut sl = seq_len as i32;
@@ -3218,6 +3283,7 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut nr as *mut _ as *mut c_void,
+            &mut layout as *mut _ as *mut c_void,
             &mut th as *mut _ as *mut c_void,
             &mut pq as *mut _ as *mut c_void,
             &mut sl as *mut _ as *mut c_void,
@@ -3248,6 +3314,7 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         n_rot: usize,
+        half_split: bool,
         rope_theta: f32,
         p_q: f32,
         seq_len: usize,
@@ -3268,6 +3335,7 @@ impl Gpu {
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut nr = n_rot as i32;
+        let mut layout = i32::from(half_split);
         let mut th = rope_theta;
         let mut pq = p_q;
         let mut sl = seq_len as i32;
@@ -3281,6 +3349,7 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut nr as *mut _ as *mut c_void,
+            &mut layout as *mut _ as *mut c_void,
             &mut th as *mut _ as *mut c_void,
             &mut pq as *mut _ as *mut c_void,
             &mut sl as *mut _ as *mut c_void,

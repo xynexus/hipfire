@@ -158,18 +158,58 @@ fn main() {
             let ts = hfq.tensors();
             println!("tensors: {}", ts.len());
             let mut total = 0u64;
+            let mut stored_total = 0u64;
+            let mut recoded = 0usize;
             for t in ts {
+                // The index reports the LOGICAL encoding — a losslessly-recoded
+                // tensor is presented as the type it expands to. An inspection
+                // tool must show what is actually on disk, or a compressed
+                // artifact is indistinguishable from a plain one.
+                let (stored_qt, stored_len) = hfq
+                    .stored_encoding(&t.name)
+                    .unwrap_or((t.quant_type, t.data_size));
                 total += t.data_size as u64;
+                stored_total += stored_len as u64;
+                let qt = if stored_qt == t.quant_type {
+                    format!("{}", t.quant_type)
+                } else {
+                    recoded += 1;
+                    format!("{stored_qt}->{}", t.quant_type)
+                };
+                let size = if stored_len == t.data_size {
+                    format!("{:.2} MB", t.data_size as f64 / 1e6)
+                } else {
+                    format!(
+                        "{:.2} MB on disk (-> {:.2} MB)",
+                        stored_len as f64 / 1e6,
+                        t.data_size as f64 / 1e6
+                    )
+                };
                 println!(
-                    "  {:60} qt={:<2} shape={:?} g={} {:.2} MB",
-                    t.name,
-                    t.quant_type,
-                    t.shape,
-                    t.group_size,
-                    t.data_size as f64 / 1e6
+                    "  {:60} qt={:<6} shape={:?} g={} {size}",
+                    t.name, qt, t.shape, t.group_size
                 );
             }
-            println!("total tensor bytes: {:.2} MB", total as f64 / 1e6);
+            if recoded > 0 {
+                println!(
+                    "  ({recoded} tensor(s) losslessly recoded on disk: {:.2} MB stored, \
+                     {:.2} MB expanded, {:.4}x; `qt=STORED->LOGICAL`)",
+                    stored_total as f64 / 1e6,
+                    total as f64 / 1e6,
+                    total as f64 / stored_total.max(1) as f64
+                );
+            }
+            // Report the on-disk total too, or a recoded artifact appears to
+            // occupy its expanded size — which is not what the file costs.
+            if stored_total == total {
+                println!("total tensor bytes: {:.2} MB", total as f64 / 1e6);
+            } else {
+                println!(
+                    "total tensor bytes: {:.2} MB on disk ({:.2} MB expanded)",
+                    stored_total as f64 / 1e6,
+                    total as f64 / 1e6
+                );
+            }
         }
         "extract" => {
             let inp = argv

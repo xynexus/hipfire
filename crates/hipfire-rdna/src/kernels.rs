@@ -2822,6 +2822,7 @@ pub const ATTENTION_FLASH_FWHT2_TILE_BATCHED_SRC: &str =
 
 /// TriAttention scoring on Q8 post-RoPE K cache (arXiv:2604.04921).
 pub const TRIATTN_SCORE_Q8_SRC: &str = include_str!("../../../kernels/src/triattn_score_q8.hip");
+pub const TRIATTN_SCORE_F32_SRC: &str = include_str!("../../../kernels/src/triattn_score_f32.hip");
 
 /// TriAttention scoring on asym3 (Givens-rotated 3-bit) K cache.
 pub const TRIATTN_SCORE_ASYM3_SRC: &str =
@@ -4004,6 +4005,11 @@ pub const GEMM_BF16_TILED_WMMA_SRC: &str =
 pub const GEMM_OPUS_TILED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_opus_tiled_wmma.hip");
 
+/// Plain-basis arch-20 DFLASH Opus reference GEMM. Consumes qt=45/46/47
+/// interleaved blocks directly without FWHT, host expansion, or repacking.
+pub const GEMM_DFLASH_OQ_PLAIN_REF_SRC: &str =
+    include_str!("../../../kernels/src/gemm_dflash_oq_plain_ref.hip");
+
 /// Generic kernel library: WMMA BF16 × BF16 → BF16 GEMM, (B, M) output.
 /// gfx1103 (RDNA3 UMA) wave32, register-tiled, zero LDS. F32 accumulation
 /// (`v_wmma_f32_16x16x16_bf16`) with a BF16 round on store. See
@@ -4285,6 +4291,8 @@ pub const LMHEAD_COARSE_HIST_SRC: &str =
 pub const LMHEAD_COARSE_COMPACT_SRC: &str =
     include_str!("../../../kernels/src/lmhead_coarse_compact.hip");
 pub const GEMV_BF16_BF16_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_bf16.hip");
+pub const GEMV_BF16L3_SRC: &str = include_str!("../../../kernels/src/gemv_bf16l3.hip");
+pub const GEMV_BF16_VEC8_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_vec8.hip");
 pub const GEMV_IU8_I32_SRC: &str = include_str!("../../../kernels/src/gemv_iu8_i32.hip");
 pub const GEMV_IU4_I32_SRC: &str = include_str!("../../../kernels/src/gemv_iu4_i32.hip");
 

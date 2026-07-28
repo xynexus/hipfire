@@ -992,7 +992,7 @@ mod resource_reservation_tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let model_path = dir.join("Qwen3.5-122B-A10B.mq4.hfq");
+        let model_path = dir.join("Qwen3.5-122B-A10B--mq4.hfq");
         std::fs::write(&model_path, vec![0u8; 1234]).unwrap();
 
         let manager = ResourceReservationManager::from_env_reader(|_| None);

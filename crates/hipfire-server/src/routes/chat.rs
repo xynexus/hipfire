@@ -27,7 +27,7 @@ use hipfire_daemon_adapter::{
 use hipfire_generate::{
     openai_chat_completion_done_chunk_json, GenerateTextRequest, GenerationSamplingPolicy,
 };
-use hipfire_model::{discover_dflash_draft_for_model, ModelLoadParams, ModelWorkerKey};
+use hipfire_model::{ModelLoadParams, ModelWorkerKey};
 use hipfire_prompt::{Message as PromptMessage, Role, ToolCall as PromptToolCall};
 use hipfire_scheduler::{
     create_request_session_draft, plan_model_residency, server_prefill_batch_enabled,
@@ -232,35 +232,16 @@ fn load_params_for_model_config(
 
 fn maybe_attach_dflash_draft(
     cfg: &HipfireConfig,
-    model_path: Option<&Path>,
+    _model_path: Option<&Path>,
     params: &mut ModelLoadParams,
 ) {
     if cfg.dflash_mode == "off" {
-        return;
-    }
-    let is_a3b = model_path
-        .and_then(|path| path.file_name())
-        .and_then(|name| name.to_str())
-        .map(|name| name.to_ascii_lowercase().contains("a3b"))
-        .unwrap_or(false);
-    let has_explicit_sidecar = cfg
-        .cask_sidecar
-        .as_deref()
-        .filter(|sidecar| !sidecar.is_empty())
-        .is_some_and(|sidecar| Path::new(sidecar).is_file());
-    let allowed =
-        cfg.dflash_mode == "on" || (cfg.dflash_mode == "auto" && (!is_a3b || has_explicit_sidecar));
-    if !allowed {
         return;
     }
     if let Ok(explicit) = std::env::var("HIPFIRE_DFLASH_DRAFT") {
         if !explicit.is_empty() {
             params.draft = Some(explicit);
         }
-        return;
-    }
-    if let Some(path) = model_path.and_then(discover_dflash_draft_for_model) {
-        params.draft = Some(path.to_string_lossy().into_owned());
     }
 }
 
@@ -280,33 +261,20 @@ fn maybe_attach_cask_sidecar(
     }
 
     if let Some(sidecar) = cfg.cask_sidecar.as_deref().filter(|s| !s.is_empty()) {
-        if Path::new(sidecar).is_file() {
-            params.cask_sidecar = Some(sidecar.to_string());
-            attach_cask_policy(cfg, params);
-        } else {
-            params.cask_sidecar = None;
-            clear_cask_policy(params);
-        }
+        params.cask_sidecar = Some(sidecar.to_string());
+        attach_cask_policy(cfg, params);
         return;
     }
 
     if !cfg.cask_auto_attach {
         return;
     }
-    let Some(model_path) = model_path else {
-        return;
-    };
-    let filename = model_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    if filename.to_ascii_lowercase().contains("a3b") {
-        return;
-    }
-    if let Some(sidecar) = discover_triattn_sidecar(model_path) {
-        params.cask_sidecar = Some(sidecar.to_string_lossy().into_owned());
-        attach_cask_policy(cfg, params);
-    }
+    let _ = model_path;
+    // Embedded and canonical sibling resolution happens in serving-core so
+    // every caller shares explicit > embedded > sibling precedence. Forward
+    // the policy here without turning an auto-discovered sibling into a fake
+    // explicit override.
+    attach_cask_policy(cfg, params);
 }
 
 fn attach_cask_policy(cfg: &HipfireConfig, params: &mut ModelLoadParams) {
@@ -315,41 +283,6 @@ fn attach_cask_policy(cfg: &HipfireConfig, params: &mut ModelLoadParams) {
     params.cask_beta = Some(cfg.cask_beta);
     params.cask_core_frac = Some(cfg.cask_core_frac);
     params.cask_fold_m = Some(cfg.cask_fold_m);
-}
-
-fn clear_cask_policy(params: &mut ModelLoadParams) {
-    params.cask = None;
-    params.cask_budget = None;
-    params.cask_beta = None;
-    params.cask_core_frac = None;
-    params.cask_fold_m = None;
-}
-
-fn discover_triattn_sidecar(model_path: &Path) -> Option<std::path::PathBuf> {
-    let filename = model_path.file_name().and_then(|name| name.to_str())?;
-    let model_dir = model_path.parent().unwrap_or_else(|| Path::new("."));
-    let mut dirs = vec![
-        model_dir.to_path_buf(),
-        hipfire_config::hipfire_dir().join("triattn"),
-    ];
-    dirs.dedup();
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if name.starts_with(&format!("{filename}.triattn"))
-                && (name.ends_with(".bin") || name.ends_with(".hfq"))
-            {
-                return Some(path);
-            }
-        }
-    }
-    None
 }
 
 #[derive(Clone, Debug)]
@@ -3313,7 +3246,7 @@ mod tests {
     }
 
     #[test]
-    fn load_params_attach_discovered_dflash_draft_like_bun() {
+    fn load_params_leave_dflash_discovery_to_shared_load_resolver() {
         let root = std::env::temp_dir().join(format!(
             "hipfire-server-dflash-draft-{}",
             std::process::id()
@@ -3331,12 +3264,12 @@ mod tests {
         };
         let params = load_params_for_model_config(&cfg, "qwen3.5-27b-mq4", Some(&target));
 
-        assert_eq!(params.draft.as_deref(), Some(draft.to_str().unwrap()));
+        assert_eq!(params.draft, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn load_params_drop_missing_explicit_cask_sidecar_like_bun() {
+    fn load_params_preserve_missing_explicit_cask_for_fail_closed_load() {
         let cfg = HipfireConfig {
             cask_sidecar: Some("/definitely/missing/model.triattn.hfq".to_string()),
             cask: true,
@@ -3345,12 +3278,15 @@ mod tests {
 
         let params = load_params_for_model_config(&cfg, "qwen3.5-27b-mq4", None);
 
-        assert_eq!(params.cask_sidecar, None);
-        assert_eq!(params.cask, None);
+        assert_eq!(
+            params.cask_sidecar.as_deref(),
+            Some("/definitely/missing/model.triattn.hfq")
+        );
+        assert_eq!(params.cask, Some(true));
     }
 
     #[test]
-    fn load_params_auto_attach_triattn_sidecar_like_bun() {
+    fn load_params_leave_triattn_discovery_to_shared_load_resolver() {
         let root = std::env::temp_dir().join(format!(
             "hipfire-server-triattn-sidecar-{}",
             std::process::id()
@@ -3369,10 +3305,7 @@ mod tests {
 
         let params = load_params_for_model_config(&cfg, "qwen3.5-27b-mq4", Some(&target));
 
-        assert_eq!(
-            params.cask_sidecar.as_deref(),
-            Some(sidecar.to_str().unwrap())
-        );
+        assert_eq!(params.cask_sidecar, None);
         assert_eq!(params.cask_budget, Some(2048));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3407,7 +3340,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let model = root.join("Qwen3.5-122B-A10B.mq4.hfq");
+        let model = root.join("Qwen3.5-122B-A10B--mq4.hfq");
         std::fs::write(&model, vec![0u8; 128]).unwrap();
         let cfg = HipfireConfig {
             model_residency_mode: "qwen_moe_modules".to_string(),

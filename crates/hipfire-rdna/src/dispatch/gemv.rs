@@ -4819,6 +4819,47 @@ impl Gpu {
     ) -> HipResult<()> {
         self.launch_gemv_generic("gemv_bf16_bf16", kernels::GEMV_BF16_BF16_SRC, w, x, y, m, k)
     }
+
+    /// Plain-BF16 GEMV with the same 8-elements-per-lane access shape as
+    /// [`Self::gemv_bf16l3`]. Same maths as [`Self::gemv_bf16_bf16`]; exists as
+    /// the like-for-like baseline that separates the BF16L3 compression win
+    /// from the coalescing win. Requires `k % 256 == 0`.
+    pub fn gemv_bf16_vec8(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        assert_eq!(
+            k % 256,
+            0,
+            "gemv_bf16_vec8 requires K % 256 == 0, got K={k}"
+        );
+        self.launch_gemv_generic("gemv_bf16_vec8", kernels::GEMV_BF16_VEC8_SRC, w, x, y, m, k)
+    }
+
+    /// GEMV against BF16L3-compressed weights, decoded in-kernel: `w` is the
+    /// packed payload of the logical [M,K] BF16 matrix (see
+    /// `hipfire_primitives::bf16_lut3`), `x` [K] BF16, `y` [M] BF16.
+    ///
+    /// Bit-identical to [`Self::gemv_bf16_bf16`] on the same weights — the
+    /// format is lossless — while reading ~1.38× fewer weight bytes.
+    ///
+    /// `k` must be a multiple of `bf16_lut3::BLOCK` (256): the format blocks the
+    /// flattened tensor, so rows begin on a block boundary only then.
+    pub fn gemv_bf16l3(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        assert_eq!(k % 256, 0, "gemv_bf16l3 requires K % 256 == 0, got K={k}");
+        self.launch_gemv_generic("gemv_bf16l3", kernels::GEMV_BF16L3_SRC, w, x, y, m, k)
+    }
     /// Generic GEMV signed-INT8×INT8 → INT32: `w` [M,K], `x` [K], `y` [M].
     pub fn gemv_iu8_i32(
         &mut self,

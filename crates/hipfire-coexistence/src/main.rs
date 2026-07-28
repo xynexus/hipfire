@@ -73,9 +73,11 @@ fn usage() {
          [--min-expert-activations N] [--expert-capture-target N] \
          [--expert-capture-tile-rows N] [--expert-coverage-policy \
          strict|preserve-undercovered] [--kldref|--no-kldref] \
-         [--kldref-topk N] [--boundary-dir DIR|--boundary-ram] [--resume] [--dry-run]\n\
+         [--kldref-topk N] [--boundary-dir DIR|--boundary-ram] [--resume] \
+         [--finalize-completed] [--dry-run]\n\
          [--pause-after-layers N] \
-         [--residual-probe-output PATH --residual-probe-rows N]\n\
+         [--residual-probe-output PATH --residual-probe-rows N] \
+         [--cask-output <model.triattn.hfq>] [--cask-only]\n\
          artifact inspect --input <artifact.hfq>\n\
          artifact audit-calibration --input <artifact.calib.hfq>\n\
          artifact compare-calibration --reference <resident.calib.hfq> \

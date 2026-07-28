@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Resumable model induction: DFlash, calib+KLDREF, quant, and TriAttention.
+"""Resumable model induction: calibration, quantization, CASK, and DFLASH.
 
 This is offline orchestration only. It composes the existing converters and
-GPU tools, records each completed stage in a manifest, and resumes from valid
-artifacts without rereading a hundreds-of-GiB source checkpoint unnecessarily.
+GPU tools, bundles role components into one HFQ, records every completed stage
+in a manifest, and resumes without rereading a large source checkpoint.
+
+This wrapper constructs candidates. It deliberately does not transfer or mark
+them admitted: promotion remains gated by the evidence recorded in the
+induction manifest.
 """
 
 from __future__ import annotations
@@ -11,6 +15,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -19,24 +24,47 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_TARGET = Path("/srv/huggingface/models--Qwen--Qwen3.5-397B-A17B")
-DEFAULT_DRAFT = Path("/srv/huggingface/models--z-lab--Qwen3.5-397B-A17B-DFlash")
+DEFAULT_DRAFT = None
 DEFAULT_CORPUS = Path("benchmarks/calib/calib-5m.txt")
 DEFAULT_QUANT_FORMAT = "oq4.25++"
-DEFAULT_DFLASH_FORMATS = ("bf16", "f16")
+DEFAULT_DFLASH_FORMATS = ("oq4+",)
 DEFAULT_LAYER_PREFETCH_BYTES = 16 * 1024**3
-DEFAULT_CALIBRATION_SEGMENT_LAYERS = 4
+DEFAULT_CALIBRATION_SEGMENT_LAYERS = 0
 DEFAULT_MIN_EXPERT_ACTIVATIONS = 2048
 DEFAULT_EXPERT_CAPTURE_TARGET = 4096
 DEFAULT_EXPERT_CAPTURE_TILE_ROWS = 256
 DEFAULT_REQUIRED_EXPERT_FRACTION = 1.0
 DEFAULT_SAMPLING_SEED = 1
 DEFAULT_EXPERT_COVERAGE_POLICY = "preserve-undercovered"
-STAGES = ("dflash", "target", "triattn")
+STAGES = ("dflash", "target", "bundle")
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def producer_revision() -> dict:
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    dirty = bool(
+        subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=REPO_ROOT,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout
+    )
+    return {
+        "git_commit": commit,
+        "worktree_dirty": dirty,
+        "orchestrator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    }
 
 
 def resolve_hf_snapshot(path: Path) -> Path:
@@ -83,11 +111,22 @@ def _source_summary(path: Path) -> dict:
     }
 
 
-def preflight_sources(target: Path, draft: Path) -> dict:
+def preflight_sources(target: Path, draft: Path | None) -> dict:
     target = resolve_hf_snapshot(target)
-    draft = resolve_hf_snapshot(draft)
     target_root = _read_config(target)
     target_text = target_root.get("text_config") or target_root
+    target_summary = {
+        **_source_summary(target),
+        **{
+            field: _integer(target_text, field)
+            for field in ("hidden_size", "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size")
+        },
+        "num_hidden_layers": _integer(target_text, "num_hidden_layers"),
+    }
+    if draft is None:
+        return {"target": target_summary, "draft": None, "compatibility": "not-applicable"}
+
+    draft = resolve_hf_snapshot(draft)
     draft_config = _read_config(draft)
     if "DFlashDraftModel" not in draft_config.get("architectures", []):
         raise ValueError("DFlash source config does not declare DFlashDraftModel")
@@ -125,11 +164,7 @@ def preflight_sources(target: Path, draft: Path) -> dict:
         raise ValueError("target/DFlash incompatibility: " + "; ".join(mismatches))
 
     return {
-        "target": {
-            **_source_summary(target),
-            **{field: _integer(target_text, field) for field in fields},
-            "num_hidden_layers": target_layers,
-        },
+        "target": target_summary,
         "draft": {
             **_source_summary(draft),
             **{field: _integer(draft_config, field) for field in fields},
@@ -175,34 +210,48 @@ def artifact_layout(
     model_name: str,
     quant_format: str,
     dflash_formats: list[str] | tuple[str, ...],
+    model_dir: Path | None = None,
 ) -> dict[str, Path]:
-    primary_stem = f"{model_name}.{quant_format}"
+    dflash_formats = list(dict.fromkeys(dflash_formats))
+    if len(dflash_formats) > 1:
+        raise ValueError("one bundle may contain exactly one DFLASH encoding")
+    # Everything carrying a quant token takes the `--` name/machine boundary;
+    # the roles and the quant are dot-separated groups inside the machine
+    # section. See AGENTS.md "Artifact Names".
+    primary_stem = f"{model_name}--{quant_format}"
+    # Roles folded INTO the bundle are `+`-marked, so the bundle is not mistaken
+    # for a standalone sidecar of that role (AGENTS.md "Artifact Names").
+    roles = (["+dflash"] if dflash_formats else []) + ["+triattn"]
+    bundle_stem = f"{model_name}--{'.'.join(roles)}.{quant_format}"
+    work_dir = root / "induction" / primary_stem
+    model_dir = model_dir or root / "models"
     paths = {
-        "model": root / "models" / f"{primary_stem}.hfq",
+        "model": work_dir / f"{primary_stem}.hfq",
         "triattn": root / "triattn" / f"{model_name}.triattn.hfq",
         "calib": root / "calib" / f"{model_name}.calib.hfq",
-        "manifest": root / "induction" / primary_stem / "manifest.json",
-        "two_pass_manifest": root / "induction" / primary_stem / "two-pass.json",
+        "bundle": model_dir / f"{bundle_stem}.hfq",
+        "bundle_partial": model_dir / f".{bundle_stem}.hfq.partial",
+        "manifest": work_dir / "manifest.json",
+        "draft_manifest": work_dir / "dflash.json",
+        "two_pass_manifest": work_dir / "two-pass.json",
     }
-    for dflash_format in dict.fromkeys(dflash_formats):
+    for dflash_format in dflash_formats:
         _dflash_format_args(dflash_format)
+        # A DFlash sidecar carries a quant token, so it takes the `--`
+        # name/machine boundary: <model>--dflash.<quant>.hfq
         paths[f"dflash_{dflash_format}"] = (
-            root / "drafts" / f"{model_name}-{dflash_format.upper()}.dflash.hfq"
+            root / "drafts" / f"{model_name}--dflash.{dflash_format}.hfq"
         )
-    if not any(key.startswith("dflash_") for key in paths):
-        raise ValueError("at least one DFlash format is required")
     return paths
 
 
 def _dflash_format_args(dflash_format: str) -> list[str]:
-    return {
-        "bf16": [],
-        "f16": ["--f16"],
-        "f32": ["--keep-f32"],
-        "mq3": ["--mq3"],
-        "mq4": ["--mq4"],
-        "mq6": ["--mq6"],
-    }[dflash_format]
+    supported = {"bf16", "f16", "f32", "mq3", "mq4", "mq6", "oq4+", "oq8+"}
+    if dflash_format not in supported and not (
+        dflash_format.startswith("oq4.") and dflash_format.endswith("+")
+    ):
+        raise ValueError(f"unsupported DFLASH format: {dflash_format}")
+    return ["--format", dflash_format]
 
 
 def default_quant_args(quant_format: str) -> list[str]:
@@ -216,7 +265,7 @@ def default_quant_args(quant_format: str) -> list[str]:
 def build_stage_commands(
     *,
     target: Path,
-    draft: Path,
+    draft: Path | None,
     corpus: Path,
     paths: dict[str, Path],
     quant_format: str,
@@ -234,26 +283,25 @@ def build_stage_commands(
     required_expert_fraction: float,
     sampling_seed: int,
     expert_coverage_policy: str,
-    triattn_max_tokens: int,
-    triattn_chunk_len: int,
     python: str,
     hipfire: str,
     coexistence: str,
     quantizer: str,
     dflash_converter: str,
-    triattn_bin: str,
     quant_args: list[str],
     reuse_calibration: bool = False,
     calibration_segment_layers: int = DEFAULT_CALIBRATION_SEGMENT_LAYERS,
 ) -> dict[str, list[list[str]]]:
+    if draft is None and dflash_formats:
+        raise ValueError("DFLASH formats require a DFLASH source")
     dflash_commands = [
         [
             dflash_converter,
-            *_dflash_format_args(dflash_format),
             "--input",
             str(draft),
             "--output",
             str(paths[f"dflash_{dflash_format}"]),
+            *_dflash_format_args(dflash_format),
         ]
         for dflash_format in dflash_formats
     ]
@@ -264,6 +312,8 @@ def build_stage_commands(
         str(target),
         "--calib",
         str(paths["calib"]),
+        "--cask-output",
+        str(paths["triattn"]),
         "--output",
         str(paths["model"]),
         "--format",
@@ -310,28 +360,22 @@ def build_stage_commands(
         "--",
         *quant_args,
     ]
-    triattn_command = [
+    bundle_inputs = [str(paths["model"])]
+    bundle_inputs.extend(str(paths[f"dflash_{fmt}"]) for fmt in dflash_formats)
+    bundle_inputs.append(str(paths["triattn"]))
+    bundle_command = [
         hipfire,
-        "lock",
-        "run",
-        "induct-triattn",
-        "--",
-        triattn_bin,
-        str(paths["model"]),
-        "--sidecar",
-        str(paths["triattn"]),
-        "--corpus",
-        str(corpus),
-        "--max-tokens",
-        str(triattn_max_tokens),
-        "--chunk-len",
-        str(triattn_chunk_len),
-        "--gpu-calib",
+        "model",
+        "compose",
+        *bundle_inputs,
+        "--output",
+        str(paths["bundle_partial"]),
+        "--json",
     ]
     return {
         "dflash": dflash_commands,
         "target": [target_command],
-        "triattn": [triattn_command],
+        "bundle": [bundle_command],
     }
 
 
@@ -342,8 +386,20 @@ def artifact_is_valid(path: Path, magic: bytes) -> bool:
         return file.read(len(magic)) == magic
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while chunk := file.read(8 * 1024**2):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def should_reuse_calibration(paths: dict[str, Path], *, force: bool) -> bool:
-    return not force and artifact_is_valid(paths["calib"], b"HFQM")
+    return (
+        not force
+        and artifact_is_valid(paths["calib"], b"HFQM")
+        and artifact_is_valid(paths["triattn"], b"HFQM")
+    )
 
 
 def _write_manifest(path: Path, manifest: dict) -> None:
@@ -378,9 +434,13 @@ def _required_outputs(stage: str, paths: dict[str, Path]) -> list[tuple[Path, by
             if key.startswith("dflash_")
         ]
     if stage == "target":
-        return [(paths["calib"], b"HFQM"), (paths["model"], b"HFQM")]
-    if stage == "triattn":
-        return [(paths["triattn"], b"TRIA")]
+        return [
+            (paths["calib"], b"HFQM"),
+            (paths["model"], b"HFQM"),
+            (paths["triattn"], b"HFQM"),
+        ]
+    if stage == "bundle":
+        return [(paths["bundle"], b"HFQM")]
     raise ValueError(f"unknown induction stage {stage}")
 
 
@@ -394,6 +454,8 @@ def target_stage_complete(paths: dict[str, Path], recipe_fingerprint: str) -> bo
     ledger = manifest.get("source_reads")
     fingerprints = manifest.get("fingerprints")
     audit = manifest.get("calibration_audit")
+    cask = manifest.get("cask")
+    cask_metadata = cask.get("metadata") if isinstance(cask, dict) else None
     return (
         manifest.get("status") == "complete"
         and manifest.get("recipe_fingerprint") == recipe_fingerprint
@@ -402,23 +464,77 @@ def target_stage_complete(paths: dict[str, Path], recipe_fingerprint: str) -> bo
         and not ledger.get("duplicate_logical")
         and isinstance(fingerprints, dict)
         and bool(fingerprints.get("calibration_artifact"))
+        and bool(fingerprints.get("cask_artifact"))
         and bool(fingerprints.get("quantized_artifact"))
         and isinstance(audit, dict)
         and audit.get("schema") == "hipfire.calibration_audit.v1"
         and audit.get("valid") is True
         and not audit.get("errors")
         and audit.get("artifact_fingerprint") == fingerprints.get("calibration_artifact")
+        and isinstance(cask_metadata, dict)
+        and cask_metadata.get("artifact_kind") == "triattn"
+        and cask_metadata.get("package_schema") == "hipfire.triattn.v2"
+        and bool(cask_metadata.get("layers"))
+        and cask.get("artifact_fingerprint") == fingerprints.get("cask_artifact")
     )
+
+
+def dflash_stage_complete(paths: dict[str, Path], recipe_fingerprint: str) -> bool:
+    outputs = _required_outputs("dflash", paths)
+    if not outputs or not all(artifact_is_valid(path, magic) for path, magic in outputs):
+        return False
+    try:
+        manifest = json.loads(paths["draft_manifest"].read_text())
+    except (KeyError, OSError, json.JSONDecodeError):
+        return False
+    recorded = manifest.get("outputs")
+    if manifest.get("status") != "complete" or manifest.get("recipe_fingerprint") != recipe_fingerprint:
+        return False
+    if not isinstance(recorded, dict):
+        return False
+    return all(recorded.get(str(path)) == sha256_file(path) for path, _magic in outputs)
 
 
 def _stage_complete(
     stage: str,
     paths: dict[str, Path],
     target_recipe_fingerprint: str | None = None,
+    dflash_recipe_fingerprint: str | None = None,
 ) -> bool:
     if stage == "target":
         return bool(target_recipe_fingerprint) and target_stage_complete(paths, target_recipe_fingerprint)
+    if stage == "dflash":
+        return bool(dflash_recipe_fingerprint) and dflash_stage_complete(paths, dflash_recipe_fingerprint)
     return all(artifact_is_valid(path, magic) for path, magic in _required_outputs(stage, paths))
+
+
+def plan_stages_to_run(
+    selected: list[str],
+    paths: dict[str, Path],
+    target_recipe_fingerprint: str,
+    dflash_recipe_fingerprint: str | None = None,
+    *,
+    force: bool,
+) -> tuple[list[str], bool]:
+    planned = [
+        stage
+        for stage in selected
+        if force
+        or not _stage_complete(
+            stage,
+            paths,
+            target_recipe_fingerprint,
+            dflash_recipe_fingerprint,
+        )
+    ]
+    bundle_dependency_invalidated = (
+        "bundle" in selected
+        and "bundle" not in planned
+        and any(stage in planned for stage in ("dflash", "target"))
+    )
+    if bundle_dependency_invalidated:
+        planned.append("bundle")
+    return planned, bundle_dependency_invalidated
 
 
 def _target_recipe_fingerprint(
@@ -446,6 +562,7 @@ def _target_recipe_fingerprint(
     recipe = {
         "model": str(target.resolve()),
         "calibration_artifact": str(paths["calib"].resolve()),
+        "cask_artifact": str(paths["triattn"].resolve()),
         "quantized_artifact": str(paths["model"].resolve()),
         "quant_format": quant_format,
         "corpus": str(corpus.resolve()),
@@ -467,6 +584,122 @@ def _target_recipe_fingerprint(
     }
     encoded = json.dumps(recipe, sort_keys=True, separators=(",", ":")).encode()
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _dflash_recipe_fingerprint(
+    *,
+    draft: Path | None,
+    paths: dict[str, Path],
+    dflash_formats: list[str],
+) -> str | None:
+    if draft is None or not dflash_formats:
+        return None
+    safetensors = sorted(draft.glob("*.safetensors"))
+    recipe = {
+        "snapshot": str(draft.resolve()),
+        "config_sha256": hashlib.sha256((draft / "config.json").read_bytes()).hexdigest(),
+        "safetensors": [
+            {"name": path.name, "bytes": path.stat().st_size}
+            for path in safetensors
+        ],
+        "formats": dflash_formats,
+        "outputs": [str(paths[f"dflash_{fmt}"].resolve()) for fmt in dflash_formats],
+    }
+    encoded = json.dumps(recipe, sort_keys=True, separators=(",", ":")).encode()
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def inspect_bundle(hipfire: str | Path, path: Path, *, expect_dflash: bool) -> dict:
+    """Inspect a composed candidate and enforce its role/digest contract."""
+    result = subprocess.run(
+        [str(hipfire), "inspect", str(path), "--json"],
+        cwd=REPO_ROOT,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    inspection = json.loads(result.stdout)
+    components = inspection.get("components")
+    if not isinstance(components, list):
+        raise RuntimeError("bundle inspection did not report components")
+    expected_roles = {"base", "triattn"} | ({"dflash"} if expect_dflash else set())
+    roles = {
+        role
+        for component in components
+        if isinstance(component, dict)
+        for role in [component.get("role")]
+        if isinstance(role, str)
+    }
+    if roles != expected_roles:
+        raise RuntimeError(f"bundle roles {sorted(roles)} differ from expected {sorted(expected_roles)}")
+    for component in components:
+        if not isinstance(component, dict):
+            raise RuntimeError("bundle inspection contains a malformed component")
+        sha256 = component.get("sha256")
+        if not isinstance(sha256, str) or len(sha256) != 64:
+            raise RuntimeError(f"bundle component {component.get('role')!r} lacks a SHA-256 digest")
+        if not isinstance(component.get("byte_len"), int) or component["byte_len"] < 32:
+            raise RuntimeError(f"bundle component {component.get('role')!r} has an invalid length")
+    return inspection
+
+
+def transfer_admitted_bundle(bundle: Path, manifest: dict, remote: str) -> dict:
+    """Copy an admitted bundle to halo-style storage and verify both digests."""
+    if remote.startswith("-") or re.fullmatch(r"[A-Za-z0-9_.@-]+", remote) is None:
+        raise RuntimeError(f"invalid SSH destination: {remote!r}")
+    admission = manifest.get("admission")
+    if not isinstance(admission, dict) or admission.get("status") != "admitted":
+        raise RuntimeError("bundle transfer requires manifest admission.status=admitted")
+    bundle_record = manifest.get("bundle")
+    expected = bundle_record.get("sha256") if isinstance(bundle_record, dict) else None
+    if not isinstance(expected, str) or len(expected) != 64:
+        raise RuntimeError("bundle transfer requires a recorded local SHA-256")
+    actual = sha256_file(bundle)
+    if actual != expected:
+        raise RuntimeError(f"local bundle SHA-256 {actual} differs from manifest {expected}")
+    name = bundle.name
+    if re.fullmatch(r"[A-Za-z0-9.+-]+\.hfq", name) is None:
+        raise RuntimeError(f"bundle filename is not canonical/shell-safe: {name!r}")
+    temporary = f".{name}.partial-{expected[:12]}"
+    remote_dir = "$HOME/.hipfire/models"
+    subprocess.run(
+        ["ssh", remote, f'mkdir -p -- "{remote_dir}"'],
+        check=True,
+    )
+    subprocess.run(
+        ["scp", "--", str(bundle), f"{remote}:~/.hipfire/models/{temporary}"],
+        check=True,
+    )
+    temporary_digest = subprocess.run(
+        ["ssh", remote, f'sha256sum -- "{remote_dir}/{temporary}"'],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.split()[0]
+    if temporary_digest != expected:
+        raise RuntimeError(
+            f"remote temporary SHA-256 {temporary_digest} differs from local {expected}"
+        )
+    subprocess.run(
+        ["ssh", remote, f'mv -- "{remote_dir}/{temporary}" "{remote_dir}/{name}"'],
+        check=True,
+    )
+    final_digest = subprocess.run(
+        ["ssh", remote, f'sha256sum -- "{remote_dir}/{name}"'],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.split()[0]
+    if final_digest != expected:
+        raise RuntimeError(f"remote final SHA-256 {final_digest} differs from local {expected}")
+    return {
+        "status": "delivered",
+        "remote": remote,
+        "path": f"~/.hipfire/models/{name}",
+        "bytes": bundle.stat().st_size,
+        "sha256": expected,
+        "verified_at": utc_now(),
+    }
 
 
 def tool_needs_build(binary: Path, sources: list[Path]) -> bool:
@@ -503,7 +736,7 @@ def calibration_adapter_source_roots(repo_root: Path = REPO_ROOT) -> list[Path]:
 
 
 def _build_commands_for_tools(
-    selected: list[str], *, hipfire: Path, coexistence: Path, quantizer: Path, dflash_converter: Path, triattn_bin: Path
+    selected: list[str], *, hipfire: Path, coexistence: Path, quantizer: Path, dflash_converter: Path
 ) -> list[list[str]]:
     commands = []
     workspace_inputs = [Path("Cargo.lock")]
@@ -521,27 +754,15 @@ def _build_commands_for_tools(
         commands.append(
             ["cargo", "build", "--release", "-p", "hipfire-coexistence", "--bin", "hipfire-coexistence"]
         )
-    hipfire_inputs = workspace_inputs + [Path("crates/hipfire-cli/Cargo.toml"), Path("crates/hipfire-cli/src")]
-    if any(stage in selected for stage in ("target", "triattn")) and tool_needs_build(hipfire, hipfire_inputs):
-        commands.append(["cargo", "build", "--release", "-p", "hipfire-cli", "--bin", "hipfire"])
-    triattn_inputs = workspace_inputs + [
-        Path("crates/hipfire-runtime/Cargo.toml"),
-        Path("crates/hipfire-runtime/examples/triattn_validate.rs"),
+    hipfire_inputs = workspace_inputs + [
+        Path("crates/hipfire-cli/Cargo.toml"),
+        Path("crates/hipfire-cli/src"),
+        Path("crates/hipfire-hfq-tooling/Cargo.toml"),
+        Path("crates/hipfire-hfq-tooling/src"),
+        Path("crates/hipfire-runtime/src/hfq_compose.rs"),
     ]
-    if "triattn" in selected and tool_needs_build(triattn_bin, triattn_inputs):
-        commands.append(
-            [
-                "cargo",
-                "build",
-                "--release",
-                "-p",
-                "hipfire-runtime",
-                "--features",
-                "deltanet",
-                "--example",
-                "triattn_validate",
-            ]
-        )
+    if any(stage in selected for stage in ("target", "bundle")) and tool_needs_build(hipfire, hipfire_inputs):
+        commands.append(["cargo", "build", "--release", "-p", "hipfire-cli", "--bin", "hipfire"])
     return commands
 
 
@@ -551,10 +772,21 @@ def _print_command(label: str, command: list[str]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Induct a target model and its DFlash/CASK support artifacts.")
-    parser.add_argument("--target", type=Path, default=DEFAULT_TARGET)
-    parser.add_argument("--dflash-source", type=Path, default=DEFAULT_DRAFT)
-    parser.add_argument("--model-name", default="Qwen3.5-397B-A17B")
+    parser.add_argument("--target", type=Path, required=True)
+    parser.add_argument(
+        "--dflash-source",
+        type=Path,
+        default=DEFAULT_DRAFT,
+        help="Optional DFLASH Hugging Face source. Omit for a CASK-only bundle.",
+    )
+    parser.add_argument("--model-name", required=True, help="Canonical family/version/size stem.")
     parser.add_argument("--artifact-root", type=Path, default=Path("~/.hipfire"))
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=Path("~/.hipfire/models"),
+        help="Final local staging directory; bundle temp/rename stays on this filesystem.",
+    )
     parser.add_argument(
         "--format",
         dest="quant_format",
@@ -565,8 +797,7 @@ def main() -> None:
         "--dflash-format",
         action="append",
         dest="dflash_formats",
-        choices=["bf16", "f16", "f32", "mq3", "mq4", "mq6"],
-        help="DFlash sidecar dtype/format; repeat to select multiple (default: bf16 and f16).",
+        help="DFLASH encoding; repeat to select multiple (default with a source: oq4+).",
     )
     parser.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
     parser.add_argument("--n-sequences", type=int, default=128)
@@ -585,8 +816,8 @@ def main() -> None:
         type=int,
         default=DEFAULT_CALIBRATION_SEGMENT_LAYERS,
         help=(
-            "Restart calibration after this many additional durable layers "
-            f"(default: {DEFAULT_CALIBRATION_SEGMENT_LAYERS}; 0 runs uninterrupted)."
+            "Reserved for calibration-only runs. Induction emits CASK in the same pass and "
+            "therefore requires 0 (the default)."
         ),
     )
     parser.add_argument("--kldref-topk", type=int, default=64)
@@ -616,10 +847,14 @@ def main() -> None:
         choices=("strict", "preserve-undercovered"),
         default=DEFAULT_EXPERT_COVERAGE_POLICY,
     )
-    parser.add_argument("--triattn-max-tokens", type=int, default=100_000)
-    parser.add_argument("--triattn-chunk-len", type=int, default=1024)
     parser.add_argument("--stage", action="append", choices=STAGES, dest="stages")
     parser.add_argument("--force", action="store_true", help="Rerun selected stages even when valid artifacts exist.")
+    parser.add_argument(
+        "--transfer",
+        action="store_true",
+        help="Deliver the verified bundle after (and only after) manifest admission.",
+    )
+    parser.add_argument("--remote", default="halo", help="SSH destination for --transfer.")
     parser.add_argument("--no-auto-build", action="store_true", help="Fail instead of building missing release tools.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--python", default=sys.executable)
@@ -631,7 +866,6 @@ def main() -> None:
     )
     parser.add_argument("--quantizer", type=Path, default=Path("target/release/hipfire-quantize"))
     parser.add_argument("--dflash-converter", type=Path, default=Path("target/release/dflash_convert"))
-    parser.add_argument("--triattn-bin", type=Path, default=Path("target/release/examples/triattn_validate"))
     parser.add_argument(
         "quant_args",
         nargs=argparse.REMAINDER,
@@ -655,8 +889,6 @@ def main() -> None:
         args.min_expert_activations,
         args.expert_capture_target,
         args.expert_capture_tile_rows,
-        args.triattn_max_tokens,
-        args.triattn_chunk_len,
     ) < 1:
         parser.error("token, sequence, batch, and top-k values must be positive")
     if args.batch_size * args.time_tile > args.max_rows:
@@ -665,6 +897,8 @@ def main() -> None:
         parser.error("--layer-prefetch-bytes must be nonnegative")
     if args.calibration_segment_layers < 0:
         parser.error("--calibration-segment-layers must be nonnegative")
+    if args.calibration_segment_layers != 0:
+        parser.error("CASK induction requires --calibration-segment-layers 0")
     if args.expert_capture_target < args.min_expert_activations:
         parser.error("--expert-capture-target must be at least --min-expert-activations")
     if not 0.0 < args.required_expert_fraction <= 1.0:
@@ -673,20 +907,32 @@ def main() -> None:
         parser.error("--sampling-seed must be nonnegative")
 
     target = resolve_hf_snapshot(args.target)
-    if "dflash" in selected:
-        draft = resolve_hf_snapshot(args.dflash_source)
-        preflight = preflight_sources(target, draft)
-    else:
-        # The DFlash draft (and its target/draft compatibility contract) is
-        # irrelevant when the dflash stage is not selected. Skip resolving and
-        # preflighting it so target-only and triattn-only inductions work for
-        # models that have no matching DFlash draft. `draft` is only referenced
-        # by the (unselected) dflash command, so aliasing it to target is safe.
-        draft = target
-        preflight = preflight_target_only(target)
+    draft = resolve_hf_snapshot(args.dflash_source) if args.dflash_source is not None else None
+    preflight = preflight_sources(target, draft)
     artifact_root = args.artifact_root.expanduser().resolve()
-    dflash_formats = list(dict.fromkeys(args.dflash_formats or DEFAULT_DFLASH_FORMATS))
-    paths = artifact_layout(artifact_root, args.model_name, args.quant_format, dflash_formats)
+    model_dir = args.model_dir.expanduser().resolve()
+    if args.dflash_formats and draft is None:
+        parser.error("--dflash-format requires --dflash-source")
+    dflash_formats = list(dict.fromkeys(args.dflash_formats or (DEFAULT_DFLASH_FORMATS if draft else ())))
+    if not dflash_formats:
+        if args.stages and "dflash" in args.stages:
+            parser.error("--stage dflash requires --dflash-source")
+        selected = [stage for stage in selected if stage != "dflash"]
+    for dflash_format in dflash_formats:
+        try:
+            _dflash_format_args(dflash_format)
+        except ValueError as error:
+            parser.error(str(error))
+    try:
+        paths = artifact_layout(
+            artifact_root,
+            args.model_name,
+            args.quant_format,
+            dflash_formats,
+            model_dir,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     supplied_quant_args = args.quant_args[1:] if args.quant_args[:1] == ["--"] else args.quant_args
     quant_args = supplied_quant_args or default_quant_args(args.quant_format)
     commands = build_stage_commands(
@@ -709,14 +955,11 @@ def main() -> None:
         required_expert_fraction=args.required_expert_fraction,
         sampling_seed=args.sampling_seed,
         expert_coverage_policy=args.expert_coverage_policy,
-        triattn_max_tokens=args.triattn_max_tokens,
-        triattn_chunk_len=args.triattn_chunk_len,
         python=args.python,
         hipfire=str(args.hipfire),
         coexistence=str(args.coexistence),
         quantizer=str(args.quantizer),
         dflash_converter=str(args.dflash_converter),
-        triattn_bin=str(args.triattn_bin),
         quant_args=quant_args,
         reuse_calibration=should_reuse_calibration(paths, force=args.force),
         calibration_segment_layers=args.calibration_segment_layers,
@@ -741,25 +984,31 @@ def main() -> None:
         expert_coverage_policy=args.expert_coverage_policy,
         quant_args=quant_args,
     )
+    dflash_recipe_fingerprint = _dflash_recipe_fingerprint(
+        draft=draft,
+        paths=paths,
+        dflash_formats=dflash_formats,
+    )
 
     print(json.dumps({"preflight": preflight, "artifacts": {key: str(value) for key, value in paths.items()}}, indent=2))
-    stages_to_run = [
-        stage
-        for stage in selected
-        if args.force or not _stage_complete(stage, paths, target_recipe_fingerprint)
-    ]
+    stages_to_run, bundle_dependency_invalidated = plan_stages_to_run(
+        selected,
+        paths,
+        target_recipe_fingerprint,
+        dflash_recipe_fingerprint,
+        force=args.force,
+    )
     build_commands = _build_commands_for_tools(
         stages_to_run,
         hipfire=args.hipfire,
         coexistence=args.coexistence,
         quantizer=args.quantizer,
         dflash_converter=args.dflash_converter,
-        triattn_bin=args.triattn_bin,
     )
     for command in build_commands:
         _print_command("build", command)
     for stage in selected:
-        if _stage_complete(stage, paths, target_recipe_fingerprint) and not args.force:
+        if stage not in stages_to_run:
             print(f"{stage}: reuse valid artifact(s)")
         else:
             for index, command in enumerate(commands[stage], start=1):
@@ -779,17 +1028,20 @@ def main() -> None:
         except (json.JSONDecodeError, OSError):
             previous_manifest = {}
     manifest = {
-        "schema": 1,
+        "schema": 2,
         "created_at": previous_manifest.get("created_at", utc_now()),
         "updated_at": utc_now(),
         "model_name": args.model_name,
+        "producer": producer_revision(),
         "quant_format": args.quant_format,
         "dflash_formats": dflash_formats,
+        "dflash_recipe_fingerprint": dflash_recipe_fingerprint,
         "corpus": str(corpus),
         "sources": preflight,
         "artifacts": {key: str(value) for key, value in paths.items() if key != "manifest"},
         "stages": previous_manifest.get("stages", {}),
-        "admission": {
+        "admission": previous_manifest.get("admission")
+        or {
             "status": "pending",
             "required_evidence": [
                 "finite-logit and coherence smoke",
@@ -800,11 +1052,21 @@ def main() -> None:
                 "Kernel Atlas AR and DFlash performance rows",
             ],
         },
+        **(
+            {"bundle": previous_manifest["bundle"]}
+            if isinstance(previous_manifest.get("bundle"), dict)
+            else {}
+        ),
+        **(
+            {"delivery": previous_manifest["delivery"]}
+            if isinstance(previous_manifest.get("delivery"), dict)
+            else {}
+        ),
     }
     _write_manifest(paths["manifest"], manifest)
 
     for stage in selected:
-        if _stage_complete(stage, paths, target_recipe_fingerprint) and not args.force:
+        if stage not in stages_to_run:
             manifest["stages"][stage] = {"status": "reused", "completed_at": utc_now()}
             if stage == "target":
                 two_pass = json.loads(paths["two_pass_manifest"].read_text())
@@ -814,8 +1076,18 @@ def main() -> None:
             manifest["updated_at"] = utc_now()
             _write_manifest(paths["manifest"], manifest)
             continue
-        if stage == "triattn" and not artifact_is_valid(paths["model"], b"HFQM"):
-            raise RuntimeError("TriAttention requires the completed target HFQ; run the target stage first")
+        if stage == "bundle" and not all(
+            artifact_is_valid(path, magic)
+            for path, magic in [
+                (paths["model"], b"HFQM"),
+                (paths["triattn"], b"HFQM"),
+                *[
+                    (paths[f"dflash_{dflash_format}"], b"HFQM")
+                    for dflash_format in dflash_formats
+                ],
+            ]
+        ):
+            raise RuntimeError("bundle requires completed target, CASK, and requested DFLASH artifacts")
         for output, _magic in _required_outputs(stage, paths):
             output.parent.mkdir(parents=True, exist_ok=True)
         manifest["stages"][stage] = {
@@ -826,9 +1098,52 @@ def main() -> None:
         manifest["updated_at"] = utc_now()
         _write_manifest(paths["manifest"], manifest)
         try:
+            if stage == "dflash" and paths["draft_manifest"].exists():
+                paths["draft_manifest"].unlink()
+            if stage == "bundle" and paths["bundle_partial"].exists():
+                paths["bundle_partial"].unlink()
             for command in commands[stage]:
                 subprocess.run(command, cwd=REPO_ROOT, check=True)
-            if not _stage_complete(stage, paths, target_recipe_fingerprint):
+            if stage == "bundle":
+                inspection = inspect_bundle(
+                    args.hipfire,
+                    paths["bundle_partial"],
+                    expect_dflash=bool(dflash_formats),
+                )
+                paths["bundle"].parent.mkdir(parents=True, exist_ok=True)
+                if (
+                    paths["bundle"].exists()
+                    and not args.force
+                    and not bundle_dependency_invalidated
+                ):
+                    raise FileExistsError(
+                        f"refusing to replace existing bundle without --force: {paths['bundle']}"
+                    )
+                paths["bundle_partial"].replace(paths["bundle"])
+                manifest["bundle"] = {
+                    "inspection": inspection,
+                    "sha256": sha256_file(paths["bundle"]),
+                }
+            if stage == "dflash":
+                assert dflash_recipe_fingerprint is not None
+                _write_manifest(
+                    paths["draft_manifest"],
+                    {
+                        "schema": 1,
+                        "status": "complete",
+                        "recipe_fingerprint": dflash_recipe_fingerprint,
+                        "outputs": {
+                            str(output): sha256_file(output)
+                            for output, _magic in _required_outputs(stage, paths)
+                        },
+                    },
+                )
+            if not _stage_complete(
+                stage,
+                paths,
+                target_recipe_fingerprint,
+                dflash_recipe_fingerprint,
+            ):
                 raise RuntimeError(f"{stage} command returned success but its output artifact is invalid")
         except BaseException as error:
             failure_status = _stage_failure_status(stage, paths, error)
@@ -860,7 +1175,26 @@ def main() -> None:
         manifest["updated_at"] = utc_now()
         _write_manifest(paths["manifest"], manifest)
 
-    print(f"induction artifacts complete; admission remains pending: {paths['manifest']}")
+    bundle_complete = _stage_complete(
+        "bundle",
+        paths,
+        target_recipe_fingerprint,
+        dflash_recipe_fingerprint,
+    )
+    if args.transfer and not bundle_complete:
+        raise RuntimeError("--transfer requires a completed bundle stage")
+    if args.transfer:
+        manifest["delivery"] = transfer_admitted_bundle(paths["bundle"], manifest, args.remote)
+        manifest["updated_at"] = utc_now()
+        _write_manifest(paths["manifest"], manifest)
+        print(f"delivered verified bundle to {manifest['delivery']['path']} on {args.remote}")
+    elif bundle_complete:
+        print(
+            f"candidate bundle complete; admission and transfer remain pending: "
+            f"{paths['bundle']} (manifest: {paths['manifest']})"
+        )
+    else:
+        print(f"selected induction stages complete; bundle remains pending: {paths['manifest']}")
 
 
 if __name__ == "__main__":
