@@ -9,6 +9,11 @@
 #include <hip/hip_runtime.h>
 
 // Embedding gather: out[t, i] = embed[ids[t]*hidden + i]. n = s*hidden.
+// NOTE: `ids[t] * hidden` is int32 arithmetic, so this is bounded by
+// vocab * hidden < 2^31. ZAYA1-8B sits at 262272 * 2048 = 537M, only 4x under
+// that ceiling — a 4x larger embedding table overflows into a wild read rather
+// than failing. Widen both this index and `n` to int64 before reusing it for a
+// bigger vocabulary or hidden size.
 extern "C" __global__ void zaya_embed_gather_f32(
     float* __restrict__ out, const float* __restrict__ embed,
     const int* __restrict__ ids, int hidden, int n
@@ -18,6 +23,60 @@ extern "C" __global__ void zaya_embed_gather_f32(
     int t = i / hidden;
     int c = i % hidden;
     out[i] = embed[ids[t] * hidden + c];
+}
+
+// ── streamed-calibration MoE row plumbing ────────────────────────────────────
+// A position slice routes its rows to different experts, so each expert's rows
+// have to be made contiguous for one GEMM and then put back. These three run
+// once per expert group instead of once per row, which is the whole point:
+// at a slice width of 128 the per-row form issued 3 launches per row against
+// ~2 GEMMs per expert.
+
+// Gather whole rows: `out[r, c] = src[idx[r], c]`.
+extern "C" __global__ void zaya_gather_rows_f32(
+    float* __restrict__ out, const float* __restrict__ src,
+    const int* __restrict__ idx, int width, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int r = i / width;
+    int c = i - r * width;
+    out[i] = src[idx[r] * width + c];
+}
+
+// Batched SwiGLU over the INTERLEAVED `[rows, 2*inter]` result of a gate_up
+// GEMM: `out[r, c] = silu(gate_up[r, c]) * gate_up[r, inter + c]`. The gate and
+// up halves are interleaved per row (that is the weight's layout), so the flat
+// `silu_mul_f32` cannot span the batch — hence the explicit row stride here.
+// Uses `expf`, matching `silu_mul_f32` exactly so the batched form stays
+// bit-identical to the per-row one.
+extern "C" __global__ void zaya_silu_mul_gate_up_f32(
+    float* __restrict__ out, const float* __restrict__ gate_up, int inter, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int r = i / inter;
+    int c = i - r * inter;
+    const float* row = &gate_up[r * 2 * inter];
+    float v = row[c];
+    out[i] = (v / (1.0f + expf(-v))) * row[inter + c];
+}
+
+// Scatter-accumulate whole rows with a per-row scale:
+//   `dst[idx[r], c] += scale[r] * src[r, c]`
+// Routing is top-1, so each row of the slice belongs to exactly one expert
+// group and every destination row is written by exactly one source row — no
+// atomics needed. Matches `scaled_add_inplace_cpu_scalar_f32`'s `y += c * x`.
+extern "C" __global__ void zaya_scatter_scaled_add_f32(
+    float* __restrict__ dst, const float* __restrict__ src,
+    const int* __restrict__ idx, const float* __restrict__ scale,
+    int width, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int r = i / width;
+    int c = i - r * width;
+    dst[idx[r] * width + c] += scale[r] * src[i];
 }
 
 // Broadcast bias add: x[i] += bias[i % d]. n = s*d.

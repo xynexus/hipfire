@@ -1458,6 +1458,10 @@ pub struct GeometryTuningReport {
     pub selected: MicrobatchGeometry,
     pub free_vram_bytes: Option<u64>,
     pub reserved_headroom_bytes: u64,
+    /// Which authority sized the candidate filter: `scheduler_budget` when the
+    /// declared memory budget was used, `live_probe` for the instantaneous
+    /// free-VRAM reading, `unavailable` when neither could be read.
+    pub vram_ceiling_source: String,
     pub probes: Vec<GeometryCandidateProbe>,
 }
 
@@ -3225,6 +3229,58 @@ fn auto_geometry_candidates(job: &CalibrationJob) -> Result<Vec<MicrobatchGeomet
     Ok(candidates)
 }
 
+/// The VRAM ceiling the automatic geometry search sizes candidates against.
+struct VramCeiling {
+    usable_bytes: Option<u64>,
+    reserved_headroom_bytes: u64,
+    source: &'static str,
+}
+
+/// Decide that ceiling from a declared budget when there is one, and only fall
+/// back to the live probe when there is not.
+///
+/// A `get_vram_info()` probe is accurate only at the instant it runs. With a
+/// daemon resident on the same GPU, free VRAM sampled before the daemon grows
+/// its KV cache picks a geometry that collides later in the run — and a
+/// calibration run is hours long. `HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES` /
+/// `_HEADROOM_BYTES` are the same pair the daemon's `ResourceReservationManager`
+/// reads, so declaring them makes both sides size against one number instead of
+/// two independent guesses.
+///
+/// This is a ceiling on which candidates get *estimated*, not a replacement for
+/// the live allocation probe below — that still runs and remains the hard check.
+fn vram_ceiling(free_vram: Option<u64>, mut get: impl FnMut(&str) -> Option<u64>) -> VramCeiling {
+    let budget = get("HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES").unwrap_or(0);
+    if budget > 0 {
+        let headroom = get("HIPFIRE_SCHEDULER_VRAM_HEADROOM_BYTES").unwrap_or(0);
+        return VramCeiling {
+            usable_bytes: Some(budget.saturating_sub(headroom)),
+            reserved_headroom_bytes: headroom,
+            source: "scheduler_budget",
+        };
+    }
+    // No declared budget: the historical behaviour — hold back 5% of what is
+    // free right now, at least 1 GiB.
+    let reserved = free_vram
+        .map(|free| (free / 20).max(1u64 << 30))
+        .unwrap_or(0);
+    VramCeiling {
+        usable_bytes: free_vram.map(|free| free.saturating_sub(reserved)),
+        reserved_headroom_bytes: reserved,
+        source: if free_vram.is_some() {
+            "live_probe"
+        } else {
+            "unavailable"
+        },
+    }
+}
+
+fn scheduler_budget_env(key: &str) -> Option<u64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 fn tune_geometry_for_gpu(
     adapter: &dyn CalibrationFamilyAdapter,
     model: &ModelInspection,
@@ -3232,22 +3288,23 @@ fn tune_geometry_for_gpu(
     job: &CalibrationJob,
     gpu: &mut Gpu,
 ) -> Result<GeometryTuningReport, CalibError> {
+    let free_vram = gpu.hip.get_vram_info().ok().map(|(free, _)| free as u64);
+    let ceiling = vram_ceiling(free_vram, scheduler_budget_env);
+
     if job.options.sequence_batch.is_some() && job.options.time_tile.is_some() {
         let selected = resolve_geometry(job)?;
         return Ok(GeometryTuningReport {
             automatic: false,
             selected,
-            free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free as u64),
+            free_vram_bytes: free_vram,
             reserved_headroom_bytes: 0,
+            vram_ceiling_source: ceiling.source.to_string(),
             probes: Vec::new(),
         });
     }
 
-    let free_vram = gpu.hip.get_vram_info().ok().map(|(free, _)| free as u64);
-    let reserved_headroom = free_vram
-        .map(|free| (free / 20).max(1u64 << 30))
-        .unwrap_or(0);
-    let usable_vram = free_vram.map(|free| free.saturating_sub(reserved_headroom));
+    let reserved_headroom = ceiling.reserved_headroom_bytes;
+    let usable_vram = ceiling.usable_bytes;
     let max_layer_bytes = (0..model.num_layers)
         .map(|layer| tensor_plan.bytes_for(TensorOwner::Layer(layer)))
         .max()
@@ -3308,15 +3365,21 @@ fn tune_geometry_for_gpu(
         }
     }
     let selected = selected.ok_or_else(|| {
-        CalibError::Runtime(
-            "no automatic calibration geometry passed the live VRAM allocation probe".into(),
-        )
+        CalibError::Runtime(format!(
+            "no automatic calibration geometry fit the VRAM ceiling ({} usable, source {}); \
+             lower --max-rows or raise HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES",
+            usable_vram
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            ceiling.source,
+        ))
     })?;
     Ok(GeometryTuningReport {
         automatic: true,
         selected,
         free_vram_bytes: free_vram,
         reserved_headroom_bytes: reserved_headroom,
+        vram_ceiling_source: ceiling.source.to_string(),
         probes,
     })
 }
@@ -3343,6 +3406,68 @@ mod tests {
             options,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn declared_scheduler_budget_outranks_the_live_vram_probe() {
+        let env = |key: &str| match key {
+            "HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES" => Some(16u64 << 30),
+            "HIPFIRE_SCHEDULER_VRAM_HEADROOM_BYTES" => Some(2u64 << 30),
+            _ => None,
+        };
+        // A live probe reporting 100 GiB free must not widen the ceiling past
+        // the declared budget: this is the whole point of the change, since the
+        // daemon's own reservation is invisible to `get_vram_info()`.
+        let ceiling = vram_ceiling(Some(100 << 30), env);
+        assert_eq!(ceiling.usable_bytes, Some(14 << 30));
+        assert_eq!(ceiling.reserved_headroom_bytes, 2 << 30);
+        assert_eq!(ceiling.source, "scheduler_budget");
+
+        // The budget also applies when no probe is available at all.
+        assert_eq!(vram_ceiling(None, env).usable_bytes, Some(14 << 30));
+    }
+
+    #[test]
+    fn without_a_budget_the_ceiling_keeps_the_historical_probe_heuristic() {
+        let none = |_: &str| None;
+        // 5% held back, floored at 1 GiB.
+        let ceiling = vram_ceiling(Some(100 << 30), none);
+        assert_eq!(ceiling.reserved_headroom_bytes, 5 << 30);
+        assert_eq!(ceiling.usable_bytes, Some(95 << 30));
+        assert_eq!(ceiling.source, "live_probe");
+
+        // Small card: the 1 GiB floor wins over 5%.
+        let small = vram_ceiling(Some(8 << 30), none);
+        assert_eq!(small.reserved_headroom_bytes, 1 << 30);
+        assert_eq!(small.usable_bytes, Some(7 << 30));
+
+        // No probe and no budget: no ceiling to apply, and say so.
+        let blind = vram_ceiling(None, none);
+        assert_eq!(blind.usable_bytes, None);
+        assert_eq!(blind.source, "unavailable");
+    }
+
+    #[test]
+    fn a_zero_budget_is_not_a_declaration() {
+        // Unset parses as 0 in the daemon's reader too; 0 must mean "fall back",
+        // never "no VRAM is usable".
+        let zero = |key: &str| match key {
+            "HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES" => Some(0u64),
+            _ => None,
+        };
+        let ceiling = vram_ceiling(Some(8 << 30), zero);
+        assert_eq!(ceiling.source, "live_probe");
+        assert_eq!(ceiling.usable_bytes, Some(7 << 30));
+    }
+
+    #[test]
+    fn a_budget_under_its_headroom_saturates_to_zero_rather_than_wrapping() {
+        let inverted = |key: &str| match key {
+            "HIPFIRE_SCHEDULER_VRAM_BUDGET_BYTES" => Some(1u64 << 30),
+            "HIPFIRE_SCHEDULER_VRAM_HEADROOM_BYTES" => Some(4u64 << 30),
+            _ => None,
+        };
+        assert_eq!(vram_ceiling(None, inverted).usable_bytes, Some(0));
     }
 
     #[test]
@@ -3981,6 +4106,7 @@ mod tests {
             selected: geometry,
             free_vram_bytes: None,
             reserved_headroom_bytes: 0,
+            vram_ceiling_source: "unavailable".into(),
             probes: Vec::new(),
         };
         let source_manifest = SourceManifestIdentity {
