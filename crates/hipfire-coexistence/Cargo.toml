@@ -17,6 +17,7 @@ hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-quantize = { path = "../hipfire-quantize" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-model = { path = "../hipfire-model" }
+hipfire-quant-format = { path = "../hipfire-quant-format" }
 hipfire-rdna = { path = "../hipfire-rdna" }
 hipfire-arch-gemma3 = { path = "../hipfire-arch-gemma3" }
 hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
@@ -38,3 +39,6 @@ libc.workspace = true
 # the lib test binary, so `from_safetensors` finds no spec for the source. Link
 # the aggregation crate directly for tests.
 hipfire-arch-specs = { path = "../hipfire-arch-specs" }
+# Encodes a Bf16Huff payload directly, so the export decode path is tested
+# without standing up the quantizer.
+hipfire-primitives = { path = "../hipfire-primitives" }
