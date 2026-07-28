@@ -54,6 +54,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Some("import"), Some("safetensors")) => {
             hipfire_coexistence::import_safetensors::run_cli(&args[2..])
         }
+        (Some("export"), Some("safetensors")) => {
+            hipfire_coexistence::export_safetensors::run_cli(&args[2..])
+        }
         #[cfg(target_os = "linux")]
         (Some("npu"), Some("pair-hfp")) => npu_pair_hfp(&args[2..]),
         _ => {
@@ -94,6 +97,9 @@ fn usage() {
          lora convert --in <adapter.lora.{{hfq,json}}> --out <adapter.lora.{{hfq,json}}>\n\
          import gguf  --in <model.gguf> --out <model.hfq> --format <FMT> \
          [--no-kmap] [--kmap-dense] [--kmap-mode full|alt|typed] [--arch-id N]\n\
+         import safetensors --input <hf_dir> --output <model.hfq> [--arch <family>]\n\
+         export safetensors --input <model.hfq> --output <hf_dir> \
+         [--arch <family>] [--shard-size 5G]\n\
          npu pair-hfp --in <whole-scaled.rdna2.hfp> --out <paired.rdna2.hfp>"
     );
 }
