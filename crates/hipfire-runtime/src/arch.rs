@@ -767,6 +767,35 @@ fn pick_next(
     ))
 }
 
+/// Pick the highest-scoring token that the grammar still allows.
+///
+/// Only called at constrained positions, where the legal set is a handful of tokens —
+/// so this is one logits download plus a vocab scan, not a per-step cost. Returns
+/// `None` when nothing is legal (the grammar has painted itself into a corner), leaving
+/// the sampled token alone rather than wedging the decode.
+fn constrained_pick(
+    gpu: &mut Gpu,
+    backend: &mut dyn SimpleAr,
+    vocab: &[String],
+    grammar: &dyn crate::tool_grammar::ToolGrammar,
+) -> Option<u32> {
+    let logits = gpu.download_f32(backend.logits()).ok()?;
+    let mut best: Option<(u32, f32)> = None;
+    for (id, text) in vocab.iter().enumerate() {
+        if id >= logits.len() {
+            break;
+        }
+        if !crate::tool_grammar::is_token_allowed(grammar, text) {
+            continue;
+        }
+        let score = logits[id];
+        if best.is_none_or(|(_, b)| score > b) {
+            best = Some((id as u32, score));
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
 fn emit_output_bytes(
     sink: &mut dyn std::io::Write,
     id: &str,
@@ -1016,6 +1045,63 @@ pub fn decode_loop_with_timing_terminators(
     prompt_tokens: usize,
     timing: DecodeLoopTiming,
 ) -> Result<ServeOutcome, String> {
+    decode_loop_inner(
+        gpu,
+        backend,
+        tok,
+        terminators,
+        ctx,
+        start_pos,
+        prompt_tokens,
+        timing,
+        None,
+    )
+}
+
+/// [`decode_loop_with_timing_terminators`] with grammar-guided decoding: `grammar`
+/// constrains sampling to tokens that keep the model on a legal tool-call path, so a
+/// malformed call is unreachable rather than merely unlikely.
+///
+/// Costs nothing while the grammar is free — which is most of a generation (prose, code,
+/// parameter bodies). Only structural positions (markers, tool and parameter names) pay
+/// for the vocab scan.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_loop_with_grammar(
+    gpu: &mut Gpu,
+    backend: &mut dyn SimpleAr,
+    tok: &crate::tokenizer::Tokenizer,
+    terminators: &[u32],
+    ctx: &mut GenerateCtx,
+    start_pos: usize,
+    prompt_tokens: usize,
+    timing: DecodeLoopTiming,
+    grammar: &mut dyn crate::tool_grammar::ToolGrammar,
+) -> Result<ServeOutcome, String> {
+    decode_loop_inner(
+        gpu,
+        backend,
+        tok,
+        terminators,
+        ctx,
+        start_pos,
+        prompt_tokens,
+        timing,
+        Some(grammar),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_loop_inner(
+    gpu: &mut Gpu,
+    backend: &mut dyn SimpleAr,
+    tok: &crate::tokenizer::Tokenizer,
+    terminators: &[u32],
+    ctx: &mut GenerateCtx,
+    start_pos: usize,
+    prompt_tokens: usize,
+    timing: DecodeLoopTiming,
+    mut grammar: Option<&mut dyn crate::tool_grammar::ToolGrammar>,
+) -> Result<ServeOutcome, String> {
     let vocab = backend.vocab_size();
     let window = if ctx.repeat_window == 0 {
         64
@@ -1087,6 +1173,14 @@ pub fn decode_loop_with_timing_terminators(
         // committed and fed to `decode_step`, so the KV cache stays consistent.
         if let Some(forced) = forced_tokens.pop_front() {
             next = forced;
+        } else if let Some(g) = grammar.as_deref() {
+            // Grammar-constrained position: the sampled token may be off-path, so pick
+            // the best legal one instead. Skipped entirely while the grammar is free.
+            if !g.is_free() {
+                if let Some(legal) = constrained_pick(gpu, backend, tok.vocab(), g) {
+                    next = legal;
+                }
+            }
         }
         // Stop on explicit EOS or any tokenizer-declared terminator. Feed the
         // decoded terminator only to the native state machine so a structural
@@ -1136,6 +1230,9 @@ pub fn decode_loop_with_timing_terminators(
         }
         generated += 1;
         committed.push(next);
+        if let Some(g) = grammar.as_deref_mut() {
+            g.advance(&frag);
+        }
         if think_budget.observe(&frag) {
             forced_tokens.extend(tok.encode(THINK_CLOSE_FORCED));
         }

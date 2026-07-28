@@ -1630,6 +1630,53 @@ pub fn generate_zaya(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Build a tool grammar for a model, chosen by the syntax its own chat template
+/// documents — the template is the authoritative statement of what the model was
+/// trained to emit, so nothing here has to hardcode a model-name heuristic.
+///
+/// `None` when no tools were declared (nothing to constrain) or the template teaches a
+/// dialect we have no grammar for yet — in which case decoding is unconstrained, exactly
+/// as before.
+fn tool_grammar_for(
+    chat_template: Option<&str>,
+    tools: Option<&[serde_json::Value]>,
+) -> Option<hipfire_runtime::tool_grammar::MiniCpmXmlGrammar> {
+    let tools = tools.filter(|t| !t.is_empty())?;
+    // MiniCPM5's template spells the call shape out verbatim in its tool guidelines.
+    if !chat_template?.contains("<function name=\"function-name\">") {
+        return None;
+    }
+    let schemas: Vec<hipfire_runtime::tool_grammar::ToolSchema> = tools
+        .iter()
+        .filter_map(|t| {
+            let func = t.get("function").unwrap_or(t);
+            let name = func.get("name")?.as_str()?.to_string();
+            let params = func.get("parameters");
+            let props = params
+                .and_then(|p| p.get("properties"))
+                .and_then(|p| p.as_object());
+            let required: Vec<String> = params
+                .and_then(|p| p.get("required"))
+                .and_then(|r| r.as_array())
+                .map(|r| {
+                    r.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(hipfire_runtime::tool_grammar::ToolSchema {
+                name,
+                params: props
+                    .map(|p| p.keys().cloned().collect())
+                    .unwrap_or_default(),
+                required,
+            })
+        })
+        .filter(|s: &hipfire_runtime::tool_grammar::ToolSchema| !s.name.is_empty())
+        .collect();
+    (!schemas.is_empty()).then(|| hipfire_runtime::tool_grammar::MiniCpmXmlGrammar::new(schemas))
+}
+
 pub fn generate_llama(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
@@ -1934,18 +1981,27 @@ pub fn generate_llama(
         images: &no_images,
         sink: stdout,
     };
-    let result = decode_loop_with_timing(
-        gpu,
-        backend,
-        tok,
-        eos,
-        &mut ctx,
-        n,
-        n,
-        DecodeLoopTiming {
-            prefill_ms: Some(prefill_ms),
-        },
-    );
+    // Grammar-guided decoding when the model's template teaches a dialect we can
+    // constrain: a malformed tool call becomes unreachable, not just unlikely. Free
+    // positions cost nothing, so an ordinary generation is unaffected.
+    let mut grammar = tool_grammar_for(m.chat_template.as_deref(), tools);
+    let timing = DecodeLoopTiming {
+        prefill_ms: Some(prefill_ms),
+    };
+    let result = match grammar.as_mut() {
+        Some(g) => hipfire_runtime::arch::decode_loop_with_grammar(
+            gpu,
+            backend,
+            tok,
+            &[eos],
+            &mut ctx,
+            n,
+            n,
+            timing,
+            g,
+        ),
+        None => decode_loop_with_timing(gpu, backend, tok, eos, &mut ctx, n, n, timing),
+    };
     drop(ctx);
     match result {
         Ok(outcome) => {
@@ -3320,5 +3376,61 @@ pub fn generate_gemma3_vl_text(
     drop(ctx);
     if let Err(e) = result {
         emit_error_with_id(stdout, id, format!("gemma3-vl serve: {e}"));
+    }
+}
+
+#[cfg(test)]
+mod tool_grammar_selection_tests {
+    use super::tool_grammar_for;
+    use serde_json::json;
+
+    /// The literal line MiniCPM5's template emits in its tool guidelines.
+    const MINICPM_TEMPLATE: &str =
+        "…When calling a function, return an XML object within <function ... </function> \
+         using:\n<function name=\"function-name\"><param name=\"param-name\">param-value</param>\
+         </function>…";
+    const QWEN_TEMPLATE: &str = "…<tool_call>\n<function=example>\n<parameter=x>…";
+
+    fn tools() -> Vec<serde_json::Value> {
+        vec![json!({"type":"function","function":{
+            "name":"read_file",
+            "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+        }})]
+    }
+
+    #[test]
+    fn a_grammar_is_built_only_for_a_dialect_we_can_constrain() {
+        assert!(
+            tool_grammar_for(Some(MINICPM_TEMPLATE), Some(&tools())).is_some(),
+            "MiniCPM's template documents the shape we have a grammar for"
+        );
+        assert!(
+            tool_grammar_for(Some(QWEN_TEMPLATE), Some(&tools())).is_none(),
+            "a dialect with no grammar yet must decode unconstrained, not wrongly"
+        );
+        assert!(tool_grammar_for(None, Some(&tools())).is_none());
+    }
+
+    #[test]
+    fn no_tools_means_nothing_to_constrain() {
+        assert!(tool_grammar_for(Some(MINICPM_TEMPLATE), None).is_none());
+        assert!(tool_grammar_for(Some(MINICPM_TEMPLATE), Some(&[])).is_none());
+    }
+
+    // Names and required params drive the constraint, so they must survive the
+    // OpenAI-shaped tools array in both its nested and flat forms.
+    #[test]
+    fn schemas_are_read_from_either_tool_shape() {
+        let flat = vec![json!({
+            "type":"function","name":"write_file",
+            "parameters":{"type":"object",
+                "properties":{"path":{"type":"string"},"contents":{"type":"string"}},
+                "required":["path","contents"]}
+        })];
+        let g = tool_grammar_for(Some(MINICPM_TEMPLATE), Some(&flat));
+        assert!(
+            g.is_some(),
+            "the flat Responses-API shape is understood too"
+        );
     }
 }
