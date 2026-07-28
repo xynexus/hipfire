@@ -314,9 +314,7 @@ impl QuantType {
             //  - Paro / TidI32: engine-tiled, arch-specific
             //  - CoarseQ4Row: planar (nibble plane + f16 row-scale plane)
             Q8HFQ | HFP4G32 | MFP4G32 | OqPlusG256 | OqPlusCompact | Oq4MixedPlain
-            | Oq4G256ArchPacked | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 | CoarseQ4Row => {
-                None
-            }
+            | Oq4G256ArchPacked | Qtip2G256 | PARO4G128 | PARO4G128T | TidI32 | CoarseQ4Row => None,
         }
     }
 

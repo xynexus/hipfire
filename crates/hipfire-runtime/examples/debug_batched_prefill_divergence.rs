@@ -30,11 +30,11 @@
 //!            --example debug_batched_prefill_divergence [model.hfq]
 
 use hipfire_arch_llama::Llama;
+use hipfire_rdna::Gpu;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
 use hipfire_runtime::llama::{self, ForwardScratch, LlamaConfig, LlamaWeights};
-use hipfire_rdna::Gpu;
 use std::path::Path;
 
 /// The fixed probe sequence. Eight ids ≥ MIN_BATCH(4) so path C takes the
@@ -72,7 +72,9 @@ fn run_pertoken(
         llama::forward_scratch_compute(gpu, weights, config, pos, &mut kv, scratch)
             .expect("forward_scratch_compute failed");
     }
-    let logits = gpu.download_f32(&scratch.logits).expect("download logits (A)");
+    let logits = gpu
+        .download_f32(&scratch.logits)
+        .expect("download logits (A)");
     kv.free_gpu(gpu);
     logits
 }
@@ -102,11 +104,11 @@ fn run_flash(
     tokens: &[u32],
 ) -> Vec<f32> {
     let mut kv = fresh_q8_kv(gpu, config);
-    llama::forward_prefill_batch(
-        gpu, weights, config, tokens, 0, &mut kv, scratch, None,
-    )
-    .expect("forward_prefill_batch failed");
-    let logits = gpu.download_f32(&scratch.logits).expect("download logits (C)");
+    llama::forward_prefill_batch(gpu, weights, config, tokens, 0, &mut kv, scratch, None)
+        .expect("forward_prefill_batch failed");
+    let logits = gpu
+        .download_f32(&scratch.logits)
+        .expect("download logits (C)");
     kv.free_gpu(gpu);
     logits
 }
@@ -216,7 +218,11 @@ fn main() {
     println!("B prefill_forward argmax  = {}", argmax(&b));
     println!("C flash argmax            = {}", argmax(&c));
     println!();
-    report("B (prefill_forward / attention_causal_batched) vs A (per-token)", &a, &b);
+    report(
+        "B (prefill_forward / attention_causal_batched) vs A (per-token)",
+        &a,
+        &b,
+    );
     println!();
     report("C (forward_prefill_batch / FLASH) vs A (per-token)", &a, &c);
 

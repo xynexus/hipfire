@@ -66,8 +66,7 @@ fn lmhead_project(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor)
         if w.gpu_dtype == DType::BF16 {
             let (vocab, hidden) = (w.m, w.k);
             let ptr = w.buf.buf.as_ptr() as usize;
-            let stale =
-                LMHEAD_COARSE.with(|c| c.borrow().as_ref().map(|(p, ..)| *p) != Some(ptr));
+            let stale = LMHEAD_COARSE.with(|c| c.borrow().as_ref().map(|(p, ..)| *p) != Some(ptr));
             if stale {
                 let coarse = build_lmhead_coarse_bf16(gpu, &w.buf, vocab, hidden, bits)
                     .map_err(|e| hip_bridge::HipError::new(0, &e))?;

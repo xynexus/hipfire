@@ -34,7 +34,9 @@ fn argmax(v: &[f32]) -> (usize, f32) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).expect("usage: verify_lmhead_twostage_real <model.hfq> [topk] [n]");
+    let path = args
+        .get(1)
+        .expect("usage: verify_lmhead_twostage_real <model.hfq> [topk] [n]");
     let topk: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(32);
     let nprobe: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(256);
 
@@ -53,15 +55,20 @@ fn main() {
     );
     let vocab = info.shape[0] as usize;
     let hidden = info.shape[1] as usize;
-    println!("lm_head [{vocab} x {hidden}] bf16, {} MB", bytes.len() / 1_000_000);
+    println!(
+        "lm_head [{vocab} x {hidden}] bf16, {} MB",
+        bytes.len() / 1_000_000
+    );
     assert_eq!(bytes.len(), vocab * hidden * 2, "bf16 byte count mismatch");
 
     // Upload the raw bf16 weight as a BF16 GpuTensor.
-    let mut lmhead = gpu.upload_raw(bytes, &[bytes.len()]).expect("upload lm_head");
+    let mut lmhead = gpu
+        .upload_raw(bytes, &[bytes.len()])
+        .expect("upload lm_head");
     lmhead.dtype = DType::BF16;
 
-    let coarse = build_lmhead_coarse_bf16(&mut gpu, &lmhead, vocab, hidden, 4)
-        .expect("build coarse tier");
+    let coarse =
+        build_lmhead_coarse_bf16(&mut gpu, &lmhead, vocab, hidden, 4).expect("build coarse tier");
     println!("coarse tier built (Q4 row-norm), topk={topk}, probes={nprobe}");
 
     // Deterministic splitmix64 -> f32 in [-1, 1].
@@ -98,7 +105,14 @@ fn main() {
         let (a_full, v_full) = argmax(&gpu.download_f32(&logits_full).expect("dl full"));
 
         lmhead_twostage_serve_bf16(
-            &mut gpu, &lmhead, &coarse, &hgpu, &logits_two, vocab, hidden, topk,
+            &mut gpu,
+            &lmhead,
+            &coarse,
+            &hgpu,
+            &logits_two,
+            vocab,
+            hidden,
+            topk,
         )
         .expect("two-stage");
         let two = gpu.download_f32(&logits_two).expect("dl two");

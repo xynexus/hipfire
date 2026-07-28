@@ -101,7 +101,10 @@ fn main() {
     // Build the coarse tier once.
     let coarse = build_lmhead_coarse_bf16(&mut gpu, &lmhead_bf16, vocab, hidden, bits)
         .expect("build coarse tier");
-    println!("built coarse tier: kdim={} bits={}", coarse.kdim, coarse.bits);
+    println!(
+        "built coarse tier: kdim={} bits={}",
+        coarse.kdim, coarse.bits
+    );
 
     let logits_full = gpu.zeros(&[vocab], DType::F32).expect("alloc logits_full");
     let logits_two = gpu.zeros(&[vocab], DType::F32).expect("alloc logits_two");
