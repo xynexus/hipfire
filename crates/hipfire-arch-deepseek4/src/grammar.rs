@@ -52,6 +52,11 @@
 
 // ── Public types ────────────────────────────────────────────────────────
 
+/// The generic constrained-decoding engine lives in `hipfire-runtime::tool_grammar`;
+/// only the DSML state machine below is DeepSeek-specific. `ToolSchema` is re-exported
+/// so existing `deepseek4::grammar::ToolSchema` call sites keep resolving.
+pub use hipfire_runtime::tool_grammar::ToolSchema;
+
 /// Position in the DSML grammar. Carries a byte-level partial-match
 /// buffer that holds the bytes committed since the last firm state
 /// transition. See module doc for transitions.
@@ -103,26 +108,6 @@ pub enum State {
         param_idx: usize,
         emitted_params: Vec<usize>,
     },
-}
-
-/// Schema for the available tools. Built from the OpenAI-format tools
-/// array at request time. The grammar uses this to constrain tool names
-/// and parameter names at their respective positions.
-#[derive(Debug, Clone)]
-pub struct ToolSchema {
-    pub name: String,
-    /// Parameter names in the order they appear in the schema. Order
-    /// isn't enforced at parse time — params can be emitted in any order
-    /// — but the schema is the authoritative set of legal names.
-    pub params: Vec<String>,
-    /// Subset of `params` that MUST appear in the emitted invoke
-    /// block. The grammar removes invoke-close alternatives from the
-    /// allowed continuations until every required param has been
-    /// observed — without this the V4F MQ2-Lloyd checkpoint emits
-    /// empty invokes like `<｜DSML｜tool name="bash"></｜DSML｜tool>`
-    /// that the downstream OpenAI client rejects with
-    /// `must have required properties command`.
-    pub required: Vec<String>,
 }
 
 /// The grammar matcher itself: a state plus the bytes committed since
@@ -1198,5 +1183,34 @@ mod tests {
                 emitted_params: vec![0]
             }
         );
+    }
+}
+
+/// DSML as one dialect of the shared constrained-decoding engine.
+///
+/// The inherent methods above stay as they are — call sites (`spec_decode`,
+/// `generate_arch`) keep working unchanged — but implementing the trait lets the
+/// generic masking in `hipfire-runtime::tool_grammar` drive this matcher, and makes
+/// DSML the reference implementation for the dialects that follow (MiniCPM5's
+/// `<function name=…>`, Qwen3.5 / zaya1's `<function=…>`).
+impl hipfire_runtime::tool_grammar::ToolGrammar for Matcher {
+    fn is_free(&self) -> bool {
+        Matcher::is_free(self)
+    }
+
+    fn partial(&self) -> &str {
+        Matcher::partial(self)
+    }
+
+    fn allowed_continuations(&self) -> Vec<String> {
+        Matcher::allowed_continuations(self)
+    }
+
+    fn advance(&mut self, text: &str) {
+        Matcher::advance(self, text)
+    }
+
+    fn allows_leading_ws(&self) -> bool {
+        self.state_allows_leading_ws()
     }
 }
