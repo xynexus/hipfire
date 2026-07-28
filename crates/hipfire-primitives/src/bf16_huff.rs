@@ -32,10 +32,14 @@
 //!
 //! ```text
 //! [16 B] header    — u32 n_elems, u32 n_chunks, u32 bitstream_bytes,
-//!                    u8 n_symbols, u8 max_code_len, u16 reserved
+//!                    u8 n_symbols, u8 max_code_len, u8 n_direct, u8 version
 //! [16 B] symbols   — exponent value per symbol; the last is ESCAPE when present
 //! [16 B] lengths   — Huffman code length per symbol (canonical code rebuild)
-//! [     ] chunks   — u32 × n_chunks: BIT offset of each chunk in the bitstream
+//! [     ] chunks   — BIT offset of each chunk in the bitstream: u32 × n_chunks
+//!                    when version is 0, u64 × n_chunks when it is 1. The width
+//!                    is chosen from the exact bit total, so it is 32-bit for
+//!                    everything under 2^32 bits and only widens where a 32-bit
+//!                    offset would wrap. See [`VERSION_OFF`].
 //! [  n B] mant     — sign << 7 | mantissa[6:0], directly indexed by element
 //! [     ] bits     — Huffman codes, MSB-first; an escape is followed by 8 raw
 //!                    bits holding the literal exponent
@@ -74,10 +78,42 @@ const SYMTAB: usize = HEADER;
 const LENTAB: usize = SYMTAB + MAX_SYMBOLS;
 const CHUNKTAB: usize = LENTAB + MAX_SYMBOLS;
 
+/// Header byte holding the chunk-offset width version.
+///
+/// v0 stored chunk bit offsets as `u32`, which silently wraps once a tensor's
+/// exponent bitstream passes 2^32 bits — about 1.65 G elements at the measured
+/// ~2.61 bits/exponent, i.e. a ~3.3 GB BF16 tensor. Past the wrap every chunk
+/// decodes from the wrong bit position, so the mantissa plane (directly
+/// indexed) stays correct while the exponents come out plausible-but-wrong.
+/// That failure is invisible to a magnitude check: the values look like
+/// weights, just the wrong ones.
+///
+/// v1 widens the offsets to `u64`. The byte was zero-filled and unread in v0,
+/// so a v0 artifact keeps decoding through the v0 arm below — which matters,
+/// because artifacts written before this fix may outlive their sources.
+const VERSION_OFF: usize = 15;
+const V0: u8 = 0;
+const V1: u8 = 1;
+
+/// Chunk-offset width in bytes for a format version.
+#[inline]
+const fn off_width(version: u8) -> usize {
+    if version == V0 {
+        4
+    } else {
+        8
+    }
+}
+
+/// Largest element count the `u32` `n_elems` header field can describe. A
+/// tensor above this cannot be encoded at all (see [`encode_if_smaller`]),
+/// rather than being written with a truncated count.
+pub const MAX_ELEMS: usize = u32::MAX as usize;
+
 /// Byte offset of the chunk table's end / mantissa plane start.
 #[inline]
-const fn mant_off(n_chunks: usize) -> usize {
-    CHUNKTAB + 4 * n_chunks
+const fn mant_off_v(n_chunks: usize, version: u8) -> usize {
+    CHUNKTAB + off_width(version) * n_chunks
 }
 
 // ── bit I/O, MSB-first ──────────────────────────────────────────────────────
@@ -199,6 +235,18 @@ fn canonical_codes(lengths: &[u8]) -> Vec<u32> {
 
 /// Compress raw little-endian BF16 bytes. A trailing odd byte is ignored.
 pub fn encode(bf16_le: &[u8]) -> Vec<u8> {
+    encode_impl(bf16_le, None)
+}
+
+/// [`encode`] with the chunk-offset width pinned, so the 64-bit arm can be
+/// covered without building a multi-gigabyte tensor. Production always lets the
+/// width be derived from the real bit total.
+#[cfg(test)]
+fn encode_forced(bf16_le: &[u8], version: u8) -> Vec<u8> {
+    encode_impl(bf16_le, Some(version))
+}
+
+fn encode_impl(bf16_le: &[u8], force_version: Option<u8>) -> Vec<u8> {
     let n = bf16_le.len() / 2;
     let at = |i: usize| u16::from_le_bytes([bf16_le[2 * i], bf16_le[2 * i + 1]]);
 
@@ -232,7 +280,7 @@ pub fn encode(bf16_le: &[u8]) -> Vec<u8> {
     let n_chunks = n.div_ceil(CHUNK);
     if counts.is_empty() {
         // Empty tensor: header + empty tables only.
-        let mut out = vec![0u8; mant_off(0)];
+        let mut out = vec![0u8; mant_off_v(0, V0)];
         out[..4].copy_from_slice(&0u32.to_le_bytes());
         return out;
     }
@@ -241,7 +289,19 @@ pub fn encode(bf16_le: &[u8]) -> Vec<u8> {
     let codes = canonical_codes(&lengths);
     let max_len = lengths.iter().copied().max().unwrap_or(1);
 
-    let mut out = vec![0u8; mant_off(n_chunks) + n];
+    // Exact bitstream length, known before a single bit is written: every
+    // symbol costs its code length, and an escape costs 8 more for the literal
+    // exponent. That is what lets the offset width be chosen up front instead
+    // of discovered after the chunk table has already been sized.
+    let total_bits: u64 = counts
+        .iter()
+        .zip(lengths.iter())
+        .map(|(&c, &l)| c * l as u64)
+        .sum::<u64>()
+        + 8 * escape_count;
+    let version = force_version.unwrap_or(if total_bits > u32::MAX as u64 { V1 } else { V0 });
+
+    let mut out = vec![0u8; mant_off_v(n_chunks, version) + n];
     for (s, &e) in direct.iter().enumerate() {
         out[SYMTAB + s] = e;
     }
@@ -250,16 +310,21 @@ pub fn encode(bf16_le: &[u8]) -> Vec<u8> {
     }
 
     // Mantissa plane: sign bit plus the low 7 bits, one byte per element.
-    let mant = mant_off(n_chunks);
+    let mant = mant_off_v(n_chunks, version);
     for i in 0..n {
         let bits = at(i);
         out[mant + i] = (((bits >> 15) as u8) << 7) | (bits as u8 & 0x7f);
     }
 
+    let w = off_width(version);
     let mut bw = BitWriter::new();
     for c in 0..n_chunks {
-        let off = (bw.bit_pos() as u32).to_le_bytes();
-        out[CHUNKTAB + 4 * c..CHUNKTAB + 4 * c + 4].copy_from_slice(&off);
+        let pos = bw.bit_pos() as u64;
+        debug_assert!(
+            version == V1 || pos <= u32::MAX as u64,
+            "v0 chunk offset {pos} exceeds u32; total_bits estimate was wrong"
+        );
+        out[CHUNKTAB + w * c..CHUNKTAB + w * c + w].copy_from_slice(&pos.to_le_bytes()[..w]);
         let start = c * CHUNK;
         for i in start..(start + CHUNK).min(n) {
             let e = (at(i) >> 7) as u8;
@@ -284,14 +349,35 @@ pub fn encode(bf16_le: &[u8]) -> Vec<u8> {
     // explicitly beats inferring it — with fewer than 15 distinct exponents and
     // nothing escaping, the last symbol IS a real exponent.
     out[14] = direct.len() as u8;
+    out[VERSION_OFF] = version;
     out.extend_from_slice(&stream);
     out
 }
 
 /// [`encode`], but `None` when the packed form is not smaller than the plain
 /// BF16 input — the caller should then store plain BF16 (`QuantType::BF16`).
+///
+/// Also `None` when the tensor cannot be described by the header's 32-bit
+/// `n_elems` / `bitstream_bytes` fields. Declining is the point: a truncated
+/// count would produce an artifact that decodes to silent garbage, and storing
+/// plain BF16 costs only the compression, not the data. The chunk-offset limit
+/// that used to sit alongside these is gone — that one is now widened to 64-bit
+/// rather than refused (see [`VERSION_OFF`]).
 pub fn encode_if_smaller(bf16_le: &[u8]) -> Option<Vec<u8>> {
+    if bf16_le.len() / 2 > MAX_ELEMS {
+        return None;
+    }
     let packed = encode(bf16_le);
+    // The recorded stream length must survive the u32 field; otherwise the
+    // truncation check in `View::new` compares against a wrapped value.
+    let n_chunks = (bf16_le.len() / 2).div_ceil(CHUNK);
+    let version = packed.get(VERSION_OFF).copied().unwrap_or(V0);
+    let stream_len = packed
+        .len()
+        .saturating_sub(mant_off_v(n_chunks, version) + bf16_le.len() / 2);
+    if stream_len > u32::MAX as usize {
+        return None;
+    }
     (packed.len() < bf16_le.len()).then_some(packed)
 }
 
@@ -447,6 +533,8 @@ struct View<'a> {
     mant: &'a [u8],
     bits: &'a [u8],
     offsets: &'a [u8],
+    /// Bytes per chunk-table entry: 4 for a v0 artifact, 8 for v1.
+    off_width: usize,
     n: usize,
     n_chunks: usize,
 }
@@ -460,7 +548,12 @@ impl<'a> View<'a> {
         if nc != n.div_ceil(CHUNK) {
             return None;
         }
-        let mant_base = mant_off(nc);
+        let version = *packed.get(VERSION_OFF)?;
+        if version != V0 && version != V1 {
+            return None;
+        }
+        let w = off_width(version);
+        let mant_base = mant_off_v(nc, version);
         let mant = packed.get(mant_base..mant_base + n)?;
         let bits = packed.get(mant_base + n..)?;
         // `peek` zero-pads past the end, so a short bitstream would otherwise
@@ -474,7 +567,8 @@ impl<'a> View<'a> {
             dec: Decoder::new(packed)?,
             mant,
             bits,
-            offsets: packed.get(CHUNKTAB..CHUNKTAB + 4 * nc)?,
+            offsets: packed.get(CHUNKTAB..CHUNKTAB + w * nc)?,
+            off_width: w,
             n,
             n_chunks: nc,
         })
@@ -489,8 +583,11 @@ impl<'a> View<'a> {
         if out.len() != 2 * (end - start) {
             return None;
         }
-        let mut pos =
-            u32::from_le_bytes(self.offsets.get(4 * c..4 * c + 4)?.try_into().ok()?) as usize;
+        let w = self.off_width;
+        let raw = self.offsets.get(w * c..w * c + w)?;
+        let mut buf = [0u8; 8];
+        buf[..w].copy_from_slice(raw);
+        let mut pos = u64::from_le_bytes(buf) as usize;
         let esc = self.dec.escape_sym;
         let mut i = start;
         while i < end {
@@ -662,7 +759,10 @@ mod tests {
         let nc = n_chunks(&packed).unwrap();
         assert_eq!(nc, 30_000usize.div_ceil(CHUNK));
         let dec = Decoder::new(&packed).unwrap();
-        let mant_base = mant_off(nc);
+        // This fixture is small, so it is a v0 artifact with a 32-bit table —
+        // which is exactly what the offsets are read as just below.
+        assert_eq!(packed[VERSION_OFF], V0);
+        let mant_base = mant_off_v(nc, V0);
         let stream = &packed[mant_base + 30_000..];
         // Decoding CHUNK symbols from chunk c must land exactly on chunk c+1.
         for c in 0..nc - 1 {
@@ -727,5 +827,125 @@ mod tests {
         let packed = roundtrips(&bits);
         assert!(decode(&packed, 601).is_none());
         assert!(decode(&packed, 100).is_none());
+    }
+}
+
+#[cfg(test)]
+mod overflow_regression {
+    use super::*;
+
+    /// Weight-shaped BF16: exponents in a narrow band, mantissas varied.
+    fn weights(n: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed | 1;
+        let mut v = Vec::with_capacity(n * 2);
+        for _ in 0..n {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let exp = 0x3Cu16 + ((s >> 3) & 0x7) as u16; // few distinct exponents
+            let bits = (exp << 8) | ((s >> 11) & 0xFF) as u16;
+            v.extend_from_slice(&bits.to_le_bytes());
+        }
+        v
+    }
+
+    /// Exponent-diverse BF16, so nearly every element escapes and the stream
+    /// costs ~12 bits/element instead of ~2.6. That is what makes crossing the
+    /// 2^32-bit boundary affordable to test at all.
+    fn escape_heavy(n: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed | 1;
+        let mut v = Vec::with_capacity(n * 2);
+        for _ in 0..n {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            v.extend_from_slice(&(s as u16).to_le_bytes()); // exponent spans all 256
+        }
+        v
+    }
+
+    /// A small tensor must still be written as v0, byte-for-byte as before this
+    /// fix. Artifacts already on disk may outlive their sources, so the v0 arm
+    /// is not free to drift.
+    #[test]
+    fn small_tensors_stay_v0_and_round_trip() {
+        let raw = weights(100_000, 0xABCD);
+        let packed = encode(&raw);
+        assert_eq!(packed[VERSION_OFF], V0, "small tensor must stay v0");
+        assert_eq!(decode(&packed, raw.len() / 2).unwrap(), raw);
+    }
+
+    /// The 64-bit-offset arm, exercised without a multi-GB allocation: same
+    /// data, width pinned to v1, must decode identically and lay its chunk
+    /// table out 8 bytes per entry.
+    #[test]
+    fn v1_offsets_round_trip_and_widen_the_chunk_table() {
+        let raw = weights(100_000, 0x1234);
+        let n = raw.len() / 2;
+        let v0 = encode_forced(&raw, V0);
+        let v1 = encode_forced(&raw, V1);
+
+        assert_eq!(v0[VERSION_OFF], V0);
+        assert_eq!(v1[VERSION_OFF], V1);
+
+        // Same payload, wider table: exactly 4 extra bytes per chunk.
+        let nc = n.div_ceil(CHUNK);
+        assert_eq!(v1.len() - v0.len(), 4 * nc);
+
+        assert_eq!(decode(&v1, n).unwrap(), raw, "v1 must decode exactly");
+        assert_eq!(decode(&v0, n).unwrap(), raw, "v0 must still decode exactly");
+        // Parallel decode walks the chunk table directly, so cover it too.
+        assert_eq!(decode_par(&v1, n, 4).unwrap(), raw);
+    }
+
+    /// A corrupt/unknown version must be refused rather than decoded with a
+    /// guessed offset width.
+    #[test]
+    fn unknown_version_is_refused() {
+        let raw = weights(20_000, 7);
+        let mut packed = encode(&raw);
+        packed[VERSION_OFF] = 99;
+        assert!(decode(&packed, raw.len() / 2).is_none());
+    }
+
+    /// The actual bug: a bitstream past 2^32 bits.
+    ///
+    /// v0 truncated each chunk's bit offset to `u32`, so every chunk after the
+    /// wrap decoded from the wrong position — correct mantissas, wrong
+    /// exponents, no error reported. Measured on gemma-4-E2B's 4.7 GB
+    /// `embed_tokens_per_layer`: byte-identical for the first 70%, then 1.41 GB
+    /// in which 100% of differing elements kept their sign and mantissa and
+    /// differed only in exponent.
+    ///
+    /// Ignored by default: escape-heavy data costs ~8.5 bits/element, so it
+    /// still takes 600 M elements to pass 2^32 bits, peaking near 3.6 GB of RAM.
+    /// Build in release — a debug encode of this size is minutes, not seconds.
+    #[test]
+    #[ignore = "allocates ~3.6 GB; run with --release --ignored"]
+    fn bitstream_past_2_32_bits_round_trips() {
+        const N: usize = 600_000_000;
+        let raw = escape_heavy(N, 0xFEED);
+        let packed = encode(&raw);
+
+        assert_eq!(
+            packed[VERSION_OFF], V1,
+            "a stream past 2^32 bits must select the 64-bit offset format"
+        );
+
+        // The last chunk must genuinely start beyond what a u32 could hold,
+        // otherwise this test would pass without reaching the old bug.
+        let nc = n_chunks(&packed).unwrap();
+        let last = {
+            let base = CHUNKTAB + 8 * (nc - 1);
+            u64::from_le_bytes(packed[base..base + 8].try_into().unwrap())
+        };
+        assert!(
+            last > u32::MAX as u64,
+            "final chunk offset {last} did not exceed u32::MAX; test data too small"
+        );
+
+        let out = decode(&packed, N).unwrap();
+        assert_eq!(out.len(), raw.len());
+        assert!(out == raw, "round trip past the 2^32-bit boundary must be exact");
     }
 }
