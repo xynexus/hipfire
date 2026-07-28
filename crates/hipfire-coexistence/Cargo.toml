@@ -31,3 +31,10 @@ serde_json = "1"
 [target.'cfg(target_os = "linux")'.dependencies]
 hipfire-xdna = { path = "../hipfire-xdna" }
 libc.workspace = true
+
+[dev-dependencies]
+# The arch-spec registry reaches the real binary transitively through
+# hipfire-quantize, but rlib pruning drops the `register_arch!` registrations in
+# the lib test binary, so `from_safetensors` finds no spec for the source. Link
+# the aggregation crate directly for tests.
+hipfire-arch-specs = { path = "../hipfire-arch-specs" }
