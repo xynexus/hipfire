@@ -849,6 +849,103 @@ fn decode_next(tok: &crate::tokenizer::Tokenizer, token: u32, terminators: &[u32
 /// temperature + top-p + repeat/presence/frequency penalties from `ctx`. At
 /// `ctx.temperature == 0` this is greedy argmax; `> 0` samples — so every seam
 /// arch (qwen2, gemma3, …) gets full sampling without a bespoke loop (P3.3).
+/// Marker a reasoning model emits to end its think block. Plain text in every
+/// family we serve (MiniCPM5, Qwen3.5, zaya1 all use `<think>` / `</think>`).
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+/// What we inject to force closure. The leading newline keeps the marker off the
+/// end of a half-written word; the trailing blank line matches the framing the
+/// chat templates use between reasoning and answer.
+const THINK_CLOSE_FORCED: &str = "\n</think>\n\n";
+
+/// Whether a framed prompt leaves the model *inside* a think block — i.e. the last
+/// `<think>` is not followed by a `</think>`. Templates open the block in the
+/// generation prompt (`enable_thinking=true`), so this is how the decode loop knows
+/// it starts mid-thought.
+fn prompt_opens_think(prompt: &str) -> bool {
+    match prompt.rfind(THINK_OPEN) {
+        Some(open) => !prompt[open..].contains(THINK_CLOSE),
+        None => false,
+    }
+}
+
+/// Enforces the thinking-token budget by *forcing* `</think>` once it is spent.
+///
+/// Without this, a long think simply runs into `max_tokens` and the request returns
+/// no answer at all — the reasoning is truncated mid-sentence. Forcing the closing
+/// marker instead makes the model transition to answering with the reasoning it has,
+/// which is how a think budget is normally implemented.
+///
+/// ponytail: text-level detection over decoded fragments rather than a token-id
+/// matcher — `</think>` is plain text in every family we serve, and this stays
+/// correct across their differing tokenizations. Swap to a token matcher if a family
+/// ever emits the marker as a single special token.
+#[derive(Debug)]
+struct ThinkBudget {
+    budget: usize,
+    open: bool,
+    tokens: usize,
+    scan: String,
+    fired: bool,
+}
+
+impl ThinkBudget {
+    /// `budget <= 1` disables enforcement: 0 means none was requested, and 1 is the
+    /// serving layer's "thinking disabled" sentinel (see `reasoning_effort_budget`).
+    ///
+    /// An empty `prompt` means the caller already consumed the framed tokens during
+    /// prefill (the serving path does this) — there the budget itself is the signal,
+    /// since a budget > 1 is only set when the template was rendered with thinking
+    /// enabled. A non-empty prompt is inspected directly.
+    fn new(budget: usize, prompt: &str) -> Self {
+        Self {
+            budget,
+            open: budget > 1 && (prompt.is_empty() || prompt_opens_think(prompt)),
+            tokens: 0,
+            scan: String::new(),
+            fired: false,
+        }
+    }
+
+    /// Observe one decoded token's text. Returns true exactly once — on the step where
+    /// the budget is spent and the caller must inject [`THINK_CLOSE_FORCED`].
+    fn observe(&mut self, frag: &str) -> bool {
+        if self.budget <= 1 || self.fired {
+            return false;
+        }
+        self.scan.push_str(frag);
+        // The model closed on its own: nothing to force, ever.
+        if self.scan.contains(THINK_CLOSE) {
+            self.fired = true;
+            self.open = false;
+            return false;
+        }
+        if !self.open && self.scan.contains(THINK_OPEN) {
+            self.open = true;
+            self.tokens = 0;
+        }
+        // Keep the scan window bounded but long enough to span a marker split across
+        // several tokens, trimming only on a char boundary.
+        if self.scan.len() > 64 {
+            let want = self.scan.len() - 16;
+            let start = (want..=self.scan.len())
+                .find(|&i| self.scan.is_char_boundary(i))
+                .unwrap_or(self.scan.len());
+            self.scan.drain(..start);
+        }
+        if !self.open {
+            return false;
+        }
+        self.tokens += 1;
+        if self.tokens >= self.budget {
+            self.fired = true;
+            self.open = false;
+            return true;
+        }
+        false
+    }
+}
+
 pub fn decode_loop(
     gpu: &mut Gpu,
     backend: &mut dyn SimpleAr,
@@ -980,8 +1077,17 @@ pub fn decode_loop_with_timing_terminators(
     let mut native_output = matches!(ctx.output_protocol, OutputProtocol::Gemma4Native)
         .then(Gemma4OutputState::default);
     let mut emitted_tool_calls = false;
+    // Thinking-token budget: when spent, `</think>` is injected here rather than
+    // letting `max_tokens` truncate mid-thought and return no answer.
+    let mut think_budget = ThinkBudget::new(ctx.max_think_tokens, ctx.prompt);
+    let mut forced_tokens: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
 
     while generated < ctx.max_tokens {
+        // A forced token replaces this step's sample; it still gets emitted,
+        // committed and fed to `decode_step`, so the KV cache stays consistent.
+        if let Some(forced) = forced_tokens.pop_front() {
+            next = forced;
+        }
         // Stop on explicit EOS or any tokenizer-declared terminator. Feed the
         // decoded terminator only to the native state machine so a structural
         // close token can complete a tool call; it is never emitted as text.
@@ -1030,6 +1136,9 @@ pub fn decode_loop_with_timing_terminators(
         }
         generated += 1;
         committed.push(next);
+        if think_budget.observe(&frag) {
+            forced_tokens.extend(tok.encode(THINK_CLOSE_FORCED));
+        }
 
         backend.decode_step(gpu, next, pos)?;
         pos += 1;
@@ -1107,8 +1216,81 @@ pub fn decode_loop_with_timing_terminators(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_next, DecodedNext};
+    use super::{decode_next, prompt_opens_think, DecodedNext, ThinkBudget};
     use crate::tokenizer::Tokenizer;
+
+    // Templates open the think block in the generation prompt, so the decode loop
+    // starts mid-thought. A pre-closed (thinking-disabled) frame must not count.
+    #[test]
+    fn prompt_open_think_detection_matches_the_template_frames() {
+        assert!(prompt_opens_think("<|im_start|>assistant\n<think>\n")); // enable_thinking=true
+        assert!(!prompt_opens_think(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n" // enable_thinking=false
+        ));
+        assert!(!prompt_opens_think("<|im_start|>assistant\n")); // undefined -> no block
+                                                                 // a completed earlier turn must not leave it "open"
+        assert!(!prompt_opens_think("<think>\nold\n</think>\n\nanswer"));
+    }
+
+    #[test]
+    fn think_budget_forces_closure_once_the_budget_is_spent() {
+        let mut b = ThinkBudget::new(3, "<|im_start|>assistant\n<think>\n");
+        assert!(!b.observe("reason"));
+        assert!(!b.observe(" more"));
+        assert!(b.observe(" done"), "3rd token spends the budget -> force");
+        // fires exactly once, never again
+        assert!(!b.observe("after"));
+        assert!(!b.observe("after"));
+    }
+
+    #[test]
+    fn think_budget_stays_out_of_the_way_when_it_should() {
+        // budget 0 (none requested) and 1 (thinking disabled) are both no-ops
+        for budget in [0, 1] {
+            let mut b = ThinkBudget::new(budget, "<think>\n");
+            for _ in 0..10 {
+                assert!(!b.observe("tok"), "budget {budget} must never force");
+            }
+        }
+        // model closed on its own -> nothing to force even past the budget
+        let mut b = ThinkBudget::new(2, "<think>\n");
+        assert!(!b.observe("brief </think> answer"));
+        assert!(!b.observe("more"));
+        assert!(!b.observe("more"));
+        // thinking never opened (template emitted no block) -> no forcing
+        let mut b = ThinkBudget::new(2, "<|im_start|>assistant\n");
+        assert!(!b.observe("plain"));
+        assert!(!b.observe("answer"));
+    }
+
+    // The serving path prefills the framed tokens and passes an empty prompt, so the
+    // budget itself has to carry the signal there — otherwise enforcement silently
+    // never engages, which is exactly the bug this whole path had.
+    #[test]
+    fn think_budget_engages_when_the_prompt_was_consumed_by_prefill() {
+        let mut b = ThinkBudget::new(2, "");
+        assert!(!b.observe("reasoning"));
+        assert!(b.observe("more"), "empty prompt + budget must still force");
+        // but a disabled budget stays disabled even with an empty prompt
+        let mut b = ThinkBudget::new(1, "");
+        for _ in 0..5 {
+            assert!(!b.observe("tok"));
+        }
+    }
+
+    // The marker can arrive split across several tokens; detection is over the
+    // accumulated text, and the scan window must not drop it.
+    #[test]
+    fn think_budget_detects_a_marker_split_across_tokens() {
+        let mut b = ThinkBudget::new(50, "<think>\n");
+        for frag in ["<", "/th", "ink", ">"] {
+            assert!(!b.observe(frag));
+        }
+        // closed -> budget no longer applies
+        for _ in 0..60 {
+            assert!(!b.observe("answer "));
+        }
+    }
 
     #[test]
     fn metadata_terminators_are_never_classified_as_visible_content() {
