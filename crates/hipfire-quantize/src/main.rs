@@ -95,7 +95,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -2863,8 +2863,11 @@ fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: us
     }
     for t in tensors.iter_mut() {
         if t.spilled_len == 0 && !t.data.is_empty() {
-            // Before the bytes leave RAM — this is the only chance.
-            compress_bf16_tensor(t, codec, &mut stats);
+            // Before the bytes leave RAM — this is the only chance. Skipped
+            // while a post-pass still needs the plain BF16 staging.
+            if bf16_precompress() {
+                compress_bf16_tensor(t, codec, &mut stats);
+            }
             match spill.spill(&t.name, &t.data) {
                 Ok(len) => {
                     t.spilled_len = len;
@@ -2897,6 +2900,23 @@ static SPILL_BF16_STATS: Mutex<Bf16CompressStats> = Mutex::new(Bf16CompressStats
     bytes_before: 0,
     bytes_after: 0,
 });
+
+/// Whether a BF16 tensor may be recoded before the per-tensor emit loop ends.
+///
+/// False while a post-pass still needs to read plain BF16 bytes back in place —
+/// `pack_qtip_real_tensors` stages its input as BF16 and rewrites it after the
+/// loop, so recoding early would hand it compressed bytes. Every other format
+/// has no such pass, which is what lets the codec run while a tensor is still
+/// small enough to matter.
+static BF16_PRECOMPRESS: AtomicBool = AtomicBool::new(false);
+
+fn set_bf16_precompress(ok: bool) {
+    BF16_PRECOMPRESS.store(ok, Ordering::Relaxed);
+}
+
+fn bf16_precompress() -> bool {
+    BF16_PRECOMPRESS.load(Ordering::Relaxed)
+}
 
 fn record_spill_compression(s: &Bf16CompressStats) {
     if let Ok(mut g) = SPILL_BF16_STATS.lock() {
@@ -4783,6 +4803,15 @@ fn run_hfq_source_pipeline(
         }
     }
 
+    // QTIP stages its weights as BF16 and rewrites them after the loop; every
+    // other format is free to recode as soon as a tensor exists.
+    set_bf16_precompress(!matches!(
+        format,
+        HfqInputFormat::Qtip3 | HfqInputFormat::Qtip4
+    ));
+    let mut early_bf16_stats = Bf16CompressStats::default();
+    let mut compressed_upto = 0usize;
+
     let mut hfq_tensors = Vec::with_capacity(hfq.tensors.len());
     // HFQ-to-HFQ rewrites can be just as large as direct safetensors ingest.
     // Keep completed output tensors bounded instead of retaining an entire
@@ -4859,6 +4888,17 @@ fn run_hfq_source_pipeline(
             });
         }
         emit_coarse_sidecar(&mut hfq_tensors, &t.name, &t.shape);
+        // Recode what this iteration produced, so bytes accumulating toward the
+        // spill threshold are already compressed. Only the new tail is touched:
+        // a tensor the codec declined stays plain BF16, and re-offering it every
+        // iteration would re-encode it O(n) times for nothing.
+        if bf16_precompress() {
+            let codec = bf16_codec();
+            for t in &mut hfq_tensors[compressed_upto..] {
+                compress_bf16_tensor(t, codec, &mut early_bf16_stats);
+            }
+            compressed_upto = hfq_tensors.len();
+        }
         if let Some(ref mut output_spill) = spill {
             maybe_spill(&mut hfq_tensors, output_spill, 2 * 1024 * 1024 * 1024);
         }
@@ -4945,7 +4985,12 @@ fn run_hfq_source_pipeline(
     // transform pass (they read bf16 bytes back in place) and before any spill
     // (spilled bytes cannot be replaced).
     let mut bf16_stats = compress_bf16_tensors(&mut hfq_tensors, bf16_codec());
-    // Tensors recoded on their way to the spill file are counted there.
+    // Tensors recoded during the emit loop or on the way to the spill file are
+    // counted there, not here.
+    bf16_stats.compressed += early_bf16_stats.compressed;
+    bf16_stats.not_smaller += early_bf16_stats.not_smaller;
+    bf16_stats.bytes_before += early_bf16_stats.bytes_before;
+    bf16_stats.bytes_after += early_bf16_stats.bytes_after;
     merge_spill_compression(&mut bf16_stats);
     if bf16_stats.compressed > 0 || bf16_stats.skipped_spilled > 0 {
         eprintln!(
@@ -6287,6 +6332,11 @@ fn main() {
     // path is for kernel-free PPL; this is the shippable bandwidth format.
     let use_qtip3_real = format == "qtip3";
     let use_qtip4_real = format == "qtip4";
+    // QTIP's post-pass rewrites BF16-staged weights after the emit loop, so the
+    // codec must wait for it. Every other format may recode a tensor as soon as
+    // it exists, which is what keeps the bytes accumulating toward the spill
+    // threshold compressed instead of plain.
+    set_bf16_precompress(!(use_qtip3_real || use_qtip4_real));
     let qtip_bits: u32 = if let Some(b) = qtip_sim_bits {
         b
     } else if use_qtip3_real {
@@ -10716,6 +10766,15 @@ fn main() {
         // Release source file page cache after each tensor to prevent
         // mmap'd pages from starving GPU allocations on UMA systems.
         st_files[*file_idx].drop_tensor_pages(name);
+        // Bound heap growth. The quant branches above each spill, but the
+        // source-precision branches (BF16/F16/F32 passthrough) did not, so a
+        // `--format bf16` conversion accumulated the entire model in RAM:
+        // measured 18 GB of anonymous memory 14% into a 31B model, with the
+        // spill file still empty. Spilling here is what makes the 2 GiB
+        // threshold mean anything on this path.
+        if let Some(ref mut sp) = spill {
+            maybe_spill(&mut hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+        }
     }
     quant_progress.finish();
 
