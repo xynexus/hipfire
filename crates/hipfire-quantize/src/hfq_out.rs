@@ -106,45 +106,59 @@ pub struct Bf16CompressStats {
 /// does not actually get smaller (an `XᵀX` Hessian spreads over too many
 /// exponents to win) is left as plain BF16.
 ///
-/// Tensors already spilled to disk are skipped: `TensorSpill` is append-only and
-/// rejects re-spilling a name, so their bytes cannot be replaced in place. The
-/// count is reported so a caller can see when spilling cost it compression.
+/// A tensor already spilled to disk can no longer be recoded: `TensorSpill` is
+/// append-only and rejects re-spilling a name, so its bytes cannot be replaced
+/// in place. That is why the spill path calls [`compress_bf16_tensor`] on each
+/// tensor *before* handing it to the spill file — recoding afterwards is not
+/// possible, and skipping it silently cost a 51 GB MoE its entire compression
+/// (1.014x measured, against 1.51x for the same weights). The counter remains
+/// so any tensor that still reaches here spilled is visible rather than quiet.
 pub fn compress_bf16_tensors(tensors: &mut [HfqTensor], codec: Bf16Codec) -> Bf16CompressStats {
     let mut stats = Bf16CompressStats::default();
     if codec == Bf16Codec::None {
         return stats;
     }
     for t in tensors.iter_mut() {
-        if t.quant_type != QuantType::BF16 {
-            continue;
-        }
-        if t.spilled_len > 0 {
+        if t.spilled_len > 0 && t.quant_type == QuantType::BF16 {
             stats.skipped_spilled += 1;
             continue;
         }
-        if t.data.is_empty() {
-            continue;
-        }
-        let packed = match codec {
-            Bf16Codec::Huff => hipfire_primitives::bf16_huff::encode_if_smaller(&t.data),
-            Bf16Codec::Lut3 => hipfire_primitives::bf16_lut3::encode_if_smaller(&t.data),
-            Bf16Codec::None => None,
-        };
-        match packed {
-            Some(packed) => {
-                stats.compressed += 1;
-                stats.bytes_before += t.data.len() as u64;
-                stats.bytes_after += packed.len() as u64;
-                t.data = packed;
-                t.quant_type = match codec {
-                    Bf16Codec::Huff => QuantType::Bf16Huff,
-                    _ => QuantType::Bf16Lut3,
-                };
-            }
-            None => stats.not_smaller += 1,
-        }
+        compress_bf16_tensor(t, codec, &mut stats);
     }
     stats
+}
+
+/// Recode one in-memory BF16 tensor, updating its `quant_type` on success.
+///
+/// Must be called while `t.data` still holds the bytes — i.e. before the tensor
+/// is spilled. A no-op for anything that is not plain in-memory BF16, so it is
+/// safe to call on a mixed list or twice on the same tensor.
+pub fn compress_bf16_tensor(t: &mut HfqTensor, codec: Bf16Codec, stats: &mut Bf16CompressStats) {
+    if codec == Bf16Codec::None
+        || t.quant_type != QuantType::BF16
+        || t.spilled_len > 0
+        || t.data.is_empty()
+    {
+        return;
+    }
+    let packed = match codec {
+        Bf16Codec::Huff => hipfire_primitives::bf16_huff::encode_if_smaller(&t.data),
+        Bf16Codec::Lut3 => hipfire_primitives::bf16_lut3::encode_if_smaller(&t.data),
+        Bf16Codec::None => None,
+    };
+    match packed {
+        Some(packed) => {
+            stats.compressed += 1;
+            stats.bytes_before += t.data.len() as u64;
+            stats.bytes_after += packed.len() as u64;
+            t.data = packed;
+            t.quant_type = match codec {
+                Bf16Codec::Huff => QuantType::Bf16Huff,
+                _ => QuantType::Bf16Lut3,
+            };
+        }
+        None => stats.not_smaller += 1,
+    }
 }
 
 pub fn tensor_param_count(t: &HfqTensor) -> u64 {
