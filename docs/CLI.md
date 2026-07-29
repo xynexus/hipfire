@@ -17,6 +17,7 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire eval`↴](#hipfire-eval)
 * [`hipfire bench`↴](#hipfire-bench)
 * [`hipfire doctor`↴](#hipfire-doctor)
+* [`hipfire env`↴](#hipfire-env)
 * [`hipfire host-profile`↴](#hipfire-host-profile)
 * [`hipfire collect-artifacts`↴](#hipfire-collect-artifacts)
 * [`hipfire optimize`↴](#hipfire-optimize)
@@ -84,6 +85,7 @@ Use `hipfire <command> help` or `hipfire <command> --help` for detailed command 
 * `eval` — Run the quant admission/model evaluation harness
 * `bench` — Quick daemon benchmark: load time, TTFT, pp512 prefill t/s, tg128 decode t/s
 * `doctor` — Diagnose the local Hipfire install, runtime, daemon, and monitoring prerequisites
+* `env` — List the environment variables hipfire reads, with descriptions
 * `host-profile` — Measure host, GPU-copy, and model storage bandwidth
 * `collect-artifacts` — Collect Tier-1 calibration artifacts (Hessian/imatrix/router-histogram) in one model load
 * `optimize` — Reshuffle a canonical .hfq into an arch-optimal layout (<model>.<arch>.hfq)
@@ -313,6 +315,22 @@ Examples:
 
 * `--fix` — Apply safe user-space fixes and invoke hipfire-priv-helper for privileged fixes
 * `--json` — Emit the full report as JSON
+
+
+
+## `hipfire env`
+
+List the environment variables hipfire reads, with descriptions
+
+**Usage:** `hipfire env [OPTIONS] [FILTER]`
+
+###### **Arguments:**
+
+* `<FILTER>` — Case-insensitive substring filter over name and description
+
+###### **Options:**
+
+* `--all` — Show developer/diagnostic variables too. Default lists only the supported, user-facing ones
 
 
 

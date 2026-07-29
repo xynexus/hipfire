@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod detect;
 pub mod diffusion;
 pub mod doctor;
+pub mod env;
 pub mod forward;
 pub mod gen_config_schema;
 pub mod gen_docs;
