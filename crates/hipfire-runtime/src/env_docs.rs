@@ -321,10 +321,10 @@ pub const ENV_HIPFIRE_BF16_MOE_M256: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-rdna/src/dispatch/overlays/gfx1151.rs:162",
 };
 
-/// `HIPFIRE_BF16_WEIGHTS` — path for correctness. "HIPFIRE_BF16_WEIGHTS=f32" forces the old
+/// `HIPFIRE_BF16_WEIGHTS` — Runtime variable controlling bf16 weights in hipfire
 pub const ENV_HIPFIRE_BF16_WEIGHTS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_BF16_WEIGHTS",
-    description: "path for correctness. \"HIPFIRE_BF16_WEIGHTS=f32\" forces the old",
+    description: "Runtime variable controlling bf16 weights in hipfire",
     source: "crates/hipfire-runtime/src/hfq.rs:1860",
 };
 
@@ -1030,10 +1030,10 @@ pub const ENV_HIPFIRE_DFLASH_NPU_DRAFT: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/examples/dflash_spec_demo.rs:1050",
 };
 
-/// `HIPFIRE_DFLASH_NPU_DRAFT_TRACE` — Runtime variable controlling dflash npu draft trace in hipfire
+/// `HIPFIRE_DFLASH_NPU_DRAFT_TRACE` — [cfg(not(target_os = "linux"))]
 pub const ENV_HIPFIRE_DFLASH_NPU_DRAFT_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_NPU_DRAFT_TRACE",
-    description: "Runtime variable controlling dflash npu draft trace in hipfire",
+    description: "[cfg(not(target_os = \"linux\"))]",
     source: "crates/hipfire-runtime/src/dflash.rs:1374",
 };
 
@@ -1191,10 +1191,10 @@ pub const ENV_HIPFIRE_DIFFUSION_ABLATE_BITS: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-diffusion/src/gpu_ops.rs:2642",
 };
 
-/// `HIPFIRE_DIFFUSION_ATTN_QTILE` — Runtime variable controlling diffusion attn qtile in hipfire
+/// `HIPFIRE_DIFFUSION_ATTN_QTILE` — Enabled by default; set to 0 to disable
 pub const ENV_HIPFIRE_DIFFUSION_ATTN_QTILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_ATTN_QTILE",
-    description: "Runtime variable controlling diffusion attn qtile in hipfire",
+    description: "Enabled by default; set to 0 to disable",
     source: "crates/hipfire-diffusion/src/gpu_ops.rs:4230",
 };
 
@@ -1219,24 +1219,24 @@ pub const ENV_HIPFIRE_DIFFUSION_FOLD_ROLES: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-diffusion/src/quant_encode.rs:787",
 };
 
-/// `HIPFIRE_DIFFUSION_LAYER_RUNG` — Runtime variable controlling diffusion layer rung in hipfire
+/// `HIPFIRE_DIFFUSION_LAYER_RUNG` — Selects behavior from recognized values
 pub const ENV_HIPFIRE_DIFFUSION_LAYER_RUNG: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_LAYER_RUNG",
-    description: "Runtime variable controlling diffusion layer rung in hipfire",
+    description: "Selects behavior from recognized values",
     source: "crates/hipfire-diffusion/src/denoise.rs:363",
 };
 
-/// `HIPFIRE_DIFFUSION_OQ8` — Fold path: unsigned codes + dynamic-int8 activation (with per-group sum)
+/// `HIPFIRE_DIFFUSION_OQ8` — Enabled when set to 1
 pub const ENV_HIPFIRE_DIFFUSION_OQ8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_OQ8",
-    description: "Fold path: unsigned codes + dynamic-int8 activation (with per-group sum)",
+    description: "Enabled when set to 1",
     source: "crates/hipfire-diffusion/src/gpu_ops.rs:2331",
 };
 
-/// `HIPFIRE_DIFFUSION_TILED_GEMM` — Runtime variable controlling diffusion tiled gemm in hipfire
+/// `HIPFIRE_DIFFUSION_TILED_GEMM` — Enabled by default; set to 0 to disable
 pub const ENV_HIPFIRE_DIFFUSION_TILED_GEMM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_TILED_GEMM",
-    description: "Runtime variable controlling diffusion tiled gemm in hipfire",
+    description: "Enabled by default; set to 0 to disable",
     source: "crates/hipfire-diffusion/src/gpu_ops.rs:2573",
 };
 
@@ -1254,10 +1254,10 @@ pub const ENV_HIPFIRE_DIR: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-serving-core/src/generate_vl.rs:1219",
 };
 
-/// `HIPFIRE_DN_STATE_EF` — HIPFIRE_DN_STATE_EF=0. Q8-only (FP32 has no requant; Q4 EF is future
+/// `HIPFIRE_DN_STATE_EF` — Runtime variable controlling dn state ef in hipfire
 pub const ENV_HIPFIRE_DN_STATE_EF: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DN_STATE_EF",
-    description: "HIPFIRE_DN_STATE_EF=0. Q8-only (FP32 has no requant; Q4 EF is future",
+    description: "Runtime variable controlling dn state ef in hipfire",
     source: "crates/hipfire-arch-qwen35/src/qwen35/state.rs:160",
 };
 
@@ -1485,10 +1485,10 @@ pub const ENV_HIPFIRE_EMBED_COMPARE_BATCH: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-embeddinggemma/examples/embed_e2e_npu_opus.rs:118",
 };
 
-/// `HIPFIRE_EMBED_COMPARE_RESIDENT_ATTENTION` — Parses "HIPFIRE_EMBED_COMPARE_RESIDENT_ATTENTION" with fallback defaults
+/// `HIPFIRE_EMBED_COMPARE_RESIDENT_ATTENTION` — Runtime variable controlling embed compare resident attention in hipfire
 pub const ENV_HIPFIRE_EMBED_COMPARE_RESIDENT_ATTENTION: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_COMPARE_RESIDENT_ATTENTION",
-    description: "Parses \"HIPFIRE_EMBED_COMPARE_RESIDENT_ATTENTION\" with fallback defaults",
+    description: "Runtime variable controlling embed compare resident attention in hipfire",
     source: "crates/hipfire-arch-embeddinggemma/examples/embed_e2e_npu_opus.rs:52",
 };
 
@@ -1569,10 +1569,10 @@ pub const ENV_HIPFIRE_EMBED_RESIDENT_FFN_CACHE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-embeddinggemma/src/npu_opus.rs:992",
 };
 
-/// `HIPFIRE_EMBED_RESIDENT_LAYER` — Selects behavior from recognized values
+/// `HIPFIRE_EMBED_RESIDENT_LAYER` — Runtime variable controlling embed resident layer in hipfire
 pub const ENV_HIPFIRE_EMBED_RESIDENT_LAYER: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EMBED_RESIDENT_LAYER",
-    description: "Selects behavior from recognized values",
+    description: "Runtime variable controlling embed resident layer in hipfire",
     source: "crates/hipfire-serving-core/src/load.rs:2867",
 };
 
@@ -1716,10 +1716,10 @@ pub const ENV_HIPFIRE_EVAL_PERPLEXITY_CORPUS: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-eval/src/run.rs:168",
 };
 
-/// `HIPFIRE_EVAL_PERPLEXITY_CTX` — Runtime variable controlling eval perplexity ctx in hipfire
+/// `HIPFIRE_EVAL_PERPLEXITY_CTX` — Parses "HIPFIRE_EVAL_PERPLEXITY_CTX" with fallback defaults
 pub const ENV_HIPFIRE_EVAL_PERPLEXITY_CTX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_EVAL_PERPLEXITY_CTX",
-    description: "Runtime variable controlling eval perplexity ctx in hipfire",
+    description: "Parses \"HIPFIRE_EVAL_PERPLEXITY_CTX\" with fallback defaults",
     source: "crates/hipfire-eval/src/executor_examples.rs:961",
 };
 
@@ -1905,10 +1905,10 @@ pub const ENV_HIPFIRE_GEMMA4_DUMP_POS: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-gemma4/src/forward.rs:359",
 };
 
-/// `HIPFIRE_GEMMA4_FORWARD_ORACLE` — Interprets "HIPFIRE_GEMMA4_FORWARD_ORACLE" from environment to select behavior
+/// `HIPFIRE_GEMMA4_FORWARD_ORACLE` — Runtime variable controlling gemma4 forward oracle in hipfire
 pub const ENV_HIPFIRE_GEMMA4_FORWARD_ORACLE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GEMMA4_FORWARD_ORACLE",
-    description: "Interprets \"HIPFIRE_GEMMA4_FORWARD_ORACLE\" from environment to select behavior",
+    description: "Runtime variable controlling gemma4 forward oracle in hipfire",
     source: "crates/hipfire-arch-gemma4/src/forward.rs:1928",
 };
 
@@ -2213,10 +2213,10 @@ pub const ENV_HIPFIRE_KVARN_BITS: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/src/kv.rs:1195",
 };
 
-/// `HIPFIRE_KVARN_ROTATE` — Enabled by default; set to 0 to disable
+/// `HIPFIRE_KVARN_ROTATE` — In-place: mq_rotate_x loads each 256-group into registers (ds_swizzle
 pub const ENV_HIPFIRE_KVARN_ROTATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KVARN_ROTATE",
-    description: "Enabled by default; set to 0 to disable",
+    description: "In-place: mq_rotate_x loads each 256-group into registers (ds_swizzle",
     source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:6781",
 };
 
@@ -2297,10 +2297,10 @@ pub const ENV_HIPFIRE_KV_COLD_V_PERSLOT: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/src/kv_hier.rs:334",
 };
 
-/// `HIPFIRE_KV_CORE_FRAC` — TriAttn importance needs calibrated centers from a TRIA sidecar. Load once
+/// `HIPFIRE_KV_CORE_FRAC` — Runtime variable controlling KV core frac in hipfire
 pub const ENV_HIPFIRE_KV_CORE_FRAC: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_CORE_FRAC",
-    description: "TriAttn importance needs calibrated centers from a TRIA sidecar. Load once",
+    description: "Runtime variable controlling KV core frac in hipfire",
     source: "crates/hipfire-runtime/src/kv_hier.rs:278",
 };
 
@@ -2346,17 +2346,17 @@ pub const ENV_HIPFIRE_KV_HIER_TEST_IDLE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/examples/parity_kv_hier.rs:82",
 };
 
-/// `HIPFIRE_KV_HOT_BITS` — Hot-tier bit-width ("HIPFIRE_KV_HOT_BITS"): 8 = per-token symmetric-absmax
+/// `HIPFIRE_KV_HOT_BITS` — Phase 1 hot-tier bit-width ("HIPFIRE_KV_HOT_BITS"): 16 = f16 ring (default),
 pub const ENV_HIPFIRE_KV_HOT_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_HOT_BITS",
-    description: "Hot-tier bit-width (\"HIPFIRE_KV_HOT_BITS\"): 8 = per-token symmetric-absmax",
+    description: "Phase 1 hot-tier bit-width (\"HIPFIRE_KV_HOT_BITS\"): 16 = f16 ring (default),",
     source: "crates/hipfire-runtime/src/kv_hier.rs:349",
 };
 
-/// `HIPFIRE_KV_HOT_BUDGET` — Default 512: the knee sweep showed hot=512 clearly beats 256 (PPL 27.5 vs
+/// `HIPFIRE_KV_HOT_BUDGET` — Runtime variable controlling KV hot budget in hipfire
 pub const ENV_HIPFIRE_KV_HOT_BUDGET: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_HOT_BUDGET",
-    description: "Default 512: the knee sweep showed hot=512 clearly beats 256 (PPL 27.5 vs",
+    description: "Runtime variable controlling KV hot budget in hipfire",
     source: "crates/hipfire-runtime/src/kv_hier.rs:260",
 };
 
@@ -2374,10 +2374,10 @@ pub const ENV_HIPFIRE_KV_IDLE_KEEP: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-serving-core/src/qwen35_prefill.rs:139",
 };
 
-/// `HIPFIRE_KV_IMPORTANCE` — TriAttn importance needs calibrated centers from a TRIA sidecar. Load once
+/// `HIPFIRE_KV_IMPORTANCE` — Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default,
 pub const ENV_HIPFIRE_KV_IMPORTANCE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_IMPORTANCE",
-    description: "TriAttn importance needs calibrated centers from a TRIA sidecar. Load once",
+    description: "Cold-tile quant precision probe: code max = 2^bits - 1 (4-bit=15 default,",
     source: "crates/hipfire-runtime/src/kv_hier.rs:283",
 };
 
@@ -2416,17 +2416,17 @@ pub const ENV_HIPFIRE_KV_POS_LOCAL: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/src/kv_hier.rs:312",
 };
 
-/// `HIPFIRE_KV_PYRAMID` — int8 ring (DEFAULT — Phase 4; ~49% smaller hot VRAM, parity + PPL neutral
+/// `HIPFIRE_KV_PYRAMID` — Enabled when set to 1
 pub const ENV_HIPFIRE_KV_PYRAMID: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_PYRAMID",
-    description: "int8 ring (DEFAULT — Phase 4; ~49% smaller hot VRAM, parity + PPL neutral",
+    description: "Enabled when set to 1",
     source: "crates/hipfire-runtime/src/kv_hier.rs:339",
 };
 
-/// `HIPFIRE_KV_PYRAMID_AMP` — int8 ring (DEFAULT — Phase 4; ~49% smaller hot VRAM, parity + PPL neutral
+/// `HIPFIRE_KV_PYRAMID_AMP` — Runtime variable controlling KV pyramid amp in hipfire
 pub const ENV_HIPFIRE_KV_PYRAMID_AMP: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KV_PYRAMID_AMP",
-    description: "int8 ring (DEFAULT — Phase 4; ~49% smaller hot VRAM, parity + PPL neutral",
+    description: "Runtime variable controlling KV pyramid amp in hipfire",
     source: "crates/hipfire-runtime/src/kv_hier.rs:340",
 };
 
@@ -3229,10 +3229,10 @@ pub const ENV_HIPFIRE_PFLASH_DRAFTER_KV: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-qwen35/src/pflash.rs:534",
 };
 
-/// `HIPFIRE_PFLASH_DRAFTER_STATE` — = auto -> the redundancy gate (FP32 for all current models)
+/// `HIPFIRE_PFLASH_DRAFTER_STATE` — Hybrid drafter only stores K (and V for chat-path) at
 pub const ENV_HIPFIRE_PFLASH_DRAFTER_STATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PFLASH_DRAFTER_STATE",
-    description: "= auto -> the redundancy gate (FP32 for all current models)",
+    description: "Hybrid drafter only stores K (and V for chat-path) at",
     source: "crates/hipfire-arch-qwen35/src/pflash.rs:653",
 };
 
@@ -3607,10 +3607,10 @@ pub const ENV_HIPFIRE_QTIP_EVAL_ST: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-quantize/src/qtip.rs:894",
 };
 
-/// `HIPFIRE_QTIP_HESSIAN` — Stamp the QTIP calib signature into the output metadata, same
+/// `HIPFIRE_QTIP_HESSIAN` — Runtime variable controlling qtip hessian in hipfire
 pub const ENV_HIPFIRE_QTIP_HESSIAN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QTIP_HESSIAN",
-    description: "Stamp the QTIP calib signature into the output metadata, same",
+    description: "Runtime variable controlling qtip hessian in hipfire",
     source: "crates/hipfire-quantize/src/main.rs:6346",
 };
 
@@ -3750,17 +3750,17 @@ pub const ENV_HIPFIRE_QWEN35_FINITE_TRACE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-qwen35/src/qwen35/mod.rs:1314",
 };
 
-/// `HIPFIRE_QWEN35_MOE_LEGACY_INLINE` — Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in
+/// `HIPFIRE_QWEN35_MOE_LEGACY_INLINE` — Runtime variable controlling qwen35 moe legacy inline in hipfire
 pub const ENV_HIPFIRE_QWEN35_MOE_LEGACY_INLINE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_MOE_LEGACY_INLINE",
-    description: "Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in",
+    description: "Runtime variable controlling qwen35 moe legacy inline in hipfire",
     source: "crates/hipfire-arch-qwen35/src/qwen35/moe_decode.rs:1553",
 };
 
-/// `HIPFIRE_QWEN35_MOE_OQ_INDEXED` — Runtime variable controlling qwen35 moe oq indexed in hipfire
+/// `HIPFIRE_QWEN35_MOE_OQ_INDEXED` — Interprets "HIPFIRE_QWEN35_MOE_OQ_INDEXED" from environment to select behavior
 pub const ENV_HIPFIRE_QWEN35_MOE_OQ_INDEXED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_MOE_OQ_INDEXED",
-    description: "Runtime variable controlling qwen35 moe oq indexed in hipfire",
+    description: "Interprets \"HIPFIRE_QWEN35_MOE_OQ_INDEXED\" from environment to select behavior",
     source: "crates/hipfire-dispatch/src/families/moe.rs:74",
 };
 
@@ -4366,10 +4366,10 @@ pub const ENV_HIPFIRE_RQ_GROUP: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-quantize/src/main.rs:10915",
 };
 
-/// `HIPFIRE_RQ_HAND` — hook, which only the hand arms below carry — force the hand path
+/// `HIPFIRE_RQ_HAND` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_RQ_HAND: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RQ_HAND",
-    description: "hook, which only the hand arms below carry — force the hand path",
+    description: "Environment toggle value controls runtime behavior",
     source: "crates/hipfire-arch-qwen35/src/qwen35/decode_layers.rs:41",
 };
 
