@@ -12,6 +12,7 @@ LOCAL_BIN="${LOCAL_BIN:-$HOME/.local/bin}"
 PUBLIC_BINS=(
     hipfire
     hipfire-quantize
+    hipfire-coexistence
     hipfire-monitor
 )
 
