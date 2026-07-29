@@ -146,6 +146,12 @@ impl MoeResolution {
 /// (the model passes only the dtype snapshot + k); the executor computes
 /// [`MoeResolution`] from [`MoeDtypes`] on entry.
 pub struct MoeParams<'a> {
+    /// Index of the decoder layer this MoE block belongs to. Carried purely so
+    /// the executor can attribute router-selection telemetry to a layer; the
+    /// compute path never reads it. Mirrors `MoePrefillParams::layer`, which
+    /// has always had it — the decode side lacked one, which is why the
+    /// verbatim port of `moe_ffn_decode_impl` could not keep its histogram call.
+    pub layer: usize,
     pub dtypes: MoeDtypes,
     /// Token-batch width. Decode = 1. >1 must route to grouped prefill (Step 8).
     /// Guarded at runtime matching the bias-aware decode guard.
