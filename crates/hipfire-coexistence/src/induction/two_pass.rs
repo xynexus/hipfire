@@ -206,6 +206,215 @@ fn validate_quantized_inspection(inspection: &Value) -> Result<(), Box<dyn Error
     Ok(())
 }
 
+/// Run the calibration *dry plan* (`calibrate --dry-run`) to get the `expected`
+/// recipe JSON — the planned geometry / samples / experts / fingerprints WITHOUT
+/// running the GPU forward. Twin of `two_pass_quantize.inspect_calibration_plan`
+/// (+ `calibration_validation_command`): where the Python appends `--dry-run` to
+/// the collect command and parses the child's stdout, the Rust reuses the exact
+/// in-process dry-run path the CLI uses — `run_from_command` returns the same
+/// `dry_run_report` Value before ever touching the GPU or its lock.
+pub fn inspect_calibration_plan(command: &CalibrateCommand) -> Result<Value, Box<dyn Error>> {
+    let mut plan_command = command.clone();
+    plan_command.dry_run = true;
+    run_from_command(&plan_command)
+}
+
+/// Python `repr()` for the scalar JSON types these fields hold, so a rejection
+/// message is byte-identical to `_require_equal`: `'str'`, `4`, `1.0`, `True`,
+/// `None`. Objects/arrays (only the `sampling` field) fall back to JSON, which
+/// only appears in a message on an actual mismatch.
+fn py_repr(value: &Value) -> String {
+    match value {
+        Value::Null => "None".to_string(),
+        Value::Bool(true) => "True".to_string(),
+        Value::Bool(false) => "False".to_string(),
+        Value::String(s) => format!("'{s}'"),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.to_string()
+            } else if let Some(u) = n.as_u64() {
+                u.to_string()
+            } else {
+                format!("{:?}", n.as_f64().unwrap_or(f64::NAN))
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
+/// `dig` that returns an owned `Value` (Null when missing), so both sides of a
+/// comparison behave like Python's `dict.get(...)` returning `None`.
+fn at(value: &Value, path: &[&str]) -> Value {
+    dig(Some(value), path).cloned().unwrap_or(Value::Null)
+}
+
+/// Twin of `two_pass_quantize._require_equal`: reject reuse on inequality with the
+/// same `reused calibration {label} mismatch: artifact=..., requested=...` shape.
+fn require_equal(label: &str, actual: &Value, expected: &Value) -> Result<(), String> {
+    if actual != expected {
+        return Err(format!(
+            "reused calibration {label} mismatch: artifact={}, requested={}",
+            py_repr(actual),
+            py_repr(expected)
+        ));
+    }
+    Ok(())
+}
+
+/// Bind a reused calibration artifact to the producer's exact semantic recipe —
+/// the ~30-field check ported faithfully from
+/// `two_pass_quantize.validate_reusable_calibration`. `inspection` is the artifact
+/// `inspect` JSON; `expected` is the dry-plan from [`inspect_calibration_plan`].
+/// Any mismatch rejects reuse (rather than silently reusing a stale calibration).
+pub fn validate_reusable_calibration(inspection: &Value, expected: &Value) -> Result<(), String> {
+    let md = &["metadata"];
+    let job = &["metadata", "job"];
+    let options = &["metadata", "job", "options"];
+    let samples = &["metadata", "job", "samples"];
+    let source_manifest = &["metadata", "source_manifest"];
+    let geometry = &["metadata", "microbatch_geometry"];
+    let quota = &["metadata", "job", "options", "expert_quota"];
+
+    require_equal(
+        "run fingerprint",
+        &at(inspection, &[md[0], "run_fingerprint"]),
+        &at(expected, &["run_fingerprint"]),
+    )?;
+    require_equal("family", &at(inspection, &[md[0], "family"]), &at(expected, &["model", "family"]))?;
+    require_equal(
+        "adapter_version",
+        &at(inspection, &[md[0], "adapter_version"]),
+        &at(expected, &["model", "adapter_version"]),
+    )?;
+    require_equal("arch_id", &at(inspection, &[md[0], "arch_id"]), &at(expected, &["model", "arch_id"]))?;
+    require_equal(
+        "source fingerprint",
+        &at(inspection, &[source_manifest[0], source_manifest[1], "fingerprint"]),
+        &at(expected, &["source_plan", "source_fingerprint"]),
+    )?;
+    require_equal(
+        "source job fingerprint",
+        &at(inspection, &[job[0], job[1], "source_fingerprint"]),
+        &at(expected, &["source_plan", "source_fingerprint"]),
+    )?;
+    require_equal(
+        "source shards",
+        &at(inspection, &[source_manifest[0], source_manifest[1], "shards"]),
+        &at(expected, &["source_plan", "shards"]),
+    )?;
+    require_equal(
+        "tokenizer fingerprint",
+        &at(inspection, &[job[0], job[1], "tokenizer_fingerprint"]),
+        &at(expected, &["source_plan", "tokenizer_fingerprint"]),
+    )?;
+    require_equal(
+        "corpus fingerprint",
+        &at(inspection, &[job[0], job[1], "corpus_fingerprint"]),
+        &at(expected, &["corpus", "corpus_fingerprint"]),
+    )?;
+    require_equal(
+        "sample fingerprint",
+        &at(inspection, &[samples[0], samples[1], samples[2], "fingerprint"]),
+        &at(expected, &["corpus", "sample_fingerprint"]),
+    )?;
+    // Computed sample stats: count of samples, and the summed per-sample token count.
+    let sample_list = dig(Some(inspection), &[samples[0], samples[1], samples[2], "samples"])
+        .and_then(|v| v.as_array());
+    let sample_count = sample_list.map(|a| a.len()).unwrap_or(0);
+    let sample_rows: usize = sample_list
+        .map(|a| {
+            a.iter()
+                .map(|s| s.get("tokens").and_then(|t| t.as_array()).map(|t| t.len()).unwrap_or(0))
+                .sum()
+        })
+        .unwrap_or(0);
+    require_equal("sample count", &json!(sample_count), &at(expected, &["corpus", "sequences"]))?;
+    require_equal(
+        "sample context",
+        &at(inspection, &[samples[0], samples[1], samples[2], "context_len"]),
+        &at(expected, &["corpus", "context"]),
+    )?;
+    require_equal("sample rows", &json!(sample_rows), &at(expected, &["corpus", "rows"]))?;
+
+    require_equal(
+        "geometry sequence_batch",
+        &at(inspection, &[geometry[0], geometry[1], "sequence_batch"]),
+        &at(expected, &["microbatch", "sequence_batch"]),
+    )?;
+    require_equal(
+        "geometry time_tile",
+        &at(inspection, &[geometry[0], geometry[1], "time_tile"]),
+        &at(expected, &["microbatch", "time_tile"]),
+    )?;
+    require_equal(
+        "geometry row_budget",
+        &at(inspection, &[geometry[0], geometry[1], "row_budget"]),
+        &at(expected, &["microbatch", "max_rows"]),
+    )?;
+    require_equal(
+        "job sequence_batch",
+        &at(inspection, &[options[0], options[1], options[2], "sequence_batch"]),
+        &at(expected, &["microbatch", "sequence_batch"]),
+    )?;
+    require_equal(
+        "job time_tile",
+        &at(inspection, &[options[0], options[1], options[2], "time_tile"]),
+        &at(expected, &["microbatch", "time_tile"]),
+    )?;
+    require_equal(
+        "job max_rows",
+        &at(inspection, &[options[0], options[1], options[2], "max_rows"]),
+        &at(expected, &["microbatch", "max_rows"]),
+    )?;
+    require_equal(
+        "boundary precision",
+        &at(inspection, &[options[0], options[1], options[2], "boundary_precision"]),
+        &json!("f32"),
+    )?;
+
+    require_equal(
+        "minimum_rows",
+        &at(inspection, &[quota[0], quota[1], quota[2], quota[3], "min_rows"]),
+        &at(expected, &["expert_capture", "minimum_rows"]),
+    )?;
+    require_equal(
+        "target_rows",
+        &at(inspection, &[quota[0], quota[1], quota[2], quota[3], "target_rows"]),
+        &at(expected, &["expert_capture", "target_rows"]),
+    )?;
+    require_equal(
+        "tile_rows",
+        &at(inspection, &[quota[0], quota[1], quota[2], quota[3], "tile_rows"]),
+        &at(expected, &["expert_capture", "tile_rows"]),
+    )?;
+    require_equal(
+        "sampling",
+        &at(inspection, &[quota[0], quota[1], quota[2], quota[3], "sampling"]),
+        &at(expected, &["expert_capture", "sampling"]),
+    )?;
+    require_equal(
+        "required_fraction",
+        &at(inspection, &[options[0], options[1], options[2], "required_expert_fraction"]),
+        &at(expected, &["expert_capture", "required_fraction"]),
+    )?;
+    require_equal(
+        "coverage_policy",
+        &at(inspection, &[options[0], options[1], options[2], "expert_coverage_policy"]),
+        &at(expected, &["expert_capture", "coverage_policy"]),
+    )?;
+    require_equal(
+        "KLDREF enabled",
+        &at(inspection, &[options[0], options[1], options[2], "kldref"]),
+        &at(expected, &["kldref", "enabled"]),
+    )?;
+    require_equal(
+        "KLDREF top_k",
+        &at(inspection, &[options[0], options[1], options[2], "kldref_top_k"]),
+        &at(expected, &["kldref", "top_k"]),
+    )?;
+    Ok(())
+}
+
 fn run_subprocess(command: &[String]) -> Result<(), Box<dyn Error>> {
     let status = std::process::Command::new(&command[0])
         .args(&command[1..])
@@ -254,6 +463,20 @@ pub fn run(cfg: &TwoPassConfig) -> Result<Value, Box<dyn Error>> {
 
     // Pass 1: calibration (in-process engine), unless reusing an existing artifact.
     let calibration_command = CalibrateCommand::parse(&collect_args).map_err(|e| format!("calibrate: {e}"))?;
+
+    // Dry-plan the calibration (CPU-only, before any GPU work) to get the
+    // `expected` recipe the reuse rebind checks against. Python computes this in
+    // both the run and the skip-calib branch.
+    if cfg.skip_calib && !cfg.calib.is_file() {
+        return Err(format!(
+            "--skip-calib requires an existing artifact: {}",
+            cfg.calib.display()
+        )
+        .into());
+    }
+    let expected_calibration =
+        inspect_calibration_plan(&calibration_command).map_err(|e| format!("calibrate dry-plan: {e}"))?;
+
     if !cfg.skip_calib {
         update_manifest(
             &cfg.manifest,
@@ -330,6 +553,9 @@ pub fn run(cfg: &TwoPassConfig) -> Result<Value, Box<dyn Error>> {
     validate_calibration_inspection(&calibration)?;
     let calibration_audit = audit_calibration(&cfg.calib)?;
     validate_calibration_audit(&calibration_audit, &calibration)?;
+    // Bind the artifact (reused or freshly produced) to its exact semantic
+    // recipe. On the skip-calib path this is what refuses a stale calibration.
+    validate_reusable_calibration(&calibration, &expected_calibration)?;
     update_manifest(
         &cfg.manifest,
         &recipe,
@@ -429,6 +655,129 @@ pub fn run(cfg: &TwoPassConfig) -> Result<Value, Box<dyn Error>> {
         },
     )?;
     Ok(final_manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A minimal but faithful (inspection, expected) pair reproducing the real
+    // field values captured from the /tmp/e2e Qwen3.5-0.8B calibration artifact
+    // and its `calibrate --dry-run` plan, which Python
+    // `validate_reusable_calibration` ACCEPTS.
+    fn golden_pair() -> (Value, Value) {
+        let sampling = json!({"kind": "deterministic_first", "seed": 1});
+        let shards = json!([{
+            "file": "model.safetensors-00001-of-00001.safetensors",
+            "bytes": 1746942600u64,
+            "identity_kind": "huggingface_blob_digest",
+            "identity": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+        }]);
+        let samples: Vec<Value> = (0..4).map(|_| json!({"tokens": vec![0u32; 64]})).collect();
+        let inspection = json!({
+            "metadata": {
+                "run_fingerprint": "fnv64:d4ff9fa71a504e8f",
+                "family": "qwen3.5",
+                "adapter_version": "qwen3.5-stream-v2",
+                "arch_id": 5,
+                "source_manifest": {"fingerprint": "fnv64:921e21656fa33904", "shards": shards.clone()},
+                "microbatch_geometry": {"sequence_batch": 4, "time_tile": 16, "row_budget": 256},
+                "job": {
+                    "source_fingerprint": "fnv64:921e21656fa33904",
+                    "tokenizer_fingerprint": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+                    "corpus_fingerprint": "b1b72c4c35eebd31d23a515f349b66e3176a242496499384ba0e93713ad39503",
+                    "options": {
+                        "sequence_batch": 4,
+                        "time_tile": 16,
+                        "max_rows": 256,
+                        "boundary_precision": "f32",
+                        "required_expert_fraction": 1.0,
+                        "expert_coverage_policy": "preserve-undercovered",
+                        "kldref": true,
+                        "kldref_top_k": 64,
+                        "expert_quota": {
+                            "min_rows": 2048,
+                            "target_rows": 4096,
+                            "tile_rows": 256,
+                            "sampling": sampling.clone()
+                        }
+                    },
+                    "samples": {
+                        "fingerprint": "fnv1a64:defd7352474c01ab",
+                        "context_len": 64,
+                        "samples": samples
+                    }
+                }
+            }
+        });
+        let expected = json!({
+            "run_fingerprint": "fnv64:d4ff9fa71a504e8f",
+            "model": {"family": "qwen3.5", "adapter_version": "qwen3.5-stream-v2", "arch_id": 5},
+            "source_plan": {
+                "source_fingerprint": "fnv64:921e21656fa33904",
+                "shards": shards,
+                "tokenizer_fingerprint": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+            },
+            "corpus": {
+                "corpus_fingerprint": "b1b72c4c35eebd31d23a515f349b66e3176a242496499384ba0e93713ad39503",
+                "sample_fingerprint": "fnv1a64:defd7352474c01ab",
+                "sequences": 4,
+                "context": 64,
+                "rows": 256
+            },
+            "microbatch": {"sequence_batch": 4, "time_tile": 16, "max_rows": 256},
+            "expert_capture": {
+                "minimum_rows": 2048,
+                "target_rows": 4096,
+                "tile_rows": 256,
+                "sampling": sampling,
+                "required_fraction": 1.0,
+                "coverage_policy": "preserve-undercovered"
+            },
+            "kldref": {"enabled": true, "top_k": 64}
+        });
+        (inspection, expected)
+    }
+
+    #[test]
+    fn reuse_accepts_matching_recipe_like_python() {
+        let (inspection, expected) = golden_pair();
+        assert!(validate_reusable_calibration(&inspection, &expected).is_ok());
+    }
+
+    #[test]
+    fn reuse_rejects_with_python_field_labels() {
+        // (perturb expected, exact Python golden message)
+        let cases: &[(fn(&mut Value), &str)] = &[
+            (
+                |e| e["microbatch"]["sequence_batch"] = json!(8),
+                "reused calibration geometry sequence_batch mismatch: artifact=4, requested=8",
+            ),
+            (
+                |e| e["corpus"]["sequences"] = json!(99),
+                "reused calibration sample count mismatch: artifact=4, requested=99",
+            ),
+            (
+                |e| e["expert_capture"]["minimum_rows"] = json!(111),
+                "reused calibration minimum_rows mismatch: artifact=2048, requested=111",
+            ),
+            (
+                |e| e["run_fingerprint"] = json!("run:BOGUS"),
+                "reused calibration run fingerprint mismatch: artifact='fnv64:d4ff9fa71a504e8f', requested='run:BOGUS'",
+            ),
+            (
+                |e| e["kldref"]["top_k"] = json!(7),
+                "reused calibration KLDREF top_k mismatch: artifact=64, requested=7",
+            ),
+        ];
+        for (perturb, expect_msg) in cases {
+            let (inspection, mut expected) = golden_pair();
+            perturb(&mut expected);
+            let err = validate_reusable_calibration(&inspection, &expected)
+                .expect_err("perturbation must reject reuse");
+            assert_eq!(&err, expect_msg);
+        }
+    }
 }
 
 /// Resolve the manifest path default (`<output>.two-pass.json`) the way Python
