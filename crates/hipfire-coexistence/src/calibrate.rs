@@ -262,6 +262,19 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let command = CalibrateCommand::parse(args)?;
+    let report = run_from_command(&command)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+/// Run one calibration pass in-process (planning, GPU self-lock, layer stream)
+/// and return the same JSON report the CLI prints. This is the in-process
+/// engine entry point the Rust induction driver drives instead of respawning
+/// the calibrate binary (the `two_pass_quantize.py` `run_calibration_pass`
+/// process-quantum scheduler it replaces). A daemon-resident caller drives the
+/// `DaemonCalibration` one-layer-per-turn session instead and never reaches
+/// here. On `--dry-run` this returns the dry-run plan without touching the GPU.
+pub fn run_from_command(command: &CalibrateCommand) -> Result<serde_json::Value, Box<dyn Error>> {
     // Source/adapter/job construction is factored into the runtime engine so the
     // CLI and the daemon op feed byte-identical inputs to `begin`.
     let CalibrationRunInputs {
@@ -304,8 +317,7 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
         &capture,
     )?;
     if command.dry_run {
-        println!("{}", serde_json::to_string_pretty(&dry_run)?);
-        return Ok(());
+        return Ok(dry_run);
     }
 
     let storage_estimate = calibration_storage_estimate(&command, &inspection, &job, &capture)?;
@@ -384,8 +396,7 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
             "read_ledger": read_ledger_cli_summary(&result.read_ledger),
         }),
     };
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
+    Ok(report)
 }
 
 fn read_ledger_cli_summary(snapshot: &ReadLedgerSnapshot) -> serde_json::Value {
