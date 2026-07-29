@@ -31,6 +31,27 @@ the relevant docs under `docs/`.
   crate), not folded into the daemon, server, or runtime hot path. The inference
   path stays lean and HIP-direct; conversion and compatibility concerns are
   offline tooling.
+- The line above is drawn at **format conversion, not at GPU work**. A workload
+  that is a forward (or backward) pass over a model — calibration/induction,
+  Hessian and imatrix capture, KLD evaluation, training and drafter training — is
+  inference-shaped work and may live in the daemon, where it can be scheduled,
+  batched, and preempted against serving traffic. What must stay out is
+  container/format translation and external-ecosystem interop. Test: if it runs
+  kernels over model weights it may be scheduled by the daemon; if it rewrites
+  bytes between container formats it belongs in `hipfire-coexistence`.
+- Concretely, the layer-stream **calibration/induction engine** — the forward-pass
+  evidence producer (`LayerStreamEngine`, `CalibrationSession`, and the
+  `DaemonCalibration` daemon wrapper) — lives in
+  `hipfire_runtime::calibration::layer_stream`, alongside the rest of
+  `hipfire_runtime::calibration`. That is what lets both the daemon
+  (`DaemonRequest::Calibrate`, one layer per turn) and the daemon-free
+  `hipfire-coexistence calibrate` CLI drive the same engine and produce a
+  byte-identical artifact. `hipfire-coexistence` keeps the **offline, zero-GPU**
+  half: CLI argument orchestration, the GPU self-lock for the standalone binary,
+  corpus/format/storage byte-math, dry-run planning, and artifact
+  compare/import/export/interop (plan §1.7: "coexistence keeps index/bytes, zero
+  GPU"). Do not depend on `hipfire-coexistence` from the daemon/server/runtime;
+  reach for the engine in `hipfire-runtime` instead.
 
 ## Branch And Git
 

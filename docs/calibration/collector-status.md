@@ -6,6 +6,239 @@ and its `oq4.25++` second pass are complete; the controlled expert sweeps,
 second-family resident parity, and final quality/channel admission evidence
 remain pending.
 
+## Update (2026-07-25) — stratum lens + a multilingual calibration corpus
+
+### The stratum lens (semantic routing, where token identity says nothing)
+
+Token-identity profiling is the right lens where routing is lexical, but ZAYA's
+middle third is language-*universal* (max 4.2% CJK concentration in blocks 16-23
+versus 100% in block 26) so a token histogram there is uninformative. Matching
+[Multilingual Routing in MoE](https://arxiv.org/pdf/2510.04694), which finds
+language-specific routing in early and late layers with middle layers acting as
+language-universal machinery.
+
+`LayerRouterStats.stratum_counts` therefore counts, per expert, the *label of the
+sample* each routed token came from. `CalibrationSample::stratum` already existed
+and was hashed into the sample fingerprint but nothing ever set it beyond the
+literal `"plain-text"`; a `.jsonl` corpus now populates it. Both fields ride a
+single [`RoutedRowContext`] so the grouped-MoE dispatch seam — which sees neither
+token nor stratum — keeps passing `unknown()`.
+
+The report scores **enrichment** (expert's stratum share ÷ the layer's stratum
+share), not raw share: an expert taking 40% code from a 40%-code corpus has
+learned nothing about code. A single-label corpus sets
+`stratum_profile_present: false` rather than reporting a tautological 1.0x.
+
+Labelled corpora are JSONL, one record per sample, text from `text`/`content`/
+`messages` (chat-style arrays are flattened over `content`) and label from
+`stratum`/`label`/`source`/`domain`/`language`. That makes
+[`Moe-lab/DBES`](https://huggingface.co/datasets/Moe-lab/DBES) (7 domains) and
+`allenai/tulu-3-sft-mixture` usable as-is. A record is truncated to the sample
+context, never split across samples — a sample straddling two labels would make
+the profile a lie.
+
+### The starved set is not stable under reweighting — re-measure lift every time
+
+`stratum_guidance` reports each stratum's share of *starved-expert* traffic over
+its share of all traffic. Measured on `calib-multi-labelled.jsonl` (32,138
+tokens/layer, 5 strata):
+
+| stratum | starved share | corpus share | lift |
+|---------|---------------|--------------|------|
+| math | 50.4% | 9.6% | **5.27x** |
+| code | 18.0% | 19.1% | 0.94x |
+| english | 25.8% | 41.4% | 0.62x |
+| japanese | 4.1% | 14.0% | 0.29x |
+| chinese | 1.8% | 15.9% | 0.11x |
+
+Math holds 4.50-6.25x lift in *every* depth band (early 0-9, mid 10-19, mid
+20-29, late 30-39), so it is not a shallow-layer artifact. The conclusion
+**reverses the CJK finding above**: CJK starvation was real for the English-only
+corpus, but once CJK reaches ~17% of tokens it over-serves already-covered
+experts (lift 0.04-0.24x) and the binding constraint becomes math. Pushing CJK
+further actively hurts — the 44%-CJK overshoot build raised mean Gini to 0.535
+against 0.323 for the corrected mix.
+
+Tail health with the labelled corpus: **never-routed 0** (against 29 on
+English-only), starved-below-400 21/640, absolute counts worst 3 / 5th pct 491 /
+10th pct 692 / median 1684. Scaled to 262k tokens that puts the whole
+distribution above the 2048 floor bar a handful of points.
+
+The operational lesson: expert-targeted calibration is a **loop**, not a one-shot
+fix. Reweighting the corpus moves the starved set, so lift must be re-measured
+after every change; a fixed prior about which material the tail needs will be
+wrong within one iteration.
+
+### Building a calibration corpus: two traps
+
+Both bit during construction of `benchmarks/calib/calib-multi-8m.txt` (English +
+zh + ja + code + math from
+[`eaddario/imatrix-calibration`](https://huggingface.co/datasets/eaddario/imatrix-calibration),
+`text_{en,cn,jp}_large` + `code_large` + `math_large`, cached under
+`/srv/huggingface/datasets--eaddario--imatrix-calibration/manual`):
+
+1. **`load_corpus_samples` consumes the corpus in order and stops** once it has
+   `--sequences` samples. A concatenated corpus is therefore sampled only from its
+   head: a first attempt with 100 KB interleave rounds put 64 KB of English first,
+   and an 8192-token pass measured **0.00% CJK** from a corpus that is 6.3% CJK.
+   Sources must be interleaved so that *every prefix* carries the target mix —
+   greedy largest-deficit-first over documents does this exactly.
+2. **A sample cannot span a paragraph.** `pending` resets per `\n\n` paragraph, so
+   any document shorter than `--context` tokens yields a short sample. Four-line
+   documents silently produced 311-token samples against a 1024-token context
+   (2489 routed tokens per layer instead of 8192). Documents must exceed the
+   sample context — size them in *chars* via each source's chars/token (~4.0
+   ASCII, ~1.2 CJK).
+
+Getting both right moved the measured token mix from cjk 0.62% / digit 6.18% /
+punct 12.79% / word 75.76% to **cjk 8.36% / digit 10.13% / punct 26.87% / word
+48.94%**. A labelled twin lives at `benchmarks/calib/calib-multi-labelled.jsonl`
+(2713 records, english 38% / code 21% / chinese 15.5% / japanese 15.5% / math
+10%), trimmed to the prefix over which its stated mix holds within 2 points.
+
+Caveat worth carrying: `eaddario/imatrix-calibration` covers 18 languages but
+**not Korean**, so hangul experts stay starved by this mix.
+
+## Update (2026-07-25) — MoE router specialisation profiler
+
+`artifact moe-router-profile` answers *what* an expert specialises in, not just
+how much load it takes. Router load alone cannot distinguish a weak expert from a
+specialist the corpus never triggers, and only the second case is fixed by corpus
+material rather than a quantization policy.
+
+Producer: `LayerRouterStats` gained `token_counts` — a per-expert routed-token
+histogram — populated when the family adapter passes the corpus token to
+`record_router_selection`. It is truncated to the top
+`TOKEN_PROFILE_KEEP` (256) ids per expert at snapshot time with
+`token_profile_dropped` recording the discarded distinct-id count, so a report
+never implies it saw the whole tail. The ZAYA streamed adapter supplies tokens;
+the grouped-MoE dispatch seam (qwen3.5's batched routed capture) does not see
+corpus tokens, so those layers report `token_profile: absent` instead of an empty
+profile. Threading tokens through that callback is a follow-on.
+
+Consumer: `hipfire-coexistence artifact moe-router-profile --input <calib.hfq>
+--tokenizer <hf-dir|model.hfq> [--layer N] [--top N] [--min-activations N]
+[--json]` decodes the retained ids and buckets them into coarse, tokenizer-neutral
+character classes (word / digit / punct / whitespace / CJK / other-non-ascii /
+byte-fallback), then reports per expert: load share, mean±σ of the winning gate,
+top-10 concentration, dominant classes, and top decoded tokens — plus per-layer
+imbalance and Gini, and a starved-expert summary against `--min-activations`.
+
+### Finding: ZAYA1-8B strict coverage fails because the corpus is English-only
+
+The 262144-token `benchmarks/calib/calib-5m.txt` run aborted at block 7 under the
+default `strict` policy (4 of 32 capture points below the 2048-activation floor).
+An 8192-token profiling pass explains why. Comparing starved (<200 of 8192) with
+well-covered capture points across all 40 blocks:
+
+| class | starved | well-covered | enrichment |
+|-------|---------|--------------|-----------|
+| cjk | 5.66% | 0.44% | **13.0x** |
+| whitespace | 11.93% | 5.46% | 2.2x |
+| digit | 7.12% | 6.91% | 1.0x |
+| word | 45.24% | 72.26% | 0.63x |
+
+The corpus itself is word 76% / punct 13% / digit 6% / whitespace 5% / **cjk 0.6%**.
+The mean winning gate is *identical* for starved and well-covered experts (0.458
+vs 0.461), so starvation is a coverage problem, not weak experts — and 17 starved
+experts are >10% CJK, several of them 83-100% CJK in the deep blocks with the
+highest gates in their layer (e.g. block 28 expert 3: 40 tokens, cjk 90%, gate
+0.666 — the most confident expert in that block). Their tokens are `ヴァ ル キュ 戦`,
+i.e. "Valkyria" in katakana: the corpus is WikiText-style English prose whose only
+CJK is one article's incidental Japanese, so ZAYA's CJK experts can never reach
+the floor. 29 experts were never routed at all.
+
+Block 28 shows the router has learned an interpretable functional decomposition —
+separate experts for determiners (`·the ·a ·The`), prepositions (`·of ·in ·to`),
+copulas (`·was ·were ·be ·is`), punctuation (96% punct, concentration 1.00),
+numerals (56% digit + 42% space), formatting/newlines, single-capital initials,
+and CJK. The narrow ones carry the highest gates and the least traffic.
+
+Consequence for admission: calibrating a multilingual MoE on an English-only
+corpus yields trustworthy Hessians for the prose experts and thin statistics for
+the rest. Either extend the corpus with the scripts the model was trained on, or
+run `--expert-coverage-policy preserve-undercovered` so the thin experts are held
+at high precision instead of being quantized off <2048 samples. Also worth noting:
+the Mixture-of-Depths skip route never won in any block across either run, so
+`zaya_use_mod` is effectively inert on this corpus.
+
+## Update (2026-07-25) — ZAYA1 streamed adapter + resume is now the default
+
+`hipfire-coexistence calibrate` gained a third family adapter,
+`zaya-stream-v1` (`crates/hipfire-arch-zaya/src/calibration_stream.rs`, arch 16),
+so ZAYA1 no longer has to go through the single-load resident collector.
+
+Two design points are ZAYA-specific and worth carrying forward to any family
+with cross-layer state:
+
+- **The boundary row is wider than the residual.** ZAYA's EDA router carries
+  `router_states [router_hidden_size]` from block `l-1` into block `l`, which
+  has exactly the residual's lifetime. It rides in the same boundary row —
+  `ModelInspection::hidden_width` is `hidden_size + router_hidden_size` (2304
+  for ZAYA1-8B), i.e. the *boundary row width*, not the model's hidden size.
+  This is what makes a resumed run pick the EDA state back up instead of
+  silently restarting it at zero. A family whose only cross-layer quantity is
+  the residual needs none of this.
+- **The adapter reads the raw Megatron alternating half-layer checkpoint**
+  (even `2l` = block `l`'s CCA attention, odd `2l+1` = its EDA/MoD MoE, residual
+  scales one half-layer ahead of the weights they scale). A unit test asserts
+  those raw names canonicalize through `ingest::canonical_name` to exactly the
+  names `gpu::build_capture_names` uses, so both calibration paths emit
+  artifacts the quantizer reads identically.
+
+**Resume is now the default** for `calibrate`; `--no-resume` opts out. The two
+modes that cannot checkpoint — `--boundary-ram` and residual probes — quietly
+turn the default off, while an explicit `--resume` with either is still an
+error. An interrupted run being continuable is the common case, and the old
+default silently restarted from layer 0.
+
+### Resident vs streamed parity (ZAYA1-8B, 256 tokens, 1 sample)
+
+Measured by running the streamed path first, replaying the identical token
+sequence through the resident collector with `collect_artifacts --job-from`, and
+diffing with `artifact compare-calibration` at `--atol 1e-3 --rtol 1e-2`.
+Corpus and sample fingerprints matched (`provenance_complete: true`).
+
+**Block 0 is numerically identical**: every layer-0 dense Hessian/imatrix
+(q/k/v_current/v_delayed, o_proj, router down_proj, router MLP fc1/fc2/out_proj)
+and every layer-0 routed-expert imatrix matched. That covers the embedding +
+input affine, the whole CCA mixer (conv pair, delayed value, L2/temp qk-norm,
+partial RoPE, GQA attention), both residual affines, and the EDA router prep.
+
+Downstream the two paths are **equivalent but not bit-identical**:
+
+| depth | max abs error, `q_proj.hessian` | top-1 routings differing |
+|-------|--------------------------------|--------------------------|
+| 0–1   | match                          | 0 / 256 (block 0)        |
+| 2     | 0.0078 (one bf16 ULP at 1.0)   | 0                        |
+| 10    | 0.14                           | ~1                       |
+| 20–39 | 1.2–20                         | ~3 per block             |
+
+Total: **77 of 10240 (0.75%) token-block routings flip**, and the MoD skip
+decision matched at every block (all 40 blocks routed exactly 256 tokens on both
+paths). The seed is the attention kernel: the resident path runs full-sequence
+prefill (`zaya_gqa_attn_f32`), the streamed path runs per-token flash-decode
+(`attention_f32`) against per-sequence KV/conv/delayed-value state. Those are
+mathematically equivalent but differ in reduction order at ~1e-7, and a top-1
+router amplifies a near-tie into a different expert. Hessian off-diagonals are
+stored bf16 (`quant_type` 130), so the shallow-depth deltas are literally one
+storage ULP.
+
+**Known gap:** the streamed path does not capture the tied `model.embed_tokens`
+lm-head input — the engine has no capture seam in the finalizer phase, and
+neither the Gemma3 nor Qwen3.5 adapter captures it either. A streamed artifact
+carries 360 Hessians where the resident one carries 361, and that projection
+falls back to RTN. ZAYA's embed is best left bf16 regardless (see the embed
+quant residual-sensitivity finding), but use the resident path if you need it.
+
+**Also found:** the resident `collect-artifacts` path cannot read a raw ZAYA
+safetensors directory even though `HfqFile::from_safetensors` opens it —
+`ZayaGpuWeights::load` wants the canonical hybrid-block names, and
+`from_safetensors` passes the raw Megatron names through unchanged. Convert with
+`hipfire-coexistence import safetensors` first, or use the streamed path, which
+reads the raw layout directly. (`derive_arch_id` also had to learn `zaya`; a
+stale binary silently fell back to arch 5 / Qwen3.5.)
+
 ## Update (2026-07-20) — family-neutral native safetensors engine
 
 `hipfire-coexistence calibrate` now emits the canonical HFQM v2

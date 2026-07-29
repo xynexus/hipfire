@@ -47,8 +47,14 @@ __device__ __forceinline__ void asym_reduce_body(
 
     const float* my_partials = partials + ((long long)local_bid * n_heads + h) * max_tiles * stride;
 
-    // Per-thread assignment: DPT consecutive dims per thread (32 × DPT == head_dim).
-    const int d_base = tid * DPT;
+    // Per-thread assignment: `dpt` consecutive dims per thread, computed at RUNTIME
+    // from head_dim (32 × dpt == head_dim) exactly like the tile kernel. DPT is only
+    // the register-array bound (MAXDPT). Using the compile-time DPT as the stride
+    // instead assumes head_dim == 32*DPT (256 for DPT=8) and, for smaller heads
+    // (e.g. head_dim=128), makes threads write past the head boundary into the next
+    // head's output — corrupting every head but the first of each kv-group.
+    const int dpt = head_dim / 32;
+    const int d_base = tid * dpt;
 
     // Pass 1: global max
     float global_max = -1e30f;
@@ -58,7 +64,7 @@ __device__ __forceinline__ void asym_reduce_body(
             global_max = fmaxf(global_max, p[0]);
     }
 
-    // Pass 2: accumulate DPT dims per thread
+    // Pass 2: accumulate dpt dims per thread
     float global_sum = 0.0f;
     float g[DPT];
     #pragma unroll
@@ -70,8 +76,7 @@ __device__ __forceinline__ void asym_reduce_body(
         float tile_sum = p[1];
         if (tile_sum <= 0.0f) continue;
         float corr = expf(tile_max - global_max);
-        #pragma unroll
-        for (int i = 0; i < DPT; i++)
+        for (int i = 0; i < dpt; i++)
             g[i] += p[2 + d_base + i] * corr;
         global_sum += tile_sum * corr;
     }
@@ -80,8 +85,7 @@ __device__ __forceinline__ void asym_reduce_body(
 
     const int q_dim = n_heads * head_dim;
     float* my_out = out + local_bid * q_dim + h * head_dim;
-    #pragma unroll
-    for (int i = 0; i < DPT; i++)
+    for (int i = 0; i < dpt; i++)
         my_out[d_base + i] = g[i] * inv_sum;
 }
 

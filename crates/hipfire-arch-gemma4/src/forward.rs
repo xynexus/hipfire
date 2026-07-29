@@ -1007,7 +1007,12 @@ fn moe_ffn_finish(
                 .map(|(_, weight)| *weight)
                 .collect::<Vec<_>>();
             telemetry
-                .record_router_selection(calibration.logical_layer, &indices, &weights)
+                .record_router_selection(
+                    calibration.logical_layer,
+                    hipfire_runtime::calibration::contracts::RoutedRowContext::unknown(),
+                    &indices,
+                    &weights,
+                )
                 .map_err(|error| HipError::new(0, &error.to_string()))?;
             telemetry
                 .record_grouped_batch_shape(

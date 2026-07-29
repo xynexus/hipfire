@@ -825,6 +825,7 @@ mod tests {
                 expert_coverage_policy: policy,
                 kldref: true,
                 kldref_top_k: 2,
+                kldref_rows: None,
             },
         )
         .unwrap()

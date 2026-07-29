@@ -13,7 +13,6 @@
 //! called from `main.rs` are `pub`.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::time::Instant;
 
 use hipfire_arch_qwen35::qwen35;
@@ -528,7 +527,7 @@ pub fn qwen35_semantic_boundary_checkpoints(
 /// prefill work.
 pub fn run_prefix_hash_preflight_qwen35(
     m: &LoadedModel,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &PrefixHashPreflightEnvelope,
 ) -> Result<(), String> {
     if !is_qwen35_family_arch_id(m.arch_id) {
@@ -1747,7 +1746,7 @@ pub fn qwen35_prefill_suffix_batch_serial_reference(
 pub fn run_generate_batch_prefill_serial_qwen35(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchPrefillEnvelope,
     pflash_active: bool,
 ) -> Result<(), String> {

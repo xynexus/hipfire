@@ -13,8 +13,6 @@
 //! `mean_draft_len`/`mean_committed`/`acceptance_hist`) are identical across
 //! strategies, so eval tooling parses one schema regardless of drafter.
 
-use std::io::Write;
-
 use hipfire_specdecode::SpecMetrics;
 use serde_json::{Map, Value};
 
@@ -39,7 +37,7 @@ use serde_json::{Map, Value};
 ///
 /// `tok_s` is rounded to 1 dp for stable JSONL. This function flushes `stdout`.
 pub fn emit_spec_done(
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     tokens: usize,
     tok_s: f64,

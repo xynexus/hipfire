@@ -1234,7 +1234,12 @@ pub(crate) fn execute_cohere2_row(
                     .iter()
                     .map(|(_, weight)| *weight)
                     .collect::<Vec<_>>();
-                telemetry.record_router_selection(layer, &indices, &route_weights)?;
+                telemetry.record_router_selection(
+                    layer,
+                    hipfire_runtime::calibration::contracts::RoutedRowContext::unknown(),
+                    &indices,
+                    &route_weights,
+                )?;
                 telemetry.record_grouped_batch_shape(
                     layer,
                     indices.len(),

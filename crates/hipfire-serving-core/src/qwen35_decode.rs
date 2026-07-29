@@ -12,7 +12,6 @@
 //! Extracted verbatim from the former `main.rs` monolith (no behavior change);
 //! items called from `main.rs` are `pub`.
 
-use std::io::Write;
 use std::time::Instant;
 
 use hipfire_arch_qwen35::qwen35;
@@ -305,7 +304,7 @@ pub fn validate_qwen35_fused_dense_decode_resident_sessions(
 /// Emit the `generate_batch_prefill_ready` capability event for the real
 /// (non-dummy) qwen35 backend.
 pub fn emit_generate_batch_prefill_ready(
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchPrefillEnvelope,
 ) {
     let line = serde_json::json!({
@@ -324,7 +323,7 @@ pub fn emit_generate_batch_prefill_ready(
 /// Emit a `generate_batch_prefill_ready` event reporting the request is
 /// unsupported, with the reason.
 pub fn emit_generate_batch_prefill_unsupported(
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchPrefillEnvelope,
     reason: &str,
 ) {
@@ -347,7 +346,7 @@ pub fn emit_generate_batch_prefill_unsupported(
 pub fn run_generate_batch_decode_step_qwen35(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchDecodeEnvelope,
 ) -> Result<(), String> {
     validate_qwen35_decode_batch_runtime_surface(
@@ -579,7 +578,7 @@ pub fn qwen35_decode_token_outcome(
 pub fn qwen35_decode_step_serial_reference(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
 ) -> Result<Vec<serde_json::Value>, String> {
@@ -667,7 +666,7 @@ pub fn qwen35_decode_step_serial_reference(
 pub fn qwen35_decode_step_fused_dense_layer_chunked(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    _stdout: &mut std::io::Stdout,
+    _stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
 ) -> Result<Qwen35DecodeBatchStepResult, String> {
@@ -681,7 +680,7 @@ pub fn qwen35_decode_step_fused_dense_layer_chunked(
 pub fn qwen35_decode_step_fused_grouped_moe_layer_chunked(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    _stdout: &mut std::io::Stdout,
+    _stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
 ) -> Result<Qwen35DecodeBatchStepResult, String> {

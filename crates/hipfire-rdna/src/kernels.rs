@@ -3129,6 +3129,14 @@ pub const CONV1D_DECODE_SRC: &str = include_str!("../../../kernels/src/conv1d_de
 /// (no LDS). See kernels/src/zaya_cca.hip.
 pub const ZAYA_CCA_SRC: &str = include_str!("../../../kernels/src/zaya_cca.hip");
 
+/// ZAYA decode cooperative megakernel (Phase 0, megakernel-B): fuses the MLP
+/// half of a decode block (post-attn rmsnorm+rotate → router MLP+select → MoE
+/// gate_up → silu_mul+rotate → MoE down+affine) into one cooperative launch,
+/// grid-strided over all resident workgroups with `grid.sync()` between phases.
+/// See kernels/src/zaya_megakernel.hip and
+/// docs/plans/2026-07-24-zaya-cooperative-megakernel.md.
+pub const ZAYA_MEGAKERNEL_SRC: &str = include_str!("../../../kernels/src/zaya_megakernel.hip");
+
 /// LFM2 LIV double-gated short-conv, single-token decode (runtime kernel_size).
 /// Fuses the B*x pre-gate, depthwise causal conv, C*conv_out post-gate, and the
 /// rolling conv-state ring-buffer advance into one launch. conv_bias is always

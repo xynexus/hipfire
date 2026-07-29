@@ -272,6 +272,7 @@ mod tests {
                 expert_coverage_policy: ExpertCoveragePolicy::Strict,
                 kldref: false,
                 kldref_top_k: 1,
+                kldref_rows: None,
             },
         )
         .unwrap();
