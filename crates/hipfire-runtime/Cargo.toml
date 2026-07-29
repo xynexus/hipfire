@@ -56,6 +56,7 @@ arch-lfm2moe = []
 arch-dots-ocr = []
 experimental-examples = []
 [dependencies]
+hipfire-env = { path = "../hipfire-env" }
 inventory = "0.3"
 hipfire-kvquant = { path = "../hipfire-kvquant" }
 hipfire-quant-format = { path = "../hipfire-quant-format" }

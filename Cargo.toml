@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/hipfire-env",
     "crates/hip-bridge",
     "crates/hsa-bridge",
     "crates/hipfire-rdna",

@@ -46,6 +46,9 @@ echo "== Python CPU tests =="
 "$PYTHON" -m mypy tests scripts benchmarks tools --config-file pyproject.toml
 "$PYTHON" -m pytest tests
 
+echo "== Env-var registry (declared in hipfire-env, per-crate enforcement) =="
+./tests/env-registry-gate.sh
+
 echo "== Env-var docs freshness (docs/env-vars.md + env_docs.rs vs source) =="
 cargo run -q -p hipfire-cli -- gen-env-docs --check
 

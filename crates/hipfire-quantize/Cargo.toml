@@ -15,6 +15,7 @@ default = ["gpu"]
 gpu = ["dep:hipfire-rdna", "dep:hipfire-lock"]
 
 [dependencies]
+hipfire-env = { path = "../hipfire-env" }
 # Capability layer (all LEAF/CPU-only, no GPU/runtime deps): consult a migrated
 # arch's Ingest quant-policy instead of the legacy name-matching. hipfire-arch-specs
 # force-links every family `-spec` crate, so adding a family never touches this crate.

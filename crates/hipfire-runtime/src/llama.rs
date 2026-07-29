@@ -37,7 +37,7 @@ thread_local! {
 /// 4-bit coarse, K=32; `q2` = 2-bit, K=2048. Append `:<K>` to override K
 /// (e.g. `q4:64`). Absent → the exact full lm_head. OFF by default.
 fn lmhead_twostage_cfg() -> Option<(usize, usize)> {
-    let v = std::env::var("HIPFIRE_LMHEAD_TWOSTAGE").ok()?;
+    let v = hipfire_env::LMHEAD_TWOSTAGE.get()?;
     let (bits, base_k, rest) = if let Some(r) = v.strip_prefix("q2") {
         (2usize, 2048usize, r)
     } else if let Some(r) = v.strip_prefix("q4") {

@@ -63,10 +63,7 @@ pub fn deltanet_state_redundancy(config: &Qwen35Config) -> usize {
 /// run under this policy. DDTree is opt-in and off by default. Adding an FP32 (or
 /// FP16) tree kernel is the way to reconcile them; forcing Q8 state is not.
 pub fn deltanet_state_fp32_below() -> usize {
-    std::env::var("HIPFIRE_DN_STATE_FP32_BELOW")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(usize::MAX)
+    hipfire_env::DN_STATE_FP32_BELOW.parse_or(usize::MAX)
 }
 
 /// Default DeltaNet state precision, gated on redundancy (`head_dim × n_heads`)

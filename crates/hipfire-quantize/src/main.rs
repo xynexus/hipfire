@@ -462,7 +462,7 @@ thread_local! {
 /// built without it still serves — the runtime falls back to a single fine pass.
 fn coarse_lmhead_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("HIPFIRE_NO_COARSE_LMHEAD").is_none())
+    *ON.get_or_init(|| !hipfire_env::NO_COARSE_LMHEAD.is_set())
 }
 
 /// Drain the pending coarse tier (if the just-pushed tensor produced one) and

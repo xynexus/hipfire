@@ -1563,6 +1563,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-cpu",
  "hipfire-dispatch",
+ "hipfire-env",
  "hipfire-kld",
  "hipfire-model",
  "hipfire-npu",
@@ -1731,6 +1732,7 @@ dependencies = [
  "hipfire-detect",
  "hipfire-diffusion",
  "hipfire-diffusion-coexist",
+ "hipfire-env",
  "hipfire-generate",
  "hipfire-hfq-tooling",
  "hipfire-lock",
@@ -1937,6 +1939,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-env"
+version = "0.3.0"
+
+[[package]]
 name = "hipfire-eval"
 version = "0.3.0"
 dependencies = [
@@ -2079,6 +2085,7 @@ dependencies = [
  "byteorder",
  "hipfire-arch-api",
  "hipfire-config",
+ "hipfire-env",
  "hipfire-hash",
  "hipfire-prompt",
  "memmap2",
@@ -2155,6 +2162,7 @@ dependencies = [
  "faer",
  "hipfire-arch-api",
  "hipfire-arch-specs",
+ "hipfire-env",
  "hipfire-gguf",
  "hipfire-kvquant",
  "hipfire-lock",
@@ -2220,6 +2228,7 @@ dependencies = [
  "hipfire-cpu",
  "hipfire-detect",
  "hipfire-dispatch",
+ "hipfire-env",
  "hipfire-evidence",
  "hipfire-generate",
  "hipfire-hneurons",

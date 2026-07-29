@@ -1258,14 +1258,14 @@ pub const ENV_HIPFIRE_DIR: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DN_STATE_EF: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DN_STATE_EF",
     description: "Runtime variable controlling dn state ef in hipfire",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/state.rs:160",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/state.rs:157",
 };
 
-/// `HIPFIRE_DN_STATE_FP32_BELOW` — Parses "HIPFIRE_DN_STATE_FP32_BELOW" with fallback defaults
+/// `HIPFIRE_DN_STATE_FP32_BELOW` — DeltaNet state stays FP32 when head_dim x n_value_heads is below this threshold. Defaults to usize::MAX, so FP32 always. Quantized (Q8/Q4) DeltaNet state is refused by policy — lowering this errors out rather than degrading quality.
 pub const ENV_HIPFIRE_DN_STATE_FP32_BELOW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DN_STATE_FP32_BELOW",
-    description: "Parses \"HIPFIRE_DN_STATE_FP32_BELOW\" with fallback defaults",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/state.rs:66",
+    description: "DeltaNet state stays FP32 when head_dim x n_value_heads is below this threshold. Defaults to usize::MAX, so FP32 always. Quantized (Q8/Q4) DeltaNet state is refused by policy — lowering this errors out rather than degrading quality.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_DOT2_GEMV` — Interprets "HIPFIRE_DOT2_GEMV" from environment to select behavior
@@ -1415,11 +1415,11 @@ pub const ENV_HIPFIRE_DUMP_GATE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-diffusion/src/transformer.rs:2087",
 };
 
-/// `HIPFIRE_DUMP_HIDDEN` — DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
+/// `HIPFIRE_DUMP_HIDDEN` — Path prefix for hidden-state and router-logit dumps written during decode. Unset disables dumping. Diagnostic only — it forces device synchronisation and is slow.
 pub const ENV_HIPFIRE_DUMP_HIDDEN: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DUMP_HIDDEN",
-    description: "DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)",
-    source: "crates/hipfire-dispatch/src/pipeline/mod.rs:386",
+    description: "Path prefix for hidden-state and router-logit dumps written during decode. Unset disables dumping. Diagnostic only — it forces device synchronisation and is slow.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_DUMP_HIDDEN_ALL` — Activation-capture mode (HIPFIRE_DUMP_HIDDEN_ALL=1): dump EVERY row of "x"
@@ -2522,11 +2522,11 @@ pub const ENV_HIPFIRE_LLOYD_MB4: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-rdna/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs:274",
 };
 
-/// `HIPFIRE_LMHEAD_TWOSTAGE` — Runtime variable controlling lmhead twostage in hipfire
+/// `HIPFIRE_LMHEAD_TWOSTAGE` — Two-stage lm_head decode: coarse Q4 shortlist then bf16 rescore. Presets `q4` or `1`; or `<bits>,<topk>` explicitly. Unset disables it and the exact full-precision gemv runs.
 pub const ENV_HIPFIRE_LMHEAD_TWOSTAGE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LMHEAD_TWOSTAGE",
-    description: "Runtime variable controlling lmhead twostage in hipfire",
-    source: "crates/hipfire-runtime/src/llama.rs:40",
+    description: "Two-stage lm_head decode: coarse Q4 shortlist then bf16 rescore. Presets `q4` or `1`; or `<bits>,<topk>` explicitly. Unset disables it and the exact full-precision gemv runs.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_LM_DUMP` — Selects behavior from recognized values
@@ -2900,11 +2900,11 @@ pub const ENV_HIPFIRE_NGRAM_WINDOW: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/src/config.rs:105",
 };
 
-/// `HIPFIRE_NORMALIZE_PROMPT` — Interprets "HIPFIRE_NORMALIZE_PROMPT" from environment to select behavior
+/// `HIPFIRE_NORMALIZE_PROMPT` — Normalise prompts before tokenizing: CRLF to LF, NBSP to space, strip trailing line whitespace, collapse 3+ blank lines. Set 0/false/off/no to disable. Default on.
 pub const ENV_HIPFIRE_NORMALIZE_PROMPT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NORMALIZE_PROMPT",
-    description: "Interprets \"HIPFIRE_NORMALIZE_PROMPT\" from environment to select behavior",
-    source: "crates/hipfire-serving-core/src/output_filter.rs:30",
+    description: "Normalise prompts before tokenizing: CRLF to LF, NBSP to space, strip trailing line whitespace, collapse 3+ blank lines. Set 0/false/off/no to disable. Default on.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_NORM_PLUS1` — qwen3.5 may store RMSNorm weight as (1+γ) (Gemma-style). HIPFIRE_NORM_PLUS1=1
@@ -2914,11 +2914,11 @@ pub const ENV_HIPFIRE_NORM_PLUS1: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-train/examples/qwen35_mlp_norm_recovery.rs:212",
 };
 
-/// `HIPFIRE_NO_COARSE_LMHEAD` — Runtime variable controlling no coarse lmhead in hipfire
+/// `HIPFIRE_NO_COARSE_LMHEAD` — Set to any value to stop the quantizer emitting the `<embed>.coarse.weight` shortlist tier. Equivalent to `--no-coarse-lmhead`. Default is to emit it.
 pub const ENV_HIPFIRE_NO_COARSE_LMHEAD: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_NO_COARSE_LMHEAD",
-    description: "Runtime variable controlling no coarse lmhead in hipfire",
-    source: "crates/hipfire-quantize/src/main.rs:465",
+    description: "Set to any value to stop the quantizer emitting the `<embed>.coarse.weight` shortlist tier. Equivalent to `--no-coarse-lmhead`. Default is to emit it.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_NO_EXPERT_AWQ` — experts fall back to plain MQ4/MQ8) — an A/B knob for measuring the
@@ -3455,18 +3455,18 @@ pub const ENV_HIPFIRE_PROFILE_DECODE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-runtime/examples/bench_qwen35_speed.rs:579",
 };
 
-/// `HIPFIRE_PROMPT_HEAT_JSON` — Enabled when set to 1
+/// `HIPFIRE_PROMPT_HEAT_JSON` — Emit the prompt heat-class dump as JSON instead of a table. Set 1. Diagnostic for BPE merge-rank distribution of a prompt.
 pub const ENV_HIPFIRE_PROMPT_HEAT_JSON: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PROMPT_HEAT_JSON",
-    description: "Enabled when set to 1",
-    source: "crates/hipfire-runtime/src/config.rs:66",
+    description: "Emit the prompt heat-class dump as JSON instead of a table. Set 1. Diagnostic for BPE merge-rank distribution of a prompt.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
-/// `HIPFIRE_PROMPT_HEAT_LIMIT` — Runtime variable controlling prompt heat limit in hipfire
+/// `HIPFIRE_PROMPT_HEAT_LIMIT` — Maximum tokens listed in the prompt heat dump. Default 64.
 pub const ENV_HIPFIRE_PROMPT_HEAT_LIMIT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PROMPT_HEAT_LIMIT",
-    description: "Runtime variable controlling prompt heat limit in hipfire",
-    source: "crates/hipfire-runtime/src/config.rs:67",
+    description: "Maximum tokens listed in the prompt heat dump. Default 64.",
+    source: "crates/hipfire-env/src/lib.rs",
 };
 
 /// `HIPFIRE_PROMPT_TOKEN_HEAT` — Enabled when set to 1

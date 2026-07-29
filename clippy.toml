@@ -1,0 +1,13 @@
+# Environment variables must be declared in `crates/hipfire-env` so that
+# `hipfire help env` can list every one of them with a description a user can
+# act on, and so a read site cannot name a variable the docs have never heard
+# of. `EnvVar::get` / `is_set` in that crate are the sanctioned callers and
+# carry the single `#[allow(clippy::disallowed_methods)]` in the workspace.
+#
+# Level is set to `deny` by `[workspace.lints.clippy]` in Cargo.toml. A crate
+# opts in with `[lints] workspace = true`, which is only valid once all of its
+# reads go through the table.
+disallowed-methods = [
+  { path = "std::env::var", reason = "declare it in crates/hipfire-env and read it via hipfire_env::<CONST>.get() / .parse_or() / .flag()" },
+  { path = "std::env::var_os", reason = "declare it in crates/hipfire-env and read it via hipfire_env::<CONST>.is_set()" },
+]

@@ -291,6 +291,31 @@ fn collect_env_data(root: &Path) -> anyhow::Result<Vec<EnvDoc>> {
         docs.push(best);
     }
 
+    // Declared entries from `hipfire-env` win over anything scanned.
+    //
+    // A migrated variable is read as `hipfire_env::CONST.get()`, so its name no
+    // longer appears as a string literal and the scanner cannot see it. Without
+    // this merge every migration would silently DELETE a row from
+    // `docs/env-vars.md`. Merging here also means the hand-written description
+    // replaces the generated "Runtime variable controlling ..." boilerplate as
+    // each variable moves over, so the markdown improves with the migration
+    // rather than shrinking.
+    //
+    // The `source` is the declaration, not the read site — that is the point of
+    // the table, and it is stable under unrelated line moves in the reader.
+    for v in hipfire_env::ALL {
+        let entry = EnvDoc {
+            name: v.name.to_string(),
+            description: v.description.to_string(),
+            source: "crates/hipfire-env/src/lib.rs".to_string(),
+        };
+        if let Some(slot) = docs.iter_mut().find(|d| d.name == entry.name) {
+            *slot = entry;
+        } else {
+            docs.push(entry);
+        }
+    }
+
     // Curated doc-only entries override/extend scanned ones.
     for entry in doc_only_entries() {
         if let Some(slot) = docs.iter_mut().find(|d| d.name == entry.name) {

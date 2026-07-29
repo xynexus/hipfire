@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-env"
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# Deliberately dependency-free. Every crate in the workspace must be able to
+# depend on this one without risking a cycle, so it stays a leaf.
+[dependencies]
