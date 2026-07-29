@@ -1409,6 +1409,17 @@ pub(crate) struct ThinkStreamFilter {
 }
 
 impl ThinkStreamFilter {
+    /// A filter for a stream that begins *inside* the think block — the chat
+    /// templates open `<think>` in the generation prompt when thinking is enabled,
+    /// so the model's first token is already reasoning and no opening marker will
+    /// ever appear in the stream.
+    pub(crate) fn started_in_think() -> Self {
+        Self {
+            in_think: true,
+            strip_next_leading_newline: false,
+        }
+    }
+
     pub(crate) fn observe(&mut self, text: &str, preserve: bool) -> Vec<AssistantDelta> {
         if preserve {
             let text = text.replace("<|im_end|>", "");

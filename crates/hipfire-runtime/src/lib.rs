@@ -56,6 +56,7 @@ pub mod sequence_state;
 pub mod speed_bench;
 pub mod tokenizer;
 pub mod tool_call;
+pub mod tool_grammar;
 pub mod tp_shard;
 pub mod transformer;
 pub mod transformer_loader;

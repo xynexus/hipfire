@@ -4174,7 +4174,7 @@ pub const ENV_HIPFIRE_RESOURCE_LOCK_WAIT_MS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_RESPONSES_STATE_MAX: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_RESPONSES_STATE_MAX",
     description: "Parses \"HIPFIRE_RESPONSES_STATE_MAX\" with fallback defaults",
-    source: "crates/hipfire-server/src/routes/responses.rs:981",
+    source: "crates/hipfire-server/src/routes/responses.rs:1104",
 };
 
 /// `HIPFIRE_ROCBLAS_ALL_ARCHS` — Runtime variable controlling rocblas all archs in hipfire
