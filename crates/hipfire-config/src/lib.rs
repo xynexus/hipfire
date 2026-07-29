@@ -230,6 +230,20 @@ pub struct HipfireConfig {
     /// `api_auth_mode` is `off` or `optional`.
     #[serde(default)]
     pub unsafe_allow_unauthenticated_remote: bool,
+    /// Rate limits applied when `host` is a loopback address, where the only
+    /// possible clients are processes on this machine. Consulted ONLY for a
+    /// loopback bind — a network-reachable bind always uses the standard
+    /// policy, so nothing here can loosen limits for a remote client.
+    ///
+    /// Unset fields keep `RatePolicy::loopback_default()`, which is
+    /// effectively unlimited; set any field to narrow it. Same shape as a
+    /// user/token override, e.g.:
+    ///
+    /// ```json
+    /// "local_rate_policy": { "max_in_flight_text": 2 }
+    /// ```
+    #[serde(default)]
+    pub local_rate_policy: hipfire_auth::RatePolicyOverride,
     /// Root directory for images saved by the SD API compatibility routes
     /// (`save_images: true`). Client-supplied `outdir_*` override_settings
     /// are ignored; every SD API image write stays under this root.
@@ -452,6 +466,8 @@ impl Default for HipfireConfig {
             admin_user: default_admin_user(),
             api_auth_mode: default_api_auth_mode(),
             unsafe_allow_unauthenticated_remote: false,
+            // Empty = keep `RatePolicy::loopback_default()` unnarrowed.
+            local_rate_policy: hipfire_auth::RatePolicyOverride::default(),
             sdapi_output_root: default_sdapi_output_root(),
             sdapi_max_dimension: default_sdapi_max_dimension(),
             sdapi_max_steps: default_sdapi_max_steps(),

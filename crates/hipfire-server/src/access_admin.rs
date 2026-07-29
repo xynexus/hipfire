@@ -439,7 +439,7 @@ fn rate_limit_row(
         scopes: BTreeSet::new(),
         auth_kind: AuthKind::ApiToken,
     };
-    let user_policy = RatePolicy::default().with_override(&user.rate_policy);
+    let user_policy = state.rate_limiter.base().with_override(&user.rate_policy);
     let effective = token
         .map(|token| user_policy.stricter_token_policy(&token.rate_policy))
         .unwrap_or(user_policy);

@@ -1794,6 +1794,7 @@ dependencies = [
  "argon2",
  "dirs",
  "getrandom 0.2.17",
+ "hipfire-auth",
  "serde",
  "serde_json",
 ]
