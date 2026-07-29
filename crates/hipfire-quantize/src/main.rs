@@ -45,7 +45,8 @@ pub use hipfire_quantize::{codecs, fixture, gptq, hessian_io, hfhs_diag, ldlq, q
 // GGUF import pipeline (owned by hipfire-coexistence) can produce byte-identical
 // artifacts through the same code path the native quantizer uses.
 use hipfire_quantize::hfq_out::{
-    compress_bf16_tensors, insert_parameter_counts_metadata, write_hfq_with_progress, Bf16Codec,
+    compress_bf16_tensor, compress_bf16_tensors, insert_parameter_counts_metadata,
+    write_hfq_with_progress, Bf16Codec, Bf16CompressStats,
     HfqStreamTensor, HfqTensor, LiveHfqWriter, TensorSpill, Xxh64, HFQ_MAGIC,
 };
 // Helpers exercised only by this binary's unit tests.
@@ -95,6 +96,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 // imatrix lookup populated once in main() when --imatrix is supplied; keyed by
@@ -2840,7 +2842,17 @@ fn xxh64_hex(bytes: &[u8]) -> String {
 
 /// Spill tensors whose data is in memory to the spill file, freeing RAM.
 /// Called after each layer's expert batch to keep peak RSS bounded.
+///
+/// Recodes each BF16 tensor immediately before spilling it. The spill file is
+/// append-only, so a tensor written plain can never be compressed afterwards —
+/// doing it here is what lets a model be both RAM-bounded and compressed. A
+/// large stacked-expert MoE crosses the threshold on nearly every layer, so
+/// compressing only the survivors left `gemma-4-26B-A4B-it` at 1.014x when its
+/// weights measure 1.51x. Stats accumulate into `stats` so the reported totals
+/// still cover the whole model.
 fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: usize) {
+    let codec = bf16_codec();
+    let mut stats = Bf16CompressStats::default();
     let in_mem: usize = tensors
         .iter()
         .filter(|t| t.spilled_len == 0)
@@ -2851,6 +2863,8 @@ fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: us
     }
     for t in tensors.iter_mut() {
         if t.spilled_len == 0 && !t.data.is_empty() {
+            // Before the bytes leave RAM — this is the only chance.
+            compress_bf16_tensor(t, codec, &mut stats);
             match spill.spill(&t.name, &t.data) {
                 Ok(len) => {
                     t.spilled_len = len;
@@ -2868,6 +2882,40 @@ fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: us
     }
     if let Err(error) = spill.flush() {
         eprintln!("warning: could not flush tensor spill: {error}");
+    }
+    record_spill_compression(&stats);
+}
+
+/// Codec work done at spill time, which the end-of-run report has to add to the
+/// in-memory pass or it would under-report a model that spilled — exactly the
+/// large-MoE case this exists for. A global mirrors how the codec choice itself
+/// is threaded (`BF16_CODEC`), keeping the ~14 `maybe_spill` call sites intact.
+static SPILL_BF16_STATS: Mutex<Bf16CompressStats> = Mutex::new(Bf16CompressStats {
+    compressed: 0,
+    not_smaller: 0,
+    skipped_spilled: 0,
+    bytes_before: 0,
+    bytes_after: 0,
+});
+
+fn record_spill_compression(s: &Bf16CompressStats) {
+    if let Ok(mut g) = SPILL_BF16_STATS.lock() {
+        g.compressed += s.compressed;
+        g.not_smaller += s.not_smaller;
+        g.skipped_spilled += s.skipped_spilled;
+        g.bytes_before += s.bytes_before;
+        g.bytes_after += s.bytes_after;
+    }
+}
+
+/// Merge the spill-time totals into an in-memory pass's stats for reporting.
+fn merge_spill_compression(s: &mut Bf16CompressStats) {
+    if let Ok(g) = SPILL_BF16_STATS.lock() {
+        s.compressed += g.compressed;
+        s.not_smaller += g.not_smaller;
+        s.skipped_spilled += g.skipped_spilled;
+        s.bytes_before += g.bytes_before;
+        s.bytes_after += g.bytes_after;
     }
 }
 
@@ -4896,7 +4944,9 @@ fn run_hfq_source_pipeline(
     // Recode BF16 tensors with the lossless disk codec. Must run after every
     // transform pass (they read bf16 bytes back in place) and before any spill
     // (spilled bytes cannot be replaced).
-    let bf16_stats = compress_bf16_tensors(&mut hfq_tensors, bf16_codec());
+    let mut bf16_stats = compress_bf16_tensors(&mut hfq_tensors, bf16_codec());
+    // Tensors recoded on their way to the spill file are counted there.
+    merge_spill_compression(&mut bf16_stats);
     if bf16_stats.compressed > 0 || bf16_stats.skipped_spilled > 0 {
         eprintln!(
             "  bf16 codec: {} tensors {:.1} MB -> {:.1} MB ({:.4}x){}{}",
@@ -12011,7 +12061,9 @@ fn main() {
     // Recode BF16 tensors with the lossless disk codec. Must run after every
     // transform pass (they read bf16 bytes back in place) and before any spill
     // (spilled bytes cannot be replaced).
-    let bf16_stats = compress_bf16_tensors(&mut hfq_tensors, bf16_codec());
+    let mut bf16_stats = compress_bf16_tensors(&mut hfq_tensors, bf16_codec());
+    // Tensors recoded on their way to the spill file are counted there.
+    merge_spill_compression(&mut bf16_stats);
     if bf16_stats.compressed > 0 || bf16_stats.skipped_spilled > 0 {
         eprintln!(
             "  bf16 codec: {} tensors {:.1} MB -> {:.1} MB ({:.4}x){}{}",
