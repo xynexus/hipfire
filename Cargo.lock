@@ -1737,6 +1737,7 @@ dependencies = [
 name = "hipfire-coexistence"
 version = "0.3.0"
 dependencies = [
+ "chrono",
  "hipfire-arch-gemma3",
  "hipfire-arch-qwen35",
  "hipfire-arch-zaya",
@@ -1745,6 +1746,7 @@ dependencies = [
  "hipfire-lock",
  "hipfire-lora-hfq",
  "hipfire-model",
+ "hipfire-quant-format",
  "hipfire-quantize",
  "hipfire-rdna",
  "hipfire-runtime",
@@ -1754,6 +1756,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
