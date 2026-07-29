@@ -34,6 +34,27 @@ pub async fn get_load_progress() -> Json<Value> {
 }
 
 pub async fn get_health(state: State<SharedState>) -> Json<Value> {
+    // Bound health assembly: a busy server (mid-generation, holding the runtime and
+    // the scheduler/telemetry locks this payload reads) answers "alive but busy"
+    // fast instead of blocking. A stall here otherwise reads as a *wedge* to
+    // monitors when the server is merely generating.
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(750),
+        assemble_health_json(&state),
+    )
+    .await
+    {
+        Ok(payload) => Json(payload),
+        Err(_) => Json(json!({
+            "status": "ok",
+            "busy": true,
+            "version": hipfire_build_info::VERSION,
+            "pid": std::process::id(),
+        })),
+    }
+}
+
+async fn assemble_health_json(state: &SharedState) -> Value {
     let loaded = {
         let loaded = state.loaded_model_path.lock().await;
         loaded.clone()
@@ -49,15 +70,15 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         Some(false) => "degraded",
         _ => "ok",
     };
-    let diffusion = diffusion_health_payload(&state).await;
+    let diffusion = diffusion_health_payload(state).await;
     let active_model = loaded
         .clone()
         .or_else(|| diffusion_active_model(&diffusion));
-    let scheduler_resources = scheduler_resource_health_payload(&state).await;
+    let scheduler_resources = scheduler_resource_health_payload(state).await;
     let prefill_queue_size = state.prefill_scheduler.lock().await.size();
     let selected_prefill_requests = state.selected_prefill_requests.lock().await.len();
-    let accelerator_inventory = server_accelerator_inventory(&state).await;
-    let runtime_workers = runtime_workers_health_payload(&state, &accelerator_inventory).await;
+    let accelerator_inventory = server_accelerator_inventory(state).await;
+    let runtime_workers = runtime_workers_health_payload(state, &accelerator_inventory).await;
     let scheduler_env = scheduler_env_from_process();
     // When continuous batching is enabled, the batch runner owns live counters
     // (residency, selected batch size, decode backend). Surface them here so
@@ -67,6 +88,12 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
     let batch_telemetry = state.batch_telemetry.lock().await.clone();
     let batch_pending = state.batch_inbox.lock().await.len();
     let work_snapshot = state.work_scheduler.lock().await.snapshot();
+    // The daemon's own scheduler counters. Deliberately a separate block from the
+    // `prefill_batch` / `decode_batch` / `state_cache` views below: those describe
+    // SERVER-side batching, which still lives here, so back-filling them with
+    // daemon numbers would report one subsystem's activity under another's name.
+    // They stay placeholders until the batch runner moves across.
+    let daemon_scheduler = daemon_scheduler_health_payload(state).await;
     let mut prefill_batch = server_prefill_batch_health_json(&scheduler_env);
     if let Some(obj) = prefill_batch.as_object_mut() {
         obj.insert("queue_size".to_string(), json!(prefill_queue_size));
@@ -119,7 +146,7 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
             crate::api_auth::ApiAuthPolicy::Required => "required",
         }
     };
-    Json(json!({
+    json!({
         "status": status,
         "worker_alive": worker_alive,
         "version": hipfire_build_info::VERSION,
@@ -130,6 +157,7 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         "diffusion": diffusion,
         "pid": std::process::id(),
         "scheduler_resources": scheduler_resources,
+        "daemon_scheduler": daemon_scheduler,
         "work_scheduler": json!({
             "queued": work_snapshot.queued,
             "active_batches": work_snapshot.active_batches,
@@ -147,8 +175,8 @@ pub async fn get_health(state: State<SharedState>) -> Json<Value> {
         "state_cache": server_state_cache_health_json(&scheduler_env),
         "deferred_jobs": crate::deferred_jobs::deferred_jobs_health_json(),
         "runtime_workers": runtime_workers,
-        "batches": batch_health_payload(&state).await,
-    }))
+        "batches": batch_health_payload(state).await,
+    })
 }
 
 async fn diffusion_health_payload(state: &SharedState) -> Value {
@@ -192,6 +220,28 @@ fn diffusion_active_model(diffusion: &Value) -> Option<String> {
 
 fn scheduler_env_from_process() -> SchedulerPolicyEnv {
     SchedulerPolicyEnv::from_pairs(env::vars())
+}
+
+/// Read the daemon's scheduler counters, or say why they are unavailable.
+///
+/// `/health` must answer even when the daemon is absent or busy, so a failure here
+/// reports itself rather than propagating: an unreachable daemon is a fact about
+/// the system worth showing, not a reason for the endpoint to fail.
+async fn daemon_scheduler_health_payload(state: &SharedState) -> serde_json::Value {
+    let mut engine = state.engine.lock().await;
+    let Some(engine) = engine.as_mut() else {
+        return json!({ "available": false, "reason": "daemon not running" });
+    };
+    match engine.scheduler_status().await {
+        Ok(mut status) => {
+            if let Some(obj) = status.as_object_mut() {
+                obj.remove("type");
+                obj.insert("available".to_string(), json!(true));
+            }
+            status
+        }
+        Err(error) => json!({ "available": false, "reason": error.to_string() }),
+    }
 }
 
 async fn scheduler_resource_health_payload(state: &SharedState) -> serde_json::Value {

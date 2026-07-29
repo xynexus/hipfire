@@ -14,7 +14,6 @@
 //! Extracted verbatim from the former `main.rs` monolith (no behavior change);
 //! items called from `main.rs` are `pub`.
 
-use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
@@ -71,7 +70,7 @@ use hipfire_specdecode::SpecMetrics;
 pub fn generate_mtp(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
@@ -320,7 +319,7 @@ pub fn generate_mtp(
 
         // Helper closure semantics inlined: stream one committed token, return
         // (hit_eos, think_cap_hit).
-        let emit_token = |stdout: &mut std::io::Stdout,
+        let emit_token = |stdout: &mut dyn std::io::Write,
                           tok: u32,
                           streamed_tokens: &mut Vec<u32>,
                           bytes_fed_to_filter: &mut usize,
@@ -496,7 +495,7 @@ pub fn generate_mtp(
 pub fn generate_dflash(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
@@ -1177,7 +1176,7 @@ pub fn generate_multi(
     gpu: &mut hipfire_rdna::Gpu,
     pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
     pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
@@ -1883,7 +1882,7 @@ pub fn generate(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
     drafter_gpu: Option<&mut hipfire_rdna::Gpu>,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,

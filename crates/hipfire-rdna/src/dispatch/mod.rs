@@ -430,6 +430,11 @@ pub struct Gpu {
     pub mq_signs1_128: Option<GpuTensor>,
     pub mq_signs2_128: Option<GpuTensor>,
     pub mq_x_rot: Option<GpuTensor>, // scratch for rotated x, sized to max K
+    /// Memoized cooperative grid (blocks) for the ZAYA decode megakernels, sized
+    /// once each to the device residency limit (occupancy/MP × MP count). See
+    /// `zaya_decode_megakernel_b` / `zaya_decode_megakernel_a`.
+    pub zaya_megakernel_grid: Option<u32>,
+    pub zaya_megakernel_a_grid: Option<u32>,
     // Opus Quant W4A4 persistent decode scratch (B=1). Hoisted out of the
     // per-projection dispatch so the forward issues ZERO hipMalloc/hipFree inside
     // the (future) hipGraph-captured region — per-call alloc would trip
@@ -847,6 +852,8 @@ impl Gpu {
             mq_signs1_128: None,
             mq_signs2_128: None,
             mq_x_rot: None,
+            zaya_megakernel_grid: None,
+            zaya_megakernel_a_grid: None,
             oq4_xq: None,
             oq4_xs: None,
             oq4_xr: None,
@@ -1946,6 +1953,18 @@ impl Gpu {
     /// In-place constant fill of an existing F32 tensor (sync htod).
     pub fn fill_f32(&mut self, tensor: &GpuTensor, value: f32) -> HipResult<()> {
         self.bind_thread()?;
+        // Zero fast-path: a device memset is capture-safe (no host→device copy on
+        // the legacy stream) and routes to the active stream under graph capture.
+        if value == 0.0 {
+            match self.active_stream.as_ref() {
+                Some(stream) => {
+                    self.hip
+                        .memset_async(&tensor.buf, 0, tensor.byte_size(), stream)?
+                }
+                None => self.hip.memset(&tensor.buf, 0, tensor.byte_size())?,
+            }
+            return Ok(());
+        }
         let data = vec![value; tensor.numel()];
         let bytes =
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };

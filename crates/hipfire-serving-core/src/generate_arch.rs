@@ -11,7 +11,6 @@
 //! `main.rs` for now. Extracted verbatim from the former `main.rs` monolith (no
 //! behavior change); items called from `main.rs` are `pub`.
 
-use std::io::Write;
 use std::time::Instant;
 
 use hipfire_arch_deepseek4 as deepseek4;
@@ -41,7 +40,7 @@ use hipfire_specdecode_dspark::spec::PrefillOutcome;
 pub fn generate_registered_backend(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
@@ -201,7 +200,7 @@ pub fn generate_registered_backend(
 pub fn generate_deepseek4(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
@@ -1058,7 +1057,14 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             }
         };
 
-        while generated_count < max_tokens && next_tok != eos_tok {
+        // deepseek4 streams through `emit_stream_event` and drives its own loop, so
+        // it reaches neither of the other cancellation points — the arch-generic
+        // `decode_loop_*` nor `emit_filter_action`. Without this check an `abort`
+        // against a deepseek4 generation would be accepted and then ignored.
+        while generated_count < max_tokens
+            && next_tok != eos_tok
+            && !hipfire_runtime::cancel::is_cancelled(id)
+        {
             let frag = tokenizer.decode(&[next_tok]);
             for ev in parser.feed(&frag) {
                 absorb_event(&ev);
@@ -1279,7 +1285,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
 pub fn generate_nemotron(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
@@ -1456,7 +1462,7 @@ pub fn generate_nemotron(
 pub fn generate_zaya(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
@@ -1680,7 +1686,7 @@ fn tool_grammar_for(
 pub fn generate_llama(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
@@ -2047,7 +2053,7 @@ pub fn generate_llama(
 pub fn generate_minimax(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
@@ -2322,7 +2328,7 @@ pub fn generate_minimax(
 pub fn generate_lfm2moe(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
@@ -2702,7 +2708,7 @@ pub fn generate_lfm2moe(
 fn generate_lfm2moe_dflash(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
@@ -2998,7 +3004,7 @@ fn generate_lfm2moe_dflash(
         return;
     }
 
-    let emit_token = |stdout: &mut std::io::Stdout,
+    let emit_token = |stdout: &mut dyn std::io::Write,
                       id: &str,
                       token: u32,
                       ordinal: usize,
@@ -3202,7 +3208,7 @@ pub fn framed_qwen35_prompt(
 pub fn generate_gemma3(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,
@@ -3296,7 +3302,7 @@ pub fn generate_gemma3(
 pub fn generate_gemma3_vl_text(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     id: &str,
     prompt: &str,
     system_prompt: Option<&str>,

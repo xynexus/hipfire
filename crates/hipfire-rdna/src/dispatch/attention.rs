@@ -82,10 +82,12 @@ impl Gpu {
         max_seq: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // gfx1103 (Phoenix): no-LDS flash-decode variant (one wave32/head,
-        // register online softmax) removes the scores[seq_len] LDS ceiling.
-        let use_gfx1103 = self.arch_caps.is_gfx1103() && head_dim % 32 == 0;
-        let (module, src, kname) = if use_gfx1103 {
+        // gfx1103 (Phoenix): no-LDS flash-decode (register online softmax, small
+        // LDS budget). Other archs use the fast LDS kernel; under graph capture its
+        // shared mem is sized by a FIXED cap (see below) so it stays position-
+        // independent and bakeable, instead of the max_seq sizing that overflows.
+        let use_no_lds = self.arch_caps.is_gfx1103() && head_dim % 32 == 0;
+        let (module, src, kname) = if use_no_lds {
             (
                 "attention_f32_gfx1103",
                 kernels::ATTENTION_F32_GFX1103_SRC,
@@ -122,13 +124,17 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
         ];
 
-        // When a stream is active (graph capture mode), use max_seq for shared mem
-        // so the captured graph works for all sequence lengths.
-        let (block_size, shared_mem) = if use_gfx1103 {
+        // Under graph mode (active stream / capture) size the scores LDS by a FIXED
+        // cap so shared mem is constant and bakeable — correct for seq_len <= cap.
+        // 8192 → ~33KB LDS (fits the 64KB budget); callers that may exceed it must
+        // gate graph use on pos < cap (see zaya `GRAPH_CTX_CAP`). Non-graph paths
+        // keep the exact seq_len_hint sizing.
+        const GRAPH_CTX_CAP: usize = 8192;
+        let (block_size, shared_mem) = if use_no_lds {
             (32u32, 0u32)
         } else {
             let effective_seq = if self.active_stream.is_some() {
-                max_seq
+                GRAPH_CTX_CAP.min(max_seq)
             } else {
                 seq_len_hint
             };

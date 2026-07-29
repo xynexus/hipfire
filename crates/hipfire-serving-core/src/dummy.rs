@@ -8,7 +8,6 @@
 //! (no behavior change); items are `pub`.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::time::Instant;
 
 use hipfire_generate::{GenerateBatchPrefillEnvelope, GenerateBatchPrefillSession};
@@ -73,7 +72,7 @@ impl DummyModelState {
     /// configurable delay) so clients can be exercised GPU-free.
     pub fn generate(
         &mut self,
-        stdout: &mut std::io::Stdout,
+        stdout: &mut dyn std::io::Write,
         id: &str,
         session_id: &str,
         prompt: &str,
@@ -152,7 +151,7 @@ fn dummy_generate_delay_ms() -> u64 {
 /// Emit the `generate_batch_prefill_ready` capability envelope advertising the
 /// dummy backend can serve a batch-prefill request.
 pub fn emit_dummy_generate_batch_prefill_ready(
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchPrefillEnvelope,
 ) {
     let line = serde_json::json!({
@@ -175,7 +174,7 @@ pub fn emit_dummy_generate_batch_prefill_ready(
 /// protocol shape the real backends produce, GPU-free.
 pub fn run_generate_batch_prefill_dummy(
     dummy: &mut DummyModelState,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchPrefillEnvelope,
 ) -> Result<(), String> {
     let delay_ms = dummy_prefill_delay_ms();

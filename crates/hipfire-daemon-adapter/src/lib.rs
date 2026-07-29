@@ -5,7 +5,8 @@
 //! Async daemon JSONL process adapter.
 
 pub use hipfire_daemon_protocol::{
-    EmbedRequest, EmbeddingVector, RerankRequest, RerankResult, SteerApplyRequest,
+    EmbedRequest, EmbeddingVector, RerankRequest, RerankResult, SetResourceBudgetRequest,
+    SteerApplyRequest,
 };
 /// Re-exported so resource-lock status consumers (admin API, TUI) can match the
 /// live flock state without a direct `hipfire-lock` dependency.
@@ -284,6 +285,92 @@ impl DaemonTransport for StdioTransport {
     }
 }
 
+/// A connection to an ALREADY-RUNNING daemon over its unix socket.
+///
+/// The counterpart to [`StdioTransport`], which spawns a private daemon and owns
+/// its pipes. The distinction matters because exactly one daemon may run per
+/// machine — it holds an exclusive flock on `~/.hipfire/daemon.pid` — so every
+/// caller that spawns is a caller that cannot coexist with `hipfire serve`.
+/// Attaching is what lets them share the one daemon instead of competing for it.
+///
+/// Read and write use the two halves of the same stream, so a reply can be read
+/// while a request is in flight, exactly as the piped-stdio pair allowed.
+struct SocketTransport {
+    write: tokio::io::BufWriter<tokio::net::unix::OwnedWriteHalf>,
+    read: BufReader<tokio::net::unix::OwnedReadHalf>,
+}
+
+impl SocketTransport {
+    async fn connect(path: &Path) -> anyhow::Result<Self> {
+        let stream = tokio::net::UnixStream::connect(path).await.map_err(|e| {
+            anyhow::anyhow!("failed to connect to daemon socket {}: {e}", path.display())
+        })?;
+        let (read, write) = stream.into_split();
+        Ok(Self {
+            write: tokio::io::BufWriter::new(write),
+            read: BufReader::new(read),
+        })
+    }
+}
+
+impl DaemonTransport for SocketTransport {
+    #[cfg(test)]
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn send_json<'a>(&'a mut self, req: &'a DaemonRequest) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let line = serde_json::to_string(req)?;
+            debug!("> {line}");
+            self.write.write_all(line.as_bytes()).await?;
+            self.write.write_all(b"\n").await?;
+            self.write.flush().await?;
+            Ok(())
+        })
+    }
+
+    fn send_value<'a>(
+        &'a mut self,
+        value: &'a serde_json::Value,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let line = serde_json::to_string(value)?;
+            debug!("> {line}");
+            self.write.write_all(line.as_bytes()).await?;
+            self.write.write_all(b"\n").await?;
+            self.write.flush().await?;
+            Ok(())
+        })
+    }
+
+    fn recv_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<DaemonResponse>> {
+        Box::pin(async move {
+            let mut line = String::new();
+            self.read.read_line(&mut line).await?;
+            if line.is_empty() {
+                anyhow::bail!("daemon socket closed unexpectedly");
+            }
+            let line = line.trim_end();
+            debug!("< {line}");
+            Ok(serde_json::from_str(line)?)
+        })
+    }
+}
+
+/// Where a listening daemon puts its socket. Beside `daemon.pid`, whose flock is
+/// what makes the daemon a singleton — this is the door to that one daemon.
+///
+/// Defined here rather than in the daemon binary so both ends agree on the path
+/// by construction; the daemon depends on this crate.
+pub fn default_socket_path() -> PathBuf {
+    #[cfg(unix)]
+    let home = std::env::var("HOME").unwrap_or_default();
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    PathBuf::from(home).join(".hipfire").join("daemon.sock")
+}
+
 pub struct DaemonEngine {
     transport: Box<dyn DaemonTransport>,
     pub worker_key_id: Option<String>,
@@ -307,6 +394,14 @@ pub enum GenerateStreamControl {
 }
 
 impl DaemonEngine {
+    /// Start a PRIVATE daemon and own it. The daemon dies with this process.
+    ///
+    /// Use this only when the caller genuinely needs its own daemon — most often
+    /// because it just built the binary and must exercise *that* build (gates,
+    /// benches, evals). For anything that should share the machine's one daemon,
+    /// prefer [`attach_or_spawn`](Self::attach_or_spawn): only one daemon can hold
+    /// the `daemon.pid` flock, so a second `spawn` while `hipfire serve` is up
+    /// fails outright rather than queueing.
     pub async fn spawn(bin: &Path) -> anyhow::Result<Self> {
         let transport = StdioTransport::spawn(bin).await?;
         Ok(Self {
@@ -320,6 +415,81 @@ impl DaemonEngine {
     /// server reports `degraded` instead of `ok` when the worker has crashed.
     pub fn worker_alive(&mut self) -> bool {
         self.transport.is_worker_alive()
+    }
+
+    /// Ask the daemon what its scheduler has done.
+    ///
+    /// These counters only exist inside the daemon: reply ordering observed by a
+    /// client reflects socket races rather than service order, so scheduling
+    /// behaviour cannot be reconstructed from outside.
+    pub async fn scheduler_status(&mut self) -> anyhow::Result<serde_json::Value> {
+        self.send(&DaemonRequest::SchedulerStatus).await?;
+        match self.transport.recv_response().await? {
+            DaemonResponse::SchedulerStatus(status) => Ok(status),
+            DaemonResponse::Error(e) => anyhow::bail!("scheduler_status: {}", e.message),
+            other => anyhow::bail!("scheduler_status: unexpected response {other:?}"),
+        }
+    }
+
+    /// Push memory budgets to the daemon and get the resulting reservation back.
+    ///
+    /// This is what makes attaching viable for a caller that would otherwise have
+    /// configured the daemon by spawning it with an environment: budgets are the
+    /// part of that configuration which is not fixed at exec. Device selection and
+    /// resource locking are — the daemon consumed them before HIP init and before
+    /// taking its flocks — so an attaching caller accepts those as the daemon's.
+    pub async fn set_resource_budget(
+        &mut self,
+        req: SetResourceBudgetRequest,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.send(&DaemonRequest::SetResourceBudget(req)).await?;
+        match self.transport.recv_response().await? {
+            DaemonResponse::ResourceStatus(status) => Ok(status),
+            DaemonResponse::Error(e) => anyhow::bail!("set_resource_budget: {}", e.message),
+            other => anyhow::bail!("set_resource_budget: unexpected response {other:?}"),
+        }
+    }
+
+    /// Attach to the daemon already listening on `path`.
+    ///
+    /// Fails if nothing is listening; callers that should work either way want
+    /// [`attach_or_spawn`](Self::attach_or_spawn).
+    pub async fn connect(path: &Path) -> anyhow::Result<Self> {
+        let transport = SocketTransport::connect(path).await?;
+        Ok(Self {
+            transport: Box::new(transport),
+            worker_key_id: None,
+        })
+    }
+
+    /// Share the running daemon if there is one, otherwise start a private one.
+    ///
+    /// This is the right default for anything user-facing. Before it existed,
+    /// `hipfire chat` spawned its own daemon, which tried to take the same
+    /// exclusive flock on `~/.hipfire/daemon.pid` that a running `hipfire serve`
+    /// already held — so chatting while serving simply failed. Attaching makes the
+    /// two coexist, and reuses the model the daemon already has resident instead
+    /// of loading a second copy.
+    ///
+    /// The fallback is deliberate rather than an error path: with no daemon
+    /// running there is nothing to share, and spawning is exactly the old
+    /// behaviour. A connect failure for any other reason (stale socket file,
+    /// permissions) also falls through to spawning, which then fails loudly on the
+    /// flock if a daemon really is alive — a clearer error than a connect refusal.
+    pub async fn attach_or_spawn(bin: &Path) -> anyhow::Result<Self> {
+        let socket = default_socket_path();
+        if socket.exists() {
+            match Self::connect(&socket).await {
+                Ok(engine) => {
+                    debug!("attached to running daemon at {}", socket.display());
+                    return Ok(engine);
+                }
+                Err(error) => {
+                    debug!("socket present but not connectable ({error}); spawning instead");
+                }
+            }
+        }
+        Self::spawn(bin).await
     }
 
     async fn send(&mut self, req: &DaemonRequest) -> anyhow::Result<()> {

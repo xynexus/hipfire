@@ -8,7 +8,7 @@
 
 use super::contracts::{
     CalibError, CaptureId, CapturePolicy, CaptureRegistry, ExpertCaptureRole, ExpertTelemetry,
-    ProjectionRole,
+    ProjectionRole, RoutedRowContext,
 };
 use super::CalibCollector;
 use crate::moe::grouped::GroupedMoeRoutingPlan;
@@ -240,7 +240,17 @@ impl GroupedMoeCalibrationCapture {
                         staging,
                         pending,
                     } = &mut *state;
-                    record_grouped_router_batch(telemetry, batch.layer, &routing, &route_weights)?;
+                    // No token profile on this seam: the dispatch-level routed
+                    // capture callback sees only router indices/weights, not the
+                    // corpus token behind each row. Threading tokens through the
+                    // grouped-MoE callback is a follow-on for the batched families.
+                    record_grouped_router_batch(
+                        telemetry,
+                        batch.layer,
+                        &routing,
+                        &route_weights,
+                        None,
+                    )?;
                     let plan = plan_grouped_expert_capture(
                         telemetry,
                         staging,
@@ -528,12 +538,25 @@ impl ExpertCaptureStaging {
     }
 }
 
+/// `tokens`, when supplied, must hold one corpus token id per routed row in
+/// `routing` order; it turns on the per-expert token profile. A grouped routing
+/// plan is shape-only, so callers that have lost the token pass `None`.
 pub fn record_grouped_router_batch(
     telemetry: &mut ExpertTelemetry,
     layer: usize,
     routing: &GroupedMoeRoutingPlan,
     route_weights: &[f32],
+    tokens: Option<&[u32]>,
 ) -> Result<(), CalibError> {
+    if let Some(tokens) = tokens {
+        if tokens.len() != routing.rows {
+            return Err(CalibError::InvalidRouting(format!(
+                "layer {layer} token profile has {} ids for {} routed rows",
+                tokens.len(),
+                routing.rows
+            )));
+        }
+    }
     validate_batch_contract(telemetry, None, layer, routing, route_weights)?;
     telemetry.record_grouped_batch_shape(
         layer,
@@ -546,6 +569,10 @@ pub fn record_grouped_router_batch(
         let start = row * routing.k_top;
         telemetry.record_router_selection(
             layer,
+            RoutedRowContext {
+                token: tokens.map(|tokens| tokens[row]),
+                stratum: None,
+            },
             &indices[start..start + routing.k_top],
             &route_weights[start..start + routing.k_top],
         )?;
@@ -796,7 +823,7 @@ mod tests {
         let mut staging = ExpertCaptureStaging::new(1, 1, 2).unwrap();
 
         let first = GroupedMoeRoutingPlan::build(&[0, 0, 0], 3, 1, 1).unwrap();
-        record_grouped_router_batch(&mut telemetry, 0, &first, &[1.0; 3]).unwrap();
+        record_grouped_router_batch(&mut telemetry, 0, &first, &[1.0; 3], None).unwrap();
         let first_capture = plan_grouped_expert_capture(
             &mut telemetry,
             &mut staging,
@@ -821,7 +848,7 @@ mod tests {
         );
 
         let second = GroupedMoeRoutingPlan::build(&[0, 0, 0], 3, 1, 1).unwrap();
-        record_grouped_router_batch(&mut telemetry, 0, &second, &[0.5; 3]).unwrap();
+        record_grouped_router_batch(&mut telemetry, 0, &second, &[0.5; 3], None).unwrap();
         let second_capture = plan_grouped_expert_capture(
             &mut telemetry,
             &mut staging,
@@ -868,7 +895,7 @@ mod tests {
         let mut telemetry = ExpertTelemetry::new(1, 1, 1, quota(2, 3, 2), 8).unwrap();
         let mut staging = ExpertCaptureStaging::new(1, 1, 2).unwrap();
         let routing = GroupedMoeRoutingPlan::build(&[0, 0, 0, 0, 0, 0], 6, 1, 1).unwrap();
-        record_grouped_router_batch(&mut telemetry, 0, &routing, &[1.0; 6]).unwrap();
+        record_grouped_router_batch(&mut telemetry, 0, &routing, &[1.0; 6], None).unwrap();
 
         let capture = plan_grouped_expert_capture(
             &mut telemetry,
@@ -912,7 +939,7 @@ mod tests {
         let mut telemetry = ExpertTelemetry::new(1, 1, 1, quota(2, 4, 2), 8).unwrap();
         let mut staging = ExpertCaptureStaging::new(1, 1, 2).unwrap();
         let routing = GroupedMoeRoutingPlan::build(&[0, 0, 0], 3, 1, 1).unwrap();
-        record_grouped_router_batch(&mut telemetry, 0, &routing, &[1.0; 3]).unwrap();
+        record_grouped_router_batch(&mut telemetry, 0, &routing, &[1.0; 3], None).unwrap();
         for role in [ExpertCaptureRole::GateUpInput, ExpertCaptureRole::DownInput] {
             plan_grouped_expert_capture(&mut telemetry, &mut staging, 0, role, &routing, &[1.0; 3])
                 .unwrap();
@@ -977,7 +1004,7 @@ mod tests {
         let routing = GroupedMoeRoutingPlan::build(&routes, 2, 10, 16).unwrap();
         let mut telemetry = ExpertTelemetry::new(1, 16, 10, quota(1, 4, 2), 16).unwrap();
         let mut staging = ExpertCaptureStaging::new(1, 16, 2).unwrap();
-        record_grouped_router_batch(&mut telemetry, 0, &routing, &[0.1; 20]).unwrap();
+        record_grouped_router_batch(&mut telemetry, 0, &routing, &[0.1; 20], None).unwrap();
 
         let gate = plan_grouped_expert_capture(
             &mut telemetry,

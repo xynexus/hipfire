@@ -7,6 +7,7 @@
 use crate::hfq_modules::{parse_module_table, validate_modules, HfqModuleRecord};
 use crate::llama::{LlamaConfig, LlamaWeights, ModelArch};
 use crate::quant::f16_to_f32;
+use crate::safetensors_source::SafetensorsSource;
 use crate::weights::{EmbeddingFormat, LayerWeights, WeightTensor};
 use hip_bridge::{HipError, HipResult};
 use hipfire_model::{ModelSource, QuantConfig, TensorInfo};
@@ -633,6 +634,65 @@ pub struct HfqTensorInfo {
     pub data_size: usize,
 }
 
+/// Map a safetensors dtype string to the HFQ `QuantType` byte used for
+/// unquantized source tensors (bf16=16, f16=1, f32=2), matching what
+/// `hipfire-quantize --format bf16` stamps. Returns `None` for dtypes
+/// `HfqFile::from_safetensors` does not pass through (pre-quantized / fp8).
+fn map_safetensors_dtype(dtype: &str) -> Option<u8> {
+    match dtype {
+        "BF16" | "bfloat16" => Some(16),
+        "F16" | "float16" => Some(1),
+        "F32" | "float32" => Some(2),
+        _ => None,
+    }
+}
+
+/// Byte width of a supported safetensors float dtype.
+fn dtype_byte_width(dtype: &str) -> Option<usize> {
+    match dtype {
+        "BF16" | "bfloat16" | "F16" | "float16" => Some(2),
+        "F32" | "float32" => Some(4),
+        _ => None,
+    }
+}
+
+/// Fold a safetensors directory's tokenizer sidecars into HFQ-style metadata so
+/// an `HfqFile::from_safetensors` model is self-describing exactly like a real
+/// `.hfq` (whose quantizer embeds these at convert time). A real `.hfq` carries
+/// the tokenizer inline; a raw safetensors `metadata_json` (just
+/// `{architecture, config}`) does not, so the tokenizer/chat/eos consumers
+/// (`hfq_tokenizer_metadata`, `from_hfq_metadata`, `hfq_chat_template`) would
+/// otherwise fail. Embeds, when present and not already set:
+/// - `"tokenizer"`: raw `tokenizer.json` text (as a JSON string);
+/// - `"tokenizer_config"`: parsed `tokenizer_config.json` (chat_template);
+/// - `"generation_config"`: parsed `generation_config.json` (authoritative
+///   bos/eos ids). Missing sidecars are simply skipped.
+fn embed_tokenizer_metadata(base: &str, dir: &Path) -> String {
+    let mut meta: serde_json::Value =
+        serde_json::from_str(base).unwrap_or_else(|_| serde_json::json!({}));
+    let Some(obj) = meta.as_object_mut() else {
+        return base.to_string();
+    };
+    if !obj.contains_key("tokenizer") {
+        if let Ok(s) = std::fs::read_to_string(dir.join("tokenizer.json")) {
+            obj.insert("tokenizer".to_string(), serde_json::Value::String(s));
+        }
+    }
+    for (file, key) in [
+        ("tokenizer_config.json", "tokenizer_config"),
+        ("generation_config.json", "generation_config"),
+    ] {
+        if !obj.contains_key(key) {
+            if let Ok(s) = std::fs::read_to_string(dir.join(file)) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                    obj.insert(key.to_string(), v);
+                }
+            }
+        }
+    }
+    serde_json::to_string(&meta).unwrap_or_else(|_| base.to_string())
+}
+
 pub struct HfqFile {
     _file: File,
     /// Path used to open the file. Exposed via [`Self::path`] so the
@@ -658,6 +718,22 @@ pub struct HfqFile {
     pread_buf: std::cell::RefCell<Vec<u8>>,
     pub version: u32,
     modules: Vec<HfqModuleRecord>,
+    /// Present only for [`Self::from_safetensors`]: owns the mmapped safetensors
+    /// shards that back tensor reads. When set, the byte accessors serve from
+    /// these shard mmaps (indexed via `st_locs`) instead of `self.mmap`/
+    /// `self._file`, and `drop_mmap` is a no-op — the shard mmaps are the only
+    /// resident copy of the weights.
+    st_source: Option<SafetensorsSource>,
+    /// Parallel to `tensors`: the physical `(shard, offset, len)` of each
+    /// tensor's bytes within `st_source`. Empty for file-backed HFQM opens.
+    st_locs: Vec<StLoc>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StLoc {
+    shard: usize,
+    offset: usize,
+    len: usize,
 }
 
 impl HfqFile {
@@ -729,6 +805,8 @@ impl HfqFile {
             pread_buf: std::cell::RefCell::new(Vec::new()),
             version,
             modules,
+            st_source: None,
+            st_locs: Vec::new(),
         })
     }
 
@@ -835,6 +913,130 @@ impl HfqFile {
             pread_buf: std::cell::RefCell::new(Vec::new()),
             version,
             modules,
+            st_source: None,
+            st_locs: Vec::new(),
+        })
+    }
+
+    /// Build an in-memory `HfqFile` directly over a HuggingFace safetensors
+    /// directory — no intermediate bf16 `.hfq` written to disk. This lets the
+    /// resident calibration path (`collect_artifacts`) and any `&HfqFile`
+    /// arch loader consume a raw HF checkpoint exactly as it consumes a bf16
+    /// `.hfq`.
+    ///
+    /// The presentation matches what `hipfire-quantize --format bf16` writes,
+    /// so the arch weight loaders need no changes:
+    /// - dense tensor names are the raw HF safetensors keys (no ggml rename);
+    /// - dtype is passed through, tagged with the matching `QuantType` byte
+    ///   (bf16→16, f16→1, f32→2), bytes verbatim (no numeric conversion);
+    /// - stacked routed-expert tensors (`...experts.gate_up_proj` /
+    ///   `...experts.down_proj`, stored 3D as `[num_experts, …]`) are split
+    ///   into the per-expert 2D `...experts.{x}.{proj}.weight` tensors the MoE
+    ///   loaders request; the fused gate_up projection stays fused.
+    ///
+    /// Only float source dtypes (BF16/F16/F32) are handled; a pre-quantized HF
+    /// checkpoint (GPTQ/AWQ/FP8) errors rather than mis-tagging its bytes.
+    pub fn from_safetensors(dir: &Path) -> std::io::Result<Self> {
+        let source = SafetensorsSource::open(dir)?;
+
+        let mut tensors: Vec<HfqTensorInfo> = Vec::new();
+        let mut tensor_map: HashMap<String, usize> = HashMap::new();
+        let mut st_locs: Vec<StLoc> = Vec::new();
+
+        // Deterministic order (HashMap iteration is not) for reproducible logs
+        // and to avoid any latent index-order dependence in scan-style callers.
+        let mut layout = source.tensor_layout();
+        layout.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (name, shard, offset, len, dtype, shape) in layout {
+            let qt = map_safetensors_dtype(&dtype).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: tensor {name} has unsupported dtype {dtype:?} \
+                         (from_safetensors handles bf16/f16/f32 source only)",
+                        dir.display()
+                    ),
+                )
+            })?;
+            let esz = dtype_byte_width(&dtype).expect("dtype width known when qt mapped");
+
+            // Stacked routed-expert weights: 3D `[E, …]` parents named
+            // `....experts.<proj>` with no `.weight` suffix. Split into the
+            // per-expert 2D tensors the MoE loaders request. Each expert slice
+            // is a contiguous sub-range of the parent's row-major bytes.
+            let is_stacked_expert =
+                shape.len() == 3 && name.contains(".experts.") && !name.ends_with(".weight");
+            if is_stacked_expert {
+                let (head, tail) = name.split_once(".experts.").expect("`.experts.` present");
+                let n_experts = shape[0];
+                let per_elems: usize = shape[1..].iter().product();
+                let per_len = per_elems * esz;
+                if per_len == 0 || per_len.checked_mul(n_experts) != Some(len) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "{}: stacked expert {name} shape {shape:?} dtype {dtype:?} \
+                             does not match stored byte length {len}",
+                            dir.display()
+                        ),
+                    ));
+                }
+                let child_shape: Vec<u32> = shape[1..].iter().map(|&d| d as u32).collect();
+                for x in 0..n_experts {
+                    let child = format!("{head}.experts.{x}.{tail}.weight");
+                    let idx = tensors.len();
+                    tensors.push(HfqTensorInfo {
+                        name: child.clone(),
+                        quant_type: qt,
+                        shape: child_shape.clone(),
+                        group_size: 0,
+                        data_offset: 0, // unused: st-backed reads come from st_locs
+                        data_size: per_len,
+                    });
+                    tensor_map.insert(child, idx);
+                    st_locs.push(StLoc {
+                        shard,
+                        offset: offset + x * per_len,
+                        len: per_len,
+                    });
+                }
+            } else {
+                let idx = tensors.len();
+                tensors.push(HfqTensorInfo {
+                    name: name.clone(),
+                    quant_type: qt,
+                    shape: shape.iter().map(|&d| d as u32).collect(),
+                    group_size: 0,
+                    data_offset: 0, // unused: st-backed reads come from st_locs
+                    data_size: len,
+                });
+                tensor_map.insert(name, idx);
+                st_locs.push(StLoc { shard, offset, len });
+            }
+        }
+
+        let arch_id = source.arch_id();
+        // Embed tokenizer/chat/generation sidecars so the model is
+        // self-describing like a real `.hfq` (config stays under "config").
+        let metadata_json = embed_tokenizer_metadata(source.metadata_json(), dir);
+        // A real fd for the `_file` field. The safetensors byte path never
+        // reads it (bytes come from the shard mmaps), and drop_mmap()
+        // short-circuits for st-backed files, so config.json is a safe handle.
+        let file = File::open(dir.join("config.json"))?;
+        Ok(Self {
+            _file: file,
+            path: dir.to_path_buf(),
+            mmap: None,
+            arch_id,
+            metadata_json,
+            tensors,
+            tensor_map,
+            pread_buf: std::cell::RefCell::new(Vec::new()),
+            version: HFQM_VERSION,
+            modules: Vec::new(),
+            st_source: Some(source),
+            st_locs,
         })
     }
 
@@ -850,6 +1052,11 @@ impl HfqFile {
     /// On discrete-GPU systems this is unnecessary (GPU VRAM is separate),
     /// so callers should only invoke this when UMA is detected.
     pub fn drop_mmap(&mut self) {
+        if self.st_source.is_some() {
+            // Safetensors-backed: the shard mmaps ARE the only resident copy of
+            // the weights; there is no separate HFQM mmap to drop.
+            return;
+        }
         self.mmap = None;
         // Cancel any in-flight readahead triggered by the Sequential advice at open
         // time. On UMA systems the slab loader opens an O_DIRECT fd immediately after
@@ -959,6 +1166,10 @@ impl HfqFile {
     pub fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
+        if let Some(source) = &self.st_source {
+            let loc = self.st_locs[idx];
+            return Some((info, source.shard_bytes(loc.shard, loc.offset, loc.len)?));
+        }
         debug_assert!(
             self.mmap.is_some(),
             "tensor_data() called after drop_mmap() — use tensor_data_vec() or tensor_data_pread() instead (tensor: {name})"
@@ -985,6 +1196,16 @@ impl HfqFile {
         use std::os::unix::io::AsRawFd;
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
+        if let Some(source) = &self.st_source {
+            let loc = self.st_locs[idx];
+            let bytes = source.shard_bytes(loc.shard, loc.offset, loc.len)?;
+            {
+                let mut buf = self.pread_buf.borrow_mut();
+                buf.clear();
+                buf.extend_from_slice(bytes);
+            }
+            return Some((info, self.pread_buf.borrow()));
+        }
         let fd = self._file.as_raw_fd();
         {
             let mut buf = self.pread_buf.borrow_mut();
@@ -1024,6 +1245,12 @@ impl HfqFile {
     pub fn tensor_data_vec(&self, name: &str) -> Option<(&HfqTensorInfo, Vec<u8>)> {
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
+
+        if let Some(source) = &self.st_source {
+            let loc = self.st_locs[idx];
+            let bytes = source.shard_bytes(loc.shard, loc.offset, loc.len)?;
+            return Some((info, bytes.to_vec()));
+        }
 
         #[cfg(unix)]
         {
@@ -1077,6 +1304,11 @@ impl HfqFile {
     /// whose name contains `prefix.` (e.g. "layers.5.").
     #[allow(dead_code)]
     pub fn layer_data_range(&self, prefix: &str) -> Option<(usize, usize)> {
+        if self.st_source.is_some() {
+            // st-backed tensors have no single-file byte range (data_offset is
+            // unused); the shard fadvise hint this feeds does not apply.
+            return None;
+        }
         let needle = format!("{prefix}.");
         let mut lo = usize::MAX;
         let mut hi = 0usize;
@@ -1116,20 +1348,33 @@ impl HfqFile {
         &self.tensors
     }
 
+    /// Whether this file supports the `O_DIRECT` GPU slab loader. True for a
+    /// real file-backed HFQM; false for a safetensors-backed in-memory file
+    /// (`from_safetensors`), whose bytes are spread across shards with no
+    /// single `O_DIRECT`-openable path and unused `data_offset`s. Such callers
+    /// fall back to the per-tensor `tensor_data_vec` path, which serves from
+    /// the shard mmaps.
+    pub fn supports_slab_load(&self) -> bool {
+        self.st_source.is_none()
+    }
+
     pub fn modules(&self) -> &[HfqModuleRecord] {
         &self.modules
     }
 }
 
-/// `base_offset` is the byte offset of the HFQM container within the host file: 0
-/// for a standalone `.hfq`, non-zero for one embedded after a base container.
-/// `metadata_offset` and `data_offset` arrive already rebased by it; v2's
-/// per-tensor offsets are stored container-relative and are rebased here.
+/// Parse the metadata+index block of one HFQM container.
+///
+/// `base` is the container's start within the file — nonzero for a container
+/// embedded in another file (a bundled LoRA or MTP head). `metadata_offset` and
+/// `data_offset` arrive already rebased by it; `base` is needed here because a
+/// v2 index stores each tensor's offset relative to the container, so it has to
+/// be rebased the same way. `base` is 0 for a standalone file.
 fn parse_hfqm_meta_index(
     meta_index: &[u8],
     metadata_offset: usize,
     data_offset: usize,
-    base_offset: usize,
+    base: usize,
     n_tensors: usize,
     file_len: usize,
     version: u32,
@@ -1207,27 +1452,26 @@ fn parse_hfqm_meta_index(
             let offset_div32 =
                 u64::from_le_bytes(meta_index[pos..pos + 8].try_into().unwrap()) as usize;
             pos += 8;
-            // v2 stores each tensor's offset relative to the CONTAINER start, so it
-            // must be rebased for an embedded container the same way the header's
-            // metadata/data offsets already were by the caller. v1 needs no rebase:
-            // it accumulates from `data_offset`, which arrives absolute. Missing this
-            // made every embedded v2 read (bundled LoRA, sidecar bundles) return
-            // payload bytes from `base_offset` bytes too early — metadata parsed
-            // fine, tensor data came back as garbage.
+            // Stored relative to the container, so rebase like the header
+            // offsets. Without this an embedded container reads every tensor
+            // `base` bytes early — out of the host file's own data — returning
+            // plausible-looking garbage instead of failing.
+            //
+            // Alignment is a property of the container's own layout, so it is
+            // checked before rebasing: `base` is where the host file happened to
+            // end and is under no obligation to be 32-byte aligned.
             let relative = offset_div32
                 .checked_mul(HFQM_V2_OFFSET_ALIGN)
                 .ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM v2 offset overflow")
                 })?;
-            // Alignment is a property of the container-relative offset; `base_offset`
-            // itself carries no alignment guarantee, so check before rebasing.
             if relative % HFQM_V2_OFFSET_ALIGN != 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("HFQM tensor {name} offset {relative} is not 32-byte aligned"),
                 ));
             }
-            relative.checked_add(base_offset).ok_or_else(|| {
+            relative.checked_add(base).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "HFQM v2 offset overflow")
             })?
         } else {
@@ -2814,5 +3058,129 @@ mod tests {
 
         let _ = std::fs::remove_file(payload);
         let _ = std::fs::remove_file(package_path);
+    }
+
+    /// Write one safetensors shard from `(name, dtype, shape, bytes)` tuples,
+    /// laying the data blob out in tuple order.
+    fn write_safetensors_shard(path: &Path, tensors: &[(&str, &str, Vec<usize>, Vec<u8>)]) {
+        let mut header = serde_json::Map::new();
+        let mut blob: Vec<u8> = Vec::new();
+        for (name, dtype, shape, bytes) in tensors {
+            let start = blob.len();
+            blob.extend_from_slice(bytes);
+            header.insert(
+                (*name).to_string(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [start, blob.len()],
+                }),
+            );
+        }
+        let header = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&blob);
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn from_safetensors_passes_dense_and_splits_stacked_experts() {
+        let dir = temp_path("st-from-dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["Qwen3_5_MoeForCausalLM"],"model_type":"qwen3_5_moe","num_experts":2}"#,
+        )
+        .unwrap();
+        // Tokenizer sidecar embed: chat_template must surface through the
+        // self-describing metadata just like a real `.hfq`.
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template":"SMOKE-TEMPLATE"}"#,
+        )
+        .unwrap();
+
+        // Dense embed: bf16 [4] = 8 bytes. Stacked experts gate_up_proj:
+        // bf16 [E=2, R=2, C=2] = 16 bytes; expert 0 = first 8, expert 1 = last 8.
+        let embed: Vec<u8> = (1u8..=8).collect();
+        let experts: Vec<u8> = (10u8..26).collect();
+        write_safetensors_shard(
+            &dir.join("model.safetensors"),
+            &[
+                ("model.embed_tokens.weight", "BF16", vec![4], embed.clone()),
+                (
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    "BF16",
+                    vec![2, 2, 2],
+                    experts.clone(),
+                ),
+            ],
+        );
+
+        let hfq = HfqFile::from_safetensors(&dir).unwrap();
+        assert_eq!(hfq.arch_id, 6, "qwen3.5-moe + num_experts>0 → arch 6");
+
+        // Dense: raw HF name, bf16 tag (16), shape/bytes verbatim.
+        let embed_info = hfq
+            .find_tensor_info("model.embed_tokens.weight")
+            .expect("dense embed present");
+        assert_eq!(embed_info.quant_type, 16);
+        assert_eq!(embed_info.shape, vec![4u32]);
+        assert_eq!(
+            hfq.tensor_data_vec("model.embed_tokens.weight").unwrap().1,
+            embed
+        );
+
+        // Stacked parent is NOT exposed; per-expert 2D tensors are, with the
+        // `.weight` suffix, fused gate_up kept, and correct byte sub-ranges.
+        assert!(hfq
+            .find_tensor_info("model.layers.0.mlp.experts.gate_up_proj")
+            .is_none());
+        let e0 = hfq
+            .find_tensor_info("model.layers.0.mlp.experts.0.gate_up_proj.weight")
+            .expect("expert 0 present");
+        assert_eq!(e0.quant_type, 16);
+        assert_eq!(e0.shape, vec![2u32, 2]);
+        assert_eq!(
+            hfq.tensor_data_vec("model.layers.0.mlp.experts.0.gate_up_proj.weight")
+                .unwrap()
+                .1,
+            experts[0..8]
+        );
+        assert_eq!(
+            hfq.tensor_data_vec("model.layers.0.mlp.experts.1.gate_up_proj.weight")
+                .unwrap()
+                .1,
+            experts[8..16]
+        );
+
+        // Exactly three tensors: 1 dense + 2 experts (gate_up not split further).
+        assert_eq!(hfq.tensors().len(), 3);
+
+        // Sidecar tokenizer_config folded into metadata → chat_template surfaces.
+        assert_eq!(hfq.chat_template().as_deref(), Some("SMOKE-TEMPLATE"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_safetensors_rejects_prequantized_dtype() {
+        let dir = temp_path("st-from-dir-bad-dtype");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama"}"#,
+        )
+        .unwrap();
+        write_safetensors_shard(
+            &dir.join("model.safetensors"),
+            &[("w", "F8_E4M3", vec![4], vec![0u8; 4])],
+        );
+        assert!(HfqFile::from_safetensors(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

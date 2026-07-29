@@ -71,6 +71,7 @@ hipfire-generate = { path = "../hipfire-generate" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-arch-api = { path = "../hipfire-arch-api" }
+hipfire-hash = { path = "../hipfire-hash" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-state = { path = "../hipfire-state" }
 hip-bridge = { path = "../hip-bridge" }

@@ -9,7 +9,6 @@
 //! arch-local `prefill_batch` for that one session. A future fused worker can
 //! batch across sessions behind the same protocol surface.
 
-use std::io::Write;
 use std::time::Instant;
 
 use hipfire_arch_lfm2moe as lfm2moe;
@@ -102,7 +101,7 @@ fn lfm2_prefill_session_done_json(
 }
 
 pub fn emit_lfm2_generate_batch_prefill_ready(
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchPrefillEnvelope,
 ) {
     let line = serde_json::json!({
@@ -285,7 +284,7 @@ pub fn lfm2_semantic_boundary_checkpoints(
 
 pub fn run_prefix_hash_preflight_lfm2(
     m: &LoadedModel,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &PrefixHashPreflightEnvelope,
 ) -> Result<(), String> {
     if m.arch_id != ARCH_ID_LFM2_MOE {
@@ -549,7 +548,7 @@ fn lfm2_prefill_with_boundary_checkpoints(
 pub fn run_generate_batch_prefill_serial_lfm2(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
-    stdout: &mut std::io::Stdout,
+    stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchPrefillEnvelope,
 ) -> Result<(), String> {
     if m.arch_id != ARCH_ID_LFM2_MOE {
