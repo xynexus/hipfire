@@ -991,3 +991,65 @@ trace BD in the runtime sequence), not just pointing the existing script at a
 different cache. Per the AIE kernel-opt skill's own
 rule, that has to be measured, not modelled — static reasoning about AIE timing
 has mispredicted by 5-300x.
+
+## The recorded 32.5 GB/s decode figure does NOT reproduce
+
+`examples/npu_decode_bench` (device-resident weights, zero host weight traffic —
+the same tool that produced the recorded 32.5 GB/s):
+
+| shape | ms/token-linear | W stream |
+|---|---|---|
+| K=2048 N=2048 | 0.622 | 3.4 GB/s |
+| K=2048 N=8192 | 1.578 | 5.3 GB/s |
+| K=2048 N=32768 | 6.375 | 5.3 GB/s |
+
+It plateaus at **~5.3 GB/s at every shape**, including a 32 MB resident weight
+set — matching the full-K path's 5.66 GB/s marginal rate measured independently.
+So both hipfire NPU paths hit the same wall, and the 32.5 GB/s in the project
+notes is not reproducible here. Any projection derived from it (e.g. "~52 tok/s
+for the 1B") should be treated as void; the measured shapes give ~7.6 tok/s,
+which is what the end-to-end 6.2 tok/s reflects.
+
+## Deconstructing FastFlowLM (authorised by the goal)
+
+`/opt/fastflowlm/share/flm/xclbins/Llama-3.2-1B-NPU2/` holds four xclbins —
+`layer`, `attn`, `mm`, `dequant`.
+
+**FLM uses the SAME toolchain we do.** Every one reports
+`<kernel name="MLIR_AIE" ... dpu_kernel_id="0x901">` with the standard 5-buffer
+DPU signature (`opcode, instr, ninstr, bo0..bo4`). It is mlir-aie, not a
+proprietary stack — so its advantage is schedule design, not tooling access.
+
+`layer.xclbin`'s AIE partition: `column_width = 8`, `operations_per_cycle =
+2048`, one PDI, one PRIMARY DPU cdo_group. **It uses all 8 columns — the same
+width as hipfire's c8 caches.** So the 46.4 vs 5.3 GB/s gap is not column count.
+
+The runtime sequences live in the per-model shared objects, not the xclbins.
+`/opt/fastflowlm/lib/libllama_npu.so` embeds **eight transaction binaries** in a
+clean column ladder (header per
+`lib/Conversion/AIEToConfiguration/AIEToConfiguration.cpp`: major/minor/devgen/
+rows/cols/memtilerows + num_ops + txn_size):
+
+| offset | cols | ops | bytes |
+|---|---|---|---|
+| 0x145360 | 1 | 31 | 548 |
+| 0x1455a0 | 1 | 35 | 596 |
+| 0x145800 | 2 | 61 | 1068 |
+| 0x145c40 | 2 | 69 | 1164 |
+| 0x1460e0 | 4 | 121 | 2108 |
+| 0x146920 | 4 | 137 | 2300 |
+| 0x147220 | 8 | 241 | 4188 |
+| 0x148280 | 8 | 273 | 4572 |
+
+All `v1.0 devgen=4 rows=6 memtilerows=1` (aie2p). Two variants per width —
+plausibly prefill/decode. `libqwen3_6_moe_npu.so` exists too and is the direct
+reference for the MoE half of this goal.
+
+The two 8-column blobs are extracted here as `flm_c8_a.txn` / `flm_c8_b.txn`.
+`txn2mlir.py` rejects them ("Failed to parse binary"), and a hand-decode of the
+v1.0 opcode stream did not line up on the first attempt — the v1.0 layout in
+`AIEToConfiguration.cpp` differs from the v0.1 case that is fully spelled out.
+Finishing that decode is the highest-value next step on this axis: 241 ops for a
+whole 8-column layer is a small enough schedule to read completely, and it would
+show directly what FLM does that sustains 46.4 GB/s where both of our paths
+plateau at 5.3.
