@@ -961,3 +961,29 @@ across dispatches.
 Taken with the earlier measurements (scaled is slower than unscaled COLS=1 at
 every buildable COLS/M at M=1), this closes the question: **the scaled path is
 not the route to the decode number.**
+
+### The wider-mmul lever does not exist for W4 on aie2p
+
+`include/aie_api/detail/aie2p/mmul_8_4.hpp` contains exactly ONE specialisation:
+
+```cpp
+struct mmul_8_4<4, 16, 16, TypeA, TypeB, 32> : public C_block<TypeA, TypeB, 32, 64, 1>
+```
+
+`aie::mmul<M,K,N,int8,int4>` is only defined for **4x16x16** on this target, and
+`r6_gemm_ts.cc` already uses exactly that. So catalog lever #8 ("wider mmul
+shape") is unavailable for the W4 path — there is nothing wider to move to.
+
+Arithmetic on the measured rate rules out the MAC unit as the cap: one
+`mmul<4,16,16>` int8xint4 consumes 128 B of weights for 1024 MACs, so 5.66 GB/s
+of weights is ~44M mmul/s = ~45 GMAC/s, three orders under aie2p's ~50 TOPS.
+The decode linear is neither MAC-bound nor (per the earlier feed comparison)
+port-bound at 13.4 GB/s — it sits at 5.66 GB/s, i.e. **42% of a single column**.
+
+That is the open question worth the next measurement: where the single-column
+decode dispatch actually stalls. The tool for it is the AIE trace unit
+(`benchmarks/npu_gemm_tuning/r1/r1b_trace_run.py`, which reports
+PORT_RUNNING/STALLED/IDLE and BUSY_FRAC for a compute tile's S2MM port) pointed
+at THIS configuration rather than at R1's. Per the AIE kernel-opt skill's own
+rule, that has to be measured, not modelled — static reasoning about AIE timing
+has mispredicted by 5-300x.
