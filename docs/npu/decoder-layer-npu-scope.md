@@ -1562,3 +1562,53 @@ The scaled path returns `rows * n` f32 instead of `groups * rows * n` int32, so
 it removes the 2.1 MB per-linear partial readback that measured as the 1.23 ms
 gap between the raw kernel (0.31 ms) and the runtime's full-K path (1.54 ms).
 That readback was the largest single decode cost identified.
+
+## Wiring the fixed scaled kernel: blocked one layer up, sharply localised
+
+The kernel fix above is verified, but the scaled path is **not yet usable from
+the runtime**, for two independent reasons.
+
+**1. N is capped at 4096 by a DMA limit.** Building the scaled cache at
+N=8192 fails:
+
+```
+aie.dma_bd op Size 3 exceeds the [1:64] range
+```
+
+The output BD uses `<size = NB, stride = 64>` with `NB = N / 64`, and AIE DMA
+descriptor dimensions max out at 64 — so `N <= 4096` for this schedule. That
+excludes Llama-3.2-1B's gate/up (N=8192). N=2048 and N=512 build fine, which
+still covers q/k/v/o and down_proj (5 of 7 linears per layer). Built:
+`w4-scaled_m64_kg8_n2048`, `..._kg8_n512`, `..._kg32_n2048`.
+
+**2. `NpuOpusExecutor`'s scaled path is broken where `NpuGemmFullK`'s is not.**
+On real `Llama-3.2-1B oq4++` q_proj (K=2048, N=2048), through
+`NpuOpusExecutor::run_f32`:
+
+| path | cols | m | result |
+|---|---|---|---|
+| unscaled full-K | 1 | 8 | **0/2048 mismatches** |
+| unscaled full-K | 8 | 64 | **0/2048 mismatches** |
+| **scaled** full-K | 8 | 64 | 1986/2048, max_abs 3.8e36 |
+| **scaled** full-K, M=64 | 8 | 64 | 40547/131072, max_abs **inf** |
+
+The same cache, driven directly by `NpuGemmFullK::run_resident_scaled` from
+`npu_fullk_scaled_bug`, is **exact on all four scale axes**. So:
+
+- the geometry is fine (unscaled at cols=8/m64 is exact),
+- the kernel is fine (direct calls are exact),
+- and it is not M=1 padding (M=64 fails too, and worse).
+
+The fault is in what `run_f32` hands the scaled path. Ruled out already:
+`pack_matrix` does pass the scales when `fullk.scaled_output()` is true
+(opus.rs:719-734); no stale `.rdna2.hfp` prepacked file exists and
+`npu_linear_oq4` calls the uncached `pack_matrix`, so packing is fresh; the
+activation layout (`[row][group][256]`) and scale layout (`[group][row]`) both
+match what the isolator passes. `inf`/1e36 outputs point at an uninitialised
+read rather than an arithmetic slip.
+
+**Next step:** make the isolator drive `NpuOpusExecutor::run_f32` instead of
+`NpuGemmFullK` directly, with the same synthetic weights that currently pass.
+That is the smallest change that puts a passing and a failing configuration
+side by side in one process, and it converts this from a code-reading problem
+into a diff.
