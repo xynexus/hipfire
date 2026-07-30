@@ -1112,6 +1112,28 @@ impl NpuOpusExecutor {
                                     &prepared.scales[group_idx][row0..row0 + chunk_rows],
                                 );
                         }
+                        if std::env::var("HIPFIRE_SCALED_TRACE").is_ok() {
+                            let f = |v: &[f32]| {
+                                let (mut lo, mut hi, mut bad) = (f32::MAX, f32::MIN, 0usize);
+                                for &x in v {
+                                    if !x.is_finite() {
+                                        bad += 1;
+                                    } else {
+                                        lo = lo.min(x);
+                                        hi = hi.max(x);
+                                    }
+                                }
+                                (lo, hi, bad, v.len())
+                            };
+                            eprintln!(
+                                "[scaled] rows={chunk_rows} padded_k={padded_k} n={} \
+                                 act_scales{:?} wscales{:?} acts={} ",
+                                matrix.n,
+                                f(&activation_scales),
+                                f(&weights.scales_slice()),
+                                activations.len()
+                            );
+                        }
                         fullk.run_resident_scaled(
                             weights,
                             &activations,

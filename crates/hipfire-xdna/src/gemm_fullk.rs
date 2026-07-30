@@ -49,6 +49,13 @@ pub struct NpuFullKResidentWeights {
     scales: Vec<f32>,
 }
 
+impl NpuFullKResidentWeights {
+    /// Diagnostic view of the packed weight scales (HIPFIRE_SCALED_TRACE).
+    pub fn scales_slice(&self) -> &[f32] {
+        &self.scales
+    }
+}
+
 /// Reusable activation/output buffers and one compiled full-K AIE schedule.
 pub struct NpuGemmFullK {
     kernel: NpuKernel,

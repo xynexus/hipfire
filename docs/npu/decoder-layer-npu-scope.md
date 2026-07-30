@@ -1612,3 +1612,55 @@ read rather than an arithmetic slip.
 That is the smallest change that puts a passing and a failing configuration
 side by side in one process, and it converts this from a code-reading problem
 into a diff.
+
+## CORRECTION: the executor's scaled path is NOT broken — that was a stale binary
+
+The previous section reported `NpuOpusExecutor::run_f32` producing `inf`/1e36
+through the scaled cache while direct `NpuGemmFullK` calls were exact, and
+concluded the executor had its own defect. **Wrong.** After the alignment fix I
+rebuilt `-p hipfire-xdna` (which owns the isolator) but ran `npu_linear_oq4`,
+which lives in `hipfire-runtime` and had not been relinked — so those numbers
+came from a binary containing the pre-fix kernel.
+
+Rebuilt, on real `Llama-3.2-1B oq4++` q_proj through `run_f32`:
+
+```
+mismatches=0/2048  max_abs=0.0000019
+```
+
+**The scaled full-K path is correct end to end through the executor on real
+oq4++ weights.** The alignment fix was the only defect.
+
+## But the scaled path is still NOT a decode win — the schedule is M-parallel
+
+Correct is not the same as fast. Same tensor (q_proj, K=2048, N=2048, M=1), all
+verified `0/2048 mismatches`:
+
+| path | ms | W GB/s |
+|---|---|---|
+| unscaled full-K, cols=1, m=8 | **0.542** | 3.87 |
+| scaled full-K, cols=4, m=32 | 1.189 | 1.76 |
+| scaled full-K, cols=8, m=64 | 1.489 | 1.41 |
+
+The scaled schedule is **slower at every column count it can be built at**, and
+`r6_gen_mp_fullk_scaled.py` rejects anything below 4 columns
+("scaled full-K schedule requires 4 or 8 columns"), so there is no cols=1 build
+to compare against.
+
+The reason is the same M-parallel decomposition documented earlier: COLS
+columns split the M dimension, and each column streams the **entire** weight
+matrix to compute its slice of rows. At decode M=1 that is COLS-fold wasted
+weight traffic. Removing the int32 partial readback saves 8x on the return
+path (`rows*n` f32 instead of `groups*rows*n` i32) but that does not pay for
+4-8x on the weight path, which is the dominant term.
+
+**Net:** the alignment fix is real and makes on-array scaling usable, but it is
+attached to a prefill-shaped schedule. It does not by itself move decode.
+
+What decode needs is unchanged and now sharply specified: **on-array group-scale
+application attached to an N-parallel schedule** (the r6 family, where
+`groups = COLS * NB` gives each column its own output slice and its own
+weights). The scaling kernel and its payload format are now proven correct and
+can be lifted; what has to be written is the N-parallel generator that hosts it
+— `r6_gen_mp_fullk_scaled.py` is M-parallel by construction and cannot be
+configured into it.
