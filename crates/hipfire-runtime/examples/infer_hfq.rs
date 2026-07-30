@@ -362,4 +362,8 @@ fn main() {
         gen_ms,
         tok_s
     );
+    #[cfg(target_os = "linux")]
+    if hipfire_runtime::npu_linear::timing_enabled() {
+        hipfire_runtime::npu_linear::report_timing();
+    }
 }

@@ -47,6 +47,45 @@ const ARCH_BLOCK: usize = 132;
 /// `[f16 scale][128 nibbles]` — what `pack_matrix` consumes.
 const CANONICAL_BLOCK: usize = 130;
 
+/// HIPFIRE_NPU_DECODE_TIMING=1 prints a per-phase breakdown at process exit, so
+/// the delivered cost can be split into GPU readback / NPU / GPU writeback
+/// instead of inferred from a microbenchmark that kept activations on the host.
+#[derive(Default)]
+struct Timing {
+    calls: u64,
+    download_ns: u64,
+    run_ns: u64,
+    upload_ns: u64,
+}
+
+thread_local! {
+    static TIMING: RefCell<Timing> = RefCell::new(Timing::default());
+}
+
+pub fn timing_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("HIPFIRE_NPU_DECODE_TIMING").is_ok_and(|v| v != "0"))
+}
+
+/// Print and reset the accumulated per-phase breakdown.
+pub fn report_timing() {
+    TIMING.with(|t| {
+        let t = t.borrow();
+        if t.calls == 0 {
+            return;
+        }
+        let per = |ns: u64| ns as f64 / t.calls as f64 / 1e6;
+        eprintln!(
+            "[npu-decode] calls={} download_ms={:.4} npu_ms={:.4} upload_ms={:.4} total_ms={:.4}",
+            t.calls,
+            per(t.download_ns),
+            per(t.run_ns),
+            per(t.upload_ns),
+            per(t.download_ns + t.run_ns + t.upload_ns),
+        );
+    });
+}
+
 pub fn npu_decode_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| {
@@ -171,10 +210,12 @@ pub fn try_npu_gemv(
         shape: vec![k],
         dtype: DType::F32,
     };
+    let t_dl = std::time::Instant::now();
     let input = match gpu.download_f32(&x_view) {
         Ok(v) => v,
         Err(e) => return Some(Err(e)),
     };
+    let dl_ns = t_dl.elapsed().as_nanos() as u64;
     let weight_bytes = w_buf.buf.size();
     let combined_if_needed = REGISTRY.with(|reg| reg.borrow().weights.contains_key(&key));
     let combined = if combined_if_needed {
@@ -249,7 +290,16 @@ pub fn try_npu_gemv(
         let resident = weights.get(&key)?;
         let exec = executors.get_mut(&m)?;
         let mut output = vec![0.0f32; rows * m];
-        match exec.run_f32(&resident.matrix, rows, &input[..rows * k], &mut output) {
+        let t_run = std::time::Instant::now();
+        let run_result = exec.run_f32(&resident.matrix, rows, &input[..rows * k], &mut output);
+        let run_ns = t_run.elapsed().as_nanos() as u64;
+        TIMING.with(|t| {
+            let t = &mut *t.borrow_mut();
+            t.calls += 1;
+            t.download_ns += dl_ns;
+            t.run_ns += run_ns;
+        });
+        match run_result {
             Ok(()) => Some(Ok(output)),
             Err(e) => Some(Err(hipfire_rdna::HipError::new(0, &e.to_string()))),
         }
@@ -258,5 +308,8 @@ pub fn try_npu_gemv(
         Ok(v) => v,
         Err(e) => return Some(Err(e)),
     };
-    Some(gpu.memcpy_htod_auto(&y.buf, bytemuck_cast(&output)))
+    let t_up = std::time::Instant::now();
+    let wrote = gpu.memcpy_htod_auto(&y.buf, bytemuck_cast(&output));
+    TIMING.with(|t| t.borrow_mut().upload_ns += t_up.elapsed().as_nanos() as u64);
+    Some(wrote)
 }
