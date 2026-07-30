@@ -883,3 +883,38 @@ the 8-vs-16-lane fp32 question.
 
 To load the skill: `ln -s ~/build/mlir-aie/skills/aie-kernel-opt
 .claude/skills/aie-kernel-opt` (or symlink the whole `skills/` directory).
+
+### Fault 1 fix candidate: 2 aligned loads + shuffle_down (needs 8 floats of tail slack)
+
+`~/build/mlir-aie/skills/aie-kernel-opt` states the constraint directly and gives
+the workaround:
+
+> Aligned vector loads need their natural alignment (a load of an N-byte vector
+> wants N-byte alignment, e.g. `load_v<int8,32>` -> 32-byte). If a deinterleave
+> lands data at an unaligned offset, do **2 aligned loads + `shuffle_down`**
+> rather than one unaligned load.
+
+That independently confirms fault 1 (`load_v<16>` on float is a 64-byte load;
+the weight scales sit at `activation_scales + ROWS` = +32 bytes) and points at a
+fix contained entirely in `r6_scale_accum.cc` — no payload padding, so the
+weight-scale offset and every existing consumer stay put:
+
+```c
+const float *aligned = activation_scales + block * 16;
+auto lo = aie::load_v<16>(aligned);
+auto hi = aie::load_v<16>(aligned + 16);
+auto weight_scale = aie::shuffle_down_fill(lo, hi, ROWS);
+```
+
+TESTED — returns infinities, because of an out-of-bounds read in the last block,
+not because the approach is wrong: the payload is `ROWS + SLAB_N` = 72 floats,
+and for `block = 3` the `hi` load covers floats 64..80. The two-load form needs
+**8 floats (32 bytes) of slack at the END** of the scale payload.
+
+That is still an `SE` change, but a strictly safer one than the earlier padding:
+it appends slack and does NOT move the weight-scale offset, so a consumer that
+writes `[act][wt]` keeps working and only has to allocate 32 more bytes. That is
+the next thing to try for fault 1.
+
+(Fault 1 alone does not fix end-to-end — the dispatch desync is separate — and
+by measurement the whole scaled path is a prefill lever, not a decode one.)
