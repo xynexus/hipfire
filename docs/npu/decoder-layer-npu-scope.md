@@ -722,3 +722,28 @@ So fault 1's fix remains the payload padding, which was independently proven to
 repair the load by direct observation. Use
 `~/AMD_AI_DOCS/install-help-aie-ml-v2-intrinsics.sh` (AIE-ML **v2** = aie2p) for
 intrinsic-level questions rather than UG1079.
+
+### objectfifo semantics relevant to the desync (from the MLIR-AIE bindings)
+
+`_aie_ops_gen.py` docstrings, which are the authoritative local reference:
+
+- **`aie.objectfifo` is a circular buffer plus LOCKS**, lowered by
+  `AIEObjectFifoStatefulTransformPass` into `aie.buffers` + `aie.locks` in the
+  memory module. Depth = number of objects. Every fifo in
+  `r6_gen_mp_fullk_scaled.py` is created with depth **1**, forcing strict
+  producer/consumer alternation.
+- **`objectfifo.acquire` elides redundant acquires**: "the operation only
+  performs new acquires if necessary… if two objects have been acquired in the
+  past and none have yet to be released by the same process, performing another
+  acquire… will not result in any new use_lock operations." So the lowering
+  tracks per-process held-object state.
+
+Locks live in the memory module and are configured once, not per dispatch. A
+dispatch that does not leave every lock back at its initial state desynchronises
+every later one — which matches the observed "only the first
+`run_resident_scaled` of a process is correct".
+
+Tested and REJECTED: raising `@fs`/`@fr` to depth 2 to tolerate skew. It builds
+but returns infinities — the `objectfifo.link [@fx] -> [@fa, @fs]` split and the
+runtime DMA sizing both assume matched depth-1 buffering, so depth is not a
+drop-in knob.
