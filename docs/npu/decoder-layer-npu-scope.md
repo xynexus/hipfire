@@ -669,3 +669,32 @@ That leaves the link's buffering, or the two consumers of `@fx` draining at
 different rates and leaving residue at dispatch end. Worth testing directly:
 call `run_resident_scaled` twice with IDENTICAL inputs and compare — the
 reversal experiment implies call 2 differs from call 1.
+
+## MEASURED: the scaled path is a PREFILL lever, not a decode lever
+
+The reason to chase `w4-scaled` was "on-array scaling removes the i32 readback,
+which is what forces COLS=1, which caps decode". **Measured, that is wrong.**
+q_proj K=2048 N=2048, per call (scaled timings taken on the first-dispatch-
+correct configuration; the desync affects values, not latency):
+
+| config | M=1 (decode) | M=64 (prefill) |
+|---|---|---|
+| unscaled COLS=1 m8 | **0.529 ms** | — |
+| unscaled COLS=8 m64 | 0.884 | 2.135 |
+| scaled COLS=8 m64 | 1.329 | **1.467** |
+
+At decode the scaled path is **2.5x SLOWER** than the current best. The readback
+argument does not apply at M=1: unscaled COLS=1/m8 reads back
+8 groups x 8 rows x 2048 x 4 = 512 KB, and scaled COLS=8/m64 reads back
+64 rows x 2048 x 4 = 512 KB. Identical. There was never a decode win to capture
+— the win only appears once M is large enough that the i32 block
+(groups x M x N) outgrows the f32 block (M x N), i.e. at prefill, where scaled
+COLS=8 does beat unscaled COLS=8 by 1.46x.
+
+CONSEQUENCE: repairing the scaled full-K desync is worth doing for PREFILL and
+is irrelevant to the decode number this project has been trying to move. The
+decode lever remains the fused decoder layer (amortising the ~0.51 ms fixed cost
+across a layer's seven linears); see the per-linear floor section above.
+
+Recorded because roughly eight turns of investigation were spent on this path
+under the assumption it gated decode. Measure the lever before repairing it.

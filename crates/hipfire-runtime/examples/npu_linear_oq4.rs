@@ -157,7 +157,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("first_mismatch index={i} got={got:.7} want={want:.7} abs={err:.7}");
     }
     if mismatches != 0 {
-        return Err("oq4 NPU dequant parity failed".into());
+        // HIPFIRE_SKIP_PARITY=1 keeps going so a known-incorrect configuration
+        // can still be TIMED — used to decide whether the scaled full-K path is
+        // worth repairing before anyone repairs it.
+        if std::env::var("HIPFIRE_SKIP_PARITY").is_err() {
+            return Err("oq4 NPU dequant parity failed".into());
+        }
+        println!("  (parity skipped — timing only)");
     }
 
     if iters > 0 {
