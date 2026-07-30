@@ -54,20 +54,28 @@ const CH: usize = 8 << 20;
 pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut verify: Option<PathBuf> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--input" => input = it.next().map(PathBuf::from),
             "--output" => output = it.next().map(PathBuf::from),
+            "--verify" => verify = it.next().map(PathBuf::from),
             other => return Err(format!("repack: unexpected argument {other:?}").into()),
         }
     }
     let input = input.ok_or("repack requires --input")?;
+    // Verify compares the archive against the source without materialising it.
+    // A restore-then-diff needs temp space equal to the whole model, which is
+    // exactly what is unavailable when the model is large enough to matter.
+    if let Some(src) = verify {
+        return restore(&input, None, Some(&src));
+    }
     let output = output.ok_or("repack requires --output")?;
     if input.is_dir() {
         pack(&input, &output)
     } else {
-        unpack(&input, &output)
+        restore(&input, Some(&output), None)
     }
 }
 
@@ -283,7 +291,14 @@ fn copy_raw(
     Ok((start, want))
 }
 
-fn unpack(archive: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+/// Reconstruct the archive, either writing it to `out_dir` or comparing it
+/// against `check` byte for byte. One code path, so verification exercises
+/// exactly the bytes a restore would produce.
+fn restore(
+    archive: &Path,
+    out_dir: Option<&Path>,
+    check: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
     let mut f = File::open(archive)?;
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
@@ -305,15 +320,27 @@ fn unpack(archive: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
     let mut n = 0usize;
     for fe in files {
         let rel = fe.get("path").and_then(|v| v.as_str()).ok_or("index entry has no path")?;
-        let dest = out_dir.join(rel);
-        if !dest.starts_with(out_dir) {
-            eprintln!("repack: skipping {rel} — escapes the output directory");
-            continue;
-        }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut o = std::io::BufWriter::new(File::create(&dest)?);
+        let mut o: Sink = match (out_dir, check) {
+            (Some(d), _) => {
+                let dest = d.join(rel);
+                if !dest.starts_with(d) {
+                    eprintln!("repack: skipping {rel} — escapes the output directory");
+                    continue;
+                }
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                Sink::Write(std::io::BufWriter::new(File::create(&dest)?))
+            }
+            (None, Some(src)) => Sink::Compare {
+                f: File::open(src.join(rel))
+                    .map_err(|e| format!("verify: cannot open source {rel}: {e}"))?,
+                path: rel.to_string(),
+                ok: true,
+                read: 0,
+            },
+            (None, None) => return Err("restore needs an output or a verify target".into()),
+        };
 
         match fe.get("kind").and_then(|v| v.as_str()) {
             Some("raw") => {
@@ -365,8 +392,58 @@ fn unpack(archive: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
             other => return Err(format!("unknown archive entry kind {other:?}").into()),
         }
         o.flush()?;
+        if let Sink::Compare { path, ok, f, read } = &o {
+            // Also catches a source that is longer than the reconstruction:
+            // every byte must be consumed, not merely match while it lasted.
+            let src_len = f.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+            if !*ok {
+                return Err(format!("verify: {path} content differs").into());
+            }
+            if src_len != *read {
+                return Err(format!(
+                    "verify: {path} is {src_len} bytes, archive reconstructs {read}"
+                )
+                .into());
+            }
+        }
         n += 1;
     }
-    eprintln!("repack: restored {n} files to {}", out_dir.display());
+    match (out_dir, check) {
+        (Some(d), _) => eprintln!("repack: restored {n} files to {}", d.display()),
+        _ => eprintln!("repack: verified {n} files byte-identical"),
+    }
     Ok(())
+}
+
+/// Either writes the reconstruction or checks it against the original.
+enum Sink {
+    Write(std::io::BufWriter<File>),
+    Compare {
+        f: File,
+        path: String,
+        ok: bool,
+        read: u64,
+    },
+}
+
+impl Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Sink::Write(w) => w.write(buf),
+            Sink::Compare { f, ok, read, .. } => {
+                let mut cmp = vec![0u8; buf.len()];
+                match f.read_exact(&mut cmp) {
+                    Ok(()) if cmp == buf => *read += buf.len() as u64,
+                    _ => *ok = false,
+                }
+                Ok(buf.len())
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Sink::Write(w) => w.flush(),
+            Sink::Compare { .. } => Ok(()),
+        }
+    }
 }
