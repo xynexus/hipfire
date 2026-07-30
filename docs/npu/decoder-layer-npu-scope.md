@@ -719,9 +719,9 @@ This is the same generation trap already recorded for benchmark numbers
 `include/aie_api/detail/aie2p/` disagree, the headers win for this target.
 
 So fault 1's fix remains the payload padding, which was independently proven to
-repair the load by direct observation. Use
-`~/AMD_AI_DOCS/install-help-aie-ml-v2-intrinsics.sh` (AIE-ML **v2** = aie2p) for
-intrinsic-level questions rather than UG1079.
+repair the load by direct observation. For intrinsic-level questions use the **aie-api headers for the target**
+(`include/aie_api/detail/aie2p/`), not UG1079 and not the AIE-ML v2 reference —
+see the naming correction below.
 
 ### objectfifo semantics relevant to the desync (from the MLIR-AIE bindings)
 
@@ -849,3 +849,37 @@ padding alone (fixes the load, end-to-end still wrong), 8-lane float rewrite
 (wrong generation — aie2p fp32 is 16-lane), objectfifo depth 2 (unsupported with
 repeat_count on a compute-tile producer), issue_token+await on the input (breaks
 the schedule).
+
+
+## Architecture naming, corrected (from ~/build/mlir-aie/skills/aie-kernel-opt)
+
+AMD's own skill gives the authoritative mapping:
+
+| internal name | marketing name | chips |
+|---|---|---|
+| `aie` | AIE | Versal VCK5000 |
+| `aie2` (NPU1) | AIE-ML (XDNA) | Phoenix |
+| `aie2p` (NPU2) | XDNA2 | Strix Point, **Strix Halo**, Krackan |
+| `aie2ps` | **AIE-MLv2** | Telluride |
+
+So **AIE-ML v2 is `aie2ps` (Telluride), NOT `aie2p`**. An earlier note here
+recommended `~/AMD_AI_DOCS/install-help-aie-ml-v2-intrinsics.sh` for this box on
+the assumption that AIE-ML v2 == aie2p; that is wrong and would mislead the same
+way UG1079's "eight lanes" did. This host is Strix Halo = `aie2p` = XDNA2.
+
+The skill also states the methodology that this investigation kept relearning
+the hard way:
+
+> Static analysis of MLIR or kernel C is unreliable on AIE — paper-compute
+> estimates have mispredicted real HW time by 5-300x depending on the kernel.
+> Every claim about where time goes must be backed by an HW measurement or an
+> ELF inspection.
+
+and, on vector widths specifically: "Concrete vector widths and `mmul<...>`
+shapes in the examples reflect one AIE generation (the numbers differ across
+AIE/AIE-ML/AIE2P); take them as worked examples and check the aie-api headers
+for your target's actual widths." That is exactly the check that beat UG1079 on
+the 8-vs-16-lane fp32 question.
+
+To load the skill: `ln -s ~/build/mlir-aie/skills/aie-kernel-opt
+.claude/skills/aie-kernel-opt` (or symlink the whole `skills/` directory).
