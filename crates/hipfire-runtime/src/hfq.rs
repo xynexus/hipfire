@@ -478,6 +478,30 @@ pub fn write_hfqm_package_streaming(
     entries: &[HfqStreamEntry],
     mut write_nth: impl FnMut(usize, &mut dyn Write) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    // This writer inlines ALL metadata in the front blob — it never emits a tail. A
+    // caller that read a v2 source (e.g. `examples/optimize.rs` passing
+    // `hfq.metadata_json` straight through) still carries that source's
+    // `tail_metadata` = {offset, size, hash} pointer, which now describes bytes that
+    // are not in this file. The loader trusts the pointer and fails with
+    // "HFQM v2 tail hash mismatch" — an unloadable artifact from a successful-looking
+    // repack. Drop the stale pointer; the values it guarded were already merged into
+    // the front by `merge_tail_metadata` when the source was opened.
+    let stripped;
+    let metadata_json = if metadata_json.contains("\"tail_metadata\"") {
+        match serde_json::from_str::<serde_json::Value>(metadata_json) {
+            Ok(mut v) => {
+                if let Some(map) = v.as_object_mut() {
+                    map.remove("tail_metadata");
+                }
+                stripped = serde_json::to_string(&v)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                stripped.as_str()
+            }
+            Err(_) => metadata_json,
+        }
+    } else {
+        metadata_json
+    };
     let meta = metadata_json.as_bytes();
     let metadata_offset = 32u64;
     let index_offset = metadata_offset + meta.len() as u64;

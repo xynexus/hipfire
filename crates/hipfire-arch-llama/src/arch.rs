@@ -157,17 +157,45 @@ impl LlamaBackend {
 
 impl SimpleAr for LlamaBackend {
     fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {
-        // Route through `prefill_forward` (attention_causal_batched) rather than
-        // `forward_prefill_batch` (the flash/masked `forward_prefill_chunk` path).
-        // BOTH are batched and — since the bf16/f16 projection gap in
-        // `forward_prefill_chunk` was fixed (BUGS.md) — numerically correct
-        // (bisection cosine 0.9998+ vs the per-token reference). `prefill_forward`
-        // is kept because it benches marginally faster: a clean same-build A/B on
-        // gfx1103 / MiniCPM5-1B.bf16 gave pp512 602 t/s here vs 581 t/s for the
-        // chunked path (tg128 identical).
-        let logits =
+        // Route Opus W4A4 (Oq4G256) through `forward_prefill_batch` (the flash/masked
+        // `forward_prefill_chunk` path) and everything else through `prefill_forward`
+        // (attention_causal_batched). BOTH are batched and numerically correct (bisection
+        // cosine 0.9998+ vs the per-token reference) since the bf16/f16 projection gap in
+        // `forward_prefill_chunk` was fixed (BUGS.md).
+        //
+        // The A/B that chose `prefill_forward` was measured on gfx1103 / MiniCPM5-1B.bf16
+        // (pp512 602 t/s vs 581 t/s for the chunked path) — i.e. on BF16 weights, where
+        // the two are within 4%. That result does NOT hold for Oq4: `prefill_forward`
+        // reaches its projections via `weights::weight_gemm`, whose Oq4G256 arm allocates
+        // and frees an `x_rot` tensor per call, while `forward_prefill_chunk` uses the
+        // persistent `PrefillBatchScratch` rotation buffers. Measured on gfx1151 /
+        // Llama-3.2-1B-Instruct oq4++: 87 t/s via `prefill_forward` vs 1320 t/s via the
+        // chunked path — 15x. Keep the split until the `weight_gemm` Oq4 arm stops
+        // allocating per call, then re-run the A/B.
+        let oq4 = self
+            .weights
+            .layers
+            .first()
+            .is_some_and(|l| matches!(l.wq.gpu_dtype, hipfire_rdna::DType::Oq4G256));
+        let logits = if oq4 {
+            llama::forward_prefill_batch(
+                gpu,
+                &self.weights,
+                &self.config,
+                tokens,
+                0,
+                &mut self.kv_cache,
+                &self.scratch,
+                None,
+            )
+            .map_err(|e| format!("llama forward_prefill_batch: {e:?}"))?;
+            // `forward_prefill_batch` already lands last-position logits in
+            // `scratch.logits`; nothing further to copy.
+            return Ok(());
+        } else {
             llama::prefill_forward(gpu, &self.weights, &self.config, tokens, &mut self.kv_cache)
-                .map_err(|e| format!("llama prefill_forward: {e:?}"))?;
+                .map_err(|e| format!("llama prefill_forward: {e:?}"))?
+        };
         // Land the last-position logits in `scratch.logits` for the SimpleAr seam.
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(logits.as_ptr() as *const u8, logits.len() * 4) };

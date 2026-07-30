@@ -84,6 +84,11 @@ else
   CTILE_ELEMS=64
   W_FIFO_DEPTH=2
 fi
+# W objectfifo depth. Default 2 (double-buffered feed). Dropping to 1 halves the W L1
+# footprint, which is what caps KCHUNK — worth trading when K-depth per dispatch matters
+# more than feed overlap (deep-K shapes: fewer K-chunks = fewer dispatches and fewer host
+# C-accumulate passes). Measure both; the winner is shape-dependent.
+W_FIFO_DEPTH="${R6_W_FIFO_DEPTH:-$W_FIFO_DEPTH}"
 TAG="${R6_OUT_TAG:-r6}"; GEN="${R6_GEN:-r6_gen.py}"
 ROUNDS="${R6_ROUNDS:-1}"  # r6_gen_mp.py only: M-blocks/core streamed in ONE dispatch
 RSFX=""; [ "$ROUNDS" != 1 ] && RSFX="_r${ROUNDS}"

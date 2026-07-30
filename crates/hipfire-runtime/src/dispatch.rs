@@ -77,11 +77,21 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
         return true;
     }
     // HFP4G32 / MFP4G32 + MQ3G256 require WMMA. Same arch gate as MQ3.
-    let wmma_only = matches!(dt, DType::MQ3G256 | DType::HFP4G32 | DType::MFP4G32)
-        && matches!(
-            arch,
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
-        );
+    // Oq4G256 (Opus W4A4) batches through `gemm_oq4_grouped_act_batched` /
+    // `gemm_oq4_grouped_residual_act_batched`, whose grouped GEMM is WMMA-based — so it
+    // takes the same arch gate as MQ3/FP4 rather than the always-ok list. Enabled only
+    // once `llama::forward_prefill_chunk` grew Oq4 arms at all four projection sites;
+    // before that Oq4 fell through to `gemm_qkv_hfq4g256` and would have been decoded as
+    // HFQ4 (silently wrong logits). Without this entry an oq4/oq4++ model is judged
+    // non-batchable and serving prefill degrades to the per-token loop — measured 631
+    // sequential positions for a 631-token prompt.
+    let wmma_only = matches!(
+        dt,
+        DType::MQ3G256 | DType::HFP4G32 | DType::MFP4G32 | DType::Oq4G256
+    ) && matches!(
+        arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
+    );
     // gfx10 RDNA1/2 scalar HFQ3 batched-prefill (Phase 1 of
     // docs/plans/gfx10_mq3_prefill.md). Mirrors the
     // `mq3_uniform_with_gfx10_scalar` arm in qwen35.rs::is_batchable_la —

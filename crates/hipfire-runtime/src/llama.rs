@@ -1174,10 +1174,38 @@ fn forward_prefill_chunk(
         let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let qkv_is_mq3 = matches!(layer.wq.gpu_dtype, DType::MQ3G256);
         let qkv_is_fp4 = matches!(layer.wq.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+        // Opus W4A4. `gemm_oq4_grouped_act_batched` consumes an ALREADY FWHT-rotated f32
+        // activation and int4-quantizes it itself — the same contract as decode's
+        // `weights.rs::weight_gemv` Oq4G256 arm: x -> (x /= awq_scale if sidecar) ->
+        // FWHT-256 -> x_rot -> quantize_act_oq4. The AWQ divide belongs to the rotation,
+        // so an oq4+/oq4++ weight MUST take the AWQ-aware rotate; skipping it yields
+        // silently wrong logits rather than a failure.
+        let qkv_is_oq4 = matches!(layer.wq.gpu_dtype, DType::Oq4G256);
+        let qkv_awq = layer.wq.awq_scale.as_ref();
 
         // attn_norm (+ FWHT for MQ — includes MFP4G32 since rotation is the
-        // same FWHT pattern as MQ4).
-        if qkv_is_mq {
+        // same FWHT pattern as MQ4, and Oq4G256 which rotates the same way).
+        if qkv_is_oq4 {
+            match qkv_awq {
+                Some(awq) => gpu.fused_rmsnorm_rotate_mq_awq_batched(
+                    &pbs.x_batch,
+                    &layer.attn_norm,
+                    awq,
+                    &pbs.x_rot_batch,
+                    dim,
+                    config.norm_eps,
+                    n,
+                )?,
+                None => gpu.fused_rmsnorm_rotate_mq_batched(
+                    &pbs.x_batch,
+                    &layer.attn_norm,
+                    &pbs.x_rot_batch,
+                    dim,
+                    config.norm_eps,
+                    n,
+                )?,
+            }
+        } else if qkv_is_mq {
             gpu.fused_rmsnorm_rotate_mq_batched(
                 &pbs.x_batch,
                 &layer.attn_norm,
@@ -1300,6 +1328,26 @@ fn forward_prefill_chunk(
                 layer.wq.k,
                 n,
             )?;
+        } else if qkv_is_oq4 {
+            debug_assert!(
+                matches!(layer.wk.gpu_dtype, DType::Oq4G256)
+                    && matches!(layer.wv.gpu_dtype, DType::Oq4G256),
+                "Oq4 qkv dispatch requires all of wq/wk/wv to be Oq4G256",
+            );
+            // W4A8 (int8 activations via q8_1) — NOT the W4A4
+            // `gemm_oq4_grouped_act_batched`. Measured logit parity vs the per-token
+            // reference on llama-3.2-1B oq4++, 541-token prompt: A16 cosine 0.99991,
+            // A8 0.99987 (both clear the 0.9998 bar), A4 0.80202 (fails badly). Int4
+            // activations are not accurate enough for prefill even though decode's
+            // W4A16 `gemv_oq4_grouped` is exact — hence the "parity-gated activation
+            // paths" note in `transformer.rs`.
+            for (w, out) in [
+                (&layer.wq, &pbs.fa_q_batch),
+                (&layer.wk, &pbs.fa_k_batch),
+                (&layer.wv, &pbs.fa_v_batch),
+            ] {
+                gpu.gemm_oq4_residual_mmq(&w.buf, &pbs.x_rot_batch, out, w.m, w.k, n, false)?;
+            }
         } else {
             gpu.gemm_qkv_hfq4g256(
                 &layer.wq.buf,
@@ -1562,7 +1610,10 @@ fn forward_prefill_chunk(
         let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
         let wo_is_dense = matches!(layer.wo.gpu_dtype, DType::BF16 | DType::F16);
-        let wo_input = if wo_is_mq {
+        // Oq4 rotates its input exactly like MQ; `rotate_x_mq_batched_for` already applies
+        // the AWQ divide when the weight carries a sidecar.
+        let wo_is_oq4 = matches!(layer.wo.gpu_dtype, DType::Oq4G256);
+        let wo_input = if wo_is_mq || wo_is_oq4 {
             // F2: AWQ-aware rotate for wo (FullAttention output projection) input.
             rotate_x_mq_batched_for(
                 gpu,
@@ -1625,6 +1676,16 @@ fn forward_prefill_chunk(
                 layer.wo.k,
                 n,
             )?;
+        } else if wo_is_oq4 {
+            gpu.gemm_oq4_residual_mmq(
+                &layer.wo.buf,
+                wo_input,
+                &pbs.x_batch,
+                layer.wo.m,
+                layer.wo.k,
+                n,
+                true,
+            )?;
         } else {
             gpu.gemm_hfq4g256_residual(
                 &layer.wo.buf,
@@ -1647,7 +1708,29 @@ fn forward_prefill_chunk(
         let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
         let ffn_is_dense = matches!(layer.w_gate.gpu_dtype, DType::BF16 | DType::F16);
-        if ffn_is_mq {
+        let ffn_is_oq4 = matches!(layer.w_gate.gpu_dtype, DType::Oq4G256);
+        let ffn_awq = layer.w_gate.awq_scale.as_ref();
+        if ffn_is_oq4 {
+            match ffn_awq {
+                Some(awq) => gpu.fused_rmsnorm_rotate_mq_awq_batched(
+                    &pbs.x_batch,
+                    &layer.ffn_norm,
+                    awq,
+                    &pbs.x_rot_batch,
+                    dim,
+                    config.norm_eps,
+                    n,
+                )?,
+                None => gpu.fused_rmsnorm_rotate_mq_batched(
+                    &pbs.x_batch,
+                    &layer.ffn_norm,
+                    &pbs.x_rot_batch,
+                    dim,
+                    config.norm_eps,
+                    n,
+                )?,
+            }
+        } else if ffn_is_mq {
             gpu.fused_rmsnorm_rotate_mq_batched(
                 &pbs.x_batch,
                 &layer.ffn_norm,
@@ -1744,6 +1827,26 @@ fn forward_prefill_chunk(
                 layer.w_gate.k,
                 n,
             )?;
+        } else if ffn_is_oq4 {
+            // No fused gate+up Oq4 kernel; two W4A8 MMQ GEMMs over the shared rotated x.
+            gpu.gemm_oq4_residual_mmq(
+                &layer.w_gate.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
+                layer.w_gate.m,
+                layer.w_gate.k,
+                n,
+                false,
+            )?;
+            gpu.gemm_oq4_residual_mmq(
+                &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.up_batch,
+                layer.w_up.m,
+                layer.w_up.k,
+                n,
+                false,
+            )?;
         } else {
             gpu.gemm_gate_up_hfq4g256(
                 &layer.w_gate.buf,
@@ -1766,7 +1869,10 @@ fn forward_prefill_chunk(
         let w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
         let w_down_is_dense = matches!(layer.w_down.gpu_dtype, DType::BF16 | DType::F16);
-        if w_down_is_mq {
+        // Oq4 down_proj consumes the FWHT-rotated SiLU-mul product, same as MQ;
+        // `fused_silu_mul_rotate_mq_batched_for` applies the weight's AWQ divide.
+        let w_down_is_oq4 = matches!(layer.w_down.gpu_dtype, DType::Oq4G256);
+        if w_down_is_mq || w_down_is_oq4 {
             // F2: AWQ-aware silu_mul+rotate for w_down input.
             fused_silu_mul_rotate_mq_batched_for(
                 gpu,
@@ -1848,6 +1954,16 @@ fn forward_prefill_chunk(
                 layer.w_down.m,
                 layer.w_down.k,
                 n,
+            )?;
+        } else if w_down_is_oq4 {
+            gpu.gemm_oq4_residual_mmq(
+                &layer.w_down.buf,
+                &pbs.ffn_hidden_batch,
+                &pbs.x_batch,
+                layer.w_down.m,
+                layer.w_down.k,
+                n,
+                true,
             )?;
         } else {
             gpu.gemm_hfq4g256_residual(

@@ -21,10 +21,13 @@ fn main() {
         let (mt, kc, g) = (p(2, 24), p(3, 8), p(4, 32));
         let (m, k, n) = (p(5, 768), p(6, 512), p(7, 4096));
         let iters = p(8, 20) as u32;
+        // Optional: NB and ROUNDS of the xclbin build. rounds > 1 streams that many
+        // M-blocks per dispatch, which is the lever against dispatch latency.
+        let (nb, rounds) = (p(9, g), p(10, 1));
 
         let x = std::fs::read(format!("{dir}/final.xclbin")).expect("xclbin");
         let i = std::fs::read(format!("{dir}/insts.bin")).expect("insts");
-        let mut gemm = NpuGemm::load(&x, &i, mt, 4, kc, g).expect("load");
+        let mut gemm = NpuGemm::load_rounds(&x, &i, mt, 4, kc, g, nb, rounds).expect("load");
         let (bm, bn, bk) = (gemm.block_m(), gemm.block_n(), gemm.block_k());
         assert!(
             m % bm == 0 && n % bn == 0 && k % bk == 0,
