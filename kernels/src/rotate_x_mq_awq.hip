@@ -20,23 +20,23 @@
 // awq_scale: 1D FP32 buffer length K (host-side F16 → F32 conversion happens
 // in the loader; see hfq.rs::load_awq_scale).
 
-extern "C" __launch_bounds__(32, 16)
-__global__ void rotate_x_mq_awq(
+__device__ __forceinline__ void rotate_x_mq_awq_body(
     const float* __restrict__ x_in,
     float* __restrict__ x_out,
-    const float* __restrict__ awq_scale,   // [K], FP32
+    const float* __restrict__ awq_scale,   // [K], FP32; null => no divide
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
-    int K
+    int K,
+    long long in_row,
+    long long out_row
 ) {
     const int group = blockIdx.x;
     const int tid = threadIdx.x;
     const int groups_total = K / 256;
     if (group >= groups_total) return;
 
-    const long long batch_off = (long long)blockIdx.y * K;
-    const float* x_in_b  = x_in  + batch_off;
-          float* x_out_b = x_out + batch_off;
+    const float* x_in_b  = x_in  + in_row * (long long)K;
+          float* x_out_b = x_out + out_row * (long long)K;
 
     int d0 = tid * 8;
     int base = group * 256 + d0;
@@ -46,14 +46,14 @@ __global__ void rotate_x_mq_awq(
     // pre-scaling cancels the runtime per-channel divide so that
     // `(W·s) · (x/s) = W·x`. awq_scale is 1D length-K, indexed in the
     // unrotated x basis (not FWHT-rotated).
-    float v0 = (x_in_b[base    ] / awq_scale[base    ]) * signs1[d0    ];
-    float v1 = (x_in_b[base + 1] / awq_scale[base + 1]) * signs1[d0 + 1];
-    float v2 = (x_in_b[base + 2] / awq_scale[base + 2]) * signs1[d0 + 2];
-    float v3 = (x_in_b[base + 3] / awq_scale[base + 3]) * signs1[d0 + 3];
-    float v4 = (x_in_b[base + 4] / awq_scale[base + 4]) * signs1[d0 + 4];
-    float v5 = (x_in_b[base + 5] / awq_scale[base + 5]) * signs1[d0 + 5];
-    float v6 = (x_in_b[base + 6] / awq_scale[base + 6]) * signs1[d0 + 6];
-    float v7 = (x_in_b[base + 7] / awq_scale[base + 7]) * signs1[d0 + 7];
+    float v0 = x_in_b[base    ] * (awq_scale ? (1.0f / awq_scale[base    ]) : 1.0f) * signs1[d0    ];
+    float v1 = x_in_b[base + 1] * (awq_scale ? (1.0f / awq_scale[base + 1]) : 1.0f) * signs1[d0 + 1];
+    float v2 = x_in_b[base + 2] * (awq_scale ? (1.0f / awq_scale[base + 2]) : 1.0f) * signs1[d0 + 2];
+    float v3 = x_in_b[base + 3] * (awq_scale ? (1.0f / awq_scale[base + 3]) : 1.0f) * signs1[d0 + 3];
+    float v4 = x_in_b[base + 4] * (awq_scale ? (1.0f / awq_scale[base + 4]) : 1.0f) * signs1[d0 + 4];
+    float v5 = x_in_b[base + 5] * (awq_scale ? (1.0f / awq_scale[base + 5]) : 1.0f) * signs1[d0 + 5];
+    float v6 = x_in_b[base + 6] * (awq_scale ? (1.0f / awq_scale[base + 6]) : 1.0f) * signs1[d0 + 6];
+    float v7 = x_in_b[base + 7] * (awq_scale ? (1.0f / awq_scale[base + 7]) : 1.0f) * signs1[d0 + 7];
 
     // Local butterfly: strides 1, 2, 4
     float t;
@@ -99,4 +99,42 @@ __global__ void rotate_x_mq_awq(
     x_out_b[base + 5] = v5 * s * signs2[d0 + 5];
     x_out_b[base + 6] = v6 * s * signs2[d0 + 6];
     x_out_b[base + 7] = v7 * s * signs2[d0 + 7];
+}
+
+extern "C" __launch_bounds__(32, 16)
+__global__ void rotate_x_mq_awq(
+    const float* __restrict__ x_in,
+    float* __restrict__ x_out,
+    const float* __restrict__ awq_scale,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int K
+) {
+    rotate_x_mq_awq_body(x_in, x_out, awq_scale, signs1, signs2, K,
+                         blockIdx.y, blockIdx.y);
+}
+
+// Routed-MoE variant: one rotated row PER ROUTED SLOT, each divided by ITS
+// expert's awq vector. Slot `blockIdx.y` reads source row `slot / k_top` and
+// selects `awq_ptrs[slot_expert[slot]]` (0 = that expert has no awq_scale, so
+// its rows skip the divide). The single-vector sister shares one rotated row
+// across all k_top slots of a token, which is only correct when every routed
+// expert shares an AWQ basis.
+extern "C" __launch_bounds__(32, 16)
+__global__ void rotate_x_mq_awq_indexed(
+    const float* __restrict__ x_in,
+    float* __restrict__ x_out,
+    const unsigned long long* __restrict__ awq_ptrs,  // [n_exp], 0 = none
+    const int* __restrict__ slot_expert,              // [n_slots]
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int K,
+    int k_top
+) {
+    const int slot = blockIdx.y;
+    const int expert = slot_expert[slot];
+    const float* awq =
+        (expert >= 0) ? reinterpret_cast<const float*>(awq_ptrs[expert]) : nullptr;
+    rotate_x_mq_awq_body(x_in, x_out, awq, signs1, signs2, K,
+                         (long long)(slot / k_top), (long long)slot);
 }

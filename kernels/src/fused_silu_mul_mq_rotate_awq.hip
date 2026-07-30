@@ -20,11 +20,10 @@
 // awq_scale: 1D FP32 buffer length K (host-side F16 → F32 conversion
 // happens in the loader; see hfq.rs::load_awq_scale).
 
-extern "C" __launch_bounds__(32, 16)
-__global__ void fused_silu_mul_mq_rotate_awq(
+__device__ __forceinline__ void fused_silu_mul_mq_rotate_awq_body(
     const float* __restrict__ gate,
     const float* __restrict__ up,
-    const float* __restrict__ awq_scale,   // [K], FP32
+    const float* __restrict__ awq_scale,   // [K], FP32; may be null => no divide
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     float* __restrict__ x_rot,
@@ -60,14 +59,14 @@ __global__ void fused_silu_mul_mq_rotate_awq(
     float g6 = gate_b[base + 6]; float u6 = up_b[base + 6];
     float g7 = gate_b[base + 7]; float u7 = up_b[base + 7];
 
-    float v0 = (SILU_MUL(g0, u0) / awq_scale[base    ]) * signs1[d0    ];
-    float v1 = (SILU_MUL(g1, u1) / awq_scale[base + 1]) * signs1[d0 + 1];
-    float v2 = (SILU_MUL(g2, u2) / awq_scale[base + 2]) * signs1[d0 + 2];
-    float v3 = (SILU_MUL(g3, u3) / awq_scale[base + 3]) * signs1[d0 + 3];
-    float v4 = (SILU_MUL(g4, u4) / awq_scale[base + 4]) * signs1[d0 + 4];
-    float v5 = (SILU_MUL(g5, u5) / awq_scale[base + 5]) * signs1[d0 + 5];
-    float v6 = (SILU_MUL(g6, u6) / awq_scale[base + 6]) * signs1[d0 + 6];
-    float v7 = (SILU_MUL(g7, u7) / awq_scale[base + 7]) * signs1[d0 + 7];
+    float v0 = SILU_MUL(g0, u0) * (awq_scale ? (1.0f / awq_scale[base    ]) : 1.0f) * signs1[d0    ];
+    float v1 = SILU_MUL(g1, u1) * (awq_scale ? (1.0f / awq_scale[base + 1]) : 1.0f) * signs1[d0 + 1];
+    float v2 = SILU_MUL(g2, u2) * (awq_scale ? (1.0f / awq_scale[base + 2]) : 1.0f) * signs1[d0 + 2];
+    float v3 = SILU_MUL(g3, u3) * (awq_scale ? (1.0f / awq_scale[base + 3]) : 1.0f) * signs1[d0 + 3];
+    float v4 = SILU_MUL(g4, u4) * (awq_scale ? (1.0f / awq_scale[base + 4]) : 1.0f) * signs1[d0 + 4];
+    float v5 = SILU_MUL(g5, u5) * (awq_scale ? (1.0f / awq_scale[base + 5]) : 1.0f) * signs1[d0 + 5];
+    float v6 = SILU_MUL(g6, u6) * (awq_scale ? (1.0f / awq_scale[base + 6]) : 1.0f) * signs1[d0 + 6];
+    float v7 = SILU_MUL(g7, u7) * (awq_scale ? (1.0f / awq_scale[base + 7]) : 1.0f) * signs1[d0 + 7];
     #undef SILU_MUL
 
     // Local butterfly: strides 1, 2, 4 — identical to mq_rotate_x.
@@ -114,4 +113,41 @@ __global__ void fused_silu_mul_mq_rotate_awq(
     x_rot_b[base + 5] = v5 * s * signs2[d0 + 5];
     x_rot_b[base + 6] = v6 * s * signs2[d0 + 6];
     x_rot_b[base + 7] = v7 * s * signs2[d0 + 7];
+}
+
+extern "C" __launch_bounds__(32, 16)
+__global__ void fused_silu_mul_mq_rotate_awq(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    const float* __restrict__ awq_scale,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    float* __restrict__ x_rot,
+    int K
+) {
+    fused_silu_mul_mq_rotate_awq_body(gate, up, awq_scale, signs1, signs2, x_rot, K);
+}
+
+// Routed-MoE variant: one AWQ vector PER EXPERT, selected by the routed slot's
+// expert id. Row `blockIdx.y` is slot `token*K_TOP + rank`, and
+// `slot_expert[slot]` is that slot's expert (i.e. the topk_indices buffer).
+// A null table entry means that expert carries no awq_scale, so its rows skip
+// the divide — exactly what the per-token reference does when `down.awq_scale`
+// is `None`. Applying one expert's vector to every slot is wrong here: routed
+// down scales differ by an order of magnitude across experts.
+extern "C" __launch_bounds__(32, 16)
+__global__ void fused_silu_mul_mq_rotate_awq_indexed(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    const unsigned long long* __restrict__ awq_ptrs,  // [n_exp], 0 = none
+    const int* __restrict__ slot_expert,              // [n_slots]
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    float* __restrict__ x_rot,
+    int K
+) {
+    const int expert = slot_expert[blockIdx.y];
+    const float* awq =
+        (expert >= 0) ? reinterpret_cast<const float*>(awq_ptrs[expert]) : nullptr;
+    fused_silu_mul_mq_rotate_awq_body(gate, up, awq, signs1, signs2, x_rot, K);
 }

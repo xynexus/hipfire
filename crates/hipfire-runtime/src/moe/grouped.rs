@@ -27,6 +27,13 @@ pub struct GroupedMoeScratch {
     pub expert_tile_ids: GpuTensor,
     pub y_gate_up_grouped: GpuTensor,
     pub y_down_grouped: GpuTensor,
+    /// `[max_rows * k_top × hidden]` per-routed-slot rotated activations.
+    ///
+    /// The shared `x_rot_batch` holds ONE rotated row per token, reused by all
+    /// `k_top` slots — correct only when every routed expert shares an AWQ
+    /// basis. When they do not, each slot needs its own row divided by its
+    /// expert's `gate_up.awq_scale` before the FWHT.
+    pub x_rot_slots: GpuTensor,
 }
 
 impl GroupedMoeScratch {
@@ -37,6 +44,7 @@ impl GroupedMoeScratch {
         num_experts: usize,
         gate_up_output_width: usize,
         down_output_width: usize,
+        hidden: usize,
     ) -> HipResult<Self> {
         let m_total_max = grouped_m_total_max(max_rows, k_top, num_experts)
             .map_err(|error| hipfire_rdna::HipError::new(0, &error.to_string()))?;
@@ -58,6 +66,7 @@ impl GroupedMoeScratch {
             y_gate_up_grouped: gpu
                 .alloc_tensor(&[m_total_max * gate_up_output_width], DType::F32)?,
             y_down_grouped: gpu.alloc_tensor(&[m_total_max * down_output_width], DType::F32)?,
+            x_rot_slots: gpu.alloc_tensor(&[total_slots_max * hidden], DType::F32)?,
         })
     }
 
@@ -70,6 +79,7 @@ impl GroupedMoeScratch {
             self.expert_tile_ids,
             self.y_gate_up_grouped,
             self.y_down_grouped,
+            self.x_rot_slots,
         ] {
             let _ = gpu.free_tensor(tensor);
         }

@@ -1723,6 +1723,8 @@ fn load_streamed_moe_ffn(
                 down: pending.take_weight(shared_down),
             },
             shared_expert_gate: pending.take_weight(shared_expert_gate),
+            expert_down_awq_ptrs: None,
+            expert_gate_up_awq_ptrs: None,
             expert_gate_up_ptrs: pending.take_tensor(expert_gate_up_ptrs),
             expert_down_ptrs: pending.take_tensor(expert_down_ptrs),
             layer_idx: layer as u16,

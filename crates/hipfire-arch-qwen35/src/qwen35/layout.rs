@@ -96,6 +96,19 @@ pub struct MoeFfnWeights {
     /// kernel's output so the indexed MoE GEMV can stay capture-safe.
     pub expert_gate_up_ptrs: GpuTensor, // [num_experts * 2] f32 slots = num_experts × u64
     pub expert_down_ptrs: GpuTensor,      // [num_experts * 2] f32 slots = num_experts × u64
+    /// Device-side array of `unsigned long long` pointers, one per expert's
+    /// `down.awq_scale` buffer, or 0 for an expert that carries none.
+    ///
+    /// The batched routed path pre-computes the down input for every routed
+    /// slot in ONE launch, so it cannot use a per-expert `WeightTensor` the way
+    /// the per-token loop does. AWQ smoothing is folded into each expert's
+    /// weights individually (`(W·s)·(h/s)`), and the routed down scales differ
+    /// by an order of magnitude across experts, so applying one representative
+    /// to every slot corrupts the result. `None` when no routed expert has a
+    /// down `awq_scale` (nothing to index) or in paged mode.
+    pub expert_down_awq_ptrs: Option<GpuTensor>, // [num_experts * 2] f32 slots
+    /// Same table for each expert's `gate_up.awq_scale`.
+    pub expert_gate_up_awq_ptrs: Option<GpuTensor>, // [num_experts * 2] f32 slots
 
     /// Layer index. Stable identity used to key
     /// [`hipfire_runtime::weight_pager::WeightId::Expert`] entries.

@@ -1127,6 +1127,113 @@ impl Gpu {
     }
     /// Phase A Stage A — F2 batched AWQ variant of `fused_silu_mul_rotate_mq`.
     /// Grid.y is the batch dim — processes [N × K] gate/up/x_rot.
+    /// Routed-MoE silu·mul → AWQ divide → FWHT with a PER-EXPERT awq vector.
+    ///
+    /// `awq_ptrs` is a `[n_exp]` u64 table (0 = expert has no awq_scale) and
+    /// `slot_expert` is the `[n_slots]` i32 routed-expert id per row (the
+    /// topk_indices buffer). The single-vector sister applies one expert's
+    /// scale to every row, which is wrong for routed experts whose down scales
+    /// differ by an order of magnitude.
+    #[allow(clippy::too_many_arguments)]
+    /// Routed-MoE x rotation with a PER-EXPERT awq vector: one output row per
+    /// routed slot, each reading source row `slot / k_top` and dividing by its
+    /// own expert's `gate_up.awq_scale` (0 in the table = no scale for that
+    /// expert). Pair with `x_row_div = 1` on the grouped GEMM.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rotate_x_mq_awq_indexed_batched(
+        &mut self,
+        x_in: &GpuTensor,
+        x_out: &GpuTensor,
+        awq_ptrs: &GpuTensor,
+        slot_expert: &GpuTensor,
+        k: usize,
+        k_top: usize,
+        n_slots: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "rotate_x_mq_awq_indexed",
+            kernels::ROTATE_X_MQ_AWQ_SRC,
+            "rotate_x_mq_awq_indexed",
+        )?;
+        let s1 = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let xip = x_in.buf.as_ptr();
+        let xop = x_out.buf.as_ptr();
+        let awp = awq_ptrs.buf.as_ptr();
+        let sep = slot_expert.buf.as_ptr();
+        let kv = k as i32;
+        let ktv = k_top as i32;
+        let bytes = k * 4 * 2 * n_slots;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fwht",
+            "rotate_x_mq_awq_indexed_batched",
+            bytes,
+        );
+        let result = self.launch_kernargs(
+            "rotate_x_mq_awq_indexed",
+            [n_groups, n_slots as u32, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr xip, ptr xop, ptr awp, ptr sep, ptr s1, ptr s2, i32 kv, i32 ktv],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xop);
+        result
+    }
+
+    pub fn fused_silu_mul_rotate_mq_awq_indexed_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        awq_ptrs: &GpuTensor,
+        slot_expert: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_silu_mul_mq_rotate_awq_indexed",
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC,
+            "fused_silu_mul_mq_rotate_awq_indexed",
+        )?;
+        let s1 = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let gp = gate.buf.as_ptr();
+        let up_p = up.buf.as_ptr();
+        let awp = awq_ptrs.buf.as_ptr();
+        let sep = slot_expert.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let kv = k as i32;
+        let bytes = (k * 4 * 4 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fused",
+            "fused_silu_mul_mq_rotate_awq_indexed_batched",
+            bytes,
+        );
+        let result = self.launch_kernargs(
+            "fused_silu_mul_mq_rotate_awq_indexed",
+            [n_groups, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr gp, ptr up_p, ptr awp, ptr sep, ptr s1, ptr s2, ptr xrp, i32 kv],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
     pub fn fused_silu_mul_rotate_mq_awq_batched(
         &mut self,
         gate: &GpuTensor,

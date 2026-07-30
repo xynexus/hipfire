@@ -1601,6 +1601,33 @@ pub fn run_moe_prefill(
     } else {
         p.x_rot_batch
     };
+    // Per-expert gate_up AWQ: one rotated row per routed slot. `x_rot_batch`
+    // holds one row per TOKEN shared by all k_top slots, which only matches the
+    // weights when every routed expert shares an AWQ basis.
+    let per_slot_gate_up = match (p.gate_up_awq_ptrs, p.x_rot_slots) {
+        (Some(awq_ptrs), Some(slots))
+            if !matches!(p.dtypes.routed_gate_up, DType::F16 | DType::BF16) =>
+        {
+            hip!(gpu.rotate_x_mq_awq_indexed_batched(
+                p.x_norm_batch,
+                slots,
+                awq_ptrs,
+                p.topk_indices,
+                gate_up_k,
+                k_top,
+                total_slots,
+            ))?;
+            Some(slots)
+        }
+        _ => None,
+    };
+    let gate_up_source = per_slot_gate_up.unwrap_or(gate_up_source);
+    let gate_up_x_row_div = if per_slot_gate_up.is_some() { 1 } else { k_top };
+    let gate_up_x_rows = if per_slot_gate_up.is_some() {
+        total_slots
+    } else {
+        n
+    };
 
     // EP (Ship 6 substrate-EP prefill): the routed combine accumulates into
     // `out_target` — the zeroed `[batch × dim]` partial when `routed_out` is set
@@ -1679,9 +1706,9 @@ pub fn run_moe_prefill(
             p.y_gate_up_grouped,
             2 * mi,
             gate_up_k,
-            k_top,
+            gate_up_x_row_div,
             path2_m_total,
-            n,
+            gate_up_x_rows,
             res.use_paro_i8,
             res.use_paro_i8_k8,
             p.routed_oq_arch_combined,
@@ -1898,7 +1925,20 @@ pub fn run_moe_prefill(
             | DType::MQ3G256Lloyd
             | DType::Oq4G256
             | DType::Oq8G256 => {
-                if let Some(awq) = p.down_awq_scale {
+                if let Some(awq_ptrs) = p.down_awq_ptrs {
+                    // Per-expert AWQ: routed down scales differ by an order of
+                    // magnitude across experts, so one representative corrupts
+                    // every slot that did not route to it.
+                    hip!(gpu.fused_silu_mul_rotate_mq_awq_indexed_batched(
+                        p.gate_batch,
+                        p.up_batch,
+                        awq_ptrs,
+                        p.topk_indices,
+                        p.rot_batch,
+                        mi,
+                        total_slots,
+                    ))?;
+                } else if let Some(awq) = p.down_awq_scale {
                     hip!(gpu.fused_silu_mul_rotate_mq_awq_batched(
                         p.gate_batch,
                         p.up_batch,

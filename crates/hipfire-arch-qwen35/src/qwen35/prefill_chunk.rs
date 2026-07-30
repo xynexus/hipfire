@@ -1700,6 +1700,9 @@ pub(crate) fn prefill_moe_ffn_body_batched(
 
     let moe_prefill_params = hipfire_dispatch::families::moe::MoePrefillParams {
         routed_oq_arch_combined: !hipfire_runtime::oq_moe::moe_expert_blocks_repacked(),
+        down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
+        gate_up_awq_ptrs: ffn.expert_gate_up_awq_ptrs.as_ref(),
+        x_rot_slots: Some(&grouped_scratch.x_rot_slots),
         layer: layer_idx,
         capture,
         dtypes: moe_dtypes,

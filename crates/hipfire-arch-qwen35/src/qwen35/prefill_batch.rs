@@ -4171,6 +4171,7 @@ impl PrefillBatchScratch {
                     config.num_experts,
                     2 * config.moe_intermediate_size,
                     config.dim,
+                    config.dim,
                 )?)
             } else {
                 None

@@ -389,6 +389,16 @@ pub struct MoePrefillParams<'a> {
     /// `oq_moe` repack (interleaved blocks only). The grouped GEMM strides the
     /// interleaved region, so it needs the region offset this selects.
     pub routed_oq_arch_combined: bool,
+    /// `[n_exp]` u64 table of per-expert `down.awq_scale` pointers (0 = none).
+    /// When present the routed silu·rotate selects each slot's own vector
+    /// instead of applying `down_awq_scale` (one representative) to all rows.
+    pub down_awq_ptrs: Option<&'a GpuTensor>,
+    /// `[n_exp]` u64 table of per-expert `gate_up.awq_scale` pointers (0 =
+    /// none), paired with `x_rot_slots` scratch. When both are present the
+    /// routed gate_up input is rotated once PER SLOT against its own expert's
+    /// vector instead of sharing one row across all `k_top` slots.
+    pub gate_up_awq_ptrs: Option<&'a GpuTensor>,
+    pub x_rot_slots: Option<&'a GpuTensor>,
     // dims
     pub batch_size: usize,
     pub mi: usize,

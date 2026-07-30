@@ -1814,6 +1814,33 @@ fn paro_load_moe_ffn(
     let expert_down_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
     gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
+    // Per-expert down AWQ scales for the batched routed path. 0 = this expert
+    // carries none, and the indexed kernel skips the divide for its rows.
+    let awq_table = |pick: &dyn Fn(&ExpertWeights) -> Option<&WeightTensor>,
+                     gpu: &mut Gpu|
+     -> HipResult<Option<GpuTensor>> {
+        if !experts
+            .iter()
+            .any(|e| pick(e).and_then(|w| w.awq_scale.as_ref()).is_some())
+        {
+            return Ok(None);
+        }
+        let ptrs: Vec<u64> = experts
+            .iter()
+            .map(|e| {
+                pick(e)
+                    .and_then(|w| w.awq_scale.as_ref())
+                    .map(|t| t.buf.as_ptr() as u64)
+                    .unwrap_or(0)
+            })
+            .collect();
+        let bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+        let table = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+        gpu.hip.memcpy_htod(&table.buf, &bytes)?;
+        Ok(Some(table))
+    };
+    let expert_down_awq_ptrs = awq_table(&|e: &ExpertWeights| Some(&e.down), gpu)?;
+    let expert_gate_up_awq_ptrs = awq_table(&|e: &ExpertWeights| Some(&e.gate_up), gpu)?;
     let expert_gate_up_dtype = experts.first().map(|e| e.gate_up.gpu_dtype);
     let expert_down_dtype = experts.first().map(|e| e.down.gpu_dtype);
     let expert_gate_up_dtypes = experts.iter().map(|e| e.gate_up.gpu_dtype).collect();
@@ -1826,6 +1853,8 @@ fn paro_load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_down_awq_ptrs,
+        expert_gate_up_awq_ptrs,
         layer_idx,
         expert_shape: None,
         expert_gate_up_dtype,
@@ -6166,6 +6195,33 @@ fn load_moe_ffn(
     let expert_down_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
     gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
+    // Per-expert down AWQ scales for the batched routed path. 0 = this expert
+    // carries none, and the indexed kernel skips the divide for its rows.
+    let awq_table = |pick: &dyn Fn(&ExpertWeights) -> Option<&WeightTensor>,
+                     gpu: &mut Gpu|
+     -> HipResult<Option<GpuTensor>> {
+        if !experts
+            .iter()
+            .any(|e| pick(e).and_then(|w| w.awq_scale.as_ref()).is_some())
+        {
+            return Ok(None);
+        }
+        let ptrs: Vec<u64> = experts
+            .iter()
+            .map(|e| {
+                pick(e)
+                    .and_then(|w| w.awq_scale.as_ref())
+                    .map(|t| t.buf.as_ptr() as u64)
+                    .unwrap_or(0)
+            })
+            .collect();
+        let bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+        let table = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+        gpu.hip.memcpy_htod(&table.buf, &bytes)?;
+        Ok(Some(table))
+    };
+    let expert_down_awq_ptrs = awq_table(&|e: &ExpertWeights| Some(&e.down), gpu)?;
+    let expert_gate_up_awq_ptrs = awq_table(&|e: &ExpertWeights| Some(&e.gate_up), gpu)?;
     let expert_gate_up_dtype = experts.first().map(|e| e.gate_up.gpu_dtype);
     let expert_down_dtype = experts.first().map(|e| e.down.gpu_dtype);
     let expert_gate_up_dtypes = experts.iter().map(|e| e.gate_up.gpu_dtype).collect();
@@ -6178,6 +6234,8 @@ fn load_moe_ffn(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_down_awq_ptrs,
+        expert_gate_up_awq_ptrs,
         // MAD-93 v0.1: non-paged loader path. Layer identity for pager-keyed
         // future work, expert_shape None (callers read shapes off `experts`
         // directly when paged_experts==false).
@@ -6286,6 +6344,8 @@ fn load_moe_ffn_paged(
         shared_expert_gate,
         expert_gate_up_ptrs,
         expert_down_ptrs,
+        expert_down_awq_ptrs: None,
+        expert_gate_up_awq_ptrs: None,
         layer_idx,
         expert_shape: Some(hipfire_runtime::weight_pager::ExpertShape {
             gate_up_m: 2 * mi,
