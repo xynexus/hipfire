@@ -646,3 +646,26 @@ NEXT: check whether the runtime sequence drains/resets the fifos per dispatch,
 and compare against the UNSCALED full-K path (`r6_gen_mp_fullk.py`), which is
 repeatedly called by `npu_linear` in the working llama path and does NOT show
 this — so whatever it does differently is the fix.
+
+### Generator diff: the dispatch pattern is the SAME, so the desync is in the link
+
+Comparing `r6_gen_mp_fullk.py` (unscaled, called ~12k times per llama run by
+`npu_linear` without desyncing) against `r6_gen_mp_fullk_scaled.py`:
+
+Both runtime sequences follow the same shape — configure and start the input
+task(s) and `@fw`, configure `@fc` with `issue_token`, `dma_await_task` on `@fc`
+only, then free. Neither awaits its INPUT task before freeing it. So the
+start/await/free pattern is not the difference.
+
+What the scaled schedule adds is a second consumer: under COLS=8 one host
+stream `@fx` is split by `objectfifo.link [@fx] -> [@fa, @fs] ([] [0, AW])` into
+the GEMM core's activations and the scale core's payload, and a second core
+(`%s{col}`) with its own `@fr`/`@fs`/`@fc` acquire pattern (`@fc` once per slab,
+`@fr`/`@fs` once per group). Element counts balance per dispatch — NB slabs,
+NB*KGROUPS groups, `@fc` repeat_count = NB-1 — so the imbalance is not in the
+counts.
+
+That leaves the link's buffering, or the two consumers of `@fx` draining at
+different rates and leaving residue at dispatch end. Worth testing directly:
+call `run_resident_scaled` twice with IDENTICAL inputs and compare — the
+reversal experiment implies call 2 differs from call 1.
