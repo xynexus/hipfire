@@ -81,7 +81,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // pre-tiled load_v/store_v variant; it builds and runs but reads a different
     // A/W layout, so `run_f32` returns plausible-looking noise instead of the
     // reference. Same trap for MT: 16 builds fine and is also wrong.
-    let w4 = format!("{home}/.hipfire/npu/r6ts_4x4x16_c8_nb{nb}");
+    // Decode is M=1, and the per-group path reads back `groups * block_m * N`
+    // int32 partials — so block_m, not the kernel, dominates a decode call.
+    // MT=4 gives block_m=16; MT=1 gives 4. HIPFIRE_NPU_W4_MT=1 selects the
+    // smaller build so the difference can be measured against the same weights.
+    let w4_mt: usize = std::env::var("HIPFIRE_NPU_W4_MT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let w4 = format!("{home}/.hipfire/npu/r6ts_{w4_mt}x4x16_c8_nb{nb}");
     // The m8k8 W8 kernel has MK=8, so K=256 needs KCHUNK=32. MT=16 at that KCHUNK
     // overruns L1 ("allocated buffers exceeded available memory").
     let w8 = format!("{home}/.hipfire/npu/r6mp_4x4x32_c8_nb{nb}_m8k8_w8");

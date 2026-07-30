@@ -178,6 +178,50 @@ fn cache_dir(n: usize, k: usize) -> Option<String> {
         .then_some(dir)
 }
 
+fn have(dir: &str) -> bool {
+    std::path::Path::new(&format!("{dir}/final.xclbin")).exists()
+}
+
+/// Build the executor for an `N`-column linear, preferring the per-group trio.
+///
+/// Both paths read back `groups * block_m * N` int32 partials and scale on the
+/// host, so for decode (M=1) it is `block_m`, not the kernel, that dominates:
+/// every row past the first is computed and transferred for nothing. The trio's
+/// MT=1 build has `block_m = 4` against the full-K `m8` build's 8, and spreads
+/// over 8 columns rather than the 1 the full-K path is loaded with. Measured on
+/// Llama-3.2-1B oq4++ at M=1, identical output (0 mismatches):
+/// gate_proj K=2048 N=8192 9.37 -> 2.07 ms, q_proj N=2048 1.13 -> 0.80 ms.
+///
+/// Falls back to full-K when the trio is not built for this N — the trio needs
+/// all three caches present, and only the shapes we have built are covered.
+fn load_executor(n: usize, k: usize) -> Option<NpuOpusExecutor> {
+    let home = std::env::var("HOME").ok()?;
+    // Opt-in, NOT the default: measured end to end on Llama-3.2-1B the trio is
+    // 4.0 tok/s against full-K's 6.2. The trio's MT=1 build beats the trio's
+    // MT=4 build 4.5x on a single linear (9.37 -> 2.07 ms on gate_proj), which
+    // is real, but full-K does that same linear in 1.54 ms — so the per-linear
+    // win does not survive contact with the path the runtime actually uses.
+    // Kept behind a flag because MT=1 is still the right shape for decode and
+    // will matter once the scale-application work removes the partial readback.
+    let trio_ok = std::env::var("HIPFIRE_NPU_TRIO").is_ok_and(|v| v != "0");
+    if trio_ok && n % 64 == 0 {
+        let nb = n / 64;
+        let w4 = format!("{home}/.hipfire/npu/r6ts_1x4x16_c8_nb{nb}");
+        let w8 = format!("{home}/.hipfire/npu/r6mp_4x4x32_c8_nb{nb}_m8k8_w8");
+        let sp3 = format!("{home}/.hipfire/npu/r6mp_4x4x16_c8_nb{nb}_sparse3");
+        if have(&w4) && have(&w8) && have(&sp3) {
+            if let Ok(exec) = NpuOpusExecutor::load_cached(&w4, &w8, &sp3, n) {
+                if timing_enabled() {
+                    eprintln!("[npu-decode] trio MT=1 N={n}");
+                }
+                return Some(exec);
+            }
+        }
+    }
+    let dir = cache_dir(n, k)?;
+    NpuOpusExecutor::load_fullk_cached(&[(&dir, 1)], n).ok()
+}
+
 /// Run `y = W x` on the NPU. `None` = not eligible; caller falls back.
 pub fn try_npu_gemv(
     gpu: &mut Gpu,
@@ -254,20 +298,16 @@ pub fn try_npu_gemv(
             return None;
         }
         if !reg.weights.contains_key(&key) {
-            let Some(dir) = cache_dir(m, k) else {
-                reg.rejected.insert(key, ());
-                return None;
-            };
             let Some(payload) = canonical_from_arch(combined.as_deref()?, m, k) else {
                 reg.rejected.insert(key, ());
                 return None;
             };
             if !reg.executors.contains_key(&m) {
-                match NpuOpusExecutor::load_fullk_cached(&[(&dir, 1)], m) {
-                    Ok(exec) => {
+                match load_executor(m, k) {
+                    Some(exec) => {
                         reg.executors.insert(m, exec);
                     }
-                    Err(_) => {
+                    None => {
                         reg.rejected.insert(key, ());
                         return None;
                     }

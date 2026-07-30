@@ -1214,3 +1214,52 @@ any NPU number:
 - `npu_linear_oq4`'s `--unscaled` is parsed with `opt()`, which reads the
   *following* argument, so as a trailing flag it never registers. Pass it
   non-last until fixed.
+
+## MT=1 trio: a real per-linear win that does NOT survive end to end
+
+Decode is M=1, and every per-group path reads back `groups * block_m * N` int32
+partials — so `block_m`, not the kernel, dominates a decode call; every row past
+the first is computed and transferred for nothing. Building MT=1 caches
+(`block_m = 4` vs MT=4's 16) and pointing the executor at them, on real
+Llama-3.2-1B oq4++ weights at M=1, **0 mismatches in both cases**:
+
+| linear | MT=4 | MT=1 | speedup |
+|---|---|---|---|
+| gate_proj K=2048 N=8192 | 9.37 ms | 2.07 ms | 4.5x |
+| q_proj K=2048 N=2048 | 1.13 ms | 0.80 ms | 1.4x |
+
+**But making it the runtime default was a regression: 6.2 -> 4.0 tok/s.** The
+error was comparing trio-MT4 against trio-MT1 and applying the result to a
+runtime that used *neither* — `npu_linear.rs` loads the full-K path, which does
+that same gate_proj in **1.54 ms**, faster than the MT=1 trio's 2.07 ms. The
+per-linear win is real and the comparison was against the wrong baseline.
+
+Reverted to opt-in (`HIPFIRE_NPU_TRIO=1`). Default is unchanged at 6.2 tok/s,
+verified. MT=1 is still the right shape for decode and will matter once scale
+application stops requiring a partial readback at all.
+
+## The arithmetic: per-linear dispatch cannot beat FLM, at any kernel speed
+
+Llama-3.2-1B decode issues **112 NPU linears per token** (16 layers x 7: q, k,
+v, o, gate, up, down — confirmed in the `[npu-decode] resident` trace). At the
+full-K path's 1.54 ms that is 172 ms/token = 5.8 tok/s, which is the measured
+6.2. So per-linear cost fully explains end-to-end throughput; nothing else is
+hiding.
+
+Now take the floor. Measured per-dispatch overhead is **~0.17 ms** and it is
+independent of both data volume and column count. Even at that floor, with one
+perfect dispatch per linear and zero kernel time:
+
+    112 x 0.17 ms = 19.0 ms/token = 52.5 tok/s
+
+**against FastFlowLM's 60.1 tok/s** — and that ignores attention, norms and
+sampling. So the current one-dispatch-per-linear architecture has a hard ceiling
+*below* the target, no matter how fast the kernels get. This is not a tuning
+problem.
+
+That is the same conclusion the transaction decompile reached from the other
+direction: FLM ships a `layer.xclbin` and issues 22 WRITEs and 4 BDs per column
+against our 3 and 3 — it runs a fused layer per dispatch. Fusing multiple
+linears per dispatch is not an optimisation here, it is the only route to the
+goal, and it also happens to be what moves us into the N regime where we already
+measured 47.2 GB/s (vs FLM's 46.4).
