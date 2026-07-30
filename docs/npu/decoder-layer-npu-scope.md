@@ -412,3 +412,29 @@ Also: the r118/r129 "staged" full-K kernel belongs to `NpuGemmStagedFullK`, not
 `NpuGemmFullK` — pairing them builds and runs and returns garbage. And `GROUPS`
 is a bash builtin (the caller's gid array), so assigning it in a build script
 silently yields 1000.
+
+### Scaled full-K: alignment is implicated, but padding alone does not fix it
+
+Tested 2026-07-30. `r6_scale_accum.cc` reads
+`weight_scales = activation_scales + ROWS` with `ROWS = MT*4 = M/COLS`. At
+M=64/COLS=8 that is ROWS=8 floats = a **32-byte** offset, while
+`aie::load_v<16>` on floats is a 64-byte vector load wanting a 64-byte aligned
+address. That would be invisible in exactly one case — a uniform-1.0 payload,
+where any misaligned read still yields 1.0 — which is the one case that passes.
+
+Padding the activation-scale region to 16 floats (updating `ROWS_PADDED` in the
+kernel, `SE` in `r6_gen_mp_fullk_scaled.py`, and `scale_bytes` /
+`copy_scale_payload` / the `input_bytes` allocation in `gemm_fullk.rs`) CHANGES
+the result — the weight-only case moved from -9.0 to -4.5 against a want of
+385.5 — so the payload layout is genuinely implicated. But it does not correct
+it, and the remaining error cannot be explained by group assignment or scale
+indexing either, because every failing case uses UNIFORM scales under which any
+permutation or mis-assignment is unobservable.
+
+REVERTED, deliberately. `copy_scale_payload` and the `SE` contract are shared
+with the EmbeddingGemma whole-scaled/full-K paths, whose cached xclbins were
+built against the old size; landing a half-migrated scale ABI risks breaking a
+working consumer to chase a broken one. Reproduce with
+`examples/npu_fullk_scaled_bug` before changing it again, and re-run the
+EmbeddingGemma sweeps after — noting that those sweeps use all-1.0 scales and
+therefore cannot detect a regression in this exact area.
