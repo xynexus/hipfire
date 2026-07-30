@@ -103,6 +103,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        // Diagnose the mechanism at the worst cell: print every group's
+        // contribution so "only the last group survived" (init overwriting
+        // instead of accumulating) is distinguishable from a scale-indexing
+        // fault or from reading scales out of the wrong buffer.
+        {
+            // Fixed cell across all cases so the three are comparable.
+            let (r, c) = (11usize, 2usize);
+            let mut parts = Vec::new();
+            for g in 0..groups {
+                parts.push(
+                    partials[(g * rows + r) * n + c] as f32
+                        * act_scales[g * rows + r]
+                        * weight_scales[g][c],
+                );
+            }
+            let sum: f32 = parts.iter().sum();
+            let last = *parts.last().unwrap();
+            let first = parts[0];
+            println!(
+                "  probe row={r} col={c} got={:.4} sum={sum:.4} first={first:.4} last={last:.4} \
+                 per_group={:?}",
+                out[r * n + c],
+                parts
+                    .iter()
+                    .map(|v| (v * 100.0).round() / 100.0)
+                    .collect::<Vec<_>>()
+            );
+        }
         let (r, c) = worst_at;
         let mut want0 = 0.0f32;
         for g in 0..groups {
