@@ -591,11 +591,21 @@ Two further probes, both with the fault-1 padding applied:
 So for groups 1..7: the scales arrive correctly, the load is fixed, and yet the
 product is wrong — while group 0's product is right (stage probe) and the
 all-1.0 case is right for every group. Uniform scales make a wrong scale VALUE
-unobservable, so what remains is the PAIRING: each group's `integers` (the
-r6_mac partial arriving on `@fr`) being combined with a different group's scale
-payload on `@fs`, or the two fifos advancing out of step. Both fifos are
-acquired once per group in `r6_gen_mp_fullk_scaled.py`'s scale core loop, so
-their relative ordering across the init/accum boundary is the thing to check.
+unobservable, so the natural suspect was the PAIRING between each group's
+r6_mac partial on `@fr` and its scale payload on `@fs`.
+
+**That hypothesis is eliminated by reading the generator.** The GEMM core
+produces `@fr` as `for slab { for group { acquire/produce } }`, and the scale
+core consumes it as `for slab { init(group 0); for group 1..KGROUPS-1 {...} }` —
+one `@fr` and one `@fs` per (slab, group), in the same nesting order. Both
+streams therefore advance in lockstep by construction. In the COMBINED (COLS=8)
+layout they even originate from a single host stream that
+`objectfifo.link [@fx] -> [@fa, @fs] ([] [0, AW])` splits, so they cannot skew.
+
+So fault 2 is NOT mis-pairing and NOT scale delivery (dumped correct for the
+accumulate groups). What is left is the accumulate arithmetic itself under
+non-unit scales, or the reuse of the single `@fc` output buffer across the
+init and accumulate calls within a slab. That is the next thing to probe.
 
 Note this is invisible in the all-1.0 case for the same reason as fault 1: every
 group's payload is identical, so mis-pairing changes nothing.
