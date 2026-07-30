@@ -1452,3 +1452,54 @@ the fifos" from "any second dispatch desyncs them". Those two have different
 fixes — the first is a host-side ordering/sync problem in
 `upload_resident_weights`, the second means the schedule needs a drain or a
 bounded outer loop instead of `INF`.
+
+## REFINED: dispatch is stable; the fault is scale indexing in the ACCUMULATE pass
+
+The previous section concluded the fault was cross-dispatch state. That was
+half right and the half that was wrong matters. `HIPFIRE_REPEAT_ONE=1` uploads
+resident weights ONCE and dispatches the identical input three times:
+
+```
+run=0 max_abs_vs_reference=0.000000 max_abs_vs_run0=0.000000
+run=1 max_abs_vs_reference=0.000000 max_abs_vs_run0=0.000000
+run=2 max_abs_vs_reference=0.000000 max_abs_vs_run0=0.000000
+```
+
+**Repeated dispatch is exact and bit-identical.** The array does not desync. The
+order-dependence seen earlier was caused by the isolator calling
+`upload_resident_weights` between cases — a test artifact, not a schedule
+defect. This matters for production: the decode path uploads weights once and
+dispatches many times, which is exactly the pattern that works.
+
+With that confound removed, one upload and *varying* scales, the result is
+**wrong but perfectly deterministic** (`max_abs_vs_run0 = 0.000000` on every
+axis). So this is an indexing/addressing bug, not a race.
+
+Varying one axis at a time (all-1.0 passes exactly, so any failing axis names a
+bad index):
+
+| axis varied | max_abs vs reference | out[0] |
+|---|---|---|
+| weight scale by column | 5397 | -371 (= all-1.0 value) |
+| weight scale by group | 3567 | **-371 (= all-1.0 value)** |
+| activation scale by row | 610080 | -371 (= all-1.0 value) |
+| activation scale by group | 24726 | **-17869 (moved)** |
+
+The informative cell is `out[0]` under `wgroup`: only weight-group scaling can
+change that cell, and it did not move — the kernel appears to apply one group's
+weight scale to every group. Under `agroup` the same cell does move, so the
+activation side of the payload is reaching the accumulate pass while the weight
+side is not being re-read per group.
+
+**Why every probe so far missed this:** `r6_scale_dump_probe.cc` implements only
+the `!ACCUMULATE` branch, so it dumps the payload for **group 0 only** — the
+`r6_scale_init` call. Groups 1..KGROUPS-1 go through `r6_scale_accum`, and no
+probe has ever observed what those receive. That is the blind spot the whole
+investigation has been circling.
+
+**Next probe (specific):** extend the dump to the `ACCUMULATE` branch, writing
+group N's received payload to a distinct output offset, and compare groups 1..7
+against group 0. If they are identical, the `@fs` fifo is delivering the same
+object every group and the fix is in the schedule's per-group scale
+acquisition; if they differ but are wrong, the fix is in `copy_scale_payload`'s
+group stride.

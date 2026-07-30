@@ -63,6 +63,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (the cores loop forever over the fifos and a dispatch leaves them mid
     // slab), not scale handling — and "all-1.0 passes" was an artifact of it
     // always being tested first.
+    // HIPFIRE_REPEAT_ONE separates the two remaining explanations for the
+    // order-dependent corruption. Each normal case does prepack ->
+    // upload_resident_weights -> run, so a failure at position 2+ could be
+    // caused by the re-upload OR by the second dispatch. This mode uploads ONCE
+    // and dispatches the identical input three times: if runs 2 and 3 still
+    // diverge, the dispatch itself desyncs the array and the schedule is at
+    // fault; if they agree, the fault is in upload_resident_weights.
+    if std::env::var("HIPFIRE_REPEAT_ONE").is_ok() {
+        // Vary ONE axis at a time. All-1.0 passes, so any axis that fails names
+        // the index the kernel gets wrong. HIPFIRE_AXIS=wcol|wgroup|arow|agroup.
+        let axis = std::env::var("HIPFIRE_AXIS").unwrap_or_else(|_| "wcol".into());
+        let weight_scales: Vec<Vec<f32>> = (0..groups)
+            .map(|g| {
+                (0..n)
+                    .map(|c| match axis.as_str() {
+                        "wcol" => 1.0 + (c % 8) as f32,
+                        "wgroup" => 1.0 + g as f32,
+                        _ => 1.0,
+                    })
+                    .collect()
+            })
+            .collect();
+        let act_scales: Vec<f32> = (0..groups * rows)
+            .map(|i| match axis.as_str() {
+                // laid out [group][row]
+                "arow" => 1.0 + (i % rows) as f32,
+                "agroup" => 1.0 + (i / rows) as f32,
+                _ => 1.0,
+            })
+            .collect();
+        let scale_refs: Vec<&[f32]> = weight_scales.iter().map(Vec::as_slice).collect();
+        let packed = scaled.prepack_weights_with_scales(&base_refs, &residual_refs, &scale_refs)?;
+        let resident = scaled.upload_resident_weights(&packed)?;
+        let mut first: Option<Vec<f32>> = None;
+        for run in 0..3 {
+            let mut out = vec![0.0f32; rows * n];
+            scaled.run_resident_scaled(&resident, &activations, &act_scales, &mut out)?;
+            let mut want_err = 0.0f32;
+            for row in 0..rows {
+                for col in 0..n {
+                    let mut want = 0.0f32;
+                    for g in 0..groups {
+                        want += partials[(g * rows + row) * n + col] as f32
+                            * act_scales[g * rows + row]
+                            * weight_scales[g][col];
+                    }
+                    want_err = want_err.max((out[row * n + col] - want).abs());
+                }
+            }
+            let drift = first
+                .as_ref()
+                .map(|f| {
+                    f.iter()
+                        .zip(&out)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max)
+                })
+                .unwrap_or(0.0);
+            println!(
+                "run={run} max_abs_vs_reference={want_err:.6} max_abs_vs_run0={drift:.6} \
+                 out[0]={:.4}",
+                out[0]
+            );
+            first.get_or_insert(out);
+        }
+        return Ok(());
+    }
     let mut cases = vec![
         ("all 1.0", 1.0f32, 1.0f32),
         ("weight only", 0.5f32, 1.0f32),
