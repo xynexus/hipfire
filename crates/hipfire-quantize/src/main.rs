@@ -2897,6 +2897,7 @@ static SPILL_BF16_STATS: Mutex<Bf16CompressStats> = Mutex::new(Bf16CompressStats
     compressed: 0,
     not_smaller: 0,
     skipped_spilled: 0,
+    gather_lut3: 0,
     bytes_before: 0,
     bytes_after: 0,
 });
@@ -2923,6 +2924,7 @@ fn record_spill_compression(s: &Bf16CompressStats) {
         g.compressed += s.compressed;
         g.not_smaller += s.not_smaller;
         g.skipped_spilled += s.skipped_spilled;
+        g.gather_lut3 += s.gather_lut3;
         g.bytes_before += s.bytes_before;
         g.bytes_after += s.bytes_after;
     }
@@ -2934,6 +2936,7 @@ fn merge_spill_compression(s: &mut Bf16CompressStats) {
         s.compressed += g.compressed;
         s.not_smaller += g.not_smaller;
         s.skipped_spilled += g.skipped_spilled;
+        s.gather_lut3 += g.gather_lut3;
         s.bytes_before += g.bytes_before;
         s.bytes_after += g.bytes_after;
     }
@@ -4989,12 +4992,13 @@ fn run_hfq_source_pipeline(
     // counted there, not here.
     bf16_stats.compressed += early_bf16_stats.compressed;
     bf16_stats.not_smaller += early_bf16_stats.not_smaller;
+    bf16_stats.gather_lut3 += early_bf16_stats.gather_lut3;
     bf16_stats.bytes_before += early_bf16_stats.bytes_before;
     bf16_stats.bytes_after += early_bf16_stats.bytes_after;
     merge_spill_compression(&mut bf16_stats);
     if bf16_stats.compressed > 0 || bf16_stats.skipped_spilled > 0 {
         eprintln!(
-            "  bf16 codec: {} tensors {:.1} MB -> {:.1} MB ({:.4}x){}{}",
+            "  bf16 codec: {} tensors {:.1} MB -> {:.1} MB ({:.4}x){}{}{}",
             bf16_stats.compressed,
             bf16_stats.bytes_before as f64 / 1e6,
             bf16_stats.bytes_after as f64 / 1e6,
@@ -5006,6 +5010,11 @@ fn run_hfq_source_pipeline(
             },
             if bf16_stats.skipped_spilled > 0 {
                 format!(", {} skipped (already spilled)", bf16_stats.skipped_spilled)
+            } else {
+                String::new()
+            },
+            if bf16_stats.gather_lut3 > 0 {
+                format!(", {} gather-shaped as lut3", bf16_stats.gather_lut3)
             } else {
                 String::new()
             },
@@ -12125,7 +12134,7 @@ fn main() {
     merge_spill_compression(&mut bf16_stats);
     if bf16_stats.compressed > 0 || bf16_stats.skipped_spilled > 0 {
         eprintln!(
-            "  bf16 codec: {} tensors {:.1} MB -> {:.1} MB ({:.4}x){}{}",
+            "  bf16 codec: {} tensors {:.1} MB -> {:.1} MB ({:.4}x){}{}{}",
             bf16_stats.compressed,
             bf16_stats.bytes_before as f64 / 1e6,
             bf16_stats.bytes_after as f64 / 1e6,
@@ -12137,6 +12146,11 @@ fn main() {
             },
             if bf16_stats.skipped_spilled > 0 {
                 format!(", {} skipped (already spilled)", bf16_stats.skipped_spilled)
+            } else {
+                String::new()
+            },
+            if bf16_stats.gather_lut3 > 0 {
+                format!(", {} gather-shaped as lut3", bf16_stats.gather_lut3)
             } else {
                 String::new()
             },

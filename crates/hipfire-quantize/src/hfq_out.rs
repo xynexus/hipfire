@@ -90,8 +90,28 @@ pub struct Bf16CompressStats {
     /// Tensors whose bytes were already spilled to disk and so could not be
     /// recoded in place.
     pub skipped_spilled: usize,
+    /// Gather-shaped tensors steered to `Bf16Lut3` instead of `Bf16Huff`.
+    pub gather_lut3: usize,
     pub bytes_before: u64,
     pub bytes_after: u64,
+}
+
+/// Whether a tensor is read by gather rather than swept end to end.
+///
+/// `lm_head` is the case that matters: the two-stage head shortlists candidate
+/// rows on device and rescores only those, so the fine tier is indexed, never
+/// streamed. `embed_tokens` is the same shape of access — a forward pass touches
+/// only the rows for the tokens in the batch.
+///
+/// It decides the codec because the two formats differ in what they can do, not
+/// just how well they compress. `bf16_huff` exposes whole-tensor `decode` only,
+/// so using it here forces materialising the entire head as plain BF16.
+/// `bf16_lut3` is planar and block-addressable (`decode_block`, 256 elements),
+/// which is what lets `gemv_bf16l3` decode in registers and keep the weights
+/// packed in VRAM. On a 27B head that trades ~160 MB of disk for ~780 MB of
+/// VRAM, and the loader already honours the choice per tensor.
+pub fn is_gather_shaped(name: &str) -> bool {
+    name.contains("lm_head") || name.contains("embed_tokens")
 }
 
 /// Recode plain-BF16 tensors with the selected lossless codec, in place.
@@ -141,18 +161,36 @@ pub fn compress_bf16_tensor(t: &mut HfqTensor, codec: Bf16Codec, stats: &mut Bf1
     {
         return;
     }
-    let packed = match codec {
+    // A gather-read tensor takes the block-addressable format even though it
+    // compresses less; see `is_gather_shaped`. An explicit --bf16-codec lut3 or
+    // none is left alone -- this only refines the default.
+    let steered = codec == Bf16Codec::Huff && is_gather_shaped(&t.name);
+    let effective = if steered { Bf16Codec::Lut3 } else { codec };
+
+    let mut chosen = effective;
+    let mut packed = match effective {
         Bf16Codec::Huff => hipfire_primitives::bf16_huff::encode_if_smaller(&t.data),
         Bf16Codec::Lut3 => hipfire_primitives::bf16_lut3::encode_if_smaller(&t.data),
         Bf16Codec::None => None,
     };
+    // LUT3 wins less often than Huffman (1.38x vs 1.50x), so a steered tensor it
+    // declines would otherwise land as plain BF16 -- worse on both axes. Fall
+    // back rather than lose the compression entirely.
+    if packed.is_none() && steered {
+        packed = hipfire_primitives::bf16_huff::encode_if_smaller(&t.data);
+        chosen = Bf16Codec::Huff;
+    }
+
     match packed {
         Some(packed) => {
             stats.compressed += 1;
+            if chosen == Bf16Codec::Lut3 && steered {
+                stats.gather_lut3 += 1;
+            }
             stats.bytes_before += t.data.len() as u64;
             stats.bytes_after += packed.len() as u64;
             t.data = packed;
-            t.quant_type = match codec {
+            t.quant_type = match chosen {
                 Bf16Codec::Huff => QuantType::Bf16Huff,
                 _ => QuantType::Bf16Lut3,
             };
