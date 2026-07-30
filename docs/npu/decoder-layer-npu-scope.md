@@ -981,9 +981,13 @@ The decode linear is neither MAC-bound nor (per the earlier feed comparison)
 port-bound at 13.4 GB/s — it sits at 5.66 GB/s, i.e. **42% of a single column**.
 
 That is the open question worth the next measurement: where the single-column
-decode dispatch actually stalls. The tool for it is the AIE trace unit
-(`benchmarks/npu_gemm_tuning/r1/r1b_trace_run.py`, which reports
-PORT_RUNNING/STALLED/IDLE and BUSY_FRAC for a compute tile's S2MM port) pointed
-at THIS configuration rather than at R1's. Per the AIE kernel-opt skill's own
+decode dispatch actually stalls. The tool for it is the AIE trace unit, but note
+`benchmarks/npu_gemm_tuning/r1/r1b_trace_run.py` BUILDS ITS OWN synthetic IRON
+design (`r1b_feed.cc`) with trace events attached — it does not attach to an
+existing xclbin. Tracing the full-K decode dispatch therefore means adding trace
+configuration to `r6_gen_mp_fullk.py`'s design (packet-switched trace flow +
+`CoreEvent.PORT_RUNNING/STALLED/IDLE` on the compute tile's S2MM port, plus a
+trace BD in the runtime sequence), not just pointing the existing script at a
+different cache. Per the AIE kernel-opt skill's own
 rule, that has to be measured, not modelled — static reasoning about AIE timing
 has mispredicted by 5-300x.
