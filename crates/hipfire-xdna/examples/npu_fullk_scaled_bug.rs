@@ -79,6 +79,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut out = vec![0.0f32; rows * n];
         scaled.run_resident_scaled(&resident, &activations, &act_scales, &mut out)?;
 
+        if std::env::var("HIPFIRE_DUMP_PAYLOAD").is_ok() {
+            // With the dump probe kernel loaded, row 0 of the output holds the
+            // scale payload the core received: ROWS activation scales then
+            // SLAB_N weight scales.
+            let rows_per_core = rows / cols;
+            let act: Vec<f32> = out[..rows_per_core].to_vec();
+            let wt: Vec<f32> = out[rows_per_core..rows_per_core + 8].to_vec();
+            println!(
+                "  payload case={case}: act[0..{}]={:?} wt[0..8]={:?}",
+                rows_per_core, act, wt
+            );
+            continue;
+        }
         let mut worst = 0.0f32;
         let mut worst_at = (0usize, 0usize);
         let mut ratio_sum = 0.0f64;

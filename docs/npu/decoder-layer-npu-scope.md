@@ -467,3 +467,41 @@ Q8_0 NPU path for attention or an oq4-quantised attention artifact. The
 
 Cache shapes that WOULD be needed for the shared expert alone (built, unused
 until a hook exists): K=2048 N=512 (gate/up) and K=512 N=2048 (down).
+
+### Scaled full-K, localised: delivery is correct, the ARITHMETIC is wrong
+
+`benchmarks/npu_gemm_tuning/r6/r6_scale_dump_probe.cc` replaces the scale math
+with a copy of the received `scale_payload` into the output, so the host can see
+exactly what the core got. Build a cache with it in place of
+`r6_scale_accum.cc` and run `npu_fullk_scaled_bug` with
+`HIPFIRE_DUMP_PAYLOAD=1`:
+
+| case | activation scales received | weight scales received |
+|---|---|---|
+| all 1.0 | `[1.0 x8]` | `[1.0 x8]` |
+| weight 0.5 uniform | `[1.0 x8]` | `[0.5 x8]` |
+| activation 0.25 uniform | `[0.25 x8]` | `[1.0 x8]` |
+
+Exactly what `copy_scale_payload` wrote, at the expected offsets. So:
+
+- **NOT** a routing fault — the core receives the right bytes.
+- **NOT** a payload-layout or offset fault — `weight_scales =
+  activation_scales + ROWS` reads the correct values.
+- **NOT** a delivery-alignment fault — scalar reads at those offsets return the
+  written data. (An earlier padding experiment changed the result, which had
+  suggested alignment; this supersedes it. Padding perturbs the arithmetic path,
+  not the delivery.)
+- **NOT** the accumulate — the all-1.0 case sums all 8 groups exactly (771).
+
+What remains is the float math in `scale_impl`: `aie::to_float(integers)`,
+`aie::mul(values, weight_scale)`, `aie::mul(scaled, row_scale)`, and their
+`.to_vector<float>()` conversions. Multiplying by 1.0 gives the exact answer;
+multiplying by 0.5 or 0.25 does not, and not by a constant factor (the sign
+flips). That points at the accumulator/vector-conversion semantics of the AIE
+API rather than at anything in this repo's plumbing, and is the next thing to
+check against the aie_api documentation for aie2p.
+
+Two failed approaches, recorded so they are not repeated: replacing the whole
+body with scalar C++ produced all zeros, and replacing only the weight-scale
+`aie::load_v<16>` with an `aie::broadcast` of one scalar produced infinities —
+both broke the previously-exact all-1.0 case, so neither isolated anything.
