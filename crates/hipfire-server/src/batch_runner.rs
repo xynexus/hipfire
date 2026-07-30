@@ -239,6 +239,10 @@ pub struct BatchTelemetry {
     /// Times a running image yielded at a sampler-step boundary and was
     /// restarted from seed (Phase 5.2).
     pub image_preemptions: u64,
+    /// Times a running batch admitted new requests at a decode-step boundary.
+    pub joins: u64,
+    /// Sessions admitted mid-cycle by those joins.
+    pub joined_sessions: u64,
 }
 
 /// The generic seam the runner groups by: two requests may share one fused
@@ -402,6 +406,8 @@ impl BatchTelemetry {
             "active_sessions": self.active_sessions,
             "preemptions": self.preemptions,
             "image_preemptions": self.image_preemptions,
+            "joins": self.joins,
+            "joined_sessions": self.joined_sessions,
         })
     }
 
@@ -442,6 +448,13 @@ pub fn batch_max() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n >= 1)
         .unwrap_or(BATCH_MAX_DEFAULT)
+}
+
+/// Whether a request that arrives mid-cycle may join the running batch at the
+/// next decode-step boundary instead of waiting for it to drain. Kill switch
+/// `HIPFIRE_SERVER_BATCH_JOIN=0` restores the drain-first behaviour.
+fn join_enabled() -> bool {
+    std::env::var("HIPFIRE_SERVER_BATCH_JOIN").ok().as_deref() != Some("0")
 }
 
 /// Gather window: after the first request appears, wait this long for more to
@@ -915,6 +928,162 @@ fn fail_all(txs: &HashMap<String, mpsc::UnboundedSender<BatchEvent>>, msg: &str)
     }
 }
 
+/// Record each session's post-prefill cursor from a `generate_batch_prefill`
+/// event stream. Shared by the initial prefill and by mid-cycle joins.
+fn collect_prefill_positions(events: &[serde_json::Value], positions: &mut HashMap<String, usize>) {
+    for ev in events {
+        if ev.get("type").and_then(|t| t.as_str()) != Some("generate_batch_prefill_session_done") {
+            continue;
+        }
+        if let (Some(sid), Some(pos)) = (
+            ev.get("session_id").and_then(|v| v.as_str()),
+            ev.get("logical_position").and_then(|v| v.as_u64()),
+        ) {
+            positions.insert(sid.to_string(), pos as usize);
+        }
+    }
+}
+
+/// Sessions admitted into a running batch at a decode-step boundary.
+struct Joined {
+    specs: Vec<SessionSpec>,
+    lease_ids: Vec<u64>,
+}
+
+/// Try to admit queued requests into the running batch.
+///
+/// The daemon keys resident sessions by `session_id`, not by batch — a prefill
+/// adds to `q35_registry.sessions` without disturbing anyone else, and a decode
+/// step takes an arbitrary cursor list. So a newcomer only has to be prefilled
+/// and then named in the next step's cursors; nothing about the running
+/// sessions changes. That is the whole join.
+///
+/// Only same-`microbatch_key` (same worker/model) waiters are eligible, checked
+/// by peeking BEFORE leasing so an incompatible waiter is never pulled out of
+/// the queue. Anything leased beyond the free-slot count is handed straight
+/// back — inbox entry and workload both — so the scheduler re-offers it.
+#[allow(clippy::too_many_arguments)]
+async fn try_join(
+    engine: &mut DaemonEngine,
+    state: &SharedState,
+    batch_id: &str,
+    worker: &str,
+    active: &mut Vec<String>,
+    positions: &mut HashMap<String, usize>,
+    remaining: &mut HashMap<String, usize>,
+    txs: &mut HashMap<String, mpsc::UnboundedSender<BatchEvent>>,
+    specs_by_id: &mut HashMap<String, SessionSpec>,
+) -> Option<Joined> {
+    let free = batch_max().saturating_sub(active.len());
+    if free == 0 {
+        return None;
+    }
+    // Peek first: never lease a waiter this batch cannot absorb.
+    let compatible = {
+        let sched = state.work_scheduler.lock().await;
+        sched
+            .peek_next_microbatch_key(now_ms())
+            .is_some_and(|(_, key)| key.as_deref() == Some(worker))
+    };
+    if !compatible {
+        return None;
+    }
+    let lease = {
+        let mut sched = state.work_scheduler.lock().await;
+        sched.next_batch(now_ms())
+    }?;
+    let lease_id = lease.lease_id;
+
+    // Pull the leased jobs, keep the Text ones we have room for, hand the rest
+    // back to the scheduler untouched.
+    let mut admitted: Vec<PendingRequest> = Vec::new();
+    let mut handed_back: Vec<hipfire_scheduler::WorkloadSpec> = Vec::new();
+    {
+        // Inbox lock only — never nested with the scheduler lock (the outer
+        // loop takes them sequentially too, so no order to invert).
+        let mut inbox = state.batch_inbox.lock().await;
+        for workload in &lease.workloads {
+            let Some(job) = inbox.remove(&workload.id) else {
+                continue;
+            };
+            match job {
+                ScheduledJob::Text(p) if p.worker_key_id == worker && admitted.len() < free => {
+                    admitted.push(p);
+                }
+                other => {
+                    inbox.insert(workload.id.clone(), other);
+                    handed_back.push(workload.clone());
+                }
+            }
+        }
+    }
+    if !handed_back.is_empty() {
+        let mut sched = state.work_scheduler.lock().await;
+        for workload in handed_back {
+            let _ = sched.enqueue(workload);
+        }
+    }
+    if admitted.is_empty() {
+        state.work_scheduler.lock().await.complete(lease_id);
+        return None;
+    }
+
+    let specs: Vec<SessionSpec> = admitted.iter().map(|p| p.spec.clone()).collect();
+    let events = match engine
+        .generate_batch_prefill(build_batch_prefill_request(batch_id, worker, &specs))
+        .await
+    {
+        Ok(events) => events,
+        Err(e) => {
+            // The running batch is untouched — fail only the joiners.
+            for p in &admitted {
+                let _ = p.tx.send(BatchEvent::Error(format!("join prefill: {e}")));
+            }
+            state.work_scheduler.lock().await.complete(lease_id);
+            return None;
+        }
+    };
+    let mut joined_positions: HashMap<String, usize> = HashMap::new();
+    collect_prefill_positions(&events, &mut joined_positions);
+
+    let mut joined_specs = Vec::new();
+    for p in admitted {
+        let id = p.spec.id.clone();
+        let Some(pos) = joined_positions.get(&id).copied() else {
+            let _ = p.tx.send(BatchEvent::Error(
+                "join prefill produced no session state".to_string(),
+            ));
+            continue;
+        };
+        positions.insert(id.clone(), pos);
+        remaining.insert(id.clone(), p.spec.max_tokens.max(1));
+        txs.insert(id.clone(), p.tx.clone());
+        specs_by_id.insert(id.clone(), p.spec.clone());
+        joined_specs.push(p.spec);
+        active.push(id);
+    }
+    if joined_specs.is_empty() {
+        state.work_scheduler.lock().await.complete(lease_id);
+        return None;
+    }
+    if std::env::var("HIPFIRE_BATCH_RUNNER_DEBUG").as_deref() == Ok("1") {
+        eprintln!(
+            "[batch-cycle] joined {} session(s) mid-cycle; batch now {}",
+            joined_specs.len(),
+            active.len()
+        );
+    }
+    {
+        let mut tel = state.batch_telemetry.lock().await;
+        tel.joins += 1;
+        tel.joined_sessions += joined_specs.len() as u64;
+    }
+    Some(Joined {
+        specs: joined_specs,
+        lease_ids: vec![lease_id],
+    })
+}
+
 /// One fused prefill + decode cycle over `batch`. Runs to completion unless
 /// `can_park` and a higher-priority (lower number than `running_priority`)
 /// workload appears after the min-quantum floor, in which case the still-active
@@ -930,7 +1099,10 @@ async fn run_batch_cycle(
     let worker = batch[0].worker_key_id.clone();
     let batch_id = format!("batch-{}", batch[0].spec.id);
     let resuming = batch[0].resume_position.is_some();
-    let specs: Vec<SessionSpec> = batch.iter().map(|p| p.spec.clone()).collect();
+    // `mut`: mid-cycle joiners are appended so the end-of-cycle release frees
+    // their sessions too.
+    let mut specs: Vec<SessionSpec> = batch.iter().map(|p| p.spec.clone()).collect();
+    let mut join_leases: Vec<u64> = Vec::new();
     if std::env::var("HIPFIRE_BATCH_RUNNER_DEBUG").as_deref() == Ok("1") {
         eprintln!(
             "[batch-cycle] {} {} request(s) into one batch",
@@ -966,18 +1138,7 @@ async fn run_batch_cycle(
                 return CycleOutcome::Completed;
             }
         };
-        for ev in &events {
-            if ev.get("type").and_then(|t| t.as_str())
-                == Some("generate_batch_prefill_session_done")
-            {
-                if let (Some(sid), Some(pos)) = (
-                    ev.get("session_id").and_then(|v| v.as_str()),
-                    ev.get("logical_position").and_then(|v| v.as_u64()),
-                ) {
-                    positions.insert(sid.to_string(), pos as usize);
-                }
-            }
-        }
+        collect_prefill_positions(&events, &mut positions);
     }
 
     let mut active: Vec<String> = specs
@@ -1111,6 +1272,29 @@ async fn run_batch_cycle(
         }
         active = still_active;
 
+        // Join at the step boundary: admit compatible waiters into THIS batch
+        // rather than making them wait for it to drain. Tried before the park
+        // check below, so a same-model waiter joins instead of forcing a park —
+        // one fused batch beats two batches with a parked one pinning VRAM.
+        if join_enabled() && !active.is_empty() {
+            if let Some(joined) = try_join(
+                engine,
+                state,
+                &batch_id,
+                &worker,
+                &mut active,
+                &mut positions,
+                &mut remaining,
+                &mut txs,
+                &mut specs_by_id,
+            )
+            .await
+            {
+                specs.extend(joined.specs);
+                join_leases.extend(joined.lease_ids);
+            }
+        }
+
         // Cooperative preemption: past the min-quantum floor, yield to a
         // strictly-higher-priority waiter. Park the still-active sessions
         // (left resident in the daemon) so no decoded work is discarded; the
@@ -1142,6 +1326,12 @@ async fn run_batch_cycle(
                         })
                     })
                     .collect();
+                {
+                    let mut sched = state.work_scheduler.lock().await;
+                    for id in &join_leases {
+                        sched.complete(*id);
+                    }
+                }
                 let mut tel = state.batch_telemetry.lock().await;
                 tel.preemptions += 1;
                 tel.last_chunk_count = last_chunk_count;
@@ -1153,6 +1343,15 @@ async fn run_batch_cycle(
                 tel.last_backend = last_backend;
                 return CycleOutcome::Parked(parked);
             }
+        }
+    }
+
+    // Mid-cycle joins hold their own leases; the outer loop only knows about
+    // the one it took, so release ours here.
+    {
+        let mut sched = state.work_scheduler.lock().await;
+        for id in &join_leases {
+            sched.complete(*id);
         }
     }
 

@@ -618,6 +618,17 @@ impl ContinuousWorkScheduler {
         self.next_seed(now_ms).map(|(priority, _)| priority as u8)
     }
 
+    /// The microbatch key `next_batch` would seed from, without removing
+    /// anything. A running batch polls this to decide whether the next waiter
+    /// is *compatible with it* — same key means the waiter could join the
+    /// running fused batch instead of waiting for it to drain. `None` key = the
+    /// seed is not microbatchable and must run on its own.
+    pub fn peek_next_microbatch_key(&self, now_ms: u64) -> Option<(u8, Option<String>)> {
+        let (priority, index) = self.next_seed(now_ms)?;
+        let seed = self.buckets[priority].get(index)?;
+        Some((priority as u8, seed.microbatch_key.clone()))
+    }
+
     pub fn snapshot(&self) -> ContinuousSchedulerSnapshot {
         ContinuousSchedulerSnapshot {
             queued: self.queued_ids.len(),
@@ -2888,6 +2899,39 @@ mod tests {
         assert_eq!(scheduler.peek_next_priority(2), Some(8));
         // Peek is non-destructive: the queue is untouched.
         assert_eq!(scheduler.snapshot().queued, 2);
+    }
+
+    #[test]
+    fn peek_next_microbatch_key_reports_the_seed_key_without_dequeuing() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        assert_eq!(scheduler.peek_next_microbatch_key(0), None);
+        scheduler.enqueue(token_workload("a", 64, 0)).unwrap();
+        // A running batch on this worker sees a compatible waiter...
+        assert_eq!(
+            scheduler.peek_next_microbatch_key(1),
+            Some((64, Some("worker:qwen|state:q8+deltanet|decode".to_string())))
+        );
+        // ...and a more urgent waiter on a DIFFERENT worker reads as
+        // incompatible, so the running batch must not try to absorb it.
+        let mut other = token_workload("b", 8, 1);
+        other.microbatch_key = Some("worker:other|decode".to_string());
+        scheduler.enqueue(other).unwrap();
+        assert_eq!(
+            scheduler.peek_next_microbatch_key(2),
+            Some((8, Some("worker:other|decode".to_string())))
+        );
+        // Non-microbatchable work reports no key: it has to run on its own.
+        let solo = WorkloadSpec::singleton(
+            "solo",
+            WorkloadClass::TokenDecode,
+            0,
+            2,
+            WorkloadResources::default(),
+        );
+        scheduler.enqueue(solo).unwrap();
+        assert_eq!(scheduler.peek_next_microbatch_key(3), Some((0, None)));
+        // Peek is non-destructive.
+        assert_eq!(scheduler.snapshot().queued, 3);
     }
 
     #[test]
