@@ -57,6 +57,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Some("export"), Some("safetensors")) => {
             hipfire_coexistence::export_safetensors::run_cli(&args[2..])
         }
+        (Some("repack"), _) => hipfire_coexistence::repack::run_cli(&args[1..]),
         #[cfg(target_os = "linux")]
         (Some("npu"), Some("pair-hfp")) => npu_pair_hfp(&args[2..]),
         _ => {
@@ -100,6 +101,8 @@ fn usage() {
          import safetensors --input <hf_dir> --output <model.hfq> [--arch <family>]\n\
          export safetensors --input <model.hfq> --output <hf_dir> \
          [--arch <family>] [--shard-size 5G]\n\
+         repack --input <hf_dir> --output <archive.hfa>   (lossless, no arch needed)\n\
+         repack --input <archive.hfa> --output <hf_dir>   (restore, byte-identical)\n\
          npu pair-hfp --in <whole-scaled.rdna2.hfp> --out <paired.rdna2.hfp>"
     );
 }
