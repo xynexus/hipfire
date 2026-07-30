@@ -1163,3 +1163,54 @@ single linear is N=8192, which lands at 27.4 GB/s; reaching the 47 GB/s regime
 requires fusing a layer's linears into one dispatch, exactly the structure the
 transaction decompile shows FLM using. That is the next implementation step,
 and it is now a specific one rather than a search.
+
+## The real decode blocker is per-group scale application, not bandwidth
+
+The 47.2 GB/s above is an **unscaled integer GEMM**. `NpuGemm::run_resident`
+accumulates C in place across k-blocks (`crates/hipfire-xdna/src/gemm.rs:219`),
+so it returns one full-K i32 sum — and oq4's per-256-group scales cannot be
+applied to an already-summed result. `npu_decode_bench` verifies against a plain
+integer reference, which is why it passes.
+
+Measured on a real artifact, `Llama-3.2-1B-Instruct--oq4++.hfq`
+`model.layers.0.mlp.gate_proj.weight` (K=2048, N=8192, M=1):
+
+| path | ms | W GB/s | correct |
+|---|---|---|---|
+| `NpuOpusExecutor::run_f32` (per-group trio) | 9.46 | 0.89 | **yes** (0/8192 mismatch) |
+| full-K `w4` unscaled | 1.54 | 5.43 | no |
+| raw `NpuGemm` MT=1, same shape | 0.306 | 27.4 | yes, but unscaled |
+
+So the kernel is already fast enough; the **wrapper is 31x off the kernel**.
+`run_f32` pays for correctness by dispatching once per 256-element K group and
+reading back `groups*rows*N` i32 partials to accumulate on the host — 8
+dispatches and 256 KB of readback for this one linear.
+
+There are only two ways to apply group scales without per-group readback, and
+one of them is the `w4-scaled` on-array kernel. **This retracts an earlier
+scoping call in this document that the scaled full-K desync is "prefill-only, so
+not on the decode critical path".** It is now the single blocking defect for
+decode throughput: it is the only route from 0.89 GB/s to the ~47 GB/s the
+silicon demonstrably delivers.
+
+Current state of that bug, via `npu_fullk_scaled_bug` (m32/kg8/n2048, cols=8) —
+all three scale cases are wrong, including all-1.0:
+
+```
+all 1.0          max_abs=1221.0  mean_ratio=-1.867
+weight only      max_abs=396.0   mean_ratio=-0.017
+activation only  max_abs=217.5   mean_ratio=-0.114
+```
+
+The probe cell shows `got=6.0` against `sum=771.0` with sane per-group partials,
+so the integer GEMM underneath is fine and the fault is in scale application /
+accumulation on the array. Negative mean ratios rule out a pure scale-indexing
+slip.
+
+Two harness bugs found while getting here, both worth knowing before trusting
+any NPU number:
+- `npu_decode_bench` silently mis-runs when ROUNDS does not match the cache
+  build (unsuffixed = rounds=1); it still produces output.
+- `npu_linear_oq4`'s `--unscaled` is parsed with `opt()`, which reads the
+  *following* argument, so as a trailing flag it never registers. Pass it
+  non-last until fixed.
