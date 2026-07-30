@@ -609,3 +609,40 @@ init and accumulate calls within a slab. That is the next thing to probe.
 
 Note this is invisible in the all-1.0 case for the same reason as fault 1: every
 group's payload is identical, so mis-pairing changes nothing.
+
+
+## THE SCALED FULL-K BUG IS DISPATCH DESYNCHRONISATION, NOT SCALES
+
+Everything above treats "all-1.0 passes, non-unit scales fail" as the signal.
+**That framing is wrong**, and `HIPFIRE_CASE_ORDER=reverse` in
+`npu_fullk_scaled_bug` proves it: reversing the order of the three cases moves
+which one passes.
+
+| order | first case run | all-1.0 result |
+|---|---|---|
+| normal | all-1.0 | mostly correct (mean_ratio 0.875) |
+| reversed | activation-only | **fails**, got -9.0, mean_ratio -0.027 |
+
+All-1.0 is not special. The FIRST `run_resident_scaled` of a process is
+(mostly) correct and every later one is corrupted. The scale-core and GEMM-core
+loops are `scf.for %i = 0 to INF` over their objectfifos, so core state persists
+across dispatches; a dispatch that does not consume exactly what the previous one
+left desynchronises the `@fr`/`@fs`/`@fc` streams for every subsequent call.
+
+This retroactively explains the whole investigation:
+- the accumulate-count probe seeing 7, 1 and 4 accumulates for three cases that
+  differ only in scale VALUES (which that probe ignored entirely);
+- padding the activation region "changing" the result without fixing it — it
+  changes buffer sizes, hence the desync pattern;
+- why fault 1 (the genuinely misaligned weight-scale load, confirmed by direct
+  observation and fixed by padding) did not repair the end-to-end result.
+
+Fault 1 is real and its fix is verified. But it is not sufficient, and the
+remaining fault is not in the arithmetic at all — it is that
+`run_resident_scaled` is not safe to call more than once. Any consumer calling
+it per layer or per token would be silently wrong from the second call onward.
+
+NEXT: check whether the runtime sequence drains/resets the fifos per dispatch,
+and compare against the UNSCALED full-K path (`r6_gen_mp_fullk.py`), which is
+repeatedly called by `npu_linear` in the working llama path and does NOT show
+this — so whatever it does differently is the fix.

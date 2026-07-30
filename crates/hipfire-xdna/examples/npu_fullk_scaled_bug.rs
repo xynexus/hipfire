@@ -58,11 +58,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut partials = vec![0i32; groups * rows * n];
     plain.run_resident(&resident_plain, &activations, &mut partials)?;
 
-    for (case, wscale, ascale) in [
+    // HIPFIRE_CASE_ORDER=reverse puts a non-unit case FIRST. If only the first
+    // case of a run is ever correct, the fault is dispatch desynchronisation
+    // (the cores loop forever over the fifos and a dispatch leaves them mid
+    // slab), not scale handling — and "all-1.0 passes" was an artifact of it
+    // always being tested first.
+    let mut cases = vec![
         ("all 1.0", 1.0f32, 1.0f32),
         ("weight only", 0.5f32, 1.0f32),
         ("activation only", 1.0f32, 0.25f32),
-    ] {
+    ];
+    if std::env::var("HIPFIRE_CASE_ORDER").as_deref() == Ok("reverse") {
+        cases.reverse();
+    }
+    for (case, wscale, ascale) in cases {
         // Distinct-but-known values so a transposed or mis-strided index shows up.
         let weight_scales: Vec<Vec<f32>> = (0..groups)
             .map(|g| {
