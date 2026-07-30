@@ -575,3 +575,27 @@ EmbeddingGemma path runs the scaled full-K or whole-scaled kernels with REAL
 (non-unit) scales, it is silently wrong today — fault 1 alone corrupts every
 weight-scale lane. `npu_opus.rs` does call `run_f32` with real matrices. The
 sweeps cannot detect it because they pass all-1.0 scales.
+
+### Fault 2 localised: groups 1..7 mis-pair partials with scales
+
+Two further probes, both with the fault-1 padding applied:
+
+- **No-add probe** (accumulate overwrites instead of adding, so the output holds
+  only the LAST group): all-1.0 gives 102.0, exactly the last group's
+  contribution — correct. Weight-0.5 gives -4.5 where the last group alone
+  should give 51.0.
+- **Accum-payload dump** (dump the payload the ACCUMULATE pass receives; the
+  earlier dump covered only the init pass, i.e. group 0): groups 1..7 receive
+  the correct activation and weight scales at the padded offsets.
+
+So for groups 1..7: the scales arrive correctly, the load is fixed, and yet the
+product is wrong — while group 0's product is right (stage probe) and the
+all-1.0 case is right for every group. Uniform scales make a wrong scale VALUE
+unobservable, so what remains is the PAIRING: each group's `integers` (the
+r6_mac partial arriving on `@fr`) being combined with a different group's scale
+payload on `@fs`, or the two fifos advancing out of step. Both fifos are
+acquired once per group in `r6_gen_mp_fullk_scaled.py`'s scale core loop, so
+their relative ordering across the init/accum boundary is the thing to check.
+
+Note this is invisible in the all-1.0 case for the same reason as fault 1: every
+group's payload is identical, so mis-pairing changes nothing.
