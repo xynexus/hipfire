@@ -26,8 +26,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: npu_fullk_scaled_bug SCALED_CACHE UNSCALED_CACHE COLS".into());
     }
     let cols: usize = args[2].parse()?;
+    // The reference cache need not share the scaled cache's column count — an
+    // N-parallel scaled build (COLS=8) is checked against a 1-column unscaled
+    // build of the same (M,K,N). Optional 4th arg; defaults to `cols`.
+    let plain_cols: usize = args.get(3).map_or(Ok(cols), |v| v.parse())?;
     let mut scaled = NpuGemmFullK::load_cached(&args[0], cols)?;
-    let mut plain = NpuGemmFullK::load_cached(&args[1], cols)?;
+    let mut plain = NpuGemmFullK::load_cached(&args[1], plain_cols)?;
     if !scaled.scaled_output() {
         return Err("first cache is not a scaled build".into());
     }

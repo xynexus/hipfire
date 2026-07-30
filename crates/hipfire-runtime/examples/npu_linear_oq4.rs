@@ -123,7 +123,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "w4-scaled"
         };
-        let dir = if std::env::var("HIPFIRE_SWEEP_CACHE").is_ok() {
+        // --np selects the N-parallel scaled schedule, whose cache name encodes
+        // COLS (the M-parallel names do not, which is how a COLS=4 build once
+        // silently overwrote a COLS=8 one).
+        let dir = if std::env::var("HIPFIRE_NP").is_ok() {
+            format!(
+                "{home}/.hipfire/npu/embgemma_aie2p_fullk_submit_w4-np-scaled_m{fk_m}_kg{}_n{n}_c{cols}",
+                k / 256
+            )
+        } else if std::env::var("HIPFIRE_SWEEP_CACHE").is_ok() {
             format!(
                 "{home}/.hipfire/npu/sweep_fullk_{mode}_c{cols}_m{fk_m}_kg{}_n{n}",
                 k / 256

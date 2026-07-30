@@ -67,6 +67,10 @@ pub struct NpuGemmFullK {
     direct_output: bool,
     scaled_output: bool,
     combined_input: bool,
+    /// N-parallel schedule (`w4-np-scaled`): each column owns `NB/COLS` slabs of
+    /// N and ALL M rows, with its own weight stream. The M-parallel default
+    /// broadcasts one weight fifo and splits M across columns instead.
+    n_parallel: bool,
     input: DeviceBuffer,
     scale_input: Option<DeviceBuffer>,
     output: DeviceBuffer,
@@ -89,12 +93,24 @@ impl NpuGemmFullK {
             NpuFullKMode::Mixed
         } else if tokens.contains(&"w8") {
             NpuFullKMode::W8
-        } else if tokens.contains(&"w4") || tokens.contains(&"w4-scaled") {
+        } else if tokens.contains(&"w4")
+            || tokens.contains(&"w4-scaled")
+            || tokens.contains(&"w4-np-scaled")
+        {
             NpuFullKMode::W4
         } else {
             return Err(bad_cache(base));
         };
-        if cols == 0 || rows == 0 || rows % cols != 0 || groups == 0 || n == 0 || n % SLAB_N != 0 {
+        let n_parallel = tokens.contains(&"w4-np-scaled");
+        if cols == 0 || rows == 0 || groups == 0 || n == 0 || n % SLAB_N != 0 {
+            return Err(bad_cache(base));
+        }
+        // M-parallel splits rows across columns; N-parallel splits slabs.
+        if n_parallel {
+            if (n / SLAB_N) % cols != 0 {
+                return Err(bad_cache(base));
+            }
+        } else if rows % cols != 0 {
             return Err(bad_cache(base));
         }
 
@@ -108,12 +124,16 @@ impl NpuGemmFullK {
             && std::fs::read_to_string(format!("{dir}/input-layout.txt"))
                 .is_ok_and(|layout| layout.trim() == "combined");
         let kernel = NpuKernel::load(&xclbin, &instructions)?;
+        let rpc = if n_parallel { rows } else { rows / cols };
+        let spc = if n_parallel {
+            (n / SLAB_N) / cols
+        } else {
+            n / SLAB_N
+        };
         let input_bytes = if combined_input {
-            let rows_per_core = rows / cols;
-            cols * (n / SLAB_N)
+            cols * spc
                 * groups
-                * (rows_per_core * GROUP_K
-                    + (padded_scale_rows(rows_per_core) + SLAB_N) * std::mem::size_of::<f32>())
+                * (rpc * GROUP_K + (padded_scale_rows(rpc) + SLAB_N) * std::mem::size_of::<f32>())
         } else {
             rows * groups * GROUP_K
         };
@@ -124,11 +144,10 @@ impl NpuGemmFullK {
         };
         let input = kernel.alloc_arg(input_bytes)?;
         let scale_input = if scaled_output && !combined_input {
-            let rows_per_core = rows / cols;
             Some(kernel.alloc_arg(
-                cols * (n / SLAB_N)
+                cols * spc
                     * groups
-                    * (padded_scale_rows(rows_per_core) + SLAB_N)
+                    * (padded_scale_rows(rpc) + SLAB_N)
                     * std::mem::size_of::<f32>(),
             )?)
         } else {
@@ -145,6 +164,7 @@ impl NpuGemmFullK {
             direct_output,
             scaled_output,
             combined_input,
+            n_parallel,
             input,
             scale_input,
             output,
@@ -450,18 +470,35 @@ impl NpuGemmFullK {
             return Err(invalid("resident scaled full-K weight shape changed"));
         }
 
-        let rows_per_core = self.rows / self.cols;
+        // M-parallel: each column owns `rows/cols` rows and iterates ALL slabs.
+        // N-parallel: each column owns ALL rows and `nb/cols` slabs, so the slab
+        // it is working on is the GLOBAL slab `core * slabs_per_core + slab`.
+        let rows_per_core = if self.n_parallel {
+            self.rows
+        } else {
+            self.rows / self.cols
+        };
+        let slabs_per_core = if self.n_parallel {
+            (self.n / SLAB_N) / self.cols
+        } else {
+            self.n / SLAB_N
+        };
         let scale_bytes = (padded_scale_rows(rows_per_core) + SLAB_N) * std::mem::size_of::<f32>();
         if self.combined_input {
             let activation_bytes = rows_per_core * GROUP_K;
             let entry_bytes = activation_bytes + scale_bytes;
             for core in 0..self.cols {
-                for slab in 0..self.n / SLAB_N {
+                for slab in 0..slabs_per_core {
                     for group in 0..self.groups {
                         let entry =
-                            ((core * (self.n / SLAB_N) + slab) * self.groups + group) * entry_bytes;
+                            ((core * slabs_per_core + slab) * self.groups + group) * entry_bytes;
                         for local_row in 0..rows_per_core {
-                            let row = core * rows_per_core + local_row;
+                            // N-parallel duplicates every row into every column.
+                            let row = if self.n_parallel {
+                                local_row
+                            } else {
+                                core * rows_per_core + local_row
+                            };
                             let source = row * self.k() + group * GROUP_K;
                             let destination = entry + local_row * GROUP_K;
                             self.input.as_mut_slice()[destination..destination + GROUP_K]
@@ -473,8 +510,12 @@ impl NpuGemmFullK {
                             activation_scales,
                             &weights.scales,
                             group,
-                            core,
-                            slab,
+                            if self.n_parallel { 0 } else { core },
+                            if self.n_parallel {
+                                core * slabs_per_core + slab
+                            } else {
+                                slab
+                            },
                             self.rows,
                             self.n,
                             rows_per_core,
