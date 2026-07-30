@@ -1792,3 +1792,38 @@ reports this).
 This is the third time in this work that a component-level win has failed to
 appear end to end. Measure the delivered path before believing a per-linear
 number.
+
+### Settled: the microbenchmark systematically understates by ~0.6 ms/call
+
+`HIPFIRE_NPU_DECODE_TIMING=1` over a real 128-token generation, 12288 calls
+(96 NPU linears per token):
+
+| path | download | **npu** | upload | total |
+|---|---|---|---|---|
+| full-K default | 0.0354 | **0.8693** | 0.0610 | 0.9656 |
+| N-parallel | 0.0374 | **1.1221** | 0.0664 | 1.2259 |
+
+Two things, and the second matters more than the first.
+
+**1. N-parallel really is slower in the runtime** — 1.122 ms against 0.869 in
+the same `run_f32` call the microbenchmark timed at 0.325 against 0.546. The
+ranking inverts. Download and upload are ~0.10 ms in both and are not the cause.
+
+**2. BOTH paths cost ~0.6-0.8 ms more per call in the runtime than in
+`npu_linear_oq4`** (default 0.869 vs 0.546; N-parallel 1.122 vs 0.325). That
+offset is roughly constant, so it is not proportional to the work — which means
+**every per-linear number in this document is optimistic by that amount**, and
+comparisons drawn only from `npu_linear_oq4` can rank two paths in the wrong
+order, as they did here.
+
+The structural difference between the two harnesses is that the microbenchmark
+loops one matrix with fixed activations, while the runtime cycles ~96 distinct
+resident matrices with fresh activations every token. N-parallel is hurt more
+because it repacks ~600 KB of duplicated activation per call against full-K's
+~16 KB, and that packing cannot amortise when the activation changes.
+
+**Consequence for method:** stop ranking NPU paths with `npu_linear_oq4` alone.
+It is fine for CORRECTNESS (bit-exactness against `reference_f32`) and for
+coarse ratios within one schedule, but any decision between schedules needs
+`HIPFIRE_NPU_DECODE_TIMING` over a real generation. Three component-level wins
+in this work failed to appear end to end; this is why.
