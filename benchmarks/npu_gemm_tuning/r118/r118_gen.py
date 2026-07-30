@@ -6,13 +6,20 @@ import sys
 REPEAT_OUTPUT_TASK = "--repeat-output-task" in sys.argv[1:]
 N_BLOCKS = 2
 BATCH = 1
+# K groups of 256 staged per full-K dispatch. 3 (= k768) is EmbeddingGemma's
+# shape and stays the default; llama-3.2-1B needs 8 (k2048) and 32 (k8192).
+GROUPS_ARG = 3
 for arg in sys.argv[1:]:
     if arg.startswith("--n-blocks="):
         N_BLOCKS = int(arg.split("=", 1)[1])
     elif arg.startswith("--batch="):
         BATCH = int(arg.split("=", 1)[1])
+    elif arg.startswith("--groups="):
+        GROUPS_ARG = int(arg.split("=", 1)[1])
     elif arg != "--repeat-output-task":
         raise SystemExit(f"unknown argument: {arg}")
+if GROUPS_ARG < 1:
+    raise SystemExit("--groups must be positive")
 if N_BLOCKS < 1:
     raise SystemExit("--n-blocks must be positive")
 if BATCH < 1:
@@ -21,7 +28,7 @@ if N_BLOCKS != 2 and not REPEAT_OUTPUT_TASK:
     raise SystemExit("non-default --n-blocks requires --repeat-output-task")
 
 COLS, ROWS = 8, 4
-HALVES, GROUPS = 2, 3
+HALVES, GROUPS = 2, GROUPS_ARG
 A_SLOT, A_JOIN = 6144, 4 * 6144
 A_STAGE = 3 * 2112
 W_RECORD = 8320

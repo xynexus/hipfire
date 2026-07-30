@@ -94,7 +94,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     }
-    let mut executor = NpuOpusExecutor::load_cached(&w4, &w8, &sp3, n)?;
+    // --fullk COLS uses a full-K cache instead of the per-group trio: one dispatch
+    // per linear rather than one per 256-element K group. `pack_matrix` picks it up
+    // automatically once the executor holds a (mode, padded_k) match.
+    let fullk_cols: Option<usize> = opt("--fullk").map(|v| v.parse()).transpose()?;
+    let mut executor = if let Some(cols) = fullk_cols {
+        // Built by benchmarks/npu_gemm_tuning/r6/r6_fullk_cache.sh w4 M K N COLS —
+        // the purpose-built one-dispatch full-K builder for `NpuGemmFullK`. (The
+        // r118/r129 "staged" full-K kernel is a DIFFERENT loader, `NpuGemmStagedFullK`;
+        // pairing it with this one compiles and runs but returns garbage.)
+        let fk_m = opt("--fullk-m")
+            .map(|v| v.parse::<usize>())
+            .transpose()?
+            .unwrap_or(64);
+        let dir = format!(
+            "{home}/.hipfire/npu/embgemma_aie2p_fullk_submit_w4_m{fk_m}_kg{}_n{n}",
+            k / 256
+        );
+        if !Path::new(&format!("{dir}/final.xclbin")).exists() {
+            return Err(format!("missing full-K cache {dir}").into());
+        }
+        NpuOpusExecutor::load_fullk_cached(&[(&dir, cols)], n)?
+    } else {
+        NpuOpusExecutor::load_cached(&w4, &w8, &sp3, n)?
+    };
     let matrix = executor.pack_matrix(quant_type, k, n, &payload, awq)?;
 
     let input = (0..m * k)
