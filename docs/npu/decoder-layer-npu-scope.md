@@ -1313,3 +1313,43 @@ So the priority order is now measured, not guessed:
 1. **Eliminate the partial readback** (on-array scale application). Worth ~5x.
 2. **Larger N per dispatch** to move from 27.4 toward 47.8 GB/s. Worth ~1.7x.
 3. Fusing linears — helps (1) and (2) but is not independently required.
+
+## The runtime's decode path is on an M-parallel kernel — the wrong axis for M=1
+
+`HIPFIRE_XDNA_TRACE=1` splits a dispatch into submit and wait (pure device
+time). Full-K, gate_proj K=2048 N=8192, 23 calls:
+
+| cache | cols | submit/call | **wait/call** | total ms |
+|---|---|---|---|---|
+| `..._w4_m8_kg8_n8192` | 1 | 0.042 | **1.236** | 1.54 |
+| `..._w4_m64_kg8_n8192` | 8 | 0.235 | **1.379** | 3.05 |
+
+Submit overhead is negligible (0.042 ms), so the 1.5 ms is real device time —
+against a 0.17 ms physics budget for 8 MB at 47.8 GB/s.
+
+**Eight columns bought nothing, and cost.** Both caches were built by
+`r6_fullk_cache.sh` at the same shape and the COLS=8 one really does instantiate
+all 8 columns (`aie.tile(0..7, *)` verified in its `aie.mlir`). The reason is
+the design: **full-K splits the M dimension across columns** — the builder
+enforces `M % (COLS*8) == 0`, i.e. COLS=8 requires M=64. Each column takes 8 of
+the 64 rows *and streams the entire weight matrix to do it*. For decode, M=1:
+one row of work, eight full reads of the weights, seven of them discarded.
+
+That is the wrong parallel axis for decode, and it is what the runtime has been
+using — `npu_linear.rs` loads `load_fullk_cached(&[(&dir, 1)], m)`, so today it
+is the 1-column M-parallel build.
+
+The r6 family splits **N** across columns (`groups = COLS * NB`), which is the
+right axis for M=1: each column owns a slice of the output and reads only its
+own weights. At this exact shape it does the job in **0.306 ms** — 5x faster
+than full-K's 1.54 — and it is the same family that reached 47.2 GB/s.
+
+So the target configuration for decode is now specific: **N-parallel r6, MT=1,
+8 columns, with group scales applied on the array** so no int32 partials come
+back. The three legs are individually proven (N-parallel scaling to 47.2 GB/s;
+MT=1 correct at 0.306 ms; per-group scales correct via the trio at 2.07 ms) —
+what does not yet exist is one kernel with all three. The `w4-scaled` on-array
+kernel is that missing piece, which is why it is the top item.
+
+Do NOT pursue: more columns on the full-K path, or larger full-K M blocks. Both
+make decode slower, measured above.
