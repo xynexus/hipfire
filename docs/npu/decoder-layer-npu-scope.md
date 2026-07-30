@@ -1353,3 +1353,39 @@ kernel is that missing piece, which is why it is the top item.
 
 Do NOT pursue: more columns on the full-K path, or larger full-K M blocks. Both
 make decode slower, measured above.
+
+## Audit of the w4-scaled desync: three hypotheses ruled out
+
+Source audit of `r6_gen_mp_fullk_scaled.py`, `r6_scale_accum.cc`,
+`r6_fullk_cache.sh` and `gemm_fullk.rs::run_resident_scaled`. None of these is
+the fault — recording so they are not re-investigated:
+
+1. **ObjectFIFO count mismatch — RULED OUT.** In the 8-column COMBINED schedule,
+   `@fx` objects (XE = AW + SE bytes) are split 1:1 into `@fa` and `@fs` by
+   `objectfifo.link ... ([] [0, AW])`. The GEMM core acquires `@fa` exactly
+   `NB * KGROUPS` times per outer iteration; the scale core acquires `@fs`
+   `1 + (KGROUPS - 1)` times per slab over `NB` slabs = the same
+   `NB * KGROUPS`. The host DMA delivers `NB * KGROUPS * XE` bytes. All three
+   agree, so the streams cannot drift by construction.
+
+2. **`MT` define mismatch — RULED OUT.** `r6_scale_accum.cc` computes
+   `ROWS = MT * 4` at compile time and derives `weight_scales =
+   activation_scales + ROWS`, so a wrong `MT` would read the weight scales from
+   the wrong offset and overrun the output tile — which would look exactly like
+   the observed failure. But `r6_fullk_cache.sh:54` compiles it with
+   `MT = M / COLS / 4`, giving `ROWS = M / COLS`, which equals the host's
+   `rows_per_core = self.rows / self.cols` in `run_resident_scaled`. Verified
+   for both the m32/cols8 isolator cache (ROWS=4) and m64/cols8 (ROWS=8).
+
+3. **Scale-kernel arithmetic — RULED OUT.** `scale_impl` applies
+   `to_float(int32) * weight_scale[col] * activation_scale[row]` with an
+   optional accumulate, over `ROWS x 4 x 16` — which is the correct
+   `partial * a_s[group][row] * w_s[group][col]` per-group form. The isolator's
+   probe confirms the integer partials underneath are sane (`sum=771.0` from
+   plausible per-group values) while the scaled result is `6.0`.
+
+What remains is the interaction between the `INF`-trip core loops, depth-1
+objectfifos and the per-dispatch DMA task lifecycle — i.e. genuine schedule
+behaviour, not a bookkeeping error in any single file. That needs hardware
+bisection (vary NB, KGROUPS and COLS independently and find which dimension
+breaks first), not more source reading; each probe is a multi-minute rebuild.
