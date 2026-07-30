@@ -541,3 +541,37 @@ or the 64-byte `load_v<16>` being lowered to an aligned load that truncates the
 The second candidate would also explain why padding to 16 floats moved the
 answer without fixing it: it makes the address 64-byte aligned but the earlier
 `ROWS` offset is still what the pointer arithmetic used.
+
+### Fault 1 CONFIRMED and its fix verified; a SECOND fault remains
+
+Applying the padding (activation-scale region rounded to 16 floats, in
+`r6_scale_accum.cc`'s `ROWS_PADDED`, `SE` in `r6_gen_mp_fullk_scaled.py`, and
+`scale_bytes` / `copy_scale_payload` / `input_bytes` in `gemm_fullk.rs`) and
+re-running the STAGE probe shows the load is repaired:
+
+| case | weight_scale loaded, before | after padding |
+|---|---|---|
+| weight 0.5 uniform | 1.0 (wrong — an activation scale) | **0.5** |
+| activation 0.25 uniform | 0.25 (wrong) | **1.0** |
+
+and `after_mul1` becomes 11.0 x 0.5 = 5.5, correct. So the 64-byte
+`aie::load_v<16>` truncating a 32-byte-aligned address is real, and padding
+fixes it.
+
+BUT the end-to-end result is STILL wrong with padding applied: weight-only reads
+-4.5 against a want of 385.5. The stage probe runs with the accumulate entry
+point inert, so it only proves group 0's first multiply. Everything downstream of
+that is still suspect, and by elimination the remaining fault is in the
+**cross-group accumulate** — `aie::add(scaled, aie::load_v<16>(output + offset))`
+over groups 1..7 — or in the second multiply by `row_scale`. Note the all-1.0
+case accumulates all 8 groups exactly, so the accumulate is not broken
+unconditionally.
+
+REVERTED again, for the same reason as before: this is a shared ABI and landing
+a half-fix is worse than landing none.
+
+**Implication worth checking independently of this work:** if any production
+EmbeddingGemma path runs the scaled full-K or whole-scaled kernels with REAL
+(non-unit) scales, it is silently wrong today — fault 1 alone corrupts every
+weight-scale lane. `npu_opus.rs` does call `run_f32` with real matrices. The
+sweeps cannot detect it because they pass all-1.0 scales.
