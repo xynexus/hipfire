@@ -918,3 +918,46 @@ the next thing to try for fault 1.
 
 (Fault 1 alone does not fix end-to-end — the dispatch desync is separate — and
 by measurement the whole scaled path is a prefill lever, not a decode one.)
+
+## Decode cost model, measured — and why the scaled path cannot help it
+
+Varying only the weight size at fixed M=1 (unscaled full-K, COLS=1, m8):
+
+| tensor | K x N | weight MB | ms | GB/s |
+|---|---|---|---|---|
+| q_proj | 2048 x 2048 | 2 | 0.544 | 3.86 |
+| gate_proj | 2048 x 8192 | 8 | 1.604 | 5.23 |
+
+Two points fit **t = 0.19 ms + 0.177 ms/MB**, i.e. a ~0.19 ms fixed cost and a
+**5.66 GB/s marginal weight rate**. That is well under one column's measured
+13.4 GB/s S2MM feed, so a decode linear is NOT port-limited — the cap is the W4
+unpack path, not the DMA.
+
+Consequences for the FLM target:
+- llama-3.2-1B streams ~0.62 GB of oq4 weights per token. At 5.66 GB/s that is
+  ~110 ms, plus 112 x 0.19 ms = ~21 ms fixed => ~131 ms/token = ~7.6 tok/s,
+  which brackets the measured 6.2 (the rest is GPU work for uncovered linears,
+  attention, norms and sampling).
+- FLM's 60.1 tok/s needs ~16.6 ms/token, i.e. ~37 GB/s sustained. So decode
+  needs roughly **6.5x the marginal weight rate** — that is a job for parallel
+  COLUMNS, not for amortising the 0.19 ms fixed cost (which is only ~16% of the
+  budget). A fused decoder layer helps the fixed part; it does not by itself
+  deliver 37 GB/s.
+
+### The scaled schedule cannot cover the weight-dominant shapes
+
+Building `w4-scaled` at the gate/up shape (K=2048 N=8192, COLS=8, M=32) fails:
+
+```
+aie.dma_bd op Size 3 exceeds the [1:64] range
+```
+
+`NB = N/64 = 128` overflows the buffer-descriptor dimension field, whose legal
+range is 1..64. So the scaled full-K schedule is unbuildable for N=8192 at these
+parameters regardless of the desync — and N=8192 is where 8 of llama's 16 layers'
+weight bytes live. Covering it would need the N dimension split across BDs or
+across dispatches.
+
+Taken with the earlier measurements (scaled is slower than unscaled COLS=1 at
+every buildable COLS/M at M=1), this closes the question: **the scaled path is
+not the route to the decode number.**
