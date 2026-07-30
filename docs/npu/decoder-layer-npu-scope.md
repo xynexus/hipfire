@@ -1389,3 +1389,66 @@ objectfifos and the per-dispatch DMA task lifecycle — i.e. genuine schedule
 behaviour, not a bookkeeping error in any single file. That needs hardware
 bisection (vary NB, KGROUPS and COLS independently and find which dimension
 breaks first), not more source reading; each probe is a multi-minute rebuild.
+
+## w4-scaled DIAGNOSED: a cross-dispatch state bug, not a scale bug
+
+Bisection on hardware, not source reading. Three results, each from a probe:
+
+**1. COLS=8 has its own first-dispatch fault; COLS=4 does not.** Rebuilding the
+same geometry at COLS=4 (`r6_fullk_cache.sh w4-scaled 32 2048 2048 4`) makes the
+all-1.0 case pass **exactly** (max_abs=0.000000, mean_ratio=1.000000), where at
+COLS=8 even that case failed. The difference between the two schedules is that
+COLS=8 is the COMBINED path, which splits one host stream into activations and
+scales with `aie.objectfifo.link [@fx] -> [@fa, @fs]`; COLS=4 uses independent
+shim streams. So the link carries a defect of its own.
+(Caution: these cache directory names do NOT encode COLS, so a COLS=4 build
+silently overwrites the COLS=8 build at the same M/KG/N. That has bitten this
+work before.)
+
+**2. The core receives the CORRECT scale payload.** With `r6_scale_dump_probe.cc`
+swapped in for the scale kernel, `HIPFIRE_DUMP_PAYLOAD=1` shows exactly what
+each core got:
+
+```
+all 1.0          act=[1.0 x8]   wt=[1.0 x8]
+weight only      act=[1.0 x8]   wt=[0.5 x8]
+activation only  act=[0.25 x8]  wt=[1.0 x8]
+```
+
+All three correct. This is the routing-vs-interpretation split the probe exists
+for, and it eliminates `copy_scale_payload`, the `SE` layout, and the
+`weight_scales = activation_scales + ROWS` offset as candidates.
+
+**3. The INTEGER partials differ between cases — so the corruption is upstream
+of scaling entirely.** `r6_scale_stage_probe.cc` dumps `to_float(integers)`
+before any scale is applied. For identical int4 weights and identical
+activations it reports `[182, 44, 116, -127]` in the first case and
+`[11, 11, 11, 11]` in the second and third. Those must be bit-identical; they
+are not. The scale kernel is innocent — it is being handed a corrupted integer
+stream.
+
+**Confirmed by `HIPFIRE_CASE_ORDER=reverse`:**
+
+| position | case | mean_ratio |
+|---|---|---|
+| 1 | all 1.0 | **1.000000** |
+| 3 | all 1.0 | **-0.031018** |
+| 1 | activation only | 0.906250 |
+| 3 | activation only | -0.028082 |
+
+The same case with the same inputs is exact at position 1 and garbage at
+position 3. **The fault is dispatch-order dependent, not scale dependent.**
+
+Every prior hypothesis about this bug — scale indexing, scale arithmetic, the
+`MT` define, payload layout — was aimed at the wrong subsystem. What actually
+breaks is state carried across dispatches within a process: the `INF`-trip core
+loops plus depth-1 objectfifos leave the array mid-stream, and the next dispatch
+starts misaligned.
+
+**Next step (specific):** each isolator case does `prepack_weights_with_scales`
+-> `upload_resident_weights` -> `run_resident_scaled`. Run the *same* case three
+times with a single upload to separate "re-uploading resident weights desyncs
+the fifos" from "any second dispatch desyncs them". Those two have different
+fixes — the first is a host-side ordering/sync problem in
+`upload_resident_weights`, the second means the schedule needs a drain or a
+bounded outer loop instead of `INF`.
