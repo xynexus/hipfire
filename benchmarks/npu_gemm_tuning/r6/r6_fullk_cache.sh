@@ -14,9 +14,9 @@ M="${2:?M}"
 K="${3:?K padded to 256}"
 N="${4:?N}"
 COLS="${5:-8}"
-[[ "$MODE" =~ ^(w4|w4-scaled|mixed|w8)$ ]] || { echo "MODE must be w4, w4-scaled, mixed, or w8" >&2; exit 2; }
+[[ "$MODE" =~ ^(w4|w4-scaled|w4-np-scaled|mixed|w8)$ ]] || { echo "MODE must be w4, w4-scaled, mixed, or w8" >&2; exit 2; }
 (( M > 0 && K > 0 && N > 0 && COLS > 0 ))
-(( M % (COLS * 8) == 0 )) || { echo "M must be divisible by COLS*8" >&2; exit 2; }
+if [[ "$MODE" != w4-np-scaled ]]; then (( M % (COLS * 8) == 0 )) || { echo "M must be divisible by COLS*8" >&2; exit 2; }; fi
 (( K % 256 == 0 )) || { echo "K must be padded to a multiple of 256" >&2; exit 2; }
 (( N % 64 == 0 )) || { echo "N must be divisible by 64" >&2; exit 2; }
 
@@ -30,7 +30,14 @@ KGROUPS=$((K / 256))
 NB=$((N / 64))
 AW=$(((M / COLS) * 256))
 CW=$(((M / COLS) * 64))
-OUT="$HOME/.hipfire/npu/embgemma_aie2p_fullk_submit_${MODE}_m${M}_kg${KGROUPS}_n${N}"
+# Only the N-parallel mode encodes COLS. The M-parallel names are load-bearing
+# (npu_linear.rs and npu_linear_oq4 resolve them), and their omission of COLS is
+# a known trap: a COLS=4 build silently overwrites the COLS=8 one.
+if [[ "$MODE" == w4-np-scaled ]]; then
+  OUT="$HOME/.hipfire/npu/embgemma_aie2p_fullk_submit_${MODE}_m${M}_kg${KGROUPS}_n${N}_c${COLS}"
+else
+  OUT="$HOME/.hipfire/npu/embgemma_aie2p_fullk_submit_${MODE}_m${M}_kg${KGROUPS}_n${N}"
+fi
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
@@ -48,6 +55,12 @@ case "$MODE" in
     compile "$HERE/r6_gemm_ts.cc" "$OUT/r6_mac.o" "$((M / COLS / 4))" 16
     python3 "$HERE/r6_gen_mp_fullk.py" "$COLS" "$NB" "$AW" 8192 "$CW" \
       "$KGROUPS" "$OUT/r6_mac.o" > "$OUT/aie.mlir"
+    ;;
+  w4-np-scaled)
+    compile "$HERE/r6_gemm_ts.cc" "$OUT/r6_mac.o" "$((M / 4))" 16
+    compile "$HERE/r6_scale_accum.cc" "$OUT/r6_scale.o" "$((M / 4))" 16
+    python3 "$HERE/r6_gen_np_fullk_scaled.py" "$COLS" "$NB" "$((M * 256))" 8192 "$((M * 64))" \
+      "$KGROUPS" "$OUT/r6_mac.o" "$OUT/r6_scale.o" > "$OUT/aie.mlir"
     ;;
   w4-scaled)
     compile "$HERE/r6_gemm_ts.cc" "$OUT/r6_mac.o" "$((M / COLS / 4))" 16

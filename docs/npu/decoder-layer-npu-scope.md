@@ -1664,3 +1664,52 @@ weights). The scaling kernel and its payload format are now proven correct and
 can be lifted; what has to be written is the N-parallel generator that hosts it
 — `r6_gen_mp_fullk_scaled.py` is M-parallel by construction and cannot be
 configured into it.
+
+## N-parallel scaled schedule: generator written and compiling
+
+`benchmarks/npu_gemm_tuning/r6/r6_gen_np_fullk_scaled.py`, built via
+`r6_fullk_cache.sh w4-np-scaled M K N COLS`.
+
+It inverts what the M-parallel generator shares. `r6_gen_mp_fullk_scaled.py`
+broadcasts ONE weight objectfifo to every core and gives each column `M/COLS`
+rows, so every column streams the whole weight matrix. This one gives each
+column `NB/COLS` slabs of N and ALL M rows, with **8 independent weight
+fifos** — no weight byte is read twice. Activations are duplicated per column
+instead, which is the cheap direction: `ROWS*K` bytes against `K*N/2`.
+
+Verified on the built cache (`..._w4-np-scaled_m8_kg8_n2048_c8`):
+`aie.tile(0..7, 0..3)` — all 8 columns, 4 rows each — and
+`grep -c 'objectfifo @fw[0-9]'` = **8** against the M-parallel build's 1.
+Transaction decompiles clean: 208/208 ops.
+
+Shim budget is why activations and scales share a stream: each column carries
+`@fx` (activations+scales, split in its own memtile) and `@fw` in, `@fc` out —
+2 in, 1 out. Column `col` owns global slabs `col*NBC .. (col+1)*NBC`, so its C
+region is contiguous and the output BD is one 64-wide run per row.
+
+One SSA trap worth recording: the scale tile is `%s{col}`, so naming an acquire
+result `%s0` collides at module scope ("redefinition of SSA value '%s0'").
+Acquires are named `%sq0`/`%sqa` for that reason.
+
+### What it still needs: a host packer
+
+`NpuGemmFullK` is M-parallel end to end and cannot drive this as-is:
+
+- `load_cached` derives `rows_per_core = rows / cols`; here every core owns all
+  `M` rows, so `ROWS = M` and `AW = M*256`.
+- Mode detection rejects the name — `w4-np-scaled` is not in the `tokens
+  .contains` chain.
+- `prepack_weights_with_scales` writes `entry_index = slab * groups + group`
+  over all `n/SLAB_N` slabs. That ordering *does* match, since global slab
+  `= col*NBC + slab_local` iterated column-major is just global-slab-major,
+  group-minor — so the weight packing likely transfers unchanged.
+- `copy_scale_payload` slices activation scales by `core * rows_per_core`; here
+  it must pass all rows, and index weight scales by the GLOBAL slab
+  `col*NBC + slab_local`.
+- The output is `[row][n]` directly rather than `[core][row][slab][64]`.
+
+So the remaining work is a packer variant plus a mode token, not a redesign.
+The cache name encodes COLS (`_c{COLS}`) precisely because the M-parallel names
+do not, which is how a COLS=4 build silently overwrote a COLS=8 one earlier in
+this work; the M-parallel names are left alone because `npu_linear.rs` and
+`npu_linear_oq4` resolve them.
