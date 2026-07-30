@@ -1263,3 +1263,53 @@ against our 3 and 3 — it runs a fused layer per dispatch. Fusing multiple
 linears per dispatch is not an optimisation here, it is the only route to the
 goal, and it also happens to be what moves us into the N regime where we already
 measured 47.2 GB/s (vs FLM's 46.4).
+
+## CORRECTION: the per-dispatch floor is 0.033 ms, and the "hard ceiling" claim was wrong
+
+The previous section derived a ceiling of 52.5 tok/s from a "~0.17 ms
+per-dispatch floor". **That floor was misread** — 0.17 ms is the total time of a
+*four*-dispatch call, not the cost of one dispatch.
+
+Measured properly, minimal N (`r6ts_1x4x32_c8_nb1`, N=512), varying only the
+dispatch count, all `row 0 correct`:
+
+| K | dispatches | ms |
+|---|---|---|
+| 512 | 1 | 0.089 |
+| 1024 | 2 | 0.106 |
+| 2048 | 4 | 0.170 |
+| 4096 | 8 | 0.293 |
+| 8192 | 16 | 0.563 |
+
+Slope between 4 and 16 dispatches: **0.033 ms per dispatch**, intercept 0.039 ms.
+
+So the corrected ceiling is `112 x 0.033 = 3.7 ms/token` of dispatch overhead —
+about 270 tok/s, far ABOVE FLM. **There is no architectural ceiling below the
+target, and the previous section's conclusion is retracted.** Fusing linears is
+a good idea but it is not the only route, and it is not the binding constraint.
+
+The binding constraint is bandwidth plus readback. Physics for the 1B: ~0.62 GB
+of oq4 weights per token, so at the measured 47.8 GB/s marginal rate that is
+13 ms/token (77 tok/s) and at 27.4 GB/s it is 23 ms (44 tok/s), plus ~3.7 ms of
+dispatch. FLM's 60.1 tok/s sits inside that band — we are bound by the same
+physics it is, not by a structural disadvantage.
+
+Where our 161 ms/token actually goes, for one gate_proj (K=2048, N=8192, 8 MB of
+weights):
+
+| path | ms | what it is |
+|---|---|---|
+| physics at 47.8 GB/s | 0.17 | lower bound |
+| raw `NpuGemm` (unscaled) | 0.31 | kernel only |
+| full-K m8 (runtime default) | 1.54 | kernel + **2.1 MB int32 readback** |
+| MT=1 trio | 2.07 | kernel + 1.0 MB readback, more dispatches |
+
+The full-K path reads back `groups(8) x chunk_rows(8) x N(8192) x 4B = 2.1 MB`
+of int32 partials **per linear** and scales them on the host. That readback,
+not the kernel and not the dispatch count, is the 1.23 ms gap between 0.31 and
+1.54 — and it is ~10x the entire physics budget for the token.
+
+So the priority order is now measured, not guessed:
+1. **Eliminate the partial readback** (on-array scale application). Worth ~5x.
+2. **Larger N per dispatch** to move from 27.4 toward 47.8 GB/s. Worth ~1.7x.
+3. Fusing linears — helps (1) and (2) but is not independently required.
