@@ -112,6 +112,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     want_err = want_err.max((out[row * n + col] - want).abs());
                 }
             }
+            // With r6_scale_group_probe.cc loaded, out[0..2*groups] holds
+            // (activation_scale, weight_scale) as RECEIVED by each group.
+            if std::env::var("HIPFIRE_DUMP_GROUPS").is_ok() {
+                let seen: Vec<(f32, f32, f32)> = (0..groups)
+                    .map(|g| (out[3 * g], out[3 * g + 1], out[3 * g + 2]))
+                    .collect();
+                println!("  received per group (act, wt, int0): {seen:?}");
+                println!(
+                    "  host wrote        (act, wt): {:?}",
+                    (0..groups)
+                        .map(|g| (act_scales[g * rows], weight_scales[g][0]))
+                        .collect::<Vec<_>>()
+                );
+                // partials[(g*rows + 0)*n + 0] is group g's own first partial.
+                println!(
+                    "  reference int0 per group   : {:?}",
+                    (0..groups)
+                        .map(|g| partials[g * rows * n])
+                        .collect::<Vec<_>>()
+                );
+                return Ok(());
+            }
             let drift = first
                 .as_ref()
                 .map(|f| {

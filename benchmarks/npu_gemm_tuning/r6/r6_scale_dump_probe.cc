@@ -5,6 +5,8 @@
 #define MT 8
 #endif
 static constexpr int ROWS = MT * 4;
+// ROWS_PADDED_DEF: see r6_scale_accum.cc — 64-byte alignment for load_v<16>.
+static constexpr int ROWS_PADDED = ((ROWS + 15) / 16) * 16;
 
 template <bool ACCUMULATE>
 static void scale_impl(const int32 *__restrict integers,
@@ -12,7 +14,7 @@ static void scale_impl(const int32 *__restrict integers,
                        int32 *__restrict output_bits) {
   const float *activation_scales =
       reinterpret_cast<const float *>(scale_payload);
-  const float *weight_scales = activation_scales + ROWS;
+  const float *weight_scales = activation_scales + ROWS_PADDED;
   float *output = reinterpret_cast<float *>(output_bits);
   // OBSERVATION PROBE: ignore the GEMM entirely and copy the scale payload this
   // core actually receives into the output, so the host can compare it against

@@ -105,7 +105,8 @@ impl NpuGemmFullK {
             let rows_per_core = rows / cols;
             cols * (n / SLAB_N)
                 * groups
-                * (rows_per_core * GROUP_K + (rows_per_core + SLAB_N) * std::mem::size_of::<f32>())
+                * (rows_per_core * GROUP_K
+                    + (padded_scale_rows(rows_per_core) + SLAB_N) * std::mem::size_of::<f32>())
         } else {
             rows * groups * GROUP_K
         };
@@ -120,7 +121,7 @@ impl NpuGemmFullK {
             Some(kernel.alloc_arg(
                 cols * (n / SLAB_N)
                     * groups
-                    * (rows_per_core + SLAB_N)
+                    * (padded_scale_rows(rows_per_core) + SLAB_N)
                     * std::mem::size_of::<f32>(),
             )?)
         } else {
@@ -443,7 +444,7 @@ impl NpuGemmFullK {
         }
 
         let rows_per_core = self.rows / self.cols;
-        let scale_bytes = (rows_per_core + SLAB_N) * std::mem::size_of::<f32>();
+        let scale_bytes = (padded_scale_rows(rows_per_core) + SLAB_N) * std::mem::size_of::<f32>();
         if self.combined_input {
             let activation_bytes = rows_per_core * GROUP_K;
             let entry_bytes = activation_bytes + scale_bytes;
@@ -541,6 +542,12 @@ impl NpuGemmFullK {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Activation-scale rows rounded up so the weight scales that follow start
+/// 64-byte aligned for the kernel's `aie::load_v<16>`.
+fn padded_scale_rows(rows_per_core: usize) -> usize {
+    rows_per_core.div_ceil(16) * 16
+}
+
 fn copy_scale_payload(
     destination: &mut [u8],
     activation_scales: &[f32],
@@ -552,11 +559,17 @@ fn copy_scale_payload(
     n: usize,
     rows_per_core: usize,
 ) {
-    let activation_bytes = rows_per_core * std::mem::size_of::<f32>();
-    destination[..activation_bytes].copy_from_slice(as_bytes_f32(
+    // The weight scales must start 64-byte aligned so the kernel's
+    // `aie::load_v<16>` reads the right lanes, so the activation region is
+    // padded up to a multiple of 16 floats. Mirror of `ROWS_PADDED` in
+    // r6_scale_accum.cc / r6_gen_mp_fullk_scaled.py.
+    let live_bytes = rows_per_core * std::mem::size_of::<f32>();
+    let activation_bytes = padded_scale_rows(rows_per_core) * std::mem::size_of::<f32>();
+    destination[..live_bytes].copy_from_slice(as_bytes_f32(
         &activation_scales
             [group * rows + core * rows_per_core..group * rows + (core + 1) * rows_per_core],
     ));
+    destination[live_bytes..activation_bytes].fill(0);
     destination[activation_bytes..].copy_from_slice(as_bytes_f32(
         &weight_scales[group * n + slab * SLAB_N..group * n + (slab + 1) * SLAB_N],
     ));

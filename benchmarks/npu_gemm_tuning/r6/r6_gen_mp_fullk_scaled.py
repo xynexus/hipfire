@@ -16,7 +16,12 @@ if COLS not in (4, 8):
 COMBINED = COLS == 8
 INF = 9223372036854775807
 ROWS = AW // 256
-SE = (ROWS + 64) * 4
+# The scale kernel reads the weight scales with a 64-byte `aie::load_v<16>`, so
+# the activation-scale region ahead of them must be padded to a multiple of 16
+# floats or that load is misaligned and returns wrong lanes. See
+# r6_scale_accum.cc. Host-side counterpart: `scale_bytes` in gemm_fullk.rs.
+ROWS_PADDED = ((ROWS + 15) // 16) * 16
+SE = (ROWS_PADDED + 64) * 4
 ATOT = COLS * KGROUPS * AW
 XE = AW + SE
 XTOT = COLS * NB * KGROUPS * XE

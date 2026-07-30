@@ -1503,3 +1503,62 @@ against group 0. If they are identical, the `@fs` fifo is delivering the same
 object every group and the fix is in the schedule's per-group scale
 acquisition; if they differ but are wrong, the fix is in `copy_scale_payload`'s
 group stride.
+
+## FIXED: the w4-scaled bug was a 64-byte vector-load misalignment
+
+Root cause, after the probes above showed every input arriving correctly:
+
+```c
+const float *weight_scales = activation_scales + ROWS;   // ROWS = M / COLS
+...
+auto weight_scale = aie::load_v<16>(weight_scales + block * 16);
+```
+
+`aie::load_v<16>` on floats is a **64-byte** vector load and needs a 64-byte
+aligned address. The weight scales begin at `ROWS * 4` bytes into the payload,
+which is aligned only when `ROWS` is a multiple of 16. Every geometry in use had
+`ROWS` of 4 or 8, so the load silently returned the wrong lanes.
+
+Why it survived so long:
+- **An all-1.0 scale set cannot detect it.** Every lane holds 1.0 whichever
+  lanes the load picks up, so the one case that passed was the one case that was
+  blind. `npu_embeddinggemma_fullk_sweep.rs` runs exactly that case.
+- **Every probe read the payload with SCALAR access** (`activation_scales[0]`),
+  which has no alignment requirement and therefore reported correct values —
+  while the kernel's vector load beside it was reading garbage. That is why
+  "the core receives the correct payload" and "the result is wrong" were both
+  true simultaneously.
+
+Fix: pad the activation-scale region up to a multiple of 16 floats so the
+boundary is always aligned. Three sites had to move together —
+`ROWS_PADDED` in `r6_scale_accum.cc` (and the three probes),
+`SE` in `r6_gen_mp_fullk_scaled.py`, and `padded_scale_rows()` in
+`gemm_fullk.rs` (the packer plus both buffer allocations).
+
+Verified on hardware, `max_abs_vs_reference` against the unscaled+host-scaled
+oracle, varying one scale axis at a time (all-1.0 alone proves nothing):
+
+| geometry | ROWS | weight-by-col | weight-by-group | act-by-row | act-by-group |
+|---|---|---|---|---|---|
+| M=32 COLS=4 (was broken on all four) | 8 | **0.000000** | **0.000000** | **0.000000** | **0.000000** |
+| M=64 COLS=8 (production shape) | 8 | **0.000000** | **0.000000** | **0.000000** | **0.000000** |
+
+**COLS=8 is now correct**, so the earlier "the COMBINED `objectfifo.link` path has
+a defect of its own" conclusion is withdrawn — that was this same misalignment.
+
+### One bug remains, and it does not block decode
+
+Re-uploading resident weights *between* dispatches still corrupts subsequent
+results: in the 3-case isolator, whichever case runs first is now exact and
+later ones are not. This does **not** affect inference, which uploads weights
+once and dispatches many times — the pattern `HIPFIRE_REPEAT_ONE` verifies as
+exact and bit-identical across three dispatches. Left open deliberately;
+`upload_resident_weights` needs a sync or fifo drain before it can be called on
+a live schedule.
+
+### What this unblocks
+
+The scaled path returns `rows * n` f32 instead of `groups * rows * n` int32, so
+it removes the 2.1 MB per-linear partial readback that measured as the 1.23 ms
+gap between the raw kernel (0.31 ms) and the runtime's full-K path (1.54 ms).
+That readback was the largest single decode cost identified.

@@ -5,6 +5,14 @@
 #define MT 8
 #endif
 static constexpr int ROWS = MT * 4;
+// `aie::load_v<16>` on floats is a 64-byte vector load and requires the address
+// to be 64-byte aligned. The weight scales follow the activation scales in the
+// payload, so that boundary lands at ROWS*4 bytes — aligned only when ROWS is a
+// multiple of 16. At ROWS=8 (e.g. M=32/COLS=4) the load silently returned wrong
+// lanes, which is what the "scaled full-K desync" actually was. A uniform
+// all-1.0 scale set cannot detect it: every lane holds 1.0 either way.
+// Pad the activation region so the boundary is always aligned.
+static constexpr int ROWS_PADDED = ((ROWS + 15) / 16) * 16;
 
 template <bool ACCUMULATE>
 static void scale_impl(const int32 *__restrict integers,
@@ -12,7 +20,7 @@ static void scale_impl(const int32 *__restrict integers,
                        int32 *__restrict output_bits) {
   const float *activation_scales =
       reinterpret_cast<const float *>(scale_payload);
-  const float *weight_scales = activation_scales + ROWS;
+  const float *weight_scales = activation_scales + ROWS_PADDED;
   float *output = reinterpret_cast<float *>(output_bits);
   for (int row = 0; row < ROWS; row++) {
     auto row_scale = aie::broadcast<float, 16>(activation_scales[row]);
