@@ -1053,3 +1053,69 @@ Finishing that decode is the highest-value next step on this axis: 241 ops for a
 whole 8-column layer is a small enough schedule to read completely, and it would
 show directly what FLM does that sustains 46.4 GB/s where both of our paths
 plateau at 5.3.
+
+## Decompiling FLM's transaction binaries
+
+`benchmarks/npu_gemm_tuning/txn_decompile.py` parses both txn versions —
+**v0.1, which our mlir-aie emits, and v1.0, which FLM ships** — and they use
+different field offsets for the same opcodes, so a v0.1 walk silently
+mis-parses a v1.0 blob (this cost a pass).
+
+**Why `txn2mlir.py` rejects FLM's binaries:** they end with **MERGE_SYNC
+(0x84)**, which our mlir-aie tree has *only* as an enum value in
+`third_party/aie-rt/.../xaie_txn.h` and `include/aie/Runtime/TxnEncoding.h` —
+no emitter, no parser case. FLM is built against a **newer aie-rt** than our
+checkout. That is the concrete toolchain delta, and it is small.
+
+Both decompile fully (241/241 and 88/88 ops). Per column, 8 columns each:
+
+| | hipfire c8 (v0.1) | FLM c8 (v1.0) |
+|---|---|---|
+| WRITE | 3 | 22 |
+| BLOCKWRITE (BDs, 32 B each) | 3 | 4 |
+| MASKWRITE | 1 | 2 |
+| DDR_PATCH | 3 (args 0,1,2) | 2 |
+| completion sync | **8 × TCT, one per column** | **1 × MERGE_SYNC, all columns** |
+| total ops | 88 | 241 |
+
+Neither loads core code — both are pure DMA/BD reconfiguration; the cores come
+from the PDI. So the size difference is not program loading.
+
+**A hypothesis this killed:** that our 8 per-column TCTs serialize the columns
+where FLM's single MERGE_SYNC does not. `--order` shows *both* schedules
+configure all eight columns first and sync only at the end
+(`...B:c7 PATCH W:c7 | TCT:c0 TCT:c1 ... TCT:c7`), so op ordering serializes
+nothing in either. The 8-vs-1 sync difference is real but is not the mechanism.
+
+The largest structural gap is **22 WRITEs per column against our 3** — FLM does
+far richer per-column DMA/task-queue setup, consistent with enqueueing a chain
+of tasks per column rather than reprogramming one BD triple per dispatch. It
+also patches only 2 buffer args to our 3 (we relocate A, W and C every
+dispatch), and its two 8-column variants use different patch conventions: one
+plain arg indices 0/1, the other high-bit-flagged values (0x80000000,
+0x80000018) — i.e. one form appears to reference a fixed preallocated device
+address rather than a per-call argument.
+
+### Dispatch cost is linear in dispatch COUNT, not bytes
+
+K sweep on `r6_16x4x16_c8_nb64`, N=4096 fixed, so only the dispatch count moves:
+
+| K | dispatches | ms |
+|---|---|---|
+| 256 | 1 | 0.665 |
+| 512 | 2 | 0.961 |
+| 1024 | 4 | 1.841 |
+| 2048 | 8 | 3.440 |
+| 4096 | 16 | 6.848 |
+
+A least-squares fit gives **0.426 ms per dispatch with a ~0.03 ms intercept** —
+essentially all cost is per-dispatch and none is fixed setup. Combined with the
+FLM structure above, the direction is to make each dispatch cover far more work
+(FLM's 4 BDs/column and richer task setup) rather than to tune the kernel body.
+
+Caveat on absolute rates: these runs report output mismatches, because driving
+the non-MP `r6_` caches through `NpuGemm::load_rounds` does not reproduce the
+bench's reference. The *linearity* is a shape result and holds — the same
+configuration is used at every point of the sweep — but do not quote GB/s from
+these runs. Fixing the `r6_`-vs-`r6mp_` driving mismatch is a prerequisite to
+trusting any absolute number from `npu_decode_bench`.
