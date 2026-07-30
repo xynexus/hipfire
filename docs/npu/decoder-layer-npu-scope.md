@@ -747,3 +747,23 @@ Tested and REJECTED: raising `@fs`/`@fr` to depth 2 to tolerate skew. It builds
 but returns infinities — the `objectfifo.link [@fx] -> [@fa, @fs]` split and the
 runtime DMA sizing both assume matched depth-1 buffering, so depth is not a
 drop-in knob.
+
+### TRAP: full-K cache directory names omit COLS
+
+`r6_fullk_cache.sh` names its output
+`embgemma_aie2p_fullk_submit_{mode}_m{M}_kg{K/256}_n{N}` — **COLS is not in the
+name**. Building the same (mode, M, K, N) at a different COLS silently
+OVERWRITES the existing cache, and `NpuGemmFullK::load_cached(dir, cols)` takes
+cols as a caller argument, so the mismatch is not detected: it loads a cache
+built for one column count and runs it as another, producing wrong numbers with
+no error.
+
+This invalidated a COLS sweep here (building COLS=2/M=8 clobbered the COLS=1/M=8
+cache that the end-to-end decode path in `npu_linear.rs` depends on, which then
+failed parity). Earlier sweeps that varied M alongside COLS — (1,8), (2,16),
+(4,32), (8,64) — were unaffected because their M values differ.
+
+If you need to compare COLS at a FIXED M, give each build a distinct cache
+directory, or add COLS to the name. Re-verify with
+`examples/npu_linear_oq4 ... --fullk COLS --fullk-m M` (it checks parity, so a
+mismatched cache shows up immediately).
