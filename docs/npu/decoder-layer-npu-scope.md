@@ -1119,3 +1119,47 @@ bench's reference. The *linearity* is a shape result and holds — the same
 configuration is used at every point of the sweep — but do not quote GB/s from
 these runs. Fixing the `r6_`-vs-`r6mp_` driving mismatch is a prerequisite to
 trusting any absolute number from `npu_decode_bench`.
+
+## CORRECTION: the 5.3 GB/s plateau was a harness bug, not silicon
+
+Both earlier claims in this document — that `npu_decode_bench` plateaus at
+~5.3 GB/s and that the recorded 32.5 GB/s "does not reproduce" — were **wrong**,
+and wrong for two compounding reasons in how the bench was being driven:
+
+1. **`rounds` mismatch.** Caches built with rounds=1 carry no suffix; the
+   `_r4`/`_r8`/`_r16`/`_r32` suffixes mark the others. Passing ROUNDS=4 to an
+   unsuffixed cache runs it mis-parameterised — it produces output (so it looks
+   like it worked), but both the result and the timing are meaningless. Every
+   "MISMATCHES" line in the runs above was this.
+2. **`MT` mismatch.** MT sets the M-block. Decode is M=1, so MT=1 is the right
+   build; MT=16 pads one token to a 64-row block. Using a prefill-shaped MT for
+   decode cost ~4x.
+
+With rounds=1 and MT=1 (`r6ts_1x4x32_c8_nb*`, K=2048, all verified
+`row 0 correct`):
+
+| N | ms | W GB/s |
+|---|---|---|
+| 512 | 0.188 | 2.8 |
+| 2048 | 0.190 | 11.0 |
+| 4096 | 0.219 | 19.1 |
+| 8192 | 0.306 | 27.4 |
+| 16384 | 0.479 | 35.0 |
+| 32768 | 0.793 | 42.3 |
+| 65536 | 1.421 | **47.2** |
+
+**47.2 GB/s exceeds FLM's 46.4 GB/s on the same silicon.** The nb=64/nb=128
+caches were built for this measurement.
+
+The shape is a fixed ~0.17 ms per-dispatch cost plus a marginal rate of
+**~47.8 GB/s** (fit between N=4096 and N=16384). So our *streaming* was never
+the problem — marginal bandwidth already matches FLM. The entire deficit is
+per-dispatch overhead, and the only lever is more N per dispatch.
+
+**This converges with the FLM decompile.** FLM issues 22 WRITEs and 4 BDs per
+column against our 3 and 3, and ships a `layer.xclbin` — it runs a whole fused
+layer per dispatch. We dispatch one linear at a time. Llama-3.2-1B's largest
+single linear is N=8192, which lands at 27.4 GB/s; reaching the 47 GB/s regime
+requires fusing a layer's linears into one dispatch, exactly the structure the
+transaction decompile shows FLM using. That is the next implementation step,
+and it is now a specific one rather than a search.
