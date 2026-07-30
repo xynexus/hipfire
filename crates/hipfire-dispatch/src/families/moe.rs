@@ -384,6 +384,11 @@ pub struct MoePrefillParams<'a> {
     pub capture: Option<&'a dyn MoePrefillCapture>,
     // dtype snapshot
     pub dtypes: MoeDtypes,
+    /// Routed OQ experts sit in the `oq4_arch` combined device layout
+    /// (split nibbles + split scales + interleaved blocks) rather than the
+    /// `oq_moe` repack (interleaved blocks only). The grouped GEMM strides the
+    /// interleaved region, so it needs the region offset this selects.
+    pub routed_oq_arch_combined: bool,
     // dims
     pub batch_size: usize,
     pub mi: usize,
@@ -479,11 +484,30 @@ impl MoePrefillResolution {
             // retain the same grouped routing and use the portable active-route
             // fallback rather than rejecting source-model calibration.
             DType::F16 | DType::BF16 => true,
+            // Opus Quant routed experts: `gemm_oq4g256_moe_grouped_wmma` is the
+            // gfx11 grouped kernel (same guard as the dispatch arm in
+            // pipeline::run_grouped_moe_gemm). Without this arm Oq4 resolved to
+            // neither path and fell through to the indexed
+            // `gemv_oq4g256_moe_*_k8_indexed_batched` GEMVs, which produce NaN —
+            // the same "finite-KLD failure" that keeps them off by default for
+            // decode (`HIPFIRE_QWEN35_MOE_OQ_INDEXED`).
+            DType::Oq4G256 => {
+                arch.is_gfx1100()
+                    || arch.is_gfx1101()
+                    || arch.is_gfx1102()
+                    || arch.is_gfx1103()
+                    || arch.is_gfx1150()
+                    || arch.is_gfx1151()
+                    || arch.is_gfx1152()
+            }
             _ => false,
         };
-        // MQ3 and raw F16/BF16 have no indexed fallback, so do not let a tuning
-        // opt-out route them into a nonexistent path.
-        let grouped_required = matches!(routed_dtype, DType::MQ3G256 | DType::F16 | DType::BF16);
+        // MQ3, raw F16/BF16, and Oq4 have no working indexed fallback, so do not
+        // let a tuning opt-out route them into a nonexistent (or NaN) path.
+        let grouped_required = matches!(
+            routed_dtype,
+            DType::MQ3G256 | DType::F16 | DType::BF16 | DType::Oq4G256
+        );
         let use_path2 = grouped_supported && (flags.moe_grouped_gemm || grouped_required);
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.

@@ -1959,11 +1959,14 @@ pub fn prefill_batch_pbs_eligible(
     !force_fallback
         && n >= MIN_BATCH
         && matches!(dn_state.quant, StateQuant::Q8 | StateQuant::FP32)
-        && (dn_state.quant == StateQuant::Q8
-            || weights
-                .layers
-                .iter()
-                .all(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_))))
+        // FP32 S-state used to be admitted only for dense (non-MoE) stacks
+        // because there was no batched FP32 GDN recurrence when this predicate
+        // was written (2026-04). `gated_delta_net_f32_batch_seq` landed
+        // 2026-06-22 and prefill_chunk dispatches it, so the MoE layer kinds no
+        // longer need excluding. `default_state_quant` returns FP32 for every
+        // shipping model, so this clause was rejecting batched prefill for the
+        // entire MoE family — qwen3.6-35B-A3B ran the per-token fallback and
+        // re-read all 40 layers' attention projections once per token.
         && weights.layers.iter().any(|lw| matches!(
             lw,
             LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),

@@ -260,6 +260,7 @@ fn run_case(gpu: &mut Gpu, quant_dtype: DType, full_dtype: DType, k_top: usize) 
             rows,
             false,
             false,
+            !hipfire_runtime::oq_moe::moe_expert_blocks_repacked(),
         )
         .unwrap();
         gpu.moe_gate_up_unscatter_k8(&grouped, &sorted, &gate, &up, mi, k_top, bucket.m_total)
@@ -407,6 +408,7 @@ fn run_paged_oq4_case(gpu: &mut Gpu) {
         rows,
         false,
         false,
+        !hipfire_runtime::oq_moe::moe_expert_blocks_repacked(),
     )
     .expect("run paged grouped OQ4");
     gpu.hip.device_synchronize().unwrap();

@@ -4,8 +4,12 @@
 // Grouped routed-expert OQ4 W4A16 GEMM. The routing/scatter contract matches
 // gemm_hfq4g256_moe_grouped_wmma_k2; only the weight block differs:
 //   OQ4 indexed block = [f32 scale | 128 signed-int4 nibbles] (132 B).
-// Canonical 130-byte HFQ blocks are repacked by hipfire-runtime::oq_moe before
-// their pointers are installed in the expert table.
+// Two producers of that block stream exist and `weight_byte_offset` selects
+// between them, since the expert pointer table always stores the buffer base:
+//   - hipfire-runtime::oq_moe repack (indexed-decode opt-in) — offset 0.
+//   - hipfire-runtime::oq4_arch combined layout (the DEFAULT for resident
+//     qt=34/37 experts) — the interleaved region trails the split nibbles and
+//     split f32 scales, so offset = M*(K/2) + M*(K/256)*4.
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
@@ -24,7 +28,8 @@ extern "C" __global__ void gemm_oq4g256_moe_grouped_wmma(
     const int*                __restrict__ sorted_slot_index,
     const _Float16*           __restrict__ X_src,
     float*                    __restrict__ Y_grouped,
-    int M, int K, int x_row_div, int m_total
+    int M, int K, int x_row_div, int m_total,
+    unsigned long long weight_byte_offset
 ) {
     const int tid = threadIdx.x;
     const int row_start = blockIdx.x * 16;
@@ -36,7 +41,8 @@ extern "C" __global__ void gemm_oq4g256_moe_grouped_wmma(
     if (expert_id < 0) return;
 
     const char* __restrict__ A =
-        reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
+        reinterpret_cast<const char*>(expert_weight_ptrs[expert_id])
+        + weight_byte_offset;
     const int lane = tid & 15;
     const int slot_idx = slot_start + lane;
     int x_row = -1;

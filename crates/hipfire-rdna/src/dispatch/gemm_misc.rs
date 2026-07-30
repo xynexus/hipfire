@@ -438,6 +438,11 @@ impl Gpu {
         x_row_div: usize,
         m_total: usize,
         x_src_rows: usize,
+        // Byte offset from each expert's buffer base to its interleaved
+        // `[f32 scale][128 nibbles]` block stream. Zero for the oq_moe repack;
+        // `m*(k/2) + m*(k/256)*4` for the oq4_arch combined layout that
+        // resident qt=34/37 experts load into.
+        weight_byte_offset: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let kernel_name = "gemm_oq4g256_moe_grouped_wmma";
@@ -455,6 +460,7 @@ impl Gpu {
         let k_value = k as i32;
         let row_div_value = x_row_div as i32;
         let total_value = m_total as i32;
+        let offset_value = weight_byte_offset as u64;
         let row_tiles = m.div_ceil(16) as u32;
         let slot_tiles = m_total.div_ceil(16) as u32;
         let bytes = crate::profile::gemv_oq4g256_moe_bytes(m, k, m_total)
@@ -475,7 +481,8 @@ impl Gpu {
                 i32 m_value,
                 i32 k_value,
                 i32 row_div_value,
-                i32 total_value
+                i32 total_value,
+                u64 offset_value
             ],
         );
         if let Some(timer) = timer {

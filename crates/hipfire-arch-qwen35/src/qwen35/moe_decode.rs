@@ -548,6 +548,7 @@ fn run_paged_mixed_routed_decode(
             1,
             false,
             false,
+            !hipfire_runtime::oq_moe::moe_expert_blocks_repacked(),
         )
         .map_err(HipError::from)?;
         gpu.moe_gate_up_unscatter_k8(
@@ -594,6 +595,7 @@ fn run_paged_mixed_routed_decode(
             k_top,
             false,
             false,
+            !hipfire_runtime::oq_moe::moe_expert_blocks_repacked(),
         )
         .map_err(HipError::from)?;
         gpu.moe_down_combine_grouped_k8(

@@ -6049,10 +6049,7 @@ fn load_moe_expert(
     let qt = qwen35_tensor_name_candidates(name)
         .into_iter()
         .find_map(|c| hfq.find_tensor_info(&c).map(|i| i.quant_type));
-    let oq_indexed_decode = std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
-        .ok()
-        .as_deref()
-        == Some("1");
+    let oq_indexed_decode = hipfire_runtime::oq_moe::moe_expert_blocks_repacked();
     if !oq_indexed_decode
         && matches!(
             qt,

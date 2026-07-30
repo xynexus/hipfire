@@ -841,6 +841,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         path2_shape.gate_up_source_rows,
                         false,
                         false,
+                        !hipfire_runtime::oq_moe::moe_expert_blocks_repacked(),
                     )
                     .map_err(HipError::from)?;
                     gpu.moe_gate_up_unscatter_k8(
@@ -1332,6 +1333,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         path2_shape.down_source_rows,
                         false,
                         false,
+                        !hipfire_runtime::oq_moe::moe_expert_blocks_repacked(),
                     )
                     .map_err(HipError::from)?;
                     gpu.moe_down_combine_grouped_k8(
@@ -1697,6 +1699,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     let grouped_scratch = pbs.grouped_moe_scratch.as_ref().expect("moe scratch");
 
     let moe_prefill_params = hipfire_dispatch::families::moe::MoePrefillParams {
+        routed_oq_arch_combined: !hipfire_runtime::oq_moe::moe_expert_blocks_repacked(),
         layer: layer_idx,
         capture,
         dtypes: moe_dtypes,
@@ -6109,6 +6112,22 @@ pub(crate) fn forward_prefill_chunk(
                         tape_q8,
                         tape_sc,
                         parents,
+                        &pbs.dn_attn_out_batch,
+                        n,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?;
+                } else if matches!(dn_state.quant, StateQuant::FP32) {
+                    // FP32 S-state has no `s_scales` allocated, so the Q8 arms
+                    // below fault on a null scale pointer. Same dispatch as the
+                    // non-MoE LA block above.
+                    gpu.gated_delta_net_f32_batch_seq(
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch,
+                        &pbs.dn_beta_batch,
+                        &dn_state.s_matrices[delta_layer_idx],
                         &pbs.dn_attn_out_batch,
                         n,
                         n_v_heads,

@@ -1401,6 +1401,7 @@ pub fn run_grouped_moe_gemm(
     rows: usize,
     paro_i8: bool,
     paro_i8_k8: bool,
+    oq_arch_combined: bool,
 ) -> Result<(), DispatchError> {
     macro_rules! hip {
         ($e:expr) => {
@@ -1468,6 +1469,15 @@ pub fn run_grouped_moe_gemm(
                 x_row_div,
                 m_total,
                 rows,
+                // Resident OQ4 experts sit in the oq4_arch combined layout, so
+                // the interleaved 132-byte block stream the kernel reads starts
+                // after the split nibbles and split f32 scales. The oq_moe
+                // repack (indexed-decode opt-in) emits that stream at offset 0.
+                if oq_arch_combined {
+                    m * (k / 2) + m * (k / 256) * 4
+                } else {
+                    0
+                },
             ))
         }
         DType::F16 if gpu.arch == "gfx1151" => {
@@ -1674,6 +1684,7 @@ pub fn run_moe_prefill(
             n,
             res.use_paro_i8,
             res.use_paro_i8_k8,
+            p.routed_oq_arch_combined,
         )?;
         // Stage 3 unscatter combine: Y_grouped → gate_batch + up_batch.
         hip!(gpu.moe_gate_up_unscatter_k8(
@@ -1954,6 +1965,7 @@ pub fn run_moe_prefill(
             total_slots,
             res.use_paro_i8,
             res.use_paro_i8_k8,
+            p.routed_oq_arch_combined,
         )?;
         hip!(gpu.moe_down_combine_grouped_k8(
             p.y_down_grouped,

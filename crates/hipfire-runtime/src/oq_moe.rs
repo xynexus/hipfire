@@ -18,6 +18,18 @@ pub const OQ8_CANONICAL_QT: u8 = QuantType::Oq8G256.code();
 pub const OQPLUS_COMPACT_QT: u8 = QuantType::OqPlusCompact.code();
 const GROUP_SIZE: usize = 256;
 
+/// Whether routed OQ experts are loaded in the repacked indexed MoE block
+/// layout (f32 scale) rather than the canonical HFQ layout (f16 scale).
+///
+/// `load_moe_expert` only repacks under `HIPFIRE_QWEN35_MOE_OQ_INDEXED=1`; every
+/// consumer that strides an expert block must agree with it, so both read this.
+pub fn moe_expert_blocks_repacked() -> bool {
+    std::env::var("HIPFIRE_QWEN35_MOE_OQ_INDEXED")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
 fn checked_group_count(m: usize, k: usize, format: &str) -> Result<usize, String> {
     if k % GROUP_SIZE != 0 {
         return Err(format!(
