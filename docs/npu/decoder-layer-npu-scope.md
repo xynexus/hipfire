@@ -339,3 +339,76 @@ Fixing `gemm_hfq4g256` (stage the activation tile in LDS, as
 NOT the fix for the measured model prefill, because that path already uses the tiled
 kernel.
 
+
+## The per-linear decode floor, measured (2026-07-30)
+
+`crates/hipfire-runtime/examples/npu_linear_oq4.rs` runs one real `.hfq` linear
+through `NpuOpusExecutor::run_f32` and checks it against
+`OpusPackedMatrix::reference_f32`. llama-3.2-1B `layers.0.self_attn.q_proj`
+(K=2048 N=2048, oq4++), **0/2048 mismatches, max_abs=0.0** — the first correct
+oq4 dequantization on the NPU from a real artifact.
+
+Decode-shape cost, same tensor at M=1:
+
+| path | ms | weight GB/s |
+|---|---|---|
+| per-group (8 dispatches) | 1.32 | 1.58 |
+| full-K m64/COLS=8 | 0.83 | 2.53 |
+| full-K m8/COLS=1 | **0.53** | 3.99 |
+
+### Where the 0.53 ms goes
+
+`HIPFIRE_XDNA_TRACE=1`, per dispatch: **submit 21.5 us (4%), wait 392 us (74%),
+host ~126 us (23%)**. It is kernel execution, not submit overhead. The work does
+not scale with rows either — M=1 0.529 ms, M=2 0.561, M=4 0.587, M=8 0.639,
+i.e. ~0.016 ms per real row on top of ~0.51 ms fixed.
+
+### Widening the array makes decode WORSE
+
+Each cache built at its minimum legal M (`M % (COLS*8) == 0`):
+
+| COLS / cache M | ms @ M=1 |
+|---|---|
+| 1 / 8 | 0.545 |
+| 2 / 16 | 0.593 |
+| 4 / 32 | 0.671 |
+| 8 / 64 | 0.830 |
+
+The unscaled full-K path reads back `groups * chunk_rows * N` i32 where
+`chunk_rows` is the cache's M. Widening the array raises the minimum M, so it
+only enlarges a readback of padded rows decode never uses: 8 groups x 64 rows x
+2048 x 4 = 4.2 MB to compute one row.
+
+### Conclusion
+
+The per-linear kernel family floors at ~0.53 ms/linear at decode = 112 linears
+= ~59 ms/token = **~17 tok/s against FastFlowLM's 60.1**, which needs
+~0.15 ms/linear. No COLS/M/kernel-variant knob closes that gap. **The fused
+decoder layer is required, not merely preferable** — it is the only structure
+that amortises the ~0.51 ms fixed cost across a layer's seven linears
+(~0.075 ms/linear effective => ~119 tok/s).
+
+### Blocked: scaled output
+
+`r6_fullk_cache.sh w4-scaled` returns f32 scaled on the array — `chunk_rows*N`
+f32 instead of `groups*chunk_rows*N` i32, i.e. 8x less readback, and it would
+make wide COLS pay off. `pack_matrix` already feeds it the per-group weight
+scales, and it dispatches, but the output is wrong (6.756 vs 1.449 at index 0).
+Why this was not caught earlier: `examples/npu_embeddinggemma_fullk_sweep.rs`
+exercises `run_resident_scaled` with all-1.0 activation AND weight scales, so it
+is a throughput probe that cannot detect a scale-application bug. The scaled
+full-K path has no correctness user in the repo.
+
+### Cache recipe traps
+
+Three ways to build a cache that loads, dispatches, and returns plausible noise,
+none of which fail loudly:
+- W4 per-group built from the default `r6_gemm.cc` instead of
+  `R6_KERNEL_SRC=r6_gemm_ts.cc`
+- MT=16 instead of MT=4
+- N-parallel `r6_gen.py` instead of `R6_GEN=r6_gen_mp.py`
+Copy `benchmarks/npu_gemm_tuning/embeddinggemma_aie2p/build_opus_caches.sh`.
+Also: the r118/r129 "staged" full-K kernel belongs to `NpuGemmStagedFullK`, not
+`NpuGemmFullK` — pairing them builds and runs and returns garbage. And `GROUPS`
+is a bash builtin (the caller's gid array), so assigning it in a build script
+silently yields 1000.
