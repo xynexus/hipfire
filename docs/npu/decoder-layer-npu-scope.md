@@ -438,3 +438,32 @@ working consumer to chase a broken one. Reproduce with
 `examples/npu_fullk_scaled_bug` before changing it again, and re-run the
 EmbeddingGemma sweeps after — noting that those sweeps use all-1.0 scales and
 therefore cannot detect a regression in this exact area.
+
+## qwen3.6-35B-A3B on the NPU: what the llama hook does NOT cover (2026-07-30)
+
+Measured, not inferred. Running the 35B with `HIPFIRE_NPU_DECODE=1` and the
+residency probe reports **zero weights made NPU-resident**, and decode is
+34.90 tok/s against a 34.70 tok/s GPU baseline — i.e. noise, no offload.
+
+Two independent reasons, both structural:
+
+1. **The MoE hot path bypasses `weight_gemv`.** The `npu_linear` hook sits on
+   `weights::weight_gemv`, which qwen35 does use (29 sites in
+   `decode_layers.rs`, 12 in `moe_decode.rs`) — but the individual
+   `weight_gemv` calls in `moe_decode.rs` are the MIXED-DTYPE FALLBACK. A
+   uniform-dtype MoE layer, which is what this artifact is, runs the fused
+   gate-side GEMV plus the indexed `gemv_oq4g256_moe_*` routed kernels. Those
+   are where essentially all the FLOPs are, and they never reach the hook.
+2. **Attention is not oq4.** Layer 0's `self_attn` / `linear_attn` tensors are
+   `qt=3` (Q8F16 -> `DType::Q8_0`), not `Oq4G256`, so they are rejected on dtype
+   before any cache lookup. Only the shared expert and the routed experts are
+   qt=34.
+
+So NPU support for the MoE is not an extension of the llama path; it needs
+(a) an offload hook inside the MoE dispatch itself — the routed-expert indexed
+GEMV is the target, one expert-group GEMM per active expert — and (b) either a
+Q8_0 NPU path for attention or an oq4-quantised attention artifact. The
+`r6_fullk_cache.sh w8` mode exists for (b) but has not been exercised here.
+
+Cache shapes that WOULD be needed for the shared expert alone (built, unused
+until a hook exists): K=2048 N=512 (gate/up) and K=512 N=2048 (down).

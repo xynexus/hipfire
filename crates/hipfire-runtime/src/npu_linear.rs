@@ -276,6 +276,12 @@ pub fn try_npu_gemv(
             let exec = reg.executors.get(&m)?;
             match exec.pack_matrix(OQ4_CANONICAL_QT, k, m, &payload, awq) {
                 Ok(matrix) => {
+                    if timing_enabled() {
+                        eprintln!(
+                            "[npu-decode] resident K={k} N={m} (weights={})",
+                            reg.weights.len() + 1
+                        );
+                    }
                     reg.weights.insert(key, Resident { matrix });
                 }
                 Err(_) => {
