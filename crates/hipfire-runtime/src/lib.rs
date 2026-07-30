@@ -46,6 +46,8 @@ pub mod model_source;
 pub mod moe;
 pub mod mtp_mirror;
 pub mod multi_gpu;
+#[cfg(target_os = "linux")]
+pub mod npu_linear;
 pub mod oq4_arch;
 pub mod oq8_arch;
 pub mod oq_moe;

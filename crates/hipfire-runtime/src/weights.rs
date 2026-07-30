@@ -417,6 +417,24 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
     if capture_at_weight_gemv_wrapper(w.gpu_dtype) {
         gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
     }
+    // NPU offload (HIPFIRE_NPU_DECODE=1). Returns None for anything it cannot
+    // serve — wrong dtype, no cached xclbin for this (K,N) — so the GPU path
+    // below stays the default and a partially-covered model still runs.
+    #[cfg(target_os = "linux")]
+    if crate::npu_linear::npu_decode_enabled() {
+        if let Some(result) = crate::npu_linear::try_npu_gemv(
+            gpu,
+            &w.buf,
+            w.gpu_dtype,
+            w.m,
+            w.k,
+            w.awq_scale.as_ref(),
+            x,
+            y,
+        ) {
+            return result;
+        }
+    }
     let ctx = DispatchCtx::new(gpu);
     let wr = WeightRef {
         buf: &w.buf,
