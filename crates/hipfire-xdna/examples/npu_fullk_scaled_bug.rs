@@ -1,0 +1,130 @@
+//! Isolate the scaled full-K discrepancy against the unscaled kernel.
+//!
+//! `run_resident_scaled` applies activation and weight scales ON THE ARRAY and
+//! returns f32; `run_resident` returns raw per-group i32 the host then scales.
+//! For the SAME weights and activations the two must agree:
+//!
+//!   scaled[row][col] == sum_group partial[group][row][col]
+//!                       * act_scale[group][row] * weight_scale[group][col]
+//!
+//! `examples/npu_embeddinggemma_fullk_sweep.rs` runs the scaled kernel with
+//! all-1.0 scales, which cannot detect a scale-application bug. This walks three
+//! cases so the failure mode is pinned rather than guessed:
+//!
+//!   1. all scales 1.0        -> isolates "are scales applied at all"
+//!   2. weight scales only    -> isolates the per-column term
+//!   3. activation scales only-> isolates the per-(group,row) term
+//!
+//! Usage: npu_fullk_scaled_bug SCALED_CACHE UNSCALED_CACHE COLS
+
+#[cfg(target_os = "linux")]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use hipfire_xdna::NpuGemmFullK;
+
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.len() < 3 {
+        return Err("usage: npu_fullk_scaled_bug SCALED_CACHE UNSCALED_CACHE COLS".into());
+    }
+    let cols: usize = args[2].parse()?;
+    let mut scaled = NpuGemmFullK::load_cached(&args[0], cols)?;
+    let mut plain = NpuGemmFullK::load_cached(&args[1], cols)?;
+    if !scaled.scaled_output() {
+        return Err("first cache is not a scaled build".into());
+    }
+    if plain.scaled_output() {
+        return Err("second cache must be an unscaled build".into());
+    }
+    let (rows, k, n) = (scaled.rows(), scaled.k(), scaled.n());
+    let groups = k / 256;
+    if (plain.rows(), plain.k(), plain.n()) != (rows, k, n) {
+        return Err("caches must share geometry".into());
+    }
+    println!("rows={rows} k={k} n={n} groups={groups} cols={cols}");
+
+    // Deterministic small int4-range weights and int8 activations.
+    let w = |g: usize, i: usize| (((g * 7 + i * 3) % 15) as i8) - 7;
+    let base: Vec<Vec<i8>> = (0..groups)
+        .map(|g| (0..256 * n).map(|i| w(g, i)).collect())
+        .collect();
+    let residual: Vec<Vec<i8>> = Vec::new();
+    let activations: Vec<i8> = (0..rows * k).map(|i| (((i * 5) % 31) as i8) - 15).collect();
+
+    let base_refs: Vec<&[i8]> = base.iter().map(Vec::as_slice).collect();
+    let residual_refs: Vec<&[i8]> = residual.iter().map(Vec::as_slice).collect();
+
+    // Unscaled reference: raw i32 partials, scaled on the host.
+    let packed_plain = plain.prepack_weights(&base_refs, &residual_refs)?;
+    let resident_plain = plain.upload_resident_weights(&packed_plain)?;
+    let mut partials = vec![0i32; groups * rows * n];
+    plain.run_resident(&resident_plain, &activations, &mut partials)?;
+
+    for (case, wscale, ascale) in [
+        ("all 1.0", 1.0f32, 1.0f32),
+        ("weight only", 0.5f32, 1.0f32),
+        ("activation only", 1.0f32, 0.25f32),
+    ] {
+        // Distinct-but-known values so a transposed or mis-strided index shows up.
+        let weight_scales: Vec<Vec<f32>> = (0..groups)
+            .map(|g| {
+                (0..n)
+                    .map(|c| wscale * (1.0 + (g + c) as f32 * 0.0))
+                    .collect()
+            })
+            .collect();
+        let act_scales: Vec<f32> = (0..groups * rows).map(|_| ascale).collect();
+        let scale_refs: Vec<&[f32]> = weight_scales.iter().map(Vec::as_slice).collect();
+
+        let packed = scaled.prepack_weights_with_scales(&base_refs, &residual_refs, &scale_refs)?;
+        let resident = scaled.upload_resident_weights(&packed)?;
+        let mut out = vec![0.0f32; rows * n];
+        scaled.run_resident_scaled(&resident, &activations, &act_scales, &mut out)?;
+
+        let mut worst = 0.0f32;
+        let mut worst_at = (0usize, 0usize);
+        let mut ratio_sum = 0.0f64;
+        let mut ratio_n = 0usize;
+        for row in 0..rows {
+            for col in 0..n {
+                let mut want = 0.0f32;
+                for g in 0..groups {
+                    want += partials[(g * rows + row) * n + col] as f32
+                        * act_scales[g * rows + row]
+                        * weight_scales[g][col];
+                }
+                let got = out[row * n + col];
+                let err = (got - want).abs();
+                if err > worst {
+                    worst = err;
+                    worst_at = (row, col);
+                }
+                if want.abs() > 1e-3 {
+                    ratio_sum += (got / want) as f64;
+                    ratio_n += 1;
+                }
+            }
+        }
+        let (r, c) = worst_at;
+        let mut want0 = 0.0f32;
+        for g in 0..groups {
+            want0 += partials[(g * rows + r) * n + c] as f32
+                * act_scales[g * rows + r]
+                * weight_scales[g][c];
+        }
+        println!(
+            "case={case:16} max_abs={worst:.6} at(row={r},col={c}) got={:.6} want={want0:.6} \
+             mean_ratio={:.6}",
+            out[r * n + c],
+            if ratio_n > 0 {
+                ratio_sum / ratio_n as f64
+            } else {
+                f64::NAN
+            }
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("npu_fullk_scaled_bug requires Linux + XDNA");
+}
