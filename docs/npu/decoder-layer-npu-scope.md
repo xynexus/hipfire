@@ -1751,3 +1751,44 @@ further above their floor than this alone explains (cols=4 / N=2048 implies
 ~139 us of tile ingress against 1189 us measured). So the port is one term, not
 the whole story — verify with the trace unit (r1b) rather than treating this
 arithmetic as complete.
+
+## N-parallel scaled: works, wins per-linear, LOSES end to end
+
+The schedule executes and is exact on all four scale axes on first run
+(`max_abs 0.000000`). Per-linear on real Llama-3.2-1B oq4++ at M=1, every case
+`0` mismatches:
+
+| linear | N-parallel | full-K default | speedup |
+|---|---|---|---|
+| q_proj K=2048 N=2048 | 0.325 ms / 6.46 GB/s | 0.546 / 3.84 | 1.68x |
+| gate_proj K=2048 N=8192 | 0.786 ms / 10.68 GB/s | 1.555 / 5.39 | 1.98x |
+| down_proj K=8192 N=2048 | 0.794 ms / 10.56 GB/s | 2.043 / 4.11 | 2.57x |
+
+It also BUILDS at N=8192, which the M-parallel schedule cannot — that one's
+output BD carries a `size = NB` dimension which exceeds the DMA `[1:64]` range
+at N>4096, while this one's is `<size = ROWS, stride = N>` with ROWS=8.
+
+**End to end it is SLOWER: 5.5 tok/s against the default's 6.2.** Every
+per-linear number says it should win by ~2x and the delivered result moves the
+other way, so the per-linear wins do not compose. It is therefore **opt-in only**
+(`HIPFIRE_NPU_NP=1`); the default is verified unchanged at 6.2 tok/s.
+
+Leading candidate, NOT yet measured: N-parallel duplicates the activation into
+every `(column, slab)` entry, so `run_resident_scaled` repacks
+`cols * spc * groups * (rows*256 + scale_bytes)` = ~600 KB of host memory per
+call, against the full-K path's ~16 KB. A microbenchmark that loops on fixed
+activations hides exactly this — the packing is per call, but so is everything
+else in that loop, and the cache stays warm. The runtime's activations change
+every token.
+
+**How to settle it:** `HIPFIRE_NPU_DECODE_TIMING=1` already splits
+download / NPU / upload per call, and `HIPFIRE_XDNA_TRACE=1` splits submit from
+device wait. Run both with `HIPFIRE_NPU_NP=1` and compare against the default.
+If host packing is the cause, `run_f32` time will exceed the sum of submit and
+wait; if it is not, look at whether `load_executor` is even selecting the
+N-parallel executor for every shape (the `[npu-decode] N-parallel scaled` line
+reports this).
+
+This is the third time in this work that a component-level win has failed to
+appear end to end. Measure the delivered path before believing a per-linear
+number.

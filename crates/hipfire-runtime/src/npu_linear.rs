@@ -218,6 +218,33 @@ fn load_executor(n: usize, k: usize) -> Option<NpuOpusExecutor> {
             }
         }
     }
+    // N-parallel scaled full-K: each column owns N/COLS slabs and all M rows
+    // with its OWN weight stream, so per-tile ingress drops by COLS instead of
+    // every tile absorbing the whole matrix through its 14.4 GB/s port. On real
+    // Llama-3.2-1B oq4++ at M=1, all bit-exact: q_proj 0.546 -> 0.325 ms
+    // (1.68x), gate_proj 1.555 -> 0.786 (1.98x), down_proj 2.043 -> 0.794
+    // (2.57x). It also builds at N=8192, which the M-parallel schedule cannot
+    // (its output BD carries a size=NB dimension that exceeds the DMA range).
+    let np = format!(
+        "{home}/.hipfire/npu/embgemma_aie2p_fullk_submit_w4-np-scaled_m8_kg{}_n{n}_c8",
+        k / GROUP
+    );
+    // OPT-IN (HIPFIRE_NPU_NP=1). Every per-linear measurement favours this path,
+    // but end to end it measured 5.5 tok/s against the full-K default's 6.2 —
+    // the opposite direction. Per-linear wins therefore do not compose here and
+    // the cause is not yet known; a candidate is that N-parallel duplicates the
+    // activation into every (column, slab) entry, so the host repacks
+    // cols*spc*groups*(rows*256 + scale_bytes) = ~600 KB per call against the
+    // full-K path's ~16 KB, which a fixed-activation microbenchmark loop hides.
+    // Not made default until that is measured, not guessed.
+    if have(&np) && std::env::var("HIPFIRE_NPU_NP").is_ok_and(|v| v != "0") {
+        if let Ok(exec) = NpuOpusExecutor::load_fullk_cached(&[(&np, 8)], n) {
+            if timing_enabled() {
+                eprintln!("[npu-decode] N-parallel scaled K={k} N={n}");
+            }
+            return Some(exec);
+        }
+    }
     let dir = cache_dir(n, k)?;
     NpuOpusExecutor::load_fullk_cached(&[(&dir, 1)], n).ok()
 }
