@@ -79,6 +79,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut out = vec![0.0f32; rows * n];
         scaled.run_resident_scaled(&resident, &activations, &act_scales, &mut out)?;
 
+        if std::env::var("HIPFIRE_DUMP_STAGE").is_ok() {
+            let f = |r: std::ops::Range<usize>| {
+                out[r]
+                    .iter()
+                    .take(4)
+                    .map(|v| (v * 1000.0).round() / 1000.0)
+                    .collect::<Vec<_>>()
+            };
+            println!(
+                "  stage case={case}: to_float[0..4]={:?} weight_scale[0..4]={:?} after_mul1[0..4]={:?}",
+                f(0..16), f(16..32), f(32..48)
+            );
+            continue;
+        }
         if std::env::var("HIPFIRE_DUMP_PAYLOAD").is_ok() {
             // With the dump probe kernel loaded, row 0 of the output holds the
             // scale payload the core received: ROWS activation scales then

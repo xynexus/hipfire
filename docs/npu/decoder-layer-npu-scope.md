@@ -505,3 +505,39 @@ Two failed approaches, recorded so they are not repeated: replacing the whole
 body with scalar C++ produced all zeros, and replacing only the weight-scale
 `aie::load_v<16>` with an `aie::broadcast` of one scalar produced infinities —
 both broke the previously-exact all-1.0 case, so neither isolated anything.
+
+### ROOT CAUSE: the weight-scale load reads the ACTIVATION-scale region
+
+`r6_scale_stage_probe.cc` parks the multiply intermediates in the output buffer
+(init pass only, with `r6_scale_accum` made inert so later groups cannot
+accumulate over them) and `npu_fullk_scaled_bug --HIPFIRE_DUMP_STAGE=1` prints
+them. Lanes 0..3 of the first block:
+
+| case | act scale | weight scale | value LOADED as weight_scale |
+|---|---|---|---|
+| all 1.0 | 1.0 | 1.0 | 1.0 |
+| weight 0.5 uniform | 1.0 | 0.5 | **1.0** |
+| activation 0.25 uniform | 0.25 | 1.0 | **0.25** |
+
+In both failing cases the vector loaded as the weight scale carries the
+ACTIVATION scale's value. `aie::load_v<16>(weight_scales + block*16)` is
+reading inside the activation-scale block rather than past it.
+
+This explains every observation at once, including why the all-1.0 case is
+exact: when the whole payload is 1.0, reading the wrong region still yields 1.0.
+It is consistent with the earlier padding experiment changing the result
+(padding moves the boundary) without fixing it (the load is still short), and
+with delivery being provably correct (the bytes are there; the load addresses
+the wrong ones).
+
+`weight_scales = activation_scales + ROWS` with ROWS = MT*4 = M/COLS = 8 floats
+should be correct C pointer arithmetic, so the next step is to print ROWS and
+the byte delta `(const int8*)weight_scales - scale_payload` from inside the
+kernel and compare against the expected 32. Candidates: MT not reaching this
+translation unit (the header defaults `#define MT 8`, which would make ROWS=32),
+or the 64-byte `load_v<16>` being lowered to an aligned load that truncates the
+32-byte-aligned address downward.
+
+The second candidate would also explain why padding to 16 floats moved the
+answer without fixing it: it makes the address 64-byte aligned but the earlier
+`ROWS` offset is still what the pointer arithmetic used.
