@@ -1827,3 +1827,40 @@ It is fine for CORRECTNESS (bit-exactness against `reference_f32`) and for
 coarse ratios within one schedule, but any decision between schedules needs
 `HIPFIRE_NPU_DECODE_TIMING` over a real generation. Three component-level wins
 in this work failed to appear end to end; this is why.
+
+### Where the 0.87 ms/call actually goes — and why N-parallel loses
+
+`HIPFIRE_XDNA_TRACE=1` alongside `HIPFIRE_NPU_DECODE_TIMING=1` over a real
+generation, 12384 dispatches (one per call):
+
+| path | submit | **device wait** | host remainder | npu_ms |
+|---|---|---|---|---|
+| full-K default | 0.020 | **0.663** | 0.186 | 0.869 |
+| N-parallel | 0.032 | **0.919** | 0.177 | 1.128 |
+
+**The host-packing hypothesis is REFUTED.** The host remainder is essentially
+identical (0.177 vs 0.186 ms); N-parallel is slower *on the device*.
+
+The cause is that `dispatch_synced(&[input, weights, output], &[true,false,true])`
+syncs the input BO **as part of the dispatch**, so it lands in the traced wait,
+not in host time. N-parallel's input is `cols * spc * groups * (rows*256 +
+scale_bytes)` ~= 600 KB of DUPLICATED activation against full-K's ~16 KB, and
+that ~584 KB of extra host->device traffic per call is the 0.256 ms gap. The
+duplication is real and it is charged to the device, which is why the
+microbenchmark's device-side win did not survive.
+
+**The fix is specific.** Every column needs the SAME activations — only the
+scales differ per (column, slab). So the activation must be sent ONCE and
+re-read by the DMA (a BD that repeats over the same host region, as the
+M-parallel *non-combined* path already does with a per-slab task), rather than
+materialised per (column, slab) in the X buffer. That conflicts with the
+combined `@fx` stream, which interleaves activations and scales precisely so
+they fit two shim channels — so it needs either scales sourced from a different
+shim, or a memtile broadcast of activations across columns.
+
+**Corrected picture of the wall.** Device wait dominates at 0.663 ms/call x 96
+calls = ~64 ms/token of pure array time, against ~13 ms if the 0.62 GB of oq4
+weights per token moved at the 47 GB/s this silicon demonstrably reaches. So the
+delivered path runs at roughly 10 GB/s effective — the schedule IS still the
+lever, and my previous note that "the remaining gap isn't in the linear kernels"
+was wrong. It is, and this is the measurement that shows it.
