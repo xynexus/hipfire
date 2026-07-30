@@ -1713,3 +1713,41 @@ The cache name encodes COLS (`_c{COLS}`) precisely because the M-parallel names
 do not, which is how a COLS=4 build silently overwrote a COLS=8 one earlier in
 this work; the M-parallel names are left alone because `npu_linear.rs` and
 `npu_linear_oq4` resolve them.
+
+### Channel and per-tile-ingress budget (the real constraint)
+
+The limit is traffic INTO tiles, not just the shim's channels. Per column, read
+off the generated MLIR:
+
+| tile | in (S2MM) | out (MM2S) | aie2p limit |
+|---|---|---|---|
+| shim | `fc` (1) | `fx`, `fw` (**2**) | 2 / 2 |
+| memtile | `fx` (1) | `fa`, `fs` (2) | 6 / 6 |
+| g (GEMM, row 2) | `fa`, `fw` (**2**) | `fr` (1) | **2** / 2 |
+| s (scale, row 3) | `fs`, `fr` (**2**) | `fc` (1) | **2** / 2 |
+
+Both compute tiles are at **exactly 2 incoming channels — full**, and the shim
+at 2 outgoing. That is why activations and scales must share `@fx` and be split
+in the memtile: there is no third inbound channel at either compute tile. Any
+future stream (a bias, a second weight plane) has to be folded into an existing
+one, not added.
+
+Bandwidth matters more than the channel count. A compute tile's S2MM receive
+port is **8 B/cycle = 14.4 GB/s**, shared by everything arriving at that tile
+(measured with the trace unit, r1b — see the memory note). So:
+
+- **M-parallel**: `@fw` is broadcast, so EVERY tile absorbs the ENTIRE weight
+  matrix through its own 14.4 GB/s port. The fan-out is free in DRAM terms and
+  expensive in per-tile terms. That is a per-tile floor no fabric headroom can
+  relieve, and it is the mechanism behind "wider is worse" — not DRAM traffic,
+  which is what I previously assumed.
+- **N-parallel**: each tile receives `weights / COLS`, so the per-tile floor
+  drops by COLS and aggregate demand (COLS x 14.4 = 115 GB/s at 8 columns)
+  moves above the ~55 GB/s fabric knee, i.e. the fabric becomes the binding
+  limit instead of the tile port. That is the intended trade.
+
+Caveat: this predicts a per-tile FLOOR, and the measured M-parallel times are
+further above their floor than this alone explains (cols=4 / N=2048 implies
+~139 us of tile ingress against 1189 us measured). So the port is one term, not
+the whole story — verify with the trace unit (r1b) rather than treating this
+arithmetic as complete.

@@ -86,9 +86,11 @@ esac
 aiecc "$OUT/aie.mlir" --no-compile-host --no-xchesscc --no-xbridge \
   --peano="$PEANO" --aie-generate-npu-insts --npu-insts-name="$OUT/insts.bin" \
   --aie-generate-xclbin --xclbin-name="$OUT/final.xclbin" --tmpdir="$OUT" >/dev/null
-if [[ "$MODE" == "w4-scaled" ]]; then
+if [[ "$MODE" == "w4-scaled" || "$MODE" == "w4-np-scaled" ]]; then
   echo scaled-f32-direct > "$OUT/output-layout.txt"
-  if (( COLS == 8 )); then
+  # N-parallel always combines activations+scales into one stream per column
+  # (shim budget: @fx and @fw in, @fc out).
+  if (( COLS == 8 )) || [[ "$MODE" == "w4-np-scaled" ]]; then
     echo combined > "$OUT/input-layout.txt"
   else
     echo separate > "$OUT/input-layout.txt"
