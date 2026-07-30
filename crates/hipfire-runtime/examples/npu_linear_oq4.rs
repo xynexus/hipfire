@@ -107,8 +107,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|v| v.parse::<usize>())
             .transpose()?
             .unwrap_or(64);
+        // `w4-scaled` scales ON THE ARRAY and returns f32, so the host never reads
+        // back the `groups * chunk_rows * N` i32 partial block (4.2 MB per call at
+        // chunk_rows=64 / N=2048, which is the whole of the plain-w4 call cost).
+        let mode = if opt("--unscaled").is_some() {
+            "w4"
+        } else {
+            "w4-scaled"
+        };
         let dir = format!(
-            "{home}/.hipfire/npu/embgemma_aie2p_fullk_submit_w4_m{fk_m}_kg{}_n{n}",
+            "{home}/.hipfire/npu/embgemma_aie2p_fullk_submit_{mode}_m{fk_m}_kg{}_n{n}",
             k / 256
         );
         if !Path::new(&format!("{dir}/final.xclbin")).exists() {
