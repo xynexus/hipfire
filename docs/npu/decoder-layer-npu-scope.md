@@ -698,3 +698,27 @@ across a layer's seven linears); see the per-linear floor section above.
 
 Recorded because roughly eight turns of investigation were spent on this path
 under the assumption it gated decode. Measure the lever before repairing it.
+
+### UG1079's "eight lanes" is AIE1/AIE-ML, NOT aie2p — do not rewrite to 8-lane
+
+`docs/npu/ug1079-2026.1-AIE-programming-manual/036-floating-point-operations.md`
+states: "The AI Engine vector unit provides eight lanes of single-precision
+floating-point multiplication and accumulation." That reads like an explanation
+for fault 1 — `r6_scale_accum.cc` uses 16-lane float vectors, so `load_v<16>`
+is a 64-byte load and the weight scales at `activation_scales + ROWS` = +32
+bytes are misaligned. Rewriting the kernel to native 8-lane ops would then make
+the existing offset naturally aligned and need no ABI change.
+
+**Tested: it produces infinities.** The reason is in the aie_api headers —
+`detail/aie2p/mul_acc32_fp.hpp` dispatches `mul_elem_16` for `Elems <= 16` on
+fp32, i.e. aie2p's native single-precision vector width is **16 lanes**. The
+UG1079 text describes AIE1 / AIE-ML (NPU1), not AIE-ML v2 / aie2p (NPU2).
+
+This is the same generation trap already recorded for benchmark numbers
+("never mix aie2 with aie2p") applied to the ISA documentation. When UG1079 and
+`include/aie_api/detail/aie2p/` disagree, the headers win for this target.
+
+So fault 1's fix remains the payload padding, which was independently proven to
+repair the load by direct observation. Use
+`~/AMD_AI_DOCS/install-help-aie-ml-v2-intrinsics.sh` (AIE-ML **v2** = aie2p) for
+intrinsic-level questions rather than UG1079.
