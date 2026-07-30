@@ -767,3 +767,64 @@ If you need to compare COLS at a FIXED M, give each build a distinct cache
 directory, or add COLS to the name. Re-verify with
 `examples/npu_linear_oq4 ... --fullk COLS --fullk-m M` (it checks parity, so a
 mismatched cache shows up immediately).
+
+## MLIR-AIE source (~/build/mlir-aie) answers the desync question
+
+### Locks are configured once, not per dispatch
+
+`lib/Dialect/AIE/Transforms/AIEObjectFifoStatefulTransform.cpp` creates the
+objectfifo locks with STATIC initial values:
+
+```cpp
+int prodLockValue = (numElem - initValues) * repeatCount;
+int consLockValue = initValues * repeatCount;
+```
+
+These are `aie.lock` init values baked into the design and applied at device
+configuration (xclbin load / hardware-context creation) — **not per dispatch**.
+So any dispatch that does not return every lock to its initial value skews every
+later one, which is exactly the observed "only the first `run_resident_scaled`
+of a process is correct".
+
+### depth > 1 with repeat_count is UNSUPPORTED — my depth-2 test was invalid
+
+`programming_guide/section-2/section-2b/04_Repeat/README.md`: with a compute-tile
+producer the lowering adjusts acquire/release values to account for the repeat,
+and "Doing this adjustement for Object FIFOs of depth larger than 1 is
+non-trivial and **currently not supported**." The scaled schedule gives `@fc`
+(produced by the scale core, a compute tile) `repeat_count = NB - 1`, so depth
+MUST stay 1. The earlier depth-2 experiment was invalid by construction.
+
+### The likely mechanism: freeing input BDs without awaiting them
+
+`include/aie/Dialect/AIEX/IR/AIEX.td` and
+`programming_guide/section-2/section-2d/DMATasks.md`:
+
+> `dma_free_task` allows the compiler to reuse the BDs of a task WITHOUT
+> synchronization. Using `dma_free_task(X)` before task `X` has completed will
+> lead to a race condition and unpredictable behavior. Only use it in
+> conjunction with some other means of synchronization — for example after
+> `dma_await_task(Y)` if `Y` can only complete after `X`.
+
+The scaled runtime sequence configures its input stream `%tx{col}` WITHOUT
+`issue_token` (so it cannot be awaited), awaits only `%tc{col}`, then frees
+`%tx`/`%tw`. That is only sound if awaiting `@fc` implies the input drained —
+and `%tc` carries `repeat_count = NB - 1`, so one await may return after the
+first of NB transfers rather than all of them, leaving input BDs live when they
+are freed.
+
+NEXT: give `%tx` `issue_token = true` and await it before freeing, or await
+`%tc` once per repeat. Both are runtime-sequence changes in
+`r6_gen_mp_fullk_scaled.py`, no kernel or ABI change.
+
+### Scaled output does NOT help decode — now tested across the corner
+
+| config | ms @ M=1 |
+|---|---|
+| unscaled COLS=1 m8 | **0.514** |
+| scaled COLS=4 m16 | 0.833 |
+| scaled COLS=8 m32 | 0.790 |
+| scaled COLS=8 m64 | 1.329 |
+
+Confirms the earlier single-point result: repairing the scaled path is a PREFILL
+win (1.46x at M=64) and does nothing for decode at any COLS/M tested.

@@ -115,10 +115,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "w4-scaled"
         };
-        let dir = format!(
-            "{home}/.hipfire/npu/embgemma_aie2p_fullk_submit_{mode}_m{fk_m}_kg{}_n{n}",
-            k / 256
-        );
+        let dir = if std::env::var("HIPFIRE_SWEEP_CACHE").is_ok() {
+            format!(
+                "{home}/.hipfire/npu/sweep_fullk_{mode}_c{cols}_m{fk_m}_kg{}_n{n}",
+                k / 256
+            )
+        } else {
+            format!(
+                "{home}/.hipfire/npu/embgemma_aie2p_fullk_submit_{mode}_m{fk_m}_kg{}_n{n}",
+                k / 256
+            )
+        };
         if !Path::new(&format!("{dir}/final.xclbin")).exists() {
             return Err(format!("missing full-K cache {dir}").into());
         }
