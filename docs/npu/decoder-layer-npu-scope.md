@@ -828,3 +828,24 @@ NEXT: give `%tx` `issue_token = true` and await it before freeing, or await
 
 Confirms the earlier single-point result: repairing the scaled path is a PREFILL
 win (1.46x at M=64) and does nothing for decode at any COLS/M tested.
+
+### Tested and REJECTED: issue_token + await on the scaled input stream
+
+The docs-motivated fix — give `%tx{col}` `issue_token = true` and
+`dma_await_task` it before `dma_free_task` — was applied to a sandbox copy of
+`r6_gen_mp_fullk_scaled.py`. The generated MLIR is correct (all eight `%tx`
+blocks carry `{issue_token = true}`, `%tc` keeps
+`{issue_token = true, repeat_count = 31}`), it builds, and it returns
+**infinities in every case including the first** — i.e. it breaks the schedule
+outright rather than repairing the cross-dispatch desync.
+
+So the "free before await" reading is not the whole story, or a token on an MM2S
+input channel is not compatible with this schedule's BD allocation. The other
+candidate from the same docs — awaiting `@fc` once per repeat rather than once
+per dispatch — is untested.
+
+Running tally of REJECTED fixes for the scaled path, all rebuilt and measured:
+padding alone (fixes the load, end-to-end still wrong), 8-lane float rewrite
+(wrong generation — aie2p fp32 is 16-lane), objectfifo depth 2 (unsupported with
+repeat_count on a compute-tile producer), issue_token+await on the input (breaks
+the schedule).
