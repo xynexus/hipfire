@@ -8903,3 +8903,46 @@ around it, which is worth remembering before reaching for another kernel.
 
 Remaining for P4: the harness side — o_proj-style weight packing for gate and
 up, the fourth broadcast fill carrying `h`, and its own `flm_asum_prepare`.
+
+## 2026-08-01 — P4 is blocked by DATA memory, not program memory
+
+P4's design side wired cleanly — kernels, core body, arg types, signature,
+TaskGroup — and then the build failed, at a stage nothing had failed at before:
+
+    warning: Failed to allocate buffer "wp7_p3_split1_cons_buff_0"
+             with size: 20544 bytes
+    warning: Bank-aware allocation failed, trying basic sequential allocation.
+
+**Core data memory, 64 KB in 4 banks of 16.** What competes for it:
+
+    weight fifo, split 2 ways    2 x 20544 = 41088 B   63%
+    broadcast object             4224 bf16 =  8448 B   13%
+    result fifo (a pair)                   =   512 B
+    stack                                  =  4096 B
+    subtotal                                 54144 B   83%
+    + g_asum, g_resid, g_gate, g_acc_down, and P2's KV operand
+
+Halving the stack from 8192 to 4096 was not enough. The operand object dominates
+at 20544 B, and it is that size because it is the layer's *universal* operand —
+one q4_1 tile at K=2048, NROWS=16 — chosen so every phase can share one weight
+fifo. Two of them per core, because the fifo is split between the pair's cores.
+
+So the fused layer has **two** ceilings, and they pull against each other. Program
+memory pushed toward sharing kernels and objects; data memory punishes the large
+shared operand that sharing requires. The 144 B of program-memory headroom
+measured earlier was real but not the binding constraint.
+
+I have **reverted the P4 wiring** rather than leave a harness that does not
+build. `p1p2_chain` is back to P1→P2→P3, still passing at 3.4631e-03. The kernel
+change (`flm_gemv_up_swiglu`'s offset write) is already committed and is inert at
+its default, so nothing is lost.
+
+Options, none yet measured:
+
+  * **a smaller operand for P4/P5.** Nothing forces every phase to share one
+    fifo object size — that was a convenience. A K-chunked P4 tile would cut the
+    41 KB directly;
+  * **fewer buffers**: the split gives each core its own 20544 B buffer. A
+    single-consumer fifo per core instead of a split pair halves it;
+  * **shrink the broadcast.** `bc_ty` is 4224 elements to hold q′ for 32 heads;
+    P3/P4/P5 need only 2*K_DIM. A per-phase fifo would cost routing.
