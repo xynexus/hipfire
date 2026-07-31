@@ -9411,3 +9411,34 @@ the scaffolding is generated loop structure. Reducing the *number* of phase
 bodies per core is the lever that remains: P3 runs on every core because both P4
 and P5 need its output, but nothing says it must run in its own loop rather than
 being folded into one of theirs.
+
+### The decomposition, complete — and it says the single dispatch does not close
+
+Ablating P3 as well gives the full split:
+
+    fixed base (runtime + shared tile body)   2848 B
+    P1 4128   P2 2992   P3 3712   P4 3984   P5 ~3984
+    a phase body averages ~3950 B
+
+The fixed part is small — only 2848 B — so the 16 KB is essentially **four phase
+bodies**, and the layer has five.
+
+Combined with the FFN being core-bound, that is a closed argument:
+
+  * the FFN must stay on 16 cores (8 costs +465 µs/layer, and 12 does not tile);
+  * so **every** core runs P3+P4+P5 — 14528 B, 89%, leaving **1856 B**;
+  * P1 is 4128 B and P2 is 2992 B. Neither fits in 1856 B.
+
+So P1 and P2 cannot share a core with the FFN, and the FFN cannot give up cores.
+**A single dispatch per layer is not reachable with the phases as they stand.**
+
+The fallback is two dispatches — attention, then FFN — and it is priced:
+32 dispatches at ~92.9 µs is +2.88 ms/token, 15.47 → 18.35 ms, **54.5 tok/s**
+against FLM's 59.86. That loses.
+
+What is left is making a phase body smaller, not moving it. At ~3950 B each and
+2272 B to find, that means roughly halving one body. The bodies are generated
+loop structure — per-phase broadcast acquire, an `flm_asum_prepare`, a `range_`
+over tiles with acquire/release — repeated five times with different kernels
+inside. Folding two phases into one loop would remove one copy of that structure,
+which is the only lever left that does not cost throughput.
