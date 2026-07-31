@@ -104,7 +104,7 @@ def build(pos, nobj):
     p2opair_ty = np.ndarray[(2 * GQA * HEAD,), np.dtype[bfloat16]]
     # P1's weights, then P2's q'+KV objects, on the same fifo
     w_all_ty = np.ndarray[(2 * HPC * TPH * wt,), np.dtype[np.uint8]]
-    kvin_ty = np.ndarray[(2 * OPERAND,), np.dtype[np.uint8]]   # q' only
+    kvin_ty = bc_ty                      # q' rides the broadcast object
     q_ty = np.ndarray[(4 * OBJ,), np.dtype[bfloat16]]
     # uint8, matching the operand fifo it feeds. A fill whose buffer and fifo
     # disagree on element width counts its sizes in the wrong unit.
@@ -113,7 +113,8 @@ def build(pos, nobj):
     flags = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_HEAD={HEAD}",
              f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS={NQ}", f"-DDIM_QKHEADS={NK}",
              f"-DDIM_GQA={GQA}", f"-DDIM_TSEQ={TSEQ}", f"-DDIM_KVPER={KVPER}",
-             f"-DDIM_QSTRIDE={OBJ}"]
+             f"-DDIM_QSTRIDE={OBJ}", f"-DDIM_KVOBJ={OPERAND}",
+             f"-DDIM_NPADOFF={32 * OBJ}", "-DQOFF_FROM_KV=1"]
     P = ", ".join(f"w{i}: In" for i in range(npairs))
     P += ", " + ", ".join(f"kvin{i}: In" for i in range(apairs))
     P += ", " + ", ".join(f"q{i}: Out" for i in range(npairs))
@@ -165,6 +166,12 @@ def _design(bc: In, {P}):
 
     def core_p1(bcc, wc, op, kqkv, kemit, kprep):
         p1_body(bcc, wc, op, kqkv, kemit, kprep)
+        # A broadcast object must be consumed by EVERY consumer of the fifo.
+        # These cores sit out P2, but the fifo still delivers them the q'
+        # object, and leaving it unreleased stalls the accounting for the cores
+        # that do use it.
+        eb2 = bcc.acquire(1)
+        bcc.release(1)
 
     def core_p1p2(bcc, wc, op, ap, kqkv, kemit, kprep, kbeg, ktile, kfin):
         if not {SKIP_P1}:
@@ -188,7 +195,7 @@ def _design(bc: In, {P}):
         eo = ap.acquire(1)
         kfin(eo, eq)
         ap.release(1)
-        wc.release(1)
+        bcc.release(1)
 
     workers = []
     for p in range({npairs}):
@@ -244,11 +251,8 @@ def _design(bc: In, {P}):
 
         # ---- P2 ----------------------------------------------------------
         tg = TaskGroup()
+        bch.fill(kvb[0], group=tg)          # the broadcast now carries q'
         for i in range(a):
-            # q' first (host-supplied), then the two cache slots this pair's
-            # cores need — read straight out of the buffer P1 just drained
-            # into, which is the ffn_chain pattern.
-            wh[i].fill(kvb[i], group=tg)
             wh[i].fill(cb[i], group=tg, offset=2 * i * {OPERAND},
                        sizes=[1, 1, 1, 2 * {OPERAND}], strides=[0, 0, 0, 1])
         for i in range(a):
@@ -356,27 +360,24 @@ def main():
         if pos:
             K[:, :pos] = Kc[g].T
             V[:pos] = Vc[g]
-    cache_t = iron.tensor(cache.reshape(-1).astype(bfloat16).view(np.uint8),
+    craw = cache.reshape(NATT, SLOT).astype(bfloat16).view(np.uint16)
+    for g in range(NATT):
+        # trailer: this core's offset into the shared q' block
+        craw[g, (OPERAND - 64) // 2:(OPERAND - 64) // 2 + 2] = \
+            np.array([float(g * GQA * OBJ)], np.float32).view(np.uint16)
+    cache_t = iron.tensor(craw.reshape(-1).view(np.uint8),
                           dtype=np.uint8, device="npu")
 
     # P2's q' object per pair — the rest of its operand stream is the cache
-    q_in = []
-    for pr in range(apairs):
-        obj = np.zeros((2, SLOT), np.float32)
-        for j in range(2):
-            a = 2 * pr + j                     # attention core == KV head
-            for sl in range(GQA):
-                obj[j, sl * OBJ:sl * OBJ + HEAD] = ref[GQA * a + sl][:HEAD]
-        # npad is an f32 BIT PATTERN occupying two bf16 slots, so it has to be
-        # written after the bf16 conversion. Assigning the float value into the
-        # float32 buffer and then converting destroys it — the kernel then reads
-        # a bf16-rounded npad and the softmax denominator is wrong.
-        raw = obj.astype(bfloat16).view(np.uint16).reshape(2, SLOT)
-        for j in range(2):
-            raw[j, GQA * OBJ:GQA * OBJ + 2] = \
-                np.array([float(npad)], np.float32).view(np.uint16)
-        q_in.append(iron.tensor(raw.reshape(-1).view(np.uint8),
-                                dtype=np.uint8, device="npu"))
+    # ONE broadcast-shaped q' object: all 32 heads at OBJ stride, then npad as
+    # an f32 bit pattern (written after the bf16 conversion, or it is destroyed).
+    BCN = 2 * K_DIM + 2 * HEAD
+    qall = np.zeros(BCN, np.float32)
+    for h in range(NQ):
+        qall[h * OBJ:h * OBJ + HEAD] = ref[h][:HEAD]
+    qraw = qall.astype(bfloat16).view(np.uint16)
+    qraw[NQ * OBJ:NQ * OBJ + 2] = np.array([float(npad)], np.float32).view(np.uint16)
+    q_in = [iron.tensor(qraw.view(bfloat16), dtype=bfloat16, device="npu")]
 
     q_ts = [iron.zeros(4 * OBJ, dtype=bfloat16, device="npu")
             for _ in range(npairs)]

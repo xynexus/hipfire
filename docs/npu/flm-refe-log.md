@@ -7088,3 +7088,31 @@ the natural read is "the offsets are wrong", and the offsets were fine.
 `AP_QOFF_ZERO` is kept as the control precisely because a wrong offset is nearly
 invisible otherwise: seven of eight cores would still be reading *some* valid
 query block, and only the cross-core pattern gives it away.
+
+## 2026-07-31 — the chain's P2 now computes; it does not yet agree
+
+Applied the verified broadcast-q′ mechanism to `p1p2_chain.py`. **P2 went from
+emitting exact zeros to emitting real values**, which is what the diagnosis
+predicted: q′ was riding the operand fifo, held across the KV traffic, and an
+object held that way does not stay valid.
+
+| | before | after |
+|---|---|---|
+| P2 output | **all zeros** | real values |
+| max err | 1.61e-01 (= \|ref\|) | **1.05e-01** |
+| tolerance | 4.18e-03 | 4.18e-03 |
+
+P1 inside the chain is unchanged and correct: k′ one bf16 ulp, v′ exact, prior
+cache intact.
+
+Also fixed, though it moved nothing: **a broadcast object must be consumed by
+every consumer of the fifo.** Cores 8–15 sit out P2 but the fifo still delivers
+them the q′ object, and leaving it unreleased unbalances the accounting for the
+cores that do use it. Kept because it is correct regardless.
+
+**Still open.** `attn_phase.py` runs the same kernels with the same broadcast-q′
+mechanism and passes at four sequence lengths, so the remaining difference is
+P1 running before P2 in the same design — most likely that P2's KV comes from
+the cache P1 drained into, where `attn_phase` gets a host-supplied stream. The
+trailer offsets survive P1's drains (k′ writes below 2048, v′ below 4224, the
+trailer sits at 10240), so that is not it.
