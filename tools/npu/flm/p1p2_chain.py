@@ -68,7 +68,18 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 import q4nx  # noqa: E402
-from qkv_verify import HEAD, K_DIM, NROWS, TPH, EPS, ROPE_THETA, qkv_rows, rope_ref  # noqa: E402
+from qkv_verify import HEAD, K_DIM, EPS, ROPE_THETA, qkv_rows, rope_ref  # noqa: E402
+
+# **The fused layer sizes its operand for DATA memory, not for one phase.**
+# Every phase's weights and P2's KV ride one fifo, so the object is the max of a
+# q4_1 tile and a KV object, and two of them live in each core's 64 KB. At
+# NROWS=16/KVPER=2 that is 20544 B and 41088 B per core — 63% — and P4's buffers
+# fail to allocate. At NROWS=8/KVPER=1 it is 10304 B and 20608 B, 31%.
+#
+# Measured: NROWS 16->8 costs 4.5% of GEMV bandwidth (48.9 -> 46.7 GB/s);
+# KVPER 2->1 costs nothing (medians 27.4 -> 19.9 us, ranges overlapping).
+NROWS = 8
+TPH = HEAD // NROWS
 from ffn_verify import load_linear  # noqa: E402
 from p1_route import (NQ, NK, NV, NCORES, HPC, heads_of, rnd,  # noqa: E402
                       head_layout, hpc_for, drain_plan)
@@ -92,8 +103,9 @@ RES_SRC = str(KDIR / "flm_gemv_residual.cc")
 ASUM_SRC = str(KDIR / "flm_asum_prepare.cc")
 HEMIT_SRC = str(KDIR / "flm_h_emit.cc")
 Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
-TSEQ, GQA, KVPER = 32, 4, 2
-OPERAND = 20544
+TSEQ, GQA, KVPER = 32, 4, 1
+# follows NROWS and KVPER: max(one KV tile 8192, a q4_1 tile 10304)
+OPERAND = max(2 * TSEQ * HEAD * 2 * KVPER, q4nx.tile_bytes(K_DIM, NROWS))
 NATT = 4                       # attention cores = KV heads
 
 
@@ -212,9 +224,9 @@ def _design(bc: In, {P}):
                            arg_types=[bc_ty, op_ty, p1o_ty],
                            compile_flags=FLAGS)
 
-    f_bc = ObjectFifo(bc_ty, depth=1, name="bc_p3")
+    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_n{NROWS}k{KVPER}")
     bc_cons = [f_bc.cons() for _ in range({NCORES})]
-    f_w = [ObjectFifo(oppair_ty, name=f"wp{{i}}_p3") for i in range({npairs})]
+    f_w = [ObjectFifo(oppair_ty, name=f"wp{{i}}_n{NROWS}k{KVPER}") for i in range({npairs})]
     w_sub = [f.cons().split([0, {OPERAND}], obj_types=[op_ty, op_ty]) for f in f_w]
     f_p1 = [ObjectFifo(p1opair_ty, name=f"p1o{{i}}") for i in range({npairs})]
     p1_sub = [f.prod().join([0, {OBJ}], obj_types=[p1o_ty, p1o_ty]) for f in f_p1]

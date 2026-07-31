@@ -9072,3 +9072,32 @@ So the data-memory blocker has a complete, measured route through it: shrink the
 operand by changing *both* constants, pay ~4.5% on GEMV, and P4/P5 fit. The
 projection at NROWS=8 was 62.4 tok/s against FLM's 59.86, and KVPER=1 costing
 nothing (or helping) leaves that unchanged or slightly better.
+
+## 2026-08-01 — the smaller operand lands, and it helps BOTH ceilings
+
+`p1p2_chain` now runs at NROWS=8 / KVPER=1, with `OPERAND` derived rather than
+hardcoded:
+
+    OPERAND = max(one KV tile, a q4_1 tile) = max(8192, 10304) = 10304 B
+
+Results are **identical** to NROWS=16 — P1 cache k′ one bf16 ulp and v′ 0.0,
+P3 `h` 9.5367e-07 at seq 31 and exact at 17 and 9, attention 3.4631e-03, and the
+host-KV control still passing.
+
+| | NROWS=16/KVPER=2 | NROWS=8/KVPER=1 |
+|---|---|---|
+| operand | 20544 B | 10304 B |
+| two per core (data) | 41088 B — 63% | **20608 B — 31%** |
+| P1 core (program) | 12800 B — 78% | **10688 B — 65%** |
+
+**Program memory dropped too**, which was not the reason for the change: the
+GEMV tile covers half as many rows, so its unrolled inner loop is smaller. The
+operand size was being paid twice over.
+
+That is 20 KB of data memory and 2 KB of program memory recovered for a measured
+4.5% of GEMV bandwidth — and P4's buffers, which failed to allocate at 20544 B,
+need far less than that.
+
+The hardcoded `OPERAND = 20544` is gone. It had been a constant since the
+universal-operand decision, and nothing recomputed it when the tile shape
+changed — which is why NROWS=8 alone appeared to do nothing at all.
