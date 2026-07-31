@@ -50,6 +50,10 @@ use std::path::{Path, PathBuf};
 const MAGIC: &[u8; 8] = b"HFAR0001";
 /// Copy granularity for verbatim payloads. Bounds memory on a multi-GB shard.
 const CH: usize = 8 << 20;
+/// Encode unit. Caps peak memory at roughly 1.7x this (the piece plus its
+/// packed copy) however large a tensor is, and keeps every unit far below the
+/// u32 element count `bf16_huff` can describe.
+const UNIT: u64 = 1 << 30;
 
 pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
     let mut input: Option<PathBuf> = None;
@@ -176,33 +180,56 @@ fn pack(dir: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
         let mut f = File::open(p)?;
         let mut entries: Vec<Entry> = Vec::new();
         for (name, off, len, dtype) in tensors {
-            f.seek(SeekFrom::Start(base + off))?;
-            let mut buf = vec![0u8; len as usize];
-            f.read_exact(&mut buf)?;
-            before += len;
-            let (codec, bytes) = if dtype == "BF16" {
-                match hipfire_primitives::bf16_huff::encode_if_smaller(&buf) {
-                    Some(packed) => ("bf16h", packed),
-                    None => ("raw", buf),
+            // Split into UNIT-sized pieces, each encoded independently.
+            //
+            // Two problems fall out of treating a tensor as one unit. A 21.47 GB
+            // stacked-expert tensor is a 21.47 GB anonymous allocation, which
+            // thrashes a 31 GB host; and `encode_if_smaller` declines anything
+            // past u32::MAX elements (~8.6 GB of BF16), so the largest tensors
+            // were stored raw. Llama-4-Maverick is 100% BF16 and still came out
+            // at 1.0126x for exactly that reason.
+            //
+            // Pieces are contiguous and recorded in offset order, and restore
+            // already writes entries back in that order, so a split tensor
+            // reassembles with no reader change.
+            let mut done = 0u64;
+            let mut part = 0usize;
+            while done < len {
+                let take = UNIT.min(len - done);
+                f.seek(SeekFrom::Start(base + off + done))?;
+                let mut buf = vec![0u8; take as usize];
+                f.read_exact(&mut buf)?;
+                before += take;
+                let (codec, bytes) = if dtype == "BF16" && take % 2 == 0 {
+                    match hipfire_primitives::bf16_huff::encode_if_smaller(&buf) {
+                        Some(packed) => ("bf16h", packed),
+                        None => ("raw", buf),
+                    }
+                } else {
+                    ("raw", buf)
+                };
+                if codec == "bf16h" {
+                    n_bf16 += 1;
                 }
-            } else {
-                ("raw", buf)
-            };
-            if codec == "bf16h" {
-                n_bf16 += 1;
+                let stored_off = pos;
+                w.write_all(&bytes)?;
+                pos += bytes.len() as u64;
+                after += bytes.len() as u64;
+                entries.push(Entry {
+                    name: if part == 0 {
+                        name.clone()
+                    } else {
+                        format!("{name}#{part}")
+                    },
+                    off: off + done,
+                    len: take,
+                    codec,
+                    stored_off,
+                    stored_len: bytes.len() as u64,
+                });
+                done += take;
+                part += 1;
             }
-            let stored_off = pos;
-            w.write_all(&bytes)?;
-            pos += bytes.len() as u64;
-            after += bytes.len() as u64;
-            entries.push(Entry {
-                name,
-                off,
-                len,
-                codec,
-                stored_off,
-                stored_len: bytes.len() as u64,
-            });
         }
         // Header bytes verbatim — the only way to guarantee a byte-identical file.
         let hdr_off = pos;
