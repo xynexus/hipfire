@@ -10706,3 +10706,43 @@ Both ratios are now printed every run. Stopping the guess-a-normalizer approach
 here: three have been tried and each fails on a different axis. Getting this right
 means modelling the kernel's actual arithmetic — the exp2 NLF's precision and the
 online rescale, in host bf16 — not searching for a lucky denominator.
+
+### The mechanism, from the source rather than from curve-fitting
+
+`flm_attn_decode.cc` names its own bf16 quantities, and there are two that reach
+the output:
+
+    const auto p = aie::exp2<bfloat16>(aie::sub(sv, broadcast(m_new)));
+    const float corr = float(aie::exp2<bfloat16>(broadcast(m_old - m_new))[0]);
+
+  1. **`p`, the softmax weights, are bf16.** Relative error up to 2^-9 per weight.
+  2. **`corr`, the rescale factor, is bf16** — and it multiplies the ENTIRE
+     running accumulator every time the running max moves. So each rescale
+     injects up to 2^-9 of relative error into everything accumulated so far,
+     which is qualitatively different from a per-term error: it compounds with
+     the number of rescales, not with the number of positions.
+
+The kernel already knew about a third and fixed it — `reduce_add` on a bf16
+vector "rounds at every step of the tree — ~1% on 32 values", so the probability
+mass is accumulated in float via `aie::accum<accfloat>` instead. That comment is
+the strongest evidence that bf16 rounding here is understood to be first-order.
+
+This is the first mechanism identified from the implementation rather than fitted
+to measurements, and it explains the *shape* of what I saw: error tied to rescale
+history rather than sequence length is why absolute error falls as positions are
+added.
+
+It does not yet close quantitatively. Taking k rescales x 2^-9 x max|ref|:
+
+    L0  seq 31   7 rescales -> 3.04e-03 predicted, 3.46e-03 observed   (1.14x)
+    L0  seq 63   ~8         -> 1.93e-03 predicted, 2.28e-03 observed   (1.18x)
+    L0  seq  9   4          -> 2.24e-03 predicted, 5.93e-03 observed   (2.6x)
+    L15 seq 31   5          -> 2.49e-03 predicted, 9.29e-03 observed   (3.7x)
+
+Two configurations land within 20%, two are off by 3-4x. The missing input is the
+**NLF's own accuracy** — `aie::exp2` is a hardware approximation and its error
+beyond bf16 rounding is not measured anywhere in this repo. Until that is
+measured, any coefficient here is still a fit.
+
+Stopping the numerical thread here with the mechanism named and the missing
+measurement identified, rather than with another envelope.
