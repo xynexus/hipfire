@@ -7933,3 +7933,38 @@ down.
 
 Every phase in the projection is now measured except the barrier constant
 (5.91 µs, fitted at R²=0.99996) and the dispatch constant (92.9 µs).
+
+## 2026-08-01 — the dominant term, measured with repeats: the margin is real
+
+P4+P5 is 76% of the layer and was a single sample. Five runs:
+
+    567.4  572.3  581.6  583.6  584.7      median 581.6, spread 3.0%
+
+**Variance is not uniform, and I generalised it too broadly.** The 22–23% spread
+holds for *short* measurements (P1, ~58 µs, where fixed overhead and contention
+from the user's `flm serve` dominate). The 582 µs measurement spreads only 3.0%.
+The dominant term is the tightest one, which is the opposite of what the
+"22% noise" entry implied about the projection's precision.
+
+Projection with medians, and bounded by the observed ranges rather than a point
+estimate:
+
+| | token | tok/s | margin vs FLM |
+|---|---|---|---|
+| best case (P1 51.5, FFN 567.4) | 15.15 ms | 66.0 | **+10.3%** |
+| **median** (58.5, 581.6) | **15.49 ms** | **64.6** | **+7.8%** |
+| worst case (65.0, 584.7) | 15.64 ms | 63.9 | **+6.8%** |
+
+The previous figure used P4+P5 = 601.8, a single run **above** the whole
+five-run range.
+
+The conclusion is now much firmer than two ticks ago, when the margin sat at
++1.8–3.7% and inside the noise. **Every case clears FLM by at least 6.8%**, and
+the spread between best and worst is 3.5% — smaller than the margin itself. This
+is no longer a result that a couple of unlucky measurements could overturn.
+
+What is still assumed rather than measured: the barrier constant (5.91 µs,
+R²=0.99996) and the dispatch constant (92.9 µs) — both fitted across many
+points — and, more importantly, **that the five phases compose in one dispatch
+at all.** Each is measured in isolation or in pairs; nothing yet runs P1→P5
+together, and routing is the known risk there.
