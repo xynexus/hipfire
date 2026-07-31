@@ -10340,3 +10340,29 @@ That reframes the remaining seam honestly: P2->P3 is not blocked because
 attention cannot do 8 groups — it demonstrably can — but because this
 five-phases-on-16-cores decomposition cannot host it. Which makes it the same
 question the program-memory wall already poses, arriving from a second direction.
+
+### Attempted and NOT achieved: a number for the routing budget
+
+Knowing that the combined design cannot route 8-group attention is less useful
+than knowing *where* the wall sits, so I tried to measure it — a synthetic design
+carrying the layer's topology (8 pairs, weight fifo split across each pair's two
+cores, result fifo joined from them, one broadcast, plus N extra shim->pair
+streams) and nothing else, sweeping N until aiecc refuses.
+
+It did not get far enough to produce a number. The scaffold kept failing on iron's
+fifo-endpoint bookkeeping rather than on routing — `Endpoint already set` when
+both cores of a pair take `.prod()` directly, then `Prod endpoint not set` after
+switching to `split`/`join`, which is the shape `p1p2_chain` uses. Setting the
+shim endpoints before the split did not clear it. Parked in the scratchpad rather
+than committed, since a probe that cannot build measures nothing.
+
+**So the routing budget remains unquantified.** What is established stays
+established — attention alone routes all 8 KV groups, and placement is not the
+lever — but "how many shim streams does this topology afford" is still open, and
+a re-decomposition would be designed partly blind to it.
+
+Worth saying plainly: this is the second tool-shaped detour (after `progmem_probe`,
+which under-predicts by ~4 KB because it models kernels rather than loop
+scaffolding). Both times the synthetic model was harder to make faithful than the
+real design was to measure directly. The reliable move here has been to change the
+real design and read the error.
