@@ -793,7 +793,9 @@ extra DRAM traffic** vs plain absmax (throughput-neutral, not separately benched
 
 So the activation clip recovers **~12% of the KLD penalty and ~65% of the PPL penalty**,
 cheaply and throughput-neutrally — validating that activation-side clip (untested in hipfire
-before) helps, exactly as Lever A predicts. It does NOT close the gap to the 0.016 noise
+before) helps, exactly as Lever A predicts. **ctx=2048 confirmation (2039 pos):** act4 plain
+0.0672 → clip **0.0553 KLD (−18%)**, PPL +0.63 → **+0.33 (−48%)** — the win is robust and
+slightly *stronger* at scale. It does NOT close the gap to the 0.016 noise
 floor alone (KLD 0.059 still ~3.7× floor), so it composes with the stronger, unbuilt levers:
 **ConQuR learned R₁/R₂ rotation** (Lever A proper — needs the quant-time objective +
 R1Plan→qwen3.5 extension) and **ResQ ⅛→1/32 A8 outlier subspace** (Lever B, the strongest —
