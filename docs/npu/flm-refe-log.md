@@ -4343,3 +4343,143 @@ amortise the activation load across rows) as the next thing to try.
 Net: 48.1-48.6 GB/s stands, and the remaining gap to the 56.5 GB/s fabric roof is
 ingress width rather than the body — consistent with the body already sitting at
 98-100% of what 4 feed streams deliver with no compute at all.
+
+## 2026-07-31 — Tile memory banking: measured, real in the address map, not dominant
+
+Prompted by a note that the optimization work was reasoning about ops and not
+about the NPU's hardware design. Fair, and it turned up something I had actively
+dismissed: a `Bank-aware allocation failed, trying basic sequential allocation`
+warning in an earlier build was written off as a red herring.
+
+**The hardware fact** (UG1079 §004, and `AIETargetModel.h` for the AIE2P
+numbers): a core tile has **64 KB in 4 banks of 16 KB** (memtiles: 512 KB, 8
+banks), and **"concurrent operation of all three ports is supported if each port
+accesses a different bank"**. Two loads plus a store per cycle only issue
+together when they land in different banks. So buffer *placement* is a
+first-class performance parameter, not just a capacity question — and the GEMV
+body was measured at an effective 0.54 ops/cycle, which is exactly what a
+serialised load port looks like.
+
+**What the shipping design actually does.** Dumping `input_with_addresses.mlir`
+for the 16-core / 16-row build:
+
+```
+wp0_split0_cons_buff_0   addr= 4096  size=20480   banks 0..1
+wp0_split0_cons_buff_1   addr=24576  size=20480   banks 1..2
+act_0_cons_buff_0        addr=45056  size= 2048   bank  2
+act_0_cons_buff_1        addr=49152  size= 2048   bank  3
+```
+
+A 16-row weight tile is 20480 B = **1.25 banks**, so every weight buffer
+straddles two, and on the double-buffer half that uses `wp..buff_1` the weight
+read and `act..buff_0` collide on **bank 2**. Half the iterations cannot issue
+both loads in one cycle.
+
+**Tested, and the conclusion is not the obvious one.** 12 rows is the largest
+tile that fits inside one bank (15360 B), which makes the layout conflict-free:
+
+| rows/tile | wtile | banks | GB/s |
+|---|---|---|---|
+| 12 | 15360 | fits one | **44.8** |
+| 16 | 20480 | straddles two | **48.1** |
+
+**The bank-clean layout is 7% SLOWER.** More rows per call amortises the
+activation block-sum pass and the per-call overhead by more than the conflict
+costs, and at 20480 B a 16-row tile can never be made to fit a 16 KB bank. So
+banking is real, visible, and currently the second-order effect — worth stating
+either way, because "bank-aware allocation succeeded" in the build log does *not*
+mean the hot buffers are in different banks, and nothing in the toolchain says so.
+
+Recorded so the next person does not either dismiss banking (as I did) or assume
+fixing it is a win (as the address map suggests).
+
+**Two hardware levers this surfaced that remain untried**, both already used by
+FLM and both bigger than banking:
+
+- **Neighbour data memory.** A core can address its neighbours' data memory
+  directly — no DMA, no cascade, "no instructions beyond a pointer into a
+  different window" (`flm-layer-dataflow.md` implication 6, which records FLM
+  doing exactly this for its paired cores). The activation is currently
+  DMA-broadcast and double-buffered into *every* core's L1 at 8192 B. Holding it
+  once per neighbourhood would free that, and the freed L1 raises the row count
+  past the 16 the 64 KB budget currently caps it at (24 rows needs 61440 B of
+  weights alone).
+- **The cascade stream.** Direct accumulator forwarding between adjacent cores,
+  which is the hardware path for splitting one dot product across cores without
+  touching memory. FLM does *not* use it (its pair is an N-split that
+  concatenates), so it is unexplored here in either direction.
+
+## 2026-07-31 — Task 1 MET (+34%), and the "compute-bound" diagnosis was measured wrong
+
+Two results, and the second corrects the previous entry and the phase-3 kickoff
+written from it.
+
+### The activation block-sums were being recomputed 116 times per core
+
+`asum[b] = sum of 32 activations` depends **only on the activation**, which is
+constant for a whole dispatch — but it sat inside the per-tile kernel call, so it
+was recomputed for every one of the 116 weight tiles. Bundle accounting from the
+disassembly put it at ~832 of ~7216 bundles per call = **12%**.
+
+Hoisted into a second entry point (`flm_asum_prepare`, called once per activation
+acquire, writing a file-scope array the GEMV reads). It has to be its **own
+translation unit**: IRON compiles each `ExternalFunction`'s source separately, so
+two entry points in one file link twice and fail with `duplicate symbol`.
+
+| | 8 cores | per core | weights/cycle |
+|---|---|---|---|
+| before | 24.4 GB/s | 3.04 GB/s | 2.70 |
+| after | **32.7 GB/s** | **4.09 GB/s** | **3.63** |
+
+**+34%, and past the >=3.2 weights/cycle/core target.**
+
+### The diagnosis it was built on was wrong, and a control experiment shows why
+
+At 16 cores the hoist measured **zero** — 48.6 GB/s before and after. That looked
+like "the loop is not issue-bound", and the previous entry concluded the design
+was per-core compute-bound because 8 -> 16 cores doubled throughput at constant
+wall clock.
+
+**Both readings were wrong, and the error was a missing control.** In the paired
+design `npairs = ncores/2`, so doubling the cores also doubles the **shim input
+streams**. Core scaling and ingress scaling were confounded, and the whole
+conclusion rested on not separating them.
+
+The control is a no-op body — identical fifos, identical traffic, no arithmetic:
+
+| | 4 cores (2 streams) | 8 cores (4) | 16 cores (8) |
+|---|---|---|---|
+| no-op, delivery ceiling | 20.6 | **40.9** | **49.3** |
+| full GEMV (after hoist) | — | 32.7 | 48.6 |
+
+So:
+
+- **At 16 cores the design is DELIVERY-bound**, not compute-bound: the no-op
+  ceiling is 49.3 and the GEMV reaches 48.6 — the body costs **1.4%**. The hoist
+  could not show there because only 1.4% of headroom existed.
+- **At 8 cores it is compute-bound** (32.7 against 40.9 available), which is where
+  the hoist is visible and where per-core work should be measured from now on.
+- Per-core compute and dataflow delivery cross within 1.5% at 16 cores, which is
+  exactly the coincidence that made one look like the other.
+
+**Consequence, and it restores what the plan said all along.** The previous entry
+claimed the reproduction was compute-bound and therefore that phase 3a/4a's
+bits-per-weight reductions "are worth approximately nothing". With the body now
+at 4.09 GB/s/core of capability against a 49.3 GB/s dataflow ceiling across 16
+cores (16 x 4.09 = 65.4 of capability), **the design is bandwidth-bound and
+bpw reduction pays again**. The original plan was right; the correction was based
+on a confounded measurement, and it is withdrawn.
+
+**The next lever is the dataflow, and it has a number.** `dispatch_bw_probe.py`
+delivers **56.2 GB/s** through 8 direct shim streams; this design's 8 streams go
+through a memtile split and deliver **49.3** — so the split costs ~12%, and
+recovering it is worth more than anything left in the body. Shim channel budget
+also has room that is not being used: 8 columns x 2 = 16 input channels against
+the 8 weight + 1 activation currently bound, and it was an *output* channel that
+failed at 16 unpaired cores, not an input.
+
+**Method note.** The tell was the hoist removing 12% of issued bundles and
+changing nothing. That should have prompted the control immediately rather than a
+conclusion about issue rate. A no-op body at identical geometry costs one run and
+separates "what can this dataflow deliver" from "what does the body cost"; it
+should be the first measurement on any new dataflow here, not the last.

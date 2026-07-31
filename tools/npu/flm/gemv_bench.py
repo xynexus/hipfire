@@ -41,6 +41,7 @@ from aie.utils.benchmark import run_iters  # noqa: E402
 from ml_dtypes import bfloat16  # noqa: E402
 
 KERNEL_SRC = str(Path(__file__).resolve().parents[3] / "kernels/npu/flm_gemv_q4_1.cc")
+PREP_SRC = str(Path(__file__).resolve().parents[3] / "kernels/npu/flm_asum_prepare.cc")
 BLK = 32
 FLM_DECODE_GBS = 46.2
 FABRIC_ROOF_GBS = 56.5
@@ -88,6 +89,11 @@ def _design(act: In, {params}):
         "flm_gemv_q4_1", source_file=KERNEL_SRC,
         arg_types=[act_ty, wt_ty, o_ty],
         compile_flags=["-DDIM_K={K}", "-DDIM_NROWS={NROWS}"])
+    # The activation block-sums depend only on the activation, so they are
+    # computed once per acquire instead of once per weight tile.
+    prep = ExternalFunction(
+        "flm_asum_prepare", source_file=PREP_SRC, arg_types=[act_ty],
+        compile_flags=["-DDIM_K={K}", "-DDIM_NROWS={NROWS}"])
 
     # One activation fifo per consumer. FLM broadcasts a single memtile channel
     # to 17 consumers; IRON expresses the same sharing as one producer handle
@@ -106,8 +112,9 @@ def _design(act: In, {params}):
     o_sub = [f.prod().join([0, {NROWS}], obj_types=[o_ty, o_ty])
              for f in f_opair]
 
-    def core(a_cons, w_cons, o_prod, k):
+    def core(a_cons, w_cons, o_prod, k, kprep):
         ea = a_cons.acquire(1)
+        kprep(ea)
         for _ in range_({tiles_per_core}):
             ew = w_cons.acquire(1)
             eo = o_prod.acquire(1)
@@ -122,7 +129,7 @@ def _design(act: In, {params}):
             workers.append(Worker(
                 core,
                 fn_args=[act_cons[2 * p + j], w_sub[p][j].cons(),
-                         o_sub[p][j].prod(), kern],
+                         o_sub[p][j].prod(), kern, prep],
                 stack_size=4096))
 
     def sequence(*args):
@@ -151,7 +158,7 @@ def _design(act: In, {params}):
     ns = dict(np=np, iron=iron, CompileTime=CompileTime, In=In, Out=Out,
               ObjectFifo=ObjectFifo, Program=Program, Runtime=Runtime,
               Worker=Worker, AnyShimTile=AnyShimTile, range_=range_,
-              ExternalFunction=ExternalFunction, KERNEL_SRC=KERNEL_SRC,
+              ExternalFunction=ExternalFunction, KERNEL_SRC=KERNEL_SRC, PREP_SRC=PREP_SRC,
               act_ty=act_ty, wt_ty=wt_ty, o_ty=o_ty,
               wpair_ty=wpair_ty, opair_ty=opair_ty,
               w_pair_all_ty=w_pair_all_ty, o_pair_all_ty=o_pair_all_ty,
@@ -161,7 +168,7 @@ def _design(act: In, {params}):
     exec(src, ns)
     # full_elf: the vararg dispatch path caps at ~20 host buffers, fails as a
     # firmware hang rather than an error, and is ~34% slower where it works.
-    return iron.jit(ns["_design"], source_files=[KERNEL_SRC], full_elf=True), wtile
+    return iron.jit(ns["_design"], source_files=[KERNEL_SRC, PREP_SRC], full_elf=True), wtile
 
 
 def run(K, NROWS, ncores, tiles_per_core, warmup, iters, tensor, check):

@@ -251,10 +251,24 @@ second 32-lane float accumulator makes the backend emit a 16-lane float add it
 cannot legalize (`G_FADD <16 x s32>`), the same limit that forced the zero-point
 term to share the dot accumulator. Marked `ponytail:` in the kernel.
 
-**Where the remaining headroom is.** 8 -> 16 cores still scales at 1.97x, so
-per-core compute has not stopped mattering; but at 48.1 GB/s the body is at
-99-100% of the 4-stream ingress figure, and the fabric roof is 56.5. The next
-lever is ingress width (open thread 1), not the kernel body.
+**Where the remaining headroom is — measured with a control, 2026-07-31.** A
+no-op body at identical geometry (same fifos, same traffic, no arithmetic)
+delivers **49.3 GB/s** against the full GEMV's 48.6, so **at 16 cores the body
+costs 1.4% and the dataflow is the wall**. At 8 cores the body does bind (32.7
+against a 40.9 no-op ceiling), which is where per-core work must be measured.
+
+Do not infer boundedness from core scaling here: the paired design has
+`npairs = ncores/2`, so core count and shim stream count scale together and an
+earlier reading of "8 -> 16 cores scales 1.97x, therefore compute-bound" was
+confounded. The no-op control costs one run and settles it.
+
+Per core the body now does **4.09 GB/s = 3.63 weights/cycle** after the
+activation block-sums were hoisted out of the per-tile call (+34% at 8 cores;
+they depend only on the activation but were recomputed for all 116 tiles). So 16
+cores is 65.4 GB/s of capability against a 49.3 GB/s dataflow. The next lever is
+the dataflow: `dispatch_bw_probe.py` delivers 56.2 GB/s through 8 *direct* shim
+streams where this design's 8 streams go through a memtile split and deliver
+49.3.
 
 ### What this rate implies for future formats (phase 4)
 

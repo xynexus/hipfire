@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import q4nx  # noqa: E402
 
 KERNEL_SRC = str(Path(__file__).resolve().parents[3] / "kernels/npu/flm_gemv_q4_1.cc")
+PREP_SRC = str(Path(__file__).resolve().parents[3] / "kernels/npu/flm_asum_prepare.cc")
 Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
 
 
@@ -53,7 +54,7 @@ from ml_dtypes import bfloat16  # noqa: E402
 # the second shape run silently reuses the first shape's binary. `source_files`
 # is here for the same reason -- ExternalFunction's own `source_file=` is not
 # part of the key, so editing the kernel .cc alone reuses a stale xclbin.
-@iron.jit(source_files=[KERNEL_SRC])
+@iron.jit(source_files=[KERNEL_SRC, PREP_SRC])
 def flm_gemv(act: In, w: In, out: Out, *, K: CompileTime[int] = 2048,
              N: CompileTime[int] = 8, NROWS: CompileTime[int] = 8):
     NB = K // BLK_C
@@ -72,16 +73,24 @@ def flm_gemv(act: In, w: In, out: Out, *, K: CompileTime[int] = 2048,
         arg_types=[act_ty, wt_ty, o_ty],
         compile_flags=[f"-DDIM_K={K}", f"-DDIM_NROWS={NROWS}"],
     )
+    # Activation block-sums, computed once per acquire rather than per tile.
+    prep = ExternalFunction(
+        "flm_asum_prepare",
+        source_file=PREP_SRC,
+        arg_types=[act_ty],
+        compile_flags=[f"-DDIM_K={K}", f"-DDIM_NROWS={NROWS}"],
+    )
 
     f_act = ObjectFifo(act_ty, name="act")
     f_w = ObjectFifo(wt_ty, name="wt")
     f_o = ObjectFifo(o_ty, name="out")
 
-    def core(a_cons, w_cons, o_prod, k):
+    def core(a_cons, w_cons, o_prod, k, kprep):
         # The activation is acquired once and held across every weight tile: it
         # is the same vector for all of them, and re-acquiring it per tile would
         # put the broadcast on the critical path.
         ea = a_cons.acquire(1)
+        kprep(ea)
         for _ in range_(ntiles):
             ew = w_cons.acquire(1)
             eo = o_prod.acquire(1)
@@ -94,7 +103,7 @@ def flm_gemv(act: In, w: In, out: Out, *, K: CompileTime[int] = 2048,
     # activation-sum array plus vector spills on the stack, and overflowing it
     # fails silently -- the symptom is NaN in the first output rows and
     # plausible-magnitude garbage in the rest.
-    worker = Worker(core, fn_args=[f_act.cons(), f_w.cons(), f_o.prod(), kern],
+    worker = Worker(core, fn_args=[f_act.cons(), f_w.cons(), f_o.prod(), kern, prep],
                     stack_size=8192)
 
     def sequence(a, wbuf, obuf, ah, wh, oh):

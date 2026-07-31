@@ -93,6 +93,18 @@ inline void unpack_codes(const uint8 *restrict qs,
 }
 } // namespace
 
+// Block sums of the activation, shared by every output row AND by every weight
+// tile. They depend only on the activation, which is constant for a whole
+// dispatch, so they are computed once by `flm_asum_prepare` and read from here
+// rather than recomputed per tile. Recomputing cost ~13 bundles x K/32 blocks =
+// **12% of every tile call**, paid 116 times per core for one useful result.
+//
+// alignas is load-bearing: this array is vector-loaded, and an unaligned
+// 512-bit load returns garbage (the symptom is NaN in every output, not a
+// fault).
+// Defined here, filled by `flm_asum_prepare` in flm_asum_prepare.cc.
+alignas(64) bfloat16 g_asum[DIM_K / 32];
+
 extern "C" __attribute__((noinline)) void
 flm_gemv_q4_1(const bfloat16 *restrict act, const uint8 *restrict wtile,
               float *restrict out) {
@@ -107,29 +119,6 @@ flm_gemv_q4_1(const bfloat16 *restrict act, const uint8 *restrict wtile,
   const auto *dq = reinterpret_cast<const bfloat16 *>(wtile);
   const auto *mq = dq + NROWS * NB;
   const uint8 *qs = wtile + 2 * NROWS * NB * sizeof(bfloat16);
-
-  // Block sums of the activation, shared by every output row in the tile.
-  // Computed once per call rather than per row, so the cost amortises over
-  // NROWS instead of riding the inner loop. Each sum is accumulated in float
-  // and only then rounded to bf16: reducing a bf16 vector directly rounds at
-  // every step of the tree and loses ~1% on a 32-element sum, which would then
-  // ride the zero-point term for every output row.
-  //
-  // Kept as bf16 so the zero-point term can be reduced with the same vector
-  // MAC path as the dot term — see the loop below for why a scalar loop is not
-  // an option here.
-  // alignas is load-bearing: this array is vector-loaded below, and an
-  // unaligned 512-bit load off the stack returns garbage (the symptom is NaN
-  // in every output, not a fault).
-  alignas(64) bfloat16 asum[NB];
-  for (int b = 0; b < NB; ++b) {
-    const auto ones = aie::broadcast<bfloat16, HALF>(bfloat16(1.0f));
-    aie::accum<accfloat, HALF> t;
-    t.from_vector(aie::zeros<float, HALF>());
-    t = aie::mac(t, aie::load_v<HALF>(act + b * BLK), ones);
-    t = aie::mac(t, aie::load_v<HALF>(act + b * BLK + HALF), ones);
-    asum[b] = bfloat16(aie::reduce_add(t.template to_vector<float>()));
-  }
 
   for (int r = 0; r < NROWS; ++r) {
     const bfloat16 *drow = dq + r * NB;
@@ -186,7 +175,7 @@ flm_gemv_q4_1(const bfloat16 *restrict act, const uint8 *restrict wtile,
     // (`G_FADD <16 x s32>`), so the width is forced as well as preferred.
     for (int b = 0; b < NB; b += LANES)
       vacc = aie::mac(vacc, aie::load_v<LANES>(mrow + b),
-                      aie::load_v<LANES>(asum + b));
+                      aie::load_v<LANES>(g_asum + b));
 
     out[r] = aie::reduce_add(vacc.template to_vector<float>());
   }
