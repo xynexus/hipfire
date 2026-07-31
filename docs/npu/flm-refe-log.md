@@ -4483,3 +4483,65 @@ changing nothing. That should have prompted the control immediately rather than 
 conclusion about issue rate. A no-op body at identical geometry costs one run and
 separates "what can this dataflow deliver" from "what does the body cost"; it
 should be the first measurement on any new dataflow here, not the last.
+
+## 2026-07-31 — Task 2: the FFN block runs on the NPU, verified end to end
+
+`tools/npu/flm/ffn_verify.py`. First time a *block* of a real decoder layer has
+run on the reproduction rather than a single operator. llama-3.2-1B layer 0 FFN,
+real q4_1 weights from FLM's container:
+
+    h -> gate_proj(h), up_proj(h)   K=2048, N=8192   flm_gemv_q4_1
+      -> silu(gate) * up            8192             flm_swiglu
+      -> down_proj(.)               K=8192, N=2048   flm_gemv_q4_1
+
+| stage | max abs err |
+|---|---|
+| gate_proj | 2.98e-08 |
+| up_proj | 2.52e-08 |
+| swiglu | 3.03e-05 |
+| down_proj | 1.00e-09 |
+| **FFN block output** | **1.00e-09, PASS** |
+
+The SwiGLU figure is bf16 output rounding, not a defect — that kernel documents
+rounding to bf16 after the SiLU and again after the multiply, and 3e-05 on values
+whose maximum is ~7e-03 is exactly bf16's ~0.4%.
+
+This is **31.5 MB of the layer's 38.0 MB of weights**, and it needs no attention,
+no KV cache and no RoPE — which is why it was the right block to do first.
+
+**Scope, stated plainly: this is correctness, not throughput.** It runs the
+single-core verification design with host glue between stages, so there is still
+no tok/s number. Fusing the stages into one dispatch needs the GEMV to emit bf16
+and the intermediate to stay on device.
+
+### The constraint that will shape the fused layer
+
+**`down_proj` is L1-constrained in a way gate/up are not**, and it is the
+activation, not the weights, that does it. At K=8192 the activation is 16384 B,
+32768 B double-buffered — half the 64 KB tile memory before a single weight byte
+lands. So the weight tile must shrink:
+
+| linear | K | act (x2) | rows/tile | wtile (x2) | total |
+|---|---|---|---|---|---|
+| gate / up | 2048 | 8192 | **16** | 40960 | 49152 |
+| down | 8192 | 32768 | 4 | 40960 | 73728 — **overflows** |
+| down | 8192 | 32768 | **2** | 20480 | 53248 |
+
+Since fewer rows per tile amortises the per-call work worse (the 8->16 row trend
+measured +34% earlier), down_proj will run at a lower per-core rate than gate/up
+for purely geometric reasons. Two ways out when this is fused, both untried:
+drop the activation fifo to depth 1 (it is acquired once and held, so the second
+buffer is dead weight — that alone frees 16 KB), or hold the K=8192 activation in
+**neighbour memory** rather than replicating it into every core's L1.
+
+### Two traps
+
+- **The existing `silu_mul_bf16` takes its element count as a runtime
+  `const int32_t`**, and passing a scalar through IRON's `ExternalFunction`
+  `arg_types` makes it allocate a *buffer* for the scalar; the design then fails
+  with `Basic sequential allocation also failed`. Omitting the argument instead
+  makes the core loop on garbage and the dispatch **time out**. Fixed by a thin
+  wrapper (`kernels/npu/flm_swiglu.cc`) that binds the count at compile time.
+- **A failed build is cached.** After the fix the run reported the *same* cache
+  hash and the same failure; `rm -rf ~/.npu/cache` was needed to see the real
+  error. Worth knowing before diagnosing a fix that "did nothing".
