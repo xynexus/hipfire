@@ -10830,3 +10830,108 @@ different ways: **normalization** in attention (neighbouring weights err togethe
 and the bias divides out) and the **sigmoid's own form** in SwiGLU (the
 `s/(1+s)` factor). Neither phase is buggy; both are reporting the accuracy of
 `aie::exp2`.
+
+---
+
+# CURRENT STATE as of 2026-08-01 — read this before any figure above
+
+This log is append-only and chronological, and it contains **22 corrections and
+retractions**. Several superseded numbers still sit in older entries exactly as
+first written. This section is authoritative; where it disagrees with anything
+above, this wins.
+
+## What is built and verified
+
+A decoder layer in **two dispatches**, on 16 cores, against real
+Llama-3.2-1B-Instruct weights out of FLM's q4nx container.
+
+    side A (one dispatch):  P1 qkv+RoPE -> P2 attention -> P3 o_proj+residual -> P4 gate/up/SwiGLU
+    side B (one dispatch):  P5 down_proj + residual
+
+**Three of four phase seams carry device data** (the fourth is blocked, below):
+
+    P1 -> P2  q'      0.0000e+00 over 32 heads   host writes ZEROS, so a bad scatter cannot pass
+    P2 -> P3  attn    NOT COMPOSED -- P3's input is random noise (see Blocked)
+    P3 -> P4  h       9.5367e-07 (L0), 5.9605e-08 (L15), checked in natural row order
+    P4 -> P5  sw      LAYER x_out 0.0000e+00 at L0 and L15
+
+Verified across depth (layers 0/4/7/11/15) and context (seq 9..191). Both
+RMSNorms present — the post-attention one was missing entirely until this session.
+
+## The numbers
+
+    seq 191, 6 KV objects:  side A ~644-672 us + side B 266 us = layer ~916 us
+                            -> token ~18.36 ms -> ~54.5 tok/s
+
+FLM measured live on this machine: **61.18 tok/s at 41 tokens, 58.83 at 641**.
+Against either end this is about **-9%**.
+
+> Earlier entries quote -5.4% and -6.3%. Those are WRONG: they compare seq-31
+> measurements against FLM's 641-token baseline. The ~9% figure agrees with the
+> independent seq-512 estimate (53.9 vs 58.83, -8.4%).
+
+## Three walls, three distinct mechanisms
+
+  1. **Program memory.** A core holds four phase bodies (2848 B fixed + ~3950 B
+     each); a layer has five. Single dispatch at NROWS=8 is short 2272 B. This is
+     why there are two dispatches, and the whole throughput gap is 16 extra
+     dispatch floors at 67.2 us.
+  2. **Per-core DMA fanin, 2 in / 2 out.** Hit when a core is given a third input
+     stream. Detected at `placed.mlir` (stage 2). This is why KV rides the weight
+     fifo rather than having its own, and it closes the obvious fix for wall 3.
+     Compiler's named remedy: memtile staging.
+  3. **Inter-tile routing.** Hit at NATT=8, detected at `input_physical.mlir`
+     (stage 9) with no per-core violation. Cause unpinned; the routing budget was
+     never quantified (the synthetic probe failed on iron endpoint bookkeeping).
+
+> An earlier entry suggested 2 and 3 were the same constraint. They are not —
+> NATT=8 clears the stage-2 DMA check and fails at stage 9.
+
+## What is blocked, and why it is not plumbing
+
+**P2 -> P3 cannot be composed.** Attention covers 16 of the model's 32 q heads
+(NATT=4 KV groups x GQA 4), so `attn_out` is a 1024-vector where o_proj needs
+2048, and P3's activation is therefore still
+`rnd(rng.standard_normal(K_DIM) * 0.05)` — random noise. Full coverage needs
+NATT=8, which hits wall 3. Attention ALONE routes all 8 KV groups
+(`attn_phase.py --cores 8` PASSES), so this is the decomposition's limit, not
+attention's.
+
+**Context tops out at 191 positions.** Multi-tile KV was implemented this session
+(cap was 32). At 7+ KV objects the dispatch builds clean and then hangs
+(ERT_CMD_STATE_TIMEOUT, reproducible). Bisected: standalone attention handles 16
+objects fine; the chain hangs at 7 with P1 skipped and with a host-built cache. The
+remaining difference is KV sharing the weight fifo — which wall 2 says cannot be
+undone without memtile staging.
+
+## Numerical floor: understood, not a bug
+
+`aie::exp2<bfloat16>` is **linear interpolation of the fractional exponent** with
+up to **6% relative error** — measured, `exp2_probe.py`; only 2.2% of results are
+correctly-rounded bf16. It is the only exponential on the core.
+
+That single approximation sets both phases' floors: attention's softmax (damped by
+normalization — neighbouring weights err together and the bias divides out) and
+SwiGLU's sigmoid (damped by the `s/(1+s)` factor). Attention lands ~1-2% of peak,
+`sw` at 1.4-2.1% of peak. Neither is a defect.
+
+> Four normalizers were fitted and discarded before this. All assumed the floor
+> was bf16 rounding (0.2%); the real term is 30x larger. The attention check's
+> bound is now ADVISORY and prints the measured ratio rather than a verdict.
+> **Two of those wrong turns came from dividing a MAX error by a MEAN reference** —
+> both call sites now print max|ref|.
+
+## The open decision
+
+The current decomposition cannot compute a correct layer (half the attention
+heads), cannot exceed 191 positions of context, and is ~9% behind FLM. All three
+trace to the same root: five phases do not fit one dispatch, and the workarounds
+have run out of per-core DMA and routing budget.
+
+    single dispatch NROWS=16   64.7 tok/s   fails DATA memory
+    single dispatch NROWS=8    58.6 tok/s   fails PROGRAM memory (short 2272 B)
+    two dispatches            ~54.5 tok/s   works; half attention, 191 positions
+
+Re-decomposition into fewer/larger phases would need to address all three at once,
+and memtile staging is the named lever for the DMA half of it. That is a design
+choice, not an implementation step, which is why it is still open.
