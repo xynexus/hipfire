@@ -736,6 +736,47 @@ A code survey settled how far this is from a running act4-vs-act16 KLD number:
   option 1 only if it passes and a serving-exact figure is wanted. **Left for the user to steer
   before authoring the scorer** — it's a substantial, quality-sensitive harness, not autonomous-safe.
 
+### 9c. A4 KLD harness BUILT + RUN — the int4-act penalty is measured (2026-07-31)
+
+User chose the **native** (serving-exact) scorer. Built + validated + ran. Scope was ~2×
+the survey estimate: `forward_prefill_chunk` has BOTH a dense-session branch and an FA
+branch; the dense path was covered (qkv/gate_up/o/down), and the run validated that the
+dense path is the one taken (see below).
+
+**What was built** (all env-gated `HIPFIRE_OQ4_PREFILL_ACT_BITS=16`, default-off ⇒ serving
+unchanged):
+- `gemm_oq4_grouped_residual_f16_batched` (`quant.rs`) — W4A16 residual variant for o/down.
+- act16 branches at the 4 dense oq4 prefill sites (`prefill_chunk.rs`: qkv, gate_up unfused
+  to 2× f16-WMMA, o, down).
+- `perplexity_batched.rs` (new example) — runs ONE `forward_prefill_batch_with_pbs_opts`
+  with `per_token_hidden_out`, then fans out the lm-head (per-row `weight_gemv`, decode-
+  precision so the KLD isolates the *body*) over the scored window, into the same
+  `hipfire_kld` scoring as `perplexity.rs`. Default **q8 KV** (f32 → silent per-token
+  fallback).
+
+**Result (gfx1103, qwen3.5-0.8b--oq4++, calib-1m, ctx=512, 503 scored positions):**
+
+| measurement | KLD/tok | PPL | meaning |
+|---|---|---|---|
+| per-token W4A16 (ref) | — | 13.29 | existing decode-path scorer |
+| **batched act16 vs per-token-W4A16** | **0.0174** | 13.64 | **noise floor** (batched-vs-per-token); VALIDATES act16 took effect + dense path covered + `final=true` eligible (Q8 KV, not the fallback) |
+| **batched act4 (W4A4) vs act16** | **0.0668** | 14.43 | **the int4-activation prefill penalty** |
+
+So **int4-act costs ≈0.067 KLD / +0.79 PPL over W4A16** — ~4× the 0.017 batched-vs-per-token
+noise floor, i.e. a **real, non-trivial degradation** consistent with the survey's ~1.1-PPL
+estimate. The validation KLD of 0.017 (vs ~0.63 if a site were missed) is the proof the
+measurement is sound.
+
+**A4 decision:** int4-act buys ~1.5× prefill throughput (§9) at ~0.067 KLD / +0.79 PPL.
+That is a genuine **throughput-vs-quality tradeoff**, NOT free — so promoting qwen3.5
+qkv/gate_up to W4A4-by-default is **not justified on quality alone**; it needs Stream B to
+close the gap first. **This is the go/no-go the whole plan was gating on: A3 throughput YES,
+A4 quality has a real cost → the recipe becomes "int4-act + a Stream-B lever," not naked
+W4A4.** Refinements available: ctx=2048 + ≥16 chunks for a house-rule-grade number; the FA
+branch would need its 3 sites edited too if a model routes there (this run confirmed the
+0.8b uses the dense path). Then Stream B (ConQuR R₁/R₂; ResQ ⅛→1/32 A8 subspace) measured
+on this exact harness.
+
 ## 10. Stream C EXECUTED — the VAE is EXONERATED; the grain is a DiT-latent problem (2026-07-31)
 
 The Stream-C premise ("rainbow-speckle **VAE-decode** grain, VAE bug #2 OPEN, in the

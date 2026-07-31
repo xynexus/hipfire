@@ -698,6 +698,31 @@ impl Gpu {
         self.add_inplace_f32(&res_n, &tmp)
     }
 
+    /// W4A16 (act16) residual variant of [`Self::gemm_oq4_grouped_residual_act_batched`]:
+    /// `residual[N×M] += W·x_rot` with the int4 weight dequantized to f16 against the
+    /// full-precision (f16) activation — no activation quantization. Used only by the
+    /// A4 KLD harness to build a same-batched-path W4A16 baseline for o_proj/down;
+    /// production keeps the W4A4 residual path. `group` is fixed at 256 (oq4 codec).
+    pub fn gemm_oq4_grouped_residual_f16_batched(
+        &mut self,
+        w_combined: &GpuTensor,
+        x_rot: &GpuTensor,
+        residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.ensure_oq4_scratch_batched(n, k, m)?;
+        let tmp = GpuTensor {
+            buf: unsafe { self.oq4_ytmp_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * m],
+            dtype: DType::F32,
+        };
+        self.gemm_oq4_grouped_f16_wmma(w_combined, x_rot, &tmp, m, k, n, 256)?;
+        let res_n = residual.sub_offset(0, n * m);
+        self.add_inplace_f32(&res_n, &tmp)
+    }
+
     /// Generic kernel library: WMMA GEMM, signed INT8 inputs → INT32 output.
     /// `a_i8` [M,K], `x_i8` [B,K] (int8), `y_i32` [B,M] (int32).
     /// gfx1103/RDNA3 wave32, zero LDS. Requires `k % 16 == 0` and wave32 WMMA.

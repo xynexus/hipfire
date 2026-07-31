@@ -3070,14 +3070,27 @@ pub(crate) fn forward_prefill_chunk(
                     // Opus W4A4: wo_input is FWHT(+AWQ)-rotated above (wo_is_mq).
                     // No fused oq4 residual kernel → grouped-WMMA GEMM into scratch
                     // + add into the residual stream (pbs.x_batch).
-                    gpu.gemm_oq4_grouped_residual_act_batched(
-                        &layer.wo.buf,
-                        wo_input,
-                        &pbs.x_batch,
-                        layer.wo.m,
-                        layer.wo.k,
-                        n,
-                    )?;
+                    // A4 KLD gate: HIPFIRE_OQ4_PREFILL_ACT_BITS=16 uses the W4A16
+                    // residual variant (act16 baseline); default = W4A4 (unchanged).
+                    if std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").as_deref() == Ok("16") {
+                        gpu.gemm_oq4_grouped_residual_f16_batched(
+                            &layer.wo.buf,
+                            wo_input,
+                            &pbs.x_batch,
+                            layer.wo.m,
+                            layer.wo.k,
+                            n,
+                        )?;
+                    } else {
+                        gpu.gemm_oq4_grouped_residual_act_batched(
+                            &layer.wo.buf,
+                            wo_input,
+                            &pbs.x_batch,
+                            layer.wo.m,
+                            layer.wo.k,
+                            n,
+                        )?;
+                    }
                 } else if wo_is_q8 && q8_wmma_arch {
                     let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
                     run_residual_gemm_key(
@@ -3430,19 +3443,43 @@ pub(crate) fn forward_prefill_chunk(
                     )?;
                 } else if ffn_is_oq4 {
                     // Opus W4A4: x_rot_batch is FWHT(+AWQ)-rotated above (ffn_is_mq).
-                    run_fused_gate_up_key(
-                        gpu,
-                        hipfire_dispatch::types::KernelKey::FusedGateUpOq4G256,
-                        &layer.w_gate.buf,
-                        &layer.w_up.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.gate_ffn_batch,
-                        &pbs.up_batch,
-                        layer.w_gate.m,
-                        layer.w_up.m,
-                        layer.w_gate.k,
-                        n,
-                    )?;
+                    // A4 KLD gate: =16 unfuses to two W4A16 GEMMs (act16 baseline into
+                    // the same gate/up buffers the fused kernel writes); default = fused
+                    // W4A4 (unchanged). The downstream silu_mul is identical either way.
+                    if std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").as_deref() == Ok("16") {
+                        gpu.gemm_oq4_grouped_f16_wmma(
+                            &layer.w_gate.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.gate_ffn_batch,
+                            layer.w_gate.m,
+                            layer.w_gate.k,
+                            n,
+                            256,
+                        )?;
+                        gpu.gemm_oq4_grouped_f16_wmma(
+                            &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.up_batch,
+                            layer.w_up.m,
+                            layer.w_up.k,
+                            n,
+                            256,
+                        )?;
+                    } else {
+                        run_fused_gate_up_key(
+                            gpu,
+                            hipfire_dispatch::types::KernelKey::FusedGateUpOq4G256,
+                            &layer.w_gate.buf,
+                            &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.gate_ffn_batch,
+                            &pbs.up_batch,
+                            layer.w_gate.m,
+                            layer.w_up.m,
+                            layer.w_gate.k,
+                            n,
+                        )?;
+                    }
                 } else if gdn_tape.is_some() {
                     gpu.gemm_gate_up_hfq4g256_exact(
                         &layer.w_gate.buf,
@@ -3566,14 +3603,26 @@ pub(crate) fn forward_prefill_chunk(
                     // Opus W4A4: ffn_hidden_batch is FWHT(+AWQ)-rotated above
                     // (fused_silu_mul_rotate_mq, w_down_is_mq). grouped-WMMA GEMM
                     // into scratch + residual add into the hidden stream.
-                    gpu.gemm_oq4_grouped_residual_act_batched(
-                        &layer.w_down.buf,
-                        &pbs.ffn_hidden_batch,
-                        &pbs.x_batch,
-                        layer.w_down.m,
-                        layer.w_down.k,
-                        n,
-                    )?;
+                    // A4 KLD gate: =16 uses the W4A16 residual variant; default W4A4.
+                    if std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").as_deref() == Ok("16") {
+                        gpu.gemm_oq4_grouped_residual_f16_batched(
+                            &layer.w_down.buf,
+                            &pbs.ffn_hidden_batch,
+                            &pbs.x_batch,
+                            layer.w_down.m,
+                            layer.w_down.k,
+                            n,
+                        )?;
+                    } else {
+                        gpu.gemm_oq4_grouped_residual_act_batched(
+                            &layer.w_down.buf,
+                            &pbs.ffn_hidden_batch,
+                            &pbs.x_batch,
+                            layer.w_down.m,
+                            layer.w_down.k,
+                            n,
+                        )?;
+                    }
                 } else if w_down_is_q8 && q8_wmma_arch {
                     let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
                     run_residual_gemm_key(
@@ -3903,9 +3952,39 @@ pub(crate) fn forward_prefill_chunk(
                     // prefill (gate_up/o/down are already W4A4), so this makes a
                     // fully-W4A4 scored prefill reachable for the A4 KLD gate. Default
                     // (unset) keeps W4A8-MMQ, the shipped incumbent. See plan doc §9a.
-                    let force_a4 =
-                        std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").as_deref() == Ok("4");
-                    if n >= 64 && !force_a4 {
+                    let act_bits = std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").ok();
+                    let force_a4 = act_bits.as_deref() == Some("4");
+                    if act_bits.as_deref() == Some("16") {
+                        // A4 KLD act16 baseline: W4A16 per-projection qkv (no fused f16
+                        // qkv kernel), into the same q/k/v buffers as the W4A4 path.
+                        gpu.gemm_oq4_grouped_f16_wmma(
+                            &layer.wq.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_q_full_batch,
+                            layer.wq.m,
+                            layer.wq.k,
+                            n,
+                            256,
+                        )?;
+                        gpu.gemm_oq4_grouped_f16_wmma(
+                            &layer.wk.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_k_batch,
+                            layer.wk.m,
+                            layer.wk.k,
+                            n,
+                            256,
+                        )?;
+                        gpu.gemm_oq4_grouped_f16_wmma(
+                            &layer.wv.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_v_batch,
+                            layer.wv.m,
+                            layer.wv.k,
+                            n,
+                            256,
+                        )?;
+                    } else if n >= 64 && !force_a4 {
                         gpu.gemm_oq4_qkv_mmq(
                             &layer.wq.buf,
                             &layer.wk.buf,
