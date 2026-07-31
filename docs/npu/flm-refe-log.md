@@ -9605,3 +9605,30 @@ Summary of what was tried, all measured rather than argued:
 
 The decomposition is sound and fast per phase; it is the *number* of phases that
 does not fit a 16 KB core. That is the design question now with the user.
+
+### The two-dispatch split is [P1..P4] + [P5], and side A is already built
+
+The split I had been costing was A: P1+P2+P3, B: P4+P5. There is a better one,
+and it needs no new work on side A:
+
+    dispatch A — the chain as it stands, partition B across core groups
+      P1 cores (12)   P1+P3+P4+emit   14672 B   90%   built, passing
+      attn cores (4)  P2+P3+P4+emit   13536 B   83%   built, passing
+
+    dispatch B — P5 on all 16 cores
+      fixed 2848 + P5 4016             6864 B   42%
+
+The boundary is natural: P4 emits `sw` to DDR and P5 reads it back as its
+broadcast, which is a round trip the phases already make between chunks. And
+side B is P5 alone at 42% of a core, where `resid_chain` and `ffn_chain` both
+already run it against a host-supplied `sw`.
+
+So the remaining work for a **complete, running layer** is one small harness, not
+two. That is worth doing regardless of the design decision: if the answer is
+"accept two dispatches", it is the answer; if it is "re-decompose", this is the
+baseline the new decomposition has to beat, and it produces the project's first
+real tok/s either way.
+
+(I first wrote this as `P1+P2+P3+P4 = 17664 B = 108%`, which is wrong — that sums
+as though one core ran all four. No core does; partition B is exactly what
+prevents it.)
