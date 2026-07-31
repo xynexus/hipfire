@@ -1076,3 +1076,33 @@ and makes int4-act's dequant/correction free too. Next: design a codebook-decode
 that fits the ~16–24 FMA/WMMA budget, fused into this LDS kernel's WMMA loop; measure footprint
 + quality vs the bf16 baseline. Experiment kernel `bench_bf16_lds_freealu` + the sweep in
 `bench_dit_bf16_gemm` are the harness.
+
+### 12b. BUT the budget is FMA-shaped, not gather-shaped — QTIP trellis is NOT free (2026-07-31)
+
+Refining §12a with a realistic decode shape (serial, data-dependent LDS-codebook gather —
+the QTIP/Viterbi/LUT pattern) instead of pure register FMAs, the free budget **collapses**:
+
+| extra ops/WMMA | pure FMA (§12a) | serial LDS-gather |
+|---|---|---|
+| 8 | 1.00× (free) | **1.63×** |
+| 16 | 0.99× (free) | 2.19× |
+| 32 | 1.28× | 3.35× |
+
+Even 8 gathers/WMMA cost +63%. The "free compute" is real only for **register-arithmetic**
+work — the gathers contend for the LDS ports the GEMM's own s_A/s_X staging uses, and a serial
+trellis chain exposes LDS latency that a pure-FMA chain doesn't. (Caveat: my gather was
+*serial* worst-case; a *parallel* per-weight codebook gather would hide somewhat better, but
+LDS-bandwidth contention is intrinsic.)
+
+**Corrected direction — this partially reverses §12a's "QTIP is free":**
+- **Arithmetic decode/correction hides (mostly free):** int4→bf16 dequant (shift/convert, no
+  gather), a low-rank **FMA** correction (SVDQuant rank-r add in registers), LDLQ error-feedback
+  as arithmetic. So **int4-act (2× WMMA) with a cheap arithmetic dequant + a register low-rank
+  correction is the DiT low-bit path that fits the budget.**
+- **Gather-heavy codebook / QTIP trellis does NOT hide** — it ~doubles the warm step. So LO-BCQ
+  codebooks / QTIP LUTs (Lever D) are the WRONG fit for hiding-in-the-GEMM on the DiT, exactly
+  opposite to the naive "extra compute corrects QTIP for free."
+
+Net: the compute headroom favors **arithmetic-decodable low-bit (int4 + low-rank/error-feedback
+correction)** over LUT/trellis codebooks. The footprint/quant-quality experiment should target
+that, not a codebook GEMM. (And it still needs a grain-free DiT for the quality gate, §10/§D3.)

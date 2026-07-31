@@ -41,6 +41,11 @@ extern "C" __global__ void bench_bf16_lds_freealu(
 ) {
     __shared__ unsigned short s_A[2][BM * BK];
     __shared__ unsigned short s_X[2][BN * BK];
+    // Small codebook in LDS (256 bf16 entries) — the `extra` ops below gather from
+    // it with a DATA-DEPENDENT, serially-chained index, mimicking a QTIP/LUT
+    // decode (serial trellis + LDS gather), which hides less cleanly than a pure
+    // register FMA. This is the realistic decode-shape budget.
+    __shared__ unsigned short s_cb[256];
 
     const int tid  = threadIdx.x;
     const int wid  = tid >> 5;
@@ -83,6 +88,7 @@ extern "C" __global__ void bench_bf16_lds_freealu(
     _Pragma("unroll") for (int l = 0; l < NA; l++) { int idx = tid + l * BLOCK; ((uint32_t*)s_A[bf])[idx] = rA[l]; } \
     _Pragma("unroll") for (int l = 0; l < NXv; l++) { int q = tid + l * BLOCK; ((i32x4*)s_X[bf])[q] = rX[l]; }
 
+    if (tid < 256) s_cb[tid] = (unsigned short)(0x3c00 + tid); // arbitrary codebook
     { LOADG(0); STS(0); }
     __syncthreads();
 
@@ -107,8 +113,11 @@ extern "C" __global__ void bench_bf16_lds_freealu(
                     // scalars (not DCE'd; competes for VALU issue).
                     float a0 = bf16_to_f32(af[i][0]);
                     float x0 = bf16_to_f32(xf[j][0]);
+                    unsigned int idx = __float_as_uint(a0) ^ __float_as_uint(x0);
                     for (int e = 0; e < extra; e++) {
-                        junk = fmaf(junk, a0, x0);
+                        // serial, data-dependent LDS-gather + fma (trellis/LUT shape)
+                        idx = (idx * 2654435761u + __float_as_uint(junk)) & 255u;
+                        junk = fmaf(junk, bf16_to_f32(s_cb[idx]), x0);
                     }
                 }
         }
