@@ -7413,3 +7413,55 @@ container's quantized tensors are not the checkpoint's weights. The bf16 tensors
 being bit-exact makes the second surprising, but it is no longer excluded.
 
 The question is now well-posed and small, which it was not this morning.
+
+## 2026-07-31 — §1.3 SOLVED: the container is the checkpoint's weights
+
+The decode is plain **q4_1, `w = d*q + m`** — my original formula. What was wrong
+was never the arithmetic; it was the layout, and the layout is now solved.
+
+Region [512:1024] holds the **min m**, and FLM's `q4nx_dequantize` computes
+`d*(q - m)`, which is *not* the weight. Taking the library's output as ground
+truth for "what the bits mean" was the trap: it is an internal helper, all
+non-negative, and I retracted one conclusion built on it. The right use of the
+oracle was as a **probe target** — perturb bytes, watch outputs — not as a
+definition of the weights.
+
+Reading region 1 as a min but with the wrong element pairing is what made every
+earlier arrangement fail.
+
+### The full layout
+
+A 5120-byte container row is one **32x256 tile**:
+
+    [0:512]     256 bf16 scales   block b -> slot 32*(b%8) + b//8
+    [512:1024]  256 bf16 mins     same transpose
+    [1024:5120] 4096 code bytes   low  nibble of byte c -> element
+                                    4096*(c//2048) + 512*(c%8) + ((c%2048)//8)
+                                  high nibble -> that + 256
+
+    container row cr:  g = cr//8 (row-group), cg = cr%8 (column-group)
+    block b covers     row  = 64*(g//2) + 2*(b//8) + (g%2)     # stride-2 interleave
+                       cols = 32*(8*cg + b%8) .. +32
+
+Every transpose here is 8-way, which is what `group_size_bytes = 8 * ROW_BYTES`
+was naming all along — and it mirrors the NPU's 8 columns.
+
+### Verification against the real checkpoint
+
+Full-tensor reconstruction vs Llama-3.2-1B-Instruct:
+
+| tensor | corr | relative Frobenius error |
+|---|---|---|
+| layers.0 wq | **0.996998** | 0.0776 |
+| layers.0 wk | **0.996902** | 0.0788 |
+
+~7.8% relative error is 4-bit quantization error and nothing else. The earlier
+Frobenius ratio of 1.16 that "no permutation could explain" is now explained: it
+was never a permutation problem, it was `d*(q-m)` vs `d*q+m`.
+
+**§1.3's negative answer is retired.** The container's quantized tensors ARE the
+checkpoint's weights; the kernels can now be verified as computing the model,
+not merely as doing q4_1 arithmetic.
+
+Open: `gate_proj` (8192x2048) still reconstructs at corr 0.034, so the tile
+formula needs generalising beyond the square/short cases that q and k cover.
