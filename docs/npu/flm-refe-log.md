@@ -8111,3 +8111,30 @@ amortisation — which the measurements say costs about 0.6 ms/token, survivable
 Every previous risk resolved in favour of the design; this one has not yet, and
 the honest position is that the single-dispatch layer is unproven precisely where
 it is hardest.
+
+### Measured R, then found the sum overstates the problem
+
+`R = 624 B` (trivial-kernel design) — only 4%, so shared runtime is no hiding
+place, and the naive sum becomes **22592 B = 138%**, overflowing by 6208 B, with
+P4 still excluded.
+
+**But the naive sum double-counts.** `flm_q4_1_tile` is `linkonce_odr` and is
+pulled in by kernels in *every* phase — P1 (`flm_gemv_qkv`, `flm_p1_emit`,
+`flm_kv_emit`), P3, P4 (`flm_gemv_gate`, `flm_gemv_up_swiglu`) and P5
+(`flm_gemv_acc`, `flm_gemv_flush`). Combined in one design it is emitted **once**,
+not once per phase image:
+
+    shared body 2 KB -> 126%    4 KB -> 113%    6 KB -> 101%
+
+It fits only if that body exceeds ~6.2 KB. The `noinline` entry recorded 10208 B
+for six GEMV entry points *including one copy of the body*, so 6 KB is not
+absurd — but it is not established either.
+
+**So the position is "probably too tight, not yet proven either way", not
+"defeated".** I nearly wrote the stronger claim off a sum that double-counts the
+single biggest piece of shared code in the tree — the same piece whose sharing
+was the subject of the `noinline` fix.
+
+The decisive test is cheap and specific: build **one** design declaring all five
+phases' kernels and measure its core ELF. That needs no correct dataflow, only a
+design that compiles. Next tick.
