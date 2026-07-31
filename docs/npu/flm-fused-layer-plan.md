@@ -98,10 +98,17 @@ onto one fifo goes from exact to 2.93e-02 against a 1.08e-03 tolerance, and fifo
 depth 2, 3 and 4 give identical results, so it is ordering semantics rather than
 capacity.
 
-q′ therefore has to ride the **broadcast**, which means the broadcast object
-grows: 32 heads × 128 bf16 = 8192 B against the current 4096 B act half. L1 goes
-56,512 → 60,608 of 65,536, leaving 4,928 B spare, so it fits. `-DDIM_QSTRIDE`
-still earns its place — the block is strided either way.
+q′ therefore has to ride the **broadcast**, and it fits the object that already
+exists: 32 heads × 128 bf16 = **4096 of the object's 4224 bf16**, with 128 bf16
+(256 B) spare for `npad`. P2's aux half is unused, so q′ spans the whole object
+rather than competing with the norm weight — 8192 B into 8448 B. **No growth and
+no L1 change.** `-DDIM_QSTRIDE` still earns its place; the block is strided
+either way.
+
+Each attention core needs its own 4 heads out of the shared block, so it needs
+its own index. That rides the **KV operand object's 64-byte trailer**, the same
+mechanism `row_base` uses on a weight tile — the object is 20544 B and the KV
+tiles occupy 16384 of it.
 
 `cs_q` carries cos/sin **pre-multiplied by `head_dim^-0.5 · log2(e)` = 0.125·1.4427**, so attention's `exp2` needs no pre-scale and the host never touches `q'` mid-dispatch. `cs_k` is the plain table. Both from `rope_freqs.weight` (the stored bf16 llama3 divisor), same table for Q and K.
 

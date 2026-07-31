@@ -7008,10 +7008,16 @@ That kills "P2's first operand acquire carries q′", which §1.4 recorded two t
 ago on the strength of the channel budget alone. The channel arithmetic was
 right; the conclusion did not survive contact.
 
-**Resolution: q′ rides the broadcast, and the broadcast object grows.** 32 heads
-× 128 bf16 = 8192 B against the current 4096 B act half. §1.5's L1 total goes
-56,512 → 60,608 of 65,536, leaving 4,928 B spare — it fits, which is why the
-8448 B broadcast was a choice rather than a limit.
+**Resolution: q′ rides the broadcast — and no enlargement is needed.** I first
+wrote that the object must grow, comparing q′ against the 4096 B *act half*.
+That was wrong: **P2's aux half is unused**, so q′ spans the whole object —
+4096 of 4224 bf16, 8192 B into 8448 B, with 256 B spare for `npad`. No growth,
+no L1 change.
+
+The remaining piece is that each attention core needs its own 4 heads from the
+shared block, so it needs its own index. That rides the **KV operand object's
+trailer** — the object is 20544 B and the KV tiles use 16384, so the same
+64-byte trailer convention `row_base` uses on a weight tile applies.
 
 It also explains the chain's P2 zeros without further bisecting: that design has
 the same held-object structure, in a topology where it degrades to nothing
