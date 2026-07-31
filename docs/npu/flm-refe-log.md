@@ -3523,3 +3523,65 @@ error at the boundary. FLM's approach — 5 declared kernel args plus a `DDR_PAT
 table for the other 45 — is not merely a different style; it is the only route to
 50 buffers on this firmware, and it also stays far inside the args-size bound
 that the kernel-argument path silently overruns.
+
+---
+
+## 2026-07-31 — Phase 2 milestone 2: the 20-BO wall is gone, 38.6 GB/s verified
+
+The previous entry concluded that binding bulk buffers as kernel arguments caps
+at 20 and that FLM's patch-table structure was "the only route to 50 buffers on
+this firmware". **That conclusion was too strong.** There is a second route, it
+was already in IRON, and it needs no patch table.
+
+### IRON has two dispatch paths, and only one has the ceiling
+
+`python/utils/hostruntime/xrtruntime/hostruntime.py`:
+
+- **default**: `kernel_handle.kernel(3, insts_bo, insts_bytes, *buffers)` — every
+  buffer an `xrt::kernel` vararg. This is the path that caps at 20 host BOs and
+  hangs the DPU past it.
+- **full ELF**: `run.set_arg(i, buf)` then `run.start()` (line 388) — selected by
+  `iron.jit(..., full_elf=True)`, which is an accepted jit config key.
+
+Switching path is a one-argument change, and it lifts the ceiling entirely.
+
+### Measured, all with `--verify` (bytes checked byte-for-byte)
+
+| buffers | kernel-arg path | full-ELF path | vs FLM 46.2 |
+|---|---|---|---|
+| 20 | 9.7 GB/s | **23.96 GB/s** | 0.52x |
+| 24 | `ERT_CMD_STATE_ERROR` | 26.78 GB/s | 0.58x |
+| 32 | — | **30.04 GB/s** | 0.65x |
+| 48 | — | **36.62 GB/s** | 0.79x |
+| 64 | — | **38.56 GB/s** | **0.83x** |
+
+**64 host buffers on ONE dispatch, 38.56 GB/s, verified.** Against FLM's 46.2
+GB/s decode and the 56.5 GB/s fabric roof, that is 83% of FLM and 68% of roof.
+
+Two things beyond removing the wall: the full-ELF path is **2.5x faster at the
+same 20 buffers** (23.96 vs 9.7), so the kernel-arg path was also costing
+bandwidth well before it failed; and throughput still climbs with buffer count
+at 64, so this is not yet the plateau.
+
+### What this changes
+
+Phase 2's central question — can one dispatch stream a whole model's weights at
+something near FLM's rate — now has a positive answer at 83% without any GEMM
+arithmetic, without the patch table, and without a custom host path. The
+remaining gap to FLM is worth chasing but is no longer a structural blocker.
+
+64 is where the sweep stopped because it is the `kMaxHostBOs` value this branch
+raised the aiecc cap to; whether the full-ELF path extends past it is untested.
+llama3.2:1b needs 50, so 64 already covers the target.
+
+### Correcting the previous entry
+
+"FLM's 5-args-plus-DDR_PATCH-table structure is not a stylistic choice but the
+only route to 50 buffers on this firmware" — wrong on the second half. It is the
+only route *through the kernel-argument path*. The full-ELF path reaches 64
+without it. FLM's structure remains interesting for other reasons (it is how a
+5-connection xclbin binds 50 buffers) but it is not a prerequisite for phase 2.
+
+The error was reasoning from one mechanism's limit to a universal claim, having
+looked at only the dispatch path IRON happened to default to. The alternative was
+in the same file, ten lines away.

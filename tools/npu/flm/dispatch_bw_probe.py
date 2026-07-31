@@ -43,7 +43,7 @@ FABRIC_ROOF_GBS = 56.5
 
 
 def build_and_run(nbufs, buf_kb, workers, tile_kb, group, warmup, iters,
-                  verify=False):
+                  verify=False, full_elf=False):
     """Stream nbufs buffers through `workers` parallel fifos in ONE dispatch.
 
     With ``verify``, one extra buffer rides the same dispatch through a
@@ -140,7 +140,15 @@ def _design({params}, *, tile_elems: CompileTime[int]):
               # manybuf_probe.py.
               __name__="dispatch_bw_probe")
     exec(src, ns)
-    design = iron.jit(ns["_design"])
+    # Two dispatch paths exist and they bind arguments differently. The default
+    # passes every buffer as an xrt::kernel vararg
+    # (`kernel(3, insts_bo, insts_bytes, *buffers)`), which is what caps at 20
+    # host BOs -- the firmware hangs past that and the driver's own
+    # MAX_DPU_ARGS_SIZE check does not catch it (docs/npu/flm-refe-log.md).
+    # full_elf instead uses run.set_arg + run.start, which may not share the
+    # ceiling.
+    design = iron.jit(ns["_design"], full_elf=True) if full_elf \
+        else iron.jit(ns["_design"])
 
     bufs = [iron.zeros(buf_elems, dtype=np.int32, device="npu") for _ in range(nbufs)]
     extra = []
