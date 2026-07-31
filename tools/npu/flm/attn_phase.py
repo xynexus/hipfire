@@ -42,8 +42,13 @@ KDIR = Path(__file__).resolve().parents[3] / "kernels/npu"
 SRC = str(KDIR / "flm_attn_decode.cc")
 BEGIN_SRC = str(KDIR / "flm_attn_begin.cc")
 FIN_SRC = str(KDIR / "flm_attn_finish.cc")
-OPERAND = 20544          # the fused layer's universal operand object
-KVPER = 2                # whole KV tiles per operand object
+import os as _oe
+# whole KV tiles per operand object. KVPER=1 halves the operand and is what the
+# fused layer needs to get data memory down; the cost is twice as many objects.
+KVPER = int(_oe.environ.get("AP_KVPER", 2))
+# The operand must follow KVPER or halving the tiles saves nothing: it is
+# what sizes the fifo buffers, and two of them per core is 63% of data memory.
+OPERAND = 20544 if KVPER == 2 else 10304
 KVELEMS = 2 * TSEQ * HEAD                  # bf16 elements in one [K][V] tile
 FIXED_US = 92.9
 

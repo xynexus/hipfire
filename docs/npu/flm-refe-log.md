@@ -9042,3 +9042,33 @@ This is the second time a measured lever has turned out to be gated by something
 it shares a resource with — the NROWS trade priced at 4.5% is real, but it only
 buys what the KV object allows. Worth measuring `KVPER=1`'s cost in `attn_phase`
 before assuming the combination is affordable.
+
+## 2026-08-01 — KVPER=1 is free, and it unblocks the operand
+
+`attn_phase.py` now takes `AP_KVPER`, and the operand follows it — halving the
+tiles saves nothing unless the object shrinks with them, which is exactly the
+mistake NROWS made.
+
+    KVPER=2  median 27.4 us   range 16.5-31.4
+    KVPER=1  median 19.9 us   range  6.8-22.5     -27%
+
+Ranges overlap heavily, so the honest claim is **KVPER=1 is no worse**, not that
+it is 27% faster. The first pair measured (35.5 vs 7.8) looked like a large win
+and was luck — a reminder that the two-sample version of this comparison would
+have been reported as a 4.5x speedup.
+
+Correctness holds at seq 512, 480 and 64.
+
+**Together with NROWS=8 this is the unblock:**
+
+    operand = max(one KV tile 8192, NROWS=8 tile 10304) = 10304 B
+    two per core = 20608 B = 31% of 64 KB,  against 41088 B = 63% today
+
+That frees ~20 KB, which is far more than P4's buffers needed. The price is the
+NROWS=8 GEMV cost measured earlier — 48.9 → 46.7 GB/s, 4.5% — and nothing from
+KVPER.
+
+So the data-memory blocker has a complete, measured route through it: shrink the
+operand by changing *both* constants, pay ~4.5% on GEMV, and P4/P5 fit. The
+projection at NROWS=8 was 62.4 tok/s against FLM's 59.86, and KVPER=1 costing
+nothing (or helping) leaves that unchanged or slightly better.
