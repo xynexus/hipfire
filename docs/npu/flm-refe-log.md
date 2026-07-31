@@ -7190,3 +7190,59 @@ recognised the symptom immediately.
 
 The P1→P2 seam is not converging and the FFN half is verified end to end. The
 next work is on the measured lever rather than this diagnosis.
+
+## 2026-07-31 — flm as an oracle (user's suggestion), and §1.3 sharpened
+
+### What the running server can and cannot be
+
+The user's `flm serve llama3.2:1b` (PID 2907931, theirs — untouched) listens on
+127.0.0.1:52625 with an OpenAI-compatible API.
+
+| use | verdict |
+|---|---|
+| end-to-end token oracle | **yes** — temp 0 is deterministic, 3/3 identical runs |
+| exact prompt-token control | **yes** — the model dir ships `tokenizer.json` + chat template; rendering it gives **40 tokens, exactly FLM's reported `prompt_tokens`** |
+| numerical oracle (logprobs) | **no** — `logprobs` is accepted but always returns null |
+| intermediate activations | **no** |
+| live baseline | **yes** — 59.05 / 59.45 / 60.34 tok/s decode, confirming the 59.86 figure |
+
+`/v1/completions` is not raw — it applies the chat template too (40 tokens for a
+6-token string), so teacher-forcing an exact prefix is not available. The oracle
+compares whole pipelines, not layers.
+
+### The container's packing is now exact, not inferred
+
+Every quantized tensor is 5120 B/row = 256 blocks x 32 = 8192 elements, and the
+element counts match the checkpoint **exactly**: q_proj (512,5120) -> 4,194,304
+= 2048x2048; lm_head (32064,5120) -> 262,668,288 = 128256x2048. Attention and
+gate/up pack **4 output rows per container row**; down_proj packs 1 (K=8192).
+
+### §1.3 sharpened: no arrangement CAN match
+
+Against `layers.0.attention.wq.weight` from the real checkpoint:
+
+    container (any arrangement)  Frobenius 85.92
+    checkpoint                   Frobenius 73.84    ratio 1.1636
+
+**A permutation preserves the Frobenius norm exactly.** The container and the
+checkpoint holding the same weights in a different layout would give an
+identical norm for *any* arrangement. They do not. So the mismatch is not the
+block-to-(row,k) mapping and not the nibble order — **the reconstructed values
+themselves differ**, and no amount of re-arranging can fix it.
+
+That converts §1.3 from "no arrangement found" (a search that could always have
+one more candidate) into "the layout is not where the error is" — the decode of
+`d`/`m`/`codes` is. Since the bf16 tensors are bit-exact, the checkpoint is
+right; the q4_1 *interpretation* is wrong.
+
+Layernorm folding is refuted as the explanation: those weights average 0.18, so
+folding shrinks (ratio 4.41), it does not inflate.
+
+Shape-only cosine over the first 5000 blocks (order- and scale-invariant) is
+0.877 — structured, not noise, but not a fit either.
+
+**The oracle is the way through.** `q4nx.blocks()` carries a comment saying
+nibble order "cannot be established ... since there is nothing to check a
+candidate order against". A deterministic end-to-end token oracle is exactly
+that missing check: run the forward pass under a candidate decode and let FLM's
+own token judge it. That does not depend on the stuck P1->P2 seam or on the NPU.

@@ -101,9 +101,13 @@ class Q4nx:
         d = bf16_to_f32(r[:, 0:DM_BYTES].copy().view(np.uint16)).reshape(-1, BLOCKS_PER_ROW)
         m = bf16_to_f32(r[:, DM_BYTES:2 * DM_BYTES].copy().view(np.uint16)).reshape(-1, BLOCKS_PER_ROW)
         qs = r[:, 2 * DM_BYTES:].reshape(-1, BLOCKS_PER_ROW, BLK // 2)
-        # Nibble order WITHIN one of FLM's blocks is not established -- it
-        # cannot be, while the block-to-(row, k) mapping is unknown, since
-        # there is nothing to check a candidate order against. Split order is
+        # Nibble order WITHIN one of FLM's blocks is not established. It was
+        # once thought unestablishable for want of a reference; the running
+        # `flm serve` is one (deterministic at temp 0, and the shipped
+        # tokenizer reproduces its prompt tokens exactly), so a candidate can
+        # now be judged end to end. Note the layout is NOT where the current
+        # mismatch lives: the container's Frobenius norm exceeds the
+        # checkpoint's by 1.16x, and permutation preserves that norm exactly. Split order is
         # assumed here so the codes are read consistently; every downstream use
         # repacks them anyway, so the choice cancels out.
         codes = np.concatenate([qs & 0x0F, qs >> 4], axis=2)
@@ -179,3 +183,27 @@ def gemv_reference(act, d, m, codes):
     asum = a.sum(1)
     dot = np.einsum("rbt,bt->rb", codes.astype(np.float64), a)
     return (d.astype(np.float64) * dot + m.astype(np.float64) * asum).sum(1)
+
+
+def flag_tag(flags):
+    """A short token that makes a `compile_flags` set visible to iron.jit's cache.
+
+    **iron.jit keys on the design's code object.** A `-D` value that reaches the
+    kernel only through a runtime-built `compile_flags` list is invisible to
+    that key, so two variants whose sources are byte-identical collide and the
+    second silently runs the first's kernels. Nothing looks stale — the flag is
+    right there in the file being read — and it has cost four debugging runs in
+    this tree, twice producing a confidently wrong conclusion.
+
+    Interpolate the tag into something inside the generated design source, most
+    simply a fifo name:
+
+        TAG = q4nx.flag_tag(flags)
+        ...
+        f_w = ObjectFifo(ty, name=f"wp{{i}}_{TAG}")
+
+    Any value that varies with the flags works; this just makes it short and
+    automatic rather than something each harness invents.
+    """
+    import hashlib
+    return hashlib.sha1("|".join(map(str, flags)).encode()).hexdigest()[:8]
