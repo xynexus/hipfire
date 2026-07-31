@@ -8213,3 +8213,38 @@ P5 on the attention cores, i.e. finding 3072 B. Candidates, cheapest first:
 merging `acc`/`flush` (they differ only in the residual add), and the `noinline`
 treatment that took one image from 103% to 78% — it has only ever been applied to
 `flm_q4_1_tile`, not to the attention or FFN entry points.
+
+### Direct per-phase images — the gap is smaller than I reported
+
+`--only` on individual phases, rather than deriving marginals from cumulative
+builds:
+
+| subset | .text | of 16 KB |
+|---|---|---|
+| P3 | 3920 B | 24% |
+| P5 | 4928 B | 30% |
+| P4 | 5920 B | 36% |
+| P1 | 6144 B | 38% |
+| P1+P2 | 10176 B | 62% |
+| P1+P3+P4 | 12112 B | 74% |
+| P1+P2+P3+P4 | 14976 B | 91% |
+| P1+P3+P4+P5 | 15424 B | 94% |
+
+**P5's marginal, with the tile body already present, is 3312 B — 1656 B per
+kernel**, not the 4480 B I derived last tick. `flm_gemv_acc` and
+`flm_gemv_flush` are thin wrappers: both call `flm_q4_1_tile` and then do a
+16-row accumulate, flush adding the residual and a bf16 narrow.
+
+The two ways to estimate the five-phase image disagree:
+
+    P1+P2+P3+P4 (14976) + P5 marginal (3312) = 18288 B = 112%
+    P1+P3+P4+P5 (15424) + P2 marginal (4032) = 19456 B = 119%
+
+so marginals are not additive — the linker folds differently depending on what
+else is present. **The cut needed is between 1904 and 3072 B**, and last tick's
+flat "3072 B" was the pessimistic end of a range I presented as a number. The
+five-phase build overflows, so the true figure cannot be measured directly.
+
+That matters for the decision: merging `acc` and `flush` into one kernel with a
+flag plausibly saves ~1656 B, which clears the optimistic end of the range and
+not the pessimistic one. Worth trying, but not obviously sufficient.
