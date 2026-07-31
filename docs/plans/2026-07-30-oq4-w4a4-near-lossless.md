@@ -772,6 +772,36 @@ int4-act penalty **0.0672 KLD**, PPL 10.67 → 11.30 (**+0.63 PPL**). The penalt
 byte-stable across ctx (0.0668 → 0.0672), so it is **robust, not a small-sample artifact** —
 ~4.2× the noise floor. Headline number: **int4-act prefill penalty ≈ 0.067 KLD / +0.6 PPL.**
 
+## 9d. Stream B — first lever landed: activation clip-search (2026-07-31)
+
+The int4-act penalty comes from `quantize_act_oq4`: scale = **absmax/7**, so one
+outlier in a 256-group inflates the scale and the bulk quantizes coarsely — and hipfire
+applies clip/AWQ to *weights* but **nothing on the activation side**. First Stream B lever
+= the plan's Lever A "+" (clip) on activations: `quantize_act_oq4_clip.hip` grid-searches a
+per-group clip ratio α∈{1.0…0.43} and picks the scale minimizing the group's int4
+reconstruction MSE (α=1.0 is in the set, so it can never beat plain absmax). Same output
+format ⇒ the GEMM is unchanged; register-cached so the search re-uses the group with **no
+extra DRAM traffic** vs plain absmax (throughput-neutral, not separately benched). Gated by
+`HIPFIRE_OQ4_ACT_CLIP=1`, default-off.
+
+**Result (A/B on the §9c harness, qwen3.5-0.8b--oq4++, ctx=512):**
+
+| act4 variant vs act16 | KLD/tok | PPL |
+|---|---|---|
+| plain absmax | 0.0668 | 14.43 (+0.79 vs act16) |
+| **+ clip-search** | **0.0586 (−12%)** | **13.92 (+0.28 vs act16)** |
+
+So the activation clip recovers **~12% of the KLD penalty and ~65% of the PPL penalty**,
+cheaply and throughput-neutrally — validating that activation-side clip (untested in hipfire
+before) helps, exactly as Lever A predicts. It does NOT close the gap to the 0.016 noise
+floor alone (KLD 0.059 still ~3.7× floor), so it composes with the stronger, unbuilt levers:
+**ConQuR learned R₁/R₂ rotation** (Lever A proper — needs the quant-time objective +
+R1Plan→qwen3.5 extension) and **ResQ ⅛→1/32 A8 outlier subspace** (Lever B, the strongest —
+needs the PCA fold + dual int4+int8 GEMM). Recipe trending toward **oq4++ weights + activation
+clip + (rotation and/or A8 subspace)**, each now measurable on this harness. Note KLD (top-128
+distributional) moved less than PPL (true-token NLL) — the clip helps the true continuation
+more than the full tail, so the KLD gate stays the stricter bar.
+
 **A4 decision:** int4-act buys ~1.5× prefill throughput (§9) at ~0.067 KLD / +0.79 PPL.
 That is a genuine **throughput-vs-quality tradeoff**, NOT free — so promoting qwen3.5
 qkv/gate_up to W4A4-by-default is **not justified on quality alone**; it needs Stream B to

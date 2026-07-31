@@ -4162,6 +4162,11 @@ pub const GEMM_OQ4_RESIDUAL_MMQ_SRC: &str =
 /// signed int4 + per-group scales). Feeds `gemm_oq4_grouped_wmma`. gfx1103
 /// wave32, zero LDS. See `kernels/src/quantize_act_oq4.hip`.
 pub const QUANTIZE_ACT_OQ4_SRC: &str = include_str!("../../../kernels/src/quantize_act_oq4.hip");
+/// Clip-search variant of `quantize_act_oq4` (Stream B activation "+"): per-group
+/// MSE-optimal clip ratio instead of plain absmax. Same output format. Gated by
+/// `HIPFIRE_OQ4_ACT_CLIP=1`. See `kernels/src/quantize_act_oq4_clip.hip`.
+pub const QUANTIZE_ACT_OQ4_CLIP_SRC: &str =
+    include_str!("../../../kernels/src/quantize_act_oq4_clip.hip");
 
 /// Opus Quant W8A8 core: grouped signed-INT8 × signed-INT8 GEMM with per-group
 /// scale rescale (v_wmma_i32_16x16x16_iu8). The int8 generalization of

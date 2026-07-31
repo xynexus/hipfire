@@ -257,11 +257,16 @@ impl Gpu {
             0,
             "quantize_act_oq4: K must be a multiple of group"
         );
-        self.ensure_kernel(
-            "quantize_act_oq4",
-            kernels::QUANTIZE_ACT_OQ4_SRC,
-            "quantize_act_oq4",
-        )?;
+        // Stream B lever: HIPFIRE_OQ4_ACT_CLIP=1 swaps in the per-group clip-search
+        // activation quantizer (MSE-optimal clip vs plain absmax). Same output
+        // format, so callers/GEMM are unchanged; default = plain absmax.
+        let (entry, src): (&str, &str) =
+            if std::env::var("HIPFIRE_OQ4_ACT_CLIP").as_deref() == Ok("1") {
+                ("quantize_act_oq4_clip", kernels::QUANTIZE_ACT_OQ4_CLIP_SRC)
+            } else {
+                ("quantize_act_oq4", kernels::QUANTIZE_ACT_OQ4_SRC)
+            };
+        self.ensure_kernel(entry, src, entry)?;
         let xp = x_f32.buf.as_ptr();
         let xqp = xq_i4.buf.as_ptr();
         let xsp = xs.buf.as_ptr();
@@ -278,7 +283,7 @@ impl Gpu {
         ];
         let grid_g = (k / group) as u32;
         let grid_b = batch_size as u32;
-        let func = &self.functions["quantize_act_oq4"];
+        let func = &self.functions[entry];
         unsafe {
             self.hip.launch_kernel(
                 func,
