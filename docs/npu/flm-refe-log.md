@@ -3695,3 +3695,75 @@ Phase 2 milestones 1-3 stand: dispatch structure is no longer the bottleneck
 (52.3 GB/s verified, 1.13x FLM). The next unit of work is a real GEMM kernel
 behind that delivery path, and it should be started deliberately rather than
 scaffolded in passing.
+
+---
+
+## 2026-07-31 — Phase 3a's premise does not survive the bandwidth arithmetic
+
+Started building a GEMM kernel and instead found that the question phase 3a is
+framed around has already been answered by two measurements taken weeks apart in
+this log. New tool: `tools/npu/flm/gemm_shapes.py`.
+
+### The two facts, put side by side
+
+| measurement | value | source |
+|---|---|---|
+| `mac_4x16_16x16` issue rate | **512 MACs/cycle/core** | `macbench_hw.py`, hardware |
+| FLM decode bandwidth | **46.2 GB/s** of 5.00 bpw weights | `flm_bench.py`, hardware |
+
+The second implies a **weight supply** of
+
+```
+46.2e9 / (5.00/8) / 16 cores / 1.8 GHz = 2.57 MACs/cycle/core
+```
+
+**The MAC unit offers 199x more than the weight supply can feed.** Even
+`mac_elem_16` — the 16-lane mode FLM actually uses, and which this plan treats
+as FLM's handicap — is **6x** more than the supply allows.
+
+### What that means for phase 3a
+
+The plan argues 3a as a MAC-width story: "symmetric int4 straight into
+`mac_4x16_16x16`: no unpack, no zero-point". That framing does not survive.
+Decode is overwhelmingly **bandwidth**-bound, so the MAC mode is nearly
+irrelevant to decode throughput. Three consequences:
+
+1. **The real oq4++ win is bytes, and it is ~21%.** 4.125 bpw against q4_1's
+   5.00 is `5.00/4.125 = 1.212` — 21% more weights per second at the same
+   bandwidth. Worth having, but it is a fifth, not a multiple.
+2. **Deleting the 42-op dequant chain buys little directly.** If the core is
+   waiting on weights, removing compute it was doing while it waited does not
+   speed anything up. There may be a second-order effect — FLM sits at 76% of
+   its own static ceiling and the plan attributes that to the dequant dependency
+   chain — but that is a 24% ceiling effect at most, not the headline.
+3. **FLM's choice of `mac_elem_16` was not a mistake to exploit.** This plan
+   reads it as FLM missing the wide modes ("what costs it the wide modes is tile
+   shape plus the q4_1 format together"). At 2.57 MACs/cycle of supply, a 16-lane
+   MAC is already 6x oversized. It is an entirely reasonable choice, and the
+   32x/64x headroom this plan has been treating as available upside is not
+   reachable through decode.
+
+### Where the upside actually is
+
+Ranked by what the measurements support:
+
+- **Fewer bytes per weight** — 21% from oq4++, and it compounds with anything
+  else that reduces traffic.
+- **Prefill**, which is compute-bound (FLM: 1774 tok/s on llama, 185 on the MoE)
+  and where MAC width *does* matter. The plan's 3a is written for decode.
+- **The MoE**, which runs at 67% of fabric against llama's 86% — a third of its
+  achievable rate is going somewhere other than weight streaming, and that gap
+  is larger than oq4++'s 21%.
+
+### Also recorded: what the tool does and does not do
+
+`gemm_shapes.py` compiles the native int4 loop and reports its schedule (4
+bundles, 2 `vmac`, confirming 2 cycles/call — an independent reproduction of the
+hardware measurement). It deliberately does **not** rebuild FLM's dequant chain
+from source: that cost is already known from the shipped binary, and a
+reconstruction would compare our codegen against theirs rather than the two
+formats.
+
+An earlier draft did try to rebuild it and got stuck on int8->bf16 conversion
+intrinsics. Abandoning that was the right call twice over — the arithmetic above
+makes the comparison unnecessary.
