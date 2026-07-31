@@ -705,6 +705,37 @@ is about; Stream B levers exist to close it if short).
 change gated on building the batched-prefill KLD harness — that harness + the gate is
 the next concrete unit (feeds Stream B).**
 
+### 9b. A4 KLD harness — plumbing mapped; the qkv gate landed; the scorer is a REAL new build (2026-07-31)
+
+A code survey settled how far this is from a running act4-vs-act16 KLD number:
+
+- **DONE — the qkv int4-act gate** (`prefill_chunk.rs:3900`, commit follows §9a): qkv@n>=64
+  was the ONLY non-W4A4 site in qwen35 oq4 prefill (gate_up/o/down are already W4A4 via
+  `FusedGateUpOq4G256` / `gemm_oq4_grouped_residual_act_batched`). `HIPFIRE_OQ4_PREFILL_
+  ACT_BITS=4` now forces true W4A4 qkv even at n>=64. Default unset = W4A8-MMQ (unchanged).
+  So a **fully-W4A4 qwen35 prefill is now reachable under one env var.**
+- **BLOCKER — no batched-prefill scorer exists.** Every KLD entry (`kld_eval.rs` generic
+  L38-64; `qwen35/loading.rs` `forward_chunk_scored` L3183, `Qwen35KldForward` L3217)
+  runs a **per-token decode loop** through `forward_scratch` → `weight_gemv*` = **W4A16
+  only**. qwen35 never calls `weight_gemm` (so its `HIPFIRE_OQ4_PREFILL_ACT_BITS` handling
+  is irrelevant here), and the `KldConfig`/`ScoringMode::Prefill`/`kld_graph_prefill`
+  surface is declared but **unconsumed**. No arch does batched KLD scoring. So measuring
+  the int4-act penalty needs a **new qwen35 teacher-forced batched-prefill logit scorer**
+  (fresh KV+DeltaNet per chunk, lm-head fan-out per scored position) — a real build, not
+  a flag flip.
+- **Design fork (needs a call):**
+  1. *Native scorer* — new `ChunkScoredForward` that drives `forward_prefill_chunk`
+     (byte-identical to serving), act4 via the new gate. Cost: also needs a W4A16 qkv/gate_up
+     path for the act16 baseline (the fused gate_up kernel is W4A4-only), so more kernel plumbing.
+  2. *`weight_gemm` reference-floor* — route the new batched forward's linears through
+     `weights::weight_gemm`, then `HIPFIRE_OQ4_PREFILL_ACT_BITS=16` vs `=4` gives both passes
+     for free (no new kernels). Cheaper, but a reference floor (weight_gemm kernels ≠ serving's
+     native dispatch), so the KLD is indicative, not serving-exact.
+
+  Recommendation: option 2 first (fast, no new kernels) for the go/no-go quality number, then
+  option 1 only if it passes and a serving-exact figure is wanted. **Left for the user to steer
+  before authoring the scorer** — it's a substantial, quality-sensitive harness, not autonomous-safe.
+
 ## 10. Stream C EXECUTED — the VAE is EXONERATED; the grain is a DiT-latent problem (2026-07-31)
 
 The Stream-C premise ("rainbow-speckle **VAE-decode** grain, VAE bug #2 OPEN, in the
