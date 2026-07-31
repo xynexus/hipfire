@@ -7968,3 +7968,51 @@ R²=0.99996) and the dispatch constant (92.9 µs) — both fitted across many
 points — and, more importantly, **that the five phases compose in one dispatch
 at all.** Each is measured in isolation or in pairs; nothing yet runs P1→P5
 together, and routing is the known risk there.
+
+## 2026-08-01 — the assembly plan, grounded in what the working chains already do
+
+Measurement is finished; every phase has a median. What is left is whether the
+five compose, and that is a dataflow question.
+
+### Phases share fifos — adding one adds acquires, not fifos
+
+`resid_chain`'s core body runs **P3 and P5 against the same three fifos**
+(`bcc`, `wc`, `op`), differing only in how many times each is acquired and which
+kernel runs. So the full layer does not need per-phase fifos, and the routing
+pressure does not grow linearly with phase count. That is the single most
+important fact for the assembly and it is already demonstrated, not assumed.
+
+### But sharing requires matched object sizes, and that is the real constraint
+
+Fifos can only be shared by phases whose objects are the same size — which is
+exactly why `resid_chain` gets away with it (P3's `h` and P5's `x_out` are both
+2048-dim) and why `p1p2_chain` needs two output fifos (P1 emits 128-element head
+objects, P2 emits 256).
+
+Budget at NATT=4, against 16 in / 16 out:
+
+    IN : f_bc 1 + f_w 8                                  =  9   ok
+
+    OUT, one fifo per distinct object size:
+      f_p1 8  (P1 -> KV cache, 128-elem)
+      f_p2 2  (attention -> DDR for P3's broadcast, 256-elem)
+      f_o  8  (P3 h / P5 x_out, 2048-dim)                = 18   EXCEEDS 16
+
+    OUT, with P1 and P3/P5 sharing one fifo:
+      shared 8 + f_p2 2                                  = 10   ok
+
+**Ten outputs is exactly what routes today** (p1p2_chain at NATT=4, P2 on the
+last pairs). So the full layer fits *if* P1's result object is padded to match
+P3/P5's — which is the "unify the result object size" idea again, now with a
+concrete purpose beyond reducing a count, and a concrete target to match.
+
+### Order of work
+
+1. pad P1's result object so it shares a fifo with P3/P5 — verify P1→P2 still
+   passes at NATT=4 and still routes;
+2. add P3 as a third TaskGroup (the broadcast refill pattern p1p2_chain already
+   uses twice, and `chain_probe.py` verified for inter-phase DDR);
+3. add P4+P5, which `resid_chain` shows need no new fifos beyond P3's.
+
+The risk sits entirely in step 1: padding P1's object doubles its drain volume,
+and P1's cache write uses strided drains whose offsets assume the current size.
