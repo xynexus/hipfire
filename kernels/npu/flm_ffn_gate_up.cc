@@ -30,16 +30,29 @@ static_assert(NROWS <= SLANES, "SwiGLU evaluates one 32-lane exp2 per tile");
 extern "C" __attribute__((noinline)) void
 flm_ffn_gate_up(const bfloat16 *restrict act, const uint8 *restrict wtile,
                 bfloat16 *restrict out) {
-  float g[NROWS], u[NROWS];
+  // g is SLANES wide and zero-initialised: the exp2 argument is built by a
+  // vector load over all SLANES lanes, and the spare tail must read as 0.
+  alignas(64) float g[SLANES] = {};
+  float u[NROWS];
   flm_q4_1_tile(act, wtile, g);
   flm_q4_1_tile(act, wtile + TILE_TOTAL, u);   // past the gate tile AND its trailer
 
   // One 32-lane exp2 covers the whole tile; NROWS is 8 or 16, so the spare
   // lanes are wasted but a second call would not be cheaper.
-  aie::vector<float, SLANES> e;
-  e = aie::zeros<float, SLANES>();
-  for (int r = 0; r < NROWS; ++r)
-    e[r] = -g[r] * LOG2E;
+  //
+  // Build the argument with a LOAD. Writing it element-wise —
+  //     aie::vector<float, SLANES> e = aie::zeros<float, SLANES>();
+  //     for (int r = 0; r < NROWS; ++r) e[r] = -g[r] * LOG2E;
+  // — compiles clean and **silently does nothing**: `operator[]` on an
+  // aie::vector returns a temporary, so the writes are dropped, `e` stays
+  // zero, exp2(0) is 1, and the sigmoid collapses to a constant 1/2. The
+  // kernel then computes `g*u/2`, which tracks SwiGLU closely enough on small
+  // activations to pass a loose tolerance. It shipped that way; see
+  // docs/npu/flm-refe-log.md, 2026-07-31. `g` is declared SLANES wide and
+  // zero-initialised so the spare lanes contribute exp2(0) = 1 and are unread.
+  const auto e = aie::mul(aie::load_v<SLANES>(g),
+                          aie::broadcast<float, SLANES>(-LOG2E))
+                     .template to_vector<float>();
   const auto s = aie::exp2<bfloat16>(e);
 
   for (int r = 0; r < NROWS; ++r)

@@ -28,9 +28,25 @@ flm_gemv_up_swiglu(const bfloat16 *restrict act, const uint8 *restrict wtile,
   float u[NROWS];
   flm_q4_1_tile(act, wtile, u);
 
-  aie::vector<float, SLANES> e = aie::zeros<float, SLANES>();
-  for (int r = 0; r < NROWS; ++r)
-    e[r] = -g_gate[r] * LOG2E;
+  // Build the exp2 argument with a LOAD, not element-by-element.
+  //
+  // The obvious form
+  //     aie::vector<float, SLANES> e = aie::zeros<float, SLANES>();
+  //     for (int r = 0; r < NROWS; ++r) e[r] = -g_gate[r] * LOG2E;
+  // compiles clean and **silently does nothing** — `operator[]` on an
+  // aie::vector yields a temporary, so every write is dropped and `e` stays
+  // zero. exp2(0) is 1, the sigmoid collapses to a constant 1/(1+1) = 1/2, and
+  // the kernel computes `g*u/2` for every row. That is close enough to
+  // SwiGLU on small activations to pass a loose tolerance (ffn_alt.py, on
+  // unnormalised inputs, showed 1.6e-04) and only shows up once the
+  // activations are RMSNorm-scaled: the measured sigmoid was 0.4990-0.5008
+  // for every row whatever g was, and `g*u/2` matched the device to 4 digits.
+  //
+  // g_gate is SLANES wide and static, so lanes [NROWS, SLANES) are zero for
+  // the life of the program and their exp2 is a harmless 1.
+  const auto gv = aie::load_v<SLANES>(g_gate);
+  const auto e = aie::mul(gv, aie::broadcast<float, SLANES>(-LOG2E))
+                     .template to_vector<float>();
   const auto s = aie::exp2<bfloat16>(e);
 
   for (int r = 0; r < NROWS; ++r)

@@ -27,7 +27,10 @@
 
 #include "flm_q4_1_tile.h"
 
-alignas(64) float g_gate[DIM_NROWS];
+// SLANES wide, not DIM_NROWS: flm_gemv_up_swiglu loads all 32 lanes for one
+// exp2. Static storage is zero-initialised and the tile body only writes
+// [0, NROWS), so the tail stays zero.
+alignas(64) float g_gate[32];
 
 extern "C" __attribute__((noinline)) void
 flm_gemv_gate(const bfloat16 *restrict act, const uint8 *restrict wtile) {

@@ -5392,6 +5392,16 @@ now indistinguishable from the other projections.
 
 ## 2026-07-31 — Task 4 FALSIFIED: gate/up's rate is not the row count
 
+> **RETRACTED the same day — this entry's measurement was made against a
+> miscompiled kernel and its conclusion is backwards.** Both kernels compared
+> here were silently computing `g*u/2` instead of SwiGLU (see "the SwiGLU
+> sigmoid was a constant 1/2", below). With that fixed, alternating acquires
+> **wins**: 467.6 us against the single fused tile's 496.2 us on the same
+> 21.0 MB, marginal 374.7 us against a 369.1 us ideal — **98.5% of its transfer
+> ceiling**, where this entry measured 433.7. The row count *was* the cause; the
+> gate passes. Left in place because the reasoning below is a good example of a
+> correct method reaching a wrong answer through an unvalidated input.
+
 The plan called this its most falsifiable claim and named the disconfirming
 number in advance. It disconfirmed.
 
@@ -5919,3 +5929,88 @@ Two candidates, not yet separated:
 The isolation that separates them is to run P4 alone with `flm_asum_prepare`
 instead of `flm_norm_prepare` and compare against `ffn_alt.py`, which passes at
 3.40e-04 with the same kernels and a private fifo. That is the next step.
+
+## 2026-07-31 — the SwiGLU sigmoid was a constant 1/2: a silent miscompile that shipped
+
+Chasing `ffn_chain.py`'s numerics found a bug in **two** kernels that had been
+passing their harnesses for days.
+
+```c
+aie::vector<float, SLANES> e = aie::zeros<float, SLANES>();
+for (int r = 0; r < NROWS; ++r)
+  e[r] = -g[r] * LOG2E;            // <-- silently does nothing
+const auto s = aie::exp2<bfloat16>(e);
+```
+
+`operator[]` on an `aie::vector` yields a **temporary**, so every write is
+dropped. It compiles without a warning. `e` stays zero, `exp2(0)` is 1, the
+sigmoid collapses to a constant `1/(1+1) = 1/2`, and the kernel computes
+**`g*u/2`** for every row. Present in `flm_ffn_gate_up.cc` and
+`flm_gemv_up_swiglu.cc` — every SwiGLU path there is.
+
+**Why the harnesses passed.** `silu(g) = g/2 + g²/4 − …`, so `g*u/2` *is*
+SwiGLU to first order, and the error is O(g²)·u. `ffn_fused.py` and
+`ffn_alt.py` fed unnormalised activations (`randn * 0.05`), where |g| stays
+small and the difference sits at 3.4e-04 — comfortably inside a tolerance set
+for the exp2 NLF. It only became visible in `ffn_chain.py`, the first harness to
+put a **RMSNorm-scaled** activation through SwiGLU.
+
+**How it was found.** Not by inspection. The error was deterministic across
+runs, uniform across every pair, core and tile (~33% of rows each), and the
+exp2 argument range was only [−1.1, 1.1] — all of which ruled out races,
+plumbing and the NLF. Printing actual values showed the device's sigmoid was
+**0.4990–0.5008 for every row whatever `g` was**, and `g*u/2` matched the device
+to four digits. The lesson is the one this log keeps re-learning: aggregate
+error statistics say *that* something is wrong, and only concrete numbers say
+*what*.
+
+**Fix:** build the argument with a vector load rather than element-wise —
+`aie::mul(aie::load_v<SLANES>(g), broadcast(-LOG2E))` — with the source array
+declared `SLANES` wide and zero-initialised so the spare lanes contribute
+`exp2(0) = 1` and are never read.
+
+### It was also making things slower
+
+Removing dead code should cost time. It gained it — the scalar loop the
+compiler was partially keeping is worse code than the two vector ops that
+replace it:
+
+| | before (miscompiled) | after |
+|---|---|---|
+| `ffn_fused` single tile, 8 rows | 514.0 us, 41.1 GB/s | **496.2 us, 42.5 GB/s** |
+| `ffn_alt` alternating, 16 rows | 526.6 us, marginal 433.7 | **467.6 us, marginal 374.7** |
+| accuracy of both | 3.40e-04 | **8.76e-05** |
+
+**So Task 4's falsification is itself falsified.** Alternating acquires at 16
+rows is *faster* than the single fused tile — 467.6 against 496.2 us — and its
+marginal 374.7 us is **98.5% of the 369.1 us its transfer size allows**. The
+plan's original claim was right, the retraction was an artifact, and the
+morning's entry is marked as such rather than deleted.
+
+## 2026-07-31 — Task 7: the FFN half runs as two chained phases in one dispatch
+
+`tools/npu/flm/ffn_chain.py` now **passes**. P4 (norm2 + gate + up + SwiGLU) and
+P5 (down, 4 K-chunks, + residual), 16 cores, one dispatch, real layer-0 weights.
+
+| | value |
+|---|---|
+| bytes | **31.56 MB** |
+| wall | 670.7 us |
+| marginal | **577.8 us** against a 563.3 us 16-core ideal — **97.5% of ceiling** |
+| rate | 47.0 GB/s |
+| P4 SwiGLU | max rel err **3.92%** on the significant values |
+| P5 x_out | max err 2.95e-03 against max\|W_down·sw\| 0.106 — **2.77%** |
+
+Both inside the AIE2P exp2 NLF floor (3.54% mean / 5.86% max).
+
+**Gating a residual-added quantity.** A pointwise relative error on `x_out`
+reads 15.8%, and that is an artifact: `x_out = W_down·sw + h` with `h` added
+exactly, so where the two nearly cancel the ratio diverges while the absolute
+error is unchanged. The honest gate scales the error by the term that carries
+it, `max|W_down·sw|`. Similarly, a max error gated against 8% of the *mean* is
+far tighter than the NLF can meet when the quantity's max/mean ratio is ~14 —
+that alone failed this harness after its arithmetic was already correct.
+
+Regression after the fix: `gemv_verify`, `normgemv_verify`, `down_verify`,
+`qkv_verify`, `attn_verify --seq 500`, `attn_phase --seq 480`, `ffn_chain` — all
+pass.
