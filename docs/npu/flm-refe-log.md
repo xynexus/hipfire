@@ -10508,3 +10508,34 @@ FLM at 191 tokens has not been measured; its bracket is 61.18 (41 tok) to 58.83
 (641 tok). Against either end that is roughly **-9%**, which agrees with the
 corrected figure from the previous entry. The ~9% deficit is now MEASURED on the
 chained design at a real context, not projected from separately-timed parts.
+
+### Correction to the entry above: the binding context wall is a RUNTIME HANG at 7 KV objects, not the BD limit
+
+I reported the BD-descriptor error as "the next context wall" after seeing seq 191
+pass and seq 511 fail to build. I had not tested between them. Doing so:
+
+    seq 191   6 objects   PASS
+    seq 223   7 objects   ERT_CMD_STATE_TIMEOUT
+    seq 255   8 objects   ERT_CMD_STATE_TIMEOUT  (x2, reproducible)
+    seq 511  16 objects   build fails, 16-BD limit
+
+seq 255 **builds fine** — it is not a BD problem at all — and then the kernel
+never completes. seq 191 passes immediately afterwards on a re-run, so this is
+not NPU contention from the user's `flm serve`; it is deterministic in the object
+count.
+
+So there are two walls, and the one that actually binds is the earlier and less
+understood of the pair:
+
+  * **7+ KV objects: the dispatch hangs.** Builds clean, times out at runtime.
+    A hang rather than a wrong answer points at fifo/lock accounting — something
+    waiting on an object that never arrives — not at arithmetic.
+  * **16+ KV objects: 16-BD shim limit.** Only reachable if the hang were fixed.
+    `dma_free_task` / `dma_await_task` do exist in
+    `aie.iron.runtime.dmataskhandle`, so the remedy the diagnostic names is
+    reachable from iron — but it is behind the hang, not in front of it.
+
+**The verified context ceiling is 191 positions.** Better than the 32 it was
+before this session's multi-tile work, and far short of the 641 FLM was measured
+at. The seq-191 timing (~54.5 tok/s, ~-9%) stands as the deepest real context
+this design has run.
