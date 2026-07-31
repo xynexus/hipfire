@@ -7321,3 +7321,43 @@ Next is the explicit-buffer overload, which takes codes and scales as separate
 arguments and so sidesteps packing entirely: feed known codes and known scales,
 see what comes back. `buffer<T>` exports ctor/data/size/resize for uint, int and
 bfloat16, so it is constructible exactly as `bytes` was.
+
+## 2026-07-31 — the q4 decode contract, established by controlled experiment
+
+The explicit-buffer overload takes codes and scales as separate arguments, so
+the packing question can be sidestepped: feed known scales and known codes, read
+what comes back. `tools/npu/flm/q4nx_contract_probe.py`.
+
+With all scales 1.0 and codes a repeating 0..15 ramp, the output is
+**exactly `[0 1 2 ... 15]`, in order**. So:
+
+    out[i] = scale[i / 32] * code[i]
+
+  - one bf16 scale per 32 elements;
+  - **plain low-nibble-first order** — byte j holds element 2j in its low nibble,
+    2j+1 in its high. That is exactly what `q4nx.pack_tile` already emits, so our
+    kernel's nibble order is now **confirmed against FLM's own decoder** instead
+    of assumed. That assumption has sat unverified since the beginning;
+  - no min/offset applied by this function;
+  - no reordering — output index equals element index.
+
+`buffer<T>` layout, recovered by constructing one and dumping the slab:
+`+0 vptr, +8 data, +16 data, +24 byte-size`, with `size() = bytes / sizeof T`.
+`buffer<float>` exports no ctor but `buffer<unsigned int>` has the same element
+size, so one built with the uint ctor serves.
+
+This also explains the earlier confusion cleanly. The bytes& overload's output
+was never `d*code` over *my* assumed row layout, because the row layout is what
+is wrong — the arithmetic was right all along.
+
+### Still open: the row layout, with a concrete lead
+
+Four natural layouts ([d][m][codes] and permutations) all fail to reproduce the
+ramp through the bytes& overload; each returns a **constant** first 8 values, so
+the codes are not where any of them put them.
+
+The lead is a library constant: `(anonymous namespace)::group_size_bytes =
+40960 = 8 * 5120`. **The reorder operates on groups of eight rows, not one.**
+`Dequant::reorder_cpy(u8*, buffer<u8>&, quant_block_t, int, int, int, int)`
+taking four trailing ints is consistent with a blocked transpose over such a
+group — which would also explain why every single-row hypothesis fails.
