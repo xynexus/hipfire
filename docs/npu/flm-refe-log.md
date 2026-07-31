@@ -8946,3 +8946,31 @@ Options, none yet measured:
     single-consumer fifo per core instead of a split pair halves it;
   * **shrink the broadcast.** `bc_ty` is 4224 elements to hold q′ for 32 heads;
     P3/P4/P5 need only 2*K_DIM. A per-phase fifo would cost routing.
+
+### Two of the three data-memory options are dead; the operand size is the lever
+
+Tried to measure the allocation directly first — it is **not** in the cached
+`aie.mlir`, which is pre-allocation; the map only appears in the failure warning.
+So the options were costed instead:
+
+| option | effect | verdict |
+|---|---|---|
+| smaller operand (NROWS 16→8) | 41088 → 20608 B, 63% → 31% | **the lever** |
+| per-core fifo, not a split pair | halves the buffer | **dead** — 16 fifos not 8, so 17 shim inputs against 16 |
+| smaller broadcast | 4224 → 4096 elements | **dead** — saves 256 B, and q′ needs all 32 heads anyway |
+
+    NROWS=16: tile 20544 B -> 2/core = 41088 B  63%
+    NROWS= 8: tile 10304 B -> 2/core = 20608 B  31%
+    NROWS= 4: tile  5184 B -> 2/core = 10368 B  16%
+
+**Halving NROWS frees 20 KB of the 64** — far more than P4 needs. But the operand
+is the layer's *universal* object: every phase's tiles ride the same fifo, so
+NROWS cannot be changed for P4 alone. It is a change to the tile shape everywhere,
+and NROWS=16 was chosen for GEMV efficiency, so the cost is a throughput question
+rather than a correctness one.
+
+That reframes the blocker usefully. It is not "P4 does not fit" but "the universal
+operand is sized for program-memory sharing and is too big for data memory" — the
+two ceilings I noted pulling against each other, with a concrete knob between
+them. Whether NROWS=8 costs measurable throughput is answerable with
+`gemv_bench.py`, which already sweeps NROWS, before touching the layer at all.
