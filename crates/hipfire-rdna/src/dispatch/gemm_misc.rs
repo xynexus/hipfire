@@ -1324,6 +1324,168 @@ impl Gpu {
         }
     }
 
+    /// bf16-OUTPUT variant of `gemm_oq4_grouped_wmma` (output-memory-lever probe).
+    /// Identical iu4 compute; writes Y as bf16 (uint16, [B,M]) to halve the output
+    /// write. `y_bf16` must be a Raw/u16 buffer of `batch_size * m * 2` bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq4_grouped_wmma_bf16out(
+        &mut self,
+        w_i4: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_i4: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_bf16: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % group, 0, "gemm_oq4_grouped_wmma_bf16out: K % group");
+        assert_eq!(group % 16, 0, "gemm_oq4_grouped_wmma_bf16out: group % 16");
+        self.ensure_kernel(
+            "gemm_oq4_grouped_wmma_bf16out",
+            kernels::GEMM_OQ4_GROUPED_WMMA_BF16OUT_SRC,
+            "gemm_oq4_grouped_wmma_bf16out",
+        )?;
+        let wp = w_i4.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xp = x_i4.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let yp = y_bf16.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &wsp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_b = ((batch_size + 15) / 16) as u32;
+        let func = &self.functions["gemm_oq4_grouped_wmma_bf16out"];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// LDS-staged, double-buffered, register-super-tiled optimization of
+    /// [`Self::gemm_oq4_grouped_wmma`] — identical contract and bit-exact per-group
+    /// f32 accumulation, ~MMQ-class throughput. Block tile BM=64 × BN=128, 8 wave32
+    /// waves. Requires `k % 64 == 0`, `group % 64 == 0`, `group % 16 == 0`,
+    /// `k % group == 0`. Parity: `parity_gemm_oq4_grouped_wmma_lds`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq4_grouped_wmma_lds(
+        &mut self,
+        w_i4: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_i4: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.gemm_oq4_grouped_wmma_lds_impl(
+            w_i4, w_scales, x_i4, x_scales, y_f32, m, k, batch_size, group, false,
+        )
+    }
+
+    /// bf16-output variant of [`Self::gemm_oq4_grouped_wmma_lds`] (output-memory
+    /// lever: halves the f32 output write, the dominant traffic term at prefill
+    /// shapes). `y_bf16` must be a Raw/u16 buffer of `batch_size * m * 2` bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq4_grouped_wmma_lds_bf16out(
+        &mut self,
+        w_i4: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_i4: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_bf16: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+    ) -> HipResult<()> {
+        self.gemm_oq4_grouped_wmma_lds_impl(
+            w_i4, w_scales, x_i4, x_scales, y_bf16, m, k, batch_size, group, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_oq4_grouped_wmma_lds_impl(
+        &mut self,
+        w_i4: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_i4: &GpuTensor,
+        x_scales: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+        bf16: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % 64, 0, "gemm_oq4_grouped_wmma_lds: K must be a multiple of 64");
+        assert_eq!(group % 64, 0, "gemm_oq4_grouped_wmma_lds: group must be a multiple of 64");
+        assert_eq!(k % group, 0, "gemm_oq4_grouped_wmma_lds: K must be a multiple of group");
+        let (entry, src) = if bf16 {
+            ("gemm_oq4_grouped_wmma_lds_bf16out", kernels::GEMM_OQ4_GROUPED_WMMA_LDS_SRC)
+        } else {
+            ("gemm_oq4_grouped_wmma_lds", kernels::GEMM_OQ4_GROUPED_WMMA_LDS_SRC)
+        };
+        self.ensure_kernel(entry, src, entry)?;
+        let wp = w_i4.buf.as_ptr();
+        let wsp = w_scales.buf.as_ptr();
+        let xp = x_i4.buf.as_ptr();
+        let xsp = x_scales.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut gi = group as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &wsp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xsp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut gi as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 63) / 64) as u32; // BM = 64
+        let grid_b = ((batch_size + 127) / 128) as u32; // BN = 128
+        let func = &self.functions[entry];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_m, grid_b, 1],
+                [256, 1, 1], // 8 wave32 waves
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// OQ4+ batched prefill: W4A16 grouped GEMM. `x_f32` is the f32
     /// FWHT(+AWQ)-rotated activation batch [B,K]; it is converted to f16 once
     /// and the 4-bit-resident weight is dequantized to f16 inline.

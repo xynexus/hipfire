@@ -405,6 +405,22 @@ fn wan_qwen_image_decoder_smooth_latent_is_smooth() {
         other => panic!("decode shape {other:?}"),
     };
     assert_eq!((b, c), (1, 3));
+    // Debug: HIPFIRE_TEST_SAVE_PNG=<path> writes the CPU-decoded image so we can
+    // eyeball whether the CPU decode path is clean vs the grainy GPU render.
+    if let Ok(png) = std::env::var("HIPFIRE_TEST_SAVE_PNG") {
+        if !png.is_empty() {
+            let rgb = crate::rgb_tensor_to_u8(&out).unwrap();
+            image::save_buffer(
+                &png,
+                &rgb.data,
+                rgb.width as u32,
+                rgb.height as u32,
+                image::ColorType::Rgb8,
+            )
+            .unwrap();
+            eprintln!("[test] saved CPU-decoded PNG -> {png}");
+        }
+    }
     // Mean absolute horizontal neighbor difference (smoothness); [-1,1] pixels.
     let mut acc = 0.0f64;
     let mut n = 0usize;

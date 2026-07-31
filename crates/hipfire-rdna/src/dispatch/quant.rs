@@ -662,7 +662,16 @@ impl Gpu {
         };
         self.quantize_act_oq4(x_rot, &xq, &xs, n, k, GROUP)?;
         let ws = w_combined.sub_offset(m * (k / 2), m * ng * 4);
-        self.gemm_oq4_grouped_wmma(w_combined, &ws, &xq, &xs, y, m, k, n, GROUP)
+        // For prefill-sized batches, the LDS-staged kernel is bit-identical to the
+        // zero-LDS original but ~1.8× faster (beats W4A8-MMQ; see the A3 gate in
+        // docs/plans/2026-07-30-oq4-w4a4-near-lossless.md §9). It needs K%64==0
+        // (group=256 guarantees it) and a full BN=128 N-tile to be worth it, so the
+        // original stays for decode/small batches. Bit-exact ⇒ no correctness risk.
+        if n >= 128 {
+            self.gemm_oq4_grouped_wmma_lds(w_combined, &ws, &xq, &xs, y, m, k, n, GROUP)
+        } else {
+            self.gemm_oq4_grouped_wmma(w_combined, &ws, &xq, &xs, y, m, k, n, GROUP)
+        }
     }
 
     /// Batched W4A4 oq4 GEMM with residual add: `residual[N×M] += W·x_rot`.

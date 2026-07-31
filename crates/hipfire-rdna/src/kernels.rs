@@ -4083,6 +4083,15 @@ pub const GEMM_W3A4_I32_WMMA_LDS_SRC: &str =
 /// gfx1103 wave32, zero LDS. See `kernels/src/gemm_oq4_grouped_wmma.hip`.
 pub const GEMM_OQ4_GROUPED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq4_grouped_wmma.hip");
+pub const GEMM_OQ4_GROUPED_WMMA_BF16OUT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq4_grouped_wmma_bf16out.hip");
+/// LDS-staged, double-buffered, register-super-tiled optimization of
+/// `gemm_oq4_grouped_wmma` (same bit-exact per-group f32 accumulation). Provides
+/// both `gemm_oq4_grouped_wmma_lds` (f32 out) and `gemm_oq4_grouped_wmma_lds_bf16out`
+/// (bf16 out). gfx1103 wave32, BM64×BN128 block tile. K%64==0, group%64==0.
+/// See `kernels/src/gemm_oq4_grouped_wmma_lds.hip`.
+pub const GEMM_OQ4_GROUPED_WMMA_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq4_grouped_wmma_lds.hip");
 
 /// OQ4+ batched PREFILL: W4A16 grouped GEMM (4-bit-resident weight dequantized
 /// to f16 inline, f16×f16 WMMA against full-precision f16 activations). The
