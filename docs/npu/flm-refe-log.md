@@ -10670,3 +10670,39 @@ was the thing not to do.
 
 The check now reports a number and refuses to pretend it is a verdict. Finding
 the actual mechanism is open work.
+
+### Third normalizer tested, third one that does not explain it
+
+`worst` is a MAX error and I had been dividing it by `mean|ref|` — comparing a max
+to a mean, which is not a relative error at all. That mismatch was real, so
+max|ref| was worth testing:
+
+    config      err/ULP(max|V|)   err/ULP(max|ref|)   max|ref|
+    L0  seq 9   1.61              5.29                0.2871
+    L0  seq 31  0.74              3.98                0.2228
+    L0  seq 63  0.43              4.72                0.1237
+    L15 seq 9   2.32              6.54                0.8474
+    L15 seq 31  1.00              9.32                0.2552
+    L15 seq 63  0.90              12.36               0.1744
+
+Spread: max|V| 5.4x, max|ref| **3.1x**. Better, and now dimensionally honest —
+but still not a floor. And it fails differently: flat-ish across sequence at
+layer 0 (5.29 / 3.98 / 4.72) while rising steadily at layer 15
+(6.54 / 9.32 / 12.36).
+
+The absolute errors say something odd on their own: they DECREASE with sequence
+length (L0: 5.93e-03, 3.46e-03, 2.28e-03), which accumulation error should not do
+as terms are added. What shrinks alongside is the output magnitude — max|ref|
+drops 0.287 -> 0.124 as the softmax flattens over more positions. At layer 15 the
+output drops similarly but the error stalls around 8e-03, which is roughly 0.9 ULP
+of that layer's max|V| = 2.39.
+
+That shape suggests two terms — something proportional to output magnitude plus
+an absolute floor tied to max|V| — but a two-term model fitted to six points is
+the same trap as the product was last entry, and it does not fit L0/seq63 anyway.
+**Not adopting it.**
+
+Both ratios are now printed every run. Stopping the guess-a-normalizer approach
+here: three have been tried and each fails on a different axis. Getting this right
+means modelling the kernel's actual arithmetic — the exp2 NLF's precision and the
+online rescale, in host bf16 — not searching for a lucky denominator.

@@ -957,7 +957,7 @@ def main():
     print(f"P1 -> P2 in one dispatch: seq {o.seq} (P1 appends at pos {pos}), "
           f"{nobj} KV objects, npad {npad}")
     worst, scale = 0.0, 0.0
-    pmax = spread = 0.0
+    pmax = spread = omax = 0.0
     nres = rmag = 0.0
     vmax = vmean = 0.0
     for a in range(NATT):
@@ -976,6 +976,10 @@ def main():
                .reshape(apairs, 2, GQA, HEAD)[a // 2, a % 2])
         worst = max(worst, np.abs(got - want).max())
         scale = max(scale, np.abs(want).mean())
+        # max|ref|, because `worst` is a MAX error -- dividing a max by a
+        # mean is not a relative error, and that mismatch may be the whole
+        # reason the 'floor' looked config-dependent.
+        omax = max(omax, np.abs(want).max())
         # How SHARP is this head's softmax? The exp2 NLF is a piecewise LUT, so
         # its relative error is worst where the distribution concentrates: a
         # near-one-hot softmax puts the whole output on a few v rows and the
@@ -1020,7 +1024,8 @@ def main():
             print(f"  DIAG if it missed pos {pos}: err "
                   f"{np.abs(got[0] - w0[0]).max():.3e}")
     print(f"  softmax: max weight {pmax:.4f}   max logit spread {spread:.2f}   rescales {nres:.0f}  total rescale {rmag:.2f}")
-    print(f"  attention floor: {worst / max(vmax, 1e-9) / 2**-8:.2f} ULP of max|V|  (envelope 2.00, empirical)")
+    print(f"  attention floor: {worst / max(vmax, 1e-9) / 2**-8:.2f} ULP of max|V|   |   {worst / max(omax, 1e-9) / 2**-8:.2f} ULP of max|ref| "
+          f"(max|ref| {omax:.4f})")
     print(f"  V range: max|V| {vmax:.4f}  mean|V| {vmean:.4f}  ratio {vmax / max(vmean, 1e-9):.1f}")
     # The floor is ONE bf16 ULP at the scale of the largest v the accumulator
     # ever holds -- not the exp2 NLF, and not proportional to mean|ref|.
