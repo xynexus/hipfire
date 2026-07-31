@@ -9442,3 +9442,42 @@ loop structure — per-phase broadcast acquire, an `flm_asum_prepare`, a `range_
 over tiles with acquire/release — repeated five times with different kernels
 inside. Folding two phases into one loop would remove one copy of that structure,
 which is the only lever left that does not cost throughput.
+
+### Folding is blocked too — every phase has a different activation
+
+| phase | activation | prepare |
+|---|---|---|
+| P1 | x, RMSNormed | `flm_norm_prepare` |
+| P2 | q′ broadcast + KV stream | none |
+| P3 | attention output | `flm_asum_prepare` |
+| P4 | h | `flm_asum_prepare` |
+| P5 | sw, in 4 chunks | `flm_asum_prepare` ×4 |
+
+A phase body **is** its activation: acquire the broadcast, prepare `g_asum` for
+it, loop over tiles. Two phases cannot share one body because they acquire
+different things. So the ~3950 B per phase is not compressible by folding, and
+the last lever that did not cost throughput is gone.
+
+### Where Task 7 actually stands
+
+Measured, not estimated:
+
+  * every phase is verified, and **four of five chain correctly in one dispatch**
+    (P1→P2→P3→P4, all exact or at the exp2 floor);
+  * a core holds **four phase bodies**, not five — 2848 B fixed plus ~3950 B each;
+  * the FFN is core-bound, so it cannot give up cores (8 costs +465 µs/layer) and
+    12 does not tile;
+  * therefore P1 and P2 cannot share a core with P3+P4+P5, and the layer needs
+    **two dispatches**;
+  * two dispatches is +2.7–2.9 ms/token: 15.47 → ~18.2 ms, **~55 tok/s**, against
+    FLM's measured 59.86.
+
+**This decomposition tops out below FLM.** Not because any phase is slow — the
+per-phase numbers are good, the FFN runs at 97.5% of its ceiling and the GEMV at
+1.06× FLM's decode bandwidth — but because five phases do not fit on a core and
+the dispatch overhead of splitting them costs more than the phases save.
+
+Beating FLM from here needs a *different decomposition*, not tuning: fewer,
+larger phases so that a layer is two or three bodies rather than five. That is a
+design question rather than an implementation one, and it is where the work
+should go next.
