@@ -7796,3 +7796,33 @@ measured at 62.0 tok/s against FLM's 59.86**, and it now runs.
 
 Task 7's blocker is gone. Every phase verifies, the seam works, and the
 attention width that the projection needs is reachable.
+
+### P1→P2 measured in-chain — and two corrections to how I read NATT
+
+`p1p2_chain.py --bench` (added this tick):
+
+    4.03 MB  22.4 GB/s  179.7 us (marginal 86.8, 16-core ideal 71.9)   82.8% of ceiling
+
+Two things this does **not** say, both of which I nearly reported:
+
+  1. **It is not a P1+P2 seam cost at realistic scale.** At seq 31 the KV stream
+     is 0.082 MB against 1.00 MB of P1 weights — **P2 is 7.6% of the bytes**. So
+     86.8 µs is essentially P1's in-chain cost, and P2's real contribution still
+     comes from `attn_phase` (58.1 µs, 4 cores, matched volume).
+  2. **NATT=4 covers 4 of the model's 8 KV heads, not all of them.** The
+     "NATT=4 is enough" conclusion holds only with each core taking *two* KV
+     groups — which is exactly what the 58.1 µs measurement models, so the
+     projection was already consistent. But the chain as it runs today is half a
+     layer's attention, and calling it "the attention width the projection needs"
+     without that qualification would have been wrong.
+
+The useful number: **P1 in-chain costs 86.8 µs against 78.6 assumed — 10%
+worse.** Folding that in with the measured P2:
+
+    projection as published      token 15.61 ms -> 64.1 tok/s
+    with P1 measured in-chain    token 16.27 ms -> 61.5 tok/s
+
+Still clears FLM's 59.86, but the margin is **+2.7%**, not the +7% the earlier
+figures implied. Every remaining unmeasured component now sits inside that
+margin, so P3–P5 assembly is where it will be won or lost rather than a
+formality.

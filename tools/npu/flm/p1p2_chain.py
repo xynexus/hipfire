@@ -74,6 +74,7 @@ from p1_route import NQ, NK, NV, NCORES, HPC, heads_of, rnd  # noqa: E402
 import aie.iron as iron  # noqa: E402
 from aie.iron import In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker  # noqa: E402
 from aie.iron.controlflow import range_  # noqa: E402
+from aie.utils.benchmark import run_iters  # noqa: E402
 from aie.iron.device import AnyShimTile  # noqa: E402
 from aie.iron.kernel import ExternalFunction  # noqa: E402
 from ml_dtypes import bfloat16  # noqa: E402
@@ -328,6 +329,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--layer", type=int, default=0)
+    p.add_argument("--bench", action="store_true",
+                   help="time the P1->P2 pair; the seam's cost is otherwise\n"
+                        "only inferred from P1 and P2 measured apart")
     p.add_argument("--seq", type=int, default=32,
                    help="cache length INCLUDING the token P1 appends")
     o = p.parse_args()
@@ -444,7 +448,13 @@ def main():
         design(bc_t, *w_ts, *q_in, *[host_t] * apairs, *q_ts,
                *[cache_t] * npairs, *a_ts)
     else:
-        design(bc_t, *w_ts, *q_in, *q_ts, *[cache_t] * npairs, *a_ts)
+        _args = (bc_t, *w_ts, *q_in, *q_ts, *[cache_t] * npairs, *a_ts)
+        if o.bench:
+            _b = run_iters(design, *_args, warmup=2, iters=10)
+            _us = _b.npu.min_us if _b.npu else _b.e2e.min_us
+        else:
+            design(*_args)
+            _us = None
 
     # first: did P1 write the cache correctly inside THIS harness?
     cv = cache_t.numpy().view(bfloat16).astype(np.float64).reshape(NATT, SLOT)
@@ -461,6 +471,13 @@ def main():
           f"v' row {pos} + prior rows max err {ve:.4e}")
 
     # ---- reference: attention over the cache INCLUDING P1's appended token --
+    if o.bench and _us is not None:
+        FIXED_US = 92.9
+        p1_b = npairs * 2 * HPC * TPH * q4nx.tile_bytes(K_DIM, NROWS)
+        kv_b = apairs * 2 * OPERAND * nobj
+        mb = (p1_b + kv_b) / 1e6
+        print(f"  bench: {mb:.2f} MB  {mb*1e3/_us:.1f} GB/s  {_us:.1f} us "
+              f"(marginal {_us - FIXED_US:.1f}, 16-core ideal {mb*17.85:.1f})")
     print(f"P1 -> P2 in one dispatch: seq {o.seq} (P1 appends at pos {pos}), "
           f"{nobj} KV objects, npad {npad}")
     worst, scale = 0.0, 0.0
