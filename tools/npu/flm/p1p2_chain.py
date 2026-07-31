@@ -131,6 +131,7 @@ def build(pos, nobj):
     p4tiles = D_FF // (NCORES * NROWS)      # gate/up steps per core
     p4per = OBJ // NROWS                    # steps sharing one result object
     p4objs = p4tiles // p4per               # result objects per core
+    rpp4 = D_FF // (NCORES // 2)            # rows a pair owns
     KTILE, VTILE = HEAD * TSEQ, TSEQ * HEAD
     # One slot per KV head, OPERAND bytes wide — not KVSTRIDE. P2's fill has
     # to deliver whole operand objects, and the fifo side of a transfer is
@@ -164,7 +165,11 @@ def build(pos, nobj):
     w3_ty = np.ndarray[(2 * p3tiles * OPERAND,), np.dtype[np.uint8]]
     h_ty = np.ndarray[(2 * OBJ,), np.dtype[bfloat16]]   # one object per core
     w4_ty = np.ndarray[(2 * 2 * p4tiles * OPERAND,), np.dtype[np.uint8]]
-    sw_ty = np.ndarray[(2 * p4objs * OBJ,), np.dtype[bfloat16]]
+    # ONE row-ordered sw buffer for all pairs. P5 slices it by K-chunk, so it
+    # must be in row order — the per-pair stream is [object][core] and a
+    # pair's cores are rpp4/2 rows apart, which is not ascending. A drain
+    # shapes its destination, so each object goes straight to its row.
+    sw_ty = np.ndarray[(D_FF,), np.dtype[bfloat16]]
     # P1's weights, then P2's q'+KV objects, on the same fifo
     w_all_ty = np.ndarray[(2 * hpc * TPH * wt,), np.dtype[np.uint8]]
     kvin_ty = bc_ty                      # q' rides the broadcast object
@@ -240,7 +245,7 @@ def _design(bc: In, {P}):
                            arg_types=[bc_ty, op_ty, p1o_ty],
                            compile_flags=FLAGS)
 
-    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_n{NROWS}k{KVPER}")
+    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_swrow")
     bc_cons = [f_bc.cons() for _ in range({NCORES})]
     f_w = [ObjectFifo(oppair_ty, name=f"wp{{i}}_n{NROWS}k{KVPER}") for i in range({npairs})]
     w_sub = [f.cons().split([0, {OPERAND}], obj_types=[op_ty, op_ty]) for f in f_w]
@@ -467,7 +472,10 @@ def _design(bc: In, {P}):
         for i in range(n):
             wh[i].fill(w4b[i], group=tg)
         for i in range(n):
-            p1h[i].drain(swb[i], wait=True, group=tg)
+            p1h[i].drain(swb[i], wait=True, group=tg,
+                         offset=i * {rpp4},
+                         sizes=[1, {p4objs}, 2, {OBJ}],
+                         strides=[0, {OBJ}, {rpp4} // 2, 1])
         tg.finish()
 
     at = [bc_ty] + [w_all_ty] * {p1pairs} + [kvin_ty] * {apairs}
@@ -492,7 +500,7 @@ def _design(bc: In, {P}):
               op_ty=op_ty, oppair_ty=oppair_ty, p1o_ty=p1o_ty,
               p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty, attn_all_ty=attn_all_ty, w3_ty=w3_ty, h_ty=h_ty, p3tiles=p3tiles,
               w4_ty=w4_ty, sw_ty=sw_ty, p4tiles=p4tiles,
-              p4per=p4per, p4objs=p4objs,
+              p4per=p4per, p4objs=p4objs, rpp4=rpp4, D_FF=D_FF,
               w_all_ty=w_all_ty, kvin_ty=kvin_ty, q_tys=q_tys,
               cache_ty=cache_ty, SKIP_P1=SKIP_P1, HOSTKV=HOSTKV,
               PREP=PREP, PREPSRC=PREPSRC,
@@ -751,8 +759,8 @@ def main():
         b = np.empty((2 * p4tiles, 2, wt), np.uint8)
         b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
         w4.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
-    sw_ts = [iron.zeros(2 * p4objs * 2 * HEAD, dtype=bfloat16, device="npu")
-             for _ in range(npairs)]
+    sw_all = iron.zeros(D_FF, dtype=bfloat16, device="npu")
+    sw_ts = [sw_all] * npairs      # every pair scatters into the same buffer
 
     import os as _oh
     if _oh.environ.get("CHAIN_HOST_KV"):
@@ -844,14 +852,9 @@ def main():
                                 oc[r0:r0+NROWS, :nbc3])
                         alt[r0:r0+NROWS] = rnd(g + x[r0:r0+NROWS])
             print(f"    DIAG vs {nm:18s}: max err {np.abs(got_h - alt[h_idx]).max():.4e}")
-    got_sw = np.concatenate([t.numpy().astype(np.float64) for t in sw_ts])
+    got_sw = sw_all.numpy().astype(np.float64)   # already row-ordered
     # stream order is [object][core], each object carrying OBJ contiguous rows
-    sw_idx = np.concatenate([np.arange(pr * rpp4 + j * (rpp4 // 2) + ob * 2 * HEAD,
-                                       pr * rpp4 + j * (rpp4 // 2) + (ob + 1) * 2 * HEAD)
-                             for pr in range(npairs)
-                             for ob in range(p4objs)
-                             for j in (0, 1)])
-    e4 = np.abs(got_sw - sw_ref[sw_idx]).max()
+    e4 = np.abs(got_sw - sw_ref).max()
     print(f"  P4 sw     : max err {e4:.4e}  mean|ref| {np.abs(sw_ref).mean():.5f}")
     print(f"P1 -> P2 in one dispatch: seq {o.seq} (P1 appends at pos {pos}), "
           f"{nobj} KV objects, npad {npad}")

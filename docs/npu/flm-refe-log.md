@@ -10015,3 +10015,29 @@ offsets the same way.
 So the caveat is a concrete piece of work rather than a formality, and it is
 side A's drain rather than anything about crossing a dispatch boundary. Worth
 having checked: "expected to work" would have been wrong.
+
+### The `sw` handoff closed: side A now emits the layout side B reads
+
+Side A's P4 drain scatters each result object straight to its row:
+
+    offset = pair * rpp4,  sizes = [1, p4objs, 2, OBJ],
+    strides = [0, OBJ, rpp4/2, 1]
+
+so all eight pairs write into **one row-ordered `sw` buffer** of D_FF elements —
+exactly what side B slices by K-chunk. The host check simplifies from an index
+permutation to an identity comparison, which is its own small confirmation that
+the layout is now the natural one.
+
+Unchanged and still exact: P4 `sw` 2.4414e-04 at seq 31 and 17, 3.6621e-04 at
+seq 9; P3 `h` 9.5367e-07; attention 3.4631e-03.
+
+    side A with the row-ordered drain   626.0 µs   (was 638.9, ranges overlap)
+    side B (P5)                         266.0 µs
+    layer                               892.0 µs -> token 17.96 ms -> **55.7 tok/s**
+    FLM at matched context 58.83                                      **−5.3%**
+
+**Both caveats on the measured layer are now closed**: core statics persist
+across dispatches (so P5's residual carries), and the two designs share a
+compatible `sw` buffer (so the handoff needs no host intervention). What remains
+is running them back to back in one script, which is orchestration rather than
+design.
