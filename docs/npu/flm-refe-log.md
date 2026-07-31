@@ -3486,3 +3486,40 @@ compile-time gate on a mechanism that hits a firmware ceiling at 20 regardless.
 `amdxdna_ctx.h` is an opcode value and a coincidence. The ERT command packet's
 size, or XRT's per-kernel argument binding, is the place to look — but the design
 conclusion above does not depend on the answer.
+
+### The 20-BO wall is a firmware limit the driver does not validate
+
+Chased where 20 comes from. Not pyxrt — `pyxrt.kernel.__call__(*args)` is
+variadic with no fixed arity. The relevant bound in the driver is:
+
+```c
+#define MAX_DPU_ARGS_SIZE (34 * sizeof(u32))      /* aie2_msg_priv.h:520 */
+...
+if (cmd_len < sizeof(*sn) || arg_sz > MAX_DPU_ARGS_SIZE)
+        return -EINVAL;                            /* aie2_message.c:1037 */
+```
+
+**34 words. But the wall is at 20, and it does not present as `-EINVAL`.**
+
+That mismatch is the interesting part. Had 20 BOs consumed 2 words each (64-bit
+addresses), 20 would be 40 words and the *driver* would have rejected it
+cleanly. It does not — 20 passes and runs. So each arg is one word here, 20 BOs
+is 20 words, comfortably inside the 34-word cap. And 21 BOs is 21 words, **also**
+inside the cap — yet the command is accepted and the DPU then hangs
+(`aie2_tdr_detect: TDR timeout`, `DPU PC 0xffffffff`, `TXN OP ID 0xffffffff`).
+
+**So the driver validates a bound the firmware does not actually honour.** The
+documented capacity is 34 args; the firmware copes with 20. Exceeding the real
+limit produces a device hang rather than a rejected ioctl, which is why this
+looked like a mysterious runtime failure rather than a limit being hit — nothing
+in the software stack says no.
+
+Worth reporting upstream: a driver-side check that is looser than the hardware's
+real capacity turns a clean `-EINVAL` into a TDR timeout and a wedged context.
+
+**This does not change the phase-2 conclusion, it sharpens it.** Binding bulk
+buffers as kernel arguments is capped somewhere in the low 20s with no clean
+error at the boundary. FLM's approach — 5 declared kernel args plus a `DDR_PATCH`
+table for the other 45 — is not merely a different style; it is the only route to
+50 buffers on this firmware, and it also stays far inside the args-size bound
+that the kernel-argument path silently overruns.
