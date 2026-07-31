@@ -1232,6 +1232,51 @@ impl Gpu {
         result
     }
 
+    /// Software-pipelined (prefetched) variant of [`Self::gemm_bf16_tiled_wmma`].
+    /// `entry` selects the tile/prefetch combo (`gemm_bf16_pf_{4x4_x,4x4_a,4x4_both,
+    /// 4x2_both,2x2_both}`); `mb`/`nb` must match the entry's tiling for the grid.
+    /// Bit-exact to the corresponding `gemm_bf16_tiled_wmma_<mb>x<nb>`; chases the
+    /// dependent-load stall the free-ALU probe exposed (plan §12c). `k % 32 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_tiled_wmma_pf(
+        &mut self,
+        entry: &str,
+        a_bf16: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        mb: usize,
+        nb: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(a_bf16.dtype, DType::BF16, "gemm_bf16_tiled_wmma_pf: weights BF16");
+        assert_eq!(k % 32, 0, "gemm_bf16_tiled_wmma_pf: K must be a multiple of 32");
+        self.ensure_kernel(entry, kernels::GEMM_BF16_TILED_WMMA_PF_SRC, entry)?;
+        let ap = a_bf16.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x_f32, batch_size * k)?;
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let grid_m = m.div_ceil(16 * mb) as u32;
+        let grid_b = batch_size.div_ceil(16 * nb) as u32;
+        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_bf16_tiled_wmma_pf", bytes);
+        let result = self.launch_kernargs(
+            entry,
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// DIAGNOSTIC-ONLY compute-headroom probe. Runs the register-tiled 4x4 bf16
     /// GEMM with `entry` = `gemm_bf16_alu{0,64,128,256,512,1024,2048}`, i.e. the
     /// production kernel plus N side FMAs per K-step. Sweeping `entry` and finding

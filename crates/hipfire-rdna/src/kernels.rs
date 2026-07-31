@@ -4016,6 +4016,13 @@ pub const BENCH_BF16_LDS_FREEALU_SRC: &str =
 /// `kernels/src/bench_bf16_alu_headroom.hip`.
 pub const BENCH_BF16_ALU_HEADROOM_SRC: &str =
     include_str!("../../../kernels/src/bench_bf16_alu_headroom.hip");
+/// Software-pipelined (prefetched) variants of `gemm_bf16_tiled_wmma` — same math
+/// and WMMA order, so bit-exact, but the next K-step's fragments are loaded before
+/// the current step's WMMAs so global-load latency overlaps the matrix core.
+/// Chases the ~15% stall the free-ALU probe exposed (plan §12c). K % 32 == 0. See
+/// `kernels/src/gemm_bf16_tiled_wmma_pf.hip`.
+pub const GEMM_BF16_TILED_WMMA_PF_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_tiled_wmma_pf.hip");
 
 /// Register-tiled, zero-LDS unified Opus-Quant W4A8 / W8A8 GEMM (gfx1103/RDNA3):
 /// dynamic-int8 activation × iu8 WMMA, weight fetched as int8 (W8) or unpacked

@@ -1150,3 +1150,51 @@ stands (gather/trellis is NOT free; arithmetic is), and the margin for the arith
 much larger than §12a suggested. Sequence: (1) take the free ~15% scheduling win, (2) build
 int4-weight + arithmetic dequant + register low-rank correction on the register-tiled shape,
 (3) gate quality on a grain-free DiT (§10/§D3).
+
+### 12d. The ~15% is REAL and now SHIPPED — software-pipelined prefetch (2026-07-31)
+
+§12c predicted that if injecting *any* independent work speeds the kernel up, the principled
+fix is to prefetch the next K-step's fragments so the dependent global-load latency overlaps
+the WMMAs. Built and confirmed: `kernels/src/gemm_bf16_tiled_wmma_pf.hip` (+ dispatch
+`gemm_bf16_tiled_wmma_pf`, sweep `examples/bench_bf16_prefetch.rs`). **All variants are
+BIT-EXACT to `gemm_bf16_tiled_wmma_4x4`** (max_abs=0 — same WMMA order and f32 accumulation).
+
+**Variant sweep (attn M6144 K6144 N=2048), control-verified order-independent:**
+
+| variant | ms | %peak | vs production |
+|---|---|---|---|
+| tiled_4x4 (production) | 96.66 | 9.6% | — |
+| **pf_4x4_x** (prefetch X only) | **89.40** | 10.4% | **1.08×** |
+| pf_4x4_a (prefetch A only) | 90.32 | 10.3% | 1.07× |
+| pf_4x4_both | 134.62 | 6.9% | 0.72× |
+| pf_4x2_both / pf_2x2_both | 158.0 / 159.6 | 5.9% | 0.61× |
+
+**Prefetching ONE operand wins; prefetching BOTH backfires** — exactly the VGPR budget
+predicted in the kernel header: acc(128) + frags(64) + both-prefetch(64) = 256 VGPRs ⇒ spill.
+The smaller tiles lose more to reduced fragment reuse than they gain from prefetch.
+
+**pf_4x4_x across all Krea-2 DiT shapes — wins twice, never regresses:**
+
+| shape | tiled ms | pf_x ms | speedup |
+|---|---|---|---|
+| attn q/o/gate M6144 K6144 | 93.37 | 76.91 | **1.21×** |
+| attn kv (GQA) M1536 K6144 | 14.70 | 14.60 | 1.01× |
+| ffn gate/up M16384 K6144 | 235.65 | 201.46 | **1.17×** |
+| ffn down M6144 K16384 | 256.07 | 255.56 | 1.00× |
+
+Weighted over one DiT block's linears that is **~1.13× on GEMM time ⇒ ~1.11× on the warm
+step** (warm step is ~90% GEMM). Contrast §12's LDS attempt, which regressed GQA 0.69× and was
+therefore never wired: this one is bit-exact AND monotone-safe, so it **is** wired —
+`gpu_ops.rs` routes the DiT bf16 linear to `gemm_bf16_pf_4x4_x` when `K % 32 == 0`, with
+`HIPFIRE_DIFFUSION_PF_GEMM=0` to opt out.
+
+**Why the two neutrals:** GQA (M=1536) already ran at the best efficiency (16.5% of peak), so
+there was less stall to recover; ffn-down's K=16384 activation stream (64 MB) likely outruns a
+one-step-ahead prefetch. Deeper prefetch (2 steps) is bounded by the same VGPR wall — the next
+lever there is the wave64 shape (4 acc VGPRs/tile instead of 8), which would free exactly the
+registers this experiment ran out of.
+
+**Status: D1 delivers a real, shipped, bit-exact ~1.11× DiT warm-step win** — the "register-
+tiled is near-achievable" conclusion in §12 was wrong; it was leaving ~15% on the table to a
+scheduling stall. Remaining D1 headroom (10%→~40% of peak) still needs the hard wave64 deep-ILP
+work; the accessible 2× remains int4-act (§12b: arithmetic decode fits the free budget).

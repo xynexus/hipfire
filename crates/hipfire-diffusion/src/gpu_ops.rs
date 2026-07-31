@@ -2574,7 +2574,29 @@ pub(crate) fn linear_resident_weight_resident(
                 .ok()
                 .as_deref()
                 != Some("0");
-        if use_tiled {
+        // Software-pipelined variant: prefetching the NEXT K-step's X fragments
+        // before issuing this step's WMMAs overlaps the dependent global-load
+        // latency that stalls the register-tiled kernel (~10% of peak). BIT-EXACT
+        // to gemm_bf16_tiled_wmma_4x4 (same WMMA order/accumulation), and measured
+        // 1.21x / 1.17x on the attn and ffn-gate/up shapes with no regression on
+        // GQA or ffn-down (~1.13x on DiT GEMM time). Needs K % 32 == 0 (Krea-2 DiT
+        // K = 6144 / 16384). Opt out with HIPFIRE_DIFFUSION_PF_GEMM=0. Plan §12d.
+        let use_pf = in_features % 32 == 0
+            && std::env::var("HIPFIRE_DIFFUSION_PF_GEMM").ok().as_deref() != Some("0");
+        if use_tiled && use_pf {
+            gpu.gemm_bf16_tiled_wmma_pf(
+                "gemm_bf16_pf_4x4_x",
+                &weight_view,
+                input,
+                &output,
+                out_features,
+                in_features,
+                rows,
+                4,
+                4,
+            )
+            .map_err(|error| DiffusionError::BackendUnavailable(error.to_string()))?;
+        } else if use_tiled {
             gpu.gemm_bf16_tiled_wmma(
                 &weight_view,
                 input,
