@@ -798,6 +798,18 @@ confirmation render needs the Turbo config (no CFG, likely 1024² via the
 `krea2-turbo-8plus1` preset)** — that is the one owed step; but the authoritative Stream C
 result is C2's config-independent golden-code match + round-trip, which stands on its own.
 
+**Correct-params retry (2026-07-31): IMPRACTICAL on this box — the render runtime is
+CPU-only.** Re-ran at the right Turbo config (cfg 1.0 / no CFG, 1024², seed 42). It ran
+~20 min with **GPU utilization 0%** — `Krea-2-Turbo.source.hfq` uses the
+`cpu-source-reference` runtime (per `hipfire diffusion inspect`: `runtime:
+"cpu-source-reference"`), so `--rocm-device-id 0` does not route the DiT to the GPU. A
+1024², 8-step bf16 DiT on one CPU core is ~an hour+; it was killed as a poor trade for a
+confirmation of an already-settled result. **A visual confirmation isn't cheaply available
+here** — it would need a GPU-runnable Krea-2 `.hfq` (the source-reference artifact runs on
+CPU), or a much faster machine. **Bottom line: the VAE-exoneration conclusion rests
+entirely on C2's config-independent code proof (golden-source match + MSE-1e-4
+round-trip), which needs no render.** The render was only ever belt-and-suspenders.
+
 ## 11. Stream D2 — footprint / cold-load quant win (quantified, 2026-07-31)
 
 Measured on disk: full bf16 pipeline `Krea-2-Turbo.source.hfq` = **33.23 GiB**; the
