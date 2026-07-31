@@ -585,6 +585,13 @@ LDS/pipeline). So the real state is:
     prompt) — the [[krea2-dit-noise-bug]] — and no runnable Flux2 `.hfq` is on disk
     (only a calib). So low-bit-activation *quality* validation on the DiT can't proceed
     until a working DiT exists (fix Krea2 or obtain/convert a Flux2 artifact).
+    **[SUPERSEDED 2026-07-31 — see §10.]** The solid-red-field state belongs to the OLD
+    artifact only (reproduced in `dit.png`, 06:20). The fresh
+    `Krea-2-Turbo.source.hfq` renders a **recognizable composition** — a red apple on a
+    table, `krea_fresh.png` — i.e. the DiT produces correct *structure*; what remains is
+    a chromatic-speckle **grain** layered over it (`krea_8step.png`). So the blocker is
+    no longer "no working DiT" but "grain in the DiT latent" (§10): D3 quality
+    validation needs a grain-free DiT, not a from-scratch fix.
   - **Net:** diffusion is the right regime for low-bit acts (compute-bound, full 2×),
     but the binding lever is an efficient DiT GEMM (bf16 first), then low-bit as the
     multiplier; and the quality path needs a working DiT first. Diffusion low-bit-act
