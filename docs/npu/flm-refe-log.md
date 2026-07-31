@@ -5436,3 +5436,78 @@ Recorded per `AGENTS.md`: a failed approach that narrows the search space. The
 useful residue is that **gate/up's ~15% shortfall against its transfer ceiling
 is arithmetic, and the SwiGLU's `exp2` is the obvious suspect** — the same NLF
 that caps this stage's accuracy at 3.40e-04.
+
+## 2026-07-31 — §1.3 answered, negatively: the quantized reading is NOT the model
+
+`tools/npu/flm/ground_truth.py`. The plan's §1.3 says FLM's weights are
+transformed, so the block->(row,k) mapping is unknown and every verification is
+self-consistency against the same reading of `model.q4nx`; it assumes this
+cannot be settled without `flm run`. That was wrong — `meta-llama/Llama-3.2-1B`
+ships `original/consolidated.00.pth`, the actual trained checkpoint, and it is
+on this machine at `/srv/huggingface`.
+
+**1. The reader and the model are confirmed, bit-exactly.** RMSNorm weights are
+stored unquantized, so they check with no quantization noise at all:
+
+| tensor | bit-exact vs base | bit-exact vs **Instruct** |
+|---|---|---|
+| `layers.0.input_layernorm.weight` | 5.96% | **100.00%** |
+| `layers.0.post_attention_layernorm.weight` | 0.63% | **100.00%** |
+| `model.norm.weight` | 47.22% | **100.00%** |
+
+maxdiff 0.000e+00. So the file structure, the planar `[d][m][codes]` split, the
+tensor naming, and the model identity (**Instruct**, not base) are all right.
+
+**2. The quantized blocks are not the model's blocks.** The sorted 32 values of
+a q4_1 block are invariant to the nibble order `q4nx.py` flags as assumed, so a
+block can be matched against all 524,288 ground-truth blocks with no unknowns
+left. Best-of-all-blocks rms is **0.15** of mean |w| — q4_1's own error is
+~0.03, random is ~1.0 — and the destinations scatter uniformly (753 distinct gt
+rows for 1024 container blocks). Those are best-of-half-a-million coincidences.
+
+**3. No container row holds any ground-truth row's blocks**, under any
+within-row permutation. Matching a gt row's 256 `(m, d)` points against every
+container row's as a set: best 0.0883 vs median 0.1008 for gt row 0, best 0.0816
+vs 0.0961 for row 1, best 0.0929 vs 0.1058 for row 7. Best ~= median is no match.
+
+**4. It is a scaling, not a rotation.** The Frobenius norm is also nibble-order
+invariant (the block's value multiset is fixed however the elements are
+assigned). Every tensor is inflated, and by a *different* factor:
+
+| | down | gate | up | q | k | v | o |
+|---|---|---|---|---|---|---|---|
+| container/gt \|W\|_F | 1.1422 | 1.1289 | 1.1226 | 1.1636 | 1.1939 | 1.1476 | 1.1552 |
+
+An orthogonal transform gives exactly 1.0000; q4_1 error contributes <0.001. A
+1.12-1.19x inflation that varies per tensor is the signature of **per-channel
+(AWQ/SmoothQuant-style) scaling**, folded into the weights with the reciprocal
+presumably folded elsewhere.
+
+### What this does and does not invalidate
+
+- **Throughput is unaffected.** Every GB/s figure is a byte-movement measurement
+  on correctly-sized buffers. 48.1-48.6 GB/s at 16 cores, the 92.9 us dispatch
+  cost, the 6.37 us barrier, the down_proj chunking win, today's Task 4
+  falsification — all stand.
+- **The kernels are verified as q4_1 arithmetic**, against a numpy reference
+  over the same bytes, to 1.9e-07. That is a real result about the kernels.
+- **They are NOT verified as computing Llama-3.2-1B-Instruct.** Milestone 4's
+  bar was "numerically equivalent on real weights"; the bytes are real, the
+  arithmetic is right, but the mapping from those bytes to the model's weights
+  is not established, so end-to-end equivalence is not shown. Anywhere that
+  claim appears it should read "equivalent on the container's q4_1 blocks".
+- **RoPE (`-DROPE_INTERLEAVED`, plan Task 5) still cannot be settled**, and this
+  is why. A row-order probe based on RoPE pairing was tried and **discarded**:
+  its v_proj control, which gets no RoPE at all, showed the same "interleaved"
+  signal *more strongly* (5.97x vs 3.62x), so the signal was adjacent-row
+  smoothness, not rotation-plane structure. The pairing argument proves nothing.
+
+Do not try to infer the grouping from the `d` (block range) distribution — a
+random regrouping of the same weights reproduces it about as well as the true
+one. A control built on it was also not reproducible run to run and was removed
+rather than shipped.
+
+**Next, if this is worth chasing:** recover the per-channel scale. If the
+transform is `w'[r,k] = w[r,k] * s_k`, then `s` is recoverable from block
+statistics against ground truth, and it would close §1.3 for real. Until then,
+the only true end-to-end check remains logits vs `flm run`.
