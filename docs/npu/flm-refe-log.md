@@ -8307,3 +8307,39 @@ displace, and the right choice is the one that is big in *code* and small in
 
 That also retires the search for 1904–3072 B of savings: it was only needed to
 put P5 back on the attention cores, and P5 no longer wants to be there.
+
+### Partition B confirmed optimal — and dropping P3 is not even legal
+
+Displacing phase X from the 4 attention cores costs `X/3` (it runs on 12 cores
+instead of 16):
+
+    drop P3:  51.5 us -> +17.2 us/layer
+    drop P1:  58.5 us -> +19.5
+    drop P5: 193.9 us -> +64.6
+    drop P4: 387.7 us -> +129.2
+
+P3 prices marginally cheaper than P1, and `P1+P2+P4+P5` does fit — at **15984 B
+= 98%**, 400 B of headroom, for a gain of 2.3 µs/layer (63.3 → 63.4 tok/s).
+
+**But it is not a legal partition.** `flm_gemv_residual` (P3) *defines*
+`g_resid` and `flm_gemv_flush` (P5) reads it — "written by flm_gemv_residual in
+phase P3, **on this same core**". A core running P5 must have run P3. Dropping
+P3 while keeping P5 would read an unwritten global, which is the silent-wrong
+class of failure this tree has been bitten by twice (the SwiGLU sigmoid, the
+lost global handoff).
+
+So the choice is P1 or P5, and P1 wins on both counts:
+
+| drop | fits at | cost | legal |
+|---|---|---|---|
+| **P1** | **90%** | **+19.5 µs** | yes |
+| P3 | 98% | +17.2 µs | **no** — P5 needs P3's `g_resid` |
+| P5 | 91% | +64.6 µs | yes |
+
+**Partition B is settled**: attention cores run P2+P3+P4+P5 at 90%, the other
+twelve run P1+P3+P4+P5 at 94%, P1 spreads over 12 cores, **63.3 tok/s, +5.7%
+over FLM**. Ten percent of program memory spare on the tighter half, which
+matters because every kernel change to date has grown these images.
+
+The design is now fully specified and every constraint on it is measured. What
+remains is building it.
