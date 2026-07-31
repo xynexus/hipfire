@@ -78,6 +78,22 @@ Per core: **2 in / 1 out DMA channels**, at the hard limit of 2 in with one out 
 | P4 norm2+gate+up+swiglu | `h` | `post_attention_layernorm.weight` |
 | P5 down chunk c (×4) | `swiglu[2048c : 2048c+2048]` | `h` |
 
+**q′ reaches P2 on the OPERAND fifo, not the broadcast — corrected 2026-07-31.**
+The table above used to put q′ in P2's broadcast act half. Two measurements kill
+that: P1's result object is `2*HEAD` per head (only k′ needs the doubled form,
+but a fifo has one object size) and a drain cannot skip source elements, so 32
+q′ heads occupy **8192 B against the broadcast's 4096 B act half**. Giving q′ its
+own fifo is not available either — a core's DMA input channels are allocated over
+the **union of every fifo it ever consumes, not per phase**, which is why
+`ffn_chain` failed with `requires 3 input/2 output DMA channels` when P4 and P5
+had separate weight fifos used in *different* phases. Broadcast + operand is
+already two.
+
+So P2's first operand acquire delivers q′ and the rest deliver KV tiles. Per
+attention core that is 4 heads × 128 bf16 = **1024 B inside a 20544 B object**,
+one object per phase, no extra channel and no repack. `flm_attn_decode.cc` takes
+`-DDIM_QSTRIDE` so it reads the strided block in place.
+
 `cs_q` carries cos/sin **pre-multiplied by `head_dim^-0.5 · log2(e)` = 0.125·1.4427**, so attention's `exp2` needs no pre-scale and the host never touches `q'` mid-dispatch. `cs_k` is the plain table. Both from `rope_freqs.weight` (the stored bf16 llama3 divisor), same table for Q and K.
 
 ### 1.4 Phase schedule, 16 cores, one dispatch per layer
@@ -85,7 +101,7 @@ Per core: **2 in / 1 out DMA channels**, at the hard limit of 2 in with one out 
 | # | phase | cores | prologue | rows/core | tiles/core | epilogue |
 |---|---|---|---|---|---|---|
 | P1 | qkv, K=2048, N=3072 | 16 | `flm_norm_prepare` | 192 | 12 | RoPE per 64-row head |
-| P2 | attention, GQA=4, TSEQ=32 | **8** (pairs 0–3) | `flm_attn_begin` | 2 kv groups/pair | KV tiles | `flm_attn_finish` |
+| P2 | attention, GQA=4, TSEQ=32 | **8** (pairs 0–3) | `flm_attn_begin` | 2 kv groups/pair | **q′ object, then KV tiles** | `flm_attn_finish` |
 | P3 | o_proj, K=2048, N=2048 | 16 | `flm_asum_prepare` | 128 | 8 | `+ aux[row_base+r]` → `h` |
 | P4 | gate+up+SwiGLU, N=8192 | 16 | `flm_norm_prepare` | 512 | 64 (32 pairs) | — |
 | P5 | down, 4×(K=2048, N=2048) | 16 | `flm_asum_prepare` ×4 | 128 | 32 | `+ aux[row_base+r]` on chunk 3 |

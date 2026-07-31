@@ -6757,3 +6757,36 @@ pattern. `ffn_chain`'s P4 scatter, `resid_chain`, `kv_append_probe`,
 `kv_emit_verify` and `qkv_route_probe` all use them as destination walks with a
 linear source, which is correct — and all of them verify, which is the
 independent check.
+
+## 2026-07-31 — q′ must reach P2 on the operand fifo; DMA channels are per-core, not per-phase
+
+Working out the P1→P2 seam turned up a plan correction with two measurements
+behind it.
+
+§1.4 put q′ in P2's **broadcast** act half. It does not fit. P1's result object
+is `2*HEAD` for every head — only k′ needs the doubled form, but a fifo has one
+object size — and a drain cannot skip source elements, so 32 q′ heads are
+**8192 B against a 4096 B act half**.
+
+The obvious alternative, a dedicated q fifo, is not available either:
+
+> **A core's DMA input channels are allocated over the union of every fifo it
+> ever consumes, not per phase.**
+
+That is not a guess. `ffn_chain` gave P4 and P5 their own weight fifos, used in
+strictly different phases, and still failed to place with `tile (0,3) requires 3
+input/2 output DMA channels, but only 2 input/2 output available`. Broadcast plus
+operand already spends both.
+
+**Resolution: P2's first operand acquire carries q′, the rest carry KV tiles.**
+Per attention core that is 4 heads × 128 bf16 = **1024 B inside a 20544 B
+object** — one object for the whole phase, no extra channel, no repack, and
+`-DDIM_QSTRIDE` (added last tick) lets `flm_attn_decode` read the strided block
+in place.
+
+The general shape of this keeps recurring and is worth stating once: **on this
+device you do not add an operand, you pack it into one you already have.** The
+norm weight rides inside the activation, `cs_q`/`cs_k` ride inside the
+broadcast, `npad` rides inside Q, the residual rides in core memory — and now q′
+rides inside the operand stream. Four separate discoveries of the same
+constraint.
