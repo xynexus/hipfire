@@ -10571,3 +10571,33 @@ Also fixed here: `CHAIN_HOST_KV` still assumed a single object
 (`cache.reshape(NATT, SLOT)`) and crashed at any multi-tile sequence. It now
 places the appended token in object `pos // TSEQ` and writes the trailer on every
 object, which is what made the third bisect line above measurable at all.
+
+### Why KV cannot have its own fifo: the core is out of input DMA channels
+
+Last entry I said giving KV a dedicated fifo "runs into the routing wall". That
+was a guess and it was wrong. Building it says something much more specific:
+
+    error: tile (0, 3) requires 3 input/2 output DMA channels,
+           but only 2 input/2 output available
+    note: placer selected this tile; to fix, pin this LTO to a tile with more
+          spare DMA capacity, or reduce the LTO's DMA fanin (e.g. via memtile
+          staging)
+
+**A core tile has 2 input and 2 output DMA channels.** An attention core already
+spends both inputs: one on the broadcast (activation, q', then P3's and P4's
+activations) and one on the weight fifo (KV during P2, then P3 and P4 weights). A
+third input does not exist.
+
+So `wh[n - a + i]` carrying KV was never a choice — the comment "KV tiles on the
+weight fifo" describes a forced move, and the 7-object hang cannot be fixed by
+un-sharing the fifo. That closes the obvious repair.
+
+The compiler names the surviving option: **memtile staging** — route KV through a
+memtile, which has far more DMA channels than a core tile, and let the core see it
+as one stream. That is a real architectural path, not a parameter change, and it
+would also bear on the NATT=8 routing wall for the same reason: both are
+symptoms of a design that has run out of per-core DMA fanin.
+
+Recorded as a closed door with a named alternative, and as a correction: the two
+walls I have been describing as "routing" and "hang" are more likely one
+constraint — DMA fanin — seen from two angles.
