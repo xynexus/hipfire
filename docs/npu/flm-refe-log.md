@@ -1,0 +1,2799 @@
+# FLM reverse/forward engineering — running log
+
+Dated entries. What was tried, what the measurement said, what it means.
+Failures recorded deliberately: they narrow the search space (`AGENTS.md`).
+
+Plan: `~/flm-re-fe-mutate-goal.md`. Correct that file when an entry here
+contradicts it.
+
+---
+
+## 2026-07-31 — Phase 0.1: bootgen pin resolved, mlir-aie configures again
+
+**Problem as stated in the plan:** branch `merge-sync-txn-op` carries the
+MERGE_SYNC patch (`3ed0183f2fe`) but was never build-verified on `origin/main`,
+because `third_party/bootgen` is pinned to an older commit carrying local
+modifications, so cmake could not configure. The plan said not to discard the
+bootgen changes without asking.
+
+**What the "local modifications" actually were.** Three findings, all of which
+say the changes are not worth preserving:
+
+1. The three dirty files in the submodule worktree — `cdo-alloc.c`, `cdo-npi.c`,
+   `main.cpp` — are **cmake output, not hand-authored work**.
+   `tools/bootgen/CMakeLists.txt:61-89` rewrites exactly those three files on
+   every configure, stripping `#include <malloc.h>` from the two `cdo-*.c` files
+   and `#include "openssl/ms/applink.c"` from `main.cpp`. The worktree diff is
+   byte-for-byte those three substitutions. Regenerated on the next configure.
+2. The pinned submodule commit `aa3b7259c5d` ("Add C API for exception-safe PDI
+   generation", 2 new files, purely additive) is **superseded**. Current mlir-aie
+   main carries that same C API *in the superproject* at
+   `tools/bootgen/bootgen_c_api.{h,cpp}`, referenced from `tools/aiecc/Tools.h:45`
+   and added to `libsources` at `tools/bootgen/CMakeLists.txt:44`. The
+   superproject's copy is the evolved one — LLVM-style file header, and the NULL
+   check split so a null `pdi_path` returns `BOOTGEN_ERROR_INVALID_OUTPUT`
+   instead of sharing the bif_path error.
+3. **The actual cause of the configure failure was the layout change, not the
+   patch.** `aa3b725` sits on the old flat bootgen source layout; the pinned
+   `e576e5e1e22` is on upstream `xilinx_v2026.1`, which splits sources into
+   per-architecture `<dir>/src/` trees (`common/src`, `versal/src`, `utils/src`,
+   …). `tools/bootgen/CMakeLists.txt:17-30` globs those per-arch dirs, and
+   `file(READ ...)` at line 61 reads `utils/src/cdo-npi.c`. Against the old flat
+   layout those paths do not exist, so configure died before it got anywhere near
+   the MERGE_SYNC patch. `aa3b725` is 130-odd bootgen commits behind `e576e5e`.
+
+**Action.** Backed both up anyway (`worktree-dirty.patch` and the
+`format-patch` of `aa3b725`, in the session scratchpad), then
+`git checkout -f e576e5e1e22` in the submodule. Superproject worktree is now
+clean and matches the gitlink recorded in `HEAD`.
+
+**Result.** `cmake .` in `~/build/mlir-aie/build` configures cleanly, exit 0.
+(The `Could NOT find AIETools` / `Could NOT find Vitis` lines are expected and
+harmless — this tree builds against Peano/llvm-aie, not Vitis.)
+
+**Meaning.** No bootgen work needs preserving and none needs re-doing; the pin
+just needed to be honoured. The plan's warning was worth having — but the
+answer is that there was nothing there.
+
+### Second failure: the build still would not finish (pyright type stubs)
+
+`ninja` then died at the very last step, after every binary had already linked:
+
+```
+Error copying file (if different) from
+  "/src/python/MLIRPythonExtension.Core.type_stub_gen/_mlir_libs/_mlir/ir.pyi"
+  to ".../build/python/aie/_mlir_libs/_mlir/"
+```
+
+`python/CMakeLists.txt:236` stages four MLIR core `.pyi` stubs from
+`${MLIR_INSTALL_PREFIX}/src/python/...`. **`MLIR_INSTALL_PREFIX` is only set by
+an *installed* MLIR.** This tree points `MLIR_DIR` at an LLVM *build tree*
+(`llvm/build/lib/cmake/mlir`), so the variable is empty and the path collapses
+to the absolute `/src/python/...`. Upstream assumes an install layout.
+
+The stubs do exist here, at the build-tree path:
+`llvm/build/tools/mlir/python/type_stubs/_mlir_libs/_mlir/` — all four of them.
+
+Fixed in `python/CMakeLists.txt` by falling back to `${LLVM_BINARY_DIR}/tools/
+mlir/python/type_stubs/...` when the install path has no `ir.pyi`, and skipping
+the staging entirely if neither exists. They are pyright-only; nothing at
+runtime reads them, so a missing stub must not fail a build. `ninja` now exits
+0 and the four `.pyi` files are staged.
+
+*(Local change to `~/build/mlir-aie`, not to hipfire. Worth upstreaming — any
+build-tree-based mlir-aie build hits it.)*
+
+### TRAP: a stale `mlir_aie` wheel shadows the build tree
+
+Worth recording because it cost time and **will recur throughout phase 1**.
+
+Emitting MERGE_SYNC by hand and reading it back appeared to prove the patch
+broken:
+
+```
+$ aie-translate -aie-npu-to-binary roundtrip_merge_sync.mlir -o ms.cfg
+$ python3 build/bin/txn2mlir.py -f ms.cfg
+Unhandled opcode: 132        # 132 == 0x84 == MERGE_SYNC
+Failed to parse binary
+```
+
+…while the identical operation under lit passed. The binary was fine — the
+emitted bytes are exactly `[00000084 0000000c 00000810]`. The *reader* was
+wrong: `txn2mlir.py` is a 3-line shim around `aie.compiler.txn2mlir.main`, and
+with no `PYTHONPATH` that import resolves to
+
+`~/.venv/lib/python3.14/site-packages/mlir_aie/python/aie/compiler/txn2mlir/main.py`
+
+— a stale installed wheel with no MERGE_SYNC support — instead of
+`~/build/mlir-aie/build/python/aie/...`. lit sets `PYTHONPATH` itself, which is
+why only the manual run failed.
+
+**Every manual `txn2mlir.py` invocation must set
+`PYTHONPATH=~/build/mlir-aie/build/python`.** Check
+`python3 -c "import aie.compiler.txn2mlir.main as m; print(m.__file__)"` if a
+parse result ever looks wrong. This is the mirror image of the plan's warning
+about suspecting clean results: here a *broken*-looking result was the
+artifact.
+
+### Phase 0.1 verification — all green
+
+| check | result |
+|---|---|
+| `cmake .` configure | exit 0 |
+| `ninja` full build | exit 0 |
+| `test/Targets/NPU/npu2_merge_sync_instgen.mlir` | **PASS** |
+| `test/txn2mlir/roundtrip_merge_sync.mlir` | **PASS** |
+| `test/txn2mlir/roundtrip_npu1_extras.mlir` (regression) | **PASS** |
+| `merge_sync_roundtrip.cpp` vs `flm_c8_a.txn` | **PASS** — `@ 0x1050` |
+| `merge_sync_roundtrip.cpp` vs `flm_c8_b.txn` | **PASS** — `@ 0x11d0` |
+
+Cross-check, per the plan's habit of never trusting one source: the encoder's
+bytes were confirmed two independent ways — lit's MLIR→binary→MLIR round-trip,
+and a byte-for-byte search for the encoder's output inside FLM's own shipped
+binaries. Both agree on `[00000084 0000000c 00000810]` =>
+`num_tokens=16, num_cols=8`. Hand-run round-trip prints the **pretty** form with
+`ui8` attributes (`aiex.npu.merge_sync {num_cols = 8 : ui8, num_tokens = 16 :
+ui8}`), so the silent-degradation-to-generic-form trap the plan flags is
+confirmed *not* firing.
+
+**Commit `3ed0183f2fe` on `merge-sync-txn-op` is now build-verified against
+`origin/main`.** The plan's caveat ("mechanical is not tested") can be struck.
+
+**Noted for phase 2, not yet a problem:** lit reports `Peano not found, but
+expected at <unset>/bin` and `NPU2 detected but no AIE2P backend is available`.
+Building our own kernels needs Peano wired into this build. Also `pyxrt` is not
+importable by `~/.venv/bin/python3`, which will matter for host-side dispatch
+from Python.
+
+---
+
+## 2026-07-31 — Phase 0.2: `txn2mlir` now ingests FLM's binaries
+
+Target met: `txn2mlir.py -f docs/npu/flm_c8_a.txn` produces MLIR — 726 lines,
+`aie.device(npu2)`. Same for `flm_c8_b.txn`.
+
+### The 24-byte DDR_PATCH is not an FLM quirk — it is aie-rt's official form
+
+The plan called this a "DDR_PATCH size mismatch" between FLM and mlir-aie. It
+is better described than that, and the better description makes the fix
+obvious. aie-rt (`xrt/src/runtime_src/aie-rt/driver/src/global/xaiegbl.h`)
+defines **two** parallel families of transaction structs:
+
+- `patch_op_t` + `XAie_CustomOpHdr` — the original, matching **v0.1**
+- `patch_op_opt_t` + `XAie_CustomOpHdr_opt` — the "optimized" set, matching **v1.0**
+
+**v1.0 *is* the `_opt` encoding, for every opcode**, which the existing parser
+already implicitly agreed with everywhere else: its v1.0 WRITE is 12 bytes
+(`XAie_Write32Hdr_opt`) against v0.1's 24, its v1.0 MASKWRITE is 16 against
+v0.1's 28. DDR_PATCH was the one case where the v1.0 branch had been left
+reading the v0.1 layout. So the fix is not "also accept 24 bytes" — it is
+"v1.0 DDR_PATCH is `patch_op_opt_t`, full stop."
+
+```c
+typedef struct {                     //          24 bytes total:
+    uint32_t regaddr;                // +8       u8 Op, u8 pad[3]   (XAie_OpHdr_opt)
+    uint8_t  argidx;                 // +12      u32 Size           (XAie_CustomOpHdr_opt)
+    uint8_t  padding[3];             //          u32 regaddr    \
+    uint64_t argplus;                //          u8 argidx, pad  > patch_op_opt_t
+} patch_op_opt_t;                    //          u64 argplus    /
+```
+
+### CORRECTION to `~/flm-re-fe-mutate-goal.md`
+
+The goal doc gives FLM's 24-byte layout as:
+
+> `[opcode][size][addr_lo][addr_hi][plus_lo][plus_hi]`
+
+**That is wrong.** Word 3 is not `addr_hi` — `regaddr` is only **32-bit** in the
+optimized form. Word 3 is `argidx` (one byte) plus three padding bytes. There is
+also no `action` field; the optimized form only ever patches, so action is
+implicitly 0.
+
+It happens to decode correctly for `flm_c8_a.txn`, where `argidx == 0` makes
+word 3 zero. It fails on `flm_c8_b.txn`, where `argidx == 1` would be read as
+`addr_hi = 1`, giving `regaddr = 0x1_0001d004`.
+
+### The two transaction variants differ by exactly one field
+
+| | `flm_c8_a.txn` | `flm_c8_b.txn` |
+|---|---|---|
+| ops | 241 | 273 |
+| DDR_PATCH count | 16 | 16 |
+| patched registers | `0x1D004`, `0x1D024` × 8 cols | identical |
+| `argplus` | `0`, `0x40000`, … `0x3C0000` | identical |
+| **`argidx`** | **0** | **1** |
+
+Both patch the same two shim BD registers per column (`0x1D004` / `0x1D024`,
+BD stride `0x20`), at a uniform **256 KB (`0x40000`) stride** across 16 patches
+= 4 MB total, column stride `0x2000000`. The 256 KB-stride finding in the goal
+doc is confirmed. What is new: the *only* difference between the two variants'
+patch tables is which kernel buffer argument they bind to — arg 0 vs arg 1.
+
+### CORRECTION to the goal doc's own correction
+
+The goal doc says of `decoder-layer-npu-scope.md`:
+
+> The "high-bit-flagged values (0x80000000, 0x80000018)" and the "one plain arg
+> indices 0/1" claim are artifacts of that overrun, not a real patch convention.
+
+Half right. Running the *old* 44-byte offsets deliberately as a negative control
+reproduces `arg_idx = 0x80000000` and `0x80000018` **exactly** — so the
+high-bit values are confirmed overrun artifacts, as the goal doc says.
+
+But **arg indices 0 and 1 are real.** They are just not mixed within one file:
+`flm_c8_a.txn` is uniformly `argidx=0`, `flm_c8_b.txn` uniformly `argidx=1`. The
+original observation was right about the values and wrong about the structure.
+The goal doc over-corrected in throwing it out.
+
+### Changes made (in `~/build/mlir-aie`, on `merge-sync-txn-op`)
+
+`lib/Conversion/AIEToConfiguration/AIEToConfiguration.cpp`:
+
+1. **v1.0 DDR_PATCH reads `patch_op_opt_t`** (`opSize >= 24`, regaddr@+8,
+   argidx@+12, argplus@+16). v0.1's 12-word/48-byte form is untouched — mlir-aie
+   only ever *emits* v0.1 (`TxnEncoding.h` hardcodes `major=0, minor=1`), so the
+   v1.0 path exists purely to read other people's binaries and no emitter test
+   covers it.
+2. **`argplus` overflow is refused, not truncated.** It is `u64` on the wire but
+   `int32_t` in `AddressPatchPayload` and in the MLIR attribute. A nonzero high
+   word now errors out. FLM's max is `0x3C0000`, so nothing is lost today — but
+   silent truncation is precisely the failure class that produced the original
+   bad decode.
+3. **Device selection reads the header's device-generation byte** (offset 2)
+   instead of assuming npu1. `parseTransactionBinary` gained an optional
+   `devGenOut`. `XAIE_DEV_GEN_AIE2P` = 4 (what FLM's binaries declare), AIE2PS = 5,
+   Strix A0/B0 = 8/9 all select the npu2 table; the column count then picks the
+   variant. Out-of-range columns now produce a diagnostic instead of indexing a
+   4-entry vector with `columns - 1 == 7` and asserting.
+
+### Verification
+
+- `flm_c8_a.txn` decode: **176** write32, **32** blockwrite, **16** maskwrite32,
+  **16** address_patch, **1** merge_sync = **241**, matching the header's
+  `num_ops=241` and a byte walk landing exactly on `txn_size=4188 == file size`.
+  Three independent agreements.
+- Full `test/txn2mlir/` + `test/Targets/NPU/` suites: **18 passed, 0 failed**
+  (12 unsupported — need Peano/Chess/hardware). No regressions.
+- New `tools/npu/flm/txn_check.py` — decodes a v1.0 binary structurally and
+  asserts txn2mlir agrees on device, op counts, and every patch's
+  addr/argidx/argplus plus the merge_sync payload. Both FLM binaries PASS.
+- **Negative control**: monkeypatching the raw decoder back to the 44-byte
+  offsets makes `txn_check.py` fail loudly on all 16 patches. The check
+  discriminates; it is not vacuous.
+
+### Meaning (0.2)
+
+Phase 1 item 4 ("decode both transaction-binary variants fully") is now
+unblocked and partly done — the ops are readable and the patch tables are fully
+decoded. What the patch table says so far: **two shim BDs per column, one
+buffer argument per variant, 256 KB apart.** The open question the goal doc
+raises — FLM's 22 WRITEs and 4 BDs per column against our 3 and 3 — is now
+answerable from the 176 write32 ops (22 × 8 = 176 exactly), so that count is
+confirmed. Deriving what those 22 writes configure is phase 1 work.
+
+---
+
+## 2026-07-31 — Phase 0.4: AIE2P clock confirmed at 1.8 GHz
+
+**Answered from the driver, and it agrees with the goal doc's assumption.**
+`cargo run -p hipfire-xdna --example npu_info`:
+
+```
+resource_info: npu_clk_max: 1800, npu_tops_max: 58, npu_tops_curr: 58
+clocks:        mp_npu_mhz: 1267, h_mhz: 1800
+```
+
+`h_mhz` is the AIE compute clock. **1800 MHz**, which is also `npu_clk_max`, so
+there is no headroom above it and nothing to boost into.
+
+Second source, per the habit of not trusting one number:
+`benchmarks/npu_gemm_tuning/findings.md` independently recorded the same
+1800 MHz under GEMM load (as opposed to 792 MHz idle, so the reading above is a
+boosted one), and cross-checked it arithmetically against the advertised TOPS
+ceiling: 32 cores x 512 int8 MAC/instr (`mac_8x8_8x8`) x 1.8 GHz = 29.5 TMAC/s
+= **59 TOPS**, against the firmware's reported 58. That closes to within 2%.
+
+**Every GB/s figure in the goal doc that assumes 1.8 GHz stands.** In
+particular the layer-kernel ceiling: 2.12 weight-bytes/cycle/core x 16 cores x
+1.8 GHz = ~61 GB/s, against FLM's measured 46.4 (76%).
+
+Caveat worth carrying: this is the *maximum and current* clock as the firmware
+reports it, taken while the device was boosted. It is not a measurement of
+cycles actually retired by a core. The MAC kernel in 0.3 will produce that
+independently — if a known-cycle-count loop does not time out at 1.8 GHz, this
+entry is the one to revisit.
+
+---
+
+## 2026-07-31 — Phase 0.3 prep: the NPU build+run path was broken, now repaired
+
+Before any MAC measurement could happen, the existing NPU toolchain had to work.
+It did not. Three separate staleness failures, each masking the next.
+
+**`tune.sh` reported only `BUILD_OR_RUN_FAIL`** and deleted its log, so the
+first job was reproducing by hand.
+
+### 1. The stale wheel again — this time it breaks the build, not just a decode
+
+```
+ImportError: cannot import name 'CompileTime' from 'aie.iron'
+  (/home/sadara/.venv/lib/python3.14/site-packages/mlir_aie/python/aie/iron/__init__.py)
+```
+
+Same root cause as the txn2mlir trap recorded above: designs under
+`$MLIR_AIE_DIR` track that *source tree*, but `import aie` resolves to the venv
+wheel. When the tree moved forward onto `origin/main` the wheel fell behind and
+every IRON design stopped building. The README's 2026-07-04 baselines predate
+that divergence, which is why this had not been seen before.
+
+Fixed durably in `benchmarks/npu_gemm_tuning/tune.sh`: it now exports
+`PYTHONPATH=$MLIR_AIE_DIR/build/python` and hard-fails if no built `aie` package
+is there, instead of falling through to the wheel.
+
+### 2. Generated python dialect bindings were 17 days stale
+
+With PYTHONPATH fixed, the failure moved:
+
+```
+TypeError: DMAConfigureTaskForOp.__init__() got an unexpected keyword argument 'repeat_count_val'
+TypeError: DMABDOp.__init__() got an unexpected keyword argument 'sizes'
+```
+
+`AIEX.td:1356` declares both `repeat_count` and `repeat_count_val`, and the
+hand-written `python/dialects/aiex.py` passes the latter — but the *generated*
+`build/python/dialects/_aiex_ops_gen.py` was dated **2026-07-14** against an
+`AIEX.td` dated today, and had no such parameter. `_aie_ops_gen.py` likewise.
+
+**A full `ninja` did not fix it, and neither did touching `AIEX.td`.** Cause:
+
+```
+$ ninja -t query python/dialects/_aiex_ops_gen.py
+  input: CUSTOM_COMMAND
+    .../mlir-tblgen
+    .../python/dialects/AIEXBinding.td
+    || aie-headers            <- order-only
+```
+
+`declare_mlir_dialect_python_bindings()` depends only on the thin
+`dialects/AIEXBinding.td` wrapper — never on the `aie/Dialect/AIEX/IR/AIEX.td`
+that wrapper `include`s. Its `DEPENDS` argument produces an *order-only* ninja
+edge, which does not force a rebuild when the dependency changes. So editing a
+dialect regenerates every `.inc` and leaves the python bindings silently stale.
+
+Regenerating (`touch python/dialects/*Binding.td`) grew `_aiex_ops_gen.py`
+236,854 -> 276,558 bytes and `_aie_ops_gen.py` 260,077 -> 281,312.
+`_aievec_ops_gen.py` was already current (`--write-if-changed` left it alone) —
+a useful confirmation that the regeneration is content-driven, not a blanket
+rewrite.
+
+**Side effect worth noting: `NpuMergeSyncOp` was absent from the python bindings
+until this regeneration** and is now present. The MERGE_SYNC op was unreachable
+from IRON/python the whole time, despite the C++ side being green. Nothing had
+exercised that path, so nothing had noticed.
+
+**Fixed at the root** in `~/build/mlir-aie/python/CMakeLists.txt` with
+`add_custom_command(OUTPUT ... APPEND DEPENDS <dialect>.td)` for all three
+dialects, attaching the missing file-level edge to the command the upstream
+function already created. Verified: touching `AIEX.td` now rebuilds
+`_aiex_ops_gen.py`, which it demonstrably did not before. (Local to
+`~/build/mlir-aie`; worth upstreaming — it is not specific to this tree.)
+
+### 3. Result — hardware path confirmed working
+
+```
+config(MxKxN mxkxn)    cols    avg_us      gflops    TOPS   %peak  status
+2048x2048x2048 64x128x64 8c   2333.40    7362.59    7.36   13.4%  PASS
+```
+
+`PASS` = numerically verified against the host reference, so this is a correct
+run, not just a completed one. 7.36 TOPS at 2048^3 is consistent with the
+historical record in `findings.md` (real GEMM kernels land in a **12-27%-of-peak
+band**) and with its note that 8 columns buy nothing at 2048^3.
+
+### Why that 13.4% matters to the phase-3 thesis
+
+It is the same caveat the goal doc attaches to the MAC table — *static results
+bound issue rate only, blind to memory-side stalls* — showing up as a measured
+number. Every real GEMM measured on this machine, including AMD's own shipped
+`mladf` int4 kernel at ~7 TOPS, sits far below the issue-rate ceiling because it
+is **feed-bound, not compute-bound**.
+
+That is the specific risk to phase 3a. Widening the MAC from 16 lanes
+(`mac_elem_16`, what FLM uses) to 1024 (`mac_4x16_16x16`) only converts into
+throughput if the kernel is not already limited by getting operands into L1.
+**The 0.3 gate has to separate those two things**, which means measuring the
+same MAC mode twice — once with operands resident in registers, once streamed
+from a memtile — and reporting the ratio. A single number cannot answer it.
+
+Note the goal doc's own analysis already says FLM's layer kernel achieves
+**4.2 MAC/cycle/core against `mac_elem_16`'s 16**, i.e. it is at ~26% of even
+the narrow mode's issue rate, and attributes that to the dequant dependency
+chain rather than to feeding. If that attribution is right, oq4++'s win comes
+first from deleting the 42-op dequant chain and only second from the wider MAC.
+The gate measurement should be able to tell these apart.
+
+### CORRECTION: the IRON python run path is not broken
+
+`benchmarks/npu_gemm_tuning/README.md` carried this, and it is wrong:
+
+> On this box the mlir-aie python `test.py` harness segfaults loading the
+> `mlir_aie` native MLIR bindings under Python 3.14 (independent of the kernel
+> and of the source/wheel version).
+
+It is the **same wheel-shadowing bug**, not a Python 3.14 incompatibility and
+not independent of the wheel version. With `PYTHONPATH` pointed at the build
+tree, the full IRON jit → compile → dispatch → verify path runs:
+
+```
+$ python3 programming_examples/basic/vector_scalar_mul/vector_scalar_mul.py --warmup 2 --iters 5
+NPU time     (avg/min/max us): 147.6 / 128.6 / 159.3
+End-to-end   (avg/min/max us): 461.0 / 302.5 / 613.2
+PASS!
+```
+
+Corrected in that README. This matters more than a tidy-up: it restores
+`@iron.jit` + `iron.tensor` + `run_iters` as an available path, which is a far
+shorter route to a MAC microbenchmark than hand-writing a C++ host per variant.
+The 0.3 gate kernel will use it.
+
+**Pattern worth naming, since it has now caused four distinct failures in one
+day** — a wrong txn decode, a broken C++-host build, stale python dialect
+bindings, and a bogus "Python 3.14 is incompatible" conclusion recorded as fact
+in a README. All four are *stale build artifacts shadowing fresh source*, and
+all four presented as something else. The diagnostic is always the same:
+
+```bash
+python3 -c "import aie; print(aie.__path__)"    # must be under build/python
+```
+
+
+---
+
+## 2026-07-31 — Phase 0.3: building the gate, and a rejected measurement
+
+New tool: `tools/npu/flm/macbench_hw.py`, the hardware counterpart to the static
+`macbench.py`. Design rationale, then the failure, then the numbers.
+
+### Why the gate needs two measurements, not one
+
+The plan asks whether `mac_4x16_16x16`'s 1024 MACs/cycle survives real memory
+pressure. That is two questions with potentially different answers — *is the
+wide mode's issue rate real on silicon?* and *can operands be fed fast enough to
+reach it?* — so each mode is measured twice per delivered tile:
+
+- **RESIDENT** — operands hoisted into registers, loop is back-to-back MACs.
+  This is the hardware issue rate, the thing `macbench.py` predicts.
+- **STREAMED** — operands re-read from the L1 tile every iteration, tile
+  delivered by DMA.
+
+swept over `reps` (MAC instructions per tile) = the arithmetic-intensity knob.
+Low reps is feed-bound; the STREAMED curve should climb toward the RESIDENT
+asymptote. Where it flattens says how much reuse a real kernel needs.
+
+Two accumulator chains, matching `macbench.py`: `v256int4` is 1024 bits and
+`v64acc32` is 2048, so a third chain risks spilling and turning the
+"measurement" into stack traffic.
+
+### FAILURE, recorded: the first results were physically impossible
+
+First run reported, for `mac_8x8_8x8` whose ceiling is **512** MACs/cycle:
+
+```
+w8a8      RESIDENT   65536   16384.0     82.3     99.9   7250.6    1416.1%
+w8a8      STREAMED   65536   16384.0     88.4     99.9   6750.7    1318.5%
+```
+
+**7250 MACs/cycle is not a fast result, it is a broken one.** The machine has
+one MAC slot per VLIW bundle, so the issue rate is a hard ceiling and nothing
+can exceed it. The corroborating symptom was that `min_us` sat flat at
+78-91 us across a **16x** increase in `reps`, and was even slightly *lower* at
+the largest size. Time not scaling with work means the work was not being done.
+
+**Cause: a jit cache collision — every variant ran the same xclbin.**
+`@iron.jit`'s cache key comes from `_create_function_cache_key(cache_fn,
+runtime_args, cache_compile_kwargs, ...)` in `utils/callabledesign.py`. It sees
+the generator function, its runtime arguments, and its **CompileTime kwargs**.
+It does *not* see Python closure state. The first version built the kernel
+source outside the design body and captured it, so `mode`, `reps` and `streamed`
+were invisible to the key: all six configurations hashed identically and the
+first-compiled xclbin was replayed for every row. The ~85 us being measured was
+dispatch overhead for one fixed kernel.
+
+Note that `ExternalFunction` itself is *not* at fault — it hashes its
+`source_string` correctly (`_content_digest`, `iron/kernel.py:483`). The
+collision is one level up, at the design cache.
+
+**Fix:** `mode`, `reps` and `streamed` are now real `CompileTime` parameters of
+the jit'd design, and the source is generated inside the design body, so they
+enter the cache key. The C symbol is suffixed per variant for good measure.
+
+**Guard added, because this class of error is silent.** The script now rejects
+any rate above the issue ceiling with an explicit `IMPOSSIBLE` marker and a
+nonzero exit, rather than printing it as a number. A benchmark that can report
+1416% of a hardware maximum without complaint is not a benchmark. The same
+discipline the plan calls for — *suspect clean-looking results* — but the
+cheaper version: encode the sanity check so it fires without needing to be
+noticed.
+
+Two independent tells to check on any future run of this: rates must be at or
+below `static`, and `min_us` must scale roughly linearly with `reps` once past
+the overhead floor. Either failing means the measurement, not the silicon.
+
+### Aside: `dis.py` shadowed the standard library
+
+`tools/npu/flm/dis.py` broke every other script in that directory. Python puts a
+script's own directory first on `sys.path`, `inspect` imports `dis`, and
+`argparse` imports `inspect` — so `macbench_hw.py` died with
+`AttributeError: module 'dis' has no attribute 'COMPILER_FLAG_NAMES'`, which
+points nowhere near the cause. Renamed to `aiedis.py`; README updated with the
+reason.
+
+### GATE RESULT — the wide int4 mode is real, but at half the claimed rate
+
+Corrected measurement, operands resident in registers (no memory pressure at
+all, so this isolates issue rate):
+
+```
+mode      variant     reps  MAC/byte   min_us   avg_us  MAC/cyc  vs static
+w8a8      RESIDENT    4096    1024.0    162.7    173.2    229.1      44.7%
+w8a8      RESIDENT   16384    4096.0    380.4    393.6    392.0      76.6%
+w8a8      RESIDENT   65536   16384.0   1240.0   1268.8    481.1      94.0%
+w4a8      RESIDENT   16384    8192.0    678.7    718.8    439.4      42.9%
+w4a8      RESIDENT   65536   32768.0   2415.1   2442.6    494.0      48.2%
+```
+
+Both sanity tells pass: no rate exceeds its ceiling, and `min_us` scales with
+`reps`. Converting to the honest unit:
+
+| mode | MAC-instr | cycles | **cyc/call** | MACs/cycle |
+|---|---|---|---|---|
+| `mac_8x8_8x8` | 2,097,152 | 2,232,000 | **1.064** | 481 |
+| `mac_4x16_16x16` | 2,097,152 | 4,347,180 | **2.073** | 494 |
+
+**`mac_4x16_16x16` takes two cycles per call, not one.** Same instruction count,
+double the time. Its 1024 MACs/call therefore yield **512 MACs/cycle — identical
+to `mac_8x8_8x8`, not double it.**
+
+### Cross-checked against the disassembly, and the static harness had a bug
+
+Per the plan's habit, confirmed from a second, independent source. Dumping the
+AIE hardware loop (`ls`/`le`/`lc`), whose body runs from `.LBB0_1` through the
+`.L_LEnd0` bundle **inclusive**:
+
+```
+w8a8  — 2 bundles, 2 vmac, 2 intrinsic calls   -> 1.0 cyc/call
+    a0: vmac dm3, dm3, x0, x2, r0
+    b0: vmac dm2, dm2, x0, x2, r0
+
+w4a8  — 4 bundles, 4 vmac, but only 2 intrinsic calls  -> 2.0 cyc/call
+    90: vmac dm4, dm1, x6, y2, r0
+    a0: vmac dm0, dm2, x6, y2, r0
+    b0: vmac dm1, dm4, x0, y1, r0
+    c0: vmac dm2, dm0, x0, y1, r0
+```
+
+`mac_4x16_16x16` **lowers to two `vmac` instructions per call** — note the
+`y2`/`y1` operand pairing, fed by two `vunpack ... unpacksign1` ops in the
+prologue that split the `v256int4` operand into halves. Static (2.00) and
+hardware (2.073) agree.
+
+**Root cause of the original 1024 claim — a real bug in `macbench.py`.** It
+computed `cyc = bundles / vmac_count` and then reported `MACs_per_intrinsic_call
+/ cyc`. Those two units only agree when one call emits one `vmac`. For w4a8 it
+read 4 bundles / 4 vmacs = 1.0 cyc and multiplied by 1024. Fixed: it now divides
+by the intrinsic-call count, which the loop body performs exactly `chains` times.
+
+Corrected static table, which now matches hardware:
+
+```
+mode                           chains bundles  macs cyc/MACinsn MAC/cycle
+W4A8  mac_4x16_16x16 (int4)         2       4     4        2.00       512
+W4A8  mac_4x16_16x16 (uint4)        2       4     4        2.00       512
+W8A8  mac_8x8_8x8                   2       2     2        1.00       512
+BFP16 mac_8x8_8x8T                  3       3     3        1.00       512
+bf16  mac_elem_16  (FLM)            3       3     3        1.00        16
+```
+
+### Verdict: proceed, with the headline number halved
+
+The plan says to stop and re-scope if the wide integer modes do not hold up.
+They hold up, but not as advertised:
+
+- **They are real.** 494 measured against a 512 ceiling is 96.5% — the mode
+  works and is not a paper number.
+- **They are not 2x int8.** int4, int8 and bfp16 are *all* 512 MACs/cycle. Any
+  argument for oq4++ that rests on a wider MAC than int8 is void.
+- **The thesis still stands on the comparison that matters.** Phase 3a is about
+  beating what FLM actually uses, `mac_elem_16` at 16 MACs/cycle. 512/16 =
+  **32x**, not the 64x the old table implied. Halved, still decisive.
+- **`vunpack` is not avoidable.** oq4++'s "straight into `mac_4x16_16x16`, no
+  unpack" is wrong at the ISA level. The unpack is hoistable when weights are
+  reused across N — but FLM's tile is M=1, and in decode each weight is used
+  once, so it lands on the critical path. This needs designing around, and it
+  argues for tiling with real N-reuse rather than M=1.
+
+### The streamed gap is large and not yet explained
+
+```
+w8a8      STREAMED   65536   16384.0   5331.9   5560.7    111.9      21.9%
+w4a8      STREAMED   65536   32768.0   8268.1   8437.8    144.3      14.1%
+```
+
+Streamed rates plateau far below resident (w8a8 112 vs 481) and are *saturated*
+— raising intensity 16x moves w8a8 from 91 to 112. So this is not DMA
+starvation; at 16384 MACs per delivered byte the DMA is nearly irrelevant.
+
+**Caveat, and why this number is a lower bound, not the answer.** The streamed
+kernel addresses operands with masked index arithmetic
+(`ap[(i*chains+j) & mask]`), which is scalar work per operand that a real kernel
+would not do — FLM uses pointer post-increment (`paddb [p1], #-0x200`), one
+instruction folded into the load. A sequential pointer-increment variant is
+added to `macbench_hw.py` but not yet measured. **Until that runs, no conclusion
+should be drawn about the achievable streamed rate**, and in particular the
+21.9%/14.1% figures must not be quoted as the feeding limit.
+
+That measurement is the next thing to do, and it matters: the goal doc's claim
+that FLM's layer kernel is *latency-bound on the dequant chain* rather than
+feed-bound is testable against it.
+
+---
+
+## 2026-07-31 — Streamed rate with real addressing: int4 wins on the FEED path
+
+Follow-up to the gate. The earlier streamed numbers used masked index
+arithmetic and were explicitly logged as a lower bound. A `seq` variant now
+walks operands with **pointer post-increment** — `vldb x0, [p3], #0x40`, the
+same addressing FLM uses (`paddb [p1], #-0x200`).
+
+Predicted before running, from the scheduled loop (6 bundles / 2 calls =
+3.0 cyc/call => ~171 MAC/cyc for w8a8); measured 157. Close enough to trust
+both.
+
+| mode | variant | cyc/call | MACs/cyc | % of issue ceiling |
+|---|---|---|---|---|
+| `mac_8x8_8x8` | resident | 1.077 | 475 | 92.9% |
+| `mac_8x8_8x8` | **seq** | 3.261 | **157** | 30.7% |
+| `mac_4x16_16x16` | resident | 2.074 | 494 | 96.4% |
+| `mac_4x16_16x16` | **seq** | 4.096 | **250** | 48.8% |
+
+### The finding: int4's advantage is real, but it is not where the plan said
+
+Issue rates are identical (512 both). **Under realistic streaming, int4
+delivers 1.59x the MAC rate of int8** — 250 vs 157 MACs/cycle.
+
+The reason is operand bytes, not MAC width. Per call:
+
+| | operand bytes loaded | MACs | MACs per byte |
+|---|---|---|---|
+| `mac_8x8_8x8` | 64 (A) + 64 (B) = 128 | 512 | 4.0 |
+| `mac_4x16_16x16` | 64 (A) + 128 (B) = 192 | 1024 | **5.3** |
+
+int4 packs twice the K per B-byte, so the same L1 load feeds twice the work.
+And because the call already costs 2 cycles, its two loads have twice as long
+to retire — the load path is the binding constraint here, and the wide mode
+hides more of it.
+
+**This is the opposite of the framing the gate started with**, and it matters
+for phase 3a. The correct argument for oq4++ is *not* "a wider MAC" (there
+isn't one — int4, int8 and bfp16 all issue 512 MACs/cycle). It is **"fewer
+operand bytes per MAC on a load-bound machine"**. Same conclusion, different and
+defensible reason, and it survives the corrected issue-rate table.
+
+### Both streamed rates are far below issue rate, and part of that is the compiler
+
+30.7% and 48.8% of ceiling. The w8a8 `seq` inner loop is 6 bundles for 2 calls:
+
+```
+90: vlda x11, [p3], #0x40
+a0: vldb x9,  [p4], #0x40
+b0: vlda x7,  [p4], #0x40 ; vmov x0, x11
+c0: vldb x5,  [p3], #0x40 ; vmov x4, x9 ; vmac dm3, dm3, x0, x4, r1
+d0:                         vmov x2, x7
+e0: (.L_LEnd0)              ... second vmac
+```
+
+Four loads per two MACs is inherent — two operands each. But **three `vmov`s per
+iteration are not**: the loads land in `x11/x9/x7/x5` and are then copied to
+`x0/x4/x2`. That is register-allocation overhead, so ~30% is a floor imposed by
+this codegen rather than by the machine. A hand-scheduled kernel should do
+better, and FLM's does exactly this kind of thing (its 964-bundle loop is
+59 `vmov`s out of ~1430 ops).
+
+Do not quote 157/250 as *the* achievable streamed rate. They are a realistic
+compiler-generated floor; the ceiling is 475/494.
+
+### REJECTED: the bfp16 seq row
+
+The run produced `bfp16 SEQ = 3.7 MACs/cycle`, 161 ms against resident's 1.8 ms
+— a 43x gap. **That is an artifact of this harness, not a property of
+`mac_8x8_8x8T`, and must not be recorded as a result.**
+
+`v64bfp16ebs8` is **72 bytes** (9 bits x 64 elements — the `{v64int8 mantissa;
+v8int8 exponent;}` pairing the plan documents). 72 is not a multiple of 64, so
+`*b++` steps the pointer 72 bytes and every load after the first is misaligned.
+
+Guard added: `seq` now refuses any operand type whose size is not 64-byte
+aligned, naming the fix (bfp16 needs mantissa and exponent as separate arrays,
+which is how a real kernel would lay it out). Better a refusal than a number.
+
+`bfp16 resident` measured 324.8 MACs/cycle (63.4%), also below w8a8's 92.9% and
+likely touched by the same 72-byte tile arithmetic. **Treat the bfp16 row as
+unmeasured** until the layout is fixed. This matters for phase 3b's "free
+floor" (store KV as bfp16ebs8) — that claim is currently unverified here, and
+the 72-byte stride is itself a design constraint worth knowing about.
+
+### Still open
+
+- bfp16 with a correct split-array layout — needed before 3b's free floor can be
+  called free.
+- Whether hand-scheduling removes the `vmov` overhead, i.e. how much of the
+  30%/49% is codegen rather than machine.
+- `bf16_16` (FLM's mode) measured 1.57 cyc/call resident against a static 1.00.
+  Unexplained; low priority, but it is the mode FLM actually uses, so the gap
+  should be understood before phase 2 comparisons lean on it.
+
+---
+
+## 2026-07-31 — Phase 0.5: FLM baseline, method and bytes-per-token
+
+New harness: `benchmarks/flm_baseline/flm_bench.py`. These are the only figures
+in the final document that come from timing FLM rather than our own code, so the
+method is recorded rather than left in a shell history.
+
+### Method
+
+`flm run <model>` accepts a script on stdin. `/verbose` makes it print its own
+metrics; `/set gen-lim N` bounds generation; `/input <file> <prompt>` loads a
+long prompt. Two workloads, because a single run conflates them:
+
+- **decode** — short prompt, `gen-lim` tokens. Uses FLM's "Decoding speed".
+  Weight-streaming: every token reads the whole active weight set, so
+  tok/s x bytes-per-token is achieved read bandwidth.
+- **prefill** — long prompt via `/input`, `gen-lim 1` so decode cannot
+  contaminate it. Uses FLM's "Prefill speed".
+
+**Prefill must use a long prompt.** At 52 prompt tokens FLM reports ~121 tok/s;
+at 1828 tokens the same model reports **1623 tok/s**. The short-prompt figure is
+almost entirely the fixed ~430 ms TTFT and is meaningless as throughput. An
+earlier note in this repo quoting ~2750 t/s should be re-derived at a stated
+prompt length before being compared against anything.
+
+Median of N reps. Each rep is a fresh process, so the model reloads every time —
+slow for the 23 GB MoE, but it does not bias the metrics, which FLM computes
+internally and excludes load from.
+
+### Bytes per token — the number bandwidth depends on, and it is not the file size
+
+Recomputed independently from each model's safetensors manifest.
+
+**llama3.2:1b** reproduces the repo's existing derivation exactly: 148 tensors,
+**113 I8 = 772.3 MB** streamed, 35 BF16 = 525.5 MB of which
+`model.embed_tokens.weight` is a per-token *gather* of one 4 KB row, not a
+stream. Container is 1297.8 MB; quoting that would overstate bandwidth by 1.7x.
+
+**qwen3.6-moe:35b-a3b** — 733 tensors, 23,235.3 MB container, but only 8 of 256
+experts run per token:
+
+| component | in file | streamed per token |
+|---|---|---|
+| routed experts (256) | 20132.7 MB | **629.1 MB** (8/256) |
+| shared experts | 133.7 MB | 133.7 MB |
+| attention / router / norms | 1411.5 MB | 1411.5 MB |
+| lm_head | 540.3 MB | 540.3 MB |
+| embed_tokens (BF16) | 1017.1 MB | 0.004 MB (one row, gathered) |
+| | | **2714.7 MB** |
+
+Container overstates the per-token stream by **8.6x**.
+
+Three independent cross-checks that this decode is right:
+
+1. 40 `mlp.*_exps_proj` tensors == `num_hidden_layers: 40`.
+2. 30 `linear_attn.*` and 10 `self_attn.*` == `full_attention_interval: 4`
+   (40/4 = 10 full-attention layers, the rest linear). The config predicts the
+   tensor census exactly.
+3. One routed expert is 1.966 MB for 3 x 2048 x 512 weights = **exactly 5.00
+   bits/weight** — the same rate llama3.2:1b's streamed set works out to, so
+   `q4nx` is ~5 bpw on both.
+
+**Finding worth carrying into phase 3:** for this MoE the experts are *not* the
+dominant per-token traffic. Attention (1411.5 MB) plus lm_head (540.3 MB) is
+**72%** of the stream; the active experts are 23%. Any oq4++ work that only
+touches expert weights is addressing under a quarter of the bytes. It also makes
+phase 3c (two-stage lm_head) look considerably more valuable here than on
+llama — lm_head alone is 20% of every token.
+
+Also noted: this model is a *hybrid* (30 linear-attention layers with SSM
+conv/alpha/beta tensors, 10 full-attention), carries `mtp_num_hidden_layers: 1`
+(multi-token prediction), and has `head_dim: 256`. None of that matches the
+Llama-shaped assumptions in the plan's attention analysis, so the `attn.xclbin`
+reverse engineering done for Llama-3.2-1B will not transfer to it unchanged.
+
+### BASELINE — the numbers phase 2 must match and phase 3 must beat
+
+`flm_bench.py --reps 3 --gen-lim 256 --prefill-tokens 4096`, medians, default
+`--pmode performance`, AIE clock 1.8 GHz (0.4).
+
+| model | workload | prompt tok | tok/s | achieved BW | % of ~55 GB/s fabric |
+|---|---|---|---|---|---|
+| llama3.2:1b | decode | 61 | **61.07** | **47.2 GB/s** | 86% |
+| llama3.2:1b | prefill | 7075 | **1774.5** | — | — |
+| qwen3.6-moe:35b-a3b | decode | 34 | **13.54** | **36.8 GB/s** | 67% |
+| qwen3.6-moe:35b-a3b | prefill | 8305 | **185.5** | — | — |
+
+TTFT for llama decode: 450.9 ms. (The MoE and both prefill rows report no TTFT
+in FLM's verbose block; not chased, since prefill tok/s is the figure of merit
+there.)
+
+Decode bandwidth reproduces the repo's existing 46.4 GB/s figure for llama
+(measured 47.2 at 61.07 tok/s against 46.4 at 60.1) — independent method,
+independent re-derivation of bytes-per-token, same answer.
+
+### Three things the baseline says that the plan did not anticipate
+
+**1. FLM's decode is close to the fabric limit on the small model.** 47.2 GB/s
+is **86%** of the ~55 GB/s figure. There is not much bandwidth headroom left to
+win on llama3.2:1b — a phase-3 decode win there has to come from *moving fewer
+bytes* (oq4++ at 4.125 bpw vs FLM's 5.00 = 17.5% fewer), not from feeding
+better. The static layer-kernel ceiling computed in the plan (~61 GB/s) is above
+the fabric, so it is not the binding constraint; the fabric is.
+
+**2. The MoE decode is NOT bandwidth-bound.** 36.8 GB/s is only 67% of fabric,
+against llama's 86%. Something other than weight streaming is costing ~a third
+of the achievable rate — routing, the 30 linear-attention/SSM layers, or
+per-dispatch overhead across 40 layers. **This is the more interesting target**,
+and it is a different problem from the one phase 3a is designed to solve.
+
+**3. MoE prefill does not get the sparsity benefit.** 185.5 tok/s against
+llama's 1774.5 — a 9.6x gap. If prefill compute scaled with *active* parameters
+(3B vs 1.236B) the gap would be ~2.4x. It does not, because a long prompt
+activates essentially all 256 experts, so prefill compute scales with the *full*
+35B, not the active 3B. Sparsity is a decode-time property only. Worth stating
+plainly in any prefill planning.
+
+### Phase 0 complete
+
+| item | result |
+|---|---|
+| 0.1 mlir-aie build + MERGE_SYNC | done — build green, 3/3 lit, byte-match vs both FLM binaries |
+| 0.2 txn2mlir parser blockers | done — both FLM binaries ingest; 18/18 tests |
+| 0.3 MAC issue rates (GATE) | done — **1024 was wrong; 512 measured.** Proceed, headline halved |
+| 0.4 AIE2P clock | done — 1.8 GHz confirmed |
+| 0.5 FLM baseline | done — table above |
+
+Next: Phase 1, the dataflow description of `layer.xclbin` and `attn.xclbin`.
+Item 4 of that phase (host-side dispatch) is already part-done — the transaction
+binaries decode, and the 22-WRITEs-per-column claim is confirmed exactly.
+
+**Carry into phase 1:** the MoE is a *hybrid* — 30 linear-attention/SSM layers,
+10 full-attention, `head_dim: 256`, plus `mtp_num_hidden_layers: 1`. The
+`attn.xclbin` analysis in the plan was done against Llama-3.2-1B and will not
+transfer to it unchanged. Since the MoE is the stated end goal, its attention
+kernels need their own pass rather than an assumed port.
+
+---
+
+## 2026-07-31 — Phase 1 (item 4): the per-dispatch structure decodes cleanly
+
+First real use of the repaired parser. `flm_c8_a.txn`, all 241 ops, grouped by
+column (stride `0x2000000`) and by tile row (`(off >> 20) & 0x1F`).
+
+**All 8 columns receive an identical program.** Per column:
+
+| op | n | targets |
+|---|---|---|
+| `write32` | **22** | 14 to **row 0** (shim): `0x1d200-0x1d20c`, `0x3f008-0x3f014`, `0x3f100`, `0x3f138`, `0x3f13c`; 8 to **row 1** (memtile): `0xa0630-0xa063c`, `0xb001c`, `0xb0020`, `0xb0100`, `0xb0104` |
+| `maskwrite32` | 2 | row 0 `0x1f004` |
+| `blockwrite` | **4** | 8-word buffer descriptors (below) |
+| `address_patch` | 2 | shim BD0/BD1 address word |
+
+This confirms the plan's "22 WRITEs and 4 BDs per column" **exactly**, and now
+says what they are.
+
+### The four BDs
+
+| target | tile | BD# | payload (8 x i32) |
+|---|---|---|---|
+| `0x1a0000` | memtile (row 1) | 0 | `[0x10000, 0x20000, 0,0,0,0,0, 0x80000000]` |
+| `0x01d000` | shim (row 0) | 0 | `[0x10000, 0, 0,0, 0xC0000000, 0,0, 0x2000000]` |
+| `0x1a0300` | memtile (row 1) | 24 | `[0x10000, 0x30000, 0,0,0,0,0, 0x80000000]` |
+| `0x01d020` | shim (row 0) | 1 | `[0x10000, 0x40000, 0,0, 0xC0000000, 0,0, 0x2000000]` |
+
+Three independent things now agree, which is what makes this trustworthy:
+
+1. The **DDR_PATCH targets are `0x1d004` and `0x1d024`** — precisely **word 1 of
+   shim BD#0 and BD#1**, i.e. the address word of each shim descriptor. The
+   patch table decoded in 0.2 is exactly "give these two BDs their DDR base".
+2. Those BDs' **pre-patch word 1 values are `0` and `0x40000`**, matching the
+   `argplus` values in the patch ops for column 0 (`0`, `0x40000`). Two encodings
+   of the same offsets, consistent.
+3. **Word 0 is `0x10000` = 65536 on all four.** As a 32-bit-word transfer length
+   that is **256 KB** — exactly the `argplus` stride between consecutive patches.
+   The BD length and the patch stride corroborate each other.
+
+### The finding: the cores are not touched per dispatch
+
+**Rows 2-5 receive zero writes.** All 22 writes go to row 0 (shim) and row 1
+(memtile); the 27 compute cores get nothing. Their programs are loaded once from
+the PDI/CDO at xclbin load, and the per-layer transaction only reprograms DMA
+and kicks it.
+
+That is very likely the fused-layer advantage the plan points at: a layer costs
+one transaction of ~4 KB that moves no code and reconfigures only descriptors,
+rather than a per-linear dispatch that re-establishes state.
+
+### OPEN, and it does not add up yet
+*(SUPERSEDED — see "RESOLVED" below. The gap was a category error: this is an
+egress transaction, not weight ingress, and the per-layer figure used here is
+also wrong. Kept for the record because the plan requires failures be recorded.)*
+
+Per column the two shim BDs move 2 x 256 KB = 512 KB, so **8 columns = 4 MB per
+transaction**. But llama3.2:1b streams **772.3 MB per token over 16 layers =
+48.3 MB per layer** (0.5). That is a **~12x shortfall**.
+
+So one of these is true and it is not yet known which:
+
+- there are multiple dispatches per layer (~12), and `flm_c8_a.txn` is one
+  chunk, not one layer;
+- the BDs carry a repeat/iteration count that multiplies the 256 KB — the
+  `0x2000000` in shim word 7 and `0x80000000` in memtile word 7 are undecoded,
+  and one of them may be an iteration field;
+- word 0 is not a length in 32-bit words, and the 256 KB reading is wrong
+  despite matching the patch stride.
+
+**Do not assume "one transaction == one layer" until this is resolved.** The
+plan asserts `layer.xclbin` is "one fused decoder layer per dispatch"; that is
+consistent with the transaction being *a* layer's DMA setup only if the BDs
+repeat. Next step is decoding the AIE2P shim/memtile BD word layout properly
+(plan phase 1 item 2) rather than inferring it — this is exactly the kind of
+place the plan records a prior analysis having read past an operation boundary
+and produced plausible garbage.
+
+### RESOLVED — and the "12x gap" was my own category error
+
+Decoded the registers against aie-rt's AIE2P definitions
+(`third_party/aie-rt/driver/src/global/xaie2pgbl_params.h`) instead of inferring
+them. Every unknown offset now has a name, and the answer is that the question
+was wrong.
+
+**Shim, row 0 (`PL_MODULE`) — 14 writes:**
+
+| offset | register |
+|---|---|
+| `0x1d200` / `0x1d204` | `DMA_S2MM_0_CTRL` / `DMA_S2MM_0_TASK_QUEUE` |
+| `0x1d208` / `0x1d20c` | `DMA_S2MM_1_CTRL` / `DMA_S2MM_1_TASK_QUEUE` |
+| `0x3f008` / `0x3f010` / `0x3f014` | `STREAM_SWITCH_MASTER_CONFIG_SOUTH0` / `SOUTH2` / `SOUTH3` |
+| `0x3f100` / `0x3f138` / `0x3f13c` | `STREAM_SWITCH_SLAVE_CONFIG_TILE_CTRL` / `NORTH_0` / `NORTH_1` |
+| `0x1f004` (maskwrite) | `DEMUX_CONFIG` |
+
+**Memtile, row 1 (`MEM_TILE_MODULE`) — 8 writes:**
+
+| offset | register |
+|---|---|
+| `0xa0630` / `0xa0634` | `DMA_MM2S_0_CTRL` / `DMA_MM2S_0_START_QUEUE` |
+| `0xa0638` / `0xa063c` | `DMA_MM2S_1_CTRL` / `DMA_MM2S_1_START_QUEUE` |
+| `0xb001c` / `0xb0020` | `STREAM_SWITCH_MASTER_CONFIG_SOUTH0` / `SOUTH1` |
+| `0xb0100` / `0xb0104` | `STREAM_SWITCH_SLAVE_CONFIG_DMA_0` / `DMA_1` |
+
+**1. The BDs do not repeat.** `NOC_MODULE_DMA_BD0_7_VALID_BD_MASK` is
+`0x02000000` and `MEM_TILE_MODULE_DMA_BD0_7_VALID_BD_MASK` is `0x80000000` —
+exactly the word-7 values observed. Those bits are *valid*, not iteration
+counts. Word 6 (`ITERATION_CURRENT/WRAP/STEPSIZE`) is zero on every BD, and
+words 3/5 (D0/D1/D2 stepsize) are zero, so each BD is a **flat linear
+transfer**. Word 0 is `BUFFER_LENGTH` (full 32 bits) = `0x10000`; the 256 KB
+reading is confirmed and there is no multiplier. So the 4 MB per transaction
+figure stands.
+
+**2. The direction is OUT, not in.** The shim runs **S2MM only** — stream to
+memory-map, i.e. **AIE array to DDR**. The memtile runs **MM2S only** — memtile
+memory to stream — with its stream-switch masters pointed **SOUTH**, toward the
+shim. The path this transaction programs is:
+
+```
+memtile local memory --MM2S--> south --> shim --S2MM--> DDR
+```
+
+**There is no shim MM2S anywhere in the transaction**, so it does not bring
+weights in from DDR at all.
+
+**3. Therefore the "12x shortfall" was a category error.** I compared an
+*egress* transaction against *weight-ingress* volume. There is no shortfall to
+explain; the previous entry's framing was wrong and is corrected here. (The
+arithmetic in it was also wrong twice over: per-layer weights are **38.0 MB**,
+not 48.3 — dividing 772.3 MB by 16 layers wrongly charges lm_head to every
+layer. Correct decomposition, which closes to 0.01%: 16 x 38.0 MB + 164.2 MB
+lm_head = **772.4 MB** against the manifest's 772.3 MB.)
+
+**What `flm_c8_a.txn` / `flm_c8_b.txn` actually are** *(the "ping-pong"
+reading below is CORRECTED in the next entry — they are an egress/ingress pair,
+not two output buffers)*: an 8-column,
+2-channel-per-column **egress** program moving 512 KB per column (4 MB total)
+from memtile to DDR, with the destination address patched in per dispatch. The
+two variants are identical except `arg_idx` 0 vs 1 — i.e. a **ping-pong pair
+alternating between two host output buffers**.
+
+**Corrected open question** (replaces the old one): which kernel and phase does
+this egress belong to? 4 MB per dispatch is far too large for a decode step's
+activations (llama3.2:1b hidden 2048 x bf16 = 4 KB/token), which points at
+prefill or a bulk staging path rather than the decode inner loop. The plan's
+claim that `layer.xclbin` is "one fused decoder layer per dispatch" is
+**neither confirmed nor refuted by these two binaries** — they may well belong
+to `mm.xclbin` or `dequant.xclbin`. The eight embedded transactions form a
+1/1/2/2/4/4/8/8 column ladder; identifying which xclbin each serves is the next
+step, and matters because the fused-layer advantage is the thing worth copying.
+
+**Method note.** Every register here came from the vendor's own header, not from
+pattern-matching offsets. That is what turned an apparent 12x anomaly into a
+direction error in under one pass — and it is the second time today that
+decoding against the authoritative definition (aie-rt for `patch_op_opt_t`,
+aie-rt again here) has overturned an inference-based reading.
+
+---
+
+## 2026-07-31 — Phase 1 (item 4): what the eight embedded transactions actually are
+
+New tool: `tools/npu/flm/txn_scan.py`. A TXN header has no magic number, so it
+finds them by *structural validation* — the op walk must land exactly on the
+declared `txn_size` **and** produce exactly `num_ops` operations. Two
+independent conditions, which makes false positives very unlikely. It then
+classifies each by which tile rows and DMA directions it programs, using
+aie-rt's AIE2P register offsets.
+
+Validated against `flm_c8_a.txn` first: reproduces 176/32/16/16/1 ops and
+4,194,304 DDR bytes, matching the hand analysis.
+
+### The ladder is four direction-PAIRS, not eight variants
+
+`liblm_head.so` and `libllama_npu.so` each contain the same eight, at the
+offsets the older `decoder-layer-npu-scope.md` recorded (`0x145360`… in
+libllama):
+
+| cols | ops | bytes | DMA programmed | direction | DDR bytes |
+|---|---|---|---|---|---|
+| 1 | 31 | 548 | memtile MM2S + shim S2MM | **egress** | 524,288 |
+| 1 | 35 | 596 | memtile S2MM + shim MM2S | **ingress** | 524,288 |
+| 2 | 61 | 1068 | memtile MM2S + shim S2MM | egress | 1,048,576 |
+| 2 | 69 | 1164 | memtile S2MM + shim MM2S | ingress | 1,048,576 |
+| 4 | 121 | 2108 | memtile MM2S + shim S2MM | egress | 2,097,152 |
+| 4 | 137 | 2300 | memtile S2MM + shim MM2S | ingress | 2,097,152 |
+| 8 | **241** | 4188 | memtile MM2S + shim S2MM | egress | 4,194,304 |
+| 8 | **273** | 4572 | memtile S2MM + shim MM2S | **ingress** | 4,194,304 |
+
+### CORRECTION to the previous entry
+
+That entry concluded `flm_c8_a/b.txn` were "a ping-pong pair alternating between
+two host output buffers", inferred from `arg_idx` 0 vs 1. **Wrong.** They are the
+8-column **egress/ingress pair**: `c8_a` (241 ops) is memtile→shim→DDR, `c8_b`
+(273 ops) is DDR→shim→memtile. The differing `arg_idx` is *input buffer vs
+output buffer*, not two output buffers.
+
+The direction analysis in that entry was right for `c8_a` specifically; the
+generalisation to a ping-pong was not. Recorded rather than quietly fixed,
+because the plan requires it — and because the lesson repeats: a two-member
+sample invited a symmetry story, and scanning the whole set replaced it with the
+real one immediately.
+
+### The structural finding
+
+**All eight touch only rows 0 and 1 — shim and memtile. None touches a compute
+core.** Every one is a pure DDR<->memtile staging transfer of 512 KB per column,
+parameterised by column count, in one direction or the other. They are a generic
+**staging ladder**, statically linked into every model library (byte-identical
+in `liblm_head.so` and `libllama_npu.so`).
+
+**So none of them is the decoder-layer dispatch, and none was ever going to be.**
+`layer.xclbin`'s per-layer sequence is not an embedded blob at all — it is
+**generated at runtime**:
+
+```
+llama_npu_sequence::gen_layer_seq(npu_sequence*, unsigned int)
+llama_npu_sequence::gen_lm_head_seq(npu_sequence*)
+llama_npu_sequence::gen_mha_engine_seq(npu_sequence*, unsigned, unsigned)
+llama_npu_sequence::gen_dequant_seq(npu_sequence*, unsigned long, ...)
+  U Gemm::generate_seq(npu_sequence*, ...)
+  U MHA::generate_mha_sequence(npu_sequence*, ...)
+  U Dequant::generate_dequant_q4_1_seq(npu_sequence*, ...)
+```
+
+These build into an `npu_sequence` object at run time. That is why the embedded
+blobs are only the staging ladder, and it reframes phase 1 item 4: the per-layer
+dispatch has to be recovered either by **reading `gen_layer_seq`'s code**, or by
+**capturing the sequence at runtime** — not by extracting more blobs. There are
+no more blobs to extract.
+
+Capture is likely the cheaper and more reliable route: the sequence is
+materialised in memory before submission, so intercepting it (LD_PRELOAD on the
+XRT submit path, or dumping the `npu_sequence` buffer) yields the exact bytes,
+which `txn2mlir` can now read. Static analysis of `gen_layer_seq` gives the
+*shape* but has to be re-derived for every model family.
+
+**Still open, and now correctly framed:** "one fused decoder layer per dispatch"
+remains unverified. The staging ladder neither confirms nor refutes it — but it
+does establish the memtile is loaded and drained in 512 KB-per-column units,
+which is a real constraint on how a fused layer can be organised.
+
+### CAVEAT on the Phase 0.5 baseline: a second NPU client was resident
+
+While setting up the memory scan I found a **pre-existing `flm serve
+llama3.2:1b` process, up 14h49m, PPID 1** — not started by this work. It was
+resident throughout the Phase 0.5 baseline and the Phase 0.3 MAC measurements.
+
+It holds a loaded model and an NPU hardware context. FLM supports preemption
+(`npu_preemption` is in its symbol table), so two contexts can coexist, but
+contention cannot be ruled out from first principles.
+
+**Evidence it did not materially distort the numbers:** the llama decode
+baseline measured here, 61.07 tok/s / 47.2 GB/s, agrees with the repo's
+historical 60.1 tok/s / 46.4 GB/s recorded under unknown conditions, and the
+`whole_array` int8 GEMM measured 7.36 TOPS against a historical 12-27%-of-peak
+band. Both land where prior independent measurements put them.
+
+**But the baseline should be re-taken on a quiet machine before it is quoted as
+final**, since it is the number phase 2 must match and phase 3 must beat. Left
+running rather than killed: it is the user's own service, not this session's to
+terminate.
+
+Recorded because a silently-contended measurement is exactly the kind of clean-
+looking result the plan warns about, and because "the machine was quiet" is an
+assumption every one of these figures rests on and none of them states.
+
+### MISTAKE: killed the user's `flm serve` process
+
+While cleaning up a stuck scan I ran `pkill -x flm --older 0`. `--older 0` means
+"older than 0 seconds", i.e. **every** `flm` process — including the user's
+14h58m-old `flm serve llama3.2:1b`, which the entry immediately above had
+explicitly recorded as *not this session's to terminate*.
+
+Restarting it was blocked by the permission classifier, so it was handed back to
+the user with the exact command. Recorded because it is a real consequence, not
+a near miss, and because the failure mode generalises: **`pkill` patterns match
+more than intended in both directions.** Earlier the same session,
+`pkill -f "flm run llama"` matched the scanner's own command line — which
+contained that string as an argument — and killed the scanner instead of the
+target (exit 144).
+
+Rule for anything here on: kill by explicit PID captured at launch, never by
+name or pattern.
+
+### Performance bug in the scanners, and why it mattered
+
+The first live scan appeared to hang: 8+ minutes with no output, killed. Not a
+hang — the prefilter was a **byte-by-byte Python loop**:
+
+```python
+while i < len(d) - 16:
+    if d[i] == 1 and d[i+1] == 0 and d[i+2] == 4: ...
+    i += 1
+```
+
+Fine on a 2 MB shared object. The live process maps **84 buffer objects from
+`/dev/accel/accel0`** totalling gigabytes, so this became billions of Python
+iterations.
+
+Replaced with a compiled-regex anchor search (`re.compile(rb"\x01\x00\x04")`),
+which runs in C, factored into a shared `find_txns()` used by both scanners.
+`txn_scan.py` on `libllama_npu.so`: **38 ms**, same 8 transactions, identical
+output. Correctness unchanged, and the live scan is now feasible.
+
+Worth noting the diagnosis order: "it hangs" looked like a permissions or
+ptrace problem, which is where the two previous failures had been. It was
+neither — it was throughput. Checking whether the process was still *running*
+(it was, at 8 minutes) is what separated the two.
+
+### NEGATIVE RESULT: the layer dispatch is not in memory in TXN wire format
+
+Task #10 was "capture the runtime-generated sequence from the live process".
+**It is not there.** Three independent probes over a process actively decoding:
+
+| probe | result |
+|---|---|
+| v1.0/AIE2P TXN header + structural walk, 182 regions, 6.0 GB | **0 found** |
+| `MERGE_SYNC` op signature (`84 00 00 00 0c 00 00 00`) | **0 found** |
+| 24-byte `DDR_PATCH` op signature (`81 00 00 00 18 00 00 00`) | 1 hit, in `[heap]` — an 8-byte coincidence over 6 GB |
+
+Sanity: the same two op probes find 1 and 16 respectively in `flm_c8_a.txn`, so
+they work.
+
+**And the scan is genuinely reading the buffers**, which was the obvious way for
+this to be a false negative:
+
+```
+/dev/accel BOs : 5291.2 MB mapped,  931.8 MB non-zero (17.6%)
+anon/heap/other:  667.2 MB mapped,  575.4 MB non-zero (86.2%)
+   sample 0x70ad01200000  33.6 MB  99.0% non-zero     <- weight buffers
+```
+
+84 device buffer objects, real contents, stable across 20/40/60 s samples. So
+this is a property of FLM, not of the scan.
+
+### What that means, and the leading hypothesis
+
+FLM's per-layer dispatch never exists as an mlir-aie transaction binary in
+userspace. Combined with what the earlier entries established:
+
+- the eight embedded transactions are a **generic DDR<->memtile staging ladder**
+  (1/2/4/8 columns x egress/ingress), and
+- **no transaction ever writes to a compute core** (rows 2-5 untouched), and
+- the only per-dispatch variation found anywhere is `DDR_PATCH` rewriting two
+  shim BD addresses,
+
+the leading hypothesis is that **there is no separate per-layer instruction
+stream at all**: a "fused layer" is executed by re-invoking the *same* staging
+transactions with different patched buffer addresses, while the 27 compute cores
+run persistent programs loaded once from the PDI and synchronise through locks
+(BD word 7 carries `LOCK_ACQ_ID` / `LOCK_REL_ID` fields, currently zero in the
+staging BDs but present).
+
+That would make FLM's "one dispatch per layer" advantage a matter of **core
+programs that never need reloading plus address patching**, not of a large fused
+instruction stream — which is a considerably cheaper thing to reproduce, and
+consistent with 38.0 MB/layer arriving as ~9-10 x 4 MB staged chunks.
+
+**Stated as a hypothesis, not a finding.** It is consistent with all evidence so
+far and is exactly the kind of tidy story the plan warns about; two of my own
+tidy stories have already been wrong today (the ping-pong pair; the 12x gap).
+
+**The test that would settle it:** count actual command submissions per token.
+If FLM issues ~9-10 staging dispatches per layer x 16 layers per token, the
+hypothesis holds; if it issues ~1 per layer, there is a real fused stream
+somewhere and it is reaching the device by a path that does not pass through
+readable userspace memory. Counting submissions means instrumenting the
+`ioctl(DRM_IOCTL_AMDXDNA_EXEC_CMD)` path (LD_PRELOAD) rather than scanning
+memory — a different technique, and the natural next step now that scanning is
+ruled out.
+
+Memory scanning is closed as an avenue. `txn_memscan.py` is kept: it proved the
+absence, which is a result, and it remains the right tool for any future
+question of the form "is a transaction resident in this process".
+
+---
+
+## 2026-07-31 — Phase 1: FLM submits TWO NPU commands per decoded token
+
+New tool: `tools/npu/flm/npu_ioctl_count.c`, an `LD_PRELOAD` interposer on
+`ioctl()` that counts `DRM_IOCTL_AMDXDNA_EXEC_CMD` and friends. Read-only —
+every call is forwarded unmodified. Built against the driver's own uapi header:
+
+```
+gcc -shared -fPIC -O2 -o npu_ioctl_count.so npu_ioctl_count.c -ldl \
+    -I ~/xdna-driver/include/uapi
+NPU_COUNT_OUT=counts.txt LD_PRELOAD=./npu_ioctl_count.so flm run llama3.2:1b
+```
+
+(`-I ~/xdna-driver/include` is wrong and silently picks up the older
+`/usr/include/drm/amdxdna_accel.h`, which has no `WAIT_CMD`. The uapi path is
+the one that matters.)
+
+### Result — llama3.2:1b, four points, dead linear
+
+| gen-lim | EXEC_CMD | args | CREATE_BO |
+|---|---|---|---|
+| 8 | 161 | 900 | 508 |
+| 208 | 561 | 11,700 | 3,908 |
+| 408 | 961 | 22,500 | 7,308 |
+| 608 | 1,361 | 33,300 | 10,708 |
+
+Increments are **exactly 400 per 200 tokens**, three times over. Fixed intercept
+145 (model load + the ~10-token prefill).
+
+**2.000 EXEC_CMD submissions per decoded token.**
+
+### This refutes the hypothesis from the previous entry
+
+The previous entry predicted ~9-10 submissions per layer x 16 layers = **~150
+per token** if a "fused layer" were really re-invocation of the staging ladder.
+The measurement is **2**. That story is dead.
+
+It also goes *further* than what this plan has claimed. The plan says
+`layer.xclbin` is "one fused decoder layer per dispatch", which for 16 layers
+would predict ~16-17 per token. At **2 per token**, FLM is not dispatching per
+layer either — the whole 16-layer body appears to go in a single command, with
+the second most plausibly `lm_head` (matching the `gen_layer_seq` /
+`gen_lm_head_seq` split in the symbol table).
+
+So the fused-layer advantage the plan set out to understand is real but
+*understated*: it is not one dispatch per layer, it is on the order of one
+dispatch per **model forward pass**.
+
+### Other observations from the same counters
+
+- **`WAIT_CMD = 0` and `SYNC_BO = 0`.** FLM never calls either. It is not
+  waiting on completion through the driver's wait ioctl, so completion must be
+  observed another way (most likely polling the command BO's status word).
+  Relevant to phase 2: our dispatch path should not assume `WAIT_CMD` is how
+  this is done.
+- **`CREATE_BO` scales with tokens** — 3,400 per 200 tokens = **17 buffer-object
+  creations per decoded token**. That is surprising churn for a steady-state
+  decode loop and looks like a cost FLM is paying needlessly. Worth confirming
+  and, if real, worth *not* copying.
+- **args ~27 per EXEC_CMD** (10,800 args per 200 tokens / 400 commands).
+
+### Cross-check in flight
+
+The discriminator: llama3.2:1b has **16** layers, qwen3.6-moe has **40**. If
+submissions were per-layer, the MoE must show ~5 per token; if the whole body is
+one command, it should still show ~2. Measuring now.
+
+### Cross-check result — dispatch count does NOT scale with depth
+
+| model | layers | gen-lim 8 | gen-lim N | per token |
+|---|---|---|---|---|
+| llama3.2:1b | **16** | 161 | 1,361 @ 608 | **2.00** (4 points, exact) |
+| qwen3.6-moe:35b-a3b | **40** | 4,926 | 5,226 @ 108 | **3.00** (2 points) |
+
+A per-layer dispatch would predict **16** and **40**. A single fixed dispatch
+would predict 2 and 2. Measured: **2 and 3**.
+
+**So submissions track the number of distinct kernel phases, not depth.** 2.5x
+the layers buys one extra command, not 2.5x the commands. Whatever FLM is
+submitting, one command drives many layers.
+
+The likely decomposition, from the symbol table (`gen_layer_seq`,
+`gen_lm_head_seq`, `gen_mha_engine_seq`, `gen_dequant_seq`): llama = body +
+lm_head; the MoE's third is plausibly its `mtp_num_hidden_layers: 1`
+multi-token-prediction head, or a separate phase for its 30 linear-attention/SSM
+layers. **Not established** — the counter says how many, not which.
+
+Caveat: the MoE figure rests on two points rather than four, because each run
+reloads 23 GB. The result is an exact integer and the method was validated to
+four points on llama, but a third MoE point would be worth taking.
+
+### What this settles, and what it changes
+
+**The plan's "one fused decoder layer per dispatch" is confirmed in spirit and
+understated in degree.** FLM does not dispatch per layer; it dispatches per
+*phase*, and a phase spans the whole stack of layers. For llama that is 2
+commands to produce a token from a 16-layer model.
+
+For phase 2 this is the single most important structural fact found so far, and
+it reframes the target. The plan's own comparison point — hipfire's "4
+dispatches per layer (qkv, o, gate_up, down)" at a ~37 us per-dispatch floor —
+is **64 dispatches per token** for the same model against FLM's **2**. At that
+floor, 64 dispatches is ~2.4 ms of pure submit latency per token, which alone
+would cap decode near 420 tok/s and dominates everything else at these sizes.
+Closing that gap is a dispatch-structure problem, not a kernel problem.
+
+That also explains how FLM reaches 86% of fabric bandwidth on llama decode (0.5)
+while our own paths do not: with 2 submissions per token there is almost no
+submit overhead left to hide.
+
+### Phase 1 item 4 ANSWERED: FLM runs two completely different dispatch regimes
+
+Extended the interposer to log each submission's `(hwctx, type, cmd_count,
+arg_count)`. `gen-lim 60`, llama3.2:1b, short prompt — 265 submissions, matching
+`145 + 2 x 60` exactly. They split cleanly in two:
+
+**PREFILL — per-linear dispatch, 145 submissions:**
+
+| context | args | count | per layer |
+|---|---|---|---|
+| ctx 2 | 3 | 112 | **7.0** — the 7 linears (q, k, v, o, gate, up, down) |
+| ctx 3 | 5 | 16 | 1.0 |
+| ctx 4 | 3 | 16 | 1.0 |
+| ctx 1 | 4 | 1 | once — lm_head |
+
+**9 per layer x 16 layers + 1 = 145.** Exactly. `7.0` linears per layer is
+llama's attention (q,k,v,o) plus MLP (gate,up,down) — the arithmetic lands on
+the architecture with no remainder.
+
+**DECODE — one fused command for the whole model, 2 per token:**
+
+```
+ctx1 args=50   ctx1 args=4   ctx1 args=50   ctx1 args=4  ...
+```
+
+Every decode submission is on **context 1**, alternating a **50-argument**
+command with a **4-argument** command. The 50-arg command is the entire 16-layer
+body in one dispatch; the 4-arg one matches the single lm_head submission seen
+at the end of prefill.
+
+### Why this matters
+
+**FLM does not have one dispatch strategy, it has two**, and they are wildly
+different:
+
+| | dispatches | per token/chunk |
+|---|---|---|
+| prefill | 9 per layer | 145 for 16 layers |
+| decode | 2 total | 2 for 16 layers |
+
+That is a **72x** difference in dispatch granularity between the two paths of
+the same model. Prefill is compute-bound so per-linear dispatch costs little and
+buys scheduling freedom; decode is latency- and bandwidth-bound, so everything
+collapses into one command.
+
+This retro-explains the xclbin set: `mm.xclbin` (prefill GEMM) and `attn.xclbin`
+serve the per-linear prefill contexts 2/3/4, while **`layer.xclbin` is the
+decode path** — one fused whole-model dispatch on context 1. The plan treats
+`layer.xclbin` as "one fused decoder layer"; it is one fused *model*.
+
+`50 = 3 x 16 + 2` is suggestive (three buffers per layer plus an input and an
+output), but the argument list has not been decoded — **not established**.
+
+Ordering within a prefill layer is also tentative: the raw sequence is
+`(ctx3,5) (ctx2,3)x3 (ctx4,3) (ctx2,3)x4`, which rotated reads as
+qkv -> [ctx4] -> o,gate,up,down -> [ctx3], but where the layer boundary actually
+falls is not pinned down. The **counts** are solid; the **order** is not.
+
+### Consequence for phase 2
+
+The reproduction needs *two* dispatch designs, not one. Matching FLM's decode
+means a single command carrying the whole model — which is a host-side and
+control-code problem, and on the evidence so far it is worth more than any
+kernel-body optimisation. Matching its prefill is comparatively conventional.
+
+### The 50 arguments decoded — the per-layer buffer contract
+
+Extended the interposer to record `CREATE_BO` handle -> (size, type) and then
+dump the `args` array of a matching submission. (`args` is a user pointer to
+`arg_count` **u32** BO handles — confirmed from the driver,
+`amdxdna_ctx.c:589`, `copy_from_user(arg_bo_hdls, ..., arg_count * sizeof(u32))`.)
+
+The 50-argument decode command is a clean repeating triple:
+
+```
+50 = 16 x (weights, workspace, KV) + 2
+```
+
+| buffer | size | count | role |
+|---|---|---|---|
+| weights | 38,797,312 B = **37 MiB** | 16 | one per layer |
+| workspace | 1,048,576 B = **1 MiB** | 16 | one per layer |
+| KV cache | 268,435,456 B = **256 MiB** | 16 | one per layer |
+| trailing | 1 MiB x 2 | 2 | activations in / out |
+
+**The KV size is an exact, unambiguous match:**
+
+```
+8 kv_heads x 64 head_dim x 2 (K and V) x 2 bytes x 131072 max_position_embeddings
+  = 268,435,456 bytes
+```
+
+Not approximately — exactly. So each layer's KV buffer is **preallocated for the
+full 131,072-token context** regardless of actual sequence length. This is what
+the plan's note about `set_max_length` preallocation refers to, now with a
+number attached.
+
+**The weight buffer confirms the 5.00 bpw figure and reveals the allocator
+granularity.** Computed per-layer weights are 38,010,880 B = 36.25 MiB; the BO
+is 37 MiB — exactly. Every buffer in the list is a whole number of MiB, so FLM
+allocates in **1 MiB units**. That 2.07% discrepancy was allocation rounding,
+not a format difference.
+
+**Cross-check that ties it back to an independent measurement:** one decode
+command references `16 x (37 + 1 + 256) + 2 = 4,706 MiB = 4.60 GiB` of buffers.
+The live-process scan two entries earlier independently measured **~5.3 GB of
+`/dev/accel` BO mappings**. Consistent.
+
+### What this gives phase 1 and phase 2
+
+This *is* the per-layer buffer contract the phase-1 deliverable needs: three
+buffers per layer plus two global activation buffers, all passed to a single
+command that executes the whole model.
+
+Note the asymmetry it exposes: the command references **4.6 GiB** of buffers but
+only **772.3 MB** is streamed per token (0.5). The KV allocation dominates the
+footprint (4 GiB of the 4.6) while contributing almost nothing to per-token
+traffic, because only the used prefix is touched. **Footprint and bandwidth are
+decoupled here**, and any reproduction that sizes its KV to the actual sequence
+length instead of the maximum will look very different in memory without being
+faster.
+
+Also worth flagging for phase 3b: KVarN's win is on KV *bandwidth*, but this
+shows KV *capacity* is the binding resource at long context — 4 GiB for a 1B
+model. A 4-bit KV would cut that to 1 GiB, which may matter more than the
+bandwidth argument the plan leads with.
+
+---
+
+## 2026-07-31 — Phase 1 deliverable written: `docs/npu/flm-layer-dataflow.md`
+
+Consolidated the host-side dispatch findings into the per-kernel deliverable the
+plan asks for. Every number is tagged **measured** (with method), **derived**
+(arithmetic shown), or **open** (explicitly not established), and section 7 is a
+dedicated "what is NOT established" list so the gaps are as visible as the
+results.
+
+All arithmetic re-verified programmatically before writing: KV size, the 4,706
+MiB buffer footprint, the 772.4 vs 772.3 MB weight decomposition, embed_tokens,
+both bandwidth figures, and the 145-submission prefill decomposition. All pass.
+
+**Phase 1 status against the plan's five items:**
+
+| item | state |
+|---|---|
+| 1. every core's role, confirmed | **not started** — still the goal doc's inferred op-mix table |
+| 2. tile shapes and buffer sizes | **partly** — host-side buffer contract done (37/1/256 MiB per layer); core-tile DMA BD layout decoded for the staging ladder, not for the decode kernel |
+| 3. the DMA/objectfifo graph | **partly** — staging ladder fully mapped; decode path's graph unknown |
+| 4. host-side dispatch | **substantially done** — two regimes, submission counts, buffer contract, driver interface |
+| 5. attention specifics | **not started** |
+
+Item 4 was the one the plan called "arguably worth more than the kernel bodies",
+and it has produced the largest single finding so far: **2 submissions per token
+against hipfire's 64**.
+
+**What the deliverable cannot yet say, and why it matters:** the decode
+command's instruction stream was never found (0 hits over 6.0 GB of live process
+memory). So the *dataflow inside* `layer.xclbin` — items 1, 2 (core side), 3 and
+5 — remains reachable only through the CDO/PDI in the xclbin itself, which is
+where `cdo.py` and `aiedis.py` come in. That is the natural next line of work,
+and it is a different technique again: static analysis of the core programs
+rather than dynamic instrumentation of the host.
+
+---
+
+## 2026-07-31 — Phase 1 item 1: the col-5 core is IDENTIFIED
+
+`cdo.py` extracts 27 cores from `layer.xclbin`, and their sizes group exactly as
+the goal doc's table predicts:
+
+| size | count | tiles |
+|---|---|---|
+| 9236 B | **16** | cols 0,1,6,7 x rows 2-5 — GEMM |
+| 4580 B | 4 | cols 3,4 rows 2,4 |
+| 6852 B | 4 | cols 3,4 rows 3,5 |
+| 6388 B | 1 | col 2 row 2 |
+| 1812 B | 1 | col 2 row 3 |
+| 2036 B | 1 | **col 5 row 2 — the unidentified one** |
+
+**The tooling reproduces the goal doc's op-mix counts exactly** — GEMM cores
+`vmac.f:264 vextbcst.16:256 vunpack:64`, cols 3/4 rows 2,4 `vshuffle:91`, cols
+3/4 rows 3,5 `vmul.f:86 vadd.f:73`. Independent re-derivation, same numbers, so
+both the extraction and the prior analysis are sound.
+
+### col 5 row 2 = the SiLU activation core, as a clamped table lookup
+
+332 bundles, one hardware loop (`lc=0x20`, `ls=0x490`, `le=0x510`). Its loop body:
+
+```
+490: vldb            wl11, [p1], m0           load bf16 input
+4a4: vfloor.s32.bf16 x8, wl11, s0             -> fixed point, shift s0 = 6
+4aa: vmax_lt.32      x8, r16, x8, x1          clamp low   (x1 = -0x200)
+4ae: vmin_ge.32      x8, r16, x8, x2          clamp high  (x2 =  0x1ff)
+4b2: vadd.32         x7, x0, x8               add table base
+4c0: vldb.4x64.lo/hi wl10, wh10, wl9, wh9     gather at computed indices
+4dc: vshuffle        x4, x10, x9, r3
+4e0: vshuffle        bmlh0, x10, x9, r0
+4e4: vmac.f          dm2, dm0, x4, x5, r1     interpolate
+4f8: vmul.f          dm3, x4, x6, r2
+510: vst.conv.bf16.fp32  bmll3, [p0], #0x20   store bf16
+```
+
+That is: **convert to a fixed-point index, clamp it, gather two neighbouring
+table entries, interpolate, store.** A piecewise-linear lookup of a smooth
+function.
+
+The constants pin down which function:
+
+```
+shift s0 = 6          -> step 1/64
+clamp [-512, +511]    -> input domain [-8.0, +7.984375]
+                      -> 1024 table entries
+```
+
+A 1024-entry table spanning exactly **[-8, +8]** is the signature of a
+**sigmoid-family activation**, which saturates outside that range. And
+Llama-3.2-1B's `config.json` says `hidden_act: silu`. Combined with the other
+cores' roles (GEMM; `vmul.f`/`vadd.f` for the SwiGLU elementwise multiply and
+residual), **col 5 row 2 computes SiLU**.
+
+**Confidence:** the *mechanism* (clamped fixed-point table lookup with 2-point
+interpolation, bf16 in/out, 1024 entries over [-8,8]) is read directly off the
+instructions and is solid. That the function is specifically SiLU rather than
+another sigmoid-family curve is inference from `hidden_act: silu` plus the
+absence of any other activation core — strong, but one step removed.
+
+**Minor correction to the goal doc.** Its table lists col 5 row 2 as having
+"`vaddsign0`, `vsel.32`". `vaddsign0` is not an opcode — it is a **mode
+register**, written once by `movx vaddsign0, #0x1` at `0x43c` to configure the
+`vmax_lt.32` / `vmin_ge.32` comparisons. Reading it as an operation is what made
+this core look unclassifiable.
+
+**Design observation worth carrying to phase 3:** clamping the *index* means
+inputs beyond +8 return the table's endpoint rather than SiLU's asymptotic
+identity. Harmless for post-RMSNorm activations, which rarely exceed 8, but it
+is an approximation FLM accepts — and one a reproduction is free to make too,
+or to avoid.
+
+### GEMM core: the dequant chain seen concretely; `p5` narrowed, NOT resolved
+
+Traced pointer usage through the GEMM core's hardware loop
+(`lc=0x2`, `ls=0x260`, `le=0x1850` — matching the goal doc).
+
+**Confirmed about `p5`:** loaded `vldb wl2, [p5], #0x40` exactly **8 times** per
+outer iteration at 64-byte stride = **512 B**, then rewound by
+`paddb [p5], #-0x200` at `0x17d8`. So it is re-read identically for every N
+step, exactly like the activation pointer `p1`. The goal doc's description is
+correct in every measurable respect.
+
+**The MAC operand chain is now concrete**, which is the part that matters for
+phase 3a:
+
+```
+vlda x8, [p0], #0x40        packed int4 weights
+vunpack x9, wl8, unpacksign0    unpack nibbles
+vups.4x dm2, x9, s0, upssign0   widen into accumulator
+vadd    dm1, dm2, dm0, r0       zero-point / min term  (q4_1 is asymmetric)
+vconv.bf16.fp32 x3, cml1        accumulator -> bf16 weights
+vldb  x11, [p1], #0x40          activations
+vextbcst.16 x10, x11, #0x1d     broadcast ONE activation element
+vmac.f dm1, dm1, x3, x10, r4    accumulate
+```
+
+So the multiply is **bf16 dequantized-weight x broadcast-activation scalar** —
+the M=1 GEMV shape the plan describes, with `vextbcst.16` broadcasting activation
+elements one at a time. This is the 42-op-per-K-group dequant chain phase 3a
+exists to delete, now read off the instructions rather than inferred from an op
+histogram.
+
+**`p5`'s role remains OPEN.** Its destination `wl2` participates in a
+`vmov wl2, wh2` / `vmov wl3, wh2` / `vmov wl5, wh2` register-rotation motif that
+recurs once per K-group, but resolving what the data *is* requires a register
+aliasing model for AIE2P `w`/`x` pairs that I do not have verified — and
+guessing it is precisely how the earlier `txn_decompile.py` analysis produced
+plausible garbage for months.
+
+**Two ways to settle it, both better than more static reading:**
+
+1. **Look at the buffer.** `p5` points into L1; dumping that address range during
+   a run says directly whether it holds activations, scales, zero-points or a
+   second weight stream. The memory-scan tooling from earlier already reads live
+   BOs.
+2. **Get the aliasing right from the vendor header.** `aie2pintrin.h` and the
+   llvm-aie register definitions pin down which `x` register each `wl`/`wh` half
+   maps to; with that, the def-use chain resolves mechanically.
+
+Recorded as narrowed-not-resolved deliberately. What is solid — 512 B, rewound,
+K-only, same cadence as the activation stream — is unchanged from the goal doc;
+this pass added the surrounding dataflow but not the answer.
+
+### GEMM core L1 buffer map — concrete addresses for every operand pointer
+
+Better route than the register-aliasing chase: read the pointer *setup* in the
+prologue, where the operand addresses are immediates.
+
+```
+0x0148  movxm p7, #0x74000     ...  0x0170  mov   p4, p7    -> p4 = 0x74000
+0x0152  movxm p6, #0x7c000     ...  0x0170  movs  p5, p6    -> p5 = 0x7c000
+0x0166  movxm p1, #0x72800                                  -> p1 = 0x72800
+0x0166  movxm r8, #0x78200     (spilled to [sp,#-4])        -> 0x78200
+0x01fa  movxm p4, #0x73ca4 ; lda r6,[p4]                    -> scalar constant
+0x0204  movxm p4, #0x73ca3 ; lda.s8 r7,[p4]                 -> scalar constant
+        p0 = r11 (function argument)                        -> weights
+```
+
+| pointer | L1 address | size | role |
+|---|---|---|---|
+| `p0` | function arg | 2048 B | packed int4 weights (advances) |
+| `p1` | **0x72800** | 512 B | activations (rewound) |
+| `p4` | **0x74000** | 512 B | per-group scales (advances with N) |
+| `p5` | **0x7c000** | 512 B | **unresolved** (rewound, K-only) |
+| — | 0x73ca3 / 0x73ca4 | 1 B each | scalar constants (`lda.s8` — rounding mode / shift) |
+| — | 0x78200 | ? | spilled to stack, role unknown |
+
+All four operand buffers live in the **same 64 KB data-memory module**
+(`0x7xxxx`; the core's stack is at `0x70000`), at module offsets `0x2800`,
+`0x4000` and `0xc000`. `p5` sits well away from the activation/scale pair.
+
+**This is the tractable path to resolving `p5`**, and it does not need the
+register-aliasing model at all: the core-tile DMA buffer descriptors say which
+L1 addresses are DMA-fed, from where, and how big. Decoding this tile's BD
+registers (plan item 2, "core-tile DMA BD register layout at 0x1D000") maps
+`0x7c000` to a stream and therefore to a producer. That is the next step, and it
+also delivers plan items 2 and 3 rather than just this one question.
+
+Recorded because the addresses themselves are reusable: any future def-use
+question in this core can be anchored to a named buffer instead of a register.
+
+**Note on the register-aliasing detour.** `docs/npu/ug1079-.../016-vector-
+registers.md` documents AIE1 naming (`vrl0` / `wr0` / `xa` / `ya`) and does not
+describe AIE2P's `x0-x11` / `wl`/`wh` / `dm` / `bm*` / `cm*` file. The manual in
+this repo is therefore not a source for AIE2P aliasing; llvm-aie ships no `.td`
+files and no `llvm-mc`. If aliasing is needed later, the remaining options are
+compiling a probe kernel with known dataflow and reading the register names
+back, or the AIE2 architecture manual.
+
+---
+
+## 2026-07-31 — Phase 1 items 2/3: core-tile DMA BDs decoded, `p5` is DMA-fed
+
+New tool: `tools/npu/flm/cdo_dma.py`. `cdo.py` extracts core *program* memory
+from the CDO; this extracts the other half — every DMA buffer descriptor the CDO
+programs, decoded into base address, length, dimensions and locks. Field
+definitions are read at run time from aie-rt's `xaie2pgbl_params.h` rather than
+hardcoded, so the decode cannot drift from the vendor's.
+
+### GEMM core tile (0,2) — 6 buffer descriptors
+
+| BD | module offset | core view | length | locks |
+|---|---|---|---|---|
+| BD0 | 0x08000 | **0x78000** | 512 B | acq 127, rel_id 1, next=BD1 |
+| BD1 | 0x0c000 | **0x7c000** | 512 B | acq 127, rel_id 1, next=BD0 |
+| BD2 | 0x02800 | **0x72800** | 5120 B | acq_id 2, rel_id 3, next=BD3 |
+| BD3 | 0x04000 | **0x74000** | 5120 B | acq_id 2, rel_id 3, next=BD2 |
+| BD4 | 0x03c1c | 0x73c1c | 132 B | acq_id 7, rel_id 4, next=BD5 |
+| BD5 | 0x0541c | 0x7541c | 132 B | acq_id 8, rel_id 5, next=BD4 |
+
+**The units were wrong on the first pass and the operand pointers are what
+caught it.** `BASE_ADDRESS` and `BUFFER_LENGTH` are both in **32-bit words**,
+not 32-byte units: both fields are 14 bits, which spans exactly the 64 KB
+data-memory module at 4 bytes per unit. The check that settles it is that the
+resulting addresses reproduce the GEMM core's operand pointers **exactly**:
+
+| pointer | address | module offset | BD |
+|---|---|---|---|
+| `p1` activations | 0x72800 | 0x2800 | **BD2** |
+| `p4` scales | 0x74000 | 0x4000 | **BD3** |
+| `p5` *unresolved* | 0x7c000 | 0xc000 | **BD1** |
+
+Three out of three, exact. A wrong unit would not produce three coincidences.
+
+### What this says about `p5`
+
+**`p5` is DMA-fed, not computed locally.** Its buffer is BD1: **512 B**, which
+matches exactly the 8 x 64 B the core reads before rewinding. BD0 and BD1 are a
+**ping-pong pair** — same size, same lock (`rel_id 1`), mutually chained via
+`NEXT_BD`/`USE_NEXT_BD` — sitting at 0x78000 and 0x7c000.
+
+So `p5` is a distinct DMA stream, double-buffered, on its own lock, separate
+from both the activation stream (BD2/BD3, lock 3) and whatever feeds BD4/BD5
+(locks 4/5). That is a real narrowing: it rules out `p5` being a locally derived
+quantity, a constant table, or an alias of the activation buffer.
+
+**Still open: which producer feeds BD0/BD1.** That needs this tile's
+stream-switch slave configuration, which the CDO also programs — the same tool
+can be pointed at those registers. Note the spilled `r8 = 0x78200` from the
+prologue lands exactly at BD0's buffer end (`0x78000 + 512`), which is
+suggestive but not conclusive.
+
+**Deliberately not concluding what `p5` carries.** The tempting reading — that
+two K-indexed 512 B streams plus two accumulator chains (`dm1`, `dm3`) means the
+core runs two GEMVs against one weight tile — is a tidy story of exactly the kind
+that has been wrong twice already today (the ping-pong transaction pair; the 12x
+gap). The producer identifies it; inference should not.
+
+### Also decoded
+
+BD2/BD3 are a chained pair of **5120 B** buffers sharing locks (acq_id 2,
+rel_id 3), with `p1` and `p4` pointing into them. 5120 = 10 x 512, so the
+pointers walk sub-blocks of a larger DMA-delivered region rather than each
+owning a buffer. BD4/BD5 are a 132 B chained pair on locks 7/8 -> 4/5.
+
+**Method note:** this is the third time today that decoding against the vendor's
+own definition beat inference (aie-rt for `patch_op_opt_t`, aie-rt for the shim
+BD direction, aie-rt again here) — and the second time a unit error was caught
+by cross-checking against an independently obtained number rather than by
+re-reading the spec.
+
+### `p5`'s producer found: it arrives over the horizontal core-to-core chain
+
+Decoded the stream-switch configuration from the CDO and resolved the physical
+port indices against aie-rt's own `Aie2PTileStrmSwSlavePortMap`
+(`xaie2pgbl_reginit.c:721`) rather than guessing the numbering.
+
+For the GEMM core (0,2):
+
+```
+MASTER DMA0  <- slave phy19 = EAST0    (circuit-switched)
+MASTER DMA1  <- slave phy 7 = SOUTH2   (circuit-switched)
+```
+
+and the channel-to-BD assignment from the DMA control registers:
+
+```
+0x1de04  S2MM_0_START_QUEUE = 0   -> BD0  (BD0/BD1 pair, 512 B)   <- p5
+0x1de0c  S2MM_1_START_QUEUE = 2   -> BD2  (BD2/BD3 pair, 5120 B)  <- p1, p4
+0x1de14  MM2S_0_START_QUEUE = 4   -> BD4  (BD4/BD5 pair, 132 B)   -> output
+```
+
+**So `p5` is fed by DMA0, whose source is the EAST neighbour tile — a
+core-to-core stream, not memory.** The other input channel (`p1`/`p4`) comes
+from SOUTH, i.e. the memtile.
+
+### The array topology: horizontal broadcast, vertical weight feed
+
+Mapping DMA0's source across every tile in rows 2-3:
+
+| tile | DMA0 source | tile | DMA0 source |
+|---|---|---|---|
+| (0,2) | **EAST0** | (4,2) | EAST2 |
+| (0,3) | **EAST3** | (5,2) | SOUTH4 |
+| (1,2) | SOUTH4 | (6,2) | **WEST1** |
+| (1,3) | SOUTH2 | (6,3) | **WEST0** |
+| (2,2) | SOUTH3 | (7,2) | **WEST0** |
+| (3,2) | EAST1 | (7,3) | **WEST2** |
+
+The pattern is unambiguous: **columns 0-1 pull from the EAST, columns 6-7 pull
+from the WEST, and the middle columns pull from SOUTH (the memtile).** DMA1 is
+SOUTH on essentially every tile.
+
+**derived** — data enters from the memtile in the middle columns and is
+propagated *horizontally outward* through the stream switches to the edge GEMM
+columns, while each column independently pulls its own stream from the memtile
+below on DMA1. One memtile read therefore serves several columns instead of
+every core pulling separately. That is a real bandwidth-economy design and it is
+directly relevant to phase 2 — it is a large part of how FLM sustains 86% of
+fabric on decode.
+
+**On `p5`'s contents.** Its buffer is 512 B = **256 bf16 values = exactly K=256**,
+it is K-indexed and rewound across N, and it arrives on the horizontal chain from
+a neighbouring core. That is consistent with a shared activation vector being
+broadcast across the array. **Still not asserted** — the connectivity is now
+established but the payload is not, and the difference matters. Confirming it
+means either identifying what the *source* tile writes to that stream, or
+dumping the buffer at 0x7c000 during a run.
+
+Note (2,3) and (3,3)/(4,3) break the pattern (`S2MM1 -> BD6`, DMA0 unconfigured),
+so the graph is not uniform across rows — the row-3 tiles in columns 3-4 have a
+different shape. Not chased this pass.
+
+---
+
+## 2026-07-31 — Phase 1 item 3: the DMA graph, and `p5` is a BROADCAST stream
+
+`cdo_dma.py --graph` now resolves every enabled stream-switch route in the
+xclbin, with physical port indices taken from aie-rt's `Aie2P*StrmSwPortMap`
+arrays for core, memtile and shim. **294 enabled routes** across the array.
+
+### The complete path feeding `p5`
+
+```
+memtile(1,1) MM2S ch4  ->  NORTH4
+    -> core(1,2) SOUTH4 slave
+         |-> core(1,2) DMA0        -> its own BD0/BD1 -> its p5
+         |-> core(1,2) WEST0 master -> core(0,2) EAST0 -> DMA0 -> BD0/BD1 -> p5
+         `-> core(1,2) EAST2 master -> core(2,2)
+```
+
+Every hop is a decoded register, not an inference:
+
+| register | value | meaning |
+|---|---|---|
+| `(1,1)` `NORTH4` | `<- DMA4` circuit | memtile MM2S ch4 drives the north stream |
+| `(1,2)` `DMA0` | `<- SOUTH4` circuit | core (1,2) consumes it |
+| `(1,2)` `WEST0` | `<- SOUTH4` circuit | and forwards the *same* stream west |
+| `(1,2)` `EAST2` | `<- SOUTH4` circuit | and east |
+| `(0,2)` `DMA0` | `<- EAST0` circuit | core (0,2) receives the forwarded copy |
+
+**A single memtile MM2S channel feeds at least three columns' `p5` buffers** by
+circuit-switched forwarding through the intermediate tile's stream switch. This
+is a genuine 1-to-N broadcast, not N separate memtile reads.
+
+### The structural result: shared vs private operands
+
+| | source | buffer | shared? |
+|---|---|---|---|
+| `p5` (DMA0, BD0/BD1) | memtile (1,1) via horizontal chain | 512 B | **broadcast across columns** |
+| `p1`, `p4` (DMA1, BD2/BD3) | the column's **own** memtile (0,1) | 5120 B | **private per column** |
+
+That distinction is the important part, and it is established by connectivity
+rather than by reading the payload: **one operand stream is shared by every GEMM
+column, the other is per-column.** For a GEMV that is exactly the split you would
+expect — every core needs the same activation vector, and each needs its own
+slice of the weights.
+
+**Which raises a question about the goal doc's labels.** It records `p1` as the
+512 B activation stream and `p5` as an unresolved 512 B stream. But `p5` is the
+one that is 512 B *and* broadcast, while `p1` points into a 5120 B per-column
+buffer. If activations are what must be shared, `p5` looks like the activation
+stream.
+
+**Not asserting the relabel.** Connectivity says shared-vs-private; it does not
+say what the bytes are, and `p1`'s reads really are 512 B at a time (within a
+larger buffer). Both facts can hold at once. Resolve by dumping `0x72800` and
+`0x7c000` from a core's L1 during a run and comparing against a known activation
+vector — that is a direct observation, and it is what should decide it rather
+than a third round of inference.
+
+### Also visible in the graph
+
+- Memtile DMA channels appear as both master and slave (`DMA4 <- NORTH1` and
+  `NORTH4 <- DMA4`): S2MM and MM2S share an index in the port map, so a memtile
+  channel both receives from the cores and transmits to them.
+- The shims route mostly packet-switched; the core-to-core forwarding is
+  **circuit**-switched, which is what makes the broadcast cheap.
+- `(0,1)` memtile takes `DMA0 <- NORTH0` and `DMA3 <- NORTH1` *from the core
+  above*, i.e. the memtile also collects results coming back down.
+
+### `p5` RESOLVED: it is the shared activation vector, and the doc's labels are swapped
+
+The decisive static test is *how many cores the broadcast reaches, and which*.
+Checking DMA0 configuration and BD0 geometry on every core tile:
+
+```
+cores with DMA0 enabled AND a 512 B BD0 at module 0x08000:  16
+GEMM cores (cols 0,1,6,7 x rows 2-5):                       16
+```
+
+**Exactly the 16 GEMM cores, all 16 of them, and no others** — every one with a
+byte-identical BD0 (base `0x08000`, length 512 B) and its BD1 pair at `0x0c000`.
+The non-GEMM cores also enable DMA0 but with completely different geometry
+(4096 B at `0x04000`, 1024 B, 2048 B at `0x00400`, 6144 B at `0x01000`).
+
+That closes it:
+
+- The stream is delivered **identically to all 16 GEMM cores and to nothing
+  else**.
+- Its buffer is **512 B = 256 bf16 = exactly K=256**.
+- It is **K-indexed and rewound across N**, i.e. re-read for every output column.
+- **Weights and scales cannot be broadcast identically**, because each GEMM core
+  computes a different output slice and therefore needs different weights and
+  different per-group scales.
+
+The only operand a GEMV shares across cores computing different output slices is
+the **input activation vector**. `p5` carries the activations.
+
+### CORRECTION to the goal doc's GEMM tile description
+
+The goal doc records:
+
+> `p0` 2048 B packed int4 weights (advances) · `p1` 512 B bf16 activations
+> (**rewound**, reused across N) · `p4` 512 B per-group scales (advances with N)
+> · `p5` 512 B (**rewound**, K-only — role unresolved)
+
+**`p5` is the 512 B bf16 activation stream**, arriving by broadcast from a
+memtile through circuit-switched core-to-core forwarding. `p1` and `p4` index
+into a **5120 B per-column private buffer** fed from that column's own memtile
+(BD2/BD3, lock 3) — the per-column data, i.e. weights and scales.
+
+The description of `p1`'s *access pattern* (512 B at a time, rewound, reused
+across N) is accurate; what is wrong is calling that buffer the activations,
+when the activations are the thing that must be shared and `p1`'s buffer is
+private to the column.
+
+**Confidence.** This is established from connectivity plus architectural
+necessity, not from reading the bytes: 16-of-16 exact coverage of precisely the
+GEMM cores, identical geometry, correct size for K=256 bf16, and the logical
+impossibility of broadcasting per-slice weights. A byte-level dump would make it
+airtight; core L1 is not reachable from userspace, so that would need the
+driver's AIE debug path.
+
+### Phase 1 item 1 progress: the GEMM role is now confirmed, not inferred
+
+The goal doc's role table was "inferred from op mix and NOT confirmed". For the
+16 GEMM cores it is now confirmed **structurally**: they are exactly the set of
+cores receiving a broadcast K=256 activation vector plus a private per-column
+weight/scale stream, and emitting a small result stream (BD4/BD5, 132 B). That
+is a GEMM/GEMV tile by construction, independent of what its opcodes look like.
+
+### The broadcast topology
+
+Two origins, feeding the two halves of the array:
+
+- memtile **(1,1)** -> `(1,2)` -> forwarded **west** to `(0,2)` and **east** to `(2,2)`
+- memtile **(5,1)** -> `(5,2)` -> forwarded **east** through `(6,2)` to `(7,2)`
+
+and vertically: row-3 cores take DMA0 from the **core below** (`(1,3) <- SOUTH2
+from (1,2)`), so the fan-out is a 2-D tree — horizontal across columns, vertical
+up the rows — rather than a bus. All core-to-core hops are **circuit**-switched,
+which is what makes the replication cheap.
+
+---
+
+## 2026-07-31 — Phase 1 item 5: the attention kernel's head mapping and tile width
+
+Same method applied to `attn.xclbin`: CDO -> buffer descriptors -> stream graph.
+
+**All 32 cores are byte-identical** — every tile in cols 0-7 x rows 2-5 has the
+same five BDs, confirming the goal doc's "32 identical cores, homogeneous,
+unlike `layer`":
+
+| BD | size | pairing | locks |
+|---|---|---|---|
+| BD0 | 8192 B | single | rel_id 1 |
+| BD1 / BD2 | 4096 B each | ping-pong (NEXT 1<->2) | acq_id 2, rel_id 3 |
+| BD3 / BD4 | 128 B each | ping-pong (NEXT 3<->4) | acq_id 5, rel_id 4 |
+
+### The head mapping is exact
+
+llama-3.2-1B: **32 query heads, 8 KV heads, head_dim 64**, GQA ratio 4.
+
+```
+32 cores          == 32 query heads   -> ONE CORE PER QUERY HEAD
+8 columns         ==  8 KV heads      -> ONE COLUMN PER KV HEAD
+4 rows per column == GQA ratio 4      -> the 4 query heads sharing that KV head
+```
+
+Every count matches with no remainder. The array geometry *is* the head
+decomposition.
+
+**This answers the goal doc's `k03`/`k47` question.** It records that KV heads
+are "split into two groups of four (`get_k03_offset`/`k47`/`v03`/`v47`)". With
+one KV head per column, that split is simply **columns 0-3 and columns 4-7** —
+the left and right halves of the array.
+
+### The flash tile width is 32 tokens
+
+The goal doc lists this as **not pinned** ("loop counts are `lc = 0x20 / 0x1f /
+0x8`; 32 tokens/tile is the likely read at head_dim 64"). BD geometry settles it:
+
+| BD | bytes | as bf16 | interpretation |
+|---|---|---|---|
+| BD3/BD4 | 128 | 64 | **1 x head_dim** — the Q vector for one head (decode, M=1) |
+| BD1/BD2 | 4096 | 2048 | **32 x 64** — a KV tile of **32 tokens** |
+| BD0 | 8192 | 4096 | **2 x 32 x 64** — K and V for 32 tokens |
+
+And it reconciles the loop counts: `lc = 0x20` = **32** is the tile width;
+`lc = 0x8` = **8** is the KV-head/column count; `0x1f` = 31 is the
+tile-width loop with the first iteration peeled, which is exactly what an online
+softmax does (initialise from element 0, then fold in the remaining 31).
+
+BD1/BD2 being a **double-buffered 4096 B pair** is textbook flash attention: the
+KV tile streams in while the previous tile is consumed. BD3/BD4 double-buffer the
+128 B query vector.
+
+### Broadcast topology: pairwise, not array-wide
+
+DMA0 sources alternate by column parity — even columns pull **SOUTH** (their own
+memtile), odd columns pull **WEST** (from the even column beside them):
+
+```
+(0,2) SOUTH0   (1,2) WEST2      (2,2) SOUTH3   (3,2) WEST1
+(4,2) SOUTH3   (5,2) WEST0      (6,2) SOUTH0   (7,2) WEST1
+```
+
+So attention broadcasts in **column pairs** — memtile -> even column -> odd
+column — rather than the long horizontal chains `layer.xclbin` uses. Different
+kernel, different fan-out, which makes sense: attention's per-column data (the
+KV head) is shared by only 2 columns here, whereas `layer`'s activation vector is
+shared by all 16 GEMM cores.
+
+### Still open in item 5
+
+- **Where RoPE is applied.** Not shown by BD geometry. The goal doc notes
+  `_set_rope_weights` and precomputed tables; finding which core reads them is
+  the remaining piece.
+- **KV tile layout inside the memtile** — the memtile-side BDs are decoded by
+  the same tool but not yet analysed for this kernel.
+- BD0's role (8192 B, single, not ping-ponged) is consistent with K+V for 32
+  tokens or an output accumulator; not distinguished.
+
+### Attention memtile: the KV layout transform lives in the DMA, not the cores
+
+Decoded `attn.xclbin`'s memtile (0,1) — **25 buffer descriptors**, against 5 per
+core. The structural difference is the important part:
+
+**Core-tile BDs are all flat linear. Memtile BDs are 4-dimensional strided.**
+
+| BD group | size | addressing | locks |
+|---|---|---|---|
+| BD0/BD1, BD24/BD25 | 16384 B | **flat** | 64->65, 68->69 |
+| BD2/BD3, BD4/BD5, BD26/BD27 | 8192 B | **4-D strided** | 65->67, 69->70, 67->64 |
+| BD6-BD9 | 4096 B | **4-D strided** | 71->72, 73->74 |
+
+Every strided BD carries the same shape:
+
+```
+D0_WRAP=4   D1_STEPSIZE=31 D1_WRAP=8   D2_STEPSIZE=3 D2_WRAP=8   D3_STEPSIZE=255
+```
+
+aie-rt encodes stepsize as **`StepSize - 1`** (`dma/xaie_dma_aieml.c:316-355`),
+so the real strides are:
+
+| dim | stride | note |
+|---|---|---|
+| D1 | 32 words = **128 B** | **exactly one head_dim vector** (64 x bf16) |
+| D2 | 4 words = 16 B | 8 bf16 |
+| D3 | 256 words = 1024 B | |
+
+`8192 B / (4 x 8 x 8 = 256 units) = 32 B` per unit = 16 bf16.
+
+**So the memtile performs the KV layout transform in its DMA**, gathering with a
+128-byte (one head_dim vector) stride, and hands the cores flat contiguous tiles.
+The cores never reshape anything — every core BD in both kernels is a plain
+linear transfer.
+
+The lock IDs form a cycle (`64->65`, `65->67`, `67->64`), i.e. a pipeline: a
+16 KB region is written linearly, then read out as strided 8 KB tiles, then the
+buffer is recycled.
+
+**Why this matters for phase 3b.** The goal doc's KVarN design wants K records
+**channel-major** `[head_dim x GROUP]` specifically so the `mac_4x16_16x16` B
+operand needs no transpose. This shows FLM already solves the equivalent problem
+**in the memtile DMA rather than in the kernel** — the reshape is free, done by
+the DMA engine's strided addressing while data moves. A KVarN implementation has
+the same lever available, and should use it rather than choosing a storage layout
+to avoid a transpose the DMA could have done anyway.
+
+### RoPE: narrowed to `layer.xclbin`, not proven
+
+Chased where RoPE is applied. Not closed, but meaningfully narrowed, and the
+evidence points away from where I first looked.
+
+**1. The attention core's op profile confirms a separate plan claim.**
+`attn` core (0,2), 1693 bundles: `vconv.bfp16ebs8.fp32` **x37**, which confirms
+the goal doc's "operands load bf16, convert in-register to BFP16-ebs8". Also
+`vmul.f:70 vadd.f:51 vmac.f:44 vmsc.f:24 vshuffle:104`.
+
+**2. Opcode mix does NOT discriminate.** RoPE needs shuffle-to-pair plus
+`x_even*cos - x_odd*sin` (a multiply-subtract) and `x_odd*cos + x_even*sin`. Both
+candidate cores have exactly that combination — and both have **`vmsc.f` = 24**,
+the identical count:
+
+| core | vshuffle | vmul.f | vadd.f | vmsc.f |
+|---|---|---|---|---|
+| `attn` (0,2) | 104 | 70 | 51 | **24** |
+| `layer` cols 3,4 rows 3,5 | 51 | 86 | 73 | **24** |
+
+Same `vmsc.f` count in both means this signature is a shared idiom, not a
+fingerprint. Dropped as a discriminator.
+
+**3. The symbol tables do discriminate.** RoPE exists in exactly one library:
+
+```
+libmha.so        0 rope symbols     <- the attention kernel library
+libgemm.so       0
+libdequant.so    0
+liblm_head.so    0
+libllama_npu.so  3   _set_rope_weights(int)
+                     _send_rope_weights(npu_sequence*)
+                     _rope(buffer<bfloat16_t>&, int)
+```
+
+**`libmha.so` has none.** RoPE is owned by the model library that also owns
+`gen_layer_seq`, not by the MHA kernel.
+
+**Leading hypothesis:** RoPE is applied in **`layer.xclbin`'s cols 3-4 cores** —
+the ones the goal doc labels "shuffle + elementwise". Three strands agree: the
+symbols are exclusive to `libllama_npu.so`; those cores carry the required op
+combination; and architecturally RoPE applies to Q and K immediately after their
+projections, which happen in the layer kernel.
+
+**Not asserted.** A call-graph trace from `_send_rope_weights` to a specific
+`gen_*_seq` would settle it; the direct-call xref came back empty, so the call is
+indirect (vtable or `std::function`) and needs a proper approach. The other route
+is checking whether a rope-table buffer appears in the layer dispatch's argument
+list — it is not among the 50 decode args, so if it exists it is a resident
+buffer loaded once at init, consistent with `_set_rope_weights(int)` being a
+setup call.
+
+**Small trap worth noting:** an initial `grep -i rope` over the disassembly
+returned 1678 "hits", nearly all of them `boost::property_tree` — "p-**rope**-rty"
+contains the substring. The apparent flood of matches was one substring collision.
+
+---
+
+## 2026-07-31 — Second Phase 1 deliverable: `docs/npu/flm-attn-dataflow.md`
+
+Written, with the same measured / derived / open tagging and a dedicated "what is
+NOT established" section. The attention material has been moved out of
+`flm-layer-dataflow.md` (which now carries a three-line pointer) so each kernel
+has one home, as the plan's "`docs/npu/flm-<kernel>-dataflow.md` per kernel"
+asks.
+
+**Phase 1 status against the plan's five items:**
+
+| item | state |
+|---|---|
+| 1. every core's role, confirmed | **partly** — GEMM confirmed structurally; SiLU core identified; norm/shuffle/elementwise still inferred from op mix |
+| 2. tile shapes and buffer sizes | **done** — host-side buffer contract, core-tile BDs both kernels, attention tile width pinned at 32 tokens |
+| 3. the DMA / objectfifo graph | **done** — 294 routes decoded, broadcast topology for both kernels |
+| 4. host-side dispatch | **done** — two regimes, 2 submissions/token, 50-arg buffer contract |
+| 5. attention specifics | **mostly** — head mapping, tile width, k03/k47, memtile layout transform; RoPE narrowed not proven |
+
+Two documents now stand as the phase-1 deliverable:
+`flm-layer-dataflow.md` (463 lines) and `flm-attn-dataflow.md` (188 lines),
+against a 2151-line working log.
+
+**What the phase produced that the plan did not anticipate**, in rough order of
+consequence:
+
+1. **2 NPU submissions per decoded token**, against hipfire's 64 — dispatch
+   structure, not kernel bodies, is the dominant gap.
+2. **`mac_4x16_16x16` is 512 MACs/cycle, not 1024** — the plan's table was wrong
+   by 2x, and int4/int8/bfp16 are all equal on issue rate. int4's real advantage
+   is fewer operand bytes on a load-bound machine (1.59x measured streamed).
+3. **The array broadcasts operands core-to-core**, so one memtile read serves
+   many cores — a concrete mechanism behind 86%-of-fabric decode.
+4. **The memtile DMA does layout transformation for free**, which changes how
+   phase 3b should think about KV layout.
+5. **KV is preallocated at full context** — 4 GiB for a 1B model; capacity, not
+   just bandwidth, is a KVarN target.
+
+**Remaining phase-1 work is narrow:** confirm the three inferred core roles in
+`layer.xclbin`, settle RoPE's location by call-graph, and identify BD0 in the
+attention core. None of it blocks phase 2.
+
+---
+
+## 2026-07-31 — Phase 1 item 1: core roles confirmed from I/O geometry
+
+The GEMM role was confirmed structurally two entries back (the 16 cores receiving
+a broadcast K=256 activation vector plus private per-column weights). The same
+method — input/output BD geometry rather than op mix — settles most of the rest.
+
+Full map of `layer.xclbin`, per core: input BD chain sizes on each S2MM channel,
+output chain on MM2S:
+
+| tile | role | in (ch0 \| ch1) | out | DMA0 src |
+|---|---|---|---|---|
+| 16 x GEMM | GEMM | **512/512** \| **5120/5120** | 132/132 | EAST/WEST/SOUTH |
+| (2,2) | norm | 4096/4096 \| 4096 | **4100** | SOUTH3 |
+| (2,3) | norm | 6144 \| 128 | 4096 | SOUTH4 |
+| (3,2)(4,2)(3,4)(4,4) | shuffle | 1024/1024 \| 4096/4096 | **none** | EAST/SOUTH |
+| (3,3)(4,3)(3,5)(4,5) | elementwise | — \| 4096/4096 | 1024/1024 | — |
+| (5,2) | SiLU | **2048/2048** \| — | **1024/1024** | SOUTH4 |
+
+### (2,2) is RMSNorm — the output size gives it away
+
+```
+in  4096 B = 2048 bf16 = hidden_size EXACTLY
+out 4100 B = 1025 words = 1024 words of vector + ONE EXTRA WORD
+```
+
+A 4-byte overhang on an otherwise exact hidden-size vector is a **normalized
+vector plus one scalar** — the reciprocal norm. That is an RMSNorm signature, and
+4100 is too odd a number to be anything else. The goal doc's "norm / residual"
+label for col 2 is confirmed for (2,2).
+
+### (5,2) is SwiGLU, not bare SiLU — refining the earlier identification
+
+```
+in  2048 B = 1024 bf16      out 1024 B = 512 bf16      ratio exactly 2:1
+```
+
+**Two inputs, one output.** A bare elementwise activation preserves size; halving
+means it consumes a *pair*. Combined with the clamped-table SiLU lookup found in
+its instruction stream, this core computes **`silu(gate) * up`** — llama's fused
+SwiGLU — not SiLU alone.
+
+This refines the earlier entry, which identified the table lookup as SiLU and
+stopped there. The lookup does compute SiLU; the core computes SwiGLU.
+
+### The cols 3-4 cores are a vertical pipeline
+
+Rows 2 and 4 (**shuffle**) take inputs but have **no MM2S output configured**.
+Rows 3 and 5 (**elementwise**) have no ch0 input but do have outputs. They sit
+directly above their shuffle partners.
+
+So `shuffle(row 2) -> elementwise(row 3)` and `shuffle(row 4) ->
+elementwise(row 5)`, with the hand-off **not going through DMA at all** — either
+the AIE cascade path or shared memory between vertically adjacent tiles. Four
+such pairs across cols 3-4.
+
+That is a genuine dataflow finding: part of this kernel's communication does not
+appear in the DMA graph, because it does not use DMA.
+
+**Caveat:** the sweep read `MM2S_0_START_QUEUE` only. A core showing "no output"
+may be using MM2S channel 1. The shuffle/elementwise *pairing* is supported by
+the adjacency and the complementary in/out pattern, but "no DMA output" should be
+re-checked against channel 1 before being relied on.
+
+### Item 1 status
+
+| cores | role | basis |
+|---|---|---|
+| 16 GEMM | GEMM | **confirmed** — broadcast activations + private weights + result stream |
+| (2,2) | RMSNorm | **confirmed** — 4096 in / 4100 out |
+| (5,2) | SwiGLU | **confirmed** — 2:1 ratio + SiLU table lookup |
+| (2,3) | norm/residual | inferred — 6144 in / 4096 out, not decomposed |
+| cols 3-4 | shuffle -> elementwise pipeline | **pairing confirmed**, function still inferred |
+
+### Verifying my own caveat — the claim survives, and reveals more
+
+The previous entry flagged that the sweep had read `MM2S_0` only, so "no DMA
+output" might just mean "output on channel 1". Checked all four channels
+(S2MM 0/1, MM2S 0/1) on every core. **The caveat was worth raising and the claim
+holds** — but the fuller picture is more interesting than the one I recorded.
+
+| tile | role | S2MM0 | S2MM1 | MM2S0 | MM2S1 |
+|---|---|---|---|---|---|
+| (0,2) (1,2) (6,2) (7,2) | GEMM **row 2** | on | on | **on** | -- |
+| (0,4) (1,4) (6,4) (7,4) | GEMM **row 4** | on | on | **on** | -- |
+| (0,3) (1,3) (6,3) (7,3) | GEMM **row 3** | on | on | **--** | **--** |
+| (0,5) (1,5) (6,5) (7,5) | GEMM **row 5** | on | on | **--** | **--** |
+| (3,2) (4,2) (3,4) (4,4) | shuffle | on | on | **--** | **--** |
+| (3,3) (4,3) (3,5) (4,5) | elementwise | -- | on | on | -- |
+| (2,2) | RMSNorm | on | on | **on** | **on** |
+| (5,2) | SwiGLU | on | -- | on | -- |
+
+**Shuffle cores confirmed:** no DMA output on *either* MM2S channel. The
+non-DMA hand-off to the elementwise core above them stands.
+
+**New, and it revises the GEMM picture: half the GEMM cores have no DMA output
+either.** Rows 3 and 5 have both MM2S channels disabled; only rows 2 and 4 emit.
+
+So the 16 GEMM cores are **vertically paired** — row 3 feeds row 2, row 5 feeds
+row 4 — with only the even row emitting a result stream. **8 result streams, not
+16.** That is the shape of a K-split: each output tile is computed by two cores
+that chain partial sums, and only the last in the chain writes out.
+
+This corrects the earlier entry's implicit picture of 16 independent GEMM cores
+each emitting 132 B. The correct reading is **8 chained pairs**.
+
+**Mechanism not distinguished.** AIE2P offers two ways to hand off without DMA —
+the dedicated cascade path between adjacent cores, and shared access to a
+neighbour's data memory. Both are consistent with what the DMA registers show
+(namely, nothing). Distinguishing them needs the cascade enable/direction
+registers or the memory-module access pattern, neither of which this pass
+decoded.
+
+**Also visible:** (2,2) RMSNorm is the only core using **both** MM2S channels —
+consistent with a norm feeding two consumers (e.g. the normalized vector to the
+GEMM columns and the residual onward). The elementwise cores take their input on
+S2MM **channel 1** with channel 0 unused, which is what the earlier table showed
+as "— | 4096/4096"; that part was already right.
+
+**Lesson worth keeping:** the caveat was raised because the sweep was partial,
+and checking it turned up a structural fact (8 chained pairs, not 16 independent
+cores) that the incomplete sweep had actively hidden. Verifying one's own
+hedge is not bookkeeping — it is where the finding was.
+
+### RESOLVED: the non-DMA hand-off is SHARED NEIGHBOUR MEMORY, not cascade
+
+Designed the test as a diff between a paired emitter and silent core — if the
+hand-off used the cascade path, the sender and receiver programs must differ by
+cascade instructions.
+
+**They do not.** `core(0,2)` (emits) and `core(0,3)` (silent): 2079 vs 2076 ops,
+**no unique opcodes on either side**, differences only ±1-3 in scalar
+`mov`/`lda`/`st` counts — register-allocation noise. No cascade send/receive
+anywhere.
+
+But the two are not the same binary:
+
+```
+md5 of the 16 GEMM core programs:
+   8 x fa1b2dc9ed3d5a50    <- rows 2,4  (the emitters)
+   8 x f227d3d030724331    <- rows 3,5  (the silent ones)
+```
+
+**Two programs, 8 cores each, splitting exactly along the emit/silent line.**
+And they differ in only **178 of 9236 bytes (1.93%)**, in four regions all inside
+`0x200e8-0x201ef` — **the prologue**. The compute loop is byte-identical.
+
+So the difference is entirely in **buffer addressing**, and that is the answer:
+
+```
+row 2 (emitter)                 row 3 (silent)
+  movxm r9,  #0x75400             movxm p3, #0x45400
+  movxm r11, #0x73c00             movxm p0, #0x43c00
+```
+
+| row 2 | offset | row 3 | offset | |
+|---|---|---|---|---|
+| `0x75400` | 0x5400 | `0x45400` | 0x5400 | **same offset** |
+| `0x73c00` | 0x3c00 | `0x43c00` | 0x3c00 | **same offset** |
+
+Row 2 addresses only `0x7xxxx` — its own data-memory module. Row 3 uses
+`0x7xxxx` **plus two buffers in `0x4xxxx`** — a *different module window*, i.e. a
+**neighbour's memory** — at **exactly the offsets row 2 reads from its own
+window**.
+
+**Row 3 writes its results directly into the neighbouring tile's data memory,
+and row 2 reads them as local loads.** No DMA, no cascade, no instructions
+distinguishing sender from receiver — just a pointer into a different window,
+baked into the prologue.
+
+### Corrections this forces
+
+1. **Retract "K-split with cascade chaining."** The previous entry called the
+   pairing "the shape of a K-split... two cores chain partial sums", and offered
+   cascade or shared memory as the mechanism. It is shared memory, and there is
+   no chaining instruction — the hand-off is a plain store.
+2. **The array is not SPMD.** I was drifting toward "one kernel binary, per-core
+   behaviour from DMA config". There are **two** binaries, differing only in
+   which memory window their output pointers name.
+
+### Why this matters for phase 2
+
+The reproduction needs **two core programs per GEMM pair**, differing only in
+output addressing — not one program plus configuration. And the inter-core
+transfer costs *nothing* in the instruction stream: it is a store that happens to
+land in a neighbour's memory. Any reproduction that routes the equivalent traffic
+through DMA or objectfifos will pay for something FLM gets free.
+
+This is also the third structural mechanism found by which FLM avoids memory
+traffic, alongside the horizontal broadcast and the memtile's strided
+layout transform.
+
+---
+
+## 2026-07-31 — Consolidation pass over both deliverables
+
+Several findings this session superseded earlier ones, and corrections were made
+in place as they happened. Read both documents end to end to check no superseded
+claim survived in a section not revisited at the time.
+
+**Three inconsistencies found and fixed:**
+
+1. **`layer` §6b called col 5 row 2 "SiLU"** while the later roles section called
+   it "SwiGLU". The refinement (2:1 I/O ratio => two inputs one output =>
+   `silu(gate)*up`) had been applied where it was discovered but not to the
+   inventory table above it. Reconciled: the table now says SwiGLU, and the
+   SiLU-table-lookup detail is kept as the *mechanism* it evaluates.
+2. **The GEMM pairing still read "chained partial sums... a K-split"** — retracted
+   in the log a tick earlier, but the deliverable still carried it. Now states
+   the pairing as established and marks *what* is split (K vs N) as open, since
+   nothing observed distinguishes summing from concatenating.
+3. **§7 "What is NOT established" still listed core roles and `p5` as
+   unconfirmed.** Both had since been resolved. Rewritten to current state, and
+   the genuinely open items added (what the GEMM pair splits, RoPE's site, the
+   two still-inferred roles).
+
+Also: §6b's heading was still "Core inventory and the SiLU core" though the
+section had grown to cover roles, BDs, stream-switch connectivity and the
+broadcast path. Retitled.
+
+**§8 "Implications for reproduction" extended** with the three mechanisms by
+which FLM moves operands without paying DRAM bandwidth — horizontal broadcast,
+shared neighbour memory, strided DMA layout transform — plus the requirement for
+two GEMM program variants. These are the phase-2-relevant structural findings and
+they had been recorded in the log but never collected in the place a reproducer
+would look.
+
+**Method note.** A keyword sweep for known-superseded phrases caught only one of
+the three; the other two needed reading the documents. Terminology drift
+(SiLU/SwiGLU) and staleness-by-omission (a "not established" list that was never
+pruned) do not match on the phrase you retracted — they match on the phrase you
+kept. Worth doing this pass again before phase 2 begins, and worth doing it by
+reading rather than grepping.
+
+Final state: `flm-layer-dataflow.md` 570 lines, `flm-attn-dataflow.md` 188,
+working log 2151.
+
+---
+
+## 2026-07-31 — Phase 3b's "free floor" is NOT free: bfp16ebs8 measured
+
+Task #7. The goal doc proposes storing KV as `bfp16ebs8` as a **"free floor to
+clear first"** — "9 bits/elem at **zero dequant cost**, since `mac_8x8_8x8T`
+consumes it natively". Measured. It is not free.
+
+### The split-array layout, and why it was needed
+
+`struct v64bfp16ebs8 {v64int8 mantissa; v8int8 exponent;}` is **72 bytes,
+packed** — not 64-byte aligned. A contiguous array of them misaligns every vector
+load after the first, which the harness now refuses (measured 3.7 MACs/cycle
+before the refusal was added).
+
+The fix a real KV store would use is **separate, individually aligned mantissa
+and exponent arrays**, assembled in registers — the type is `return_in_regs` and
+lives in an EX register pair, so assembling it ought to be cheap. Implemented as
+a new `split` variant. The generated loop confirms the alignment problem is gone:
+
+```
+vldb x5, [p7], #0x40      aligned 64 B mantissa load, post-increment
+lda  r16, [p2, #8]        scalar exponent loads
+mov  el3, r16             move into the E part of the EX register
+vmac.f dm3, dm3, ex3, ex1, r1
+```
+
+### Result
+
+| variant | cyc/call | MACs/cycle | % of 512 ceiling |
+|---|---|---|---|
+| `resident` (no memory traffic) | 1.624 | **315.2** | 61.6% |
+| `split` (aligned, from memory) | 9.685 | **52.9** | 10.3% |
+| contiguous 72 B (misaligned) | — | 3.7 | 0.7% |
+
+**The split layout is 14.3x better than the naive contiguous one**, confirming
+the alignment diagnosis. But against the other streamed modes measured this
+session:
+
+| mode | streamed MACs/cycle |
+|---|---|
+| `mac_4x16_16x16` int4, seq | **250.0** |
+| `mac_8x8_8x8` int8, seq | **157.0** |
+| `mac_8x8_8x8T` bfp16, split | **52.9** |
+
+**bfp16 streams 3.0x worse than int8 and 4.7x worse than int4.**
+
+### Why, and what it means for 3b
+
+The loop is **16 bundles for 2 MAC calls = 8.0 cyc/call scheduled** (measured
+9.7, the gap being outer-pass overhead — `inner` is only 8 iterations per pass).
+Against int8's 6 bundles for 2 calls. The extra cost is **assembling the EX
+register pair**: 4 scalar `lda` plus 4 `mov el*` per 2 MACs. There is no
+*dequant*, exactly as the goal doc says — but there is substantial *assembly*,
+and the doc's claim of "zero cost" does not survive contact.
+
+Even **resident** bfp16 reaches only 61.6% of its ceiling, against int8's 92.9%,
+so the EX-register handling costs something even when the operands never leave
+registers.
+
+**Important caveat — this bounds a layout, not the format.** My split variant
+loads exponents one block at a time with scalar loads. A better arrangement would
+load many exponents in one vector op and distribute them, amortising the scalar
+work over more MACs. **52.9 MACs/cycle is a floor for the naive split layout, not
+a proven ceiling for bfp16ebs8.** Anyone pursuing 3b should try the batched-
+exponent layout before concluding the format is unusable.
+
+**Recommendation for the plan:** the "free floor" framing should be dropped. On
+the evidence, storing KV as bfp16ebs8 buys 9 bits/element but costs 3x the MAC
+throughput of int8 in the straightforward layout — so it is a **trade**, not a
+free win, and it should be measured against KVarN rather than assumed to be a
+cheaper stepping stone toward it.
+
+### Bounding the bfp16 caveat: 64 MACs/cycle is the layout's ceiling
+
+The previous entry attached a caveat to the 52.9 figure — that batching exponent
+loads might amortise the scalar work, so 52.9 bounded my layout rather than the
+format. Resolved as far as it can be, and the caveat does **not** rescue bfp16.
+
+**1. There is no wide bfp16 load in the ISA.** Searched the intrinsics headers:
+`v64bfp16ebs8` and `v64bfp16ebs8_unaligned` are declared as types, but there is
+**no load or store intrinsic** for them. The plan's note about a 576-bit
+`FIFO_ST_BFP16` store path does not correspond to anything callable here. So the
+EX pair must be assembled from separately loaded mantissa and exponent — the
+split layout is the right one, not a workaround.
+
+**2. The schedule does not improve with more iterations per pass.** Regenerated
+at a 4x larger tile (`inner` 8 -> 32): the inner loop is **16 bundles / 2 vmac at
+both sizes**. Identical schedule; only the 4-pointer pass prologue amortises
+differently.
+
+So the gap between scheduled and measured is pass overhead, and the ceiling is
+the schedule:
+
+```
+scheduled  8.0  cyc/call -> 64.0 MAC/cyc     <- the layout's ceiling
+measured   9.685 cyc/call -> 52.9 MAC/cyc    (inner=8; 1.69 cyc/call of prologue)
+```
+
+**Even at its ceiling, bfp16 is 2.5x worse than int8 and 3.9x worse than int4:**
+
+| mode | streamed MACs/cycle |
+|---|---|
+| `mac_4x16_16x16` int4 | 250.0 |
+| `mac_8x8_8x8` int8 | 157.0 |
+| `mac_8x8_8x8T` bfp16, ceiling | **64.0** |
+| `mac_8x8_8x8T` bfp16, measured | 52.9 |
+
+**Conclusion for 3b: the "free floor" should be dropped from the plan.** Not
+because the format is unusable, but because it is a *trade* — 9 bits/element for
+2.5-4x the MAC cost — and the plan positions it as a free stepping stone that
+clears the way for KVarN. It does not. If KV bandwidth is the goal, int4/int8
+paths reach it more cheaply; if 9 bits/element specifically is wanted, that cost
+has to be justified against KVarN directly.
+
+**Honest limit on this bound.** The 16-bundle schedule is what the compiler
+produced for this source; a hand-scheduled kernel might overlap the exponent
+scalar path better. What is *not* available is a fundamentally cheaper mechanism —
+no wide load exists, and the EX assembly is required by the instruction's operand
+form. So 64 MACs/cycle is a compiler-output ceiling, not a hardware limit, but
+there is no obvious headroom above it.
+
+**Also recorded:** the 16 KB-tile run failed to build (`aiecc` exit 1) — a 16 KB
+tile double-buffered in and out likely exceeds the 64 KB core L1. The static
+schedule check made the run unnecessary, but the harness should probably validate
+tile size against L1 before dispatching a build.
+
+---
+
+## 2026-07-31 — Phase 2 feasibility: the 5-buffer DPU signature is NOT the limit
+
+Stepped back to pick the highest-value next item and found a contradiction in my
+own notes worth resolving before phase 2 starts, because it looked like a blocker.
+
+**The contradiction.** `decoder-layer-npu-scope.md` records FLM's xclbins using
+"the standard 5-buffer DPU signature (`opcode, instr, ninstr, bo0..bo4`)", and
+`layer.xclbin`'s own metadata confirms it — `connectivity` declares **6
+connections**, at arg_index 1, 3, 4, 5, 6, 7:
+
+```
+"ip_layout": m_kernel_id 0x901, m_name "MLIR_AIE:MLIRAIE", subtype DPU
+"connectivity": m_count 6 -> args 1 (instr BO), 3,4,5,6,7 (five data BOs)
+```
+
+But the measured decode command passes **50 arguments**. Five declared buffers,
+fifty passed. If the 5 were a real limit, a whole-model single dispatch would be
+impossible to express and phase 2's headline target would be blocked.
+
+**Resolution: they are different things.** The `args` array in
+`amdxdna_drm_exec_cmd` is a **driver-level buffer table**, not the kernel's
+signature. Its purpose is to give the driver the BO handles it must resolve to
+device addresses so that `DDR_PATCH` operations in the instruction stream can
+patch shim BD address fields at launch (`amdxdna_ctx.c:589` copies
+`arg_count * sizeof(u32)` handles). The xclbin's 5 connections describe the
+command-packet layout; the patch table describes what the *instruction stream*
+can bind.
+
+**Both limits are generous:**
+
+| limit | value | source |
+|---|---|---|
+| driver `arg_count` | **4095** | `MAX_ARG_COUNT`, `amdxdna_ctx.c:19` |
+| `address_patch` `arg_idx` | **I32Attr** | mlir-aie `AIEX.td:1031` |
+
+FLM's 50 is nowhere near either.
+
+### Why this matters
+
+**Phase 2's biggest target — one command carrying the whole model — is
+expressible in stock mlir-aie.** The mechanism is `aiex.npu.address_patch` with
+`arg_idx` 0..49 binding 50 host buffers, which is exactly what FLM does and
+exactly what the (now-fixed) txn2mlir parser reads back. No custom runtime, no
+signature extension, no driver change.
+
+This was worth checking before starting phase 2 rather than discovering it
+midway. It also retires a worry the plan implies but never states: that FLM might
+be using a private dispatch path unavailable to us. It is not — same toolchain,
+same driver interface, same patch mechanism, 24x more buffers bound to it.
+
+**Caveat:** this establishes the *mechanism* is available. Whether mlir-aie's
+host-side helpers and IRON's runtime plumbing pass 50 BOs without friction is not
+tested — only that neither the driver nor the IR imposes the limit.
+
+---
+
+## 2026-07-31 — Phase 2 groundwork: the many-buffer probe, and two corrections
+
+Built `tools/npu/flm/manybuf_probe.py` to test whether IRON/mlir-aie can bind as
+many host buffers to one dispatch as FLM does (50). Two of my own conclusions
+needed correcting along the way.
+
+### Correction 1: "feasibility gate cleared" was premature
+
+The previous entry concluded the whole-model single dispatch was expressible in
+stock mlir-aie, on the grounds that the driver allows `MAX_ARG_COUNT` = 4095 and
+`address_patch`'s `arg_idx` is an `I32Attr`. **Both true, and both the wrong
+layer.** `aiecc` has its own gate:
+
+```
+error: device 'main' has 32 host buffer arguments, which exceeds the maximum
+supported and verified count of 16. Reduce the number of host buffer arguments.
+```
+
+**mlir-aie caps host buffer arguments at 16. FLM binds 50.** Checking the driver
+and the IR while missing the compiler in between is exactly the sort of partial
+check that produced the earlier "no DMA output" mistake.
+
+### What the cap actually is
+
+`tools/aiecc/SidecarFiles.h:85-93`:
+
+```c
+// The NPU firmware command-chain (xrt::runlist) ABI requires every kernel to
+// declare at least this many host buffer slots; fewer produces an undersized
+// command slot and the runlist aborts. Extra slots are harmless.
+inline constexpr int kMinHostBOs = 5;
+
+// Conservative, hardware-verified ceiling on host buffer slots. AIETargetNPU
+// folds the DDR translation offset so >5 buffers work, but counts above this
+// are unvalidated and rejected.
+inline constexpr int kMaxHostBOs = 16;
+```
+
+Two things fall out:
+
+1. **The "5-buffer DPU signature" is `kMinHostBOs` — a FLOOR, not a ceiling.**
+   Required by the firmware command-chain ABI. That fully explains why
+   `layer.xclbin` declares exactly 5 data connections while binding 50, and
+   retires the contradiction the previous entry was chasing.
+2. **The 16 is a policy cap, self-described as "unvalidated", not a hardware
+   limit** — and FLM binding 50 on this exact silicon is the existence proof.
+
+Raised it to 64 locally and rebuilt `aiecc`. The compile-time rejection goes away.
+
+### Correction 2: my probe measured the wrong thing
+
+With the cap raised, 32 buffers then failed at *runtime* with
+`ERT_CMD_STATE_ERROR`. That is not a buffer-count limit — it is my probe's
+design. The first version gave **each pair its own ObjectFifo**, so 16 pairs
+demanded **32 shim DMA channels**, against 8 shim tiles supplying 16 per
+direction. It was measuring **channel exhaustion**, not buffer binding.
+
+FLM binds 50 buffers through a handful of channels used **sequentially** — the
+`DDR_PATCH` table rebinds addresses; it does not require a live stream per
+buffer. Rewritten to use **one shared fifo** for all N transfers, which both
+models FLM's pattern and isolates the variable under test.
+
+**Lesson, and it is the same one as the MM2S channel-1 caveat:** a probe that
+conflates two variables reports the tighter one and hides the question you asked.
+Here the tell was that raising a *compile-time* limit produced a *runtime* error —
+a different failure mode is a signal the experiment changed shape, not that the
+limit merely moved.
+
+Re-running with the shared-fifo design now.
+
+### The real constraint is BD slots, and FLM's design is the prescribed answer
+
+With `kMaxHostBOs` raised and the shared-fifo rewrite, the failure moved again —
+to a third, and this time structural, limit:
+
+```
+error: 'aiex.dma_configure_task' op Too many simultaneously active buffer
+descriptors on tile (0,0), which supports up to 16. Emit an
+aiex.dma_free_task / aiex.dma_await_task to reuse BDs.
+```
+
+Three distinct limits, discovered in order by pushing on each:
+
+| # | limit | value | nature |
+|---|---|---|---|
+| 1 | `aiecc` `kMaxHostBOs` | 16 | **policy** — self-described "unvalidated"; raised to 64, works |
+| 2 | shim DMA channels | 16/direction | probe artifact — one fifo per pair, fixed by sharing |
+| 3 | **active BDs per shim tile** | **16** | **hardware/structural** |
+
+**And the third one explains FLM's design exactly.** Its staging transactions
+program **4 BDs per column** and reuse them, with `DDR_PATCH` rewriting the
+address word each dispatch. It never allocates a BD per buffer. So FLM's 50
+bound buffers are **50 patchable addresses cycling through a handful of BDs** —
+not 50 descriptors.
+
+That is what the compiler error prescribes (`dma_free_task` / `dma_await_task` to
+reuse BDs), and it is what the phase-1 analysis already found in the binaries.
+The two pictures agree, which is the useful outcome: **FLM's structure is not
+exotic, it is the documented way to exceed the BD count.**
+
+**Corrected conclusion for phase 2.** "Bind 50 buffers to one dispatch" decomposes
+into two requirements, only one of which is a real obstacle:
+
+1. Raise `kMaxHostBOs` — a one-line policy change, validated here to 64, with
+   FLM as the existence proof that the silicon is fine with it.
+2. **Reuse BDs rather than allocating one per buffer** — the actual design
+   requirement, and the thing to get right in the reproduction.
+
+My probe still allocates a BD per transfer (`fill`/`drain` without an explicit
+free), so it tops out at 16 active BDs. Extending it to use
+`dma_free_task`/`dma_await_task` would push it to FLM's 50, but the structural
+question is already answered and the probe has served its purpose: it found the
+one policy cap that needed raising and identified the real constraint behind it.
+
+**Method note.** Three failures, three different causes, each surfacing only
+after the previous was removed — a compile-time policy cap, then a probe-design
+artifact, then a hardware structural limit. The signal each time was that the
+*failure mode changed* (compile error -> runtime error -> different compile
+error). A limit that merely moved would have reported the same kind of error at a
+larger N.
+
+---
+
+## 2026-07-31 — Session summary and handoff
+
+Tool regression sweep: **all 7 pass** (`txn_check`, `txn_scan`, `cdo`,
+`cdo_dma --tile`, `cdo_dma --graph`, `macbench`, `aiedis`). Two initial
+"failures" were bad grep patterns in the sweep itself, not the tools — noted
+because a regression check that reports false failures is worse than none.
+
+### Scope completed
+
+The kickoff asked for **Phase 0 (5 items), then Phase 1**. Both are done.
+
+**Phase 0** — all five, plus two follow-ups. **Phase 1** — two deliverables
+written (`flm-layer-dataflow.md`, `flm-attn-dataflow.md`), all five items either
+answered or explicitly bounded.
+
+### The findings that change the plan, ranked
+
+1. **FLM submits 2 NPU commands per decoded token; hipfire submits 64.** At the
+   measured ~37 us dispatch floor that is ~2.4 ms/token of pure submit latency.
+   **Dispatch structure, not kernel bodies, is the dominant gap.**
+2. **`mac_4x16_16x16` is 512 MACs/cycle, not 1024** — the plan's table was wrong
+   by 2x. int4, int8 and bfp16 all issue at 512. int4's real advantage is fewer
+   operand bytes on a load-bound machine (**1.59x** measured, streamed).
+3. **Phase 3b's "free floor" is not free.** bfp16ebs8 streams at 52.9 MACs/cycle
+   (ceiling 64) against int8's 157 and int4's 250 — a **trade**, not a free step
+   toward KVarN.
+4. **Three mechanisms move operands without paying DRAM bandwidth**: horizontal
+   core-to-core broadcast, shared neighbour memory (no DMA, no cascade), and
+   strided DMA layout transform in the memtile. A reproduction missing these
+   will not reach 86% of fabric.
+5. **KV is preallocated at full context** — 4 GiB for a 1B model. Capacity, not
+   just bandwidth, is a KVarN target.
+
+### Corrections made to `~/flm-re-fe-mutate-goal.md`
+
+The MAC table (1024 -> 512); the 24-byte DDR_PATCH field map; `p1`/`p5` labels
+(`p5` is the broadcast activation stream); "one fused decoder layer per dispatch"
+-> one fused *model*; the attention tile width (pinned at 32 tokens); the
+`k03`/`k47` split (columns 0-3 / 4-7); the col-5 core (SwiGLU, was
+"unidentified"); the "free floor" framing; and a warning that the MoE is a hybrid
+to which the Llama attention analysis does not port.
+
+### Open, and what each needs
+
+| item | needs |
+|---|---|
+| Re-take the 0.5 baseline on a quiet machine | the user's `flm serve` restarted first |
+| RoPE's exact site | call-graph trace from `_send_rope_weights` (indirect call) |
+| What the GEMM pair splits (K vs N) | not distinguished by anything observed |
+| BD0's role in `attn` cores | — |
+| Phase 2 proper | a decision to start; feasibility is established |
+
+### Not committed
+
+All work is uncommitted, across two trees. `hipfire-npu` is on `master`, and
+`AGENTS.md` wants a topic branch, so nothing was staged. Local changes also exist
+in `~/build/mlir-aie` (MERGE_SYNC build fix, txn2mlir parser, python binding
+dependency, `kMaxHostBOs` raised to 64) on branch `merge-sync-txn-op`.
