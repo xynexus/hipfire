@@ -65,10 +65,11 @@ Each is a thing that cost real time; module docstrings have the detail.
   slices.** Any exec-generated design that slices dies with a bare
   `ValueError: unmarshallable object` at compile time, pointing nowhere near the
   cause. Index instead of slicing.
-- **>20 host buffers on one dispatch hangs the firmware** (`TDR timeout`,
-  `DPU PC: 0xffffffff`), even though `aiecc`'s `kMaxHostBOs` now allows 64 and
-  the design compiles. Buffer count is the only axis — bytes, task-group size and
-  fifo count all move freely. Pack fewer, larger buffers.
+- **`iron.jit`'s default vararg dispatch caps at ~20 host buffers**, and fails as
+  a *firmware hang* (`TDR timeout`, `DPU PC: 0xffffffff`) rather than an error,
+  which reads like a hardware limit and is not one. `full_elf=True` binds through
+  `run.set_arg`/`run.start` instead and runs **64** buffers — past FLM's 50 —
+  while also being ~34% faster at counts where both work. Use `--full-elf`.
 - **A broadcast is invisible per tile.** Every hop of one looks like an ordinary
   local route in `--graph`, so a stream feeding all 32 cores and a stream feeding
   2 read identically until you walk them back. `--origins` does that walk and

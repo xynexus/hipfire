@@ -3830,3 +3830,53 @@ phase-4 text says so directly and tells the reader to run 3a for its bytes rathe
 than its MAC. Recorded because the failure mode is instructive: the plan was
 written before the machine was measured, and every number in it that came from
 the vendor's capability sheet rather than a measurement pointed the wrong way.
+
+---
+
+## 2026-07-31 — Milestone 3 extended: 56.3 GB/s at decode-realistic totals
+
+Milestone 3 established that the ~100 us fixed per-dispatch cost was what the
+earlier small-buffer figures were really measuring, and reached **52.28 GB/s** at
+64 MiB. Pushing the total to the size a real decode token moves confirms that
+model and finds where it tops out. Both runs `--verify`, so the bytes are
+checked, and both `--full-elf`.
+
+| shape | total | GB/s | vs FLM 46.2 | % of 56.5 roof |
+|---|---|---|---|---|
+| **50 bufs x 16 MiB** — FLM's exact argument count | **800 MiB** | **53.79** | **1.16x** | 95% |
+| 16 bufs x 32 MiB | 512 MiB | **56.34** | **1.22x** | **99.7%** |
+
+**There is nothing left in this direction.** At 512 MiB the wall clock is
+9.53 ms, so milestone 3's ~100 us fixed cost is ~1% of it and the delivery path
+is running at the fabric roof measured independently in
+`npu-memory-bandwidth-cache-characterization.md`. The 800 MiB row is 4.5% lower
+because 50 buffers of 16 MiB pay the per-buffer cost more often than 16 of 32 MiB
+— the same amortisation milestone 3 identified, seen from the other side.
+
+**FLM's exact dispatch shape reproduces.** 50 bound buffers, one command, a
+whole token's weight traffic (llama streams 772.3 MB/token), at 1.16x its
+measured rate. The "pack fewer, larger buffers" workaround recorded before
+`full_elf` was found is unnecessary — though 16 x 32 MiB does measure better and
+is the simpler design.
+
+### A matched control for the vararg/full-ELF difference
+
+Milestone 2 established that `full_elf` clears the 20-BO wall. Same design, same
+buffers, same everything, sweeping only the count, to separate "clears the wall"
+from "is otherwise equivalent":
+
+| buffers | vararg | `full_elf` |
+|---|---|---|
+| 20 | 13.99 GB/s | 18.78 GB/s |
+| 24 | `ERT_CMD_STATE_ERROR` | 19.82 GB/s |
+| 32 | `ERROR` | 21.14 GB/s |
+| 50 | `ERROR` | 22.70 GB/s |
+
+**It is not only a ceiling difference — it is ~34% faster at 20 buffers, where
+both paths work.** So the vararg path was costing bandwidth on every design that
+stayed inside its limit, not just failing outside it. `--full-elf` is now a flag
+on the probe rather than an edit.
+
+(`tools/npu/flm/README.md` still carried the pre-`full_elf` reading of the wall —
+"hangs the firmware ... pack fewer, larger buffers" — and is corrected in this
+commit. A trap list is only useful if it is corrected as fast as it is written.)

@@ -179,6 +179,8 @@ def main():
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--verify", action="store_true",
                    help="ride one tile through the same dispatch and check it")
+    p.add_argument("--full-elf", action="store_true",
+                   help="dispatch via run.set_arg/run.start instead of kernel varargs")
     p.add_argument("--sweep-workers", default=None,
                    help="comma-separated worker counts to compare, e.g. 1,2,4,8,16")
     o = p.parse_args()
@@ -194,7 +196,8 @@ def main():
     for w in points:
         try:
             gbs, us, _ = build_and_run(o.bufs, o.buf_kb, w, o.tile_kb,
-                                       o.group, o.warmup, o.iters, o.verify)
+                                       o.group, o.warmup, o.iters, o.verify,
+                                       o.full_elf)
         except Exception as e:
             first = str(e).strip().splitlines()[0][:70] if str(e).strip() else type(e).__name__
             print(f"{w:7d} {'FAIL':>8s} {'':>10s}  {first}")
