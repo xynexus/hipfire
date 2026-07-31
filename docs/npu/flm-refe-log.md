@@ -4608,3 +4608,29 @@ instead of the NLF, and that cost has not been measured.
 - **No scalar libm on the core**: `__builtin_exp2f` fails to link with
   `undefined symbol: exp2f`. The rescale factor goes through the same vector
   `exp2` with one lane extracted.
+
+## 2026-07-31 — Upstream issue 2406 corroborates the bitwise limits, and qualifies the shuffle finding
+
+[Xilinx/mlir-aie#2406](https://github.com/Xilinx/mlir-aie/issues/2406), "Multi-head
+attention fails to compile for aie2p" (closed, labelled question), reports the
+**identical** backend failure hit twice in this work:
+
+```
+fatal error: error in backend: unable to legalize instruction:
+%140:_(<4 x s32>) = G_AND %78:_, %138:_
+```
+
+theirs from `bit_and`/`bit_xor`/`downshift` inside a bf16 sin/cos polynomial,
+ours from `aie::bit_and` on a 16-lane uint8 vector. Same instruction, same
+target, same family of intrinsics — so this is a **known upstream gap on aie2p,
+not a misuse of the API**, and the working shape (do bitwise work 256 bits wide,
+avoid `downshift` on uint8 entirely) is a workaround for a real bug rather than a
+style preference.
+
+The issue also reports **`::shuffle_T16_8x2` missing for NPU2**, with the
+reporter falling back to implementing the interleave element by element. That
+**qualifies the shuffle/"twizzle" finding** recorded earlier: the network exists,
+the mode table in `aie2p_enums.h` is real, and `interleave_unzip` measured at one
+extra instruction — but **not every mode in that table has an NPU2
+implementation**. Check a specific mode compiles before designing a data layout
+around it; the earlier entry implied the whole table was available.

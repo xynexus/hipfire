@@ -141,6 +141,14 @@ Each is a thing that cost real time; module docstrings have the detail.
   arbitrary nibble order costs ~**1 extra instruction** through it (76 vs 75 on
   the GEMV loop), where a `aie::concat`-based gather of the same data costs 103.
   A layout argument was decided wrongly here before anyone counted instructions.
+- **Upstream confirms the bitwise-legalization limits** —
+  [Xilinx/mlir-aie#2406](https://github.com/Xilinx/mlir-aie/issues/2406) reports
+  the identical `unable to legalize instruction: G_AND <4 x s32>` on aie2p, from
+  `bit_and`/`bit_xor`/`downshift` in a bf16 sin/cos polynomial. So these are a
+  known backend gap, not misuse. That issue also reports **`shuffle_T16_8x2` is
+  missing for NPU2**, which qualifies the shuffle note above: the network is
+  there and `interleave_unzip` works (measured), but not every transpose mode in
+  `aie2p_enums.h` has an implementation — check before designing around one.
 - **AIE2P backend limits that shape the code**: `aie::downshift` on a *uint8*
   vector segfaults the compiler (uint16 is fine); 16-lane uint8 vectors fail to
   legalize (`G_AND <4 x s32>`), as do 16-lane float reductions
