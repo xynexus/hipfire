@@ -7512,3 +7512,48 @@ Note the older harness path is not invalidated. `Q4nx.blocks()` returns the
 container's own order, but both the kernel and the reference were fed the same
 blocks, so those runs were always valid *as arithmetic checks* — which is all
 they claimed. `--real` is the addition, not a correction.
+
+## 2026-07-31 — the 16-layer unroll, measured (Task 8's lever)
+
+`ffn_chain.py --bench --repeat N`, P4+P5 in one dispatch:
+
+| unroll | total µs | per layer | implied marginal (total−92.9)/N |
+|---|---|---|---|
+| 1  | 681.4  | 681.4 | 588.5 |
+| 4  | 2478.4 | 619.6 | 596.4 |
+| 8  | 4851.3 | 606.4 | 594.8 |
+| 16 | 9721.1 | 607.6 | 601.8 |
+
+Bandwidth rises 46.3 → 51.9 GB/s (92% of the 56.5 GB/s fabric roof).
+
+**The gain is dispatch amortisation and nothing else.** Marginal per-layer cost
+actually gets *worse* with depth — 588.5 → 601.8 µs, 2.3% — so unrolling buys
+back the fixed 92.9 µs, it does not improve streaming. Against 16 separate
+dispatches:
+
+    16 x 681.4 = 10902.4 µs   vs   one unrolled 9721.1 µs
+    saving 1181.3 µs = 1.18 ms/token (10.8%)
+
+That is close to the 1.44 ms/token the projection predicted for this lever, and
+it is now measured rather than assumed.
+
+### Projection
+
+    per-layer dispatch   token 16.97 ms -> 58.9 tok/s
+    16x unrolled         token 15.79 ms -> 63.3 tok/s
+    FLM baseline                            59.86 tok/s (live 59.05-60.34)
+
+**This is the first projection that clears FLM.** Two things it rests on that
+are NOT demonstrated:
+
+  1. that P1/P2/P3 unroll with the same amortisation. Only the FFN half has been
+     measured, and P1→P2 does not yet work at all;
+  2. that a full layer unrolled 16x **fits in 16 KB of program memory**. The FFN
+     half fits — that is what these numbers are — but §1.5b already put one
+     layer's kernels at 78% of program memory with `noinline`. Sixteen copies of
+     a full layer is the obvious place this plan breaks, and nothing here shows
+     it does not.
+
+So: the lever is real and measured on the half that works. Whether it survives
+the full layer is the open question, and it is a program-memory question rather
+than a bandwidth one.
