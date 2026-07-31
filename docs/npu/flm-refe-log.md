@@ -10210,3 +10210,41 @@ composed seam.
 
 Every number above this line that quotes 55.7 was measured on a layer missing
 this norm.
+
+### P3 -> P4 is now genuinely composed
+
+The second of four seams. P3's drain scatters each pair's h into natural row
+order, and P4's broadcast is filled from that same buffer:
+
+    p1h[i].drain(hb[i], wait=True, group=tg,
+                 offset=i * 2 * NROWS * p3tiles,
+                 sizes=[1, 2, p3tiles, NROWS],
+                 strides=[0, NROWS, 2 * NROWS, 1])
+
+A pair's object is `[core j][tile t][row r]` and core (pr, j) owns rows
+`pr*rpp3 + t*2*NROWS + j*NROWS + r`, so the permutation is a plain 3-level
+stride — the same trick the P4 drain uses for sw. One buffer serves as P3's drain
+target and P4's broadcast source, with nw2 parked at `[K_DIM:2*K_DIM]` where the
+drain never writes.
+
+Evidence the scatter is right: `P3 h` is checked in NATURAL order now (`h_idx`
+is just `arange`) and still reads 9.5367e-07 at layer 0, 5.9605e-08 at layer 15.
+A wrong scatter would be off by the size of h.
+
+`sw` is unchanged at 2.9297e-03, which is the expected result rather than a
+suspicious one: h's device-vs-host difference is 9.5e-07 and the bf16 ULP at
+|h| ~ 0.046 is ~1.8e-4, so P4's input is bit-identical either way.
+
+Two traps re-encountered, both already documented and both hit anyway:
+  * the drain's runtime arg type is the DRAIN TARGET's shape, not the object's —
+    `h_ty` had to grow from 2*OBJ to the full broadcast buffer
+  * `h_ty` reaches the design through the namespace, so the iron.jit cache did
+    not see it change; the fifo-name tag (`bc_swrow` -> `bc_hchain`) is what
+    actually rebuilt it
+
+Timing is neutral: side A 629.4 us median (627.6/641.6/629.4) against 636.6
+before, and the within-set spread is +-7 us, so the two are indistinguishable.
+The quoted figure stays **55.1 tok/s**.
+
+Seams composed: **2 of 4** (P3->P4, P4->P5). Remaining: P1->P2 (q' comes from
+the host's `qall`) and P2->P3 (the attention output comes from the host's `bc3`).

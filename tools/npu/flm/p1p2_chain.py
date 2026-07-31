@@ -163,7 +163,10 @@ def build(pos, nobj):
     # ffn_chain pattern, already used here for the KV cache.
     attn_all_ty = np.ndarray[(apairs * 2 * GQA * HEAD,), np.dtype[bfloat16]]
     w3_ty = np.ndarray[(2 * p3tiles * OPERAND,), np.dtype[np.uint8]]
-    h_ty = np.ndarray[(2 * OBJ,), np.dtype[bfloat16]]   # one object per core
+    # h's DRAIN TARGET, not its object: the drain scatters a pair's 2*OBJ
+    # object into the full broadcast-shaped buffer that P4 is filled from,
+    # so the runtime argument is that buffer's shape.
+    h_ty = np.ndarray[(2 * K_DIM + 2 * HEAD,), np.dtype[bfloat16]]
     w4_ty = np.ndarray[(2 * 2 * p4tiles * OPERAND,), np.dtype[np.uint8]]
     # ONE row-ordered sw buffer for all pairs. P5 slices it by K-chunk, so it
     # must be in row order — the per-pair stream is [object][core] and a
@@ -245,7 +248,7 @@ def _design(bc: In, {P}):
                            arg_types=[bc_ty, op_ty, p1o_ty],
                            compile_flags=FLAGS)
 
-    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_swrow")
+    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_hchain")
     bc_cons = [f_bc.cons() for _ in range({NCORES})]
     f_w = [ObjectFifo(oppair_ty, name=f"wp{{i}}_n{NROWS}k{KVPER}") for i in range({npairs})]
     w_sub = [f.cons().split([0, {OPERAND}], obj_types=[op_ty, op_ty]) for f in f_w]
@@ -469,7 +472,15 @@ def _design(bc: In, {P}):
         for i in range(n):
             wh[i].fill(w3b[i], group=tg)
         for i in range(n):
-            p1h[i].drain(hb[i], wait=True, group=tg)
+            # Scatter each pair's h into NATURAL row order so P4 can be filled
+            # straight from it. A pair's object is [core j][tile t][row r] and
+            # core (pr, j) owns rows pr*rpp3 + t*2*NROWS + j*NROWS + r, so the
+            # permutation is a plain 3-level stride -- the same trick the P4
+            # drain uses for sw.
+            p1h[i].drain(hb[i], wait=True, group=tg,
+                         offset=i * 2 * {NROWS} * {p3tiles},
+                         sizes=[1, 2, {p3tiles}, {NROWS}],
+                         strides=[0, {NROWS}, {2 * NROWS}, 1])
         tg.finish()
 
         # ---- P4 -----------------------------------------------------------
@@ -723,13 +734,13 @@ def main():
         b = np.empty((p3tiles, 2, wt), np.uint8)
         b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
         w3.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
-    h_ts = [iron.zeros(2 * 2 * HEAD, dtype=bfloat16, device="npu")
-            for _ in range(npairs)]
+    # ONE buffer that P3 drains into and P4 is filled from -- this is what
+    # actually chains the two phases -- built below, once nw2 is loaded.
 
     # ---- P4: gate/up + SwiGLU ---------------------------------------------
-    # Its activation is P3's h, and h_ref is the value P3 was just verified to
-    # produce — so this checks P4 against the real chain quantity without
-    # depending on the device's h round-tripping through DDR yet.
+    # Its activation is P3's OWN DEVICE OUTPUT: P3 drains h into `h_all` in
+    # natural row order and P4's broadcast is filled from that same buffer, so
+    # this seam is genuinely composed rather than host-fed.
     D_FF = 8192
     p4tiles = D_FF // (NCORES * NROWS)
     p4per = 2 * HEAD // NROWS
@@ -746,11 +757,14 @@ def main():
     hd = h_act.astype(np.float64)
     inv2 = np.float32(1.0 / np.sqrt((hd * hd).mean() + EPS))
     h_n = rnd(rnd(h_act * rnd(inv2)) * nw2)
+    # ONE buffer: P3's drain target AND P4's broadcast source. [0:K_DIM] is
+    # written by the drain (so its initial value is irrelevant); nw2 lives at
+    # [K_DIM:2*K_DIM] and the drain never touches it.
     bc4 = np.zeros(2 * K_DIM + 2 * HEAD, np.float32)
-    bc4[:K_DIM] = (h_n if __import__("os").environ.get("CHAIN_HOST_NORM")
-                   else h_act)
     bc4[K_DIM:2 * K_DIM] = nw2
-    bc4_t = iron.tensor(bc4.astype(bfloat16), dtype=bfloat16, device="npu")
+    h_all = iron.tensor(bc4.astype(bfloat16), dtype=bfloat16, device="npu")
+    h_ts = [h_all] * npairs          # every pair scatters into the same buffer
+    bc4_t = h_all                    # ...which P4 is then filled from
 
     rpp4 = D_FF // npairs
     # A core's rows must be CONTIGUOUS, not interleaved with its partner's.
@@ -838,15 +852,13 @@ def main():
         print(f"  bench: {mb:.2f} MB  {mb*1e3/_us:.1f} GB/s  {_us:.1f} us "
               f"(marginal {_us - FIXED_US:.1f}, 16-core ideal {mb*17.85:.1f})")
     # dense now: each core emits its whole 128-row slice in one object
-    got_h = np.concatenate([t.numpy().astype(np.float64) for t in h_ts])
+    # h_all is one shared buffer now, already in natural row order.
+    got_h = h_all.numpy().astype(np.float64)[:K_DIM]
     order = np.concatenate([np.array(p3rows(pr, j)) + r
                             for pr in range(npairs) for t in range(p3tiles)
                             for j in (0, 1) for r in range(0)] or [np.zeros(0, int)])
     # object order is [pair][core], each carrying that core's rows in tile order
-    h_idx = np.concatenate([np.arange(r0, r0 + NROWS)
-                            for pr in range(npairs)
-                            for j in (0, 1)
-                            for r0 in p3rows(pr, j)])
+    h_idx = np.arange(K_DIM)      # the drain scatters, so no permutation
     e3 = np.abs(got_h - h_ref[h_idx]).max()
     if __import__("os").environ.get("CHAIN_P3_DIAG"):
         sg, sr = np.sort(got_h), np.sort(h_ref)
