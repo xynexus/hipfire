@@ -9481,3 +9481,27 @@ Beating FLM from here needs a *different decomposition*, not tuning: fewer,
 larger phases so that a layer is two or three bodies rather than five. That is a
 design question rather than an implementation one, and it is where the work
 should go next.
+
+### Cross-layer pipelining evaluated and rejected
+
+The one structure that could have kept a single dispatch: split the cores, run
+layer *i*'s attention on half while layer *i−1*'s FFN runs on the other half, and
+let the pipeline hide one behind the other.
+
+    on 16 cores: attention 116.6 µs, FFN 633.1 µs
+    on  8 cores: attention ~121.3 µs (fabric-bound), FFN ~1126.9 µs (core-bound)
+    pipeline rate = max = 1126.9 µs/layer  vs  749.7 sequential on all 16
+    -> **1.50x worse**
+
+Same root cause as everything else this week: the FFN is core-bound and dominates
+the layer, so halving its cores costs more than overlapping the attention saves.
+A pipeline only pays when the stages are balanced, and these are 5.4:1.
+
+### If the two-dispatch route is taken, this is the split
+
+    A: P1+P2+P3   13680 B   83%    attention through o_proj + residual
+    B: P4+P5      10816 B   66%    the FFN
+
+Both comfortable, and A ends exactly where P3 stashes the residual that P5 needs
+— so the split falls on a boundary the data already has. It costs the ~2.7–2.9
+ms/token of the extra dispatch, landing at ~55 tok/s.
