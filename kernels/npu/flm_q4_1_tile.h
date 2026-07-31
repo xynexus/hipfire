@@ -67,6 +67,14 @@ inline int tile_row_base(const uint8 *restrict wtile) {
   return int(reinterpret_cast<const float *>(wtile + TILE_BYTES)[0]);
 }
 
+// The trailer's second f32. Carries the token's KV-cache position for the k'
+// emit, which needs its parity to decide whether this step opens a column pair
+// or closes one. f32 rather than bf16 because bf16 is exact on integers only to
+// 256 and the position runs to the context length.
+inline int tile_flags(const uint8 *restrict wtile) {
+  return int(reinterpret_cast<const float *>(wtile + TILE_BYTES)[1]);
+}
+
 static_assert(NB % 2 == 0, "K must be a multiple of 64");
 static_assert(NB % LANES == 0, "K/32 must be a multiple of 32 for the zero-point reduction");
 

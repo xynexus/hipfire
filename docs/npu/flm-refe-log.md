@@ -6427,3 +6427,39 @@ answer:
 That closes the primitives for Task 7's remaining harness: the inter-phase
 chain, the residual stash, the KV append geometry, core-static persistence, and
 now the three-way split are all measured.
+
+## 2026-07-31 — `flm_kv_emit.cc` written; its harness does not work yet
+
+The kernel that closes the P1→P2 seam. It supplies the two values the narrowest
+legal channel-major write needs:
+
+    even t:  (k′_t, 0)          -> column pair (t, t+1)
+    odd  t:  (k′_{t-1}, k′_t)   -> column pair (t-1, t)
+
+so every token lands in its own column, each pair is written twice, and the zero
+at even `t` is what attention's `npad` correction wants from a padded position.
+`g_kprev` carries the previous token across the dispatch boundary, which is what
+keeps K in bf16 instead of the f32 cache that costs ~6 tok/s. It compiles at a
+**64 B frame** and reads the position from the tile trailer's second f32, for
+which `flm_q4_1_tile.h` gains `tile_flags()`.
+
+**`tools/npu/flm/kv_emit_verify.py` does not work.** It produces an all-zero
+cache with no error. Ruled out by measurement:
+
+- not the stride pattern — a plain contiguous drain is equally empty;
+- not the destination BO size — a BO sized to exactly one object is equally
+  empty;
+- not the trailer offset — `tile_flags()` offsets by `TILE_BYTES`, so passing a
+  bare 64 B trailer read 20 KB out of bounds and made the even/odd branch
+  random. Fixed by passing a real tile-sized buffer; the numbers did not move,
+  because the buffer was zero either way. **Worth keeping as a trap in its own
+  right**: any kernel taking a `wtile` needs a full tile, not just its trailer.
+
+So the core or its fifos are not producing, upstream of anything about the
+append. Both mechanisms this harness combines are separately proven —
+`kv_append_probe.py` for the paired strided write and `static_persist_probe.py`
+for the carry — so what is unproven is only their combination in this design.
+
+The next attempt should **extend `qkv_route_probe.py`**, which produces and
+routes correctly, rather than write a third design from scratch. The structural
+difference is that this one feeds the core from two input fifos.
