@@ -8974,3 +8974,36 @@ operand is sized for program-memory sharing and is too big for data memory" — 
 two ceilings I noted pulling against each other, with a concrete knob between
 them. Whether NROWS=8 costs measurable throughput is answerable with
 `gemv_bench.py`, which already sweeps NROWS, before touching the layer at all.
+
+### The NROWS trade, measured: 8 costs 4.5% and buys 20 KB
+
+`gemv_bench.py --nrows N --cores 16`:
+
+| NROWS | GB/s | vs FLM decode | operand | 2/core |
+|---|---|---|---|---|
+| 16 | **48.9** | 1.06x | 20544 B | 41088 B (63%) |
+| 8 | **46.7** | 1.01x | 10304 B | 20608 B (31%) |
+| 4 | 38.7 | 0.84x | 5184 B | 10368 B (16%) |
+
+(The MB column differs between runs because `--tiles` is fixed, so the GB/s rate
+is the comparable figure, not the wall time.)
+
+**NROWS=8 costs 4.5% of GEMV bandwidth and frees 20 KB of core data memory** —
+far more than P4 needs. NROWS=4 falls off a cliff at 21%, so 8 is the operating
+point.
+
+Carried through the projection, assuming every phase slows by the same 4.5%:
+
+    NROWS=16   token 15.47 ms -> 64.7 tok/s   +8.0%
+    NROWS=8    token 16.00 ms -> 62.5 tok/s   +4.4%
+    NROWS=4    token 18.40 ms -> 54.3 tok/s   -9.2%   (loses)
+
+So the data-memory blocker has a price and it is payable: **2.2 tok/s to unblock
+P4 and P5**, still clearing FLM by 4.4%. That is a worse margin than the 8.0% the
+unbuildable configuration projected, but it is the first number for a layer that
+can actually be built.
+
+Worth stating what is not yet known: whether NROWS=8 changes the *phase*
+measurements proportionally. The 4.5% is a GEMV-level figure and the phases have
+fixed overheads that will not scale with it, so 62.5 is a floor-ish estimate
+rather than a prediction — the phases would need re-measuring at NROWS=8.
