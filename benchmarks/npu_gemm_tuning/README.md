@@ -7,11 +7,32 @@ CSV row so configs are directly comparable across runs.
 
 ## Why C++ host, not the python harness
 
-On this box the mlir-aie python `test.py` harness segfaults loading the
-`mlir_aie` native MLIR bindings under Python 3.14 (independent of the kernel and
-of the source/wheel version). The compiled C++ host (`whole_array.exe`) has no
-such dependency and is the only reliable run path. `tune.sh` uses it for both
-build and run.
+`tune.sh` drives the compiled C++ host (`whole_array.exe`) for both build and
+run. It is known-good and the CSV baselines below were all measured through it,
+so it stays the reference path.
+
+**CORRECTED 2026-07-31.** This section previously claimed the python harness
+"segfaults loading the `mlir_aie` native MLIR bindings under Python 3.14
+(independent of the kernel and of the source/wheel version)". That diagnosis was
+wrong. The cause was the venv's `mlir_aie` **wheel shadowing the build tree** —
+`import aie` resolved to `~/.venv/.../site-packages/mlir_aie/python/aie` rather
+than `$MLIR_AIE_DIR/build/python/aie`, so the native bindings loaded did not
+match the source tree the design was generated from.
+
+With `PYTHONPATH=$MLIR_AIE_DIR/build/python` set, the python path works on this
+box under Python 3.14:
+
+```
+$ python3 programming_examples/basic/vector_scalar_mul/vector_scalar_mul.py --warmup 2 --iters 5
+NPU time     (avg/min/max us): 147.6 / 128.6 / 159.3
+PASS!
+```
+
+`tune.sh` now exports that `PYTHONPATH` itself and hard-fails if the built `aie`
+package is absent. The same shadowing broke the C++-host build outright once the
+source tree moved onto `origin/main` (`ImportError: cannot import name
+'CompileTime' from 'aie.iron'`), since the design generator is python either
+way. Full write-up: `docs/npu/flm-refe-log.md`, 2026-07-31.
 
 ## Run
 

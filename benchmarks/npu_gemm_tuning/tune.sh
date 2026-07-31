@@ -47,6 +47,14 @@ source "$NPU_VENV/bin/activate" || { echo "ERROR: venv $NPU_VENV missing"; exit 
 PEANO_INSTALL_DIR="$(pip show llvm-aie 2>/dev/null | awk '/^Location:/{print $2}')/llvm-aie"
 export PEANO_INSTALL_DIR
 export PATH="$PEANO_INSTALL_DIR/bin:$PATH"
+# The venv carries an `mlir_aie` wheel whose `aie` package SHADOWS the build
+# tree. Designs under $MLIR_AIE_DIR track that source tree, so once the tree
+# moves ahead of the wheel they fail to import against it -- e.g.
+# "cannot import name 'CompileTime' from 'aie.iron'". Point at the build tree
+# explicitly; this is not optional.
+export PYTHONPATH="$MLIR_AIE_DIR/build/python${PYTHONPATH:+:$PYTHONPATH}"
+[ -d "$MLIR_AIE_DIR/build/python/aie" ] || {
+  echo "ERROR: no built aie python package at $MLIR_AIE_DIR/build/python"; exit 1; }
 # shellcheck disable=SC1090
 source "$XRT_SETUP" >/dev/null 2>&1
 [ -x "$PEANO_INSTALL_DIR/bin/clang" ] || { echo "ERROR: Peano not found at $PEANO_INSTALL_DIR"; exit 1; }

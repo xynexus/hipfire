@@ -50,9 +50,31 @@ def parse(d):
                           dir=desc & 0xFF, ch=(cfg >> 24) & 0xFF,
                           ncol=(cfg >> 16) & 0xFF, nrow=(cfg >> 8) & 0xFF)
         elif op == 0x81:  # CUSTOM_OP_DDR_PATCH — relocate a BD's DDR address
+            # Two layouts, and they are aie-rt's own two struct families rather
+            # than a vendor quirk (xaiegbl.h): v0.1 uses patch_op_t (44+ bytes,
+            # action at +20, addr at +24, arg_idx at +32, arg_plus at +40); v1.0
+            # uses patch_op_opt_t, 24 bytes:
+            #
+            #   +0  u8 Op, u8 padding[3]      XAie_OpHdr_opt
+            #   +4  u32 Size (= 24)           XAie_CustomOpHdr_opt
+            #   +8  u32 regaddr           \
+            #   +12 u8 argidx, u8 pad[3]   >  patch_op_opt_t
+            #   +16 u64 argplus           /
+            #
+            # regaddr is only 32 bits in the optimized form and there is no
+            # `action` field. Reading the 44-byte offsets out of a 24-byte op
+            # walks into the NEXT operation and yields plausible-looking garbage.
             sz = r32(i + 4)
-            detail = dict(arg=struct.unpack_from("<i", d, i + 32)[0],
-                          plus=struct.unpack_from("<i", d, i + 40)[0])
+            if sz >= 44:
+                detail = dict(addr=r32(i + 24),
+                              arg=struct.unpack_from("<i", d, i + 32)[0],
+                              plus=struct.unpack_from("<i", d, i + 40)[0])
+            elif sz >= 24:
+                detail = dict(addr=r32(i + 8),
+                              arg=d[i + 12],
+                              plus=r32(i + 16) | (r32(i + 20) << 32))
+            else:
+                detail = dict(note=f"unrecognised DDR_PATCH size {sz}")
         elif 0x82 <= op <= 0x85:  # newer custom ops; body is opaque here
             sz = r32(i + 4)
             detail["words"] = [r32(i + k) for k in range(0, sz, 4)]

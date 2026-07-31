@@ -1,0 +1,3 @@
+utc,model,workload,reps,gen_lim,prompt_tokens,tok_s,ttft_ms,gb_s,all_tps
+20260730T190418Z,llama3.2:1b,decode,1,128,61,61.22,443.07,47.3,61.22
+20260730T190422Z,llama3.2:1b,prefill,1,128,1828,1623.51,,,1623.51

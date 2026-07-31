@@ -1,0 +1,2 @@
+utc,dtype_in,dtype_out,M,K,N,m,k,n,cols,warmup,iters,avg_us,avg_gflops,tops,pct_peak,status
+20260730T182158Z,i8,i8,2048,2048,2048,64,128,64,8,3,10,,,,,BUILD_OR_RUN_FAIL
