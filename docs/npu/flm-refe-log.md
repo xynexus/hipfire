@@ -9540,3 +9540,33 @@ looked like.
 
 Both comfortable, the split falls where P3 stashes the residual P5 needs, and
 nothing in it depends on an assumed figure.
+
+### Merging acc+flush saves 1680 B — because it removes a BODY, not bytes
+
+`flm_gemv_down` folds `flm_gemv_acc` and `flm_gemv_flush` into one entry point
+selected by the tile flag, so P5's accumulating chunks and its flushing chunk
+share a single `range_` body instead of needing two.
+
+    P5 as two bodies   > 5696 B
+    P5 as one body       4016 B     -> at least 1680 B saved
+
+I built this kernel once before and **deleted it**, having measured the merge at
+80 B and concluded it was worthless. That measurement was of *kernel code*. The
+saving is in the loop body the merge removes — ~1700 B of generated acquire /
+release / prepare structure — and body count is what the 16 KB is spent on. The
+earlier conclusion was right about the number and wrong about which number
+mattered.
+
+What it changes:
+
+| | P5 = 5696 | P5 = 4016 |
+|---|---|---|
+| P3+P4+P5 | 16240 B — **99%** | 14560 B — **89%** |
+| P2+P3+P4+P5 | 19232 B | 17552 B — still over by 1168 |
+| P1+P3+P4+P5 | 20368 B | 18688 B — still over by 2304 |
+
+**Five phases still do not fit**, so the conclusion holds. But the FFN-core
+configuration goes from *only just* fitting to comfortable, which matters because
+that is what every fallback depends on.
+
+The kernel is kept this time, and justified by the right number.
