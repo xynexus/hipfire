@@ -9944,3 +9944,32 @@ model, so 55.0 is the real number for the buildable configuration.
 *(This entry first said 17.24 ms and 58.0 tok/s. That was an arithmetic slip in
 the same commit that produced the correct figures alongside it — 16 × 904.9 +
 3693.8 is 18172 µs, not 17240.)*
+
+### What 55.0 tok/s does and does not establish
+
+Both dispatches are verified, but against *host* references at the boundary, not
+against each other:
+
+  * side A's `sw` is checked against a host reference (2.4414e-04, the exp2
+    floor);
+  * side B's `x_out` is checked against a host reference computed from a
+    host-supplied `sw` (0.0000e+00).
+
+So the layer is verified **transitively** — both sides agree with the same
+intermediate — and the *timing* is a real sum of two measured dispatches. Two
+things are not yet exercised:
+
+  1. **the `sw` handoff itself.** A writes `sw` to DDR and B reads it back as its
+     broadcast. Neither run does that; each uses host data at the seam. The
+     mechanism is the same DDR round trip P5 already makes between chunks, and
+     `chain_probe.py` verified inter-phase DDR, so this is expected to work — but
+     expected is not measured;
+  2. **`g_resid` across the dispatch boundary.** In the real layer P5's residual
+     comes from what P3 stashed in the previous dispatch (`RESID_FROM_STASH=1`).
+     `p5_pass` uses a host-supplied residual instead. Core globals do persist
+     across dispatches — `g_kprev` carries the k′ column pairs that way — but
+     again, not tested for this.
+
+Neither affects the 55.0 timing, which is what the figure is for. Both would
+have to work for the layer to run unattended, and both are single experiments
+rather than open problems.
