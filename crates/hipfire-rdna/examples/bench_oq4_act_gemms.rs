@@ -103,6 +103,12 @@ fn main() {
             gpu.quantize_act_oq4(&xr, &xq, &xs, n, k, GROUP).unwrap();
             gpu.device_synchronize().unwrap();
 
+            // Stream B clip-search overhead: isolated quantize timing. Run the
+            // bench with HIPFIRE_OQ4_ACT_CLIP unset vs =1 to compare plain absmax
+            // vs the register-cached 9-alpha clip search (expected ~neutral).
+            let t_quant = med_ms!(gpu.quantize_act_oq4(&xr, &xq, &xs, n, k, GROUP).unwrap());
+            eprintln!("  quantize_act_oq4  {label}  N={n}: {t_quant:.4} ms");
+
             // bf16-output variant of the pure iu4 GEMM (output-memory lever): halves
             // the output write (2 B vs 4 B/elem). y_bf16 is a Raw buffer of n*m*2 B.
             let y_bf16 = gpu.alloc_tensor(&[n * m * 2], DType::Raw).unwrap();

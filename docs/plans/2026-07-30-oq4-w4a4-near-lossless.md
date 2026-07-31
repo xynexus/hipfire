@@ -836,10 +836,15 @@ PPL** — near the 0.016 noise floor. And with the clip lever, **full-W4A4+clip 
 11.07 PPL) is *better* than today's mix (0.0585 / 11.07) on BOTH metrics** — while also being
 **faster** (int4 qkv via the A3 LDS kernel + int4 activation throughput). So:
 
-> **A4 GO/NO-GO → GO.** full W4A4 + activation clip is a **strict improvement over the current
-> batched-prefill default** — better quality (−0.003 KLD, −0.08 PPL) AND higher throughput.
-> The expensive Stream-B levers (ConQuR rotation, ResQ A8 subspace) are **NOT required** for the
-> promotion; they would only push further below the noise floor, which the go/no-go does not need.
+> **A4 GO/NO-GO → GO on QUALITY.** full W4A4 + activation clip is **better quality than the
+> current batched-prefill default** (−0.003 KLD, −0.08 PPL; §9e confirmation below). The
+> expensive Stream-B levers (ConQuR rotation, ResQ A8 subspace) are **NOT required** — clip
+> alone clears the bar. **Throughput correction (§9f):** clip is NOT free — it ~2× the quantize
+> kernel, which offsets the qkv int4-GEMM gain, so W4A4+clip vs the current mix is a **quality
+> win at roughly neutral throughput**, not the "faster AND better" first claimed. (Plain W4A4
+> without clip IS faster but is a slight quality *regression* vs the mix — 0.073 > 0.067 — so
+> clip is what makes the promotion a quality win.) Cheapening the clip (fewer α / closed-form /
+> de-dup the redundant qkv quantizes) would restore a clean speed win — a follow-up.
 
 Remaining before flipping the default: house-rule confirmation (≥16 chunks / ctx=2048 done
 as 1; coherence-gate on the winner watching the list-primes attractor; 9B/27B confirmation),
@@ -861,7 +866,28 @@ holds at house-rule scale, not just as an aggregate. (Absolute KLD is higher tha
 ctx=2048 window's 0.0585 because these 16 windows span harder/more-varied corpus text — PPL
 23 vs 10.7; the clip<mix<plain *ordering* is the robust, corpus-independent result.) `perplexity_batched`
 now takes `--chunks N` (fresh KV+DeltaNet per chunk, matching the daemon). Confirmation
-item 1/4 DONE; remaining: coherence-gate, clip-throughput bench, 9B.
+item 1/4 DONE.
+
+### 9f. Confirmation battery results (2026-07-31)
+
+1. **≥16-chunk KLD — PASS** (above): W4A4+clip 0.0625 beats current mix 0.0667 on KLD + PPL,
+   per-chunk clip ≤ mix across the spread.
+2. **Coherence-gate — PASS.** `hipfire chat` W4A4+clip (`HIPFIRE_OQ4_ACT4=1 HIPFIRE_OQ4_ACT_CLIP=1`),
+   greedy: factual → "…Paris is the capital of…"; reasoning → "60/1.5 = 40, because dividing by
+   1.5 is multiply by 2/…" — both correct, no list-primes attractor, no gibberish. (`hipfire chat`
+   self-locks the GPU — run it BARE, not under `hipfire lock run`, or it FATALs on a double-lock.)
+3. **Clip-throughput bench — clip is NOT neutral (corrects §9d/§9e).** Isolated `quantize_act_oq4`
+   timing (`bench_oq4_act_gemms`, `HIPFIRE_OQ4_ACT_CLIP` off vs on), N=512: qkv 0.052→0.114 ms
+   (+118%), o/down 0.050→0.103 (+104%), gate 0.050→0.102 (+102%). Register-cache killed the 9×
+   DRAM re-read, but the 9-α search's ALU (per-α wave-reduce) still ~2× the quantize kernel.
+   Quantize is ~25% of a projection GEMM (and W4A4 qkv runs it 3× redundantly), so full-path
+   overhead ~10–30%, offsetting the qkv int4-GEMM gain → **W4A4+clip is a quality win at ~neutral
+   throughput, not "faster AND better."** Follow-up: fewer α / closed-form clip / de-dup qkv quantizes.
+4. **9B/27B — OWED (artifact-blocked).** No clean qwen3.5-9B/27B `oq4++` on disk (only 0.8b oq4
+   + non-3.5 bf16 + confounded 2B/4B triattn.oq4.25); needs a quant pass. Harness is ready.
+
+**Battery verdict: quality LOCKED (16-chunk + coherence both PASS) — ship W4A4+clip as a quality
+improvement; throughput ~neutral (clip overhead ≈ qkv gain) pending a clip speed-up; 9B owed.**
 
 **A4 decision:** int4-act buys ~1.5× prefill throughput (§9) at ~0.067 KLD / +0.79 PPL.
 That is a genuine **throughput-vs-quality tradeoff**, NOT free — so promoting qwen3.5
