@@ -6014,3 +6014,56 @@ that alone failed this harness after its arithmetic was already correct.
 Regression after the fix: `gemv_verify`, `normgemv_verify`, `down_verify`,
 `qkv_verify`, `attn_verify --seq 500`, `attn_phase --seq 480`, `ffn_chain` — all
 pass.
+
+## 2026-07-31 — projection from measured phases: the fused layer reaches PARITY, the 16-layer unroll is what beats FLM
+
+Four of the five phases are now measured, so the fused layer can be projected
+from real numbers instead of the plan's estimates.
+
+| phase | MB | marginal us | ideal | % of ceiling | source |
+|---|---|---|---|---|---|
+| P1 qkv+rope, 16c | 3.94 | 78.6 | 70.3 | 89% | `qkv_verify` |
+| P2 attention, **8c** | 5.26 | 145.8 | 129.3 | 89% | `attn_phase`, S=2048 |
+| P3 o_proj+residual, 16c | 2.63 | 46.9 | 46.9 | — | **estimated** at the 16c slope |
+| P4+P5 FFN, 16c | 31.56 | 577.8 | 563.3 | 97% | `ffn_chain` |
+
+`layer = 92.9 dispatch + 849.1 phases + 4 x 6.37 barriers`. With
+`lm_head` at 164.2 MB → 3.02 ms:
+
+| seq | KV MB/layer | P2 us | layer us | token ms | tok/s | vs FLM |
+|---|---|---|---|---|---|---|
+| 128 | 0.33 | 9.1 | 830.8 | 16.32 | 61.3 | **1.02x** |
+| 512 | 1.31 | 36.3 | 858.1 | 16.75 | 59.7 | **1.00x** |
+| 1024 | 2.63 | 72.7 | 894.4 | 17.33 | 57.7 | 0.96x |
+| 2048 | 5.26 | 145.3 | 967.0 | 18.50 | 54.1 | 0.90x |
+| 4096 | 10.52 | 290.6 | 1112.3 | 20.82 | 48.0 | 0.80x |
+
+### What this says, and it changes the roadmap
+
+**One dispatch per layer is not enough to beat FLM.** It reaches parity at short
+context and falls behind as the KV cache grows — 0.90x at S=2048. Getting every
+phase to the ceiling is worth only +0.15 ms (60.2 tok/s, 1.01x): the phases are
+already at 89–97%, so there is almost nothing left there.
+
+**The 16-layer unroll is the lever, and it is worth more than everything else
+combined.** 17 dispatches → 2 removes 15 x 92.9 us = **1.39 ms**, taking S=512
+from 59.7 to **65.1 tok/s = 1.09x FLM**. The plan calls it "a follow-on, not a
+prerequisite" (§ header). By these numbers it is **the** prerequisite for the
+project's goal, and Task 8 should be treated as such rather than as polish.
+
+`lm_head` is 3.02 ms — **18% of a token at S=512** — and is untouched by any of
+this. It is the single largest remaining item after the unroll.
+
+### Caveats, stated because the numbers invite over-reading
+
+- P3 is the one phase never measured; it is assumed to hit the 16-core slope
+  exactly, which is optimistic. Every measured phase lands at 89–97%.
+- FLM's 59.86 tok/s baseline has no recorded sequence length. If it was measured
+  at short context, comparing it against the S=2048 row is unfair to us; if at
+  long context, the reverse. The S=128–512 rows are the like-for-like guess.
+- KV padding (KVPER=2, 20% waste) costs 2.1 MB/layer at S=4096. At long context
+  that is worth revisiting, though 2 tiles is already the most that fit in the
+  20544 B operand object.
+- This assumes the fused layer's phases compose at their measured standalone
+  rates. `ffn_chain` is evidence they do — P4+P5 chained hit 97%, the same as
+  the parts — but P1→P2→P3 has not been chained yet.
