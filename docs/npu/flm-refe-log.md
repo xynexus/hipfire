@@ -10539,3 +10539,35 @@ understood of the pair:
 before this session's multi-tile work, and far short of the 641 FLM was measured
 at. The seq-191 timing (~54.5 tok/s, ~-9%) stands as the deepest real context
 this design has run.
+
+### Bisecting the 7-object hang: it is P2 *inside the chain*, not P2
+
+Four measurements, each removing one candidate:
+
+    attn_phase standalone, 8 cores, seq 223 (7 objs)    PASS
+    attn_phase standalone, 8 cores, seq 512 (16 objs)   PASS
+    chain, seq 191 (6 objs)                             PASS
+    chain, seq 223 (7 objs)                             HANG
+    chain, seq 223, CHAIN_P2_ONLY  (P1 skipped)         HANG
+    chain, seq 223, CHAIN_HOST_KV  (P2 reads host cache) HANG
+
+**Standalone attention consumes 16 KV objects without complaint.** The chain
+hangs at 7 — with P1 skipped entirely, and with the cache built by the host
+instead of drained by P1. So this is neither P1's drain, nor the multi-tile
+append I just wrote, nor attention's own object handling.
+
+What is left is the one structural difference between the two: in the chain, KV
+rides `wh[n - a + i]` — the **weight fifo handles of the last `a` pairs**, shared
+with the P3 and P4 weight streams — while `attn_phase` gives KV its own dedicated
+fifo. Seven KV fills queue on a handle that later carries two more phases' worth
+of weights.
+
+That is a hypothesis by elimination, not a proof; I have not instrumented the
+fifo accounting to confirm which acquire never returns. But it is specific enough
+to act on, and it says the fix is structural (give KV its own fifo) rather than a
+parameter tweak.
+
+Also fixed here: `CHAIN_HOST_KV` still assumed a single object
+(`cache.reshape(NATT, SLOT)`) and crashed at any multi-tile sequence. It now
+places the appended token in object `pos // TSEQ` and writes the trailer on every
+object, which is what made the third bisect line above measurable at all.

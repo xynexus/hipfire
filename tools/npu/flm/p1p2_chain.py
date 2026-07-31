@@ -826,16 +826,20 @@ def main():
     if _oh.environ.get("CHAIN_HOST_KV"):
         # the same cache contents, built on the host: P1 still runs and still
         # drains, but P2 reads this instead
-        hostc = cache.reshape(NATT, SLOT).copy()
+        # multi-object: the appended token lives in object pos // TSEQ, and the
+        # trailer belongs on EVERY object, not just the first.
+        hostc = cache.reshape(nobj * NATT, SLOT).copy()
         for g in range(NATT):
-            K = hostc[g, :KTILE].reshape(HEAD, TSEQ)
-            V = hostc[g, KTILE:2 * KTILE].reshape(TSEQ, HEAD)
-            K[:, pos] = ref[NQ + g]
-            V[pos] = ref[NK + g]
+            row = (pos // TSEQ) * NATT + g
+            K = hostc[row, :KTILE].reshape(HEAD, TSEQ)
+            V = hostc[row, KTILE:2 * KTILE].reshape(TSEQ, HEAD)
+            K[:, pos % TSEQ] = ref[NQ + g]
+            V[pos % TSEQ] = ref[NK + g]
         hraw = hostc.astype(bfloat16).view(np.uint16)
-        for g in range(NATT):
-            hraw[g, (OPERAND - 64) // 2:(OPERAND - 64) // 2 + 2] = \
-                np.array([float(g * GQA * OBJ)], np.float32).view(np.uint16)
+        for _o in range(nobj):
+            for g in range(NATT):
+                hraw[_o * NATT + g, (OPERAND - 64) // 2:(OPERAND - 64) // 2 + 2] = \
+                    np.array([float(g * GQA * OBJ)], np.float32).view(np.uint16)
         host_t = iron.tensor(hraw.reshape(-1).view(np.uint8), dtype=np.uint8,
                              device="npu")
         design(bc_t, *w_ts, *q_in, *[host_t] * apairs, *q_ts,
