@@ -10459,3 +10459,52 @@ positions of context. Real decode runs to hundreds.
 
 That makes the seq-512 row above a projection built from separately-measured
 parts, not something the chained design has ever run.
+
+## 2026-08-01 — multi-tile KV implemented: the 32-position cap is gone
+
+The append now targets the object the position actually falls in:
+
+    kv_ob    = pos // TSEQ          # object holding logical position `pos`
+    kv_in    = pos %  TSEQ          # its column/row within that object
+    kv_obase = kv_ob * NATT         # cache is flat [obj*NATT + head][SLOT]
+    off      = kv_in - (kv_in & 1)
+
+and both KV drains carry `(kv_obase + _base)` instead of `_base`. The host side
+follows: real KV now spans every object it needs (`lo, hi = ob*TSEQ,
+min(pos, (ob+1)*TSEQ)`) instead of all sitting in object 0 with the rest padding,
+and the cache check reads across objects the same way.
+
+Verified — and these are real contexts, not one tile with padding:
+
+    seq   objs  k'          v'      P3 h        x_out       attention
+    63    2     1.9531e-03  0.0     0.0         7.6294e-06  0.43 ULP  PASS
+    127   4     -           -       0.0         0.0000e+00  0.33 ULP  PASS
+    191   6     -           -       0.0         0.0000e+00  0.31 ULP  PASS
+
+Single-tile is unchanged (seq 17/31/32 identical to before), so this is additive.
+
+`--seq 32`'s 1.0078e+00 on k' is the documented odd-append artifact, not a
+regression: the k' pair-write emits `(g_kprev, k_t)` at column `t-1` when `t` is
+odd, and `g_kprev` is empty on a first dispatch. The docstring at :49 says so.
+
+### The next context wall is named, and it is not this one
+
+    seq 511: error: 'aiex.dma_configure_task' op Too many simultaneously active
+    buffer descriptors on tile (4,0), which supports up to 16.
+    Emit an aiex.dma_free_task / aiex.dma_await_task to reuse BDs.
+
+A shim tile holds 16 BDs and each KV object's fill takes one. seq 191 (6 objects)
+builds; seq 511 (16) does not. Unlike the routing wall, this one comes with its
+own remedy in the diagnostic — BD reuse via free/await — so it is a plumbing
+limit rather than a fabric one. Where exactly between 191 and 511 it bites is not
+pinned down; seq 255 did not finish building inside the timeout.
+
+### Timing at a realistic context
+
+    seq 191: side A 643.8 / 671.5 us  ->  layer ~916 us
+    token ~18.36 ms -> **~54.5 tok/s**
+
+FLM at 191 tokens has not been measured; its bracket is 61.18 (41 tok) to 58.83
+(641 tok). Against either end that is roughly **-9%**, which agrees with the
+corrected figure from the previous entry. The ~9% deficit is now MEASURED on the
+chained design at a real context, not projected from separately-timed parts.

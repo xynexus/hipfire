@@ -145,7 +145,13 @@ def build(pos, nobj):
     # same 4160 B attn_phase pads with, and must be zero for npad.
     SLOT = OPERAND // 2                 # bf16 elements per head slot
     KVSTRIDE = SLOT
-    off = pos - (pos & 1)
+    # WHICH object the appended token lands in. Without this the drain always
+    # targeted object 0, so at pos >= TSEQ it wrote past the K tile's columns and
+    # into V -- silently, because nothing verified beyond one tile.
+    kv_ob = pos // TSEQ                 # object holding logical position `pos`
+    kv_in = pos % TSEQ                  # its column/row within that object
+    kv_obase = kv_ob * NATT             # cache is flat [obj*NATT + head][SLOT]
+    off = kv_in - (kv_in & 1)
     import os as _osk
     SKIP_P1 = 1 if _osk.environ.get("CHAIN_P2_ONLY") else 0
     # bisect: P2 reads a host-built cache instead of the one P1 drained into.
@@ -254,7 +260,7 @@ def _design(bc: In, {P}):
                            arg_types=[bc_ty, op_ty, p1o_ty],
                            compile_flags=FLAGS)
 
-    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_qchain")
+    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_kvtile")
     bc_cons = [f_bc.cons() for _ in range({NCORES})]
     f_w = [ObjectFifo(oppair_ty, name=f"wp{{i}}_n{NROWS}k{KVPER}") for i in range({npairs})]
     w_sub = [f.cons().split([0, {OPERAND}], obj_types=[op_ty, op_ty]) for f in f_w]
@@ -434,13 +440,14 @@ def _design(bc: In, {P}):
             for _kind, _base in KVPLAN[i]:
                 if _kind == "k":
                     p1h[i].drain(cb[i], wait=True, group=tg,
-                                 offset=2 * (_base * {SLOT} + {off}),
+                                 offset=2 * (({kv_obase} + _base) * {SLOT}
+                                             + {off}),
                                  sizes=[1, 2, {HEAD}, 4],
                                  strides=[0, 2 * {SLOT}, 2 * {TSEQ}, 1])
                 else:
                     p1h[i].drain(cb[i], wait=True, group=tg,
-                                 offset=2 * (_base * {SLOT} + {KTILE}
-                                             + {pos} * {HEAD}),
+                                 offset=2 * (({kv_obase} + _base) * {SLOT}
+                                             + {KTILE} + {kv_in} * {HEAD}),
                                  sizes=[1, 2, 1, 2 * {OBJ}],
                                  strides=[0, 2 * {SLOT}, 0, 1])
         tg.finish()
@@ -645,15 +652,20 @@ def main():
         np.zeros((NATT, 0, HEAD), np.float32)
     Vc = rnd(rng.standard_normal((NATT, pos, HEAD)) * 0.3) if pos else \
         np.zeros((NATT, 0, HEAD), np.float32)
-    # [obj][head][SLOT]: object 0 holds the real KV, the rest are padding that
-    # npad masks. P1 still appends into object 0, so verification is unchanged.
+    # [obj][head][SLOT]. Real KV now spans every object it needs -- position p
+    # lives in object p // TSEQ at slot p % TSEQ. Previously all of it went in
+    # object 0 and the rest were padding, which meant nothing past one tile was
+    # ever exercised with data.
+    assert KVPER == 1, "multi-tile cache layout assumes one KV tile per object"
     cache = np.zeros((nobj, NATT, SLOT), np.float32)
     for g in range(NATT):
-        K = cache[0, g, :KTILE].reshape(HEAD, TSEQ)
-        V = cache[0, g, KTILE:2 * KTILE].reshape(TSEQ, HEAD)
-        if pos:
-            K[:, :pos] = Kc[g].T
-            V[:pos] = Vc[g]
+        for ob in range(nobj):
+            K = cache[ob, g, :KTILE].reshape(HEAD, TSEQ)
+            V = cache[ob, g, KTILE:2 * KTILE].reshape(TSEQ, HEAD)
+            lo, hi = ob * TSEQ, min(pos, (ob + 1) * TSEQ)
+            if hi > lo:
+                K[:, :hi - lo] = Kc[g][lo:hi].T
+                V[:hi - lo] = Vc[g][lo:hi]
     craw = cache.reshape(nobj * NATT, SLOT).astype(bfloat16).view(np.uint16)
     for g in range(NATT):
         # trailer: this core's offset into the shared q' block
@@ -845,13 +857,16 @@ def main():
           .reshape(nobj, NATT, SLOT))
     ke = ve = 0.0
     for g in range(NATT):
-        K = cv[0, g, :KTILE].reshape(HEAD, TSEQ)
-        V = cv[0, g, KTILE:2 * KTILE].reshape(TSEQ, HEAD)
-        ke = max(ke, np.abs(K[:, pos] - ref[NQ + g]).max())
-        ve = max(ve, np.abs(V[pos] - ref[NK + g]).max())
-        if pos:
-            ke = max(ke, np.abs(K[:, :pos] - Kc[g].T).max())
-            ve = max(ve, np.abs(V[:pos] - Vc[g]).max())
+        for ob in range(nobj):
+            K = cv[ob, g, :KTILE].reshape(HEAD, TSEQ)
+            V = cv[ob, g, KTILE:2 * KTILE].reshape(TSEQ, HEAD)
+            if ob == pos // TSEQ:               # the token P1 just appended
+                ke = max(ke, np.abs(K[:, pos % TSEQ] - ref[NQ + g]).max())
+                ve = max(ve, np.abs(V[pos % TSEQ] - ref[NK + g]).max())
+            lo, hi = ob * TSEQ, min(pos, (ob + 1) * TSEQ)
+            if hi > lo:                          # the prior cache in this object
+                ke = max(ke, np.abs(K[:, :hi - lo] - Kc[g][lo:hi].T).max())
+                ve = max(ve, np.abs(V[:hi - lo] - Vc[g][lo:hi]).max())
     print(f"  P1 cache: k' col {pos} + prior cols max err {ke:.4e};  "
           f"v' row {pos} + prior rows max err {ve:.4e}")
 
