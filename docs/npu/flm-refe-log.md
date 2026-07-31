@@ -5352,3 +5352,40 @@ closure-captured shapes, and now a module-level constant that feeds the design.
 **Anything that changes a design's shapes must be a `CompileTime` parameter, a
 listed `source_files` entry, or followed by a cache clear.** There is no fourth
 option, and the failure mode is always a stale binary rather than an error.
+
+## 2026-07-31 — Task 3: down_proj K-chunked — 370 -> 280 us, now at 99% of its ceiling
+
+`kernels/npu/flm_gemv_acc.cc` + `flm_gemv_flush.cc` + `tools/npu/flm/down_verify.py`.
+
+down_proj's K=8192 forced a 16384 B activation (32768 double-buffered), and the
+64 KB tile memory then allowed only **2 rows per weight tile** against 16 for
+every other projection. Splitting K into 4 chunks of 2048 makes it the same
+shape as everything else: a 4096 B activation and 16-row tiles. Chunks 0-2
+accumulate into a per-core slot; chunk 3 adds, applies the residual from the
+broadcast aux half, emits and clears.
+
+**It is exact, and the reason is worth keeping.** The GEMV identity is linear in
+blocks, so four 2048-wide partials sum to the same value as one 8192-wide pass.
+And the container's planar 5120 B row splits on a chunk boundary with **no code
+repacking at all** — chunk c is `d[64c:64c+64]`, `m[64c:64c+64]`,
+`codes[1024c:1024c+1024]`, which is precisely a K=2048 tile. Measured against
+the monolithic K=8192 reference: **3.28e-08**.
+
+| | wall us | GB/s | marginal us | % of fitted ceiling |
+|---|---|---|---|---|
+| monolithic, 2 rows/tile | 370.0 | 28.4 | 277.1 | 75% |
+| **K-chunked, 16 rows/tile** | **280.1** | **37.6** | **187.2** | **99%** |
+
+The plan's gate was marginal <= 200 us (ideal 184); measured 187.2, within 2% of
+ideal. Against the branch's own fitted `t = 92.9 + 17.547*MB`, a 10.52 MB
+dispatch cannot beat 277.5 us however good the kernel — **so down_proj is now at
+99% of what its transfer size allows, where it was at 75%.** The remaining 25%
+was never arithmetic; it was the row count the activation size forced.
+
+**Saving: 89.9 us/layer x 16 = 1.44 ms/token**, against the plan's estimate of
+0.86 ms. It also removes the last shape in the design that was not K=2048 /
+16 rows, which is what lets one operand fifo serve every phase.
+
+This also retires the earlier reading of down_proj as intrinsically slow: with
+the chunking its ~54 us/layer "geometric penalty" is gone, and its efficiency is
+now indistinguishable from the other projections.
