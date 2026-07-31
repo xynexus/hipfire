@@ -5692,3 +5692,57 @@ reason — the norm weight inside the activation (`flm_norm_prepare`), cs_q/cs_k
 inside the broadcast (`flm_gemv_qkv`), now npad inside Q. On this device extra
 operands are packed, never given a fifo. Worth treating as the default move
 rather than a trick.
+
+## 2026-07-31 — Task 6 complete: attention as a phase, 8 cores, one dispatch
+
+`tools/npu/flm/attn_phase.py`. The attention arithmetic was already verified on
+one core; this runs it at the phase's real shape — 8 cores, one KV group each,
+in the fused layer's paired topology (operand fifo per pair split to two cores,
+result fifo per pair joined).
+
+8 KV heads at GQA=4 is exactly 8 cores covering all 32 query heads, so **no KV
+broadcast and no cross-core softmax merge**: every core's cache is private.
+Pairs 4–7 sit the phase out.
+
+| seq | KV tiles | objects | npad | max err | tol | |
+|---|---|---|---|---|---|---|
+| 512 | 16 | 8 | 0 | 7.31e-04 | 1.08e-03 | PASS |
+| 2048 | 64 | 32 | 0 | 3.62e-04 | 4.98e-04 | PASS |
+| 500 | 16 | 8 | 12 | 5.51e-04 | 9.93e-04 | PASS |
+| **480** | **15** | 8 | **32** | 6.22e-04 | 1.05e-03 | PASS |
+
+The 480 row matters: 15 tiles is odd, so the last object carries one real tile
+and one **entirely padded** one. The correction handles it because it counts
+padded *positions*, not partial tiles. Tolerance is the exp2 NLF floor
+throughout, not bf16.
+
+**`DIM_KVPER` — two KV tiles per operand object, and the plan's +2.8% checks
+out.** KV has to ride the same 20544 B operand object as every other phase or
+the topology changes between phases and one dispatch per layer is illegal. A KV
+tile is 2·TSEQ·HEAD bf16 = 8192 B, so one per object wastes 61%. TSEQ cannot
+just be doubled — `static_assert(TSEQ == 32, "score vectors are one 32-lane
+register")` — so `flm_attn_decode.cc` now loops over `DIM_KVPER` tiles per call
+instead. The online softmax state already persists across calls, so folding
+tiles into one call changes nothing arithmetically; it only decouples the object
+size from TSEQ. Measured at S=2048:
+
+| | KV bytes | vs a 38.0 MB layer |
+|---|---|---|
+| unpadded | 4.194 MB | — |
+| **2 tiles/object (KVPER=2)** | **5.259 MB** | **+2.80%** |
+| 1 tile/object | 10.52 MB | +16.6% |
+
++2.80% is the number the plan predicted for this task. `KVPER=1` recompiles
+byte-identically and `attn_verify.py` returns the same 7.2378e-04 / 5.3524e-04
+it did before the refactor, so the single-tile path is unchanged.
+
+**Throughput, with a caveat.** S=2048 runs 5.26 MB in 238.7 us wall, 145.8 us
+marginal. Against the 17.547 us/MB slope that would be 63% of ceiling, far below
+the GEMV phases' 88–99% — but that slope was fitted at **16 cores** and this
+phase runs on **8**, with half the operand fifos. The honest statement is that
+the 8-core slope has not been measured, so this number is not yet interpretable;
+`dispatch_bw_probe.py` at 8 cores would settle it.
+
+**Not done here:** appending k′/v′ to the KV cache with a strided BD. That is
+the seam between P1 and P2 rather than a property of either, so it belongs with
+Task 7's single-dispatch wiring, where both phases exist in the same program.

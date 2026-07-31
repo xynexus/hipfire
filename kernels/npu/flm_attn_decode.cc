@@ -41,12 +41,23 @@
 #ifndef DIM_TSEQ
 #define DIM_TSEQ 32
 #endif
+// How many whole KV tiles one acquire delivers. 1 for the standalone harness,
+// where the fifo object is exactly a tile; >1 in the fused layer, where every
+// phase shares one 20544 B operand object and a lone 8192 B KV tile would waste
+// 61% of it. Two tiles fill 16384 of 20544 — 20% waste on the KV stream, which
+// at S=2048 is +2.8% of a layer's bytes against +16.6% for one tile. TSEQ
+// itself cannot just be doubled: the score vector is one 32-lane register.
+#ifndef DIM_KVPER
+#define DIM_KVPER 1
+#endif
 
 namespace {
 constexpr int GQA = DIM_GQA;
 constexpr int HEAD = DIM_HEAD;
 constexpr int TSEQ = DIM_TSEQ;
 constexpr int HALF = HEAD / 2;      // head vectors run 32 lanes at a time
+constexpr int KVPER = DIM_KVPER;
+constexpr int KVSTRIDE = 2 * TSEQ * HEAD;   // bf16 elements in one [K][V] tile
 
 static_assert(TSEQ == 32, "score vectors are one 32-lane register");
 static_assert(HEAD % 32 == 0, "head_dim must be a multiple of 32");
@@ -63,12 +74,18 @@ alignas(64) float g_acc[GQA * HEAD];        // running weighted sum of V
 
 extern "C" __attribute__((noinline)) void
 flm_attn_tile(const bfloat16 *restrict q,       // [GQA][HEAD], pre-scaled
-              const bfloat16 *restrict kv) {    // one tile: [K][V], see below
+              const bfloat16 *restrict kvpack) {  // KVPER x [K][V], see below
   // The tile is one sequential read of the cache: K channel-major
   // [HEAD][TSEQ] followed by V position-major [TSEQ][HEAD]. Keeping them in a
   // single object means one DMA stream per core rather than two.
-  const bfloat16 *restrict kt = kv;
-  const bfloat16 *restrict vt = kv + TSEQ * HEAD;
+  //
+  // KVPER tiles are processed per call. The online softmax state is carried in
+  // g_m/g_l/g_acc across calls anyway, so folding several tiles into one call
+  // changes nothing arithmetically — it only decouples the fifo object size
+  // from TSEQ, which the fused layer needs.
+  for (int u = 0; u < KVPER; ++u) {
+  const bfloat16 *restrict kt = kvpack + u * KVSTRIDE;
+  const bfloat16 *restrict vt = kt + TSEQ * HEAD;
   for (int h = 0; h < GQA; ++h) {
     // ---- scores: accumulate across the head dim, 32 positions at a time ----
     aie::accum<accfloat, TSEQ> s;
@@ -113,5 +130,6 @@ flm_attn_tile(const bfloat16 *restrict q,       // [GQA][HEAD], pre-scaled
       aie::store_v(g_acc + h * HEAD + off, a.template to_vector<float>());
     }
     g_m[h] = m_new;
+  }
   }
 }
