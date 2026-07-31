@@ -9873,3 +9873,33 @@ So the whole remaining question is dispatch count, and it is not reducible by
 tuning: two dispatches per layer is what five phase bodies on a four-body core
 forces. Anything that gets a layer into one dispatch wins ~1.1 ms/token and lands
 level with FLM; nothing else in the design has that much left in it.
+
+## 2026-08-01 — P5 as its own dispatch: built, runs, outputs zeros
+
+`p5_pass.py` is side B of the two-dispatch layer — down_proj alone, NCHUNK=4
+K-chunks, one loop body via `flm_gemv_down`, each chunk with its own
+`flm_asum_prepare`. It builds and runs on 16 cores.
+
+It outputs **zeros**:
+
+    x_out max err 3.1250e-01,  |got| 0.00000 vs |ref| 0.08126
+    vs last-chunk-only  2.3145e-01     vs residual alone  1.7383e-01
+
+`|got| = 0` localises it exactly. `flm_gemv_down` takes an early return on the
+accumulate path:
+
+    if (!tile_flags(wtile)) { accumulate; return; }
+
+so if the flag is never seen, `out` is never written and the drain gets zeros.
+The host packs `flags=float(ch == NCHUNK-1)`, which should set it on the last
+chunk's tiles.
+
+Not yet diagnosed. Worth noting the shape of the evidence: the two "partial
+result" hypotheses (only the last chunk landed, only the residual landed) were
+both wrong, and the mean told the real story in one number where the max error
+did not. `|got|` should be the first thing printed in a value check, not the
+last.
+
+This is the piece that turns the two-dispatch projection into a measurement, so
+it is worth finishing — every tok/s figure in this log is still a projection, and
+projections here have been wrong five times.
