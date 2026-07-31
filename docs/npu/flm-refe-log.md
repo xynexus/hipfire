@@ -9726,3 +9726,37 @@ Every configuration that beats FLM fails a memory constraint, and the one that
 builds loses by 7%. That is the real shape of the result, and it took three
 wrong numbers to see it: the 64.7 ignored the config change, the 55 double-counted
 dispatch, the 59.7 mixed builds.
+
+## 2026-08-01 — NROWS=8 is FASTER for the FFN, not slower
+
+`ffn_chain` now takes `FFN_NROWS`, so the FFN can be measured at the
+configuration the layer actually runs:
+
+    ffn_chain marginal   NROWS=16   611.8 µs   44.8 GB/s
+                         NROWS=8    589.3 µs   46.4 GB/s   -> **3.7% faster**
+
+`gemv_bench` measured NROWS=8 costing **4.5%** (48.9 → 46.7 GB/s), and I applied
+that penalty to the whole layer. It is true for a *pure* GEMV and false for the
+FFN, which also runs SwiGLU and is chunked — at NROWS=8 it gains more from
+whatever it gains (pipelining, register pressure) than it loses in tile
+efficiency.
+
+So the premise behind "NROWS=8 costs most of the margin" was wrong. Recomputed
+from measurements taken at the same configuration throughout:
+
+    chain (P1..P4, NROWS=8)   638.9 µs   measured wall
+    P5 marginal at NROWS=8    ~195.9 µs  byte share of a measured NROWS=8 FFN
+
+    single dispatch (needs 2272 B)   16.38 ms -> **61.0 tok/s**  (+2.0% vs FLM)
+    two dispatches (buildable)       17.87 ms -> **56.0 tok/s**  (−6.5%)
+
+The shape is unchanged — the configuration that beats FLM is the one that does
+not fit — but the single-dispatch figure is 61.0 rather than 60.4, and it is now
+built entirely from NROWS=8 measurements rather than a scaled NROWS=16 one.
+
+This is the fourth revision of the tok/s number and the first where no component
+was measured under a different configuration than the others. The corrections
+have been: 64.7 (NROWS=16 phases, ignored the later config change), ~55
+(double-counted dispatch), 59.7 (mixed builds), 60.4 (applied a GEMV-derived
+penalty to the FFN). Each error was a different way of composing incomparable
+measurements.
