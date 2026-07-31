@@ -1006,3 +1006,48 @@ speed** (warm-GEMM needs D1's efficient DiT kernel first — the bf16 DiT GEMM r
 of peak, a ~6-10× kernel lever that low-bit only multiplies *after* it's fixed). D1
 (efficient DiT bf16 GEMM) and D3 (DiT quant quality — blocked on a grain-free DiT per §10)
 remain the open diffusion units.
+
+## 12. Stream D1 — LDS staging does NOT transfer to the compute-bound DiT GEMM (2026-07-31)
+
+Built a wave32 LDS-staged bf16 GEMM (`kernels/src/gemm_bf16_tiled_wmma_lds.hip`, dispatch
+`gemm_bf16_tiled_wmma_lds`, `parity_gemm_bf16_tiled_wmma_lds`, `bench_dit_bf16_gemm`) — a
+simplification of the iu4 LDS kernel (no int4 unpack/scales/rescale; bf16 accumulates
+directly in the f32 fragment). **Bit-exact** to `gemm_bf16_tiled_wmma` (max_abs=0 on all
+shapes incl. DiT 6144×6144 and unaligned bounds).
+
+**Result (gfx1103, N=2048, vs the current register-tiled 4×4):**
+
+| DiT shape | tiled %peak | LDS %peak | speedup |
+|---|---|---|---|
+| attn q/o/gate 6144×6144 | 10.2% | 11.5% | 1.13× |
+| attn kv GQA 1536×6144 | 16.3% | 11.2% | **0.69× (slower)** |
+| ffn gate/up 16384×6144 | 10.4% | 11.5% | 1.10× |
+| ffn down 6144×16384 | 9.9% | 11.8% | 1.20× |
+
+**Negative result — the LLM win does NOT transfer.** The iu4 LDS win (~3×) came from LDS
+killing *redundant DRAM traffic* (the iu4 GEMM was memory/occupancy-bound). The DiT bf16
+GEMM is **firmly compute-bound** (AI 800–1400 ≫ ridge 240, §recon), so a memory-traffic
+optimization barely helps: only ~1.1× on big shapes, and it *regresses* small-M GQA (its
+larger BM=64/8-wave block under-utilizes vs the 4×4's smaller, more-numerous blocks). The
+register-tiled 4×4 (16 independent WMMA chains, 1 wave/block) already has the ILP; the LDS
+2×2 (4 chains/wave) does not out-schedule it. **The limiter is WMMA scheduling/occupancy,
+not DRAM — and LDS is the wrong lever for it.** The kernel is committed as bit-exact,
+reusable infrastructure but is **NOT wired into the DiT routing** (it would regress GQA).
+
+**The real DiT levers, re-ranked by this finding:**
+1. **Deep-ILP WMMA scheduling** — the only path to 25–40% of peak, and it's *hard*. wave64
+   (your nudge) is the promising angle: its 4-acc-GPRs/tile (vs 8 wave32) lets a wave hold a
+   *bigger* super-tile (more independent chains) without spilling — which is exactly what a
+   compute-bound WMMA kernel wants. A wave64 4×4-super-tile LDS kernel is the next experiment.
+   (LDS at BK=64 caps BN via the 64 KiB budget, so this needs BK=32 or fewer waves.)
+2. **Low-bit activations (int4) on the DiT** — on RDNA3 the iu4 WMMA is **2× the bf16 rate**
+   (16 vs 32 cyc), so W4A4 is up to a **2× on the WMMA itself** — a *bigger, more accessible*
+   lever than out-scheduling the bf16 kernel. But it needs the DiT quant-quality validation,
+   which is blocked on a grain-free DiT (§10, §D3).
+3. **De-dup the redundant f32→bf16 staging** — `must_convert=true` re-stages identical X for
+   all 4 attn projections (§recon); caching it is a free few-% with no kernel work.
+
+Honest conclusion: **D1's naive "port the LDS win" failed — the DiT GEMM is a different
+(compute-bound) beast.** A real bf16 win needs the hard wave64 deep-ILP scheduling work; the
+more accessible 2× is int4-act, gated on DiT quality. The register-tiled 4×4 is near the
+achievable for its structure.

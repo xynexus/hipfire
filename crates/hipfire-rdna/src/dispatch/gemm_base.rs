@@ -1187,6 +1187,51 @@ impl Gpu {
         result
     }
 
+    /// LDS-staged, double-buffered, register-super-tiled bf16 GEMM (gfx1103 wave32)
+    /// — the DiT throughput kernel. Same contract as [`Self::gemm_bf16_tiled_wmma`]
+    /// (bf16 weight × f32 activation staged to bf16, F32 [B,M] output) and bit-exact
+    /// to it, but LDS-staged for far higher occupancy. Requires `k % 64 == 0`.
+    /// Parity: `parity_gemm_bf16_tiled_wmma_lds`.
+    pub fn gemm_bf16_tiled_wmma_lds(
+        &mut self,
+        a_bf16: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(a_bf16.dtype, DType::BF16, "gemm_bf16_tiled_wmma_lds: weights BF16");
+        assert_eq!(k % 64, 0, "gemm_bf16_tiled_wmma_lds: K must be a multiple of 64");
+        self.ensure_kernel(
+            "gemm_bf16_tiled_wmma_lds",
+            kernels::GEMM_BF16_TILED_WMMA_LDS_SRC,
+            "gemm_bf16_tiled_wmma_lds",
+        )?;
+        let ap = a_bf16.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x_f32, batch_size * k)?;
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let grid_m = m.div_ceil(64) as u32; // BM = 64
+        let grid_b = batch_size.div_ceil(128) as u32; // BN = 128
+        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_bf16_tiled_wmma_lds", bytes);
+        let result = self.launch_kernargs(
+            "gemm_bf16_tiled_wmma_lds",
+            [grid_m, grid_b, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Register-tiled F32 batched GEMM. Y[batch, M] = A[M,K] @ x[batch,K]^T.
     /// Each block holds BATCH_TILE=8 accumulators in registers and
     /// reuses each loaded weight element across them — amortizing

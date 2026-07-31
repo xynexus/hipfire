@@ -3997,6 +3997,12 @@ pub const GEMM_BF16_X_BF16_WMMA_SRC: &str =
 /// `kernels/src/gemm_bf16_tiled_wmma.hip`.
 pub const GEMM_BF16_TILED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_bf16_tiled_wmma.hip");
+/// LDS-staged, double-buffered, register-super-tiled bf16 GEMM (gfx1103 wave32) —
+/// the DiT throughput kernel. Bit-exact to `gemm_bf16_tiled_wmma` but LDS-staged
+/// (BM64×BN128 block tile, 8 waves, BK=64 double-buffered). K%64==0. See
+/// `kernels/src/gemm_bf16_tiled_wmma_lds.hip`.
+pub const GEMM_BF16_TILED_WMMA_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_tiled_wmma_lds.hip");
 
 /// Register-tiled, zero-LDS unified Opus-Quant W4A8 / W8A8 GEMM (gfx1103/RDNA3):
 /// dynamic-int8 activation × iu8 WMMA, weight fetched as int8 (W8) or unpacked
