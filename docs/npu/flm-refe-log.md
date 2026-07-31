@@ -8625,3 +8625,34 @@ Not yet diagnosed: whether `h` is wrong because of the weight packing order, the
 itself is new and unverified, so it is as likely to be wrong as the device path —
 `resid_chain` gets P3 exact (0.0000e+00) in isolation, so the kernel and the
 packing are known good there and the difference is in this harness.
+
+### P3's wrong `h`: what it is not
+
+Four hypotheses eliminated by measurement, none of them the cause:
+
+| hypothesis | test | result |
+|---|---|---|
+| stream ordering (my `h_idx` wrong) | sorted-multiset of got vs ref | **not it** — maxdiff 6.83e-01, so the *values* differ, not their order |
+| P3 reads a stale broadcast (fill 1, the activation) | recompute the reference with `x` as the activation | not it — 8.10e-01 |
+| ... with the *normalised* activation | same with `xn` | not it — 9.00e-01 |
+| P3 reads fill 2 (q′) | same with the q′ block | not it — 8.82e-01 |
+
+A fifth, sharper control: **zeroing P3's activation does not zero the GEMV
+term.** With `attn3 = 0` the reference is just the residual (mean 0.040) and the
+device still returns mean 0.241. So P3's activation is not coming from `bc3` at
+all — but it is not any of the other two fills either.
+
+Broadcast accounting is not the explanation. Both core kinds acquire and release
+the broadcast exactly three times (P1 core: `p1_body`, the q′ skip, `p3_body`;
+attention core: the activation skip, P2's `eq`, `p3_body`), matching the three
+fills.
+
+Nor is the weight fifo. P1 consumes exactly `hpc * TPH` = 16 objects per core —
+`hpc*(TPH-1)` in the inner loop plus one per head for the emit — which is what
+the fill supplies, so nothing is left over for P3 to pick up.
+
+The device magnitude is 4.4x the reference and P1/P2 remain exact, so whatever
+P3 reads is wrong in content rather than in arrangement. The packing matches
+`resid_chain`'s (`pr*rpp + t*2*NROWS + j*NROWS`, `rpp = K_DIM // npairs`, 8 tiles
+per core) where P3 is exact at 0.0000e+00, so the difference is in this harness
+and not in the kernel or the tile layout.

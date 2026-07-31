@@ -553,7 +553,9 @@ def main():
     # P2->P3 handoff carries the right bytes", which is the next step.
     od, om, oc = load_linear(c, f"model.layers.{o.layer}.self_attn.o_proj.weight",
                              K_DIM, K_DIM)
-    attn3 = rnd(rng.standard_normal(K_DIM) * 0.05)     # P3's activation
+    attn3 = (np.zeros(K_DIM, np.float32)
+             if __import__('os').environ.get('CHAIN_P3_ZERO')
+             else rnd(rng.standard_normal(K_DIM) * 0.05))
     bc3 = np.zeros(2 * K_DIM + 2 * HEAD, np.float32)
     bc3[:K_DIM] = attn3
     bc3[K_DIM:2 * K_DIM] = x                            # the residual P3 adds
@@ -650,6 +652,27 @@ def main():
                             for r0 in [p3rows(pr, j)[t]]])
     e3 = np.abs(got_h - h_ref[h_idx]).max()
     print(f"  P3 h      : max err {e3:.4e}  mean|ref| {np.abs(h_ref).mean():.5f}")
+    if __import__("os").environ.get("CHAIN_P3_DIAG"):
+        srt_g, srt_r = np.sort(got_h), np.sort(h_ref)
+        print(f"    DIAG got[:6]  {got_h[:6].round(4)}")
+        print(f"    DIAG want[:6] {h_ref[h_idx][:6].round(4)}")
+        print(f"    DIAG sorted-multiset maxdiff {np.abs(srt_g - srt_r).max():.4e}"
+              f"  -> {'PERMUTATION (ordering bug)' if np.abs(srt_g-srt_r).max() < 1e-2 else 'different VALUES (not ordering)'}")
+        print(f"    DIAG |got| mean {np.abs(got_h).mean():.5f} vs |ref| {np.abs(h_ref).mean():.5f}"
+              f"  ratio {np.abs(got_h).mean()/max(np.abs(h_ref).mean(),1e-12):.3f}")
+        # which broadcast fill did P3 actually read? try the other two.
+        for nm, act in (("fill1 x (raw)", bc[:K_DIM].astype(np.float32)),
+                        ("fill1 xn (normed)", xn.astype(np.float32)),
+                        ("fill2 q' block", qall[:K_DIM].astype(np.float32))):
+            alt = np.zeros(K_DIM, np.float64)
+            for pr in range(npairs):
+                for j in (0, 1):
+                    for r0 in p3rows(pr, j):
+                        g = q4nx.gemv_reference_bf16(rnd(act),
+                                od[r0:r0+NROWS, :nbc3], om[r0:r0+NROWS, :nbc3],
+                                oc[r0:r0+NROWS, :nbc3])
+                        alt[r0:r0+NROWS] = rnd(g + x[r0:r0+NROWS])
+            print(f"    DIAG vs {nm:18s}: max err {np.abs(got_h - alt[h_idx]).max():.4e}")
     print(f"P1 -> P2 in one dispatch: seq {o.seq} (P1 appends at pos {pos}), "
           f"{nobj} KV objects, npad {npad}")
     worst, scale = 0.0, 0.0
