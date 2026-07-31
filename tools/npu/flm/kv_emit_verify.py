@@ -1,7 +1,29 @@
 #!/usr/bin/env python3
 """k′ appended one token per dispatch, carrying across the dispatch boundary.
 
-**STATUS: does not work yet, but the fault is now pinned.** Run with
+**STATUS: the append works; this harness cannot test the carry.** Two faults
+were found and one is fatal to the harness's design:
+
+1. **Acquire every fifo object BEFORE calling any kernel.** Interleaving
+   `acquire -> call -> acquire` silently loses the input data — the kernel reads
+   zeros with no error. Hoisting the acquires fixed it. Every working harness in
+   this tree happens to acquire first; this one did not, and that is the whole
+   of the "input fifo does not deliver" fault below.
+
+2. **This harness builds a NEW design per token**, because it bakes the drain
+   offset into the runtime sequence. A new design is a new program load, which
+   **resets core `.bss`** — so `g_kprev` is empty at every odd step and the
+   carry cannot possibly work here. The evidence is exact: odd columns (whose
+   data is same-dispatch) verify at 0.0e+00, even columns that a later odd step
+   overwrites from `g_kprev` read zero, and t=4 — even, and never overwritten —
+   is also exact.
+
+   The real decode loop reuses **one** design for every token, so this is a
+   harness artifact, not a flaw in the scheme. Fixing it needs the drain offset
+   as a runtime value (`fill`/`drain` take `offset_parameter=`) instead of a
+   baked constant, which is what the fused layer will need anyway.
+
+**STATUS (superseded): does not work yet, but the fault is now pinned.** Run with
 `KV_SEEDCONST=1` the cache fills correctly — so `flm_kv_emit`, the cross-TU
 `g_stage` handoff, and the paired strided drain with a non-zero offset all work.
 Run normally, with the seed reading its input fifo, the cache stays zero **even
@@ -132,10 +154,12 @@ def _design(hin: In, wt: In, kc: Out):
     f_o = ObjectFifo(out_ty, depth=1, name="ko{t}")
 
     def core(ic, wc, op, ks, ke):
+        # acquire everything BEFORE calling any kernel — interleaving
+        # acquire/call/acquire is what the working probes do not do
         ei = ic.acquire(1)
-        ks(ei)
         ew = wc.acquire(1)
         eo = op.acquire(1)
+        ks(ei)
         ke(ew, eo)
         op.release(1)
         wc.release(1)

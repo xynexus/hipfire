@@ -6493,3 +6493,39 @@ kernels that *ignored* their inputs. They proved the design runs and produces,
 not that input data arrives — which is precisely the gap that turned out to
 matter. A bisect that varies structure while holding the payload trivial cannot
 see a payload fault, and I nearly concluded "input fifos are fine" from it.
+
+### Resolved — two faults, and the second invalidates the harness rather than the scheme
+
+**1. Acquire every fifo object before calling any kernel.** This was the
+"input fifo does not deliver" fault. The core did
+
+    ei = ic.acquire(1); ks(ei); ew = wc.acquire(1); eo = op.acquire(1); ke(...)
+
+and the kernel read **zeros** from `ei`, with no error and no warning. Hoisting
+all three acquires above both calls fixed it immediately — the constant-head
+test went from an all-zero cache to exact. Every other harness in this tree
+happens to acquire everything first, which is why nothing had hit it. Treat
+interleaved `acquire -> call -> acquire` as unsupported.
+
+**2. A new design per token resets core `.bss`.** With the acquires fixed, the
+result is diagnostic rather than uniform:
+
+| t | column | result | |
+|---|---|---|---|
+| 0 | 0 | **wrong (zero)** | overwritten later from `g_kprev` |
+| 1 | 1 | **0.0e+00** | same-dispatch data |
+| 2 | 2 | **wrong (zero)** | overwritten later from `g_kprev` |
+| 3 | 3 | **0.0e+00** | same-dispatch data |
+| 4 | 4 | **0.0e+00** | even, but never overwritten |
+
+Every value that comes from the previous dispatch is empty; every value from the
+current one is exact. `kv_emit_verify.py` builds a **new design per token**
+because it bakes the drain offset into the runtime sequence, and a new design is
+a new program load, which clears `.bss`. `static_persist_probe.py` saw
+persistence because it called **one** design repeatedly.
+
+So the carry is not disproven — the harness simply cannot test it. **Real decode
+reuses one design for every token**, which is the condition persistence needs.
+The fix is to pass the drain offset as a runtime value (`fill`/`drain` accept
+`offset_parameter=`) rather than a baked constant, which the fused layer needs
+regardless: 16 layers x N tokens cannot each be their own program.
