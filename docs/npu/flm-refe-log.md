@@ -4926,3 +4926,57 @@ already demonstrates. Every bit of that 0.83 -> 1.19 gap is per-dispatch fixed
 cost, which is precisely what fusing to FLM's 2-commands-per-token removes —
 and lm_head, at 164 MB in one command, is the existence proof that the rate is
 reachable.
+
+## 2026-07-31 — The per-dispatch cost, fitted: 92.9 us and 57.0 GB/s (R^2 = 0.99997)
+
+Everything now hinges on how much fusing dispatches is worth, and that was still
+resting on a ~100 us figure inherited from milestone 1's *small-buffer* probe.
+Measured directly for **this** design by sweeping transfer size at fixed geometry
+(K=2048, 16 rows/tile, 16 cores) and fitting:
+
+    time_us = 92.9 + 17.547 * MB          R^2 = 0.99997
+
+| MB | measured us | fit us | err | fixed cost is |
+|---|---|---|---|---|
+| 6.6 | 207.3 | 208.7 | +0.7% | **44.8%** |
+| 12.8 | 325.0 | 317.5 | −2.3% | 28.6% |
+| 25.6 | 544.0 | 542.0 | −0.4% | 17.1% |
+| 38.0 | 754.6 | 759.6 | +0.7% | 12.3% |
+| 76.0 | 1420.0 | 1426.4 | +0.5% | 6.5% |
+| 164.2 | 2977.3 | 2974.0 | −0.1% | **3.1%** |
+
+Two numbers fall out, and both matter:
+
+- **92.9 us of fixed cost per dispatch.** An independent confirmation of the
+  ~100 us figure, now measured on the real design rather than a synthetic probe.
+- **57.0 GB/s asymptotic rate** — at or fractionally above the 56.5 GB/s stated
+  fabric roof, and above `dispatch_bw_probe`'s 56.3. **Once fixed cost is
+  amortised this design streams at the roof.** That independently confirms the
+  retraction of the "memtile split costs 12%" claim: the split costs nothing
+  measurable.
+
+A single number explains every previously confusing rate: 33.0 GB/s for q/k/v/o,
+41.4 for the fused gate/up, 48.6 at 38 MB, 55.1 for lm_head are all the *same*
+design at different transfer sizes, and the fixed-cost column above is the whole
+story.
+
+### What fusion is worth, from the model
+
+772.3 MB/token:
+
+| dispatches/token | ms | tok/s | vs FLM |
+|---|---|---|---|
+| 49 (3/layer + lm_head, today) | 18.10 | 55.2 | 0.92x |
+| 17 (1/layer + lm_head) | 15.13 | 66.1 | 1.10x |
+| **2 (FLM's structure)** | **13.74** | **72.8** | **1.22x** |
+
+**Scope of the model, stated so it is not over-read.** It is fitted on the
+K=2048 / 16-rows-per-tile geometry. `down_proj` cannot use that geometry
+(K=8192 forces 2 rows) and carries a measured ~54 us/layer intrinsic penalty on
+top, so add ~0.86 ms/token: **1 dispatch/layer -> 15.99 ms -> 62.5 tok/s
+(1.04x)**, **2 dispatches -> 14.60 ms -> 68.5 tok/s (1.14x)**. Those are the
+honest figures.
+
+Either way the conclusion is unchanged and now quantitative: **fusion is the
+whole remaining lever, it is worth roughly 0.92x -> 1.1-1.2x FLM, and nothing
+else on the table is worth more than a few percent.**
