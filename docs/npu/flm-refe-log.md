@@ -5031,3 +5031,52 @@ bad expression; it is 2048 rows x 5120 B = **10.486 MB**, and the corrected
 per-layer total is 38.03 MB against the container's 38,010,880 B. The
 dispatch-count projections used the independent 772.3 MB/token figure and were
 not affected.)
+
+## 2026-07-31 — RMSNorm fused into the GEMV prologue: 2 dispatches/layer gone, free
+
+Acting on the previous entry's finding that half a layer's operators move ~4 KB
+and are ~99.9% fixed cost. `kernels/npu/flm_norm_prepare.cc` replaces
+`flm_asum_prepare` where a projection is preceded by a norm.
+
+**Why it is free.** `flm_asum_prepare` already walks the entire activation to
+compute the q4_1 block sums. RMSNorm's sum-of-squares rides in that same walk,
+and the normalisation is applied **in place in the ObjectFifo buffer**, so the
+GEMV that follows is *completely unchanged* — same pointer, same code. Passes
+over the activation:
+
+    standalone RMSNorm (2) + asum_prepare (1) = 3
+    fused                                     = 2
+
+so it is **one pass cheaper** than the two operators were separately, on top of
+removing a dispatch.
+
+Verified against a norm-then-GEMV reference carrying the kernel's own bf16
+roundings: **3.48e-07** (layer 0) and **3.58e-07** (layer 7) — float32
+round-off. The plain GEMV, the fused FFN and the attention path all re-checked
+unchanged after the shared-header edit.
+
+**Worth 2 x 92.9 us x 16 layers = 2.97 ms/token**, ~14% of today's projected
+21.07 ms, for no bytes and no extra L1.
+
+### Two IRON limits hit, both structural
+
+- **A core tile has only 2 input DMA channels.** Giving the norm weight its own
+  fifo made three inputs (act, norm weight, weights) and the placer rejected it:
+  *"reduce the LTO's DMA fanin (e.g. via memtile staging)"*. The fix is to carry
+  the norm weight in the **same buffer** as the activation — `[act K][nw K]` —
+  which costs one extra 4 KB of L1 and no channel. This is a general constraint
+  on the fused layer: **every operand a core needs is a DMA input, and it gets
+  two**, so operands must be packed together or staged through a memtile.
+- **A definition in a shared header links N times.** `g_asum` was defined in
+  `flm_q4_1_tile.h`, which was fine while one TU included it; the fused FFN and
+  now the fused norm made three. `duplicate symbol: g_asum`. It is now `extern`
+  in the header with one definition in `flm_gemv_q4_1.cc` — the same
+  one-definition discipline the multiple entry points already needed.
+
+### Dispatch budget after this
+
+Per layer the tiny operators were: 2 norms, RoPE, 2 residual adds. **The two
+norms are now free.** Remaining to fuse: RoPE (rides with the qkv projection's
+epilogue) and the two residual adds (ride with o_proj's and down_proj's
+epilogues) — all three are epilogue/prologue work on an operator that already
+exists, none needs a new dispatch.

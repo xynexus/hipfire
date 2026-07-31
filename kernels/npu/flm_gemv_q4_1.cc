@@ -8,6 +8,11 @@
 
 #include "flm_q4_1_tile.h"
 
+// The one definition of the shared activation block-sum array. alignas is
+// load-bearing: it is vector-loaded, and an unaligned 512-bit load returns
+// garbage rather than faulting.
+alignas(64) bfloat16 g_asum[DIM_K / 32];
+
 extern "C" __attribute__((noinline)) void
 flm_gemv_q4_1(const bfloat16 *restrict act, const uint8 *restrict wtile,
               float *restrict out) {

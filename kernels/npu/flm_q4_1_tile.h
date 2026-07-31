@@ -108,8 +108,12 @@ inline void unpack_codes(const uint8 *restrict qs,
 // alignas is load-bearing: this array is vector-loaded, and an unaligned
 // 512-bit load returns garbage (the symptom is NaN in every output, not a
 // fault).
-// Defined here, filled by `flm_asum_prepare` in flm_asum_prepare.cc.
-alignas(64) bfloat16 g_asum[DIM_K / 32];
+// DECLARED here, DEFINED in flm_gemv_q4_1.cc — this header is included by more
+// than one translation unit (the plain GEMV, the fused FFN, the fused
+// norm+prepare), and a definition in the header links N times
+// (`duplicate symbol: g_asum`). Filled by whichever prepare entry point runs:
+// `flm_asum_prepare` (block sums only) or `flm_norm_prepare` (RMSNorm fused in).
+extern bfloat16 g_asum[];
 
 // One weight tile against one activation: out[0..NROWS) = W_tile . act.
 // Shared by the plain GEMV entry point and by the fused FFN kernel, which
