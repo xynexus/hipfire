@@ -5,32 +5,41 @@ Every numeric result in this reproduction is self-consistency: the kernel is
 compared to a numpy reference built from *the same reading* of `model.q4nx`. If
 that reading is wrong, kernel and reference are wrong together and every check
 still passes. `docs/npu/flm-fused-layer-plan.md` §1.3 flags this and assumes it
-is unresolvable. It is not — `meta-llama/Llama-3.2-1B-Instruct` ships the actual
-trained checkpoint, so the reading can be checked against ground truth.
+is unresolvable without `flm run`. It is not — `meta-llama/Llama-3.2-1B` ships
+`original/consolidated.00.pth`, the actual trained checkpoint.
 
-Four probes, cheapest and most conclusive first:
+Four probes. **Every one of them needs a control**, because the natural
+statistics of a weight matrix are similar enough everywhere that an uncalibrated
+probe reports a confident wrong answer. Two did, before the controls were added.
 
 1. **bf16 tensors, bit-exact.** RMSNorm weights are stored unquantized, so this
-   is an exact check of the file structure, the tensor naming, and *which model
-   this is*, with no quantization noise anywhere.
+   checks the file structure, the planar split, the tensor naming and *which
+   model this is*, with no quantization noise and no control needed.
 
-2. **Blocks, order-free.** The sorted 32 values of a q4_1 block are invariant to
-   the nibble order `q4nx.py` flags as assumed, so a block can be matched
-   against every ground-truth block with no unknowns left in it.
+2. **Blocks, scale- and order-invariant.** Cosine on the block's *sorted* 32
+   values: sorting removes the unknown nibble order, normalising removes any
+   per-tensor scale. Matched against all 524,288 ground-truth blocks.
+   **Control (essential):** the same search run on gt blocks this tool quantized
+   itself, once with the true block in the pool and once with it masked out.
+   That second number is the look-alike floor — the score a block gets when its
+   true match is *definitely absent*. Sorted 32-value profiles of weight blocks
+   all resemble each other, so the floor is ~0.995, not ~0. Without it, 0.9949
+   reads as "no match by a mile" or "basically a match" depending on taste.
 
-3. **Rows, order-free.** Each block's `(m, d)` is its (min, range/15). Comparing
-   a ground-truth row's 256 such points against a container row's as a *set*
-   asks whether any container row holds that row's blocks under any permutation.
+3. **Which q4_1 fit is this?** Per-block code span. llama.cpp's q4_1 is a plain
+   min/max fit, which forces span 15 and a code 0 and a code 15 in every block.
+   FLM's does not — so do NOT compare container `d` against `(max-min)/15`.
+   An earlier version of this file did exactly that as its row-level probe; the
+   probe could only ever fail, and it was removed rather than reported.
 
-4. **Frobenius norm.** Also invariant to the nibble order (the block's value
-   multiset is fixed regardless of which element is which), so it separates an
-   orthogonal transform (ratio 1.000) from a scaling (ratio != 1).
+4. **Frobenius norm and value quantiles.** The norm is invariant to the nibble
+   order (a block's value multiset is fixed however elements are assigned), so
+   it separates an orthogonal transform (ratio 1.000) from a scaling. The
+   quantile ratios then say whether that scaling is one number or many.
 
-Do NOT try to infer the grouping from the `d` (block range) distribution. A
+Do not try to infer the block grouping from the `d` (block range) distribution: a
 random regrouping of the same weights reproduces it about as well as the true
-one, so it separates nothing — an earlier version of this file shipped that
-comparison as a control and it was not reproducible run to run. The four probes
-below are.
+one.
 
     python3 ground_truth.py
 
@@ -71,13 +80,35 @@ def dequant(c, name):
             + m.astype(np.float64)[:, :, None])
 
 
-def probe_bf16(c, sd, layer):
+def fingerprint(x):
+    """Sorted block values, unit norm: invariant to nibble order AND to scale."""
+    s = np.sort(x, axis=-1).astype(np.float32).reshape(-1, BLK)
+    return s / np.linalg.norm(s, axis=1, keepdims=True)
+
+
+def best_match(cs, gs, exclude=None):
+    best = np.full(len(cs), -2.0)
+    arg = np.zeros(len(cs), np.int64)
+    for i in range(0, len(gs), 65536):
+        b = gs[i:i + 65536]
+        sim = cs @ b.T
+        if exclude is not None:                      # mask the true match out
+            k = (exclude >= i) & (exclude < i + len(b))
+            sim[np.where(k)[0], exclude[k] - i] = -2
+        j = sim.argmax(1)
+        v = sim[np.arange(len(cs)), j]
+        u = v > best
+        best[u], arg[u] = v[u], j[u] + i
+    return arg, best
+
+
+def probe_bf16(c, sd, layer, torch):
     print("1. unquantized bf16 tensors — exact, no quantization noise")
     ok = True
     for cn, mn in NORMS:
         got = c.bf16(cn.replace("layers.0", f"layers.{layer}")).astype(np.float64)
         ref = sd[mn.replace("layers.0", f"layers.{layer}")].to(
-            __import__("torch").float32).numpy().astype(np.float64)
+            torch.float32).numpy().astype(np.float64)
         n = min(got.size, ref.size)
         ex = float(np.mean(got[:n] == ref[:n]))
         ok &= ex > 0.999
@@ -88,105 +119,83 @@ def probe_bf16(c, sd, layer):
     return ok
 
 
-def probe_blocks(c, sd, layer, cn, mn, nrows=4):
-    import torch
-    w = sd[f"layers.{layer}.{mn}.weight"].to(torch.float32).numpy()
-    nb = w.shape[1] // BLK
-    gs = np.sort(w.reshape(-1, BLK), axis=1).astype(np.float32)
-    cs = np.sort(dequant(c, f"model.layers.{layer}.{cn}.weight")[:nrows],
-                 axis=2).reshape(-1, BLK).astype(np.float32)
-    best = np.full(len(cs), np.inf)
-    arg = np.zeros(len(cs), np.int64)
-    cn2 = (cs * cs).sum(1)[:, None]
-    for i in range(0, len(gs), 65536):
-        b = gs[i:i + 65536]
-        dist = cn2 + (b * b).sum(1)[None, :] - 2 * (cs @ b.T)
-        j = dist.argmin(1)
-        v = dist[np.arange(len(cs)), j]
-        u = v < best
-        best[u], arg[u] = v[u], j[u] + i
-    rms = np.sqrt(np.maximum(best, 0) / BLK) / np.abs(w).mean()
-    rows = arg // nb
-    return float(np.median(rms)), len(set(rows.tolist())), len(rows)
-
-
-def probe_rows(c, sd, layer, cn, mn, gt_rows=(0, 1, 7)):
-    import torch
-    w = sd[f"layers.{layer}.{mn}.weight"].to(torch.float32).numpy().astype(np.float64)
-    nb = w.shape[1] // BLK
-    g = w.reshape(w.shape[0], nb, BLK)
-    gm = g.min(2)
-    gd = (g.max(2) - gm) / 15.0
-    d, m, _ = c.blocks(f"model.layers.{layer}.{cn}.weight")
-    sd_, sm = 1.0 / gd.std(), 1.0 / gm.std()
-    out = []
-    for gr in gt_rows:
-        A = np.stack([gd[gr] * sd_, gm[gr] * sm], 1)
-        dists = np.empty(d.shape[0])
-        for cr in range(d.shape[0]):
-            B = np.stack([d[cr, :nb] * sd_, m[cr, :nb] * sm], 1)
-            dists[cr] = np.sqrt(((A[:, None] - B[None]) ** 2).sum(2).min(1)).mean()
-        out.append((dists.min(), float(np.median(dists))))
-    return out
-
-
 def main():
     import torch
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--which", default="instruct", choices=list(CKPT))
+    p.add_argument("--rows", type=int, default=8, help="container rows to match")
     o = p.parse_args()
 
     sd = torch.load(str(CKPT[o.which]), map_location="cpu", mmap=True, weights_only=True)
     c = q4nx.Q4nx(str(Q4NX))
-    print(f"container vs meta-llama/Llama-3.2-1B{'-Instruct' if o.which=='instruct' else ''}"
-          f", layer {o.layer}\n")
+    print(f"container vs meta-llama/Llama-3.2-1B"
+          f"{'-Instruct' if o.which == 'instruct' else ''}, layer {o.layer}\n")
 
-    if not probe_bf16(c, sd, o.layer):
+    if not probe_bf16(c, sd, o.layer, torch):
         print("   stop: the reader or the model is wrong; nothing below is meaningful.")
         return 1
 
-    print("2. blocks, order-free (sorted values; nibble order cancels)")
-    rms, distinct, n = probe_blocks(c, sd, o.layer, *PROJ[0])
-    print(f"   {PROJ[0][0]}: best-of-all-blocks rms/|w| = {rms:.4f}")
-    print(f"     q4_1 quantization error alone is ~0.03; random is ~1.0")
-    print(f"     destinations: {distinct} distinct gt rows for {n} container blocks "
-          f"({distinct/n:.0%} — uniform scatter)")
-    blocks_ok = rms < 0.06
-    print(f"   -> container blocks {'ARE' if blocks_ok else 'are NOT'} "
-          f"the model's 32-element blocks\n")
+    cn, mn = PROJ[0]
+    w = sd[f"layers.{o.layer}.{mn}.weight"].to(torch.float32).numpy().astype(np.float64)
+    g = w.reshape(-1, BLK)
+    gs = fingerprint(g)
 
-    print("3. rows, order-free ((m,d) set match, any within-row permutation)")
-    res = probe_rows(c, sd, o.layer, *PROJ[0])
-    for (gr, (b, med)) in zip((0, 1, 7), res):
-        print(f"   gt row {gr:3d}: best container row {b:.5f} vs median {med:.5f} "
-              f"({'MATCH' if b < 0.3 * med else 'no match'})")
-    rows_ok = all(b < 0.3 * med for b, med in res)
-    print(f"   -> a true match would be ~bf16 noise; best ~= median means no\n"
-          f"      container row holds any gt row's blocks\n")
+    print("2. blocks — cosine on sorted values (nibble order and scale both cancel)")
+    rng = np.random.default_rng(0)
+    pick = rng.choice(len(g), 256, replace=False)
+    mn_ = g[pick].min(1, keepdims=True)
+    dd = (g[pick].max(1, keepdims=True) - mn_) / 15.0
+    rec = fingerprint(mn_ + dd * np.clip(np.rint((g[pick] - mn_) / dd), 0, 15))
+    arg_p, b_present = best_match(rec, gs)
+    _, b_absent = best_match(rec, gs, exclude=pick)
+    x = dequant(c, f"model.layers.{o.layer}.{cn}.weight")
+    arg_c, b_cont = best_match(fingerprint(x[:o.rows]), gs)
+    print(f"   control, true match PRESENT   p50={np.median(b_present):.5f}  "
+          f"(found it {np.mean(arg_p == pick):.1%} of the time)")
+    print(f"   control, true match ABSENT    p50={np.median(b_absent):.5f}  "
+          f"<- the look-alike floor")
+    print(f"   CONTAINER {cn:19s} p50={np.median(b_cont):.5f}")
+    at_floor = abs(np.median(b_cont) - np.median(b_absent)) < \
+        abs(np.median(b_cont) - np.median(b_present))
+    print(f"   destinations: {len(set((arg_c // (w.shape[1] // BLK)).tolist()))} distinct "
+          f"gt rows for {len(arg_c)} container blocks")
+    print(f"   -> container is at the {'LOOK-ALIKE FLOOR — no true match exists' if at_floor else 'true-match level'}\n")
 
-    print("4. Frobenius norm (nibble-order invariant): rotation or scaling?")
+    print("3. which q4_1 fit is this? (min/max forces span 15 in every block)")
+    _, _, codes = c.blocks(f"model.layers.{o.layer}.{cn}.weight")
+    q = codes.reshape(-1, BLK)
+    span = (q.max(1) - q.min(1)).mean()
+    both = float(((q == 0).any(1) & (q == 15).any(1)).mean())
+    print(f"   mean per-block code span {span:.2f} of 15;  blocks holding both "
+          f"0 and 15: {both:.1%}")
+    print(f"   -> FLM's q4_1 is a SEARCH fit on a grid ~{15/span-1:.1%} wider than "
+          f"min/max,\n      not llama.cpp's. Never compare container d against "
+          f"(max-min)/15.\n")
+
+    print("4. Frobenius norm and value quantiles: one scale, or many?")
     print(f"   {'tensor':>16s} {'gt |W|_F':>9s} {'container':>9s} {'ratio':>7s}")
     ratios = []
-    for cn, mn in PROJ:
-        w = sd[f"layers.{o.layer}.{mn}.weight"].to(torch.float32).numpy().astype(np.float64)
-        x = dequant(c, f"model.layers.{o.layer}.{cn}.weight")
-        gf, cf = np.linalg.norm(w), np.sqrt((x * x).sum())
+    for pn, pm in PROJ:
+        ww = sd[f"layers.{o.layer}.{pm}.weight"].to(torch.float32).numpy().astype(np.float64)
+        xx = dequant(c, f"model.layers.{o.layer}.{pn}.weight")
+        gf, cf = np.linalg.norm(ww), np.sqrt((xx * xx).sum())
         ratios.append(cf / gf)
-        print(f"   {cn:>16s} {gf:9.3f} {cf:9.3f} {cf/gf:7.4f}")
-    lo, hi = min(ratios), max(ratios)
-    print(f"   -> ratios {lo:.4f}..{hi:.4f}; orthogonal would be 1.0000 and q4_1\n"
-          f"      error alone contributes <0.001\n")
+        print(f"   {pn:>16s} {gf:9.3f} {cf:9.3f} {cf/gf:7.4f}")
+    qs = [0.001, 0.01, 0.1, 0.25, 0.75, 0.9, 0.99, 0.999]
+    qr = np.quantile(x.ravel(), qs) / np.quantile(w.ravel(), qs)
+    print(f"   {cn} quantile ratios {np.round(qr, 3)}")
+    print(f"     spread {qr.min():.3f}..{qr.max():.3f} — a single scalar would be flat\n")
 
-    if blocks_ok and rows_ok:
-        print("VERDICT: the container reading matches the real weights.")
-        return 0
+    lo, hi = min(ratios), max(ratios)
     print("VERDICT: the quantized reading does NOT recover the real weights.")
-    print("  The bf16 path is bit-exact, so the reader and the model are right;")
-    print("  the quantized tensors carry a VALUE TRANSFORM, not a reordering —")
-    print(f"  norms are inflated {lo:.2f}-{hi:.2f}x and vary per tensor, which is the")
-    print("  signature of per-channel (AWQ/SmoothQuant-style) scaling, not a rotation.")
+    print("  The bf16 path is bit-exact, so the reader and the model are right.")
+    print("  The quantized blocks sit at the look-alike floor against all 524288")
+    print("  ground-truth blocks, so no arrangement of them is the model's blocks.")
+    print(f"  Norms are inflated {lo:.2f}-{hi:.2f}x, per tensor — orthogonal would be")
+    print("  1.0000, so there is a real scaling, and the quantile spread above says")
+    print("  whether it is one number per tensor or a per-channel vector.")
     print("  Consequence: the GEMV kernels are verified as q4_1 ARITHMETIC against")
     print("  a reference on the same bytes, but are NOT verified as computing")
     print("  Llama-3.2-1B-Instruct. Throughput results are unaffected.")

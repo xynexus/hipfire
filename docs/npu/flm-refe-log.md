@@ -5511,3 +5511,72 @@ rather than shipped.
 transform is `w'[r,k] = w[r,k] * s_k`, then `s` is recoverable from block
 statistics against ground truth, and it would close §1.3 for real. Until then,
 the only true end-to-end check remains logits vs `flm run`.
+
+## 2026-07-31 (later) — correcting the §1.3 probes; the verdict survives, two probes did not
+
+Re-checked the morning's §1.3 work by asking whether its own dequantization was
+self-consistent. It mostly was, but **two of the four probes were built on a
+false premise and one claim was stated too strongly.** The verdict is unchanged
+and now rests on a properly calibrated control.
+
+**FLM's q4_1 is not llama.cpp's.** Testable without any ground truth: a min/max
+fit forces code 0 and code 15 into *every* block. Measured on down_proj layer 0,
+only **48.5%** of blocks hold both, the code histogram is bell-shaped about 7.4,
+and the mean per-block span is **14.08 of 15** — a search fit on a grid ~6.6%
+wider than min/max. (48.5% is *below* the 76.3% random 4-bit codes would give,
+which is itself the tell: the codes avoid the rails.)
+
+**Retracted — probe 3 (row-level `(m,d)` set match) was invalid.** It compared
+container `(m, d)` against each ground-truth row's `(min, (max-min)/15)`. Since
+FLM's `d` is not `(max-min)/15`, that probe could only ever fail, whatever the
+row mapping was. It has been deleted, not merely caveated. **Never compare
+container `d` against `(max-min)/15`.**
+
+**Corrected — probe 2's threshold was wrong, and its conclusion is now stronger.**
+The morning claimed "q4_1's own error is ~0.03, the container gives 0.15". The
+first number was invented: this tool's own min/max quantization of a ground-truth
+block lands at **0.094** rms/mean|w|, not 0.03. The fix is not a better threshold
+but the control that was missing — run the search on blocks whose true match is
+*masked out of the pool*, to get the score a block earns when its match is
+definitely absent. Switching to a scale-invariant fingerprint (cosine on sorted
+block values) at the same time:
+
+| best-of-524288 cosine | p50 |
+|---|---|
+| control, true match **present** | 0.99713 (found it 98.4% of the time) |
+| control, true match **absent** (masked) | **0.99503** ← look-alike floor |
+| container down_proj | **0.99487** |
+
+The container sits *at the floor*. Sorted 32-value profiles of weight blocks all
+resemble one another, so the floor is 0.995 and not 0 — without that control,
+0.9949 reads as either "no match by a mile" or "basically a match", by taste.
+
+**Softened — the transform is a scaling, but "per-channel AWQ" was over-claimed.**
+The morning asserted per-channel scaling. What is actually measured is that the
+container's value distribution is a near-uniform **~1.14x** of ground truth's at
+every quantile:
+
+| quantile | .001 | .01 | .1 | .25 | .75 | .9 | .99 | .999 |
+|---|---|---|---|---|---|---|---|---|
+| container/gt | 1.118 | 1.097 | 1.152 | 1.141 | 1.146 | 1.157 | 1.117 | 1.145 |
+
+std ratio 1.1422, exactly the Frobenius ratio. A single scalar per tensor would
+make that row flat; it wobbles ~±3%, so there is some shape change — but this is
+much closer to one number per tensor than to a broad per-channel vector, and
+"AWQ/SmoothQuant-style per-channel scaling" claimed more than the data shows. A
+scaled *rotation* fits it at least as well and is not excluded.
+
+### What stands
+
+Unchanged: the bf16 tensors are 100% bit-exact against Llama-3.2-1B-**Instruct**
+(reader, planar split, naming, model identity all confirmed); the quantized
+blocks are not the model's under any arrangement; the kernels are verified as
+q4_1 arithmetic over the container's blocks and **not** as computing the model;
+every throughput figure is untouched.
+
+The lesson is the same one this file recorded this morning, and it cost a second
+round: **a probe without a control is not evidence.** Three probes have now
+scored confident wrong answers in one day — the RoPE row-order pairing (killed by
+its v_proj control), the `d`-distribution grouping (killed by a random
+regrouping), and probe 3 above (killed by asking what fit FLM actually uses).
+The first two were caught before publishing. The third was not.
