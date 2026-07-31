@@ -8278,3 +8278,32 @@ duplicating two others, and integrating it would touch `ffn_chain`,
 60.5 tok/s, +1.1% over FLM and inside the noise. Beating FLM convincingly now
 depends on finding savings nobody has identified, or on accepting that the
 margin is a coin flip.
+
+## 2026-08-01 — a better partition: displace P1, not P5
+
+I had assumed the attention cores must skip **P5**, and priced the margin
+accordingly. That was never argued for — it was the first split I tried. P1 is
+the *largest* image (6144 B) and the *cheapest* phase in time (58.5 µs), which
+makes it the obvious thing to displace, not P5 at 193.9 µs.
+
+    P2+P3+P4+P5   14704 B   90%   FITS
+
+**It fits.** And it is valid: attention cores receive q′ by broadcast and KV from
+the cache, exactly as `p1p2_chain` already does — they never needed to compute
+P1's projections themselves. P1's work simply spreads over 12 cores instead of 16
+(each owning 4 heads instead of 3).
+
+| partition | attention cores | other cores | displaced | token | tok/s | margin |
+|---|---|---|---|---|---|---|
+| A | P1+P2+P3+P4 (91%) | P1+P3+P4+P5 (94%) | P5, 193.9 µs | 16.52 ms | 60.5 | +1.1% |
+| **B** | **P2+P3+P4+P5 (90%)** | **P1+P3+P4+P5 (94%)** | **P1, 58.5 µs** | **15.80 ms** | **63.3** | **+5.7%** |
+| — | ideal, all 16 cores | — | — | 15.49 ms | 64.6 | +7.8% |
+
+**Partition B recovers most of the margin the overflow cost** — 63.3 vs the
+64.6 tok/s of a configuration that does not build, and vs 60.5 for the partition
+I spent two ticks pricing. The whole difference is choosing which phase to
+displace, and the right choice is the one that is big in *code* and small in
+*time*. Those are unrelated quantities and I had been optimising the wrong one.
+
+That also retires the search for 1904–3072 B of savings: it was only needed to
+put P5 back on the attention cores, and P5 no longer wants to be there.
