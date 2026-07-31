@@ -9219,3 +9219,33 @@ This is the pattern that keeps paying in this design — reuse a global that
 already holds the right values rather than adding a path. `flm_gemv_acc` stashes
 so `flm_gemv_flush` need not re-read; `flm_gemv_q4_1_residual` stashes so P5's
 residual never travels; now the flush stashes so P5's emit already exists.
+
+### All five phases overflow program memory — even at NROWS=8
+
+P5's design side wired (acc + flush chunked NCHUNK=4, each chunk with its own
+`flm_asum_prepare`, `flm_h_emit` sending `x_out` out of `g_resid`) and the build
+returned:
+
+    [AIE ERROR] _XAie_LoadProgMemSection():231: Overflow of program memory
+
+The P1 cores are at **14672 B — 90%, 1712 B of headroom** — carrying P1, P3, P4
+and the emit. P5's two kernels need more than that even with NROWS=8 halving the
+loops.
+
+`p1p2_chain` is restored to P1→P2→P3→P4, still passing. A `g_resid` declaration
+fix in `flm_gemv_flush` is kept (it guarded on `RESID_FROM_STASH` alone, so
+`XOUT_TO_STASH=1` would not compile).
+
+So the layer is **four phases per core, not five**, and the question is which
+partition absorbs P5. The measured facts:
+
+    P1 cores       P1+P3+P4+emit   14672 B  90%
+    attention      P2+P3+P4+emit   13536 B  83%   (1136 B more room)
+    P5 marginal    ~3312 B at NROWS=16, unmeasured at 8
+
+Neither half has room, so P5 displaces something wherever it goes. The candidates
+are the ones already priced: **P1 is the biggest image and the cheapest phase**
+(6144 B, 58.5 µs, and fabric-bound so spreading it costs ~nothing) — a partition
+where some cores run P1+P3+P4 and others P3+P4+P5 keeps every phase on 12+ cores.
+That is a three-way split rather than the current two-way, and the routing lever
+(placement, not fifo count) is known to work.
