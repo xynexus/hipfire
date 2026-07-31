@@ -8370,3 +8370,45 @@ it.
 
 That is the next build step, and it is now the *only* thing between the measured
 design and a running one.
+
+## 2026-08-01 — head redistribution: the assignment is free, so pick it for the drains
+
+Partition B needs P1's 48 head-tiles spread over **12** cores, not 16.
+`p1_route` had them hardcoded: `heads_of(c) -> {c, c+16, c+32}`, stride 16.
+
+### The pure stride is the obvious generalisation and the wrong one
+
+`{c, c+n, c+2n, ...}` is a bijection at any `n` that divides 48, but at 12 it
+scatters the KV heads:
+
+    pair 0: c0s3:k4 c1s3:k5        pair 3: c6s3:v2 c7s3:v3
+    pair 1: c2s3:k6 c3s3:k7        pair 4: c8s2:k0 c8s3:v4 c9s2:k1 c9s3:v5
+    pair 2: c4s3:v0 c5s3:v1        pair 5: c10s2:k2 c10s3:v6 c11s2:k3 c11s3:v7
+
+At 16 cores every pair is purely K (0–3) or purely V (4–7), which is exactly
+what the drain code expresses (`elif i < n // 2:`). At 12, pairs 4–5 carry a k
+*and* a v in different slots while pairs 0–1 carry only k — three different drain
+shapes where there were two.
+
+**The assignment is free.** Any bijection works as long as the host packs the
+weight stream to match, so it should be chosen to make the drains uniform rather
+than derived from a stride and then coped with. `head_layout()` does that:
+
+| cores | k | v | uniform? |
+|---|---|---|---|
+| 16 | slot 2, cores 0–7 | slot 2, cores 8–15 | yes — the original rule, kept exactly |
+| 12 | slot 3, cores 0–7 | slot 2, cores 0–7 | yes — pairs 0–3 identical, pairs 4–5 pure q |
+
+Verified as a bijection over all 48 tiles at both counts, with 8 k and 8 v
+placed; `hpc_for` refuses a ragged split (7 cores) rather than truncating.
+
+Regression: `p1_route` at 16 cores is **unchanged** (q′ 9.5367e-07, k′ one bf16
+ulp, v′ 0.0) and `p1p2_chain` at NATT=4 still passes at 3.4631e-03. The 16-core
+path returns the original stride rule verbatim, so nothing that depends on it
+moved.
+
+Remaining for partition B: thread the core count through `build()` — `npairs`,
+`bc_cons`, `HPC` in the weight/result types and the `range_` loop — and rewrite
+the KV drains against `kv_placement()` instead of the `i < n // 2` branch. The
+layout now guarantees those drains stay uniform, which is the whole point of
+choosing it this way.

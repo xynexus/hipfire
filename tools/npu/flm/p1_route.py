@@ -53,9 +53,89 @@ NQ, NK, NV = 32, 40, 48          # head-index boundaries
 rnd = lambda v: q4nx.bf16_to_f32(q4nx.f32_to_bf16(np.asarray(v, np.float32)))
 
 
-def heads_of(core):
-    """Core c owns heads {c, c+16, c+32} — see the module docstring."""
-    return [core + 16 * h for h in range(HPC)]
+NHEADS = NV                      # 48 head-tiles: 32 q + 8 k + 8 v
+
+
+def hpc_for(ncores):
+    """Head-tiles per core. Raises rather than truncating on a ragged split."""
+    if NHEADS % ncores:
+        raise ValueError(f"{NHEADS} head-tiles do not divide over {ncores} cores")
+    return NHEADS // ncores
+
+
+def heads_of(core, ncores=NCORES):
+    """Core c owns {c, c+n, c+2n, ...} over `ncores` P1 cores.
+
+    The stride is the CORE COUNT, not a constant 16. At 16 cores that is the
+    original {c, c+16, c+32}; at 12 (partition B, where the four attention cores
+    sit P1 out) it becomes {c, c+12, c+24, c+36}, four tiles each, and 48/12
+    divides exactly.
+
+    **The KV placement is not uniform at 12 cores**, and that is the part that
+    costs work. At 16 every k head sits in slot 2 on cores 0-7 and every v head
+    in slot 2 on cores 8-15, so one drain formula covers both. At 12 the k heads
+    split across slot 2 (cores 8-11) and slot 3 (cores 0-3), and v lands in slot
+    3 on cores 4-11. Any drain that hardcodes "K from core g, V from core g+8"
+    is wrong off 16 cores; use `kv_placement()`.
+    """
+    return head_layout(ncores)[core]
+
+
+def head_layout(ncores=NCORES):
+    """-> [heads owned by core 0, core 1, ...], chosen so the KV drains stay
+    uniform across pairs.
+
+    The assignment is **free** — any bijection over the 48 head-tiles works, and
+    the host packs the weight stream to match. So it should be chosen to make
+    the drains simple, not derived from a stride and then coped with. A pure
+    stride-`ncores` rule is the obvious thing and it is the wrong thing: at 12
+    cores it puts a k head and a v head on the SAME core in different slots
+    (pairs 4-5), while pairs 0-1 carry only k. Every pair then needs a different
+    drain shape.
+
+    At 16 cores the original rule already happens to be uniform — k in slot 2 on
+    cores 0-7, v in slot 2 on cores 8-15 — so it is kept exactly, and
+    `p1_route` at 16 cores is unaffected.
+
+    At 12 cores this puts **both** a k and a v head on each of cores 0-7, in
+    fixed slots, so pairs 0-3 all have the identical two-drain shape and pairs
+    4-5 are pure q with none. Uniform in both groups, which is what the drain
+    code can express.
+    """
+    hpc = hpc_for(ncores)
+    if ncores == NCORES:                      # the original stride-16 rule
+        return [[c + NCORES * h for h in range(hpc)] for c in range(ncores)]
+
+    nkv = NV - NQ                             # 16 kv head-tiles
+    kv_cores = nkv // 2                       # 8 cores carry one k and one v
+    if kv_cores > ncores or hpc < 2:
+        raise ValueError(f"cannot place {nkv} kv tiles over {ncores} cores")
+    layout, q = [], iter(range(NQ))
+    for c in range(ncores):
+        if c < kv_cores:                      # ... q ..., v[c], k[c]
+            row = [next(q) for _ in range(hpc - 2)] + [NK + c, NQ + c]
+        else:
+            row = [next(q) for _ in range(hpc)]
+        layout.append(row)
+    if next(q, None) is not None:
+        raise ValueError("q head-tiles left over: layout is not a bijection")
+    return layout
+
+
+def kv_placement(ncores=NCORES):
+    """-> (k_at, v_at), each {kv_head_index: (core, slot)}.
+
+    Derived from `heads_of` rather than assumed, so a drain built on it follows
+    the assignment automatically when the core count changes.
+    """
+    k_at, v_at = {}, {}
+    for c, row in enumerate(head_layout(ncores)):
+        for slot, h in enumerate(row):
+            if NQ <= h < NK:
+                k_at[h - NQ] = (c, slot)
+            elif h >= NK:
+                v_at[h - NK] = (c, slot)
+    return k_at, v_at
 
 
 def build(pos):
