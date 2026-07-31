@@ -4827,3 +4827,56 @@ RMSNorm, q/k/v/o projections, RoPE, decode attention with online softmax,
 gate/up+SwiGLU fused, and down_proj are all now built and verified on hardware.
 What remains before a layer can run end to end is the **residual adds** (trivial)
 and the **KV cache append**, then the fusion itself and a tok/s number.
+
+## 2026-07-31 — First tok/s PROJECTION from measured phases: 0.81x FLM today, 1.05x fused
+
+Every phase of a decoder layer is now measured on hardware, so a per-token time
+can be projected from measured numbers rather than guessed. **This is a
+projection, not a measurement — no token has been produced.**
+
+| phase | MB | GB/s | us |
+|---|---|---|---|
+| q/k/v/o (K=2048, N=5120) | 6.55 | 33.0 | 198.4 |
+| gate+up fused (K=2048, N=8192) | 21.00 | 41.4 | 507.0 |
+| down (K=8192, N=2048) | 10.49 | 28.4 | 370.0 |
+| **per layer** | **38.04** | **35.4** | **1075.4** |
+
+Against the 38,010,880 B/layer the container arithmetic gives, 38.04 MB is the
+whole layer's weights — nothing is missing from the accounting.
+
+    16 layers            17.21 ms
+    lm_head @ 48.6 GB/s   3.38 ms  (164.2 MB)
+    TOTAL                20.59 ms/token  ->  48.6 tok/s  =  0.81x FLM
+    FLM measured         16.71 ms/token  ->  59.86 tok/s
+
+**If every phase ran at the 48.6 GB/s the big shape already achieves: 15.90 ms
+-> 62.9 tok/s = 1.05x FLM.**
+
+### The gap is dispatch overhead, and it must not be double-counted
+
+The obvious second calculation — 49 dispatches x ~100 us fixed cost = 4.9 ms,
+24% of the total — lands on the same answer (15.89 ms, 63.0 tok/s). That is
+**not** an independent second loss. The measured per-phase GB/s *includes* the
+fixed dispatch cost, so "phases run below peak" and "dispatch overhead" are two
+views of one thing. Adding them would be wrong.
+
+Checking it per phase — excess over what pure streaming at 48.6 GB/s would take:
+
+| phase | pure-stream us | measured us | excess |
+|---|---|---|---|
+| q/k/v/o | 135 | 198 | **63** |
+| gate+up | 432 | 507 | **75** |
+| down | 216 | 370 | **154** |
+
+Two of three sit at or under the ~100 us per-dispatch floor established in
+milestone 1, so their below-peak rate **is** the fixed cost. down_proj's 154 us
+exceeds it by ~54 us, which is the genuinely geometric part (K=8192 forces a
+2-row weight tile).
+
+**So fusion is the whole remaining lever, and it is worth 0.81x -> 1.05x.** That
+also revises the earlier reading of down_proj as "the slow phase": most of its
+apparent slowness is the same per-dispatch cost every phase pays, not its
+geometry. Its intrinsic penalty is ~54 us per layer, ~0.9 ms per token, ~4%.
+
+This is the clearest statement yet of why FLM issues **2 commands per token**,
+and it puts a number on what the fused layer is worth before it is built.
