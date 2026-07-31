@@ -9196,3 +9196,26 @@ That is the second time the "unify the layout" instinct has cost a tick and been
 reverted (the first was unifying the result object size, which placement solved
 instead). The layouts differ because the kernels index differently, and making
 them agree is not free.
+
+### P5's emit costs no new kernel: the flush stashes x_out
+
+`flm_gemv_flush` gains `-DXOUT_TO_STASH`. With it set, the flush writes its
+result into `g_resid[(base+r) % DIM_RESN]` instead of the result object.
+
+That lets **`flm_h_emit` serve P5 unchanged**. P5's 128 rows per core have the
+same shape as P3's and must leave in one object — a per-tile object would be 6%
+dense and the next layer could not be broadcast from it — and `flm_h_emit`
+already copies a core's slice out of `g_resid`. A P5-specific emit was measured
+at ~496 B against 1712 B of headroom; this is 0.
+
+It is safe in place: the flush reads `g_resid[(base+r) % DIM_RESN]` for the
+residual and writes the same slot, so no tile disturbs a slot another tile still
+needs.
+
+Both standalone harnesses pass with the flag off (`ffn_chain`, `resid_chain`),
+so the default path is untouched.
+
+This is the pattern that keeps paying in this design — reuse a global that
+already holds the right values rather than adding a path. `flm_gemv_acc` stashes
+so `flm_gemv_flush` need not re-read; `flm_gemv_q4_1_residual` stashes so P5's
+residual never travels; now the flush stashes so P5's emit already exists.

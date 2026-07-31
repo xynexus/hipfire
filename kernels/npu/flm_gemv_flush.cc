@@ -17,6 +17,21 @@ extern float g_acc_down[];
 #ifndef RESID_FROM_STASH
 #define RESID_FROM_STASH 0
 #endif
+
+// **Write x_out back into g_resid instead of the result object.**
+//
+// In the fused layer P5's 128 rows per core have to leave in ONE object, or the
+// drain is 6% dense and the next layer cannot be broadcast from it. P3 has the
+// same shape and solves it with flm_h_emit, which copies a core's slice out of
+// g_resid — so if the flush leaves its result there, that emit serves P5 too and
+// costs no new kernel. Program memory is the binding budget: an x-specific emit
+// was measured at ~496 B against 1712 B of headroom, and this is 0.
+//
+// Safe in place: the flush reads g_resid[(base+r) % DIM_RESN] and writes the
+// same slot, so no tile disturbs a slot another tile still needs.
+#ifndef XOUT_TO_STASH
+#define XOUT_TO_STASH 0
+#endif
 #if RESID_FROM_STASH
 #ifndef DIM_RESN
 #define DIM_RESN 128
@@ -45,7 +60,12 @@ flm_gemv_flush(const bfloat16 *restrict act_aux, const uint8 *restrict wtile,
 #else
     const float res = float(aux[base + r]);   // standalone harnesses
 #endif
+#if XOUT_TO_STASH
+    g_resid[(base + r) % DIM_RESN] = g_acc_down[slot + r] + part[r] + res;
+    (void)out;
+#else
     out[r] = bfloat16(g_acc_down[slot + r] + part[r] + res);
+#endif
     g_acc_down[slot + r] = 0.0f;   // ready for the next token
   }
 }
