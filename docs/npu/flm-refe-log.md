@@ -4634,3 +4634,47 @@ the mode table in `aie2p_enums.h` is real, and `interleave_unzip` measured at on
 extra instruction — but **not every mode in that table has an NPU2
 implementation**. Check a specific mode compiles before designing a data layout
 around it; the earlier entry implied the whole table was available.
+
+## 2026-07-31 — Fused gate/up + SwiGLU: one kernel, one dispatch, 16 cores
+
+`kernels/npu/flm_ffn_gate_up.cc` + `tools/npu/flm/ffn_fused.py`. `ffn_verify.py`
+proved the FFN arithmetic but ran four dispatches with host glue; this fuses the
+first half into one kernel and one dispatch.
+
+**It fuses because that half is entirely local.** gate and up read the *same*
+activation and produce the *same* output rows, and SwiGLU combines them
+element-wise — so one core does all three for its slice and **the 8192-wide
+intermediate is never materialised in memory at all**. No cross-core dependency,
+no barrier. (down_proj is the opposite: its activation is the whole SwiGLU
+output, so it needs every core's slice and stays a separate phase.)
+
+| cores | MB | GB/s | wall us | vs FLM | max err |
+|---|---|---|---|---|---|
+| 8 | 10.5 | 20.6 | 508.8 | 0.45x | 3.40e-04 |
+| 16 | **21.0** | **41.4** | 506.5 | 0.90x | 3.40e-04 |
+
+21.0 MB is exactly gate + up for llama-3.2-1B (10.5 each). The error is against a
+float64 reference and sits at the hardware-exp2 floor (3.54% mean / 5.86% max
+relative), not at bf16.
+
+**Fusing costs 15% of GB/s here, and the reason is L1, not the arithmetic.** The
+fused tile carries both the gate and the up weights, so it is 2x the size, and
+the 64 KB tile memory then forces **8 rows per tile instead of 16**:
+
+| | tile | x2 buffered | + act | total | rows |
+|---|---|---|---|---|---|
+| plain GEMV | 20480 | 40960 | 8192 | 49152 | **16** |
+| fused | 2 x 10240 | 40960 | 8192 | 49152 | **8** |
+| fused at 16 rows | 2 x 20480 | 81920 | 8192 | 90112 | does not fit |
+
+and 8 rows/tile was already measured ~25% worse than 16 for the plain GEMV. So
+41.4 against the plain GEMV's 48.6 is the row count, not the fusion. The trade is
+**one dispatch and no 8192-element host round trip, against 15% of streaming
+rate** — which of those wins is an end-to-end question that needs a tok/s number,
+not a GB/s one.
+
+This is also a second, independent instance of the same pressure `down_proj`
+showed: **L1 capacity, not compute, is what limits tile size in every fused
+shape so far.** It sharpens the case for the untried neighbour-memory lever —
+the activation is replicated into every core at 8192 B double-buffered, and
+freeing that is worth a row-count step in every one of these designs.
