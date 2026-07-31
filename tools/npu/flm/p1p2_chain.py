@@ -887,6 +887,7 @@ def main():
     print(f"P1 -> P2 in one dispatch: seq {o.seq} (P1 appends at pos {pos}), "
           f"{nobj} KV objects, npad {npad}")
     worst, scale = 0.0, 0.0
+    pmax = spread = 0.0
     for a in range(NATT):
         Kfull = np.zeros((o.seq, HEAD), np.float64)
         Vfull = np.zeros((o.seq, HEAD), np.float64)
@@ -903,6 +904,13 @@ def main():
                .reshape(apairs, 2, GQA, HEAD)[a // 2, a % 2])
         worst = max(worst, np.abs(got - want).max())
         scale = max(scale, np.abs(want).mean())
+        # How SHARP is this head's softmax? The exp2 NLF is a piecewise LUT, so
+        # its relative error is worst where the distribution concentrates: a
+        # near-one-hot softmax puts the whole output on a few v rows and the
+        # LUT's error on those weights lands undiluted. Track it alongside the
+        # error so a growing error can be attributed rather than guessed at.
+        pmax = max(pmax, (e / e.sum(1, keepdims=True)).max())
+        spread = max(spread, (sc.max(1) - sc.min(1)).max())
         if a == 0:
             print(f"  DIAG head0 got[0,:4] {got[0,:4].round(4)}")
             print(f"  DIAG head0 want[0,:4] {want[0,:4].round(4)}")
@@ -916,6 +924,7 @@ def main():
             w0 = (e0 / e0.sum(1, keepdims=True)) @ Vfull[:pos]
             print(f"  DIAG if it missed pos {pos}: err "
                   f"{np.abs(got[0] - w0[0]).max():.3e}")
+    print(f"  softmax: max weight {pmax:.4f}   max logit spread {spread:.2f}")
     tol = 8e-2 * scale                        # AIE2P exp2 NLF floor
     print(f"  attention out: max err {worst:.4e}   mean|ref| {scale:.5f}   "
           f"tol {tol:.4e}")

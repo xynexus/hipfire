@@ -10066,3 +10066,39 @@ reference computed from the device's own intermediate, exact to the last bit.
 Nothing about the layer is projected any more. The remaining gap is the one
 structural fact established earlier: a core holds four phase bodies, a layer has
 five, and the extra dispatch costs 16 × 67.2 µs.
+
+## 2026-08-01 — the layer generalises, but attention's error grows with depth
+
+`--layer-pass` at layers 0, 7 and 15:
+
+    layer   P3 h        P4 sw       LAYER x_out   attention    tol
+    0       9.5367e-07  2.4414e-04  0.0000e+00    3.4631e-03   3.8603e-03  PASS
+    7       0.0000e+00  3.0518e-04  0.0000e+00    4.8651e-03   4.0772e-03  FAIL
+    15      5.9605e-08  1.8770e-04* 0.0000e+00    9.2940e-03   4.6999e-03  FAIL
+
+`x_out` is exact at every layer — the layer itself carries no layer-0 assumption,
+and P3/P4/P5 hold. What does not hold is **attention**, whose error grows 2.7×
+from layer 0 to 15 while its tolerance grows only 22%.
+
+**The standing attribution — "floor is the exp2 NLF" — is not supported.** Two
+candidate causes are now measured and BOTH are refuted:
+
+  * *Not softmax sharpness.* The exp2 LUT's relative error should be worst where
+    the distribution concentrates. It does not concentrate: max softmax weight is
+    0.1664 / 0.1259 / 0.1339 and max logit spread 2.25 / 2.07 / 1.95 across the
+    three layers — flat, and if anything *flatter* where the error is worst.
+  * *Not inherited from P1.* k' and v' are bit-exact (0.0000e+00) at layers 7 and
+    15, so attention's cached inputs are clean.
+
+The remaining unchecked input is **q'**, which is the only operand with no
+readback comparison — the check builds its reference from the host's `ref[h]`.
+Whether P2 consumes P1's device q' or the host's broadcast fill is exactly the
+seam that produced the 1.0496e-01 bug earlier, so it is the place to look. A q'
+readback check is the next step; until it runs, the cause is unidentified and the
+"exp2 NLF" line in the check output is a guess, not a finding.
+
+This matters beyond one layer: at layer 15 the error is 2× tolerance, and a token
+passes through all 16.
+
+*P4 sw at layer 15 tracks its own mean|ref| (0.00189) proportionally; it is the
+exp2 floor there, which is a separate and well-behaved thing.
