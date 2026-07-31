@@ -9929,13 +9929,18 @@ and distinguished nothing.
 ### The two-dispatch layer, now measured on both sides
 
     side A (P1..P4)   638.9 µs   measured
-    side B (P5)       269.5 µs   measured
-    layer             908.4 µs
-    token 17.24 ms -> **58.0 tok/s**   vs FLM 58.83 at matched context, **−1.4%**
+    side B (P5)       266.0 µs   measured (median of 3)
+    layer             904.9 µs
+    token 18.17 ms -> **55.0 tok/s**   vs FLM 58.83 at matched context, **−6.5%**
 
-The projection said 53.9–55.1, pricing P5 at ~197 µs plus a 67–93 µs dispatch.
-Measured, side B is 269.5 — close to that sum, but the layer lands better than
-projected because side A already carries its own dispatch.
+**The projection was right.** It said 53.9–55.1, pricing P5 at ~197 µs plus a
+67–93 µs dispatch; measured side B is 266.0, within 1% of that sum, and the layer
+lands at 55.0 — inside the projected range.
 
-**−1.4% is the closest this design has been to FLM on measured numbers**, and it
-is the buildable configuration, not the one that does not fit.
+That is the first time a projection here has survived measurement. It is also
+the first end-to-end figure built from two measured dispatches rather than a
+model, so 55.0 is the real number for the buildable configuration.
+
+*(This entry first said 17.24 ms and 58.0 tok/s. That was an arithmetic slip in
+the same commit that produced the correct figures alongside it — 16 × 904.9 +
+3693.8 is 18172 µs, not 17240.)*
