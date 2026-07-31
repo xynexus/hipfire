@@ -35,6 +35,7 @@ import q4nx  # noqa: E402
 from qkv_verify import HEAD, K_DIM, NROWS, TPH, EPS, ROPE_THETA, qkv_rows, rope_ref  # noqa: E402
 
 import aie.iron as iron  # noqa: E402
+from aie.utils.benchmark import run_iters  # noqa: E402
 from aie.iron import In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker  # noqa: E402
 from aie.iron.controlflow import range_  # noqa: E402
 from aie.iron.device import AnyShimTile  # noqa: E402
@@ -208,6 +209,9 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--pos", type=int, default=0, help="KV cache position")
+    p.add_argument("--bench", action="store_true",
+                   help="time P1 alone, so P2's in-chain marginal can be\n"
+                        "isolated against p1p2_chain --bench")
     o = p.parse_args()
     npairs = NCORES // 2
     KTILE = HEAD * TSEQ
@@ -271,7 +275,14 @@ def main():
     KVSTRIDE = KTILE + TSEQ * HEAD
     cache = iron.zeros(8 * KVSTRIDE, dtype=bfloat16, device="npu")
     kv_ts = [cache] * npairs          # every pair drains into the same buffer
-    design(bc_t, *w_ts, *q_ts, *kv_ts)
+    if o.bench:
+        _b = run_iters(design, bc_t, *w_ts, *q_ts, *kv_ts, warmup=2, iters=10)
+        _us = _b.npu.min_us if _b.npu else _b.e2e.min_us
+        _mb = NCORES // 2 * 2 * HPC * TPH * q4nx.tile_bytes(K_DIM, NROWS) / 1e6
+        print(f"  bench: {_mb:.2f} MB  {_mb*1e3/_us:.1f} GB/s  {_us:.1f} us "
+              f"(marginal {_us - 92.9:.1f})")
+    else:
+        design(bc_t, *w_ts, *q_ts, *kv_ts)
     cv = cache.numpy().astype(np.float64).reshape(8, KVSTRIDE)
 
     print(f"P1 routed to three destinations: {NCORES} cores, layer {o.layer}, "

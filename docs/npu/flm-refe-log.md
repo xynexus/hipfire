@@ -7900,3 +7900,36 @@ is now in place, which is most of the work; what remains is generating and
 checking KV content across tiles.
 
 `--kvobj 1` and the default path both still PASS, so nothing regressed.
+
+### P1 measured (medians, not single runs) — the projection was pessimistic on it
+
+Added `--bench` to `p1_route.py` so P1 alone can be timed and P2's in-chain
+increment isolated. Both figures are **medians of repeats**, per the variance
+finding:
+
+    P1 alone   51.5  54.4  58.5  64.4  65.0            median 58.5  (23% spread)
+    P1 -> P2   77.3  78.9  82.2  86.8  95.3  95.7      median 84.5
+
+Two readings:
+
+  * **P2's in-chain increment at negligible KV is +26.0 µs.** That is fixed cost
+    — softmax setup and kernel entry — not streaming, since KV is 7.6% of the
+    bytes here. It composes with the streaming measured separately
+    (`attn_phase`, 58.1 µs at 4 cores, matched volume) rather than adding to it:
+    58.5 + 58.1 and 84.5 + (58.1 − 26.0) agree at 116.6 µs.
+  * **P1 was *assumed* 78.6 µs and measures 58.5 — 26% better.** The projection
+    has carried that assumed value since it was first written.
+
+| P1 | token | tok/s | margin vs FLM |
+|---|---|---|---|
+| assumed 78.6 | 16.14 ms | 62.0 | +3.5% |
+| **measured 58.5** | **15.81 ms** | **63.2** | **+5.6%** |
+
+The margin roughly doubles, from inside the noise band to just outside it. That
+is the opposite direction from the last two corrections, which is worth stating
+plainly: my errors have not been biased pessimistic or optimistic, they have been
+*from reading single samples*. Medians moved this one up and the P1-in-chain one
+down.
+
+Every phase in the projection is now measured except the barrier constant
+(5.91 µs, fitted at R²=0.99996) and the dispatch constant (92.9 µs).
