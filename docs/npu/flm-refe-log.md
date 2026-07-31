@@ -6463,3 +6463,33 @@ for the carry — so what is unproven is only their combination in this design.
 The next attempt should **extend `qkv_route_probe.py`**, which produces and
 routes correctly, rather than write a third design from scratch. The structural
 difference is that this one feeds the core from two input fifos.
+
+### Later the same day — the k′ harness fault is pinned to input-fifo delivery
+
+Bisected up from `qkv_route_probe.py` (which works) rather than down from the
+broken design, and split the failure with two constant-injection tests.
+
+**Works** — `KV_SEEDCONST=1` makes the seed write a constant instead of reading
+its input, and the cache fills correctly (`K[:,0] = 5.0`). That clears, in one
+run: `flm_kv_emit` itself, the cross-TU `g_stage` handoff, and the paired
+strided drain at a non-zero offset.
+
+**Fails** — with the seed reading its input fifo, the cache stays zero **even
+when the input is all 5s** (`KV_CONSTHEAD=1`). So the fault is exactly one
+thing: data filled into this harness's input fifo does not reach the kernel.
+
+Eliminated along the way, each by measurement:
+
+| hypothesis | result |
+|---|---|
+| two input fifos confuse the design | no — 0, 1 and 2 input fifos all pass |
+| the core body needs a `range_` loop | no — a plain traced Python loop passes |
+| output fifo depth 1 vs 2 | no — both behave the same |
+| destination BO larger than one object | no — a matched BO is equally empty |
+| tile trailer offset | a real bug (`tile_flags()` offsets by `TILE_BYTES`, so a bare 64 B trailer reads 20 KB out of bounds) but not this one |
+
+**The bisect's own limit, worth stating:** the probes I bisected with had
+kernels that *ignored* their inputs. They proved the design runs and produces,
+not that input data arrives — which is precisely the gap that turned out to
+matter. A bisect that varies structure while holding the payload trivial cannot
+see a payload fault, and I nearly concluded "input fifos are fine" from it.

@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """k′ appended one token per dispatch, carrying across the dispatch boundary.
 
-**STATUS: this harness does not work yet — it produces an all-zero cache.** The
-kernel it exercises (`kernels/npu/flm_kv_emit.cc`) compiles clean at a 64 B
-frame, and the two mechanisms it combines are each already proven elsewhere:
-the paired strided append by `kv_append_probe.py`, and cross-dispatch `.bss`
-persistence by `static_persist_probe.py`. What fails is this design: nothing is
-written at all, with no error reported. Ruled out — the drain's stride pattern
-(a plain contiguous drain is equally empty), the destination BO size (a BO sized
-to exactly one object is equally empty), and the tile trailer offset (fixed, no
-change). So the core or its fifos are not producing, upstream of the append.
+**STATUS: does not work yet, but the fault is now pinned.** Run with
+`KV_SEEDCONST=1` the cache fills correctly — so `flm_kv_emit`, the cross-TU
+`g_stage` handoff, and the paired strided drain with a non-zero offset all work.
+Run normally, with the seed reading its input fifo, the cache stays zero **even
+when the input is all 5s** (`KV_CONSTHEAD=1`). So the single remaining fault is
+that **data filled into this harness's input fifo does not reach the kernel**.
 
-The next attempt should **extend `qkv_route_probe.py`**, which produces and
-routes correctly with one input-less core, rather than build a third design from
-scratch; the difference here is two input fifos feeding the core.
+Eliminated by bisecting up from `qkv_route_probe.py`, which works: input fifo
+count (0, 1 and 2 all pass), `range_` versus a plain traced loop, output fifo
+depth, the destination BO size, and the tile trailer offset. Note the bisect's
+own limit — those probes' kernels *ignored* their inputs, so they proved the
+design runs, not that input data arrives, which is exactly the gap that is left.
 
 `flm_kv_emit.cc` closes the P1→P2 seam. Appending a token to the channel-major K
 cache is a stride-TSEQ scatter, and a DMA cannot do that one element at a time —
@@ -85,8 +84,16 @@ Path(SEED_SRC).write_text("""// SPDX-License-Identifier: Apache-2.0
 alignas(64) bfloat16 g_stage[DIM_HEAD];
 extern "C" __attribute__((noinline)) void
 kv_seed(const bfloat16 *restrict in) {
+#ifdef SEED_CONST
+  // split test: ignore the input and write a constant. If the cache then shows
+  // 5.0, the g_stage handoff works and the input fifo is at fault; if it stays
+  // zero, the cross-TU g_stage link is.
+  for (int i = 0; i < DIM_HEAD; i += 32)
+    aie::store_v(g_stage + i, aie::broadcast<bfloat16, 32>(bfloat16(5.0f)));
+#else
   for (int i = 0; i < DIM_HEAD; i += 32)
     aie::store_v(g_stage + i, aie::load_v<32>(in + i));
+#endif
 }
 """)
 
@@ -101,6 +108,11 @@ def build(t):
             if _os0.environ.get('KV_MATCHED')
             else np.ndarray[(HEAD * TSEQ,), np.dtype[bfloat16]])
     off = t - (t & 1)                    # even column of this token's pair
+    import os as _osc
+    SEEDC = ["-DSEED_CONST=1"] if _osc.environ.get("KV_SEEDCONST") else []
+    SEEDTAG = 1 if SEEDC else 0    # local: the f-string interpolates it,
+                                   # which is what gives the two variants
+                                   # distinct jit cache keys
     import os as _os
     if _os.environ.get("KV_CONTIG"):     # control: is the drain running at all?
         SIZES, STRIDES = [1, 1, 1, 2 * HEAD], [0, 0, 0, 1]
@@ -115,7 +127,7 @@ def _design(hin: In, wt: In, kc: Out):
                              arg_types=[in_ty], compile_flags=FLAGS)
     kemit = ExternalFunction("flm_kv_emit", source_file=EMIT_SRC,
                              arg_types=[wt_ty, out_ty], compile_flags=FLAGS)
-    f_in = ObjectFifo(in_ty, depth=1, name="hin{t}")
+    f_in = ObjectFifo(in_ty, depth=1, name="hin{t}_{SEEDTAG}")
     f_wt = ObjectFifo(wt_ty, depth=1, name="wt{t}")
     f_o = ObjectFifo(out_ty, depth=1, name="ko{t}")
 
@@ -152,9 +164,10 @@ def _design(hin: In, wt: In, kc: Out):
               ExternalFunction=ExternalFunction, EMIT_SRC=EMIT_SRC,
               SEED_SRC=SEED_SRC,
               FLAGS=[f"-DDIM_K=2048", f"-DDIM_NROWS=16", f"-DDIM_HEAD={HEAD}",
-                     f"-DDIM_ACT=2048"],
+                     f"-DDIM_ACT=2048"] + SEEDC,
               in_ty=in_ty, wt_ty=wt_ty, out_ty=out_ty, k_ty=k_ty,
-              SIZES=SIZES, STRIDES=STRIDES,
+              SIZES=SIZES, STRIDES=STRIDES, SEEDC=SEEDC,
+              SEEDTAG=SEEDTAG,
               __name__=f"flm_kv_emit_t{t}")
     exec(src, ns)
     return iron.jit(ns["_design"], source_files=[EMIT_SRC, SEED_SRC],
@@ -173,6 +186,8 @@ def main():
     rng = np.random.default_rng(0)
     ks = q4nx.bf16_to_f32(q4nx.f32_to_bf16(
         (rng.standard_normal((N, HEAD)) * 0.3).astype(np.float32)))
+    if __import__("os").environ.get("KV_CONSTHEAD"):
+        ks = np.full((N, HEAD), 5.0, np.float32)   # split: known input data
 
     # the KV tile persists across dispatches on the host side, like a real cache
     import os as _os1

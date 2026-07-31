@@ -12,6 +12,14 @@
 alignas(64) bfloat16 g_stage[DIM_HEAD];
 extern "C" __attribute__((noinline)) void
 kv_seed(const bfloat16 *restrict in) {
+#ifdef SEED_CONST
+  // split test: ignore the input and write a constant. If the cache then shows
+  // 5.0, the g_stage handoff works and the input fifo is at fault; if it stays
+  // zero, the cross-TU g_stage link is.
+  for (int i = 0; i < DIM_HEAD; i += 32)
+    aie::store_v(g_stage + i, aie::broadcast<bfloat16, 32>(bfloat16(5.0f)));
+#else
   for (int i = 0; i < DIM_HEAD; i += 32)
     aie::store_v(g_stage + i, aie::load_v<32>(in + i));
+#endif
 }
