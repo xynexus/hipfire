@@ -65,11 +65,11 @@ def build(NROWS, ncores, tiles_per_core, ACCN):
 
     act_ty = np.ndarray[(2 * CHUNK_K,), np.dtype[bfloat16]]   # [act][aux]
     wt_ty = np.ndarray[(wt,), np.dtype[np.uint8]]
-    o_ty = np.ndarray[(NROWS,), np.dtype[np.float32]]
+    o_ty = np.ndarray[(NROWS,), np.dtype[bfloat16]]
     wpair_ty = np.ndarray[(2 * wt,), np.dtype[np.uint8]]
-    opair_ty = np.ndarray[(2 * NROWS,), np.dtype[np.float32]]
+    opair_ty = np.ndarray[(2 * NROWS,), np.dtype[bfloat16]]
     w_all_ty = np.ndarray[(2 * NCHUNK * tiles_per_core * wt,), np.dtype[np.uint8]]
-    o_all_ty = np.ndarray[(2 * rows,), np.dtype[np.float32]]
+    o_all_ty = np.ndarray[(2 * rows,), np.dtype[bfloat16]]
     a_all_ty = np.ndarray[(NCHUNK * 2 * CHUNK_K,), np.dtype[bfloat16]]
 
     flags = [f"-DDIM_K={CHUNK_K}", f"-DDIM_NROWS={NROWS}", f"-DDIM_ACCN={ACCN}"]
@@ -202,7 +202,7 @@ def main():
     a_t = iron.tensor(abuf.astype(bfloat16), dtype=bfloat16, device="npu")
     w_ts = [iron.tensor(wpair, dtype=np.uint8, device="npu")
             for _ in range(ncores // 2)]
-    o_ts = [iron.zeros(2 * rows, dtype=np.float32, device="npu")
+    o_ts = [iron.zeros(2 * rows, dtype=bfloat16, device="npu")
             for _ in range(ncores // 2)]
     bench = run_iters(design, a_t, *w_ts, *o_ts, warmup=2, iters=10)
     npu = bench.npu

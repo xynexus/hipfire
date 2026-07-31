@@ -5857,3 +5857,65 @@ it pays.
 Worth having measured before building `layer_verify.py` rather than after: the
 symptom would have been a link failure deep in a five-phase design, with the
 cause four files away.
+
+## 2026-07-31 — Task 7 in progress: FFN chain plumbing works, numerics do not
+
+`tools/npu/flm/ffn_chain.py`, phases P4+P5 in one dispatch — 2 of the layer's 5
+phases and 29.2 of its 38.0 MB. **It runs but does not pass**; recording what is
+established and what is not, because the plumbing findings are reusable and the
+failure is specific.
+
+### Established
+
+**`fill` and `drain` take `offset`, `sizes`, `strides` and `transfer_len`.**
+This is the mechanism Task 7 needs and the plan never names: a phase's drain can
+write into a *chosen slice* of the buffer a later phase's fill reads. Here P4's
+per-pair drains land directly in the activation halves of P5's four broadcast
+objects, whose aux halves the host pre-filled with the residual. No host round
+trip and no extra buffer.
+
+`transfer_len` alone is not enough — it emits `sizes = [0,0,0,0]` and the
+lowering rejects it (`'aie.dma_bd' op Size 0 must be a positive integer`). Give
+the full 4-D form: `sizes=[1,1,1,N], strides=[0,0,0,1]` for a contiguous run.
+
+**Phases must share one operand fifo and one result fifo.** Giving P4 and P5
+their own is not a tight fit but a compile error — `tile (0,3) requires 3
+input/2 output DMA channels, but only 2 input/2 output available`, because the
+broadcast already takes one of the two inputs. This is what §1.1 means by the
+topology being identical in every phase, and it is enforced by the hardware
+rather than by convention.
+
+**Row assignment must match the join order, not the core.** A pair's result
+join emits `[core0's NROWS][core1's NROWS]` per step, so assigning core *c* a
+contiguous block of rows makes the pair's drain an interleaving of two distant
+row ranges, and it cannot be written to one contiguous destination. The
+assignment that works is `row = pair*rows_per_pair + tile*2*NROWS + core_j*NROWS`,
+which makes each pair's drain a contiguous global run. Fixing this alone took
+the error from 1.38e-01 to 4.05e-02 — a real improvement, and not enough.
+
+Consequently `DIM_ACCN` for the chunked `down_proj` must cover a **pair's** row
+span, not a core's: with the interleaved assignment a core's slots run to
+`2·p5_tiles·NROWS`, and the old `p5_tiles·NROWS` aliases them.
+
+### Not established — the numbers are wrong
+
+| | max err | mean\|ref\| | rel p50 | rel max |
+|---|---|---|---|---|
+| P4 SwiGLU out | 4.05e-02 | 0.01132 | **10.3%** | **51%** |
+| P5 x_out | 9.01e-02 | 0.04698 | 47.9% | — |
+
+The AIE2P `exp2` floor is 3.54% mean / 5.86% max, so **this is a bug, not the
+NLF**. The sorted multiset does not match either (3.03e-02), so it is not a pure
+ordering error; 5505 of 8192 rows are exactly right and the wrong ones are
+scattered rather than blocked.
+
+Two candidates, not yet separated:
+- the in-place RMSNorm prologue — this is the first harness to run
+  `flm_norm_prepare` against a broadcast fifo **shared across phases**, where
+  the object is acquired, normalised in place, released, and later refilled;
+- the gate/up in-core stash under a shared operand fifo, where P4's alternating
+  acquires now interleave with P5's stream on the same fifo.
+
+The isolation that separates them is to run P4 alone with `flm_asum_prepare`
+instead of `flm_norm_prepare` and compare against `ffn_alt.py`, which passes at
+3.40e-04 with the same kernels and a private fifo. That is the next step.
