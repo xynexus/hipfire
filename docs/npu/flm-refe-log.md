@@ -6842,9 +6842,15 @@ phase needs must fit the one shape the topology already has.
 
 ## 2026-07-31 — the P1+P2 two-phase topology places; the KV fill is what remains
 
-`tools/npu/flm/p1p2_chain.py`. The structural question — can one design run two
-phases on overlapping-but-different core sets, with the fifo budget the layer
-needs — is answered: **it places and compiles.**
+`tools/npu/flm/p1p2_chain.py`.
+
+> **RETRACTED the next day: it does not place at the full shape, and this entry
+> never demonstrated that it did.** `iron.jit` compiles **lazily, on first
+> call**, and the harness returned before calling `design(...)` — so nothing was
+> compiled and "places and compiles" was unearned. Measured properly: 1
+> attention pair routes and runs, **2 or 4 pairs fail with `Unable to find a
+> legal routing`**. See the entry below. The channel arithmetic in this entry is
+> still correct; what was wrong was claiming the compiler had accepted it.
 
 | | |
 |---|---|
@@ -6872,3 +6878,42 @@ drained; this adds a gather pattern to it.
 
 The harness builds the design and reports placement; it does not run P2 yet, and
 says so rather than reporting a number it has not earned.
+
+## 2026-07-31 — `iron.jit` is LAZY, and the two-phase design does not route at full width
+
+Two findings, the first of which invalidates yesterday's entry.
+
+### `iron.jit` compiles on first call, not at `build()`
+
+`p1p2_chain.py` printed "design placed and compiled" and returned **before
+calling the design**. Nothing had been compiled. Adding the call produced
+`Unable to find a legal routing` immediately.
+
+Every other harness in this tree calls its design, so this had never mattered —
+but a harness that builds and reports without invoking has verified **nothing**,
+and it reported success in a commit message. Yesterday's entry is retracted in
+place.
+
+### It routes at 1 attention pair, not at 2 or 4
+
+| attention pairs | result |
+|---|---|
+| 1 (NATT=2) | routes, runs end to end |
+| 2 (NATT=4) | **`Unable to find a legal routing`** |
+| 4 (NATT=8, the real shape) | **`Unable to find a legal routing`** |
+
+This is **not** a channel-count failure — 9 shim inputs and 10 outputs at NATT=4
+are inside both limits, and the per-core budget is 2 in / 2 out exactly. It is
+stream-switch congestion, a different failure from the
+`no ShimNOCTile has sufficient DMA capacity` the plan already records.
+
+**The fix is to delete P2's result fifo, not to shuffle placement.** It exists
+only because P1 emits `2*HEAD` bf16 objects and P2 emits `GQA*HEAD`, and a fifo
+has one object size. Make P1's object `GQA*HEAD` too and one fifo serves both.
+The k′ drain can still consume whole objects: with the pair form in the first
+half and zeros after, `sizes=[1,2,HEAD,2], strides=[0,2,TSEQ,1]` writes the real
+column pair and then dumps the zeros into the **next** column pair — future
+positions, where zero is exactly what the `npad` correction wants.
+
+At 1 pair the chain runs but does not verify (1.58e-01 against a 3.98e-03
+tolerance), so there is a numeric fault behind the routing one. Both are open.

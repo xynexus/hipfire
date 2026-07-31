@@ -74,7 +74,13 @@ def build(pos, nobj):
     BC = 2 * K_DIM + 2 * HEAD
     OBJ = 2 * HEAD                                  # P1 result object, bf16
     KTILE, VTILE = HEAD * TSEQ, TSEQ * HEAD
-    KVSTRIDE = KTILE + VTILE
+    # One slot per KV head, OPERAND bytes wide — not KVSTRIDE. P2's fill has
+    # to deliver whole operand objects, and the fifo side of a transfer is
+    # linear, so a tightly-packed cache would land head g+1's data at the
+    # wrong offset inside the pair object. The slack inside each slot is the
+    # same 4160 B attn_phase pads with, and must be zero for npad.
+    SLOT = OPERAND // 2                 # bf16 elements per head slot
+    KVSTRIDE = SLOT
     off = pos - (pos & 1)
 
     bc_ty = np.ndarray[(BC,), np.dtype[bfloat16]]
@@ -86,9 +92,9 @@ def build(pos, nobj):
     p2opair_ty = np.ndarray[(2 * GQA * HEAD,), np.dtype[bfloat16]]
     # P1's weights, then P2's q'+KV objects, on the same fifo
     w_all_ty = np.ndarray[(2 * HPC * TPH * wt,), np.dtype[np.uint8]]
-    kvin_ty = np.ndarray[(2 * (1 + nobj) * OPERAND,), np.dtype[np.uint8]]
+    kvin_ty = np.ndarray[(2 * OPERAND,), np.dtype[np.uint8]]   # q' only
     q_ty = np.ndarray[(4 * OBJ,), np.dtype[bfloat16]]
-    cache_ty = np.ndarray[(NATT * KVSTRIDE,), np.dtype[bfloat16]]
+    cache_ty = np.ndarray[(NATT * SLOT,), np.dtype[bfloat16]]
 
     flags = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_HEAD={HEAD}",
              f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS={NQ}", f"-DDIM_QKHEADS={NK}",
@@ -211,7 +217,12 @@ def _design(bc: In, {P}):
         # ---- P2 ----------------------------------------------------------
         tg = TaskGroup()
         for i in range(a):
+            # q' first (host-supplied), then the two cache slots this pair's
+            # cores need — read straight out of the buffer P1 just drained
+            # into, which is the ffn_chain pattern.
             wh[i].fill(kvb[i], group=tg)
+            wh[i].fill(cb[i], group=tg, offset=2 * i * {SLOT},
+                       sizes=[1, 1, 1, 2 * {SLOT}], strides=[0, 0, 0, 1])
         for i in range(a):
             p2h[i].drain(ab[i], wait=True, group=tg)
         tg.finish()
@@ -277,6 +288,7 @@ def main():
     inv = np.float32(1.0 / np.sqrt((xd * xd).mean() + EPS))
     xn = rnd(rnd(x * rnd(inv)) * nw)
 
+    bc_t = iron.tensor(bc.astype(bfloat16), dtype=bfloat16, device="npu")
     w_ts, ref = [], {}
     for pr in range(npairs):
         per = []
@@ -303,46 +315,65 @@ def main():
         b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
         w_ts.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
 
-    # prior cache contents for positions 0..pos-1, and the q'/KV operand stream
+    # prior cache: positions 0..pos-1, laid out in OPERAND-sized head slots
+    SLOT = KVSTRIDE
     Kc = rnd(rng.standard_normal((NATT, pos, HEAD)) * 0.3) if pos else \
         np.zeros((NATT, 0, HEAD), np.float32)
     Vc = rnd(rng.standard_normal((NATT, pos, HEAD)) * 0.3) if pos else \
         np.zeros((NATT, 0, HEAD), np.float32)
-    cache = np.zeros((NATT, KVSTRIDE), np.float32)
+    cache = np.zeros((NATT, SLOT), np.float32)
     for g in range(NATT):
         K = cache[g, :KTILE].reshape(HEAD, TSEQ)
-        V = cache[g, KTILE:].reshape(TSEQ, HEAD)
+        V = cache[g, KTILE:2 * KTILE].reshape(TSEQ, HEAD)
         if pos:
             K[:, :pos] = Kc[g].T
             V[:pos] = Vc[g]
     cache_t = iron.tensor(cache.reshape(-1).astype(bfloat16), dtype=bfloat16,
                           device="npu")
 
-    # P2's operand stream per pair: [q' object][KV objects]
-    kv_ts = []
+    # P2's q' object per pair — the rest of its operand stream is the cache
+    q_in = []
     for pr in range(apairs):
-        stream = np.zeros((1 + nobj, 2, OPERAND // 2), np.float32)
+        obj = np.zeros((2, SLOT), np.float32)
         for j in range(2):
-            a = 2 * pr + j                    # attention core == KV head
-            qh = np.zeros(OPERAND // 2, np.float32)
-            for s in range(GQA):
-                qh[s * OBJ:s * OBJ + HEAD] = ref[4 * a + s][:HEAD]
-            qh[GQA * OBJ:GQA * OBJ + 2] = np.array([float(npad)],
-                                                   np.float32).view(np.float32)
-            stream[0, j] = qh
-        kv_ts.append(stream)                 # KV objects filled after the run
-    q_ts = [iron.zeros(4 * OBJ, dtype=bfloat16, device="npu") for _ in range(npairs)]
+            a = 2 * pr + j                     # attention core == KV head
+            for sl in range(GQA):
+                obj[j, sl * OBJ:sl * OBJ + HEAD] = ref[GQA * a + sl][:HEAD]
+            obj[j, GQA * OBJ:GQA * OBJ + 2] = \
+                np.array([float(npad)], np.float32).view(np.float32)[0]
+        q_in.append(iron.tensor(obj.reshape(-1).astype(bfloat16).view(np.uint8),
+                                dtype=np.uint8, device="npu"))
 
+    q_ts = [iron.zeros(4 * OBJ, dtype=bfloat16, device="npu")
+            for _ in range(npairs)]
+    a_ts = [iron.zeros(2 * GQA * HEAD, dtype=bfloat16, device="npu")
+            for _ in range(apairs)]
+    design(bc_t, *w_ts, *q_in, *q_ts, *[cache_t] * npairs, *a_ts)
+
+    # ---- reference: attention over the cache INCLUDING P1's appended token --
     print(f"P1 -> P2 in one dispatch: seq {o.seq} (P1 appends at pos {pos}), "
           f"{nobj} KV objects, npad {npad}")
-    print(f"  design placed and compiled: {NCORES} cores, "
-          f"{NATT} running both phases")
-    print(f"  channels: 2 in/core (broadcast + operand), 2 out/core "
-          f"(P1 + P2 results), {npairs + apairs} of 16 shim outputs")
-    print("  NOT YET RUN: P2's KV operand must be FILLED from the cache BO that")
-    print("  P1 drains into — a strided gather, the mirror of the drain")
-    print("  patterns. That is the remaining piece.")
-    return 0
+    worst, scale = 0.0, 0.0
+    for a in range(NATT):
+        Kfull = np.zeros((o.seq, HEAD), np.float64)
+        Vfull = np.zeros((o.seq, HEAD), np.float64)
+        if pos:
+            Kfull[:pos], Vfull[:pos] = Kc[a], Vc[a]
+        Kfull[pos] = ref[NQ + a]              # k' P1 just wrote
+        Vfull[pos] = ref[NK + a]              # v' P1 just wrote
+        qr = np.stack([ref[GQA * a + sl] for sl in range(GQA)])
+        # q' already carries the 1/sqrt(d)*log2(e) scale from cs_q
+        sc = (qr @ Kfull.T) / math.log2(math.e)
+        e = np.exp(sc - sc.max(1, keepdims=True))
+        want = (e / e.sum(1, keepdims=True)) @ Vfull
+        got = a_ts[a // 2].numpy().astype(np.float64).reshape(2, GQA, HEAD)[a % 2]
+        worst = max(worst, np.abs(got - want).max())
+        scale = max(scale, np.abs(want).mean())
+    tol = 8e-2 * scale                        # AIE2P exp2 NLF floor
+    print(f"  attention out: max err {worst:.4e}   mean|ref| {scale:.5f}   "
+          f"tol {tol:.4e}")
+    print(f"  -> {'PASS' if worst <= tol else 'FAIL'}  (floor is the exp2 NLF)")
+    return 0 if worst <= tol else 1
 
 
 if __name__ == "__main__":
