@@ -3643,3 +3643,55 @@ with cores that acquire and release without reading. FLM's 46.2 GB/s is a real
 decode doing full arithmetic. These are not like-for-like: the probe shows the
 delivery path *can* exceed FLM's rate, not that a working kernel will. The honest
 claim is that dispatch structure has been removed as the bottleneck.
+
+---
+
+## 2026-07-31 — A mis-scoped tick, reversed; and where the AIE2P intrinsics live
+
+Set out to put the q4_1 dequant chain behind the streaming probe, to answer
+"can a core consume at 52 GB/s while paying the dequant cost?". Scaffolded a
+consuming kernel, then stopped and reverted it. Two reasons, both worth
+recording.
+
+### 1. The intrinsic names were guesses, and all of them were wrong
+
+Wrote `unpack_v32int4`, `ups_to_v64acc32`, `add_v64acc32`, `undef_v64acc32` from
+memory. Checking before wiring them in: **none exists** — and neither did
+`mac_8x8_8x8`, which `macbench.py` compiles successfully every run. That last
+one is the tell that the check was worth doing: a grep returning zero for a
+symbol known to work means the *grep* is wrong, not the symbol.
+
+`aie2pintrin.h` is a 2.6 KB umbrella header. The definitions are in
+`lib/clang/21/include/aie2p/`:
+
+| what | where | real names |
+|---|---|---|
+| MAC modes | `aie2p_vmult.h` | `mac_8x8_8x8`, `mac_4x16_16x16`, ... |
+| widen | `aie2p_*.h` | `ups(...)`, `ups_to_v16acc32`, `ups_to_v16acc64`, `ups_to_v16accfloat` |
+| unpack | | `unpack(...)` — generic, not per-type |
+| undef | | `undef_v16acc32`, `undef_v32acc32`, ... (per width) |
+
+Recorded because the next attempt at a hand-written AIE2P kernel will need this,
+and because "grep the umbrella header" silently returns nothing useful.
+
+### 2. The experiment was largely redundant, which I should have seen first
+
+The question "can a core keep up with the delivery rate while running the
+dequant chain?" is **already answered empirically — by FLM**. Its 16 GEMM cores
+run exactly this chain and sustain 46.2 GB/s, i.e. ~1.6 weight-bytes/cycle/core.
+And `macbench_hw.py` separately measured the streamed MAC modes (int8 157,
+int4 250 MACs/cycle). Building a second, weaker proof of a thing already
+demonstrated by the reference implementation is not where the risk is.
+
+**The actually-open phase-2 question is different**: not *whether* compute can
+keep up, but whether **our** kernel reaches FLM's per-core efficiency — FLM gets
+76% of its own static ceiling and is latency-bound on the dequant dependency
+chain. Answering that means writing the GEMM, which is a phase-2 workstream, not
+a tick.
+
+### State
+
+Phase 2 milestones 1-3 stand: dispatch structure is no longer the bottleneck
+(52.3 GB/s verified, 1.13x FLM). The next unit of work is a real GEMM kernel
+behind that delivery path, and it should be started deliberately rather than
+scaffolded in passing.
