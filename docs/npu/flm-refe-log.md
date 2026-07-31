@@ -10132,3 +10132,52 @@ re-proposed:
 
 **There is no attention bug.** The layer is correct at every depth measured:
 `x_out` exact at layers 0/7/15, attention at its representation floor.
+
+## 2026-08-01 — CORRECTION: the phases are chained in TIME, not in DATA
+
+I claimed above that "a whole decoder layer runs end to end" with "no host
+intervention at the seam". **That is wrong for three of the four seams**, and the
+claim is withdrawn.
+
+Reading the argument list settles it — every phase gets its OWN host-built
+broadcast:
+
+    design(bc_t, *w_ts, *q_in, ..., bc3_t, *w3, *h_ts, bc4_t, *w4, *sw_ts)
+
+  * `q_in`  is `qall`, built from the host's `ref[h]`   (p1p2_chain.py:641-646)
+  * `bc3_t` is `bc3[:K_DIM] = attn3`, the HOST attention output          (:690)
+  * `bc4_t` is `bc4[:K_DIM] = h_act = rnd(h_ref)`, the HOST h            (:732)
+
+So P1->P2, P2->P3 and P3->P4 each consume the host's reference activation, not
+the previous phase's device output. The device's own output at each boundary is
+drained and CHECKED, then discarded.
+
+What this does and does not invalidate:
+
+  * **Timing is unaffected.** The dispatch really does perform all five phases'
+    compute and DMA; which values a phase is fed does not change the work done.
+    55.7 tok/s stands.
+  * **Per-phase correctness stands**, and it is strong — each phase is verified
+    against a real-weight host reference.
+  * **Composition is NOT verified.** Exactly one seam is genuinely composed:
+    P4->P5, where `p5_pass.run(sw_all, ...)` takes side A's own device output.
+    That is the one that returned `x_out` exact.
+
+`flm_h_emit` was written precisely to make the P3->P4 composition possible (it
+gathers a core's `g_resid` slice into one dense object) but is not yet wired to
+it: its output goes to `h_ts` and is compared, while P4 reads `bc4_t`.
+
+**Task 7 is therefore not done.** The layer's phases are individually correct and
+the layer's cost is known; the layer as a composed computation is untested.
+
+### A second gap found in the same read: the post-attention norm is missing
+
+`p4_body` calls `flm_asum_prepare`, not `flm_norm_prepare`, and `p1p2_chain` only
+ever loads `input_layernorm.weight` (:564) — never `post_attention_layernorm`.
+The host reference makes the same omission (`h_act` is raw `h_ref`), so the check
+passes while both sides compute a layer that is missing one of its two RMSNorms.
+`ffn_chain.py:273` has the weight; the layer harness does not.
+
+Both are fixable and neither costs program memory: `flm_norm_prepare` is already
+linked for P1, and `bc4` is already sized `2*K_DIM + 2*HEAD` with the weight slot
+zeroed, so the norm weight needs no layout change.
