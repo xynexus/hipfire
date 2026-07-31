@@ -9335,3 +9335,48 @@ around them.** Every figure taken from it — the 99% five-phase estimate, the
 Ablation is the measurement that has not been wrong.
 
 `p1p2_chain` is restored and passing.
+
+### In-situ costs for every phase, and why the three-way partition does not work
+
+Ablating P1 as well as P4 gives the full set, measured rather than derived:
+
+    base (P3 + emit + asum + fixed scaffolding)   6560 B
+    P1                                            4128 B
+    P2                                            2992 B
+    P4                                            3984 B
+    P5                                           ~3984 B  (assumed = P4)
+
+| combination | size | |
+|---|---|---|
+| P1+P3+P4 | 14672 B | 90% fits (today) |
+| P3+P4+P5 | 14528 B | 89% fits |
+| P2+P3+P4 | 13536 B | 83% fits |
+| P1+P2+P3 | 13680 B | 83% fits |
+| **P2+P3+P4+P5** | 17520 B | **107%** short by 1136 B |
+| **P1+P3+P4+P5** | 18656 B | **114%** short by 2272 B |
+
+So P3+P4+P5 fits on a core, and P1 or P2 alongside does not. The obvious
+three-way split — P1/P2 on some cores, P3+P4+P5 on the rest — founders on a
+constraint I had not checked:
+
+    cores that tile D_FF evenly (8192 / (cores * NROWS) integer): 2, 4, 8, 16
+
+**12 is not among them.** `ffn_chain --cores 12` does not run at all. A
+three-way partition that leaves 12 cores for the FFN needs *uneven* tiling —
+some cores taking more rows than others — which the harness does not express and
+which no phase currently does.
+
+That leaves three routes, all costed:
+
+  * **uneven FFN tiling** so 12 cores works. A harness change, no measured price
+    yet, and the cheapest if the imbalance is small (12 cores at 85.33 tiles
+    means 4 cores take 86 and 8 take 85 — a 1% imbalance);
+  * **cut 1136 B** so the attention cores can carry P2+P3+P4+P5, leaving the
+    other 12 on P1+P3+P4+P5 — but that still needs 2272 B cut, so it is the
+    harder target, not the easier one;
+  * **two dispatches per layer**, attention then FFN. At ~87.6 µs of fixed cost
+    each and 16 layers, that is ~2.9 ms/token — 15.47 → 18.35 ms, **54.5 tok/s**,
+    which loses to FLM.
+
+Uneven tiling is the one worth trying: it is the only route that does not
+obviously cost the race.
