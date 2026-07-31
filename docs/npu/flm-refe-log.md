@@ -10318,3 +10318,25 @@ between builds; the honest reading is that composing seams is timing-neutral.
 
 **Seams composed: 3 of 4.** Only P2->P3 remains, and it is blocked on attention
 routing at full head coverage (NATT=8), not on plumbing.
+
+### Narrowing the NATT=8 routing wall: it is not attention, and not placement
+
+Two experiments, both negative, both worth not repeating:
+
+  * **Attention alone routes at full coverage.** `attn_phase.py --seq 31 --pos 30
+    --cores 8` is 8 cores x 1 KV group — all 8 KV groups, the whole model's
+    attention — and it builds and PASSES (3.3802e-03 vs a 3.8738e-03 tolerance).
+    So the constraint is not attention's own routing demand.
+  * **Placement is not the lever.** Moving the attention pairs from the last
+    `apairs` (`p >= npairs - apairs`) to the first (`p < apairs`) fails
+    identically. The router's objection does not depend on where attention sits.
+
+So the wall is the COMBINED design: attention at 8 groups alongside P1's, P3's
+and P4's fifos. The aiecc diagnostic dumps the whole `aie.device` op rather than
+naming the flow that failed, so pinning it further needs router-level tooling
+that is not set up here.
+
+That reframes the remaining seam honestly: P2->P3 is not blocked because
+attention cannot do 8 groups — it demonstrably can — but because this
+five-phases-on-16-cores decomposition cannot host it. Which makes it the same
+question the program-memory wall already poses, arriving from a second direction.
