@@ -4880,3 +4880,49 @@ geometry. Its intrinsic penalty is ~54 us per layer, ~0.9 ms per token, ~4%.
 
 This is the clearest statement yet of why FLM issues **2 commands per token**,
 and it puts a number on what the fused layer is worth before it is built.
+
+## 2026-07-31 — lm_head measured at 55.1 GB/s, and the "memtile split costs 12%" claim is WRONG
+
+The tok/s projection assumed lm_head at 48.6 GB/s — the only phase not measured.
+Measured now, and it is the largest single dispatch of real GEMV work done here:
+**164.2 MB in one command at 55.1 GB/s**, 1.19x FLM's decode rate and **98% of
+the 56.5 GB/s fabric roof**, correctness-checked at 4.99e-07.
+
+### The correction, and it retracts something in the kickoff
+
+Earlier I measured a no-op body at 38 MB, got **49.3 GB/s**, compared it against
+`dispatch_bw_probe`'s **56.2 GB/s** at 512 MB, and concluded "the memtile split
+costs ~12%, and recovering it is worth more than anything left in the body".
+That comparison was **apples to oranges** — the two numbers are at transfer sizes
+where the ~100 us fixed dispatch cost is a completely different share of the wall
+clock:
+
+| measurement | MB | GB/s | wall us | ~100 us fixed cost is |
+|---|---|---|---|---|
+| no-op body, 16 cores | 38.0 | 49.3 | 771 | **13.0%** |
+| **real GEMV, 16 cores** | **164.2** | **55.1** | 2980 | 3.4% |
+| dispatch_bw_probe, 8 direct streams | 512.0 | 56.3 | 9094 | 1.1% |
+
+A **real GEMV** at 164 MB reaches 55.1 against a **no-op** at 38 MB reaching
+49.3. The split is not costing 12% — at matched fixed-cost share it costs ~2%.
+**The memtile split is nearly free, and the "widen the dataflow" task in the
+phase-3 kickoff is largely chasing a measurement artefact.** Corrected there.
+
+The lesson is the one this project keeps relearning: **never compare two rates
+measured at different transfer sizes on a machine with a large fixed
+per-dispatch cost.** Normalise, or measure both at the same size.
+
+### The projection, updated
+
+| | ms/token | tok/s | vs FLM |
+|---|---|---|---|
+| lm_head assumed @ 48.6 | 20.59 | 48.6 | 0.81x |
+| **lm_head measured @ 55.1** | **20.19** | **49.5** | **0.83x** |
+| ceiling: whole token at 55.1 GB/s | 14.02 | **71.3** | **1.19x** |
+
+So the reproduction projects to **0.83x FLM as separate dispatches**, with a
+**1.19x ceiling** if the whole 772.3 MB streamed at the rate a large dispatch
+already demonstrates. Every bit of that 0.83 -> 1.19 gap is per-dispatch fixed
+cost, which is precisely what fusing to FLM's 2-commands-per-token removes —
+and lm_head, at 164 MB in one command, is the existence proof that the rate is
+reachable.
