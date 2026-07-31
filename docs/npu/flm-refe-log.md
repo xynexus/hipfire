@@ -9283,3 +9283,26 @@ That is much closer than a three-way partition implies. Before restructuring, it
 is worth spending a tick looking for 416 B — the `#pragma clang loop
 unroll(disable)` on `flm_h_emit` found 496 B on its own, and nothing else in the
 layer has been examined for unrolling.
+
+### Hunting the 416 B: four candidates ruled out, none found
+
+| candidate | result |
+|---|---|
+| unrolled copy loops elsewhere | **no** — `flm_p1_emit` and `flm_qkv_emit` are already vectorised at VLANES=32, so 2 iterations each |
+| kernels linked but unused | **no** — the P1 core ELF carries exactly what it calls, plus `flm_kv_pair` and `flm_q4_1_tile`, both genuinely used |
+| the shared tile body's row loop | **no** — `#pragma clang loop unroll(disable)` on it changed the image by **0 bytes**, so it was not being unrolled |
+| per-symbol attribution | **unavailable** — the core ELFs carry no size fields, so `nm --size-sort` returns buffer addresses rather than function sizes |
+
+The pragma is reverted rather than kept: it documents an intent the compiler was
+already honouring, and this tree does not need another comment describing
+something that is not happening.
+
+So the 3968 B the probe misses is **not** in the kernels — it is the design's own
+loop structure: per-phase acquire/release sequences, nested `range_` bodies, and
+the object handling around them. That is generated code, not something a pragma
+reaches.
+
+The way to attribute it is ablation — remove one phase from the chain and
+measure the delta in situ — which also gives the only per-phase numbers that
+have been right so far. Every estimate derived from the probe or from summing
+has been optimistic, twice by enough to change a decision.
