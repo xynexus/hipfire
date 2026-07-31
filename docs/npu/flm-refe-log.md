@@ -6917,3 +6917,33 @@ positions, where zero is exactly what the `npad` correction wants.
 
 At 1 pair the chain runs but does not verify (1.58e-01 against a 3.98e-03
 tolerance), so there is a numeric fault behind the routing one. Both are open.
+
+### P1 verifies inside the chain; P2 emits zeros
+
+Progress and three facts, none of which land the chain yet.
+
+**P1 is correct in the two-phase design** — k′ at one bf16 ulp, v′ exact,
+against both the appended column and the prior cache contents.
+
+**A single-dispatch test can only append at an EVEN position.** The k′ pair-write
+emits `(g_kprev, k_t)` at column `t-1` when `t` is odd, and `g_kprev` is empty on
+a design's first dispatch, so an odd append **zeroes the previous column**.
+`--seq 32` (append at 31) showed 8.9e-01 on K; `--seq 31` (append at 30) shows
+one ulp. That is a property of the scheme, not a defect: in real decode the
+previous token was processed by the same design and the carry is populated. Any
+test that appends at an odd position must run the prior token first.
+
+**`sizes`/`strides`/`offset` are counted in the BUFFER's element units**, not the
+fifo's. Rewriting the cache from bf16 to uint8 and doubling every offset and
+innermost run produced a byte-identical transfer and identical results, which is
+what pins it down.
+
+**`npad` must be written as an f32 bit pattern *after* the bf16 conversion.**
+Assigning the float value into a float32 host buffer and then converting the
+whole thing to bf16 destroys it, and the kernel reads a bf16-rounded count. A
+real bug, fixed — and not the cause of the failure below.
+
+**Open: P2 emits all zeros.** Its output buffer is untouched, so the 1.6e-01
+"error" is just the reference's magnitude. P1 runs, the cache is right, and the
+attention phase produces nothing — the same shape of failure as the earlier
+`kv_emit_verify` fault, which turned out to be an acquire ordering issue.

@@ -29,7 +29,17 @@ Four things the seam forced, each measured rather than assumed:
     256; one fifo cannot do both. A core has two output DMA channels and P1 uses
     one, so this is free — 12 of 16 shim outputs.
 
-    python3 p1p2_chain.py                 # S=32, one KV tile
+**STATUS: P1 verifies inside the chain; P2 emits zeros.** Run it with
+`NATT = 2` — at 2 or 4 attention pairs the design fails to route.
+
+**Append at an EVEN position only.** The k′ pair-write emits `(g_kprev, k_t)` at
+column `t-1` when `t` is odd, and `g_kprev` is empty on a design's first
+dispatch — so an odd append zeroes the previous column, which is correct only if
+the same design processed the previous token. `--seq 31` appends at 30 and the
+cache verifies (k′ one bf16 ulp, v′ exact); `--seq 32` appends at 31 and shows
+8.9e-01 on K, which is the test setup, not the kernel.
+
+    python3 p1p2_chain.py --seq 31        # even append position
     python3 p1p2_chain.py --seq 64
 
 Needs PYTHONPATH=<mlir-aie>/build/python plus the Peano/XRT env.
@@ -64,7 +74,7 @@ FIN_SRC = str(KDIR / "flm_attn_finish.cc")
 Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
 TSEQ, GQA, KVPER = 32, 4, 2
 OPERAND = 20544
-NATT = 8                       # attention cores = KV heads
+NATT = 2                       # attention cores = KV heads
 
 
 def build(pos, nobj):
@@ -94,7 +104,9 @@ def build(pos, nobj):
     w_all_ty = np.ndarray[(2 * HPC * TPH * wt,), np.dtype[np.uint8]]
     kvin_ty = np.ndarray[(2 * OPERAND,), np.dtype[np.uint8]]   # q' only
     q_ty = np.ndarray[(4 * OBJ,), np.dtype[bfloat16]]
-    cache_ty = np.ndarray[(NATT * SLOT,), np.dtype[bfloat16]]
+    # uint8, matching the operand fifo it feeds. A fill whose buffer and fifo
+    # disagree on element width counts its sizes in the wrong unit.
+    cache_ty = np.ndarray[(2 * NATT * SLOT,), np.dtype[np.uint8]]
 
     flags = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_HEAD={HEAD}",
              f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS={NQ}", f"-DDIM_QKHEADS={NK}",
@@ -203,15 +215,15 @@ def _design(bc: In, {P}):
                          sizes=[1, 1, 1, 4 * {OBJ}], strides=[0, 0, 0, 1])
             if i < n // 2:
                 p1h[i].drain(cb[i], wait=True, group=tg,
-                             offset=2 * i * {KVSTRIDE} + {off},
-                             sizes=[1, 2, {HEAD}, 2],
-                             strides=[0, {KVSTRIDE}, {TSEQ}, 1])
+                             offset=2 * (2 * i * {SLOT} + {off}),
+                             sizes=[1, 2, {HEAD}, 4],
+                             strides=[0, 2 * {SLOT}, 2 * {TSEQ}, 1])
             else:
                 p1h[i].drain(cb[i], wait=True, group=tg,
-                             offset=2 * (i - n // 2) * {KVSTRIDE} + {KTILE}
-                                    + {pos} * {HEAD},
-                             sizes=[1, 2, 1, {OBJ}],
-                             strides=[0, {KVSTRIDE}, 0, 1])
+                             offset=2 * (2 * (i - n // 2) * {SLOT} + {KTILE}
+                                         + {pos} * {HEAD}),
+                             sizes=[1, 2, 1, 2 * {OBJ}],
+                             strides=[0, 2 * {SLOT}, 0, 1])
         tg.finish()
 
         # ---- P2 ----------------------------------------------------------
@@ -221,8 +233,8 @@ def _design(bc: In, {P}):
             # cores need — read straight out of the buffer P1 just drained
             # into, which is the ffn_chain pattern.
             wh[i].fill(kvb[i], group=tg)
-            wh[i].fill(cb[i], group=tg, offset=2 * i * {SLOT},
-                       sizes=[1, 1, 1, 2 * {SLOT}], strides=[0, 0, 0, 1])
+            wh[i].fill(cb[i], group=tg, offset=2 * i * {OPERAND},
+                       sizes=[1, 1, 1, 2 * {OPERAND}], strides=[0, 0, 0, 1])
         for i in range(a):
             p2h[i].drain(ab[i], wait=True, group=tg)
         tg.finish()
@@ -328,8 +340,8 @@ def main():
         if pos:
             K[:, :pos] = Kc[g].T
             V[:pos] = Vc[g]
-    cache_t = iron.tensor(cache.reshape(-1).astype(bfloat16), dtype=bfloat16,
-                          device="npu")
+    cache_t = iron.tensor(cache.reshape(-1).astype(bfloat16).view(np.uint8),
+                          dtype=np.uint8, device="npu")
 
     # P2's q' object per pair — the rest of its operand stream is the cache
     q_in = []
@@ -339,9 +351,15 @@ def main():
             a = 2 * pr + j                     # attention core == KV head
             for sl in range(GQA):
                 obj[j, sl * OBJ:sl * OBJ + HEAD] = ref[GQA * a + sl][:HEAD]
-            obj[j, GQA * OBJ:GQA * OBJ + 2] = \
-                np.array([float(npad)], np.float32).view(np.float32)[0]
-        q_in.append(iron.tensor(obj.reshape(-1).astype(bfloat16).view(np.uint8),
+        # npad is an f32 BIT PATTERN occupying two bf16 slots, so it has to be
+        # written after the bf16 conversion. Assigning the float value into the
+        # float32 buffer and then converting destroys it — the kernel then reads
+        # a bf16-rounded npad and the softmax denominator is wrong.
+        raw = obj.astype(bfloat16).view(np.uint16).reshape(2, SLOT)
+        for j in range(2):
+            raw[j, GQA * OBJ:GQA * OBJ + 2] = \
+                np.array([float(npad)], np.float32).view(np.uint16)
+        q_in.append(iron.tensor(raw.reshape(-1).view(np.uint8),
                                 dtype=np.uint8, device="npu"))
 
     q_ts = [iron.zeros(4 * OBJ, dtype=bfloat16, device="npu")
@@ -349,6 +367,20 @@ def main():
     a_ts = [iron.zeros(2 * GQA * HEAD, dtype=bfloat16, device="npu")
             for _ in range(apairs)]
     design(bc_t, *w_ts, *q_in, *q_ts, *[cache_t] * npairs, *a_ts)
+
+    # first: did P1 write the cache correctly inside THIS harness?
+    cv = cache_t.numpy().view(bfloat16).astype(np.float64).reshape(NATT, SLOT)
+    ke = ve = 0.0
+    for g in range(NATT):
+        K = cv[g, :KTILE].reshape(HEAD, TSEQ)
+        V = cv[g, KTILE:2 * KTILE].reshape(TSEQ, HEAD)
+        ke = max(ke, np.abs(K[:, pos] - ref[NQ + g]).max())
+        ve = max(ve, np.abs(V[pos] - ref[NK + g]).max())
+        if pos:
+            ke = max(ke, np.abs(K[:, :pos] - Kc[g].T).max())
+            ve = max(ve, np.abs(V[:pos] - Vc[g]).max())
+    print(f"  P1 cache: k' col {pos} + prior cols max err {ke:.4e};  "
+          f"v' row {pos} + prior rows max err {ve:.4e}")
 
     # ---- reference: attention over the cache INCLUDING P1's appended token --
     print(f"P1 -> P2 in one dispatch: seq {o.seq} (P1 appends at pos {pos}), "
@@ -369,6 +401,19 @@ def main():
         got = a_ts[a // 2].numpy().astype(np.float64).reshape(2, GQA, HEAD)[a % 2]
         worst = max(worst, np.abs(got - want).max())
         scale = max(scale, np.abs(want).mean())
+        if a == 0:
+            print(f"  DIAG head0 got[0,:4] {got[0,:4].round(4)}")
+            print(f"  DIAG head0 want[0,:4] {want[0,:4].round(4)}")
+            # what would attention over ONLY the appended token give?
+            w1 = Vfull[pos]
+            print(f"  DIAG if it saw only pos {pos}: {w1[:4].round(4)}  "
+                  f"err {np.abs(got[0] - w1).max():.3e}")
+            # ... and over the prior cache only?
+            sc0 = (qr @ Kfull[:pos].T) / math.log2(math.e)
+            e0 = np.exp(sc0 - sc0.max(1, keepdims=True))
+            w0 = (e0 / e0.sum(1, keepdims=True)) @ Vfull[:pos]
+            print(f"  DIAG if it missed pos {pos}: err "
+                  f"{np.abs(got[0] - w0[0]).max():.3e}")
     tol = 8e-2 * scale                        # AIE2P exp2 NLF floor
     print(f"  attention out: max err {worst:.4e}   mean|ref| {scale:.5f}   "
           f"tol {tol:.4e}")
