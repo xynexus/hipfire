@@ -8849,3 +8849,28 @@ headroom", the first measurement was an overflow, and the fix brought it to 99%.
 The estimate was directionally right and still wrong about whether it fits, which
 is the third time in this investigation that a program-memory calculation has not
 survived contact with a build.
+
+### A second emit does not fit — so P4 must densify without a new kernel
+
+    P1+P3+P4+P5 + emit + asum        16240 B   99%   (144 B spare)
+    + a TRIVIAL second emit          16320 B  100%   (64 B spare)   fits
+    + an flm_h_emit-sized one       ~16736 B          OVERFLOWS by 352 B
+
+P4 has the same density problem P3 had — 512 values per core arriving as 32
+tiles of NROWS against a 128-element shared object — but **it cannot be solved
+the same way.** `flm_h_emit` costs 496 B because it gathers from a scattered
+`g_resid`; a P4 equivalent would push the P1 cores past 16 KB. Only a trivial
+copy (80 B, measured with `flm_qkv_emit` standing in) fits, and P4's case is not
+trivial.
+
+The cheap route is not a new kernel at all: **give
+`flm_gemv_up_swiglu` an offset.** It already writes `out[r]` for its NROWS rows;
+writing `out[slot + r]` with `slot` derived from the tile's `row_base` — exactly
+how `flm_h_emit` derives `j`, and how `flm_gemv_acc` derives its accumulator slot
+— lets the core acquire **one object per 8 tiles** and have the kernel fill it
+densely as it goes. No stash, no emit, no new entry point, and the change is an
+index expression in a kernel that is already linked in.
+
+That also avoids the +512 B of core *data* memory a P4 stash would need, which
+matters because the build has been warning "not all requested buffers fit in the
+available memory" since P3 went in.

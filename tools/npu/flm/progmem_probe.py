@@ -61,6 +61,7 @@ PHASES = {
     4: [("flm_gemv_gate", "flm_gemv_gate.cc", 2),
         ("flm_gemv_up_swiglu", "flm_gemv_up_swiglu.cc", 3)],
     6: [("flm_h_emit", "flm_h_emit.cc", 2)],
+    8: [("flm_qkv_emit", "flm_qkv_emit.cc", 1)],   # stands in for a P4 emit
     7: [("flm_asum_prepare", "flm_asum_prepare.cc", 1)],
     5: [("flm_gemv_acc", "flm_gemv_acc.cc", 2),
         ("flm_gemv_flush", "flm_gemv_flush.cc", 3)],
@@ -124,7 +125,7 @@ def _design(a: In, o: Out):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--phases", type=int, default=5, choices=[1, 2, 3, 4, 5, 6, 7])
+    p.add_argument("--phases", type=int, default=5, choices=[1, 2, 3, 4, 5, 6, 7, 8])
     p.add_argument("--only", help="comma-separated phase list, e.g. 1,3,4,5 for "
                                   "the cores that run no attention")
     o = p.parse_args()
