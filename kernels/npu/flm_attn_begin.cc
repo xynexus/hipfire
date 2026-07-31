@@ -27,6 +27,15 @@
 // exponential is the hardware `exp2` on an accumulator with no pre-multiply.
 //
 // Call order per token: begin() -> tile() per KV tile -> finish().
+//
+// **Operands arrive as `uint8`, not `bfloat16`, and are cast here.** The fused
+// layer has ONE operand fifo per pair carrying q4_1 weight tiles in P1/P3/P4/P5
+// and q'/KV in P2 — a core has two input DMA channels and the broadcast takes
+// one, so a second data fifo does not exist. A fifo has a single object type and
+// IRON requires the kernel's declared argument type to match it exactly:
+// `func.call op operand type mismatch: expected memref<128xbf16>, but provided
+// memref<256xui8>`. uint8 is the type the weight tiles need, so attention casts.
+//
 // Compile-time: -DDIM_GQA -DDIM_HEAD -DDIM_TSEQ.
 
 #include <aie_api/aie.hpp>
@@ -78,8 +87,8 @@ extern float g_acc[];
 // `q` is the core's [GQA][HEAD] query block. It is untouched here — the
 // parameter is kept because IRON binds each kernel to the fifo objects it is
 // called with, and this is the one that names the phase's Q buffer.
-extern "C" __attribute__((noinline)) void flm_attn_begin(bfloat16 *restrict q) {
-  (void)q;
+extern "C" __attribute__((noinline)) void flm_attn_begin(const uint8 *restrict q_raw) {
+  (void)q_raw;
   for (int h = 0; h < GQA; ++h) {
     g_m[h] = -3.0e38f;      // -inf; the first tile always wins the max
     g_l[h] = 0.0f;

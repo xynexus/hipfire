@@ -6806,3 +6806,36 @@ pairs draining into one BO is the `ffn_chain` pattern; passing the same tensor
 as all eight arguments works.
 
 Still exact after the change: q′ 9.5e-07, k′ one bf16 ulp, v′ 0.0.
+
+## 2026-07-31 — the operand fifo's element type is uint8, and attention now casts
+
+The last structural gap in the P1→P2 seam, and another thing §1.1 implies
+without stating.
+
+The fused layer has **one operand fifo per pair**, carrying q4_1 weight tiles in
+P1/P3/P4/P5 and q′/KV in P2 — a core has two input DMA channels and the
+broadcast takes one, so a second data fifo does not exist. Those payloads are
+naturally `uint8` and `bfloat16`. **A fifo has one object type, and IRON requires
+the kernel's declared argument type to match it exactly:**
+
+```
+func.call op operand type mismatch: expected 'memref<128xbf16>',
+                                    but provided 'memref<256xui8>'
+```
+
+measured directly rather than assumed. So the consumers must agree on a type,
+and it has to be `uint8` — that is what the weight tiles are, and six GEMV
+kernels plus `flm_q4_1_tile.h` would otherwise change against three attention
+kernels.
+
+`flm_attn_{decode,begin,finish}` now take `const uint8 *` and cast to `bfloat16`
+on entry, one line each. `attn_verify.py` and `attn_phase.py` follow, with their
+fifo element counts doubled and their host buffers `.view(np.uint8)`.
+
+Costs nothing — the cast is compile-time — and all three still verify:
+`attn_verify --seq 500` PASS, `--ignore-pad` **FAIL** (correct: the control must
+fail), `attn_phase --seq 480` PASS.
+
+That is the fourth constraint of the same family in as many days: **you cannot
+add an operand, and now you cannot even give it its own type.** Everything a
+phase needs must fit the one shape the topology already has.

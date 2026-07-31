@@ -64,11 +64,12 @@ rnd = lambda x: q4nx.bf16_to_f32(q4nx.f32_to_bf16(np.asarray(x, np.float32)))
 def build(ncores, nobj):
     npairs = ncores // 2
     # the operand object is the fused layer's, in bf16 elements
-    kv_ty = np.ndarray[(OPERAND // 2,), np.dtype[bfloat16]]
-    kvpair_ty = np.ndarray[(2 * (OPERAND // 2),), np.dtype[bfloat16]]
-    kv_all_ty = np.ndarray[(2 * nobj * (OPERAND // 2),), np.dtype[bfloat16]]
-    q_ty = np.ndarray[(GQA * HEAD + 2,), np.dtype[bfloat16]]     # + f32 npad
-    qpair_ty = np.ndarray[(2 * (GQA * HEAD + 2),), np.dtype[bfloat16]]
+    # uint8, to match the layer's single operand fifo — see attn_verify.py
+    kv_ty = np.ndarray[(OPERAND,), np.dtype[np.uint8]]
+    kvpair_ty = np.ndarray[(2 * OPERAND,), np.dtype[np.uint8]]
+    kv_all_ty = np.ndarray[(2 * nobj * OPERAND,), np.dtype[np.uint8]]
+    q_ty = np.ndarray[(2 * (GQA * HEAD + 2),), np.dtype[np.uint8]]  # +f32 npad
+    qpair_ty = np.ndarray[(2 * 2 * (GQA * HEAD + 2),), np.dtype[np.uint8]]
     o_ty = np.ndarray[(GQA * HEAD,), np.dtype[bfloat16]]
     opair_ty = np.ndarray[(2 * GQA * HEAD,), np.dtype[bfloat16]]
 
@@ -87,10 +88,10 @@ def _design({params}):
                           arg_types=[o_ty, q_ty], compile_flags=FLAGS)
 
     f_q = [ObjectFifo(qpair_ty, name=f"q{{i}}") for i in range({npairs})]
-    q_sub = [f.cons().split([0, {GQA * HEAD + 2}], obj_types=[q_ty, q_ty])
+    q_sub = [f.cons().split([0, {2 * (GQA * HEAD + 2)}], obj_types=[q_ty, q_ty])
              for f in f_q]
     f_kv = [ObjectFifo(kvpair_ty, name=f"kv{{i}}") for i in range({npairs})]
-    kv_sub = [f.cons().split([0, {OPERAND // 2}], obj_types=[kv_ty, kv_ty])
+    kv_sub = [f.cons().split([0, {OPERAND}], obj_types=[kv_ty, kv_ty])
               for f in f_kv]
     f_o = [ObjectFifo(opair_ty, name=f"o{{i}}") for i in range({npairs})]
     o_sub = [f.prod().join([0, {GQA * HEAD}], obj_types=[o_ty, o_ty])
@@ -185,7 +186,7 @@ def main():
         qp = np.concatenate([
             np.concatenate([qrot[2 * pr + j].reshape(-1).astype(bfloat16)
                             .view(np.uint16), npad_u16]) for j in range(2)])
-        q_ts.append(iron.tensor(qp.view(bfloat16), dtype=bfloat16, device="npu"))
+        q_ts.append(iron.tensor(qp.view(np.uint8), dtype=np.uint8, device="npu"))
         # one operand object per acquire: KVPER tiles then pad to 20544 B
         buf = np.zeros((2, nobj, OPERAND // 2), np.float32)
         for j in range(2):
@@ -200,8 +201,8 @@ def main():
         # interleave the pair's objects the way the memtile split consumes them
         inter = np.empty((nobj, 2, OPERAND // 2), np.float32)
         inter[:, 0], inter[:, 1] = buf[0], buf[1]
-        kv_ts.append(iron.tensor(inter.reshape(-1).astype(bfloat16),
-                                 dtype=bfloat16, device="npu"))
+        kv_ts.append(iron.tensor(inter.reshape(-1).astype(bfloat16).view(np.uint8),
+                                 dtype=np.uint8, device="npu"))
         o_ts.append(iron.zeros(2 * GQA * HEAD, dtype=bfloat16, device="npu"))
 
     if o.bench:

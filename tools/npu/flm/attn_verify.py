@@ -67,10 +67,12 @@ def attn(q: In, kv: In, out: Out, *, SEQ: CompileTime[int] = 512):
     # appended to the KV cache, and P1 is what writes the cache. `npad` is the
     # padded-position count the finish epilogue subtracts from the softmax
     # denominator; it is f32 because bf16 is exact on integers only to 256.
-    q_ty = np.ndarray[(GQA * HEAD + 2,), np.dtype[bfloat16]]
+    # uint8: one operand fifo carries weight tiles elsewhere in the layer, and
+    # IRON requires the kernel arg type to match the fifo object type exactly.
+    q_ty = np.ndarray[(2 * (GQA * HEAD + 2),), np.dtype[np.uint8]]
     # one tile of K (channel-major) immediately followed by one tile of V
-    kv_tile_ty = np.ndarray[(2 * TSEQ * HEAD,), np.dtype[bfloat16]]
-    kv_all_ty = np.ndarray[(ntiles * 2 * TSEQ * HEAD,), np.dtype[bfloat16]]
+    kv_tile_ty = np.ndarray[(2 * 2 * TSEQ * HEAD,), np.dtype[np.uint8]]
+    kv_all_ty = np.ndarray[(2 * ntiles * 2 * TSEQ * HEAD,), np.dtype[np.uint8]]
     o_ty = np.ndarray[(GQA * HEAD,), np.dtype[bfloat16]]
 
     flags = [f"-DDIM_GQA={GQA}", f"-DDIM_HEAD={HEAD}", f"-DDIM_TSEQ={TSEQ}"]
@@ -166,8 +168,9 @@ def main():
         buf[t, 1] = Vp[t * TSEQ:(t + 1) * TSEQ].reshape(-1)
     kv_flat = buf.reshape(-1)
 
-    q_t = iron.tensor(q_in.view(bfloat16), dtype=bfloat16, device="npu")
-    kv_t = iron.tensor(kv_flat.astype(bfloat16), dtype=bfloat16, device="npu")
+    q_t = iron.tensor(q_in.view(np.uint8), dtype=np.uint8, device="npu")
+    kv_t = iron.tensor(kv_flat.astype(bfloat16).view(np.uint8),
+                       dtype=np.uint8, device="npu")
     o_t = iron.zeros(GQA * HEAD, dtype=bfloat16, device="npu")
     attn(q_t, kv_t, o_t, SEQ=SEQ)
     got = o_t.numpy().astype(np.float64).reshape(GQA, HEAD)

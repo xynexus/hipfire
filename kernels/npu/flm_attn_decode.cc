@@ -27,6 +27,15 @@
 // exponential is the hardware `exp2` on an accumulator with no pre-multiply.
 //
 // Call order per token: begin() -> tile() per KV tile -> finish().
+//
+// **Operands arrive as `uint8`, not `bfloat16`, and are cast here.** The fused
+// layer has ONE operand fifo per pair carrying q4_1 weight tiles in P1/P3/P4/P5
+// and q'/KV in P2 — a core has two input DMA channels and the broadcast takes
+// one, so a second data fifo does not exist. A fifo has a single object type and
+// IRON requires the kernel's declared argument type to match it exactly:
+// `func.call op operand type mismatch: expected memref<128xbf16>, but provided
+// memref<256xui8>`. uint8 is the type the weight tiles need, so attention casts.
+//
 // Compile-time: -DDIM_GQA -DDIM_HEAD -DDIM_TSEQ.
 
 #include <aie_api/aie.hpp>
@@ -82,8 +91,11 @@ alignas(64) float g_l[GQA];                 // running denominator
 alignas(64) float g_acc[GQA * HEAD];        // running weighted sum of V
 
 extern "C" __attribute__((noinline)) void
-flm_attn_tile(const bfloat16 *restrict q,       // [GQA][HEAD], pre-scaled
-              const bfloat16 *restrict kvpack) {  // KVPER x [K][V], see below
+flm_attn_tile(const uint8 *restrict q_raw,      // [GQA][HEAD] bf16, pre-scaled
+              const uint8 *restrict kv_raw) {     // KVPER x [K][V] bf16
+  const auto *restrict q = reinterpret_cast<const bfloat16 *>(q_raw);
+  const auto *restrict kvpack =
+      reinterpret_cast<const bfloat16 *>(kv_raw);
   // The tile is one sequential read of the cache: K channel-major
   // [HEAD][TSEQ] followed by V position-major [TSEQ][HEAD]. Keeping them in a
   // single object means one DMA stream per core rather than two.
