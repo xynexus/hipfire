@@ -8343,3 +8343,30 @@ matters because every kernel change to date has grown these images.
 
 The design is now fully specified and every constraint on it is measured. What
 remains is building it.
+
+### Partition B's shape builds and routes; what is missing is head redistribution
+
+`CHAIN_P2_ONLY=1` at NATT=4 makes the attention cores skip P1 — exactly
+partition B's shape. It now **compiles, routes and runs**. It used to crash the
+compiler outright; the q′ fix removed that.
+
+It fails numerically (1.1880e-01), and the reason is not a defect:
+
+    heads_of(core) -> {core, core+16, core+32}
+
+P1's 48 head-tiles (32 q + 8 k + 8 v) are assigned by a **stride-16** rule that
+only works when 16 cores run P1. With the four attention cores sitting P1 out,
+their heads are simply never computed and their cache slots never appended, so
+attention reads a stale cache. The harness skips those drains too
+(`if SKIP_P1 and i >= n - a: continue`), which is consistent but leaves the work
+undone rather than moved.
+
+**Partition B needs the stride to become 12**: core `c` owns
+`{c, c+12, c+24, c+36}`, four head-tiles each, and 48/12 = 4 divides exactly. It
+is a change to `heads_of`, `HPC`, and the weight-stream layout that feeds it —
+contained, but it touches the assignment every P1 harness depends on, so it
+wants its own verification pass against `p1_route` before the layer harness uses
+it.
+
+That is the next build step, and it is now the *only* thing between the measured
+design and a running one.
