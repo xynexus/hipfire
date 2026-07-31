@@ -7582,3 +7582,48 @@ addresses are read, which costs the same.
 surviving constraint is unchanged and unrelated to unrolling: all five phases'
 kernels must coexist in 16 KB, which §1.5b already measures at 78% for one
 layer. Depth does not make that worse.
+
+## 2026-07-31 — the chain's two faults separated, and two corrections
+
+Returning to the P1→P2 seam with everything else measured and cleared.
+
+### The k' cache "failure" at seq 32 is a harness artifact
+
+| append pos | parity | k' cache error | attention error |
+|---|---|---|---|
+| 30 | **even** | 1.9531e-03 (one bf16 ulp — correct) | 1.0496e-01 |
+| 31 | **odd**  | 8.9453e-01 (broken)                  | 8.6509e-02 |
+
+`flm_kv_pair` writes column pairs: at even t it writes `(k'_t, 0)`, at odd t it
+writes `(k'_{t-1}, k'_t)` using `g_kprev` **carried from the previous dispatch**.
+A one-shot harness appending at an odd position has no previous dispatch, so
+`k'_{t-1}` is whatever the global held. The default `--seq 32` appends at pos 31
+— odd — and so was testing a configuration that cannot work in isolation.
+
+**Not a kernel bug.** At an even position the same path is correct to one ulp.
+
+### Two corrections to the record
+
+1. I recorded the cache handoff as "eliminated — bit-identical with a host-built
+   cache". It is **not bit-identical**: 8.7345e-02 host vs 8.6509e-02 device.
+   Small, but I reported it as exact and built on that.
+2. The device cache is not always correct, which that entry implied. It is
+   correct only at even append positions.
+
+### What survives, and it is the useful part
+
+At pos 30 the cache is correct to one bf16 ulp and **P2 still fails at
+1.0496e-01** against a 4.1764e-03 tolerance. The two faults are independent:
+
+  - the odd-position k' write needs a prior dispatch (expected, not a bug);
+  - P2 is wrong even when handed a correct cache **and** a host-built q'.
+
+Note the harness builds q' on the host from `ref`, not from P1 — so P2 fails
+with entirely host-supplied inputs. That rules the handoff out properly, which
+the earlier "bit-identical" claim only appeared to.
+
+Next: `attn_phase` pads its q object to a 64-byte multiple with an explicit note
+about corruption when it did not; the chain instead reuses the **broadcast**
+fifo, filling it once with the activation for P1 and again with q' for P2. A
+consumer reading the wrong fill would be invariant to core count, stride and
+sequence — which is exactly the observed signature.
