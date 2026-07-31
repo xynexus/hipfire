@@ -8002,9 +8002,8 @@ Budget at NATT=4, against 16 in / 16 out:
       shared 8 + f_p2 2                                  = 10   ok
 
 **Ten outputs is exactly what routes today** (p1p2_chain at NATT=4, P2 on the
-last pairs). So the full layer fits *if* P1's result object is padded to match
-P3/P5's — which is the "unify the result object size" idea again, now with a
-concrete purpose beyond reducing a count, and a concrete target to match.
+last pairs). So the full layer fits *if* P1 and P3/P5 share one output fifo.
+~~pad P1's result object to match P3/P5's~~ — **backwards, corrected below.**
 
 ### Order of work
 
@@ -8014,5 +8013,28 @@ concrete purpose beyond reducing a count, and a concrete target to match.
    uses twice, and `chain_probe.py` verified for inter-phase DDR);
 3. add P4+P5, which `resid_chain` shows need no new fifos beyond P3's.
 
-The risk sits entirely in step 1: padding P1's object doubles its drain volume,
-and P1's cache write uses strided drains whose offsets assume the current size.
+### Correction: P3/P5's objects grow, not P1's — and it is nearly free
+
+I wrote "pad P1's result object to match P3/P5's" without checking the sizes.
+They run the other way:
+
+    P1 per-core object     128 bf16 = 256 B
+    P3/P5 per-core object   16 bf16 =  32 B
+
+P1's object is **8x larger**, so it cannot be padded down to meet them. The
+sharing has to go the other way — grow P3/P5's output object to 256 B — and the
+first instinct against that is drain volume. But the numbers say otherwise:
+
+    P3/P5 outputs today   128 objects x  16 bf16 =  4.0 KB
+    grown to P1's size    128 objects x 128 bf16 = 32.0 KB
+    extra                                          28.0 KB  =  0.091% of the
+                                                   FFN half's 31.56 MB
+
+**0.09%.** These phases emit `h` and `x_out` — 2048 values each — against tens of
+megabytes of streamed weights, so their output volume is noise. Growing them is
+the cheap direction and padding P1 was never possible.
+
+The risk therefore sits in P1's cache write, whose strided drains assume the
+current object size, and in whether an 8x-larger object still satisfies whatever
+alignment rule made a 4100 B broadcast object fail where 4160 B worked — a rule
+this tree has recorded as *unknown*.
