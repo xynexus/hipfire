@@ -10415,3 +10415,47 @@ finished, and the module docstring still advertises `--seq 64` as a usage exampl
 **Scope, stated plainly: every layer and seam result in this log is for a single
 KV tile, seq <= 32.** The composed seams, the exact `x_out`, the 55.7 tok/s — all
 single-tile. Real decode runs to hundreds of positions.
+
+## 2026-08-01 — CORRECTION: the recent tok/s figures are compared against the wrong FLM baseline
+
+Every figure since the layer came together — 55.7, 55.1, "-5.4%", "-6.3%" — was
+measured with `p1p2_chain --seq 31 --bench` and compared against **FLM's
+641-token number, 58.83**. Those are not the same context.
+
+This log already established the correct pairing, several thousand lines above:
+
+    41-token context    61.18 tok/s
+   641-token context    58.83 tok/s
+
+and made the point explicitly — "the 59.86 I have been comparing against is a
+short-context figure ... that is not like for like". I then made the same class
+of mistake in the other direction, holding the long-context FLM number while
+measuring my own side at seq 31.
+
+Corrected:
+
+    mine @ seq 31   55.7 tok/s   vs FLM @ 41 tokens   61.18   **-9.0%**
+    mine @ seq 512  53.9 tok/s   vs FLM @ 641 tokens  58.83   -8.4%
+
+The two agree, which is the reassuring part: the deficit is **~8-9% at either
+context**, not the 5-6% I have been reporting. The older seq-512 row was computed
+with P2 measured at matched KV volume; the recent rows were not.
+
+**The gap is roughly twice what I have been saying.** Nothing about the
+engineering changed — the seams, the exactness, the layer are all as reported.
+Only the comparison was wrong, and it was wrong in the flattering direction.
+
+### And the design cannot reach long context anyway
+
+`off = pos - (pos & 1)` (p1p2_chain.py:148) is the KV append offset, and it
+carries no `pos // TSEQ` term — the device always appends into object 0. At
+pos=63 that writes column 62 of a 32-column K tile, spilling into V's region.
+`nobj > 1` exists, but the extra objects are padding that npad masks, exactly as
+the comment at :649 says: "object 0 holds the real KV, the rest are padding".
+
+So multi-tile KV is **unimplemented, not merely unverified**, and the module
+docstring's `--seq 64` example cannot work. The design supports at most TSEQ = 32
+positions of context. Real decode runs to hundreds.
+
+That makes the seq-512 row above a projection built from separately-measured
+parts, not something the chained design has ever run.
