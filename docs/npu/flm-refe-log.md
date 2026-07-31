@@ -7116,3 +7116,37 @@ P1 running before P2 in the same design — most likely that P2's KV comes from
 the cache P1 drained into, where `attn_phase` gets a host-supplied stream. The
 trailer offsets survive P1's drains (k′ writes below 2048, v′ below 4224, the
 trailer sits at 10240), so that is not it.
+
+### Two more hypotheses eliminated; the chain's P2 fault is still unlocated
+
+**Not the cache handoff.** `CHAIN_HOST_KV=1` makes P2 read a host-built cache
+with identical contents while P1 still runs and still drains. The error is
+**bit-identical** (1.0496e-01) either way, so P2 computes the same wrong answer
+whether or not it reads what P1 wrote.
+
+**Not the small-sequence shape.** `attn_phase.py` at the chain's own sequence
+lengths:
+
+| seq | max err | |
+|---|---|---|
+| 31 | 2.91e-03 | PASS |
+| 32 | 3.24e-03 | PASS |
+| 64 | 2.22e-03 | PASS |
+| 512 | 7.31e-04 | PASS |
+
+seq=31 is exactly the chain's configuration — one KV object, 33 of 64 positions
+padded — and it passes there. The chain is 25x worse at the same shape.
+
+Checked and consistent between the two: `DIM_QSTRIDE` against the q′ packing
+stride, `DIM_NPADOFF` against where npad is written, the broadcast object size
+(4224 bf16, a 64-byte multiple), the KV-head→core mapping, and the reference's
+scale handling.
+
+**Cost note.** This seam has taken many ticks. Each has eliminated something and
+several produced constraints that apply well beyond it — the held-object fifo
+rule, `iron.jit`'s laziness, buffer-element transfer units, the object-size
+alignment surprise. But P1→P2 itself is not converging quickly, and the FFN half
+(P4+P5, 29.2 of the layer's 38.0 MB) already chains and verifies. If the next
+one or two probes do not locate this, the better use of time is the 16-layer
+unroll on the working half — the measured projection says that is the lever
+worth 1.44 ms/token, and it does not depend on this seam.

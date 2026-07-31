@@ -94,6 +94,9 @@ def build(pos, nobj):
     off = pos - (pos & 1)
     import os as _osk
     SKIP_P1 = 1 if _osk.environ.get("CHAIN_P2_ONLY") else 0
+    # bisect: P2 reads a host-built cache instead of the one P1 drained into.
+    # P1 still runs. Separates "P2 after P1" from "P2 reading P1's output".
+    HOSTKV = 1 if _osk.environ.get("CHAIN_HOST_KV") else 0
 
     bc_ty = np.ndarray[(BC,), np.dtype[bfloat16]]
     op_ty = np.ndarray[(OPERAND,), np.dtype[np.uint8]]      # ONE operand type
@@ -117,6 +120,8 @@ def build(pos, nobj):
              f"-DDIM_NPADOFF={32 * OBJ}", "-DQOFF_FROM_KV=1"]
     P = ", ".join(f"w{i}: In" for i in range(npairs))
     P += ", " + ", ".join(f"kvin{i}: In" for i in range(apairs))
+    if HOSTKV:
+        P += ", " + ", ".join(f"hostkv{i}: In" for i in range(apairs))
     P += ", " + ", ".join(f"q{i}: Out" for i in range(npairs))
     P += ", " + ", ".join(f"cache{i}: Out" for i in range(npairs))
     P += ", " + ", ".join(f"attn{i}: Out" for i in range(apairs))
@@ -215,11 +220,12 @@ def _design(bc: In, {P}):
         n, a = {npairs}, {apairs}
         bcb = args[0]
         wb = [args[1 + i] for i in range(n)]
-        kvb = [args[1 + n + i] for i in range(a)]
-        qb = [args[1 + n + a + i] for i in range(n)]
-        cb = [args[1 + 2 * n + a + i] for i in range(n)]
-        ab = [args[1 + 3 * n + a + i] for i in range(a)]
-        base = 1 + 3 * n + 2 * a
+        kvb = [args[1 + n + i] for i in range(a + (a if {HOSTKV} else 0))]
+        ax = a + (a if {HOSTKV} else 0)
+        qb = [args[1 + n + ax + i] for i in range(n)]
+        cb = [args[1 + 2 * n + ax + i] for i in range(n)]
+        ab = [args[1 + 3 * n + ax + i] for i in range(a)]
+        base = 1 + 3 * n + ax + a
         bch = args[base]
         wh = [args[base + 1 + i] for i in range(n)]
         p1h = [args[base + 1 + n + i] for i in range(n)]
@@ -253,13 +259,15 @@ def _design(bc: In, {P}):
         tg = TaskGroup()
         bch.fill(kvb[0], group=tg)          # the broadcast now carries q'
         for i in range(a):
-            wh[i].fill(cb[i], group=tg, offset=2 * i * {OPERAND},
+            src = kvb[1 + i] if {HOSTKV} else cb[i]
+            wh[i].fill(src, group=tg, offset=2 * i * {OPERAND},
                        sizes=[1, 1, 1, 2 * {OPERAND}], strides=[0, 0, 0, 1])
         for i in range(a):
             p2h[i].drain(ab[i], wait=True, group=tg)
         tg.finish()
 
     at = [bc_ty] + [w_all_ty] * {npairs} + [kvin_ty] * {apairs}
+    at += [cache_ty] * ({apairs} if {HOSTKV} else 0)
     at += [q_ty] * {npairs} + [cache_ty] * {npairs} + [p2opair_ty] * {apairs}
     at += [f_bc.prod(tile=AnyShimTile)]
     at += [f.prod(tile=AnyShimTile) for f in f_w]
@@ -277,7 +285,8 @@ def _design(bc: In, {P}):
               op_ty=op_ty, oppair_ty=oppair_ty, p1o_ty=p1o_ty,
               p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty,
               w_all_ty=w_all_ty, kvin_ty=kvin_ty, q_ty=q_ty,
-              cache_ty=cache_ty, SKIP_P1=SKIP_P1, __name__="flm_p1p2")
+              cache_ty=cache_ty, SKIP_P1=SKIP_P1, HOSTKV=HOSTKV,
+              __name__="flm_p1p2")
     exec(src, ns)
     return iron.jit(ns["_design"],
                     source_files=[QKV_SRC, EMIT_SRC, NORM_SRC, ATT_SRC,
@@ -383,7 +392,26 @@ def main():
             for _ in range(npairs)]
     a_ts = [iron.zeros(2 * GQA * HEAD, dtype=bfloat16, device="npu")
             for _ in range(apairs)]
-    design(bc_t, *w_ts, *q_in, *q_ts, *[cache_t] * npairs, *a_ts)
+    import os as _oh
+    if _oh.environ.get("CHAIN_HOST_KV"):
+        # the same cache contents, built on the host: P1 still runs and still
+        # drains, but P2 reads this instead
+        hostc = cache.reshape(NATT, SLOT).copy()
+        for g in range(NATT):
+            K = hostc[g, :KTILE].reshape(HEAD, TSEQ)
+            V = hostc[g, KTILE:2 * KTILE].reshape(TSEQ, HEAD)
+            K[:, pos] = ref[NQ + g]
+            V[pos] = ref[NK + g]
+        hraw = hostc.astype(bfloat16).view(np.uint16)
+        for g in range(NATT):
+            hraw[g, (OPERAND - 64) // 2:(OPERAND - 64) // 2 + 2] = \
+                np.array([float(g * GQA * OBJ)], np.float32).view(np.uint16)
+        host_t = iron.tensor(hraw.reshape(-1).view(np.uint8), dtype=np.uint8,
+                             device="npu")
+        design(bc_t, *w_ts, *q_in, *[host_t] * apairs, *q_ts,
+               *[cache_t] * npairs, *a_ts)
+    else:
+        design(bc_t, *w_ts, *q_in, *q_ts, *[cache_t] * npairs, *a_ts)
 
     # first: did P1 write the cache correctly inside THIS harness?
     cv = cache_t.numpy().view(bfloat16).astype(np.float64).reshape(NATT, SLOT)
