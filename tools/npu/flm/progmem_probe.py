@@ -65,12 +65,14 @@ PHASES = {
 }
 
 
-def build(nphases):
+def build(nphases, sel=None):
     # One generous object type. IRON only checks that the memref shape matches
     # the fifo the object came from, so a single big uint8 object satisfies
     # every kernel's declared argument.
     big_ty = np.ndarray[(OPERAND,), np.dtype[np.uint8]]
-    want = [k for p in range(1, nphases + 1) for k in PHASES[p]]
+    tag = "".join(str(x) for x in (sel if sel else range(1, nphases + 1)))
+    picked = sel if sel else list(range(1, nphases + 1))
+    want = [k for p in picked for k in PHASES[p]]
     missing = [s for _, s, _ in want if not (KDIR / s).exists()]
     if missing:
         raise SystemExit(f"missing kernel sources: {missing}")
@@ -84,8 +86,8 @@ def build(nphases):
     src = f'''
 def _design(a: In, o: Out):
     {decls}
-    f_a = ObjectFifo(big_ty, depth=1, name="pm_in_{nphases}")
-    f_o = ObjectFifo(big_ty, depth=1, name="pm_out_{nphases}")
+    f_a = ObjectFifo(big_ty, depth=1, name="pm_in_{tag}")
+    f_o = ObjectFifo(big_ty, depth=1, name="pm_out_{tag}")
 
     def core(ac, op, {", ".join(f"k{i}" for i in range(len(want)))}):
         e = ac.acquire(1)
@@ -111,7 +113,7 @@ def _design(a: In, o: Out):
               Program=Program, Runtime=Runtime, TaskGroup=TaskGroup,
               Worker=Worker, AnyShimTile=AnyShimTile,
               ExternalFunction=ExternalFunction, FLAGS=FLAGS,
-              big_ty=big_ty, __name__=f"pm{nphases}")
+              big_ty=big_ty, __name__=f"pm{tag}")
     exec(src, ns)
     srcs = [str(KDIR / s) for _, s, _ in want]
     return iron.jit(ns["_design"], source_files=srcs, full_elf=True), len(want)
@@ -121,8 +123,11 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--phases", type=int, default=5, choices=[1, 2, 3, 4, 5])
+    p.add_argument("--only", help="comma-separated phase list, e.g. 1,3,4,5 for "
+                                  "the cores that run no attention")
     o = p.parse_args()
-    design, nk = build(o.phases)
+    sel = [int(x) for x in o.only.split(",")] if o.only else None
+    design, nk = build(o.phases, sel)
     a = iron.zeros(OPERAND, dtype=np.uint8, device="npu")
     b = iron.zeros(OPERAND, dtype=np.uint8, device="npu")
     try:
@@ -135,12 +140,12 @@ def main():
     for d in caches[:4]:
         elf = next(d.glob("elfs_main_core_*/*.elf"), None)
         if elf and (d / "aie.mlir").exists() and \
-                f"pm_in_{o.phases}" in (d / "aie.mlir").read_text():
+                f"pm_in_{''.join(str(x) for x in (sel or range(1, o.phases + 1)))}" in (d / "aie.mlir").read_text():
             out = subprocess.run(["size", "-A", str(elf)], capture_output=True,
                                  text=True).stdout
             text = next((int(l.split()[1]) for l in out.splitlines()
                          if l.startswith(".text")), None)
-            print(f"phases 1..{o.phases}: {nk} kernels  "
+            print(f"phases {sel or list(range(1, o.phases+1))}: {nk} kernels  "
                   f".text = {text} B = {100 * text / 16384:.0f}% of 16 KB  "
                   f"{'FITS' if text <= 16384 else 'OVERFLOWS'}")
             return 0 if text <= 16384 else 1

@@ -8181,3 +8181,35 @@ not been measured yet:
 
 The probe makes each of these a single command, which is the point of having
 built it.
+
+### A partition that fits — the single dispatch survives
+
+`--only` measures arbitrary phase subsets. Both halves of the obvious split fit:
+
+    P1+P2+P3+P4  (attention cores, no P5)   14976 B   91%   FITS
+    P1+P3+P4+P5  (all other cores)          15424 B   94%   FITS
+
+So **one dispatch per layer is still possible** — 4 attention cores run
+P1–P4 and skip P5; the other 12 run P1, P3, P4 and P5. Nothing needs a second
+dispatch, so the 1.18 ms/token the unroll buys is preserved. That is a much
+better outcome than the two-dispatch fallback the overflow first suggested.
+
+Derived marginals: P2 costs 4032 B, P5 4480 B. An attention core running
+everything would be 19456 B = 119%, needing a 3072 B cut — more than merging
+`flm_gemv_acc` and `flm_gemv_flush` is likely to give.
+
+**The cost is P5 losing 4 of 16 cores.** P5 is 33% of the FFN by bytes
+(10.52 of 31.56 MB) = 193.9 µs, so on 12 cores it is 258.5 µs, +64.6 µs/layer:
+
+    all 16 cores (does not fit)   token 15.49 ms -> 64.6 tok/s   +7.8%
+    P5 on 12 cores                token 16.52 ms -> 60.5 tok/s   +1.1%
+
+P5 was the right phase to displace: P4 is 67% of the FFN and would cost twice as
+much.
+
+**+1.1% is inside the measurement noise**, so this configuration is no longer a
+confident win over FLM — it is a coin flip. Recovering the margin means fitting
+P5 on the attention cores, i.e. finding 3072 B. Candidates, cheapest first:
+merging `acc`/`flush` (they differ only in the residual add), and the `noinline`
+treatment that took one image from 103% to 78% — it has only ever been applied to
+`flm_q4_1_tile`, not to the attention or FFN entry points.
