@@ -7022,3 +7022,31 @@ trailer** — the object is 20544 B and the KV tiles use 16384, so the same
 It also explains the chain's P2 zeros without further bisecting: that design has
 the same held-object structure, in a topology where it degrades to nothing
 instead of to wrong numbers.
+
+## 2026-07-31 — the broadcast-q′ mechanism is wired; it does not verify yet
+
+Implementing the resolution from the previous entry. q′ rides the broadcast,
+every core sees all 32 heads, and each finds its own 4 via an offset in the **KV
+operand object's 64-byte trailer** — the same convention `row_base` uses on a
+weight tile, and no new operand or channel.
+
+Kernel side, all three attention kernels building clean:
+
+- `flm_attn_decode` indexes `q + kv_qoff(kv)`.
+- `flm_attn_finish` reads `npad` at a **fixed** offset (`DIM_NPADOFF`), since it
+  is the same for every core and needs no per-core index.
+- `kv_qoff` is gated by `-DQOFF_FROM_KV`, **default off**. Without the gate,
+  every harness that gives each core its own packed q block reads a garbage
+  offset and indexes out of the block — `attn_verify.py` is exactly that shape.
+
+`attn_phase.py` rewired to the broadcast form **does not verify**: 8.14e-02
+against a 1.08e-03 tolerance. Marked in its docstring. The tree is otherwise
+green — `attn_verify --seq 500` PASS, `--ignore-pad` FAIL (correct), `p1_route`
+PASS — because the gate keeps the old path intact.
+
+Worth noting what the gate bought: the rewiring touched a harness that had been
+passing, and without a default-off flag the change would have taken
+`attn_verify` down with it. That is the second time this week a kernel change
+silently altered an interface (`flm_qkv_emit`'s object size was the first), and
+both were caught by running the *existing* harnesses rather than only the new
+one.

@@ -76,6 +76,40 @@ constexpr int HALF = HEAD / 2;      // head vectors run 32 lanes at a time
 constexpr int KVPER = DIM_KVPER;
 constexpr int KVSTRIDE = 2 * TSEQ * HEAD;   // bf16 elements in one [K][V] tile
 constexpr int QSTRIDE = DIM_QSTRIDE;        // elements between query heads
+} // namespace
+
+// The KV operand object's 64-byte trailer, the same convention `row_base` uses
+// on a weight tile. The object is DIM_KVOBJ bytes and the KV tiles occupy
+// 2*KVPER*TSEQ*HEAD of it, so the tail is free.
+//
+// It carries this core's offset into the SHARED q' block. q' cannot ride the
+// operand fifo — an object held across other acquire/release cycles on one fifo
+// does not stay valid (measured: tools/npu/flm/attn_phase one-fifo variant,
+// 2.93e-02 against a 1.08e-03 tolerance, unchanged at fifo depth 2/3/4) — so it
+// rides the broadcast, where every core sees all 32 heads and needs to be told
+// which 4 are its own.
+#ifndef DIM_KVOBJ
+#define DIM_KVOBJ 20544
+#endif
+#ifndef DIM_NPADOFF
+#define DIM_NPADOFF 4096        // bf16 elements: npad sits past all 32 heads
+#endif
+namespace {
+// Off by default: harnesses that give each core its own packed q block have no
+// trailer to read, and a garbage offset indexes out of the block.
+#ifndef QOFF_FROM_KV
+#define QOFF_FROM_KV 0
+#endif
+inline int kv_qoff(const uint8 *restrict kv) {
+#if QOFF_FROM_KV
+  return int(reinterpret_cast<const float *>(kv + DIM_KVOBJ - 64)[0]);
+#else
+  (void)kv;
+  return 0;
+#endif
+}
+} // namespace
+namespace {
 
 static_assert(TSEQ == 32, "score vectors are one 32-lane register");
 static_assert(HEAD % 32 == 0, "head_dim must be a multiple of 32");
@@ -93,7 +127,9 @@ alignas(64) float g_acc[GQA * HEAD];        // running weighted sum of V
 extern "C" __attribute__((noinline)) void
 flm_attn_tile(const uint8 *restrict q_raw,      // [GQA][HEAD] bf16, pre-scaled
               const uint8 *restrict kv_raw) {     // KVPER x [K][V] bf16
-  const auto *restrict q = reinterpret_cast<const bfloat16 *>(q_raw);
+  // q_raw is the shared broadcast block; the trailer says which slice.
+  const auto *restrict q =
+      reinterpret_cast<const bfloat16 *>(q_raw) + kv_qoff(kv_raw);
   const auto *restrict kvpack =
       reinterpret_cast<const bfloat16 *>(kv_raw);
   // The tile is one sequential read of the cache: K channel-major

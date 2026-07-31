@@ -53,6 +53,11 @@
 #ifndef DIM_QSTRIDE
 #define DIM_QSTRIDE DIM_HEAD
 #endif
+// npad sits at a FIXED offset in the shared q' block — it is the same for every
+// core, so unlike the query slice it needs no per-core index.
+#ifndef DIM_NPADOFF
+#define DIM_NPADOFF (DIM_GQA * DIM_QSTRIDE)
+#endif
 //
 // NOTE: one entry point per translation unit. IRON compiles each
 // ExternalFunction's source separately, so N entry points in one file are
@@ -97,7 +102,7 @@ flm_attn_finish(bfloat16 *restrict out,        // [GQA][HEAD]
                 const uint8 *restrict q_raw) {
   const float npad_f =
       *reinterpret_cast<const float *>(
-          reinterpret_cast<const bfloat16 *>(q_raw) + GQA * QSTRIDE);
+          reinterpret_cast<const bfloat16 *>(q_raw) + DIM_NPADOFF);
   for (int h = 0; h < GQA; ++h) {
     // No scalar libm on the core (`undefined symbol: exp2f`), so this goes
     // through the vector exp2 and extracts one lane — the same idiom the

@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Decode attention as phase P2 of the fused layer — 8 cores, one dispatch.
 
+**STATUS: the broadcast-q′ rewiring does not verify yet** — 8.14e-02 against a
+1.08e-03 tolerance. Before it, this harness gave each core its own packed q
+block on a split fifo and passed exactly; that shape is what `attn_verify.py`
+still exercises. The rewiring is here because q′ *cannot* ride the operand fifo
+(an object held across other traffic on one fifo does not stay valid) and each
+core must therefore find its own 4 heads inside a shared block, via the offset
+in the KV object's trailer. The kernel side is gated by `-DQOFF_FROM_KV` and
+defaults off, so nothing else is affected.
+
 `attn_verify.py` proves the attention arithmetic on ONE core. This runs it at
 the phase's real shape: **8 cores, one KV group each**, in the fused layer's
 paired topology (operand fifo per pair, split to two cores; result fifo per
@@ -68,14 +77,20 @@ def build(ncores, nobj):
     kv_ty = np.ndarray[(OPERAND,), np.dtype[np.uint8]]
     kvpair_ty = np.ndarray[(2 * OPERAND,), np.dtype[np.uint8]]
     kv_all_ty = np.ndarray[(2 * nobj * OPERAND,), np.dtype[np.uint8]]
-    q_ty = np.ndarray[(2 * (GQA * HEAD + 2),), np.dtype[np.uint8]]  # +f32 npad
-    qpair_ty = np.ndarray[(2 * 2 * (GQA * HEAD + 2),), np.dtype[np.uint8]]
+    # q' is BROADCAST: one object holding all 32 heads, every core sees it and
+    # takes its own 4 via the offset in the KV object's trailer. It cannot ride
+    # the operand fifo — an object held across other traffic on one fifo does
+    # not stay valid — and it fits the layer's broadcast object as-is.
+    QALL = 32 * HEAD                       # all query heads, packed here
+    q_ty = np.ndarray[(2 * (QALL + 2),), np.dtype[np.uint8]]
     o_ty = np.ndarray[(GQA * HEAD,), np.dtype[bfloat16]]
     opair_ty = np.ndarray[(2 * GQA * HEAD,), np.dtype[bfloat16]]
 
+    QALL = 32 * HEAD
     flags = [f"-DDIM_GQA={GQA}", f"-DDIM_HEAD={HEAD}", f"-DDIM_TSEQ={TSEQ}",
-             f"-DDIM_KVPER={KVPER}"]
-    params = ", ".join(f"q{i}: In" for i in range(npairs))
+             f"-DDIM_KVPER={KVPER}", f"-DDIM_KVOBJ={OPERAND}",
+             f"-DDIM_NPADOFF={QALL}", "-DQOFF_FROM_KV=1"]
+    params = "qbc: In"
     params += ", " + ", ".join(f"kv{i}: In" for i in range(npairs))
     params += ", " + ", ".join(f"o{i}: Out" for i in range(npairs))
     src = f'''
@@ -87,9 +102,8 @@ def _design({params}):
     kf = ExternalFunction("flm_attn_finish", source_file=FIN_SRC,
                           arg_types=[o_ty, q_ty], compile_flags=FLAGS)
 
-    f_q = [ObjectFifo(qpair_ty, name=f"q{{i}}") for i in range({npairs})]
-    q_sub = [f.cons().split([0, {2 * (GQA * HEAD + 2)}], obj_types=[q_ty, q_ty])
-             for f in f_q]
+    f_q = ObjectFifo(q_ty, depth=1, name="qbc")
+    q_cons = [f_q.cons() for _ in range({ncores})]
     f_kv = [ObjectFifo(kvpair_ty, name=f"kv{{i}}") for i in range({npairs})]
     kv_sub = [f.cons().split([0, {OPERAND}], obj_types=[kv_ty, kv_ty])
               for f in f_kv]
@@ -113,25 +127,24 @@ def _design({params}):
     for p in range({npairs}):
         for j in range(2):
             workers.append(Worker(core,
-                fn_args=[q_sub[p][j].cons(), kv_sub[p][j].cons(),
+                fn_args=[q_cons[2 * p + j], kv_sub[p][j].cons(),
                          o_sub[p][j].prod(), kb, kt, kf], stack_size=4096))
 
     def sequence(*args):
-        qb = [args[i] for i in range({npairs})]
-        kvb = [args[{npairs} + i] for i in range({npairs})]
-        ob = [args[2 * {npairs} + i] for i in range({npairs})]
-        qh = [args[3 * {npairs} + i] for i in range({npairs})]
-        kvh = [args[4 * {npairs} + i] for i in range({npairs})]
-        oh = [args[5 * {npairs} + i] for i in range({npairs})]
-        for i in range({npairs}):
-            qh[i].fill(qb[i])
+        qb = args[0]
+        kvb = [args[1 + i] for i in range({npairs})]
+        ob = [args[1 + {npairs} + i] for i in range({npairs})]
+        qh = args[1 + 2 * {npairs}]
+        kvh = [args[2 + 2 * {npairs} + i] for i in range({npairs})]
+        oh = [args[2 + 3 * {npairs} + i] for i in range({npairs})]
+        qh.fill(qb)
         for i in range({npairs}):
             kvh[i].fill(kvb[i])
         for i in range({npairs}):
             oh[i].drain(ob[i], wait=True)
 
-    arg_types = [qpair_ty] * {npairs} + [kv_all_ty] * {npairs} + [opair_ty] * {npairs}
-    arg_types += [f.prod(tile=AnyShimTile) for f in f_q]
+    arg_types = [q_ty] + [kv_all_ty] * {npairs} + [opair_ty] * {npairs}
+    arg_types += [f_q.prod(tile=AnyShimTile)]
     arg_types += [f.prod(tile=AnyShimTile) for f in f_kv]
     arg_types += [f.cons(tile=AnyShimTile) for f in f_o]
     rt = Runtime(sequence, arg_types)
@@ -141,7 +154,7 @@ def _design({params}):
               ObjectFifo=ObjectFifo, Program=Program, Runtime=Runtime,
               Worker=Worker, AnyShimTile=AnyShimTile, range_=range_,
               ExternalFunction=ExternalFunction, SRC=SRC, BEGIN_SRC=BEGIN_SRC,
-              FIN_SRC=FIN_SRC, FLAGS=flags, q_ty=q_ty, qpair_ty=qpair_ty,
+              FIN_SRC=FIN_SRC, FLAGS=flags, q_ty=q_ty,
               kv_ty=kv_ty, kvpair_ty=kvpair_ty, kv_all_ty=kv_all_ty,
               o_ty=o_ty, opair_ty=opair_ty, __name__="flm_attn_phase")
     exec(src, ns)
@@ -180,13 +193,18 @@ def main():
 
     design = build(ncores, nobj)
 
-    q_ts, kv_ts, o_ts = [], [], []
+    # ONE q' buffer for every core: 32 heads packed, then npad
+    QALL = 32 * HEAD
     npad_u16 = np.array([NPAD], np.float32).view(np.uint16)
+    qall = np.zeros(QALL + 2, np.uint16)
+    for a in range(ncores):
+        qall[a * GQA * HEAD:(a + 1) * GQA * HEAD] = \
+            qrot[a].reshape(-1).astype(bfloat16).view(np.uint16)
+    qall[QALL:QALL + 2] = npad_u16
+    q_t = iron.tensor(qall.view(np.uint8), dtype=np.uint8, device="npu")
+
+    kv_ts, o_ts = [], []
     for pr in range(npairs):
-        qp = np.concatenate([
-            np.concatenate([qrot[2 * pr + j].reshape(-1).astype(bfloat16)
-                            .view(np.uint16), npad_u16]) for j in range(2)])
-        q_ts.append(iron.tensor(qp.view(np.uint8), dtype=np.uint8, device="npu"))
         # one operand object per acquire: KVPER tiles then pad to 20544 B
         buf = np.zeros((2, nobj, OPERAND // 2), np.float32)
         for j in range(2):
@@ -201,15 +219,21 @@ def main():
         # interleave the pair's objects the way the memtile split consumes them
         inter = np.empty((nobj, 2, OPERAND // 2), np.float32)
         inter[:, 0], inter[:, 1] = buf[0], buf[1]
-        kv_ts.append(iron.tensor(inter.reshape(-1).astype(bfloat16).view(np.uint8),
+        raw = inter.reshape(nobj, 2, OPERAND // 2).astype(bfloat16).view(np.uint16)
+        for j in range(2):
+            # trailer: this core's offset into the shared q' block
+            off = np.array([float((2 * pr + j) * GQA * HEAD)], np.float32)
+            raw[:, j, (OPERAND - 64) // 2:(OPERAND - 64) // 2 + 2] = \
+                off.view(np.uint16)
+        kv_ts.append(iron.tensor(raw.reshape(-1).view(np.uint8),
                                  dtype=np.uint8, device="npu"))
         o_ts.append(iron.zeros(2 * GQA * HEAD, dtype=bfloat16, device="npu"))
 
     if o.bench:
-        bench = run_iters(design, *q_ts, *kv_ts, *o_ts, warmup=2, iters=10)
+        bench = run_iters(design, q_t, *kv_ts, *o_ts, warmup=2, iters=10)
         us = bench.npu.min_us if bench.npu else bench.e2e.min_us
     else:
-        design(*q_ts, *kv_ts, *o_ts)
+        design(q_t, *kv_ts, *o_ts)
         us = None
 
     kv_bytes = ncores * nobj * OPERAND
