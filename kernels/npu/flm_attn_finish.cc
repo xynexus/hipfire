@@ -41,6 +41,9 @@
 #ifndef DIM_TSEQ
 #define DIM_TSEQ 32
 #endif
+#ifndef DIM_QSTRIDE
+#define DIM_QSTRIDE DIM_HEAD
+#endif
 //
 // NOTE: one entry point per translation unit. IRON compiles each
 // ExternalFunction's source separately, so N entry points in one file are
@@ -52,6 +55,7 @@ constexpr int GQA = DIM_GQA;
 constexpr int HEAD = DIM_HEAD;
 constexpr int TSEQ = DIM_TSEQ;
 constexpr int HALF = HEAD / 2;
+constexpr int QSTRIDE = DIM_QSTRIDE;
 } // namespace
 
 extern float g_m[];
@@ -83,7 +87,7 @@ extern "C" __attribute__((noinline)) void
 flm_attn_finish(bfloat16 *restrict out,        // [GQA][HEAD]
                 const bfloat16 *restrict q) {
   const float npad_f =
-      *reinterpret_cast<const float *>(q + GQA * HEAD);
+      *reinterpret_cast<const float *>(q + GQA * QSTRIDE);
   for (int h = 0; h < GQA; ++h) {
     // No scalar libm on the core (`undefined symbol: exp2f`), so this goes
     // through the vector exp2 and extracts one lane — the same idiom the

@@ -6722,3 +6722,38 @@ the head index.
 **Gate each group against its own scale.** A single tolerance derived from the
 q′ heads under-measures k′ by the ratio of their magnitudes (0.057 vs 0.445),
 and reported FAIL on a k′ error that was exactly 2⁻⁹ — one bf16 ulp.
+
+## 2026-07-31 — attention gains a query stride, because P1's q′ lands strided
+
+A consequence of the linear-source drain semantics, worth its own note because
+it changes an interface rather than a number.
+
+P1's result-fifo object is `2*HEAD` for every head — only k′ needs the doubled
+form, but a fifo has one object size. A drain cannot skip source elements, so
+q′ arrives as 32 objects of 128 bf16 with the head in the first half. P2 wants
+`[GQA][HEAD]` packed.
+
+Rather than repack (a copy per token, per layer) or force the emit to a
+different shape, `flm_attn_decode.cc` takes `-DDIM_QSTRIDE`, defaulting to
+`DIM_HEAD`. **It is a one-line change**: `q[h * HEAD + d]` → `q[h * QSTRIDE + d]`
+is the *only* place the query block is indexed — everything else in the
+attention kernels is core-local state. `flm_attn_finish` follows it for the
+`npad` slot, which sits at the tail of the same buffer.
+
+Costs nothing at the default and builds at 128. Regression after the change:
+
+| | |
+|---|---|
+| `attn_verify --seq 500` | PASS |
+| `attn_verify --seq 500 --ignore-pad` | **FAIL** — correct; the control must fail |
+| `attn_phase --seq 480` | PASS |
+| `p1_route --pos 1` | PASS |
+
+The `--ignore-pad` row is the point of keeping that flag: a pad correction that
+did nothing would pass the ordinary rows just as happily.
+
+**Checked while here:** no other harness misuses `sizes`/`strides` as a *source*
+pattern. `ffn_chain`'s P4 scatter, `resid_chain`, `kv_append_probe`,
+`kv_emit_verify` and `qkv_route_probe` all use them as destination walks with a
+linear source, which is correct — and all of them verify, which is the
+independent check.

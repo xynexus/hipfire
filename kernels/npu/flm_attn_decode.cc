@@ -41,6 +41,14 @@
 #ifndef DIM_TSEQ
 #define DIM_TSEQ 32
 #endif
+// Elements between consecutive query heads. HEAD when the block is packed, which
+// is what the standalone harnesses use. Phase P1 emits every head as a 2*HEAD
+// object — only k' needs the doubled form, but the result-fifo object size is
+// fixed — and a drain cannot skip source elements, so P1's q' lands strided.
+// This is the one place q is indexed; everything else is core-local.
+#ifndef DIM_QSTRIDE
+#define DIM_QSTRIDE DIM_HEAD
+#endif
 // How many whole KV tiles one acquire delivers. 1 for the standalone harness,
 // where the fifo object is exactly a tile; >1 in the fused layer, where every
 // phase shares one 20544 B operand object and a lone 8192 B KV tile would waste
@@ -58,6 +66,7 @@ constexpr int TSEQ = DIM_TSEQ;
 constexpr int HALF = HEAD / 2;      // head vectors run 32 lanes at a time
 constexpr int KVPER = DIM_KVPER;
 constexpr int KVSTRIDE = 2 * TSEQ * HEAD;   // bf16 elements in one [K][V] tile
+constexpr int QSTRIDE = DIM_QSTRIDE;        // elements between query heads
 
 static_assert(TSEQ == 32, "score vectors are one 32-lane register");
 static_assert(HEAD % 32 == 0, "head_dim must be a multiple of 32");
@@ -92,7 +101,7 @@ flm_attn_tile(const bfloat16 *restrict q,       // [GQA][HEAD], pre-scaled
     s.from_vector(aie::zeros<float, TSEQ>());
     for (int d = 0; d < HEAD; ++d)
       s = aie::mac(s, aie::load_v<TSEQ>(kt + d * TSEQ),
-                   aie::broadcast<bfloat16, TSEQ>(q[h * HEAD + d]));
+                   aie::broadcast<bfloat16, TSEQ>(q[h * QSTRIDE + d]));
 
     const auto sv = s.template to_vector<float>();
 
