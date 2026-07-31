@@ -7863,3 +7863,40 @@ works at `--kvobj 1` and **times out above that** — the sequence fills one
 pair-object while the core loops `range_(nobj-1)` for more, so the fill and the
 cache sizing both need extending before the interesting measurement is possible.
 Left as a known-incomplete flag rather than a silent trap.
+
+### Multi-object KV: plumbing done, but padding cannot stand in for data
+
+Extending `--kvobj` past 1 (so the seam can be measured with P2 at more than 7.6%
+of the bytes) needed three fixes, all now in:
+
+  * the cache carries `nobj` objects — `[obj][head][OPERAND]` — and the qoff
+    trailer must be written into **every** object, not just the first;
+  * **one fill per KV object**, not one strided fill. A single strided fill is
+    rejected: the `2*OPERAND` run decomposes into 6 x 3424, which exhausts the
+    BD's dimensions and pushes the object stride into the repeat-count slot —
+    *"Do not include the highest dimension size in transfer length, as this is
+    the BD repeat count."* A new DMA constraint for the trap list;
+  * the cache verification reshape follows the new layout.
+
+With those, `--kvobj 2/4` **run** — and are **wrong**: 1.5855e-02 against a
+3.9e-03 tolerance, *identical* at 2 and 4.
+
+The reason is a real kernel contract, not a bug. `npad` describes padding in the
+**last tile pair only** (`flm_attn_finish.cc`). Padding whole extra objects
+overruns it:
+
+    kvobj=1: npad  33 <= 64  ok
+    kvobj=2: npad  97  > 64  exceeds what npad can express
+    kvobj=4: npad 225  > 64  exceeds
+    kvobj=8: npad 481  > 64  exceeds
+
+The correction saturates rather than accumulating, which is why 2 and 4 give the
+same error. `--kvobj` now **refuses** that range with the explanation instead of
+reporting a wrong PASS.
+
+So the interesting measurement still is not available: it needs *real* KV in the
+extra objects — multi-tile cache verification — not padding. The plumbing for it
+is now in place, which is most of the work; what remains is generating and
+checking KV content across tiles.
+
+`--kvobj 1` and the default path both still PASS, so nothing regressed.

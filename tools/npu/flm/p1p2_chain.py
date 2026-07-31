@@ -129,7 +129,7 @@ def build(pos, nobj):
     q_ty = np.ndarray[(4 * OBJ,), np.dtype[bfloat16]]
     # uint8, matching the operand fifo it feeds. A fill whose buffer and fifo
     # disagree on element width counts its sizes in the wrong unit.
-    cache_ty = np.ndarray[(2 * NATT * SLOT,), np.dtype[np.uint8]]
+    cache_ty = np.ndarray[(nobj * 2 * NATT * SLOT,), np.dtype[np.uint8]]
 
     flags = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_HEAD={HEAD}",
              f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS={NQ}", f"-DDIM_QKHEADS={NK}",
@@ -289,7 +289,13 @@ def _design(bc: In, {P}):
         bch.fill(kvb[0], group=tg)          # the broadcast now carries q'
         for i in range(a):
             src = kvb[1 + i] if {HOSTKV} else cb[i]
-            wh[n - a + i].fill(src, group=tg, offset=2 * i * {OPERAND},
+            # One fill per KV object. A single strided fill cannot express this:
+            # the 2*OPERAND run decomposes into 6 x 3424, which uses up the BD's
+            # dimensions and pushes the object stride into the repeat-count slot
+            # ("Do not include the highest dimension size in transfer length").
+            for _j in range({nobj}):
+                wh[n - a + i].fill(src, group=tg,
+                       offset=2 * i * {OPERAND} + _j * {NATT} * {OPERAND},
                        sizes=[1, 1, 1, 2 * {OPERAND}], strides=[0, 0, 0, 1])
         for i in range(a):
             p2h[i].drain(ab[i], wait=True, group=tg)
@@ -348,6 +354,18 @@ def main():
         if o.kvobj < nobj:
             raise SystemExit(f"--kvobj {o.kvobj} < the {nobj} needed for seq {o.seq}")
         nobj = o.kvobj
+        # npad describes padding in the LAST tile pair only (see
+        # flm_attn_finish.cc). Padding whole extra objects overruns that and the
+        # result is silently wrong -- 1.5855e-02 against a 3.9e-03 tolerance,
+        # identical at kvobj 2 and 4 because the correction saturates rather
+        # than accumulating. Refuse instead of reporting a wrong PASS.
+        if nobj * KVPER * TSEQ - o.seq > KVPER * TSEQ:
+            raise SystemExit(
+                f"--kvobj {nobj} needs npad {nobj * KVPER * TSEQ - o.seq}, but "
+                f"npad covers at most one tile pair ({KVPER * TSEQ}).\n"
+                f"Measuring the seam at decode-scale KV needs REAL data in the "
+                f"extra objects, not padding -- i.e. multi-tile cache "
+                f"verification, not this flag.")
     npad = nobj * KVPER * TSEQ - o.seq
     npairs, apairs = NCORES // 2, NATT // 2
 
@@ -407,17 +425,20 @@ def main():
         np.zeros((NATT, 0, HEAD), np.float32)
     Vc = rnd(rng.standard_normal((NATT, pos, HEAD)) * 0.3) if pos else \
         np.zeros((NATT, 0, HEAD), np.float32)
-    cache = np.zeros((NATT, SLOT), np.float32)
+    # [obj][head][SLOT]: object 0 holds the real KV, the rest are padding that
+    # npad masks. P1 still appends into object 0, so verification is unchanged.
+    cache = np.zeros((nobj, NATT, SLOT), np.float32)
     for g in range(NATT):
-        K = cache[g, :KTILE].reshape(HEAD, TSEQ)
-        V = cache[g, KTILE:2 * KTILE].reshape(TSEQ, HEAD)
+        K = cache[0, g, :KTILE].reshape(HEAD, TSEQ)
+        V = cache[0, g, KTILE:2 * KTILE].reshape(TSEQ, HEAD)
         if pos:
             K[:, :pos] = Kc[g].T
             V[:pos] = Vc[g]
-    craw = cache.reshape(NATT, SLOT).astype(bfloat16).view(np.uint16)
+    craw = cache.reshape(nobj * NATT, SLOT).astype(bfloat16).view(np.uint16)
     for g in range(NATT):
         # trailer: this core's offset into the shared q' block
-        craw[g, (OPERAND - 64) // 2:(OPERAND - 64) // 2 + 2] = \
+        for _o in range(nobj):
+            craw[_o * NATT + g, (OPERAND - 64) // 2:(OPERAND - 64) // 2 + 2] = \
             np.array([float(g * GQA * OBJ)], np.float32).view(np.uint16)
     cache_t = iron.tensor(craw.reshape(-1).view(np.uint8),
                           dtype=np.uint8, device="npu")
@@ -467,11 +488,13 @@ def main():
             _us = None
 
     # first: did P1 write the cache correctly inside THIS harness?
-    cv = cache_t.numpy().view(bfloat16).astype(np.float64).reshape(NATT, SLOT)
+    # object 0 carries the real KV; P1 appends there and the rest is padding
+    cv = (cache_t.numpy().view(bfloat16).astype(np.float64)
+          .reshape(nobj, NATT, SLOT))
     ke = ve = 0.0
     for g in range(NATT):
-        K = cv[g, :KTILE].reshape(HEAD, TSEQ)
-        V = cv[g, KTILE:2 * KTILE].reshape(TSEQ, HEAD)
+        K = cv[0, g, :KTILE].reshape(HEAD, TSEQ)
+        V = cv[0, g, KTILE:2 * KTILE].reshape(TSEQ, HEAD)
         ke = max(ke, np.abs(K[:, pos] - ref[NQ + g]).max())
         ve = max(ve, np.abs(V[pos] - ref[NK + g]).max())
         if pos:
