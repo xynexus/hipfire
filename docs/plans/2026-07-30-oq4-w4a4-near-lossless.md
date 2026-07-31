@@ -847,6 +847,22 @@ a clip-throughput bench (expected neutral), and the daemon serving-routing quest
 whether the hybrid actually reaches this batched path vs per-token W4A16). But the *quality*
 verdict is settled: **int4-act + clip ships.**
 
+**≥16-chunk confirmation (2026-07-31, 16 independent ctx=512 windows, 8048 pos):**
+
+| variant (vs A16) | KLD/tok | PPL | per-chunk KLD min/max |
+|---|---|---|---|
+| current mix (qkv-A8 + rest-A4) | 0.0667 | 24.15 | 0.054 / 0.084 |
+| **full W4A4 + clip** | **0.0625** | **23.63** | 0.052 / 0.082 |
+| full W4A4 plain | 0.0731 | 24.43 | 0.060 / 0.089 |
+
+**W4A4+clip beats the current shipped mix on BOTH KLD (0.0625<0.0667) and PPL
+(23.63<24.15), and per-chunk clip ≤ mix across the whole min/max spread** — the ship claim
+holds at house-rule scale, not just as an aggregate. (Absolute KLD is higher than the single
+ctx=2048 window's 0.0585 because these 16 windows span harder/more-varied corpus text — PPL
+23 vs 10.7; the clip<mix<plain *ordering* is the robust, corpus-independent result.) `perplexity_batched`
+now takes `--chunks N` (fresh KV+DeltaNet per chunk, matching the daemon). Confirmation
+item 1/4 DONE; remaining: coherence-gate, clip-throughput bench, 9B.
+
 **A4 decision:** int4-act buys ~1.5× prefill throughput (§9) at ~0.067 KLD / +0.79 PPL.
 That is a genuine **throughput-vs-quality tradeoff**, NOT free — so promoting qwen3.5
 qkv/gate_up to W4A4-by-default is **not justified on quality alone**; it needs Stream B to
