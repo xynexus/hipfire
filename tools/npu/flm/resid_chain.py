@@ -33,7 +33,6 @@ Needs PYTHONPATH=<mlir-aie>/build/python plus the Peano/XRT env.
 """
 
 import argparse
-import shutil
 import sys
 from pathlib import Path
 
@@ -84,21 +83,29 @@ def build(ncores, from_stash):
     bc_all_ty = np.ndarray[((1 + NCHUNK) * 2 * K_DIM,), np.dtype[bfloat16]]
 
     flags = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_ACCN={accn}",
-             f"-DDIM_RESN={resn}", f"-DRESID_FROM_STASH={1 if from_stash else 0}"]
+             f"-DDIM_RESN={resn}"]
     params = ", ".join(f"w3_{i}: In" for i in range(npairs))
     params += ", " + ", ".join(f"w5_{i}: In" for i in range(npairs))
     params += ", " + ", ".join(f"o3_{i}: Out" for i in range(npairs))
     params += ", " + ", ".join(f"o5_{i}: Out" for i in range(npairs))
+    rfs = 1 if from_stash else 0
     src = f'''
 def _design(bc: In, {params}):
+    # -DRESID_FROM_STASH is appended HERE, inside the generated design source,
+    # not in the flags list built outside it. iron.jit keys its cache on the
+    # design's code object, so a value that only ever reaches it through a
+    # runtime-constructed list is invisible: two variants collide and the second
+    # silently runs the first's kernels. Interpolating it into the source is
+    # what makes the key differ. See the tools README.
+    KFLAGS = FLAGS + ["-DRESID_FROM_STASH={rfs}"]
     kres = ExternalFunction("flm_gemv_q4_1_residual", source_file=RES_SRC,
-                            arg_types=[bc_ty, wt_ty, ob_ty], compile_flags=FLAGS)
+                            arg_types=[bc_ty, wt_ty, ob_ty], compile_flags=KFLAGS)
     kacc = ExternalFunction("flm_gemv_acc", source_file=ACC_SRC,
-                            arg_types=[bc_ty, wt_ty], compile_flags=FLAGS)
+                            arg_types=[bc_ty, wt_ty], compile_flags=KFLAGS)
     kfl = ExternalFunction("flm_gemv_flush", source_file=FLUSH_SRC,
-                           arg_types=[bc_ty, wt_ty, ob_ty], compile_flags=FLAGS)
+                           arg_types=[bc_ty, wt_ty, ob_ty], compile_flags=KFLAGS)
     kas = ExternalFunction("flm_asum_prepare", source_file=ASUM_SRC,
-                           arg_types=[bc_ty], compile_flags=FLAGS)
+                           arg_types=[bc_ty], compile_flags=KFLAGS)
 
     f_bc = ObjectFifo(bc_ty, depth=1, name="bc")
     bc_cons = [f_bc.cons() for _ in range({ncores})]
@@ -209,23 +216,9 @@ def main():
     p.add_argument("--aux-residual", action="store_true",
                    help="control: -DRESID_FROM_STASH=0, residual via the "
                         "broadcast aux half. Must pass and agree.")
-    p.add_argument("--keep-cache", action="store_true",
-                   help="skip the cache clear below. Only safe if the previous "
-                        "run used the same residual path.")
     o = p.parse_args()
     ncores, npairs = o.cores, o.cores // 2
     from_stash = not o.aux_residual
-
-    # **iron.jit does not hash `compile_flags`.** The two residual paths differ
-    # ONLY by -DRESID_FROM_STASH, with byte-identical sources, so the second run
-    # silently reuses the first run's kernel objects and reports the first
-    # path's behaviour under the second path's name. That produced a confident
-    # wrong diagnosis once already (docs/npu/flm-refe-log.md, 2026-07-31) — the
-    # stash looked like it read zeros when in fact the flush had been compiled
-    # for the aux path. Clearing is cheap next to being wrong.
-    cache = Path.home() / ".npu" / "cache"
-    if not o.keep_cache and cache.is_dir():
-        shutil.rmtree(cache, ignore_errors=True)
 
     c = q4nx.Q4nx(str(Q4NX))
     pre = f"model.layers.{o.layer}."

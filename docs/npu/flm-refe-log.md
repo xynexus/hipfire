@@ -6209,10 +6209,28 @@ Exact, once the reference rounds to bf16 at both points the device does — the
 > reference has to model whichever path is under test, which is why this only
 > reached 0.0 once that was separated.
 >
-> `resid_chain.py` now clears `~/.npu/cache` itself unless `--keep-cache` is
-> passed. This is the **fourth** instance of this trap family and the worst:
-> the source-file case at least leaves stale-looking code, whereas here the flag
-> is right there in the file being read.
+> **The rule, measured rather than guessed.** `iron.jit` keys on the design's
+> **code object**, so what matters is not that the switch is a `compile_flag`
+> but that it never appears in the design's *source text*. Two harnesses, both
+> building their design by `exec`-ing an f-string:
+>
+> | how the switch reaches the kernel | cache entries for 2 variants |
+> |---|---|
+> | interpolated into the design source (`ffn_chain.py --host-norm`) | **2 — rebuilds** |
+> | only in a flags list built outside it (`resid_chain.py`, before) | **1 — collides** |
+>
+> That also retroactively validates the `--host-norm` A/B used during the SwiGLU
+> hunt, which had looked suspect for the same reason — it was rebuilding.
+>
+> Fixed by interpolating the value into the generated source rather than by
+> clearing the cache: `resid_chain.py` now produces 2 cache entries and both
+> paths pass exactly, back to back, with no workaround. (Watch the shadowing:
+> `FLAGS = FLAGS + [...]` inside the design makes it local and raises
+> `UnboundLocalError`.)
+>
+> Fourth instance of this trap family and the worst — the source-file case at
+> least leaves stale-looking code, whereas here the flag is right there in the
+> file being read.
 
 ### Superseded: the in-core stash reads as zero
 

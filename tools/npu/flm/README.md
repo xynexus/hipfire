@@ -176,12 +176,27 @@ Each is a thing that cost real time; module docstrings have the detail.
   And the block-range (`d`) distribution appears to confirm a 32-contiguous
   grouping — until a random regrouping of the same weights matches it just as
   well. Both would have shipped a confident wrong answer.
-- **`iron.jit` does not hash `compile_flags` either.** The known trap is that it
-  does not hash `ExternalFunction(source_file=...)`; this is the same hole one
-  level down. Two designs whose sources are byte-identical and which differ only
-  by a `-D` value get the **same cache key**, so the second silently runs the
-  first's kernels. It is worse than the source-file case because nothing looks
-  stale — the flag is right there in the code being read. It cost a whole cycle
-  and a wrong published conclusion (`docs/npu/flm-refe-log.md`, the in-core
-  residual stash "reading zeros"). Any harness with two `-D` variants must clear
-  `~/.npu/cache` between them; `resid_chain.py` does it automatically.
+- **A `-D` value that reaches the kernel only through a runtime list is
+  invisible to the jit cache.** `iron.jit` keys on the design's **code object**,
+  so what matters is not whether a switch is a `compile_flag` but whether it
+  appears in the design's *source text*. Measured, on two harnesses that both
+  build their design by `exec`-ing an f-string:
+
+  | how the switch reaches the kernel | cache entries for 2 variants |
+  |---|---|
+  | interpolated into the design source (`ffn_chain.py --host-norm`) | **2 — rebuilds** |
+  | only in a flags list built outside it (`resid_chain.py`, before the fix) | **1 — collides** |
+
+  On a collision the second variant silently runs the first's kernels, and
+  nothing looks stale: the flag is right there in the file being read. It cost a
+  cycle and a wrong published conclusion — the in-core residual stash appeared
+  to "read zeros" when the flush had simply been compiled for the other path
+  (`docs/npu/flm-refe-log.md`). **Fix by interpolating the value into the
+  generated source** (`KFLAGS = FLAGS + ["-DX={val}"]` *inside* the f-string),
+  not by clearing the cache. Note the local-shadowing trap while doing it:
+  `FLAGS = FLAGS + [...]` inside the design makes `FLAGS` local and raises
+  `UnboundLocalError`, so give it a new name.
+
+  This is also the general form of the older entry above: **anything that
+  changes behaviour must be visible in the design source, a `CompileTime`
+  parameter, or a listed source file.**
