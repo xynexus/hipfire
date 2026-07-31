@@ -8874,3 +8874,32 @@ index expression in a kernel that is already linked in.
 That also avoids the +512 B of core *data* memory a P4 stash would need, which
 matters because the build has been warning "not all requested buffers fit in the
 available memory" since P3 went in.
+
+## 2026-08-01 — P4 can densify for free: an offset, not a kernel
+
+`flm_gemv_up_swiglu` now writes `out[slot + r]` instead of `out[r]`, with
+`slot = row_base % DIM_OBJROWS` and `DIM_OBJROWS` defaulting to `DIM_NROWS`.
+
+At the default the modulo is always 0, the compiler folds it away, and the
+standalone harnesses are untouched:
+
+    ffn_chain    P4 SwiGLU 2.9297e-03, P5 x_out 2.9497e-03   PASS
+    resid_chain  PASS        p1p2_chain  PASS
+    program memory 16240 B — **identical**, to the byte
+
+In the fused layer, setting `DIM_OBJROWS` to the shared object's 128 rows lets a
+core acquire **one object per 8 tiles** and have the kernel fill it densely as it
+goes. That is what P5 needs to be broadcast a dense `sw`.
+
+**The measured alternatives were both worse.** A P4 stash plus an emit kernel
+costs +496 B of program memory against 144 B of headroom, and +512 B of core
+data memory on a build that already warns "not all requested buffers fit". An
+index expression costs nothing measurable.
+
+The pattern is now used three times — `flm_h_emit` derives its interleave from
+`row_base`, `flm_gemv_acc` its accumulator slot, and now this. A tile knowing
+where it belongs from its own trailer is cheaper than any amount of plumbing
+around it, which is worth remembering before reaching for another kernel.
+
+Remaining for P4: the harness side — o_proj-style weight packing for gate and
+up, the fourth broadcast fill carrying `h`, and its own `flm_asum_prepare`.

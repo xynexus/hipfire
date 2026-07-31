@@ -14,9 +14,15 @@
 
 #include "flm_q4_1_tile.h"
 
+#ifndef DIM_OBJROWS
+#define DIM_OBJROWS DIM_NROWS   // rows per shared result object
+#endif
+
 namespace {
 constexpr float LOG2E = 1.4426950408889634f;
 constexpr int SLANES = 32;
+constexpr int OBJROWS = DIM_OBJROWS;
+static_assert(OBJROWS % NROWS == 0, "the shared object must hold whole tiles");
 static_assert(NROWS <= SLANES, "one 32-lane exp2 covers the tile");
 } // namespace
 
@@ -49,6 +55,23 @@ flm_gemv_up_swiglu(const bfloat16 *restrict act, const uint8 *restrict wtile,
                      .template to_vector<float>();
   const auto s = aie::exp2<bfloat16>(e);
 
+  // **Write at an offset inside the object, not always at 0.**
+  //
+  // In the fused layer P4's result object is shared with P1 and P3 and holds
+  // DIM_OBJROWS rows, but a tile only produces NROWS of them. One object per
+  // tile would be NROWS/DIM_OBJROWS dense — 12% at the layer's sizes — and a
+  // drain consumes its source linearly, so that padding could never be dropped
+  // on the way out and P5 could not be broadcast a dense `sw`.
+  //
+  // Filling the object in place costs an index expression. The alternative, a
+  // stash plus an emit kernel, was measured at +496 B of program memory against
+  // 144 B of headroom, and +512 B of core data memory besides.
+  //
+  // `slot` comes from the tile's own row_base, the same way flm_h_emit derives
+  // its interleave and flm_gemv_acc its accumulator slot. With
+  // DIM_OBJROWS == NROWS the modulo is always 0 and this is exactly the old
+  // behaviour, so the standalone harnesses are unaffected.
+  const int slot = OBJROWS == NROWS ? 0 : tile_row_base(wtile) % OBJROWS;
   for (int r = 0; r < NROWS; ++r)
-    out[r] = bfloat16(g_gate[r] / (1.0f + float(s[r])) * u[r]);
+    out[slot + r] = bfloat16(g_gate[r] / (1.0f + float(s[r])) * u[r]);
 }
