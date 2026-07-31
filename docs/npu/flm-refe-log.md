@@ -9007,3 +9007,38 @@ Worth stating what is not yet known: whether NROWS=8 changes the *phase*
 measurements proportionally. The 4.5% is a GEMV-level figure and the phases have
 fixed overheads that will not scale with it, so 62.5 is a floor-ish estimate
 rather than a prediction — the phases would need re-measuring at NROWS=8.
+
+### NROWS alone does not shrink the operand — P2's KV object bounds it
+
+Switching the chain to NROWS=8 failed with
+
+    Tensor argument 'w3_0' has 329728 elements but the kernel was compiled
+    for 657408 elements
+
+and the cause is not the cache. **`OPERAND` is a hardcoded 20544, independent of
+the tile size**, and `OPERAND` is what sizes the fifo buffers. Shrinking the
+weight tile to 10304 B changes what the host packs and nothing about what the
+core allocates.
+
+`OPERAND` is the max of the two things that ride the weight fifo — a q4_1 tile
+and a KV object — and the KV side is not small:
+
+    one KV tile        4096 bf16 = 8192 B
+    KVPER=2            P2's object needs 16384 B
+
+    KVPER=2, NROWS=16 -> max(16384, 20544) = 20544   today
+    KVPER=2, NROWS= 8 -> max(16384, 10304) = 16384   saves only 20%
+    KVPER=1, NROWS= 8 -> max( 8192, 10304) = 10304   saves 50%
+
+So the 20 KB the NROWS measurement promised is **not available from NROWS alone**
+— at KVPER=2 the floor is 16384 B and the saving drops from 50% to 20%. Getting
+the full saving needs **KVPER=1** as well: one KV tile per operand object instead
+of two, which doubles P2's object count and is a change to its streaming, not
+just a constant.
+
+The chain is reverted to NROWS=16 and passes at 3.4631e-03.
+
+This is the second time a measured lever has turned out to be gated by something
+it shares a resource with — the NROWS trade priced at 4.5% is real, but it only
+buys what the KV object allows. Worth measuring `KVPER=1`'s cost in `attn_phase`
+before assuming the combination is affordable.
