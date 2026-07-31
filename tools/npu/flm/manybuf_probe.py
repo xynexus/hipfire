@@ -55,7 +55,11 @@ def _design({params}, *, n: CompileTime[int]):
     f_out = f_in.cons().forward()
 
     def sequence(*args):
-        bufs = args[:2 * {npairs}]
+        # Indexed, not sliced: on Python 3.14 a constant slice folds into
+        # co_consts, and mlir-aie's jit cache hashes the generator with
+        # marshal.dumps(code, 4), which cannot serialize a slice object. The
+        # symptom is a bare "ValueError: unmarshallable object" at compile time.
+        bufs = [args[i] for i in range(2 * {npairs})]
         in_h, out_h = args[2 * {npairs}], args[2 * {npairs} + 1]
         for i in range({npairs}):
             in_h.fill(bufs[i])

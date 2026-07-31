@@ -24,7 +24,7 @@ import os
 import re
 import struct
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cdo import parse, split  # noqa: E402
@@ -152,6 +152,37 @@ def ss_edges(regs_for_tile, kind, portmaps):
     return out
 
 
+OPPOSITE = {"EAST": "WEST", "WEST": "EAST", "NORTH": "SOUTH", "SOUTH": "NORTH"}
+
+
+def walk_origins(routes):
+    """{(tile, master_port): origin} for core DMA inputs, following the fan-out back.
+
+    A tile's slave EASTn is wired to the east neighbour's master WESTn (and so on
+    per NEIGHBOUR), so a directional source resolves to one specific upstream
+    master, which is itself either directional or a real producer.
+
+    This is what separates a per-consumer stream from an array-wide broadcast --
+    invisible per tile, because every hop looks like an ordinary local route.
+    """
+    def back(tile, slave, depth=0):
+        m = re.match(r"(EAST|WEST|NORTH|SOUTH)(\d+)$", slave)
+        if not m:
+            return (tile, slave)
+        d, i = m.group(1), m.group(2)
+        dc, dr = NEIGHBOUR[d]
+        src = (tile[0] + dc, tile[1] + dr)
+        port = OPPOSITE[d] + i
+        nxt = routes.get((src, port))
+        # A missing upstream route means the chain leaves the configured array.
+        if nxt is None or depth > 64:
+            return (src, port + "?")
+        return back(src, nxt, depth + 1)
+
+    return {(t, p): back(t, s) for (t, p), s in routes.items()
+            if p.startswith("DMA") and kind_for(t[1]) == "core"}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Decode DMA BDs from an AIE PDI/xclbin CDO")
     ap.add_argument("path")
@@ -160,6 +191,8 @@ def main():
     ap.add_argument("--raw", action="store_true", help="also print raw BD words")
     ap.add_argument("--graph", action="store_true",
                     help="print the stream-switch connectivity graph instead of BDs")
+    ap.add_argument("--origins", action="store_true",
+                    help="walk every core DMA input back to the tile that sources it")
     ap.add_argument("--reginit", default=os.environ.get("AIE_RT_REGINIT", DEFAULT_REGINIT))
     o = ap.parse_args()
 
@@ -176,10 +209,25 @@ def main():
         c, r = (int(x) for x in o.tile.split(","))
         want = (c, r)
 
-    if o.graph:
+    if o.graph or o.origins:
         if not os.path.exists(o.reginit):
             sys.exit(f"aie-rt reginit not found: {o.reginit}")
         portmaps = load_portmaps(o.reginit)
+
+    if o.origins:
+        routes = {}
+        for (c, r) in regs:
+            for mname, src, _mode in ss_edges(regs[(c, r)], kind_for(r), portmaps):
+                routes[((c, r), mname)] = src
+        origins = walk_origins(routes)
+        counts = Counter(origins.values())
+        for (tile, port), org in sorted(origins.items(), key=lambda kv: (kv[0][0][1], kv[0][0][0], kv[0][1])):
+            print(f"({tile[0]},{tile[1]}) {port:6s} <= {org[0]} {org[1]:6s} "
+                  f"[{counts[org]} consumer(s)]")
+        print(f"\n{len(counts)} distinct origin(s) for {len(origins)} core DMA input(s)")
+        return
+
+    if o.graph:
         print(f"{'tile':9s} {'kind':8s} {'master':22s} <- {'slave':12s} mode")
         edges = 0
         for (c, r) in sorted(regs, key=lambda t: (t[1], t[0])):

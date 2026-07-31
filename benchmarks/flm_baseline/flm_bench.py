@@ -212,7 +212,8 @@ def main():
                   f"{ttft if ttft is not None else '-':>9} {gbs:>7s}")
             rows.append(dict(utc=time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()),
                              model=model, workload=workload, reps=len(runs),
-                             gen_lim=opts.gen_lim, prompt_tokens=ptok,
+                             gen_lim=opts.gen_lim,
+                             prefill_tokens=opts.prefill_tokens, prompt_tokens=ptok,
                              tok_s=tps, ttft_ms=ttft, gb_s=gbs,
                              all_tps=";".join(str(r.get(key)) for r in runs)))
             if opts.keep_logs:

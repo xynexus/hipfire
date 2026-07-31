@@ -14,6 +14,7 @@ python3 cdo.py       <file.xclbin|.pdi> [dump_dir]   # per-core program memory
 python3 aiedis.py    <dump_dir>/core_C_R.bin         # AIE2P disassembly
 python3 cdo_dma.py   <file.xclbin> [--tile C,R]      # DMA buffer descriptors
 python3 cdo_dma.py   <file.xclbin> --graph           # stream-switch connectivity
+python3 cdo_dma.py   <file.xclbin> --origins         # walk each core DMA input to its source
 python3 txn_scan.py  <file.so|.txn> [--dump DIR]     # embedded transaction binaries
 ```
 
@@ -36,6 +37,7 @@ python3 txn_memscan.py --launch "flm run llama3.2:1b" --dump captured/
 ## Measurement
 
 ```bash
+python3 dispatch_bw_probe.py               # one-dispatch weight streaming rate
 python3 macbench.py                        # static MAC issue rates (bundle counts)
 python3 macbench_hw.py                     # the same modes on hardware
 python3 manybuf_probe.py                   # max host buffers per dispatch
@@ -58,6 +60,22 @@ Each is a thing that cost real time; module docstrings have the detail.
 - **CDO command word** is `cmd | len<<16` with an **8-bit** length, `0xFF`
   escaping to a following 32-bit length. `0x102`/`0x103` are 32-bit addressed,
   `0x105` is 64-bit — the mixed widths are the trap.
+- **Python 3.14 folds `args[:50]` into a constant `slice`, and mlir-aie's jit
+  cache hashes generators with `marshal.dumps(code, 4)` — which cannot serialize
+  slices.** Any exec-generated design that slices dies with a bare
+  `ValueError: unmarshallable object` at compile time, pointing nowhere near the
+  cause. Index instead of slicing.
+- **>20 host buffers on one dispatch hangs the firmware** (`TDR timeout`,
+  `DPU PC: 0xffffffff`), even though `aiecc`'s `kMaxHostBOs` now allows 64 and
+  the design compiles. Buffer count is the only axis — bytes, task-group size and
+  fifo count all move freely. Pack fewer, larger buffers.
+- **A broadcast is invisible per tile.** Every hop of one looks like an ordinary
+  local route in `--graph`, so a stream feeding all 32 cores and a stream feeding
+  2 read identically until you walk them back. `--origins` does that walk and
+  prints the consumer count; in `attn.xclbin` it is the difference between the Q
+  operand and the K/V operand. It reproduces `layer.xclbin`'s independently
+  hand-traced `memtile(1,1) MM2S ch4 -> 17 consumers` broadcast, which is the
+  check that it is walking correctly.
 - **Transaction binaries have no magic number.** `txn_scan.py` finds them by
   structural validation: the op walk must land exactly on `txn_size` *and*
   produce exactly `num_ops`. Two independent conditions, so false positives are

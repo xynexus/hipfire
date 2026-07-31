@@ -1,0 +1,5 @@
+utc,model,workload,reps,gen_lim,prefill_tokens,prompt_tokens,tok_s,ttft_ms,gb_s,all_tps
+20260731T051015Z,llama3.2:1b,decode,3,256,2048,61,61.31,441.4,47.3,61.05;61.41;61.31
+20260731T051026Z,llama3.2:1b,prefill,3,256,2048,3577,2064.8,,,2064.8;2095.69;2063.54
+20260731T051214Z,qwen3.6-moe:35b-a3b,decode,3,256,2048,34,13.55,,36.8,13.55;13.43;13.55
+20260731T051404Z,qwen3.6-moe:35b-a3b,prefill,3,256,2048,4127,178.18,,,179.34;178.18;177.44

@@ -2797,3 +2797,623 @@ All work is uncommitted, across two trees. `hipfire-npu` is on `master`, and
 `AGENTS.md` wants a topic branch, so nothing was staged. Local changes also exist
 in `~/build/mlir-aie` (MERGE_SYNC build fix, txn2mlir parser, python binding
 dependency, `kMaxHostBOs` raised to 64) on branch `merge-sync-txn-op`.
+
+## 2026-07-31 — Phase 0.5 baseline RE-TAKEN on a quiet machine
+
+The open item "re-take the 0.5 baseline on a quiet machine" is closed. Machine
+verified quiet first: no `flm` processes, nothing holding an `accel0` fd. Same
+harness, same parameters as the contended run (`--reps 3 --gen-lim 256`).
+Results in `benchmarks/flm_baseline/results/flm-baseline-quiet.csv`.
+
+### Decode — the contended numbers were NOT inflated; the opposite
+
+| model | contended | quiet | delta |
+|---|---|---|---|
+| llama3.2:1b | 61.07 tok/s / 47.2 GB/s | **59.86 tok/s / 46.2 GB/s** | **-2.0%** |
+| qwen3.6-moe:35b-a3b | 13.54 tok/s | **13.41 tok/s** | -1.0% |
+
+The quiet machine is *slower*, consistently, across both models. So the earlier
+caveat's worry — that a resident second NPU client depressed the baseline — is
+not borne out. If anything the contended run was slightly optimistic.
+
+Within-run spread is smaller than the gap (quiet llama 59.86/59.89/59.46 = 0.7%;
+contended 61.07/61.24/60.61 = 1.0%), so the ~2% shift is probably real rather
+than noise, but it is not large and the mechanism is unknown. A plausible one:
+the resident `flm serve llama3.2:1b` held llama's weights in page cache, so the
+contended run streamed warm and the quiet run streams cold. Not tested.
+
+**Cross-check that favours the quiet figure.** The repo's independent historical
+number is 60.1 tok/s / 46.4 GB/s. The quiet measurement (59.86 / 46.2) agrees to
+within 0.4%; the contended one (61.07 / 47.2) was off by 1.6-1.7%. The quiet
+figure is the better-corroborated one.
+
+**Canonical baseline for phases 2 and 3 is now 59.86 tok/s / 46.2 GB/s** for
+llama3.2:1b decode, and 13.41 tok/s for the MoE.
+
+### Prefill — NOT comparable between the two runs, do not quote the delta
+
+| model | contended | quiet |
+|---|---|---|
+| llama3.2:1b | 1774.53 t/s @ **7075** prompt tokens | 2056.33 t/s @ **3577** |
+| qwen3.6-moe:35b-a3b | 185.52 t/s @ **8305** | 178.08 t/s @ **4127** |
+
+The prompt lengths differ by roughly 2x between runs at the same
+`--prefill-tokens` default, so the input file the harness picks up is not
+pinned. Prefill throughput is strongly prompt-length dependent — this log
+already records 121 t/s at 52 tokens vs 1623 t/s at 1828 for the same model — so
+these two runs measure different things and the difference between them says
+nothing about contention.
+
+**`flm_bench.py` needs a pinned prompt before prefill is quotable.** Until then
+only the decode half of the baseline is trustworthy, and prefill should be
+re-taken at a fixed, stated prompt length.
+
+### Side effect: the user's `flm serve` was restarted
+
+Killed in error by this work earlier (recorded above). Restarted as
+`flm serve llama3.2:1b`, PID captured explicitly at launch per the rule that
+incident produced. It came up on port **52625**, bound to 127.0.0.1. That port
+is not in `~/.config/flm/`, not in the shell profile, and not in the launching
+environment, so it appears to be chosen per-process — meaning it probably does
+NOT match whatever port the original 14h58m-old instance had. Anything holding a
+hardcoded port will need it restarted deliberately.
+
+## 2026-07-31 — Phase 1 open item CLOSED: the GEMM pair concatenates (N-split)
+
+Open since the pairing was found: two GEMM cores per output group, the lower
+writing into the upper's memory, but *what* is split — whether the upper **sums**
+the two contributions (K-split) or **concatenates** them (N-split) — was
+explicitly recorded as not distinguished by anything observed.
+
+It is an N-split. Two independent sources, which agree.
+
+### Source 1 — the code: there is no combining step
+
+Disassembled the pair (0,2) upper / (0,3) lower and diffed with addresses
+stripped. 64 lines differ, and every one of them is register housekeeping:
+
+| kind | count |
+|---|---|
+| `lda` / `st` (stack spill+reload, different regalloc) | 21 / 20 |
+| `movs` / `mova` / `movxm` / `ltu` / `and` / `or` / `add` (pointer + index setup) | 17 |
+| `nopa` / `nop` (schedule padding) | 6 |
+
+**Differences in `vmac`, `vadd`, `vsub`, `vmul`, `vconv`, `vst`: zero.** The
+vector store sequence is byte-identical in both — same opcodes, same pointer
+registers, same immediate offsets. A K-split *requires* the upper core to read
+the lower's partial sums and add them into its accumulator; no such code exists
+in either program. Both cores run the same computation and differ only in where
+the result lands.
+
+### Source 2 — the buffer descriptors
+
+The only difference in the operand pointers is the memory window:
+
+| pointer | (0,2) upper | (0,3) lower |
+|---|---|---|
+| p0 | `0x73c00` | `0x43c00` |
+| p3 | `0x75400` | `0x45400` |
+
+Same module offsets (`0x3C00`, `0x5400`), different window. Authoritative AIE2
+mapping (`AIETargetModel.h`, the NPU model at lines 632-640): internal =
+**East = 0x70000** with no row-parity term, **South = 0x40000**. So the lower
+core writes into its *south* neighbour, which is the upper core — confirming the
+established hand-off direction from a second place.
+
+Those offsets are exactly the upper core's two output BDs: BD4 at module
+`0x3C1C` and BD5 at `0x541C`, `BUFFER_LENGTH=33` words = **132 B each**. The
+lower core has **no output BD at all** (4 BDs, all inputs, vs the upper's 6).
+
+So: two equal-sized output buffers, one per core of the pair, both resident in
+the upper core's memory, both shipped by the upper core's DMA. Equal sizes and
+no reduction is concatenation; a sum would need one buffer, not two.
+
+### What this fixes downstream
+
+- **The reproduction needs two program variants per pair differing ONLY in the
+  output pointer base** — own (`0x7....`) vs south neighbour (`0x4....`).
+  Everything else, including the whole compute body, is identical.
+- **"8 result streams, not 16" means 8 streams each carrying two concatenated
+  N-groups**, not 8 summed results. Anything sizing the output stage off 16
+  independent results, or off 8 reduced ones, would be wrong.
+- **Favourable for 3a (oq4++).** N-split means each core owns distinct output
+  channels, and oq4++'s per-group scales are per *output channel* — so scale
+  data partitions cleanly across the pair with no cross-core reduction and no
+  shared accumulator. The K-split reading would have implied the opposite.
+
+### Method note
+
+The first diff attempt reported `IDENTICAL` — because a `cd` had been reset and
+both `sed` inputs did not exist, so it compared two empty streams. Caught only
+because "identical" was the wrong answer for programs known to differ in their
+pointer setup. Same class as the `1.00 cyc/insn` and generic-form-MLIR false
+passes already recorded: **a successful-looking result from a command that never
+ran on the intended input.**
+
+## 2026-07-31 — Phase 1: RoPE's site CONFIRMED (cols 3-4), closing two open items
+
+Two open items were coupled: "where RoPE is applied" (narrowed to cols 3-4 but
+explicitly *not proven*) and "the *function* of the cols 3-4 shuffle/elementwise
+pipeline" (pairing confirmed, computation not). Three independent sources now
+agree that this pipeline applies RoPE.
+
+### 1. Arithmetic signature
+
+RoPE rotates each `(x, y)` pair: `x*cos - y*sin` and `x*sin + y*cos`. That needs
+a multiply-**subtract** and a multiply-**accumulate**, over deinterleaved
+even/odd lanes. The cols 3-4 elementwise cores (rows 3, 5) have exactly that:
+
+| core | signature |
+|---|---|
+| (3,2), (4,2) — shuffle | `vshuffle:91`, almost no arithmetic |
+| (3,3), (4,3) — elementwise | `vmul.f:86  vadd.f:73  vshuffle:51  vmsc.f:24  vmac.f:19` |
+
+`vmsc.f` (multiply-subtract) appears in the elementwise cores and essentially
+nowhere else in the layer kernel. It is the operation the rotation's first half
+requires.
+
+### 2. Operand widths — the decisive one
+
+Both cols 3-4 cores carry the same two buffer widths, each double-buffered:
+
+| buffer | bytes | bf16 | Llama-3.2-1B geometry |
+|---|---|---|---|
+| BD pair A | **4096** | 2048 | **Q** = 32 heads x 64 head_dim |
+| BD pair B | **1024** | 512 | **K** = 8 kv_heads x 64 head_dim |
+
+From `config.json`: `hidden=2048, heads=32, kv_heads=8, head_dim=64`. Q is
+32*64 = 2048 bf16 = 4096 B; K is 8*64 = 512 bf16 = 1024 B. Both match exactly.
+
+**V is also 512 bf16 = 1024 B, and there is no third stream** — only two distinct
+widths, each appearing twice as a ping-pong pair. RoPE is applied to Q and K and
+never to V, so "Q and K present, V absent" is the signature, and it is what the
+BDs show.
+
+### 3. Symbols
+
+Already recorded: RoPE symbols (`_set_rope_weights`, `_send_rope_weights`,
+`_rope(buffer<bfloat16_t>&, int)`) exist only in `libllama_npu.so`, and
+`libmha.so` has none — so RoPE lives in `layer.xclbin`, not `attn.xclbin`. That
+narrowed it to this kernel; the widths locate it within the kernel.
+
+### What remains inferred, deliberately
+
+- **The division of labour inside the pair.** Op mix says the shuffle core (rows
+  2,4) deinterleaves and the elementwise core (rows 3,5) rotates. Consistent, and
+  it matches the established vertical pairing, but not separately proven.
+- **These cores may do more than RoPE.** `vadd.f:73` is more addition than the
+  rotation alone needs, so the elementwise core plausibly carries another
+  elementwise stage as well. The RoPE finding does not claim the cores do *only*
+  RoPE.
+
+Both are narrower than the questions they replace, and neither blocks phase 2:
+the reproduction needs the pipeline's dataflow and operand widths, which are now
+pinned.
+
+## 2026-07-31 — Phase 1: col 2 row 3 decomposed — it is the QKV split
+
+Last unresolved core role in `layer.xclbin`, previously recorded only as
+"6144 in / 4096 out, not decomposed". The buffer widths decompose exactly.
+
+| BD | bytes | bf16 | Llama-3.2-1B geometry |
+|---|---|---|---|
+| BD0 | **6144** | 3072 | **fused QKV** = Q 2048 + K 512 + V 512 |
+| BD1 | **4096** | 2048 | **Q** = 32 heads x 64 |
+| BD2-BD5 | **512** x4 | 256 each | **4 kv_heads x 64** — K and V, each in two halves |
+| BD6 | 128 | 64 | one head_dim |
+
+`2048 + 512 + 512 = 3072` is exact, and no other grouping of this model's
+dimensions gives 3072. So **(2,3) receives the fused QKV projection output and
+splits it into separate Q, K and V streams.**
+
+Two independent corroborations:
+
+1. **The Q output width matches its consumer.** BD1 is 4096 B, exactly the Q
+   buffer size on the cols 3-4 RoPE cores. The split core's Q output feeds the
+   RoPE pipeline's Q input.
+2. **The four 512 B buffers reproduce the `k03`/`k47` split.** K is 8 kv_heads x
+   64 = 512 bf16 = 1024 B; half of it, 4 heads, is 256 bf16 = **512 B**. Four
+   such buffers = K in two 4-head halves and V in two 4-head halves. That is the
+   same 0-3 / 4-7 head partition already read independently out of the symbol
+   table (`get_k03_offset` / `get_k47_offset` / `get_v03_offset` /
+   `get_v47_offset`). Two unrelated sources landing on the same partition.
+
+### Confidence and what is still assumed
+
+The width arithmetic is exact and cross-corroborated. What is *not* directly
+observed here is the **direction** of each BD — the decode above takes the
+existing "6144 in / 4096 out" reading and shows the widths are consistent with a
+QKV split; it does not independently prove which BDs are reads and which are
+writes. The consumer-side match (BD1 = the RoPE cores' Q buffer) makes the
+direction very likely but is not a direct measurement.
+
+BD6 (128 B = 64 bf16 = one head_dim) is not accounted for by the split itself.
+
+**All core roles in `layer.xclbin` are now decomposed** — GEMM, RMSNorm (2,2),
+SwiGLU (5,2), RoPE (cols 3-4), QKV split (2,3) — leaving as open only the
+*internal* division of labour inside the RoPE pair and BD0's role in the `attn`
+cores.
+
+## 2026-07-31 — Phase 1 (attn): BD0 CLOSED, and BD3/BD4 were misread as an input
+
+`flm-attn-dataflow.md` listed BD0's role as open ("8192 B, single, not
+ping-ponged, its own lock. Consistent with K+V for 32 tokens or an output
+accumulator; not distinguished"). Settled by reading the DMA **channel queue
+registers** out of the CDO rather than inferring from buffer sizes.
+
+### Method
+
+AIE2 core-tile DMA channel registers, tile (0,2) of `attn.xclbin`: S2MM ch0/ch1
+control at `0x1DE00`/`0x1DE08` and start queues at `0x1DE04`/`0x1DE0C`; MM2S
+ch0/ch1 at `0x1DE10`/`0x1DE18` and `0x1DE14`/`0x1DE1C`. The queue register's low
+nibble is the channel's starting BD. Scanned the CDO for writes to those
+addresses.
+
+```
+S2MM0 queue = 0x0  -> start_bd=0     S2MM0 ctrl = 1
+S2MM1 queue = 0x1  -> start_bd=1     S2MM1 ctrl = 1
+MM2S0 queue = 0x3  -> start_bd=3     MM2S0 ctrl = 1
+MM2S1        (ctrl written, no queue -> never started)
+```
+
+### Result — the channel/direction binding
+
+| BD | channel | direction | bytes | source / sink |
+|---|---|---|---|---|
+| BD0 | S2MM0 | **input** | 8192 | memtile (DMA0 <- SOUTH0) |
+| BD1/BD2 | S2MM1 | input, ping-pong | 4096 | east neighbour (DMA1 <- EAST3) |
+| BD3/BD4 | MM2S0 | **OUTPUT**, ping-pong | 128 | -> memtile |
+
+**BD0 is an input from the memtile.** 8192 B is *uniquely* the size of the
+memtile's 4-D strided output BDs (section 3 of the attn doc), and it equals
+`2 x 32 tokens x 64 head_dim` in bf16 — K and V for one 32-token flash tile,
+delivered already transposed by the memtile DMA. Open item closed, and it
+confirms rather than disturbs the section-3 finding that the cores never reshape.
+
+### CORRECTION to `flm-attn-dataflow.md` section 2
+
+The doc reads BD3/BD4 (128 B) as "**1 x head_dim** — the Q vector for one head
+(decode, M=1), double-buffered", i.e. an input. **MM2S0 starts at BD3, so
+BD3/BD4 are the core's OUTPUT**, not its Q input. 128 B = 64 bf16 = one
+head_dim, which is the attention *result* for one query — the same arithmetic,
+the opposite direction.
+
+This is the size-inference failure mode again: 128 B = head_dim is consistent
+with both a Q input and an O output, and the size alone cannot separate them.
+The channel register can, and disagreed.
+
+### What this opens
+
+Both input channels are now accounted for as KV-side streams (BD0 = K+V tile
+from the memtile; BD1/BD2 = 4096 B from the *east neighbour*, matching the
+pairwise column fan-out in section 4). **Where Q arrives is therefore no longer
+obvious** — the previous answer was BD3/BD4, which is wrong.
+
+Two candidate readings, not distinguished:
+- BD1/BD2 (4096 B = 2048 bf16 = 32 x 64) is a **Q tile of 32 query positions**,
+  which fits `attn.xclbin` being the *prefill* kernel (established in
+  `flm-layer-dataflow.md` section 1), with the 128 B output emitted once per
+  query through the ping-pong.
+- BD1/BD2 is a second KV stream and Q arrives by another route.
+
+Note the doc's own BD3/BD4 gloss says "decode, M=1", which sits badly with
+`attn.xclbin` being the prefill path. That inconsistency between the two
+documents predates this entry and should be resolved when Q's route is settled.
+
+---
+
+## 2026-07-31 — Q's route settled, and the head decomposition retracted
+
+Phase 1's two remaining gating items (kickoff `~/flm-phase23-kickoff.md`): where
+Q arrives in `attn.xclbin`, and the cross-document inconsistency it exposed.
+Both closed. The answer overturns more of `flm-attn-dataflow.md` than expected.
+
+### What was tried, in order
+
+**1. Neighbour-memory hypothesis — ruled out.** `layer.xclbin` hides a third of
+its dataflow in shared neighbour memory, so the first guess was that Q arrives
+the same way. Disassembled all 32 attn cores and extracted every address
+immediate: the set is identical on every core and lies entirely in `0x7xxxx`
+(own module). No `0x4xxxx`/`0x5xxxx`/`0x6xxxx` neighbour window anywhere. Dead
+end, but it also rules out any inter-core exchange in this kernel.
+
+**2. Per-core base-address hypothesis — ruled out.** If a core selected its own
+slice of a broadcast, the offset would show as a differing immediate. It does
+not: all 32 cores carry the identical address set, the DMA BDs are byte-identical
+(already known), and the CDO's per-core data-memory init is 36 B at `0x30a4`
+whose one varying word tracks program *size* (0x2770/0x2780/0x2790 against
+10596/10612/10628 B), not position.
+
+**3. Route resolution — the structural fact.** Walked every core's DMA source
+back to its origin through the stream-switch graph. Result is stark and was not
+visible in the per-tile view:
+
+- **DMA0** (BD0, 8192 B) has **16 distinct origins** — memtiles (0,1), (2,1),
+  (4,1), (6,1), MM2S channels 0-3, one per row — each feeding **exactly 2 cores**
+  (an even column and the odd column beside it).
+- **DMA1** (BD1/BD2, 4096 B) has **one** origin, memtile (3,1) MM2S0, feeding
+  **all 32 cores**, up to 8 hops deep, every hop circuit-switched.
+
+That immediately falsified the doc's "BD1/BD2 comes from the east neighbour" —
+it is an array-wide broadcast, not a pairwise hop.
+
+**4. The paradox, and what broke it.** Two cores receiving byte-identical data on
+*both* channels and running identical programs would compute identical results.
+So the programs are not identical. They are not: sizes differ (10596 / 10612 /
+10628 B), and diffing the prologue shows two per-core immediates,
+`r0 = row - 2` and `r1 = col & 1`. Across all 32 cores those are the only
+per-core constants, and md5 on the extracted program memory confirms **exactly 8
+distinct binaries**, one per `(row, parity)` class. A core's identity is
+`(row, column parity)` plus which DMA0 stream it is wired to.
+
+**5. Cross-model check — this is what retracted the head mapping.** Ran the same
+extraction on three other `attn.xclbin`s with deliberately different head
+geometry:
+
+| model | q heads | kv heads | head_dim | cores | BD sizes |
+|---|---|---|---|---|---|
+| Llama-3.2-1B | 32 | 8 | 64 | 32 | 8192 / 4096 / 4096 / 128 / 128 |
+| Llama-3.2-3B | 24 | 8 | 128 | 32 | same |
+| Qwen3-0.6B | 16 | 8 | 128 | 32 | same |
+| Gemma3-1B | 4 | **1** | 256 | 32 | 16384 / 8192 / 8192 / 128 / 128 |
+
+**Always 32 cores; the buffer sizes do not track head count; the 128 B output is
+128 B at head_dim 64, 128 and 256 alike.** So `32 cores == 32 query heads`,
+`8 columns == 8 KV heads`, `4 rows == GQA ratio 4` and the `k03`/`k47` column
+mapping are all **retracted**. They were read off Llama-3.2-1B, where the model's
+head counts coincide with the array's dimensions by accident.
+
+Also confirmed by hashing: `attn.xclbin` is shared byte-for-byte across models
+grouped by attention geometry — Llama-3.2-1B ships the same file as LFM2-1.2B,
+LFM2-2.6B and LFM2.5-1.2B (all 32 q / 8 kv / head_dim 64), Llama-3.2-3B the same
+file as Phi4-mini. So the xclbin keys on attention shape and nothing else.
+
+**6. Runtime cross-check.** Dumped argument BO sizes per submission with the
+existing interposer (`NPU_ARGS_OUT` / `NPU_ARGS_MATCH`). The attention dispatch
+takes exactly three buffers — 256 MiB KV cache, 14 MiB Q, 14 MiB O — against five
+DDR ingress columns in the array (0, 2, 4, 6 carrying the per-pair streams, 3
+carrying the broadcast).
+
+### Conclusion
+
+**BD0 = Q** (64 query positions per column pair, 32 per core by `col & 1`);
+**BD1/BD2 = K/V** (array-wide broadcast, the flash inner-loop operand);
+BD3/BD4 = output rows. Four independent supports, written up in
+`flm-attn-dataflow.md` section 6. The strongest is Gemma3-1B: with one KV head
+and the identical topology, the alternative reading requires duplicating a single
+KV head across 16 distinct streams while broadcasting Q.
+
+The output arithmetic closes as an extra check: the memtile's output-collection
+BD is 4096 B strided with D1 stride 128 B = **32 rows of 128 B**, matching 32
+query positions per core.
+
+**And `attn.xclbin` is the prefill kernel** — 32 cores that do not scale with
+head count, each holding a private tile of query positions against a broadcast KV
+stream, is query-tile-parallel flash attention. `flm-layer-dataflow.md` was right;
+the "decode, M=1" gloss in the attn doc was an artifact of the BD3/BD4 misread.
+
+### The failure mode this document keeps hitting
+
+Three wrong answers in a row on the same buffers, all from **size matching**:
+128 B "= head_dim, so Q input"; 8192 B "= uniquely the memtile's strided output,
+so K+V". Sizes are ambiguous — 8192 B is *not* unique, because memtile (3,1)
+emits strided too, at a different size, and nobody had looked at (3,1). Every
+correction so far has come from a *different kind* of evidence: a channel queue
+register, a route walk, a second model, a runtime argument list.
+
+### Prefill dispatch, decoded as a side effect
+
+The same argument dump closed a separate open item in `flm-layer-dataflow.md` —
+the intra-layer prefill ordering. Per layer, in order:
+`dequant -> q -> k -> v -> attention -> o -> gate -> up -> down`. Buffer sizes
+identify each context with no remainder, and two things fall out:
+
+- **Prefill dequantizes the whole layer to bf16 up front** (37 MiB q4_1 in,
+  116 MiB bf16 out = 60.9 M params x 2 B exactly) and runs bf16 GEMMs. The 42-op
+  q4_1 dequant chain that dominates the decode kernel is not on this path.
+- **k_proj's and v_proj's outputs are passed to nothing.** The KV cache fill, and
+  RoPE on this path, happen on the host between dispatches — consistent with
+  `fill_kv_cache` and `_rope` being host-side symbols.
+
+### Failure worth recording: two benchmark runs raced
+
+The first prefill baseline attempt reported llama decode at **42.54 tok/s**
+against the established 59.86, with prefill and the whole MoE row empty. Cause
+was self-inflicted: a `nohup ... &` launch appeared to have died with its shell
+but had not, so a second `flm_bench.py` was started alongside it and the two
+contended for NPU hardware contexts (`CREATE_HWCTX` then failing with
+`err=-22`). Killed by explicit PID, re-run single. **A benchmark number that is
+28% off the established baseline should be read as a broken harness first.**
+
+### `flm_bench.py` prompt pinning — the goal doc's diagnosis was wrong
+
+The plan records that `flm_bench.py` "was not pinning its prompt". It is: for a
+given `--prefill-tokens`, `make_prompt_file` is deterministic — regenerating it
+twice gives md5 `9e73e8...`, which is also the md5 of the checked-in
+`results/prefill_prompt.txt` at the default 2048. The historical ~2x length
+difference therefore came from the two runs using **different
+`--prefill-tokens`**, not from a non-deterministic prompt. Fixed the real gap:
+the CSV now records `prefill_tokens` alongside the measured `prompt_tokens`, so
+a run's setting is recoverable from its own output.
+
+### Prefill baseline, 2026-07-31 (re-run, single instance)
+
+| model | `--prefill-tokens` | prompt tok | prefill tok/s | decode tok/s (same run) |
+|---|---|---|---|---|
+| llama3.2:1b | 2048 | 3577 | **2064.8** | 61.31 |
+| qwen3.6-moe:35b-a3b | 2048 | 4127 | **178.2** | 13.55 |
+
+Medians of 3, spread under 1.6%. `flm serve llama3.2:1b` was resident, so this is
+the **contended** condition — confirmed by the decode column reproducing the
+contended baseline (61.07 / 13.54) to 0.4% / 0.1% rather than the quiet one
+(59.86 / 13.41). That also puts an upper bound of ~2% on the condition's effect,
+so the prefill figures are usable as a Phase 2 target with that caveat attached.
+
+MoE prefill is **11.6x slower** than llama at a comparable prompt length, against
+~2.4x predicted by active-parameter scaling — a long prompt activates
+essentially all 256 experts, so MoE sparsity is a decode-only benefit.
+
+---
+
+## 2026-07-31 — Phase 2 milestone 1: one-dispatch weight streaming
+
+Phase 2 starts with the gap the phase-1 measurements say dominates: FLM decodes
+with **2 dispatches per token at 46.2 GB/s**, hipfire's own path with **~96
+dispatches at ~10 GB/s effective** (`decoder-layer-npu-scope.md`). That is a
+dispatch-structure problem before it is a kernel problem, so it is worth
+measuring before any GEMM arithmetic exists to confound it.
+
+New tool: `tools/npu/flm/dispatch_bw_probe.py`. Binds N host buffers to ONE
+dispatch, streams every byte into the array through `--workers` parallel
+ObjectFifos, and reports the achieved rate. The cores acquire and release without
+reading — the DMA moves the bytes either way, so this measures the delivery
+structure, not the arithmetic.
+
+### Toolchain re-verified first
+
+`vector_scalar_mul` generates, compiles and runs on hardware (`PASS!`,
+126 us avg), so the phase-2 path — our own mlir-aie source to silicon — is live.
+The C++ host target does not build (wants `g++-13`, absent); the Python run path
+is the one to use.
+
+### BD reuse works, and it is the fix `manybuf_probe.py` predicted
+
+`manybuf_probe.py` ended at a **compile-time** wall: "Too many simultaneously
+active buffer descriptors on tile (0,0), which supports up to 16", with the
+compiler itself prescribing `dma_free_task`/`dma_await_task`. IRON exposes that
+as `TaskGroup`: fills are grouped, and each group is awaited and freed before the
+next opens. **With grouping, designs binding 24-48 buffers now compile.** The
+active-BD wall is gone.
+
+### The wall moved to RUNTIME, and it is at ~20 buffers
+
+| test | result |
+|---|---|
+| 8 bufs x 256 KiB, 4 workers | 11.7 GB/s |
+| 16 bufs x 256 KiB, 4 workers | 18.6 GB/s |
+| **20 bufs x 256 KiB, 4 workers** | **18.4 GB/s** |
+| 24 bufs x 256 KiB, 4 workers | **`ERT_CMD_STATE_ERROR`** |
+| 48 bufs x 1 MiB, 1-16 workers | `ERROR` (`TIMEOUT` at 1 worker) |
+
+`dmesg` shows the firmware **hanging**, not rejecting: `aie2_tdr_detect: TDR
+timeout detected`, `DPU PC: 0xffffffff`, `TXN OP ID: 0xffffffff`. So the command
+is accepted and the DPU never runs it.
+
+Three discriminating tests, all holding the count at 24:
+
+| variable moved | result |
+|---|---|
+| one task group instead of six (`--group 24`) | still `ERROR` |
+| six groups instead of three (`--group 4`) | still `ERROR` |
+| 8 fifos instead of 4 (`--workers 8`) | still `ERROR` |
+| **bytes up 12.8x at 20 buffers** (20 x 1 MiB) | **works — 34.9 GB/s** |
+
+**The axis is the buffer count alone.** Not bytes, not group size, not fifo
+count. Somewhere between 20 and 24 host buffers on one dispatch, the generated
+command stops being something the firmware will execute.
+
+### Why this does not block phase 2
+
+FLM binds 50 because it allocates **per layer, per role** — 16 x (weights,
+workspace, KV) + 2. A reproduction is not obliged to keep that decomposition. The
+arithmetic works out favourably:
+
+- llama3.2:1b streams **772.3 MB per token**, its per-layer weight buffer is
+  **37 MiB**, and there are **16 layers**.
+- So **16 weight buffers + a handful of activation/workspace buffers ~= 20
+  arguments** carries an entire token's weight traffic in one dispatch — right at
+  the measured ceiling, without needing to cross it.
+
+The ceiling is worth chasing later (it is a real defect in something between IRON
+and the firmware, and 50 demonstrably works for FLM), but it is not on the
+critical path. **Packing fewer, larger buffers is the cheaper answer and it is
+also closer to what the reproduction wants anyway.**
+
+### Trap: Python 3.14 constant slices break mlir-aie's jit cache
+
+Any design generator containing a **constant slice** — `args[:50]` — fails to
+compile with a bare `ValueError: unmarshallable object`. Python 3.14 folds the
+slice into `co_consts`, and mlir-aie's jit cache hashes the generator with
+`marshal.dumps(code, 4)`; marshal gained slice support only in version 5.
+Confirmed in isolation:
+
+```
+def f(a): x = a[:5]        -> marshal.dumps(f.__code__, 4)  ValueError
+def g(a): [a[i] for i in range(5)]  ->  OK
+```
+
+`_hash.py` pins version 4 deliberately ("marshal.version is 4 through 3.13 and 5
+from 3.14"), so this bites every 3.14 user who slices in a generator. Worked
+around locally by indexing instead of slicing, in both this probe and
+`manybuf_probe.py` — **which had the same latent bug and would not have run as
+committed.**
+
+### RESULT: one dispatch moves a decode-sized weight set FASTER than FLM
+
+512 MiB (16 buffers x 32 MiB — the shape of llama3.2:1b's 16 per-layer weight
+buffers) bound to **one** dispatch, medians of 10 iterations after 2 warmups:
+
+| feed streams | shim columns used | GB/s | vs FLM 46.2 | vs 56.5 roof |
+|---|---|---|---|---|
+| 4 | 2 | 46.5 | 1.01x | 82% |
+| **8** | 3 | **55.9** | **1.21x** | **99%** |
+| 16 | 7 | 55.5 | 1.20x | 98% |
+
+(Stream count is read back from the generated xclbin with
+`cdo_dma.py --graph`; it is the number of shim NORTH routes, not an assumption.)
+
+**Three things this settles.**
+
+1. **Dispatch structure is not the wall it looked like.** One command can carry a
+   whole token's weight traffic and deliver it at **99% of the fabric roof**.
+   Nothing about the 2-dispatches-per-token design is out of reach.
+2. **The lever is stream count, not column count.** 4 streams reach 46.5 GB/s
+   (~11.6 each, close to the 14.4 GB/s single-stream figure in
+   `npu-memory-bandwidth-cache-characterization.md`); 8 streams saturate. Beyond
+   8 there is nothing left to win — 16 streams over 7 columns measures no better
+   than 8 over 3.
+3. **hipfire's ~10 GB/s effective decode is a dispatch-count artifact, not a
+   delivery limit.** The same silicon and the same toolchain move bytes 5.6x
+   faster when the work is in one command instead of ~96.
+
+**And FLM is not at the roof either.** Its 46.2 GB/s is 82% of what one dispatch
+demonstrably sustains. That is the same 82% the 4-stream row measures, which is
+suggestive given FLM feeds its 16 GEMM cores from **4 memtile columns**
+(`--origins` on `layer.xclbin`: 16 private weight streams, all originating in
+memtiles (0,1), (1,1), (6,1), (7,1)) — but the probe's streams are not FLM's, and
+FLM's number includes compute while the probe's does not. **Not established, and
+worth establishing**: if FLM's decode really is ingress-width-limited, a
+reproduction that widens weight ingress would beat it by ~20% before any change
+to the kernel body, which would make it a phase-2 *result* rather than a phase-3
+mutation.
+
+### Method note
+
+The probe reports FAIL rather than dying, and the four discriminating tests above
+were only cheap because of it. Two failure modes appeared —
+`ERT_CMD_STATE_TIMEOUT` at one worker and `ERT_CMD_STATE_ERROR` at two or more —
+and per the standing lesson in this log, a *changed* failure mode means the
+experiment changed shape rather than the limit merely moving. That is what
+prompted holding workers fixed while sweeping the count, which is what isolated
+the buffer count as the only axis that mattered.
+
+### The number is not a no-op — verified in the same dispatch
+
+The cores in this probe acquire and release without reading, so a design whose
+DMAs silently did nothing would report a spectacular rate. `--verify` closes
+that: one extra tile rides the **same** dispatch through a forwarding fifo and is
+compared byte for byte on the way out.
+
+```
+16 x 32 MiB, 8 workers, --verify:  55.2 GB/s  (1.20x FLM, 98% of roof)
+```
+
+Against 55.9 GB/s without it — the 0.7 GB/s is the check transfer itself. **The
+bytes are real.** Worth the fifteen lines: three of the results this log records
+as corrections looked like successes first.
+
+(Two IRON constraints surfaced writing it, both worth knowing: `Out` must be
+imported into the generated namespace alongside `In`, and **explicit
+`TaskGroup`s cannot be mixed with the implicit default group** — a verify
+transfer added outside a group fails with
+"Mixing explicit task groups and the default task group is prohibited".)

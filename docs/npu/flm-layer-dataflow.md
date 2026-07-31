@@ -43,10 +43,50 @@ submission's `(hwctx, type, cmd_count, arg_count)`.
 `9 per layer x 16 layers + 1 = 145`. The 7.0 lands on the architecture with no
 remainder.
 
-**open** — intra-layer *ordering*. The raw sequence is
-`(ctx3,5) (ctx2,3)x3 (ctx4,3) (ctx2,3)x4`, which rotated reads as
-`qkv -> [ctx4] -> o,gate,up,down -> [ctx3]`, but where the layer boundary falls
-is not pinned down. The counts are solid; the order is not.
+~~**open** — intra-layer *ordering*.~~ **CLOSED 2026-07-31 — the order and every
+context's role are settled**, by dumping each submission's argument BO sizes
+(`NPU_ARGS_OUT` / `NPU_ARGS_MATCH`, same interposer). The layer starts at ctx3:
+
+```
+ctx3(5)  ctx2(3) ctx2(3) ctx2(3)  ctx4(3)  ctx2(3) ctx2(3) ctx2(3) ctx2(3)
+dequant   q       k       v        attn     o       gate    up      down
+```
+
+The buffer sizes identify each one with no remainder (Llama-3.2-1B, hidden 2048,
+kv dim 512, intermediate 8192, bf16):
+
+| context | kernel | arg0 | arg1 | arg2 |
+|---|---|---|---|---|
+| 3 | `dequant.xclbin` | **37 MiB q4_1 weights, a different handle each layer** | 20 MiB | 32 MiB (+ 32, 32 as arg3/4) |
+| 2 | `mm.xclbin` | weight slice | **out** | **in** |
+| 4 | `attn.xclbin` | **256 MiB KV cache, a different handle each layer** | Q (14 MiB) | O (14 MiB) |
+
+- **ctx3 is dequant, and it begins the layer.** Its arg0 is the only per-layer
+  weight buffer, 38,797,312 B — Llama-3.2-1B's 60.9 M per-layer parameters at
+  q4_1's 5.00 bpw. Its four outputs are **20 + 32 + 32 + 32 = 116 MiB**, which is
+  exactly those parameters at bf16 (121.8 MB), split the obvious way:
+  20 MiB = q+k+v+o (8+2+2+8), and one 32 MiB buffer each for gate, up, down
+  (2048 x 8192 x 2 B). **Prefill dequantizes the whole layer to bf16 up front and
+  runs bf16 GEMMs**; the q4_1 dequant chain that dominates the decode kernel is
+  not on the prefill path at all.
+- **ctx2 is `(weights, out, in)`.** Confirmed on `down_proj`, whose 8192-wide
+  input and 2048-wide output are unambiguous: arg1 is the 14 MiB (2048-dim)
+  buffer, arg2 the 56 MiB (8192-dim) one. Chaining then reads cleanly —
+  q/k/v all take the layer input, o takes attention's output, down takes the
+  gate/up product.
+- **ctx4 is attention, and takes exactly three buffers**: the layer's 256 MiB KV
+  cache (same size and per-layer handle as the decode path's), q_proj's output,
+  and o_proj's input.
+- **k_proj's and v_proj's outputs (4 MiB each) are passed to nothing.** They are
+  not arguments to the attention dispatch and not to any later one. So the KV
+  cache fill — and, on this path, RoPE — happens **off the NPU**, between
+  dispatches, which is consistent with `fill_kv_cache(buffer<bfloat16_t>&, ...)`
+  and `_rope(buffer<bfloat16_t>&, int)` being host-side symbols in
+  `libllama_npu.so`.
+
+Activation buffer sizes pin the chunk: 14,680,064 B / 2 B / 2048 = **3584 tokens**,
+and 58,720,256 / 2 / 8192 gives the same 3584. (The 4 MiB k/v buffers are that
+same 3584 x 512 x 2 B = 3.5 MiB rounded to the 1 MiB allocation granularity.)
 
 ### Decode — one command for the whole model
 
@@ -148,26 +188,60 @@ Weight format is **q4_1** (asymmetric, scale + min) — from
 **measured** — `benchmarks/flm_baseline/flm_bench.py`, medians of 3,
 `--pmode performance`, AIE clock 1.8 GHz.
 
+Re-taken 2026-07-31 on a **verified-quiet machine** (no `flm` processes, nothing
+holding an `accel0` fd). These supersede the earlier contended run.
+
 | model | workload | prompt tok | tok/s | achieved BW | % of ~55 GB/s fabric |
 |---|---|---|---|---|---|
-| Llama-3.2-1B | decode | 61 | **61.07** | **47.2 GB/s** | 86% |
-| Llama-3.2-1B | prefill | 7075 | **1774.5** | — | — |
-| Qwen3.6-35B-A3B | decode | 34 | **13.54** | **36.8 GB/s** | 67% |
-| Qwen3.6-35B-A3B | prefill | 8305 | **185.5** | — | — |
+| Llama-3.2-1B | decode | 61 | **59.86** | **46.2 GB/s** | 84% |
+| Qwen3.6-35B-A3B | decode | 34 | **13.41** | **36.4 GB/s** | 66% |
 
 Bandwidth = tok/s x streamed bytes/token (section 3).
 
-**Prefill throughput requires a long prompt.** The same model reports ~121 tok/s
-at 52 prompt tokens and 1774 tok/s at 7075, because a short prompt is dominated
-by the fixed ~430 ms TTFT.
+**The contention caveat resolved the opposite way to expectation.** The earlier
+run (61.07 / 47.2, 13.54) was taken with a resident second NPU client. Quiet, both
+models came out *slower* — llama -2.0%, MoE -1.0%. Contention was not inflating
+the figures. Mechanism unknown; plausibly the resident `flm serve` kept llama's
+weights in page cache, so that run streamed warm and this one cold. Untested.
+The quiet figure is also the better-corroborated one: against the independently
+recorded historical 60.1 tok/s / 46.4 GB/s it agrees to 0.4%, where the contended
+run was off by 1.6-1.7%.
 
-**caveat** — a pre-existing `flm serve` process held an NPU context during these
-runs. Figures agree with independently recorded historical ones (60.1 tok/s /
-46.4 GB/s), so distortion appears small, but they should be re-taken on a quiet
-machine before being treated as final.
+### Prefill — baseline taken 2026-07-31, at a stated length
 
-**derived** — at 86% of fabric, llama decode has little bandwidth headroom left;
-a decode win there must come from moving fewer bytes. The MoE at 67% is *not*
+Previously recorded here as "not quotable" because two runs used prompts of very
+different length (llama 7075 vs 3577 tokens). **The diagnosis was wrong.**
+`flm_bench.py` *does* pin its prompt: `make_prompt_file` is deterministic for a
+given `--prefill-tokens`, and regenerating it reproduces the checked-in
+`results/prefill_prompt.txt` byte for byte (md5 `9e73e8...` at the default 2048).
+The two runs simply used **different `--prefill-tokens`**. The harness now also
+records that setting in its CSV so a run is self-describing.
+
+Prefill throughput remains strongly prompt-length dependent (~121 tok/s at 52
+prompt tokens against 1623 at 1828 for the same model, because a short prompt is
+dominated by the fixed ~430 ms TTFT), so **the length below is part of the
+number**:
+
+| model | workload | `--prefill-tokens` | prompt tok | tok/s |
+|---|---|---|---|---|
+| Llama-3.2-1B | prefill | 2048 | **3577** | **2064.8** |
+| Qwen3.6-35B-A3B | prefill | 2048 | **4127** | **178.2** |
+
+Medians of 3; spread was under 1.6% on both. Prompt-token counts differ between
+the models because their tokenizers do, not because the input did.
+
+**Conditions: `flm serve llama3.2:1b` was resident, so this is a contended run**,
+not the verified-quiet condition of the decode table above. The same run's decode
+figures — llama **61.31**, MoE **13.55** — reproduce the earlier *contended*
+numbers (61.07 / 13.54) to 0.4% and 0.1% rather than the quiet ones, which both
+confirms the condition and bounds its effect at ~2%.
+
+**derived** — the MoE prefills **11.6x slower** than llama at a comparable prompt
+length, where active-parameter scaling predicts ~2.4x. Sparsity is a decode-only
+benefit: a long prompt activates essentially all 256 experts.
+
+**derived** — at 84% of fabric, llama decode has little bandwidth headroom left;
+a decode win there must come from moving fewer bytes. The MoE at 66% is *not*
 bandwidth-bound, so a third of its achievable rate is going elsewhere.
 
 ---
@@ -305,11 +379,28 @@ post-RMSNorm activations, and one a reproduction may knowingly make or avoid.
   only rows 2 and 4 emit. So row 3 feeds row 2 and row 5 feeds row 4 —
   **8 result streams, not 16**.
 
-  **open** — *what* is split between the pair. Two cores per output group with
-  the lower writing into the upper's memory is established (below); whether the
-  upper **sums** the two contributions (a K-split) or **concatenates** them (an
-  N-split) is not. Nothing observed so far distinguishes them, and the earlier
-  reading of this as "chained partial sums" was an assumption, not a measurement.
+  **RESOLVED 2026-07-31 — it is an N-split: the pair CONCATENATES.** Two
+  independent sources agree.
+
+  *Code.* Diffing the pair's programs with addresses stripped leaves 64 differing
+  lines, all of them register housekeeping — stack spill/reload under a different
+  regalloc, pointer and index setup, nop padding. **Zero differences in `vmac`,
+  `vadd`, `vsub`, `vmul`, `vconv` or any `vst`**; the vector store sequence is
+  byte-identical. A K-split requires the upper core to read the lower's partials
+  and add them, and that code exists in neither program.
+
+  *Buffer descriptors.* The pair's operand pointers differ only in memory window
+  — upper `p0=0x73c00`, `p3=0x75400`; lower `p0=0x43c00`, `p3=0x45400`. Per
+  `AIETargetModel.h` (NPU model) internal = East = `0x70000` and South =
+  `0x40000`, so the lower writes into its south neighbour = the upper. Those
+  offsets are exactly the upper's two output BDs (module `0x3C1C` and `0x541C`,
+  **132 B each**), and the lower core has **no output BD at all**. Two
+  equal-sized buffers with no reduction is concatenation; a sum would need one.
+
+  Consequence for reproduction: **two program variants per pair, differing only
+  in the output pointer base** (own vs south). The compute body is identical.
+  And "8 result streams" means 8 streams each carrying two concatenated
+  N-groups — not 8 reduced results.
 - **shuffle -> elementwise.** Rows 2,4 (shuffle) take input and emit nothing;
   rows 3,5 (elementwise) sit directly above and do emit.
 
@@ -499,11 +590,25 @@ leave DMA0 unconfigured. Row-3 tiles in columns 3-4 have a different shape.
 
 ## 6c. `attn.xclbin`
 
-Covered in its own deliverable: **`flm-attn-dataflow.md`**. Headline results —
-32 cores = 32 query heads (one each), 8 columns = 8 KV heads, 4 rows = GQA
-ratio 4, so the `k03`/`k47` split is columns 0-3 / 4-7; flash tile width pinned
-at **32 tokens**; and the KV layout transform is performed by the **memtile
-DMA's 4-D strided addressing**, not by the cores.
+Covered in its own deliverable: **`flm-attn-dataflow.md`**. Headline results,
+**rewritten 2026-07-31 — the head-mapping version that stood here is retracted**:
+
+- The array is a **fixed 32-core template** that does not track head count. Same
+  32 cores and same buffer sizes on models with 32, 24, 16 and 4 query heads, and
+  on one with a single KV head. `32 cores = 32 query heads`, `8 columns = 8 KV
+  heads`, `4 rows = GQA ratio` and the `k03`/`k47` column mapping were all read
+  off Llama-3.2-1B, where those numbers coincide by accident.
+- Cores are differentiated by two compile-time constants, `row - 2` and
+  `col & 1` — **8 distinct binaries** — plus which DMA stream they are wired to.
+- **BD0 is Q** (64 query positions per column pair, 32 per core), **BD1/BD2 are
+  K/V** (array-wide broadcast from memtile (3,1)), BD3/BD4 are the output. This
+  is the reverse of what that doc first concluded.
+- Tile width **32 query positions per core**, cross-checked by the memtile's
+  output-collection BD gathering exactly 32 x 128 B rows.
+- The layout transform is performed by the **memtile DMA's 4-D strided
+  addressing**, not by the cores — unchanged, and true of both operands.
+
+Consistent with this document: `attn.xclbin` is the **prefill** kernel.
 
 ---
 
@@ -517,18 +622,33 @@ DMA's 4-D strided addressing**, not by the cores.
 - **Which phase the MoE's third command is.** Plausibly its
   `mtp_num_hidden_layers: 1` head or its 30 linear-attention layers; not shown.
 - **Intra-layer ordering during prefill** (section 1).
-- **What is split between a GEMM pair** — two cores per output group with the
-  lower writing into the upper's memory is established; whether the upper sums
-  (K-split) or concatenates (N-split) is not.
-- **Two core roles remain inferred**: col 2 row 3 (6144 in / 4096 out, not
-  decomposed) and the *function* of the cols 3-4 shuffle/elementwise pipeline —
-  its *pairing* is confirmed, what it computes is not. GEMM, RMSNorm (2,2) and
+- ~~**What is split between a GEMM pair**~~ — **CLOSED 2026-07-31: N-split, the
+  pair concatenates.** No combining code exists in either program, and the pair
+  emits two equal 132 B buffers rather than one reduced result. See section 1.
+- **One core role remains inferred**: col 2 row 3 (6144 in / 4096 out, not
+  decomposed). The cols 3-4 pipeline is **RESOLVED: it applies RoPE** — the
+  elementwise cores carry `vmsc.f` (the multiply-subtract `x*cos - y*sin`
+  needs) found essentially nowhere else, and the pipeline's operands are
+  exactly **Q (4096 B = 2048 bf16 = 32x64)** and **K (1024 B = 512 bf16 =
+  8x64)** with **no V stream**, which is precisely what RoPE touches. Still
+  inferred within that: which of the pair deinterleaves vs rotates, and whether
+  these cores also carry a further elementwise stage (`vadd.f:73` exceeds what
+  the rotation alone needs). GEMM, RMSNorm (2,2) and
   SwiGLU (5,2) **are** confirmed, and the `p5` operand stream **is** resolved
   (the broadcast activation vector).
-- **Where RoPE is applied.** Narrowed to `layer.xclbin` — RoPE symbols exist only
-  in `libllama_npu.so`, and `libmha.so` has none — with cols 3-4 the likely site,
-  but not proven. Opcode mix does not discriminate (`attn` cores and `layer`
-  cols 3,4 rows 3,5 both have `vmsc.f` = 24 exactly).
+- ~~**Where RoPE is applied.**~~ **CLOSED 2026-07-31: cols 3-4.** The symbols put
+  it in `layer.xclbin` (present in `libllama_npu.so`, absent from `libmha.so`);
+  the **operand widths** locate it within the kernel. Both cols 3-4 cores carry
+  exactly two double-buffered widths — **4096 B = 2048 bf16 = Q (32x64)** and
+  **1024 B = 512 bf16 = K (8x64)** — matching `config.json` exactly, with **no
+  third stream for V**. V is also 512 bf16, so it would be visible if present.
+  RoPE touches Q and K and never V, which is precisely the pattern observed.
+  Supporting: `vmsc.f` (the multiply-subtract `x*cos - y*sin` needs) occurs in
+  `layer.xclbin` only in these four cores (24 each) and RMSNorm (4).
+
+  Note the earlier objection stands on its own terms and is why the widths, not
+  the opcode, carry this: `attn` cores also have `vmsc.f` = 24, so the opcode
+  alone is not a RoPE fingerprint across kernels.
 - **Whether any of this transfers to the MoE.** It is a *hybrid*: 30 linear
   attention / SSM layers, 10 full attention, `head_dim` 256,
   `num_key_value_heads` 2, 256 experts with 8 active, plus multi-token
