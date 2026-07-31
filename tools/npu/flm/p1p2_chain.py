@@ -88,7 +88,7 @@ FIN_SRC = str(KDIR / "flm_attn_finish.cc")
 Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
 TSEQ, GQA, KVPER = 32, 4, 2
 OPERAND = 20544
-NATT = 2                       # attention cores = KV heads
+NATT = 4                       # attention cores = KV heads
 
 
 def build(pos, nobj):
@@ -234,10 +234,10 @@ def _design(bc: In, {P}):
     for p in range({npairs}):
         for j in range(2):
             c = 2 * p + j
-            if p < {apairs}:
+            if p >= {npairs} - {apairs}:
                 workers.append(Worker(core_p1p2,
                     fn_args=[bc_cons[c], w_sub[p][j].cons(), p1_sub[p][j].prod(),
-                             p2_sub[p][j].prod(), kq, ke, kn, kab, kat, kaf],
+                             p2_sub[p - ({npairs} - {apairs})][j].prod(), kq, ke, kn, kab, kat, kaf],
                     stack_size=8192))
             else:
                 workers.append(Worker(core_p1,
@@ -262,11 +262,11 @@ def _design(bc: In, {P}):
         tg = TaskGroup()
         bch.fill(bcb, group=tg)
         for i in range(n):
-            if {SKIP_P1} and i < a:
+            if {SKIP_P1} and i >= n - a:
                 continue          # these cores skip P1, so no weights for them
             wh[i].fill(wb[i], group=tg)
         for i in range(n):
-            if {SKIP_P1} and i < a:
+            if {SKIP_P1} and i >= n - a:
                 continue
             p1h[i].drain(qb[i], wait=True, group=tg,
                          sizes=[1, 1, 1, 4 * {OBJ}], strides=[0, 0, 0, 1])
@@ -288,7 +288,7 @@ def _design(bc: In, {P}):
         bch.fill(kvb[0], group=tg)          # the broadcast now carries q'
         for i in range(a):
             src = kvb[1 + i] if {HOSTKV} else cb[i]
-            wh[i].fill(src, group=tg, offset=2 * i * {OPERAND},
+            wh[n - a + i].fill(src, group=tg, offset=2 * i * {OPERAND},
                        sizes=[1, 1, 1, 2 * {OPERAND}], strides=[0, 0, 0, 1])
         for i in range(a):
             p2h[i].drain(ab[i], wait=True, group=tg)
@@ -417,7 +417,9 @@ def main():
         qall[h * OBJ:h * OBJ + HEAD] = ref[h][:HEAD]
     qraw = qall.astype(bfloat16).view(np.uint16)
     qraw[NQ * OBJ:NQ * OBJ + 2] = np.array([float(npad)], np.float32).view(np.uint16)
-    q_in = [iron.tensor(qraw.view(bfloat16), dtype=bfloat16, device="npu")]
+    # one broadcast-shaped q' per attention pair — the design takes `apairs`
+    # of them, and a short list silently shifts every later argument.
+    q_in = [iron.tensor(qraw.view(bfloat16), dtype=bfloat16, device="npu")] * apairs
 
     q_ts = [iron.zeros(4 * OBJ, dtype=bfloat16, device="npu")
             for _ in range(npairs)]

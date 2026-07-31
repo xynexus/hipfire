@@ -7760,3 +7760,39 @@ The caveat that remains: these runs vary sequence length to hold KV volume
 constant, so the per-core softmax spans a longer sequence than a real layer's
 would. Streaming dominates and both are O(seq), so it is a fair proxy — but it
 is a proxy, not the real shape.
+## 2026-08-01 — routing solved: it was PLACEMENT, not resources
+
+`NATT=4` now routes and passes. The fix is one condition:
+
+    if p < apairs:              ->    if p >= npairs - apairs:
+
+P2 on the **last** core pairs routes; on the **first** pairs it does not. Same
+fifo count, same object sizes, same channel demand — only which columns carry the
+extra output paths. That confirms the earlier characterisation (nothing is
+exhausted at ten outputs) and supplies the fix the object-size refactor was
+being lined up to provide, at a fraction of the cost. **The unify-the-result-
+object plan is not needed.**
+
+Two supporting changes:
+
+  * KV fills into the weight fifo of the pair P2 actually runs on
+    (`wh[n-a+i]`, not `wh[i]`), and the `SKIP_P1` guards follow the move;
+  * `q_in` was a **one-element list** while the design takes `apairs` of them.
+    Latent at NATT=2 where apairs=1; at apairs=2 it silently shifted every later
+    argument, surfacing as `Tensor argument 'kvin1' has 512 elements but the
+    kernel was compiled for 4224`. That 512 is `2*GQA*HEAD` — an `a_ts` output
+    tensor being read as an input.
+
+| config | seq | attention err | tol | |
+|---|---|---|---|---|
+| NATT=2 | 31 | 3.5241e-03 | 4.1764e-03 | PASS (unchanged — no regression) |
+| NATT=4 | 31 | 3.4631e-03 | 3.8603e-03 | **PASS** |
+| NATT=4 | 17 | 4.1995e-03 | 4.9616e-03 | **PASS** |
+| NATT=4 |  9 | 5.8671e-03 | 7.0232e-03 | **PASS** |
+
+`NATT=8` still fails to route even on the last pairs, so twelve outputs is past
+what placement alone can fix. It does not matter: **NATT=4 is the configuration
+measured at 62.0 tok/s against FLM's 59.86**, and it now runs.
+
+Task 7's blocker is gone. Every phase verifies, the seam works, and the
+attention width that the projection needs is reachable.
