@@ -6589,12 +6589,27 @@ in whatever kernel is downstream.
 The `release` row matters: it rules out "the object is still locked", which was
 the obvious explanation and is wrong.
 
-**The boundary is still not fully characterised, and one case contradicts the
-simple rule.** `ffn_chain.py` puts *two* acquires between `flm_gemv_gate` and
-`flm_gemv_up_swiglu` and verifies exact. The structural difference from this
-probe is that there both calls sit in the same `range_` loop iteration, while
-here the write is outside the loop and the read inside. That is a hypothesis and
-not a result — stated so the next person tests it rather than trusting it.
+**Four hypotheses tested, all refuted.** The `range_`-iteration idea recorded
+above as a hypothesis was tested and is **wrong**:
+
+| variant | acquire between? | result |
+|---|---|---|
+| `interleave` | yes | LOST |
+| `release` | yes, after a `release` | LOST |
+| `inloop` | yes, both in one `range_` iteration | **LOST** |
+| `shared` | yes, but both calls take the same fifo object | **LOST** |
+| `hoist` | no | ok |
+
+So it is not the lock, not the loop, and not the absence of a visible data
+dependency. And `ffn_chain.py` still works with two acquires between its two
+kernels — if `g_gate` were lost there, SwiGLU would emit zero rather than land
+at 3.92% relative error. Something separates that case from all five variants
+and none of the obvious candidates is it.
+
+This now looks like a **silent miscompilation** rather than a usage error, and
+is a candidate to report upstream alongside Xilinx/mlir-aie#2406 — a decision
+for the user, not something to file autonomously. The five variants are kept so
+that starts from a reproduction rather than a symptom.
 
 What *is* established, and is enough to work with: **when two kernels
 communicate through a global, hoisting every acquire above both calls is always

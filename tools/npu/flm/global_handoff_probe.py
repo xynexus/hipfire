@@ -22,11 +22,22 @@ An intervening `release` does **not** help, which rules out the obvious
 
     ks(es); sc.release(1); ew = wc.acquire(1); ke(...)  ->  0.0   WRONG
 
-**The boundary is not fully characterised, and one known case contradicts the
-simple rule.** `ffn_chain.py` puts two acquires between `flm_gemv_gate` and
-`flm_gemv_up_swiglu` and verifies exact. The difference from this probe is that
-there both calls sit in the same `range_` loop iteration, whereas here the write
-is outside the loop and the read inside it. That is a hypothesis, not a result.
+**The mechanism is unexplained, and four hypotheses are refuted.** Only hoisting
+works; `release`, wrapping both calls in one `range_` iteration, and giving the
+two calls a shared fifo-object argument all still lose the value. Yet
+`ffn_chain.py` puts two acquires between `flm_gemv_gate` and
+`flm_gemv_up_swiglu`, communicates through `g_gate`, and verifies exact — if
+`g_gate` were lost its SwiGLU would output zero, not 3.92% relative error. So
+something separates that case from all five variants here and it is not any of:
+
+  - an intervening `release`            (variant `release`)
+  - being inside a `range_` loop        (variant `inloop`)
+  - a shared fifo argument              (variant `shared`)
+  - the mere presence of an acquire     (`ffn_chain` has two)
+
+This looks like a silent miscompilation rather than a usage error. The variants
+are kept so the next attempt starts from a five-way reproduction instead of a
+symptom.
 
     python3 global_handoff_probe.py            # all three variants
     python3 global_handoff_probe.py --variant hoist
@@ -42,6 +53,7 @@ import numpy as np
 
 import aie.iron as iron  # noqa: E402
 from aie.iron import In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker  # noqa: E402
+from aie.iron.controlflow import range_  # noqa: E402
 from aie.iron.device import AnyShimTile  # noqa: E402
 from aie.iron.kernel import ExternalFunction  # noqa: E402
 from ml_dtypes import bfloat16  # noqa: E402
@@ -84,6 +96,18 @@ def _design(a: In, b: In, o: Out):
     f_o = ObjectFifo(ty, depth=1, name="o_{variant}")
 
     def core(ac, bc, op, kwr, krd):
+      if "{variant}" == "inloop":
+        # ffn_chain's shape: both calls inside the SAME range_ iteration, with
+        # an acquire between them. Tests whether the device loop is what makes
+        # ffn_chain safe.
+        for _ in range_(1):
+            ea = ac.acquire(1)
+            kwr(ea)
+            eb = bc.acquire(1)
+            eo = op.acquire(1)
+            krd(eb, eo)
+            op.release(1); bc.release(1); ac.release(1)
+      else:
         ea = ac.acquire(1)
         if "{variant}" == "hoist":
             eb = bc.acquire(1); eo = op.acquire(1); kwr(ea)
@@ -91,7 +115,10 @@ def _design(a: In, b: In, o: Out):
             kwr(ea); ac.release(1); eb = bc.acquire(1); eo = op.acquire(1)
         else:                                   # "interleave" — the bug
             kwr(ea); eb = bc.acquire(1); eo = op.acquire(1)
-        krd(eb, eo)
+        # "shared" passes the object kernel A read as kernel B's first arg, so
+        # the two calls have a VISIBLE data dependency instead of only the
+        # invisible global. ffn_chain does this (both take `eb`).
+        krd(ea if "{variant}" == "shared" else eb, eo)
         op.release(1); bc.release(1)
         if "{variant}" != "release":
             ac.release(1)
@@ -112,7 +139,8 @@ def _design(a: In, b: In, o: Out):
     ns = dict(np=np, iron=iron, In=In, Out=Out, ObjectFifo=ObjectFifo,
               Program=Program, Runtime=Runtime, TaskGroup=TaskGroup,
               Worker=Worker, AnyShimTile=AnyShimTile,
-              ExternalFunction=ExternalFunction, A_SRC=A_SRC, B_SRC=B_SRC,
+              ExternalFunction=ExternalFunction, range_=range_,
+              A_SRC=A_SRC, B_SRC=B_SRC,
               ty=ty, __name__=f"gh_{variant}")
     exec(src, ns)
     return iron.jit(ns["_design"], source_files=[str(A_SRC), str(B_SRC)],
@@ -122,9 +150,13 @@ def _design(a: In, b: In, o: Out):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--variant", choices=["interleave", "release", "hoist"])
+    p.add_argument("--variant",
+                   choices=["interleave", "release", "hoist", "inloop",
+                            "shared"])
     o = p.parse_args()
-    variants = [o.variant] if o.variant else ["interleave", "release", "hoist"]
+    variants = ([o.variant] if o.variant
+                else ["interleave", "release", "inloop", "shared",
+                      "hoist"])
 
     print("kernel A reads an acquired object -> global -> kernel B reads it")
     print(f"{'variant':<12s} {'acquire between the calls?':<28s} {'out[0]':>7s}  ")
@@ -139,6 +171,8 @@ def main():
         design(a, b, out)
         got = float(out.numpy().astype(np.float64)[0])
         desc = {"interleave": "yes", "release": "yes, after a release",
+                "inloop": "yes, both in one range_ iter",
+                "shared": "yes, but calls share an arg",
                 "hoist": "no — hoisted above both"}[v]
         good = got == 42.0
         ok &= good if v == "hoist" else True
