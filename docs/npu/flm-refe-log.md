@@ -6564,3 +6564,38 @@ before a `sync_parameters()` in the sequence. Two notes from its source: the nam
 must be unique within the device, and **`np.float32` is unsupported** — the
 scratchpad encoding zeroes the value's top 2 bits, which clobbers an f32's sign
 and top exponent bits. Use `np.int32`.
+
+## 2026-07-31 — minimal repro: an acquire between two kernels sharing a global loses the handoff
+
+`tools/npu/flm/global_handoff_probe.py`. The bug that cost two ticks in
+`kv_emit_verify.py`, reduced to three variants that differ by one line.
+
+Kernel A reads an acquired fifo object and writes a core global; kernel B reads
+the global and writes the output. **That is the fused layer's pattern three
+times over** — `flm_gemv_gate → g_gate → flm_gemv_up_swiglu`,
+`flm_gemv_residual → g_resid → flm_gemv_flush`,
+`flm_gemv_qkv → g_stage → flm_qkv_emit`/`flm_kv_emit`.
+
+| variant | acquire between the calls? | out[0] | |
+|---|---|---|---|
+| interleave | yes | **0.0** | LOST |
+| release | yes, after a `release` | **0.0** | LOST |
+| hoist | no — both acquires above both calls | **42.0** | ok |
+
+42.0 is the value fed in. There is **no error, no warning, no diagnostic** — the
+output is just the global's initial value, which is why it reads as a logic bug
+in whatever kernel is downstream.
+
+The `release` row matters: it rules out "the object is still locked", which was
+the obvious explanation and is wrong.
+
+**The boundary is still not fully characterised, and one case contradicts the
+simple rule.** `ffn_chain.py` puts *two* acquires between `flm_gemv_gate` and
+`flm_gemv_up_swiglu` and verifies exact. The structural difference from this
+probe is that there both calls sit in the same `range_` loop iteration, while
+here the write is outside the loop and the read inside. That is a hypothesis and
+not a result — stated so the next person tests it rather than trusting it.
+
+What *is* established, and is enough to work with: **when two kernels
+communicate through a global, hoisting every acquire above both calls is always
+safe**, and it costs nothing.

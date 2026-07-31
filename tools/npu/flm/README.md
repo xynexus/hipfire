@@ -208,3 +208,12 @@ Each is a thing that cost real time; module docstrings have the detail.
   overflow here is silent and reads as a logic bug. Run `stack_audit.py` after
   changing a kernel's shape; today every kernel is ≤1088 B against a 4096 B
   stack.
+- **An `acquire` between two kernels that share a core global silently loses the
+  handoff.** The second kernel reads the global's initial value — no error, no
+  warning — so it surfaces as a logic bug in the downstream kernel.
+  `global_handoff_probe.py` reproduces it in three one-line variants and shows
+  an intervening `release` does *not* help, which rules out the obvious
+  lock explanation. `ffn_chain.py` contradicts the simple rule (two acquires
+  between gate and up_swiglu, exact) — the difference may be that its calls
+  share a `range_` iteration, untested. **Hoisting every acquire above both
+  calls is always safe and free**; do that when kernels share a global.
