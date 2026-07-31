@@ -34,16 +34,46 @@
 
 #include "flm_q4_1_tile.h"
 
+#ifndef DIM_RESN
+#define DIM_RESN 128            // residual rows this core owns (N / cores)
+#endif
+
+// This core's rows of the post-attention residual stream, handed to
+// flm_gemv_flush without going through memory. See the epilogue below.
+alignas(64) float g_resid[DIM_RESN];
+
 extern "C" __attribute__((noinline)) void
 flm_gemv_q4_1_residual(const bfloat16 *restrict act_aux,
-                       const uint8 *restrict wtile, float *restrict out) {
-  flm_q4_1_tile(act_aux, wtile, out);
+                       const uint8 *restrict wtile,
+                       bfloat16 *restrict out) {
+  // Emits bf16: `h` is the residual stream, which every phase of the fused
+  // layer carries in bf16, and one result-object shape per phase is what
+  // keeps the topology legal — two differently-typed result fifos need 16
+  // shim outputs and the router gives up (`Unable to find a legal routing`).
+  float acc[NROWS];
+  flm_q4_1_tile(act_aux, wtile, acc);
   // The residual comes from the broadcast buffer's aux half, indexed by the
   // tile's own row_base. It CANNOT be packed into the tile as it was before:
   // in a fused layer the residual is computed on-device during the same
   // dispatch, so it does not exist at pack time.
   const bfloat16 *restrict aux = act_aux + K;
   const int base = tile_row_base(wtile);
-  for (int r = 0; r < NROWS; ++r)
-    out[r] += float(aux[base + r]);
+  for (int r = 0; r < NROWS; ++r) {
+    const float h = acc[r] + float(aux[base + r]);
+    out[r] = bfloat16(h);
+    // Stash this core's own rows of `h` for the FFN's residual add.
+    //
+    // In the fused layer, `h` is needed in FIVE places: phase P4's activation
+    // half, and the aux half of each of P5's four down-chunk objects. A drain
+    // consumes its data once, so one phase cannot write it to five
+    // destinations, and P3 would have to emit it repeatedly.
+    //
+    // It does not have to travel at all. P5's flush needs only the residual for
+    // the rows IT outputs, and P3 and P5 have the same shape — N=2048 over 16
+    // cores, 8 tiles each — so if they use the same row assignment, the core
+    // that will need a residual is the core that just computed it. Keeping it
+    // in 512 B of core memory removes the copy, and with it 16 KB per layer of
+    // broadcast traffic.
+    g_resid[(base + r) % DIM_RESN] = h;
+  }
 }

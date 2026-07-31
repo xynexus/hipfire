@@ -6140,3 +6140,65 @@ So Task 8's premise holds on measurement. The unroll is worth what the
 projection said, and combined with the earlier feasibility result (320 phases
 fit one dispatch, ~17 host buffers against a ceiling of 64) there is nothing
 left to check before building it.
+
+## 2026-07-31 — P3 emits bf16 (forced), and an in-core residual that does not work yet
+
+Working toward the full 5-phase layer. Two results, one solid and one open.
+
+### `h` is needed in five places, and a drain writes to one
+
+Phase P3 produces `h`, and the fused layer needs it as P4's activation half *and*
+as the aux half of each of P5's four down-chunk objects. A drain consumes its
+data once, so no phase can write it to five destinations, and P3 would have to
+emit it repeatedly.
+
+The proposed fix is that it should not travel at all: P5's flush needs only the
+residual for the rows **it** outputs, and P3 and P5 have the same shape (N=2048,
+16 cores, 8 tiles each), so with a shared row assignment the core that needs a
+residual is the core that just computed it. 512 B of core memory replaces the
+copy and removes 16 KB per layer of broadcast traffic.
+
+### Established: P3 must emit bf16
+
+Not a preference — a routing constraint. With P3 emitting f32 and P5 bf16 they
+cannot share a result fifo, and two typed result fifos need 16 shim outputs.
+The router does not report congestion, it reports **`Unable to find a legal
+routing`**, which reads like a placement bug and is a budget failure. One
+result-object shape per phase is what makes the topology placeable, and bf16 is
+the right type anyway: `h` is the residual stream, which every phase carries in
+bf16.
+
+`tools/npu/flm/resid_chain.py` runs P3 → P5 back to back in one dispatch,
+skipping P4 (its SwiGLU output is host-supplied, since the residual path is what
+is under test). With the residual routed the old way, through the broadcast aux
+half:
+
+| | max err |
+|---|---|
+| P3 `h` | **0.0000e+00** |
+| P5 `x_out` | **0.0000e+00** |
+
+Exact, once the reference rounds to bf16 at both points the device does — the
+`gemv_reference_bf16` lesson again, and it cost two rounds here.
+
+### Open: the in-core stash reads as zero
+
+`-DRESID_FROM_STASH=1` fails, and the diagnostic is unambiguous: `x_out` matches
+`W_down·swiglu + 0` at **100% exact**, so `flm_gemv_flush` reads `g_resid` as
+zero. Ruled out, each checked rather than assumed:
+
+- **Not the row mapping.** P3 and P5 use the same assignment, and
+  `(base + r) % DIM_RESN` covers 0..255 distinctly for both.
+- **Not the symbol.** `llvm-nm` shows `g_resid` defined (B) in
+  `flm_gemv_residual.o` and undefined (U) in `flm_gemv_flush.o` — the same shape
+  as `g_acc_down`, which crosses the same TU boundary and **works** (chunked
+  `down_proj` accumulates correctly across four calls).
+- **Not dead-code elimination.** `llvm-objdump -r` shows 16 relocations to
+  `g_resid` in the writing object, exactly as many as to `g_acc_down` in its.
+- **Not P3 failing.** P3's own output is bit-exact in the same run.
+
+So a global written by one kernel and read by another works for `g_acc_down` and
+does not for `g_resid`, with no difference visible in the symbols, the
+relocations, the row arithmetic, or the phase order. That is the whole of what is
+known. The control path passes exactly and is what the layer will use until this
+is understood; `resid_chain.py --aux-residual` keeps it checkable.

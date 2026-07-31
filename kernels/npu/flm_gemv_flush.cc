@@ -14,6 +14,18 @@
 
 extern float g_acc_down[];
 
+#ifndef RESID_FROM_STASH
+#define RESID_FROM_STASH 0
+#endif
+#if RESID_FROM_STASH
+#ifndef DIM_RESN
+#define DIM_RESN 128
+#endif
+// Written by flm_gemv_residual in phase P3, on this same core. See that file
+// for why the residual does not travel through the broadcast.
+extern float g_resid[];
+#endif
+
 // Emits **bf16**, not f32. This is the layer's output `x_out`, which is the
 // next layer's residual stream, and every inter-phase value in the fused layer
 // is bf16 — the broadcast object is bf16, so an f32 result would have to be
@@ -28,7 +40,12 @@ flm_gemv_flush(const bfloat16 *restrict act_aux, const uint8 *restrict wtile,
   const int slot = base % DIM_ACCN;
   const bfloat16 *restrict aux = act_aux + K;
   for (int r = 0; r < NROWS; ++r) {
-    out[r] = bfloat16(g_acc_down[slot + r] + part[r] + float(aux[base + r]));
+#if RESID_FROM_STASH
+    const float res = g_resid[(base + r) % DIM_RESN];
+#else
+    const float res = float(aux[base + r]);   // standalone harnesses
+#endif
+    out[r] = bfloat16(g_acc_down[slot + r] + part[r] + res);
     g_acc_down[slot + r] = 0.0f;   // ready for the next token
   }
 }

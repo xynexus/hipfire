@@ -60,9 +60,9 @@ def norm_gemv(actnw: In, w: In, out: Out, *, K: CompileTime[int] = 2048,
     # every phase.
     act_ty = np.ndarray[(2 * K,), np.dtype[bfloat16]]
     wt_ty = np.ndarray[(wtile,), np.dtype[np.uint8]]
-    o_ty = np.ndarray[(NROWS,), np.dtype[np.float32]]
+    o_ty = np.ndarray[(NROWS,), np.dtype[bfloat16]] if RESID else np.ndarray[(NROWS,), np.dtype[np.float32]]
     w_all_ty = np.ndarray[(ntiles * wtile,), np.dtype[np.uint8]]
-    o_all_ty = np.ndarray[(N,), np.dtype[np.float32]]
+    o_all_ty = np.ndarray[(N,), np.dtype[bfloat16]] if RESID else np.ndarray[(N,), np.dtype[np.float32]]
 
     flags = [f"-DDIM_K={K}", f"-DDIM_NROWS={NROWS}"]
     kern = ExternalFunction(
@@ -142,7 +142,8 @@ def main():
     a_t = iron.tensor(np.concatenate([x, aux]).astype(bfloat16),
                       dtype=bfloat16, device="npu")
     w_t = iron.tensor(wbuf, dtype=np.uint8, device="npu")
-    o_t = iron.zeros(N, dtype=np.float32, device="npu")
+    o_t = iron.zeros(N, dtype=bfloat16 if o.residual else np.float32,
+                     device="npu")
     norm_gemv(a_t, w_t, o_t, K=K, N=N, NROWS=NROWS,
               RESID=1 if o.residual else 0)
     got = o_t.numpy().astype(np.float64)
