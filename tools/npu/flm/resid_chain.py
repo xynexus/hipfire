@@ -57,7 +57,10 @@ ACC_SRC = str(KDIR / "flm_gemv_acc.cc")
 FLUSH_SRC = str(KDIR / "flm_gemv_flush.cc")
 ASUM_SRC = str(KDIR / "flm_asum_prepare.cc")
 Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
-K_DIM, NROWS, BLK = 2048, 16, 32
+import os as _rne
+# NROWS follows the fused layer; see the log on composing measurements
+# taken under different configurations.
+K_DIM, NROWS, BLK = 2048, int(_rne.environ.get('RESID_NROWS', 16)), 32
 D_MODEL, D_FF, NCHUNK = 2048, 8192, 4
 
 rnd = lambda v: q4nx.bf16_to_f32(q4nx.f32_to_bf16(np.asarray(v, np.float32)))

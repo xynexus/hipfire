@@ -9794,3 +9794,27 @@ what went wrong: NROWS=16 phases carried past a config change; dispatch
 double-counted; NROWS=8 and 16 builds mixed; a GEMV penalty applied to the FFN;
 and now a roof rate applied to a real GEMV. Every one was a number that was
 plausible in isolation and wrong in composition.
+
+### P5 cross-checked — the audit closes, and the numbers hold
+
+`resid_chain` gained `RESID_NROWS` and was measured at the layer's configuration:
+
+    resid_chain (P3+P5) marginal   NROWS=16  247.8 µs   NROWS=8  247.1 µs
+
+Flat in NROWS, like the FFN. P5's cost derived two independent ways:
+
+    from ffn_chain   (10.52 of 31.65 MB)   195.9 µs
+    from resid_chain (10.52 of 13.19 MB)   197.1 µs
+    agree within 0.6%
+
+**This is the first derived term that survived checking.** Every other one moved
+when measured — and always in the same direction. So the projection's last
+unmeasured component is sound, and the conclusion is now built entirely from
+measurements or cross-validated derivations:
+
+    single dispatch (does not fit)   17.06 ms -> **58.6 tok/s**  (−2.1% vs FLM)
+    two dispatches (buildable)       18.55 ms -> **53.9 tok/s**  (−9.9%)
+
+The audit is closed. Every term — the chain's wall, the FFN, P5, the lm_head, the
+dispatch and barrier constants — is measured or corroborated at NROWS=8. Nothing
+further is expected to move the answer.
