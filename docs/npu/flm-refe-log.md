@@ -10601,3 +10601,31 @@ symptoms of a design that has run out of per-core DMA fanin.
 Recorded as a closed door with a named alternative, and as a correction: the two
 walls I have been describing as "routing" and "hang" are more likely one
 constraint — DMA fanin — seen from two angles.
+
+### Retracting the consolidation: the two walls are NOT the same constraint
+
+I ended the last entry suggesting the NATT=8 routing failure and the DMA-fanin
+failure "are probably one constraint seen from two angles". Checking rather than
+asserting: they are not, and the evidence is in which compiler stage each dies at.
+
+    DMA channels   (2/42) placed.mlir          "3 input/2 output ... only 2/2 available"
+    legal routing  (9/42) input_physical.mlir  "Unable to find a legal routing"
+
+The per-core DMA check runs at stage 2; routing at stage 9. **NATT=8 reaches
+stage 9**, so it passes the DMA check outright — no core in that configuration
+asks for a third input channel. Which makes sense on inspection: NATT=8 changes
+*which* cores run attention, not how many fifos any one core touches. Each core
+still sees broadcast + weight in, and two out.
+
+So there are two independent walls after all:
+
+  * **per-core DMA fanin (2 in / 2 out)** — hit only when a core is given a third
+    input stream, which is what a dedicated KV fifo does. Fix: memtile staging.
+  * **inter-tile routing** — hit at NATT=8, with no per-core violation. Cause
+    still unpinned; the routing budget was never quantified.
+
+The 7-object hang belongs to neither yet: it builds clean through both checks and
+fails at runtime.
+
+Three walls, three different mechanisms. Tidier to call them one; it just is not
+what the compiler says.
