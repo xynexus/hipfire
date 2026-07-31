@@ -6307,3 +6307,51 @@ v′ is unaffected: it is a contiguous 64-element write.
 The probe is left checking the **f32** path, since that is the one proven to
 work; the bf16 constraints are recorded in its docstring so the next attempt
 does not rediscover them.
+
+## 2026-07-31 — core `.bss` PERSISTS between dispatches: the k′ append stays bf16
+
+`tools/npu/flm/static_persist_probe.py`. The previous entry left the k′ append
+choosing between a proven f32 K cache (double the KV traffic) and a free bf16
+paired append that assumed a core could carry `k′_{t-1}` from one dispatch to
+the next. Measured: **it can.**
+
+A kernel incrementing a file-scope `float[]` and emitting it, over six separate
+dispatches on one loaded design:
+
+| | values |
+|---|---|
+| control, stateless kernel writing 7.0 | 7, 7, 7, 7, 7, 7 |
+| **counter** | **1, 2, 3, 4, 5, 6** |
+
+So core `.bss` survives between dispatches while the xclbin stays loaded, and
+the paired append is available:
+
+    even t:  emit (k′_t, 0)               at offset t
+    odd  t:  emit (k′_{t-1}, k′_t)        at offset t-1
+
+Both writes are 2 elements at an even offset, which is the narrowest legal
+channel-major bf16 scatter. **K stays bf16 at 5.26 MB/layer** (S=2048) instead
+of f32's 10.52, worth roughly 6 tok/s on the measured projection. The zero
+partner at even `t` is also exactly what attention's `npad` correction wants
+from a padded position.
+
+### Two false answers before the true one, both from the harness
+
+The probe reported "does not persist" twice, and neither reading was about
+persistence:
+
+1. **Default fifo depth 2** gave `0, 2, 0, 4, 0, 6` — the drain alternated
+   buffers and read the one the core had not just written. The even values were
+   real, which is what made it look like partial persistence.
+2. **`stack_size=4096`** gave all zeros even at depth 1. The disassembly shows
+   the frame is `paddxm [sp], #0x1c40` — **7232 bytes** for a 32-element float
+   loop, because the compiler spills whole vector register files. The overflow
+   is silent and corrupts the result, exactly as this log's earlier entry on the
+   1024 B IRON default says. 4096 is not a safe default either; this needed
+   16384.
+
+What separated harness from hardware was a **stateless control** — the same
+kernel writing a constant. It passed while the counter read zero, which located
+the fault in the global rather than the plumbing, and made the stack frame worth
+looking at. Without it the probe would have shipped "core state does not
+persist" and the design would have taken the f32 path and the 6 tok/s.
