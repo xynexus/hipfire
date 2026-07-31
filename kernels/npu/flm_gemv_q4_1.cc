@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: Apache-2.0
+// hipfire - see LICENSE and NOTICE in the project root.
+//
+// Decode GEMV over q4_1 weights for AIE2P — the compute body of the
+// `layer.xclbin` reproduction (phase 2 milestone 4).
+//
+// Weight format, established from FLM's own container in
+// `docs/npu/flm-refe-log.md`: asymmetric q4_1, **32 contiguous input dims per
+// block**, one bf16 scale `d` and one bf16 min `m` per block, planar per tile:
+//
+//     [NROWS*NB bf16 d][NROWS*NB bf16 m][NROWS*K/2 bytes of packed nibbles]
+//
+// which is 5.00 bits/weight exactly, matching FLM byte for byte. Nibbles are
+// in plain element order — byte j carries element 2j in its low nibble and
+// element 2j+1 in its high nibble — because that is what lets the codes be
+// loaded as a native uint4 vector and widened by the hardware.
+//
+// The dequant folds out of the inner loop. With w = d*q + m and the GEMV
+// summing over K,
+//
+//     out[n] = sum_b ( d[n,b] * sum_t q[n,b,t]*a[b,t]  +  m[n,b] * sum_t a[b,t] )
+//
+// so the zero-point term collapses to one scalar per block against an
+// activation block-sum that is shared by every output row, and the codes go
+// into the MAC as small integers. FLM instead spends a 42-op dequant chain
+// materialising bf16 weights; that chain is not reproduced here, and it does
+// not need to be — the weight supply is 2.57 MACs/cycle/core against the MAC
+// unit's 512, so the body is built for correctness and for bytes.
+//
+// Compile-time: -DDIM_K (input dims) -DDIM_NROWS (output rows per tile).
+
+#include <aie_api/aie.hpp>
+#include <stdint.h>
+
+#ifndef DIM_K
+#define DIM_K 2048
+#endif
+#ifndef DIM_NROWS
+#define DIM_NROWS 8
+#endif
+
+namespace {
+constexpr int K = DIM_K;
+constexpr int NROWS = DIM_NROWS;
+constexpr int BLK = 32;            // weights per q4_1 block
+constexpr int NB = K / BLK;        // blocks per output row
+constexpr int HALF = BLK / 2;      // lanes per nibble half within one block
+constexpr int LANES = 2 * HALF;    // two blocks per iteration — see below
+constexpr int QBYTES = K / 2;      // packed bytes per output row
+
+static_assert(NB % 2 == 0, "K must be a multiple of 64");
+static_assert(NB % LANES == 0, "K/32 must be a multiple of 32 for the zero-point reduction");
+
+// Two blocks are unpacked at a time, not one. A 16-lane uint8 vector is 128
+// bits, which the AIE2P backend cannot legalize (`unable to legalize
+// G_AND <4 x s32>`); 32 lanes is 256 bits and is native. So the byte-domain
+// work runs 32-wide while the bf16 domain stays 16-wide per sub-block.
+//
+// A 32-byte group holds two whole blocks in element order, so unpacking gives
+// 64 bf16 lanes that line up with a contiguous 64-element activation run.
+// Widening keeps the codes exact — 0..15 is well inside bf16's 8-bit
+// significand, so nothing is lost before the MAC.
+//
+// The native uint4 operand is 75 instructions for this loop against 103 for a
+// masked-uint8 version, because `vband` disappears and the widening rides the
+// load. The body is op-bound, not bandwidth-bound, at this size, so that is
+// the axis that matters.
+//
+// **Plain element order is a convenience here, NOT a requirement.** Any nibble
+// order can be consumed for ~1 extra instruction using the shuffle network:
+// llama.cpp's split form (byte j -> elements j and j+16 of one block) unpacks
+// to lanes [e0,e16,e1,e17,...], which `aie::interleave_unzip(lo, hi, 1)`
+// separates in one op — measured at **76 instructions against this loop's
+// 75**. An earlier version of this comment claimed that form cost 25 vector
+// ops per 64 weights against 18; that was true only of a `aie::concat`-based
+// gather and is wrong as a statement about the format. It matters because
+// FLM's own nibble order is not yet known, and consuming it will be cheap.
+//
+// Note `aie::downshift` on a uint8 vector **segfaults the AIE2P backend**
+// (fine on uint16 — see `tools/npu/flm/README.md`), which is what ruled out
+// the obvious shift-based nibble extraction in the first place.
+inline void unpack_codes(const uint8 *restrict qs,
+                         aie::vector<bfloat16, LANES> &lo,
+                         aie::vector<bfloat16, LANES> &hi) {
+  // Load the 32 bytes AS 64 uint4 lanes and let the hardware widen them. This
+  // is the native int4 operand path: it issues `vldb.unpack` (widening folded
+  // into the load) and `vups.4x`, which are exactly the instructions FLM's
+  // GEMM cores carry (`vunpack:64 vups.4x:64`).
+  const auto packed = aie::load_v<2 * LANES>(reinterpret_cast<const uint4 *>(qs));
+  const auto wide = aie::to_float<bfloat16>(aie::unpack(packed));
+  lo = wide.template extract<LANES>(0);   // block b   -> elements 0..31
+  hi = wide.template extract<LANES>(1);   // block b+1 -> elements 32..63
+}
+} // namespace
+
+extern "C" __attribute__((noinline)) void
+flm_gemv_q4_1(const bfloat16 *restrict act, const uint8 *restrict wtile,
+              float *restrict out) {
+  // Round to nearest even on every accum->bf16 conversion. The default mode
+  // TRUNCATES, which puts a one-sided bias on each rounded product; the GEMV
+  // sums ~2000 terms whose magnitudes total far more than the result (heavy
+  // cancellation), so a systematic bias survives the reduction where a
+  // symmetric error would not. Measured cost of leaving it unset: 13% on a
+  // real row, against 0.19% for correctly-rounded bf16 operands.
+  aie::set_rounding(aie::rounding_mode::conv_even);
+
+  const auto *dq = reinterpret_cast<const bfloat16 *>(wtile);
+  const auto *mq = dq + NROWS * NB;
+  const uint8 *qs = wtile + 2 * NROWS * NB * sizeof(bfloat16);
+
+  // Block sums of the activation, shared by every output row in the tile.
+  // Computed once per call rather than per row, so the cost amortises over
+  // NROWS instead of riding the inner loop. Each sum is accumulated in float
+  // and only then rounded to bf16: reducing a bf16 vector directly rounds at
+  // every step of the tree and loses ~1% on a 32-element sum, which would then
+  // ride the zero-point term for every output row.
+  //
+  // Kept as bf16 so the zero-point term can be reduced with the same vector
+  // MAC path as the dot term — see the loop below for why a scalar loop is not
+  // an option here.
+  // alignas is load-bearing: this array is vector-loaded below, and an
+  // unaligned 512-bit load off the stack returns garbage (the symptom is NaN
+  // in every output, not a fault).
+  alignas(64) bfloat16 asum[NB];
+  for (int b = 0; b < NB; ++b) {
+    const auto ones = aie::broadcast<bfloat16, HALF>(bfloat16(1.0f));
+    aie::accum<accfloat, HALF> t;
+    t.from_vector(aie::zeros<float, HALF>());
+    t = aie::mac(t, aie::load_v<HALF>(act + b * BLK), ones);
+    t = aie::mac(t, aie::load_v<HALF>(act + b * BLK + HALF), ones);
+    asum[b] = bfloat16(aie::reduce_add(t.template to_vector<float>()));
+  }
+
+  for (int r = 0; r < NROWS; ++r) {
+    const bfloat16 *drow = dq + r * NB;
+    const bfloat16 *mrow = mq + r * NB;
+    const uint8 *qrow = qs + r * QBYTES;
+
+    // ponytail: single accumulator, so both MACs in an iteration serialise on
+    // its latency. Splitting them into two independent accumulators is the
+    // obvious ILP fix and it does not compile — a second 32-lane float
+    // accumulator makes the backend emit a 16-lane float add it cannot
+    // legalize (`G_FADD <16 x s32>`), the same limit that forced the
+    // zero-point term into this accumulator. Revisit if the Peano backend
+    // grows 16-lane float support; see the throughput section of
+    // docs/npu/flm-reproduction-results.md.
+    aie::accum<accfloat, LANES> vacc;
+    vacc.from_vector(aie::zeros<float, LANES>());
+
+    for (int b = 0; b < NB; b += 2) {
+      // One 32-byte load carries both blocks in element order, so each
+      // unpacked 32-lane code vector lines up with a CONTIGUOUS 32-lane
+      // activation load and the scale is one broadcast per block.
+      aie::vector<bfloat16, LANES> lo, hi;
+      unpack_codes(qrow + b * HALF, lo, hi);
+
+      // Fold the block scale into the activation rather than onto the 32
+      // decoded weights: one multiply per block instead of a per-weight
+      // rescale, and the codes stay exact going into the MAC.
+      const auto d0 = aie::broadcast<bfloat16, LANES>(drow[b]);
+      const auto d1 = aie::broadcast<bfloat16, LANES>(drow[b + 1]);
+
+      const auto a0 = aie::mul(aie::load_v<LANES>(act + b * BLK), d0)
+                          .template to_vector<bfloat16>();
+      const auto a1 = aie::mul(aie::load_v<LANES>(act + (b + 1) * BLK), d1)
+                          .template to_vector<bfloat16>();
+
+      vacc = aie::mac(vacc, lo, a0);
+      vacc = aie::mac(vacc, hi, a1);
+    }
+
+    // Zero-point term, sum_b m[b]*asum[b], as a vector MAC.
+    //
+    // This was a scalar loop and it MISCOMPILED: written as
+    // `msum += float(mrow[b])*asum[b] + float(mrow[b+1])*asum[b+1]` inside the
+    // stride-2 loop above, the device dropped every b+1 term — the result
+    // matched "even blocks only" to six digits, while `mrow[b]`, `asum[b]`,
+    // `sum_b mrow[b]` and `sum_b asum[b]` all read back correct on their own.
+    // A plain `for (b=0..NB) m2 += float(mq[b])*asum[b]` produced a third,
+    // different wrong value. The vector form below is correct; scalar
+    // reductions mixing bf16 loads with a float accumulator are not to be
+    // trusted on this Peano build.
+    // It accumulates into the SAME 32-lane accumulator as the dot term, since
+    // both are summed into one scalar at the end anyway — one reduction, not
+    // two. A separate 16-lane accumulator also fails to legalize here
+    // (`G_FADD <16 x s32>`), so the width is forced as well as preferred.
+    for (int b = 0; b < NB; b += LANES)
+      vacc = aie::mac(vacc, aie::load_v<LANES>(mrow + b),
+                      aie::load_v<LANES>(asum + b));
+
+    out[r] = aie::reduce_add(vacc.template to_vector<float>());
+  }
+}
