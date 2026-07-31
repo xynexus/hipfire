@@ -5187,3 +5187,55 @@ per weight tile for the residual.
 The remaining step from 17 to 2 is the cross-core barrier — `down_proj` needs
 the whole 8192-wide SwiGLU output, so it needs every core's slice — plus the KV
 cache append. Those are the only structural pieces left.
+
+## 2026-07-31 — Fused-layer falsifier PASSES: an in-dispatch barrier is 6.37 us, 14.6x cheaper than a dispatch
+
+An 11-agent design workflow produced `docs/npu/flm-fused-layer-plan.md` (surveys
+-> three competing designs -> adversarial judges -> synthesis). Its own Task 0 is
+a falsifier, and it named the single number the plan was missing: **what does a
+phase barrier INSIDE one dispatch cost?** The whole design — one dispatch per
+layer with 5 internal barriers replacing 5 dispatches — is a bet that this is
+below the measured 92.9 us per-dispatch cost.
+
+`tools/npu/flm/barrier_probe.py`: the same 16-core paired topology, a no-op
+kernel, N sequential `fill`/`drain(wait=True)` round trips in ONE runtime
+sequence.
+
+| phases/dispatch | us | us/phase |
+|---|---|---|
+| 1 | 71.6 | 71.6 |
+| 5 | 91.9 | 18.4 |
+| 20 | 197.0 | 9.8 |
+| 80 | 573.0 | 7.2 |
+
+    time_us = 64.7 + 6.37 * phases        R^2 = 0.99971
+
+**6.37 us per in-dispatch barrier against 92.9 us per dispatch — 14.6x
+cheaper.** The gate was `< 93 us`; it passes by more than an order of magnitude,
+so the fused layer is worth building and the plan's central bet is sound.
+
+| | ms/token | tok/s | vs FLM |
+|---|---|---|---|
+| today: 81 dispatches, 0 barriers | 21.07 | 47.5 | 0.79x |
+| **fused: 17 dispatches, 80 barriers** | **15.64** | **63.9** | **1.07x** |
+
+### The probe found a second thing the plan needs
+
+**80 barriers per token does not compile without BD reuse.** Each `fill`/`drain`
+allocates a buffer descriptor, and N phases x 8 pairs exceeds the **16
+simultaneously-active BDs a shim tile supports**:
+
+    'aiex.dma_configure_task' op Too many simultaneously active buffer
+    descriptors on tile (1,0), which supports up to 16. Emit an
+    aiex.dma_free_task / aiex.dma_await_task to reuse BDs.
+
+Wrapping each phase in its own `TaskGroup` fixes it — the same mechanism
+milestone 1 needed for many-buffer dispatches, now required for many-*barrier*
+ones too. IRON also forbids mixing explicit groups with the implicit default,
+so once one fill is grouped they all must be. **The fused-layer plan must group
+per phase**; it does not currently say so.
+
+Also worth noting: a single-phase dispatch measures 71.6 us here against the
+92.9 us fitted on the GEMV sweep, which is consistent — this probe moves 8 KB
+where that fit was over 6.6-164 MB, and the intercept is not identical across
+transfer regimes.
