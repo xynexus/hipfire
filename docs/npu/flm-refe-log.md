@@ -7548,12 +7548,37 @@ are NOT demonstrated:
 
   1. that P1/P2/P3 unroll with the same amortisation. Only the FFN half has been
      measured, and P1→P2 does not yet work at all;
-  2. that a full layer unrolled 16x **fits in 16 KB of program memory**. The FFN
-     half fits — that is what these numbers are — but §1.5b already put one
-     layer's kernels at 78% of program memory with `noinline`. Sixteen copies of
-     a full layer is the obvious place this plan breaks, and nothing here shows
-     it does not.
+  2. ~~that a full layer unrolled 16x fits in 16 KB of program memory~~ —
+     **retracted the same day, see below.**
 
 So: the lever is real and measured on the half that works. Whether it survives
-the full layer is the open question, and it is a program-memory question rather
-than a bandwidth one.
+the full layer is the open question.
+
+### Correction: the unroll does NOT multiply program memory
+
+I flagged 16 KB of core program memory as the likely breaking point. That was
+wrong, and the evidence was already in hand.
+
+`ffn_chain` builds the unroll as `for _ in range_(nrep)` — a **device loop**, so
+the body is emitted **once** regardless of depth. The proof needs no new
+measurement: §1.5b puts one layer's kernels at 78% of program memory, so if the
+body were duplicated even twice it could not have built, let alone sixteen
+times. The repeat=16 run succeeding *is* the evidence.
+
+Two distinct budgets were being conflated:
+
+  - **core program memory (16 KB)** — constant in `nrep`, because the device
+    loop body is emitted once;
+  - **the runtime sequence** — `for _rep in range(nrep)` on the host side emits
+    `nrep` sets of DMA descriptors. That grows linearly, but it lives in the
+    control processor's instruction stream, a separate and far larger budget.
+
+The weight stream is genuinely repeat-sized (`total = repeat * ncores * ... * wt`,
+504.89 MB at nrep=16) and time scaled linearly, so the measurement is a faithful
+model of 16 real layers — the only difference for real weights is which DDR
+addresses are read, which costs the same.
+
+**This removes one of the two caveats on the 63.3 tok/s projection.** The
+surviving constraint is unchanged and unrelated to unrolling: all five phases'
+kernels must coexist in 16 KB, which §1.5b already measures at 78% for one
+layer. Depth does not make that worse.
