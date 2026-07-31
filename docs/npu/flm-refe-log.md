@@ -3767,3 +3767,66 @@ formats.
 An earlier draft did try to rebuild it and got stuck on int8->bf16 conversion
 intrinsics. Abandoning that was the right call twice over — the arithmetic above
 makes the comparison unnecessary.
+
+---
+
+## 2026-07-31 — Phase 4 added to the plan: bandwidth reduction
+
+Added a fourth phase to `~/flm-re-fe-mutate-goal.md` on the user's request:
+QTIP-3 trellis quant and other bandwidth-reduction levers.
+
+**Why it belongs, in one line:** the phase 0-2 measurements say decode is
+bandwidth-bound with the MAC unit **199x oversupplied**, so bytes per weight is
+the dominant lever and the plan had no phase aimed at it.
+
+### The argument that makes QTIP interesting *here* specifically
+
+On a GPU, trellis formats are held back by decode cost — sequential work per
+weight against contended ALUs. **On this hardware the ALUs are 199x idle while
+the core waits on DDR.** An expensive-to-decode, very compact format is close to
+a free trade here. That is a hypothesis from the measurements, not a result, and
+the phase is written to kill it quickly if wrong.
+
+### What the repo already knows, and it is adverse on quality
+
+`docs/roughquant-spec.md` sim (Qwen3.5-0.8B): bf16 26.17 PPL, mq4 29.08,
+**QTIP-3-LDLQ 31.42**. Iso-bit QTIP-3 was *worse* than mq4, and roughquant's best
+rotated config beat it by 11%. A `qtip3-sim(calib)` eval cell exists and passes.
+
+Recorded prominently in the phase because the honest framing is "the format is
+not obviously good; what changed is the exchange rate". 31.42 vs 29.08 PPL at
+3.00 vs 4.00+ bpw is a different trade when bytes convert to tok/s at 1.67x.
+
+### Ceilings, from bandwidth alone
+
+Against the measured 59.86 tok/s baseline: oq4++ 1.21x (72.6), mq3/oq3 1.54x
+(92.1), QTIP-3 1.67x (99.8), QTIP-2 2.50x (149.7). Ceilings only — they assume
+the format decodes at rate and carry no quality cost.
+
+### The lever ranked above QTIP
+
+**Multi-token verification (speculative decode / MTP)** is almost certainly worth
+more than every format change combined, and it is not a quant format. Decode
+streams the whole weight set *per token*; verifying N tokens per sweep divides
+weight traffic per token by ~N. The repo has DFlash and MTP, and
+**Qwen3.6-35B-A3B ships `mtp_num_hidden_layers: 1`** — the head is already in the
+target model. It also composes with any format change.
+
+Then two-stage lm_head, which phase 1 measured at **20-21% of the per-token
+stream on both models** — under-rated in the plan relative to 3a.
+
+### The gate this phase must pass
+
+Item 2 of the QTIP de-risk order is the real gate: **measure the trellis
+decoder's bundles/weight on AIE2P.** 199x headroom is generous but not
+unbounded, and a sequential trellis may serialise badly on a VLIW machine with
+one MAC slot. If the decoder cannot sustain ~3.11 MACs/cycle/core the format is
+dead here whatever its quality.
+
+### And a note on how phase 3 was written
+
+Phase 3's premise was a MAC-width advantage the hardware does not have. The
+phase-4 text says so directly and tells the reader to run 3a for its bytes rather
+than its MAC. Recorded because the failure mode is instructive: the plan was
+written before the machine was measured, and every number in it that came from
+the vendor's capability sheet rather than a measurement pointed the wrong way.
