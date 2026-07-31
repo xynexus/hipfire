@@ -9973,3 +9973,22 @@ things are not yet exercised:
 Neither affects the 55.0 timing, which is what the figure is for. Both would
 have to work for the layer to run unattended, and both are single experiments
 rather than open problems.
+
+### Caveat 2 settled: `g_resid` will survive the dispatch boundary
+
+`static_persist_probe.py`, re-run against the current tree:
+
+    core-static counter over 5 separate dispatches, one loaded design
+    values: [1.0, 2.0, 3.0, 4.0, 5.0]
+    -> PERSISTS — .bss survives between dispatches
+
+So P5 reading the residual that P3 stashed in the *previous* dispatch
+(`RESID_FROM_STASH=1`) is sound: the same property the paired k′ append already
+relies on. That was the second of the two untested assumptions behind the 55.0
+figure, and it holds.
+
+The first — the actual `sw` handoff from side A's DDR write to side B's
+broadcast fill — is still unexercised. It is the same inter-phase DDR round trip
+`chain_probe.py` verified and that P5 makes between its own chunks, so the
+mechanism is proven; what is untested is this particular pair of designs sharing
+a buffer.
