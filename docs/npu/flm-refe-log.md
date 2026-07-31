@@ -7666,3 +7666,33 @@ for several ticks and I read it as a description of the code. Every hypothesis I
 eliminated was downstream of an assumption the docstring had already made for
 me. Prose that outlives its code is worse than no prose; the docstring is now
 corrected and carries the story.
+
+## 2026-08-01 — routing is now Task 7's blocker, and it is not a channel count
+
+With the q' fault fixed I retested whether the changed fifo topology relieved the
+`Unable to find a legal routing` failure at more attention pairs. **It does not**
+— NATT=4 and NATT=8 both still fail at `input_physical.mlir`.
+
+The counts say this is not a resource ceiling:
+
+    NATT=2: shim in 1 bc + 8 weight = 9;  shim out 8 P1 + 1 P2 =  9   routes
+    NATT=4: same 9 in;                    shim out 8 P1 + 2 P2 = 10   FAILS
+    NATT=8: same 9 in;                    shim out 8 P1 + 4 P2 = 12   FAILS
+
+against a 16-in / 16-out ceiling. Nothing is exhausted at ten outputs, so the
+failure is in the **stream-switch topology** — which paths can physically
+coexist — not in how many channels are asked for.
+
+This matters more than it did yesterday. Every phase is now verified
+individually (P1, P2, P3, P4+P5) and the arithmetic is no longer the obstacle;
+assembling them into one dispatch is, and P3–P5 will only add routing pressure
+to a design that already fails with two phases at NATT=4.
+
+The recorded candidate fix still stands and is now the main lever: **unify the
+result object size so P2's fifo disappears.** P1 emits `2*HEAD` = 128-element
+objects and P2 emits `GQA*HEAD` = 256; one fifo cannot carry both, which is the
+only reason `f_p2` exists. Padding P1's result to 256 would drop 8 P1 + N P2
+fifos to 8 shared ones — and at NATT=8 that is 12 outputs down to 8.
+
+Not attempted this tick: it is a change to a design that only just started
+passing, and worth starting fresh rather than at the end of a long session.
