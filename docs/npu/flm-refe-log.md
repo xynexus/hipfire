@@ -3585,3 +3585,61 @@ without it. FLM's structure remains interesting for other reasons (it is how a
 The error was reasoning from one mechanism's limit to a universal claim, having
 looked at only the dispatch path IRON happened to default to. The alternative was
 in the same file, ten lines away.
+
+---
+
+## 2026-07-31 — Phase 2 milestone 3: 52.3 GB/s verified, above FLM's 46.2
+
+The delivery structure now exceeds FLM's decode bandwidth. Verified byte-for-byte.
+
+| configuration | total | GB/s | vs FLM 46.2 | % of 56.5 roof |
+|---|---|---|---|---|
+| 32 bufs x 1024 KiB | 32 MiB | **47.89** | **1.04x** | 85% |
+| 48 bufs x 1024 KiB | 48 MiB | **50.79** | **1.10x** | 90% |
+| 32 bufs x 2048 KiB | 64 MiB | **52.28** | **1.13x** | **93%** |
+
+### The gap was per-dispatch overhead, not delivery structure
+
+Milestone 2 reported 38.56 GB/s at 64 buffers and treated the remaining 17% as
+an open question about workers or tiling. Both of those turned out to be spent
+knobs, and the real cause was visible in the numbers already recorded:
+
+| buffers | MiB | npu us | GB/s | ideal us @46.2 | implied fixed cost |
+|---|---|---|---|---|---|
+| 20 | 5 | 218.9 | 23.95 | 113.5 | **105.4 us** |
+| 24 | 6 | 235.0 | 26.77 | 136.2 | **98.8 us** |
+| 32 | 8 | 278.9 | 30.08 | 181.6 | **97.3 us** |
+
+A near-constant **~100 us fixed cost per dispatch**, independent of buffer count.
+At 8 MiB that is a third of the wall clock; at 64 MiB it is under 8%. So the
+earlier figures were not measuring the delivery path's rate at all — they were
+measuring a fixed overhead diluted by a small transfer.
+
+**FLM streams 37 MiB per layer.** Measuring with 256 KiB buffers was testing a
+regime FLM never operates in. Sizing the transfer realistically, the same design
+that read 33.79 GB/s reads **52.28 GB/s**.
+
+### The exhausted knobs, recorded so they are not re-swept
+
+- **workers**: 4 -> 35.65, 8 -> 39.02, 16 -> 39.88 GB/s at 64 bufs. Plateaus past
+  8; not the limiter.
+- **tile size**: >16 KiB fails to compile. 32 KiB double-buffered is the entire
+  64 KiB core L1, so 16 KiB is the practical maximum.
+
+### What this settles for phase 2
+
+The plan's phase-2 bar is "within ~10% of FLM's throughput". **On delivery
+structure alone that bar is met and passed** — 1.04x to 1.13x — with no GEMM
+arithmetic in the design, on stock mlir-aie, using `full_elf=True` and BD reuse
+via TaskGroups.
+
+So a phase-2 reproduction does not inherit a bandwidth deficit. Whatever it ends
+up costing will come from the compute and the dequant chain, not from the
+dispatch path. That is a materially better starting position than the
+64-dispatches-per-token, ~10 GB/s figure this work began from.
+
+**Caveat on the comparison.** 52.28 GB/s is this probe streaming bulk buffers
+with cores that acquire and release without reading. FLM's 46.2 GB/s is a real
+decode doing full arithmetic. These are not like-for-like: the probe shows the
+delivery path *can* exceed FLM's rate, not that a working kernel will. The honest
+claim is that dispatch structure has been removed as the bottleneck.
