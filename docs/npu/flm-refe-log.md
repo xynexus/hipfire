@@ -4980,3 +4980,54 @@ honest figures.
 Either way the conclusion is unchanged and now quantitative: **fusion is the
 whole remaining lever, it is worth roughly 0.92x -> 1.1-1.2x FLM, and nothing
 else on the table is worth more than a few percent.**
+
+## 2026-07-31 — Correction: today's dispatch count is 81, not 49, so today is 0.79x not 0.92x
+
+The previous entry projected "49 dispatches (3/layer + lm_head) -> 0.92x FLM"
+and called it today's figure. **That counted the phases I had benchmarked, not
+the phases a decoder layer actually has.** o_proj cannot share a dispatch with
+q/k/v because attention sits between them, and attention is its own dispatch.
+The realistic minimum with the operators as built is **5 per layer** — qkv,
+attention, o_proj, gate/up, down — so **81 per token**, not 49.
+
+| dispatches/token | | ms | tok/s | vs FLM |
+|---|---|---|---|---|
+| 161 | fully unfused (~10 ops/layer) | 28.51 | 35.1 | 0.59x |
+| **81** | **5/layer — realistic today** | **21.07** | **47.5** | **0.79x** |
+| 49 | 3/layer — *what the last entry claimed* | 18.10 | 55.2 | 0.92x |
+| 17 | 1/layer + lm_head | 15.13 | 66.1 | 1.10x |
+| 2 | FLM's structure | 13.73 | 72.8 | 1.22x |
+
+Streaming floor is 772.3 MB / 57.0 GB/s = **13.55 ms**; everything above it is
+fixed cost.
+
+### The sharper point: half a layer's operators move almost no bytes
+
+At 92.9 us per dispatch, an operator's fixed-cost share depends only on its size:
+
+| operator | MB | fixed cost is |
+|---|---|---|
+| input_layernorm | 0.004 | **99.9%** |
+| RoPE (Q and K) | 0.005 | **99.9%** |
+| residual add (x2) | 0.004 | **99.9%** |
+| post_attn_layernorm | 0.004 | **99.9%** |
+| q/k/v proj | 3.932 | 57.4% |
+| o_proj | 2.621 | 66.9% |
+| gate/up + SwiGLU | 20.972 | 20.2% |
+| down_proj | 10.486 | 33.5% |
+
+**A 4 KB RMSNorm costs the same 92.9 us as 38 MB of weights.** Five of the ten
+operators per layer move ~4 KB each and are essentially *pure* fixed cost — if
+each got its own dispatch they alone would cost 7.4 ms/token, more than half the
+entire streaming floor.
+
+So the fused-layer requirement is not mainly about bandwidth. It is: **every
+operator that does not share a dispatch with a large one costs 92.9 us, and half
+of them move nothing.** The elementwise ops must ride along with the projections
+(as SwiGLU already rides with gate/up), not merely be "fused for tidiness".
+
+(The previous entry's per-operator table also had `down_proj` at 20.97 MB from a
+bad expression; it is 2048 rows x 5120 B = **10.486 MB**, and the corrected
+per-layer total is 38.03 MB against the container's 38,010,880 B. The
+dispatch-count projections used the independent 772.3 MB/token figure and were
+not affected.)
