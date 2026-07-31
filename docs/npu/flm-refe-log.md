@@ -9903,3 +9903,39 @@ last.
 This is the piece that turns the two-dispatch projection into a measurement, so
 it is worth finishing — every tok/s figure in this log is still a projection, and
 projections here have been wrong five times.
+
+## 2026-08-01 — P5 as its own dispatch works: exact, and side B is measured
+
+    P5 dispatch: 10.55 MB, 38.1 GB/s, 269.5 µs median
+    x_out max err **0.0000e+00**
+
+Two bugs, both in the harness rather than the kernels:
+
+  * **the accumulating chunks still acquire and release a result object.** The
+    loop is uniform — that is what makes P5 one body instead of two — so the
+    stream carries `NCHUNK` objects per tile and only the last chunk's are
+    written. The drain was sized for one chunk and read chunk 0's never-written
+    objects, hence `|got| = 0`. Sized for `NCHUNK` and taking the last quarter,
+    the magnitude came right immediately;
+  * **the stream is `[tile][core]`, not `[core][tile]`.** The join interleaves a
+    pair's two cores per object. With the magnitude already matching |ref|
+    exactly, that left ordering as the only candidate, and fixing the index gave
+    0.0000e+00.
+
+`|got|` against `|ref|` did the work both times — zero meant nothing was written,
+equal-but-wrong meant a permutation. Max error alone said "wrong" in both cases
+and distinguished nothing.
+
+### The two-dispatch layer, now measured on both sides
+
+    side A (P1..P4)   638.9 µs   measured
+    side B (P5)       269.5 µs   measured
+    layer             908.4 µs
+    token 17.24 ms -> **58.0 tok/s**   vs FLM 58.83 at matched context, **−1.4%**
+
+The projection said 53.9–55.1, pricing P5 at ~197 µs plus a 67–93 µs dispatch.
+Measured, side B is 269.5 — close to that sum, but the layer lands better than
+projected because side A already carries its own dispatch.
+
+**−1.4% is the closest this design has been to FLM on measured numbers**, and it
+is the buildable configuration, not the one that does not fit.

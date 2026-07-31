@@ -63,7 +63,11 @@ def build(ncores):
     wpair_ty = np.ndarray[(2 * wt,), np.dtype[np.uint8]]
     opair_ty = np.ndarray[(2 * NROWS,), np.dtype[bfloat16]]
     w_all_ty = np.ndarray[(2 * NCHUNK * tiles * wt,), np.dtype[np.uint8]]
-    o_all_ty = np.ndarray[(2 * tiles * NROWS,), np.dtype[bfloat16]]
+    # NCHUNK times the live data: the accumulating chunks still acquire and
+    # release a result object (the loop is uniform, which is what makes P5 one
+    # body instead of two), so the stream carries NCHUNK objects per tile and
+    # only the last chunk's are written. The host takes that last quarter.
+    o_all_ty = np.ndarray[(NCHUNK * 2 * tiles * NROWS,), np.dtype[bfloat16]]
     bc_all_ty = np.ndarray[(NCHUNK * 2 * K_DIM,), np.dtype[bfloat16]]
 
     flags = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_ACCN={accn}"]
@@ -76,11 +80,11 @@ def _design(bc: In, {params}):
     kas = ExternalFunction("flm_asum_prepare", source_file=ASUM_SRC,
                            arg_types=[bc_ty], compile_flags=FLAGS)
 
-    f_bc = ObjectFifo(bc_ty, depth=1, name="p5bc")
+    f_bc = ObjectFifo(bc_ty, depth=1, name=f"p5bc_c{NCHUNK}")
     bc_cons = [f_bc.cons() for _ in range({ncores})]
     f_w = [ObjectFifo(wpair_ty, name=f"p5w{{i}}") for i in range({npairs})]
     w_sub = [f.cons().split([0, {wt}], obj_types=[wt_ty, wt_ty]) for f in f_w]
-    f_o = [ObjectFifo(opair_ty, name=f"p5o{{i}}") for i in range({npairs})]
+    f_o = [ObjectFifo(opair_ty, name=f"p5o{{i}}_c{NCHUNK}") for i in range({npairs})]
     o_sub = [f.prod().join([0, {NROWS}], obj_types=[o_ty, o_ty]) for f in f_o]
 
     def core(bcc, wc, op, kdown, kasum):
@@ -210,7 +214,7 @@ def main():
                         dd[sl, lo:hi], dm[sl, lo:hi], dc[sl, lo:hi])
                 ref[r0:r0 + NROWS] = rnd(acc + x[r0:r0 + NROWS])
 
-    o_ts = [iron.zeros(2 * tiles * NROWS, dtype=bfloat16, device="npu")
+    o_ts = [iron.zeros(NCHUNK * 2 * tiles * NROWS, dtype=bfloat16, device="npu")
             for _ in range(npairs)]
     if o.bench:
         b = run_iters(design, bc_t, *w5, *o_ts, warmup=2, iters=10)
@@ -219,10 +223,15 @@ def main():
         design(bc_t, *w5, *o_ts)
         us = None
 
-    got = np.concatenate([t.numpy().astype(np.float64) for t in o_ts])
-    idx = np.concatenate([np.arange(r0, r0 + NROWS)
-                          for pr in range(npairs) for j in (0, 1)
-                          for r0 in rows(pr, j)])
+    # stream is [chunk][tile][core]; only the last chunk was written
+    got = np.concatenate([t.numpy().astype(np.float64)
+                          .reshape(NCHUNK, -1)[NCHUNK - 1] for t in o_ts])
+    # the join interleaves the pair's two cores per object, so the stream is
+    # [tile][core], not [core][tile]
+    idx = np.concatenate([np.arange(rows(pr, j)[t], rows(pr, j)[t] + NROWS)
+                          for pr in range(npairs)
+                          for t in range(tiles)
+                          for j in (0, 1)])
     err = np.abs(got - ref[idx]).max()
     if __import__("os").environ.get("P5_DIAG"):
         scale0 = np.abs(ref).mean()
