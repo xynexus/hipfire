@@ -4678,3 +4678,49 @@ showed: **L1 capacity, not compute, is what limits tile size in every fused
 shape so far.** It sharpens the case for the untried neighbour-memory lever —
 the activation is replicated into every core at 8192 B double-buffered, and
 freeing that is worth a row-count step in every one of these designs.
+
+## 2026-07-31 — RMSNorm verified bit-exact, and a rounding-mode bug in a shipped kernel
+
+`kernels/npu/flm_rmsnorm.cc` + `tools/npu/flm/rmsnorm_verify.py`. Needed twice
+per decoder layer, so every candidate fused-layer design needs it. It wraps the
+existing `tools/npu/rms_norm_weighted_bf16.cc`, whose math already matches llama
+exactly — `x * rsqrt(mean(x^2) + eps) * w` with `eps = 1e-5`, which is
+llama-3.2-1B's `rms_norm_eps`.
+
+**`rms_norm_weighted_bf16` never calls `aie::set_rounding`, so every bf16
+conversion in it truncates.** Confirmed exactly rather than inferred: a
+truncating numpy emulation reproduces the device's error to the last digit —
+**1.2320e-02 both** — where a round-to-nearest emulation gives 8.81e-03. One line
+in the wrapper (`set_rounding(conv_even)`; the mode is core-global, so it fixes
+the shared kernel's behaviour on our path without editing a kernel other paths
+depend on):
+
+| | max abs err | max rel err |
+|---|---|---|
+| truncating (as shipped) | 1.2320e-02 | 1.479% |
+| round-to-nearest | **8.8108e-03** | **0.890%** |
+
+**−28% error for one line.** This is the *third* time the default truncating
+rounding mode has cost accuracy here (13% on the GEMV, and `silu_mul_bf16` does
+set it — so this kernel is the outlier, not the rule). `grep -c set_rounding`
+over `tools/npu/*.cc` is worth running on any kernel before trusting its
+numerics. **`rms_norm_weighted_bf16` is used by the shipped Qwen3.5 NPU path**
+per its own docstring, so this is a live accuracy bug there too, not only here.
+
+With the mode set, the device matches its own bf16 chain **exactly (0.0e+00)**.
+
+The remaining 0.89% is inherent to the kernel and is left alone: three bf16
+roundings (inv_rms, x*inv_rms, *weight), of which the `inv_rms` broadcast is a
+**systematic 0.26% gain error applied uniformly to the whole vector** — a scale
+error on every activation entering the projections, not a random one. Whether
+that matters end to end is a question for the first tok/s comparison.
+
+### A metric that has now misled twice
+
+Reporting an absolute error against **mean**|ref| inflates it wherever the
+reference has wide dynamic range. It read as "7% error" on this kernel and as
+"4.4%" on the SwiGLU earlier, both of which are artefacts — the true relative
+errors are 0.89% and ~0.4%. The harness now reports **elementwise relative
+error** over elements above 5% of peak, plus a best-fit-gain decomposition that
+separates a systematic scale error from elementwise noise. Use that shape for
+any future operator check.
