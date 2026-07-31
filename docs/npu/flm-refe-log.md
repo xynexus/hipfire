@@ -10102,3 +10102,33 @@ passes through all 16.
 
 *P4 sw at layer 15 tracks its own mean|ref| (0.00189) proportionally; it is the
 exp2 floor there, which is a separate and well-behaved thing.
+
+### The attention floor is one bf16 ULP at max|V|, not the exp2 NLF
+
+Dividing the error by the largest v the accumulator ever holds settles it:
+
+    layer   max err      max|V|    err/max|V|
+    0       3.4631e-03   1.2031    2.88e-03
+    7       4.8651e-03   1.2031    4.04e-03
+    15      9.2940e-03   2.3906    3.89e-03
+
+bf16 eps is 2^-8 = **3.906e-03**. Every layer is within ~1 ULP. The output is a
+weighted sum of v rows, so the accumulator's ABSOLUTE error is set by the largest
+magnitude it holds — and max|V| doubles at layer 15 (1.20 -> 2.39) while mean|ref|
+moves 22%. The old `8e-2 * mean|ref|` tolerance tracked the wrong quantity, which
+is the entire reason layers 7 and 15 "failed".
+
+Tolerance is now `1.5 * 2^-8 * max|V|`. Layers 0, 4, 7, 11 and 15 all PASS, and
+the check now states a floor it can actually defend.
+
+Four explanations were measured; three are refuted and recorded so they are not
+re-proposed:
+
+  * exp2 NLF sharpness — max softmax weight is flat (0.13-0.17) and flattest
+    where the error is worst
+  * inherited P1 error — k' and v' are bit-exact at layers 7 and 15
+  * online-softmax rescale history — the rescale count DECREASES (7, 6, 5) as
+    the error grows, and total rescale magnitude is flat (1.85, 1.97, 1.95)
+
+**There is no attention bug.** The layer is correct at every depth measured:
+`x_out` exact at layers 0/7/15, attention at its representation floor.
