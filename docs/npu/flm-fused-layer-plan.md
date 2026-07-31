@@ -89,10 +89,19 @@ the **union of every fifo it ever consumes, not per phase**, which is why
 had separate weight fifos used in *different* phases. Broadcast + operand is
 already two.
 
-So P2's first operand acquire delivers q′ and the rest deliver KV tiles. Per
-attention core that is 4 heads × 128 bf16 = **1024 B inside a 20544 B object**,
-one object per phase, no extra channel and no repack. `flm_attn_decode.cc` takes
-`-DDIM_QSTRIDE` so it reads the strided block in place.
+~~So P2's first operand acquire delivers q′ and the rest deliver KV tiles.~~
+**That does not work — measured 2026-07-31 and retracted.** Putting q′ first on
+the operand fifo means the core holds that object while cycling KV objects
+through the *same* fifo, and **an object held across other acquire/release
+cycles on one fifo does not stay valid**: `attn_phase.py` with q′ and KV merged
+onto one fifo goes from exact to 2.93e-02 against a 1.08e-03 tolerance, and fifo
+depth 2, 3 and 4 give identical results, so it is ordering semantics rather than
+capacity.
+
+q′ therefore has to ride the **broadcast**, which means the broadcast object
+grows: 32 heads × 128 bf16 = 8192 B against the current 4096 B act half. L1 goes
+56,512 → 60,608 of 65,536, leaving 4,928 B spare, so it fits. `-DDIM_QSTRIDE`
+still earns its place — the block is strided either way.
 
 `cs_q` carries cos/sin **pre-multiplied by `head_dim^-0.5 · log2(e)` = 0.125·1.4427**, so attention's `exp2` needs no pre-scale and the host never touches `q'` mid-dispatch. `cs_k` is the plain table. Both from `rope_freqs.weight` (the stored bf16 llama3 divisor), same table for Q and K.
 

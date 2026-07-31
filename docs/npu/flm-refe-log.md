@@ -6983,3 +6983,36 @@ So the next move is the unification rather than more bisecting:
 Recording the change of approach explicitly: four ticks of point-debugging a
 structure that has a known simplification is the wrong trade, and the
 simplification is independently required for the real 8-core shape.
+
+## 2026-07-31 — q′ cannot ride the operand fifo: a held object does not survive other traffic
+
+The bisect-from-working test, and it retracts a plan decision I made two ticks
+ago.
+
+Took `attn_phase.py`, which verifies exactly, and changed **one thing**: q′ and
+KV merged onto a single fifo, q′ delivered as the first object.
+
+| | max err | tol |
+|---|---|---|
+| `attn_phase` as shipped (separate q and KV fifos) | passes | — |
+| same, q′ and KV on ONE fifo | **2.93e-02** | 1.08e-03 |
+| same, fifo depth 3 | 2.93e-02 | |
+| same, fifo depth 4 | 2.93e-02 | |
+
+Depth changes nothing, so this is **ordering semantics, not capacity**: attention
+holds the q′ object for the whole phase while cycling KV objects through the
+same fifo, and **an object held across other acquire/release cycles on that fifo
+does not stay valid**.
+
+That kills "P2's first operand acquire carries q′", which §1.4 recorded two ticks
+ago on the strength of the channel budget alone. The channel arithmetic was
+right; the conclusion did not survive contact.
+
+**Resolution: q′ rides the broadcast, and the broadcast object grows.** 32 heads
+× 128 bf16 = 8192 B against the current 4096 B act half. §1.5's L1 total goes
+56,512 → 60,608 of 65,536, leaving 4,928 B spare — it fits, which is why the
+8448 B broadcast was a choice rather than a limit.
+
+It also explains the chain's P2 zeros without further bisecting: that design has
+the same held-object structure, in a topology where it degrades to nothing
+instead of to wrong numbers.
