@@ -10746,3 +10746,58 @@ measured, any coefficient here is still a fit.
 
 Stopping the numerical thread here with the mechanism named and the missing
 measurement identified, rather than with another envelope.
+
+## 2026-08-01 — MEASURED: `aie::exp2<bfloat16>` is linear interpolation, ~6% error
+
+The missing term, finally measured rather than fitted. `exp2_probe.py` runs the
+same call attention makes — a float vector in, bf16 lanes out — and compares
+against float64:
+
+    x in [-8, 0], 1024 points
+      vs float64 2**x    : max rel 7.852e-02   mean 4.287e-02
+      vs bfloat16(2**x)  : max rel 8.074e-02   mean 4.288e-02
+      bit-identical to correctly-rounded bf16: 23/1024 (2.2%)
+
+**The NLF is not correctly rounded, and it is not close.** bf16 rounding would be
+0.2%; this is 4-8%, twenty to forty times larger. The second row barely differs
+from the first, which says bf16 rounding contributes almost nothing — the error
+is the approximation itself.
+
+Sampling shows its structure:
+
+    x  -8.00000  rel 3.906e-03      <- integer, ~1 ulp
+    x  -7.20235  rel 3.821e-02
+    x  -6.40469  rel 7.042e-02      <- mid-interval, worst
+    x  -5.60704  rel 6.500e-02
+    x  -4.80938  rel 6.106e-02
+    x  -4.01173  rel 4.226e-03      <- integer again, ~1 ulp
+    x  -0.02346  rel 5.133e-04
+
+Small at integer x, peaking between: **linear interpolation of the fractional
+exponent.** 2**x is exact at integers (a pure exponent change) and the mantissa
+is interpolated in between. The classic max relative error for linearly
+interpolating 2^f is |2^0.5 - 1.5| / 2^0.5 = **6.1%**, and at f = 0.19 it
+predicts 4.3% against 6.1% measured. Right shape, right magnitude.
+
+### What this settles about the attention floor
+
+Every model I tried assumed the floor was bf16 rounding, and scaled it by some
+denominator. That premise was wrong: the dominant error is ~6% from the NLF, 30x
+bf16's 0.2%. No amount of choosing between max|V|, mean|ref| and max|ref| could
+have worked, which is why four attempts each failed on a different axis.
+
+It also explains why attention's OUTPUT error is only ~1-2% rather than 6%: the
+weights are normalized by `g_l`, and the NLF's error is a smooth function of its
+input, so neighbouring `p_i` are wrong in the same direction and the bias largely
+cancels in `p_i / sum(p)`. What survives is the residual variation across the
+tile, plus `corr` — which is the same NLF output applied multiplicatively to the
+whole accumulator, and does NOT get normalized away.
+
+That last point is the one to carry forward: **`corr` is the unnormalized path for
+a 6%-accurate function.** It is applied once per running-max update, which is why
+the error tracked rescale count in the earlier measurements.
+
+Not fixing this today — it is the hardware's exp2, and a more accurate softmax
+would mean a different formulation, which is design work. But the floor is no
+longer unexplained, and the check's advisory bound can now be replaced by a real
+one when someone wants to derive it.
