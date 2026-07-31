@@ -33,6 +33,18 @@ for a real Strix Halo GEMM. The lever for more is a better *dataflow* that keeps
 the cores fed (larger effective tiles / less per-tile overhead), not compute,
 power, columns, or datatype. Bottleneck = feeding the AIE array.
 
+> **Refinement from R141 (2026-07-31), which measured the opposite first.** "The
+> ceiling is feeding" is about *MAC issue capacity* against operand delivery, and
+> it holds for a dense GEMM with large output tiles. It does **not** mean a
+> weight-quantized decode kernel is automatically feed-bound: a q4_1 decode GEMV
+> ran **compute-bound before it was bandwidth-bound**, with wall time flat across
+> an 8x change in cores and bytes, because the per-weight *unpack and rescale*
+> work around each MAC set the rate. Fixing that (native int4 operand path, wider
+> tile) moved it from 14.4 to 48.1 GB/s and only then did feeding bind again, at
+> 98-100% of the achievable ingress. Both statements are true of different
+> regimes: count **ops per weight**, not just MACs per weight, before concluding
+> a kernel is starved.
+
 ## Platform
 
 - **Machine**: nix1
@@ -1714,3 +1726,142 @@ on AIE2P. The full target notes are in
 `docs/npu/aie2-cost-model-plan.md`; raw probe records are the
 `aiecost-aie2p-*-20260717.json` files under
 `benchmarks/npu_gemm_tuning/results/`.
+
+## R141 — FLM's q4_1 decode GEMM reproduced at 1.03–1.05× on AIE2P (2026-07-31)
+
+Phase 2 milestone 4 of the FLM reverse/forward-engineering track: `layer.xclbin`'s
+decode GEMM rebuilt from our own mlir-aie/Peano source. **48.1 GB/s at 16 cores
+on 38.0 MB — exactly one Llama-3.2-1B decoder layer's weights — in ONE dispatch,
+against FLM's measured 46.2 GB/s.** Repeat runs read 47.5 and 48.6 GB/s
+(1.03–1.05×), so the reproduction is within the ~10% bar and above it. Kernel:
+`kernels/npu/flm_gemv_q4_1.cc`; gates: `tools/npu/flm/gemv_verify.py` (numerics)
+and `gemv_bench.py` (throughput, every point correctness-checked on the bytes it
+actually streamed). Full record: `docs/npu/flm-reproduction-results.md`.
+
+**The weight format was decoded from FLM's own container and reproduced exactly.**
+`model.q4nx` is plain safetensors; every streamed tensor is `I8` with a second
+dimension of 5120 bytes, and each row is *planar* rather than an array of
+interleaved blocks — `[256 bf16 d][256 bf16 m][4096 B codes]`. That is 5120 bytes
+for 8192 weights = **exactly 5.00 bpw**, confirming the bandwidth figure from the
+byte layout instead of from dividing a manifest by a parameter count. The
+quantizer is plain min/max asymmetric q4_1 (`m/d` = −7.4…−7.5, std 1.35, and
+`m + 7.5d` centres on zero). Blocks are **32 contiguous input dims**, settled by
+per-block scale spread — `q_proj` p99/p1 is 7.18 stored against 7.01 K-major and
+31.77 N-major — which went *against* the ISA reading, since `vextbcst.16` +
+`mac_elem_16` suggests broadcasting one activation scalar into contiguous output
+weights.
+
+**Numerics are exact**: the device matches a bf16-faithful reference to 1.9e-07 on
+real q4_1 data from FLM's container. The ~1% deviation from float64 is the
+format's own cost (bf16 operands are inherent — FLM materialises `w = d*q + m` in
+bf16 before its own MAC), and the reference reproduces it exactly. Comparing
+against float64 alone reads as a 1% failure and cost a debugging cycle; both
+references are now reported.
+
+**Getting from 14.4 to 48.1 GB/s, each step measured.** The first working version
+was compute-bound: wall time flat at ~1315 µs across an 8× change in cores and
+bytes while GB/s doubled at every step.
+
+| change | GB/s | mechanism |
+| --- | --- | --- |
+| baseline (masked uint8, 8 rows/tile, 8 cores) | 14.4 | — |
+| native uint4 operand | 18.5 (+28%) | `vldb.unpack` + `vups.4x` instead of a generic `bit_and`→`unpack`→`to_float` chain; 75 instructions against 103, predicting the gain to a percentage point |
+| 16 rows per weight tile | 24.8 (+34%) | widest that fits L1 double-buffered (49 KB of 64; 24 rows needs 68 KB) |
+| 16 cores wired in pairs | **48.1** (+94%) | one shim stream per pair split in a memtile, the pair's two result streams joined before the shim |
+
+The pairing is not cosmetic. 16 private weight streams plus a broadcast
+activation is 17 shim inputs against 8 columns × 2 channels, and the placer
+rejects it outright (`no ShimNOCTile has sufficient DMA capacity`). This is
+exactly why `layer.xclbin` packet-switches at the shim — 24 of its 42 shim routes
+are packet mode — and it independently confirms a prediction made from the static
+analysis before it was hit.
+
+**The arithmetic identity is ours, not FLM's.** With `w = d*q + m`, the GEMV is
+`out[n] = Σ_b ( d[n,b]·Σ_t q[n,b,t]·a[b,t] + m[n,b]·Σ_t a[b,t] )`, so the
+zero-point term collapses to one scalar per block against an activation block-sum
+shared by every output row in the tile, and the codes enter the MAC as exact small
+integers. FLM's 42-op dequant chain is not reproduced and does not need to be.
+
+**Not established, and it gates the end-to-end comparison**: FLM's weights are
+**not** a quantization of the published checkpoint. Four independent searches
+returned the noise floor against controls that self-match at 0.99996 / exactly
+zero, run against both the Instruct and base checkpoints. Aggregate statistics
+match untransformed K-major weights to ~2% while every per-block fingerprint
+fails — consistent with a mild per-channel (SmoothQuant/AWQ-style) transform
+before quantization. So the block→(row, k) mapping is unrecovered: the arithmetic
+is verified on real FLM bytes, but their addressing is ours.
+
+Related: 4 feed streams deliver 48.6 GB/s and 8 deliver ~56 (reproduced at two
+totals, one of them FLM's exact 772.3 MB/token traffic), so FLM's 46.2 sits 5.2%
+under the 4-stream figure and it feeds from 4 memtile columns.
+
+## R142 — AIE2P kernel-authoring traps, and three optimizations rejected by measurement (2026-07-31)
+
+Collected while building R141. Each cost real time or was tested and dropped; the
+trap list also lives in `tools/npu/flm/README.md` where kernel authors will hit it.
+
+**Traps.** `iron.jit` does **not** hash `ExternalFunction(source_file=...)`, so
+editing a kernel `.cc` silently reuses the cached xclbin and the run reports the
+*old* kernel's numbers — it presents as a fix that did nothing, and made two
+identical expressions in one probe disagree. Closure-captured shapes have the same
+hole. Pass the kernel path as the design-level `source_files=[...]` and make
+shapes `CompileTime[int]`. The **default rounding mode truncates**: without
+`aie::set_rounding(aie::rounding_mode::conv_even)` a one-sided bias on every
+accum→bf16 conversion survives a long cancelling reduction, measured at **13%
+error** on a real GEMV row against 0.19% with it. **Scalar reductions mixing bf16
+loads with a float accumulator miscompile** — a stride-2 loop dropped every odd
+term while every operand read back correct on its own, and a unit-stride loop over
+the same values produced a third wrong answer; use vector MACs for reductions.
+**IRON's default worker stack is 1024 B** and overflow is silent (NaN in the first
+outputs, plausible garbage after). Anything vector-loaded needs `alignas(64)`; an
+unaligned 512-bit stack load returns garbage rather than faulting.
+`split()`/`join()` offsets are in **elements, not bytes** — a byte offset emits a
+BD with negative length (`XAie_DmaSetAddrLen … static_len = -16`) and produces a
+misleading `Bank-aware allocation failed` warning that sends the diagnosis to L1
+capacity instead. Backend limits that shape code rather than breaking it:
+`aie::downshift` on a **uint8** vector segfaults the compiler (uint16 is fine),
+16-lane uint8 fails to legalize (`G_AND <4 x s32>`), and 16-lane float reductions
+fail too (`G_FADD <16 x s32>`), which is what blocks a second float accumulator.
+
+**Three optimizations tested and rejected**, all by instruction count on the same
+loop (2048 weights) before spending hardware time:
+
+| idea | result | why |
+| --- | --- | --- |
+| `aie::reduce_add_v` to defer the per-block scale | **185 vs 75 insns** | a 32-lane float horizontal reduce costs ~20 instructions on its own (86 for four), so per-block reduction is far dearer than the per-block rescale it would replace — this validates accumulate-once/reduce-once |
+| 64-lane form (one MAC per 64 weights, scales joined by `concat`) | 78 vs 75 insns | no win |
+| two independent accumulators for ILP | does not compile | `G_FADD <16 x s32>` |
+| `#pragma clang loop unroll_count(2)` | 48.6 GB/s | inside the 47.5–48.6 run-to-run band of no unrolling — no gain, knob removed rather than left as a no-op |
+| `unroll_count(4)` | **42.6 GB/s** | −12%; the unrolled body spills |
+
+**`chess_prepare_for_pipelining` and `chess_loop_range` are no-ops under Peano.**
+Both are `#define`d **empty** in `llvm-aie/lib/clang/21/include/aiebase_chess.h`,
+so copying them out of AMD's own `aie_kernels/aie2p/mm.cc` — where they appear on
+the hot loop — buys exactly nothing in this toolchain, silently. The real LLVM
+equivalent (`#pragma clang loop`) is honoured but did not help here.
+
+Load-port arithmetic, since UG1079 §043 flags two loads per cycle as a resource
+constraint: the inner loop issues 3 vector loads per 64 weights, so ≥1.5 cycles,
+i.e. a 42.7 weights/cycle ceiling. Measured is 2.75 weights/cycle against ~13 ops
+per 64 weights, so this loop is **op- and latency-bound, not load-bound**, and
+reducing loads is not the lever.
+
+**`aie::sliding_mul` does not apply here, and the reason is structural.** It is
+the natural GEMV shape — `out[l] = Σ_p coeff[·]·data[d_s + l·DSY + p·DSX]` would
+give L output rows with no horizontal reduction at all — but UG1079 §037 defines
+`DataStepY` as a step *within the data register*, so all L lanes' weights must sit
+in one loaded vector, i.e. **N-major**. FLM's format is K-major with per-K-block
+scales, so using sliding_mul would mean changing the quantization block axis and
+no longer reproducing the format. Recorded so the idea is not re-derived.
+
+**One correction to R141's own working notes.** The claim that llama.cpp's split
+nibble order "forces two 16-lane activation loads joined by `aie::concat`, 25 ops
+per 64 weights" is wrong as a statement about the format: it describes a
+concat-based gather. AIE2P's shuffle network (`aie2p_enums.h` transpose modes
+`T8_64x2`, `T16_32x2`, `T8_2x64`, …; aie_api `interleave_zip`/`interleave_unzip`,
+`shuffle_up`/`shuffle_down`, raw `shuffle_u8`) consumes an arbitrary nibble order
+for **one extra instruction** — 76 against the current loop's 75. Repacking was
+the simplest thing that worked, but it was never forced, and this matters because
+FLM's own nibble order is still unknown: matching it later will be nearly free.
+**Reach for the shuffle network before redesigning a data layout**, and count
+instructions before arguing about lane alignment.

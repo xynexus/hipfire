@@ -4302,3 +4302,44 @@ body already reaches (`vldb.unpack` + `vups.4x` in the disassembly).
 Third time on this project that changing the KIND of check moved something: the
 instruction count settled in one compile what an argument about lane alignment
 had got wrong.
+
+## 2026-07-31 — Four more levers from UG1079, all measured, none kept
+
+Read `docs/npu/ug1079-2026.1-AIE-programming-manual/` (it is vendored in this
+repo) for anything that could push past 48 GB/s. Four candidates, none survived.
+
+**`aie::reduce_add_v`** (§030) reduces up to 4 vectors in parallel, which would
+allow deferring the per-block scale: accumulate blocks unscaled, reduce four at
+once, apply four scales as one vector multiply. **185 instructions against 75**
+for the same 2048 weights. A 32-lane float horizontal reduce costs ~20
+instructions on its own (86 for four), so per-block reduction is far dearer than
+the per-block rescale it replaces. This is a positive result about the current
+structure: accumulate-once / reduce-once is right, and the reason is measurable.
+
+**`aie::sliding_mul`** (§037) is the natural GEMV shape — `out[l]` over L lanes
+with no horizontal reduction at all. It does not apply: UG1079 defines
+`DataStepY` as a step *within the data register*, so all L lanes' weights must
+sit in one loaded vector, i.e. **N-major**. FLM's format is K-major with
+per-K-block scales, so using it would mean changing the quantization block axis
+and no longer reproducing the format. Structural, not a tuning question.
+
+**Loop unrolling.** `#pragma clang loop unroll_count(2)` measured 48.6 GB/s,
+inside the 47.5-48.6 band of no unrolling — no gain. `unroll_count(4)` measured
+**42.6 GB/s, -12%**; the unrolled body spills. The knob was removed rather than
+left in at a value that does nothing.
+
+**`chess_prepare_for_pipelining` / `chess_loop_range` are no-ops under Peano** —
+both `#define`d empty in `aiebase_chess.h`. They appear on the hot loop in AMD's
+own `aie_kernels/aie2p/mm.cc`, so copying that pattern into a Peano build looks
+like tuning and is not. Worth knowing before attributing a result to them.
+
+**Load-port check.** §043 flags two loads per cycle as a resource constraint. The
+inner loop issues 3 vector loads per 64 weights => >=1.5 cycles => a 42.7
+weights/cycle ceiling, against 2.75 measured with ~13 ops per 64 weights. So the
+loop is op- and latency-bound, not load-bound, and cutting loads is not the
+lever. That also rules out the block-outer/row-inner inversion (which would
+amortise the activation load across rows) as the next thing to try.
+
+Net: 48.1-48.6 GB/s stands, and the remaining gap to the 56.5 GB/s fabric roof is
+ingress width rather than the body — consistent with the body already sitting at
+98-100% of what 4 feed streams deliver with no compute at all.
