@@ -10248,3 +10248,36 @@ The quoted figure stays **55.1 tok/s**.
 
 Seams composed: **2 of 4** (P3->P4, P4->P5). Remaining: P1->P2 (q' comes from
 the host's `qall`) and P2->P3 (the attention output comes from the host's `bc3`).
+
+### The P2 -> P3 seam is blocked, and the reason is not plumbing
+
+Composing this seam is not a matter of pointing P3's broadcast at `attn_out`. Two
+things stand in the way, and the second is structural.
+
+**1. P3's activation today is RANDOM NOISE, not an attention output.**
+
+    attn3 = rnd(rng.standard_normal(K_DIM) * 0.05)      # p1p2_chain.py:706
+
+So P3/P4/P5 are chained onto a vector that has nothing to do with the model. That
+is a legitimate GEMV test — it is how P3's o_proj was verified — but it means the
+FFN half of the layer has never run on a real attention output.
+
+**2. Attention covers half the heads.** `NATT = 4` KV groups x GQA 4 = 16 of the
+model's 32 q heads, so `attn_out` is a 1024-vector where o_proj needs 2048. The
+existing comment at :675 says exactly this and calls the handoff "the next step".
+
+Full coverage means `NATT = 8` (apairs 4, p1pairs 4). Measured:
+
+    RuntimeError: [aiecc] ... error: Unable to find a legal routing
+
+which is what the module docstring at :47 already warned: "at 2 or 4 attention
+pairs the design fails to route". So this is an interconnect limit, not a bug in
+the handoff — reverted, and NATT stays 4.
+
+That makes the seam ordering clear: **P2->P3 cannot be composed until attention
+routes at full head coverage**, and that is a routing problem in the same family
+as the program-memory one — a fabric constraint the current decomposition runs
+into, not something a wiring change fixes.
+
+Seams composed: 2 of 4. P3->P4 and P4->P5 done. P1->P2 is still open and is pure
+plumbing (q' from the host's `qall`). P2->P3 is blocked on routing at NATT=8.
