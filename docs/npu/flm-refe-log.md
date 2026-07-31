@@ -9760,3 +9760,37 @@ have been: 64.7 (NROWS=16 phases, ignored the later config change), ~55
 (double-counted dispatch), 59.7 (mixed builds), 60.4 (applied a GEMV-derived
 penalty to the FFN). Each error was a different way of composing incomparable
 measurements.
+
+## 2026-08-01 — the lm_head was priced at the fabric roof; measured, nothing beats FLM
+
+The projection's lm_head term was `92.9 + 164.2 MB × 17.85 µs/MB` = 3024 µs.
+**17.85 µs/MB is 56.0 GB/s — the fabric roof**, and no measured GEMV in this tree
+runs there: 48.9 at NROWS=16, 46.7 at NROWS=8, 46.4 for the FFN.
+
+Measured directly (`gemv_bench --tensor lm_head.weight --nrows 8 --cores 16`):
+
+    45.6 GB/s — 0.99x FLM decode, 81% of the roof
+    -> lm_head = 92.9 + 164.2/45.6 = 3694 µs,  **+670 µs on every token**
+
+That is 18% of the token, priced 22% optimistic. Recomputed:
+
+| | lm_head at roof | lm_head measured |
+|---|---|---|
+| single dispatch (does not fit) | 61.0 tok/s (+2.0%) | **58.6 tok/s (−2.0%)** |
+| two dispatches (buildable) | 56.0 tok/s (−6.5%) | **53.9 tok/s (−9.9%)** |
+
+**This changes the conclusion, not just the numbers.** The position was "the
+configuration that beats FLM is the one that does not fit". Measured, *no*
+configuration beats FLM — the impossible one falls 2% short and the buildable one
+10%.
+
+The lm_head had never been measured. It was carried from a fitted streaming model
+(`t_us = 92.9 + slope·MB`) whose slope is a *bandwidth* figure, and applied to a
+GEMV that has to do arithmetic as well. It is the single largest term after the
+FFN and the only one that was never checked.
+
+Fifth revision, and the first that is below FLM everywhere. The running list of
+what went wrong: NROWS=16 phases carried past a config change; dispatch
+double-counted; NROWS=8 and 16 builds mixed; a GEMV penalty applied to the FFN;
+and now a roof rate applied to a real GEMV. Every one was a number that was
+plausible in isolation and wrong in composition.
