@@ -8790,3 +8790,29 @@ for `flm_p1_emit`, hit independently here.
 Cost: +752 B on the P1 cores (74% → 78%) and +768 B on the attention cores
 (65% → 70%). Both still have room for P4 and P5, which the probe put at ~2496 B
 and ~3312 B marginal.
+
+### P4 and P5's shape, worked out before writing them
+
+P4 emits **512 values per core** (D_FF/16) as 32 tiles of NROWS, and the shared
+result object is 128 elements — so it needs **4 objects per core, each batching
+8 tiles**. Exactly P3's problem, four times over, and for the same reason: a
+fifo of its own would cost 8 shim outputs against a budget of 10 in 16, so the
+object size is fixed and the tiles must be batched behind it.
+
+P3's fix does not carry over unchanged. Its emit worked because
+`flm_gemv_q4_1_residual` *already* stashed every row in `g_resid` for P5's
+benefit, so the emit was pure copy. `flm_gemv_up_swiglu` writes its result
+straight to `out` and stashes nothing, so P4 needs either a new stash global
+(+512 B of core data memory) or an emit that batches differently.
+
+And P5 confirms why the FFN is chunked at all: it reads `sw` (8192) as its
+activation while the broadcast holds 2048 — **8192/2048 = 4 = NCHUNK**. Each
+chunk needs its own broadcast fill *and* its own `flm_asum_prepare`, since the
+activation changes every chunk and `g_asum` is what the `m` term reads. That is
+the bug that cost this session a tick on P3, and it will appear four more times
+in P5; `ffn_chain`'s core body already calls `kas(eb)` per chunk, which is the
+pattern to copy rather than rediscover.
+
+Running total for the layer's broadcast fills: activation, q′, h, then four
+chunks of `sw` — **seven fills**, each of which every core must consume whether
+or not it uses the contents.
