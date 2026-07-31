@@ -6120,9 +6120,11 @@ rested on arithmetic.
 | 2 | 63.11 | 1258.9 | 1374.0 | 115.1 | 50.1 |
 | 4 | 126.22 | 2457.7 | 2748.0 | **290.3** | **51.4** |
 
-`wall_us = 96.8 + 590.2 * repeats`, R² = 0.99999.
+`wall_us = 87.6 + 591.5 * repeats`, R² = 0.99987 (least squares over all three
+points; a two-point estimate from N=1 and N=4 gives 96.8 + 590.2, and the
+difference is the N=2 point sitting slightly below the line).
 
-**The fixed term is 96.8 us**, which independently reproduces the 92.9 us
+**The fixed term is 87.6 us**, which independently reproduces the 92.9 us
 per-dispatch cost from a completely different experiment. Everything above it
 scales linearly, so the dispatch really is paid once however many phases follow.
 
@@ -6130,8 +6132,8 @@ Throughput rises with N — 45.9 → 51.4 GB/s, i.e. **91% of the 56.5 GB/s fabr
 roof** — because the fixed cost is being spread, not because the phases got
 faster: marginal efficiency is flat at 94.8% (N=1) and 95.3% (N=4).
 
-Extrapolated to 16 repeats: 9540 us unrolled against 10992 for 16 dispatches,
-**saving 1.45 ms**. The projection assumed 15 x 92.9 = 1.39 ms for the full
+Extrapolated to 16 repeats: 9552 us unrolled against 10992 for 16 dispatches,
+**saving 1.44 ms**. The projection assumed 15 x 92.9 = 1.39 ms for the full
 5-phase layer; measured and assumed agree.
 
 So Task 8's premise holds on measurement. The unroll is worth what the
