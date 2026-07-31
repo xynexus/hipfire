@@ -9505,3 +9505,38 @@ A pipeline only pays when the stages are balanced, and these are 5.4:1.
 Both comfortable, and A ends exactly where P3 stashes the residual that P5 needs
 — so the split falls on a boundary the data already has. It costs the ~2.7–2.9
 ms/token of the extra dispatch, landing at ~55 tok/s.
+
+### P5 measured: >5696 B, at least 1.4x P4 — the assumption was wrong
+
+The whole conclusion rested on P5 ≈ P4 ≈ 3984 B, which was never measured.
+Swapping P5 in for P4 (P1+P3+P5+emit) **overflows**:
+
+    P1+P3+emit+asum (measured by ablating P4)   10688 B
+    + P5                                        OVERFLOW
+    -> P5 in situ > 5696 B, at least 1.4x P4
+
+The reason is structural: **P5 has four loop bodies** — three `acc` chunks and a
+`flush`, each with its own broadcast acquire and `flm_asum_prepare` — where P4
+has two nested. It is body count that costs, not kernel count, which is the same
+thing the whole decomposition analysis has been saying at a larger scale.
+
+That strengthens the conclusion rather than changing it, and corrects one figure
+that was load-bearing:
+
+| combination | with P5 ≥ 5696 | |
+|---|---|---|
+| P3+P4+P5 | ≥ 16240 B | 99% — *only just* fits, where P5≈P4 said 89% |
+| P1+P2+P3 | 13680 B | 83% fits |
+| P4+P5 | ≥ 12528 B | 76% fits |
+
+So "every core runs P3+P4+P5" — the arrangement the single-dispatch argument was
+tested against — is at 99%, not 89%. It was never the comfortable option it
+looked like.
+
+**The two-dispatch split still holds**, and on measured numbers now:
+
+    A: P1+P2+P3   13680 B   83%
+    B: P4+P5     ≥12528 B   76%
+
+Both comfortable, the split falls where P3 stashes the residual P5 needs, and
+nothing in it depends on an assumed figure.
