@@ -5389,3 +5389,50 @@ was never arithmetic; it was the row count the activation size forced.
 This also retires the earlier reading of down_proj as intrinsically slow: with
 the chunking its ~54 us/layer "geometric penalty" is gone, and its efficiency is
 now indistinguishable from the other projections.
+
+## 2026-07-31 — Task 4 FALSIFIED: gate/up's rate is not the row count
+
+The plan called this its most falsifiable claim and named the disconfirming
+number in advance. It disconfirmed.
+
+`kernels/npu/flm_gemv_gate.cc` + `flm_gemv_up_swiglu.cc` + `tools/npu/flm/ffn_alt.py`
+stream gate and up as **alternating acquires of single 16-row tiles** instead of
+one fused tile carrying both (which forces 8 rows). Same bytes, same acquire
+count, weight stream reordered offline.
+
+| | wall us | marginal us | GB/s | err |
+|---|---|---|---|---|
+| single fused tile, 8 rows/tile | **514.0** | **421.1** | 41.1 | 3.40e-04 |
+| alternating acquires, 16 rows/tile | 526.6 | 433.7 | 39.9 | 3.40e-04 |
+| ideal at 21.0 MB | — | 369.1 | — | — |
+
+Gate was marginal <= 400 us. Measured **433.7 — worse than the incumbent's
+421.1**. So:
+
+- **The 8-row tile was NOT why gate/up runs below ideal.** Doubling the rows per
+  tile changed nothing for the better; both sit ~55-65 us above the 369 us its
+  transfer size allows. Whatever that gap is, it is the *arithmetic* of the
+  stage (two GEMV calls plus a SwiGLU per output row), not the geometry — which
+  is the opposite of what held for `down_proj`, where the geometry was the whole
+  story and chunking recovered 24%.
+- **The plan's perf rationale for alternating acquires is withdrawn.**
+
+**But do not delete the kernels, because the L1 argument is separate and still
+stands.** The fused layer wants one operand-object shape across every phase:
+
+| | object | x2 depth | + act | |
+|---|---|---|---|---|
+| fused tile, 8 rows | 20608 | 41216 | 45312 | fits |
+| fused tile, **16 rows** | 41088 | 82176 | 86272 | **over 64 KB** |
+| **alternating, 16 rows** | **20544** | **41088** | **45184** | **fits** |
+
+A single fused gate/up tile at 16 rows does not fit at all, and at 8 rows its
+object is 20608 B against every other phase's 20544 — close, but not the same
+shape. So alternating acquires may still be the right choice *for operand-shape
+uniformity in the fused layer*, at a measured 2.4% cost on this stage. That is a
+different argument from the one the plan made, and the layer build settles it.
+
+Recorded per `AGENTS.md`: a failed approach that narrows the search space. The
+useful residue is that **gate/up's ~15% shortfall against its transfer ceiling
+is arithmetic, and the SwiGLU's `exp2` is the obvious suspect** — the same NLF
+that caps this stage's accuracy at 3.40e-04.
