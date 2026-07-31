@@ -5580,3 +5580,54 @@ scored confident wrong answers in one day — the RoPE row-order pairing (killed
 its v_proj control), the `d`-distribution grouping (killed by a random
 regrouping), and probe 3 above (killed by asking what fit FLM actually uses).
 The first two were caught before publishing. The third was not.
+
+## 2026-07-31 — Task 5 done: qkv fused N=3072 with RoPE in the epilogue
+
+`kernels/npu/flm_gemv_qkv.cc`, `flm_qkv_emit.cc`, `tools/npu/flm/qkv_verify.py`.
+Phase P1 of the fused layer, whole: RMSNorm fused into the GEMV prologue, one
+N=3072 projection (2048 q + 512 k + 512 v), and RoPE per completed head.
+
+| shape | max err vs numpy | note |
+|---|---|---|
+| 2 cores, 6 q heads | **0.0e+00** | exact, both conventions |
+| 4 cores, heads 30–41 | 1.95e-03 | straddles q→k→v, bf16 floor |
+| 4 cores, heads 42–53 | **0.0e+00** | pure v, no rotation |
+| **16 cores, N=3072, all 48 heads** | **1.95e-03** | 3.94 MB, 171.5 us, marginal **78.6** vs 69.1 ideal (88%) |
+
+Head identity comes from the weight tile's `row_base` trailer
+(`head = row_base/64`), so there are no runtime scalar arguments and no static
+cursor to get out of step. 192 rows/core = exactly 3 whole heads, so RoPE never
+straddles a core — the reason this phase is 16 cores and not 32.
+
+### The `-DROPE_INTERLEAVED` flag turned out to be unnecessary
+
+The plan called this Task 5's open question and said it "must stay a `-D` flag".
+It does not need to be a flag at all. **The interleaved pairing `(2i, 2i+1)` is
+the half-split pairing `(i, i+32)` applied to a permuted row order** — which is
+precisely why llama.cpp's converter permutes q/k weights rather than shipping a
+second RoPE. Feeding the kernel `[v0,v2,…,v62, v1,v3,…,v63]` makes half-split
+compute the interleaved rotation.
+
+So the convention moves to **pack time**, one kernel serves both, and it is
+free. A shuffle-network version using `aie::interleave_unzip`/`zip` was written
+first, measured at **308 instructions against 300**, and produced wrong results
+(0.42 and 2.26 absolute against a mean |ref| of 0.06 and 0.47); rather than
+debug a second code path that did not need to exist, it was deleted. Both orders
+now verify exactly.
+
+This is safe for attention because `q·k` is a dot product over the head
+dimension: **any permutation shared by q and k leaves it unchanged**, and v is
+never rotated so it keeps the model's order for `o_proj`.
+
+Which convention the container actually wants remains open, and per this
+morning's §1.3 work it cannot be settled from the weights.
+
+### One trap, and it is the one this repo keeps re-learning
+
+The first run failed at 7.8e-04 against a 6.2e-04 tolerance — 1.25% of
+mean|ref|. Cause: the kernel stages the GEMV result in a **bf16** buffer and
+rotates *that*, while the reference rotated full-precision values. `x·cos −
+y·sin` is a difference of similar magnitudes, so it amplifies the 0.2% bf16
+step. Modelling both of the kernel's roundings (stage, then store) takes the
+error to **0.0e+00**. Exactly the reason `gemv_reference_bf16` is the gate and
+`gemv_reference` is only context.

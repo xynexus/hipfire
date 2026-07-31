@@ -177,7 +177,7 @@ llvm-readelf -S ~/.npu/cache/<hash>/elfs_main_core_0_2/elfs_main_core_0_2.elf
 **New:** `tools/npu/flm/qkv_verify.py`.
 **Shapes:** K=2048, N=3072, 192 rows/core, 12 tiles, result object 128 B.
 **Verify:** numpy `norm → [W_q;W_k;W_v]·y → rope(q,k)` using `rope_verify.py`'s existing `rope_freqs`-driven table. Check q′, k′, v separately.
-**Open, and it must stay a `-D` flag:** `-DROPE_INTERLEAVED` vs half-split. `rope_freqs.weight` is bit-exactly llama.cpp's `ROPE_FREQS`, which means the converter is llama.cpp-derived and the container's q/k rows *may* carry `LlamaModel.permute`. Guessing wrong gives silently plausible wrong output. Build both; neither can be settled until §1.3 is.
+**Open, but it did NOT need to be a `-D` flag — built 2026-07-31, and this part of the plan is superseded.** The interleaved pairing `(2i, 2i+1)` is the half-split pairing `(i, i+32)` applied to a permuted row order, which is exactly why llama.cpp's converter permutes q/k weights instead of shipping a second RoPE. So the convention is selected at **pack time** by reordering the tile's rows within a head, and one kernel serves both — 300 instructions against 308 for a shuffle-network version that was written, measured and discarded. Safe because `q·k` is a dot product over the head dimension, so any permutation shared by q and k leaves attention unchanged, and v is never rotated. `qkv_verify.py` checks both orders: **0.0e+00** at 2 cores and 1.95e-03 (the bf16 floor) at the full N=3072. Which convention the container wants is still open and still cannot be settled from the weights — see §1.3.
 
 ### Task 6 — attention as a phase, 8 cores
 **Modify:** nothing in the attention kernels.
