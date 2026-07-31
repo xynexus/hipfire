@@ -9131,3 +9131,40 @@ fed. Attention and P3 passing say nothing about P4, which runs after both.
 Headroom for P5: 1712 B on the P1 cores. Its marginal was ~3312 B at NROWS=16 and
 should be smaller at 8, since the loops halve — but that is exactly the kind of
 extrapolation that has been wrong three times here, so it wants measuring.
+
+## 2026-08-01 — P1→P2→P3→P4 in one dispatch
+
+    P1 cache : k' one bf16 ulp, v' 0.0
+    P3 h     : 9.5367e-07 (seq 31), exact at 17 and 9
+    P4 sw    : 2.4414e-04, 3.6621e-04 at seq 9
+    attention: 3.4631e-03  PASS
+
+P4's activation is P3's `h_ref` — the value P3 was just verified to produce — so
+this checks P4 against the real chain quantity rather than an invented one.
+
+The relative scale matches the standalone harness, so `sw` is at the same floor:
+
+    ffn_chain  2.9297e-03 / mean 0.01132 = 0.259   (accepted)
+    chain      2.4414e-04 / mean 0.00089 = 0.274
+
+That is the AIE2P exp2 NLF, which `ffn_chain` gates at ≤6% on the largest values.
+
+### The bug, and it is the third of its kind
+
+`sw` first came out at **2.3616e+00** against a 0.00089 reference. The cause was
+the row assignment: I packed P4's rows interleaved between a pair's two cores
+(`t*2*NROWS + j*NROWS`), copying P1's layout, while
+`flm_gemv_up_swiglu` writes at `row_base % DIM_OBJROWS`. Those disagree:
+
+    interleaved: slots 0,16,32,...,112,0,16,...   8 distinct for 16 steps
+    contiguous:  slots 0,8,16,...,120            16 distinct, tiles 128 exactly
+
+so half the object was never written and half was written twice. Contiguous
+per-core blocks (`j*(rpp4//2) + t*NROWS`) fix it: 2.3616e+00 → 2.4414e-04.
+
+**Every phase that writes at an offset needs its rows laid out to match that
+offset**, and this is the third time the same mismatch has bitten: `g_resid`
+collided at DIM_RESN=128 because a core's rows are interleaved, `flm_h_emit`
+needed a gather for the same reason, and now this. The rule worth carrying: an
+interleaved row assignment and a modulo-indexed write are incompatible unless
+one is built from the other.

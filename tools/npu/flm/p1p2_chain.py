@@ -705,6 +705,55 @@ def main():
     h_ts = [iron.zeros(2 * 2 * HEAD, dtype=bfloat16, device="npu")
             for _ in range(npairs)]
 
+    # ---- P4: gate/up + SwiGLU ---------------------------------------------
+    # Its activation is P3's h, and h_ref is the value P3 was just verified to
+    # produce — so this checks P4 against the real chain quantity without
+    # depending on the device's h round-tripping through DDR yet.
+    D_FF = 8192
+    p4tiles = D_FF // (NCORES * NROWS)
+    p4per = 2 * HEAD // NROWS
+    p4objs = p4tiles // p4per
+    gd, gm, gc = load_linear(c, f"model.layers.{o.layer}.mlp.gate_proj.weight",
+                             D_FF, K_DIM)
+    ud, um, uc = load_linear(c, f"model.layers.{o.layer}.mlp.up_proj.weight",
+                             D_FF, K_DIM)
+    h_act = rnd(h_ref.astype(np.float32))
+    bc4 = np.zeros(2 * K_DIM + 2 * HEAD, np.float32)
+    bc4[:K_DIM] = h_act
+    bc4_t = iron.tensor(bc4.astype(bfloat16), dtype=bfloat16, device="npu")
+
+    rpp4 = D_FF // npairs
+    # A core's rows must be CONTIGUOUS, not interleaved with its partner's.
+    # flm_gemv_up_swiglu writes at row_base % DIM_OBJROWS, and an interleave of
+    # 2*NROWS makes that modulo collide — 8 distinct slots for 16 steps, half
+    # the object unwritten and half written twice. Contiguous gives
+    # t*NROWS % 128 = 0,8,...,120, tiling the object exactly.
+    p4rows = lambda pr, j: [pr * rpp4 + j * (rpp4 // 2) + t * NROWS
+                            for t in range(p4tiles)]
+    nbc4 = K_DIM // 32
+    w4, sw_ref = [], np.zeros(D_FF, np.float64)
+    for pr in range(npairs):
+        per = []
+        for j in range(2):
+            blob = []
+            for r0 in p4rows(pr, j):
+                sl = slice(r0, r0 + NROWS)
+                blob.append(q4nx.pack_tile(gd[sl, :nbc4], gm[sl, :nbc4],
+                                           gc[sl, :nbc4], row_base=r0, flags=0.0))
+                blob.append(q4nx.pack_tile(ud[sl, :nbc4], um[sl, :nbc4],
+                                           uc[sl, :nbc4], row_base=r0, flags=0.0))
+                g = rnd(q4nx.gemv_reference_bf16(h_act, gd[sl, :nbc4],
+                                                 gm[sl, :nbc4], gc[sl, :nbc4]))
+                u = rnd(q4nx.gemv_reference_bf16(h_act, ud[sl, :nbc4],
+                                                 um[sl, :nbc4], uc[sl, :nbc4]))
+                sw_ref[sl] = rnd(g / (1.0 + np.exp(-g.astype(np.float64))) * u)
+            per.append(np.concatenate(blob))
+        b = np.empty((2 * p4tiles, 2, wt), np.uint8)
+        b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
+        w4.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
+    sw_ts = [iron.zeros(2 * p4objs * 2 * HEAD, dtype=bfloat16, device="npu")
+             for _ in range(npairs)]
+
     import os as _oh
     if _oh.environ.get("CHAIN_HOST_KV"):
         # the same cache contents, built on the host: P1 still runs and still
@@ -722,10 +771,11 @@ def main():
         host_t = iron.tensor(hraw.reshape(-1).view(np.uint8), dtype=np.uint8,
                              device="npu")
         design(bc_t, *w_ts, *q_in, *[host_t] * apairs, *q_ts,
-               *[cache_t] * npairs, *a_ts, bc3_t, *w3, *h_ts)
+               *[cache_t] * npairs, *a_ts, bc3_t, *w3, *h_ts,
+               bc4_t, *w4, *sw_ts)
     else:
         _args = (bc_t, *w_ts, *q_in, *q_ts, *[cache_t] * npairs, *a_ts,
-                 bc3_t, *w3, *h_ts)
+                 bc3_t, *w3, *h_ts, bc4_t, *w4, *sw_ts)
         if o.bench:
             _b = run_iters(design, *_args, warmup=2, iters=10)
             _us = _b.npu.min_us if _b.npu else _b.e2e.min_us
@@ -790,6 +840,15 @@ def main():
                                 oc[r0:r0+NROWS, :nbc3])
                         alt[r0:r0+NROWS] = rnd(g + x[r0:r0+NROWS])
             print(f"    DIAG vs {nm:18s}: max err {np.abs(got_h - alt[h_idx]).max():.4e}")
+    got_sw = np.concatenate([t.numpy().astype(np.float64) for t in sw_ts])
+    # stream order is [object][core], each object carrying OBJ contiguous rows
+    sw_idx = np.concatenate([np.arange(pr * rpp4 + j * (rpp4 // 2) + ob * 2 * HEAD,
+                                       pr * rpp4 + j * (rpp4 // 2) + (ob + 1) * 2 * HEAD)
+                             for pr in range(npairs)
+                             for ob in range(p4objs)
+                             for j in (0, 1)])
+    e4 = np.abs(got_sw - sw_ref[sw_idx]).max()
+    print(f"  P4 sw     : max err {e4:.4e}  mean|ref| {np.abs(sw_ref).mean():.5f}")
     print(f"P1 -> P2 in one dispatch: seq {o.seq} (P1 appends at pos {pos}), "
           f"{nobj} KV objects, npad {npad}")
     worst, scale = 0.0, 0.0
