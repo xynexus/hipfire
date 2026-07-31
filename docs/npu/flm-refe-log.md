@@ -8069,3 +8069,45 @@ reused and reported `compiled for 256 elements`. Putting `OBJW` in the fifo name
 fixed it. The rule holds with no exceptions so far: **if it is not in the source
 text, a CompileTime param, or a listed source file, it does not exist to the
 cache.**
+
+## 2026-08-01 — program memory MEASURED, and it threatens the one-dispatch layer
+
+`iron.jit` does keep core ELFs: `~/.npu/cache/<key>/elfs_main_core_<col>_<row>/`.
+So program memory can be measured instead of estimated, which §1.5b never did.
+
+    P1 alone (core 0_2)        7648 B   47%
+    P1 + attention (core 3_2) 12640 B   77%    (attention marginal 4992 B)
+    P3 + P5 (widened)         10576 B   65%
+
+**§1.5b's "78% for one layer's kernels" is wrong.** 77% is what P1 *plus
+attention alone* costs, before P3, P4 or P5 exist on that core.
+
+In the fused layer an attention core must hold all five phases. Bounding by the
+unknown shared runtime `R` (common prologue counted in both images):
+
+    R = 2 KB -> 21216 B = 129%   OVERFLOWS
+    R = 4 KB -> 19216 B = 117%   OVERFLOWS
+    R = 6 KB -> 17216 B = 105%   OVERFLOWS
+    R = 8 KB -> 15216 B =  93%   fits
+
+`R` would have to exceed **6.8 KB** — most of the P3/P5 image being shared
+runtime rather than kernel code — for the design to fit. That is possible but
+not likely, and it is now the dominant risk to Task 7.
+
+### What it costs if it does not fit
+
+The obvious escape is to keep attention on dedicated cores that skip P3–P5. But
+the FFN then runs on 12 cores instead of 16:
+
+    581.6 µs x 16/12 = 775 µs/layer, +194 µs
+    -> token 18.6 ms -> 53.8 tok/s, **below FLM's 59.86**
+
+So that escape loses the race. The others are: shrink the kernels further (the
+`noinline` fix already took one image from 103% to 78%, so there may be more
+there), or split the layer into two dispatches and give up part of the 1.18 ms
+amortisation — which the measurements say costs about 0.6 ms/token, survivable.
+
+**This is the first measured constraint that could actually defeat the plan.**
+Every previous risk resolved in favour of the design; this one has not yet, and
+the honest position is that the single-dispatch layer is unproven precisely where
+it is hardest.
