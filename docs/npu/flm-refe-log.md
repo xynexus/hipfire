@@ -9380,3 +9380,34 @@ That leaves three routes, all costed:
 
 Uneven tiling is the one worth trying: it is the only route that does not
 obviously cost the race.
+
+## 2026-08-01 — the FFN is compute-bound, which closes the partition routes
+
+    ffn_chain marginal   16 cores  600.3 us  45.5 GB/s
+                          8 cores 1065.6 us  27.2 GB/s
+
+**1.78x on half the cores — near-linear.** The FFN is core-bound, not
+fabric-bound, so taking cores away from it costs proportionally.
+
+That is the opposite of P1, which measured 54.9 → 57.0 µs going from 16 cores to
+12 (+4%) because it streams 1.0 MB and the fabric is its limit. The FFN streams
+31.6 MB *and* runs exp2 per row, so its cores are the limit. **The phase that can
+be squeezed is the small one, and the small one is not what overflows.**
+
+So the routes close:
+
+  * **fewer FFN cores** — 8 cores costs +465 µs/layer, 7.4 ms/token. Dead;
+  * **12 FFN cores via uneven tiling** — would cost ~1/3 of that gap, ~+155
+    µs/layer or 2.5 ms/token, before counting the harness work. Dead on the
+    numbers, so the tiling work is not worth doing;
+  * **two dispatches per layer** — 32 dispatches at ~92.9 µs is +2.88 ms/token,
+    15.47 → 18.35 ms, **54.5 tok/s**. Loses to FLM;
+  * **cut 2272 B** from P1+P3+P4+P5 so one core holds all five. The only route
+    left that does not cost the race.
+
+The cut has to come from the 6560 B base (P3 + emit + asum + scaffolding) or
+from P1's 4128 B, and the earlier hunt established it is not in the kernels —
+the scaffolding is generated loop structure. Reducing the *number* of phase
+bodies per core is the lever that remains: P3 runs on every core because both P4
+and P5 need its output, but nothing says it must run in its own loop rather than
+being folded into one of theirs.
