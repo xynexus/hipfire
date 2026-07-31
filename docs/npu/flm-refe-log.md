@@ -8528,3 +8528,32 @@ which is the strongest statement yet that the P1→P2 cache handoff is correct.
 
 Remaining for Task 7: P3, P4 and P5 onto this chain. The layout, drain-plan and
 per-pair-type machinery they need is now in place and exercised.
+
+### P2's output is now gathered into one buffer — the prerequisite for P3
+
+P3's o_proj is a GEMV over the whole 2048-dim vector, so the attention results
+have to be contiguous before they can feed the next phase's broadcast. They were
+draining to one buffer per attention pair.
+
+Now every attention pair drains into a **single** `attn_all_ty` buffer at its own
+offset — the same several-pairs-into-one-BO pattern the KV cache already uses.
+The verification reads `attn_out.reshape(apairs, 2, GQA, HEAD)` instead of
+indexing a list of buffers.
+
+All configurations unchanged: seq 31/17/9 and the host-KV control all PASS, with
+seq 31 still at 3.4631e-03.
+
+Two small traps in the edit, both worth naming because they recur:
+
+  * `{apairs}` inside `build()`'s **Python body** is a set literal, not an
+    interpolation — the braces only mean substitution inside the design
+    f-string. It failed loudly (`unsupported operand type(s) for *: 'set' and
+    'int'`), which is the good case;
+  * a new type must be added to the `exec` namespace as well as used in the
+    source, or the design raises `NameError` at generation time. Third time this
+    tree has hit the two-places-to-declare-a-type shape.
+
+With the gather in place, P3 needs a third TaskGroup that refills the broadcast
+from `attn_out`, streams o_proj weights on the existing weight fifos, and drains
+`h` — the pattern `chain_probe.py` verified and this harness already performs
+twice.

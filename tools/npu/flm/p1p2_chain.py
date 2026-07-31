@@ -131,6 +131,11 @@ def build(pos, nobj):
     p1opair_ty = np.ndarray[(2 * OBJ,), np.dtype[bfloat16]]
     p2o_ty = np.ndarray[(GQA * HEAD,), np.dtype[bfloat16]]
     p2opair_ty = np.ndarray[(2 * GQA * HEAD,), np.dtype[bfloat16]]
+    # P3's o_proj is over the whole 2048-dim vector, so P2's per-pair results
+    # have to land in ONE buffer before they can feed the next phase's
+    # broadcast. Several pairs draining into one BO at different offsets is the
+    # ffn_chain pattern, already used here for the KV cache.
+    attn_all_ty = np.ndarray[(apairs * 2 * GQA * HEAD,), np.dtype[bfloat16]]
     # P1's weights, then P2's q'+KV objects, on the same fifo
     w_all_ty = np.ndarray[(2 * hpc * TPH * wt,), np.dtype[np.uint8]]
     kvin_ty = bc_ty                      # q' rides the broadcast object
@@ -317,12 +322,15 @@ def _design(bc: In, {P}):
                        offset=2 * i * {OPERAND} + _j * {NATT} * {OPERAND},
                        sizes=[1, 1, 1, 2 * {OPERAND}], strides=[0, 0, 0, 1])
         for i in range(a):
-            p2h[i].drain(ab[i], wait=True, group=tg)
+            p2h[i].drain(ab[i], wait=True, group=tg,
+                         offset=i * 2 * {GQA} * {HEAD},
+                         sizes=[1, 1, 1, 2 * {GQA} * {HEAD}],
+                         strides=[0, 0, 0, 1])
         tg.finish()
 
     at = [bc_ty] + [w_all_ty] * {p1pairs} + [kvin_ty] * {apairs}
     at += [cache_ty] * ({apairs} if {HOSTKV} else 0)
-    at += list(q_tys) + [cache_ty] * {npairs} + [p2opair_ty] * {apairs}
+    at += list(q_tys) + [cache_ty] * {npairs} + [attn_all_ty] * {apairs}
     at += [f_bc.prod(tile=AnyShimTile)]
     at += [f.prod(tile=AnyShimTile) for f in f_w]
     at += [f.cons(tile=AnyShimTile) for f in f_p1]
@@ -337,7 +345,7 @@ def _design(bc: In, {P}):
               EMIT_SRC=EMIT_SRC, NORM_SRC=NORM_SRC, ATT_SRC=ATT_SRC,
               BEG_SRC=BEG_SRC, FIN_SRC=FIN_SRC, FLAGS=flags, bc_ty=bc_ty,
               op_ty=op_ty, oppair_ty=oppair_ty, p1o_ty=p1o_ty,
-              p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty,
+              p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty, attn_all_ty=attn_all_ty,
               w_all_ty=w_all_ty, kvin_ty=kvin_ty, q_tys=q_tys,
               cache_ty=cache_ty, SKIP_P1=SKIP_P1, HOSTKV=HOSTKV,
               PREP=PREP, PREPSRC=PREPSRC,
@@ -481,8 +489,8 @@ def main():
 
     q_ts = [iron.zeros(qobj[pr] * OBJ, dtype=bfloat16, device="npu")
             for pr in range(p1pairs)]
-    a_ts = [iron.zeros(2 * GQA * HEAD, dtype=bfloat16, device="npu")
-            for _ in range(apairs)]
+    attn_out = iron.zeros(apairs * 2 * GQA * HEAD, dtype=bfloat16, device="npu")
+    a_ts = [attn_out] * apairs        # every pair drains into the same buffer
     import os as _oh
     if _oh.environ.get("CHAIN_HOST_KV"):
         # the same cache contents, built on the host: P1 still runs and still
@@ -549,7 +557,8 @@ def main():
         sc = (qr @ Kfull.T) / math.log2(math.e)
         e = np.exp(sc - sc.max(1, keepdims=True))
         want = (e / e.sum(1, keepdims=True)) @ Vfull
-        got = a_ts[a // 2].numpy().astype(np.float64).reshape(2, GQA, HEAD)[a % 2]
+        got = (attn_out.numpy().astype(np.float64)
+               .reshape(apairs, 2, GQA, HEAD)[a // 2, a % 2])
         worst = max(worst, np.abs(got - want).max())
         scale = max(scale, np.abs(want).mean())
         if a == 0:
