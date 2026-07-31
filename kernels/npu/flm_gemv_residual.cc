@@ -35,12 +35,15 @@
 #include "flm_q4_1_tile.h"
 
 extern "C" __attribute__((noinline)) void
-flm_gemv_q4_1_residual(const bfloat16 *restrict act,
+flm_gemv_q4_1_residual(const bfloat16 *restrict act_aux,
                        const uint8 *restrict wtile, float *restrict out) {
-  flm_q4_1_tile(act, wtile, out);
-  static_assert(NROWS * 2 <= 64, "residual region holds NROWS bf16");
-  static_assert(TILE_BYTES % 64 == 0, "tile must already be 64-byte aligned");
-  const auto *res = reinterpret_cast<const bfloat16 *>(wtile + TILE_BYTES);
+  flm_q4_1_tile(act_aux, wtile, out);
+  // The residual comes from the broadcast buffer's aux half, indexed by the
+  // tile's own row_base. It CANNOT be packed into the tile as it was before:
+  // in a fused layer the residual is computed on-device during the same
+  // dispatch, so it does not exist at pack time.
+  const bfloat16 *restrict aux = act_aux + K;
+  const int base = tile_row_base(wtile);
   for (int r = 0; r < NROWS; ++r)
-    out[r] += float(res[r]);
+    out[r] += float(aux[base + r]);
 }

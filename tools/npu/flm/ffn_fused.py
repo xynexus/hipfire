@@ -42,8 +42,7 @@ BLK = 32
 FLM_DECODE_GBS = 46.2
 
 
-def tile_bytes(K, NROWS):
-    return 2 * NROWS * (K // BLK) * 2 + NROWS * (K // 2)
+tile_bytes = q4nx.tile_bytes   # includes the universal 64 B trailer
 
 
 def build(K, NROWS, ncores, tiles_per_core):
@@ -56,7 +55,7 @@ def build(K, NROWS, ncores, tiles_per_core):
     """
     if ncores % 2:
         raise ValueError("--cores must be even (cores are wired in pairs)")
-    wt = 2 * tile_bytes(K, NROWS)          # gate tile + up tile
+    wt = 2 * tile_bytes(K, NROWS)          # [gate tile+trailer][up tile+trailer]
     npairs = ncores // 2
     rows_per_core = tiles_per_core * NROWS
 

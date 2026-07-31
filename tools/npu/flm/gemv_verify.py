@@ -35,10 +35,9 @@ Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
 
 
 BLK_C = 32
-
-
-def tile_bytes(K, NROWS):
-    return 2 * NROWS * (K // BLK_C) * 2 + NROWS * (K // 2)
+# tile_bytes lives in q4nx now (it must agree with pack_tile's trailer), and is
+# re-exported here because several harnesses import it from this module.
+tile_bytes = q4nx.tile_bytes
 
 
 import aie.iron as iron  # noqa: E402

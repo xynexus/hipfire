@@ -51,8 +51,21 @@ constexpr int NB = K / BLK;        // blocks per output row
 constexpr int HALF = BLK / 2;      // lanes per nibble half within one block
 constexpr int LANES = 2 * HALF;    // two blocks per iteration — see below
 constexpr int QBYTES = K / 2;      // packed bytes per output row
-// Bytes in one weight tile: [NROWS*NB bf16 d][NROWS*NB bf16 m][NROWS*K/2 codes]
+// Bytes in one weight tile's PAYLOAD:
+//   [NROWS*NB bf16 d][NROWS*NB bf16 m][NROWS*K/2 codes]
 constexpr int TILE_BYTES = 2 * NROWS * NB * 2 + NROWS * QBYTES;
+// ... followed by a universal 64-byte trailer: [f32 row_base][f32 flags][pad].
+// `row_base` is the global output-row index of this tile's first row, and it
+// replaces every per-core index the kernels would otherwise need — residual
+// indexing, RoPE head identity, down-chunk accumulator slot — with no runtime
+// scalar arguments and no static cursors. 64 also keeps the tile a multiple of
+// 64 so both halves of a double-buffered fifo stay aligned.
+constexpr int TILE_TRAILER = 64;
+constexpr int TILE_TOTAL = TILE_BYTES + TILE_TRAILER;
+
+inline int tile_row_base(const uint8 *restrict wtile) {
+  return int(reinterpret_cast<const float *>(wtile + TILE_BYTES)[0]);
+}
 
 static_assert(NB % 2 == 0, "K must be a multiple of 64");
 static_assert(NB % LANES == 0, "K/32 must be a multiple of 32 for the zero-point reduction");

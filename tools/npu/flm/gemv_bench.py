@@ -48,8 +48,7 @@ FABRIC_ROOF_GBS = 56.5
 FOUR_STREAM_GBS = 48.6
 
 
-def tile_bytes(K, NROWS):
-    return 2 * NROWS * (K // BLK) * 2 + NROWS * (K // 2)
+tile_bytes = q4nx.tile_bytes   # includes the universal 64 B trailer
 
 
 def build(K, NROWS, ncores, tiles_per_core):

@@ -32,7 +32,7 @@ flm_ffn_gate_up(const bfloat16 *restrict act, const uint8 *restrict wtile,
                 bfloat16 *restrict out) {
   float g[NROWS], u[NROWS];
   flm_q4_1_tile(act, wtile, g);
-  flm_q4_1_tile(act, wtile + TILE_BYTES, u);
+  flm_q4_1_tile(act, wtile + TILE_TOTAL, u);   // past the gate tile AND its trailer
 
   // One 32-lane exp2 covers the whole tile; NROWS is 8 or 16, so the spare
   // lanes are wasted but a second call would not be cheaper.

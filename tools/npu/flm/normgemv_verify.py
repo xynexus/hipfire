@@ -41,19 +41,23 @@ KDIR = Path(__file__).resolve().parents[3] / "kernels/npu"
 GEMV_SRC = str(KDIR / "flm_gemv_q4_1.cc")
 RES_SRC = str(KDIR / "flm_gemv_residual.cc")
 NORM_SRC = str(KDIR / "flm_norm_prepare.cc")
+ASUM_SRC = str(KDIR / "flm_asum_prepare.cc")
 Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
 EPS = 1e-5
 
 
-@iron.jit(source_files=[GEMV_SRC, NORM_SRC, RES_SRC])
+@iron.jit(source_files=[GEMV_SRC, NORM_SRC, RES_SRC, ASUM_SRC])
 def norm_gemv(actnw: In, w: In, out: Out, *, K: CompileTime[int] = 2048,
               N: CompileTime[int] = 512, NROWS: CompileTime[int] = 16,
               RESID: CompileTime[int] = 0):
     # the residual rides inside the weight tile: NROWS bf16 appended
-    wtile = tile_bytes(K, NROWS) + (64 if RESID else 0)
+    wtile = tile_bytes(K, NROWS)   # trailer is universal now
     ntiles = N // NROWS
-    # One buffer carries [activation K][norm weight K]: a separate fifo for the
-    # norm weight would be a third DMA input and a core tile has only two.
+    # One buffer carries [activation K][aux K]. A separate fifo for the second
+    # operand would be a third DMA input and a core tile has only two. The aux
+    # half is the norm weight for flm_norm_prepare and the residual for the
+    # residual-fused GEMV — the plan's single broadcast object, one shape for
+    # every phase.
     act_ty = np.ndarray[(2 * K,), np.dtype[bfloat16]]
     wt_ty = np.ndarray[(wtile,), np.dtype[np.uint8]]
     o_ty = np.ndarray[(NROWS,), np.dtype[np.float32]]
@@ -65,9 +69,14 @@ def norm_gemv(actnw: In, w: In, out: Out, *, K: CompileTime[int] = 2048,
         "flm_gemv_q4_1_residual" if RESID else "flm_gemv_q4_1",
         source_file=RES_SRC if RESID else GEMV_SRC,
         arg_types=[act_ty, wt_ty, o_ty], compile_flags=flags)
-    # Replaces flm_asum_prepare: normalises in place AND fills g_asum.
-    prep = ExternalFunction("flm_norm_prepare", source_file=NORM_SRC,
-                            arg_types=[act_ty], compile_flags=flags)
+    # With the residual (the plan's P3, o_proj) there is NO norm — the aux half
+    # carries the residual, so running flm_norm_prepare would normalise using
+    # the residual as the norm weight. That phase uses the plain block-sum
+    # prologue instead, exactly as the fused-layer plan specifies.
+    prep = ExternalFunction(
+        "flm_asum_prepare" if RESID else "flm_norm_prepare",
+        source_file=ASUM_SRC if RESID else NORM_SRC,
+        arg_types=[act_ty], compile_flags=flags)
 
     f_act = ObjectFifo(act_ty, depth=1, name="act")
     f_w = ObjectFifo(wt_ty, name="wt")
@@ -117,17 +126,20 @@ def main():
     rng = np.random.default_rng(0)
     x = rnd(rng.standard_normal(K) * 0.05)
 
+    # row_base is DISTINCT per tile: that is what actually tests the trailer is
+    # being read, rather than a constant that would pass by accident.
+    wbuf = np.concatenate([q4nx.pack_tile(d[i:i + NROWS], m[i:i + NROWS],
+                                          codes[i:i + NROWS], row_base=i)
+                           for i in range(0, N, NROWS)])
+    # The residual GEMV normalises nothing, so its aux half carries the
+    # residual; the norm-fused GEMV's aux half carries the norm weight.
     resid = rnd(rng.standard_normal(N) * 0.3) if o.residual else None
+    aux = np.zeros(K, np.float32)
     if o.residual:
-        wbuf = np.concatenate([
-            q4nx.pack_tile_residual(d[i:i + NROWS], m[i:i + NROWS],
-                                    codes[i:i + NROWS], resid[i:i + NROWS])
-            for i in range(0, N, NROWS)])
+        aux[:N] = resid
     else:
-        wbuf = np.concatenate([q4nx.pack_tile(d[i:i + NROWS], m[i:i + NROWS],
-                                              codes[i:i + NROWS])
-                               for i in range(0, N, NROWS)])
-    a_t = iron.tensor(np.concatenate([x, nw]).astype(bfloat16),
+        aux = nw
+    a_t = iron.tensor(np.concatenate([x, aux]).astype(bfloat16),
                       dtype=bfloat16, device="npu")
     w_t = iron.tensor(wbuf, dtype=np.uint8, device="npu")
     o_t = iron.zeros(N, dtype=np.float32, device="npu")
@@ -138,8 +150,11 @@ def main():
     # Reference: the same two steps the kernel now does in one pass, with the
     # kernel's own bf16 roundings, so this is the correctness gate.
     xd = x.astype(np.float64)
-    inv = np.float32(1.0 / np.sqrt((xd * xd).mean() + EPS))
-    xn = rnd(rnd(x * rnd(inv)) * nw)
+    if o.residual:
+        xn = x                     # P3 has no norm
+    else:
+        inv = np.float32(1.0 / np.sqrt((xd * xd).mean() + EPS))
+        xn = rnd(rnd(x * rnd(inv)) * nw)
     ref = np.concatenate([
         q4nx.gemv_reference_bf16(xn, d[i:i + NROWS], m[i:i + NROWS],
                                  codes[i:i + NROWS])
@@ -149,7 +164,7 @@ def main():
 
     err = np.abs(got - ref)
     scale = np.abs(ref).mean()
-    what = "norm+GEMV+residual" if o.residual else "norm+GEMV"
+    what = "GEMV+residual (P3, no norm)" if o.residual else "norm+GEMV"
     print(f"{what} fused: K={K} N={N} rows/tile={NROWS}, layer {o.layer}")
     print(f"  norm weight range [{nw.min():.4f}, {nw.max():.4f}]")
     print(f"  vs norm-then-GEMV reference: max {err.max():.4e}  mean {err.mean():.4e}")
