@@ -301,12 +301,21 @@ def _design(bc: In, {P}):
         op.release(1)
         bcc.release(1)
 
-    def p4_body(bcc, wc, op, kgate, kups, kasum):
+    def p4_body(bcc, wc, op, kgate, kups, kprep):
         """gate/up + SwiGLU. One result object per p4per steps: the kernel writes
         at row_base % DIM_OBJROWS, so the object fills densely and P5 can be
         broadcast a dense sw."""
         eb = bcc.acquire(1)
-        kasum(eb)                          # g_asum for h, P4's activation
+        # The POST-ATTENTION RMSNorm, and g_asum for the normalised h. This used
+        # to be flm_asum_prepare, which computes the sums but does NOT normalise
+        # -- so the FFN ran on raw h and the layer was missing one of its two
+        # norms. The host reference made the same omission, so the check passed
+        # on both sides computing the wrong layer.
+        #
+        # Costs no program memory: flm_norm_prepare is already linked for P1.
+        # Under CHAIN_HOST_NORM `kprep` is the asum kernel and the host
+        # pre-normalises h, exactly as it does for x.
+        kprep(eb)
         for _ in range_({p4objs}):
             eo = op.acquire(1)
             for _ in range_({p4per}):
@@ -329,7 +338,7 @@ def _design(bc: In, {P}):
         eb2 = bcc.acquire(1)
         bcc.release(1)
         p3_body(bcc, wc, op, kres, kasum, khemit)
-        p4_body(bcc, wc, op, kgate, kups, kasum)
+        p4_body(bcc, wc, op, kgate, kups, kprep)
 
     def core_p1p2(bcc, wc, op, ap, kqkv, kemit, kprep, kbeg, ktile, kfin,
                   kres, kasum, khemit, kgate, kups):
@@ -366,7 +375,7 @@ def _design(bc: In, {P}):
         ap.release(1)
         bcc.release(1)
         p3_body(bcc, wc, op, kres, kasum, khemit)
-        p4_body(bcc, wc, op, kgate, kups, kasum)
+        p4_body(bcc, wc, op, kgate, kups, kprep)
 
     workers = []
     for p in range({npairs}):
@@ -730,8 +739,17 @@ def main():
     ud, um, uc = load_linear(c, f"model.layers.{o.layer}.mlp.up_proj.weight",
                              D_FF, K_DIM)
     h_act = rnd(h_ref.astype(np.float32))
+    # h is the FFN's input and it must be RMSNormed with the layer's SECOND
+    # norm weight before gate/up. Mirrors P1's rounding exactly.
+    nw2 = c.bf16(f"model.layers.{o.layer}.post_attention_layernorm.weight"
+                 ).astype(np.float32)[:K_DIM]
+    hd = h_act.astype(np.float64)
+    inv2 = np.float32(1.0 / np.sqrt((hd * hd).mean() + EPS))
+    h_n = rnd(rnd(h_act * rnd(inv2)) * nw2)
     bc4 = np.zeros(2 * K_DIM + 2 * HEAD, np.float32)
-    bc4[:K_DIM] = h_act
+    bc4[:K_DIM] = (h_n if __import__("os").environ.get("CHAIN_HOST_NORM")
+                   else h_act)
+    bc4[K_DIM:2 * K_DIM] = nw2
     bc4_t = iron.tensor(bc4.astype(bfloat16), dtype=bfloat16, device="npu")
 
     rpp4 = D_FF // npairs
@@ -754,9 +772,9 @@ def main():
                                            gc[sl, :nbc4], row_base=r0, flags=0.0))
                 blob.append(q4nx.pack_tile(ud[sl, :nbc4], um[sl, :nbc4],
                                            uc[sl, :nbc4], row_base=r0, flags=0.0))
-                g = rnd(q4nx.gemv_reference_bf16(h_act, gd[sl, :nbc4],
+                g = rnd(q4nx.gemv_reference_bf16(h_n, gd[sl, :nbc4],
                                                  gm[sl, :nbc4], gc[sl, :nbc4]))
-                u = rnd(q4nx.gemv_reference_bf16(h_act, ud[sl, :nbc4],
+                u = rnd(q4nx.gemv_reference_bf16(h_n, ud[sl, :nbc4],
                                                  um[sl, :nbc4], uc[sl, :nbc4]))
                 sw_ref[sl] = rnd(g / (1.0 + np.exp(-g.astype(np.float64))) * u)
             per.append(np.concatenate(blob))

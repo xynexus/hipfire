@@ -10181,3 +10181,32 @@ passes while both sides compute a layer that is missing one of its two RMSNorms.
 Both are fixable and neither costs program memory: `flm_norm_prepare` is already
 linked for P1, and `bc4` is already sized `2*K_DIM + 2*HEAD` with the weight slot
 zeroed, so the norm weight needs no layout change.
+
+### Fixed: the post-attention RMSNorm is now in the layer
+
+`p4_body` calls `kprep` (flm_norm_prepare) instead of `flm_asum_prepare`, and
+`bc4[K_DIM:2*K_DIM]` carries `post_attention_layernorm.weight`. No program-memory
+cost — that kernel is already linked for P1 — and `bc4` was already sized
+`2*K_DIM + 2*HEAD` with the slot zeroed.
+
+The device really is normalising, and the cleanest evidence is that the RELATIVE
+error did not move while the scale did:
+
+    before (no norm):  sw 2.4414e-04   mean|ref| 0.00089   ratio 0.274
+    after  (norm):     sw 2.9297e-03   mean|ref| 0.01109   ratio 0.264
+
+Both grew ~12x together. Had the device skipped the norm while the reference
+applied it, the error would be the size of the values, not proportional to them.
+
+`x_out` stays exact at layers 0 and 15 (0.0000e+00), on the one genuinely
+composed seam.
+
+**Timing, corrected.** The norm prepare does more work than the asum prepare:
+
+    side A 636.6 us (was 626.0; median of 641.1/636.6/629.0)
+    side B 266.0 us
+    layer  902.6 us  ->  16 layers 14.44 ms + lm_head 3.70 ms = 18.14 ms
+    **55.1 tok/s** (was 55.7). FLM at matched context 58.83, -6.3%.
+
+Every number above this line that quotes 55.7 was measured on a layer missing
+this norm.
