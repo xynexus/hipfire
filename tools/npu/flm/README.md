@@ -65,8 +65,9 @@ reading passes it. `ground_truth.py` checks that reading against
 `meta-llama/Llama-3.2-1B-Instruct`'s actual checkpoint and, as of 2026-07-31,
 **it fails**: the unquantized tensors are 100% bit-exact (so the reader, the
 planar split, the naming and the model are right), but the quantized blocks are
-not a reordering of the checkpoint's, and the Frobenius norm is inflated
-1.12–1.19x by a per-tensor factor — a per-channel scaling. So the kernels are
+not the checkpoint's under any arrangement (they score at the look-alike floor
+against all 524,288 ground-truth blocks), and the Frobenius norm is inflated
+1.12–1.19x, differing per tensor, so a scaling is present too. So the kernels are
 verified as q4_1 arithmetic over the container's blocks, not as computing the
 model. Throughput figures are unaffected.
 

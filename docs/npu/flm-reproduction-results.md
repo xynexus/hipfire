@@ -10,9 +10,10 @@ records where the reproduction matched and where it did not.
 > container's *unquantized* tensors are **100% bit-exact** — file structure,
 > planar split, tensor naming and model identity (Llama-3.2-1B-**Instruct**) are
 > all confirmed. The *quantized* blocks are not: they do not match the model's
-> 32-element blocks under any grouping or permutation tested, and the Frobenius
-> norm is inflated 1.12–1.19x by a per-tensor factor, which is a per-channel
-> scaling rather than a reordering. So the kernels are verified as **q4_1
+> 32-element blocks — against all 524,288 of them they score 0.99487, at the
+> 0.99503 look-alike floor rather than the 0.99713 a true match earns — and the
+> Frobenius norm is inflated 1.12–1.19x, differing per tensor, so a real scaling
+> is present on top of whatever reordering there is. So the kernels are verified as **q4_1
 > arithmetic over the container's blocks** (1.9e-07 against a reference on the
 > same bytes) — not as computing Llama-3.2-1B-Instruct end to end. Read every
 > "on real weights" below as "on the container's q4_1 blocks". Throughput
@@ -53,10 +54,21 @@ bytes sum to 38,010,880 — the number that document derived independently.
 8192 weights per row is four output rows at K=2048 or one at K=8192, which is
 why q/k/v/o/gate/up and down all land on the same second dimension.
 
-**Quantizer**: plain min/max asymmetric q4_1 (`d=(max-min)/15`, `m=min`).
-`m/d` is −7.4 to −7.5 with std 1.35 across every tensor and `m + 7.5d` centres
-on zero — the signature of min/max on symmetric zero-mean blocks. This
-corroborates `Dequant::generate_dequant_q4_1_seq` from the symbol table.
+**Quantizer**: asymmetric q4_1, `w = d*q + m` — corroborated by
+`Dequant::generate_dequant_q4_1_seq` in the symbol table. `m/d` is −7.4 to −7.5
+with std 1.35 across every tensor and `m + 7.5d` centres on zero, so the blocks
+are symmetric and zero-mean.
+
+**It is not a plain min/max fit**, which this document previously claimed on the
+strength of those centring statistics alone. A min/max fit (`d=(max-min)/15`,
+`m=min`) puts a code 0 and a code 15 in *every* block by construction. Measured
+on `down_proj` layer 0, only **48.5%** of blocks hold both, the code histogram is
+bell-shaped about 7.4, and the mean per-block code span is **14.08 of 15** — a
+search fit on a grid ~6.6% wider than min/max. (48.5% is *below* the 76.3%
+uniformly random 4-bit codes would give, which is the tell: the codes avoid the
+rails.) Consequence for any future probe: **never compare the stored `d` against
+a candidate block's `(max-min)/15`** — that comparison fails whatever the block
+mapping is, and it invalidated one §1.3 probe before the error was caught.
 
 **Block axis**: 32 **contiguous input dims** (K-major). Settled by per-block
 scale spread, which separates the two orientations cleanly because outlier
