@@ -10801,3 +10801,32 @@ Not fixing this today — it is the hardware's exp2, and a more accurate softmax
 would mean a different formulation, which is design work. But the floor is no
 longer unexplained, and the check's advisory bound can now be replaced by a real
 one when someone wants to derive it.
+
+### The same NLF explains P4, and P4's error was never 26%
+
+SwiGLU runs the same approximation — `flm_gemv_up_swiglu.cc` computes
+`silu(g) = g / (1 + exp(-g))` via `aie::exp2<bfloat16>`, because it is the only
+exponential on the core. Unlike attention's softmax there is **no normalization**
+to cancel the NLF's bias.
+
+But first, a correction of my own reading. I twice quoted P4's `sw` error against
+`mean|ref|` and twice let a 26% figure pass without comment. Against the peak:
+
+    layer  0:  max err 2.9297e-03   mean|ref| 0.01109   max|ref| 0.14062   **2.08% of peak**
+    layer 15:  max err 2.3438e-02   mean|ref| 0.09660   max|ref| 1.66406   **1.41% of peak**
+
+`sw` is a SwiGLU product, so its mean sits far below its peak and the
+mean-relative number reads alarmingly high for no reason. **This is the second
+time a max-over-mean comparison misled me** — it sent the attention investigation
+down three wrong normalizers first. Both call sites now print max|ref| too.
+
+At 1.4-2% of peak the numbers line up with the NLF being the dominant term.
+Propagating: with `s = exp2(-g log2 e)` carrying up to 6%, the sigmoid's relative
+error is `(s/(1+s)) . (ds/s)`, damped to roughly 3% at `s ~ 1`, and `sw = g.sigma.u`
+inherits it. Measured 1.4-2% sits just under that bound.
+
+So one hardware approximation accounts for both phases' floors, damped two
+different ways: **normalization** in attention (neighbouring weights err together
+and the bias divides out) and the **sigmoid's own form** in SwiGLU (the
+`s/(1+s)` factor). Neither phase is buggy; both are reporting the accuracy of
+`aie::exp2`.

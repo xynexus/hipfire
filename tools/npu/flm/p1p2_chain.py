@@ -929,7 +929,12 @@ def main():
     got_sw = sw_all.numpy().astype(np.float64)   # already row-ordered
     # stream order is [object][core], each object carrying OBJ contiguous rows
     e4 = np.abs(got_sw - sw_ref).max()
-    print(f"  P4 sw     : max err {e4:.4e}  mean|ref| {np.abs(sw_ref).mean():.5f}")
+    # max|ref| alongside mean: e4 is a MAX error, and comparing it to a mean has
+    # already misled me once on attention. sw is a SwiGLU product, so its mean is
+    # far below its peak and the mean-relative figure reads alarmingly high.
+    print(f"  P4 sw     : max err {e4:.4e}  mean|ref| {np.abs(sw_ref).mean():.5f}"
+          f"  max|ref| {np.abs(sw_ref).max():.5f}"
+          f"  ({e4 / max(np.abs(sw_ref).max(), 1e-9):.2%} of peak)")
     if o.layer_pass:
         import p5_pass
         # the residual P5 adds is x, the layer's input — in the fused layer it
