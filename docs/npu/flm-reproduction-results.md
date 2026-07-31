@@ -256,6 +256,36 @@ per-core compute has not stopped mattering; but at 48.1 GB/s the body is at
 99-100% of the 4-stream ingress figure, and the fabric roof is 56.5. The next
 lever is ingress width (open thread 1), not the kernel body.
 
+### What this rate implies for future formats (phase 4)
+
+Worth stating here because the phase-4 plan was written against "the MAC unit is
+oversupplied 199x", which is a statement about **MAC issue capacity** and not
+about the per-weight decode budget. Measured: **3.01 GB/s/core = 2.67
+weights/cycle/core** at 5.00 bpw. The rate needed to saturate the 56.5 GB/s
+fabric, by format and core count:
+
+| bpw | 16 cores | 32 cores |
+|---|---|---|
+| 5.000 (q4_1 today) | 3.14 | 1.57 |
+| 4.125 (oq4++) | 3.80 | 1.90 |
+| 3.000 (QTIP-3) | 5.23 | **2.62** |
+| 2.000 (QTIP-2) | 7.85 | **3.92** |
+
+Fewer bits per weight means more weights per delivered byte, so the decode
+requirement rises exactly as fast as the bandwidth win — they trade rather than
+compound. On the full 32-core array a QTIP-3 decoder must be **no more expensive
+per weight than this int4 unpack** (2.62 needed against 2.67 measured), and
+QTIP-2 must be ~1.5x cheaper.
+
+The counterweight: this body issues ~13 vector ops per 64 weights yet achieves
+only 2.67 weights/cycle, an effective **0.54 ops/cycle** — it is latency- and
+dependency-bound, not issue-bound, and the VLIW slots are largely idle
+(corroborated by the second accumulator failing to legalize and unrolling not
+helping). A sequential trellis decoder has **NROWS independent chains available
+per tile** (16 output rows, no dependency between them), which is the structure
+that fills idle slots. So the phase-4 gate should be measured with several rows
+in flight rather than on one chain.
+
 ## 6. Traps found building this
 
 Full detail in the log and in `tools/npu/flm/README.md`. Each cost real time.
