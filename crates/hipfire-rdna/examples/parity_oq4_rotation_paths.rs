@@ -48,7 +48,7 @@ fn main() {
     let xb = gpu.upload_f32(&xv, &[n, k]).unwrap();
 
     // Helper: int4-quantize a [rows×K] f32 rotated activation, return (nibbles, scales).
-    let mut quantize = |gpu: &mut Gpu, xr: &hipfire_rdna::GpuTensor, rows: usize| {
+    let quantize = |gpu: &mut Gpu, xr: &hipfire_rdna::GpuTensor, rows: usize| {
         let q = gpu.alloc_tensor(&[rows * (k / 2)], DType::Raw).unwrap();
         let s = gpu.alloc_tensor(&[rows * ng], DType::F32).unwrap();
         gpu.quantize_act_oq4(xr, &q, &s, rows, k, group).unwrap();
