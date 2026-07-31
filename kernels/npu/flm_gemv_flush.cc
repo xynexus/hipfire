@@ -32,7 +32,7 @@ extern float g_acc_down[];
 #ifndef XOUT_TO_STASH
 #define XOUT_TO_STASH 0
 #endif
-#if RESID_FROM_STASH
+#if RESID_FROM_STASH || XOUT_TO_STASH
 #ifndef DIM_RESN
 #define DIM_RESN 128
 #endif
