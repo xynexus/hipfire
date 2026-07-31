@@ -4,10 +4,12 @@
 **Verified.** One design, N dispatches, every step exact — including the two
 carries. Two faults had to be fixed to get here and both are worth knowing:
 
-1. **Acquire every fifo object BEFORE calling any kernel.** Interleaving
-   `acquire -> call -> acquire` silently loses the input: the kernel reads zeros
-   with no error. Every other harness in this tree happens to acquire first,
-   which is why nothing had hit it.
+1. **Hoisting the acquires above the kernel calls.** Interleaved
+   `acquire -> call -> acquire` made the first kernel read zeros from its
+   acquired input, with no error; hoisting fixed it, and reverting broke it
+   again. **The trigger is not understood** — `ffn_chain.py` interleaves the
+   same way and is exact — so this is a known hazard with an unknown boundary,
+   not a rule. If a kernel reads zeros from an acquired input, try hoisting.
 2. **Build ONE design and reuse it.** A new design is a new program load, which
    clears core `.bss` — so a harness that rebuilds per token destroys the very
    carry it is trying to test. The drain offset is therefore fixed at column
@@ -111,8 +113,13 @@ def _design(hin: In, wt: In, kc: Out):
     f_o = ObjectFifo(out_ty, depth=1, name="ko{t}")
 
     def core(ic, wc, op, ks, ke):
-        # acquire everything BEFORE calling any kernel — interleaving
-        # acquire/call/acquire is what the working probes do not do
+        # All three acquires precede both kernel calls. Interleaving them —
+        # acquire, call, acquire — makes `ks` read ZEROS from `ei`, verified by
+        # A/B in both directions. The exact trigger is NOT established:
+        # ffn_chain.py interleaves in the same way and is exact, so "never
+        # interleave" is not the rule. Treat it as a known hazard with an
+        # unknown boundary; if a kernel reads zeros from an acquired input,
+        # hoist the acquires first.
         ei = ic.acquire(1)
         ew = wc.acquire(1)
         eo = op.acquire(1)

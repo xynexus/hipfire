@@ -6496,16 +6496,23 @@ see a payload fault, and I nearly concluded "input fifos are fine" from it.
 
 ### Resolved — two faults, and the second invalidates the harness rather than the scheme
 
-**1. Acquire every fifo object before calling any kernel.** This was the
-"input fifo does not deliver" fault. The core did
+**1. Hoisting the acquires above the kernel calls.** This was the "input fifo
+does not deliver" fault. The core did
 
     ei = ic.acquire(1); ks(ei); ew = wc.acquire(1); eo = op.acquire(1); ke(...)
 
 and the kernel read **zeros** from `ei`, with no error and no warning. Hoisting
-all three acquires above both calls fixed it immediately — the constant-head
-test went from an all-zero cache to exact. Every other harness in this tree
-happens to acquire everything first, which is why nothing had hit it. Treat
-interleaved `acquire -> call -> acquire` as unsupported.
+all three acquires above both calls fixed it, and reverting the hoist broke it
+again — A/B in both directions, so the hoist is the cause and not a coincidence.
+
+**The trigger is NOT understood, and the obvious rule is wrong.** "Never
+interleave acquire → call → acquire" would be the natural conclusion, and
+`ffn_chain.py` does exactly that (`kn(eb)` then `wc.acquire(1)` inside the tile
+loop, reusing `eb` afterwards) while verifying exact. So some narrower condition
+distinguishes the two and I have not found it. Recorded as a **hazard with an
+unknown boundary**: if a kernel reads zeros from an acquired input, hoist the
+acquires and see. Do not read it as a design rule, and do not assume existing
+harnesses are unsafe — every one of them verifies.
 
 **2. A new design per token resets core `.bss`.** With the acquires fixed, the
 result is diagnostic rather than uniform:
