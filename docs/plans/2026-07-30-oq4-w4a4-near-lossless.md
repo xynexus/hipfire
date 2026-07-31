@@ -767,6 +767,11 @@ noise floor, i.e. a **real, non-trivial degradation** consistent with the survey
 estimate. The validation KLD of 0.017 (vs ~0.63 if a site were missed) is the proof the
 measurement is sound.
 
+**ctx=2048 confirmation (2039 scored positions, 4× the data):** noise floor **0.0160**,
+int4-act penalty **0.0672 KLD**, PPL 10.67 → 11.30 (**+0.63 PPL**). The penalty is
+byte-stable across ctx (0.0668 → 0.0672), so it is **robust, not a small-sample artifact** —
+~4.2× the noise floor. Headline number: **int4-act prefill penalty ≈ 0.067 KLD / +0.6 PPL.**
+
 **A4 decision:** int4-act buys ~1.5× prefill throughput (§9) at ~0.067 KLD / +0.79 PPL.
 That is a genuine **throughput-vs-quality tradeoff**, NOT free — so promoting qwen3.5
 qkv/gate_up to W4A4-by-default is **not justified on quality alone**; it needs Stream B to
