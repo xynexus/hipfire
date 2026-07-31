@@ -71,7 +71,7 @@ FIXED_US = 92.9
 rnd = lambda v: q4nx.bf16_to_f32(q4nx.f32_to_bf16(np.asarray(v, np.float32)))
 
 
-def build(ncores, host_norm=False):
+def build(ncores, host_norm=False, nrep=1):
     wt = q4nx.tile_bytes(K_DIM, NROWS)
     npairs = ncores // 2
     p4_pairs = D_FF // (ncores * NROWS)        # gate/up pairs per core  (32)
@@ -140,37 +140,38 @@ def _design(bc: In, {params}):
     o_sub = [f.prod().join([0, {NROWS}], obj_types=[o_ty, o_ty]) for f in f_o]
 
     def core(bcc, wc, op, kgate, kups, kacc, kflush, kn, kas):
-        # ---- P4: norm2 + gate/up + SwiGLU ----
-        eb = bcc.acquire(1)
-        kn(eb)                                  # RMSNorm in place + block sums
-        for _ in range_({p4_pairs}):
-            eg = wc.acquire(1)
-            kgate(eb, eg)                       # gate -> 64 B in-core stash
-            wc.release(1)
-            eu = wc.acquire(1)
-            eo = op.acquire(1)
-            kups(eb, eu, eo)                    # up, then SwiGLU against g_gate
-            op.release(1)
-            wc.release(1)
-        bcc.release(1)
-        # ---- P5: down, 4 K-chunks; the last flushes with the residual ----
-        for _ in range_({NCHUNK - 1}):
-            eb = bcc.acquire(1)
-            kas(eb)
-            for _ in range_({p5_tiles}):
-                ew = wc.acquire(1)
-                kacc(eb, ew)
-                wc.release(1)
-            bcc.release(1)
-        eb = bcc.acquire(1)
-        kas(eb)
-        for _ in range_({p5_tiles}):
-            ew = wc.acquire(1)
-            eo = op.acquire(1)
-            kflush(eb, ew, eo)
-            op.release(1)
-            wc.release(1)
-        bcc.release(1)
+        for _ in range_({nrep}):
+          # ---- P4: norm2 + gate/up + SwiGLU ----
+          eb = bcc.acquire(1)
+          kn(eb)                                  # RMSNorm in place + block sums
+          for _ in range_({p4_pairs}):
+              eg = wc.acquire(1)
+              kgate(eb, eg)                       # gate -> 64 B in-core stash
+              wc.release(1)
+              eu = wc.acquire(1)
+              eo = op.acquire(1)
+              kups(eb, eu, eo)                    # up, then SwiGLU against g_gate
+              op.release(1)
+              wc.release(1)
+          bcc.release(1)
+          # ---- P5: down, 4 K-chunks; the last flushes with the residual ----
+          for _ in range_({NCHUNK - 1}):
+              eb = bcc.acquire(1)
+              kas(eb)
+              for _ in range_({p5_tiles}):
+                  ew = wc.acquire(1)
+                  kacc(eb, ew)
+                  wc.release(1)
+              bcc.release(1)
+          eb = bcc.acquire(1)
+          kas(eb)
+          for _ in range_({p5_tiles}):
+              ew = wc.acquire(1)
+              eo = op.acquire(1)
+              kflush(eb, ew, eo)
+              op.release(1)
+              wc.release(1)
+          bcc.release(1)
 
     workers = []
     for p in range({npairs}):
@@ -190,38 +191,39 @@ def _design(bc: In, {params}):
         wh = [args[2 + 3 * n + i] for i in range(n)]
         oh = [args[2 + 4 * n + i] for i in range(n)]
 
-        # ---- P4 ------------------------------------------------------------
-        # The results drain straight into the ACTIVATION halves of the P5
-        # broadcast objects, in the same BO. `drain(offset=)` is what makes the
-        # chain work without a host round trip: pair p owns a contiguous run of
-        # SwiGLU rows, and the run lands where P5 chunk c will read it. The aux
-        # halves of those same objects were written by the host with the
-        # residual, and the drains do not touch them.
-        tg = TaskGroup()
-        bch.fill(bcb, group=tg, offset=0,
-                 sizes=[1, 1, 1, {2 * K_DIM}], strides=[0, 0, 0, 1])
-        for i in range(n):
-            wh[i].fill(w4b[i], group=tg)
-        for i in range(n):
-            row = i * {rows_per_pair}
-            oh[i].drain(bcb, wait=True, group=tg,
-                        offset=(1 + row // {K_DIM}) * {2 * K_DIM} + row % {K_DIM},
-                        sizes=[1, 1, {nblk}, {blk}],
-                        strides=[0, 0, {2 * K_DIM}, 1])
-        tg.finish()
+        for _rep in range({nrep}):
+          # ---- P4 ------------------------------------------------------------
+          # The results drain straight into the ACTIVATION halves of the P5
+          # broadcast objects, in the same BO. `drain(offset=)` is what makes the
+          # chain work without a host round trip: pair p owns a contiguous run of
+          # SwiGLU rows, and the run lands where P5 chunk c will read it. The aux
+          # halves of those same objects were written by the host with the
+          # residual, and the drains do not touch them.
+          tg = TaskGroup()
+          bch.fill(bcb, group=tg, offset=0,
+                   sizes=[1, 1, 1, {2 * K_DIM}], strides=[0, 0, 0, 1])
+          for i in range(n):
+              wh[i].fill(w4b[i], group=tg)
+          for i in range(n):
+              row = i * {rows_per_pair}
+              oh[i].drain(bcb, wait=True, group=tg,
+                          offset=(1 + row // {K_DIM}) * {2 * K_DIM} + row % {K_DIM},
+                          sizes=[1, 1, {nblk}, {blk}],
+                          strides=[0, 0, {2 * K_DIM}, 1])
+          tg.finish()
 
-        # ---- P5 ------------------------------------------------------------
-        # One fill per chunk (the core acquires the broadcast once per chunk),
-        # one weight fill for all four chunks (they share the operand fifo).
-        tg = TaskGroup()
-        for ch in range({NCHUNK}):
-            bch.fill(bcb, group=tg, offset=(1 + ch) * {2 * K_DIM},
-                     sizes=[1, 1, 1, {2 * K_DIM}], strides=[0, 0, 0, 1])
-        for i in range(n):
-            wh[i].fill(w5b[i], group=tg)
-        for i in range(n):
-            oh[i].drain(o5b[i], wait=True, group=tg)
-        tg.finish()
+          # ---- P5 ------------------------------------------------------------
+          # One fill per chunk (the core acquires the broadcast once per chunk),
+          # one weight fill for all four chunks (they share the operand fifo).
+          tg = TaskGroup()
+          for ch in range({NCHUNK}):
+              bch.fill(bcb, group=tg, offset=(1 + ch) * {2 * K_DIM},
+                       sizes=[1, 1, 1, {2 * K_DIM}], strides=[0, 0, 0, 1])
+          for i in range(n):
+              wh[i].fill(w5b[i], group=tg)
+          for i in range(n):
+              oh[i].drain(o5b[i], wait=True, group=tg)
+          tg.finish()
 
     arg_types = [bc_all_ty] + [w4_ty] * {npairs} + [w5_ty] * {npairs}
     arg_types += [o5_ty] * {npairs}
@@ -239,7 +241,7 @@ def _design(bc: In, {params}):
               FLUSH_SRC=FLUSH_SRC, NORM_SRC=NORM_SRC, ASUM_SRC=ASUM_SRC,
               FLAGS=flags, bc_ty=bc_ty, wt_ty=wt_ty, o_ty=o_ty,
               wpair_ty=wpair_ty, opair_ty=opair_ty, w4_ty=w4_ty, w5_ty=w5_ty,
-              o5_ty=o5_ty, bc_all_ty=bc_all_ty,
+              o5_ty=o5_ty, bc_all_ty=bc_all_ty, nrep=nrep,
               __name__="flm_ffn_chain")
     exec(src, ns)
     return iron.jit(ns["_design"],
@@ -253,6 +255,10 @@ def main():
     p.add_argument("--cores", type=int, default=16)
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--bench", action="store_true")
+    p.add_argument("--repeat", type=int, default=1,
+                   help="run the P4+P5 pair N times in ONE dispatch — the Task 8 "
+                        "unroll shape. Throughput only; correctness is checked "
+                        "at N=1 (later repeats overwrite the same buffers).")
     p.add_argument("--host-norm", action="store_true",
                    help="A/B: normalise on the host and use flm_asum_prepare, "
                         "isolating the in-place RMSNorm prologue")
@@ -276,7 +282,7 @@ def main():
     rng = np.random.default_rng(0)
     h = rnd(rng.standard_normal(D_MODEL) * 0.05)
 
-    design, wt = build(ncores, o.host_norm)
+    design, wt = build(ncores, o.host_norm, o.repeat)
 
     # ---- weight streams -------------------------------------------------
     # P4: core i owns rows [i*p4_pairs*NROWS, ...), gate/up alternating
@@ -488,7 +494,7 @@ def main():
               f"p99 {np.quantile(rel5,0.99):.4f}", file=_s.stderr)
         print("  DIAG AIE2P exp2 floor: 3.54% mean / 5.86% max", file=_s.stderr)
 
-    total = ncores * (2 * p4_pairs + NCHUNK * p5_tiles) * wt
+    total = o.repeat * ncores * (2 * p4_pairs + NCHUNK * p5_tiles) * wt
     print(f"FFN half as 2 chained phases, 1 dispatch: {ncores} cores, "
           f"layer {o.layer}")
     print(f"  P4 {p4_pairs} gate/up pairs/core -> {D_FF};  "
