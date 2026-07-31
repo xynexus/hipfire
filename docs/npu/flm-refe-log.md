@@ -8724,3 +8724,37 @@ was worth more than any amount of reasoning about ordering.
 
 Task 7 now has three of five phases chained: P1 (12 cores) → P2 (4 cores) →
 P3 (all 16), one dispatch, partition B, all exact or at the exp2 floor.
+
+### P4 needs a dense `h`, and P3's drain is 12% dense
+
+P4's GEMV takes the whole 2048-element `h` as its activation, and every core
+needs all of it — so `h` has to go out to DDR and come back as a broadcast. It
+cannot stay in core memory: P3 stashes each core's own 128 rows in `g_resid`
+(which is what P5's residual reads), but that is one core's slice, not the
+vector P4 needs.
+
+The drain as it stands cannot supply it:
+
+    P3 emits 8 tiles/core, 16 live values each, in 128-element objects
+    drained: 16 objects x 128 = 2048 elements per pair
+    live:    16 x 16 = 256           -> 12% density
+
+and **a drain consumes its source linearly** — `sizes`/`strides` shape only the
+destination — so the 112 padding elements per object cannot be dropped on the way
+out. Reshaping the destination does not help either: the products have to match,
+so a 256-element destination would consume only the first two objects.
+
+The 128-element object is not negotiable: P3 shares P1's result fifo, and a fifo
+of its own costs 8 shim outputs against a budget of 10 in 16.
+
+**But `p3tiles * NROWS = 8 * 16 = 128 = OBJ` exactly.** If P3 wrote all eight of
+its tiles into *one* object at offset `t*NROWS`, the drain would be fully dense
+and the object would still be P1-sized. The mechanism already exists twice in
+this tree — `flm_gemv_acc` accumulates into `g_acc_down` and `flm_gemv_flush`
+emits it; `flm_gemv_qkv` stages a head and `flm_p1_emit` writes it out. P3 can do
+the same: it already writes `h` into `g_resid`, so a small emit kernel that
+copies `g_resid`'s 128 values into one acquired object completes the pattern.
+
+That is the next step, and it is a kernel addition rather than a harness change —
+worth noting because the program-memory budget is measured and an extra entry
+point costs roughly what `flm_p1_emit` does.
