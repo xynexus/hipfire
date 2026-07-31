@@ -9168,3 +9168,31 @@ collided at DIM_RESN=128 because a core's rows are interleaved, `flm_h_emit`
 needed a gather for the same reason, and now this. The rule worth carrying: an
 interleaved row assignment and a modulo-indexed write are incompatible unless
 one is built from the other.
+
+### Making P3's rows contiguous broke it — reverted, and P5 takes the other route
+
+P4's offset write needs contiguous per-core rows, and P5's flush reads `g_resid`
+that P3 wrote, so the tempting move was to give P3 the same contiguous layout —
+one row assignment for P3, P4 and P5, and `flm_h_emit` becomes a straight copy
+instead of a gather.
+
+It broke P3: `h` went 9.5367e-07 → **2.9980e-01**, and the sorted-multiset test
+says the **values** differ on the device (4.06e-02), not their order. The host
+side is self-consistent — weight packing, reference and `h_idx` all moved
+together — so something in the device path depends on the interleave in a way I
+have not identified. Not diagnosed further; reverted.
+
+`p1p2_chain` is back to P1→P2→P3→P4 all passing: P3 `h` 9.5367e-07, P4 `sw`
+2.4414e-04, attention 3.4631e-03.
+
+**P5 therefore takes the emit route rather than the offset route.** Its output is
+128 rows per core — one shared object, exactly like P3's — and `g_acc_down`
+already holds them, indexed by `base % DIM_ACCN`, for the same reason `g_resid`
+holds P3's. So an emit modelled on `flm_h_emit` works with the *interleaved*
+layout that P3 and P5 must share, at a measured ~496 B against 1712 B of
+headroom.
+
+That is the second time the "unify the layout" instinct has cost a tick and been
+reverted (the first was unifying the result object size, which placement solved
+instead). The layouts differ because the kernels index differently, and making
+them agree is not free.

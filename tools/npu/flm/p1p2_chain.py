@@ -818,6 +818,10 @@ def main():
                             for j in (0, 1)
                             for r0 in p3rows(pr, j)])
     e3 = np.abs(got_h - h_ref[h_idx]).max()
+    if __import__("os").environ.get("CHAIN_P3_DIAG"):
+        sg, sr = np.sort(got_h), np.sort(h_ref)
+        print(f"    DIAG sorted-multiset maxdiff {np.abs(sg-sr).max():.4e} -> "
+              f"{'PERMUTATION (my h_idx)' if np.abs(sg-sr).max()<1e-2 else 'VALUES differ (device)'}")
     print(f"  P3 h      : max err {e3:.4e}  mean|ref| {np.abs(h_ref).mean():.5f}")
     if __import__("os").environ.get("CHAIN_P3_DIAG"):
         srt_g, srt_r = np.sort(got_h), np.sort(h_ref)
