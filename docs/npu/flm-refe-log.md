@@ -7696,3 +7696,39 @@ fifos to 8 shared ones — and at NATT=8 that is 12 outputs down to 8.
 
 Not attempted this tick: it is a change to a design that only just started
 passing, and worth starting fresh rather than at the end of a long session.
+
+### What the routing blocker actually costs — and the target is NATT=4, not 8
+
+`attn_phase --bench` gives one KV group per core, so its KV volume scales *with*
+core count and each core does the same work. Those are per-core costs, not a
+strong/weak scaling curve:
+
+    cores 8: 1.31 MB, marginal 34.4 us
+    cores 4: 0.66 MB, marginal 24.5 us
+    cores 2: 0.33 MB, marginal 31.4 us
+
+A real layer must process all 8 KV heads whatever the core count, so fewer cores
+means more groups each:
+
+| P2 cores | groups/core | est µs/layer | token | tok/s |
+|---|---|---|---|---|
+| 8 | 1 | 34.4 | 15.76 ms | **63.5** |
+| 4 | 2 | 49.0 | 15.99 ms | **62.5** |
+| 2 | 4 | 125.6 | 17.22 ms | 58.1 |
+
+**NATT=4 is enough to beat FLM** — 62.5 vs 59.86 tok/s. Only the NATT=2 case
+that routes today falls short. So the refactor target is one more attention
+pair (10 shim outputs), not the full eight, which is a materially smaller change
+than "make P2's fifo disappear entirely".
+
+Caveat, and it is not a small one: the 2- and 4-core rows are **extrapolations**
+(groups/core x per-core cost), not measurements, and the per-core figures are
+noisy enough (24.5 at 4 cores vs 34.4 at 8) that they are clearly
+fixed-overhead-dominated rather than clean. The ranking is safe; the absolute
+numbers are not.
+
+Also recorded: a quick probe aliasing `f_p2` onto `f_p1` to test the lever
+cheaply does **not** work — the harness builds its design by exec'ing an
+f-string, and a live ObjectFifo cannot be interpolated into it
+(`ValueError: unmarshallable object`). Surgical routing experiments need a real
+edit to the generated source, not a shim around it.
