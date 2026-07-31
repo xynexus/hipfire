@@ -7061,13 +7061,24 @@ one.
 | S=480 (odd tile count) | | | PASS |
 | S=512, `AP_QOFF_ZERO=1` | | | **FAIL** — the control |
 
-The mechanism was right; the object was **4100 bytes**, and
-`2*(32*HEAD + 2)` is not a multiple of 64. Padding to 4160 took it from
-8.14e-02 to passing. This tree already records the same failure at a different
-size — a 20512 B weight tile put the second buffer of a double-buffered fifo on
-a 32-byte boundary and corrupted alternate objects — and the lesson did not
-transfer because the earlier note reads as being about *tiles*. It is about any
-fifo object: **round every object size up to 64 bytes.**
+The mechanism was right; the object was **4100 bytes** and padding it to 4160
+took it from 8.14e-02 to passing. This tree already records a similar failure —
+a 20512 B weight tile put the second buffer of a double-buffered fifo on a
+32-byte boundary and corrupted alternate objects.
+
+**The obvious generalisation is wrong, and I checked before writing it down.**
+"Round every fifo object up to 64 bytes" would be the natural rule, but auditing
+every object in the tree finds **six at 32 bytes** — the `NROWS` bf16 result
+objects in `down_verify`, `ffn_alt`, `ffn_chain`, `ffn_fused`, `normgemv_verify`
+and `resid_chain` — and all six verify exactly. A vector-alignment explanation
+does not survive either: those objects are written with scalar stores
+(`out[r] = …`), and attention reads the q object scalar too
+(`q[h * QSTRIDE + d]`), so nothing is doing a 512-bit access on it.
+
+So the honest position: **padding to 64 bytes fixed this object, the precise
+requirement is not established, and 32-byte objects demonstrably work.** When a
+fifo object misbehaves for no visible reason, padding to 64 is worth trying
+early — it is cheap and it has now been the answer twice.
 
 What located it was forcing every core's trailer offset to 0. Core 0 wants
 offset 0 anyway, so it should have been exact and was not — which moved the

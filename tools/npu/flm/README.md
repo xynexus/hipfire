@@ -217,3 +217,11 @@ Each is a thing that cost real time; module docstrings have the detail.
   between gate and up_swiglu, exact) — the difference may be that its calls
   share a `range_` iteration, untested. **Hoisting every acquire above both
   calls is always safe and free**; do that when kernels share a global.
+- **A fifo object of an awkward size can silently deliver wrong data.** A 4100 B
+  broadcast object (`2*(32*HEAD+2)`) gave 8.14e-02 where padding it to 4160
+  gives 7.31e-04; a 20512 B weight tile corrupted alternate objects until padded
+  to a 64-byte multiple. **But the rule is not "always pad to 64"** — six
+  32-byte result objects in this tree verify exactly, and the accesses involved
+  are scalar, so vector alignment is not the explanation. The precise
+  requirement is unknown. Treat padding to 64 as a cheap early thing to try when
+  an object misbehaves, not as a law.
