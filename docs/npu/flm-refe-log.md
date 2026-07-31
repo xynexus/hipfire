@@ -9849,3 +9849,27 @@ It also says something about where the remaining gap is. Per-layer, this design
 is within ~1% of FLM at both contexts. The whole deficit is the extra dispatch
 the split costs — 92.9 µs × 16 = 1.49 ms on a 17 ms token. Not the kernels, not
 the bandwidth, not the decomposition's arithmetic: the dispatch count.
+
+### The dispatch floor is 67.2 µs, not 92.9
+
+A minimal design — one core, one trivial kernel, 128 B out — measures:
+
+    minimal dispatch   67.2 µs   (20 iters, min)
+
+The 92.9 µs the projection charges came from fitting large dispatches
+(`16 x 681.4` against `1 x 9721`), so it folds in per-dispatch work that scales
+with size. The irreducible floor is **67.2 µs**.
+
+    extra dispatch at 92.9   ->  18.56 ms  ->  53.9 tok/s   (−8.4% vs FLM 58.83)
+    extra dispatch at 67.2   ->  18.14 ms  ->  55.1 tok/s   (−6.3%)
+
+Worth being careful about what this does and does not say. The split's real cost
+is **one extra dispatch's fixed overhead**, and 67.2 µs is the right figure for
+that — the transfer work happens either way. But it does not close the gap: 55.1
+against 58.83 is still 6.3% back, and the deficit is now almost exactly the
+1.08 ms of 16 extra dispatch floors.
+
+So the whole remaining question is dispatch count, and it is not reducible by
+tuning: two dispatches per layer is what five phase bodies on a four-body core
+forces. Anything that gets a layer into one dispatch wins ~1.1 ms/token and lands
+level with FLM; nothing else in the design has that much left in it.
