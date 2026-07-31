@@ -8138,3 +8138,46 @@ was the subject of the `noinline` fix.
 The decisive test is cheap and specific: build **one** design declaring all five
 phases' kernels and measure its core ELF. That needs no correct dataflow, only a
 design that compiles. Next tick.
+
+## 2026-08-01 — MEASURED: five phases do not fit on one core
+
+`progmem_probe.py` builds one design declaring every entry point the layer needs
+and reports the core ELF's `.text`. It computes nothing — only the image size
+matters — so it answers the question a sum of phase images cannot.
+
+| phases | kernels | .text | of 16 KB | |
+|---|---|---|---|---|
+| P1 | 4 | 6144 B | 38% | fits |
+| P1–P2 | 7 | 10176 B | 62% | fits |
+| P1–P3 | 8 | 12480 B | 76% | fits |
+| P1–P4 | 10 | **14976 B** | **91%** | fits |
+| P1–P5 | 12 | — | — | **`[AIE ERROR] _XAie_LoadProgMemSection(): Overflow of program memory`** |
+
+**The single-dispatch five-phase layer does not fit.** P1–P4 sits at 91% with
+1408 B of headroom, and P5's two kernels (`flm_gemv_acc`, `flm_gemv_flush`) need
+more than that. The build also warns *"Not all requested buffers fit in the
+available memory"*, so data memory is tight too.
+
+Both of yesterday's estimates were wrong in opposite directions: the naive sum
+said 138% because it double-counted the shared tile body; the corrected reasoning
+said it might fit if that body exceeded ~6.2 KB. Measured, it lands just past the
+edge — 91% at four phases, overflow at five. **The right move was to build it,
+and both attempts to reason it out beforehand missed.**
+
+### Where that leaves Task 7
+
+The obvious partition costs the race — dedicated attention cores drop the FFN to
+12 cores, 53.8 tok/s. But P1–P4 fitting at 91% suggests better splits that have
+not been measured yet:
+
+  * **P5 alone in a second dispatch.** Costs one extra dispatch per layer
+    (92.9 µs) against the 1.18 ms/token the unroll buys — worth measuring rather
+    than assuming;
+  * **drop P2 from the FFN cores**, since only 4 of 16 cores run attention. The
+    non-attention combination P1+P3+P4+P5 has not been measured and may fit;
+  * **merge `flm_gemv_acc` and `flm_gemv_flush`**, which differ only in whether
+    the residual is added — plausibly a flag on one kernel rather than two
+    images.
+
+The probe makes each of these a single command, which is the point of having
+built it.
