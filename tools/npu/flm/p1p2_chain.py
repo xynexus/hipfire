@@ -102,6 +102,8 @@ FIN_SRC = str(KDIR / "flm_attn_finish.cc")
 RES_SRC = str(KDIR / "flm_gemv_residual.cc")
 ASUM_SRC = str(KDIR / "flm_asum_prepare.cc")
 HEMIT_SRC = str(KDIR / "flm_h_emit.cc")
+GATE_SRC = str(KDIR / "flm_gemv_gate.cc")
+UPS_SRC = str(KDIR / "flm_gemv_up_swiglu.cc")
 Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
 TSEQ, GQA, KVPER = 32, 4, 1
 # follows NROWS and KVPER: max(one KV tile 8192, a q4_1 tile 10304)
@@ -125,6 +127,10 @@ def build(pos, nobj):
     p3tiles = K_DIM // (NCORES * NROWS)
     BC = 2 * K_DIM + 2 * HEAD
     OBJ = 2 * HEAD                                  # P1 result object, bf16
+    D_FF = 8192
+    p4tiles = D_FF // (NCORES * NROWS)      # gate/up steps per core
+    p4per = OBJ // NROWS                    # steps sharing one result object
+    p4objs = p4tiles // p4per               # result objects per core
     KTILE, VTILE = HEAD * TSEQ, TSEQ * HEAD
     # One slot per KV head, OPERAND bytes wide — not KVSTRIDE. P2's fill has
     # to deliver whole operand objects, and the fifo side of a transfer is
@@ -157,6 +163,8 @@ def build(pos, nobj):
     attn_all_ty = np.ndarray[(apairs * 2 * GQA * HEAD,), np.dtype[bfloat16]]
     w3_ty = np.ndarray[(2 * p3tiles * OPERAND,), np.dtype[np.uint8]]
     h_ty = np.ndarray[(2 * OBJ,), np.dtype[bfloat16]]   # one object per core
+    w4_ty = np.ndarray[(2 * 2 * p4tiles * OPERAND,), np.dtype[np.uint8]]
+    sw_ty = np.ndarray[(2 * p4objs * OBJ,), np.dtype[bfloat16]]
     # P1's weights, then P2's q'+KV objects, on the same fifo
     w_all_ty = np.ndarray[(2 * hpc * TPH * wt,), np.dtype[np.uint8]]
     kvin_ty = bc_ty                      # q' rides the broadcast object
@@ -174,7 +182,8 @@ def build(pos, nobj):
              f"-DDIM_QSTRIDE={OBJ}", f"-DDIM_KVOBJ={OPERAND}",
              f"-DDIM_NPADOFF={32 * OBJ}", "-DQOFF_FROM_KV=1",
              f"-DDIM_RESN={2 * p3tiles * NROWS}",
-             f"-DDIM_P3TILES={p3tiles}"]
+             f"-DDIM_P3TILES={p3tiles}",
+             f"-DDIM_OBJROWS={OBJ}"]
     # This list must match `at` element for element. Weights and q results are
     # per P1 PAIR (only those cores run P1); the cache, P3's weights and P3's
     # results are per pair, since every core runs P3.
@@ -188,6 +197,9 @@ def build(pos, nobj):
     P += ", bc3: In"
     P += ", " + ", ".join(f"w3_{i}: In" for i in range(npairs))
     P += ", " + ", ".join(f"h{i}: Out" for i in range(npairs))
+    P += ", bc4: In"
+    P += ", " + ", ".join(f"w4_{i}: In" for i in range(npairs))
+    P += ", " + ", ".join(f"sw{i}: Out" for i in range(npairs))
     src = f'''
 def _design(bc: In, {P}):
     kq = ExternalFunction("flm_gemv_qkv", source_file=QKV_SRC,
@@ -220,6 +232,10 @@ def _design(bc: In, {P}):
                            arg_types=[bc_ty], compile_flags=FLAGS)
     khe = ExternalFunction("flm_h_emit", source_file=HEMIT_SRC,
                            arg_types=[op_ty, p1o_ty], compile_flags=FLAGS)
+    kg4 = ExternalFunction("flm_gemv_gate", source_file=GATE_SRC,
+                           arg_types=[bc_ty, op_ty], compile_flags=FLAGS)
+    ku4 = ExternalFunction("flm_gemv_up_swiglu", source_file=UPS_SRC,
+                           arg_types=[bc_ty, op_ty, p1o_ty], compile_flags=FLAGS)
     kr3 = ExternalFunction("flm_gemv_q4_1_residual", source_file=RES_SRC,
                            arg_types=[bc_ty, op_ty, p1o_ty],
                            compile_flags=FLAGS)
@@ -280,7 +296,26 @@ def _design(bc: In, {P}):
         op.release(1)
         bcc.release(1)
 
-    def core_p1(bcc, wc, op, kqkv, kemit, kprep, kres, kasum, khemit):
+    def p4_body(bcc, wc, op, kgate, kups, kasum):
+        """gate/up + SwiGLU. One result object per p4per steps: the kernel writes
+        at row_base % DIM_OBJROWS, so the object fills densely and P5 can be
+        broadcast a dense sw."""
+        eb = bcc.acquire(1)
+        kasum(eb)                          # g_asum for h, P4's activation
+        for _ in range_({p4objs}):
+            eo = op.acquire(1)
+            for _ in range_({p4per}):
+                eg = wc.acquire(1)
+                kgate(eb, eg)              # gate -> in-core stash
+                wc.release(1)
+                eu = wc.acquire(1)
+                kups(eb, eu, eo)           # up, then SwiGLU against the stash
+                wc.release(1)
+            op.release(1)
+        bcc.release(1)
+
+    def core_p1(bcc, wc, op, kqkv, kemit, kprep, kres, kasum, khemit,
+                kgate, kups):
         p1_body(bcc, wc, op, kqkv, kemit, kprep)
         # A broadcast object must be consumed by EVERY consumer of the fifo.
         # These cores sit out P2, but the fifo still delivers them the q'
@@ -289,8 +324,10 @@ def _design(bc: In, {P}):
         eb2 = bcc.acquire(1)
         bcc.release(1)
         p3_body(bcc, wc, op, kres, kasum, khemit)
+        p4_body(bcc, wc, op, kgate, kups, kasum)
 
-    def core_p1p2(bcc, wc, op, ap, kqkv, kemit, kprep, kbeg, ktile, kfin, kres, kasum, khemit):
+    def core_p1p2(bcc, wc, op, ap, kqkv, kemit, kprep, kbeg, ktile, kfin,
+                  kres, kasum, khemit, kgate, kups):
         # Partition B: these cores do NOT run P1 — measured, five phases
         # overflow 16 KB of program memory. They must still consume the
         # broadcast's first fill (the activation), because a broadcast object
@@ -324,6 +361,7 @@ def _design(bc: In, {P}):
         ap.release(1)
         bcc.release(1)
         p3_body(bcc, wc, op, kres, kasum, khemit)
+        p4_body(bcc, wc, op, kgate, kups, kasum)
 
     workers = []
     for p in range({npairs}):
@@ -332,12 +370,12 @@ def _design(bc: In, {P}):
             if p >= {npairs} - {apairs}:
                 workers.append(Worker(core_p1p2,
                     fn_args=[bc_cons[c], w_sub[p][j].cons(), p1_sub[p][j].prod(),
-                             p2_sub[p - ({npairs} - {apairs})][j].prod(), kq, ke, kn, kab, kat, kaf, kr3, kas, khe],
+                             p2_sub[p - ({npairs} - {apairs})][j].prod(), kq, ke, kn, kab, kat, kaf, kr3, kas, khe, kg4, ku4],
                     stack_size=8192))
             else:
                 workers.append(Worker(core_p1,
                     fn_args=[bc_cons[c], w_sub[p][j].cons(), p1_sub[p][j].prod(),
-                             kq, ke, kn, kr3, kas, khe], stack_size=8192))
+                             kq, ke, kn, kr3, kas, khe, kg4, ku4], stack_size=8192))
 
     def sequence(*args):
         n, a = {npairs}, {apairs}
@@ -352,7 +390,8 @@ def _design(bc: In, {P}):
         # tensor args: bc, w*p1pairs, (kvin+hostcache)*ax, q*p1pairs,
         # cache*n, attn*a, then P3's bc + w3*n + h*n. Handles follow all of them.
         base3 = 1 + 2 * {p1pairs} + ax + n + a
-        base = base3 + 1 + 2 * n
+        base4 = base3 + 1 + 2 * n
+        base = base4 + 1 + 2 * n
         bch = args[base]
         wh = [args[base + 1 + i] for i in range(n)]   # all pairs: KV rides these
         p1h = [args[base + 1 + n + i] for i in range(n)]
@@ -419,10 +458,23 @@ def _design(bc: In, {P}):
             p1h[i].drain(hb[i], wait=True, group=tg)
         tg.finish()
 
+        # ---- P4 -----------------------------------------------------------
+        p4b = args[base4]
+        w4b = [args[base4 + 1 + i] for i in range(n)]
+        swb = [args[base4 + 1 + n + i] for i in range(n)]
+        tg = TaskGroup()
+        bch.fill(p4b, group=tg)
+        for i in range(n):
+            wh[i].fill(w4b[i], group=tg)
+        for i in range(n):
+            p1h[i].drain(swb[i], wait=True, group=tg)
+        tg.finish()
+
     at = [bc_ty] + [w_all_ty] * {p1pairs} + [kvin_ty] * {apairs}
     at += [cache_ty] * ({apairs} if {HOSTKV} else 0)
     at += list(q_tys) + [cache_ty] * {npairs} + [attn_all_ty] * {apairs}
     at += [bc_ty] + [w3_ty] * {npairs} + [h_ty] * {npairs}
+    at += [bc_ty] + [w4_ty] * {npairs} + [sw_ty] * {npairs}
     at += [f_bc.prod(tile=AnyShimTile)]
     at += [f.prod(tile=AnyShimTile) for f in f_w]
     at += [f.cons(tile=AnyShimTile) for f in f_p1]
@@ -435,9 +487,12 @@ def _design(bc: In, {P}):
               Worker=Worker, AnyShimTile=AnyShimTile, range_=range_,
               ExternalFunction=ExternalFunction, QKV_SRC=QKV_SRC,
               EMIT_SRC=EMIT_SRC, NORM_SRC=NORM_SRC, ATT_SRC=ATT_SRC,
-              BEG_SRC=BEG_SRC, RES_SRC=RES_SRC, ASUM_SRC=ASUM_SRC, HEMIT_SRC=HEMIT_SRC, FIN_SRC=FIN_SRC, FLAGS=flags, bc_ty=bc_ty,
+              BEG_SRC=BEG_SRC, RES_SRC=RES_SRC, ASUM_SRC=ASUM_SRC, HEMIT_SRC=HEMIT_SRC,
+              GATE_SRC=GATE_SRC, UPS_SRC=UPS_SRC, FIN_SRC=FIN_SRC, FLAGS=flags, bc_ty=bc_ty,
               op_ty=op_ty, oppair_ty=oppair_ty, p1o_ty=p1o_ty,
               p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty, attn_all_ty=attn_all_ty, w3_ty=w3_ty, h_ty=h_ty, p3tiles=p3tiles,
+              w4_ty=w4_ty, sw_ty=sw_ty, p4tiles=p4tiles,
+              p4per=p4per, p4objs=p4objs,
               w_all_ty=w_all_ty, kvin_ty=kvin_ty, q_tys=q_tys,
               cache_ty=cache_ty, SKIP_P1=SKIP_P1, HOSTKV=HOSTKV,
               PREP=PREP, PREPSRC=PREPSRC,

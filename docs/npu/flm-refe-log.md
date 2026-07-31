@@ -9101,3 +9101,33 @@ need far less than that.
 The hardcoded `OPERAND = 20544` is gone. It had been a constant since the
 universal-operand decision, and nothing recomputed it when the tile shape
 changed — which is why NROWS=8 alone appeared to do nothing at all.
+
+### P4 builds — the data-memory blocker is cleared
+
+Re-applied P4's wiring against the smaller operand. It **builds, routes and
+runs**, where at OPERAND=20544 it failed to allocate:
+
+    core 0_2  (P1 + P3 + emit + P4)   14672 B   90%
+    core 3_2  (P2 + P3 + emit + P4)   13536 B   83%
+
+No allocation failure, no routing failure. P1→P3 still exact: P3 `h` 9.5367e-07,
+attention 3.4631e-03.
+
+Geometry at NROWS=8: P4 is 64 gate/up steps per core, 16 steps per result
+object, 4 objects — and `p4per * NROWS = 128 = OBJ` exactly, so the offset write
+fills each object with no padding.
+
+That closes the blocker that stopped this two ticks ago. The route was: measure
+the ceiling (data, not program), find `OPERAND` hardcoded and independent of the
+tile, discover the KV object bounds it as much as the weight tile does, price
+both knobs (NROWS 4.5%, KVPER free), and change them together.
+
+**Same caveat as P3's first landing: P4's host side is unwired.** The design
+declares its broadcast, weights and `sw` tensors and `main()` does not pass them,
+so P4 runs against unsupplied buffers. A short argument list is not caught here —
+only a long one is — so "it ran" again says nothing about whether the phase is
+fed. Attention and P3 passing say nothing about P4, which runs after both.
+
+Headroom for P5: 1712 B on the P1 cores. Its marginal was ~3312 B at NROWS=16 and
+should be smaller at 8, since the loops halve — but that is exactly the kind of
+extrapolation that has been wrong three times here, so it wants measuring.
