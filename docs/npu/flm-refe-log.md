@@ -8656,3 +8656,32 @@ P3 reads is wrong in content rather than in arrangement. The packing matches
 `resid_chain`'s (`pr*rpp + t*2*NROWS + j*NROWS`, `rpp = K_DIM // npairs`, 8 tiles
 per core) where P3 is exact at 0.0000e+00, so the difference is in this harness
 and not in the kernel or the tile layout.
+
+### Zeroing P3's weights makes `h` exact — which localises the fault to tile ORDER
+
+    CHAIN_P3_WZERO=1  ->  P3 h max err 0.0000e+00, ratio 1.000
+
+With `od/om/oc` zeroed the GEMV term vanishes and `h` is *exactly* the residual.
+That confirms, all at once:
+
+  * P3 does read the tiles this harness packs (zeroing them zeroed the result);
+  * the residual half of the third broadcast fill is correct;
+  * `row_base` is right — the kernel indexes the residual by it (`aux[base + r]`)
+    and every row lands where the reference expects;
+  * the `h_idx` stream order used by the check is right, since an exact match
+    over all 2048 rows cannot survive a permutation.
+
+So the activation, the residual, the row mapping and the drain order are all
+correct, and the only thing left is the **weight values a given tile carries**.
+
+**And zeroing cannot distinguish tile order** — all-zero tiles are identical, so
+a design that hands core 3 the tile meant for core 5 passes this control
+perfectly. That makes misordered tiles the leading candidate, and it is exactly
+the case the control is blind to.
+
+This also retires an earlier inference. The zero-*activation* test (`attn3 = 0`
+still gave mean 0.241) was read as "P3's activation is not `bc3`". It cannot mean
+that: the residual comes from the *same object* at `act_aux + K`, and the
+residual is now proven correct, so the object is `bc3`. The likelier reading is
+that the earlier run did not rebuild — that test predates several structural
+edits, and this tree has been caught by a stale design five times.

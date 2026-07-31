@@ -553,6 +553,10 @@ def main():
     # P2->P3 handoff carries the right bytes", which is the next step.
     od, om, oc = load_linear(c, f"model.layers.{o.layer}.self_attn.o_proj.weight",
                              K_DIM, K_DIM)
+    if __import__("os").environ.get("CHAIN_P3_WZERO"):
+        # zero weights -> the GEMV term is 0 and h must be exactly the residual.
+        # If it is not, P3 is not reading the tiles this harness packs.
+        od = np.zeros_like(od); om = np.zeros_like(om); oc = np.zeros_like(oc)
     attn3 = (np.zeros(K_DIM, np.float32)
              if __import__('os').environ.get('CHAIN_P3_ZERO')
              else rnd(rng.standard_normal(K_DIM) * 0.05))
