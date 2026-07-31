@@ -7627,3 +7627,42 @@ about corruption when it did not; the chain instead reuses the **broadcast**
 fifo, filling it once with the activation for P1 and again with q' for P2. A
 consumer reading the wrong fill would be invariant to core count, stride and
 sequence — which is exactly the observed signature.
+
+## 2026-07-31 — the P1→P2 seam is FIXED (Task 7's blocker)
+
+**q' was delivered on the broadcast fifo and read from the weight fifo.**
+
+The sequence does `bch.fill(kvb[0])` with the comment "the broadcast now carries
+q'", but `core_p1p2` still had `eq = wc.acquire(1)` — the *weight* fifo, which
+that TaskGroup fills with the KV cache. So `flm_attn_begin` and `flm_attn_tile`
+were handed cache bytes as the query. There was even a `bcc.release(1)` at the
+end with no matching acquire.
+
+A wrong input explains **every** elimination on the record: invariant to core
+count (2/4/8), q stride (64/128), sequence length, acquire ordering, the in-place
+norm, and surviving both a host-built cache and a host-built q'. Nothing
+downstream could matter, because the input was already wrong.
+
+    eq = wc.acquire(1)   ->   eq = bcc.acquire(1)
+    arg_types q: op_ty   ->   bc_ty  (memref shape must match its fifo)
+
+| seq | append pos | attention err | tol | |
+|---|---|---|---|---|
+| 31 | 30 | 3.5241e-03 | 4.1764e-03 | PASS |
+| 25 | 24 | 4.3701e-03 | 3.9709e-03 | marginal FAIL (+10%) |
+| 17 | 16 | 4.3978e-03 | 4.9060e-03 | PASS |
+|  9 |  8 | 5.8168e-03 | 6.2636e-03 | PASS |
+
+Was 1.0496e-01. The seq-25 case sits 10% over a tolerance scaled by `mean|ref|`,
+which happens to dip there while the absolute error stays in the same
+3.5–5.8e-03 band as the passing cases — the exp2 NLF floor, not the old fault.
+`CHAIN_HOST_KV` now passes identically, confirming the cache path.
+
+### How it hid
+
+The module docstring said "**q' rides the operand fifo**, not the broadcast" —
+true of the original design, false since the broadcast change. It sat that way
+for several ticks and I read it as a description of the code. Every hypothesis I
+eliminated was downstream of an assumption the docstring had already made for
+me. Prose that outlives its code is worse than no prose; the docstring is now
+corrected and carries the story.

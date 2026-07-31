@@ -15,10 +15,24 @@ design. 8 KV heads at GQA=4 is exactly 8 attention cores.
 
 Four things the seam forced, each measured rather than assumed:
 
-  * **q' rides the operand fifo**, not the broadcast. A core's DMA input
-    channels are allocated over the union of every fifo it consumes, not per
-    phase, and broadcast+operand already spends both. P2's first operand acquire
-    is q'; the rest are KV tiles.
+  * **q' rides the BROADCAST fifo**, not the operand fifo. It was the other way
+    round originally, on the reasoning that a core's DMA input channels are
+    allocated over the union of every fifo it consumes, so broadcast+operand
+    already spends both. But an object held across other acquire/release cycles
+    on the SAME fifo does not stay valid, which is what forced q' off the
+    operand fifo, and the sequence was changed to broadcast it.
+
+    **The core body was not changed with it, and that was the P2 fault**: the
+    sequence filled the broadcast with q' while `core_p1p2` still acquired q'
+    from the weight fifo, so attention was handed KV-cache bytes as its query.
+    A wrong input explains every elimination — invariant to core count, q
+    stride, sequence length, and surviving both a host-built cache and a
+    host-built q'. Fixing it took the error from 1.0496e-01 to 3.5241e-03.
+
+    The lesson is narrow and worth keeping: this docstring described the old
+    design for several ticks after the code changed, and I read it as a
+    statement of what the code does. Prose that outlives its code is worse than
+    no prose.
   * **The operand fifo is `uint8`.** One fifo carries q4_1 tiles and q'/KV, a
     fifo has one object type, and IRON requires the kernel arg type to match it
     exactly. Attention casts on entry.
@@ -139,12 +153,15 @@ def _design(bc: In, {P}):
     # broadcast object that the SAME fifo later reuses to deliver q'.
     kn = ExternalFunction({PREP!r}, source_file={PREPSRC!r},
                           arg_types=[bc_ty], compile_flags=FLAGS)
+    # q' now arrives on the broadcast fifo, so its declared type is bc_ty.
+    # The kernels take `const uint8*` and cast internally, so only the memref
+    # shape has to agree with the fifo the object comes from.
     kab = ExternalFunction("flm_attn_begin", source_file=BEG_SRC,
-                           arg_types=[op_ty], compile_flags=FLAGS)
+                           arg_types=[bc_ty], compile_flags=FLAGS)
     kat = ExternalFunction("flm_attn_tile", source_file=ATT_SRC,
-                           arg_types=[op_ty, op_ty], compile_flags=FLAGS)
+                           arg_types=[bc_ty, op_ty], compile_flags=FLAGS)
     kaf = ExternalFunction("flm_attn_finish", source_file=FIN_SRC,
-                           arg_types=[p2o_ty, op_ty], compile_flags=FLAGS)
+                           arg_types=[p2o_ty, bc_ty], compile_flags=FLAGS)
 
     f_bc = ObjectFifo(bc_ty, depth=1, name="bc")
     bc_cons = [f_bc.cons() for _ in range({NCORES})]
@@ -187,14 +204,19 @@ def _design(bc: In, {P}):
     def core_p1p2(bcc, wc, op, ap, kqkv, kemit, kprep, kbeg, ktile, kfin):
         if not {SKIP_P1}:
             p1_body(bcc, wc, op, kqkv, kemit, kprep)
-        # ---- P2: first operand object is q', the rest are KV tiles ----
-        # kbeg writes the online-softmax state and ktile reads it. An acquire
+        # ---- P2: q' arrives on the BROADCAST, KV tiles on the weight fifo ----
+        # This used to read q' from `wc` while the sequence delivered it on the
+        # broadcast — so kbeg/ktile were handed KV-cache bytes as q'. That is
+        # the whole P2 fault: a wrong input, which is why it was invariant to
+        # core count, q stride and sequence length, and why it survived a
+        # host-built cache AND a host-built q'.
+        #
+        # kbeg writes the online-softmax state and ktile reads it; an acquire
         # between two kernels sharing a global loses the handoff
-        # (global_handoff_probe.py), and here q' and KV are on the SAME fifo, so
-        # the natural ordering puts one there. Hoist the first KV acquire above
-        # kbeg; attn_phase.py escapes this only because its q and KV are on
-        # different fifos.
-        eq = wc.acquire(1)
+        # (global_handoff_probe.py), so the first KV acquire stays hoisted above
+        # kbeg. With q' on its own fifo this now matches attn_phase.py, which
+        # passes precisely because its q and KV are on different fifos.
+        eq = bcc.acquire(1)
         ekv = wc.acquire(1)
         kbeg(eq)
         ktile(eq, ekv)
