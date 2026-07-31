@@ -32,8 +32,10 @@
 //
 // Compile-time: -DDIM_K (input dims) -DDIM_NROWS (output rows per tile).
 
-#include <aie_api/aie.hpp>
-#include <stdint.h>
+// Includes the shared header for `g_asum`, which is an `inline` variable there
+// (one object across every TU that includes it — see the header for why that is
+// the only arrangement that links across all the entry-point combinations).
+#include "flm_q4_1_tile.h"
 
 #ifndef DIM_K
 #define DIM_K 2048
@@ -41,13 +43,6 @@
 #ifndef DIM_NROWS
 #define DIM_NROWS 8
 #endif
-
-namespace {
-constexpr int K = DIM_K;
-constexpr int BLK = 32;
-constexpr int NB = K / BLK;
-constexpr int HALF = BLK / 2;
-} // namespace
 
 
 // Call once per activation, before the tile loop.

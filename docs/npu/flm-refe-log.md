@@ -5239,3 +5239,60 @@ Also worth noting: a single-phase dispatch measures 71.6 us here against the
 92.9 us fitted on the GEMV sweep, which is consistent — this probe moves 8 KB
 where that fit was over 6.6-164 MB, and the intercept is not identical across
 transfer regimes.
+
+## 2026-07-31 — Program-memory falsifier, and a regression the sweep caught
+
+### Task 1 of the fused-layer plan: program memory
+
+Every entry point the fused layer needs, `.text` at K=2048 / NROWS=16 / GQA=4:
+
+| entry point | .text B |
+|---|---|
+| `flm_ffn_gate_up` | 3888 |
+| `flm_gemv_residual` | 1760 |
+| `flm_attn_decode` | 1616 |
+| `flm_norm_prepare` | 1200 |
+| `flm_gemv_q4_1` | 880 |
+| `flm_attn_finish` | 544 |
+| `flm_attn_begin` | 448 |
+| `flm_rope` | 64 |
+| `flm_asum_prepare` | (see below) |
+| **sum** | **10,400** |
+
+**10,400 B of the 16,384 B program module = 63%**, leaving ~6 KB for the
+5-phase control flow. The plan's gate was <=14 KB, so it passes, but not with
+the margin the barrier probe had — and this is an *upper* bound in one sense
+(the linker discards unused inline copies of the shared tile body, which is
+inlined into each) and a *lower* bound in another (no phase control flow yet).
+`flm_ffn_gate_up` at 3888 B is by far the largest and is the one the plan
+already proposes retiring in favour of two smaller entry points.
+
+For calibration, real linked core ELFs from designs already built measure 560 B
+(attention-only) to 1264 B (norm+GEMV+residual) of `.text`, so a single design's
+code is a small fraction of the module; it is the *union* over phases that has
+to fit.
+
+### The sweep caught a regression I introduced two ticks ago
+
+`flm_asum_prepare.cc` **did not compile**: `use of undeclared identifier
+'g_asum'`. When `g_asum` became an `inline` variable in the shared header, I
+removed the file's `extern bfloat16 g_asum[];` but the file does not include
+that header — it carries its own copy of the constants. Two ticks of work
+followed without noticing, because everything built since used
+`flm_norm_prepare` instead.
+
+**`gemv_bench.py` and `ffn_fused.py` would both have failed to build.** Fixed by
+including `flm_q4_1_tile.h` and deleting the duplicated constants, and all three
+affected paths re-verified:
+
+| | |
+|---|---|
+| `gemv_verify` | PASS |
+| `gemv_bench` (4 cores) | 8.9 GB/s, 3.28e-07 |
+| `ffn_fused` (4 cores) | 5.1 GB/s, 1.58e-04 |
+
+The lesson is narrow and worth stating: **a file that duplicates a header's
+declarations instead of including it will not track that header's changes**, and
+nothing catches it until a design that uses that particular entry point is
+rebuilt. Compiling every kernel in `kernels/npu/` is a 9-command check and it
+found this in one pass — worth doing after any edit to the shared header.
