@@ -7290,3 +7290,34 @@ quant_block_t, int,int,int,int)` exist to do.
 §1.3 is no longer unanswerable. It was "no arrangement matches, and there is
 nothing to check a candidate against"; it is now a bounded search for one
 reorder, with an oracle that answers in a second.
+
+### Retraction (same day): the oracle's output is NOT d*code
+
+The entry above concluded that `q4nx_dequantize` applies the scale but not the
+min. **That is retracted.** `d*code` was the closest of six candidates by
+sorted-multiset distance, and I read "closest" as "correct". Per-element tests
+refute it:
+
+  - the output has **zero zeros** in 8192 values — impossible for `d*code` with
+    codes spanning 0..15;
+  - for only 20% of outputs does *any* of the 256 block scales divide the value
+    to an integer 0..15, which is roughly what chance gives with 256 candidates
+    at 1e-3 tolerance;
+  - recovering the map by division yields a unique block for just 788/8192
+    outputs — consistent with no true pairing existing, not with a hidden
+    reorder.
+
+The multiset agreement reflects similar distribution *shape*, not matching
+values. A sorted-multiset comparison cannot distinguish "same values" from
+"similar histogram", and I used it as though it could — the same class of error
+as reading a statistic instead of printing values, which cost a tick on the
+SwiGLU sigmoid.
+
+What survives: the calling convention (5/5 on the size formula), that the output
+is 100% non-negative over 4.19M elements and so is not finished weights, and
+that it is f32-computed rather than bf16-rounded.
+
+Next is the explicit-buffer overload, which takes codes and scales as separate
+arguments and so sidesteps packing entirely: feed known codes and known scales,
+see what comes back. `buffer<T>` exports ctor/data/size/resize for uint, int and
+bfloat16, so it is constructible exactly as `bytes` was.
