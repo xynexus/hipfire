@@ -664,6 +664,18 @@ Portability: iu4 `_w32` WMMA is RDNA3/3.5/4; the kernel JIT-compiles only when
 dispatched (gated by `has_wmma_w32`), same as the original — no RDNA2 regression
 (RDNA2 has no iu4 WMMA and never dispatches it). gfx1201 re-bench still pending (medusa).
 
+**gfx1201/RDNA4 — matrix-calculator verdict (2026-07-31, no GPU): the A3 win does NOT
+transfer with the current kernel.** Per the vendored AMD matrix calculator:
+`v_wmma_i32_16x16x16_iu4` and `..._iu8` on gfx1201 are **both 8 cyc / 4096 ops-WGP-cyc =
+EQUAL** — RDNA4 sped iu8 up to iu4's rate, so the **2× iu4-over-iu8 edge RDNA3 has (16 vs
+32 cyc) is GONE at the 16×16×16 shape** the A3 kernel uses. The iu4 advantage moved to the
+**new `v_wmma_i32_16x16x32_iu4`** (K=32, 8 cyc / **8192** ops-WGP-cyc = 2×). Consequence:
+`gemm_oq4_grouped_wmma_lds` (which emits `iu4_16x16x16_w32`) would run **≈ MMQ, not 1.5×,
+on RDNA4** — the A3 throughput win is **RDNA3/3.5-specific**. To recover it on gfx1201 the
+kernel needs a K=32 iu4 variant (new builtin, K-doubled tiling) — an arch-specific port,
+tracked for when the effort targets RDNA4. (Bandwidth is separate: medusa's gfx1201 is a
+discrete GPU, not UMA, which also shifts the roofline.)
+
 ### 9a. Stream A4 — routing map + what shipped vs what the quality gate blocks
 
 **Shipped (bit-exact, safe, default-on).** `gemm_oq4_grouped_act_batched`
