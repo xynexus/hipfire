@@ -5296,3 +5296,59 @@ declarations instead of including it will not track that header's changes**, and
 nothing catches it until a design that uses that particular entry point is
 rebuilt. Compiling every kernel in `kernels/npu/` is a 9-command check and it
 found this in one pass — worth doing after any edit to the shared header.
+
+## 2026-07-31 — Task 2: the universal tile trailer, and a third jit-cache trap
+
+Every weight tile now carries a 64-byte trailer after the codes:
+
+    [NROWS*NB bf16 d][NROWS*NB bf16 m][NROWS*K/2 codes][f32 row_base][f32 flags][pad]
+
+One tile shape for every phase — which is what lets a single operand fifo serve
+all of them — at **+0.31%** weight traffic. `row_base` is the global output-row
+index of the tile's first row and replaces every per-core index the kernels
+would otherwise need (residual indexing, RoPE head identity, down-chunk
+accumulator slot) with **no runtime scalar arguments and no static cursors**.
+The 64 also keeps the tile a multiple of 64, so both halves of a double-buffered
+fifo stay aligned — the alternating even/odd corruption from the previous entry
+cannot recur.
+
+**The residual moved out of the tile and into the broadcast's aux half**,
+indexed by `row_base`. The pack-time trailer it used before *cannot* work in a
+fused layer: the residual is computed on-device during the same dispatch, so it
+does not exist when the weights are packed. That was a real design error in the
+earlier version, caught by the plan rather than by a test.
+
+**The residual phase uses `flm_asum_prepare`, not `flm_norm_prepare`.** The aux
+half carries the residual there, so running the norm prologue would normalise
+the activation *using the residual as the norm weight*. The harness failed
+loudly after the change, which is how it surfaced — a good argument for the
+per-phase prologue being explicit rather than defaulted.
+
+`tile_bytes` is now centralised in `q4nx.py` (it has to agree with `pack_tile`'s
+trailer); `gemv_verify`, `gemv_bench` and `ffn_fused` had three separate copies.
+The fused FFN's up-tile offset becomes `TILE_TOTAL`, past the gate tile **and**
+its trailer.
+
+Verified with a **distinct `row_base` per tile** — a constant would have passed
+by accident:
+
+| | |
+|---|---|
+| `gemv_verify`, `normgemv_verify` (±residual) | PASS |
+| `rope_verify`, `attn_verify`, `rmsnorm_verify` | PASS |
+| `gemv_bench` (4 cores) | 3.28e-07 |
+| `ffn_fused` (4 cores) | 1.58e-04 |
+
+### Third instance of the same trap
+
+`tile_bytes` changed, but it is neither a `CompileTime` parameter nor a listed
+source file, so it **does not rekey the jit cache**. The cached binary was served
+until `~/.npu/cache` was cleared, surfacing as:
+
+    Tensor argument 'w' has 657408 elements but the kernel was compiled for 655360
+
+The pattern is now three for three — `ExternalFunction(source_file=...)`,
+closure-captured shapes, and now a module-level constant that feeds the design.
+**Anything that changes a design's shapes must be a `CompileTime` parameter, a
+listed `source_files` entry, or followed by a cache clear.** There is no fourth
+option, and the failure mode is always a stale binary rather than an error.
