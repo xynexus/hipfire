@@ -329,6 +329,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--layer", type=int, default=0)
+    p.add_argument("--kvobj", type=int, default=0,
+                   help="force N KV objects instead of deriving them from --seq.\n"
+                        "The seam's cost is otherwise measured with P2 at 7.6%% of\n"
+                        "the bytes, which says nothing about it at decode scale.\n"
+                        "The extra positions are padding and npad masks them, so\n"
+                        "correctness still holds while the KV stream is realistic.")
     p.add_argument("--bench", action="store_true",
                    help="time the P1->P2 pair; the seam's cost is otherwise\n"
                         "only inferred from P1 and P2 measured apart")
@@ -338,6 +344,10 @@ def main():
     pos = o.seq - 1                       # P1 appends at the end
     ntiles = -(-o.seq // TSEQ)
     nobj = -(-ntiles // KVPER)
+    if o.kvobj:
+        if o.kvobj < nobj:
+            raise SystemExit(f"--kvobj {o.kvobj} < the {nobj} needed for seq {o.seq}")
+        nobj = o.kvobj
     npad = nobj * KVPER * TSEQ - o.seq
     npairs, apairs = NCORES // 2, NATT // 2
 

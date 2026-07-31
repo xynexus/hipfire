@@ -7817,7 +7817,8 @@ Two things this does **not** say, both of which I nearly reported:
      without that qualification would have been wrong.
 
 The useful number: **P1 in-chain costs 86.8 µs against 78.6 assumed — 10%
-worse.** Folding that in with the measured P2:
+worse.** *(Single sample. Six repeats put this at 77.3–95.7 µs; see the variance
+entry below — 78.6 is at the low end of the range, not below it.)* Folding that in with the measured P2:
 
     projection as published      token 15.61 ms -> 64.1 tok/s
     with P1 measured in-chain    token 16.27 ms -> 61.5 tok/s
@@ -7826,3 +7827,39 @@ Still clears FLM's 59.86, but the margin is **+2.7%**, not the +7% the earlier
 figures implied. Every remaining unmeasured component now sits inside that
 margin, so P3–P5 assembly is where it will be won or lost rather than a
 formality.
+
+### Measurement variance: 22%, and it matters at this margin
+
+The same `p1p2_chain --bench --seq 31` config, six runs:
+
+    77.3  78.9  82.2  86.8  95.3  95.7      median 84.5, spread 22%
+
+**I over-read a single sample.** Last entry reported "86.8 against 78.6 assumed,
+10% worse" as though it were a result. It is one draw from a distribution whose
+minimum (77.3) is *better* than the assumed 78.6. The honest statement is that
+P1 in-chain is consistent with the assumption, not worse than it.
+
+The likely cause is sitting in plain sight: the user's `flm serve llama3.2:1b`
+(PID 2907931) has been up 12 hours and contends for the same NPU. It is not
+mine to stop, so every number in this log carries that contention.
+
+What it does to the projection:
+
+| P1 µs | token | tok/s | margin vs FLM |
+|---|---|---|---|
+| 77.3 (min) | 16.11 ms | 62.1 | +3.7% |
+| 84.5 (median) | 16.23 ms | 61.6 | +2.9% |
+| 95.7 (max) | 16.41 ms | 60.9 | +1.8% |
+
+The conclusion survives the whole range — every draw clears 59.86. But **the
+margin (1.8–3.7%) is now the same order as the measurement noise (22% on one
+component)**, so single-run comparisons cannot settle anything finer from here.
+Anything that claims to move the token time by <5% needs repeats and a median,
+not a run.
+
+Also recorded: `--kvobj` (added this tick) forces extra KV objects so the seam
+can be measured with P2 at a realistic share of the bytes rather than 7.6%. It
+works at `--kvobj 1` and **times out above that** — the sequence fills one
+pair-object while the core loops `range_(nobj-1)` for more, so the fill and the
+cache sizing both need extending before the interesting measurement is possible.
+Left as a known-incomplete flag rather than a silent trap.
