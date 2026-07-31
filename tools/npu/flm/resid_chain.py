@@ -48,6 +48,7 @@ from aie.iron import (CompileTime, In, ObjectFifo, Out, Program, Runtime,  # noq
 from aie.iron.controlflow import range_  # noqa: E402
 from aie.iron.device import AnyShimTile  # noqa: E402
 from aie.iron.kernel import ExternalFunction  # noqa: E402
+from aie.utils.benchmark import run_iters  # noqa: E402
 from ml_dtypes import bfloat16  # noqa: E402
 
 KDIR = Path(__file__).resolve().parents[3] / "kernels/npu"
@@ -213,6 +214,8 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--cores", type=int, default=16)
     p.add_argument("--layer", type=int, default=0)
+    p.add_argument("--bench", action="store_true",
+                   help="time it — P3 is the fused layer's one unmeasured phase")
     p.add_argument("--aux-residual", action="store_true",
                    help="control: -DRESID_FROM_STASH=0, residual via the "
                         "broadcast aux half. Must pass and agree.")
@@ -298,7 +301,13 @@ def main():
              for _ in range(npairs)]
     o5_ts = [iron.zeros(2 * tiles * NROWS, dtype=bfloat16, device="npu")
              for _ in range(npairs)]
-    design(bc_t, *w3_ts, *w5_ts, *o3_ts, *o5_ts)
+    if o.bench:
+        b = run_iters(design, bc_t, *w3_ts, *w5_ts, *o3_ts, *o5_ts,
+                      warmup=2, iters=10)
+        us = b.npu.min_us if b.npu else b.e2e.min_us
+    else:
+        design(bc_t, *w3_ts, *w5_ts, *o3_ts, *o5_ts)
+        us = None
 
     got_h = np.concatenate([t.numpy().astype(np.float64) for t in o3_ts])
     got_x = np.concatenate([t.numpy().astype(np.float64) for t in o5_ts])
@@ -337,6 +346,15 @@ def main():
           f"{np.abs(ref_h).mean()/np.abs(ref_x).mean():.0%} of it)")
     ok = e_h.max() <= 1e-2 * np.abs(ref_h).mean() and \
         e_x.max() <= 1e-2 * np.abs(ref_x).mean()
+    if us is not None:
+        wt_b = q4nx.tile_bytes(K_DIM, NROWS)
+        p3 = ncores * tiles * wt_b
+        p5 = ncores * NCHUNK * tiles * wt_b
+        tot = p3 + p5
+        print(f"  {tot/1e6:.2f} MB  {tot/(us*1e-6)/1e9:.1f} GB/s  {us:.1f} us "
+              f"(marginal {us - 92.9:.1f}, 16-core ideal {tot/1e6*17.85:.1f})")
+        print(f"  P3 alone is {p3/1e6:.2f} MB of that; the projection assumed "
+              f"{p3/1e6*17.85:.1f} us for it")
     print(f"  -> {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 

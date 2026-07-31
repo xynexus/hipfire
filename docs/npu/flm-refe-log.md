@@ -7150,3 +7150,43 @@ alignment surprise. But P1→P2 itself is not converging quickly, and the FFN ha
 one or two probes do not locate this, the better use of time is the 16-layer
 unroll on the working half — the measured projection says that is the lever
 worth 1.44 ms/token, and it does not depend on this seam.
+
+## 2026-07-31 — P3 measured; five more eliminations on the chain; pivoting
+
+### P3 is no longer an estimate
+
+`resid_chain.py --bench`. P3+P5 chained: **13.15 MB, 350.4 us wall, 257.5 us
+marginal** against a 234.7 us ideal — **91% of the 16-core ceiling**. By byte
+share P3 is ~51.5 us against the 46.9 the projection assumed at 100%.
+
+The projection barely moves: S=512 goes 59.7 → **59.6 tok/s**. Every row is now
+measured rather than assumed, and the conclusion is unchanged — one dispatch per
+layer reaches parity, and the 16-layer unroll is the lever.
+
+### Five more hypotheses eliminated on the chain's P2
+
+Each tested by reproducing the chain's configuration inside `attn_phase.py`,
+which passes:
+
+| hypothesis | result |
+|---|---|
+| P2 reads the cache P1 wrote | **not it** — a host-built cache gives a bit-identical error |
+| the small-sequence shape | **not it** — `attn_phase` passes at seq 31/32/64 |
+| P1's in-place norm corrupting the reused broadcast | **not it** — a non-writing prologue changes nothing |
+| the 2-core attention count | **not it** — `attn_phase` passes at 2/4/8 cores |
+| the strided q′ packing (`QSTRIDE=128`) | **not it** — passes identically to stride 64 |
+
+Every structural difference I can name is exonerated. Three of these produced
+**bit-identical** errors, which says the fault is insensitive to everything
+around P2.
+
+The `QSTRIDE` test needed the `compile_flags` cache trap worked around again —
+the stride reaches the kernel through the runtime flags list, so the design key
+does not change and the first build is reused. Interpolating it into the fifo
+name fixes it. **Fourth time this trap has cost a run**, and the first where I
+recognised the symptom immediately.
+
+### Pivoting, as recorded last tick
+
+The P1→P2 seam is not converging and the FFN half is verified end to end. The
+next work is on the measured lever rather than this diagnosis.

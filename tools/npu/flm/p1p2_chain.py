@@ -97,6 +97,9 @@ def build(pos, nobj):
     # bisect: P2 reads a host-built cache instead of the one P1 drained into.
     # P1 still runs. Separates "P2 after P1" from "P2 reading P1's output".
     HOSTKV = 1 if _osk.environ.get("CHAIN_HOST_KV") else 0
+    HOSTNORM = 1 if _osk.environ.get("CHAIN_HOST_NORM") else 0
+    PREP = "flm_asum_prepare" if HOSTNORM else "flm_norm_prepare"
+    PREPSRC = str(KDIR / "flm_asum_prepare.cc") if HOSTNORM else NORM_SRC
 
     bc_ty = np.ndarray[(BC,), np.dtype[bfloat16]]
     op_ty = np.ndarray[(OPERAND,), np.dtype[np.uint8]]      # ONE operand type
@@ -131,7 +134,10 @@ def _design(bc: In, {P}):
                           arg_types=[bc_ty, op_ty], compile_flags=FLAGS)
     ke = ExternalFunction("flm_p1_emit", source_file=EMIT_SRC,
                           arg_types=[op_ty, p1o_ty], compile_flags=FLAGS)
-    kn = ExternalFunction("flm_norm_prepare", source_file=NORM_SRC,
+    # HOSTNORM: the plain block-sum prologue, which does NOT write the
+    # broadcast. Isolates flm_norm_prepare's in-place modification of a
+    # broadcast object that the SAME fifo later reuses to deliver q'.
+    kn = ExternalFunction({PREP!r}, source_file={PREPSRC!r},
                           arg_types=[bc_ty], compile_flags=FLAGS)
     kab = ExternalFunction("flm_attn_begin", source_file=BEG_SRC,
                            arg_types=[op_ty], compile_flags=FLAGS)
@@ -286,11 +292,14 @@ def _design(bc: In, {P}):
               p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty,
               w_all_ty=w_all_ty, kvin_ty=kvin_ty, q_ty=q_ty,
               cache_ty=cache_ty, SKIP_P1=SKIP_P1, HOSTKV=HOSTKV,
+              PREP=PREP, PREPSRC=PREPSRC,
               __name__="flm_p1p2")
     exec(src, ns)
     return iron.jit(ns["_design"],
                     source_files=[QKV_SRC, EMIT_SRC, NORM_SRC, ATT_SRC,
-                                  BEG_SRC, FIN_SRC], full_elf=True), wt, KVSTRIDE
+                                  BEG_SRC, FIN_SRC,
+                                  str(KDIR / 'flm_asum_prepare.cc')],
+                    full_elf=True), wt, KVSTRIDE
 
 
 def main():
@@ -320,15 +329,15 @@ def main():
 
     rng = np.random.default_rng(0)
     x = rnd(rng.standard_normal(K_DIM) * 0.05)
-    bc = np.zeros(2 * K_DIM + 2 * HEAD, np.float32)
-    bc[:K_DIM] = x
-    bc[K_DIM:2 * K_DIM] = nw
-    bc[2 * K_DIM:2 * K_DIM + HEAD] = cs_q
-    bc[2 * K_DIM + HEAD:] = cs_k
     xd = x.astype(np.float64)
     inv = np.float32(1.0 / np.sqrt((xd * xd).mean() + EPS))
     xn = rnd(rnd(x * rnd(inv)) * nw)
 
+    bc = np.zeros(2 * K_DIM + 2 * HEAD, np.float32)
+    bc[:K_DIM] = (xn if __import__("os").environ.get("CHAIN_HOST_NORM") else x)
+    bc[K_DIM:2 * K_DIM] = nw
+    bc[2 * K_DIM:2 * K_DIM + HEAD] = cs_q
+    bc[2 * K_DIM + HEAD:] = cs_k
     bc_t = iron.tensor(bc.astype(bfloat16), dtype=bfloat16, device="npu")
     w_ts, ref = [], {}
     for pr in range(npairs):

@@ -61,7 +61,8 @@ def build(ncores, nobj):
     # takes its own 4 via the offset in the KV object's trailer. It cannot ride
     # the operand fifo — an object held across other traffic on one fifo does
     # not stay valid — and it fits the layer's broadcast object as-is.
-    QALL = 32 * HEAD                       # all query heads, packed here
+    QSTR = 2 * HEAD if __import__("os").environ.get("AP_QSTRIDE2") else HEAD
+    QALL = 32 * QSTR                       # all query heads
     # Padded to a 64-byte multiple. 2*(QALL+2) = 4100 B is not, and this tree
     # already records what that costs: a 20512 B tile put the second buffer of a
     # double-buffered fifo on a 32-byte boundary and corrupted alternate objects.
@@ -70,10 +71,13 @@ def build(ncores, nobj):
     o_ty = np.ndarray[(GQA * HEAD,), np.dtype[bfloat16]]
     opair_ty = np.ndarray[(2 * GQA * HEAD,), np.dtype[bfloat16]]
 
-    QALL = 32 * HEAD
+    import os as _oq
+    QSTR = 2 * HEAD if _oq.environ.get("AP_QSTRIDE2") else HEAD
+    QALL = 32 * QSTR
     flags = [f"-DDIM_GQA={GQA}", f"-DDIM_HEAD={HEAD}", f"-DDIM_TSEQ={TSEQ}",
              f"-DDIM_KVPER={KVPER}", f"-DDIM_KVOBJ={OPERAND}",
-             f"-DDIM_NPADOFF={QALL}", "-DQOFF_FROM_KV=1"]
+             f"-DDIM_NPADOFF={QALL}", "-DQOFF_FROM_KV=1",
+             f"-DDIM_QSTRIDE={QSTR}"]
     params = "qbc: In"
     params += ", " + ", ".join(f"kv{i}: In" for i in range(npairs))
     params += ", " + ", ".join(f"o{i}: Out" for i in range(npairs))
@@ -86,7 +90,7 @@ def _design({params}):
     kf = ExternalFunction("flm_attn_finish", source_file=FIN_SRC,
                           arg_types=[o_ty, q_ty], compile_flags=FLAGS)
 
-    f_q = ObjectFifo(q_ty, depth=1, name="qbc")
+    f_q = ObjectFifo(q_ty, depth=1, name="qbc{QSTR}")
     q_cons = [f_q.cons() for _ in range({ncores})]
     f_kv = [ObjectFifo(kvpair_ty, name=f"kv{{i}}") for i in range({npairs})]
     kv_sub = [f.cons().split([0, {OPERAND}], obj_types=[kv_ty, kv_ty])
@@ -138,7 +142,7 @@ def _design({params}):
               ObjectFifo=ObjectFifo, Program=Program, Runtime=Runtime,
               Worker=Worker, AnyShimTile=AnyShimTile, range_=range_,
               ExternalFunction=ExternalFunction, SRC=SRC, BEGIN_SRC=BEGIN_SRC,
-              FIN_SRC=FIN_SRC, FLAGS=flags, q_ty=q_ty,
+              FIN_SRC=FIN_SRC, FLAGS=flags, q_ty=q_ty, QSTR=QSTR,
               kv_ty=kv_ty, kvpair_ty=kvpair_ty, kv_all_ty=kv_all_ty,
               o_ty=o_ty, opair_ty=opair_ty, __name__="flm_attn_phase")
     exec(src, ns)
@@ -178,13 +182,16 @@ def main():
     design = build(ncores, nobj)
 
     # ONE q' buffer for every core: 32 heads packed, then npad
-    QALL = 32 * HEAD
+    QSTR = 2 * HEAD if __import__("os").environ.get("AP_QSTRIDE2") else HEAD
+    QALL = 32 * QSTR
     npad_u16 = np.array([NPAD], np.float32).view(np.uint16)
     QOBJ = ((2 * (QALL + 2) + 63) // 64) * 64
     qall = np.zeros(QOBJ // 2, np.uint16)
     for a in range(ncores):
-        qall[a * GQA * HEAD:(a + 1) * GQA * HEAD] = \
-            qrot[a].reshape(-1).astype(bfloat16).view(np.uint16)
+        for sl in range(GQA):
+            base = (a * GQA + sl) * QSTR
+            qall[base:base + HEAD] = \
+                qrot[a, sl].astype(bfloat16).view(np.uint16)
     qall[QALL:QALL + 2] = npad_u16
     q_t = iron.tensor(qall.view(np.uint8), dtype=np.uint8, device="npu")
 
@@ -208,7 +215,7 @@ def main():
         for j in range(2):
             # trailer: this core's offset into the shared q' block
             _z = __import__("os").environ.get("AP_QOFF_ZERO")
-            off = np.array([0.0 if _z else float((2 * pr + j) * GQA * HEAD)],
+            off = np.array([0.0 if _z else float((2 * pr + j) * GQA * QSTR)],
                            np.float32)
             raw[:, j, (OPERAND - 64) // 2:(OPERAND - 64) // 2 + 2] = \
                 off.view(np.uint16)
