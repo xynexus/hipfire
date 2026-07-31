@@ -207,3 +207,43 @@ def flag_tag(flags):
     """
     import hashlib
     return hashlib.sha1("|".join(map(str, flags)).encode()).hexdigest()[:8]
+
+
+# ---------------------------------------------------------------------------
+# The q4nx row layout, solved against FLM's own decoder and verified bit-exact
+# (3/3 random payload+scale trials, maxdiff 0.0). See q4nx_contract_probe.py.
+#
+# A 5120-byte row carries 8192 elements as:
+#   [0:512]     256 bf16 scales
+#   [512:1024]  256 bf16 zero-points
+#   [1024:5120] 4096 bytes of 4-bit codes
+#
+# BOTH the scales and the codes are 8-way transposed, which is what the library
+# constant `group_size_bytes = 40960 = 8 * 5120` was pointing at. The decode is
+#
+#   w[i] = scale[block(i)] * (code[i] - zero[block(i)])
+#
+# i.e. a ZERO-POINT form, not llama.cpp's `d*q + m`. Reading region 1 as a min
+# is what made every earlier arrangement fail: m = -d*z, so treating z as m is
+# wrong by a factor of d.
+
+def q4nx_maps():
+    """-> (lo, hi, sidx): byte->element maps and the block->scale-slot map."""
+    c = np.arange(4096)
+    lo = 4096 * (c // 2048) + 512 * (c % 8) + ((c % 2048) // 8)
+    hi = lo + 256
+    b = np.arange(BLOCKS_PER_ROW)
+    sidx = 32 * (b % 8) + (b // 8)
+    return lo, hi, sidx
+
+
+def q4nx_decode_row(row):
+    """One 5120-byte row -> (8192,) float32, matching FLM's decoder exactly."""
+    lo, hi, sidx = q4nx_maps()
+    d = bf16_to_f32(row[0:512].copy().view(np.uint16))[sidx]
+    z = bf16_to_f32(row[512:1024].copy().view(np.uint16))[sidx]
+    by = row[1024:ROW_BYTES]
+    q = np.empty(8192, np.float32)
+    q[lo] = by & 0x0F
+    q[hi] = by >> 4
+    return d.repeat(BLK) * (q - z.repeat(BLK))

@@ -7361,3 +7361,55 @@ The lead is a library constant: `(anonymous namespace)::group_size_bytes =
 `Dequant::reorder_cpy(u8*, buffer<u8>&, quant_block_t, int, int, int, int)`
 taking four trailing ints is consistent with a blocked transpose over such a
 group — which would also explain why every single-row hypothesis fails.
+
+## 2026-07-31 — the q4nx row layout is SOLVED (bit-exact)
+
+Not by guessing arrangements — by perturbation against FLM's own decoder. Fill a
+row uniformly, change one region or one byte, see which outputs move.
+
+**Byte localisation.** Setting bytes [0:512] to bf16 2.0 (with all codes 1) made
+every output 2.0 → that region is the scales. Bytes [1024:5120] are the codes:
+each 512-byte region drives exactly 1024 outputs.
+
+**Byte→element map.** One byte drives exactly TWO outputs, 256 apart — the two
+nibbles are *split*, not adjacent. Mapping 33 bytes gave the closed form
+
+    low  nibble of byte c -> element 4096*(c//2048) + 512*(c%8) + ((c%2048)//8)
+    high nibble           -> that + 256
+
+which is a bijection over all 8192 elements.
+
+**Scale map.** With distinct scales, block b of 32 elements uses slot
+`32*(b%8) + (b//8)` — the same 8-way transpose.
+
+**Region [512:1024] is a ZERO-POINT, not a min.** Probing it against a known
+scale and code gave `out = scale * (code - v)`, exact at v = 0, ±1, 0.5, 5:
+
+    scale 2.0, code 3:  v=0 -> 6.0   v=1 -> 4.0   v=-1 -> 8.0   v=0.5 -> 5.0
+
+So the decode is
+
+    w[i] = scale[block(i)] * (code[i] - zero[block(i)])
+
+**That is the §1.3 error.** llama.cpp's q4_1 is `d*q + m`; q4nx stores `z` with
+`m = -d*z`. Reading region 1 as a min is wrong by a factor of `d`, which is
+exactly why no arrangement ever matched — and why the Frobenius norm came out
+inflated rather than merely permuted.
+
+Verified bit-exact: random codes + random scales, **3/3 trials, maxdiff 0.0**.
+`q4nx.q4nx_decode_row()` now reproduces FLM's decoder (Frobenius 179.977 vs the
+library's 179.98 on layers.0 q_proj).
+
+Both transposes being 8-way is what `group_size_bytes = 40960 = 8 * 5120` was
+pointing at all along.
+
+### What this does NOT yet explain
+
+The decoded values are **100% non-negative** and still do not match the
+checkpoint (corr 0.0008, Frobenius ratio 2.44). Since the decode now provably
+matches FLM's own, the gap is not in reading the container. Either
+`q4nx_dequantize` is an intermediate with a further transform after it, or the
+container's quantized tensors are not the checkpoint's weights. The bf16 tensors
+being bit-exact makes the second surprising, but it is no longer excluded.
+
+The question is now well-posed and small, which it was not this morning.
