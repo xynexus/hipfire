@@ -5746,3 +5746,33 @@ the 8-core slope has not been measured, so this number is not yet interpretable;
 **Not done here:** appending k′/v′ to the KV cache with a strided BD. That is
 the seam between P1 and P2 rather than a property of either, so it belongs with
 Task 7's single-dispatch wiring, where both phases exist in the same program.
+
+## 2026-07-31 — the marginal slope is per core count; attention P2 is at 89%, not 63%
+
+Closing the caveat left on Task 6. `gemv_bench.py --sweep-cores 4,8,16`, with
+the marginal time taken as wall − 92.9 us:
+
+| cores | MB | wall us | marginal us | **us/MB** | marginal GB/s |
+|---|---|---|---|---|---|
+| 4 | 9.5 | 577.9 | 485.0 | **51.05** | 19.6 |
+| 8 | 19.1 | 562.5 | 469.6 | **24.59** | 40.7 |
+| 16 | 38.1 | 772.9 | 680.0 | **17.85** | 56.0 |
+
+**The 17.547 us/MB figure used throughout this log is the 16-core slope, not a
+constant.** It is close to the fabric roof (56.0 of 56.5 GB/s), and it is not
+what a phase running on fewer cores can reach: 4→8 nearly halves the slope
+(factor 2.08, so the fabric is not the limit there), but 8→16 only improves it
+1.38x, because by 16 cores the fabric is what is left.
+
+So attention P2's 145.8 us marginal on 5.26 MB is:
+
+- against the 16-core slope: 93.9 us ideal → **64%** — the number reported for
+  Task 6, and it is wrong, because P2 runs on 8 cores.
+- against the 8-core slope: 129.3 us ideal → **89%**.
+
+89% puts it with the GEMV phases (88–99%), not below them. Task 6's throughput
+caveat is resolved in the phase's favour, and no work is needed there.
+
+**Rule for every future phase measurement:** divide marginal time by the slope
+*at that phase's core count*. Only P2 runs on 8; everything else in the fused
+layer is 16, where 17.85 is right.
