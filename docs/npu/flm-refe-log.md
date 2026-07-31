@@ -4782,3 +4782,48 @@ layer design should treat down_proj as the phase to optimise, and the obvious
 lever is the one still untried — put that 16 KB activation in **neighbour
 memory** instead of every core's L1, which would free the whole budget for
 weights.
+
+## 2026-07-31 — RoPE: full rotary, and `rope_freqs.weight` identified
+
+`kernels/npu/flm_rope.cc` + `tools/npu/flm/rope_verify.py`.
+
+**The existing `rope_rotate_bf16` could not be reused.** It is Qwen3.5-specific:
+`partial_rotary_factor = 0.25`, so it rotates only `head_dim/4` dims and passes
+the rest through. llama-3.2 rotates all 64. New kernel, half-split convention
+matching HF's `rotate_half`, using `aie::msc` for the `x*cos - y*sin` — the same
+`vmsc.f` that `flm-layer-dataflow.md` used to LOCATE RoPE in FLM's array, since
+that opcode occurs in `layer.xclbin` essentially nowhere else.
+
+**`rope_freqs.weight` [32] is the per-frequency llama3 DIVISOR, not the
+frequencies.** Its values are `[1]*15, 1.648, 3.297, 9.688, [32]*14` — the
+textbook llama3 shape: unscaled at high frequency, `/factor` at low frequency,
+smooth in between. So
+
+    inv_freq = 1 / theta**(2i/head_dim) / rope_freqs[i]
+
+and this matches an independent re-derivation of the llama3 wavelength
+interpolation (`factor=32, low_freq_factor=1, high_freq_factor=4,
+original_max_position_embeddings=8192`) to **0.21% max**, which is inside
+bf16 storage error. **The scaling does not need reimplementing** — it is a
+divide. The harness asserts the agreement rather than assuming it.
+
+Verified bit-exact against its own bf16 chain, **0.0000e+00** at both a normal
+position and one far past the original context:
+
+| | max rel vs float64 | vs own bf16 chain |
+|---|---|---|
+| pos 1000, 32 query heads | 2.009% max / 0.150% mean | **0.0e+00** |
+| pos 100000, 8 KV heads | 1.104% max / 0.184% mean | **0.0e+00** |
+
+The 2% against float64 is one element of 1722 and is **cancellation**, not
+error: `x*cos - y*sin` is a difference of similar-magnitude terms, so relative
+error blows up wherever it cancels hardest no matter how exact the kernel is.
+The mean, 0.150%, is the honest figure. Third operator where the float64
+comparison misleads and the bf16-chain comparison is the real gate.
+
+### Operator coverage for a decoder layer
+
+RMSNorm, q/k/v/o projections, RoPE, decode attention with online softmax,
+gate/up+SwiGLU fused, and down_proj are all now built and verified on hardware.
+What remains before a layer can run end to end is the **residual adds** (trivial)
+and the **KV cache append**, then the fusion itself and a tok/s number.
