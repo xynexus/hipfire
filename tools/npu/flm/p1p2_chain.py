@@ -69,6 +69,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 import q4nx  # noqa: E402
 from qkv_verify import HEAD, K_DIM, NROWS, TPH, EPS, ROPE_THETA, qkv_rows, rope_ref  # noqa: E402
+from ffn_verify import load_linear  # noqa: E402
 from p1_route import (NQ, NK, NV, NCORES, HPC, heads_of, rnd,  # noqa: E402
                       head_layout, hpc_for, drain_plan)
 
@@ -158,13 +159,19 @@ def build(pos, nobj):
              f"-DDIM_GQA={GQA}", f"-DDIM_TSEQ={TSEQ}", f"-DDIM_KVPER={KVPER}",
              f"-DDIM_QSTRIDE={OBJ}", f"-DDIM_KVOBJ={OPERAND}",
              f"-DDIM_NPADOFF={32 * OBJ}", "-DQOFF_FROM_KV=1"]
-    P = ", ".join(f"w{i}: In" for i in range(npairs))
+    # This list must match `at` element for element. Weights and q results are
+    # per P1 PAIR (only those cores run P1); the cache, P3's weights and P3's
+    # results are per pair, since every core runs P3.
+    P = ", ".join(f"w{i}: In" for i in range(p1pairs))
     P += ", " + ", ".join(f"kvin{i}: In" for i in range(apairs))
     if HOSTKV:
         P += ", " + ", ".join(f"hostkv{i}: In" for i in range(apairs))
-    P += ", " + ", ".join(f"q{i}: Out" for i in range(npairs))
+    P += ", " + ", ".join(f"q{i}: Out" for i in range(p1pairs))
     P += ", " + ", ".join(f"cache{i}: Out" for i in range(npairs))
     P += ", " + ", ".join(f"attn{i}: Out" for i in range(apairs))
+    P += ", bc3: In"
+    P += ", " + ", ".join(f"w3_{i}: In" for i in range(npairs))
+    P += ", " + ", ".join(f"h{i}: Out" for i in range(npairs))
     src = f'''
 def _design(bc: In, {P}):
     kq = ExternalFunction("flm_gemv_qkv", source_file=QKV_SRC,
@@ -192,9 +199,9 @@ def _design(bc: In, {P}):
                            arg_types=[bc_ty, op_ty, p1o_ty],
                            compile_flags=FLAGS)
 
-    f_bc = ObjectFifo(bc_ty, depth=1, name="bc")
+    f_bc = ObjectFifo(bc_ty, depth=1, name="bc_p3")
     bc_cons = [f_bc.cons() for _ in range({NCORES})]
-    f_w = [ObjectFifo(oppair_ty, name=f"wp{{i}}") for i in range({npairs})]
+    f_w = [ObjectFifo(oppair_ty, name=f"wp{{i}}_p3") for i in range({npairs})]
     w_sub = [f.cons().split([0, {OPERAND}], obj_types=[op_ty, op_ty]) for f in f_w]
     f_p1 = [ObjectFifo(p1opair_ty, name=f"p1o{{i}}") for i in range({npairs})]
     p1_sub = [f.prod().join([0, {OBJ}], obj_types=[p1o_ty, p1o_ty]) for f in f_p1]
@@ -445,6 +452,7 @@ def main():
     hpc = hpc_for(2 * p1pairs)
     layout = head_layout(2 * p1pairs)
     qobj, _kvplan = drain_plan(2 * p1pairs)
+    p3tiles = K_DIM // (NCORES * NROWS)
 
     c = q4nx.Q4nx(str(Q4NX))
     nw = c.bf16(f"model.layers.{o.layer}.input_layernorm.weight").astype(np.float32)[:K_DIM]
@@ -537,6 +545,46 @@ def main():
             for pr in range(p1pairs)]
     attn_out = iron.zeros(apairs * 2 * GQA * HEAD, dtype=bfloat16, device="npu")
     a_ts = [attn_out] * apairs        # every pair drains into the same buffer
+    # ---- P3: o_proj + residual -------------------------------------------
+    # Its activation is host-supplied for now. The device's own attn_out covers
+    # only NATT of the 8 KV groups (16 of 32 q heads at NATT=4), so it is not a
+    # whole 2048-vector and cannot feed an o_proj GEMV yet. Verifying P3 against
+    # a full host vector separates "P3 works in the chained design" from "the
+    # P2->P3 handoff carries the right bytes", which is the next step.
+    od, om, oc = load_linear(c, f"model.layers.{o.layer}.self_attn.o_proj.weight",
+                             K_DIM, K_DIM)
+    attn3 = rnd(rng.standard_normal(K_DIM) * 0.05)     # P3's activation
+    bc3 = np.zeros(2 * K_DIM + 2 * HEAD, np.float32)
+    bc3[:K_DIM] = attn3
+    bc3[K_DIM:2 * K_DIM] = x                            # the residual P3 adds
+    bc3_t = iron.tensor(bc3.astype(bfloat16), dtype=bfloat16, device="npu")
+
+    # rows so a pair's join is a contiguous global run, as resid_chain packs them
+    rpp3 = K_DIM // npairs
+    p3rows = lambda pr, j: [pr * rpp3 + t * 2 * NROWS + j * NROWS
+                            for t in range(p3tiles)]
+    nbc3 = K_DIM // 32
+    w3, h_ref = [], np.zeros(K_DIM, np.float64)
+    for pr in range(npairs):
+        per = []
+        for j in range(2):
+            blob = []
+            for r0 in p3rows(pr, j):
+                blob.append(q4nx.pack_tile(od[r0:r0 + NROWS, :nbc3],
+                                           om[r0:r0 + NROWS, :nbc3],
+                                           oc[r0:r0 + NROWS, :nbc3],
+                                           row_base=r0, flags=0.0))
+                got = q4nx.gemv_reference_bf16(attn3, od[r0:r0 + NROWS, :nbc3],
+                                               om[r0:r0 + NROWS, :nbc3],
+                                               oc[r0:r0 + NROWS, :nbc3])
+                h_ref[r0:r0 + NROWS] = rnd(got + x[r0:r0 + NROWS])
+            per.append(np.concatenate(blob))
+        b = np.empty((p3tiles, 2, wt), np.uint8)
+        b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
+        w3.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
+    h_ts = [iron.zeros(2 * p3tiles * 2 * HEAD, dtype=bfloat16, device="npu")
+            for _ in range(npairs)]
+
     import os as _oh
     if _oh.environ.get("CHAIN_HOST_KV"):
         # the same cache contents, built on the host: P1 still runs and still
@@ -554,9 +602,10 @@ def main():
         host_t = iron.tensor(hraw.reshape(-1).view(np.uint8), dtype=np.uint8,
                              device="npu")
         design(bc_t, *w_ts, *q_in, *[host_t] * apairs, *q_ts,
-               *[cache_t] * npairs, *a_ts)
+               *[cache_t] * npairs, *a_ts, bc3_t, *w3, *h_ts)
     else:
-        _args = (bc_t, *w_ts, *q_in, *q_ts, *[cache_t] * npairs, *a_ts)
+        _args = (bc_t, *w_ts, *q_in, *q_ts, *[cache_t] * npairs, *a_ts,
+                 bc3_t, *w3, *h_ts)
         if o.bench:
             _b = run_iters(design, *_args, warmup=2, iters=10)
             _us = _b.npu.min_us if _b.npu else _b.e2e.min_us
@@ -588,6 +637,19 @@ def main():
         mb = (p1_b + kv_b) / 1e6
         print(f"  bench: {mb:.2f} MB  {mb*1e3/_us:.1f} GB/s  {_us:.1f} us "
               f"(marginal {_us - FIXED_US:.1f}, 16-core ideal {mb*17.85:.1f})")
+    got_h = np.concatenate([t.numpy().astype(np.float64)
+                            .reshape(-1, 2 * HEAD)[:, :NROWS].reshape(-1)
+                            for t in h_ts])
+    order = np.concatenate([np.array(p3rows(pr, j)) + r
+                            for pr in range(npairs) for t in range(p3tiles)
+                            for j in (0, 1) for r in range(0)] or [np.zeros(0, int)])
+    h_idx = np.concatenate([np.arange(r0, r0 + NROWS)
+                            for pr in range(npairs)
+                            for t in range(p3tiles)
+                            for j in (0, 1)
+                            for r0 in [p3rows(pr, j)[t]]])
+    e3 = np.abs(got_h - h_ref[h_idx]).max()
+    print(f"  P3 h      : max err {e3:.4e}  mean|ref| {np.abs(h_ref).mean():.5f}")
     print(f"P1 -> P2 in one dispatch: seq {o.seq} (P1 appends at pos {pos}), "
           f"{nobj} KV objects, npad {npad}")
     worst, scale = 0.0, 0.0

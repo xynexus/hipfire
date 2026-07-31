@@ -8592,3 +8592,36 @@ fed. Attention passing says nothing about P3, which runs after it.
 Next: pack o_proj tiles, allocate the `h` buffers, extend the broadcast fill with
 attention output plus the residual stream, and check `h` against a host
 reference. `resid_chain` already has all of that for P3 in isolation.
+
+### P3 is wired end to end and runs — and its result is wrong
+
+`p1p2_chain` now supplies P3's o_proj weights, its broadcast (a host-supplied
+activation plus the residual stream) and its `h` buffers, and checks `h` against
+a host reference.
+
+    P1 cache: k' one bf16 ulp, v' 0.0
+    P3 h    : max err 8.0859e-01   mean|ref| 0.04606      <-- WRONG
+    attention out: 3.4631e-03  PASS
+
+The error is ~17x the reference magnitude, so it is structural, not a rounding
+or offset issue. P1 and P2 are unaffected.
+
+**The plumbing works; the data does not.** Three things had to be fixed to get
+this far, and the third is the one worth remembering:
+
+  * `RES_SRC` and the new types must be added to the `exec` namespace as well as
+    used in the design source;
+  * P3's kernel had to be passed to *both* core kinds' `fn_args`;
+  * **the generated `_design` signature is built separately from the `at` list
+    and nothing checks they agree.** `P` still used `npairs` for the weight and
+    q parameters where `at` had moved to `p1pairs`, and P3's parameters were
+    absent entirely — 29 parameters against 42 tensors. It surfaced as
+    "`_design` takes at most 29 positional arguments but 42 were given", which
+    names the symptom and not the cause. Two lists that must agree element for
+    element, edited in different places, with no assertion between them.
+
+Not yet diagnosed: whether `h` is wrong because of the weight packing order, the
+`h_idx` stream order used by the check, or the broadcast's third fill. The check
+itself is new and unverified, so it is as likely to be wrong as the device path —
+`resid_chain` gets P3 exact (0.0000e+00) in isolation, so the kernel and the
+packing are known good there and the difference is in this harness.
