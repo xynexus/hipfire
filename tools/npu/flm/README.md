@@ -55,6 +55,21 @@ python3 gemv_bench.py --sweep-cores 1,2,4,8   # throughput, every point checked
 Kernel: `kernels/npu/flm_gemv_q4_1.cc`. Container reader and both references:
 `q4nx.py`. Results: `docs/npu/flm-reproduction-results.md`.
 
+```bash
+python3 ground_truth.py                       # the reading vs Meta's real checkpoint
+```
+
+**Know what `gemv_verify.py` does and does not prove.** It compares the kernel to
+a numpy reference built from *the same reading* of `model.q4nx`, so a wrong
+reading passes it. `ground_truth.py` checks that reading against
+`meta-llama/Llama-3.2-1B-Instruct`'s actual checkpoint and, as of 2026-07-31,
+**it fails**: the unquantized tensors are 100% bit-exact (so the reader, the
+planar split, the naming and the model are right), but the quantized blocks are
+not a reordering of the checkpoint's, and the Frobenius norm is inflated
+1.12–1.19x by a per-tensor factor — a per-channel scaling. So the kernels are
+verified as q4_1 arithmetic over the container's blocks, not as computing the
+model. Throughput figures are unaffected.
+
 **Compare against `gemv_reference_bf16`, not `gemv_reference`.** bf16 operands
 are inherent to the format — FLM materialises `w = d*q + m` in bf16 before its
 own MAC — so an exactly-correct body still lands ~1% from float64 on an output
@@ -153,3 +168,10 @@ Each is a thing that cost real time; module docstrings have the detail.
   vector segfaults the compiler (uint16 is fine); 16-lane uint8 vectors fail to
   legalize (`G_AND <4 x s32>`), as do 16-lane float reductions
   (`G_FADD <16 x s32>`). Work 32 lanes wide in the byte domain.
+- **A probe without a control is not evidence.** Two examples from one day, both
+  caught only because the control was written first. A RoPE row-order probe
+  scored "interleaved" 9/10 — until `v_proj`, which gets no RoPE at all, scored
+  it *more* strongly (5.97x vs 3.62x): the signal was adjacent-row smoothness.
+  And the block-range (`d`) distribution appears to confirm a 32-contiguous
+  grouping — until a random regrouping of the same weights matches it just as
+  well. Both would have shipped a confident wrong answer.

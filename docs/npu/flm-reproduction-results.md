@@ -5,6 +5,20 @@ mlir-aie/Peano source. **The bar is functional, not textual** — numerically
 equivalent on real weights, and within ~10% of the throughput baseline. This
 records where the reproduction matched and where it did not.
 
+> **Scope of the correctness half of that bar, as of 2026-07-31.** Checked
+> against Meta's actual checkpoint (`tools/npu/flm/ground_truth.py`), the
+> container's *unquantized* tensors are **100% bit-exact** — file structure,
+> planar split, tensor naming and model identity (Llama-3.2-1B-**Instruct**) are
+> all confirmed. The *quantized* blocks are not: they do not match the model's
+> 32-element blocks under any grouping or permutation tested, and the Frobenius
+> norm is inflated 1.12–1.19x by a per-tensor factor, which is a per-channel
+> scaling rather than a reordering. So the kernels are verified as **q4_1
+> arithmetic over the container's blocks** (1.9e-07 against a reference on the
+> same bytes) — not as computing Llama-3.2-1B-Instruct end to end. Read every
+> "on real weights" below as "on the container's q4_1 blocks". Throughput
+> figures are byte-movement measurements and are unaffected. See
+> `flm-refe-log.md`, 2026-07-31.
+
 Working log with the failures in order: `docs/npu/flm-refe-log.md`. Dataflow
 findings: `flm-layer-dataflow.md`, `flm-attn-dataflow.md`.
 
