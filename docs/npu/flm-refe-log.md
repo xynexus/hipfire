@@ -9249,3 +9249,37 @@ are the ones already priced: **P1 is the biggest image and the cheapest phase**
 where some cores run P1+P3+P4 and others P3+P4+P5 keeps every phase on 12+ cores.
 That is a three-way split rather than the current two-way, and the routing lever
 (placement, not fifo count) is known to work.
+
+### The probe under-predicts by 4 KB — and the five-phase shortfall is only 416 B
+
+Switched `progmem_probe.py` to NROWS=8 / KVPER=1 to pick a partition. It says
+**every** combination fits, including all five phases:
+
+    P1+P3+P4+emit+asum    10704 B  65%
+    P3+P4+P5+emit+asum     9584 B  58%
+    P2+P3+P4+P5+emit+asum 12352 B  75%
+    P1+P3+P4+P5+emit+asum 12832 B  78%
+
+But the chain **overflowed** with those same five phases. The probe calls each
+kernel once from a flat body; the chain runs them inside nested `range_` loops
+with per-phase acquire/release sequences, and that scaffolding is not modelled:
+
+    probe  P1+P3+P4+emit+asum   10704 B
+    chain  same phases          14672 B
+    -> scaffolding the probe misses: 3968 B
+
+**So the probe is a lower bound, not an estimate**, and every partition decision
+taken from it has been optimistic by ~4 KB. Worth stating plainly because it was
+built specifically to stop me reasoning about program memory, and it does that
+only for kernel images.
+
+The useful number falls out of the same arithmetic:
+
+    P5's marginal (probe, NROWS=8)   2128 B
+    chain with P5                    14672 + 2128 = 16800 B = 103%
+    **short by 416 B**
+
+That is much closer than a three-way partition implies. Before restructuring, it
+is worth spending a tick looking for 416 B — the `#pragma clang loop
+unroll(disable)` on `flm_h_emit` found 496 B on its own, and nothing else in the
+layer has been examined for unrolling.

@@ -35,18 +35,22 @@ sys.path.insert(0, str(Path(__file__).parent))
 import q4nx  # noqa: E402
 
 KDIR = Path(__file__).resolve().parents[3] / "kernels/npu"
-K_DIM, NROWS, HEAD, TSEQ, GQA = 2048, 16, 64, 32, 4
-OPERAND = 20544
+# NROWS follows the fused layer, which runs 8 — the operand is sized for
+# data memory, not for one phase. See the log.
+K_DIM, NROWS, HEAD, TSEQ, GQA = 2048, 8, 64, 32, 4
+OPERAND = max(2 * TSEQ * HEAD * 2 * 1, q4nx.tile_bytes(K_DIM, NROWS))
 WT = q4nx.tile_bytes(K_DIM, NROWS)
 
 # every -D the phase kernels read, unioned; a wrong value only makes the kernel
 # compute nonsense, which is fine here, but a MISSING one fails the build
 FLAGS = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_HEAD={HEAD}",
          f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS=32", f"-DDIM_QKHEADS=40",
-         f"-DDIM_GQA={GQA}", f"-DDIM_TSEQ={TSEQ}", f"-DDIM_KVPER=2",
+         f"-DDIM_GQA={GQA}", f"-DDIM_TSEQ={TSEQ}", f"-DDIM_KVPER=1",
          f"-DDIM_KVOBJ={OPERAND}", f"-DDIM_QSTRIDE={2 * HEAD}",
          f"-DDIM_NPADOFF={32 * 2 * HEAD}", "-DQOFF_FROM_KV=1",
-         f"-DDIM_KVSTRIDE={OPERAND // 2}", f"-DDIM_NCHUNK=4"]
+         f"-DDIM_KVSTRIDE={OPERAND // 2}", f"-DDIM_NCHUNK=4", f"-DDIM_OBJROWS={2*HEAD}",
+         f"-DDIM_ACCN={2 * (K_DIM // (16 * NROWS)) * NROWS}",
+         f"-DDIM_P3TILES={K_DIM // (16 * NROWS)}", "-DRESID_FROM_STASH=1"]
 
 # (name, source, arity) per phase — arity is how many objects it takes
 PHASES = {
