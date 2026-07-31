@@ -9694,3 +9694,35 @@ has changed configuration three times (NROWS 16→8, KVPER 2→1, operand derive
 Every figure carried forward from before those changes needs re-measuring, not
 reusing. The remaining unmeasured piece is P5 as its own dispatch; ~290 µs is
 scaled, not measured.
+
+### The clean derivation — and NROWS=8 costs most of the margin
+
+The split does not need measuring half by half. The work is the same either way;
+splitting costs **exactly one extra dispatch per layer**. From the chain's
+measured wall at the current configuration:
+
+    chain (P1..P4, NROWS=8)      638.9 µs   measured, 1 dispatch
+    P5 marginal, scaled to NR=8  ~207.0 µs
+    single dispatch (if it fit)   845.9 µs -> 16.56 ms -> **60.4 tok/s**
+    two dispatches                938.8 µs -> 18.04 ms -> **55.4 tok/s**
+    FLM                                                    59.86
+
+Two things fall out, and the first is the one that matters:
+
+**Even a single-dispatch layer is only 60.4 tok/s at NROWS=8**, not the 64.7 I
+have been quoting. That 64.7 was computed from NROWS=16 phase figures, and
+NROWS=8 was forced later by data memory. The operand change that unblocked P4
+also took ~4.5% of GEMV bandwidth, and 4.5% is most of the margin over FLM.
+
+So the honest position is narrower than either previous claim:
+
+| configuration | tok/s | vs FLM |
+|---|---|---|
+| single dispatch, NROWS=16 | 64.7 | +8.1% — **but does not fit data memory** |
+| single dispatch, NROWS=8 | 60.4 | +0.9% — **but does not fit program memory** |
+| two dispatches, NROWS=8 | 55.4 | −7.4% — **fits, and is buildable today** |
+
+Every configuration that beats FLM fails a memory constraint, and the one that
+builds loses by 7%. That is the real shape of the result, and it took three
+wrong numbers to see it: the 64.7 ignored the config change, the 55 double-counted
+dispatch, the 59.7 mixed builds.
