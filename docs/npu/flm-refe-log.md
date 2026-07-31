@@ -6347,11 +6347,44 @@ persistence:
    the frame is `paddxm [sp], #0x1c40` — **7232 bytes** for a 32-element float
    loop, because the compiler spills whole vector register files. The overflow
    is silent and corrupts the result, exactly as this log's earlier entry on the
-   1024 B IRON default says. 4096 is not a safe default either; this needed
-   16384.
+   1024 B IRON default says. This probe needed 16384. (I first wrote "4096 is
+   not a safe default either" — see the audit in the next entry, which shows it
+   is safe for every real kernel with 3.8x margin, and that the probe was the
+   outlier.)
 
 What separated harness from hardware was a **stateless control** — the same
 kernel writing a constant. It passed while the counter read zero, which located
 the fault in the global rather than the plumbing, and made the stack frame worth
 looking at. Without it the probe would have shipped "core state does not
 persist" and the design would have taken the f32 path and the 6 tok/s.
+
+## 2026-07-31 — stack frames audited: every kernel fits, and what actually blows the stack
+
+The 7232 B frame that broke the persistence probe raised an obvious question —
+**every harness passes `stack_size=4096`**, so is anything else silently
+overflowing? `tools/npu/flm/stack_audit.py` disassembles each kernel at the
+shapes the harnesses build and reports the frame.
+
+Nothing is. The worst is `flm_attn_decode` at **1088 B, 27% of 4096**, a 3.8x
+margin; most are 64–320 B and four are zero. So the previous entry's "4096 is
+not a safe default either" was wrong, and the probe was the outlier rather than
+the warning.
+
+**What actually causes it** is not size but how far the backend unrolls. A fully
+unrolled loop doing a scalar `float -> bfloat16` conversion spills the whole
+accumulator register file:
+
+| trips | 8 | 16 | 24 | 32 | 48 | 64 |
+|---|---|---|---|---|---|---|
+| frame B | 1024 | 3136 | 5184 | **7232** | **0** | **0** |
+
+~2 KB per 8 iterations while it unrolls, then **0** once it gives up and emits a
+real loop — so the danger zone is a *middle* trip count, and a bigger loop can
+be cheaper than a smaller one. The identical loop writing `float` instead of
+`bfloat16` costs **64 B**, which is what isolates the conversion as the trigger.
+
+Every kernel in `kernels/npu/` escapes it by indexing with a dynamic base
+(`slot + r`, `base + r`, `off + r`) rather than the loop variable, which the
+backend will not unroll that way. That is a property of how they happen to be
+written and not a guarantee, which is the reason the audit is a script rather
+than a paragraph: it is cheap to re-run when a kernel changes shape.

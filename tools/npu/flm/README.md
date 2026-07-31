@@ -200,3 +200,11 @@ Each is a thing that cost real time; module docstrings have the detail.
   This is also the general form of the older entry above: **anything that
   changes behaviour must be visible in the design source, a `CompileTime`
   parameter, or a listed source file.**
+- **A fully-unrolled loop doing scalar `float -> bfloat16` spills the whole
+  accumulator file.** Frames of 1024 / 3136 / 5184 / **7232** B at 8 / 16 / 24 /
+  32 trips, then **0** at 48 — the backend gives up unrolling and emits a real
+  loop, so the danger zone is a *middle* trip count and a bigger loop can be
+  cheaper than a smaller one. The same loop writing `float` costs 64 B. Stack
+  overflow here is silent and reads as a logic bug. Run `stack_audit.py` after
+  changing a kernel's shape; today every kernel is ≤1088 B against a 4096 B
+  stack.
