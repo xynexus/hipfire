@@ -9632,3 +9632,35 @@ real tok/s either way.
 (I first wrote this as `P1+P2+P3+P4 = 17664 B = 108%`, which is wrong — that sums
 as though one core ran all four. No core does; partition B is exactly what
 prevents it.)
+
+## 2026-08-01 — the two-dispatch route is 59.7 tok/s, not 55 — I double-counted
+
+Both halves of the A=[P1,P2,P3] / B=[P4,P5] split already exist as working
+harnesses, so the layer can be measured rather than modelled:
+
+    dispatch A (P1+P2+P3)   172.0 µs   measured
+    dispatch B (P4+P5)      685.9 µs   measured, median of 3
+    layer                   857.9 µs
+    token 16.75 ms  ->  **59.7 tok/s**   against FLM's 59.86 — a **tie**, −0.3%
+
+**I reported ~55 tok/s for this route, three times.** The error: I took the
+single-dispatch projection (built from phase *marginals*, which exclude dispatch
+overhead) and added 32 × 92.9 µs on top. But a measured **wall** already contains
+its own dispatch cost. The real penalty for splitting is the 15 dispatches an
+unrolled single-dispatch design would have saved — **1.39 ms, not 2.88 ms** — and
+I counted the overhead twice.
+
+That materially changes the conclusion I escalated. The two-dispatch layer is not
+"loses to FLM by 9%"; it is level with it, on measured numbers, with the
+single-dispatch ideal at 64.7 tok/s some way above.
+
+Caveats worth keeping:
+
+  * dispatch A's 172 µs is from an earlier tick, before P4 was added and removed
+    again; it should be re-measured on the current tree;
+  * A and B have never run back to back with real data flowing between them —
+    `sw` from A's P4 into B, and `g_resid` across the dispatch boundary. The
+    cross-dispatch global carry is known to work (`g_kprev` does it), but not
+    for this;
+  * 59.7 vs 59.86 is inside the measurement noise established earlier, so the
+    honest claim is a tie, not a win or a loss.
