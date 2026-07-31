@@ -7722,13 +7722,41 @@ pair (10 shim outputs), not the full eight, which is a materially smaller change
 than "make P2's fifo disappear entirely".
 
 Caveat, and it is not a small one: the 2- and 4-core rows are **extrapolations**
-(groups/core x per-core cost), not measurements, and the per-core figures are
-noisy enough (24.5 at 4 cores vs 34.4 at 8) that they are clearly
-fixed-overhead-dominated rather than clean. The ranking is safe; the absolute
-numbers are not.
+(groups/core x per-core cost), not measurements. **Now measured — see below.**
 
 Also recorded: a quick probe aliasing `f_p2` onto `f_p1` to test the lever
 cheaply does **not** work — the harness builds its design by exec'ing an
 f-string, and a live ObjectFifo cannot be interpolated into it
 (`ValueError: unmarshallable object`). Surgical routing experiments need a real
 edit to the generated source, not a shim around it.
+
+
+### Measured, replacing that extrapolation
+
+`attn_phase` ties one KV group to one core, so "4 groups per core" cannot be
+expressed directly. But the dominant cost is KV streaming, and that *can* be
+matched: 8 cores x seq 512, 4 x 1024 and 2 x 2048 all move **1.31 MB**.
+
+| P2 cores | measured µs | (extrapolated) | token | tok/s |
+|---|---|---|---|---|
+| 8 | **25.3** | (34.4) | 15.61 ms | **64.1** |
+| 4 | **58.1** | (49.0) | 16.14 ms | **62.0** |
+| 2 | **131.8** | (125.6) | 17.31 ms | 57.8 |
+
+Scaling is near-perfect 2x per halving (2.30x, 2.27x), so P2 is cleanly
+bandwidth-bound with no core-count anomaly.
+
+**The conclusion survives but the numbers moved.** The extrapolation was
+optimistic exactly where it mattered: 4 cores measured 58.1 µs against 49.0
+predicted, 19% worse. Had the true figure been another 20 µs/layer worse, NATT=4
+would have fallen below FLM and the whole "one more attention pair is enough"
+plan with it. The ranking was safe; the margin was not, and the margin is what
+the decision rested on.
+
+Standing: **NATT=4 gives 62.0 tok/s vs FLM's 59.86** — still enough, now on a
+measurement. NATT=2, which is what routes today, gives 57.8 and does not.
+
+The caveat that remains: these runs vary sequence length to hold KV volume
+constant, so the per-core softmax spans a longer sequence than a real layer's
+would. Streaming dominates and both are O(seq), so it is a fair proxy — but it
+is a proxy, not the real shape.
