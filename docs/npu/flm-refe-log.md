@@ -5776,3 +5776,35 @@ caveat is resolved in the phase's favour, and no work is needed there.
 **Rule for every future phase measurement:** divide marginal time by the slope
 *at that phase's core count*. Only P2 runs on 8; everything else in the fused
 layer is 16, where 17.85 is right.
+
+## 2026-07-31 — Task 7 falsifier PASSES: a phase can read what the previous one drained
+
+`tools/npu/flm/chain_probe.py`. The fused layer is five phases in one dispatch
+and every phase but the first consumes the previous one's output — P1's q′ feeds
+P2, P2's attention output feeds P3, P3's `h` feeds P4, P4's SwiGLU output feeds
+P5. There is no host between them, so the only mechanism available is for a
+phase's `drain` to land in a DDR buffer that a later phase's `fill` reads back,
+as buffer descriptors in one command stream ordered by the in-dispatch barrier.
+
+**That had never been tested, and all of Task 7 rested on it.** The probe chains
+N phases of a doubling kernel through the same two fifos, phase 0 reading host
+buffer A and every later phase reading B — the buffer the previous drain just
+wrote. A working chain gives 2^N; a broken one localises where it stopped.
+
+| phases | elements | realised gain | expected | max err | |
+|---|---|---|---|---|---|
+| 3 | 256 | **8.000x** | 8x | **0.0e+00** | PASS |
+| 5 | 2048 | **32.000x** | 32x | 6.25e-02 | PASS |
+| 5 | 4224 (broadcast-sized) | 31.969x | 32x | 6.06e-02 | PASS |
+
+The residual error is bf16 rounding — the doubled values reach 32, where the
+bf16 step is 0.25. The gain is what matters and it is exact.
+
+So **Task 7 is buildable as §1.4 specifies**: inter-phase values ride DDR
+round-trips inside the dispatch, one TaskGroup per phase so its BDs are freed
+before the next opens, and `drain(wait=True)` is the barrier. No memtile
+residency scheme is needed, and the phase schedule stands.
+
+Worth having run before writing the five-phase harness rather than after — a
+failure here would have invalidated §1.4's whole structure, not just its
+wiring.
