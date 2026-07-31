@@ -8816,3 +8816,36 @@ pattern to copy rather than rediscover.
 Running total for the layer's broadcast fills: activation, q′, h, then four
 chunks of `sw` — **seven fills**, each of which every core must consume whether
 or not it uses the contents.
+
+## 2026-08-01 — the full phase set fits, at 99%, and only because the emit was rolled
+
+Checked the program-memory risk before writing P4 rather than after. It was real:
+
+    P1+P3+P4+P5                    15424 B   94%
+    + flm_h_emit (unrolled)        OVERFLOW
+    + flm_h_emit (rolled)          15920 B   97%     496 B
+    + flm_asum_prepare             16240 B   99%     -> 144 B spare
+
+**A 128-iteration copy loop cost over 960 B fully unrolled** — more than the
+`m`-term GEMV kernel it supports — and that alone pushed a core running
+P1+P3+P4+P5 past 16 KB. `#pragma clang loop unroll(disable)` takes it to 496 B.
+The copy is off the critical path, so the unrolling bought nothing and cost
+nearly the whole remaining budget.
+
+The attention half is not the constraint: `P2+P3+P4+P5` + emit sits at 98%, and
+P1 is the largest image. Correctness is unaffected — P3's `h` is still 9.5367e-07
+at seq 31 and exact at 17 and 9.
+
+**144 B of headroom is the real state of Task 7.** Every phase fits on one core
+in one dispatch, but nothing further can be added without displacing something:
+the P4 stash that `flm_gemv_up_swiglu` will need is *data* memory rather than
+program memory, which is the only reason it is not already over. The ordered
+fallbacks if it does overflow — densify `h` another way, displace P5 to 12 cores
+(~1.1% of margin), split the dispatch (~0.6 ms/token) — are all measured and none
+loses to FLM outright.
+
+Worth noting the sequence here: the estimate was "~98%, roughly 270 B of
+headroom", the first measurement was an overflow, and the fix brought it to 99%.
+The estimate was directionally right and still wrong about whether it fits, which
+is the third time in this investigation that a program-memory calculation has not
+survived contact with a build.

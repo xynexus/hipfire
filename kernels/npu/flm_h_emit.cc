@@ -60,7 +60,13 @@ flm_h_emit(const uint8 *restrict wtile, bfloat16 *restrict out) {
   // land in the same slot — which is why resid_chain sizes it per pair.
   const int base = tile_row_base(wtile);
   const int j = (base % (2 * NR)) / NR;
-  for (int t = 0; t < TILES; ++t)
-    for (int r = 0; r < NR; ++r)
-      out[t * NR + r] = bfloat16(g_resid[t * 2 * NR + j * NR + r]);
+  // **Do not let this unroll.** TILES*NR is 128 iterations, and fully unrolled
+  // it costs over 960 B of program memory — enough to push a core running
+  // P1+P3+P4+P5 past 16 KB, which is measured, not hypothetical. As a rolled
+  // loop it is a handful of instructions and the copy is off the critical path.
+#pragma clang loop unroll(disable)
+  for (int i = 0; i < TILES * NR; ++i) {
+    const int t = i / NR, r = i - t * NR;
+    out[i] = bfloat16(g_resid[t * 2 * NR + j * NR + r]);
+  }
 }
