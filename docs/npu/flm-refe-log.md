@@ -6839,3 +6839,36 @@ fail), `attn_phase --seq 480` PASS.
 That is the fourth constraint of the same family in as many days: **you cannot
 add an operand, and now you cannot even give it its own type.** Everything a
 phase needs must fit the one shape the topology already has.
+
+## 2026-07-31 — the P1+P2 two-phase topology places; the KV fill is what remains
+
+`tools/npu/flm/p1p2_chain.py`. The structural question — can one design run two
+phases on overlapping-but-different core sets, with the fifo budget the layer
+needs — is answered: **it places and compiles.**
+
+| | |
+|---|---|
+| cores | 16, two Worker bodies — 0–7 run P1 then P2, 8–15 run P1 only |
+| input channels/core | **2 of 2** — broadcast + operand, unchanged |
+| output channels/core | **2 of 2** — P1's result fifo and P2's |
+| shim outputs | 12 of 16 |
+
+Two Worker bodies in one design is fine; a core simply never acquires a fifo it
+does not use in a phase.
+
+**P2 needs its own result fifo.** P1 emits 128-element bf16 objects (`2*HEAD` per
+head) and P2 emits 256 (`GQA*HEAD`); a fifo has one object size, and unlike the
+*input* side — where a third fifo is a hard compile error — a second output is
+free, because P1 was using one of two channels.
+
+### What remains, and it is a mirror of something already solved
+
+P2's KV operand must be **filled from the cache buffer P1 drains into**, gathering
+KV head `g`'s `[K][V]` into that core's operand object. `fill` takes the same
+`sizes`/`strides` as `drain`, and by the same rule — the *buffer* side is
+patterned and the *fifo* side is linear — a fill gathers where a drain scatters.
+`ffn_chain` already proves a phase can fill from a buffer an earlier phase
+drained; this adds a gather pattern to it.
+
+The harness builds the design and reports placement; it does not run P2 yet, and
+says so rather than reporting a number it has not earned.
