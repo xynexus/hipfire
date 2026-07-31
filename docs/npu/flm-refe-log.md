@@ -10041,3 +10041,28 @@ across dispatches (so P5's residual carries), and the two designs share a
 compatible `sw` buffer (so the handoff needs no host intervention). What remains
 is running them back to back in one script, which is orchestration rather than
 design.
+
+## 2026-08-01 — a whole decoder layer runs end to end, and it is exact
+
+`p1p2_chain.py --layer-pass` runs side A, hands its own `sw` buffer to side B,
+and checks the layer's output:
+
+    P3 h        : 9.5367e-07
+    P4 sw       : 2.4414e-04   (exp2 floor)
+    LAYER x_out : **0.0000e+00**   — side B on side A's own sw
+    attention   : 3.4631e-03   PASS
+
+All five phases, two dispatches, no host intervention at the seam: side A's P4
+drain writes `sw` in row order and side B slices it by K-chunk directly. The
+residual is host-supplied in this run; in the fused layer it reaches P5 through
+`g_resid`, which persists across the boundary (measured).
+
+**This is Task 7 complete.** A real decoder layer, verified against a host
+reference computed from the device's own intermediate, exact to the last bit.
+
+    side A   626.0 µs      side B   266.0 µs      layer 892.0 µs
+    token 17.97 ms -> **55.7 tok/s**    FLM at matched context 58.83, −5.4%
+
+Nothing about the layer is projected any more. The remaining gap is the one
+structural fact established earlier: a core holds four phase bodies, a layer has
+five, and the extra dispatch costs 16 × 67.2 µs.

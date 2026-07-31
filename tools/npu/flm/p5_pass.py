@@ -153,6 +153,67 @@ def _design(bc: In, {params}):
                      full_elf=True), wt, tiles)
 
 
+def run(sw_t, x, layer=0, ncores=16, bench=False):
+    """Side B, driven by side A: `sw_t` is the row-ordered D_FF buffer side A's
+    P4 drain produced, used directly as the broadcast source. `x` is the
+    residual, host-supplied here — in the fused layer P5 reads it from g_resid,
+    which P3 stashed in the previous dispatch and which survives (measured:
+    static_persist_probe).
+
+    -> (x_out in row order, wall_us or None)
+    """
+    npairs = ncores // 2
+    design, wt, tiles = build(ncores)
+    c = q4nx.Q4nx(str(Q4NX))
+    dd, dm, dc = load_linear(c, f"model.layers.{layer}.mlp.down_proj.weight",
+                             D_MODEL, D_FF)
+    sw = sw_t.numpy().astype(np.float32)
+    bc = np.zeros((NCHUNK, 2 * K_DIM), np.float32)
+    for ch in range(NCHUNK):
+        bc[ch, :K_DIM] = sw[ch * K_DIM:(ch + 1) * K_DIM]
+        bc[ch, K_DIM:] = x
+    bc_t = iron.tensor(bc.reshape(-1).astype(bfloat16), dtype=bfloat16,
+                       device="npu")
+    rpp = D_MODEL // npairs
+    rows = lambda pr, j: [pr * rpp + t * 2 * NROWS + j * NROWS
+                          for t in range(tiles)]
+    nbc = D_FF // BLK
+    w5 = []
+    for pr in range(npairs):
+        per = []
+        for j in range(2):
+            blob = []
+            for ch in range(NCHUNK):
+                lo = ch * (nbc // NCHUNK)
+                hi = lo + nbc // NCHUNK
+                for r0 in rows(pr, j):
+                    sl = slice(r0, r0 + NROWS)
+                    blob.append(q4nx.pack_tile(
+                        dd[sl, lo:hi], dm[sl, lo:hi], dc[sl, lo:hi],
+                        row_base=r0, flags=float(ch == NCHUNK - 1)))
+            per.append(np.concatenate(blob))
+        b = np.empty((NCHUNK * tiles, 2, wt), np.uint8)
+        b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
+        w5.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
+    o_ts = [iron.zeros(NCHUNK * 2 * tiles * NROWS, dtype=bfloat16, device="npu")
+            for _ in range(npairs)]
+    us = None
+    if bench:
+        b2 = run_iters(design, bc_t, *w5, *o_ts, warmup=2, iters=10)
+        us = b2.npu.min_us if b2.npu else b2.e2e.min_us
+    else:
+        design(bc_t, *w5, *o_ts)
+    got = np.concatenate([t.numpy().astype(np.float64)
+                          .reshape(NCHUNK, -1)[NCHUNK - 1] for t in o_ts])
+    idx = np.concatenate([np.arange(rows(pr, j)[t], rows(pr, j)[t] + NROWS)
+                          for pr in range(npairs)
+                          for t in range(tiles)
+                          for j in (0, 1)])
+    out = np.zeros(D_MODEL, np.float64)
+    out[idx] = got
+    return out, us
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)

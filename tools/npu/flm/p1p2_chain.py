@@ -523,6 +523,10 @@ def main():
                         "the bytes, which says nothing about it at decode scale.\n"
                         "The extra positions are padding and npad masks them, so\n"
                         "correctness still holds while the KV stream is realistic.")
+    p.add_argument("--layer-pass", action="store_true",
+                   help="after side A, run side B (P5) on the sw buffer side A\n"
+                        "just produced, and check x_out — the whole layer in two\n"
+                        "dispatches, end to end")
     p.add_argument("--bench", action="store_true",
                    help="time the P1->P2 pair; the seam's cost is otherwise\n"
                         "only inferred from P1 and P2 measured apart")
@@ -856,6 +860,30 @@ def main():
     # stream order is [object][core], each object carrying OBJ contiguous rows
     e4 = np.abs(got_sw - sw_ref).max()
     print(f"  P4 sw     : max err {e4:.4e}  mean|ref| {np.abs(sw_ref).mean():.5f}")
+    if o.layer_pass:
+        import p5_pass
+        # the residual P5 adds is x, the layer's input — in the fused layer it
+        # reaches P5 through g_resid, which P3 stashed and which persists across
+        # the dispatch boundary (static_persist_probe). Host-supplied here.
+        x_out, us5 = p5_pass.run(sw_all, x.astype(np.float32), layer=o.layer)
+        # reference: down_proj over the sw side A actually produced, plus x
+        swv = sw_all.numpy().astype(np.float32)
+        dd, dm, dc = p5_pass.load_linear(
+            c, f"model.layers.{o.layer}.mlp.down_proj.weight", 2048, 8192)
+        nbc5 = 8192 // 32
+        ref5 = np.zeros(2048, np.float64)
+        for r0 in range(0, 2048, 8):
+            sl = slice(r0, r0 + 8)
+            acc = np.zeros(8, np.float64)
+            for ch in range(4):
+                lo = ch * (nbc5 // 4); hi = lo + nbc5 // 4
+                acc += q4nx.gemv_reference_bf16(
+                    rnd(swv[ch * 2048:(ch + 1) * 2048]),
+                    dd[sl, lo:hi], dm[sl, lo:hi], dc[sl, lo:hi])
+            ref5[r0:r0 + 8] = rnd(acc + x[r0:r0 + 8])
+        e5 = np.abs(x_out - ref5).max()
+        print(f"  LAYER x_out: max err {e5:.4e}  mean|ref| {np.abs(ref5).mean():.5f}"
+              f"  (side B on side A's own sw)")
     print(f"P1 -> P2 in one dispatch: seq {o.seq} (P1 appends at pos {pos}), "
           f"{nobj} KV objects, npad {npad}")
     worst, scale = 0.0, 0.0
