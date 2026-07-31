@@ -37,33 +37,13 @@
 // Compile-time: -DDIM_HEAD.
 
 #include "flm_q4_1_tile.h"
-
-#ifndef DIM_HEAD
-#define DIM_HEAD 64
-#endif
-
-namespace {
-constexpr int KHEAD = DIM_HEAD;
-} // namespace
-
-// This core's previous token k', carried across the dispatch boundary.
-alignas(64) bfloat16 g_kprev[DIM_HEAD];
+#include "flm_kv_pair.h"
 
 extern bfloat16 g_stage[];      // the rotated head, from flm_gemv_qkv
 
+// Thin entry point. The write itself lives in flm_kv_pair.h because
+// flm_qkv_emit's k branch is the other real call site.
 extern "C" __attribute__((noinline)) void
 flm_kv_emit(const uint8 *restrict wtile, bfloat16 *restrict out) {
-  const int t = tile_flags(wtile);
-  if (t & 1) {
-    for (int d = 0; d < KHEAD; ++d) {
-      out[2 * d] = g_kprev[d];
-      out[2 * d + 1] = g_stage[d];
-    }
-  } else {
-    for (int d = 0; d < KHEAD; ++d) {
-      out[2 * d] = g_stage[d];
-      out[2 * d + 1] = bfloat16(0.0f);
-      g_kprev[d] = g_stage[d];
-    }
-  }
+  flm_kv_pair(g_stage, tile_flags(wtile), out);
 }

@@ -6614,3 +6614,41 @@ that starts from a reproduction rather than a symptom.
 What *is* established, and is enough to work with: **when two kernels
 communicate through a global, hoisting every acquire above both calls is always
 safe**, and it costs nothing.
+
+## 2026-07-31 — P1's emit path: `flm_kv_pair.h` shared, `flm_p1_emit.cc` routes
+
+Preparing the P1→P2 harness. Two kernels now need the k′ column-pair write —
+the standalone `flm_kv_emit` entry point and P1's routing emit — so the write
+moved into `kernels/npu/flm_kv_pair.h` rather than being copied.
+
+The link check is the point: `flm_kv_pair` resolves as **`W`** (folded to one
+copy) and **`g_kprev` as `V`, 128 B, one object across both translation units**.
+The carry state has to be shared, not duplicated — two copies would each hold
+half the token history and the odd steps would read the wrong one.
+
+`flm_p1_emit.cc` branches on the head index from the tile's `row_base`:
+
+    head <  32          q'  -> contiguous, first HEAD of the object
+    32 <= head < 40     k'  -> flm_kv_pair, the column-pair form
+    head >= 40          v'  -> contiguous, first HEAD
+
+One kernel rather than three because **the core cannot choose at trace time**:
+all 16 cores run the same body, and which of a core's three heads is q, k or v
+depends on where they fall in 0..47. The result object is `2*HEAD` for every
+head; only k′ needs the doubled form, so q′ and v′ use the first half and their
+drains skip the rest with a stride. The waste is 40 heads x 128 B = **5 KB per
+layer** of result bandwidth, against 38 MB of weights.
+
+### A regression I made and backed out
+
+The first version folded the branch into `flm_qkv_emit` itself. That changes its
+result-object size from `HEAD` to `2*HEAD`, and `qkv_verify.py` — which had been
+exact — started failing at 2.36 against a 4.7e-03 tolerance, because its k heads
+were writing 128 elements into a 64-element object. Reverted: `flm_qkv_emit`
+stays the plain emit its callers expect, and the routing form is a separate
+entry point. **Changing a kernel's object size is an interface change**, and the
+two forms are cheap to keep apart.
+
+Both harnesses pass again, and `stack_audit.py` is unchanged at a worst 1088 B.
+Program memory for cores 0–7 goes 12,832 → ~13,904 B, **85% of 16 KB**, still
+inside the budget §1.5b records.
