@@ -1232,6 +1232,83 @@ impl Gpu {
         result
     }
 
+    /// DIAGNOSTIC-ONLY compute-headroom probe. Runs the register-tiled 4x4 bf16
+    /// GEMM with `entry` = `gemm_bf16_alu{0,64,128,256,512,1024,2048}`, i.e. the
+    /// production kernel plus N side FMAs per K-step. Sweeping `entry` and finding
+    /// the knee where wall-time rises measures how much unrelated VALU work the
+    /// compute-bound DiT GEMM absorbs for free — the budget for a codebook/trellis
+    /// weight decode (QTIP, LO-BCQ) or a correction branch. Affordable decode cost
+    /// = `NALU_free / 64` ops per weight element. Like `bench_iu_wmma_gfx1151`,
+    /// this is diagnostic-only and is intentionally not routed into any model path.
+    pub fn bench_bf16_alu_headroom(
+        &mut self,
+        entry: &str,
+        a_bf16: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(a_bf16.dtype, DType::BF16, "bench_bf16_alu_headroom: weights BF16");
+        self.ensure_kernel(entry, kernels::BENCH_BF16_ALU_HEADROOM_SRC, entry)?;
+        let ap = a_bf16.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x_f32, batch_size * k)?;
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let sink = 0i32; // never taken; blocks DCE of the side chain
+        let grid_m = m.div_ceil(64) as u32;
+        let grid_b = batch_size.div_ceil(64) as u32;
+        self.launch_kernargs(
+            entry,
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi, i32 sink],
+        )
+    }
+
+    /// EXPERIMENT (D1 free-ALU headroom): LDS bf16 GEMM + `extra` throwaway VALU
+    /// FMAs per WMMA. Sweep `extra`; the wall-time-rise knee is the free-compute
+    /// budget a QTIP/codebook decode or correction branch can hide in. Not production.
+    pub fn bench_bf16_lds_freealu(
+        &mut self,
+        a_bf16: &GpuTensor,
+        x_f32: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        extra: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % 64, 0, "bench_bf16_lds_freealu: K%64");
+        self.ensure_kernel(
+            "bench_bf16_lds_freealu",
+            kernels::BENCH_BF16_LDS_FREEALU_SRC,
+            "bench_bf16_lds_freealu",
+        )?;
+        let ap = a_bf16.buf.as_ptr();
+        let xp = self.ensure_bf16_x(x_f32, batch_size * k)?;
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let ei = extra as i32;
+        let grid_m = m.div_ceil(64) as u32;
+        let grid_b = batch_size.div_ceil(128) as u32;
+        self.launch_kernargs(
+            "bench_bf16_lds_freealu",
+            [grid_m, grid_b, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr ap, ptr xp, ptr yp, i32 mi, i32 ki, i32 bi, i32 ei],
+        )
+    }
+
     /// Register-tiled F32 batched GEMM. Y[batch, M] = A[M,K] @ x[batch,K]^T.
     /// Each block holds BATCH_TILE=8 accumulators in registers and
     /// reuses each loaded weight element across them — amortizing

@@ -4003,6 +4003,19 @@ pub const GEMM_BF16_TILED_WMMA_SRC: &str =
 /// `kernels/src/gemm_bf16_tiled_wmma_lds.hip`.
 pub const GEMM_BF16_TILED_WMMA_LDS_SRC: &str =
     include_str!("../../../kernels/src/gemm_bf16_tiled_wmma_lds.hip");
+/// EXPERIMENT: LDS bf16 GEMM + `extra` throwaway VALU FMAs/WMMA, to measure the
+/// DiT GEMM's free-ALU headroom (the QTIP/correction budget). Not production.
+/// See `kernels/src/bench_bf16_lds_freealu.hip`.
+pub const BENCH_BF16_LDS_FREEALU_SRC: &str =
+    include_str!("../../../kernels/src/bench_bf16_lds_freealu.hip");
+/// DIAGNOSTIC-ONLY compute-headroom probe: the register-tiled 4x4 bf16 GEMM plus
+/// N side FMAs per K-step, to measure how much unrelated VALU work the
+/// (compute-bound, ~10%-of-peak) DiT GEMM absorbs for free — i.e. the budget a
+/// codebook/trellis weight decode (QTIP, LO-BCQ) or correction branch has to fit
+/// inside. Not routed into any model path. See
+/// `kernels/src/bench_bf16_alu_headroom.hip`.
+pub const BENCH_BF16_ALU_HEADROOM_SRC: &str =
+    include_str!("../../../kernels/src/bench_bf16_alu_headroom.hip");
 
 /// Register-tiled, zero-LDS unified Opus-Quant W4A8 / W8A8 GEMM (gfx1103/RDNA3):
 /// dynamic-int8 activation × iu8 WMMA, weight fetched as int8 (W8) or unpacked

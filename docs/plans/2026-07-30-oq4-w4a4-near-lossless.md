@@ -1051,3 +1051,28 @@ Honest conclusion: **D1's naive "port the LDS win" failed — the DiT GEMM is a 
 (compute-bound) beast.** A real bf16 win needs the hard wave64 deep-ILP scheduling work; the
 more accessible 2× is int4-act, gated on DiT quality. The register-tiled 4×4 is near the
 achievable for its structure.
+
+### 12a. The compute headroom is spendable — free-ALU budget = ~16–24 FMAs/WMMA (2026-07-31)
+
+**Correction to §12's ending:** "the register-tiled 4×4 is near the achievable, bf16 is hard"
+looks at it backwards. The DiT GEMM at ~10% of peak is COMPUTE-bound-but-stalled → the VALU
+is mostly idle, and **that idle compute is spendable** on a heavier, higher-quality quant —
+the reframe: *use the extra compute to run QTIP/codebook decode + correction, which normally
+is the blocker (a fast codebook-indexed GEMM, plan §4.3 "hardest kernel question"), for free.*
+
+**Measured** (`bench_bf16_lds_freealu.hip` = LDS bf16 GEMM + `extra` throwaway VALU FMAs/WMMA;
+attn 6144×6144, N=2048): wall-time is FLAT through **extra=16 FMAs/WMMA (0.99×)**, then rises
+(32→1.28×, 64→2.41×). So the free budget is **~16–24 scalar FMAs per WMMA.** Per lane a WMMA
+consumes 16 weight elements, so that is **~1–1.5 free ops/weight** — enough to hide:
+- a **per-fragment QTIP/codebook decode** (trellis/LUT → weight, ~1–2 ops/weight), or
+- a **correction branch** (SVDQuant low-rank add, LDLQ error-feedback, dual-branch sum).
+
+**So the DiT lever is NOT "make bf16 faster" (D1: hard, ~1.1×) — it's "quantize the DiT to a
+compute-heavy codebook/corrected low-bit format and hide the decode in the stalls":**
+footprint/cold-load win (§8, D2's ~3.7×) + codebook near-lossless quality, at ~zero warm-step
+cost because the GEMM was idle anyway. This dissolves Lever D's blocker *for the DiT
+specifically* (the LUT-GEMM needn't be fast — just correct — since there's compute to spare),
+and makes int4-act's dequant/correction free too. Next: design a codebook-decode / correction
+that fits the ~16–24 FMA/WMMA budget, fused into this LDS kernel's WMMA loop; measure footprint
++ quality vs the bf16 baseline. Experiment kernel `bench_bf16_lds_freealu` + the sweep in
+`bench_dit_bf16_gemm` are the harness.
