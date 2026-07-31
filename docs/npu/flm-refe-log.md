@@ -8248,3 +8248,33 @@ five-phase build overflows, so the true figure cannot be measured directly.
 That matters for the decision: merging `acc` and `flush` into one kernel with a
 flag plausibly saves ~1656 B, which clears the optimistic end of the range and
 not the pessimistic one. Worth trying, but not obviously sufficient.
+
+### Merging acc+flush saves 80 B, not 1656 — the candidate is dead
+
+Wrote `flm_gemv_down`, folding `flm_gemv_acc` and `flm_gemv_flush` into one entry
+point selected by the tile trailer's flag, and measured it:
+
+    P5 as two kernels (acc + flush)   4928 B
+    P5 as one merged kernel           4848 B
+    saving                              80 B
+
+In place: `P1+P3+P4+P5` 15424 B → `P1+P3+P4+merged` 15344 B. **80 B against the
+1904–3072 B needed** — 0.5% of the gap.
+
+I projected ~1656 B by dividing P5's 3312 B marginal by its two kernels. That is
+wrong the same way the earlier ELF-summing was wrong: the 3312 B is mostly the
+row loops and the `flm_q4_1_tile` call, which *both* paths still need and which
+`linkonce_odr` already shares. Only the second entry point's prologue and
+epilogue actually disappear, and that is 80 B. **Dividing a joint cost by the
+number of parts has now produced a wrong answer three times in this
+investigation** — for phase images, for per-kernel marginals, and here.
+
+The kernel is deleted rather than kept: 80 B does not justify a third file
+duplicating two others, and integrating it would touch `ffn_chain`,
+`resid_chain` and the layer harness.
+
+**The cheapest candidate is gone, and no other named one is likely to yield
+~2 KB.** The realistic position is the measured partition — P5 on 12 cores,
+60.5 tok/s, +1.1% over FLM and inside the noise. Beating FLM convincingly now
+depends on finding savings nobody has identified, or on accepting that the
+margin is a coin flip.
