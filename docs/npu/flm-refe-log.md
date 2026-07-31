@@ -9818,3 +9818,34 @@ measurements or cross-validated derivations:
 The audit is closed. Every term — the chain's wall, the FFN, P5, the lm_head, the
 dispatch and barrier constants — is measured or corroborated at NROWS=8. Nothing
 further is expected to move the answer.
+
+### The FLM baseline is context-dependent — and I was comparing against its best case
+
+Measured live on the user's server, same session:
+
+    41-token context    61.18 tok/s
+   641-token context    58.83 tok/s      3.8% slower at length
+
+FLM's decode slows with context, as attention should. **The 59.86 I have been
+comparing against is a short-context figure**, while my projection assumes
+seq-512 attention (P2 measured at matched KV volume). That is not like for like.
+
+Against a context-matched baseline:
+
+| | mine | FLM at same context | |
+|---|---|---|---|
+| single dispatch @ seq 512 | 58.6 | 58.83 | **−0.4%** — a tie |
+| two dispatches @ seq 512 | 53.9 | 58.83 | −8.4% |
+| single dispatch @ short* | 60.4 | 61.18 | −1.3% |
+
+\* derived: P2 at short context is mostly fixed cost, not measured.
+
+**This is the first correction that runs in my favour**, after five that did not.
+The single-dispatch configuration is level with FLM at matched context rather
+than 2% behind it — though it still does not fit, so the buildable number remains
+8.4% back.
+
+It also says something about where the remaining gap is. Per-layer, this design
+is within ~1% of FLM at both contexts. The whole deficit is the extra dispatch
+the split costs — 92.9 µs × 16 = 1.49 ms on a 17 ms token. Not the kernels, not
+the bandwidth, not the decomposition's arithmetic: the dispatch count.
