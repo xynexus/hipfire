@@ -804,6 +804,37 @@ clip + (rotation and/or A8 subspace)**, each now measurable on this harness. Not
 distributional) moved less than PPL (true-token NLL) — the clip helps the true continuation
 more than the full tail, so the KLD gate stays the stricter bar.
 
+## 9e. The A4 go/no-go RESOLVES — measure vs the real incumbent, not vs A16 (2026-07-31)
+
+An ideation pass surfaced the decisive correction: the 0.067 penalty is act4 **vs A16**, but
+the batched-prefill path never runs all-A16. gate_up/o/down are **already W4A4** (§9b) — qkv
+is the *only* non-W4A4 site. So the right baseline is the current mix, measured for free with
+the env unset (qkv-W4A8-MMQ + gate_up/o/down-W4A4):
+
+| batched-prefill variant (ctx=2048, 2039 pos, vs A16 ref) | KLD | PPL | vs A16 |
+|---|---|---|---|
+| A16 (full-precision act) | — | 10.67 | ref |
+| **current batched default** (qkv-W4A8 + rest-W4A4) | **0.0585** | 11.07 | +0.40 |
+| full W4A4 (act4) | 0.0672 | 11.30 | +0.63 |
+| **full W4A4 + clip** | **0.0553** | 10.99 | +0.33 |
+
+**The reframe:** ~87% of the "int4-act penalty" is **already paid** by the shipped path
+(gate_up/o/down are W4A4). Promoting qkv W4A8→W4A4 (full A4) adds only **+0.0087 KLD / +0.23
+PPL** — near the 0.016 noise floor. And with the clip lever, **full-W4A4+clip (0.0553 KLD /
+11.07 PPL) is *better* than today's mix (0.0585 / 11.07) on BOTH metrics** — while also being
+**faster** (int4 qkv via the A3 LDS kernel + int4 activation throughput). So:
+
+> **A4 GO/NO-GO → GO.** full W4A4 + activation clip is a **strict improvement over the current
+> batched-prefill default** — better quality (−0.003 KLD, −0.08 PPL) AND higher throughput.
+> The expensive Stream-B levers (ConQuR rotation, ResQ A8 subspace) are **NOT required** for the
+> promotion; they would only push further below the noise floor, which the go/no-go does not need.
+
+Remaining before flipping the default: house-rule confirmation (≥16 chunks / ctx=2048 done
+as 1; coherence-gate on the winner watching the list-primes attractor; 9B/27B confirmation),
+a clip-throughput bench (expected neutral), and the daemon serving-routing question (§2c —
+whether the hybrid actually reaches this batched path vs per-token W4A16). But the *quality*
+verdict is settled: **int4-act + clip ships.**
+
 **A4 decision:** int4-act buys ~1.5× prefill throughput (§9) at ~0.067 KLD / +0.79 PPL.
 That is a genuine **throughput-vs-quality tradeoff**, NOT free — so promoting qwen3.5
 qkv/gate_up to W4A4-by-default is **not justified on quality alone**; it needs Stream B to
