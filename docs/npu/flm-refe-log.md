@@ -9306,3 +9306,32 @@ The way to attribute it is ablation — remove one phase from the chain and
 measure the delta in situ — which also gives the only per-phase numbers that
 have been right so far. Every estimate derived from the probe or from summing
 has been optimistic, twice by enough to change a decision.
+
+### Ablation: a phase costs ~1.9x its probe marginal, so the shortfall is 2272 B
+
+Removed P4's body call from the chain and rebuilt:
+
+    P1 core with P4     14672 B
+    P1 core without     10688 B
+    **P4 in situ         3984 B**
+
+against a probe marginal of ~2128 B for a phase's kernels. **The scaffolding
+roughly doubles a phase** — per-phase acquire/release sequences, the nested
+`range_` bodies and the object handling around them.
+
+That corrects last tick's arithmetic:
+
+    chain with P5   14672 + ~3984 = 18656 B = 114%
+    short by ~2272 B, not the 416 B the probe's marginal implied
+
+So the five-phase core is not 416 B away from fitting; it is over 2 KB away, and
+no pragma hunt was ever going to close that. **The three-way partition is
+needed**, and this is the number that says so.
+
+The pattern is now consistent and worth stating once: **the probe under-predicts
+a phase by about half, because it models kernels and not the loop structure
+around them.** Every figure taken from it — the 99% five-phase estimate, the
+144 B of headroom, the 416 B shortfall — has been optimistic by that factor.
+Ablation is the measurement that has not been wrong.
+
+`p1p2_chain` is restored and passing.
