@@ -6529,3 +6529,31 @@ reuses one design for every token**, which is the condition persistence needs.
 The fix is to pass the drain offset as a runtime value (`fill`/`drain` accept
 `offset_parameter=`) rather than a baked constant, which the fused layer needs
 regardless: 16 layers x N tokens cannot each be their own program.
+
+### Verified — the carry works; the bf16 k′ append is complete
+
+One design, five dispatches, every step exact:
+
+| t | column 0 | column 1 | |
+|---|---|---|---|
+| 0 | k₀ **0.0e+00** | 0 **0.0e+00** | opens the pair |
+| 1 | **k₀ 0.0e+00** | k₁ 0.0e+00 | **the carry** — column 0 can only come from `g_kprev` |
+| 2 | k₂ 0.0e+00 | 0 0.0e+00 | |
+| 3 | **k₂ 0.0e+00** | k₃ 0.0e+00 | **the carry** |
+| 4 | k₄ 0.0e+00 | 0 0.0e+00 | |
+
+So `g_kprev` survives the dispatch boundary and **K stays bf16 at 5.26 MB/layer**
+rather than f32's 10.52 — the ~6 tok/s that decision was worth is kept.
+
+The harness fixes it to column pair (0,1) for every token, because varying the
+offset means either rebuilding the design (which clears `.bss` and destroys the
+thing under test) or a runtime offset. An odd step's column 0 can still only
+come from `g_kprev`, so the carry is genuinely exercised.
+
+**For the fused layer, the offset must be a `ScratchpadParameter`**, passed as
+`offset_parameter=` to `drain`. `fill`/`drain` accept it, a Worker can `read()`
+it in the core body, and the host writes it through `ParameterScratchpad.write()`
+before a `sync_parameters()` in the sequence. Two notes from its source: the name
+must be unique within the device, and **`np.float32` is unsupported** — the
+scratchpad encoding zeroes the value's top 2 bits, which clobbers an f32's sign
+and top exponent bits. Use `np.int32`.

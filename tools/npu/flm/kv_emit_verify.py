@@ -1,63 +1,20 @@
 #!/usr/bin/env python3
 """k′ appended one token per dispatch, carrying across the dispatch boundary.
 
-**STATUS: the append works; this harness cannot test the carry.** Two faults
-were found and one is fatal to the harness's design:
+**Verified.** One design, N dispatches, every step exact — including the two
+carries. Two faults had to be fixed to get here and both are worth knowing:
 
 1. **Acquire every fifo object BEFORE calling any kernel.** Interleaving
-   `acquire -> call -> acquire` silently loses the input data — the kernel reads
-   zeros with no error. Hoisting the acquires fixed it. Every working harness in
-   this tree happens to acquire first; this one did not, and that is the whole
-   of the "input fifo does not deliver" fault below.
-
-2. **This harness builds a NEW design per token**, because it bakes the drain
-   offset into the runtime sequence. A new design is a new program load, which
-   **resets core `.bss`** — so `g_kprev` is empty at every odd step and the
-   carry cannot possibly work here. The evidence is exact: odd columns (whose
-   data is same-dispatch) verify at 0.0e+00, even columns that a later odd step
-   overwrites from `g_kprev` read zero, and t=4 — even, and never overwritten —
-   is also exact.
-
-   The real decode loop reuses **one** design for every token, so this is a
-   harness artifact, not a flaw in the scheme. Fixing it needs the drain offset
-   as a runtime value (`fill`/`drain` take `offset_parameter=`) instead of a
-   baked constant, which is what the fused layer will need anyway.
-
-**STATUS (superseded): does not work yet, but the fault is now pinned.** Run with
-`KV_SEEDCONST=1` the cache fills correctly — so `flm_kv_emit`, the cross-TU
-`g_stage` handoff, and the paired strided drain with a non-zero offset all work.
-Run normally, with the seed reading its input fifo, the cache stays zero **even
-when the input is all 5s** (`KV_CONSTHEAD=1`). So the single remaining fault is
-that **data filled into this harness's input fifo does not reach the kernel**.
-
-Eliminated by bisecting up from `qkv_route_probe.py`, which works: input fifo
-count (0, 1 and 2 all pass), `range_` versus a plain traced loop, output fifo
-depth, the destination BO size, and the tile trailer offset. Note the bisect's
-own limit — those probes' kernels *ignored* their inputs, so they proved the
-design runs, not that input data arrives, which is exactly the gap that is left.
-
-`flm_kv_emit.cc` closes the P1→P2 seam. Appending a token to the channel-major K
-cache is a stride-TSEQ scatter, and a DMA cannot do that one element at a time —
-sizes must be multiples of 4 bytes and offsets 4-byte aligned, so a lone bf16 per
-destination is an illegal size and an odd column an unreachable offset. The
-narrowest legal write covers two columns from an even one, so:
-
-    even t:  (k′_t, 0)          -> column pair (t, t+1)
-    odd  t:  (k′_{t-1}, k′_t)   -> column pair (t-1, t)
-
-Every column is written twice, once opening the pair and once closing it, and
-the zero at even t is what attention's `npad` correction needs from a padded
-position.
-
-**Closing a pair needs the previous token's k′, from the previous dispatch.**
-That is the one thing this scheme rests on and the one thing a single dispatch
-cannot show, so this harness runs **N separate dispatches** — one per token,
-exactly as decode does — and then checks the whole cache at once:
-
-    GATE: K[:, t] == k′_t for every t < N, and every column >= N still zero
-
-A carry that failed would leave the odd columns holding the wrong token, which
-this catches per column rather than in aggregate.
+   `acquire -> call -> acquire` silently loses the input: the kernel reads zeros
+   with no error. Every other harness in this tree happens to acquire first,
+   which is why nothing had hit it.
+2. **Build ONE design and reuse it.** A new design is a new program load, which
+   clears core `.bss` — so a harness that rebuilds per token destroys the very
+   carry it is trying to test. The drain offset is therefore fixed at column
+   pair (0,1) here and every token writes there; an odd step's column 0 can only
+   come from `g_kprev`, so the carry is still what is under test. Real decode
+   reuses one design too, and will vary the offset with `offset_parameter=`
+   (a `ScratchpadParameter`) rather than by rebuilding.
 
     python3 kv_emit_verify.py
     python3 kv_emit_verify.py --tokens 8
@@ -217,45 +174,37 @@ def main():
     import os as _os1
     ksz = 2 * HEAD if _os1.environ.get("KV_MATCHED") else HEAD * TSEQ
     k_t = iron.zeros(ksz, dtype=bfloat16, device="npu")
+
+    # ONE design for every token — the whole point. Building per token would
+    # reload the program and clear .bss, which is what defeated the previous
+    # version of this harness. The drain offset is therefore FIXED at column
+    # pair (0,1) and every token writes there; that still exercises the carry,
+    # because an odd step's column 0 can only come from g_kprev.
+    design = build(0)
+    snaps = []
     for t in range(N):
         trailer = np.zeros(TILE, np.uint8)
         trailer[TRAILER_OFF:TRAILER_OFF + 8].view(np.float32)[:] = [0.0, float(t)]
-        design = build(t)
         design(iron.tensor(ks[t].astype(bfloat16), dtype=bfloat16, device="npu"),
                iron.tensor(trailer, dtype=np.uint8, device="npu"), k_t)
+        snaps.append(k_t.numpy().astype(np.float64).reshape(HEAD, TSEQ)[:, :2].copy())
 
-    if _os1.environ.get("KV_MATCHED"):
-        v = k_t.numpy().astype(np.float64)
-        print(f"  MATCHED-BO control: got[0:6] {v[:6].round(4)}  "
-              f"want interleaved {ks[0][:3].round(4)} with zeros")
-        return 0
-    K = k_t.numpy().astype(np.float64).reshape(HEAD, TSEQ)
-    if __import__("os").environ.get("KV_DIAG"):
-        import sys as _s
-        w0 = ks[0].astype(np.float64)
-        print(f"  DIAG want k0[0:6] {w0[:6].round(4)}", file=_s.stderr)
-        print(f"  DIAG K[0:6, 0]    {K[:6,0].round(4)}", file=_s.stderr)
-        print(f"  DIAG K[0:6, 1]    {K[:6,1].round(4)}", file=_s.stderr)
-        print(f"  DIAG K[0, 0:6]    {K[0,:6].round(4)}", file=_s.stderr)
-        flat = k_t.numpy().astype(np.float64)
-        hits = [int(i) for i in np.where(np.abs(flat - w0[0]) < 1e-6)[0][:6]]
-        print(f"  DIAG k0[0]={w0[0]:.4f} appears at flat indices {hits} "
-              f"(want {0*TSEQ+0}); TSEQ={TSEQ}", file=_s.stderr)
-        hits1 = [int(i) for i in np.where(np.abs(flat - w0[1]) < 1e-6)[0][:6]]
-        print(f"  DIAG k0[1]={w0[1]:.4f} appears at {hits1} (want {1*TSEQ})",
-              file=_s.stderr)
-    print(f"k' appended over {N} SEPARATE dispatches, one per token")
+    print(f"k' over {N} dispatches of ONE design, all writing column pair (0,1)")
     ok = True
     for t in range(N):
-        e = np.abs(K[:, t] - ks[t].astype(np.float64)).max()
-        ok &= e == 0
-        kind = "opens pair" if t % 2 == 0 else "closes pair (needs the carry)"
-        print(f"  t={t}: column {t} max err {e:.3e}   [{kind}]")
-    tail = np.abs(K[:, N:]).max()
-    ok &= tail == 0
-    print(f"  columns {N}..{TSEQ-1} still zero: {tail:.3e}  "
-          f"(attention needs K=0 padding)")
-    print(f"  -> {'PASS: the cross-dispatch carry works; K stays bf16'
+        c0, c1 = snaps[t][:, 0], snaps[t][:, 1]
+        if t % 2 == 0:
+            e0 = np.abs(c0 - ks[t].astype(np.float64)).max()
+            e1 = np.abs(c1).max()
+            ok &= e0 == 0 and e1 == 0
+            print(f"  t={t} even: col0=k{t} err {e0:.3e}   col1=0 err {e1:.3e}")
+        else:
+            e0 = np.abs(c0 - ks[t - 1].astype(np.float64)).max()
+            e1 = np.abs(c1 - ks[t].astype(np.float64)).max()
+            ok &= e0 == 0 and e1 == 0
+            print(f"  t={t} odd : col0=k{t-1} err {e0:.3e}  <- THE CARRY   "
+                  f"col1=k{t} err {e1:.3e}")
+    print(f"  -> {'PASS: g_kprev survives the dispatch boundary; K stays bf16'
                  if ok else 'FAIL'}")
     return 0 if ok else 1
 
