@@ -9664,3 +9664,33 @@ Caveats worth keeping:
     for this;
   * 59.7 vs 59.86 is inside the measurement noise established earlier, so the
     honest claim is a tie, not a win or a loss.
+
+### Retraction: the 59.7 tok/s figure mixed two builds
+
+Measured dispatch A on the current tree:
+
+    chain (NROWS=8, P1+P2+P3+P4) wall   638.9 µs   median of 3
+
+Last tick I combined **A = 172 µs** with **B = 685.9 µs** to get 59.7 tok/s and
+called the two-dispatch route a tie with FLM. That is retracted. The 172 µs was
+measured at **NROWS=16**, before the operand change; the chain is now NROWS=8.
+Two different builds, and they do not compose.
+
+On a consistent footing:
+
+    A (P1..P4, NROWS=8)        638.9 µs   measured
+    B (P5 alone)              ~290.6 µs   scaled from ffn_chain's byte share
+    layer                      929.5 µs
+    token 17.90 ms  ->  **55.9 tok/s**   against FLM's 59.86
+
+So the original ~55 was closer than the correction. **Both figures were wrong for
+different reasons** — the first double-counted dispatch overhead, the second
+mixed NROWS=8 and NROWS=16 measurements — and they happened to land either side
+of the truth.
+
+The lesson is narrow and I keep relearning it: **a number measured under one
+configuration cannot be composed with one measured under another**, and this tree
+has changed configuration three times (NROWS 16→8, KVPER 2→1, operand derived).
+Every figure carried forward from before those changes needs re-measuring, not
+reusing. The remaining unmeasured piece is P5 as its own dispatch; ~290 µs is
+scaled, not measured.
