@@ -98,7 +98,10 @@ def _design(act: In, {params}):
     # One activation fifo per consumer. FLM broadcasts a single memtile channel
     # to 17 consumers; IRON expresses the same sharing as one producer handle
     # with many consumer handles.
-    f_act = ObjectFifo(act_ty, name="act")
+    # depth=1: the activation is acquired ONCE and held for the whole tile
+    # loop, so a second buffer has nothing to overlap with and is dead L1.
+    # At K=8192 that is 16384 B — the difference between 2 and 4 rows/tile.
+    f_act = ObjectFifo(act_ty, depth=1, name="act")
     act_cons = [f_act.cons() for _ in range({ncores})]
 
     # One shim stream per pair, split in a memtile into the pair's two cores.

@@ -81,7 +81,11 @@ def flm_gemv(act: In, w: In, out: Out, *, K: CompileTime[int] = 2048,
         compile_flags=[f"-DDIM_K={K}", f"-DDIM_NROWS={NROWS}"],
     )
 
-    f_act = ObjectFifo(act_ty, name="act")
+    # depth=1: the activation is acquired ONCE and held for the whole tile
+    # loop, so there is nothing for a second buffer to overlap with — it is
+    # dead weight in L1. At K=8192 that is 16384 B, which is the difference
+    # between 2 and 4 rows per weight tile for down_proj.
+    f_act = ObjectFifo(act_ty, depth=1, name="act")
     f_w = ObjectFifo(wt_ty, name="wt")
     f_o = ObjectFifo(o_ty, name="out")
 
@@ -99,12 +103,13 @@ def flm_gemv(act: In, w: In, out: Out, *, K: CompileTime[int] = 2048,
             w_cons.release(1)
         a_cons.release(1)
 
-    # IRON's default worker stack is 1024 B. The kernel keeps a per-block
-    # activation-sum array plus vector spills on the stack, and overflowing it
-    # fails silently -- the symptom is NaN in the first output rows and
-    # plausible-magnitude garbage in the rest.
+    # IRON's default worker stack is 1024 B and overflowing it fails silently
+    # (NaN in the first output rows, plausible garbage in the rest). 4096 is
+    # ample now that the activation block-sums are a file-scope static rather
+    # than a stack array -- and the stack counts against the same 64 KB as the
+    # buffers, which is what pushed K=8192 at 4 rows/tile over the limit.
     worker = Worker(core, fn_args=[f_act.cons(), f_w.cons(), f_o.prod(), kern, prep],
-                    stack_size=8192)
+                    stack_size=4096)
 
     def sequence(a, wbuf, obuf, ah, wh, oh):
         ah.fill(a)

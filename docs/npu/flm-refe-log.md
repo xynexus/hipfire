@@ -4724,3 +4724,61 @@ errors are 0.89% and ~0.4%. The harness now reports **elementwise relative
 error** over elements above 5% of peak, plus a best-fit-gain decomposition that
 separates a systematic scale error from elementwise noise. Use that shape for
 any future operator check.
+
+## 2026-07-31 — down_proj is the slow phase, and the rows-per-tile trade FLIPS with K
+
+Two results while the fused-layer design was being worked out.
+
+### The activation fifo does not need double buffering
+
+It is acquired **once** and held for the whole tile loop, so a second buffer has
+nothing to overlap with — it is dead L1. `ObjectFifo(act_ty, depth=1, ...)`.
+At K=8192 that frees **16384 B**, and dropping the worker stack from 8192 to
+4096 (ample now that the block-sums are a file-scope static rather than a stack
+array) frees another 4096. Together they take K=8192 from a hard 2-rows-per-tile
+limit to 4:
+
+| K=8192 | wtile x2 | + act | + stack | total |
+|---|---|---|---|---|
+| 2 rows, act depth 2, stack 8192 | 20480 | 32768 | 8192 | 61440 |
+| 4 rows, act depth 2 | 40960 | 32768 | — | **73728 over** |
+| 4 rows, act depth 1, stack 4096 | 40960 | 16384 | 4096 | **61440 fits** |
+
+The stack counts against the same 64 KB as the buffers — forgetting it is what
+made the first 4-row attempt fail after the arithmetic said it would fit.
+
+### But 4 rows is SLOWER, and that inverts the K=2048 result
+
+down_proj shape, K=8192, 16 cores, 10.5 MB (the real down_proj size), both
+correctness-checked at 1.16e-06:
+
+| rows/tile | wtile | banks | GB/s |
+|---|---|---|---|
+| **2** | 10240 | fits one | **28.4** |
+| 4 | 20480 | straddles two | 26.3 |
+
+At K=2048 the *straddling* 16-row tile beat the bank-clean 12-row tile (48.1 vs
+44.8) because row amortisation dominated. At K=8192 the direction **reverses**.
+The mechanism is bank pressure: the activation at K=8192 is 16384 B = **exactly
+one full bank**, and it is read on every iteration, so a weight tile that
+straddles banks now collides with it far more often than at K=2048 where the
+activation is a quarter of a bank. **The rows-per-tile optimum is not a constant
+— it depends on how much of a bank the activation occupies**, which is set by K.
+
+So: keep depth=1 (it is strictly better on capacity and costs nothing), but keep
+**2 rows/tile at K=8192**.
+
+### down_proj is the FFN's slow phase
+
+| phase | MB | GB/s | wall |
+|---|---|---|---|
+| gate + up fused | 21.0 | 41.4 | 507 us |
+| down_proj | 10.5 | **28.4** | 370 us |
+
+down_proj moves **half** the bytes of gate+up but takes **73%** of the time, at
+**58%** of the plain GEMV's 48.6 GB/s. The cause is geometric, not arithmetic:
+K=8192 forces a tiny weight tile because the activation is 8x larger. Any fused
+layer design should treat down_proj as the phase to optimise, and the obvious
+lever is the one still untried — put that 16 KB activation in **neighbour
+memory** instead of every core's L1, which would free the whole budget for
+weights.
