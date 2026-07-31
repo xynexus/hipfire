@@ -6652,3 +6652,35 @@ two forms are cheap to keep apart.
 Both harnesses pass again, and `stack_audit.py` is unchanged at a worst 1088 B.
 Program memory for cores 0–7 goes 12,832 → ~13,904 B, **85% of 16 KB**, still
 inside the budget §1.5b records.
+
+## 2026-07-31 — P1 routing harness written; first emit exact, the rest garbage
+
+`tools/npu/flm/p1_route.py` — phase P1 with its 48 heads routed from one result
+fifo to three destinations, using `flm_p1_emit` and per-pair drains. It runs but
+does not verify, and the symptom is worth recording because it is narrow:
+
+    pair0 q slot 0  (core 0, emit 1)   head 0   err 0.000e+00
+    pair0 q slot 1  (core 1, emit 1)   garbage
+    pair0 q slot 2  (core 0, emit 2)   garbage
+    pair0 q slot 3  (core 1, emit 2)   garbage
+
+**The first object of the result stream is exact and everything after it is
+not** — not per-core, not per-head-type, not the arithmetic (which is
+`qkv_verify.py`'s and exact at these shapes).
+
+One real bug found and fixed on the way, which was *not* the cause: the emit
+acquired its own weight tile, a **fifth per head against the four packed**, so
+the weight stream desynchronised after the first head. It now reuses the head's
+last tile — `row_base` is `h*HEAD + 48`, so `row_base/HEAD` is still `h`. The
+result did not change, which is how I know the remaining fault is downstream.
+
+**The head assignment is worth keeping regardless.** Core `c` takes heads
+`{c, c+16, c+32}`, so every core holds two q heads and one k-or-v head and each
+emit step is type-homogeneous across all 16 cores — steps 0 and 1 all q, step 2
+k on cores 0–7 and v on cores 8–15. The natural `{3c, 3c+1, 3c+2}` assignment
+puts q and k in the same emit step for the core straddling head 32, and **a
+drain cannot split a step**, so the routing would not be expressible at all.
+
+Still to exclude: the three-way drain split against a **`join`ed pair fifo**
+(every earlier routing probe drained a fifo fed by a single core), and the
+result object being `2*HEAD` where `qkv_verify` uses `HEAD`.
