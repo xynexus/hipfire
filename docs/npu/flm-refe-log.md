@@ -6253,3 +6253,57 @@ does not for `g_resid`, with no difference visible in the symbols, the
 relocations, the row arithmetic, or the phase order. That is the whole of what is
 known. The control path passes exactly and is what the layer will use until this
 is understood; `resid_chain.py --aux-residual` keeps it checkable.
+
+## 2026-07-31 — the KV append hits two DMA rules; §1.4's k′ path needs a decision
+
+`tools/npu/flm/kv_append_probe.py`. Before writing the P1→P2→P3 harness, the one
+primitive it needs: can a `drain` scatter a new k′ into the **channel-major** K
+cache? Attention wants K as `[HEAD][TSEQ]` so scores accumulate across `d` with
+no horizontal reduce, which makes appending one token a stride-32 scatter of 64
+bf16.
+
+**With a bf16 cache it is not expressible.** Two independent rules:
+
+```
+sizes:   'aie.dma_bd' op Transfer sizes must be multiples of 4 bytes.
+         1 elements at 2 bytes each equal 2 bytes, which is not divisible by 4
+offsets: 'aie.dma_bd' op Offset must be aligned to 4 byte boundary
+```
+
+A bf16 is 2 bytes, so **one value per destination is an illegal size** and **an
+odd column is an illegal offset**. The narrowest legal channel-major bf16 write
+covers two columns starting at an even one — measured working, ramp-checked
+element by element — and a decode step produces one token.
+
+v′ is unaffected: it is a contiguous 64-element write.
+
+### Options, with the traffic each costs
+
+| | K tile | tiles per 20544 B operand object | KV MB/layer at S=2048 |
+|---|---|---|---|
+| bf16 K (today) | 4096 B | **2** | **5.26** |
+| f32 K | 8192 B | 1 | **10.52** |
+
+- **f32 K — proven.** One element is 4 bytes, so the single-token scatter is
+  legal at every position including odd ones; the probe passes at t=0..3 with
+  the untouched columns still exactly zero (which attention needs, since its
+  `npad` correction assumes padded positions hold K=0). It **doubles** the KV
+  traffic: the K tile no longer shares an operand object with V, so padding goes
+  from 20% to 40% and S=2048 goes 5.26 → 10.52 MB/layer, +14% of a 38 MB layer.
+  On the measured projection that costs ~2.3 ms/token, roughly 54 → 48 tok/s.
+- **Paired append — cheapest, and untested.** Keep bf16 and write two columns at
+  an even offset: at even `t` emit `(k′_t, 0)`, at odd `t` emit `(k′_{t-1},
+  k′_t)` at offset `t−1`. Costs nothing in traffic and keeps K=0 padding for
+  free at even steps. It requires the emitting core to still hold `k′_{t-1}`
+  **from the previous dispatch**, i.e. that core-static data survives between
+  dispatches while the xclbin stays loaded. That is plausible and unverified,
+  and it is the next thing to measure.
+- **Position-major K** — makes the append contiguous and destroys the property
+  the attention kernel is built on (`aie::load_v<TSEQ>(kt + d*TSEQ)` needs 32
+  consecutive positions for one channel). Not pursued.
+- **Transform in a core or memtile** — what FLM does, per
+  `flm-attn-dataflow.md`. Not investigated here.
+
+The probe is left checking the **f32** path, since that is the one proven to
+work; the bf16 constraints are recorded in its docstring so the next attempt
+does not rediscover them.
