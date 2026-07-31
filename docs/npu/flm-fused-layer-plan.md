@@ -115,6 +115,26 @@ Two structural notes:
 
 Live sets never exceed the static union. Note what makes this fit: **K-chunked `down_proj`**, which keeps the broadcast at 4096 B of activation instead of 16384 B, and **alternating acquires** for gate/up, which keeps the operand object at one tile instead of two. Neither is an optimisation — both are load-bearing.
 
+### 1.5b PROGRAM memory per core — 12,832 of 16,384 B (measured 2026-07-31)
+
+This section did not exist and the design did not fit without it. A core tile has **16 KB of instruction memory** as well as 64 KB of data, and a Worker is one program per core, so **every phase's code is resident at once**.
+
+| kernel | .text B | phase |
+|---|---|---|
+| `flm_q4_1_tile` (shared, folded once) | ~1,000 | P1, P3, P4, P5 |
+| `flm_gemv_qkv` + `flm_qkv_emit` | 1,888 | P1 |
+| `flm_gemv_residual` | 1,920 | P3 |
+| `flm_gemv_gate` + `flm_gemv_up_swiglu` | 4,000 | P4 |
+| `flm_gemv_acc` + `flm_gemv_flush` | 5,008 | P5 |
+| `flm_norm_prepare` + `flm_asum_prepare` | 1,504 | P1/P4, P3/P5 |
+| `flm_attn_{decode,begin,finish}` | 2,576 | P2, **cores 0–7 only** |
+| **linked total, cores 0–7** | **12,832** | **78%** |
+| linked total, cores 8–15 | 10,256 | 63% |
+
+**`flm_q4_1_tile` must stay `noinline`.** As an `inline` header body it is copied into all six GEMV entry points with nothing for the linker to fold, and the same set measures **16,896 B = 103% of 16 KB** — the fused layer does not fit at all. One word recovers 4.4 KB at no throughput cost (49.3 → 49.0 GB/s, within noise). See `flm-refe-log.md`, 2026-07-31.
+
+The remaining 3.5 KB has to cover the worker's own control flow and the IRON glue for five phases, so it is headroom, not slack. **Any new per-phase kernel must be counted against it**, and shared kernel bodies should be `noinline` by default.
+
 ### 1.6 Shim / memtile
 
 | | used | of |
