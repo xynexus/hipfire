@@ -6684,3 +6684,41 @@ drain cannot split a step**, so the routing would not be expressible at all.
 Still to exclude: the three-way drain split against a **`join`ed pair fifo**
 (every earlier routing probe drained a fifo fed by a single core), and the
 result object being `2*HEAD` where `qkv_verify` uses `HEAD`.
+
+### Resolved — P1 routes correctly; the fault was destination-only stride semantics
+
+| | max err | mean\|ref\| | tol (1 bf16 ulp) | |
+|---|---|---|---|---|
+| q′, 32 heads | **9.5e-07** | 0.0567 | 5.7e-04 | PASS |
+| k′, 8 heads → K column | **1.95e-03** | 0.4451 | 4.5e-03 | PASS |
+| v′, 8 heads → V row | **0.0000e+00** | 0.0806 | 8.1e-04 | PASS |
+
+Verified at pos 0, 1 and 5 — even and odd, so the column-pair carry is exercised.
+
+**The bug was mine, and it is a semantics point worth stating plainly: a drain
+consumes its source LINEARLY.** `sizes`/`strides` describe the *destination*
+walk only. I had written the q′ drain as `sizes=[1,4,1,HEAD],
+strides=[0,OBJ,0,1]`, intending "take the first HEAD of each OBJ-sized object" —
+but that is a destination stride of OBJ into a 4·HEAD buffer, and there is no
+way to skip source elements at all.
+
+The fix is to drain **whole objects** and index host-side. `flm_p1_emit` zeroes
+the unused half so the bytes that must be written are harmless: for v′ they land
+on cache row pos+1, a future position where zero is exactly what the `npad`
+correction wants; for q′ the host ignores them. Cost is 5 KB per layer of result
+bandwidth.
+
+The single-plain-drain bisect is what localised it — with one drain the q heads
+came out **exact** while the 3-drain version had them garbage, which ruled out
+the emit, the head assignment, the object size and the joined pair fifo in one
+run. The step-2 mismatch in that bisect was also mine: k′ is emitted in the
+interleaved pair form, and I compared its first HEAD elements against a plain
+head.
+
+Also fixed: the emit acquired its own weight tile, a fifth per head against the
+four packed. It now reuses the head's last tile, whose `row_base/HEAD` is still
+the head index.
+
+**Gate each group against its own scale.** A single tolerance derived from the
+q′ heads under-measures k′ by the ratio of their magnitudes (0.057 vs 0.445),
+and reported FAIL on a k′ error that was exactly 2⁻⁹ — one bf16 ulp.

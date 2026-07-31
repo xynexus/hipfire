@@ -57,7 +57,16 @@ flm_p1_emit(const uint8 *restrict wtile, bfloat16 *restrict out) {
     flm_kv_pair(g_stage, tile_flags(wtile), out);
     return;
   }
-  // q' and v': contiguous, in the first half of the object.
-  for (int i = 0; i < HEAD; i += VLANES)
+  // q' and v': the head in the first half, ZEROS in the second.
+  //
+  // The zeros are not padding for its own sake. A drain consumes its source
+  // LINEARLY — `sizes`/`strides` shape only the destination walk — so there is
+  // no way to skip the unused half on the way out. Whatever is in it gets
+  // written. For v' that lands on cache row pos+1, which is a future position:
+  // zero is exactly what attention's `npad` correction wants there, and the
+  // next token overwrites it. For q' the host simply ignores it.
+  for (int i = 0; i < HEAD; i += VLANES) {
     aie::store_v(out + i, aie::load_v<VLANES>(g_stage + i));
+    aie::store_v(out + HEAD + i, aie::zeros<bfloat16, VLANES>());
+  }
 }
