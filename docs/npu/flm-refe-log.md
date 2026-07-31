@@ -4545,3 +4545,66 @@ buffer is dead weight — that alone frees 16 KB), or hold the K=8192 activation
 - **A failed build is cached.** After the fix the run reported the *same* cache
   hash and the same failure; `rm -rf ~/.npu/cache` was needed to see the real
   error. Worth knowing before diagnosing a fix that "did nothing".
+
+## 2026-07-31 — Decode attention runs, and AIE2P's hardware exp2 is 18x worse than bf16
+
+`kernels/npu/flm_attn_decode.cc` + `tools/npu/flm/attn_verify.py`. `attn.xclbin`
+was never rebuilt; this is the missing operator, for the decode path.
+
+One GQA group per core (llama-3.2-1B: 32 query heads over 8 KV heads, ratio 4,
+head_dim 64), online softmax so the cache streams once, verified against a
+float64 numpy reference:
+
+| seq | KV streamed | max abs err | mean\|ref\| | verdict |
+|---|---|---|---|---|
+| 512 | 0.13 MB | 5.41e-04 | 0.01098 | PASS |
+| 2048 | 0.52 MB | 2.02e-04 | 0.00574 | PASS |
+
+**The operand orientations are the design, and they came straight out of the
+reverse engineering.** K is stored **channel-major** `[HEAD][TSEQ]` so scores
+accumulate *across the head dim* — each `mac` adds a whole 32-position vector and
+there is no horizontal reduce anywhere in the score path. V is **position-major**
+`[TSEQ][HEAD]` so the output accumulates across positions. The two operands want
+opposite layouts, which is exactly why FLM does the KV layout transform in the
+memtile DMA rather than in a core.
+
+The 1/sqrt(head_dim) and log2(e) factors are folded into Q on the host, so the
+softmax exponential is a bare hardware `exp2` on an accumulator with no
+pre-multiply.
+
+### The accuracy floor is the hardware exp2, not bf16
+
+The first run missed a 2% tolerance at 4.9% relative error. It was not the
+kernel. Measured directly — a probe that exp2s a known ramp and compares against
+numpy:
+
+| | value |
+|---|---|
+| AIE2P hardware `exp2`, max rel err over x in [-8,0] | **5.86%** |
+| mean rel err | **3.54%** |
+| bf16 rounding alone would be | 0.20% |
+
+**The NLF unit is a coarse piecewise approximation, ~18x worse than the format
+it returns.** Softmax probabilities inherit that directly, and an attention
+output is a probability-weighted average, so it passes through undiminished.
+Corroboration that this is known behaviour and not a misuse: the existing
+`silu_mul_bf16` deliberately uses scalar F32 sigmoid on AIE2P rather than the
+vector NLF, with a comment about matching the PyTorch BF16 reference.
+
+**Consequence for phase 3b (KVarN).** That phase plans to quantize K/V and
+measure the accuracy cost. This says a **3.5% softmax error is already present
+before any KV quantization**, so a KVarN ablation measured on this attention path
+would be reading its own noise floor unless the exponential is fixed first.
+Fixing it means range reduction plus a polynomial for the fractional part
+instead of the NLF, and that cost has not been measured.
+
+### Two traps, one of them for the second time
+
+- **One entry point per translation unit.** Three `ExternalFunction`s on one
+  source file link it three times: `duplicate symbol: flm_attn_finish`. This is
+  the *same* trap that hit `flm_asum_prepare` earlier the same day — it is now
+  split into `flm_attn_decode.cc` (state + tile), `flm_attn_begin.cc` and
+  `flm_attn_finish.cc`, sharing the softmax state by `extern`.
+- **No scalar libm on the core**: `__builtin_exp2f` fails to link with
+  `undefined symbol: exp2f`. The rescale factor goes through the same vector
+  `exp2` with one lane extracted.
