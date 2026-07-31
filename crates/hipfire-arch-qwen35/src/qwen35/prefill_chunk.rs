@@ -3897,7 +3897,15 @@ pub(crate) fn forward_prefill_chunk(
                             && matches!(layer.wv.gpu_dtype, DType::Oq4G256),
                         "FA qkv Oq4 dispatch requires all of wq/wk/wv to be Oq4G256",
                     );
-                    if n >= 64 {
+                    // A4 int4-act gate: HIPFIRE_OQ4_PREFILL_ACT_BITS=4 forces TRUE
+                    // W4A4 (int4 activations) on qkv even at n>=64, where the default
+                    // routes to W4A8-MMQ. qkv@n>=64 is the ONLY non-W4A4 site in oq4
+                    // prefill (gate_up/o/down are already W4A4), so this makes a
+                    // fully-W4A4 scored prefill reachable for the A4 KLD gate. Default
+                    // (unset) keeps W4A8-MMQ, the shipped incumbent. See plan doc §9a.
+                    let force_a4 =
+                        std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").as_deref() == Ok("4");
+                    if n >= 64 && !force_a4 {
                         gpu.gemm_oq4_qkv_mmq(
                             &layer.wq.buf,
                             &layer.wk.buf,
