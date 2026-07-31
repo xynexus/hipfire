@@ -181,9 +181,14 @@ def build(pos, ncores=NCORES):
     w_all_ty = np.ndarray[(2 * hpc * TPH * wt,), np.dtype[np.uint8]]
     import os as _os
     SINGLE = 1 if _os.environ.get("P1_SINGLE") else 0
-    # whole pair stream when bisecting: HPC steps x 2 cores x OBJ
-    q_ty = (np.ndarray[(hpc * 2 * OBJ,), np.dtype[bfloat16]] if SINGLE
-            else np.ndarray[(4 * OBJ,), np.dtype[bfloat16]])
+    # whole pair stream when bisecting: hpc steps x 2 cores x OBJ
+    # ONE type per pair, not one for all: at 12 cores pairs 0-3 emit 4 q
+    # objects and pairs 4-5 emit 8, because the KV-carrying cores spend two of
+    # their four slots on k and v. A single q_ty can only describe a uniform
+    # split and would silently size the later pairs wrong.
+    q_tys = [(np.ndarray[(hpc * 2 * OBJ,), np.dtype[bfloat16]] if SINGLE
+              else np.ndarray[(qobj[i] * OBJ,), np.dtype[bfloat16]])
+             for i in range(npairs)]
     # ONE cache buffer, 8 KV heads of [K tile][V tile] — the shape P2's operand
     # objects are cut from. K for KV head g comes from core g (pairs 0-3) and V
     # from core g+8 (pairs 4-7), so the two halves of a head are written by
@@ -292,7 +297,7 @@ def _design(bc: In, {params}):
         tg.finish()
 
     arg_types = [bc_ty] + [w_all_ty] * {npairs}
-    arg_types += [q_ty] * {npairs} + [kv_ty] * {npairs}
+    arg_types += list(q_tys) + [kv_ty] * {npairs}
     arg_types += [f_bc.prod(tile=AnyShimTile)]
     arg_types += [f.prod(tile=AnyShimTile) for f in f_w]
     arg_types += [f.cons(tile=AnyShimTile) for f in f_o]
@@ -305,7 +310,7 @@ def _design(bc: In, {params}):
               ExternalFunction=ExternalFunction, QKV_SRC=QKV_SRC,
               EMIT_SRC=EMIT_SRC, NORM_SRC=NORM_SRC, FLAGS=flags, bc_ty=bc_ty,
               wt_ty=wt_ty, o_ty=o_ty, wpair_ty=wpair_ty, opair_ty=opair_ty,
-              w_all_ty=w_all_ty, q_ty=q_ty, kv_ty=kv_ty, SINGLE=SINGLE,
+              w_all_ty=w_all_ty, q_tys=q_tys, kv_ty=kv_ty, SINGLE=SINGLE,
               __name__="flm_p1_route")
     exec(src, ns)
     return iron.jit(ns["_design"], source_files=[QKV_SRC, EMIT_SRC, NORM_SRC],
@@ -317,11 +322,19 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--pos", type=int, default=0, help="KV cache position")
+    p.add_argument("--p1-cores", type=int, default=NCORES,
+                   help="how many cores run P1. Partition B uses 12: the four\n"
+                        "attention cores sit P1 out, so its 48 head-tiles spread\n"
+                        "over the remaining twelve.")
     p.add_argument("--bench", action="store_true",
                    help="time P1 alone, so P2's in-chain marginal can be\n"
                         "isolated against p1p2_chain --bench")
     o = p.parse_args()
-    npairs = NCORES // 2
+    ncores = o.p1_cores
+    npairs = ncores // 2
+    hpc = hpc_for(ncores)
+    layout = head_layout(ncores)
+    qobj, _kvplan = drain_plan(ncores)
     KTILE = HEAD * TSEQ
 
     c = q4nx.Q4nx(str(Q4NX))
@@ -332,7 +345,7 @@ def main():
     cs_k = rnd(np.concatenate([np.cos(ang), np.sin(ang)]))
     cs_q = rnd(cs_k * (HEAD ** -0.5) * np.log2(np.e))
 
-    design, wt = build(o.pos)
+    design, wt = build(o.pos, ncores)
 
     rng = np.random.default_rng(0)
     x = rnd(rng.standard_normal(K_DIM) * 0.05)
@@ -346,14 +359,14 @@ def main():
     inv = np.float32(1.0 / np.sqrt((xd * xd).mean() + EPS))
     xn = rnd(rnd(x * rnd(inv)) * nw)
 
-    # weights: core c owns heads {c, c+16, c+32}, in emit order
+    # weights: whatever head_layout gives this core, in emit order
     w_ts, ref = [], {}
     for pr in range(npairs):
         per = []
         for j in range(2):
             cix = 2 * pr + j
             blob = []
-            for h in heads_of(cix):
+            for h in layout[cix]:
                 first = h * HEAD
                 d, m, q = qkv_rows(c, o.layer, first, HEAD)
                 blob.append(np.concatenate([
@@ -371,46 +384,54 @@ def main():
                     v = rope_ref(v, cs_k)
                 ref[h] = rnd(v).astype(np.float64)
             per.append(np.concatenate(blob))
-        b = np.empty((HPC * TPH, 2, wt), np.uint8)
+        b = np.empty((hpc * TPH, 2, wt), np.uint8)
         b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
         w_ts.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
 
     bc_t = iron.tensor(bc.astype(bfloat16), dtype=bfloat16, device="npu")
     import os as _os2
     SINGLE = bool(_os2.environ.get("P1_SINGLE"))
-    qsz = HPC * 2 * 2 * HEAD if SINGLE else 4 * 2 * HEAD
-    q_ts = [iron.zeros(qsz, dtype=bfloat16, device="npu") for _ in range(npairs)]
+    # per pair: SINGLE drains the whole stream, otherwise just its q
+    # objects — and at 12 cores pairs 4-5 carry twice as many as 0-3.
+    qsz = [hpc * 2 * 2 * HEAD if SINGLE else qobj[pr] * 2 * HEAD
+           for pr in range(npairs)]
+    q_ts = [iron.zeros(qsz[pr], dtype=bfloat16, device="npu")
+            for pr in range(npairs)]
     KVSTRIDE = KTILE + TSEQ * HEAD
     cache = iron.zeros(8 * KVSTRIDE, dtype=bfloat16, device="npu")
     kv_ts = [cache] * npairs          # every pair drains into the same buffer
     if o.bench:
         _b = run_iters(design, bc_t, *w_ts, *q_ts, *kv_ts, warmup=2, iters=10)
         _us = _b.npu.min_us if _b.npu else _b.e2e.min_us
-        _mb = NCORES // 2 * 2 * HPC * TPH * q4nx.tile_bytes(K_DIM, NROWS) / 1e6
+        _mb = npairs * 2 * hpc * TPH * q4nx.tile_bytes(K_DIM, NROWS) / 1e6
         print(f"  bench: {_mb:.2f} MB  {_mb*1e3/_us:.1f} GB/s  {_us:.1f} us "
               f"(marginal {_us - 92.9:.1f})")
     else:
         design(bc_t, *w_ts, *q_ts, *kv_ts)
     cv = cache.numpy().astype(np.float64).reshape(8, KVSTRIDE)
 
-    print(f"P1 routed to three destinations: {NCORES} cores, layer {o.layer}, "
+    print(f"P1 routed to three destinations: {ncores} cores, layer {o.layer}, "
           f"pos {o.pos}")
     ok, worst, scale = True, 0.0, 0.0
     if SINGLE:
         # the pair stream is [step][core][OBJ]; head h of core j at step t
         print("  BISECT: one plain drain of the whole pair stream")
         for pr in range(1):
-            v = q_ts[pr].numpy().astype(np.float64).reshape(HPC, 2, 2 * HEAD)
-            for t in range(HPC):
+            v = q_ts[pr].numpy().astype(np.float64).reshape(hpc, 2, 2 * HEAD)
+            for t in range(hpc):
                 for j in range(2):
-                    h = heads_of(2 * pr + j)[t]
+                    h = layout[2 * pr + j][t]
                     e = np.abs(v[t, j, :HEAD] - ref[h]).max()
                     print(f"    step {t} core {j}: head {h} err {e:.4e}")
         return 0
-    # q': pair pr emits heads 2pr, 2pr+1 (step 0) then 2pr+16, 2pr+17 (step 1)
+    # q': the pair stream is [slot][core], so a pair's q heads are its cores'
+    # q slots interleaved. Read from the layout rather than restated, or the
+    # check silently follows a different assignment than the device.
     for pr in range(npairs):
-        got = q_ts[pr].numpy().astype(np.float64).reshape(4, 2 * HEAD)[:, :HEAD]
-        want = [2 * pr, 2 * pr + 1, 2 * pr + 16, 2 * pr + 17]
+        got = (q_ts[pr].numpy().astype(np.float64)
+               .reshape(qobj[pr], 2 * HEAD)[:, :HEAD])
+        want = [layout[2 * pr + j][sl]
+                for sl in range(qobj[pr] // 2) for j in (0, 1)]
         for slot, h in enumerate(want):
             e = np.abs(got[slot] - ref[h]).max()
             worst = max(worst, e); scale = max(scale, np.abs(ref[h]).mean())

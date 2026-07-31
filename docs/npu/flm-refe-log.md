@@ -8448,3 +8448,47 @@ What remains for a 12-core P1 run: the **host** side still packs the weight
 stream and unpacks the results through `HPC` and the 16-core `heads_of`
 (`p1_route.py` lines 374-403), and there is no `--p1-cores` flag yet. The device
 side is done.
+
+## 2026-08-01 — P1 runs on 12 cores, and the partition is nearly free
+
+`p1_route.py --p1-cores 12` **passes**, with error figures identical to 16 cores:
+q′ 9.5367e-07, k′ one bf16 ulp, v′ 0.0. Partition B's P1 works.
+
+The host side needed four things beyond the layout and drain plan:
+
+  * the packing loop reads `layout[core]` instead of the stride rule;
+  * the weight buffer shape follows `hpc`;
+  * **per-pair result types.** A single `q_ty` can only describe a uniform
+    split; at 12 cores pairs 0–3 emit 4 q objects and pairs 4–5 emit 8, because
+    the KV-carrying cores spend two of their four slots on k and v. This
+    surfaced as `Tensor argument 'q4' has 1024 elements but the kernel was
+    compiled for 512`;
+  * the q verification reads its expected heads from the layout rather than
+    restating `[2pr, 2pr+1, 2pr+16, 2pr+17]`, which is the 16-core rule written
+    out — a check that restates the assignment cannot catch the assignment being
+    wrong.
+
+### The cost is not what linear scaling says
+
+    P1 on 16 cores: median 54.9 µs   range 48.3–59.2
+    P1 on 12 cores: median 57.0 µs   range 55.1–67.4    +2.1 µs (+4%)
+    linear scaling predicted 73.2 µs, i.e. +18.3 µs (+33%)
+
+**P1 streams the same 1.00 MB of qkv weights whatever the core count.** It is
+fabric-bound, not core-bound, so spreading it over fewer cores does not create
+work — each core simply takes four head-tiles instead of three. The ranges
+overlap, so +2.1 µs is an upper bound rather than a measurement.
+
+| | token | tok/s | margin |
+|---|---|---|---|
+| P1 on 16 (does not fit) | 15.43 ms | 64.8 | +8.2% |
+| P1 on 12, linear guess | 15.73 ms | 63.6 | +6.2% |
+| **P1 on 12, measured** | **15.47 ms** | **64.7** | **+8.0%** |
+
+**Partition B costs essentially nothing** — 64.7 against 64.8 tok/s for a
+configuration that cannot be built. I had priced it at 63.3 by assuming
+`phase_time × 16/12`, the same divide-a-joint-cost reflex that has now been wrong
+four times here. Displacement cost depends on whether a phase is bound by cores
+or by bandwidth, and P1 is the second.
+
+Regression: `p1_route` at 16 cores and `p1p2_chain` at NATT=4 both unchanged.
