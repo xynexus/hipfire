@@ -1,35 +1,15 @@
 #!/usr/bin/env python3
 """Decode attention as phase P2 of the fused layer — 8 cores, one dispatch.
 
-**STATUS: the broadcast-q′ rewiring does not verify yet** — 8.14e-02 against a
-1.08e-03 tolerance. Before it, this harness gave each core its own packed q
-block on a split fifo and passed exactly; that shape is what `attn_verify.py`
-still exercises. The rewiring is here because q′ *cannot* ride the operand fifo
-(an object held across other traffic on one fifo does not stay valid) and each
-core must therefore find its own 4 heads inside a shared block, via the offset
-in the KV object's trailer. The kernel side is gated by `-DQOFF_FROM_KV` and
-defaults off, so nothing else is affected.
+**q′ is BROADCAST**: one object holds all 32 heads, every core sees it, and each
+takes its own 4 via an offset in the KV object's 64-byte trailer. q′ cannot ride
+the operand fifo — an object held across other traffic on one fifo does not stay
+valid — and it needs no separate fifo, since a core's two input DMA channels are
+already spent on the broadcast and the operand stream.
 
-`attn_verify.py` proves the attention arithmetic on ONE core. This runs it at
-the phase's real shape: **8 cores, one KV group each**, in the fused layer's
-paired topology (operand fifo per pair, split to two cores; result fifo per
-pair, joined). llama-3.2-1B has 8 KV heads and GQA=4, so 8 cores cover all 32
-query heads with **no broadcast of KV and no cross-core softmax merge** — each
-core's cache is private. That is why P2 runs on 8 of the 16 cores and pairs 4-7
-sit the phase out.
-
-**KV rides the same 20544 B operand object every other phase uses**, which is
-what makes one dispatch per layer legal — the topology cannot change between
-phases. A KV tile is 2 x TSEQ x HEAD bf16 = 8192 B, so a lone tile would waste
-61% of the object. Two fill 16384 of 20544: 20% waste on the KV stream, which
-at S=2048 is **+2.8% of a layer's bytes against +16.6%** for one. `DIM_KVPER=2`
-is what makes that possible; TSEQ itself cannot be doubled because the score
-vector is one 32-lane register.
-
-Padding falls out of the same mechanism `attn_verify.py` checks: whatever the
-last object is short of, K=0/V=0 supplies, and `npad` subtracts its
-`exp2(-m)` contribution in `flm_attn_finish`. Here npad covers the tail of the
-last *object*, not just the last tile.
+`AP_QOFF_ZERO=1` forces every trailer offset to 0 and **must fail**: without it
+a wrong offset would be invisible, because seven of eight cores would still be
+reading *somebody's* valid query block.
 
     python3 attn_phase.py                    # S=512
     python3 attn_phase.py --seq 2048 --bench
@@ -82,7 +62,11 @@ def build(ncores, nobj):
     # the operand fifo — an object held across other traffic on one fifo does
     # not stay valid — and it fits the layer's broadcast object as-is.
     QALL = 32 * HEAD                       # all query heads, packed here
-    q_ty = np.ndarray[(2 * (QALL + 2),), np.dtype[np.uint8]]
+    # Padded to a 64-byte multiple. 2*(QALL+2) = 4100 B is not, and this tree
+    # already records what that costs: a 20512 B tile put the second buffer of a
+    # double-buffered fifo on a 32-byte boundary and corrupted alternate objects.
+    QOBJ = ((2 * (QALL + 2) + 63) // 64) * 64
+    q_ty = np.ndarray[(QOBJ,), np.dtype[np.uint8]]
     o_ty = np.ndarray[(GQA * HEAD,), np.dtype[bfloat16]]
     opair_ty = np.ndarray[(2 * GQA * HEAD,), np.dtype[bfloat16]]
 
@@ -196,7 +180,8 @@ def main():
     # ONE q' buffer for every core: 32 heads packed, then npad
     QALL = 32 * HEAD
     npad_u16 = np.array([NPAD], np.float32).view(np.uint16)
-    qall = np.zeros(QALL + 2, np.uint16)
+    QOBJ = ((2 * (QALL + 2) + 63) // 64) * 64
+    qall = np.zeros(QOBJ // 2, np.uint16)
     for a in range(ncores):
         qall[a * GQA * HEAD:(a + 1) * GQA * HEAD] = \
             qrot[a].reshape(-1).astype(bfloat16).view(np.uint16)
@@ -222,7 +207,9 @@ def main():
         raw = inter.reshape(nobj, 2, OPERAND // 2).astype(bfloat16).view(np.uint16)
         for j in range(2):
             # trailer: this core's offset into the shared q' block
-            off = np.array([float((2 * pr + j) * GQA * HEAD)], np.float32)
+            _z = __import__("os").environ.get("AP_QOFF_ZERO")
+            off = np.array([0.0 if _z else float((2 * pr + j) * GQA * HEAD)],
+                           np.float32)
             raw[:, j, (OPERAND - 64) // 2:(OPERAND - 64) // 2 + 2] = \
                 off.view(np.uint16)
         kv_ts.append(iron.tensor(raw.reshape(-1).view(np.uint8),
@@ -258,6 +245,10 @@ def main():
             ref = (e / e.sum(1, keepdims=True)) @ Vc[c].astype(np.float64)
             worst = max(worst, np.abs(got[j] - ref).max())
             scale = max(scale, np.abs(ref).mean())
+            if __import__("os").environ.get("AP_PERCORE"):
+                import sys as _s
+                print(f"  core {c}: max err {np.abs(got[j]-ref).max():.4e}",
+                      file=_s.stderr)
 
     if us:
         print(f"  {kv_bytes/1e6:.2f} MB KV  {kv_bytes/(us*1e-6)/1e9:.1f} GB/s  "

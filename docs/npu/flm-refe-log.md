@@ -7050,3 +7050,30 @@ passing, and without a default-off flag the change would have taken
 silently altered an interface (`flm_qkv_emit`'s object size was the first), and
 both were caught by running the *existing* harnesses rather than only the new
 one.
+
+### Resolved — the broadcast q′ object was not 64-byte aligned
+
+| | max err | tol | |
+|---|---|---|---|
+| S=512 | 7.31e-04 | 1.08e-03 | PASS |
+| S=2048 | | | PASS |
+| S=500 (pad) | | | PASS |
+| S=480 (odd tile count) | | | PASS |
+| S=512, `AP_QOFF_ZERO=1` | | | **FAIL** — the control |
+
+The mechanism was right; the object was **4100 bytes**, and
+`2*(32*HEAD + 2)` is not a multiple of 64. Padding to 4160 took it from
+8.14e-02 to passing. This tree already records the same failure at a different
+size — a 20512 B weight tile put the second buffer of a double-buffered fifo on
+a 32-byte boundary and corrupted alternate objects — and the lesson did not
+transfer because the earlier note reads as being about *tiles*. It is about any
+fifo object: **round every object size up to 64 bytes.**
+
+What located it was forcing every core's trailer offset to 0. Core 0 wants
+offset 0 anyway, so it should have been exact and was not — which moved the
+fault from the per-core indexing to the delivery in one run. Without that split
+the natural read is "the offsets are wrong", and the offsets were fine.
+
+`AP_QOFF_ZERO` is kept as the control precisely because a wrong offset is nearly
+invisible otherwise: seven of eight cores would still be reading *some* valid
+query block, and only the cross-core pattern gives it away.
