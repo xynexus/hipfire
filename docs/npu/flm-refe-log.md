@@ -5631,3 +5631,64 @@ y·sin` is a difference of similar magnitudes, so it amplifies the 0.2% bf16
 step. Modelling both of the kernel's roundings (stage, then store) takes the
 error to **0.0e+00**. Exactly the reason `gemv_reference_bf16` is the gate and
 `gemv_reference` is only context.
+
+## 2026-07-31 — Task 6, part 1: attention prepared to be a phase
+
+Two changes the attention kernels needed before they can run as phase P2, plus
+the harness work to verify them. `attn_phase.py` (8 cores, KV on the operand
+fifo) is not written yet.
+
+### RoPE moved out of attention
+
+`flm_attn_begin.cc` used to rotate Q, and the comment there argued it *had* to:
+"at 16 rows per weight tile a q4_1 tile produces a quarter of a head_dim-64
+head, and RoPE needs whole heads — NROWS=64 would make the tile 81920 B, far
+past the 64 KB tile memory." The premise was right, the conclusion was wrong.
+The projection never needed a 64-row tile; it needed somewhere to put four
+16-row tiles, and 128 B of core memory is somewhere. Task 5's `flm_gemv_qkv.cc`
+does exactly that.
+
+It also *has* to move, for a reason that is not about tidiness: **k′ must be
+rotated before it is appended to the KV cache, and the cache is written by phase
+P1.** Leaving the rotation in attention would rotate q only and every cached k
+would be unrotated. So P1 now owns RoPE for both, `flm_attn_begin` is state-init
+only, and `attn_verify.py` rotates Q on the host — which is what makes it
+faithful to the pipeline rather than a shortcut.
+
+### Pad correction, and the control that proves it works
+
+The cache streams in whole TSEQ=32 tiles, so a sequence length that is not a
+multiple of 32 leaves the tail padded. K=0 gives a **zero** score, not −inf, so
+each padded position contributes `exp2(0 − m)` to the softmax denominator; V=0
+means they add nothing to the accumulator. Three lines in `flm_attn_finish.cc`
+subtract exactly that.
+
+| seq | tiles | npad | max err | tol | |
+|---|---|---|---|---|---|
+| 512 | 16 | 0 | 7.24e-04 | 8.71e-04 | PASS |
+| 2048 | 64 | 0 | 1.81e-04 | 4.63e-04 | PASS |
+| **500** | 16 | **12** | 5.35e-04 | 8.86e-04 | PASS |
+| **500, `--ignore-pad`** | 16 | 0 | **1.20e-03** | 8.86e-04 | **FAIL** |
+| 512, `--ignore-pad` | 16 | 0 | 7.24e-04 | 8.71e-04 | PASS (nothing to correct) |
+
+The last two rows are the point. A correction that did nothing would pass the
+seq=500 row just as happily; `--ignore-pad` is kept in the harness so that stays
+checkable. Tolerance is the exp2 NLF floor (3.54% mean / 5.86% max), not bf16.
+
+### `npad` cannot have its own fifo — it rides inside Q
+
+The obvious wiring gives npad an input fifo, and that is not a tight fit but a
+compile error: `tile (0,3) requires 3 input/1 output DMA channels, but only 2
+input/2 output available`. Attention already uses both inputs for Q and the KV
+stream. So npad rides in the tail of the Q buffer as one f32 in two bf16 slots,
+read through a cast (offset GQA*HEAD bf16 = 512 B, so 4-byte aligned by
+construction).
+
+f32 and not bf16 because **bf16 is exact on integers only to 256**, and the slot
+carries counts to 2047 in the fused layer.
+
+This is the third operand packed into another operand's buffer for the same
+reason — the norm weight inside the activation (`flm_norm_prepare`), cs_q/cs_k
+inside the broadcast (`flm_gemv_qkv`), now npad inside Q. On this device extra
+operands are packed, never given a fifo. Worth treating as the default move
+rather than a trick.

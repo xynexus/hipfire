@@ -61,10 +61,13 @@ ROPE_INV_FREQ = _llama3_inv_freq()
 def attn(q: In, kv: In, out: Out, *, SEQ: CompileTime[int] = 512):
     """One GQA group. K and V tiles are interleaved in one stream so the cache
     arrives as a single sequential read, which is what it is in memory."""
-    ntiles = SEQ // TSEQ
-    # [GQA*HEAD q][HEAD cs]: RoPE is applied in flm_attn_begin, and cs rides
-    # with Q because the core's 2 input DMA channels are taken by Q and KV.
-    q_ty = np.ndarray[(GQA * HEAD + HEAD,), np.dtype[bfloat16]]
+    ntiles = -(-SEQ // TSEQ)              # ceil: the tail tile is padded
+    # [GQA*HEAD q'][f32 npad]. Q arrives ALREADY ROTATED — in the fused layer
+    # phase P1 rotates both q and k, because k' has to be rotated before it is
+    # appended to the KV cache, and P1 is what writes the cache. `npad` is the
+    # padded-position count the finish epilogue subtracts from the softmax
+    # denominator; it is f32 because bf16 is exact on integers only to 256.
+    q_ty = np.ndarray[(GQA * HEAD + 2,), np.dtype[bfloat16]]
     # one tile of K (channel-major) immediately followed by one tile of V
     kv_tile_ty = np.ndarray[(2 * TSEQ * HEAD,), np.dtype[bfloat16]]
     kv_all_ty = np.ndarray[(ntiles * 2 * TSEQ * HEAD,), np.dtype[bfloat16]]
@@ -77,7 +80,7 @@ def attn(q: In, kv: In, out: Out, *, SEQ: CompileTime[int] = 512):
                               arg_types=[q_ty, kv_tile_ty],
                               compile_flags=flags)
     k_fin = ExternalFunction("flm_attn_finish", source_file=FIN_SRC,
-                             arg_types=[o_ty], compile_flags=flags)
+                             arg_types=[o_ty, q_ty], compile_flags=flags)
 
     f_q = ObjectFifo(q_ty, name="q")
     f_kv = ObjectFifo(kv_tile_ty, name="kv")
@@ -85,7 +88,7 @@ def attn(q: In, kv: In, out: Out, *, SEQ: CompileTime[int] = 512):
 
     def core(qc, kvc, op, kb, kt, kf):
         eq = qc.acquire(1)
-        kb(eq)                      # rotate Q in place, then zero the state
+        kb(eq)                      # zero the online-softmax state
         for _ in range_(ntiles):
             ekv = kvc.acquire(1)
             # one object = [K tile channel-major][V tile position-major];
@@ -93,7 +96,7 @@ def attn(q: In, kv: In, out: Out, *, SEQ: CompileTime[int] = 512):
             kt(eq, ekv)
             kvc.release(1)
         eo = op.acquire(1)
-        kf(eo)
+        kf(eo, eq)                  # npad rides in the tail of the Q buffer
         op.release(1)
         qc.release(1)
 
@@ -114,10 +117,14 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--seq", type=int, default=512, help="KV cache length")
     p.add_argument("--pos", type=int, default=1000, help="token position for RoPE")
+    p.add_argument("--ignore-pad", action="store_true",
+                   help="control: send npad=0 so the correction is a no-op. At a "
+                        "seq that is not a multiple of 32 this MUST fail, or the "
+                        "correction is not doing anything.")
     o = p.parse_args()
     SEQ = o.seq
-    if SEQ % TSEQ:
-        raise SystemExit(f"--seq must divide by {TSEQ}")
+    NTILES = -(-SEQ // TSEQ)                 # ceil — the tail tile is padded
+    NPAD = NTILES * TSEQ - SEQ
 
     rnd = lambda x: q4nx.bf16_to_f32(q4nx.f32_to_bf16(np.asarray(x, np.float32)))
     rng = np.random.default_rng(0)
@@ -126,35 +133,50 @@ def main():
     V = rnd(rng.standard_normal((SEQ, HEAD)) * 0.3)
 
     print(f"decode attention: GQA={GQA} head_dim={HEAD} seq={SEQ} "
-          f"(KV streamed {2*SEQ*HEAD*2/1e6:.2f} MB)")
+          f"({NTILES} tiles, {NPAD} padded positions; KV streamed "
+          f"{2*NTILES*TSEQ*HEAD*2/1e6:.2f} MB)")
 
-    # Fold 1/sqrt(head_dim) and log2(e) into Q so the kernel's exp2 is exact.
-    # Q is passed UNROTATED: flm_attn_begin applies RoPE in place. Rotation and
-    # the scalar scale commute, so folding the scale first is safe.
-    qs = rnd(q * (1.0 / math.sqrt(HEAD)) * math.log2(math.e))
+    # Fold 1/sqrt(head_dim) and log2(e) into Q so the kernel's exp2 is exact,
+    # then ROTATE ON THE HOST. Attention no longer rotates: in the fused layer
+    # phase P1 rotates q and k together, because k' must be rotated before it is
+    # appended to the KV cache and P1 is what writes the cache. Doing it here
+    # keeps this harness faithful to that pipeline. Rotation and the scalar
+    # scale commute, so folding the scale first is safe.
     pos_ang = o.pos * ROPE_INV_FREQ
     cs = rnd(np.concatenate([np.cos(pos_ang), np.sin(pos_ang)]))
-    qs_cs = np.concatenate([qs.reshape(-1), cs])
+    cb, sb = cs[:HEAD // 2], cs[HEAD // 2:]
+    qs = rnd(q * (1.0 / math.sqrt(HEAD)) * math.log2(math.e))
+    qrot_dev = rnd(np.concatenate(
+        [qs[:, :HEAD // 2] * cb - qs[:, HEAD // 2:] * sb,
+         qs[:, HEAD // 2:] * cb + qs[:, :HEAD // 2] * sb], axis=1))
+    # the 2 trailing bf16 slots ARE one f32 npad — the kernel reads them cast
+    q_in = np.concatenate([qrot_dev.reshape(-1).astype(bfloat16).view(np.uint16),
+                           np.array([0.0 if o.ignore_pad else NPAD],
+                                    np.float32).view(np.uint16)])
 
-    # Interleave [K tile channel-major][V tile position-major] per tile.
-    buf = np.empty((SEQ // TSEQ, 2, TSEQ * HEAD), np.float32)
-    for t in range(SEQ // TSEQ):
-        kt = K[t * TSEQ:(t + 1) * TSEQ]           # [TSEQ][HEAD]
-        buf[t, 0] = kt.T.reshape(-1)              # -> [HEAD][TSEQ]
-        buf[t, 1] = V[t * TSEQ:(t + 1) * TSEQ].reshape(-1)
+    # Interleave [K tile channel-major][V tile position-major] per tile. The
+    # tail tile is zero-padded: K=0 gives a zero score (not -inf), so each pad
+    # position adds exp2(-m) to the denominator, which flm_attn_finish subtracts
+    # using NPAD. V=0 means they contribute nothing to the accumulator.
+    Kp = np.zeros((NTILES * TSEQ, HEAD), np.float32); Kp[:SEQ] = K
+    Vp = np.zeros((NTILES * TSEQ, HEAD), np.float32); Vp[:SEQ] = V
+    buf = np.empty((NTILES, 2, TSEQ * HEAD), np.float32)
+    for t in range(NTILES):
+        buf[t, 0] = Kp[t * TSEQ:(t + 1) * TSEQ].T.reshape(-1)   # -> [HEAD][TSEQ]
+        buf[t, 1] = Vp[t * TSEQ:(t + 1) * TSEQ].reshape(-1)
     kv_flat = buf.reshape(-1)
 
-    q_t = iron.tensor(qs_cs.astype(bfloat16), dtype=bfloat16, device="npu")
+    q_t = iron.tensor(q_in.view(bfloat16), dtype=bfloat16, device="npu")
     kv_t = iron.tensor(kv_flat.astype(bfloat16), dtype=bfloat16, device="npu")
     o_t = iron.zeros(GQA * HEAD, dtype=bfloat16, device="npu")
     attn(q_t, kv_t, o_t, SEQ=SEQ)
     got = o_t.numpy().astype(np.float64).reshape(GQA, HEAD)
 
     # reference: rotate Q the same way, then plain softmax attention in float64
-    cb, sb = cs[:HEAD // 2].astype(np.float64), cs[HEAD // 2:].astype(np.float64)
+    cbd, sbd = cb.astype(np.float64), sb.astype(np.float64)
     qd = q.astype(np.float64)
-    qrot = np.concatenate([qd[:, :HEAD // 2] * cb - qd[:, HEAD // 2:] * sb,
-                           qd[:, HEAD // 2:] * cb + qd[:, :HEAD // 2] * sb], axis=1)
+    qrot = np.concatenate([qd[:, :HEAD // 2] * cbd - qd[:, HEAD // 2:] * sbd,
+                           qd[:, HEAD // 2:] * cbd + qd[:, :HEAD // 2] * sbd], axis=1)
     scores = (qrot @ K.astype(np.float64).T) / math.sqrt(HEAD)
     pmax = scores.max(1, keepdims=True)
     e = np.exp(scores - pmax)

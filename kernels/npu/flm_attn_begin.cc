@@ -58,38 +58,28 @@ extern float g_m[];
 extern float g_l[];
 extern float g_acc[];
 
-// RoPE rides here rather than in the qkv projection's epilogue. It cannot go
-// there: at 16 rows per weight tile a q4_1 tile produces a quarter of a
-// head_dim-64 head, and RoPE needs whole heads — NROWS=64 would make the tile
-// 81920 B, far past the 64 KB tile memory. `flm_attn_begin` runs **once per
-// token** and already owns this core's Q, so rotating in place here costs no
-// dispatch and no extra pass.
+// State init only — **RoPE is NOT applied here**, and this is a change.
 //
-// `qcs` is [GQA*HEAD q][HEAD cs], one buffer: the attention core already uses
-// both of its 2 input DMA channels for Q and the KV stream, so cs rides with Q
-// exactly as the norm weight rides with the activation in flm_norm_prepare.
-// cs is [cos(HEAD/2)][sin(HEAD/2)] for this token's position, and the
-// 1/sqrt(head_dim) * log2(e) softmax scale is folded into Q on the host, so
-// what is rotated here is the pre-scaled Q — rotation and scaling commute
-// because the scale is a scalar.
-extern "C" __attribute__((noinline)) void flm_attn_begin(bfloat16 *restrict qcs) {
-  aie::set_rounding(aie::rounding_mode::conv_even);
-
-  constexpr int HALFH = HEAD / 2;
-  const auto c = aie::load_v<HALFH>(qcs + GQA * HEAD);
-  const auto s = aie::load_v<HALFH>(qcs + GQA * HEAD + HALFH);
-  for (int h = 0; h < GQA; ++h) {
-    bfloat16 *q = qcs + h * HEAD;
-    const auto x = aie::load_v<HALFH>(q);
-    const auto y = aie::load_v<HALFH>(q + HALFH);
-    auto lo = aie::mul(x, c);
-    lo = aie::msc(lo, y, s);            // x*cos - y*sin
-    auto hi = aie::mul(y, c);
-    hi = aie::mac(hi, x, s);            // y*cos + x*sin
-    aie::store_v(q, lo.template to_vector<bfloat16>());
-    aie::store_v(q + HALFH, hi.template to_vector<bfloat16>());
-  }
-
+// It used to be, and the comment that lived here argued it *had* to be: "at 16
+// rows per weight tile a q4_1 tile produces a quarter of a head_dim-64 head,
+// and RoPE needs whole heads — NROWS=64 would make the tile 81920 B, far past
+// the 64 KB tile memory." The premise was right and the conclusion was wrong.
+// The qkv projection does not need a 64-row tile to rotate a whole head; it
+// needs somewhere to put four 16-row tiles, and 128 B of core memory is
+// somewhere. `flm_gemv_qkv.cc` stages the head and rotates it when the fourth
+// tile closes it, from the tile's own `row_base` trailer.
+//
+// That matters beyond tidiness: in the fused layer, k' must be rotated *before*
+// it is appended to the KV cache, and the cache is written by phase P1. Leaving
+// the rotation in attention would rotate q only, and every cached k would be
+// wrong. So P1 owns RoPE for both, and by the time attention runs, q' and every
+// cached k' are already rotated.
+//
+// `q` is the core's [GQA][HEAD] query block. It is untouched here — the
+// parameter is kept because IRON binds each kernel to the fifo objects it is
+// called with, and this is the one that names the phase's Q buffer.
+extern "C" __attribute__((noinline)) void flm_attn_begin(bfloat16 *restrict q) {
+  (void)q;
   for (int h = 0; h < GQA; ++h) {
     g_m[h] = -3.0e38f;      // -inf; the first tile always wins the max
     g_l[h] = 0.0f;
