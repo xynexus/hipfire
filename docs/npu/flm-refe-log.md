@@ -10629,3 +10629,44 @@ fails at runtime.
 
 Three walls, three different mechanisms. Tidier to call them one; it just is not
 what the compiler says.
+
+## 2026-08-01 — the attention floor model is wrong, and I am not widening it again
+
+Going looking for the mechanism behind the 0.74-1.61 ULP spread, rather than
+fitting another envelope. A layer x sequence grid:
+
+    config      max|V|   mean|ref|  err          err/ULP(max|V|)  err/mean|ref|
+    L0  seq 9   0.9453   0.08779    5.9281e-03   1.61             0.068
+    L0  seq 31  1.2031   0.04825    3.4631e-03   0.74             0.072
+    L0  seq 63  1.3516   0.03110    2.2820e-03   0.43             0.073
+    L15 seq 9   2.3906   0.12397    2.1643e-02   **2.32**         0.175
+    L15 seq 31  2.3906   0.05875    9.2940e-03   1.00             0.158
+    L15 seq 63  2.3906   0.03601    8.4250e-03   0.90             0.234
+
+**L15/seq 9 is 2.32 ULP — outside the 2.0 envelope I set one entry ago.** So the
+bound was already wrong when I wrote it; I had only swept seq at layer 0 and
+layer at seq 31, never the corner where both are unfavourable.
+
+Neither normalizer works:
+
+  * `max|V|` collapses the LAYER spread (that part is real — it is why the
+    across-layer 2.7x became ~1x) but leaves a 0.31-2.32 spread across sequence
+    length, 7.5x.
+  * `mean|ref|` is nearly flat across sequence length at a given layer
+    (0.068/0.072/0.073 at L0) but moves 2.4x with layer.
+
+Each explains the axis the other misses, which is suspicious in itself. Their
+product tightens the spread to 0.054-0.098 (1.8x) — but that is a two-parameter
+fit to six points, and an error bound quadratic in signal magnitude has no
+physical justification I can offer. **I am not adopting it.** Recording it as a
+lead, not a result.
+
+What I changed instead: the verdict is now **advisory**, printed as "within" or
+"OUTSIDE the empirical envelope", and the code says plainly that a breach means
+"the model does not cover this config" rather than "the device is wrong". The
+envelope stays at 2.0. Widening it to 2.4 would make every configuration pass and
+would be the third time this bound moved to fit data — which I said last entry
+was the thing not to do.
+
+The check now reports a number and refuses to pretend it is a verdict. Finding
+the actual mechanism is open work.

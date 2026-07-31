@@ -1053,7 +1053,13 @@ def main():
     tol = 2.0 * 2**-8 * vmax
     print(f"  attention out: max err {worst:.4e}   mean|ref| {scale:.5f}   "
           f"tol {tol:.4e}")
-    print(f"  -> {'PASS' if worst <= tol else 'FAIL'}  (bf16-ULP envelope at max|V| = {vmax:.3f})")
+    # ADVISORY, not a gate. The floor model is known wrong: layer 15 / seq 9
+    # sits at 2.32 ULP, outside this envelope, and no normalizer tested explains
+    # the spread (see the log). Treat a breach as "the model does not cover this
+    # config", not automatically as a device fault -- and do not widen the
+    # envelope to silence it, which is what the last two changes here did.
+    print(f"  -> {'within' if worst <= tol else 'OUTSIDE'} the empirical envelope"
+          f"  (advisory; floor model unresolved)")
     return 0 if worst <= tol else 1
 
 
