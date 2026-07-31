@@ -7,11 +7,8 @@
 // source separately, so two entry points in one file link twice).
 
 #include "flm_q4_1_tile.h"
-
-// The one definition of the shared activation block-sum array. alignas is
-// load-bearing: it is vector-loaded, and an unaligned 512-bit load returns
-// garbage rather than faulting.
-alignas(64) bfloat16 g_asum[DIM_K / 32];
+// g_asum is defined in flm_q4_1_state.cc — see the comment there for why it
+// cannot live in an entry point's own translation unit.
 
 extern "C" __attribute__((noinline)) void
 flm_gemv_q4_1(const bfloat16 *restrict act, const uint8 *restrict wtile,

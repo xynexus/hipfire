@@ -49,7 +49,6 @@ constexpr int NB = K / BLK;
 constexpr int HALF = BLK / 2;
 } // namespace
 
-extern bfloat16 g_asum[];
 
 // Call once per activation, before the tile loop.
 extern "C" __attribute__((noinline)) void

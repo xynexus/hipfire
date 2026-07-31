@@ -5080,3 +5080,58 @@ norms are now free.** Remaining to fuse: RoPE (rides with the qkv projection's
 epilogue) and the two residual adds (ride with o_proj's and down_proj's
 epilogues) — all three are epilogue/prologue work on an operator that already
 exists, none needs a new dispatch.
+
+## 2026-07-31 — Residual add fused into the GEMV epilogue, and an alignment trap with a very clean signature
+
+`kernels/npu/flm_gemv_residual.cc`: `out[r] = W_tile[r] . act + residual[r]`.
+The second of the tiny per-layer operators to stop costing a dispatch. Verified
+**3.48e-07** with the norm ALSO fused (so norm + GEMV + residual in one kernel),
+and the non-residual path unchanged at 3.48e-07.
+
+**Getting the residual to the core is constrained by the 2-input-channel limit**
+found last entry. The activation and the weight stream already use both, so the
+residual rides *inside the weight tile*, appended after the codes. That costs 64
+bytes on a 20480-byte tile (**0.3%**) to remove a 92.9 us dispatch, and it solves
+the addressing problem for free — each core receives exactly the residual rows it
+is computing, with no notion of its own row offset.
+
+### The trap: the region is a fixed 64 bytes, not NROWS*2
+
+With `NROWS*2` the tile is 20512 B. The weight ObjectFifo is double-buffered, so
+buffer 1 lands 20512 bytes after buffer 0 — a **32-byte** boundary, not 64 — and
+the vectorised residual load off it reads garbage.
+
+The symptom is one of the cleanest in this project:
+
+    max err per tile, 32 tiles:
+    [2.1e-07  6.7e-01  8.3e-08  9.8e-01  1.5e-07  7.3e-01  2.1e-07  7.1e-01 ...]
+
+**Even tiles exact, odd tiles wrong by ~1.0, strictly alternating** — because the
+fifo alternates buffers and only one of the two is 64-byte aligned. Padding the
+tile to a multiple of 64 fixes it. Worth remembering as a diagnostic: *an
+alternating-by-tile error pattern means a double-buffer alignment problem, not an
+arithmetic one.*
+
+### Also: `g_asum` is now an `inline` variable, which is the only arrangement that links
+
+Three arrangements were tried and only the third works, because IRON compiles
+each ExternalFunction's source separately and links **only the objects whose
+entry points a design actually calls**:
+
+| arrangement | failure |
+|---|---|
+| defined in the shared header | `duplicate symbol` once two includers link |
+| `extern` + defined in `flm_gemv_q4_1.cc` | `undefined symbol` for any design not using that entry point — e.g. residual-GEMV + fused-norm |
+| own TU + a no-op "anchor" entry point | still `undefined symbol`: an uncalled ExternalFunction's object is not linked |
+| **`alignas(64) inline bfloat16 g_asum[...]` in the header** | **works for every combination** |
+
+C++17 inline variables are exactly the right tool here and the reasoning is now
+in the header.
+
+### Dispatch budget
+
+Of the five tiny operators per layer, **four are now free**: both RMSNorm's
+(previous entry) and both residual adds. Only RoPE remains, and it rides with
+the qkv projection's epilogue by the same mechanism. That is
+**4 x 92.9 us x 16 layers = 5.9 ms/token** removed, against a 13.55 ms streaming
+floor.

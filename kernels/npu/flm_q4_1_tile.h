@@ -108,12 +108,22 @@ inline void unpack_codes(const uint8 *restrict qs,
 // alignas is load-bearing: this array is vector-loaded, and an unaligned
 // 512-bit load returns garbage (the symptom is NaN in every output, not a
 // fault).
-// DECLARED here, DEFINED in flm_gemv_q4_1.cc — this header is included by more
-// than one translation unit (the plain GEMV, the fused FFN, the fused
-// norm+prepare), and a definition in the header links N times
-// (`duplicate symbol: g_asum`). Filled by whichever prepare entry point runs:
-// `flm_asum_prepare` (block sums only) or `flm_norm_prepare` (RMSNorm fused in).
-extern bfloat16 g_asum[];
+// An `inline` variable (C++17), which is exactly the right tool here and worth
+// stating why. This header is included by several translation units — the plain
+// GEMV, the residual-fused GEMV, the fused FFN, the fused norm+prepare — and
+// IRON compiles each ExternalFunction's source separately, then links only the
+// objects whose entry points a given design actually calls. A plain definition
+// in the header gives `duplicate symbol` when two includers are linked; a plain
+// `extern` with the definition in one entry point's file gives
+// `undefined symbol` for any design that does not happen to use that entry
+// point (e.g. residual-GEMV + fused-norm). An `inline` variable is one object
+// across every TU that includes it, and is emitted by whichever ones survive
+// the link — so every combination works.
+//
+// Filled by whichever prepare entry point runs: `flm_asum_prepare` (block sums
+// only) or `flm_norm_prepare` (RMSNorm fused in). alignas is load-bearing: it
+// is vector-loaded, and an unaligned 512-bit load returns garbage.
+alignas(64) inline bfloat16 g_asum[DIM_K / 32];
 
 // One weight tile against one activation: out[0..NROWS) = W_tile . act.
 // Shared by the plain GEMV entry point and by the fused FFN kernel, which

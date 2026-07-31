@@ -39,15 +39,18 @@ from ml_dtypes import bfloat16  # noqa: E402
 
 KDIR = Path(__file__).resolve().parents[3] / "kernels/npu"
 GEMV_SRC = str(KDIR / "flm_gemv_q4_1.cc")
+RES_SRC = str(KDIR / "flm_gemv_residual.cc")
 NORM_SRC = str(KDIR / "flm_norm_prepare.cc")
 Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
 EPS = 1e-5
 
 
-@iron.jit(source_files=[GEMV_SRC, NORM_SRC])
+@iron.jit(source_files=[GEMV_SRC, NORM_SRC, RES_SRC])
 def norm_gemv(actnw: In, w: In, out: Out, *, K: CompileTime[int] = 2048,
-              N: CompileTime[int] = 512, NROWS: CompileTime[int] = 16):
-    wtile = tile_bytes(K, NROWS)
+              N: CompileTime[int] = 512, NROWS: CompileTime[int] = 16,
+              RESID: CompileTime[int] = 0):
+    # the residual rides inside the weight tile: NROWS bf16 appended
+    wtile = tile_bytes(K, NROWS) + (64 if RESID else 0)
     ntiles = N // NROWS
     # One buffer carries [activation K][norm weight K]: a separate fifo for the
     # norm weight would be a third DMA input and a core tile has only two.
@@ -58,8 +61,10 @@ def norm_gemv(actnw: In, w: In, out: Out, *, K: CompileTime[int] = 2048,
     o_all_ty = np.ndarray[(N,), np.dtype[np.float32]]
 
     flags = [f"-DDIM_K={K}", f"-DDIM_NROWS={NROWS}"]
-    kern = ExternalFunction("flm_gemv_q4_1", source_file=GEMV_SRC,
-                            arg_types=[act_ty, wt_ty, o_ty], compile_flags=flags)
+    kern = ExternalFunction(
+        "flm_gemv_q4_1_residual" if RESID else "flm_gemv_q4_1",
+        source_file=RES_SRC if RESID else GEMV_SRC,
+        arg_types=[act_ty, wt_ty, o_ty], compile_flags=flags)
     # Replaces flm_asum_prepare: normalises in place AND fills g_asum.
     prep = ExternalFunction("flm_norm_prepare", source_file=NORM_SRC,
                             arg_types=[act_ty], compile_flags=flags)
@@ -94,6 +99,8 @@ def main():
     p.add_argument("--n", type=int, default=512)
     p.add_argument("--nrows", type=int, default=16)
     p.add_argument("--layer", type=int, default=0)
+    p.add_argument("--residual", action="store_true",
+                   help="also fuse the residual add into the GEMV epilogue")
     o = p.parse_args()
     K, N, NROWS = o.k, o.n, o.nrows
     nb = K // BLK_C
@@ -110,14 +117,22 @@ def main():
     rng = np.random.default_rng(0)
     x = rnd(rng.standard_normal(K) * 0.05)
 
-    wbuf = np.concatenate([q4nx.pack_tile(d[i:i + NROWS], m[i:i + NROWS],
-                                          codes[i:i + NROWS])
-                           for i in range(0, N, NROWS)])
+    resid = rnd(rng.standard_normal(N) * 0.3) if o.residual else None
+    if o.residual:
+        wbuf = np.concatenate([
+            q4nx.pack_tile_residual(d[i:i + NROWS], m[i:i + NROWS],
+                                    codes[i:i + NROWS], resid[i:i + NROWS])
+            for i in range(0, N, NROWS)])
+    else:
+        wbuf = np.concatenate([q4nx.pack_tile(d[i:i + NROWS], m[i:i + NROWS],
+                                              codes[i:i + NROWS])
+                               for i in range(0, N, NROWS)])
     a_t = iron.tensor(np.concatenate([x, nw]).astype(bfloat16),
                       dtype=bfloat16, device="npu")
     w_t = iron.tensor(wbuf, dtype=np.uint8, device="npu")
     o_t = iron.zeros(N, dtype=np.float32, device="npu")
-    norm_gemv(a_t, w_t, o_t, K=K, N=N, NROWS=NROWS)
+    norm_gemv(a_t, w_t, o_t, K=K, N=N, NROWS=NROWS,
+              RESID=1 if o.residual else 0)
     got = o_t.numpy().astype(np.float64)
 
     # Reference: the same two steps the kernel now does in one pass, with the
@@ -129,10 +144,13 @@ def main():
         q4nx.gemv_reference_bf16(xn, d[i:i + NROWS], m[i:i + NROWS],
                                  codes[i:i + NROWS])
         for i in range(0, N, NROWS)])
+    if o.residual:
+        ref = ref + resid.astype(np.float64)
 
     err = np.abs(got - ref)
     scale = np.abs(ref).mean()
-    print(f"norm+GEMV fused: K={K} N={N} rows/tile={NROWS}, layer {o.layer}")
+    what = "norm+GEMV+residual" if o.residual else "norm+GEMV"
+    print(f"{what} fused: K={K} N={N} rows/tile={NROWS}, layer {o.layer}")
     print(f"  norm weight range [{nw.min():.4f}, {nw.max():.4f}]")
     print(f"  vs norm-then-GEMV reference: max {err.max():.4e}  mean {err.mean():.4e}")
     print(f"  mean|ref| {scale:.5f}")

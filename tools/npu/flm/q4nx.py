@@ -37,6 +37,7 @@ ROW_BYTES = 5120
 BLK = 32                       # weights per q4_1 block
 BLOCKS_PER_ROW = 256
 DM_BYTES = BLOCKS_PER_ROW * 2  # bf16
+RESIDUAL_BYTES = 64            # fixed, keeps the tile a multiple of 64
 
 
 def bf16_to_f32(u16):
@@ -112,6 +113,29 @@ def pack_tile(d, m, codes):
         f32_to_bf16(m).ravel().view(np.uint8),
         packed.ravel(),
     ])
+
+
+def pack_tile_residual(d, m, codes, residual):
+    """Pack a tile for `flm_gemv_q4_1_residual`: the standard tile with the
+    tile's NROWS residual values appended.
+
+    The residual rides inside the weight tile because a core tile has only two
+    input DMA channels and the activation and weight streams already use both.
+    It costs a fixed RESIDUAL_BYTES per tile (0.3% at NROWS=16, K=2048) and
+    removes a whole 92.9 us dispatch per residual add.
+
+    The region is a fixed 64 bytes rather than nrows*2 so the tile stays a
+    multiple of 64. At 20512 B the double-buffered ObjectFifo puts buffer 1 on a
+    32-byte boundary and the vectorised residual load off it reads garbage —
+    with the exact signature of EVEN tiles correct and ODD tiles wrong, because
+    the fifo alternates buffers.
+    """
+    nrows = d.shape[0]
+    assert residual.shape == (nrows,), residual.shape
+    assert nrows * 2 <= RESIDUAL_BYTES
+    pad = np.zeros(RESIDUAL_BYTES - nrows * 2, np.uint8)
+    return np.concatenate([pack_tile(d, m, codes),
+                           f32_to_bf16(residual).view(np.uint8), pad])
 
 
 def gemv_reference_bf16(act, d, m, codes):
