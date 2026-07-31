@@ -8557,3 +8557,38 @@ With the gather in place, P3 needs a third TaskGroup that refills the broadcast
 from `attn_out`, streams o_proj weights on the existing weight fifos, and drains
 `h` — the pattern `chain_probe.py` verified and this harness already performs
 twice.
+
+## 2026-08-01 — P1+P2+P3 builds, routes and runs in the real design
+
+P3's kernel is now declared and called by every core in `p1p2_chain` — the third
+TaskGroup refills the broadcast from the gathered attention output, streams
+o_proj tiles on the existing weight fifos, and drains `h` into P1's result fifo.
+
+**Program memory, measured on the real design rather than the probe:**
+
+    core 0_2  (P1 + P3)          12048 B   74%
+    core 3_2  (P2 + P3, attn)    10704 B   65%
+
+Both fit, and the attention cores are the *lighter* half — because they skip P1,
+which is the largest single image at 6144 B. That is partition B's whole
+argument, now visible in a build rather than a projection.
+
+P3 shares P1's result fifo, so it needs no new shim outputs: a fifo of its own
+would have been 8 more against a budget of 10 in 16. Its object is P1-sized
+(2*HEAD bf16) and the kernel fills only the first NROWS — the widening verified
+on `resid_chain` earlier, applied where it was always meant to go.
+
+Routing succeeds with all three phases present. Attention still passes at
+3.4631e-03, unchanged.
+
+### What is NOT yet true
+
+**P3's host side is not wired.** The design declares its broadcast, weight and
+result tensors but `main()` does not pass them, so P3 is running against
+unsupplied buffers. The runtime did not object, which is worth knowing: a short
+argument list is not caught here, so "it ran" is not evidence that a phase is
+fed. Attention passing says nothing about P3, which runs after it.
+
+Next: pack o_proj tiles, allocate the `h` buffers, extend the broadcast fill with
+attention output plus the residual stream, and check `h` against a host
+reference. `resid_chain` already has all of that for P3 in isolation.
