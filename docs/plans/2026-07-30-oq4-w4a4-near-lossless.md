@@ -1106,3 +1106,47 @@ LDS-bandwidth contention is intrinsic.)
 Net: the compute headroom favors **arithmetic-decodable low-bit (int4 + low-rank/error-feedback
 correction)** over LUT/trellis codebooks. The footprint/quant-quality experiment should target
 that, not a codebook GEMM. (And it still needs a grain-free DiT for the quality gate, §10/§D3.)
+
+### 12c. The budget is a KERNEL property, and the production kernel has ~8× more (2026-07-31)
+
+§12a/§12b measured the **LDS** kernel (`bench_bf16_lds_freealu`). The same probe on the
+**production** kernel — the register-tiled 4×4 that actually runs the DiT
+(`gpu_ops.rs` `use_tiled`) — gives a very different, much larger budget
+(`kernels/src/bench_bf16_alu_headroom.hip` + `examples/bench_bf16_alu_headroom.rs`,
+attn M6144 K6144 N=2048, side FMAs are register-arithmetic = §12b's "real" regime):
+
+| FMAs/WMMA | ms | vs 0 | arithmetic ops per *loaded* weight element |
+|---|---|---|---|
+| 0 | 97.40 | 1.00× | 0 |
+| 4 | 82.31 | **0.85×** | 1 |
+| 16 | 82.78 | **0.85×** | 4 |
+| 64 | 85.03 | **0.87×** | 16 |
+| **128** | **87.23** | **0.90×** | **32** |
+
+**Two findings.**
+
+1. **≥128 FMAs/WMMA is free on the production kernel — 8× the LDS kernel's ~16–24 knee.**
+   Per *loaded* weight element (each A-fragment is reused across TILE_NB=4 WMMAs, so decode
+   happens once per 4 WMMAs) that is **~32 arithmetic ops/weight-element**, vs ~1–2 on the LDS
+   kernel. So **the free budget is a property of the KERNEL STRUCTURE, not of the GPU**: the
+   4×4's 1-wave/block, 128-acc-VGPR, zero-LDS shape leaves far more idle issue slots than the
+   8-wave LDS kernel. Corollary for design: a low-bit DiT kernel should be built on the
+   *register-tiled* shape, where the decode is nearly unbounded, not the LDS shape.
+
+2. **Adding arithmetic makes the production kernel ~15% FASTER** (97.4 → 82.3 ms), and it is
+   still 10% faster at 128 FMAs/WMMA. **Control: alu0 re-measured LAST = 96.21 ms vs 97.40 ms
+   first (−1.2%) ⇒ order-independent, not a clock-ramp artifact** (a 30-launch warmup precedes
+   all timing). This is a **scheduling pathology**: the baseline stalls on dependent global
+   fragment loads, and independent VALU work fills those slots (classic software-pipeline
+   filler). Two consequences: (a) an arithmetic dequant/correction branch is not merely free
+   here, it **pays for itself**; (b) there is an **independent ~15% DiT win** available from
+   scheduling/pipelining the existing kernel with *no* format change — cheaper than any of the
+   §12 levers and worth taking first.
+
+**Net (consistent with §12b, strengthened):** on the kernel that actually ships, the
+arithmetic headroom is ~32 ops/weight-element — int4→bf16 dequant (~2 ops) plus a register
+low-rank/error-feedback correction fits with an order of magnitude to spare. §12b's verdict
+stands (gather/trellis is NOT free; arithmetic is), and the margin for the arithmetic path is
+much larger than §12a suggested. Sequence: (1) take the free ~15% scheduling win, (2) build
+int4-weight + arithmetic dequant + register low-rank correction on the register-tiled shape,
+(3) gate quality on a grain-free DiT (§10/§D3).
