@@ -5135,3 +5135,55 @@ Of the five tiny operators per layer, **four are now free**: both RMSNorm's
 the qkv projection's epilogue by the same mechanism. That is
 **4 x 92.9 us x 16 layers = 5.9 ms/token** removed, against a 13.55 ms streaming
 floor.
+
+## 2026-07-31 — RoPE fused into attention: all five tiny per-layer operators are now free
+
+RoPE **cannot** ride in the qkv projection's epilogue, which was the obvious
+place: at 16 rows per weight tile a q4_1 tile produces a quarter of a
+head_dim-64 head, and RoPE needs whole heads. NROWS=64 would make the tile
+81920 B, far past the 64 KB tile memory.
+
+It rides in `flm_attn_begin` instead, which runs **once per token** and already
+owns this core's Q — so rotating in place there costs no dispatch and no extra
+pass. `cs` rides in the same buffer as Q (`[GQA*HEAD q][HEAD cs]`) because the
+attention core's two input DMA channels are already taken by Q and the KV
+stream — the same packing trick the norm weight uses in `flm_norm_prepare`.
+
+Rotation and the softmax scale commute (the scale is a scalar), so Q can still
+be pre-scaled by `1/sqrt(head_dim) * log2(e)` on the host and rotated on device.
+
+Verified across positions and context lengths, against a reference that rotates
+Q in float64 and then attends:
+
+| seq | pos | max abs err | tolerance | |
+|---|---|---|---|---|
+| 512 | 1000 | 6.63e-04 | 8.71e-04 | PASS |
+| 2048 | 100000 | 1.68e-04 | 4.62e-04 | PASS |
+| 1024 | 0 | 3.50e-04 | 6.86e-04 | PASS |
+
+(The tolerance is set by AIE2P's hardware `exp2`, 3.54% mean / 5.86% max, not by
+this kernel.)
+
+### All five tiny operators are now free
+
+| operator | rides in |
+|---|---|
+| input_layernorm | `flm_norm_prepare` — the GEMV's activation prologue |
+| post_attention_layernorm | same |
+| residual add (after o_proj) | `flm_gemv_q4_1_residual` — the GEMV epilogue |
+| residual add (after down_proj) | same |
+| **RoPE (Q)** | **`flm_attn_begin` — attention's per-token prologue** |
+
+**5 x 92.9 us x 16 layers = 7.43 ms/token** of pure fixed cost removed, against a
+13.55 ms streaming floor. None of it cost a byte of extra bandwidth beyond 64 B
+per weight tile for the residual.
+
+| dispatches/token | | ms | tok/s | vs FLM |
+|---|---|---|---|---|
+| 81 (5/layer, before this work) | | 21.07 | 47.5 | 0.79x |
+| **17 (1/layer, all elementwise fused)** | | **15.13** | **66.1** | **1.10x** |
+| 2 (FLM's structure) | | 13.73 | 72.8 | 1.22x |
+
+The remaining step from 17 to 2 is the cross-core barrier — `down_proj` needs
+the whole 8192-wide SwiGLU output, so it needs every core's slice — plus the KV
+cache append. Those are the only structural pieces left.

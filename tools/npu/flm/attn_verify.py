@@ -42,6 +42,19 @@ SRC = str(K / "flm_attn_decode.cc")
 BEGIN_SRC = str(K / "flm_attn_begin.cc")
 FIN_SRC = str(K / "flm_attn_finish.cc")
 GQA, HEAD, TSEQ = 4, 64, 32
+THETA, FACTOR, LO_F, HI_F, OLD_CTX = 500000.0, 32.0, 1.0, 4.0, 8192
+
+
+def _llama3_inv_freq():
+    base = 1.0 / (THETA ** (np.arange(0, HEAD, 2) / HEAD))
+    wl = 2 * np.pi / base
+    out = np.where(wl > OLD_CTX / LO_F, base / FACTOR, base)
+    mid = (wl >= OLD_CTX / HI_F) & (wl <= OLD_CTX / LO_F)
+    smooth = (OLD_CTX / wl - LO_F) / (HI_F - LO_F)
+    return np.where(mid, (1 - smooth) * base / FACTOR + smooth * base, out)
+
+
+ROPE_INV_FREQ = _llama3_inv_freq()
 
 
 @iron.jit(source_files=[SRC, BEGIN_SRC, FIN_SRC])
@@ -49,7 +62,9 @@ def attn(q: In, kv: In, out: Out, *, SEQ: CompileTime[int] = 512):
     """One GQA group. K and V tiles are interleaved in one stream so the cache
     arrives as a single sequential read, which is what it is in memory."""
     ntiles = SEQ // TSEQ
-    q_ty = np.ndarray[(GQA * HEAD,), np.dtype[bfloat16]]
+    # [GQA*HEAD q][HEAD cs]: RoPE is applied in flm_attn_begin, and cs rides
+    # with Q because the core's 2 input DMA channels are taken by Q and KV.
+    q_ty = np.ndarray[(GQA * HEAD + HEAD,), np.dtype[bfloat16]]
     # one tile of K (channel-major) immediately followed by one tile of V
     kv_tile_ty = np.ndarray[(2 * TSEQ * HEAD,), np.dtype[bfloat16]]
     kv_all_ty = np.ndarray[(ntiles * 2 * TSEQ * HEAD,), np.dtype[bfloat16]]
@@ -57,7 +72,7 @@ def attn(q: In, kv: In, out: Out, *, SEQ: CompileTime[int] = 512):
 
     flags = [f"-DDIM_GQA={GQA}", f"-DDIM_HEAD={HEAD}", f"-DDIM_TSEQ={TSEQ}"]
     k_begin = ExternalFunction("flm_attn_begin", source_file=BEGIN_SRC,
-                               arg_types=[], compile_flags=flags)
+                               arg_types=[q_ty], compile_flags=flags)
     k_tile = ExternalFunction("flm_attn_tile", source_file=SRC,
                               arg_types=[q_ty, kv_tile_ty],
                               compile_flags=flags)
@@ -70,7 +85,7 @@ def attn(q: In, kv: In, out: Out, *, SEQ: CompileTime[int] = 512):
 
     def core(qc, kvc, op, kb, kt, kf):
         eq = qc.acquire(1)
-        kb()
+        kb(eq)                      # rotate Q in place, then zero the state
         for _ in range_(ntiles):
             ekv = kvc.acquire(1)
             # one object = [K tile channel-major][V tile position-major];
@@ -98,6 +113,7 @@ def attn(q: In, kv: In, out: Out, *, SEQ: CompileTime[int] = 512):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--seq", type=int, default=512, help="KV cache length")
+    p.add_argument("--pos", type=int, default=1000, help="token position for RoPE")
     o = p.parse_args()
     SEQ = o.seq
     if SEQ % TSEQ:
@@ -113,7 +129,12 @@ def main():
           f"(KV streamed {2*SEQ*HEAD*2/1e6:.2f} MB)")
 
     # Fold 1/sqrt(head_dim) and log2(e) into Q so the kernel's exp2 is exact.
+    # Q is passed UNROTATED: flm_attn_begin applies RoPE in place. Rotation and
+    # the scalar scale commute, so folding the scale first is safe.
     qs = rnd(q * (1.0 / math.sqrt(HEAD)) * math.log2(math.e))
+    pos_ang = o.pos * ROPE_INV_FREQ
+    cs = rnd(np.concatenate([np.cos(pos_ang), np.sin(pos_ang)]))
+    qs_cs = np.concatenate([qs.reshape(-1), cs])
 
     # Interleave [K tile channel-major][V tile position-major] per tile.
     buf = np.empty((SEQ // TSEQ, 2, TSEQ * HEAD), np.float32)
@@ -123,14 +144,18 @@ def main():
         buf[t, 1] = V[t * TSEQ:(t + 1) * TSEQ].reshape(-1)
     kv_flat = buf.reshape(-1)
 
-    q_t = iron.tensor(qs.reshape(-1).astype(bfloat16), dtype=bfloat16, device="npu")
+    q_t = iron.tensor(qs_cs.astype(bfloat16), dtype=bfloat16, device="npu")
     kv_t = iron.tensor(kv_flat.astype(bfloat16), dtype=bfloat16, device="npu")
     o_t = iron.zeros(GQA * HEAD, dtype=bfloat16, device="npu")
     attn(q_t, kv_t, o_t, SEQ=SEQ)
     got = o_t.numpy().astype(np.float64).reshape(GQA, HEAD)
 
-    # reference: plain softmax attention in float64
-    scores = (q.astype(np.float64) @ K.astype(np.float64).T) / math.sqrt(HEAD)
+    # reference: rotate Q the same way, then plain softmax attention in float64
+    cb, sb = cs[:HEAD // 2].astype(np.float64), cs[HEAD // 2:].astype(np.float64)
+    qd = q.astype(np.float64)
+    qrot = np.concatenate([qd[:, :HEAD // 2] * cb - qd[:, HEAD // 2:] * sb,
+                           qd[:, HEAD // 2:] * cb + qd[:, :HEAD // 2] * sb], axis=1)
+    scores = (qrot @ K.astype(np.float64).T) / math.sqrt(HEAD)
     pmax = scores.max(1, keepdims=True)
     e = np.exp(scores - pmax)
     ref = (e / e.sum(1, keepdims=True)) @ V.astype(np.float64)

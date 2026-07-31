@@ -58,8 +58,38 @@ extern float g_m[];
 extern float g_l[];
 extern float g_acc[];
 
-extern "C" __attribute__((noinline)) void flm_attn_begin() {
+// RoPE rides here rather than in the qkv projection's epilogue. It cannot go
+// there: at 16 rows per weight tile a q4_1 tile produces a quarter of a
+// head_dim-64 head, and RoPE needs whole heads — NROWS=64 would make the tile
+// 81920 B, far past the 64 KB tile memory. `flm_attn_begin` runs **once per
+// token** and already owns this core's Q, so rotating in place here costs no
+// dispatch and no extra pass.
+//
+// `qcs` is [GQA*HEAD q][HEAD cs], one buffer: the attention core already uses
+// both of its 2 input DMA channels for Q and the KV stream, so cs rides with Q
+// exactly as the norm weight rides with the activation in flm_norm_prepare.
+// cs is [cos(HEAD/2)][sin(HEAD/2)] for this token's position, and the
+// 1/sqrt(head_dim) * log2(e) softmax scale is folded into Q on the host, so
+// what is rotated here is the pre-scaled Q — rotation and scaling commute
+// because the scale is a scalar.
+extern "C" __attribute__((noinline)) void flm_attn_begin(bfloat16 *restrict qcs) {
   aie::set_rounding(aie::rounding_mode::conv_even);
+
+  constexpr int HALFH = HEAD / 2;
+  const auto c = aie::load_v<HALFH>(qcs + GQA * HEAD);
+  const auto s = aie::load_v<HALFH>(qcs + GQA * HEAD + HALFH);
+  for (int h = 0; h < GQA; ++h) {
+    bfloat16 *q = qcs + h * HEAD;
+    const auto x = aie::load_v<HALFH>(q);
+    const auto y = aie::load_v<HALFH>(q + HALFH);
+    auto lo = aie::mul(x, c);
+    lo = aie::msc(lo, y, s);            // x*cos - y*sin
+    auto hi = aie::mul(y, c);
+    hi = aie::mac(hi, x, s);            // y*cos + x*sin
+    aie::store_v(q, lo.template to_vector<bfloat16>());
+    aie::store_v(q + HALFH, hi.template to_vector<bfloat16>());
+  }
+
   for (int h = 0; h < GQA; ++h) {
     g_m[h] = -3.0e38f;      // -inf; the first tile always wins the max
     g_l[h] = 0.0f;
