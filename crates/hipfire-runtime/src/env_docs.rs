@@ -1188,21 +1188,21 @@ pub const ENV_HIPFIRE_DIAG: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_DIFFUSION_ABLATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_ABLATE",
     description: "Runtime variable controlling diffusion ablate in hipfire",
-    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2638",
+    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2660",
 };
 
 /// `HIPFIRE_DIFFUSION_ABLATE_BITS` — Parses "HIPFIRE_DIFFUSION_ABLATE_BITS" with fallback defaults
 pub const ENV_HIPFIRE_DIFFUSION_ABLATE_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_ABLATE_BITS",
     description: "Parses \"HIPFIRE_DIFFUSION_ABLATE_BITS\" with fallback defaults",
-    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2642",
+    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2664",
 };
 
 /// `HIPFIRE_DIFFUSION_ATTN_QTILE` — Enabled by default; set to 0 to disable
 pub const ENV_HIPFIRE_DIFFUSION_ATTN_QTILE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_ATTN_QTILE",
     description: "Enabled by default; set to 0 to disable",
-    source: "crates/hipfire-diffusion/src/gpu_ops.rs:4230",
+    source: "crates/hipfire-diffusion/src/gpu_ops.rs:4252",
 };
 
 /// `HIPFIRE_DIFFUSION_CPU_REFERENCE` — Runtime variable controlling diffusion cpu reference in hipfire
@@ -1238,6 +1238,13 @@ pub const ENV_HIPFIRE_DIFFUSION_OQ8: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DIFFUSION_OQ8",
     description: "Enabled when set to 1",
     source: "crates/hipfire-diffusion/src/gpu_ops.rs:2331",
+};
+
+/// `HIPFIRE_DIFFUSION_PF_GEMM` — Enabled by default; set to 0 to disable
+pub const ENV_HIPFIRE_DIFFUSION_PF_GEMM: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DIFFUSION_PF_GEMM",
+    description: "Enabled by default; set to 0 to disable",
+    source: "crates/hipfire-diffusion/src/gpu_ops.rs:2585",
 };
 
 /// `HIPFIRE_DIFFUSION_TILED_GEMM` — Enabled by default; set to 0 to disable
@@ -2224,7 +2231,7 @@ pub const ENV_HIPFIRE_KVARN_BITS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_KVARN_ROTATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_KVARN_ROTATE",
     description: "In-place: mq_rotate_x loads each 256-group into registers (ds_swizzle",
-    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:6781",
+    source: "crates/hipfire-arch-qwen35/src/qwen35/prefill_chunk.rs:6868",
 };
 
 /// `HIPFIRE_KVARN_SIM` — Environment toggle value controls runtime behavior
@@ -3047,6 +3054,20 @@ pub const ENV_HIPFIRE_NPU_VERIFY_UNIT_SCALES: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-xdna/examples/npu_gemm_whole_scaled_verify.rs:50",
 };
 
+/// `HIPFIRE_OQ4_ACT4` — HIPFIRE_OQ4_ACT4=1 (verification harness): consume the rotated
+pub const ENV_HIPFIRE_OQ4_ACT4: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_OQ4_ACT4",
+    description: "HIPFIRE_OQ4_ACT4=1 (verification harness): consume the rotated",
+    source: "crates/hipfire-runtime/src/weights.rs:594",
+};
+
+/// `HIPFIRE_OQ4_ACT_CLIP` — Environment toggle value controls runtime behavior
+pub const ENV_HIPFIRE_OQ4_ACT_CLIP: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_OQ4_ACT_CLIP",
+    description: "Environment toggle value controls runtime behavior",
+    source: "crates/hipfire-runtime/examples/perplexity_batched.rs:83",
+};
+
 /// `HIPFIRE_OQ4_BATCHED_PREFILL` — Environment toggle value controls runtime behavior
 pub const ENV_HIPFIRE_OQ4_BATCHED_PREFILL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ4_BATCHED_PREFILL",
@@ -3058,14 +3079,14 @@ pub const ENV_HIPFIRE_OQ4_BATCHED_PREFILL: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_OQ4_PREFILL_ACT_BITS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ4_PREFILL_ACT_BITS",
     description: "Interprets \"HIPFIRE_OQ4_PREFILL_ACT_BITS\" from environment to select behavior",
-    source: "crates/hipfire-runtime/src/weights.rs:1382",
+    source: "crates/hipfire-runtime/src/weights.rs:1392",
 };
 
 /// `HIPFIRE_OQ4_TRACE` — Runtime variable controlling oQ4 trace in hipfire
 pub const ENV_HIPFIRE_OQ4_TRACE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_OQ4_TRACE",
     description: "Runtime variable controlling oQ4 trace in hipfire",
-    source: "crates/hipfire-runtime/src/weights.rs:667",
+    source: "crates/hipfire-runtime/src/weights.rs:677",
 };
 
 /// `HIPFIRE_OQ8_ROUTER` — OQ8-W8A16 router promotion (opt-in HIPFIRE_OQ8_ROUTER): keep
@@ -3121,7 +3142,7 @@ pub const ENV_HIPFIRE_PARO_FUSED_PACK2: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PARO_FUSE_RMSNORM: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_FUSE_RMSNORM",
     description: "time per call. Net loss on every site. Default OFF; explicit opt-in for",
-    source: "crates/hipfire-runtime/src/weights.rs:780",
+    source: "crates/hipfire-runtime/src/weights.rs:790",
 };
 
 /// `HIPFIRE_PARO_GATE_UP_FUSED` — Runtime variable controlling paro gate up fused in hipfire
@@ -3177,7 +3198,7 @@ pub const ENV_HIPFIRE_PARO_PACK4: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PARO_PREROTATE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_PREROTATE",
     description: "Runtime variable controlling paro prerotate in hipfire",
-    source: "crates/hipfire-runtime/src/weights.rs:1311",
+    source: "crates/hipfire-runtime/src/weights.rs:1321",
 };
 
 /// `HIPFIRE_PARO_SHARED_PAIRS` — Runtime variable controlling paro shared pairs in hipfire
@@ -3191,7 +3212,7 @@ pub const ENV_HIPFIRE_PARO_SHARED_PAIRS: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PARO_SWIGLU_FUSED: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PARO_SWIGLU_FUSED",
     description: "Runtime variable controlling paro swiglu fused in hipfire",
-    source: "crates/hipfire-runtime/src/weights.rs:1324",
+    source: "crates/hipfire-runtime/src/weights.rs:1334",
 };
 
 /// `HIPFIRE_PERF_BASELINE` — Runtime variable controlling perf baseline in hipfire
@@ -4569,6 +4590,13 @@ pub const ENV_HIPFIRE_TEST_NOLIMA_CACHE: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-eval/src/datasets.rs:1571",
 };
 
+/// `HIPFIRE_TEST_SAVE_PNG` — Debug: HIPFIRE_TEST_SAVE_PNG=<path> writes the CPU-decoded image so we can
+pub const ENV_HIPFIRE_TEST_SAVE_PNG: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_TEST_SAVE_PNG",
+    description: "Debug: HIPFIRE_TEST_SAVE_PNG=<path> writes the CPU-decoded image so we can",
+    source: "crates/hipfire-diffusion/src/tests/vae.rs:410",
+};
+
 /// `HIPFIRE_TIER_RATIO` — Runtime variable controlling tier ratio in hipfire
 pub const ENV_HIPFIRE_TIER_RATIO: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_TIER_RATIO",
@@ -5344,6 +5372,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DIFFUSION_FOLD_ROLES,
     ENV_HIPFIRE_DIFFUSION_LAYER_RUNG,
     ENV_HIPFIRE_DIFFUSION_OQ8,
+    ENV_HIPFIRE_DIFFUSION_PF_GEMM,
     ENV_HIPFIRE_DIFFUSION_TILED_GEMM,
     ENV_HIPFIRE_DIFFUSION_W4A8,
     ENV_HIPFIRE_DIR,
@@ -5602,6 +5631,8 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_NPU_SOFTMAX_CONFIGS,
     ENV_HIPFIRE_NPU_TARGETS,
     ENV_HIPFIRE_NPU_VERIFY_UNIT_SCALES,
+    ENV_HIPFIRE_OQ4_ACT4,
+    ENV_HIPFIRE_OQ4_ACT_CLIP,
     ENV_HIPFIRE_OQ4_BATCHED_PREFILL,
     ENV_HIPFIRE_OQ4_PREFILL_ACT_BITS,
     ENV_HIPFIRE_OQ4_TRACE,
@@ -5818,6 +5849,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_TEST_LATENT,
     ENV_HIPFIRE_TEST_NEEDLECHAIN_CACHE,
     ENV_HIPFIRE_TEST_NOLIMA_CACHE,
+    ENV_HIPFIRE_TEST_SAVE_PNG,
     ENV_HIPFIRE_TIER_RATIO,
     ENV_HIPFIRE_TINYQUANT_FAMILIES,
     ENV_HIPFIRE_TINYQUANT_RECORD,
