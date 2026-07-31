@@ -141,7 +141,21 @@ alignas(64) inline bfloat16 g_asum[DIM_K / 32];
 // One weight tile against one activation: out[0..NROWS) = W_tile . act.
 // Shared by the plain GEMV entry point and by the fused FFN kernel, which
 // calls it twice (gate, then up) before applying SwiGLU in-core.
-inline void flm_q4_1_tile(const bfloat16 *restrict act,
+//
+// **`noinline` is load-bearing, and it is about program memory, not speed.** A
+// core tile has 16 KB of it, and the fused layer needs every phase's code
+// resident at once because a Worker is one program per core. Inlined, this body
+// is duplicated into all six GEMV entry points and the linker has nothing to
+// fold: measured, the fused set links to 14,272 B, and with attention on cores
+// 0-7 that is **16,896 B = 103% of 16 KB — one dispatch per layer does not
+// fit.** As one out-of-line `linkonce_odr` definition the duplicates fold away,
+// 14,608 B of objects link to 10,208, and the same set lands at 12,832 B = 78%
+// with 3.5 KB of headroom for control flow.
+//
+// It is free: the call happens once per weight tile and the loop inside it runs
+// K/32 blocks, so the overhead is one call per ~2000 MACs. Measured on
+// gemv_bench at 16 cores, throughput is unchanged.
+inline __attribute__((noinline)) void flm_q4_1_tile(const bfloat16 *restrict act,
                           const uint8 *restrict wtile,
                           float *restrict out) {
   // Round to nearest even on every accum->bf16 conversion. The default mode

@@ -5808,3 +5808,52 @@ residency scheme is needed, and the phase schedule stands.
 Worth having run before writing the five-phase harness rather than after — a
 failure here would have invalidated §1.4's whole structure, not just its
 wiring.
+
+## 2026-07-31 — one dispatch per layer did NOT fit in program memory; one word fixed it
+
+Before writing the five-phase harness, a check the plan never makes: **a core
+tile has 16 KB of program memory**, and the fused layer needs every phase's code
+resident at once, because a Worker is one program per core. §1.5 budgets L1
+data down to the byte and says nothing about instructions.
+
+It did not fit.
+
+| | linked .text | cores 0–7 (+attention) | cores 8–15 |
+|---|---|---|---|
+| `inline` tile body (as built) | 14,272 | **16,896 = 103% of 16 KB** | 14,320 = 87% |
+| `noinline` tile body | **10,208** | **12,832 = 78%** | 10,256 = 63% |
+
+And that is *before* the worker's own control flow and the IRON glue, so 103%
+understates it.
+
+**Cause: `flm_q4_1_tile` was `inline` in a shared header**, so it was duplicated
+into all six GEMV entry points — qkv, residual, gate, up_swiglu, acc, flush —
+and the linker had nothing to fold: the sum of the objects and the linked size
+are both 14,272 B, i.e. zero sharing. Marking it
+`inline __attribute__((noinline))` makes it one out-of-line `linkonce_odr`
+definition; 14,608 B of objects then link to 10,208 B. **4.4 KB recovered from
+one word**, which is the difference between the fused layer fitting and not.
+
+It costs nothing. The call happens once per weight tile and the loop inside runs
+K/32 blocks, so it is one call per ~2000 MACs:
+
+| cores | before GB/s | after GB/s |
+|---|---|---|
+| 4 | 16.5 | 16.7 |
+| 8 | 33.9 | 33.2 |
+| 16 | **49.3** | **49.0** |
+
+Within run-to-run noise, numerics bit-identical at 5.96e-07, and
+`gemv_verify`, `normgemv_verify` (both modes), `down_verify` and `qkv_verify`
+all still pass.
+
+**The general point, and it is the one worth keeping:** on this device an
+`inline` helper in a shared header is not free the way it is on a CPU — it is
+paid for once per entry point, out of 16 KB. With N kernels sharing a body, the
+cost is N copies unless the definition is out-of-line. Any future shared kernel
+code should be `noinline` by default and inlined only where a measurement says
+it pays.
+
+Worth having measured before building `layer_verify.py` rather than after: the
+symptom would have been a link failure deep in a five-phase design, with the
+cause four files away.
