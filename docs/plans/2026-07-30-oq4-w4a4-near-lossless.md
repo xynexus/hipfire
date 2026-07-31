@@ -889,6 +889,25 @@ item 1/4 DONE.
 **Battery verdict: quality LOCKED (16-chunk + coherence both PASS) — ship W4A4+clip as a quality
 improvement; throughput ~neutral (clip overhead ≈ qkv gain) pending a clip speed-up; 9B owed.**
 
+### 9g. Clip α-grid tuning — conservative 4-α is strictly better (2026-07-31)
+
+Cheapening the clip (the §9f throughput follow-up). The per-α wave-reduce dominates the kernel,
+so fewer α ≈ proportionally cheaper — but α count is quality-fragile:
+- **wide 4-α {1.0,0.85,0.70,0.55}: FAILED.** KLD **0.0707 > plain-no-clip 0.0668** — worse than
+  no clip, even though α=1.0 is in the set (per-group MSE can't lose). Proof that **per-group MSE
+  ≠ end-to-end KLD**: a coarse grid forces some groups onto an over-aggressive clip that trims a
+  signal-carrying outlier. The fine search's *resolution in the moderate region* is load-bearing.
+- **conservative 4-α {1.0,0.93,0.86,0.79}: WINS.** ctx=512 KLD **0.0589** ≈ 9-α 0.0586; 16-chunk
+  **0.0621** ≈ 9-α 0.0625 (both beat mix 0.0667), PPL 23.72. Full quality gain preserved by
+  sampling only the moderate-trim region [0.79,1.0] where the real gain lives — and it **avoids
+  the aggressive clips entirely**. Throughput: quantize **0.080 ms** vs 9-α's 0.114 (plain 0.052)
+  — **~30% less clip overhead at no quality cost.** This is the ship config (committed).
+
+Net: W4A4 + conservative-4-α clip = the same quality win over the current mix, now at ~half the
+clip overhead — closer to throughput-neutral (still +54% quantize vs plain; a closed-form or
+3-α clip could close the rest, but the knee is here). Lesson: clip quality is fragile to the
+α grid; keep α in the moderate region, never let a coarse grid reach aggressive clips.
+
 **A4 decision:** int4-act buys ~1.5× prefill throughput (§9) at ~0.067 KLD / +0.79 PPL.
 That is a genuine **throughput-vs-quality tradeoff**, NOT free — so promoting qwen3.5
 qkv/gate_up to W4A4-by-default is **not justified on quality alone**; it needs Stream B to

@@ -64,11 +64,16 @@ extern "C" __global__ void quantize_act_oq4_clip(
 
     // Grid-search clip ratio a: scale = a*amax/7 ; pick min group MSE. a=1.0 is
     // the plain absmax baseline, so the search can never do worse than it.
-    const float ALPHAS[9] = {1.0f, 0.92f, 0.85f, 0.78f, 0.71f, 0.64f, 0.57f, 0.50f, 0.43f};
+    // 4-α CONSERVATIVE grid (near 1.0): a wide/aggressive 4-α grid regressed
+    // end-to-end BELOW plain absmax (over-clips signal-carrying outliers for
+    // groups forced onto a coarse aggressive option), even though per-group MSE
+    // can't lose — per-group MSE ≠ end-to-end KLD. This samples only the moderate
+    // trim region where the real gain lives; α=1.0 stays in.
+    const float ALPHAS[4] = {1.0f, 0.93f, 0.86f, 0.79f};
     float best_scale = amax / 7.0f;
     float best_err = 3.4e38f;
     #pragma unroll
-    for (int a = 0; a < 9; ++a) {
+    for (int a = 0; a < 4; ++a) {
         const float scale = ALPHAS[a] * amax / 7.0f;
         const float inv = 1.0f / scale;
         float err = 0.0f;
