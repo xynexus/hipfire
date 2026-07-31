@@ -3417,3 +3417,72 @@ imported into the generated namespace alongside `In`, and **explicit
 `TaskGroup`s cannot be mixed with the implicit default group** — a verify
 transfer added outside a group fails with
 "Mixing explicit task groups and the default task group is prohibited".)
+
+---
+
+## 2026-07-31 — The phase-2 runtime wall is exactly 20 host BOs, and why FLM has no such wall
+
+Milestone 1 left "a runtime wall at ~20 buffers" with the firmware hanging
+(`aie2_tdr_detect`, `DPU PC 0xffffffff`). Located precisely.
+
+### It is a count, and the count is 20
+
+| configuration | total host BOs | result |
+|---|---|---|
+| 20 data, no verify | 20 | **PASS** 9.7 GB/s |
+| 18 data + 2 verify | **20** | **PASS** 8.9 GB/s, bytes verified byte-for-byte |
+| 19 data + 2 verify | **21** | FAIL `ERT_CMD_STATE_ERROR` |
+| 21 data, no verify | 21 | FAIL |
+
+**Exactly 20 total host buffer objects per dispatch.** It does not matter how
+they divide between data buffers and the verify pair — 18+2 and 20+0 both pass,
+19+2 and 21+0 both fail. The `--verify` run passing at 20 also shows the data
+path is *correct* there, so this is a pure count ceiling, not corruption.
+
+**Not an active-BD limit.** `--group` 2, 4 and 8 all fail identically at 24
+buffers, so TaskGroup recycling — which fixed the *compile-time* wall — has no
+bearing on this one.
+
+### A false signal I chased, and the grep that caused it
+
+An intermediate result appeared to show that cutting DMA pushes 16x (tile size =
+buffer size, one push per buffer) let 24 buffers through at "0.0 GB/s". It did
+not. That run failed at **compile** time, and the extraction grep
+(`[0-9.]+ GB/s`) matched the probe's trailing `best 0.0 GB/s` summary banner
+rather than a measurement row. A failure was scraped as a result.
+
+Worth recording because the tell was there and I nearly missed it: **0.0 GB/s is
+not a plausible measurement.** The probe's own docstring warns that a design
+whose DMAs silently did nothing would report a *spectacular* rate; the mirror
+case — an implausibly small one — deserves the same suspicion. Re-running with
+`--verify` surfaced the real `[aiecc] Compilation failed`.
+
+### Why FLM has no such wall: it does not bind weights as kernel arguments
+
+FLM binds **50** buffers to one dispatch on this same hardware, so 20 is not a
+silicon limit. The difference is structural, and the earlier phase-1 work already
+recorded both halves without connecting them:
+
+- `layer.xclbin` declares only the **`kMinHostBOs` = 5** DPU signature
+  (`connectivity` m_count 6). Its 50 buffers are **not** kernel arguments — they
+  reach the driver as the `args` array of `amdxdna_drm_exec_cmd`, a buffer table
+  that `DDR_PATCH` ops index by `arg_idx` to patch shim BD addresses at launch.
+- IRON binds every host buffer as a **named kernel parameter**, which flows into
+  the ERT command packet. That packet is what runs out at 20.
+
+So the two paths are not the same mechanism at different scales — they are
+different mechanisms. FLM's 50 "arguments" are patch-table entries; IRON's are
+kernel arguments.
+
+**Consequence for phase 2, and it is a design correction rather than a tuning
+knob:** streaming a whole model through one dispatch must **not** bind each
+weight buffer as a kernel argument. It needs few kernel args plus
+`aiex.npu.address_patch` entries carrying the rest — exactly FLM's shape, which
+is also why its xclbin declares the bare minimum signature. Raising
+`kMaxHostBOs` was necessary to get this far but is not the path; it lifts a
+compile-time gate on a mechanism that hits a firmware ceiling at 20 regardless.
+
+**Still open:** where the 20 comes from precisely. `ERT_START_NPU = 20` in
+`amdxdna_ctx.h` is an opcode value and a coincidence. The ERT command packet's
+size, or XRT's per-kernel argument binding, is the place to look — but the design
+conclusion above does not depend on the answer.
