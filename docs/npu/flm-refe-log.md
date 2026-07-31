@@ -7246,3 +7246,47 @@ nibble order "cannot be established ... since there is nothing to check a
 candidate order against". A deterministic end-to-end token oracle is exactly
 that missing check: run the forward pass under a candidate decode and let FLM's
 own token judge it. That does not depend on the stuck P1->P2 seam or on the NPU.
+
+## 2026-07-31 — FLM's own dequantizer, called directly
+
+`libq4_npu_eXpress.so` exports `Q4NX::q4nx_dequantize<float>` plus the whole
+`bytes` accessor set, so FLM's decoder runs from ctypes with nothing patched.
+`tools/npu/flm/flm_dequant_oracle.py`.
+
+The convention came from disassembling the size check, not from guessing:
+**`(out, in, n)`, not `(in, out, n)`** — I had them backwards, which is why
+every call was rejected.
+
+    nrows = in.size() / 5120 ; need = nrows * 8192 * 4 ; out.size() must == need
+
+That reproduces all five observed mismatches **exactly**. `n` is consumed as
+`n/256`, so pass `n = 256*nrows`. `bytes(0)` throws, so pre-size the output.
+
+Two findings from running it on all of layers.0 `q_proj`:
+
+**1. The output is 100% non-negative** (4.19M elements) — so it is not finished
+weights. Of six candidate formulas, `d*code` wins by 50–90x:
+
+| formula | mean abs diff vs oracle |
+|---|---|
+| **d*code** | **0.00084** |
+| \|d*code + m\| | 0.0411 |
+| d*code - m | 0.0700 |
+| d*code + m | 0.0716 |
+| d*(code-8) | 0.0776 |
+
+FLM applies the scale but **not** the q4_1 min. That is the factored form:
+`sum((d*c+m)*x) = d*sum(c*x) + m*sum(x)`, so `m` meets a per-block activation
+sum rather than each weight. Same result as our per-element `d*c+m` — the
+difference is where the work happens, not the arithmetic. Nothing to fix in the
+kernel; worth knowing for cost.
+
+**2. The container is reordered.** No nibble order matches elementwise (all four
+sit at ~5.2e-02 under the natural block-to-scale pairing) while the *multiset*
+matches. So the pairing, not the formula, is what differs — which is exactly
+what `Q4NX::_q4nx_reorder` and `Dequant::reorder_cpy(u8*, buffer<u8>&,
+quant_block_t, int,int,int,int)` exist to do.
+
+§1.3 is no longer unanswerable. It was "no arrangement matches, and there is
+nothing to check a candidate against"; it is now a bounded search for one
+reorder, with an oracle that answers in a second.
