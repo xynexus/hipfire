@@ -9570,3 +9570,38 @@ configuration goes from *only just* fitting to comfortable, which matters becaus
 that is what every fallback depends on.
 
 The kernel is kept this time, and justified by the right number.
+
+### Fusing gate/up would close the gap, and the trade puts it back
+
+`flm_ffn_gate_up` already exists and does exactly what P4's body needs — one
+kernel, one acquire per step instead of two, which would remove the same kind of
+body the P5 merge did. But it takes **one object holding [gate tile][up tile]**,
+so the operand doubles:
+
+    NROWS=8: pair 20608 B -> 2/core = 41216 B, 63% of data memory
+    NROWS=4: pair 10368 B -> 2/core = 20736 B, 32%
+
+NROWS=8 puts data memory back to 63% — the exact condition that made P4's buffers
+fail to allocate and forced NROWS=8/KVPER=1. NROWS=4 keeps data memory but costs
+21% of GEMV bandwidth (38.7 vs 48.9 GB/s, measured), which prices the token at
+17.92 ms — **55.8 tok/s**, below FLM.
+
+So the two ceilings trade against each other one more time, and the trade is
+priced both ways. **The analysis is complete**: every route from here either does
+not fit or does not beat 59.86.
+
+Summary of what was tried, all measured rather than argued:
+
+| route | outcome |
+|---|---|
+| five phases on one core | over by 2304 B |
+| fewer FFN cores | core-bound, 8 cores = +465 µs/layer |
+| 12 FFN cores | D_FF does not tile over 12 |
+| cross-layer pipelining | 1.50x worse, stages 5.4:1 |
+| folding phase bodies | blocked, every phase has a different activation |
+| merging acc+flush | **worked**, −1680 B, not enough |
+| fusing gate/up | closes program memory, reopens data memory |
+| two dispatches | fits comfortably, ~55 tok/s |
+
+The decomposition is sound and fast per phase; it is the *number* of phases that
+does not fit a 16 KB core. That is the design question now with the user.
