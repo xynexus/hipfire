@@ -9992,3 +9992,26 @@ broadcast fill — is still unexercised. It is the same inter-phase DDR round tr
 `chain_probe.py` verified and that P5 makes between its own chunks, so the
 mechanism is proven; what is untested is this particular pair of designs sharing
 a buffer.
+
+### The `sw` handoff needs a reorder, not just a shared buffer
+
+I had been treating the last caveat as "the same DDR round trip, just untested".
+It is more than that. Side A drains `sw` per pair in stream order
+`[object][core]`, and a pair's two cores are 512 rows apart:
+
+    pair 0 stream: ob0c0 ob0c1 ob1c0 ob1c1 ...
+    rows:          0     512   128   640   256   768   384   896
+
+Not ascending. Side B needs chunk `ch` to be rows `[ch*2048, (ch+1)*2048)`
+contiguous, because that is what its broadcast fill slices. **So the two designs
+cannot simply share a buffer** — the layouts disagree.
+
+The fix costs nothing: a drain shapes its *destination*, so side A can scatter
+each object straight to its row offset (`offset=row` with per-object
+sizes/strides) instead of writing stream-order. Several drains in this tree
+already do exactly that — P1's cache write places k′ and v′ at their KV-head
+offsets the same way.
+
+So the caveat is a concrete piece of work rather than a formality, and it is
+side A's drain rather than anything about crossing a dispatch boundary. Worth
+having checked: "expected to work" would have been wrong.
