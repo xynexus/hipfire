@@ -6388,3 +6388,42 @@ Every kernel in `kernels/npu/` escapes it by indexing with a dynamic base
 backend will not unroll that way. That is a property of how they happen to be
 written and not a guarantee, which is the reason the audit is a script rather
 than a paragraph: it is cheap to re-run when a kernel changes shape.
+
+## 2026-07-31 — one result fifo can feed three destinations: the last P1→P2 primitive
+
+`tools/npu/flm/qkv_route_probe.py`. Phase P1 emits 48 heads down **one** result
+fifo — 32 q, 8 k, 8 v — bound for three unrelated places: q′ contiguous into P2's
+query block, k′ a stride-TSEQ scatter into the channel-major K cache, v′
+contiguous into the position-major V cache. Every harness so far drains a fifo
+exactly once, so successive *partial* drains with different patterns had never
+been tried. If they did not work, P1 would need a fifo per destination, and a
+core tile has 2 output DMA channels.
+
+They work. All three destinations land exact, with the untouched K columns still
+zero (which attention's `npad` correction requires).
+
+**A fifo may have only one shim endpoint.** Asking for three
+`cons(tile=AnyShimTile)` is `redefinition of symbol named 'heads_shim_alloc'`.
+The working form is one handle drained three times — the split is in the
+*drains*, not the endpoints.
+
+**A K tile consumes two objects, not one.** The paired write is 2 elements per
+destination, so filling HEAD destinations needs 2·HEAD source values; channels
+0–31 come from the first object and 32–63 from the second, because the drain
+walks the source linearly while striding the destination. The probe initially
+reported k tags 5,7 and v tags 9,10 where 5,6 and 7,8 were expected — those
+numbers were **right**, and the expectation was wrong. Worth stating because the
+same off-by-one will appear in the real emit kernel's pack order.
+
+Two harness faults were fixed on the way, both of which would have muddied the
+answer:
+
+- **tags of `100h + i` are not exact in bf16**, which is only exact on integers
+  to 256. The routing error and the rounding error were indistinguishable until
+  the tag became a small per-head constant.
+- `stack_size` is 16384 here, not the usual 4096, because this kernel's emit
+  loop is exactly the shape that spills the accumulator file.
+
+That closes the primitives for Task 7's remaining harness: the inter-phase
+chain, the residual stash, the KV append geometry, core-static persistence, and
+now the three-way split are all measured.
