@@ -8758,3 +8758,35 @@ copies `g_resid`'s 128 values into one acquired object completes the pattern.
 That is the next step, and it is a kernel addition rather than a harness change —
 worth noting because the program-memory budget is measured and an extra entry
 point costs roughly what `flm_p1_emit` does.
+
+### `flm_h_emit`: P3's output is now dense, and P4 can be broadcast from it
+
+    seq 31: P3 h 9.5367e-07    seq 17 / 9: exact 0.0000e+00
+    program memory: P1 cores 12800 B (78%), attention cores 11472 B (70%)
+
+`flm_gemv_q4_1_residual` already stashed every row it computed in `g_resid` for
+P5's flush, so the emit only copies that slice out. P3 now acquires **one**
+result object for its whole 128-row slice instead of one per tile, taking the
+drain from 12% dense to 100% while keeping the object P1-sized.
+
+Two things had to be right, and neither was obvious:
+
+  * **`g_resid` spans a PAIR, not a core.** It is indexed `base % DIM_RESN`, and
+    a core-sized 128 *collides* — rows 0 and 128 land in the same slot, so tiles
+    0 and 4 overwrite each other. `resid_chain` sizes it `2*tiles*NROWS = 256`
+    for exactly this reason and `p1p2_chain` had never set the flag at all,
+    silently taking the 128 default. It did not matter until something read
+    `g_resid` back;
+  * so a core's rows are **scattered** through `g_resid` at `t*2*NR + j*NR`,
+    the two cores of a pair interleaving at NROWS granularity. The emit gathers
+    them, deriving `j` from the tile's `row_base`.
+
+The emit also has to reuse the loop's **last** tile rather than acquiring its
+own — an object released inside a `range_` body does not dominate a use after it
+(`operand #0 does not dominate this use`), and a fresh acquire would
+desynchronise the weight stream. That is the same constraint `p1_body` documents
+for `flm_p1_emit`, hit independently here.
+
+Cost: +752 B on the P1 cores (74% → 78%) and +768 B on the attention cores
+(65% → 70%). Both still have room for P4 and P5, which the probe put at ~2496 B
+and ~3312 B marginal.

@@ -90,6 +90,7 @@ BEG_SRC = str(KDIR / "flm_attn_begin.cc")
 FIN_SRC = str(KDIR / "flm_attn_finish.cc")
 RES_SRC = str(KDIR / "flm_gemv_residual.cc")
 ASUM_SRC = str(KDIR / "flm_asum_prepare.cc")
+HEMIT_SRC = str(KDIR / "flm_h_emit.cc")
 Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
 TSEQ, GQA, KVPER = 32, 4, 2
 OPERAND = 20544
@@ -143,7 +144,7 @@ def build(pos, nobj):
     # ffn_chain pattern, already used here for the KV cache.
     attn_all_ty = np.ndarray[(apairs * 2 * GQA * HEAD,), np.dtype[bfloat16]]
     w3_ty = np.ndarray[(2 * p3tiles * OPERAND,), np.dtype[np.uint8]]
-    h_ty = np.ndarray[(2 * p3tiles * OBJ,), np.dtype[bfloat16]]
+    h_ty = np.ndarray[(2 * OBJ,), np.dtype[bfloat16]]   # one object per core
     # P1's weights, then P2's q'+KV objects, on the same fifo
     w_all_ty = np.ndarray[(2 * hpc * TPH * wt,), np.dtype[np.uint8]]
     kvin_ty = bc_ty                      # q' rides the broadcast object
@@ -159,7 +160,9 @@ def build(pos, nobj):
              f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS={NQ}", f"-DDIM_QKHEADS={NK}",
              f"-DDIM_GQA={GQA}", f"-DDIM_TSEQ={TSEQ}", f"-DDIM_KVPER={KVPER}",
              f"-DDIM_QSTRIDE={OBJ}", f"-DDIM_KVOBJ={OPERAND}",
-             f"-DDIM_NPADOFF={32 * OBJ}", "-DQOFF_FROM_KV=1"]
+             f"-DDIM_NPADOFF={32 * OBJ}", "-DQOFF_FROM_KV=1",
+             f"-DDIM_RESN={2 * p3tiles * NROWS}",
+             f"-DDIM_P3TILES={p3tiles}"]
     # This list must match `at` element for element. Weights and q results are
     # per P1 PAIR (only those cores run P1); the cache, P3's weights and P3's
     # results are per pair, since every core runs P3.
@@ -203,6 +206,8 @@ def _design(bc: In, {P}):
     # flm_norm_prepare — P3 must not renormalise.
     kas = ExternalFunction("flm_asum_prepare", source_file=ASUM_SRC,
                            arg_types=[bc_ty], compile_flags=FLAGS)
+    khe = ExternalFunction("flm_h_emit", source_file=HEMIT_SRC,
+                           arg_types=[op_ty, p1o_ty], compile_flags=FLAGS)
     kr3 = ExternalFunction("flm_gemv_q4_1_residual", source_file=RES_SRC,
                            arg_types=[bc_ty, op_ty, p1o_ty],
                            compile_flags=FLAGS)
@@ -236,21 +241,34 @@ def _design(bc: In, {P}):
             wc.release(1)
         bcc.release(1)
 
-    def p3_body(bcc, wc, op, kres, kasum):
+    def p3_body(bcc, wc, op, kres, kasum, khemit):
         """o_proj + residual. Every core runs this — P3 is on all 16, only P1
         and P2 are partitioned. The broadcast's third fill carries the gathered
         attention output in its first K_DIM and the residual stream after it."""
         eb = bcc.acquire(1)
         kasum(eb)                      # g_asum for P3's activation
-        for _ in range_({p3tiles}):
+        # ONE result object for the core's whole 128-row slice, not one per
+        # tile. Per-tile objects are 12% dense and a drain cannot skip the
+        # padding, so P4 could never be broadcast a dense h from them. kres
+        # still takes an `out` and writes its NROWS there each time — those
+        # writes are overwritten and unused; the values that matter go to
+        # g_resid, which is where they were already going for P5.
+        eo = op.acquire(1)
+        for _ in range_({p3tiles} - 1):
             ew = wc.acquire(1)
-            eo = op.acquire(1)
             kres(eb, ew, eo)
-            op.release(1)
             wc.release(1)
+        # the emit reuses the LAST tile for its row_base, exactly as p1_body
+        # does: an object released inside the loop does not dominate a use
+        # after it, and a separate acquire would desynchronise the stream.
+        ew = wc.acquire(1)
+        kres(eb, ew, eo)
+        khemit(ew, eo)
+        wc.release(1)
+        op.release(1)
         bcc.release(1)
 
-    def core_p1(bcc, wc, op, kqkv, kemit, kprep, kres, kasum):
+    def core_p1(bcc, wc, op, kqkv, kemit, kprep, kres, kasum, khemit):
         p1_body(bcc, wc, op, kqkv, kemit, kprep)
         # A broadcast object must be consumed by EVERY consumer of the fifo.
         # These cores sit out P2, but the fifo still delivers them the q'
@@ -258,9 +276,9 @@ def _design(bc: In, {P}):
         # that do use it.
         eb2 = bcc.acquire(1)
         bcc.release(1)
-        p3_body(bcc, wc, op, kres, kasum)
+        p3_body(bcc, wc, op, kres, kasum, khemit)
 
-    def core_p1p2(bcc, wc, op, ap, kqkv, kemit, kprep, kbeg, ktile, kfin, kres, kasum):
+    def core_p1p2(bcc, wc, op, ap, kqkv, kemit, kprep, kbeg, ktile, kfin, kres, kasum, khemit):
         # Partition B: these cores do NOT run P1 — measured, five phases
         # overflow 16 KB of program memory. They must still consume the
         # broadcast's first fill (the activation), because a broadcast object
@@ -293,7 +311,7 @@ def _design(bc: In, {P}):
         kfin(eo, eq)
         ap.release(1)
         bcc.release(1)
-        p3_body(bcc, wc, op, kres, kasum)
+        p3_body(bcc, wc, op, kres, kasum, khemit)
 
     workers = []
     for p in range({npairs}):
@@ -302,12 +320,12 @@ def _design(bc: In, {P}):
             if p >= {npairs} - {apairs}:
                 workers.append(Worker(core_p1p2,
                     fn_args=[bc_cons[c], w_sub[p][j].cons(), p1_sub[p][j].prod(),
-                             p2_sub[p - ({npairs} - {apairs})][j].prod(), kq, ke, kn, kab, kat, kaf, kr3, kas],
+                             p2_sub[p - ({npairs} - {apairs})][j].prod(), kq, ke, kn, kab, kat, kaf, kr3, kas, khe],
                     stack_size=8192))
             else:
                 workers.append(Worker(core_p1,
                     fn_args=[bc_cons[c], w_sub[p][j].cons(), p1_sub[p][j].prod(),
-                             kq, ke, kn, kr3, kas], stack_size=8192))
+                             kq, ke, kn, kr3, kas, khe], stack_size=8192))
 
     def sequence(*args):
         n, a = {npairs}, {apairs}
@@ -405,7 +423,7 @@ def _design(bc: In, {P}):
               Worker=Worker, AnyShimTile=AnyShimTile, range_=range_,
               ExternalFunction=ExternalFunction, QKV_SRC=QKV_SRC,
               EMIT_SRC=EMIT_SRC, NORM_SRC=NORM_SRC, ATT_SRC=ATT_SRC,
-              BEG_SRC=BEG_SRC, RES_SRC=RES_SRC, ASUM_SRC=ASUM_SRC, FIN_SRC=FIN_SRC, FLAGS=flags, bc_ty=bc_ty,
+              BEG_SRC=BEG_SRC, RES_SRC=RES_SRC, ASUM_SRC=ASUM_SRC, HEMIT_SRC=HEMIT_SRC, FIN_SRC=FIN_SRC, FLAGS=flags, bc_ty=bc_ty,
               op_ty=op_ty, oppair_ty=oppair_ty, p1o_ty=p1o_ty,
               p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty, attn_all_ty=attn_all_ty, w3_ty=w3_ty, h_ty=h_ty, p3tiles=p3tiles,
               w_all_ty=w_all_ty, kvin_ty=kvin_ty, q_tys=q_tys,
@@ -617,7 +635,7 @@ def main():
         b = np.empty((p3tiles, 2, wt), np.uint8)
         b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
         w3.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
-    h_ts = [iron.zeros(2 * p3tiles * 2 * HEAD, dtype=bfloat16, device="npu")
+    h_ts = [iron.zeros(2 * 2 * HEAD, dtype=bfloat16, device="npu")
             for _ in range(npairs)]
 
     import os as _oh
@@ -672,17 +690,16 @@ def main():
         mb = (p1_b + kv_b) / 1e6
         print(f"  bench: {mb:.2f} MB  {mb*1e3/_us:.1f} GB/s  {_us:.1f} us "
               f"(marginal {_us - FIXED_US:.1f}, 16-core ideal {mb*17.85:.1f})")
-    got_h = np.concatenate([t.numpy().astype(np.float64)
-                            .reshape(-1, 2 * HEAD)[:, :NROWS].reshape(-1)
-                            for t in h_ts])
+    # dense now: each core emits its whole 128-row slice in one object
+    got_h = np.concatenate([t.numpy().astype(np.float64) for t in h_ts])
     order = np.concatenate([np.array(p3rows(pr, j)) + r
                             for pr in range(npairs) for t in range(p3tiles)
                             for j in (0, 1) for r in range(0)] or [np.zeros(0, int)])
+    # object order is [pair][core], each carrying that core's rows in tile order
     h_idx = np.concatenate([np.arange(r0, r0 + NROWS)
                             for pr in range(npairs)
-                            for t in range(p3tiles)
                             for j in (0, 1)
-                            for r0 in [p3rows(pr, j)[t]]])
+                            for r0 in p3rows(pr, j)])
     e3 = np.abs(got_h - h_ref[h_idx]).max()
     print(f"  P3 h      : max err {e3:.4e}  mean|ref| {np.abs(h_ref).mean():.5f}")
     if __import__("os").environ.get("CHAIN_P3_DIAG"):
