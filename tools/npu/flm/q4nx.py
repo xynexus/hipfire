@@ -260,27 +260,46 @@ def q4nx_decode_row(row, zero_point=False):
     return d.repeat(BLK) * q + z.repeat(BLK)
 
 
-def q4nx_decode_tensor(c, name, out_shape):
+def q4nx_decode_tensor(c, name, out_shape, interleave=None):
     """Decode a whole quantized tensor to its true (rows, cols) layout.
 
-    Container row `cr` is one 32x256 TILE: row-group `cr // 8`, column-group
-    `cr % 8`. Within a tile, block b covers checkpoint
+    A container row is one 32x256 TILE. With `ncg = cols // 256` column-groups:
 
-        row  = 64*(g//2) + 2*(b//8) + (g%2)        # rows interleave by 2
-        cols = 32*(8*(cr%8) + b%8) .. +32
+        g  = cr // ncg          # row-group
+        cg = cr %  ncg          # column-group
+        cols = 32*(8*cg + b%8) .. +32
 
-    The stride-2 row interleave and the 8-way scale/code transposes are all the
-    same 8-lane structure; `group_size_bytes = 8 * ROW_BYTES` names it.
+    and the row depends on whether the tensor is RoPE-rotated:
+
+        interleave  row = 64*(g//2) + 2*(b//8) + (g%2)    # q and k ONLY
+        plain       row = 32*g + b//8                     # everything else
+
+    The stride-2 interleave holds for **exactly** q_proj and k_proj and for no
+    other tensor -- which is the RoPE pair layout, not a fitted parameter. v is
+    never rotated and lands plain, as do o, gate, up and down.
+
+    Verified against Llama-3.2-1B-Instruct, all seven layer-0 tensors:
+
+        wq 0.996998   wk 0.996902   wv 0.996997   wo 0.997149
+        w1 0.997442   w3 0.997452   w2 0.997304        (corr)
+
+    with relative Frobenius error 0.072-0.079 throughout -- 4-bit quantization
+    error and nothing else.
+
+    interleave=None picks by name (q_proj/k_proj -> True).
     """
+    if interleave is None:
+        interleave = ("q_proj" in name) or ("k_proj" in name)
     R, C = out_shape
+    ncg = C // 256
     rows = c.rows(name)
     out = np.zeros((R, C), np.float32)
     b = np.arange(BLOCKS_PER_ROW)
     col = np.arange(BLK)
     for cr in range(rows.shape[0]):
         W = q4nx_decode_row(rows[cr]).reshape(BLOCKS_PER_ROW, BLK)
-        g, cg = cr // 8, cr % 8
-        r = 64 * (g // 2) + 2 * (b // 8) + (g % 2)
+        g, cg = cr // ncg, cr % ncg
+        r = (64 * (g // 2) + 2 * (b // 8) + (g % 2)) if interleave else (32 * g + b // 8)
         k = 8 * cg + (b % 8)
         out[r[:, None], k[:, None] * BLK + col[None, :]] = W
     return out

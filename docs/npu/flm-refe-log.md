@@ -7463,5 +7463,23 @@ was never a permutation problem, it was `d*(q-m)` vs `d*q+m`.
 checkpoint's weights; the kernels can now be verified as computing the model,
 not merely as doing q4_1 arithmetic.
 
-Open: `gate_proj` (8192x2048) still reconstructs at corr 0.034, so the tile
-formula needs generalising beyond the square/short cases that q and k cover.
+### Generalised: all seven tensors, and the interleave means something
+
+`gate_proj` failed only because the tile formula hard-coded 8 column-groups.
+With `ncg = cols // 256` (down_proj has 32), every layer-0 tensor reconstructs:
+
+| tensor | interleave | corr | relative Frobenius |
+|---|---|---|---|
+| wq | **True**  | 0.996998 | 0.0776 |
+| wk | **True**  | 0.996902 | 0.0788 |
+| wv | False | 0.996997 | 0.0775 |
+| wo | False | 0.997149 | 0.0756 |
+| w1 (gate) | False | 0.997442 | 0.0720 |
+| w3 (up)   | False | 0.997452 | 0.0718 |
+| w2 (down) | False | 0.997304 | 0.0738 |
+
+The stride-2 row interleave holds for **exactly q and k, and nothing else**.
+Those are precisely the RoPE-rotated tensors — v is never rotated and lands
+plain, as do o, gate, up and down. So the interleave is the RoPE pair layout,
+not a fitted parameter, and it is the same half-split structure `flm_gemv_qkv`
+already implements.
