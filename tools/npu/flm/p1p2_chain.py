@@ -89,6 +89,7 @@ ATT_SRC = str(KDIR / "flm_attn_decode.cc")
 BEG_SRC = str(KDIR / "flm_attn_begin.cc")
 FIN_SRC = str(KDIR / "flm_attn_finish.cc")
 RES_SRC = str(KDIR / "flm_gemv_residual.cc")
+ASUM_SRC = str(KDIR / "flm_asum_prepare.cc")
 Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
 TSEQ, GQA, KVPER = 32, 4, 2
 OPERAND = 20544
@@ -195,6 +196,13 @@ def _design(bc: In, {P}):
     # P3 shares P1's result fifo: a fifo of its own would need 8 more shim
     # outputs against a budget of 10 in 16. Its object is therefore P1-sized
     # (2*HEAD bf16) and the kernel fills only the first NROWS of it.
+    # P3 needs its OWN activation-sum prepare. flm_q4_1_tile folds the dequant
+    # as d*sum(q*a) + m*sum(a) and keeps sum(a) in the global g_asum, so a phase
+    # that changes the activation without re-running a prepare computes its `m`
+    # term against the PREVIOUS phase's sums. flm_asum_prepare, not
+    # flm_norm_prepare — P3 must not renormalise.
+    kas = ExternalFunction("flm_asum_prepare", source_file=ASUM_SRC,
+                           arg_types=[bc_ty], compile_flags=FLAGS)
     kr3 = ExternalFunction("flm_gemv_q4_1_residual", source_file=RES_SRC,
                            arg_types=[bc_ty, op_ty, p1o_ty],
                            compile_flags=FLAGS)
@@ -228,11 +236,12 @@ def _design(bc: In, {P}):
             wc.release(1)
         bcc.release(1)
 
-    def p3_body(bcc, wc, op, kres):
+    def p3_body(bcc, wc, op, kres, kasum):
         """o_proj + residual. Every core runs this — P3 is on all 16, only P1
         and P2 are partitioned. The broadcast's third fill carries the gathered
         attention output in its first K_DIM and the residual stream after it."""
         eb = bcc.acquire(1)
+        kasum(eb)                      # g_asum for P3's activation
         for _ in range_({p3tiles}):
             ew = wc.acquire(1)
             eo = op.acquire(1)
@@ -241,7 +250,7 @@ def _design(bc: In, {P}):
             wc.release(1)
         bcc.release(1)
 
-    def core_p1(bcc, wc, op, kqkv, kemit, kprep, kres):
+    def core_p1(bcc, wc, op, kqkv, kemit, kprep, kres, kasum):
         p1_body(bcc, wc, op, kqkv, kemit, kprep)
         # A broadcast object must be consumed by EVERY consumer of the fifo.
         # These cores sit out P2, but the fifo still delivers them the q'
@@ -249,9 +258,9 @@ def _design(bc: In, {P}):
         # that do use it.
         eb2 = bcc.acquire(1)
         bcc.release(1)
-        p3_body(bcc, wc, op, kres)
+        p3_body(bcc, wc, op, kres, kasum)
 
-    def core_p1p2(bcc, wc, op, ap, kqkv, kemit, kprep, kbeg, ktile, kfin, kres):
+    def core_p1p2(bcc, wc, op, ap, kqkv, kemit, kprep, kbeg, ktile, kfin, kres, kasum):
         # Partition B: these cores do NOT run P1 — measured, five phases
         # overflow 16 KB of program memory. They must still consume the
         # broadcast's first fill (the activation), because a broadcast object
@@ -284,7 +293,7 @@ def _design(bc: In, {P}):
         kfin(eo, eq)
         ap.release(1)
         bcc.release(1)
-        p3_body(bcc, wc, op, kres)
+        p3_body(bcc, wc, op, kres, kasum)
 
     workers = []
     for p in range({npairs}):
@@ -293,12 +302,12 @@ def _design(bc: In, {P}):
             if p >= {npairs} - {apairs}:
                 workers.append(Worker(core_p1p2,
                     fn_args=[bc_cons[c], w_sub[p][j].cons(), p1_sub[p][j].prod(),
-                             p2_sub[p - ({npairs} - {apairs})][j].prod(), kq, ke, kn, kab, kat, kaf, kr3],
+                             p2_sub[p - ({npairs} - {apairs})][j].prod(), kq, ke, kn, kab, kat, kaf, kr3, kas],
                     stack_size=8192))
             else:
                 workers.append(Worker(core_p1,
                     fn_args=[bc_cons[c], w_sub[p][j].cons(), p1_sub[p][j].prod(),
-                             kq, ke, kn, kr3], stack_size=8192))
+                             kq, ke, kn, kr3, kas], stack_size=8192))
 
     def sequence(*args):
         n, a = {npairs}, {apairs}
@@ -396,7 +405,7 @@ def _design(bc: In, {P}):
               Worker=Worker, AnyShimTile=AnyShimTile, range_=range_,
               ExternalFunction=ExternalFunction, QKV_SRC=QKV_SRC,
               EMIT_SRC=EMIT_SRC, NORM_SRC=NORM_SRC, ATT_SRC=ATT_SRC,
-              BEG_SRC=BEG_SRC, RES_SRC=RES_SRC, FIN_SRC=FIN_SRC, FLAGS=flags, bc_ty=bc_ty,
+              BEG_SRC=BEG_SRC, RES_SRC=RES_SRC, ASUM_SRC=ASUM_SRC, FIN_SRC=FIN_SRC, FLAGS=flags, bc_ty=bc_ty,
               op_ty=op_ty, oppair_ty=oppair_ty, p1o_ty=p1o_ty,
               p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty, attn_all_ty=attn_all_ty, w3_ty=w3_ty, h_ty=h_ty, p3tiles=p3tiles,
               w_all_ty=w_all_ty, kvin_ty=kvin_ty, q_tys=q_tys,
@@ -553,11 +562,31 @@ def main():
     # P2->P3 handoff carries the right bytes", which is the next step.
     od, om, oc = load_linear(c, f"model.layers.{o.layer}.self_attn.o_proj.weight",
                              K_DIM, K_DIM)
+    if __import__("os").environ.get("CHAIN_P3_MARK"):
+        # Each tile carries its own id: codes and d zeroed, m[.,0] = tile_id, so
+        # with an all-ones activation the GEMV for every row of tile t is
+        # exactly 32*t. The device output then names which tile landed where,
+        # which the all-zero control cannot show.
+        od = np.zeros_like(od); oc = np.zeros_like(oc)
+        om = np.zeros_like(om)
+        if __import__("os").environ.get("CHAIN_P3_MARK") == "d":
+            # marker in d*code instead of m: separates "the activation is not
+            # ones" from "m never reaches the kernel". d=1, code=1 over one
+            # block, act=ones -> every row of every tile returns exactly 32.
+            od[:, 0] = 1.0
+            oc[:, 0, :] = 1
+        else:
+            for _r in range(K_DIM):
+                om[_r, 0] = _r // NROWS
+        attn3_override = np.ones(K_DIM, np.float32)
+    else:
+        attn3_override = None
     if __import__("os").environ.get("CHAIN_P3_WZERO"):
         # zero weights -> the GEMV term is 0 and h must be exactly the residual.
         # If it is not, P3 is not reading the tiles this harness packs.
         od = np.zeros_like(od); om = np.zeros_like(om); oc = np.zeros_like(oc)
-    attn3 = (np.zeros(K_DIM, np.float32)
+    attn3 = (attn3_override if attn3_override is not None
+             else np.zeros(K_DIM, np.float32)
              if __import__('os').environ.get('CHAIN_P3_ZERO')
              else rnd(rng.standard_normal(K_DIM) * 0.05))
     bc3 = np.zeros(2 * K_DIM + 2 * HEAD, np.float32)

@@ -8685,3 +8685,42 @@ that: the residual comes from the *same object* at `act_aux + K`, and the
 residual is now proven correct, so the object is `bc3`. The likelier reading is
 that the earlier run did not rebuild — that test predates several structural
 edits, and this tree has been caught by a stale design five times.
+
+## 2026-08-01 — P1→P2→P3 in one dispatch. The bug was a missing activation-sum prepare
+
+    P1 cache : k' one bf16 ulp, v' 0.0
+    P3 h     : max err 9.5367e-07   (was 8.0859e-01)
+    attention: 3.4631e-03  PASS
+    seq 17 / seq 9: P3 h exact, 0.0000e+00
+
+**`flm_q4_1_tile` folds the dequant out of the inner loop:**
+
+    out[n] = sum_b ( d[n,b] * sum_t q[n,b,t]*a[b,t]  +  m[n,b] * sum_t a[b,t] )
+
+and `sum_t a[b,t]` lives in a **global**, `g_asum`, filled by a prepare kernel.
+P1 calls `flm_norm_prepare`; `p3_body` called nothing. So P3's `d*q` term was
+right and its `m` term was computed against **P1's activation sums**.
+
+A phase that changes the activation must re-run a prepare, and P3 needs
+`flm_asum_prepare` rather than `flm_norm_prepare` — it must not renormalise.
+`resid_chain` does exactly this and is why P3 is exact there; the call simply did
+not come across when the phase was ported.
+
+### The controls were consistent with this the whole time
+
+Each result now reads differently, and only the last one is decisive:
+
+| control | result | why |
+|---|---|---|
+| weights zeroed | exact | `m = 0`, so the broken term vanishes |
+| marker in `d`,`code` | exact | that term never touches `g_asum` |
+| marker in `m` alone | **zero output** | the *only* term that uses `g_asum` |
+
+The zero-weight control passing was read as "P3 reads my tiles", which was true
+but pointed at tile order — the one thing it cannot see. The finding actually
+lived in the *pair*: `d`·`code` exact **and** `m` dead is a one-line diagnosis,
+and neither control alone says it. Splitting a formula's terms across two probes
+was worth more than any amount of reasoning about ordering.
+
+Task 7 now has three of five phases chained: P1 (12 cores) → P2 (4 cores) →
+P3 (all 16), one dispatch, partition B, all exact or at the exp2 floor.
