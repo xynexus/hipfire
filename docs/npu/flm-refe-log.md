@@ -8038,3 +8038,34 @@ The risk therefore sits in P1's cache write, whose strided drains assume the
 current object size, and in whether an 8x-larger object still satisfies whatever
 alignment rule made a 4100 B broadcast object fail where 4160 B worked — a rule
 this tree has recorded as *unknown*.
+
+### Step 1 done: widening P3/P5's output object works, and is nearly free
+
+Tested in isolation on a copy of `resid_chain` with the per-core output object
+grown from `NROWS` (16 bf16) to `OBJW` = 128 bf16 — P1's size, so the two can
+share a fifo.
+
+**Correctness: exact.** `P3 h` and `P5 x_out` both max err **0.0000e+00**, same
+as baseline. The alignment worry did not bite: the pair object is 2x128 bf16 =
+512 B, already a multiple of 64.
+
+**Cost, 7 runs each:**
+
+    baseline  median 236.8   range 225.5-248.5
+    widened   median 242.8   range 227.9-259.8    +2.5%
+
+The ranges overlap heavily, so +2.5% is an upper bound rather than a
+measurement. Even taken at face value it costs ~0.25 ms/token and leaves the
+margin at +6.3% over FLM.
+
+Six lines do it: `ob_ty`, `o3pair_ty`, `o5pair_ty`, `o3_ty`, `o5_ty` and the
+`join([0, OBJW])` offset, plus a host-side `reshape(-1, OBJW)[:, :NROWS]` to
+take the live rows out of each object.
+
+**The `iron.jit` cache trap cost a run again — fifth time.** Widening the
+`np.ndarray` types is invisible to the cache because they reach the design
+through the *namespace*, not the source text, so the old build was silently
+reused and reported `compiled for 256 elements`. Putting `OBJW` in the fifo name
+fixed it. The rule holds with no exceptions so far: **if it is not in the source
+text, a CompileTime param, or a listed source file, it does not exist to the
+cache.**
