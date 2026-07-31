@@ -33,6 +33,7 @@ Needs PYTHONPATH=<mlir-aie>/build/python plus the Peano/XRT env.
 """
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -208,9 +209,23 @@ def main():
     p.add_argument("--aux-residual", action="store_true",
                    help="control: -DRESID_FROM_STASH=0, residual via the "
                         "broadcast aux half. Must pass and agree.")
+    p.add_argument("--keep-cache", action="store_true",
+                   help="skip the cache clear below. Only safe if the previous "
+                        "run used the same residual path.")
     o = p.parse_args()
     ncores, npairs = o.cores, o.cores // 2
     from_stash = not o.aux_residual
+
+    # **iron.jit does not hash `compile_flags`.** The two residual paths differ
+    # ONLY by -DRESID_FROM_STASH, with byte-identical sources, so the second run
+    # silently reuses the first run's kernel objects and reports the first
+    # path's behaviour under the second path's name. That produced a confident
+    # wrong diagnosis once already (docs/npu/flm-refe-log.md, 2026-07-31) — the
+    # stash looked like it read zeros when in fact the flush had been compiled
+    # for the aux path. Clearing is cheap next to being wrong.
+    cache = Path.home() / ".npu" / "cache"
+    if not o.keep_cache and cache.is_dir():
+        shutil.rmtree(cache, ignore_errors=True)
 
     c = q4nx.Q4nx(str(Q4NX))
     pre = f"model.layers.{o.layer}."
@@ -253,19 +268,27 @@ def main():
     bc[0, K_DIM:K_DIM + D_MODEL] = x                    # P3's residual
     for ch in range(NCHUNK):
         bc[1 + ch, :K_DIM] = sw[ch * K_DIM:(ch + 1) * K_DIM]
-        bc[1 + ch, K_DIM:K_DIM + D_MODEL] = 0.0 if from_stash else 0.0
+        # Poison the aux half in stash mode: if the flush is really reading
+        # the stash, this is never touched. If it reads aux, the output
+        # moves by exactly this, which names the bug instead of hiding it.
+        bc[1 + ch, K_DIM:K_DIM + D_MODEL] = (
+            -7.0 if from_stash else 0.0)
     bc_t = iron.tensor(bc.reshape(-1).astype(bfloat16), dtype=bfloat16, device="npu")
 
     # The row assignment makes each pair's drain a contiguous global run
     # (pair pr covers rows [pr*rpp, (pr+1)*rpp) in order), so concatenating the
     # pair buffers gives natural row order and the reference needs no
     # permutation at all.
-    # rnd(): P3 now emits bf16, so the reference must round too or it measures
-    # its own extra precision — the same trap gemv_reference_bf16 exists for.
-    h_global = rnd(np.concatenate([
+    # h at full precision, and its bf16 image. P3 EMITS bf16, so the emitted
+    # value must be compared against the rounded one — but the in-core stash
+    # keeps the float, so P5's residual add is more accurate than the aux route,
+    # which round-trips h through the broadcast in bf16. Which reference is
+    # right therefore depends on the path under test.
+    h_exact = np.concatenate([
         q4nx.gemv_reference_bf16(attn_out, od[r:r+NROWS], om[r:r+NROWS],
                                  oc[r:r+NROWS])
-        for r in range(0, D_MODEL, NROWS)]) + x.astype(np.float64)).astype(np.float64)
+        for r in range(0, D_MODEL, NROWS)]) + x.astype(np.float64)
+    h_global = rnd(h_exact).astype(np.float64)
     if not from_stash:
         # The control has to route the residual through the aux half, which
         # means the HOST must already know h — exactly the copy the stash
@@ -291,7 +314,8 @@ def main():
         q4nx.gemv_reference_bf16(sw, dd[r:r+NROWS], dm[r:r+NROWS], dc[r:r+NROWS])
         for r in range(0, D_MODEL, NROWS)])
     # x_out is emitted as bf16 too — round the reference to match.
-    ref_x = rnd(down + ref_h).astype(np.float64)
+    # the stash carries float h; the aux route carries bf16 h
+    ref_x = rnd(down + (h_exact if from_stash else ref_h)).astype(np.float64)
 
     if __import__("os").environ.get("RC_DIAG"):
         import sys as _s

@@ -176,3 +176,12 @@ Each is a thing that cost real time; module docstrings have the detail.
   And the block-range (`d`) distribution appears to confirm a 32-contiguous
   grouping — until a random regrouping of the same weights matches it just as
   well. Both would have shipped a confident wrong answer.
+- **`iron.jit` does not hash `compile_flags` either.** The known trap is that it
+  does not hash `ExternalFunction(source_file=...)`; this is the same hole one
+  level down. Two designs whose sources are byte-identical and which differ only
+  by a `-D` value get the **same cache key**, so the second silently runs the
+  first's kernels. It is worse than the source-file case because nothing looks
+  stale — the flag is right there in the code being read. It cost a whole cycle
+  and a wrong published conclusion (`docs/npu/flm-refe-log.md`, the in-core
+  residual stash "reading zeros"). Any harness with two `-D` variants must clear
+  `~/.npu/cache` between them; `resid_chain.py` does it automatically.

@@ -6181,7 +6181,40 @@ half:
 Exact, once the reference rounds to bf16 at both points the device does — the
 `gemv_reference_bf16` lesson again, and it cost two rounds here.
 
-### Open: the in-core stash reads as zero
+### RESOLVED — it does not. `iron.jit` does not hash `compile_flags`
+
+> The section below is **wrong**, and kept because how it was wrong is the
+> point. The stash works, exactly (0.0000e+00). It looked broken because
+> `iron.jit` **does not include `compile_flags` in its cache key**: the two
+> residual paths differ only by `-DRESID_FROM_STASH`, with byte-identical
+> sources, so running `--aux-residual` first and the stash second silently
+> reused the aux-compiled flush and reported *its* behaviour under the stash's
+> name. Every elimination below is individually correct and the conclusion is
+> still false, because they all assumed the binary matched the source.
+>
+> **What actually named it:** poisoning the aux half with −7.0 in stash mode.
+> If the flush were reading the stash, that value is never touched; the output
+> moved by exactly −7.0. One deliberate wrong value did what four correct
+> eliminations could not.
+>
+> With a cleared cache, both paths are exact:
+>
+> | | P3 `h` | P5 `x_out` |
+> |---|---|---|
+> | in-core stash | **0.0000e+00** | **0.0000e+00** |
+> | broadcast aux (control) | **0.0000e+00** | **0.0000e+00** |
+>
+> And the stash is **more accurate by construction**: it carries `h` in float,
+> where the aux route round-trips it through the broadcast in bf16. The
+> reference has to model whichever path is under test, which is why this only
+> reached 0.0 once that was separated.
+>
+> `resid_chain.py` now clears `~/.npu/cache` itself unless `--keep-cache` is
+> passed. This is the **fourth** instance of this trap family and the worst:
+> the source-file case at least leaves stale-looking code, whereas here the flag
+> is right there in the file being read.
+
+### Superseded: the in-core stash reads as zero
 
 `-DRESID_FROM_STASH=1` fails, and the diagnostic is unambiguous: `x_out` matches
 `W_down·swiglu + 0` at **100% exact**, so `flm_gemv_flush` reads `g_resid` as
