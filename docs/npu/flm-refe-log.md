@@ -8492,3 +8492,39 @@ four times here. Displacement cost depends on whether a phase is bound by cores
 or by bandwidth, and P1 is the second.
 
 Regression: `p1_route` at 16 cores and `p1p2_chain` at NATT=4 both unchanged.
+
+## 2026-08-01 — partition B runs end to end (P1→P2)
+
+`p1p2_chain` now implements partition B: **P1 on 12 cores (pairs 0–5), attention
+on 4 (pairs 6–7)**, no core holding both. It passes at every sequence length
+tried, with error identical to the all-16 version:
+
+    seq 31: 3.4631e-03   seq 17: 3.8689e-03   seq 9: 5.9281e-03    (tol ~3.9e-03)
+    P1 cache: k' one bf16 ulp, v' 0.0
+    CHAIN_HOST_KV control: 3.4631e-03 — bit-identical to the device cache
+
+Timing is unchanged too: median 82.1 µs against 82.2 for the all-16 build, ranges
+overlapping. As `p1_route` predicted, moving P1 to 12 cores costs nothing
+measurable — it is fabric-bound.
+
+The attention cores now acquire and release the broadcast's **first** fill
+without using it. A broadcast object is recycled only once every consumer has
+taken it, so a core that skips P1 must still take the activation or it stalls the
+cores that use it.
+
+### A latent bug this exposed
+
+    src = kvb[1 + i] if HOSTKV else cb[i]
+
+The host caches follow the `a` q′ broadcast buffers, so they start at `kvb[a]`.
+`kvb[1 + i]` is only correct when `a == 1` — i.e. NATT=2. **At NATT=4 it read a
+q′ buffer as a KV cache**, and the control produced values around 1e25 rather
+than failing loudly. It has been wrong since NATT=4 started routing and nothing
+caught it, because the control is a diagnostic that is only consulted when
+something else is already suspect.
+
+Fixed to `kvb[a + i]`; the control now returns exactly the device-cache result,
+which is the strongest statement yet that the P1→P2 cache handoff is correct.
+
+Remaining for Task 7: P3, P4 and P5 onto this chain. The layout, drain-plan and
+per-pair-type machinery they need is now in place and exercised.

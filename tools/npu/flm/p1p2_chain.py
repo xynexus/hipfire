@@ -69,7 +69,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 import q4nx  # noqa: E402
 from qkv_verify import HEAD, K_DIM, NROWS, TPH, EPS, ROPE_THETA, qkv_rows, rope_ref  # noqa: E402
-from p1_route import NQ, NK, NV, NCORES, HPC, heads_of, rnd  # noqa: E402
+from p1_route import (NQ, NK, NV, NCORES, HPC, heads_of, rnd,  # noqa: E402
+                      head_layout, hpc_for, drain_plan)
 
 import aie.iron as iron  # noqa: E402
 from aie.iron import In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker  # noqa: E402
@@ -96,6 +97,13 @@ def build(pos, nobj):
     wt = q4nx.tile_bytes(K_DIM, NROWS)
     npairs = NCORES // 2
     apairs = NATT // 2
+    # Partition B: the attention cores cannot also hold P1's kernels (measured —
+    # five phases overflow 16 KB), so P1 spreads over the remaining cores.
+    p1pairs = npairs - apairs
+    p1cores = 2 * p1pairs
+    hpc = hpc_for(p1cores)
+    layout = head_layout(p1cores)
+    qobj, kvplan = drain_plan(p1cores)
     BC = 2 * K_DIM + 2 * HEAD
     OBJ = 2 * HEAD                                  # P1 result object, bf16
     KTILE, VTILE = HEAD * TSEQ, TSEQ * HEAD
@@ -124,9 +132,12 @@ def build(pos, nobj):
     p2o_ty = np.ndarray[(GQA * HEAD,), np.dtype[bfloat16]]
     p2opair_ty = np.ndarray[(2 * GQA * HEAD,), np.dtype[bfloat16]]
     # P1's weights, then P2's q'+KV objects, on the same fifo
-    w_all_ty = np.ndarray[(2 * HPC * TPH * wt,), np.dtype[np.uint8]]
+    w_all_ty = np.ndarray[(2 * hpc * TPH * wt,), np.dtype[np.uint8]]
     kvin_ty = bc_ty                      # q' rides the broadcast object
-    q_ty = np.ndarray[(4 * OBJ,), np.dtype[bfloat16]]
+    # one per P1 pair: at 12 P1 cores pairs 0-3 emit 4 q objects and
+    # pairs 4-5 emit 8, since the KV-carrying cores spend two slots on k/v
+    q_tys = [np.ndarray[(qobj[i] * OBJ,), np.dtype[bfloat16]]
+             for i in range(p1pairs)]
     # uint8, matching the operand fifo it feeds. A fill whose buffer and fifo
     # disagree on element width counts its sizes in the wrong unit.
     cache_ty = np.ndarray[(nobj * 2 * NATT * SLOT,), np.dtype[np.uint8]]
@@ -180,7 +191,7 @@ def _design(bc: In, {P}):
     def p1_body(bcc, wc, op, kqkv, kemit, kprep):
         eb = bcc.acquire(1)
         kprep(eb)
-        for _ in range_({HPC}):
+        for _ in range_({hpc}):
             for _ in range_({TPH} - 1):
                 ew = wc.acquire(1)
                 kqkv(eb, ew)
@@ -203,8 +214,13 @@ def _design(bc: In, {P}):
         bcc.release(1)
 
     def core_p1p2(bcc, wc, op, ap, kqkv, kemit, kprep, kbeg, ktile, kfin):
-        if not {SKIP_P1}:
-            p1_body(bcc, wc, op, kqkv, kemit, kprep)
+        # Partition B: these cores do NOT run P1 — measured, five phases
+        # overflow 16 KB of program memory. They must still consume the
+        # broadcast's first fill (the activation), because a broadcast object
+        # is only recycled once every consumer has taken it; skipping it stalls
+        # the cores that do use it.
+        _act = bcc.acquire(1)
+        bcc.release(1)
         # ---- P2: q' arrives on the BROADCAST, KV tiles on the weight fifo ----
         # This used to read q' from `wc` while the sequence delivered it on the
         # broadcast — so kbeg/ktile were handed KV-cache bytes as q'. That is
@@ -248,47 +264,50 @@ def _design(bc: In, {P}):
     def sequence(*args):
         n, a = {npairs}, {apairs}
         bcb = args[0]
-        wb = [args[1 + i] for i in range(n)]
-        kvb = [args[1 + n + i] for i in range(a + (a if {HOSTKV} else 0))]
+        wb = [args[1 + i] for i in range({p1pairs})]
+        kvb = [args[1 + {p1pairs} + i]
+               for i in range(a + (a if {HOSTKV} else 0))]
         ax = a + (a if {HOSTKV} else 0)
-        qb = [args[1 + n + ax + i] for i in range(n)]
-        cb = [args[1 + 2 * n + ax + i] for i in range(n)]
-        ab = [args[1 + 3 * n + ax + i] for i in range(a)]
-        base = 1 + 3 * n + ax + a
+        qb = [args[1 + {p1pairs} + ax + i] for i in range({p1pairs})]
+        cb = [args[1 + 2 * {p1pairs} + ax + i] for i in range(n)]
+        ab = [args[1 + 2 * {p1pairs} + ax + n + i] for i in range(a)]
+        base = 1 + 2 * {p1pairs} + ax + n + a
         bch = args[base]
-        wh = [args[base + 1 + i] for i in range(n)]
+        wh = [args[base + 1 + i] for i in range(n)]   # all pairs: KV rides these
         p1h = [args[base + 1 + n + i] for i in range(n)]
         p2h = [args[base + 1 + 2 * n + i] for i in range(a)]
 
         tg = TaskGroup()
         bch.fill(bcb, group=tg)
-        for i in range(n):
-            if {SKIP_P1} and i >= n - a:
-                continue          # these cores skip P1, so no weights for them
+        for i in range({p1pairs}):     # partition B: only these pairs run P1
             wh[i].fill(wb[i], group=tg)
-        for i in range(n):
-            if {SKIP_P1} and i >= n - a:
-                continue
+        QOBJ, KVPLAN = {qobj!r}, {kvplan!r}
+        for i in range({p1pairs}):
             p1h[i].drain(qb[i], wait=True, group=tg,
-                         sizes=[1, 1, 1, 4 * {OBJ}], strides=[0, 0, 0, 1])
-            if i < n // 2:
-                p1h[i].drain(cb[i], wait=True, group=tg,
-                             offset=2 * (2 * i * {SLOT} + {off}),
-                             sizes=[1, 2, {HEAD}, 4],
-                             strides=[0, 2 * {SLOT}, 2 * {TSEQ}, 1])
-            else:
-                p1h[i].drain(cb[i], wait=True, group=tg,
-                             offset=2 * (2 * (i - n // 2) * {SLOT} + {KTILE}
-                                         + {pos} * {HEAD}),
-                             sizes=[1, 2, 1, 2 * {OBJ}],
-                             strides=[0, 2 * {SLOT}, 0, 1])
+                         sizes=[1, 1, 1, QOBJ[i] * {OBJ}], strides=[0, 0, 0, 1])
+            for _kind, _base in KVPLAN[i]:
+                if _kind == "k":
+                    p1h[i].drain(cb[i], wait=True, group=tg,
+                                 offset=2 * (_base * {SLOT} + {off}),
+                                 sizes=[1, 2, {HEAD}, 4],
+                                 strides=[0, 2 * {SLOT}, 2 * {TSEQ}, 1])
+                else:
+                    p1h[i].drain(cb[i], wait=True, group=tg,
+                                 offset=2 * (_base * {SLOT} + {KTILE}
+                                             + {pos} * {HEAD}),
+                                 sizes=[1, 2, 1, 2 * {OBJ}],
+                                 strides=[0, 2 * {SLOT}, 0, 1])
         tg.finish()
 
         # ---- P2 ----------------------------------------------------------
         tg = TaskGroup()
         bch.fill(kvb[0], group=tg)          # the broadcast now carries q'
         for i in range(a):
-            src = kvb[1 + i] if {HOSTKV} else cb[i]
+            # the host caches follow the `a` q' broadcast buffers, so they
+            # start at kvb[a] — `kvb[1 + i]` only happened to be right when
+            # apairs was 1 (NATT=2) and silently read a q' buffer as a cache
+            # at NATT=4.
+            src = kvb[a + i] if {HOSTKV} else cb[i]
             # One fill per KV object. A single strided fill cannot express this:
             # the 2*OPERAND run decomposes into 6 x 3424, which uses up the BD's
             # dimensions and pushes the object stride into the repeat-count slot
@@ -301,9 +320,9 @@ def _design(bc: In, {P}):
             p2h[i].drain(ab[i], wait=True, group=tg)
         tg.finish()
 
-    at = [bc_ty] + [w_all_ty] * {npairs} + [kvin_ty] * {apairs}
+    at = [bc_ty] + [w_all_ty] * {p1pairs} + [kvin_ty] * {apairs}
     at += [cache_ty] * ({apairs} if {HOSTKV} else 0)
-    at += [q_ty] * {npairs} + [cache_ty] * {npairs} + [p2opair_ty] * {apairs}
+    at += list(q_tys) + [cache_ty] * {npairs} + [p2opair_ty] * {apairs}
     at += [f_bc.prod(tile=AnyShimTile)]
     at += [f.prod(tile=AnyShimTile) for f in f_w]
     at += [f.cons(tile=AnyShimTile) for f in f_p1]
@@ -319,7 +338,7 @@ def _design(bc: In, {P}):
               BEG_SRC=BEG_SRC, FIN_SRC=FIN_SRC, FLAGS=flags, bc_ty=bc_ty,
               op_ty=op_ty, oppair_ty=oppair_ty, p1o_ty=p1o_ty,
               p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty,
-              w_all_ty=w_all_ty, kvin_ty=kvin_ty, q_ty=q_ty,
+              w_all_ty=w_all_ty, kvin_ty=kvin_ty, q_tys=q_tys,
               cache_ty=cache_ty, SKIP_P1=SKIP_P1, HOSTKV=HOSTKV,
               PREP=PREP, PREPSRC=PREPSRC,
               __name__="flm_p1p2")
@@ -368,6 +387,10 @@ def main():
                 f"verification, not this flag.")
     npad = nobj * KVPER * TSEQ - o.seq
     npairs, apairs = NCORES // 2, NATT // 2
+    p1pairs = npairs - apairs          # partition B: attention cores skip P1
+    hpc = hpc_for(2 * p1pairs)
+    layout = head_layout(2 * p1pairs)
+    qobj, _kvplan = drain_plan(2 * p1pairs)
 
     c = q4nx.Q4nx(str(Q4NX))
     nw = c.bf16(f"model.layers.{o.layer}.input_layernorm.weight").astype(np.float32)[:K_DIM]
@@ -394,11 +417,11 @@ def main():
     bc[2 * K_DIM + HEAD:] = cs_k
     bc_t = iron.tensor(bc.astype(bfloat16), dtype=bfloat16, device="npu")
     w_ts, ref = [], {}
-    for pr in range(npairs):
+    for pr in range(p1pairs):
         per = []
         for j in range(2):
             blob = []
-            for h in heads_of(2 * pr + j):
+            for h in layout[2 * pr + j]:
                 first = h * HEAD
                 d, m, q = qkv_rows(c, o.layer, first, HEAD)
                 blob.append(np.concatenate([
@@ -415,7 +438,7 @@ def main():
                     v = rope_ref(v, cs_k)
                 ref[h] = rnd(v).astype(np.float64)
             per.append(np.concatenate(blob))
-        b = np.empty((HPC * TPH, 2, wt), np.uint8)
+        b = np.empty((hpc * TPH, 2, wt), np.uint8)
         b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
         w_ts.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
 
@@ -456,8 +479,8 @@ def main():
     # of them, and a short list silently shifts every later argument.
     q_in = [iron.tensor(qraw.view(bfloat16), dtype=bfloat16, device="npu")] * apairs
 
-    q_ts = [iron.zeros(4 * OBJ, dtype=bfloat16, device="npu")
-            for _ in range(npairs)]
+    q_ts = [iron.zeros(qobj[pr] * OBJ, dtype=bfloat16, device="npu")
+            for pr in range(p1pairs)]
     a_ts = [iron.zeros(2 * GQA * HEAD, dtype=bfloat16, device="npu")
             for _ in range(apairs)]
     import os as _oh
@@ -506,7 +529,7 @@ def main():
     # ---- reference: attention over the cache INCLUDING P1's appended token --
     if o.bench and _us is not None:
         FIXED_US = 92.9
-        p1_b = npairs * 2 * HPC * TPH * q4nx.tile_bytes(K_DIM, NROWS)
+        p1_b = p1pairs * 2 * hpc * TPH * q4nx.tile_bytes(K_DIM, NROWS)
         kv_b = apairs * 2 * OPERAND * nobj
         mb = (p1_b + kv_b) / 1e6
         print(f"  bench: {mb:.2f} MB  {mb*1e3/_us:.1f} GB/s  {_us:.1f} us "
