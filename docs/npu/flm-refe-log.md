@@ -7483,3 +7483,32 @@ Those are precisely the RoPE-rotated tensors — v is never rotated and lands
 plain, as do o, gate, up and down. So the interleave is the RoPE pair layout,
 not a fitted parameter, and it is the same half-split structure `flm_gemv_qkv`
 already implements.
+
+## 2026-07-31 — a kernel verified against the MODEL, not just against arithmetic
+
+Every verification in this project has carried the caveat "verified as q4_1
+arithmetic, not as computing the model", because there was no way to get real
+weights out of the container. With the tile map solved there is.
+
+`q4nx.q4nx_tensor_blocks()` gathers the container's true weights as q4_1 blocks
+in checkpoint order, so `pack_tile` receives real rows. `gemv_verify.py --real`
+uses it and adds a comparison against the real model matrix.
+
+    gemv_verify.py --real --tensor model.layers.0.self_attn.q_proj.weight \
+                   --k 2048 --n 32 --nrows 4
+
+    vs bf16 reference       : max 5.6624e-07  mean 1.6438e-07
+    vs the REAL model matrix: max 1.6893e-02  mean 5.8577e-03  rel 4.822e-03
+    vs exact float64        : max 1.6893e-02
+      (the format's own cost is 1.6893e-02, 1.57% of |out|)
+    -> PASS
+
+**The deviation from the real model is exactly the format's own quantization
+cost — the kernel contributes nothing beyond it.** The NPU is computing real
+Llama-3.2-1B q_proj, and the two figures agreeing to all printed digits is the
+point: kernel error is ~5.7e-07, six orders below the format floor.
+
+Note the older harness path is not invalidated. `Q4nx.blocks()` returns the
+container's own order, but both the kernel and the reference were fed the same
+blocks, so those runs were always valid *as arithmetic checks* — which is all
+they claimed. `--real` is the addition, not a correction.

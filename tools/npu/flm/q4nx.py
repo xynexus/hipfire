@@ -303,3 +303,43 @@ def q4nx_decode_tensor(c, name, out_shape, interleave=None):
         k = 8 * cg + (b % 8)
         out[r[:, None], k[:, None] * BLK + col[None, :]] = W
     return out
+
+
+def q4nx_tensor_blocks(c, name, out_shape, interleave=None):
+    """Real weights in checkpoint order, as q4_1 blocks the kernels can eat.
+
+    -> (D, M, CODES) with shapes (R, C//BLK), (R, C//BLK), (R, C//BLK, BLK).
+    Block (r, k) covers `out[r, 32k : 32k+32] == D[r,k]*CODES[r,k] + M[r,k]`.
+
+    `Q4nx.blocks()` returns the container's own row/nibble order, which is NOT
+    the checkpoint's -- fine for checking kernel-vs-reference arithmetic on
+    identical inputs (which is all it was ever used for), useless for feeding a
+    kernel the actual model. This gathers the same data through the solved tile
+    map so `pack_tile` receives real rows.
+    """
+    if interleave is None:
+        interleave = ("q_proj" in name) or ("k_proj" in name)
+    R, C = out_shape
+    NK = C // BLK
+    ncg = C // 256
+    rows = c.rows(name)
+    lo, hi, sidx = q4nx_maps()
+    D = np.zeros((R, NK), np.float32)
+    M = np.zeros((R, NK), np.float32)
+    CODES = np.zeros((R, NK, BLK), np.uint8)
+    b = np.arange(BLOCKS_PER_ROW)
+    for cr in range(rows.shape[0]):
+        row = rows[cr]
+        d = bf16_to_f32(row[0:512].copy().view(np.uint16))[sidx]
+        m = bf16_to_f32(row[512:1024].copy().view(np.uint16))[sidx]
+        by = row[1024:ROW_BYTES]
+        q = np.empty(8192, np.uint8)
+        q[lo] = by & 0x0F
+        q[hi] = by >> 4
+        g, cg = cr // ncg, cr % ncg
+        r = (64 * (g // 2) + 2 * (b // 8) + (g % 2)) if interleave else (32 * g + b // 8)
+        k = 8 * cg + (b % 8)
+        D[r, k] = d
+        M[r, k] = m
+        CODES[r, k] = q.reshape(BLOCKS_PER_ROW, BLK)
+    return D, M, CODES

@@ -125,6 +125,8 @@ def main():
     p.add_argument("--k", type=int, default=2048)
     p.add_argument("--n", type=int, default=8, help="output rows total")
     p.add_argument("--nrows", type=int, default=8, help="output rows per tile")
+    p.add_argument("--real", action="store_true",
+                   help="use the container's TRUE weights (solved tile map), and additionally check the device against the real model matrix")
     p.add_argument("--tensor", default="model.layers.0.mlp.down_proj.weight")
     o = p.parse_args()
 
@@ -136,12 +138,30 @@ def main():
     # Real q4_1 data from FLM's container. A 5120-byte row carries 256 blocks;
     # take as many as this shape needs and regroup them into (rows, NB).
     c = q4nx.Q4nx(str(Q4NX))
-    d_all, m_all, codes_all = c.blocks(o.tensor)
-    need = N * NB
-    flat_d = d_all.ravel()[:need].reshape(N, NB).astype(np.float32)
-    flat_m = m_all.ravel()[:need].reshape(N, NB).astype(np.float32)
-    flat_c = codes_all.reshape(-1, BLK_C)[:need].reshape(N, NB, BLK_C)
-    print(f"{o.tensor}: using {need} real q4_1 blocks -> {N} rows x {NB} blocks, K={K}")
+    ckpt_W = None
+    if o.real:
+        # The container's TRUE weights, in checkpoint order. Without this the
+        # blocks are real q4_1 data but scrambled, so the kernel is checked
+        # against arithmetic rather than against the model.
+        cols = 8192 if "down_proj" in o.tensor else 2048
+        R = c.header[o.tensor]["shape"][0] * 8192 // cols
+        if K > cols or N > R:
+            raise SystemExit(f"--real: {o.tensor} is {R}x{cols}, too small for "
+                             f"N={N} K={K}")
+        D, M, CD = q4nx.q4nx_tensor_blocks(c, o.tensor, (R, cols))
+        flat_d = D[:N, :NB].astype(np.float32)
+        flat_m = M[:N, :NB].astype(np.float32)
+        flat_c = CD[:N, :NB]
+        ckpt_W = (flat_d[:, :, None] * flat_c + flat_m[:, :, None]).reshape(N, K)
+        print(f"{o.tensor}: REAL weights, {o.tensor} is {R}x{cols} -> "
+              f"{N} rows x {NB} blocks, K={K}")
+    else:
+        d_all, m_all, codes_all = c.blocks(o.tensor)
+        need = N * NB
+        flat_d = d_all.ravel()[:need].reshape(N, NB).astype(np.float32)
+        flat_m = m_all.ravel()[:need].reshape(N, NB).astype(np.float32)
+        flat_c = codes_all.reshape(-1, BLK_C)[:need].reshape(N, NB, BLK_C)
+        print(f"{o.tensor}: using {need} real q4_1 blocks -> {N} rows x {NB} blocks, K={K}")
     print(f"  d in [{flat_d.min():.5g}, {flat_d.max():.5g}]  "
           f"m in [{flat_m.min():.5g}, {flat_m.max():.5g}]  "
           f"codes in [{flat_c.min()}, {flat_c.max()}]")
@@ -186,6 +206,11 @@ def main():
         print(f"{i:5d} {got[i]:14.6f} {expected[i]:14.6f} {exact[i]:14.6f} "
               f"{err[i]:11.3e}")
     print(f"\nvs bf16 reference : max {err.max():.4e}  mean {err.mean():.4e}")
+    if ckpt_W is not None:
+        model_ref = (ckpt_W.astype(np.float64) @ act.astype(np.float64))
+        me = np.abs(got - model_ref)
+        print(f"\nvs the REAL model matrix: max {me.max():.4e}  mean {me.mean():.4e}  "
+              f"rel {me.max()/ (np.abs(model_ref).max() + 1e-30):.3e}")
     print(f"vs exact float64  : max {np.abs(got - exact).max():.4e}   "
           f"(the format's own cost is {fmt_err.max():.4e}, "
           f"{fmt_err.max()/scale:.2%} of |out|)")
