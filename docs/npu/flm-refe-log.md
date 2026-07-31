@@ -8412,3 +8412,39 @@ Remaining for partition B: thread the core count through `build()` — `npairs`,
 the KV drains against `kv_placement()` instead of the `i < n // 2` branch. The
 layout now guarantees those drains stay uniform, which is the whole point of
 choosing it this way.
+
+### The KV drains are now derived from the layout, not branched on a rule
+
+`drain_plan(ncores)` turns `head_layout` into per-pair drain descriptors, and the
+sequence emits them instead of branching:
+
+    16 cores  qobj [4,4,4,4,4,4,4,4]
+              kv   [[k0],[k2],[k4],[k6],[v0],[v2],[v4],[v6]]
+
+    12 cores  qobj [4,4,4,4,8,8]
+              kv   [[v0,k0],[v2,k2],[v4,k4],[v6,k6],[],[]]
+
+The old code said `elif i < n // 2:` — a statement of the 16-core placement
+dressed as control flow. It cannot express the 12-core case at all: pairs 0-3
+carry **both** a v and a k, and pairs 4-5 carry neither and drain twice as many
+q objects.
+
+Two details the plan has to respect and the branch never had to:
+
+  * **slot order.** A pair's stream is consumed linearly, so at 12 cores the v
+    drain must be emitted *before* the k drain — v is in slot 2, k in slot 3.
+    Getting this backwards would read k' bytes as v' and vice versa, silently;
+  * **q must be a prefix.** The q drain takes the head of the stream, so
+    `drain_plan` raises if a layout ever puts a q slot after a KV slot rather
+    than producing a subtly wrong drain.
+
+`build()` now takes `ncores` and derives `hpc`, `npairs`, the weight/result
+types and the `range_` trip count from it.
+
+Regression, all bit-identical: `p1_route` at 16 cores (q′ 9.5367e-07, k′ one bf16
+ulp, v′ 0.0), `p1p2_chain` at NATT=4, and `qkv_verify`.
+
+What remains for a 12-core P1 run: the **host** side still packs the weight
+stream and unpacks the results through `HPC` and the 16-core `heads_of`
+(`p1_route.py` lines 374-403), and there is no `--p1-cores` flag yet. The device
+side is done.

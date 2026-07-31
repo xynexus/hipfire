@@ -138,9 +138,36 @@ def kv_placement(ncores=NCORES):
     return k_at, v_at
 
 
-def build(pos):
+def drain_plan(ncores=NCORES):
+    """-> (qobj, kvplan): q objects per pair, and its KV drains in SLOT order.
+
+    Derived from `head_layout` so the drains follow the assignment instead of
+    encoding one. The old code branched `elif i < n // 2`, which states the
+    16-core placement as a rule; at 12 cores pairs 0-3 carry a v *and* a k and
+    pairs 4-5 carry neither, which that branch cannot say.
+
+    Slot order matters: a pair's stream is consumed linearly, so the drains must
+    be emitted in the order the core wrote them.
+    """
+    layout = head_layout(ncores)
+    qobj, kvplan = [], []
+    for pr in range(ncores // 2):
+        row = layout[2 * pr]
+        qslots = [s for s, h in enumerate(row) if h < NQ]
+        if qslots != list(range(len(qslots))):
+            raise ValueError(f"pair {pr}: q slots {qslots} are not a prefix; "
+                             "the q drain takes the head of the stream")
+        qobj.append(2 * len(qslots))
+        kvplan.append([("k", h - NQ) if h < NK else ("v", h - NK)
+                       for h in row if h >= NQ])
+    return qobj, kvplan
+
+
+def build(pos, ncores=NCORES):
     wt = q4nx.tile_bytes(K_DIM, NROWS)
-    npairs = NCORES // 2
+    npairs = ncores // 2
+    hpc = hpc_for(ncores)
+    qobj, kvplan = drain_plan(ncores)
     BC = 2 * K_DIM + 2 * HEAD
     OBJ = 2 * HEAD                              # 2*HEAD for every head
     KTILE, VTILE = HEAD * TSEQ, TSEQ * HEAD
@@ -151,11 +178,11 @@ def build(pos):
     o_ty = np.ndarray[(OBJ,), np.dtype[bfloat16]]
     wpair_ty = np.ndarray[(2 * wt,), np.dtype[np.uint8]]
     opair_ty = np.ndarray[(2 * OBJ,), np.dtype[bfloat16]]
-    w_all_ty = np.ndarray[(2 * HPC * TPH * wt,), np.dtype[np.uint8]]
+    w_all_ty = np.ndarray[(2 * hpc * TPH * wt,), np.dtype[np.uint8]]
     import os as _os
     SINGLE = 1 if _os.environ.get("P1_SINGLE") else 0
     # whole pair stream when bisecting: HPC steps x 2 cores x OBJ
-    q_ty = (np.ndarray[(HPC * 2 * OBJ,), np.dtype[bfloat16]] if SINGLE
+    q_ty = (np.ndarray[(hpc * 2 * OBJ,), np.dtype[bfloat16]] if SINGLE
             else np.ndarray[(4 * OBJ,), np.dtype[bfloat16]])
     # ONE cache buffer, 8 KV heads of [K tile][V tile] — the shape P2's operand
     # objects are cut from. K for KV head g comes from core g (pairs 0-3) and V
@@ -180,7 +207,7 @@ def _design(bc: In, {params}):
                           arg_types=[bc_ty], compile_flags=FLAGS)
 
     f_bc = ObjectFifo(bc_ty, depth=1, name="bc")
-    bc_cons = [f_bc.cons() for _ in range({NCORES})]
+    bc_cons = [f_bc.cons() for _ in range({ncores})]
     f_w = [ObjectFifo(wpair_ty, name=f"wp{{i}}") for i in range({npairs})]
     w_sub = [f.cons().split([0, {wt}], obj_types=[wt_ty, wt_ty]) for f in f_w]
     f_o = [ObjectFifo(opair_ty, name=f"op{{i}}") for i in range({npairs})]
@@ -189,7 +216,7 @@ def _design(bc: In, {params}):
     def core(bcc, wc, op, kqkv, kemit, kprep):
         eb = bcc.acquire(1)
         kprep(eb)
-        for _ in range_({HPC}):
+        for _ in range_({hpc}):
             for _ in range_({TPH} - 1):
                 ew = wc.acquire(1)
                 kqkv(eb, ew)
@@ -220,6 +247,7 @@ def _design(bc: In, {params}):
 
     def sequence(*args):
         n = {npairs}
+        QOBJ, KVPLAN = {qobj!r}, {kvplan!r}
         bcb = args[0]
         wb = [args[1 + i] for i in range(n)]
         qb = [args[1 + n + i] for i in range(n)]
@@ -243,24 +271,24 @@ def _design(bc: In, {params}):
             # unused half of each object cannot be skipped on the way out — the
             # host reads the first HEAD of each OBJ instead.
             oh[i].drain(qb[i], wait=True, group=tg,
-                        sizes=[1, 1, 1, 4 * {OBJ}], strides=[0, 0, 0, 1])
-            if False:
-                pass
-            elif i < n // 2:
-                # step 2: 2 k heads -> the K halves of KV heads 2i, 2i+1
-                oh[i].drain(kvb[i], wait=True, group=tg,
-                            offset=2 * i * {KVSTRIDE} + {off},
-                            sizes=[1, 2, {HEAD}, 2],
-                            strides=[0, {KVSTRIDE}, {TSEQ}, 1])
-            else:
-                # step 2: 2 v heads, each contiguous in its own V tile
-                # whole objects again: OBJ per head, so row pos gets v' and
-                # row pos+1 gets the emit's zeros — which is what a padded
-                # position must hold, and the next token overwrites it.
-                oh[i].drain(kvb[i], wait=True, group=tg,
-                            offset=2 * (i - n // 2) * {KVSTRIDE} + {KTILE}
-                                   + {pos} * {HEAD},
-                            sizes=[1, 2, 1, {OBJ}], strides=[0, {KVSTRIDE}, 0, 1])
+                        sizes=[1, 1, 1, QOBJ[i] * {OBJ}], strides=[0, 0, 0, 1])
+            for _kind, _base in KVPLAN[i]:
+                if _kind == "k":
+                    # 2 k heads -> the K halves of KV heads base, base+1
+                    oh[i].drain(kvb[i], wait=True, group=tg,
+                                offset=_base * {KVSTRIDE} + {off},
+                                sizes=[1, 2, {HEAD}, 2],
+                                strides=[0, {KVSTRIDE}, {TSEQ}, 1])
+                else:
+                    # 2 v heads, each contiguous in its own V tile. Whole
+                    # objects: OBJ per head, so row pos gets v' and row pos+1
+                    # gets the emit's zeros — what a padded position must hold,
+                    # and the next token overwrites it.
+                    oh[i].drain(kvb[i], wait=True, group=tg,
+                                offset=_base * {KVSTRIDE} + {KTILE}
+                                       + {pos} * {HEAD},
+                                sizes=[1, 2, 1, {OBJ}],
+                                strides=[0, {KVSTRIDE}, 0, 1])
         tg.finish()
 
     arg_types = [bc_ty] + [w_all_ty] * {npairs}
