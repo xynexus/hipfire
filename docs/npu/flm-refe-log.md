@@ -6947,3 +6947,39 @@ real bug, fixed — and not the cause of the failure below.
 "error" is just the reference's magnitude. P1 runs, the cache is right, and the
 attention phase produces nothing — the same shape of failure as the earlier
 `kv_emit_verify` fault, which turned out to be an acquire ordering issue.
+
+### P2 emits zeros with P1 removed too — changing approach
+
+`CHAIN_P2_ONLY=1` skips P1 on the attention cores. P2 still emits **exactly
+zeros**, so the fault is in how P2 is wired in this design, not in the P1→P2
+sequencing. Also excluded: the acquire ordering between `kbeg` and `ktile`
+(hoisting the first KV acquire above `kbeg` changed nothing).
+
+`attn_phase.py` runs the same kernels and verifies, so the difference is
+structural. What differs here:
+
+- **q′ and KV share one fifo**; `attn_phase` gives them separate fifos.
+- the q′ object is a full 20544 B operand object rather than
+  `2*(GQA*HEAD+2)` bytes.
+
+### Reassessing rather than continuing to point-debug
+
+This harness has taken several ticks and still has two open problems — P2's
+zeros and the routing failure at ≥2 attention pairs. They plausibly share a
+root: **the design carries a second result fifo purely because P1's result
+object is `2*HEAD` and P2's is `GQA*HEAD`.** Removing that difference removes
+the fifo, which is the identified fix for routing, and simplifies the wiring
+that P2's zeros are hiding in.
+
+So the next move is the unification rather than more bisecting:
+
+1. P1's result object becomes `GQA*HEAD` (256 bf16), the same as P2's.
+2. P2 emits on P1's fifo; `f_p2` and its 4 shim outputs disappear.
+3. The k′ drain still consumes whole objects — with the pair form in the first
+   half and zeros after, `sizes=[1,2,HEAD,2], strides=[0,2,TSEQ,1]` writes the
+   real column pair then dumps zeros into the **next** pair, which are future
+   positions where zero is what `npad` wants.
+
+Recording the change of approach explicitly: four ticks of point-debugging a
+structure that has a known simplification is the wrong trade, and the
+simplification is independently required for the real 8-core shape.

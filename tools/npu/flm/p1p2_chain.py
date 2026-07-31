@@ -92,6 +92,8 @@ def build(pos, nobj):
     SLOT = OPERAND // 2                 # bf16 elements per head slot
     KVSTRIDE = SLOT
     off = pos - (pos & 1)
+    import os as _osk
+    SKIP_P1 = 1 if _osk.environ.get("CHAIN_P2_ONLY") else 0
 
     bc_ty = np.ndarray[(BC,), np.dtype[bfloat16]]
     op_ty = np.ndarray[(OPERAND,), np.dtype[np.uint8]]      # ONE operand type
@@ -165,11 +167,21 @@ def _design(bc: In, {P}):
         p1_body(bcc, wc, op, kqkv, kemit, kprep)
 
     def core_p1p2(bcc, wc, op, ap, kqkv, kemit, kprep, kbeg, ktile, kfin):
-        p1_body(bcc, wc, op, kqkv, kemit, kprep)
+        if not {SKIP_P1}:
+            p1_body(bcc, wc, op, kqkv, kemit, kprep)
         # ---- P2: first operand object is q', the rest are KV tiles ----
+        # kbeg writes the online-softmax state and ktile reads it. An acquire
+        # between two kernels sharing a global loses the handoff
+        # (global_handoff_probe.py), and here q' and KV are on the SAME fifo, so
+        # the natural ordering puts one there. Hoist the first KV acquire above
+        # kbeg; attn_phase.py escapes this only because its q and KV are on
+        # different fifos.
         eq = wc.acquire(1)
+        ekv = wc.acquire(1)
         kbeg(eq)
-        for _ in range_({nobj}):
+        ktile(eq, ekv)
+        wc.release(1)
+        for _ in range_({nobj} - 1):
             ekv = wc.acquire(1)
             ktile(eq, ekv)
             wc.release(1)
@@ -209,8 +221,12 @@ def _design(bc: In, {P}):
         tg = TaskGroup()
         bch.fill(bcb, group=tg)
         for i in range(n):
+            if {SKIP_P1} and i < a:
+                continue          # these cores skip P1, so no weights for them
             wh[i].fill(wb[i], group=tg)
         for i in range(n):
+            if {SKIP_P1} and i < a:
+                continue
             p1h[i].drain(qb[i], wait=True, group=tg,
                          sizes=[1, 1, 1, 4 * {OBJ}], strides=[0, 0, 0, 1])
             if i < n // 2:
@@ -257,7 +273,7 @@ def _design(bc: In, {P}):
               op_ty=op_ty, oppair_ty=oppair_ty, p1o_ty=p1o_ty,
               p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty,
               w_all_ty=w_all_ty, kvin_ty=kvin_ty, q_ty=q_ty,
-              cache_ty=cache_ty, __name__="flm_p1p2")
+              cache_ty=cache_ty, SKIP_P1=SKIP_P1, __name__="flm_p1p2")
     exec(src, ns)
     return iron.jit(ns["_design"],
                     source_files=[QKV_SRC, EMIT_SRC, NORM_SRC, ATT_SRC,
