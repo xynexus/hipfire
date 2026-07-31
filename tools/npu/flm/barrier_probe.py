@@ -158,12 +158,18 @@ def main():
           f"  ({92.9/per:.1f}x)" if per > 0 else "")
 
     if ok:
+        # These assume every byte moves at the 57.0 GB/s fabric roof and ignore
+        # the KV cache, so they are an UPPER BOUND, not a forecast. The measured
+        # projection, built from the phases' real rates (89-97% of ceiling) and
+        # real KV traffic, is 59.7 tok/s at S=512 — see docs/npu/flm-refe-log.md,
+        # "projection from measured phases". Quote that one, not this one.
         B, RATE, L = 772.3, 57.0, 16
         for nb, nd, lab in ((5 * L, L + 1, "fused layer: 17 dispatches, 80 barriers"),
                             (0, 5 * L + 1, "today: 81 dispatches, 0 barriers")):
             t = B / RATE + nd * 92.9 / 1000 + nb * per / 1000
             print(f"  {lab:42s} {t:6.2f} ms -> {1000/t:5.1f} tok/s "
-                  f"= {(1000/t)/59.86:.2f}x FLM")
+                  f"= {(1000/t)/59.86:.2f}x FLM   [upper bound]")
+        print("  (upper bound: fabric roof, no KV. Measured: 59.7 tok/s at S=512.)")
     return 0 if ok else 1
 
 

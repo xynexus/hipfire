@@ -6067,3 +6067,42 @@ this. It is the single largest remaining item after the unroll.
 - This assumes the fused layer's phases compose at their measured standalone
   rates. `ffn_chain` is evidence they do — P4+P5 chained hit 97%, the same as
   the parts — but P1→P2→P3 has not been chained yet.
+
+## 2026-07-31 — Task 8 feasibility: 320 phases fit in one dispatch, so the unroll is not blocked
+
+Before building the 16-layer unroll — which the measured projection says is the
+lever that beats FLM — the two things that could stop it, checked rather than
+assumed.
+
+**Instruction stream.** `barrier_probe.py --cores 16 --sweep 80,160,320`:
+
+| phases | us | us/phase |
+|---|---|---|
+| 80 | 560.8 | 7.0 |
+| 160 | 1042.1 | 6.5 |
+| **320** | **1981.7** | 6.2 |
+
+`time_us = 91.0 + 5.91 * phases`, R² = 0.99996. The unroll needs **80** phases
+(16 layers x 5); 320 run fine, so there is 4x headroom. The fixed term, 91.0 us,
+independently reproduces the 92.9 us per-dispatch cost measured a different way.
+
+**The barrier is 5.91 us, not 6.37.** The earlier figure came from a sweep
+topping out at 80 phases; extending to 320 gives a much better-conditioned fit.
+Nothing downstream changes materially — 4 barriers per layer is 23.6 us against
+a ~858 us layer — but 5.91 is the number to quote.
+
+**Host buffers.** The unroll needs ~17 BOs: 8 weight streams (one per pair,
+each carrying all 16 layers = 76.3 MB), 1 broadcast, 8 results. The measured
+ceiling with `full_elf=True` is **64**, so this is not close.
+
+So Task 8 is buildable. The blocker candidates are eliminated; what remains is
+the work.
+
+### One inconsistency fixed while here
+
+`barrier_probe.py` printed "fused layer … 64.1 tok/s = 1.07x FLM", computed at
+the 57.0 GB/s fabric roof with no KV traffic. That is an **upper bound**, and it
+now contradicts the measured projection (59.7 tok/s at S=512, from phases
+running at 89–97% of ceiling with real KV). The probe now labels its numbers as
+upper bounds and points at the measured projection, so the optimistic figure
+cannot be quoted by accident.
