@@ -76,7 +76,13 @@ def build(pos):
     # whole pair stream when bisecting: HPC steps x 2 cores x OBJ
     q_ty = (np.ndarray[(HPC * 2 * OBJ,), np.dtype[bfloat16]] if SINGLE
             else np.ndarray[(4 * OBJ,), np.dtype[bfloat16]])
-    kv_ty = np.ndarray[(2 * KTILE,), np.dtype[bfloat16]]      # 2 tiles/pair
+    # ONE cache buffer, 8 KV heads of [K tile][V tile] — the shape P2's operand
+    # objects are cut from. K for KV head g comes from core g (pairs 0-3) and V
+    # from core g+8 (pairs 4-7), so the two halves of a head are written by
+    # different pairs into the same buffer at different offsets. Several pairs
+    # draining into one BO is the ffn_chain pattern.
+    KVSTRIDE = KTILE + VTILE
+    kv_ty = np.ndarray[(8 * KVSTRIDE,), np.dtype[bfloat16]]
 
     flags = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_HEAD={HEAD}",
              f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS={NQ}", f"-DDIM_QKHEADS={NK}"]
@@ -160,17 +166,20 @@ def _design(bc: In, {params}):
             if False:
                 pass
             elif i < n // 2:
-                # step 2: 2 k heads, each a column pair in its own K tile
-                oh[i].drain(kvb[i], wait=True, group=tg, offset={off},
+                # step 2: 2 k heads -> the K halves of KV heads 2i, 2i+1
+                oh[i].drain(kvb[i], wait=True, group=tg,
+                            offset=2 * i * {KVSTRIDE} + {off},
                             sizes=[1, 2, {HEAD}, 2],
-                            strides=[0, {KTILE}, {TSEQ}, 1])
+                            strides=[0, {KVSTRIDE}, {TSEQ}, 1])
             else:
                 # step 2: 2 v heads, each contiguous in its own V tile
                 # whole objects again: OBJ per head, so row pos gets v' and
                 # row pos+1 gets the emit's zeros — which is what a padded
                 # position must hold, and the next token overwrites it.
-                oh[i].drain(kvb[i], wait=True, group=tg, offset={pos} * {HEAD},
-                            sizes=[1, 2, 1, {OBJ}], strides=[0, {VTILE}, 0, 1])
+                oh[i].drain(kvb[i], wait=True, group=tg,
+                            offset=2 * (i - n // 2) * {KVSTRIDE} + {KTILE}
+                                   + {pos} * {HEAD},
+                            sizes=[1, 2, 1, {OBJ}], strides=[0, {KVSTRIDE}, 0, 1])
         tg.finish()
 
     arg_types = [bc_ty] + [w_all_ty] * {npairs}
@@ -259,8 +268,11 @@ def main():
     SINGLE = bool(_os2.environ.get("P1_SINGLE"))
     qsz = HPC * 2 * 2 * HEAD if SINGLE else 4 * 2 * HEAD
     q_ts = [iron.zeros(qsz, dtype=bfloat16, device="npu") for _ in range(npairs)]
-    kv_ts = [iron.zeros(2 * KTILE, dtype=bfloat16, device="npu") for _ in range(npairs)]
+    KVSTRIDE = KTILE + TSEQ * HEAD
+    cache = iron.zeros(8 * KVSTRIDE, dtype=bfloat16, device="npu")
+    kv_ts = [cache] * npairs          # every pair drains into the same buffer
     design(bc_t, *w_ts, *q_ts, *kv_ts)
+    cv = cache.numpy().astype(np.float64).reshape(8, KVSTRIDE)
 
     print(f"P1 routed to three destinations: {NCORES} cores, layer {o.layer}, "
           f"pos {o.pos}")
@@ -310,19 +322,17 @@ def main():
                   f"wanted {32 + j}", file=_s.stderr)
 
     we = 0.0
-    for pr in range(npairs // 2):                      # K cache
-        K = kv_ts[pr].numpy().astype(np.float64).reshape(2, HEAD, TSEQ)
-        for j in range(2):
-            e = np.abs(K[j, :, o.pos] - ref[2 * pr + j + NQ]).max()
-            we = max(we, e)
+    for g in range(8):                                 # K half of KV head g
+        K = cv[g, :KTILE].reshape(HEAD, TSEQ)
+        e = np.abs(K[:, o.pos] - ref[NQ + g]).max()
+        we = max(we, e)
     ok &= gate(we, range(NQ, NK), f"k' : 8 heads -> K col {o.pos:<2d}      ")
 
     ve = 0.0
-    for pr in range(npairs // 2, npairs):              # V cache
-        V = kv_ts[pr].numpy().astype(np.float64).reshape(2, TSEQ, HEAD)
-        for j in range(2):
-            e = np.abs(V[j, o.pos] - ref[2 * pr + j + NQ]).max()
-            ve = max(ve, e)
+    for g in range(8):                                 # V half of KV head g
+        V = cv[g, KTILE:].reshape(TSEQ, HEAD)
+        e = np.abs(V[o.pos] - ref[NK + g]).max()
+        ve = max(ve, e)
     ok &= gate(ve, range(NK, NV), f"v' : 8 heads -> V row {o.pos:<2d}      ")
     print(f"  -> {'PASS' if ok else 'FAIL'}  (floor is one bf16 ulp)")
     return 0 if ok else 1

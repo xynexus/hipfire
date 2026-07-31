@@ -6790,3 +6790,19 @@ norm weight rides inside the activation, `cs_q`/`cs_k` ride inside the
 broadcast, `npad` rides inside Q, the residual rides in core memory — and now q′
 rides inside the operand stream. Four separate discoveries of the same
 constraint.
+
+### P1's KV output now lands in the layout P2 consumes
+
+`p1_route.py` used to drain k′ and v′ into separate per-pair buffers, which
+verified but is not what attention reads. It now writes **one cache buffer of 8
+KV heads, each `[K tile][V tile]`** — the shape P2's operand objects are cut
+from.
+
+The mapping this pins down: with core `c` owning heads `{c, c+16, c+32}`,
+**KV head g's K comes from core g and its V from core g+8** — heads 32+g and
+40+g, so the two halves of one KV head are produced by different cores in
+different pairs and written into the same buffer at different offsets. Eight
+pairs draining into one BO is the `ffn_chain` pattern; passing the same tensor
+as all eight arguments works.
+
+Still exact after the change: q′ 9.5e-07, k′ one bf16 ulp, v′ 0.0.
