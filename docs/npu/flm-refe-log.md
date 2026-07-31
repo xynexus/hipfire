@@ -10281,3 +10281,40 @@ into, not something a wiring change fixes.
 
 Seams composed: 2 of 4. P3->P4 and P4->P5 done. P1->P2 is still open and is pure
 plumbing (q' from the host's `qall`). P2->P3 is blocked on routing at NATT=8.
+
+### P1 -> P2 is composed, bit-exact
+
+Third of four seams. P1's q' drain scatters straight into the broadcast buffer
+P2 reads:
+
+    p1h[i].drain(qb[i], wait=True, group=tg,
+                 offset=QBASE[i] * OBJ,
+                 sizes=[1, HPCC[i], 2, OBJ],
+                 strides=[0, OBJ, HPCC[i] * OBJ, 1])
+
+The stream order was **measured, not assumed** (`CHAIN_QMAP`, now retired into a
+permanent check). A pair's objects arrive `[slot s][core j]` and its head is
+`qbase + hpcc*j + s`:
+
+    pair 0: 0, 2, 1, 3        pair 4: 16, 20, 17, 21, 18, 22, 19, 23
+    pair 1: 4, 6, 5, 7        pair 5: 24, 28, 25, 29, 26, 30, 27, 31
+
+every match at 0.0 error. Head redistribution leaves each pair's q heads
+contiguous, which is what makes a single stride work.
+
+The check is built so a wrong scatter cannot pass quietly: **the host writes
+ZEROS for all 32 heads**, so if P1 failed to land one, attention would run on
+zeros rather than on a plausible host value.
+
+    P1 q' in P2's broadcast: max err 0.0000e+00 over 32 heads (host wrote zeros)
+
+npad survives — it rides at `NQ*OBJ` = 4096 and the highest byte any pair writes
+is 4095.
+
+Timing improves slightly: 624.8 us median (624.5/624.8/627.2) against 629.4, so
+side A is ~625 us. Layer 891 us -> 16 layers 14.25 ms + lm_head 3.70 ms =
+17.95 ms -> **55.7 tok/s**. The gain is real but small and sits inside the drift
+between builds; the honest reading is that composing seams is timing-neutral.
+
+**Seams composed: 3 of 4.** Only P2->P3 remains, and it is blocked on attention
+routing at full head coverage (NATT=8), not on plumbing.

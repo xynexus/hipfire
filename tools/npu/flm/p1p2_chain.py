@@ -122,6 +122,11 @@ def build(pos, nobj):
     hpc = hpc_for(p1cores)
     layout = head_layout(p1cores)
     qobj, kvplan = drain_plan(p1cores)
+    # Where each pair's q' belongs in the broadcast. Measured, not assumed (see
+    # CHAIN_QMAP): a pair's stream is [slot s][core j] and its head is
+    # qbase + hpcc*j + s, so the scatter is a plain 3-level stride.
+    qbase = [sum(qobj[:i]) for i in range(len(qobj))]
+    hpcc = [q // 2 for q in qobj]
     # P3 runs on ALL cores — only P1 and P2 are partitioned — so o_proj's 2048
     # output rows split over every core, NROWS at a time.
     p3tiles = K_DIM // (NCORES * NROWS)
@@ -178,7 +183,8 @@ def build(pos, nobj):
     kvin_ty = bc_ty                      # q' rides the broadcast object
     # one per P1 pair: at 12 P1 cores pairs 0-3 emit 4 q objects and
     # pairs 4-5 emit 8, since the KV-carrying cores spend two slots on k/v
-    q_tys = [np.ndarray[(qobj[i] * OBJ,), np.dtype[bfloat16]]
+    # drain TARGET shape, not object shape -- the same trap h_ty hit
+    q_tys = [np.ndarray[(2 * K_DIM + 2 * HEAD,), np.dtype[bfloat16]]
              for i in range(p1pairs)]
     # uint8, matching the operand fifo it feeds. A fill whose buffer and fifo
     # disagree on element width counts its sizes in the wrong unit.
@@ -248,7 +254,7 @@ def _design(bc: In, {P}):
                            arg_types=[bc_ty, op_ty, p1o_ty],
                            compile_flags=FLAGS)
 
-    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_hchain")
+    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_qchain")
     bc_cons = [f_bc.cons() for _ in range({NCORES})]
     f_w = [ObjectFifo(oppair_ty, name=f"wp{{i}}_n{NROWS}k{KVPER}") for i in range({npairs})]
     w_sub = [f.cons().split([0, {OPERAND}], obj_types=[op_ty, op_ty]) for f in f_w]
@@ -419,9 +425,12 @@ def _design(bc: In, {P}):
         for i in range({p1pairs}):     # partition B: only these pairs run P1
             wh[i].fill(wb[i], group=tg)
         QOBJ, KVPLAN = {qobj!r}, {kvplan!r}
+        QBASE, HPCC = {qbase!r}, {hpcc!r}
         for i in range({p1pairs}):
             p1h[i].drain(qb[i], wait=True, group=tg,
-                         sizes=[1, 1, 1, QOBJ[i] * {OBJ}], strides=[0, 0, 0, 1])
+                         offset=QBASE[i] * {OBJ},
+                         sizes=[1, HPCC[i], 2, {OBJ}],
+                         strides=[0, {OBJ}, HPCC[i] * {OBJ}, 1])
             for _kind, _base in KVPLAN[i]:
                 if _kind == "k":
                     p1h[i].drain(cb[i], wait=True, group=tg,
@@ -659,16 +668,19 @@ def main():
     # an f32 bit pattern (written after the bf16 conversion, or it is destroyed).
     BCN = 2 * K_DIM + 2 * HEAD
     qall = np.zeros(BCN, np.float32)
-    for h in range(NQ):
-        qall[h * OBJ:h * OBJ + HEAD] = ref[h][:HEAD]
     qraw = qall.astype(bfloat16).view(np.uint16)
     qraw[NQ * OBJ:NQ * OBJ + 2] = np.array([float(npad)], np.float32).view(np.uint16)
-    # one broadcast-shaped q' per attention pair — the design takes `apairs`
-    # of them, and a short list silently shifts every later argument.
-    q_in = [iron.tensor(qraw.view(bfloat16), dtype=bfloat16, device="npu")] * apairs
-
-    q_ts = [iron.zeros(qobj[pr] * OBJ, dtype=bfloat16, device="npu")
-            for pr in range(p1pairs)]
+    # ONE buffer: P1's q' drain target AND P2's broadcast source. The heads are
+    # left ZERO on the host -- P1's drain scatters every one of them to h*OBJ,
+    # so any host value here would be overwritten. If P1 ever failed to write a
+    # head, attention would see zeros rather than a plausible host value, which
+    # is the failure mode this seam is supposed to expose.
+    #
+    # npad rides at NQ*OBJ as an f32 bit pattern and the drain never reaches it:
+    # the highest byte any pair writes is qbase[-1]*OBJ + ... = 4095 < 4096.
+    q_all = iron.tensor(qraw.view(bfloat16), dtype=bfloat16, device="npu")
+    q_in = [q_all] * apairs
+    q_ts = [q_all] * p1pairs
     attn_out = iron.zeros(apairs * 2 * GQA * HEAD, dtype=bfloat16, device="npu")
     a_ts = [attn_out] * apairs        # every pair drains into the same buffer
     # ---- P3: o_proj + residual -------------------------------------------
@@ -852,6 +864,15 @@ def main():
         print(f"  bench: {mb:.2f} MB  {mb*1e3/_us:.1f} GB/s  {_us:.1f} us "
               f"(marginal {_us - FIXED_US:.1f}, 16-core ideal {mb*17.85:.1f})")
     # dense now: each core emits its whole 128-row slice in one object
+    # q' is now P1's OWN output, scattered into the broadcast P2 reads. The host
+    # writes ZEROS for every head, so this check fails loudly if the scatter is
+    # wrong -- attention would be running on zeros, not on a plausible host value.
+    qgot = q_all.numpy().astype(np.float64)
+    eq = max(np.abs(qgot[h * OBJ:h * OBJ + HEAD] - ref[h][:HEAD]).max()
+             for h in range(NQ))
+    print(f"  P1 q' in P2's broadcast: max err {eq:.4e} over {NQ} heads "
+          f"(host wrote zeros)")
+
     # h_all is one shared buffer now, already in natural row order.
     got_h = h_all.numpy().astype(np.float64)[:K_DIM]
     order = np.concatenate([np.array(p3rows(pr, j)) + r
