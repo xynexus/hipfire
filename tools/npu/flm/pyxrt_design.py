@@ -131,7 +131,20 @@ class PyxrtDesign:
         per token, because a rebind drops the control scratchpad the position
         lives in.
         """
-        if self._bound is None or self.rebind:
+        # Rebind when the ARGUMENTS CHANGE, not just when told to. Holding the
+        # bind unconditionally silently ignored every argument after the first
+        # call: `lmhead_twostage.py`'s gate passes a fresh activation tensor per
+        # probe and got probe 0's logits back for all 48, which read as a coarse
+        # tier with no recall (36/48 outside the top-64) rather than as a
+        # dispatch that never saw the new input. Identity, not equality -- the
+        # held path (`redo`, `fused.Session`) reuses the SAME tensor objects and
+        # must keep its run, which is worth 5714 us on the fused design.
+        # A rebind drops the control scratchpad, so anything carrying a position
+        # there binds once and calls dispatch() directly, as fused.Session does.
+        changed = (self._bound is not None
+                   and (len(args) != len(self._bound)
+                        or any(a is not b for a, b in zip(args, self._bound))))
+        if self._bound is None or self.rebind or changed:
             self.bind(*args)
         self.times_us = [self.dispatch() for _ in range(self.iters)]
         return None

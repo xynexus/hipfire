@@ -13456,16 +13456,36 @@ was the host model, and the device substitute put in its place has never worked 
 first probe. Reproduced with `--gate` alone, so the `--vs-exact` second design is not
 involved.
 
-**What this does and does not cost.** The TIMING is untouched: 2426.7 us coarse against
-2980.7 exact is a bytes ratio, measured on dispatches whose activation never changes, and
-it still composes to 64.7-64.8 tok/s. What is now unevidenced is that the DEVICE's coarse
-shortlist contains the right token — the only device evidence is probe 0, where the first
-dispatch matched the host model to 1.7e-7. A faster head that returns the wrong token is
-not a speedup, so the 64.8 tok/s figure should be read as "the timing of a path whose
-device-side recall is verified at one probe" until `again()` is fixed.
+**FIXED the same day, and the device now reproduces the host claim:**
+
+    two-pass argmax at K=32: 48/48 match the exact argmax
+    device coarse rank of the true argmax: max 3, median 1, outside top-64: 0
+    token 12874.0 + 2425.0 + 206.0 = 15505.0 us -> 64.5 tok/s, +5.4% vs FLM
+
+The bug was in `PyxrtDesign.__call__`, not in `again()` or the coarse tier:
+
+    if self._bound is None or self.rebind:
+        self.bind(*args)
+
+On a second call with DIFFERENT arguments, `_bound` is not None and `rebind` defaults
+False, so it dispatched the previously-bound buffers and silently ignored every argument
+after the first. `again()`'s own docstring says "this REBINDS (a fresh pyxrt.run per call)"
+— the intent was right and nothing ever configured it. Every `__call__` caller had it; the
+gate is just where it became visible, because it is the only one that passes a new tensor
+per call.
+
+Fixed by rebinding when the arguments CHANGE, by identity rather than equality: the held
+path (`redo`, `fused.Session`) reuses the same tensor objects and must keep its run, which
+is worth 5714 us on the fused design. A rebind still drops the control scratchpad, so
+anything carrying a position there binds once and calls `dispatch()` directly, as
+`fused.Session` does — unchanged.
+
+The TIMING never depended on this: 2425.0 us coarse against 2980.7 exact is a bytes ratio
+measured on dispatches whose activation never changes. 64.5-64.8 tok/s across sessions.
 
 `fused_pyxrt.py --recheck` exists for exactly this failure mode (perturb x, dispatch, the
-output must MOVE and then return bit for bit). It was never pointed at this driver.
+output must MOVE and then return bit for bit) and was never pointed at this driver. It would
+have caught it immediately.
 
 The 241.5 us host term is numpy per-op OVERHEAD, not work — 78 us to top-32 a 128256 array
 that the same numpy argmaxes in 4.9, and 110 us to rescore 41 KB. It eats 40% of the device
