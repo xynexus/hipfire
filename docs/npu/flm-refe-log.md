@@ -15981,3 +15981,40 @@ recall sample is 48; at K=32 with a worst observed rank of 3 the margin is large
 Files: `kernels/npu/flm_gemv_coarse_q4row.cc`, `tools/npu/flm/lmhead_coarse.py` (tier build,
 recall curve), `tools/npu/flm/lmhead_twostage.py` (design, device run, gate),
 `tools/npu/flm/lmhead_coarse_xcheck.py` (torch cross-check).
+
+### Fixing the two-pass host overhead: two candidate levers, one rejected
+
+The 241.5 us host term eats 40% of the two-pass win. Measured the two obvious levers.
+
+**Rescore cost against K** (`gemv_bf16_fast`, real shapes, this machine with an agent
+running so absolute values run high; the ratios are the point):
+
+    K=4   50.6 us    K=8   64.7    K=16  90.6    K=32  302.6    K=64  573.2
+
+The jump from K=16 to K=32 is 3.3x for twice the rows, which is not linear and suggests a
+cache or allocation cliff rather than arithmetic.
+
+**A float32 einsum rescore is 6.7x faster and is REJECTED.** 45.0 us against 302.6 at K=32,
+by dequantising once and contracting with `np.einsum` instead of modelling bf16 rounding
+step by step. But over 400 random draws it picks a different argmax than the bf16-modelled
+path **2 times** — 0.5%. On real weights the top-2 gap is wider so it would be rarer, but
+the fine pass exists precisely to be exact, and "rarely wrong" is the failure mode the whole
+two-pass design is built to avoid. Not adopted.
+
+**Dropping K from 32 to 8 is available and probably not worth it.** Recall@8 is 48/48 with a
+worst observed coarse rank of 3, so K=8 keeps 2.7x margin, and it would cut the rescore
+about 4.7x. But the saving is ~40 us against a 15491 us token — **0.26%** — in exchange for
+halving the safety margin on a failure that silently emits the wrong token. The agent chose
+32 deliberately for that reason and the trade does not look better on a second reading.
+
+**What is left is the selection, at 78-123 us**, and it has a safe shape: `cl.max()` costs
+7.5 us and a threshold pass ~20, so a scale-relative threshold with a fall-back to the exact
+partition when fewer than K survive would keep the K=32 guarantee exactly while usually
+costing ~30 us instead of ~120. That needs REAL coarse logits to tune — my synthetic
+distribution gave candidate counts between 16 and 1424 for neighbouring thresholds, which is
+not a distribution worth fitting against.
+
+The honest reading so far: the host term is not obviously fixable in numpy without giving up
+either exactness or margin, which is what "a Rust implementation does not pay it" already
+said. The selection lever is the one that survives scrutiny and it is worth ~90 us, or
++0.4 tok/s.
