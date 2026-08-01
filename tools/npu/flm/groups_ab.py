@@ -51,6 +51,8 @@ EMIT_SRC = str(KDIR / "flm_p1_emit.cc")
 NORM_SRC = str(KDIR / "flm_norm_prepare.cc")
 Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
 TSEQ = 32
+GQA = 4                          # q heads per KV group = per B core
+KVPER = 1
 NCORES, HPC = 16, 3
 NQ, NK, NV = 32, 40, 48          # head-index boundaries
 rnd = lambda v: q4nx.bf16_to_f32(q4nx.f32_to_bf16(np.asarray(v, np.float32)))
@@ -196,6 +198,9 @@ def build(pos, ncores=NCORES):
     bc_ty = np.ndarray[(BC,), np.dtype[bfloat16]]
     wt_ty = np.ndarray[(wt,), np.dtype[np.uint8]]
     o_ty = np.ndarray[(OBJ,), np.dtype[bfloat16]]
+    # all GQA q heads in ONE object, at OBJ stride: attention reads
+    # q[h * QSTRIDE + d] from a single acquire
+    q_ty = np.ndarray[(GQA * OBJ,), np.dtype[bfloat16]]
     wpair_ty = np.ndarray[(2 * wt,), np.dtype[np.uint8]]
     opair_ty = np.ndarray[(2 * OBJ,), np.dtype[bfloat16]]
     w_all_ty = np.ndarray[(2 * hpc * TPH * wt,), np.dtype[np.uint8]]
@@ -247,12 +252,30 @@ def _design(bc: In, {params}):
     # PER-CORE result fifos. p1_route joins two cores into one; group A
     # streams each core to its own B core, so there is nothing to join —
     # and a join would cost a memtile input the architecture wants free.
-    f_o = [ObjectFifo(o_ty, name=f"oc{{i}}") for i in range({ncores})]
+    # A's output, split by destination. q' -> B core-to-core (one object holding
+    # all GQA heads); k'/v' -> the host cache. Two fifos is exactly a core's two
+    # output DMA channels, with none spare.
+    f_q = [ObjectFifo(q_ty, name=f"aq{{i}}") for i in range({ncores})]
+    f_kv = [ObjectFifo(o_ty, name=f"akv{{i}}") for i in range({ncores})]
 
-    def core(bcc, wc, op, kqkv, kemit, kprep):
+    def core(bcc, wc, opq, opkv, kqkv, kemit, kprep):
+        """P1 with its output SPLIT by destination.
+
+        q' goes to B[j] core-to-core and k'/v' go to the host cache, and a fifo
+        has one consumer chain — so they cannot share one. A core has exactly two
+        output DMA channels, which this uses both of and leaves none spare.
+
+        The q heads fill ONE object between them: `flm_p1_emit` with
+        DIM_QGROUP=GQA writes head h at slot h % GQA, so attention can acquire it
+        once and read all four at QSTRIDE. The kv heads take an object each.
+
+        Slots 0..GQA-1 are q and the rest are kv — that is `head_layout(8)`'s
+        order, and drain_plan already checks q slots form a prefix.
+        """
         eb = bcc.acquire(1)
         kprep(eb)
-        for _ in range_({hpc}):
+        eq = opq.acquire(1)                  # ONE object for all GQA q heads
+        for _ in range_({GQA}):
             for _ in range_({TPH} - 1):
                 ew = wc.acquire(1)
                 kqkv(eb, ew)
@@ -267,10 +290,21 @@ def _design(bc: In, {params}):
             # two kernels sharing a global loses the handoff
             # (global_handoff_probe.py), and these share g_stage.
             ew = wc.acquire(1)
-            eo = op.acquire(1)
             kqkv(eb, ew)
-            kemit(ew, eo)
-            op.release(1)
+            kemit(ew, eq)                    # slot = head % GQA, in place
+            wc.release(1)
+        opq.release(1)
+
+        for _ in range_({hpc} - {GQA}):      # k' and v', one object each
+            for _ in range_({TPH} - 1):
+                ew = wc.acquire(1)
+                kqkv(eb, ew)
+                wc.release(1)
+            ew = wc.acquire(1)
+            ekv = opkv.acquire(1)
+            kqkv(eb, ew)
+            kemit(ew, ekv)
+            opkv.release(1)
             wc.release(1)
         bcc.release(1)
 
@@ -281,7 +315,8 @@ def _design(bc: In, {params}):
             # weights still arrive per PAIR (split two ways); results leave per CORE
             workers.append(Worker(core,
                 fn_args=[bc_cons[c], w_sub[p][j].cons(),
-                         f_o[c].prod(), kq, ke, kn], stack_size=8192))
+                         f_q[c].prod(), f_kv[c].prod(), kq, ke, kn],
+                stack_size=8192))
 
     def sequence(*args):
         n, nc = {npairs}, {ncores}
