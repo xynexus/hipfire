@@ -12507,3 +12507,37 @@ Worth noting this is not a workaround — it is why FLM's ABI has
 `_send_rms_weights` and `_send_rope_weights` as separate movements rather than
 part of an activation block. The constraint that produced those calls is the one
 being hit here.
+
+### CORRECTION: the residual already rides the weight tile — but only the HOST can put it there
+
+My previous entry reasoned out where C's residual should come from and concluded
+it must stay on-core. The reasoning was right about the constraint and wrong about
+the mechanism, because `flm_gemv_residual` solved this long ago, for the same
+stated reason:
+
+> HOW the residual reaches the core. A core tile has only **2 input DMA
+> channels**, and the activation and the weight stream already use both — a third
+> fifo is rejected by the placer. So the residual slice for this tile rides in the
+> **weight tile itself**, appended after the codes.
+
+So P3 needs no new mechanism and no `g_resid` read: attention output on one
+channel, weights-with-residual on the other, exactly two.
+
+**But that only works while the host knows the residual.** It writes it into the
+weight tile when packing. In the layer loop the residual for layer L+1 is C's own
+output from layer L, which never leaves the array — so there is nothing for the
+host to pack, and a round trip to fetch it would reintroduce the dispatch the
+architecture exists to remove.
+
+So the distinction is:
+
+    one layer, host-supplied residual   works today, no changes
+    the layer loop                      P3 must read g_resid, which P5 already
+                                        writes under XOUT_TO_STASH
+
+That second case needs a `RESID_FROM_STASH` in `flm_gemv_residual`, mirroring the
+one `flm_gemv_flush` already has. Small, and the write side exists.
+
+Recording the correction because "the residual is already handled" would have been
+true of the single-layer test and false of the thing being built — the sort of gap
+that passes a first check and fails on the second token.
