@@ -34,11 +34,14 @@ lm_head every token. At the measured 54.7 GB/s ceiling:
     oq4          ~4.50     698   MB    ~68   tok/s  projected, +11%
     oq8++         8.00    1235   MB    ~44   tok/s  projected, -28% vs FLM
 
-**`oq8++`/W8A8 cannot beat FLM on NPU decode.** It moves 59% more bytes than the
-format FLM already ships. W8A8's activation half is free here — activations are
-negligible against weights — but the weight half is the entire cost. If that goal
-came from GPU work, note that the intuition inverts: on a compute-rich,
-bandwidth-poor NPU, the quant format is the performance story.
+**This CONFIRMS the standing `oq4++`/W4A8 target rather than revising it** — the
+project's quant target was set to `oq4++` on 2026-07-30, and the measurement above
+is independent evidence for that choice. The row is kept because ruling `oq8`
+out is worth having in writing: it moves 59% more bytes than the format FLM
+already ships and lands near 44 tok/s. W8A8's activation half is free here —
+activations are negligible against weights — but the weight half is the entire
+cost. On a compute-rich, bandwidth-poor NPU the quant format is the performance
+story, which is the opposite of where GPU intuition points.
 
 **So the next phase's headline lever is a TIGHTER format, not a faster kernel.**
 `oq4++` (symmetric Opus Quant, clip-search/AWQ, Hessian error feedback) is both
@@ -111,7 +114,17 @@ Each of these produced a confident wrong result that survived at least one check
 
 1. **Port the decode path to `oq4++`.** The headline. Target ~72 tok/s on
    Llama-3.2-1B, +18% over the current reference kernel and +17% over FLM.
-   Success is measured on the WALL CLOCK against FLM's 61.18, not device time.
+   Success is measured on the WALL CLOCK, not device time.
+
+   **Which FLM number you are beating matters.** Two exist and they are not
+   interchangeable: 61.18 tok/s is FLM's own server figure at short context and
+   is what every comparison in `flm-refe-log.md` uses; `flm-benchmarks.md`
+   records 60.1 tok/s at a 159-token prompt, DECAYING to 52.6 across the context
+   range — a ~13% decay with depth. Our design does not decay that way because
+   its cache is a fixed 40 columns, but it also cannot reach the depths where
+   FLM slows down. So 63.4 vs 61.18 is like-for-like at short context and is the
+   honest claim; any comparison at depth is unsupported in BOTH directions until
+   the cache stops being a fixed tile.
 2. **Keep the correctness apparatus.** Token-for-token agreement with FLM on its
    own `context` array is the acceptance test; the fp32 oracle is the reference.
    Both exist and work — `decode.py`, `decode_oracle.py`, `sweep.sh`.
