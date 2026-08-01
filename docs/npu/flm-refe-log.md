@@ -12149,3 +12149,31 @@ into another core's, and the symptom is a timeout, not a wrong number.
 
 Group A is the first piece of the role architecture running on real weights.
 Groups B and C are next, then the streams between them.
+
+### Dropping the joins made P1 cheaper, and the projection lands on FLM exactly
+
+Group A measures **191.2 us** against `p1_route`'s **204.1 us** at the same eight
+cores. The only difference is per-core result fifos instead of per-pair joins, so
+the 12.9 us is the join's cost — and removing it was a side effect of the
+architecture, not an optimisation aimed at it.
+
+    group A (per-core fifos)   191.2 us -> 124.0 compute
+    p1_route 8 cores (paired)  204.1 us -> 136.9
+    p1_route 12 cores          160.1 us ->  92.9
+
+    P1 penalty 12 -> 8 cores:  was +44.0, now **+31.1 us/layer**
+
+Feeding that back, with the measured handoff cost included:
+
+    (744.1 + 31.1 + 9.9) x 16 + 67.2 + 3700  =  16.33 ms  ->  **61.2 tok/s**
+    FLM measured                                              61.18 tok/s
+
+Level to within 0.03%. That is a coincidence of arithmetic rather than a
+meaningful tie — every term carries more uncertainty than 0.02 tok/s — but it does
+say the architecture is in FLM's territory rather than trailing it, and it is
+still the only structure that computes a correct token.
+
+The honest caveat stands unchanged: 744.1 us/layer was measured on the
+half-attention design, and group B doing eight KV groups on eight cores instead of
+four on four is *inferred* to cost the same per core. That inference is the largest
+remaining uncertainty in the number, and group B will measure it.
