@@ -79,6 +79,12 @@ the KV cache holds exactly the one entry this design's own P1 wrote. Multi-token
 decode needs `offset_parameter=` with a `ParameterScratchpad`, which is a
 host-side restructuring (see the log) and is not done here.
 
+`FUSED_STUB=ab|c|all` builds the same design with a group's COMPUTE replaced and
+its DMA untouched -- see the constant below and `_stubcheck.py`. It measured the
+floor: 731.5 of the 791.5 us/layer is data movement with every kernel stubbed,
+38.25 MB a layer at 52.3 GB/s against a 54.7 GB/s ceiling. All thirty-two cores'
+arithmetic is worth 60 us/layer. This design is bandwidth-bound, not compute-bound.
+
 Needs PYTHONPATH=<mlir-aie>/build/python plus the Peano/XRT env.
 """
 
@@ -138,6 +144,59 @@ ASPL = 8 // AQ                          # cores per A weight fifo
 # costs nothing measurable and buys four shim inputs.
 BQ = 2                                  # B KV fifos, split 1->4
 D_FF, NCHUNK = 8192, 4
+# `FUSED_STUB=ab|c|all` replaces a group's COMPUTE with a body that reads eight
+# elements per operand and writes one, leaving every acquire, release, fifo,
+# fill, drain, size, count and order byte-identical. It exists to attribute what
+# the fused design costs above the sum of the two standalone slopes: a body that
+# returned early would stop sharing the memtile and shim budgets that the
+# additivity question is about, and would measure nothing.
+#
+# `flm_norm_prepare` is deliberately NEVER stubbed: it is the one kernel both A
+# and C call, so stubbing it per-group would need two instances of one symbol.
+# It is two passes over 2048 elements against A's 3.96 MB of weights a layer, so
+# it sits in the common floor of all four builds and cancels out of every
+# difference taken below.
+#
+# Stubbing frees .text on the stubbed cores, so a stub build places more easily
+# than the real one. That is fine for a timing attribution and must NOT be read
+# as headroom for the real design.
+STUB = os.environ.get("FUSED_STUB", "")
+# name -> (group, arg-type expressions). The variable names match the design.
+_STUBBABLE = {
+    "kq": ("ab", "flm_gemv_qkv", "[bc_ty, wt_ty]"),
+    "ke": ("ab", "flm_p1_emit", "[wt_ty, q_ty]"),
+    "kve": ("ab", "flm_kv_emit", "[wt_ty, o_ty]"),
+    "kab": ("ab", "flm_attn_begin", "[q_ty]"),
+    "kat": ("ab", "flm_attn_tile", "[q_ty, op_ty]"),
+    "kaf": ("ab", "flm_attn_finish", "[ao_ty, q_ty, op_ty]"),
+    "kr3": ("c", "flm_gemv_q4_1_residual", "[bc_ty, op_ty, p1o_ty]"),
+    "kas": ("c", "flm_asum_prepare", "[bc_ty]"),
+    "khe": ("c", "flm_h_emit", "[op_ty, p1o_ty]"),
+    "kg4": ("c", "flm_gemv_gate", "[bc_ty, op_ty]"),
+    "ku4": ("c", "flm_gemv_up_swiglu", "[bc_ty, op_ty, p1o_ty]"),
+    "kd5": ("c", "flm_gemv_down", "[bc_ty, op_ty, p1o_ty]"),
+}
+# element C type per arg-type expression, in the same order as _STUBBABLE's
+# expressions; uint8 operands are weight tiles, everything else is bf16.
+_U8 = {"wt_ty", "op_ty"}
+
+
+def _stub_source(name, argexpr):
+    """A body with the real signature that touches ~8 elements per operand.
+
+    `noinline` and the volatile sink keep it from being folded away; the write
+    to the last operand keeps an output object genuinely produced."""
+    ts = [t.strip() for t in argexpr.strip("[]").split(",")]
+    ct = ["unsigned char" if t in _U8 else "bfloat16" for t in ts]
+    sig = ", ".join(f"{c} *restrict a{i}" for i, c in enumerate(ct))
+    body = "".join(f"  for (int i = 0; i < 8; ++i) s += (float)a{i}[i];\n"
+                   for i in range(len(ct)))
+    wr = f"  a{len(ct) - 1}[0] = (bfloat16)s;\n" if ct[-1] == "bfloat16" else ""
+    return ("#include <aie_api/aie.hpp>\n"
+            "#include <stdint.h>\n"
+            "static volatile float g_stub_sink;\n"
+            f'extern "C" __attribute__((noinline)) void {name}({sig}) {{\n'
+            "  float s = 0.f;\n" + body + wr + "  g_stub_sink = s;\n}\n")
 
 WT = q4nx.tile_bytes(K_DIM, NROWS)                      # 10304
 OPERAND = max(2 * TSEQ * HEAD * 2 * KVPER, WT)          # 10304
@@ -222,7 +281,21 @@ def build(pos, nlay, seq):
              # host.
              "-DRESID_FROM_STASH=1", "-DXOUT_TO_STASH=1"]
 
-    tag = f"fz{nlay}p{pos}s{seq}n{NROWS}m{MASKPAD}a{AQ}"
+    # The stub mode rides in the tag, which is stamped into every fifo NAME:
+    # iron.jit hashes the AST, so a flag or a comment would not bust the cache.
+    # With STUB="" `stubdefs` is the empty string and `src` below is character
+    # for character what it was before stub mode existed -- so the verified
+    # build stays a cache hit and its behaviour is untouched.
+    tag = f"fz{nlay}p{pos}s{seq}n{NROWS}m{MASKPAD}a{AQ}" + (f"S{STUB}" if STUB else "")
+    stubs = {}
+    stubdefs = ""
+    for var, (grp, name, argexpr) in _STUBBABLE.items():
+        if STUB in ("all", grp):
+            stubs[name] = _stub_source(name + "_stub", argexpr)
+            stubdefs += (f'    {var} = ExternalFunction("{name}_stub", '
+                         f'source_string=STUBS["{name}"],\n'
+                         f'                            arg_types={argexpr}, '
+                         f'compile_flags=FLAGS)\n')
     P = "xin: In"
     P += ", " + ", ".join(f"aw{i}: In" for i in range(AQ))
     P += ", kvo: Out, kvi: In, xout: Out"
@@ -258,7 +331,7 @@ def _design({P}):
                            arg_types=[bc_ty, op_ty, p1o_ty], compile_flags=FLAGS)
     kr3 = ExternalFunction("flm_gemv_q4_1_residual", source_file=RES_SRC,
                            arg_types=[bc_ty, op_ty, p1o_ty], compile_flags=FLAGS)
-
+{stubdefs}
     # ---- group A: qkv + RoPE on 8 cores ------------------------------------
     f_bca = ObjectFifo(bc_ty, depth=1, name="{tag}_abc")
     bca = [f_bca.cons() for _ in range({NA})]
@@ -564,7 +637,7 @@ def _design({P}):
               NORM_SRC=NORM_SRC, ATT_SRC=ATT_SRC, BEG_SRC=BEG_SRC,
               FIN_SRC=FIN_SRC, RES_SRC=RES_SRC, ASUM_SRC=ASUM_SRC,
               HEMIT_SRC=HEMIT_SRC, DOWN_SRC=DOWN_SRC, GATE_SRC=GATE_SRC,
-              UPS_SRC=UPS_SRC, FLAGS=flags,
+              UPS_SRC=UPS_SRC, FLAGS=flags, STUBS=stubs,
               bc_ty=bc_ty, wt_ty=wt_ty, wq_ty=wq_ty, o_ty=o_ty, okv_ty=okv_ty,
               q_ty=q_ty, op_ty=op_ty, opq_ty=opq_ty, opp_ty=opp_ty,
               ao_ty=ao_ty, aoj_ty=aoj_ty, p1o_ty=p1o_ty, p1p_ty=p1p_ty,

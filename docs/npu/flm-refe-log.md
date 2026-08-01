@@ -13451,8 +13451,14 @@ success was treated as insufficient — internally everything agreed at pos 30.
 
 ## Open
 
-  * **31 us/layer unattributed** in the fused design (see above) — and whether additivity
-    holds is a standing question about how throughput gets estimated here at all
+  * ~~**31 us/layer unattributed** in the fused design~~ **CLOSED** — see the last entry
+    in this file. 812.1 was the post-build outlier run; against a mean of three fresh
+    runs (791.5) the surcharge is 16.2 us/layer. Four stub builds put 731.5 of the 791.5
+    in a shared DMA floor, 26.2 in A+B's compute, 21.6 in C's, and 12.2 in an interaction
+    that exists only when both halves' compute runs. Additivity does NOT hold, for a
+    different reason than expected: `groups_ab`'s 123.6 us/layer slope is latency at 31.9
+    GB/s, not bandwidth, so it does not transfer into a design that is DDR-bound. Bytes
+    add; latency-bound slopes do not.
   * a KV cache carried by the device across successive tokens
   * group C's internal seams: P4 reads host h, P5 host sw
   * attention floor 2-3 ULP at pos 1-2, advisory in both harnesses
@@ -15199,3 +15205,125 @@ that reusing one name for both broke `resid_chain` the moment it was tried.
 `channel_probe.py`'s docstring now says what it does and does not cover. Its "40 in / 36
 out places" is a memtile result and was read here as settling the fused design's channel
 demand; it could not, and the shim is where the union actually fails.
+
+### The 31 us/layer, attributed: half of it was never there, and the rest is DMA
+
+Four builds of the same design, three runs each, `FUSED_AQ=4`, one session. `FUSED_STUB`
+replaces a group's COMPUTE with a body that reads eight elements per operand and writes
+one; every acquire, release, fifo, fill, drain, size, count and order is untouched.
+`_stubcheck.py` diffs the generated design source at each setting against the unstubbed
+one and fails on any difference except the inserted kernel bindings — `-0 +12`, `-0 +12`,
+`-0 +24`. The DMA is not approximately the same, it is the same text.
+
+    build                      runs (us, 16 layers)          us/layer       spread
+    T    everything real       12674.0 12705.1 12611.1     791.5 +- 1.7      0.74%
+    S_A  C stubbed             12071.4 12145.4 12152.4     757.7 +- 1.6      0.67%
+    S_C  A and B stubbed       12025.8 12016.4 12105.6     753.1 +- 1.8      0.74%
+    S_0  everything stubbed    11692.6 11793.9 11626.0     731.5 +- 3.1      1.44%
+
+(+- is the standard error of the mean of three runs. Medians agree with the means to
+under 1 us/layer in every row.)
+
+**The first number to fix is the target.** 812.1 us/layer is the FIRST of the three runs
+recorded in the fused entry above — the one immediately after the build, which that entry
+itself names as the outlier. Three fresh runs of the same cached build give 788.2 / 792.1
+/ 794.1, mean **791.5**. Against the 775.3 projection the surcharge is **16.2 us/layer,
+not 31**. Half of what was being chased was a single post-build run quoted as the result.
+I set that target myself, in the entry that flagged the spread.
+
+**What the design actually is.** With all compute stubbed the dispatch still takes 731.5
+us/layer — **92.4% of the real time**. 38.25 MB a layer at 52.29 GB/s. That is not a
+number that needs explaining: `group_c` standalone moves 34.292 MB at 651.7 us/layer =
+**52.62 GB/s**, and lm_head was measured at 54.7 GB/s. The fused floor and group_c
+standalone run at the same bandwidth to 0.6%. Adding A's 3.957 MB at that bandwidth
+predicts 651.7 + 75.2 = **726.9** against a measured floor of 731.5.
+
+So the whole compute of thirty-two cores — every GEMV, the attention, the SwiGLU — is
+worth **60.0 +- 3.5 us/layer** on top of the bytes, and the design has been
+bandwidth-bound all along.
+
+**The three candidates, and what the experiment says about each.**
+
+    AB compute above the floor   S_A - S_0 = 26.2 +- 3.5 us/layer
+    C  compute above the floor   S_C - S_0 = 21.6 +- 3.5 us/layer
+    both                         T   - S_0 = 60.0 +- 3.5 us/layer
+    halves summed          S_A + S_C - S_0 = 779.3 +- 3.9   vs   T = 791.5
+
+**The halves sum to LESS than the whole by 12.2 +- 4.3 us/layer** — the two-factor
+interaction, the part that exists only when both halves' compute runs. That is candidate
+2 and it is the only one of the three that survives, at 2.9 sigma and 1.5% of a layer.
+
+Candidate 3 — C genuinely slower fused — is not supported. C's standalone 651.7 us/layer
+IS its own DMA at 52.62 GB/s, so there was never compute-bound headroom in it to lose;
+fused, C's compute costs 21.6 us/layer above a floor that already carries C's bytes.
+Nothing here says C's phases got slower; it says C's phases were nearly free in both.
+
+Candidate 1 — A at NROWS=8 instead of 16 — **this experiment cannot isolate it, and I am
+not going to pretend otherwise.** A's DMA lives inside S_0, so the predicted 4.5%
+bandwidth cost (about 3.4 us against A's ~75 us of fused DMA, not the 5.6 us/layer
+quoted, which was scaled off the 123.6 slope) and the doubled acquire/release count are
+both inside the 731.5 floor and inside its 3.1 us error bar. The one weak thing that can
+be said: the floor sits 0.6% above bytes-at-group_c's-bandwidth, which leaves no room for
+a large acquire/release penalty anywhere in the design — but that comparison assumes A
+gets the same bandwidth C does, which nothing measured.
+
+**Why the projection was ever close.** It summed a bandwidth-bound slope and a
+latency-bound one and got lucky:
+
+    projected  123.6 (A+B) + 651.7 (C)                       = 775.3
+    actual      75.2  A's bytes at the shared 52.6 GB/s
+              + 26.2  A+B compute above the floor
+              + 21.6  C compute above the floor
+              + 651.7 C's bytes, which ARE its standalone slope
+              + 12.2  interaction
+              +  4.6  floor residual (731.5 measured vs 726.9 from bytes)
+                                                             = 791.5
+
+`groups_ab` standalone runs at **31.9 GB/s** — it does not saturate anything, so its
+123.6 us/layer is latency, not bandwidth. Fused, A's bytes queue behind C's at the DDR
+ceiling and cost 75.2. The projection therefore **over-counted A+B by 22 us/layer** and
+under-counted C's unhidden compute plus the interaction by about the same, and the two
+errors nearly cancelled. The 16.2 us/layer that was left over is what remains of a
+cancellation, not a single mechanism.
+
+**So the answer to "is additivity safe" is no, and not for the reason expected.** The
+failure is not that fused execution is slower than the sum. It is that a slope measured
+on a design that owns the machine is not a slope at all when the design is not
+bandwidth-bound — it is that design's latency, and it does not transfer. Every projection
+in this log that summed `groups_ab`'s slope with anything has that error in it. The ones
+that summed only bandwidth-bound terms are fine, because bytes do add: 651.7 + 75.2 =
+726.9 against a measured 731.5.
+
+**What this changes about where to look next.** Nothing in the compute is worth
+optimising: 60 us/layer of 791.5. The 731.5 us/layer floor is 38.25 MB at 52.3 GB/s
+against a 54.7 GB/s ceiling, so the only levers left are fewer bytes (a smaller weight
+format) or a higher fraction of peak. Kernel work on this design is over.
+
+Method notes, so this is reproducible and so its limits are on the record:
+
+  * `flm_norm_prepare` is the one kernel A and C both call, so stubbing it per-group
+    would need two instances of one symbol. It is never stubbed. Two passes over 2048
+    elements against A's 3.96 MB a layer — it sits in the common floor of all four
+    builds and cancels out of every difference above.
+  * Stubbing frees .text on the stubbed cores, so all three stub builds place more
+    easily than the real one. That is fine for timing attribution and **must not be read
+    as headroom**: the real build is still at 15712 B / 95.9% on C.
+  * The stubs demonstrably ran. `FUSED_STUB=c` produces x16 with mean|.| 1.5e+29 and
+    cosine +0.0009 against the real x16; `FUSED_STUB=ab` produces mean|.| 1.55 against
+    1.749 and cosine +0.9940 (high because the residual stream survives C's real path
+    and only attention is junk). A stub that had silently linked the real kernel would
+    have reproduced the real output bit for bit.
+  * `S_C` is NOT "group C alone" and `S_A` is NOT "A+B alone" — each is the whole fused
+    dispatch with one half's compute removed and both halves' DMA present. That is
+    deliberate: a body that returned early would stop sharing the memtile and shim
+    budgets the additivity question is about. It also means "C_fused vs 651.7" as a
+    direct comparison does not exist in this data, and the entries above do not report
+    one.
+  * `T - S_0`, `S_A - S_0` and `S_C - S_0` all assume stubbing removes compute and
+    nothing else. `_stubcheck.py` is what makes that assumption checkable rather than
+    asserted.
+  * The default build's design source is character-identical to what it was before
+    `FUSED_STUB` existed — `stubdefs` is the empty string — so the verified build was a
+    cache HIT this session and its behaviour is untouched. That is also why the control
+    numbers here are comparable with the fused entry's.
+
