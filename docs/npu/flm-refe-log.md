@@ -13378,7 +13378,16 @@ deficit to within 0.3%. The kernels were never the problem. Unchanged.
     group C   16 cores   P3+P4+P5 in ONE dispatch, three phases, layer loop
                          P3 9.5367e-07   P4 2.9297e-03   P5 0.0000e+00     PASS
 
-P5 is bit-exact. C's h->P4 and sw->P5 seams close inside the dispatch.
+**ALL SIXTEEN LAYERS CHAINED**, each consuming the previous layer's device output
+(`chain_layers.sh 16`, exit 0): P5 exact at 13 of 16 layers and within two ulp at the
+rest, P4 between 0.65% and 2.50% of peak with no trend across depth, k'/v' passing
+everywhere, attention 0.61-2.20 ULP with layers 11-12 above the advisory envelope.
+No drift — activations grow through the stack while relative error does not, and the
+deepest layer has the lowest P4 error of any.
+
+The full-token compute path is therefore correct end to end, in 32 dispatches. All
+four seams close: q' core to core inside A+B, attention out A+B -> C, h and sw inside
+C's dispatch, x_out C -> A for the next layer.
 
 ## Measured throughput
 
@@ -13420,11 +13429,16 @@ a limit of 6 — but has never been placed. A full-operand skeleton build is run
 
 ## Open
 
-  * fused 32-core placement — the only thing between here and the projection
-  * attention floor at pos 1-2 (2-3 ULP) — the padding fix did not reach it
+  * **the fused single dispatch** — the only thing between here and the projection.
+    Topology places and routes at full operand size; per-core program memory fits
+    (A+B 57%, C 90% of 16 KB, and fusing adds code to no core); the C->A seam needs
+    no new core code if it goes through host memory. None of that has been built.
+  * attention floor: 2-3 ULP at pos 1-2, and 2.16-2.20 ULP at layers 11-12 of the
+    chain. The padding fix reached neither. Advisory in both harnesses now, because a
+    bound known to be fitted cannot also be the gate — that miswiring stopped the
+    16-layer chain twice.
   * p1p2_chain short-context is worse than groups_ab by more than npad explains
-  * DIM_ACCN is a per-design constant: `2 * tiles * NROWS` for whoever runs P5.
-    Its default of 128 is wrong for every configuration used here.
+  * DIM_ACCN is now mandatory (`#error` without it), so this trap is closed
 
 ### DIM_ACCN is now mandatory
 
