@@ -12541,3 +12541,36 @@ one `flm_gemv_flush` already has. Small, and the write side exists.
 Recording the correction because "the residual is already handled" would have been
 true of the single-layer test and false of the thing being built — the sort of gap
 that passes a first check and fails on the second token.
+
+### Two-level joins are impossible — and the fix is a kernel that already exists
+
+C needs the whole 2048-element attention vector for o_proj, but B has 8 cores and
+an 8-way join exceeds a memtile's inputs. The obvious answer is to join in two
+levels — four cores to a half, two halves to the whole. The API allows it:
+
+    level 1 join -> ['ObjectFifo', 'ObjectFifo']
+    level 2 join -> ['ObjectFifo', ...]      # expressible
+
+The hardware does not:
+
+    error: 'aie.objectfifo' op objectfifo cannot be in more than one
+           ObjectFifoLinkOp
+
+A fifo produced by a join cannot itself be joined. So the attention vector
+**cannot** arrive as one object, and that is settled rather than worth retrying.
+
+The resolution is not to fight it. C receives two halves and runs o_proj as **two
+K-chunks**, accumulating — which is exactly what `flm_gemv_down` already does for
+P5, selecting accumulate-vs-flush from the tile's own flag:
+
+    P5 today   down_proj over D_FF in NCHUNK=4 chunks, residual added on flush
+    P3 here    o_proj over K_DIM in 2 chunks, residual added on flush
+
+Same shape, same kernel. So group C can run **one GEMV kernel for both P3 and P5**
+rather than two, which also takes a body off a core that is carrying three.
+
+Worth noting the shape of this: the constraint that looked like a blocker
+(8 cores, no wide join) turns into a saving, because chunked accumulation was
+already built for a different reason. That is the second time the existing
+kernels have already solved a problem this architecture ran into — the first was
+the residual riding the weight tile, for the same 2-input-channel reason.
