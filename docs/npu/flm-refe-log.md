@@ -13134,3 +13134,33 @@ and is not addressed here.
 
 `ATTN_MASK_PAD=0` reproduces the old numbers exactly at every position tested, so
 the toggle is clean and nothing else moved.
+
+### The mask had a latent defect, found by re-verifying the other caller
+
+`ATTN_MASK_PAD` read npad from the KV trailer unconditionally. That is only where
+npad lives when `NPAD_FROM_KV=1`, which `groups_ab` sets and `p1p2_chain` does not —
+the latter writes npad into the q tail. So enabling the mask there made decode
+consume whatever happened to sit at the trailer offset:
+
+    p1p2_chain seq=2   mask off  9.0432e-02
+                       mask on   4.0055e-01     <- far worse
+                       fixed     7.2854e-02     <- better than mask off
+
+Decode now mirrors `flm_attn_finish`'s `#if NPAD_FROM_KV` exactly instead of
+assuming one layout.
+
+The previous entry called the toggle "clean and nothing else moved." That was true
+of everything measured and false in general: `groups_ab` was the only design the
+flag was ever enabled on, and it happens to be the one whose layout the code
+assumed. A flag verified on a single caller says nothing about the callers that
+select a different code path, and this one was one flag away from silently
+corrupting them.
+
+After the fix, short context in `p1p2_chain` improves but does not pass —
+7.29e-02 against a 6.23e-03 tolerance at seq=2, versus 2.70 ULP for `groups_ab` at
+the same position. The two designs disagree by more than the mask explains, so
+something else differs at short context in the older two-dispatch path. Not chased
+here; A+B is the direction, and A+B is bit-exact at position 0.
+
+Unchanged after the second edit: `p1p2_chain` mask off at seq=31 (3.4631e-03),
+A+B at pos 0 (0.00 ULP) and pos 30 (0.76 ULP).

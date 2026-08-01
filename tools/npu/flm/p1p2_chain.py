@@ -210,7 +210,12 @@ def build(pos, nobj):
     # disagree on element width counts its sizes in the wrong unit.
     cache_ty = np.ndarray[(nobj * 2 * NATT * SLOT,), np.dtype[np.uint8]]
 
-    flags = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_HEAD={HEAD}",
+    # Mask the padded KV lanes rather than subtracting them at the end. The
+    # fifo name carries it too, because the jit cache hashes the AST and does
+    # not see compile flags.
+    MASKPAD = __import__("os").environ.get("ATTN_MASK_PAD", "0")
+    flags = [f"-DATTN_MASK_PAD={MASKPAD}",
+             f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_HEAD={HEAD}",
              f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS={NQ}", f"-DDIM_QKHEADS={NK}",
              f"-DDIM_GQA={GQA}", f"-DDIM_TSEQ={TSEQ}", f"-DDIM_KVPER={KVPER}",
              f"-DDIM_QSTRIDE={OBJ}", f"-DDIM_KVOBJ={OPERAND}",
@@ -274,7 +279,7 @@ def _design(bc: In, {P}):
                            arg_types=[bc_ty, op_ty, p1o_ty],
                            compile_flags=FLAGS)
 
-    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_c32n8_{NLAY}")
+    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_c32n8_{NLAY}_m{MASKPAD}")
     bc_cons = [f_bc.cons() for _ in range({NCORES})]
     f_w = [ObjectFifo(oppair_ty, name=f"wp{{i}}_n{NROWS}k{KVPER}") for i in range({npairs})]
     w_sub = [f.cons().split([0, {OPERAND}], obj_types=[op_ty, op_ty]) for f in f_w]

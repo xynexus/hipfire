@@ -180,8 +180,19 @@ flm_attn_tile(const uint8 *restrict q_raw,      // [GQA][HEAD] bf16, pre-scaled
   // changes nothing arithmetically — it only decouples the fifo object size
   // from TSEQ, which the fused layer needs.
 #if ATTN_MASK_PAD
+  // npad must be read from wherever THIS build put it. Reading the KV trailer
+  // unconditionally was wrong: designs that leave NPAD_FROM_KV at 0 write npad
+  // into the q tail and never touch the KV trailer, so the mask consumed
+  // garbage and made the result far worse (p1p2_chain seq=2: 9.0e-02 -> 4.0e-01).
+  // Mirror flm_attn_finish exactly rather than assuming one layout.
+#if NPAD_FROM_KV
   const float npad_dec =
       *reinterpret_cast<const float *>(kv_raw + DIM_KVOBJ - 60);
+#else
+  const float npad_dec =
+      *reinterpret_cast<const float *>(
+          reinterpret_cast<const bfloat16 *>(q_raw) + DIM_NPADOFF);
+#endif
 #endif
   for (int u = 0; u < KVPER; ++u) {
   const bfloat16 *restrict kt = kvpack + u * KVSTRIDE;
