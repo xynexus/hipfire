@@ -38,7 +38,7 @@ for ((L = 0; L < N; L++)); do
     # layer 0 while looking like the chain had simply ended.
     AB_EMIT_ATTN="$D/a$L.npy" \
         python3 groups_ab.py --p1-cores 8 --pos "$POS" --layer "$L" 2>&1 |
-        { grep -E "attn:|k' |v' " || true; } | sed 's/^/  /' | tr -s ' '
+        { grep -E "attn:|ADVISORY|k' |v' " || true; } | sed 's/^/  /' | tr -s ' '
     C_ATTN_FROM="$D/a$L.npy" C_EMIT_XOUT="$D/x$((L + 1)).npy" CHAIN_NLAY=1 \
         python3 group_c.py --seq "$SEQ" --layer "$L" 2>&1 |
         { grep -E "P3 h|P4 sw|P5 x_out" || true; } | sed 's/^/  /' | tr -s ' '

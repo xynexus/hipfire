@@ -13778,3 +13778,41 @@ Worth separating two things the stop conflated: the harness behaved correctly �
 nonzero exit stopped a chain that would otherwise have run on producing numbers nobody
 was checking — and the thing it caught was a bad threshold rather than a bad result.
 Both are useful. Only one is a bug.
+
+### All sixteen layers chained, end to end
+
+    layer   attn ULP   P4 (% peak)   P5
+    0       0.76       2.50          4.7684e-07
+    1-7     0.74-1.35  1.22-1.82     0.0
+    8       1.99       1.11          0.0
+    9       0.87       1.36          1.9073e-06
+    10      1.06       1.28          0.0
+    11      2.16       1.39          0.0
+    12      2.20       1.03          0.0
+    13-14   0.61-0.97  0.98-1.19     0.0
+    15      1.10       0.65          9.5367e-07
+
+    exit 0
+
+Every layer of Llama-3.2-1B computed by the role architecture, each consuming the
+previous layer's real device output. P5 is exact at thirteen of sixteen layers and
+within two ulp at the other three. P4 stays between 0.65% and 2.50% of peak with no
+trend across depth. k' and v' — the gates — pass everywhere.
+
+Attention runs 0.61 to 2.20 ULP. Layers 11 and 12 exceed the 2.0 advisory envelope,
+which is the known-unresolved floor the log has recorded twice before; it is reported,
+not gated, and the envelope was not widened to absorb it.
+
+**No drift.** The activations grow through the stack while the relative error does
+not, and the deepest layer (15) has the *lowest* P4 error of any layer. Sixteen
+compounding layers producing no growth in relative error is the strongest evidence yet
+that the composition is correct rather than merely plausible at one layer.
+
+One reporting caveat: `chain_layers.sh` filtered its own advisory line out of the
+transcript, so the run above shows "advisories: 0" while layers 11 and 12 were in fact
+above the envelope. The grep now includes it. That is the third time in this session a
+harness's *output filter* rather than its logic produced a misleading summary.
+
+This is the full-token compute path, correct end to end, in 32 dispatches. What it is
+not is one dispatch — the 65.4 tok/s projection still needs the fused design, and that
+remains untested beyond placement.
