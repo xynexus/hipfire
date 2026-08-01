@@ -13072,3 +13072,32 @@ as broader evidence than it was.
 
 Group C is unaffected: it has no attention. The projection-phase results and the
 96%-of-ideal throughput stand.
+
+### Correction: it is not a missing mask, and it is not A+B's
+
+Two claims in the previous entry are wrong.
+
+**It is not an A+B fault.** The two-dispatch `p1p2_chain` shows the same blow-up:
+
+    p1p2_chain seq=2  (pos 1)   9.0432e-02   vs tol 6.2256e-03
+    p1p2_chain seq=32 (pos 31)  5.6120e-03   vs tol 9.3994e-03   passes
+
+So it predates the fusion and lives in the attention kernel, not in the wiring
+between A and B. Discovering it while sweeping A+B said nothing about where it came
+from, and I attributed it to the design I happened to be running.
+
+**The mask is not missing.** `flm_attn_finish` does correct for padding, at
+`g_l[h] -= npad_f * exp2(-g_m[h])`. The padded slots hold K=0, so each contributes
+`exp2(0 - m)` to the denominator, and the correction removes exactly that many.
+
+The problem is that the correction works by *subtraction after accumulation*. At
+position 0 there are 31 padded entries against 1 real one, so the denominator is
+built up to ~31 and then almost all of it is taken away again. What survives is the
+real term plus whatever rounding the 31 discarded terms deposited along the way.
+The error therefore tracks the padded-to-real ratio, which is exactly the decay
+observed — and `npad` reaches 0 at pos=31, where the correction is not applied at
+all and the result is the clean 0.69 ULP floor.
+
+That also explains why this looked like the unresolved attention floor at every
+position anyone had checked: past about pos=8 the padding fraction is small enough
+that the cancellation error drops below the floor and disappears into it.
