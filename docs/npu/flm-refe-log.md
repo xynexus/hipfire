@@ -13487,6 +13487,21 @@ measured on dispatches whose activation never changes. 64.5-64.8 tok/s across se
 output must MOVE and then return bit for bit) and was never pointed at this driver. It would
 have caught it immediately.
 
+**BLAST RADIUS: exactly one call site. No other recorded result is contaminated.** Every
+`PyxrtDesign` user in the tree was enumerated:
+
+    fused.py:782        bind(*self.args) ONCE, then dispatch() per token (:917)
+    fused_pyxrt.py:84   d.dispatch() directly
+    lmhead_twostage.py  :216 first bind, :234/:285 re-pass the SAME a_t   -- all fine
+    lmhead_twostage.py:228  again(), a FRESH tensor per call              -- the bug
+
+Only `again()` ever called `__call__` with changed arguments. Everything else binds once and
+mutates the bound buffer in place — which is the pattern `--recheck` validates and the
+reason the fused path was immune. **Multi-token decode, the odd-position table and the FLM
+4/4 all run through bind-once + dispatch and were never exposed to this.** The earlier
+phrasing "every `__call__` caller had the bug" is true of the code path and should not be
+read as doubt about those results.
+
 The 241.5 us host term is numpy per-op OVERHEAD, not work — 78 us to top-32 a 128256 array
 that the same numpy argmaxes in 4.9, and 110 us to rescore 41 KB. It eats 40% of the device
 saving. With a host implementation that costs what the work costs, the same device time is
