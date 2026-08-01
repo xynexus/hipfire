@@ -15680,3 +15680,47 @@ One term still deserves care in a real implementation rather than a benchmark: t
 table is 525 MB in bf16 and `c.bf16()` returns it converted to float32, i.e. 1051 MB
 resident. That is a one-time 0.44 s load here, but a decode loop should keep it bf16 and
 convert the single row it needs.
+
+### The numpy elision hazard does not touch anything verified — checked, not assumed
+
+numpy 2.1.3 on Python 3.14.4 overwrites named local arrays in place. 3.14 emits
+`LOAD_FAST_BORROW`, so a local ndarray still shows refcount 1 while it is an operand of a
+binary op; numpy's temp elision reads that as "throwaway" and writes the result into it.
+Reproduced here:
+
+    in function:     before [0.02 0.02 0.02]  after [0.06 0.06 0.06]  clobbered True
+    module level:    before [0.02 0.02 0.02]  after [0.02 0.02 0.02]  clobbered False
+
+It needs all three: inside a function, array over ~256 KB, and the victim OWNS its data.
+That is why it survives small tests and bites real tensors.
+
+**Swept the reference path, and it is clean:**
+
+  * `q4nx.gemv_reference_bf16` — the function every check in this tree ultimately calls.
+    The only arrays over threshold are `d` and `m`, and both enter through `rnd()`, whose
+    first act is `.view(np.uint32)` — a view lacks OWNDATA and cannot be elided. Everything
+    inside the `(r, b)` loop is a 32- or 64-element slice. Reductions use `np.dot`, which
+    never elides. Independently confirmed by the lm_head agent: a vectorised transcription
+    with completely different array shapes agrees **bit-identically** over 256 real rows
+    (max abs diff 0.000e+00). Two implementations cannot agree to the last bit if either is
+    having an operand eaten.
+  * `host_forward.py`, `head_verify.py` — every array is K_DIM or D_FF wide, 8-32 KB, an
+    order of magnitude under the threshold.
+
+**Re-ran the measurement that drove the whole weight-path fix, elision-proof** (`np.multiply`
+with `out=`, explicit `.copy()`, no named array ever an operand while it must survive):
+
+    load_linear (container order)     corr +0.00107   relF 1.52109
+    q4nx_tensor_blocks (checkpoint)   corr +0.99700   relF 0.07748
+
+Identical to the originals. The finding stands.
+
+One place it probably did bite, recorded because it is mine: in the throwaway `dec_cmp`
+script, a row-match diagnostic read `got` *after* `np.linalg.norm(got - ref)`, so its
+`[452 413 269 463 87 300]` output may be junk. It was not load-bearing — the `corr` figures
+were computed before that line, which is why they reproduce — but "not load-bearing" is
+luck, not design.
+
+Rule for harnesses here: an array that must survive its own use as an operand must not be a
+bare local in a binary expression. Use `np.einsum`/`np.dot`/`np.matmul` (never elide),
+`np.multiply(..., out=)`, or `.copy()`. Views and slices are immune.
