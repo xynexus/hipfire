@@ -14899,3 +14899,24 @@ That closes the change: the declarations were dead, removing them frees 320 B, c
 is unchanged at every level checked (single layer, sixteen-layer chain, and the token).
 The only thing it did not do is what I claimed it would, which the previous entry
 retracts.
+
+### Final sweep: every design re-run on the current code
+
+After today's five correctness fixes and two removals, every design in the tree, re-run:
+
+    group_a       q' 3.8147e-06   k' 0.0000e+00   v' 5.9605e-08          PASS
+    groups_ab     attn 0.50 ULP   k' 0.0000e+00   v' 5.9605e-08          PASS
+    group_c       P3 0.0  P4 2.9297e-03  P5 7.4506e-09                   PASS
+    p5_pass       x_out 0.0000e+00                                       PASS
+    p1p2_chain    P3 9.5367e-07  P4 2.9297e-03  attn 3.1111e-03 vs tol 9.3994e-03
+    16-layer      token 16309, cosine 0.999659 vs the validated host
+
+`p5_pass` and `group_a` were the two gaps — `p5_pass` had its loader switched to
+`q4nx_tensor_blocks` and was never re-run, and `group_a` had not been run since the RoPE
+row permutation. Both pass, and `p5_pass` is now bit-exact where it was 0.0 before against
+different weights: `mean|ref|` moved 0.08126 -> 0.07176, which is the checkpoint-order
+weights arriving.
+
+That is the whole tree consistent on one set of code, with the headline result — sixteen
+device layers producing the oracle's token — reproduced after the last change rather than
+inherited from before it.
