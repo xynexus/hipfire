@@ -16018,3 +16018,272 @@ The honest reading so far: the host term is not obviously fixable in numpy witho
 either exactness or margin, which is what "a Rust implementation does not pay it" already
 said. The selection lever is the one that survives scrutiny and it is worth ~90 us, or
 +0.4 tok/s.
+
+# THE FUSED DISPATCH IS CORRECT AT POSITIONS 2 AND 4
+
+Sixteen layers in one dispatch, real RoPE, a real online softmax over a cache the
+design did not write, checked against an fp32 oracle built from
+`consolidated.00.pth` that shares no code with anything here.
+
+    prompt  "The quick brown fox" = [128000, 791, 4062, 14198, 39935]
+    host prefills positions 0..3, the DEVICE decodes position 4
+
+    device x16   mean 0.31817   max 2.59375     argmax 35308
+    host   x16   mean 0.32352   max 2.60562     argmax 35308
+    oracle x16   mean 0.29726   max 2.14293     argmax 35308      = " jumps"
+
+    cosine   device vs host     0.999014
+             device vs ORACLE   0.964879        host vs ORACLE   0.964990
+
+    prompt  "Hello world" = [128000, 9906, 1917], device decodes position 2
+
+    device x16   mean 0.36623   max 7.25000     argmax 2268
+    host   x16   mean 0.37359                   argmax 2268
+    oracle x16   mean 0.36202   max 7.47707     argmax 2268
+
+    cosine   device vs host     0.999032
+             device vs ORACLE   0.986880        host vs ORACLE   0.986386
+
+**The number that carries the claim is the PAIR of oracle cosines, not either one.**
+The device cannot be closer to the model than 4-bit weights allow, so "is it 1.0" is
+the wrong question; the question is whether it is the HOST's number. At pos 4 the two
+differ by 1.1e-04 and at pos 2 the device is 4.9e-04 *closer* to the oracle than the
+host is. A device fault the host does not share would open a gap between them, and
+there is none at either position. The token agrees three ways at both.
+
+`fused.py --tokens ...` does the whole thing: `host_forward.prefill` runs positions
+0..P-1 on the host, the k'/v' go into the cache in the layout the drains write, and
+the device decodes at P.
+
+## Nothing in the device changed. The whole gap was host-side
+
+No kernel, no descriptor, no compile flag. `pos` was already threaded into the cs
+tables, the weight tiles' `flags` trailer, `npad` and the drain offsets. What did not
+exist was
+
+  * a KV cache holding real prior k'/v' — which needs a real multi-position prefill,
+    because layer L's input at position p is layer L-1's output at position p, which
+    itself attends over 0..p;
+  * a reference that does multi-position attention at all. `host_forward.layer` hard
+    coded the pos-0 shortcut (output = the KV group's v, no rotation), so it could
+    not serve as one.
+
+`host_forward.layer_parts(c, x, L, pos, prior)` is now the single layer function:
+with `prior=None` it is the pos-0 shortcut, unchanged and still bit-identical (`x1
+0.08325/20.88908 ... x16 1.74094/148.66781`, argmax 16309, every digit as recorded).
+`layer()` is a two-line wrapper on it, and `fused.ref_layer` — a hand copy of the
+same arithmetic, policed by an assert — is deleted. The duplication that produced
+five faults in this project is now absent rather than guarded.
+
+## Position 0 re-run on the changed harness: unchanged
+
+    device x16   mean 1.74863   max 147.00000
+    cosine vs the validated host   0.999650      (as recorded)
+    vs the external oracle: device 0.999325   host 0.999465
+    argmax 16309   +6.9362   then 2, 1340, 791, 1757
+
+## The floor at pos > 0 is the exp2 NLF, and that is a derivation not a concession
+
+The first pos-4 run printed FAIL on the two-bf16-step bound that pos 0 uses. That
+bound is correct at pos 0 and models the wrong mechanism at pos 4:
+
+    pos 0     the softmax is over ONE entry, so `aie::exp2` is evaluated only at 0,
+              where this log already records it as EXACT ("linear interpolation,
+              ~6% error, exact at integers"). The output is that entry's V, and bf16
+              rounding is the only error there is. `groups_ab` measures 0.00 ULP
+              there, bit-exact — which is what that claim PREDICTS, and is the
+              evidence that two representable steps is the right bound for pos 0.
+    pos > 0   the online softmax evaluates `aie::exp2` at NON-integer arguments,
+              where the AIE2P NLF is a linear interpolation whose relative error is
+              MEASURED at 3.54% mean / 5.86% max (`exp2_probe.py`, recorded in this
+              log as "AIE2P hardware exp2, max rel err over x in [-8,0] 5.86%").
+              Softmax weights inherit it directly, the attention output is a
+              probability-weighted average of V so it arrives undiminished, and
+              o_proj carries it into `h` and the FFN into `x_out`.
+
+5.86% is ~18x a bf16 step, so past position 0 it is what binds. Holding the device to
+the bf16 step there is holding it to a floor its own hardware cannot reach.
+
+The harness now prints every phase as a FRACTION OF PEAK as well as against the
+bound, so the margin is visible rather than asserted:
+
+    worst over 16 layers    attn    h       x_out
+      pos 4                 5.62%   1.80%   2.38%
+      pos 2                 3.73%   2.42%   4.61%
+    against the 5.86% NLF floor
+
+It is fair to say what would have falsified this: a phase above 5.86%, or a spread
+that grew with depth. Neither happens at either position. `h` and `x_out` sit well
+inside and do not trend, and attention — the phase that touches `exp2` directly — is
+the one that comes closest to the bound, which is the shape this explanation has to
+have to be worth anything.
+
+## ODD POSITIONS NEED A SEQUENTIAL DECODE, AND THE FUSED DESIGN CANNOT DO ONE YET
+
+Two separate reasons. The second is a device-side design fault that no amount of
+pos-0 work could have exposed.
+
+**1. Parity, which is a property of the TEST.** `flm_kv_pair` writes K as an aligned
+COLUMN PAIR because a single bf16 column is a 2-byte write at an odd byte offset and
+the DMA rejects it:
+
+    even t:  (k'_t, 0)          -> columns (t, t+1)
+    odd  t:  (k'_{t-1}, k'_t)   -> columns (t-1, t)
+
+At an even position a single-shot run touches its own column and a forward-looking
+padded one, so a host-built prefix survives intact. At an odd position it also writes
+column t-1 out of `g_kprev`, which in a single-shot run holds whatever the previous
+dispatch left — destroying the prior entry. `fused.py` now REFUSES an odd decode
+position with that explanation rather than producing a number that would look like a
+device fault. Verifying one requires the device to have decoded t-1 itself.
+
+**2. `g_kprev` is per-CORE, and the fused design runs sixteen layers on that core.**
+
+    kernels/npu/flm_kv_pair.h:
+        inline bfloat16 g_kprev[DIM_HEAD] __attribute__((aligned(64)));
+
+ONE head-wide buffer. In `groups_ab` that is correct, because one dispatch is one
+layer, so the value a core carries across dispatches is the same layer's k' from the
+previous token. In `fused.py` a single P1 core runs the whole layer loop and stores
+into `g_kprev` at every one of the sixteen layers. At the next token, layer 0's emit
+would read **layer 15's** k', layer 1's would read layer 0's, and so on — every layer
+closing its K column pair with a different layer's key.
+
+So a sequential decode at an odd position would be wrong on the fused design even
+with the xclbin held loaded and even with `offset_parameter` making position a
+runtime value. Those two were the known blockers; this is a third and nothing had
+looked for it. The fix is `g_kprev[NLAY][DIM_HEAD]` — 2048 B of .bss per P1 core,
+which fits, since P1 cores sit at 9040 B / 55.2% of 16 KB — plus a layer index the
+kernel does not currently have. It can ride the weight tile's `flags` trailer, which
+already carries `pos`, or be a core-local counter, since each P1 core does exactly
+one k' emit per layer in layer order.
+
+**Even positions are unaffected, and not by luck**: at even t the kernel only WRITES
+`g_kprev` and never reads it, so the stale-layer value is never consumed. That is why
+pos 2 and pos 4 are correct, and why an even position was the right thing to verify
+first.
+
+Not fixed here. It is a one-array change to a header that every design in this tree
+links, it cannot be verified without the runtime-offset host restructuring that odd
+positions need anyway, and shipping it unverified ahead of that work would put an
+unexercised change under every existing result.
+
+## The external oracle I built was itself wrong, and only for T > 1
+
+The first `oracle_forward.py` did its arithmetic in numpy. It reproduced the recorded
+single-token result EXACTLY — argmax 16309, x16 1.76944 / 155.89619, logits +7.0285
+then 2, 791, 1340, 475 — and was badly wrong at five tokens, reporting x16
+40.67964 / 3146.70653 and argmax 14924 where the truth is 0.29726 / 2.14293 and 35308.
+
+I spent a long time treating the q4nx host reference as the suspect, because the
+oracle was the thing that was supposed to be trustworthy. What settled it is that the
+host and a torch implementation agree with each other and the numpy oracle agrees
+with neither: two independent implementations against one.
+
+**The cause is NOT established and must not be recorded as if it were.** Measured:
+
+  * `sw = (g / (1.0 + np.exp(-g))) * u` returned `u` itself — `sw is u` True,
+    `np.shares_memory(sw, u)` True — which is numpy temp elision;
+  * but with `u` provably untouched (`np.array_equal(u, u_before)` True) and the
+    product written into a fresh array through `np.multiply(..., out=)`, the result
+    still disagreed with `np.multiply(t, u.copy())` computed moments earlier in the
+    same scope, and the whole-forward answer did not change;
+  * two runs of the same numpy forward, differing only in surrounding code, gave
+    x16 40.67964 / 3146.70653 and 39.28495 / 3023.61815 — it is not stable;
+  * the extracted weights are ruled out: seven spot-checked tensors are all
+    `torch.equal` to the checkpoint;
+  * with torch also imported, `h2 @ w1.T` returned three different answers in one
+    scope, the second exactly the first plus the correct one. `OMP_NUM_THREADS=1`
+    changed nothing;
+  * none of it reproduced standalone, at T = 1, 2, 5 or 8, with or without torch.
+
+So elision is real and is at least part of it, it is not the whole story, and "numpy
+is wrong at T>1" is a characterisation the evidence does not support. The T=1 / T>1
+split is more likely a refcount and size-threshold coincidence than a distinct code
+path. numpy 2.1.3, torch 2.12.0a0+rocm7.13, Python 3.14.4, `~/.venv`.
+
+`oracle_forward.py` now does its arithmetic in torch. That is not a workaround for a
+diagnosis I do not have — it is a second implementation, maintained elsewhere, and a
+second implementation is the only thing that made the fault visible at all.
+
+**The failure announces itself as a CONTRADICTION, not as a wrong-looking number.**
+Both instances found today printed internally inconsistent output on adjacent lines:
+the SwiGLU gate dropped while the identical expression three lines later was correct;
+and elsewhere in this project the same day, "these two arrays agree to 1.4e-06" next
+to "argmax 45 vs 16309". Eyeballing magnitudes will not catch it — an assert on the
+comparison will, and knowing about the bug demonstrably does not, since the person
+who wrote the warning hit it again an hour later.
+
+**None of this reaches any earlier recorded result.** Everything verified in this
+project before today is T=1, where both faults vanish, and the pos-0 figures were
+re-run afterwards and are unchanged to the digit.
+
+### Two environment facts that will otherwise cost someone a day
+
+  * **`import aie.iron` followed by `import torch` SEGFAULTS in this venv.** Not an
+    exception — a core dump, before any work is done.
+  * **`qkv_verify` does `import aie.iron` at module scope**, so ANY file that imports
+    the flm python helpers pulls iron in and then cannot import torch. That is
+    structural rather than a quirk of one script: it is why `oracle_forward.py` is
+    standalone, and why the device harnesses compare against the `.npy` it saves
+    instead of calling it.
+
+## `gemv_reference_bf16` vectorised: 19x, bit-identical
+
+The host reference GEMV was a Python loop over rows x blocks, and a five-position
+prefill runs it ~80 times over the whole model. It is now vectorised over rows, with
+the accumulation ACROSS blocks left as an explicit sequential loop, because the order
+of a float sum is part of what "reproduces the kernel step for step" means.
+
+    o_proj  0.80s -> 0.038s      gate_proj  3.14s -> 0.161s
+    down    3.14s -> 0.169s      k_proj     0.20s -> 0.004s
+    np.array_equal(old, new) True on all four, max diff 0.0
+
+Bit-identity is what makes the swap safe rather than merely fast: every host
+reference in this tree is built on this function, and one of them is the yardstick
+the fp32 oracle validated. `host_forward.py` at pos 0 reproduces its recorded output
+to every digit after the change, which is the end-to-end form of the same check.
+
+`host_forward` also memoises decoded blocks (~1 GB for 16 layers), because a prefill
+walks every layer once per token. Together those took the 5-token host forward from
+tens of minutes to 48 s, which is what made iterating on this possible at all.
+
+## State of the design, by position
+
+    pos 0    device argmax 16309, cosine 0.999650 vs host, 0.999325 vs oracle
+    pos 2    device argmax 2268,  cosine 0.999032 vs host, 0.986880 vs oracle
+             (host 0.986386 -- the device is marginally CLOSER to the model)
+    pos 4    device argmax 35308, cosine 0.999014 vs host, 0.964879 vs oracle
+             (host 0.964990)
+
+    RoPE at a nonzero position    EXERCISED end to end for the first time
+    online softmax over a real    EXERCISED -- 3 and 5 entries, all but the last
+      multi-position KV cache       written by a real prefill, prior V non-zero
+    odd positions                 NOT verifiable single-shot, AND the fused design
+                                    has a real fault there (`g_kprev` per core, not
+                                    per layer). Reported above, not fixed.
+    KV carried by the DEVICE      still not done: the prefill is host-side, so what
+      across successive tokens      is verified is one decode step onto a correct
+                                    cache, not a sequence the device produced
+    throughput                    untouched -- same arithmetic, same bytes, at any
+                                    position
+
+### Regression sweep after the `gemv_reference_bf16` change
+
+`gemv_reference_bf16` is the function every host reference in this tree is built
+on, so "bit-identical on four tensors" is a claim about the function and not about
+its callers. Every design re-run:
+
+    group_a       q' 3.8147e-06   k' 0.0000e+00   v' 5.9605e-08          PASS
+    groups_ab p0  attn 0.00 ULP   k' 0.0000e+00   v' 5.9605e-08          PASS
+    groups_ab p30 attn 0.50 ULP   k' 0.0000e+00   v' 5.9605e-08          PASS
+    group_c       P3 0.0000e+00   P4 2.9297e-03   P5 0.0000e+00          PASS
+    p5_pass       x_out 0.0000e+00                                       PASS
+    p1p2_chain    attn 3.1111e-03 vs tol 9.3994e-03                      advisory OK
+    fused pos 0   argmax 16309, cosine 0.999650                          PASS
+
+Identical to the previous sweep in every digit, which is the expected result and
+the reason to run it rather than assert it. `groups_ab` at pos 0 measuring **0.00
+ULP — bit-exact** is also the standing evidence for the pos-0 floor argument above:
+one softmax entry, `exp2` evaluated only at 0 where the NLF is exact, output equal
+to that entry's V.

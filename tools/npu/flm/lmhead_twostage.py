@@ -404,8 +404,27 @@ def main():
         # at or above the K-th is the same shortlist -- asserted equal below --
         # for 78 us against 130. Both are numpy overhead rather than work; the
         # same numpy does a 513 KB argmax in 4.9 us.
-        thr = np.partition(cl, -o.topk)[-o.topk]
-        idx = np.flatnonzero(cl >= thr)
+        # A THRESHOLD SET IS THE TOP-N FOR SOME N, so `cl > m - d` with at least
+        # K survivors provably contains the true top-K — the guarantee the recall
+        # curve was measured against is preserved exactly, not approximated. One
+        # max (7.5 us) plus one threshold pass beats partitioning 128256 values:
+        # 19.3 us against 76-110, for the identical set.
+        #
+        # d = 2.0 lands ~39 candidates on real coarse logits (the 32nd is 1.87
+        # below the max on both probes measured); the widening ladder and the
+        # argpartition fallback cover a hidden state whose logits are flatter.
+        # The trim is an argpartition over ~39 elements, not 128256, so it costs
+        # nothing and keeps the rescore at exactly K rows — which matters because
+        # the rescore has a cliff above K=16 (90.6 us at 16, 302.6 at 32).
+        m = cl.max()
+        for _d in (2.0, 4.0, 8.0, 16.0):
+            idx = np.flatnonzero(cl > m - _d)
+            if idx.size >= o.topk:
+                if idx.size > o.topk:
+                    idx = idx[np.argpartition(cl[idx], -o.topk)[-o.topk:]]
+                break
+        else:
+            idx = np.argpartition(cl, -o.topk)[-o.topk:]
         fine = lc.gemv_bf16_fast(x, D[idx], M[idx], C[idx])
         got = int(idx[int(np.argmax(fine))])
         fine_us.append((time.perf_counter_ns() - t0) / 1e3)
