@@ -19,8 +19,16 @@
 
 #include "flm_q4_1_tile.h"
 
+// No default. `g_acc_down` is indexed `base % DIM_ACCN`, so a value smaller than
+// the row span the caller tiles over aliases two output tiles onto one
+// accumulator slot -- every core wrong, identically, which reads as a data-routing
+// fault and is not one. The old default of 128 was wrong for every configuration
+// in this tree (p5_pass and group_c both need 2 * tiles * NROWS = 256), and group_c
+// shipped that bug precisely because omitting the flag compiled and ran.
+//
+// Omitting it is now a build error rather than a plausible wrong answer.
 #ifndef DIM_ACCN
-#define DIM_ACCN 128
+#error "flm_gemv_down requires -DDIM_ACCN=<2 * tiles * NROWS for this design>"
 #endif
 
 alignas(64) float g_acc_down[DIM_ACCN];

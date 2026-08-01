@@ -13425,3 +13425,26 @@ a limit of 6 — but has never been placed. A full-operand skeleton build is run
   * p1p2_chain short-context is worse than groups_ab by more than npad explains
   * DIM_ACCN is a per-design constant: `2 * tiles * NROWS` for whoever runs P5.
     Its default of 128 is wrong for every configuration used here.
+
+### DIM_ACCN is now mandatory
+
+`flm_gemv_down` defaulted `DIM_ACCN` to 128. Both callers in this tree need 256
+(`2 * tiles * NROWS`), so the default was wrong for every configuration that exists —
+and group C shipped exactly that bug, for a whole session, *because omitting the flag
+compiled and ran*. It produced a plausible wrong answer on every core identically,
+which reads as a data-routing fault and sent the investigation after the broadcast
+and the weight stream.
+
+The default is removed; omitting the flag is now `#error`. Verified in isolation —
+the guard fires when the macro is absent and is silent when present — and `group_c`
+still passes unchanged (P3 9.5367e-07, P4 2.9297e-03, P5 0.0000e+00).
+
+Both existing callers already pass the flag, so this is inert for them by
+construction: with the macro defined the preprocessor output is byte-identical. The
+only behaviour that changes is a future caller's, which now fails to build instead of
+silently halving its accumulator.
+
+The general shape is worth keeping: a compile-time constant whose wrong value still
+computes *something* is more dangerous than one that crashes. Defaults belong on
+parameters where every value is valid, not on ones where the correct value is a
+property of the caller's tiling.
