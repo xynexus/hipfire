@@ -13392,11 +13392,20 @@ produce token **16309**, matching the oracle. Device x16 vs validated host: cosi
 
 ## Measured throughput — unaffected by any correctness fix
 
-    A+B   slope 124.8 us/layer     C  slope 637.9 us/layer  (96% of the 612.1 ideal)
-    lm_head      2994.2 us         (163.7 MB at 54.7 GB/s)
+Every term is a multi-point fit or a direct measurement. Two-point slopes were carrying
+a ~30 us error bar (same-build run-to-run spread is 2.6%), which is where the earlier
+65.4 / 64.0 / 64.4 figures came from — all the same measurement.
 
-    token = 92.9 + 16 x (124.8 + 637.9) + 2994.2 = 15290.3 us -> 65.4 tok/s
-    FLM 61.18, +6.9%   -- IF the two halves fuse into ONE dispatch
+    A+B      123.6 us/layer    8-point fit, R^2 0.99777, residual 14.7 us
+    C        651.7 us/layer    8-point fit, R^2 0.99965, residual 22.2 us
+    lm_head 2994.2 us          measured at its own size, 163.7 MB at 54.7 GB/s
+    floor      92.9 us         7-point fit, R^2 0.99997
+
+    token = 92.9 + 16 x (123.6 + 651.7) + 2994.2 = 15492.7 us -> 64.5 tok/s
+    FLM 61.18, +5.5%   -- IF the two halves fuse into ONE dispatch
+
+A+B's fit recovers an intercept of 90.0 us against the independently fitted 92.9 us
+floor, which is a consistency check on both.
 
 Interleaved as separate dispatches it is 55.0 tok/s, a 10% LOSS. The fused topology
 places and routes at full operand size (32 cores, 0 DMA errors), per-core program
