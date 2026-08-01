@@ -12756,3 +12756,38 @@ is built and passing, but not load-bearing.
 
 What I got wrong: treating "goes through host memory" as equivalent to "costs a
 dispatch". Those are different things, and conflating them nearly cost the design.
+
+### The architecture, with C at 16 cores: 61.8 tok/s projected
+
+Decomposing the measured per-layer marginals without circularity — side A's 549.6
+contains P1 at 12 cores, P2 at 4, and P3&P4 at 16, so the last is the remainder:
+
+    side A 549.6 = P1@12 92.9 + P2@4 25.1 + P3&P4@16 431.6
+    side B 194.5 = P5@16
+
+    role layer = P1@8 124.0 + P2@8 25.1 + P3&P4@16 431.6 + P5@16 194.5 = 775.2 us
+                 vs today's 744.1 marginal -> +31.1, entirely P1 losing four cores
+
+    token = 775.2 x 16 + 67.2 floor + 3700 lm_head + 5.6 staging
+          = 16.18 ms  ->  **61.8 tok/s**     FLM 61.18, **+1.0%**
+
+Every term measured. The only regression against the current design is P1 at 8
+cores instead of 12, which costs 31.1 us/layer; everything else is unchanged
+because C keeps all sixteen cores.
+
+I nearly reported 63.8 from a circular decomposition — deriving P3&P4 as
+`549.6 - P1@8 - P2` and then adding P1@8 back, which double-counts the saving.
+The corrected figure is 61.8.
+
+### Where this leaves the work
+
+    measured and passing   group A (P1, 8 cores, per-core fifos)
+                           group B (P2, 8 cores, full head coverage)
+                           A+B fused, q' core to core, 0.76 ULP
+                           topology at 32 cores, all four stream kinds
+    designed, not built    group C (P3+P4+P5, 16 cores) with host-staged handoffs
+    proven elsewhere       the layer loop, per-layer weights, exact x_out
+
+The remaining build is group C plus the two staged handoffs, then the layer loop
+around all of it. No unmeasured quantity is left in the projection — the risk is
+integration, which is where the last five faults came from.
