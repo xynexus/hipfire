@@ -14282,3 +14282,27 @@ multi-token decode and not at all for the attention kernel, which is now validat
 real multi-position data. The zero-filled cache that every earlier "attention passes"
 result used is retired either way — with prior V all zero, the online rescaling operates
 entirely on zeros.
+
+### Narrowing the cache-write bug: not the rotation
+
+    pos 3: rope_ref vs my prior construction   max diff 1.2307e-02   max|k| 6.4538
+    pos 1: same                                max diff 1.2413e-02   max|k| 6.3856
+
+A bf16 ulp at |k| = 6.45 is 0.025, so 1.23e-02 is half an ulp — the kernel's half-split
+on permuted rows and the pairwise-then-repermute construction agree to rounding. The
+rotation is not where the two references diverge.
+
+That leaves the packing: which cache slot each KV head lands in, and the V offsets. The
+drain writes at `2 * (_base * KVSTRIDE + ...)` where `_base` comes from `KVPLAN`, and
+the prior-position write assumes slot g holds head g. If `KVPLAN` is not the identity
+for this configuration, the priors are in the wrong slots — which would leave K and V
+individually correct and the attention wrong, exactly as observed.
+
+Not chased further this tick, and it is worth being clear about why that is defensible:
+this is a bug in a test scaffold I wrote today, and it does not touch any claim about
+the device. The device's attention was measured against a reference built from the bytes
+it actually read — 0.57 ULP over four real positions with non-zero prior V — and that
+measurement is independent of whether those bytes were the ones I intended to write.
+
+What it does block is an end-to-end multi-token decode, where the cache has to hold the
+right values and not merely self-consistent ones.
