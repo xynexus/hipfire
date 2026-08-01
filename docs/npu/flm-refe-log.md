@@ -11837,3 +11837,56 @@ setup — is negligible. The data movement itself still has to be paid for, and 
 So both halves of the premise now hold: core-to-core costs no memtile channels
 (measured, zero) and no meaningful fixed latency (measured, ~0.9 us). The
 role-specialised architecture is viable on both counts that killed the quad plan.
+
+## 2026-08-01 — the role-specialised architecture, specified
+
+Reconnaissance is finished. Both facts that decide the shape are measured:
+core-to-core fifos use **zero** memtile channels, and a handoff's fixed cost is
+**~0.9 us**. What remains is choosing the groups, and the tiling constraint does
+most of the choosing:
+
+    group size   P3/P5 rows   P4 rows   head-tiles
+        4            ok          ok         ok
+        8            ok          ok         ok
+       12            NO          NO         ok
+       16            ok          ok         ok
+       24            NO          NO         ok
+       32            ok          ok         NO
+
+A group running P3/P4/P5 must divide both 2048 and 8192 at NROWS=8, so it must be
+4, 8, 16 or 32 — **24 is not available**, which rules out the obvious "8 cores for
+attention, the other 24 for everything else".
+
+### The assignment
+
+    group A   8 cores    P1  qkv + RoPE          48 head-tiles / 8 = 6 each
+    group B   8 cores    P2  attention           one KV group per core, full coverage
+    group C  16 cores    P3 + P4 + P5            2048/128 = 16, 8192/128 = 64
+
+Three bodies is the largest any core carries, against the four that overflowed.
+Streams:
+
+    host -> A   activation, weights
+    A -> B      q', k', v'        core to core
+    B -> C      attention output  core to core
+    C -> A      residual          core to core, next layer's input
+    C -> host   x_out             the only join, 16 cores
+
+Memtile input channels: 16 (C's join) + splits. Against ~48, ample — the
+constraint that killed the quad plan does not bind.
+
+### What it costs, and the honest uncertainty
+
+P1 moves from 12 cores to 8, so qkv slows by ~1.5x. P2 moves from 4 cores to 8 and
+gains full head coverage — today's design computes half the heads. P3/P4/P5 stay
+at 16, unchanged.
+
+Whether that nets out faster than the current 744 us/layer **is not predictable
+from what I have measured.** P1's share of the layer has never been isolated, and
+the 4 KB handoff bandwidth has not been measured either. The dispatch-floor saving
+is 16 x 67.2 us = 1.1 ms per token, which is large; whether P1's slowdown eats it
+is exactly the open question, and the build answers it.
+
+Recording the design before building it, as with the quad plan — that one was
+specified, attempted, and proven impossible by arithmetic, which was far cheaper
+than discovering it halfway through.
