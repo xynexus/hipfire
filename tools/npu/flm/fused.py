@@ -108,8 +108,10 @@ whatever the last dispatch left in the carry.
     pos 1  argmax   220   oracle 2768 at +10.2370 against 220's +10.1084
     pos 3  argmax 39935   the oracle's token       cos vs oracle 0.938162
 
-`decode.py` is the loop. Positions are capped at TSEQ=32, which is five short of
-FLM's shortest server context -- see the log for why TSEQ is not a free constant.
+`decode.py` is the loop. Positions are capped at TSEQ=40 (see the constant below),
+which CLEARS FLM's shortest server context -- 36 template tokens, leaving four.
+It costs 5% of throughput against TSEQ=32, all of it compute, and 40 is the
+largest this design holds without a second operand size.
 
 `FUSED_STUB=ab|c|all` builds the same design with a group's COMPUTE replaced and
 its DMA untouched -- see the constant below and `_stubcheck.py`. It measured the

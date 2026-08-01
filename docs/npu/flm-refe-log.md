@@ -13511,6 +13511,19 @@ prompts. Feeding the device FLM's own `/api/generate` `context` array verbatim:
 
 Four for four, no divergence. Four is what a 40-column cache leaves after 36 prompt tokens.
 
+**Reproduced 2026-08-02 from the merged tree, on a capture taken that day.** The system
+block carries the DATE, so a stored `context` goes stale at midnight and the comparison has
+to re-capture both sides; this run did, and got the same answer:
+
+    device [4438, 649, 358, 1520]                    generated
+    FLM    [4438, 649, 358, 1520, 499, 3432, 30, 128009]
+    13163.3 + 3010.6 + 10.5 = 16184.4 us -> 61.8 tok/s   against the recorded 61.3
+
+61.8 against 61.3 is inside the 2.6% same-build spread, so this is a reproduction, not an
+improvement. **FLM serves on port 52625 here, not 11434** — `flm serve` picks a port and
+both this log and the first re-check attempt assumed Ollama's default and got nothing.
+`ss -ltnp | grep flm` is the reliable way to find it.
+
 **Context length is a knob against throughput.** KVSTRIDE is 5152 elements either way, so
 identical bytes move and the 5% is pure compute — more columns scored per head:
 
