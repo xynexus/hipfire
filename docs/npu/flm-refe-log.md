@@ -13357,3 +13357,71 @@ Either way the useful reading is directional, not decisive. The honest version o
 projection's remaining risk is unchanged: 65.0-65.4 tok/s holds if the halves fuse
 into one dispatch, and the fusion has been shown to fit the aggregate channel budget
 but not yet shown to place.
+
+# CURRENT STATE — supersedes both earlier CURRENT STATE sections
+
+Written 2026-08-01, after group C passed and every compute term was measured. The
+section above is stale in four load-bearing ways: it says group C is "not yet built",
+quotes 61.2 tok/s, calls P4's activation unresolved, and carries lm_head at 3700 us.
+
+## What the whole thing turned on
+
+FLM issues **~2.5 dispatches per TOKEN**; the design that existed issued **32**
+(16 layers x 2). That surplus times the 67.2 us floor accounts for the entire ~9%
+deficit to within 0.3%. The kernels were never the problem. Unchanged.
+
+## What works today, all on real weights
+
+    group A    8 cores   P1 qkv+RoPE      q' 9.5e-07, k' 1 ulp, v' 0.0     PASS
+    group B    8 cores   P2 attention     0.76 ULP at pos 30, 0.00 at pos 0 PASS
+    group A+B 16 cores   fused, q' core to core                            PASS
+    group C   16 cores   P3+P4+P5 in ONE dispatch, three phases, layer loop
+                         P3 9.5367e-07   P4 2.9297e-03   P5 0.0000e+00     PASS
+
+P5 is bit-exact. C's h->P4 and sw->P5 seams close inside the dispatch.
+
+## Measured throughput
+
+    A+B   slope 124.8 us/layer   (1/2/4 layers: 219.2 / 340.1 / 593.6)
+    C     slope 637.9 us/layer   (1/2 layers: 735.4 / 1373.3; 96% of ideal 612.1)
+    lm_head      2994.2 us       (163.7 MB at 54.7 GB/s, 97% of the roof)
+
+    token = 92.9 + 16 x (124.8 + 637.9) + 2994.2 = 15290.3 us -> 65.4 tok/s
+    FLM 61.18, +6.9%    -- IF the two halves fuse into one dispatch
+
+## The one thing this rests on
+
+Summing the halves is only valid in a single fused dispatch. Interleaved as separate
+dispatches it is 55.0 tok/s, a 10% LOSS. The fused topology fits the aggregate
+memtile budget — 40 of 48 inputs, 36 of 48 outputs, 5.00 in per tile balanced against
+a limit of 6 — but has never been placed. A full-operand skeleton build is running.
+
+## Hard limits, all measured
+
+    core tile               2 in / 2 out DMA channels
+    memtile                 ~6 in / ~6 out; joins and splits max 4-way
+    joined fifo             cannot be joined again
+    program memory          16 KB; 4 phase bodies overflow, 3 fit at ~78%
+    full-size build         exceeds 2400 s at 32 cores — background it
+    aie::exp2               linear interpolation, ~6% error, exact at integers
+    iron.jit cache          hashes the AST: comments and compile FLAGS do not bust
+                            it. Stamp varying values into fifo NAMES.
+
+## Enabling changes, all default-off with callers verified
+
+    flm_p1_emit       DIM_QGROUP            pack GQA q heads per object
+    flm_kv_emit       handles v' as well    two emitters, two output types
+    flm_attn_finish   NPAD_FROM_KV          npad from the KV trailer
+    flm_attn_decode   ATTN_MASK_PAD         mask padded lanes, do not subtract them;
+                      + finish              both kernels must get the same value
+    flm_gemv_residual P3_RESID_FROM_STASH   distinct name; the shared one collided
+    flm_h_emit        DIM_GROUP             group size no longer hard-coded
+    drain_plan        group=                same
+
+## Open
+
+  * fused 32-core placement — the only thing between here and the projection
+  * attention floor at pos 1-2 (2-3 ULP) — the padding fix did not reach it
+  * p1p2_chain short-context is worse than groups_ab by more than npad explains
+  * DIM_ACCN is a per-design constant: `2 * tiles * NROWS` for whoever runs P5.
+    Its default of 128 is wrong for every configuration used here.
