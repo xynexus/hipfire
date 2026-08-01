@@ -613,7 +613,7 @@ def main():
     # a wrong q' cannot produce the right attention output.
     import math
     kv_groups = (NV - NQ) // 2
-    aw, asc = 0.0, 0.0
+    aw, asc, worst_at = 0.0, 0.0, None
     for a in range(kv_groups):
         Kf = np.zeros((o.pos + 1, HEAD), np.float64)
         Vf = np.zeros((o.pos + 1, HEAD), np.float64)
@@ -626,12 +626,28 @@ def main():
         want = (e / e.sum(1, keepdims=True)) @ Vf
         got = (ao_ts[a // 4].numpy().astype(np.float64)
                .reshape(4, GQA, HEAD)[a % 4])
-        aw = max(aw, np.abs(got - want).max())
+        if a == 0 and __import__("os").environ.get("AB_DIAG"):
+            print(f"    DIAG g0 got  {got[0][:6].round(5)}")
+            print(f"    DIAG g0 want {want[0][:6].round(5)}")
+            r = got[0] / np.where(np.abs(want[0]) > 1e-9, want[0], np.nan)
+            print(f"    DIAG ratio   {np.nanmedian(r):.5f}  "
+                  f"(1.0 = right, other = a scale fault)")
+        d = np.abs(got - want)
+        if __import__("os").environ.get("AB_DIAG"):
+            print(f"    DIAG group {a}: max err {d.max():.4e}  "
+                  f"max|want| {np.abs(want).max():.4f}")
+        if d.max() > aw:
+            aw = d.max()
+            worst_at = (a, *np.unravel_index(int(d.argmax()), d.shape))
         asc = max(asc, np.abs(want).max())
     ulp = 2.0**-8
     atol = 2.0 * ulp * max(asc, 1e-9)
     print(f"  attn: {kv_groups} KV groups        max err {aw:.4e}   "
           f"max|ref| {asc:.5f}   tol {atol:.4e}")
+    if worst_at and aw > atol:
+        _a, _h, _d = worst_at
+        print(f"        worst at KV group {_a}, head {_h}, dim {_d}"
+              f"  ({'core ' + str(_a)} -> ao_ts[{_a // 4}] slot {_a % 4})")
     ok &= aw <= atol
 
     print(f"  q' : {NQ} heads                CHECKED VIA ATTENTION (core to "

@@ -12377,3 +12377,35 @@ Running total on this seam: four faults found and fixed (two cache buffers,
 unpadded slots, missing per-core fill offset, unwritten npad), each of which
 produced a wrong number rather than a failure, and at least one more outstanding.
 k' and v' have passed throughout — every fault has been on the path into B.
+
+### The remaining A+B fault is per-group: group 0 exact, 1-7 wrong by ~12%
+
+Bisecting the 6.25e-02 rather than guessing at it:
+
+    group 0: max err 0.0000e+00   max|want| 0.2637     EXACT
+    group 1: max err 6.2500e-02   max|want| 0.5195
+    group 2: max err 2.2461e-02   max|want| 0.1875
+    group 3: max err 3.3203e-02   max|want| 0.2598
+    group 4: max err 3.5156e-02   max|want| 0.3027
+    group 5: max err 1.9531e-02   max|want| 0.1631
+    group 6: max err 3.3203e-02   max|want| 0.2139
+    group 7: max err 2.2461e-02   max|want| 0.1885
+
+Every group but the first is off by roughly 12% of its own magnitude, and the
+first is bit-exact. That rules out several things at once:
+
+  * **Not arithmetic.** An exp2 or bf16 effect would touch group 0 too.
+  * **Not the cache contents.** k' and v' pass for all eight heads.
+  * **Not the output join.** Group 0 lands in slot 0 correctly, and the slot map
+    is the same expression for every group.
+
+At `pos=0` there is one real position, so the expected output is just v' for every
+group — the softmax weight is 1. Group 0 gets exactly that; the others do not.
+Something distinguishes core 0 from cores 1-7 on the path into attention, and
+whatever it is survives correct k'/v' in the cache.
+
+The obvious candidate is the per-core KV fill offset — core i reads `i * OPERAND`,
+which is right only if the cache strides heads by exactly OPERAND bytes. It does
+by construction (`KVSTRIDE = OPERAND // 2` bf16), but "by construction" is what
+the last four faults also looked like. Next step is to check what core 1 actually
+receives, rather than reason about what it should.
