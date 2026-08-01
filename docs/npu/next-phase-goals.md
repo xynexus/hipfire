@@ -52,6 +52,53 @@ Sanity-check the projections before building on them: they assume the same 54.7
 GB/s and the same dispatch structure, and a format with a different tile shape may
 not hit the same ceiling.
 
+## Context depth changes which lever matters (measured 2026-08-02)
+
+The `flm-benchmarks.md` sweep stops at 3135 tokens — **2.4% of a 131072 window** — so
+its "~13% decay" describes the shallow end of a much steeper curve. Swept properly
+against the running server:
+
+    ctx tokens   decode tok/s   prefill tok/s   TTFT
+         1010        58.36          1258         0.8 s
+         2035        55.74          1842         1.1 s
+         4110        50.22          1592         2.6 s
+         8210        43.37          1598         5.1 s
+        16435        33.89          1331        12.4 s
+        32885        23.21           942        34.9 s
+        65785        14.51           587       112.0 s
+        98685        10.56           426       231.8 s
+
+**FLM loses 82% of its decode rate between 1K and 96K.** The advertised window works
+to the top — 122880 was accepted; 131072 refuses with "Max length reached" only
+because prompt plus generation must fit inside it, which is the window being full
+rather than a lower runtime cap.
+
+This is the same bandwidth story, one level up. KV traffic per token is
+16 layers x 8 KV heads x 64 dim x 2 (K,V) x 2 B = **32 KB per position**, so at
+context L a token moves 775.7 MB of weights PLUS L x 32 KB of cache:
+
+    ctx      KV bytes   +weights   bandwidth model   measured   ratio
+      1010      33 MB     809 MB      67.6 tok/s       58.4     0.86
+      8210     269 MB    1045 MB      52.4             43.4     0.83
+     32885    1078 MB    1854 MB      29.5             23.2     0.79
+     98685    3234 MB    4010 MB      13.6             10.6     0.78
+
+The ratio is roughly CONSTANT at ~0.8. FLM is bandwidth-bound at ~80% efficiency
+across the whole range, and the decay is inherent to KV growth — not an attention
+kernel with headroom left in it. Do not go looking for that headroom; it is not there.
+
+**So the lever inverts with depth.** At 98K, KV is 3234 MB against 776 MB of weights
+— the cache is 80% of the traffic and the weight format is nearly irrelevant. The
+`oq4++` port wins ~18% at short context and progressively less as context grows;
+past ~16K the dominant lever is **KV cache quantization**, which is a different piece
+of work and is not currently scoped anywhere.
+
+**And our design cannot reach any of this.** The KV tile is a fixed 40 columns. We do
+not decay, because we cannot go deep enough to decay. Any claim of beating FLM
+"across the context range" requires the cache to stop being a tile and become a
+streamed structure — a much larger change than a quant-format port. Until then the
+honest claim is bounded: 63.4 vs 61.18 at short context.
+
 ## What is established and should not be re-derived
 
 Hard limits, all measured on this hardware:
