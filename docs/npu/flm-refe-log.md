@@ -12280,3 +12280,36 @@ That is not a workaround, it is the shape group C consumes anyway — the topolo
 skeleton already validated B emitting through two 4-way joins broadcast to all
 sixteen C cores. Using it here means the A+B test exercises the real structure
 instead of a standalone one that would have to be undone.
+
+### The A-side output split has a type conflict, and it is not cosmetic
+
+`groups_ab` now builds and runs, with q' flowing A[j] -> B[j] core to core. v'
+lands exactly. **k' is wrong (2.3594e+00)**, and the cause is structural:
+
+A needs two output destinations — q' to a core, k'/v' to the host cache — so two
+fifos. But `flm_p1_emit` is declared **once**, with one output type, and it serves
+both. Making both fifos `q_ty` (GQA * OBJ = 512) to satisfy that means the kv
+objects are 512 while the k'/v' drains consume 128, so the stream misaligns after
+the first head. v' survives only because it precedes k' in the slot order.
+
+The options, none free:
+
+  1. **Drain whole objects.** A drain consumes linearly, so the descriptors would
+     have to take all 512. For v' that is harmless — the tail is zeros and lands
+     on future cache rows, which is what attention wants there. For k' it is not:
+     the drain writes *strided into K's columns*, so 512 elements would clobber
+     four columns instead of one, including previous tokens'.
+  2. **Zero the unused slots** in the kernel so the tail is well-defined. Needed
+     for (1) to be safe, but does not fix the column clobbering.
+  3. **A scratch host buffer** for k'/v', gathered into the cache on the host.
+     Correct and simple, but it puts a host copy in a path the architecture exists
+     to keep on-device.
+  4. **A second emit kernel** — `flm_kv_emit` exists and handles k', but not v',
+     and two `ExternalFunction`s naming one C symbol with different signatures is
+     an ODR conflict rather than a solution.
+
+Recording before choosing, because the first option looks cheapest and is the one
+that silently corrupts a neighbouring column. The v'-passes/k'-fails split is
+itself the tell: it is an ordering artefact, not evidence that half the path works.
+
+`group_a.py` remains the working per-core P1; nothing that passes depends on this.

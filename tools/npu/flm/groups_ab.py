@@ -236,26 +236,30 @@ def build(pos, ncores=NCORES, seq=32):
 
     flags = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_HEAD={HEAD}",
              f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS={NQ}", f"-DDIM_QKHEADS={NK}"]
-    # weights per PAIR, q' and KV drains per CORE
+    # weights per PAIR; k'/v' out per CORE; the cache back IN per core as B's
+    # operand; attention out as two joined streams. No q' — core to core.
     params = ", ".join(f"w{i}: In" for i in range(npairs))
-    params += ", " + ", ".join(f"q{i}: Out" for i in range(ncores))
     params += ", " + ", ".join(f"kv{i}: Out" for i in range(ncores))
+    params += ", " + ", ".join(f"kvin{i}: In" for i in range(ncores))
+    params += ", " + ", ".join(f"ao{i}: Out" for i in range(2))
     src = f'''
 def _design(bc: In, {params}):
     kq = ExternalFunction("flm_gemv_qkv", source_file=QKV_SRC,
                           arg_types=[bc_ty, wt_ty], compile_flags=FLAGS)
     ke = ExternalFunction("flm_p1_emit", source_file=EMIT_SRC,
-                          arg_types=[wt_ty, o_ty], compile_flags=FLAGS)
+                          arg_types=[wt_ty, q_ty], compile_flags=FLAGS)
     kn = ExternalFunction("flm_norm_prepare", source_file=NORM_SRC,
                           arg_types=[bc_ty], compile_flags=FLAGS)
 
     # ---- group B: attention ------------------------------------------------
+    # q_ty, not o_ty: B's q object holds all GQA heads, which is the whole point
+    # of DIM_QGROUP — attention acquires it once and reads q[h*QSTRIDE + d].
     kab = ExternalFunction("flm_attn_begin", source_file=BEG_SRC,
-                           arg_types=[o_ty], compile_flags=FLAGS)
+                           arg_types=[q_ty], compile_flags=FLAGS)
     kat = ExternalFunction("flm_attn_tile", source_file=ATT_SRC,
-                           arg_types=[o_ty, kvop_ty], compile_flags=FLAGS)
+                           arg_types=[q_ty, kvop_ty], compile_flags=FLAGS)
     kaf = ExternalFunction("flm_attn_finish", source_file=FIN_SRC,
-                           arg_types=[ao_ty, o_ty], compile_flags=FLAGS)
+                           arg_types=[ao_ty, q_ty], compile_flags=FLAGS)
 
     f_bc = ObjectFifo(bc_ty, depth=1, name="bc")
     bc_cons = [f_bc.cons() for _ in range({ncores})]
@@ -268,7 +272,11 @@ def _design(bc: In, {params}):
     # all GQA heads); k'/v' -> the host cache. Two fifos is exactly a core's two
     # output DMA channels, with none spare.
     f_q = [ObjectFifo(q_ty, name=f"aq{{i}}") for i in range({ncores})]
-    f_kv = [ObjectFifo(o_ty, name=f"akv{{i}}") for i in range({ncores})]
+    # q_ty for BOTH: one ExternalFunction declares flm_p1_emit's output type, so
+    # the two fifos must agree on it. A kv head writes at slot 0 and the drain
+    # reads from offset 0, so the extra room costs 8 KB across the array and
+    # nothing else.
+    f_kv = [ObjectFifo(q_ty, name=f"akv{{i}}") for i in range({ncores})]
     # ---- group B's streams -------------------------------------------------
     f_kvin = [ObjectFifo(kvop_ty, name=f"bkv{{i}}") for i in range({ncores})]
     # Attention leaves through two 4-way joins, not eight drains: eight would put
@@ -431,6 +439,7 @@ def _design(bc: In, {params}):
               Program=Program, Runtime=Runtime, TaskGroup=TaskGroup,
               Worker=Worker, AnyShimTile=AnyShimTile, range_=range_,
               ExternalFunction=ExternalFunction, QKV_SRC=QKV_SRC,
+              ATT_SRC=ATT_SRC, BEG_SRC=BEG_SRC, FIN_SRC=FIN_SRC,
               EMIT_SRC=EMIT_SRC, NORM_SRC=NORM_SRC, FLAGS=flags, bc_ty=bc_ty,
               wt_ty=wt_ty, o_ty=o_ty, wpair_ty=wpair_ty, opair_ty=opair_ty,
               w_all_ty=w_all_ty, kv_ty=kv_ty, kv_all_ty=kv_all_ty,
@@ -447,6 +456,8 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--pos", type=int, default=0, help="KV cache position")
+    p.add_argument("--seq", type=int, default=32,
+                   help="context length; sets how many KV objects B streams")
     p.add_argument("--p1-cores", type=int, default=NCORES,
                    help="how many cores run P1. Partition B uses 12: the four\n"
                         "attention cores sit P1 out, so its 48 head-tiles spread\n"
@@ -470,7 +481,7 @@ def main():
     cs_k = rnd(np.concatenate([np.cos(ang), np.sin(ang)]))
     cs_q = rnd(cs_k * (HEAD ** -0.5) * np.log2(np.e))
 
-    design, wt = build(o.pos, ncores)
+    design, wt = build(o.pos, ncores, o.seq)
 
     rng = np.random.default_rng(0)
     x = rnd(rng.standard_normal(K_DIM) * 0.05)
@@ -514,54 +525,34 @@ def main():
         w_ts.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
 
     bc_t = iron.tensor(bc.astype(bfloat16), dtype=bfloat16, device="npu")
-    import os as _os2
-    SINGLE = bool(_os2.environ.get("P1_SINGLE"))
-    # per pair: SINGLE drains the whole stream, otherwise just its q
-    # objects — and at 12 cores pairs 4-5 carry twice as many as 0-3.
-    qsz = [hpc * 2 * HEAD if SINGLE else qobj[c] * 2 * HEAD
-           for c in range(ncores)]
-    q_ts = [iron.zeros(qsz[c], dtype=bfloat16, device="npu")
-            for c in range(ncores)]
+    # No q' tensor: it goes A[j] -> B[j] core to core and never reaches the host.
     KVSTRIDE = KTILE + TSEQ * HEAD
+    OPERAND = max(2 * TSEQ * HEAD * 2 * KVPER, q4nx.tile_bytes(K_DIM, NROWS))
+    nobj = -(-o.seq // (TSEQ * KVPER))
+    # ONE buffer serving both directions: A drains k'/v' into it, B reads it back
+    # as OPERAND-sized objects. The two task groups in sequence() order that.
     cache = iron.zeros(8 * KVSTRIDE, dtype=bfloat16, device="npu")
-    kv_ts = [cache] * ncores          # every core drains into the same buffer
+    kv_ts = [cache] * ncores
+    cache_u8 = iron.zeros(nobj * OPERAND, dtype=np.uint8, device="npu")
+    kvin_ts = [cache_u8] * ncores
+    ao_ts = [iron.zeros(4 * GQA * HEAD, dtype=bfloat16, device="npu")
+             for _ in range(2)]
     if o.bench:
-        _b = run_iters(design, bc_t, *w_ts, *q_ts, *kv_ts, warmup=2, iters=10)
+        _b = run_iters(design, bc_t, *w_ts, *kv_ts, *kvin_ts, *ao_ts,
+                       warmup=2, iters=10)
         _us = _b.npu.min_us if _b.npu else _b.e2e.min_us
         _mb = npairs * 2 * hpc * TPH * q4nx.tile_bytes(K_DIM, NROWS) / 1e6
         print(f"  bench: {_mb:.2f} MB  {_mb*1e3/_us:.1f} GB/s  {_us:.1f} us "
               f"(marginal {_us - 92.9:.1f})")
     else:
-        design(bc_t, *w_ts, *q_ts, *kv_ts)
+        design(bc_t, *w_ts, *kv_ts, *kvin_ts, *ao_ts)
     cv = cache.numpy().astype(np.float64).reshape(8, KVSTRIDE)
 
     print(f"P1 routed to three destinations: {ncores} cores, layer {o.layer}, "
           f"pos {o.pos}")
     ok, worst, scale = True, 0.0, 0.0
-    if SINGLE:
-        # the pair stream is [step][core][OBJ]; head h of core j at step t
-        print("  BISECT: one plain drain of the whole pair stream")
-        for pr in range(1):
-            v = q_ts[pr].numpy().astype(np.float64).reshape(hpc, 2, 2 * HEAD)
-            for t in range(hpc):
-                for j in range(2):
-                    h = layout[2 * pr + j][t]
-                    e = np.abs(v[t, j, :HEAD] - ref[h]).max()
-                    print(f"    step {t} core {j}: head {h} err {e:.4e}")
-        return 0
-    # q': the pair stream is [slot][core], so a pair's q heads are its cores'
-    # q slots interleaved. Read from the layout rather than restated, or the
-    # check silently follows a different assignment than the device.
-    # Per CORE now, not per pair: a core's buffer holds its own q heads in slot
-    # order, with no interleave to undo. p1_route's version alternated between
-    # the pair's two cores; here the stream is one core's.
-    for c in range(ncores):
-        got = (q_ts[c].numpy().astype(np.float64)
-               .reshape(qobj[c], 2 * HEAD)[:, :HEAD])
-        want = [layout[c][sl] for sl in range(qobj[c])]
-        for slot, h in enumerate(want):
-            e = np.abs(got[slot] - ref[h]).max()
-            worst = max(worst, e); scale = max(scale, np.abs(ref[h]).mean())
+    # q' is no longer checkable here — it goes core to core. What it produced is
+    # checked one step downstream, in attention's output.
     # Gate each group against ITS OWN scale. The device emits bf16 and the
     # reference rounds to it, so ~one ulp is the floor rather than a defect —
     # and k' heads are larger than q' heads, so a tolerance derived from q

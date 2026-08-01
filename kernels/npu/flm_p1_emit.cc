@@ -66,9 +66,12 @@ flm_p1_emit(const uint8 *restrict wtile, bfloat16 *restrict out) {
     flm_kv_pair(g_stage, tile_flags(wtile), out);
     return;
   }
-  // Which slot of the result object this head occupies. At QGROUP == 1 this is
-  // always 0 and the object holds one head, as before.
-  const int slot = QGROUP == 1 ? 0 : (head % QGROUP);
+  // Which slot of the result object this head occupies. Only Q heads pack into
+  // a group: they share one object so attention can acquire it once and read
+  // q[h * QSTRIDE + d] across all GQA. A v' head gets its own object at offset
+  // 0 — grouping it would put it at head % QGROUP, which varies with the head
+  // index and is not where the cache drain looks.
+  const int slot = (QGROUP == 1 || head >= DIM_QHEADS) ? 0 : (head % QGROUP);
   bfloat16 *restrict dst = out + slot * 2 * HEAD;
 
   // q' and v': the head in the first half of its slot, ZEROS in the second.
