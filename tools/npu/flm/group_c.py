@@ -963,6 +963,16 @@ def main():
             for j in range(2):
                 r0 = p5rows(pr, j)[ti]
                 got5[r0:r0 + NROWS] = v[ti, j]
+    if __import__("os").environ.get("C_DIAG"):
+        raw = o5_ts[0].numpy().astype(np.float64)
+        print(f"    DIAG o5[0] nonzero: {int((raw != 0).sum())}/{raw.size}")
+        for ch in range(NCHUNK):
+            blk = raw.reshape(NCHUNK, -1)[ch]
+            print(f"    DIAG chunk {ch}: nonzero {int((blk != 0).sum())}/{blk.size}"
+                  f"  max|.| {np.abs(blk).max():.5f}")
+        sg, sr = np.sort(got5), np.sort(x5_ref)
+        print(f"    DIAG sorted match (permutation?): "
+              f"{np.abs(sg - sr).max():.4e}")
     e5 = np.abs(got5 - x5_ref).max()
     print(f"  P5 x_out  : max err {e5:.4e}  mean|ref| {np.abs(x5_ref).mean():.5f}"
           f"  max|ref| {np.abs(x5_ref).max():.5f}")

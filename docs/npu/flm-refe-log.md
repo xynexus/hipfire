@@ -12871,3 +12871,28 @@ Prime suspect is the result indexing: `o5_ts` is read as
 `(NCHUNK, p5tiles, 2, NROWS)` and the accumulating chunks still acquire result
 objects, so the live data is in the last chunk — an ordering that took two attempts
 to get right in `p5_pass` originally ([tile][core] versus [core][tile]).
+
+### P5 in group C: the output alternates with period 2
+
+    chunk 0: max|.| 0.07227
+    chunk 1: max|.| 0.11084
+    chunk 2: max|.| 0.07227     <- same as chunk 0
+    chunk 3: max|.| 0.11084     <- same as chunk 1
+
+Not zeros — every element is written — and not a permutation either (sorting both
+sides still leaves 1.34e-01). The data is *wrong*, and wrong with a period of two.
+
+Period two is the signature of **double buffering**. An ObjectFifo of depth 2
+alternates between two backing buffers, so a producer that only refreshes one of
+them yields exactly this: chunk 0 and chunk 2 read the same buffer, 1 and 3 the
+other. The same mechanism produced the "even tiles correct to 1e-7, odd tiles wrong
+by ~1.0" alignment fault recorded in `flm_gemv_residual`'s header.
+
+So the suspect is not the result indexing after all — it is the broadcast fill.
+Four fills of `bc5b` at four offsets go into a depth-1 or depth-2 fifo, and if the
+core acquires four times while the fifo holds fewer distinct objects than that, the
+later chunks re-read earlier buffers.
+
+Also noted: `group_c` still prints `p1p2_chain`'s attention DIAG lines, which show
+zeros because group C has no attention. Harmless but misleading — the attention
+check belongs to the other group and should come out.
