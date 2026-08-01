@@ -822,8 +822,11 @@ def main():
     p5tiles = K_DIM // (NCORES * NROWS)
     p5rows = lambda pr, j: [pr * rpp3 + t * 2 * NROWS + j * NROWS
                             for t in range(p5tiles)]
-    dd5, dm5, dc5 = load_linear(
-        c, f"model.layers.{o.layer}.mlp.down_proj.weight", K_DIM, D_FF)
+    # down_proj per layer, packed back to back like o_proj and gate/up; the fill
+    # picks one by offset. The reference follows the LAST layer, as P4's does.
+    d_pl = [load_linear(c, f"model.layers.{o.layer + _l}.mlp.down_proj.weight",
+                        K_DIM, D_FF) for _l in range(NLAY)]
+    dd5, dm5, dc5 = d_pl[NLAY - 1]
     nbc5 = D_FF // 32
     swv = sw_ref.astype(np.float32)
     BCN1_ = 2 * K_DIM + 2 * HEAD
@@ -835,20 +838,25 @@ def main():
     bc5_t = iron.tensor(bc5.astype(bfloat16), dtype=bfloat16, device="npu")
     w5, x5_ref = [], np.zeros(K_DIM, np.float64)
     for pr in range(npairs):
-        per = []
-        for j in range(2):
-            blob = []
-            for ch in range(NCHUNK):
-                lo, hi = ch * (nbc5 // NCHUNK), (ch + 1) * (nbc5 // NCHUNK)
-                for r0 in p5rows(pr, j):
-                    sl = slice(r0, r0 + NROWS)
-                    blob.append(q4nx.pack_tile(
-                        dd5[sl, lo:hi], dm5[sl, lo:hi], dc5[sl, lo:hi],
-                        row_base=r0, flags=float(ch == NCHUNK - 1)))
-            per.append(np.concatenate(blob))
-        b = np.empty((NCHUNK * p5tiles, 2, wt), np.uint8)
-        b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
-        w5.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
+        per_layer = []
+        for _lw in range(NLAY):
+            _dd, _dm, _dc = d_pl[_lw]
+            per = []
+            for j in range(2):
+                blob = []
+                for ch in range(NCHUNK):
+                    lo, hi = ch * (nbc5 // NCHUNK), (ch + 1) * (nbc5 // NCHUNK)
+                    for r0 in p5rows(pr, j):
+                        sl = slice(r0, r0 + NROWS)
+                        blob.append(q4nx.pack_tile(
+                            _dd[sl, lo:hi], _dm[sl, lo:hi], _dc[sl, lo:hi],
+                            row_base=r0, flags=float(ch == NCHUNK - 1)))
+                per.append(np.concatenate(blob))
+            b = np.empty((NCHUNK * p5tiles, 2, wt), np.uint8)
+            b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
+            per_layer.append(b.reshape(-1))
+        w5.append(iron.tensor(np.concatenate(per_layer), dtype=np.uint8,
+                              device="npu"))
     o5_ts = [iron.zeros(NCHUNK * 2 * p5tiles * OBJ, dtype=bfloat16,
                         device="npu") for _ in range(npairs)]
 
@@ -882,9 +890,19 @@ def main():
     # ---- reference: attention over the cache INCLUDING P1's appended token --
     if o.bench and _us is not None:
         FIXED_US = 92.9
-        p1_b = p1pairs * 2 * hpc * TPH * q4nx.tile_bytes(K_DIM, NROWS)
-        kv_b = apairs * 2 * OPERAND * nobj
-        mb = (p1_b + kv_b) / 1e6
+        # Count the phases THIS design runs. The inherited version counted P1's
+        # weights and the KV cache -- tensors group C never touches -- and so
+        # reported 4.00 MB against 34 MB actually streamed, turning a healthy
+        # 54 GB/s into an alarming 3.0.
+        _only = os.environ.get("C_ONLY", "")
+        _d3, _d4 = _only not in ("5", "45"), _only != "5"
+        b = 0
+        if _d3:
+            b += npairs * 2 * p3tiles * wt
+        if _d4:
+            b += npairs * 2 * 2 * p4tiles * wt
+        b += npairs * 2 * NCHUNK * p5tiles * wt
+        mb = NLAY * b / 1e6
         print(f"  bench: {mb:.2f} MB  {mb*1e3/_us:.1f} GB/s  {_us:.1f} us "
               f"(marginal {_us - FIXED_US:.1f}, 16-core ideal {mb*17.85:.1f})")
     # dense now: each core emits its whole 128-row slice in one object

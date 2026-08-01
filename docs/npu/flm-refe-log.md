@@ -13018,3 +13018,26 @@ far. I read it as "upstream of the per-core work — the broadcast or the weight
 stream." It was neither: it was a per-core constant that happened to be wrong
 identically on every core. Uniformity implicates anything shared, including shared
 compile-time configuration, not only shared data paths.
+
+### Group C's throughput: 96% of the 16-core issue-bound ideal on the marginal layer
+
+    NLAY=1   34.29 MB   46.6 GB/s    735.4 us   (ideal 612.1)
+    NLAY=2   68.58 MB   49.9 GB/s   1373.3 us   (ideal 1224.2)
+
+The marginal layer costs 637.9 us against an issue-bound ideal of 612.1 — **96% of
+the ideal**. The layer loop is doing what it was built to do, and P5 stays exact at
+the second layer, so the loop is correct as well as fast.
+
+Extrapolated, sixteen layers of the projection phases cost
+735.4 + 15 x 637.9 = 10.3 ms.
+
+The bench's own accounting had to be fixed first, and it was badly wrong in a way
+that inverted the conclusion. It counted P1's weights and the KV cache — tensors
+group C never touches — because it was inherited wholesale from `p1p2_chain`. So it
+reported 4.00 MB against the 34.29 MB actually streamed, and turned a healthy
+46.6 GB/s into an alarming 3.0 GB/s. I had already started reasoning about why the
+design might be bandwidth-starved before checking what the number was measuring.
+
+The lesson is narrower than "check your instruments": a metric copied from a design
+with a different tensor set will keep reporting confidently, in the right units, at
+a plausible magnitude. Nothing about 3.0 GB/s looked like a broken measurement.
