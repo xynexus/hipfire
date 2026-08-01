@@ -13358,11 +13358,11 @@ projection's remaining risk is unchanged: 65.0-65.4 tok/s holds if the halves fu
 into one dispatch, and the fusion has been shown to fit the aggregate channel budget
 but not yet shown to place.
 
-# CURRENT STATE — supersedes both earlier CURRENT STATE sections
+# CURRENT STATE — supersedes all earlier CURRENT STATE sections
 
-Written 2026-08-01, after group C passed and every compute term was measured. The
-section above is stale in four load-bearing ways: it says group C is "not yet built",
-quotes 61.2 tok/s, calls P4's activation unresolved, and carries lm_head at 3700 us.
+Rewritten 2026-08-01 after the first external validation. Everything above this line
+that claims the pipeline computes Llama-3.2-1B predates that check and is wrong; the
+throughput figures are unaffected and stand.
 
 ## What the whole thing turned on
 
@@ -13370,250 +13370,69 @@ FLM issues **~2.5 dispatches per TOKEN**; the design that existed issued **32**
 (16 layers x 2). That surplus times the 67.2 us floor accounts for the entire ~9%
 deficit to within 0.3%. The kernels were never the problem. Unchanged.
 
-## What works today, all on real weights
+## Correctness, by what each part is checked AGAINST
 
-    group A    8 cores   P1 qkv+RoPE      q' 9.5e-07, k' 1 ulp, v' 0.0     PASS
-    group B    8 cores   P2 attention     0.76 ULP at pos 30, 0.00 at pos 0 PASS
-    group A+B 16 cores   fused, q' core to core                            PASS
-    group C   16 cores   P3+P4+P5 in ONE dispatch, three phases, layer loop
-                         P3 9.5367e-07   P4 2.9297e-03   P5 0.0000e+00     PASS
+An external oracle means an independent fp32 forward from `consolidated.00.pth`, or the
+checkpoint's own weights — code that shares nothing with this tree.
 
-**ALL SIXTEEN LAYERS CHAINED**, each consuming the previous layer's device output
-(`chain_layers.sh 16`, exit 0): P5 exact at 13 of 16 layers and within two ulp at the
-rest, P4 between 0.65% and 2.50% of peak with no trend across depth, k'/v' passing
-everywhere, attention 0.61-2.20 ULP with layers 11-12 above the advisory envelope.
-No drift — activations grow through the stack while relative error does not, and the
-deepest layer has the lowest P4 error of any.
+    weights          EXTERNAL   corr 0.997 vs checkpoint, 4-bit error only
+    RMSNorm + GEMV   EXTERNAL   pos-0 forward reproduces the oracle end to end
+    FFN residual     EXTERNAL   same run
+    RoPE frequency   EXTERNAL   rope_freqs vs the llama3 schedule in config.json
+    RoPE rotation    EXTERNAL   6.40% vs a 6.36% floor at position 7
+    attention math   EXTERNAL   4 real positions, 3.18% of peak
+    online softmax   internal   device vs reference 0.5-2.2 ULP over 31 entries,
+                                and that reference is now externally validated
+    KV across tokens NOT RUN    the cache has never been carried by the device
+                                from one token to the next
 
-The full-token compute path is therefore correct end to end, in 32 dispatches. All
-four seams close: q' core to core inside A+B, attention out A+B -> C, h and sw inside
-C's dispatch, x_out C -> A for the next layer.
+**The end-to-end result**: sixteen device layers from the BOS embedding at position 0
+produce token **16309**, matching the oracle. Device x16 vs validated host: cosine
+0.999659.
 
-## Measured throughput
+## Measured throughput — unaffected by any correctness fix
 
-    A+B   slope 124.8 us/layer   (1/2/4 layers: 219.2 / 340.1 / 593.6)
-    C     slope 637.9 us/layer   (1/2 layers: 735.4 / 1373.3; 96% of ideal 612.1)
-    lm_head      2994.2 us       (163.7 MB at 54.7 GB/s, 97% of the roof)
+    A+B   slope 124.8 us/layer     C  slope 637.9 us/layer  (96% of the 612.1 ideal)
+    lm_head      2994.2 us         (163.7 MB at 54.7 GB/s)
 
     token = 92.9 + 16 x (124.8 + 637.9) + 2994.2 = 15290.3 us -> 65.4 tok/s
-    FLM 61.18, +6.9%    -- IF the two halves fuse into one dispatch
+    FLM 61.18, +6.9%   -- IF the two halves fuse into ONE dispatch
 
-## The one thing this rests on
+Interleaved as separate dispatches it is 55.0 tok/s, a 10% LOSS. The fused topology
+places and routes at full operand size (32 cores, 0 DMA errors), per-core program
+memory fits (A+B 57%, C 90% of 16 KB, and fusing adds code to no core), and the C->A
+seam needs no new core code if it crosses host memory. **Nothing is built.**
 
-Summing the halves is only valid in a single fused dispatch. Interleaved as separate
-dispatches it is 55.0 tok/s, a 10% LOSS. The fused topology fits the aggregate
-memtile budget — 40 of 48 inputs, 36 of 48 outputs, 5.00 in per tile balanced against
-a limit of 6 — but has never been placed. A full-operand skeleton build is running.
+## The five faults found today, and what they have in common
+
+    1. weights read in container row order        corr 0.001 vs the checkpoint
+    2. P5's residual on x, not h                  every layer discarded its attention
+    3. group C's phases fed host references       never composed
+    4. group C invented its own layer input       chain residual random per layer
+    5. RoPE half-split on Meta-order rows         151% of peak wrong at any pos > 0
+
+Every one passed every check, because each check compared a stage's output against a
+reference computed from the same wrong input. Fault 5 was found only because the pos-0
+success was treated as insufficient — internally everything agreed at pos 30.
 
 ## Hard limits, all measured
 
     core tile               2 in / 2 out DMA channels
     memtile                 ~6 in / ~6 out; joins and splits max 4-way
     joined fifo             cannot be joined again
-    program memory          16 KB; 4 phase bodies overflow, 3 fit at ~78%
-    full-size build         exceeds 2400 s at 32 cores — background it
+    program memory          16 KB; 4 phase bodies overflow, 3 fit at ~78-90%
+    full-size build         ~57 min at 32 cores, dominated by group A's cores
     aie::exp2               linear interpolation, ~6% error, exact at integers
-    iron.jit cache          hashes the AST: comments and compile FLAGS do not bust
-                            it. Stamp varying values into fifo NAMES.
-
-## Enabling changes, all default-off with callers verified
-
-    flm_p1_emit       DIM_QGROUP            pack GQA q heads per object
-    flm_kv_emit       handles v' as well    two emitters, two output types
-    flm_attn_finish   NPAD_FROM_KV          npad from the KV trailer
-    flm_attn_decode   ATTN_MASK_PAD         mask padded lanes, do not subtract them;
-                      + finish              both kernels must get the same value
-    flm_gemv_residual P3_RESID_FROM_STASH   distinct name; the shared one collided
-    flm_h_emit        DIM_GROUP             group size no longer hard-coded
-    drain_plan        group=                same
+    iron.jit cache          hashes the AST: comments and compile FLAGS do not bust it.
+                            Stamp varying values into fifo NAMES.
 
 ## Open
 
-  * **the fused single dispatch** — the only thing between here and the projection.
-    Topology places and routes at full operand size; per-core program memory fits
-    (A+B 57%, C 90% of 16 KB, and fusing adds code to no core); the C->A seam needs
-    no new core code if it goes through host memory. None of that has been built.
-  * attention floor: 2-3 ULP at pos 1-2, and 2.16-2.20 ULP at layers 11-12 of the
-    chain. The padding fix reached neither. Advisory in both harnesses now, because a
-    bound known to be fitted cannot also be the gate — that miswiring stopped the
-    16-layer chain twice.
-  * p1p2_chain short-context is worse than groups_ab by more than npad explains
-  * DIM_ACCN is now mandatory (`#error` without it), so this trap is closed
-
-### DIM_ACCN is now mandatory
-
-`flm_gemv_down` defaulted `DIM_ACCN` to 128. Both callers in this tree need 256
-(`2 * tiles * NROWS`), so the default was wrong for every configuration that exists —
-and group C shipped exactly that bug, for a whole session, *because omitting the flag
-compiled and ran*. It produced a plausible wrong answer on every core identically,
-which reads as a data-routing fault and sent the investigation after the broadcast
-and the weight stream.
-
-The default is removed; omitting the flag is now `#error`. Verified in isolation —
-the guard fires when the macro is absent and is silent when present — and `group_c`
-still passes unchanged (P3 9.5367e-07, P4 2.9297e-03, P5 0.0000e+00).
-
-Both existing callers already pass the flag, so this is inert for them by
-construction: with the macro defined the preprocessor output is byte-identical. The
-only behaviour that changes is a future caller's, which now fails to build instead of
-silently halving its accumulator.
-
-The general shape is worth keeping: a compile-time constant whose wrong value still
-computes *something* is more dangerous than one that crashes. Defaults belong on
-parameters where every value is valid, not on ones where the correct value is a
-property of the caller's tiling.
-
-### The 32-core topology PLACES at full operand size
-
-The background build has not finished, but it has already answered the question. Its
-cache directory now holds per-core object directories named by *physical* coordinate:
-
-    core objects assigned: 32
-      col 0..7: 4 cores each
-    memtile / DMA errors: 0
-
-Thirty-two cores, four per column across all eight columns, at the real 10304 B
-operand. Per-core code generation only begins after placement, routing and DMA
-assignment have all passed — and "no MemTile has sufficient DMA capacity", the error
-that killed the earlier 32-core attempt, is raised in exactly that earlier stage. So
-the structure that the whole 65.4 tok/s projection depends on is placeable.
-
-What this does *not* establish, unchanged from the note written when the build was
-launched:
-
-  * It is the skeleton's optimistic topology — B->C and C->A core to core, C emitting
-    through one join, roughly 16 memtile inputs. The union of the designs that
-    actually exist carries 40. Fitting the budget was shown by counting; placing the
-    *union* has still not been demonstrated.
-  * Trivial kernels, so program memory is untested. Four phase bodies overflowed 16 KB
-    on a real build; that limit is why the work was split into role groups at all.
-
-So: the shape places. Whether the shape with real kernel bodies in it places, and
-whether the seams as built rather than as designed place, are still open. The
-remaining llc work is core codegen and will not change the placement result.
-
-### Build cost at full operand is dominated by group A's eight cores
-
-Partway through the 32-core skeleton build, with 24 of 32 ELFs linked, the eight
-still compiling were all in columns 0 and 1 — group A — and they had been in `llc`
-for 32 minutes while the other 24 finished. The optimised IR explains it:
-
-    group A cores (cols 0-1)   584K   7779 lines
-    group C cores              148K   1983 lines
-    others                     236K   3280 lines
-
-Group A carries 2.4x to 3.9x the IR of any other role, because it is the core with
-the most streams: broadcast in, weights in, and q' plus k'/v' out on separate fifos.
-At the real 10304 B operand the skeleton's copy loops over those scale with it.
-
-Practical consequence for iterating here: a full-operand 32-core build is not a
-uniform cost that can be trimmed by making the design smaller in general — it is
-dominated by one role. Changing group C and rebuilding is comparatively cheap;
-touching group A is what costs half an hour.
-
-### The 32-core build FAILED: program memory overflows even with trivial kernels
-
-After 57 minutes it reached stage 30 of 37 and stopped:
-
-    (29/37) perDeviceMatching
-    (30/37) [0/1] cdo_{0}
-    [AIE ERROR] _XAie_LoadProgMemSection():231: Overflow of program memory
-    XAie_LoadElf failed with XAIE_INVALID_ELF
-    aiecc: edge 'cdo_{0}' (key 'main') failed
-    exit=1
-
-Everything up to CDO generation passed: placement, routing, DMA assignment, per-core
-code generation, and all 32 ELF links. The design then failed to *load*, because at
-least one core's program exceeds the 16 KB program memory.
-
-**This corrects the entry two above.** That entry said the topology "PLACES at full
-operand size" and called the structure the projection depends on "placeable". Both
-statements are still literally true — placement did pass, and the failure is in a
-later stage. But I wrote them as though they settled the question, and they did not.
-I even wrote "the remaining llc work is core codegen and will not change the placement
-result", which is true and beside the point: codegen does not change placement, it
-changes whether the thing loads, and that is what failed.
-
-The sharper miss is in the caveat itself. I listed "trivial kernels, so program memory
-is untested" as a weakness of the test — implying a real design might overflow where
-this one would not. The opposite is the case: the skeleton overflows *with* trivial
-kernels. Its per-core bodies are copy loops sized by `--elems`, and at the real
-2576-int32 operand those unroll into 7779 lines of IR on group A's cores against
-1983-3280 elsewhere. A caveat framed as "this test is too easy" turned out to describe
-a test that is, in this one respect, harder than the real thing.
-
-So the load-bearing question is open again, and narrower than before: the fused
-32-core *topology* is placeable and routable at full operand size, and the obstacle is
-per-core program memory, not DMA channels or memtiles.
-
-What this does not say: that the real design overflows. A real GEMV kernel reads its
-10 KB operand with a compact vectorized loop, not an unrolled copy, and group C
-already runs three real phase bodies at ~78% of program memory on 16 cores. The next
-test should use the real kernels rather than a skeleton, since the skeleton is now
-known to misrepresent the binding constraint in both directions.
-
-(The task notification reported "exit code 0" — that is the shell wrapper's status.
-The build itself exited 1.)
-
-### The skeleton's overflow was its own artifact — the real bodies fit, but C is at 90%
-
-Program memory is **per core**, and each core's ELF holds only its own role's code —
-visible in both builds, where cores within a role have byte-identical `.text` and
-cores in different roles do not. So fusing A+B with C does not add code to any core;
-it only puts more distinct programs in one design.
-
-Measured from the real designs' cached per-core ELFs:
-
-    A+B  cores    .text  9440 bytes    57% of 16 KB
-    C    cores    .text 14784 bytes    90% of 16 KB   (max across 16 cores)
-
-Both fit, and the fused design's per-core usage is the max of the two *per role*, not
-their sum: 57% on A+B's sixteen cores and 90% on C's sixteen. The skeleton's overflow
-came from its own copy loops unrolling at `--elems 2576`, exactly as the IR line
-counts suggested, and says nothing about the real design.
-
-That retires the alarm raised by the failed build. It does not retire the constraint,
-which is now located precisely: **group C sits at 90% of program memory with 1600
-bytes spare.** The fused design needs the C->A residual seam that group C does not
-currently carry, and 1600 bytes is not much room to add a phase body's worth of
-anything. Three bodies already fit where four overflowed; the seam has to be cheap.
-
-Two corrections this leaves standing, both mine: the failed build did not show the
-fused design cannot load, and the entry before it did not show that it can. What is
-actually known is narrower than either claim — the topology places and routes at full
-operand size, and every real core body measured fits, with C close to the edge.
-
-### The C->A seam needs no program memory at all, if it goes through host memory
-
-The 1600-byte worry from the previous entry assumed the fused design needs new code on
-group C's cores for the C->A residual. It does not, if the seam takes the route both
-halves already implement:
-
-  * `group_c` already drains x_out to a host buffer through its result fifo.
-  * `groups_ab` already fills its activation broadcast from a host buffer.
-  * A drain and a refill separated by a TaskGroup barrier, inside one dispatch, costs
-    no dispatch — `p1p2_chain` demonstrated write-then-read through host memory within
-    a single dispatch, and `group_c` relies on it for all three of its own phases.
-
-So layer L's C output reaches layer L+1's A input with **zero additional core code**.
-Group C stays at 90% of program memory, and the constraint that looked binding is not
-engaged at all.
-
-What this gives up is the core-to-core C->A that `layer_roles` designed. That would be
-faster — no shim traffic — but it needs an emit body on C's cores, which is what 1600
-bytes has to cover, and an output DMA channel on cores that have two. The host-staged
-route trades a small amount of bandwidth for not spending either.
-
-Scope, stated plainly because the last two entries both over-reached: this is an
-inference from what the two builds already contain, not a built result. Nothing has
-been fused and run. The claim is only that the *program memory* obstacle is avoidable
-by construction, not that the fused design works.
-
-One number in the older projection should be treated with suspicion rather than
-carried: it lists "5.6 staging" among terms it calls "every term measured", and no
-measurement of it appears anywhere in this log. At 5.6 us against a 15.3 ms token it
-changes nothing either way — but that is exactly the profile of lm_head's 3700, which
-also looked harmless and was wrong by 700 us.
+  * **the fused single dispatch** — the only throughput item, and the result turns on it
+  * a KV cache carried by the device across successive tokens
+  * group C's internal seams: P4 reads host h, P5 host sw
+  * attention floor 2-3 ULP at pos 1-2, advisory in both harnesses
+  * `p1p2_chain` short-context is worse than `groups_ab` by more than npad explains
 
 ### Full re-verification after this session's kernel changes
 
