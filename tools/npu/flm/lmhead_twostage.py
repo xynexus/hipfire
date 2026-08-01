@@ -24,9 +24,14 @@ block of the vocabulary, and within it tile t core j is global tile
 concatenating the eight pair outputs in order gives the 128256 logits in row
 order with no gather.
 
-    python3 lmhead_twostage.py --check          # device vs host coarse, one probe
-    python3 lmhead_twostage.py --bench --iters 8
-    python3 lmhead_twostage.py --gate           # two-pass argmax on every probe
+    python3 lmhead_twostage.py                        # device vs host coarse, one probe
+    python3 lmhead_twostage.py --vs-exact --rounds 5  # timing, INTERLEAVED against exact
+    python3 lmhead_twostage.py --gate                 # two-pass argmax on every probe
+
+`--check` and `--bench` were documented here and never existed in the parser; the
+default run is the one-probe check and `--vs-exact` is the timing path. Timing is
+interleaved by construction because a sequential A-then-B on this machine measured
+chunk=16 as a win TWICE and it was a loss both times.
 
 Needs the NPU and the coarse tier from `lmhead_coarse.py --build`.
 """

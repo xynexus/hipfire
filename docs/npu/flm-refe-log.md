@@ -13437,6 +13437,36 @@ across sessions, so quote the range rather than the best row.
     recall@4 = 48/48 on real hidden states; K=32 taken for margin; two-pass argmax ==
     exact argmax on 48/48. Worst coarse rank of the true argmax: 3.
 
+**2026-08-02 — that recall claim is a HOST-model claim, and the DEVICE path does not
+reproduce it.** `lmhead_twostage.py --gate` re-measured today:
+
+    host coarse   (lc.coarse_logits)  outside top-64  0/48   max rank 3, median 1
+    device coarse (again(x))          outside top-64 36/48   max rank 999
+
+The host row reproduces the recorded numbers EXACTLY — 48/48, worst rank 3 — so the coarse
+Q4 tier and the 4-bit direction encoding are sound and every recall figure above stands as
+written. What fails is the re-dispatch: `again(x)` builds a fresh `iron.tensor` per call and
+the device does not see the new activation. One miss returns 16309, which is PROBE 0's own
+argmax — the signature of a stale activation rather than a wrong computation.
+
+The gate's own comment says the device path was chosen deliberately ("the shortlist the
+device actually produced is the thing under test and modelling it would be a weaker claim").
+That is the right instinct and it is what surfaced this — but it means the recorded evidence
+was the host model, and the device substitute put in its place has never worked past the
+first probe. Reproduced with `--gate` alone, so the `--vs-exact` second design is not
+involved.
+
+**What this does and does not cost.** The TIMING is untouched: 2426.7 us coarse against
+2980.7 exact is a bytes ratio, measured on dispatches whose activation never changes, and
+it still composes to 64.7-64.8 tok/s. What is now unevidenced is that the DEVICE's coarse
+shortlist contains the right token — the only device evidence is probe 0, where the first
+dispatch matched the host model to 1.7e-7. A faster head that returns the wrong token is
+not a speedup, so the 64.8 tok/s figure should be read as "the timing of a path whose
+device-side recall is verified at one probe" until `again()` is fixed.
+
+`fused_pyxrt.py --recheck` exists for exactly this failure mode (perturb x, dispatch, the
+output must MOVE and then return bit for bit). It was never pointed at this driver.
+
 The 241.5 us host term is numpy per-op OVERHEAD, not work — 78 us to top-32 a 128256 array
 that the same numpy argmaxes in 4.9, and 110 us to rescore 41 KB. It eats 40% of the device
 saving. With a host implementation that costs what the work costs, the same device time is
