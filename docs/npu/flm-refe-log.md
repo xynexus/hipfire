@@ -13583,8 +13583,16 @@ identical bytes move and the 5% is pure compute — more columns scored per head
 Both rows carry the **exact** lm_head tier so they are comparable to each other and to the
 63.1 above, not to the 64.8 two-pass row; the two-pass saving is orthogonal and stacks.
 
-Which one is the default is a product call, not a correctness one, and is still open: 40
-buys the FLM comparison and 40 columns of context but spends nearly the whole margin.
+**SETTLED: TSEQ=40 is the default and the 5% is not a trade worth taking here.** This is a
+REFERENCE kernel — its job is to reproduce FLM's tokens and establish what the hardware
+does, and TSEQ=40 is what makes the like-for-like comparison possible at all. Spending 5%
+of a reference kernel's throughput to be able to check the answer is the right way round.
+
+Where the 5% actually matters is the real opus/kvarn/2pass kernel, not this one. Carry the
+MEASUREMENT forward, not the default: KVSTRIDE is unchanged at 5152 either way, so the cost
+is purely the extra columns scored per head, and it is the per-column compute slope — not
+any byte movement — that a production KV layout has to answer for. Do not re-litigate the
+knob here; re-measure it there.
 
 **`aie::load_v` on a misaligned pointer does not fault — it reads the wrong bytes.** At
 TSEQ=40, K's row stride is 80 bytes, so 3 loads in 4 land misaligned. **pos 0 stayed

@@ -32,17 +32,37 @@ python3 -c "import pyxrt" 2>/dev/null ||
     { echo "no importable pyxrt via $XRT_DIR/python -- set XRT_DIR" >&2; exit 2; }
 
 fails=0
-run() {
+# run_n takes the tail depth: the gate's verdict lines (48/48, outside top-64) sit
+# ABOVE its timing block, so at 6 the sweep showed the gate running and none of
+# what it decided.
+run_n() {
+    local n=$1; shift
     echo; echo "===== $* ====="
-    python3 -u "$@" 2>&1 | tail -6
+    python3 -u "$@" 2>&1 | tail -"$n"
     [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "  ^^ FAILED (exit ${PIPESTATUS[0]})"; fails=$((fails + 1)); }
 }
+run() { run_n 6 "$@"; }
 run group_a.py
 run groups_ab.py --pos 0
 run groups_ab.py --pos 30
 run group_c.py --seq 31
 run p5_pass.py
 run p1p2_chain.py --seq 31
+# The gate is the ONLY device-side recall evidence for the two-pass head, and the
+# bug it caught (PyxrtDesign dispatching stale buffers when the arguments change)
+# was silent everywhere else: correct timing, correct-looking logits, wrong token.
+# Skipped rather than failed when the coarse tier has not been built, because a
+# missing artifact is not a regression.
+# Path comes from the module, not a second copy of it here -- lmhead_coarse.CACHE
+# is /tmp/lmhead2p, so the tier does not survive a reboot and the skip is a normal
+# state, not a broken checkout.
+tier=$(python3 -c "import lmhead_coarse as lc; print(lc.CACHE / 'lmhead_coarse.npz')" 2>/dev/null || true)
+if [ -n "${tier:-}" ] && [ -f "$tier" ]; then
+    run_n 12 lmhead_twostage.py --gate
+else
+    echo; echo "===== lmhead_twostage.py --gate ====="
+    echo "  SKIP: no coarse tier at ${tier:-<unresolved>} -- lmhead_coarse.py --build"
+fi
 
 echo
 # "no design failed", NOT "all designs PASS" -- p1p2_chain.py returns 0 with an
