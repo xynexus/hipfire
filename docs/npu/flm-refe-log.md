@@ -15759,3 +15759,38 @@ once, generalised, and then wrong for a long time. If the cause is elision, the 
 the one already recorded (do not let an array that must survive be a bare local operand) and
 torch is not implicated at all. The `import aie.iron` then `import torch` segfault is
 separate and stands on its own.
+
+### Structural: any file importing the flm helpers cannot also import torch
+
+`qkv_verify.py` does `import aie.iron` at module scope, and most tooling here imports
+`qkv_verify` for constants like `K_DIM` and `HEAD`. So a script that touches the flm python
+helpers at all pulls iron into the process, and `import torch` after that segfaults in this
+venv.
+
+That is why every torch-based oracle in this project has had to be standalone, restating the
+handful of constants it needs and importing only `q4nx` (numpy/json/struct, clean). It is a
+property of the tree, not a quirk of one script, and it is worth knowing before writing the
+next cross-check: the moment a convenience import of `qkv_verify` sneaks in, the file can no
+longer hold a torch reference beside it.
+
+### The elision bug found a second time, by the person who had just documented it
+
+The agent that discovered the numpy elision hazard hit it again in its own new code an hour
+after writing the warning:
+
+    err = np.abs(logits - ref).max()     # ate `logits`
+    np.argmax(logits)                    # argmax of the wrong array
+
+It reported "device coarse argmax 45" against a host argmax of 16309 while also reporting
+that the two arrays agreed to 1.4e-6 — two numbers on adjacent lines that cannot both be
+true. No result moved, because the gate did not use that path.
+
+Two things generalise. **The failure announces itself as an internal contradiction rather
+than a plausible wrong number** — both instances so far produced output that was
+self-inconsistent, which is a far better detector than judging magnitudes. And **knowing
+about it is not sufficient protection**: the person best informed about the bug in the whole
+project made the mistake within the hour. The fix that works is a guard — an assert on the
+comparison so it cannot pass silently — not vigilance.
+
+This also strengthens the reading of the two unreproducible "T>1" faults as elision wearing
+a different face: same shape, a named array consumed as a binary operand and then read again.
