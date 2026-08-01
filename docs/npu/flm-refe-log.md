@@ -11453,3 +11453,40 @@ one stream.
 
 Reverted; 16 cores untouched and passing. The `AnyMemTile` / `Tile(col, 1)` import
 and usage pattern is now known-good and can be reused.
+
+### The fix direction is expressible with the existing API
+
+`ObjectFifoHandle.split` takes an **arbitrary-length** offsets list and its own
+tile argument:
+
+    split(offsets: list[int], tile: Tile = AnyMemTile, depths=None,
+          obj_types=None, names=None, ...) -> list[ObjectFifo]
+    "Split the data ... by sending it to producers in N newly constructed
+     ObjectFifos."
+
+Two consequences:
+
+  * **N-way splits are supported**, not just the 2-way pair split used today. One
+    fifo can serve 4 or 8 cores.
+  * `split` already accepts `tile=`, defaulting to `AnyMemTile`. The
+    `.cons(tile=...)` route I tested works but is unnecessary — the tile belongs
+    on the split itself.
+
+Link count as a function of split width:
+
+     cores  way   weight links  p1 links  total(+p2)
+       16    2         8          8         18      <- today
+       16    4         4          4          9
+       16    8         2          2          5
+       32    2        16         16         36      <- fails, 8 memtiles
+       32    4         8          8         18
+       32    8         4          4          9
+
+So **32 cores at 4-way lands exactly where 16 cores at 2-way sits today** (18
+links), and 8-way halves it again. The memtile wall is not a wall — it is a
+consequence of splitting two ways.
+
+What it costs: the host packs weights per pair today, so a 4- or 8-way split
+changes the packing layout and every drain descriptor that assumes pairs. That is
+real work, but it is bookkeeping against a known-good API rather than a search for
+a mechanism.
