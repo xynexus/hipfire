@@ -11924,3 +11924,33 @@ most likely to move this number.
 61.1 against FLM's 61.18 is close enough that either could come out ahead. What
 makes it worth building anyway is that it is the only structure measured so far
 that computes a correct token at all.
+
+### The last unmeasured term: a 4 KB handoff costs 3.3 us
+
+    payload   1 handoff   3 handoffs   per-handoff
+    256 B        85.9        84.9        -0.50   (noise; floor-dominated)
+    4 KB         92.3        98.9        +3.30
+
+Both computed correctly. So the handoff **does** scale with payload — 0.9 us at
+256 B, 3.3 us at 4 KB — which is what I said it would and is worth having measured
+rather than assumed. But the magnitude is small:
+
+    3 handoffs/layer x 3.3 us  =   9.9 us per layer
+                               =   0.16 ms per token
+    projection  16.38 ms -> 16.54 ms  ->  **60.5 tok/s** (was 61.1)
+
+Against FLM's 61.18 that is now marginally behind rather than level. The honest
+reading: **the architecture and FLM are within measurement noise of each other**,
+and which one is faster will not be settled by projection.
+
+That closes the derisking. Every term in the estimate is now measured:
+
+    P1 at 8 cores          136.9 us compute      (vs 92.9 at 12)
+    3 handoffs/layer         9.9 us
+    memtile channels           16 of ~48         (does not bind)
+    bodies per core              3 max           (4 overflowed)
+    dispatches per token         1               (vs 32 interleaved)
+
+Nothing left to learn without building it. The remaining risk is integration —
+five phases across three groups with four streams between them — not any
+individual quantity.
