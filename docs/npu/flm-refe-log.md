@@ -13568,3 +13568,35 @@ Two corrections this leaves standing, both mine: the failed build did not show t
 fused design cannot load, and the entry before it did not show that it can. What is
 actually known is narrower than either claim — the topology places and routes at full
 operand size, and every real core body measured fits, with C close to the edge.
+
+### The C->A seam needs no program memory at all, if it goes through host memory
+
+The 1600-byte worry from the previous entry assumed the fused design needs new code on
+group C's cores for the C->A residual. It does not, if the seam takes the route both
+halves already implement:
+
+  * `group_c` already drains x_out to a host buffer through its result fifo.
+  * `groups_ab` already fills its activation broadcast from a host buffer.
+  * A drain and a refill separated by a TaskGroup barrier, inside one dispatch, costs
+    no dispatch — `p1p2_chain` demonstrated write-then-read through host memory within
+    a single dispatch, and `group_c` relies on it for all three of its own phases.
+
+So layer L's C output reaches layer L+1's A input with **zero additional core code**.
+Group C stays at 90% of program memory, and the constraint that looked binding is not
+engaged at all.
+
+What this gives up is the core-to-core C->A that `layer_roles` designed. That would be
+faster — no shim traffic — but it needs an emit body on C's cores, which is what 1600
+bytes has to cover, and an output DMA channel on cores that have two. The host-staged
+route trades a small amount of bandwidth for not spending either.
+
+Scope, stated plainly because the last two entries both over-reached: this is an
+inference from what the two builds already contain, not a built result. Nothing has
+been fused and run. The claim is only that the *program memory* obstacle is avoidable
+by construction, not that the fused design works.
+
+One number in the older projection should be treated with suspicion rather than
+carried: it lists "5.6 staging" among terms it calls "every term measured", and no
+measurement of it appears anywhere in this log. At 5.6 us against a 15.3 ms token it
+changes nothing either way — but that is exactly the profile of lm_head's 3700, which
+also looked harmless and was wrong by 700 us.
