@@ -14853,3 +14853,35 @@ rather than a wrong number.
 Not removed yet — `group_c` is the design every correctness result was measured on today,
 and touching its kernel set invalidates the cached builds behind those numbers. Worth
 doing deliberately, with the re-verification that implies, rather than as a drive-by.
+
+### Correction: removing the dead kernels saved 320 B, not 2656
+
+The declarations are gone from `group_c` and correctness is unchanged to the digit
+(P3 0.0, P4 2.9297e-03, P5 7.4506e-09, PASS). But the previous entry's headline number was
+wrong by a factor of eight:
+
+    predicted   2656 B freed, 90% -> 73%
+    measured     320 B freed, 14672 -> 14352, 90% -> 87%
+
+And across every cached `group_c` build, the attention symbols do not correlate with size
+at all:
+
+    with flm_attn syms:     14784, 15024, 14784, 14784, 15024, ...
+    without:                14352, 14416, 14784, 15024, 14352, ...
+
+Builds carrying the symbols and builds without them span the same range. So the linker
+was already discarding most of that code, and I read per-symbol sizes out of `nm` and
+treated their sum as removable `.text` without checking that the two quantities are the
+same thing. They are not: `nm` reports symbol extents, and what survives into `.text`
+after garbage collection is a different question, which one subtraction would have
+answered.
+
+What stands: the declarations were genuinely dead, removing them is correct, it frees 320
+bytes and it removes a real derived-harness wart. What does not: "18% of the core's
+program memory", and with it the claim that this materially loosens the fused design's
+tightest constraint. C sits at 87% rather than 90%, and the C->A seam still has to avoid
+new core code.
+
+This is the day's pattern once more, in the one place I had not yet hit it — I inferred a
+quantity from an artifact instead of measuring the quantity itself, and the artifact was
+adjacent to the answer rather than equal to it.

@@ -231,10 +231,13 @@ def _design({P}):
     # commented size does not bust it. Widening o5_ty alone silently reused the
     # old build -- the sixth time this trap has fired, and the first where the
     # usual comment-based fix was itself invisible.
-    kq = ExternalFunction("flm_gemv_qkv", source_file=QKV_SRC,
-                          arg_types=[bc_ty, op_ty], compile_flags=FLAGS)
-    ke = ExternalFunction("flm_p1_emit", source_file=EMIT_SRC,
-                          arg_types=[op_ty, p1o_ty], compile_flags=FLAGS)
+    # P1's kernels are NOT declared here. group_c is derived from p1p2_chain and
+    # inherited them, and an ExternalFunction declaration links its source even
+    # when no Worker ever calls it: flm_attn_begin/_tile/_finish cost 2656 B of
+    # a core's 16 KB — 18% — of attention these cores cannot execute. Removing
+    # them takes .text from 14672 to what the phases actually need. Same
+    # derived-harness problem as the inherited attention CHECK and the inherited
+    # bench accounting, in a third form.
     # HOSTNORM: the plain block-sum prologue, which does NOT write the
     # broadcast. Isolates flm_norm_prepare's in-place modification of a
     # broadcast object that the SAME fifo later reuses to deliver q'.
@@ -243,12 +246,6 @@ def _design({P}):
     # q' now arrives on the broadcast fifo, so its declared type is bc_ty.
     # The kernels take `const uint8*` and cast internally, so only the memref
     # shape has to agree with the fifo the object comes from.
-    kab = ExternalFunction("flm_attn_begin", source_file=BEG_SRC,
-                           arg_types=[bc_ty], compile_flags=FLAGS)
-    kat = ExternalFunction("flm_attn_tile", source_file=ATT_SRC,
-                           arg_types=[bc_ty, op_ty], compile_flags=FLAGS)
-    kaf = ExternalFunction("flm_attn_finish", source_file=FIN_SRC,
-                           arg_types=[p2o_ty, bc_ty], compile_flags=FLAGS)
     # P3 shares P1's result fifo: a fifo of its own would need 8 more shim
     # outputs against a budget of 10 in 16. Its object is therefore P1-sized
     # (2*HEAD bf16) and the kernel fills only the first NROWS of it.
