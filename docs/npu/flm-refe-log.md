@@ -12261,3 +12261,22 @@ The correction matters because "no changes needed" would have had me wiring
 `f_o[c]` straight into attention and getting a wrong answer from a stream whose
 shape happens to be acceptable. Checking the kernel's *addressing* was right;
 checking only the addressing was not enough.
+
+### A+B shim budget: join attention's output rather than draining eight streams
+
+Counting channels before wiring:
+
+    IN : broadcast 1 + P1 weights 4 + KV operand 8       = 13 of 16
+    OUT: k'/v' 8 + attention out 8                       = 16 of 16
+
+Exactly full — and "exactly full" is the state that failed in the memtile case,
+where 48 of 48 input channels placed only if nothing was imbalanced. Rather than
+find out whether the shim is more forgiving, attention's eight outputs join 4-way
+into two streams:
+
+    OUT: k'/v' 8 + attention out 2                       = 10 of 16
+
+That is not a workaround, it is the shape group C consumes anyway — the topology
+skeleton already validated B emitting through two 4-way joins broadcast to all
+sixteen C cores. Using it here means the A+B test exercises the real structure
+instead of a standalone one that would have to be undone.
