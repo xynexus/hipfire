@@ -14739,3 +14739,31 @@ processes were reparented to init and kept running with the parent gone — twel
 of 28 cores at full tilt on a build whose result had already been discarded. They had to
 be killed by explicit PID list (`ps -C llc` filtered on `ppid == 1`). Any long
 `aiecc` run stopped mid-flight leaves this behind.
+
+### Runtime drain offsets: the mechanism exists, but not through `iron.jit`
+
+Probing `offset_parameter` directly failed on the first call:
+
+    TypeError: '_design' takes at most 2 positional argument(s) (tensor: 2, scalar: 0)
+                but 3 were given
+
+The declaration is right — `program.py` explicitly supports "offset_parameter= passed
+directly to fill()/drain(), rather than declared up front via Worker fn_args" — but the
+VALUE does not travel as a design argument. Upstream's own test
+(`test/python/npu-xrt/scratchpad_addr_offset/`) sets it through the lower-level XRT path:
+
+    params = ParameterScratchpad(run, "params.txt")
+    params.write("input_offset", np.int32(offset))
+
+with `pyxrt.hw_context`, `pyxrt.ext.kernel` and explicit `run.set_arg`, rather than the
+`iron.jit(design)(a, b)` callable every design in this tree uses.
+
+So the earlier entry's conclusion stands but needs qualifying. Runtime offsets are real
+and upstream-tested — a position can patch a BD address without rebuilding — but adopting
+them means the fused design leaves `iron.jit`'s convenience wrapper for `ParameterScratchpad`
+plus manual buffer binding. That is a host-side restructuring of every harness here, not a
+one-line change to a drain call.
+
+This is worth knowing before the fused design is written rather than after, which is the
+whole reason for probing a mechanism instead of reading its signature and assuming. The
+signature said yes; the calling convention says yes with a cost attached.
