@@ -12896,3 +12896,30 @@ later chunks re-read earlier buffers.
 Also noted: `group_c` still prints `p1p2_chain`'s attention DIAG lines, which show
 zeros because group C has no attention. Harmless but misleading — the attention
 check belongs to the other group and should come out.
+
+### P5: four theories eliminated, and what that leaves
+
+Each was cheap to test against the drained buffer, and each is now dead:
+
+    residual added once per chunk       1x is best (2.39e-01); 2x/3x/4x worse
+    stash never accumulates             every single-chunk answer ~2.0e-01
+    result reshape is wrong             all six axis orders 2.1-2.4e-01
+    output is zero or a permutation     every element written; sorted diff 1.3e-01
+
+No layout reads the right answer out of that buffer, so the buffer does not
+contain the right answer in any arrangement. The data is wrong at the source.
+
+What that leaves is the one thing the three phases share: **`wc` and `op` are the
+same operand and result fifos for P3, P4 and P5.** Object counts have to balance
+exactly across the whole sequence — if P3 or P4 leaves either fifo off by a single
+object, P5 reads weights that belong to a different tile. That produces precisely
+what is observed: a plausible magnitude, no relation to the reference, and no
+reindexing that recovers it.
+
+It also explains the pattern of what passes. P3 is first and correct. P4 is second
+and correct. P5 is last and wrong — which is the order in which a drift would show
+up. The period-2 signature fits too: a two-core pair alternating on a fifo that has
+slipped relative to its producer.
+
+The test is to run P5 alone in this design with P3 and P4 bodies removed. If it is
+correct alone, the fault is drift from the phases before it, not P5's own wiring.

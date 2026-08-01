@@ -970,6 +970,49 @@ def main():
             blk = raw.reshape(NCHUNK, -1)[ch]
             print(f"    DIAG chunk {ch}: nonzero {int((blk != 0).sum())}/{blk.size}"
                   f"  max|.| {np.abs(blk).max():.5f}")
+        # Every hypothesis failing points at the common factor: the drain
+        # layout. Sweep the axis orders and see if any reads the answer.
+        import itertools as _it
+        dims = dict(c=NCHUNK, t=p5tiles, j=2, r=NROWS)
+        for order in _it.permutations("ctjr"):
+            if order[-1] != "r":
+                continue                 # NROWS is contiguous in every layout
+            shape = tuple(dims[k] for k in order)
+            ci = order.index("c")
+            cand = np.zeros(K_DIM, np.float64)
+            try:
+                for pr in range(npairs):
+                    v = o5_ts[pr].numpy().astype(np.float64).reshape(shape)
+                    v = np.moveaxis(v, (ci, order.index("t"), order.index("j")),
+                                    (0, 1, 2))[NCHUNK - 1]
+                    for ti in range(p5tiles):
+                        for j in range(2):
+                            r0 = p5rows(pr, j)[ti]
+                            cand[r0:r0 + NROWS] = v[ti, j]
+            except Exception as exc:
+                print(f"    DIAG layout {''.join(order)}: {exc}")
+                continue
+            print(f"    DIAG layout {''.join(order)}: err "
+                  f"{np.abs(cand - x5_ref).max():.4e}")
+        # If the stash never accumulates, each chunk stands alone and the
+        # drained value is the LAST chunk's contribution plus the residual.
+        for only in range(NCHUNK):
+            solo = np.zeros(K_DIM, np.float64)
+            for pr in range(npairs):
+                for j in range(2):
+                    for r0 in p5rows(pr, j):
+                        sl = slice(r0, r0 + NROWS)
+                        lo, hi = only * (nbc5 // NCHUNK), (only + 1) * (nbc5 // NCHUNK)
+                        solo[r0:r0 + NROWS] = q4nx.gemv_reference_bf16(
+                            rnd(swv[only * K_DIM:(only + 1) * K_DIM]),
+                            dd5[sl, lo:hi], dm5[sl, lo:hi], dc5[sl, lo:hi])
+            solo = rnd(solo + x[:K_DIM])
+            print(f"    DIAG only chunk {only} + resid: err "
+                  f"{np.abs(got5 - solo).max():.4e}")
+        for extra in (1, 2, 3, 4):
+            alt = x5_ref + (extra - 1) * x[:K_DIM]
+            print(f"    DIAG residual counted {extra}x: err "
+                  f"{np.abs(got5 - alt).max():.4e}")
         sg, sr = np.sort(got5), np.sort(x5_ref)
         print(f"    DIAG sorted match (permutation?): "
               f"{np.abs(sg - sr).max():.4e}")
