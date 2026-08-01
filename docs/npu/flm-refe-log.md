@@ -16376,3 +16376,43 @@ Recorded because "the FLM server is a deterministic token oracle with byte-exact
 tokenization" has been in this log for a long time as though the comparison were merely
 blocked on multi-token. It was also blocked on a templating detail that takes one curl to
 find and would otherwise have produced a spectacular false negative.
+
+### Correction: FLM's context is 36 tokens, and the comparison is out of reach at TSEQ=32
+
+The previous entry gave "Hi" as a reachable FLM target at pos 10, from an 11-token template.
+**That template was wrong** — it omitted the system block. Measured from FLM's own
+`/api/generate` `context` array, which is the token sequence it actually fed the model:
+
+    prompt "Hi"  ->  context 44 = 36 prompt + 8 generated
+    <|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n
+    Cutting Knowledge Date: December 2023\nToday Date: 02 Aug 2026\n\n
+    <|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>
+    <|start_header_id|>assistant<|end_header_id|>\n\n
+
+`usage.prompt_tokens` agrees independently: 36 for "Hi", 39 for "The quick brown fox",
+against the no-system template's 11 and 14. The 35-token overhead is fixed —
+`raw:true`, `template:""`, `system:""` and `num_predict` are all ignored by this server.
+
+So FLM's first generated token 4438 continues **36** tokens, not 11, and feeding our pipeline
+the 11-token version and expecting 4438 would have been the same fault the entry above warns
+about, one level up: two correct answers to different questions. I derived the template from
+the tokenizer config instead of asking FLM what it actually sent, when the `context` array
+settles it in one call.
+
+**The wall this exposes.** pos 36 needs a 37-position cache. The fused design's KV cache is
+TSEQ = 32 columns, and TSEQ is not a free constant: `flm_attn_decode.cc` carries
+`static_assert(TSEQ == 32, "score vectors are one 32-lane register")` — the entire online
+softmax lives in one vector. The alternative, KVPER=2, makes the KV object 16384 B against
+the fused design's single shared operand size of 10304 B, which is also group C's weight
+tile, breaking the uniformity that lets 32 cores share one fifo width at 46/46 memtile
+channels.
+
+**A like-for-like device-versus-FLM comparison is therefore out of reach at TSEQ=32, and out
+of reach by five positions.** That is the reason this project's headline bar has never been
+cleared, and it is a property of the attention kernel rather than a gap in the work. Clearing
+it costs either a two-register score path or a second operand size, each with its own
+verification.
+
+Also: FLM's system block contains **today's date**. Any recorded FLM token sequence must
+carry its capture date, or a later comparison will diverge for a reason that has nothing to
+do with the device.
