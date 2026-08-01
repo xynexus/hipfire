@@ -47,6 +47,7 @@ QKV_SRC = str(KDIR / "flm_gemv_qkv.cc")
 ATT_SRC = str(KDIR / "flm_attn_decode.cc")
 BEG_SRC = str(KDIR / "flm_attn_begin.cc")
 FIN_SRC = str(KDIR / "flm_attn_finish.cc")
+KVE_SRC = str(KDIR / "flm_kv_emit.cc")
 EMIT_SRC = str(KDIR / "flm_p1_emit.cc")
 NORM_SRC = str(KDIR / "flm_norm_prepare.cc")
 Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
@@ -248,6 +249,8 @@ def _design(bc: In, {params}):
                           arg_types=[bc_ty, wt_ty], compile_flags=FLAGS)
     ke = ExternalFunction("flm_p1_emit", source_file=EMIT_SRC,
                           arg_types=[wt_ty, q_ty], compile_flags=FLAGS)
+    kve = ExternalFunction("flm_kv_emit", source_file=KVE_SRC,
+                           arg_types=[wt_ty, o_ty], compile_flags=FLAGS)
     kn = ExternalFunction("flm_norm_prepare", source_file=NORM_SRC,
                           arg_types=[bc_ty], compile_flags=FLAGS)
 
@@ -272,11 +275,10 @@ def _design(bc: In, {params}):
     # all GQA heads); k'/v' -> the host cache. Two fifos is exactly a core's two
     # output DMA channels, with none spare.
     f_q = [ObjectFifo(q_ty, name=f"aq{{i}}") for i in range({ncores})]
-    # q_ty for BOTH: one ExternalFunction declares flm_p1_emit's output type, so
-    # the two fifos must agree on it. A kv head writes at slot 0 and the drain
-    # reads from offset 0, so the extra room costs 8 KB across the array and
-    # nothing else.
-    f_kv = [ObjectFifo(q_ty, name=f"akv{{i}}") for i in range({ncores})]
+    # o_ty: k'/v' take one object each, emitted by flm_kv_emit. Two kernels with
+    # two output types is what lets the fifos differ — one kernel serving both
+    # forced them equal and desynchronised the kv stream.
+    f_kv = [ObjectFifo(o_ty, name=f"akv{{i}}") for i in range({ncores})]
     # ---- group B's streams -------------------------------------------------
     f_kvin = [ObjectFifo(kvop_ty, name=f"bkv{{i}}") for i in range({ncores})]
     # Attention leaves through two 4-way joins, not eight drains: eight would put
@@ -285,7 +287,7 @@ def _design(bc: In, {params}):
     ao_sub = [f.prod().join([k * {GQA} * {HEAD} for k in range(4)],
                             obj_types=[ao_ty] * 4) for f in f_ao]
 
-    def core(bcc, wc, opq, opkv, kqkv, kemit, kprep):
+    def core(bcc, wc, opq, opkv, kqkv, kemit, kvemit, kprep):
         """P1 with its output SPLIT by destination.
 
         q' goes to B[j] core-to-core and k'/v' go to the host cache, and a fifo
@@ -330,7 +332,7 @@ def _design(bc: In, {params}):
             ew = wc.acquire(1)
             ekv = opkv.acquire(1)
             kqkv(eb, ew)
-            kemit(ew, ekv)
+            kvemit(ew, ekv)          # the kv emitter, o_ty output
             opkv.release(1)
             wc.release(1)
         bcc.release(1)
@@ -342,7 +344,7 @@ def _design(bc: In, {params}):
             # weights still arrive per PAIR (split two ways); results leave per CORE
             workers.append(Worker(core,
                 fn_args=[bc_cons[c], w_sub[p][j].cons(),
-                         f_q[c].prod(), f_kv[c].prod(), kq, ke, kn],
+                         f_q[c].prod(), f_kv[c].prod(), kq, ke, kve, kn],
                 stack_size=8192))
 
     def core_b(qc, kvc, op, kbegin, ktile, kfin):
@@ -440,6 +442,7 @@ def _design(bc: In, {params}):
               Worker=Worker, AnyShimTile=AnyShimTile, range_=range_,
               ExternalFunction=ExternalFunction, QKV_SRC=QKV_SRC,
               ATT_SRC=ATT_SRC, BEG_SRC=BEG_SRC, FIN_SRC=FIN_SRC,
+              KVE_SRC=KVE_SRC,
               EMIT_SRC=EMIT_SRC, NORM_SRC=NORM_SRC, FLAGS=flags, bc_ty=bc_ty,
               wt_ty=wt_ty, o_ty=o_ty, wpair_ty=wpair_ty, opair_ty=opair_ty,
               w_all_ty=w_all_ty, kv_ty=kv_ty, kv_all_ty=kv_all_ty,
@@ -447,7 +450,7 @@ def _design(bc: In, {params}):
               GQA=GQA, nobj=nobj,
               __name__="flm_p1_route")
     exec(src, ns)
-    return iron.jit(ns["_design"], source_files=[QKV_SRC, EMIT_SRC, NORM_SRC],
+    return iron.jit(ns["_design"], source_files=[QKV_SRC, EMIT_SRC, KVE_SRC, NORM_SRC],
                     full_elf=True), wt
 
 
@@ -562,7 +565,12 @@ def main():
         t = 1e-2 * sc
         print(f"  {name}  max err {err:.4e}   mean|ref| {sc:.5f}   tol {t:.4e}")
         return err <= t
-    ok &= gate(worst, range(NQ), "q' : 32 heads               ")
+    # q' has no host tensor: it goes A[j] -> B[j] core to core. `worst` is
+    # untouched by it, so gating on that here would print 0.0000e+00 and read as
+    # a pass for something never measured. It is checked one step downstream,
+    # once attention's output is compared — which is not wired yet.
+    print(f"  q' : {NQ} heads                NOT CHECKED (core to core; "
+          f"verified downstream once attention's output is)")
     if __import__("os").environ.get("P1_DIAG"):
         import sys as _s
         got = q_ts[0].numpy().astype(np.float64).reshape(4, 2 * HEAD)[:, :HEAD]

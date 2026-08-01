@@ -39,11 +39,41 @@
 #include "flm_q4_1_tile.h"
 #include "flm_kv_pair.h"
 
+#ifndef DIM_QHEADS
+#define DIM_QHEADS 32
+#endif
+#ifndef DIM_QKHEADS
+#define DIM_QKHEADS 40
+#endif
+
 extern bfloat16 g_stage[];      // the rotated head, from flm_gemv_qkv
 
-// Thin entry point. The write itself lives in flm_kv_pair.h because
+// Thin entry point. The k write itself lives in flm_kv_pair.h because
 // flm_qkv_emit's k branch is the other real call site.
+//
+// **Now handles v' as well as k'.** The role architecture splits A's output by
+// destination — q' to a core, k'/v' to the host cache — which needs two fifos,
+// and a fifo's object type is fixed by the kernel declared against it. q' packs
+// GQA heads into one object (DIM_QGROUP) while k'/v' take one each, so one
+// kernel cannot serve both: declaring flm_p1_emit twice with different output
+// types is an ODR conflict, and giving both fifos the larger type left the
+// kv drains consuming 128 of a 512-element object and desynchronising the
+// stream after the first head.
+//
+// So this becomes the complete kv emitter: k' in the column-pair form, v' as
+// the plain head-then-zeros that flm_p1_emit writes for it.
 extern "C" __attribute__((noinline)) void
 flm_kv_emit(const uint8 *restrict wtile, bfloat16 *restrict out) {
-  flm_kv_pair(g_stage, tile_flags(wtile), out);
+  const int head = tile_row_base(wtile) / DIM_HEAD;
+  if (head >= DIM_QHEADS && head < DIM_QKHEADS) {
+    flm_kv_pair(g_stage, tile_flags(wtile), out);
+    return;
+  }
+  // v': the head, then ZEROS. The zeros land on cache row pos+1, a future
+  // position, and zero is what attention's npad correction wants there.
+  constexpr int VL = 32;
+  for (int i = 0; i < DIM_HEAD; i += VL) {
+    aie::store_v(out + i, aie::load_v<VL>(g_stage + i));
+    aie::store_v(out + DIM_HEAD + i, aie::zeros<bfloat16, VL>());
+  }
 }
