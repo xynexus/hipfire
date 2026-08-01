@@ -215,15 +215,13 @@ def build(pos, ncores=NCORES, seq=32):
     opair_ty = np.ndarray[(2 * OBJ,), np.dtype[bfloat16]]
     w_all_ty = np.ndarray[(2 * hpc * TPH * wt,), np.dtype[np.uint8]]
     import os as _os
-    SINGLE = 1 if _os.environ.get("P1_SINGLE") else 0
+    # p1_route's P1_SINGLE bisect is gone: it drained the whole q stream to the
+    # host to isolate the 3-way split, and here q' has no host destination at all.
     # whole pair stream when bisecting: hpc steps x 2 cores x OBJ
     # ONE type per pair, not one for all: at 12 cores pairs 0-3 emit 4 q
     # objects and pairs 4-5 emit 8, because the KV-carrying cores spend two of
     # their four slots on k and v. A single q_ty can only describe a uniform
     # split and would silently size the later pairs wrong.
-    q_tys = [(np.ndarray[(hpc * OBJ,), np.dtype[bfloat16]] if SINGLE
-              else np.ndarray[(qobj[i] * OBJ,), np.dtype[bfloat16]])
-             for i in range(ncores)]
     # ONE cache buffer, 8 KV heads of [K tile][V tile] — the shape P2's operand
     # objects are cut from. K for KV head g comes from core g (pairs 0-3) and V
     # from core g+8 (pairs 4-7), so the two halves of a head are written by
@@ -377,43 +375,43 @@ def _design(bc: In, {params}):
         oh = [args[h0 + 1 + n + i] for i in range(nc)]
         kvinh = [args[h0 + 1 + n + nc + i] for i in range(nc)]
         aoh = [args[h0 + 1 + n + 2 * nc + i] for i in range(2)]
+        # ---- group A -------------------------------------------------------
+        # q' is absent from this task group by design: it leaves core to core,
+        # so the only drains here are k' and v' into the cache buffer.
         tg = TaskGroup()
         bch.fill(bcb, group=tg)
         for i in range(n):
             wh[i].fill(wb[i], group=tg)
         for i in range(nc):
-            if {SINGLE}:
-                # bisect: ONE plain drain of the whole pair stream, the shape
-                # qkv_verify.py uses. Isolates the 3-way split from everything
-                # else that differs here.
-                oh[i].drain(qb[i], wait=True, group=tg)
-                continue
-            # steps 0-1: 4 q objects, drained WHOLE. The source streams
-            # linearly and sizes/strides shape only the destination, so the
-            # unused half of each object cannot be skipped on the way out — the
-            # host reads the first HEAD of each OBJ instead.
-            oh[i].drain(qb[i], wait=True, group=tg,
-                        sizes=[1, 1, 1, QOBJ[i] * {OBJ}], strides=[0, 0, 0, 1])
             for _kind, _base in KVPLAN[i]:
                 if _kind == "k":
-                    # ONE k head per core at group=1 (p1_route's pair drained
-                    # two). The second dimension counted KV heads within the
-                    # group, so it collapses to 1 — leaving it at 2 drains a
-                    # neighbour's tile and the stream desynchronises.
+                    # ONE k head per core at group=1. The second dimension counts
+                    # KV heads within the group; leaving it at 2 drains a
+                    # neighbour's tile and HANGS rather than erring.
                     oh[i].drain(kvb[i], wait=True, group=tg,
                                 offset=_base * {KVSTRIDE} + {off},
                                 sizes=[1, 1, {HEAD}, 2],
                                 strides=[0, {KVSTRIDE}, {TSEQ}, 1])
                 else:
-                    # ONE v head per core at group=1, same collapse as k. A
-                    # whole object: OBJ per head, so row pos gets v' and row
-                    # pos+1 gets the emit's zeros — what a padded position must
-                    # hold, and the next token overwrites it.
+                    # ONE v head per core, whole object: row pos gets v' and row
+                    # pos+1 gets the emit's zeros, which is what a padded
+                    # position must hold until the next token overwrites it.
                     oh[i].drain(kvb[i], wait=True, group=tg,
                                 offset=_base * {KVSTRIDE} + {KTILE}
                                        + {pos} * {HEAD},
                                 sizes=[1, 1, 1, {OBJ}],
                                 strides=[0, {KVSTRIDE}, 0, 1])
+        tg.finish()
+
+        # ---- group B -------------------------------------------------------
+        # A separate task group, because B reads back the cache A just wrote.
+        # The barrier is the ordering: p1p2_chain proved this write-then-read
+        # through host memory within one dispatch.
+        tg = TaskGroup()
+        for i in range(nc):
+            kvinh[i].fill(kvinb[i], group=tg)
+        for i in range(2):
+            aoh[i].drain(aob[i], wait=True, group=tg)
         tg.finish()
 
     # q' never reaches the host — it goes core to core — so it has no tensor and
@@ -435,7 +433,9 @@ def _design(bc: In, {params}):
               ExternalFunction=ExternalFunction, QKV_SRC=QKV_SRC,
               EMIT_SRC=EMIT_SRC, NORM_SRC=NORM_SRC, FLAGS=flags, bc_ty=bc_ty,
               wt_ty=wt_ty, o_ty=o_ty, wpair_ty=wpair_ty, opair_ty=opair_ty,
-              w_all_ty=w_all_ty, q_tys=q_tys, kv_ty=kv_ty, SINGLE=SINGLE,
+              w_all_ty=w_all_ty, kv_ty=kv_ty, kv_all_ty=kv_all_ty,
+              kvop_ty=kvop_ty, q_ty=q_ty, ao_ty=ao_ty, aoj_ty=aoj_ty,
+              GQA=GQA, nobj=nobj,
               __name__="flm_p1_route")
     exec(src, ns)
     return iron.jit(ns["_design"], source_files=[QKV_SRC, EMIT_SRC, NORM_SRC],
