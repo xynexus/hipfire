@@ -39,9 +39,18 @@
 #ifndef DIM_QKHEADS
 #define DIM_QKHEADS 40          // + k heads: 512 / 64
 #endif
+#ifndef DIM_QGROUP
+#define DIM_QGROUP 1            // q heads per RESULT OBJECT
+#endif
 
 namespace {
 constexpr int HEAD = DIM_HEAD;
+// How many q heads share one result object. 1 is the paired design: one head per
+// object, written at offset 0. The role architecture needs GQA of them in ONE
+// object, because attention acquires its q once and holds it across the whole KV
+// loop, reading q[h * QSTRIDE + d] for h in 0..GQA-1 — four separate objects
+// would not be contiguous.
+constexpr int QGROUP = DIM_QGROUP;
 constexpr int VLANES = 32;
 static_assert(HEAD % VLANES == 0, "a head must be a whole number of vectors");
 } // namespace
@@ -57,7 +66,12 @@ flm_p1_emit(const uint8 *restrict wtile, bfloat16 *restrict out) {
     flm_kv_pair(g_stage, tile_flags(wtile), out);
     return;
   }
-  // q' and v': the head in the first half, ZEROS in the second.
+  // Which slot of the result object this head occupies. At QGROUP == 1 this is
+  // always 0 and the object holds one head, as before.
+  const int slot = QGROUP == 1 ? 0 : (head % QGROUP);
+  bfloat16 *restrict dst = out + slot * 2 * HEAD;
+
+  // q' and v': the head in the first half of its slot, ZEROS in the second.
   //
   // The zeros are not padding for its own sake. A drain consumes its source
   // LINEARLY — `sizes`/`strides` shape only the destination walk — so there is
@@ -66,7 +80,7 @@ flm_p1_emit(const uint8 *restrict wtile, bfloat16 *restrict out) {
   // zero is exactly what attention's `npad` correction wants there, and the
   // next token overwrites it. For q' the host simply ignores it.
   for (int i = 0; i < HEAD; i += VLANES) {
-    aie::store_v(out + i, aie::load_v<VLANES>(g_stage + i));
-    aie::store_v(out + HEAD + i, aie::zeros<bfloat16, VLANES>());
+    aie::store_v(dst + i, aie::load_v<VLANES>(g_stage + i));
+    aie::store_v(dst + HEAD + i, aie::zeros<bfloat16, VLANES>());
   }
 }
