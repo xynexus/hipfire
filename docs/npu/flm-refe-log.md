@@ -11810,3 +11810,30 @@ stylistic choice.
 stream between groups, emit from one. That is a different program, and the first
 thing it needs is a measurement of what a core-to-core handoff costs in time —
 which this probe does not answer.
+
+### And a core-to-core handoff costs about 1 us
+
+Timing the chain at increasing depth, all with zero memtiles and correct results:
+
+    stages   us    marginal/stage
+      2     85.9
+      4     84.9      -0.50
+      8     91.3      +1.60
+
+    2 -> 8 stages: +5.4 us for six extra handoffs = **0.90 us each**
+
+The whole chain is dispatch-floor dominated (67.2 us), which is why the numbers
+barely move. A handoff is under a microsecond against phase bodies that cost
+hundreds — so streaming between role groups is affordable, and the architecture
+is not trading memtile pressure for latency.
+
+**Caveat on the number:** this moves 64 int32 = 256 B per handoff. A real
+intermediate is `K_DIM` bf16 = 4 KB, sixteen times larger, and the cost will scale
+with volume rather than staying at 0.9 us. What the measurement establishes is
+that the *fixed* cost of a handoff — synchronisation, acquire/release, switchbox
+setup — is negligible. The data movement itself still has to be paid for, and at
+4 KB over a core-to-core stream that is bandwidth, not overhead.
+
+So both halves of the premise now hold: core-to-core costs no memtile channels
+(measured, zero) and no meaningful fixed latency (measured, ~0.9 us). The
+role-specialised architecture is viable on both counts that killed the quad plan.

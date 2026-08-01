@@ -36,57 +36,69 @@ from aie.iron.device import AnyShimTile  # noqa: E402
 N = 64
 
 
-def build():
+def build(stages):
+    """A chain of `stages` workers, each handing off to the next core to core.
+
+    Built through exec so `stages` lands in the design SOURCE — iron.jit keys its
+    cache on the function's text, and a closure over it silently reuses a stale
+    build (that trap has cost time four times in this session).
+    """
     ty = np.ndarray[(N,), np.dtype[np.int32]]
 
-    def _design(a: In, o: Out):
-        f_in = ObjectFifo(ty, depth=1, name="c2c_in")
-        f_mid = ObjectFifo(ty, depth=1, name="c2c_mid")     # the one under test
-        f_out = ObjectFifo(ty, depth=1, name="c2c_out")
+    src = f"""
+def _design(a: In, o: Out):
+    f_in = ObjectFifo(ty, depth=1, name="c2c_in{stages}")
+    mids = [ObjectFifo(ty, depth=1, name=f"c2c_mid{stages}_{{i}}")
+            for i in range({stages} - 1)]
+    f_out = ObjectFifo(ty, depth=1, name="c2c_out{stages}")
 
-        def stage_a(ic, oc):
-            e = ic.acquire(1)
-            r = oc.acquire(1)
-            for k in range(N):
-                r[k] = e[k] + 1
-            oc.release(1)
-            ic.release(1)
+    def stage(ic, oc):
+        e = ic.acquire(1)
+        r = oc.acquire(1)
+        for k in range({N}):
+            r[k] = e[k] + 1
+        oc.release(1)
+        ic.release(1)
 
-        def stage_b(ic, oc):
-            e = ic.acquire(1)
-            r = oc.acquire(1)
-            for k in range(N):
-                r[k] = e[k] * 2
-            oc.release(1)
-            ic.release(1)
+    ins = [f_in.cons()] + [m.cons() for m in mids]
+    outs = [m.prod() for m in mids] + [f_out.prod()]
+    workers = [Worker(stage, fn_args=[ins[i], outs[i]], stack_size=2048)
+               for i in range({stages})]
 
-        wa = Worker(stage_a, fn_args=[f_in.cons(), f_mid.prod()], stack_size=2048)
-        wb = Worker(stage_b, fn_args=[f_mid.cons(), f_out.prod()], stack_size=2048)
+    def seq(ab, ob, ah, oh):
+        tg = TaskGroup()
+        ah.fill(ab, group=tg)
+        oh.drain(ob, wait=True, group=tg)
+        tg.finish()
 
-        def seq(ab, ob, ah, oh):
-            tg = TaskGroup()
-            ah.fill(ab, group=tg)
-            oh.drain(ob, wait=True, group=tg)
-            tg.finish()
-
-        rt = Runtime(seq, [ty, ty, f_in.prod(tile=AnyShimTile),
-                           f_out.cons(tile=AnyShimTile)])
-        return Program(iron.get_current_device(), rt, workers=[wa, wb]).resolve_program()
-
-    return iron.jit(_design)
+    rt = Runtime(seq, [ty, ty, f_in.prod(tile=AnyShimTile),
+                       f_out.cons(tile=AnyShimTile)])
+    return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
+"""
+    ns = dict(np=np, iron=iron, In=In, Out=Out, ObjectFifo=ObjectFifo,
+              Program=Program, Runtime=Runtime, TaskGroup=TaskGroup,
+              Worker=Worker, AnyShimTile=AnyShimTile, ty=ty,
+              __name__=f"c2c{stages}")
+    exec(src, ns)
+    return iron.jit(ns["_design"])
 
 
 def main():
-    argparse.ArgumentParser(description=__doc__,
-                            formatter_class=argparse.RawDescriptionHelpFormatter).parse_args()
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--stages", type=int, default=2)
+    ap.add_argument("--bench", action="store_true",
+                    help="time it; the slope over --stages is the per-handoff cost")
+    o = ap.parse_args()
     src = np.arange(N, dtype=np.int32)
     a = iron.tensor(src, dtype=np.int32, device="npu")
     b = iron.zeros(N, dtype=np.int32, device="npu")
-    build()(a, b)
+    design = build(o.stages)
+    design(a, b)
 
-    got, want = b.numpy(), (src + 1) * 2
+    got, want = b.numpy(), src + o.stages
     ok = bool((got == want).all())
-    print(f"core -> core -> shim: {'computes correctly' if ok else 'WRONG RESULT'}")
+    print(f"{o.stages}-stage core-to-core chain: {'computes correctly' if ok else 'WRONG RESULT'}")
     if not ok:
         i = int(np.argmax(got != want))
         print(f"  first mismatch at {i}: got {got[i]} want {want[i]}")
@@ -95,7 +107,7 @@ def main():
     # The point of the probe: what did f_mid get placed on?
     cache = sorted(Path.home().glob(".npu/cache/*/aie.mlir"),
                    key=lambda p: p.stat().st_mtime, reverse=True)
-    mlir = next((p for p in cache if "c2c_mid" in p.read_text()), None)
+    mlir = next((p for p in cache if f"c2c_mid{o.stages}_" in p.read_text()), None)
     if mlir is None:
         print("  could not find this design's MLIR to inspect")
         return 2
@@ -109,6 +121,11 @@ def main():
         print("  -> f_mid DOES traverse a memtile; the core-to-core premise fails")
         return 1
     print("  -> f_mid is core-to-core with no memtile: the premise holds")
+    if o.bench:
+        from aie.utils.benchmark import run_iters
+        r = run_iters(design, a, b, warmup=2, iters=20)
+        us = r.npu.min_us if r.npu else r.e2e.min_us
+        print(f"  {o.stages} stages: {us:.1f} us")
     return 0
 
 
