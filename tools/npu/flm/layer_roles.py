@@ -61,7 +61,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from p1_route import NQ, NK, NV, HPC, hpc_for, head_layout  # noqa: E402
+import q4nx  # noqa: E402
+from p1_route import (NQ, NK, NV, HPC, hpc_for, head_layout,  # noqa: E402
+                      drain_plan, rnd)
 
 import aie.iron as iron  # noqa: E402
 from aie.iron import In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker  # noqa: E402
@@ -71,11 +73,35 @@ from aie.iron.device import AnyShimTile  # noqa: E402
 # half the array idle; role groups only pay if that half is used.
 NCORES = 32
 K_DIM, D_FF, NROWS, HEAD, GQA, TSEQ = 2048, 8192, 8, 64, 4, 32
+KVPER = 1
+# One operand size for every fifo, as in the working design: the KV tile and the
+# weight tile are different shapes but a core has only 2 input DMA channels, so
+# they share a stream and the object must hold whichever is larger.
+OPERAND = max(2 * TSEQ * HEAD * 2 * KVPER, q4nx.tile_bytes(K_DIM, NROWS))
+OBJ = 2 * HEAD                     # a head's result slot
+BC = 2 * K_DIM + 2 * HEAD          # broadcast block: activation, norm weight, RoPE
 
 # Group sizes. Forced by tiling, not chosen: see the module docstring.
 A_CORES = 8         # P1  qkv + RoPE
 B_CORES = 8         # P2  attention, one KV group each
 C_CORES = 16        # P3 + P4 + P5
+
+
+def sizes():
+    """-> the per-group shares, so a wrong constant fails here and not on device."""
+    g = groups()
+    return {
+        # group=1: A[j] streams straight to B[j], so each A core owns its fifo
+        # and there is no join to describe. drain_plan's default of 2 is for the
+        # paired design and would report half as many, twice as large.
+        "A": dict(cores=A_CORES, head_tiles=NV // A_CORES,
+                  q_objs=drain_plan(A_CORES, group=1)[0]),
+        "B": dict(cores=B_CORES, kv_groups=(NV - NQ) // 2,
+                  q_heads_each=NQ // B_CORES),
+        "C": dict(cores=C_CORES, k_tiles=K_DIM // (C_CORES * NROWS),
+                  ff_tiles=D_FF // (C_CORES * NROWS),
+                  emits=C_CORES // 4),        # four 4-way joins, not one 16-way
+    }
 
 
 def groups():
@@ -209,6 +235,9 @@ def main():
     print("\nstreams: host->A, A->B (q'k'v'), B->C (attn), C->A (residual), "
           "C->host (x_out)")
     print("memtile inputs: 16 (C's join) + splits, against ~48 — does not bind")
+    print(f"\noperand {OPERAND} B, OBJ {OBJ}, broadcast block {BC}")
+    for name, d in sizes().items():
+        print(f"  group {name}: " + ", ".join(f"{k}={v}" for k, v in d.items()))
     print("\nA->B head layout (chosen so A[j] feeds B[j] with no shuffle):")
     for j, row in enumerate(role_layout()):
         print(f"  A{j} -> B{j}: q {row[:-2]}, k {row[-2]}, v {row[-1]}")
