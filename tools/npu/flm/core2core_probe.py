@@ -33,29 +33,29 @@ import aie.iron as iron  # noqa: E402
 from aie.iron import In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker  # noqa: E402
 from aie.iron.device import AnyShimTile  # noqa: E402
 
-N = 64
+N = 64                          # default elements; --elems overrides
 
 
-def build(stages):
+def build(stages, n=N):
     """A chain of `stages` workers, each handing off to the next core to core.
 
     Built through exec so `stages` lands in the design SOURCE — iron.jit keys its
     cache on the function's text, and a closure over it silently reuses a stale
     build (that trap has cost time four times in this session).
     """
-    ty = np.ndarray[(N,), np.dtype[np.int32]]
+    ty = np.ndarray[(n,), np.dtype[np.int32]]
 
     src = f"""
 def _design(a: In, o: Out):
-    f_in = ObjectFifo(ty, depth=1, name="c2c_in{stages}")
-    mids = [ObjectFifo(ty, depth=1, name=f"c2c_mid{stages}_{{i}}")
+    f_in = ObjectFifo(ty, depth=1, name="c2c_in{stages}_{n}")
+    mids = [ObjectFifo(ty, depth=1, name=f"c2c_mid{stages}_{n}_{{i}}")
             for i in range({stages} - 1)]
-    f_out = ObjectFifo(ty, depth=1, name="c2c_out{stages}")
+    f_out = ObjectFifo(ty, depth=1, name="c2c_out{stages}_{n}")
 
     def stage(ic, oc):
         e = ic.acquire(1)
         r = oc.acquire(1)
-        for k in range({N}):
+        for k in range({n}):
             r[k] = e[k] + 1
         oc.release(1)
         ic.release(1)
@@ -78,7 +78,7 @@ def _design(a: In, o: Out):
     ns = dict(np=np, iron=iron, In=In, Out=Out, ObjectFifo=ObjectFifo,
               Program=Program, Runtime=Runtime, TaskGroup=TaskGroup,
               Worker=Worker, AnyShimTile=AnyShimTile, ty=ty,
-              __name__=f"c2c{stages}")
+              __name__=f"c2c{stages}_{n}")
     exec(src, ns)
     return iron.jit(ns["_design"])
 
@@ -87,13 +87,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--stages", type=int, default=2)
+    ap.add_argument("--elems", type=int, default=N,
+                    help="int32 elements per handoff; a real intermediate is\n"
+                         "K_DIM bf16 = 4 KB = 1024 int32-equivalents")
     ap.add_argument("--bench", action="store_true",
                     help="time it; the slope over --stages is the per-handoff cost")
     o = ap.parse_args()
-    src = np.arange(N, dtype=np.int32)
+    src = np.arange(o.elems, dtype=np.int32)
     a = iron.tensor(src, dtype=np.int32, device="npu")
-    b = iron.zeros(N, dtype=np.int32, device="npu")
-    design = build(o.stages)
+    b = iron.zeros(o.elems, dtype=np.int32, device="npu")
+    design = build(o.stages, o.elems)
     design(a, b)
 
     got, want = b.numpy(), src + o.stages
@@ -107,7 +110,8 @@ def main():
     # The point of the probe: what did f_mid get placed on?
     cache = sorted(Path.home().glob(".npu/cache/*/aie.mlir"),
                    key=lambda p: p.stat().st_mtime, reverse=True)
-    mlir = next((p for p in cache if f"c2c_mid{o.stages}_" in p.read_text()), None)
+    mlir = next((p for p in cache
+                 if f"c2c_mid{o.stages}_{o.elems}_" in p.read_text()), None)
     if mlir is None:
         print("  could not find this design's MLIR to inspect")
         return 2
@@ -125,7 +129,8 @@ def main():
         from aie.utils.benchmark import run_iters
         r = run_iters(design, a, b, warmup=2, iters=20)
         us = r.npu.min_us if r.npu else r.e2e.min_us
-        print(f"  {o.stages} stages: {us:.1f} us")
+        kb = o.elems * 4 / 1024
+        print(f"  {o.stages} stages, {kb:.1f} KB/handoff: {us:.1f} us")
     return 0
 
 
