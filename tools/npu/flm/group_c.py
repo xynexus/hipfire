@@ -167,7 +167,7 @@ def build(pos, nobj):
     # chunk-step because accumulating chunks still acquire one.
     w5_ty = np.ndarray[(NLAY * 2 * NCHUNK * p5tiles * OPERAND,),
                        np.dtype[np.uint8]]
-    o5_ty = np.ndarray[(NCHUNK * 2 * p5tiles * NROWS,), np.dtype[bfloat16]]
+    o5_ty = np.ndarray[(NCHUNK * 2 * p5tiles * OBJ,), np.dtype[bfloat16]]
     # P5's broadcast holds all NCHUNK activations; the fill picks one
     bc5_ty = np.ndarray[(NCHUNK * (2 * K_DIM + 2 * HEAD),), np.dtype[bfloat16]]
     # ONE row-ordered sw buffer for all pairs. P5 slices it by K-chunk, so it
@@ -212,6 +212,13 @@ def build(pos, nobj):
     P += ", " + ", ".join(f"o5_{i}: Out" for i in range(npairs))
     src = f'''
 def _design({P}):
+    # cache key: iron.jit hashes the SOURCE OF THIS FUNCTION. Types handed in
+    # through the namespace (o5_ty, h_ty, ...) are invisible to it, so their
+    # sizes are stamped into a fifo NAME below, not a comment: the cache key
+    # ignores comments (it hashes the AST, where comments do not survive), so a
+    # commented size does not bust it. Widening o5_ty alone silently reused the
+    # old build -- the sixth time this trap has fired, and the first where the
+    # usual comment-based fix was itself invisible.
     kq = ExternalFunction("flm_gemv_qkv", source_file=QKV_SRC,
                           arg_types=[bc_ty, op_ty], compile_flags=FLAGS)
     ke = ExternalFunction("flm_p1_emit", source_file=EMIT_SRC,
@@ -252,7 +259,7 @@ def _design({P}):
                            arg_types=[bc_ty, op_ty, p1o_ty],
                            compile_flags=FLAGS)
 
-    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_c32n8_{NLAY}")
+    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_c32n8_{NLAY}_o{NCHUNK * 2 * p5tiles * OBJ}")
     bc_cons = [f_bc.cons() for _ in range({NCORES})]
     f_w = [ObjectFifo(oppair_ty, name=f"wp{{i}}_n{NROWS}k{KVPER}") for i in range({npairs})]
     w_sub = [f.cons().split([0, {OPERAND}], obj_types=[op_ty, op_ty]) for f in f_w]
@@ -836,7 +843,7 @@ def main():
         b = np.empty((NCHUNK * p5tiles, 2, wt), np.uint8)
         b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
         w5.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
-    o5_ts = [iron.zeros(NCHUNK * 2 * p5tiles * NROWS, dtype=bfloat16,
+    o5_ts = [iron.zeros(NCHUNK * 2 * p5tiles * OBJ, dtype=bfloat16,
                         device="npu") for _ in range(npairs)]
 
     _args = (bc3_t, *w3, *h_ts, bc4_t, *w4, *sw_ts, bc5_t, *w5, *o5_ts)
@@ -965,12 +972,13 @@ def main():
                 x5_ref[r0:r0 + NROWS] = rnd(acc + x[r0:r0 + NROWS])
     got5 = np.zeros(K_DIM, np.float64)
     for pr in range(npairs):
+        # kdown writes NROWS rows into an OBJ-wide object; the rest is stale.
         v = (o5_ts[pr].numpy().astype(np.float64)
-             .reshape(NCHUNK, p5tiles, 2, NROWS)[NCHUNK - 1])
+             .reshape(NCHUNK, p5tiles, 2, OBJ)[NCHUNK - 1])
         for ti in range(p5tiles):
             for j in range(2):
                 r0 = p5rows(pr, j)[ti]
-                got5[r0:r0 + NROWS] = v[ti, j]
+                got5[r0:r0 + NROWS] = v[ti, j, :NROWS]
     if __import__("os").environ.get("C_DIAG"):
         raw = o5_ts[0].numpy().astype(np.float64)
         print(f"    DIAG o5[0] nonzero: {int((raw != 0).sum())}/{raw.size}")
@@ -1024,6 +1032,13 @@ def main():
         sg, sr = np.sort(got5), np.sort(x5_ref)
         print(f"    DIAG sorted match (permutation?): "
               f"{np.abs(sg - sr).max():.4e}")
+    if __import__("os").environ.get("C_DIAG"):
+        bad = np.abs(got5 - x5_ref) > 1e-2
+        print(f"    DIAG rows wrong: {int(bad.sum())}/{K_DIM}")
+        for pr in range(npairs):
+            for j in range(2):
+                n = sum(int(bad[r0:r0 + NROWS].any()) for r0 in p5rows(pr, j))
+                print(f"    DIAG pair {pr} core {j}: {n}/{p5tiles} tiles wrong")
     e5 = np.abs(got5 - x5_ref).max()
     print(f"  P5 x_out  : max err {e5:.4e}  mean|ref| {np.abs(x5_ref).mean():.5f}"
           f"  max|ref| {np.abs(x5_ref).max():.5f}")

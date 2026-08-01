@@ -12950,3 +12950,39 @@ Worth noting what the three-phase run would have shown if P5's result fifo had b
 drained into a zeroed buffer with no other producer: a clean zero, and a diagnosis
 two ticks earlier. Sharing `op` across phases hid the failure by filling the
 evidence with plausible data.
+
+### Why P5 emitted nothing: the result object is OBJ wide, not NROWS
+
+`p5_pass` could size its result fifo to `NROWS`, because P5 owned that fifo. In
+group C the fifo is shared with P1, P3 and P4, so its object is `OBJ` = 128
+elements while `kdown` fills only the first `NROWS` = 8. Sixteen cores emitting
+`NCHUNK * p5tiles` objects each therefore produce 16384 elements per pair, against
+an `o5_ty` sized for 1024. The drain could not place the stream and produced zeros.
+
+Widening `o5_ty` to the full stream and slicing host-side costs host memory rather
+than memtile channels, which are the actual budget. P5 now emits real data:
+
+    before  2.1875e-01  == max|ref|, i.e. zero
+    after   1.0657e-01  wrong, but no longer nothing
+
+Reading the rows at `row_base % OBJ` instead of offset 0 returns to zero, so
+`kdown` does write at the base of its object — unlike P4's dense packing.
+
+Still wrong, and uniformly so: all 16 tiles on all 16 cores, 1450 of 2048 rows off
+by more than 1e-2. A fault that hits every core equally is upstream of the per-core
+work — the broadcast or the weight stream, not the tiling.
+
+### A new variant of the iron.jit cache trap: comments do not bust it
+
+The established fix for this trap is to interpolate every varying parameter into
+the design's source text. That failed here. Widening `o5_ty` and stamping the new
+size in a comment inside the design function still reused the old build, which kept
+reporting "compiled for 1024 elements" against a 16384-element argument.
+
+The cache key does not survive comments — it hashes the AST, where comments do not
+exist. Stamping the size into a fifo NAME instead busts it correctly, because names
+are AST nodes. The earlier successful fixes all happened to interpolate into names
+or numbers, so the distinction never surfaced.
+
+So the rule needs sharpening: interpolate varying parameters into *code* — names,
+literals, arguments — not into comments or docstrings.
