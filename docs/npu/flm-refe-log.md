@@ -15348,3 +15348,49 @@ Method notes, so this is reproducible and so its limits are on the record:
     cache HIT this session and its behaviour is untouched. That is also why the control
     numbers here are comparable with the fused entry's.
 
+
+### Why lm_head is faster: it is not NROWS, and it is not fusion
+
+lm_head runs at 54.7 GB/s and the fused layer loop at 52.29 — 4.6% apart. The standing
+explanation was NROWS: lm_head was benched at 16, the fused design uses 8 for a uniform
+operand size, and this log records "NROWS 16->8 costs 4.5% of GEMV bandwidth (48.9 ->
+46.7)", which matches the gap almost exactly.
+
+**That is wrong.** At matched transfer size:
+
+    gemv_bench  tiles=498  nrows=16   163.7 MB   2976.3 us   55.00 GB/s
+    gemv_bench  tiles=996  nrows=8    164.2 MB   2971.0 us   55.27 GB/s
+
+A wash, and NROWS=8 is marginally the faster of the two. The 4.5% figure does not
+reproduce at this size — its absolute numbers (48.9 / 46.7) are both well below what
+either configuration reaches here, so it was measured on a different setup and has been
+carried as a general fact ever since. A coincidence of magnitude made it the obvious
+culprit.
+
+Laying the measurements out by STRUCTURE instead:
+
+                                        MB       us     GB/s   structure
+    gemv_bench nrows=16              163.70   2976.3    55.00   one stream, no barriers
+    gemv_bench nrows=8               164.20   2971.0    55.27   one stream, no barriers
+    lm_head (as benched)             163.70   2994.2    54.67   one stream
+    group_c standalone, per layer     34.29    651.7    52.62   3 phases, 3 barriers
+    fused stubbed, per layer          38.25    731.5    52.29   5 barriers, 32 cores
+
+The step is not from standalone to fused — `group_c` alone is already at 52.62, and
+fusing A and B into it costs 0.33 GB/s. The step is from **one continuous stream** to
+**a multi-phase design with barriers**, and it is ~4.5%, already fully present in
+`group_c` before any fusion happened.
+
+So the honest answer to "why is lm_head faster" is that lm_head is one uninterrupted
+stream of a single 163.7 MB tensor, and a decoder layer cannot be. Five TaskGroup barriers
+per layer — 80 across a token — each drain the DMA pipeline and restart it, and the phases
+stream from different tensors through different fifos rather than walking one.
+
+That reframes the remaining headroom stated earlier. "83% of the fabric roof" is not 17%
+of slack waiting to be recovered by better kernels: ~4.5% of it is the barrier structure a
+sequential layer requires, and the compute is already only 60 us of 791.5. What is left is
+fewer bytes or fewer barriers, and fewer barriers means changing what the phases are.
+
+Not separated here: barriers versus fifo-switching versus routing contention at 46/46
+memtile channels. They co-vary across every design in the table, and telling them apart
+needs a probe that holds bytes constant and varies only the barrier count.
