@@ -13830,3 +13830,35 @@ harness's *output filter* rather than its logic produced a misleading summary.
 This is the full-token compute path, correct end to end, in 32 dispatches. What it is
 not is one dispatch — the 65.4 tok/s projection still needs the fused design, and that
 remains untested beyond placement.
+
+### The model head exists now (host side): norm -> lm_head -> argmax
+
+`head_verify.py` closes the first half of the gap named when the remaining work was
+listed: **nothing in this tree had ever produced a token.** No design loaded
+`model.norm` or `lm_head`; lm_head had been timed at 163.7 MB / 54.7 GB/s and never
+run as part of the model, so 2994 us — 20% of the projected token — rode in every
+projection on no correctness evidence whatever.
+
+All four head tensors are in the container: `model.embed_tokens.weight`,
+`model.norm.weight`, `rope_freqs.weight`, `lm_head.weight`.
+
+    head of embed_tokens[128000]
+      argmax : 51902
+        51902  +7.5492    61534  +6.8203    83102  +6.8115
+
+That number means nothing semantically and the script says so: it embeds a token and
+heads it with no layers in between. It is a plumbing check — every step runs, the
+shapes agree, the logits are finite and separated.
+
+One bug caught on the way, of a familiar kind: `logits_for` called `load_linear`
+INSIDE the chunk loop, loading all 128256 rows sixteen times. The chunking was written
+to keep peak memory down and bought nothing, since `load_linear` returns the whole
+tensor regardless — the peak was the full tensor either way. Loading once cut the run
+to 50 s and left the argmax identical, which is the check that the change was inert.
+
+What is still missing is the part that matters: a real hidden state. The chain starts
+layer 0 from `rng.standard_normal(K_DIM) * 0.05`, not an embedding, and its KV cache
+is synthetic — so running its x_out through this head would produce a token with no
+meaning. Closing that needs a real prompt token embedded at layer 0 and a KV cache the
+design's own P1 wrote, which at pos 0 with seq 1 it entirely does. That is the next
+step, and it is what makes comparison against FLM's token oracle possible.
