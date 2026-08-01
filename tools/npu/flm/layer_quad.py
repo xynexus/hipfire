@@ -116,7 +116,7 @@ def build(pos, nobj):
     # Where each pair's q' belongs in the broadcast. Measured, not assumed (see
     # CHAIN_QMAP): a pair's stream is [slot s][core j] and its head is
     # qbase + hpcc*j + s, so the scatter is a plain 3-level stride.
-    p1_lsz = hpc * TPH * 2 * q4nx.tile_bytes(K_DIM, NROWS)
+    p1_lsz = hpc * TPH * 4 * q4nx.tile_bytes(K_DIM, NROWS)
     qbase = [sum(qobj[:i]) for i in range(len(qobj))]
     hpcc = [q // 2 for q in qobj]
     # P3 runs on ALL cores — only P1 and P2 are partitioned — so o_proj's 2048
@@ -127,12 +127,12 @@ def build(pos, nobj):
     D_FF = 8192
     p4tiles = D_FF // (NCORES * NROWS)      # gate/up steps per core
     # bytes of ONE layer's weights per pair, per phase — the fill offset
-    p3_lsz = 2 * p3tiles * q4nx.tile_bytes(K_DIM, NROWS)
-    p4_lsz = 2 * 2 * p4tiles * q4nx.tile_bytes(K_DIM, NROWS)
+    p3_lsz = 4 * p3tiles * q4nx.tile_bytes(K_DIM, NROWS)
+    p4_lsz = 4 * 2 * p4tiles * q4nx.tile_bytes(K_DIM, NROWS)
     BCN1 = 2 * K_DIM + 2 * HEAD          # one layer's broadcast block
     p4per = OBJ // NROWS                    # steps sharing one result object
     p4objs = p4tiles // p4per               # result objects per core
-    rpp4 = D_FF // (NCORES // 2)            # rows a pair owns
+    rpp4 = D_FF // (NCORES // 4)            # rows a QUAD owns
     KTILE, VTILE = HEAD * TSEQ, TSEQ * HEAD
     # One slot per KV head, OPERAND bytes wide — not KVSTRIDE. P2's fill has
     # to deliver whole operand objects, and the fifo side of a transfer is
@@ -175,12 +175,12 @@ def build(pos, nobj):
     # broadcast. Several pairs draining into one BO at different offsets is the
     # ffn_chain pattern, already used here for the KV cache.
     attn_all_ty = np.ndarray[(apairs * 2 * GQA * HEAD,), np.dtype[bfloat16]]
-    w3_ty = np.ndarray[(NLAY * 2 * p3tiles * OPERAND,), np.dtype[np.uint8]]
+    w3_ty = np.ndarray[(NLAY * 4 * p3tiles * OPERAND,), np.dtype[np.uint8]]
     # h's DRAIN TARGET, not its object: the drain scatters a pair's 2*OBJ
     # object into the full broadcast-shaped buffer that P4 is filled from,
     # so the runtime argument is that buffer's shape.
     h_ty = np.ndarray[(2 * K_DIM + 2 * HEAD,), np.dtype[bfloat16]]
-    w4_ty = np.ndarray[(NLAY * 2 * 2 * p4tiles * OPERAND,), np.dtype[np.uint8]]
+    w4_ty = np.ndarray[(NLAY * 4 * 2 * p4tiles * OPERAND,), np.dtype[np.uint8]]
     # ONE row-ordered sw buffer for all pairs. P5 slices it by K-chunk, so it
     # must be in row order — the per-pair stream is [object][core] and a
     # pair's cores are rpp4/2 rows apart, which is not ascending. A drain
@@ -188,7 +188,7 @@ def build(pos, nobj):
     sw_ty = np.ndarray[(D_FF,), np.dtype[bfloat16]]
     # P1's weights, then P2's q'+KV objects, on the same fifo
     # spans NLAY layers; the fill selects one by offset
-    w_all_ty = np.ndarray[(NLAY * 2 * hpc * TPH * wt,), np.dtype[np.uint8]]
+    w_all_ty = np.ndarray[(NLAY * 4 * hpc * TPH * wt,), np.dtype[np.uint8]]
     kvin_ty = bc_ty                      # q' rides the broadcast object
     # one per P1 pair: at 12 P1 cores pairs 0-3 emit 4 q objects and
     # pairs 4-5 emit 8, since the KV-carrying cores spend two slots on k/v
@@ -663,16 +663,16 @@ def main():
             nw, xn = nw_l, xn_l          # references follow the LAST iteration
     bc_t = iron.tensor(bc.astype(bfloat16), dtype=bfloat16, device="npu")
     w_ts, ref = [], {}
-    # One buffer per pair holding NLAY layers back to back; the fill picks a
-    # layer by offset. This is what makes a layer-iterating dispatch run REAL
-    # layers instead of the same one repeatedly.
-    for pr in range(p1pairs):
+    # One buffer per QUAD holding NLAY layers back to back; the fill picks a
+    # layer by offset. Four cores share a buffer now, so `per` has four entries
+    # and the head layout is indexed 4*q + j rather than 2*pr + j.
+    for pr in range(p1quads):
         per_layer = []
         for _lw in range(NLAY):
             per = []
-            for j in range(2):
+            for j in range(4):
                 blob = []
-                for h in layout[2 * pr + j]:
+                for h in layout[4 * pr + j]:
                     first = h * HEAD
                     d, m, q = qkv_rows(c, o.layer + _lw, first, HEAD)
                     blob.append(np.concatenate([
@@ -689,8 +689,9 @@ def main():
                         v = rope_ref(v, cs_k)
                     ref[h] = rnd(v).astype(np.float64)
                 per.append(np.concatenate(blob))
-            b = np.empty((hpc * TPH, 2, wt), np.uint8)
-            b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
+            b = np.empty((hpc * TPH, 4, wt), np.uint8)
+            for j in range(4):
+                b[:, j, :] = per[j].reshape(-1, wt)
             per_layer.append(b.reshape(-1))
         w_ts.append(iron.tensor(np.concatenate(per_layer), dtype=np.uint8,
                                 device="npu"))
@@ -785,8 +786,8 @@ def main():
     bc3_t = iron.tensor(bc3.astype(bfloat16), dtype=bfloat16, device="npu")
 
     # rows so a pair's join is a contiguous global run, as resid_chain packs them
-    rpp3 = K_DIM // npairs
-    p3rows = lambda pr, j: [pr * rpp3 + t * 2 * NROWS + j * NROWS
+    rpp3 = K_DIM // nquads                 # rows a QUAD owns
+    p3rows = lambda pr, j: [pr * rpp3 + t * 4 * NROWS + j * NROWS
                             for t in range(p3tiles)]
     nbc3 = K_DIM // 32
     w3, h_ref = [], np.zeros(K_DIM, np.float64)
@@ -794,13 +795,13 @@ def main():
     # shape as P1's buffer -- see p1_lsz.
     o_pl = [load_linear(c, f"model.layers.{o.layer + _l}.self_attn.o_proj.weight",
                         K_DIM, K_DIM) for _l in range(NLAY)]
-    p3_lsz = p3tiles * 2 * wt
-    for pr in range(npairs):
+    p3_lsz = p3tiles * 4 * wt   # one layer, one quad
+    for pr in range(nquads):
         per_layer = []
         for _lw in range(NLAY):
             od_, om_, oc_ = o_pl[_lw]
             per = []
-            for j in range(2):
+            for j in range(4):
                 blob = []
                 for r0 in p3rows(pr, j):
                     blob.append(q4nx.pack_tile(od_[r0:r0 + NROWS, :nbc3],
@@ -812,8 +813,9 @@ def main():
                                                    oc_[r0:r0 + NROWS, :nbc3])
                     h_ref[r0:r0 + NROWS] = rnd(got + x[r0:r0 + NROWS])
                 per.append(np.concatenate(blob))
-            b = np.empty((p3tiles, 2, wt), np.uint8)
-            b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
+            b = np.empty((p3tiles, 4, wt), np.uint8)
+            for j in range(4):
+                b[:, j, :] = per[j].reshape(-1, wt)
             per_layer.append(b.reshape(-1))
         w3.append(iron.tensor(np.concatenate(per_layer), dtype=np.uint8,
                               device="npu"))
@@ -850,22 +852,22 @@ def main():
     h_ts = [h_all] * npairs          # every pair scatters into the same buffer
     bc4_t = h_all                    # ...which P4 is then filled from
 
-    rpp4 = D_FF // npairs
+    rpp4 = D_FF // nquads                  # rows a QUAD owns
     # A core's rows must be CONTIGUOUS, not interleaved with its partner's.
     # flm_gemv_up_swiglu writes at row_base % DIM_OBJROWS, and an interleave of
     # 2*NROWS makes that modulo collide — 8 distinct slots for 16 steps, half
     # the object unwritten and half written twice. Contiguous gives
     # t*NROWS % 128 = 0,8,...,120, tiling the object exactly.
-    p4rows = lambda pr, j: [pr * rpp4 + j * (rpp4 // 2) + t * NROWS
+    p4rows = lambda pr, j: [pr * rpp4 + j * (rpp4 // 4) + t * NROWS
                             for t in range(p4tiles)]
     nbc4 = K_DIM // 32
     w4, sw_ref = [], np.zeros(D_FF, np.float64)
-    for pr in range(npairs):
+    for pr in range(nquads):
         per_layer = []
         for _lw in range(NLAY):
           (gd, gm, gc), (ud, um, uc) = gu_pl[_lw]
           per = []
-          for j in range(2):
+          for j in range(4):
             blob = []
             for r0 in p4rows(pr, j):
                 sl = slice(r0, r0 + NROWS)
@@ -879,8 +881,9 @@ def main():
                                                  um[sl, :nbc4], uc[sl, :nbc4]))
                 sw_ref[sl] = rnd(g / (1.0 + np.exp(-g.astype(np.float64))) * u)
             per.append(np.concatenate(blob))
-          b = np.empty((2 * p4tiles, 2, wt), np.uint8)
-          b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
+          b = np.empty((2 * p4tiles, 4, wt), np.uint8)
+          for j in range(4):
+              b[:, j, :] = per[j].reshape(-1, wt)
           per_layer.append(b.reshape(-1))
         w4.append(iron.tensor(np.concatenate(per_layer), dtype=np.uint8,
                               device="npu"))
