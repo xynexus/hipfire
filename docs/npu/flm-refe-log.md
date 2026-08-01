@@ -15152,6 +15152,14 @@ Per phase, per layer, on the AQ=4 build:
     x_out  1.6e-02 to 1.0        against 2.0 - 4.0
     sw     5.0e-01 against 1.1e+01 (4% of peak) = 0.45% of peak
 
-Attention stays inside the envelope at all sixteen layers where the 32-dispatch chain
-breached it at layers 11 and 12. No cause is claimed: at position 0 the softmax is over
-one entry, which is the most forgiving case in the space.
+Attention stays inside the envelope at all sixteen layers. **That is not an improvement
+over the 32-dispatch chain and must not be read as one.** The chain run that breached at
+layers 11 and 12 (2.16 and 2.20 ULP) was `chain_layers.sh 16` at its default POS=30; this
+run is at pos 0, where the softmax is over a single entry and the output must equal that
+entry's V — `groups_ab` measures 0.00 ULP there, bit-exact. The chain's own pos-0 run
+shows no breach either. Both designs pass at pos 0; the fused design's behaviour at pos 30
+is simply untested, because position is still a build parameter here.
+
+I nearly recorded this as a difference worth explaining. Two runs at different positions
+are not a comparison, and a phantom improvement in a log is worse than a gap in one:
+someone will eventually try to account for it.
