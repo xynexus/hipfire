@@ -527,7 +527,12 @@ def main():
     design, wt = build(o.pos, ncores, o.seq)
 
     rng = np.random.default_rng(0)
-    x = rnd(rng.standard_normal(K_DIM) * 0.05)
+    # AB_X_FROM closes the C -> A seam: the previous layer's x_out becomes this
+    # layer's input, which is what makes a multi-layer chain a real chain rather
+    # than sixteen independent layers on random activations.
+    _xf = os.environ.get("AB_X_FROM")
+    x = (rnd(np.load(_xf).astype(np.float32)) if _xf
+         else rnd(rng.standard_normal(K_DIM) * 0.05))
     bc = np.zeros(2 * K_DIM + 2 * HEAD, np.float32)
     bc[:K_DIM] = x
     bc[K_DIM:2 * K_DIM] = nw

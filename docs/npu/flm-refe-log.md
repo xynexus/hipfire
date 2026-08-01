@@ -13652,3 +13652,35 @@ no permutation needed.
 What this is not: a fused dispatch. The seam crosses a file, so this measures
 correctness of the composition, not its cost. The two halves still run as separate
 dispatches, and the 65.4 tok/s projection still depends on fusing them.
+
+### Two chained layers on the role architecture
+
+`C_EMIT_XOUT` and `AB_X_FROM` close the last seam, C -> A. Layer 0's x_out becomes
+layer 1's input, so this is a chain rather than two layers on independent random
+activations:
+
+    layer 0   attn 1.5359e-03 (0.76 ULP)   P3 0.0   P4 3.9062e-03   P5 4.7684e-07
+    layer 1   attn 2.0904e-03 (0.87 ULP)   P3 0.0   P4 7.8125e-03   P5 0.0000e+00
+              k' 0.0000e+00   v' 0.0000e+00
+
+Every phase of layer 1 runs on layer 0's real device output, through the full path:
+P1 -> P2 core to core, attention out to C, h and sw inside C's dispatch, x_out back to
+the next layer's P1.
+
+The error going **down** as the chain lengthens is the tell that the plumbing is
+right, and it has a mechanical cause worth recording. At layer 0 the input `x` is a
+float32 random vector, so every consumer sees a value the reference rounds differently
+than the device does, and the floor is one bf16 ulp. At layer 1 the input is a saved
+x_out — already bf16 — so reference and device consume bit-identical inputs and k', v',
+P3 and P5 all come out exact. A wrong chain cannot produce that: feeding the wrong
+vector forward would raise the error, not drive it to zero.
+
+P4 remains the one phase with real error (1.35-2.50% of peak), unchanged from when it
+was fed host references. That is the SwiGLU path's own floor, not something the chain
+introduced.
+
+Still not a fused dispatch. The seams cross files, so this establishes that the role
+architecture computes a correct multi-layer chain — which was never demonstrated
+before, and was the substantive risk behind the 65.4 tok/s projection. What remains is
+whether the same composition survives being put in one dispatch, which is a placement
+and program-memory question, not a correctness one.

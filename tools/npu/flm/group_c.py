@@ -1070,6 +1070,10 @@ def main():
             for j in range(2):
                 n = sum(int(bad[r0:r0 + NROWS].any()) for r0 in p5rows(pr, j))
                 print(f"    DIAG pair {pr} core {j}: {n}/{p5tiles} tiles wrong")
+    _xo = os.environ.get("C_EMIT_XOUT")
+    if _xo:
+        np.save(_xo, got5.astype(np.float32))
+        print(f"  x_out -> {_xo}  (max|.| {np.abs(got5).max():.4f})")
     e5 = np.abs(got5 - x5_ref).max()
     print(f"  P5 x_out  : max err {e5:.4e}  mean|ref| {np.abs(x5_ref).mean():.5f}"
           f"  max|ref| {np.abs(x5_ref).max():.5f}")
