@@ -14682,3 +14682,37 @@ margin.
 So: 32 cores with full-size objects can place, route, load and run, which was not
 previously demonstrated at all. The specific configuration the projection depends on
 still has not been built.
+
+### The fused design's channel demand PLACES at full operand size
+
+`channel_probe.py` builds the union's link structure and nothing else — 12 splits 1->2,
+2 joins 4->1, 10 joins 2->1, the counts and widths measured from the two designs' own
+MLIR — with 10304 B objects and bodies that touch 8 elements so program memory cannot be
+what fails:
+
+    memtile channels: 40 in, 36 out   (budget 48 / 48)
+    cores: 28   object: 2576 int32 = 10304 B
+      -> PLACES, ROUTES AND LOADS
+
+Verified genuine rather than a cache hit: the MLIR carries `memref<2576xi32>` for the
+whole object, 1288 for the halves and 644 for the quarters, with 28 CoreTiles, **24
+MemTiles** and 28 ELFs, built seconds earlier. It completes in two seconds because the
+bodies are trivial, which is exactly what `--touch` was added for.
+
+So the number the whole projection rested on — 40 of 48 input channels, 24 logical
+memtiles packed onto 8 physical, at the real weight-tile size — is satisfiable. That was
+computed analytically three days' worth of entries ago and never built. The earlier
+32-core attempt died at "no MemTile has sufficient DMA capacity" with 40 inputs from
+joins alone; this reaches 40 *including* the splits and places.
+
+One correction the probe forced on me: my first version gave every fifo endpoint its own
+core, asked for 52, and the placer refused at 32. The real designs put a split consumer
+and a join producer on the SAME core — `group_c`'s cores each read a weight sub-fifo and
+write into a result join. That is a detail I would have got wrong in the real fused
+design, and the probe was cheap enough to find it.
+
+What this is not: the fused design. This is its DMA skeleton at full width. The real one
+adds the kernels, whose per-core program memory is measured separately (A+B 57%, C 90% of
+16 KB, and fusing adds code to no core since each ELF holds only its own role). Those two
+facts compose by argument, not by measurement, and today has been a long lesson in the
+difference.
