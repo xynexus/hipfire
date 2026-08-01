@@ -14101,3 +14101,21 @@ host references.
 The argmax in that run is still meaningless: the process imported `head_verify` before
 its loader was fixed, so the layers used real weights and lm_head used scrambled ones.
 Re-running the head separately on the saved hidden state.
+
+### The host path produces the oracle's token
+
+    ours    argmax 16309   +6.9125   then 2, 1340, 791, 1757
+    oracle  argmax 16309   +7.0285   then 2, 791, 1340, 475
+
+Same token, top-4 the same set, logits within 2%. The host reference path — q4nx
+weights through sixteen layers, final norm, lm_head, argmax — now reproduces an
+independent fp32 forward that shares no code with it.
+
+That is the first time anything here has been checked against something outside this
+tree, and it took two faults with it: weights uncorrelated with the model, and a layer
+that discarded its own attention. Both had been invisible for the same reason — the
+host reference implemented the same mistake as the thing it was checking.
+
+The yardstick is now trustworthy, which is what makes the device work measurable. It is
+also worth stating what the device has *not* got: both faults are still in
+`group_c`, `groups_ab` and `p5_pass`, unchanged.
