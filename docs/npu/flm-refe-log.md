@@ -11233,3 +11233,21 @@ bottleneck.
 Remaining before this is a real token: side B's per-layer weights, and the
 residual chaining layer to layer on device. Both are the same offset pattern
 already working three times over.
+
+### Side B carries per-layer weights too — exact
+
+`p5_pass` now packs down_proj for NLAY layers back to back and selects one per
+iteration by fill offset (`w5_lsz = 2 * NCHUNK * tiles * wt`), the same pattern
+used four times now.
+
+    NLAY=1   max err 0.0000e+00   PASS
+    NLAY=2   max err 0.0000e+00   PASS   (real layers 0,1)
+    NLAY=4   max err 0.0000e+00   PASS   (real layers 0-3)
+
+Exact, not at a floor — down_proj has no exp2 in its path, so there is nothing to
+be approximately right about.
+
+Every weight tensor in the token is now per-layer: P1's qkv, P3's o_proj, P4's
+gate/up, P5's down_proj, and both RMSNorm weights. **The only thing still not
+per-layer is the residual**, which is fed the same `x` on every iteration instead
+of carrying forward from the previous layer's output.

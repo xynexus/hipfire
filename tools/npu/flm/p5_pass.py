@@ -65,7 +65,8 @@ def build(ncores):
     o_ty = np.ndarray[(NROWS,), np.dtype[bfloat16]]
     wpair_ty = np.ndarray[(2 * wt,), np.dtype[np.uint8]]
     opair_ty = np.ndarray[(2 * NROWS,), np.dtype[bfloat16]]
-    w_all_ty = np.ndarray[(2 * NCHUNK * tiles * wt,), np.dtype[np.uint8]]
+    w5_lsz = 2 * NCHUNK * tiles * wt        # one layer's bytes per pair
+    w_all_ty = np.ndarray[(_NLAY * 2 * NCHUNK * tiles * wt,), np.dtype[np.uint8]]
     # NCHUNK times the live data: the accumulating chunks still acquire and
     # release a result object (the loop is uniform, which is what makes P5 one
     # body instead of two), so the stream carries NCHUNK objects per tile and
@@ -137,7 +138,10 @@ def _design(bc: In, {params}):
                 bch.fill(bcb, group=tg, offset=ch * 2 * {K_DIM},
                          sizes=[1, 1, 1, 2 * {K_DIM}], strides=[0, 0, 0, 1])
             for i in range(n):
-                wh[i].fill(wb[i], group=tg)
+                wh[i].fill(wb[i], group=tg,
+                           offset=_lay * {w5_lsz},
+                           sizes=[1, 1, 1, {w5_lsz}],
+                           strides=[0, 0, 0, 1])
             for i in range(n):
                 oh[i].drain(ob[i], wait=True, group=tg)
             tg.finish()
@@ -253,23 +257,33 @@ def main():
                           for t in range(tiles)]
     nbc = D_FF // BLK
     w5, ref = [], np.zeros(D_MODEL, np.float64)
+    # down_proj per layer, back to back; the fill picks one by offset. Same
+    # pattern as side A's P1/P3/P4 buffers.
+    d_pl = [load_linear(c, f"model.layers.{o.layer + _l}.mlp.down_proj.weight",
+                        D_MODEL, D_FF) for _l in range(_NLAY)]
+    dd, dm, dc = d_pl[_NLAY - 1]              # reference follows the LAST layer
     for pr in range(npairs):
-        per = []
-        for j in range(2):
-            blob = []
-            for ch in range(NCHUNK):
-                lo = ch * (nbc // NCHUNK)
-                hi = lo + nbc // NCHUNK
-                for r0 in rows(pr, j):
-                    sl = slice(r0, r0 + NROWS)
-                    # the last chunk carries the flush flag
-                    blob.append(q4nx.pack_tile(
-                        dd[sl, lo:hi], dm[sl, lo:hi], dc[sl, lo:hi],
-                        row_base=r0, flags=float(ch == NCHUNK - 1)))
-            per.append(np.concatenate(blob))
-        b = np.empty((NCHUNK * tiles, 2, wt), np.uint8)
-        b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
-        w5.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
+        per_layer = []
+        for _lw in range(_NLAY):
+            dd_, dm_, dc_ = d_pl[_lw]
+            per = []
+            for j in range(2):
+                blob = []
+                for ch in range(NCHUNK):
+                    lo = ch * (nbc // NCHUNK)
+                    hi = lo + nbc // NCHUNK
+                    for r0 in rows(pr, j):
+                        sl = slice(r0, r0 + NROWS)
+                        # the last chunk carries the flush flag
+                        blob.append(q4nx.pack_tile(
+                            dd_[sl, lo:hi], dm_[sl, lo:hi], dc_[sl, lo:hi],
+                            row_base=r0, flags=float(ch == NCHUNK - 1)))
+                per.append(np.concatenate(blob))
+            b = np.empty((NCHUNK * tiles, 2, wt), np.uint8)
+            b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
+            per_layer.append(b.reshape(-1))
+        w5.append(iron.tensor(np.concatenate(per_layer), dtype=np.uint8,
+                              device="npu"))
     # reference: the whole K, then the residual
     for pr in range(npairs):
         for j in range(2):
