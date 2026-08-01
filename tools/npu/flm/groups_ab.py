@@ -184,7 +184,10 @@ def drain_plan(ncores=NCORES, group=2):
     return qobj, kvplan
 
 
-def build(pos, ncores=NCORES):
+def build(pos, ncores=NCORES, seq=32):
+    # KV objects B streams per token: ceil(seq / TSEQ) at KVPER=1. attn_phase
+    # derives the same way; here it must agree with the host's cache layout.
+    nobj = -(-seq // (TSEQ * KVPER))
     wt = q4nx.tile_bytes(K_DIM, NROWS)
     npairs = ncores // 2
     hpc = hpc_for(ncores)
@@ -201,6 +204,13 @@ def build(pos, ncores=NCORES):
     # all GQA q heads in ONE object, at OBJ stride: attention reads
     # q[h * QSTRIDE + d] from a single acquire
     q_ty = np.ndarray[(GQA * OBJ,), np.dtype[bfloat16]]
+    # B's KV tiles arrive from the host cache as OPERAND-sized objects, the same
+    # shape the working design uses — one operand type for every fifo, because a
+    # core has two input channels and KV shares a stream with weights there.
+    OPERAND = max(2 * TSEQ * HEAD * 2 * KVPER, wt)
+    kvop_ty = np.ndarray[(OPERAND,), np.dtype[np.uint8]]
+    ao_ty = np.ndarray[(GQA * HEAD,), np.dtype[bfloat16]]        # one B core
+    aoj_ty = np.ndarray[(4 * GQA * HEAD,), np.dtype[bfloat16]]   # four, joined
     wpair_ty = np.ndarray[(2 * wt,), np.dtype[np.uint8]]
     opair_ty = np.ndarray[(2 * OBJ,), np.dtype[bfloat16]]
     w_all_ty = np.ndarray[(2 * hpc * TPH * wt,), np.dtype[np.uint8]]
@@ -257,6 +267,13 @@ def _design(bc: In, {params}):
     # output DMA channels, with none spare.
     f_q = [ObjectFifo(q_ty, name=f"aq{{i}}") for i in range({ncores})]
     f_kv = [ObjectFifo(o_ty, name=f"akv{{i}}") for i in range({ncores})]
+    # ---- group B's streams -------------------------------------------------
+    f_kvin = [ObjectFifo(kvop_ty, name=f"bkv{{i}}") for i in range({ncores})]
+    # Attention leaves through two 4-way joins, not eight drains: eight would put
+    # the shim at 16 of 16 outputs, and it is the shape group C consumes anyway.
+    f_ao = [ObjectFifo(aoj_ty, name=f"bao{{i}}") for i in range(2)]
+    ao_sub = [f.prod().join([k * {GQA} * {HEAD} for k in range(4)],
+                            obj_types=[ao_ty] * 4) for f in f_ao]
 
     def core(bcc, wc, opq, opkv, kqkv, kemit, kprep):
         """P1 with its output SPLIT by destination.
@@ -317,6 +334,27 @@ def _design(bc: In, {params}):
                 fn_args=[bc_cons[c], w_sub[p][j].cons(),
                          f_q[c].prod(), f_kv[c].prod(), kq, ke, kn],
                 stack_size=8192))
+
+    def core_b(qc, kvc, op, kbegin, ktile, kfin):
+        """Attention for one KV group. `qc` is A[j]'s q' fifo, arriving core to
+        core — the q object holds all GQA heads at OBJ stride, which is what
+        DIM_QSTRIDE expects, and QOFF_FROM_KV=0 puts head 0 at offset 0."""
+        eq = qc.acquire(1)
+        kbegin(eq)
+        for _ in range_({nobj}):
+            ekv = kvc.acquire(1)
+            ktile(eq, ekv)
+            kvc.release(1)
+        eo = op.acquire(1)
+        kfin(eo, eq)
+        op.release(1)
+        qc.release(1)
+
+    for c in range({ncores}):
+        workers.append(Worker(core_b,
+            fn_args=[f_q[c].cons(), f_kvin[c].cons(),
+                     ao_sub[c // 4][c % 4].prod(), kab, kat, kaf],
+            stack_size=4096))
 
     def sequence(*args):
         n, nc = {npairs}, {ncores}
