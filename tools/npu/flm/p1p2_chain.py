@@ -152,6 +152,12 @@ def build(pos, nobj):
     kv_in = pos % TSEQ                  # its column/row within that object
     kv_obase = kv_ob * NATT             # cache is flat [obj*NATT + head][SLOT]
     off = kv_in - (kv_in & 1)
+    # Layers per DISPATCH. Measured: FLM issues ~2.5 EXEC_CMD per token where
+    # this design issues 32 (16 layers x 2 dispatches), and that surplus is the
+    # entire performance gap. If one dispatch can iterate layers, the gap closes.
+    # Weights are reused across iterations here -- this measures the MECHANISM
+    # and its cost, not a correct multi-layer result.
+    NLAY = int(_osk.environ.get("CHAIN_NLAY", 1)) if (_osk := __import__("os")) else 1
     import os as _osk
     SKIP_P1 = 1 if _osk.environ.get("CHAIN_P2_ONLY") else 0
     # bisect: P2 reads a host-built cache instead of the one P1 drained into.
@@ -345,15 +351,16 @@ def _design(bc: In, {P}):
 
     def core_p1(bcc, wc, op, kqkv, kemit, kprep, kres, kasum, khemit,
                 kgate, kups):
-        p1_body(bcc, wc, op, kqkv, kemit, kprep)
-        # A broadcast object must be consumed by EVERY consumer of the fifo.
-        # These cores sit out P2, but the fifo still delivers them the q'
-        # object, and leaving it unreleased stalls the accounting for the cores
-        # that do use it.
-        eb2 = bcc.acquire(1)
-        bcc.release(1)
-        p3_body(bcc, wc, op, kres, kasum, khemit)
-        p4_body(bcc, wc, op, kgate, kups, kprep)
+        for _lay in range_({NLAY}):
+          p1_body(bcc, wc, op, kqkv, kemit, kprep)
+          # A broadcast object must be consumed by EVERY consumer of the fifo.
+          # These cores sit out P2, but the fifo still delivers them the q'
+          # object, and leaving it unreleased stalls the accounting for the cores
+          # that do use it.
+          eb2 = bcc.acquire(1)
+          bcc.release(1)
+          p3_body(bcc, wc, op, kres, kasum, khemit)
+          p4_body(bcc, wc, op, kgate, kups, kprep)
 
     def core_p1p2(bcc, wc, op, ap, kqkv, kemit, kprep, kbeg, ktile, kfin,
                   kres, kasum, khemit, kgate, kups):
@@ -362,35 +369,36 @@ def _design(bc: In, {P}):
         # broadcast's first fill (the activation), because a broadcast object
         # is only recycled once every consumer has taken it; skipping it stalls
         # the cores that do use it.
-        _act = bcc.acquire(1)
-        bcc.release(1)
-        # ---- P2: q' arrives on the BROADCAST, KV tiles on the weight fifo ----
-        # This used to read q' from `wc` while the sequence delivered it on the
-        # broadcast — so kbeg/ktile were handed KV-cache bytes as q'. That is
-        # the whole P2 fault: a wrong input, which is why it was invariant to
-        # core count, q stride and sequence length, and why it survived a
-        # host-built cache AND a host-built q'.
-        #
-        # kbeg writes the online-softmax state and ktile reads it; an acquire
-        # between two kernels sharing a global loses the handoff
-        # (global_handoff_probe.py), so the first KV acquire stays hoisted above
-        # kbeg. With q' on its own fifo this now matches attn_phase.py, which
-        # passes precisely because its q and KV are on different fifos.
-        eq = bcc.acquire(1)
-        ekv = wc.acquire(1)
-        kbeg(eq)
-        ktile(eq, ekv)
-        wc.release(1)
-        for _ in range_({nobj} - 1):
-            ekv = wc.acquire(1)
-            ktile(eq, ekv)
-            wc.release(1)
-        eo = ap.acquire(1)
-        kfin(eo, eq)
-        ap.release(1)
-        bcc.release(1)
-        p3_body(bcc, wc, op, kres, kasum, khemit)
-        p4_body(bcc, wc, op, kgate, kups, kprep)
+        for _lay in range_({NLAY}):
+         _act = bcc.acquire(1)
+         bcc.release(1)
+         # ---- P2: q' arrives on the BROADCAST, KV tiles on the weight fifo ----
+         # This used to read q' from `wc` while the sequence delivered it on the
+         # broadcast — so kbeg/ktile were handed KV-cache bytes as q'. That is
+         # the whole P2 fault: a wrong input, which is why it was invariant to
+         # core count, q stride and sequence length, and why it survived a
+         # host-built cache AND a host-built q'.
+         #
+         # kbeg writes the online-softmax state and ktile reads it; an acquire
+         # between two kernels sharing a global loses the handoff
+         # (global_handoff_probe.py), so the first KV acquire stays hoisted above
+         # kbeg. With q' on its own fifo this now matches attn_phase.py, which
+         # passes precisely because its q and KV are on different fifos.
+         eq = bcc.acquire(1)
+         ekv = wc.acquire(1)
+         kbeg(eq)
+         ktile(eq, ekv)
+         wc.release(1)
+         for _ in range_({nobj} - 1):
+             ekv = wc.acquire(1)
+             ktile(eq, ekv)
+             wc.release(1)
+         eo = ap.acquire(1)
+         kfin(eo, eq)
+         ap.release(1)
+         bcc.release(1)
+         p3_body(bcc, wc, op, kres, kasum, khemit)
+         p4_body(bcc, wc, op, kgate, kups, kprep)
 
     workers = []
     for p in range({npairs}):
@@ -426,93 +434,94 @@ def _design(bc: In, {P}):
         p1h = [args[base + 1 + n + i] for i in range(n)]
         p2h = [args[base + 1 + 2 * n + i] for i in range(a)]
 
-        tg = TaskGroup()
-        bch.fill(bcb, group=tg)
-        for i in range({p1pairs}):     # partition B: only these pairs run P1
-            wh[i].fill(wb[i], group=tg)
-        QOBJ, KVPLAN = {qobj!r}, {kvplan!r}
-        QBASE, HPCC = {qbase!r}, {hpcc!r}
-        for i in range({p1pairs}):
-            p1h[i].drain(qb[i], wait=True, group=tg,
-                         offset=QBASE[i] * {OBJ},
-                         sizes=[1, HPCC[i], 2, {OBJ}],
-                         strides=[0, {OBJ}, HPCC[i] * {OBJ}, 1])
-            for _kind, _base in KVPLAN[i]:
-                if _kind == "k":
-                    p1h[i].drain(cb[i], wait=True, group=tg,
-                                 offset=2 * (({kv_obase} + _base) * {SLOT}
-                                             + {off}),
-                                 sizes=[1, 2, {HEAD}, 4],
-                                 strides=[0, 2 * {SLOT}, 2 * {TSEQ}, 1])
-                else:
-                    p1h[i].drain(cb[i], wait=True, group=tg,
-                                 offset=2 * (({kv_obase} + _base) * {SLOT}
-                                             + {KTILE} + {kv_in} * {HEAD}),
-                                 sizes=[1, 2, 1, 2 * {OBJ}],
-                                 strides=[0, 2 * {SLOT}, 0, 1])
-        tg.finish()
+        for _lay in range({NLAY}):   # one dispatch, NLAY layer iterations
+            tg = TaskGroup()
+            bch.fill(bcb, group=tg)
+            for i in range({p1pairs}):     # partition B: only these pairs run P1
+                wh[i].fill(wb[i], group=tg)
+            QOBJ, KVPLAN = {qobj!r}, {kvplan!r}
+            QBASE, HPCC = {qbase!r}, {hpcc!r}
+            for i in range({p1pairs}):
+                p1h[i].drain(qb[i], wait=True, group=tg,
+                             offset=QBASE[i] * {OBJ},
+                             sizes=[1, HPCC[i], 2, {OBJ}],
+                             strides=[0, {OBJ}, HPCC[i] * {OBJ}, 1])
+                for _kind, _base in KVPLAN[i]:
+                    if _kind == "k":
+                        p1h[i].drain(cb[i], wait=True, group=tg,
+                                     offset=2 * (({kv_obase} + _base) * {SLOT}
+                                                 + {off}),
+                                     sizes=[1, 2, {HEAD}, 4],
+                                     strides=[0, 2 * {SLOT}, 2 * {TSEQ}, 1])
+                    else:
+                        p1h[i].drain(cb[i], wait=True, group=tg,
+                                     offset=2 * (({kv_obase} + _base) * {SLOT}
+                                                 + {KTILE} + {kv_in} * {HEAD}),
+                                     sizes=[1, 2, 1, 2 * {OBJ}],
+                                     strides=[0, 2 * {SLOT}, 0, 1])
+            tg.finish()
 
-        # ---- P2 ----------------------------------------------------------
-        tg = TaskGroup()
-        bch.fill(kvb[0], group=tg)          # the broadcast now carries q'
-        for i in range(a):
-            # the host caches follow the `a` q' broadcast buffers, so they
-            # start at kvb[a] — `kvb[1 + i]` only happened to be right when
-            # apairs was 1 (NATT=2) and silently read a q' buffer as a cache
-            # at NATT=4.
-            src = kvb[a + i] if {HOSTKV} else cb[i]
-            # One fill per KV object. A single strided fill cannot express this:
-            # the 2*OPERAND run decomposes into 6 x 3424, which uses up the BD's
-            # dimensions and pushes the object stride into the repeat-count slot
-            # ("Do not include the highest dimension size in transfer length").
-            for _j in range({nobj}):
-                wh[n - a + i].fill(src, group=tg,
-                       offset=2 * i * {OPERAND} + _j * {NATT} * {OPERAND},
-                       sizes=[1, 1, 1, 2 * {OPERAND}], strides=[0, 0, 0, 1])
-        for i in range(a):
-            p2h[i].drain(ab[i], wait=True, group=tg,
-                         offset=i * 2 * {GQA} * {HEAD},
-                         sizes=[1, 1, 1, 2 * {GQA} * {HEAD}],
-                         strides=[0, 0, 0, 1])
-        tg.finish()
+            # ---- P2 ----------------------------------------------------------
+            tg = TaskGroup()
+            bch.fill(kvb[0], group=tg)          # the broadcast now carries q'
+            for i in range(a):
+                # the host caches follow the `a` q' broadcast buffers, so they
+                # start at kvb[a] — `kvb[1 + i]` only happened to be right when
+                # apairs was 1 (NATT=2) and silently read a q' buffer as a cache
+                # at NATT=4.
+                src = kvb[a + i] if {HOSTKV} else cb[i]
+                # One fill per KV object. A single strided fill cannot express this:
+                # the 2*OPERAND run decomposes into 6 x 3424, which uses up the BD's
+                # dimensions and pushes the object stride into the repeat-count slot
+                # ("Do not include the highest dimension size in transfer length").
+                for _j in range({nobj}):
+                    wh[n - a + i].fill(src, group=tg,
+                           offset=2 * i * {OPERAND} + _j * {NATT} * {OPERAND},
+                           sizes=[1, 1, 1, 2 * {OPERAND}], strides=[0, 0, 0, 1])
+            for i in range(a):
+                p2h[i].drain(ab[i], wait=True, group=tg,
+                             offset=i * 2 * {GQA} * {HEAD},
+                             sizes=[1, 1, 1, 2 * {GQA} * {HEAD}],
+                             strides=[0, 0, 0, 1])
+            tg.finish()
 
-        # ---- P3 -----------------------------------------------------------
-        # The broadcast's THIRD fill: attention output, then the residual
-        # stream. Same refill mechanism as the first two (activation, q'),
-        # which chain_probe.py verified across a phase boundary.
-        p3b = args[base3]
-        w3b = [args[base3 + 1 + i] for i in range(n)]
-        hb = [args[base3 + 1 + n + i] for i in range(n)]
-        tg = TaskGroup()
-        bch.fill(p3b, group=tg)
-        for i in range(n):
-            wh[i].fill(w3b[i], group=tg)
-        for i in range(n):
-            # Scatter each pair's h into NATURAL row order so P4 can be filled
-            # straight from it. A pair's object is [core j][tile t][row r] and
-            # core (pr, j) owns rows pr*rpp3 + t*2*NROWS + j*NROWS + r, so the
-            # permutation is a plain 3-level stride -- the same trick the P4
-            # drain uses for sw.
-            p1h[i].drain(hb[i], wait=True, group=tg,
-                         offset=i * 2 * {NROWS} * {p3tiles},
-                         sizes=[1, 2, {p3tiles}, {NROWS}],
-                         strides=[0, {NROWS}, {2 * NROWS}, 1])
-        tg.finish()
+            # ---- P3 -----------------------------------------------------------
+            # The broadcast's THIRD fill: attention output, then the residual
+            # stream. Same refill mechanism as the first two (activation, q'),
+            # which chain_probe.py verified across a phase boundary.
+            p3b = args[base3]
+            w3b = [args[base3 + 1 + i] for i in range(n)]
+            hb = [args[base3 + 1 + n + i] for i in range(n)]
+            tg = TaskGroup()
+            bch.fill(p3b, group=tg)
+            for i in range(n):
+                wh[i].fill(w3b[i], group=tg)
+            for i in range(n):
+                # Scatter each pair's h into NATURAL row order so P4 can be filled
+                # straight from it. A pair's object is [core j][tile t][row r] and
+                # core (pr, j) owns rows pr*rpp3 + t*2*NROWS + j*NROWS + r, so the
+                # permutation is a plain 3-level stride -- the same trick the P4
+                # drain uses for sw.
+                p1h[i].drain(hb[i], wait=True, group=tg,
+                             offset=i * 2 * {NROWS} * {p3tiles},
+                             sizes=[1, 2, {p3tiles}, {NROWS}],
+                             strides=[0, {NROWS}, {2 * NROWS}, 1])
+            tg.finish()
 
-        # ---- P4 -----------------------------------------------------------
-        p4b = args[base4]
-        w4b = [args[base4 + 1 + i] for i in range(n)]
-        swb = [args[base4 + 1 + n + i] for i in range(n)]
-        tg = TaskGroup()
-        bch.fill(p4b, group=tg)
-        for i in range(n):
-            wh[i].fill(w4b[i], group=tg)
-        for i in range(n):
-            p1h[i].drain(swb[i], wait=True, group=tg,
-                         offset=i * {rpp4},
-                         sizes=[1, {p4objs}, 2, {OBJ}],
-                         strides=[0, {OBJ}, {rpp4} // 2, 1])
-        tg.finish()
+            # ---- P4 -----------------------------------------------------------
+            p4b = args[base4]
+            w4b = [args[base4 + 1 + i] for i in range(n)]
+            swb = [args[base4 + 1 + n + i] for i in range(n)]
+            tg = TaskGroup()
+            bch.fill(p4b, group=tg)
+            for i in range(n):
+                wh[i].fill(w4b[i], group=tg)
+            for i in range(n):
+                p1h[i].drain(swb[i], wait=True, group=tg,
+                             offset=i * {rpp4},
+                             sizes=[1, {p4objs}, 2, {OBJ}],
+                             strides=[0, {OBJ}, {rpp4} // 2, 1])
+            tg.finish()
 
     at = [bc_ty] + [w_all_ty] * {p1pairs} + [kvin_ty] * {apairs}
     at += [cache_ty] * ({apairs} if {HOSTKV} else 0)

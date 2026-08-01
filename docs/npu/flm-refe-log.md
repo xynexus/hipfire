@@ -11050,3 +11050,56 @@ new weights per layer rather than re-loaded with new code.
 So the redesign target is not "fit five phases in one dispatch". It is **"configure
 once, iterate layers by parameter"** — which is a different program entirely, and
 the one worth building.
+
+## 2026-08-01 — one dispatch, sixteen layers: MEASURED, and it clears FLM
+
+Acting on the dispatch-count finding. The core bodies and the host sequence are
+now wrapped in a layer loop (`CHAIN_NLAY`), so one dispatch iterates the layer N
+times. Weights are reused across iterations — this measures the MECHANISM and its
+cost, not a correct 16-layer result.
+
+     N   total us   marginal us
+     1      614.6
+     2     1180.4     565.8
+     4     2279.9     549.8
+     8     4586.9     576.7
+    16     8936.0     543.6
+
+Linear, and the marginal layer costs **~555 us against 614.6 us for the first**.
+The ~60 us difference is the dispatch floor, recovered on every layer after the
+first.
+
+**Side A, 16 layers: 9834 us as 16 dispatches -> 8936 us as ONE.** I projected
+8941 from the N<=4 slope before measuring; the measurement came in at 8936, within
+0.06%. Worth noting because three earlier projections this session were wrong —
+this one was checked rather than trusted.
+
+Correctness is unchanged at N = 2, 4 and 16: q' 0.0000e+00, P3 h 9.5367e-07,
+P4 sw 2.08% of peak, attention within envelope — identical to N=1, as it must be
+when each iteration is fed the same inputs.
+
+### Where this lands
+
+    today (32 dispatches)        17.79 ms -> 56.2 tok/s
+    side A looped (17 dispatch)  16.89 ms -> 59.2 tok/s
+    both sides looped (2)        15.99 ms -> **62.5 tok/s**
+    FLM measured                             61.18 tok/s
+
+Side B's figure is projected from side A's measured per-layer saving; the loop is
+not yet written for it. But side A alone — measured, no projection — already
+takes this from 56.2 to 59.2.
+
+**The remaining gap to FLM was never the kernels.** The arithmetic has been at
+parity for some time; what was missing was that a layer is not the dispatch unit.
+
+### What this does NOT yet show
+
+  * Weights are **reused** across iterations. A real 16-layer token needs 16 sets
+    of weight tensors and 16x the host fills. DMA volume per layer is unchanged so
+    the timing should hold, but the instruction stream grows 16x and that is
+    untested at full weight variety.
+  * The residual must chain layer to layer on device. Today each iteration is fed
+    the same `x`.
+  * Side B's loop is unwritten.
+
+None of those are walls of the kind this session kept hitting — they are work.
