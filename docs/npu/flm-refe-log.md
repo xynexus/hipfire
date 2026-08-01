@@ -12204,3 +12204,34 @@ Both groups now measured on real weights:
     group A   P1 on 8 cores, per-core fifos   191.2 us  (124.0 compute)  PASS
     group B   P2 on 8 cores, 8 KV groups       92.3 us  ( 25.1 compute)  PASS
     group C   P3+P4+P5 on 16 cores             — the working design's phases
+
+### The A -> B interface needs no kernel change
+
+Checking the seam before writing it, because q' delivery is the operand that
+produced the 1.0496e-01 bug once already.
+
+The attention kernel reads `q[h * QSTRIDE + d]` for `h` in `0..GQA-1`, at an
+offset from `kv_qoff()` — which is the KV tile's trailer when `QOFF_FROM_KV=1`,
+and **0** otherwise. In the paired design the trailer carried a global offset
+because one broadcast held all 32 heads and a core had to find its own four.
+
+Under the role split there is no global block: A[j] streams its own four heads to
+B[j] and nothing else. So:
+
+    QOFF_FROM_KV = 0      offset 0 — B reads from the start of its own stream
+    DIM_QSTRIDE  = 2*HEAD each head occupies OBJ, HEAD live, as A emits it
+
+And the ordering already agrees, head for head:
+
+    A0 emits [0,1,2,3]      B0 needs [0,1,2,3]      match
+    A1 emits [4,5,6,7]      B1 needs [4,5,6,7]      match
+    ...                                             all 8 match
+
+So the seam is plumbing only — no kernel edit, no shuffle, no trailer. That falls
+out of having chosen the head layout to follow the role split, which cost nothing
+because `head_layout(8)` already produced it.
+
+Worth contrasting with the paired design, where q' had to ride the broadcast fifo
+with a per-core offset in the KV trailer, and reading it from the wrong fifo was a
+bug that survived a host-built cache *and* a host-built q'. The role split deletes
+that machinery rather than reimplementing it.
