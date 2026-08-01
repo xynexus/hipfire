@@ -14920,3 +14920,114 @@ weights arriving.
 That is the whole tree consistent on one set of code, with the headline result — sixteen
 device layers producing the oracle's token — reproduced after the last change rather than
 inherited from before it.
+
+### The shim budget is 16 in / 16 out, and nothing had ever measured it
+
+The fusion argument's prerequisite list said every constraint was measured. One of them
+had not been identified at all.
+
+`channel_probe.py` builds 12 fills and 12 drains, so its "40 in / 36 out places" is about
+**memtile** channels only. The shim is a separate budget and the union needs far more of
+it than either design alone:
+
+    in   A bc 1 + A w 4 + B kvin 8 + C bc 1 + C w 8  = 22
+    out  A kv 8 + B ao 2 + C p1 8                    = 18
+
+A probe of N shim->core fills and M core->shim drains, one core each, trivial bodies:
+
+    22 in / 18 out   ->  no ShimNOCTile has sufficient DMA capacity for
+                         0 input/1 output channels near centroid column 1
+    17 in / 16 out   ->  same
+    16 in / 16 out   ->  PLACES, ROUTES AND LOADS
+
+NPU2 is 8 columns x 6 rows, so 8 shim tiles x 2 channels each way is exactly 16/16. The
+log already contained the number — "eight would put the shim at 16 of 16 outputs" — as a
+remark about one fifo, never as a budget the fused design would have to fit.
+
+Three consolidations fit it, and none of them touches a core:
+
+    A weights   4 fifos split 1->2  ->  2 fifos split 1->4    (host packs 4-wide)
+    B KV in     8 fifos, unsplit    ->  2 fifos split 1->4    (slots are contiguous)
+    A k'/v' out 8 fifos, unjoined   ->  4 joins 2->1
+
+giving 14 in / 14 out and 44 memtile in / 38 out. The k'/v' drain needed no new shape at
+all: its second dimension is the KV-head stride and was already there, sized 1.
+
+That exact topology — 41216 B quad objects, 20608 B pair objects, two broadcasts, 32
+cores — places, routes, loads and runs.
+
+The general point is the one this log keeps making in new forms. The prerequisite that
+fails is not the one on the list that turns out false; it is the one that was never on
+the list, because nothing in the two existing designs came close enough to it to make it
+visible. Each half used 13 and 9 shim inputs against a budget of 16, so neither could
+have found it.
+
+### THE FUSED SINGLE DISPATCH EXISTS
+
+`tools/npu/flm/fused.py`. One design, 32 cores, one dispatch, the layer loop inside the
+instruction sequence: 8 P1 cores, 8 P2 cores, 16 C cores, five TaskGroup barriers per
+layer.
+
+The kernels are untouched. What moved is descriptor plumbing plus two compile flags that
+select branches already present in `flm_gemv_down.cc`:
+
+  * `RESID_FROM_STASH=1` gives P5 the `h` that P3 stashed. `flm_gemv_q4_1_residual`
+    already writes every row it produces into `g_resid` unconditionally, and P3 and P5 use
+    the SAME row assignment on the same core, so the residual needs no transport — only
+    the flag that reads it there. It is a different flag from `P3_RESID_FROM_STASH`, which
+    stays 0: at layer 0 the stash holds nothing and `x` has to come from the host.
+  * `XOUT_TO_STASH=1` leaves x_out in that same stash, and `flm_h_emit` — already linked,
+    P3 calls it — copies a core's whole 128-row slice into ONE object. P5's drain goes
+    from 16384 elements per pair, 6% of them live, to 256 dense ones with exactly P3's
+    shape.
+
+The C -> A seam is closed by a host block layout rather than by a second drain:
+
+    [ attn(2048) | x(2048) | nw(2048) | cs_q(64) | cs_k(64) ]     6272 bf16 per layer
+
+P3's broadcast is the first 4224 elements (activation `attn`, aux `x`); P1's is the 4224
+starting at 2048 (`x`, `nw`, `cs_q`, `cs_k`). Layer L's P5 drains x_out into block L+1's
+x slot and both fills read it there. A drain has one destination, and without this layout
+x_out would have needed two.
+
+First correctness, one layer, from the BOS embedding at position 0, every phase against a
+reference chain that starts at x0 and never reads a device value:
+
+    L0  attn  1.0986e-03 / 3.2618e-03      h      1.9531e-03 / 2.4489e-03
+        sw    3.1250e-02 / 1.3063e+00      x_out  3.1250e-02 / 1.6320e-01
+    device x1 vs host chain   cosine 0.999978
+    device x1  mean 0.08349  max 20.875
+    oracle x1  mean 0.08315  max 20.944
+
+The reference is `host_forward.layer` with its intermediates exposed, and the harness
+asserts the copy is bit-identical to `host_forward.layer` at layer 0, so the duplication
+that produced five faults this session cannot recur silently here.
+
+**Fusing DID add code to a core**, contrary to the prerequisite list:
+
+    P1 cores   9040 B   55.2%
+    P2 cores   5824 B   35.5%
+    C cores   15712 B   95.9%      against group_c standalone at 14352 B / 87.6%
+
++1360 B on C, from the `flm_h_emit` call site in P5 plus the layer loop, leaving 672 B of
+headroom. "Each core's ELF holds only its own role's code, so fusing adds code to no core"
+was true of the roles and false of the loop that runs them. It fits; it is now the
+tightest thing in the design.
+
+What this build does not do: position is still a BUILD parameter, so it is verified at
+pos 0 only, where the KV cache holds exactly the one entry this design's own P1 wrote.
+Multi-token decode needs `offset_parameter=` with a `ParameterScratchpad`, which is the
+host-side restructuring recorded earlier and is not done here.
+
+### A Python 3.14 trap that looks like a toolchain bug
+
+    ValueError: unmarshallable object
+      _hash.py:79 in _code_identity -> marshal.dumps(_without_location(code), 4)
+
+before a line of MLIR is emitted. The cause is a **literal slice** in the design source:
+`args[:10]`. Python 3.14 folds it into a code constant, and iron pins `marshal` version 4
+because "marshal.version is 4 through 3.13 and 5 from 3.14" — and version 4 cannot encode
+a `slice`. Unpack index by index instead.
+
+Nothing in this tree had hit it because no existing design slices its argument tuple with
+a constant. It cost one build here and will cost the next person one.
