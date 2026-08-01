@@ -38,7 +38,13 @@ from aie.iron.kernel import ExternalFunction  # noqa: E402
 from aie.utils.benchmark import run_iters  # noqa: E402
 from ml_dtypes import bfloat16  # noqa: E402
 
-from ffn_verify import load_linear  # noqa: E402
+# Weights in CHECKPOINT order. ffn_verify.load_linear returns the container's own
+# row order, which measures corr 0.001 / relF 1.52 against the real checkpoint --
+# uncorrelated, not merely permuted. Every check here passed anyway because the
+# host references read the same wrong tensor. q4nx_tensor_blocks was written
+# beside q4nx_decode_tensor for exactly this and was never wired in.
+def load_linear(c, name, N, K):  # noqa: E302
+    return q4nx.q4nx_tensor_blocks(c, name, (N, K))
 
 KDIR = Path(__file__).resolve().parents[3] / "kernels/npu"
 DOWN_SRC = str(KDIR / "flm_gemv_down.cc")

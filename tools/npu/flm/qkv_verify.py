@@ -45,7 +45,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 import q4nx  # noqa: E402
-from ffn_verify import load_linear  # noqa: E402
+# Checkpoint-order weights. The container's own row order is uncorrelated with
+# the model (corr 0.001). q4nx_tensor_blocks picks the stride-2 RoPE interleave
+# for q_proj/k_proj automatically, so the rows it returns are checkpoint rows --
+# which means the kernel's half-split RoPE may no longer match the packing it
+# used to receive. That is what this change has to be tested for, not assumed.
+def load_linear(c, name, N, K):  # noqa: E302
+    return q4nx.q4nx_tensor_blocks(c, name, (N, K))  # noqa: E402
 
 import aie.iron as iron  # noqa: E402
 from aie.iron import (CompileTime, In, ObjectFifo, Out, Program, Runtime,  # noqa: E402

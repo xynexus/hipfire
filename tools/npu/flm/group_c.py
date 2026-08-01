@@ -47,7 +47,13 @@ from qkv_verify import HEAD, K_DIM, EPS, ROPE_THETA, qkv_rows, rope_ref  # noqa:
 # KVPER 2->1 costs nothing (medians 27.4 -> 19.9 us, ranges overlapping).
 NROWS = 8
 TPH = HEAD // NROWS
-from ffn_verify import load_linear  # noqa: E402
+# Weights in CHECKPOINT order. ffn_verify.load_linear returns the container's own
+# row order, which measures corr 0.001 / relF 1.52 against the real checkpoint --
+# uncorrelated, not merely permuted. Every check here passed anyway because the
+# host references read the same wrong tensor. q4nx_tensor_blocks was written
+# beside q4nx_decode_tensor for exactly this and was never wired in.
+def load_linear(c, name, N, K):  # noqa: E302
+    return q4nx.q4nx_tensor_blocks(c, name, (N, K))
 from p1_route import (NQ, NK, NV, NCORES, HPC, heads_of, rnd,  # noqa: E402
                       head_layout, hpc_for, drain_plan)
 
