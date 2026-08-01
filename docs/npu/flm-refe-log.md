@@ -14424,3 +14424,35 @@ unexpressible (4-byte alignment), and the v pair points forward while the k pair
 backward. What is retracted: that multi-token decode cannot work as the design stands.
 It can; the test cannot, without either running positions in sequence or seeding
 `g_kprev`.
+
+### Multi-token decode has a structural blocker: position is a BUILD parameter
+
+`build(pos, ...)` — the position is interpolated into the design source and lands in the
+drain offsets:
+
+    offset = 2 * (_base * KVSTRIDE + {off})           # k, off = pos - (pos & 1)
+    offset = 2 * (... + KTILE + {pos} * HEAD)         # v
+
+So each position is a different xclbin. That collides directly with the mechanism that
+makes the K pair correct: `g_kprev` lives in **core .bss, which survives only while the
+xclbin stays loaded**. Loading the next position's design resets it, and the first odd
+position after each load writes a stale or zero k' into the column below it.
+
+The two facts are individually fine and jointly fatal:
+
+  * the K column pair must be closed with the previous token's k', which only the core
+    that computed it has
+  * every position is a separate build, and a new build clears the core memory holding it
+
+So a real decode needs **one xclbin serving every position**, with the position supplied
+at runtime rather than baked into the descriptors. Whether the fill/drain API can express
+a runtime offset is the question that decides it; nothing here has tried.
+
+This is why the multi-position tests kept needing a host-built cache: not laziness in the
+harness, a property of the designs. And it is a second structural item alongside the
+fused dispatch — the fused design would have to carry a runtime position too, since it
+runs all sixteen layers of one token and then the next token needs pos+1.
+
+Recording rather than attempting: this is a design question about the runtime API, not a
+bug to patch, and today has already produced three claims I had to withdraw for reasoning
+past what I had measured.
