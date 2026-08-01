@@ -14224,3 +14224,33 @@ different tokens. `groups_ab` measures the device against its reference at 0.5-2
 over many positions, and that reference is now externally validated for the same math,
 so the two links exist. What has never run is a multi-position sequence where the cache
 was filled by the device across successive tokens rather than staged by the host.
+
+### Attention on a REAL multi-position cache: 55 ULP, cause not yet established
+
+`AB_REAL_CACHE` fills positions 0..pos-1 with the k'/v' of real tokens instead of
+leaving them zero. At pos 3 with four real tokens:
+
+    attn  1.7886e-01  vs tol 6.5002e-03   (55.03 ULP)
+    k'    0.0000e+00      v'  5.9605e-08
+
+Against 0.50 ULP on the zero-filled cache. So the device and its reference agree closely
+when every prior V is zero and disagree by 55 ULP when they are not.
+
+**This does not yet mean attention is broken.** The device reads the cache bytes this
+harness writes; the reference reads `prior_kv` directly. If the cache write puts the
+data somewhere the device does not look — wrong tile, wrong rotation, wrong permutation
+— the two disagree and the device may be entirely correct. That is a harness fault and
+it looks identical from here.
+
+What the zero cache was hiding is worth stating separately, because it is real either
+way: with prior V all zero, the attention output is the current position's V scaled by
+its own softmax weight. The online rescaling runs, but every term it rescales is zero.
+Thirty-one entries of that constrain almost nothing, and every "attention passes at pos
+30" result in this log rests on it.
+
+The discriminating test is to compute the reference from the **cache bytes** rather than
+from `prior_kv`. If that matches the device, the write is wrong and the device is fine;
+if it still disagrees, the fault is in the device's online softmax. Until then this is
+one measurement with two candidate causes, and the harness is the one I would bet on —
+it is new, it is mine, and today's score is five harness or reference faults to zero
+device faults.

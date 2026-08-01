@@ -588,6 +588,46 @@ def main():
     # trailer is what left attention off by its own magnitude.
     npad = TSEQ * nobj * KVPER - (o.pos + 1)
     cache_np = np.zeros(8 * KVSTRIDE * 2, np.uint8)
+    # AB_REAL_CACHE=tok,tok,...  fills positions 0..pos-1 with the k'/v' of real
+    # tokens instead of leaving them zero. Without it the device attends over
+    # `pos` ZERO entries plus one real one: the online softmax and its rescaling
+    # run, but on data where every prior V is 0, so the output is the real
+    # entry's V scaled by its own weight. That exercises the machinery and
+    # constrains almost nothing about it.
+    prior_kv = None
+    if os.environ.get("AB_REAL_CACHE"):
+        _toks = [int(t) for t in os.environ["AB_REAL_CACHE"].split(",")]
+        assert len(_toks) > o.pos, f"need > {o.pos} tokens, got {len(_toks)}"
+        _emb = c.bf16("model.embed_tokens.weight").astype(np.float32).reshape(-1, K_DIM)
+        _inv = (1.0 / ROPE_THETA ** (np.arange(0, HEAD, 2) / HEAD)) / divisor
+        _pm = np.concatenate([np.arange(0, HEAD, 2), np.arange(1, HEAD, 2)])
+        _un = np.argsort(_pm)
+        prior_kv = []
+        for _p in range(o.pos):
+            _x = _emb[_toks[_p]].astype(np.float64)
+            _h = rnd(_x / np.sqrt((_x * _x).mean() + EPS) * nw)
+            _kk = np.empty((8, HEAD), np.float32)
+            _vv = np.empty((8, HEAD), np.float32)
+            for _g in range(8):
+                _d, _m, _q = qkv_rows(c, o.layer, 2048 + _g * HEAD, HEAD)
+                _kk[_g] = q4nx.gemv_reference_bf16(_h, _d, _m, _q)
+                _d, _m, _q = qkv_rows(c, o.layer, 2560 + _g * HEAD, HEAD)
+                _vv[_g] = q4nx.gemv_reference_bf16(_h, _d, _m, _q)
+            # rotate in Meta order (rows arrive permuted), then re-permute
+            _a = _p * _inv; _co, _si = np.cos(_a), np.sin(_a)
+            _u = _kk[:, _un].copy()
+            _r = np.empty_like(_u)
+            _r[:, 0::2] = _u[:, 0::2] * _co - _u[:, 1::2] * _si
+            _r[:, 1::2] = _u[:, 1::2] * _co + _u[:, 0::2] * _si
+            prior_kv.append((rnd(_r[:, _pm]), rnd(_vv)))
+        _cv = cache_np.view(np.dtype("uint16"))
+        for _p, (_k, _v) in enumerate(prior_kv):
+            for _g in range(8):
+                _b = _g * KVSTRIDE
+                _cv[_b:_b + KTILE].reshape(HEAD, TSEQ)[:, _p] = \
+                    np.asarray(_k[_g], dtype=bfloat16).view(np.uint16)
+                _cv[_b + KTILE:_b + KTILE + TSEQ * HEAD].reshape(TSEQ, HEAD)[_p] = \
+                    np.asarray(_v[_g], dtype=bfloat16).view(np.uint16)
     for _g in range(8):
         _off = _g * OPERAND + OPERAND - 60
         cache_np[_off:_off + 4] = np.array([float(npad)], np.float32).view(np.uint8)
@@ -646,6 +686,9 @@ def main():
         Vf = np.zeros((o.pos + 1, HEAD), np.float64)
         Kf[o.pos] = ref[NQ + a]                 # k' A just wrote
         Vf[o.pos] = ref[NK + a]                 # v' likewise
+        if prior_kv is not None:                # real prior positions, not zeros
+            for _p, (_k, _v) in enumerate(prior_kv):
+                Kf[_p], Vf[_p] = _k[a], _v[a]
         qr = np.stack([ref[GQA * a + sl] for sl in range(GQA)])[:, :HEAD]
         # q' already carries 1/sqrt(d) * log2(e) from cs_q
         sc = (qr @ Kf.T) / math.log2(math.e)
