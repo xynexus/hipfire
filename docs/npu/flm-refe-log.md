@@ -11657,3 +11657,42 @@ combination. If the real scaffolding for four bodies is 4.4 KB rather than 4.0,
 Worth attempting before the restructure regardless: adding P5's body and fills to
 `p1p2_chain` is a fraction of the quad rewrite, and if it overflows the restructure
 is still there. The plan's step 4 has effectively become step 1.
+
+### The shortcut is closed: five phases overflow, measured on the real build
+
+Adding P5's kernel and body to both core types and building:
+
+    (37/42) cdo: [AIE ERROR] _XAie_LoadProgMemSection():231:
+            Overflow of program memory
+
+So the probe's ~4 KB correction was optimistic and `1,3,4,5` does not fit. That is
+a **measurement now**, not an estimate, and it closes the shortcut.
+
+**But look where it failed: stage 37 of 42.** Routing, placement, DMA capacity,
+memtile allocation — everything else in a five-phase single-dispatch design at 16
+cores passes. The only thing that fails is the core ELF being too big.
+
+That narrows the problem precisely: **a valid single-dispatch token needs fewer
+bodies per core, and nothing else.** No memtile work, no routing work, no
+32-core migration — at 16 cores.
+
+### Which makes the real trade explicit
+
+Role groups have to divide the row count: `2048 / (n * NROWS)` must be integral, so
+n must divide 256 — **16, 8, 4 work; 12 does not.** That rules out "attention cores
+skip the FFN" style splits at 16 cores, since the remainder is 12.
+
+The clean 16-core split is 8 + 8:
+
+    group A (8 cores)  P1 + P2 + P3    3 bodies, fits
+    group B (8 cores)  P4 + P5         2 bodies, fits
+
+Both fit comfortably. But every phase then runs on 8 cores instead of 16, roughly
+doubling the marginal layer from 744 us — worse than the two-dispatch design it
+replaces.
+
+**So role specialisation only pays at 32 cores**, where each group keeps 16 cores
+and parallelism is unchanged. Which puts the quad restructure back as the required
+path, exactly as the plan had it — but now for a measured reason rather than an
+assumed one, and with the knowledge that everything except program memory already
+works at five phases.
