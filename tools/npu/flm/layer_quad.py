@@ -31,8 +31,25 @@ Derived from `p1p2_chain` rather than written fresh, because the layer-loop
 machinery, per-layer weight offsets and composed seams in it are all measured and
 worth keeping. What changes is the operand argument layout.
 
-**Status: incomplete.** `p1p2_chain` remains the working design; this file is the
-restructure in progress and is not expected to run yet.
+**Status: PROVEN NOT TO WORK, kept as the record.** It builds through kernel
+compilation and fails in placement:
+
+    no MemTile has sufficient DMA capacity for 4 input/1 output channels
+
+The reason is arithmetic, not a bug. A w-way join costs w inputs and there are
+cores/w of them, so the join side costs exactly `cores` input channels at ANY
+width; only splits shrink. At 32 cores that is 32 (P1/P3/P4 outputs) + 8
+(attention outputs) = 40 of a ~48 budget across 8 memtiles, leaving 8 for every
+operand split. 4-way lands on exactly 48; 8-way splits would total 44 but 8-way was
+separately measured to exceed a memtile's outputs.
+
+So no split width fits 32 cores while every core emits its own result through a
+memtile join. Fixing it means changing which cores emit at all — core-to-core
+streams between role groups, which do not traverse a memtile. That is FLM's shape
+(mvm/proj/attn_qk/attn_kv with npu_dma_wait sequencing), and a different program
+from this one.
+
+`p1p2_chain` remains the working design.
 """
 
 import argparse

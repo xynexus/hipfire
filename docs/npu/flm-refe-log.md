@@ -11737,3 +11737,39 @@ distributed, which is a different kind of change from the one planned.
 Recorded rather than worked around. `flm_h_emit` is now correctly parameterised by
 `DIM_GROUP` (2 or 4) and `p1p2_chain` is verified unaffected — q' 0.0000e+00,
 P3 h 9.5367e-07, sw 2.08% of peak — so that part of the work stands.
+
+### Why widening cannot fix this: joins cost one input per CORE, at any width
+
+    cores  way  splits  p1 joins  p2 joins  total in   (budget 48)
+      16    2       8        16         4        28    works today
+      32    2      16        32         8        56    fails
+      32    4       8        32         8        48    exactly full
+      32    8       4        32         8        44    still no real slack
+
+**A join costs `w` inputs and there are `cores / w` of them, so the join side
+always costs exactly `cores` input channels.** Widening moves nothing there; only
+the split side shrinks. At 32 cores the joins alone are 32 + 8 = 40 of a 48
+budget, leaving 8 for every operand split in the design. 8-way splits would give
+44 total — under, but 8-way was measured to fail on its own (1-in/8-out exceeds a
+memtile's outputs).
+
+So no choice of split width makes 32 cores fit while every core emits its own
+result stream through a memtile join. That is the structural statement, and it
+holds regardless of how the operands are grouped.
+
+### Which points at what FLM actually does
+
+`mvm_tiles`, `proj_tiles`, `attn_qk_tiles`, `attn_kv_tiles` are not just four
+groups — they are four groups where **intermediate results move between groups**.
+A core-to-core stream does not traverse a memtile at all, so it costs nothing from
+this budget. If only the projection tiles emit to shim and the mvm tiles feed them
+directly, the join count collapses from `cores` to `proj_cores`.
+
+That is a different architecture from "the same phases, wider fifos": it changes
+which cores produce host-visible output. It is also what `npu_dma_wait(tiles,
+direction, channel)` in FLM's ABI implies — explicit per-group, per-channel
+sequencing rather than one fifo per core group.
+
+**Status:** the quad restructure is complete enough to have proven it cannot work,
+and stops here. `layer_quad.py` stays in the tree as the record of that, with the
+channel arithmetic in its docstring. `p1p2_chain` remains the working design.
