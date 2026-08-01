@@ -14767,3 +14767,34 @@ one-line change to a drain call.
 This is worth knowing before the fused design is written rather than after, which is the
 whole reason for probing a mechanism instead of reading its signature and assuming. The
 signature said yes; the calling convention says yes with a cost attached.
+
+### Runtime drain offsets VERIFIED on this hardware
+
+Rather than write host XRT code to prove the mechanism, upstream's own test was built and
+run here:
+
+    aiecc -v --get-full-elf --no-xchesscc --no-xbridge --dynamic-objFifos \
+          --get-scratchpad-parameters aie.mlir
+    -> aie.elf, params.txt:  "input_offset 0 i32 addr"
+
+    pytest test/python/npu-xrt/scratchpad_addr_offset/test.py
+    -> 3 passed
+
+Three different runtime offsets (0, 8, 16), each patching the DMA's start address without
+a rebuild, each verified against expected output. So the mechanism the fused design and
+multi-token decode both need is not merely an API signature — it works on this machine.
+
+That closes the question opened three entries ago. Position can be a runtime value; one
+xclbin serves every position; `g_kprev` survives because nothing is reloaded. The cost
+stands as recorded: it requires `ParameterScratchpad` and explicit `pyxrt` buffer binding
+rather than `iron.jit(design)(a, b)`.
+
+One environmental trap, since it cost a build here and will cost the next person one:
+`aiecc` picked up **ROCm's** `opt` from `/opt/rocm/lib/llvm/bin` and failed with
+`unrecognized architecture 'aie2p'`. The llvm-aie toolchain has to precede ROCm on PATH:
+
+    export PATH=~/.venv/lib/python3.14/site-packages/llvm-aie/bin:...:$PATH
+
+`iron.jit` sets this up itself, which is why no design in this tree has ever hit it — it
+only appears when driving `aiecc` by hand, which is exactly what adopting runtime offsets
+would require.
