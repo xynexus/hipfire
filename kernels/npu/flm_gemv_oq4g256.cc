@@ -38,12 +38,30 @@
 // the codes start at a natural boundary with nothing wasted.
 //
 // AGAINST THE COARSE TIER, which this is deliberately shaped to be comparable
-// to: that kernel carries ONE scale for a whole output row and reduces its
-// accumulator once. This carries K/256 = 8 scales per row and therefore
-// reduces 8 times per row. That is the only arithmetic difference, and on a
-// design running at 97% of the fabric roof it should be invisible — which is
-// itself part of what this measures. If 8x the reductions DID show up, the
-// format would be paying for its finer scales in time as well as bytes.
+// to: that kernel carries ONE scale for a whole output row. This carries
+// K/256 = 8 per row, and HOW those scales are applied turned out to be worth
+// more than everything else in this file. Measured at lm_head size, same tile,
+// same loads, interleaved in one process against a 55.3 GB/s coarse control:
+//
+//   one reduce_add per GROUP (128 a tile)                    16.3 GB/s
+//   group accum folded into a row accum by broadcast FMA     31.4
+//   ... with the 4-iteration inner loop fully unrolled       35.5
+//   scale folded into the WEIGHTS, ONE row accumulator       55.5   <- shipped
+//
+// The last row is at the ceiling: +0.4% on the coarse tier and +0.1% on a
+// control that streams this exact tile with coarse arithmetic. So a per-256
+// group scale costs NOTHING in time on this hardware — but only in the last
+// formulation, and the first one looked like a verdict on the format itself.
+//
+// WHAT IT COSTS INSTEAD, and this is not free: folding the scale into the
+// weights rounds `scale * code` to bf16 BEFORE the MAC, where folding it into
+// the accumulator scaled an f32 sum after. Against the same host reference
+// (which scales the accumulator) that moves the relative error from 1.651e-03
+// to 3.666e-03 — 2.2x — while the argmax is unchanged at 16309. For a coarse
+// SHORTLIST that is irrelevant; the host rescores exactly. For sixteen chained
+// decoder layers it is a live question, because the errors compound and nobody
+// has measured that here. The accumulator-scaling variant is the accurate one
+// and is preserved in git history at the commit that shipped this.
 //
 // Codes are loaded as native `int4`, not `uint4`: Opus Quant is SYMMETRIC
 // signed, so the sign extension rides the same `vldb.unpack` + `vups.4x` the
@@ -147,41 +165,33 @@ flm_gemv_oq4g256(const bfloat16 *restrict act, const uint8 *restrict wtile,
     }
 #endif
 
+    // VARIANT B: no per-group accumulator at all. The group's scale is folded
+    // into its WEIGHTS as they are unpacked -- one vector multiply per 64 codes
+    // -- and every group MACs into the single row accumulator. That trades the
+    // per-group init + accum->vector SRS + FMA (3 ops a group) for one multiply
+    // per inner iteration (4 a group). More multiplies, but no accumulator
+    // round-trip and no dependency stall between groups.
+    //
+    // Numerically this rounds the scaled weight to bf16 BEFORE the MAC, where
+    // variant A scaled an f32 accumulator after it. That is a real precision
+    // difference and the host reference follows variant A, so the check below
+    // is what decides whether it is acceptable.
     for (int g = 0; g < NG; ++g) {
       const int k0 = g * GROUP;
+      const auto sb = aie::broadcast<bfloat16, 2 * LANES>(
+          static_cast<bfloat16>(scale[r * NG + g]));
 
-      // One 32-lane float accumulator per GROUP, reduced at the group's end.
-      // 32 is forced as well as preferred: a 16-lane float accumulator does not
-      // legalize on this Peano build (`G_FADD <16 x s32>`), recorded in
-      // flm_q4_1_tile.h. Accumulating all NG groups into one vector and scaling
-      // afterwards is not available — each group carries its OWN scale, which
-      // is the entire point of a grouped format.
-      aie::accum<accfloat, LANES> vacc;
-      vacc.from_vector(aie::zeros<float, LANES>());
-
+#pragma clang loop unroll(full)
       for (int i = 0; i < GROUP; i += 2 * LANES) {
-        // 32 bytes loaded AS 64 signed int4 lanes; the hardware widens them to
-        // int8 and converts to bf16. Codes are in [-8, 7], exact in bf16's
-        // 8-bit significand, so nothing is lost before the MAC.
-        //
-        // Alignment holds by construction: qrow is a multiple of QBYTES=1024
-        // from a 64-aligned base, and (k0+i)/2 is a multiple of 32. The 130 B
-        // on-disk block would break exactly this, which is why it is repacked.
         const auto packed = aie::load_v<2 * LANES>(
             reinterpret_cast<const int4 *>(qrow + (k0 + i) / 2));
-        const auto wide = aie::to_float<bfloat16>(aie::unpack(packed));
-        const auto lo = wide.template extract<LANES>(0);
-        const auto hi = wide.template extract<LANES>(1);
-
-        vacc = aie::mac(vacc, lo, aie::load_v<LANES>(act + k0 + i));
-        vacc = aie::mac(vacc, hi, aie::load_v<LANES>(act + k0 + i + LANES));
+        const auto wide = aie::mul(aie::to_float<bfloat16>(aie::unpack(packed)), sb)
+                              .template to_vector<bfloat16>();
+        rowacc = aie::mac(rowacc, wide.template extract<LANES>(0),
+                          aie::load_v<LANES>(act + k0 + i));
+        rowacc = aie::mac(rowacc, wide.template extract<LANES>(1),
+                          aie::load_v<LANES>(act + k0 + i + LANES));
       }
-
-      // Fold this group into the row with its scale broadcast across the lanes.
-      // No reduce here -- that is the whole point.
-      rowacc = aie::mac(rowacc, vacc.template to_vector<float>(),
-                        aie::broadcast<float, LANES>(
-                            static_cast<float>(scale[r * NG + g])));
     }
 
     out[r] = aie::reduce_add(rowacc.template to_vector<float>());
