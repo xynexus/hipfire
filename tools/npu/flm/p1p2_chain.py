@@ -143,6 +143,7 @@ def build(pos, nobj):
     # bytes of ONE layer's weights per pair, per phase — the fill offset
     p3_lsz = 2 * p3tiles * q4nx.tile_bytes(K_DIM, NROWS)
     p4_lsz = 2 * 2 * p4tiles * q4nx.tile_bytes(K_DIM, NROWS)
+    BCN1 = 2 * K_DIM + 2 * HEAD          # one layer's broadcast block
     p4per = OBJ // NROWS                    # steps sharing one result object
     p4objs = p4tiles // p4per               # result objects per core
     rpp4 = D_FF // (NCORES // 2)            # rows a pair owns
@@ -170,7 +171,10 @@ def build(pos, nobj):
     PREP = "flm_asum_prepare" if HOSTNORM else "flm_norm_prepare"
     PREPSRC = str(KDIR / "flm_asum_prepare.cc") if HOSTNORM else NORM_SRC
 
-    bc_ty = np.ndarray[(BC,), np.dtype[bfloat16]]
+    bc_ty = np.ndarray[(BC,), np.dtype[bfloat16]]     # the FIFO OBJECT: one layer
+    # P1's host broadcast buffer holds one block per layer; P3's and P4's are
+    # still single-block, so only the first arg widens.
+    bc_all_ty = np.ndarray[(NLAY * BC,), np.dtype[bfloat16]]
     op_ty = np.ndarray[(OPERAND,), np.dtype[np.uint8]]      # ONE operand type
     oppair_ty = np.ndarray[(2 * OPERAND,), np.dtype[np.uint8]]
     p1o_ty = np.ndarray[(OBJ,), np.dtype[bfloat16]]
@@ -440,7 +444,9 @@ def _design(bc: In, {P}):
 
         for _lay in range({NLAY}):   # one dispatch, NLAY layer iterations
             tg = TaskGroup()
-            bch.fill(bcb, group=tg)
+            bch.fill(bcb, group=tg,
+                     offset=_lay * {BCN1},
+                     sizes=[1, 1, 1, {BCN1}], strides=[0, 0, 0, 1])
             for i in range({p1pairs}):     # partition B: only these pairs run P1
                 wh[i].fill(wb[i], group=tg,
                            offset=_lay * {p1_lsz},
@@ -536,7 +542,7 @@ def _design(bc: In, {P}):
                              strides=[0, {OBJ}, {rpp4} // 2, 1])
             tg.finish()
 
-    at = [bc_ty] + [w_all_ty] * {p1pairs} + [kvin_ty] * {apairs}
+    at = [bc_all_ty] + [w_all_ty] * {p1pairs} + [kvin_ty] * {apairs}
     at += [cache_ty] * ({apairs} if {HOSTKV} else 0)
     at += list(q_tys) + [cache_ty] * {npairs} + [attn_all_ty] * {apairs}
     at += [bc_ty] + [w3_ty] * {npairs} + [h_ty] * {npairs}
@@ -559,7 +565,7 @@ def _design(bc: In, {P}):
               p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty, attn_all_ty=attn_all_ty, w3_ty=w3_ty, h_ty=h_ty, p3tiles=p3tiles,
               w4_ty=w4_ty, sw_ty=sw_ty, p4tiles=p4tiles,
               p4per=p4per, p4objs=p4objs, rpp4=rpp4, D_FF=D_FF,
-              w_all_ty=w_all_ty, kvin_ty=kvin_ty, q_tys=q_tys,
+              w_all_ty=w_all_ty, bc_all_ty=bc_all_ty, kvin_ty=kvin_ty, q_tys=q_tys,
               cache_ty=cache_ty, SKIP_P1=SKIP_P1, HOSTKV=HOSTKV,
               PREP=PREP, PREPSRC=PREPSRC,
               __name__="flm_p1p2")
@@ -636,11 +642,23 @@ def main():
     inv = np.float32(1.0 / np.sqrt((xd * xd).mean() + EPS))
     xn = rnd(rnd(x * rnd(inv)) * nw)
 
-    bc = np.zeros(2 * K_DIM + 2 * HEAD, np.float32)
-    bc[:K_DIM] = (xn if __import__("os").environ.get("CHAIN_HOST_NORM") else x)
-    bc[K_DIM:2 * K_DIM] = nw
-    bc[2 * K_DIM:2 * K_DIM + HEAD] = cs_q
-    bc[2 * K_DIM + HEAD:] = cs_k
+    # One broadcast block PER LAYER: each carries that layer's own
+    # input_layernorm weight. Previously every iteration normalised with layer
+    # 0's nw, which is exactly why q' read 1 ulp off instead of exact.
+    BCN1 = 2 * K_DIM + 2 * HEAD
+    bc = np.zeros(NLAY * BCN1, np.float32)
+    for _lb in range(NLAY):
+        nw_l = c.bf16(f"model.layers.{o.layer + _lb}.input_layernorm.weight"
+                      ).astype(np.float32)[:K_DIM]
+        xn_l = rnd(rnd(x * rnd(inv)) * nw_l)
+        b0 = _lb * BCN1
+        bc[b0:b0 + K_DIM] = (xn_l if __import__("os").environ.get("CHAIN_HOST_NORM")
+                             else x)
+        bc[b0 + K_DIM:b0 + 2 * K_DIM] = nw_l
+        bc[b0 + 2 * K_DIM:b0 + 2 * K_DIM + HEAD] = cs_q
+        bc[b0 + 2 * K_DIM + HEAD:b0 + BCN1] = cs_k
+        if _lb == NLAY - 1:
+            nw, xn = nw_l, xn_l          # references follow the LAST iteration
     bc_t = iron.tensor(bc.astype(bfloat16), dtype=bfloat16, device="npu")
     w_ts, ref = [], {}
     # One buffer per pair holding NLAY layers back to back; the fill picks a

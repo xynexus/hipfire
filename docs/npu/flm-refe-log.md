@@ -11197,3 +11197,39 @@ the size of h, not by a ulp.
 layer 0's `input_layernorm` for every iteration. It reads 0.0000e+00 at NLAY=4
 because that comparison lands on a layer whose norm weight happens to round the
 same way — not because the issue is fixed. Per-layer norm weights are still to do.
+
+### Per-layer norm weights close the q' ulp; 16 REAL layers cost nothing extra
+
+Two results.
+
+**1. The broadcast now carries a block per layer**, each with that layer's own
+`input_layernorm` weight (`bc_all_ty = NLAY * BC`, fill selects by offset; the
+FIFO object type stays one block). The predicted consequence held exactly:
+
+    NLAY=2, before:  q' 1.5259e-04     every iteration normalised with layer 0's nw
+    NLAY=2, after:   q' 0.0000e+00     each iteration uses its own
+
+k', v' and P3's h are all 0.0000e+00 as well. So the earlier 1 ulp was the missing
+norm weight, as recorded at the time — not noise, and not something that needed a
+tolerance.
+
+**2. Sixteen REAL layers time the same as sixteen repeats of one.**
+
+    16 layers, weights reused:   8936.0 us
+    16 layers, real 0..15:       8859.0 us
+
+Within noise, marginally faster. The concern that a 16x longer instruction stream
+with full weight variety would cost something does not materialise — the DMA
+volume per layer is what it always was, and the sequence length is not the
+bottleneck.
+
+    side A, 16 real layers, ONE dispatch   8859.0 us
+    side B, 16 layers, ONE dispatch        3289.9 us   (weights still reused)
+    lm_head                                3700   us   (carried, not re-measured)
+    ------------------------------------------------
+    token                                 15.85 ms  ->  **63.1 tok/s**
+    FLM measured                                        61.18 tok/s    **+3.1%**
+
+Remaining before this is a real token: side B's per-layer weights, and the
+residual chaining layer to layer on device. Both are the same offset pattern
+already working three times over.
