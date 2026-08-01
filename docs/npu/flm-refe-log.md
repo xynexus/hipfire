@@ -13407,9 +13407,24 @@ a ~30 us error bar (same-build run-to-run spread is 2.6%), which is where the ea
 token, all 16 layers looped inside the instruction sequence.
 
     16 layers, one dispatch, three runs of one build:
-      12993.8   12703.5   12651.9 us     median 12703.5, spread 2.7%
-    token = 12703.5 + 2994.2 (lm_head) = 15697.7 us  ->  **63.7 tok/s**
-    FLM 61.18, **+4.1%**       range over the three runs 62.5-63.9 (+2.2% to +4.4%)
+      12993.8   12703.5   12651.9 us     median 12703.5, spread 2.7%   DEVICE time
+
+**The end-to-end token, every term measured on the WALL CLOCK** — which is what FLM's
+61.18 is, so this is the like-for-like comparison:
+
+    layers   12874.0 us   pyxrt, run object HELD
+    lm_head   3010.6 us   pyxrt, run object HELD
+    host        10.5 us   embedding row 0.38 + final RMSNorm 5.25 + argmax 4.89
+    token    15895.1 us   ->  **62.9 tok/s**    FLM 61.18, **+2.8%**
+
+The 63.7 previously quoted here is `run_iters`' `npu.min_us` — device time, against FLM's
+wall-clock server figure. Not the same quantity. The margin is +2.8%, not +4.1%.
+
+**Holding the `pyxrt.run` object is load-bearing, not an optimisation.** Rebinding buffers
+per call costs 5714 us on the layers and 1363 on lm_head; driven that way the design runs
+43.1 tok/s and LOSES to FLM by 29%. `iron.jit(..., full_elf=True)` already dispatches
+through `pyxrt.hw_context` / `ext.kernel` / `set_arg`, so this is a matter of holding the
+run, not of restructuring the host.
 
     cosine 0.999650 vs the validated host; argmax **16309**, the oracle's token
     per-phase bounds DERIVED from the format (two bf16 representable steps at each
