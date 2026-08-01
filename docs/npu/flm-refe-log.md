@@ -12313,3 +12313,37 @@ that silently corrupts a neighbouring column. The v'-passes/k'-fails split is
 itself the tell: it is an ordering artefact, not evidence that half the path works.
 
 `group_a.py` remains the working per-core P1; nothing that passes depends on this.
+
+### A+B: three layout faults found, npad is the remaining one
+
+Wiring the attention check turned up three separate mismatches, each of which
+produced a *plausible* wrong answer rather than a failure:
+
+  1. **Two cache buffers.** A drained into a bf16 `cache`; B read a separately
+     allocated `cache_u8` of zeros. Attention output was exactly zero, so the
+     error equalled `max|ref|` — which looks like "attention is broken" and is
+     actually "B attended over a cache nobody wrote". Now one uint8 buffer, with
+     the drains in bytes, as `p1p2_chain` does.
+  2. **Unpadded cache slots.** `group_a` strides heads by `KTILE + VTILE` = 4096
+     bf16; B reads them back as `OPERAND` = 5152-bf16 objects. The two do not
+     divide, so every head after the first would land at a drifting offset. The
+     slot is now padded to `OPERAND // 2`, which is why `p1p2_chain` pads too.
+  3. **No per-core fill offset.** Every B core was handed the whole eight-head
+     buffer clipped to one object. Now core i reads slot i at `i * OPERAND`.
+
+Each fix moved the number (5.1947e-01 -> 5.0330e-01) without reaching the floor,
+so there is a fourth: **npad has nowhere to live.**
+
+`flm_attn_finish` reads it at `DIM_NPADOFF`, which defaults to
+`DIM_GQA * DIM_QSTRIDE` — immediately after the four q heads. In the paired design
+the q broadcast is BCN-sized and the host writes npad into its tail. Here A's q
+object is exactly `GQA * OBJ` with no tail, and it travels core to core, so the
+host cannot write into it at all.
+
+The options are to widen A's q object by one f32 and have the emit kernel write
+npad, or to read npad from the KV tile's trailer the way `QOFF_FROM_KV` already
+reads the q offset. The second is the same shape as machinery that exists and
+keeps the q stream pure data — it is the one to try.
+
+k' and v' pass throughout, so A's side is right; every fault has been on the path
+into B.

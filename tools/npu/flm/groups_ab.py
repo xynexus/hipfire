@@ -228,12 +228,16 @@ def build(pos, ncores=NCORES, seq=32):
     # from core g+8 (pairs 4-7), so the two halves of a head are written by
     # different pairs into the same buffer at different offsets. Several pairs
     # draining into one BO is the ffn_chain pattern.
-    KVSTRIDE = KTILE + VTILE
-    kv_ty = np.ndarray[(8 * KVSTRIDE,), np.dtype[bfloat16]]
+    # A head's cache slot is padded to the OPERAND object B reads it back as.
+    # Unpadded (KTILE + VTILE = 4096 bf16) is what group_a used, and it does not
+    # divide the 5152-bf16 operand — B would read each head at a drifting offset.
+    # p1p2_chain pads the same way for the same reason.
+    KVSTRIDE = max(KTILE + VTILE, OPERAND // 2)
+    kv_ty = np.ndarray[(8 * KVSTRIDE * 2,), np.dtype[np.uint8]]
     # the same cache buffer, seen as B's operand stream: nobj objects of
     # OPERAND bytes per core. A writes it, B reads it back — the two-task-
     # group ordering in sequence() is what makes that safe.
-    kv_all_ty = np.ndarray[(nobj * OPERAND,), np.dtype[np.uint8]]
+    kv_all_ty = kv_ty          # the same buffer, read back as B's operand
 
     flags = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_HEAD={HEAD}",
              f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS={NQ}", f"-DDIM_QKHEADS={NK}"]
@@ -399,18 +403,18 @@ def _design(bc: In, {params}):
                     # KV heads within the group; leaving it at 2 drains a
                     # neighbour's tile and HANGS rather than erring.
                     oh[i].drain(kvb[i], wait=True, group=tg,
-                                offset=_base * {KVSTRIDE} + {off},
-                                sizes=[1, 1, {HEAD}, 2],
-                                strides=[0, {KVSTRIDE}, {TSEQ}, 1])
+                                offset=2 * (_base * {KVSTRIDE} + {off}),
+                                sizes=[1, 1, {HEAD}, 4],
+                                strides=[0, 2 * {KVSTRIDE}, 2 * {TSEQ}, 1])
                 else:
                     # ONE v head per core, whole object: row pos gets v' and row
                     # pos+1 gets the emit's zeros, which is what a padded
                     # position must hold until the next token overwrites it.
                     oh[i].drain(kvb[i], wait=True, group=tg,
-                                offset=_base * {KVSTRIDE} + {KTILE}
-                                       + {pos} * {HEAD},
-                                sizes=[1, 1, 1, {OBJ}],
-                                strides=[0, {KVSTRIDE}, 0, 1])
+                                offset=2 * (_base * {KVSTRIDE} + {KTILE}
+                                            + {pos} * {HEAD}),
+                                sizes=[1, 1, 1, 2 * {OBJ}],
+                                strides=[0, 2 * {KVSTRIDE}, 0, 1])
         tg.finish()
 
         # ---- group B -------------------------------------------------------
@@ -419,7 +423,13 @@ def _design(bc: In, {params}):
         # through host memory within one dispatch.
         tg = TaskGroup()
         for i in range(nc):
-            kvinh[i].fill(kvinb[i], group=tg)
+            # B core i attends with KV group i, so it reads slot i — one
+            # OPERAND-sized object at i * OPERAND. Without the offset every core
+            # gets the whole eight-head buffer clipped to one object, which is
+            # head 0's K followed by nothing it should see.
+            kvinh[i].fill(kvinb[i], group=tg,
+                          offset=i * {OPERAND},
+                          sizes=[1, 1, 1, {OPERAND}], strides=[0, 0, 0, 1])
         for i in range(2):
             aoh[i].drain(aob[i], wait=True, group=tg)
         tg.finish()
@@ -529,15 +539,18 @@ def main():
 
     bc_t = iron.tensor(bc.astype(bfloat16), dtype=bfloat16, device="npu")
     # No q' tensor: it goes A[j] -> B[j] core to core and never reaches the host.
-    KVSTRIDE = KTILE + TSEQ * HEAD
     OPERAND = max(2 * TSEQ * HEAD * 2 * KVPER, q4nx.tile_bytes(K_DIM, NROWS))
+    KVSTRIDE = max(KTILE + TSEQ * HEAD, OPERAND // 2)
     nobj = -(-o.seq // (TSEQ * KVPER))
     # ONE buffer serving both directions: A drains k'/v' into it, B reads it back
     # as OPERAND-sized objects. The two task groups in sequence() order that.
-    cache = iron.zeros(8 * KVSTRIDE, dtype=bfloat16, device="npu")
+    # ONE buffer, uint8, that A drains into and B reads back as operand objects.
+    # Two separate buffers is what made attention output zeros: B attended over a
+    # cache nobody had written. uint8 because the operand fifo is byte-typed, so
+    # the drain offsets below are BYTES — which is also the form p1p2_chain uses.
+    cache = iron.zeros(8 * KVSTRIDE * 2, dtype=np.uint8, device="npu")
     kv_ts = [cache] * ncores
-    cache_u8 = iron.zeros(nobj * OPERAND, dtype=np.uint8, device="npu")
-    kvin_ts = [cache_u8] * ncores
+    kvin_ts = [cache] * ncores
     ao_ts = [iron.zeros(4 * GQA * HEAD, dtype=bfloat16, device="npu")
              for _ in range(2)]
     if o.bench:
@@ -549,7 +562,8 @@ def main():
               f"(marginal {_us - 92.9:.1f})")
     else:
         design(bc_t, *w_ts, *kv_ts, *kvin_ts, *ao_ts)
-    cv = cache.numpy().astype(np.float64).reshape(8, KVSTRIDE)
+    cv = (cache.numpy().view(bfloat16).astype(np.float64)
+          .reshape(8, KVSTRIDE))
 
     print(f"P1 routed to three destinations: {ncores} cores, layer {o.layer}, "
           f"pos {o.pos}")
@@ -569,8 +583,36 @@ def main():
     # untouched by it, so gating on that here would print 0.0000e+00 and read as
     # a pass for something never measured. It is checked one step downstream,
     # once attention's output is compared — which is not wired yet.
-    print(f"  q' : {NQ} heads                NOT CHECKED (core to core; "
-          f"verified downstream once attention's output is)")
+    # ---- attention: the check that verifies q' -----------------------------
+    # B attended with whatever A sent it. Comparing B's output against a
+    # reference built from the host's OWN q'/k'/v' therefore checks the stream:
+    # a wrong q' cannot produce the right attention output.
+    import math
+    kv_groups = (NV - NQ) // 2
+    aw, asc = 0.0, 0.0
+    for a in range(kv_groups):
+        Kf = np.zeros((o.pos + 1, HEAD), np.float64)
+        Vf = np.zeros((o.pos + 1, HEAD), np.float64)
+        Kf[o.pos] = ref[NQ + a]                 # k' A just wrote
+        Vf[o.pos] = ref[NK + a]                 # v' likewise
+        qr = np.stack([ref[GQA * a + sl] for sl in range(GQA)])[:, :HEAD]
+        # q' already carries 1/sqrt(d) * log2(e) from cs_q
+        sc = (qr @ Kf.T) / math.log2(math.e)
+        e = np.exp(sc - sc.max(1, keepdims=True))
+        want = (e / e.sum(1, keepdims=True)) @ Vf
+        got = (ao_ts[a // 4].numpy().astype(np.float64)
+               .reshape(4, GQA, HEAD)[a % 4])
+        aw = max(aw, np.abs(got - want).max())
+        asc = max(asc, np.abs(want).max())
+    ulp = 2.0**-8
+    atol = 2.0 * ulp * max(asc, 1e-9)
+    print(f"  attn: {kv_groups} KV groups        max err {aw:.4e}   "
+          f"max|ref| {asc:.5f}   tol {atol:.4e}")
+    ok &= aw <= atol
+
+    print(f"  q' : {NQ} heads                CHECKED VIA ATTENTION (core to "
+          f"core; a wrong q' cannot give the right attention output)"
+          )
     if __import__("os").environ.get("P1_DIAG"):
         import sys as _s
         got = q_ts[0].numpy().astype(np.float64).reshape(4, 2 * HEAD)[:, :HEAD]
@@ -596,7 +638,9 @@ def main():
 
     ve = 0.0
     for g in range(8):                                 # V half of KV head g
-        V = cv[g, KTILE:].reshape(TSEQ, HEAD)
+        # the slot is padded past KTILE + VTILE now, so slice the V tile
+        # explicitly rather than taking the remainder
+        V = cv[g, KTILE:KTILE + TSEQ * HEAD].reshape(TSEQ, HEAD)
         e = np.abs(V[o.pos] - ref[NK + g]).max()
         ve = max(ve, e)
     ok &= gate(ve, range(NK, NV), f"v' : 8 heads -> V row {o.pos:<2d}      ")
