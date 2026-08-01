@@ -16337,3 +16337,42 @@ rule recorded is not a rule applied.
 Where the host term now stands: 181.1 us, of which ~19 is selection and ~162 the rescore of
 32 rows — 41 KB and 65K MACs. It remains per-op overhead rather than work, and the ceiling is
 still an implementation that does not pay it.
+
+### The FLM comparison needs the chat template — and one target is reachable today
+
+Tried the comparison this project has been aiming at since the start, and hit a precondition
+nobody had checked: **FLM's server applies a chat template and ignores both `raw:true` and
+`num_predict`.**
+
+    /v1/completions  "The quick brown fox", max_tokens=1   ->  'The sentence'
+    /api/generate    same, raw:true, num_predict:1         ->  the full pangram paragraph
+
+So the obvious comparison is not like for like. Our verified pos-4 result (35308 " jumps") is
+a correct RAW continuation of `[128000, 791, 4062, 14198, 39935]`; FLM's 'The sentence' is a
+correct TEMPLATED response to the same words. They disagree because they were asked different
+questions, and comparing them directly would have looked exactly like a device fault.
+
+To compare, our pipeline has to be fed FLM's tokens:
+
+    <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n
+    {prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
+
+Templated lengths, and the parity decides whether a test needs odd-position support:
+
+    "The quick brown fox"   14 tokens -> decode at pos 13   ODD
+    "Hello world"           12 tokens -> decode at pos 11   ODD
+    "Hi"                    11 tokens -> decode at pos 10   EVEN
+
+**"Hi" is reachable with what already works.** FLM answers "How can I help you today?", whose
+first token is **4438 = 'How'**. Prefill the 11 templated tokens, decode one step at pos 10,
+and the argmax should be 4438 — a genuine device-versus-FLM token comparison that needs
+neither odd positions nor a decode loop. Worth doing before the multi-token work rather than
+after: if it fails, the loop is being built on a broken premise.
+
+The full sequence target, for when odd positions land: [4438, 649, 358, 1520, 499, 3432] =
+"How can I help you today".
+
+Recorded because "the FLM server is a deterministic token oracle with byte-exact prompt
+tokenization" has been in this log for a long time as though the comparison were merely
+blocked on multi-token. It was also blocked on a templating detail that takes one curl to
+find and would otherwise have produced a spectacular false negative.
