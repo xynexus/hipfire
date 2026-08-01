@@ -14319,3 +14319,35 @@ both", so the mechanism exists and the designs do not use it.
 Worth stating plainly: this was found only because the pos-0 success was treated as
 insufficient. Everything internal agreed at pos 30 — device against reference, k' at
 exactly 0.0 — and all of it was two wrong things matching.
+
+### RoPE fixed: the permutation that makes half-split compute pairwise
+
+`load_linear` now reorders each head's rows to `[0,2,...,62,1,3,...,63]` for `q_proj`
+and `k_proj` only. Verified against the external oracle before wiring it in:
+
+    pos 7, half-split on PERMUTED rows vs oracle   6.40% of peak   (floor 6.36%)
+
+against 150.99% for the unpermuted rows. That is the quantization floor, so the
+rotation is now right to the precision 4-bit weights allow.
+
+Why this is safe for the rest of the layer: q and k receive the *same* permutation, and
+`q . k` is invariant under a shared permutation of both, so attention is unchanged. v is
+not permuted, so `o_proj` still sees normal row order. Only the two rotated tensors move.
+
+A+B after the change, at position 30:
+
+    attn 4.8865e-04 (0.50 ULP)   k' 0.0000e+00   v' 5.9605e-08   PASS
+
+**That result alone would prove nothing** — it is device against a reference that shares
+the loader, which is the exact trap that hid five faults today. The claim rests on two
+measurements chained:
+
+    device  ==  host reference     k' exactly 0.0, measured on the NPU
+    host reference  ==  oracle     6.40% vs a 6.36% floor, measured against the checkpoint
+
+Each link is independently measured, and only together do they say the device computes
+the model's RoPE. Neither half is sufficient, and the first half is what I mistakenly
+relied on at pos 30 twice before.
+
+Only `qkv_verify` needed the change — it feeds `groups_ab` and `p1p2_chain`, and `group_c`
+and `p5_pass` have no rotated tensors.

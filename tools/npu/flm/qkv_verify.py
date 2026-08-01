@@ -51,7 +51,24 @@ import q4nx  # noqa: E402
 # which means the kernel's half-split RoPE may no longer match the packing it
 # used to receive. That is what this change has to be tested for, not assumed.
 def load_linear(c, name, N, K):  # noqa: E302
-    return q4nx.q4nx_tensor_blocks(c, name, (N, K))  # noqa: E402
+    d, m, codes = q4nx.q4nx_tensor_blocks(c, name, (N, K))
+    if "q_proj" in name or "k_proj" in name:
+        # q and k are ROTATED, and the two conventions differ. The checkpoint
+        # (and so q4nx_tensor_blocks) is Meta order, where RoPE turns the pairs
+        # (2i, 2i+1); the kernel rotates half-split. Measured at position 7:
+        # half-split on these rows is 151% of peak wrong, pairwise is 6.36% —
+        # the 4-bit quantization floor exactly.
+        #
+        # Reordering each head's rows to [0,2,...,62,1,3,...,63] makes half-split
+        # compute the pairwise rotation. q and k get the SAME permutation, and
+        # q.k is invariant under a shared permutation of both, so attention is
+        # unaffected; v is not permuted, so o_proj still sees normal order.
+        h = np.arange(N) // HEAD
+        i = np.arange(N) % HEAD
+        pm = np.concatenate([np.arange(0, HEAD, 2), np.arange(1, HEAD, 2)])
+        idx = h * HEAD + pm[i]
+        d, m, codes = d[idx], m[idx], codes[idx]
+    return d, m, codes  # noqa: E402
 
 import aie.iron as iron  # noqa: E402
 from aie.iron import (CompileTime, In, ObjectFifo, Out, Program, Runtime,  # noqa: E402
