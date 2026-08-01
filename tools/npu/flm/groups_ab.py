@@ -231,6 +231,10 @@ def build(pos, ncores=NCORES, seq=32):
     # draining into one BO is the ffn_chain pattern.
     KVSTRIDE = KTILE + VTILE
     kv_ty = np.ndarray[(8 * KVSTRIDE,), np.dtype[bfloat16]]
+    # the same cache buffer, seen as B's operand stream: nobj objects of
+    # OPERAND bytes per core. A writes it, B reads it back — the two-task-
+    # group ordering in sequence() is what makes that safe.
+    kv_all_ty = np.ndarray[(nobj * OPERAND,), np.dtype[np.uint8]]
 
     flags = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_HEAD={HEAD}",
              f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS={NQ}", f"-DDIM_QKHEADS={NK}"]
@@ -359,13 +363,20 @@ def _design(bc: In, {params}):
     def sequence(*args):
         n, nc = {npairs}, {ncores}
         QOBJ, KVPLAN = {qobj!r}, {kvplan!r}
+        # tensors: bc, weights*n, cache*nc (A writes), cache-as-operand*nc (B
+        # reads), attention out*2. No q' — it never leaves the array.
         bcb = args[0]
         wb = [args[1 + i] for i in range(n)]
-        qb = [args[1 + n + i] for i in range(nc)]
-        kvb = [args[1 + n + nc + i] for i in range(nc)]
-        bch = args[1 + n + 2 * nc]
-        wh = [args[2 + n + 2 * nc + i] for i in range(n)]
-        oh = [args[2 + 2 * n + 2 * nc + i] for i in range(nc)]
+        kvb = [args[1 + n + i] for i in range(nc)]
+        kvinb = [args[1 + n + nc + i] for i in range(nc)]
+        aob = [args[1 + n + 2 * nc + i] for i in range(2)]
+        # handles begin where the tensors end: 1 + n + 2*nc + 2
+        h0 = 3 + n + 2 * nc
+        bch = args[h0]
+        wh = [args[h0 + 1 + i] for i in range(n)]
+        oh = [args[h0 + 1 + n + i] for i in range(nc)]
+        kvinh = [args[h0 + 1 + n + nc + i] for i in range(nc)]
+        aoh = [args[h0 + 1 + n + 2 * nc + i] for i in range(2)]
         tg = TaskGroup()
         bch.fill(bcb, group=tg)
         for i in range(n):
@@ -405,12 +416,16 @@ def _design(bc: In, {params}):
                                 strides=[0, {KVSTRIDE}, 0, 1])
         tg.finish()
 
-    # weights per PAIR, results per CORE
+    # q' never reaches the host — it goes core to core — so it has no tensor and
+    # no handle. What crosses the shim: weights in, k'/v' out to the cache, the
+    # cache back in as B's operand, and attention's two joined streams out.
     arg_types = [bc_ty] + [w_all_ty] * {npairs}
-    arg_types += list(q_tys) + [kv_ty] * {ncores}
+    arg_types += [kv_ty] * {ncores} + [kv_all_ty] * {ncores} + [aoj_ty] * 2
     arg_types += [f_bc.prod(tile=AnyShimTile)]
     arg_types += [f.prod(tile=AnyShimTile) for f in f_w]
-    arg_types += [f.cons(tile=AnyShimTile) for f in f_o]
+    arg_types += [f.cons(tile=AnyShimTile) for f in f_kv]
+    arg_types += [f.prod(tile=AnyShimTile) for f in f_kvin]
+    arg_types += [f.cons(tile=AnyShimTile) for f in f_ao]
     rt = Runtime(sequence, arg_types)
     return Program(iron.get_current_device(), rt, workers).resolve_program()
 '''
