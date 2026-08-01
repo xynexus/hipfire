@@ -14249,3 +14249,36 @@ position, comparing the device's half-split rotation against a Meta-format refer
 would produce a mismatch that looks like a device fault and is a convention difference.
 Given that four faults today were all "the reference shared the mistake", the failure
 mode here is the mirror image and just as easy to walk into.
+
+### The container's q/k rows are Meta-order, and the kernel rotates half-split
+
+    q4nx q_proj vs meta (2i,2i+1) pairs   corr +0.99700   relF 0.07762
+    q4nx q_proj vs hf half-split          corr +0.02143   relF 1.39915
+
+`q4nx_decode_tensor` returns q_proj in **Meta's** convention, where RoPE rotates
+(2i, 2i+1) pairs — despite the container using HF tensor names. The kernel applies
+**half-split** RoPE, and `rope_ref` says so: "Half-split only, matching the kernel.
+Interleaved is this applied to the permuted row order, which the caller has already
+packed."
+
+So somebody has to permute, and it matters which rows the loader hands over:
+
+  * before today, `load_linear` returned the container's RAW row order, and the
+    container's own layout for q/k *is* the RoPE-pair layout — the "stride-2 interleave
+    holds for exactly q_proj and k_proj" note describes `decode_tensor` UNDOING it
+  * after today's fix, the loader returns Meta order, which is the un-permuted form
+
+That raises the possibility that switching the weight path fixed the GEMV operands and
+broke the rotation for q and k specifically. Everything else in the layer is
+permutation-free and unaffected.
+
+**What cannot settle this**: the runs already done. `groups_ab` at pos 30 gives k'
+exactly 0.0 and attention 0.51 ULP after the change — but against a reference that
+reads the same rows through the same loader, so the two agree whichever convention they
+are both in. This is the identical trap that hid four faults today, and the pos-0
+end-to-end result cannot help either, since RoPE is the identity there.
+
+The check has to be external: compute q' and k' at a nonzero position from
+`consolidated.00.pth` in Meta convention with the llama3-scaled frequencies, and compare
+against what the device produces for the same activation. That is the next step, and it
+is the last unverified part of the layer.
