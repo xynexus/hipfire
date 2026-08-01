@@ -13101,3 +13101,36 @@ all and the result is the clean 0.69 ULP floor.
 That also explains why this looked like the unresolved attention floor at every
 position anyone had checked: past about pos=8 the padding fraction is small enough
 that the cancellation error drops below the floor and disappears into it.
+
+### ATTN_MASK_PAD: mask the padded lanes instead of subtracting them
+
+`flm_attn_decode` now reads npad from the KV trailer it already has, and forces the
+padded lanes to -3e38 before the tile max, so they never enter `g_m` or `g_l`.
+`flm_attn_finish` skips its subtraction under the same flag — the two must agree or
+the correction applies twice or not at all. Default off, as every kernel flag here is.
+
+                MASK=0    MASK=1
+    pos=0       30.80      0.00  ULP
+    pos=1        4.04      2.70
+    pos=2        1.59      2.19
+    pos=15       1.05      1.05
+    pos=30       0.76      0.76
+
+Position 0 is now **bit-exact**, which is the strongest available confirmation of the
+diagnosis: attention over one token has a softmax of 1.0, so the output must equal
+V[0] exactly, and with the padded lanes gone it does. Nothing short of removing them
+from the sum could produce a zero there.
+
+Masking also fixes something the subtraction structurally could not. A padded score
+of 0 can *win* the running max when every real score is negative, shifting the whole
+softmax frame; subtracting afterwards cannot undo a wrong `m`.
+
+Reporting the rest honestly: pos=1 improves, pos=15 and pos=30 are unchanged to five
+digits, and **pos=2 gets slightly worse**, 1.59 -> 2.19 ULP. The old numbers at small
+positions were partly error cancellation between the accumulated padding and its
+subtraction; removing the cancellation leaves the true floor exposed, which is not
+uniformly smaller. The remaining 2-3 ULP at pos=1-2 is the unresolved attention floor
+and is not addressed here.
+
+`ATTN_MASK_PAD=0` reproduces the old numbers exactly at every position tested, so
+the toggle is clean and nothing else moved.

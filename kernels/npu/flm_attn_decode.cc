@@ -120,6 +120,45 @@ static_assert(HEAD % 32 == 0, "head_dim must be a multiple of 32");
 
 // Softmax state, defined here and reached by `extern` from the begin/finish
 // translation units.
+// ATTN_MASK_PAD: drop the padded lanes instead of correcting for them later.
+//
+// The cache streams in whole TSEQ tiles, so a sequence that is not a multiple of
+// TSEQ leaves a padded tail of K=0, V=0. A zero K gives a score of 0, not -inf,
+// so each padded lane contributes exp2(0 - m) to the denominator.
+// `flm_attn_finish` compensates by subtracting npad * exp2(-m) at the end.
+//
+// That is exact in real arithmetic and badly conditioned in floating point. At
+// position 0 there are 31 padded lanes against 1 real one: the denominator is
+// built up to ~31 and then nearly all of it is subtracted away, leaving the real
+// term plus the rounding the discarded terms deposited. Measured 30.8 ULP at
+// pos 0, decaying to the 0.69 ULP floor by pos 31 as the padded fraction shrinks.
+//
+// Masking is the conditioning fix: the padded lanes never enter g_l or g_m at
+// all, so there is nothing to subtract. It also fixes a second-order error the
+// subtraction could not — a padded score of 0 can WIN the running max when every
+// real score is negative, which shifts the whole softmax frame.
+//
+// Off by default; `flm_attn_finish` must be built with the same flag, since the
+// two corrections would otherwise both apply.
+#ifndef ATTN_MASK_PAD
+#define ATTN_MASK_PAD 0
+#endif
+
+#if ATTN_MASK_PAD
+namespace {
+// No iota in the vector API and no runtime init on a core, so the lane indices
+// are a constexpr table.
+struct LaneIdx {
+  float v[TSEQ];
+  constexpr LaneIdx() : v() {
+    for (int i = 0; i < TSEQ; ++i)
+      v[i] = float(i);
+  }
+};
+alignas(64) constexpr LaneIdx g_lane{};
+} // namespace
+#endif
+
 alignas(64) float g_m[GQA];                 // running max
 alignas(64) float g_l[GQA];                 // running denominator
 alignas(64) float g_acc[GQA * HEAD];        // running weighted sum of V
@@ -140,6 +179,10 @@ flm_attn_tile(const uint8 *restrict q_raw,      // [GQA][HEAD] bf16, pre-scaled
   // g_m/g_l/g_acc across calls anyway, so folding several tiles into one call
   // changes nothing arithmetically — it only decouples the fifo object size
   // from TSEQ, which the fused layer needs.
+#if ATTN_MASK_PAD
+  const float npad_dec =
+      *reinterpret_cast<const float *>(kv_raw + DIM_KVOBJ - 60);
+#endif
   for (int u = 0; u < KVPER; ++u) {
   const bfloat16 *restrict kt = kvpack + u * KVSTRIDE;
   const bfloat16 *restrict vt = kt + TSEQ * HEAD;
@@ -151,7 +194,19 @@ flm_attn_tile(const uint8 *restrict q_raw,      // [GQA][HEAD] bf16, pre-scaled
       s = aie::mac(s, aie::load_v<TSEQ>(kt + d * TSEQ),
                    aie::broadcast<bfloat16, TSEQ>(q[h * QSTRIDE + d]));
 
-    const auto sv = s.template to_vector<float>();
+    auto sv = s.template to_vector<float>();
+#if ATTN_MASK_PAD
+    // Valid lanes in THIS tile. npad rides the object's trailer and covers the
+    // whole object, so it is spent tile by tile from the end.
+    {
+      const int nv_i = TSEQ * KVPER - int(npad_dec) - u * TSEQ;
+      const int nv = nv_i < 0 ? 0 : (nv_i > TSEQ ? TSEQ : nv_i);
+      sv = aie::select(
+          aie::broadcast<float, TSEQ>(-3.0e38f), sv,
+          aie::lt(aie::load_v<TSEQ>(g_lane.v),
+                  aie::broadcast<float, TSEQ>(float(nv))));
+    }
+#endif
 
     // ---- online softmax update ----
     const float m_old = g_m[h];

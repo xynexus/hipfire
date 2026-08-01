@@ -111,6 +111,14 @@ extern float g_acc[];
 #ifndef NPAD_FROM_KV
 #define NPAD_FROM_KV 0
 #endif
+
+// ATTN_MASK_PAD: flm_attn_decode masked the padded lanes out of g_l and g_m, so
+// there is nothing left to subtract here. Building the two kernels with
+// different values of this flag double-corrects or under-corrects; they must
+// agree. See the long note in flm_attn_decode.cc.
+#ifndef ATTN_MASK_PAD
+#define ATTN_MASK_PAD 0
+#endif
 extern "C" __attribute__((noinline)) void
 flm_attn_finish(bfloat16 *restrict out,        // [GQA][HEAD]
                 const uint8 *restrict q_raw
@@ -126,12 +134,17 @@ flm_attn_finish(bfloat16 *restrict out,        // [GQA][HEAD]
       *reinterpret_cast<const float *>(
           reinterpret_cast<const bfloat16 *>(q_raw) + DIM_NPADOFF);
 #endif
+#if ATTN_MASK_PAD
+  (void)npad_f;                 // decode already masked; nothing to subtract
+#endif
   for (int h = 0; h < GQA; ++h) {
     // No scalar libm on the core (`undefined symbol: exp2f`), so this goes
     // through the vector exp2 and extracts one lane — the same idiom the
     // rescale factor in flm_attn_decode.cc uses.
+#if !ATTN_MASK_PAD
     g_l[h] -= npad_f * float(aie::exp2<bfloat16>(
         aie::broadcast<float, HALF>(-g_m[h]))[0]);
+#endif
     const float inv = 1.0f / g_l[h];
     const auto iv = aie::broadcast<float, HALF>(inv);
     for (int off = 0; off < HEAD; off += HALF)

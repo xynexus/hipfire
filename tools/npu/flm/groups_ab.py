@@ -24,6 +24,7 @@ tokens and B reads it back as an operand. Only q' takes the direct path.
 Needs PYTHONPATH=<mlir-aie>/build/python plus the Peano/XRT env.
 """
 
+import os
 import argparse
 import sys
 from pathlib import Path
@@ -239,6 +240,7 @@ def build(pos, ncores=NCORES, seq=32):
     # group ordering in sequence() is what makes that safe.
     kv_all_ty = kv_ty          # the same buffer, read back as B's operand
 
+    MASKPAD = os.environ.get("ATTN_MASK_PAD", "1")
     flags = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_HEAD={HEAD}",
              f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS={NQ}", f"-DDIM_QKHEADS={NK}",
              # group A packs GQA q heads into one object so B can acquire it once
@@ -251,7 +253,11 @@ def build(pos, ncores=NCORES, seq=32):
              "-DQOFF_FROM_KV=0",
              # and npad rides the KV trailer, because a core-to-core q has no
              # host-written tail to carry it
-             "-DNPAD_FROM_KV=1"]
+             "-DNPAD_FROM_KV=1",
+             # Mask the padded KV lanes rather than subtracting them at the end.
+             # ATTN_MASK_PAD env=0 restores the subtraction for comparison; both
+             # attention kernels must get the same value.
+             f"-DATTN_MASK_PAD={MASKPAD}"]
     # weights per PAIR; k'/v' out per CORE; the cache back IN per core as B's
     # operand; attention out as two joined streams. No q' — core to core.
     params = ", ".join(f"w{i}: In" for i in range(npairs))
@@ -281,7 +287,7 @@ def _design(bc: In, {params}):
 
     f_bc = ObjectFifo(bc_ty, depth=1, name="bc")
     bc_cons = [f_bc.cons() for _ in range({ncores})]
-    f_w = [ObjectFifo(wpair_ty, name=f"wp{{i}}") for i in range({npairs})]
+    f_w = [ObjectFifo(wpair_ty, name=f"wp{MASKPAD}_{{i}}") for i in range({npairs})]
     w_sub = [f.cons().split([0, {wt}], obj_types=[wt_ty, wt_ty]) for f in f_w]
     # PER-CORE result fifos. p1_route joins two cores into one; group A
     # streams each core to its own B core, so there is nothing to join —
