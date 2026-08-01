@@ -15631,3 +15631,37 @@ embedding lookup, the final RMSNorm, sampling, and the argmax over 128256 logits
 does that argmax in numpy over a dequantised lm_head and takes ~50 s, so "small in
 principle" is not the same as "measured", and a decode loop needs a real implementation of
 it before the end-to-end number exists.
+
+### The host side costs 10.5 us a token — and that completes the accounting
+
+Measured directly, 200 repeats each, median and min:
+
+    embedding lookup (row -> f32)      0.38 us     0.36
+    final RMSNorm (2048)               5.25 us     5.18
+    argmax over 128256 logits          4.89 us     4.80
+    (logits copy, 513 KB, for scale)   5.41 us     4.58
+
+    per-token host total               10.5 us     = 0.066% of the token
+
+So the last uncounted term is three parts in ten thousand, and the end-to-end token is:
+
+    layers 12874.0 (held wall) + lm_head 3010.6 (held wall) + host 10.5
+    = 15895.1 us -> **62.9 tok/s, +2.8% over FLM's 61.18**
+
+Every term is now measured on the wall clock, and the comparison against FLM's
+server-measured figure is complete rather than partial. At temperature 0 the argmax IS the
+sampling, so there is no separate sampling cost to add.
+
+Worth naming why this looked like it might matter: `head_verify.py` takes ~50 s to produce a
+token from a hidden state, and I cited that as evidence the host path needed a real
+implementation before an end-to-end number could exist. That 50 s is almost entirely
+dequantising `lm_head` — 128256 x 2048 4-bit weights — and running the GEMV in numpy. On the
+device that GEMV is the 3010.6 us dispatch. The host work that actually remains in a decode
+loop is a row copy, a 2048-element normalise, and an argmax over an array the device just
+wrote. I had conflated "the checker is slow" with "the host path is expensive", and they are
+not the same thing.
+
+One term still deserves care in a real implementation rather than a benchmark: the embedding
+table is 525 MB in bf16 and `c.bf16()` returns it converted to float32, i.e. 1051 MB
+resident. That is a one-time 0.44 s load here, but a decode loop should keep it bf16 and
+convert the single row it needs.
