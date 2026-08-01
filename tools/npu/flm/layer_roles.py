@@ -147,10 +147,17 @@ def role_layout():
     return head_layout(A_CORES)
 
 
-def build_skeleton():
+def build_skeleton(elems=64):
     """The stream topology with trivial kernels: does 32 cores in three groups
-    place and route at all? Everything else is filling it in."""
-    ty = np.ndarray[(64,), np.dtype[np.int32]]
+    place and route at all? Everything else is filling it in.
+
+    `elems` sets the object size. The topology was first proven at 64 int32 =
+    256 B, but the real operand is OPERAND = 10304 B and the broadcast block is
+    BC * 2 = 8448 B. Object size is charged against each core's 64 KB of data
+    memory and against DMA descriptors, so a topology that places at 256 B can
+    still fail at realistic sizes — which is what this checks.
+    """
+    ty = np.ndarray[(elems,), np.dtype[np.int32]]
 
     def _design(a: In, o0: Out, o1: Out, o2: Out, o3: Out):
         f_act = ObjectFifo(ty, depth=1, name="rl_act")          # shim -> A
@@ -167,7 +174,7 @@ def build_skeleton():
         f_out = [ObjectFifo(ty, depth=1, name=f"rl_out{i}")
                  for i in range(C_CORES // 4)]
 
-        part = 64 // 4                      # each of four producers fills a quarter
+        part = elems // 4                      # each of four producers fills a quarter
         bc_in = [f.prod().join([j * part for j in range(4)],
                                obj_types=[np.ndarray[(part,),
                                                      np.dtype[np.int32]]] * 4)
@@ -181,19 +188,19 @@ def build_skeleton():
 
         def core_a(ic, oc):
             e = ic.acquire(1); r = oc.acquire(1)
-            for k in range(64):
+            for k in range(elems):
                 r[k] = e[k] + 1
             oc.release(1); ic.release(1)
 
         def core_b(ic, oc):
             e = ic.acquire(1); r = oc.acquire(1)
-            for k in range(64 // 4):
+            for k in range(elems // 4):
                 r[k] = e[k] + 2
             oc.release(1); ic.release(1)
 
         def core_c(ic0, ic1, oc):
             e0 = ic0.acquire(1); e1 = ic1.acquire(1); r = oc.acquire(1)
-            for k in range(64 // 4):
+            for k in range(elems // 4):
                 r[k] = e0[k] + e1[k] + 3
             oc.release(1); ic1.release(1); ic0.release(1)
 
@@ -227,6 +234,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--skeleton", action="store_true",
                     help="build the stream topology with trivial kernels")
+    ap.add_argument("--elems", type=int, default=64,
+                    help="object size in int32; the real operand is 2576 int32 "
+                         "(10304 B), so 64 does not prove much on its own")
     o = ap.parse_args()
     print(f"role-specialised layer, {NCORES} cores")
     for name, (first, n), phases, share in plan():
@@ -242,10 +252,11 @@ def main():
     for j, row in enumerate(role_layout()):
         print(f"  A{j} -> B{j}: q {row[:-2]}, k {row[-2]}, v {row[-1]}")
     if o.skeleton:
-        print("\nbuilding the stream topology...")
-        a = iron.zeros(64, dtype=np.int32, device="npu")
-        outs = [iron.zeros(64, dtype=np.int32, device="npu") for _ in range(4)]
-        build_skeleton()(a, *outs)
+        print(f"\nbuilding the stream topology at {o.elems} int32 "
+              f"({o.elems * 4} B/object)...")
+        a = iron.zeros(o.elems, dtype=np.int32, device="npu")
+        outs = [iron.zeros(o.elems, dtype=np.int32, device="npu") for _ in range(4)]
+        build_skeleton(o.elems)(a, *outs)
         # Running is not enough: a topology that misroutes still runs. Trace the
         # arithmetic — A adds 1, B adds 2, C adds both halves plus 3 — so with a
         # zero input every output element must be (1+2) + (1+2) + 3 = 9. A wrong
