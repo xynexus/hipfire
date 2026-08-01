@@ -15431,3 +15431,105 @@ What this makes concrete: the 4.5% is not waste, it is what phase ordering costs
 already the cheapest available form of it — the same five phases as separate dispatches would
 cost 5 x 92.9 us per layer instead of 5 x 6.0. Reducing it means fewer phases, not faster
 ones, and the phase count is set by the data dependencies in a decoder layer.
+
+### The pyxrt host path multi-token needs: not a restructuring, and it costs 5.7 ms/token
+
+The premise of this task was that adopting a runtime position offset means
+restructuring the host away from the `iron.jit` callable onto `pyxrt.hw_context` /
+`pyxrt.ext.kernel` / `pyxrt.run` / `run.set_arg`, and that nothing in this tree had
+ever done that. **The restructuring does not exist.** `iron.jit(..., full_elf=True)` —
+which `fused.py` already passes — dispatches through exactly that path internally:
+`aie/utils/hostruntime/xrtruntime/hostruntime.py:_load_full_elf` builds the context from
+`pyxrt.elf(design.elf)`, and `_run_full_elf` creates a `pyxrt.run` and binds every host
+buffer with `run.set_arg(i, bo)`. The callable is a wrapper over the raw path, not an
+alternative to it.
+
+`tools/npu/flm/fused_pyxrt.py` drives the same design by hand. It does not copy
+`fused.py`; it monkeypatches `fused.build` and lets `fused.main()` build every buffer,
+so the two paths cannot differ in their inputs. Same cached `design.elf`
+(`~/.npu/cache/fe8470efc4ebe1bd858f544b/`), same 36 arguments, same x0:
+
+    python3 fused_pyxrt.py --layers 16 --pos 0 --seq 1 --x0 x0_bos.npy --save x.npy --no-ref
+
+    x16 vs the iron.jit reference: BIT-IDENTICAL (max abs diff 0.0), three separate runs
+    cosine 0.999650 vs host_x16b.npy, argmax 16309 — the same bar, reproduced exactly
+
+#### The four questions
+
+**1. Can the existing cached build be driven this way?** Yes, unchanged — `--get-full-elf`
+is already on. What it CANNOT do is carry a parameter, and the reason is not an aiecc flag.
+`run.get_ctrl_scratchpad_bo()` on the fused ELF gives
+
+    RuntimeError: Control scratchpad memory is not present
+
+Built upstream's `scratchpad_addr_offset` design twice, with and WITHOUT
+`--get-scratchpad-parameters`, and probed both: **both report a 4-byte scratchpad BO
+present.** So the BO comes from the design declaring a `ScratchpadParameter` (which lowers
+to `aiex.npu.create_scratchpad` in the runtime sequence), not from the flag. The flag emits
+only `params.txt` — the name -> state-table-slot + kind map `ParameterScratchpad` reads.
+Verified it lands in aiecc's `--output-dir`, which `compile_mlir_module` points at the JIT
+cache dir, so it will appear as `~/.npu/cache/<hash>/params.txt`. Two changes are needed,
+in two different files:
+
+    fused.py     declare ScratchpadParameter + offset_parameter= on the drains
+    iron.jit     aiecc_flags=["--get-scratchpad-parameters"]
+
+Both are in the cache hash (`compilabledesign.py` lines 802/826), so this costs one rebuild.
+Note the aiecc that `iron.jit` uses is `build/bin/aiecc` via `aie.utils.config.aiecc_path()`,
+NOT the `aiecc` on PATH — the venv's copy is older and has no `ScratchpadParameterOp` at all.
+Upstream's own test, rebuilt here with `build/bin/aiecc`, passes 3/3.
+
+**2. Argument order — discoverable or guesswork?** Discoverable, three ways that agree.
+It is the design function's parameter order = the `Runtime(sequence, arg_types)` order =
+the `aie.runtime_sequence` operand order, positionally into `set_arg(0..35)`. The cache dir
+carries two independent cross-checks: `full_elf_config.json` lists `arg_0`..`arg_35` (the
+count), and `parse_dma_sizes(input_with_addresses.mlir)`, which the JIT already exposes as
+`compilable._expected_tensor_sizes`, gives each operand's element count. `fused_pyxrt.py`
+asserts every argument against it, so a mis-ordered argument of a different size is a
+failed assert rather than a wrong answer.
+
+**3. What does `ParameterScratchpad` need?** A `pyxrt.run` object (for
+`get_ctrl_scratchpad_bo()`) and a `params.txt`. Nobody emits `params.txt` today — it is
+absent from every one of the ~200 dirs under `~/.npu/cache/`. It is an aiecc graph-edge
+output (`aiecc: wrote edge 'params.txt'`), one line per parameter:
+
+    1
+    input_offset 0 i32 addr
+
+**4. Per-dispatch overhead, measured.** Three configurations, three runs each of 12
+dispatches, first dropped (it is ~150 ms on every path — first touch of ~500 MB of weight
+BOs — and folding it in would report a warm-up as an overhead):
+
+    pyxrt, run held         medians 12883.3  12874.0  12823.5      spread 3.9-5.1%
+    pyxrt, rebound per call medians 15920.3  15856.7  15499.1      spread 2.2-4.6%
+    iron.jit callable       medians 18583.8  18591.4  18168.3      spread 5.4-9.3%
+
+    holding the run object vs rebinding it:  -2983 us/dispatch
+    holding the run object vs iron.jit:      -5714 us/dispatch
+
+Cross-checked on a second clock: `run_iters` on the iron.jit path reports npu min 12524.8 /
+avg 12843.1 us against e2e min 17710.1 / avg 18545.2 us. The npu figure matches the held-run
+pyxrt wall time (min 12528.1, median 12883.3) — i.e. **with the run object held, wall time
+IS the NPU time; the host cost falls below the measurement's resolution.**
+
+This reframes a number in the CURRENT STATE section. The 12703.5 us that produces 63.7 tok/s
+is `--bench`'s `npu.min_us`, the interval around `run.wait()`. It is a correct measurement of
+the dispatch and it is what the projections are built from, but a token driven by the
+`iron.jit` callable costs 18.6 ms wall, not 12.7 — the difference is host-side and was never
+in the figure. Multi-token pays it per token. Holding the run object recovers all of it,
+which is what the `ParameterScratchpad` flow does anyway, since the parameter is written into
+a BO reached through that same run object.
+
+#### One thing worth having checked
+
+At pos 0 with fixed input, a dispatch that silently reused the previous result is
+indistinguishable from a correct one. `--recheck` therefore perturbs block 0's x by 0.5x
+(exact in bf16), dispatches on the SAME held run, restores, and dispatches again: the output
+must move and then return bit for bit. It does. A held `pyxrt.run` re-reads its buffers'
+current contents on every `start()`, which is the property the multi-token loop is built on.
+
+#### What is left
+
+Nothing on the host side. The remaining work is in the design: a `ScratchpadParameter` on the
+drain offsets in `fused.py`, `aiecc_flags=["--get-scratchpad-parameters"]`, one rebuild — and
+then `g_kprev` survives, because there is no new xclbin to load.
