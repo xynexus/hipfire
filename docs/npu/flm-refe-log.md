@@ -12986,3 +12986,35 @@ or numbers, so the distinction never surfaced.
 
 So the rule needs sharpening: interpolate varying parameters into *code* — names,
 literals, arguments — not into comments or docstrings.
+
+### Group C passes: the last fault was DIM_ACCN
+
+`flm_gemv_down` accumulates across chunks in `g_acc_down`, indexed `base % DIM_ACCN`.
+The define defaults to 128. `p5_pass` passed the correct value; group C's flag list
+never did, so a pair spanning `2 * p5tiles * NROWS` = 256 rows had two tiles aliasing
+onto the same accumulator slot. That is why the error was identical on all sixteen
+cores — it was not a data-routing fault at all, it was the accumulator being half
+the size the tiling needs.
+
+    P3 h     : 9.5367e-07
+    P4 sw    : 2.9297e-03   (2.08% of peak)
+    P5 x_out : 0.0000e+00   exact
+
+P5 is bit-exact against the host reference. All three projection phases now run in
+one dispatch on sixteen cores, with h reaching P4 and sw reaching P5 inside the
+dispatch.
+
+Two process notes from this hunt, both about believing the wrong thing confidently:
+
+The `-DDIM_ACCN` flag alone did not change the result *at all* — the same digits to
+five places. That looked like evidence the theory was wrong, and it nearly ended the
+line of inquiry. It was the AST cache again: compile flags do not bust it either.
+Only after stamping ACCN into the fifo name did the rebuild happen and the error go
+to zero. An unchanged result after a real change is not a refutation; it is first a
+question about whether the change was actually built.
+
+And the "uniformly wrong on every core" reasoning was sound but pointed one step too
+far. I read it as "upstream of the per-core work — the broadcast or the weight
+stream." It was neither: it was a per-core constant that happened to be wrong
+identically on every core. Uniformity implicates anything shared, including shared
+compile-time configuration, not only shared data paths.

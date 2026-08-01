@@ -195,7 +195,13 @@ def build(pos, nobj):
              f"-DDIM_NPADOFF={32 * OBJ}", "-DQOFF_FROM_KV=1",
              f"-DDIM_RESN={2 * p3tiles * NROWS}",
              f"-DDIM_P3TILES={p3tiles}",
-             f"-DDIM_OBJROWS={OBJ}"]
+             f"-DDIM_OBJROWS={OBJ}",
+             # g_acc_down spans a PAIR's rows. The default is 128; group C's pair
+             # spans 2*p5tiles*NROWS, and since the kernel indexes it as
+             # `base % DIM_ACCN`, too small a value aliases two tiles onto one
+             # accumulator slot -- wrong on every core equally, which is the
+             # symptom P5 showed.
+             f"-DDIM_ACCN={2 * p5tiles * NROWS}"]
     # This list must match `at` element for element. Weights and q results are
     # per P1 PAIR (only those cores run P1); the cache, P3's weights and P3's
     # results are per pair, since every core runs P3.
@@ -259,7 +265,7 @@ def _design({P}):
                            arg_types=[bc_ty, op_ty, p1o_ty],
                            compile_flags=FLAGS)
 
-    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_c32n8_{NLAY}_o{NCHUNK * 2 * p5tiles * OBJ}")
+    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_c32n8_{NLAY}_o{NCHUNK * 2 * p5tiles * OBJ}_a{2 * p5tiles * NROWS}")
     bc_cons = [f_bc.cons() for _ in range({NCORES})]
     f_w = [ObjectFifo(oppair_ty, name=f"wp{{i}}_n{NROWS}k{KVPER}") for i in range({npairs})]
     w_sub = [f.cons().split([0, {OPERAND}], obj_types=[op_ty, op_ty]) for f in f_w]
