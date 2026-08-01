@@ -10935,3 +10935,72 @@ have run out of per-core DMA and routing budget.
 Re-decomposition into fewer/larger phases would need to address all three at once,
 and memtile staging is the named lever for the DMA half of it. That is a design
 choice, not an implementation step, which is why it is still open.
+
+## 2026-08-01 — FLM's actual shape, read off its ABI
+
+Asked directly: what shape does the FLM kernel use? The answer is in
+`libllama_npu.so`'s exported symbols, and it is **not the shape I built**.
+
+### What ships
+
+    Llama-3.2-1B-NPU2/  attn.xclbin  layer.xclbin  mm.xclbin  dequant.xclbin
+
+All four are `MLIR_AIE` kernels with 5 buffer objects (`bo0..bo4`, `instr`,
+`ninstr`, `opcode`) at `column_width = 8` — the same toolchain and the same
+partition width my designs use, so neither is a differentiator. **There are no
+instruction files on disk**: FLM generates its instruction stream at runtime.
+
+### The generator API
+
+    llama_npu_sequence::gen_layer_seq      (npu_sequence*, unsigned int layer)
+    llama_npu_sequence::gen_mha_engine_seq (npu_sequence*, unsigned, unsigned)
+    llama_npu_sequence::gen_lm_head_seq    (npu_sequence*)
+    llama_npu_sequence::gen_dequant_seq    (npu_sequence*, ...)
+
+    Impl::mvm_tiles        Impl::proj_tiles
+    Impl::attn_qk_tiles    Impl::attn_kv_tiles
+
+    Impl::_send_x            Impl::_send_rms_weights   Impl::_send_rope_weights
+    Impl::_move_weights      Impl::_move_kv_cache      Impl::_receive_kv_cache
+    get_k03_offset  get_k47_offset  get_v03_offset  get_v47_offset
+
+    npu_sequence::rtp_write     (npu_tiles, unsigned, unsigned)
+    npu_sequence::npu_dma_wait  (npu_tiles, dma_direction, npu_it_channel)
+    npu_sequence::npu_preemption(unsigned)
+
+### The shape, and why it matters
+
+**Tiles are specialised by ROLE, not cycled through phases.** `mvm_tiles`,
+`proj_tiles`, `attn_qk_tiles` and `attn_kv_tiles` are four distinct tile groups.
+A core belongs to one group and runs one kind of kernel. Data moves between
+groups.
+
+Mine is the opposite: 16 uniform cores, each holding **every** phase body and
+running them in sequence. That is exactly why program memory binds at four bodies
+per core and a five-phase layer needs two dispatches.
+
+**Under FLM's shape the program-memory wall does not exist.** A core that only
+does mvm holds one kernel. The 2272 B shortfall, the merged acc+flush, the
+body-count arithmetic — all of it is an artefact of insisting every core can do
+everything.
+
+Three more things the ABI shows:
+
+  * **`rtp_write(npu_tiles, ...)`** — runtime parameters are written into tiles.
+    The array is configured once and re-parameterised per layer rather than
+    re-dispatched with a new program. That is a plausible route to far fewer
+    dispatch floors than 16 x 2.
+  * **`npu_dma_wait(tiles, direction, channel)`** — explicit DMA synchronisation
+    at sequence level, per tile group and channel. Movement is scheduled, not
+    left to objectfifo back-pressure.
+  * **`get_k03_offset` / `get_k47_offset`** (and v) — the 8 KV heads are handled
+    in two groups of four. My NATT=4 covers exactly half the heads, which now
+    looks less like a limitation I hit and more like half of FLM's own split.
+
+`npu_preemption(unsigned)` also means the sequence yields — relevant to sharing
+the NPU with another process, which is not something my designs do at all.
+
+**Caveat, stated plainly: this is inferred from an ABI, not observed.** Symbol
+names and signatures are strong evidence of structure but say nothing about how
+many dispatches actually issue per token. Confirming that needs runtime
+observation, which has not been done.
