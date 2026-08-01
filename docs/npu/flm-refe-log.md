@@ -14000,3 +14000,44 @@ Two claims of mine failed the same way this session: both were about data flowin
 between phases, and both were checked by looking at whether each phase's *output* was
 right rather than at where its *input* came from. A phase fed a correct host reference
 produces a correct output and tells you nothing about the seam ahead of it.
+
+### The device pipeline's weights are not the checkpoint's
+
+Chasing why the corrected host forward still disagreed with the fp32 oracle turned up
+something larger than the residual bug. There are two decoders in this tree and they do
+not agree:
+
+    load_linear(c, "model.layers.0.self_attn.v_proj.weight", 512, 2048)
+        Frobenius 10.781
+    q4nx_decode_tensor(c, same, (512, 2048))
+        Frobenius  9.382
+
+    identical: False        rel diff 1.52234
+
+Not a permutation — a permutation preserves the Frobenius norm and these differ by
+1.149x. That number is already in the tree: `blocks()` records "the container's
+Frobenius norm exceeds the checkpoint's by 1.16x" as a known unresolved discrepancy.
+
+`q4nx_decode_tensor` is the one verified against the real checkpoint (corr 0.997 on all
+seven layer-0 tensors). It maps a container row to a 32x256 TILE with a real rule —
+row-group, column-group, and a stride-2 interleave for q and k. `load_linear` does a
+linear reshape of the container's raw rows, which is a different tensor.
+
+**The device pipeline uses `load_linear`.** `group_c`, `groups_ab` and `p5_pass` all
+pack their tiles from it. So the weights on the device are not the model's weights.
+
+Why every check still passed: the host references use `load_linear` too. Device and
+reference agree because they share the same wrong tensor. `blocks()` even says so, about
+the nibble order — "every downstream use repacks them anyway, so the choice cancels
+out". It cancels out between the device and the reference. It does not cancel out
+against the model.
+
+That leaves the residual bug's status unresolved rather than fixed. The corrected host
+forward still lands at x1 mean 0.038 / max 0.399 against the oracle's 0.083 / 20.94, and
+with the wrong weights underneath it, that gap cannot be attributed to the residual one
+way or the other. Both faults have to be corrected before either can be judged.
+
+What still stands: everything about throughput, dispatch structure, placement, and the
+kernels as *operations*. A GEMV that computes `sum(d*q + m)` correctly does so whatever
+the weights mean, and `gemv_verify --real` measured exactly that. What does not stand is
+any claim that this pipeline computes Llama-3.2-1B.
