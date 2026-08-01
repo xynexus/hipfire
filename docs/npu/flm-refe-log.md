@@ -11773,3 +11773,40 @@ sequencing rather than one fifo per core group.
 **Status:** the quad restructure is complete enough to have proven it cannot work,
 and stops here. `layer_quad.py` stays in the tree as the record of that, with the
 channel arithmetic in its docstring. `p1p2_chain` remains the working design.
+
+### MEASURED: core-to-core fifos use no memtile at all — the path reopens
+
+`core2core_probe.py` builds `worker A --f_mid--> worker B --f_out--> shim` and
+reads the generated MLIR:
+
+    f_mid: aie.objectfifo @c2c_mid(%logical_core, {%logical_core_0}, 1)
+    MemTiles declared in the whole design: 0
+
+**Zero.** A fifo between two core tiles is placed directly on them; it consumes no
+memtile DMA. The result also computes correctly, so this is a working stream and
+not just a placement artefact.
+
+That changes the arithmetic that killed the quad plan. The join side cost `cores`
+input channels *because every core emitted its own result to shim*. If
+intermediate results move core to core and only a subset emits, the joins cost
+only that subset:
+
+    cores  emit  splits(4w)  joins  total in   (budget 48)
+      32    32        8        32       40     today's shape, exactly full
+      32    16        8        16       24     slack
+      32     8        8         8       16     ample
+
+So 32 cores is reachable — not by widening fifos, which cannot work, but by
+**changing which cores emit**. Intermediate phases hand off core to core; only the
+final projection writes out.
+
+This is FLM's shape arriving from a third direction. Its ABI names four tile
+groups with results moving between them, its per-core DMA fanin is 2-in/2-out, and
+its `npu_dma_wait(tiles, direction, channel)` sequences movement per group and
+channel. Each of those reads as a consequence of the same constraint rather than a
+stylistic choice.
+
+**The plan is no longer "wider fifos on the same phases".** It is: role-specialise,
+stream between groups, emit from one. That is a different program, and the first
+thing it needs is a measurement of what a core-to-core handoff costs in time —
+which this probe does not answer.
