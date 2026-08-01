@@ -14282,3 +14282,40 @@ The check has to be external: compute q' and k' at a nonzero position from
 `consolidated.00.pth` in Meta convention with the llama3-scaled frequencies, and compare
 against what the device produces for the same activation. That is the next step, and it
 is the last unverified part of the layer.
+
+### RoPE is wrong at every nonzero position
+
+External check at position 7, layer 0, q' — oracle built from `consolidated.00.pth` in
+Meta convention with llama3-scaled frequencies:
+
+    unrotated q (sanity)     6.36% of peak      <- the 4-bit quantization floor
+    kernel half-split      150.99% of peak      WRONG
+    pairwise (Meta)          6.36% of peak      correct to the floor
+
+The pairwise result lands exactly on the quantization floor — the same 6.36% the
+*unrotated* comparison shows — so pairwise is right to the last bit that 4-bit weights
+allow. Half-split is off by more than the signal.
+
+This is the risk flagged one entry ago, confirmed. `q4nx_decode_tensor` returns q/k in
+Meta order, where RoPE rotates (2i, 2i+1) pairs; the kernel rotates half-split, which
+needs rows pre-permuted. The container's raw layout *was* that permutation, and today's
+weight fix replaced it with the un-permuted form — correct for every other tensor, and
+wrong for exactly the two that get rotated.
+
+What this does and does not invalidate:
+
+  * **pos 0 is unaffected.** The rotation is the identity there, so the token 16309 and
+    the 0.9997 cosine stand exactly as reported.
+  * **every nonzero position is affected**, which is every result at pos 7, 15, 30, 31 —
+    including the "k' exactly 0.0, attention 0.51 ULP" run from after the weight change
+    that I explicitly said could not settle this. It could not, and it did not.
+  * the throughput numbers are untouched, as always.
+
+The fix is a row permutation on q_proj and k_proj only, so that half-split reproduces
+pairwise: per head, dims ordered [0,2,4,...,62, 1,3,...,63]. `qkv_verify` already has a
+`--interleave` flag described as "pack q/k rows in the (2i,2i+1) order; one kernel serves
+both", so the mechanism exists and the designs do not use it.
+
+Worth stating plainly: this was found only because the pos-0 success was treated as
+insufficient. Everything internal agreed at pos 30 — device against reference, k' at
+exactly 0.0 — and all of it was two wrong things matching.
