@@ -14306,3 +14306,23 @@ measurement is independent of whether those bytes were the ones I intended to wr
 
 What it does block is an end-to-end multi-token decode, where the cache has to hold the
 right values and not merely self-consistent ones.
+
+### The KVPLAN hypothesis was wrong
+
+    KVPLAN: core g -> base g, identity for all eight
+    head_layout(8): core c holds k head 32+c and v head 40+c, also in order
+
+So the slot mapping is not the cache-write bug. The prior-position write assumes slot g
+holds head g and that is exactly what the drain does. The row bases are right too — k
+head g starts at row 2048 + 64g and v head g at 2560 + 64g in the concatenated
+[Wq; Wk; Wv], which is what `qkv_rows` was asked for.
+
+Recording the falsification rather than quietly moving on, because the previous entry
+proposed this as the likely cause and it is not. The bug is somewhere else in the pack —
+plausibly the V object's extent, since the drain writes `2 * OBJ` elements per v head
+with a comment about row `pos` and row `pos+1`, and the prior write fills a single
+`HEAD`-wide row.
+
+Not pursued further. The device claim does not depend on it: attention was measured
+against a reference built from the bytes the device read, at 0.57 ULP over four real
+positions. What remains blocked is an end-to-end multi-token decode.
