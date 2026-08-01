@@ -14041,3 +14041,40 @@ What still stands: everything about throughput, dispatch structure, placement, a
 kernels as *operations*. A GEMV that computes `sum(d*q + m)` correctly does so whatever
 the weights mean, and `gemv_verify --real` measured exactly that. What does not stand is
 any claim that this pipeline computes Llama-3.2-1B.
+
+### Measured: the pipeline's weights are uncorrelated with the model
+
+Both decoders against the real checkpoint, layer 0:
+
+    v  q4nx_decode_tensor   corr +0.99700   relF 0.07748
+    v  load_linear          corr +0.00107   relF 1.52109
+    o  q4nx_decode_tensor   corr +0.99715   relF 0.07564
+    o  load_linear          corr +0.00041   relF 1.52716
+
+`q4nx_decode_tensor` is right: 0.997 correlation, 7.6% relative error, which is 4-bit
+quantization and nothing else. `load_linear` is **corr 0.001** — not misordered, not
+approximately right, *uncorrelated*. Whatever it returns bears no relation to the
+model's weights.
+
+Every design here packs its tiles from `load_linear`. So the device has been computing
+GEMVs against effectively scrambled weights, and every correctness check agreed
+because the host references read the same scrambled weights.
+
+This subsumes the earlier finding rather than adding to it. The 1.16x Frobenius
+discrepancy recorded in `blocks()` was not a loose end about nibble order — it was this,
+visible from the start, in a function whose own docstring says the choice "cancels out".
+It cancels between two consumers of the same wrong data.
+
+The fix path is already in the tree: `q4nx_tensor_blocks()` exists alongside
+`q4nx_decode_tensor()` and returns blocks in checkpoint order, which is the form the
+tile packer needs. Nothing new has to be reverse-engineered; the pipeline is calling the
+wrong one of two functions that were written side by side.
+
+Ordering of what to trust, restated after three retractions in a row:
+
+  * throughput, dispatch counts, placement, program memory — unaffected, the arithmetic
+    is identical whatever the operands are
+  * the GEMV kernel as an operation — unaffected, `w = d*q + m` is computed correctly
+  * anything about what the pipeline computes — retracted, including the sixteen-layer
+    chain, the token, and this task's own earlier conclusion that the kernels were
+    "verified as computing the model"
