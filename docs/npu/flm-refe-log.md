@@ -14177,3 +14177,44 @@ Three harness faults now, all with the same shape: the check looked at whether e
 stage's output matched its own reference, and no reference asked where the input came
 from. A stage fed a plausible wrong input produces an output that matches a reference
 computed from the same wrong input.
+
+## THE DEVICE COMPUTES THE MODEL
+
+Sixteen layers on the NPU, from the BOS embedding at position 0, through the full role
+architecture — P1 qkv+RoPE, P2 attention, P3 o_proj, P4 gate/up/SwiGLU, P5 down_proj —
+then the head:
+
+    device x16   mean|.| 1.75427   max 150.00000
+    host   x16   mean|.| 1.74094   max 148.66782
+    cosine       0.999659
+
+    device argmax 16309   +6.9032   then 2, 1340, 791, 1757
+    host   argmax 16309   +6.9125   then 2, 1340, 791, 1757
+    oracle argmax 16309   +7.0285   then 2, 791, 1340, 475
+
+The device, the host reference and an independent fp32 forward that shares no code with
+either all produce the same token. The device's hidden state tracks the host's to
+0.9997 cosine, and both track the unquantised oracle to within 4-bit quantization
+error.
+
+This is the first result here that means what it says. Everything before it was a
+comparison between two things that shared a mistake.
+
+It took four faults, none visible from inside:
+
+  1. weights read in the container's row order — corr 0.001 against the checkpoint
+  2. P5's residual on x rather than h, so every layer discarded its own attention
+  3. group C's phases fed host references instead of the previous phase's output
+  4. group C inventing its own layer input, so the chain's residual was random per layer
+
+Every one of them passed every check, because each check compared a stage's output
+against a reference computed from the same wrong input. The single external oracle
+found all four in an afternoon.
+
+Unchanged by all of this: throughput. The arithmetic is identical whatever the operands
+are — 124.8 us/layer for A+B, 637.9 for C, 2994.2 for lm_head, 65.4 tok/s projected for
+a fused dispatch. Those numbers never depended on the values being right.
+
+Still open: the fused single dispatch (the throughput claim), group C's internal seams
+(P4 and P5 still read host h and sw — the residual fix uses the host's h), and any
+position past 0, where RoPE stops being the identity and attention stops being trivial.
