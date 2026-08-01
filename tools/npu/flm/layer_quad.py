@@ -103,6 +103,8 @@ def build(pos, nobj):
     # is what the 8 memtiles limit: 2-way gives 2*npairs links (36 at 32 cores,
     # fails placement), 4-way gives 2*nquads (18, the working design's count).
     nquads = NCORES // 4
+    p1quads = (npairs - apairs) // 2      # quads whose cores run P1
+    aquads = apairs // 2                  # quads whose cores run attention
     apairs = NATT // 2
     # Partition B: the attention cores cannot also hold P1's kernels (measured —
     # five phases overflow 16 KB), so P1 spreads over the remaining cores.
@@ -164,8 +166,10 @@ def build(pos, nobj):
     opquad_ty = np.ndarray[(4 * OPERAND,), np.dtype[np.uint8]]
     p1o_ty = np.ndarray[(OBJ,), np.dtype[bfloat16]]
     p1opair_ty = np.ndarray[(2 * OBJ,), np.dtype[bfloat16]]
+    p1oquad_ty = np.ndarray[(4 * OBJ,), np.dtype[bfloat16]]
     p2o_ty = np.ndarray[(GQA * HEAD,), np.dtype[bfloat16]]
     p2opair_ty = np.ndarray[(2 * GQA * HEAD,), np.dtype[bfloat16]]
+    p2oquad_ty = np.ndarray[(4 * GQA * HEAD,), np.dtype[bfloat16]]
     # P3's o_proj is over the whole 2048-dim vector, so P2's per-pair results
     # have to land in ONE buffer before they can feed the next phase's
     # broadcast. Several pairs draining into one BO at different offsets is the
@@ -265,14 +269,18 @@ def _design(bc: In, {P}):
            for i in range({nquads})]
     w_sub = [f.cons().split([i * {OPERAND} for i in range(4)],
                             obj_types=[op_ty] * 4) for f in f_w]
-    f_p1 = [ObjectFifo(p1opair_ty, name=f"p1o{{i}}") for i in range({npairs})]
-    p1_sub = [f.prod().join([0, {OBJ}], obj_types=[p1o_ty, p1o_ty]) for f in f_p1]
+    # Outputs join four ways too. Widening only the weight side would leave
+    # nquads + npairs + aquads = 26 links at 32 cores, still over the 8
+    # memtiles; 4-way on both sides gives 18, the working count.
+    f_p1 = [ObjectFifo(p1oquad_ty, name=f"p1o{{i}}") for i in range({nquads})]
+    p1_sub = [f.prod().join([i * {OBJ} for i in range(4)],
+                            obj_types=[p1o_ty] * 4) for f in f_p1]
     # P2's own result fifo — P1 emits {OBJ} bf16 objects and P2 emits
     # {GQA * HEAD}; one fifo cannot carry both sizes. Only pairs 0..{apairs - 1}
     # need it, and a core has 2 output channels.
-    f_p2 = [ObjectFifo(p2opair_ty, name=f"p2o{{i}}") for i in range({apairs})]
-    p2_sub = [f.prod().join([0, {GQA * HEAD}], obj_types=[p2o_ty, p2o_ty])
-              for f in f_p2]
+    f_p2 = [ObjectFifo(p2oquad_ty, name=f"p2o{{i}}") for i in range({aquads})]
+    p2_sub = [f.prod().join([i * {GQA * HEAD} for i in range(4)],
+                            obj_types=[p2o_ty] * 4) for f in f_p2]
 
     def p1_body(bcc, wc, op, kqkv, kemit, kprep):
         eb = bcc.acquire(1)
@@ -401,27 +409,28 @@ def _design(bc: In, {P}):
             c = 2 * p + j
             if p >= {npairs} - {apairs}:
                 workers.append(Worker(core_p1p2,
-                    fn_args=[bc_cons[c], w_sub[c // 4][c % 4].cons(), p1_sub[p][j].prod(),
-                             p2_sub[p - ({npairs} - {apairs})][j].prod(), kq, ke, kn, kab, kat, kaf, kr3, kas, khe, kg4, ku4],
+                    fn_args=[bc_cons[c], w_sub[c // 4][c % 4].cons(), p1_sub[c // 4][c % 4].prod(),
+                             p2_sub[(c - ({npairs} - {apairs}) * 2) // 4][c % 4].prod(), kq, ke, kn, kab, kat, kaf, kr3, kas, khe, kg4, ku4],
                     stack_size=8192))
             else:
                 workers.append(Worker(core_p1,
-                    fn_args=[bc_cons[c], w_sub[c // 4][c % 4].cons(), p1_sub[p][j].prod(),
+                    fn_args=[bc_cons[c], w_sub[c // 4][c % 4].cons(), p1_sub[c // 4][c % 4].prod(),
                              kq, ke, kn, kr3, kas, khe, kg4, ku4], stack_size=8192))
 
     def sequence(*args):
-        n, a = {npairs}, {apairs}
+        n, a = {nquads}, {aquads}      # QUAD counts now, not pairs
+        pq = {p1quads}
         bcb = args[0]
-        wb = [args[1 + i] for i in range({p1pairs})]
+        wb = [args[1 + i] for i in range(pq)]
         kvb = [args[1 + {p1pairs} + i]
                for i in range(a + (a if {HOSTKV} else 0))]
         ax = a + (a if {HOSTKV} else 0)
         qb = [args[1 + {p1pairs} + ax + i] for i in range({p1pairs})]
         cb = [args[1 + 2 * {p1pairs} + ax + i] for i in range(n)]
-        ab = [args[1 + 2 * {p1pairs} + ax + n + i] for i in range(a)]
+        ab = [args[1 + pq + pq + ax + n + i] for i in range(a)]
         # tensor args: bc, w*p1pairs, (kvin+hostcache)*ax, q*p1pairs,
         # cache*n, attn*a, then P3's bc + w3*n + h*n. Handles follow all of them.
-        base3 = 1 + 2 * {p1pairs} + ax + n + a
+        base3 = 1 + pq + pq + ax + n + a
         base4 = base3 + 1 + 2 * n
         base = base4 + 1 + 2 * n
         bch = args[base]
@@ -529,11 +538,15 @@ def _design(bc: In, {P}):
                              strides=[0, {OBJ}, {rpp4} // 2, 1])
             tg.finish()
 
-    at = [bc_all_ty] + [w_all_ty] * {p1pairs} + [kvin_ty] * {apairs}
-    at += [cache_ty] * ({apairs} if {HOSTKV} else 0)
-    at += list(q_tys) + [cache_ty] * {npairs} + [attn_all_ty] * {apairs}
-    at += [bc_ty] + [w3_ty] * {npairs} + [h_ty] * {npairs}
-    at += [bc_ty] + [w4_ty] * {npairs} + [sw_ty] * {npairs}
+    # Everything the operand fifos carry is now counted in QUADS. Note the two
+    # groups differ: w_ts covers only the P1 quads, while w3/w4 cover every quad
+    # because all cores run P3 and P4 — so these shift by different amounts and a
+    # single rename does not serve.
+    at = [bc_all_ty] + [w_all_ty] * {p1quads} + [kvin_ty] * {aquads}
+    at += [cache_ty] * ({aquads} if {HOSTKV} else 0)
+    at += list(q_tys) + [cache_ty] * {nquads} + [attn_all_ty] * {aquads}
+    at += [bc_ty] + [w3_ty] * {nquads} + [h_ty] * {nquads}
+    at += [bc_ty] + [w4_ty] * {nquads} + [sw_ty] * {nquads}
     at += [f_bc.prod(tile=AnyShimTile)]
     at += [f.prod(tile=AnyShimTile) for f in f_w]
     at += [f.cons(tile=AnyShimTile) for f in f_p1]
@@ -549,7 +562,9 @@ def _design(bc: In, {P}):
               BEG_SRC=BEG_SRC, RES_SRC=RES_SRC, ASUM_SRC=ASUM_SRC, HEMIT_SRC=HEMIT_SRC,
               GATE_SRC=GATE_SRC, UPS_SRC=UPS_SRC, FIN_SRC=FIN_SRC, FLAGS=flags, bc_ty=bc_ty,
               op_ty=op_ty, oppair_ty=oppair_ty, p1o_ty=p1o_ty,
-              p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty, attn_all_ty=attn_all_ty, w3_ty=w3_ty, h_ty=h_ty, p3tiles=p3tiles,
+              p1opair_ty=p1opair_ty, p1oquad_ty=p1oquad_ty,
+              p2o_ty=p2o_ty, p2opair_ty=p2opair_ty, p2oquad_ty=p2oquad_ty,
+              opquad_ty=opquad_ty, attn_all_ty=attn_all_ty, w3_ty=w3_ty, h_ty=h_ty, p3tiles=p3tiles,
               w4_ty=w4_ty, sw_ty=sw_ty, p4tiles=p4tiles,
               p4per=p4per, p4objs=p4objs, rpp4=rpp4, D_FF=D_FF,
               w_all_ty=w_all_ty, bc_all_ty=bc_all_ty, kvin_ty=kvin_ty, q_tys=q_tys,
