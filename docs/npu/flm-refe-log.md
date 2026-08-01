@@ -14885,3 +14885,17 @@ new core code.
 This is the day's pattern once more, in the one place I had not yet hit it — I inferred a
 quantity from an artifact instead of measuring the quantity itself, and the artifact was
 adjacent to the answer rather than equal to it.
+
+### The kernel removal is bit-neutral, measured
+
+    lean x16 vs previous build   max abs diff 0.000e+00
+    lean x16 vs validated host   cosine 0.999659
+    argmax 16309                 +6.9032, then 2, 1340
+
+Sixteen device layers, bit-identical output to the build before the dead declarations
+were removed. Not "should be neutral" — the same bits.
+
+That closes the change: the declarations were dead, removing them frees 320 B, correctness
+is unchanged at every level checked (single layer, sixteen-layer chain, and the token).
+The only thing it did not do is what I claimed it would, which the previous entry
+retracts.
