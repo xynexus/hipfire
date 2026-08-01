@@ -16563,3 +16563,132 @@ wrong, and only an unrelated invalidation could reveal it.
     tools/npu/flm/fused_pyxrt.py   diagnostics only now; --iron is gone, because that
                                    path never writes the scratchpad and would dispatch
                                    with whatever offsets a fresh BO happens to hold
+
+## THE BAR: the device reproduces FLM's tokens, on FLM's own context
+
+    prompt "Hi", captured from the FLM server on 2026-08-02
+    36 templated tokens, the sequence FLM actually fed the model
+
+    device   [4438, 649, 358, 1520]
+    FLM      [4438, 649, 358, 1520, 499, 3432, 30, 128009]   "How can I help you today?"
+
+Four for four, and they are the first four the server produced. Every position
+0..38 was decoded by the DEVICE, in order, carrying its own KV cache, with the
+odd ones closing their K column pairs out of `g_kprev[layer]`. Nothing about this
+comparison is approximate: the context is byte-identical to the server's, taken
+from its own `/api/generate` `context` array on the same day, so the system
+block's date matches.
+
+Four rather than more because the cache is 40 columns and the context is 36:
+positions 35..38 are what is left. The comparison this project had never been
+able to make is now a matter of how much context the design holds.
+
+Per token at TSEQ=40:
+
+    layers   13298.4 us   median of 4 generated steps, held run, wall clock
+    lm_head   3010.6 us   measured separately
+    host        10.5 us
+    token    16319.5 us   ->  **61.3 tok/s**   FLM 61.18, +0.2%
+
+**TSEQ=40 costs 5.0% of throughput** — 13298.4 against 12667.2 us at TSEQ=32,
+which is 63.7 tok/s down to 61.3. The DMA is untouched: `KVSTRIDE` is 5152 at
+both, so the design moves exactly the same bytes. The whole 631 us is compute —
+the tail score vector doubles the score MACs, p.V runs 40 rows instead of 32, and
+K's loads become unaligned. So context length is a knob against throughput here,
+not a free widening, and the two configurations are one constant apart.
+
+### TSEQ = 40: the scores are a 32-lane vector plus a masked tail
+
+40 is the largest context this design can hold. The KV tile is `2 * HEAD * TSEQ`
+bf16 and has to fit OPERAND, the ONE object size every fifo in the fused design
+shares — which is also group C's q4nx weight tile:
+
+    TSEQ=32   8192 B    fits
+    TSEQ=40  10240 B    fits, 64 B spare
+    TSEQ=44  11264 B    exceeds 10304
+
+and `KVSTRIDE = max(KTILE + VTILE, OPERAND / 2) = max(5120, 5152) = 5152` at
+TSEQ=40 — exactly the stride at 32 — so not one cache offset moves. The host
+side is a single constant.
+
+`flm_attn_decode.cc` is where the work is. `static_assert(TSEQ == 32, "score
+vectors are one 32-lane register")` was load-bearing: the running max, the
+denominator and p.V all live in one vector. The scores are now a 32-lane vector
+plus a 32-lane TAIL of which 8 lanes are valid, and at TSEQ=32 the tail compiles
+out entirely under `#if SCORE1` — which is why the whole sweep below is
+unchanged to the digit.
+
+**Two build failures, and the first one's cause is only half established.** An
+8-lane tail failed in the backend with `unable to legalize instruction:
+<16 x s32> G_FADD`. Widening it to 32 lanes did NOT fix that. What fixed it was
+folding the tail's denominator into the SAME accumulator as the head's — a
+masked lane's score is -3.0e38, so its `exp2` is exactly 0 and it adds nothing —
+and its max into one reduction over `aie::max(sv, sv_t)`. So the cause was the
+second accumulator and the second `reduce_add`, not the vector width, and an
+8-lane tail was never retried after the fold. The kernel comment says so rather
+than the tidier story, which is what the first version of it said and was wrong.
+
+**The second failure is the one worth carrying forward.** K is channel-major with
+a row stride of TSEQ, so `kt + d * TSEQ` is 64-byte aligned for every `d` only
+when TSEQ is a multiple of the 32-lane vector. At 40 the rows are 80 B apart and
+three loads in four are misaligned — and **`aie::load_v` on a misaligned pointer
+does not fault, it reads the wrong bytes**:
+
+    pos 0   argmax 16309   cos vs oracle 0.999325     <- bit-exact
+    pos 1   argmax   471   cos vs oracle 0.091152
+    pos 2   argmax  6864   cos vs oracle 0.282122
+    pos 3   argmax   279   cos vs oracle 0.134273
+    pos 4   argmax 21959   cos vs oracle 0.053952
+
+Position 0 is exact because its softmax is over one entry, so the output is that
+entry's V and **no score reaches it** — the same structural blindness that hid
+the attention scale, the GQA mapping and the `log2(e)` factor earlier in this
+file, appearing a third time. Every position past it collapsed. `aie::
+load_unaligned_v<32>(p, 8)` — 8 being the alignment the 80-byte stride does
+guarantee — fixes it.
+
+### TSEQ=40 is arithmetically transparent
+
+Sequential device decode, cache written entirely by the device, against the fp32
+oracle — and against the same five runs at TSEQ=32:
+
+    pos 0 EVEN  argmax 16309  cos 0.999325   TSEQ=32 gave 0.999325
+    pos 1 ODD   argmax   220  cos 0.993758   TSEQ=32 gave 0.993758
+    pos 2 EVEN  argmax  2268  cos 0.987621   TSEQ=32 gave 0.987621
+    pos 3 ODD   argmax 39935  cos 0.938162   TSEQ=32 gave 0.938162
+    pos 4 EVEN  argmax 35308  cos 0.956228   TSEQ=32 gave 0.956228
+
+Six decimal places at every position, odd and even. The padded tail is 24 lanes
+wider and every one of them is masked out of the max, the denominator and p.V, so
+the arithmetic is the same arithmetic.
+
+### Sweep after the attention change
+
+Every design re-run — the kernel source changed, so every cached build was
+invalidated and every generator ran:
+
+    group_a        q' 3.8147e-06  k' 0.0000e+00  v' 5.9605e-08              PASS
+    groups_ab p0   attn 5.9605e-08 (0.00 ULP)  k' 0.0  v' 5.9605e-08        PASS
+    groups_ab p30  attn 4.8865e-04 (0.50 ULP)  k' 0.0  v' 5.9605e-08        PASS
+    group_c s31    P3 0.0000e+00  P4 2.9297e-03  P5 7.4506e-09              PASS
+    p5_pass        x_out 0.0000e+00                                         PASS
+    p1p2_chain s31 attn 3.1111e-03 vs tol 9.3994e-03                        PASS
+
+    fused, HOST-prefilled cache, at TSEQ=40:
+      pos 0  argmax 16309  cos vs oracle 0.999325   (recorded 0.999325)
+      pos 2  argmax  2268  cos vs oracle 0.986880   (recorded 0.986880)
+      pos 4  argmax 35308  cos vs oracle 0.964879   (recorded 0.964879)
+
+Identical to every recorded number. Those six designs all run TSEQ=32, where the
+tail is compiled out, so this is the check that the change is inert where it is
+meant to be — and it was worth running rather than asserting, because "this
+change is inert for other callers" is the claim that has proved false here twice.
+
+### Where the throughput stands, both configurations
+
+    TSEQ=32   12667.2 + 3010.6 + 10.5 = 15688.3 us -> 63.7 tok/s   +4.1%
+    TSEQ=40   13298.4 + 3010.6 + 10.5 = 16319.5 us -> 61.3 tok/s   +0.2%
+
+Same bytes, same dispatch structure, same everything but the width of the score
+path. The FLM token comparison needs 40; the throughput margin wants 32. Both
+are one constant in `fused.py` and one in the kernel, and both are verified.

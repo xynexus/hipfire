@@ -162,7 +162,14 @@ Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
 
 NROWS = 8
 TPH = HEAD // NROWS                     # 8 weight tiles per head
-GQA, TSEQ, KVPER = 4, 32, 1
+# TSEQ = 40, not 32. The KV tile is 2*HEAD*TSEQ bf16 and must fit OPERAND, the
+# ONE object size every fifo in this design shares (it is also group C's q4nx
+# weight tile): 32 -> 8192 B, 40 -> 10240, 44 -> 11264 and it stops fitting. So
+# 40 is the largest context this design can hold without a second operand size.
+# KVSTRIDE = max(KTILE+VTILE, OPERAND//2) = max(5120, 5152) = 5152, exactly the
+# stride at TSEQ=32, so no cache offset moves. `flm_attn_decode` carries the
+# scores as a 32-lane vector plus an 8-lane tail to reach it.
+GQA, TSEQ, KVPER = 4, 40, 1
 NA = NB = 8                             # P1 cores, P2 cores
 NC, NCP = 16, 8                         # C cores, C pairs
 # A's weight fifos. Every one of them is a MEMTILE INPUT CHANNEL, and A streams
@@ -332,7 +339,7 @@ def build(nlay, seq):
     # No `p{pos}` any more: position is a RUNTIME value, so one xclbin serves
     # every position -- which is what lets `g_kprev` survive from one token to
     # the next, since a new xclbin would clear core .bss.
-    tag = f"fz{nlay}rs{seq}n{NROWS}m{MASKPAD}a{AQ}" + (f"S{STUB}" if STUB else "")
+    tag = f"fz{nlay}rs{seq}n{NROWS}t{TSEQ}m{MASKPAD}a{AQ}" + (f"S{STUB}" if STUB else "")
     stubs = {}
     stubdefs = ""
     for var, (grp, name, argexpr) in _STUBBABLE.items():

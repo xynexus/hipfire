@@ -111,8 +111,55 @@ inline int kv_qoff(const uint8 *restrict kv) {
 } // namespace
 namespace {
 
-static_assert(TSEQ == 32, "score vectors are one 32-lane register");
+// The scores for one tile are TSEQ floats and there is no TSEQ-lane register
+// for an arbitrary TSEQ. They are carried as a 32-lane vector plus an optional
+// TAIL vector -- also 32 lanes, of which only SCORE1 are valid. TSEQ may be 32
+// (one vector; the tail compiles out entirely and the code is textually what it
+// always was) or 40 (32 + 8 valid).
+//
+// The tail is a FULL 32-lane vector, so it reads 32 columns from column SCORE0,
+// of which the last 24 run past K's row into the next channel's -- and are
+// masked off before they can reach the running max, the denominator or p.V. The
+// read stays inside the KV object (V follows K), so it is garbage, never a fault.
+//
+// It is 32 lanes rather than 8 for a reason that is only half established. An
+// 8-lane tail failed in the backend with `unable to legalize instruction:
+// <16 x s32> G_FADD`; widening it to 32 did NOT fix that, and what did was
+// folding the tail's denominator into the SAME accumulator as the head's (its
+// masked lanes exp2 to exactly 0) and its max into one reduction over
+// `aie::max(sv, sv_t)`. So the cause was the second accumulator and the second
+// reduce_add, not the width -- and an 8-lane tail was never retried after the
+// fold. Recording that rather than the tidier story, because the tidier story is
+// the one the first version of this comment told and it was wrong.
+//
+// 40 is not arbitrary. The fused layer's KV tile is `2 * HEAD * TSEQ` bf16 and
+// has to fit the one operand size every fifo in that design shares, 10304 B,
+// which is also group C's q4nx weight tile: 32 -> 8192 B, 40 -> 10240, 44 ->
+// 11264 and it no longer fits. At 40, `KVSTRIDE = max(KTILE + VTILE,
+// OPERAND / 2) = max(5120, 5152) = 5152` — today's stride — so the cache layout
+// does not move either.
+#define SCORE0 32
+#define SCORE1 (DIM_TSEQ - SCORE0)
+static_assert(TSEQ == 32 || TSEQ == 40,
+              "scores are one 32-lane register plus an optional tail");
+static_assert(SCORE1 >= 0 && SCORE1 <= SCORE0, "the tail is at most one vector");
 static_assert(HEAD % 32 == 0, "head_dim must be a multiple of 32");
+
+// K is channel-major with a row stride of TSEQ, so `kt + d * TSEQ` is 64-byte
+// aligned for every d only when TSEQ is a multiple of the 32-lane vector. At
+// TSEQ = 40 three loads in four are not, and `aie::load_v` on a misaligned
+// pointer does NOT fault — it reads the wrong bytes, which is worse. It cost one
+// build here: pos 0 was bit-exact (its softmax is over one entry, so no score
+// reaches the output) and every position past it collapsed to a cosine of 0.05
+// to 0.28 against the oracle.
+//
+// The rows are 40 bf16 = 80 B apart, so the pointer is always a multiple of 8
+// elements and never of 32; `load_unaligned_v` is told the 8 it can rely on.
+#if SCORE1
+#define KLOAD(p) aie::load_unaligned_v<SCORE0>((p), 8)
+#else
+#define KLOAD(p) aie::load_v<SCORE0>(p)
+#endif
 
 // Running softmax state, per query head. Persistent across tile() calls, which
 // is what makes the cache a single streaming pass.
@@ -144,14 +191,19 @@ static_assert(HEAD % 32 == 0, "head_dim must be a multiple of 32");
 #define ATTN_MASK_PAD 0
 #endif
 
-#if ATTN_MASK_PAD
+#if ATTN_MASK_PAD || SCORE1
 namespace {
 // No iota in the vector API and no runtime init on a core, so the lane indices
-// are a constexpr table.
+// are a constexpr table. It runs to TSEQ + SCORE0 rather than TSEQ when there is
+// a tail, because the tail's mask loads 32 lanes starting at column SCORE0 and
+// only SCORE1 of them are real columns -- the comparison has to see indices past
+// TSEQ so those lanes lose it. At TSEQ = 32 there is no tail and the table is
+// TSEQ entries, exactly as it was.
+constexpr int LANES_N = TSEQ + (SCORE1 ? SCORE0 : 0);
 struct LaneIdx {
-  float v[TSEQ];
+  float v[LANES_N];
   constexpr LaneIdx() : v() {
-    for (int i = 0; i < TSEQ; ++i)
+    for (int i = 0; i < LANES_N; ++i)
       v[i] = float(i);
   }
 };
@@ -199,13 +251,29 @@ flm_attn_tile(const uint8 *restrict q_raw,      // [GQA][HEAD] bf16, pre-scaled
   const bfloat16 *restrict vt = kt + TSEQ * HEAD;
   for (int h = 0; h < GQA; ++h) {
     // ---- scores: accumulate across the head dim, 32 positions at a time ----
-    aie::accum<accfloat, TSEQ> s;
-    s.from_vector(aie::zeros<float, TSEQ>());
+    aie::accum<accfloat, SCORE0> s;
+    s.from_vector(aie::zeros<float, SCORE0>());
     for (int d = 0; d < HEAD; ++d)
-      s = aie::mac(s, aie::load_v<TSEQ>(kt + d * TSEQ),
-                   aie::broadcast<bfloat16, TSEQ>(q[h * QSTRIDE + d]));
+      s = aie::mac(s, KLOAD(kt + d * TSEQ),
+                   aie::broadcast<bfloat16, SCORE0>(q[h * QSTRIDE + d]));
 
     auto sv = s.template to_vector<float>();
+#if SCORE1
+    // The tail lanes. K is channel-major [HEAD][TSEQ], so this segment is the
+    // same rows at a +SCORE0 column offset -- one more load per head dim.
+    aie::accum<accfloat, SCORE0> s_t;
+    s_t.from_vector(aie::zeros<float, SCORE0>());
+    for (int d = 0; d < HEAD; ++d)
+      s_t = aie::mac(s_t, KLOAD(kt + d * TSEQ + SCORE0),
+                     aie::broadcast<bfloat16, SCORE0>(q[h * QSTRIDE + d]));
+    auto sv_t = s_t.template to_vector<float>();
+    // Only SCORE1 of these lanes are this channel's. Killing the rest here,
+    // unconditionally, is what makes the over-read safe -- it must not depend
+    // on ATTN_MASK_PAD, which is a different correction and may be off.
+    sv_t = aie::select(aie::broadcast<float, SCORE0>(-3.0e38f), sv_t,
+                       aie::lt(aie::load_v<SCORE0>(g_lane.v),
+                               aie::broadcast<float, SCORE0>(float(SCORE1))));
+#endif
 #if ATTN_MASK_PAD
     // Valid lanes in THIS tile. npad rides the object's trailer and covers the
     // whole object, so it is spent tile by tile from the end.
@@ -213,43 +281,74 @@ flm_attn_tile(const uint8 *restrict q_raw,      // [GQA][HEAD] bf16, pre-scaled
       const int nv_i = TSEQ * KVPER - int(npad_dec) - u * TSEQ;
       const int nv = nv_i < 0 ? 0 : (nv_i > TSEQ ? TSEQ : nv_i);
       sv = aie::select(
-          aie::broadcast<float, TSEQ>(-3.0e38f), sv,
-          aie::lt(aie::load_v<TSEQ>(g_lane.v),
-                  aie::broadcast<float, TSEQ>(float(nv))));
+          aie::broadcast<float, SCORE0>(-3.0e38f), sv,
+          aie::lt(aie::load_v<SCORE0>(g_lane.v),
+                  aie::broadcast<float, SCORE0>(float(nv))));
+#if SCORE1
+      sv_t = aie::select(
+          aie::broadcast<float, SCORE0>(-3.0e38f), sv_t,
+          aie::lt(aie::load_v<SCORE0>(g_lane.v + SCORE0),
+                  aie::broadcast<float, SCORE0>(float(nv))));
+#endif
     }
 #endif
 
     // ---- online softmax update ----
+    // The running max and the denominator reduce over BOTH segments: a tail
+    // lane that wins the max and is not seen would leave the whole softmax
+    // frame wrong, and one that is not summed would leave the denominator short.
     const float m_old = g_m[h];
+#if SCORE1
+    // One reduction over the elementwise max of the two segments, rather than
+    // two reductions: the masked tail lanes are -3.0e38 and lose it.
+    const float m_tile = aie::reduce_max(aie::max(sv, sv_t));
+#else
     const float m_tile = aie::reduce_max(sv);
+#endif
     const float m_new = m_old > m_tile ? m_old : m_tile;
 
     // exp2, not exp: the 1/sqrt(head_dim) and log2(e) factors are already in q.
     const auto p = aie::exp2<bfloat16>(
-        aie::sub(sv, aie::broadcast<float, TSEQ>(m_new)));
+        aie::sub(sv, aie::broadcast<float, SCORE0>(m_new)));
+#if SCORE1
+    const auto p_t = aie::exp2<bfloat16>(
+        aie::sub(sv_t, aie::broadcast<float, SCORE0>(m_new)));
+#endif
     // No scalar libm on the core (`undefined symbol: exp2f`), so the rescale
     // factor goes through the same vector exp2 and one lane is extracted.
     const float corr = float(aie::exp2<bfloat16>(
-        aie::broadcast<float, TSEQ>(m_old - m_new))[0]);
+        aie::broadcast<float, SCORE0>(m_old - m_new))[0]);
     // Accumulate the tile's probability mass in FLOAT. `p` is bf16, and
     // reduce_add on a bf16 vector rounds at every step of the tree — ~1% on 32
     // values, and this is the softmax denominator, so it scales the output
     // directly. (Same fault as the activation block-sums in the GEMV.)
-    aie::accum<accfloat, TSEQ> pa;
-    pa.from_vector(aie::zeros<float, TSEQ>());
-    pa = aie::mac(pa, p, aie::broadcast<bfloat16, TSEQ>(bfloat16(1.0f)));
+    aie::accum<accfloat, SCORE0> pa;
+    pa.from_vector(aie::zeros<float, SCORE0>());
+    pa = aie::mac(pa, p, aie::broadcast<bfloat16, SCORE0>(bfloat16(1.0f)));
+#if SCORE1
+    // Into the SAME accumulator: a masked lane's score is -3.0e38, so its
+    // exp2 is exactly 0 and it adds nothing. One reduction, not two.
+    pa = aie::mac(pa, p_t, aie::broadcast<bfloat16, SCORE0>(bfloat16(1.0f)));
+#endif
     g_l[h] = g_l[h] * corr + aie::reduce_add(pa.template to_vector<float>());
 
     // ---- accumulate p . V, rescaling the running sum by corr ----
+    // V is position-major [TSEQ][HEAD], so the tail is just the last SCORE1
+    // rows and needs no second layout -- only its own probabilities.
     const auto cv = aie::broadcast<float, HALF>(corr);
     for (int off = 0; off < HEAD; off += HALF) {
       aie::accum<accfloat, HALF> a;
       // rescale the old accumulator into the new max's frame
       a.from_vector(aie::mul(aie::load_v<HALF>(g_acc + h * HEAD + off), cv)
                         .template to_vector<float>());
-      for (int t = 0; t < TSEQ; ++t)
+      for (int t = 0; t < SCORE0; ++t)
         a = aie::mac(a, aie::load_v<HALF>(vt + t * HEAD + off),
                      aie::broadcast<bfloat16, HALF>(p[t]));
+#if SCORE1
+      for (int t = 0; t < SCORE1; ++t)
+        a = aie::mac(a, aie::load_v<HALF>(vt + (SCORE0 + t) * HEAD + off),
+                     aie::broadcast<bfloat16, HALF>(p_t[t]));
+#endif
       aie::store_v(g_acc + h * HEAD + off, a.template to_vector<float>());
     }
     g_m[h] = m_new;

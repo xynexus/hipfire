@@ -19,25 +19,24 @@ built. This is the loop, and two things had to land together for it to exist:
     python3 decode.py --prompt "The quick brown fox" -n 6
     python3 decode.py --tokens 128000,791,4062,14198,39935 -n 4 --host-ref
 
-## What this can and cannot be compared against
+## Comparing against FLM
 
-`--chat` wraps the prompt in Llama-3.2-Instruct's user/assistant template. That is
-NOT what the FLM server feeds its model: measured from its own `/api/generate`
-`context` array, FLM prepends a system block ("Cutting Knowledge Date...") for a
-fixed 35-token overhead, and ignores `raw`, `template`, `system` and
-`num_predict`. "Hi" is 36 tokens to FLM and 11 without the system block.
+FLM's server applies the Instruct chat template INCLUDING a system block, and
+ignores `raw`, `template`, `system` and `num_predict` — 35 tokens of fixed
+overhead, measured from its own `/api/generate` `context` array, which is the
+sequence it fed the model. So do not tokenize a prompt and expect FLM's answer;
+take its `context`, cut it at the assistant header, and pass that to `--tokens`.
+The system block carries the DATE, so capture it the same day.
 
-The KV cache here is TSEQ=32 columns, so FLM's shortest context does not fit, by
-five positions. `kernels/npu/flm_attn_decode.cc` carries
-`static_assert(TSEQ == 32, "score vectors are one 32-lane register")`, so TSEQ is
-not a constant that can be raised on its own. A like-for-like FLM diff needs
-either that two-register score path or KVPER=2 -- and KVPER=2 makes the KV object
-16384 B against the fused design's single shared operand size of 10304, which is
-also group C's weight tile. Both are real changes; neither is done here.
+    prompt "Hi", 36 tokens, captured 2026-08-02
+    device [4438, 649, 358, 1520]     FLM [4438, 649, 358, 1520, 499, 3432, 30]
 
-What IS here: a token sequence the device generated, each token's hidden state
-checkable against `oracle_forward.py` (fp32, from `consolidated.00.pth`, sharing
-no code with this tree) and against a host autoregressive reference (`--host-ref`).
+Four is what a 40-column cache leaves after a 36-token prompt. TSEQ=40 is the
+largest this design holds — the KV tile has to fit the one operand size every
+fifo shares — and it costs 5% of throughput against TSEQ=32, all of it compute.
+
+`decode_oracle.py` diffs a generated sequence against the fp32 oracle instead,
+one step at a time on a shared prefix, for prompts that need no template.
 
 ## The head
 
