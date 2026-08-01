@@ -138,26 +138,42 @@ def kv_placement(ncores=NCORES):
     return k_at, v_at
 
 
-def drain_plan(ncores=NCORES):
-    """-> (qobj, kvplan): q objects per pair, and its KV drains in SLOT order.
+def drain_plan(ncores=NCORES, group=2):
+    """-> (qobj, kvplan): q objects per GROUP, and its KV drains in SLOT order.
+
+    `group` is how many cores share one operand fifo — 2 for the pair-split
+    design, 4 for the quad-split one. Only the link count differs, but the link
+    count is what the 8 memtiles limit, so it decides the maximum core count.
 
     Derived from `head_layout` so the drains follow the assignment instead of
     encoding one. The old code branched `elif i < n // 2`, which states the
     16-core placement as a rule; at 12 cores pairs 0-3 carry a v *and* a k and
     pairs 4-5 carry neither, which that branch cannot say.
 
-    Slot order matters: a pair's stream is consumed linearly, so the drains must
+    Slot order matters: a group's stream is consumed linearly, so the drains must
     be emitted in the order the core wrote them.
+
+    Reading only the group's FIRST core assumes every core in it has the same
+    slot structure. That holds for both widths in use and is checked here rather
+    than assumed, because a group whose cores disagree would drain silently
+    misaligned.
     """
     layout = head_layout(ncores)
+    if ncores % group:
+        raise ValueError(f"{ncores} cores do not divide into groups of {group}")
     qobj, kvplan = [], []
-    for pr in range(ncores // 2):
-        row = layout[2 * pr]
+    for pr in range(ncores // group):
+        rows = [layout[group * pr + j] for j in range(group)]
+        kind = lambda r: tuple("q" if h < NQ else ("k" if h < NK else "v") for h in r)
+        if len({kind(r) for r in rows} ) != 1:
+            raise ValueError(f"group {pr}: cores disagree on slot structure "
+                             f"{[kind(r) for r in rows]}; the drain assumes they match")
+        row = rows[0]
         qslots = [s for s, h in enumerate(row) if h < NQ]
         if qslots != list(range(len(qslots))):
-            raise ValueError(f"pair {pr}: q slots {qslots} are not a prefix; "
+            raise ValueError(f"group {pr}: q slots {qslots} are not a prefix; "
                              "the q drain takes the head of the stream")
-        qobj.append(2 * len(qslots))
+        qobj.append(group * len(qslots))
         kvplan.append([("k", h - NQ) if h < NK else ("v", h - NK)
                        for h in row if h >= NQ])
     return qobj, kvplan

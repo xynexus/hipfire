@@ -112,13 +112,13 @@ def build(pos, nobj):
     p1cores = 2 * p1pairs
     hpc = hpc_for(p1cores)
     layout = head_layout(p1cores)
-    qobj, kvplan = drain_plan(p1cores)
+    qobj, kvplan = drain_plan(p1cores, group=4)
     # Where each pair's q' belongs in the broadcast. Measured, not assumed (see
     # CHAIN_QMAP): a pair's stream is [slot s][core j] and its head is
     # qbase + hpcc*j + s, so the scatter is a plain 3-level stride.
     p1_lsz = hpc * TPH * 4 * q4nx.tile_bytes(K_DIM, NROWS)
     qbase = [sum(qobj[:i]) for i in range(len(qobj))]
-    hpcc = [q // 2 for q in qobj]
+    hpcc = [q // 4 for q in qobj]
     # P3 runs on ALL cores — only P1 and P2 are partitioned — so o_proj's 2048
     # output rows split over every core, NROWS at a time.
     p3tiles = K_DIM // (NCORES * NROWS)
