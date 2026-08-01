@@ -14608,3 +14608,37 @@ Every term in the projection now:
 
 A+B is now the least-supported number in the projection, and it is 16 x 125 us of the
 token. It deserves the same treatment before the fused figure is quoted anywhere.
+
+### Every term fitted: 64.5 tok/s, +5.5% over FLM
+
+A+B over eight points:
+
+    NLAY  1: 215.7, 219.7    3: 462.4, 465.3
+          2: 337.1, 322.6    4: 590.8, 579.6
+
+    fit: time_us = 90.0 + 123.6 * NLAY    R^2 = 0.99777, max residual 14.7 us
+
+The intercept is 90.0 us against the independently fitted 92.9 us dispatch floor — the
+two agree to 3%, which is a real consistency check on both: a per-layer fit that knew
+nothing about the floor recovered it.
+
+The projection, with every term now a multi-point fit or a direct measurement:
+
+    A+B      123.6 us/layer   8-point fit, R^2 0.99777, residual 14.7 us
+    C        651.7 us/layer   8-point fit, R^2 0.99965, residual 22.2 us
+    lm_head 2994.2 us         measured at its own size, 163.7 MB
+    floor      92.9 us        7-point fit, R^2 0.99997
+
+    token = 92.9 + 16 x (123.6 + 651.7) + 2994.2 = 15492.7 us
+          = **64.5 tok/s**    FLM 61.18, **+5.5%**
+
+The two-point A+B estimate was 125.4 against a fitted 123.6 — a 1.4% difference, and the
+projection moves by 0.1 tok/s. So that term was fine; it simply was not known to be.
+
+The figure has moved 65.4 -> 64.0 -> 64.4 -> 64.5 across today's re-measurements, and
+that spread is the honest error bar on a projection built from parts. It still says the
+architecture is ahead of FLM, by about 5%, and every input to it is now measured on the
+code that exists rather than inherited.
+
+What it still assumes is unchanged and is the whole remaining question: that the two
+halves fuse into one dispatch. Interleaved they are 55 tok/s.
