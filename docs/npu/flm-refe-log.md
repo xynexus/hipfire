@@ -12120,3 +12120,32 @@ question than "does the topology hold at realistic size".
 What the 2400 s timeout does establish stands on its own: **iterating at full
 size is impractical**, so the build should be developed at reduced object sizes
 and only sized up at the end.
+
+## 2026-08-01 — group A works: P1 on 8 cores, one result fifo per CORE
+
+`group_a.py` is `p1_route` with the result fifos restructured from per-pair to
+per-core, which is what lets A core j stream straight to B core j. Kernels,
+weight packing and reference are unchanged, so a failure could only be the
+restructuring — which is why it is a separate file rather than an edit.
+
+    q' : 32 heads          max err 9.5367e-07   tol 5.6648e-04
+    k' : 8 heads -> K col  max err 1.9531e-03   tol 4.4514e-03   (one bf16 ulp)
+    v' : 8 heads -> V row  max err 0.0000e+00
+    -> PASS
+
+Four things had to change together, and three of them would have been silent:
+
+  * `drain_plan(ncores, group=1)` in **both** `build()` and `main()` — the second
+    call still used the pair default and indexed off the end
+  * the design's parameter list: weights stay per PAIR, q' and KV go per CORE
+  * **the KV drain widths.** `sizes=[1, 2, HEAD, 2]` counted KV heads within a
+    group; at group=1 there is one k and one v per core, so the 2 collapses to 1.
+    Left alone it drains a neighbour's tile — and it hung rather than erring.
+  * the host check's reshape: a core's buffer holds its own heads in slot order,
+    with no pair interleave to undo
+
+The hang is the one worth remembering: an over-wide drain reads past its object
+into another core's, and the symptom is a timeout, not a wrong number.
+
+Group A is the first piece of the role architecture running on real weights.
+Groups B and C are next, then the streams between them.
