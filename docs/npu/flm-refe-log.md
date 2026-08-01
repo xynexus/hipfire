@@ -11421,3 +11421,35 @@ Recording the distinction because it is easy to reach for `delegate_tile` on the
 strength of its name and get buffer placement instead of stream staging. The
 32-core error is a MemTile *DMA channel* shortage, which is about how many streams
 cross a memtile, not where buffers live.
+
+### The 32-core memtile wall, quantified: split/join links outnumber memtiles
+
+`f.cons(tile=AnyMemTile).split(...)` **works** — the 16-core design builds and
+passes with the weight fifos explicitly staged. So the staging mechanism is
+`split`/`join` with a tile argument, not `delegate_tile`.
+
+Pinning each pair to its own column (`Tile(i % 8, 1)`) did not fix 32 cores: the
+failure moved to a different, unpinned memtile. Dumping the generated MLIR shows
+why — every split and join lowers to a memtile-hosted link:
+
+    aie.objectfifo @p2o0_join0(%logical_core_11, {%logical_mem_30}, 2)
+    aie.objectfifo @p2o0_join1(%logical_core_12, {%logical_mem_30}, 2)
+    aie.objectfifo.link [@p2o0_join0, @p2o0_join1] -> [@p2o0]([0, 256] [])
+
+and the 16-core design already declares **18 logical memtiles against 8 physical**:
+
+    16 cores:  8 pairs ->  8 weight splits +  8 p1 joins + 2 p2 joins = 18 links
+    32 cores: 16 pairs -> 16 weight splits + 16 p1 joins + 4 p2 joins = 36 links
+
+Eight memtiles, each with a handful of DMA channels, cannot host 36 links. **The
+constraint is links per memtile, and it scales with PAIR COUNT** — so doubling the
+cores doubles the pressure on a fixed resource.
+
+This says the fix is *fewer, wider* links rather than more staging: one fifo
+serving four cores instead of two would halve the link count at any core count.
+That is a change to how operands are distributed, not to the phases — and it is
+the same direction as role specialisation, where a whole group of cores consumes
+one stream.
+
+Reverted; 16 cores untouched and passing. The `AnyMemTile` / `Tile(col, 1)` import
+and usage pattern is now known-good and can be reused.
