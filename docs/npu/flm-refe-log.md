@@ -15724,3 +15724,38 @@ luck, not design.
 Rule for harnesses here: an array that must survive its own use as an operand must not be a
 bare local in a binary expression. Use `np.einsum`/`np.dot`/`np.matmul` (never elide),
 `np.multiply(..., out=)`, or `.copy()`. Views and slices are immune.
+
+### Attempted reproduction: the two "numpy is wrong at T>1" faults do not reproduce
+
+A teammate reported two silent numpy faults in this venv, both said to appear at T=5 and
+vanish at T=1: `(g / (1 + np.exp(-g))) * u` evaluating to exactly `u`, and `h2 @ w1.T`
+returning three different answers in one scope. Tried to reproduce both independently:
+
+    swiglu (g/(1+exp(-g)))*u, T = 1, 2, 5, 8, D_FF = 8192
+      out==u False, matches a fresh-array reference exactly, neither operand clobbered
+    same with torch imported            out==u False
+    h2 @ w1.T three times, T = 1 and 5, (8192, 2048)
+      a==b==c bit-identical, within 7.4e-06 of the torch result, b == a+a False
+
+numpy 2.1.3, torch 2.12.0a0, py 3.14.4, the same venv.
+
+The observation was certainly real — `np.array_equal(out, u)` returning True is not
+misreadable — but "numpy takes a different path at T>1" is probably the wrong cause. The
+likelier explanation is the elision bug the same teammate found, wearing a different face:
+if `u` is an owning local above the 256 KB threshold at refcount 1, the multiply can write
+its result INTO u, after which `out` and `u` are the same object and `array_equal` is
+trivially True. That is not "the SwiGLU gate was dropped" but "out and u alias" — the gate
+was computed correctly and then written over its own operand. The distinguishing test is
+`out is u`.
+
+It also explains the failed reproduction: in the form quoted, `(g/(1+exp(-g)))` is itself a
+fresh binary-op result, so numpy elides into that temp and leaves `u` alone. For `u` to be
+the victim the real expression or refcounts must have differed from the quoted form.
+
+Recording the negative result because the alternative is that "numpy is unreliable for
+multi-token work" becomes project doctrine on one unreproduced observation, and this log has
+already carried two things — the 4.5% NROWS penalty and lm_head's 3700 us — that were true
+once, generalised, and then wrong for a long time. If the cause is elision, the mitigation is
+the one already recorded (do not let an array that must survive be a bare local operand) and
+torch is not implicated at all. The `import aie.iron` then `import torch` segfault is
+separate and stands on its own.
