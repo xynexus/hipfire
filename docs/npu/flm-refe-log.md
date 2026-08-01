@@ -14351,3 +14351,28 @@ relied on at pos 30 twice before.
 
 Only `qkv_verify` needed the change — it feeds `groups_ab` and `p1p2_chain`, and `group_c`
 and `p5_pass` have no rotated tensors.
+
+### The RoPE fix leaves position 0 untouched
+
+    device x16   mean 1.75427   max 150.00000
+    cosine vs validated host     0.999659
+    argmax 16309   +6.9032   then 2, 1340, 791
+
+Identical to the run before the permutation, to every digit reported. That is the
+expected outcome — RoPE is the identity at position 0, and the permutation is shared
+between q and k so attention is invariant — but it is now measured rather than argued,
+which after today is the only form worth having.
+
+State of the layer, by what each part has actually been checked against:
+
+    weights          external: corr 0.997 vs checkpoint, 4-bit error only
+    RMSNorm, GEMV    external: pos-0 forward matches the fp32 oracle end to end
+    residual (h)     external: same
+    RoPE frequency   external: rope_freqs vs the llama3 schedule from config.json
+    RoPE rotation    external: 6.40% vs a 6.36% floor at position 7
+    attention        pos 0 only — softmax over one entry, which is not a test of it
+    KV cache         pos 0 only — one entry, written and read by the same design
+
+The last two lines are what remain. Attention's online softmax, its rescaling, and the
+cache across multiple real positions have never met an external reference — only the
+one-entry case where the answer is V itself. Everything above them now has.
