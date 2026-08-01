@@ -425,6 +425,13 @@ def main():
                 break
         else:
             idx = np.argpartition(cl, -o.topk)[-o.topk:]
+        # The default chunk, deliberately. chunk=16 looked 40% faster in a tight
+        # loop over pre-gathered arrays (174.8 vs 293.1) and 120 sequential
+        # repeats agreed (217.7 vs 338.0) — but INTERLEAVED, alternating the two
+        # configurations pair by pair, it reverses: 304.3 against 249.9. The
+        # sequential result was an order artifact, whichever ran first keeping
+        # the cache. The in-situ gate run had said the same thing (202.5 against
+        # 181.6) and was dismissed as noise.
         fine = lc.gemv_bf16_fast(x, D[idx], M[idx], C[idx])
         got = int(idx[int(np.argmax(fine))])
         fine_us.append((time.perf_counter_ns() - t0) / 1e3)

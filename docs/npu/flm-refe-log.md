@@ -16287,3 +16287,47 @@ the reason to run it rather than assert it. `groups_ab` at pos 0 measuring **0.0
 ULP — bit-exact** is also the standing evidence for the pos-0 floor argument above:
 one softmax entry, `exp2` evaluated only at 0 where the NLF is exact, output equal
 to that entry's V.
+
+### The two-pass host term: 241.5 -> 181.1 us, and one optimisation that measured backwards
+
+**Landed: a threshold shortlist instead of a full partition.** A threshold set IS the top-N
+for some N, so `cl > m - d` with at least K survivors provably contains the true top-K —
+the guarantee the recall curve was measured against, preserved exactly rather than
+approximated. One `max()` (7.5 us) plus one threshold pass beats partitioning 128256 values,
+and an `argpartition` over the ~39 survivors trims to exactly K for nothing:
+
+    partition + flatnonzero    76-110 us   (varies with machine state)
+    max + threshold + trim     19.3 us     identical set, verified
+
+On real coarse logits the 32nd value sits 1.87 below the max on both probes measured, so
+d = 2.0 lands ~39 candidates; the widening ladder and an `argpartition` fallback cover a
+flatter distribution. Gate re-run: **48/48 argmax match, host fine pass 241.5 -> 181.1 us**.
+
+**Rejected: a float32 einsum rescore.** 6.7x faster, and over 400 random draws it picks a
+different argmax than the bf16-modelled path twice. 0.5% is the exact failure mode two-pass
+exists to prevent.
+
+**Rejected: K = 32 -> 8.** Recall@8 is 48/48 with worst rank 3, so the margin is real, but
+the saving is ~40 us on a 15.5 ms token — 0.26% — for half the safety margin on a silently
+wrong token.
+
+**Rejected after measuring it three ways: chunk=16 on the rescore.** This one is worth
+recording because it measured backwards twice before it measured right.
+
+    tight loop over pre-gathered arrays       174.8 us vs 293.1   chunk=16 wins
+    120 SEQUENTIAL repeats, real gather path  217.7 us vs 338.0   chunk=16 wins
+    in-situ gate run                          202.5 us vs 181.6   chunk=16 LOSES
+    120 INTERLEAVED repeats, alternating      304.3 us vs 249.9   chunk=16 LOSES
+
+The sequential repeats were an order artifact — whichever configuration ran first kept the
+cache — and the two that agreed with each other were both wrong. The in-situ run had said so
+and I dismissed it as noise because two benchmarks outvoted it.
+
+The lm_head agent had already written down the rule that would have caught this: "Interleaving
+mattered: a single back-to-back A-then-B measured 161% spread on one side and 2% on the other."
+I read that, merged it, and then ran a sequential A/B on the same machine an hour later. A
+rule recorded is not a rule applied.
+
+Where the host term now stands: 181.1 us, of which ~19 is selection and ~162 the rescore of
+32 rows — 41 KB and 65K MACs. It remains per-op overhead rather than work, and the ceiling is
+still an implementation that does not pay it.
