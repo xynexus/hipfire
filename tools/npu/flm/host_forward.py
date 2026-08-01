@@ -32,7 +32,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 import q4nx  # noqa: E402
-from ffn_verify import load_linear  # noqa: E402
+# NOT ffn_verify.load_linear: that returns the CONTAINER's row order, which is
+# uncorrelated with the checkpoint (corr 0.001, relF 1.52 measured). This is the
+# function written beside q4nx_decode_tensor for exactly this purpose.
+def load_linear(c, name, N, K):
+    return q4nx.q4nx_tensor_blocks(c, name, (N, K))
 from head_verify import Q4NX, VOCAB, logits_for, rmsnorm  # noqa: E402
 from qkv_verify import HEAD, K_DIM  # noqa: E402
 

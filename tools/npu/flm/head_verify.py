@@ -33,7 +33,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 import q4nx  # noqa: E402
-from ffn_verify import load_linear  # noqa: E402
+# NOT ffn_verify.load_linear — that returns the container's own row order, which
+# measures corr 0.001 against the checkpoint. lm_head is 128256 rows of it.
+def load_linear(c, name, N, K):
+    return q4nx.q4nx_tensor_blocks(c, name, (N, K))
 from qkv_verify import EPS, K_DIM  # noqa: E402
 
 Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"

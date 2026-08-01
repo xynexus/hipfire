@@ -14078,3 +14078,26 @@ Ordering of what to trust, restated after three retractions in a row:
   * anything about what the pipeline computes — retracted, including the sixteen-layer
     chain, the token, and this task's own earlier conclusion that the kernels were
     "verified as computing the model"
+
+### With both faults fixed, the host forward matches the oracle
+
+`q4nx_tensor_blocks` for the weights, and the FFN residual on `h` instead of `x`:
+
+    layer      host forward            independent fp32 oracle
+    x1     0.08325 /  20.889       0.08315 /  20.944
+    x2     1.49461 / 404.983       1.47680 / 408.166
+    x8     1.51777 / 406.606       1.50250 / 409.801
+    x16    1.74094 / 148.668       1.76944 / 155.896
+
+Agreement to 1-5%, against 4-bit weights whose own relative error is 7.7%. Llama's
+massive activations appear exactly where the oracle has them — max 405 at layer 2,
+decaying to 149 by layer 16 — where the old path never left ~1.
+
+Both faults were required. Fixing the residual alone left x1 at 0.038/0.399 (the run
+two entries above); fixing the weights alone would have left the FFN discarding
+attention. Neither is visible without an external oracle, because both had matching
+host references.
+
+The argmax in that run is still meaningless: the process imported `head_verify` before
+its loader was fixed, so the layers used real weights and lm_head used scrambled ones.
+Re-running the head separately on the saved hidden state.
