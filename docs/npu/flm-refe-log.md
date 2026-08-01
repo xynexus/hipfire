@@ -13296,3 +13296,35 @@ So the honest status is: 65.0-65.4 tok/s is what the measured compute supports I
 two halves fuse, and nothing has yet demonstrated that they do. That is now the single
 question the result depends on — not the handoff's staging cost, which at ~5.6 us per
 layer is 0.6% either way.
+
+### The fused 32-core design fits the memtile budget — 40 of 48 input channels
+
+A memtile-hosted link with n sources and m destinations costs n input and m output
+DMA channels. Counting both designs' links out of their generated MLIR:
+
+    A+B     6 links   12 in  10 out      (4 splits 1->2, 2 joins 4->1)
+    C      18 links   28 in  26 out      (8 splits 1->2, 10 joins 2->1)
+    fused             40 in  36 out      budget 48 / 48
+
+    headroom: 8 in (83% used), 12 out (75% used)
+    balanced: 5.00 in and 4.50 out per memtile, against a limit of 6
+
+So the union of the two topologies is inside the budget, with real if modest slack.
+The seam adds nothing to this count — it crosses host memory, and both its ends
+(A+B's attention drain, C's broadcast fill) already exist in the counts above.
+
+The contrast with the earlier 32-core dead end is the whole point, and it is not that
+the budget changed. That attempt spent **40 input channels on joins alone**, before a
+single operand split was placed, because every core emitted its result through a
+memtile join and the join side costs `cores` inputs at any width. Here 40 is the
+*total*: A+B's q' travels core to core and never touches a memtile, and group A's
+results leave through per-core fifos rather than per-pair joins. Those two decisions
+were made for other reasons — the first to dodge a DMA channel limit, the second for
+speed — and what they bought was the headroom that makes fusion arithmetically
+possible.
+
+This does not prove the fused design builds. The limit is per memtile, not aggregate,
+so the mapper still has to balance 40 inputs across 8 tiles without exceeding 6 on
+any one, and a 5.00 average leaves little room for a bad assignment. But the question
+has moved from "is this over budget" — it is not — to "can the mapper place it",
+which only a build answers, and a full-operand build here exceeds 2400 s.
