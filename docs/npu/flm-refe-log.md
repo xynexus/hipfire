@@ -15680,3 +15680,173 @@ One term still deserves care in a real implementation rather than a benchmark: t
 table is 525 MB in bf16 and `c.bf16()` returns it converted to float32, i.e. 1051 MB
 resident. That is a one-time 0.44 s load here, but a decode loop should keep it bf16 and
 convert the single row it needs.
+
+### numpy 2.1.3 on Python 3.14 silently overwrites named local arrays
+
+Found while building the two-pass lm_head, but it is not specific to it and every numpy
+harness in this tree is exposed. It is silent, and it produces wrong numbers rather than
+errors.
+
+Python 3.14 emits `LOAD_FAST_BORROW`, which pushes a **borrowed** reference. A local ndarray
+therefore still has refcount 1 while it is an operand of a binary op. numpy's temp elision
+(`temp_elide.c`) reads refcount 1 as "this is a throwaway temporary" and writes the result of
+the op straight into it. So inside a **function**:
+
+    R = q * s[:, None]              # R is itself made by a binary op -> OWNDATA, refcount 1
+    num = (R * W).sum(1)            # <-- OVERWRITES R with R*W
+    nrm = np.linalg.norm(R, axis=1) # the norm of the wrong array
+
+Measured, both lines are real output of the same script:
+
+    in function:      before [0.02 0.02 0.02]  after [0.06 0.06 0.06]  clobbered True
+    at module level:  before [0.02 0.02 0.02]  after [0.02 0.02 0.02]  clobbered False
+
+Three conditions, and they are exactly why it survives small tests:
+
+  * only inside a **function** — module globals are not borrowed, so the same lines at module
+    scope are correct;
+  * only for arrays over numpy's ~256 KB elision threshold;
+  * only when the victim **owns its data** — a `.reshape()` or slice VIEW is immune.
+
+So it appears on real tensors and not on toy ones, which is the worst possible shape for a
+project whose references are all numpy over large arrays inside functions.
+
+**The rule.** An array that must SURVIVE its own use as an operand cannot be a bare local in
+a binary expression. Reduce with `np.einsum`/`np.dot`/`np.matmul`, which never elide, or take
+a `.copy()`. `np.linalg.norm(a, axis=1)` is safe as a *reader*; the damage is done by the
+earlier `a * b`. `np.subtract(a, b)` also does not elide — the elision lives in the `-`
+operator slot, not the ufunc.
+
+It cost an hour twice, and the second time was **after** writing this warning. The first
+symptom was a per-row cosine of 22.0, which is impossible. The second was a diagnostic that
+printed "device coarse argmax 45, host coarse argmax 16309" on the line after reporting the
+two arrays agreed to `1.4e-6` — `err = np.abs(logits - ref).max()` had eaten `logits`, and
+the following `np.argmax(logits)` read the residual.
+
+**Both failures announced themselves as internal contradictions, not as plausible wrong
+numbers.** A cosine above 1 and a Cauchy-Schwarz violation are the tell. That is the thing to
+watch for, because knowing about the bug is demonstrably not sufficient protection.
+
+`q4nx.gemv_reference_bf16` is CLEAN, and this was checked rather than argued. Its only
+large arrays, `d` and `m`, enter through `rnd()`, whose first act is
+`np.asarray(x).view(np.uint32)` — a view, which lacks OWNDATA and cannot be elided.
+Everything inside its `(r, b)` loop is a 32-element slice, orders of magnitude under the
+threshold. Independently: a vectorised transcription with a completely different array shape
+and reduction structure agrees with it **bit for bit** (`max abs 0.000e+00`) over 8192 real
+`lm_head` rows.
+
+### The two-pass lm_head: 19.7% fewer bytes, and the argmax does not move
+
+`lm_head` is the second-largest term in a token and it is **bandwidth bound** — 164.7 MB at
+55.7 GB/s, against a 56.5 GB/s fabric roof. The arithmetic is not the lever and never was.
+The only thing that makes it faster is streaming fewer bytes.
+
+The coarse tier of `hipfire_quantize::codecs::build_coarse_q4row` does that: per row the exact
+L2 norm is factored out into the row's scale, and only the UNIT DIRECTION is quantized to
+symmetric Q4 with one global 3-sigma step, `unit_scale = 3/(7*sqrt(cols))`, levels [-7, 7].
+Row normalisation is what makes 4 bits sufficient — a per-row-max Q4 lets a few outlier
+channels set the step and crushes the rest of the direction.
+
+    exact q4_1   2*NB bf16 (d and m) + K/2 codes  = 1280 B/row   164.7 MB
+    coarse       K/2 codes + one f32 row scale    = 1028 B/row   131.8 MB   -19.94%
+
+**The kernel is new, not `flm_q4_1_tile` with a flag** (`kernels/npu/flm_gemv_coarse_q4row.cc`).
+q4_1's whole body is organised around folding a per-block min into a shared activation
+block-sum; the coarse tier is symmetric and has no min, so there is no zero-point term, no
+`g_asum`, and no prepare kernel. The codes are loaded as native **`int4`**, not `uint4` — they
+are two's-complement signed nibbles and `int4` is a first-class vector element type here
+(`native_vector_type<int4, 64> = v64int4`), so the sign extension rides the same
+`vldb.unpack` + `vups.4x` the unsigned path gets and costs nothing.
+
+Tile is `[NROWS f32 scales][NROWS*K/2 nibbles]`, 16448 B at NROWS=16. The f32 scale is free:
+16 of them is exactly 64 bytes, one alignment unit, where 16 bf16 scales would be 32 bytes and
+need 32 bytes of padding to keep the tile a multiple of 64. There is **no 64-byte trailer** —
+lm_head needs no `row_base`, the output is NROWS floats the fifo already places, and omitting
+it saves 0.39%.
+
+**Measured, interleaved A/B, both designs' buffers resident, run object HELD, 5 rounds x 10:**
+
+    coarse  min  2375.9 us  median  2423.1   131.8 MB   55.5 GB/s
+    exact   min  2957.5 us  median  3003.5   164.7 MB   55.7 GB/s
+    bytes ratio 0.8006   time ratio 0.8033   ->  19.7% faster, 581.7 us saved
+
+The time ratio matches the byte ratio to **0.3%**, and both formats run at the same GB/s.
+That is the entire mechanism confirmed: this is bytes, not arithmetic, and the new kernel
+costs nothing per byte.
+
+Interleaving is load-bearing, not tidiness. A single back-to-back A-then-B measured 161%
+spread on one side and 2% on the other — the user's `flm serve` contends for this NPU, and
+whichever side it lands on loses. The MIN is quoted because under an external contender every
+sample is the dispatch plus a non-negative delay; it also reproduces across three independent
+sessions (2378.0 / 2403.6 / 2375.9) where the median does not.
+
+Device against host over all 128256 rows: `max abs 1.4305e-06, rel 2.030e-07`, same argmax.
+
+#### The recall gate — measured on Llama-3.2-1B, not assumed from ZAYA1-8B
+
+`codecs.rs` claims recall@8 = 100%, but that was measured on a different model and does not
+transfer. 48 real hidden states from `host_forward.py` (16 layers, position 0), each with its
+exact argmax as ground truth, each coarse pass run **on the device**:
+
+        K   recall@K              two-pass argmax == exact
+        1   39/48 = 0.812         39/48 = 0.812
+        2   44/48 = 0.917         44/48 = 0.917
+        4   48/48 = 1.000         48/48 = 1.000
+        8   48/48 = 1.000         48/48 = 1.000
+       16   48/48 = 1.000         48/48 = 1.000
+       32   48/48 = 1.000         48/48 = 1.000
+       64   48/48 = 1.000         48/48 = 1.000
+
+    coarse rank of the true argmax: max 3, median 1, outside top-64: 0
+
+**K = 32 is the choice, and 4 would have passed.** The worst rank observed is 3, so K=8 is
+already 2.7x margin and K=32 is 10.7x. The margin costs 74 us of host time (K=8 162.1 us,
+K=32 235.9 us) — 0.5% of a token against a 582 us device saving — and the failure mode is a
+silently wrong token. 48 probes is a small sample from a narrow slice; buy the margin.
+
+#### The end-to-end token
+
+    layers    12874.0 us   fused.py, run HELD
+    lm_head    2375.9 us   coarse, run HELD, interleaved against the exact tier
+    host        241.5 us   5.63 base + 235.9 shortlist and rescore
+    token     15491.4 us   ->  **64.6 tok/s**,  +5.5% over FLM's 61.18
+
+Against the exact lm_head measured the same way in the same session (2957.5 + 10.5 host),
+15842.0 us -> 63.1 tok/s. So the two-pass is worth **+2.3%** end to end.
+
+**The host figure is numpy overhead, not work, and it eats 40% of the win.** 235.9 us breaks
+down as 78 us to find the top 32 of 128256, 3.5 us to gather, and 110 us to rescore 32 rows.
+The yardstick is in this same tree: the same numpy does an argmax over the same 513 KB array
+in **4.9 us**. The rescore is 41 KB and 65K MACs. `np.argpartition` was replaced with
+`np.partition` + `flatnonzero` (130 -> 78 us) because argpartition allocates and permutes a
+1 MB int64 index array to deliver 32 numbers, but the remainder is per-op overhead that a
+Rust implementation does not pay. Reported as measured; the ceiling is not the algorithm.
+
+#### What is verified, and by what
+
+    coarse tier bytes    EXTERNAL   rebuilt in torch with a different expression tree
+                                    (addcmul dequant, vector_norm, int16 shift pack) and
+                                    compared BIT FOR BIT over 49152 rows in three slices:
+                                    0 of 50.3M nibble bytes and 0 of 49152 f16 scales differ
+    coarse GEMV          EXTERNAL   the NPU itself, all 128256 rows, rel 2.030e-07;
+                                    C++ on AIE against numpy on x86, no shared kernels
+    exact reference      internal   bit-identical to q4nx.gemv_reference_bf16 over 8192 rows
+    ground-truth argmax  EXTERNAL   torch float64, w = d*q + m dotted directly with no
+                                    block-sum identity: 16309, the oracle's token
+    recall@K             measured   48 probes, device coarse pass
+    timing               measured   interleaved A/B, 5 rounds, held run
+
+The torch cross-check lives in `tools/npu/flm/lmhead_coarse_xcheck.py` and imports **only**
+`q4nx` — `qkv_verify` does `import aie.iron` at module scope, and iron plus torch segfaults
+this venv. Any file reaching the flm python tooling inherits that; build the tier in one
+process, run the NPU in another.
+
+**Two limits worth stating.** Every probe is a position-0 hidden state, because that is the
+only forward this tree has validated — `host_forward.py` is position 0 only and position is
+still a build parameter. Recall on states from deeper in a sequence is unmeasured. And the
+recall sample is 48; at K=32 with a worst observed rank of 3 the margin is large, but 100% on
+48 probes is not 100%.
+
+Files: `kernels/npu/flm_gemv_coarse_q4row.cc`, `tools/npu/flm/lmhead_coarse.py` (tier build,
+recall curve), `tools/npu/flm/lmhead_twostage.py` (design, device run, gate),
+`tools/npu/flm/lmhead_coarse_xcheck.py` (torch cross-check).
