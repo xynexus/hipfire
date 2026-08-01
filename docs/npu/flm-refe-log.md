@@ -12024,3 +12024,25 @@ So all four stream kinds are confirmed carrying data:
 That is the architecture validated end to end as plumbing. What remains is
 replacing the trivial kernels with the real phase bodies — mechanical, and against
 a topology that is now known to work rather than hoped to.
+
+### Program memory per role group: the constraint the architecture exists to satisfy
+
+    group  phases   probe    real ~   of 16 KB
+      A    1         5808   ~ 9808     60%    P1 qkv+RoPE
+      C    3,4,5     8768   ~12768     78%    P3+P4+P5
+
+against what actually overflowed:
+
+      uniform 1,2,3,4,5  14784  ~18784  115%   measured OVERFLOW, stage 37/42
+
+Group C — the heaviest, carrying three phases — sits at ~78% with the probe's
+~4 KB scaffolding correction applied. That is real headroom, not the 98% margin
+that turned out to be optimistic when `1,3,4,5` was actually built.
+
+So the architecture clears the constraint it was designed around, and clears it
+with room rather than by a hair. Group B (attention alone) is lighter still.
+
+Worth stating plainly: this is the first configuration in the session where the
+program-memory budget is not the binding constraint. Every earlier structure was
+shaped by trying to squeeze bodies onto cores; this one has spare capacity in
+every group.
