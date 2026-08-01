@@ -11890,3 +11890,37 @@ is exactly the open question, and the build answers it.
 Recording the design before building it, as with the quad plan — that one was
 specified, attempted, and proven impossible by arithmetic, which was far cheaper
 than discovering it halfway through.
+
+### Derisked: P1 on 8 cores costs +44 us/layer, and the architecture still wins
+
+The open question in the spec was whether shrinking P1 from 12 cores to 8 eats the
+dispatch saving. `p1_route --p1-cores N --bench` answers it directly:
+
+    P1  8 cores   204.1 us total  ->  136.9 compute (floor 67.2 removed)
+    P1 12 cores   160.1 us        ->   92.9
+    P1 16 cores   155.4 us        ->   88.2
+
+**+44.0 us per layer, +0.70 ms per token.** Note also that 12 -> 16 buys only
+4.7 us: P1 stops scaling past twelve cores, so the current design's twelve are
+already near the knee and eight is a real but bounded loss.
+
+Against the alternatives that actually compute a correct token:
+
+    interleaved A,B per layer (32 dispatches)   17.76 ms -> 56.3 tok/s
+    role-specialised, ONE dispatch              16.38 ms -> 61.1 tok/s
+    FLM measured                                            61.18 tok/s
+
+So the architecture is worth building: **+8.5% over the naive valid approach, and
+level with FLM** — while computing all 32 attention heads, which no configuration
+measured so far has done.
+
+Caveats kept explicit: the 744.1 us/layer marginal was measured on the
+half-attention design. Group B goes from 4 cores doing 4 KV groups to 8 cores
+doing 8, so per-core work is unchanged and the time should hold — but "should
+hold" is inference, not measurement. The 4 KB core-to-core handoff bandwidth is
+still unmeasured, and three handoffs per layer at some cost per KB is the term
+most likely to move this number.
+
+61.1 against FLM's 61.18 is close enough that either could come out ahead. What
+makes it worth building anyway is that it is the only structure measured so far
+that computes a correct token at all.
