@@ -13540,3 +13540,31 @@ known to misrepresent the binding constraint in both directions.
 
 (The task notification reported "exit code 0" — that is the shell wrapper's status.
 The build itself exited 1.)
+
+### The skeleton's overflow was its own artifact — the real bodies fit, but C is at 90%
+
+Program memory is **per core**, and each core's ELF holds only its own role's code —
+visible in both builds, where cores within a role have byte-identical `.text` and
+cores in different roles do not. So fusing A+B with C does not add code to any core;
+it only puts more distinct programs in one design.
+
+Measured from the real designs' cached per-core ELFs:
+
+    A+B  cores    .text  9440 bytes    57% of 16 KB
+    C    cores    .text 14784 bytes    90% of 16 KB   (max across 16 cores)
+
+Both fit, and the fused design's per-core usage is the max of the two *per role*, not
+their sum: 57% on A+B's sixteen cores and 90% on C's sixteen. The skeleton's overflow
+came from its own copy loops unrolling at `--elems 2576`, exactly as the IR line
+counts suggested, and says nothing about the real design.
+
+That retires the alarm raised by the failed build. It does not retire the constraint,
+which is now located precisely: **group C sits at 90% of program memory with 1600
+bytes spare.** The fused design needs the C->A residual seam that group C does not
+currently carry, and 1600 bytes is not much room to add a phase body's worth of
+anything. Three bodies already fit where four overflowed; the seam has to be cheap.
+
+Two corrections this leaves standing, both mine: the failed build did not show the
+fused design cannot load, and the entry before it did not show that it can. What is
+actually known is narrower than either claim — the topology places and routes at full
+operand size, and every real core body measured fits, with C close to the edge.
