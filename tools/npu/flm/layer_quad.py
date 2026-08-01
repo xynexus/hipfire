@@ -453,20 +453,20 @@ def _design(bc: In, {P}):
             for i in range({p1pairs}):
                 p1h[i].drain(qb[i], wait=True, group=tg,
                              offset=QBASE[i] * {OBJ},
-                             sizes=[1, HPCC[i], 2, {OBJ}],
+                             sizes=[1, HPCC[i], 4, {OBJ}],
                              strides=[0, {OBJ}, HPCC[i] * {OBJ}, 1])
                 for _kind, _base in KVPLAN[i]:
                     if _kind == "k":
                         p1h[i].drain(cb[i], wait=True, group=tg,
                                      offset=2 * (({kv_obase} + _base) * {SLOT}
                                                  + {off}),
-                                     sizes=[1, 2, {HEAD}, 4],
+                                     sizes=[1, 4, {HEAD}, 4],
                                      strides=[0, 2 * {SLOT}, 2 * {TSEQ}, 1])
                     else:
                         p1h[i].drain(cb[i], wait=True, group=tg,
                                      offset=2 * (({kv_obase} + _base) * {SLOT}
                                                  + {KTILE} + {kv_in} * {HEAD}),
-                                     sizes=[1, 2, 1, 2 * {OBJ}],
+                                     sizes=[1, 4, 1, 2 * {OBJ}],
                                      strides=[0, 2 * {SLOT}, 0, 1])
             tg.finish()
 
@@ -489,8 +489,8 @@ def _design(bc: In, {P}):
                            sizes=[1, 1, 1, 2 * {OPERAND}], strides=[0, 0, 0, 1])
             for i in range(a):
                 p2h[i].drain(ab[i], wait=True, group=tg,
-                             offset=i * 2 * {GQA} * {HEAD},
-                             sizes=[1, 1, 1, 2 * {GQA} * {HEAD}],
+                             offset=i * 4 * {GQA} * {HEAD},
+                             sizes=[1, 1, 1, 4 * {GQA} * {HEAD}],
                              strides=[0, 0, 0, 1])
             tg.finish()
 
@@ -515,9 +515,9 @@ def _design(bc: In, {P}):
                 # permutation is a plain 3-level stride -- the same trick the P4
                 # drain uses for sw.
                 p1h[i].drain(hb[i], wait=True, group=tg,
-                             offset=i * 2 * {NROWS} * {p3tiles},
-                             sizes=[1, 2, {p3tiles}, {NROWS}],
-                             strides=[0, {NROWS}, {2 * NROWS}, 1])
+                             offset=i * 4 * {NROWS} * {p3tiles},
+                             sizes=[1, 4, {p3tiles}, {NROWS}],
+                             strides=[0, {NROWS}, {4 * NROWS}, 1])
             tg.finish()
 
             # ---- P4 -----------------------------------------------------------
@@ -534,8 +534,8 @@ def _design(bc: In, {P}):
             for i in range(n):
                 p1h[i].drain(swb[i], wait=True, group=tg,
                              offset=i * {rpp4},
-                             sizes=[1, {p4objs}, 2, {OBJ}],
-                             strides=[0, {OBJ}, {rpp4} // 2, 1])
+                             sizes=[1, {p4objs}, 4, {OBJ}],
+                             strides=[0, {OBJ}, {rpp4} // 4, 1])
             tg.finish()
 
     # Everything the operand fifos carry is now counted in QUADS. Note the two
