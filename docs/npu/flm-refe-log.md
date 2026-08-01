@@ -15394,3 +15394,40 @@ fewer bytes or fewer barriers, and fewer barriers means changing what the phases
 Not separated here: barriers versus fifo-switching versus routing contention at 46/46
 memtile channels. They co-vary across every design in the table, and telling them apart
 needs a probe that holds bytes constant and varies only the barrier count.
+
+### The barrier costs 6.00 us, and that is most of the multi-phase gap
+
+`barrier_probe.py` already existed to answer this — it was written to decide whether the
+fused layer was worth building at all, and its gate (is a barrier cheaper than the 92.9 us
+dispatch floor?) passed long ago. Re-run now for the quantity rather than the verdict:
+
+    phases      us    us/phase
+         1    62.1        62.1
+         5   101.1        20.2
+        20   189.7         9.5
+        80   543.7         6.8
+    fit: time_us = 65.2 + 6.00 * phases    R^2 = 0.99904
+
+**An in-dispatch barrier costs 6.00 us.** Applied to the previous entry's gap between a
+continuous stream (55.14 GB/s, mean of the two matched-size runs) and the multi-phase
+designs:
+
+    group_c standalone   34.29 MB   measured 651.7   at stream rate 621.9   gap 29.8
+                         3 barriers x 6.0 = 18.0    -> 60% of the gap, 11.8 unexplained
+    fused stubbed        38.25 MB   measured 731.5   at stream rate 693.7   gap 37.8
+                         5 barriers x 6.0 = 30.0    -> 79% of the gap,  7.8 unexplained
+
+So barriers are the mechanism, at 60-79% of it. Across a token, 80 barriers cost 480 us of
+12664 — **3.8%**, which is most of the 4.5% that separates the fused loop from lm_head's
+uninterrupted stream.
+
+The 8-12 us/layer left over is where fifo-switching and routing contention live, and this
+still does not separate those two from each other. It is also within reach of the probe's
+own limits: its barrier is measured with a no-op kernel and small transfers, while the real
+design's barriers drain a far deeper DMA pipeline, so 6.00 us is plausibly a lower bound and
+the residual may be barrier cost the probe cannot see.
+
+What this makes concrete: the 4.5% is not waste, it is what phase ordering costs, and it is
+already the cheapest available form of it — the same five phases as separate dispatches would
+cost 5 x 92.9 us per layer instead of 5 x 6.0. Reducing it means fewer phases, not faster
+ones, and the phase count is set by the data dependencies in a decoder layer.
