@@ -14364,3 +14364,28 @@ pointing backwards, and that asymmetry appears to have been missed.
 
 Consequence: multi-token decode cannot work as the design stands. Throughput is
 unaffected — the drain moves the same bytes either way.
+
+### The pair write is mandatory: a single column is unaligned
+
+Trying the obvious fix — write one bf16 column instead of the aligned pair:
+
+    offset = 2 * (base * KVSTRIDE + pos),  sizes = [1, 1, HEAD, 2]
+    -> 'aie.dma_bd' op Offset must be aligned to 4 byte boundary
+
+So `off = pos - (pos & 1)` is not a choice; it is the only expressible form. A single
+bf16 column is a 2-byte write at an odd byte offset and the DMA rejects it at compile
+time. The clobber is a consequence of a hardware constraint, not an oversight in the
+offset arithmetic.
+
+That fixes the shape of the real fix: since the drain must write both columns, the
+**emit** has to supply both — the current token's k' and the previous one's. The kernel
+cannot recompute the previous k', but it does not need to: statics persist across
+dispatch boundaries (`static_persist_probe`), and each core keeps the same head every
+token, so the value it needs is precisely the one it produced last time. One `HEAD`-wide
+bf16 static per core, written at the end of each emit and read at the start of the next.
+
+Not built this tick. Recording the constraint and the shape, because the obvious fix is
+ruled out by measurement rather than by argument, and the next person to look at this
+will otherwise try the same two-byte write.
+
+The v side needs nothing: its pair points forward into a position not yet written.

@@ -432,6 +432,21 @@ def _design(bc: In, {params}):
                       # KV heads within the group; leaving it at 2 drains a
                       # neighbour's tile and HANGS rather than erring.
                       oh[i].drain(kvb[i], wait=True, group=tg,
+                                  # The aligned PAIR is mandatory, not a choice:
+                                  # a single bf16 column is a 2-byte write at an
+                                  # odd offset and the DMA rejects it —
+                                  #   'aie.dma_bd' op Offset must be aligned to
+                                  #   4 byte boundary
+                                  # which is why `off` rounds down to even. The
+                                  # cost is that at odd positions this also
+                                  # writes column pos-1, destroying the previous
+                                  # token's k' (measured: 6.19 at pos 3). Fixing
+                                  # it needs the EMIT to supply both columns, so
+                                  # the kernel has to carry the previous k' in a
+                                  # static — those persist across dispatches
+                                  # (static_persist_probe) and each core keeps
+                                  # the same head, so the value it needs is the
+                                  # one it computed last time.
                                   offset=2 * (_base * {KVSTRIDE} + {off}),
                                   sizes=[1, 1, {HEAD}, 4],
                                   strides=[0, 2 * {KVSTRIDE}, 2 * {TSEQ}, 1])
