@@ -12574,3 +12574,63 @@ Worth noting the shape of this: the constraint that looked like a blocker
 already built for a different reason. That is the second time the existing
 kernels have already solved a problem this architecture ran into — the first was
 the residual riding the weight tile, for the same 2-input-channel reason.
+
+---
+
+# CURRENT STATE — supersedes the earlier CURRENT STATE section
+
+## What the whole thing turned on
+
+FLM issues **~2.5 dispatches per TOKEN**; the design that existed issued **32**
+(16 layers x 2). Traced by counting `DRM_IOCTL_AMDXDNA_EXEC_CMD` in FLM's own
+process. That surplus x the 67.2 us floor accounts for the entire ~9% deficit to
+within 0.3% — the kernels were never the problem.
+
+## What works today
+
+`p1p2_chain` + `p5_pass`, 16 cores, two dispatches. One dispatch can iterate 16
+real layers with per-layer weights (8859 us + 3205 us). **But the composition is
+invalid**: P5 feeds the next layer's P1, so A x16 then B x16 cannot compute a
+token. The 63.4 tok/s figure is for a structure that cannot produce output.
+
+## The role architecture (32 cores, one dispatch per token)
+
+    group A   8 cores   P1 qkv+RoPE    191.2 us (124.0 compute)   PASS
+    group B   8 cores   P2 attention    92.3 us ( 25.1 compute)   PASS, full 32 heads
+    group C  16 cores   P3+P4+P5        not yet built
+
+**A+B are integrated and passing** (`groups_ab.py`): q' streams A[j] -> B[j] core
+to core, attention at 0.76 ULP, fused 215.5 us vs 283.5 as two dispatches — saving
+exactly one floor. Compute does not overlap at nobj=1, which is expected; whether
+it does at NLAY>1 is untested.
+
+Projection, every term measured: **61.2 tok/s** against FLM's 61.18.
+
+## Hard limits, all measured
+
+    core tile               2 in / 2 out DMA channels
+    memtile                 ~6 in / ~6 out; joins and splits max 4-way
+    joined fifo             cannot be joined again (no two-level joins)
+    program memory          16 KB; 4 phase bodies overflow, 3 fit at ~78%
+    full-size build         exceeds 2400 s at 32 cores — iterate small
+    aie::exp2               linear interpolation, ~6% error, exact at integers
+
+## Group C's open questions
+
+  * o_proj must run as **two K-chunks** (B's 8 cores cannot join to one object).
+    `flm_gemv_down` already does chunked accumulate/flush, so one kernel can serve
+    both P3 and P5.
+  * P3's residual now has `P3_RESID_FROM_STASH`; P5 writes it via `XOUT_TO_STASH`.
+  * **Unresolved:** P4's activation is h, which lives in `g_resid` on-core, but
+    `flm_gemv_gate` expects it in a fifo object. Either a self-loop fifo (costs
+    DMA channels a core does not have spare) or the gate kernels read `g_resid`
+    directly. Not yet decided.
+
+## Enabling changes, all default-off with callers verified
+
+    flm_p1_emit       DIM_QGROUP            pack GQA q heads per object
+    flm_kv_emit       handles v' as well    two emitters, two output types
+    flm_attn_finish   NPAD_FROM_KV          npad from the KV trailer
+    flm_gemv_residual P3_RESID_FROM_STASH   distinct name; the shared one collided
+    flm_h_emit        DIM_GROUP             group size no longer hard-coded
+    drain_plan        group=                same
