@@ -12235,3 +12235,29 @@ Worth contrasting with the paired design, where q' had to ride the broadcast fif
 with a per-core offset in the KV trailer, and reading it from the wrong fifo was a
 bug that survived a host-built cache *and* a host-built q'. The role split deletes
 that machinery rather than reimplementing it.
+
+### CORRECTION: the A -> B seam needs two output fifos, not zero changes
+
+I said the seam was "plumbing only, no kernel edit". The kernel side holds —
+`QOFF_FROM_KV=0`, `DIM_QSTRIDE=2*HEAD`, ordering already correct — but the fifo
+side does not, for two reasons found while wiring it:
+
+**1. Attention needs all four q heads in ONE object.** `flm_attn_decode` acquires
+`eq` once and holds it across the whole KV loop, reading `q[h*QSTRIDE + d]` for
+`h` in `0..GQA-1`. Group A emits one head per object (`o_ty = OBJ`). Acquiring
+four objects would not give contiguity, so A's q' object has to be `GQA * OBJ`.
+
+**2. q' and k'/v' need different destinations.** Today all of A's emissions share
+one fifo and the host drains different parts of the stream to different buffers.
+Under the role split q' goes to B (a core) while k' and v' go to the host cache —
+and a fifo has one consumer chain, so one fifo cannot serve both.
+
+So group A needs **two output fifos**: `f_q[c]` carrying `GQA * OBJ` to B[c], and
+`f_kv[c]` carrying k'/v' to the host cache. That is exactly the 2 output DMA
+channels a core has, so it fits — but with nothing spare, which is worth knowing
+before anything else wants an output from those cores.
+
+The correction matters because "no changes needed" would have had me wiring
+`f_o[c]` straight into attention and getting a wrong answer from a stream whose
+shape happens to be acceptable. Checking the kernel's *addressing* was right;
+checking only the addressing was not enough.
