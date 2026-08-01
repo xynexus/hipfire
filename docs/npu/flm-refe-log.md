@@ -13600,3 +13600,24 @@ carried: it lists "5.6 staging" among terms it calls "every term measured", and 
 measurement of it appears anywhere in this log. At 5.6 us against a 15.3 ms token it
 changes nothing either way — but that is exactly the profile of lm_head's 3700, which
 also looked harmless and was wrong by 700 us.
+
+### Full re-verification after this session's kernel changes
+
+Three kernels changed this session — `flm_attn_decode` and `flm_attn_finish` gained
+`ATTN_MASK_PAD`, and `flm_gemv_down` lost its `DIM_ACCN` default. Every design that
+compiles any of them, re-run:
+
+    group_a                 q' 9.5367e-07   k' 1.9531e-03 (1 ulp)   v' 0.0   PASS
+    groups_ab  pos 0        0.0000e+00                                       PASS
+    groups_ab  pos 30       1.5359e-03  (0.76 ULP)                           PASS
+    group_c                 P3 9.5367e-07   P4 2.9297e-03   P5 0.0000e+00    PASS
+    p5_pass                 x_out 0.0000e+00                                 PASS
+    p1p2_chain seq 31       3.4631e-03  vs tol 9.3994e-03                    PASS
+
+Two of these were gaps rather than routine: `p5_pass` is the other `DIM_ACCN` caller
+and I had verified only `group_c` when making that flag mandatory, and `group_a` had
+not been re-run at all since the attention kernels changed. Neither turned up a
+problem, which is the expected outcome and not the reason to run them — the reason is
+that "this change is inert for other callers" was exactly the claim that proved false
+once already this session, when `ATTN_MASK_PAD` read npad from the wrong layout and
+only `p1p2_chain` revealed it.
