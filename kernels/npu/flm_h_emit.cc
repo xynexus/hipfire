@@ -35,14 +35,22 @@
 #ifndef DIM_P3TILES
 #define DIM_P3TILES 8
 #endif
+#ifndef DIM_GROUP
+#define DIM_GROUP 2             // cores sharing one operand fifo: 2 pair, 4 quad
+#endif
 
 namespace {
 constexpr int RESN = DIM_RESN;
 constexpr int NR = DIM_NROWS;
 constexpr int TILES = DIM_P3TILES;
-static_assert(TILES * NR == 2 * DIM_HEAD,
-              "h's slice must fill the shared result object exactly");
-static_assert(RESN == 2 * TILES * NR, "g_resid spans a PAIR's rows");
+constexpr int GRP = DIM_GROUP;
+// A core's slice must FIT the shared result object, not fill it. At 16 cores in
+// pairs it happens to fill it exactly (8*16 == 2*64); at 32 cores in quads a core
+// owns half as many rows and the object is half-written, which is legal — the
+// drain reads only TILES*NR per core either way.
+static_assert(TILES * NR <= 2 * DIM_HEAD,
+              "h's slice must fit the shared result object");
+static_assert(RESN == GRP * TILES * NR, "g_resid spans the GROUP's rows");
 } // namespace
 
 extern float g_resid[];
@@ -59,7 +67,9 @@ flm_h_emit(const uint8 *restrict wtile, bfloat16 *restrict out) {
   // A core-sized DIM_RESN would collide instead of scattering — rows 0 and 128
   // land in the same slot — which is why resid_chain sizes it per pair.
   const int base = tile_row_base(wtile);
-  const int j = (base % (2 * NR)) / NR;
+  // Which core within the group: rows interleave at NROWS granularity across all
+  // GRP cores, so the modulus spans the group, not just a pair.
+  const int j = (base % (GRP * NR)) / NR;
   // **Do not let this unroll.** TILES*NR is 128 iterations, and fully unrolled
   // it costs over 960 B of program memory — enough to push a core running
   // P1+P3+P4+P5 past 16 KB, which is measured, not hypothetical. As a rolled
@@ -67,6 +77,6 @@ flm_h_emit(const uint8 *restrict wtile, bfloat16 *restrict out) {
 #pragma clang loop unroll(disable)
   for (int i = 0; i < TILES * NR; ++i) {
     const int t = i / NR, r = i - t * NR;
-    out[i] = bfloat16(g_resid[t * 2 * NR + j * NR + r]);
+    out[i] = bfloat16(g_resid[t * GRP * NR + j * NR + r]);
   }
 }

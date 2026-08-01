@@ -103,13 +103,13 @@ def build(pos, nobj):
     # is what the 8 memtiles limit: 2-way gives 2*npairs links (36 at 32 cores,
     # fails placement), 4-way gives 2*nquads (18, the working design's count).
     nquads = NCORES // 4
-    p1quads = (npairs - apairs) // 2      # quads whose cores run P1
-    aquads = apairs // 2                  # quads whose cores run attention
     apairs = NATT // 2
     # Partition B: the attention cores cannot also hold P1's kernels (measured —
     # five phases overflow 16 KB), so P1 spreads over the remaining cores.
     p1pairs = npairs - apairs
     p1cores = 2 * p1pairs
+    p1quads = p1pairs // 2                # quads whose cores run P1
+    aquads = apairs // 2                  # quads whose cores run attention
     hpc = hpc_for(p1cores)
     layout = head_layout(p1cores)
     qobj, kvplan = drain_plan(p1cores, group=4)
@@ -194,7 +194,7 @@ def build(pos, nobj):
     # pairs 4-5 emit 8, since the KV-carrying cores spend two slots on k/v
     # drain TARGET shape, not object shape -- the same trap h_ty hit
     q_tys = [np.ndarray[(2 * K_DIM + 2 * HEAD,), np.dtype[bfloat16]]
-             for i in range(p1pairs)]
+             for i in range(p1quads)]
     # uint8, matching the operand fifo it feeds. A fill whose buffer and fifo
     # disagree on element width counts its sizes in the wrong unit.
     cache_ty = np.ndarray[(nobj * 2 * NATT * SLOT,), np.dtype[np.uint8]]
@@ -204,7 +204,7 @@ def build(pos, nobj):
              f"-DDIM_GQA={GQA}", f"-DDIM_TSEQ={TSEQ}", f"-DDIM_KVPER={KVPER}",
              f"-DDIM_QSTRIDE={OBJ}", f"-DDIM_KVOBJ={OPERAND}",
              f"-DDIM_NPADOFF={32 * OBJ}", "-DQOFF_FROM_KV=1",
-             f"-DDIM_RESN={2 * p3tiles * NROWS}",
+             f"-DDIM_RESN={4 * p3tiles * NROWS}", "-DDIM_GROUP=4",
              f"-DDIM_P3TILES={p3tiles}",
              f"-DDIM_OBJROWS={OBJ}"]
     # This list must match `at` element for element. Weights and q results are
@@ -422,11 +422,11 @@ def _design(bc: In, {P}):
         pq = {p1quads}
         bcb = args[0]
         wb = [args[1 + i] for i in range(pq)]
-        kvb = [args[1 + {p1pairs} + i]
+        kvb = [args[1 + {p1quads} + i]
                for i in range(a + (a if {HOSTKV} else 0))]
         ax = a + (a if {HOSTKV} else 0)
-        qb = [args[1 + {p1pairs} + ax + i] for i in range({p1pairs})]
-        cb = [args[1 + 2 * {p1pairs} + ax + i] for i in range(n)]
+        qb = [args[1 + {p1quads} + ax + i] for i in range({p1quads})]
+        cb = [args[1 + 2 * {p1quads} + ax + i] for i in range(n)]
         ab = [args[1 + pq + pq + ax + n + i] for i in range(a)]
         # tensor args: bc, w*p1pairs, (kvin+hostcache)*ax, q*p1pairs,
         # cache*n, attn*a, then P3's bc + w3*n + h*n. Handles follow all of them.
@@ -443,14 +443,14 @@ def _design(bc: In, {P}):
             bch.fill(bcb, group=tg,
                      offset=_lay * {BCN1},
                      sizes=[1, 1, 1, {BCN1}], strides=[0, 0, 0, 1])
-            for i in range({p1pairs}):     # partition B: only these pairs run P1
+            for i in range({p1quads}):     # partition B: only these quads run P1
                 wh[i].fill(wb[i], group=tg,
                            offset=_lay * {p1_lsz},
                            sizes=[1, 1, 1, {p1_lsz}],
                            strides=[0, 0, 0, 1])
             QOBJ, KVPLAN = {qobj!r}, {kvplan!r}
             QBASE, HPCC = {qbase!r}, {hpcc!r}
-            for i in range({p1pairs}):
+            for i in range({p1quads}):
                 p1h[i].drain(qb[i], wait=True, group=tg,
                              offset=QBASE[i] * {OBJ},
                              sizes=[1, HPCC[i], 4, {OBJ}],
@@ -620,6 +620,9 @@ def main():
                 f"verification, not this flag.")
     npad = nobj * KVPER * TSEQ - o.seq
     npairs, apairs = NCORES // 2, NATT // 2
+    nquads = NCORES // 4
+    p1quads = (npairs - apairs) // 2
+    aquads = apairs // 2
     p1pairs = npairs - apairs          # partition B: attention cores skip P1
     hpc = hpc_for(2 * p1pairs)
     layout = head_layout(2 * p1pairs)
@@ -741,10 +744,12 @@ def main():
     # npad rides at NQ*OBJ as an f32 bit pattern and the drain never reaches it:
     # the highest byte any pair writes is qbase[-1]*OBJ + ... = 4095 < 4096.
     q_all = iron.tensor(qraw.view(bfloat16), dtype=bfloat16, device="npu")
-    q_in = [q_all] * apairs
-    q_ts = [q_all] * p1pairs
-    attn_out = iron.zeros(apairs * 2 * GQA * HEAD, dtype=bfloat16, device="npu")
-    a_ts = [attn_out] * apairs        # every pair drains into the same buffer
+    q_in = [q_all] * aquads
+    # One shared buffer per role, replicated once per QUAD now — the design
+    # takes one handle per operand fifo and there are nquads of those.
+    q_ts = [q_all] * p1quads
+    attn_out = iron.zeros(aquads * 4 * GQA * HEAD, dtype=bfloat16, device="npu")
+    a_ts = [attn_out] * aquads        # every quad drains into the same buffer
     # ---- P3: o_proj + residual -------------------------------------------
     # Its activation is host-supplied for now. The device's own attn_out covers
     # only NATT of the 8 KV groups (16 of 32 q heads at NATT=4), so it is not a
@@ -849,7 +854,7 @@ def main():
     bc4 = np.zeros(2 * K_DIM + 2 * HEAD, np.float32)
     bc4[K_DIM:2 * K_DIM] = nw2
     h_all = iron.tensor(bc4.astype(bfloat16), dtype=bfloat16, device="npu")
-    h_ts = [h_all] * npairs          # every pair scatters into the same buffer
+    h_ts = [h_all] * nquads          # every quad scatters into the same buffer
     bc4_t = h_all                    # ...which P4 is then filled from
 
     rpp4 = D_FF // nquads                  # rows a QUAD owns
@@ -888,7 +893,7 @@ def main():
         w4.append(iron.tensor(np.concatenate(per_layer), dtype=np.uint8,
                               device="npu"))
     sw_all = iron.zeros(D_FF, dtype=bfloat16, device="npu")
-    sw_ts = [sw_all] * npairs      # every pair scatters into the same buffer
+    sw_ts = [sw_all] * nquads      # every quad scatters into the same buffer
 
     import os as _oh
     if _oh.environ.get("CHAIN_HOST_KV"):
@@ -910,11 +915,11 @@ def main():
                     np.array([float(g * GQA * OBJ)], np.float32).view(np.uint16)
         host_t = iron.tensor(hraw.reshape(-1).view(np.uint8), dtype=np.uint8,
                              device="npu")
-        design(bc_t, *w_ts, *q_in, *[host_t] * apairs, *q_ts,
-               *[cache_t] * npairs, *a_ts, bc3_t, *w3, *h_ts,
+        design(bc_t, *w_ts, *q_in, *[host_t] * aquads, *q_ts,
+               *[cache_t] * nquads, *a_ts, bc3_t, *w3, *h_ts,
                bc4_t, *w4, *sw_ts)
     else:
-        _args = (bc_t, *w_ts, *q_in, *q_ts, *[cache_t] * npairs, *a_ts,
+        _args = (bc_t, *w_ts, *q_in, *q_ts, *[cache_t] * nquads, *a_ts,
                  bc3_t, *w3, *h_ts, bc4_t, *w4, *sw_ts)
         if o.bench:
             _b = run_iters(design, *_args, warmup=2, iters=10)

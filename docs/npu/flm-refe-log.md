@@ -11696,3 +11696,44 @@ and parallelism is unchanged. Which puts the quad restructure back as the requir
 path, exactly as the plan had it — but now for a measured reason rather than an
 assumed one, and with the knowledge that everything except program memory already
 works at five phases.
+
+## 2026-08-01 — CORRECTION: the memtile budget is CHANNELS, not links
+
+`layer_quad` now builds through kernel compilation and reaches placement:
+
+    (2/42) placed.mlir: error: no MemTile has sufficient DMA capacity
+           for 4 input/1 output channels near centroid column 6
+
+That is a 4-way **join**, and `split_width_probe` showed 4-way joins work in
+isolation. So this is contention, and my "18 links, same as the working design"
+reasoning was measuring the wrong thing.
+
+Each link costs channels, and a w-way link costs `w + 1` of them — but split and
+join load the two directions differently:
+
+    w-way split: 1 in,  w out
+    w-way join:  w in,  1 out
+
+Counting properly, against 8 memtiles at ~6 in / 6 out = 48 each way:
+
+    16 cores 2-way:  18 links,  28 in,  26 out    works today
+    32 cores 2-way:  36 links,  56 in,  52 out    fails (as measured)
+    32 cores 4-way:  18 links,  **48 in**, 42 out    exactly at the limit
+
+**48 of 48.** The link count halved exactly as intended, but the input channels
+did not — widening a join trades one link for `w` inputs, so the join side barely
+moves. With zero slack, any placement imbalance fails, which is what "near
+centroid column 6" is reporting.
+
+And the obvious rebalance does not help: making outputs 2-way while weights stay
+4-way gives 8 + 32 + 8 = 48 in as well. The join side dominates either way.
+
+So the restructure as specified does not fit, and this is a real dead end rather
+than a bug to chase. What would create slack: fewer joined outputs — draining some
+cores straight to shim instead of through a memtile join — or fewer output streams
+per core. Both are changes to what the phases emit, not to how operands are
+distributed, which is a different kind of change from the one planned.
+
+Recorded rather than worked around. `flm_h_emit` is now correctly parameterised by
+`DIM_GROUP` (2 or 4) and `p1p2_chain` is verified unaffected — q' 0.0000e+00,
+P3 h 9.5367e-07, sw 2.08% of peak — so that part of the work stands.
