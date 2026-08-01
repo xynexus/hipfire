@@ -12634,3 +12634,42 @@ Projection, every term measured: **61.2 tok/s** against FLM's 61.18.
     flm_gemv_residual P3_RESID_FROM_STASH   distinct name; the shared one collided
     flm_h_emit        DIM_GROUP             group size no longer hard-coded
     drain_plan        group=                same
+
+### Group C does not fit as one group — the architecture needs a fourth
+
+Working out how P4 gets its activation turns up a channel shortage that no
+kernel flag fixes.
+
+**Why h has to be gathered.** P4's gate and up are `K_DIM -> D_FF`, so every core
+needs the *whole* normalised h. But P3 distributes h across the group — each core
+computes 1/16 of its rows. So h must be gathered and broadcast back, which is
+exactly what `flm_h_emit` plus a drain plus a refill does in the paired design.
+
+**Which does not fit.** As one 16-core group, C needs:
+
+    IN : attention (from B), weights, the gathered h broadcast    = 3
+    OUT: its h slice (to the gather), x_out (to host)             = 2
+
+against 2 in / 2 out. The attention stream and the h broadcast cannot share a
+fifo — different producers — so the inputs are genuinely over.
+
+**The fork.** Splitting C in two fixes it and pushes further toward FLM's shape:
+
+    group A   8 cores   P1  qkv + RoPE
+    group B   8 cores   P2  attention
+    group C1  8 cores   P3  o_proj + residual       in: attn, weights   out: h
+    group C2  8 cores   P4 + P5  FFN                in: h, weights      out: x_out
+
+Every group is then within 2 in / 2 out, and no core carries more than two phase
+bodies. Both 8-core groups tile 2048 and 8192 cleanly.
+
+**The cost is real and unmeasured.** P3, P4 and P5 would run on 8 cores instead of
+16, roughly doubling their share of the layer. The FFN is the bulk of the work, so
+this is not a rounding error — it could plausibly cost more than the 1.1 ms the
+single dispatch saves. That is the thing to measure before committing: the 61.2
+tok/s projection assumed C at 16 cores and does not survive this change unexamined.
+
+Recording the fork rather than picking. The alternative — finding a way to keep C
+at 16 — would need the h gather to arrive on the same fifo as the attention
+stream, and those have different producers, which is the constraint that has been
+closing options all along.
