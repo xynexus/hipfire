@@ -197,7 +197,7 @@ def device_run(design, wtile, NROWS, ncores, tiles_per_core, tiles, act, iters):
     larger than everything this design is trying to save. Timing through the
     iron.jit callable measures that overhead, not the dispatch.
     """
-    from fused_pyxrt import PyxrtDesign
+    from pyxrt_design import PyxrtDesign
 
     npairs = ncores // 2
     per_pair = 2 * tiles_per_core
@@ -248,7 +248,7 @@ def bench_exact(NROWS, ncores, tiles_per_core, act, iters):
     what guards against timing a kernel that computes nothing.
     """
     import gemv_bench
-    from fused_pyxrt import PyxrtDesign
+    from pyxrt_design import PyxrtDesign
 
     design, wtile = gemv_bench.build(K_DIM, NROWS, ncores, tiles_per_core)
     nb = K_DIM // q4nx.BLK

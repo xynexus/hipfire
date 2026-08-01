@@ -24,6 +24,14 @@
 //
 // Verified end to end by `tools/npu/flm/kv_emit_verify.py`: five dispatches,
 // both carries exact.
+//
+// **One carry per LAYER.** A design that runs several layers on the same core
+// between dispatches — the fused single dispatch does all sixteen — would
+// otherwise have layer 0 of the next token close its column pair with layer 15's
+// key. Even positions never READ the carry, which is why that stayed invisible
+// through every even-position result. `FLM_KV_LAYERS` defaults to 1, so every
+// one-layer design keeps a single 128-byte array and the layer index is the
+// constant 0 that `pack_tile` writes.
 
 #pragma once
 #include <aie_api/aie.hpp>
@@ -33,22 +41,33 @@
 #define DIM_HEAD 64
 #endif
 
-// This core's previous-token k', carried between dispatches.
-inline bfloat16 g_kprev[DIM_HEAD] __attribute__((aligned(64)));
+// Layers this core runs between dispatches. A power of two, so the index can be
+// masked into range for free rather than trusted.
+#ifndef FLM_KV_LAYERS
+#define FLM_KV_LAYERS 1
+#endif
+static_assert((FLM_KV_LAYERS & (FLM_KV_LAYERS - 1)) == 0,
+              "FLM_KV_LAYERS must be a power of two");
+
+// This core's previous-token k', per layer, carried between dispatches.
+inline bfloat16 g_kprev[FLM_KV_LAYERS][DIM_HEAD] __attribute__((aligned(64)));
 
 // `src` is this token's k' head; `out` receives 2*DIM_HEAD interleaved values.
+// `lay` selects the carry, and is `tile_layer(wtile)` at both call sites.
 inline __attribute__((noinline)) void
-flm_kv_pair(const bfloat16 *restrict src, int t, bfloat16 *restrict out) {
+flm_kv_pair(const bfloat16 *restrict src, int t, int lay,
+            bfloat16 *restrict out) {
+  bfloat16 *restrict prev = g_kprev[lay & (FLM_KV_LAYERS - 1)];
   if (t & 1) {
     for (int d = 0; d < DIM_HEAD; ++d) {
-      out[2 * d] = g_kprev[d];
+      out[2 * d] = prev[d];
       out[2 * d + 1] = src[d];
     }
   } else {
     for (int d = 0; d < DIM_HEAD; ++d) {
       out[2 * d] = src[d];
       out[2 * d + 1] = bfloat16(0.0f);
-      g_kprev[d] = src[d];
+      prev[d] = src[d];
     }
   }
 }

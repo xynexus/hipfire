@@ -16337,3 +16337,229 @@ rule recorded is not a rule applied.
 Where the host term now stands: 181.1 us, of which ~19 is selection and ~162 the rescore of
 32 rows — 41 KB and 65K MACs. It remains per-op overhead rather than work, and the ceiling is
 still an implementation that does not pay it.
+
+### MULTI-TOKEN DECODE: the device carries its own KV cache from token to token
+
+Every result in this file before this line is a SINGLE decode step onto a cache the
+host built. This is the loop:
+
+    prompt "The quick brown fox"  ->  [128000, 791, 4062, 14198, 39935]
+    the DEVICE decodes positions 0..11, writing every KV entry it later reads
+
+    pos  4  GENERATE  35308 ' jumps'      12987.5 us
+    pos  5  GENERATE    927 ' over'       12603.8
+    pos  6  GENERATE    279 ' the'        13007.8
+    pos  7  GENERATE  16053 ' lazy'       13022.5
+    pos  8  GENERATE   5679 ' dog'        12600.8
+    pos  9  GENERATE    627 '.\n'         12692.2
+    pos 10  GENERATE     32 'A'           12642.1
+    pos 11  GENERATE  11670 ' classic'    12635.0
+
+    ' jumps over the lazy dog.\nA classic'
+
+Sixteen layers in one dispatch per token, the run object held, positions alternating
+odd and even, and nothing staged by the host between steps except the embedding row
+and the RoPE pair.
+
+**Against the fp32 oracle** (`decode_oracle.py`, which follows the DEVICE's token at
+each step so every line is a one-step comparison on a shared prefix):
+
+    pos  4  oracle  35308  device  35308  ok      margin +3.5140
+    pos  5  oracle    927  device    927  ok      margin +7.9172
+    pos  6  oracle    279  device    279  ok      margin +4.5703
+    pos  7  oracle  16053  device  16053  ok      margin +4.6194
+    pos  8  oracle   5679  device   5679  ok      margin +3.9595
+    pos  9  oracle     13  device    627  DIFFER  margin +0.0535   top3 [13, 627, 382]
+    pos 10  oracle   2028  device     32  DIFFER  margin +0.2933   top3 [2028, 32, 791]
+    pos 11  oracle  11670  device  11670  ok      margin +2.0894
+
+Five identical, then two disagreements, then agreement again. **Both disagreements are
+near-ties and in both the device picks the oracle's runner-up**: the oracle prefers its
+own token by 0.05 and 0.29 logits, against margins of 3.5-7.9 everywhere it agrees. That
+is 4-bit quantization choosing between two candidates the fp32 model is nearly
+indifferent between ('.' against '.\n', 'This' against 'A'), and it is the signature to
+look for — a divergence at a margin of 3.0 would be a fault. The disagreements sit at an
+odd and an even position with agreement on both sides, so there is no parity pattern to
+them either.
+
+Per token, every term measured:
+
+    layers   12667.2 us   median of 8 generated steps, held run, wall clock
+    lm_head   3010.6 us   the exact q4_1 dispatch, held run, measured separately
+    host        10.5 us   embedding row 0.38 + final RMSNorm 5.25 + argmax 4.89
+    token    15688.3 us   ->  **63.7 tok/s**   FLM 61.18, **+4.1%**
+
+The loop's own head runs on the HOST exactly (2.3 s a token in numpy) because no design
+in this tree runs lm_head against the model's real rows — `gemv_bench`'s lm_head-sized
+build streams tiled repeats of one tensor, which measures bytes and not logits. So the
+3010.6 is carried from its own measurement rather than measured inside the loop, and the
+figure says so.
+
+## The two changes, and why they had to land together
+
+**1. `g_kprev` is per LAYER.** `flm_kv_pair` closes an odd position's K column pair with
+the previous token's key out of core `.bss`, and the fused design runs all sixteen layers
+on that core — so one `HEAD`-wide array had layer 0 of the next token closing its pair
+with layer 15's key. `g_kprev[FLM_KV_LAYERS][DIM_HEAD]`, 2048 B at sixteen layers, with
+the layer index arriving in a THIRD f32 of the weight tile's 64-byte trailer
+(`tile_layer()`, alongside `row_base` and `flags`, 56 bytes of which were spare).
+`FLM_KV_LAYERS` defaults to 1 and `pack_tile`'s `layer` defaults to 0, so every one-layer
+design keeps a single 128-byte array and byte-identical tiles.
+
+**2. Position is a runtime value.** Three `ScratchpadParameter`s — `kv_k_off`,
+`kv_v_off`, `aw_parity` — as `offset_parameter=` on the drains and on A's weight fill,
+plus `aiecc_flags=["--get-scratchpad-parameters"]`. One xclbin serves every position, so
+nothing is reloaded and `g_kprev` survives. Without this, loading the next position's
+build clears the `.bss` that fix 1 lives in.
+
+`aw_parity` is the one that is not obvious. `flm_kv_pair` needs the position's PARITY, and
+that reaches the kernel through the weight tile's `flags` — a host-written byte. Rather
+than patch 128 tile trailers per token and pay a partial cache flush for each, A's weights
+are held TWICE, identical but for `flags`, and the parameter selects the copy: 32 MB of
+DDR against nothing per token. A's tiles use `flags` for nothing else — only
+`flm_gemv_down` reads it, and no A tile reaches that kernel.
+
+Measured, so the next person does not re-derive it: `bo.sync(dir, size, offset)` exists in
+pyxrt and a 64-byte partial sync costs 0.6 us against 148 us for a full 16 MB buffer. That
+is what made the in-place patch a live option, and the duplicate the better one.
+
+The value a DMA `offset_parameter` carries is in ELEMENTS of the destination buffer — the
+firmware computes `StateTable[idx] * elemBytes` and ADDS it to the BD address register
+(`AIEUtils.cpp:emitUpdateBdAddressFromOffsetParameter`). The KV buffer is uint8, so these
+three are byte counts, and every one is a multiple of 4 by construction, which the address
+register requires. `params.txt` lands in the JIT cache dir and reports kind `addr`, which
+is written raw; the shift-by-2 in `ParameterScratchpad` applies only to `core`-kind
+parameters read by a `Worker`.
+
+`fused.Session` holds the run object across steps, which is worth 5714 us a token — more
+than lm_head — and is not optional anyway, since the parameter values are written through
+`run.get_ctrl_scratchpad_bo()`.
+
+## Odd positions verify
+
+Sequential device decode, the cache written entirely by the device, against the fp32
+oracle's hidden state at the same position:
+
+    pos 0 EVEN  [128000]                       argmax 16309 (oracle 16309)  cos 0.999325
+    pos 1 ODD   [128000,791]                   argmax   220 (oracle  2768)  cos 0.993758
+    pos 2 EVEN  [128000,9906,1917]             argmax  2268 (oracle  2268)  cos 0.987621
+    pos 3 ODD   [128000,791,4062,14198]        argmax 39935 (oracle 39935)  cos 0.938162
+    pos 4 EVEN  [128000,791,4062,14198,39935]  argmax 35308 (oracle 35308)  cos 0.956228
+
+Position 3 — an ODD position, the case that could never have been right before — produces
+the oracle's token. Position 1's 220 is the oracle's SECOND choice at +10.1084 against
++10.2370, a 1.3% logit gap, on the highest hidden-state cosine of any nonzero position
+here (0.9938); same near-tie signature as the two divergences above.
+
+The pos 2 and pos 4 cosines here (0.987621, 0.956228) differ from the recorded 0.986880
+and 0.964879 **because this is a different experiment**: the recorded numbers are a single
+step onto a HOST-prefilled cache, and here the device wrote every prior entry itself, in
+bf16, where the host reference holds fp64. Re-run in the recorded configuration they
+reproduce to every digit — see the sweep below. Two runs at different cache provenances
+are not a comparison, and quoting the sequential number as a regression would have been
+the same error as comparing a pos-0 run against a pos-30 one.
+
+## The FLM comparison is out of reach at TSEQ=32, by five positions
+
+FLM's server applies the Llama-3.2-Instruct chat template **including a system block**,
+and there is no way off it: `raw: true`, `template: ""`, `template: "{{ .Prompt }}"`,
+`system: ""` and `num_predict` are each ignored, tested individually. Measured from the
+server's own `/api/generate` `context` array — the token sequence it fed the model —
+cross-checked against `usage.prompt_tokens` from `/v1/completions`, and the two agree:
+
+    prompt "Hi"                   36 prompt tokens, then [4438,649,358,1520,499,3432,30,128009]
+    prompt "The quick brown fox"  39 prompt tokens
+    fixed overhead                35 tokens
+
+    "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n
+      Cutting Knowledge Date: December 2023\nToday Date: 02 Aug 2026\n\n
+      <|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>
+      <|start_header_id|>assistant<|end_header_id|>\n\n"
+
+**The system block carries today's date.** Any FLM token sequence recorded here has to
+carry the date it was captured or a later comparison will diverge for a reason that has
+nothing to do with the device. The sequence above is 2026-08-02.
+
+The template WITHOUT the system block is 11 tokens for "Hi" and 14 for "The quick brown
+fox", and it is not what FLM sees. Feeding our pipeline the 11-token version and expecting
+4438 would be the fault this log has recorded five times, one level up: two correct
+answers to different questions, compared.
+
+So a like-for-like diff needs 37 positions and the KV cache is 32 columns. TSEQ is not a
+free constant. `kernels/npu/flm_attn_decode.cc` carries
+`static_assert(TSEQ == 32, "score vectors are one 32-lane register")` — the whole online
+softmax, its running max, its rescale and its p.V live in one vector. Two routes:
+
+  * **TSEQ = 40**, the largest that preserves the design's single shared operand size:
+    the KV tile is `2 * HEAD * TSEQ` elements, so 32 -> 8192 B, 40 -> 10240 B, 44 ->
+    11264 B against an operand of 10304 that is ALSO group C's q4nx weight tile. And
+    `KVSTRIDE = max(KTILE + VTILE, OPERAND // 2) = max(5120, 5152) = 5152` at TSEQ=40,
+    i.e. exactly today's stride, so the cache layout arithmetic does not move. It costs a
+    two-register score path in the attention kernel.
+  * **KVPER = 2**, which the kernel already loops for (`u * TSEQ`) — and which makes the
+    KV object 16384 B, breaking that same shared operand size, with placement risk at
+    46/46 memtile channels.
+
+Neither is done in this entry. This is the reason the bar has not been cleared, and it is
+a property of the design rather than a gap in the work.
+
+## Regression sweep, on the current code
+
+`flm_kv_pair.h` and `flm_q4_1_tile.h` are linked by every design, so all of them:
+
+    group_a        q' 3.8147e-06  k' 0.0000e+00  v' 5.9605e-08              PASS
+    groups_ab p0   attn 5.9605e-08 (0.00 ULP)  k' 0.0  v' 5.9605e-08        PASS
+    groups_ab p30  attn 4.8865e-04 (0.50 ULP)  k' 0.0  v' 5.9605e-08        PASS
+    group_c s31    P3 0.0000e+00  P4 2.9297e-03  P5 7.4506e-09              PASS
+    p5_pass        x_out 0.0000e+00                                         PASS
+    p1p2_chain s31 attn 3.1111e-03 vs tol 9.3994e-03                        PASS
+
+    fused, HOST-prefilled cache, the recorded configuration:
+      pos 0  argmax 16309  cos vs oracle 0.999325   (recorded 0.999325)
+      pos 2  argmax  2268  cos vs oracle 0.986880   (recorded 0.986880)
+      pos 4  argmax 35308  cos vs oracle 0.964879   (recorded 0.964879)
+
+Every one identical to its recorded number. `sweep.sh` runs the first six.
+
+### The sweep found a latent bug the JIT cache had been hiding
+
+`groups_ab` at its default `--p1-cores 16` does not generate at all:
+
+    IndexError: list index out of range     <string>:133 in _design
+    ao_sub[c // 4][c % 4].prod()            f_ao is 2 fifos of 4 -> 8 consumers
+
+Group B's attention output leaves through two 4-way joins, so exactly eight cores can run
+it; there is no index for a ninth. The default asked for sixteen. **Every recorded
+`groups_ab` PASS in this log came from an 8-core ELF that `iron.jit` served from cache
+without ever re-running the generator** — the numbers are real, the configuration they
+were labelled with was not. It surfaced only because changing `flm_kv_pair.h` busted the
+cache and the generator ran for the first time in a long while.
+
+Nothing about it is caused by this session's work: `_design` is pure Python, and
+`ao_sub[c // 4]` with two entries is out of range for `c >= 8` under any kernel. The
+default is now 8 and the constraint raises a sentence instead of an IndexError. The 8-core
+numbers above are the ones that were always being measured.
+
+This is the third form of the same thing in this file — a harness reporting confidently
+about a configuration it was not in. The first two were a derived check gating on a phase
+that did not run, and a grep filtering an advisory out of its own transcript. This one had
+a cache in the middle, which is worse: the stale artifact was correct, so nothing looked
+wrong, and only an unrelated invalidation could reveal it.
+
+### What moved, file by file
+
+    kernels/npu/flm_q4_1_tile.h    + tile_layer(), the trailer's third f32
+    kernels/npu/flm_kv_pair.h      g_kprev[FLM_KV_LAYERS][DIM_HEAD]; default 1, additive
+    kernels/npu/flm_kv_emit.cc     passes tile_layer(wtile)
+    kernels/npu/flm_p1_emit.cc     same
+    tools/npu/flm/q4nx.py          pack_tile(..., layer=0.0), the third trailer slot
+    tools/npu/flm/fused.py         ScratchpadParameters, the doubled A weights, Session,
+                                   --sequential; build() loses its `pos` argument
+    tools/npu/flm/pyxrt_design.py  PyxrtDesign, moved out of fused_pyxrt, + parameters()
+    tools/npu/flm/decode.py        the loop
+    tools/npu/flm/decode_oracle.py the one-step external diff
+    tools/npu/flm/sweep.sh         the sweep
+    tools/npu/flm/groups_ab.py     8 cores, stated rather than an IndexError
+    tools/npu/flm/fused_pyxrt.py   diagnostics only now; --iron is gone, because that
+                                   path never writes the scratchpad and would dispatch
+                                   with whatever offsets a fresh BO happens to hold

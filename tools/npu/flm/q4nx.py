@@ -114,7 +114,7 @@ class Q4nx:
         return d, m, codes
 
 
-def pack_tile(d, m, codes, row_base=0, flags=0.0, trailer=True):
+def pack_tile(d, m, codes, row_base=0, flags=0.0, layer=0.0, trailer=True):
     """Pack NROWS output rows into the kernel's tile layout.
 
     [NROWS*NB bf16 d][NROWS*NB bf16 m][NROWS*K/2 bytes], the same planar shape
@@ -136,7 +136,11 @@ def pack_tile(d, m, codes, row_base=0, flags=0.0, trailer=True):
              packed.ravel()]
     if trailer:
         tr = np.zeros(TILE_TRAILER, np.uint8)
-        tr[0:8].view(np.float32)[:] = (np.float32(row_base), np.float32(flags))
+        # [row_base | flags | layer], the third slot read by `tile_layer()`.
+        # It stays 0 for every one-layer design, so their tiles are byte
+        # identical to what they were before the field existed.
+        tr[0:12].view(np.float32)[:] = (np.float32(row_base), np.float32(flags),
+                                        np.float32(layer))
         parts.append(tr)
     return np.concatenate(parts)
 

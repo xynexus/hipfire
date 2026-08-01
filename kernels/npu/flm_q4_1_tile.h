@@ -75,6 +75,15 @@ inline int tile_flags(const uint8 *restrict wtile) {
   return int(reinterpret_cast<const float *>(wtile + TILE_BYTES)[1]);
 }
 
+// The trailer's THIRD f32: which LAYER this tile belongs to. Zero for every
+// design that runs one layer per dispatch, which is all of them but the fused
+// one — and the fused one runs sixteen layers on the same core, so anything the
+// core carries between dispatches (`g_kprev`) has to be indexed by it. The
+// trailer has 56 spare bytes, so this costs nothing and no other caller moves.
+inline int tile_layer(const uint8 *restrict wtile) {
+  return int(reinterpret_cast<const float *>(wtile + TILE_BYTES)[2]);
+}
+
 static_assert(NB % 2 == 0, "K must be a multiple of 64");
 static_assert(NB % LANES == 0, "K/32 must be a multiple of 32 for the zero-point reduction");
 
