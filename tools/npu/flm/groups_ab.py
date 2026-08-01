@@ -240,7 +240,18 @@ def build(pos, ncores=NCORES, seq=32):
     kv_all_ty = kv_ty          # the same buffer, read back as B's operand
 
     flags = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_HEAD={HEAD}",
-             f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS={NQ}", f"-DDIM_QKHEADS={NK}"]
+             f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS={NQ}", f"-DDIM_QKHEADS={NK}",
+             # group A packs GQA q heads into one object so B can acquire it once
+             f"-DDIM_QGROUP={GQA}",
+             # group B: attention over one KV group per core
+             f"-DDIM_GQA={GQA}", f"-DDIM_TSEQ={TSEQ}", f"-DDIM_KVPER={KVPER}",
+             f"-DDIM_KVOBJ={OPERAND}", f"-DDIM_KVSTRIDE={OPERAND // 2}",
+             f"-DDIM_QSTRIDE={2 * HEAD}",
+             # q' arrives on its own fifo starting at head 0, so no offset
+             "-DQOFF_FROM_KV=0",
+             # and npad rides the KV trailer, because a core-to-core q has no
+             # host-written tail to carry it
+             "-DNPAD_FROM_KV=1"]
     # weights per PAIR; k'/v' out per CORE; the cache back IN per core as B's
     # operand; attention out as two joined streams. No q' — core to core.
     params = ", ".join(f"w{i}: In" for i in range(npairs))
@@ -266,7 +277,7 @@ def _design(bc: In, {params}):
     kat = ExternalFunction("flm_attn_tile", source_file=ATT_SRC,
                            arg_types=[q_ty, kvop_ty], compile_flags=FLAGS)
     kaf = ExternalFunction("flm_attn_finish", source_file=FIN_SRC,
-                           arg_types=[ao_ty, q_ty], compile_flags=FLAGS)
+                           arg_types=[ao_ty, q_ty, kvop_ty], compile_flags=FLAGS)
 
     f_bc = ObjectFifo(bc_ty, depth=1, name="bc")
     bc_cons = [f_bc.cons() for _ in range({ncores})]
@@ -357,13 +368,18 @@ def _design(bc: In, {params}):
         DIM_QSTRIDE expects, and QOFF_FROM_KV=0 puts head 0 at offset 0."""
         eq = qc.acquire(1)
         kbegin(eq)
-        for _ in range_({nobj}):
+        for _ in range_({nobj} - 1):
             ekv = kvc.acquire(1)
             ktile(eq, ekv)
             kvc.release(1)
+        # hold the LAST KV object: npad rides its trailer (NPAD_FROM_KV), because
+        # q travels core to core and has no host-written tail to carry it.
+        ekv = kvc.acquire(1)
+        ktile(eq, ekv)
         eo = op.acquire(1)
-        kfin(eo, eq)
+        kfin(eo, eq, ekv)
         op.release(1)
+        kvc.release(1)
         qc.release(1)
 
     for c in range({ncores}):
@@ -548,7 +564,15 @@ def main():
     # Two separate buffers is what made attention output zeros: B attended over a
     # cache nobody had written. uint8 because the operand fifo is byte-typed, so
     # the drain offsets below are BYTES — which is also the form p1p2_chain uses.
-    cache = iron.zeros(8 * KVSTRIDE * 2, dtype=np.uint8, device="npu")
+    # npad rides each head's KV trailer (NPAD_FROM_KV), 4 bytes after the qoff
+    # slot the paired design uses. The host must WRITE it — reading an unwritten
+    # trailer is what left attention off by its own magnitude.
+    npad = TSEQ * nobj * KVPER - (o.pos + 1)
+    cache_np = np.zeros(8 * KVSTRIDE * 2, np.uint8)
+    for _g in range(8):
+        _off = _g * OPERAND + OPERAND - 60
+        cache_np[_off:_off + 4] = np.array([float(npad)], np.float32).view(np.uint8)
+    cache = iron.tensor(cache_np, dtype=np.uint8, device="npu")
     kv_ts = [cache] * ncores
     kvin_ts = [cache] * ncores
     ao_ts = [iron.zeros(4 * GQA * HEAD, dtype=bfloat16, device="npu")

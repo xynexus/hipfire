@@ -12347,3 +12347,33 @@ keeps the q stream pure data — it is the one to try.
 
 k' and v' pass throughout, so A's side is right; every fault has been on the path
 into B.
+
+### npad via the KV trailer: 5.05e-01 -> 6.25e-02, and still not the last fault
+
+`flm_attn_finish` now takes the KV tile and reads npad from its trailer under
+`NPAD_FROM_KV`, because a core-to-core q has no host-written tail:
+
+    #if NPAD_FROM_KV
+      npad_f = *(const float *)(kv_raw + DIM_KVOBJ - 60);
+    #else
+      npad_f = *(const float *)((const bfloat16 *)q_raw + DIM_NPADOFF);
+
+The attention core holds its LAST KV object rather than releasing it inside the
+loop, so `kfin` can read that trailer. `attn_phase` is unaffected — the flag
+defaults off and it still PASSes.
+
+Adding the flag alone changed nothing, because **the host was never writing npad
+into the trailer**. Reading an unwritten trailer is what left attention off by
+roughly its own magnitude. With the host writing it:
+
+    before npad wired   5.0549e-01
+    after               **6.2500e-02**      tol 4.0588e-03
+
+A real fix — the error fell by 8x — but still 15x over the floor. The remaining
+gap is not yet identified. 6.25e-02 is exactly 1/16, which is suggestive but not
+evidence.
+
+Running total on this seam: four faults found and fixed (two cache buffers,
+unpadded slots, missing per-core fill offset, unwritten npad), each of which
+produced a wrong number rather than a failure, and at least one more outstanding.
+k' and v' have passed throughout — every fault has been on the path into B.

@@ -55,6 +55,9 @@
 #endif
 // npad sits at a FIXED offset in the shared q' block — it is the same for every
 // core, so unlike the query slice it needs no per-core index.
+#ifndef DIM_KVOBJ
+#define DIM_KVOBJ 10304
+#endif
 #ifndef DIM_NPADOFF
 #define DIM_NPADOFF (DIM_GQA * DIM_QSTRIDE)
 #endif
@@ -97,12 +100,32 @@ extern float g_acc[];
 //
 // So `q` is [GQA*HEAD bf16 q'][1 f32 npad], and the f32 is read through a cast.
 // The offset is GQA*HEAD bf16 = 512 B, so it is 4-byte aligned by construction.
+// **NPAD_FROM_KV**: read npad from the KV tile's trailer instead of the q tail.
+//
+// The q tail works when the host builds the q block — it writes npad after the
+// heads. Under the role architecture q travels core to core (P1's cores straight
+// to attention's), so the host never touches it and there is no tail to write.
+// The KV tile is still host-built, and it already carries a trailer that
+// QOFF_FROM_KV reads, so npad rides there instead. Same value, a source the host
+// can still reach.
+#ifndef NPAD_FROM_KV
+#define NPAD_FROM_KV 0
+#endif
 extern "C" __attribute__((noinline)) void
 flm_attn_finish(bfloat16 *restrict out,        // [GQA][HEAD]
-                const uint8 *restrict q_raw) {
+                const uint8 *restrict q_raw
+#if NPAD_FROM_KV
+                , const uint8 *restrict kv_raw
+#endif
+                ) {
+#if NPAD_FROM_KV
+  const float npad_f =
+      *reinterpret_cast<const float *>(kv_raw + DIM_KVOBJ - 60);
+#else
   const float npad_f =
       *reinterpret_cast<const float *>(
           reinterpret_cast<const bfloat16 *>(q_raw) + DIM_NPADOFF);
+#endif
   for (int h = 0; h < GQA; ++h) {
     // No scalar libm on the core (`undefined symbol: exp2f`), so this goes
     // through the vector exp2 and extracts one lane — the same idiom the
