@@ -12177,3 +12177,30 @@ The honest caveat stands unchanged: 744.1 us/layer was measured on the
 half-attention design, and group B doing eight KV groups on eight cores instead of
 four on four is *inferred* to cost the same per core. That inference is the largest
 remaining uncertainty in the number, and group B will measure it.
+
+### Group B measured: full head coverage is free
+
+The largest remaining uncertainty was whether group B, doing eight KV groups on
+eight cores, costs what four groups on four cores cost. It does:
+
+    4 cores / 4 KV groups   93.0 us  ->  25.8 compute
+    8 cores / 8 KV groups   92.3 us  ->  25.1 compute
+
+Doubling both the work and the cores changes nothing — **-0.7 us**, inside noise.
+The inference in the projection was right, so 61.2 tok/s stands with one fewer
+assumption behind it.
+
+It also says something about the design that exists today: **the half-attention
+configuration has been paying full-coverage prices all along.** Computing 16 of 32
+q heads on four cores costs the same as computing all 32 on eight. The correctness
+gap was never bought with speed; it was just a consequence of the core budget.
+
+Attention is also small in absolute terms — 25 us of compute against a 67.2 us
+dispatch floor, which is why it has been floor-dominated in every standalone
+measurement. Inside a fused dispatch it contributes ~25 us per layer.
+
+Both groups now measured on real weights:
+
+    group A   P1 on 8 cores, per-core fifos   191.2 us  (124.0 compute)  PASS
+    group B   P2 on 8 cores, 8 KV groups       92.3 us  ( 25.1 compute)  PASS
+    group C   P3+P4+P5 on 16 cores             — the working design's phases
