@@ -99,6 +99,40 @@ not decay, because we cannot go deep enough to decay. Any claim of beating FLM
 streamed structure — a much larger change than a quant-format port. Until then the
 honest claim is bounded: 63.4 vs 61.18 at short context.
 
+## Sizing the two levers — they barely overlap
+
+Our fused design runs 777 MB/token at 63.4 tok/s = **49.3 GB/s effective**, against FLM's
+781 MB at 60.1 = 46.9 GB/s. We are 5.0% more bandwidth-efficient on identical weights.
+Holding that efficiency and varying only the FORMATS (projection, not measurement):
+
+        ctx     FLM |  us q4nx  us oq4++  oq4+kv8  oq4+kv4
+       1010   58.36 |     61.0      71.3     73.0     73.8
+       8210   43.37 |     47.7      53.8     62.5     68.1
+      32885   23.21 |     27.3      29.2     42.0     53.8
+      65785   14.51 |     17.4      18.1     29.2     42.0
+      98685   10.56 |     12.8      13.2     22.4     34.4
+
+**The two levers are nearly disjoint.** At 1K, `oq4++` IS the win (+22% over FLM) and KV
+quantization adds 3%. At 98K, `oq4++` adds almost nothing over the format we already have
+(13.2 against 12.8) while KV quantization is worth 2.6x — because KV is 82% of traffic at
+bf16 and 54% even at 4-bit.
+
+Which to build first is therefore a question about which context regime matters, not about
+which is the better idea:
+
+  - **short-context serving** -> `oq4++`, ~+22%, well-understood path, no cache redesign
+  - **long-context serving**  -> streamed KV + KV quantization, ~2-3x, but it needs the
+    cache to stop being a fixed 40-column tile first, which is the larger engineering item
+
+Both are real; neither subsumes the other. Doing `oq4++` first is defensible because it is
+bounded and reuses everything here — but note it wins in exactly the region where FLM is
+strongest, and leaves untouched the region where FLM falls to 10 tok/s.
+
+Projections assume 49.3 GB/s holds at other formats and depths, which is exactly the
+assumption the first task below is meant to test. KV quantization also costs accuracy in a
+way weight quantization at 4 bits largely does not — 4-bit KV is aggressive and unvalidated
+here.
+
 ## What is established and should not be re-derived
 
 Hard limits, all measured on this hardware:
@@ -191,3 +225,52 @@ Each of these produced a confident wrong result that survived at least one check
     (12.2 +- 4.3 us/layer at 2.9 sigma) but not eliminated.
   - Whether the two-pass head's coarse tier should be `oq4++` too, or stay a
     purpose-built 4-bit direction encoding.
+
+## Kickoff prompt for the next session
+
+```
+Read docs/npu/next-phase-goals.md first — it closes the FLM reverse-engineering
+phase and states the findings that drive this one.
+
+CONTEXT. tools/npu/flm/ reproduces FLM's tokens exactly (4/4 on FLM's own
+/api/generate context array) and runs 63.4 tok/s against FLM's 61.18 at short
+context. Full record in docs/npu/flm-refe-log.md — long, and its CURRENT STATE
+section supersedes everything above it.
+
+THE SHAPE OF THE PROBLEM. NPU decode here is bandwidth-bound end to end: 92.4% of
+layer time survives with all 32 cores' compute stubbed. Bits per weight IS speed,
+measured not inferred (coarse 4.02 vs exact 5.00 bits gave a bytes ratio 0.8006
+against a time ratio 0.8033). Two levers follow, and they are nearly disjoint:
+
+  oq4++ weights        +22% at 1K context, ~nothing past 32K
+  streamed+quantized KV  ~nothing at 1K, 2.6x at 98K
+
+Pick per the scoping decision in the goal doc. If unspecified, default to oq4++.
+
+FIRST TASK EITHER WAY, before touching sixteen layers: build ONE GEMV in the target
+format at lm_head size and measure whether it reaches the same ~54.7 GB/s. Every
+projection in the goal doc assumes it does, and that assumption is untested. If it
+does not, say so and stop — the plan rests on it.
+
+CONSTRAINTS THAT ARE NOT NEGOTIABLE:
+- Verify at pos > 0. Position 0's softmax is over one entry, so it is structurally
+  blind to attention; it stayed bit-exact through a bug that collapsed every later
+  position to cosine 0.05.
+- Benchmark by INTERLEAVING, never sequential A-then-B. Same-build spread is 2.6%
+  and a sequential A/B has twice called a loss a 40% win here.
+- Verify against something that shares no code — the fp32 oracle from
+  consolidated.00.pth. Five correctness faults once passed every check because
+  each check's reference came from the same wrong input.
+- iron.jit caches on the AST. Comments and compile flags do NOT bust it; stamp
+  values into fifo names.
+- ./tools/npu/flm/sweep.sh is the regression gate. Run it after touching anything
+  shared: kernels/npu/flm_kv_pair.h, flm_q4_1_tile.h, pyxrt_design.py.
+- A user-owned `flm serve llama3.2:1b` runs on port 52625 (NOT 11434) and is the
+  token oracle. Query it, never restart it. Requesting a different model would
+  evict llama from it — do not, without asking.
+- Quote the right baseline: 61.18 tok/s is FLM at short context. Its decode falls
+  to 10.56 at 98K, so a deep-context comparison is a different claim. Read the
+  baseline caveat before quoting any tok/s number.
+
+Work on a new branch off feat/npu-flm-reverse-engineering.
+```
