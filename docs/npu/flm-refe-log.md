@@ -13401,16 +13401,30 @@ a ~30 us error bar (same-build run-to-run spread is 2.6%), which is where the ea
     lm_head 2994.2 us          measured at its own size, 163.7 MB at 54.7 GB/s
     floor      92.9 us         7-point fit, R^2 0.99997
 
-    token = 92.9 + 16 x (123.6 + 651.7) + 2994.2 = 15492.7 us -> 64.5 tok/s
-    FLM 61.18, +5.5%   -- IF the two halves fuse into ONE dispatch
+    projected  92.9 + 16 x (123.6 + 651.7) + 2994.2 = 15492.7 us -> 64.5 tok/s
 
-A+B's fit recovers an intercept of 90.0 us against the independently fitted 92.9 us
-floor, which is a consistency check on both.
+**BUILT AND MEASURED** (`tools/npu/flm/fused.py`): one design, 32 cores, ONE dispatch per
+token, all 16 layers looped inside the instruction sequence.
 
-Interleaved as separate dispatches it is 55.0 tok/s, a 10% LOSS. The fused topology
-places and routes at full operand size (32 cores, 0 DMA errors), per-core program
-memory fits (A+B 57%, C 90% of 16 KB, and fusing adds code to no core), and the C->A
-seam needs no new core code if it crosses host memory. **Nothing is built.**
+    16 layers, one dispatch, three runs of one build:
+      12993.8   12703.5   12651.9 us     median 12703.5, spread 2.7%
+    token = 12703.5 + 2994.2 (lm_head) = 15697.7 us  ->  **63.7 tok/s**
+    FLM 61.18, **+4.1%**       range over the three runs 62.5-63.9 (+2.2% to +4.4%)
+
+    cosine 0.999650 vs the validated host; argmax **16309**, the oracle's token
+    per-phase bounds DERIVED from the format (two bf16 representable steps at each
+    phase's own peak), inside at every layer
+
+Interleaved as separate dispatches it would be 55.0 tok/s, a 10% LOSS — the fusion is
+what makes the result, not an optimisation on top of it.
+
+**31 us/layer above projection is unattributed**, across three unisolated candidates: A at
+NROWS=8 where `groups_ab` runs 16; the projection's additivity (two slopes each fitted on a
+design that owned the whole machine); C genuinely slower fused. If it is additivity, that
+invalidates the estimation METHOD every projection in this log used.
+
+Verified at **pos 0 only** — position is still a build parameter, so `g_kprev` and the
+prior KV cache are unexercised.
 
 ## The five faults found today, and what they have in common
 
@@ -13437,7 +13451,8 @@ success was treated as insufficient — internally everything agreed at pos 30.
 
 ## Open
 
-  * **the fused single dispatch** — the only throughput item, and the result turns on it
+  * **31 us/layer unattributed** in the fused design (see above) — and whether additivity
+    holds is a standing question about how throughput gets estimated here at all
   * a KV cache carried by the device across successive tokens
   * group C's internal seams: P4 reads host h, P5 host sw
   * attention floor 2-3 ULP at pos 1-2, advisory in both harnesses
