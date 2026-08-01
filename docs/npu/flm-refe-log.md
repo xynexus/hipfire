@@ -13196,3 +13196,35 @@ inherited constant. +2.0% over FLM is inside that error bar, not outside it. The
 honest claim is that the architecture is *at parity or slightly ahead* on projection,
 and that giving A+B a layer loop is what would turn the largest assumption into a
 measurement.
+
+### A+B's layer slope, measured: the assumption held
+
+`AB_NLAY` wraps both core bodies and both task groups in a layer loop, reusing the
+same weights and cache across iterations — the basis `p5_pass` used, which measures
+the mechanism's cost rather than producing a correct multi-layer result.
+
+    AB_NLAY=1   219.2 us
+    AB_NLAY=2   340.1 us      slope 1->2  120.9
+    AB_NLAY=4   593.6 us      slope 2->4  126.8   slope 1->4  124.8
+
+The projection had assumed 121.1 us/layer from a single-layer measurement. The
+measured slope is 124.8 — 3% higher, and the assumption was sound. Attention is
+still 0.76 ULP at pos 30 with the loop in place, so the loop did not cost
+correctness.
+
+Adding the loop cost 5 us at one layer (214.0 -> 219.2), which is the loop's own
+overhead and is now included in every point above.
+
+Both slopes measured:
+
+    A+B 16 layers :   2089.7 us   (MEASURED)
+    C   16 layers :  10299.3 us   (MEASURED)
+    lm_head       :   3700.0 us   (carried, never re-measured)
+    token         :  16089.0 us  ->  62.2 tok/s    FLM 61.18, +1.6%
+
+Two of the four weak terms from the previous entry are now retired. What remains is
+the handoff between A+B and C, which is still absent from the arithmetic, and
+lm_head, which is 23% of the token and inherited. A 1.6% margin still sits inside
+those two, so this does not yet establish beating FLM — it establishes that the
+per-layer compute, which is 77% of the token, is measured end to end and lands
+slightly ahead.

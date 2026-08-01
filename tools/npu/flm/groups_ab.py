@@ -241,6 +241,7 @@ def build(pos, ncores=NCORES, seq=32):
     kv_all_ty = kv_ty          # the same buffer, read back as B's operand
 
     MASKPAD = os.environ.get("ATTN_MASK_PAD", "1")
+    ABLAY = int(os.environ.get("AB_NLAY", "1"))
     flags = [f"-DDIM_K={K_DIM}", f"-DDIM_NROWS={NROWS}", f"-DDIM_HEAD={HEAD}",
              f"-DDIM_ACT={K_DIM}", f"-DDIM_QHEADS={NQ}", f"-DDIM_QKHEADS={NK}",
              # group A packs GQA q heads into one object so B can acquire it once
@@ -287,7 +288,7 @@ def _design(bc: In, {params}):
 
     f_bc = ObjectFifo(bc_ty, depth=1, name="bc")
     bc_cons = [f_bc.cons() for _ in range({ncores})]
-    f_w = [ObjectFifo(wpair_ty, name=f"wp{MASKPAD}_{{i}}") for i in range({npairs})]
+    f_w = [ObjectFifo(wpair_ty, name=f"wp{MASKPAD}l{ABLAY}_{{i}}") for i in range({npairs})]
     w_sub = [f.cons().split([0, {wt}], obj_types=[wt_ty, wt_ty]) for f in f_w]
     # PER-CORE result fifos. p1_route joins two cores into one; group A
     # streams each core to its own B core, so there is nothing to join —
@@ -322,41 +323,45 @@ def _design(bc: In, {params}):
         Slots 0..GQA-1 are q and the rest are kv — that is `head_layout(8)`'s
         order, and drain_plan already checks q slots form a prefix.
         """
-        eb = bcc.acquire(1)
-        kprep(eb)
-        eq = opq.acquire(1)                  # ONE object for all GQA q heads
-        for _ in range_({GQA}):
-            for _ in range_({TPH} - 1):
-                ew = wc.acquire(1)
-                kqkv(eb, ew)
-                wc.release(1)
-            # The emit reuses the head's LAST tile rather than acquiring its
-            # own: it needs a tile only for row_base/flags, and a separate
-            # acquire would consume a fifth object per head, desynchronising the
-            # weight stream after the first head. Its row_base is h*HEAD+48, so
-            # row_base/HEAD is still h.
-            #
-            # Both objects are acquired before either call — an acquire between
-            # two kernels sharing a global loses the handoff
-            # (global_handoff_probe.py), and these share g_stage.
-            ew = wc.acquire(1)
-            kqkv(eb, ew)
-            kemit(ew, eq)                    # slot = head % GQA, in place
-            wc.release(1)
-        opq.release(1)
+        # Layer loop. Weights and the cache are REUSED across iterations, so
+        # this measures the mechanism's per-layer cost, not a correct
+        # multi-layer result -- the same basis p5_pass used for its slope.
+        for _lay in range_({ABLAY}):
+          eb = bcc.acquire(1)
+          kprep(eb)
+          eq = opq.acquire(1)                  # ONE object for all GQA q heads
+          for _ in range_({GQA}):
+              for _ in range_({TPH} - 1):
+                  ew = wc.acquire(1)
+                  kqkv(eb, ew)
+                  wc.release(1)
+              # The emit reuses the head's LAST tile rather than acquiring its
+              # own: it needs a tile only for row_base/flags, and a separate
+              # acquire would consume a fifth object per head, desynchronising the
+              # weight stream after the first head. Its row_base is h*HEAD+48, so
+              # row_base/HEAD is still h.
+              #
+              # Both objects are acquired before either call — an acquire between
+              # two kernels sharing a global loses the handoff
+              # (global_handoff_probe.py), and these share g_stage.
+              ew = wc.acquire(1)
+              kqkv(eb, ew)
+              kemit(ew, eq)                    # slot = head % GQA, in place
+              wc.release(1)
+          opq.release(1)
 
-        for _ in range_({hpc} - {GQA}):      # k' and v', one object each
-            for _ in range_({TPH} - 1):
-                ew = wc.acquire(1)
-                kqkv(eb, ew)
-                wc.release(1)
-            ew = wc.acquire(1)
-            ekv = opkv.acquire(1)
-            kqkv(eb, ew)
-            kvemit(ew, ekv)          # the kv emitter, o_ty output
-            opkv.release(1)
-            wc.release(1)
-        bcc.release(1)
+          for _ in range_({hpc} - {GQA}):      # k' and v', one object each
+              for _ in range_({TPH} - 1):
+                  ew = wc.acquire(1)
+                  kqkv(eb, ew)
+                  wc.release(1)
+              ew = wc.acquire(1)
+              ekv = opkv.acquire(1)
+              kqkv(eb, ew)
+              kvemit(ew, ekv)          # the kv emitter, o_ty output
+              opkv.release(1)
+              wc.release(1)
+          bcc.release(1)
 
     workers = []
     for p in range({npairs}):
@@ -372,21 +377,22 @@ def _design(bc: In, {params}):
         """Attention for one KV group. `qc` is A[j]'s q' fifo, arriving core to
         core — the q object holds all GQA heads at OBJ stride, which is what
         DIM_QSTRIDE expects, and QOFF_FROM_KV=0 puts head 0 at offset 0."""
-        eq = qc.acquire(1)
-        kbegin(eq)
-        for _ in range_({nobj} - 1):
-            ekv = kvc.acquire(1)
-            ktile(eq, ekv)
-            kvc.release(1)
-        # hold the LAST KV object: npad rides its trailer (NPAD_FROM_KV), because
-        # q travels core to core and has no host-written tail to carry it.
-        ekv = kvc.acquire(1)
-        ktile(eq, ekv)
-        eo = op.acquire(1)
-        kfin(eo, eq, ekv)
-        op.release(1)
-        kvc.release(1)
-        qc.release(1)
+        for _lay in range_({ABLAY}):
+          eq = qc.acquire(1)
+          kbegin(eq)
+          for _ in range_({nobj} - 1):
+              ekv = kvc.acquire(1)
+              ktile(eq, ekv)
+              kvc.release(1)
+          # hold the LAST KV object: npad rides its trailer (NPAD_FROM_KV), because
+          # q travels core to core and has no host-written tail to carry it.
+          ekv = kvc.acquire(1)
+          ktile(eq, ekv)
+          eo = op.acquire(1)
+          kfin(eo, eq, ekv)
+          op.release(1)
+          kvc.release(1)
+          qc.release(1)
 
     for c in range({ncores}):
         workers.append(Worker(core_b,
@@ -411,50 +417,52 @@ def _design(bc: In, {params}):
         oh = [args[h0 + 1 + n + i] for i in range(nc)]
         kvinh = [args[h0 + 1 + n + nc + i] for i in range(nc)]
         aoh = [args[h0 + 1 + n + 2 * nc + i] for i in range(2)]
-        # ---- group A -------------------------------------------------------
-        # q' is absent from this task group by design: it leaves core to core,
-        # so the only drains here are k' and v' into the cache buffer.
-        tg = TaskGroup()
-        bch.fill(bcb, group=tg)
-        for i in range(n):
-            wh[i].fill(wb[i], group=tg)
-        for i in range(nc):
-            for _kind, _base in KVPLAN[i]:
-                if _kind == "k":
-                    # ONE k head per core at group=1. The second dimension counts
-                    # KV heads within the group; leaving it at 2 drains a
-                    # neighbour's tile and HANGS rather than erring.
-                    oh[i].drain(kvb[i], wait=True, group=tg,
-                                offset=2 * (_base * {KVSTRIDE} + {off}),
-                                sizes=[1, 1, {HEAD}, 4],
-                                strides=[0, 2 * {KVSTRIDE}, 2 * {TSEQ}, 1])
-                else:
-                    # ONE v head per core, whole object: row pos gets v' and row
-                    # pos+1 gets the emit's zeros, which is what a padded
-                    # position must hold until the next token overwrites it.
-                    oh[i].drain(kvb[i], wait=True, group=tg,
-                                offset=2 * (_base * {KVSTRIDE} + {KTILE}
-                                            + {pos} * {HEAD}),
-                                sizes=[1, 1, 1, 2 * {OBJ}],
-                                strides=[0, 2 * {KVSTRIDE}, 0, 1])
-        tg.finish()
+        for _lay in range({ABLAY}):
+          # ---- group A -------------------------------------------------------
+          # q' is absent from this task group by design: it leaves core to core,
+          # so the only drains here are k' and v' into the cache buffer.
+          tg = TaskGroup()
+          bch.fill(bcb, group=tg)
+          for i in range(n):
+              wh[i].fill(wb[i], group=tg)
+          for i in range(nc):
+              for _kind, _base in KVPLAN[i]:
+                  if _kind == "k":
+                      # ONE k head per core at group=1. The second dimension counts
+                      # KV heads within the group; leaving it at 2 drains a
+                      # neighbour's tile and HANGS rather than erring.
+                      oh[i].drain(kvb[i], wait=True, group=tg,
+                                  offset=2 * (_base * {KVSTRIDE} + {off}),
+                                  sizes=[1, 1, {HEAD}, 4],
+                                  strides=[0, 2 * {KVSTRIDE}, 2 * {TSEQ}, 1])
+                  else:
+                      # ONE v head per core, whole object: row pos gets v' and row
+                      # pos+1 gets the emit's zeros, which is what a padded
+                      # position must hold until the next token overwrites it.
+                      oh[i].drain(kvb[i], wait=True, group=tg,
+                                  offset=2 * (_base * {KVSTRIDE} + {KTILE}
+                                              + {pos} * {HEAD}),
+                                  sizes=[1, 1, 1, 2 * {OBJ}],
+                                  strides=[0, 2 * {KVSTRIDE}, 0, 1])
+          tg.finish()
 
-        # ---- group B -------------------------------------------------------
-        # A separate task group, because B reads back the cache A just wrote.
-        # The barrier is the ordering: p1p2_chain proved this write-then-read
-        # through host memory within one dispatch.
-        tg = TaskGroup()
-        for i in range(nc):
-            # B core i attends with KV group i, so it reads slot i — one
-            # OPERAND-sized object at i * OPERAND. Without the offset every core
-            # gets the whole eight-head buffer clipped to one object, which is
-            # head 0's K followed by nothing it should see.
-            kvinh[i].fill(kvinb[i], group=tg,
-                          offset=i * {OPERAND},
-                          sizes=[1, 1, 1, {OPERAND}], strides=[0, 0, 0, 1])
-        for i in range(2):
-            aoh[i].drain(aob[i], wait=True, group=tg)
-        tg.finish()
+        for _lay in range({ABLAY}):
+          # ---- group B -------------------------------------------------------
+          # A separate task group, because B reads back the cache A just wrote.
+          # The barrier is the ordering: p1p2_chain proved this write-then-read
+          # through host memory within one dispatch.
+          tg = TaskGroup()
+          for i in range(nc):
+              # B core i attends with KV group i, so it reads slot i — one
+              # OPERAND-sized object at i * OPERAND. Without the offset every core
+              # gets the whole eight-head buffer clipped to one object, which is
+              # head 0's K followed by nothing it should see.
+              kvinh[i].fill(kvinb[i], group=tg,
+                            offset=i * {OPERAND},
+                            sizes=[1, 1, 1, {OPERAND}], strides=[0, 0, 0, 1])
+          for i in range(2):
+              aoh[i].drain(aob[i], wait=True, group=tg)
+          tg.finish()
 
     # q' never reaches the host — it goes core to core — so it has no tensor and
     # no handle. What crosses the shim: weights in, k'/v' out to the cache, the
