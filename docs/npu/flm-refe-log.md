@@ -11564,3 +11564,32 @@ also where role specialisation has to appear, since five bodies still do not fit
 core.
 
 Not started. The working 16-core design is untouched and passing.
+
+### Step 1 attempted, reverted: the quad boundary also rewrites KV delivery
+
+At 16 cores the quads align cleanly with the partition — quads 0-2 are P1 cores,
+quad 3 is exactly the four attention cores, nothing straddles. That looked like
+the easy case.
+
+The design side went in fine (opquad_ty, `f_w` over `nquads`, a four-offset split,
+`w_sub[c // 4][c % 4]`). What stopped it is the argument list, and the reason is
+worth adding to the plan:
+
+**Weight tensors are not counted in pairs uniformly.** `w_ts` covers only the P1
+group (`p1pairs` today, `p1quads` after), while `w3` and `w4` cover **every** pair
+because all cores run P3 and P4. So one rename does not serve: the P1 weight arg
+count goes 6 -> 3 while P3/P4 go 8 -> 4, and every `base3` / `base4` / `base`
+offset downstream shifts by a different amount.
+
+**And KV delivery changes shape.** Today two attention pairs take two separate
+fills into two pair-fifos (`wh[n - a + i]`, i in 0..1). Under quads those four
+cores share ONE fifo, so the two fills become one fill through a 4-way split. That
+is not a re-index; it is a different delivery structure for the operand that
+already caused the P1->P2 seam bug once.
+
+The plan said quad boundaries and the P1/P2 split "have to be chosen together". It
+under-stated it: the KV **fill count** changes too, and that is the part with
+history.
+
+Reverted; 16 cores untouched and passing. Step 1 stands, but it is
+"rewrite the operand argument layout", not "widen a split".
