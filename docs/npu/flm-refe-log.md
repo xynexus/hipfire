@@ -14119,3 +14119,28 @@ host reference implemented the same mistake as the thing it was checking.
 The yardstick is now trustworthy, which is what makes the device work measurable. It is
 also worth stating what the device has *not* got: both faults are still in
 `group_c`, `groups_ab` and `p5_pass`, unchanged.
+
+### group C computes a Llama layer now: real weights, and the residual on h
+
+    P3 h     : 0.0000e+00   mean|ref| 0.04417
+    P4 sw    : 2.9297e-03   1.81% of peak
+    P5 x_out : 7.4506e-09   mean|ref| 0.04876
+    -> group C PASS
+
+Two changes since the last passing run, and the numbers show both took effect. Weights
+come through `q4nx_tensor_blocks`, so the GEMVs are against the model's actual weights.
+And P5's residual is `h` rather than `x`, so the layer no longer discards its own
+attention — visible in `mean|ref|` rising from 0.04454 to 0.04876, which is the
+attention contribution reappearing in the output.
+
+The reference this is measured against is now itself validated: the same layer
+arithmetic, run on the host over all sixteen layers, reproduces an independent fp32
+oracle's token (16309). So "device equals reference" finally means something it did not
+mean this morning.
+
+What is still not fixed, and is one problem rather than two: P4 consumes the host's
+`h_ref` and P5 the host's `sw_ref`, so C's three phases are each verified against a
+host-fed input rather than composed. The residual fix above uses the host's h for the
+same reason. Making P5 read the *device's* h needs the drain-barrier-refill route
+inside the dispatch — the mechanism `p1p2_chain` proved and `group_c` already uses for
+its phase sequencing, applied to data instead of to timing.

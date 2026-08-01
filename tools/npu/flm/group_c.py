@@ -847,7 +847,18 @@ def main():
     for ch in range(NCHUNK):
         b0 = ch * BCN1_
         bc5[b0:b0 + K_DIM] = rnd(swv[ch * K_DIM:(ch + 1) * K_DIM])
-        bc5[b0 + K_DIM:b0 + 2 * K_DIM] = x      # the residual P5 adds
+        # THE FFN RESIDUAL IS h, NOT x. A Llama layer is
+        #     h = x + attn(norm1(x));  y = h + mlp(norm2(h))
+        # Adding x here made every layer discard its own attention output, and
+        # the reference below made the same mistake, so both agreed and both
+        # computed something that is not a Llama layer (cosine 0.012 against an
+        # independent fp32 forward).
+        #
+        # h is the host's P3 reference, which is what P4 already consumes — so
+        # this fixes the arithmetic, not the composition. Making P5 read the
+        # DEVICE's h needs the drain-barrier-refill route, which is the separate
+        # seam problem.
+        bc5[b0 + K_DIM:b0 + 2 * K_DIM] = rnd(h_ref.astype(np.float32))
     bc5_t = iron.tensor(bc5.astype(bfloat16), dtype=bfloat16, device="npu")
     w5, x5_ref = [], np.zeros(K_DIM, np.float64)
     for pr in range(npairs):
@@ -1007,7 +1018,8 @@ def main():
                     acc += q4nx.gemv_reference_bf16(
                         rnd(swv[ch * K_DIM:(ch + 1) * K_DIM]),
                         dd5[sl, lo:hi], dm5[sl, lo:hi], dc5[sl, lo:hi])
-                x5_ref[r0:r0 + NROWS] = rnd(acc + x[r0:r0 + NROWS])
+                x5_ref[r0:r0 + NROWS] = rnd(acc + rnd(
+                    h_ref.astype(np.float32))[r0:r0 + NROWS])
     got5 = np.zeros(K_DIM, np.float64)
     for pr in range(npairs):
         # kdown writes NROWS rows into an OBJ-wide object; the rest is stale.
