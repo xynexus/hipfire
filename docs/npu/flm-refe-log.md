@@ -12471,3 +12471,39 @@ layer loop will answer, and it is the kind of thing that only shows up at
 
 So the A->B seam costs what the projection assumed: one handoff, ~3 us, and no
 structural surprise.
+
+### Group C's input budget forces where the residual lives
+
+Before wiring C, counting what it needs per layer against what a core has:
+
+    attention output (from B)          |
+    o_proj / gate / up / down weights  |  four things
+    post-attention norm weight         |
+    the residual x                     |
+
+against **2 input DMA channels**. And a fifo has one producer, so B and the host
+cannot both fill the same one — the trick the paired design uses, where one
+broadcast fifo carries the activation then q' then h, does not extend across
+producers.
+
+The resolution falls out of what each phase actually reads:
+
+  * **The residual never has to arrive.** P3 computes `h = x + o_proj(attn)` and
+    P5 computes `y = h + down(sw)`; both operands are C's own previous output,
+    which already lives in `g_resid` on-core — `RESID_FROM_STASH` exists for
+    exactly this. C keeps its residual rather than being sent it.
+  * **The norm weight rides the weight stream.** It is per-layer data on the same
+    schedule as the projections, and the weight fifo is already streaming four of
+    those.
+
+That leaves C with two inputs: **attention output on one channel, weights on the
+other.** Which fits.
+
+The same count applies to A, and is tighter: A needs x (now from C, core to core),
+plus its qkv weights, plus the RMSNorm weight and RoPE tables. Three sources for
+two channels, so the norm and RoPE tables have to ride A's weight stream too.
+
+Worth noting this is not a workaround — it is why FLM's ABI has
+`_send_rms_weights` and `_send_rope_weights` as separate movements rather than
+part of an activation block. The constraint that produced those calls is the one
+being hit here.
