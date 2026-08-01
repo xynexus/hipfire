@@ -11490,3 +11490,32 @@ What it costs: the host packs weights per pair today, so a 4- or 8-way split
 changes the packing layout and every drain descriptor that assumes pairs. That is
 real work, but it is bookkeeping against a known-good API rather than a search for
 a mechanism.
+
+### MEASURED: 4-way memtile splits work; 8-way exceeds a memtile's DMA channels
+
+The wider-split plan rested on an API signature. `split_width_probe.py` tests it
+with data — one fifo split N ways at a memtile, one worker per slice, each adding
+a mark only it knows, so a slice delivered to the wrong worker cannot pass:
+
+    way=2   PASS      (what the layer does today)
+    way=4   PASS
+    way=8   error: no MemTile has sufficient DMA capacity
+                   for 1 input/8 output channels near centroid column 0
+
+So the usable width is **4** — 8 asks for more output channels than a memtile
+has. That is enough:
+
+     cores  way   total links     8 memtiles?
+       16    2        18          over, but placeable today
+       32    2        36          FAILS
+       32    4        18          same as the working 16-core design
+
+**32 cores at 4-way sits exactly where the working design sits now.** The path is
+measured rather than inferred.
+
+One trap re-encountered and worth the repetition: `--way 4` first failed with
+"argument 'a' has 256 elements but the kernel was compiled for 128". `iron.jit`
+keys its cache on the design function's SOURCE TEXT, and `way` reached the design
+through a closure — invisible. The probe now builds through `exec` with the width
+interpolated into the source. **This is the fourth time this session that a
+value reaching a design via the namespace silently reused a stale build.**
