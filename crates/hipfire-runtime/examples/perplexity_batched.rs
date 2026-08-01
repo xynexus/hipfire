@@ -116,6 +116,11 @@ fn main() {
     let mut total_kld: f64 = 0.0;
     let mut kld_scored: usize = 0;
     let mut chunk_klds: Vec<f64> = Vec::new();
+    // Real-model PREFILL wall time (excludes the lm-head fan-out, which is a
+    // harness artifact, not part of serving): the honest tok/s comparison
+    // between activation precisions.
+    let mut prefill_secs = 0.0f64;
+    let mut prefill_toks = 0usize;
     let t0 = Instant::now();
 
     let mut done_chunks = 0usize;
@@ -133,12 +138,15 @@ fn main() {
         // matching the daemon kld_eval. new/drop each chunk (the daemon does too).
         let mut kv = make_kv(&mut gpu, &kv_mode, &config, n + 16);
         let mut dn = DeltaNetState::new(&mut gpu, &config).unwrap();
+        let tp = Instant::now();
         qwen35::forward_prefill_batch_with_pbs_opts(
             &mut gpu, &weights, &config, &window, 0, &mut kv, &mut dn, &scratch,
             None, Some(&hidden), None, None, None, None, None, false, false,
         )
         .expect("forward_prefill_batch");
         gpu.device_synchronize().unwrap();
+        prefill_secs += tp.elapsed().as_secs_f64();
+        prefill_toks += n;
 
         let mut chunk_kld_sum = 0.0f64;
         let mut chunk_kld_n = 0usize;
@@ -202,6 +210,10 @@ fn main() {
     println!(
         "Chunks:   {done_chunks}  Scored:   {scored}  ({:.1}s total)",
         t0.elapsed().as_secs_f64()
+    );
+    println!(
+        "PREFILL:  {prefill_toks} tok in {prefill_secs:.3}s = {:.1} tok/s  <-- real-model prefill throughput",
+        prefill_toks as f64 / prefill_secs.max(1e-9)
     );
     println!("NLL/tok:  {:.10}", avg_nll);
     println!("PPL:      {:.4}", avg_nll.exp());

@@ -1205,3 +1205,37 @@ registers this experiment ran out of.
 tiled is near-achievable" conclusion in §12 was wrong; it was leaving ~15% on the table to a
 scheduling stall. Remaining D1 headroom (10%→~40% of peak) still needs the hard wave64 deep-ILP
 work; the accessible 2× remains int4-act (§12b: arithmetic decode fits the free budget).
+
+### 9h. REAL-MODEL tok/s — the GEMM win does NOT translate (2026-08-01, corrects §9e/§9f)
+
+Every prior perf number in this plan is a **kernel microbenchmark** (isolated GEMM ms). Added
+prefill wall-time to `perplexity_batched` and measured **real-model prefill throughput**
+(qwen3.5-0.8b--oq4++, 4 chunks × ctx 2048 = 8192 tok, timer around `forward_prefill_batch`
+only, excludes the harness lm-head fan-out):
+
+| config | tok/s | vs incumbent | PPL |
+|---|---|---|---|
+| **mix (qkv-W4A8-MMQ + rest-W4A4) = incumbent** | **1135.9** | — | 17.13 |
+| full W4A4 (plain) | 1139.4 | +0.3% (noise) | 17.37 |
+| **full W4A4 + clip (ship config)** | **1095.9** | **−3.5%** | 16.90 |
+| full W4A16 | 996.7 | −12.2% | 16.42 |
+
+**Corrections this forces:**
+1. **The A3 GEMM win (1.5× fair / 1.8× GEMM-only vs MMQ) does NOT show up in model
+   throughput.** Promoting qkv W4A8→W4A4 = **+0.3%, i.e. nothing**. §9e's "and faster" and
+   §9f's "≈neutral throughput" are both **wrong** — measured, the ship config is **3.5%
+   SLOWER** than the incumbent (the clip's ~2× quantize cost exceeds the qkv GEMM gain).
+2. **Why:** dropping *all* projections to W4A16 costs only **12%** — so the oq4 GEMMs are a
+   modest fraction of this model's prefill. qwen3.5-0.8b is a **hybrid DeltaNet** model whose
+   GDN recurrence is sequential per token; **prefill is not GEMM-bound here**, so activation
+   precision is a few-percent lever, not a 1.5× one. Amdahl, measured.
+3. **Scope of the negative:** this is ONE model — small (0.8b) and hybrid. On a **dense,
+   wider** model where prefill genuinely is GEMM-dominated, the kernel win should translate far
+   better. That is untested and is the honest next measurement (no dense qwen3.5-oq4++ on disk).
+
+**Revised LLM verdict: W4A4 + clip is a QUALITY win (KLD 0.0625 vs 0.0667, PPL 16.90 vs
+17.13) at a ~3.5% throughput COST on this model** — a quality/speed trade, not a free win.
+Whether to ship it is now a judgement call, not a slam dunk: it's justified if the KLD/PPL
+gain is worth ~3.5% prefill, or if a cheaper clip (closed-form, or de-dup'ing the redundant
+qkv quantizes) erases the cost. **The A3 kernel work remains valid at the kernel level and is
+bit-exact; its model-level payoff awaits a GEMM-bound (dense/large) target.**
