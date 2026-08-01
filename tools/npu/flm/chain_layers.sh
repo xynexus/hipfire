@@ -24,6 +24,14 @@ set -euo pipefail
 N=${1:-2}
 POS=${2:-30}
 SEQ=${3:-31}
+# X0: an initial activation for layer 0 instead of the design's random vector.
+# With a real token embedding here AND --pos 0, the run is self-consistent: at
+# position 0 attention sees exactly one KV entry, the one this layer's own P1 just
+# wrote, so nothing synthetic enters the computation.
+X0=${X0:-}
+# XOUT: where to keep the final layer's x_out, which otherwise dies with the
+# temp dir.
+XOUT=${XOUT:-}
 D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 cd "$(dirname "$0")"
@@ -32,7 +40,9 @@ for ((L = 0; L < N; L++)); do
     echo "=== layer $L ==="
     # Layer 0 starts from the design's own random x; later layers read the
     # previous x_out. Unset rather than empty -- groups_ab tests presence.
-    if [ "$L" -gt 0 ]; then export AB_X_FROM="$D/x$L.npy"; else unset AB_X_FROM; fi
+    if [ "$L" -gt 0 ]; then export AB_X_FROM="$D/x$L.npy"
+    elif [ -n "$X0" ]; then export AB_X_FROM="$X0"
+    else unset AB_X_FROM; fi
     # `|| true` on every grep: under `set -e` a grep that matches nothing kills
     # the whole run, which is how the first version stopped silently after
     # layer 0 while looking like the chain had simply ended.
@@ -43,3 +53,5 @@ for ((L = 0; L < N; L++)); do
         python3 group_c.py --seq "$SEQ" --layer "$L" 2>&1 |
         { grep -E "P3 h|P4 sw|P5 x_out" || true; } | sed 's/^/  /' | tr -s ' '
 done
+
+if [ -n "$XOUT" ]; then cp "$D/x$N.npy" "$XOUT" && echo "final x_out -> $XOUT"; fi

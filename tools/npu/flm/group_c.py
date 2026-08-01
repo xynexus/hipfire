@@ -1079,117 +1079,129 @@ def main():
     print(f"  P5 x_out  : max err {e5:.4e}  mean|ref| {np.abs(x5_ref).mean():.5f}"
           f"  max|ref| {np.abs(x5_ref).max():.5f}")
 
-    print(f"P1 -> P2 in one dispatch: seq {o.seq} (P1 appends at pos {pos}), "
-          f"{nobj} KV objects, npad {npad}")
-    worst, scale = 0.0, 0.0
-    pmax = spread = omax = 0.0
-    nres = rmag = 0.0
-    vmax = vmean = 0.0
-    for a in range(NATT):
-        Kfull = np.zeros((o.seq, HEAD), np.float64)
-        Vfull = np.zeros((o.seq, HEAD), np.float64)
-        if pos:
-            Kfull[:pos], Vfull[:pos] = Kc[a], Vc[a]
-        Kfull[pos] = ref[NQ + a]              # k' P1 just wrote
-        Vfull[pos] = ref[NK + a]              # v' P1 just wrote
-        qr = np.stack([ref[GQA * a + sl] for sl in range(GQA)])
-        # q' already carries the 1/sqrt(d)*log2(e) scale from cs_q
-        sc = (qr @ Kfull.T) / math.log2(math.e)
-        e = np.exp(sc - sc.max(1, keepdims=True))
-        want = (e / e.sum(1, keepdims=True)) @ Vfull
-        got = (attn_out.numpy().astype(np.float64)
-               .reshape(apairs, 2, GQA, HEAD)[a // 2, a % 2])
-        worst = max(worst, np.abs(got - want).max())
-        scale = max(scale, np.abs(want).mean())
-        # max|ref|, because `worst` is a MAX error -- dividing a max by a
-        # mean is not a relative error, and that mismatch may be the whole
-        # reason the 'floor' looked config-dependent.
-        omax = max(omax, np.abs(want).max())
-        # How SHARP is this head's softmax? The exp2 NLF is a piecewise LUT, so
-        # its relative error is worst where the distribution concentrates: a
-        # near-one-hot softmax puts the whole output on a few v rows and the
-        # LUT's error on those weights lands undiluted. Track it alongside the
-        # error so a growing error can be attributed rather than guessed at.
-        pmax = max(pmax, (e / e.sum(1, keepdims=True)).max())
-        spread = max(spread, (sc.max(1) - sc.min(1)).max())
-        # P2 is an ONLINE softmax: it walks the sequence keeping a running max
-        # and, whenever a bigger score appears, rescales everything accumulated
-        # so far by exp2(m_old - m_new). Each rescale is a lossy bf16 multiply
-        # over the whole accumulator, so the error depends on the rescale
-        # HISTORY -- how often the max moves and how far -- not on how sharp the
-        # final distribution is. Sharpness is flat across layers; this need not
-        # be, which makes it the candidate that survives.
-        for row in sc:
-            m, n, tot = -np.inf, 0, 0.0
-            for v in row:
-                if v > m:
-                    if m > -np.inf:
-                        n += 1
-                        tot += v - m
-                    m = v
-            nres, rmag = max(nres, n), max(rmag, tot)
-        # The last input-side property that can vary with depth: V's dynamic
-        # range. The output is a weighted SUM of v rows, so a few large-magnitude
-        # rows accumulated alongside many small ones lose the small ones' low
-        # bits -- classic bf16 cancellation, and it scales with max|V| rather
-        # than with mean|V| (which the tolerance is built from).
-        vmax = max(vmax, np.abs(Vfull).max())
-        vmean = max(vmean, np.abs(Vfull).mean())
-        if a == 0:
-            print(f"  DIAG head0 got[0,:4] {got[0,:4].round(4)}")
-            print(f"  DIAG head0 want[0,:4] {want[0,:4].round(4)}")
-            # what would attention over ONLY the appended token give?
-            w1 = Vfull[pos]
-            print(f"  DIAG if it saw only pos {pos}: {w1[:4].round(4)}  "
-                  f"err {np.abs(got[0] - w1).max():.3e}")
-            # ... and over the prior cache only?
-            sc0 = (qr @ Kfull[:pos].T) / math.log2(math.e)
-            e0 = np.exp(sc0 - sc0.max(1, keepdims=True))
-            w0 = (e0 / e0.sum(1, keepdims=True)) @ Vfull[:pos]
-            print(f"  DIAG if it missed pos {pos}: err "
-                  f"{np.abs(got[0] - w0[0]).max():.3e}")
-    print(f"  softmax: max weight {pmax:.4f}   max logit spread {spread:.2f}   rescales {nres:.0f}  total rescale {rmag:.2f}")
-    print(f"  attention floor: {worst / max(vmax, 1e-9) / 2**-8:.2f} ULP of max|V|   |   {worst / max(omax, 1e-9) / 2**-8:.2f} ULP of max|ref| "
-          f"(max|ref| {omax:.4f})")
-    print(f"  V range: max|V| {vmax:.4f}  mean|V| {vmean:.4f}  ratio {vmax / max(vmean, 1e-9):.1f}")
-    # The floor is ONE bf16 ULP at the scale of the largest v the accumulator
-    # ever holds -- not the exp2 NLF, and not proportional to mean|ref|.
+    # Everything from here to the verdict is INHERITED from p1p2_chain and
+    # describes phases group C does not run: the P1->P2 dispatch line, the
+    # softmax diagnostics, the attention floor and its envelope. Group C has no
+    # attention, so it all reports against zeros.
     #
-    # Measured at layers 0/7/15: err/max|V| = 2.88e-3, 4.04e-3, 3.89e-3 against
-    # bf16 eps = 2^-8 = 3.906e-3. Every one is within ~1 ULP. The old
-    # `8e-2 * mean|ref|` tolerance tracked the wrong quantity and so failed at
-    # layers 7 and 15 purely because max|V| doubles there (1.20 -> 2.39) while
-    # mean|ref| moves 22%.
-    #
-    # Three other explanations were measured and refuted before this one: the
-    # exp2 NLF's sharpness (max softmax weight is FLAT at 0.13-0.17 and flattest
-    # where the error is worst), inheritance from P1 (k' and v' are bit-exact at
-    # layers 7 and 15) and the online-softmax rescale history (the rescale count
-    # DECREASES, 7 -> 6 -> 5, as the error grows).
-    # 2 ULP is an EMPIRICAL envelope, not a derived bound. Measured err/ULP:
-    #
-    #   seq  9 (npad 23): 1.61      layer  0: 0.74
-    #   seq 17 (npad 15): 0.95      layer  7: 1.03
-    #   seq 31 (npad  1): 0.74      layer 15: 1.00
-    #   seq 32 (npad  0): 1.19
-    #
-    # The bf16-ULP SCALE is solid -- dividing by max|V| is what collapses the
-    # across-layer spread from 2.7x to ~1x. What is NOT explained is the
-    # remaining 0.74-1.61 variation across sequence length: neither npad nor
-    # softmax concentration orders it (seq 32 has the least padding AND the
-    # flattest softmax, yet lands at 1.19). So this bound is fitted to observed
-    # worst case, and a regression that pushed the true floor to 1.9 ULP would
-    # pass. The printed ratio below is the number to watch, not the verdict.
-    tol = 2.0 * 2**-8 * vmax
-    print(f"  attention out: max err {worst:.4e}   mean|ref| {scale:.5f}   "
-          f"tol {tol:.4e}")
-    # ADVISORY, not a gate. The floor model is known wrong: layer 15 / seq 9
-    # sits at 2.32 ULP, outside this envelope, and no normalizer tested explains
-    # the spread (see the log). Treat a breach as "the model does not cover this
-    # config", not automatically as a device fault -- and do not widen the
-    # envelope to silence it, which is what the last two changes here did.
-    print(f"  -> {'within' if worst <= tol else 'OUTSIDE'} the empirical envelope"
-          f"  (advisory; floor model unresolved)")
+    # It is off by default now because it is not merely noisy: at --seq 1 the
+    # softmax reference reduces over a zero-size array and raises, which killed a
+    # 16-layer run after layer 0 with every one of group C's own checks passing.
+    # I left this block in place two ticks ago on the grounds that it was
+    # misleading but harmless once it no longer drove the exit code. It was not
+    # harmless.
+    if os.environ.get("C_INHERITED_CHECKS"):
+        print(f"P1 -> P2 in one dispatch: seq {o.seq} (P1 appends at pos {pos}), "
+              f"{nobj} KV objects, npad {npad}")
+        worst, scale = 0.0, 0.0
+        pmax = spread = omax = 0.0
+        nres = rmag = 0.0
+        vmax = vmean = 0.0
+        for a in range(NATT):
+            Kfull = np.zeros((o.seq, HEAD), np.float64)
+            Vfull = np.zeros((o.seq, HEAD), np.float64)
+            if pos:
+                Kfull[:pos], Vfull[:pos] = Kc[a], Vc[a]
+            Kfull[pos] = ref[NQ + a]              # k' P1 just wrote
+            Vfull[pos] = ref[NK + a]              # v' P1 just wrote
+            qr = np.stack([ref[GQA * a + sl] for sl in range(GQA)])
+            # q' already carries the 1/sqrt(d)*log2(e) scale from cs_q
+            sc = (qr @ Kfull.T) / math.log2(math.e)
+            e = np.exp(sc - sc.max(1, keepdims=True))
+            want = (e / e.sum(1, keepdims=True)) @ Vfull
+            got = (attn_out.numpy().astype(np.float64)
+                   .reshape(apairs, 2, GQA, HEAD)[a // 2, a % 2])
+            worst = max(worst, np.abs(got - want).max())
+            scale = max(scale, np.abs(want).mean())
+            # max|ref|, because `worst` is a MAX error -- dividing a max by a
+            # mean is not a relative error, and that mismatch may be the whole
+            # reason the 'floor' looked config-dependent.
+            omax = max(omax, np.abs(want).max())
+            # How SHARP is this head's softmax? The exp2 NLF is a piecewise LUT, so
+            # its relative error is worst where the distribution concentrates: a
+            # near-one-hot softmax puts the whole output on a few v rows and the
+            # LUT's error on those weights lands undiluted. Track it alongside the
+            # error so a growing error can be attributed rather than guessed at.
+            pmax = max(pmax, (e / e.sum(1, keepdims=True)).max())
+            spread = max(spread, (sc.max(1) - sc.min(1)).max())
+            # P2 is an ONLINE softmax: it walks the sequence keeping a running max
+            # and, whenever a bigger score appears, rescales everything accumulated
+            # so far by exp2(m_old - m_new). Each rescale is a lossy bf16 multiply
+            # over the whole accumulator, so the error depends on the rescale
+            # HISTORY -- how often the max moves and how far -- not on how sharp the
+            # final distribution is. Sharpness is flat across layers; this need not
+            # be, which makes it the candidate that survives.
+            for row in sc:
+                m, n, tot = -np.inf, 0, 0.0
+                for v in row:
+                    if v > m:
+                        if m > -np.inf:
+                            n += 1
+                            tot += v - m
+                        m = v
+                nres, rmag = max(nres, n), max(rmag, tot)
+            # The last input-side property that can vary with depth: V's dynamic
+            # range. The output is a weighted SUM of v rows, so a few large-magnitude
+            # rows accumulated alongside many small ones lose the small ones' low
+            # bits -- classic bf16 cancellation, and it scales with max|V| rather
+            # than with mean|V| (which the tolerance is built from).
+            vmax = max(vmax, np.abs(Vfull).max())
+            vmean = max(vmean, np.abs(Vfull).mean())
+            if a == 0:
+                print(f"  DIAG head0 got[0,:4] {got[0,:4].round(4)}")
+                print(f"  DIAG head0 want[0,:4] {want[0,:4].round(4)}")
+                # what would attention over ONLY the appended token give?
+                w1 = Vfull[pos]
+                print(f"  DIAG if it saw only pos {pos}: {w1[:4].round(4)}  "
+                      f"err {np.abs(got[0] - w1).max():.3e}")
+                # ... and over the prior cache only?
+                sc0 = (qr @ Kfull[:pos].T) / math.log2(math.e)
+                e0 = np.exp(sc0 - sc0.max(1, keepdims=True))
+                w0 = (e0 / e0.sum(1, keepdims=True)) @ Vfull[:pos]
+                print(f"  DIAG if it missed pos {pos}: err "
+                      f"{np.abs(got[0] - w0[0]).max():.3e}")
+        print(f"  softmax: max weight {pmax:.4f}   max logit spread {spread:.2f}   rescales {nres:.0f}  total rescale {rmag:.2f}")
+        print(f"  attention floor: {worst / max(vmax, 1e-9) / 2**-8:.2f} ULP of max|V|   |   {worst / max(omax, 1e-9) / 2**-8:.2f} ULP of max|ref| "
+              f"(max|ref| {omax:.4f})")
+        print(f"  V range: max|V| {vmax:.4f}  mean|V| {vmean:.4f}  ratio {vmax / max(vmean, 1e-9):.1f}")
+        # The floor is ONE bf16 ULP at the scale of the largest v the accumulator
+        # ever holds -- not the exp2 NLF, and not proportional to mean|ref|.
+        #
+        # Measured at layers 0/7/15: err/max|V| = 2.88e-3, 4.04e-3, 3.89e-3 against
+        # bf16 eps = 2^-8 = 3.906e-3. Every one is within ~1 ULP. The old
+        # `8e-2 * mean|ref|` tolerance tracked the wrong quantity and so failed at
+        # layers 7 and 15 purely because max|V| doubles there (1.20 -> 2.39) while
+        # mean|ref| moves 22%.
+        #
+        # Three other explanations were measured and refuted before this one: the
+        # exp2 NLF's sharpness (max softmax weight is FLAT at 0.13-0.17 and flattest
+        # where the error is worst), inheritance from P1 (k' and v' are bit-exact at
+        # layers 7 and 15) and the online-softmax rescale history (the rescale count
+        # DECREASES, 7 -> 6 -> 5, as the error grows).
+        # 2 ULP is an EMPIRICAL envelope, not a derived bound. Measured err/ULP:
+        #
+        #   seq  9 (npad 23): 1.61      layer  0: 0.74
+        #   seq 17 (npad 15): 0.95      layer  7: 1.03
+        #   seq 31 (npad  1): 0.74      layer 15: 1.00
+        #   seq 32 (npad  0): 1.19
+        #
+        # The bf16-ULP SCALE is solid -- dividing by max|V| is what collapses the
+        # across-layer spread from 2.7x to ~1x. What is NOT explained is the
+        # remaining 0.74-1.61 variation across sequence length: neither npad nor
+        # softmax concentration orders it (seq 32 has the least padding AND the
+        # flattest softmax, yet lands at 1.19). So this bound is fitted to observed
+        # worst case, and a regression that pushed the true floor to 1.9 ULP would
+        # pass. The printed ratio below is the number to watch, not the verdict.
+        tol = 2.0 * 2**-8 * vmax
+        print(f"  attention out: max err {worst:.4e}   mean|ref| {scale:.5f}   "
+              f"tol {tol:.4e}")
+        # ADVISORY, not a gate. The floor model is known wrong: layer 15 / seq 9
+        # sits at 2.32 ULP, outside this envelope, and no normalizer tested explains
+        # the spread (see the log). Treat a breach as "the model does not cover this
+        # config", not automatically as a device fault -- and do not widen the
+        # envelope to silence it, which is what the last two changes here did.
+        print(f"  -> {'within' if worst <= tol else 'OUTSIDE'} the empirical envelope"
+              f"  (advisory; floor model unresolved)")
     # The verdict is group C's OWN phases. The attention block above is
     # inherited from p1p2_chain, which this design is a derivative of, and there
     # is no attention on these sixteen cores -- it reports FAIL against zeros

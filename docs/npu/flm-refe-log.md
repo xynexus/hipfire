@@ -13862,3 +13862,38 @@ is synthetic — so running its x_out through this head would produce a token wi
 meaning. Closing that needs a real prompt token embedded at layer 0 and a KV cache the
 design's own P1 wrote, which at pos 0 with seq 1 it entirely does. That is the next
 step, and it is what makes comparison against FLM's token oracle possible.
+
+### The first token this stack has ever produced — and why it cannot yet be checked
+
+Sixteen device layers from a real embedding, at position 0 where the KV cache is
+entirely what the design's own P1 wrote:
+
+    x0 = embed_tokens[128000]      (BOS)
+    16 layers, --pos 0 --seq 1     exit 0
+    layer 0: attn 0.00 ULP, k' 0.0, v' 0.0, P3 0.0, P4 1.91%, P5 7.6e-06
+    head: RMSNorm -> lm_head -> argmax
+    argmax 124463  (+12.4069; next 57143 +12.3619, 75373 +12.2531)
+
+Attention at **0.00 ULP** is the point worth dwelling on. At position 0 the softmax is
+over one entry, so the output must equal that entry's V exactly — and it does, which
+means the whole path from the embedding through qkv, RoPE, the cache write and the
+cache read back is bit-exact. Nothing synthetic enters: every value in the cache was
+produced by this design.
+
+The comparison against FLM's oracle is **not reachable yet**, for a structural reason
+rather than a missing tool. FLM refuses an empty prompt ("Max length reached"), and
+any non-empty prompt tokenizes to BOS plus at least one content token — so its first
+generated token comes after two or more positions, while this run has exactly one. A
+like-for-like comparison needs multi-position prefill, which the harness does not do.
+
+So 124463 is a token produced by real weights, a real embedding and sixteen verified
+device layers. It is not a token known to be right. The distinction matters and the
+gap is now precisely one capability wide.
+
+Also fixed here: the inherited attention block in `group_c` is behind
+`C_INHERITED_CHECKS`, off by default. At `--seq 1` its softmax reference reduces over a
+zero-size array and raises, which killed the first BOS run after layer 0 with every one
+of group C's own checks passing — and `chain_layers.sh` pipes both streams into a grep,
+so the traceback matched nothing and vanished. Two ticks ago I looked at this block,
+wrote that it was misleading but harmless now that it no longer drove the exit code,
+and left it. It needed only an input nobody had tried.
