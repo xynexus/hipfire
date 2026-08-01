@@ -14218,3 +14218,34 @@ a fused dispatch. Those numbers never depended on the values being right.
 Still open: the fused single dispatch (the throughput claim), group C's internal seams
 (P4 and P5 still read host h and sw — the residual fix uses the host's h), and any
 position past 0, where RoPE stops being the identity and attention stops being trivial.
+
+### RoPE frequencies check out against the config
+
+Llama-3.2-1B uses `rope_type: llama3` scaling — factor 32, low/high freq factors 1 and
+4, original context 8192 — which changes every frequency, not just long-range ones. The
+repo does not compute it; it reads `rope_freqs.weight` from the container as a stored
+per-frequency divisor. That is the right shape of answer, but it had never been checked
+against the config.
+
+Computing the llama3 schedule independently from `config.json` and comparing:
+
+    max rel err 6.491e-04      identical to bf16: True
+
+against bf16's own 2^-9 ~ 2e-3. So the stored divisor is the llama3 schedule, and the
+frequencies the kernel uses are correct.
+
+That is one of the two RoPE questions. The other — whether the *rotation* is applied
+correctly at a nonzero position — needs care, because the obvious oracle is booby
+trapped:
+
+  * `original/consolidated.00.pth` is **Meta's** format, where RoPE rotates (2i, 2i+1)
+    pairs.
+  * The q4nx container is **HF-named** (`model.layers.N.self_attn.q_proj.weight`), so
+    its weights carry HF's permutation and RoPE is half-split.
+
+At position 0 this could not matter, since the rotation is the identity — which is
+exactly why the fp32 oracle worked without my having to think about it. At any other
+position, comparing the device's half-split rotation against a Meta-format reference
+would produce a mismatch that looks like a device fault and is a convention difference.
+Given that four faults today were all "the reference shared the mistake", the failure
+mode here is the mirror image and just as easy to walk into.
