@@ -12719,3 +12719,40 @@ Ways it could still work, none yet explored:
 
 The third is the most interesting because it attacks the gather itself rather than
 routing around it. None are measured.
+
+### The fork resolves: a host round trip inside a dispatch costs no dispatch
+
+I framed "send h through the host" as paying an extra dispatch. That is wrong, and
+the working design already disproves it. In `p1p2_chain`:
+
+    p1h[i].drain(hb[i], ...)     # P3's h out to host memory
+    tg.finish()
+    bch.fill(p4b, ...)           # P4's activation back in
+
+Both are fills and drains **inside one dispatch's instruction sequence**, separated
+by a TaskGroup barrier. Host memory is the staging buffer; the host CPU is not
+involved and no dispatch boundary is crossed. Four such barriers exist in that
+sequence today.
+
+So group C can stay at 16 cores. What changes is that B's output reaches C the same
+way — drained to host memory and refilled — rather than core to core. Then C's
+inputs are:
+
+    one host-filled fifo carrying, in sequence: attention output, then h
+    the weight stream
+
+**Two channels.** Which fits, and it is exactly the pattern the paired design uses
+where one broadcast fifo carries the activation, then q', then h — all host-filled,
+one producer, refilled per phase.
+
+The cost is bandwidth, not dispatches: the attention output is 2048 bf16 = 4 KB per
+layer each way, and h likewise. At 16 layers that is ~256 KB of extra shim traffic
+per token against a 45.6 GB/s measured fabric — roughly 5.6 us, against the 4.93 ms
+the four-group split would have cost.
+
+**So the architecture survives with C at 16 cores**, and the A -> B core-to-core
+stream becomes an optimisation rather than a requirement — worth keeping, since it
+is built and passing, but not load-bearing.
+
+What I got wrong: treating "goes through host memory" as equivalent to "costs a
+dispatch". Those are different things, and conflating them nearly cost the design.
