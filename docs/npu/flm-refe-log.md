@@ -13621,3 +13621,34 @@ problem, which is the expected outcome and not the reason to run them — the re
 that "this change is inert for other callers" was exactly the claim that proved false
 once already this session, when `ATTN_MASK_PAD` read npad from the wrong layout and
 only `p1p2_chain` revealed it.
+
+### The A+B -> C seam closes: a whole decoder layer computes end to end
+
+`AB_EMIT_ATTN` writes group B's device attention output; `C_ATTN_FROM` feeds it to
+group C in place of P3's host-computed activation. Every phase of the layer now runs
+on the previous phase's real device result:
+
+    P3 h     : 0.0000e+00   mean|ref| 0.04015
+    P4 sw    : 3.9062e-03   2.50% of peak
+    P5 x_out : 4.7684e-07   mean|ref| 0.04693
+
+P1 -> P2 -> P3 -> P4 -> P5, with q' travelling core to core inside A+B, attention out
+crossing to C, and h and sw composed inside C's single dispatch. This is the first
+time the whole layer has been computed by the role architecture rather than by five
+phases each fed a host reference.
+
+P3's h is now *exact* where it was 9.5367e-07 against the random host activation. That
+is the expected direction and worth noting as a check on the plumbing rather than a
+lucky result: the device's attention output is already bf16, so P3 consumes exactly
+what the reference consumes, and the rounding mismatch that produced the 1-ulp floor
+is gone. An activation that arrives right makes the error *smaller*; one that arrives
+wrong could not.
+
+The head ordering was the only real risk and it resolved by construction. At 8 cores
+`head_layout` gives core c the q heads 4c..4c+3, and B core c attends with KV group c,
+so group `a` slot `sl` is original head 4a+sl — exactly the order o_proj expects, with
+no permutation needed.
+
+What this is not: a fused dispatch. The seam crosses a file, so this measures
+correctness of the composition, not its cost. The two halves still run as separate
+dispatches, and the 65.4 tok/s projection still depends on fusing them.

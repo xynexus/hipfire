@@ -699,6 +699,13 @@ def main():
         attn3_override = np.ones(K_DIM, np.float32)
     else:
         attn3_override = None
+    _from = os.environ.get("C_ATTN_FROM")
+    if _from:
+        # P3's activation is normally a host-computed reference. This takes the
+        # DEVICE's attention output from groups_ab instead, closing the A+B -> C
+        # seam end to end.
+        attn3_override = np.load(_from).astype(np.float32)
+        assert attn3_override.shape == (K_DIM,), attn3_override.shape
     if __import__("os").environ.get("CHAIN_P3_WZERO"):
         # zero weights -> the GEMV term is 0 and h must be exactly the residual.
         # If it is not, P3 is not reading the tiles this harness packs.

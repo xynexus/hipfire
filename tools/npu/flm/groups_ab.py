@@ -627,6 +627,14 @@ def main():
     # a wrong q' cannot produce the right attention output.
     import math
     kv_groups = (NV - NQ) // 2
+    # The A+B -> C seam. At 8 cores each core owns q heads 4c..4c+3 and B core c
+    # attends with KV group c, so group `a` slot `sl` is ORIGINAL head 4a+sl --
+    # which is the order o_proj expects. Written to a file rather than plumbed
+    # through an import, because both mains build their own tensors and neither
+    # is factored for reuse; the filesystem is the cheapest seam that tests the
+    # real device output.
+    _emit = os.environ.get("AB_EMIT_ATTN")
+    attn_full = np.zeros(K_DIM, np.float64) if _emit else None
     aw, asc, worst_at = 0.0, 0.0, None
     for a in range(kv_groups):
         Kf = np.zeros((o.pos + 1, HEAD), np.float64)
@@ -646,6 +654,10 @@ def main():
             r = got[0] / np.where(np.abs(want[0]) > 1e-9, want[0], np.nan)
             print(f"    DIAG ratio   {np.nanmedian(r):.5f}  "
                   f"(1.0 = right, other = a scale fault)")
+        if attn_full is not None:
+            for _sl in range(GQA):
+                _h = GQA * a + _sl
+                attn_full[_h * HEAD:(_h + 1) * HEAD] = got[_sl]
         d = np.abs(got - want)
         if __import__("os").environ.get("AB_DIAG"):
             print(f"    DIAG group {a}: max err {d.max():.4e}  "
@@ -671,6 +683,10 @@ def main():
     # so the two harnesses agree on what "at the floor" means.
     ulp = 2.0**-8
     atol = 2.0 * ulp * max(asc, 1e-9)
+    if attn_full is not None:
+        np.save(_emit, attn_full.astype(np.float32))
+        print(f"  attention output -> {_emit}  "
+              f"({kv_groups * GQA} heads, max|.| {np.abs(attn_full).max():.4f})")
     print(f"  attn: {kv_groups} KV groups        max err {aw:.4e}   "
           f"max|V| {asc:.5f}   tol {atol:.4e}  "
           f"({aw / max(asc, 1e-9) / ulp:.2f} ULP)")
