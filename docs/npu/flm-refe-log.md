@@ -13750,3 +13750,31 @@ The general lesson is about derived harnesses. `group_c` began as a copy of
 cache, and the q' scatter — all of which still print, and one of which was the gate.
 The earlier bench-accounting bug had exactly the same origin: a metric copied from a
 design with a different tensor set, still reporting confidently in the right units.
+
+### The 16-layer chain stopped at layer 8 — on my own tolerance, not the device
+
+`set -e` did its job on the first full run: the chain ran layers 0-8 and stopped.
+
+    layer 8   attn 1.99 ULP   P3 4.8828e-04   P4 1.11%   P5 0.0000e+00
+
+P5 exact, P4 well inside its bound, attention marginal but passing. The failure was
+**P3 against the 1e-5 bound I had set one tick earlier**, and 4.8828e-04 is 2^-11 —
+exactly one bf16 ulp of a value in [0.125, 0.25). Rounding, not a fault. With
+`max|h_ref|` now printed at 0.23828, one ulp of the peak is 1.86e-03, and layer 8 sits
+comfortably inside it.
+
+The bound was wrong in a specific and familiar way. I wrote that P3 and P5 were "held
+to 1e-5, which they beat by two orders of magnitude" — true of layers 0-7, and true
+only because those layers' inputs happened to be bit-identical to the reference, so P3
+came out exact rather than merely close. I fitted a threshold to the cases already
+observed and called the headroom evidence. That is the same error the attention
+envelope made twice, and I had described it in this log while making it.
+
+P3 and P5 now use `2 * 2^-8 * peak` against their own reference peak, the same relative
+form the k'/v'/attention checks use. P4 keeps its 4%-of-peak bound, which was already
+relative.
+
+Worth separating two things the stop conflated: the harness behaved correctly — a real
+nonzero exit stopped a chain that would otherwise have run on producing numbers nobody
+was checking — and the thing it caught was a bad threshold rather than a bad result.
+Both are useful. Only one is a bug.

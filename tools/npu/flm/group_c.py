@@ -934,7 +934,8 @@ def main():
         sg, sr = np.sort(got_h), np.sort(h_ref)
         print(f"    DIAG sorted-multiset maxdiff {np.abs(sg-sr).max():.4e} -> "
               f"{'PERMUTATION (my h_idx)' if np.abs(sg-sr).max()<1e-2 else 'VALUES differ (device)'}")
-    print(f"  P3 h      : max err {e3:.4e}  mean|ref| {np.abs(h_ref).mean():.5f}")
+    print(f"  P3 h      : max err {e3:.4e}  mean|ref| {np.abs(h_ref).mean():.5f}"
+          f"  max|ref| {np.abs(h_ref[h_idx]).max():.5f}")
     if __import__("os").environ.get("CHAIN_P3_DIAG"):
         srt_g, srt_r = np.sort(got_h), np.sort(h_ref)
         print(f"    DIAG got[:6]  {got_h[:6].round(4)}")
@@ -1198,8 +1199,17 @@ def main():
     #
     # P4's floor is the SwiGLU path's, measured at 1.2-2.5% of peak across four
     # chained layers, so it is bounded rather than compared to zero.
-    bad = [n for n, e, lim in (("P3", e3, 1e-5), ("P4", e4, 0.04 * np.abs(sw_ref).max()),
-                               ("P5", e5, 1e-5)) if e > lim]
+    # Bounds are RELATIVE to each phase's own peak, not absolute. An absolute
+    # 1e-5 on P3 passed layers 0-7 and failed layer 8 at 4.8828e-04 -- which is
+    # 2^-11, exactly one bf16 ulp of a value in [0.125, 0.25), i.e. rounding, not
+    # a fault. The tight bound only held while the chain's inputs happened to be
+    # bit-identical to the reference; it was fitted to the layers already seen,
+    # which is the same mistake the attention envelope made twice.
+    h_peak = np.abs(h_ref[h_idx]).max()
+    bad = [n for n, e, lim in (("P3", e3, 2 * 2**-8 * h_peak),
+                               ("P4", e4, 0.04 * np.abs(sw_ref).max()),
+                               ("P5", e5, 2 * 2**-8 * np.abs(x5_ref).max()))
+           if e > lim]
     print(f"  -> group C {'PASS' if not bad else 'FAIL: ' + ', '.join(bad)}"
           f"   (P3 {e3:.4e}  P4 {e4:.4e}  P5 {e5:.4e})")
     return 0 if not bad else 1
