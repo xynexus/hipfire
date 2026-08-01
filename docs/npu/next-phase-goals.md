@@ -52,6 +52,18 @@ Sanity-check the projections before building on them: they assume the same 54.7
 GB/s and the same dispatch structure, and a format with a different tile shape may
 not hit the same ceiling.
 
+**That assumption is already PARTLY discharged, by the coarse tier.** It is a
+~4-bit format — 4 bits flat plus 4 bytes a row, planar — and it measured 54.7 GB/s
+against the 5.00-bit exact tier's 55.2 on the same driver in the same session. A
+4-bit weight format on this hardware does reach the same ceiling as the 5-bit one;
+the bandwidth does not care about the bit width, only the byte count. So the risk
+in the table above is narrower than "will 4 bits go fast" — it is specifically
+whether `oq4++`'s GROUP-SCALE layout (scales interleaved per group rather than one
+per row) streams as cleanly as a planar one. That is a real question, because the
+coarse tier's row-planar layout was chosen precisely so the host never permutes and
+the memtile split falls out naturally. It is also a much smaller question, and the
+single-GEMV test answers it directly.
+
 ## Context depth changes which lever matters (measured 2026-08-02)
 
 The `flm-benchmarks.md` sweep stops at 3135 tokens — **2.4% of a 131072 window** — so
