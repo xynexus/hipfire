@@ -14549,3 +14549,33 @@ The margin over FLM has narrowed from +6.9% to +4.6% purely by re-measuring rath
 by any change, which is worth remembering when the fused design finally produces a real
 number: 1.4 tok/s of the previous figure was drift in a slope carried across three code
 changes.
+
+### The "3.2% regression" is below the noise floor — and so is most of this log's precision
+
+Three runs of the SAME cached build, group C at NLAY=1:
+
+    755.0   736.1   737.8 us      spread 2.6%
+
+So a single measurement carries about +/- 19 us. A two-point slope subtracts two such
+measurements, giving roughly sqrt(19^2 + 23^2) = 30 us of noise — against an observed
+"change" of 658.4 - 637.9 = 20.5 us. The slope did not move; the measurement did.
+
+That retires the previous entry's suggestion that something in the correctness work might
+have cost device time. Nothing did, and the 3.2% was never evidence that it had.
+
+The wider consequence matters more than this one number. **Every per-layer slope in this
+log is a two-point estimate with a ~30 us error bar**, and the token projection multiplies
+it by sixteen:
+
+    C = 637.9 -> 65.4 tok/s
+    C = 658.4 -> 64.0 tok/s
+
+Both figures were reported to one decimal, one of them as an improvement over the other,
+and they are the same measurement. The honest projection is **64-65 tok/s, +5% +/- 3% over
+FLM's 61.18** — still ahead, but by a margin that a two-point slope cannot resolve to the
+precision this log has been quoting.
+
+What this asks for, before the fused number is taken seriously: slopes fitted over three
+or more layer counts with repeats, not differences of single runs. The dispatch-floor fit
+already in this log did exactly that — `92.9 + 17.547 * MB`, R^2 0.99997, seven points —
+and is the most trustworthy number here for precisely that reason.
