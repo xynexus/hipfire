@@ -52,17 +52,53 @@ Sanity-check the projections before building on them: they assume the same 54.7
 GB/s and the same dispatch structure, and a format with a different tile shape may
 not hit the same ceiling.
 
-**That assumption is already PARTLY discharged, by the coarse tier.** It is a
-~4-bit format — 4 bits flat plus 4 bytes a row, planar — and it measured 54.7 GB/s
-against the 5.00-bit exact tier's 55.2 on the same driver in the same session. A
-4-bit weight format on this hardware does reach the same ceiling as the 5-bit one;
-the bandwidth does not care about the bit width, only the byte count. So the risk
-in the table above is narrower than "will 4 bits go fast" — it is specifically
-whether `oq4++`'s GROUP-SCALE layout (scales interleaved per group rather than one
-per row) streams as cleanly as a planar one. That is a real question, because the
-coarse tier's row-planar layout was chosen precisely so the host never permutes and
-the memtile split falls out naturally. It is also a much smaller question, and the
-single-GEMV test answers it directly.
+**MEASURED 2026-08-02 — the assumption holds, and the format is tighter than assumed.**
+`kernels/npu/flm_gemv_oq4g256.cc` + `lmhead_twostage.py --vs-oq4`, three designs
+interleaved in one process at lm_head size:
+
+    coarse  2384.6 us  131.8 MB  55.3 GB/s   16448 B/tile
+    oq4     2403.8 us  133.4 MB  55.5 GB/s   16640 B/tile
+    oq4-1s  2406.1 us  133.4 MB  55.4 GB/s   SAME TILE, coarse arithmetic (control)
+
+oq4 streams at the ceiling: +0.4% on the coarse tier, +0.1% on the control. Device
+argmax 16309 matches an independent host reference, so this is a checked kernel and
+not just a timed one.
+
+`Oq4G256` is **4.0625 b/w**, not the ~4.25 the table above assumed — 130 B per
+256-group. So the oq4 row is 630 MB/token and **~78 tok/s, +27% vs FLM**, better
+than the +18% projected.
+
+**Getting there took four kernels, and the first one looked like a verdict:**
+
+    one reduce_add per GROUP (128 a tile)                    16.3 GB/s
+    group accum folded into a row accum by broadcast FMA     31.4
+    ... with the 4-iteration inner loop fully unrolled       35.5
+    scale folded into the WEIGHTS, ONE row accumulator       55.5
+
+3.4x slower for 1.2% more bytes is a convincing-looking number and it was entirely
+my arithmetic. The control tile — identical bytes and loads, coarse arithmetic — is
+what separated "this shape cannot stream" from "this code is slow" in one
+measurement. Keep that control if the layout is ever changed again.
+
+**The 130 B on-disk block is a STORAGE form, never a kernel form.** Its nibbles
+start at byte 130g+2, a stride that is not a multiple of 4 — vector-loading it is
+the silent misaligned-load failure this tree has already paid for. That is what
+`Oq4G256ArchPacked` and the loader's per-arch repack exist for; the NPU repack is
+planar, `[NROWS*NG bf16 scales][NROWS*K/2 nibbles]`, same byte count.
+
+**Two things this did NOT settle**, both real:
+
+  - **Scale precision.** The shipped kernel folds the scale into the weights, which
+    rounds `scale * code` to bf16 BEFORE the MAC and moves relative error
+    1.651e-03 -> 3.666e-03 against the accumulator-scaling variant. Irrelevant for
+    a coarse shortlist the host rescores; a live question for SIXTEEN CHAINED
+    LAYERS, where it compounds and has not been measured. The accurate variant
+    costs 36%.
+  - **f16 vs bf16 scales.** On-disk is f16; AIE2P's native 2-byte float is bf16,
+    so the repack converts. bf16 gives ~0.4% scale accuracy against f16's ~0.05%.
+    f32 scales would fix it at 4.125 b/w instead of 4.0625 — 1.5% of bandwidth for
+    8x the scale precision. Packing f16 and reading bf16 passes every size and
+    alignment check and produces garbage (rel 1.0); only a value check finds it.
 
 ## Context depth changes which lever matters (measured 2026-08-02)
 
