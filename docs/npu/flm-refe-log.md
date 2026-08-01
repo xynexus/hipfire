@@ -11625,3 +11625,35 @@ Note the near-miss: **P1+P3+P4+P5 (no attention) fits at ~98%.** A core that doe
 everything except attention is right at the edge, which is another way of saying
 attention is what does not fit — consistent with attention being the phase FLM
 gives its own engine and its own xclbin.
+
+### A shortcut: no core needs all five phases
+
+The 115% figure for `1,2,3,4,5` assumed one core runs everything. **Partition B
+already means it does not.** Non-attention cores skip P2; attention cores skip P1.
+So the combinations that matter are:
+
+    phases                    probe    real ~     of 16 KB
+    1,3,4,5  (non-attention)  12016    16016        98%    fits
+    2,3,4,5  (attention)      11536    15536        95%    fits
+
+**Both fit.** Five phases can run in ONE dispatch at 16 cores with the partition
+that already exists — no quad restructure, no 32 cores, no memtile work.
+
+That makes the token valid: each layer iteration runs P1..P5 in order, so
+iteration L+1 consumes what iteration L's P5 produced. And the timing follows the
+already-measured marginals, since the compute is unchanged and only the floor
+count drops:
+
+    marginal per layer (measured)  744.1 us
+    16 layers, one dispatch        744.1 x 16 + 67.2 = 11973 us
+    + lm_head                                          3700 us
+    token                          15.67 ms  ->  ~63.8 tok/s
+
+**Caveat, and it is the whole risk:** 98% rests on the probe's ~4 KB correction,
+which is a rule of thumb from one comparison, not a measurement of this
+combination. If the real scaffolding for four bodies is 4.4 KB rather than 4.0,
+`1,3,4,5` overflows. The only way to know is to build it.
+
+Worth attempting before the restructure regardless: adding P5's body and fills to
+`p1p2_chain` is a fraction of the quad rewrite, and if it overflows the restructure
+is still there. The plan's step 4 has effectively become step 1.
