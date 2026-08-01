@@ -12445,3 +12445,29 @@ harnesses agreeing on what "at the floor" means.
 Five faults on this seam, every one producing a plausible wrong number rather than
 a failure: two cache buffers, unpadded slots, missing per-core fill offset,
 unwritten npad, and a mis-scaled tolerance. k' and v' passed throughout.
+
+### A+B fused costs less than the sum of its parts
+
+    group A alone      191.2 us  ->  124.0 compute
+    group B alone       92.3 us  ->   25.1 compute
+    A+B fused          215.5 us  ->  148.3 compute
+
+    sum of computes             149.1
+    fused                       148.3     -0.8, i.e. no overlap penalty
+
+    as two dispatches  283.5 us
+    as one             215.5 us     saves 68.0 — one dispatch floor, exactly
+
+Two things worth separating. The **floor saving is real and exactly one floor**
+(68.0 against 67.2), which is what fusing any two dispatches buys. The **compute
+does not overlap** — 148.3 fused against 149.1 summed is within noise, so B waits
+on A rather than running alongside it.
+
+That is expected here and not a defect: at `nobj=1` B has one KV tile to process
+and cannot start until A's q' arrives, so there is nothing to overlap. Whether B
+can be kept busy while A works on the next layer is a pipelining question the
+layer loop will answer, and it is the kind of thing that only shows up at
+`NLAY > 1`.
+
+So the A->B seam costs what the projection assumed: one handoff, ~3 us, and no
+structural surprise.
