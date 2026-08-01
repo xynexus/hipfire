@@ -11292,3 +11292,42 @@ addressed. They stopped mattering.
 The measurement that changed it was not a kernel measurement. It was counting
 `DRM_IOCTL_AMDXDNA_EXEC_CMD` in FLM's own process and finding 2.5 where mine had
 32.
+
+### CORRECTION: A x16 then B x16 cannot produce a correct token
+
+I described the unchained residual as remaining work. It is worse than that: the
+**structure** is wrong, not just unfinished.
+
+A decoder layer is strictly sequential:
+
+    h   = x + o_proj(attn(norm1(x)))          <- side A, phases P1..P3
+    y   = h + down(swiglu(gate/up(norm2(h))))  <- side A's P4, then side B's P5
+
+`y` is the layer's output and the next layer's `x`. **P5 is in side B.** So
+running side A for all sixteen layers and then side B for all sixteen means
+iteration L+1 of side A consumes an `x` that layer L's P5 has not yet produced.
+No amount of residual plumbing fixes that ordering; the two dispatches would have
+to interleave A(0), B(0), A(1), B(1)... which is 32 dispatches and exactly where
+this started.
+
+**What survives:** the timing. If all five phases ran in one dispatch looping
+sixteen layers, the total is about the same, because the dispatch floor is paid
+once either way:
+
+    marginal per layer:  side A 549.6 us + side B 194.5 us = 744.1 us
+    one dispatch, 5 phases x 16 layers:  835.2 + 15 x 744.1 + 3700 = 15.70 ms
+    -> 63.7 tok/s
+
+So ~63 tok/s is a real target. What it needs is five phase bodies reachable within
+one dispatch — which is the program-memory wall, short 2272 B.
+
+**And that is exactly what FLM's shape solves.** Role-specialised tiles
+(`mvm_tiles`, `proj_tiles`, `attn_qk_tiles`, `attn_kv_tiles`) mean a core holds
+one kernel, not five. Sixteen cores split by role — some doing qkv/attention,
+others the FFN — each hold two or three bodies and fit comfortably. The cost is
+that data must move between core groups, which is what memtile staging is for,
+and which the user has put in scope.
+
+So the path is not "close the residual loop". It is: **role-specialise the cores,
+then loop layers inside one dispatch.** The layer-loop mechanism measured over the
+last few entries is the half that already works.
