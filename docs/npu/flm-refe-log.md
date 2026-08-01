@@ -15533,3 +15533,42 @@ current contents on every `start()`, which is the property the multi-token loop 
 Nothing on the host side. The remaining work is in the design: a `ScratchpadParameter` on the
 drain offsets in `fused.py`, `aiecc_flags=["--get-scratchpad-parameters"]`, one rebuild — and
 then `g_kprev` survives, because there is no new xclbin to load.
+
+### The 63.7 is device time; FLM's 61.18 is wall clock. What survives.
+
+`fused_pyxrt.py` measured the same dispatch three ways, and the spread between them is
+larger than the margin over FLM:
+
+    --bench npu.min_us (the 63.7 figure)   12703.5 + 2994.2 = 15697.7 us -> 63.7 tok/s
+    pyxrt, run HELD, wall median           12874.0 + 2994.2 = 15868.2 us -> 63.0 tok/s
+    iron.jit callable, wall median         18583.8 + 2994.2 = 21578.0 us -> 46.3 tok/s
+
+FLM's 61.18 was "measured live on the user's server" at a 41-token context — an
+end-to-end wall-clock number from a running server. The 63.7 on record is
+`run_iters`' `npu.min_us`, which is device time. **Those are not the same quantity and
+should not have been compared without saying so.**
+
+What survives the correction: with the run object held, wall time IS device time
+(12874 wall against a 12843 npu average, cross-checked on two clocks), so **63.0 tok/s
+wall, +3.0% over FLM** — the result stands, with a smaller margin and a condition attached.
+
+What does not: the 63.7 as an end-to-end figure, and any reading of it that assumes the
+current harness achieves it. Driven by the `iron.jit` callable, which rebinds buffers every
+call, a token costs 18.6 ms and the design LOSES to FLM by 24%. The entire difference is
+host-side buffer rebinding, not the NPU.
+
+Still not counted on our side, and FLM's number includes all of it: the embedding lookup,
+the final RMSNorm, sampling, and the argmax over a 128256-wide vocabulary. lm_head's
+2994.2 us is itself a device-time bench figure. So 63.0 is the NPU portion measured
+honestly against the wall, not a complete end-to-end token.
+
+Consequence for multi-token decode: it must hold the run object across steps. That is not
+an optimisation to consider later — it is 5714 us per token, larger than lm_head, and the
+`ParameterScratchpad` flow requires holding the run anyway.
+
+The de-risking that prompted this found the opposite of what it looked for. There was no
+host-side restructuring to fear: `iron.jit(..., full_elf=True)` already dispatches through
+`pyxrt.hw_context` / `ext.kernel` / `set_arg`, and `fused.py` already passes `full_elf=True`.
+The caveat recorded earlier — "adopting runtime offsets means leaving iron.jit's wrapper for
+ParameterScratchpad plus manual buffer binding, a host-side restructuring of every harness
+here" — was wrong. The wrapper IS that path.
