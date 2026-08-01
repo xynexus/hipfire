@@ -11391,3 +11391,33 @@ guess — is exactly the remedy the earlier DMA-fanin diagnostic named, and is i
 scope.**
 
 Reverted; the 16-core configuration is untouched and passing.
+
+### The memtile API in iron, and what it is not
+
+Reconnaissance for the staging step. `ObjectFifo.__init__` exposes two relevant
+parameters:
+
+    delegate_tile: Tile | None = None
+    via_DMA: bool = False
+
+`delegate_tile` is documented as:
+
+> Shared-memory delegate tile. When set, the ObjectFifo's underlying buffer pool
+> is allocated on this tile's memory module instead of the default placement.
+> Lowers to `aie.objectfifo.allocate`. **Only valid when both producer and consumer
+> have shared-memory access to the delegate tile** (e.g. self-loop fifos where
+> prod == cons, or fifos between adjacent tiles spilling to a neighbouring MemTile).
+
+So it relocates **storage**, not the stream, and the shared-memory precondition
+means it does **not** apply to the shim->core weight fifos that are exhausting
+capacity at 32 cores — a shim has no shared-memory access to a memtile.
+
+`aie.iron.device` also exports `AnyMemTile` alongside `AnyShimTile` and
+`AnyComputeTile`, and `.cons()` / `.prod()` both take `tile=`. That is the more
+likely route to real staging — a fifo terminating on a memtile, and a second fifo
+from there to the cores — but it is untested.
+
+Recording the distinction because it is easy to reach for `delegate_tile` on the
+strength of its name and get buffer placement instead of stream staging. The
+32-core error is a MemTile *DMA channel* shortage, which is about how many streams
+cross a memtile, not where buffers live.
