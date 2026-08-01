@@ -13448,3 +13448,32 @@ The general shape is worth keeping: a compile-time constant whose wrong value st
 computes *something* is more dangerous than one that crashes. Defaults belong on
 parameters where every value is valid, not on ones where the correct value is a
 property of the caller's tiling.
+
+### The 32-core topology PLACES at full operand size
+
+The background build has not finished, but it has already answered the question. Its
+cache directory now holds per-core object directories named by *physical* coordinate:
+
+    core objects assigned: 32
+      col 0..7: 4 cores each
+    memtile / DMA errors: 0
+
+Thirty-two cores, four per column across all eight columns, at the real 10304 B
+operand. Per-core code generation only begins after placement, routing and DMA
+assignment have all passed — and "no MemTile has sufficient DMA capacity", the error
+that killed the earlier 32-core attempt, is raised in exactly that earlier stage. So
+the structure that the whole 65.4 tok/s projection depends on is placeable.
+
+What this does *not* establish, unchanged from the note written when the build was
+launched:
+
+  * It is the skeleton's optimistic topology — B->C and C->A core to core, C emitting
+    through one join, roughly 16 memtile inputs. The union of the designs that
+    actually exist carries 40. Fitting the budget was shown by counting; placing the
+    *union* has still not been demonstrated.
+  * Trivial kernels, so program memory is untested. Four phase bodies overflowed 16 KB
+    on a real build; that limit is why the work was split into role groups at all.
+
+So: the shape places. Whether the shape with real kernel bodies in it places, and
+whether the seams as built rather than as designed place, are still open. The
+remaining llc work is core codegen and will not change the placement result.
