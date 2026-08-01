@@ -40,6 +40,13 @@
 
 // This core's rows of the post-attention residual stream, handed to
 // flm_gemv_flush without going through memory. See the epilogue below.
+// NOT `RESID_FROM_STASH` — that name is already used by flm_gemv_flush for
+// P5's residual, and designs that set it for P5 would silently change P3 too.
+// resid_chain does exactly that, and it failed the moment the names collided.
+#ifndef P3_RESID_FROM_STASH
+#define P3_RESID_FROM_STASH 0
+#endif
+
 alignas(64) float g_resid[DIM_RESN];
 
 extern "C" __attribute__((noinline)) void
@@ -59,7 +66,20 @@ flm_gemv_q4_1_residual(const bfloat16 *restrict act_aux,
   const bfloat16 *restrict aux = act_aux + K;
   const int base = tile_row_base(wtile);
   for (int r = 0; r < NROWS; ++r) {
+#if P3_RESID_FROM_STASH
+    // The role architecture has no broadcast to carry the residual: P3's
+    // activation arrives from the attention cores core-to-core, and a core's two
+    // input channels are spent on that and the weight stream. The residual is
+    // this core's own output from the previous layer, which P5 left in g_resid
+    // under XOUT_TO_STASH — so read it there instead of from the aux half.
+    //
+    // Read-then-write on the same slot below is deliberate and safe: each
+    // iteration reads x[base+r] and writes h[base+r] afterwards, so no later
+    // iteration depends on the slot this one overwrote.
+    const float h = acc[r] + g_resid[(base + r) % DIM_RESN];
+#else
     const float h = acc[r] + float(aux[base + r]);
+#endif
     out[r] = bfloat16(h);
     // Stash this core's own rows of `h` for the FFN's residual add.
     //
