@@ -11954,3 +11954,51 @@ That closes the derisking. Every term in the estimate is now measured:
 Nothing left to learn without building it. The remaining risk is integration —
 five phases across three groups with four streams between them — not any
 individual quantity.
+
+## 2026-08-01 — the three-group topology places, routes and runs at 32 cores
+
+`layer_roles.py --skeleton` builds the full stream topology with trivial kernels:
+
+    host -> A (broadcast to 8)
+    A[j] -> B[j]          8 direct core-to-core fifos, no memtile
+    B -> C                two 4-way joins, each broadcast to all 16 C cores
+    C -> host             four 4-way joins
+
+It places, routes and executes. **The integration risk that could not be retired
+by any individual measurement is now retired.**
+
+Two things learned getting there, both of which cost a build each:
+
+**1. Join width is bounded exactly as split width is.** A 16-way join asks a
+memtile for 16 inputs and a memtile has ~6:
+
+    16-way join   error: no MemTile has sufficient DMA capacity for 16 input/1 output
+     8-way join   error: ... 8 input/1 output
+     4-way join   places
+
+`split_width_probe` had shown 8-way *splits* fail on outputs; joins fail
+symmetrically on inputs. So **4 is the usable width in both directions**, and a
+16-core group emitting needs four 4-way joins rather than one wide one. That is
+fine — the shim has 16 output channels and four drains cost four of them.
+
+**2. A join must SPAN the fifo's object.** My first version gave four producers
+`64/4/4 = 4` elements each against a 64-element fifo, so three quarters of every
+object was never written and the consumers waited forever — a runtime hang, not a
+build error. The offsets and the object type have to agree, and nothing checks it.
+
+### The head layout falls out of the role split
+
+`role_layout()` assigns A core j the four q heads, one k and one v that B core j
+attends with:
+
+    A0 -> B0: q [0,1,2,3],     k 32, v 40
+    A1 -> B1: q [4,5,6,7],     k 33, v 41
+    ...                                        6 head-tiles x 8 cores = 48
+
+`head_layout`'s own docstring says the assignment is free — "any bijection over
+the 48 head-tiles works, and the host packs the weight stream to match". Choosing
+it to follow the role split makes A->B a 1:1 core-to-core stream with no shuffle
+and no memtile, which is the cheapest possible handoff.
+
+Status: topology proven, phases not yet wired. `p1p2_chain` remains the working
+design.

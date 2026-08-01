@@ -53,12 +53,19 @@ a composition that cannot.
 `p1p2_chain` remains the working design.
 """
 
+import argparse
 import sys
 from pathlib import Path
+
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from p1_route import NQ, NK, NV, HPC, hpc_for, head_layout  # noqa: E402
+
+import aie.iron as iron  # noqa: E402
+from aie.iron import In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker  # noqa: E402
+from aie.iron.device import AnyShimTile  # noqa: E402
 
 # Core budget: 4 rows x 8 columns on npu2. The working design uses 16 and leaves
 # half the array idle; role groups only pay if that half is used.
@@ -97,7 +104,100 @@ def plan():
     ]
 
 
+def role_layout():
+    """Head-tiles per A core, chosen so A[j] feeds B[j] directly.
+
+    `head_layout` is free — any bijection over the 48 head-tiles works and the
+    host packs the weight stream to match. Choosing it to follow the ROLE SPLIT
+    means A core j computes exactly the q/k/v that B core j attends with, so the
+    A->B stream is 1:1 core to core with no shuffle and no memtile.
+    """
+    kv = (NV - NQ) // 2                       # 8 kv groups
+    return [[4 * j + i for i in range(NQ // A_CORES)] + [NQ + j, NQ + kv + j]
+            for j in range(A_CORES)]
+
+
+def build_skeleton():
+    """The stream topology with trivial kernels: does 32 cores in three groups
+    place and route at all? Everything else is filling it in."""
+    ty = np.ndarray[(64,), np.dtype[np.int32]]
+
+    def _design(a: In, o0: Out, o1: Out, o2: Out, o3: Out):
+        f_act = ObjectFifo(ty, depth=1, name="rl_act")          # shim -> A
+        f_ab = [ObjectFifo(ty, depth=1, name=f"rl_ab{j}")       # A[j] -> B[j]
+                for j in range(A_CORES)]
+        # B emits through TWO 4-way joins for the same reason C does: 8-way asks a
+        # memtile for 8 inputs and fails. Each C core consumes both halves, which
+        # it needs anyway — o_proj takes the whole attention vector.
+        f_bc = [ObjectFifo(ty, depth=1, name=f"rl_bc{i}")
+                for i in range(B_CORES // 4)]
+        # C emits through FOUR 4-way joins, not one 16-way: a join needs `w`
+        # inputs on a single memtile and a memtile has ~6, so 16-way is
+        # unplaceable. Four drains is fine — the shim has 16 output channels.
+        f_out = [ObjectFifo(ty, depth=1, name=f"rl_out{i}")
+                 for i in range(C_CORES // 4)]
+
+        part = 64 // 4                      # each of four producers fills a quarter
+        bc_in = [f.prod().join([j * part for j in range(4)],
+                               obj_types=[np.ndarray[(part,),
+                                                     np.dtype[np.int32]]] * 4)
+                 for f in f_bc]
+        out_sub = [f.prod().join([j * part for j in range(4)],
+                                  obj_types=[np.ndarray[(part,),
+                                                        np.dtype[np.int32]]] * 4)
+                   for f in f_out]
+        act_cons = [f_act.cons() for _ in range(A_CORES)]
+        bc_cons = [[f.cons() for _ in range(C_CORES)] for f in f_bc]
+
+        def core_a(ic, oc):
+            e = ic.acquire(1); r = oc.acquire(1)
+            for k in range(64):
+                r[k] = e[k] + 1
+            oc.release(1); ic.release(1)
+
+        def core_b(ic, oc):
+            e = ic.acquire(1); r = oc.acquire(1)
+            for k in range(64 // 4):
+                r[k] = e[k] + 2
+            oc.release(1); ic.release(1)
+
+        def core_c(ic0, ic1, oc):
+            e0 = ic0.acquire(1); e1 = ic1.acquire(1); r = oc.acquire(1)
+            for k in range(64 // 4):
+                r[k] = e0[k] + e1[k] + 3
+            oc.release(1); ic1.release(1); ic0.release(1)
+
+        workers = []
+        workers += [Worker(core_a, fn_args=[act_cons[j], f_ab[j].prod()],
+                           stack_size=2048) for j in range(A_CORES)]
+        workers += [Worker(core_b, fn_args=[f_ab[j].cons(),
+                                            bc_in[j // 4][j % 4].prod()],
+                           stack_size=2048) for j in range(B_CORES)]
+        workers += [Worker(core_c, fn_args=[bc_cons[0][j], bc_cons[1][j],
+                                            out_sub[j // 4][j % 4].prod()],
+                           stack_size=2048) for j in range(C_CORES)]
+
+        def seq(ab, *rest):
+            n = len(rest) // 2
+            obs, ah, ohs = rest[:n], rest[n], rest[n + 1:]
+            tg = TaskGroup()
+            ah.fill(ab, group=tg)
+            for ob, oh in zip(obs, ohs):
+                oh.drain(ob, wait=True, group=tg)
+            tg.finish()
+
+        rt = Runtime(seq, [ty] + [ty] * len(f_out) + [f_act.prod(tile=AnyShimTile)]
+                     + [f.cons(tile=AnyShimTile) for f in f_out])
+        return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
+
+    return iron.jit(_design)
+
+
 def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--skeleton", action="store_true",
+                    help="build the stream topology with trivial kernels")
+    o = ap.parse_args()
     print(f"role-specialised layer, {NCORES} cores")
     for name, (first, n), phases, share in plan():
         print(f"  group {name}: cores {first:2d}-{first + n - 1:2d} ({n:2d})  "
@@ -105,6 +205,15 @@ def main():
     print("\nstreams: host->A, A->B (q'k'v'), B->C (attn), C->A (residual), "
           "C->host (x_out)")
     print("memtile inputs: 16 (C's join) + splits, against ~48 — does not bind")
+    print("\nA->B head layout (chosen so A[j] feeds B[j] with no shuffle):")
+    for j, row in enumerate(role_layout()):
+        print(f"  A{j} -> B{j}: q {row[:-2]}, k {row[-2]}, v {row[-1]}")
+    if o.skeleton:
+        print("\nbuilding the stream topology...")
+        a = iron.zeros(64, dtype=np.int32, device="npu")
+        outs = [iron.zeros(64, dtype=np.int32, device="npu") for _ in range(4)]
+        build_skeleton()(a, *outs)
+        print("  -> 32 cores in three groups PLACE AND ROUTE")
     return 0
 
 
