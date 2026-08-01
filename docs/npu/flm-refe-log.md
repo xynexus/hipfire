@@ -13383,8 +13383,10 @@ checkpoint's own weights — code that shares nothing with this tree.
     attention math   EXTERNAL   4 real positions, 3.18% of peak
     online softmax   internal   device vs reference 0.5-2.2 ULP over 31 entries,
                                 and that reference is now externally validated
-    KV across tokens NOT RUN    the cache has never been carried by the device
-                                from one token to the next
+    KV across tokens EXTERNAL   the device carries its own cache across steps; odd
+                                positions verify against the oracle (pos 3 argmax
+                                39935, cos 0.938) and 8-token decode runs
+    vs FLM ITSELF    EXTERNAL   4/4 identical tokens on FLM's own context array
 
 **The end-to-end result**: sixteen device layers from the BOS embedding at position 0
 produce token **16309**, matching the oracle. Device x16 vs validated host: cosine
@@ -13482,8 +13484,56 @@ interaction by about the same, and the errors nearly cancelled. Bytes add; slope
 on a latency-bound design do not. Every projection in this log that summed `groups_ab`'s
 slope with anything carries that error.
 
-Verified at **pos 0 only** — position is still a build parameter, so `g_kprev` and the
-prior KV cache are unexercised.
+## Multi-token decode, and the FLM diff — 2026-08-02
+
+The "verified at pos 0 only" caveat this section used to end on is **gone**. Position is a
+runtime `ScratchpadParameter`, `g_kprev` is per-layer, the run object is held, and the
+device carries its own KV cache from one token to the next.
+
+    pos 0 EVEN  argmax 16309 = oracle   cos 0.999325
+    pos 1 ODD   argmax   220 vs 2768    cos 0.993758   near-tie 10.1084 vs 10.2370
+    pos 2 EVEN  argmax  2268 = oracle   cos 0.987621
+    pos 3 ODD   argmax 39935 = oracle   cos 0.938162   <- structurally impossible before
+    pos 4 EVEN  argmax 35308 = oracle   cos 0.956228
+
+`decode.py`, prompt "The quick brown fox", 8 tokens at positions 4-11:
+`" jumps over the lazy dog.\nA classic"`. Against the oracle step by step: 5 identical, 2
+disagreements at margins of **0.05 and 0.29 logits** taking the runner-up, against margins
+of 3.5-7.9 wherever it agrees. Quantization, not a fault.
+
+**The FLM bar is cleared — the first like-for-like device-vs-FLM token comparison here.**
+FLM applies a chat template with a DATED system block (36 tokens for "Hi") and ignores
+`raw`/`template`/`system`/`num_predict`, so every earlier attempt at this compared different
+prompts. Feeding the device FLM's own `/api/generate` `context` array verbatim:
+
+    device [4438, 649, 358, 1520]
+    FLM    [4438, 649, 358, 1520, 499, 3432, 30, 128009]   "How can I help you today?"
+
+Four for four, no divergence. Four is what a 40-column cache leaves after 36 prompt tokens.
+
+**Context length is a knob against throughput.** KVSTRIDE is 5152 elements either way, so
+identical bytes move and the 5% is pure compute — more columns scored per head:
+
+    TSEQ=32  12667.2 + 3010.6 + 10.5 = 15688.3 us -> 63.7 tok/s   +4.1% vs FLM
+    TSEQ=40  13298.4 + 3010.6 + 10.5 = 16319.5 us -> 61.3 tok/s   +0.2% vs FLM
+
+Both rows carry the **exact** lm_head tier so they are comparable to each other and to the
+63.1 above, not to the 64.8 two-pass row; the two-pass saving is orthogonal and stacks.
+
+Which one is the default is a product call, not a correctness one, and is still open: 40
+buys the FLM comparison and 40 columns of context but spends nearly the whole margin.
+
+**`aie::load_v` on a misaligned pointer does not fault — it reads the wrong bytes.** At
+TSEQ=40, K's row stride is 80 bytes, so 3 loads in 4 land misaligned. **pos 0 stayed
+BIT-EXACT** throughout (its softmax is over a single entry, so no score reaches the output)
+while every later position collapsed to cosine 0.05-0.28. Position 0 is structurally blind
+to the whole attention path — the same blindness that hid the attention scale and fault 5
+below. Any future change to the KV layout is not verified until it is verified at pos > 0.
+
+**`groups_ab` at its default 16 cores cannot generate its design at all**: group B's output
+is two 4-way joins, so 8 is the limit. Every recorded PASS came from an 8-core ELF that
+`iron.jit` served from cache without re-running the generator. Pre-existing, surfaced only
+because a header change busted the cache. Default is now 8 with an explicit message.
 
 ## The five faults found today, and what they have in common
 
