@@ -13418,10 +13418,26 @@ token, all 16 layers looped inside the instruction sequence.
 Interleaved as separate dispatches it would be 55.0 tok/s, a 10% LOSS — the fusion is
 what makes the result, not an optimisation on top of it.
 
-**31 us/layer above projection is unattributed**, across three unisolated candidates: A at
-NROWS=8 where `groups_ab` runs 16; the projection's additivity (two slopes each fitted on a
-design that owned the whole machine); C genuinely slower fused. If it is additivity, that
-invalidates the estimation METHOD every projection in this log used.
+**The surcharge over projection is 16.2 us/layer, and it is attributed.** Fresh repeats of
+the same build give 791.5 +- 1.7 us/layer (12674.0 / 12705.1 / 12611.1), against 775.3
+projected. The "31 us/layer" this section previously carried was computed from 12993.8 —
+the post-build OUTLIER of the three runs above, which the same paragraph names as an
+outlier. I propagated it into this section and into the task record.
+
+Stub builds attribute it: interaction 12.2 +- 4.3 us/layer at 2.9 sigma (candidate 2);
+C-slower-fused unsupported, since C's standalone 651.7 us/layer for 34.292 MB already IS
+52.62 GB/s; NROWS=8 unresolvable at this noise (~3.4 us predicted).
+
+**The design is DMA bound.** With all compute stubbed it still runs 731.5 us/layer — 92.4%
+of the real time, 38.25 MB/layer at 52.29 GB/s against lm_head's 54.7 ceiling. All
+thirty-two cores' arithmetic is worth 60.0 +- 3.5 us/layer.
+
+**Latency-bound slopes do not transfer.** `groups_ab`'s 123.6 us/layer is 31.9 GB/s — it
+was latency bound standing alone. Fused, A's bytes queue at the DDR ceiling and cost 75.2.
+The projection over-counted A+B by ~22 and under-counted C's unhidden compute plus the
+interaction by about the same, and the errors nearly cancelled. Bytes add; slopes measured
+on a latency-bound design do not. Every projection in this log that summed `groups_ab`'s
+slope with anything carries that error.
 
 Verified at **pos 0 only** — position is still a build parameter, so `g_kprev` and the
 prior KV cache are unexercised.
