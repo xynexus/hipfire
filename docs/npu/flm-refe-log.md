@@ -14798,3 +14798,23 @@ One environmental trap, since it cost a build here and will cost the next person
 `iron.jit` sets this up itself, which is why no design in this tree has ever hit it — it
 only appears when driving `aiecc` by hand, which is exactly what adopting runtime offsets
 would require.
+
+### Removed `runtime_offset_probe.py`
+
+It never worked — it passed the offset as a design argument, which is not how the value
+travels, and failed with a `TypeError` on the first call. Upstream's
+`test/python/npu-xrt/scratchpad_addr_offset/` already exercises the mechanism properly and
+has now been run here (3 passed), so a broken duplicate in this tree is worse than none.
+
+The recipe it was meant to capture, verified on this machine:
+
+    export PATH=~/.venv/lib/python3.14/site-packages/llvm-aie/bin:$PATH   # before ROCm
+    python3 <upstream>/aie_design.py > aie.mlir
+    aiecc -v --get-full-elf --no-xchesscc --no-xbridge --dynamic-objFifos \
+          --get-scratchpad-parameters aie.mlir
+    pytest <upstream>/test.py
+
+Writing the probe was still worth it: it is what turned "the API has `offset_parameter`"
+into "the value goes through `ParameterScratchpad`, not the design call", which is a
+host-side restructuring the fused design has to plan for. The probe failed and the
+knowledge survives, which is the correct outcome for a probe.
