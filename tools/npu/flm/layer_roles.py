@@ -105,16 +105,20 @@ def plan():
 
 
 def role_layout():
-    """Head-tiles per A core, chosen so A[j] feeds B[j] directly.
+    """Head-tiles per A core — which is just `head_layout(A_CORES)`.
 
-    `head_layout` is free — any bijection over the 48 head-tiles works and the
-    host packs the weight stream to match. Choosing it to follow the ROLE SPLIT
-    means A core j computes exactly the q/k/v that B core j attends with, so the
-    A->B stream is 1:1 core to core with no shuffle and no memtile.
+    I wrote a bespoke assignment to make A[j] feed B[j] with no shuffle, then
+    checked it against the existing one: **they already agree**. `head_layout(8)`
+    gives core j the four q heads `4j..4j+3` plus k[j] and v[j], differing only in
+    whether k or v sits in the last slot — and `drain_plan` derives that from the
+    layout rather than assuming it.
+
+    So the role-aligned head assignment is not something to arrange; at eight
+    cores it is what the existing rule already produces. Using it directly keeps
+    one source of truth, and P1's measured 204.1 us at 8 cores was measured with
+    exactly this layout.
     """
-    kv = (NV - NQ) // 2                       # 8 kv groups
-    return [[4 * j + i for i in range(NQ // A_CORES)] + [NQ + j, NQ + kv + j]
-            for j in range(A_CORES)]
+    return head_layout(A_CORES)
 
 
 def build_skeleton():
