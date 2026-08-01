@@ -12845,3 +12845,29 @@ Two faults on the way, both from importing constants out of context:
 The second is worth the note: `layer_quad` is kept in the tree as the record of a
 proven-impossible design, and its constants are close enough to the live ones to
 be copied by hand without the mismatch being obvious.
+
+### Group C on real weights: P3 and P4 correct, P5 wrong
+
+    P3 h      : 9.5367e-07                          matches p1p2_chain exactly
+    P4 sw     : 2.9297e-03  (2.08% of peak)         matches p1p2_chain exactly
+    P5 x_out  : 2.3877e-01  max|ref| 0.21875        WRONG — error exceeds the signal
+
+Two of three phases are right on the sixteen-core group, and right to the same
+digits as the two-dispatch design produces. So the three-body core, the phase
+sequencing and the h handoff all work.
+
+P5 does not. The error being *larger than* `max|ref|` says the output is not a
+perturbed answer but a wrong one — zeros or misindexed, the same signature as the
+earlier "attention error equals max|ref|" case, which turned out to be a buffer
+nobody had written.
+
+One fault already fixed on the way there: P5's broadcast was filled with the same
+block for every chunk, so all four chunks would have seen chunk 0's activation.
+Each chunk is a different slice of `sw`, so the broadcast now holds all four and
+the fill selects one by offset. That was wrong-by-construction rather than a
+symptom, and it is fixed independently of whatever is still wrong.
+
+Prime suspect is the result indexing: `o5_ts` is read as
+`(NCHUNK, p5tiles, 2, NROWS)` and the accumulating chunks still acquire result
+objects, so the live data is in the last chunk — an ordering that took two attempts
+to get right in `p5_pass` originally ([tile][core] versus [core][tile]).

@@ -167,6 +167,8 @@ def build(pos, nobj):
     w5_ty = np.ndarray[(NLAY * 2 * NCHUNK * p5tiles * OPERAND,),
                        np.dtype[np.uint8]]
     o5_ty = np.ndarray[(NCHUNK * 2 * p5tiles * NROWS,), np.dtype[bfloat16]]
+    # P5's broadcast holds all NCHUNK activations; the fill picks one
+    bc5_ty = np.ndarray[(NCHUNK * (2 * K_DIM + 2 * HEAD),), np.dtype[bfloat16]]
     # ONE row-ordered sw buffer for all pairs. P5 slices it by K-chunk, so it
     # must be in row order — the per-pair stream is [object][core] and a
     # pair's cores are rpp4/2 rows apart, which is not ascending. A drain
@@ -405,7 +407,10 @@ def _design({P}):
 
             tg = TaskGroup()
             for ch in range({NCHUNK}):
-                bch.fill(bc5b, group=tg)
+                # each chunk is a DIFFERENT slice of sw; filling the same block
+                # NCHUNK times would hand every chunk the first one's activation
+                bch.fill(bc5b, group=tg, offset=ch * {BCN1},
+                         sizes=[1, 1, 1, {BCN1}], strides=[0, 0, 0, 1])
             for i in range(n):
                 wh[i].fill(w5b[i], group=tg, offset=_lay * {p5_lsz},
                            sizes=[1, 1, 1, {p5_lsz}], strides=[0, 0, 0, 1])
@@ -415,7 +420,7 @@ def _design({P}):
 
     at = [bc_ty] + [w3_ty] * {npairs} + [h_ty] * {npairs}
     at += [bc_ty] + [w4_ty] * {npairs} + [sw_ty] * {npairs}
-    at += [bc_ty] + [w5_ty] * {npairs} + [o5_ty] * {npairs}
+    at += [bc5_ty] + [w5_ty] * {npairs} + [o5_ty] * {npairs}
     at += [f_bc.prod(tile=AnyShimTile)]
     at += [f.prod(tile=AnyShimTile) for f in f_w]
     at += [f.cons(tile=AnyShimTile) for f in f_p1]
@@ -432,7 +437,7 @@ def _design({P}):
               op_ty=op_ty, oppair_ty=oppair_ty, p1o_ty=p1o_ty,
               p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty, attn_all_ty=attn_all_ty, w3_ty=w3_ty, h_ty=h_ty, p3tiles=p3tiles,
               w4_ty=w4_ty, sw_ty=sw_ty, p4tiles=p4tiles,
-              w5_ty=w5_ty, o5_ty=o5_ty, p5tiles=p5tiles, NCHUNK=NCHUNK,
+              w5_ty=w5_ty, o5_ty=o5_ty, bc5_ty=bc5_ty, p5tiles=p5tiles, NCHUNK=NCHUNK,
               p4per=p4per, p4objs=p4objs, rpp4=rpp4, D_FF=D_FF,
               w_all_ty=w_all_ty, bc_all_ty=bc_all_ty, kvin_ty=kvin_ty, q_tys=q_tys,
               cache_ty=cache_ty, SKIP_P1=SKIP_P1, HOSTKV=HOSTKV,
@@ -789,38 +794,50 @@ def main():
     sw_all = iron.zeros(D_FF, dtype=bfloat16, device="npu")
     sw_ts = [sw_all] * npairs      # every pair scatters into the same buffer
 
-    import os as _oh
-    if _oh.environ.get("CHAIN_HOST_KV"):
-        # the same cache contents, built on the host: P1 still runs and still
-        # drains, but P2 reads this instead
-        # multi-object: the appended token lives in object pos // TSEQ, and the
-        # trailer belongs on EVERY object, not just the first.
-        hostc = cache.reshape(nobj * NATT, SLOT).copy()
-        for g in range(NATT):
-            row = (pos // TSEQ) * NATT + g
-            K = hostc[row, :KTILE].reshape(HEAD, TSEQ)
-            V = hostc[row, KTILE:2 * KTILE].reshape(TSEQ, HEAD)
-            K[:, pos % TSEQ] = ref[NQ + g]
-            V[pos % TSEQ] = ref[NK + g]
-        hraw = hostc.astype(bfloat16).view(np.uint16)
-        for _o in range(nobj):
-            for g in range(NATT):
-                hraw[_o * NATT + g, (OPERAND - 64) // 2:(OPERAND - 64) // 2 + 2] = \
-                    np.array([float(g * GQA * OBJ)], np.float32).view(np.uint16)
-        host_t = iron.tensor(hraw.reshape(-1).view(np.uint8), dtype=np.uint8,
-                             device="npu")
-        design(bc_t, *w_ts, *q_in, *[host_t] * apairs, *q_ts,
-               *[cache_t] * npairs, *a_ts, bc3_t, *w3, *h_ts,
-               bc4_t, *w4, *sw_ts)
+    # ---- P5: down_proj + residual, NCHUNK chunks over D_FF ------------------
+    # Its activation is the sw that P4 just produced, chunk by chunk, with the
+    # residual after it — the same broadcast shape every phase here uses.
+    NCHUNK = 4
+    p5tiles = K_DIM // (NCORES * NROWS)
+    p5rows = lambda pr, j: [pr * rpp3 + t * 2 * NROWS + j * NROWS
+                            for t in range(p5tiles)]
+    dd5, dm5, dc5 = load_linear(
+        c, f"model.layers.{o.layer}.mlp.down_proj.weight", K_DIM, D_FF)
+    nbc5 = D_FF // 32
+    swv = sw_ref.astype(np.float32)
+    BCN1_ = 2 * K_DIM + 2 * HEAD
+    bc5 = np.zeros(NCHUNK * BCN1_, np.float32)
+    for ch in range(NCHUNK):
+        b0 = ch * BCN1_
+        bc5[b0:b0 + K_DIM] = rnd(swv[ch * K_DIM:(ch + 1) * K_DIM])
+        bc5[b0 + K_DIM:b0 + 2 * K_DIM] = x      # the residual P5 adds
+    bc5_t = iron.tensor(bc5.astype(bfloat16), dtype=bfloat16, device="npu")
+    w5, x5_ref = [], np.zeros(K_DIM, np.float64)
+    for pr in range(npairs):
+        per = []
+        for j in range(2):
+            blob = []
+            for ch in range(NCHUNK):
+                lo, hi = ch * (nbc5 // NCHUNK), (ch + 1) * (nbc5 // NCHUNK)
+                for r0 in p5rows(pr, j):
+                    sl = slice(r0, r0 + NROWS)
+                    blob.append(q4nx.pack_tile(
+                        dd5[sl, lo:hi], dm5[sl, lo:hi], dc5[sl, lo:hi],
+                        row_base=r0, flags=float(ch == NCHUNK - 1)))
+            per.append(np.concatenate(blob))
+        b = np.empty((NCHUNK * p5tiles, 2, wt), np.uint8)
+        b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
+        w5.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
+    o5_ts = [iron.zeros(NCHUNK * 2 * p5tiles * NROWS, dtype=bfloat16,
+                        device="npu") for _ in range(npairs)]
+
+    _args = (bc3_t, *w3, *h_ts, bc4_t, *w4, *sw_ts, bc5_t, *w5, *o5_ts)
+    if o.bench:
+        _b = run_iters(design, *_args, warmup=2, iters=10)
+        _us = _b.npu.min_us if _b.npu else _b.e2e.min_us
     else:
-        _args = (bc_t, *w_ts, *q_in, *q_ts, *[cache_t] * npairs, *a_ts,
-                 bc3_t, *w3, *h_ts, bc4_t, *w4, *sw_ts)
-        if o.bench:
-            _b = run_iters(design, *_args, warmup=2, iters=10)
-            _us = _b.npu.min_us if _b.npu else _b.e2e.min_us
-        else:
-            design(*_args)
-            _us = None
+        design(*_args)
+        _us = None
 
     # first: did P1 write the cache correctly inside THIS harness?
     # object 0 carries the real KV; P1 appends there and the rest is padding
@@ -926,6 +943,30 @@ def main():
         e5 = np.abs(x_out - ref5).max()
         print(f"  LAYER x_out: max err {e5:.4e}  mean|ref| {np.abs(ref5).mean():.5f}"
               f"  (side B on side A's own sw)")
+    # ---- P5: x_out = sum over chunks of down_proj(sw) + x -------------------
+    for pr in range(npairs):
+        for j in range(2):
+            for ti, r0 in enumerate(p5rows(pr, j)):
+                sl = slice(r0, r0 + NROWS)
+                acc = np.zeros(NROWS, np.float64)
+                for ch in range(NCHUNK):
+                    lo, hi = ch * (nbc5 // NCHUNK), (ch + 1) * (nbc5 // NCHUNK)
+                    acc += q4nx.gemv_reference_bf16(
+                        rnd(swv[ch * K_DIM:(ch + 1) * K_DIM]),
+                        dd5[sl, lo:hi], dm5[sl, lo:hi], dc5[sl, lo:hi])
+                x5_ref[r0:r0 + NROWS] = rnd(acc + x[r0:r0 + NROWS])
+    got5 = np.zeros(K_DIM, np.float64)
+    for pr in range(npairs):
+        v = (o5_ts[pr].numpy().astype(np.float64)
+             .reshape(NCHUNK, p5tiles, 2, NROWS)[NCHUNK - 1])
+        for ti in range(p5tiles):
+            for j in range(2):
+                r0 = p5rows(pr, j)[ti]
+                got5[r0:r0 + NROWS] = v[ti, j]
+    e5 = np.abs(got5 - x5_ref).max()
+    print(f"  P5 x_out  : max err {e5:.4e}  mean|ref| {np.abs(x5_ref).mean():.5f}"
+          f"  max|ref| {np.abs(x5_ref).max():.5f}")
+
     print(f"P1 -> P2 in one dispatch: seq {o.seq} (P1 appends at pos {pos}), "
           f"{nobj} KV objects, npad {npad}")
     worst, scale = 0.0, 0.0
