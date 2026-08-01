@@ -11173,3 +11173,27 @@ Still single-layer, and therefore still to do:
   * P3's o_proj and P4's gate/up weights (same offset pattern, more packing)
   * the per-layer RMSNorm weights on the broadcast
   * the residual chaining layer to layer on device
+
+### P3 and P4 now carry per-layer weights too
+
+Same offset pattern as P1, extended to o_proj and gate/up. Each pair's buffer
+holds NLAY layers; the fill selects one:
+
+    w3_ty = (NLAY * 2 * p3tiles * OPERAND,)     p3_lsz = 2 * p3tiles * tile_bytes
+    w4_ty = (NLAY * 2 * 2 * p4tiles * OPERAND,) p4_lsz = 2 * 2 * p4tiles * tile_bytes
+
+Verified running REAL successive layers:
+
+    NLAY   q'           P3 h          P4 sw
+    1      0.0000e+00   9.5367e-07    2.08% of peak
+    2      1.5259e-04   0.0000e+00    1.22% of peak     (layers 0,1)
+    4      0.0000e+00   0.0000e+00    2.46% of peak     (layers 0-3)
+
+**P3's `h` is exact against layer 1's and layer 3's own o_proj**, which is the
+strongest evidence the offset addressing is right — a wrong layer would miss by
+the size of h, not by a ulp.
+
+`q'` at NLAY=2 is 1 ulp for the reason already recorded: the broadcast carries
+layer 0's `input_layernorm` for every iteration. It reads 0.0000e+00 at NLAY=4
+because that comparison lands on a layer whose norm weight happens to round the
+same way — not because the issue is fixed. Per-layer norm weights are still to do.
