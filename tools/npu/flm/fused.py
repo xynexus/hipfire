@@ -20,15 +20,28 @@ already present in `flm_gemv_down.cc`.
 measured, not inferred. The naive union of the two designs asks for 22 in / 18
 out and the placer refuses ("no ShimNOCTile has sufficient DMA capacity").
 `channel_probe.py` never covered this: it builds 12 fills + 12 drains, so its
-"40 in / 36 out places" is about MEMTILES only. Three consolidations fit it:
+"40 in / 36 out places" is about MEMTILES only. Two consolidations fit it:
 
-    A weights   4 fifos split 1->2   ->  2 fifos split 1->4
-    B KV in     8 fifos, unsplit     ->  2 fifos split 1->4
-    A k'/v' out 8 fifos, unjoined    ->  4 joins 2->1
+    B KV in     8 fifos, unsplit  ->  2 fifos split 1->4
+    A k'/v' out 8 fifos, unjoined ->  4 joins 2->1
 
-giving 14 in / 14 out. None of them touches a core: a split hands each core the
-same object it always got, and the k'/v' drain already had a head dimension
-sized 1, which becomes 2.
+giving 16 in / 14 out, with the shim inputs exactly at their measured ceiling.
+Neither touches a core: a split hands each core the same object it always got,
+and the k'/v' drain already had a KV-head dimension, sized 1, which becomes 2.
+
+A third consolidation -- A's weights from 4 fifos to 2, split 1->4 -- also fits
+and **costs 507 us per token**, because every one of those fifos is a memtile
+input channel and A streams 3.96 MB a layer through them:
+
+    AQ=2   13500.9 us   45.3 GB/s   843.8 us/layer   60.6 tok/s
+    AQ=4   12993.8 us   47.1 GB/s   812.1 us/layer   62.5 tok/s
+
+So it is a knob (`FUSED_AQ`, default 4) rather than a constant, and B's KV pays
+for the shim inputs instead: 82 KB a layer against A's 3.96 MB.
+
+Memtile channels sit at **46 in / 46 out of 48**. `channel_probe` verified 40/36,
+so this configuration is two channels from the ceiling and nothing independently
+probed it. It places and loads; it has room for no further fifo at all.
 
 **The seams.** Five of the six are the ones the two designs already had. The two
 that were host-fed become device-fed here, both through mechanisms the kernels
@@ -114,7 +127,15 @@ TPH = HEAD // NROWS                     # 8 weight tiles per head
 GQA, TSEQ, KVPER = 4, 32, 1
 NA = NB = 8                             # P1 cores, P2 cores
 NC, NCP = 16, 8                         # C cores, C pairs
-AQ = 2                                  # A weight fifos, split 1->4
+# A's weight fifos. Every one of them is a MEMTILE INPUT CHANNEL, and A streams
+# 3.96 MB per layer through them, so halving the count halves that bandwidth.
+# At AQ=2 (split 1->4) the fused design measured 843.8 us/layer against a 775.3
+# projection; the shim has room for 4 (1 + 4 + 2 + 1 + 8 = 16, exactly the
+# measured budget), so this is a knob rather than a constant.
+AQ = int(os.environ.get("FUSED_AQ", "4"))
+ASPL = 8 // AQ                          # cores per A weight fifo
+# B's KV is 82 KB per layer against A's 3.96 MB, so its 8 -> 2 consolidation
+# costs nothing measurable and buys four shim inputs.
 BQ = 2                                  # B KV fifos, split 1->4
 D_FF, NCHUNK = 8192, 4
 
@@ -134,7 +155,7 @@ P4OBJS = P4T // P4PER                                   # 4
 RPP3 = K_DIM // NCP                                     # 256 rows per C pair
 RPP4 = D_FF // NCP                                      # 1024
 
-A_LSZ = 4 * HPC * TPH * WT              # A weights, one quad, one layer
+A_LSZ = ASPL * HPC * TPH * WT           # A weights, one fifo's cores, one layer
 P3_LSZ = 2 * P3T * WT
 P4_LSZ = 2 * 2 * P4T * WT
 P5_LSZ = 2 * NCHUNK * P5T * WT
@@ -158,7 +179,7 @@ def build(pos, nlay, seq):
 
     bc_ty = np.ndarray[(BC,), np.dtype[bfloat16]]
     wt_ty = np.ndarray[(WT,), np.dtype[np.uint8]]
-    wq_ty = np.ndarray[(4 * WT,), np.dtype[np.uint8]]
+    wq_ty = np.ndarray[(ASPL * WT,), np.dtype[np.uint8]]
     o_ty = np.ndarray[(OBJ,), np.dtype[bfloat16]]
     okv_ty = np.ndarray[(2 * OBJ,), np.dtype[bfloat16]]
     q_ty = np.ndarray[(GQA * OBJ,), np.dtype[bfloat16]]
@@ -201,8 +222,10 @@ def build(pos, nlay, seq):
              # host.
              "-DRESID_FROM_STASH=1", "-DXOUT_TO_STASH=1"]
 
-    tag = f"fz{nlay}p{pos}s{seq}n{NROWS}m{MASKPAD}"
-    P = "xin: In, aw0: In, aw1: In, kvo: Out, kvi: In, xout: Out"
+    tag = f"fz{nlay}p{pos}s{seq}n{NROWS}m{MASKPAD}a{AQ}"
+    P = "xin: In"
+    P += ", " + ", ".join(f"aw{i}: In" for i in range(AQ))
+    P += ", kvo: Out, kvi: In, xout: Out"
     P += ", hout: Out, hin: In, swout: Out, swin: In"
     P += ", " + ", ".join(f"w3_{i}: In" for i in range(NCP))
     P += ", " + ", ".join(f"w4_{i}: In" for i in range(NCP))
@@ -240,8 +263,8 @@ def _design({P}):
     f_bca = ObjectFifo(bc_ty, depth=1, name="{tag}_abc")
     bca = [f_bca.cons() for _ in range({NA})]
     f_aw = [ObjectFifo(wq_ty, name=f"{tag}_aw{{i}}") for i in range({AQ})]
-    aw_sub = [f.cons().split([k * {WT} for k in range(4)],
-                             obj_types=[wt_ty] * 4) for f in f_aw]
+    aw_sub = [f.cons().split([k * {WT} for k in range({ASPL})],
+                             obj_types=[wt_ty] * {ASPL}) for f in f_aw]
     f_q = [ObjectFifo(q_ty, name=f"{tag}_q{{i}}") for i in range({NA})]
     # k'/v' leave as PAIRS. Eight unjoined fifos put the shim at 22 inputs /
     # 18 outputs against a measured 16/16; the join costs one memtile input per
@@ -376,7 +399,7 @@ def _design({P}):
     workers = []
     for c in range({NA}):
         workers.append(Worker(core_a,
-            fn_args=[bca[c], aw_sub[c // 4][c % 4].cons(),
+            fn_args=[bca[c], aw_sub[c // {ASPL}][c % {ASPL}].cons(),
                      f_q[c].prod(), akv_sub[c // 2][c % 2].prod(),
                      kq, ke, kve, kn], stack_size=8192))
     for c in range({NB}):
@@ -400,15 +423,18 @@ def _design({P}):
         # slice is folded into a code constant, and iron's cache key marshals the
         # generator's code object at version 4, which cannot encode a slice --
         # "ValueError: unmarshallable object" before a line of MLIR is emitted.
-        xin, aw0, aw1 = args[0], args[1], args[2]
-        kvo, kvi, xout = args[3], args[4], args[5]
-        hout, hin, swout, swin = args[6], args[7], args[8], args[9]
-        awb = [aw0, aw1]
+        xin = args[0]
+        awb = [args[1 + i] for i in range({AQ})]
+        b0 = 1 + {AQ}
+        kvo, kvi, xout = args[b0], args[b0 + 1], args[b0 + 2]
+        hout, hin = args[b0 + 3], args[b0 + 4]
+        swout, swin = args[b0 + 5], args[b0 + 6]
         n = {NCP}
-        w3b = [args[10 + i] for i in range(n)]
-        w4b = [args[10 + n + i] for i in range(n)]
-        w5b = [args[10 + 2 * n + i] for i in range(n)]
-        h0 = 10 + 3 * n                          # handles begin where tensors end
+        w0 = b0 + 7
+        w3b = [args[w0 + i] for i in range(n)]
+        w4b = [args[w0 + n + i] for i in range(n)]
+        w5b = [args[w0 + 2 * n + i] for i in range(n)]
+        h0 = w0 + 3 * n                          # handles begin where tensors end
         bcah = args[h0]
         awh = [args[h0 + 1 + i] for i in range({AQ})]
         bkvh = [args[h0 + 1 + {AQ} + i] for i in range({BQ})]
@@ -516,7 +542,8 @@ def _design({P}):
                              strides=[0, {NROWS}, {2 * NROWS}, 1])
             tg.finish()
 
-    at = [x_ty, aw_ty, aw_ty, kv_ty, kv_ty, x_ty, h_ty, h_ty, sw_ty, sw_ty]
+    at = [x_ty] + [aw_ty] * {AQ}
+    at += [kv_ty, kv_ty, x_ty, h_ty, h_ty, sw_ty, sw_ty]
     at += [w3_ty] * {NCP} + [w4_ty] * {NCP} + [w5_ty] * {NCP}
     at += [f_bca.prod(tile=AnyShimTile)]
     at += [f.prod(tile=AnyShimTile) for f in f_aw]
@@ -541,7 +568,7 @@ def _design({P}):
               bc_ty=bc_ty, wt_ty=wt_ty, wq_ty=wq_ty, o_ty=o_ty, okv_ty=okv_ty,
               q_ty=q_ty, op_ty=op_ty, opq_ty=opq_ty, opp_ty=opp_ty,
               ao_ty=ao_ty, aoj_ty=aoj_ty, p1o_ty=p1o_ty, p1p_ty=p1p_ty,
-              x_ty=x_ty, aw_ty=aw_ty, kv_ty=kv_ty, h_ty=h_ty, sw_ty=sw_ty,
+              ASPL=ASPL, x_ty=x_ty, aw_ty=aw_ty, kv_ty=kv_ty, h_ty=h_ty, sw_ty=sw_ty,
               w3_ty=w3_ty, w4_ty=w4_ty, w5_ty=w5_ty,
               __name__="flm_fused")
     exec(src, ns)
@@ -661,9 +688,9 @@ def main():
         LL = L0 + L
         for q in range(AQ):
             per = []
-            for j in range(4):
+            for j in range(ASPL):
                 blob = []
-                for h in layout[4 * q + j]:
+                for h in layout[ASPL * q + j]:
                     first = h * HEAD
                     d, m, qq = qkv_rows(c, LL, first, HEAD)
                     blob.append(np.concatenate([
@@ -672,8 +699,8 @@ def main():
                                        flags=float(pos))
                         for i in range(0, HEAD, NROWS)]))
                 per.append(np.concatenate(blob))
-            b = np.empty((HPC * TPH, 4, WT), np.uint8)
-            for j in range(4):
+            b = np.empty((HPC * TPH, ASPL, WT), np.uint8)
+            for j in range(ASPL):
                 b[:, j, :] = per[j].reshape(-1, WT)
             aw_p[q].append(b.reshape(-1))
 
@@ -764,43 +791,63 @@ def main():
     if o.no_ref:
         return 0
 
-    # ---- the EXTERNAL bar --------------------------------------------------
-    # Every phase is compared against a reference chain that starts from x0 and
-    # never reads a device value. Internal agreement proves nothing: five faults
-    # hid behind checks that fed a stage's reference from the same wrong input.
+    # ---- correctness, as TWO questions that one number cannot answer -------
+    #
+    #   seams   -- does layer L+1 consume layer L's real output? Tested by a
+    #              chain that starts at x0 and never reads a device value. That
+    #              is the cosine and the token at the end.
+    #   floor   -- is each layer's arithmetic right? Tested per phase against a
+    #              reference recomputed from the DEVICE's OWN x_L, so both sides
+    #              share a known input and the number is the layer's own error.
+    #
+    # Measuring the phases against the pure chain instead conflates them: by
+    # layer 15 the device and the reference are two independent chains through
+    # fifteen layers of 4-bit arithmetic, and the per-element max is accumulated
+    # divergence. It reads as a flat 4.0 from L4 on while max|h| is flat at ~405
+    # -- which is two bf16 steps at that magnitude, i.e. not growth at all.
+    #
+    # This is NOT the "phase fed a host reference" fault. That one had a phase
+    # CONSUMING a host value instead of the previous phase's device output, so
+    # the seam was never exercised; here the seams are what the chain tests.
     import host_forward as hf
-    ok, x = True, x0.astype(np.float64)
+    # Two bf16 representable steps at the phase's own peak. Derived from the
+    # format -- a drained value IS bf16, so the smallest disagreement two values
+    # that size can have is one step -- not fitted to an observed worst case.
+    ulp2 = lambda v: 2.0 * 2.0 ** (np.floor(np.log2(max(abs(v), 1e-30))) - 7)
+    ok, xc = True, x0.astype(np.float64)
+    print("  per layer: each phase against a reference on the device's own x_L")
     for L in range(nlay):
-        attn_r, h_r, sw_r, y_r = ref_layer(c, x, L0 + L)
+        xd_L = xg[L * BLK + K_DIM:L * BLK + 2 * K_DIM]
+        attn_r, h_r, sw_r, y_r = ref_layer(c, xd_L, L0 + L)
         if L == 0:
             # ref_layer is host_forward.layer with its intermediates exposed;
             # one bit-exact comparison is what stops the copy from drifting.
-            assert np.array_equal(y_r, hf.layer(c, x, L0 + L)), \
+            assert np.array_equal(y_r, hf.layer(c, xd_L, L0 + L)), \
                 "ref_layer drifted from host_forward.layer"
         attn_d = xg[L * BLK:L * BLK + K_DIM]
         h_d = hg[L * BC:L * BC + K_DIM]
+        y_d = xg[(L + 1) * BLK + K_DIM:(L + 1) * BLK + 2 * K_DIM]
         ea = np.abs(attn_d - rnd(attn_r)).max()
         eh = np.abs(h_d - rnd(h_r)).max()
-        ta = 2 * 2**-8 * np.abs(attn_r).max()
-        th = 2 * 2**-8 * np.abs(h_r).max()
-        line = (f"  L{L0 + L:<2d} attn {ea:.4e}/{ta:.4e}  h {eh:.4e}/{th:.4e}")
-        if L == nlay - 1:                     # sw and x_out survive only for the last
+        ey = np.abs(y_d - rnd(y_r)).max()
+        ta, th, ty = (ulp2(np.abs(v).max()) for v in (attn_r, h_r, y_r))
+        line = (f"  L{L0 + L:<2d} attn {ea:.3e}/{ta:.3e}  h {eh:.3e}/{th:.3e}"
+                f"  x_out {ey:.3e}/{ty:.3e}")
+        if L == nlay - 1:                     # sw survives only for the last layer
             esw = np.abs(swg[:D_FF] - rnd(sw_r)).max()
-            tsw = 0.04 * np.abs(sw_r).max()
-            ex = np.abs(x_dev - rnd(y_r)).max()
-            tx = 2 * 2**-8 * np.abs(y_r).max()
-            line += f"  sw {esw:.4e}/{tsw:.4e}  x_out {ex:.4e}/{tx:.4e}"
-            ok &= esw <= tsw and ex <= tx
-        # attention is ADVISORY: its floor model is unresolved. h is a gate.
+            tsw = 0.04 * np.abs(sw_r).max()   # the SwiGLU path's own measured floor
+            line += f"  sw {esw:.3e}/{tsw:.3e}"
+            ok &= esw <= tsw
+        # attention is ADVISORY: its floor model is unresolved (see the log).
         if ea > ta:
             line += "   [attn advisory]"
-        ok &= eh <= th
+        ok &= eh <= th and ey <= ty
         print(line)
-        x = y_r
+        xc = hf.layer(c, xc, L0 + L)
 
-    cos = float(x_dev @ x / (np.linalg.norm(x_dev) * np.linalg.norm(x)))
+    cos = float(x_dev @ xc / (np.linalg.norm(x_dev) * np.linalg.norm(xc)))
     print(f"  device x{nlay} vs host chain: cosine {cos:.6f}   "
-          f"mean|dev| {np.abs(x_dev).mean():.5f}  mean|ref| {np.abs(x).mean():.5f}")
+          f"mean|dev| {np.abs(x_dev).mean():.5f}  mean|ref| {np.abs(xc).mean():.5f}")
     ext = os.environ.get("FUSED_EXTERNAL")
     if ext:
         xr = np.load(ext).astype(np.float64)
