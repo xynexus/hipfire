@@ -15572,3 +15572,33 @@ host-side restructuring to fear: `iron.jit(..., full_elf=True)` already dispatch
 The caveat recorded earlier — "adopting runtime offsets means leaving iron.jit's wrapper for
 ParameterScratchpad plus manual buffer binding, a host-side restructuring of every harness
 here" — was wrong. The wrapper IS that path.
+
+### lm_head has the same two clocks, and 63.0 is conditional on both being held
+
+Measured at the lm_head configuration (498 tiles, NROWS=16, 16 cores, 163.7 MB):
+
+    npu.min 2959.5   npu.avg 2994.3
+    e2e.min 4599.6   e2e.avg 4993.5        e2e - npu = 1640.1 us
+
+The 2994.2 carried in every projection is the DEVICE figure. Its wall time under
+`run_iters` is 4599.6 — the same per-dispatch buffer-rebinding cost the fused dispatch
+showed, scaled to lm_head's smaller argument list (1640 us against 5714).
+
+So the token depends on how BOTH dispatches are driven:
+
+    both runs held (assumed for lm_head)   12874.0 + 2994.3 = 15868.3 -> 63.0 tok/s  +3.0%
+    fused held, lm_head rebinding          12874.0 + 4599.6 = 17473.6 -> 57.2 tok/s  -6.5%
+    neither held                           18583.8 + 4599.6 = 23183.4 -> 43.1 tok/s  -29.5%
+
+**63.0 assumes lm_head runs with its run object held, and that has not been demonstrated —
+only the fused dispatch has.** The mechanism is the same and a real decode loop would hold
+both naturally, since they live in one process against one device. But the middle row is
+what happens if lm_head is driven the way every bench in this tree drives it, and it loses
+to FLM.
+
+Recording the conditional rather than the best row. The honest statement of the result is:
+**63.0 tok/s wall, +3.0% over FLM, conditional on both dispatches holding their run
+objects — demonstrated for the layers, assumed for lm_head.** Closing that assumption is a
+single measurement: drive the lm_head-sized dispatch through the held-run path in
+`fused_pyxrt.py` and see whether its wall time converges on 2994 the way the fused
+dispatch's did on 12874.
