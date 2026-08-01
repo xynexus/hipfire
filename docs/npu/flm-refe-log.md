@@ -14326,3 +14326,41 @@ with a comment about row `pos` and row `pos+1`, and the prior write fills a sing
 Not pursued further. The device claim does not depend on it: attention was measured
 against a reference built from the bytes the device read, at 0.57 ULP over four real
 positions. What remains blocked is an end-to-end multi-token decode.
+
+### The cache discrepancy is a real design fault: odd positions clobber the previous K
+
+Byte-level comparison of the cache against what the harness intended to write:
+
+    CACHE p0: K diff 0.0000e+00   V diff 0.0000e+00
+    CACHE p1: K diff 0.0000e+00   V diff 0.0000e+00
+    CACHE p2: K diff 6.1875e+00   V diff 0.0000e+00      <-- clobbered
+    CACHE p3: K diff 0.0000e+00   V diff 0.0000e+00      (device-written)
+
+Only p2, only K. The cause is in the design, not the harness:
+
+    off = pos - (pos & 1)                       # even column of this pair
+    sizes=[1, 1, HEAD, 4]                       # 4 BYTES = two bf16 columns
+
+At pos 3, `off` is 2 and the drain writes columns 2 **and** 3 for every one of the HEAD
+rows. Column 2 holds the previous token's k', and the kernel has no way to reproduce it —
+so it writes whatever the emit left there. Every odd position destroys the K of the
+position before it.
+
+This does not show up in any single-shot test, because the host builds the whole cache
+and the only column checked is the current one. It requires a cache with real prior
+positions, which is what this scaffold added.
+
+**I called this a harness bug twice and it is not.** The discriminator was right as far
+as it went — the device does compute correctly over the bytes it read, at 0.57 ULP — but
+I stopped at "the device is exonerated" and framed the remaining difference as my own
+packing error. The byte comparison I nearly skipped is what showed the device writing
+outside its column. Two hypotheses were falsified by inspection before I measured; the
+measurement took one run.
+
+The v side is deliberate and documented — "row pos gets v' and row pos+1 gets the emit's
+zeros, which is what a padded position must hold until the next token overwrites it" —
+forward-looking, so it destroys nothing. The k side has the same two-element granularity
+pointing backwards, and that asymmetry appears to have been missed.
+
+Consequence: multi-token decode cannot work as the design stands. Throughput is
+unaffected — the drain moves the same bytes either way.

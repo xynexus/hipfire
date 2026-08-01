@@ -702,6 +702,19 @@ def main():
                              .reshape(TSEQ, HEAD).view(bfloat16),
                              np.float64)[:o.pos + 1]
             cache_KV = (_Kc, _Vc)          # qr is not in scope yet
+            if a == 0:
+                # Byte-level: what did the cache actually receive at the prior
+                # positions, against what prior_kv says it should hold. Two
+                # hypotheses (KVPLAN slots, V extent) were falsified by
+                # inspection; this measures rather than guesses.
+                for _p, (_k, _v) in enumerate(prior_kv):
+                    print(f"  CACHE p{_p}: K diff "
+                          f"{np.abs(_Kc[_p] - _k[a].astype(np.float64)).max():.4e}"
+                          f"   V diff "
+                          f"{np.abs(_Vc[_p] - _v[a].astype(np.float64)).max():.4e}")
+                print(f"  CACHE p{o.pos} (device-written): K diff "
+                      f"{np.abs(_Kc[o.pos] - ref[NQ + a]).max():.4e}"
+                      f"   V diff {np.abs(_Vc[o.pos] - ref[NK + a]).max():.4e}")
         qr = np.stack([ref[GQA * a + sl] for sl in range(GQA)])[:, :HEAD]
         # q' already carries 1/sqrt(d) * log2(e) from cs_q
         sc = (qr @ Kf.T) / math.log2(math.e)
