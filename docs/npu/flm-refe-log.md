@@ -11331,3 +11331,34 @@ and which the user has put in scope.
 So the path is not "close the residual loop". It is: **role-specialise the cores,
 then loop layers inside one dispatch.** The layer-loop mechanism measured over the
 last few entries is the half that already works.
+
+### Reconnaissance: 32 cores needs NATT=8, and hits a 16-core kernel assumption
+
+The device has 4 core rows x 8 columns = **32 core tiles**; this design has always
+used `NCORES = 16`, with no recorded reason. Role specialisation only pays if the
+core count goes up — splitting 16 cores by role halves each phase's parallelism.
+
+Raising it, and reading the errors in order:
+
+  1. `NCORES=32, NATT=4` -> "48 head-tiles do not divide over 28 cores".
+     `p1cores = NCORES - 2*apairs = 28`, and 48/28 is ragged.
+  2. `NCORES=32, NATT=8` -> `p1cores = 24`, and **48/24 = 2 exactly**. The layout
+     divides. This is also FULL attention coverage — all 8 KV groups, the thing
+     that could not route at 16 cores.
+  3. That combination then fails in Peano:
+
+         flm_h_emit.cc:43: static assertion failed:
+         'TILES * NR == 2 * 64' — h's slice must fill the shared result object
+
+     At 32 cores `p3tiles = 2048/(32*8) = 8`, so a core owns `8*8 = 64` rows while
+     the shared object is `2*HEAD = 128`. The kernel assumes a core's slice fills
+     the object exactly, which is true only at 16 cores.
+
+**Routing at 32 cores is NOT tested** — Peano compiles kernels before aiecc places
+and routes, so this failed earlier in the pipeline. Whether 32 cores route is
+still open, and it is the question that matters most.
+
+What this does establish: 32 cores is not blocked by the head layout, it forces
+NATT=8 (which is what a correct layer needs anyway), and the first obstacle is a
+kernel-side size assumption rather than a fabric limit. Reverted; the working
+configuration is untouched.
