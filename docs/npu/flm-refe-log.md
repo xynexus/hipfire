@@ -14579,3 +14579,32 @@ What this asks for, before the fused number is taken seriously: slopes fitted ov
 or more layer counts with repeats, not differences of single runs. The dispatch-floor fit
 already in this log did exactly that — `92.9 + 17.547 * MB`, R^2 0.99997, seven points —
 and is the most trustworthy number here for precisely that reason.
+
+### C's slope, fitted over eight points: 651.7 us/layer, 64.4 tok/s
+
+    NLAY  1: 727.2, 729.6     3: 2030.7, 2004.9
+          2: 1384.4, 1358.0   4: 2670.2, 2700.5
+
+    fit:  time_us = 71.3 + 651.7 * NLAY      R^2 = 0.99965, max residual 22.2 us
+
+The intercept lands at 71.3 us against the independently fitted 92.9 us dispatch floor,
+which is reasonable agreement for a four-point lever arm and a 22 us residual.
+
+    C = 637.9 (two-point, older code)  ->  65.4 tok/s
+    C = 658.4 (two-point, current)     ->  64.0 tok/s
+    C = 651.7 (eight-point fit)        ->  64.4 tok/s     FLM 61.18, +5.3%
+
+The fitted value sits between the two single-difference estimates, and the whole 1.4
+tok/s spread between them was noise in two measurements. **64.4 tok/s** is the number to
+carry, and the residual says its own uncertainty is about +/- 22 us per point, so roughly
++/- 0.5 tok/s on the projection rather than the +/- 3% guessed last entry.
+
+Every term in the projection now:
+
+    A+B      125.4 us/layer   two-point, current code — still the weakest term
+    C        651.7 us/layer   eight-point fit, R^2 0.99965
+    lm_head 2994.2 us         measured directly at its own size
+    floor      92.9 us        seven-point fit, R^2 0.99997
+
+A+B is now the least-supported number in the projection, and it is 16 x 125 us of the
+token. It deserves the same treatment before the fused figure is quoted anywhere.
