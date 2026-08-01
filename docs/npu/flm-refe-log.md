@@ -13897,3 +13897,63 @@ of group C's own checks passing — and `chain_layers.sh` pipes both streams int
 so the traceback matched nothing and vanished. Two ticks ago I looked at this block,
 wrote that it was misleading but harmless now that it no longer drove the exit code,
 and left it. It needed only an input nobody had tried.
+
+## The chain computes the WRONG LAYER: P5 adds x, and it must add h
+
+The first external check ever run against this stack fails, and it fails structurally.
+
+An independent fp32 forward straight from `consolidated.00.pth` — no code shared with
+anything here — for the same BOS token at position 0:
+
+    reference argmax 16309  (+7.0285; then 2 +7.0268, 791 +6.5374)
+    ours      argmax 124463 (+12.4069; then 57143 +12.3619)
+
+Not a near miss. The tokens differ, the logit scale is 1.8x off, and the hidden states
+are **orthogonal**:
+
+    ref  x0   mean|.| 0.00580   max   0.36133
+    ref  x1   mean|.| 0.08315   max  20.94366
+    ref  x2   mean|.| 1.47680   max 408.16583
+    ref  x16  mean|.| 1.76944   max 155.89609
+    ours x16  mean|.| 0.25624   max   1.10938
+    cosine(ours, ref) = 0.0120
+
+The reference's residual stream grows to a max of 408 by layer 2 — Llama's well-known
+massive activations. Ours never leaves ~1. That is the tell: the residual is not
+accumulating.
+
+The cause is one line. A Llama layer is
+
+    h = x + attn(norm1(x))          <- P3
+    y = h + mlp(norm2(h))           <- P5
+
+`group_c` builds P5's broadcast as `bc5[K_DIM:2*K_DIM] = x` — **the layer input, not
+h**. So the attention contribution is added in P3 and then discarded, because P5 adds
+the pre-attention residual instead of the post-attention one. Every layer throws away
+its own attention output.
+
+**Every check passed because the host reference has the same bug**:
+`x5_ref = rnd(acc + x[...])`. Device and reference agreed to the bit at thirteen of
+sixteen layers, and both were computing a layer that is not a Llama layer.
+
+This is the second time this exact failure mode has appeared here. The first was the
+missing post-attention RMSNorm, recorded earlier as "the host reference made the same
+omission, so the check passed on both sides computing the wrong layer". I wrote that
+sentence, and then did not go looking for other instances of it.
+
+What survives and what does not:
+
+  * **Throughput is unaffected.** The arithmetic is identical either way — same GEMVs,
+    same bytes, same dispatches. 124.8 and 637.9 us/layer, 65.4 tok/s projected, all
+    stand.
+  * **The kernels are unaffected.** Every operation-level check — GEMV against real
+    weights, RoPE, the KV cache, the softmax, the container decode — tested an
+    operation, not the composition, and those remain valid.
+  * **The composition claims do not survive.** "All sixteen layers chained correctly",
+    "no drift", "P5 exact at 13 of 16 layers", and the token 124463 are all correct
+    statements about the wrong computation. The chaining machinery works; what flows
+    through it is wrong.
+
+The 0.0120 cosine is worth keeping as the headline number: sixteen layers of agreement
+with my own reference to the last bit, and near-orthogonality to the model it claims to
+be reproducing. Internal consistency measured nothing.
