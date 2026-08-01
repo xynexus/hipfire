@@ -161,6 +161,11 @@ def build(pos, nobj):
     # so the runtime argument is that buffer's shape.
     h_ty = np.ndarray[(2 * K_DIM + 2 * HEAD,), np.dtype[bfloat16]]
     w4_ty = np.ndarray[(NLAY * 2 * 2 * p4tiles * OPERAND,), np.dtype[np.uint8]]
+    # P5: NCHUNK chunks of down_proj per layer, and one result object per
+    # chunk-step because accumulating chunks still acquire one.
+    w5_ty = np.ndarray[(NLAY * 2 * NCHUNK * p5tiles * OPERAND,),
+                       np.dtype[np.uint8]]
+    o5_ty = np.ndarray[(NCHUNK * 2 * p5tiles * NROWS,), np.dtype[bfloat16]]
     # ONE row-ordered sw buffer for all pairs. P5 slices it by K-chunk, so it
     # must be in row order — the per-pair stream is [object][core] and a
     # pair's cores are rpp4/2 rows apart, which is not ascending. A drain
@@ -190,21 +195,17 @@ def build(pos, nobj):
     # This list must match `at` element for element. Weights and q results are
     # per P1 PAIR (only those cores run P1); the cache, P3's weights and P3's
     # results are per pair, since every core runs P3.
-    P = ", ".join(f"w{i}: In" for i in range(p1pairs))
-    P += ", " + ", ".join(f"kvin{i}: In" for i in range(apairs))
-    if HOSTKV:
-        P += ", " + ", ".join(f"hostkv{i}: In" for i in range(apairs))
-    P += ", " + ", ".join(f"q{i}: Out" for i in range(p1pairs))
-    P += ", " + ", ".join(f"cache{i}: Out" for i in range(npairs))
-    P += ", " + ", ".join(f"attn{i}: Out" for i in range(apairs))
-    P += ", bc3: In"
+    P = "bc3: In"
     P += ", " + ", ".join(f"w3_{i}: In" for i in range(npairs))
     P += ", " + ", ".join(f"h{i}: Out" for i in range(npairs))
     P += ", bc4: In"
     P += ", " + ", ".join(f"w4_{i}: In" for i in range(npairs))
     P += ", " + ", ".join(f"sw{i}: Out" for i in range(npairs))
+    P += ", bc5: In"
+    P += ", " + ", ".join(f"w5_{i}: In" for i in range(npairs))
+    P += ", " + ", ".join(f"o5_{i}: Out" for i in range(npairs))
     src = f'''
-def _design(bc: In, {P}):
+def _design({P}):
     kq = ExternalFunction("flm_gemv_qkv", source_file=QKV_SRC,
                           arg_types=[bc_ty, op_ty], compile_flags=FLAGS)
     ke = ExternalFunction("flm_p1_emit", source_file=EMIT_SRC,
@@ -475,11 +476,12 @@ def _design(bc: In, {P}):
                              strides=[0, {OBJ}, {rpp4} // 2, 1])
             tg.finish()
 
-    at = [bc_all_ty] + [w_all_ty] * {p1pairs} + [kvin_ty] * {apairs}
-    at += [cache_ty] * ({apairs} if {HOSTKV} else 0)
-    at += [cache_ty] * {npairs}
-    at += [bc_ty] + [w3_ty] * {npairs} + [h_ty] * {npairs}
+    # C's args only: no qkv weights, no KV cache, no attention output — those
+    # belong to the other sixteen cores. One broadcast per phase, one weight
+    # stream per phase, one result set per phase.
+    at = [bc_ty] + [w3_ty] * {npairs} + [h_ty] * {npairs}
     at += [bc_ty] + [w4_ty] * {npairs} + [sw_ty] * {npairs}
+    at += [bc_ty] + [w5_ty] * {npairs} + [o5_ty] * {npairs}
     at += [f_bc.prod(tile=AnyShimTile)]
     at += [f.prod(tile=AnyShimTile) for f in f_w]
     at += [f.cons(tile=AnyShimTile) for f in f_p1]
