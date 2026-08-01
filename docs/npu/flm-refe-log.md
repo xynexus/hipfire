@@ -12673,3 +12673,49 @@ Recording the fork rather than picking. The alternative — finding a way to kee
 at 16 — would need the h gather to arrive on the same fifo as the attention
 stream, and those have different producers, which is the constraint that has been
 closing options all along.
+
+## 2026-08-01 — the four-group split costs more than the fusion saves
+
+Measured P5 at both widths rather than assuming the split was affordable:
+
+    P5 compute:  16 cores 215.8 us,  8 cores 327.6 us   ->  **1.52x**
+
+Sub-linear, which is the good news — halving the cores costs 52% more, not 100%,
+because the GEMV is bandwidth-bound rather than issue-bound at this size. But the
+arithmetic still goes the wrong way. Decomposing the measured 744.1 us/layer:
+
+    P1 124 + P2 25 + P3&P4 400 + P5 194 = 744 us   (P3/P4/P5 at 16 cores)
+
+    P3+P4+P5 at 8 cores:  595 x 1.52 = 903   ->  +308 us/layer
+    over 16 layers:                              **+4.93 ms**
+    what one dispatch instead of 32 saves:        ~2.08 ms
+
+**The split costs more than twice what the fusion saves.** So the four-group
+architecture — A/B/C1/C2 at 8 cores each — is worse than the two-dispatch design
+it would replace, and the 61.2 tok/s projection does not survive it.
+
+Caveat on the number: only P5's ratio is measured. P3 and P4 are assumed to scale
+the same way, which is plausible (same GEMV kernel, same bandwidth limit) but not
+verified. Even at a 1.3x ratio the split still loses; it would need to be under
+about 1.17x to break even, and 1.52x measured makes that implausible.
+
+### What this means
+
+The role architecture is not dead, but the version that fits the channel budget
+is. The problem is specific: **P4 needs the whole h, P3 produces it distributed,
+and gathering it needs a third input channel.** Everything else about the design
+holds — A+B are integrated and passing, the streams place and route, program
+memory is comfortable.
+
+Ways it could still work, none yet explored:
+  * **Keep C at 16 and give up on-chip h.** Send h to the host and back, paying one
+    extra dispatch per token rather than per layer — 16 layers x 1 handoff instead
+    of 16 x 2 dispatches. That is 2 dispatches per token, which is FLM's number.
+  * **Fold P3 into B.** If attention's cores also did o_proj, h would be produced
+    where the attention output already is, and C2 would only need the FFN. B is
+    carrying one body and has room.
+  * **Split the FFN by rows rather than by phase**, so each core needs only its own
+    slice of h and no gather is required at all.
+
+The third is the most interesting because it attacks the gather itself rather than
+routing around it. None are measured.
