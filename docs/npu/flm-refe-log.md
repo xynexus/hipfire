@@ -11004,3 +11004,49 @@ the NPU with another process, which is not something my designs do at all.
 names and signatures are strong evidence of structure but say nothing about how
 many dispatches actually issue per token. Confirming that needs runtime
 observation, which has not been done.
+
+## 2026-08-01 — MEASURED: FLM issues ~2.5 dispatches per TOKEN. I issue 32.
+
+The ABI said `rtp_write` re-parameterises a configured array rather than
+re-dispatching. That is now measured, not inferred. Tracing
+`DRM_IOCTL_AMDXDNA_EXEC_CMD` on my own `flm run` instance (the user's server left
+alone), two generations differing only in length:
+
+    "Count from 1 to 10."   231 EXEC_CMD    31 output chars
+    "Count from 1 to 60."   505 EXEC_CMD   231 output chars
+    -------------------------------------------------------
+    difference              274 EXEC_CMD   200 chars = 50 numbers
+
+Prefill is identical between the two, so the difference isolates decode. At
+~2.0-2.5 tokens per number that is **2.2-2.7 dispatches per token; call it 2.5.**
+
+Mine is **32** — sixteen layers, two dispatches each.
+
+### This accounts for the entire gap, quantitatively
+
+    my dispatch floor    32  x 67.2 us = 2.15 ms per token
+    FLM's               ~2.5 x 67.2 us = 0.17 ms per token
+    difference                          1.98 ms
+
+    my measured token    18.36 ms                        -> 54.5 tok/s
+    minus the excess     18.36 - 1.98 = 16.38 ms         -> 61.0 tok/s
+    FLM measured                                            61.18 tok/s
+
+**Within 0.3%.** The ~9% deficit is not kernel efficiency, not GEMV throughput,
+not the exp2 floor, not attention coverage. It is 29.5 surplus dispatch floors.
+Every per-kernel optimisation measured this session was optimising the wrong
+thing — the arithmetic was already at parity, and the whole difference was
+sitting in how often the array gets re-programmed.
+
+### What it implies for the rebuild
+
+A layer is not the dispatch unit. FLM's unit is closer to the whole token, with
+`rtp_write` supplying per-layer parameters into a persistently configured array
+and `npu_dma_wait` sequencing the movement. Combined with role-specialised tiles
+(mvm / proj / attn-qk / attn-kv), the program-memory wall that forced two
+dispatches per layer never arises: a core holds one kernel and is re-pointed at
+new weights per layer rather than re-loaded with new code.
+
+So the redesign target is not "fit five phases in one dispatch". It is **"configure
+once, iterate layers by parameter"** — which is a different program entirely, and
+the one worth building.
