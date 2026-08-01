@@ -13422,7 +13422,13 @@ rescore on the host), measured interleaved against the exact tier in one session
 share their conditions:
 
     exact tier   12874.0 + 2957.5 + 10.5  = 15842.0 us -> 63.1 tok/s   +3.2%
-    two-pass     12874.0 + 2375.9 + 241.5 = 15491.4 us -> **64.6 tok/s**   **+5.5%**
+    two-pass     12874.0 + 2375.9 + 181.1 = 15431.0 us -> **64.8 tok/s**   **+5.9%**
+
+The host term was 241.5 and is now 181.1: the shortlist takes one `max()` and a threshold
+pass instead of partitioning 128256 values (19.3 us against 76-110), which is exact because
+a threshold set IS the top-N for some N. Session to session the whole token measures
+15431-15517 us, i.e. **64.4-64.8 tok/s**; the coarse dispatch alone varies 2375.9-2456.4
+across sessions, so quote the range rather than the best row.
 
     coarse 131.8 MB at 55.5 GB/s, exact 164.7 MB at 55.7 — bytes ratio 0.8006 against a
     time ratio 0.8033, matching to 0.3%. Same GB/s both ways: the mechanism is bytes.
