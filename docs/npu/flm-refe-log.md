@@ -13415,6 +13415,11 @@ token, all 16 layers looped inside the instruction sequence.
     per-phase bounds DERIVED from the format (two bf16 representable steps at each
     phase's own peak), inside at every layer
 
+Six runs of that build now exist — 12611.1 / 12651.9 / 12674.0 / 12703.5 / 12705.1 /
+12993.8 — median 12688.8, which is 63.8 tok/s. The quoted 63.7 comes from the first
+triple's median and the two differ by 0.06 tok/s, below the measurement's own resolution.
+The figure stands; this is noted only so nobody re-derives it later and thinks it moved.
+
 Interleaved as separate dispatches it would be 55.0 tok/s, a 10% LOSS — the fusion is
 what makes the result, not an optimisation on top of it.
 
