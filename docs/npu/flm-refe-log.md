@@ -11593,3 +11593,35 @@ history.
 
 Reverted; 16 cores untouched and passing. Step 1 stands, but it is
 "rewrite the operand argument layout", not "widen a split".
+
+### Re-measured: five phases still do not fit, so the restructure is not optional
+
+Before committing to the quad rewrite, checking whether the cheap path reopened —
+several things have changed since "short 2272 B" was measured (acc+flush merged,
+saving a body; various kernels edited). `progmem_probe --only`:
+
+    phases 1,3,4       .text  9888 B  (60%)
+    phases 1,3,4,5     .text 12016 B  (73%)
+    phases 1,2,3,4,5   .text 14784 B  (90%)   FITS, says the probe
+
+But the probe is documented to **under-predict the real design by ~4 KB** because
+it models kernels, not the acquire/release/prepare scaffolding each phase body
+generates. Applying that:
+
+    phases 1,3,4       ~13888 B   (85%)   fits
+    phases 1,3,4,5     ~16016 B   (98%)   fits, barely
+    phases 1,2,3,4,5   ~18784 B  (115%)   over by ~2400 B
+
+The margin at five phases is 1638 B against a ~4000 B correction. And ~2400 B over
+lines up with the independently measured **2272 B shortfall** from before — two
+different routes to the same number, which is the reassuring part.
+
+So: the direct path — five phases in one dispatch on uniform cores — is still
+closed, and the quad/role restructure is not an optimisation, it is the
+requirement. Worth the ten minutes to check rather than assume, since the
+alternative was a multi-tick rewrite.
+
+Note the near-miss: **P1+P3+P4+P5 (no attention) fits at ~98%.** A core that does
+everything except attention is right at the edge, which is another way of saying
+attention is what does not fit — consistent with attention being the phase FLM
+gives its own engine and its own xclbin.
