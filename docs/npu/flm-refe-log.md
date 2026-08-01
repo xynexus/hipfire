@@ -13684,3 +13684,37 @@ architecture computes a correct multi-layer chain — which was never demonstrat
 before, and was the substantive risk behind the 65.4 tok/s projection. What remains is
 whether the same composition survives being put in one dispatch, which is a placement
 and program-memory question, not a correctness one.
+
+### Four chained layers: no drift, and `chain_layers.sh` to reproduce it
+
+    layer   attn ULP   k'          v'          P3    P4 (% peak)   P5
+    0       0.76       1.9531e-03  0.0         0.0   2.50%         4.7684e-07
+    1       0.87       0.0         0.0         0.0   1.35%         0.0
+    2       1.18       0.0         1.2207e-04  0.0   1.22%         0.0
+    3       0.74       0.0         0.0         0.0   1.25%         0.0
+
+Four real layers, each consuming the previous one's device x_out. P3 and P5 are exact
+at every layer after the first, k' and v' are exact but for one 1.2e-04 blip at layer
+2, and attention stays inside one bf16 ulp throughout. P4 sits at 1.2-2.5% of peak and
+does not trend.
+
+The activations grow as expected through the stack — mean|x_out| 0.047, 0.059, 0.068,
+0.073 and max|V| 0.52, 0.61, 1.01, 1.02 — while the *relative* error does not, which
+is what "no drift" means here. An error that compounded would show as a rising ULP
+count against a rising signal; instead the ULP count wanders between 0.74 and 1.18
+with no direction.
+
+`chain_layers.sh N [pos] [seq]` reproduces it.
+
+Two bugs in that script, both worth naming because each looked like a result:
+
+  * `set -e` plus a `grep` that matches nothing ends the run. The first version
+    stopped after layer 0 and printed exactly what a successful one-layer run prints.
+  * `group_c` exits nonzero — it still runs `p1p2_chain`'s attention check, which has
+    no attention to check in group C and duly reports FAIL. Under `set -e` that killed
+    the loop after layer 0 a second time, for a different reason, with the same
+    indistinguishable output.
+
+Both were caught only because four layers were expected and one appeared. A harness
+whose failure mode is "silently does less" is worse than one that crashes, and this
+one had two independent paths into it.
