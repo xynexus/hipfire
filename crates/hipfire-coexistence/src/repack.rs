@@ -437,7 +437,52 @@ fn restore(
     }
     match (out_dir, check) {
         (Some(d), _) => eprintln!("repack: restored {n} files to {}", d.display()),
-        _ => eprintln!("repack: verified {n} files byte-identical"),
+        (_, Some(src)) => {
+            // Checking only that every archived file matches the source proves
+            // nothing about files the archive does not contain. Ornith-1.0-35B
+            // reported "62 files byte-identical" while the source held 105 --
+            // 45.8 GB of `.git/lfs` objects that `collect` skips. Deleting on
+            // that verdict would have destroyed them, so enumerate the source
+            // too and fail on anything the archive is missing.
+            let archived: std::collections::HashSet<String> = files
+                .iter()
+                .filter_map(|f| f.get("path").and_then(|v| v.as_str()).map(String::from))
+                .collect();
+            let mut extra: Vec<(u64, String)> = Vec::new();
+            let mut walk = vec![src.to_path_buf()];
+            while let Some(d) = walk.pop() {
+                let Ok(rd) = std::fs::read_dir(&d) else { continue };
+                for e in rd.flatten() {
+                    let path = e.path();
+                    if path.is_dir() {
+                        walk.push(path);
+                    } else if path.is_file() {
+                        let rel = path
+                            .strip_prefix(src)
+                            .map(|r| r.to_string_lossy().replace('\\', "/"))
+                            .unwrap_or_default();
+                        if !archived.contains(&rel) {
+                            extra.push((path.metadata().map(|m| m.len()).unwrap_or(0), rel));
+                        }
+                    }
+                }
+            }
+            if !extra.is_empty() {
+                extra.sort_by(|a, b| b.0.cmp(&a.0));
+                let bytes: u64 = extra.iter().map(|e| e.0).sum();
+                let sample: Vec<&str> =
+                    extra.iter().take(3).map(|e| e.1.as_str()).collect();
+                return Err(format!(
+                    "verify: {} source file(s) are NOT in the archive ({:.2} GB). Deleting the source would lose them. e.g. {:?}",
+                    extra.len(),
+                    bytes as f64 / 1e9,
+                    sample
+                )
+                .into());
+            }
+            eprintln!("repack: verified {n} files byte-identical, source fully covered");
+        }
+        _ => {}
     }
     Ok(())
 }
