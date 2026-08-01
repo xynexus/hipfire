@@ -13413,9 +13413,26 @@ token, all 16 layers looped inside the instruction sequence.
 61.18 is, so this is the like-for-like comparison:
 
     layers   12874.0 us   pyxrt, run object HELD
-    lm_head   3010.6 us   pyxrt, run object HELD
+    lm_head   3010.6 us   pyxrt, run object HELD, EXACT q4nx tier
     host        10.5 us   embedding row 0.38 + final RMSNorm 5.25 + argmax 4.89
     token    15895.1 us   ->  **62.9 tok/s**    FLM 61.18, **+2.8%**
+
+**With the two-pass lm_head** (`lmhead_twostage.py`, coarse Q4 shortlist on the NPU + fine
+rescore on the host), measured interleaved against the exact tier in one session so the two
+share their conditions:
+
+    exact tier   12874.0 + 2957.5 + 10.5  = 15842.0 us -> 63.1 tok/s   +3.2%
+    two-pass     12874.0 + 2375.9 + 241.5 = 15491.4 us -> **64.6 tok/s**   **+5.5%**
+
+    coarse 131.8 MB at 55.5 GB/s, exact 164.7 MB at 55.7 — bytes ratio 0.8006 against a
+    time ratio 0.8033, matching to 0.3%. Same GB/s both ways: the mechanism is bytes.
+    recall@4 = 48/48 on real hidden states; K=32 taken for margin; two-pass argmax ==
+    exact argmax on 48/48. Worst coarse rank of the true argmax: 3.
+
+The 241.5 us host term is numpy per-op OVERHEAD, not work — 78 us to top-32 a 128256 array
+that the same numpy argmaxes in 4.9, and 110 us to rescore 41 KB. It eats 40% of the device
+saving. With a host implementation that costs what the work costs, the same device time is
+**65.5 tok/s, +7.1%**. The ceiling here is not the algorithm.
 
 The 63.7 previously quoted here is `run_iters`' `npu.min_us` — device time, against FLM's
 wall-clock server figure. Not the same quantity. The margin is +2.8%, not +4.1%.
