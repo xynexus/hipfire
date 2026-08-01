@@ -274,7 +274,7 @@ def _design(bc: In, {P}):
                            arg_types=[bc_ty, op_ty, p1o_ty],
                            compile_flags=FLAGS)
 
-    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_nlay{NLAY}")
+    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_c32n8_{NLAY}")
     bc_cons = [f_bc.cons() for _ in range({NCORES})]
     f_w = [ObjectFifo(oppair_ty, name=f"wp{{i}}_n{NROWS}k{KVPER}") for i in range({npairs})]
     w_sub = [f.cons().split([0, {OPERAND}], obj_types=[op_ty, op_ty]) for f in f_w]

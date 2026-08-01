@@ -11362,3 +11362,32 @@ What this does establish: 32 cores is not blocked by the head layout, it forces
 NATT=8 (which is what a correct layer needs anyway), and the first obstacle is a
 kernel-side size assumption rather than a fabric limit. Reverted; the working
 configuration is untouched.
+
+### 32 cores: the wall is MEMTILE DMA capacity — which is the thing already in scope
+
+Relaxing `flm_h_emit`'s `TILES * NR == 2*HEAD` to `<=` (legitimate — at 32 cores a
+core owns half the rows, so the shared object is half-written, and the drain reads
+only `p3tiles*NROWS` per core anyway) lets the build proceed past Peano. It then
+reaches the placer:
+
+    (2/42) placed.mlir: error: no MemTile has sufficient DMA capacity
+           for 1 input/2 output channels near centroid column 1
+
+So the 32-core wall is neither the head layout, nor a kernel assumption, nor
+inter-tile routing. It is **memtile DMA capacity** — and the compiler is already
+reaching for memtiles on its own, unprompted, and running out.
+
+The full progression at `NCORES=32`:
+
+    1. head layout          -> fixed by NATT=8 (48/24 = 2, and full head coverage)
+    2. flm_h_emit assert    -> relaxed == to <=
+    3. memtile DMA capacity -> HERE
+
+That is a good place to be stuck. Every earlier wall this session was a hard
+resource limit with no lever (16 KB program memory, 2-in/2-out per core, a routing
+failure with no diagnostic). This one names its resource, and **explicit memtile
+staging — deciding what goes through a memtile rather than letting the placer
+guess — is exactly the remedy the earlier DMA-fanin diagnostic named, and is in
+scope.**
+
+Reverted; the 16-core configuration is untouched and passing.
