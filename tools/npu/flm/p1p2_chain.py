@@ -109,6 +109,11 @@ TSEQ, GQA, KVPER = 32, 4, 1
 # follows NROWS and KVPER: max(one KV tile 8192, a q4_1 tile 10304)
 OPERAND = max(2 * TSEQ * HEAD * 2 * KVPER, q4nx.tile_bytes(K_DIM, NROWS))
 NATT = 4                       # attention cores = KV heads
+# Layers per DISPATCH. FLM issues ~2.5 EXEC_CMD per token where one-dispatch-per-
+# layer would issue 32, and that surplus was the entire performance gap. Each
+# pair's weight buffer holds NLAY layers back to back; the fill picks one by
+# offset, so the loop runs REAL successive layers.
+NLAY = int(__import__("os").environ.get("CHAIN_NLAY", 1))
 
 
 def build(pos, nobj):
@@ -125,6 +130,7 @@ def build(pos, nobj):
     # Where each pair's q' belongs in the broadcast. Measured, not assumed (see
     # CHAIN_QMAP): a pair's stream is [slot s][core j] and its head is
     # qbase + hpcc*j + s, so the scatter is a plain 3-level stride.
+    p1_lsz = hpc * TPH * 2 * q4nx.tile_bytes(K_DIM, NROWS)
     qbase = [sum(qobj[:i]) for i in range(len(qobj))]
     hpcc = [q // 2 for q in qobj]
     # P3 runs on ALL cores — only P1 and P2 are partitioned — so o_proj's 2048
@@ -152,12 +158,6 @@ def build(pos, nobj):
     kv_in = pos % TSEQ                  # its column/row within that object
     kv_obase = kv_ob * NATT             # cache is flat [obj*NATT + head][SLOT]
     off = kv_in - (kv_in & 1)
-    # Layers per DISPATCH. Measured: FLM issues ~2.5 EXEC_CMD per token where
-    # this design issues 32 (16 layers x 2 dispatches), and that surplus is the
-    # entire performance gap. If one dispatch can iterate layers, the gap closes.
-    # Weights are reused across iterations here -- this measures the MECHANISM
-    # and its cost, not a correct multi-layer result.
-    NLAY = int(_osk.environ.get("CHAIN_NLAY", 1)) if (_osk := __import__("os")) else 1
     import os as _osk
     SKIP_P1 = 1 if _osk.environ.get("CHAIN_P2_ONLY") else 0
     # bisect: P2 reads a host-built cache instead of the one P1 drained into.
@@ -191,7 +191,8 @@ def build(pos, nobj):
     # shapes its destination, so each object goes straight to its row.
     sw_ty = np.ndarray[(D_FF,), np.dtype[bfloat16]]
     # P1's weights, then P2's q'+KV objects, on the same fifo
-    w_all_ty = np.ndarray[(2 * hpc * TPH * wt,), np.dtype[np.uint8]]
+    # spans NLAY layers; the fill selects one by offset
+    w_all_ty = np.ndarray[(NLAY * 2 * hpc * TPH * wt,), np.dtype[np.uint8]]
     kvin_ty = bc_ty                      # q' rides the broadcast object
     # one per P1 pair: at 12 P1 cores pairs 0-3 emit 4 q objects and
     # pairs 4-5 emit 8, since the KV-carrying cores spend two slots on k/v
@@ -266,7 +267,7 @@ def _design(bc: In, {P}):
                            arg_types=[bc_ty, op_ty, p1o_ty],
                            compile_flags=FLAGS)
 
-    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_kvtile")
+    f_bc = ObjectFifo(bc_ty, depth=1, name=f"bc_nlay{NLAY}")
     bc_cons = [f_bc.cons() for _ in range({NCORES})]
     f_w = [ObjectFifo(oppair_ty, name=f"wp{{i}}_n{NROWS}k{KVPER}") for i in range({npairs})]
     w_sub = [f.cons().split([0, {OPERAND}], obj_types=[op_ty, op_ty]) for f in f_w]
@@ -438,7 +439,10 @@ def _design(bc: In, {P}):
             tg = TaskGroup()
             bch.fill(bcb, group=tg)
             for i in range({p1pairs}):     # partition B: only these pairs run P1
-                wh[i].fill(wb[i], group=tg)
+                wh[i].fill(wb[i], group=tg,
+                           offset=_lay * {p1_lsz},
+                           sizes=[1, 1, 1, {p1_lsz}],
+                           strides=[0, 0, 0, 1])
             QOBJ, KVPLAN = {qobj!r}, {kvplan!r}
             QBASE, HPCC = {qbase!r}, {hpcc!r}
             for i in range({p1pairs}):
@@ -630,30 +634,37 @@ def main():
     bc[2 * K_DIM + HEAD:] = cs_k
     bc_t = iron.tensor(bc.astype(bfloat16), dtype=bfloat16, device="npu")
     w_ts, ref = [], {}
+    # One buffer per pair holding NLAY layers back to back; the fill picks a
+    # layer by offset. This is what makes a layer-iterating dispatch run REAL
+    # layers instead of the same one repeatedly.
     for pr in range(p1pairs):
-        per = []
-        for j in range(2):
-            blob = []
-            for h in layout[2 * pr + j]:
-                first = h * HEAD
-                d, m, q = qkv_rows(c, o.layer, first, HEAD)
-                blob.append(np.concatenate([
-                    q4nx.pack_tile(d[i:i+NROWS], m[i:i+NROWS], q[i:i+NROWS],
-                                   row_base=first + i, flags=float(pos))
-                    for i in range(0, HEAD, NROWS)]))
-                v = rnd(np.concatenate([
-                    q4nx.gemv_reference_bf16(xn, d[i:i+NROWS], m[i:i+NROWS],
-                                             q[i:i+NROWS])
-                    for i in range(0, HEAD, NROWS)]))
-                if h < NQ:
-                    v = rope_ref(v, cs_q)
-                elif h < NK:
-                    v = rope_ref(v, cs_k)
-                ref[h] = rnd(v).astype(np.float64)
-            per.append(np.concatenate(blob))
-        b = np.empty((hpc * TPH, 2, wt), np.uint8)
-        b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
-        w_ts.append(iron.tensor(b.reshape(-1), dtype=np.uint8, device="npu"))
+        per_layer = []
+        for _lw in range(NLAY):
+            per = []
+            for j in range(2):
+                blob = []
+                for h in layout[2 * pr + j]:
+                    first = h * HEAD
+                    d, m, q = qkv_rows(c, o.layer + _lw, first, HEAD)
+                    blob.append(np.concatenate([
+                        q4nx.pack_tile(d[i:i+NROWS], m[i:i+NROWS], q[i:i+NROWS],
+                                       row_base=first + i, flags=float(pos))
+                        for i in range(0, HEAD, NROWS)]))
+                    v = rnd(np.concatenate([
+                        q4nx.gemv_reference_bf16(xn, d[i:i+NROWS], m[i:i+NROWS],
+                                                 q[i:i+NROWS])
+                        for i in range(0, HEAD, NROWS)]))
+                    if h < NQ:
+                        v = rope_ref(v, cs_q)
+                    elif h < NK:
+                        v = rope_ref(v, cs_k)
+                    ref[h] = rnd(v).astype(np.float64)
+                per.append(np.concatenate(blob))
+            b = np.empty((hpc * TPH, 2, wt), np.uint8)
+            b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, wt), per[1].reshape(-1, wt)
+            per_layer.append(b.reshape(-1))
+        w_ts.append(iron.tensor(np.concatenate(per_layer), dtype=np.uint8,
+                                device="npu"))
 
     # prior cache: positions 0..pos-1, laid out in OPERAND-sized head slots
     SLOT = KVSTRIDE

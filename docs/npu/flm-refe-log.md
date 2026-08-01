@@ -11142,3 +11142,34 @@ passing. What is NOT:
 So: a real token is not yet running. But every wall that made this look
 impossible — program memory, DMA fanin, routing — was a consequence of treating a
 layer as the dispatch unit, and none of them bind here.
+
+### Real successive layers in one dispatch — P1's weights, verified
+
+The layer loop previously reused one layer's weights, which measured the
+mechanism but not the thing. P1's weight buffer now holds NLAY layers back to
+back and the fill selects one by offset:
+
+    w_all_ty = np.ndarray[(NLAY * 2 * hpc * TPH * wt,), uint8]
+
+    wh[i].fill(wb[i], group=tg, offset=_lay * p1_lsz,
+               sizes=[1, 1, 1, p1_lsz], strides=[0, 0, 0, 1])
+
+At `NLAY=2, --layer 0` the dispatch runs layers **0 then 1**, and the checks
+compare against layer 1 (the last iteration, which is what `ref` holds):
+
+    P1 cache:  k' 0.0000e+00   v' 0.0000e+00      exact
+    P1 q':     1.5259e-04                          ~1 bf16 ulp at |q'| ~ 0.04
+
+So the second iteration really did use layer 1's weights. **A single dispatch can
+iterate real successive layers**, not just repeat one.
+
+The q' ULP rather than exact: both iterations normalise with the broadcast's
+`nw`, which is layer 0's `input_layernorm`. Layer 1's own norm weight is not yet
+supplied per iteration — that is the next piece, and it is why this is 1 ulp
+instead of 0.
+
+Still single-layer, and therefore still to do:
+
+  * P3's o_proj and P4's gate/up weights (same offset pattern, more packing)
+  * the per-layer RMSNorm weights on the broadcast
+  * the residual chaining layer to layer on device
