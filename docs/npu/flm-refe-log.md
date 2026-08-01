@@ -14818,3 +14818,38 @@ Writing the probe was still worth it: it is what turned "the API has `offset_par
 into "the value goes through `ParameterScratchpad`, not the design call", which is a
 host-side restructuring the fused design has to plan for. The probe failed and the
 knowledge survives, which is the correct outcome for a probe.
+
+### Group C's cores carry 2656 B of attention it never runs
+
+Sizing the functions in a `group_c` core ELF (`.text` total 14672 B, 90% of 16 KB):
+
+    3824  core_3_4              the core body itself
+    1888  flm_attn_tile         NEVER CALLED on these cores
+    1552  flm_gemv_up_swiglu
+    1248  flm_norm_prepare
+    1232  flm_gemv_q4_1_residual
+    1168  __divsf3
+     848  __mulsf3
+     544  flm_attn_finish       NEVER CALLED
+     464  flm_h_emit
+     288  flm_asum_prepare
+     224  flm_attn_begin        NEVER CALLED
+
+`group_c` is derived from `p1p2_chain` and still *declares* `flm_attn_begin`, `_tile` and
+`_finish` as `ExternalFunction`s. Its cores run only P3/P4/P5 and never call them, but
+they are linked in anyway: **2656 bytes, 18% of the core's program memory, of attention
+that cannot execute.**
+
+That matters for the fused design specifically. C's 90% occupancy was the tightest
+constraint in the whole fusion argument — the reason the C->A seam had to avoid new core
+code. Deleting three unused declarations takes C from 14672 to roughly 12016 B, 73%
+instead of 90%, which turns 1600 bytes of headroom into about 4400.
+
+It is the same derived-harness problem as the inherited attention CHECK and the inherited
+bench accounting, in a third form: the code was copied, the parts that do not apply were
+never removed, and nothing failed loudly enough to notice. Here it cost program memory
+rather than a wrong number.
+
+Not removed yet — `group_c` is the design every correctness result was measured on today,
+and touching its kernel set invalidates the cached builds behind those numbers. Worth
+doing deliberately, with the re-verification that implies, rather than as a drive-by.
