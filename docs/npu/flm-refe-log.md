@@ -11103,3 +11103,42 @@ parity for some time; what was missing was that a layer is not the dispatch unit
   * Side B's loop is unwritten.
 
 None of those are walls of the kind this session kept hitting — they are work.
+
+### Side B loops too — and the whole token now projects past FLM
+
+Same lever applied to `p5_pass`:
+
+    NLAY   total us   marginal us
+    1        287.8
+    4        851.0      187.7
+    16      3289.9      200.1
+
+**16 layers as one dispatch: 3289.9 us against 4604.8 us as sixteen — saves
+1315 us.** PASS at N = 1, 4 and 16.
+
+The per-layer saving here is 87.7 us, MORE than the 67.2 us dispatch floor. So
+re-dispatching costs something beyond the floor itself — plausibly the host-side
+fill/drain setup that a loop amortises. Side A's saving was 59.5 us, under the
+floor. I do not have an account for why the two differ; recording both rather
+than averaging them into a story.
+
+    today,  32 dispatches   17.74 ms -> 56.4 tok/s
+    looped,  2 dispatches   15.93 ms -> **62.8 tok/s**
+    FLM measured                        61.18 tok/s      **+2.6%**
+
+**This is the first configuration that projects faster than FLM**, and it does it
+at 2 dispatches per token against FLM's measured ~2.5.
+
+What is measured: both sides' 16-layer times, on device, with correctness checks
+passing. What is NOT:
+
+  * **Weights are reused across iterations.** A real token needs 16 distinct
+    weight sets. DMA volume per layer is identical so the timing should hold,
+    but the instruction stream grows and that is untested.
+  * **The residual does not chain between layers.** Each iteration is fed the
+    same `x`.
+  * **lm_head at 3700 us** is carried from an earlier measurement, not re-taken.
+
+So: a real token is not yet running. But every wall that made this look
+impossible — program memory, DMA fanin, routing — was a consequence of treating a
+layer as the dispatch unit, and none of them bind here.

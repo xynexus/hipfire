@@ -51,6 +51,9 @@ FIXED_US = 92.9
 rnd = lambda v: q4nx.bf16_to_f32(q4nx.f32_to_bf16(np.asarray(v, np.float32)))
 
 
+_NLAY = int(__import__("os").environ.get("CHAIN_NLAY", 1))
+
+
 def build(ncores):
     wt = q4nx.tile_bytes(K_DIM, NROWS)
     npairs = ncores // 2
@@ -96,7 +99,12 @@ def _design(bc: In, {params}):
         # asum prepare — g_asum is what the tile body's `m` term reads, and a
         # phase that skips it computes that term against the previous
         # activation's sums.
-        for _ in range_({NCHUNK}):
+        # Layer loop: side A measured ~60 us recovered per layer after the
+        # first by iterating inside ONE dispatch instead of re-dispatching.
+        # Same lever here. Weights are reused across iterations, so this
+        # measures the mechanism's cost, not a correct multi-layer result.
+        for _lay in range_({_NLAY}):
+          for _ in range_({NCHUNK}):
             eb = bcc.acquire(1)
             kasum(eb)
             for _ in range_({tiles}):
@@ -123,15 +131,16 @@ def _design(bc: In, {params}):
         bch = args[1 + 2 * n]
         wh = [args[2 + 2 * n + i] for i in range(n)]
         oh = [args[2 + 3 * n + i] for i in range(n)]
-        tg = TaskGroup()
-        for ch in range({NCHUNK}):
-            bch.fill(bcb, group=tg, offset=ch * 2 * {K_DIM},
-                     sizes=[1, 1, 1, 2 * {K_DIM}], strides=[0, 0, 0, 1])
-        for i in range(n):
-            wh[i].fill(wb[i], group=tg)
-        for i in range(n):
-            oh[i].drain(ob[i], wait=True, group=tg)
-        tg.finish()
+        for _lay in range({_NLAY}):    # one dispatch, _NLAY layer iterations
+            tg = TaskGroup()
+            for ch in range({NCHUNK}):
+                bch.fill(bcb, group=tg, offset=ch * 2 * {K_DIM},
+                         sizes=[1, 1, 1, 2 * {K_DIM}], strides=[0, 0, 0, 1])
+            for i in range(n):
+                wh[i].fill(wb[i], group=tg)
+            for i in range(n):
+                oh[i].drain(ob[i], wait=True, group=tg)
+            tg.finish()
 
     at = [bc_all_ty] + [w_all_ty] * {npairs} + [o_all_ty] * {npairs}
     at += [f_bc.prod(tile=AnyShimTile)]
