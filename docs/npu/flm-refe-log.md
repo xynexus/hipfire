@@ -14389,3 +14389,38 @@ ruled out by measurement rather than by argument, and the next person to look at
 will otherwise try the same two-byte write.
 
 The v side needs nothing: its pair points forward into a position not yet written.
+
+### Retraction: the K clobber is not a design fault, it is my test
+
+`flm_kv_pair.h` already does exactly what the previous two entries proposed as the fix:
+
+    inline bfloat16 g_kprev[DIM_HEAD] __attribute__((aligned(64)));
+    if (t & 1) { out[2*d] = g_kprev[d]; ... } else { g_kprev[d] = src[d]; ... }
+
+    even t:  (k'_t, 0)          -> column pair (t, t+1)
+    odd  t:  (k'_{t-1}, k'_t)   -> column pair (t-1, t)
+
+Every token lands in its own column, each pair is written twice — once opening, once
+closing — and `g_kprev` carries the previous token across the dispatch boundary in core
+.bss. The alignment constraint I "discovered" is stated in that header's first lines, as
+the reason the scheme exists.
+
+So the clobber I measured is an artefact of the test. `AB_REAL_CACHE` hands the device a
+cache whose prior positions the host wrote, then asks it to emit position 3 — but the
+device never processed position 2, so its `g_kprev` holds whatever the previous dispatch
+left. It faithfully wrote that into column 2. In a real sequential decode, `g_kprev`
+holds the k' the same core computed one token earlier, and the write is correct.
+
+I called this "the first genuine device-side design fault found today" and it is not
+one. The error was that I reasoned from the drain descriptor outward — offsets, sizes,
+alignment — and never opened the kernel that fills the object. Its header describes the
+whole mechanism, including the constraint I rediscovered by compile error, in the file I
+was already changing the caller of.
+
+The score for the day is unchanged: six harness or reference faults, zero device faults.
+
+What remains true and useful from those entries: a single-column write is genuinely
+unexpressible (4-byte alignment), and the v pair points forward while the k pair points
+backward. What is retracted: that multi-token decode cannot work as the design stands.
+It can; the test cannot, without either running positions in sequence or seeding
+`g_kprev`.
