@@ -63,7 +63,7 @@ flm_p1_emit(const uint8 *restrict wtile, bfloat16 *restrict out) {
   if (head >= DIM_QHEADS && head < DIM_QKHEADS) {
     // k': the column-pair form, carrying the previous token when this step
     // closes a pair. tile_flags() is the KV-cache position.
-    flm_kv_pair(g_stage, tile_flags(wtile), out);
+    flm_kv_pair(g_stage, tile_flags(wtile), tile_layer(wtile), out);
     return;
   }
   // Which slot of the result object this head occupies. Only Q heads pack into

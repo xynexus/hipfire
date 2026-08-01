@@ -66,7 +66,7 @@ extern "C" __attribute__((noinline)) void
 flm_kv_emit(const uint8 *restrict wtile, bfloat16 *restrict out) {
   const int head = tile_row_base(wtile) / DIM_HEAD;
   if (head >= DIM_QHEADS && head < DIM_QKHEADS) {
-    flm_kv_pair(g_stage, tile_flags(wtile), out);
+    flm_kv_pair(g_stage, tile_flags(wtile), tile_layer(wtile), out);
     return;
   }
   // v': the head, then ZEROS. The zeros land on cache row pos+1, a future

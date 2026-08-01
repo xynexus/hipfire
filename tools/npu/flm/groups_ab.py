@@ -186,7 +186,20 @@ def drain_plan(ncores=NCORES, group=2):
     return qobj, kvplan
 
 
-def build(pos, ncores=NCORES, seq=32):
+def build(pos, ncores=8, seq=32):
+    # Group B's attention output leaves through TWO joined fifos of four, so
+    # exactly eight cores can run it -- `ao_sub[c // 4][c % 4]` has no index for
+    # a ninth. At `ncores=16` the design source raises IndexError before a line
+    # of MLIR is emitted, which is what the default used to be and what the JIT
+    # cache hid: the build was never regenerated, so the recorded PASS came from
+    # an 8-core ELF while the default asked for 16. Found when a change to
+    # `flm_kv_pair.h` busted the cache and the generator ran for the first time
+    # in a long while. State the constraint rather than let it be an IndexError.
+    if ncores != 8:
+        raise SystemExit(
+            f"groups_ab runs {ncores} cores; group B's output is 2 joins of 4, "
+            f"so it supports exactly 8. Raising it needs more `f_ao` fifos, and "
+            f"the shim is the budget that decides how many.")
     # KV objects B streams per token: ceil(seq / TSEQ) at KVPER=1. attn_phase
     # derives the same way; here it must agree with the host's cache layout.
     nobj = -(-seq // (TSEQ * KVPER))
@@ -516,10 +529,9 @@ def main():
     p.add_argument("--pos", type=int, default=0, help="KV cache position")
     p.add_argument("--seq", type=int, default=32,
                    help="context length; sets how many KV objects B streams")
-    p.add_argument("--p1-cores", type=int, default=NCORES,
-                   help="how many cores run P1. Partition B uses 12: the four\n"
-                        "attention cores sit P1 out, so its 48 head-tiles spread\n"
-                        "over the remaining twelve.")
+    p.add_argument("--p1-cores", type=int, default=8,
+                   help="how many cores run P1. Group B's two 4-way output\n"
+                        "joins fix this at 8; see build().")
     p.add_argument("--bench", action="store_true",
                    help="time P1 alone, so P2's in-chain marginal can be\n"
                         "isolated against p1p2_chain --bench")

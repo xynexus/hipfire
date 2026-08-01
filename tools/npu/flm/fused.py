@@ -86,18 +86,30 @@ cache with non-zero prior V are both exercised:
 The device tracking the HOST's own distance from the oracle is the claim; 4-bit
 weights set how close either can get.
 
-**Odd positions are refused**, and for two reasons — see the log. The test-side
-one is parity: `flm_kv_pair` must write an aligned column PAIR, so an odd
-position also writes column t-1 out of `g_kprev`, which a single-shot run has not
-filled. The design-side one is worse and is not fixed: `g_kprev` is ONE
-head-wide static per core, while this design runs sixteen layers on that core, so
-at an odd position every layer would close its K pair with a different layer's
-key. Even positions never read `g_kprev`, which is why they are correct.
+**Odd positions work now, and only in sequence.** Two things had to land together:
 
-The KV cache is still built by the host. What is verified is one decode step onto
-a correct cache — not a sequence the device produced, which additionally needs
-`offset_parameter=` with a `ParameterScratchpad` so one xclbin serves every
-position.
+  * `g_kprev` is per LAYER (`kernels/npu/flm_kv_pair.h`). It was ONE head-wide
+    static per core while this design runs sixteen layers on that core, so an
+    odd position had layer 0 closing its K pair with layer 15's key. Even
+    positions never READ the carry, which is why pos 0/2/4 all verified and this
+    stayed invisible. The layer index rides the weight tile trailer's third f32.
+  * Position is a RUNTIME value: `kv_k_off`, `kv_v_off` and `aw_parity` are
+    `ScratchpadParameter`s on the drains and on A's weight fill. Every position
+    used to be its own xclbin, and loading one clears the core `.bss` that
+    `g_kprev` lives in -- which is why the first fix alone would not have worked.
+
+`--sequential` has the DEVICE decode positions 0..n-1 in order, so the cache it
+attends over is one it wrote and `g_kprev[layer]` holds the k' the same core
+computed one token earlier. That is the only configuration in which an odd
+position can be right, and `--tokens` without it still refuses one: there the
+host stages the cache, and an odd position would overwrite column t-1 with
+whatever the last dispatch left in the carry.
+
+    pos 1  argmax   220   oracle 2768 at +10.2370 against 220's +10.1084
+    pos 3  argmax 39935   the oracle's token       cos vs oracle 0.938162
+
+`decode.py` is the loop. Positions are capped at TSEQ=32, which is five short of
+FLM's shortest server context -- see the log for why TSEQ is not a free constant.
 
 `FUSED_STUB=ab|c|all` builds the same design with a group's COMPUTE replaced and
 its DMA untouched -- see the constant below and `_stubcheck.py`. It measured the
@@ -127,9 +139,9 @@ from groups_ab import head_layout, hpc_for, drain_plan, NQ, NK, NV  # noqa: E402
 import aie.iron as iron  # noqa: E402
 from aie.iron import In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker  # noqa: E402
 from aie.iron.controlflow import range_  # noqa: E402
-from aie.utils.benchmark import run_iters  # noqa: E402
 from aie.iron.device import AnyShimTile  # noqa: E402
 from aie.iron.kernel import ExternalFunction  # noqa: E402
+from aie.iron.scratchpad_parameter import ScratchpadParameter  # noqa: E402
 from ml_dtypes import bfloat16  # noqa: E402
 
 KDIR = Path(__file__).resolve().parents[3] / "kernels/npu"
@@ -150,7 +162,14 @@ Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
 
 NROWS = 8
 TPH = HEAD // NROWS                     # 8 weight tiles per head
-GQA, TSEQ, KVPER = 4, 32, 1
+# TSEQ = 40, not 32. The KV tile is 2*HEAD*TSEQ bf16 and must fit OPERAND, the
+# ONE object size every fifo in this design shares (it is also group C's q4nx
+# weight tile): 32 -> 8192 B, 40 -> 10240, 44 -> 11264 and it stops fitting. So
+# 40 is the largest context this design can hold without a second operand size.
+# KVSTRIDE = max(KTILE+VTILE, OPERAND//2) = max(5120, 5152) = 5152, exactly the
+# stride at TSEQ=32, so no cache offset moves. `flm_attn_decode` carries the
+# scores as a 32-lane vector plus an 8-lane tail to reach it.
+GQA, TSEQ, KVPER = 4, 40, 1
 NA = NB = 8                             # P1 cores, P2 cores
 NC, NCP = 16, 8                         # C cores, C pairs
 # A's weight fifos. Every one of them is a MEMTILE INPUT CHANNEL, and A streams
@@ -244,12 +263,11 @@ p3rows = lambda pr, j: [pr * RPP3 + t * 2 * NROWS + j * NROWS for t in range(P3T
 p4rows = lambda pr, j: [pr * RPP4 + j * (RPP4 // 2) + t * NROWS for t in range(P4T)]
 
 
-def build(pos, nlay, seq):
+def build(nlay, seq):
     nobj = -(-seq // (TSEQ * KVPER))
     if nobj != 1:
         raise SystemExit(f"seq {seq} needs {nobj} KV objects; the quad-split B "
                          f"stream delivers one per core per layer (seq <= {TSEQ})")
-    off = pos - (pos & 1)                       # the k pair's even column
     _, kvplan = drain_plan(NA, group=1)         # per CORE, in emit (slot) order
     for pr in range(NA // 2):
         a, b = kvplan[2 * pr], kvplan[2 * pr + 1]
@@ -269,9 +287,15 @@ def build(pos, nlay, seq):
     aoj_ty = np.ndarray[(4 * GQA * HEAD,), np.dtype[bfloat16]]
     p1o_ty = np.ndarray[(OBJ,), np.dtype[bfloat16]]
     p1p_ty = np.ndarray[(2 * OBJ,), np.dtype[bfloat16]]
-    # host buffers, by the role each argument plays
+    # host buffers, by the role each argument plays. A's weights are held TWICE,
+    # identical but for the tile trailer's `flags`: 0 in the first copy, 1 in the
+    # second. That flag is the k' emit's PARITY -- `flm_kv_pair` needs to know
+    # whether this token opens a column pair or closes one -- and the copy is
+    # selected at runtime by the `aw_parity` offset parameter. The alternative,
+    # patching 128 trailers in place per token, costs a partial cache flush per
+    # trailer; this costs 32 MB of DDR and nothing per token.
     x_ty = np.ndarray[((nlay + 1) * BLK,), np.dtype[bfloat16]]
-    aw_ty = np.ndarray[(nlay * A_LSZ,), np.dtype[np.uint8]]
+    aw_ty = np.ndarray[(2 * nlay * A_LSZ,), np.dtype[np.uint8]]
     kv_ty = np.ndarray[(nlay * CACHEB,), np.dtype[np.uint8]]
     h_ty = np.ndarray[(nlay * BC,), np.dtype[bfloat16]]
     sw_ty = np.ndarray[(D_FF + BC,), np.dtype[bfloat16]]
@@ -290,6 +314,12 @@ def build(pos, nlay, seq):
              # trailer because a core-to-core q has no host-written tail.
              "-DQOFF_FROM_KV=0", "-DNPAD_FROM_KV=1",
              f"-DATTN_MASK_PAD={MASKPAD}",
+             # One k' carry per LAYER. Sixteen layers run on the same P1 core
+             # inside one dispatch, so a single g_kprev would have layer 0 of
+             # the next token close its column pair with layer 15's key. Even
+             # positions never read the carry, which is why every result so far
+             # was at an even position and none of them saw it.
+             f"-DFLM_KV_LAYERS={1 << (nlay - 1).bit_length()}",
              f"-DDIM_RESN={2 * P3T * NROWS}", f"-DDIM_P3TILES={P3T}",
              f"-DDIM_OBJROWS={OBJ}", f"-DDIM_ACCN={2 * P5T * NROWS}",
              # P5's residual is the h THIS core stashed in P3 (same rows, same
@@ -306,7 +336,10 @@ def build(pos, nlay, seq):
     # With STUB="" `stubdefs` is the empty string and `src` below is character
     # for character what it was before stub mode existed -- so the verified
     # build stays a cache hit and its behaviour is untouched.
-    tag = f"fz{nlay}p{pos}s{seq}n{NROWS}m{MASKPAD}a{AQ}" + (f"S{STUB}" if STUB else "")
+    # No `p{pos}` any more: position is a RUNTIME value, so one xclbin serves
+    # every position -- which is what lets `g_kprev` survive from one token to
+    # the next, since a new xclbin would clear core .bss.
+    tag = f"fz{nlay}rs{seq}n{NROWS}t{TSEQ}m{MASKPAD}a{AQ}" + (f"S{STUB}" if STUB else "")
     stubs = {}
     stubdefs = ""
     for var, (grp, name, argexpr) in _STUBBABLE.items():
@@ -316,6 +349,14 @@ def build(pos, nlay, seq):
                          f'source_string=STUBS["{name}"],\n'
                          f'                            arg_types={argexpr}, '
                          f'compile_flags=FLAGS)\n')
+    # The three runtime values that make one xclbin serve every position. All
+    # are BYTE offsets added to a shim BD's address by the firmware, and all are
+    # multiples of 4 by construction (the BD address register has no finer
+    # granularity). See `set_position` for the values.
+    KOFF = ScratchpadParameter("kv_k_off", np.int32)
+    VOFF = ScratchpadParameter("kv_v_off", np.int32)
+    PAR = ScratchpadParameter("aw_parity", np.int32)
+
     P = "xin: In"
     P += ", " + ", ".join(f"aw{i}: In" for i in range(AQ))
     P += ", kvo: Out, kvi: In, xout: Out"
@@ -547,7 +588,10 @@ def _design({P}):
             bcah.fill(xin, group=tg, offset=L * {BLK} + {K_DIM},
                       sizes=[1, 1, 1, {BC}], strides=[0, 0, 0, 1])
             for i in range({AQ}):
+                # PAR selects the flags=0 or flags=1 copy of A's weights, which
+                # is how the k' emit learns this token's parity.
                 awh[i].fill(awb[i], group=tg, offset=L * {A_LSZ},
+                            offset_parameter=PAR,
                             sizes=[1, 1, 1, {A_LSZ}], strides=[0, 0, 0, 1])
             for pr in range({NA // 2}):
                 for slot, (kind, base) in enumerate(KVPLAN[2 * pr]):
@@ -557,16 +601,23 @@ def _design({P}):
                         # flm_kv_pair closes the pair with the previous token's
                         # k' out of g_kprev, which survives because nothing is
                         # reloaded between layers.
+                        #
+                        # KOFF carries 2*(pos - (pos&1)) BYTES at runtime. The
+                        # buffer is uint8, so the firmware's `mul by element
+                        # size` is a multiply by one and the parameter is a byte
+                        # count. It is a multiple of 4 by construction, which
+                        # the BD address register requires.
                         akvh[pr].drain(kvo, wait=True, group=tg,
-                                       offset=L * {CACHEB}
-                                              + 2 * (base * {KVSTRIDE} + {off}),
+                                       offset=L * {CACHEB} + 2 * base * {KVSTRIDE},
+                                       offset_parameter=KOFF,
                                        sizes=[1, 2, {HEAD}, 4],
                                        strides=[0, 2 * {KVSTRIDE}, 2 * {TSEQ}, 1])
                     else:
+                        # VOFF carries 2 * pos * HEAD bytes, also a multiple of 4.
                         akvh[pr].drain(kvo, wait=True, group=tg,
                                        offset=L * {CACHEB}
-                                              + 2 * (base * {KVSTRIDE} + {KTILE}
-                                                     + {pos} * {HEAD}),
+                                              + 2 * (base * {KVSTRIDE} + {KTILE}),
+                                       offset_parameter=VOFF,
                                        sizes=[1, 2, 1, 2 * {OBJ}],
                                        strides=[0, 2 * {KVSTRIDE}, 0, 1])
             tg.finish()
@@ -663,13 +714,227 @@ def _design({P}):
               ao_ty=ao_ty, aoj_ty=aoj_ty, p1o_ty=p1o_ty, p1p_ty=p1p_ty,
               ASPL=ASPL, x_ty=x_ty, aw_ty=aw_ty, kv_ty=kv_ty, h_ty=h_ty, sw_ty=sw_ty,
               w3_ty=w3_ty, w4_ty=w4_ty, w5_ty=w5_ty,
+              KOFF=KOFF, VOFF=VOFF, PAR=PAR,
               __name__="flm_fused")
     exec(src, ns)
     return iron.jit(ns["_design"],
                     source_files=[QKV_SRC, EMIT_SRC, KVE_SRC, NORM_SRC, ATT_SRC,
                                   BEG_SRC, FIN_SRC, RES_SRC, ASUM_SRC,
                                   HEMIT_SRC, DOWN_SRC, GATE_SRC, UPS_SRC],
+                    # emits params.txt (name -> state-table slot) beside the
+                    # cached ELF; `ParameterScratchpad` reads it. The control
+                    # scratchpad BO itself comes from the design declaring a
+                    # ScratchpadParameter, not from this flag.
+                    aiecc_flags=["--get-scratchpad-parameters"],
                     full_elf=True)
+
+
+class Session:
+    """One xclbin, one held `pyxrt.run`, every buffer built once.
+
+    Position is a RUNTIME value here, so nothing is rebuilt or reloaded between
+    tokens -- which is exactly what lets each P1 core's `g_kprev[layer]` carry
+    the k' it computed for the PREVIOUS token, and therefore what makes an odd
+    position, and a sequential decode, possible at all.
+
+    Three runtime byte offsets carry the position (`_set_position`), and the
+    only host work per token is 213 KB of x/RoPE, 512 bytes of `npad`, and three
+    scratchpad writes.
+    """
+
+    def __init__(self, c, nlay=16, L0=0, seq=1, quiet=False):
+        self.c, self.nlay, self.L0, self.seq = c, nlay, L0, seq
+        self.pos = None
+        import host_forward as hf
+        self.hf = hf
+
+        design = build(nlay, seq)
+        from pyxrt_design import PyxrtDesign
+        self.drv = design if isinstance(design, PyxrtDesign) else \
+            PyxrtDesign(design, quiet=quiet)
+
+        # ---- host buffers, everything position-INDEPENDENT ------------------
+        xbuf = np.zeros((nlay + 1) * BLK, np.float32)
+        for L in range(nlay):
+            nw = c.bf16(f"model.layers.{L0 + L}.input_layernorm.weight"
+                        ).astype(np.float32)[:K_DIM]
+            xbuf[L * BLK + 2 * K_DIM:L * BLK + 3 * K_DIM] = nw
+        self.xbuf_t = iron.tensor(xbuf.astype(bfloat16), dtype=bfloat16,
+                                  device="npu")
+
+        hbuf = np.zeros(nlay * BC, np.float32)
+        for L in range(nlay):
+            nw2 = c.bf16(f"model.layers.{L0 + L}.post_attention_layernorm.weight"
+                         ).astype(np.float32)[:K_DIM]
+            hbuf[L * BC + K_DIM:L * BC + 2 * K_DIM] = nw2
+        self.hbuf_t = iron.tensor(hbuf.astype(bfloat16), dtype=bfloat16,
+                                  device="npu")
+        self.sw_t = iron.zeros(D_FF + BC, dtype=bfloat16, device="npu")
+        self.cache_t = iron.tensor(np.zeros(nlay * CACHEB, np.uint8),
+                                   dtype=np.uint8, device="npu")
+
+        self._pack_weights()
+        self.args = (self.xbuf_t, *self.aw_ts, self.cache_t, self.cache_t,
+                     self.xbuf_t, self.hbuf_t, self.hbuf_t, self.sw_t, self.sw_t,
+                     *self.w3_ts, *self.w4_ts, *self.w5_ts)
+        self.drv.bind(*self.args)
+        self.params = self.drv.parameters()
+
+    # ---- weights -----------------------------------------------------------
+    def _pack_weights(self):
+        """LAYER-OUTER, so only one layer's tensors are ever live: a
+        per-pair-outer loop would hold gate/up/down for every layer at once,
+        which is 500 MB of decoded blocks before a single tile is packed."""
+        c, nlay, L0 = self.c, self.nlay, self.L0
+        layout = head_layout(NA)
+        nbc3, nbc4, nbc5 = K_DIM // 32, K_DIM // 32, D_FF // 32
+        aw_p = [[] for _ in range(AQ)]
+        w3_p = [[] for _ in range(NCP)]
+        w4_p = [[] for _ in range(NCP)]
+        w5_p = [[] for _ in range(NCP)]
+        for L in range(nlay):
+            LL = L0 + L
+            for q in range(AQ):
+                per = []
+                for j in range(ASPL):
+                    blob = []
+                    for h in layout[ASPL * q + j]:
+                        first = h * HEAD
+                        d, m, qq = qkv_rows(c, LL, first, HEAD)
+                        # `layer` is what makes g_kprev per-layer; `flags` is the
+                        # k' emit's parity and is 0 in this, the even copy.
+                        blob.append(np.concatenate([
+                            q4nx.pack_tile(d[i:i + NROWS], m[i:i + NROWS],
+                                           qq[i:i + NROWS], row_base=first + i,
+                                           flags=0.0, layer=float(L))
+                            for i in range(0, HEAD, NROWS)]))
+                    per.append(np.concatenate(blob))
+                b = np.empty((HPC * TPH, ASPL, WT), np.uint8)
+                for j in range(ASPL):
+                    b[:, j, :] = per[j].reshape(-1, WT)
+                aw_p[q].append(b.reshape(-1))
+
+            od, om, oc = q4nx.q4nx_tensor_blocks(
+                c, f"model.layers.{LL}.self_attn.o_proj.weight", (K_DIM, K_DIM))
+            for pr in range(NCP):
+                per = [np.concatenate([
+                    q4nx.pack_tile(od[r0:r0 + NROWS, :nbc3], om[r0:r0 + NROWS, :nbc3],
+                                   oc[r0:r0 + NROWS, :nbc3], row_base=r0, flags=0.0)
+                    for r0 in p3rows(pr, j)]) for j in range(2)]
+                b = np.empty((P3T, 2, WT), np.uint8)
+                b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, WT), per[1].reshape(-1, WT)
+                w3_p[pr].append(b.reshape(-1))
+            del od, om, oc
+
+            gd, gm, gc = q4nx.q4nx_tensor_blocks(
+                c, f"model.layers.{LL}.mlp.gate_proj.weight", (D_FF, K_DIM))
+            ud, um, uc = q4nx.q4nx_tensor_blocks(
+                c, f"model.layers.{LL}.mlp.up_proj.weight", (D_FF, K_DIM))
+            for pr in range(NCP):
+                per = []
+                for j in range(2):
+                    blob = []
+                    for r0 in p4rows(pr, j):
+                        sl = slice(r0, r0 + NROWS)
+                        blob.append(q4nx.pack_tile(gd[sl, :nbc4], gm[sl, :nbc4],
+                                                   gc[sl, :nbc4], row_base=r0, flags=0.0))
+                        blob.append(q4nx.pack_tile(ud[sl, :nbc4], um[sl, :nbc4],
+                                                   uc[sl, :nbc4], row_base=r0, flags=0.0))
+                    per.append(np.concatenate(blob))
+                b = np.empty((2 * P4T, 2, WT), np.uint8)
+                b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, WT), per[1].reshape(-1, WT)
+                w4_p[pr].append(b.reshape(-1))
+            del gd, gm, gc, ud, um, uc
+
+            dd, dm, dc = q4nx.q4nx_tensor_blocks(
+                c, f"model.layers.{LL}.mlp.down_proj.weight", (K_DIM, D_FF))
+            for pr in range(NCP):
+                per = []
+                for j in range(2):
+                    blob = []
+                    for ch in range(NCHUNK):
+                        lo, hi = ch * (nbc5 // NCHUNK), (ch + 1) * (nbc5 // NCHUNK)
+                        for r0 in p3rows(pr, j):     # p5rows == p3rows, by design:
+                            sl = slice(r0, r0 + NROWS)   # P5's residual is the h THIS
+                            blob.append(q4nx.pack_tile(  # core stashed in P3
+                                dd[sl, lo:hi], dm[sl, lo:hi], dc[sl, lo:hi],
+                                row_base=r0, flags=float(ch == NCHUNK - 1)))
+                    per.append(np.concatenate(blob))
+                b = np.empty((NCHUNK * P5T, 2, WT), np.uint8)
+                b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, WT), per[1].reshape(-1, WT)
+                w5_p[pr].append(b.reshape(-1))
+            del dd, dm, dc
+
+        T = lambda parts: iron.tensor(np.concatenate(parts), dtype=np.uint8,
+                                      device="npu")
+        self.aw_ts = [_aw_tensor(p) for p in aw_p]
+        self.w3_ts = [T(p) for p in w3_p]
+        self.w4_ts = [T(p) for p in w4_p]
+        self.w5_ts = [T(p) for p in w5_p]
+
+    # ---- per-token host writes ---------------------------------------------
+    def set_x0(self, x0):
+        self.xbuf_t.numpy()[K_DIM:2 * K_DIM] = np.asarray(x0, bfloat16)
+
+    def set_position(self, pos):
+        """RoPE into every layer's block, `npad` into every head's trailer, and
+        the three runtime offsets. Nothing else changes with position."""
+        if pos + 1 > TSEQ:
+            raise SystemExit(f"position {pos} needs a cache longer than TSEQ={TSEQ}")
+        cs_q, cs_k = self.hf.rope_cs(self.c, pos)
+        xb = self.xbuf_t.numpy()
+        for L in range(self.nlay):
+            b = L * BLK + 3 * K_DIM
+            xb[b:b + HEAD] = np.asarray(cs_q, bfloat16)
+            xb[b + HEAD:b + 2 * HEAD] = np.asarray(cs_k, bfloat16)
+        npad = np.float32(TSEQ * KVPER - (pos + 1)).tobytes()
+        cb = self.cache_t.numpy()
+        for L in range(self.nlay):
+            for g in range(8):
+                o = L * CACHEB + g * OPERAND + OPERAND - 60
+                cb[o:o + 4] = np.frombuffer(npad, np.uint8)
+        # The three runtime BYTE offsets. Each is a multiple of 4, which the BD
+        # address register requires, and each is added to a static base the
+        # design already carries.
+        self.params.write("kv_k_off", np.int32(2 * (pos - (pos & 1))))
+        self.params.write("kv_v_off", np.int32(2 * pos * HEAD))
+        self.params.write("aw_parity", np.int32((pos & 1) * self.nlay * A_LSZ))
+        self.params.sync()
+        self.pos = pos
+
+    def x_out(self):
+        n = self.nlay * BLK
+        return self.xbuf_t.numpy()[n + K_DIM:n + 2 * K_DIM].astype(np.float64)
+
+    def step(self, x0, pos):
+        """One token: host writes, one dispatch, x_out. Returns (x_out, us)."""
+        self.set_x0(x0)
+        self.set_position(pos)
+        self.xbuf_t._sync_to_device()
+        self.cache_t._sync_to_device()
+        us = self.drv.dispatch()
+        self.xbuf_t._sync_from_device()
+        return self.x_out(), us
+
+
+def _aw_tensor(parts):
+    """A's weight tensor, held TWICE: identical but for the tile trailer's
+    `flags`, 0 in the first copy and 1 in the second.
+
+    That flag is the k' emit's PARITY -- `flm_kv_pair` needs to know whether
+    this token opens a column pair or closes one -- and the copy is selected at
+    runtime by the `aw_parity` offset parameter. A's tiles use `flags` for
+    nothing else (only `flm_gemv_down` does, and no A tile reaches it), so
+    setting it in every tile of the odd copy is safe and needs no tile-index
+    arithmetic. The alternative, patching the 128 k-head trailers in place per
+    token, costs a partial cache flush each; this costs 32 MB of DDR and nothing
+    per token.
+    """
+    even = np.concatenate(parts)
+    odd = even.copy()
+    one = np.frombuffer(np.float32(1.0).tobytes(), np.uint8)
+    odd.reshape(-1, WT)[:, WT - 60:WT - 56] = one
+    return iron.tensor(np.concatenate([even, odd]), dtype=np.uint8, device="npu")
 
 
 def main():
@@ -687,6 +952,10 @@ def main():
                                     "which sets --pos, --seq and --x0. n-1 must be "
                                     "EVEN -- see the parity note below.")
     p.add_argument("--save", help="write the final x_out to .npy")
+    p.add_argument("--sequential", action="store_true",
+                   help="with --tokens: the DEVICE decodes positions 0..n-1 in "
+                        "order, carrying its own KV cache, instead of the host "
+                        "prefilling it. The only way an ODD position is right.")
     p.add_argument("--bench", action="store_true")
     p.add_argument("--no-ref", action="store_true",
                    help="skip the host reference chain (it costs minutes)")
@@ -705,24 +974,26 @@ def main():
         # (k'_{t-1}, k'_t) -> columns (t-1, t), and k'_{t-1} comes from
         # `g_kprev`, a static in core .bss holding whatever the LAST dispatch
         # left. A single-shot odd position therefore destroys position t-1 of a
-        # host-built cache. That is a property of the test, not of the design:
-        # in a real sequential decode g_kprev holds the k' this same core
-        # computed one token earlier and the write is correct. Verifying an odd
-        # position needs the device to have decoded t-1 itself.
-        if pos & 1:
+        # HOST-BUILT cache, which is what `--tokens` stages. That is a property
+        # of this test, not of the design: in a sequential decode g_kprev holds
+        # the k' this same core computed one token earlier and the write is
+        # correct. `--sequential` does exactly that -- the device decodes every
+        # position 0..pos itself -- and it is how an odd position is verified.
+        if pos & 1 and not o.sequential:
             raise SystemExit(
                 f"decode position {pos} is ODD: closing its K column pair needs "
-                f"the previous token's k' out of g_kprev, which a single-shot "
-                f"run does not have. Use an even position (an odd token count).")
+                f"the previous token's k' out of g_kprev, which a HOST-prefilled "
+                f"single shot does not have. Use --sequential, which has the "
+                f"device decode 0..{pos} itself, or an even position.")
         if pos + 1 > TSEQ:
             raise SystemExit(f"position {pos} needs a cache longer than TSEQ={TSEQ}")
 
     c = q4nx.Q4nx(str(Q4NX))
     import host_forward as hf
-    cs_q, cs_k = hf.rope_cs(c, pos)
 
     rng = np.random.default_rng(0)
     prior = [None] * nlay
+    emb = None
     if toks:
         emb = c.bf16("model.embed_tokens.weight").astype(np.float32).reshape(-1, K_DIM)
         x0 = rnd(emb[toks[pos]])
@@ -747,43 +1018,16 @@ def main():
                   f"test of multi-position attention.")
 
     print(f"fused: 32 cores, {nlay} layers, ONE dispatch, layer {L0}, pos {pos}")
-    design = build(pos, nlay, seq)
+    s = Session(c, nlay=nlay, L0=L0, seq=seq)
+    xbuf_t, hbuf_t, sw_t, cache_t = s.xbuf_t, s.hbuf_t, s.sw_t, s.cache_t
 
-    # ---- host buffers ------------------------------------------------------
-    xbuf = np.zeros((nlay + 1) * BLK, np.float32)
-    for L in range(nlay):
-        nw = c.bf16(f"model.layers.{L0 + L}.input_layernorm.weight"
-                    ).astype(np.float32)[:K_DIM]
-        b = L * BLK
-        xbuf[b + 2 * K_DIM:b + 3 * K_DIM] = nw
-        xbuf[b + 3 * K_DIM:b + 3 * K_DIM + HEAD] = cs_q
-        xbuf[b + 3 * K_DIM + HEAD:b + BLK] = cs_k
-    xbuf[K_DIM:2 * K_DIM] = x0                       # block 0's x, the only one
-    xbuf_t = iron.tensor(xbuf.astype(bfloat16), dtype=bfloat16, device="npu")
-
-    hbuf = np.zeros(nlay * BC, np.float32)
-    for L in range(nlay):
-        nw2 = c.bf16(f"model.layers.{L0 + L}.post_attention_layernorm.weight"
-                     ).astype(np.float32)[:K_DIM]
-        hbuf[L * BC + K_DIM:L * BC + 2 * K_DIM] = nw2
-    hbuf_t = iron.tensor(hbuf.astype(bfloat16), dtype=bfloat16, device="npu")
-    sw_t = iron.zeros(D_FF + BC, dtype=bfloat16, device="npu")
-
-    # ---- the KV cache: one block per layer, npad in every head's trailer ----
-    nobj = -(-seq // (TSEQ * KVPER))
-    npad = TSEQ * nobj * KVPER - (pos + 1)
-    cache = np.zeros(nlay * CACHEB, np.uint8)
-    for L in range(nlay):
-        for g in range(8):
-            off = L * CACHEB + g * OPERAND + OPERAND - 60
-            cache[off:off + 4] = np.array([float(npad)], np.float32).view(np.uint8)
     if toks:
         # The prior positions, in the layout the drains write and P2 reads back:
         # K channel-major [HEAD][TSEQ], V position-major [TSEQ][HEAD], per KV
         # group at `g * KVSTRIDE` bf16 elements inside the layer's block. The
         # device writes only columns/rows `pos` and `pos+1`, so everything below
         # `pos` is exactly what is put here.
-        cv = cache.view(np.uint16)
+        cv = cache_t.numpy().view(np.uint16)
         for L in range(nlay):
             base = L * (CACHEB // 2)
             for g in range(8):
@@ -792,113 +1036,45 @@ def main():
                 Vt = cv[b + KTILE:b + KTILE + VTILE].reshape(TSEQ, HEAD)
                 Kt[:, :pos] = np.asarray(prior[L][0][:, g], bfloat16).view(np.uint16).T
                 Vt[:pos] = np.asarray(prior[L][1][:, g], bfloat16).view(np.uint16)
-    cache_t = iron.tensor(cache, dtype=np.uint8, device="npu")
 
-    # ---- weights: LAYER-OUTER, so only one layer's tensors are ever live ----
-    # A per-pair-outer loop would hold gate/up/down for every layer at once,
-    # which is 500 MB of decoded blocks before a single tile is packed.
-    layout = head_layout(NA)
-    nbc3, nbc4, nbc5 = K_DIM // 32, K_DIM // 32, D_FF // 32
-    aw_p = [[] for _ in range(AQ)]
-    w3_p = [[] for _ in range(NCP)]
-    w4_p = [[] for _ in range(NCP)]
-    w5_p = [[] for _ in range(NCP)]
-    for L in range(nlay):
-        LL = L0 + L
-        for q in range(AQ):
-            per = []
-            for j in range(ASPL):
-                blob = []
-                for h in layout[ASPL * q + j]:
-                    first = h * HEAD
-                    d, m, qq = qkv_rows(c, LL, first, HEAD)
-                    blob.append(np.concatenate([
-                        q4nx.pack_tile(d[i:i + NROWS], m[i:i + NROWS],
-                                       qq[i:i + NROWS], row_base=first + i,
-                                       flags=float(pos))
-                        for i in range(0, HEAD, NROWS)]))
-                per.append(np.concatenate(blob))
-            b = np.empty((HPC * TPH, ASPL, WT), np.uint8)
-            for j in range(ASPL):
-                b[:, j, :] = per[j].reshape(-1, WT)
-            aw_p[q].append(b.reshape(-1))
-
-        od, om, oc = q4nx.q4nx_tensor_blocks(
-            c, f"model.layers.{LL}.self_attn.o_proj.weight", (K_DIM, K_DIM))
-        for pr in range(NCP):
-            per = [np.concatenate([
-                q4nx.pack_tile(od[r0:r0 + NROWS, :nbc3], om[r0:r0 + NROWS, :nbc3],
-                               oc[r0:r0 + NROWS, :nbc3], row_base=r0, flags=0.0)
-                for r0 in p3rows(pr, j)]) for j in range(2)]
-            b = np.empty((P3T, 2, WT), np.uint8)
-            b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, WT), per[1].reshape(-1, WT)
-            w3_p[pr].append(b.reshape(-1))
-        del od, om, oc
-
-        gd, gm, gc = q4nx.q4nx_tensor_blocks(
-            c, f"model.layers.{LL}.mlp.gate_proj.weight", (D_FF, K_DIM))
-        ud, um, uc = q4nx.q4nx_tensor_blocks(
-            c, f"model.layers.{LL}.mlp.up_proj.weight", (D_FF, K_DIM))
-        for pr in range(NCP):
-            per = []
-            for j in range(2):
-                blob = []
-                for r0 in p4rows(pr, j):
-                    sl = slice(r0, r0 + NROWS)
-                    blob.append(q4nx.pack_tile(gd[sl, :nbc4], gm[sl, :nbc4],
-                                               gc[sl, :nbc4], row_base=r0, flags=0.0))
-                    blob.append(q4nx.pack_tile(ud[sl, :nbc4], um[sl, :nbc4],
-                                               uc[sl, :nbc4], row_base=r0, flags=0.0))
-                per.append(np.concatenate(blob))
-            b = np.empty((2 * P4T, 2, WT), np.uint8)
-            b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, WT), per[1].reshape(-1, WT)
-            w4_p[pr].append(b.reshape(-1))
-        del gd, gm, gc, ud, um, uc
-
-        dd, dm, dc = q4nx.q4nx_tensor_blocks(
-            c, f"model.layers.{LL}.mlp.down_proj.weight", (K_DIM, D_FF))
-        for pr in range(NCP):
-            per = []
-            for j in range(2):
-                blob = []
-                for ch in range(NCHUNK):
-                    lo, hi = ch * (nbc5 // NCHUNK), (ch + 1) * (nbc5 // NCHUNK)
-                    for r0 in p3rows(pr, j):     # p5rows == p3rows, by design:
-                        sl = slice(r0, r0 + NROWS)   # P5's residual is the h THIS
-                        blob.append(q4nx.pack_tile(  # core stashed in P3
-                            dd[sl, lo:hi], dm[sl, lo:hi], dc[sl, lo:hi],
-                            row_base=r0, flags=float(ch == NCHUNK - 1)))
-                per.append(np.concatenate(blob))
-            b = np.empty((NCHUNK * P5T, 2, WT), np.uint8)
-            b[:, 0, :], b[:, 1, :] = per[0].reshape(-1, WT), per[1].reshape(-1, WT)
-            w5_p[pr].append(b.reshape(-1))
-        del dd, dm, dc
-
-    T = lambda parts: iron.tensor(np.concatenate(parts), dtype=np.uint8,
-                                  device="npu")
-    aw_ts = [T(p) for p in aw_p]
-    w3_ts = [T(p) for p in w3_p]
-    w4_ts = [T(p) for p in w4_p]
-    w5_ts = [T(p) for p in w5_p]
-    del aw_p, w3_p, w4_p, w5_p
-
-    args = (xbuf_t, *aw_ts, cache_t, cache_t, xbuf_t, hbuf_t, hbuf_t,
-            sw_t, sw_t, *w3_ts, *w4_ts, *w5_ts)
-    if o.bench:
-        b = run_iters(design, *args, warmup=2, iters=10)
-        us = b.npu.min_us if b.npu else b.e2e.min_us
+    if o.sequential:
+        # The device decodes every position itself, so its own P1 wrote every
+        # entry of the cache below `pos` and `g_kprev[layer]` holds the k' the
+        # SAME core computed one token earlier. That is the only configuration
+        # in which an odd position can be right, and it is the one a real decode
+        # loop is in. The host prefill above is skipped entirely.
+        assert toks, "--sequential needs --tokens"
+        cache_t.numpy().fill(0)
+        for t in range(pos + 1):
+            _, us = s.step(rnd(emb[toks[t]]), t)
+            print(f"  seq pos {t:2d}  tok {toks[t]:6d}  {us:8.1f} us")
+    elif o.bench:
+        # Wall clock on a HELD run, which is the honest number: with the run
+        # object held, wall time IS the NPU time (12874 wall against a 12843 npu
+        # average, two clocks). Driven by the iron.jit callable it is 18.6 ms,
+        # and the difference is host-side buffer rebinding.
+        s.set_x0(x0)
+        s.set_position(pos)
+        xbuf_t._sync_to_device()
+        cache_t._sync_to_device()
+        t = np.array([s.drv.dispatch() for _ in range(12)])[1:]
+        us = float(np.median(t))
         mb = (nlay * (AQ * A_LSZ + NCP * (P3_LSZ + P4_LSZ + P5_LSZ))) / 1e6
-        LM_HEAD_US = 2994.2                   # measured at its own size, 163.7 MB
-        tok = us + LM_HEAD_US
+        LM_HEAD_US = 3010.6                   # held-run wall, measured at its size
+        tok = us + LM_HEAD_US + 10.5          # + the measured host term
         print(f"  bench: {mb:.2f} MB  {mb * 1e3 / us:.1f} GB/s  {us:.1f} us "
-              f"for {nlay} layers in ONE dispatch")
+              f"for {nlay} layers in ONE dispatch  (n=11 held-run wall, "
+              f"min {t.min():.1f} max {t.max():.1f})")
         print(f"         {us / nlay:.1f} us/layer   "
-              f"token = {us:.1f} + {LM_HEAD_US} = {tok:.1f} us "
+              f"token = {us:.1f} + {LM_HEAD_US} + 10.5 = {tok:.1f} us "
               f"-> {1e6 / tok:.1f} tok/s   (FLM 61.18)")
+        xbuf_t._sync_from_device()
     else:
-        design(*args)
+        s.step(x0, pos)
 
     # ---- read back ---------------------------------------------------------
+    hbuf_t._sync_from_device()
+    sw_t._sync_from_device()
     xg = xbuf_t.numpy().astype(np.float64)
     hg = hbuf_t.numpy().astype(np.float64)
     swg = sw_t.numpy().astype(np.float64)
