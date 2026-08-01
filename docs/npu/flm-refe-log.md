@@ -13164,3 +13164,35 @@ here; A+B is the direction, and A+B is bit-exact at position 0.
 
 Unchanged after the second edit: `p1p2_chain` mask off at seq=31 (3.4631e-03),
 A+B at pos 0 (0.00 ULP) and pos 30 (0.76 ULP).
+
+### Projection with C's layer slope measured: 62.4 tok/s
+
+    A+B  16 layers :   2030.5 us   (marginal 121.1 x 16, ASSUMED to repeat)
+    C    16 layers :  10299.3 us   (marginal 637.9 x 16, MEASURED slope)
+    lm_head        :   3700.0 us   (carried, not re-measured)
+    token          :  16029.8 us  ->  62.4 tok/s    FLM 61.18, +2.0%
+
+This supersedes the 61.8 figure, which assumed C's per-layer cost. C's slope is now
+measured directly — NLAY=1 at 735.4 us and NLAY=2 at 1373.3 gives 637.9 us per
+additional layer, against a 16-core issue-bound ideal of 612.1, so 96% of ideal.
+
+Three terms are weaker than that one, and the margin over FLM is smaller than their
+combined uncertainty:
+
+**A+B's 121.1 us marginal is not a slope.** It is one layer's cost inside one
+dispatch, and A+B has no layer loop at all yet. Multiplying it by 16 assumes the
+loop will behave the way C's does. C's did — its marginal held constant from one
+layer to two — which is evidence for the method, not for A+B.
+
+**The handoff is not in the number.** A+B and C are still separate dispatches with
+nothing wired between them; staging attention output from one to the other costs
+something, and that cost is currently zero in this arithmetic.
+
+**lm_head's 3700 us is carried forward** from an older measurement and is 23% of the
+token. It has not been re-measured against any of this work.
+
+So 62.4 tok/s is one measured slope, one assumed slope, one missing term and one
+inherited constant. +2.0% over FLM is inside that error bar, not outside it. The
+honest claim is that the architecture is *at parity or slightly ahead* on projection,
+and that giving A+B a layer loop is what would turn the largest assumption into a
+measurement.
