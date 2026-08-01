@@ -26,6 +26,7 @@ within a core's two input channels:
 """
 
 import argparse
+import os
 import math
 import sys
 from pathlib import Path
@@ -198,6 +199,8 @@ def build(pos, nobj):
     # This list must match `at` element for element. Weights and q results are
     # per P1 PAIR (only those cores run P1); the cache, P3's weights and P3's
     # results are per pair, since every core runs P3.
+    only = os.environ.get("C_ONLY", "")
+    do3, do4 = only not in ("5", "45"), only != "5"
     P = "bc3: In"
     P += ", " + ", ".join(f"w3_{i}: In" for i in range(npairs))
     P += ", " + ", ".join(f"h{i}: Out" for i in range(npairs))
@@ -345,8 +348,10 @@ def _design({P}):
         """The projection phases only. P1 and P2 run on the array's other cores,
         so this carries three bodies where four overflowed."""
         for _lay in range_({NLAY}):
-          p3_body(bcc, wc, op, kres, kasum, khemit)
-          p4_body(bcc, wc, op, kgate, kups, kprep)
+          if {do3}:
+              p3_body(bcc, wc, op, kres, kasum, khemit)
+          if {do4}:
+              p4_body(bcc, wc, op, kgate, kups, kprep)
           p5_body(bcc, wc, op, kdown, kasum)
 
     workers = []
@@ -380,6 +385,7 @@ def _design({P}):
         oh = [args[h0 + 1 + n + i] for i in range(n)]
 
         for _lay in range({NLAY}):
+          if {do3}:
             tg = TaskGroup()
             bch.fill(bc3b, group=tg, offset=_lay * {BCN1},
                      sizes=[1, 1, 1, {BCN1}], strides=[0, 0, 0, 1])
@@ -393,6 +399,7 @@ def _design({P}):
                             strides=[0, {NROWS}, {2 * NROWS}, 1])
             tg.finish()
 
+          if {do4}:
             tg = TaskGroup()
             bch.fill(bc4b, group=tg)
             for i in range(n):
@@ -405,6 +412,7 @@ def _design({P}):
                             strides=[0, {OBJ}, {rpp4} // 2, 1])
             tg.finish()
 
+          if True:
             tg = TaskGroup()
             for ch in range({NCHUNK}):
                 # each chunk is a DIFFERENT slice of sw; filling the same block
@@ -438,7 +446,7 @@ def _design({P}):
               p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty, attn_all_ty=attn_all_ty, w3_ty=w3_ty, h_ty=h_ty, p3tiles=p3tiles,
               w4_ty=w4_ty, sw_ty=sw_ty, p4tiles=p4tiles,
               w5_ty=w5_ty, o5_ty=o5_ty, bc5_ty=bc5_ty, p5tiles=p5tiles, NCHUNK=NCHUNK,
-              p4per=p4per, p4objs=p4objs, rpp4=rpp4, D_FF=D_FF,
+              do3=do3, do4=do4, p4per=p4per, p4objs=p4objs, rpp4=rpp4, D_FF=D_FF,
               w_all_ty=w_all_ty, bc_all_ty=bc_all_ty, kvin_ty=kvin_ty, q_tys=q_tys,
               cache_ty=cache_ty, SKIP_P1=SKIP_P1, HOSTKV=HOSTKV,
               PREP=PREP, PREPSRC=PREPSRC,

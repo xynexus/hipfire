@@ -12923,3 +12923,30 @@ slipped relative to its producer.
 
 The test is to run P5 alone in this design with P3 and P4 bodies removed. If it is
 correct alone, the fault is drift from the phases before it, not P5's own wiring.
+
+### P5 alone emits nothing — which inverts last tick's theory
+
+`C_ONLY=5` drops P3 and P4 from both the core body and the sequence, leaving P5 as
+the only phase. P3 and P4 then report errors equal to their own peak, confirming the
+mode works: their outputs are untouched zeros.
+
+    P5 x_out : max err 2.1875e-01   max|ref| 0.21875
+
+Those are the same number. `got5` is **zero**. P5 alone produces nothing at all.
+
+So the drift theory recorded last tick is wrong, and wrong in an instructive
+direction. The fault is in P5's own wiring, not in what P3 and P4 leave behind. And
+the nonzero data seen in the three-phase run was never P5's — with P5 emitting
+nothing, the drain collected whatever the shared result fifo still held from the
+phases before it. That is why no axis order recovered the answer and why no
+arithmetic hypothesis fit: the buffer never held a P5 result to rearrange.
+
+It also retracts the reasoning that made the drift theory attractive. "P3 first and
+correct, P4 second and correct, P5 last and wrong" looked like accumulating drift.
+It is better explained by P5 never having worked, with the phase order irrelevant.
+The pattern was real; the mechanism I read into it was not.
+
+Worth noting what the three-phase run would have shown if P5's result fifo had been
+drained into a zeroed buffer with no other producer: a clean zero, and a diagnosis
+two ticks earlier. Sharing `op` across phases hid the failure by filling the
+evidence with plausible data.
