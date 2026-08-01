@@ -11251,3 +11251,44 @@ Every weight tensor in the token is now per-layer: P1's qkv, P3's o_proj, P4's
 gate/up, P5's down_proj, and both RMSNorm weights. **The only thing still not
 per-layer is the residual**, which is fed the same `x` on every iteration instead
 of carrying forward from the previous layer's output.
+
+## 2026-08-01 — both sides, 16 real layers, one dispatch each: 63.4 tok/s
+
+    side A, 16 real layers, ONE dispatch    8859.0 us   checks pass
+    side B, 16 real layers, ONE dispatch    3205.1 us   exact, 0.0000e+00
+    lm_head                                 3700.0 us   carried, not re-measured
+    ---------------------------------------------------------------
+    token                                   15.76 ms -> **63.4 tok/s**
+    FLM measured                                          61.18 tok/s   **+3.7%**
+
+Every weight in the token is now the real per-layer weight: qkv, o_proj,
+gate/up, down_proj, and both RMSNorms, each selected by fill offset from a buffer
+holding all sixteen. Two dispatches per token against FLM's measured ~2.5.
+
+### What this is, and what it is not
+
+It **is** two measured device timings for sixteen real layers, with correctness
+checks passing on both sides, plus one carried number for lm_head.
+
+It is **not a running token.** The residual is still fed the same `x` on every
+iteration rather than carrying the previous layer's output forward. So the
+arithmetic each layer performs is the arithmetic that layer should perform, on an
+input that is not what the previous layer produced.
+
+That is the last structural piece. It is also the one that decides whether the
+timing survives: chaining the residual means side A's output must reach side B and
+side B's must return to side A's next iteration, and today that crosses the
+dispatch boundary through host memory. `g_resid` already persists across
+dispatches (measured earlier), and P3/P5 already stash through it, so the pieces
+exist — but the loop is not closed.
+
+### The thing worth remembering from this session
+
+Every wall this session — program memory short by 2272 B, per-core DMA fanin at
+2 in / 2 out, inter-tile routing at NATT=8, the 7-object runtime hang — was a
+consequence of treating **a layer as the dispatch unit**. None of them were
+addressed. They stopped mattering.
+
+The measurement that changed it was not a kernel measurement. It was counting
+`DRM_IOCTL_AMDXDNA_EXEC_CMD` in FLM's own process and finding 2.5 where mine had
+32.
