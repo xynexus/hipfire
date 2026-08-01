@@ -14,10 +14,12 @@
 #     ./chain_layers.sh 4 [pos] [seq]
 #
 # Needs the mlir-aie/XRT env, same as the designs themselves.
-# No `set -e`: group_c exits nonzero because it still runs p1p2_chain's
-# attention check, which has no attention to check here and reports FAIL. Under
-# `set -e` that ended the chain after layer 0 while looking like it had finished.
-set -uo pipefail
+# `set -e` is back: group_c's verdict now reflects its own phases rather than an
+# inherited attention check with no attention to check, so a nonzero exit means a
+# real failure and SHOULD stop the chain. The greps keep their `|| true` -- a
+# grep that matches nothing is not a failure, and that one silently ended the
+# chain after layer 0 while printing what a successful run prints.
+set -euo pipefail
 
 N=${1:-2}
 POS=${2:-30}

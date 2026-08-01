@@ -1189,7 +1189,20 @@ def main():
     # envelope to silence it, which is what the last two changes here did.
     print(f"  -> {'within' if worst <= tol else 'OUTSIDE'} the empirical envelope"
           f"  (advisory; floor model unresolved)")
-    return 0 if worst <= tol else 1
+    # The verdict is group C's OWN phases. The attention block above is
+    # inherited from p1p2_chain, which this design is a derivative of, and there
+    # is no attention on these sixteen cores -- it reports FAIL against zeros
+    # every run. Gating on it made `group_c` exit nonzero always, which silently
+    # ended chain_layers.sh after one layer while printing what a successful run
+    # prints. Its own comment already says it is advisory; now it is.
+    #
+    # P4's floor is the SwiGLU path's, measured at 1.2-2.5% of peak across four
+    # chained layers, so it is bounded rather than compared to zero.
+    bad = [n for n, e, lim in (("P3", e3, 1e-5), ("P4", e4, 0.04 * np.abs(sw_ref).max()),
+                               ("P5", e5, 1e-5)) if e > lim]
+    print(f"  -> group C {'PASS' if not bad else 'FAIL: ' + ', '.join(bad)}"
+          f"   (P3 {e3:.4e}  P4 {e4:.4e}  P5 {e5:.4e})")
+    return 0 if not bad else 1
 
 
 if __name__ == "__main__":

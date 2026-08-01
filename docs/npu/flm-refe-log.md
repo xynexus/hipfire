@@ -13718,3 +13718,35 @@ Two bugs in that script, both worth naming because each looked like a result:
 Both were caught only because four layers were expected and one appeared. A harness
 whose failure mode is "silently does less" is worse than one that crashes, and this
 one had two independent paths into it.
+
+### group_c's exit code now means something
+
+`group_c` returned `0 if worst <= tol else 1` on the **attention** check inherited from
+`p1p2_chain` — in a design that has no attention on its sixteen cores, so that check
+ran against zeros and reported FAIL every single run. The exit code was therefore
+always 1, and always meaningless.
+
+That is what silently ended `chain_layers.sh` after one layer. Worse, the block's own
+comment already said "ADVISORY, not a gate ... treat a breach as 'the model does not
+cover this config'" — and it was wired as the gate anyway. The comment and the code
+had disagreed for as long as both existed.
+
+The verdict is now group C's own phases:
+
+    -> group C PASS   (P3 9.5367e-07  P4 2.9297e-03  P5 0.0000e+00)
+    exit code 0
+
+P3 and P5 are held to 1e-5, which they beat by two orders of magnitude or hit exactly.
+P4 is bounded at 4% of `max|sw_ref|` rather than compared against zero, because its
+floor is the SwiGLU path's own and measured at 1.2-2.5% of peak across four chained
+layers — a real bound with headroom, not a number chosen to make today pass.
+
+With that fixed, `set -e` is back in `chain_layers.sh`: a nonzero exit now means a real
+failure and should stop the chain. The greps keep their `|| true`, since a grep
+matching nothing is not a failure. Re-verified at 3 layers.
+
+The general lesson is about derived harnesses. `group_c` began as a copy of
+`p1p2_chain` and inherited three checks for phases it does not run — attention, the P1
+cache, and the q' scatter — all of which still print, and one of which was the gate.
+The earlier bench-accounting bug had exactly the same origin: a metric copied from a
+design with a different tensor set, still reporting confidently in the right units.
