@@ -15031,3 +15031,127 @@ a `slice`. Unpack index by index instead.
 
 Nothing in this tree had hit it because no existing design slices its argument tuple with
 a constant. It cost one build here and will cost the next person one.
+
+### The fused dispatch, measured: 63.7 tok/s, +4.1% over FLM
+
+Sixteen layers in ONE dispatch, three runs of the same cached build (`FUSED_AQ=4`),
+`run_iters` taking min over 10 dispatches inside each:
+
+    12993.8   12703.5   12651.9 us     median 12703.5, spread 342 us = 2.7%
+
+which is the same-build run-to-run spread this log already measured at 2.6%. The first
+run is the outlier and it is the one immediately after the build; the two later ones
+agree to 0.4%.
+
+    token = 12703.5 + 2994.2 (lm_head, measured separately at its own size)
+          = 15697.7 us  ->  63.7 tok/s      FLM 61.18, +4.1%
+    range over the three runs   62.5 - 63.9 tok/s   (+2.2% to +4.4%)
+
+**This is not a projection.** Every earlier figure in this log multiplied a fitted
+per-layer slope by sixteen and added a separately fitted floor; the slope noise was
+amplified 16x, which is how 65.4 / 64.0 / 64.4 / 64.5 turned out to be the same
+measurement four times. Here the dispatch is measured as the thing it is, and only
+lm_head is added.
+
+Correctness on the same build — 16 layers from the BOS embedding at position 0:
+
+    device x16   mean|.| 1.74863   max 147.000
+    host   x16   mean|.| 1.74094   max 148.668
+    cosine vs the validated host forward   0.999650    (32-dispatch chain: 0.999659)
+    argmax 16309   +6.9362   then 2, 1340, 791, 1757
+
+The fused design is indistinguishable from the verified 32-dispatch chain on the
+external bar.
+
+### A's weight fifos are memtile input channels, and that is worth 507 us a token
+
+Three consolidations fit the 22-input union into 16. Only two of them are free.
+
+    AQ=2   A weights 2 fifos, split 1->4   13500.9 us   45.3 GB/s   843.8 us/layer   60.6 tok/s
+    AQ=4   A weights 4 fifos, split 1->2   12993.8 us   47.1 GB/s   812.1 us/layer   62.5 tok/s
+
+Every fifo is a memtile input channel and A streams 3.96 MB a layer through them, so
+collapsing 4 into 2 halves that bandwidth. **The design that fit the shim budget most
+comfortably was 0.9% SLOWER than FastFlowLM; the one that fits it exactly is 4% faster.**
+
+B's KV pays for the shim inputs instead — 82 KB a layer against A's 3.96 MB — so the
+final shape is 1 + 4 + 2 + 1 + 8 = 16 inputs, exactly at the measured ceiling, and 14
+outputs. At `ASPL=2` A's weight topology is identical to `groups_ab`'s; the only
+surviving consolidations are B's KV and A's k'/v' joins.
+
+The lesson generalises past this design. A consolidation chosen to satisfy a *placement*
+constraint is a *bandwidth* decision, and the two budgets are not visible in the same
+place: the shim count appears in a placer error, and the cost of the fix appears nowhere
+until it is timed. Both consolidations placed. One of them cost 3.5 tok/s.
+
+Memtile channels now sit at **46 in / 46 out of 48**, against the 40/36 `channel_probe`
+verified. It places and loads, and it has room for no further fifo at all — the next
+phase, seam or debug drain hits the wall immediately.
+
+### 31 us a layer are unexplained, and I am not attributing them
+
+    measured    794.0 - 812.1 us/layer
+    projected   775.3 = 123.6 (A+B, 8-point fit) + 651.7 (C, 8-point fit)
+
+Three candidates, none isolated:
+
+  1. **A runs at NROWS=8 here**, where `groups_ab` runs 16, so one operand size and one
+     set of compile flags serve the whole array. The log measures the bandwidth part at
+     4.5%, about 5.6 us/layer, and says nothing about doubling the acquire/release count
+     per core per layer (48 objects instead of 24).
+  2. **Additivity was an assumption.** Both slopes were fitted on designs that owned the
+     machine. Fused, they share memtiles, shim channels and DDR. Nothing has ever tested
+     whether two slopes measured in isolation add.
+  3. **C may be slower fused**: its environment changed most — 46/46 of 48 channels
+     shared with A and B, and 1360 B more core code.
+
+The obvious move is to subtract: A+B = 812.1 - 651.7 = 160.4 against a fitted 123.6.
+That subtraction assumes candidate 3 is false, which is exactly the thing it would be
+used to prove. It is the same shape as the P3&P4 derivation earlier in this log that
+double-counted a saving, and it is not reported here as a measurement.
+
+Candidate 2 is the one worth chasing beyond this design, because it invalidates a
+*method* rather than a number: every projection in this log summed slopes measured on
+designs that had the machine to themselves.
+
+### The first tolerance here that is not fitted to what was already seen
+
+The fused harness bounds each phase at **two bf16 representable steps of that phase's own
+peak**, computed from the format:
+
+    ulp2(v) = 2 * 2 ** (floor(log2(|v|)) - 7)
+
+A drained value *is* bf16, so one representable step is the smallest disagreement two
+values of that size can have; two allows the reference its own rounding. Nothing about
+it comes from an observed worst case. Every other bound in this log — the 2-ULP attention
+envelope, P3's 1e-5, P4's 4% — was fitted to runs already done, and two of them were then
+widened when a later run breached them.
+
+It also forced a distinction that one number cannot carry. The first 16-layer run printed
+FAIL with `h` flat at 4.0 from layer 4 to layer 15, which looked like a fault and is not:
+max|h| is flat at ~405 across those layers and the bf16 step at 405 is 2.0, so 4.0 is two
+steps. The reference was a pure host chain from x0, so by layer 15 it and the device were
+two independent chains through fifteen layers of 4-bit arithmetic and the per-element max
+was accumulated divergence, not any layer's floor.
+
+Splitting it answers both questions instead of neither:
+
+    seams   the chain from x0, end to end -- the cosine and the token
+    floor   each phase against a reference recomputed from the DEVICE's own x_L,
+            so both sides share a known input
+
+This is **not** the "phase fed a host reference" fault that cost this log two retractions.
+That fault had a phase *consuming* a host value instead of the previous phase's device
+output, so the seam between them was never exercised and a broken seam still passed. Here
+the seams are precisely what the first check tests.
+
+Per phase, per layer, on the AQ=4 build:
+
+    attn   1.1e-03 to 3.9e-03    inside the envelope at EVERY layer
+    h      9.8e-04 to 3.1e-02    against 4.0 at max|h| ~ 405
+    x_out  1.6e-02 to 1.0        against 2.0 - 4.0
+    sw     5.0e-01 against 1.1e+01 (4% of peak) = 0.45% of peak
+
+Attention stays inside the envelope at all sixteen layers where the 32-dispatch chain
+breached it at layers 11 and 12. No cause is claimed: at position 0 the softmax is over
+one entry, which is the most forgiving case in the space.
