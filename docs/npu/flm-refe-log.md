@@ -13477,3 +13477,22 @@ launched:
 So: the shape places. Whether the shape with real kernel bodies in it places, and
 whether the seams as built rather than as designed place, are still open. The
 remaining llc work is core codegen and will not change the placement result.
+
+### Build cost at full operand is dominated by group A's eight cores
+
+Partway through the 32-core skeleton build, with 24 of 32 ELFs linked, the eight
+still compiling were all in columns 0 and 1 — group A — and they had been in `llc`
+for 32 minutes while the other 24 finished. The optimised IR explains it:
+
+    group A cores (cols 0-1)   584K   7779 lines
+    group C cores              148K   1983 lines
+    others                     236K   3280 lines
+
+Group A carries 2.4x to 3.9x the IR of any other role, because it is the core with
+the most streams: broadcast in, weights in, and q' plus k'/v' out on separate fifos.
+At the real 10304 B operand the skeleton's copy loops over those scale with it.
+
+Practical consequence for iterating here: a full-operand 32-core build is not a
+uniform cost that can be trimmed by making the design smaller in general — it is
+dominated by one role. Changing group C and rebuilding is comparatively cheap;
+touching group A is what costs half an hour.
