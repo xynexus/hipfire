@@ -11519,3 +11519,48 @@ keys its cache on the design function's SOURCE TEXT, and `way` reached the desig
 through a closure — invisible. The probe now builds through `exec` with the width
 interpolated into the source. **This is the fourth time this session that a
 value reaching a design via the namespace silently reused a stale build.**
+
+### The restructure, specified before it is attempted
+
+Everything needed is now measured. Writing the plan down rather than starting to
+edit, because this touches a working design and the change is larger than it looks.
+
+**Target:** 32 cores, 4-way splits, role-specialised, five phases in one dispatch
+looping sixteen layers. ~63 tok/s with a valid token.
+
+**Why 4-way is forced:** memtile DMA. 8-way asks 1-in/8-out and fails; 2-way at 32
+cores needs 36 links against 8 memtiles. 4-way at 32 cores gives 18 — exactly
+today's working count.
+
+**What changes, concretely:**
+
+    line ~179  oppair_ty (2*OPERAND)  ->  opquad_ty (4*OPERAND)
+    line ~279  f_w over npairs        ->  over nquads = NCORES // 4
+    line ~280  split([0, OPERAND])    ->  split([0, OP, 2*OP, 3*OP], [op_ty]*4)
+    line ~417  w_sub[p][j]            ->  w_sub[c // 4][c % 4]
+    line ~691  b[:, 0..1, :]  (P1)    ->  b[:, 0..3, :]
+    line ~814  same for P3
+    line ~881  same for P4
+    drains     sizes/strides with a 2 -> 4, and rpp3/rpp4 divide by nquads
+    flm_h_emit DIM_RESN spans a PAIR   -> spans a QUAD (and TILES*NR <= object)
+
+**The complication that makes this more than a rename:** the weight fifo also
+carries KV to the attention cores (`wh[n - a + i]`), because a core has only 2
+input DMA channels and both are spoken for. So the grouping is not purely "four
+P1 cores" — a quad may straddle the P1/attention partition, and partition B places
+attention on the last pairs. Quad boundaries and the P1/P2 split have to be chosen
+together, not independently.
+
+**Order to do it in**, each step leaving a runnable design:
+
+    1. 16 cores, 4-way weights only, attention still on pairs   (validates packing)
+    2. 16 cores, 4-way weights + outputs                        (validates joins)
+    3. 32 cores, NATT=8, 4-way throughout                       (the target)
+    4. merge P5 into the same dispatch                          (valid token)
+
+Step 1 is the one that proves the host packing rewrite; steps 2-3 are mechanical
+once it holds. Step 4 is what makes the 63 tok/s figure mean something, and it is
+also where role specialisation has to appear, since five bodies still do not fit a
+core.
+
+Not started. The working 16-core design is untouched and passing.
