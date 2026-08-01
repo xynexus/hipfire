@@ -72,12 +72,32 @@ is the 4224 starting at 2048: `x`, `nw`, `cs_q`, `cs_k`. Layer L's P5 drains
 x_out into block L+1's x slot and both fills read it from there. A drain has one
 destination, so without this layout x_out would need two.
 
-## Limits of this build
+## Positions
 
-Position is still a BUILD parameter, so this is verified at **pos 0** only, where
-the KV cache holds exactly the one entry this design's own P1 wrote. Multi-token
-decode needs `offset_parameter=` with a `ParameterScratchpad`, which is a
-host-side restructuring (see the log) and is not done here.
+Verified at **pos 0, 2 and 4** against an fp32 oracle from `consolidated.00.pth`
+(`oracle_forward.py`). `--tokens` prefills positions 0..P-1 on the HOST into the
+KV cache and has the device decode at P, so RoPE and the online softmax over a
+cache with non-zero prior V are both exercised:
+
+    pos 0   argmax 16309   cosine vs oracle  device 0.999325  host 0.999465
+    pos 2   argmax 2268    cosine vs oracle  device 0.986880  host 0.986386
+    pos 4   argmax 35308   cosine vs oracle  device 0.964879  host 0.964990
+
+The device tracking the HOST's own distance from the oracle is the claim; 4-bit
+weights set how close either can get.
+
+**Odd positions are refused**, and for two reasons — see the log. The test-side
+one is parity: `flm_kv_pair` must write an aligned column PAIR, so an odd
+position also writes column t-1 out of `g_kprev`, which a single-shot run has not
+filled. The design-side one is worse and is not fixed: `g_kprev` is ONE
+head-wide static per core, while this design runs sixteen layers on that core, so
+at an odd position every layer would close its K pair with a different layer's
+key. Even positions never read `g_kprev`, which is why they are correct.
+
+The KV cache is still built by the host. What is verified is one decode step onto
+a correct cache — not a sequence the device produced, which additionally needs
+`offset_parameter=` with a `ParameterScratchpad` so one xclbin serves every
+position.
 
 `FUSED_STUB=ab|c|all` builds the same design with a group's COMPUTE replaced and
 its DMA untouched -- see the constant below and `_stubcheck.py`. It measured the
@@ -97,7 +117,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 import q4nx  # noqa: E402
-from qkv_verify import HEAD, K_DIM, EPS, ROPE_THETA, qkv_rows, rope_ref  # noqa: E402
+from qkv_verify import HEAD, K_DIM, qkv_rows  # noqa: E402
 # The layout functions only, which are NROWS-independent. groups_ab's own NROWS
 # is 16; this design runs the whole array at 8 so one operand size, one set of
 # compile flags and one memtile object size serve both halves -- and 10304 B is
@@ -652,39 +672,6 @@ def _design({P}):
                     full_elf=True)
 
 
-# ---------------------------------------------------------------------------
-# the host reference, with its intermediates exposed
-# ---------------------------------------------------------------------------
-def ref_layer(c, x, L):
-    """One decoder layer at position 0 -> (attn, h, sw, y).
-
-    Line for line `host_forward.layer`, which reproduces an independent fp32
-    forward from `consolidated.00.pth` end to end; the only difference is that
-    this returns the intermediates so the device's phases can be checked against
-    something external rather than against each other. `main` asserts the two
-    agree on `y`, so the copy cannot drift.
-    """
-    import host_forward as hf
-    P = f"model.layers.{L}."
-    nw1 = c.bf16(P + "input_layernorm.weight").astype(np.float32)[:K_DIM]
-    h1 = hf.rmsnorm(x, nw1)
-    vd, vm, vc = hf.load_linear(c, P + "self_attn.v_proj.weight", 8 * HEAD, K_DIM)
-    v = q4nx.gemv_reference_bf16(h1, vd, vm, vc)
-    attn = np.repeat(v.reshape(8, HEAD), NQ // 8, axis=0).reshape(-1)
-    od, om, oc = hf.load_linear(c, P + "self_attn.o_proj.weight", K_DIM, K_DIM)
-    h = x + q4nx.gemv_reference_bf16(attn.astype(np.float32), od, om, oc)
-    nw2 = c.bf16(P + "post_attention_layernorm.weight").astype(np.float32)[:K_DIM]
-    h2 = hf.rmsnorm(h.astype(np.float32), nw2)
-    gd, gm, gc = hf.load_linear(c, P + "mlp.gate_proj.weight", D_FF, K_DIM)
-    ud, um, uc = hf.load_linear(c, P + "mlp.up_proj.weight", D_FF, K_DIM)
-    g = q4nx.gemv_reference_bf16(h2, gd, gm, gc)
-    u = q4nx.gemv_reference_bf16(h2, ud, um, uc)
-    sw = (g / (1.0 + np.exp(-g))) * u
-    dd, dm, dc = hf.load_linear(c, P + "mlp.down_proj.weight", K_DIM, D_FF)
-    y = h + q4nx.gemv_reference_bf16(sw.astype(np.float32), dd, dm, dc)
-    return attn, h, sw, y
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -694,29 +681,73 @@ def main():
     p.add_argument("--seq", type=int, default=1, help="context length")
     p.add_argument("--x0", help=".npy holding layer 0's input; default a real BOS "
                                 "embedding is NOT assumed, a random vector is used")
+    p.add_argument("--tokens", help="comma-separated prompt token ids. Positions "
+                                    "0..n-2 are PREFILLED on the host into the KV "
+                                    "cache and the device decodes at position n-1, "
+                                    "which sets --pos, --seq and --x0. n-1 must be "
+                                    "EVEN -- see the parity note below.")
     p.add_argument("--save", help="write the final x_out to .npy")
     p.add_argument("--bench", action="store_true")
     p.add_argument("--no-ref", action="store_true",
                    help="skip the host reference chain (it costs minutes)")
     o = p.parse_args()
     nlay, L0, pos = o.layers, o.layer0, o.pos
-    if pos != 0:
-        print("  NOTE: position is a BUILD parameter here and only pos 0 is "
-              "verified; g_kprev and the prior cache are not exercised.")
+    seq, toks = o.seq, None
+    if o.tokens:
+        toks = [int(t) for t in o.tokens.split(",")]
+        pos, seq = len(toks) - 1, len(toks)
+        # PARITY IS NOT A CONVENIENCE. `flm_kv_pair` writes the K cache as an
+        # aligned COLUMN PAIR because a single bf16 column is a 2-byte write at
+        # an odd byte offset and the DMA rejects it. At an EVEN position the
+        # pair is (k'_t, 0) -> columns (t, t+1), so a single-shot run touches
+        # only its own column and a forward-looking padded one, leaving a
+        # host-built prefix intact. At an ODD position the pair is
+        # (k'_{t-1}, k'_t) -> columns (t-1, t), and k'_{t-1} comes from
+        # `g_kprev`, a static in core .bss holding whatever the LAST dispatch
+        # left. A single-shot odd position therefore destroys position t-1 of a
+        # host-built cache. That is a property of the test, not of the design:
+        # in a real sequential decode g_kprev holds the k' this same core
+        # computed one token earlier and the write is correct. Verifying an odd
+        # position needs the device to have decoded t-1 itself.
+        if pos & 1:
+            raise SystemExit(
+                f"decode position {pos} is ODD: closing its K column pair needs "
+                f"the previous token's k' out of g_kprev, which a single-shot "
+                f"run does not have. Use an even position (an odd token count).")
+        if pos + 1 > TSEQ:
+            raise SystemExit(f"position {pos} needs a cache longer than TSEQ={TSEQ}")
 
     c = q4nx.Q4nx(str(Q4NX))
-    divisor = c.bf16("rope_freqs.weight").astype(np.float64)[:HEAD // 2]
-    inv_freq = (1.0 / ROPE_THETA ** (np.arange(0, HEAD, 2) / HEAD)) / divisor
-    ang = pos * inv_freq
-    cs_k = rnd(np.concatenate([np.cos(ang), np.sin(ang)]))
-    cs_q = rnd(cs_k * (HEAD ** -0.5) * np.log2(np.e))
+    import host_forward as hf
+    cs_q, cs_k = hf.rope_cs(c, pos)
 
     rng = np.random.default_rng(0)
-    x0 = (rnd(np.load(o.x0).astype(np.float32)) if o.x0
-          else rnd(rng.standard_normal(K_DIM) * 0.05))
+    prior = [None] * nlay
+    if toks:
+        emb = c.bf16("model.embed_tokens.weight").astype(np.float32).reshape(-1, K_DIM)
+        x0 = rnd(emb[toks[pos]])
+        print(f"  host prefill of positions 0..{pos - 1} ({pos} tokens) ...",
+              flush=True)
+        Kc, Vc = hf.prefill(c, toks[:pos], nlay, L0)
+        prior = [(Kc[L], Vc[L]) for L in range(nlay)]
+    else:
+        x0 = (rnd(np.load(o.x0).astype(np.float32)) if o.x0
+              else rnd(rng.standard_normal(K_DIM) * 0.05))
+        if pos != 0:
+            # Without --tokens there is no prefill, so the cache is ZERO at every
+            # prior position and `prior[L]` is None -- which makes the reference
+            # take the position-0 shortcut while the device rotates and attends
+            # over `pos` zero entries. The two are not computing the same thing.
+            # Every "attention passes at pos 30" result in this log rests on this
+            # configuration, where the online rescaling operates entirely on
+            # zeros. Use --tokens for a check that means something.
+            print(f"  WARNING: --pos {pos} without --tokens. The cache holds "
+                  f"ZEROS at positions 0..{pos - 1} and the reference takes the "
+                  f"pos-0 shortcut, so the per-phase numbers below are not a "
+                  f"test of multi-position attention.")
 
     print(f"fused: 32 cores, {nlay} layers, ONE dispatch, layer {L0}, pos {pos}")
-    design = build(pos, nlay, o.seq)
+    design = build(pos, nlay, seq)
 
     # ---- host buffers ------------------------------------------------------
     xbuf = np.zeros((nlay + 1) * BLK, np.float32)
@@ -739,13 +770,28 @@ def main():
     sw_t = iron.zeros(D_FF + BC, dtype=bfloat16, device="npu")
 
     # ---- the KV cache: one block per layer, npad in every head's trailer ----
-    nobj = -(-o.seq // (TSEQ * KVPER))
+    nobj = -(-seq // (TSEQ * KVPER))
     npad = TSEQ * nobj * KVPER - (pos + 1)
     cache = np.zeros(nlay * CACHEB, np.uint8)
     for L in range(nlay):
         for g in range(8):
             off = L * CACHEB + g * OPERAND + OPERAND - 60
             cache[off:off + 4] = np.array([float(npad)], np.float32).view(np.uint8)
+    if toks:
+        # The prior positions, in the layout the drains write and P2 reads back:
+        # K channel-major [HEAD][TSEQ], V position-major [TSEQ][HEAD], per KV
+        # group at `g * KVSTRIDE` bf16 elements inside the layer's block. The
+        # device writes only columns/rows `pos` and `pos+1`, so everything below
+        # `pos` is exactly what is put here.
+        cv = cache.view(np.uint16)
+        for L in range(nlay):
+            base = L * (CACHEB // 2)
+            for g in range(8):
+                b = base + g * KVSTRIDE
+                Kt = cv[b:b + KTILE].reshape(HEAD, TSEQ)
+                Vt = cv[b + KTILE:b + KTILE + VTILE].reshape(TSEQ, HEAD)
+                Kt[:, :pos] = np.asarray(prior[L][0][:, g], bfloat16).view(np.uint16).T
+                Vt[:pos] = np.asarray(prior[L][1][:, g], bfloat16).view(np.uint16)
     cache_t = iron.tensor(cache, dtype=np.uint8, device="npu")
 
     # ---- weights: LAYER-OUTER, so only one layer's tensors are ever live ----
@@ -882,30 +928,57 @@ def main():
     # This is NOT the "phase fed a host reference" fault. That one had a phase
     # CONSUMING a host value instead of the previous phase's device output, so
     # the seam was never exercised; here the seams are what the chain tests.
-    import host_forward as hf
     # Two bf16 representable steps at the phase's own peak. Derived from the
     # format -- a drained value IS bf16, so the smallest disagreement two values
     # that size can have is one step -- not fitted to an observed worst case.
     ulp2 = lambda v: 2.0 * 2.0 ** (np.floor(np.log2(max(abs(v), 1e-30))) - 7)
+    # **The binding mechanism is not the same at pos 0 and pos > 0**, and this is
+    # a derivation rather than a concession to what the run produced:
+    #
+    #   pos 0     the softmax is over ONE entry. `aie::exp2` is evaluated only at
+    #             0, where the log records it as EXACT ("linear interpolation,
+    #             ~6% error, exact at integers"), and the output is that entry's
+    #             V. bf16 rounding is then the only error there is, so two
+    #             representable steps is the right bound -- and `groups_ab`
+    #             measures 0.00 ULP at pos 0, bit-exact, which is what that
+    #             claim predicts.
+    #   pos > 0   the online softmax evaluates `aie::exp2` at NON-integer
+    #             arguments, where the AIE2P NLF is a linear interpolation whose
+    #             relative error is MEASURED at 3.54% mean / 5.86% max
+    #             (`exp2_probe.py`; this log, "AIE2P hardware exp2, max rel err
+    #             over x in [-8,0] 5.86%"). Softmax weights inherit it directly,
+    #             the attention output is a probability-weighted average of V so
+    #             it arrives undiminished, and o_proj carries it into `h` and the
+    #             FFN into `x_out`. That is ~18x a bf16 step, so it is what binds.
+    #
+    # Holding pos > 0 to the bf16 step would be holding the device to a floor its
+    # own hardware cannot reach. The bound below is the measured NLF figure, not
+    # a number chosen to make this run pass -- the run's worst phase sits at
+    # 3.2% of peak against it, and every phase is printed as a FRACTION OF PEAK
+    # so a future reader can see the margin instead of taking it on trust.
+    NLF = 5.86e-2
+    bound = (lambda v: ulp2(v)) if pos == 0 else (lambda v: NLF * abs(v))
     ok, xc = True, x0.astype(np.float64)
-    print("  per layer: each phase against a reference on the device's own x_L")
+    print(f"  per layer: each phase against a reference on the device's own x_L"
+          f"   [floor: {'2 bf16 steps' if pos == 0 else f'{NLF:.2%} exp2 NLF'}]")
     for L in range(nlay):
         xd_L = xg[L * BLK + K_DIM:L * BLK + 2 * K_DIM]
-        attn_r, h_r, sw_r, y_r = ref_layer(c, xd_L, L0 + L)
-        if L == 0:
-            # ref_layer is host_forward.layer with its intermediates exposed;
-            # one bit-exact comparison is what stops the copy from drifting.
-            assert np.array_equal(y_r, hf.layer(c, xd_L, L0 + L)), \
-                "ref_layer drifted from host_forward.layer"
+        # `host_forward.layer_parts` IS `host_forward.layer` with its
+        # intermediates exposed -- one function, not a copy, so the drift this
+        # harness used to assert against cannot happen. At pos 0 `prior[L]` is
+        # None and it takes the position-0 shortcut the fp32 oracle validated.
+        attn_r, h_r, sw_r, y_r, _, _ = hf.layer_parts(c, xd_L, L0 + L, pos, prior[L])
         attn_d = xg[L * BLK:L * BLK + K_DIM]
         h_d = hg[L * BC:L * BC + K_DIM]
         y_d = xg[(L + 1) * BLK + K_DIM:(L + 1) * BLK + 2 * K_DIM]
         ea = np.abs(attn_d - rnd(attn_r)).max()
         eh = np.abs(h_d - rnd(h_r)).max()
         ey = np.abs(y_d - rnd(y_r)).max()
-        ta, th, ty = (ulp2(np.abs(v).max()) for v in (attn_r, h_r, y_r))
-        line = (f"  L{L0 + L:<2d} attn {ea:.3e}/{ta:.3e}  h {eh:.3e}/{th:.3e}"
-                f"  x_out {ey:.3e}/{ty:.3e}")
+        pa, ph, py = (np.abs(v).max() for v in (attn_r, h_r, y_r))
+        ta, th, ty = bound(pa), bound(ph), bound(py)
+        line = (f"  L{L0 + L:<2d} attn {ea:.3e}/{ta:.3e} ({ea / pa:5.2%})"
+                f"  h {eh:.3e}/{th:.3e} ({eh / ph:5.2%})"
+                f"  x_out {ey:.3e}/{ty:.3e} ({ey / py:5.2%})")
         if L == nlay - 1:                     # sw survives only for the last layer
             esw = np.abs(swg[:D_FF] - rnd(sw_r)).max()
             tsw = 0.04 * np.abs(sw_r).max()   # the SwiGLU path's own measured floor
@@ -916,16 +989,23 @@ def main():
             line += "   [attn advisory]"
         ok &= eh <= th and ey <= ty
         print(line)
-        xc = hf.layer(c, xc, L0 + L)
+        xc = hf.layer_parts(c, xc, L0 + L, pos, prior[L])[3]
 
     cos = float(x_dev @ xc / (np.linalg.norm(x_dev) * np.linalg.norm(xc)))
     print(f"  device x{nlay} vs host chain: cosine {cos:.6f}   "
           f"mean|dev| {np.abs(x_dev).mean():.5f}  mean|ref| {np.abs(xc).mean():.5f}")
     ext = os.environ.get("FUSED_EXTERNAL")
     if ext:
+        # `oracle_forward.py --save` writes this: an fp32 forward from
+        # consolidated.00.pth that shares no code with anything here. The HOST's
+        # cosine against it is printed alongside on purpose -- the device can
+        # only be as close to the model as the 4-bit weights allow, so the
+        # question is not "is it 1.0" but "is it the host's number". A device
+        # materially worse than the host has a fault the host does not.
         xr = np.load(ext).astype(np.float64)
-        ce = float(x_dev @ xr / (np.linalg.norm(x_dev) * np.linalg.norm(xr)))
-        print(f"  device x{nlay} vs {ext}: cosine {ce:.6f}")
+        cs = lambda a: float(a @ xr / (np.linalg.norm(a) * np.linalg.norm(xr)))
+        print(f"  vs EXTERNAL ORACLE {ext}:  device {cs(x_dev):.6f}   "
+              f"host {cs(xc):.6f}")
     print(f"  -> fused {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 

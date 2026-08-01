@@ -151,6 +151,15 @@ def gemv_reference_bf16(act, d, m, codes):
     activation scaled by the block's bf16 scale and rounded to bf16, the block
     sums rounded to bf16, everything accumulated in float — so a mismatch here
     is a defect.
+
+    Vectorised over rows. The accumulation ACROSS blocks stays an explicit
+    sequential loop rather than a reduction, because the order of a float sum is
+    part of what "step for step" means. The row-by-row Python version this
+    replaces was ~19x slower, and its output is reproduced BIT-IDENTICALLY on
+    o_proj, gate_proj, down_proj and k_proj (`np.array_equal`, max diff 0.0) --
+    which is what makes the swap safe, since every host reference in this tree
+    is built on this function and one of them is the yardstick the fp32 oracle
+    validated.
     """
     nrows, nb = d.shape
     a = np.asarray(act, np.float32).reshape(nb, BLK)
@@ -158,16 +167,12 @@ def gemv_reference_bf16(act, d, m, codes):
 
     asum = rnd(a.astype(np.float64).sum(1).astype(np.float32))
     d = rnd(d)
-    out = np.zeros(nrows, np.float64)
-    for r in range(nrows):
-        acc = 0.0
-        for b in range(nb):
-            a_s = rnd(a[b] * d[r, b])
-            acc += float(np.dot(codes[r, b].astype(np.float64),
-                                a_s.astype(np.float64)))
-        out[r] = acc + float(np.dot(rnd(m[r]).astype(np.float64),
-                                    asum.astype(np.float64)))
-    return out
+    a_s = rnd(a[None, :, :] * d[:, :, None])            # [nrows][nb][BLK] f32
+    bd = np.einsum("rbt,rbt->rb", codes.astype(np.float64), a_s.astype(np.float64))
+    out = bd[:, 0].copy()
+    for b in range(1, nb):
+        out += bd[:, b]
+    return out + rnd(m).astype(np.float64) @ asum.astype(np.float64)
 
 
 def gemv_reference(act, d, m, codes):
