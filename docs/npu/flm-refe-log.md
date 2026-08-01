@@ -12093,3 +12093,30 @@ Object-size results so far:
     256         1 KB    PLACE AND ROUTE, every stream delivers
     512         2 KB    building
     2576       10 KB    exceeds a 2400 s build — unanswered
+
+### Object size: the topology holds at every size the core-to-core streams need
+
+    64 int32    256 B   places, routes, every stream delivers
+    256         1 KB    same
+    512         2 KB    same
+    1024        4 KB    same
+    2576       10 KB    exceeds a 2400 s build
+
+I framed the 10 KB gap as the open risk. Looking at what actually flows where,
+that is over-stated:
+
+  * **The core-to-core streams carry intermediates**, and an intermediate is at
+    most `K_DIM` bf16 = 4 KB — q' to B, the attention output to C, the residual
+    back to A. **4 KB is measured and passes.**
+  * **10304 B is OPERAND**, the weight/KV tile. That travels host -> core on the
+    operand fifo, which is exactly the stream the working 16-core design already
+    places at that size every run.
+
+So the sizes that are new to this architecture are all verified, and the size
+that is not verified is not new. The remaining uncertainty is whether 32 cores
+changes the operand fifo's placement — plausible, but a different and narrower
+question than "does the topology hold at realistic size".
+
+What the 2400 s timeout does establish stands on its own: **iterating at full
+size is impractical**, so the build should be developed at reduced object sizes
+and only sized up at the end.
