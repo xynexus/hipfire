@@ -12002,3 +12002,25 @@ and no memtile, which is the cheapest possible handoff.
 
 Status: topology proven, phases not yet wired. `p1p2_chain` remains the working
 design.
+
+### And it delivers the right data, not just runs
+
+Running was not enough — a topology that misroutes still runs. The skeleton's
+kernels are chosen so the arithmetic traces the streams: A adds 1, B adds 2, C
+adds both halves it receives plus 3. From a zero input every output element must
+be `(1+2) + (1+2) + 3 = 9`, and a stream delivering the wrong thing shows up as a
+wrong value rather than a hang.
+
+    -> 32 cores in three groups PLACE AND ROUTE
+    -> all four outputs carry 9: every stream delivers
+
+So all four stream kinds are confirmed carrying data:
+
+    host -> A     broadcast reached all 8
+    A[j] -> B[j]  each B core received its own A core's output
+    B -> C        both 4-way joins broadcast to all 16
+    C -> host     all four joins drained
+
+That is the architecture validated end to end as plumbing. What remains is
+replacing the trivial kernels with the real phase bodies — mechanical, and against
+a topology that is now known to work rather than hoped to.

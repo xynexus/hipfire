@@ -213,7 +213,18 @@ def main():
         a = iron.zeros(64, dtype=np.int32, device="npu")
         outs = [iron.zeros(64, dtype=np.int32, device="npu") for _ in range(4)]
         build_skeleton()(a, *outs)
+        # Running is not enough: a topology that misroutes still runs. Trace the
+        # arithmetic — A adds 1, B adds 2, C adds both halves plus 3 — so with a
+        # zero input every output element must be (1+2) + (1+2) + 3 = 9. A wrong
+        # stream shows up as a wrong value, not a hang.
+        want = 9
+        bad = [i for i, t in enumerate(outs) if not (t.numpy() == want).all()]
         print("  -> 32 cores in three groups PLACE AND ROUTE")
+        if bad:
+            g = outs[bad[0]].numpy()
+            print(f"  -> but output {bad[0]} is wrong: got {g[:4]} want {want}")
+            return 1
+        print(f"  -> all four outputs carry {want}: every stream delivers")
     return 0
 
 
