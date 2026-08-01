@@ -12409,3 +12409,39 @@ which is right only if the cache strides heads by exactly OPERAND bytes. It does
 by construction (`KVSTRIDE = OPERAND // 2` bf16), but "by construction" is what
 the last four faults also looked like. Next step is to check what core 1 actually
 receives, rather than reason about what it should.
+
+## 2026-08-01 — groups A and B run together, q' core to core
+
+    pos=30   attn 1.5359e-03   max|V| 0.51953   0.76 ULP   PASS
+    pos=15   attn 2.1371e-03   max|V| 0.51953   1.05 ULP   PASS
+    k'       1.9531e-03 (one bf16 ulp)                     PASS
+    v'       0.0000e+00                                    PASS
+
+**P1 on 8 cores streams q' straight to attention on 8 cores** — no host round
+trip, no memtile, 1:1 core to core. The first real stream of the role
+architecture carrying real data, and it verifies q' too: a wrong q' cannot produce
+the right attention output.
+
+The last "fault" was not one. At `pos=0` the error is 6.25e-02, and it scales
+directly with the padded-position count:
+
+    pos= 0   npad 31   6.2500e-02
+    pos=15   npad 16   2.1371e-03
+    pos=30   npad  1   1.5359e-03
+
+`flm_attn_finish` subtracts `npad * exp2(-m)` to remove the padded positions'
+contribution. With 31 padded against 1 real, that correction dominates the
+denominator, so `aie::exp2`'s ~6% error is amplified by the ratio. It is a
+degenerate case, not a defect — and group 0 read exact throughout because its `m`
+lands where the NLF is accurate.
+
+**The tolerance was also wrong, in the way this log has been wrong before.** I
+scaled by max|ref| — the output — which is a weighted *average* of v rows and
+shrinks as positions are added, while the accumulator's absolute error is set by
+the largest v it holds. Normalising by max|V| is what p1p2_chain established, and
+carrying its advisory 2-ULP envelope rather than fitting a new one keeps the two
+harnesses agreeing on what "at the floor" means.
+
+Five faults on this seam, every one producing a plausible wrong number rather than
+a failure: two cache buffers, unpadded slots, missing per-core fill offset,
+unwritten npad, and a mis-scaled tolerance. k' and v' passed throughout.

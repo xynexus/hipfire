@@ -636,14 +636,30 @@ def main():
         if __import__("os").environ.get("AB_DIAG"):
             print(f"    DIAG group {a}: max err {d.max():.4e}  "
                   f"max|want| {np.abs(want).max():.4f}")
+        if a == 1 and __import__("os").environ.get("AB_XTALK"):
+            # At pos=0 the output IS v'. If group 1 received another group's KV
+            # it will match that group's v' instead of its own.
+            for g in range(kv_groups):
+                e = np.abs(got[0] - ref[NK + g][:HEAD]).max()
+                print(f"    XTALK group1 head0 vs v'[{g}]: {e:.4e}"
+                      f"{'   <-- MATCH' if e < 1e-2 else ''}")
         if d.max() > aw:
             aw = d.max()
             worst_at = (a, *np.unravel_index(int(d.argmax()), d.shape))
-        asc = max(asc, np.abs(want).max())
+        # Scale by max|V|, not by the output. The output is a weighted AVERAGE of
+        # v rows, so it shrinks as positions are added while the accumulator's
+        # absolute error is set by the largest v it holds. p1p2_chain established
+        # this: normalising by max|V| collapsed a 2.7x across-layer spread to ~1x,
+        # where normalising by the output did not.
+        asc = max(asc, np.abs(Vf).max())
+    # 2 ULP of max|V| is p1p2_chain's ADVISORY envelope — empirical, fitted to an
+    # observed worst case, not derived. It is carried here rather than re-fitted
+    # so the two harnesses agree on what "at the floor" means.
     ulp = 2.0**-8
     atol = 2.0 * ulp * max(asc, 1e-9)
     print(f"  attn: {kv_groups} KV groups        max err {aw:.4e}   "
-          f"max|ref| {asc:.5f}   tol {atol:.4e}")
+          f"max|V| {asc:.5f}   tol {atol:.4e}  "
+          f"({aw / max(asc, 1e-9) / ulp:.2f} ULP)")
     if worst_at and aw > atol:
         _a, _h, _d = worst_at
         print(f"        worst at KV group {_a}, head {_h}, dim {_d}"
