@@ -14456,3 +14456,35 @@ runs all sixteen layers of one token and then the next token needs pos+1.
 Recording rather than attempting: this is a design question about the runtime API, not a
 bug to patch, and today has already produced three claims I had to withdraw for reasoning
 past what I had measured.
+
+### Correction: position CAN be a runtime parameter — the API has it
+
+The previous entry called "position is a build parameter" a structural blocker and left
+the question open. It is not a blocker, and the answer was one grep away.
+
+`ObjectFifoHandle.fill()` and `.drain()` both take an **`offset_parameter`** argument,
+distinct from `offset`, and it accepts a `ScratchpadParameter`:
+
+    """ScratchpadParameter: a named runtime value set from the host and read by
+    Workers."""
+
+    seq_len = ScratchpadParameter("seq_len", np.int32)
+    worker = Worker(core_body, [seq_len])          # p.read() inside the core
+
+with `--aie-lower-scratchpad-parameters` inserting the lock and sync preamble. So a
+single xclbin can serve every position: the drain offsets take the position at runtime
+instead of being interpolated into the design source, and `g_kprev` survives because the
+xclbin is never reloaded.
+
+That removes the collision entirely. The two facts that were "jointly fatal" — the K pair
+needing the previous token's k' from core .bss, and every position being a separate build
+— stop colliding as soon as the second one stops being true.
+
+This also matters for the fused dispatch, which has the same requirement: one design, all
+sixteen layers, then the next token at pos+1.
+
+Both the blocker and its resolution came from reading rather than measuring, and the
+blocker was wrong. The pattern for the day is consistent: every claim I made from the
+outside in — drain descriptors, offsets, alignment, build parameters — was wrong until I
+opened the thing that implements it. `flm_kv_pair.h` had the K mechanism in its header;
+`objectfifo.py` had the runtime offset in its signature.
