@@ -13496,3 +13496,47 @@ Practical consequence for iterating here: a full-operand 32-core build is not a
 uniform cost that can be trimmed by making the design smaller in general — it is
 dominated by one role. Changing group C and rebuilding is comparatively cheap;
 touching group A is what costs half an hour.
+
+### The 32-core build FAILED: program memory overflows even with trivial kernels
+
+After 57 minutes it reached stage 30 of 37 and stopped:
+
+    (29/37) perDeviceMatching
+    (30/37) [0/1] cdo_{0}
+    [AIE ERROR] _XAie_LoadProgMemSection():231: Overflow of program memory
+    XAie_LoadElf failed with XAIE_INVALID_ELF
+    aiecc: edge 'cdo_{0}' (key 'main') failed
+    exit=1
+
+Everything up to CDO generation passed: placement, routing, DMA assignment, per-core
+code generation, and all 32 ELF links. The design then failed to *load*, because at
+least one core's program exceeds the 16 KB program memory.
+
+**This corrects the entry two above.** That entry said the topology "PLACES at full
+operand size" and called the structure the projection depends on "placeable". Both
+statements are still literally true — placement did pass, and the failure is in a
+later stage. But I wrote them as though they settled the question, and they did not.
+I even wrote "the remaining llc work is core codegen and will not change the placement
+result", which is true and beside the point: codegen does not change placement, it
+changes whether the thing loads, and that is what failed.
+
+The sharper miss is in the caveat itself. I listed "trivial kernels, so program memory
+is untested" as a weakness of the test — implying a real design might overflow where
+this one would not. The opposite is the case: the skeleton overflows *with* trivial
+kernels. Its per-core bodies are copy loops sized by `--elems`, and at the real
+2576-int32 operand those unroll into 7779 lines of IR on group A's cores against
+1983-3280 elsewhere. A caveat framed as "this test is too easy" turned out to describe
+a test that is, in this one respect, harder than the real thing.
+
+So the load-bearing question is open again, and narrower than before: the fused
+32-core *topology* is placeable and routable at full operand size, and the obstacle is
+per-core program memory, not DMA channels or memtiles.
+
+What this does not say: that the real design overflows. A real GEMV kernel reads its
+10 KB operand with a compact vectorized loop, not an unrolled copy, and group C
+already runs three real phase bodies at ~78% of program memory on 16 cores. The next
+test should use the real kernels rather than a skeleton, since the skeleton is now
+known to misrepresent the binding constraint in both directions.
+
+(The task notification reported "exit code 0" — that is the shell wrapper's status.
+The build itself exited 1.)
