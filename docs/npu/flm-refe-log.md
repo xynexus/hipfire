@@ -14920,3 +14920,267 @@ weights arriving.
 That is the whole tree consistent on one set of code, with the headline result — sixteen
 device layers producing the oracle's token — reproduced after the last change rather than
 inherited from before it.
+
+### The shim budget is 16 in / 16 out, and nothing had ever measured it
+
+The fusion argument's prerequisite list said every constraint was measured. One of them
+had not been identified at all.
+
+`channel_probe.py` builds 12 fills and 12 drains, so its "40 in / 36 out places" is about
+**memtile** channels only. The shim is a separate budget and the union needs far more of
+it than either design alone:
+
+    in   A bc 1 + A w 4 + B kvin 8 + C bc 1 + C w 8  = 22
+    out  A kv 8 + B ao 2 + C p1 8                    = 18
+
+A probe of N shim->core fills and M core->shim drains, one core each, trivial bodies:
+
+    22 in / 18 out   ->  no ShimNOCTile has sufficient DMA capacity for
+                         0 input/1 output channels near centroid column 1
+    17 in / 16 out   ->  same
+    16 in / 16 out   ->  PLACES, ROUTES AND LOADS
+
+NPU2 is 8 columns x 6 rows, so 8 shim tiles x 2 channels each way is exactly 16/16. The
+log already contained the number — "eight would put the shim at 16 of 16 outputs" — as a
+remark about one fifo, never as a budget the fused design would have to fit.
+
+Three consolidations fit it, and none of them touches a core:
+
+    A weights   4 fifos split 1->2  ->  2 fifos split 1->4    (host packs 4-wide)
+    B KV in     8 fifos, unsplit    ->  2 fifos split 1->4    (slots are contiguous)
+    A k'/v' out 8 fifos, unjoined   ->  4 joins 2->1
+
+giving 14 in / 14 out and 44 memtile in / 38 out. The k'/v' drain needed no new shape at
+all: its second dimension is the KV-head stride and was already there, sized 1.
+
+That exact topology — 41216 B quad objects, 20608 B pair objects, two broadcasts, 32
+cores — places, routes, loads and runs.
+
+The general point is the one this log keeps making in new forms. The prerequisite that
+fails is not the one on the list that turns out false; it is the one that was never on
+the list, because nothing in the two existing designs came close enough to it to make it
+visible. Each half used 13 and 9 shim inputs against a budget of 16, so neither could
+have found it.
+
+### THE FUSED SINGLE DISPATCH EXISTS
+
+`tools/npu/flm/fused.py`. One design, 32 cores, one dispatch, the layer loop inside the
+instruction sequence: 8 P1 cores, 8 P2 cores, 16 C cores, five TaskGroup barriers per
+layer.
+
+The kernels are untouched. What moved is descriptor plumbing plus two compile flags that
+select branches already present in `flm_gemv_down.cc`:
+
+  * `RESID_FROM_STASH=1` gives P5 the `h` that P3 stashed. `flm_gemv_q4_1_residual`
+    already writes every row it produces into `g_resid` unconditionally, and P3 and P5 use
+    the SAME row assignment on the same core, so the residual needs no transport — only
+    the flag that reads it there. It is a different flag from `P3_RESID_FROM_STASH`, which
+    stays 0: at layer 0 the stash holds nothing and `x` has to come from the host.
+  * `XOUT_TO_STASH=1` leaves x_out in that same stash, and `flm_h_emit` — already linked,
+    P3 calls it — copies a core's whole 128-row slice into ONE object. P5's drain goes
+    from 16384 elements per pair, 6% of them live, to 256 dense ones with exactly P3's
+    shape.
+
+The C -> A seam is closed by a host block layout rather than by a second drain:
+
+    [ attn(2048) | x(2048) | nw(2048) | cs_q(64) | cs_k(64) ]     6272 bf16 per layer
+
+P3's broadcast is the first 4224 elements (activation `attn`, aux `x`); P1's is the 4224
+starting at 2048 (`x`, `nw`, `cs_q`, `cs_k`). Layer L's P5 drains x_out into block L+1's
+x slot and both fills read it there. A drain has one destination, and without this layout
+x_out would have needed two.
+
+First correctness, one layer, from the BOS embedding at position 0, every phase against a
+reference chain that starts at x0 and never reads a device value:
+
+    L0  attn  1.0986e-03 / 3.2618e-03      h      1.9531e-03 / 2.4489e-03
+        sw    3.1250e-02 / 1.3063e+00      x_out  3.1250e-02 / 1.6320e-01
+    device x1 vs host chain   cosine 0.999978
+    device x1  mean 0.08349  max 20.875
+    oracle x1  mean 0.08315  max 20.944
+
+The reference is `host_forward.layer` with its intermediates exposed, and the harness
+asserts the copy is bit-identical to `host_forward.layer` at layer 0, so the duplication
+that produced five faults this session cannot recur silently here.
+
+**Fusing DID add code to a core**, contrary to the prerequisite list:
+
+    P1 cores   9040 B   55.2%
+    P2 cores   5824 B   35.5%
+    C cores   15712 B   95.9%      against group_c standalone at 14352 B / 87.6%
+
++1360 B on C, from the `flm_h_emit` call site in P5 plus the layer loop, leaving 672 B of
+headroom. "Each core's ELF holds only its own role's code, so fusing adds code to no core"
+was true of the roles and false of the loop that runs them. It fits; it is now the
+tightest thing in the design.
+
+What this build does not do: position is still a BUILD parameter, so it is verified at
+pos 0 only, where the KV cache holds exactly the one entry this design's own P1 wrote.
+Multi-token decode needs `offset_parameter=` with a `ParameterScratchpad`, which is the
+host-side restructuring recorded earlier and is not done here.
+
+### A Python 3.14 trap that looks like a toolchain bug
+
+    ValueError: unmarshallable object
+      _hash.py:79 in _code_identity -> marshal.dumps(_without_location(code), 4)
+
+before a line of MLIR is emitted. The cause is a **literal slice** in the design source:
+`args[:10]`. Python 3.14 folds it into a code constant, and iron pins `marshal` version 4
+because "marshal.version is 4 through 3.13 and 5 from 3.14" — and version 4 cannot encode
+a `slice`. Unpack index by index instead.
+
+Nothing in this tree had hit it because no existing design slices its argument tuple with
+a constant. It cost one build here and will cost the next person one.
+
+### The fused dispatch, measured: 63.7 tok/s, +4.1% over FLM
+
+Sixteen layers in ONE dispatch, three runs of the same cached build (`FUSED_AQ=4`),
+`run_iters` taking min over 10 dispatches inside each:
+
+    12993.8   12703.5   12651.9 us     median 12703.5, spread 342 us = 2.7%
+
+which is the same-build run-to-run spread this log already measured at 2.6%. The first
+run is the outlier and it is the one immediately after the build; the two later ones
+agree to 0.4%.
+
+    token = 12703.5 + 2994.2 (lm_head, measured separately at its own size)
+          = 15697.7 us  ->  63.7 tok/s      FLM 61.18, +4.1%
+    range over the three runs   62.5 - 63.9 tok/s   (+2.2% to +4.4%)
+
+**This is not a projection.** Every earlier figure in this log multiplied a fitted
+per-layer slope by sixteen and added a separately fitted floor; the slope noise was
+amplified 16x, which is how 65.4 / 64.0 / 64.4 / 64.5 turned out to be the same
+measurement four times. Here the dispatch is measured as the thing it is, and only
+lm_head is added.
+
+Correctness on the same build — 16 layers from the BOS embedding at position 0:
+
+    device x16   mean|.| 1.74863   max 147.000
+    host   x16   mean|.| 1.74094   max 148.668
+    cosine vs the validated host forward   0.999650    (32-dispatch chain: 0.999659)
+    argmax 16309   +6.9362   then 2, 1340, 791, 1757
+
+The fused design is indistinguishable from the verified 32-dispatch chain on the
+external bar.
+
+### A's weight fifos are memtile input channels, and that is worth 507 us a token
+
+Three consolidations fit the 22-input union into 16. Only two of them are free.
+
+    AQ=2   A weights 2 fifos, split 1->4   13500.9 us   45.3 GB/s   843.8 us/layer   60.6 tok/s
+    AQ=4   A weights 4 fifos, split 1->2   12993.8 us   47.1 GB/s   812.1 us/layer   62.5 tok/s
+
+Every fifo is a memtile input channel and A streams 3.96 MB a layer through them, so
+collapsing 4 into 2 halves that bandwidth. **The design that fit the shim budget most
+comfortably was 0.9% SLOWER than FastFlowLM; the one that fits it exactly is 4% faster.**
+
+B's KV pays for the shim inputs instead — 82 KB a layer against A's 3.96 MB — so the
+final shape is 1 + 4 + 2 + 1 + 8 = 16 inputs, exactly at the measured ceiling, and 14
+outputs. At `ASPL=2` A's weight topology is identical to `groups_ab`'s; the only
+surviving consolidations are B's KV and A's k'/v' joins.
+
+The lesson generalises past this design. A consolidation chosen to satisfy a *placement*
+constraint is a *bandwidth* decision, and the two budgets are not visible in the same
+place: the shim count appears in a placer error, and the cost of the fix appears nowhere
+until it is timed. Both consolidations placed. One of them cost 3.5 tok/s.
+
+Memtile channels now sit at **46 in / 46 out of 48**, against the 40/36 `channel_probe`
+verified. It places and loads, and it has room for no further fifo at all — the next
+phase, seam or debug drain hits the wall immediately.
+
+### 31 us a layer are unexplained, and I am not attributing them
+
+    measured    794.0 - 812.1 us/layer
+    projected   775.3 = 123.6 (A+B, 8-point fit) + 651.7 (C, 8-point fit)
+
+Three candidates, none isolated:
+
+  1. **A runs at NROWS=8 here**, where `groups_ab` runs 16, so one operand size and one
+     set of compile flags serve the whole array. The log measures the bandwidth part at
+     4.5%, about 5.6 us/layer, and says nothing about doubling the acquire/release count
+     per core per layer (48 objects instead of 24).
+  2. **Additivity was an assumption.** Both slopes were fitted on designs that owned the
+     machine. Fused, they share memtiles, shim channels and DDR. Nothing has ever tested
+     whether two slopes measured in isolation add.
+  3. **C may be slower fused**: its environment changed most — 46/46 of 48 channels
+     shared with A and B, and 1360 B more core code.
+
+The obvious move is to subtract: A+B = 812.1 - 651.7 = 160.4 against a fitted 123.6.
+That subtraction assumes candidate 3 is false, which is exactly the thing it would be
+used to prove. It is the same shape as the P3&P4 derivation earlier in this log that
+double-counted a saving, and it is not reported here as a measurement.
+
+Candidate 2 is the one worth chasing beyond this design, because it invalidates a
+*method* rather than a number: every projection in this log summed slopes measured on
+designs that had the machine to themselves.
+
+### The first tolerance here that is not fitted to what was already seen
+
+The fused harness bounds each phase at **two bf16 representable steps of that phase's own
+peak**, computed from the format:
+
+    ulp2(v) = 2 * 2 ** (floor(log2(|v|)) - 7)
+
+A drained value *is* bf16, so one representable step is the smallest disagreement two
+values of that size can have; two allows the reference its own rounding. Nothing about
+it comes from an observed worst case. Every other bound in this log — the 2-ULP attention
+envelope, P3's 1e-5, P4's 4% — was fitted to runs already done, and two of them were then
+widened when a later run breached them.
+
+It also forced a distinction that one number cannot carry. The first 16-layer run printed
+FAIL with `h` flat at 4.0 from layer 4 to layer 15, which looked like a fault and is not:
+max|h| is flat at ~405 across those layers and the bf16 step at 405 is 2.0, so 4.0 is two
+steps. The reference was a pure host chain from x0, so by layer 15 it and the device were
+two independent chains through fifteen layers of 4-bit arithmetic and the per-element max
+was accumulated divergence, not any layer's floor.
+
+Splitting it answers both questions instead of neither:
+
+    seams   the chain from x0, end to end -- the cosine and the token
+    floor   each phase against a reference recomputed from the DEVICE's own x_L,
+            so both sides share a known input
+
+This is **not** the "phase fed a host reference" fault that cost this log two retractions.
+That fault had a phase *consuming* a host value instead of the previous phase's device
+output, so the seam between them was never exercised and a broken seam still passed. Here
+the seams are precisely what the first check tests.
+
+Per phase, per layer, on the AQ=4 build:
+
+    attn   1.1e-03 to 3.9e-03    inside the envelope at EVERY layer
+    h      9.8e-04 to 3.1e-02    against 4.0 at max|h| ~ 405
+    x_out  1.6e-02 to 1.0        against 2.0 - 4.0
+    sw     5.0e-01 against 1.1e+01 (4% of peak) = 0.45% of peak
+
+Attention stays inside the envelope at all sixteen layers. **That is not an improvement
+over the 32-dispatch chain and must not be read as one.** The chain run that breached at
+layers 11 and 12 (2.16 and 2.20 ULP) was `chain_layers.sh 16` at its default POS=30; this
+run is at pos 0, where the softmax is over a single entry and the output must equal that
+entry's V — `groups_ab` measures 0.00 ULP there, bit-exact. The chain's own pos-0 run
+shows no breach either. Both designs pass at pos 0; the fused design's behaviour at pos 30
+is simply untested, because position is still a build parameter here.
+
+I nearly recorded this as a difference worth explaining. Two runs at different positions
+are not a comparison, and a phantom improvement in a log is worse than a gap in one:
+someone will eventually try to account for it.
+
+### Regression sweep: the fused work broke nothing
+
+Every pre-existing design re-run after `fused.py` landed:
+
+    group_a       q' 3.8147e-06   k' 0.0000e+00   v' 5.9605e-08          PASS
+    groups_ab     attn 0.50 ULP   k' 0.0000e+00   v' 5.9605e-08          PASS   (pos 30)
+    group_c       P3 0.0000e+00   P4 2.9297e-03   P5 7.4506e-09          PASS   (seq 31)
+    p5_pass       x_out 0.0000e+00                                       PASS
+    16-layer      argmax 16309  +6.9032                                  exit 0
+
+Identical to the previous sweep in every digit, which is the expected result: `fused.py`
+is a new file, the kernels are untouched, and its two new compile flags
+(`RESID_FROM_STASH`, `XOUT_TO_STASH`) are per-design, so no other caller of
+`flm_gemv_down.cc` sees them. That last point was worth checking rather than asserting —
+the reason `flm_gemv_residual.cc` carries a separately named `P3_RESID_FROM_STASH` is
+that reusing one name for both broke `resid_chain` the moment it was tried.
+
+`channel_probe.py`'s docstring now says what it does and does not cover. Its "40 in / 36
+out places" is a memtile result and was read here as settling the fused design's channel
+demand; it could not, and the shim is where the union actually fails.
