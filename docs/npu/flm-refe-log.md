@@ -13228,3 +13228,36 @@ lm_head, which is 23% of the token and inherited. A 1.6% margin still sits insid
 those two, so this does not yet establish beating FLM — it establishes that the
 per-layer compute, which is 77% of the token, is measured end to end and lands
 slightly ahead.
+
+### lm_head's 3700 us was stale — re-measured at 2994, and the projection moves to 65.0
+
+Re-measured today at lm_head's own size, same geometry:
+
+    163.7 MB   54.7 GB/s   2994.2 us     97% of the 56.5 GB/s roof
+
+The projection has been carrying **3700 us**. That number came from an assumed
+48.6 GB/s. lm_head was measured at 55.1 GB/s and 2980 us wall *in this same log*,
+and the per-dispatch fit `92.9 + 17.547 x MB` independently gives 2974 us for
+164.2 MB. Three sources agree near 2980-2994; only the carried figure disagrees.
+
+    lm_head   carried 3700 : token  16089.0 us ->  62.2 tok/s   FLM 61.18  +1.6%
+    lm_head measured  2994 : token  15383.2 us ->  65.0 tok/s   FLM 61.18  +6.3%
+
+So the term was not merely unverified — it had already been superseded, and every
+projection since kept quoting it while labelling it "carried, not re-measured". The
+label was honest about the provenance and wrong about the situation: it read as "we
+have not checked this", when the truth was "we checked this and did not propagate
+the result". Flagging a number as uncertain is not the same as acting on it, and a
+caveat repeated across a dozen entries stops being read.
+
+Current standing, every compute term measured:
+
+    A+B  16 layers :   2089.7 us   (measured slope 124.8/layer)
+    C    16 layers :  10299.3 us   (measured slope 637.9/layer)
+    lm_head        :   2994.2 us   (measured today)
+    token          :  15383.2 us  ->  65.0 tok/s     FLM 61.18, +6.3%
+
+The one remaining absent term is the A+B-to-C handoff. A previous entry estimated
+staging at 5.6 us per layer, which would be ~90 us per token — 0.6%, well inside the
++6.3% margin. That estimate is not a measurement and the wiring does not exist yet,
+so it is not folded in.
