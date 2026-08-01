@@ -14488,3 +14488,36 @@ blocker was wrong. The pattern for the day is consistent: every claim I made fro
 outside in — drain descriptors, offsets, alignment, build parameters — was wrong until I
 opened the thing that implements it. `flm_kv_pair.h` had the K mechanism in its header;
 `objectfifo.py` had the runtime offset in its signature.
+
+### The ATTN_MASK_PAD kernels, compiled and compared against the old ones
+
+I claimed this flag was a correctness fix and never measured what it cost. Doing that
+now, since "it only adds a select" is the same kind of assertion that has been wrong all
+day.
+
+    time, A+B at pos 30, one layer
+      MASK=0   217.7 us   (marginal 124.8)
+      MASK=1   203.9 us   (marginal 111.0)      11% FASTER
+
+    layer slope, 1/2/4 layers
+      before   219.2 / 340.1 / 593.6   ->  124.8 us/layer
+      now      206.6 / 330.8 / 582.7   ->  125.4 us/layer      +0.5%
+
+    program memory, max across cores
+      MASK=0   .text 9440 (57% of 16 KB)   .bss 1152
+      MASK=1   .text 9440 (57% of 16 KB)   .bss 1152      identical
+
+So the mask is not a cost. It is ~14 us cheaper per dispatch, because it deletes
+`flm_attn_finish`'s per-head `npad_f * exp2(-g_m[h])` — a vector exp2 and a broadcast per
+head — and the `select` it adds is cheaper than what it removes. The saving is fixed per
+dispatch, not per layer: the slope is unchanged at ~125 us/layer, so the 65.4 tok/s
+projection stands either way.
+
+Program memory is byte-identical. The constexpr lane table is 128 bytes of `.rodata` and
+did not move `.text` or `.bss` at this granularity.
+
+Two things this corrects about how I reported it. The first `ATTN_MASK_PAD` entry said the
+toggle was "clean and nothing else moved" on the strength of numerical output alone —
+true of correctness, untested for cost. And the slope of 124.8 us/layer in the projection
+was measured on code that has since changed twice; it happens to be right, but nothing
+until now established that.
