@@ -13957,3 +13957,46 @@ What survives and what does not:
 The 0.0120 cosine is worth keeping as the headline number: sixteen layers of agreement
 with my own reference to the last bit, and near-orthogonality to the model it claims to
 be reproducing. Internal consistency measured nothing.
+
+### Correction: group C's internal seams are host-fed, not composed
+
+Looking for where P5's residual should come from turned up a second wrong claim of
+mine. I wrote, in the CURRENT STATE and twice elsewhere, that "C's h->P4 and sw->P5
+seams close inside the dispatch". They do not.
+
+    h_act = rnd(h_ref.astype(np.float32))     # h_ref is the HOST's P3 reference
+    swv   = sw_ref.astype(np.float32)         # sw_ref is the HOST's P4 reference
+
+P4's broadcast is built from the host's h, and P5's from the host's sw. The device's
+own h *is* drained and checked against `h_ref` — that is what the P3 number reports —
+but P4 never consumes it. Each phase is verified independently against a host
+reference and fed a host reference.
+
+What is real, and what the timing measures, is the dispatch structure: three phases and
+three barriers in one dispatch, sixteen cores, the layer loop. The 637.9 us/layer slope
+is unaffected, because the same work happens either way — only the provenance of the
+input bytes differs.
+
+What is not real is "the layer composes inside C". Across the whole chain the honest
+picture is:
+
+    A+B -> C      device attention output, through a file          REAL
+    C's P3        device, from that attention output               REAL
+    P3 -> P4      host h_ref                                       host-fed
+    P4 -> P5      host sw_ref                                      host-fed
+    C -> A        device x_out, through a file                     REAL
+
+So the cross-group seams carry device data and the intra-C ones do not. That still
+leaves the sixteen-layer chain meaningful as a test of the cross-group plumbing, and
+meaningless as a test of whether C's three phases compose — which was never exercised.
+
+This compounds the residual bug rather than being separate from it. P5 must add h, and
+h is produced inside the same dispatch, so a host-prepared broadcast cannot carry it —
+the buffer is filled before the dispatch starts. That is precisely what
+`P3_RESID_FROM_STASH` and `XOUT_TO_STASH` exist for: P3 stashes h on-core, P5 reads it
+from there. The flags were built for this and are not wired in.
+
+Two claims of mine failed the same way this session: both were about data flowing
+between phases, and both were checked by looking at whether each phase's *output* was
+right rather than at where its *input* came from. A phase fed a correct host reference
+produces a correct output and tells you nothing about the seam ahead of it.
