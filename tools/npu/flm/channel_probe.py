@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Does the FUSED design's memtile channel demand actually place?
+"""Does the FUSED design's MEMTILE channel demand actually place?
+
+**This probe answers one budget and there are two.** It builds 12 fills and 12
+drains, so it never exercised the SHIM, which on NPU2 is 8 shim tiles x 2
+channels each way = a hard 16 in / 16 out (measured). The naive union of
+`groups_ab` and `group_c` asks the shim for 22 in / 18 out and the placer refuses
+with "no ShimNOCTile has sufficient DMA capacity". Passing here says nothing
+about that.
+
+`fused.py` fits both budgets, at 16 shim in / 14 out and 46 memtile in / 46 out
+— tighter on the memtile side than the 40/36 below, and with room for no further
+fifo at all.
+
 
 The 64.5 tok/s projection assumes `groups_ab` and `group_c` fuse into one
 dispatch. Everything else about that has been checked — placement and routing at

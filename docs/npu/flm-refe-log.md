@@ -15163,3 +15163,24 @@ is simply untested, because position is still a build parameter here.
 I nearly recorded this as a difference worth explaining. Two runs at different positions
 are not a comparison, and a phantom improvement in a log is worse than a gap in one:
 someone will eventually try to account for it.
+
+### Regression sweep: the fused work broke nothing
+
+Every pre-existing design re-run after `fused.py` landed:
+
+    group_a       q' 3.8147e-06   k' 0.0000e+00   v' 5.9605e-08          PASS
+    groups_ab     attn 0.50 ULP   k' 0.0000e+00   v' 5.9605e-08          PASS   (pos 30)
+    group_c       P3 0.0000e+00   P4 2.9297e-03   P5 7.4506e-09          PASS   (seq 31)
+    p5_pass       x_out 0.0000e+00                                       PASS
+    16-layer      argmax 16309  +6.9032                                  exit 0
+
+Identical to the previous sweep in every digit, which is the expected result: `fused.py`
+is a new file, the kernels are untouched, and its two new compile flags
+(`RESID_FROM_STASH`, `XOUT_TO_STASH`) are per-design, so no other caller of
+`flm_gemv_down.cc` sees them. That last point was worth checking rather than asserting —
+the reason `flm_gemv_residual.cc` carries a separately named `P3_RESID_FROM_STASH` is
+that reusing one name for both broke `resid_chain` the moment it was tried.
+
+`channel_probe.py`'s docstring now says what it does and does not cover. Its "40 in / 36
+out places" is a memtile result and was read here as settling the fused design's channel
+demand; it could not, and the shim is where the union actually fails.
