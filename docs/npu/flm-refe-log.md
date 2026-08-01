@@ -14651,3 +14651,34 @@ code that exists rather than inherited.
 
 What it still assumes is unchanged and is the whole remaining question: that the two
 halves fuse into one dispatch. Interleaved they are 55 tok/s.
+
+### 32 cores load and run at full operand size — but at 24 channels, not 40
+
+Adding `--touch` to the skeleton separates two things the earlier failed build conflated:
+the fifo OBJECT stays 2576 int32 (10304 B), so DMA, memtile and routing demands are
+unchanged, while each core's body writes only 8 elements instead of copying all of them.
+
+    building the stream topology at 2576 int32 (10304 B/object)...
+     -> 32 cores in three groups PLACE AND ROUTE
+    exit=1, on the data check only
+
+It got past CDO and executed. The earlier run died at
+`_XAie_LoadProgMemSection(): Overflow of program memory` — so that failure was the copy
+loops unrolling (7779 lines of IR on group A), exactly as the IR line counts suggested,
+and not the topology. The data check fails because with `--touch 8` only 8 of 2576
+elements are written; it is meaningless by construction here.
+
+**What this does not establish**, and this is the third time this script has invited the
+same over-claim from me:
+
+    built topology       6 MemTiles    24 in,  6 out
+    union of the designs 24 MemTiles   40 in, 36 out
+
+The skeleton routes intermediates core-to-core, so it needs 24 input channels. The union
+of `groups_ab` and `group_c` as they actually exist needs 40. Loading at 24 says nothing
+about 40 — the budget is 48, and the earlier 32-core attempt died at exactly this kind of
+margin.
+
+So: 32 cores with full-size objects can place, route, load and run, which was not
+previously demonstrated at all. The specific configuration the projection depends on
+still has not been built.

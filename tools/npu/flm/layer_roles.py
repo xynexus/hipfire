@@ -147,7 +147,7 @@ def role_layout():
     return head_layout(A_CORES)
 
 
-def build_skeleton(elems=64):
+def build_skeleton(elems=64, touch=0):
     """The stream topology with trivial kernels: does 32 cores in three groups
     place and route, and does every stream deliver?
 
@@ -162,6 +162,7 @@ def build_skeleton(elems=64):
     256". **That is the fifth time this session**; every probe that varies a
     parameter now interpolates it into the source rather than closing over it.
     """
+    touch = touch or elems
     src = f"""
 def _design(a: In, o0: Out, o1: Out, o2: Out, o3: Out):
     ty = np.ndarray[({elems},), np.dtype[np.int32]]
@@ -186,19 +187,19 @@ def _design(a: In, o0: Out, o1: Out, o2: Out, o3: Out):
 
     def core_a(ic, oc):
         e = ic.acquire(1); r = oc.acquire(1)
-        for k in range({elems}):
+        for k in range({touch}):
             r[k] = e[k] + 1
         oc.release(1); ic.release(1)
 
     def core_b(ic, oc):
         e = ic.acquire(1); r = oc.acquire(1)
-        for k in range(part):
+        for k in range(min(part, {touch})):
             r[k] = e[k] + 2
         oc.release(1); ic.release(1)
 
     def core_c(ic0, ic1, oc):
         e0 = ic0.acquire(1); e1 = ic1.acquire(1); r = oc.acquire(1)
-        for k in range(part):
+        for k in range(min(part, {touch})):
             r[k] = e0[k] + e1[k] + 3
         oc.release(1); ic1.release(1); ic0.release(1)
 
@@ -224,7 +225,7 @@ def _design(a: In, o0: Out, o1: Out, o2: Out, o3: Out):
 """
     ns = dict(np=np, iron=iron, In=In, Out=Out, ObjectFifo=ObjectFifo,
               Program=Program, Runtime=Runtime, TaskGroup=TaskGroup,
-              Worker=Worker, AnyShimTile=AnyShimTile, __name__=f"rl{elems}")
+              Worker=Worker, AnyShimTile=AnyShimTile, __name__=f"rl{elems}_{touch}")
     exec(src, ns)
     return iron.jit(ns["_design"])
 
@@ -233,6 +234,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--skeleton", action="store_true",
                     help="build the stream topology with trivial kernels")
+    ap.add_argument("--touch", type=int, default=0,
+                    help="elements each core actually writes; 0 means all of them.\n"
+                         "The fifo OBJECT stays --elems wide either way, so the DMA,\n"
+                         "memtile and routing demands are unchanged — only the core\n"
+                         "program shrinks. At --elems 2576 the full copy unrolls to\n"
+                         "7779 lines of IR on group A and overflows the 16 KB program\n"
+                         "memory at CDO time, which says nothing about the topology.")
     ap.add_argument("--elems", type=int, default=64,
                     help="object size in int32; the real operand is 2576 int32 "
                          "(10304 B), so 64 does not prove much on its own")
@@ -255,7 +263,7 @@ def main():
               f"({o.elems * 4} B/object)...")
         a = iron.zeros(o.elems, dtype=np.int32, device="npu")
         outs = [iron.zeros(o.elems, dtype=np.int32, device="npu") for _ in range(4)]
-        build_skeleton(o.elems)(a, *outs)
+        build_skeleton(o.elems, o.touch)(a, *outs)
         # Running is not enough: a topology that misroutes still runs. Trace the
         # arithmetic — A adds 1, B adds 2, C adds both halves plus 3 — so with a
         # zero input every output element must be (1+2) + (1+2) + 3 = 9. A wrong
