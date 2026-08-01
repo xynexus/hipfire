@@ -378,3 +378,116 @@ def recall_curve(ks=(1, 2, 4, 8, 16, 32, 64)):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# --------------------------------------------------------------------------
+# The oq4 tier — Opus Quant W4A4 (`Oq4G256`), the bandwidth probe's format.
+# --------------------------------------------------------------------------
+# Symmetric signed-INT4, one f16 scale per 256-element GROUP, against the coarse
+# tier's one f32 scale per ROW. 4.0625 bits/weight either way to within 1.2%, so
+# a device A/B between them isolates tile SHAPE from tile SIZE.
+#
+# NOT the full oq4++ recipe: hipfire's `quantize_oq4g256` FWHT-rotates the weights
+# and calibrates with AWQ clip-search plus LDLQ error feedback. None of that
+# changes the byte count or the streaming pattern, which is what the probe
+# measures. It changes ACCURACY, so no accuracy claim may be made from this.
+OQ4_GROUP = 256
+
+
+def build_oq4(D, M, CODES, chunk=8192, group=OQ4_GROUP):
+    """(D, M, CODES) q4_1 blocks -> (nib uint8 [rows, cols//2], f16 [rows, ng]).
+
+    Chunked for the same reason `build_coarse` is: the whole [128256, 2048]
+    matrix as float32 is a gigabyte and there is no reason to hold it.
+    """
+    rows, nb = D.shape
+    cols = nb * BLK
+    if cols % group:
+        raise ValueError(f"cols {cols} is not a whole number of {group}-groups")
+    ng = cols // group
+    nib = np.empty((rows, cols // 2), np.uint8)
+    gscale = np.empty((rows, ng), np.float32)
+    for lo in range(0, rows, chunk):
+        hi = min(lo + chunk, rows)
+        W = (D[lo:hi, :, None] * CODES[lo:hi] + M[lo:hi, :, None]).reshape(-1, cols)
+        Wg = W.reshape(-1, ng, group)
+        # Symmetric: the scale is set by the group's peak magnitude over 7, and
+        # codes land in [-7, 7]. int4 also holds -8, but a symmetric codebook
+        # that used it would be asymmetric about zero by one step.
+        amax = np.abs(Wg).max(2).astype(np.float32)
+        s = amax / np.float32(7.0)
+        inv = np.where(s > 0, np.float32(1.0) / np.maximum(s, np.float32(1e-30)), 0.0)
+        q = np.clip(np.rint(Wg * inv[:, :, None]), -7, 7).astype(np.int8)
+        u = q.reshape(-1, cols).view(np.uint8) & np.uint8(0x0F)
+        nib[lo:hi] = u[:, 0::2] | (u[:, 1::2] << 4)
+        gscale[lo:hi] = s
+    # THE ON-DISK WIDTH IS f16; THE KERNEL TILE'S IS bf16. Both are 2 bytes, so
+    # the byte count -- and every bandwidth number derived from it -- is
+    # identical, but the exponent layouts are not: packing f16 and reading bf16
+    # gave rel error 1.0 and argmax 128000 against 16309, with nothing to
+    # complain about because the widths matched. Converting f16 -> bf16 is
+    # precisely the job the format's per-arch loader repack exists to do, since
+    # AIE2P's native 2-byte float is bf16.
+    #
+    # Returned as f32 holding bf16-REPRESENTABLE values, so the host reference
+    # and the device tile carry the same numbers and a disagreement means the
+    # kernel is wrong rather than the rounding.
+    #
+    # Cost: bf16 keeps 8 mantissa bits against f16's 11, so a group scale is
+    # good to ~0.4% instead of ~0.05%. That is a real accuracy question for the
+    # port -- f32 scales would fix it at 4.125 b/w instead of 4.0625 -- and it
+    # is NOT settled by this probe, which measures bandwidth.
+    return nib, q4nx.bf16_to_f32(q4nx.f32_to_bf16(gscale))
+
+
+def oq4_unpack(nib):
+    """[rows, cols//2] packed nibbles -> [rows, cols] int8 in [-7, 7].
+
+    Byte j carries element 2j in its LOW half and 2j+1 in its HIGH half, which
+    is what `build_oq4` packs and what the kernel's `int4` load expects. The
+    `^8 - 8` is 4-bit two's-complement sign extension.
+    """
+    rows, half = nib.shape
+    out = np.empty((rows, half * 2), np.int8)
+    out[:, 0::2] = ((nib & np.uint8(0x0F)).astype(np.int8) ^ 8) - 8
+    out[:, 1::2] = ((nib >> 4).astype(np.int8) ^ 8) - 8
+    return out
+
+
+def oq4_logits(nib, gscale, act, group=OQ4_GROUP, chunk=16384):
+    """The oq4 GEMV, the arithmetic the NPU kernel has to reproduce.
+
+    out[r] = sum_g scale[r,g] * (Q[r,g] . act[g]) — the group sum is formed
+    first and scaled once, exactly as the kernel does it, because scaling each
+    product instead would round in a different place.
+    """
+    rows = nib.shape[0]
+    cols = nib.shape[1] * 2
+    ng = cols // group
+    a = np.asarray(act, np.float32).reshape(ng, group).astype(np.float64)
+    out = np.empty(rows, np.float64)
+    for lo in range(0, rows, chunk):
+        hi = min(lo + chunk, rows)
+        q = oq4_unpack(nib[lo:hi]).reshape(-1, ng, group).astype(np.float64)
+        part = np.einsum("rgk,gk->rg", q, a)
+        out[lo:hi] = (part * gscale[lo:hi].astype(np.float64)).sum(1)
+    return out
+
+
+def oq4_tier():
+    """(nib, gscale), cached — the oq4 analogue of `coarse_tier`."""
+    p = CACHE / "lmhead_oq4.npz"
+    if p.exists():
+        z = np.load(p)
+        return z["nib"], z["gscale"]
+    D, M, C = lmhead_blocks()
+    t0 = time.time()
+    nib, gscale = build_oq4(D, M, C)
+    print(f"  built oq4 tier in {time.time() - t0:.1f} s")
+    np.savez(p, nib=nib, gscale=gscale)
+    return nib, gscale
+
+
+def oq4_bytes(rows=VOCAB, cols=K_DIM, group=OQ4_GROUP):
+    """4 bits a weight plus one f16 scale per group = 130 B per 256 weights."""
+    return rows * cols // 2 + rows * (cols // group) * 2

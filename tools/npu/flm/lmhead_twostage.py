@@ -72,20 +72,48 @@ HOST_BASE_US = 5.63
 EXACT_LMHEAD_US = 3010.6     # the q4_1 lm_head dispatch, run HELD
 
 
-def tile_bytes(K, NROWS):
-    """[NROWS f32 scales, padded to 64][NROWS*K/2 nibbles].
+# The oq4 probe rides this same harness rather than getting its own file, so the
+# A/B is INTERLEAVED in one process by construction -- the rule this tree learned
+# the hard way when a sequential A/B called chunk=16 a 40% win twice and it was a
+# loss both times.
+OQ4_SRC = str(Path(__file__).resolve().parents[3] / "kernels/npu/flm_gemv_oq4g256.cc")
+OQ4_GROUP = 256              # Oq4G256 -- the G in the format name
+
+# (kernel symbol, source, scale-plane bytes) per tier. The scale plane is what
+# differs: one f32 per ROW for the coarse tier, one bf16 per 256-GROUP for oq4.
+TIERS = {
+    "coarse": ("flm_gemv_coarse_q4row", KERNEL_SRC, lambda K, N: N * 4),
+    "oq4":    ("flm_gemv_oq4g256", OQ4_SRC, lambda K, N: N * (K // OQ4_GROUP) * 2),
+    # Identical tile and identical loads to "oq4", coarse-tier arithmetic. The
+    # DMA control that separates layout from arithmetic; numerically wrong by
+    # construction, so it is a timing probe only and never a correctness one.
+    "oq4_1s": ("flm_gemv_oq4g256", OQ4_SRC, lambda K, N: N * (K // OQ4_GROUP) * 2),
+}
+# Extra -D flags per tier. These do NOT enter the iron.jit AST hash, so the tier
+# name must differ too -- it is in the fifo tag, which does.
+TIER_FLAGS = {"oq4_1s": ["-DOQ4_ONE_SCALE=1"]}
+
+
+def tile_bytes(K, NROWS, tier="coarse"):
+    """[scale plane, padded to 64][NROWS*K/2 nibbles].
 
     No 64-byte trailer. Every other tile in this tree carries one for
     `row_base`, which replaces per-core indexing; lm_head's output is NROWS
     floats that the fifo already places, so there is nothing for it to carry.
+
+    The codes are K/2 bytes a row in BOTH tiers -- 4 bits flat -- so the tiers
+    differ only in the scale plane, and at K=2048, NROWS=16 that is 64 B for
+    coarse against 256 B for oq4. 16448 vs 16640 bytes, 1.2% apart, which is
+    what makes this a controlled comparison of tile SHAPE rather than of size.
     """
-    return (((NROWS * 4) + 63) & ~63) + NROWS * (K // 2)
+    return ((TIERS[tier][2](K, NROWS) + 63) & ~63) + NROWS * (K // 2)
 
 
-def build(K, NROWS, ncores, tiles_per_core):
+def build(K, NROWS, ncores, tiles_per_core, tier="coarse"):
     if ncores % 2:
         raise ValueError("--cores must be even (cores are wired in pairs)")
-    wtile = tile_bytes(K, NROWS)
+    kern_name, kern_src, _ = TIERS[tier]
+    wtile = tile_bytes(K, NROWS, tier)
     rows_per_core = tiles_per_core * NROWS
     npairs = ncores // 2
 
@@ -106,13 +134,18 @@ def build(K, NROWS, ncores, tiles_per_core):
     # iron.jit hashes the design's AST, and `compile_flags` are NOT in it -- two
     # variants with byte-identical source silently share one build. Stamp the
     # shape into a fifo NAME so the cache key moves when the flags do.
-    tag = f"c{K}x{NROWS}"
+    # The tier MUST be in the tag: iron.jit hashes the AST and the two tiers
+    # differ only in a string and a byte count, so without this they would
+    # silently share one cached ELF and the "comparison" would be one design
+    # measured twice.
+    tag = f"{tier}{K}x{NROWS}"
+    extra_flags = TIER_FLAGS.get(tier, [])
     src = f'''
 def _design(act: In, {params}):
     kern = ExternalFunction(
-        "flm_gemv_coarse_q4row", source_file=KERNEL_SRC,
+        "{kern_name}", source_file=KERN_SRC,
         arg_types=[act_ty, wt_ty, o_ty],
-        compile_flags=["-DDIM_K={K}", "-DDIM_NROWS={NROWS}"])
+        compile_flags=["-DDIM_K={K}", "-DDIM_NROWS={NROWS}"] + {extra_flags})
 
     # depth=1: the activation is acquired ONCE and held for the whole tile
     # loop, so a second buffer has nothing to overlap with and is dead L1.
@@ -173,7 +206,7 @@ def _design(act: In, {params}):
     ns = dict(np=np, iron=iron, In=In, Out=Out, ObjectFifo=ObjectFifo,
               Program=Program, Runtime=Runtime, Worker=Worker,
               AnyShimTile=AnyShimTile, range_=range_,
-              ExternalFunction=ExternalFunction, KERNEL_SRC=KERNEL_SRC,
+              ExternalFunction=ExternalFunction, KERN_SRC=kern_src,
               act_ty=act_ty, wt_ty=wt_ty, o_ty=o_ty,
               wpair_ty=wpair_ty, opair_ty=opair_ty,
               w_pair_all_ty=w_pair_all_ty, o_pair_all_ty=o_pair_all_ty,
@@ -183,7 +216,7 @@ def _design(act: In, {params}):
     exec(src, ns)
     # full_elf: the vararg dispatch path caps at ~20 host buffers, fails as a
     # firmware hang rather than an error, and is ~34% slower where it works.
-    return iron.jit(ns["_design"], source_files=[KERNEL_SRC], full_elf=True), wtile
+    return iron.jit(ns["_design"], source_files=[kern_src], full_elf=True), wtile
 
 
 def pack_tiles(nib, scale, NROWS, wtile):
@@ -197,6 +230,31 @@ def pack_tiles(nib, scale, NROWS, wtile):
     # laid out contiguously first and copied in as bytes.
     out[:, :NROWS * 4] = (np.ascontiguousarray(scale, np.float32)
                           .reshape(ntiles, NROWS).view(np.uint8))
+    out[:, sb:] = nib.reshape(ntiles, NROWS * half)
+    return out
+
+
+def pack_tiles_oq4(nib, gscale, NROWS, wtile):
+    """The oq4 tier -> one (ntiles, wtile) uint8 array, in row order.
+
+    Same shape of job as `pack_tiles`, and deliberately the same row order, so
+    the two tiers stream identical amounts of identical structure and the only
+    difference the device sees is the scale plane: NROWS*NG f16 here against
+    NROWS f32 there.
+    """
+    rows, half = nib.shape
+    assert rows % NROWS == 0, f"{rows} rows is not a multiple of NROWS={NROWS}"
+    ntiles = rows // NROWS
+    ng = gscale.shape[1]
+    sb = wtile - NROWS * half
+    out = np.zeros((ntiles, wtile), np.uint8)
+    # Contiguous first, then viewed as bytes -- a column slice of a 2-D array is
+    # not contiguous and .view(uint8) on it raises.
+    # bfloat16, NOT np.float16 -- see build_oq4. The widths match either way,
+    # which is why this failed silently rather than loudly.
+    out[:, :NROWS * ng * 2] = (np.ascontiguousarray(gscale, np.float32)
+                               .astype(bfloat16)
+                               .reshape(ntiles, NROWS * ng).view(np.uint8))
     out[:, sb:] = nib.reshape(ntiles, NROWS * half)
     return out
 
@@ -294,6 +352,20 @@ def bench_exact(NROWS, ncores, tiles_per_core, act, iters):
     return redo, ncores * tiles_per_core * wtile
 
 
+def bench_oq4(NROWS, ncores, tiles_per_core, act, iters, tier="oq4"):
+    """The oq4 tier through the SAME driver as the coarse one.
+
+    Returns what `device_run` returns, so the caller gets timing and the device
+    logits from one path -- a bandwidth number from a kernel whose output was
+    never checked is worth nothing, and this tree has shipped exactly that.
+    """
+    nib, gscale = lc.oq4_tier()
+    design, wtile = build(K_DIM, NROWS, ncores, tiles_per_core, tier=tier)
+    tiles = pack_tiles_oq4(nib, gscale, NROWS, wtile)
+    return device_run(design, wtile, NROWS, ncores, tiles_per_core,
+                      tiles, act, iters) + (wtile, nib, gscale)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -305,6 +377,8 @@ def main():
     p.add_argument("--gate", action="store_true", help="two-pass argmax on EVERY probe")
     p.add_argument("--vs-exact", action="store_true",
                    help="also time the exact q4_1 lm_head, same session, same driver")
+    p.add_argument("--vs-oq4", action="store_true",
+                   help="build the oq4 tier and A/B it against coarse, INTERLEAVED")
     p.add_argument("--rounds", type=int, default=5,
                    help="interleaved A/B rounds when --vs-exact")
     o = p.parse_args()
@@ -353,6 +427,55 @@ def main():
           f"min {w.min():.1f} median {us:.1f} max {w.max():.1f} "
           f"spread {(w.max()/w.min()-1)*100:.1f}%")
     print(f"  {gbs:.1f} GB/s")
+
+    if o.vs_oq4:
+        # THE BANDWIDTH PROBE. Same activation, same driver, same row order,
+        # same 4-bits-a-weight codes; the tiers differ only in the scale plane
+        # (NROWS f32 per tile against NROWS*NG f16). 131.9 MB against 133.4 --
+        # 1.2% apart -- so a GB/s difference is the tile SHAPE and nothing else.
+        oq_logits, _, oq_bytes, _, oq_redo, oq_wtile, oq_nib, oq_gs = \
+            bench_oq4(NROWS, ncores, tiles_per_core, xn, o.iters)
+        # CORRECTNESS FIRST. A bandwidth number from an unchecked kernel is
+        # worth nothing. Take the argmaxes BEFORE any subtraction: numpy 2.1.3
+        # on 3.14 elides `a - b` into `a` when the refcount says throwaway, and
+        # this file has already printed a bogus argmax from exactly that.
+        ref = lc.oq4_logits(oq_nib, oq_gs, xn)
+        dev_am, ref_am = int(np.argmax(oq_logits)), int(np.argmax(ref))
+        err = float(np.abs(np.subtract(oq_logits, ref)).max())
+        print(f"\n  oq4 device vs host: max abs {err:.4e}, "
+              f"rel {err/np.abs(ref).max():.3e}")
+        print(f"  oq4 argmax {dev_am}, host oq4 argmax {ref_am}")
+        assert dev_am == ref_am, "device and host oq4 disagree on the argmax"
+
+        # THE DMA CONTROL: identical tile, identical loads, coarse arithmetic.
+        # Three-way in ONE process so all of it sees the same contention.
+        _, _, _, _, dma_redo, _, _, _ = bench_oq4(
+            NROWS, ncores, tiles_per_core, xn, o.iters, tier="oq4_1s")
+        ca, qa, da = [], [], []
+        for _ in range(o.rounds):
+            ca.append(redo(o.iters)[1:])
+            qa.append(oq_redo(o.iters)[1:])
+            da.append(dma_redo(o.iters)[1:])
+        ct, qt, dt = np.concatenate(ca), np.concatenate(qa), np.concatenate(da)
+        dg = oq_bytes / (dt.min() * 1e-6) / 1e9
+        cg = total / (ct.min() * 1e-6) / 1e9
+        qg = oq_bytes / (qt.min() * 1e-6) / 1e9
+        print(f"\n  interleaved A/B, {o.rounds} rounds x {o.iters-1} warm dispatches:")
+        print(f"    coarse  min {ct.min():7.1f}  median {np.median(ct):7.1f}  "
+              f"{total/1e6:6.1f} MB  {cg:.1f} GB/s   {oq_wtile and total//(ncores*tiles_per_core)} B/tile")
+        print(f"    oq4     min {qt.min():7.1f}  median {np.median(qt):7.1f}  "
+              f"{oq_bytes/1e6:6.1f} MB  {qg:.1f} GB/s   {oq_wtile} B/tile")
+        print(f"    bytes oq4/coarse {oq_bytes/total:.4f}, time {qt.min()/ct.min():.4f}, "
+              f"GB/s {qg/cg:.4f}")
+        print(f"    oq4-1s  min {dt.min():7.1f}  median {np.median(dt):7.1f}  "
+              f"{oq_bytes/1e6:6.1f} MB  {dg:.1f} GB/s   <- SAME TILE, coarse arithmetic")
+        print(f"\n  VERDICT: oq4 reaches {qg:.1f} GB/s against coarse's {cg:.1f} "
+              f"({100*qg/cg-100:+.1f}%).")
+        print(f"  The same tile with COARSE arithmetic reaches {dg:.1f} GB/s "
+              f"({100*dg/cg-100:+.1f}% vs coarse).")
+        print("  -> " + ("the tile SHAPE streams fine; the gap is arithmetic"
+                         if dg > 0.9 * cg else
+                         "the tile SHAPE itself does not stream at the coarse rate"))
 
     exact_us = EXACT_LMHEAD_US
     if o.vs_exact:
