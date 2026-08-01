@@ -15602,3 +15602,32 @@ objects — demonstrated for the layers, assumed for lm_head.** Closing that ass
 single measurement: drive the lm_head-sized dispatch through the held-run path in
 `fused_pyxrt.py` and see whether its wall time converges on 2994 the way the fused
 dispatch's did on 12874.
+
+### The conditional is closed: 63.0 tok/s wall, both halves measured
+
+The previous entry left 63.0 resting on an assumption — that lm_head, like the fused
+dispatch, converges on its device time when the `pyxrt.run` object is held. `PyxrtDesign`
+from `fused_pyxrt.py` turns out to be generic over any `CompilableDesign`, so it drives
+`gemv_bench`'s lm_head-sized build unchanged:
+
+    lm_head-sized dispatch (498 tiles, NROWS=16, 16 cores, 163.7 MB)
+      run HELD           median 3010.6 us   min 2966.5
+      rebound per call   median 4373.9 us   min 4345.8
+
+    for reference, run_iters on the same build: npu.min 2959.5, e2e.min 4599.6
+
+Held converges on the device figure (3010.6 against 2959.5-2994.3); rebound lands near
+run_iters' e2e. Same mechanism as the fused dispatch, now measured rather than argued.
+
+    layers 12874.0 (held, measured) + lm_head 3010.6 (held, measured) = 15884.6 us
+    -> **63.0 tok/s wall, +2.9% over FLM's 61.18**
+
+Both terms are now held-run wall clock, so the comparison against FLM's server-measured
+wall figure is like for like. The conditional recorded one entry ago is discharged.
+
+What remains uncounted, and is the last gap between this and a true end-to-end token: the
+embedding lookup, the final RMSNorm, sampling, and the argmax over 128256 logits. FLM's
+61.18 includes all of it. Those are host-side and small in principle — but `head_verify.py`
+does that argmax in numpy over a dequantised lm_head and takes ~50 s, so "small in
+principle" is not the same as "measured", and a decode loop needs a real implementation of
+it before the end-to-end number exists.
