@@ -13596,7 +13596,19 @@ identical bytes move and the 5% is pure compute — more columns scored per head
     TSEQ=40  13298.4 + 3010.6 + 10.5 = 16319.5 us -> 61.3 tok/s   +0.2% vs FLM
 
 Both rows carry the **exact** lm_head tier so they are comparable to each other and to the
-63.1 above, not to the 64.8 two-pass row; the two-pass saving is orthogonal and stacks.
+63.1 above, not to the 64.8 two-pass row.
+
+**The two-pass saving does stack, and here is the stacked number rather than the claim.**
+Measured 2026-08-02 with `LAYERS_US` corrected to the TSEQ=40 figure:
+
+    TSEQ=40, exact head      13163.3 + 2939.8 + 10.5  = 16184.4 us -> 61.8 tok/s  +1.0%
+    TSEQ=40, two-pass head   13163.3 + 2402.4 + 204.5 = 15770.2 us -> **63.4 tok/s  +3.6%**
+
+**63.4 is the honest headline for the default build.** The 64.6-64.8 previously printed by
+`lmhead_twostage.py` composed a fresh lm_head measurement with `LAYERS_US = 12874.0`, the
+TSEQ=32-era layers figure — a stale constant in a script that re-measures everything else,
+worth ~1.1 tok/s. The exact-head row independently reproduces `decode.py`'s 61.8 from the
+FLM run, which is what cross-checks the corrected constant.
 
 **SETTLED: TSEQ=40 is the default and the 5% is not a trade worth taking here.** This is a
 REFERENCE kernel — its job is to reproduce FLM's tokens and establish what the hardware

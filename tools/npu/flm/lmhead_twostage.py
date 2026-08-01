@@ -58,7 +58,13 @@ from ml_dtypes import bfloat16  # noqa: E402
 
 KERNEL_SRC = str(Path(__file__).resolve().parents[3] / "kernels/npu/flm_gemv_coarse_q4row.cc")
 FLM_TOK_S = 61.18            # FLM's own wall-clock server figure
-LAYERS_US = 12874.0          # fused.py, 16 layers, one dispatch, run HELD
+# fused.py, 16 layers, one dispatch, run HELD. This TRACKS fused.py's TSEQ default
+# and is not a free constant: at TSEQ=32 it was 12874.0, and 40 -- now the default,
+# because it is what clears FLM's 36-token prompt -- costs ~5% in pure compute.
+# Composing a fresh lm_head number with the OLD layers figure overstates every
+# tok/s this file prints by ~1.1. Re-measure with `decode.py` if TSEQ moves again;
+# it is not imported from fused.py because that import builds the design.
+LAYERS_US = 13163.3          # TSEQ=40, decode.py median of 4 held dispatches
 HOST_US = 10.5               # embedding row 0.38 + final RMSNorm 5.25 + argmax 4.89
 # The two-pass decode keeps the first two and REPLACES the 4.89 us full argmax
 # with shortlist + rescore + argmax-of-K, which is measured here.
