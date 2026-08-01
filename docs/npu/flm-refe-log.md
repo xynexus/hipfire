@@ -12813,3 +12813,35 @@ Not taking it. The 0.4% is inside the noise on every measurement feeding this
 projection, and the change touches attention, which has been the most delicate part
 of the system. Recording it so the allocation reads as chosen rather than assumed,
 and so the option is there if 0.4% ever matters.
+
+## 2026-08-01 — group C builds: P3+P4+P5 on 16 cores fit one core's program memory
+
+    C_PROGMEM: building with 51 shaped-zero tensors
+      -> BUILT AND RAN: three bodies fit 16 KB
+
+That is the question group C exists to answer, and it is answered on a real build
+rather than by the probe. Against the record:
+
+    1,3,4,5  four bodies   ~18784 B est   OVERFLOW at stage 37/42, measured
+    3,4,5    three bodies  ~12768 B est   **BUILDS AND RUNS**
+
+So the role split does what it was designed to do: taking P1 and P2 off these
+cores leaves room for the whole projection chain, and a layer's five phases become
+reachable within one dispatch across three groups.
+
+The build passes correctly SHAPED zeros rather than correct data — the question is
+settled at link time and needs none. Anything that mode prints about values is
+meaningless; what it prints about program memory is not.
+
+Two faults on the way, both from importing constants out of context:
+
+  * `p5_lsz` was defined after the f-string that interpolates it. The design source
+    is built by interpolation, so a name defined later is simply absent.
+  * **Quad widths leaked in from the abandoned 32-core plan.** `p3_lsz` at `4 *`,
+    drain descriptors at `sizes=[1, 4, ...]` — group C is 16 cores in PAIRS, so
+    every one of those should be 2. It surfaced as "argument has 659456 elements
+    but the kernel was compiled for 329728", exactly a factor of two.
+
+The second is worth the note: `layer_quad` is kept in the tree as the record of a
+proven-impossible design, and its constants are close enough to the live ones to
+be copied by hand without the mismatch being obvious.

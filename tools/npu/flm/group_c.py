@@ -109,6 +109,7 @@ def build(pos, nobj):
     p4tiles = D_FF // (NCORES * NROWS)      # gate/up steps per core
     NCHUNK = 4
     p5tiles = K_DIM // (NCORES * NROWS)     # rows a core flushes per chunk
+    p5_lsz = 2 * NCHUNK * p5tiles * q4nx.tile_bytes(K_DIM, NROWS)
     # bytes of ONE layer's weights per pair, per phase — the fill offset
     p3_lsz = 2 * p3tiles * q4nx.tile_bytes(K_DIM, NROWS)
     p4_lsz = 2 * 2 * p4tiles * q4nx.tile_bytes(K_DIM, NROWS)
@@ -357,128 +358,61 @@ def _design({P}):
                          kr3, kas, khe, kg4, ku4, kn, kd5], stack_size=8192))
 
     def sequence(*args):
-        n, a = {npairs}, {apairs}
-        bcb = args[0]
-        wb = [args[1 + i] for i in range({p1pairs})]
-        kvb = [args[1 + {p1pairs} + i]
-               for i in range(a + (a if {HOSTKV} else 0))]
-        ax = a + (a if {HOSTKV} else 0)
-        qb = [args[1 + {p1pairs} + ax + i] for i in range({p1pairs})]
-        cb = [args[1 + 2 * {p1pairs} + ax + i] for i in range(n)]
-        ab = [args[1 + 2 * {p1pairs} + ax + n + i] for i in range(a)]
-        # tensor args: bc, w*p1pairs, (kvin+hostcache)*ax, q*p1pairs,
-        # cache*n, attn*a, then P3's bc + w3*n + h*n. Handles follow all of them.
-        base3 = 1 + 2 * {p1pairs} + ax + n + a
-        base4 = base3 + 1 + 2 * n
-        base = base4 + 1 + 2 * n
-        bch = args[base]
-        wh = [args[base + 1 + i] for i in range(n)]   # all pairs: KV rides these
-        p1h = [args[base + 1 + n + i] for i in range(n)]
-        p2h = [args[base + 1 + 2 * n + i] for i in range(a)]
+        """Three phases, three barriers. Each phase fills a broadcast and a weight
+        stream and drains its result; the barrier between them is what lets the
+        next phase's fill depend on the previous one's drain — which is how h
+        reaches P4 and sw reaches P5 without leaving the dispatch."""
+        n = {npairs}
+        bc3b = args[0]
+        w3b = [args[1 + i] for i in range(n)]
+        hb = [args[1 + n + i] for i in range(n)]
+        bc4b = args[1 + 2 * n]
+        w4b = [args[2 + 2 * n + i] for i in range(n)]
+        swb = [args[2 + 3 * n + i] for i in range(n)]
+        bc5b = args[2 + 4 * n]
+        w5b = [args[3 + 4 * n + i] for i in range(n)]
+        o5b = [args[3 + 5 * n + i] for i in range(n)]
+        h0 = 3 + 6 * n                      # handles start where tensors end
+        bch = args[h0]
+        wh = [args[h0 + 1 + i] for i in range(n)]
+        oh = [args[h0 + 1 + n + i] for i in range(n)]
 
-        for _lay in range({NLAY}):   # one dispatch, NLAY layer iterations
+        for _lay in range({NLAY}):
             tg = TaskGroup()
-            bch.fill(bcb, group=tg,
-                     offset=_lay * {BCN1},
+            bch.fill(bc3b, group=tg, offset=_lay * {BCN1},
                      sizes=[1, 1, 1, {BCN1}], strides=[0, 0, 0, 1])
-            for i in range({p1pairs}):     # partition B: only these pairs run P1
-                wh[i].fill(wb[i], group=tg,
-                           offset=_lay * {p1_lsz},
-                           sizes=[1, 1, 1, {p1_lsz}],
-                           strides=[0, 0, 0, 1])
-            QOBJ, KVPLAN = {qobj!r}, {kvplan!r}
-            QBASE, HPCC = {qbase!r}, {hpcc!r}
-            for i in range({p1pairs}):
-                p1h[i].drain(qb[i], wait=True, group=tg,
-                             offset=QBASE[i] * {OBJ},
-                             sizes=[1, HPCC[i], 2, {OBJ}],
-                             strides=[0, {OBJ}, HPCC[i] * {OBJ}, 1])
-                for _kind, _base in KVPLAN[i]:
-                    if _kind == "k":
-                        p1h[i].drain(cb[i], wait=True, group=tg,
-                                     offset=2 * (({kv_obase} + _base) * {SLOT}
-                                                 + {off}),
-                                     sizes=[1, 2, {HEAD}, 4],
-                                     strides=[0, 2 * {SLOT}, 2 * {TSEQ}, 1])
-                    else:
-                        p1h[i].drain(cb[i], wait=True, group=tg,
-                                     offset=2 * (({kv_obase} + _base) * {SLOT}
-                                                 + {KTILE} + {kv_in} * {HEAD}),
-                                     sizes=[1, 2, 1, 2 * {OBJ}],
-                                     strides=[0, 2 * {SLOT}, 0, 1])
+            for i in range(n):
+                wh[i].fill(w3b[i], group=tg, offset=_lay * {p3_lsz},
+                           sizes=[1, 1, 1, {p3_lsz}], strides=[0, 0, 0, 1])
+            for i in range(n):
+                oh[i].drain(hb[i], wait=True, group=tg,
+                            offset=i * 2 * {NROWS} * {p3tiles},
+                            sizes=[1, 2, {p3tiles}, {NROWS}],
+                            strides=[0, {NROWS}, {2 * NROWS}, 1])
             tg.finish()
 
-            # ---- P2 ----------------------------------------------------------
             tg = TaskGroup()
-            bch.fill(kvb[0], group=tg)          # the broadcast now carries q'
-            for i in range(a):
-                # the host caches follow the `a` q' broadcast buffers, so they
-                # start at kvb[a] — `kvb[1 + i]` only happened to be right when
-                # apairs was 1 (NATT=2) and silently read a q' buffer as a cache
-                # at NATT=4.
-                src = kvb[a + i] if {HOSTKV} else cb[i]
-                # One fill per KV object. A single strided fill cannot express this:
-                # the 2*OPERAND run decomposes into 6 x 3424, which uses up the BD's
-                # dimensions and pushes the object stride into the repeat-count slot
-                # ("Do not include the highest dimension size in transfer length").
-                for _j in range({nobj}):
-                    wh[n - a + i].fill(src, group=tg,
-                           offset=2 * i * {OPERAND} + _j * {NATT} * {OPERAND},
-                           sizes=[1, 1, 1, 2 * {OPERAND}], strides=[0, 0, 0, 1])
-            for i in range(a):
-                p2h[i].drain(ab[i], wait=True, group=tg,
-                             offset=i * 2 * {GQA} * {HEAD},
-                             sizes=[1, 1, 1, 2 * {GQA} * {HEAD}],
-                             strides=[0, 0, 0, 1])
+            bch.fill(bc4b, group=tg)
+            for i in range(n):
+                wh[i].fill(w4b[i], group=tg, offset=_lay * {p4_lsz},
+                           sizes=[1, 1, 1, {p4_lsz}], strides=[0, 0, 0, 1])
+            for i in range(n):
+                oh[i].drain(swb[i], wait=True, group=tg,
+                            offset=i * {rpp4},
+                            sizes=[1, {p4objs}, 2, {OBJ}],
+                            strides=[0, {OBJ}, {rpp4} // 2, 1])
             tg.finish()
 
-            # ---- P3 -----------------------------------------------------------
-            # The broadcast's THIRD fill: attention output, then the residual
-            # stream. Same refill mechanism as the first two (activation, q'),
-            # which chain_probe.py verified across a phase boundary.
-            p3b = args[base3]
-            w3b = [args[base3 + 1 + i] for i in range(n)]
-            hb = [args[base3 + 1 + n + i] for i in range(n)]
             tg = TaskGroup()
-            bch.fill(p3b, group=tg)
+            for ch in range({NCHUNK}):
+                bch.fill(bc5b, group=tg)
             for i in range(n):
-                wh[i].fill(w3b[i], group=tg,
-                           offset=_lay * {p3_lsz},
-                           sizes=[1, 1, 1, {p3_lsz}],
-                           strides=[0, 0, 0, 1])
+                wh[i].fill(w5b[i], group=tg, offset=_lay * {p5_lsz},
+                           sizes=[1, 1, 1, {p5_lsz}], strides=[0, 0, 0, 1])
             for i in range(n):
-                # Scatter each pair's h into NATURAL row order so P4 can be filled
-                # straight from it. A pair's object is [core j][tile t][row r] and
-                # core (pr, j) owns rows pr*rpp3 + t*2*NROWS + j*NROWS + r, so the
-                # permutation is a plain 3-level stride -- the same trick the P4
-                # drain uses for sw.
-                p1h[i].drain(hb[i], wait=True, group=tg,
-                             offset=i * 2 * {NROWS} * {p3tiles},
-                             sizes=[1, 2, {p3tiles}, {NROWS}],
-                             strides=[0, {NROWS}, {2 * NROWS}, 1])
+                oh[i].drain(o5b[i], wait=True, group=tg)
             tg.finish()
 
-            # ---- P4 -----------------------------------------------------------
-            p4b = args[base4]
-            w4b = [args[base4 + 1 + i] for i in range(n)]
-            swb = [args[base4 + 1 + n + i] for i in range(n)]
-            tg = TaskGroup()
-            bch.fill(p4b, group=tg)
-            for i in range(n):
-                wh[i].fill(w4b[i], group=tg,
-                           offset=_lay * {p4_lsz},
-                           sizes=[1, 1, 1, {p4_lsz}],
-                           strides=[0, 0, 0, 1])
-            for i in range(n):
-                p1h[i].drain(swb[i], wait=True, group=tg,
-                             offset=i * {rpp4},
-                             sizes=[1, {p4objs}, 2, {OBJ}],
-                             strides=[0, {OBJ}, {rpp4} // 2, 1])
-            tg.finish()
-
-    # C's args only: no qkv weights, no KV cache, no attention output — those
-    # belong to the other sixteen cores. One broadcast per phase, one weight
-    # stream per phase, one result set per phase.
     at = [bc_ty] + [w3_ty] * {npairs} + [h_ty] * {npairs}
     at += [bc_ty] + [w4_ty] * {npairs} + [sw_ty] * {npairs}
     at += [bc_ty] + [w5_ty] * {npairs} + [o5_ty] * {npairs}
@@ -498,6 +432,7 @@ def _design({P}):
               op_ty=op_ty, oppair_ty=oppair_ty, p1o_ty=p1o_ty,
               p1opair_ty=p1opair_ty, p2o_ty=p2o_ty, p2opair_ty=p2opair_ty, attn_all_ty=attn_all_ty, w3_ty=w3_ty, h_ty=h_ty, p3tiles=p3tiles,
               w4_ty=w4_ty, sw_ty=sw_ty, p4tiles=p4tiles,
+              w5_ty=w5_ty, o5_ty=o5_ty, p5tiles=p5tiles, NCHUNK=NCHUNK,
               p4per=p4per, p4objs=p4objs, rpp4=rpp4, D_FF=D_FF,
               w_all_ty=w_all_ty, bc_all_ty=bc_all_ty, kvin_ty=kvin_ty, q_tys=q_tys,
               cache_ty=cache_ty, SKIP_P1=SKIP_P1, HOSTKV=HOSTKV,
@@ -567,6 +502,41 @@ def main():
     cs_q = rnd(cs_k * (HEAD ** -0.5) * np.log2(np.e))
 
     design, wt, KVSTRIDE = build(pos, nobj)
+    if __import__("os").environ.get("C_PROGMEM"):
+        # The question this file exists to answer is whether THREE phase bodies
+        # fit 16 KB, where four overflowed on a real build. That is settled at
+        # link time and needs no correct data — so pass correctly SHAPED zeros
+        # and let the toolchain speak. Anything it prints about values is
+        # meaningless here; anything it prints about program memory is not.
+        import numpy as _np
+        npairs_ = NCORES // 2
+        p3t = K_DIM // (NCORES * NROWS)
+        D_FF_ = 8192
+        p4t = D_FF_ // (NCORES * NROWS)
+        p5t = p3t
+        NCH = 4
+        OPD = OPERAND
+        z = lambda n, d: iron.zeros(n, dtype=d, device="npu")
+        args = [z(NLAY * (2 * K_DIM + 2 * HEAD), bfloat16)]
+        args += [z(NLAY * 2 * p3t * OPD, _np.uint8) for _ in range(npairs_)]
+        args += [z(2 * K_DIM + 2 * HEAD, bfloat16) for _ in range(npairs_)]
+        args += [z(2 * K_DIM + 2 * HEAD, bfloat16)]
+        args += [z(NLAY * 2 * 2 * p4t * OPD, _np.uint8) for _ in range(npairs_)]
+        args += [z(D_FF_, bfloat16) for _ in range(npairs_)]
+        args += [z(2 * K_DIM + 2 * HEAD, bfloat16)]
+        args += [z(NLAY * 2 * NCH * p5t * OPD, _np.uint8) for _ in range(npairs_)]
+        args += [z(NCH * 2 * p5t * NROWS, bfloat16) for _ in range(npairs_)]
+        print(f"C_PROGMEM: building with {len(args)} shaped-zero tensors")
+        try:
+            design(*args)
+            print("  -> BUILT AND RAN: three bodies fit 16 KB")
+        except Exception as _e:
+            m = str(_e)
+            if "Overflow of program memory" in m:
+                print("  -> OVERFLOW: three bodies do NOT fit")
+            else:
+                print(f"  -> stopped elsewhere: {type(_e).__name__}: {m[:160]}")
+        return 0
     OBJ = 2 * HEAD
     KTILE = HEAD * TSEQ
 
