@@ -13041,3 +13041,34 @@ design might be bandwidth-starved before checking what the number was measuring.
 The lesson is narrower than "check your instruments": a metric copied from a design
 with a different tensor set will keep reporting confidently, in the right units, at
 a plausible magnitude. Nothing about 3.0 GB/s looked like a broken measurement.
+
+### A+B has a short-context fault, worst at position 0
+
+Sweeping the position, with the tolerance held at one bf16 ulp of max|V|:
+
+    pos=0    6.2500e-02   30.80 ULP    FAIL
+    pos=1    8.1961e-03    4.04 ULP    FAIL
+    pos=2    3.2202e-03    1.59 ULP    fail (marginal)
+    pos=7    2.5930e-03    1.28 ULP    fail (marginal)
+    pos=15   2.1371e-03    1.05 ULP    PASS
+    pos=30   1.5359e-03    0.76 ULP    PASS
+    pos=31   1.4050e-03    0.69 ULP    PASS
+
+Monotonic decay with context length. That is not noise and not the unresolved
+attention floor — it is the shape of a contribution that is *constant in absolute
+terms* being diluted as real tokens accumulate.
+
+Position 0 makes the diagnosis concrete: attention over exactly one token has a
+softmax of 1.0, so the output must equal V[0] to the bit. It does not, off by 12% of
+max|V|. The device is attending over cache entries that hold nothing — the padding
+mask is not covering the uninitialised slots.
+
+**This was masked by how it was verified.** A+B was recorded as passing, and it does
+— at the two positions it was ever run at, 15 and 30, both comfortably into the
+region where the fault has decayed below tolerance. The default position is 0, and
+running it with no arguments at all would have shown this immediately. Two samples
+from the same end of a range is not a sweep, and "passes at pos=30 and pos=15" read
+as broader evidence than it was.
+
+Group C is unaffected: it has no attention. The projection-phase results and the
+96%-of-ideal throughput stand.
