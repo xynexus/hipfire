@@ -12067,3 +12067,29 @@ which should exercise whatever scales with size, at a build time that permits
 iteration. If placement holds at 2 KB and the failure mode at 10 KB is capacity
 rather than something structural, that is a different and more tractable problem
 than a topology that cannot place.
+
+### The iron.jit cache trap, a fifth time — and a rule to stop it
+
+`--elems 512` failed with:
+
+    Tensor argument 'a' has 512 elements but the kernel was compiled for 256
+
+`build_skeleton(elems)` was a plain closure, so `elems` never appeared in the
+design function's source and iron.jit reused the 256-element build. **This is the
+fifth occurrence this session** — after `h_ty` reaching a design via the namespace,
+`way` in `split_width_probe`, `stages` and then `elems` in `core2core_probe`.
+
+The rule, now applied everywhere: **any parameter that changes a design must be
+interpolated into the design SOURCE, not closed over.** Every probe here builds
+through `exec` with an f-string for exactly this reason, and the fifo names carry
+the parameter so the text differs even when nothing else does.
+
+Rewritten `build_skeleton` accordingly; it still places, routes and delivers 9 at
+64 int32.
+
+Object-size results so far:
+
+    64 int32    256 B   PLACE AND ROUTE, every stream delivers
+    256         1 KB    PLACE AND ROUTE, every stream delivers
+    512         2 KB    building
+    2576       10 KB    exceeds a 2400 s build — unanswered

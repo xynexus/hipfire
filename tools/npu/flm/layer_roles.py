@@ -149,85 +149,84 @@ def role_layout():
 
 def build_skeleton(elems=64):
     """The stream topology with trivial kernels: does 32 cores in three groups
-    place and route at all? Everything else is filling it in.
+    place and route, and does every stream deliver?
 
     `elems` sets the object size. The topology was first proven at 64 int32 =
-    256 B, but the real operand is OPERAND = 10304 B and the broadcast block is
-    BC * 2 = 8448 B. Object size is charged against each core's 64 KB of data
-    memory and against DMA descriptors, so a topology that places at 256 B can
-    still fail at realistic sizes — which is what this checks.
+    256 B; the real operand is 10304 B. Object size is charged against each
+    core's 64 KB and against DMA descriptors, so a topology that places small can
+    still fail large.
+
+    Built through exec so `elems` lands in the design SOURCE. iron.jit keys its
+    cache on the function's text, and a closure over the size silently reuses a
+    stale build — "argument 'a' has 512 elements but the kernel was compiled for
+    256". **That is the fifth time this session**; every probe that varies a
+    parameter now interpolates it into the source rather than closing over it.
     """
-    ty = np.ndarray[(elems,), np.dtype[np.int32]]
+    src = f"""
+def _design(a: In, o0: Out, o1: Out, o2: Out, o3: Out):
+    ty = np.ndarray[({elems},), np.dtype[np.int32]]
+    part_ty = np.ndarray[({elems} // 4,), np.dtype[np.int32]]
 
-    def _design(a: In, o0: Out, o1: Out, o2: Out, o3: Out):
-        f_act = ObjectFifo(ty, depth=1, name="rl_act")          # shim -> A
-        f_ab = [ObjectFifo(ty, depth=1, name=f"rl_ab{j}")       # A[j] -> B[j]
-                for j in range(A_CORES)]
-        # B emits through TWO 4-way joins for the same reason C does: 8-way asks a
-        # memtile for 8 inputs and fails. Each C core consumes both halves, which
-        # it needs anyway — o_proj takes the whole attention vector.
-        f_bc = [ObjectFifo(ty, depth=1, name=f"rl_bc{i}")
-                for i in range(B_CORES // 4)]
-        # C emits through FOUR 4-way joins, not one 16-way: a join needs `w`
-        # inputs on a single memtile and a memtile has ~6, so 16-way is
-        # unplaceable. Four drains is fine — the shim has 16 output channels.
-        f_out = [ObjectFifo(ty, depth=1, name=f"rl_out{i}")
-                 for i in range(C_CORES // 4)]
+    f_act = ObjectFifo(ty, depth=1, name="rl{elems}_act")
+    f_ab = [ObjectFifo(ty, depth=1, name=f"rl{elems}_ab{{j}}")
+            for j in range({A_CORES})]
+    # Two 4-way joins, not one 8-way: a join needs w inputs on one memtile and a
+    # memtile has ~6. Each C core reads both halves, which o_proj needs anyway.
+    f_bc = [ObjectFifo(ty, depth=1, name=f"rl{elems}_bc{{i}}") for i in range(2)]
+    # Four 4-way joins out, for the same reason: 16-way is unplaceable.
+    f_out = [ObjectFifo(ty, depth=1, name=f"rl{elems}_out{{i}}") for i in range(4)]
 
-        part = elems // 4                      # each of four producers fills a quarter
-        bc_in = [f.prod().join([j * part for j in range(4)],
-                               obj_types=[np.ndarray[(part,),
-                                                     np.dtype[np.int32]]] * 4)
-                 for f in f_bc]
-        out_sub = [f.prod().join([j * part for j in range(4)],
-                                  obj_types=[np.ndarray[(part,),
-                                                        np.dtype[np.int32]]] * 4)
-                   for f in f_out]
-        act_cons = [f_act.cons() for _ in range(A_CORES)]
-        bc_cons = [[f.cons() for _ in range(C_CORES)] for f in f_bc]
+    part = {elems} // 4
+    bc_in = [f.prod().join([k * part for k in range(4)],
+                           obj_types=[part_ty] * 4) for f in f_bc]
+    out_sub = [f.prod().join([k * part for k in range(4)],
+                             obj_types=[part_ty] * 4) for f in f_out]
+    act_cons = [f_act.cons() for _ in range({A_CORES})]
+    bc_cons = [[f.cons() for _ in range({C_CORES})] for f in f_bc]
 
-        def core_a(ic, oc):
-            e = ic.acquire(1); r = oc.acquire(1)
-            for k in range(elems):
-                r[k] = e[k] + 1
-            oc.release(1); ic.release(1)
+    def core_a(ic, oc):
+        e = ic.acquire(1); r = oc.acquire(1)
+        for k in range({elems}):
+            r[k] = e[k] + 1
+        oc.release(1); ic.release(1)
 
-        def core_b(ic, oc):
-            e = ic.acquire(1); r = oc.acquire(1)
-            for k in range(elems // 4):
-                r[k] = e[k] + 2
-            oc.release(1); ic.release(1)
+    def core_b(ic, oc):
+        e = ic.acquire(1); r = oc.acquire(1)
+        for k in range(part):
+            r[k] = e[k] + 2
+        oc.release(1); ic.release(1)
 
-        def core_c(ic0, ic1, oc):
-            e0 = ic0.acquire(1); e1 = ic1.acquire(1); r = oc.acquire(1)
-            for k in range(elems // 4):
-                r[k] = e0[k] + e1[k] + 3
-            oc.release(1); ic1.release(1); ic0.release(1)
+    def core_c(ic0, ic1, oc):
+        e0 = ic0.acquire(1); e1 = ic1.acquire(1); r = oc.acquire(1)
+        for k in range(part):
+            r[k] = e0[k] + e1[k] + 3
+        oc.release(1); ic1.release(1); ic0.release(1)
 
-        workers = []
-        workers += [Worker(core_a, fn_args=[act_cons[j], f_ab[j].prod()],
-                           stack_size=2048) for j in range(A_CORES)]
-        workers += [Worker(core_b, fn_args=[f_ab[j].cons(),
-                                            bc_in[j // 4][j % 4].prod()],
-                           stack_size=2048) for j in range(B_CORES)]
-        workers += [Worker(core_c, fn_args=[bc_cons[0][j], bc_cons[1][j],
-                                            out_sub[j // 4][j % 4].prod()],
-                           stack_size=2048) for j in range(C_CORES)]
+    workers = []
+    workers += [Worker(core_a, fn_args=[act_cons[j], f_ab[j].prod()],
+                       stack_size=2048) for j in range({A_CORES})]
+    workers += [Worker(core_b, fn_args=[f_ab[j].cons(), bc_in[j // 4][j % 4].prod()],
+                       stack_size=2048) for j in range({B_CORES})]
+    workers += [Worker(core_c, fn_args=[bc_cons[0][j], bc_cons[1][j],
+                                        out_sub[j // 4][j % 4].prod()],
+                       stack_size=2048) for j in range({C_CORES})]
 
-        def seq(ab, *rest):
-            n = len(rest) // 2
-            obs, ah, ohs = rest[:n], rest[n], rest[n + 1:]
-            tg = TaskGroup()
-            ah.fill(ab, group=tg)
-            for ob, oh in zip(obs, ohs):
-                oh.drain(ob, wait=True, group=tg)
-            tg.finish()
+    def seq(ab, ob0, ob1, ob2, ob3, ah, oh0, oh1, oh2, oh3):
+        tg = TaskGroup()
+        ah.fill(ab, group=tg)
+        for ob, oh in ((ob0, oh0), (ob1, oh1), (ob2, oh2), (ob3, oh3)):
+            oh.drain(ob, wait=True, group=tg)
+        tg.finish()
 
-        rt = Runtime(seq, [ty] + [ty] * len(f_out) + [f_act.prod(tile=AnyShimTile)]
-                     + [f.cons(tile=AnyShimTile) for f in f_out])
-        return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
-
-    return iron.jit(_design)
+    rt = Runtime(seq, [ty] * 5 + [f_act.prod(tile=AnyShimTile)]
+                 + [f.cons(tile=AnyShimTile) for f in f_out])
+    return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
+"""
+    ns = dict(np=np, iron=iron, In=In, Out=Out, ObjectFifo=ObjectFifo,
+              Program=Program, Runtime=Runtime, TaskGroup=TaskGroup,
+              Worker=Worker, AnyShimTile=AnyShimTile, __name__=f"rl{elems}")
+    exec(src, ns)
+    return iron.jit(ns["_design"])
 
 
 def main():
