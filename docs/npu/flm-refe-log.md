@@ -14254,3 +14254,31 @@ if it still disagrees, the fault is in the device's online softmax. Until then t
 one measurement with two candidate causes, and the harness is the one I would bet on —
 it is new, it is mine, and today's score is five harness or reference faults to zero
 device faults.
+
+### The 55 ULP was the harness. The online softmax is correct on real data.
+
+    device vs prior_kv reference   5.1252e-02
+    device vs CACHE   reference    1.8406e-03      = 0.57 ULP of max|V|
+    the two references differ by   5.0438e-02
+
+The device reproduces attention over the bytes it was actually handed to 0.57 ULP — over
+**four real positions**, with a genuine online softmax, a running max, real rescaling,
+and prior V values that are not zero. That is the last piece of the layer's math, and it
+is correct.
+
+The 55 ULP was this harness writing the cache somewhere `prior_kv` does not describe.
+The two references differ by 5.04e-02 and the device sits within 0.0018 of the one built
+from the bytes it read, which is the only reference that can be held against it. A
+device can only be as right as what it was handed.
+
+I guessed the harness over the device before running this, on the grounds that the
+harness was new and mine and the day's score was five harness faults to zero device
+faults. That was the right prior, but it was a prior — the discriminator is what settled
+it, and it cost one run.
+
+Left over: the cache write itself is still wrong somewhere, most likely in how prior
+positions are rotated or permuted before being packed. That matters for an end-to-end
+multi-token decode and not at all for the attention kernel, which is now validated on
+real multi-position data. The zero-filled cache that every earlier "attention passes"
+result used is retired either way — with prior V all zero, the online rescaling operates
+entirely on zeros.

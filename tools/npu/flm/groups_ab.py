@@ -689,6 +689,19 @@ def main():
         if prior_kv is not None:                # real prior positions, not zeros
             for _p, (_k, _v) in enumerate(prior_kv):
                 Kf[_p], Vf[_p] = _k[a], _v[a]
+            # DISCRIMINATOR: the same reference, but read out of the CACHE BYTES
+            # the device actually consumed. If `want` from prior_kv disagrees
+            # with the device and `want_c` from the cache agrees, the fault is
+            # this harness writing the cache in the wrong place, not the online
+            # softmax. The device can only be as right as what it was handed.
+            _cvr = kv_ts[0].numpy().view(np.uint16)
+            _b = a * KVSTRIDE
+            _Kc = np.asarray(_cvr[_b:_b + KTILE].reshape(HEAD, TSEQ)
+                             .view(bfloat16), np.float64).T[:o.pos + 1]
+            _Vc = np.asarray(_cvr[_b + KTILE:_b + KTILE + TSEQ * HEAD]
+                             .reshape(TSEQ, HEAD).view(bfloat16),
+                             np.float64)[:o.pos + 1]
+            cache_KV = (_Kc, _Vc)          # qr is not in scope yet
         qr = np.stack([ref[GQA * a + sl] for sl in range(GQA)])[:, :HEAD]
         # q' already carries 1/sqrt(d) * log2(e) from cs_q
         sc = (qr @ Kf.T) / math.log2(math.e)
@@ -706,6 +719,17 @@ def main():
             for _sl in range(GQA):
                 _h = GQA * a + _sl
                 attn_full[_h * HEAD:(_h + 1) * HEAD] = got[_sl]
+        if prior_kv is not None and a == 0:
+            _Kc, _Vc = cache_KV
+            _sc = (qr @ _Kc.T) / math.log2(math.e)
+            _e = np.exp(_sc - _sc.max(1, keepdims=True))
+            want_cache = (_e / _e.sum(1, keepdims=True)) @ _Vc
+            print(f"  DISCRIM group 0: device vs prior_kv ref  "
+                  f"{np.abs(got - want).max():.4e}")
+            print(f"  DISCRIM group 0: device vs CACHE   ref  "
+                  f"{np.abs(got - want_cache).max():.4e}")
+            print(f"  DISCRIM group 0: the two refs differ by "
+                  f"{np.abs(want - want_cache).max():.4e}")
         d = np.abs(got - want)
         if __import__("os").environ.get("AB_DIAG"):
             print(f"    DIAG group {a}: max err {d.max():.4e}  "
