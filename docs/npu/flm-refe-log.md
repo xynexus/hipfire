@@ -12791,3 +12791,25 @@ The corrected figure is 61.8.
 The remaining build is group C plus the two staged handoffs, then the layer loop
 around all of it. No unmeasured quantity is left in the projection — the risk is
 integration, which is where the last five faults came from.
+
+### The core allocation is near-optimal; the alternative saves 6 us and costs a kernel change
+
+Checking A=8/B=8/C=16 against the alternatives, with C fixed at 16 since that is
+where the FFN penalty lives:
+
+    A=8  B=8  C=16    layer 775.2 us   32/32 heads   FULL coverage
+    A=12 B=4  C=16    layer 744.1 us   16/32 heads   half — not a real option
+    A=12 B=4* C=16    layer 769.2 us   32/32 heads   *two KV groups per core
+
+The middle row is what the current design does and is why it is 31 us cheaper per
+layer: it simply does not compute half the attention. Not a comparison.
+
+The third row is real: attention already has a `KVPER` notion, so four cores each
+handling two KV groups would give full coverage while leaving P1 twelve cores.
+It saves **6.0 us per layer, 0.1 ms per token, about 0.4%** — and costs a change to
+a kernel that is currently passing.
+
+Not taking it. The 0.4% is inside the noise on every measurement feeding this
+projection, and the change touches attention, which has been the most delicate part
+of the system. Recording it so the allocation reads as chosen rather than assumed,
+and so the option is there if 0.4% ever matters.
