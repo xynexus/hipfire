@@ -14716,3 +14716,26 @@ adds the kernels, whose per-core program memory is measured separately (A+B 57%,
 16 KB, and fusing adds code to no core since each ELF holds only its own role). Those two
 facts compose by argument, not by measurement, and today has been a long lesson in the
 difference.
+
+### Stopped a badly-targeted build, and a note on orphaned compilers
+
+I launched `channel_probe --elems 2576 --touch 2576` to check that the union topology and
+large per-core programs coexist, then stopped it twelve minutes in because the test
+cannot answer the question either way.
+
+`--touch 2576` makes each core copy the whole 2576-element object, which the compiler
+unrolls — that is what put group A at 7779 lines of IR and overflowed program memory in
+`layer_roles`. It is not a proxy for a real kernel. A real GEMV is a compact loop over
+tiles, and `group_c`'s three phase bodies measure 14784 B of `.text` in total. So a pass
+would have proved something harder than needed, and a failure would have said only that
+unrolled copies are large, which was already known.
+
+The right form of that check is the real fused design with real kernels, and there is no
+cheap synthetic stand-in for it: program memory depends on the kernels, not on the
+topology, and the two are already measured separately.
+
+Operational note worth recording: killing the launcher was not enough. The 28 `llc`
+processes were reparented to init and kept running with the parent gone — twelve minutes
+of 28 cores at full tilt on a build whose result had already been discarded. They had to
+be killed by explicit PID list (`ps -C llc` filtered on `ppid == 1`). Any long
+`aiecc` run stopped mid-flight leaves this behind.
