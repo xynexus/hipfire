@@ -13261,3 +13261,38 @@ The one remaining absent term is the A+B-to-C handoff. A previous entry estimate
 staging at 5.6 us per layer, which would be ~90 us per token — 0.6%, well inside the
 +6.3% margin. That estimate is not a measurement and the wiring does not exist yet,
 so it is not folded in.
+
+### The load-bearing assumption in the 65.0 figure, and what it costs if wrong
+
+The projection sums A+B's and C's per-layer slopes. That is only right if both halves
+live in ONE design and one dispatch, with the seam crossing host memory inside it —
+drain, TaskGroup barrier, refill, which costs no dispatch. If instead the halves stay
+separate dispatches that must alternate per layer (layer L's C output feeds layer
+L+1's A+B input), the floor is paid 32 times:
+
+    fused, one dispatch               15290.3 us ->  65.4 tok/s   +6.9% vs FLM
+    two dispatches (as projected)     15383.2 us ->  65.0 tok/s   +6.3%
+    interleaved, 32 dispatches        18170.2 us ->  55.0 tok/s   -10.0%
+
+A 20-point swing in tok/s rests on it, and it is the difference between beating FLM
+and losing to it. Every projection in this log has silently taken the favourable
+branch. (The middle row is what the previous entry computed — it pays the floor
+twice, which is neither structure, just an artefact of measuring two halves
+separately.)
+
+Whether the fused structure is buildable is now a concrete, countable question, and
+the counts are not encouraging:
+
+    A+B    16 CoreTiles    6 logical MemTiles    6 links
+    C      16 CoreTiles   18 logical MemTiles   18 links
+    fused  32 CoreTiles   24 logical MemTiles   against 8 physical
+
+C alone maps 18 logical memtiles onto 8 physical and builds, so packing works; the
+binding constraint is DMA channels per physical memtile, not the logical count. But
+24 is a third more than the largest configuration known to build here, and the
+earlier 32-core attempt died precisely on "no MemTile has sufficient DMA capacity".
+
+So the honest status is: 65.0-65.4 tok/s is what the measured compute supports IF the
+two halves fuse, and nothing has yet demonstrated that they do. That is now the single
+question the result depends on — not the handoff's staging cost, which at ~5.6 us per
+layer is 0.6% either way.
