@@ -14376,3 +14376,32 @@ State of the layer, by what each part has actually been checked against:
 The last two lines are what remain. Attention's online softmax, its rescaling, and the
 cache across multiple real positions have never met an external reference — only the
 one-entry case where the answer is V itself. Everything above them now has.
+
+### Attention across four real positions, checked externally
+
+    attention over 4 real positions, layer 0, query at pos 3
+      max|oracle| 0.40375
+      repo path vs oracle   max err 1.2825e-02   3.18% of peak
+
+Below the ~6% quantization floor, so the path is right to the precision 4-bit weights
+allow. Four real tokens embedded, RoPE applied per position, GQA grouping of 32 q heads
+over 8 KV heads, softmax over four entries, against an oracle built from
+`consolidated.00.pth`.
+
+This closes the gap position 0 structurally could not reach. **A softmax over one entry
+is 1 whatever the scale is** — so the `1/sqrt(head_dim)` and `log2(e)` factors folded
+into `cs_q`, the GQA head mapping, and the softmax itself were all unconstrained by
+every result up to now, including the token 16309. A wrong attention scale would have
+produced exactly the same pos-0 output.
+
+One caveat on what this run used: the rotation here is applied in Meta convention on
+un-permuted dims, not through the kernel's `rope_ref`. The equivalence between those two
+was established separately (6.40% vs a 6.36% floor at position 7), so the chain holds,
+but this is two measurements joined rather than one end-to-end run.
+
+Remaining, and now genuinely the last of it: the device's own **online** softmax across
+positions — the running max, the rescale factor, and the KV cache holding entries from
+different tokens. `groups_ab` measures the device against its reference at 0.5-2.2 ULP
+over many positions, and that reference is now externally validated for the same math,
+so the two links exist. What has never run is a multi-position sequence where the cache
+was filled by the device across successive tokens rather than staged by the host.
