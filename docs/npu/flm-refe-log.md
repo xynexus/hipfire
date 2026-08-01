@@ -12046,3 +12046,24 @@ Worth stating plainly: this is the first configuration in the session where the
 program-memory budget is not the binding constraint. Every earlier structure was
 shaped by trying to squeeze bodies onto cores; this one has spare capacity in
 every group.
+
+### Build time at 32 cores and full operand size is prohibitive
+
+The topology skeleton at `--elems 2576` (10304 B, the real operand) **exceeded a
+2400 s build** and was killed with no output. At 64 int32 = 256 B the same design
+builds in a couple of minutes.
+
+Two consequences worth recording:
+
+  * The real-size placement question is **not answered**. Object size is charged
+    against each core's 64 KB and against DMA descriptors, so a topology proven at
+    256 B is not proven at 10304 B. That gap is open.
+  * **Iterating at full size is impractical.** Forty minutes per build makes the
+    edit-test loop unusable, which is a constraint on how the rest of this gets
+    built, not just on this measurement.
+
+Retrying at 256 and 512 int32 (1 KB and 2 KB) — eight times the original object,
+which should exercise whatever scales with size, at a build time that permits
+iteration. If placement holds at 2 KB and the failure mode at 10 KB is capacity
+rather than something structural, that is a different and more tractable problem
+than a topology that cannot place.
