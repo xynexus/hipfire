@@ -14521,3 +14521,31 @@ toggle was "clean and nothing else moved" on the strength of numerical output al
 true of correctness, untested for cost. And the slope of 124.8 us/layer in the projection
 was measured on code that has since changed twice; it happens to be right, but nothing
 until now established that.
+
+### Both slopes re-measured on current code: 64.0 tok/s
+
+    C slope     before 637.9   now 658.4 us/layer   (+3.2%)
+    A+B slope   before 124.8   now 125.4 us/layer   (+0.5%)
+
+    as projected   token 15290.3 us -> 65.4 tok/s   FLM 61.18, +6.9%
+    re-measured    token 15627.9 us -> 64.0 tok/s   FLM 61.18, +4.6%
+
+C at NLAY=1/2: 738.0 and 1396.4 us, against 735.4 and 1373.3 before. Nothing in the
+correctness work should have cost device time — the weight-loader change is host-side and
+the residual change swaps one K_DIM block for another of the same size — so 3.2% is
+either build drift or something not yet understood. Earlier entries in this log record
+build-to-build drift of about this size and treat it as noise; that is the likely
+reading, and it is not established.
+
+The projection is now **64.0 tok/s against FLM's 61.18, +4.6%**, and every term in it was
+measured on the code that exists today:
+
+    A+B      125.4 us/layer     re-measured
+    C        658.4 us/layer     re-measured
+    lm_head 2994.2 us           measured today
+    floor      92.9 us          fitted, R^2 0.99997
+
+The margin over FLM has narrowed from +6.9% to +4.6% purely by re-measuring rather than
+by any change, which is worth remembering when the fused design finally produces a real
+number: 1.4 tok/s of the previous figure was drift in a slope carried across three code
+changes.
