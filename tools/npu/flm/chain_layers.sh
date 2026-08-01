@@ -49,7 +49,10 @@ for ((L = 0; L < N; L++)); do
     AB_EMIT_ATTN="$D/a$L.npy" \
         python3 groups_ab.py --p1-cores 8 --pos "$POS" --layer "$L" 2>&1 |
         { grep -E "attn:|ADVISORY|k' |v' " || true; } | sed 's/^/  /' | tr -s ' '
-    C_ATTN_FROM="$D/a$L.npy" C_EMIT_XOUT="$D/x$((L + 1)).npy" CHAIN_NLAY=1 \
+    # C_X_FROM is the layer INPUT (P3's and P5's residual); C_ATTN_FROM is P3's
+    # ACTIVATION. Passing only the latter left group_c using a random residual.
+    if [ "$L" -gt 0 ]; then CX="$D/x$L.npy"; else CX="${X0:-}"; fi
+    C_X_FROM="$CX" C_ATTN_FROM="$D/a$L.npy" C_EMIT_XOUT="$D/x$((L + 1)).npy" CHAIN_NLAY=1 \
         python3 group_c.py --seq "$SEQ" --layer "$L" 2>&1 |
         { grep -E "P3 h|P4 sw|P5 x_out" || true; } | sed 's/^/  /' | tr -s ' '
 done

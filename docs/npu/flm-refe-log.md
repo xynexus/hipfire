@@ -14144,3 +14144,36 @@ host-fed input rather than composed. The residual fix above uses the host's h fo
 same reason. Making P5 read the *device's* h needs the drain-barrier-refill route
 inside the dispatch — the mechanism `p1p2_chain` proved and `group_c` already uses for
 its phase sequencing, applied to data instead of to timing.
+
+### The chain never gave group C the layer input
+
+The corrected device chain still did not match:
+
+    device x16  mean|.| 0.18967  max   1.94531
+    host   x16  mean|.| 1.74094  max 148.66782
+    cosine = 0.031
+
+Same signature as before the fixes — activations not growing — even though `group_c`
+passes its own checks on real weights with the residual on h. The cause is in the
+harness, not the device:
+
+    x = rnd(rng.standard_normal(K_DIM) * 0.05)
+
+`group_c` invents its own layer input. `chain_layers.sh` passed `C_ATTN_FROM`, and
+attention is P3's *activation*; `x` is P3's and P5's *residual*, and nothing ever set
+it. So every layer of the chain added a fresh random vector as its residual. The
+hidden state could not propagate, which is exactly why the magnitudes stayed flat.
+
+`C_X_FROM` now carries it, and `chain_layers.sh` passes the same file it already feeds
+to A+B.
+
+This makes the earlier sixteen-layer results emptier than the previous retraction
+described. It was not only that C's internal seams were host-fed — the layer input
+itself was random, per layer, so the chain never carried anything from one layer to the
+next through C at all. The C -> A file seam moved a value that was computed from a
+random residual.
+
+Three harness faults now, all with the same shape: the check looked at whether each
+stage's output matched its own reference, and no reference asked where the input came
+from. A stage fed a plausible wrong input produces an output that matches a reference
+computed from the same wrong input.

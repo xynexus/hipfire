@@ -573,7 +573,15 @@ def main():
     KTILE = HEAD * TSEQ
 
     rng = np.random.default_rng(0)
-    x = rnd(rng.standard_normal(K_DIM) * 0.05)
+    # C_X_FROM: the layer's INPUT. Without it group_c invents its own random x,
+    # which is fine for a standalone check and silently wrong in a chain — every
+    # layer then adds a fresh random residual instead of the propagating hidden
+    # state, so the activations never grow and the chain computes nothing.
+    # C_ATTN_FROM alone is not enough: attention is P3's activation, x is P3's
+    # and P5's residual, and they are different inputs.
+    _xin = os.environ.get("C_X_FROM")
+    x = (rnd(np.load(_xin).astype(np.float32)) if _xin
+         else rnd(rng.standard_normal(K_DIM) * 0.05))
     xd = x.astype(np.float64)
     inv = np.float32(1.0 / np.sqrt((xd * xd).mean() + EPS))
     xn = rnd(rnd(x * rnd(inv)) * nw)
