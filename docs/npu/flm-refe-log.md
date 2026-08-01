@@ -13328,3 +13328,32 @@ so the mapper still has to balance 40 inputs across 8 tiles without exceeding 6 
 any one, and a 5.00 average leaves little room for a bad assignment. But the question
 has moved from "is this over budget" — it is not — to "can the mapper place it",
 which only a build answers, and a full-operand build here exceeds 2400 s.
+
+### The full-operand placement build is running — and it tests a weaker claim than the union
+
+`layer_roles.py --skeleton --elems 2576` (2576 int32 = the real 10304 B operand) is
+building in the background. Earlier attempts stopped at 4 KB objects because the full
+operand exceeded a 2400 s foreground limit; backgrounding removes that ceiling.
+
+What it will and will not settle needs stating before the result arrives, because the
+two topologies are not the same:
+
+    layer_roles skeleton   B->C and C->A core to core; C emits through ONE join
+                           -> its own note says "16 (C's join) + splits"
+    union of built designs A+B's 6 links and C's 18, as they actually exist
+                           -> 40 in, 36 out
+
+The skeleton is the *more optimistic* structure. It assumes seams that the built
+designs do not yet have: `groups_ab` drains attention to the host and `group_c` fills
+its broadcast from the host, so B->C currently crosses host memory rather than going
+core to core, and C->A does not exist at all.
+
+So a successful skeleton build says the ambitious topology places at full operand
+size. It does not say the union of what is actually built places, because that union
+carries 40 memtile inputs where the skeleton carries roughly 16 plus splits. And a
+failure would be worse news than it looks, since it would rule out the easier shape.
+
+Either way the useful reading is directional, not decisive. The honest version of the
+projection's remaining risk is unchanged: 65.0-65.4 tok/s holds if the halves fuse
+into one dispatch, and the fusion has been shown to fit the aggregate channel budget
+but not yet shown to place.
