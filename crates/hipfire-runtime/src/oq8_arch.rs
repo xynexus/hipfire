@@ -103,6 +103,57 @@ pub fn oq4_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
     combined
 }
 
+/// `Oq3G256` (qt 38): symmetric W3, on-disk block `[f16 scale][8 × 3 u32
+/// bit-planes]` = 98 B/group (3.0625 b/w). The 256 weights of a group are stored
+/// as 8 sub-blocks of 32, each sub-block holding bit 0, bit 1 and bit 2 of its
+/// 32 values as three separate little-endian u32 words — so weight `i` of
+/// sub-block `s` is assembled bit-by-bit rather than read as a field.
+///
+/// Sign-extending int3 into an int8 container is EXACT (values live in [-4, 3])
+/// and the f16 group scale carries over unchanged, so this upcast is lossless:
+/// the served weights are bit-identical to what a native W3 decode would
+/// produce. That is what lets 3-bit share the iu8 W8A8 kernels with oq4/oq8
+/// instead of needing a dedicated W3 GEMV — the same trade `expand_oq2_to_oq8`
+/// already makes for W2. Runtime VRAM is int8; the 3-bit win is on disk and on
+/// the DMA path that reads it.
+pub fn oq3_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8> {
+    const GROUP: usize = 256;
+    const BLOCK: usize = 98; // 2 (f16 scale) + 8 × 12 (three u32 bit-planes)
+    assert_eq!(k % GROUP, 0, "OQ3->OQ8 requires K % 256 == 0 (got K={k})");
+    let ng = k / GROUP;
+    let expect = m * ng * BLOCK;
+    assert_eq!(
+        data.len(),
+        expect,
+        "OQ3->OQ8 weight byte length {} != M*ng*98 = {expect} (M={m} K={k})",
+        data.len()
+    );
+    let mut combined = vec![0u8; m * k + m * ng * 4];
+    for r in 0..m {
+        for g in 0..ng {
+            let src = (r * ng + g) * BLOCK;
+            let dst = r * k + g * GROUP;
+            for s in 0..8 {
+                let bo = src + 2 + s * 12;
+                let w = |o: usize| {
+                    u32::from_le_bytes([data[bo + o], data[bo + o + 1], data[bo + o + 2], data[bo + o + 3]])
+                };
+                let (p0, p1, p2) = (w(0), w(4), w(8));
+                for i in 0..32 {
+                    let v = ((p0 >> i) & 1) | (((p1 >> i) & 1) << 1) | (((p2 >> i) & 1) << 2);
+                    // 3-bit two's complement: codes 4..7 are -4..-1.
+                    let signed = if v > 3 { v as i32 - 8 } else { v as i32 };
+                    combined[dst + s * 32 + i] = signed as i8 as u8;
+                }
+            }
+            let scale = f16_to_f32(u16::from_le_bytes([data[src], data[src + 1]]));
+            let so = m * k + (r * ng + g) * 4;
+            combined[so..so + 4].copy_from_slice(&scale.to_le_bytes());
+        }
+    }
+    combined
+}
+
 /// `OqPlusCompact` (qt 36): magnitude-tiered W4A8, on-disk block `[f16 scale]
 /// [128 int4 nibbles][N_out × (u8 idx, i8 val)]` = `130 + 2·N_out` bytes. `N_out`
 /// is derived from the byte length (uniform per tensor). Sign-extend the int4
@@ -162,6 +213,7 @@ pub fn oqplus_compact_to_oq8_combined(data: &[u8], m: usize, k: usize) -> Vec<u8
 ///   * qt 35 (`Oq8G256`)     — W8A8, int8 weights + int8 acts.
 ///   * qt 33 (`OqPlusG256`)  — W4A8, int4 weights sign-extended to int8.
 ///   * qt 36 (`OqPlusCompact`) — mixed W4A8, int4 bulk + int8 outliers.
+///   * qt 38 (`Oq3G256`)     — W3, bit-planed int3 sign-extended to int8.
 ///
 /// Returns `None` for any other code so the caller falls through to its own arms
 /// (OQ4 via `oq4_arch_load`, plain dtypes, etc.). All three resolve to
@@ -171,6 +223,7 @@ pub fn oq8_arch_load(qt: u8, data: &[u8], m: usize, k: usize) -> Option<(Vec<u8>
         c if c == QuantType::Oq8G256.code() => oq8_combined(data, m, k),
         c if c == QuantType::OqPlusG256.code() => oq4_to_oq8_combined(data, m, k),
         c if c == QuantType::OqPlusCompact.code() => oqplus_compact_to_oq8_combined(data, m, k),
+        c if c == QuantType::Oq3G256.code() => oq3_to_oq8_combined(data, m, k),
         _ => return None,
     };
     Some((bytes, DType::Oq8G256))
@@ -184,6 +237,44 @@ mod tests {
     const F16_ONE: u16 = 0x3C00;
     fn one_le() -> [u8; 4] {
         1.0f32.to_le_bytes()
+    }
+
+    #[test]
+    fn oq3_upcast_recovers_every_int3_code_losslessly() {
+        // Pack one 256-group by hand in the on-disk bit-plane layout, using a
+        // pattern that visits all 8 codes including the negative half, then check
+        // the upcast reproduces them exactly. Sign extension is the whole point:
+        // codes 4..7 must come back as -4..-1, not 4..7.
+        let codes: Vec<i32> = (0..256).map(|i| i % 8).collect();
+        let mut data = Vec::from(F16_ONE.to_le_bytes());
+        for s in 0..8 {
+            let (mut p0, mut p1, mut p2) = (0u32, 0u32, 0u32);
+            for i in 0..32 {
+                let v = codes[s * 32 + i] as u32;
+                p0 |= (v & 1) << i;
+                p1 |= ((v >> 1) & 1) << i;
+                p2 |= ((v >> 2) & 1) << i;
+            }
+            for w in [p0, p1, p2] {
+                data.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        assert_eq!(data.len(), 98, "on-disk Oq3G256 block is 98 B");
+
+        let out = oq3_to_oq8_combined(&data, 1, 256);
+        assert_eq!(out.len(), 256 + 4);
+        for i in 0..256 {
+            let raw = codes[i];
+            let want = if raw > 3 { raw - 8 } else { raw };
+            assert_eq!(out[i] as i8 as i32, want, "code {raw} at {i}");
+        }
+        assert_eq!(&out[256..260], &one_le());
+
+        // The dispatcher must route qt 38 here rather than returning None.
+        let (bytes, dtype) = oq8_arch_load(QuantType::Oq3G256.code(), &data, 1, 256)
+            .expect("qt 38 dispatches to the oq3 upcast");
+        assert_eq!(dtype, DType::Oq8G256);
+        assert_eq!(bytes, out);
     }
 
     #[test]
