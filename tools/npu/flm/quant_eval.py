@@ -59,9 +59,92 @@ TEXT = ("The capital of France is Paris, a city known for its museums and its "
 
 
 def bf16(a):
-    u = np.asarray(a, np.float32).view(np.uint32)
+    # np.array (a COPY), not np.asarray (a VIEW): `u + r` can elide into `u`,
+    # and if `u` views the caller's array this writes uint32 bit patterns
+    # straight through it. Every caller here passes a temp, but that is luck
+    # rather than design and this function is cheap.
+    u = np.array(a, np.float32).view(np.uint32)
     r = ((u >> 16) & 1) + np.uint32(0x7FFF)
     return ((u + r) & np.uint32(0xFFFF0000)).view(np.float32)
+
+
+def fwht(x, s1, s2):
+    """hipfire's `signed_fwht`, vectorised over leading axes.
+
+    signs1, Hadamard butterfly, orthonormal 1/sqrt(n), signs2 -- in that order,
+    matching hipfire-primitives/src/fwht.rs. Because H/sqrt(n) is its own inverse
+    and the sign vectors are +-1 (self-inverse), the INVERSE is the same transform
+    with the sign vectors SWAPPED, which is what codecs.rs's decoder does.
+    """
+    # Flattened to 2-D for the butterfly. The earlier version reshaped to
+    # (*lead, nblk, 2, h) and stacked, which was CORRECT for a 2-D input and
+    # WRONG for 3-D -- round-trip error 7.6 and energy ratio 0.103 at
+    # (64, 8, 256), against 3.6e-07 at (3, 256). It only ever ran on 3-D data
+    # (rows x groups x 256), so every oq4+ number it produced was garbage while
+    # the 2-D self-test passed. Flattening removes the axis bookkeeping that got
+    # it wrong; the checks below run at BOTH ranks now.
+    x = np.asarray(x, np.float32)
+    n = x.shape[-1]
+    y = (x * s1).reshape(-1, n).copy()
+    h = 1
+    while h < n:
+        y = y.reshape(-1, n // (2 * h), 2, h)
+        u = y[:, :, 0, :].copy()
+        v = y[:, :, 1, :].copy()
+        # EXPLICIT out=, and it is load-bearing. Written as `y[...] = u + v`
+        # followed by `y[...] = u - v`, numpy 2.1.3 on Python 3.14 elides the
+        # first sum INTO `u` -- so the second line computes (u+v)-v = u and the
+        # butterfly silently degenerates. Only above the 256 KB elision
+        # threshold: (2,3,4,256) at 24 KB round-tripped to 4.8e-07 while
+        # (512,256) at 512 KB gave energy 0.099 and error 7.1, from the SAME
+        # code. Copying u and v protects `y` but not `u` itself; out= is what
+        # actually stops it.
+        np.add(u, v, out=y[:, :, 0, :])
+        np.subtract(u, v, out=y[:, :, 1, :])
+        y = y.reshape(-1, n)
+        h *= 2
+    return (y.reshape(x.shape) / np.float32(np.sqrt(n))) * s2
+
+
+def clipsearch(g, qmax=7.0):
+    """hipfire's `symmetric_clipsearch`: the scale over a 9-point grid that
+    minimises squared reconstruction error, not simply amax/qmax."""
+    amax = np.abs(g).max(-1)
+    best_s = np.maximum(amax / qmax, 1e-12).astype(np.float32)
+    best_e = np.full(amax.shape, np.inf, np.float32)
+    for c in (1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6):
+        sc = np.maximum(np.float32(c) * amax / qmax, 1e-12).astype(np.float32)
+        q = np.clip(np.rint(g / sc[..., None]), -qmax, qmax)
+        # OPERAND ORDER IS LOAD-BEARING. Written `g - q*sc`, numpy 2.1.3 on
+        # 3.14 elides the subtraction INTO `g` -- the caller's rotated weights --
+        # so clipsearch silently replaced R with its own residuals: R rms fell
+        # 0.019971 -> 0.000108, every code quantised to zero, and the
+        # reconstruction came back 26x too small. Reversed, the elision target
+        # is the fresh `q*sc` temp instead, and squared error does not care.
+        e = ((q * sc[..., None] - g) ** 2).sum(-1)
+        take = e < best_e
+        best_s = np.where(take, sc, best_s)
+        best_e = np.where(take, e, best_e)
+    return best_s
+
+
+def requant_oq4pp(W, group, rng):
+    """oq4+ as hipfire actually encodes it: FWHT-rotate, clip-search, int4.
+
+    The rotation is what makes a symmetric per-group codebook fit a weight
+    distribution -- without it this tree measured 4.5-7.7x worse KLD than q4nx at
+    every group size. Modelled here by rotating, quantising and rotating BACK, so
+    the effective reconstructed weight is exact and the forward is untouched. On
+    device the same identity is realised by rotating the ACTIVATION instead.
+    """
+    N, K = W.shape
+    s1 = rng.choice(np.float32([-1, 1]), group)
+    s2 = rng.choice(np.float32([-1, 1]), group)
+    Wg = W.reshape(N, K // group, group)
+    R = fwht(Wg, s1, s2)
+    sc = bf16(clipsearch(R))
+    q = np.clip(np.rint(R / sc[..., None]), -7, 7).astype(np.float32)
+    return fwht(bf16(q * sc[..., None]), s2, s1).reshape(N, K)
 
 
 def requant_oq4(W, group):
@@ -73,14 +156,16 @@ def requant_oq4(W, group):
     return bf16(q * s[:, :, None]).reshape(N, K)
 
 
-def weights_oq4(sd, cfg, group):
+def weights_oq4(sd, cfg, group, pp=False):
     import torch
     out = dict(sd)
+    rng = np.random.default_rng(0)      # fixed signs: encode and decode must agree
     for L in range(cfg["num_hidden_layers"]):
         for nm in KEYMAP:
             k = f"layers.{L}.{nm}.weight"
-            out[k] = torch.from_numpy(
-                requant_oq4(sd[k].to(torch.float32).numpy(), group))
+            W = sd[k].to(torch.float32).numpy()
+            out[k] = torch.from_numpy(requant_oq4pp(W, group, rng) if pp
+                                      else requant_oq4(W, group))
     return out
 
 
@@ -143,9 +228,12 @@ def main():
 
     rows = []
     kld_bar = None
+    gs = [int(x) for x in o.groups.split(",")]
     for name, w, bw in ([("q4nx", weights_q4nx(sd, cfg), 5.0)] +
                         [(f"oq4_g{g}", weights_oq4(sd, cfg, g), 4.0 + 16.0 / g)
-                         for g in (int(x) for x in o.groups.split(","))]):
+                         for g in gs] +
+                        [(f"oq4+_g{g}", weights_oq4(sd, cfg, g, pp=True),
+                          4.0 + 16.0 / g) for g in gs]):
         k, ppl, t1 = score(ref, all_logits(toks, cfg, w), toks)
         if kld_bar is None:
             kld_bar = k
