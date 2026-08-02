@@ -28,11 +28,17 @@ Same GB/s both ways. The kernel is not the lever and never was.
 Llama-3.2-1B decode moves 60.8M params/layer x 16 layers plus a 262M-param
 lm_head every token. At the measured 54.7 GB/s ceiling:
 
-    format        bits   bytes/token   projected   note
-    q4nx (FLM)    5.00     775.7 MB     63.4 tok/s  MEASURED, our fused design
-    oq4++        ~4.25     659   MB    ~72   tok/s  projected, +18%
-    oq4          ~4.50     698   MB    ~68   tok/s  projected, +11%
-    oq8++         8.00    1235   MB    ~44   tok/s  projected, -28% vs FLM
+    format        bits   bytes/token   tok/s       note
+    q4nx (FLM)    5.00     775.7 MB     63.4        MEASURED, our fused design
+    oq4/oq4++     4.0625   630   MB    ~78          +27%; the GEMV is MEASURED at
+                                                    55.5 GB/s, the token is projected
+    oq3/oq3++     3.0625   475   MB   ~104          +70%; wholly projected
+    oq8++         8.0625  1244   MB    ~44          -28% vs FLM; ruled out
+
+Bits are the real block sizes from `hipfire-quant-format`, not estimates: 130 B,
+98 B and 258 B per 256-group respectively. The `++` suffixes share a container
+with their plain forms — calibration changes which codes are stored, never how
+many bytes — so they are one row each.
 
 **This CONFIRMS the standing `oq4++`/W4A8 target rather than revising it** — the
 project's quant target was set to `oq4++` on 2026-07-30, and the measurement above
@@ -48,9 +54,19 @@ story, which is the opposite of where GPU intuition points.
 faster AND more accurate than the q4_1-shaped container FLM uses. That is the
 rare case where the two goals do not trade against each other.
 
-Sanity-check the projections before building on them: they assume the same 54.7
-GB/s and the same dispatch structure, and a format with a different tile shape may
-not hit the same ceiling.
+**`oq3` is the bigger lever and is scoped nowhere.** `Oq3G256` is W3A4,
+`[f16 scale][8 x 3 u32 bit-planes]` = 98 B per 256-group = 3.0625 b/w, and
+hipfire's own format docs call it "the memory-ceiling lever (25% less weight
+traffic than Oq4)". On a decode path that is 92.4% DMA that is ~104 tok/s against
+oq4's ~78. Its bit-plane storage IS the kernel layout, so unlike oq4 it needs no
+repack — but it needs a Morton spread-to-int4 unpack in the inner loop, and this
+file's own oq4 experience is that the unpack path is exactly where a grouped
+format can lose 3.4x to arithmetic. Worth a probe of its own, on the same control
+method, before anyone believes the 104.
+
+Sanity-check the projections before building on them: the oq4 GEMV is now measured,
+but the TOKEN figures still assume the same dispatch structure across sixteen
+layers, and no layer has been built in either format.
 
 **MEASURED 2026-08-02 — the assumption holds, and the format is tighter than assumed.**
 `kernels/npu/flm_gemv_oq4g256.cc` + `lmhead_twostage.py --vs-oq4`, three designs
