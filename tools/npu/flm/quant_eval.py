@@ -48,9 +48,18 @@ GROUP = 256
 # round-trips itself -- but make W4A4 impossible, because the activation hook
 # cannot know which matrix it is feeding. hipfire passes signs1/signs2 in as
 # fixed vectors for exactly this reason.
-_SG = np.random.default_rng(0)
-SIGNS = (_SG.choice(np.float32([-1, 1]), GROUP),
-         _SG.choice(np.float32([-1, 1]), GROUP))
+# Per GROUP SIZE, cached: a fixed pair for 256 broke every other group size with
+# a broadcast error the moment the sweep widened. Same seed per size, so a run at
+# one group is reproducible and the activation hook and the weights agree.
+_SIGNS = {}
+
+
+def signs(group):
+    if group not in _SIGNS:
+        g = np.random.default_rng(0)
+        _SIGNS[group] = (g.choice(np.float32([-1, 1]), group),
+                         g.choice(np.float32([-1, 1]), group))
+    return _SIGNS[group]
 # oracle key -> q4nx container key. The container uses HF names, the checkpoint
 # uses Meta's; the tree's q4nx_tensor_blocks already returns checkpoint row order.
 KEYMAP = {"attention.wq": "self_attn.q_proj", "attention.wk": "self_attn.k_proj",
@@ -155,7 +164,7 @@ def requant_variant(W, group, rng, rotate, clip):
     """
     N, K = W.shape
     Wg = W.reshape(N, K // group, group)
-    s1, s2 = SIGNS
+    s1, s2 = signs(group)
     R = fwht(Wg, s1, s2) if rotate else Wg
     sc = bf16(clipsearch(R) if clip else np.abs(R).max(-1) / np.float32(7.0))
     q = np.clip(np.rint(R / sc[..., None]), -7, 7).astype(np.float32)
@@ -176,7 +185,7 @@ def quant_act(A, group, rotate, clip):
     a = np.array(A.numpy(), np.float32)
     lead, K = a.shape[:-1], a.shape[-1]
     G = a.reshape(-1, K // group, group)
-    s1, s2 = SIGNS
+    s1, s2 = signs(group)
     R = fwht(G, s1, s2) if rotate else G
     sc = bf16(clipsearch(R) if clip else np.abs(R).max(-1) / np.float32(7.0))
     q = np.clip(np.rint(R / np.maximum(sc, np.float32(1e-30))[..., None]),
@@ -212,6 +221,41 @@ def requant_oq4(W, group):
     inv = np.where(s > 0, np.float32(1.0) / np.maximum(s, np.float32(1e-30)), 0.0)
     q = np.clip(np.rint(Wg * inv[:, :, None]), -7, 7).astype(np.float32)
     return bf16(q * s[:, :, None]).reshape(N, K)
+
+
+def requant_asym(W, group):
+    """q4_1's shape at an arbitrary group: ASYMMETRIC, scale AND min per group.
+
+    q4nx is q4_1 -- 32 weights, 4 bits each, plus a bf16 scale and a bf16 min =
+    5.00 b/w -- and it beats every symmetric variant tried here by 4.5-7.7x on
+    KLD. Two candidate reasons: its groups are 8x finer, or it is asymmetric.
+    They cost very differently. Asymmetry at group 256 is 4 + 32/256 = 4.125
+    b/w, still 0.875 bits under q4nx; finer groups cost bits directly.
+
+    So this isolates asymmetry from group size. Codes are 0..15 against the
+    symmetric path's -7..7, which is also 16 levels vs 15 -- a real edge that
+    has nothing to do with either hypothesis and is worth naming.
+    """
+    N, K = W.shape
+    Wg = W.reshape(N, K // group, group)
+    lo = Wg.min(-1)
+    hi = Wg.max(-1)
+    sc = bf16((hi - lo) / np.float32(15.0))
+    mn = bf16(lo)
+    inv = np.where(sc > 0, np.float32(1.0) / np.maximum(sc, np.float32(1e-30)), 0.0)
+    q = np.clip(np.rint((Wg - mn[..., None]) * inv[..., None]), 0, 15).astype(np.float32)
+    return bf16(q * sc[..., None] + mn[..., None]).reshape(N, K)
+
+
+def weights_asym(sd, cfg, group):
+    import torch
+    out = dict(sd)
+    for L in range(cfg["num_hidden_layers"]):
+        for nm in KEYMAP:
+            k = f"layers.{L}.{nm}.weight"
+            W = np.array(sd[k].to(torch.float32).numpy(), np.float32)
+            out[k] = torch.from_numpy(requant_asym(W, group))
+    return out
 
 
 def weights_variant(sd, cfg, group, rotate, clip):
@@ -349,7 +393,9 @@ def main():
                         [(f"rot_g{g}", weights_variant(sd, cfg, g, True, False),
                           4.0 + 16.0 / g) for g in gs] +
                         [(f"clip_g{g}", weights_variant(sd, cfg, g, False, True),
-                          4.0 + 16.0 / g) for g in gs]):
+                          4.0 + 16.0 / g) for g in gs] +
+                        [(f"asym_g{g}", weights_asym(sd, cfg, g),
+                          4.0 + 32.0 / g) for g in gs]):
         k, ppl, t1 = score(ref, all_logits(toks, cfg, w), toks)
         if kld_bar is None:
             kld_bar = k
