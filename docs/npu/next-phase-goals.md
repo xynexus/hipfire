@@ -110,8 +110,33 @@ DO NOT read the qtip3 row as "trellis loses". That artifact has NO conditioning:
 `format_needs_calibration("qtip3")` is false, so it took neither AWQ nor LDLQ
 while oq3++ took both. The row measures conditioned 3-bit against UNconditioned
 3-bit trellis, which is the same lesson as everything else in this file —
-calibration dominates the codec. Trellis at equal conditioning is still
-unmeasured and is the open question 3-bit hinges on.
+calibration dominates the codec.
+
+**RESOLVED SAME DAY — CONDITION THE TRELLIS AND IT WINS.** AWQ was wired into
+`pack_qtip_real_tensors` (hipfire `ad547ff9d`) and re-measured on the same slice:
+
+    oq3++  (AWQ + LDLQ)  3.0625 b/w  PPL 19.9025  KLD 0.197836     —
+    qtip3  (no cond.)    3.1250 b/w  PPL 25.2538  KLD 0.368288  1.86x worse
+    qtip3+ (AWQ only)    3.1250 b/w  PPL 20.0937  KLD 0.152725  1.30x BETTER
+
+**AWQ alone cuts qtip3's KLD 2.41x, and that beats oq3++ WHICH ALSO HAS LDLQ** —
+half the conditioning, better distribution match, 2% more bits. PPL disagrees
+slightly (20.09 vs 19.90), so KLD and PPL are not ranking these identically;
+do not quote one as if it settled the other.
+
+The lever is still calibration, but the trellis is now the better container to
+apply it to. Real `qtip3++` — Hessian-weighting the beam search so it minimises
+OUTPUT error rather than unweighted squared error, which is the actual QTIP
+recipe — is untested and is the experiment most likely to make 3-bit
+competitive. `qtip3++` currently REFUSES to run rather than silently producing
+an AWQ-only artifact under a name whose second `+` promises error feedback.
+
+LQER IS A DEAD END ON THIS PATH, measured, not assumed. `HIPFIRE_LOWRANK_R`
+emits 224 `lr_u`/`lr_v` tensors and llama scores BIT-IDENTICAL (25.2538 /
+0.368288 at r=16 AND r=32, +55 MB for nothing) because `lr_u` has exactly one
+consumer in the tree: `hipfire-arch-minimax`. The llama path never applies the
+correction it paid for. Fixing that means a runtime consumer — `y += (x·U)·V`,
+two rank-r GEMVs — not a quantizer change.
 
 The CONTROL is why these numbers can be trusted: oq4++ rebuilt from the fp16
 source landed at 17.2091 against 17.2238 from bf16, a 0.09% difference. All four
