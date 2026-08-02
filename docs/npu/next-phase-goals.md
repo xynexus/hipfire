@@ -86,6 +86,25 @@ the silent misaligned-load failure this tree has already paid for. That is what
 `Oq4G256ArchPacked` and the loader's per-arch repack exist for; the NPU repack is
 planar, `[NROWS*NG bf16 scales][NROWS*K/2 nibbles]`, same byte count.
 
+**WHAT WAS ACTUALLY MEASURED: the oq4 CONTAINER, not the oq4 CODEC.** The probe packs
+weights with a naive absmax quantizer (`s = max|w|/7`). `quantize_oq4g256`
+(`hipfire-quantize/src/codecs.rs:701`) additionally applies
+
+    cpu_fwht_256(&mut group, signs1, signs2);       // randomized Hadamard rotation
+    let scale = symmetric_clipsearch(&group, 7.0);  // clip-search = the first '+'
+
+so the probe is weaker than `oq4+` and well short of `oq4++`. That is deliberate and it
+does not weaken the throughput result: FWHT, clip-search and LDLQ change WHICH codes and
+scales are stored, never HOW MANY BYTES, and the block is 130 B per 256-group whatever
+chose the numbers. **The 55.5 GB/s and the ~78 tok/s are the real format's.** What the
+probe says nothing about is the format's ACCURACY, and no accuracy claim rests on it.
+
+**The port still owes the FWHT.** Stored codes decode as `scale * sext4` under an inverse
+FWHT. The rotation is orthogonal, so `x . W^T = (Rx) . (RW)^T` — the GEMV body is
+unchanged and what is missing is a pre-pass that rotates the ACTIVATION in 256-element
+groups. It is per-GEMV, not per-row: a 256-point transform over 8 groups is ~16K ops
+amortised across 128256 rows. Free in time, absent in code.
+
 **Two things this did NOT settle**, both real:
 
   - **Scale precision.** The shipped kernel folds the scale into the weights, which

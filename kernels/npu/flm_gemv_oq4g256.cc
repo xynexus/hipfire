@@ -2,7 +2,8 @@
 // hipfire - see LICENSE and NOTICE in the project root.
 //
 // Opus Quant W4A4 (`Oq4G256`) GEMV for AIE2P — the bandwidth probe for the
-// oq4++ decode port.
+// oq4 decode port. This validates the LAYOUT and THROUGHPUT of the oq4 block,
+// not the oq4/oq4+/oq4++ codec; see "WHAT THIS IS AND IS NOT" below.
 //
 // WHAT THIS ANSWERS. Every tok/s projection in docs/npu/next-phase-goals.md
 // assumes an oq4 tile streams at the same ~54.7 GB/s the q4_1 and coarse tiers
@@ -68,13 +69,32 @@
 // unsigned path gets and costs nothing. Extracting the sign by hand would be
 // two extra vector ops per 64 weights for what the load already gives.
 //
-// NOT MODELLED HERE: the FWHT rotation of the activation. It is an
-// activation-side transform — it changes neither the weight bytes nor how they
-// stream, and at K=2048 it is ~22K ops against 2048 MACs a row over 16 rows.
-// It belongs in the forward path, not in a bandwidth probe, and leaving it out
-// is what keeps this measuring the thing it claims to measure. The GEMV below
-// is a correct symmetric-int4 grouped dequant-and-dot for whatever basis the
-// weights were packed in.
+// WHAT THIS IS AND IS NOT. The weights here are packed by a NAIVE symmetric
+// quantizer written for this probe — absmax, `s = max|w|/7`, q in [-7, 7]. That
+// is the oq4 CONTAINER, not the oq4 CODEC. `quantize_oq4g256` does two more
+// things (crates/hipfire-quantize/src/codecs.rs:701):
+//
+//     cpu_fwht_256(&mut group, signs1, signs2);       // randomized Hadamard
+//     let scale = symmetric_clipsearch(&group, 7.0);  // clip-search = first '+'
+//
+// so this is weaker than `oq4+`, and well short of `oq4++` (which adds
+// Hessian/LDLQ error feedback). Calling it either would be wrong.
+//
+// It does not matter for what this file measures, and that is the point of
+// saying so: FWHT, clip-search and LDLQ change WHICH codes and scales are
+// stored, never HOW MANY BYTES. The block is [f16 scale][128 nibbles] per
+// 256-group = 4.0625 b/w whatever chose the numbers, so the GB/s here is the
+// real format's GB/s. It matters enormously for ACCURACY, which is why no
+// accuracy claim may rest on this file.
+//
+// THE FWHT IS NOT MODELLED, and the port needs it. The stored codes decode as
+// `scale * sext4` under an INVERSE FWHT, so the rotation is a basis change:
+// since it is orthogonal, x . W^T = (Rx) . (RW)^T, and the kernel body below is
+// unchanged — what is needed is a pre-pass that FWHT-rotates the ACTIVATION in
+// 256-element groups. That is per-GEMV, not per-row: a 256-point transform over
+// 8 groups is ~16K ops amortised across 128256 rows, so it is free in time and
+// simply absent in code. The GEMV below is a correct symmetric-int4 grouped
+// dequant-and-dot for whatever basis the weights were packed in.
 //
 // Compile-time: -DDIM_K (input dims) -DDIM_NROWS (output rows per tile).
 
