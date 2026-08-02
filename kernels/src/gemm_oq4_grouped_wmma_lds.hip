@@ -34,6 +34,13 @@
 // Requires K % 64 == 0, group % 64 == 0, group % 16 == 0, K % group == 0
 // (Oq4G256 guarantees group=256, so all hold). gfx1103/RDNA3 wave32; gated to
 // WMMA archs by the dispatch (same as the original).
+//
+// Group-size constraint chain (see the `_gx` entry below): the flush must land
+// on a BK=64 K-strip boundary, so any group — weight or activation — has to be a
+// multiple of 64. The wave32 activation quantizer independently needs
+// group % 64 == 0 (its per-lane run group/32 must be even to nibble-pack), and a
+// wave64 quantizer would need group % 128 == 0. So the sizes that fit BOTH wave
+// widths are the multiples of 128: 128, 256, 512.
 
 #include <hip/hip_runtime.h>
 #include <stdint.h>
@@ -61,7 +68,7 @@ static __device__ __forceinline__ void gemm_oq4_grouped_wmma_lds_body(
     const uint8_t* __restrict__ X,
     const float*   __restrict__ Xs,
     void*          __restrict__ Yv,
-    int M, int K, int B, int group
+    int M, int K, int B, int group, int group_x
 ) {
     __shared__ uint8_t s_A[2][BM * (BK / 2)];
     __shared__ uint8_t s_X[2][BN * (BK / 2)];
@@ -77,9 +84,11 @@ static __device__ __forceinline__ void gemm_oq4_grouped_wmma_lds_body(
     const int bm = blockIdx.x * BM;
     const int bn = blockIdx.y * BN;
     const int st = K / 2;                 // packed bytes per row
-    const int n_groups = K / group;
+    const int n_groups = K / group;       // weight-scale groups
+    const int n_groups_x = K / group_x;   // activation-scale groups (== n_groups when coupled)
     const int nstrip = K / BK;
-    const int spg = group / BK;           // K-strips per group (=4 for group 256)
+    const int spg = group_x / BK;         // K-strips per FLUSH (=4 for group 256)
+    const int wpx = group / group_x;      // X-groups per W-group (=1 when coupled)
 
     const int UA  = (BK / 2) / 4;         // u32 per source row-strip (=8)
     const int NA  = BM * UA / BLOCK;      // As u32 / thread (=2)
@@ -138,7 +147,8 @@ static __device__ __forceinline__ void gemm_oq4_grouped_wmma_lds_body(
         // Same (row,col)->scale map and same (iacc*sw)*sx order as the original
         // kernel, in ascending group order ⇒ bit-exact f32 result.
         if ((k + 1) % spg == 0) {
-            const int g = k / spg;
+            const int gx = k / spg;       // activation-scale group just completed
+            const int g = gx / wpx;       // enclosing weight-scale group
             float sw[WMt][8];
 #pragma unroll
             for (int i = 0; i < WMt; i++)
@@ -153,7 +163,7 @@ static __device__ __forceinline__ void gemm_oq4_grouped_wmma_lds_body(
             for (int j = 0; j < WNt; j++) {
                 int c = bn + (wn * WNt + j) * 16 + lane;
                 int cs = c < B ? c : B - 1;
-                sx[j] = Xs[(long long)cs * n_groups + g];
+                sx[j] = Xs[(long long)cs * n_groups_x + gx];
             }
 #pragma unroll
             for (int i = 0; i < WMt; i++)
@@ -202,7 +212,7 @@ extern "C" __global__ void gemm_oq4_grouped_wmma_lds(
     float*         __restrict__ Y,
     int M, int K, int B, int group
 ) {
-    gemm_oq4_grouped_wmma_lds_body<false>(W, Ws, X, Xs, (void*)Y, M, K, B, group);
+    gemm_oq4_grouped_wmma_lds_body<false>(W, Ws, X, Xs, (void*)Y, M, K, B, group, group);
 }
 
 __launch_bounds__(BLOCK, 2)
@@ -214,5 +224,25 @@ extern "C" __global__ void gemm_oq4_grouped_wmma_lds_bf16out(
     uint16_t*      __restrict__ Y,
     int M, int K, int B, int group
 ) {
-    gemm_oq4_grouped_wmma_lds_body<true>(W, Ws, X, Xs, (void*)Y, M, K, B, group);
+    gemm_oq4_grouped_wmma_lds_body<true>(W, Ws, X, Xs, (void*)Y, M, K, B, group, group);
+}
+
+// Decoupled activation group: the weight scales keep the codec's group (256 for
+// Oq4G256) while the ACTIVATION is quantized at a finer group_x. group_x must
+// divide group and be a multiple of BK=64, so every X-group lies inside exactly
+// one W-group and still lands on a K-strip boundary. Finer group_x = a tighter
+// absmax per scale (better int4 activation reconstruction) at the cost of more
+// f32 flushes (group/group_x× as many) and more Xs traffic. NOT bit-exact vs
+// the coupled entry when group_x < group — that is the point; it is a quality
+// knob, measured by KLD, not parity.
+__launch_bounds__(BLOCK, 2)
+extern "C" __global__ void gemm_oq4_grouped_wmma_lds_gx(
+    const uint8_t* __restrict__ W,
+    const float*   __restrict__ Ws,
+    const uint8_t* __restrict__ X,
+    const float*   __restrict__ Xs,
+    float*         __restrict__ Y,
+    int M, int K, int B, int group, int group_x
+) {
+    gemm_oq4_grouped_wmma_lds_body<false>(W, Ws, X, Xs, (void*)Y, M, K, B, group, group_x);
 }

@@ -13,6 +13,28 @@ use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 
+/// Activation group size for the batched W4A4 prefill path (`HIPFIRE_OQ4_ACT_GROUP`,
+/// default 256 = the Oq4G256 weight codec's group, i.e. production unchanged).
+///
+/// A finer activation group means a tighter absmax per scale, so fewer values in
+/// each group are crushed by an outlier — the cheapest quality knob on the
+/// activation side that needs no new math. Legal sizes are constrained from three
+/// directions: the LDS GEMM flushes on a BK=64 K-strip boundary, the wave32
+/// quantizer needs `group/32` even, and it must divide the weight group. That
+/// leaves 64 / 128 / 256 on wave32; a wave64 quantizer (`group/64` even) would
+/// start at 128, so **128 and 256 are the only sizes portable across both wave
+/// widths**. Anything below 256 goes through `gemm_oq4_grouped_wmma_lds_gx`.
+pub fn oq4_act_group() -> usize {
+    match std::env::var("HIPFIRE_OQ4_ACT_GROUP") {
+        Ok(v) => {
+            let g: usize = v.parse().expect("HIPFIRE_OQ4_ACT_GROUP must be an integer");
+            assert!(g == 64 || g == 128 || g == 256, "HIPFIRE_OQ4_ACT_GROUP must be 64, 128 or 256");
+            g
+        }
+        Err(_) => 256,
+    }
+}
+
 impl Gpu {
     /// Ensure reusable plain-basis DFLASH activation staging for `n` rows.
     /// Capacity only grows; sequential projections safely reuse it on the same
@@ -247,10 +269,15 @@ impl Gpu {
         group: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Multiple of 64, not 32: both quantizer kernels give each of the 32 lanes
+        // a contiguous run of `group/32` elements and nibble-pack it in PAIRS, so
+        // an odd run (group = 32, 96, …) makes a lane read its neighbour's first
+        // element and drop its own last one — silent corruption, not a crash.
+        // (A wave64 port would need group % 128 == 0 for the same reason.)
         assert_eq!(
-            group % 32,
+            group % 64,
             0,
-            "quantize_act_oq4: group must be a multiple of 32"
+            "quantize_act_oq4: group must be a multiple of 64 (group/32 must be even to nibble-pack)"
         );
         assert_eq!(
             k % group,
@@ -653,8 +680,10 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         const GROUP: usize = 256;
+        let group_x = oq4_act_group().min(k);
         self.ensure_oq4_scratch_batched(n, k, m)?;
         let ng = k / GROUP;
+        let ngx = k / group_x;
         let xq = GpuTensor {
             buf: unsafe { self.oq4_xq_batch.as_ref().unwrap().buf.alias() },
             shape: vec![n * (k / 2)],
@@ -662,11 +691,20 @@ impl Gpu {
         };
         let xs = GpuTensor {
             buf: unsafe { self.oq4_xs_batch.as_ref().unwrap().buf.alias() },
-            shape: vec![n * ng],
+            shape: vec![n * ngx],
             dtype: DType::F32,
         };
-        self.quantize_act_oq4(x_rot, &xq, &xs, n, k, GROUP)?;
+        self.quantize_act_oq4(x_rot, &xq, &xs, n, k, group_x)?;
         let ws = w_combined.sub_offset(m * (k / 2), m * ng * 4);
+        if group_x != GROUP {
+            // Finer activation group than the weight codec's 256 — the decoupled
+            // kernel. Needs the LDS tiling (BK-boundary flush), so only for n>=128.
+            if n >= 128 {
+                return self
+                    .gemm_oq4_grouped_wmma_lds_gx(w_combined, &ws, &xq, &xs, y, m, k, n, GROUP, group_x);
+            }
+            panic!("HIPFIRE_OQ4_ACT_GROUP != 256 needs the LDS path (n>=128), got n={n}");
+        }
         // For prefill-sized batches, the LDS-staged kernel is bit-identical to the
         // zero-LDS original but ~1.8× faster (beats W4A8-MMQ; see the A3 gate in
         // docs/plans/2026-07-30-oq4-w4a4-near-lossless.md §9). It needs K%64==0

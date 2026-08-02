@@ -222,3 +222,35 @@ into full investigations here.
   runnable model.
 - Note: The sibling `forward.rs` chunk/ring path is NOT affected — its
   non-aligned-with-compress-events case returns an explicit `Err`.
+
+## [High] bf16 KLD reference artifacts contain chunk 0 replicated 1175×
+- Category: Correctness / Evidence tooling
+- Location: `/srv/hipfire/kldrefs/qwen3.5-{0.8b,2b,4b}-bf16.kldref.hfq`
+  (and the `.arch0.bak` copy under `/srv/Public`); produced 2026-06-05 by
+  `build_kld_ref_hipfire` (hipfire 0.2.0). That producer is no longer in the
+  tree — only the artifacts remain.
+- Summary: `kldref.tokens` is correct (1175 contiguous 2048-token windows of the
+  wikitext2 slice), but the `kldref.top_indices` / `top_log_probs` /
+  `residual_mass` blocks for EVERY chunk are byte-identical to chunk 0's. The
+  block cursor never advanced. Verified with
+  `cargo run --release -p hipfire-runtime --example kldref_selftest -- <ref>`:
+  chunk 0's argmax agrees with the corpus's next token 44–50% of the time (a
+  healthy bf16 reference), chunks 1..N agree ~1% (chance), and a slide of chunk
+  1's blocks over the token stream best-matches token position 1025 — chunk 0's
+  scoring window. All three model sizes show it identically, so it is a producer
+  bug, not file corruption.
+- Impact: any absolute KLD-vs-bf16 computed from these files past chunk 0 is
+  meaningless (a candidate is scored against a different passage's predictions;
+  observed ~11.5 nats/tok vs ~0.3 for the valid chunk). Chunk 0 alone (1023
+  positions) IS usable, which is how the defect stayed invisible to spot checks.
+  The daemon's own loader independently refuses these files — their metadata
+  `arch_id` is 0 (`read_hfqm_kld_ref_archive`, `hipfire-daemon/src/main.rs`) — so
+  the in-tree evidence path was never exposed; the risk is ad-hoc harnesses that
+  bypass that check.
+- Suggested fix: regenerate against a bf16 `.hfq` (none currently on disk for
+  qwen3.5-0.8b; `/srv/hipfire/archives/models--Qwen--Qwen3.5-0.8B.hfa` holds the
+  HF source) with a per-chunk block-cursor assertion, and have any new reader
+  run the `kldref_selftest` agreement check before trusting a reference. Until
+  then treat these three artifacts as single-chunk.
+- Scope: Tooling / evidence integrity
+- Confidence: High (self-test is deterministic and reproduces on all 3 files)

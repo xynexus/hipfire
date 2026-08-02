@@ -1239,3 +1239,181 @@ Whether to ship it is now a judgement call, not a slam dunk: it's justified if t
 gain is worth ~3.5% prefill, or if a cheaper clip (closed-form, or de-dup'ing the redundant
 qkv quantizes) erases the cost. **The A3 kernel work remains valid at the kernel level and is
 bit-exact; its model-level payoff awaits a GEMM-bound (dense/large) target.**
+
+## 13. Absolute-vs-bf16, and TWO new Stream-B levers (2026-08-02)
+
+Three questions drove this pass: what is W4A4's KLD/PPL **against bf16** (not
+against an A16 activation baseline); have the levers been exhausted; and which
+activation group sizes actually fit the wave32/wave64 kernels.
+
+### 13a. The house bf16 kldrefs are BROKEN — chunk 0 replicated 1175×
+
+`perplexity_batched` gained `--hfqm-ref`, which reads an HFQM `*.kldref.hfq`
+(`hipfire.kldref.v1`) directly. The ref carries its own token stream, so the
+candidate runs on exactly the reference's windows — no corpus, no tokenizer, and
+the KLD is **absolute vs bf16** rather than an act-precision delta.
+
+The first 16-chunk run came back at **9.65 nats/tok** with chunk 0 at 0.29 and
+every later chunk ~11.5. The model side was fine (PPL 14–15), so the reference
+was suspect. New CPU-only `kldref_selftest` settled it: chunk 0's stored argmax
+agrees with the corpus's next token **44.4%** of the time (a healthy bf16 ref),
+chunks 1..N agree ~1% (chance), chunk 1's blocks are **byte-identical to chunk
+0's (1023/1023)**, and sliding chunk 1's blocks over the token stream
+best-matches token position 1025 — chunk 0's own scoring window. The producer
+never advanced the block cursor. **All three refs (0.8b, 2b, 4b) show it**, so it
+is a `build_kld_ref_hipfire` bug (hipfire 0.2.0, 2026-06-05; that producer is no
+longer in the tree). Recorded in BUGS.md. The daemon's loader independently
+refuses these files (their `arch_id` is 0), so the in-tree evidence path was
+never exposed — only ad-hoc harnesses that bypass that check are at risk.
+
+**Consequence: chunk 0 alone is usable (1023 positions).** Every absolute number
+below is therefore single-window and indicative, NOT house-rule (≥16 chunks). A
+house-rule absolute number needs a regenerated reference, which needs a bf16
+`.hfq` — none on disk (`/srv/hipfire/archives/models--Qwen--Qwen3.5-0.8B.hfa`
+holds the HF source).
+
+### 13b. Absolute vs bf16 — the weights dominate, activations are a small slice
+
+qwen3.5-0.8b--oq4++, chunk 0 of the wikitext2 slice, 1023 scored positions,
+top-256, vs the bf16 reference:
+
+| configuration | KLD vs bf16 | PPL |
+|---|---|---|
+| per-token W4A16, f32 KV (**weights only**) | **0.2729** | 19.55 |
+| batched W4A16, q8 KV (+ KV, + batched path) | 0.2927 | 19.98 |
+| current mix (qkv-W4A8 + rest-W4A4) | 0.3244 | 20.96 |
+| full W4A4 plain | 0.3359 | 21.45 |
+| **full W4A4 + clip** | **0.3064** | 20.61 |
+| full W4A4 + clip + act group 128 | 0.3090 | 20.53 |
+
+**The headline: ~88% of the distance to bf16 is the oq4++ WEIGHT quantization
+(0.273 of ~0.31).** q8 KV + the batched path add ~0.020. The entire
+activation-precision question — the whole W4A4-vs-W4A8 debate — moves the total
+by ~0.01–0.03, i.e. **4–10% of the error budget**. Ordering is preserved
+(clip < mix < plain), matching the act16-relative measurements.
+
+Caveats, stated rather than buried: this is one 1023-position window; the two
+clip rows are within single-window noise of each other (the sharper
+act16-relative instrument in §13c puts clip+g128 clearly ahead of clip); and
+0.27 is **not** comparable to the historical "oq4 KLD 0.046" — different scorer,
+top-k, corpus window, and KV mode. Anchor: the reference's own restricted PPL on
+this window (targets inside top-256 only, optimistic) is 11.0.
+
+### 13c. Two NEW levers, both measured, both real
+
+Instrument: KLD vs a full-A16 batched reference generated in the same session
+(self-consistent; A16-vs-A16 checks in at exactly 0.000000). 8 chunks × ctx 512,
+4024 positions.
+
+**Lever 1 — per-site activation sensitivity.** `HIPFIRE_OQ4_PREFILL_ACT_BITS_<SITE>`
+(QKV|GATEUP|O|DOWN) now overrides the global per site, so one projection can be
+held at A16 while the rest run A4. An A16 lift is an **upper bound** on what a
+mixed-precision (ResQ-style A8 subspace) treatment of that site could recover —
+measurable without building the dual int4+int8 GEMM first.
+
+| variant | KLD | PPL | recovered |
+|---|---|---|---|
+| A4 everywhere | 0.0713 | 31.98 | — |
+| A4, GATEUP=A16 | 0.0699 | 31.94 | 2% |
+| A4, QKV=A16 | 0.0642 | 31.61 | 10% |
+| A4, DOWN=A16 | 0.0556 | 31.38 | 22% |
+| **A4, O=A16** | **0.0475** | 30.57 | **33%** |
+| A4, O+DOWN=A16 | 0.0338 | 30.17 | 53% |
+
+**`o_proj` is the most activation-sensitive site, not `down_proj`** — which
+refutes the standing intuition (down's input is the SwiGLU product, the textbook
+worst-outlier activation). o+down together recover half the penalty. gate_up is
+nearly free, so any future mixed-precision work should target o first, and there
+is no reason to spend precision on gate_up.
+
+**Lever 2 — finer activation group.** The activation group was welded to the
+weight codec's 256 because the GEMM indexed `Ws` and `Xs` with one `group`.
+Decoupled via a new `gemm_oq4_grouped_wmma_lds_gx` entry (weights keep 256, the
+activation carries `group_x`), knob `HIPFIRE_OQ4_ACT_GROUP`:
+
+| variant | KLD | PPL |
+|---|---|---|
+| current mix (incumbent) | 0.0644 | 31.81 |
+| A4 plain | 0.0713 | 31.98 |
+| A4 + group 128 | 0.0618 | 31.43 |
+| A4 + group 64 | 0.0568 | 31.32 |
+| A4 + clip (previous ship config) | 0.0585 | 30.65 |
+| **A4 + clip + group 128** | **0.0551** | 30.71 |
+| **A4 + clip + group 64** | **0.0528** | 30.52 |
+
+The group lever is **independent of and composes with the clip** — it is worth
+~13% alone at 128, ~20% at 64, and stacks on top of clip for a combined −26% vs
+plain A4 and **−18% vs the shipped incumbent**. Note the first attempt at this
+row was invalid: the group knob read identical KLD to 6 decimal places because
+the example binary predated the dispatch rebuild. Identical-to-6-digits is the
+signature of a knob that never got linked in; re-run after rebuilding.
+
+**Throughput cost** (real-model prefill, 8192 tok, same-run paired):
+
+| variant | tok/s | vs incumbent |
+|---|---|---|
+| mix (incumbent) | 1126.7 | — |
+| A4 + clip (g256) | 1051.9 | −6.6% |
+| A4 + clip + g128 | 1025.1 | −9.0% |
+| A4 + clip + g64 | 1016.6 | −9.8% |
+
+So the finer group costs ~2.5–3.3% on top of the clip. Run-to-run variance on
+this box is ~1–4%, so treat these as approximate; the ordering is stable.
+Recommended stack if quality is the goal: **A4 + clip + group 128** — −14% KLD
+vs the incumbent at ~−9% prefill, and 128 is the only finer size that stays
+wave64-portable (below).
+
+### 13d. Which group sizes actually fit — wave32 vs wave64
+
+The constraint chain, from three independent places:
+
+- **Quantizer (`quantize_act_oq4`, `_clip`), wave32:** block = [32], each lane
+  owns a contiguous run of `group/32` and nibble-packs it in PAIRS, so the run
+  must be **even** ⇒ `group % 64 == 0`. group = 32 or 96 does not fail loudly —
+  a lane reads its neighbour's first element and drops its own last one. The
+  dispatch asserted only `group % 32`, which admitted exactly those silently
+  corrupting sizes; **tightened to `% 64`** in this pass.
+- **A wave64 port** would give each of 64 lanes `group/64`, even ⇒
+  `group % 128 == 0`. The dword-store sweet spot (each lane emitting exactly one
+  aligned 32-bit store, `group/wave = 8`) is **256 on wave32 and 512 on wave64**
+  — which is why 256 was the natural choice here.
+- **GEMM (`gemm_oq4_grouped_wmma_lds`):** the group-boundary flush must land on a
+  BK = 64 K-strip ⇒ `group % 64 == 0`, plus `K % group == 0`. (The zero-LDS
+  original is looser: `group % 16`.)
+- **Codec:** `Oq4G256` fixes the WEIGHT group at 256; `group_x` must divide it so
+  each activation group sits inside one weight group.
+
+| group | wave32 quantizer | wave64 quantizer | LDS GEMM | verdict |
+|---|---|---|---|---|
+| 32 | NO (odd run) | NO | NO | silently corrupting — now asserted out |
+| 64 | yes | NO | yes | wave32-only |
+| **128** | yes | yes | yes | **finest size portable to both wave widths** |
+| **256** | yes (dword-optimal) | yes | yes | **today's default** |
+| 512 | yes | yes (dword-optimal) | yes | coarser, no reason to |
+
+So: multiples of 64 on wave32, multiples of 128 on wave64, and **128 / 256 are
+the only sizes legal everywhere**. Per AGENTS.md portability, a finer group
+shipped as default should be 128, not 64 — 64 would strand a wave64 port.
+
+### 13e. Verification
+
+- `parity_gemm_oq4_grouped_wmma_lds`: the coupled path is still **BIT-EXACT**
+  vs the zero-LDS original after the body refactor (max_abs = 0.000000, all 7
+  shapes), and the new `_gx` entry matches a mixed-group CPU reference at
+  gx = 256 / 128 / 64 across 3 shapes. ALL PASS.
+- A16-vs-A16 self-check reads exactly 0.000000 KLD — the instrument is
+  deterministic and the reference is self-consistent.
+- Every runtime change is env-gated and default-off; production routing is
+  unchanged.
+
+### 13f. What is still owed
+
+- **A house-rule absolute-vs-bf16 number** — blocked on regenerating a bf16
+  reference (needs a bf16 `.hfq` built from the `.hfa` HF source).
+- **≥16-chunk confirmation** of the two new levers (these are 8-chunk smokes).
+- **A8 (not A16) on `o_proj`** — the sensitivity sweep says o is where a real
+  mixed-precision lever pays; the A16 number is the upper bound, an A8 subspace
+  would capture some fraction of it at a fraction of the cost.
+- Still untouched from the original ranking: ConQuR R₁/R₂ rotation, ResQ ⅛→1/32
+  subspace proper, SVDQuant, LO-BCQ. **The cheap levers are not exhausted** —
+  two more were found and measured today, both bigger than expected.

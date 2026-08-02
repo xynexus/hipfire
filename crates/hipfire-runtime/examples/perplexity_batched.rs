@@ -62,6 +62,7 @@ fn main() {
     let mut kv_mode: String = "q8".to_string();
     let mut dump_ref: Option<String> = None;
     let mut kld_ref: Option<String> = None;
+    let mut hfqm_ref: Option<String> = None;
     let mut top_k: usize = 128;
     while let Some(flag) = args.next() {
         let val = args.next().expect("flag missing value");
@@ -73,9 +74,23 @@ fn main() {
             "--kv-mode" => kv_mode = val,
             "--dump-ref" => dump_ref = Some(val),
             "--kld-ref" => kld_ref = Some(val),
+            "--hfqm-ref" => hfqm_ref = Some(val),
             "--top-k" => top_k = val.parse().unwrap(),
             _ => panic!("unknown flag: {flag}"),
         }
+    }
+    // An HFQM kldref carries its OWN tokens, ctx, and scoring window — it drives
+    // the run so the candidate is scored on exactly the reference's positions.
+    let hfqm = hfqm_ref.as_ref().map(|p| read_hfqm_ref(p));
+    if let Some(h) = hfqm.as_ref() {
+        ctx_len = h.n_ctx;
+        warmup = h.scoring_start;
+        top_k = h.top_k;
+        eprintln!(
+            "HFQM ref: {} ({}), n_ctx={} scoring_start={} scored/chunk={} top_k={} n_chunk={} kv_mode(ref)={}",
+            h.base_model_id, h.reference_precision, h.n_ctx, h.scoring_start,
+            h.scored_per_chunk, h.top_k, h.n_chunk, h.ref_kv_mode
+        );
     }
     assert!(ctx_len > warmup + 4, "ctx must exceed warmup by enough to score");
     let act_bits =
@@ -86,17 +101,21 @@ fn main() {
         eprintln!("WARNING: f32 KV → per-token fallback (W4A16); use q8 for a real int4-act measurement.");
     }
 
-    let want_bytes = (offset + ctx_len * chunks) * 8;
-    let raw = std::fs::read(&corpus_path).expect("read corpus");
-    let take = want_bytes.min(raw.len());
-    let corpus = String::from_utf8_lossy(&raw[..take]).to_string();
-
     let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
-    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .expect("tokenizer");
-    eprintln!("Tokenizing...");
-    let all_tokens: Vec<u32> = tokenizer.encode(&corpus);
+    let all_tokens: Vec<u32> = if hfqm.is_some() {
+        Vec::new() // the ref supplies the tokens, per chunk
+    } else {
+        let want_bytes = (offset + ctx_len * chunks) * 8;
+        let raw = std::fs::read(&corpus_path).expect("read corpus");
+        let take = want_bytes.min(raw.len());
+        let corpus = String::from_utf8_lossy(&raw[..take]).to_string();
+        let tokenizer =
+            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                .expect("tokenizer");
+        eprintln!("Tokenizing...");
+        tokenizer.encode(&corpus)
+    };
 
     let mut gpu = Gpu::init().expect("GPU init");
     eprintln!("GPU: {}  Loading {model_path}...", gpu.arch);
@@ -125,13 +144,22 @@ fn main() {
 
     let mut done_chunks = 0usize;
     for c in 0..chunks {
-        let wstart = offset + c * ctx_len;
-        let wend = (wstart + ctx_len).min(all_tokens.len());
-        if wend <= wstart + warmup + 4 {
-            eprintln!("(ran out of corpus at chunk {c}/{chunks})");
-            break;
-        }
-        let window: Vec<u32> = all_tokens[wstart..wend].to_vec();
+        let window: Vec<u32> = if let Some(h) = hfqm.as_ref() {
+            let ci = offset + c;
+            if ci >= h.n_chunk {
+                eprintln!("(ran out of reference chunks at {c}/{chunks})");
+                break;
+            }
+            h.tokens[ci * h.n_ctx..(ci + 1) * h.n_ctx].to_vec()
+        } else {
+            let wstart = offset + c * ctx_len;
+            let wend = (wstart + ctx_len).min(all_tokens.len());
+            if wend <= wstart + warmup + 4 {
+                eprintln!("(ran out of corpus at chunk {c}/{chunks})");
+                break;
+            }
+            all_tokens[wstart..wend].to_vec()
+        };
         let n = window.len();
 
         // Fresh state per chunk = independent teacher-forced sequence (start_pos=0),
@@ -170,6 +198,44 @@ fn main() {
                 let topk: Vec<(u32, f32)> =
                     red.indices.iter().map(|&i| (i, logits[i as usize])).collect();
                 ref_records.push((lz as f32, topk));
+            }
+            if let Some(h) = hfqm.as_ref() {
+                // Reference block index: chunk-major, scored positions only.
+                let j = pos - h.scoring_start;
+                if j < h.scored_per_chunk {
+                    let ci = offset + c;
+                    let b = (ci * h.scored_per_chunk + j) * h.top_k;
+                    if std::env::var("HIPFIRE_REF_DIAG").is_ok() && j < 3 {
+                        // Alignment check: the reference's argmax and the target
+                        // token, next to ours. A block/position misalignment shows
+                        // up here as a ref top-1 unrelated to what we predict.
+                        let rtop = h.top_indices[b];
+                        let rlp = h.top_log_probs[b];
+                        let mut mine = 0usize;
+                        for (i, v) in logits.iter().enumerate() {
+                            if *v > logits[mine] {
+                                mine = i;
+                            }
+                        }
+                        eprintln!(
+                            "[refdiag] chunk={ci} j={j} pos={pos} target={target} ref_top1={rtop} \
+                             ref_lp={rlp:.4} my_top1={mine} resid={:.4}",
+                            h.residual_mass[ci * h.scored_per_chunk + j]
+                        );
+                    }
+                    let rb = RefBlock {
+                        top_indices: &h.top_indices[b..b + h.top_k],
+                        top_log_probs: &h.top_log_probs[b..b + h.top_k],
+                        residual_mass: h.residual_mass[ci * h.scored_per_chunk + j],
+                    };
+                    let ps = score_position(&rb, &logits, target);
+                    if ps.kld.is_finite() {
+                        total_kld += ps.kld as f64;
+                        kld_scored += 1;
+                        chunk_kld_sum += ps.kld as f64;
+                        chunk_kld_n += 1;
+                    }
+                }
             }
             if let Some(ref recs) = kld_records {
                 if scored < recs.len() {
@@ -217,10 +283,14 @@ fn main() {
     );
     println!("NLL/tok:  {:.10}", avg_nll);
     println!("PPL:      {:.4}", avg_nll.exp());
-    if kld_records.is_some() && kld_scored > 0 {
+    if (kld_records.is_some() || hfqm.is_some()) && kld_scored > 0 {
         let mean_kld = total_kld / kld_scored as f64;
+        let what = match hfqm.as_ref() {
+            Some(h) => format!("ABSOLUTE vs {} ({})", h.base_model_id, h.reference_precision),
+            None => "act-precision penalty".to_string(),
+        };
         println!(
-            "KLD/tok:  {:.6} (top-{top_k}, {kld_scored} pos)  <-- act-precision penalty",
+            "KLD/tok:  {:.6} (top-{top_k}, {kld_scored} pos)  <-- {what}",
             mean_kld
         );
         if chunk_klds.len() > 1 {
@@ -239,6 +309,84 @@ fn main() {
     if let Some(path) = dump_ref {
         write_kldref(&path, &ref_records, top_k);
         println!("Wrote KLD reference: {path} ({} positions)", ref_records.len());
+    }
+}
+
+/// A decoded `*.kldref.hfq` (HFQM package, `hipfire.kldref.v1`) — the house
+/// bf16 reference produced by `build_kld_ref_hipfire`. It carries its own token
+/// stream, so scoring against it needs no corpus and no tokenizer: the candidate
+/// runs on exactly the reference's windows and positions. That makes the KLD an
+/// ABSOLUTE vs-bf16 number, not an act-precision delta.
+struct HfqmRef {
+    base_model_id: String,
+    reference_precision: String,
+    ref_kv_mode: String,
+    n_ctx: usize,
+    n_chunk: usize,
+    scored_per_chunk: usize,
+    scoring_start: usize,
+    top_k: usize,
+    tokens: Vec<u32>,
+    top_indices: Vec<u32>,
+    top_log_probs: Vec<f32>,
+    residual_mass: Vec<f32>,
+}
+
+fn read_hfqm_ref(path: &str) -> HfqmRef {
+    let package =
+        hipfire_runtime::hfq::HfqPackage::open(Path::new(path)).expect("open HFQM kldref");
+    let meta: serde_json::Value =
+        serde_json::from_str(&package.metadata_json).expect("kldref metadata json");
+    assert_eq!(
+        meta.get("artifact_kind").and_then(|v| v.as_str()),
+        Some("hipfire.kldref"),
+        "not a hipfire.kldref package"
+    );
+    let usize_of = |k: &str| meta.get(k).and_then(|v| v.as_u64()).unwrap() as usize;
+    let str_of = |k: &str| {
+        meta.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string()
+    };
+    let n_ctx = usize_of("n_ctx");
+    let n_chunk = usize_of("n_chunk");
+    let scored_per_chunk = usize_of("scored_per_chunk");
+    let top_k = usize_of("top_k");
+    let blob = |name: &str| package.blob_data(name).unwrap_or_else(|| panic!("missing {name}"));
+    let u32s = |b: &[u8]| -> Vec<u32> {
+        b.chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let f32s = |b: &[u8]| -> Vec<f32> {
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let tokens = u32s(blob("kldref.tokens"));
+    let top_indices = u32s(blob("kldref.top_indices"));
+    let top_log_probs = f32s(blob("kldref.top_log_probs"));
+    let residual_mass = f32s(blob("kldref.residual_mass"));
+    assert_eq!(tokens.len(), n_chunk * n_ctx, "kldref.tokens length");
+    assert_eq!(
+        top_indices.len(),
+        n_chunk * scored_per_chunk * top_k,
+        "kldref.top_indices length"
+    );
+    HfqmRef {
+        base_model_id: str_of("base_model_id"),
+        reference_precision: str_of("reference_precision"),
+        ref_kv_mode: str_of("kv_mode"),
+        n_ctx,
+        n_chunk,
+        scored_per_chunk,
+        scoring_start: usize_of("scoring_start"),
+        top_k,
+        tokens,
+        top_indices,
+        top_log_probs,
+        residual_mass,
     }
 }
 

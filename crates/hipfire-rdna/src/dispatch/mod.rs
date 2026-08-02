@@ -2336,7 +2336,9 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let need_xq = n * (k / 2);
-        let need_xs = n * (k / 256);
+        // Scale slots follow the ACTIVATION group, which the W4A4 group-size
+        // experiment can set finer than the codec's 256 (see `oq4_act_group`).
+        let need_xs = n * (k / crate::dispatch::quant::oq4_act_group());
         let need_y = n * m_max;
         let grow = |cur: &Option<GpuTensor>, need: usize| -> bool {
             cur.as_ref().map(|t| t.numel() < need).unwrap_or(true)

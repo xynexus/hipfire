@@ -10,6 +10,20 @@
 use super::prefill_batch::*;
 use super::*;
 
+/// Activation precision for one oq4 prefill projection site (W4A4 experiments).
+///
+/// `HIPFIRE_OQ4_PREFILL_ACT_BITS_<SITE>` (QKV | GATEUP | O | DOWN) overrides the
+/// global `HIPFIRE_OQ4_PREFILL_ACT_BITS` for that site alone; with both unset the
+/// production routing is unchanged. The per-site form exists so a smoke A/B can
+/// hold ONE projection at A16 while the rest run A4 — an upper bound on what a
+/// mixed-precision (ResQ-style) treatment of that site could buy, measurable
+/// without building the dual int4+int8 GEMM first.
+pub(crate) fn oq4_act_bits(site: &str) -> Option<String> {
+    std::env::var(format!("HIPFIRE_OQ4_PREFILL_ACT_BITS_{site}"))
+        .ok()
+        .or_else(|| std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").ok())
+}
+
 /// Batched MoE FFN for `forward_prefill_chunk`. Takes the post-attention
 /// residual stream in `pbs.x_batch` ([N × dim]) and writes the FFN output
 /// residual back into the same buffer in-place.
@@ -3070,9 +3084,9 @@ pub(crate) fn forward_prefill_chunk(
                     // Opus W4A4: wo_input is FWHT(+AWQ)-rotated above (wo_is_mq).
                     // No fused oq4 residual kernel → grouped-WMMA GEMM into scratch
                     // + add into the residual stream (pbs.x_batch).
-                    // A4 KLD gate: HIPFIRE_OQ4_PREFILL_ACT_BITS=16 uses the W4A16
-                    // residual variant (act16 baseline); default = W4A4 (unchanged).
-                    if std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").as_deref() == Ok("16") {
+                    // A4 KLD gate: HIPFIRE_OQ4_PREFILL_ACT_BITS[_O]=16 uses the
+                    // W4A16 residual variant (act16 baseline); default = W4A4.
+                    if oq4_act_bits("O").as_deref() == Some("16") {
                         gpu.gemm_oq4_grouped_residual_f16_batched(
                             &layer.wo.buf,
                             wo_input,
@@ -3446,7 +3460,7 @@ pub(crate) fn forward_prefill_chunk(
                     // A4 KLD gate: =16 unfuses to two W4A16 GEMMs (act16 baseline into
                     // the same gate/up buffers the fused kernel writes); default = fused
                     // W4A4 (unchanged). The downstream silu_mul is identical either way.
-                    if std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").as_deref() == Ok("16") {
+                    if oq4_act_bits("GATEUP").as_deref() == Some("16") {
                         gpu.gemm_oq4_grouped_f16_wmma(
                             &layer.w_gate.buf,
                             &pbs.x_rot_batch,
@@ -3603,8 +3617,8 @@ pub(crate) fn forward_prefill_chunk(
                     // Opus W4A4: ffn_hidden_batch is FWHT(+AWQ)-rotated above
                     // (fused_silu_mul_rotate_mq, w_down_is_mq). grouped-WMMA GEMM
                     // into scratch + residual add into the hidden stream.
-                    // A4 KLD gate: =16 uses the W4A16 residual variant; default W4A4.
-                    if std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").as_deref() == Ok("16") {
+                    // A4 KLD gate: [_DOWN]=16 uses the W4A16 residual variant.
+                    if oq4_act_bits("DOWN").as_deref() == Some("16") {
                         gpu.gemm_oq4_grouped_residual_f16_batched(
                             &layer.w_down.buf,
                             &pbs.ffn_hidden_batch,
@@ -3952,7 +3966,7 @@ pub(crate) fn forward_prefill_chunk(
                     // prefill (gate_up/o/down are already W4A4), so this makes a
                     // fully-W4A4 scored prefill reachable for the A4 KLD gate. Default
                     // (unset) keeps W4A8-MMQ, the shipped incumbent. See plan doc §9a.
-                    let act_bits = std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").ok();
+                    let act_bits = oq4_act_bits("QKV");
                     let force_a4 = act_bits.as_deref() == Some("4");
                     if act_bits.as_deref() == Some("16") {
                         // A4 KLD act16 baseline: W4A16 per-projection qkv (no fused f16

@@ -142,6 +142,65 @@ fn run_shape(gpu: &mut Gpu, m: usize, k: usize, b: usize, group: usize) -> bool 
     pass
 }
 
+/// Parity for the decoupled-activation-group entry `gemm_oq4_grouped_wmma_lds_gx`:
+/// weights keep the codec group (256), the activation is quantized at a finer
+/// `group_x`. There is no bit-exact sibling to compare against (the finer flush
+/// changes the f32 accumulation order on purpose), so this checks the mixed-group
+/// CPU reference — which is what actually validates the two-level scale indexing
+/// (`gx` for Xs, `gx / (group/group_x)` for Ws). A wrong index would miss by
+/// orders of magnitude, not by a rounding tolerance.
+fn run_shape_gx(gpu: &mut Gpu, m: usize, k: usize, b: usize, group: usize, group_x: usize) -> bool {
+    let ng = k / group;
+    let ngx = k / group_x;
+    let wpx = group / group_x;
+    let w = lcg(1, m * k);
+    let x = lcg(2, b * k);
+    let (wp, ws, wq) = quant_i4(&w, m, k, group);
+    let (xp, xs, xq) = quant_i4(&x, b, k, group_x);
+
+    let mut yref = vec![0.0f32; b * m];
+    for bi in 0..b {
+        for mi in 0..m {
+            let mut acc = 0.0f32;
+            for gx in 0..ngx {
+                let g0 = gx * group_x;
+                let mut isum = 0i32;
+                for c in g0..g0 + group_x {
+                    isum += wq[mi * k + c] as i32 * xq[bi * k + c] as i32;
+                }
+                acc += isum as f32 * ws[mi * ng + gx / wpx] * xs[bi * ngx + gx];
+            }
+            yref[bi * m + mi] = acc;
+        }
+    }
+
+    let wsb: Vec<u8> = ws.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let xsb: Vec<u8> = xs.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let wd = gpu.upload_raw(&wp, &[m, k / 2]).unwrap();
+    let wsd = gpu.upload_raw(&wsb, &[m, ng]).unwrap();
+    let xd = gpu.upload_raw(&xp, &[b, k / 2]).unwrap();
+    let xsd = gpu.upload_raw(&xsb, &[b, ngx]).unwrap();
+    let y = gpu.upload_raw(&vec![0u8; b * m * 4], &[b, m]).unwrap();
+    gpu.gemm_oq4_grouped_wmma_lds_gx(&wd, &wsd, &xd, &xsd, &y, m, k, b, group, group_x)
+        .unwrap();
+    gpu.device_synchronize().unwrap();
+    let yg = gpu.download_f32(&y).unwrap();
+
+    let mut max_abs = 0.0f32;
+    let mut max_mag = 0.0f32;
+    for i in 0..b * m {
+        max_abs = max_abs.max((yg[i] - yref[i]).abs());
+        max_mag = max_mag.max(yref[i].abs());
+    }
+    let tol = 1e-3 * max_mag.max(1.0);
+    let pass = max_abs <= tol;
+    println!(
+        "  M={m:<5} K={k} B={b:<5} g={group} gx={group_x}: gx-vs-cpu max_abs={max_abs:.5} (tol {tol:.5}) -> {}",
+        if pass { "PASS" } else { "FAIL" }
+    );
+    pass
+}
+
 fn main() {
     let mut gpu = Gpu::init().unwrap();
     if !gpu.arch_caps.has_wmma_w32() {
@@ -164,6 +223,12 @@ fn main() {
     let mut all = true;
     for (m, k, b) in shapes {
         all &= run_shape(&mut gpu, m, k, b, group);
+    }
+    println!("decoupled activation group (gemm_oq4_grouped_wmma_lds_gx):");
+    for (m, k, b) in [(1024usize, 1024usize, 512usize), (1536, 1024, 512), (1000, 1024, 100)] {
+        for gx in [256usize, 128, 64] {
+            all &= run_shape_gx(&mut gpu, m, k, b, group, gx);
+        }
     }
     println!("{}", if all { "ALL PASS" } else { "SOME FAILED" });
     if !all {

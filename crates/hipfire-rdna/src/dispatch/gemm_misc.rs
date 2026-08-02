@@ -1427,6 +1427,33 @@ impl Gpu {
         )
     }
 
+    /// Decoupled-activation-group variant: weight scales stay on the codec's
+    /// `group` (256 for Oq4G256) while the activation carries a finer `group_x`.
+    /// `group_x` must divide `group` and be a multiple of 64 (the BK K-strip, and
+    /// also what the wave32 activation quantizer needs). Passing
+    /// `group_x == group` is bit-identical to [`Self::gemm_oq4_grouped_wmma_lds`];
+    /// a finer `group_x` is a deliberate quality change, gated on KLD not parity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq4_grouped_wmma_lds_gx(
+        &mut self,
+        w_i4: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_i4: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+        group_x: usize,
+    ) -> HipResult<()> {
+        assert_eq!(group % group_x, 0, "gemm_oq4_grouped_wmma_lds_gx: group_x must divide group");
+        assert_eq!(group_x % 64, 0, "gemm_oq4_grouped_wmma_lds_gx: group_x must be a multiple of 64");
+        self.gemm_oq4_grouped_wmma_lds_inner(
+            w_i4, w_scales, x_i4, x_scales, y_f32, m, k, batch_size, group, group_x, false,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn gemm_oq4_grouped_wmma_lds_impl(
         &mut self,
@@ -1441,11 +1468,34 @@ impl Gpu {
         group: usize,
         bf16: bool,
     ) -> HipResult<()> {
+        self.gemm_oq4_grouped_wmma_lds_inner(
+            w_i4, w_scales, x_i4, x_scales, y, m, k, batch_size, group, group, bf16,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_oq4_grouped_wmma_lds_inner(
+        &mut self,
+        w_i4: &GpuTensor,
+        w_scales: &GpuTensor,
+        x_i4: &GpuTensor,
+        x_scales: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        group: usize,
+        group_x: usize,
+        bf16: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         assert_eq!(k % 64, 0, "gemm_oq4_grouped_wmma_lds: K must be a multiple of 64");
         assert_eq!(group % 64, 0, "gemm_oq4_grouped_wmma_lds: group must be a multiple of 64");
         assert_eq!(k % group, 0, "gemm_oq4_grouped_wmma_lds: K must be a multiple of group");
-        let (entry, src) = if bf16 {
+        let decoupled = group_x != group;
+        let (entry, src) = if decoupled {
+            ("gemm_oq4_grouped_wmma_lds_gx", kernels::GEMM_OQ4_GROUPED_WMMA_LDS_SRC)
+        } else if bf16 {
             ("gemm_oq4_grouped_wmma_lds_bf16out", kernels::GEMM_OQ4_GROUPED_WMMA_LDS_SRC)
         } else {
             ("gemm_oq4_grouped_wmma_lds", kernels::GEMM_OQ4_GROUPED_WMMA_LDS_SRC)
@@ -1460,6 +1510,7 @@ impl Gpu {
         let mut ki = k as i32;
         let mut bi = batch_size as i32;
         let mut gi = group as i32;
+        let mut gxi = group_x as i32;
         let mut params: Vec<*mut c_void> = vec![
             &wp as *const _ as *mut c_void,
             &wsp as *const _ as *mut c_void,
@@ -1471,6 +1522,9 @@ impl Gpu {
             &mut bi as *mut _ as *mut c_void,
             &mut gi as *mut _ as *mut c_void,
         ];
+        if decoupled {
+            params.push(&mut gxi as *mut _ as *mut c_void);
+        }
         let grid_m = ((m + 63) / 64) as u32; // BM = 64
         let grid_b = ((batch_size + 127) / 128) as u32; // BN = 128
         let func = &self.functions[entry];
