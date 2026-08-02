@@ -32,7 +32,8 @@ lm_head every token. At the measured 54.7 GB/s ceiling:
     q4nx (FLM)    5.00     775.7 MB     63.4        MEASURED, our fused design
     oq4/oq4++     4.0625   630   MB    ~78          +27%; the GEMV is MEASURED at
                                                     55.5 GB/s, the token is projected
-    oq3/oq3++     3.0625   475   MB   ~104          +70%; wholly projected
+    oq3/oq3++     3.0625   475   MB    see below   DMA win MEASURED and real;
+                                                    the UNPACK is 2x over budget
     oq8++         8.0625  1244   MB    ~44          -28% vs FLM; ruled out
 
 Bits are the real block sizes from `hipfire-quant-format`, not estimates: 130 B,
@@ -54,29 +55,41 @@ story, which is the opposite of where GPU intuition points.
 faster AND more accurate than the q4_1-shaped container FLM uses. That is the
 rare case where the two goals do not trade against each other.
 
-**`oq3` is the bigger lever and is scoped nowhere.** `Oq3G256` is W3A4,
-`[f16 scale][8 x 3 u32 bit-planes]` = 98 B per 256-group = 3.0625 b/w, and
-hipfire's own format docs call it "the memory-ceiling lever (25% less weight
-traffic than Oq4)". On a decode path that is 92.4% DMA that is ~104 tok/s against
-oq4's ~78. Its bit-plane storage IS the kernel layout, so unlike oq4 it needs no
-repack. Codes are `[-3, 3]`, 8 blocks of 3 u32 planes per 256-group.
+**`oq3` MEASURED 2026-08-02: the DMA win is real, the unpack is not affordable yet.**
+At lm_head size, three designs interleaved in one process:
 
-**AIE2P has the intrinsics for the unpack; do not assume it is expensive.**
-`aie_api` provides `aie::mask<32>::from_uint32` (a bit-plane IS a 32-lane mask),
-`aie::select`, `aie::bit_and/or/xor`, `aie::interleave_zip/unzip`, and
-`aie::unpack` / `unpack_sign` — the last being the same `vldb.unpack` int4->int8
-widening the oq4 kernel already gets for free. So the promising shape is NOT
-mask-select per value: spread the 3 planes into packed int4 NIBBLES with shifts
-and bit ops, then hand them to the existing unpack path, which already consumes
-exactly that and costs nothing.
+    coarse   2396.8 us  131.8 MB  55.0 GB/s
+    oq3      4781.1 us  100.6 MB  21.0 GB/s
+    oq3-1s   1866.8 us  100.6 MB  53.9 GB/s   SAME TILE, vector loads (the DMA floor)
 
-The real question is ops-per-byte against the DMA budget, not whether an unpack
-exists. oq3 moves 75% of oq4's bytes, so it gets 75% of the time per 256 weights
-and must fit its extra unpack inside that. That is measurable, and the method is
-already in the tree: build it, and put a control tile beside it that streams the
-identical bytes with trivial arithmetic. This file's oq4 numbers went
-16.3 -> 31.4 -> 35.5 -> 55.5 GB/s on formulation alone with the bytes never
-changing, so measure the formulation you actually wrote rather than the format.
+**The 3-bit tile streams beautifully — 100.6 MB in 1866.8 us against coarse's 131.8 MB in
+2396.8. It moves 76% of the bytes in 78% of the time, a real ~22% win.** The entire deficit
+is the UNPACK: 4781 against an 1866 floor. To beat coarse, oq3 must land under 2397 us, so
+the unpack overhead has to fall from 2914 us to under 530 — a further 5.5x.
+
+Four formulations were measured, and the op count is not the lever it looks like:
+
+    32-lane spread, bf16 MAC                     7187.9 us
+    64-lane spread (native int8 width), bf16 MAC 4781.1 us   1.50x
+
+**The remaining gap is a design error, not a tuning problem.** The format is W3A4 —
+FOUR-BIT ACTIVATIONS — and both kernels above convert each code to bf16 and MAC in bf16
+(`to_float` + `mul` + bf16 MAC). That is the expensive part and it is not what W3A4 means.
+The intended path stays integer: int8 codes against int4/int8 activations, int32
+accumulate, group scale applied ONCE to the integer sum. That deletes two ops per iteration
+and moves the MAC to the integer pipeline. Plausibly the 3-5x required; more tuning of the
+bf16 form is worth ~1.2x. It is a pipeline change, not a kernel one, because it needs
+quantised activations and it moves accuracy.
+
+**This also settles QTIP-3**, which is the better 3-bit quant and cannot help here: its
+trellis decode needs MORE arithmetic per weight than oq3's spread, so it cannot clear a bar
+oq3 misses by 2x. Rate-distortion does not rescue a compute-bound decode. If the integer
+W3A4 path lands, revisit — the bandwidth is identical (100 B vs 98 B per group) and the
+quality is much better.
+
+**`#pragma clang loop unroll(full)` MISCOMPILES the oq3 decode loop**: rel 2.8e-1 unrolled
+against 2.8e-3 rolled, identical source. The same pragma on oq4's loop is correct, so it is
+not universally broken — but it cannot be used without a correctness check beside it.
 
 Sanity-check the projections before building on them: the oq4 GEMV is now measured,
 but the TOKEN figures still assume the same dispatch structure across sixteen
