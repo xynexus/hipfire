@@ -79,19 +79,37 @@ EXACT_LMHEAD_US = 3010.6     # the q4_1 lm_head dispatch, run HELD
 OQ4_SRC = str(Path(__file__).resolve().parents[3] / "kernels/npu/flm_gemv_oq4g256.cc")
 OQ4_GROUP = 256              # Oq4G256 -- the G in the format name
 
-# (kernel symbol, source, scale-plane bytes) per tier. The scale plane is what
-# differs: one f32 per ROW for the coarse tier, one bf16 per 256-GROUP for oq4.
+OQ3_SRC = str(Path(__file__).resolve().parents[3] / "kernels/npu/flm_gemv_oq3g256.cc")
+
+# (kernel symbol, source, scale-plane bytes, CODE bytes per row) per tier. Both
+# planes vary: the coarse tier carries one f32 per ROW and 4 bits a weight; oq4
+# one bf16 per 256-GROUP and 4 bits; oq3 the same scales but 3 bits, as
+# bit-planes. Carrying the code width here is what keeps tile_bytes honest --
+# assuming K/2 for every tier would have silently over-sized the oq3 tile by a
+# third and turned a bandwidth win into a bandwidth loss on paper.
+_SC_ROW = lambda K, N: N * 4
+_SC_GRP = lambda K, N: N * (K // OQ4_GROUP) * 2
+_CD_4BIT = lambda K, N: N * (K // 2)
+_CD_3BIT = lambda K, N: N * (K // 8 * 3)
 TIERS = {
-    "coarse": ("flm_gemv_coarse_q4row", KERNEL_SRC, lambda K, N: N * 4),
-    "oq4":    ("flm_gemv_oq4g256", OQ4_SRC, lambda K, N: N * (K // OQ4_GROUP) * 2),
-    # Identical tile and identical loads to "oq4", coarse-tier arithmetic. The
-    # DMA control that separates layout from arithmetic; numerically wrong by
-    # construction, so it is a timing probe only and never a correctness one.
-    "oq4_1s": ("flm_gemv_oq4g256", OQ4_SRC, lambda K, N: N * (K // OQ4_GROUP) * 2),
+    "coarse": ("flm_gemv_coarse_q4row", KERNEL_SRC, _SC_ROW, _CD_4BIT),
+    "oq4":    ("flm_gemv_oq4g256", OQ4_SRC, _SC_GRP, _CD_4BIT),
+    # Identical tile and identical loads to their real tier, trivial arithmetic.
+    # The DMA control that separates layout from arithmetic; numerically wrong by
+    # construction, so a timing probe only and never a correctness one.
+    "oq4_1s": ("flm_gemv_oq4g256", OQ4_SRC, _SC_GRP, _CD_4BIT),
+    "oq3":    ("flm_gemv_oq3g256", OQ3_SRC, _SC_GRP, _CD_3BIT),
+    "oq3_1s": ("flm_gemv_oq3g256", OQ3_SRC, _SC_GRP, _CD_3BIT),
+    "oq3_sumq": ("flm_gemv_oq3g256", OQ3_SRC, _SC_GRP, _CD_3BIT),
+    "oq3_acc":  ("flm_gemv_oq3g256", OQ3_SRC, _SC_GRP, _CD_3BIT),
+    "oq3_dotq": ("flm_gemv_oq3g256", OQ3_SRC, _SC_GRP, _CD_3BIT),
+    "oq3_sums": ("flm_gemv_oq3g256", OQ3_SRC, _SC_GRP, _CD_3BIT),
 }
 # Extra -D flags per tier. These do NOT enter the iron.jit AST hash, so the tier
 # name must differ too -- it is in the fifo tag, which does.
-TIER_FLAGS = {"oq4_1s": ["-DOQ4_ONE_SCALE=1"]}
+TIER_FLAGS = {"oq4_1s": ["-DOQ4_ONE_SCALE=1"], "oq3_1s": ["-DOQ3_ONE_SCALE=1"],
+              "oq3_sumq": ["-DOQ3_SUMQ=1"], "oq3_acc": ["-DOQ3_ACCUM_SCALE=1"],
+              "oq3_dotq": ["-DOQ3_DOTQ=1"], "oq3_sums": ["-DOQ3_SUMS=1"]}
 
 
 def tile_bytes(K, NROWS, tier="coarse"):
@@ -106,13 +124,13 @@ def tile_bytes(K, NROWS, tier="coarse"):
     coarse against 256 B for oq4. 16448 vs 16640 bytes, 1.2% apart, which is
     what makes this a controlled comparison of tile SHAPE rather than of size.
     """
-    return ((TIERS[tier][2](K, NROWS) + 63) & ~63) + NROWS * (K // 2)
+    return ((TIERS[tier][2](K, NROWS) + 63) & ~63) + TIERS[tier][3](K, NROWS)
 
 
 def build(K, NROWS, ncores, tiles_per_core, tier="coarse"):
     if ncores % 2:
         raise ValueError("--cores must be even (cores are wired in pairs)")
-    kern_name, kern_src, _ = TIERS[tier]
+    kern_name, kern_src, _, _ = TIERS[tier]
     wtile = tile_bytes(K, NROWS, tier)
     rows_per_core = tiles_per_core * NROWS
     npairs = ncores // 2
@@ -259,6 +277,27 @@ def pack_tiles_oq4(nib, gscale, NROWS, wtile):
     return out
 
 
+def pack_tiles_oq3(planes, gscale, NROWS, wtile):
+    """The oq3 tier -> one (ntiles, wtile) uint8 array, in row order.
+
+    `build_oq3` already emits plane-major order, so this is a reshape and the
+    layout is defined in exactly one place rather than two that can drift.
+    """
+    rows = planes.shape[0]
+    assert rows % NROWS == 0, f"{rows} rows is not a multiple of NROWS={NROWS}"
+    ntiles = rows // NROWS
+    ng = gscale.shape[1]
+    pb = planes.shape[1] * 4                      # plane bytes per row
+    sb = wtile - NROWS * pb
+    out = np.zeros((ntiles, wtile), np.uint8)
+    out[:, :NROWS * ng * 2] = (np.ascontiguousarray(gscale, np.float32)
+                               .astype(bfloat16)
+                               .reshape(ntiles, NROWS * ng).view(np.uint8))
+    out[:, sb:] = (np.ascontiguousarray(planes, np.uint32)
+                   .view(np.uint8).reshape(ntiles, NROWS * pb))
+    return out
+
+
 def device_run(design, wtile, NROWS, ncores, tiles_per_core, tiles, act, iters):
     """Bind once, dispatch `iters` times, HOLD the run object.
 
@@ -366,6 +405,15 @@ def bench_oq4(NROWS, ncores, tiles_per_core, act, iters, tier="oq4"):
                       tiles, act, iters) + (wtile, nib, gscale)
 
 
+def bench_oq3(NROWS, ncores, tiles_per_core, act, iters, tier="oq3"):
+    """The oq3 tier through the same driver, same as bench_oq4."""
+    planes, gscale = lc.oq3_tier()
+    design, wtile = build(K_DIM, NROWS, ncores, tiles_per_core, tier=tier)
+    tiles = pack_tiles_oq3(planes, gscale, NROWS, wtile)
+    return device_run(design, wtile, NROWS, ncores, tiles_per_core,
+                      tiles, act, iters) + (wtile, planes, gscale)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -377,6 +425,17 @@ def main():
     p.add_argument("--gate", action="store_true", help="two-pass argmax on EVERY probe")
     p.add_argument("--vs-exact", action="store_true",
                    help="also time the exact q4_1 lm_head, same session, same driver")
+    p.add_argument("--oq3-tier", default="oq3",
+                   help="oq3 | oq3_acc (accumulator scaling instead of weight fold)")
+    p.add_argument("--oq3-dump", help="save device oq3 logits to .npy and exit")
+    p.add_argument("--oq3-sums", action="store_true",
+                   help="isolate the scale plane read")
+    p.add_argument("--oq3-dotq", action="store_true",
+                   help="isolate to_float+MAC: unscaled q.act vs host")
+    p.add_argument("--oq3-debug", action="store_true",
+                   help="isolate the oq3 spread: device code sums vs host")
+    p.add_argument("--vs-oq3", action="store_true",
+                   help="build the oq3 tier and A/B it against coarse, INTERLEAVED")
     p.add_argument("--vs-oq4", action="store_true",
                    help="build the oq4 tier and A/B it against coarse, INTERLEAVED")
     p.add_argument("--rounds", type=int, default=5,
@@ -427,6 +486,103 @@ def main():
           f"min {w.min():.1f} median {us:.1f} max {w.max():.1f} "
           f"spread {(w.max()/w.min()-1)*100:.1f}%")
     print(f"  {gbs:.1f} GB/s")
+
+    if o.oq3_dump:
+        d_logits, _, _, _, _, _, d_pl, d_gs = bench_oq3(
+            NROWS, ncores, tiles_per_core, xn, o.iters, tier=o.oq3_tier)
+        np.save(o.oq3_dump, np.asarray(d_logits, np.float64))
+        np.save(o.oq3_dump + ".act", np.asarray(xn, np.float32))
+        print(f"  device oq3 logits ({o.oq3_tier}) -> {o.oq3_dump}")
+        return 0
+
+    if o.oq3_sums:
+        d_logits, _, _, _, _, _, _, d_gs = bench_oq3(
+            NROWS, ncores, tiles_per_core, xn, o.iters, tier="oq3_sums")
+        w = (np.arange(d_gs.shape[1], dtype=np.float64) + 1)
+        want = (d_gs.astype(np.float64) * w).sum(1)
+        got = np.asarray(d_logits, np.float64)
+        e = float(np.abs(np.subtract(got, want)).max())
+        print(f"\n  SCALE READ: max abs {e:.4e}  rel {e/np.abs(want).max():.3e}")
+        bad = np.flatnonzero(np.abs(np.subtract(got, want)) > 1e-4 * np.abs(want).max())
+        print(f"    {len(want)-len(bad)}/{len(want)} rows match")
+        for r in bad[:4]:
+            print(f"    row {r:6d}: device {got[r]:12.6f}  host {want[r]:12.6f}")
+        return 0
+
+    if o.oq3_dotq:
+        d_logits, _, _, _, _, _, d_pl, d_gs = bench_oq3(
+            NROWS, ncores, tiles_per_core, xn, o.iters, tier="oq3_dotq")
+        _q = lc.oq3_unpack(d_pl, d_gs.shape[1]).astype(np.float64)
+        _a = np.asarray(xn, np.float32).astype(np.float64)
+        want = _q @ _a
+        got = np.asarray(d_logits, np.float64)
+        e = float(np.abs(np.subtract(got, want)).max())
+        print(f"\n  UNSCALED DOT: max abs {e:.4e}  rel {e/np.abs(want).max():.3e}")
+        print(f"    device argmax {int(np.argmax(got))}  host {int(np.argmax(want))}")
+        return 0
+
+    if o.oq3_debug:
+        d_logits, _, _, _, _, _, d_pl, d_gs = bench_oq3(
+            NROWS, ncores, tiles_per_core, xn, o.iters, tier="oq3_sumq")
+        # The device weights each code by its LANE INDEX (i+1 within each
+        # 32-block), so the host must too -- a plain sum here compared against a
+        # weighted sum there is not a check, it is a mismatch that looks like one.
+        _q = lc.oq3_unpack(d_pl, d_gs.shape[1]).astype(np.int64)
+        _w = (np.arange(32, dtype=np.int64) + 1)
+        want = (_q.reshape(_q.shape[0], -1, 32) * _w).sum((1, 2))
+        got = np.asarray(d_logits, np.int64)
+        n_bad = int((got != want).sum())
+        print(f"\n  SPREAD ISOLATION: {len(want)-n_bad}/{len(want)} rows match "
+              f"the host code sum")
+        for r in np.flatnonzero(got != want)[:5]:
+            print(f"    row {r:6d}: device {got[r]:8d}  host {want[r]:8d}  "
+                  f"diff {got[r]-want[r]:+d}")
+        return 0 if n_bad == 0 else 1
+
+    if o.vs_oq3:
+        q_logits, _, q_bytes, _, q_redo, q_wtile, q_pl, q_gs = \
+            bench_oq3(NROWS, ncores, tiles_per_core, xn, o.iters, tier=o.oq3_tier)
+        ref = lc.oq3_logits(q_pl, q_gs, xn)
+        dev_am, ref_am = int(np.argmax(q_logits)), int(np.argmax(ref))
+        err = float(np.abs(np.subtract(q_logits, ref)).max())
+        print(f"\n  oq3 device vs host: max abs {err:.4e}, "
+              f"rel {err/np.abs(ref).max():.3e}")
+        print(f"  oq3 argmax {dev_am}, host oq3 argmax {ref_am}")
+        # VALUES, not just the argmax. An argmax-only gate passed a kernel with
+        # 28% relative error at NROWS=16 and only failed at 24 -- the dominant
+        # logit survived a systematically wrong spread. 1e-2 is loose enough for
+        # bf16 scale folding (oq4 measures 3.7e-3) and tight enough that a wrong
+        # bit order cannot hide behind it.
+        rel = err / np.abs(ref).max()
+        assert dev_am == ref_am, "device and host oq3 disagree on the argmax"
+        assert rel < 1e-2, f"oq3 device vs host rel {rel:.3e} -- kernel is wrong"
+
+        _, _, _, _, d_redo, _, _, _ = bench_oq3(
+            NROWS, ncores, tiles_per_core, xn, o.iters, tier="oq3_1s")
+        ca, qa, da = [], [], []
+        for _ in range(o.rounds):
+            ca.append(redo(o.iters)[1:])
+            qa.append(q_redo(o.iters)[1:])
+            da.append(d_redo(o.iters)[1:])
+        ct, qt, dt = np.concatenate(ca), np.concatenate(qa), np.concatenate(da)
+        cg = total / (ct.min() * 1e-6) / 1e9
+        qg = q_bytes / (qt.min() * 1e-6) / 1e9
+        dg = q_bytes / (dt.min() * 1e-6) / 1e9
+        print(f"\n  interleaved A/B, {o.rounds} rounds x {o.iters-1} warm dispatches:")
+        print(f"    coarse  min {ct.min():7.1f}  median {np.median(ct):7.1f}  "
+              f"{total/1e6:6.1f} MB  {cg:.1f} GB/s")
+        print(f"    oq3     min {qt.min():7.1f}  median {np.median(qt):7.1f}  "
+              f"{q_bytes/1e6:6.1f} MB  {qg:.1f} GB/s   {q_wtile} B/tile")
+        print(f"    oq3-1s  min {dt.min():7.1f}  median {np.median(dt):7.1f}  "
+              f"{q_bytes/1e6:6.1f} MB  {dg:.1f} GB/s   <- SAME TILE, trivial arithmetic")
+        print(f"\n  VERDICT: oq3 reaches {qg:.1f} GB/s against coarse's {cg:.1f} "
+              f"({100*qg/cg-100:+.1f}%); control {dg:.1f}.")
+        print("  -> " + ("the tile SHAPE streams fine; the gap is the unpack"
+                         if dg > 0.9 * cg else
+                         "the tile SHAPE itself does not stream at the coarse rate"))
+        # TIME is the thing, not GB/s: fewer bytes at the same GB/s IS the win.
+        print(f"  TIME vs coarse: {qt.min()/ct.min():.4f}x for "
+              f"{q_bytes/total:.4f}x the bytes")
 
     if o.vs_oq4:
         # THE BANDWIDTH PROBE. Same activation, same driver, same row order,

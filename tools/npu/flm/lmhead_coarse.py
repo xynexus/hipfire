@@ -491,3 +491,99 @@ def oq4_tier():
 def oq4_bytes(rows=VOCAB, cols=K_DIM, group=OQ4_GROUP):
     """4 bits a weight plus one f16 scale per group = 130 B per 256 weights."""
     return rows * cols // 2 + rows * (cols // group) * 2
+
+
+# --------------------------------------------------------------------------
+# The oq3 tier — Opus Quant W3A4 (`Oq3G256`), the memory-ceiling probe.
+# --------------------------------------------------------------------------
+# 3.0625 b/w against oq4's 4.0625: 98 B per 256-group. Codes are [-3, 3] stored
+# as 3-bit two's complement in BIT-PLANES -- plane b of a 32-weight sub-block
+# has bit i set iff bit b of `q & 7` is set for weight i.
+#
+# The NPU repack here is PLANE-MAJOR within a group, [8 p0][8 p1][8 p2], where
+# the on-disk form interleaves p0,p1,p2 every 12 bytes. Same 96 B either way; 12
+# is not a vector stride and this tree has already paid for a misaligned load
+# that reads wrong bytes without faulting.
+#
+# NOT the full oq3 recipe: no FWHT, no clip-search, and critically no SpinQuant.
+# codecs.rs is explicit that "3-bit is only viable with the SpinQuant learned
+# rotation on top of the FWHT". Bytes are unaffected, which is all this measures.
+OQ3_GROUP = 256
+
+
+def build_oq3(D, M, CODES, chunk=8192, group=OQ3_GROUP):
+    """(D, M, CODES) -> (planes uint32 [rows, ng*3*8], f32 [rows, ng] bf16-valued).
+
+    `planes` is already in the kernel's plane-major order, so the packer is a
+    reshape and the layout lives in exactly one place.
+    """
+    rows, nb = D.shape
+    cols = nb * BLK
+    ng, sub = cols // group, group // 32
+    planes = np.empty((rows, ng * 3 * sub), np.uint32)
+    gscale = np.empty((rows, ng), np.float32)
+    for lo in range(0, rows, chunk):
+        hi = min(lo + chunk, rows)
+        W = (D[lo:hi, :, None] * CODES[lo:hi] + M[lo:hi, :, None]).reshape(-1, cols)
+        Wg = W.reshape(-1, ng, group)
+        s = (np.abs(Wg).max(2).astype(np.float32)) / np.float32(3.0)
+        inv = np.where(s > 0, np.float32(1.0) / np.maximum(s, np.float32(1e-30)), 0.0)
+        q = np.clip(np.rint(Wg * inv[:, :, None]), -3, 3).astype(np.int8)
+        u = (q.astype(np.uint8) & np.uint8(7)).reshape(-1, ng, sub, 32)
+        # bit b of every lane -> one u32 per (group, sub, plane), lane i at bit i
+        # Weight i at bit i. The reversed order (31-i) was MEASURED and is
+        # worse -- rel 1.52 against 0.28 -- so from_uint32 maps bit i to lane i,
+        # as documented nowhere but now established.
+        bits = np.arange(32, dtype=np.uint32)
+        out = np.empty((hi - lo, ng, 3, sub), np.uint32)
+        for b in range(3):
+            out[:, :, b, :] = ((((u >> np.uint8(b)) & np.uint8(1)).astype(np.uint32)
+                                << bits).sum(3, dtype=np.uint32))
+        planes[lo:hi] = out.reshape(hi - lo, -1)
+        gscale[lo:hi] = s
+    # bf16-valued, for the same reason build_oq4 is: the kernel tile carries bf16
+    # and the host reference must see the identical numbers.
+    return planes, q4nx.bf16_to_f32(q4nx.f32_to_bf16(gscale))
+
+
+def oq3_unpack(planes, ng, group=OQ3_GROUP):
+    """plane-major u32 -> [rows, cols] int8 in [-3, 3]."""
+    rows = planes.shape[0]
+    sub = group // 32
+    p = planes.reshape(rows, ng, 3, sub)
+    bits = np.arange(32, dtype=np.uint32)   # see build_oq3
+    u = np.zeros((rows, ng, sub, 32), np.uint8)
+    for b in range(3):
+        u |= (((p[:, :, b, :, None] >> bits) & np.uint32(1)).astype(np.uint8)
+              << np.uint8(b))
+    # 3-bit two's complement: u<4 -> u, u>=4 -> u-8
+    q = u.astype(np.int8)
+    return np.where(q >= 4, q - 8, q).astype(np.int8).reshape(rows, ng * group)
+
+
+def oq3_logits(planes, gscale, act, group=OQ3_GROUP, chunk=8192):
+    """The oq3 GEMV the NPU kernel has to reproduce (scale folded per group)."""
+    ng = gscale.shape[1]
+    rows = planes.shape[0]
+    a = np.asarray(act, np.float32).reshape(ng, group).astype(np.float64)
+    out = np.empty(rows, np.float64)
+    for lo in range(0, rows, chunk):
+        hi = min(lo + chunk, rows)
+        q = oq3_unpack(planes[lo:hi], ng).reshape(-1, ng, group).astype(np.float64)
+        part = np.einsum("rgk,gk->rg", q, a)
+        out[lo:hi] = (part * gscale[lo:hi].astype(np.float64)).sum(1)
+    return out
+
+
+def oq3_tier():
+    """(planes, gscale), cached."""
+    p = CACHE / "lmhead_oq3.npz"
+    if p.exists():
+        z = np.load(p)
+        return z["planes"], z["gscale"]
+    D, M, C = lmhead_blocks()
+    t0 = time.time()
+    planes, gscale = build_oq3(D, M, C)
+    print(f"  built oq3 tier in {time.time() - t0:.1f} s")
+    np.savez(p, planes=planes, gscale=gscale)
+    return planes, gscale
