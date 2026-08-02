@@ -196,6 +196,12 @@ impl DType {
                 // int8); same AWQ contract — the forward divides x by the sidecar
                 // before FWHT+int8-quantize. (Real W8A8 Oq8 has no sidecar → no-op.)
                 | DType::Oq8G256
+                // QTIP-3 trellis: the pack applies W*s before the FWHT exactly as
+                // the Opus arms do, so the forward must divide x by the sidecar to
+                // complete (W*s).(x/s) = W.x. Without this arm the quantizer would
+                // emit awq_scale sidecars that nothing attaches — weights smoothed
+                // on one side only, which is worse than no AWQ at all.
+                | DType::Qtip3G256
         )
     }
 }

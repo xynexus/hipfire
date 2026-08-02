@@ -3717,7 +3717,16 @@ impl HfqInputFormat {
             "mq4" | "mq4g256" | "magnum" => Some(Self::Mq4),
             "mq6" | "mq6g256" => Some(Self::Mq6),
             "mq3" | "mq3g256" => Some(Self::Mq3),
-            "qtip3" => Some(Self::Qtip3),
+            // qtip3+ resolves here for the same reason oq3+ does: the trellis
+            // pack honours AWQ scales when a Hessian/imatrix is supplied.
+            //
+            // qtip3++ is deliberately NOT accepted. In the artifact-naming
+            // contract a second `+` means Hessian/LDLQ error feedback, and the
+            // trellis pack has none — accepting it would emit an AWQ-only
+            // artifact wearing a name that promises error feedback, which is
+            // undetectable downstream. Reject until the beam search is
+            // Hessian-weighted.
+            "qtip3" | "qtip3+" => Some(Self::Qtip3),
             "qtip4" => Some(Self::Qtip4),
             // oq3+/oq3++ resolve here like oq2 and oq4 do: the Oq3 arm already
             // implements the full recipe (AWQ pre-scale, H' = diag(1/s) H diag(1/s),
@@ -4628,6 +4637,7 @@ fn pack_qtip_real_tensors(
     let want_lr = lowrank_r > 0;
     let mut new_sidecars: Vec<HfqTensor> = Vec::new();
     let mut n_lr = 0usize;
+    let mut n_awq = 0usize;
     for t in tensors.iter_mut() {
         // Trellis every BF16 2D weight with k%256==0, except the embedding table
         // (always gather → Q8F16 above). The untied lm_head/output is trellised
@@ -4649,11 +4659,21 @@ fn pack_qtip_real_tensors(
             .strip_suffix(".weight")
             .unwrap_or(&t.name)
             .to_string();
-        let wf: Vec<f32> = t
+        let mut wf: Vec<f32> = t
             .data
             .chunks_exact(2)
             .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
+        // AWQ SmoothQuant, when a Hessian/imatrix supplied scales (`qtip3+`).
+        // Must happen BEFORE the FWHT below: the contract is that the artifact
+        // stores rot(W*s) while the forward feeds rot(x/s), so (W*s).(x/s) = W.x.
+        // Smoothing after the rotation would scale the wrong basis. Same ordering
+        // the Oq3/Oq4 arms use, and the same `<stem>.awq_scale.weight` sidecar the
+        // loader already attaches for those dtypes.
+        let awq = awq_scales_for(&t.name);
+        if let Some(sc) = &awq {
+            awq_pre_scale_weights(&mut wf, m, k, sc);
+        }
         // Phase 1 — FWHT-rotate every group into the incoherent frame (CPU,
         // parallel over rows). `rotated` holds the [m*k] rotated weights.
         let _t_rot = Instant::now();
@@ -4769,8 +4789,19 @@ fn pack_qtip_real_tensors(
             });
             n_lr += 1;
         }
+        if let Some(sc) = &awq {
+            new_sidecars.push(HfqTensor {
+                name: format!("{stem}.awq_scale.weight"),
+                quant_type: QuantType::F16,
+                shape: vec![k as u32],
+                group_size: 0,
+                data: f32_slice_to_f16_bytes(sc),
+                spilled_len: 0,
+            });
+            n_awq += 1;
+        }
     }
-    if want_lr {
+    if !new_sidecars.is_empty() {
         tensors.extend(new_sidecars);
     }
     eprintln!(
@@ -4783,6 +4814,9 @@ fn pack_qtip_real_tensors(
             String::new()
         }
     );
+    if n_awq > 0 {
+        eprintln!("  qtip{bits} (real): AWQ pre-scaled {n_awq} tensors + awq_scale sidecars");
+    }
     eprintln!(
         "  qtip{bits} (real): phase wall-time — rotate {:.2}s  encode {:.2}s  pack {:.2}s",
         t_rot.as_secs_f64(),
@@ -6221,6 +6255,19 @@ fn main() {
     // trailing `+` so downstream format matching sees the base (e.g. "mq4"), and
     // enable clip-search globally. AWQ is auto-enabled below.
     // MQ+ keeps the generic `+` suffix; calibrated OQ4+ was normalized above.
+    // `qtip3++` must not silently become `qtip3+`. The generic stripper below
+    // pops ONE trailing `+` for any non-OQ format, so `qtip3++` would be handed
+    // to the AWQ-only qtip3+ path and written under a name whose second `+`
+    // promises Hessian/LDLQ error feedback the trellis pack does not implement.
+    // A mislabelled artifact is undetectable downstream, so refuse instead.
+    if format_storage.starts_with("qtip") && format_storage.ends_with("++") {
+        eprintln!(
+            "error: --format {format_storage} is not implemented — the QTIP trellis pack has \
+             no Hessian/LDLQ error feedback, so the second `+` would be a lie. \
+             Use `qtip3+` (AWQ SmoothQuant) or `oq3++` for LDLQ."
+        );
+        std::process::exit(2);
+    }
     let mq_plus = format_storage.ends_with('+') && !oq_plus_recipe;
     if mq_plus {
         format_storage.pop();
@@ -6389,7 +6436,7 @@ fn main() {
     // Real packed QTIP-3 (vs the bf16 sim): emit QuantType::Qtip3G256 records
     // (rotated-frame symbols), decoded by the gemv_qtip3g256 kernel. The sim
     // path is for kernel-free PPL; this is the shippable bandwidth format.
-    let use_qtip3_real = format == "qtip3";
+    let use_qtip3_real = matches!(format, "qtip3" | "qtip3+");
     let use_qtip4_real = format == "qtip4";
     // QTIP's post-pass rewrites BF16-staged weights after the emit loop, so the
     // codec must wait for it. Every other format may recode a tensor as soon as
