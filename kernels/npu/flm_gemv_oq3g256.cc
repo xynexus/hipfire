@@ -103,6 +103,10 @@ flm_gemv_oq3g256(const bfloat16 *restrict act, const uint8 *restrict wtile,
   int16_t lane_init[LANES];
   for (int i = 0; i < LANES; ++i) lane_init[i] = static_cast<int16_t>(i + 1);
   const auto v_lane = aie::load_v<LANES>(lane_init);
+  const auto w_zero = aie::zeros<int8, 2 * LANES>();
+  const auto w_one = aie::broadcast<int8, 2 * LANES>(1);
+  const auto w_two = aie::broadcast<int8, 2 * LANES>(2);
+  const auto w_four = aie::broadcast<int8, 2 * LANES>(4);
 
   for (int r = 0; r < NROWS; ++r) {
     const uint32_t *prow =
@@ -217,52 +221,41 @@ flm_gemv_oq3g256(const bfloat16 *restrict act, const uint8 *restrict wtile,
       // the per-group accumulator round-trip entirely. It costs precision --
       // `scale * code` rounds to bf16 before the MAC -- which is recorded as an
       // open question for chained layers in docs/npu/next-phase-goals.md.
-      const auto sb = aie::broadcast<bfloat16, LANES>(
+      const auto sb2 = aie::broadcast<bfloat16, 2 * LANES>(
           static_cast<bfloat16>(scale[r * NG + g]));
 #if OQ3_ACCUM_SCALE
       aie::accum<accfloat, LANES> gacc;
       gacc.from_vector(aie::zeros<float, LANES>());
 #endif
 
-      // NO unroll pragma here, deliberately: the OQ3_DOTQ probe (which has no
-      // pragma) reproduces the host dot product to 9.8e-4, while this loop with
-      // `unroll(full)` produced rel 2.8e-1 with every component verified
-      // individually -- spread exact, scale read exact, to_float+MAC exact.
-      for (int s = 0; s < SUB; ++s) {
-        const auto m0 = aie::mask<LANES>::from_uint32(p0[s]);
-        const auto m1 = aie::mask<LANES>::from_uint32(p1[s]);
-        const auto m2 = aie::mask<LANES>::from_uint32(p2[s]);
+      // SIXTY-FOUR LANES AT A TIME. int8 at 64 lanes is AIE2P's NATIVE integer
+      // vector and the width oq4's proven path uses; at 32 lanes every spread op
+      // does half a register's work. `from_uint32` is variadic, so a mask<64>
+      // takes the TWO plane words for sub-blocks s and s+1 -- which the
+      // plane-major repack already stores adjacently, covering 64 contiguous
+      // weights.
+      //
+      // Per 64 weights: 3 masks, 3 selects, an add, a sub, one to_float, one
+      // mul, two MACs = 12 ops, against 22 for the same weights at 32 lanes.
+      //
+      // No unroll pragma: `unroll(full)` on this loop produced rel 2.8e-1
+      // against the rolled form's 2.8e-3, same source. It is not trusted here.
+      for (int s = 0; s < SUB; s += 2) {
+        const auto m0 = aie::mask<2 * LANES>::from_uint32(p0[s], p0[s + 1]);
+        const auto m1 = aie::mask<2 * LANES>::from_uint32(p1[s], p1[s + 1]);
+        const auto m2 = aie::mask<2 * LANES>::from_uint32(p2[s], p2[s + 1]);
 
-        // base = u & 3, then bit 2 turns it into the negative half.
-        // `select(a, b, m)` is `m ? b : a` -- MEASURED, not assumed: the flipped
-        // order gave rel 1.94 against this order's 2.8e-1, so this one is right
-        // and the residual error is elsewhere.
-        //
-        // The sign is applied ARITHMETICALLY rather than with a second
-        // three-operand select: q = base - 4*bit2. Same result for 3-bit two's
-        // complement (u<4 -> u, u>=4 -> u-8, and base is u&3), one less API
-        // semantic to be wrong about, and it keeps every lane on the same code
-        // path. Lanes are int16, not int8: AIE2P's native int8 vector is 64
-        // lanes and a 32-lane int8 vector is a half-register whose behaviour
-        // through to_float is exactly the kind of thing that produces a
-        // structurally-right, numerically-wrong result.
-        auto q = aie::select(v_zero, v_one, m0);
-        q = aie::add(q, aie::select(v_zero, v_two, m1));
-        q = aie::sub(q, aie::select(v_zero, v_four, m2));
+        auto q = aie::select(w_zero, w_one, m0);
+        q = aie::add(q, aie::select(w_zero, w_two, m1));
+        q = aie::sub(q, aie::select(w_zero, w_four, m2));
 
-#if OQ3_ACCUM_SCALE
-        // Accumulate UNSCALED into a per-group accumulator; the scale is applied
-        // once to the group's f32 sum below. Costs a per-group accumulator
-        // round-trip (which is what held oq4 to 35.5 GB/s) but never rounds
-        // scale*code to bf16.
-        gacc = aie::mac(gacc, aie::to_float<bfloat16>(q),
-                        aie::load_v<LANES>(act + g * GROUP + s * LANES));
-#else
-        const auto w = aie::mul(aie::to_float<bfloat16>(q), sb)
+        const auto w = aie::mul(aie::to_float<bfloat16>(q), sb2)
                            .template to_vector<bfloat16>();
-        rowacc = aie::mac(rowacc, w,
-                          aie::load_v<LANES>(act + g * GROUP + s * LANES));
-#endif
+        const int k0i = g * GROUP + s * LANES;
+        rowacc = aie::mac(rowacc, w.template extract<LANES>(0),
+                          aie::load_v<LANES>(act + k0i));
+        rowacc = aie::mac(rowacc, w.template extract<LANES>(1),
+                          aie::load_v<LANES>(act + k0i + LANES));
       }
 #if OQ3_ACCUM_SCALE
       rowacc = aie::mac(rowacc, gacc.template to_vector<float>(),
