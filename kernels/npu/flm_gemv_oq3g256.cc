@@ -119,11 +119,19 @@ flm_gemv_oq3g256(const bfloat16 *restrict act, const uint8 *restrict wtile,
     // numerically meaningless by construction. If this reaches the coarse
     // tier's GB/s and the real path does not, the gap is the unpack.
     {
-      uint32_t acc = 0;
-      for (int w = 0; w < NG * 3 * SUB; ++w)
-        acc += prow[w];
+      // VECTOR loads, not scalar. The first version of this control summed the
+      // 192 plane words with a scalar loop -- 3072 scalar loads a tile -- and
+      // measured SCALAR LOAD THROUGHPUT, not DMA. It reported 36.2 GB/s and
+      // held that number across a 50% change in tile size, which is exactly
+      // what a compute-bound control does and exactly what a DMA control does
+      // not. A control that is itself bound on the wrong resource answers no
+      // question at all.
+      aie::vector<int32, LANES> vacc = aie::zeros<int32, LANES>();
+      const int32 *pw = reinterpret_cast<const int32 *>(prow);
+      for (int w = 0; w < NG * 3 * SUB; w += LANES)
+        vacc = aie::add(vacc, aie::load_v<LANES>(pw + w));
       out[r] = static_cast<float>(scale[r * NG]) *
-               static_cast<float>(acc & 0xFF);
+               static_cast<float>(aie::reduce_add(vacc) & 0xFF);
       continue;
     }
 #endif
