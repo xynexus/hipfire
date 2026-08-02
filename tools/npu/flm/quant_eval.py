@@ -128,6 +128,35 @@ def clipsearch(g, qmax=7.0):
     return best_s
 
 
+def requant_variant(W, group, rng, rotate, clip):
+    """oq4 with the rotation and the clip-search independently switchable.
+
+    `oq4+` bundles two changes and measured WORSE end-to-end than plain absmax
+    oq4 despite reconstructing the weights ~21% better. Two very different
+    explanations, so they are separated here:
+
+      rotate only  -- if this is what hurts, the rotation's value is on the
+                      ACTIVATION side (W4A4) and an fp32-activation eval cannot
+                      see it, which is the leading hypothesis.
+      clip only    -- if this is what hurts, MSE-optimal scaling is not
+                      output-optimal: clip-search minimises per-group squared
+                      error and in doing so discards outlier weights the model
+                      actually depends on.
+    """
+    N, K = W.shape
+    Wg = W.reshape(N, K // group, group)
+    if rotate:
+        s1 = rng.choice(np.float32([-1, 1]), group)
+        s2 = rng.choice(np.float32([-1, 1]), group)
+        R = fwht(Wg, s1, s2)
+    else:
+        R = Wg
+    sc = bf16(clipsearch(R) if clip else np.abs(R).max(-1) / np.float32(7.0))
+    q = np.clip(np.rint(R / sc[..., None]), -7, 7).astype(np.float32)
+    deq = bf16(q * sc[..., None])
+    return (fwht(deq, s2, s1) if rotate else deq).reshape(N, K)
+
+
 def requant_oq4pp(W, group, rng):
     """oq4+ as hipfire actually encodes it: FWHT-rotate, clip-search, int4.
 
@@ -154,6 +183,18 @@ def requant_oq4(W, group):
     inv = np.where(s > 0, np.float32(1.0) / np.maximum(s, np.float32(1e-30)), 0.0)
     q = np.clip(np.rint(Wg * inv[:, :, None]), -7, 7).astype(np.float32)
     return bf16(q * s[:, :, None]).reshape(N, K)
+
+
+def weights_variant(sd, cfg, group, rotate, clip):
+    import torch
+    out = dict(sd)
+    rng = np.random.default_rng(0)
+    for L in range(cfg["num_hidden_layers"]):
+        for nm in KEYMAP:
+            k = f"layers.{L}.{nm}.weight"
+            W = np.array(sd[k].to(torch.float32).numpy(), np.float32)
+            out[k] = torch.from_numpy(requant_variant(W, group, rng, rotate, clip))
+    return out
 
 
 def weights_oq4(sd, cfg, group, pp=False):
@@ -239,6 +280,18 @@ def main():
                         [(f"oq4_g{g}", weights_oq4(sd, cfg, g), 4.0 + 16.0 / g)
                          for g in gs] +
                         [(f"oq4+_g{g}", weights_oq4(sd, cfg, g, pp=True),
+                          4.0 + 16.0 / g) for g in gs] +
+                        # THE CONTROL: requant_variant with BOTH switches off.
+                        # It must land on plain oq4. If it does not, the ablation
+                        # is comparing code paths rather than features -- the
+                        # variant divides by the scale where requant_oq4
+                        # multiplies by a precomputed reciprocal, which rounds
+                        # differently at .5 boundaries.
+                        [(f"base_g{g}", weights_variant(sd, cfg, g, False, False),
+                          4.0 + 16.0 / g) for g in gs] +
+                        [(f"rot_g{g}", weights_variant(sd, cfg, g, True, False),
+                          4.0 + 16.0 / g) for g in gs] +
+                        [(f"clip_g{g}", weights_variant(sd, cfg, g, False, True),
                           4.0 + 16.0 / g) for g in gs]):
         k, ppl, t1 = score(ref, all_logits(toks, cfg, w), toks)
         if kld_bar is None:
