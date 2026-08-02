@@ -594,9 +594,38 @@ fn main() {
                 "nemotron-h",
             )
         }
+        // Dense LLaMA/Mistral (0) and plain Qwen3/Qwen2 (1) share the
+        // runtime-hosted LLaMA forward, so one arm serves both. The embedding
+        // workload at arch 1 is matched earlier and takes precedence.
+        0 | 1 => {
+            let config =
+                hipfire_runtime::hfq::config_from_hfq(&hfq).expect("llama config from hfq");
+            let weights = hipfire_runtime::hfq::load_weights_hfq(&hfq, &config, &mut gpu)
+                .expect("load_weights_hfq");
+            let opts = hipfire_runtime::llama_calibration::CalibOpts {
+                kldref: want_kldref,
+                kldref_topk,
+            };
+            let summary = hipfire_runtime::llama_calibration::collect_calibration_artifacts(
+                &mut gpu,
+                &weights,
+                &config,
+                tokens,
+                &opts,
+                Path::new(&output),
+                &provenance,
+            )
+            .expect("collect");
+            (
+                summary.n_hessian,
+                summary.n_imatrix,
+                summary.max_consistency,
+                "llama-text",
+            )
+        }
         other => {
             panic!(
-                "collect_artifacts: unsupported arch_id {other}; handled 5/6/10/11/12/13/14/16/19"
+                "collect_artifacts: unsupported arch_id {other}; handled 0/1/5/6/10/11/12/13/14/16/19"
             )
         }
     };
