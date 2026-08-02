@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-from scipy.linalg import solve_triangular
+from scipy.linalg import lapack
 
 import oracle_forward as of
 import quant_eval as qe
@@ -180,15 +180,29 @@ def inv_chol_lower(H, damp_frac=0.01, tries=24):
             # the SHAPE was wrong, and a check that only verified
             # L L^T (H+lI) v == v passed it at 3.2e-12.
             #
-            # So: invert the triangular factor (K^3/3), form A^-1 = X^T X as a
-            # symmetric product, and take its lower Cholesky (K^3/3). Still well
-            # under a general inverse plus a Cholesky.
+            # Three LAPACK calls, each K^3/3, and NO explicit matmul:
+            # dpotrf (Cholesky) -> dpotri (A^-1 straight from the factor) ->
+            # dpotrf (lower Cholesky of A^-1).
+            #
+            # The previous version formed A^-1 = X^T X explicitly, and that
+            # matmul dominated everything: numpy here runs a 2000^3 matmul at
+            # 2.6 GFLOPS while LAPACK Cholesky manages ~13 on the same machine,
+            # so a K=8192 product cost ~210 s of each 530 s layer. Measured 4.9x
+            # faster at K=2048, producing a factor identical to 4.7e-15 --
+            # Cholesky is unique, so "identical" is the right expectation and a
+            # good check that the fast path is the same computation.
             A = H + lam * np.eye(K)
-            C = np.linalg.cholesky(A)
-            X = solve_triangular(C, np.eye(K), lower=True)      # C^-1, lower
-            Hinv = X.T @ X                                      # = A^-1, sym
-            Hinv = 0.5 * (Hinv + Hinv.T)
-            L = np.linalg.cholesky(Hinv)                        # LOWER
+            C, info = lapack.dpotrf(A, lower=1)
+            if info != 0:
+                raise np.linalg.LinAlgError(f"dpotrf info={info}")
+            Ai, info = lapack.dpotri(C, lower=1)
+            if info != 0:
+                raise np.linalg.LinAlgError(f"dpotri info={info}")
+            Ai = np.tril(Ai) + np.tril(Ai, -1).T                # mirror to full
+            L, info = lapack.dpotrf(Ai, lower=1)
+            if info != 0:
+                raise np.linalg.LinAlgError(f"dpotrf(A^-1) info={info}")
+            L = np.tril(L)
             assert abs(L[0, -1]) == 0.0 and np.count_nonzero(
                 L[K // 2:, :K // 2]) > 0, "factor is not lower triangular"
             return L, lam / base
