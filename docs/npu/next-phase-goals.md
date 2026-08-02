@@ -90,13 +90,45 @@ quantiser is naturally tuned against — hipfire's clip-search optimises exactly
 — and on this model it is not a proxy for anything. Any calibration work needs
 the KLD harness in the loop, not an RMSE target.
 
-**STILL UNMEASURED: whether hipfire's own oq4++ clears the bar.** The artifact
-exists (`~/.hipfire/models/Llama-3.2-1B-Instruct-nc--oq4++.hfq`, built from the
-Instruct bf16 with the Instruct Hessians) and both routes to scoring it are
-blocked — see `read_oq4.py` for the reader (5 of 7 tensor types correct; AWQ
-folding across a shared norm unsolved) and AGENTS.md for the lock/daemon state
-that blocks `hipfire-eval`. That is the single most valuable open measurement in
-this phase.
+**ANSWERED 2026-08-02: oq4++ REACHES PARITY WITH q4nx AT 19% FEWER BITS.** The
+measurement this section called the most valuable open one in the phase, on a
+common corpus slice — the same 512 wikitext2 tokens, same 8-position warmup, the
+same 503 scored positions:
+
+                              reference    quantised    degradation   b/w
+    my harness  fp32/q4nx       16.9183      17.7460       +4.89%    5.0000
+    hipfire     fp16/oq4++      16.4027      17.2238       +5.01%    4.0625
+
+**Equivalent quality at 4.0625 vs 5.00 b/w.** The 0.12-point spread is inside
+noise at 503 positions and the two references differ by 3.1% themselves (fp32 vs
+fp16, different harnesses), so this reads as PARITY — not better, not worse. What
+is unambiguous is the bit rate: 630 MB/token against 775.7. Against the +27%
+throughput already banked at the DMA ceiling, **the port is justified end to
+end.**
+
+    hipfire's own KLD, oq4++ vs its fp16 reference:  0.045964 (top-128, 503 pos)
+    sanity floor, fp16 vs its OWN reference:         0.000000  <- exact
+
+DO NOT compare that 0.046 against q4nx's 0.031 in the table above. Different
+harnesses, different references, different corpora (that 0.031 came from a
+synthetic paragraph at 64 tokens against fp32) and different lengths. Relative
+PPL degradation on one shared slice is the only quantity both sides can express;
+the KLD pair would manufacture a "48% worse" conclusion out of two incomparable
+numbers.
+
+This also RESOLVES the section above. "The lever is calibration, not the
+container" stays true — naive q4_1 at q4nx's own bit rate really is 4.53x worse —
+but the conclusion drawn from it, that matching FLM's calibration was the open
+problem, is now closed: hipfire's existing oq4++ calibration already matches it.
+The remaining work is the port, not the quant.
+
+Both routes named here as blocked were cleared by going through hipfire rather
+than around it: `read_oq4.py`'s AWQ folding is still unsolved (5 of 7 tensor
+types correct — q/k/v and gate/up share a norm but carry separate scales, so no
+per-tensor division inverts it), so the artifact was scored by
+`examples/perplexity.rs` instead, which needed a llama calibration collector
+(hipfire `2be6f2e70`, validated at 0.9999 against the shipped package) and arch
+dispatch (hipfire `125aa0993`).
 
 **`oq3` MEASURED 2026-08-02: the DMA win is real, the unpack is not affordable yet.**
 At lm_head size, three designs interleaved in one process:
