@@ -2514,6 +2514,13 @@ pub const ENV_HIPFIRE_LFM2_GRAPH: EnvVarDoc = EnvVarDoc {
     source: "crates/hipfire-arch-lfm2moe/src/forward.rs:220",
 };
 
+/// `HIPFIRE_LLAMA_CALIB_LAYERS_PER_PASS` — Runtime variable controlling llama calib layers per pass in hipfire
+pub const ENV_HIPFIRE_LLAMA_CALIB_LAYERS_PER_PASS: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_LLAMA_CALIB_LAYERS_PER_PASS",
+    description: "Runtime variable controlling llama calib layers per pass in hipfire",
+    source: "crates/hipfire-runtime/src/llama_calibration.rs:44",
+};
+
 /// `HIPFIRE_LLOYD_FORCE_BASELINE` — Runtime variable controlling lloyd force baseline in hipfire
 pub const ENV_HIPFIRE_LLOYD_FORCE_BASELINE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_LLOYD_FORCE_BASELINE",
@@ -5526,6 +5533,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_LFM2_DFLASH_F16,
     ENV_HIPFIRE_LFM2_DFLASH_SYNC_GEMM,
     ENV_HIPFIRE_LFM2_GRAPH,
+    ENV_HIPFIRE_LLAMA_CALIB_LAYERS_PER_PASS,
     ENV_HIPFIRE_LLOYD_FORCE_BASELINE,
     ENV_HIPFIRE_LLOYD_GFX12,
     ENV_HIPFIRE_LLOYD_K3,
