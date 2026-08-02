@@ -55,6 +55,49 @@ story, which is the opposite of where GPU intuition points.
 faster AND more accurate than the q4_1-shaped container FLM uses. That is the
 rare case where the two goals do not trade against each other.
 
+**REVISED 2026-08-02 — the lever is CALIBRATION, not the container.** The
+sentence above is right about throughput and wrong about what makes the quality.
+Measured end to end against q4nx on the same forward:
+
+    q4nx (FLM)                  5.0000 b/w   KLD 0.03066   THE BAR
+    my q4_1 at group 32         5.0000 b/w   KLD 0.13898   4.53x worse
+    my oq4 sym g256             4.0625 b/w   KLD 0.23732   7.74x
+    + FWHT rotation             4.0625 b/w   KLD 0.34528  11.26x
+    + clip-search               4.0625 b/w   KLD 0.34296  11.18x
+
+The second row is q4_1 AT GROUP 32 — q4nx's own format, its own bit rate, 4-bit
+codes with a scale and a min per 32 weights. Same container, same bits, **4.53x
+worse**, while reconstructing only 5% worse (0.0814 vs 0.0775 relRMS). Confirmed
+by inspection of FLM's container: its stored min differs from the naive block
+minimum by nearly a full standard deviation of the weights, so q4nx is a
+CALIBRATED q4_1 and naive min/max over identical blocks is not close.
+
+A 5% reconstruction difference is worth 4.5x in KLD. The error MAGNITUDE is
+nearly identical; the error STRUCTURE is not, and only the structure reaches the
+output.
+
+**So picking a tighter container is not the work.** oq4's 4.0625 b/w is measured
+at the DMA ceiling and is worth +27% — that half is done and idle. The open
+problem is matching or beating FLM's CALIBRATION at that container, and the
+throughput does not arrive until the quality does.
+
+**RECONSTRUCTION ERROR IS NOT A USABLE OBJECTIVE HERE.** It failed to predict
+output quality six times in one session, in both directions: clip-search 13%
+better RMSE and 43% worse KLD; FWHT 2.1-2.5x better ACTIVATION RMSE and 4%
+better KLD; asymmetry 15% better RMSE and worse KLD; LDLQ deliberately worse
+RMSE by design; and 5% better RMSE for 4.5x better KLD above. It is the metric a
+quantiser is naturally tuned against — hipfire's clip-search optimises exactly it
+— and on this model it is not a proxy for anything. Any calibration work needs
+the KLD harness in the loop, not an RMSE target.
+
+**STILL UNMEASURED: whether hipfire's own oq4++ clears the bar.** The artifact
+exists (`~/.hipfire/models/Llama-3.2-1B-Instruct-nc--oq4++.hfq`, built from the
+Instruct bf16 with the Instruct Hessians) and both routes to scoring it are
+blocked — see `read_oq4.py` for the reader (5 of 7 tensor types correct; AWQ
+folding across a shared norm unsolved) and AGENTS.md for the lock/daemon state
+that blocks `hipfire-eval`. That is the single most valuable open measurement in
+this phase.
+
 **`oq3` MEASURED 2026-08-02: the DMA win is real, the unpack is not affordable yet.**
 At lm_head size, three designs interleaved in one process:
 
