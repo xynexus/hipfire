@@ -3602,7 +3602,11 @@ impl HfqInputFormat {
             "mq3" | "mq3g256" => Some(Self::Mq3),
             "qtip3" => Some(Self::Qtip3),
             "qtip4" => Some(Self::Qtip4),
-            "oq3" => Some(Self::Oq3),
+            // oq3+/oq3++ resolve here like oq2 and oq4 do: the Oq3 arm already
+            // implements the full recipe (AWQ pre-scale, H' = diag(1/s) H diag(1/s),
+            // oq3_ldlq_pack), so accepting only the bare form left the calibrated
+            // 3-bit formats unreachable from the CLI.
+            "oq3" | "oq3+" | "oq3++" => Some(Self::Oq3),
             "oq2" | "oq2+" | "oq2++" => Some(Self::Oq2),
             "oq6" => Some(Self::Oq6),
             "oq4" | "oq4+" | "oq4++" => Some(Self::Oq4),
@@ -14597,6 +14601,12 @@ mod tests {
         );
         assert_eq!(HfqInputFormat::from_flag("q8"), Some(HfqInputFormat::Q8F16));
         assert_eq!(HfqInputFormat::from_flag("mq4"), Some(HfqInputFormat::Mq4));
+        // The calibrated 3-bit suffixes must resolve like oq2/oq4 do. The Oq3 arm
+        // implements the full recipe, so dropping these left `--format oq3++`
+        // normalizing to "oq3+" and failing the HFQ-source dispatch outright.
+        assert_eq!(HfqInputFormat::from_flag("oq3"), Some(HfqInputFormat::Oq3));
+        assert_eq!(HfqInputFormat::from_flag("oq3+"), Some(HfqInputFormat::Oq3));
+        assert_eq!(HfqInputFormat::from_flag("oq3++"), Some(HfqInputFormat::Oq3));
         assert_eq!(HfqInputFormat::from_flag("op4"), None);
         assert_eq!(HfqInputFormat::from_flag("op4+"), None);
         assert_eq!(
