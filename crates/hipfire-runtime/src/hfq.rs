@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::hash::Hasher;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use twox_hash::XxHash64;
 
 // The OQ4 arch-packing transform now lives in `crate::oq4_arch` (single source
@@ -657,6 +657,133 @@ fn dtype_byte_width(dtype: &str) -> Option<usize> {
     }
 }
 
+/// Per-file ceiling for a captured sidecar. `vocab.json` runs ~7 MB on a large
+/// vocabulary, so the cap has to clear that comfortably; anything above this is
+/// a weight-shaped file we do not want inlined into the header.
+const MAX_SIDECAR_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Ceiling on the whole captured set. `metadata_json` is parsed in full every
+/// time a model is opened, so the sidecar blob is a load-time cost on every
+/// run, not just at conversion.
+const MAX_SIDECAR_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Files that are never sidecars: weight shards, and the shard index, which is
+/// meaningless once export re-shards at a different size.
+fn is_weight_like(name: &str) -> bool {
+    if name == "model.safetensors.index.json" {
+        return true;
+    }
+    matches!(
+        Path::new(name).extension().and_then(|e| e.to_str()),
+        Some("safetensors" | "bin" | "pt" | "pth" | "gguf" | "h5" | "msgpack" | "onnx")
+    )
+}
+
+/// Recursively capture the non-weight files of an HF snapshot so an export can
+/// reproduce the directory byte-for-byte.
+///
+/// Keys are `/`-separated paths relative to `dir` (`assets/logo.png`). Values
+/// are `{"text": ...}` for valid UTF-8 and `{"b64": ...}` otherwise, so JSON
+/// sidecars stay readable in the header while PNGs still survive.
+///
+/// `tokenizer.json` is deliberately excluded: it is already stored verbatim
+/// under `"tokenizer"`, and duplicating it costs ~20 MB in a blob that is
+/// parsed on every model open. Dot-entries (`.git/`, `.cache/`) are skipped.
+fn collect_hf_sidecars(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    let mut total: u64 = 0;
+    collect_hf_sidecars_into(dir, dir, 0, &mut total, &mut out);
+    out
+}
+
+fn collect_hf_sidecars_into(
+    root: &Path,
+    dir: &Path,
+    depth: u32,
+    total: &mut u64,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // Sort so the captured set is deterministic across filesystems.
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+
+    for path in paths {
+        let Some(base) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if base.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            collect_hf_sidecars_into(root, &path, depth + 1, total, out);
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let Some(key) = rel.to_str().map(|s| s.replace('\\', "/")) else {
+            continue;
+        };
+        if is_weight_like(&key) || key == "tokenizer.json" {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.len() > MAX_SIDECAR_FILE_BYTES || *total + meta.len() > MAX_SIDECAR_TOTAL_BYTES {
+            eprintln!(
+                "hfq: skipping sidecar {key} ({} bytes) — over the capture budget",
+                meta.len()
+            );
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        *total += bytes.len() as u64;
+        let value = match String::from_utf8(bytes) {
+            Ok(text) => serde_json::json!({ "text": text }),
+            Err(e) => {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(e.as_bytes());
+                serde_json::json!({ "b64": b64 })
+            }
+        };
+        out.insert(key, value);
+    }
+}
+
+/// Decode the `"hf_sidecars"` blob written by [`collect_hf_sidecars`] back into
+/// `(relative path, contents)` pairs, ready to be written into an export
+/// directory. Entries that are malformed are dropped rather than failing the
+/// whole export.
+pub fn hf_sidecars_from_metadata(metadata_json: &str) -> Vec<(String, Vec<u8>)> {
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(metadata_json) else {
+        return Vec::new();
+    };
+    let Some(obj) = meta.get("hf_sidecars").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(obj.len());
+    for (key, value) in obj {
+        if let Some(text) = value.get("text").and_then(|t| t.as_str()) {
+            out.push((key.clone(), text.as_bytes().to_vec()));
+        } else if let Some(b64) = value.get("b64").and_then(|b| b.as_str()) {
+            use base64::Engine;
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                out.push((key.clone(), bytes));
+            }
+        }
+    }
+    out
+}
+
 /// Fold a safetensors directory's tokenizer sidecars into HFQ-style metadata so
 /// an `HfqFile::from_safetensors` model is self-describing exactly like a real
 /// `.hfq` (whose quantizer embeds these at convert time). A real `.hfq` carries
@@ -668,6 +795,12 @@ fn dtype_byte_width(dtype: &str) -> Option<usize> {
 /// - `"tokenizer_config"`: parsed `tokenizer_config.json` (chat_template);
 /// - `"generation_config"`: parsed `generation_config.json` (authoritative
 ///   bos/eos ids). Missing sidecars are simply skipped.
+/// - `"hf_sidecars"`: every other non-weight file in the snapshot, verbatim.
+///   The parsed keys above lose byte-level formatting and cover only what the
+///   runtime consumes; a multimodal checkpoint also needs
+///   `preprocessor_config.json`, `processor_config.json`, `vocab.json` and the
+///   like, and none of it can be recovered later from an `.hfq` that never
+///   stored it. See [`collect_hf_sidecars`].
 fn embed_tokenizer_metadata(base: &str, dir: &Path) -> String {
     let mut meta: serde_json::Value =
         serde_json::from_str(base).unwrap_or_else(|_| serde_json::json!({}));
@@ -689,6 +822,15 @@ fn embed_tokenizer_metadata(base: &str, dir: &Path) -> String {
                     obj.insert(key.to_string(), v);
                 }
             }
+        }
+    }
+    if !obj.contains_key("hf_sidecars") {
+        let sidecars = collect_hf_sidecars(dir);
+        if !sidecars.is_empty() {
+            obj.insert(
+                "hf_sidecars".to_string(),
+                serde_json::Value::Object(sidecars),
+            );
         }
     }
     serde_json::to_string(&meta).unwrap_or_else(|_| base.to_string())
@@ -3084,6 +3226,71 @@ mod tests {
             "hipfire-hfqm-package-test-{}-{name}",
             std::process::id()
         ))
+    }
+
+    /// The sidecars a multimodal snapshot needs must survive the capture →
+    /// metadata → restore path byte-for-byte, including a binary asset and a
+    /// nested directory. This is the property that makes an `.hfq` → HF export
+    /// reproduce a loadable checkpoint rather than a text-model skeleton.
+    #[test]
+    fn captures_and_restores_hf_sidecars_verbatim() {
+        let dir = temp_path("sidecar-snapshot");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::create_dir_all(dir.join(".cache/huggingface")).unwrap();
+
+        // Formatting that a parse/re-serialize round trip would destroy.
+        let preproc = "{\n  \"image_size\":  384,\n  \"do_rescale\": true\n}\n";
+        std::fs::write(dir.join("preprocessor_config.json"), preproc).unwrap();
+        std::fs::write(dir.join("vocab.json"), r#"{"a":0,"b":1}"#).unwrap();
+        std::fs::write(dir.join("chat_template.jinja"), "{{ bos_token }}").unwrap();
+        // Invalid UTF-8 — must take the base64 arm.
+        let png = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0xff, 0xfe, 0x00];
+        std::fs::write(dir.join("assets/logo.png"), png).unwrap();
+        // Excluded: weight shard, shard index, dot-dir, and the tokenizer that
+        // is already stored verbatim under its own key.
+        std::fs::write(dir.join("model-00001-of-00002.safetensors"), [0u8; 8]).unwrap();
+        std::fs::write(dir.join("model.safetensors.index.json"), "{}").unwrap();
+        std::fs::write(dir.join("tokenizer.json"), r#"{"big":true}"#).unwrap();
+        std::fs::write(dir.join(".cache/huggingface/junk"), "no").unwrap();
+
+        let metadata = embed_tokenizer_metadata(r#"{"architecture":"test"}"#, &dir);
+        let restored: std::collections::HashMap<String, Vec<u8>> =
+            hf_sidecars_from_metadata(&metadata).into_iter().collect();
+
+        assert_eq!(
+            restored.get("preprocessor_config.json").map(|v| &v[..]),
+            Some(preproc.as_bytes()),
+            "byte-exact formatting must survive"
+        );
+        assert_eq!(
+            restored.get("assets/logo.png").map(|v| &v[..]),
+            Some(&png[..]),
+            "binary assets must round-trip through base64"
+        );
+        assert!(restored.contains_key("vocab.json"));
+        assert!(restored.contains_key("chat_template.jinja"));
+
+        for excluded in [
+            "model-00001-of-00002.safetensors",
+            "model.safetensors.index.json",
+            "tokenizer.json",
+            ".cache/huggingface/junk",
+        ] {
+            assert!(
+                !restored.contains_key(excluded),
+                "{excluded} must not be captured"
+            );
+        }
+
+        // The pre-existing tokenizer embedding is untouched by the sweep.
+        let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(
+            meta.get("tokenizer").and_then(|t| t.as_str()),
+            Some(r#"{"big":true}"#)
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

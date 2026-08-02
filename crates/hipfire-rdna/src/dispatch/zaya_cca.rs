@@ -630,6 +630,91 @@ impl Gpu {
         self.zaya_launch("zaya_qk_l2norm_qk_f32", s * (nq + nkv), &mut p)
     }
 
+    /// Gather whole rows into a contiguous run: `out[r,c] = src[idx[r],c]`.
+    ///
+    /// `idx` is an i32 device buffer of `rows` entries; `n = rows * width`.
+    /// Indices are rows within a batch, not model-scale ids, so the int32
+    /// arithmetic in the kernel has no realistic overflow bound.
+    pub fn zaya_gather_rows_f32(
+        &mut self,
+        out: &GpuTensor,
+        src: &GpuTensor,
+        idx: &hip_bridge::DeviceBuffer,
+        width: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_gather_rows_f32")?;
+        let (op, sp, ip) = (out.buf.as_ptr(), src.buf.as_ptr(), idx.as_ptr());
+        let (wi, ni) = (width as i32, n as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wi as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_gather_rows_f32", n, &mut p)
+    }
+
+    /// Batched SwiGLU over an interleaved `[rows, 2*inter]` gate_up result:
+    /// `out[r,c] = silu(gate_up[r,c]) * gate_up[r,inter+c]`, `n = rows * inter`.
+    ///
+    /// The flat `silu_mul_f32` cannot express this because the gate and up
+    /// halves are interleaved per row; this takes the row stride explicitly and
+    /// uses the same `expf` formula, so one call is bit-identical to `rows`
+    /// per-row calls.
+    pub fn zaya_silu_mul_gate_up_f32(
+        &mut self,
+        out: &GpuTensor,
+        gate_up: &GpuTensor,
+        inter: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_silu_mul_gate_up_f32")?;
+        let (op, gp) = (out.buf.as_ptr(), gate_up.buf.as_ptr());
+        let (ii, ni) = (inter as i32, n as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &ii as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_silu_mul_gate_up_f32", n, &mut p)
+    }
+
+    /// Scatter-accumulate whole rows with a per-row scale:
+    /// `dst[idx[r],c] += scale[r] * src[r,c]`, `n = rows * width`.
+    ///
+    /// Callers must guarantee each destination row is named by at most one
+    /// source row (true under top-1 routing) — there are no atomics.
+    pub fn zaya_scatter_scaled_add_f32(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        idx: &hip_bridge::DeviceBuffer,
+        scale: &GpuTensor,
+        width: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.zaya_ensure("zaya_scatter_scaled_add_f32")?;
+        let (dp, sp, ip, cp) = (
+            dst.buf.as_ptr(),
+            src.buf.as_ptr(),
+            idx.as_ptr(),
+            scale.buf.as_ptr(),
+        );
+        let (wi, ni) = (width as i32, n as i32);
+        let mut p: Vec<*mut c_void> = vec![
+            &dp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &wi as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+        ];
+        self.zaya_launch("zaya_scatter_scaled_add_f32", n, &mut p)
+    }
+
     /// Fused add-conv-residual over query AND key in one launch (both modes).
     #[allow(clippy::too_many_arguments)]
     pub fn zaya_add_conv_residual_qk_f32(

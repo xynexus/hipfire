@@ -10,9 +10,11 @@ edition.workspace = true
 # encoder. So all functionality is available CPU-only, and a GPU is used when present.
 [features]
 default = ["gpu"]
-# `gpu` pulls the GPU trellis encoder AND the shared flock so the quantizer
-# self-coordinates the GPU it acquires (no external `hipfire lock` needed).
-gpu = ["dep:hipfire-rdna", "dep:hipfire-lock"]
+# `gpu` pulls the GPU trellis encoder only. The GPU flock is NOT taken here:
+# AGENTS.md puts non-daemon GPU binaries behind the caller's
+# `hipfire lock {acquire,release,status}`, and self-locking deadlocked under
+# `scripts/two_pass_quantize.py`, which wraps this binary in `hipfire lock run`.
+gpu = ["dep:hipfire-rdna"]
 
 [dependencies]
 # Capability layer (all LEAF/CPU-only, no GPU/runtime deps): consult a migrated
@@ -27,9 +29,6 @@ hipfire-primitives = { path = "../hipfire-primitives" }
 hipfire-model = { path = "../hipfire-model" }
 # GPU QTIP trellis encoder (offline accel). Optional + runtime-autodetected.
 hipfire-rdna = { path = "../hipfire-rdna", optional = true }
-# Shared flock(2) GPU resource lock — held automatically while the quantizer uses
-# the GPU, so it cooperates with the daemon/benches (AGENTS.md: one lock primitive).
-hipfire-lock = { path = "../hipfire-lock", optional = true }
 memmap2.workspace = true
 serde.workspace = true
 serde_json = "1"

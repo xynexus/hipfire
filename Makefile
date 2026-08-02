@@ -6,7 +6,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 TARGET_DIR ?= $(REPO_ROOT)/target/release
 # Binaries symlinked into ~/.hipfire/bin (and that `hipfire serve` resolves the
 # daemon from). Override DEV_BINS to link a different set.
-DEV_BINS ?= hipfire hipfire-daemon hipfire-quantize hipfire-eval hipfire-monitor hipfire-priv-helper hipfire-host-profile
+DEV_BINS ?= hipfire hipfire-daemon hipfire-quantize hipfire-coexistence hipfire-eval hipfire-monitor hipfire-priv-helper hipfire-host-profile
 
 # Embedded browser UIs (Leptos/WASM) baked into the `hipfire` CLI. They require
 # `trunk` + the wasm32-unknown-unknown target; when trunk is absent we build

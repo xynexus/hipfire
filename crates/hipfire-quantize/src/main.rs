@@ -45,7 +45,8 @@ pub use hipfire_quantize::{codecs, fixture, gptq, hessian_io, hfhs_diag, ldlq, q
 // GGUF import pipeline (owned by hipfire-coexistence) can produce byte-identical
 // artifacts through the same code path the native quantizer uses.
 use hipfire_quantize::hfq_out::{
-    compress_bf16_tensors, insert_parameter_counts_metadata, write_hfq_with_progress, Bf16Codec,
+    compress_bf16_tensor, compress_bf16_tensors, insert_parameter_counts_metadata,
+    write_hfq_with_progress, Bf16Codec, Bf16CompressStats,
     HfqStreamTensor, HfqTensor, LiveHfqWriter, TensorSpill, Xxh64, HFQ_MAGIC,
 };
 // Helpers exercised only by this binary's unit tests.
@@ -94,7 +95,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 // imatrix lookup populated once in main() when --imatrix is supplied; keyed by
@@ -2886,7 +2888,17 @@ fn xxh64_hex(bytes: &[u8]) -> String {
 
 /// Spill tensors whose data is in memory to the spill file, freeing RAM.
 /// Called after each layer's expert batch to keep peak RSS bounded.
+///
+/// Recodes each BF16 tensor immediately before spilling it. The spill file is
+/// append-only, so a tensor written plain can never be compressed afterwards —
+/// doing it here is what lets a model be both RAM-bounded and compressed. A
+/// large stacked-expert MoE crosses the threshold on nearly every layer, so
+/// compressing only the survivors left `gemma-4-26B-A4B-it` at 1.014x when its
+/// weights measure 1.51x. Stats accumulate into `stats` so the reported totals
+/// still cover the whole model.
 fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: usize) {
+    let codec = bf16_codec();
+    let mut stats = Bf16CompressStats::default();
     let in_mem: usize = tensors
         .iter()
         .filter(|t| t.spilled_len == 0)
@@ -2897,6 +2909,11 @@ fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: us
     }
     for t in tensors.iter_mut() {
         if t.spilled_len == 0 && !t.data.is_empty() {
+            // Before the bytes leave RAM — this is the only chance. Skipped
+            // while a post-pass still needs the plain BF16 staging.
+            if bf16_precompress() {
+                compress_bf16_tensor(t, codec, &mut stats);
+            }
             match spill.spill(&t.name, &t.data) {
                 Ok(len) => {
                     t.spilled_len = len;
@@ -2914,6 +2931,60 @@ fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: us
     }
     if let Err(error) = spill.flush() {
         eprintln!("warning: could not flush tensor spill: {error}");
+    }
+    record_spill_compression(&stats);
+}
+
+/// Codec work done at spill time, which the end-of-run report has to add to the
+/// in-memory pass or it would under-report a model that spilled — exactly the
+/// large-MoE case this exists for. A global mirrors how the codec choice itself
+/// is threaded (`BF16_CODEC`), keeping the ~14 `maybe_spill` call sites intact.
+static SPILL_BF16_STATS: Mutex<Bf16CompressStats> = Mutex::new(Bf16CompressStats {
+    compressed: 0,
+    not_smaller: 0,
+    skipped_spilled: 0,
+    gather_lut3: 0,
+    bytes_before: 0,
+    bytes_after: 0,
+});
+
+/// Whether a BF16 tensor may be recoded before the per-tensor emit loop ends.
+///
+/// False while a post-pass still needs to read plain BF16 bytes back in place —
+/// `pack_qtip_real_tensors` stages its input as BF16 and rewrites it after the
+/// loop, so recoding early would hand it compressed bytes. Every other format
+/// has no such pass, which is what lets the codec run while a tensor is still
+/// small enough to matter.
+static BF16_PRECOMPRESS: AtomicBool = AtomicBool::new(false);
+
+fn set_bf16_precompress(ok: bool) {
+    BF16_PRECOMPRESS.store(ok, Ordering::Relaxed);
+}
+
+fn bf16_precompress() -> bool {
+    BF16_PRECOMPRESS.load(Ordering::Relaxed)
+}
+
+fn record_spill_compression(s: &Bf16CompressStats) {
+    if let Ok(mut g) = SPILL_BF16_STATS.lock() {
+        g.compressed += s.compressed;
+        g.not_smaller += s.not_smaller;
+        g.skipped_spilled += s.skipped_spilled;
+        g.gather_lut3 += s.gather_lut3;
+        g.bytes_before += s.bytes_before;
+        g.bytes_after += s.bytes_after;
+    }
+}
+
+/// Merge the spill-time totals into an in-memory pass's stats for reporting.
+fn merge_spill_compression(s: &mut Bf16CompressStats) {
+    if let Ok(g) = SPILL_BF16_STATS.lock() {
+        s.compressed += g.compressed;
+        s.not_smaller += g.not_smaller;
+        s.skipped_spilled += g.skipped_spilled;
+        s.gather_lut3 += g.gather_lut3;
+        s.bytes_before += g.bytes_before;
+        s.bytes_after += g.bytes_after;
     }
 }
 
@@ -4432,39 +4503,14 @@ fn gpu_encode_symbols(
     Ok(symbols)
 }
 
-/// Acquire the shared GPU flock so the quantizer cooperates with the daemon and
-/// other GPU tools while it runs the trellis encoder — AGENTS.md's one lock
-/// primitive (`hipfire-lock`), acquired automatically rather than by an external
-/// `hipfire lock`. Blocks (with a poll message) until the GPU is free; the guard
-/// is held for the duration of the GPU work via RAII. Returns None only if the
-/// lock file can't be opened, in which case we proceed lock-less rather than fail.
-#[cfg(feature = "gpu")]
-fn acquire_gpu_lock() -> Option<hipfire_lock::FlockGuard> {
-    let path = hipfire_lock::gpu_resource_lock_path();
-    let mut guard = match hipfire_lock::FlockGuard::open(&path) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!(
-                "  qtip: could not open GPU lock {}: {e}; proceeding without it",
-                path.display()
-            );
-            return None;
-        }
-    };
-    let mut waited = 0u64;
-    let acquired = guard
-        .lock_blocking(std::time::Duration::from_secs(2), None, |holder| {
-            waited += 2;
-            let who = if holder.is_empty() { "unknown" } else { holder };
-            eprintln!("  qtip: GPU busy ({who}) — waited {waited}s for the GPU lock…");
-        })
-        .unwrap_or(false);
-    if !acquired {
-        return None;
-    }
-    let _ = guard.write_holder(&format!("{} hipfire-quantize", std::process::id()));
-    Some(guard)
-}
+// The trellis encoder deliberately does NOT take the GPU flock. AGENTS.md:
+// "Non-daemon GPU binaries do not self-lock" — the caller coordinates with
+// `hipfire lock {acquire,release,status}`, and `scripts/two_pass_quantize.py`
+// wraps this binary in `hipfire lock run`. A self-lock here deadlocked under
+// that wrapper: the flock is held by the *parent* process and `FlockGuard`'s fd
+// is O_CLOEXEC, so the child never inherits it and waits forever on a lock its
+// own parent owns. It never fired only because the induction default is
+// `oq4.25++`, not `--format qtip3`/`qtip4`.
 
 /// Pack the real QTIP format (`bits`-bit trellis) over a set of staged BF16
 /// tensors, in place.
@@ -4520,27 +4566,20 @@ fn pack_qtip_real_tensors(
     };
     // Autodetect a GPU for the trellis encode (exact Viterbi, ~250× the CPU beam).
     // The CPU beam remains the fallback + reference; nothing here requires a GPU.
-    // When a device is found we self-acquire the shared GPU flock (`_gpu_lock`,
-    // held via RAII until this function returns) so we cooperate with the daemon
-    // and other GPU tools — no external `hipfire lock` needed.
+    // The GPU flock is the caller's responsibility (see the note above the pack
+    // helpers) — this binary must not take it itself.
     #[cfg(feature = "gpu")]
-    let (mut gpu, _gpu_lock) = match hipfire_rdna::Gpu::init() {
+    let mut gpu = match hipfire_rdna::Gpu::init() {
         Ok(g) => {
-            let lock = acquire_gpu_lock();
             eprintln!(
-                "  qtip{bits} (real): GPU trellis encoder ({}, exact Viterbi){}",
+                "  qtip{bits} (real): GPU trellis encoder ({}, exact Viterbi)",
                 g.arch,
-                if lock.is_some() {
-                    " — GPU lock held"
-                } else {
-                    " — WARNING: proceeding without GPU lock"
-                }
             );
-            (Some(g), lock)
+            Some(g)
         }
         Err(_) => {
             eprintln!("  qtip{bits} (real): no GPU device — CPU beam encoder (beam={beam})");
-            (None, None)
+            None
         }
     };
     #[cfg(not(feature = "gpu"))]
@@ -4817,6 +4856,15 @@ fn run_hfq_source_pipeline(
         }
     }
 
+    // QTIP stages its weights as BF16 and rewrites them after the loop; every
+    // other format is free to recode as soon as a tensor exists.
+    set_bf16_precompress(!matches!(
+        format,
+        HfqInputFormat::Qtip3 | HfqInputFormat::Qtip4
+    ));
+    let mut early_bf16_stats = Bf16CompressStats::default();
+    let mut compressed_upto = 0usize;
+
     let mut hfq_tensors = Vec::with_capacity(hfq.tensors.len());
     // HFQ-to-HFQ rewrites can be just as large as direct safetensors ingest.
     // Keep completed output tensors bounded instead of retaining an entire
@@ -4893,6 +4941,17 @@ fn run_hfq_source_pipeline(
             });
         }
         emit_coarse_sidecar(&mut hfq_tensors, &t.name, &t.shape);
+        // Recode what this iteration produced, so bytes accumulating toward the
+        // spill threshold are already compressed. Only the new tail is touched:
+        // a tensor the codec declined stays plain BF16, and re-offering it every
+        // iteration would re-encode it O(n) times for nothing.
+        if bf16_precompress() {
+            let codec = bf16_codec();
+            for t in &mut hfq_tensors[compressed_upto..] {
+                compress_bf16_tensor(t, codec, &mut early_bf16_stats);
+            }
+            compressed_upto = hfq_tensors.len();
+        }
         if let Some(ref mut output_spill) = spill {
             maybe_spill(&mut hfq_tensors, output_spill, 2 * 1024 * 1024 * 1024);
         }
@@ -4978,10 +5037,18 @@ fn run_hfq_source_pipeline(
     // Recode BF16 tensors with the lossless disk codec. Must run after every
     // transform pass (they read bf16 bytes back in place) and before any spill
     // (spilled bytes cannot be replaced).
-    let bf16_stats = compress_bf16_tensors(&mut hfq_tensors, bf16_codec());
+    let mut bf16_stats = compress_bf16_tensors(&mut hfq_tensors, bf16_codec());
+    // Tensors recoded during the emit loop or on the way to the spill file are
+    // counted there, not here.
+    bf16_stats.compressed += early_bf16_stats.compressed;
+    bf16_stats.not_smaller += early_bf16_stats.not_smaller;
+    bf16_stats.gather_lut3 += early_bf16_stats.gather_lut3;
+    bf16_stats.bytes_before += early_bf16_stats.bytes_before;
+    bf16_stats.bytes_after += early_bf16_stats.bytes_after;
+    merge_spill_compression(&mut bf16_stats);
     if bf16_stats.compressed > 0 || bf16_stats.skipped_spilled > 0 {
         eprintln!(
-            "  bf16 codec: {} tensors {:.1} MB -> {:.1} MB ({:.4}x){}{}",
+            "  bf16 codec: {} tensors {:.1} MB -> {:.1} MB ({:.4}x){}{}{}",
             bf16_stats.compressed,
             bf16_stats.bytes_before as f64 / 1e6,
             bf16_stats.bytes_after as f64 / 1e6,
@@ -4993,6 +5060,11 @@ fn run_hfq_source_pipeline(
             },
             if bf16_stats.skipped_spilled > 0 {
                 format!(", {} skipped (already spilled)", bf16_stats.skipped_spilled)
+            } else {
+                String::new()
+            },
+            if bf16_stats.gather_lut3 > 0 {
+                format!(", {} gather-shaped as lut3", bf16_stats.gather_lut3)
             } else {
                 String::new()
             },
@@ -6319,6 +6391,11 @@ fn main() {
     // path is for kernel-free PPL; this is the shippable bandwidth format.
     let use_qtip3_real = format == "qtip3";
     let use_qtip4_real = format == "qtip4";
+    // QTIP's post-pass rewrites BF16-staged weights after the emit loop, so the
+    // codec must wait for it. Every other format may recode a tensor as soon as
+    // it exists, which is what keeps the bytes accumulating toward the spill
+    // threshold compressed instead of plain.
+    set_bf16_precompress(!(use_qtip3_real || use_qtip4_real));
     let qtip_bits: u32 = if let Some(b) = qtip_sim_bits {
         b
     } else if use_qtip3_real {
@@ -10748,6 +10825,15 @@ fn main() {
         // Release source file page cache after each tensor to prevent
         // mmap'd pages from starving GPU allocations on UMA systems.
         st_files[*file_idx].drop_tensor_pages(name);
+        // Bound heap growth. The quant branches above each spill, but the
+        // source-precision branches (BF16/F16/F32 passthrough) did not, so a
+        // `--format bf16` conversion accumulated the entire model in RAM:
+        // measured 18 GB of anonymous memory 14% into a 31B model, with the
+        // spill file still empty. Spilling here is what makes the 2 GiB
+        // threshold mean anything on this path.
+        if let Some(ref mut sp) = spill {
+            maybe_spill(&mut hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+        }
     }
     quant_progress.finish();
 
@@ -12093,10 +12179,12 @@ fn main() {
     // Recode BF16 tensors with the lossless disk codec. Must run after every
     // transform pass (they read bf16 bytes back in place) and before any spill
     // (spilled bytes cannot be replaced).
-    let bf16_stats = compress_bf16_tensors(&mut hfq_tensors, bf16_codec());
+    let mut bf16_stats = compress_bf16_tensors(&mut hfq_tensors, bf16_codec());
+    // Tensors recoded on their way to the spill file are counted there.
+    merge_spill_compression(&mut bf16_stats);
     if bf16_stats.compressed > 0 || bf16_stats.skipped_spilled > 0 {
         eprintln!(
-            "  bf16 codec: {} tensors {:.1} MB -> {:.1} MB ({:.4}x){}{}",
+            "  bf16 codec: {} tensors {:.1} MB -> {:.1} MB ({:.4}x){}{}{}",
             bf16_stats.compressed,
             bf16_stats.bytes_before as f64 / 1e6,
             bf16_stats.bytes_after as f64 / 1e6,
@@ -12108,6 +12196,11 @@ fn main() {
             },
             if bf16_stats.skipped_spilled > 0 {
                 format!(", {} skipped (already spilled)", bf16_stats.skipped_spilled)
+            } else {
+                String::new()
+            },
+            if bf16_stats.gather_lut3 > 0 {
+                format!(", {} gather-shaped as lut3", bf16_stats.gather_lut3)
             } else {
                 String::new()
             },
