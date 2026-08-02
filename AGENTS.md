@@ -78,9 +78,24 @@ the relevant docs under `docs/`.
   suites first. Shell gates should remain enforcement wrappers when they still
   provide baseline comparison or hook integration.
 - Non-daemon GPU binaries do not self-lock. Coordinate GPU examples, benches,
-  `hipfire eval`, and `hipfire-quantize` with
-  `hipfire lock {acquire,release,status}` unless the called gate already does
-  so.
+  and `hipfire-quantize` with `hipfire lock {acquire,release,status}` unless the
+  called gate already does so.
+- `hipfire-eval` is the exception: it loads through the daemon, which acquires
+  the resource lock itself. Do NOT wrap it in `hipfire lock` — it deadlocks
+  against the caller's own holder, and the failure names your own label as the
+  blocker (`resource hip-gpu-0 ... is locked by <your label> ... mode=run`).
+  Run it directly.
+- A `lock run` holder that dies leaves a stale record in
+  `~/.hipfire/locks/hip-gpu-0.lock` that no CLI command clears: `release`,
+  `release <label>` and `kill` all test whether the lock is HELD — it is not,
+  the flock died with the process — rather than whether the RECORD is stale, so
+  they report "no lock held" / "free — nothing to kill" and do nothing. Meanwhile
+  the daemon's acquire path honours the record and refuses to load, while
+  `lock status` reports "gpu is free" throughout. `HIPFIRE_RESOURCE_LOCK=0` does
+  not help; the daemon does not inherit the caller's environment. Until `lock
+  kill` is fixed to clear the record when it finds the recorded holder already
+  gone, recovery means emptying that file by hand — check the label is yours
+  first, so you cannot drop another agent's lock.
 
 ## Artifact Names
 
