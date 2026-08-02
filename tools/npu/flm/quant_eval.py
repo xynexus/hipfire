@@ -163,7 +163,13 @@ def weights_oq4(sd, cfg, group, pp=False):
     for L in range(cfg["num_hidden_layers"]):
         for nm in KEYMAP:
             k = f"layers.{L}.{nm}.weight"
-            W = sd[k].to(torch.float32).numpy()
+            # np.array = an explicit COPY. `.to(float32).numpy()` returns a
+            # VIEW sharing memory with the state dict when the tensor is already
+            # float32, and elision inside the quantisers then writes through to
+            # the ORIGINAL weights -- so every mode silently corrupted the
+            # weights for every mode after it. oq4+ runs last and looked worst,
+            # while measuring BETTER than oq4 in isolation on the same matrices.
+            W = np.array(sd[k].to(torch.float32).numpy(), np.float32)
             out[k] = torch.from_numpy(requant_oq4pp(W, group, rng) if pp
                                       else requant_oq4(W, group))
     return out
