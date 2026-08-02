@@ -90,6 +90,45 @@ quantiser is naturally tuned against — hipfire's clip-search optimises exactly
 — and on this model it is not a proxy for anything. Any calibration work needs
 the KLD harness in the loop, not an RMSE target.
 
+**3-BIT MEASURED 2026-08-02: oq3++ IS 4.29x WORSE THAN oq4++ AND DOES NOT REACH
+THE BAR.** Four artifacts, one 503-position wikitext2 slice, one fp16 reference:
+
+                        b/w      PPL      KLD      vs fp16   vs oq4++
+    fp16 reference     16.0000  16.4027  0.000000     —          —
+    oq4++ (bf16 src)    4.0625  17.2238  0.045964   +5.01%     1.00x
+    oq4++ (f16 src)     4.0625  17.2091  0.046167   +4.92%     1.00x   CONTROL
+    oq3++               3.0625  19.9025  0.197836  +21.34%     4.29x
+    qtip3 (no cond.)    3.1250  25.2538  0.368288  +53.96%     7.98x
+
+**q4nx costs +4.89%. oq3++ costs +21.34%.** 3-bit does not reach the bar; parity
+was an oq4++ result and does not survive the drop to 3 bits. The 4.29x is worth
+recording precisely because it was PREDICTED as "about 4-5x" before measurement —
+the intuition about this codec family is calibrated, the absolute standard was
+not.
+
+DO NOT read the qtip3 row as "trellis loses". That artifact has NO conditioning:
+`format_needs_calibration("qtip3")` is false, so it took neither AWQ nor LDLQ
+while oq3++ took both. The row measures conditioned 3-bit against UNconditioned
+3-bit trellis, which is the same lesson as everything else in this file —
+calibration dominates the codec. Trellis at equal conditioning is still
+unmeasured and is the open question 3-bit hinges on.
+
+The CONTROL is why these numbers can be trusted: oq4++ rebuilt from the fp16
+source landed at 17.2091 against 17.2238 from bf16, a 0.09% difference. All four
+therefore share a parent, and that parent is the exact model the .pkld reference
+was generated from.
+
+Three hipfire gaps had to be closed to measure any of this, none of them the
+measurement: `--format oq3++` did not resolve (the recipe existed, the flag parse
+accepted only the bare form); hfq -> hfq requant silently dropped config and
+tokenizer, producing artifacts that load far enough to look healthy then panic
+with no cause; and `load_weights_hfq` had no qt 38 arm, so the quantizer could
+write W3 but nothing could read it. The last is now served by a LOSSLESS int8
+upcast — int3 sign-extends into int8 exactly and the f16 group scale carries
+over — so 3-bit shares the iu8 W8A8 kernels with oq4/oq8 rather than needing a
+W3 GEMV. That also retires the earlier "oq3 unpack is unaffordable" worry: that
+number came from a kernel decoding bit-planes to bf16, not to a shared int8 grid.
+
 **ANSWERED 2026-08-02: oq4++ REACHES PARITY WITH q4nx AT 19% FEWER BITS.** The
 measurement this section called the most valuable open one in the phase, on a
 common corpus slice — the same 512 wikitext2 tokens, same 8-position warmup, the
