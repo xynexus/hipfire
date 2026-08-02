@@ -1268,3 +1268,171 @@ mod tests {
         assert!(eh < ei, "OBS feedback must beat no-feedback: {eh} !< {ei}");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// QTIP-3 conditioning (qtip3++ candidates)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Which conditioning to apply to the QTIP trellis encode. All three answer the
+/// same question — how to spend Hessian information on a beam search — and they
+/// sit at very different points on the cost curve, so they are measured rather
+/// than argued about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QtipCondMode {
+    /// Weight each step's squared error by the ROTATED Hessian diagonal.
+    /// Cheapest; expected weakest, because the FWHT exists to flatten exactly
+    /// that diagonal.
+    Weighted,
+    /// Plain beam per group, but feed the winning path's error forward to later
+    /// groups through L. Captures cross-group error at almost no encode cost;
+    /// no feedback within a group.
+    Greedy,
+    /// Carry a residual per beam candidate, so error feeds forward WITHIN a
+    /// group too, and across groups as in `Greedy`. Faithful LDLQ; pays O(n) per
+    /// candidate per step, so the caller must narrow the beam to afford it.
+    BeamLdlq,
+}
+
+/// Conditioned QTIP encode. `rotated` is the already-FWHT-rotated weight matrix
+/// [m, k]; the Hessian is rotated here to match that frame.
+///
+/// Returns `(symbols, targets)`. `targets` is what the symbols were actually
+/// chosen to represent — identical to `rotated` for [`QtipCondMode::Weighted`],
+/// but the RESIDUAL-adjusted values for the LDLQ modes. The caller must refit
+/// the per-group scale against `targets`, not against `rotated`: under error
+/// feedback a block encodes its adjusted target and the compensation for its own
+/// error is carried by later blocks. Refitting against the original weights
+/// would discard that compensation and quietly degrade to plain RTN-with-extra-
+/// steps — the same trap that made an earlier LDLQ run silently do nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn qtip_conditioned_encode(
+    rotated: &[f32],
+    m: usize,
+    k: usize,
+    h_rowmajor_f32: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+    damp: f64,
+    cb: &[f32],
+    beam: usize,
+    bits: u32,
+    mode: QtipCondMode,
+) -> Option<(Vec<u8>, Vec<f32>)> {
+    use rayon::prelude::*;
+    assert_eq!(rotated.len(), m * k);
+    assert_eq!(h_rowmajor_f32.len(), k * k);
+    assert_eq!(k % 256, 0, "qtip conditioning requires k % 256 == 0");
+
+    let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
+    rotate_hessian(&mut h, k, signs1, signs2);
+
+    if mode == QtipCondMode::Weighted {
+        // Normalize the rotated diagonal to mean 1 so the cost stays on the same
+        // scale as the unweighted encode (only the RELATIVE weighting matters,
+        // and an unnormalized H would just rescale every candidate equally).
+        let diag: Vec<f64> = (0..k).map(|i| h[i * k + i].max(0.0)).collect();
+        let mean = diag.iter().sum::<f64>() / k as f64;
+        let diag: Vec<f64> = if mean > 0.0 {
+            diag.iter().map(|d| d / mean).collect()
+        } else {
+            vec![1.0; k]
+        };
+        let mut symbols = vec![0u8; m * k];
+        symbols
+            .par_chunks_mut(256)
+            .enumerate()
+            .zip(rotated.par_chunks(256))
+            .for_each(|((gi, srow), grp)| {
+                let c0 = (gi * 256) % k;
+                let scale0 = crate::qtip::group_scale(grp);
+                let sym = crate::qtip::beam_encode_group_bits_weighted(
+                    grp,
+                    scale0,
+                    cb,
+                    beam,
+                    bits,
+                    &diag[c0..c0 + 256],
+                );
+                srow.copy_from_slice(&sym);
+            });
+        return Some((symbols, rotated.to_vec()));
+    }
+
+    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    drop(h);
+    let nb = k / 256;
+    let mut residual: Vec<f64> = rotated.iter().map(|&w| w as f64).collect();
+    let mut symbols = vec![0u8; m * k];
+    let mut targets = vec![0.0f32; m * k];
+
+    for blk in 0..nb {
+        let c0 = blk * 256;
+        let c1 = c0 + 256;
+        // The [256, 256] diagonal sub-block of L for this group, row-major.
+        let l_block: Vec<f64> = if mode == QtipCondMode::BeamLdlq {
+            let mut lb = vec![0.0f64; 256 * 256];
+            for f in 0..256 {
+                for c in 0..=f {
+                    lb[f * 256 + c] = l[(c0 + f, c0 + c)];
+                }
+            }
+            lb
+        } else {
+            Vec::new()
+        };
+
+        let per_row: Vec<(Vec<u8>, Vec<f32>, Vec<f64>)> = residual
+            .par_chunks(k)
+            .map(|rr| {
+                let grp: Vec<f32> = rr[c0..c1].iter().map(|&v| v as f32).collect();
+                let scale0 = crate::qtip::group_scale(&grp);
+                let sym = match mode {
+                    QtipCondMode::BeamLdlq => crate::qtip::beam_encode_group_bits_ldlq(
+                        &grp, scale0, cb, beam, bits, &l_block,
+                    ),
+                    _ => crate::qtip::beam_encode_group_bits(&grp, scale0, cb, beam, bits),
+                };
+                // Refit the scale against what was actually encoded, then measure
+                // the error THAT reconstruction leaves behind.
+                let scale = crate::qtip::optimal_scale_bits(&grp, &sym, cb, bits);
+                let deq = crate::qtip::decode_group_bits(&sym, scale, cb, bits);
+                let mut err = vec![0.0f64; 256];
+                for c in 0..256 {
+                    let lcc = l[(c0 + c, c0 + c)];
+                    err[c] = if lcc > 0.0 {
+                        (grp[c] as f64 - deq[c] as f64) / lcc
+                    } else {
+                        0.0
+                    };
+                }
+                (sym, grp, err)
+            })
+            .collect();
+
+        for (row, (sym, grp, _)) in per_row.iter().enumerate() {
+            symbols[row * k + c0..row * k + c1].copy_from_slice(sym);
+            targets[row * k + c0..row * k + c1].copy_from_slice(grp);
+        }
+
+        if c1 < k {
+            residual
+                .par_chunks_mut(k)
+                .zip(per_row.par_iter())
+                .for_each(|(rr, (_, _, err))| {
+                    for (c, &ec) in err.iter().enumerate() {
+                        if ec == 0.0 {
+                            continue;
+                        }
+                        let col = c0 + c;
+                        for f in c1..k {
+                            let lfc = l[(f, col)];
+                            if lfc != 0.0 {
+                                rr[f] -= ec * lfc;
+                            }
+                        }
+                    }
+                });
+        }
+    }
+    Some((symbols, targets))
+}

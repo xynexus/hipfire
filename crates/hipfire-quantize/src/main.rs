@@ -4541,6 +4541,22 @@ fn gpu_encode_symbols(
 /// Opt-in: trellis the untied lm_head/output under QTIP formats instead of
 /// keeping it Q8F16. Set `HIPFIRE_QTIP_LM_HEAD=1`. Default off preserves the
 /// measured gather-friendly Q8F16 head (see `pack_qtip_real_tensors`).
+/// Which trellis conditioning to apply, from `HIPFIRE_QTIP_COND`:
+/// `weighted` | `greedy` | `beamldlq`. Unset (default) = plain unweighted beam.
+/// All three need `--hessian`; without one the tensor falls back to plain.
+fn qtip_cond_mode() -> Option<hipfire_quantize::ldlq::QtipCondMode> {
+    use hipfire_quantize::ldlq::QtipCondMode;
+    match std::env::var("HIPFIRE_QTIP_COND").ok()?.to_ascii_lowercase().as_str() {
+        "weighted" => Some(QtipCondMode::Weighted),
+        "greedy" => Some(QtipCondMode::Greedy),
+        "beamldlq" | "beam_ldlq" => Some(QtipCondMode::BeamLdlq),
+        other => {
+            eprintln!("warning: HIPFIRE_QTIP_COND={other:?} unrecognized — using plain beam");
+            None
+        }
+    }
+}
+
 fn qtip_trellis_lm_head_enabled() -> bool {
     std::env::var("HIPFIRE_QTIP_LM_HEAD").ok().as_deref() == Some("1")
 }
@@ -4577,8 +4593,19 @@ fn pack_qtip_real_tensors(
     // The CPU beam remains the fallback + reference; nothing here requires a GPU.
     // The GPU flock is the caller's responsibility (see the note above the pack
     // helpers) — this binary must not take it itself.
+    // Force the CPU beam even when a device is present. The conditioned encodes
+    // are CPU-only, so measuring them against a GPU-Viterbi baseline would vary
+    // the ENCODER and the conditioning at once — a conditioned arm could lose on
+    // the encoder swap alone. Set HIPFIRE_QTIP_CPU_ENCODE=1 to hold the encoder
+    // fixed across arms.
     #[cfg(feature = "gpu")]
-    let mut gpu = match hipfire_rdna::Gpu::init() {
+    let force_cpu = std::env::var("HIPFIRE_QTIP_CPU_ENCODE").ok().as_deref() == Some("1");
+    #[cfg(feature = "gpu")]
+    let mut gpu = if force_cpu {
+        eprintln!("  qtip{bits} (real): CPU beam encoder forced (beam={beam})");
+        None
+    } else {
+        match hipfire_rdna::Gpu::init() {
         Ok(g) => {
             eprintln!(
                 "  qtip{bits} (real): GPU trellis encoder ({}, exact Viterbi)",
@@ -4589,6 +4616,7 @@ fn pack_qtip_real_tensors(
         Err(_) => {
             eprintln!("  qtip{bits} (real): no GPU device — CPU beam encoder (beam={beam})");
             None
+        }
         }
     };
     #[cfg(not(feature = "gpu"))]
@@ -4638,6 +4666,8 @@ fn pack_qtip_real_tensors(
     let mut new_sidecars: Vec<HfqTensor> = Vec::new();
     let mut n_lr = 0usize;
     let mut n_awq = 0usize;
+    let cond_mode = qtip_cond_mode();
+    let mut n_cond = 0usize;
     for t in tensors.iter_mut() {
         // Trellis every BF16 2D weight with k%256==0, except the embedding table
         // (always gather → Q8F16 above). The untied lm_head/output is trellised
@@ -4714,6 +4744,35 @@ fn pack_qtip_real_tensors(
         };
         #[cfg(not(feature = "gpu"))]
         let symbols: Vec<u8> = cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits);
+        // Conditioned encode (qtip3++ candidates) replaces the plain symbols when
+        // a mode is set AND this tensor has a Hessian. `enc_target` is what the
+        // symbols represent: the rotated weights for the unconditioned and
+        // Weighted paths, the residual-adjusted values under error feedback.
+        let mut enc_target: Option<Vec<f32>> = None;
+        let mut symbols = symbols;
+        if let Some(mode) = cond_mode {
+            if let Some(h) = OQ4_LDLQ_HESSIAN
+                .get()
+                .and_then(|idx| ldlq_hessian_for_tensor(idx, &t.name, k))
+            {
+                let diag_sum: f64 = (0..k).map(|i| h[i * k + i] as f64).sum();
+                let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
+                match hipfire_quantize::ldlq::qtip_conditioned_encode(
+                    &rotated, m, k, &h, qtip_s1, qtip_s2, damp, qtip_cb, beam, bits, mode,
+                ) {
+                    Some((sym, tgt)) => {
+                        symbols = sym;
+                        enc_target = Some(tgt);
+                        n_cond += 1;
+                    }
+                    None => eprintln!(
+                        "  qtip{bits}: conditioning factorization failed for {} — plain beam",
+                        t.name
+                    ),
+                }
+            }
+        }
+        let rotated = enc_target.unwrap_or(rotated);
         t_enc += _t_enc.elapsed();
 
         // Phase 3 — refit the closed-form optimal scale, self-check (rotated-frame
@@ -4816,6 +4875,19 @@ fn pack_qtip_real_tensors(
     );
     if n_awq > 0 {
         eprintln!("  qtip{bits} (real): AWQ pre-scaled {n_awq} tensors + awq_scale sidecars");
+    }
+    if let Some(mode) = cond_mode {
+        eprintln!("  qtip{bits} (real): {mode:?} conditioning applied to {n_cond} tensors");
+        if n_cond == 0 && n_packed > 0 {
+            // Refuse to ship an artifact that silently ignored the conditioning it
+            // was asked for. Byte-identical to the unconditioned build, it would
+            // read as "this mode makes no difference" in any comparison.
+            eprintln!(
+                "error: HIPFIRE_QTIP_COND={mode:?} reached 0 of {n_packed} tensors — no full \
+                 Hessian matched. Pass --hessian with per-tensor [K,K] payloads."
+            );
+            std::process::exit(3);
+        }
     }
     eprintln!(
         "  qtip{bits} (real): phase wall-time — rotate {:.2}s  encode {:.2}s  pack {:.2}s",
@@ -6974,7 +7046,13 @@ fn main() {
     // --ldlq / OQ++: full-Hessian error-feedback weight quant for calibrated plus
     // formats. Loads the full [K,K] payloads from the same --hessian file the
     // AWQ diagonal came from. Requires --hessian.
-    let ldlq_requested = oq_ldlq_recipe || args.iter().any(|a| a == "--ldlq");
+    // HIPFIRE_QTIP_COND needs the same full [K,K] payloads: all three trellis
+    // conditioning modes rotate H and (for the feedback modes) factor it. Without
+    // this the index stays unset, `ldlq_hessian_for_tensor` returns None for every
+    // tensor, and the run emits a plain artifact while reporting success — which
+    // is exactly what happened the first time these were measured.
+    let ldlq_requested =
+        oq_ldlq_recipe || args.iter().any(|a| a == "--ldlq") || qtip_cond_mode().is_some();
     if ldlq_requested {
         match args
             .iter()
