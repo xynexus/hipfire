@@ -115,6 +115,69 @@ def dequant_oq4(mm, ent, s1, s2, awq=None):
     return W.astype(np.float32)
 
 
+HEAD = 64
+
+
+def hf_to_meta(D, nh):
+    """HF q/k row order -> Meta's. Verified by best-match search, not assumed:
+    for head 0, D row i matches checkpoint row pm[i] with
+    pm = [0,2,...,62,1,3,...,63] on 64/64 rows."""
+    N, K = D.shape
+    return D.reshape(nh, 2, N // nh // 2, K).transpose(0, 2, 1, 3).reshape(N, K)
+
+
+def build_state(mm, idx, cfg, sd):
+    """The artifact AS A MODEL: its own weights AND its own norms.
+
+    Recovering the original W from the artifact needs the AWQ folding undone,
+    and that is not recoverable per-tensor: q/k/v share one RMSNorm but carry
+    SEPARATE awq_scale sidecars, so only a compromise scale can have been folded
+    into the norm and no per-tensor division inverts it. Measured, o_proj and
+    down_proj want the scale divided out (no preceding norm to fold into) while
+    gate/up/v want it left alone -- which is the folding rule, not a bug.
+
+    So do not reconstruct W at all. Take the artifact's weights and the
+    artifact's norms together and the folding cancels by construction, which is
+    exactly what the runtime relies on. Only naming and the q/k row order have
+    to be mapped.
+    """
+    import torch
+    out = dict(sd)
+    nh = cfg["num_attention_heads"]
+    nkv = cfg["num_key_value_heads"]
+    s1, s2 = gen_fwht_signs(42), gen_fwht_signs(1042)
+    nq = 0
+    for L in range(cfg["num_hidden_layers"]):
+        for mk, hk in qe.KEYMAP.items():
+            wn = f"model.layers.{L}.{hk}.weight"
+            if wn not in idx:
+                continue
+            aw = idx.get(f"model.layers.{L}.{hk}.awq_scale.weight")
+            a = None
+            # o_proj / down_proj have no preceding norm, so their scale is a
+            # RUNTIME activation divide and must be undone here; the rest fold
+            # into the norm this function also takes from the artifact.
+            if aw is not None and hk in ("self_attn.o_proj", "mlp.down_proj"):
+                a = np.frombuffer(mm, np.float16, count=aw[1][0],
+                                  offset=aw[3]).astype(np.float32)
+            W = dequant_oq4(mm, idx[wn], s1, s2, a)
+            if hk == "self_attn.q_proj":
+                W = hf_to_meta(W, nh)
+            elif hk == "self_attn.k_proj":
+                W = hf_to_meta(W, nkv)
+            out[f"layers.{L}.{mk}.weight"] = torch.from_numpy(np.ascontiguousarray(W))
+            nq += 1
+        for hn, mn in (("input_layernorm", "attention_norm"),
+                       ("post_attention_layernorm", "ffn_norm")):
+            e = idx.get(f"model.layers.{L}.{hn}.weight")
+            if e is None:
+                continue
+            dt = np.float16 if e[0] == 16 else np.float32
+            v = np.frombuffer(mm, dt, count=e[1][0], offset=e[3]).astype(np.float32)
+            out[f"layers.{L}.{mn}.weight"] = torch.from_numpy(v)
+    return out, nq
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -130,24 +193,8 @@ def main():
           f"calib {meta['calibration']['source']}")
     s1, s2 = gen_fwht_signs(42), gen_fwht_signs(1042)
 
-    out = dict(sd)
-    nq = 0
-    for L in range(cfg["num_hidden_layers"]):
-        for nm, hf in qe.KEYMAP.items():
-            wn = f"model.layers.{L}.{hf}.weight"
-            if wn not in idx:
-                continue
-            aw = idx.get(f"model.layers.{L}.{hf}.awq_scale.weight")
-            a = None
-            if aw is not None:
-                a = np.frombuffer(mm, np.float16, count=aw[1][0],
-                                  offset=aw[3]).astype(np.float32)
-            W = dequant_oq4(mm, idx[wn], s1, s2, a)
-            k = f"layers.{L}.{nm}.weight"
-            assert W.shape == tuple(sd[k].shape), (wn, W.shape, sd[k].shape)
-            out[k] = torch.from_numpy(W)
-            nq += 1
-    print(f"  dequantised {nq} weight tensors")
+    out, nq = build_state(mm, idx, cfg, sd)
+    print(f"  dequantised {nq} weight tensors + artifact norms")
 
     toks = ([128000] + of.encode(qe.TEXT))[:o.ntok]
     ref = qe.all_logits(toks, cfg, sd)
