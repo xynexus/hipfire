@@ -59,10 +59,24 @@ rare case where the two goals do not trade against each other.
 hipfire's own format docs call it "the memory-ceiling lever (25% less weight
 traffic than Oq4)". On a decode path that is 92.4% DMA that is ~104 tok/s against
 oq4's ~78. Its bit-plane storage IS the kernel layout, so unlike oq4 it needs no
-repack — but it needs a Morton spread-to-int4 unpack in the inner loop, and this
-file's own oq4 experience is that the unpack path is exactly where a grouped
-format can lose 3.4x to arithmetic. Worth a probe of its own, on the same control
-method, before anyone believes the 104.
+repack. Codes are `[-3, 3]`, 8 blocks of 3 u32 planes per 256-group.
+
+**AIE2P has the intrinsics for the unpack; do not assume it is expensive.**
+`aie_api` provides `aie::mask<32>::from_uint32` (a bit-plane IS a 32-lane mask),
+`aie::select`, `aie::bit_and/or/xor`, `aie::interleave_zip/unzip`, and
+`aie::unpack` / `unpack_sign` — the last being the same `vldb.unpack` int4->int8
+widening the oq4 kernel already gets for free. So the promising shape is NOT
+mask-select per value: spread the 3 planes into packed int4 NIBBLES with shifts
+and bit ops, then hand them to the existing unpack path, which already consumes
+exactly that and costs nothing.
+
+The real question is ops-per-byte against the DMA budget, not whether an unpack
+exists. oq3 moves 75% of oq4's bytes, so it gets 75% of the time per 256 weights
+and must fit its extra unpack inside that. That is measurable, and the method is
+already in the tree: build it, and put a control tile beside it that streams the
+identical bytes with trivial arithmetic. This file's oq4 numbers went
+16.3 -> 31.4 -> 35.5 -> 55.5 GB/s on formulation alone with the bytes never
+changing, so measure the formulation you actually wrote rather than the format.
 
 Sanity-check the projections before building on them: the oq4 GEMV is now measured,
 but the TOKEN figures still assume the same dispatch structure across sixteen
