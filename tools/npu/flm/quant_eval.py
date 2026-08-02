@@ -41,6 +41,16 @@ import oracle_forward as of
 import q4nx                       # numpy only -- safe to import beside torch
 
 Q4NX = Path.home() / ".config/flm/models/Llama-3.2-1B-NPU2/model.q4nx"
+GROUP = 256
+# ONE global sign pair, not per-matrix draws. The rotation only cancels when the
+# activation and the weight of the SAME GEMV use the SAME R: x.W = (Rx).(RW).
+# Per-matrix signs are harmless while activations stay fp32 -- each matrix
+# round-trips itself -- but make W4A4 impossible, because the activation hook
+# cannot know which matrix it is feeding. hipfire passes signs1/signs2 in as
+# fixed vectors for exactly this reason.
+_SG = np.random.default_rng(0)
+SIGNS = (_SG.choice(np.float32([-1, 1]), GROUP),
+         _SG.choice(np.float32([-1, 1]), GROUP))
 # oracle key -> q4nx container key. The container uses HF names, the checkpoint
 # uses Meta's; the tree's q4nx_tensor_blocks already returns checkpoint row order.
 KEYMAP = {"attention.wq": "self_attn.q_proj", "attention.wk": "self_attn.k_proj",
@@ -145,16 +155,35 @@ def requant_variant(W, group, rng, rotate, clip):
     """
     N, K = W.shape
     Wg = W.reshape(N, K // group, group)
-    if rotate:
-        s1 = rng.choice(np.float32([-1, 1]), group)
-        s2 = rng.choice(np.float32([-1, 1]), group)
-        R = fwht(Wg, s1, s2)
-    else:
-        R = Wg
+    s1, s2 = SIGNS
+    R = fwht(Wg, s1, s2) if rotate else Wg
     sc = bf16(clipsearch(R) if clip else np.abs(R).max(-1) / np.float32(7.0))
     q = np.clip(np.rint(R / sc[..., None]), -7, 7).astype(np.float32)
     deq = bf16(q * sc[..., None])
     return (fwht(deq, s2, s1) if rotate else deq).reshape(N, K)
+
+
+def quant_act(A, group, rotate, clip):
+    """int4 the ACTIVATION, the A4 half of W4A4.
+
+    rotate -> quantise -> rotate back, exactly as the weights are handled, so
+    the pair is consistent: with R orthogonal, Q(Rx).Q(RW) equals
+    [R^-1 Q(Rx)] . [R^-1 Q(RW)], which is what this models. Per TOKEN and per
+    256-group, which is what an activation quantiser can actually do at runtime
+    -- it sees one row at a time.
+    """
+    import torch
+    a = np.array(A.numpy(), np.float32)
+    lead, K = a.shape[:-1], a.shape[-1]
+    G = a.reshape(-1, K // group, group)
+    s1, s2 = SIGNS
+    R = fwht(G, s1, s2) if rotate else G
+    sc = bf16(clipsearch(R) if clip else np.abs(R).max(-1) / np.float32(7.0))
+    q = np.clip(np.rint(R / np.maximum(sc, np.float32(1e-30))[..., None]),
+                -7, 7).astype(np.float32)
+    deq = bf16(q * sc[..., None])
+    out = (fwht(deq, s2, s1) if rotate else deq).reshape(*lead, K)
+    return torch.from_numpy(out)
 
 
 def requant_oq4pp(W, group, rng):
@@ -232,10 +261,10 @@ def weights_q4nx(sd, cfg):
     return out
 
 
-def all_logits(toks, cfg, sd):
+def all_logits(toks, cfg, sd, act=None):
     """[T, vocab] float64 — logits at every position, not just the last."""
     import torch
-    x, _ = of.forward(toks, cfg=cfg, sd=sd)
+    x, _ = of.forward(toks, cfg=cfg, sd=sd, act_hook=act)
     return np.stack([np.asarray(of.logits(x[t], cfg=cfg, sd=sd), np.float64)
                      for t in range(len(toks))])
 
@@ -261,6 +290,8 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--groups", default="32,64,128,256")
     p.add_argument("--ntok", type=int, default=128)
+    p.add_argument("--a4", action="store_true",
+                   help="quantise ACTIVATIONS too — the only fair test of a rotated format")
     o = p.parse_args()
 
     cfg = json.loads(of.CFG.read_text())
@@ -268,6 +299,7 @@ def main():
     sd = of.load(cfg)
     print(f"quant eval, {len(toks)} tokens, KLD vs fp32 in nats (lower better)")
 
+    kld_bar = None
     ref = all_logits(toks, cfg, sd)
     _, ppl0, _ = score(ref, ref, toks)
     print(f"  {'format':10s} {'b/w':>6} {'KLD':>10} {'PPL':>9} {'top1':>7}   vs q4nx")
@@ -276,6 +308,31 @@ def main():
     rows = []
     kld_bar = None
     gs = [int(x) for x in o.groups.split(",")]
+    if o.a4:
+        # W4A4: weights AND activations at int4. The rotation is not optional
+        # here -- unrotated int4 activations quantise at 0.25-0.29 relRMS, which
+        # is not usable, so "rotate" and "A4" are one decision, not two.
+        print("  W4A4 mode: activations int4 per token per 256-group")
+        rows = [("q4nx_A16", weights_q4nx(sd, cfg), 5.0, None)]
+        for g in gs:
+            rows += [
+                (f"W4A4_g{g}", weights_variant(sd, cfg, g, False, False),
+                 4.0 + 16.0 / g, lambda t, g=g: quant_act(t, g, False, False)),
+                (f"W4A4+rot_g{g}", weights_variant(sd, cfg, g, True, False),
+                 4.0 + 16.0 / g, lambda t, g=g: quant_act(t, g, True, False)),
+                (f"W4A4+both_g{g}", weights_variant(sd, cfg, g, True, True),
+                 4.0 + 16.0 / g, lambda t, g=g: quant_act(t, g, True, True)),
+            ]
+        for name, w, bw, hook in rows:
+            k, ppl, t1 = score(ref, all_logits(toks, cfg, w, hook), toks)
+            if kld_bar is None:
+                kld_bar = k
+            v = "" if hook is None else (
+                f"  {'BETTER' if k < kld_bar else 'worse':>6}  {k/kld_bar:.2f}x KLD")
+            print(f"  {name:14s} {bw:>6.4f} {k:>10.5f} {ppl:>9.4f} {t1:>7.3f}{v}")
+        print("\n  The bar is q4nx at fp32 activations -- what FLM actually runs.")
+        return 0
+
     for name, w, bw in ([("q4nx", weights_q4nx(sd, cfg), 5.0)] +
                         [(f"oq4_g{g}", weights_oq4(sd, cfg, g), 4.0 + 16.0 / g)
                          for g in gs] +

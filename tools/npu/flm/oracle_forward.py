@@ -84,12 +84,22 @@ def _rope(v, co, si):
     return torch.stack([e * co - o * si, o * co + e * si], -1).flatten(-2)
 
 
-def forward(tokens, cfg=None, sd=None, keep=None):
+def forward(tokens, cfg=None, sd=None, keep=None, act_hook=None):
     """Causal fp32 forward over `tokens` -> (x16 [T, hidden] numpy, stash).
 
     x16 is the residual stream BEFORE `norm.weight`, which is what the device
     produces; the final norm and lm_head are the head's job. `keep` is an
     optional list of layer indices whose *input* hidden states are stashed.
+
+    `act_hook`, if given, is applied to EVERY GEMV input just before the
+    matmul -- the four of them: the attention-norm output feeding q/k/v, the
+    attention output feeding wo, the ffn-norm output feeding w1/w3, and the
+    SwiGLU product feeding w2. That is what makes a W4A**4** evaluation
+    possible without reimplementing this forward: quantising the activations
+    is the only thing an A4 format does that an A16 one does not, and every
+    quality comparison of a ROTATED format needs it (the rotation cuts
+    activation int4 error 2.1-2.5x and weight error only 1.1x, measured).
+    Default None leaves this function bit-identical to what it was.
     """
     import torch
     cfg = cfg or json.loads(CFG.read_text())
@@ -107,13 +117,14 @@ def forward(tokens, cfg=None, sd=None, keep=None):
     rms = lambda t, w: t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + EPS) * w
 
     with torch.no_grad():
+        hook = act_hook or (lambda t: t)
         x = W("tok_embeddings.weight")[list(tokens)]
         stash = {}
         for L in range(cfg["num_hidden_layers"]):
             P = f"layers.{L}."
             if keep and L in keep:
                 stash[L] = x.numpy().copy()
-            h1 = rms(x, W(P + "attention_norm.weight"))
+            h1 = hook(rms(x, W(P + "attention_norm.weight")))
             q = _rope((h1 @ W(P + "attention.wq.weight").T).view(T, NH, HD), co, si)
             k = _rope((h1 @ W(P + "attention.wk.weight").T).view(T, NKV, HD), co, si)
             v = (h1 @ W(P + "attention.wv.weight").T).view(T, NKV, HD)
@@ -123,12 +134,12 @@ def forward(tokens, cfg=None, sd=None, keep=None):
             sc = torch.bmm(q.permute(1, 0, 2), kx) / HD ** 0.5      # [NH, T, T]
             p = torch.softmax(sc + neg, -1)
             a = torch.bmm(p, vx).permute(1, 0, 2).reshape(T, NH * HD)
-            h = x + a @ W(P + "attention.wo.weight").T
+            h = x + hook(a) @ W(P + "attention.wo.weight").T
 
-            h2 = rms(h, W(P + "ffn_norm.weight"))
+            h2 = hook(rms(h, W(P + "ffn_norm.weight")))
             g = h2 @ W(P + "feed_forward.w1.weight").T
             u = h2 @ W(P + "feed_forward.w3.weight").T
-            x = h + (torch.nn.functional.silu(g) * u) @ W(P + "feed_forward.w2.weight").T
+            x = h + hook(torch.nn.functional.silu(g) * u) @ W(P + "feed_forward.w2.weight").T
         return x.numpy().copy(), stash
 
 
