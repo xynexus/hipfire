@@ -171,15 +171,27 @@ def inv_chol_lower(H, damp_frac=0.01, tries=24):
     lam = damp_frac * base
     for i in range(tries):
         try:
-            # A = C C^T  =>  A^-1 = C^-T C^-1 = L L^T with L = C^-T.
-            # One Cholesky plus one TRIANGULAR inverse (~K^3/3), against a full
-            # inverse plus a second Cholesky (~4K^3/3). At K=8192 that is the
-            # difference between minutes and seconds, and it is also more
-            # accurate -- no explicit general inverse to drift off symmetry.
+            # The OBS loop needs the LOWER Cholesky factor of A^-1: it reads
+            # L[f, c] for f > c to propagate error forward. C^-T satisfies
+            # L L^T = A^-1 but is UPPER triangular, so every L[f, c] below the
+            # diagonal is zero, no error propagates, and LDLQ silently becomes
+            # plain RTN -- which is exactly what a 57-minute 16-layer run
+            # produced, bit-identical to the RTN row. The equation was right and
+            # the SHAPE was wrong, and a check that only verified
+            # L L^T (H+lI) v == v passed it at 3.2e-12.
+            #
+            # So: invert the triangular factor (K^3/3), form A^-1 = X^T X as a
+            # symmetric product, and take its lower Cholesky (K^3/3). Still well
+            # under a general inverse plus a Cholesky.
             A = H + lam * np.eye(K)
             C = np.linalg.cholesky(A)
-            Cinv = solve_triangular(C, np.eye(K), lower=True)
-            return np.ascontiguousarray(Cinv.T), lam / base
+            X = solve_triangular(C, np.eye(K), lower=True)      # C^-1, lower
+            Hinv = X.T @ X                                      # = A^-1, sym
+            Hinv = 0.5 * (Hinv + Hinv.T)
+            L = np.linalg.cholesky(Hinv)                        # LOWER
+            assert abs(L[0, -1]) == 0.0 and np.count_nonzero(
+                L[K // 2:, :K // 2]) > 0, "factor is not lower triangular"
+            return L, lam / base
         except np.linalg.LinAlgError:
             lam *= 2.0
     raise np.linalg.LinAlgError(f"no damping in {tries} tries made H SPD")
