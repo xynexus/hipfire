@@ -2639,6 +2639,43 @@ struct HfqInputFile {
 }
 
 impl HfqInputFile {
+    /// Fold a v2 container's tail metadata back over its front metadata.
+    ///
+    /// Returns the front unchanged if there is no tail, it is out of bounds, or
+    /// it does not parse — a malformed tail must not make a readable container
+    /// unreadable. Front keys win on collision: the front is what this build
+    /// wrote, the tail is carried provenance.
+    fn merge_tail_metadata(mmap: &[u8], front_json: &str) -> String {
+        let Ok(serde_json::Value::Object(mut front)) =
+            serde_json::from_str::<serde_json::Value>(front_json)
+        else {
+            return front_json.to_string();
+        };
+        let Some(tail) = front.get("tail_metadata").cloned() else {
+            return front_json.to_string();
+        };
+        let (Some(off), Some(size)) = (
+            tail.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize),
+            tail.get("size").and_then(|v| v.as_u64()).map(|v| v as usize),
+        ) else {
+            return front_json.to_string();
+        };
+        if off.saturating_add(size) > mmap.len() {
+            return front_json.to_string();
+        }
+        let Ok(blob) = serde_json::from_slice::<serde_json::Value>(&mmap[off..off + size]) else {
+            return front_json.to_string();
+        };
+        let Some(serde_json::Value::Object(carried)) = blob.get("metadata").cloned() else {
+            return front_json.to_string();
+        };
+        for (k, v) in carried {
+            front.entry(k).or_insert(v);
+        }
+        serde_json::to_string(&serde_json::Value::Object(front))
+            .unwrap_or_else(|_| front_json.to_string())
+    }
+
     fn open(path: &Path) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
@@ -2703,6 +2740,15 @@ impl HfqInputFile {
                 format!("HFQM metadata is not UTF-8: {e}"),
             )
         })?;
+        // Merge the TAIL back in. `split_front_tail_metadata` moves config,
+        // tokenizer, tokenizer_config, generation_config, gguf_meta and
+        // hfqm_modules out of the front and into the tail blob, so a front-only
+        // read loses every one of them. The requant pipeline seeds its output
+        // metadata from this string, so without the merge an hfq -> hfq requant
+        // silently emits an artifact with no config: it loads far enough to look
+        // fine, then dies in `config_from_hfq`, which returns None and panics the
+        // caller with no payload to explain why.
+        let metadata_json = Self::merge_tail_metadata(&mmap, &metadata_json);
 
         let mut pos = metadata_offset + json_end;
         if pos + 4 > data_offset {
@@ -14591,6 +14637,40 @@ mod tests {
             "model.hfq".to_string(),
         ];
         assert_eq!(format_arg(&args), DEFAULT_QUANT_FORMAT);
+    }
+
+    #[test]
+    fn tail_metadata_merges_back_over_the_front() {
+        // A v2 container keeps `config` only in the tail, so a front-only read
+        // yields metadata that parses fine and is missing the one key the
+        // runtime needs. Build a front + tail pair and check the merge.
+        let tail = serde_json::json!({
+            "format": "hipfire.hfq.tail.v1",
+            "metadata": {"config": {"model_type": "llama"}, "architecture": "tail-loses"},
+        });
+        let tail_bytes = serde_json::to_vec(&tail).unwrap();
+        let mut mmap = vec![0u8; 64];
+        let off = mmap.len();
+        mmap.extend_from_slice(&tail_bytes);
+        let front = serde_json::json!({
+            "architecture": "front-wins",
+            "tail_metadata": {"offset": off, "size": tail_bytes.len()},
+        })
+        .to_string();
+
+        let merged: serde_json::Value =
+            serde_json::from_str(&HfqInputFile::merge_tail_metadata(&mmap, &front)).unwrap();
+        assert_eq!(merged["config"]["model_type"], "llama");
+        // Front wins on collision — it describes THIS build; the tail is carried.
+        assert_eq!(merged["architecture"], "front-wins");
+
+        // A tail pointing past the end must not make a readable container fail.
+        let bad = serde_json::json!({
+            "architecture": "front-wins",
+            "tail_metadata": {"offset": 1_000_000, "size": 10},
+        })
+        .to_string();
+        assert_eq!(HfqInputFile::merge_tail_metadata(&mmap, &bad), bad);
     }
 
     #[test]
