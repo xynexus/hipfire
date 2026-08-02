@@ -85,17 +85,17 @@ the relevant docs under `docs/`.
   against the caller's own holder, and the failure names your own label as the
   blocker (`resource hip-gpu-0 ... is locked by <your label> ... mode=run`).
   Run it directly.
-- A `lock run` holder that dies leaves a stale record in
-  `~/.hipfire/locks/hip-gpu-0.lock` that no CLI command clears: `release`,
-  `release <label>` and `kill` all test whether the lock is HELD — it is not,
-  the flock died with the process — rather than whether the RECORD is stale, so
-  they report "no lock held" / "free — nothing to kill" and do nothing. Meanwhile
-  the daemon's acquire path honours the record and refuses to load, while
-  `lock status` reports "gpu is free" throughout. `HIPFIRE_RESOURCE_LOCK=0` does
-  not help; the daemon does not inherit the caller's environment. Until `lock
-  kill` is fixed to clear the record when it finds the recorded holder already
-  gone, recovery means emptying that file by hand — check the label is yours
-  first, so you cannot drop another agent's lock.
+- The lock itself is sound: `flock(2)` is kernel state and is released when its
+  holder dies, so a crashed job never wedges the lock. The daemon acquires with
+  a real `try_lock`, not by reading anything.
+- But the holder LINE in `~/.hipfire/locks/hip-gpu-0.lock` is file contents, not
+  kernel state, so it outlives its writer — and it is what the "is locked by
+  ..." message NAMES. A stale line therefore makes a genuine contention error
+  point at a long-dead pid, which is badly misleading when the real holder is
+  something else (a wrapper you started, a daemon that outlived its run).
+  `hipfire lock kill` now clears such a line when it can prove the writer is
+  gone; if you are staring at an error naming a pid that `ps` does not show,
+  run it and read the message again.
 
 ## Artifact Names
 
