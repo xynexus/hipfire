@@ -4472,7 +4472,10 @@ fn quantize_hfq_source_tensor(
             // int8 in the compact ~4 b/w layout (130 + 2*N_out B/group, qt=36).
             // Composes AWQ + LDLQ like the Oq4 arm.
             let m_dim = shape[0] as usize;
-            let w8_frac = OQPLUS_W8_FRAC.get().copied().unwrap_or(0.01);
+            let w8_frac = outliers_per_group_for(
+                name,
+                OQPLUS_W8_FRAC.get().copied().unwrap_or(0.01),
+            );
             // `--ldlq`: tiered GPTQ/OBS error-feedback (Hessian) → tiered int8
             // layout. Composes AWQ exactly like the Oq4 LDLQ arm (W·s offline +
             // rebase H' = diag(1/s) H diag(1/s) + x/s sidecar).
@@ -6266,6 +6269,45 @@ fn awq_scales_to_f16_bytes(scales: &[f32]) -> Vec<u8> {
 /// Whitelist (vs blacklist) is still the safe default: a new tensor name
 /// in a future arch fails closed (no AWQ) until someone confirms its
 /// runtime path is AWQ-aware.
+/// Per-layer outlier budget for the compact mixed format, from
+/// `HIPFIRE_OUTLIERS_BY_LAYER` — comma-separated `suffix:count` pairs where
+/// `count` is OUTLIERS PER 256-GROUP, e.g.
+/// `down_proj:7,o_proj:3,default:1`. Unset keeps the uniform budget the format
+/// string implies.
+///
+/// Uniform outliers are a poor fit for what the layers actually look like.
+/// Outliers are the only lever measured to move KLD (mixed precision bought 21%
+/// where AWQ-alpha and clip policy bought 0%), and the tails differ sharply by
+/// layer: `down_proj` consumes SwiGLU output and is the largest tensor
+/// (k=8192, ~28% of all quantised parameters), while `q`/`k`/`v` are mild. Spending
+/// the budget where the tail is buys KLD at the SAME average bit rate — which
+/// matters because the 15% bandwidth margin over q4nx is the point of the port.
+///
+/// The container already supports this: OqPlusCompact stores `N_out` implicitly
+/// in the block length (`130 + 2·N_out`), derived per tensor on read, so a
+/// per-layer budget needs no format change.
+fn outliers_per_group_for(name: &str, default_frac: f32) -> f32 {
+    let Ok(spec) = std::env::var("HIPFIRE_OUTLIERS_BY_LAYER") else {
+        return default_frac;
+    };
+    let mut fallback = default_frac;
+    let mut matched: Option<f32> = None;
+    for entry in spec.split(',') {
+        let Some((key, val)) = entry.split_once(':') else {
+            continue;
+        };
+        let (key, val) = (key.trim(), val.trim());
+        let Ok(n) = val.parse::<f32>() else { continue };
+        let frac = (n / 256.0).clamp(1.0 / 256.0, 62.0 / 256.0);
+        if key == "default" {
+            fallback = frac;
+        } else if name.contains(key) {
+            matched = Some(frac);
+        }
+    }
+    matched.unwrap_or(fallback)
+}
+
 fn awq_eligible(name: &str) -> bool {
     // F1-vs-F2 A/B gate. When `HIPFIRE_AWQ_F1_ONLY=1` is set, the F2
     // additions below (o_proj / wo / out_proj / down_proj / w_down)
