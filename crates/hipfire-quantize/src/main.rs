@@ -4643,7 +4643,7 @@ fn qtip_greedy_encode_gpu(
     hipfire_quantize::ldlq::rotate_hessian(&mut h, k, signs1, signs2);
     greedy_timing::add(&greedy_timing::ROTATE_MS, t.elapsed());
     let t = Instant::now();
-    let l = hipfire_quantize::ldlq::inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = hipfire_quantize::ldlq::inv_cholesky_lower_rotated_fast(&h, k, damp)?;
     greedy_timing::add(&greedy_timing::CHOL_MS, t.elapsed());
     drop(h);
 

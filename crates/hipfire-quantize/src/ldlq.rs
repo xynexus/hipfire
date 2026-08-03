@@ -73,6 +73,44 @@ pub fn rotate_hessian(h: &mut [f64], k: usize, signs1: &[f32], signs2: &[f32]) {
 }
 
 /// Lower Cholesky of (H_rot + lambda I)^-1. Exposed alongside rotate_hessian.
+/// Same contract as [`inv_cholesky_lower_rotated`], without the identity solve.
+///
+/// The original computes `(H+λI)⁻¹` as `chol.solve(Mat::identity(k, k))`, which
+/// materialises a k×k identity — 512 MB at k=8192, allocated per tensor PER
+/// damping retry — and costs ~k³ (k triangular solves). `DenseSolveCore::inverse`
+/// is the `potri` equivalent: it forms the inverse from the factor in ~k³/3 and
+/// allocates only the result. Total drops from ~1.67·k³ to ~k³.
+///
+/// The second factorization is NOT redundant and must stay: `L·Lᵀ = (H+λI)⁻¹`
+/// needs a LOWER factor of the inverse. `C⁻ᵀ` also satisfies `L·Lᵀ = A⁻¹` but is
+/// UPPER triangular, and substituting it silently degrades LDLQ to RTN while
+/// every residual check still passes — that cost 57 minutes earlier in this
+/// project, so the shape is asserted in the test rather than assumed.
+pub fn inv_cholesky_lower_rotated_fast(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
+    use faer::linalg::solvers::DenseSolveCore;
+    let base = damp.max(1e-12);
+    for mult in [1.0, 10.0, 100.0, 1000.0, 10000.0] {
+        let lambda = base * mult;
+        let hd = Mat::<f64>::from_fn(k, k, |i, j| {
+            h[i * k + j] + if i == j { lambda } else { 0.0 }
+        });
+        let Ok(chol) = hd.llt(Side::Lower) else {
+            continue;
+        };
+        let hinv = chol.inverse();
+        let Ok(chol2) = hinv.llt(Side::Lower) else {
+            continue;
+        };
+        return Some(chol2.L().to_owned());
+    }
+    None
+}
+
+/// REFERENCE implementation, kept as the equivalence oracle for
+/// [`inv_cholesky_lower_rotated_fast`], which is what callers use. Retained
+/// rather than deleted because a rewrite of this routine has already failed
+/// silently once — comparing the two outputs directly is the cheapest check that
+/// would have caught it.
 pub fn inv_cholesky_lower_rotated(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
     let base = damp.max(1e-12);
     for mult in [1.0, 10.0, 100.0, 1000.0, 10000.0] {
@@ -154,7 +192,7 @@ pub fn qtip_ldlq_dequant_bits(
     // Rotate the Hessian, then L with L·Lᵀ = (H_rot + λI)⁻¹.
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
 
     // Rotate the weights into the same domain.
     let nb = k / 256;
@@ -276,7 +314,7 @@ pub fn oq4_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
 
     let nb = k / 256;
     // FWHT-rotate weights into the same domain (this is the residual we feed).
@@ -399,7 +437,7 @@ pub fn oq3_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -519,7 +557,7 @@ pub fn oq2_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -630,7 +668,7 @@ pub fn oq8_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -744,7 +782,7 @@ pub fn oqplus_tiered_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -875,7 +913,7 @@ pub fn oqplus_compact_ldlq_pack(
 
     let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
     rotate_hessian(&mut h, k, signs1, signs2);
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
 
     let nb = k / 256;
     let mut residual = vec![0.0f64; m * k];
@@ -991,6 +1029,114 @@ pub fn oqplus_compact_ldlq_pack(
     }
 
     Some(out)
+}
+
+#[cfg(test)]
+mod chol_tests {
+    use super::*;
+
+    /// Build an ill-conditioned SPD matrix: a rank-deficient Gram plus a small
+    /// ridge, which is what a real Hessian looks like here and what makes the
+    /// damping-retry loop matter.
+    fn ill_conditioned(k: usize, ridge: f64) -> Vec<f64> {
+        let r = k / 4; // rank-deficient by construction
+        let mut a = vec![0.0f64; k * r];
+        for i in 0..k {
+            for j in 0..r {
+                a[i * r + j] = ((i * 7 + j * 13) % 23) as f64 / 23.0 - 0.5;
+            }
+        }
+        let mut h = vec![0.0f64; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let mut acc = 0.0;
+                for t in 0..r {
+                    acc += a[i * r + t] * a[j * r + t];
+                }
+                h[i * k + j] = acc + if i == j { ridge } else { 0.0 };
+            }
+        }
+        h
+    }
+
+    /// The identity-free variant must reproduce the original EXACTLY in shape and
+    /// to tight tolerance in value. Comparing the outputs directly is both
+    /// cheaper and stronger than comparing downstream KLD: a subtly wrong L could
+    /// move KLD by less than run-to-run noise and pass, whereas any deviation
+    /// shows up here.
+    #[test]
+    fn identity_free_inverse_cholesky_matches_the_original() {
+        for (k, ridge, damp) in [(256usize, 1e-3, 1e-2), (256, 1e-8, 1e-6)] {
+            let h = ill_conditioned(k, ridge);
+            let a = inv_cholesky_lower_rotated(&h, k, damp).expect("original");
+            let b = inv_cholesky_lower_rotated_fast(&h, k, damp).expect("fast");
+
+            // Shape first: LOWER triangular. C^-T also satisfies L·Lᵀ = A⁻¹ but is
+            // UPPER, and swapping it in degrades LDLQ to RTN with every residual
+            // check still passing.
+            let mut upper = 0.0f64;
+            for i in 0..k {
+                for j in (i + 1)..k {
+                    upper = upper.max(b[(i, j)].abs());
+                }
+            }
+            assert_eq!(upper, 0.0, "fast variant is not lower-triangular (k={k})");
+
+            let scale = (0..k).map(|i| a[(i, i)].abs()).fold(0.0f64, f64::max);
+            let mut worst = 0.0f64;
+            for i in 0..k {
+                for j in 0..=i {
+                    worst = worst.max((a[(i, j)] - b[(i, j)]).abs());
+                }
+            }
+            assert!(
+                worst / scale < 1e-9,
+                "fast variant differs by {worst} (rel {:.3e}, k={k}, ridge={ridge})",
+                worst / scale
+            );
+        }
+    }
+
+    /// Not a correctness test — a throughput probe. The greedy pipeline spends
+    /// ~400s of ~600s in this routine. MEASURED: faer already uses all 32 rayon
+    /// threads by default (Par::rayon(0) resolves to current_num_threads) and
+    /// setting it explicitly changes nothing, so the low rate is NOT a
+    /// misconfiguration — Cholesky just scales badly at these sizes, because the
+    /// panel factorization serialises. That is the argument for moving the
+    /// trailing SYRK to the GPU rather than tuning the CPU path.
+    #[test]
+    fn cholesky_throughput_probe() {
+        let k = 2048usize;
+        let h = ill_conditioned(k, 1e-3);
+        println!(
+            "  rayon threads={}  faer par={:?}",
+            rayon::current_num_threads(),
+            faer::get_global_parallelism()
+        );
+        let t = std::time::Instant::now();
+        let l = inv_cholesky_lower_rotated_fast(&h, k, 1e-2).expect("factorization");
+        let secs = t.elapsed().as_secs_f64();
+
+        // two Cholesky factorizations + one inverse, each ~k^3/3
+        let flops = 3.0 * (k as f64).powi(3) / 3.0;
+        println!(
+            "  k={k}  {:.3}s  {:.1} GFLOP/s  (one AVX-512 core is ~20-50)",
+            secs,
+            flops / secs / 1e9
+        );
+        assert_eq!(l.nrows(), k);
+    }
+
+    /// Both variants must agree that a hopeless matrix is hopeless — the retry
+    /// loop is where a rewrite most easily diverges, because it picks a different
+    /// lambda on each pass.
+    #[test]
+    fn both_variants_agree_on_breakdown() {
+        let k = 64usize;
+        let h = vec![f64::NAN; k * k];
+        assert!(inv_cholesky_lower_rotated(&h, k, 1e-6).is_none());
+        assert!(inv_cholesky_lower_rotated_fast(&h, k, 1e-6).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1443,7 +1589,7 @@ pub fn qtip_conditioned_encode(
         return Some((symbols, rotated.to_vec()));
     }
 
-    let l = inv_cholesky_lower_rotated(&h, k, damp)?;
+    let l = inv_cholesky_lower_rotated_fast(&h, k, damp)?;
     drop(h);
     let nb = k / 256;
     let mut residual: Vec<f64> = rotated.iter().map(|&w| w as f64).collect();
