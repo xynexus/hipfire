@@ -27,6 +27,8 @@ hipfire-arch-zaya = { path = "../hipfire-arch-zaya" }
 hipfire-primitives = { path = "../hipfire-primitives" }
 twox-hash = { version = "2", default-features = false, features = ["xxhash3_64", "alloc"] }
 hipfire-hash = { path = "../hipfire-hash" }
+hipfire-hub = { path = "../hipfire-hub" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
 hipfire-lock = { path = "../hipfire-lock" }
 serde.workspace = true
 serde_json = "1"
