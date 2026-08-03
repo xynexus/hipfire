@@ -3989,6 +3989,15 @@ fn quantize_hfq_source_tensor(
     })?;
     let f32_data = hfq_source_to_f32(name, src_qt, raw)?;
 
+    // Per-layer clip policy. symmetric_clipsearch has no idea which tensor it is
+    // quantising, so this is the only place the name is still in scope. See
+    // codecs::CLIP_DISABLED for why down_proj / o_proj are the layers that want
+    // it off.
+    hipfire_quantize::codecs::CLIP_DISABLED.store(
+        hipfire_quantize::codecs::clip_disabled_for(name),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     if format == HfqInputFormat::Bf16 {
         let (data, qt, label) = source_precision_tensor_bytes(raw, src_dtype, &f32_data);
         return Ok((data, qt, 0, label));

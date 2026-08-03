@@ -469,10 +469,51 @@ fn affine_clipsearch(group: &[f32], levels: f32) -> (f32, f32) {
     (best_lo, if best_scale > 0.0 { best_scale } else { 1.0 })
 }
 
+/// When set, [`symmetric_clipsearch`] returns the unclipped scale (`amax/qmax`)
+/// instead of searching the grid.
+///
+/// A GLOBAL, not a thread_local. The LDLQ paths call clipsearch from inside
+/// `par_chunks` closures, so a thread_local set on the caller's thread is
+/// invisible to every rayon worker that does the actual work — the first version
+/// of this produced results BIT-IDENTICAL to the unmodified baseline, which is
+/// the only reason it was caught. Quantization processes one tensor at a time, so
+/// a global is safe here.
+///
+/// Clipping is otherwise applied uniformly to every group of every tensor, with
+/// no notion of which layer it is quantising. That is wrong for the layers whose
+/// outliers carry signal — `down_proj` consumes SwiGLU output, `o_proj` the
+/// attention mixture — and the code already concedes those two are different:
+/// `awq_eligible` puts them in a separate "F2" tier with `HIPFIRE_AWQ_F1_ONLY`
+/// to A/B it. Clipping never got the same treatment.
+///
+/// The objective is mismatched too: the grid minimises UNWEIGHTED squared error
+/// inside the group, and reconstruction error has repeatedly failed to predict
+/// output quality on this model.
+pub static CLIP_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+
+/// Per-tensor clip policy: `true` when this tensor should NOT be clip-searched.
+/// Controlled by `HIPFIRE_NO_CLIP_LAYERS` — a comma-separated list of suffixes,
+/// e.g. `down_proj,o_proj`. Unset keeps the historical uniform behaviour.
+pub fn clip_disabled_for(name: &str) -> bool {
+    let Ok(list) = std::env::var("HIPFIRE_NO_CLIP_LAYERS") else {
+        return false;
+    };
+    list.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .any(|suffix| name.contains(suffix))
+}
+
 /// MSE-optimal symmetric clip of a signed-int scale. `qmax` = 2^(bits−1) − 1.
 /// Returns the scale for dequant `q·scale`. For the symmetric mqN+ codecs (MQ8).
 pub fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
     const CLIP_GRID: [f32; 9] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6];
+    if CLIP_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        let amax = group.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        return (amax / qmax).max(1e-12);
+    }
     let amax = group.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     let (mut best_scale, mut best_err) = (amax / qmax, f32::INFINITY);
     for &c in &CLIP_GRID {
