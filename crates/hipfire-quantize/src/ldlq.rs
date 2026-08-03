@@ -32,34 +32,48 @@ pub fn inv_cholesky_lower(h_rowmajor: &[f32], k: usize, damp: f64) -> Option<Mat
 /// (`crate::cpu_fwht_256`). Row-pass then column-pass (same R both sides),
 /// putting H in the same incoherent domain as the FWHT-rotated weights so the
 /// OBS feedback is consistent.
-fn rotate_hessian(h: &mut [f64], k: usize, signs1: &[f32], signs2: &[f32]) {
-    let nb = k / 256;
-    let mut buf = [0.0f32; 256];
-    for r in 0..k {
-        for b in 0..nb {
-            for c in 0..256 {
-                buf[c] = h[r * k + b * 256 + c] as f32;
+/// Rotate a [k, k] Hessian into the FWHT frame the trellis sees. Exposed so the
+/// GPU-resident conditioning path can build L without duplicating this.
+pub fn rotate_hessian(h: &mut [f64], k: usize, signs1: &[f32], signs2: &[f32]) {
+    use rayon::prelude::*;
+    // Rows are independent, so this pass parallelizes directly.
+    let rows_pass = |h: &mut [f64]| {
+        let nb = k / 256;
+        h.par_chunks_mut(k).for_each(|row| {
+            let mut buf = [0.0f32; 256];
+            for b in 0..nb {
+                for c in 0..256 {
+                    buf[c] = row[b * 256 + c] as f32;
+                }
+                crate::cpu_fwht_256(&mut buf, signs1, signs2);
+                for c in 0..256 {
+                    row[b * 256 + c] = buf[c] as f64;
+                }
             }
-            crate::cpu_fwht_256(&mut buf, signs1, signs2);
-            for c in 0..256 {
-                h[r * k + b * 256 + c] = buf[c] as f64;
+        });
+    };
+    // The column pass is the row pass on the transpose. Transposing twice costs
+    // two O(k²) copies but buys the same parallelism, whereas striding down
+    // columns of a `&mut [f64]` cannot be split by rayon without unsafe.
+    //
+    // Measured at 23% of greedy conditioning's wall-time (119.0s of 514s) while
+    // fully SERIAL — the single cheapest speedup left in this path.
+    let transpose = |src: &[f64], dst: &mut [f64]| {
+        dst.par_chunks_mut(k).enumerate().for_each(|(i, drow)| {
+            for (j, v) in drow.iter_mut().enumerate() {
+                *v = src[j * k + i];
             }
-        }
-    }
-    for col in 0..k {
-        for b in 0..nb {
-            for r in 0..256 {
-                buf[r] = h[(b * 256 + r) * k + col] as f32;
-            }
-            crate::cpu_fwht_256(&mut buf, signs1, signs2);
-            for r in 0..256 {
-                h[(b * 256 + r) * k + col] = buf[r] as f64;
-            }
-        }
-    }
+        });
+    };
+    rows_pass(h);
+    let mut t = vec![0.0f64; k * k];
+    transpose(h, &mut t);
+    rows_pass(&mut t);
+    transpose(&t, h);
 }
 
-fn inv_cholesky_lower_rotated(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
+/// Lower Cholesky of (H_rot + lambda I)^-1. Exposed alongside rotate_hessian.
+pub fn inv_cholesky_lower_rotated(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
     let base = damp.max(1e-12);
     for mult in [1.0, 10.0, 100.0, 1000.0, 10000.0] {
         let lambda = base * mult;
@@ -977,6 +991,69 @@ pub fn oqplus_compact_ldlq_pack(
     }
 
     Some(out)
+}
+
+#[cfg(test)]
+mod rotate_tests {
+    use super::*;
+
+    /// The parallel rotate_hessian does the column pass as `transpose ->
+    /// row-pass -> transpose`. That is only valid if it reproduces the original
+    /// serial row-then-column loops EXACTLY — a silently different rotation
+    /// would put H in a frame the trellis does not see, and would surface as a
+    /// quality regression rather than an error.
+    fn rotate_hessian_serial(h: &mut [f64], k: usize, s1: &[f32], s2: &[f32]) {
+        let nb = k / 256;
+        let mut buf = [0.0f32; 256];
+        for r in 0..k {
+            for b in 0..nb {
+                for c in 0..256 {
+                    buf[c] = h[r * k + b * 256 + c] as f32;
+                }
+                crate::cpu_fwht_256(&mut buf, s1, s2);
+                for c in 0..256 {
+                    h[r * k + b * 256 + c] = buf[c] as f64;
+                }
+            }
+        }
+        for col in 0..k {
+            for b in 0..nb {
+                for r in 0..256 {
+                    buf[r] = h[(b * 256 + r) * k + col] as f32;
+                }
+                crate::cpu_fwht_256(&mut buf, s1, s2);
+                for r in 0..256 {
+                    h[(b * 256 + r) * k + col] = buf[r] as f64;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_rotate_hessian_matches_the_serial_loops() {
+        let k = 512usize; // two 256-blocks, so both passes cross a block boundary
+        let s1 = crate::gen_fwht_signs(42, 256);
+        let s2 = crate::gen_fwht_signs(1042, 256);
+        // Symmetric, non-trivial, and not separable across blocks.
+        let mut h = vec![0.0f64; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let v = ((i * 31 + j * 17) % 97) as f64 / 97.0 + if i == j { 3.0 } else { 0.0 };
+                h[i * k + j] = v;
+                h[j * k + i] = v;
+            }
+        }
+        let mut a = h.clone();
+        let mut b = h;
+        rotate_hessian(&mut a, k, &s1, &s2);
+        rotate_hessian_serial(&mut b, k, &s1, &s2);
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f64, f64::max);
+        assert!(worst == 0.0, "parallel rotation differs by {worst}");
+    }
 }
 
 #[cfg(test)]

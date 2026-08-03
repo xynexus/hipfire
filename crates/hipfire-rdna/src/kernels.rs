@@ -254,6 +254,11 @@ pub const GEMV_QTIP4G256_SRC: &str = include_str!("../../../kernels/src/gemv_qti
 /// [`GEMV_QTIP3G256I3_SRC`]: the encoder minimises error against the codebook it
 /// bakes, so an encoder/decoder codebook mismatch yields weights optimal for a
 /// function the decoder never evaluates.
+/// OBS error propagation for block-sequential QTIP conditioning: the rank-256
+/// update that feeds a finished block's error forward to all later columns.
+/// Strided destination, hence its own kernel rather than the general GEMM.
+pub const QTIP_OBS_PROPAGATE_SRC: &str =
+    include_str!("../../../kernels/src/qtip_obs_propagate.hip");
 pub const QTIP_VITERBI_ENCODE_I3_SRC: &str =
     include_str!("../../../kernels/src/qtip_viterbi_encode_i3.hip");
 pub const QTIP_VITERBI_ENCODE_SRC: &str =

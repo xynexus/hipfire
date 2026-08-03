@@ -4575,6 +4575,163 @@ fn cpu_encode_symbols(
 /// Groups are chunked so the per-group Viterbi backpointer scratch (256×4096 B)
 /// stays bounded; the scratch buffer is allocated once and reused across chunks.
 #[cfg(feature = "gpu")]
+/// Where the greedy conditioning wall-time actually goes. Two FLOP-count
+/// predictions about this were wrong (the 512 MB scratch churn, then the
+/// O(m·k²) propagation — together worth 8%), so it is measured now instead.
+#[cfg(feature = "gpu")]
+mod greedy_timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static ROTATE_MS: AtomicU64 = AtomicU64::new(0);
+    pub static CHOL_MS: AtomicU64 = AtomicU64::new(0);
+    pub static UPLOAD_MS: AtomicU64 = AtomicU64::new(0);
+    pub static GATHER_MS: AtomicU64 = AtomicU64::new(0);
+    pub static ENCODE_MS: AtomicU64 = AtomicU64::new(0);
+    pub static ERR_MS: AtomicU64 = AtomicU64::new(0);
+    pub static PROP_MS: AtomicU64 = AtomicU64::new(0);
+    pub fn add(c: &AtomicU64, d: std::time::Duration) {
+        c.fetch_add(d.as_millis() as u64, Ordering::Relaxed);
+    }
+    pub fn report() -> String {
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1000.0;
+        format!(
+            "rotate_H {:.1}s  cholesky {:.1}s  upload {:.1}s  gather {:.1}s  \
+             encode {:.1}s  err {:.1}s  propagate {:.1}s",
+            g(&ROTATE_MS), g(&CHOL_MS), g(&UPLOAD_MS), g(&GATHER_MS),
+            g(&ENCODE_MS), g(&ERR_MS), g(&PROP_MS)
+        )
+    }
+}
+
+/// Greedy OBS conditioning with the residual kept DEVICE-RESIDENT across blocks.
+///
+/// The CPU version in `ldlq::qtip_conditioned_encode` holds `residual` as a host
+/// `Vec<f64>` and, after every block, walks `residual[f] -= err[c] * L[f, c]` for
+/// all later columns — O(m·k²/2) f64 ops per tensor, ~6.9e10 at m=2048, k=8192,
+/// and the dominant cost of `greedy`. That update is a rank-256 GEMM, so it
+/// belongs on the GPU; once it is there the residual never needs to come back to
+/// the host at all, and the per-block transfers go with it.
+///
+/// Per block only ~2 MB moves each way (the gathered block out, `err` back in)
+/// instead of the whole residual. `L` is uploaded once per tensor.
+///
+/// Returns `(symbols, targets)` with the same contract as the CPU path:
+/// `targets` is the residual-adjusted value each symbol actually represents, so
+/// the caller must refit scales against it and not against the original weights.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn qtip_greedy_encode_gpu(
+    gpu: &mut hipfire_rdna::Gpu,
+    rotated: &[f32],
+    m: usize,
+    k: usize,
+    h_rowmajor_f32: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+    damp: f64,
+    cb: &[f32],
+    bits: u32,
+    scratch: &mut Option<QtipEncodeScratch>,
+) -> Option<(Vec<u8>, Vec<f32>)> {
+    use hipfire_rdna::DType;
+    use rayon::prelude::*;
+    assert_eq!(rotated.len(), m * k);
+    assert_eq!(k % 256, 0);
+
+    use std::time::Instant;
+    let t = Instant::now();
+    let mut h: Vec<f64> = h_rowmajor_f32.iter().map(|&v| v as f64).collect();
+    hipfire_quantize::ldlq::rotate_hessian(&mut h, k, signs1, signs2);
+    greedy_timing::add(&greedy_timing::ROTATE_MS, t.elapsed());
+    let t = Instant::now();
+    let l = hipfire_quantize::ldlq::inv_cholesky_lower_rotated(&h, k, damp)?;
+    greedy_timing::add(&greedy_timing::CHOL_MS, t.elapsed());
+    drop(h);
+
+    // L as f32 [k, k] row-major, uploaded once. The kernel reads L[f, c0+c].
+    let mut lflat = vec![0.0f32; k * k];
+    lflat
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(f, row)| {
+            for (c, v) in row.iter_mut().enumerate() {
+                *v = l[(f, c)] as f32;
+            }
+        });
+    let t = Instant::now();
+    let l_dev = gpu.upload_raw(&f32_slice_to_le_bytes(&lflat), &[k, k]).ok()?;
+    drop(lflat);
+    let res_dev = gpu
+        .upload_raw(&f32_slice_to_le_bytes(rotated), &[m, k])
+        .ok()?;
+    greedy_timing::add(&greedy_timing::UPLOAD_MS, t.elapsed());
+    let blk_dev = gpu.alloc_tensor(&[m * 256], DType::F32).ok()?;
+
+    let nb = k / 256;
+    let mut symbols = vec![0u8; m * k];
+    let mut targets = vec![0.0f32; m * k];
+
+    for blk in 0..nb {
+        let c0 = blk * 256;
+        let c1 = c0 + 256;
+        let t = Instant::now();
+        gpu.qtip_gather_block(&res_dev, &blk_dev, m, k, c0).ok()?;
+        gpu.device_synchronize().ok()?;
+        let block: Vec<f32> = gpu.download_f32(&blk_dev).ok()?;
+        greedy_timing::add(&greedy_timing::GATHER_MS, t.elapsed());
+
+        let t = Instant::now();
+        let sym_flat = gpu_encode_symbols_scratch(gpu, &block, m, bits, scratch).ok()?;
+        greedy_timing::add(&greedy_timing::ENCODE_MS, t.elapsed());
+        let t = Instant::now();
+
+        // Per row: refit the scale against what was encoded, then the error that
+        // reconstruction leaves, divided by L[c,c] as OBS prescribes.
+        let mut err_flat = vec![0.0f32; m * 256];
+        err_flat
+            .par_chunks_mut(256)
+            .enumerate()
+            .for_each(|(row, erow)| {
+                let grp = &block[row * 256..row * 256 + 256];
+                let sym = &sym_flat[row * 256..row * 256 + 256];
+                let scale = crate::qtip::optimal_scale_bits(grp, sym, cb, bits);
+                let deq = crate::qtip::decode_group_bits(sym, scale, cb, bits);
+                for c in 0..256 {
+                    let lcc = l[(c0 + c, c0 + c)];
+                    erow[c] = if lcc > 0.0 {
+                        ((grp[c] as f64 - deq[c] as f64) / lcc) as f32
+                    } else {
+                        0.0
+                    };
+                }
+            });
+
+        greedy_timing::add(&greedy_timing::ERR_MS, t.elapsed());
+        for row in 0..m {
+            symbols[row * k + c0..row * k + c1]
+                .copy_from_slice(&sym_flat[row * 256..row * 256 + 256]);
+            targets[row * k + c0..row * k + c1]
+                .copy_from_slice(&block[row * 256..row * 256 + 256]);
+        }
+
+        if c1 < k {
+            // No upload-into-existing API, so this is a fresh 2 MB tensor per
+            // block — negligible next to the 512 MB per-block churn removed from
+            // the encoder scratch.
+            let t = Instant::now();
+            let err_dev = gpu.upload_f32(&err_flat, &[m, 256]).ok()?;
+            gpu.qtip_obs_propagate(&res_dev, &err_dev, &l_dev, m, k, c0, c1)
+                .ok()?;
+            gpu.device_synchronize().ok()?;
+            greedy_timing::add(&greedy_timing::PROP_MS, t.elapsed());
+        }
+    }
+    Some((symbols, targets))
+}
+
+fn f32_slice_to_le_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
 /// Reusable GPU scratch for the trellis encode. The backpointer buffer is
 /// `chunk × 256 × 256 × 2` F32 = 512 MB at the default chunk, and its contents
 /// are written before use every time, so there is no reason to allocate it more
@@ -4904,8 +5061,17 @@ fn pack_qtip_real_tensors(
         // so its symbols differ (better) — a valid, self-consistent .hfq either way.
         let _t_enc = Instant::now();
         let ng = m * groups;
+        // When a conditioning mode is active its encode REPLACES these symbols
+        // wholesale, so computing them first is pure waste — and worse than
+        // waste: with the GPU handed to the conditioning path, this fell back to
+        // the CPU beam (the "~1h/1B @ 25 cores" path) for every tensor after the
+        // first, which was 3435s of a 3482s encode phase.
+        let skip_plain = cond_mode.is_some();
         #[cfg(feature = "gpu")]
-        let symbols: Vec<u8> = match gpu.as_mut() {
+        let symbols: Vec<u8> = if skip_plain {
+            Vec::new()
+        } else {
+            match gpu.as_mut() {
             Some(g) => match gpu_encode_symbols(g, &rotated, ng, bits) {
                 Ok(s) => s,
                 Err(e) => {
@@ -4918,9 +5084,14 @@ fn pack_qtip_real_tensors(
                 }
             },
             None => cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits),
+            }
         };
         #[cfg(not(feature = "gpu"))]
-        let symbols: Vec<u8> = cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits);
+        let symbols: Vec<u8> = if skip_plain {
+            Vec::new()
+        } else {
+            cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits)
+        };
         // Conditioned encode (qtip3++ candidates) replaces the plain symbols when
         // a mode is set AND this tensor has a Hessian. `enc_target` is what the
         // symbols represent: the rotated weights for the unconditioned and
@@ -4940,6 +5111,9 @@ fn pack_qtip_real_tensors(
                 // encoder matters more than the conditioning, so this pairing is
                 // the one worth shipping. BeamLdlq cannot delegate — its feedback
                 // is inside the beam — and falls through to the CPU path.
+                // BORROW the device for this tensor and hand it back below.
+                // `gpu.take()` left the outer Option None from the second tensor
+                // on, silently demoting every later encode to the CPU beam.
                 #[cfg(feature = "gpu")]
                 let gpu_cell = std::cell::RefCell::new(gpu.take());
                 // One scratch for every block of this tensor — see
@@ -4971,10 +5145,45 @@ fn pack_qtip_real_tensors(
                     };
                 #[cfg(not(feature = "gpu"))]
                 let gpu_block: Option<Box<dyn Fn(&[f32], usize) -> Vec<u8>>> = None;
-                match hipfire_quantize::ldlq::qtip_conditioned_encode(
-                    &rotated, m, k, &h, qtip_s1, qtip_s2, damp, qtip_cb, beam, bits, mode,
-                    gpu_block.as_deref(),
-                ) {
+                // Greedy with a GPU present takes the device-resident path: the
+                // residual stays on-device and the O(m·k²/2) OBS propagation runs
+                // as a kernel instead of on the host. Every other mode, and the
+                // no-GPU case, uses the host implementation.
+                #[cfg(feature = "gpu")]
+                let device_resident = mode == hipfire_quantize::ldlq::QtipCondMode::Greedy
+                    && gpu_cell.borrow().is_some();
+                #[cfg(not(feature = "gpu"))]
+                let device_resident = false;
+                if device_resident && n_cond == 0 {
+                    eprintln!(
+                        "  qtip{bits} (real): greedy OBS with DEVICE-RESIDENT residual \
+                         (propagation on GPU)"
+                    );
+                } else if !device_resident && n_cond == 0 {
+                    eprintln!("  qtip{bits} (real): {mode:?} conditioning on the HOST");
+                }
+                let encoded = if device_resident {
+                    #[cfg(feature = "gpu")]
+                    {
+                        let mut guard = gpu_cell.borrow_mut();
+                        let mut sc = enc_scratch.borrow_mut();
+                        let g = guard.as_mut().expect("checked above");
+                        qtip_greedy_encode_gpu(
+                            g, &rotated, m, k, &h, qtip_s1, qtip_s2, damp, qtip_cb, bits,
+                            &mut sc,
+                        )
+                    }
+                    #[cfg(not(feature = "gpu"))]
+                    {
+                        None
+                    }
+                } else {
+                    hipfire_quantize::ldlq::qtip_conditioned_encode(
+                        &rotated, m, k, &h, qtip_s1, qtip_s2, damp, qtip_cb, beam, bits, mode,
+                        gpu_block.as_deref(),
+                    )
+                };
+                match encoded {
                     Some((sym, tgt)) => {
                         symbols = sym;
                         enc_target = Some(tgt);
@@ -4985,7 +5194,39 @@ fn pack_qtip_real_tensors(
                         t.name
                     ),
                 }
+                // Give the device back. Without this the next tensor sees None and
+                // silently drops to the CPU beam.
+                #[cfg(feature = "gpu")]
+                {
+                    // The block-encoder closure borrows gpu_cell; it has served
+                    // its purpose for this tensor.
+                    drop(gpu_block);
+                    gpu = gpu_cell.into_inner();
+                }
             }
+        }
+        // A conditioning mode that produced nothing leaves `symbols` empty (the
+        // plain encode was skipped); fall back rather than pack a zero-length
+        // tensor.
+        #[allow(unused_mut)]
+        let mut symbols = symbols;
+        if symbols.is_empty() {
+            symbols = {
+                #[cfg(feature = "gpu")]
+                {
+                    match gpu.as_mut() {
+                        Some(g) => gpu_encode_symbols(g, &rotated, ng, bits)
+                            .unwrap_or_else(|_| {
+                                cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits)
+                            }),
+                        None => cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits),
+                    }
+                }
+                #[cfg(not(feature = "gpu"))]
+                {
+                    cpu_encode_symbols(&rotated, ng, qtip_cb, beam, bits)
+                }
+            };
         }
         let rotated = enc_target.unwrap_or(rotated);
         t_enc += _t_enc.elapsed();
@@ -5093,6 +5334,8 @@ fn pack_qtip_real_tensors(
     }
     if let Some(mode) = cond_mode {
         eprintln!("  qtip{bits} (real): {mode:?} conditioning applied to {n_cond} tensors");
+        #[cfg(feature = "gpu")]
+        eprintln!("  qtip{bits} (real): greedy breakdown — {}", greedy_timing::report());
         if n_cond == 0 && n_packed > 0 {
             // Refuse to ship an artifact that silently ignored the conditioning it
             // was asked for. Byte-identical to the unconditioned build, it would

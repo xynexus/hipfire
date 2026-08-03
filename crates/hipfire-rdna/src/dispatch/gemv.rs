@@ -1871,6 +1871,70 @@ impl Gpu {
             &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val],
         )
     }
+    /// OBS error propagation: `residual[r, f] -= sum_c err[r, c] * L[f, c0+c]`
+    /// for every `f >= c1`. `residual` is `[m, k]` f32 row-major and updated in
+    /// place, so it can stay device-resident across every block of a tensor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qtip_obs_propagate(
+        &mut self,
+        residual: &GpuTensor,
+        err: &GpuTensor,
+        l: &GpuTensor,
+        m: usize,
+        k: usize,
+        c0: usize,
+        c1: usize,
+    ) -> HipResult<()> {
+        if c1 >= k {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qtip_obs_propagate",
+            kernels::QTIP_OBS_PROPAGATE_SRC,
+            "qtip_obs_propagate",
+        )?;
+        let r_ptr = residual.buf.as_ptr();
+        let e_ptr = err.buf.as_ptr();
+        let l_ptr = l.buf.as_ptr();
+        let (mi, ki, c0i, c1i) = (m as i32, k as i32, c0 as i32, c1 as i32);
+        let cols = k - c1;
+        let gx = cols.div_ceil(256) as u32;
+        self.launch_kernargs(
+            "qtip_obs_propagate",
+            [gx, m as u32, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr r_ptr, ptr e_ptr, ptr l_ptr, i32 mi, i32 ki, i32 c0i, i32 c1i],
+        )
+    }
+    /// Gather block `[c0, c0+256)` from a device-resident `[m, k]` residual into
+    /// a contiguous `[m, 256]` buffer for the trellis encoder.
+    pub fn qtip_gather_block(
+        &mut self,
+        residual: &GpuTensor,
+        out: &GpuTensor,
+        m: usize,
+        k: usize,
+        c0: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qtip_gather_block",
+            kernels::QTIP_OBS_PROPAGATE_SRC,
+            "qtip_gather_block",
+        )?;
+        let r_ptr = residual.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let (mi, ki, c0i) = (m as i32, k as i32, c0 as i32);
+        self.launch_kernargs(
+            "qtip_gather_block",
+            [m as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &kernargs![ptr r_ptr, ptr o_ptr, i32 mi, i32 ki, i32 c0i],
+        )
+    }
     /// QTIP-3 GEMV, 3INST codebook (`Qtip3G256I3`). Byte-identical contract to
     /// [`Self::gemv_qtip3g256`] — same layout, same pre-rotated x — decoded with
     /// the 3INST map instead of 1MAD.
