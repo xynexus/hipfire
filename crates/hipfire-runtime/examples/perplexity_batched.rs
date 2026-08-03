@@ -304,6 +304,17 @@ fn main() {
                 p99,
                 cs.len()
             );
+            // In chunk order (not sorted) so two runs can be compared PAIRWISE.
+            // min/max alone only show the distribution shifted; a per-chunk win
+            // needs the same window on both sides.
+            println!(
+                "  per-chunk KLD (in order): {}",
+                chunk_klds
+                    .iter()
+                    .map(|v| format!("{v:.6}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
         }
     }
     if let Some(path) = dump_ref {

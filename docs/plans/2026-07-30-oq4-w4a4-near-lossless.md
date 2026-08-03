@@ -1417,3 +1417,43 @@ shipped as default should be 128, not 64 — 64 would strand a wave64 port.
 - Still untouched from the original ranking: ConQuR R₁/R₂ rotation, ResQ ⅛→1/32
   subspace proper, SVDQuant, LO-BCQ. **The cheap levers are not exhausted** —
   two more were found and measured today, both bigger than expected.
+
+### 13g. 16-chunk confirmation of A4 + clip + group 128 — PASS (2026-08-03)
+
+House-rule run: 16 independent ctx-512 windows (8048 scored positions), fresh
+KV+DeltaNet per chunk, KLD vs a full-A16 batched reference generated in the same
+session. Corpus is the **wikitext2 slice**, not §9c–§9f's calib-1m, so absolute
+values are not comparable across sections — every comparison below is paired
+within this run.
+
+| variant | KLD/tok | PPL | per-chunk min / max |
+|---|---|---|---|
+| A16 reference (self-check) | **0.000000** | 24.83 | 0 / 0 |
+| current mix (qkv-A8 + rest-A4) | 0.063187 | 26.07 | 0.05225 / 0.08323 |
+| A4 + clip (previous ship config) | 0.058339 | 25.65 | 0.04952 / **0.08374** |
+| **A4 + clip + act group 128** | **0.056399** | **25.64** | **0.04713 / 0.07846** |
+| A4 plain | 0.070489 | 26.32 | 0.06155 / 0.09980 |
+
+Per-chunk KLDs were dumped in chunk order (new `per-chunk KLD (in order)` line)
+so the three configs could be compared **pairwise on the same windows** rather
+than by min/max, which only shows a distribution shift:
+
+| comparison | chunks won | mean Δ KLD | paired t | worst chunk |
+|---|---|---|---|---|
+| clip vs mix | 15/16 | −0.00485 | −5.42 | 0.08323 → **0.08374 (worse)** |
+| **clip+g128 vs mix** | **14/16** | **−0.00679** | **−6.32** | 0.08323 → **0.07846 (better)** |
+| clip+g128 vs clip | 12/16 | −0.00194 | −2.39 | 0.08374 → 0.07846 |
+
+**Verdict: PASS, and the group lever is what makes the promotion safe.** clip
+alone wins on aggregate and on 15/16 windows but is *slightly worse than the
+incumbent on the hardest chunk* (0.08374 vs 0.08323) — an aggregate win with a
+tail regression. Adding group 128 turns that around: −10.7% KLD, −0.44 PPL, and
+the worst chunk improves by 5.7%. That is the stronger claim, and it is the one
+that should gate a default flip.
+
+The incremental clip+g128-over-clip is real but modest (t = −2.39, 12/16) — the
+group lever's value here is disproportionately in the tail, not the mean.
+
+Scope unchanged from §13: one small hybrid model, one corpus, gfx1103. The
+throughput cost stands at ~−9% prefill vs the incumbent (§13c). Ship size is
+**128, not 64** — 64 is not wave64-portable (§13d).
