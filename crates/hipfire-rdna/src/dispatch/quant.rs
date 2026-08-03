@@ -717,6 +717,106 @@ impl Gpu {
         }
     }
 
+    /// Batched W8A8 (Opus oq8) GEMM for prefill: int8-quantize the FWHT-rotated
+    /// activation `x_rot` [N×K] once into the shared batched scratch, then the
+    /// grouped int8 WMMA GEMM into `y` [N×M]. The oq8 counterpart of
+    /// [`Self::gemm_oq4_grouped_act_batched`]; `group` is fixed at 256 (oq8
+    /// codec). Same rotate-then-quantize-then-GEMM sequence that
+    /// `weight_gemm`'s `DType::Oq8G256` arm already uses, hoisted here so the
+    /// arch prefill sites can reach it without per-call scratch alloc/free.
+    pub fn gemm_oq8_grouped_act_batched(
+        &mut self,
+        w_combined: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.quantize_act_oq8_batched(x_rot, m, k, n)?;
+        self.gemm_oq8_grouped_prequant(w_combined, y, m, k, n)
+    }
+
+    /// Quantize the rotated activation into the shared oq8 batched scratch.
+    /// Split out from [`Self::gemm_oq8_grouped_act_batched`] so a multi-projection
+    /// site (qkvza, gate+up) can quantize ONCE and then issue one
+    /// [`Self::gemm_oq8_grouped_prequant`] per projection — the oq8 analogue of
+    /// what the fused oq4 kernels do internally.
+    pub fn quantize_act_oq8_batched(
+        &mut self,
+        x_rot: &GpuTensor,
+        m_max: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        const GROUP: usize = 256;
+        self.ensure_oq8_scratch_batched(n, k, m_max)?;
+        let ng = k / GROUP;
+        let xq = GpuTensor {
+            buf: unsafe { self.oq8_xq_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * k],
+            dtype: DType::Raw,
+        };
+        let xs = GpuTensor {
+            buf: unsafe { self.oq8_xs_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * ng],
+            dtype: DType::F32,
+        };
+        self.quantize_act_oq8(x_rot, &xq, &xs, n, k, GROUP)
+    }
+
+    /// One grouped int8-WMMA GEMM against the activation already quantized into
+    /// the oq8 scratch by [`Self::quantize_act_oq8_batched`]. The caller must have
+    /// quantized with the SAME `n`/`k` — the scratch is only grown, never shrunk,
+    /// so a later call with a larger `m` cannot invalidate the quantized data.
+    pub fn gemm_oq8_grouped_prequant(
+        &mut self,
+        w_combined: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        const GROUP: usize = 256;
+        self.ensure_oq8_scratch_batched(n, k, m)?;
+        let ng = k / GROUP;
+        let xq = GpuTensor {
+            buf: unsafe { self.oq8_xq_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * k],
+            dtype: DType::Raw,
+        };
+        let xs = GpuTensor {
+            buf: unsafe { self.oq8_xs_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * ng],
+            dtype: DType::F32,
+        };
+        let ws = w_combined.sub_offset(m * k, m * ng * 4);
+        self.gemm_oq8_grouped_wmma(w_combined, &ws, &xq, &xs, y, m, k, n, GROUP)
+    }
+
+    /// Batched W8A8 oq8 GEMM with residual add: `residual[N×M] += W·x_rot`.
+    /// GEMMs into the persistent batched f32 scratch then one elementwise add —
+    /// there is no fused oq8 residual kernel, mirroring the oq4 arm.
+    pub fn gemm_oq8_grouped_residual_act_batched(
+        &mut self,
+        w_combined: &GpuTensor,
+        x_rot: &GpuTensor,
+        residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.ensure_oq8_scratch_batched(n, k, m)?;
+        let tmp = GpuTensor {
+            buf: unsafe { self.oq8_ytmp_batch.as_ref().unwrap().buf.alias() },
+            shape: vec![n * m],
+            dtype: DType::F32,
+        };
+        self.gemm_oq8_grouped_act_batched(w_combined, x_rot, &tmp, m, k, n)?;
+        let res_n = residual.sub_offset(0, n * m);
+        self.add_inplace_f32(&res_n, &tmp)
+    }
+
     /// Batched W4A4 oq4 GEMM with residual add: `residual[N×M] += W·x_rot`.
     /// GEMMs into the persistent batched f32 scratch (`oq4_ytmp_batch`, sized for
     /// M*N here) then a single elementwise add — there is no fused oq4 residual

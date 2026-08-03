@@ -2314,12 +2314,17 @@ pub(crate) fn forward_prefill_chunk(
                         // the int4 activation quantize (decode parity:
                         // rotate_x_mq[_awq] → quantize_act_oq4).
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let is_mq3 = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256);
                 let is_mq3_lloyd = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256Lloyd);
                 let is_fp4 = matches!(layer.wqkv.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let is_oq4 = matches!(layer.wqkv.gpu_dtype, DType::Oq4G256);
+                let is_oq8 = matches!(layer.wqkv.gpu_dtype, DType::Oq8G256);
                 let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
                 let is_f32 = matches!(layer.wqkv.gpu_dtype, DType::F32);
                 let is_f16 = matches!(layer.wqkv.gpu_dtype, DType::F16 | DType::BF16);
@@ -2623,6 +2628,23 @@ pub(crate) fn forward_prefill_chunk(
                         layer.wqkv.k,
                         n,
                     )?;
+                } else if is_oq8 {
+                    // Opus W8A8: x_rot_batch is FWHT-rotated above (is_mq covers
+                    // Oq8G256 — types.rs maps it to RotationPlan::FwhtG256). No
+                    // fused oq8 PREFILL arm exists (FusedQkvzaOq8G256 resolves to
+                    // the decode GEMV), so run one grouped int8-WMMA GEMM per
+                    // projection. Each shares the same int8 activation quantize
+                    // via the batched scratch, so the redundancy is the quantize
+                    // launch, not a re-read of x.
+                    gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.wqkv.m, layer.wqkv.k, n)?;
+                    for (w, y) in [
+                        (&layer.wqkv, &pbs.dn_qkv_batch),
+                        (&layer.wz, &pbs.dn_z_batch),
+                        (&layer.w_beta, &pbs.dn_beta_batch),
+                        (&layer.w_alpha, &pbs.dn_alpha_batch),
+                    ] {
+                        gpu.gemm_oq8_grouped_prequant(&w.buf, y, w.m, w.k, n)?;
+                    }
                 } else if is_oq4 {
                     // Opus W4A4: x_rot_batch is FWHT(+AWQ)-rotated above (is_mq).
                     // The FusedQkvzaOq4G256 run-arm int4-quantizes it once then
@@ -3053,12 +3075,17 @@ pub(crate) fn forward_prefill_chunk(
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
                 let wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
                 let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let wo_is_oq4 = matches!(layer.wo.gpu_dtype, DType::Oq4G256);
+                let wo_is_oq8 = matches!(layer.wo.gpu_dtype, DType::Oq8G256);
                 let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let wo_is_f32 = matches!(layer.wo.gpu_dtype, DType::F32);
                 let wo_is_f16 = matches!(layer.wo.gpu_dtype, DType::F16 | DType::BF16);
@@ -3093,6 +3120,18 @@ pub(crate) fn forward_prefill_chunk(
                         hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
                         &layer.wo.buf,
                         layer.wo.gpu_dtype,
+                        wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                    )?;
+                } else if wo_is_oq8 {
+                    // Opus W8A8 o_proj: grouped int8-WMMA GEMM into scratch +
+                    // residual add (no fused oq8 residual kernel), mirroring the
+                    // oq4 arm below.
+                    gpu.gemm_oq8_grouped_residual_act_batched(
+                        &layer.wo.buf,
                         wo_input,
                         &pbs.x_batch,
                         layer.wo.m,
@@ -3283,6 +3322,10 @@ pub(crate) fn forward_prefill_chunk(
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let ffn_is_6bit =
                     matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -3290,6 +3333,7 @@ pub(crate) fn forward_prefill_chunk(
                 let ffn_is_mq3_lloyd = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256Lloyd);
                 let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let ffn_is_oq4 = matches!(layer.w_gate.gpu_dtype, DType::Oq4G256);
+                let ffn_is_oq8 = matches!(layer.w_gate.gpu_dtype, DType::Oq8G256);
                 let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
                 let ffn_is_f32 = matches!(layer.w_gate.gpu_dtype, DType::F32);
                 let ffn_is_f16 = matches!(layer.w_gate.gpu_dtype, DType::F16 | DType::BF16);
@@ -3489,6 +3533,17 @@ pub(crate) fn forward_prefill_chunk(
                         layer.w_gate.k,
                         n,
                     )?;
+                } else if ffn_is_oq8 {
+                    // Opus W8A8 gate+up: two grouped int8-WMMA GEMMs into the
+                    // same buffers the fused kernel writes; downstream silu_mul
+                    // is unchanged.
+                    gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.w_gate.m, layer.w_gate.k, n)?;
+                    for (w, y) in [
+                        (&layer.w_gate, &pbs.gate_ffn_batch),
+                        (&layer.w_up, &pbs.up_batch),
+                    ] {
+                        gpu.gemm_oq8_grouped_prequant(&w.buf, y, w.m, w.k, n)?;
+                    }
                 } else if ffn_is_oq4 {
                     // Opus W4A4: x_rot_batch is FWHT(+AWQ)-rotated above (ffn_is_mq).
                     // CAREFUL — the default here is NOT int4 activation. The
@@ -3628,6 +3683,10 @@ pub(crate) fn forward_prefill_chunk(
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let w_down_is_6bit =
                     matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -3636,6 +3695,7 @@ pub(crate) fn forward_prefill_chunk(
                 let w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let w_down_is_oq4 = matches!(layer.w_down.gpu_dtype, DType::Oq4G256);
+                let w_down_is_oq8 = matches!(layer.w_down.gpu_dtype, DType::Oq8G256);
                 let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
                 let w_down_is_f32 = matches!(layer.w_down.gpu_dtype, DType::F32);
                 let w_down_is_f16 = matches!(layer.w_down.gpu_dtype, DType::F16 | DType::BF16);
@@ -3681,6 +3741,16 @@ pub(crate) fn forward_prefill_chunk(
                         hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
                         &layer.w_down.buf,
                         layer.w_down.gpu_dtype,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
+                    )?;
+                } else if w_down_is_oq8 {
+                    // Opus W8A8 down: grouped int8-WMMA GEMM + residual add.
+                    gpu.gemm_oq8_grouped_residual_act_batched(
+                        &layer.w_down.buf,
                         &pbs.ffn_hidden_batch,
                         &pbs.x_batch,
                         layer.w_down.m,
@@ -3882,12 +3952,17 @@ pub(crate) fn forward_prefill_chunk(
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let qkv_is_mq3 = matches!(layer.wq.gpu_dtype, DType::MQ3G256);
                 let qkv_is_mq3_lloyd = matches!(layer.wq.gpu_dtype, DType::MQ3G256Lloyd);
                 let qkv_is_fp4 = matches!(layer.wq.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let qkv_is_oq4 = matches!(layer.wq.gpu_dtype, DType::Oq4G256);
+                let qkv_is_oq8 = matches!(layer.wq.gpu_dtype, DType::Oq8G256);
                 let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
                 let qkv_is_f32 = matches!(layer.wq.gpu_dtype, DType::F32);
                 let qkv_is_f16 = matches!(layer.wq.gpu_dtype, DType::F16 | DType::BF16);
@@ -4038,6 +4113,22 @@ pub(crate) fn forward_prefill_chunk(
                         layer.wq.k,
                         n,
                     )?;
+                } else if qkv_is_oq8 && qkv_same_dtype {
+                    // Opus W8A8 FA QKV: one grouped int8-WMMA GEMM per projection
+                    // off the shared FWHT-rotated activation.
+                    debug_assert!(
+                        matches!(layer.wk.gpu_dtype, DType::Oq8G256)
+                            && matches!(layer.wv.gpu_dtype, DType::Oq8G256),
+                        "FA qkv Oq8 dispatch requires all of wq/wk/wv to be Oq8G256",
+                    );
+                    gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.wq.m, layer.wq.k, n)?;
+                    for (w, y) in [
+                        (&layer.wq, &pbs.fa_q_full_batch),
+                        (&layer.wk, &pbs.fa_k_batch),
+                        (&layer.wv, &pbs.fa_v_batch),
+                    ] {
+                        gpu.gemm_oq8_grouped_prequant(&w.buf, y, w.m, w.k, n)?;
+                    }
                 } else if qkv_is_oq4 && qkv_same_dtype {
                     // OQ4+ batched prefill FA QKV: int8-WMMA MMQ (n>=64) quantizing
                     // the shared FWHT(+AWQ)-rotated activation to q8_1 ONCE across
@@ -5163,12 +5254,17 @@ pub(crate) fn forward_prefill_chunk(
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let fa_wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
                 let fa_wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
                 let fa_wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_wo_is_oq4 = matches!(layer.wo.gpu_dtype, DType::Oq4G256);
+                let fa_wo_is_oq8 = matches!(layer.wo.gpu_dtype, DType::Oq8G256);
                 let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let fa_wo_is_f32 = matches!(layer.wo.gpu_dtype, DType::F32);
                 let fa_wo_is_f16 = matches!(layer.wo.gpu_dtype, DType::F16 | DType::BF16);
@@ -5192,6 +5288,16 @@ pub(crate) fn forward_prefill_chunk(
                         hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
                         &layer.wo.buf,
                         layer.wo.gpu_dtype,
+                        fa_wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                    )?;
+                } else if fa_wo_is_oq8 {
+                    // Opus W8A8: fa_wo_input is FWHT-rotated above.
+                    gpu.gemm_oq8_grouped_residual_act_batched(
+                        &layer.wo.buf,
                         fa_wo_input,
                         &pbs.x_batch,
                         layer.wo.m,
@@ -5344,6 +5450,10 @@ pub(crate) fn forward_prefill_chunk(
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let fa_ffn_is_6bit =
                     matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -5352,6 +5462,7 @@ pub(crate) fn forward_prefill_chunk(
                 let fa_ffn_is_fp4 =
                     matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_ffn_is_oq4 = matches!(layer.w_gate.gpu_dtype, DType::Oq4G256);
+                let fa_ffn_is_oq8 = matches!(layer.w_gate.gpu_dtype, DType::Oq8G256);
                 let fa_ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
                 let fa_ffn_is_f32 = matches!(layer.w_gate.gpu_dtype, DType::F32);
                 let fa_ffn_is_f16 = matches!(layer.w_gate.gpu_dtype, DType::F16 | DType::BF16);
@@ -5395,6 +5506,15 @@ pub(crate) fn forward_prefill_chunk(
                         layer.w_gate.k,
                         n,
                     )?;
+                } else if fa_ffn_is_oq8 {
+                    // Opus W8A8 gate+up: one grouped int8-WMMA GEMM per projection.
+                    gpu.quantize_act_oq8_batched(&pbs.x_rot_batch, layer.w_gate.m, layer.w_gate.k, n)?;
+                    for (w, y) in [
+                        (&layer.w_gate, &pbs.gate_ffn_batch),
+                        (&layer.w_up, &pbs.up_batch),
+                    ] {
+                        gpu.gemm_oq8_grouped_prequant(&w.buf, y, w.m, w.k, n)?;
+                    }
                 } else if fa_ffn_is_oq4 {
                     // Opus W4A4: x_rot_batch is FWHT(+AWQ)-rotated above (fa_ffn_is_mq).
                     run_fused_gate_up_key(
@@ -5574,6 +5694,10 @@ pub(crate) fn forward_prefill_chunk(
                         | DType::MQ3G256Lloyd
                         | DType::MFP4G32
                         | DType::Oq4G256
+                        // Opus W8A8 needs the SAME FWHT rotation as W4A4 — its
+                        // weights are rotated offline too. Omitting it here fed the
+                        // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
+                        | DType::Oq8G256
                 );
                 let fa_w_down_is_6bit =
                     matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
@@ -5582,6 +5706,7 @@ pub(crate) fn forward_prefill_chunk(
                 let fa_w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_w_down_is_oq4 = matches!(layer.w_down.gpu_dtype, DType::Oq4G256);
+                let fa_w_down_is_oq8 = matches!(layer.w_down.gpu_dtype, DType::Oq8G256);
                 let fa_w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
                 let fa_w_down_is_f32 = matches!(layer.w_down.gpu_dtype, DType::F32);
                 let fa_w_down_is_f16 = matches!(layer.w_down.gpu_dtype, DType::F16 | DType::BF16);
@@ -5605,6 +5730,16 @@ pub(crate) fn forward_prefill_chunk(
                         hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
                         &layer.w_down.buf,
                         layer.w_down.gpu_dtype,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
+                    )?;
+                } else if fa_w_down_is_oq8 {
+                    // Opus W8A8: ffn_hidden_batch is FWHT-rotated above.
+                    gpu.gemm_oq8_grouped_residual_act_batched(
+                        &layer.w_down.buf,
                         &pbs.ffn_hidden_batch,
                         &pbs.x_batch,
                         layer.w_down.m,

@@ -1736,3 +1736,105 @@ tok/s, and only then decide whether 2× body footprint for ~830× less quantizat
 error is the right trade for a given deployment. Note this is one small model on
 one corpus chunk — the oq8++ figure deserves a house-rule run once a working
 bf16 reference exists (§13a).
+
+## 13k. Oq8G256 batched prefill WIRED + admitted; and the bits-vs-quality curve (2026-08-03)
+
+### What was wired
+
+New dispatch helpers (`hipfire-rdna/src/dispatch/quant.rs`), mirroring the oq4
+pair and reusing the sequence `weight_gemm`'s `DType::Oq8G256` arm already used
+(rotate → `quantize_act_oq8` → `gemm_oq8_grouped_wmma`, the latter already
+parity-tested by `parity_oq8_gemm`):
+
+- `quantize_act_oq8_batched` / `gemm_oq8_grouped_prequant` — split so a
+  multi-projection site quantizes ONCE and issues one GEMM per projection (the
+  oq8 analogue of what the fused oq4 kernels do internally).
+- `gemm_oq8_grouped_act_batched` (= the two combined) and
+  `gemm_oq8_grouped_residual_act_batched` (+ residual add).
+- `ensure_oq8_scratch_batched` + three `oq8_*_batch` scratch fields (the
+  quantized activation is a full byte per element, `n*k`, not `n*k/2`).
+
+All **eight** oq4 prefill sites gained an `Oq8G256` sibling — LA qkvza / wo /
+gate+up / w_down and FA qkv / wo / gate+up / w_down — and `is_batchable_la`
+gained an `oq8_with_wmma` arm (same wave32-WMMA arch set as oq4; opt out with
+`HIPFIRE_OQ8_BATCHED_PREFILL=0`).
+
+**The bug this surfaced.** The first wired run was eligible and 5.4× faster but
+produced garbage — PPL 3,472,118, KLD 12.05. Cause: the eight `*_is_mq` rotation
+gates list `Oq4G256` but **not `Oq8G256`**, so the activation was never
+FWHT-rotated while the oq8 weights had been rotated offline. Adding `Oq8G256` to
+all eight rotation sets fixed it. Worth noting for the next dtype someone
+admits: **admission and rotation are two separate lists, and only the second one
+fails silently-but-catastrophically.**
+
+**Verification** (chunk 0, vs bf16): batched **0.000603** vs the per-token
+reference **0.000351**, PPL 23.6343 vs 23.6350 — the batched path matches the
+path it replaces to four decimal places, the residual gap being the same
+batched-vs-per-token noise the oq4 harness shows. Coherence gate: `hipfire chat`
+on the oq8 artifact returns "The capital of France is Paris." Throughput
+**56 → ~384 tok/s (≈6.9×)** over the per-token fallback.
+
+### The bits-vs-quality curve
+
+All three artifacts now take the batched path (`final=true`). Body bits/weight is
+`bits + 32/256` for the f32 per-group scale; `OqPlusCompact` is derived from its
+byte ratio (279.91 / 252.70 MB × 4.125).
+
+| artifact | body | bits/wt | KLD vs bf16 | PPL | tok/s (median of 3) |
+|---|---|---|---|---|---|
+| oq4++ (A8 act) | 252.70 MB | 4.125 | 0.292612 | 19.92 | **1011.2** |
+| oq4.5++ | 279.91 MB | 4.569 | 0.052957 | 24.10 | 361.9 |
+| **oq8++** | 501.50 MB | 8.125 | **0.000603** | 23.63 | 384.2 |
+
+*(bf16's own PPL on this window is ≈23.63 — inferred in §13j from oq8++ sitting
+at ~1e-4 KLD. Note oq4++ scores 19.92, well BELOW bf16, while oq4.5++ scores
+24.10, slightly above. PPL is not monotone in quantization quality; KLD is.)*
+
+**Two results fall straight out:**
+
+1. **Mixed precision is far more bit-efficient than uniform promotion at the low
+   end.** Going 4.125 → 4.569 bits (+0.444 bits, +11% of the weight budget)
+   removes **82%** of the linear KLD gap to oq8 (0.2926 → 0.0530 of a 0.2920
+   total drop). In log-KLD the marginal return is **−3.85/bit** over
+   4.125→4.569 versus **−1.26/bit** over 4.569→8.125 — the first half-bit the
+   mixed allocator spends is ~3× more valuable per bit than the rest of the climb
+   to 8.
+
+2. **But oq4.5++ is Pareto-dominated here.** oq8++ is *both* 88× better on KLD
+   *and slightly faster* (384 vs 362 tok/s) — `OqPlusCompact` does not have the
+   optimized kernel that Oq8G256 does, so it pays nearly the full 4-bit-exit
+   throughput penalty without the quality. On this box the choice is effectively
+   **oq4++ at 1011 tok/s, or oq8++ at ~384** — 2.6× throughput for 488× the
+   error. There is no useful middle rung today.
+
+### The allocation math the question actually asks — NOT yet done
+
+"Mixed precision within layers vs promoting whole layers to 8-bit, at equal
+bits" needs **per-layer sensitivity**, which we do not have. The decision rule is
+water-filling: allocate bits so the *marginal* KLD-per-bit is equal across
+layers. Uniform-vs-bimodal is not decidable from a global average — it falls out
+of the per-layer curves.
+
+What the curve above does let us say, as a bound: at 4.569 bits the equal-budget
+layer-promotion alternative is "**11% of layers at 8.125 bits, 89% at 4.125**".
+If per-layer error contributions were even roughly additive and comparable,
+promoting 11% of layers removes on the order of 11% of the error — against the
+**82%** the mixed allocator achieves at the same cost. Layer-granular promotion
+could only compete if sensitivity is extremely concentrated (a few layers
+carrying most of the error). **That concentration is exactly the unmeasured
+quantity.**
+
+Cheapest way to get it, in order:
+1. **Hessian/imatrix proxy** — `hipfire collect-artifacts` already captures
+   per-tensor Hessian/imatrix in one model load. Weighted per-layer sensitivity
+   from that is a zero-GPU-inference estimate and would rank layers immediately.
+2. **Leave-one-out ground truth** — quantize N artifacts each promoting one layer
+   group to 8-bit, measure ΔKLD on this harness. 3–4 coarse groups
+   (early/middle/late/attention-vs-FFN) is 3–4 quant runs, not 24.
+3. Then solve the water-filling allocation against the measured curve and check
+   it against `OqPlusCompact`'s own choice — which, per result 1, is already
+   doing something quite good.
+
+Scope: one small hybrid model, one corpus window (chunk 0, the only valid one —
+§13a), gfx1103. The KLD figures deserve a house-rule ≥16-chunk run once a working
+bf16 reference exists.

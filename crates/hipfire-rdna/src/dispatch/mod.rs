@@ -453,6 +453,9 @@ pub struct Gpu {
     pub oq4_xq_batch: Option<GpuTensor>, // packed int4 activation, N*K/2 bytes
     pub oq4_xs_batch: Option<GpuTensor>, // per-group f32 activation scales, N*K/256
     pub oq4_ytmp_batch: Option<GpuTensor>, // f32 residual GEMM scratch, M*N
+    pub oq8_xq_batch: Option<GpuTensor>, // int8 activation, N*K bytes (oq8 W8A8)
+    pub oq8_xs_batch: Option<GpuTensor>, // per-group f32 activation scales, N*K/256
+    pub oq8_ytmp_batch: Option<GpuTensor>, // f32 residual GEMM scratch, M*N
     // Plain-basis DFLASH W4A8/W8A8 staging. The activation is quantized once
     // per (batch,G256) and reused by every output-row block in the projection.
     // Capacity grows to the largest bounded chunk seen and is stream-reused.
@@ -861,6 +864,9 @@ impl Gpu {
             oq4_xq_batch: None,
             oq4_xs_batch: None,
             oq4_ytmp_batch: None,
+            oq8_xq_batch: None,
+            oq8_xs_batch: None,
+            oq8_ytmp_batch: None,
             dflash_oq_xq_batch: None,
             dflash_oq_xs_batch: None,
             paro_x_scratch: None,
@@ -2351,6 +2357,34 @@ impl Gpu {
         }
         if grow(&self.oq4_ytmp_batch, need_y) {
             self.oq4_ytmp_batch = Some(self.alloc_tensor(&[need_y], DType::F32)?);
+        }
+        Ok(())
+    }
+
+    /// oq8 (W8A8) batched-prefill scratch. Same shape as the oq4 trio except the
+    /// quantized activation is a full byte per element (`n*k`, not `n*k/2`), and
+    /// the scale group is the oq8 codec's fixed 256.
+    pub fn ensure_oq8_scratch_batched(
+        &mut self,
+        n: usize,
+        k: usize,
+        m_max: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let need_xq = n * k;
+        let need_xs = n * (k / 256);
+        let need_y = n * m_max;
+        let grow = |cur: &Option<GpuTensor>, need: usize| -> bool {
+            cur.as_ref().map(|t| t.numel() < need).unwrap_or(true)
+        };
+        if grow(&self.oq8_xq_batch, need_xq) {
+            self.oq8_xq_batch = Some(self.alloc_tensor(&[need_xq], DType::Raw)?);
+        }
+        if grow(&self.oq8_xs_batch, need_xs) {
+            self.oq8_xs_batch = Some(self.alloc_tensor(&[need_xs], DType::F32)?);
+        }
+        if grow(&self.oq8_ytmp_batch, need_y) {
+            self.oq8_ytmp_batch = Some(self.alloc_tensor(&[need_y], DType::F32)?);
         }
         Ok(())
     }
