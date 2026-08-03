@@ -217,6 +217,21 @@ pub enum QuantType {
     /// Byte length is data-dependent, so `block_bytes() == None`. Readers must
     /// take an owned copy (`tensor_data_vec`), never the zero-copy mmap slice.
     Bf16Huff = 50,
+    /// QTIP-3 with the 3INST computed codebook. Byte-identical LAYOUT to
+    /// [`QuantType::Qtip3G256`] — 100 B/group, same 12-bit trellis, same FWHT —
+    /// and differing ONLY in the state→value map the decoder computes: 3INST
+    /// (excess kurtosis -0.111) instead of 1MAD (-0.312), i.e. closer to the
+    /// Gaussian the rotated weights actually follow.
+    ///
+    /// It is a SEPARATE TYPE rather than a flag on `Qtip3G256` because the
+    /// codebook is part of the wire contract: nothing in the block distinguishes
+    /// them, so a 3INST artifact read by a 1MAD kernel dequantizes to noise while
+    /// every length, checksum and shape check still passes. Two codes make that
+    /// mismatch a load error instead of silent garbage.
+    ///
+    /// Codec/kernel pending — the encoder can emit this; `gemv_qtip3g256`
+    /// computes 1MAD on-device and must gain a 3INST path before it can serve.
+    Qtip3G256I3 = 51,
 }
 
 impl QuantType {
@@ -270,6 +285,7 @@ impl QuantType {
             29 => PARO4G128T,
             30 => MQ4G256Lloyd,
             31 => Qtip3G256,
+            51 => Qtip3G256I3,
             33 => OqPlusG256,
             34 => Oq4G256,
             35 => Oq8G256,
@@ -355,6 +371,7 @@ impl QuantType {
             OpaqueBytes => Some(1),
             // QTIP trellis (f32 scale + packed symbols)
             Qtip3G256 => Some(100), // 4 + 96 (256×3-bit)
+            Qtip3G256I3 => Some(100), // identical layout to Qtip3G256; only the codebook differs
             Qtip4G256 => Some(132), // 4 + 128 (256×4-bit)
             // Variable-length or not-yet-single-sourced here:
             //  - Q8HFQ: row-dependent
@@ -456,6 +473,7 @@ mod tests {
             (QuantType::Oq8Plain, 258),
             (QuantType::Oq4Plain, 130),
             (QuantType::Qtip3G256, 100),
+            (QuantType::Qtip3G256I3, 100),
             (QuantType::Qtip4G256, 132),
         ];
         for (qt, bytes) in cases {
@@ -518,6 +536,13 @@ mod tests {
         // On-disk contract: these bytes must never move.
         assert_eq!(QuantType::F16.code(), 1);
         assert_eq!(QuantType::Qtip3G256.code(), 31);
+        assert_eq!(QuantType::Qtip3G256I3.code(), 51);
+        // Same geometry, different codebook — the distinction is the whole point.
+        assert_eq!(
+            QuantType::Qtip3G256I3.block_bytes(),
+            QuantType::Qtip3G256.block_bytes()
+        );
+        assert_ne!(QuantType::Qtip3G256I3.code(), QuantType::Qtip3G256.code());
         assert_eq!(QuantType::OqPlusG256.code(), 33);
         assert_eq!(QuantType::Oq4G256.code(), 34);
         assert_eq!(QuantType::Oq8G256.code(), 35);

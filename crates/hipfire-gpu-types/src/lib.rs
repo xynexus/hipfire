@@ -36,6 +36,11 @@ pub enum DType {
     Qtip3G256, // QTIP-3: FWHT-rotated trellis-coded 3-bit (100 bytes/group: f32 scale + 96 B
     // packed symbols). Decoded by gemv_qtip3g256 (computed 1MAD codebook, zero LDS); runtime
     // FWHT-rotates x like MQ3/MQ4. See kernels/src/gemv_qtip3g256.hip / qtip.rs.
+    Qtip3G256I3, // QTIP-3 with the 3INST codebook (100 bytes/group, identical layout to
+    // Qtip3G256). Only the computed state->value map differs: 3INST (excess kurtosis -0.111)
+    // vs 1MAD (-0.312), i.e. closer to the Gaussian the rotated weights follow. A separate
+    // DType because the codebook is part of the wire format -- decoding one as the other
+    // produces noise while every structural check passes. See gemv_qtip3g256i3.hip.
     Qtip4G256, // QTIP-4: FWHT-rotated trellis-coded 4-bit (132 bytes/group: f32 scale + 128 B
     // nibble-packed symbols). Same 1MAD codebook/12-bit trellis as Qtip3G256, decoded by
     // gemv_qtip4g256. See kernels/src/gemv_qtip4g256.hip / qtip::pack_qtip4_group.
@@ -106,6 +111,7 @@ impl DType {
             | DType::MQ8G256
             | DType::MQ3G256
             | DType::Qtip3G256
+            | DType::Qtip3G256I3
             | DType::Qtip4G256
             | DType::MQ2G256
             | DType::MQ2G256Lloyd

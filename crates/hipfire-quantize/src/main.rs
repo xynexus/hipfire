@@ -3671,6 +3671,12 @@ enum HfqInputFormat {
     Mq3,
     Qtip3,
     Qtip4,
+    /// Simulated QTIP-3: run the FWHT + trellis, then emit the DEQUANTIZED
+    /// weights as BF16. Quality-only — no packed trellis, no kernel involvement,
+    /// so it can compare codebooks (HIPFIRE_QTIP_CODEBOOK) without the decode
+    /// side having to agree. That independence is the whole point: the real
+    /// path's codebook is fixed by what the kernel computes on-device.
+    Qtip3Sim,
     Oq3,
     Oq2,
     Oq6,
@@ -3727,6 +3733,7 @@ impl HfqInputFormat {
             // undetectable downstream. Reject until the beam search is
             // Hessian-weighted.
             "qtip3" | "qtip3+" => Some(Self::Qtip3),
+            "qtip3-sim" => Some(Self::Qtip3Sim),
             "qtip4" => Some(Self::Qtip4),
             // oq3+/oq3++ resolve here like oq2 and oq4 do: the Oq3 arm already
             // implements the full recipe (AWQ pre-scale, H' = diag(1/s) H diag(1/s),
@@ -3981,6 +3988,19 @@ fn quantize_hfq_source_tensor(
         return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
     }
     let out = match format {
+        // Simulated QTIP-3: dequantized weights straight back out as BF16. Ragged
+        // K (not a multiple of 256) has no trellis group, so it stays at source
+        // precision rather than being zero-padded into a fake group.
+        HfqInputFormat::Qtip3Sim => {
+            if !should_quantize(name) || k % 256 != 0 {
+                let (data, qt, label) = source_precision_tensor_bytes(raw, src_dtype, &f32_data);
+                return Ok((data, qt, 0, label));
+            }
+            let mut wf = f32_data.clone();
+            let cb = qtip_sim_codebook();
+            qtip_simquant_nbit(&mut wf, k, &cb, &signs1, &signs2, 3);
+            (f32_slice_to_bf16_bytes(&wf), QuantType::BF16, 0, "BF16")
+        }
         HfqInputFormat::Q8F16 => (quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"),
         HfqInputFormat::Hfq4 => {
             if k % 256 == 0 {
@@ -4470,6 +4490,11 @@ fn gpu_encode_symbols(
     n_groups: usize,
     bits: u32,
 ) -> Result<Vec<u8>, String> {
+    // The encoder's codebook MUST match the one the artifact will be decoded
+    // with, or the symbols are optimal for a function nobody evaluates. Selecting
+    // 3INST offline while this defaulted to the 1MAD encoder kernel is exactly how
+    // a 2.7-million PPL artifact got produced.
+    let use_3inst = qtip_use_3inst();
     use hipfire_rdna::DType;
     // Per-chunk packed backpointer scratch = chunk×256×256×2 u32 = chunk×512 KB
     // (uninitialized — the kernel writes it before backtrack, so use a device alloc
@@ -4502,7 +4527,7 @@ fn gpu_encode_symbols(
         let scd = gpu
             .alloc_tensor(&[cn], DType::F32)
             .map_err(|e| e.to_string())?;
-        gpu.qtip_viterbi_encode(&wd, &sd, &backptr, &scd, cn, bits)
+        gpu.qtip_viterbi_encode_cb(&wd, &sd, &backptr, &scd, cn, bits, use_3inst)
             .map_err(|e| e.to_string())?;
         gpu.device_synchronize().map_err(|e| e.to_string())?;
         let s = gpu.download_raw(&sd, cn * 256).map_err(|e| e.to_string())?;
@@ -4557,6 +4582,26 @@ fn qtip_cond_mode() -> Option<hipfire_quantize::ldlq::QtipCondMode> {
     }
 }
 
+/// Codebook for the SIM paths, honouring `HIPFIRE_QTIP_CODEBOOK=3inst`. Only the
+/// sim may choose: the real trellis decode computes 1MAD on-device, so a real
+/// artifact encoded against any other codebook would dequantize to noise with no
+/// way for the reader to notice.
+/// The one place the 3INST decision is read. Encoder codebook, artifact tag and
+/// decode kernel all derive from this, so they cannot drift apart.
+fn qtip_use_3inst() -> bool {
+    std::env::var("HIPFIRE_QTIP_CODEBOOK").as_deref() == Ok("3inst")
+}
+
+fn qtip_sim_codebook() -> Vec<f32> {
+    if std::env::var("HIPFIRE_QTIP_CODEBOOK").as_deref() == Ok("3inst") {
+        eprintln!("qtip3-sim: 3INST computed codebook");
+        qtip::build_codebook_3inst()
+    } else {
+        eprintln!("qtip3-sim: 1MAD computed codebook");
+        qtip::build_codebook()
+    }
+}
+
 fn qtip_trellis_lm_head_enabled() -> bool {
     std::env::var("HIPFIRE_QTIP_LM_HEAD").ok().as_deref() == Some("1")
 }
@@ -4584,10 +4629,13 @@ fn pack_qtip_real_tensors(
     } else {
         qtip::QTIP3_BLOCK_BYTES
     };
-    let tag = if bits == 4 {
-        QuantType::Qtip4G256
-    } else {
-        QuantType::Qtip3G256
+    // The tag must follow the CODEBOOK, not just the bit width — see
+    // QuantType::Qtip3G256I3. Mis-tagging here is undetectable downstream.
+    let use_3inst = qtip_use_3inst();
+    let tag = match (bits, use_3inst) {
+        (4, _) => QuantType::Qtip4G256,
+        (_, true) => QuantType::Qtip3G256I3,
+        (_, false) => QuantType::Qtip3G256,
     };
     // Autodetect a GPU for the trellis encode (exact Viterbi, ~250× the CPU beam).
     // The CPU beam remains the fallback + reference; nothing here requires a GPU.
@@ -5101,7 +5149,18 @@ fn run_hfq_source_pipeline(
         } else {
             3
         };
-        let qtip_cb = qtip::build_codebook();
+        // MUST agree with the tag `pack_qtip_real_tensors` writes and with the
+        // codebook the decode kernel computes. This path builds its own codebook
+        // (the HF/GGUF selector upstream does not reach here), so hardcoding 1MAD
+        // meant `HIPFIRE_QTIP_CODEBOOK=3inst` produced 1MAD-encoded weights under
+        // a Qtip3G256I3 tag — decoded as 3INST, PPL 2.7e6. Encoder, tag and
+        // decoder are one decision; it is made once, here.
+        let qtip_cb = if bits == 3 && qtip_use_3inst() {
+            eprintln!("  qtip3 (real): 3INST computed codebook (Qtip3G256I3)");
+            qtip::build_codebook_3inst()
+        } else {
+            qtip::build_codebook()
+        };
         let qtip_s1 = gen_fwht_signs(42, 256);
         let qtip_s2 = gen_fwht_signs(1042, 256);
         pack_qtip_real_tensors(
@@ -6589,9 +6648,16 @@ fn main() {
             );
         }
         // HIPFIRE_QTIP_CODEBOOK=3inst selects the QTIP 3INST computed codebook
-        // (closer-to-Gaussian than 1MAD) for the SIM paths only — the real qtip
-        // kernel computes 1MAD on-device, so its codebook must stay 1MAD.
-        let cb = if !(use_qtip3_real || use_qtip4_real)
+        // (closer to Gaussian than 1MAD: excess kurtosis -0.111 vs -0.312).
+        //
+        // The sim paths may always use it — they emit dequantized BF16, so no
+        // decoder has to agree. The REAL qtip3 path may now use it too, but only
+        // because the result is tagged `Qtip3G256I3` (51) rather than
+        // `Qtip3G256` (31): the codebook is part of the wire contract and the
+        // block carries no marker, so sharing one code would let a 3INST artifact
+        // dequantize to noise under a 1MAD kernel with every structural check
+        // passing. Real qtip4 stays 1MAD — no distinct code exists for it.
+        let cb = if !use_qtip4_real
             && std::env::var("HIPFIRE_QTIP_CODEBOOK").as_deref() == Ok("3inst")
         {
             eprintln!("qtip: using 3INST computed codebook (sim)");

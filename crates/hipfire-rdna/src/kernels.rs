@@ -238,11 +238,24 @@ pub const GEMV_MQ3G256_LLOYD_SRC: &str =
 /// QTIP-3: FWHT-rotated trellis-coded 3-bit, fused on-the-fly decode + matvec
 /// (100 B/group, computed 1MAD codebook, zero LDS). Arch-generic (gfx1103/1100).
 pub const GEMV_QTIP3G256_SRC: &str = include_str!("../../../kernels/src/gemv_qtip3g256.hip");
+/// QTIP-3 with the 3INST computed codebook (`QuantType::Qtip3G256I3` = 51).
+/// Same 100 B/group layout and 12-bit trellis as [`GEMV_QTIP3G256_SRC`]; only
+/// the state->value map differs (3INST, excess kurtosis -0.111, vs 1MAD's
+/// -0.312). A distinct kernel because the codebook is part of the wire format:
+/// decoding one with the other silently yields noise.
+pub const GEMV_QTIP3G256I3_SRC: &str =
+    include_str!("../../../kernels/src/gemv_qtip3g256i3.hip");
 /// QTIP-4: FWHT-rotated trellis-coded 4-bit, fused on-the-fly decode + matvec
 /// (132 B/group, same computed 1MAD codebook, zero LDS). Arch-generic.
 pub const GEMV_QTIP4G256_SRC: &str = include_str!("../../../kernels/src/gemv_qtip4g256.hip");
 /// QTIP trellis ENCODER (offline): full Viterbi over the 12-bit state space, one
 /// block per 256-group, dp ping-pong in LDS. Replaces the ~1h/1B CPU beam encode.
+/// QTIP trellis encoder for the 3INST codebook. Must stay in lockstep with
+/// [`GEMV_QTIP3G256I3_SRC`]: the encoder minimises error against the codebook it
+/// bakes, so an encoder/decoder codebook mismatch yields weights optimal for a
+/// function the decoder never evaluates.
+pub const QTIP_VITERBI_ENCODE_I3_SRC: &str =
+    include_str!("../../../kernels/src/qtip_viterbi_encode_i3.hip");
 pub const QTIP_VITERBI_ENCODE_SRC: &str =
     include_str!("../../../kernels/src/qtip_viterbi_encode.hip");
 /// MQ4G256Lloyd: 4-bit + per-block 16-entry fp16 codebook (160 B/group).

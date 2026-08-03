@@ -794,6 +794,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn kernel_3inst_baked_affine_matches_the_builder() {
+        // The HIP kernel (gemv_qtip3g256i3.hip) cannot call build_codebook_3inst
+        // — it recomputes the value from the state and applies a BAKED affine.
+        // This mirrors that arithmetic exactly and asserts it reproduces the
+        // builder for every reachable state. A wrong constant here would not
+        // crash: it would dequantize every weight slightly off, which reads as
+        // "the 3INST codebook is not better" rather than as a bug.
+        const KERNEL_MEAN: f64 = -0.0002955198;
+        const KERNEL_INV_STD: f64 = 0.8089565944;
+        let cb = build_codebook_3inst();
+        let mut worst = 0.0f64;
+        for state in 0..NUM_STATES as u32 {
+            let raw = decode_3inst(state) as f64;
+            let raw = if raw.is_finite() { raw } else { 0.0 };
+            let kernel_val = (raw - KERNEL_MEAN) * KERNEL_INV_STD;
+            worst = worst.max((kernel_val - cb[state as usize] as f64).abs());
+        }
+        assert!(
+            worst < 1e-5,
+            "baked affine drifts from build_codebook_3inst by {worst}"
+        );
+    }
+
+    #[test]
     fn codebook_3inst_is_sane_and_more_gaussian() {
         let cb1 = build_codebook();
         let cb3 = build_codebook_3inst();

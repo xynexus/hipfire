@@ -1871,6 +1871,64 @@ impl Gpu {
             &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val],
         )
     }
+    /// QTIP-3 GEMV, 3INST codebook (`Qtip3G256I3`). Byte-identical contract to
+    /// [`Self::gemv_qtip3g256`] — same layout, same pre-rotated x — decoded with
+    /// the 3INST map instead of 1MAD.
+    pub fn gemv_qtip3g256i3(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_qtip3g256i3",
+            kernels::GEMV_QTIP3G256I3_SRC,
+            "gemv_qtip3g256i3",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        self.launch_kernargs(
+            "gemv_qtip3g256i3",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val],
+        )
+    }
+    /// QTIP-3 3INST GEMV with fused residual add (y += W·x).
+    pub fn gemv_qtip3g256i3_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_qtip3g256i3",
+            kernels::GEMV_QTIP3G256I3_SRC,
+            "gemv_qtip3g256i3_residual",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        self.launch_kernargs(
+            "gemv_qtip3g256i3_residual",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val],
+        )
+    }
     /// QTIP-4 GEMV (plain, y = W·x). The 4-bit sibling of `gemv_qtip3g256`:
     /// same computed 1MAD codebook / 12-bit trellis, 132 B/group nibble packing.
     /// x must be pre-FWHT-rotated by the caller (rotate_x_mq_for), same contract.
@@ -1944,12 +2002,38 @@ impl Gpu {
         n_groups: usize,
         bits: u32,
     ) -> HipResult<()> {
+        self.qtip_viterbi_encode_cb(w, symbols, backptr, scales, n_groups, bits, false)
+    }
+    /// As [`Self::qtip_viterbi_encode`], but `use_3inst` selects the 3INST
+    /// codebook encoder. The choice MUST match the codebook the artifact will be
+    /// decoded with (Qtip3G256 = 1MAD, Qtip3G256I3 = 3INST) — the encoder picks
+    /// symbols to minimise error against whichever it bakes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qtip_viterbi_encode_cb(
+        &mut self,
+        w: &GpuTensor,
+        symbols: &GpuTensor,
+        backptr: &GpuTensor,
+        scales: &GpuTensor,
+        n_groups: usize,
+        bits: u32,
+        use_3inst: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "qtip_viterbi_encode",
-            kernels::QTIP_VITERBI_ENCODE_SRC,
-            "qtip_viterbi_encode",
-        )?;
+        let (key, src, entry) = if use_3inst {
+            (
+                "qtip_viterbi_encode_i3",
+                kernels::QTIP_VITERBI_ENCODE_I3_SRC,
+                "qtip_viterbi_encode_i3",
+            )
+        } else {
+            (
+                "qtip_viterbi_encode",
+                kernels::QTIP_VITERBI_ENCODE_SRC,
+                "qtip_viterbi_encode",
+            )
+        };
+        self.ensure_kernel(key, src, entry)?;
         let w_ptr = w.buf.as_ptr();
         let sym_ptr = symbols.buf.as_ptr();
         let bp_ptr = backptr.buf.as_ptr();
@@ -1957,7 +2041,7 @@ impl Gpu {
         let ng = n_groups as i32;
         let b = bits as i32;
         self.launch_kernargs(
-            "qtip_viterbi_encode",
+            entry,
             [n_groups as u32, 1, 1],
             [256, 1, 1],
             0,

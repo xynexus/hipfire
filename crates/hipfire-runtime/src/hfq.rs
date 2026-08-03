@@ -2380,14 +2380,20 @@ fn load_weight_tensor(
                 awq_scale: None,
             })
         }
-        31 => {
-            // Qtip3G256 — packed bitshift-trellis (100 B/group), served by the
-            // gemv_qtip3g256 kernel. Wires qtip3 into the plain-llama path
-            // (previously only the qwen3.5 arch loaded qtip3).
+        qt @ (31 | 51) => {
+            // Qtip3G256 (31) / Qtip3G256I3 (51) — packed bitshift-trellis
+            // (100 B/group), served by gemv_qtip3g256 and gemv_qtip3g256i3
+            // respectively. IDENTICAL bytes; the code selects which computed
+            // codebook the kernel decodes with, which is exactly why they are two
+            // codes: cross-decoding produces noise that no structural check sees.
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
-                gpu_dtype: DType::Qtip3G256,
+                gpu_dtype: if qt == 51 {
+                    DType::Qtip3G256I3
+                } else {
+                    DType::Qtip3G256
+                },
                 m,
                 k,
                 row_stride: 0,
