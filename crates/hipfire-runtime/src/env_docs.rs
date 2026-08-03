@@ -1958,7 +1958,7 @@ pub const ENV_HIPFIRE_GEMM_DUMP: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GEMV_MROW: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GEMV_MROW",
     description: "Multi-row register-blocked variant (HIPFIRE_GEMV_MROW): each wave owns",
-    source: "crates/hipfire-rdna/src/dispatch/gemv.rs:4494",
+    source: "crates/hipfire-rdna/src/dispatch/gemv.rs:4526",
 };
 
 /// `HIPFIRE_GEMV_ROWS` — Runtime variable controlling gemv rows in hipfire
