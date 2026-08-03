@@ -4658,13 +4658,17 @@ fn qtip_greedy_encode_gpu(
             }
         });
     let t = Instant::now();
-    let l_dev = gpu.upload_raw(&f32_slice_to_le_bytes(&lflat), &[k, k]).ok()?;
+    // OWNED allocations throughout. `GpuTensor` has NO Drop impl — only
+    // `OwnedTensor` returns its buffer to the pool — so allocating per tensor
+    // with alloc_tensor/upload_raw leaked every one: ~386 MB per k=8192 tensor,
+    // roughly 15 GB across a model. On this UMA APU that is system RAM, and it
+    // showed up as ~28 GB of `shared` while the kernel evicted other processes
+    // at ~5000 pages/s with tens of GB nominally free.
+    let l_dev = gpu.upload_owned_f32(&lflat, &[k, k]).ok()?;
     drop(lflat);
-    let res_dev = gpu
-        .upload_raw(&f32_slice_to_le_bytes(rotated), &[m, k])
-        .ok()?;
+    let res_dev = gpu.upload_owned_f32(rotated, &[m, k]).ok()?;
     greedy_timing::add(&greedy_timing::UPLOAD_MS, t.elapsed());
-    let blk_dev = gpu.alloc_tensor(&[m * 256], DType::F32).ok()?;
+    let blk_dev = gpu.alloc_owned(&[m * 256], DType::F32).ok()?;
 
     let nb = k / 256;
     let mut symbols = vec![0u8; m * k];
@@ -4718,19 +4722,39 @@ fn qtip_greedy_encode_gpu(
             // block — negligible next to the 512 MB per-block churn removed from
             // the encoder scratch.
             let t = Instant::now();
-            let err_dev = gpu.upload_f32(&err_flat, &[m, 256]).ok()?;
+            let err_dev = gpu.upload_owned_f32(&err_flat, &[m, 256]).ok()?;
             gpu.qtip_obs_propagate(&res_dev, &err_dev, &l_dev, m, k, c0, c1)
                 .ok()?;
             gpu.device_synchronize().ok()?;
             greedy_timing::add(&greedy_timing::PROP_MS, t.elapsed());
         }
+        // Dropped OwnedTensors only ENQUEUE their buffers; returning them to the
+        // pool is explicit. Without this the mailbox grows exactly as the leak
+        // did — the buffers are reclaimable but never reclaimed.
+        gpu.reclaim_pending();
+    }
+    // reclaim_pending only returns buffers to the POOL free-list — `pool.free`
+    // issues no device free — so GTT stays held. Across 112 tensors of differing
+    // (m, k) the pool cannot reuse most entries and grows to their sum: GTT
+    // climbed ~190 MB/s and one process held 58 GB, which on this UMA part is
+    // system RAM and drove the machine into swap.
+    //
+    // `drain_pool` hipFrees for real, but doing it EVERY tensor costs more than
+    // the leak did in wall-time: 388s -> 564s, with cholesky alone going 178.7s
+    // -> 363.8s despite being pure CPU work on identical data — churning tens of
+    // GB of GTT punishes the page tables the CPU side is using too. Draining
+    // periodically keeps the high-water mark near a few GB while amortising the
+    // free/realloc cost over several tensors.
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SINCE_DRAIN: AtomicUsize = AtomicUsize::new(0);
+        if SINCE_DRAIN.fetch_add(1, Ordering::Relaxed) % 8 == 7 {
+            gpu.drain_pool();
+        }
     }
     Some((symbols, targets))
 }
 
-fn f32_slice_to_le_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
 
 /// Reusable GPU scratch for the trellis encode. The backpointer buffer is
 /// `chunk × 256 × 256 × 2` F32 = 512 MB at the default chunk, and its contents
@@ -4804,14 +4828,19 @@ fn gpu_encode_symbols_scratch(
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
+        // OWNED: `GpuTensor` has no Drop, so alloc_tensor/upload_raw here retained
+        // every chunk buffer for the life of the process. Harmless when this ran
+        // once per tensor; with block-wise conditioning it runs k/256 times per
+        // tensor and GTT grew at ~267 MB/s — 63 GB reclaimed the moment the
+        // process died.
         let wd = gpu
-            .upload_raw(&wbytes, &[cn, 256])
+            .upload_raw_owned(&wbytes, &[cn, 256])
             .map_err(|e| e.to_string())?;
         let sd = gpu
-            .alloc_tensor(&[cn * 256], DType::Raw)
+            .alloc_owned(&[cn * 256], DType::Raw)
             .map_err(|e| e.to_string())?;
         let scd = gpu
-            .alloc_tensor(&[cn], DType::F32)
+            .alloc_owned(&[cn], DType::F32)
             .map_err(|e| e.to_string())?;
         gpu.qtip_viterbi_encode_cb(&wd, &sd, backptr, &scd, cn, bits, use_3inst)
             .map_err(|e| e.to_string())?;
