@@ -1645,3 +1645,94 @@ gate_up on their default routing unless per-site `_QKV=4` / `_GATEUP=4` are also
 set. Pin every site explicitly in any run whose label claims a uniform precision.
 And the rule that caught this twice: **a knob that reads byte-identical to its
 baseline has not taken effect** — check the binary, then check the dispatch.
+
+## 13j. What "A8" actually is — and why the next lever is oq8 WEIGHTS (2026-08-03)
+
+### A8 is untreated int8, but at 8× finer granularity than A4
+
+`quantize_q8_1_mmq_ds4` (`kernels/src/gemm_hfq4g256_residual_mmq.hip`): each
+thread takes 4 elements, the `__shfl_xor` butterfly runs offsets 4/2/1 = **8
+lanes**, so a scale covers **32 elements**. `d = amax/127`, no clip, no AWQ, no
+extra rotation. So yes — A8 is plain absmax int8.
+
+But the comparison in §13 was never clean bit-depth: the int4 activation path
+uses **group 256** (welded to the Oq4G256 weight codec until §13's `_gx` kernel),
+while int8 uses **group 32**. A4-vs-A8 was *4 bits AND 8× coarser scaling*. That
+recontextualizes §13c's group lever — it was closing a gap that only existed
+because the activation group was tied to the weight codec. Group 32 for int4 is
+not even reachable today: the LDS kernel flushes on a BK=64 K-strip, so 64 is the
+floor. An int4-at-group-32 measurement would be the honest apples-to-apples test,
+and it does not exist.
+
+### There is nothing left to win on the activation side at 8 bits
+
+Absolute vs bf16, chunk 0 (the one valid chunk, §13a), oq4++ weights throughout:
+
+| activation precision | KLD vs bf16 | PPL |
+|---|---|---|
+| W4A16 | 0.292738 | 19.976 |
+| **W4A8** | **0.292612** | 19.917 |
+| W4A4-ish (incumbent mix) | 0.324405 | 20.961 |
+
+**A8 is within 0.0001 KLD of A16 in absolute terms.** An activation clip on
+q8_1 — the obvious analogue of §9d's int4 clip — would be chasing ~0.04% of the
+error budget. Not worth building. At 8 bits with group 32, outlier inflation is
+already negligible.
+
+### The weights are the entire remaining error, and oq8++ nearly erases it
+
+| model | KLD vs bf16 (chunk 0) | PPL | prefill tok/s |
+|---|---|---|---|
+| oq4++ (W4A16) | 0.292738 | 19.976 | ~1046 |
+| **oq8++ (W8A16)** | **0.000351** | 23.635 | **86** |
+
+**oq8++ is ~830× closer to bf16 than oq4++ — effectively lossless.** This is the
+direct confirmation of §13b's estimate that ~88%+ of the distance to bf16 is
+weight quantization: with 8-bit weights the distance essentially vanishes.
+
+Two catches, both important:
+
+1. **oq8++ never reaches batched prefill.** `[prefill-eligible] base=false` —
+   `is_batchable_la` (`qwen35/mod.rs`) has an `Oq4G256` arm but **no `Oq8G256`**,
+   so every oq8 model drops to the per-token decode loop: **86 tok/s vs 1046, a
+   12× regression.** That also means the row above is W8**A16**, not W8A8 — the
+   int8 activation path is never entered. This is an admission-list gap, not a
+   property of 8-bit weights.
+2. **The fix is bounded but not a one-liner.** The oq8 batched kernel family
+   already exists (`fused_qkvza_oq8_wmma`, `fused_gate_up_oq8_wmma`,
+   `gemm_oq8_grouped_wmma`, `quantize_act_oq8[_sum]` — a real W8A8 quantizer),
+   but `forward_prefill_chunk` has only **4** `Oq8G256` arms (gate_up, a
+   residual-sigmoid path, and two MoE ones). The dense LA sites — qkvza, wo,
+   w_down — are unwired, so simply admitting the dtype would route those layers
+   into unhandled branches. Wiring those three sites and then admitting
+   `Oq8G256` is the actual task.
+
+Footprint: oq8++ body 501 MB vs oq4++ 253 MB (2×). Total artifact size is
+misleadingly similar (773 vs 762 MB) only because oq4++ keeps a **BF16** lm-head
++ embedding (509 MB) where oq8++ uses **Q8F16** (270 MB).
+
+### Bonus: the bf16 PPL anchor, and a clean demonstration that PPL is not the gate
+
+Because oq8++ sits at 0.000351 KLD, its output distribution *is* bf16's — so its
+**PPL of 23.635 is effectively bf16's PPL** on chunk 0. That is the anchor §13a
+could not obtain (the reference's stored top-256 gives only a restricted,
+optimistic 11.0).
+
+Against that anchor, **oq4++ scores PPL 19.98 — markedly BETTER than bf16 —
+while sitting 0.29 KLD away.** Quantization noise flattens the distribution, and
+on text where the model is often wrong a flatter distribution assigns *more* mass
+to the true token. A 4-bit model can therefore beat its own bf16 parent on
+perplexity while being distributionally much worse. This is the concrete case for
+the rule this plan already follows: **KLD is the admission gate; PPL is a
+sanity check, not evidence.**
+
+### Recommendation
+
+The activation-precision question is closed on this model (A8, untreated, is
+within 1e-4 of A16). The open lever with real headroom is **oq8 weights**, and
+the blocker is batched-prefill admission, not quality. Suggested order: wire the
+three missing dense `Oq8G256` LA sites, admit the dtype, re-measure KLD and
+tok/s, and only then decide whether 2× body footprint for ~830× less quantization
+error is the right trade for a given deployment. Note this is one small model on
+one corpus chunk — the oq8++ figure deserves a house-rule run once a working
+bf16 reference exists (§13a).
