@@ -151,7 +151,11 @@ pub enum QuantType {
     /// the true argmax inside a small top-K (measured recall@8 = 100%).
     /// It always accompanies a full-precision fine tier that rescores the
     /// shortlist; it is never the sole storage for a tensor.
-    CoarseQ4Row = 44,
+    ///
+    /// Numbered 48, not 44: `origin/master` independently assigned 44-47 to
+    /// `OpaqueBytes`/`Oq8Plain`/`Oq4MixedPlain`/`Oq4Plain` and already ships
+    /// artifacts carrying those codes, so it owns that range. Leave 44-47 free.
+    CoarseQ4Row = 48,
 }
 
 impl QuantType {
@@ -216,7 +220,7 @@ impl QuantType {
             41 => Qtip2G256,
             42 => Qtip4G256,
             43 => Oq8G256RowPadded,
-            44 => CoarseQ4Row,
+            48 => CoarseQ4Row,
             _ => return None,
         })
     }
@@ -447,5 +451,14 @@ mod tests {
         assert_eq!(QuantType::Qtip2G256.code(), 41);
         assert_eq!(QuantType::Qtip4G256.code(), 42);
         assert_eq!(QuantType::Oq8G256RowPadded.code(), 43);
+        // 44-47 belong to origin/master (OpaqueBytes, Oq8Plain, Oq4MixedPlain,
+        // Oq4Plain). Keep this one at 48 so the two numberings can merge.
+        assert_eq!(QuantType::CoarseQ4Row.code(), 48);
+        for code in 44..=47u8 {
+            assert!(
+                QuantType::from_code(code).is_none(),
+                "code {code} is reserved for origin/master"
+            );
+        }
     }
 }
