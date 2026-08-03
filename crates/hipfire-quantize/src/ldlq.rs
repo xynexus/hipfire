@@ -1779,7 +1779,6 @@ pub fn llt_lower_right_looking_gpu(
     a: &[f64],
     k: usize,
 ) -> Option<Vec<f64>> {
-    use hipfire_rdna::DType;
     const JB: usize = 128;
 
     // Device copy in f32. Only the lower triangle is meaningful from here on.
