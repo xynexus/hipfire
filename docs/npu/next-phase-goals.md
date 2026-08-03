@@ -225,6 +225,47 @@ over — so 3-bit shares the iu8 W8A8 kernels with oq4/oq8 rather than needing a
 W3 GEMV. That also retires the earlier "oq3 unpack is unaffordable" worry: that
 number came from a kernel decoding bit-planes to bf16, not to a shared int8 grid.
 
+**GOAL MET 2026-08-03: oq4.25++ BEATS q4nx ON BOTH METRICS AT 15% FEWER BITS.**
+
+                              b/w      PPL       KLD
+    q4nx (FLM, the bar)     5.0000  17.1949  0.034954
+    oq4.25++ @ alpha 0.45   4.2500  17.1547  0.034862   BETTER ON BOTH
+    oq4.25++ @ alpha 0.55   4.2500  17.1767  0.036631
+    oq4++    @ alpha 0.55   4.0625  17.2091  0.046167
+
+Margins are thin — 0.23% PPL, 0.26% KLD — so this is "clears the bar", not
+"clears it comfortably". They are meaningful because the harness is
+DETERMINISTIC: the same artifact reproduced KLD 0.088172 and 0.152725 exactly
+across repeated runs all session, so a 0.26% difference between artifacts is real.
+
+**THE BAR ITSELF WAS FINALLY MEASURED ON OUR HARNESS** (q4nx dequantised to dense
+f16 and scored through perplexity.rs against the same .pkld). Until then it was
+inferred from relative PPL degradation across two different harnesses, and that
+inference silently did NOT transfer to KLD: measured directly, plain oq4++ was
+1.32x WORSE than q4nx on KLD while matching it on PPL. The 2026-08-02 "parity"
+entry below is a PPL statement only.
+
+**WHAT MOVED IT, and what did not:**
+
+    alpha sweep 0.35-0.75    KLD floor 0.046167 at the 0.55 default — no gain
+    per-layer no-clip        KLD 0.048006 — worse; better PPL (17.0054)
+    oq4.125++ / .25 / .5     KLD 0.038748 / 0.036631 / 0.037291 — 21% at .25
+    then alpha on top of .25 KLD 0.034862 at alpha 0.45 — clears the bar
+
+Everything that adjusted the CENTRE of the weight distribution (smoothing,
+clipping) traded PPL against KLD and never moved KLD's floor. KLD is a top-128
+DISTRIBUTION match and the tail is what symmetric int4 at group 256 discards;
+q4nx keeps it with a zero-point and 8x more scales (asymmetric q4_1 at group 32).
+Sparse int8 outliers put the tail back — that is why mixed precision was the
+lever and parameter tuning was not.
+
+**The alpha optimum SHIFTED once outliers handled the tail** (0.55 -> 0.45), so
+sweeping alpha first and stopping there would have missed this entirely. Tune the
+structural knob, then re-tune the parameter.
+
+Cost: 4.25 b/w vs oq4++'s 4.0625 is ~5% of the bandwidth advantage, leaving 15%
+against q4nx rather than 19% — still ~15% throughput on a 92.4% DMA-bound decode.
+
 **ANSWERED 2026-08-02: oq4++ REACHES PARITY WITH q4nx AT 19% FEWER BITS.** The
 measurement this section called the most valuable open one in the phase, on a
 common corpus slice — the same 512 wikitext2 tokens, same 8-position warmup, the
