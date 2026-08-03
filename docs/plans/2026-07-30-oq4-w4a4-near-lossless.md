@@ -1942,3 +1942,56 @@ whole tensor (4.2%). Sub-tensor promotion would beat both.
   captured imatrix. Extending `collect-artifacts` to all sites would make the
   weighted ranking model-wide, and is the next step if this is to drive a real
   mixed-precision recipe.
+
+## 13m. Extending imatrix capture to all sites — NOT DONE, and why (2026-08-03)
+
+§13l's weighted ranking covers `mlp.down_proj` only. Attempting to extend the
+capture produced a precise map of the problem but no working change; recording it
+so the next attempt starts from the right place.
+
+**There are four distinct capture points per layer, not eight.** Weight sites
+that share an input share an imatrix: qkv/z/a/b (or q/k/v) share the attention
+input, gate+up share theirs, out_proj and down_proj have their own. So the target
+is 4 roles × 24 layers ≈ 96 tensors, not 186.
+
+**The capability already exists — twice.** `qwen35_capture_registry`
+(`calibration_stream.rs`) registers all four roles with
+`CapturePolicy::HessianAndImatrix`, and
+`forward_prefill_dense_session_batch_impl` has eight matching
+`capture_streamed_dense_input` call sites (four roles × two layer types). Neither
+is reachable from `hipfire collect-artifacts` for this model:
+
+- The CLI's default path is `collect_calibration_artifacts` → per-token
+  `forward_scratch`. Capture there happens only in the `weight_gemv*` wrappers,
+  and qwen3.5's **fused** qkvza/gate-up kernels bypass them. Only `down_proj`
+  appears because it routes through `weight_gemv_residual`.
+- The registry path is gated behind `--job-from`, which requires an **existing**
+  calibration artifact carrying a `job` contract. The 2026-06-27 artifacts have
+  `job_schema_version: null`, so they cannot seed it.
+- `hipfire-coexistence calibrate` (the layer-stream engine, full coverage)
+  requires a HuggingFace **safetensors** directory. The qwen3.5-0.8b snapshot on
+  this box is LFS-pointer-only; the payload is inside
+  `models--Qwen--Qwen3.5-0.8B.hfa`, and no HFAR extractor exists in-tree.
+
+**Two attempts, both failed, both informative.** Taps were added at the five
+`fused_rmsnorm_rotate_for_mq` sites in `decode_layers.rs`. Attempt 1 captured
+`x_rot`; it never fired because that helper's match lists MQ/MFP4 dtypes only —
+**Opus dtypes fall through to the `_` arm and return `None`**, leaving the normed
+input in `s.tmp`. Attempt 2 captured `x_rot.unwrap_or(&s.tmp)`; still 24 tensors,
+which means `forward_scratch_layers` in `decode_layers.rs` is **not the layer body
+this model executes** — the resident calib forward must run
+`forward_scratch_layers_lowered` (`lowered.rs`) or the `ep.rs` variant. Both
+attempts were reverted rather than committed: guarded no-op code that looks like
+a fix but isn't is worse than no code.
+
+**Next attempt should start by confirming which layer-body function the resident
+calibration forward actually runs** (instrument `collect_calibration_artifacts`
+or breakpoint the capture), then either put the taps there or — cleaner — thread
+the registry-driven `forward_prefill_dense_session_batch_with_capture` into the
+non-`--job-from` path, which already has all four roles wired and validated.
+
+Also worth noting: the capture convention is **already inconsistent** in-tree.
+`weight_gemm`'s tap documents "capture the pre-rotation x", while the MQ4/MQ3
+arms of `weight_gemv_residual` capture the **rotated** activation. Any extension
+should settle that first, because a `.calib.hfq` mixing both is silently wrong
+for a consumer that assumes one basis.
