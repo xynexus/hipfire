@@ -124,12 +124,44 @@ half the conditioning, better distribution match, 2% more bits. PPL disagrees
 slightly (20.09 vs 19.90), so KLD and PPL are not ranking these identically;
 do not quote one as if it settled the other.
 
-The lever is still calibration, but the trellis is now the better container to
-apply it to. Real `qtip3++` — Hessian-weighting the beam search so it minimises
-OUTPUT error rather than unweighted squared error, which is the actual QTIP
-recipe — is untested and is the experiment most likely to make 3-bit
-competitive. `qtip3++` currently REFUSES to run rather than silently producing
-an AWQ-only artifact under a name whose second `+` promises error feedback.
+**ERROR FEEDBACK MEASURED 2026-08-03 — BEST 3-BIT YET.** Three formulations were
+implemented and compared at a FIXED encoder and beam (conditioning the only
+variable), then the winner was paired with the strong encoder:
+
+    arm (beam 4, CPU)   PPL      KLD        vs plain   encode cost
+    plain             33.1883  0.590375       —           1x
+    weighted          29.0761  0.509756    1.16x          8x
+    greedy            23.1624  0.300033    1.97x         23x
+    beamldlq          22.5309  0.260646    2.27x         35x
+
+They rank in cost order. But the number that decides the design is NOT in that
+table: plain qtip3+ with GPU exact Viterbi scores 0.152725 — better than the best
+conditioned CPU arm. **Encoder quality dominates conditioning; you cannot pay for
+feedback by narrowing the beam.** So the two must be combined, and only `greedy`
+can be: it needs the CHOSEN path only, so each block delegates to the Viterbi
+encoder and still feeds error forward. `beamldlq` keeps a residual per beam
+candidate and cannot delegate.
+
+    qtip3+        (AWQ, Viterbi)      3.1250 b/w  PPL 20.0937  KLD 0.152725
+    qtip3+greedy  (AWQ+OBS, Viterbi)  3.1250 b/w  PPL 18.8525  KLD 0.093290
+    oq3++         (AWQ+LDLQ)          3.0625 b/w  PPL 19.9025  KLD 0.197836
+    oq4++         (AWQ+LDLQ)          4.0625 b/w  PPL 17.2091  KLD 0.046167
+
+**qtip3+greedy is 2.12x better than oq3++ at the same 3-bit tier** and closes the
+gap to oq4++ from 4.29x to 2.02x, at 23% fewer bits. Still short of the q4nx bar
+(+14.9% PPL vs +4.89%), so oq4++ remains the only quant at parity.
+
+Predicted 0.078 from the beam-4 ratio and got 0.093290: conditioning buys LESS on
+top of a stronger encoder. Assume that direction rather than extrapolating a
+weak-encoder ratio. Cost is 3584s vs ~100s (36x) — the tensor is encoded
+block-by-block instead of once. Offline only.
+
+`weighted` was expected to be a no-op (the FWHT exists to flatten the rotated
+diagonal it weights by). It is the weakest at 1.16x, but not nothing.
+
+`qtip3++` still REFUSES to run: the trellis has no in-beam Hessian weighting, so
+the second `+` would promise error feedback the pack does not implement. The
+shipped combination is spelled `qtip3+` with `HIPFIRE_QTIP_COND=greedy`.
 
 LQER IS A DEAD END ON THIS PATH, measured, not assumed. `HIPFIRE_LOWRANK_R`
 emits 224 `lr_u`/`lr_v` tensors and llama scores BIT-IDENTICAL (25.2538 /
