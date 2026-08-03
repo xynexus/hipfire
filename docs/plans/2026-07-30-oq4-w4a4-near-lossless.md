@@ -1348,7 +1348,11 @@ row was invalid: the group knob read identical KLD to 6 decimal places because
 the example binary predated the dispatch rebuild. Identical-to-6-digits is the
 signature of a knob that never got linked in; re-run after rebuilding.
 
-**Throughput cost** (real-model prefill, 8192 tok, same-run paired):
+**Throughput cost** (real-model prefill, 8192 tok, same-run paired) — **SUPERSEDED
+by §13h: these are measurement-order artifacts.** A control run showed the same
+config reading 1084 tok/s in first position and 998 in third, so a single paired
+run cannot resolve a few-percent difference. Replicated interleaved medians put
+clip+g128 at **−0.8%**, not −9%. Table kept for the record:
 
 | variant | tok/s | vs incumbent |
 |---|---|---|
@@ -1454,6 +1458,98 @@ that should gate a default flip.
 The incremental clip+g128-over-clip is real but modest (t = −2.39, 12/16) — the
 group lever's value here is disproportionately in the tail, not the mean.
 
-Scope unchanged from §13: one small hybrid model, one corpus, gfx1103. The
-throughput cost stands at ~−9% prefill vs the incumbent (§13c). Ship size is
-**128, not 64** — 64 is not wave64-portable (§13d).
+Scope unchanged from §13: one small hybrid model, one corpus, gfx1103. Ship size
+is **128, not 64** — 64 is not wave64-portable (§13d). (The "~−9% prefill" cost
+quoted here originally was a measurement-order artifact; §13h replicates it at
+**−0.8%**.)
+
+## 13h. The A8 `o_proj` lever — int8 activation fully closes the sensitive site (2026-08-03)
+
+§13c's sensitivity sweep found `o_proj` (then `down`) to be where the int4
+activation actually hurts, and bounded the gain with an A16 lift. This builds the
+real lever: int8 activation at those two sites, `HIPFIRE_OQ4_PREFILL_ACT_BITS_O=8`
+/ `_DOWN=8`.
+
+**It needed almost no new code** — `gemm_oq4_residual_mmq(.., add)` already
+existed (q8_1 activation quantize + int8-WMMA MMQ over the 4-bit weight, with a
+fused residual add). **But its `add=true` arm had never been exercised**: every
+caller in the tree passed `add=false`, and the parity example only covered SET.
+So the first task was verifying dead code, not writing new code.
+`parity_gemm_oq4_mmq` now covers the add arm on **both** dispatch arms (the
+`_full_add` fast path at M%128==0 && N%128==0, and the generic bounds-checked
+kernel), checking `Y_add == R + Y_set` **bit-exactly** — the GPU's `*yp += v` and
+a host add of the same `v` are the same f32 op — plus a touched-element count, so
+an add arm that skipped tiles could not pass on the elements it did write.
+ALL PASS, max_abs 0.000000, every element touched, 4 shapes.
+
+**Quality** (16 chunks × ctx 512, 8048 positions, same full-A16 reference as
+§13g; per-chunk dumps paired across configs):
+
+| variant | KLD/tok | PPL | worst chunk |
+|---|---|---|---|
+| current mix (incumbent) | 0.063187 | 26.072 | 0.083231 |
+| clip + g128 (§13g best) | 0.056399 | 25.636 | 0.078459 |
+| **clip + g128, O=A8** | **0.041427** | 25.202 | 0.055310 |
+| clip + g128, O=A16 *(upper bound)* | 0.041534 | 25.164 | 0.058215 |
+| **clip + g128, O=A8 DOWN=A8** | **0.032565** | **24.834** | **0.044448** |
+| clip + g128, O+DOWN=A16 *(upper bound)* | 0.032152 | 24.875 | 0.042518 |
+| *(A16 everywhere — the floor)* | *0.000000* | *24.826* | — |
+
+Paired per-chunk:
+
+| comparison | won | mean Δ | paired t |
+|---|---|---|---|
+| O=A8 vs mix | **16/16** | −0.02176 | **−18.13** |
+| O=A8 vs clip+g128 | **16/16** | −0.01497 | −12.27 |
+| O+DOWN=A8 vs mix | **16/16** | −0.03062 | **−20.62** |
+| **O=A8 vs O=A16** | 8/16 | −0.00011 | **−0.19** |
+| **O+DOWN=A8 vs O+DOWN=A16** | 8/16 | +0.00041 | **+0.87** |
+
+**The decisive result: A8 is statistically indistinguishable from A16 at these
+sites** (t = −0.19 and +0.87, 8/16 splits — coin flips). int8 activation captures
+essentially **100% of the A16 upper bound**. So the damage at `o_proj`/`down` was
+never "activation precision" in general — it was specifically int4. Eight bits is
+enough; sixteen buys nothing.
+
+Full stack vs the shipped incumbent: **KLD 0.0326 vs 0.0632 (−48%)**, PPL 24.834
+vs 26.072 — and the A16 floor is 24.826, i.e. the recipe lands **within 0.008 PPL
+of full-precision activations**. It wins **16/16 chunks** and improves the worst
+chunk by 47% (0.0832 → 0.0444).
+
+### Throughput — and a correction to §13c
+
+Single-shot paired runs are not reliable on this box. An order control makes it
+unambiguous: **the same config reads 1084.1 tok/s running first and 998.4 running
+third** — an 8.6% position effect, larger than any difference between configs.
+Interleaved round-robin, 3 reps, medians (8192-token prefill):
+
+| config | reps | median tok/s | vs mix |
+|---|---|---|---|
+| mix (incumbent) | 1045.2 / 1016.4 / 1013.4 | 1016.4 | — |
+| A4 plain | 1018.1 / 1018.6 / 1019.0 | 1018.6 | +0.2% |
+| clip + g128 | 1008.0 / 1010.0 / 1007.7 | 1008.0 | −0.8% |
+| clip + g128, O=A8 | 1000.2 / 1002.9 / 1005.2 | 1002.9 | −1.3% |
+| **clip + g128, O+DOWN=A8** | 996.9 / 1001.2 / 1001.9 | 1001.2 | **−1.5%** |
+
+Within-config spread is ≤0.3% once the first run is excluded; only the
+first-executed config is inflated.
+
+> **CORRECTION to §13c/§13g:** the "−9% prefill" cost quoted for clip+g128 was a
+> **measurement-order artifact** — it compared a first-run `mix` against
+> later-position candidates. The replicated figure is **−0.8%**, and the full
+> A8 stack is **−1.5%**. The earlier §9h finding is unaffected and in fact
+> reinforced: activation precision is a ~1% throughput lever on this model, in
+> either direction. Any future throughput claim here must interleave and
+> replicate; a single paired run is not evidence.
+
+**Verdict: clip + group-128 + A8 on o_proj and down is a −48% KLD improvement over
+the shipped incumbent for ~1.5% prefill, winning every chunk and nearly reaching
+the A16 activation floor.** That is a far stronger ship case than any earlier
+configuration in this plan.
+
+Scope unchanged: one small hybrid model (qwen3.5-0.8b), one corpus, gfx1103, and
+the batched dense prefill path (the FA branch's 3 sites are not wired). `gate_up`
+is deliberately left at A4 — §13c measured it at ~2% of the penalty, so it does
+not justify the MMQ cost. Still owed: a dense/wider GEMM-bound model, ≥16-chunk
+on a second corpus, and a regenerated bf16 reference (§13a) for an absolute
+number on this recipe.

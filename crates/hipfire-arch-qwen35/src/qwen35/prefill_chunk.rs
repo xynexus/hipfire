@@ -14,12 +14,26 @@ use super::*;
 ///
 /// `HIPFIRE_OQ4_PREFILL_ACT_BITS_<SITE>` (QKV | GATEUP | O | DOWN) overrides the
 /// global `HIPFIRE_OQ4_PREFILL_ACT_BITS` for that site alone; with both unset the
-/// production routing is unchanged. The per-site form exists so a smoke A/B can
-/// hold ONE projection at A16 while the rest run A4 — an upper bound on what a
-/// mixed-precision (ResQ-style) treatment of that site could buy, measurable
-/// without building the dual int4+int8 GEMM first.
+/// production routing is unchanged. Values: `4` (int4 activation), `8` (int8-MMQ
+/// — O and DOWN only; QKV already routes to MMQ by default at n>=64), `16` (f16
+/// activation).
+///
+/// The per-site form started as a way to hold ONE projection at A16 while the
+/// rest ran A4 — an upper bound on what mixed precision at that site could buy,
+/// measurable before building anything. That sweep found `o_proj` to be the
+/// activation-sensitive site (plan §13c), and `8` is the real lever it pointed at.
+/// The site names are spelled out rather than interpolated so the env-doc
+/// scanner (and anyone grepping) can see them, and so the lookup does not
+/// allocate on the prefill path.
 pub(crate) fn oq4_act_bits(site: &str) -> Option<String> {
-    std::env::var(format!("HIPFIRE_OQ4_PREFILL_ACT_BITS_{site}"))
+    let per_site = match site {
+        "QKV" => std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS_QKV"),
+        "GATEUP" => std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS_GATEUP"),
+        "O" => std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS_O"),
+        "DOWN" => std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS_DOWN"),
+        other => panic!("oq4_act_bits: unknown site {other}"),
+    };
+    per_site
         .ok()
         .or_else(|| std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").ok())
 }
@@ -3085,8 +3099,12 @@ pub(crate) fn forward_prefill_chunk(
                     // No fused oq4 residual kernel → grouped-WMMA GEMM into scratch
                     // + add into the residual stream (pbs.x_batch).
                     // A4 KLD gate: HIPFIRE_OQ4_PREFILL_ACT_BITS[_O]=16 uses the
-                    // W4A16 residual variant (act16 baseline); default = W4A4.
-                    if oq4_act_bits("O").as_deref() == Some("16") {
+                    // W4A16 residual variant (act16 baseline), =8 the int8-MMQ
+                    // residual variant; default = W4A4. o_proj is the most
+                    // activation-sensitive oq4 site (plan §13c), so A8 here is
+                    // the cheapest real mixed-precision lever.
+                    let o_bits = oq4_act_bits("O");
+                    if o_bits.as_deref() == Some("16") {
                         gpu.gemm_oq4_grouped_residual_f16_batched(
                             &layer.wo.buf,
                             wo_input,
@@ -3094,6 +3112,17 @@ pub(crate) fn forward_prefill_chunk(
                             layer.wo.m,
                             layer.wo.k,
                             n,
+                        )?;
+                    } else if o_bits.as_deref() == Some("8") {
+                        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+                        gpu.gemm_oq4_residual_mmq(
+                            &layer.wo.buf,
+                            wo_input,
+                            &x_n,
+                            layer.wo.m,
+                            layer.wo.k,
+                            n,
+                            true,
                         )?;
                     } else {
                         gpu.gemm_oq4_grouped_residual_act_batched(
@@ -3617,8 +3646,11 @@ pub(crate) fn forward_prefill_chunk(
                     // Opus W4A4: ffn_hidden_batch is FWHT(+AWQ)-rotated above
                     // (fused_silu_mul_rotate_mq, w_down_is_mq). grouped-WMMA GEMM
                     // into scratch + residual add into the hidden stream.
-                    // A4 KLD gate: [_DOWN]=16 uses the W4A16 residual variant.
-                    if oq4_act_bits("DOWN").as_deref() == Some("16") {
+                    // A4 KLD gate: [_DOWN]=16 uses the W4A16 residual variant,
+                    // =8 the int8-MMQ one (down is the 2nd most act-sensitive
+                    // oq4 site after o_proj — plan §13c).
+                    let down_bits = oq4_act_bits("DOWN");
+                    if down_bits.as_deref() == Some("16") {
                         gpu.gemm_oq4_grouped_residual_f16_batched(
                             &layer.w_down.buf,
                             &pbs.ffn_hidden_batch,
@@ -3626,6 +3658,17 @@ pub(crate) fn forward_prefill_chunk(
                             layer.w_down.m,
                             layer.w_down.k,
                             n,
+                        )?;
+                    } else if down_bits.as_deref() == Some("8") {
+                        let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
+                        gpu.gemm_oq4_residual_mmq(
+                            &layer.w_down.buf,
+                            &pbs.ffn_hidden_batch,
+                            &x_n,
+                            layer.w_down.m,
+                            layer.w_down.k,
+                            n,
+                            true,
                         )?;
                     } else {
                         gpu.gemm_oq4_grouped_residual_act_batched(
