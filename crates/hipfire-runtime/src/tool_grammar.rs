@@ -23,6 +23,8 @@
 //! malformed call — which is a stronger guarantee than finetuning it to prefer valid
 //! ones.
 
+use std::collections::HashMap;
+
 /// Schema for the tools available to a request, built from the OpenAI-format tools
 /// array. A grammar uses this to constrain tool names and parameter names at the
 /// positions where they appear.
@@ -36,7 +38,29 @@ pub struct ToolSchema {
     /// its close alternatives until every required param has been seen, which stops a
     /// model emitting an empty call that the downstream client then rejects.
     pub required: Vec<String>,
+    /// Closed value sets, by param name, from the JSON-Schema `enum` of that param.
+    /// A param listed here may only decode to one of its values; a param absent keeps
+    /// a free-text body. Only params with a genuinely closed set belong here — free
+    /// text (`contents`, `command`) constrained by mistake wedges generation.
+    pub allowed_values: HashMap<String, Vec<String>>,
 }
+
+/// Above this many candidates a value set is ignored and the param decodes free.
+///
+/// Measured (`cargo test -p hipfire-runtime --release --lib -- --ignored grammar_`, 129k
+/// vocab, 42-byte path values, at a constrained param BODY — the position value sets
+/// actually apply to): 0.31ms/token at 1 candidate, 4.2ms at 16, 16.4ms at 64, i.e. linear
+/// at ~0.26ms per candidate. A real call is 55% constrained (22 of 40 tokens), so 64
+/// candidates costs ~360ms per call. That is the last tolerable rung; past it, correcting
+/// a bad argument after the fact is cheaper than making it unreachable. At those value
+/// lengths [`MAX_CONSTRAINED_BYTES`] binds first above 64 anyway.
+pub const MAX_CONSTRAINED_VALUES: usize = 64;
+
+/// Above this many bytes of values in total a value set is ignored and the param decodes
+/// free. The count cap alone doesn't bound the work: `enum` is client-supplied wire data,
+/// and 64 values of 8KB each is a legal request that would allocate half a megabyte of
+/// continuations per constrained token.
+pub const MAX_CONSTRAINED_BYTES: usize = 4096;
 
 /// A tool-call dialect as a byte-level state machine.
 ///
@@ -293,6 +317,9 @@ pub struct MiniCpmXmlGrammar {
     /// Param names already emitted for the current call, so required-param tracking
     /// can withhold the close.
     emitted: Vec<String>,
+    /// The current param body has left every allowed value behind, so its value set is
+    /// spent for the rest of this param. Reset on entering the next body.
+    value_diverged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -330,6 +357,16 @@ fn keep_marker_prefix(buf: &mut String, marker: &str) {
     buf.clear();
 }
 
+/// Whether `value` can still complete from what a constrained body has emitted so far:
+/// `partial` is a prefix of `value</param>`, or has already run through it. Compares
+/// against the two pieces rather than building `value + PARAM_CLOSE`, which would
+/// allocate per value per token.
+fn value_live(partial: &str, value: &str) -> bool {
+    value.starts_with(partial)
+        // `starts_with` guarantees value.len() is a char boundary in partial.
+        || (partial.starts_with(value) && PARAM_CLOSE.starts_with(&partial[value.len()..]))
+}
+
 impl MiniCpmXmlGrammar {
     pub fn new(tools: Vec<ToolSchema>) -> Self {
         Self {
@@ -338,11 +375,32 @@ impl MiniCpmXmlGrammar {
             tools,
             tool_idx: None,
             emitted: Vec::new(),
+            value_diverged: false,
         }
     }
 
     fn current_tool(&self) -> Option<&ToolSchema> {
         self.tool_idx.and_then(|i| self.tools.get(i))
+    }
+
+    /// Value set constraining the param currently being emitted, when it has one that
+    /// is worth enforcing. Only meaningful in [`XmlState::InParamBody`], where the last
+    /// emitted name is the param being filled in.
+    fn current_values(&self) -> Option<&[String]> {
+        if self.value_diverged {
+            return None;
+        }
+        let vals = self
+            .current_tool()?
+            .allowed_values
+            .get(self.emitted.last()?)?;
+        // Empty set = nothing legal at all, which would wedge the call; too many or too
+        // many bytes = the per-token scan gets expensive (see MAX_CONSTRAINED_VALUES /
+        // MAX_CONSTRAINED_BYTES). All fall back to free text.
+        (!vals.is_empty()
+            && vals.len() <= MAX_CONSTRAINED_VALUES
+            && vals.iter().map(String::len).sum::<usize>() <= MAX_CONSTRAINED_BYTES)
+            .then_some(vals.as_slice())
     }
 
     /// Every required param emitted, so the call may close.
@@ -380,6 +438,15 @@ impl MiniCpmXmlGrammar {
                 true
             }
             XmlState::InBody => {
+                // Whitespace between tags is legal in this dialect, and a `</param>`
+                // token that carries a trailing newline leaves that newline here. Without
+                // consuming it, `partial` can never start with either marker again and
+                // the call wedges in InBody for the rest of the generation.
+                let ws = self.partial.len() - self.partial.trim_start().len();
+                if ws > 0 {
+                    self.partial.drain(..ws);
+                    return true;
+                }
                 if self.partial.starts_with(PARAM_OPEN) {
                     self.partial.drain(..PARAM_OPEN.len());
                     self.state = XmlState::InParamName;
@@ -401,6 +468,7 @@ impl MiniCpmXmlGrammar {
                 self.emitted.push(name);
                 self.partial.drain(..quote + 2);
                 self.state = XmlState::InParamBody;
+                self.value_diverged = false;
                 true
             }
             XmlState::InParamBody => {
@@ -409,7 +477,23 @@ impl MiniCpmXmlGrammar {
                     self.state = XmlState::InBody;
                     return true;
                 }
-                keep_marker_prefix(&mut self.partial, PARAM_CLOSE);
+                // `constrained_pick` lets the sampled token through when nothing is
+                // legal, which can push the body off every allowed value. From there the
+                // set can never match again: mark it spent so the body finishes as free
+                // text — otherwise the constraint is dead weight AND the whole-buffer
+                // rule below grows `partial` for the rest of the call.
+                if self
+                    .current_values()
+                    .is_some_and(|vals| !vals.iter().any(|v| value_live(&self.partial, v)))
+                {
+                    self.value_diverged = true;
+                }
+                // A constrained body is matched from its first byte, so its buffer must
+                // be kept whole; trimming it to the close-marker prefix (what a free
+                // body wants) would lose the value prefix and wedge the call.
+                if self.current_values().is_none() {
+                    keep_marker_prefix(&mut self.partial, PARAM_CLOSE);
+                }
                 false
             }
         }
@@ -426,7 +510,10 @@ impl ToolGrammar for MiniCpmXmlGrammar {
             // the close tag starting.
             // ponytail: a literal `</...` inside a value (e.g. HTML in a string) is
             // forced to `</param>`. Same ceiling DSML accepts; escape via CDATA.
-            XmlState::InParamBody => !self.partial.starts_with("</"),
+            // A param with a closed value set is constrained from its first byte.
+            XmlState::InParamBody => {
+                self.current_values().is_none() && !self.partial.starts_with("</")
+            }
             _ => false,
         }
     }
@@ -462,7 +549,13 @@ impl ToolGrammar for MiniCpmXmlGrammar {
                         .collect()
                 })
                 .unwrap_or_default(),
-            XmlState::InParamBody => vec![PARAM_CLOSE.to_string()],
+            // A closed value set forces the body the same way names are forced, one
+            // position further in: value + close, so the existing close transition
+            // still fires when the value completes.
+            XmlState::InParamBody => match self.current_values() {
+                Some(vals) => vals.iter().map(|v| format!("{v}{PARAM_CLOSE}")).collect(),
+                None => vec![PARAM_CLOSE.to_string()],
+            },
         }
     }
 
@@ -485,13 +578,22 @@ mod minicpm_tests {
                 name: "read_file".to_string(),
                 params: vec!["path".to_string()],
                 required: vec!["path".to_string()],
+                allowed_values: HashMap::new(),
             },
             ToolSchema {
                 name: "write_file".to_string(),
                 params: vec!["path".to_string(), "contents".to_string()],
                 required: vec!["path".to_string(), "contents".to_string()],
+                allowed_values: HashMap::new(),
             },
         ]
+    }
+
+    /// `write_file` again, but `path` is a closed set and `contents` stays free text.
+    fn tools_with_values(paths: Vec<String>) -> Vec<ToolSchema> {
+        let mut tools = tools();
+        tools[1].allowed_values.insert("path".to_string(), paths);
+        tools
     }
 
     fn feed(g: &mut MiniCpmXmlGrammar, s: &str) {
@@ -583,6 +685,164 @@ mod minicpm_tests {
     }
 
     #[test]
+    fn a_constrained_value_can_only_decode_to_a_listed_one() {
+        let mut g = MiniCpmXmlGrammar::new(tools_with_values(vec![
+            "src/lib.rs".to_string(),
+            "src/main.rs".to_string(),
+        ]));
+        feed(
+            &mut g,
+            "<function name=\"write_file\"><param name=\"path\">",
+        );
+        assert!(!g.is_free(), "a closed value set constrains the body");
+        assert!(is_token_allowed(&g, "src/"), "shared prefix of both values");
+        assert!(!is_token_allowed(&g, ".git/"), "not in the set");
+        feed(&mut g, "src/");
+        let vocab: Vec<String> = ["lib.rs</param>", "main", "other.rs</param>", ".git"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut mask = vec![true; vocab.len()];
+        token_mask(&g, &vocab, &mut mask);
+        assert_eq!(
+            mask,
+            vec![true, true, false, false],
+            "only in-set continuations survive the mask"
+        );
+        feed(&mut g, "lib.rs</param>");
+        assert_eq!(g.state, XmlState::InBody, "the close still fires");
+    }
+
+    #[test]
+    fn a_free_param_beside_a_constrained_one_stays_free() {
+        let mut g = MiniCpmXmlGrammar::new(tools_with_values(vec!["src/lib.rs".to_string()]));
+        feed(
+            &mut g,
+            "<function name=\"write_file\"><param name=\"contents\">",
+        );
+        assert!(g.is_free(), "contents has no value set");
+        assert!(is_token_allowed(&g, "anything at all"));
+        feed(&mut g, "fn main() { let a: Vec<u8> = vec![]; }</param>");
+        assert_eq!(g.state, XmlState::InBody);
+    }
+
+    #[test]
+    fn a_value_set_past_the_cap_decodes_free() {
+        let big: Vec<String> = (0..=MAX_CONSTRAINED_VALUES)
+            .map(|i| format!("f{i}"))
+            .collect();
+        let mut g = MiniCpmXmlGrammar::new(tools_with_values(big));
+        feed(
+            &mut g,
+            "<function name=\"write_file\"><param name=\"path\">",
+        );
+        assert!(g.is_free(), "past the cap the param is unconstrained");
+        assert!(is_token_allowed(&g, "anything at all"));
+        // and exactly at the cap it still constrains
+        let capped: Vec<String> = (0..MAX_CONSTRAINED_VALUES)
+            .map(|i| format!("f{i}"))
+            .collect();
+        let mut g = MiniCpmXmlGrammar::new(tools_with_values(capped));
+        feed(
+            &mut g,
+            "<function name=\"write_file\"><param name=\"path\">",
+        );
+        assert!(!g.is_free());
+        assert!(!is_token_allowed(&g, "zzz"));
+    }
+
+    #[test]
+    fn an_empty_value_set_decodes_free_rather_than_wedging() {
+        let mut g = MiniCpmXmlGrammar::new(tools_with_values(Vec::new()));
+        feed(
+            &mut g,
+            "<function name=\"write_file\"><param name=\"path\">",
+        );
+        assert!(g.is_free());
+        assert!(is_token_allowed(&g, "whatever"));
+    }
+
+    #[test]
+    fn a_value_set_past_the_byte_cap_decodes_free() {
+        let long = "d/".repeat(MAX_CONSTRAINED_BYTES / 3);
+        let mut g = MiniCpmXmlGrammar::new(tools_with_values(vec![long.clone(), long]));
+        feed(
+            &mut g,
+            "<function name=\"write_file\"><param name=\"path\">",
+        );
+        assert!(g.is_free(), "two values, but far past the byte budget");
+        assert!(is_token_allowed(&g, "anything at all"));
+    }
+
+    /// The mask is built from `Tokenizer::decode` output (real bytes), never from
+    /// `Tokenizer::vocab()`, whose canonical BPE strings spell a space `Ġ`. A value with
+    /// whitespace in it is where the two forms visibly disagree.
+    #[test]
+    fn a_constrained_value_containing_a_space_matches_only_the_decoded_form() {
+        let mut g = MiniCpmXmlGrammar::new(tools_with_values(vec!["docs/my notes.md".to_string()]));
+        feed(
+            &mut g,
+            "<function name=\"write_file\"><param name=\"path\">docs/my",
+        );
+        let vocab: Vec<String> = ["Ġnotes.md</param>", " notes.md</param>"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut mask = vec![true; vocab.len()];
+        token_mask(&g, &vocab, &mut mask);
+        assert_eq!(
+            mask,
+            vec![false, true],
+            "the raw BPE form is off-path; only the decoded one survives"
+        );
+        feed(&mut g, " notes.md</param>");
+        assert_eq!(g.state, XmlState::InBody, "the close still fires");
+    }
+
+    /// `constrained_pick` lets the sampled token through when no token is legal, so a
+    /// body can leave the value set behind. The set must go free from there rather than
+    /// scanning candidates that can never match again while `partial` grows forever.
+    #[test]
+    fn a_body_that_leaves_the_value_set_falls_back_to_free_text() {
+        let mut g = MiniCpmXmlGrammar::new(tools_with_values(vec!["src/lib.rs".to_string()]));
+        feed(
+            &mut g,
+            "<function name=\"write_file\"><param name=\"path\">",
+        );
+        assert!(!g.is_free());
+        feed(&mut g, "/etc/pa");
+        assert!(g.is_free(), "diverged: the constraint is spent");
+        feed(&mut g, "sswd, and then a long tail of unconstrained prose");
+        assert!(
+            g.partial().len() < PARAM_CLOSE.len(),
+            "buffer is trimmed again, not grown for the rest of the call"
+        );
+        feed(&mut g, "</param>");
+        assert_eq!(g.state, XmlState::InBody, "the close tag still transitions");
+        feed(&mut g, "<param name=\"path\">");
+        assert!(!g.is_free(), "the next body is constrained again");
+    }
+
+    /// A `</param>` token that carries a trailing newline leaves it in the buffer at
+    /// InBody, where nothing used to consume it — wedging the rest of the generation.
+    #[test]
+    fn whitespace_between_tags_does_not_wedge_the_body() {
+        let mut g = MiniCpmXmlGrammar::new(tools());
+        feed(
+            &mut g,
+            "<function name=\"read_file\"><param name=\"path\">src/lib.rs</param>\n",
+        );
+        assert_eq!(g.state, XmlState::InBody);
+        assert!(
+            is_token_allowed(&g, FN_CLOSE),
+            "the close is still reachable"
+        );
+        assert!(is_token_allowed(&g, PARAM_OPEN));
+        feed(&mut g, FN_CLOSE);
+        assert_eq!(g.state, XmlState::Out, "the call still closes");
+    }
+
+    #[test]
     fn markers_split_across_tokens_still_transition() {
         let mut g = MiniCpmXmlGrammar::new(tools());
         for frag in ["<fun", "ction", " name", "=\"", "read", "_file", "\">"] {
@@ -612,13 +872,17 @@ mod cost_measurements {
             .collect()
     }
 
-    /// Schema with `k` params, standing in for a value set of size `k` — the same shape
-    /// the proposed `allowed_values` constraint would produce.
+    /// Schema whose `path` param carries a `k`-value set of realistic repo paths (~48
+    /// bytes each) — the shipped `allowed_values` shape, not a stand-in.
     fn schema_with(k: usize) -> Vec<ToolSchema> {
+        let values: Vec<String> = (0..k)
+            .map(|i| format!("crates/hipfire-runtime/src/gen/mod_{i:04}.rs"))
+            .collect();
         vec![ToolSchema {
             name: "write_file".to_string(),
-            params: (0..k).map(|i| format!("p{i}")).collect(),
+            params: vec!["path".to_string()],
             required: Vec::new(),
+            allowed_values: HashMap::from([("path".to_string(), values)]),
         }]
     }
 
@@ -640,9 +904,15 @@ mod cost_measurements {
         println!("{}", "-".repeat(42));
         for k in [1usize, 4, 16, 64, 256, 1_024] {
             let mut g = MiniCpmXmlGrammar::new(schema_with(k));
-            // park it at a constrained position: choosing a param name
-            g.advance("<function name=\"write_file\"><param name=\"");
-            assert!(!g.is_free(), "must be constrained to measure the hot path");
+            // Park it where a value set is enforced: inside a constrained param BODY,
+            // which is the position the candidate set actually scales at.
+            g.advance("<function name=\"write_file\"><param name=\"path\">");
+            if g.is_free() {
+                // The guards in `current_values` dropped the set, so this row cannot
+                // occur in production — report that instead of timing the free path.
+                println!("{k:>10}  {:>24}", "(unconstrained: over the cap)");
+                continue;
+            }
 
             let reps = 20;
             let t0 = Instant::now();
@@ -684,6 +954,7 @@ mod cost_measurements {
             name: "write_file".to_string(),
             params: vec!["path".to_string(), "contents".to_string()],
             required: vec!["path".to_string()],
+            allowed_values: HashMap::new(),
         }]);
         // Feed it the way a tokenizer would: small fragments.
         let (mut constrained, mut total) = (0usize, 0usize);

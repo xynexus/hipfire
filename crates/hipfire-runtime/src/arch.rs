@@ -775,6 +775,9 @@ fn pick_next(
 /// so this is one logits download plus a vocab scan, not a per-step cost. Returns
 /// `None` when nothing is legal (the grammar has painted itself into a corner), leaving
 /// the sampled token alone rather than wedging the decode.
+///
+/// `vocab` is the DECODED vocab (see [`decode_loop_with_grammar`]); the raw BPE strings
+/// never match a continuation containing a space or newline.
 fn constrained_pick(
     gpu: &mut Gpu,
     backend: &mut dyn SimpleAr,
@@ -782,12 +785,17 @@ fn constrained_pick(
     grammar: &dyn crate::tool_grammar::ToolGrammar,
 ) -> Option<u32> {
     let logits = gpu.download_f32(backend.logits()).ok()?;
+    // Via the mask, not `is_token_allowed` per entry: the latter rebuilds the
+    // continuation list for every vocab token, which is the naive form measured at
+    // 8.6ms/token with ONE candidate — and value sets make the list far longer.
+    let mut mask = vec![false; vocab.len()];
+    crate::tool_grammar::token_mask(grammar, vocab, &mut mask);
     let mut best: Option<(u32, f32)> = None;
-    for (id, text) in vocab.iter().enumerate() {
+    for (id, &allowed) in mask.iter().enumerate() {
         if id >= logits.len() {
             break;
         }
-        if !crate::tool_grammar::is_token_allowed(grammar, text) {
+        if !allowed {
             continue;
         }
         let score = logits[id];
@@ -1057,6 +1065,7 @@ pub fn decode_loop_with_timing_terminators(
         prompt_tokens,
         timing,
         None,
+        &[],
     )
 }
 
@@ -1067,6 +1076,13 @@ pub fn decode_loop_with_timing_terminators(
 /// Costs nothing while the grammar is free — which is most of a generation (prose, code,
 /// parameter bodies). Only structural positions (markers, tool and parameter names) pay
 /// for the vocab scan.
+///
+/// `decoded_vocab` must be the vocab as [`crate::tokenizer::Tokenizer::decode`] renders
+/// it — real bytes, indexed by token id — NOT `Tokenizer::vocab()`, whose canonical BPE
+/// strings spell a space `Ġ` and a newline `Ċ`. The grammar is advanced with decoded
+/// text, so masking against raw strings silently fails to match any continuation
+/// containing whitespace or non-ASCII. Building it is O(vocab), so callers cache it
+/// (`Model::decoded_vocab`). An empty slice disables the constraint.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_loop_with_grammar(
     gpu: &mut Gpu,
@@ -1078,6 +1094,7 @@ pub fn decode_loop_with_grammar(
     prompt_tokens: usize,
     timing: DecodeLoopTiming,
     grammar: &mut dyn crate::tool_grammar::ToolGrammar,
+    decoded_vocab: &[String],
 ) -> Result<ServeOutcome, String> {
     decode_loop_inner(
         gpu,
@@ -1089,6 +1106,7 @@ pub fn decode_loop_with_grammar(
         prompt_tokens,
         timing,
         Some(grammar),
+        decoded_vocab,
     )
 }
 
@@ -1103,6 +1121,7 @@ fn decode_loop_inner(
     prompt_tokens: usize,
     timing: DecodeLoopTiming,
     mut grammar: Option<&mut dyn crate::tool_grammar::ToolGrammar>,
+    decoded_vocab: &[String],
 ) -> Result<ServeOutcome, String> {
     let vocab = backend.vocab_size();
     let window = if ctx.repeat_window == 0 {
@@ -1206,7 +1225,7 @@ fn decode_loop_inner(
             // Grammar-constrained position: the sampled token may be off-path, so pick
             // the best legal one instead. Skipped entirely while the grammar is free.
             if !g.is_free() {
-                if let Some(legal) = constrained_pick(gpu, backend, tok.vocab(), g) {
+                if let Some(legal) = constrained_pick(gpu, backend, decoded_vocab, g) {
                     next = legal;
                 }
             }

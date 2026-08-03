@@ -760,6 +760,8 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                             name,
                             params,
                             required,
+                            // DSML constrains names, not values.
+                            allowed_values: Default::default(),
                         }
                     })
                     .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
@@ -966,6 +968,8 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                             name,
                             params,
                             required,
+                            // DSML constrains names, not values.
+                            allowed_values: Default::default(),
                         }
                     })
                     .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
@@ -1670,12 +1674,38 @@ fn tool_grammar_for(
                         .collect()
                 })
                 .unwrap_or_default();
+            // JSON-Schema `enum` is the wire carrier for a closed value set. All-string
+            // or nothing: a non-string or empty enum is ignored (the param stays free
+            // text) rather than rejected — a wrong value constraint wedges generation,
+            // and an over-large one is dropped later by MAX_CONSTRAINED_VALUES/_BYTES.
+            let allowed_values = props
+                .map(|p| {
+                    p.iter()
+                        .filter_map(|(param, spec)| {
+                            let values: Option<Vec<String>> = spec
+                                .get("enum")?
+                                .as_array()?
+                                .iter()
+                                .map(|v| v.as_str().map(str::to_string))
+                                .collect();
+                            // A constrained value is forced out raw, and CDATA is
+                            // unreachable under the constraint, so a value carrying XML
+                            // metacharacters would be emitted unescaped and misparse.
+                            let usable = |v: &Vec<String>| {
+                                !v.is_empty() && !v.iter().any(|s| s.contains(['<', '&', '\n']))
+                            };
+                            Some((param.clone(), values.filter(usable)?))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             Some(hipfire_runtime::tool_grammar::ToolSchema {
                 name,
                 params: props
                     .map(|p| p.keys().cloned().collect())
                     .unwrap_or_default(),
                 required,
+                allowed_values,
             })
         })
         .filter(|s: &hipfire_runtime::tool_grammar::ToolSchema| !s.name.is_empty())
@@ -1991,6 +2021,21 @@ pub fn generate_llama(
     // constrain: a malformed tool call becomes unreachable, not just unlikely. Free
     // positions cost nothing, so an ordinary generation is unaffected.
     let mut grammar = tool_grammar_for(m.chat_template.as_deref(), tools);
+    // The mask must be built against decoded bytes, not `Tokenizer::vocab()`'s canonical
+    // BPE strings (space `Ġ`, newline `Ċ`), because the grammar is advanced with decoded
+    // text. Cached on the model like the DSML path's copy — O(vocab) to build.
+    let decoded_vocab_arc: Option<std::sync::Arc<Vec<String>>> = grammar.as_ref().map(|_| {
+        m.decoded_vocab
+            .get_or_insert_with(|| {
+                std::sync::Arc::new(
+                    (0..tok.vocab_size())
+                        .map(|id| tok.decode(&[id as u32]))
+                        .collect(),
+                )
+            })
+            .clone()
+    });
+    let decoded_vocab: &[String] = decoded_vocab_arc.as_ref().map_or(&[], |v| v.as_slice());
     let timing = DecodeLoopTiming {
         prefill_ms: Some(prefill_ms),
     };
@@ -2005,6 +2050,7 @@ pub fn generate_llama(
             n,
             timing,
             g,
+            decoded_vocab,
         ),
         None => decode_loop_with_timing(gpu, backend, tok, eos, &mut ctx, n, n, timing),
     };
@@ -3388,6 +3434,7 @@ pub fn generate_gemma3_vl_text(
 #[cfg(test)]
 mod tool_grammar_selection_tests {
     use super::tool_grammar_for;
+    use hipfire_runtime::tool_grammar::ToolGrammar;
     use serde_json::json;
 
     /// The literal line MiniCPM5's template emits in its tool guidelines.
@@ -3421,6 +3468,51 @@ mod tool_grammar_selection_tests {
     fn no_tools_means_nothing_to_constrain() {
         assert!(tool_grammar_for(Some(MINICPM_TEMPLATE), None).is_none());
         assert!(tool_grammar_for(Some(MINICPM_TEMPLATE), Some(&[])).is_none());
+    }
+
+    /// Park a freshly derived grammar at `path`'s value position and report whether it
+    /// constrains there — the only externally visible effect of an `enum`.
+    fn path_is_constrained(tools: &[serde_json::Value]) -> bool {
+        let mut g = tool_grammar_for(Some(MINICPM_TEMPLATE), Some(tools))
+            .expect("MiniCPM grammar for a non-empty tools array");
+        g.advance("<function name=\"read_file\"><param name=\"path\">");
+        !g.is_free()
+    }
+
+    fn read_file_with(path_spec: serde_json::Value) -> Vec<serde_json::Value> {
+        vec![json!({"type":"function","function":{
+            "name":"read_file",
+            "parameters":{"type":"object","properties":{"path":path_spec},"required":["path"]}
+        }})]
+    }
+
+    // A string `enum` is the wire carrier for a closed value set; anything else must
+    // leave the param free rather than fail the request.
+    #[test]
+    fn only_a_string_enum_constrains_a_value() {
+        assert!(
+            path_is_constrained(&read_file_with(
+                json!({"type":"string","enum":["src/lib.rs","Cargo.toml"]})
+            )),
+            "string enum -> constrained"
+        );
+        assert!(!path_is_constrained(&tools()), "no enum -> free");
+        for malformed in [
+            json!({"type":"integer","enum":[1,2,3]}),
+            json!({"type":"string","enum":["ok",7]}),
+            json!({"type":"string","enum":[{"path":"src/lib.rs"}]}),
+            json!({"type":"string","enum":[]}),
+            json!({"type":"string","enum":"src/lib.rs"}),
+            // Forced out raw (CDATA is unreachable under constraint) -> would misparse.
+            json!({"type":"string","enum":["a<b","ok"]}),
+            json!({"type":"string","enum":["a&b"]}),
+            json!({"type":"string","enum":["two\nlines"]}),
+        ] {
+            assert!(
+                !path_is_constrained(&read_file_with(malformed.clone())),
+                "malformed enum must be ignored, not enforced: {malformed}"
+            );
+        }
     }
 
     // Names and required params drive the constraint, so they must survive the

@@ -729,6 +729,7 @@ mod tests {
             name: "read".to_string(),
             params: vec!["path".to_string()],
             required: vec!["path".to_string()],
+            allowed_values: Default::default(),
         };
         assert_eq!(s.name, "read");
         assert_eq!(s.params, vec!["path".to_string()]);
@@ -740,11 +741,13 @@ mod tests {
                 name: "read".to_string(),
                 params: vec!["path".to_string()],
                 required: vec!["path".to_string()],
+                allowed_values: Default::default(),
             },
             ToolSchema {
                 name: "write".to_string(),
                 params: vec!["path".to_string(), "content".to_string()],
                 required: vec!["path".to_string(), "content".to_string()],
+                allowed_values: Default::default(),
             },
         ]
     }
@@ -954,6 +957,7 @@ mod tests {
             name: "bash".to_string(),
             params: vec!["command".to_string()],
             required: vec!["command".to_string()],
+            allowed_values: Default::default(),
         }];
         let mut m = Matcher::new(schema);
         m.advance("<｜DSML｜tool_calls>");
@@ -986,6 +990,7 @@ mod tests {
             name: "bash".to_string(),
             params: vec!["command".to_string(), "cwd".to_string()],
             required: vec!["command".to_string()],
+            allowed_values: Default::default(),
         }];
         let mut m = Matcher::new(schema);
         m.advance("<｜DSML｜tool_calls>");
@@ -1011,6 +1016,7 @@ mod tests {
             name: "read".to_string(),
             params: vec!["path".to_string()],
             required: vec![],
+            allowed_values: Default::default(),
         }];
         let mut m = Matcher::new(schema);
         m.advance("<｜DSML｜tool_calls>");
