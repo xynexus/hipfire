@@ -1908,6 +1908,38 @@ impl Gpu {
             &kernargs![ptr r_ptr, ptr e_ptr, ptr l_ptr, i32 mi, i32 ki, i32 c0i, i32 c1i],
         )
     }
+    /// Right-looking Cholesky trailing update: `A[i,j] -= sum_t L[i,j0+t]·L[j,j0+t]`
+    /// over the LOWER triangle of the trailing submatrix. `a` is `[k, k]` f32
+    /// row-major and updated in place.
+    pub fn chol_syrk_trailing(
+        &mut self,
+        a: &GpuTensor,
+        k: usize,
+        j0: usize,
+        jb: usize,
+    ) -> HipResult<()> {
+        let start = j0 + jb;
+        if start >= k {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "chol_syrk_trailing",
+            kernels::CHOL_SYRK_TRAILING_SRC,
+            "chol_syrk_trailing",
+        )?;
+        let a_ptr = a.buf.as_ptr();
+        let (ki, j0i, jbi) = (k as i32, j0 as i32, jb as i32);
+        let n = k - start;
+        let g = n.div_ceil(16) as u32;
+        self.launch_kernargs(
+            "chol_syrk_trailing",
+            [g, g, 1],
+            [16, 16, 1],
+            0,
+            &kernargs![ptr a_ptr, i32 ki, i32 j0i, i32 jbi],
+        )
+    }
     /// Gather block `[c0, c0+256)` from a device-resident `[m, k]` residual into
     /// a contiguous `[m, 256]` buffer for the trellis encoder.
     pub fn qtip_gather_block(

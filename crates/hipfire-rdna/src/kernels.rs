@@ -257,6 +257,10 @@ pub const GEMV_QTIP4G256_SRC: &str = include_str!("../../../kernels/src/gemv_qti
 /// OBS error propagation for block-sequential QTIP conditioning: the rank-256
 /// update that feeds a finished block's error forward to all later columns.
 /// Strided destination, hence its own kernel rather than the general GEMM.
+/// Trailing-submatrix update for right-looking blocked Cholesky. Carries the
+/// O(k^3); the panel factorization stays on the host in f64.
+pub const CHOL_SYRK_TRAILING_SRC: &str =
+    include_str!("../../../kernels/src/chol_syrk_trailing.hip");
 pub const QTIP_OBS_PROPAGATE_SRC: &str =
     include_str!("../../../kernels/src/qtip_obs_propagate.hip");
 pub const QTIP_VITERBI_ENCODE_I3_SRC: &str =

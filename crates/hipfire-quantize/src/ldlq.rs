@@ -1127,6 +1127,67 @@ mod chol_tests {
         assert_eq!(l.nrows(), k);
     }
 
+    /// The GPU right-looking factorization must reproduce faer's `llt` on the
+    /// same matrix. Tolerance is f32-scale, not f64: the trailing update runs in
+    /// f32 by design, so exact agreement is not the claim — agreement to within
+    /// single precision is, and that is what decides whether this is usable.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_right_looking_matches_faer_llt() {
+        let Ok(mut gpu) = hipfire_rdna::Gpu::init() else {
+            eprintln!("no GPU — skipping");
+            return;
+        };
+        let k = 512usize;
+        let h = ill_conditioned(k, 1e-1); // well-conditioned enough for a clean compare
+        let hd = Mat::<f64>::from_fn(k, k, |i, j| h[i * k + j]);
+        let reference = hd.llt(Side::Lower).expect("faer llt").L().to_owned();
+
+        let got = super::llt_lower_right_looking_gpu(&mut gpu, &h, k).expect("gpu llt");
+
+        let scale = (0..k).map(|i| reference[(i, i)].abs()).fold(0.0f64, f64::max);
+        let mut worst = 0.0f64;
+        for i in 0..k {
+            for j in 0..=i {
+                worst = worst.max((reference[(i, j)] - got[i * k + j]).abs());
+            }
+        }
+        println!("  gpu-vs-faer worst |dL| = {:.3e} (rel {:.3e})", worst, worst / scale);
+        assert!(
+            worst / scale < 1e-4,
+            "GPU factorization differs by rel {:.3e} — f32 trailing update is not \
+             accurate enough for this matrix",
+            worst / scale
+        );
+    }
+
+    /// Is the GPU path actually faster? The draft round-trips the whole k×k per
+    /// block, so this is not a foregone conclusion — the transfers may cost more
+    /// than the trailing update saves.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_right_looking_throughput_vs_faer() {
+        let Ok(mut gpu) = hipfire_rdna::Gpu::init() else {
+            eprintln!("no GPU — skipping");
+            return;
+        };
+        for k in [1024usize, 2048] {
+            let h = ill_conditioned(k, 1e-1);
+            let hd = Mat::<f64>::from_fn(k, k, |i, j| h[i * k + j]);
+            let t = std::time::Instant::now();
+            let _ = hd.llt(Side::Lower).expect("faer");
+            let cpu = t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let _ = super::llt_lower_right_looking_gpu(&mut gpu, &h, k).expect("gpu");
+            let gpu_s = t.elapsed().as_secs_f64();
+            let f = (k as f64).powi(3) / 3.0;
+            println!(
+                "  k={k}  faer {:.3}s ({:.1} GF/s)   gpu {:.3}s ({:.1} GF/s)   speedup {:.2}x",
+                cpu, f / cpu / 1e9, gpu_s, f / gpu_s / 1e9, cpu / gpu_s
+            );
+        }
+    }
+
     /// Both variants must agree that a hopeless matrix is hopeless — the retry
     /// loop is where a rewrite most easily diverges, because it picks a different
     /// lambda on each pass.
@@ -1689,4 +1750,90 @@ pub fn qtip_conditioned_encode(
         }
     }
     Some((symbols, targets))
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Right-looking blocked Cholesky, trailing update on GPU
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Lower Cholesky `A = L·Lᵀ` by right-looking blocks, with the trailing
+/// submatrix update on the GPU.
+///
+/// MIXED PRECISION BY DESIGN. The panel (diagonal factorization + TRSM) runs on
+/// the host in f64: it is O(k·jb²), negligible next to the trailing update, and
+/// it is where an ill-conditioned Hessian actually breaks down. The trailing
+/// update — the O(k³) — runs in f32 on the GPU, which is the only reason this is
+/// worth doing at all: the CPU path measures ~20 GFLOP/s with all 32 threads
+/// (verified not a misconfiguration), and Cholesky scales badly at these sizes
+/// because the panel serialises.
+///
+/// Returns `None` on non-positive-definite input, matching faer's `llt`, so the
+/// damping-retry loop above behaves identically.
+///
+/// `a` is `[k, k]` row-major, lower triangle read; the result overwrites the
+/// lower triangle. The upper triangle is left untouched (the kernel skips it, and
+/// writing it would break the symmetry each panel download assumes).
+#[cfg(feature = "gpu")]
+pub fn llt_lower_right_looking_gpu(
+    gpu: &mut hipfire_rdna::Gpu,
+    a: &[f64],
+    k: usize,
+) -> Option<Vec<f64>> {
+    use hipfire_rdna::DType;
+    const JB: usize = 128;
+
+    // Device copy in f32. Only the lower triangle is meaningful from here on.
+    // `host` is the authoritative copy throughout: panels are read from it and
+    // trailing updates are downloaded back into it. Reading panels from a device
+    // buffer that was uploaded once and never refreshed gives a factorization of
+    // the ORIGINAL matrix — 98% relative error, which is what the first draft did.
+    let mut host: Vec<f32> = a.iter().map(|&v| v as f32).collect();
+
+    let mut j0 = 0usize;
+    while j0 < k {
+        let jb = JB.min(k - j0);
+        let rows = k - j0;
+        let mut panel = vec![0.0f64; rows * jb];
+        for r in 0..rows {
+            for c in 0..jb {
+                panel[r * jb + c] = host[(j0 + r) * k + j0 + c] as f64;
+            }
+        }
+
+        // Diagonal block: unblocked Cholesky in f64.
+        for c in 0..jb {
+            let mut d = panel[c * jb + c];
+            for t in 0..c {
+                d -= panel[c * jb + t] * panel[c * jb + t];
+            }
+            if !(d > 0.0) {
+                return None; // not positive definite — caller retries with more damping
+            }
+            let d = d.sqrt();
+            panel[c * jb + c] = d;
+            for r in (c + 1)..rows {
+                let mut v = panel[r * jb + c];
+                for t in 0..c {
+                    v -= panel[r * jb + t] * panel[c * jb + t];
+                }
+                panel[r * jb + c] = v / d;
+            }
+        }
+
+        // Write the factored panel back and let the GPU take the trailing update.
+        for r in 0..rows {
+            for c in 0..jb.min(r + 1) {
+                host[(j0 + r) * k + j0 + c] = panel[r * jb + c] as f32;
+            }
+        }
+        if j0 + jb < k {
+            let dev = gpu.upload_owned_f32(&host, &[k, k]).ok()?;
+            gpu.chol_syrk_trailing(&dev, k, j0, jb).ok()?;
+            gpu.device_synchronize().ok()?;
+            host = gpu.download_f32(&dev).ok()?;
+        }
+        j0 += jb;
+    }
+    gpu.reclaim_pending();
+    Some(host.iter().map(|&v| v as f64).collect())
 }
