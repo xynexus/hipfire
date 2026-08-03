@@ -163,6 +163,45 @@ diagonal it weights by). It is the weakest at 1.16x, but not nothing.
 the second `+` would promise error feedback the pack does not implement. The
 shipped combination is spelled `qtip3+` with `HIPFIRE_QTIP_COND=greedy`.
 
+**CODEBOOK MEASURED 2026-08-03, AND IT IS A REAL LEVER.** The trellis codebook is
+not stored — it is RECOMPUTED from the state at decode — so changing it means
+changing kernels, not data. 3INST (excess kurtosis -0.111) sits closer to the
+Gaussian the rotated weights follow than 1MAD (-0.312), and existed encoder-side
+only until hipfire `ce4544da9` added `QuantType::Qtip3G256I3` (51) with its own
+GEMV and Viterbi kernels.
+
+    qtip3+ 1MAD   (AWQ, Viterbi)         3.1250 b/w  PPL 20.0937  KLD 0.152725
+    qtip3+ 3INST  (AWQ, Viterbi)         3.1250 b/w  PPL 19.8332  KLD 0.142660
+    greedy + 1MAD (AWQ+OBS, Viterbi)     3.1250 b/w  PPL 18.8438  KLD 0.092899
+    greedy + 3INST(AWQ+OBS, Viterbi)     3.1250 b/w  PPL 18.0755  KLD 0.088172
+    oq4++ (for scale)                    4.0625 b/w  PPL 17.2091  KLD 0.046167
+
+**Best 3-bit is greedy + 3INST at KLD 0.088172** — 2.24x better than oq3++'s
+0.197836 where this phase started, and 1.91x from oq4++ at 23% fewer bits.
+
+THE GAIN SHRINKS AS THE SURROUNDING MACHINERY STRENGTHENS, measured four ways:
+16.4% (beam 4, no AWQ), 8.3% (Viterbi, no AWQ), 6.6% (Viterbi + AWQ), 5.1% (on
+top of greedy). Same shape as the conditioning result. **Treat any ratio measured
+at a weak operating point as an upper bound, not an estimate** — it over-predicts
+by roughly 2x in this codec family.
+
+A SEPARATE QUANT TYPE, NOT A FLAG, because the codebook is part of the wire
+contract: nothing in a block distinguishes 1MAD from 3INST, so a cross-decoded
+artifact yields noise while every length, checksum and shape check passes. That
+choice paid off immediately — the first end-to-end run gave PPL 2.7e6, which is
+unmistakable, where a shared code would have produced a plausible-looking
+regression. Adding the type needed FIVE separate registrations (size, dispatch
+tables, supports_awq_sidecar, three rotation predicates, loader arm) and none of
+the omissions failed loudly: they produced 2.7e6, 1.07e38, and 8.27.
+
+QUANTIZE COST, once the encoder stopped being sabotaged: 524s for the model
+(hipfire `9e80f3d19`). `gpu.take()` had left the outer Option None from the
+second tensor on, silently demoting every later encode to the CPU beam — 3435s of
+a 3482s phase. Three FLOP-count predictions about that bottleneck were wrong
+before instrumenting seven stages found it in one run. Measured breakdown after
+the fix: cholesky 193.8s, rotate_H 119.0s (since parallelized), encode 95.7s,
+propagate 89.1s.
+
 LQER IS A DEAD END ON THIS PATH, measured, not assumed. `HIPFIRE_LOWRANK_R`
 emits 224 `lr_u`/`lr_v` tensors and llama scores BIT-IDENTICAL (25.2538 /
 0.368288 at r=16 AND r=32, +55 MB for nothing) because `lr_u` has exactly one
