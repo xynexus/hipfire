@@ -261,6 +261,33 @@ the efficiency winner at 202% KLD-improvement per b/w against o_proj's 56% — 3
 better — and v+k buys -16.0% for only 0.13 b/w. The MLP tensors (gate/up/down,
 27.6% each) were never worth promoting: too expensive per unit of KLD.
 
+**MINIMUM BIT RATE, SEARCHED 2026-08-04: 4.25 b/w.**
+
+    config                            b/w      PPL       KLD     verdict
+    oq4.125++ plain                 4.1250  17.1196  0.039581   FAIL
+    oq4.125++ + promo (-> 4.358)    4.3580  17.0650  0.036972   FAIL
+    oq4.25++  plain @ alpha 0.45    4.2500  17.1547  0.034862   PASS  <- minimum
+    oq4.25++  + v_proj/o_proj oq8   4.5780  17.1157  0.025025   PASS, 28% margin
+    q4nx (bar)                      5.0000  17.1949  0.034954     —
+
+**THE TAIL MUST BE REPRESENTED ON EVERY TENSOR — you cannot buy past it.**
+oq4.125++ fails even with promotions up to 4.358 b/w, which is MORE total bits
+than the passing 4.25 configuration. Three outliers per group everywhere beats
+one outlier everywhere plus 22 promoted tensors. Sparse outliers fix the tail on
+all 113 tensors for 0.1875 b/w flat; promotion fixes everything on a few tensors
+for 3.8125 b/w each, and KLD is dominated by tail truncation model-wide.
+
+A plain oq4++ base (4.0625, no outliers) fails even at 4.497 b/w with 38 tensors
+promoted — KLD 0.038826. The outlier base is not optional.
+
+`mixed_precision.rs` is now wired behind `--mixed-bpw <target>` (hipfire
+`fbead4163`) and works, but UNDERPERFORMS hand-picking: auto at ~4.72 b/w gives
+KLD 0.030071 against hand-picked v+o's 0.025025 at 4.578 — better KLD for fewer
+bits, by hand. It ranks with `oq4_sensitivity`, which is imatrix-weighted
+RECONSTRUCTION error, and reconstruction error has mispredicted output quality
+repeatedly on this model. Ranking by an output-error measure (the Hessian is
+already loaded for LDLQ) is the fix.
+
 `mixed_precision.rs` already implements exactly this search — rank dense-linear
 tensors by the output error incurred when DEMOTED, promote greedily under a bit
 budget — and it is not wired into this path. The layers above were hand-picked;
