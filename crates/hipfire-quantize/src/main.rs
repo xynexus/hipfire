@@ -5404,6 +5404,7 @@ fn run_hfq_source_pipeline(
     awq_enabled: bool,
     awq_alpha_explicit: Option<f32>,
     tensor_overrides: &[TensorFormatOverride],
+    mixed_bpw_target: Option<f64>,
 ) -> Result<(), String> {
     let hfq = HfqInputFile::open(input).map_err(|e| format!("open HFQ input: {e}"))?;
     eprintln!(
@@ -5430,6 +5431,87 @@ fn run_hfq_source_pipeline(
             "AWQ pre-scaling: ENABLED for HFQ source (alpha={awq_alpha}, formula: s[j]=(RMS_act[j])^alpha, geo-mean normalized to 1)"
         );
     }
+
+    // ── Automatic mixed precision (--mixed-bpw) ─────────────────────────────
+    // mixed_precision::assign_tiers already implements the right search: rank
+    // dense-linear tensors by the output error they incur when DEMOTED, then
+    // greedily apply the upgrade with the best error-reduction per extra bit that
+    // still fits an average-bpw budget. It was never wired to this path, so layer
+    // promotion had to be hand-picked.
+    //
+    // Floor is Oq4 (the requested base format), so only the oq4 -> oq8 step is
+    // available and oq2 never enters. Sensitivity is the imatrix-weighted
+    // reconstruction error at oq4 — the same proxy `oq4_sensitivity` uses —
+    // which is why this needs the Hessian/imatrix already loaded for AWQ.
+    let auto_overrides: Vec<TensorFormatOverride> = match mixed_bpw_target {
+        None => Vec::new(),
+        Some(target) => {
+            use hipfire_quantize::mixed_precision::{assign_tiers, Tier, TierCandidate};
+            let s1 = gen_fwht_signs(42, 256);
+            let s2 = gen_fwht_signs(1042, 256);
+            let mut cands: Vec<TierCandidate> = Vec::new();
+            for t in &hfq.tensors {
+                if t.shape.len() != 2 || !should_quantize(&t.name) {
+                    continue;
+                }
+                let (m, k) = (t.shape[0] as usize, t.shape[1] as usize);
+                if k % 256 != 0 || m == 0 {
+                    continue;
+                }
+                let raw = hfq.tensor_data(t);
+                let Ok(f32d) = hfq_source_to_f32(&t.name, t.quant_type, raw.as_ref()) else {
+                    continue;
+                };
+                let ones;
+                let im: &[f32] = match imatrix_weights_for(&t.name) {
+                    Some(v) => v,
+                    None => {
+                        ones = vec![1.0f32; k];
+                        &ones
+                    }
+                };
+                let err = hipfire_quantize::mixed_precision::oq4_sensitivity(
+                    &f32d, m, k, &im, &s1, &s2,
+                );
+                cands.push(TierCandidate {
+                    name: t.name.clone(),
+                    numel: m * k,
+                    err_oq2: err, // unused at floor=Oq4; the oq2 step never fires
+                    err_oq4: err,
+                });
+            }
+            let plan = assign_tiers(&cands, target, Tier::Oq4);
+            let promoted: Vec<&TierCandidate> = cands
+                .iter()
+                .filter(|c| plan.tier(&c.name) == Tier::Oq8)
+                .collect();
+            eprintln!(
+                "mixed-bpw {target:.4}: promoted {} of {} tensors to oq8++ \
+                 (realized {:.4} b/w over quantised tensors)",
+                promoted.len(),
+                cands.len(),
+                plan.realized_bpw(&cands)
+            );
+            for c in &promoted {
+                eprintln!("  promote: {}", c.name);
+            }
+            promoted
+                .iter()
+                .map(|c| TensorFormatOverride {
+                    pattern: c.name.clone(),
+                    format: HfqInputFormat::Oq8Plus,
+                    format_label: "oq8++".to_string(),
+                })
+                .collect()
+        }
+    };
+    // Explicit --tensor-format entries win: they are appended last and the
+    // matcher takes the LAST match.
+    let tensor_overrides: Vec<TensorFormatOverride> = auto_overrides
+        .into_iter()
+        .chain(tensor_overrides.iter().cloned())
+        .collect();
+    let tensor_overrides = tensor_overrides.as_slice();
 
     let mut metadata: serde_json::Value =
         serde_json::from_str(&hfq.metadata_json).unwrap_or_else(|_| serde_json::json!({}));
@@ -7607,6 +7689,15 @@ fn main() {
     // this the index stays unset, `ldlq_hessian_for_tensor` returns None for every
     // tensor, and the run emits a plain artifact while reporting success — which
     // is exactly what happened the first time these were measured.
+    // --mixed-bpw <F>: target average bits-per-weight over quantised tensors.
+    // Drives mixed_precision::assign_tiers to pick WHICH tensors get oq8++,
+    // instead of hand-listing them with --tensor-format.
+    let mixed_bpw_target: Option<f64> = args
+        .iter()
+        .position(|a| a == "--mixed-bpw")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<f64>().ok());
+
     let ldlq_requested =
         oq_ldlq_recipe || args.iter().any(|a| a == "--ldlq") || qtip_cond_mode().is_some();
     if ldlq_requested {
@@ -7904,6 +7995,7 @@ fn main() {
                 awq_enabled,
                 awq_alpha_explicit,
                 &tensor_format_overrides,
+                mixed_bpw_target,
             ) {
                 eprintln!("HFQ input pipeline failed: {e}");
                 std::process::exit(2);
