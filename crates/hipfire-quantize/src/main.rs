@@ -6660,7 +6660,7 @@ fn main() {
         let cb = if !use_qtip4_real
             && std::env::var("HIPFIRE_QTIP_CODEBOOK").as_deref() == Ok("3inst")
         {
-            eprintln!("qtip: using 3INST computed codebook (sim)");
+            eprintln!("qtip: 3INST computed codebook selected");
             qtip::build_codebook_3inst()
         } else {
             qtip::build_codebook()

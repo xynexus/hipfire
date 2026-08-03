@@ -208,6 +208,12 @@ impl DType {
                 // emit awq_scale sidecars that nothing attaches — weights smoothed
                 // on one side only, which is worse than no AWQ at all.
                 | DType::Qtip3G256
+                // Same contract as Qtip3G256 — the 3INST codebook changes the
+                // decoded VALUES, not whether the weights were AWQ-smoothed.
+                // Omitting this arm left the sidecar unattached on qtip3+ I3
+                // artifacts: W*s served against un-divided x, which scored KLD
+                // 8.27 while the non-AWQ path scored 1.61.
+                | DType::Qtip3G256I3
         )
     }
 }

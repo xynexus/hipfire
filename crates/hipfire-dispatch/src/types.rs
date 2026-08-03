@@ -770,6 +770,13 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MQ4G128
             | MQ3G256
             | Qtip3G256
+            // I3 weights are FWHT-rotated exactly like Qtip3G256 — only the
+            // codebook differs. Omitting it here made this return false, taking
+            // the no-rotation early return in weight_gemv/run_auto: activations
+            // unrotated AND the AWQ divide skipped, KLD 8.27. The sibling
+            // dtype_rotation_plan / dtype_post_rotation_variant already listed it,
+            // so the three were inconsistent.
+            | Qtip3G256I3
             | MQ2G256
             | MQ6G256
             | MQ8G256
