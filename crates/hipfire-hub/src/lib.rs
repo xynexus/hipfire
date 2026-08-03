@@ -114,6 +114,10 @@ impl RepoFile {
 fn client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(UA)
+        // Fail a stalled connection rather than hanging on it. Without this a
+        // dead transfer occupies a slot indefinitely.
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| Error::Fatal(format!("http client: {e}")))
 }
@@ -246,6 +250,19 @@ pub async fn fetch_file(
     file: &RepoFile,
     store: &cache::Store,
 ) -> Result<PathBuf> {
+    fetch_file_from(HUB, repo, revision, file, store).await
+}
+
+/// [`fetch_file`] against an explicit origin, so the fault-injection suite can
+/// serve truncated bodies, wrong digests and dropped connections from a local
+/// socket. Production always passes [`HUB`].
+pub async fn fetch_file_from(
+    base: &str,
+    repo: &str,
+    revision: &str,
+    file: &RepoFile,
+    store: &cache::Store,
+) -> Result<PathBuf> {
     // A content-addressed blob we already hold is already proven; there is
     // nothing to gain by fetching it again.
     if let Some(sha) = &file.sha256 {
@@ -255,11 +272,61 @@ pub async fn fetch_file(
         }
     }
 
-    let url = format!("{HUB}/{repo}/resolve/{revision}/{}", file.path);
-    let resp = auth(client()?.get(&url)).send().await?;
+    let url = format!("{base}/{repo}/resolve/{revision}/{}", file.path);
+    let part = store.part_path(&file.path);
+
+    // Resume a partial transfer rather than restarting it. This is not an
+    // optimisation: on a connection that drops mid-stream, a 4 GB single-shot
+    // download never completes, however many times it is retried. Measured on
+    // this host, a repair attempt reached 0.34 GB of 4.00 GB four times over.
+    //
+    // The existing prefix is re-hashed rather than trusting a persisted hash
+    // state: it costs one sequential read and removes a whole class of
+    // resume-corruption bug.
+    let mut h = Sha256::new();
+    let mut written = 0u64;
+    if let Ok(md) = tokio::fs::metadata(&part).await {
+        let have = md.len();
+        if have > 0 && (file.size == 0 || have < file.size) {
+            let mut f = tokio::fs::File::open(&part).await?;
+            let mut buf = vec![0u8; 8 << 20];
+            loop {
+                let n = tokio::io::AsyncReadExt::read(&mut f, &mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+            }
+            written = have;
+        } else {
+            // Complete or overlong: start clean rather than guess.
+            let _ = tokio::fs::remove_file(&part).await;
+        }
+    }
+
+    let mut req = auth(client()?.get(&url));
+    if written > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={written}-"));
+    }
+    let resp = req.send().await?;
     let status = resp.status();
     if !status.is_success() {
         return Err(classify(status, &file.path));
+    }
+    // A server that ignores Range answers 200 with the whole body; honour that
+    // by discarding the prefix instead of appending to it.
+    let resuming = written > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+    if written > 0 && !resuming {
+        h = Sha256::new();
+        written = 0;
+        let _ = tokio::fs::remove_file(&part).await;
+    }
+    if resuming {
+        eprintln!(
+            "hub: resuming {} at {:.2} GB",
+            file.path,
+            written as f64 / 1e9
+        );
     }
 
     // Prefer the digest the hub states on the response; fall back to the one
@@ -272,18 +339,30 @@ pub async fn fetch_file(
         .filter(|s| s.len() == 64)
         .or_else(|| file.sha256.clone());
 
-    let part = store.part_path(&file.path);
     if let Some(p) = part.parent() {
         tokio::fs::create_dir_all(p).await?;
     }
-    let mut out = tokio::fs::File::create(&part).await?;
-    let mut h = Sha256::new();
-    let mut written = 0u64;
+    let mut out = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(resuming)
+        .truncate(!resuming)
+        .open(&part)
+        .await?;
 
     let mut stream = resp.bytes_stream();
     use futures_util::StreamExt;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| Error::Retryable(format!("{}: {e}", file.path)))?;
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                // Flush what arrived and keep the .part: the next attempt
+                // resumes from here instead of starting over.
+                let _ = out.flush().await;
+                let _ = out.sync_all().await;
+                return Err(Error::Retryable(format!("{}: {e}", file.path)));
+            }
+        };
         h.update(&chunk);
         out.write_all(&chunk).await?;
         written += chunk.len() as u64;

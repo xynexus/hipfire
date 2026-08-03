@@ -113,8 +113,12 @@ impl Store {
             else {
                 continue;
             };
-            // SAFETY: signal 0 only probes for existence.
-            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            // `kill` treats 0 as "this process group" and negatives as a
+            // group id, so only a positive pid is a process to probe. Without
+            // this guard a `.part` tagged 0 looks permanently alive and is
+            // never reclaimed.
+            // SAFETY: signal 0 only probes for existence, it delivers nothing.
+            let alive = pid > 0 && unsafe { libc::kill(pid, 0) } == 0;
             if !alive {
                 if let Ok(m) = e.metadata() {
                     freed += m.len();

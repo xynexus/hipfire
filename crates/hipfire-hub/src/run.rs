@@ -154,28 +154,71 @@ pub async fn repair(root: &Path, repo: &str, revision: &str) -> Result<usize> {
     Ok(fixed)
 }
 
-/// Retry only what retrying can fix, with backoff.
+/// Retry only what retrying can fix, and judge attempts by progress.
+///
+/// A fixed attempt budget cannot finish a large file on a lossy link: measured
+/// here, a 4 GB shard dropped every ~0.3 GB, so four tries exhausted the budget
+/// at 0.79 GB however well resume worked. What matters is not how many attempts
+/// were spent but whether they are still advancing — so an attempt that grew
+/// the partial file resets the budget, and only consecutive *stalled* attempts
+/// count toward giving up.
 async fn fetch_with_retry(
     repo: &str,
     revision: &str,
     f: &RepoFile,
     store: &Store,
 ) -> Result<std::path::PathBuf> {
+    const MAX_STALLED: u32 = 5;
+    /// Backstop against an unbounded loop if the server trickles a byte at a time.
+    const MAX_ATTEMPTS: u32 = 200;
+
+    let part = store.part_path(&f.path);
+    let progress = || {
+        std::fs::metadata(&part)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+
+    let mut stalled = 0u32;
     let mut delay = std::time::Duration::from_secs(1);
-    for attempt in 1..=4 {
+    for attempt in 1..=MAX_ATTEMPTS {
+        let before = progress();
         match fetch_file(repo, revision, f, store).await {
             Ok(p) => return Ok(p),
-            Err(Error::Retryable(m)) if attempt < 4 => {
-                eprintln!("hub: {} — attempt {attempt} failed ({m}); retrying", f.path);
+            Err(Error::Retryable(m)) => {
+                let after = progress();
+                if after > before {
+                    // Still advancing: this is a lossy link, not a broken one.
+                    stalled = 0;
+                    delay = std::time::Duration::from_secs(1);
+                } else {
+                    stalled += 1;
+                    if stalled >= MAX_STALLED {
+                        return Err(Error::Retryable(format!(
+                            "{}: {MAX_STALLED} consecutive attempts made no progress ({m})",
+                            f.path
+                        )));
+                    }
+                    delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                }
+                if attempt % 5 == 0 || after == before {
+                    eprintln!(
+                        "hub: {} at {:.2} GB — attempt {attempt} ({m})",
+                        f.path,
+                        after as f64 / 1e9
+                    );
+                }
                 tokio::time::sleep(delay).await;
-                delay *= 2;
             }
             // A digest mismatch is not transient noise: the bytes on the wire
             // were wrong. Surface it rather than papering over it with retries.
             Err(e) => return Err(e),
         }
     }
-    unreachable!("loop returns on the final attempt")
+    Err(Error::Retryable(format!(
+        "{}: gave up after {MAX_ATTEMPTS} attempts",
+        f.path
+    )))
 }
 
 /// Minimal `*` glob, enough for `--include '*.safetensors'`.
