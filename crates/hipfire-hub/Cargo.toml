@@ -17,3 +17,9 @@ sha2 = "0.10"
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
+
+[dev-dependencies]
+# The fault-injection origin is hand-rolled on std::net; sha2 is needed to
+# compute the digests the tests promise.
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
