@@ -1237,6 +1237,12 @@ impl ZayaStreamedCalibrationLayer {
         let row = |tensor: &GpuTensor, index: usize, width: usize| -> GpuTensor {
             tensor.sub_offset(index * width, width)
         };
+        // Scratch is sized for `max_slice_rows`, but `capture_by_id` derives its
+        // source row stride as `numel() / n`. Handing it the whole buffer with
+        // `n = s` reads rows 1.. at `max_slice_rows * width / s`, i.e. stale rows
+        // of the previous, wider slice. Narrow every capture input to `s` rows.
+        let slice =
+            |tensor: &GpuTensor, width: usize| -> GpuTensor { tensor.sub_offset(0, s * width) };
 
         // ── CCA attention ────────────────────────────────────────────────────
         run(gpu.rmsnorm_batched(
@@ -1251,7 +1257,7 @@ impl ZayaStreamedCalibrationLayer {
             gpu,
             registry,
             CaptureId::new(block, ProjectionRole::QueryInput, None),
-            &scratch.normed,
+            &slice(&scratch.normed, hidden_dim),
             s,
             hidden_dim,
         )?;
@@ -1363,7 +1369,7 @@ impl ZayaStreamedCalibrationLayer {
             gpu,
             registry,
             CaptureId::new(block, ProjectionRole::AttentionOutputInput, None),
-            &scratch.ctx,
+            &slice(&scratch.ctx, q_dim),
             s,
             q_dim,
         )?;
@@ -1393,7 +1399,7 @@ impl ZayaStreamedCalibrationLayer {
             gpu,
             registry,
             CaptureId::new(block, ProjectionRole::RouterInput, None),
-            &scratch.normed,
+            &slice(&scratch.normed, hidden_dim),
             s,
             hidden_dim,
         )?;
@@ -1420,7 +1426,7 @@ impl ZayaStreamedCalibrationLayer {
             gpu,
             registry,
             CaptureId::new(block, ROLE_ROUTER_FC1, None),
-            &scratch.rnormed,
+            &slice(&scratch.rnormed, rh),
             s,
             rh,
         )?;
@@ -1430,7 +1436,7 @@ impl ZayaStreamedCalibrationLayer {
             gpu,
             registry,
             CaptureId::new(block, ROLE_ROUTER_FC2, None),
-            &scratch.a1,
+            &slice(&scratch.a1, rh),
             s,
             rh,
         )?;
@@ -1440,7 +1446,7 @@ impl ZayaStreamedCalibrationLayer {
             gpu,
             registry,
             CaptureId::new(block, ROLE_ROUTER_OUT, None),
-            &scratch.a2,
+            &slice(&scratch.a2, rh),
             s,
             rh,
         )?;

@@ -352,11 +352,19 @@ impl CalibCollector {
                 capture_id.0, descriptor.input_width
             )));
         }
+        // Exact, not `>= k`: every caller either passes `n = 1` or narrows the
+        // source with `sub_offset(0, n * k)` first. A wider stride only ever
+        // means the caller handed us a scratch buffer sized for its MAXIMUM row
+        // count while `n` is this call's ACTUAL row count — in which case rows
+        // 1..n-1 are read from stale data at `row * (numel / n)`. That is silent
+        // accumulator corruption, so reject it instead of striding over it.
         let row_stride = input.numel() / n;
-        if row_stride < k {
+        if row_stride != k {
             return Err(contracts::CalibError::InvalidCapture(format!(
-                "capture {} input row stride {row_stride} is below width {k}",
-                capture_id.0
+                "capture {} input row stride {row_stride} != width {k} \
+                 (input has {} elements for {n} rows; narrow it to n*k first)",
+                capture_id.0,
+                input.numel()
             )));
         }
 
