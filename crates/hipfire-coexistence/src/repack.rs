@@ -113,7 +113,16 @@ struct Entry {
     codec: &'static str,
     stored_off: u64,
     stored_len: u64,
+    /// XXH3-64 of the payload as stored. Detects an archive that rotted at rest.
     xxh3: u64,
+    /// XXH3-64 of the ORIGINAL source bytes, before any recoding.
+    ///
+    /// The stored hash cannot catch a payload that is intact but decodes wrong
+    /// -- which is precisely what the u32 chunk-offset overflow produced: a
+    /// well-formed bitstream whose chunks decoded from wrapped positions, with
+    /// `Max quant error: 0.00000000` reported alongside. Hashing the source
+    /// content makes a restore verifiable end to end, codec included.
+    src_xxh3: u64,
 }
 
 fn read_st_header(path: &Path) -> Option<(u64, Vec<u8>, serde_json::Value, u64)> {
@@ -221,6 +230,7 @@ fn pack(dir: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
                 let mut buf = vec![0u8; take as usize];
                 f.read_exact(&mut buf)?;
                 before += take;
+                let src_hash = xxh3(&buf);
                 let (codec, bytes) = if dtype == "BF16" && take % 2 == 0 {
                     match hipfire_primitives::bf16_huff::encode_if_smaller(&buf) {
                         Some(packed) => ("bf16h", packed),
@@ -248,6 +258,7 @@ fn pack(dir: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
                     stored_off,
                     stored_len: bytes.len() as u64,
                     xxh3: xxh3(&bytes),
+                    src_xxh3: src_hash,
                 });
                 done += take;
                 part += 1;
@@ -264,7 +275,7 @@ fn pack(dir: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
             "tensors": entries.iter().map(|e| serde_json::json!({
                 "name": e.name, "off": e.off, "len": e.len,
                 "codec": e.codec, "stored_off": e.stored_off, "stored_len": e.stored_len,
-                "xxh3": e.xxh3
+                "xxh3": e.xxh3, "src_xxh3": e.src_xxh3
             })).collect::<Vec<_>>()
         }));
     }
@@ -428,18 +439,36 @@ fn restore(
                     f.seek(SeekFrom::Start(so))?;
                     let mut sb = vec![0u8; sl as usize];
                     f.read_exact(&mut sb)?;
-                    if codec == "bf16h" {
+                    let logical: Vec<u8> = if codec == "bf16h" {
                         let d = hipfire_primitives::bf16_huff::decode(&sb, (ln / 2) as usize)
                             .ok_or_else(|| {
                                 format!("corrupt bf16h payload for {:?}", t.get("name"))
                             })?;
                         if d.len() as u64 != ln {
-                            return Err(format!("bf16h expanded to {} bytes, expected {ln}", d.len()).into());
+                            return Err(format!(
+                                "bf16h expanded to {} bytes, expected {ln}",
+                                d.len()
+                            )
+                            .into());
                         }
-                        o.write_all(&d)?;
+                        d
                     } else {
-                        o.write_all(&sb)?;
+                        sb
+                    };
+                    // The decoded content must match what was packed. A payload
+                    // can be byte-perfect and still decode wrong; this is the
+                    // only check that would have caught that.
+                    if let Some(want) = t.get("src_xxh3").and_then(|v| v.as_u64()) {
+                        let got = xxh3(&logical);
+                        if got != want {
+                            return Err(format!(
+                                "restore: {:?} decoded to xxh3 {got:016x}, expected {want:016x}",
+                                t.get("name").and_then(|v| v.as_str()).unwrap_or("?")
+                            )
+                            .into());
+                        }
                     }
+                    o.write_all(&logical)?;
                 }
             }
             other => return Err(format!("unknown archive entry kind {other:?}").into()),
@@ -547,6 +576,21 @@ impl Write for Sink {
 }
 
 
+/// XXH3-64 over a byte range of the archive, streamed.
+fn hash_range(f: &mut File, off: u64, len: u64) -> std::io::Result<u64> {
+    f.seek(SeekFrom::Start(off))?;
+    let mut h = twox_hash::xxhash3_64::Hasher::new();
+    let mut left = len;
+    let mut buf = vec![0u8; CH.min(len.max(1) as usize)];
+    while left > 0 {
+        let n = (buf.len() as u64).min(left) as usize;
+        f.read_exact(&mut buf[..n])?;
+        std::hash::Hasher::write(&mut h, &buf[..n]);
+        left -= n as u64;
+    }
+    Ok(std::hash::Hasher::finish(&h))
+}
+
 /// Validate every stored payload against its recorded XXH3-64.
 ///
 /// A read sweep proves the bytes are *readable*; this proves they are the same
@@ -573,46 +617,36 @@ fn check(archive: &Path) -> Result<(), Box<dyn Error>> {
     let files = index.get("files").and_then(|v| v.as_array()).ok_or("no files")?;
 
     let (mut checked, mut unchecked, mut bad, mut bytes) = (0usize, 0usize, 0usize, 0u64);
-    let mut payload = |f: &mut File, off: u64, len: u64| -> std::io::Result<u64> {
-        f.seek(SeekFrom::Start(off))?;
-        let mut h = twox_hash::xxhash3_64::Hasher::new();
-        let mut left = len;
-        let mut buf = vec![0u8; CH.min(len.max(1) as usize)];
-        while left > 0 {
-            let n = (buf.len() as u64).min(left) as usize;
-            f.read_exact(&mut buf[..n])?;
-            std::hash::Hasher::write(&mut h, &buf[..n]);
-            left -= n as u64;
-        }
-        Ok(std::hash::Hasher::finish(&h))
-    };
+    let mut decoded = 0usize;
 
     for fe in files {
         let path = fe.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-        let mut one = |off: u64, len: u64, want: Option<u64>, what: &str| {
-            match payload(&mut f, off, len) {
-                Err(e) => {
-                    println!("  READ-ERROR {path} {what}: {e}");
-                    bad += 1;
-                }
-                Ok(got) => match want {
-                    None => unchecked += 1,
-                    Some(w) if w == got => {
-                        checked += 1;
-                        bytes += len;
-                    }
-                    Some(w) => {
-                        println!("  CORRUPT    {path} {what}: xxh3 {got:016x} != {w:016x}");
-                        bad += 1;
-                    }
-                },
+        let mut tally = |res: std::io::Result<u64>, want: Option<u64>, what: &str,
+                         checked: &mut usize, unchecked: &mut usize, bad: &mut usize,
+                         bytes: &mut u64, len: u64| match res {
+            Err(e) => {
+                println!("  READ-ERROR {path} {what}: {e}");
+                *bad += 1;
             }
+            Ok(got) => match want {
+                None => *unchecked += 1,
+                Some(w) if w == got => {
+                    *checked += 1;
+                    *bytes += len;
+                }
+                Some(w) => {
+                    println!("  CORRUPT    {path} {what}: xxh3 {got:016x} != {w:016x}");
+                    *bad += 1;
+                }
+            },
         };
         match fe.get("kind").and_then(|v| v.as_str()) {
             Some("raw") => {
                 let off = fe.get("off").and_then(|v| v.as_u64()).unwrap_or(0);
                 let len = fe.get("len").and_then(|v| v.as_u64()).unwrap_or(0);
-                one(off, len, fe.get("xxh3").and_then(|v| v.as_u64()), "");
+                let r = hash_range(&mut f, off, len);
+                tally(r, fe.get("xxh3").and_then(|v| v.as_u64()), "",
+                      &mut checked, &mut unchecked, &mut bad, &mut bytes, len);
             }
             Some("safetensors") => {
                 if let Some(ts) = fe.get("tensors").and_then(|v| v.as_array()) {
@@ -620,7 +654,36 @@ fn check(archive: &Path) -> Result<(), Box<dyn Error>> {
                         let off = t.get("stored_off").and_then(|v| v.as_u64()).unwrap_or(0);
                         let len = t.get("stored_len").and_then(|v| v.as_u64()).unwrap_or(0);
                         let nm = t.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                        one(off, len, t.get("xxh3").and_then(|v| v.as_u64()), nm);
+                        let r = hash_range(&mut f, off, len);
+                        tally(r, t.get("xxh3").and_then(|v| v.as_u64()), nm,
+                              &mut checked, &mut unchecked, &mut bad, &mut bytes, len);
+                        // Decode and check the content hash: proves the payload
+                        // still reproduces the original bytes, not merely that
+                        // it is unchanged since it was written.
+                        if t.get("codec").and_then(|v| v.as_str()) == Some("bf16h") {
+                            if let Some(want) = t.get("src_xxh3").and_then(|v| v.as_u64()) {
+                                let ln = t.get("len").and_then(|v| v.as_u64()).unwrap_or(0);
+                                if f.seek(SeekFrom::Start(off)).is_ok() {
+                                    let mut sb = vec![0u8; len as usize];
+                                    if f.read_exact(&mut sb).is_ok() {
+                                        match hipfire_primitives::bf16_huff::decode(
+                                            &sb,
+                                            (ln / 2) as usize,
+                                        ) {
+                                            Some(d) if xxh3(&d) == want => decoded += 1,
+                                            Some(_) => {
+                                                println!("  DECODE-BAD {path} {nm}: content hash mismatch");
+                                                bad += 1;
+                                            }
+                                            None => {
+                                                println!("  DECODE-FAIL {path} {nm}");
+                                                bad += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -629,7 +692,8 @@ fn check(archive: &Path) -> Result<(), Box<dyn Error>> {
     }
 
     println!(
-        "repack: {checked} payload(s) match ({:.2} GB), {bad} bad, {unchecked} unchecked{}",
+        "repack: {checked} payload(s) match ({:.2} GB), {decoded} decode-verified, \
+{bad} bad, {unchecked} unchecked{}",
         bytes as f64 / 1e9,
         if v1 {
             " — v1 archive, written before checksums existed"
