@@ -179,6 +179,17 @@ GEMV and Viterbi kernels.
 **Best 3-bit is greedy + 3INST at KLD 0.088172** — 2.24x better than oq3++'s
 0.197836 where this phase started, and 1.91x from oq4++ at 23% fewer bits.
 
+**RECONTEXTUALISED 2026-08-03 once the bar was measured directly.** That 1.91x is
+against oq4++, which was NOT itself at the bar: measured on our harness, plain
+oq4++ is 1.32x worse than q4nx on KLD. Against the real bar:
+
+    q4nx (measured)              5.0000 b/w  KLD 0.034954
+    oq4.25++ @ alpha 0.45        4.2500 b/w  KLD 0.034862   clears it
+    qtip3+greedy+3INST           3.1250 b/w  KLD 0.088172   2.52x from the bar
+
+So 3-bit is **2.52x** off, not 1.91x. Quoting a gap against an intermediate
+artifact rather than the target is how the earlier number understated it.
+
 THE GAIN SHRINKS AS THE SURROUNDING MACHINERY STRENGTHENS, measured four ways:
 16.4% (beam 4, no AWQ), 8.3% (Viterbi, no AWQ), 6.6% (Viterbi + AWQ), 5.1% (on
 top of greedy). Same shape as the conditioning result. **Treat any ratio measured
