@@ -4484,11 +4484,40 @@ fn cpu_encode_symbols(
 /// Groups are chunked so the per-group Viterbi backpointer scratch (256×4096 B)
 /// stays bounded; the scratch buffer is allocated once and reused across chunks.
 #[cfg(feature = "gpu")]
+/// Reusable GPU scratch for the trellis encode. The backpointer buffer is
+/// `chunk × 256 × 256 × 2` F32 = 512 MB at the default chunk, and its contents
+/// are written before use every time, so there is no reason to allocate it more
+/// than once. Whole-tensor encoding called `gpu_encode_symbols` once per tensor
+/// and never noticed; block-wise error feedback calls it once per BLOCK (k/256
+/// times, 32 for a k=8192 tensor), turning that into ~1500 allocate/free cycles
+/// of half a gigabyte across a model — which is most of why greedy conditioning
+/// measured 3584s against the plain encode's 89s.
+#[cfg(feature = "gpu")]
+struct QtipEncodeScratch {
+    chunk: usize,
+    backptr: hipfire_rdna::GpuTensor,
+}
+
+#[cfg(feature = "gpu")]
 fn gpu_encode_symbols(
     gpu: &mut hipfire_rdna::Gpu,
     rotated: &[f32],
     n_groups: usize,
     bits: u32,
+) -> Result<Vec<u8>, String> {
+    let mut own: Option<QtipEncodeScratch> = None;
+    gpu_encode_symbols_scratch(gpu, rotated, n_groups, bits, &mut own)
+}
+
+/// As [`gpu_encode_symbols`], but reuses `scratch` across calls. Pass the same
+/// `Option` for every block of a tensor.
+#[cfg(feature = "gpu")]
+fn gpu_encode_symbols_scratch(
+    gpu: &mut hipfire_rdna::Gpu,
+    rotated: &[f32],
+    n_groups: usize,
+    bits: u32,
+    scratch: &mut Option<QtipEncodeScratch>,
 ) -> Result<Vec<u8>, String> {
     // The encoder's codebook MUST match the one the artifact will be decoded
     // with, or the symbols are optimal for a function nobody evaluates. Selecting
@@ -4502,14 +4531,23 @@ fn gpu_encode_symbols(
     // same pool). The APU may not have a big contiguous block free with a model
     // resident, so start modest and halve on OOM until it fits. Allocated once,
     // reused across chunks.
-    let mut chunk = 1024usize.min(n_groups.max(1));
-    let backptr = loop {
-        match gpu.alloc_tensor(&[chunk * 256 * 256 * 2], DType::F32) {
-            Ok(b) => break b,
-            Err(_) if chunk > 64 => chunk /= 2,
-            Err(e) => return Err(format!("backptr alloc (chunk={chunk}): {e}")),
-        }
-    };
+    if scratch.is_none() {
+        // Size once at the cap, not at this call's n_groups: a later block must
+        // not find the buffer too small, and the kernel only touches the first
+        // `cn` entries so an oversized scratch costs nothing per call.
+        let mut chunk = 1024usize;
+        let backptr = loop {
+            match gpu.alloc_tensor(&[chunk * 256 * 256 * 2], DType::F32) {
+                Ok(b) => break b,
+                Err(_) if chunk > 64 => chunk /= 2,
+                Err(e) => return Err(format!("backptr alloc (chunk={chunk}): {e}")),
+            }
+        };
+        *scratch = Some(QtipEncodeScratch { chunk, backptr });
+    }
+    let sc = scratch.as_ref().expect("scratch allocated above");
+    let chunk = sc.chunk.min(n_groups.max(1));
+    let backptr = &sc.backptr;
     let mut symbols = vec![0u8; n_groups * 256];
     let mut done = 0usize;
     while done < n_groups {
@@ -4527,7 +4565,7 @@ fn gpu_encode_symbols(
         let scd = gpu
             .alloc_tensor(&[cn], DType::F32)
             .map_err(|e| e.to_string())?;
-        gpu.qtip_viterbi_encode_cb(&wd, &sd, &backptr, &scd, cn, bits, use_3inst)
+        gpu.qtip_viterbi_encode_cb(&wd, &sd, backptr, &scd, cn, bits, use_3inst)
             .map_err(|e| e.to_string())?;
         gpu.device_synchronize().map_err(|e| e.to_string())?;
         let s = gpu.download_raw(&sd, cn * 256).map_err(|e| e.to_string())?;
@@ -4813,6 +4851,12 @@ fn pack_qtip_real_tensors(
                 // is inside the beam — and falls through to the CPU path.
                 #[cfg(feature = "gpu")]
                 let gpu_cell = std::cell::RefCell::new(gpu.take());
+                // One scratch for every block of this tensor — see
+                // QtipEncodeScratch. Without this the block loop reallocated
+                // 512 MB per block.
+                #[cfg(feature = "gpu")]
+                let enc_scratch: std::cell::RefCell<Option<QtipEncodeScratch>> =
+                    std::cell::RefCell::new(None);
                 #[cfg(feature = "gpu")]
                 let gpu_block: Option<Box<dyn Fn(&[f32], usize) -> Vec<u8>>> =
                     if mode == hipfire_quantize::ldlq::QtipCondMode::Greedy
@@ -4820,11 +4864,14 @@ fn pack_qtip_real_tensors(
                     {
                         Some(Box::new(|flat: &[f32], groups: usize| {
                             let mut guard = gpu_cell.borrow_mut();
+                            let mut sc = enc_scratch.borrow_mut();
                             match guard.as_mut() {
-                                Some(g) => gpu_encode_symbols(g, flat, groups, bits)
-                                    .unwrap_or_else(|_| {
-                                        cpu_encode_symbols(flat, groups, qtip_cb, beam, bits)
-                                    }),
+                                Some(g) => {
+                                    gpu_encode_symbols_scratch(g, flat, groups, bits, &mut sc)
+                                        .unwrap_or_else(|_| {
+                                            cpu_encode_symbols(flat, groups, qtip_cb, beam, bits)
+                                        })
+                                }
                                 None => cpu_encode_symbols(flat, groups, qtip_cb, beam, bits),
                             }
                         }))
