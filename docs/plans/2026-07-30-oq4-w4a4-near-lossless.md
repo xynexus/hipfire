@@ -1322,9 +1322,14 @@ measurable without building the dual int4+int8 GEMM first.
 
 **`o_proj` is the most activation-sensitive site, not `down_proj`** — which
 refutes the standing intuition (down's input is the SwiGLU product, the textbook
-worst-outlier activation). o+down together recover half the penalty. gate_up is
-nearly free, so any future mixed-precision work should target o first, and there
-is no reason to spend precision on gate_up.
+worst-outlier activation). o+down together recover half the penalty.
+
+> **CORRECTED by §13i:** the gate_up row above is NOT an A16-vs-A4 measurement.
+> gate_up's default dispatch already routes to int8 MMQ at n>=64, so this row
+> compares A16 against **A8**, which is why it looks nearly free. Measured
+> against a true int4 gate_up (a path nothing reached until §13i), the cost is
+> **0.0179 KLD** — comparable to `down`. Do not read this table as "gate_up is
+> insensitive"; it was already fixed.
 
 **Lever 2 — finer activation group.** The activation group was welded to the
 weight codec's 256 because the GEMM indexed `Ws` and `Xs` with one `group`.
@@ -1548,8 +1553,95 @@ the A16 activation floor.** That is a far stronger ship case than any earlier
 configuration in this plan.
 
 Scope unchanged: one small hybrid model (qwen3.5-0.8b), one corpus, gfx1103, and
-the batched dense prefill path (the FA branch's 3 sites are not wired). `gate_up`
-is deliberately left at A4 — §13c measured it at ~2% of the penalty, so it does
-not justify the MMQ cost. Still owed: a dense/wider GEMM-bound model, ≥16-chunk
+the batched dense prefill path (the FA branch's 3 sites are not wired).
+
+> **CORRECTED by §13i:** the claim here that "`gate_up` is deliberately left at
+> A4" was false — gate_up's dispatch has always routed to int8 MMQ at n>=64, so
+> it was already A8 in every configuration in this section. §13i measures the
+> true-A4 counterfactual and finds A8-everywhere strictly better than this
+> recipe (0.0198 vs 0.0326 KLD at the same 1.5% throughput cost). Still owed: a dense/wider GEMM-bound model, ≥16-chunk
 on a second corpus, and a regenerated bf16 reference (§13a) for an absolute
 number on this recipe.
+
+## 13i. gate_up was NEVER on the int4 path — and A8-everywhere wins (2026-08-03)
+
+Wiring `HIPFIRE_OQ4_PREFILL_ACT_BITS_GATEUP=8` produced KLD **byte-identical to
+the A4 baseline** (0.056399 both). Same signature as §13c's stale-binary row, but
+the binary was fresh and the string was linked in. The cause is worse than a
+stale build:
+
+> `KernelKey::FusedGateUpOq4G256` (`hipfire-dispatch/src/families/fused_qkv.rs`)
+> routes to `gemm_oq4_gate_up_mmq` — **int8 MMQ** — whenever `n >= 64`, falling
+> back to f16-WMMA below that. **The int4 activation path is never taken at
+> prefill batch sizes.** gate_up has always run at A8, including under a global
+> `HIPFIRE_OQ4_PREFILL_ACT_BITS=4`.
+
+**This invalidates two claims in this plan, both mine:**
+
+1. **§9e/§13's premise "gate_up/o/down are already W4A4" is wrong for gate_up.**
+   The incumbent's real activation map at n≥64 is qkv **A8**, gate_up **A8**,
+   o **A4**, down **A4** — only two of the four sites were ever int4.
+2. **§13c's "gate_up is only ~2% of the penalty" measured A16-vs-A8, not
+   A16-vs-A4.** gate_up looked insensitive because it was never damaged in the
+   first place. With the true int4 path now reachable (new `GATEUP=4` arm), the
+   real number is the opposite of the earlier reading:
+
+| gate_up | rest at A4 | rest with O+DOWN=A8 |
+|---|---|---|
+| **true A4** (new path) | 0.074320 | 0.048392 |
+| A8 (what the default has always done) | **0.056399** | **0.032565** |
+| paired | 16/16, mean −0.01792, t −15.61 | 16/16, mean −0.01583, t −23.35 |
+
+So gate_up at int4 costs ~0.016–0.018 KLD — comparable to `down` and second only
+to `o_proj`. It was never the insensitive site; it was the *already-fixed* one.
+Every "full W4A4" figure in §9c–§13h therefore describes a **partial** W4A4
+(gate_up at A8 throughout); the comparisons remain valid because all configs
+shared that treatment, but the labels were wrong.
+
+### The consequence: stop using int4 activations here
+
+With the accounting corrected, the ladder is (16 chunks, vs the A16 reference;
+throughput = interleaved 3-rep medians, first run discarded):
+
+| configuration | KLD/tok | PPL | worst chunk | tok/s | vs mix |
+|---|---|---|---|---|---|
+| true all-A4 (clip+g128, GATEUP=4) | 0.074320 | 26.110 | 0.109932 | 1020.0 | +0.3% |
+| current mix (incumbent) | 0.063187 | 26.072 | 0.083231 | 1016.8 | — |
+| clip + g128 (§13g) | 0.056399 | 25.636 | 0.078459 | — | — |
+| clip + g128 + O/DOWN=A8 (§13h) | 0.032565 | 24.834 | 0.044448 | 1002.0 | −1.5% |
+| **A8 everywhere** | **0.019802** | 24.844 | **0.026875** | 1001.5 | **−1.5%** |
+| A16 everywhere (floor) | 0.000000 | 24.826 | — | 937.5 | −7.8% |
+
+**A8-everywhere is the best point measured: −69% KLD vs the incumbent for −1.5%
+prefill, beating §13h's recipe on 16/16 chunks (mean −0.01276, t = −20.43) and
+improving the worst chunk another 40%.** It needs no clip kernel, no group
+change, and no int4 activation at all — the two levers §13 built were optimizing
+a path that the best configuration simply does not use.
+
+That is the honest end state of the activation-precision question **on this
+model**: int4 activations are not worth it. They buy ~1.8% throughput over A8
+(1020.0 vs 1001.5) and cost 0.074 vs 0.020 KLD — nearly 4× the error for under
+two percent. A8 sits 7.8% *above* A16 in throughput while giving up only 0.0198
+KLD, which is the actual bargain in this design space.
+
+The clip and group-128 levers are not wasted — they remain the right treatment
+*if* int4 activations are forced (a memory-bound regime, a wave64 port without
+fast int8 MMQ, or hardware where iu4 has a real edge, e.g. RDNA4's
+`v_wmma_i32_16x16x32_iu4`). They are simply not the default recipe here.
+
+### Scope and what this does not overturn
+
+§9h stands and is reinforced: activation precision is a ~1–2% throughput lever on
+this hybrid model in either direction, because prefill is not GEMM-bound (GDN
+recurrence is sequential per token). The A3 kernel result stands too — the LDS
+iu4 GEMM genuinely beats W4A8-MMQ ~1.5× at the kernel level; it just does not
+reach model throughput here, and now we know the quality side does not favour it
+either. A dense, wider, GEMM-bound model could still flip this: there the 1.5×
+kernel win would translate, and 1.8% could become double digits. Untested.
+
+**Verification note for the next person:** a bare global
+`HIPFIRE_OQ4_PREFILL_ACT_BITS` is no longer unambiguous — `=4` leaves qkv and
+gate_up on their default routing unless per-site `_QKV=4` / `_GATEUP=4` are also
+set. Pin every site explicitly in any run whose label claims a uniform precision.
+And the rule that caught this twice: **a knob that reads byte-identical to its
+baseline has not taken effect** — check the binary, then check the dispatch.

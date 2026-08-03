@@ -14,9 +14,14 @@ use super::*;
 ///
 /// `HIPFIRE_OQ4_PREFILL_ACT_BITS_<SITE>` (QKV | GATEUP | O | DOWN) overrides the
 /// global `HIPFIRE_OQ4_PREFILL_ACT_BITS` for that site alone; with both unset the
-/// production routing is unchanged. Values: `4` (int4 activation), `8` (int8-MMQ
-/// — O and DOWN only; QKV already routes to MMQ by default at n>=64), `16` (f16
-/// activation).
+/// production routing is unchanged. Values: `4` (int4 activation), `8` (int8-MMQ),
+/// `16` (f16 activation); all four sites accept all three.
+///
+/// Note which sites are actually int4 by default at prefill batch sizes: **QKV
+/// and GATEUP both route to int8 MMQ at n>=64**, so only O and DOWN run int4.
+/// That means a global `=4` does NOT produce an all-int4 prefill — per-site `=4`
+/// on QKV/GATEUP is what forces those (plan §13i). A global `=8` gives a fully-A8
+/// prefill.
 ///
 /// The per-site form started as a way to hold ONE projection at A16 while the
 /// rest ran A4 — an upper bound on what mixed precision at that site could buy,
@@ -3486,10 +3491,50 @@ pub(crate) fn forward_prefill_chunk(
                     )?;
                 } else if ffn_is_oq4 {
                     // Opus W4A4: x_rot_batch is FWHT(+AWQ)-rotated above (ffn_is_mq).
-                    // A4 KLD gate: =16 unfuses to two W4A16 GEMMs (act16 baseline into
-                    // the same gate/up buffers the fused kernel writes); default = fused
-                    // W4A4 (unchanged). The downstream silu_mul is identical either way.
-                    if oq4_act_bits("GATEUP").as_deref() == Some("16") {
+                    // CAREFUL — the default here is NOT int4 activation. The
+                    // `FusedGateUpOq4G256` dispatch key routes to
+                    // `gemm_oq4_gate_up_mmq` (int8 MMQ) whenever n >= 64, falling
+                    // back to f16-WMMA below that; the int4 activation path is
+                    // never taken at prefill batch sizes. So gate_up has always
+                    // run at A8, including under a global `=4` (plan §13i).
+                    //
+                    // =16 unfuses to two W4A16 GEMMs, =8 pins the int8-MMQ pair
+                    // explicitly at any n, and =4 forces the TRUE int4-activation
+                    // path (two grouped-act GEMMs) — which nothing reached before,
+                    // so "full W4A4" numbers predating §13i all had gate_up at A8.
+                    // Default (unset) keeps the existing routing untouched.
+                    // The downstream silu_mul is identical in every case.
+                    let gate_up_bits = oq4_act_bits("GATEUP");
+                    if gate_up_bits.as_deref() == Some("4") {
+                        gpu.gemm_oq4_grouped_act_batched(
+                            &layer.w_gate.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.gate_ffn_batch,
+                            layer.w_gate.m,
+                            layer.w_gate.k,
+                            n,
+                        )?;
+                        gpu.gemm_oq4_grouped_act_batched(
+                            &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.up_batch,
+                            layer.w_up.m,
+                            layer.w_up.k,
+                            n,
+                        )?;
+                    } else if gate_up_bits.as_deref() == Some("8") {
+                        gpu.gemm_oq4_gate_up_mmq(
+                            &layer.w_gate.buf,
+                            &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.gate_ffn_batch,
+                            &pbs.up_batch,
+                            layer.w_gate.m,
+                            layer.w_up.m,
+                            layer.w_gate.k,
+                            n,
+                        )?;
+                    } else if gate_up_bits.as_deref() == Some("16") {
                         gpu.gemm_oq4_grouped_f16_wmma(
                             &layer.w_gate.buf,
                             &pbs.x_rot_batch,
