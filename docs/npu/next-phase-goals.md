@@ -236,17 +236,35 @@ over — so 3-bit shares the iu8 W8A8 kernels with oq4/oq8 rather than needing a
 W3 GEMV. That also retires the earlier "oq3 unpack is unaffordable" worry: that
 number came from a kernel decoding bit-planes to bf16, not to a shared int8 grid.
 
-**GOAL MET 2026-08-03: oq4.25++ BEATS q4nx ON BOTH METRICS AT 15% FEWER BITS,
-and PROMOTING ONE LAYER widens the KLD margin to 15%.**
+**GOAL MET 2026-08-03: oq4.25++ WITH TWO PROMOTED LAYERS BEATS q4nx BY 28% ON
+KLD AT 8.4% FEWER BITS.**
 
-                                    b/w      PPL       KLD      vs q4nx
-    q4nx (FLM, the bar)           5.0000  17.1949  0.034954       —
-    oq4.25++ @ alpha 0.45         4.2500  17.1547  0.034862     -0.3%
-    + o_proj promoted to oq8++    4.5100  17.1886  0.029688    -15.1%
+                                b/w      PPL       KLD      vs q4nx
+    q4nx (FLM, the bar)       5.0000  17.1949  0.034954       —
+    oq4.25++ @ alpha 0.45     4.2500  17.1547  0.034862     -0.3%
+    + v_proj -> oq8++         4.3150  17.1520  0.030288    -13.4%
+    + o_proj -> oq8++         4.5130  17.1886  0.029688    -15.1%
+    + v_proj + k_proj         4.3800  17.0660  0.029371    -16.0%
+    + v_proj + o_proj         4.5780  17.1157  0.025025    -28.4%   BEST
 
-`--tensor-format '*o_proj*=oq8++'` costs 0.26 b/w (o_proj is 6.9% of quantised
-params) and buys a 15% KLD margin — a comfortable win rather than the 0.26%
-squeaker, still 10% under the bar's bit rate.
+Recipe: `--format oq4.25++ --awq-alpha 0.45 --ldlq --awq`
+        `--tensor-format '*v_proj*=oq8++' --tensor-format '*o_proj*=oq8++'`
+
+**PER-LAYER TREATMENT IS THE LEVER, VIA PRECISION TIER — not clip policy, not
+outlier allocation.** Both of those were tested and lost (see below). Promoting
+whole small tensors to int8 wins, and the effects are almost exactly ADDITIVE:
+v alone -13.4%, o alone -15.1%, together -28.4%.
+
+The sensitivity is concentrated in the ATTENTION projections, which are cheap:
+v_proj and k_proj are 1.7% of quantised parameters each, o_proj 6.9%. v_proj is
+the efficiency winner at 202% KLD-improvement per b/w against o_proj's 56% — 3.6x
+better — and v+k buys -16.0% for only 0.13 b/w. The MLP tensors (gate/up/down,
+27.6% each) were never worth promoting: too expensive per unit of KLD.
+
+`mixed_precision.rs` already implements exactly this search — rank dense-linear
+tensors by the output error incurred when DEMOTED, promote greedily under a bit
+budget — and it is not wired into this path. The layers above were hand-picked;
+that module would search the space properly.
 
 CLIPPING IS NOT A PER-LAYER LEVER, and the reason is worth knowing: the MSE
 search already picks c = 1.0 (no clipping) whenever clipping does not pay,
