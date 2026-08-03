@@ -20,6 +20,69 @@ use hipfire_rdna::{DType, Gpu, GpuTensor};
 pub use crate::dispatch::gemv_family;
 pub use hipfire_primitives::conv::f16_to_f32;
 
+use hipfire_rdna::lmhead_twostage::{
+    build_lmhead_coarse_bf16, lmhead_twostage_serve_bf16, LmheadCoarse,
+};
+use std::cell::RefCell;
+
+thread_local! {
+    // (lm_head buf ptr, coarse tier, vocab, hidden) — the coarse shortlist tier is
+    // built once per resident bf16 lm_head and reused across decode steps. Rebuilt
+    // when the head pointer changes (model swap).
+    static LMHEAD_COARSE: RefCell<Option<(usize, LmheadCoarse, usize, usize)>> =
+        const { RefCell::new(None) };
+}
+
+/// Parse `HIPFIRE_LMHEAD_TWOSTAGE` → (coarse bits, top-K). Presets: `q4` / `1` =
+/// 4-bit coarse, K=32; `q2` = 2-bit, K=2048. Append `:<K>` to override K
+/// (e.g. `q4:64`). Absent → the exact full lm_head. OFF by default.
+fn lmhead_twostage_cfg() -> Option<(usize, usize)> {
+    let v = hipfire_env::LMHEAD_TWOSTAGE.get()?;
+    let (bits, base_k, rest) = if let Some(r) = v.strip_prefix("q2") {
+        (2usize, 2048usize, r)
+    } else if let Some(r) = v.strip_prefix("q4") {
+        (4, 32, r)
+    } else if v == "1" {
+        (4, 32, "")
+    } else {
+        return None;
+    };
+    let k = rest
+        .strip_prefix(':')
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(base_k)
+        .max(1);
+    Some((bits, k))
+}
+
+/// lm_head projection with an optional coarse-shortlist + fine-rescore fast path
+/// gated by `HIPFIRE_LMHEAD_TWOSTAGE`. Falls back to the exact `weight_gemv` when
+/// the env is unset or the head is not bf16. The two-stage path is **greedy-exact**
+/// (recall@1 = 1.0 at K=32 on real lm_heads) but truncates the tail to the
+/// shortlist, so it is a decode/argmax fast path — the eval/scoring paths simply
+/// leave the env unset to keep full-distribution logits.
+fn lmhead_project(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
+    if let Some((bits, topk)) = lmhead_twostage_cfg() {
+        if w.gpu_dtype == DType::BF16 {
+            let (vocab, hidden) = (w.m, w.k);
+            let ptr = w.buf.buf.as_ptr() as usize;
+            let stale = LMHEAD_COARSE.with(|c| c.borrow().as_ref().map(|(p, ..)| *p) != Some(ptr));
+            if stale {
+                let coarse = build_lmhead_coarse_bf16(gpu, &w.buf, vocab, hidden, bits)
+                    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+                LMHEAD_COARSE.with(|c| *c.borrow_mut() = Some((ptr, coarse, vocab, hidden)));
+            }
+            return LMHEAD_COARSE.with(|c| {
+                let b = c.borrow();
+                let (_, coarse, v, h) = b.as_ref().unwrap();
+                lmhead_twostage_serve_bf16(gpu, &w.buf, coarse, x, y, *v, *h, topk)
+                    .map_err(|e| hip_bridge::HipError::new(0, &e))
+            });
+        }
+    }
+    weight_gemv(gpu, w, x, y)
+}
+
 /// Model architecture type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelArch {
@@ -347,7 +410,7 @@ pub fn prefill_forward(
         gpu.hip
             .memcpy_dtod_at(&x_last.buf, 0, &x_batch.buf, last_off, dim * 4)?;
         gpu.rmsnorm_f32(&x_last, &weights.output_norm, &tmp, config.norm_eps)?;
-        weight_gemv(gpu, &weights.output, &tmp, &logits)?;
+        lmhead_project(gpu, &weights.output, &tmp, &logits)?;
         gpu.download_f32(&logits)
     })();
 
@@ -639,7 +702,7 @@ pub fn forward_prefill_batch(
             &scratch.tmp,
             config.norm_eps,
         )?;
-        weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+        lmhead_project(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
         Ok(())
     })();
 
@@ -740,7 +803,7 @@ pub fn forward_prefill_batch_capture(
             &scratch.tmp,
             config.norm_eps,
         )?;
-        weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+        lmhead_project(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
         Ok(())
     })();
 
@@ -911,7 +974,33 @@ pub fn forward_prefill_batch_chunk_captured(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Whether `forward_prefill_chunk`'s per-linear projection dispatch has an
+/// explicit arm for weight dtype `dt`. Any dtype NOT in this set silently falls
+/// through to the HFQ4 `gemm_*_hfq4g256*` kernels, which reinterpret the raw
+/// weight bytes as 4-bit blocks and produce garbage logits.
+///
+/// This is the coverage predicate paired with [`crate::dispatch::is_batchable_la`]:
+/// a dtype that `is_batchable_la` marks batchable MUST appear here, or the
+/// batched serving prefill routes it into the wrong GEMM. BF16/F16 were made
+/// batchable (`is_batchable_la` bf16_f16_wmma arm) without a matching projection
+/// arm here — that mismatch was the MiniCPM5-1B batched-prefill garbage bug
+/// (BUGS.md). The unit test `chunk_projection_covers_all_batchable_dtypes`
+/// enforces the pairing so the two can't drift again.
+pub(crate) fn chunk_projection_handles_dtype(dt: DType) -> bool {
+    matches!(
+        dt,
+        // Dense unquantized (routed through `weight_gemm`).
+        DType::BF16 | DType::F16
+        // Quantized formats with explicit fused/chunked arms.
+        | DType::Q8_0
+        | DType::MQ6G256 | DType::HFQ6G256
+        | DType::MQ3G256
+        | DType::HFP4G32 | DType::MFP4G32
+        // MQ4 (via FWHT-rotate) and HFQ4 share the `gemm_*_hfq4g256*` else arm.
+        | DType::MQ4G256 | DType::HFQ4G256
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn forward_prefill_chunk(
     gpu: &mut Gpu,
@@ -1057,6 +1146,27 @@ fn forward_prefill_chunk(
     // 2. Per-layer loop.
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
+        // Guard the projection dispatch: any weight dtype that reached the
+        // batched chunk but lacks an explicit arm below would fall through to
+        // the HFQ4 `gemm_*_hfq4g256*` kernels and be misread as 4-bit blocks
+        // (the MiniCPM5-1B bf16 garbage bug). Debug-only; compiled out of the
+        // serving release build.
+        debug_assert!(
+            chunk_projection_handles_dtype(layer.wq.gpu_dtype)
+                && chunk_projection_handles_dtype(layer.wk.gpu_dtype)
+                && chunk_projection_handles_dtype(layer.wv.gpu_dtype)
+                && chunk_projection_handles_dtype(layer.wo.gpu_dtype)
+                && chunk_projection_handles_dtype(layer.w_gate.gpu_dtype)
+                && chunk_projection_handles_dtype(layer.w_up.gpu_dtype)
+                && chunk_projection_handles_dtype(layer.w_down.gpu_dtype),
+            "forward_prefill_chunk: layer {layer_idx} has a weight dtype with no \
+             explicit projection arm; it would fall through to the HFQ4 GEMM and \
+             produce garbage. wq={:?} wo={:?} w_gate={:?} w_down={:?}",
+            layer.wq.gpu_dtype,
+            layer.wo.gpu_dtype,
+            layer.w_gate.gpu_dtype,
+            layer.w_down.gpu_dtype,
+        );
         let qkv_is_mq = matches!(
             layer.wq.gpu_dtype,
             DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MFP4G32
@@ -1088,9 +1198,19 @@ fn forward_prefill_chunk(
         }
 
         let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
+        // Dense (unquantized) BF16/F16 weights have no fused QKV kernel; route
+        // each projection through the dtype-dispatched `weight_gemm` (identical
+        // to the correct `prefill_forward` path). Without this arm, BF16/F16
+        // weights fell through to `gemm_qkv_hfq4g256` and were reinterpreted as
+        // HFQ4 blocks — producing garbage batched-prefill logits (BUGS.md).
+        let qkv_is_dense = matches!(layer.wq.gpu_dtype, DType::BF16 | DType::F16);
 
         // 3-way fused QKV projection.
-        if qkv_is_6bit {
+        if qkv_is_dense {
+            crate::weights::weight_gemm(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_batch, n)?;
+            crate::weights::weight_gemm(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
+            crate::weights::weight_gemm(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
+        } else if qkv_is_6bit {
             gpu.gemm_qkv_hfq6g256(
                 &layer.wq.buf,
                 &layer.wk.buf,
@@ -1441,6 +1561,7 @@ fn forward_prefill_chunk(
         let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
         let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+        let wo_is_dense = matches!(layer.wo.gpu_dtype, DType::BF16 | DType::F16);
         let wo_input = if wo_is_mq {
             // F2: AWQ-aware rotate for wo (FullAttention output projection) input.
             rotate_x_mq_batched_for(
@@ -1455,7 +1576,14 @@ fn forward_prefill_chunk(
         } else {
             &pbs.fa_attn_out_batch
         };
-        if wo_is_6bit {
+        if wo_is_dense {
+            // Dense BF16/F16 wo: project into scratch, then residual-add into
+            // x_batch (mirrors the wo_is_q8 non-WMMA path).
+            let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
+            crate::weights::weight_gemm(gpu, &layer.wo, wo_input, &scratch, n)?;
+            let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+            gpu.add_inplace_f32(&x_n, &scratch)?;
+        } else if wo_is_6bit {
             gpu.gemm_hfq6g256_residual(
                 &layer.wo.buf,
                 wo_input,
@@ -1518,6 +1646,7 @@ fn forward_prefill_chunk(
         let ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
         let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
+        let ffn_is_dense = matches!(layer.w_gate.gpu_dtype, DType::BF16 | DType::F16);
         if ffn_is_mq {
             gpu.fused_rmsnorm_rotate_mq_batched(
                 &pbs.x_batch,
@@ -1565,6 +1694,15 @@ fn forward_prefill_chunk(
                 layer.w_gate.k,
                 n,
             )?;
+        } else if ffn_is_dense {
+            crate::weights::weight_gemm(
+                gpu,
+                &layer.w_gate,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
+                n,
+            )?;
+            crate::weights::weight_gemm(gpu, &layer.w_up, &pbs.x_rot_batch, &pbs.up_batch, n)?;
         } else if ffn_is_q8 {
             gpu.gemm_q8_0_batched_chunked(
                 &layer.w_gate.buf,
@@ -1627,6 +1765,7 @@ fn forward_prefill_chunk(
         let w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
         let w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
+        let w_down_is_dense = matches!(layer.w_down.gpu_dtype, DType::BF16 | DType::F16);
         if w_down_is_mq {
             // F2: AWQ-aware silu_mul+rotate for w_down input.
             fused_silu_mul_rotate_mq_batched_for(
@@ -1654,7 +1793,14 @@ fn forward_prefill_chunk(
         } else {
             None
         };
-        if w_down_is_6bit {
+        if w_down_is_dense {
+            // Dense BF16/F16 w_down: project into scratch, residual-add into
+            // x_batch (mirrors the w_down_is_q8 non-WMMA path).
+            let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
+            crate::weights::weight_gemm(gpu, &layer.w_down, &pbs.ffn_hidden_batch, &scratch, n)?;
+            let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
+            gpu.add_inplace_f32(&x_n, &scratch)?;
+        } else if w_down_is_6bit {
             gpu.gemm_hfq6g256_residual(
                 &layer.w_down.buf,
                 &pbs.ffn_hidden_batch,
@@ -2221,7 +2367,7 @@ pub fn forward_scratch_layers(
         &scratch.tmp,
         config.norm_eps,
     )?;
-    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+    lmhead_project(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
 
     // GPU-side sampling (includes sync readback — can't be in graph capture)
     gpu.sample_top_p(
@@ -2417,7 +2563,7 @@ pub fn forward_early_exit(
                 &scratch.tmp,
                 config.norm_eps,
             )?;
-            weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+            lmhead_project(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
 
             // GPU-side confidence check: compute max(softmax) on GPU, download 4 bytes
             gpu.max_prob(&scratch.logits, &scratch.sample_buf, config.vocab_size)?;
@@ -2452,7 +2598,7 @@ pub fn forward_early_exit(
         &scratch.tmp,
         config.norm_eps,
     )?;
-    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+    lmhead_project(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
     let (tok, rng) = gpu.sample_top_p(
         &scratch.logits,
         &scratch.sample_buf,
@@ -2744,7 +2890,7 @@ pub fn forward_scratch_compute(
         &scratch.tmp,
         config.norm_eps,
     )?;
-    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+    lmhead_project(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
     Ok(())
 }
 
@@ -3064,7 +3210,7 @@ pub fn forward_scratch_compute_capture(
         &scratch.tmp,
         config.norm_eps,
     )?;
-    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+    lmhead_project(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
     Ok(())
 }
 
@@ -3231,7 +3377,7 @@ pub fn forward(
 
         // Logits: output = output_weight * x
         let logits = gpu.alloc_owned(&[config.vocab_size], DType::F32)?;
-        weight_gemv(gpu, &weights.output, &tmp, &logits)?;
+        lmhead_project(gpu, &weights.output, &tmp, &logits)?;
         gpu.download_f32(&logits)
     })();
 
@@ -3419,7 +3565,7 @@ fn forward_logits_gpu(
         // `logits` is returned to the caller, so it stays a plain pooled tensor
         // (the caller owns + frees it); free it here only on the gemv error path.
         let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
-        match weight_gemv(gpu, &weights.output, &tmp, &logits) {
+        match lmhead_project(gpu, &weights.output, &tmp, &logits) {
             Ok(()) => Ok(logits),
             Err(e) => {
                 let _ = gpu.free_tensor(logits);
@@ -3464,6 +3610,50 @@ fn apply_rope_cpu(data: &mut [f32], n_heads: usize, head_dim: usize, pos: usize,
 mod tests {
     use super::*;
     use crate::transformer::is_batchable_la;
+
+    /// Regression guard for the MiniCPM5-1B bf16 batched-prefill garbage bug
+    /// (BUGS.md): every weight dtype that `is_batchable_la` routes into the
+    /// batched serving prefill MUST have an explicit projection arm in
+    /// `forward_prefill_chunk` (`chunk_projection_handles_dtype`). Otherwise it
+    /// falls through to the HFQ4 GEMMs and is reinterpreted as 4-bit blocks.
+    ///
+    /// BF16/F16 were made batchable without the matching projection arm — this
+    /// test fails on that state and passes once the arms exist.
+    #[test]
+    fn chunk_projection_covers_all_batchable_dtypes() {
+        // Every dtype the runtime can tag on a linear weight.
+        let all = [
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::Q8_0,
+            DType::MQ4G256,
+            DType::HFQ4G256,
+            DType::HFQ4G128,
+            DType::MQ6G256,
+            DType::HFQ6G256,
+            DType::MQ3G256,
+            DType::HFP4G32,
+            DType::MFP4G32,
+        ];
+        // gfx1103 (this fleet) plus the other WMMA archs that batch bf16/f16.
+        for arch in [
+            "gfx1100", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            for dt in all {
+                if is_batchable_la(dt, arch) {
+                    assert!(
+                        chunk_projection_handles_dtype(dt),
+                        "{dt:?} is batchable on {arch} but forward_prefill_chunk \
+                         has no explicit projection arm (would misroute to HFQ4)"
+                    );
+                }
+            }
+        }
+        // Explicitly pin the bug's trigger dtypes.
+        assert!(chunk_projection_handles_dtype(DType::BF16));
+        assert!(chunk_projection_handles_dtype(DType::F16));
+    }
 
     #[test]
     fn is_batchable_la_always_ok_dtypes() {

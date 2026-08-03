@@ -1563,6 +1563,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-cpu",
  "hipfire-dispatch",
+ "hipfire-env",
  "hipfire-kld",
  "hipfire-model",
  "hipfire-npu",
@@ -1733,6 +1734,7 @@ dependencies = [
  "hipfire-detect",
  "hipfire-diffusion",
  "hipfire-diffusion-coexist",
+ "hipfire-env",
  "hipfire-generate",
  "hipfire-hfq-tooling",
  "hipfire-lock",
@@ -1800,6 +1802,7 @@ dependencies = [
  "argon2",
  "dirs",
  "getrandom 0.2.17",
+ "hipfire-auth",
  "serde",
  "serde_json",
 ]
@@ -1941,6 +1944,10 @@ dependencies = [
  "hipfire-rdna",
  "hipfire-runtime",
 ]
+
+[[package]]
+name = "hipfire-env"
+version = "0.3.0"
 
 [[package]]
 name = "hipfire-eval"
@@ -2085,6 +2092,7 @@ dependencies = [
  "byteorder",
  "hipfire-arch-api",
  "hipfire-config",
+ "hipfire-env",
  "hipfire-hash",
  "hipfire-prompt",
  "memmap2",
@@ -2164,6 +2172,7 @@ dependencies = [
  "faer",
  "hipfire-arch-api",
  "hipfire-arch-specs",
+ "hipfire-env",
  "hipfire-gguf",
  "hipfire-kvquant",
  "hipfire-model",
@@ -2228,6 +2237,7 @@ dependencies = [
  "hipfire-cpu",
  "hipfire-detect",
  "hipfire-dispatch",
+ "hipfire-env",
  "hipfire-evidence",
  "hipfire-generate",
  "hipfire-hneurons",
@@ -2260,10 +2270,12 @@ dependencies = [
 name = "hipfire-scheduler"
 version = "0.3.0"
 dependencies = [
+ "hipfire-arch-specs",
  "hipfire-auth",
  "hipfire-model",
  "hipfire-state",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -2293,6 +2305,7 @@ dependencies = [
  "hipfire-state",
  "hipfire-sysinfo",
  "image",
+ "libc",
  "reqwest",
  "rust-embed",
  "serde",

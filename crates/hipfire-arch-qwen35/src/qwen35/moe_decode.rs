@@ -825,6 +825,7 @@ pub(crate) fn moe_ffn_decode_impl(
             .collect();
 
         let moe_params = hipfire_dispatch::families::moe::MoeParams {
+            layer: layer_idx,
             dtypes: moe_dtypes,
             batch_size: 1,
             hidden,
@@ -1571,6 +1572,7 @@ pub(crate) fn moe_ffn_decode_impl(
         .collect();
 
     let moe_params = hipfire_dispatch::families::moe::MoeParams {
+        layer: layer_idx,
         dtypes: moe_dtypes,
         batch_size: 1,
         hidden,

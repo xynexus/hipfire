@@ -1412,6 +1412,17 @@ pub(crate) struct ThinkStreamFilter {
 }
 
 impl ThinkStreamFilter {
+    /// A filter for a stream that begins *inside* the think block — the chat
+    /// templates open `<think>` in the generation prompt when thinking is enabled,
+    /// so the model's first token is already reasoning and no opening marker will
+    /// ever appear in the stream.
+    pub(crate) fn started_in_think() -> Self {
+        Self {
+            in_think: true,
+            strip_next_leading_newline: false,
+        }
+    }
+
     pub(crate) fn observe(&mut self, text: &str, preserve: bool) -> Vec<AssistantDelta> {
         if preserve {
             let text = text.replace("<|im_end|>", "");
@@ -1559,11 +1570,21 @@ fn estimated_prompt_tokens(messages: &[ChatMessage]) -> Vec<u32> {
     tokens
 }
 
-fn scheduler_worker_key(model_path: &str, cfg: &HipfireConfig) -> ModelWorkerKey {
+/// Build the scheduler's view of the current model.
+///
+/// `arch` is the tag the daemon reported on load ([`LoadedModelState::arch`]).
+/// It must be threaded through: the scheduler classifies recurrent and
+/// arena-private families from it to decide whether two sessions may share a
+/// fused prefill batch, and with no tag it fails closed and disables batching.
+fn scheduler_worker_key(
+    model_path: &str,
+    cfg: &HipfireConfig,
+    arch: Option<String>,
+) -> ModelWorkerKey {
     ModelWorkerKey {
         artifact_path: model_path.to_string(),
         artifact_digest: None,
-        arch_id: "unknown".to_string(),
+        arch_id: arch.unwrap_or_else(|| "unknown".to_string()),
         quant_family: "unknown".to_string(),
         state_mode: cfg.kv_cache.clone(),
         max_seq_bucket: cfg.max_seq as usize,
@@ -1586,9 +1607,16 @@ pub(crate) async fn wait_for_prefill_scheduler_turn(
         return Ok(());
     }
 
+    // Taken before `config` and released immediately — never hold both.
+    let arch = state
+        .loaded_models
+        .lock()
+        .await
+        .get(model_path)
+        .and_then(|loaded| loaded.arch.clone());
     let worker_key = {
         let cfg = state.config.lock().await;
-        scheduler_worker_key(model_path, &cfg)
+        scheduler_worker_key(model_path, &cfg, arch)
     };
     let session = create_request_session_draft(CreateRequestSessionInput {
         id: req_id.to_string(),
@@ -1673,6 +1701,28 @@ pub(crate) async fn execute_blocking_chat_for_principal(
         execute_blocking_chat_owned(state, body, scheduler_owner_from_principal(principal)).await?;
     report_done_usage(accounting, &result.done);
     Ok(result)
+}
+
+/// Sends the worker a cooperative cancel (SIGUSR1) if dropped while armed.
+///
+/// A client disconnect drops the whole request future, so the `Ok(None)` cancel
+/// path below never runs — nothing would tell the worker to stop. Drop can't
+/// await, so it signals and leaves the drain to the next request (which skips
+/// the abandoned request's frames by id).
+struct CancelWorkerOnDrop(Option<u32>);
+
+impl CancelWorkerOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelWorkerOnDrop {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = hipfire_daemon_adapter::signal_worker_cancel(pid);
+        }
+    }
 }
 
 async fn execute_blocking_chat_cancellable<F>(
@@ -1901,7 +1951,13 @@ where
     };
 
     let mut engine_guard = state.engine.lock().await;
-    let mut engine = match engine_guard.take() {
+    // Borrow the engine, never move it out: a client disconnect drops this whole
+    // future (axum cancels the handler task, and `/v1/responses` awaits us
+    // inline rather than on a spawned task), and an owned `DaemonEngine` would
+    // be dropped with it — `kill_on_drop` SIGKILLs the inference worker, taking
+    // the loaded model and every other in-flight request down silently. Borrowed,
+    // the engine stays in `AppState` and a dropped future only releases the lock.
+    let engine = match engine_guard.as_mut() {
         Some(e) => e,
         None => {
             return Err(json!({"error": {"message": "daemon not running", "type": "server_error"}}))
@@ -1910,13 +1966,16 @@ where
 
     if !loaded.cache_capable {
         if let Err(e) = engine.reset().await {
-            *engine_guard = Some(engine);
             return Err(json!({"error": {"message": e.to_string(), "type": "server_error"}}));
         }
     }
 
     let mut raw_text = String::new();
     let mut raw_tool_calls = Vec::new();
+    // Captured before the move so a client disconnect can cooperatively cancel
+    // this exact request in the worker (SIGUSR1 + drain) instead of SIGKILL.
+    let gen_req_id = gen_req.id.clone();
+    let cancel_on_drop = CancelWorkerOnDrop(engine.worker_pid());
     let result = engine
         .generate_streaming_events_controlled(gen_req, |event| {
             if should_cancel() {
@@ -1929,10 +1988,11 @@ where
             GenerateStreamControl::Continue
         })
         .await;
+    // Past the await: every arm below either finishes or cancels explicitly.
+    cancel_on_drop.disarm();
 
     match result {
         Ok(Some(done)) => {
-            *engine_guard = Some(engine);
             let raw_reply = raw_text.clone();
             let mut text = strip_visible_thinking(raw_text, preserve_thinking, true);
             let mut tool_calls = daemon_tool_calls_to_openai(raw_tool_calls, &req_id);
@@ -1955,17 +2015,27 @@ where
             }))
         }
         Ok(None) => {
-            tracing::info!(request_id = %req_id, "non-stream client disconnected; dropping daemon");
-            *state.loaded_model_path.lock().await = None;
-            *state.loaded_model_cache_capable.lock().await = None;
-            *state.loaded_model_max_seq.lock().await = None;
-            drop(engine);
+            // Client disconnected mid-generation. Cooperatively cancel the
+            // worker's in-flight generation (SIGUSR1 + drain) and keep the
+            // worker + loaded model resident for reuse. Only fall back to
+            // discarding the engine (old SIGKILL-on-drop) if the cancel/drain
+            // fails, since unread events would corrupt the next request.
+            let drained = engine.abort_and_drain(&gen_req_id).await;
+            match drained {
+                Ok(()) => {
+                    tracing::info!(request_id = %req_id, "non-stream client disconnected; cancelled generation, worker retained");
+                }
+                Err(e) => {
+                    tracing::warn!(request_id = %req_id, error = %e, "non-stream cancel/drain failed; dropping daemon");
+                    *state.loaded_model_path.lock().await = None;
+                    *state.loaded_model_cache_capable.lock().await = None;
+                    *state.loaded_model_max_seq.lock().await = None;
+                    *engine_guard = None;
+                }
+            }
             Ok(None)
         }
-        Err(e) => {
-            *engine_guard = Some(engine);
-            Err(json!({"error": {"message": e.to_string(), "type": "server_error"}}))
-        }
+        Err(e) => Err(json!({"error": {"message": e.to_string(), "type": "server_error"}})),
     }
 }
 
@@ -2255,6 +2325,9 @@ async fn stream_chat(
             }
         }
 
+        // Captured before the move so a client disconnect can cooperatively
+        // cancel this exact request in the worker (SIGUSR1 + drain).
+        let gen_req_id = gen_req.id.clone();
         let result = engine
             .generate_streaming_events_controlled(gen_req, |event| match event {
                 GenerateStreamEvent::Token(token) => {
@@ -2427,11 +2500,23 @@ async fn stream_chat(
                     .await;
             }
             Ok(None) => {
-                tracing::info!(request_id = %req_id, "stream client disconnected; dropping daemon");
-                *state.loaded_model_path.lock().await = None;
-                *state.loaded_model_cache_capable.lock().await = None;
-                *state.loaded_model_max_seq.lock().await = None;
-                drop(engine);
+                // Client disconnected mid-stream. Cooperatively cancel the
+                // worker's in-flight generation (SIGUSR1 + drain) and keep the
+                // worker + loaded model resident for reuse. Fall back to
+                // discarding the engine only if the cancel/drain fails.
+                match engine.abort_and_drain(&gen_req_id).await {
+                    Ok(()) => {
+                        tracing::info!(request_id = %req_id, "stream client disconnected; cancelled generation, worker retained");
+                        *engine_guard = Some(engine);
+                    }
+                    Err(e) => {
+                        tracing::warn!(request_id = %req_id, error = %e, "stream cancel/drain failed; dropping daemon");
+                        *state.loaded_model_path.lock().await = None;
+                        *state.loaded_model_cache_capable.lock().await = None;
+                        *state.loaded_model_max_seq.lock().await = None;
+                        drop(engine);
+                    }
+                }
                 return;
             }
             Err(e) => {

@@ -59,7 +59,18 @@ async fn assemble_health_json(state: &SharedState) -> Value {
         let loaded = state.loaded_model_path.lock().await;
         loaded.clone()
     };
-    let diffusion = diffusion_health_payload(state).await;
+    // Probe the inference worker so a crashed worker surfaces as `degraded`
+    // instead of the front-end reporting a blanket `ok`. `None` = no worker has
+    // been spawned yet (e.g. a diffusion-only server), which is not a fault.
+    let worker_alive: Option<bool> = {
+        let mut engine = state.engine.lock().await;
+        engine.as_mut().map(|e| e.worker_alive())
+    };
+    let status = match worker_alive {
+        Some(false) => "degraded",
+        _ => "ok",
+    };
+    let diffusion = diffusion_health_payload(&state).await;
     let active_model = loaded
         .clone()
         .or_else(|| diffusion_active_model(&diffusion));
@@ -119,9 +130,28 @@ async fn assemble_health_json(state: &SharedState) -> Value {
             );
         }
     }
+    // Authoritative bind, captured from the listener itself. Clients must read
+    // the address from here rather than re-deriving it from their own config,
+    // which may be newer than the running process.
+    let bind = state
+        .bind
+        .lock()
+        .ok()
+        .and_then(|bind| bind.as_ref().map(crate::bind::BindInfo::to_json));
+    let api_auth = {
+        let config = state.config.lock().await;
+        match crate::api_auth::effective_api_auth_policy(&config) {
+            crate::api_auth::ApiAuthPolicy::Off => "off",
+            crate::api_auth::ApiAuthPolicy::Optional => "optional",
+            crate::api_auth::ApiAuthPolicy::Required => "required",
+        }
+    };
     json!({
-        "status": "ok",
+        "status": status,
+        "worker_alive": worker_alive,
         "version": hipfire_build_info::VERSION,
+        "bind": bind,
+        "api_auth": api_auth,
         "model": loaded,
         "active_model": active_model,
         "diffusion": diffusion,

@@ -18,6 +18,7 @@ ffn_bf16 = []
 npu-kernels = []
 
 [dependencies]
+hipfire-env = { path = "../hipfire-env" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-kld = { path = "../hipfire-kld" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = [

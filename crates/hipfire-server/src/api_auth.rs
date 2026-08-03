@@ -384,7 +384,7 @@ pub(crate) fn principal_has_scope_for_path(principal: &RequestPrincipal, path: &
     required_scope(path).is_none_or(|scope| principal.has_scope(scope))
 }
 
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     let host = host.trim().trim_start_matches('[').trim_end_matches(']');
     host.eq_ignore_ascii_case("localhost")
         || host.ends_with(".localhost")

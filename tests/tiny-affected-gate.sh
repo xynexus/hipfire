@@ -161,6 +161,16 @@ while IFS= read -r path; do
             select_all_tiny
             ;;
 
+        # Tokenizer / vocab loading is family-blind: every prompt for every
+        # family is encoded here, so a change shifts token ids everywhere.
+        # Whole crate, not just tokenizer.rs — lib.rs owns
+        # `hfq_tokenizer_metadata`, `tokenizer_signature`, and
+        # `read_optional_tokenizer_json`, which are equally cross-family.
+        crates/hipfire-model/*)
+            add_all_supported
+            select_all_tiny
+            ;;
+
         crates/hipfire-runtime/src/ddtree.rs|crates/hipfire-runtime/src/dflash.rs|\
         crates/hipfire-arch-qwen35/src/speculative.rs|crates/hipfire-arch-qwen35/src/mtp_spec.rs|\
         crates/hipfire-arch-qwen35/src/mtp_compose.rs|*dflash*|*ddtree*|*spec_step*|*tree_verify*|*spec_decode*)

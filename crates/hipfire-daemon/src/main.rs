@@ -1120,6 +1120,14 @@ struct DrafterTrainSession {
 }
 
 fn main() {
+    // Cooperative generation cancellation: install the SIGUSR1 handler so the
+    // HTTP server can abort an in-flight generation (on client disconnect)
+    // without SIGKILL-ing this worker and destroying the loaded model. The
+    // handler only sets a process-global atomic (async-signal-safe); the
+    // per-token decode loops poll it and stop cleanly. See
+    // `hipfire_runtime::GENERATION_CANCEL`.
+    hipfire_runtime::install_generation_cancel_handler();
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -1391,8 +1399,6 @@ fn main() {
 
             DaemonRequest::Rerank(req) => handlers::generate::rerank(&mut daemon_state, &msg, req),
 
-            DaemonRequest::Generate(_) => handlers::generate::text(&mut daemon_state, &msg),
-
             DaemonRequest::GenerateBatchPrefill => {
                 handlers::batch::prefill(&mut daemon_state, &msg)
             }
@@ -1403,6 +1409,19 @@ fn main() {
 
             DaemonRequest::GenerateBatchDecodeStep => {
                 handlers::batch::decode_step(&mut daemon_state, &msg)
+            }
+
+            DaemonRequest::Generate(_) => {
+                // Clear any stale cancel request before starting a fresh
+                // generation: a SIGUSR1 delivered after the previous request
+                // already finished (a disconnect racing the terminal `done`)
+                // must not immediately cancel this one. The single serial worker
+                // guarantees no other generation is in flight, so this is
+                // race-free. Ported from origin/master, whose ~700-line inline
+                // arm this branch had already refactored into
+                // handlers::generate::text — only the reset is new behaviour.
+                hipfire_runtime::reset_generation_cancel();
+                handlers::generate::text(&mut daemon_state, &msg)
             }
 
             DaemonRequest::ReleaseSessions => {

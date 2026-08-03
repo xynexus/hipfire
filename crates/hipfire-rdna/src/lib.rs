@@ -17,6 +17,7 @@ pub mod profile_rocprof;
 pub mod profiler;
 
 pub use compiler::KernelCompiler;
+pub use dispatch::lmhead_twostage;
 pub use dispatch::{
     gen_fwht_signs, ActivationCapture, DType, Gpu, GpuTensor, OpusNpuIoLayout, OwnedTensor,
     LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER,

@@ -409,6 +409,22 @@ pub fn run_moe_decode(
         p.n_exp,
         p.norm_topk_prob
     ))?;
+    // Feed the shared router histogram (see the CPU-fallback call below for why
+    // this port was missing it). Gated on the histogram being armed because,
+    // unlike the fallback, this path keeps top-K on-device — recording costs a
+    // per-token device->host copy, so it must stay off by default.
+    if crate::moe_telemetry::moe_router_histogram_active() {
+        hip!(gpu.bind_thread())?;
+        let mut idx = vec![0i32; p.k];
+        let bytes = unsafe { std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut u8, p.k * 4) };
+        hip!(gpu.hip.memcpy_dtoh(bytes, &p.topk_indices.buf))?;
+        let weights = hip!(gpu.download_f32(p.topk_weights))?;
+        let indices: Vec<usize> = idx
+            .into_iter()
+            .map(crate::moe_telemetry::router_index_i32_to_usize)
+            .collect();
+        crate::moe_telemetry::record_moe_router_selection(p.layer, &indices, &weights);
+    }
 
     // ── Shared expert down ───────────────────────────────────────────────────
     // EP: on rank>0 `skip_shared` is set so the replicated shared expert is
@@ -743,6 +759,12 @@ fn run_moe_decode_cpu_fallback(
             }
         }
     }
+    // Feed the shared router histogram. The verbatim port of
+    // `moe_ffn_decode_impl` dropped this, so expert-balance telemetry was blank
+    // for every model routed through this executor — which is every MoE whose
+    // `k != 8`, since those fail the `use_gpu_topk` guard and land here.
+    // Indices/weights are already on the host, so this costs nothing extra.
+    crate::moe_telemetry::record_moe_router_selection(p.layer, &topk_indices, &topk_weights);
 
     // ── 3. Shared-expert down (identical to the GPU-top-K shared-down block) ──
     if p.shared_down_w.dtype == DType::MQ4G256 {

@@ -277,6 +277,26 @@ pub struct RegisteredArch {
     pub caps: Caps,
 }
 
+/// Fold an arch tag to a comparison key: lowercase, separators removed. Lets
+/// `nemotron-h`, `nemotron_h` and `Nemotron.H` compare equal without each
+/// caller carrying its own spelling table.
+fn normalize_arch_tag(tag: &str) -> String {
+    tag.chars()
+        .filter(|c| !matches!(c, '-' | '_' | '.' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The process-wide arch registry, built once from whatever `register_arch!`
+/// registrations are linked into this binary.
+///
+/// A binary that does not link an arch's spec crate will not see it here —
+/// which is the correct answer, since it cannot serve that family either.
+pub fn registry() -> &'static ArchRegistry {
+    static REG: std::sync::OnceLock<ArchRegistry> = std::sync::OnceLock::new();
+    REG.get_or_init(ArchRegistry::build)
+}
+
 /// Runtime index over every `register_arch!`-published architecture linked into the
 /// binary. Build once (e.g. into a `OnceLock`), then look up by [`ArchId`].
 pub struct ArchRegistry {
@@ -337,6 +357,38 @@ impl ArchRegistry {
         self.archs
             .iter()
             .find(|arch| arch.model_types.contains(&model_type))
+    }
+
+    /// Resolve an arch *tag* — either a canonical HF `model_type` or a family
+    /// name — through linked arch specs.
+    ///
+    /// Callers hold a string whose provenance they cannot always pin: the
+    /// daemon reports a `model_type` for families that declare one, and a
+    /// [`Arch::family`] name for those that don't (e.g. `nemotron-h`,
+    /// `mamba2`, whose specs leave `model_types` empty). Matching is
+    /// separator- and case-insensitive so `nemotron-h`, `nemotron_h` and
+    /// `Nemotron-H` all land on the same arch.
+    ///
+    /// Returns `None` for a tag no linked arch claims — which is also the
+    /// honest answer when the binary genuinely cannot serve that family,
+    /// because an arch absent from the link is absent from the registry.
+    pub fn resolve(&self, tag: &str) -> Option<&RegisteredArch> {
+        let needle = normalize_arch_tag(tag);
+        if needle.is_empty() {
+            return None;
+        }
+        self.archs
+            .iter()
+            .find(|arch| {
+                arch.model_types
+                    .iter()
+                    .any(|mt| normalize_arch_tag(mt) == needle)
+            })
+            .or_else(|| {
+                self.archs
+                    .iter()
+                    .find(|arch| normalize_arch_tag(arch.family) == needle)
+            })
     }
 
     /// True if `id` is a registered diffusion denoiser arch (declares the
