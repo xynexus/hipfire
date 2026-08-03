@@ -1171,6 +1171,10 @@ mod chol_tests {
             eprintln!("no GPU — skipping");
             return;
         };
+        // Warm up: the gather/scatter/syrk kernels are hiprtc-compiled on first
+        // use, and that one-off lands entirely in whichever size runs first.
+        let warm = ill_conditioned(256, 1e-1);
+        let _ = super::llt_lower_right_looking_gpu(&mut gpu, &warm, 256);
         for k in [1024usize, 2048] {
             let h = ill_conditioned(k, 1e-1);
             let hd = Mat::<f64>::from_fn(k, k, |i, j| h[i * k + j]);
@@ -1782,20 +1786,30 @@ pub fn llt_lower_right_looking_gpu(
     const JB: usize = 128;
 
     // Device copy in f32. Only the lower triangle is meaningful from here on.
-    // `host` is the authoritative copy throughout: panels are read from it and
-    // trailing updates are downloaded back into it. Reading panels from a device
-    // buffer that was uploaded once and never refreshed gives a factorization of
-    // the ORIGINAL matrix — 98% relative error, which is what the first draft did.
-    let mut host: Vec<f32> = a.iter().map(|&v| v as f32).collect();
+    // The matrix stays DEVICE-RESIDENT; only the k x jb panel crosses the bus
+    // each block. The first draft round-tripped the whole [k, k] per block —
+    // 256 MB at k=8192 against the ~4 MB actually needed — which is why it
+    // plateaued at 27 GF/s.
+    //
+    // The device copy is authoritative. Factoring a panel read from a stale
+    // device buffer factors the ORIGINAL matrix rather than the trailing-updated
+    // one: 98% relative error, which is exactly what the first draft did.
+    let host0: Vec<f32> = a.iter().map(|&v| v as f32).collect();
+    let dev = gpu.upload_owned_f32(&host0, &[k, k]).ok()?;
+    drop(host0);
+    let panel_dev = gpu.alloc_owned(&[k * JB], hipfire_rdna::DType::F32).ok()?;
 
     let mut j0 = 0usize;
     while j0 < k {
         let jb = JB.min(k - j0);
         let rows = k - j0;
+        gpu.chol_panel_gather(&dev, &panel_dev, k, j0, jb, rows).ok()?;
+        gpu.device_synchronize().ok()?;
+        let flat = gpu.download_f32(&panel_dev).ok()?;
         let mut panel = vec![0.0f64; rows * jb];
         for r in 0..rows {
             for c in 0..jb {
-                panel[r * jb + c] = host[(j0 + r) * k + j0 + c] as f64;
+                panel[r * jb + c] = flat[r * jb + c] as f64;
             }
         }
 
@@ -1820,19 +1834,14 @@ pub fn llt_lower_right_looking_gpu(
         }
 
         // Write the factored panel back and let the GPU take the trailing update.
-        for r in 0..rows {
-            for c in 0..jb.min(r + 1) {
-                host[(j0 + r) * k + j0 + c] = panel[r * jb + c] as f32;
-            }
-        }
-        if j0 + jb < k {
-            let dev = gpu.upload_owned_f32(&host, &[k, k]).ok()?;
-            gpu.chol_syrk_trailing(&dev, k, j0, jb).ok()?;
-            gpu.device_synchronize().ok()?;
-            host = gpu.download_f32(&dev).ok()?;
-        }
+        let back: Vec<f32> = panel.iter().map(|&v| v as f32).collect();
+        let back_dev = gpu.upload_owned_f32(&back, &[rows, jb]).ok()?;
+        gpu.chol_panel_scatter(&dev, &back_dev, k, j0, jb, rows).ok()?;
+        gpu.chol_syrk_trailing(&dev, k, j0, jb).ok()?;
+        gpu.device_synchronize().ok()?;
         j0 += jb;
     }
+    let out = gpu.download_f32(&dev).ok()?;
     gpu.reclaim_pending();
-    Some(host.iter().map(|&v| v as f64).collect())
+    Some(out.iter().map(|&v| v as f64).collect())
 }

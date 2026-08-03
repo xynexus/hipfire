@@ -37,3 +37,31 @@ extern "C" __global__ __launch_bounds__(256) void chol_syrk_trailing(
     for (int t = 0; t < jb; ++t) acc += li[t] * lj[t];
     a[(long long)i * k + j] -= acc;
 }
+
+// Gather the panel (rows j0..k, columns j0..j0+jb) into a contiguous
+// [rows, jb] buffer. Without this the host must pull the whole [k, k] matrix
+// back every block just to read a k x jb slice — at k=8192 that is 256 MB per
+// block against the ~4 MB actually needed, and it is why the first draft
+// plateaued at 27 GF/s.
+extern "C" __global__ __launch_bounds__(256) void chol_panel_gather(
+    const float* __restrict__ a, float* __restrict__ out,
+    int k, int j0, int jb, int rows
+) {
+    const int c = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int r = (int)blockIdx.y;
+    if (c >= jb || r >= rows) return;
+    out[(long long)r * jb + c] = a[(long long)(j0 + r) * k + j0 + c];
+}
+
+// Scatter the factored panel back, LOWER triangle only (c <= r within the
+// diagonal block; every column for rows below it). Writing the upper half would
+// destroy the symmetry the next gather relies on.
+extern "C" __global__ __launch_bounds__(256) void chol_panel_scatter(
+    float* __restrict__ a, const float* __restrict__ src,
+    int k, int j0, int jb, int rows
+) {
+    const int c = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int r = (int)blockIdx.y;
+    if (c >= jb || r >= rows || c > r) return;
+    a[(long long)(j0 + r) * k + j0 + c] = src[(long long)r * jb + c];
+}

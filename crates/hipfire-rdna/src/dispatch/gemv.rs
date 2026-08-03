@@ -1940,6 +1940,59 @@ impl Gpu {
             &kernargs![ptr a_ptr, i32 ki, i32 j0i, i32 jbi],
         )
     }
+    /// Gather the Cholesky panel (rows `j0..k`, cols `j0..j0+jb`) into a
+    /// contiguous `[rows, jb]` buffer.
+    pub fn chol_panel_gather(
+        &mut self,
+        a: &GpuTensor,
+        out: &GpuTensor,
+        k: usize,
+        j0: usize,
+        jb: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "chol_panel_gather",
+            kernels::CHOL_SYRK_TRAILING_SRC,
+            "chol_panel_gather",
+        )?;
+        let (a_ptr, o_ptr) = (a.buf.as_ptr(), out.buf.as_ptr());
+        let (ki, j0i, jbi, ri) = (k as i32, j0 as i32, jb as i32, rows as i32);
+        self.launch_kernargs(
+            "chol_panel_gather",
+            [jb.div_ceil(64) as u32, rows as u32, 1],
+            [64, 1, 1],
+            0,
+            &kernargs![ptr a_ptr, ptr o_ptr, i32 ki, i32 j0i, i32 jbi, i32 ri],
+        )
+    }
+    /// Scatter a factored panel back into the device matrix, lower triangle only.
+    pub fn chol_panel_scatter(
+        &mut self,
+        a: &GpuTensor,
+        src: &GpuTensor,
+        k: usize,
+        j0: usize,
+        jb: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "chol_panel_scatter",
+            kernels::CHOL_SYRK_TRAILING_SRC,
+            "chol_panel_scatter",
+        )?;
+        let (a_ptr, s_ptr) = (a.buf.as_ptr(), src.buf.as_ptr());
+        let (ki, j0i, jbi, ri) = (k as i32, j0 as i32, jb as i32, rows as i32);
+        self.launch_kernargs(
+            "chol_panel_scatter",
+            [jb.div_ceil(64) as u32, rows as u32, 1],
+            [64, 1, 1],
+            0,
+            &kernargs![ptr a_ptr, ptr s_ptr, i32 ki, i32 j0i, i32 jbi, i32 ri],
+        )
+    }
     /// Gather block `[c0, c0+256)` from a device-resident `[m, k]` residual into
     /// a contiguous `[m, 256]` buffer for the trellis encoder.
     pub fn qtip_gather_block(
