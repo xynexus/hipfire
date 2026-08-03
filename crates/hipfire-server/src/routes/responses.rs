@@ -547,7 +547,9 @@ async fn stream_responses(
             .await;
 
         let mut engine_guard = state.engine.lock().await;
-        let mut engine = match engine_guard.take() {
+        // Borrowed, never moved out — an owned `DaemonEngine` dropped on any
+        // early exit would `kill_on_drop` (SIGKILL) the inference worker.
+        let engine = match engine_guard.as_mut() {
             Some(engine) => engine,
             None => {
                 let _ = tx
@@ -562,7 +564,6 @@ async fn stream_responses(
 
         if !loaded.cache_capable {
             if let Err(e) = engine.reset().await {
-                *engine_guard = Some(engine);
                 let _ = tx
                     .send(Ok(sse_json_event(
                         "error",
@@ -580,6 +581,9 @@ async fn stream_responses(
         // the whole reasoning block as answer text.
         let mut think_filter = ThinkStreamFilter::started_in_think();
         let mut reasoning_text = String::new();
+        // Captured before the move so a client disconnect can cooperatively
+        // cancel this exact request in the worker (SIGUSR1 + drain).
+        let gen_req_id = gen_req.id.clone();
         let result = engine
             .generate_streaming_events_controlled(gen_req, |event| {
                 if tx.is_closed() {
@@ -623,7 +627,6 @@ async fn stream_responses(
                         0,
                     );
                 }
-                *engine_guard = Some(engine);
                 // Already split by the stream filter — reasoning went out on its own
                 // event, so there is nothing left to strip here.
                 let mut stored = messages;
@@ -672,17 +675,31 @@ async fn stream_responses(
                     .await;
             }
             Ok(None) => {
-                tracing::info!(
-                    response_id = %response_id,
-                    "responses stream client disconnected; dropping daemon"
-                );
-                *state.loaded_model_path.lock().await = None;
-                *state.loaded_model_cache_capable.lock().await = None;
-                *state.loaded_model_max_seq.lock().await = None;
-                drop(engine);
+                // Cooperatively cancel and keep the worker + loaded model
+                // resident, as the chat routes do; only discard the engine
+                // (SIGKILL-on-drop) if the drain fails, since unread events
+                // would corrupt the next request.
+                let drained = engine.abort_and_drain(&gen_req_id).await;
+                match drained {
+                    Ok(()) => {
+                        tracing::info!(
+                            response_id = %response_id,
+                            "responses stream client disconnected; cancelled generation, worker retained"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            response_id = %response_id, error = %e,
+                            "responses stream cancel/drain failed; dropping daemon"
+                        );
+                        *state.loaded_model_path.lock().await = None;
+                        *state.loaded_model_cache_capable.lock().await = None;
+                        *state.loaded_model_max_seq.lock().await = None;
+                        *engine_guard = None;
+                    }
+                }
             }
             Err(e) => {
-                *engine_guard = Some(engine);
                 let _ = tx
                     .send(Ok(sse_json_event(
                         "error",
