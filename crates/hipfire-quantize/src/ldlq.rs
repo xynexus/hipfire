@@ -1317,6 +1317,14 @@ pub fn qtip_conditioned_encode(
     beam: usize,
     bits: u32,
     mode: QtipCondMode,
+    // Optional external encoder for ONE block of `m` groups, laid out
+    // contiguously as [m * 256]. `Greedy` needs only the chosen path, so it can
+    // delegate to a stronger encoder (the GPU exact Viterbi) and still feed its
+    // error forward — that combination is the point of this parameter, because
+    // encoder quality was measured to dominate conditioning at small beams.
+    // `BeamLdlq` ignores it: its feedback lives INSIDE the beam, so it cannot
+    // delegate without the encoder itself carrying per-candidate residuals.
+    block_encoder: Option<&dyn Fn(&[f32], usize) -> Vec<u8>>,
 ) -> Option<(Vec<u8>, Vec<f32>)> {
     use rayon::prelude::*;
     assert_eq!(rotated.len(), m * k);
@@ -1381,16 +1389,39 @@ pub fn qtip_conditioned_encode(
             Vec::new()
         };
 
+        // Gather this block from every row into one contiguous [m * 256] buffer so
+        // an external encoder sees the same layout it would for a whole tensor.
+        let block_flat: Vec<f32> = if block_encoder.is_some() && mode == QtipCondMode::Greedy {
+            let mut v = vec![0.0f32; m * 256];
+            v.par_chunks_mut(256)
+                .zip(residual.par_chunks(k))
+                .for_each(|(dst, rr)| {
+                    for (d, &sv) in dst.iter_mut().zip(&rr[c0..c1]) {
+                        *d = sv as f32;
+                    }
+                });
+            v
+        } else {
+            Vec::new()
+        };
+        let ext_syms: Option<Vec<u8>> = if block_flat.is_empty() {
+            None
+        } else {
+            block_encoder.map(|f| f(&block_flat, m))
+        };
+
         let per_row: Vec<(Vec<u8>, Vec<f32>, Vec<f64>)> = residual
             .par_chunks(k)
-            .map(|rr| {
+            .enumerate()
+            .map(|(row, rr)| {
                 let grp: Vec<f32> = rr[c0..c1].iter().map(|&v| v as f32).collect();
                 let scale0 = crate::qtip::group_scale(&grp);
-                let sym = match mode {
-                    QtipCondMode::BeamLdlq => crate::qtip::beam_encode_group_bits_ldlq(
+                let sym = match (&ext_syms, mode) {
+                    (Some(es), _) => es[row * 256..row * 256 + 256].to_vec(),
+                    (None, QtipCondMode::BeamLdlq) => crate::qtip::beam_encode_group_bits_ldlq(
                         &grp, scale0, cb, beam, bits, &l_block,
                     ),
-                    _ => crate::qtip::beam_encode_group_bits(&grp, scale0, cb, beam, bits),
+                    (None, _) => crate::qtip::beam_encode_group_bits(&grp, scale0, cb, beam, bits),
                 };
                 // Refit the scale against what was actually encoded, then measure
                 // the error THAT reconstruction leaves behind.

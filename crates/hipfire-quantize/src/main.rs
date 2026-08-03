@@ -4757,8 +4757,37 @@ fn pack_qtip_real_tensors(
             {
                 let diag_sum: f64 = (0..k).map(|i| h[i * k + i] as f64).sum();
                 let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
+                // Greedy composes with the GPU exact Viterbi encoder: it only
+                // needs the winning path, so each block can be encoded by the
+                // strong encoder and its error still fed forward. Measured, the
+                // encoder matters more than the conditioning, so this pairing is
+                // the one worth shipping. BeamLdlq cannot delegate — its feedback
+                // is inside the beam — and falls through to the CPU path.
+                #[cfg(feature = "gpu")]
+                let gpu_cell = std::cell::RefCell::new(gpu.take());
+                #[cfg(feature = "gpu")]
+                let gpu_block: Option<Box<dyn Fn(&[f32], usize) -> Vec<u8>>> =
+                    if mode == hipfire_quantize::ldlq::QtipCondMode::Greedy
+                        && gpu_cell.borrow().is_some()
+                    {
+                        Some(Box::new(|flat: &[f32], groups: usize| {
+                            let mut guard = gpu_cell.borrow_mut();
+                            match guard.as_mut() {
+                                Some(g) => gpu_encode_symbols(g, flat, groups, bits)
+                                    .unwrap_or_else(|_| {
+                                        cpu_encode_symbols(flat, groups, qtip_cb, beam, bits)
+                                    }),
+                                None => cpu_encode_symbols(flat, groups, qtip_cb, beam, bits),
+                            }
+                        }))
+                    } else {
+                        None
+                    };
+                #[cfg(not(feature = "gpu"))]
+                let gpu_block: Option<Box<dyn Fn(&[f32], usize) -> Vec<u8>>> = None;
                 match hipfire_quantize::ldlq::qtip_conditioned_encode(
                     &rotated, m, k, &h, qtip_s1, qtip_s2, damp, qtip_cb, beam, bits, mode,
+                    gpu_block.as_deref(),
                 ) {
                     Some((sym, tgt)) => {
                         symbols = sym;
