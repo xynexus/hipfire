@@ -261,6 +261,45 @@ the efficiency winner at 202% KLD-improvement per b/w against o_proj's 56% — 3
 better — and v+k buys -16.0% for only 0.13 b/w. The MLP tensors (gate/up/down,
 27.6% each) were never worth promoting: too expensive per unit of KLD.
 
+**ALLOCATION, SETTLED 2026-08-04 UNDER THE FULL CODEC: THE MARGINAL BIT BELONGS
+TO THE ATTENTION VALUE PATH.** Five strategies, same `oq4.25++ @ alpha 0.45`
+base, same harness:
+
+    allocation                    bytes         PPL       KLD
+    plain (no promotion)     1,182,436,398   17.1547   0.034862
+    last layer (15) only     1,214,041,203   17.1919   0.032130
+    v_proj + o_proj          1,225,034,900   17.1157   0.025025   BEST
+    auto (density-greedy)    1,242,031,756   16.9765   0.030071
+    last 2 layers (14,15)    1,243,024,540   17.1747   0.030461
+
+`v_proj + o_proj` wins with ~18 MB FEWER bytes than either competitor. Depth-based
+allocation and `mixed_precision.rs`'s greedy-per-parameter ranking land within
+noise of each other, both clearly behind.
+
+**The reason is architectural, which is why no error statistic found it.** v_proj
+and o_proj are the attention VALUE PATH: v produces the values, o mixes them back
+into the residual stream, so error there enters the carrier signal directly. q and
+k only shape attention WEIGHTS, which pass through a softmax and tolerate
+perturbation. Isotropic sensitivity, imatrix-weighted per-tensor sensitivity, and
+per-layer depth concentration all missed this — it is a property of what the
+tensor DOES, not of its error magnitude.
+
+**This is the full-codec A/B that hipfire branch `feat/oq4-w4a4-int4act-lds`
+§13l calls for** ("A/B'ing shapes under the *full* codec needs quantizer runs").
+That branch's simulation found promotion 3-5x more bit-efficient than uniform
+outliers; under LDLQ + AWQ + magnitude-tiered outliers the ordering REVERSES for
+entry: oq4.125++ plus promotions to 4.358 b/w FAILS the bar while oq4.25++ plain
+at 4.25 b/w passes — more total bits, worse result. Both are right about
+different things: the simulation isolates allocation shape against a naive absmax
+baseline, and the real codec's outlier selection is magnitude-tiered rather than
+error-ranked.
+
+Note also that §13l's weighted ranking is `down_proj`-only ("the sole site with a
+captured imatrix") and §13m records the capture extension as NOT done — but
+`llama-3.2-1b-inst.calib.hfq` already carries imatrix for ALL 112 tensors, every
+site and layer, from the llama collector restored in hipfire `2be6f2e70`. The
+model-wide weighted ranking is computable today with no capture work.
+
 **MINIMUM BIT RATE, SEARCHED 2026-08-04: 4.25 b/w.**
 
     config                            b/w      PPL       KLD     verdict
