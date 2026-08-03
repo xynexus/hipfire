@@ -1768,6 +1768,7 @@ dependencies = [
  "hipfire-arch-zaya",
  "hipfire-daemon-adapter",
  "hipfire-hash",
+ "hipfire-hub",
  "hipfire-lock",
  "hipfire-lora-hfq",
  "hipfire-model",
@@ -1782,6 +1783,8 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tokio",
+ "twox-hash 2.1.2",
 ]
 
 [[package]]
@@ -2030,6 +2033,19 @@ dependencies = [
  "hipfire-rdna",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "hipfire-hub"
+version = "0.3.0"
+dependencies = [
+ "futures-util",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

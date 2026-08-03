@@ -58,6 +58,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             hipfire_coexistence::export_safetensors::run_cli(&args[2..])
         }
         (Some("repack"), _) => hipfire_coexistence::repack::run_cli(&args[1..]),
+        (Some("hub"), Some(op)) => hub_cli(op, &args[2..]),
         #[cfg(target_os = "linux")]
         (Some("npu"), Some("pair-hfp")) => npu_pair_hfp(&args[2..]),
         _ => {
@@ -101,6 +102,9 @@ fn usage() {
          import safetensors --input <hf_dir> --output <model.hfq> [--arch <family>]\n\
          export safetensors --input <model.hfq> --output <hf_dir> \
          [--arch <family>] [--shard-size 5G]\n\
+         hub fetch  --repo <org/name> [--revision <sha|main>] [--include <glob>] [--dest <dir>]\n\
+         hub verify --repo <org/name> [--revision <sha|main>] [--dest <dir>]\n\
+         hub repair --repo <org/name> [--revision <sha|main>] [--dest <dir>]\n\
          repack --input <hf_dir> --output <archive.hfa>   (lossless, no arch needed)\n\
          repack --input <archive.hfa> --output <hf_dir>   (restore, byte-identical)\n\
          npu pair-hfp --in <whole-scaled.rdna2.hfp> --out <paired.rdna2.hfp>"
@@ -333,4 +337,82 @@ fn lora_convert(args: &[String]) -> Result<(), Box<dyn Error>> {
         adapter.deltas.len()
     );
     Ok(())
+}
+
+
+/// `hub {fetch,verify,repair}`. Offline tooling — the runtime never links this.
+fn hub_cli(op: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
+    let val = |k: &str| -> Option<String> {
+        args.iter()
+            .position(|a| a == k)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let repo = val("--repo").ok_or("hub: --repo <org/name> is required")?;
+    let revision = val("--revision").unwrap_or_else(|| "main".to_string());
+    let dest = val("--dest").unwrap_or_else(|| {
+        std::env::var("HF_HOME").unwrap_or_else(|_| "/srv/huggingface".to_string())
+    });
+    let root = PathBuf::from(dest);
+    let include = val("--include");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("hub: runtime: {e}"))?;
+
+    rt.block_on(async {
+        match op {
+            "fetch" => {
+                let n = hipfire_hub::run::fetch(&root, &repo, &revision, include.as_deref()).await?;
+                eprintln!("hub: {n} file(s) present and verified");
+            }
+            "verify" => {
+                let states = hipfire_hub::run::verify(&root, &repo, &revision).await?;
+                let mut good = 0;
+                let mut bad = 0;
+                let mut missing = 0;
+                let mut lenonly = 0;
+                for (f, s) in &states {
+                    use hipfire_hub::run::FileState::*;
+                    match s {
+                        Good => good += 1,
+                        Corrupt { want, got } => {
+                            bad += 1;
+                            eprintln!(
+                                "  CORRUPT {} expected {}… got {}…",
+                                f.path,
+                                &want[..16.min(want.len())],
+                                &got[..16.min(got.len())]
+                            );
+                        }
+                        Missing => {
+                            missing += 1;
+                            eprintln!("  MISSING {}", f.path);
+                        }
+                        Unreadable(e) => {
+                            bad += 1;
+                            eprintln!("  UNREADABLE {} ({e})", f.path);
+                        }
+                        // Reported separately: the hub gives no content hash for
+                        // these, so calling them "verified" would overstate it.
+                        LengthOnly => lenonly += 1,
+                    }
+                }
+                eprintln!(
+                    "hub: {good} verified, {bad} corrupt, {missing} missing, \
+{lenonly} length-only (no hub digest)"
+                );
+                if bad > 0 || missing > 0 {
+                    return Err(format!("{} file(s) need repair", bad + missing).into());
+                }
+            }
+            "repair" => {
+                let n = hipfire_hub::run::repair(&root, &repo, &revision).await?;
+                eprintln!("hub: repaired {n} file(s)");
+            }
+            other => return Err(format!("hub: unknown op {other:?}").into()),
+        }
+        Ok::<(), Box<dyn Error>>(())
+    })
 }
