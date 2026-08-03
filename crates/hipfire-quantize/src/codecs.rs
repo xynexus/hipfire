@@ -2846,6 +2846,31 @@ mod tests {
     }
 
     #[test]
+    /// Which clip factor does the search actually pick, as a function of
+    /// bitwidth? The grid is [1.0 .. 0.6] of amax; c=1.0 means NO clipping.
+    ///
+    /// This decides whether a per-layer "disable clipping" knob can do anything
+    /// at a given precision: if the search already picks 1.0 at int8, the knob is
+    /// a no-op there by construction, not by accident.
+    #[test]
+    fn clip_factor_chosen_by_bitwidth() {
+        // A group where clipping genuinely pays at int4: a dense bulk plus one
+        // extreme outlier, so the coarse grid wastes most of its levels covering
+        // a single value.
+        let mut g = vec![0.0f32; 256];
+        for (i, v) in g.iter_mut().enumerate() {
+            *v = (((i * 37 % 101) as f32 / 101.0) - 0.5) * 2.0;
+        }
+        g[200] = 20.0;
+        let amax = g.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        for &qmax in &[7.0f32, 127.0] {
+            let scale = symmetric_clipsearch(&g, qmax);
+            let c = scale * qmax / amax;
+            println!("  qmax={qmax:>5}  chosen clip factor c = {c:.3}");
+        }
+    }
+
+    #[test]
     fn symmetric_clipsearch_degenerate_groups() {
         let empty = symmetric_clipsearch(&[], 7.0);
         assert!(empty.is_finite() && empty >= 0.0);
