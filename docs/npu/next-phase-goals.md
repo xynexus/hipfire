@@ -236,7 +236,25 @@ over — so 3-bit shares the iu8 W8A8 kernels with oq4/oq8 rather than needing a
 W3 GEMV. That also retires the earlier "oq3 unpack is unaffordable" worry: that
 number came from a kernel decoding bit-planes to bf16, not to a shared int8 grid.
 
-**GOAL MET 2026-08-03: oq4.25++ BEATS q4nx ON BOTH METRICS AT 15% FEWER BITS.**
+**GOAL MET 2026-08-03: oq4.25++ BEATS q4nx ON BOTH METRICS AT 15% FEWER BITS,
+and PROMOTING ONE LAYER widens the KLD margin to 15%.**
+
+                                    b/w      PPL       KLD      vs q4nx
+    q4nx (FLM, the bar)           5.0000  17.1949  0.034954       —
+    oq4.25++ @ alpha 0.45         4.2500  17.1547  0.034862     -0.3%
+    + o_proj promoted to oq8++    4.5100  17.1886  0.029688    -15.1%
+
+`--tensor-format '*o_proj*=oq8++'` costs 0.26 b/w (o_proj is 6.9% of quantised
+params) and buys a 15% KLD margin — a comfortable win rather than the 0.26%
+squeaker, still 10% under the bar's bit rate.
+
+CLIPPING IS NOT A PER-LAYER LEVER, and the reason is worth knowing: the MSE
+search already picks c = 1.0 (no clipping) whenever clipping does not pay,
+including essentially always at int8. Even a group with a 20:1 outlier picks 1.0
+at BOTH int4 and int8, because clipping 20 down to 12 costs 64 in squared error.
+So a "disable clipping" knob finds nothing to disable at high precision, and at
+int4 it can only override the sparse subset of groups where the search correctly
+engaged — measured, that made KLD worse (0.048006 vs 0.046167).
 
                               b/w      PPL       KLD
     q4nx (FLM, the bar)     5.0000  17.1949  0.034954
