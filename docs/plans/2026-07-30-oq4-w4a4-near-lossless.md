@@ -1782,9 +1782,13 @@ byte ratio (279.91 / 252.70 MB × 4.125).
 
 | artifact | body | bits/wt | KLD vs bf16 | PPL | tok/s (median of 3) |
 |---|---|---|---|---|---|
-| oq4++ (A8 act) | 252.70 MB | 4.125 | 0.292612 | 19.92 | **1011.2** |
-| oq4.5++ | 279.91 MB | 4.569 | 0.052957 | 24.10 | 361.9 |
-| **oq8++** | 501.50 MB | 8.125 | **0.000603** | 23.63 | 384.2 |
+| oq4++ (A8 act) | 252.70 MB | 4.0625 | 0.292612 | 19.92 | **1011.2** |
+| oq4.5++ | 279.91 MB | 4.500 | 0.052957 | 24.10 | 361.9 |
+| **oq8++** | 501.50 MB | 8.0625 | **0.000603** | 23.63 | 384.2 |
+
+*(bits corrected in §13l: the on-disk per-group scale is **f16**, not f32, so the
+overhead is 16/256 not 32/256. `OqPlusCompact` then lands on exactly 4.500 —
+matching the artifact's name, which is the confirmation the reading is right.)*
 
 *(bf16's own PPL on this window is ≈23.63 — inferred in §13j from oq8++ sitting
 at ~1e-4 KLD. Note oq4++ scores 19.92, well BELOW bf16, while oq4.5++ scores
@@ -1838,3 +1842,103 @@ Cheapest way to get it, in order:
 Scope: one small hybrid model, one corpus window (chunk 0, the only valid one —
 §13a), gfx1103. The KLD figures deserve a house-rule ≥16-chunk run once a working
 bf16 reference exists.
+
+## 13l. Per-layer sensitivity, Hessian/imatrix proxy — and the allocation answer (2026-08-03)
+
+New CPU-only `layer_sensitivity_hessian` example. Ranks layers without
+quantizing one artifact per layer, and then answers §13k's open question by
+putting **both allocation strategies in the same metric**.
+
+### Method, and two dead ends worth recording
+
+`E‖δy‖² = tr(ΔW H ΔWᵀ)`; with the captured imatrix `d_j = E[x_j²]` this is
+`Σ_ij d_j ΔW_ij²`. Getting there needed two corrections:
+
+1. **The on-disk layout is not the kernel layout.** `Oq4G256` on disk is
+   block-interleaved `[f16 scale][128 nibbles]` = 130 B per 256-group
+   (`Oq8G256`: `[f16 scale][256 int8]` = 258 B). The flat `[payload | scales]`
+   form is what the *loader* repacks to. Decoding on-disk bytes with the kernel
+   layout silently reinterprets half of each value — it produced ~15% inf/NaN
+   elements, not an obvious crash. (Also: scales are **f16**, so bits/weight is
+   `4 + 16/256 = 4.0625`, not the 4.125 quoted in §13k; `OqPlusCompact` works out
+   to exactly **4.500**, matching its name.)
+2. **`ΔW = W_oq8 − W_oq4` is not recoverable.** Stored weights are AWQ-scaled
+   then FWHT-rotated, `W_st = (W·S)·Rᵀ`, and the artifacts do not share `S` —
+   oq4++ carries AWQ on down_proj only, oq8++ on all 186 projections. The
+   original basis needs `W = W_st·R·S⁻¹`, and diagonal `S` does **not** commute
+   with orthogonal `R`, so the rotation cannot be skipped. (Skipping it reports
+   ~50% relative weight error, which is how the mistake announces itself.)
+
+So the analysis stays inside **one** basis: take oq8++'s stored weights as the
+reference (3.5e-4 KLD from bf16 ⇒ near-lossless) and simulate 4-bit quantization
+of them *in that basis*. No inverse transform, and it measures what allocation
+needs — **what 4 bits costs at each site** — rather than what one particular oq4
+artifact's LDLQ/AWQ choices happened to cost. The imatrix transfers because AWQ
+makes the second moment `d_j/s_j²` and the FWHT's random-sign Hadamard leaves the
+rotated diagonal ≈ the group mean.
+
+### Result 1 — the isotropic view says sensitivity is flat; the weighted view says it is not
+
+Relative 4-bit error is **12.5% at every one of the 12 sites** (12.32–12.61%) —
+so unweighted sensitivity is essentially proportional to parameter count, and
+carries no allocation signal. Weighting by the imatrix changes the picture:
+
+| concentration | isotropic (all sites) | imatrix-weighted (down_proj) |
+|---|---|---|
+| top 10% of layers | 18.5% of error | **47.9%** |
+| top 25% of layers | 34.9% | **66.5%** |
+| top 50% of layers | 59.9% | 86.7% |
+| Gini | 0.105 | **0.425** |
+
+Spearman ρ between the two rankings is only **0.683** — the isotropic proxy is
+*not* a usable substitute for the weighted one. The activation statistics carry
+most of the signal, and they are concentrated in the **late layers**: layer 23
+alone holds 28.5% of down_proj's weighted error, then 22 (11.3%), 21 (8.1%),
+20 (6.8%).
+
+### Result 2 — at equal bits, promoting whole tensors beats uniform outliers
+
+Both strategies simulated under one codec: (A) uniform int4 + N exact
+`(u8 idx, i8 val)` outlier patches per 256-group — the `OqPlusCompact` shape,
+costing `N/16` bits/weight, with N=7 reproducing oq4.5++'s 4.500 exactly; (B)
+int4 everywhere, then promote whole tensors to int8, greedy by error-removed per
+parameter, to the same average budget.
+
+| bits/wt | budget | A: outliers/group | B: promote tensors |
+|---|---|---|---|
+| *isotropic, 186 tensors* | | | |
+| 4.5000 | N=7 | 8.0% of gap closed | **25.7%** |
+| 4.8125 | N=12 | 13.5% | **38.1%** |
+| *imatrix-weighted, down_proj* | | | |
+| 4.3125 | N=4 | 4.6% | **28.5%** |
+| 4.5000 | N=7 | 8.0% | **39.8%** |
+| 4.8125 | N=12 | 13.5% | **54.7%** |
+
+**Promotion is 3–5× more bit-efficient than uniform per-group outliers**, and the
+advantage grows with the imatrix weighting — exactly as the concentration
+statistic predicts. **This reverses the back-of-envelope in §13k**, which guessed
+mixed-precision would win by ~2×; that estimate compared oq4.5++'s *measured KLD*
+against an assumed-even error distribution, and the error distribution is not
+even.
+
+Note the granularity constraint is real and visible: at N=2 on down_proj,
+strategy B closes **0%** — the budget (3.1% of parameters) cannot fit even one
+whole tensor (4.2%). Sub-tensor promotion would beat both.
+
+### What this does and does not license
+
+- **Does:** rank layers cheaply, and establish that for *this* model the error is
+  concentrated enough (Gini 0.425, top quartile = two thirds of the error) that
+  targeted promotion is the better use of a marginal bit.
+- **Does not:** explain the shipped oq4.5++ artifact's measured −82% KLD (§13k).
+  The simulation's baseline is plain absmax int4 with no LDLQ or AWQ, so it
+  isolates the allocation *shape* from the codec's sophistication. Real
+  `OqPlusCompact` also picks outliers magnitude-tiered, not purely by error.
+  A/B'ing shapes under the *full* codec needs quantizer runs.
+- **Caveat on the floor:** because the reference is itself int8, a promoted
+  tensor has exactly zero error by construction, which flatters B slightly.
+  oq8++'s real residual is ~3.5e-4 KLD — small, but not zero.
+- **Coverage:** the weighted numbers are down_proj only — the sole site with a
+  captured imatrix. Extending `collect-artifacts` to all sites would make the
+  weighted ranking model-wide, and is the next step if this is to drive a real
+  mixed-precision recipe.
