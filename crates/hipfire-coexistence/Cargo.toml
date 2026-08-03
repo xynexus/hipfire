@@ -25,6 +25,7 @@ hipfire-arch-cohere2 = { path = "../hipfire-arch-cohere2" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-zaya = { path = "../hipfire-arch-zaya" }
 hipfire-primitives = { path = "../hipfire-primitives" }
+twox-hash = { version = "2", default-features = false, features = ["xxhash3_64", "alloc"] }
 hipfire-hash = { path = "../hipfire-hash" }
 hipfire-lock = { path = "../hipfire-lock" }
 serde.workspace = true

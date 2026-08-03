@@ -47,7 +47,19 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"HFAR0001";
+/// v2 records an XXH3-64 over every stored payload. v1 archives predate that
+/// and stay readable -- they hold the only copy of models whose sources are
+/// gone, so refusing them to gain a checksum would be the wrong trade.
+const MAGIC: &[u8; 8] = b"HFAR0002";
+const MAGIC_V1: &[u8; 8] = b"HFAR0001";
+
+/// XXH3-64 of a stored payload. Detects the corruption a read sweep cannot:
+/// bytes that come back without an I/O error but are no longer what was
+/// written. On a no-redundancy array that is the failure mode with no other
+/// backstop.
+fn xxh3(bytes: &[u8]) -> u64 {
+    twox_hash::XxHash3_64::oneshot(bytes)
+}
 /// Copy granularity for verbatim payloads. Bounds memory on a multi-GB shard.
 const CH: usize = 8 << 20;
 /// Encode unit. Caps peak memory at roughly 1.7x this (the piece plus its
@@ -59,16 +71,24 @@ pub fn run_cli(args: &[String]) -> Result<(), Box<dyn Error>> {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut verify: Option<PathBuf> = None;
+    let mut check_only = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--input" => input = it.next().map(PathBuf::from),
             "--output" => output = it.next().map(PathBuf::from),
             "--verify" => verify = it.next().map(PathBuf::from),
+            "--check" => check_only = true,
             other => return Err(format!("repack: unexpected argument {other:?}").into()),
         }
     }
     let input = input.ok_or("repack requires --input")?;
+    // Integrity without the source: the archives whose sources were deleted have
+    // nothing left to compare against, so the stored checksums are the only
+    // remaining evidence they are still what was written.
+    if check_only {
+        return check(&input);
+    }
     // Verify compares the archive against the source without materialising it.
     // A restore-then-diff needs temp space equal to the whole model, which is
     // exactly what is unavailable when the model is large enough to matter.
@@ -93,6 +113,7 @@ struct Entry {
     codec: &'static str,
     stored_off: u64,
     stored_len: u64,
+    xxh3: u64,
 }
 
 fn read_st_header(path: &Path) -> Option<(u64, Vec<u8>, serde_json::Value, u64)> {
@@ -159,17 +180,17 @@ fn pack(dir: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
 
         // Non-safetensors, or a shard whose tensors do not tile: store verbatim.
         let Some((hlen, hdr, parsed, blob_len)) = parsed else {
-            let (o, l) = copy_raw(p, 0, None, &mut w, &mut pos)?;
+            let (o, l, x) = copy_raw(p, 0, None, &mut w, &mut pos)?;
             files_json.push(serde_json::json!({
-                "path": rel, "kind": "raw", "off": o, "len": l
+                "path": rel, "kind": "raw", "off": o, "len": l, "xxh3": x
             }));
             n_raw += 1;
             continue;
         };
         let Some(tensors) = tiling(&parsed, blob_len) else {
-            let (o, l) = copy_raw(p, 0, None, &mut w, &mut pos)?;
+            let (o, l, x) = copy_raw(p, 0, None, &mut w, &mut pos)?;
             files_json.push(serde_json::json!({
-                "path": rel, "kind": "raw", "off": o, "len": l
+                "path": rel, "kind": "raw", "off": o, "len": l, "xxh3": x
             }));
             eprintln!("repack: {rel} tensors do not tile its blob — stored verbatim");
             n_raw += 1;
@@ -226,6 +247,7 @@ fn pack(dir: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
                     codec,
                     stored_off,
                     stored_len: bytes.len() as u64,
+                    xxh3: xxh3(&bytes),
                 });
                 done += take;
                 part += 1;
@@ -241,7 +263,8 @@ fn pack(dir: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
             "header_off": hdr_off, "header_len": hlen, "blob_len": blob_len,
             "tensors": entries.iter().map(|e| serde_json::json!({
                 "name": e.name, "off": e.off, "len": e.len,
-                "codec": e.codec, "stored_off": e.stored_off, "stored_len": e.stored_len
+                "codec": e.codec, "stored_off": e.stored_off, "stored_len": e.stored_len,
+                "xxh3": e.xxh3
             })).collect::<Vec<_>>()
         }));
     }
@@ -301,21 +324,24 @@ fn copy_raw(
     len: Option<u64>,
     w: &mut impl Write,
     pos: &mut u64,
-) -> Result<(u64, u64), Box<dyn Error>> {
+) -> Result<(u64, u64, u64), Box<dyn Error>> {
     let mut f = File::open(src)?;
     f.seek(SeekFrom::Start(from))?;
     let want = len.unwrap_or_else(|| f.metadata().map(|m| m.len() - from).unwrap_or(0));
     let start = *pos;
     let mut left = want;
     let mut buf = vec![0u8; CH.min(want.max(1) as usize)];
+    // Hashed streaming so a multi-GB verbatim shard is never held whole.
+    let mut h = twox_hash::xxhash3_64::Hasher::new();
     while left > 0 {
         let n = (buf.len() as u64).min(left) as usize;
         f.read_exact(&mut buf[..n])?;
+        std::hash::Hasher::write(&mut h, &buf[..n]);
         w.write_all(&buf[..n])?;
         left -= n as u64;
         *pos += n as u64;
     }
-    Ok((start, want))
+    Ok((start, want, std::hash::Hasher::finish(&h)))
 }
 
 /// Reconstruct the archive, either writing it to `out_dir` or comparing it
@@ -329,7 +355,7 @@ fn restore(
     let mut f = File::open(archive)?;
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
-    if &magic != MAGIC {
+    if &magic != MAGIC && &magic != MAGIC_V1 {
         return Err("not a hipfire repack archive".into());
     }
     let total = f.metadata()?.len();
@@ -518,4 +544,101 @@ impl Write for Sink {
             Sink::Compare { .. } => Ok(()),
         }
     }
+}
+
+
+/// Validate every stored payload against its recorded XXH3-64.
+///
+/// A read sweep proves the bytes are *readable*; this proves they are the same
+/// bytes. On an array with no redundancy those are different questions, and
+/// only the second one catches silent corruption.
+fn check(archive: &Path) -> Result<(), Box<dyn Error>> {
+    let mut f = File::open(archive)?;
+    let mut magic = [0u8; 8];
+    f.read_exact(&mut magic)?;
+    if &magic != MAGIC && &magic != MAGIC_V1 {
+        return Err("not a hipfire repack archive".into());
+    }
+    let v1 = &magic == MAGIC_V1;
+    let total = f.metadata()?.len();
+    f.seek(SeekFrom::Start(total - 16))?;
+    let mut b = [0u8; 16];
+    f.read_exact(&mut b)?;
+    let io = u64::from_le_bytes(b[..8].try_into()?);
+    let il = u64::from_le_bytes(b[8..].try_into()?);
+    f.seek(SeekFrom::Start(io))?;
+    let mut ib = vec![0u8; il as usize];
+    f.read_exact(&mut ib)?;
+    let index: serde_json::Value = serde_json::from_slice(&ib)?;
+    let files = index.get("files").and_then(|v| v.as_array()).ok_or("no files")?;
+
+    let (mut checked, mut unchecked, mut bad, mut bytes) = (0usize, 0usize, 0usize, 0u64);
+    let mut payload = |f: &mut File, off: u64, len: u64| -> std::io::Result<u64> {
+        f.seek(SeekFrom::Start(off))?;
+        let mut h = twox_hash::xxhash3_64::Hasher::new();
+        let mut left = len;
+        let mut buf = vec![0u8; CH.min(len.max(1) as usize)];
+        while left > 0 {
+            let n = (buf.len() as u64).min(left) as usize;
+            f.read_exact(&mut buf[..n])?;
+            std::hash::Hasher::write(&mut h, &buf[..n]);
+            left -= n as u64;
+        }
+        Ok(std::hash::Hasher::finish(&h))
+    };
+
+    for fe in files {
+        let path = fe.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let mut one = |off: u64, len: u64, want: Option<u64>, what: &str| {
+            match payload(&mut f, off, len) {
+                Err(e) => {
+                    println!("  READ-ERROR {path} {what}: {e}");
+                    bad += 1;
+                }
+                Ok(got) => match want {
+                    None => unchecked += 1,
+                    Some(w) if w == got => {
+                        checked += 1;
+                        bytes += len;
+                    }
+                    Some(w) => {
+                        println!("  CORRUPT    {path} {what}: xxh3 {got:016x} != {w:016x}");
+                        bad += 1;
+                    }
+                },
+            }
+        };
+        match fe.get("kind").and_then(|v| v.as_str()) {
+            Some("raw") => {
+                let off = fe.get("off").and_then(|v| v.as_u64()).unwrap_or(0);
+                let len = fe.get("len").and_then(|v| v.as_u64()).unwrap_or(0);
+                one(off, len, fe.get("xxh3").and_then(|v| v.as_u64()), "");
+            }
+            Some("safetensors") => {
+                if let Some(ts) = fe.get("tensors").and_then(|v| v.as_array()) {
+                    for t in ts {
+                        let off = t.get("stored_off").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let len = t.get("stored_len").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let nm = t.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        one(off, len, t.get("xxh3").and_then(|v| v.as_u64()), nm);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    println!(
+        "repack: {checked} payload(s) match ({:.2} GB), {bad} bad, {unchecked} unchecked{}",
+        bytes as f64 / 1e9,
+        if v1 {
+            " — v1 archive, written before checksums existed"
+        } else {
+            ""
+        }
+    );
+    if bad > 0 {
+        return Err(format!("{bad} payload(s) failed integrity check").into());
+    }
+    Ok(())
 }
